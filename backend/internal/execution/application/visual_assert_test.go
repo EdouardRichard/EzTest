@@ -1,529 +1,349 @@
-package application
+package executionapp_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
-	"errors"
-	"fmt"
-	"strings"
+	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
+	"sync"
 	"testing"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
-// visualPNG is a byte string with a valid PNG signature. The recorder never
-// decodes it (the executor does); the evidence service only checks the magic.
-var visualPNG = []byte("\x89PNG\r\n\x1a\nbaseline-and-actual-pixels")
+type fakeVisualPort struct {
+	mu          sync.Mutex
+	config      executionapp.VisualAssertConfig
+	configErr   error
+	baseline    executionapp.VisualBaselineRef
+	hasBaseline bool
+	diffs       map[int64]executionapp.VisualDiffRecord
+	recordCalls []executionapp.VisualDiffInput
+	recordErr   error
+}
 
-// visualAssertSnapshot is a one-step case with a single kind=visual assertion.
-// baselineID nil models an assertion that was never approved.
-func visualAssertSnapshot(baselineID *int64) domain.CaseSnapshot {
-	return domain.CaseSnapshot{
-		Node:  domain.CaseSnapshotNode{ID: 10, Title: "visual case", Priority: "P0"},
-		Steps: []domain.CaseSnapshotStep{{Seq: 1, Action: "open receipt", Expected: "receipt visible"}},
-		Assertions: []domain.CaseSnapshotAssertion{{
-			ID: 31, StepSeq: 1, Kind: "visual", Target: "#receipt", Expected: "match",
-			Visual: &domain.CaseSnapshotVisual{
-				Selector: "#receipt", Threshold: 0.01,
-				BaselineEvidenceID: baselineID,
-				ViewportWidth:      1280, ViewportHeight: 720, DeviceScaleFactor: 1,
-			},
-		}},
-		GraphHash: testBaselineHash,
+func (f *fakeVisualPort) Config(context.Context, int64, int64) (executionapp.VisualAssertConfig, error) {
+	return f.config, f.configErr
+}
+
+func (f *fakeVisualPort) ActiveBaseline(context.Context, int64) (executionapp.VisualBaselineRef, bool, error) {
+	return f.baseline, f.hasBaseline, nil
+}
+
+func (f *fakeVisualPort) RecordDiff(_ context.Context, in executionapp.VisualDiffInput) (executionapp.VisualDiffRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.recordErr != nil {
+		return executionapp.VisualDiffRecord{}, f.recordErr
 	}
-}
-
-// visualComparatorFake is an in-memory VisualComparator.
-type visualComparatorFake struct {
-	result  VisualCompareResult
-	err     error
-	calls   int
-	ref     ContextRef
-	request VisualCompareRequest
-}
-
-func (f *visualComparatorFake) CompareVisual(_ context.Context, ref ContextRef, req VisualCompareRequest) (VisualCompareResult, error) {
-	f.calls++
-	f.ref = ref
-	f.request = req
-	return f.result, f.err
-}
-
-// visualBaselineReaderFake is an in-memory VisualBaselineReader.
-type visualBaselineReaderFake struct {
-	baseline VisualBaseline
-	err      error
-	calls    int
-	version  int64
-	evidence int64
-}
-
-func (f *visualBaselineReaderFake) ReadVisualBaseline(_ context.Context, versionID, evidenceID int64) (VisualBaseline, error) {
-	f.calls++
-	f.version = versionID
-	f.evidence = evidenceID
-	if f.err != nil {
-		return VisualBaseline{}, f.err
+	f.recordCalls = append(f.recordCalls, in)
+	if f.diffs == nil {
+		f.diffs = map[int64]executionapp.VisualDiffRecord{}
 	}
-	return f.baseline, nil
+	record := executionapp.VisualDiffRecord{
+		ID: 9001, AssertionResultID: in.AssertionResultID, VisualAssertionID: in.VisualAssertionID,
+		BaselineID: in.BaselineID, ActualEvidenceID: in.ActualEvidenceID,
+		DiffEvidenceID: in.DiffEvidenceID, DiffRatio: in.DiffRatio, Threshold: in.Threshold,
+		Classification: in.Classification, Reason: in.Reason,
+		EnvironmentMatch: in.EnvironmentMatch, Width: in.Width, Height: in.Height,
+		MismatchBoxes: in.MismatchBoxes,
+	}
+	f.diffs[in.AssertionResultID] = record
+	return record, nil
 }
 
-// visualTestWorld wires a recorder and the visual ports. Capture uses a real
-// EvidenceService over the in-memory repositories so the persisted evidence rows
-// (sha256/mime/size) are exercised.
-func visualTestWorld(t *testing.T) (*CaseRecorder, *recWorld, *recEvidenceStore, *visualComparatorFake, *visualBaselineReaderFake, VisualAssertOptions) {
+func (f *fakeVisualPort) DiffForAssertionResult(_ context.Context, assertionResultID int64) (executionapp.VisualDiffRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	record, ok := f.diffs[assertionResultID]
+	return record, ok, nil
+}
+
+func testVisualPNG(t *testing.T, width, height int) []byte {
 	t.Helper()
-	recorder, world := newRecorderTest(t)
-	world.ids.next = 1000
-	store := &recEvidenceStore{}
-	capture := NewEvidenceService(world.evidence, world.refs, world.batches, store, world.ids)
-	comparator := &visualComparatorFake{result: VisualCompareResult{
-		EnvironmentMatch: true,
-		ActualPNG:        visualPNG,
-		ActualWidth:      1280, ActualHeight: 720,
-	}}
-	reader := &visualBaselineReaderFake{baseline: VisualBaseline{
-		EvidenceID: 501, Kind: "visual_baseline", Mime: "image/png", Data: visualPNG,
-	}}
-	opts := VisualAssertOptions{
-		Comparator:       comparator,
-		Context:          ContextRef{ID: "ctx-1"},
-		Baselines:        reader,
-		Capture:          capture,
-		MaxBaselineBytes: DefaultVisualBaselineMaxBytes,
-		MaxArtifactBytes: DefaultEvidenceMaxBytes,
-	}
-	return recorder, world, store, comparator, reader, opts
-}
-
-// baselineID returns an approved baseline evidence id.
-func baselineID(value int64) *int64 { return &value }
-
-// recordVisualStep records the snapshot's only step.
-func recordVisualStep(t *testing.T, recorder *CaseRecorder, caseRunID int64) {
-	t.Helper()
-	if _, err := recorder.RecordStep(context.Background(), caseRunID, StepRecordInput{
-		Seq: 1, Status: domain.StepStatusPassed, Actual: "done",
-	}); err != nil {
-		t.Fatalf("RecordStep: %v", err)
-	}
-}
-
-// visualResultOf returns the single recorded assertion result of the run.
-func visualResultOf(t *testing.T, world *recWorld, caseRunID int64) domain.AssertionResult {
-	t.Helper()
-	results := world.assertions.rows[caseRunID]
-	if len(results) != 1 {
-		t.Fatalf("assertion results = %+v, want one", results)
-	}
-	return results[0]
-}
-
-// visualEvidenceOf returns the captured evidence rows of one kind.
-func visualEvidenceOf(t *testing.T, world *recWorld, caseRunID int64, kind string) []domain.Evidence {
-	t.Helper()
-	rows, err := world.evidence.ListByCaseRun(context.Background(), caseRunID)
-	if err != nil {
-		t.Fatalf("ListByCaseRun: %v", err)
-	}
-	out := make([]domain.Evidence, 0, len(rows))
-	for _, row := range rows {
-		if row.Kind == kind {
-			out = append(out, row)
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: 10, G: 20, B: 30, A: 255})
 		}
 	}
-	return out
+	var buffer bytes.Buffer
+	if err := png.Encode(&buffer, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buffer.Bytes()
 }
 
-// TestVisualAssertMissingBaselineRecordsNotRun pins §9.3: an assertion without
-// an approved baseline is inconclusive(case, missing_visual_baseline); it never
-// opens the browser, never compares pixels and the recorded result lets the
-// agent submit the prescribed finish.
-func TestVisualAssertMissingBaselineRecordsNotRun(t *testing.T) {
-	recorder, world, _, comparator, reader, opts := visualTestWorld(t)
-	run := world.seedRunningRun(visualAssertSnapshot(nil))
-	recordVisualStep(t, recorder, run.ID)
+func shaHex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
 
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
-	wantToolError(t, err, "missing_visual_baseline", "inconclusive(case)")
-	if outcome.Verdict != "not_run" || outcome.Classification != string(domain.VerdictInconclusive) ||
-		outcome.FailureClass != string(domain.FailureClassCase) {
-		t.Fatalf("outcome = %+v", outcome)
-	}
-	if comparator.calls != 0 || reader.calls != 0 {
-		t.Fatalf("comparator/baseline calls = %d/%d, want 0/0", comparator.calls, reader.calls)
-	}
-	result := visualResultOf(t, world, run.ID)
-	if result.Kind != "visual" || result.Verdict != "not_run" || result.FailureReason != "missing_visual_baseline" {
-		t.Fatalf("assertion result = %+v", result)
-	}
-	if rows := visualEvidenceOf(t, world, run.ID, "visual_actual"); len(rows) != 0 {
-		t.Fatalf("missing baseline captured actual evidence: %+v", rows)
-	}
-
-	// The prescribed finish is admissible: the not_run result satisfies the
-	// finish gate and inconclusive(case) needs no evidence.
-	if _, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{
-			Verdict: domain.VerdictInconclusive, FailureClass: failureClassPointer(domain.FailureClassCase),
-			Reason: "missing_visual_baseline",
-		},
-	}); err != nil {
-		t.Fatalf("FinishCase inconclusive(case): %v", err)
+func visualArtifact(kind string, data []byte) executionapp.BrowserArtifact {
+	return executionapp.BrowserArtifact{
+		Kind: kind, MIME: "image/png", Base64: base64.StdEncoding.EncodeToString(data),
+		SHA256: shaHex(data), Bytes: len(data),
 	}
 }
 
-// TestVisualAssertEnvironmentMismatchIsInconclusiveEnvironment pins the §9.3
-// environment fingerprint rule: a live viewport/DPR mismatch is recorded as
-// not_run with visual_environment_mismatch, captures the actual screenshot only,
-// and admits the inconclusive(environment) finish.
-func TestVisualAssertEnvironmentMismatchIsInconclusiveEnvironment(t *testing.T) {
-	recorder, world, _, comparator, _, opts := visualTestWorld(t)
-	comparator.result = VisualCompareResult{
-		EnvironmentMatch: false, ActualPNG: visualPNG,
-		ActualWidth: 1280, ActualHeight: 720, ActualDeviceScaleFactor: 2,
+func visualCaseFixture(t *testing.T) (*caseRunnerFixture, executionapp.VisualAssertConfig) {
+	t.Helper()
+	fixture := newCaseRunnerFixture(t)
+	fixture.cases.snapshot.Assertions = []execution.CaseAssertion{{
+		StepSeq: 1, AssertionSeq: 2, Kind: "visual", Expected: "页面与基线一致", TargetVersionSUTID: 7,
+	}}
+	fixture.visual.config = executionapp.VisualAssertConfig{
+		ID: 6001, VersionID: 10, CaseVersionID: 41, CaseAssertionID: 9001,
+		StepSeq: 1, AssertionSeq: 2, VersionSUTID: 7,
+		Region: json.RawMessage(`{}`), Threshold: 0.005,
+		ViewportWidth: 100, ViewportHeight: 100, DeviceScaleFactor: 1,
+		WaitPolicy: json.RawMessage(`{}`), ConfigRevision: 1,
 	}
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
-	recordVisualStep(t, recorder, run.ID)
+	return fixture, fixture.visual.config
+}
 
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
-	wantToolError(t, err, "visual_environment_mismatch", "inconclusive(environment)")
-	if outcome.Verdict != "not_run" ||
-		outcome.Classification != string(domain.VerdictInconclusive) ||
-		outcome.FailureClass != string(domain.FailureClassEnvironment) {
-		t.Fatalf("outcome = %+v", outcome)
+func visualBrowserResult(t *testing.T, actual, diff []byte, environmentMatch bool, ratio float64) executionapp.BrowserActionResult {
+	t.Helper()
+	artifacts := []executionapp.BrowserArtifact{visualArtifact("actual_png", actual)}
+	if diff != nil {
+		artifacts = append(artifacts, visualArtifact("diff_png", diff))
 	}
-	if comparator.calls != 1 {
-		t.Fatalf("comparator calls = %d, want 1", comparator.calls)
-	}
-	result := visualResultOf(t, world, run.ID)
-	if result.Verdict != "not_run" || result.FailureReason != "visual_environment_mismatch" {
-		t.Fatalf("assertion result = %+v", result)
-	}
-	if rows := visualEvidenceOf(t, world, run.ID, "visual_actual"); len(rows) != 1 {
-		t.Fatalf("environment mismatch actual evidence = %+v, want 1", rows)
-	}
-	if rows := visualEvidenceOf(t, world, run.ID, "visual_diff"); len(rows) != 0 {
-		t.Fatalf("environment mismatch captured a diff: %+v", rows)
-	}
+	payload, _ := json.Marshal(map[string]any{
+		"diff_ratio":        ratio,
+		"width":             100,
+		"height":            100,
+		"environment_match": environmentMatch,
+		"mismatch_boxes":    []any{},
+	})
+	return executionapp.BrowserActionResult{OK: true, Result: payload, Artifacts: artifacts}
+}
 
-	if _, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{
-			Verdict: domain.VerdictInconclusive, FailureClass: failureClassPointer(domain.FailureClassEnvironment),
-			Reason: "visual_environment_mismatch",
-		},
-	}); err != nil {
-		t.Fatalf("FinishCase inconclusive(environment): %v", err)
+func passVisualStep(t *testing.T, fixture *caseRunnerFixture) {
+	t.Helper()
+	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+		t.Fatalf("StepRecord: %v", err)
 	}
 }
 
-// TestVisualAssertDiffAboveThresholdFails pins the only application-failing
-// outcome of §9.3 and the visual_actual/visual_diff evidence pair.
-func TestVisualAssertDiffAboveThresholdFails(t *testing.T) {
-	recorder, world, _, comparator, _, opts := visualTestWorld(t)
-	comparator.result = VisualCompareResult{
-		EnvironmentMatch: true, ActualPNG: visualPNG, DiffPNG: []byte("\x89PNG\r\n\x1a\ndiff"),
-		DiffRatio: 0.02, Width: 1280, Height: 720, ActualWidth: 1280, ActualHeight: 720,
+func evidenceKinds(fixture *caseRunnerFixture) []execution.EvidenceKind {
+	fixture.evidence.mu.Lock()
+	defer fixture.evidence.mu.Unlock()
+	kinds := make([]execution.EvidenceKind, 0, len(fixture.evidence.rows))
+	for _, row := range fixture.evidence.rows {
+		kinds = append(kinds, row.Kind)
 	}
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
-	recordVisualStep(t, recorder, run.ID)
+	return kinds
+}
 
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
+func TestVisualAssertWithoutBaselineIsInconclusive(t *testing.T) {
+	fixture, cfg := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
+	actual := testVisualPNG(t, 100, 100)
+	fixture.browser.result = visualBrowserResult(t, actual, nil, true, 0)
+
+	out, err := fixture.runner.VisualAssert(context.Background(), p3Scope(), cfg.ID)
 	if err != nil {
 		t.Fatalf("VisualAssert: %v", err)
 	}
-	if outcome.Verdict != "failed" || outcome.Classification != string(domain.VerdictFailed) ||
-		outcome.FailureClass != string(domain.FailureClassApplication) ||
-		outcome.DiffRatio != 0.02 || outcome.Threshold != 0.01 || outcome.Reason != "visual_mismatch" {
-		t.Fatalf("outcome = %+v", outcome)
+	result := out.(map[string]any)
+	if result["classification"] != "inconclusive" || result["reason"] != "missing_visual_baseline" {
+		t.Fatalf("result = %+v", result)
 	}
-	result := visualResultOf(t, world, run.ID)
-	if result.Verdict != "failed" || result.FailureReason != "visual_mismatch" {
-		t.Fatalf("assertion result = %+v", result)
+	kinds := evidenceKinds(fixture)
+	if len(kinds) != 1 || kinds[0] != execution.EvidenceVisualActual {
+		t.Fatalf("evidence kinds = %v", kinds)
+	}
+	recorded := fixture.results.assertions
+	if len(recorded) != 1 {
+		t.Fatalf("assertion results = %d", len(recorded))
+	}
+	for _, row := range recorded {
+		if row.Kind != "visual" || row.Verdict != execution.AssertionInconclusive || row.Reason != "missing_visual_baseline" {
+			t.Fatalf("assertion result = %+v", row)
+		}
+	}
+	if len(fixture.visual.recordCalls) != 1 {
+		t.Fatalf("diff records = %d", len(fixture.visual.recordCalls))
+	}
+	diff := fixture.visual.recordCalls[0]
+	if diff.BaselineID != nil || diff.Classification != "inconclusive" || diff.Reason != "missing_visual_baseline" {
+		t.Fatalf("diff record = %+v", diff)
+	}
+	if diff.DiffEvidenceID != nil {
+		t.Fatalf("no-baseline run must not store a diff image")
 	}
 
-	actuals := visualEvidenceOf(t, world, run.ID, "visual_actual")
-	diffs := visualEvidenceOf(t, world, run.ID, "visual_diff")
-	if len(actuals) != 1 || len(diffs) != 1 {
-		t.Fatalf("evidence actual/diff = %d/%d, want 1/1", len(actuals), len(diffs))
+	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
 	}
-	actual := actuals[0]
-	sum := sha256.Sum256(visualPNG)
-	if actual.Mime != "image/png" || actual.SizeBytes != int64(len(visualPNG)) ||
-		!strings.EqualFold(actual.SHA256, hex.EncodeToString(sum[:])) {
-		t.Fatalf("actual evidence metadata = %+v", actual)
+	if finished.Status != execution.CaseRunInconclusive || finished.Summary.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("case_run = %s reason=%s", finished.Status, finished.Summary.VerdictReason)
 	}
-	if actual.Metadata["assertion_id"] != "31" || metadataInt(actual.Metadata["width"]) != 1280 ||
-		metadataInt(actual.Metadata["height"]) != 720 ||
-		metadataInt(actual.Metadata["assertion_result_id"]) != int(result.ID) {
-		t.Fatalf("actual evidence metadata = %+v", actual.Metadata)
-	}
-
-	if _, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{
-			Verdict: domain.VerdictFailed, FailureClass: failureClassPointer(domain.FailureClassApplication),
-			Reason: "visual_mismatch",
-		},
-	}); err != nil {
-		t.Fatalf("FinishCase failed(application): %v", err)
+	if finished.Summary.VisualInconclusive != 1 || finished.Summary.VisualSkipped != 0 {
+		t.Fatalf("visual summary = %+v", finished.Summary)
 	}
 }
 
-// TestVisualAssertWithinThresholdPasses pins the pass boundary: diff at or below
-// the threshold records a passed assertion and admits a passed finish.
-func TestVisualAssertWithinThresholdPasses(t *testing.T) {
-	recorder, world, _, comparator, reader, opts := visualTestWorld(t)
-	comparator.result = VisualCompareResult{
-		EnvironmentMatch: true, ActualPNG: visualPNG, DiffPNG: []byte("\x89PNG\r\n\x1a\ndiff"),
-		DiffRatio: 0.01, Width: 1280, Height: 720, ActualWidth: 1280, ActualHeight: 720,
+func TestVisualAssertWithMatchingBaselinePasses(t *testing.T) {
+	fixture, cfg := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
+	actual := testVisualPNG(t, 100, 100)
+	diffImage := testVisualPNG(t, 100, 100)
+	fixture.content.open = actual
+	fixture.visual.hasBaseline = true
+	fixture.visual.baseline = executionapp.VisualBaselineRef{
+		ID: 5001, EvidenceID: 4001, SHA256: shaHex(actual), SizeBytes: int64(len(actual)),
+		Width: 100, Height: 100, ConfigRevision: 1,
 	}
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
-	recordVisualStep(t, recorder, run.ID)
+	fixture.browser.result = visualBrowserResult(t, actual, diffImage, true, 0)
 
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
+	out, err := fixture.runner.VisualAssert(context.Background(), p3Scope(), cfg.ID)
 	if err != nil {
 		t.Fatalf("VisualAssert: %v", err)
 	}
-	if outcome.Verdict != "passed" || outcome.Classification != string(domain.VerdictPassed) ||
-		outcome.FailureClass != "" || outcome.Reason != "visual_match" {
-		t.Fatalf("outcome = %+v", outcome)
+	result := out.(map[string]any)
+	if result["classification"] != "passed" || result["reason"] != "visual_match" {
+		t.Fatalf("result = %+v", result)
 	}
-	if reader.calls != 1 || reader.version != schedVersionID || reader.evidence != 501 {
-		t.Fatalf("baseline read = calls %d version %d evidence %d", reader.calls, reader.version, reader.evidence)
+	kinds := evidenceKinds(fixture)
+	if len(kinds) != 2 || kinds[0] != execution.EvidenceVisualActual || kinds[1] != execution.EvidenceVisualDiff {
+		t.Fatalf("evidence kinds = %v", kinds)
 	}
-	if comparator.request.Selector != "#receipt" || comparator.request.Threshold != 0.01 ||
-		comparator.request.Viewport.Width != 1280 || comparator.request.Viewport.Height != 720 ||
-		comparator.request.DeviceScaleFactor != 1 ||
-		string(comparator.request.Baseline) != string(visualPNG) {
-		t.Fatalf("comparison request = %+v", comparator.request)
+	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
 	}
-	result := visualResultOf(t, world, run.ID)
-	if result.Verdict != "passed" || result.FailureReason != "" {
-		t.Fatalf("assertion result = %+v", result)
-	}
-
-	if _, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
-	}); err != nil {
-		t.Fatalf("FinishCase passed: %v", err)
+	if finished.Status != execution.CaseRunPassed || finished.Summary.VisualPassed != 1 {
+		t.Fatalf("case_run = %s summary=%+v", finished.Status, finished.Summary)
 	}
 }
 
-// TestVisualAssertContextErrorRecordsNotRun pins the fail-closed context path:
-// when the browser context cannot be created, the assertion is still submitted
-// (not_run with the executor code) so the agent can finish blocked(environment).
-func TestVisualAssertContextErrorRecordsNotRun(t *testing.T) {
-	recorder, world, _, comparator, reader, opts := visualTestWorld(t)
-	opts.ContextError = NewBrowserError("executor_unavailable", "executor is down")
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
-	recordVisualStep(t, recorder, run.ID)
+func TestVisualAssertMismatchFailsApplication(t *testing.T) {
+	fixture, cfg := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
+	baseline := testVisualPNG(t, 100, 100)
+	actual := testVisualPNG(t, 100, 100)
+	fixture.content.open = baseline
+	fixture.visual.hasBaseline = true
+	fixture.visual.baseline = executionapp.VisualBaselineRef{
+		ID: 5001, EvidenceID: 4001, SHA256: shaHex(baseline), SizeBytes: int64(len(baseline)),
+		Width: 100, Height: 100, ConfigRevision: 1,
+	}
+	fixture.browser.result = visualBrowserResult(t, actual, testVisualPNG(t, 100, 100), true, 0.02)
 
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
-	var browserErr *BrowserError
-	if !errors.As(err, &browserErr) || browserErr.Code != "executor_unavailable" {
-		t.Fatalf("error = %v, want the typed executor_unavailable BrowserError", err)
+	out, err := fixture.runner.VisualAssert(context.Background(), p3Scope(), cfg.ID)
+	if err != nil {
+		t.Fatalf("VisualAssert: %v", err)
 	}
-	if outcome.Verdict != "not_run" || outcome.FailureReason != "executor_unavailable" {
-		t.Fatalf("outcome = %+v", outcome)
+	result := out.(map[string]any)
+	if result["classification"] != "failed" || result["reason"] != "visual_mismatch" {
+		t.Fatalf("result = %+v", result)
 	}
-	if comparator.calls != 0 || reader.calls != 0 {
-		t.Fatalf("comparator/baseline calls = %d/%d, want 0/0", comparator.calls, reader.calls)
+	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
 	}
-	if result := visualResultOf(t, world, run.ID); result.Verdict != "not_run" ||
-		result.FailureReason != "executor_unavailable" {
-		t.Fatalf("assertion result = %+v", result)
+	if finished.Status != execution.CaseRunFailed || finished.FailureClass != execution.FailureClassApplication {
+		t.Fatalf("case_run = %s/%s", finished.Status, finished.FailureClass)
 	}
-	if _, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{
-			Verdict: domain.VerdictBlocked, FailureClass: failureClassPointer(domain.FailureClassEnvironment),
-			Reason: "executor_unavailable",
-		},
-	}); err != nil {
-		t.Fatalf("FinishCase blocked(environment): %v", err)
+	if finished.Summary.VisualFailed != 1 {
+		t.Fatalf("visual failed = %d", finished.Summary.VisualFailed)
 	}
 }
 
-// TestVisualAssertIsIdempotent pins the §9.3 idempotency rule: a repeated call
-// replays the recorded outcome instead of comparing again.
-func TestVisualAssertIsIdempotent(t *testing.T) {
-	recorder, world, _, comparator, reader, opts := visualTestWorld(t)
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
+func TestVisualAssertEnvironmentMismatchIsInconclusive(t *testing.T) {
+	fixture, cfg := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
+	baseline := testVisualPNG(t, 100, 100)
+	fixture.content.open = baseline
+	fixture.visual.hasBaseline = true
+	fixture.visual.baseline = executionapp.VisualBaselineRef{
+		ID: 5001, EvidenceID: 4001, SHA256: shaHex(baseline), SizeBytes: int64(len(baseline)),
+		Width: 100, Height: 100, ConfigRevision: 1,
+	}
+	fixture.browser.result = visualBrowserResult(t, testVisualPNG(t, 100, 100), nil, false, 0)
 
-	first, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
+	out, err := fixture.runner.VisualAssert(context.Background(), p3Scope(), cfg.ID)
+	if err != nil {
+		t.Fatalf("VisualAssert: %v", err)
+	}
+	result := out.(map[string]any)
+	if result["classification"] != "inconclusive" || result["reason"] != "visual_environment_mismatch" {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(fixture.visual.recordCalls) != 1 || fixture.visual.recordCalls[0].EnvironmentMatch {
+		t.Fatalf("diff record = %+v", fixture.visual.recordCalls)
+	}
+	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if finished.Status != execution.CaseRunInconclusive || finished.FailureClass != execution.FailureClassEnvironment {
+		t.Fatalf("case_run = %s/%s", finished.Status, finished.FailureClass)
+	}
+}
+
+func TestVisualAssertReplayIsIdempotent(t *testing.T) {
+	fixture, cfg := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
+	actual := testVisualPNG(t, 100, 100)
+	fixture.browser.result = visualBrowserResult(t, actual, nil, true, 0)
+	scope := p3Scope()
+
+	first, err := fixture.runner.VisualAssert(context.Background(), scope, cfg.ID)
 	if err != nil {
 		t.Fatalf("first VisualAssert: %v", err)
 	}
-	second, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
+	second, err := fixture.runner.VisualAssert(context.Background(), scope, cfg.ID)
 	if err != nil {
-		t.Fatalf("second VisualAssert: %v", err)
+		t.Fatalf("replay VisualAssert: %v", err)
 	}
-	if comparator.calls != 1 || reader.calls != 1 {
-		t.Fatalf("comparator/baseline calls = %d/%d, want 1/1", comparator.calls, reader.calls)
+	if second.(map[string]any)["replayed"] != true {
+		t.Fatalf("second call was not a replay: %+v", second)
 	}
-	if !second.Repeated || second.Verdict != first.Verdict ||
-		second.ActualEvidenceID != first.ActualEvidenceID ||
-		second.DiffEvidenceID != first.DiffEvidenceID {
-		t.Fatalf("replayed outcome = %+v, first = %+v", second, first)
+	if first.(map[string]any)["assertion_result_id"] != second.(map[string]any)["assertion_result_id"] {
+		t.Fatalf("replay returned another assertion_result: %+v vs %+v", first, second)
 	}
-	if results := world.assertions.rows[run.ID]; len(results) != 1 {
-		t.Fatalf("assertion results = %d, want 1", len(results))
+	if len(fixture.browser.actions) != 1 {
+		t.Fatalf("executor actions = %v", fixture.browser.actions)
 	}
-}
-
-// TestVisualAssertRejectsNonVisualAssertion keeps the tool scoped to kind=visual.
-func TestVisualAssertRejectsNonVisualAssertion(t *testing.T) {
-	recorder, world, _, comparator, _, opts := visualTestWorld(t)
-	snapshot := visualAssertSnapshot(baselineID(501))
-	snapshot.Assertions[0].Kind = "ui"
-	run := world.seedRunningRun(snapshot)
-
-	_, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
-	wantToolError(t, err, "invalid_arguments", "kind")
-	if comparator.calls != 0 {
-		t.Fatalf("comparator calls = %d, want 0", comparator.calls)
+	if len(fixture.visual.recordCalls) != 1 {
+		t.Fatalf("diff records = %d", len(fixture.visual.recordCalls))
 	}
-	if results := world.assertions.rows[run.ID]; len(results) != 0 {
-		t.Fatalf("rejected assertion wrote a result: %+v", results)
+	if len(fixture.evidence.rows) != 1 {
+		t.Fatalf("evidence rows = %d", len(fixture.evidence.rows))
+	}
+	if len(fixture.results.assertions) != 1 {
+		t.Fatalf("assertion results = %d", len(fixture.results.assertions))
 	}
 }
 
-// TestVisualAssertUnsupportedComparatorFailsClosed ensures a browser adapter
-// that cannot compare visuals never fakes a pass.
-func TestVisualAssertUnsupportedComparatorFailsClosed(t *testing.T) {
-	recorder, world, _, _, _, opts := visualTestWorld(t)
-	opts.Comparator = nil
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
+func TestVisualAssertionNotRunBlocksFalsePass(t *testing.T) {
+	fixture, _ := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
 
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
-	wantToolError(t, err, "unsupported_assertion_kind", "inconclusive(case)")
-	if outcome.Verdict != "not_run" || outcome.FailureClass != string(domain.FailureClassCase) {
-		t.Fatalf("outcome = %+v", outcome)
-	}
-	if result := visualResultOf(t, world, run.ID); result.FailureReason != "unsupported_assertion_kind" {
-		t.Fatalf("assertion result = %+v", result)
-	}
-}
-
-// failingDiffCapture delegates to the real EvidenceService but fails the
-// visual_diff capture, modelling a storage failure after the visual_actual
-// screenshot was already committed.
-type failingDiffCapture struct {
-	inner EvidenceCapturePort
-}
-
-func (f failingDiffCapture) Capture(ctx context.Context, in CaptureInput) (domain.Evidence, error) {
-	if in.Kind == visualDiffEvidenceKind {
-		return domain.Evidence{}, errors.New("evidence store is full")
-	}
-	return f.inner.Capture(ctx, in)
-}
-
-// TestVisualAssertDiffCaptureFailureKeepsEvidenceResultIdsConsistent pins fix
-// round 1 finding 6: when the diff capture fails after the actual screenshot was
-// persisted, the recorded not_run result must reuse the assertion_result id the
-// actual evidence metadata points at, and the actual evidence must be referenced
-// from that result. Otherwise the evidence would reference a result id that was
-// never stored.
-func TestVisualAssertDiffCaptureFailureKeepsEvidenceResultIdsConsistent(t *testing.T) {
-	recorder, world, store, comparator, _, opts := visualTestWorld(t)
-	comparator.result = VisualCompareResult{
-		EnvironmentMatch: true, ActualPNG: visualPNG, DiffPNG: []byte("\x89PNG\r\n\x1a\ndiff"),
-		DiffRatio: 0.02, Width: 1280, Height: 720, ActualWidth: 1280, ActualHeight: 720,
-	}
-	opts.Capture = failingDiffCapture{inner: NewEvidenceService(world.evidence, world.refs, world.batches, store, world.ids)}
-	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
-	recordVisualStep(t, recorder, run.ID)
-
-	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
-	wantToolError(t, err, "internal", "visual_evidence_capture_failed")
-	if outcome.Verdict != "not_run" || outcome.FailureReason != "visual_evidence_capture_failed" {
-		t.Fatalf("outcome = %+v", outcome)
-	}
-
-	result := visualResultOf(t, world, run.ID)
-	if result.Verdict != "not_run" || result.FailureReason != "visual_evidence_capture_failed" {
-		t.Fatalf("assertion result = %+v", result)
-	}
-	actuals := visualEvidenceOf(t, world, run.ID, "visual_actual")
-	if len(actuals) != 1 {
-		t.Fatalf("visual_actual evidence = %d, want 1", len(actuals))
-	}
-	referencedResultID := metadataInt(actuals[0].Metadata["assertion_result_id"])
-	if referencedResultID != int(result.ID) {
-		t.Fatalf("actual evidence references assertion_result %d, persisted result is %d",
-			referencedResultID, result.ID)
-	}
-	if outcome.ActualEvidenceID != actuals[0].ID {
-		t.Fatalf("outcome actual evidence = %d, persisted %d", outcome.ActualEvidenceID, actuals[0].ID)
-	}
-	if diffs := visualEvidenceOf(t, world, run.ID, "visual_diff"); len(diffs) != 0 {
-		t.Fatalf("failed diff capture wrote evidence: %+v", diffs)
-	}
-
-	// The actual screenshot is an artifact of the recorded result, so the
-	// evidence ref must exist even on the diff-failure path.
-	foundRef := false
-	for _, ref := range world.refs.all() {
-		if ref.EvidenceID == actuals[0].ID && ref.RefKind == "assertion_result" && ref.RefID == result.ID {
-			foundRef = true
-		}
-	}
-	if !foundRef {
-		t.Fatalf("no assertion_result ref for evidence %d -> result %d", actuals[0].ID, result.ID)
-	}
-}
-
-// TestReadVisualBaselineKinds pins the execution-side baseline reader: only a
-// screenshot/visual_baseline PNG is comparable; any other artifact is rejected.
-func TestReadVisualBaselineKinds(t *testing.T) {
-	for _, kind := range []string{"screenshot", "visual_baseline"} {
-		recorder, world := newRecorderTest(t)
-		_ = recorder
-		store := &recEvidenceStore{}
-		service := NewEvidenceService(world.evidence, world.refs, world.batches, store, world.ids)
-		evidence := seedVisualEvidence(t, world, store, kind, visualPNG)
-
-		baseline, err := service.ReadVisualBaseline(context.Background(), schedVersionID, evidence.ID)
-		if err != nil {
-			t.Fatalf("kind %q: ReadVisualBaseline: %v", kind, err)
-		}
-		if baseline.Kind != kind || string(baseline.Data) != string(visualPNG) || baseline.EvidenceID != evidence.ID {
-			t.Fatalf("kind %q: baseline = %+v", kind, baseline)
-		}
-	}
-
-	_, world := newRecorderTest(t)
-	store := &recEvidenceStore{}
-	service := NewEvidenceService(world.evidence, world.refs, world.batches, store, world.ids)
-	evidence := seedVisualEvidence(t, world, store, "download", visualPNG)
-	if _, err := service.ReadVisualBaseline(context.Background(), schedVersionID, evidence.ID); err == nil {
-		t.Fatal("a download artifact was accepted as a visual baseline")
-	}
-
-	corrupt := seedVisualEvidence(t, world, store, "screenshot", []byte("not a png"))
-	if _, err := service.ReadVisualBaseline(context.Background(), schedVersionID, corrupt.ID); err == nil {
-		t.Fatal("a non-PNG artifact was accepted as a visual baseline")
-	}
-}
-
-// seedVisualEvidence writes one artifact through the evidence store and records
-// its metadata row (the EvidenceService.Open read path verifies sha256/size).
-func seedVisualEvidence(t *testing.T, world *recWorld, store *recEvidenceStore, kind string, data []byte) domain.Evidence {
-	t.Helper()
-	path := fmt.Sprintf("55/2/%s-%d.png", kind, len(data))
-	storedPath, sum, size, err := store.Write(context.Background(), path, data)
+	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 	if err != nil {
-		t.Fatalf("store.Write: %v", err)
+		t.Fatalf("Finish: %v", err)
 	}
-	caseRunID := int64(2)
-	return world.evidence.seed(domain.Evidence{
-		BatchID:   schedBatchID,
-		CaseRunID: &caseRunID,
-		Kind:      kind,
-		Path:      storedPath,
-		SHA256:    sum,
-		SizeBytes: size,
-		Mime:      "image/png",
-	})
+	if finished.Status != execution.CaseRunInconclusive || finished.Summary.VerdictReason != "visual_assertion_not_run" {
+		t.Fatalf("case_run = %s reason=%s", finished.Status, finished.Summary.VerdictReason)
+	}
+	if finished.Summary.VisualSkipped != 0 || finished.Summary.VisualInconclusive != 1 {
+		t.Fatalf("summary = %+v", finished.Summary)
+	}
 }

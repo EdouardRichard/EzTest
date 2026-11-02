@@ -1,241 +1,158 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import "@testing-library/jest-dom/vitest"
 
-const mocks = vi.hoisted(() => ({
-  listSystems: vi.fn(),
-  createSystem: vi.fn(),
-  updateSystem: vi.fn(),
-  listEnvironments: vi.fn(),
-  createEnvironment: vi.fn(),
-  updateEnvironment: vi.fn(),
-  listAppModels: vi.fn(),
-  importAppModels: vi.fn(),
-  createAppModel: vi.fn(),
-  updateAppModel: vi.fn(),
-  listAccounts: vi.fn(),
-  createAccount: vi.fn(),
-  updateAccount: vi.fn(),
-  listAccesses: vi.fn(),
-  createAccess: vi.fn(),
-  updateAccess: vi.fn(),
-  listSessions: vi.fn(),
-  getSession: vi.fn(),
-  importSession: vi.fn(),
-  validateSession: vi.fn(),
-  confirmSession: vi.fn(),
-  invalidateSession: vi.fn(),
-  revokeSession: vi.fn(),
-  listSnapshots: vi.fn(),
-  requestTakeover: vi.fn(),
-  completeTakeover: vi.fn(),
-  cancelTakeover: vi.fn(),
+import { ApiError } from "@/lib/api-client"
+
+const navigation = vi.hoisted(() => ({
+  push: vi.fn(),
+  replace: vi.fn(),
+  refresh: vi.fn(),
+  back: vi.fn(),
+  forward: vi.fn(),
+  prefetch: vi.fn(),
+}))
+vi.mock("next/navigation", () => ({
+  useRouter: () => navigation,
 }))
 
-const auth = vi.hoisted(() => ({ role: "user" as "user" | "admin" }))
-
-vi.mock("@/features/auth/AuthProvider", () => ({
-  useAuth: () => ({
-    user: { id: 1, username: "qa01", role: auth.role, status: "active" },
-    loading: false,
-    login: vi.fn(),
-    logout: vi.fn(),
-  }),
-}))
-
-vi.mock("./api", () => ({
-  listSystems: mocks.listSystems,
-  createSystem: mocks.createSystem,
-  updateSystem: mocks.updateSystem,
-  listEnvironments: mocks.listEnvironments,
-  createEnvironment: mocks.createEnvironment,
-  updateEnvironment: mocks.updateEnvironment,
-  listAppModels: mocks.listAppModels,
-  importAppModels: mocks.importAppModels,
-  createAppModel: mocks.createAppModel,
-  updateAppModel: mocks.updateAppModel,
-  listAccounts: mocks.listAccounts,
-  createAccount: mocks.createAccount,
-  updateAccount: mocks.updateAccount,
-  listAccesses: mocks.listAccesses,
-  createAccess: mocks.createAccess,
-  updateAccess: mocks.updateAccess,
-  listSessions: mocks.listSessions,
-  getSession: mocks.getSession,
-  importSession: mocks.importSession,
-  validateSession: mocks.validateSession,
-  confirmSession: mocks.confirmSession,
-  invalidateSession: mocks.invalidateSession,
-  revokeSession: mocks.revokeSession,
-  listSnapshots: mocks.listSnapshots,
-  requestTakeover: mocks.requestTakeover,
-  completeTakeover: mocks.completeTakeover,
-  cancelTakeover: mocks.cancelTakeover,
-}))
-
-import { ResourcesPage } from "./ResourcesPage"
-import type { EnvironmentDTO, SessionDTO, SystemDTO } from "./types"
-
-function makeSystem(id: number, key: string, name: string): SystemDTO {
+vi.mock("./api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>()
   return {
-    id,
-    key,
-    name,
-    kind: "web",
-    baseUrl: "http://localhost:13335",
-    defaultSessionTtlSeconds: 3600,
-    notes: "",
-    status: "active",
-    createdAt: "2026-10-27T00:00:00Z",
-    updatedAt: "2026-10-27T00:00:00Z",
+    ...actual,
+    listSuts: vi.fn(),
+    getSut: vi.fn(),
+    listRepositories: vi.fn(),
+    createSutWithDefaultEnvironment: vi.fn(),
+    createEnvironment: vi.fn(),
+    updateEnvironment: vi.fn(),
+    deleteEnvironment: vi.fn(),
+    updateSut: vi.fn(),
+    deleteSut: vi.fn(),
+    createPage: vi.fn(),
+    updatePage: vi.fn(),
+    deletePage: vi.fn(),
+    importPages: vi.fn(),
+    createApi: vi.fn(),
+    updateApi: vi.fn(),
+    deleteApi: vi.fn(),
+    importApis: vi.fn(),
+    createDatabase: vi.fn(),
+    updateDatabase: vi.fn(),
+    deleteDatabase: vi.fn(),
+    createAccount: vi.fn(),
+    updateAccount: vi.fn(),
+    deleteAccount: vi.fn(),
+    createRepository: vi.fn(),
+    updateRepository: vi.fn(),
+    deleteRepository: vi.fn(),
+  }
+})
+
+import * as api from "./api"
+import { parseResourceTab, ResourcesPage } from "./ResourcesPage"
+import {
+  environmentFixture,
+  secondEnvironmentFixture,
+  secondSutFixture,
+  sutFixture,
+  sutListItemFixture,
+} from "./test-fixtures"
+
+function jsonFixtureDetail() {
+  return {
+    ...sutFixture,
+    environments: [
+      { ...secondEnvironmentFixture, id: "1110", is_default: false },
+      { ...environmentFixture, id: "1111", is_default: true },
+    ],
   }
 }
 
-const SHOP = makeSystem(1, "shop", "Shop")
-const BLOG = makeSystem(2, "blog", "Blog")
-
-function makeEnvironment(id: number, systemId: number, name: string): EnvironmentDTO {
-  return {
-    id,
-    systemId,
-    key: `env-${id}`,
-    name,
-    baseUrl: "http://localhost:13335",
-    kind: "staging",
-    isProd: false,
-    allowedHosts: [],
-    loginCheck: null,
-    allowAutoLogin: false,
-    requireApproval: false,
-  }
-}
-
-function makeSession(id: number, state: string): SessionDTO {
-  return {
-    id,
-    accountId: 3,
-    systemId: 1,
-    environmentId: 5,
-    accessId: 11,
-    state,
-    acquisition: "import",
-    storageStateKind: "storage_state",
-    cookieCount: 0,
-    originCount: 0,
-    storageStateHash: "state-hash",
-    expiresAt: "2026-10-28T12:00:00Z",
-    lastValidatedAt: null,
-    lastUsedAt: null,
-    failureReason: "",
-    invalidatedReason: "",
-    expiring: false,
-    latestSnapshot: null,
-    activeLease: null,
-    latestTakeover: null,
-  }
-}
+describe("parseResourceTab", () => {
+  it("normalizes unknown and array query values", () => {
+    expect(parseResourceTab("pages")).toBe("pages")
+    expect(parseResourceTab(["data", "repos"])).toBe("data")
+    expect(parseResourceTab("nope")).toBe("suts")
+    expect(parseResourceTab(undefined)).toBe("suts")
+  })
+})
 
 describe("ResourcesPage", () => {
   beforeEach(() => {
-    for (const mock of Object.values(mocks)) mock.mockReset()
-    auth.role = "user"
-    mocks.listSystems.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
-    mocks.listEnvironments.mockResolvedValue([])
-    mocks.listAppModels.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
-    mocks.listAccounts.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
-    mocks.listAccesses.mockResolvedValue([])
-    mocks.listSessions.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
-    mocks.getSession.mockResolvedValue(makeSession(1, "valid"))
+    vi.mocked(api.listSuts).mockReset()
+    vi.mocked(api.getSut).mockReset()
+    vi.mocked(api.listRepositories).mockReset()
+    vi.mocked(api.listSuts).mockResolvedValue([sutListItemFixture, secondSutFixture])
+    vi.mocked(api.getSut).mockResolvedValue(sutFixture)
+    vi.mocked(api.listRepositories).mockResolvedValue([])
+    navigation.replace.mockReset()
   })
 
-  afterEach(() => {
-    cleanup()
-    window.history.replaceState(null, "", "/")
-  })
+  afterEach(cleanup)
 
-  it("shows the readonly badge and all four tab labels for a normal user", async () => {
-    mocks.listSystems.mockResolvedValue({ items: [SHOP], nextCursor: null, hasMore: false })
+  it("opens the tab from ?tab= and keeps the URL in sync when switching", async () => {
+    render(<ResourcesPage initialTab="pages" />)
 
-    render(<ResourcesPage />)
-
-    expect(await screen.findByText("Shop")).toBeTruthy()
-    expect(screen.getByText("只读")).toBeTruthy()
-    for (const name of ["系统与环境", "应用模型", "账号与访问", "会话"]) {
-      expect(screen.getByRole("tab", { name })).toBeTruthy()
-    }
-    expect(screen.queryByRole("button", { name: "新建系统" })).toBeNull()
-  })
-
-  it("opens the tab named by the ?tab= deep link", async () => {
-    window.history.replaceState(null, "", "/resources?tab=sessions")
-
-    render(<ResourcesPage />)
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "会话" }).getAttribute("aria-selected")).toBe("true"),
+    expect(await screen.findByRole("tab", { name: "页面与 API" })).toHaveAttribute(
+      "aria-selected",
+      "true",
     )
-    expect(await screen.findByRole("heading", { name: "会话" })).toBeTruthy()
-    expect(await screen.findByText("暂无会话")).toBeTruthy()
+    expect(await screen.findByRole("table", { name: "页面列表" })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("tab", { name: "代码仓库" }))
+    expect(navigation.replace).toHaveBeenCalledWith("/resources?tab=repos")
+    expect(await screen.findByRole("button", { name: "新建代码仓" })).toBeInTheDocument()
   })
 
-  it("switches tabs and records the active tab in the URL", async () => {
-    render(<ResourcesPage />)
-    await screen.findByText("暂无系统")
+  it("defaults to the first SUT and its default environment", async () => {
+    render(<ResourcesPage initialTab="data" />)
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "应用模型" }))
-
-    expect(await screen.findByRole("heading", { name: "请选择系统" })).toBeTruthy()
-    await waitFor(() => expect(window.location.search).toContain("tab=app-models"))
+    expect(await screen.findByLabelText("SUT")).toHaveValue("1001")
+    expect(await screen.findByLabelText("环境")).toHaveValue("1101")
+    expect(screen.getByRole("table", { name: "目标库列表" })).toBeInTheDocument()
   })
 
-  it("shows admin write controls without the readonly badge", async () => {
-    auth.role = "admin"
-    mocks.listSystems.mockResolvedValue({ items: [SHOP], nextCursor: null, hasMore: false })
+  it("prefers the environment flagged is_default when none is selected yet", async () => {
+    vi.mocked(api.getSut).mockResolvedValue(jsonFixtureDetail())
+    render(<ResourcesPage initialTab="pages" />)
 
-    render(<ResourcesPage />)
-
-    expect(await screen.findByRole("button", { name: "新建系统" })).toBeTruthy()
-    expect(screen.queryByText("只读")).toBeNull()
+    expect(await screen.findByLabelText("环境")).toHaveValue("1111")
   })
 
-  it("selects the system named by the ?system= deep link and loads its environments", async () => {
-    window.history.replaceState(null, "", "/resources?tab=systems&system=2")
-    mocks.listSystems.mockResolvedValue({
-      items: [SHOP, BLOG],
-      nextCursor: null,
-      hasMore: false,
-    })
-    mocks.listEnvironments.mockResolvedValue([makeEnvironment(5, 2, "Blog 预发")])
+  it("loads another SUT aggregate when the scope selector changes", async () => {
+    vi.mocked(api.getSut).mockImplementation(async (id: string) =>
+      id === "1002" ? secondSutFixture : sutFixture,
+    )
+    render(<ResourcesPage initialTab="pages" />)
+    await screen.findByRole("table", { name: "页面列表" })
 
-    render(<ResourcesPage />)
+    fireEvent.change(screen.getByLabelText("SUT"), { target: { value: "1002" } })
 
-    expect(await screen.findByText("Blog 预发")).toBeTruthy()
-    expect(mocks.listEnvironments).toHaveBeenCalledWith(2)
-    const blogRow = screen.getByRole("button", { name: "Blog" })
-    expect(blogRow.getAttribute("aria-current")).toBe("true")
-
-    fireEvent.click(screen.getByRole("button", { name: "Shop" }))
-    await waitFor(() => expect(window.location.search).toContain("system=1"))
+    await waitFor(() => expect(api.getSut).toHaveBeenCalledWith("1002"))
   })
 
-  it("opens the session named by the ?session= deep link and keeps it in the URL", async () => {
-    window.history.replaceState(null, "", "/resources?tab=sessions&session=2")
-    const session = makeSession(2, "needs_manual")
-    const other = makeSession(1, "valid")
-    mocks.listSessions.mockResolvedValue({
-      items: [other, session],
-      nextCursor: null,
-      hasMore: false,
-    })
-    mocks.getSession.mockImplementation((id: number) => Promise.resolve(id === 1 ? other : session))
+  it("shows the empty SUT state and retries a failed list load", async () => {
+    vi.mocked(api.listSuts).mockResolvedValueOnce([])
+    const { unmount } = render(<ResourcesPage initialTab="suts" />)
+    expect(await screen.findByText("还没有 SUT")).toBeInTheDocument()
+    unmount()
 
-    render(<ResourcesPage />)
+    vi.mocked(api.listSuts)
+      .mockRejectedValueOnce(
+        new ApiError({
+          status: 503,
+          code: "unavailable",
+          message: "资源服务暂不可用",
+          retryable: true,
+        }),
+      )
+      .mockResolvedValueOnce([sutListItemFixture])
+    render(<ResourcesPage initialTab="suts" />)
+    expect(await screen.findByText("资源服务暂不可用")).toBeInTheDocument()
 
-    expect(await screen.findByText("会话 #2")).toBeTruthy()
-    await waitFor(() => expect(mocks.getSession).toHaveBeenCalledWith(2))
-
-    fireEvent.click(await screen.findByRole("button", { name: "查看会话 #1" }))
-
-    await waitFor(() => expect(mocks.getSession).toHaveBeenCalledWith(1))
-    await waitFor(() => expect(window.location.search).toContain("session=1"))
+    fireEvent.click(screen.getByRole("button", { name: "重试" }))
+    expect(await screen.findByRole("table", { name: "SUT 列表" })).toBeInTheDocument()
+    expect(api.listSuts).toHaveBeenCalledTimes(3)
   })
 })

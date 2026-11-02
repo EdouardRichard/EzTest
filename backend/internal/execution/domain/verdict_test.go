@@ -1,498 +1,505 @@
-package domain_test
+package execution
 
-import (
-	"errors"
-	"testing"
+import "testing"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
-)
-
-func failureClassPtr(class domain.FailureClass) *domain.FailureClass {
-	return &class
-}
-
-// finishSnapshot is the canonical two-step, two-assertion case used by the
-// ValidateFinish matrix: step 1 carries a ui assertion, step 2 an api one.
-func finishSnapshot() domain.CaseSnapshot {
-	return domain.CaseSnapshot{
-		Node: domain.CaseSnapshotNode{ID: 7, Title: "下单"},
-		Steps: []domain.CaseSnapshotStep{
-			{Seq: 1, Action: "打开列表", Expected: "列表可见"},
-			{Seq: 2, Action: "提交订单", Expected: "创建成功"},
-		},
-		Assertions: []domain.CaseSnapshotAssertion{
-			{ID: 9, StepSeq: 1, Kind: "ui", Target: "list", Expression: "visible", Expected: "true"},
-			{ID: 10, StepSeq: 2, Kind: "api", Target: "/orders", Expression: "status", Expected: "201"},
-		},
+func caseSnapshotForVerdict(stepSeqs ...int) CaseSnapshot {
+	snapshot := CaseSnapshot{CaseID: 100, CaseVersionID: 200, DefaultVersionSUTID: 500}
+	for _, seq := range stepSeqs {
+		snapshot.Steps = append(snapshot.Steps, CaseStep{Seq: seq, Action: "step", TargetVersionSUTID: 500})
+		snapshot.Assertions = append(snapshot.Assertions, CaseAssertion{
+			StepSeq: seq, AssertionSeq: 1, Kind: "ui", Expected: "expected", TargetVersionSUTID: 500,
+		})
 	}
-}
-
-// finishDBSnapshot adds a db assertion to the canonical case. Since P7 a db
-// assertion is submitted and justified like any other assertion (spec §6.6.2).
-func finishDBSnapshot() domain.CaseSnapshot {
-	snapshot := finishSnapshot()
-	snapshot.Assertions = append(snapshot.Assertions, domain.CaseSnapshotAssertion{
-		ID: 11, StepSeq: 2, Kind: "db", Target: "orders", Expression: "count", Expected: "1",
-	})
 	return snapshot
 }
 
-// finishVisualSnapshot adds a visual assertion to the canonical case. The
-// assertion is submitted as not_run with the §9.3 environment-mismatch reason by
-// visualEnvironmentAssertions.
-func finishVisualSnapshot() domain.CaseSnapshot {
-	snapshot := finishSnapshot()
-	snapshot.Assertions = append(snapshot.Assertions, domain.CaseSnapshotAssertion{
-		ID: 12, StepSeq: 2, Kind: "visual", Target: "#receipt", Expected: "match",
-	})
-	return snapshot
+func passedStep(seq int) StepResult { return StepResult{CaseRunID: 1, Seq: seq, Status: StepPassed} }
+
+func failedAssertion(stepSeq, assertionSeq int, kind string) AssertionResult {
+	return AssertionResult{CaseRunID: 1, StepSeq: stepSeq, AssertionSeq: assertionSeq, Kind: kind, Verdict: AssertionFailed}
 }
 
-// visualEnvironmentAssertions submits the visual assertion of
-// finishVisualSnapshot as not_run with the environment-mismatch reason.
-func visualEnvironmentAssertions() []domain.AssertionResult {
-	return append(passedAssertions(), domain.AssertionResult{
-		AssertionID: 12, Kind: "visual", Verdict: "not_run", FailureReason: "visual_environment_mismatch",
-	})
+func passedAssertion(stepSeq, assertionSeq int, kind string) AssertionResult {
+	return AssertionResult{CaseRunID: 1, StepSeq: stepSeq, AssertionSeq: assertionSeq, Kind: kind, Verdict: AssertionPassed}
 }
 
-func passedSteps() []domain.StepResult {
-	return []domain.StepResult{
-		{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
-		{Seq: 2, Status: domain.StepStatusPassed, EvidenceCount: 1},
+func visualAssertion(stepSeq, assertionSeq int, verdict AssertionVerdict, reason string) AssertionResult {
+	return AssertionResult{
+		CaseRunID: 1, StepSeq: stepSeq, AssertionSeq: assertionSeq, Kind: AssertionKindVisual,
+		Verdict: verdict, Reason: reason,
 	}
 }
 
-func failedSteps() []domain.StepResult {
-	return []domain.StepResult{
-		{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
-		{Seq: 2, Status: domain.StepStatusFailed, EvidenceCount: 1},
-	}
-}
-
-func passedAssertions() []domain.AssertionResult {
-	return []domain.AssertionResult{
-		{AssertionID: 9, Kind: "ui", Verdict: "passed"},
-		{AssertionID: 10, Kind: "api", Verdict: "passed"},
-	}
-}
-
-func failedAssertions() []domain.AssertionResult {
-	return []domain.AssertionResult{
-		{AssertionID: 9, Kind: "ui", Verdict: "passed"},
-		{AssertionID: 10, Kind: "api", Verdict: "failed"},
-	}
-}
-
-// dbPassedAssertions adds the db assertion of finishDBSnapshot as passed.
-func dbPassedAssertions() []domain.AssertionResult {
-	return append(passedAssertions(), domain.AssertionResult{AssertionID: 11, Kind: "db", Verdict: "passed"})
-}
-
-// dbFailedAssertions adds the db assertion of finishDBSnapshot as failed.
-func dbFailedAssertions() []domain.AssertionResult {
-	return append(passedAssertions(), domain.AssertionResult{AssertionID: 11, Kind: "db", Verdict: "failed"})
-}
-
-func withoutEvidence(steps []domain.StepResult) []domain.StepResult {
-	for i := range steps {
-		steps[i].EvidenceCount = 0
-	}
-	return steps
-}
-
-// finishEvidenceCount is the case-run evidence the matrix fixture implies: the
-// evidence artifacts attached to the recorded steps.
-func finishEvidenceCount(steps []domain.StepResult) int {
-	total := 0
-	for _, step := range steps {
-		total += step.EvidenceCount
-	}
-	return total
-}
-
-type finishCase struct {
-	name       string
-	snapshot   domain.CaseSnapshot
-	steps      []domain.StepResult
-	assertions []domain.AssertionResult
-	decision   domain.FinishDecision
-	wantReason string // empty means ValidateFinish must return nil
-}
-
-func passedFinish() domain.FinishDecision {
-	return domain.FinishDecision{Verdict: domain.VerdictPassed}
-}
-
-func TestValidateFinishMatrix(t *testing.T) {
-	tests := []finishCase{
-		{
-			name: "passed with evidence", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(), decision: passedFinish(),
-		},
-		{
-			name: "failed application with failed assertion and evidence", snapshot: finishSnapshot(),
-			steps: failedSteps(), assertions: failedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
-			},
-		},
-		{
-			name: "blocked environment needs no evidence", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictBlocked, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
-			},
-		},
-		{
-			name: "blocked session needs no evidence", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictBlocked, FailureClass: failureClassPtr(domain.FailureClassSession),
-			},
-		},
-		{
-			name: "inconclusive model needs no evidence", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassModel),
-			},
-		},
-		{
-			name: "inconclusive case needs no evidence", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassCase),
-			},
-		},
-		{
-			name: "inconclusive environment from a visual mismatch is admissible", snapshot: finishVisualSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: visualEnvironmentAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
-			},
-		},
-		{
-			name: "db assertion is submitted like any other assertion", snapshot: finishDBSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassCase),
-			},
-		},
-		{
-			name: "passed without evidence", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "evidence_missing",
-		},
-		{
-			name: "failed without evidence", snapshot: finishSnapshot(),
-			steps: withoutEvidence(failedSteps()), assertions: failedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
-			},
-			wantReason: "evidence_missing",
-		},
-		{
-			name: "passed cannot carry a failure class", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictPassed, FailureClass: failureClassPtr(domain.FailureClassCase),
-			},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "failed requires a failure class", snapshot: finishSnapshot(),
-			steps: failedSteps(), assertions: failedAssertions(),
-			decision:   domain.FinishDecision{Verdict: domain.VerdictFailed},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "failed cannot be environment", snapshot: finishSnapshot(),
-			steps: failedSteps(), assertions: failedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
-			},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "blocked cannot be application", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictBlocked, FailureClass: failureClassPtr(domain.FailureClassApplication),
-			},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "blocked requires a failure class", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(),
-			decision:   domain.FinishDecision{Verdict: domain.VerdictBlocked},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "inconclusive cannot be session", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassSession),
-			},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "inconclusive environment requires a visual mismatch", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
-			},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "inconclusive environment without the visual reason is rejected", snapshot: finishVisualSnapshot(),
-			steps: withoutEvidence(passedSteps()),
-			assertions: append(passedAssertions(), domain.AssertionResult{
-				AssertionID: 12, Kind: "visual", Verdict: "not_run", FailureReason: "visual_executor_failed",
-			}),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
-			},
-			wantReason: "invalid_failure_class",
-		},
-		{
-			name: "skipped is not a finish verdict", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(),
-			decision:   domain.FinishDecision{Verdict: domain.Verdict("skipped")},
-			wantReason: "invalid_finish_verdict",
-		},
-		{
-			name: "passed requires every assertion passed", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: failedAssertions(), decision: passedFinish(),
-			wantReason: "verdict_not_justified",
-		},
-		{
-			name: "passed requires every step passed", snapshot: finishSnapshot(),
-			steps: failedSteps(), assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "verdict_not_justified",
-		},
-		{
-			name: "failed requires a failed assertion", snapshot: finishSnapshot(),
-			steps: failedSteps(), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
-			},
-			wantReason: "verdict_not_justified",
-		},
-		{
-			name: "budget exhaustion never fails", snapshot: finishSnapshot(),
-			steps: failedSteps(), assertions: failedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict:      domain.VerdictFailed,
-				FailureClass: failureClassPtr(domain.FailureClassApplication),
-				Reason:       "budget_exhausted",
-			},
-			wantReason: "budget_exhausted",
-		},
-		{
-			name: "budget exhaustion is inconclusive model", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict:      domain.VerdictInconclusive,
-				FailureClass: failureClassPtr(domain.FailureClassModel),
-				Reason:       "budget_exhausted",
-			},
-		},
-		{
-			name: "budget exhaustion is not inconclusive case", snapshot: finishSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict:      domain.VerdictInconclusive,
-				FailureClass: failureClassPtr(domain.FailureClassCase),
-				Reason:       "budget_exhausted",
-			},
-			wantReason: "budget_exhausted",
-		},
-		{
-			name: "missing step result", snapshot: finishSnapshot(),
-			steps: passedSteps()[:1], assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "invalid_step_results",
-		},
-		{
-			name: "steps are not in seq order", snapshot: finishSnapshot(),
-			steps: []domain.StepResult{
-				{Seq: 2, Status: domain.StepStatusPassed, EvidenceCount: 1},
-				{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
-			},
-			assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "invalid_step_results",
-		},
-		{
-			name: "duplicate step result", snapshot: finishSnapshot(),
-			steps: []domain.StepResult{
-				{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
-				{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
-			},
-			assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "invalid_step_results",
-		},
-		{
-			name: "step outside the snapshot", snapshot: finishSnapshot(),
-			steps: []domain.StepResult{
-				{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
-				{Seq: 3, Status: domain.StepStatusPassed, EvidenceCount: 1},
-			},
-			assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "invalid_step_results",
-		},
-		{
-			name: "missing non-db assertion submission", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions()[:1], decision: passedFinish(),
-			wantReason: "invalid_assertion_results",
-		},
-		{
-			name: "duplicate assertion submission", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: append(passedAssertions(), passedAssertions()[0]), decision: passedFinish(),
-			wantReason: "invalid_assertion_results",
-		},
-		{
-			name: "assertion outside the snapshot", snapshot: finishSnapshot(),
-			steps: passedSteps(), assertions: append(passedAssertions(), domain.AssertionResult{
-				AssertionID: 99, Kind: "ui", Verdict: "passed",
-			}), decision: passedFinish(),
-			wantReason: "invalid_assertion_results",
-		},
-		{
-			name: "db assertion passed permits passed", snapshot: finishDBSnapshot(),
-			steps: passedSteps(), assertions: dbPassedAssertions(), decision: passedFinish(),
-		},
-		{
-			name: "db assertion failed permits failed application", snapshot: finishDBSnapshot(),
-			steps: passedSteps(), assertions: dbFailedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
-			},
-		},
-		{
-			name: "db assertion failure permits inconclusive case", snapshot: finishDBSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassCase),
-			},
-		},
-		{
-			name: "db assertion failure permits blocked environment", snapshot: finishDBSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictBlocked, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
-			},
-		},
-		{
-			name: "db assertion failure permits inconclusive model", snapshot: finishDBSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassModel),
-			},
-		},
-		{
-			name: "db assertion failure blocks passed", snapshot: finishDBSnapshot(),
-			steps: passedSteps(), assertions: dbFailedAssertions(), decision: passedFinish(),
-			wantReason: "verdict_not_justified",
-		},
-		{
-			name: "db assertion never submitted", snapshot: finishDBSnapshot(),
-			steps: passedSteps(), assertions: passedAssertions(), decision: passedFinish(),
-			wantReason: "invalid_assertion_results",
-		},
-		{
-			name: "db assertion never submitted for model inconclusive", snapshot: finishDBSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
-			decision: domain.FinishDecision{
-				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassModel),
-			},
-			wantReason: "invalid_assertion_results",
-		},
-		{
-			name: "db assertion submitted twice", snapshot: finishDBSnapshot(),
-			steps: passedSteps(), assertions: append(dbPassedAssertions(), domain.AssertionResult{
-				AssertionID: 11, Kind: "db", Verdict: "passed",
-			}),
-			decision: passedFinish(), wantReason: "invalid_assertion_results",
-		},
-		{
-			name: "db assertion outside the snapshot", snapshot: finishDBSnapshot(),
-			steps: passedSteps(), assertions: append(dbPassedAssertions(), domain.AssertionResult{
-				AssertionID: 12, Kind: "db", Verdict: "passed",
-			}),
-			decision: passedFinish(), wantReason: "invalid_assertion_results",
+func visualCaseSnapshot() CaseSnapshot {
+	return CaseSnapshot{
+		CaseID: 100, CaseVersionID: 200, DefaultVersionSUTID: 500,
+		Steps: []CaseStep{{Seq: 1, Action: "step", TargetVersionSUTID: 500}},
+		Assertions: []CaseAssertion{
+			{StepSeq: 1, AssertionSeq: 1, Kind: "ui", Expected: "expected", TargetVersionSUTID: 500},
+			{StepSeq: 1, AssertionSeq: 2, Kind: "visual", Expected: "expected", TargetVersionSUTID: 500},
 		},
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := domain.ValidateFinish(tt.snapshot, tt.steps, tt.assertions, tt.decision, finishEvidenceCount(tt.steps))
-			if tt.wantReason == "" {
-				if err != nil {
-					t.Fatalf("ValidateFinish returned %v, want nil", err)
-				}
-				return
+func TestAggregateFourStates(t *testing.T) {
+	cases := []struct {
+		name          string
+		in            VerdictInput
+		wantStatus    CaseRunStatus
+		wantClass     FailureClass
+		wantReason    string
+		wantAssertion int
+		wantStep      int
+	}{
+		{
+			name: "all steps and assertions pass",
+			in: VerdictInput{
+				Case:       caseSnapshotForVerdict(1, 2),
+				Steps:      []StepResult{passedStep(1), passedStep(2)},
+				Assertions: []AssertionResult{passedAssertion(1, 1, "ui"), passedAssertion(2, 1, "ui")},
+			},
+			wantStatus:    CaseRunPassed,
+			wantReason:    VerdictReasonPassed,
+			wantAssertion: 2,
+			wantStep:      2,
+		},
+		{
+			name: "failed UI assertion is an application failure",
+			in: VerdictInput{
+				Case:       caseSnapshotForVerdict(1),
+				Steps:      []StepResult{passedStep(1)},
+				Assertions: []AssertionResult{failedAssertion(1, 1, "ui")},
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassApplication,
+			wantReason:    VerdictReasonAssertionFailed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "failed step without candidate maps to automation",
+			in: VerdictInput{
+				Case:  caseSnapshotForVerdict(1),
+				Steps: []StepResult{{CaseRunID: 1, Seq: 1, Status: StepFailed, Error: "target_not_found"}},
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassAutomation,
+			wantReason:    VerdictReasonStepFailed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "failed step keeps a non-application candidate",
+			in: VerdictInput{
+				Case:   caseSnapshotForVerdict(1),
+				Steps:  []StepResult{{CaseRunID: 1, Seq: 1, Status: StepFailed, Error: "connection refused"}},
+				Finish: &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassEnvironment},
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassEnvironment,
+			wantReason:    VerdictReasonStepFailed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "failed step cannot be upgraded to application",
+			in: VerdictInput{
+				Case:   caseSnapshotForVerdict(1),
+				Steps:  []StepResult{{CaseRunID: 1, Seq: 1, Status: StepFailed}},
+				Finish: &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassApplication},
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassAutomation,
+			wantReason:    VerdictReasonStepFailed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "failed assertion may be downgraded to automation",
+			in: VerdictInput{
+				Case:       caseSnapshotForVerdict(1),
+				Steps:      []StepResult{passedStep(1)},
+				Assertions: []AssertionResult{failedAssertion(1, 1, "ui")},
+				Finish:     &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassAutomation},
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassAutomation,
+			wantReason:    VerdictReasonAssertionFailed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "missing required step is inconclusive",
+			in: VerdictInput{
+				Case:       caseSnapshotForVerdict(1, 2),
+				Steps:      []StepResult{passedStep(1)},
+				Assertions: []AssertionResult{passedAssertion(1, 1, "ui")},
+			},
+			wantStatus:    CaseRunInconclusive,
+			wantReason:    VerdictReasonIncomplete,
+			wantAssertion: 2,
+			wantStep:      2,
+		},
+		{
+			name: "case without steps is inconclusive",
+			in: VerdictInput{
+				Case: caseSnapshotForVerdict(),
+			},
+			wantStatus: CaseRunInconclusive,
+			wantReason: VerdictReasonEmptyCase,
+		},
+		{
+			name: "candidate blocked before any result is blocked",
+			in: VerdictInput{
+				Case:   caseSnapshotForVerdict(1),
+				Finish: &FinishCandidate{Verdict: CaseRunBlocked, FailureClass: FailureClassBlocked},
+			},
+			wantStatus:    CaseRunBlocked,
+			wantClass:     FailureClassBlocked,
+			wantReason:    VerdictReasonBlocked,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "blocked step is blocked",
+			in: VerdictInput{
+				Case:  caseSnapshotForVerdict(1),
+				Steps: []StepResult{{CaseRunID: 1, Seq: 1, Status: StepBlocked, Error: "missing account"}},
+			},
+			wantStatus:    CaseRunBlocked,
+			wantClass:     FailureClassBlocked,
+			wantReason:    VerdictReasonBlocked,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "agent model failure is failed model",
+			in: VerdictInput{
+				Case:         caseSnapshotForVerdict(1),
+				AgentFailure: FailureClassModel,
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassModel,
+			wantReason:    VerdictReasonAgentFailure,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "agent executor loss is interrupted",
+			in: VerdictInput{
+				Case:         caseSnapshotForVerdict(1),
+				AgentFailure: FailureClassExecutorLost,
+			},
+			wantStatus:    CaseRunInterrupted,
+			wantClass:     FailureClassExecutorLost,
+			wantReason:    VerdictReasonAgentFailure,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "finish passed is overwritten by a failed step",
+			in: VerdictInput{
+				Case:   caseSnapshotForVerdict(1),
+				Steps:  []StepResult{{CaseRunID: 1, Seq: 1, Status: StepFailed}},
+				Finish: &FinishCandidate{Verdict: CaseRunPassed},
+			},
+			wantStatus:    CaseRunFailed,
+			wantClass:     FailureClassAutomation,
+			wantReason:    VerdictReasonStepFailed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "application candidate without assertion or observed evidence is inconclusive",
+			in: VerdictInput{
+				Case:   caseSnapshotForVerdict(1),
+				Finish: &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassApplication},
+			},
+			wantStatus:    CaseRunInconclusive,
+			wantReason:    VerdictReasonIncomplete,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+		{
+			name: "passed finish candidate with complete green results stays passed",
+			in: VerdictInput{
+				Case:       caseSnapshotForVerdict(1),
+				Steps:      []StepResult{passedStep(1)},
+				Assertions: []AssertionResult{passedAssertion(1, 1, "text")},
+				Finish:     &FinishCandidate{Verdict: CaseRunPassed},
+			},
+			wantStatus:    CaseRunPassed,
+			wantReason:    VerdictReasonPassed,
+			wantAssertion: 1,
+			wantStep:      1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, class, summary, err := Aggregate(tc.in)
+			if err != nil {
+				t.Fatalf("Aggregate returned error: %v", err)
 			}
-			requireFinishReason(t, err, tt.wantReason)
+			if status != tc.wantStatus || class != tc.wantClass {
+				t.Fatalf("got status=%s class=%s, want status=%s class=%s", status, class, tc.wantStatus, tc.wantClass)
+			}
+			if summary.VerdictReason != tc.wantReason {
+				t.Fatalf("got verdict reason %q, want %q", summary.VerdictReason, tc.wantReason)
+			}
+			if summary.VisualSkipped != 0 {
+				t.Fatalf("visual skipped = %d, want 0 (P5 removed the false pass)", summary.VisualSkipped)
+			}
+			if summary.AssertionTotal != tc.wantAssertion {
+				t.Fatalf("got assertion total %d, want %d", summary.AssertionTotal, tc.wantAssertion)
+			}
+			if summary.StepTotal != tc.wantStep {
+				t.Fatalf("got step total %d, want %d", summary.StepTotal, tc.wantStep)
+			}
 		})
 	}
 }
 
-func requireFinishReason(t *testing.T, err error, want string) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("ValidateFinish returned nil, want reason %q", want)
+func TestAggregateVisualAssertions(t *testing.T) {
+	cases := []struct {
+		name             string
+		assertions       []AssertionResult
+		wantStatus       CaseRunStatus
+		wantClass        FailureClass
+		wantReason       string
+		wantVisualPassed int
+		wantVisualFailed int
+		wantVisualIncon  int
+	}{
+		{
+			name: "passed visual assertion keeps the case green",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+				visualAssertion(1, 2, AssertionPassed, "visual_match"),
+			},
+			wantStatus:       CaseRunPassed,
+			wantReason:       VerdictReasonPassed,
+			wantVisualPassed: 1,
+		},
+		{
+			name: "failed visual assertion fails the application",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+				visualAssertion(1, 2, AssertionFailed, "visual_mismatch"),
+			},
+			wantStatus:       CaseRunFailed,
+			wantClass:        FailureClassApplication,
+			wantReason:       VerdictReasonAssertionFailed,
+			wantVisualFailed: 1,
+		},
+		{
+			name: "visual assertion that never ran blocks a false pass",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+			},
+			wantStatus:      CaseRunInconclusive,
+			wantReason:      VerdictReasonVisualAssertionNotRun,
+			wantVisualIncon: 1,
+		},
+		{
+			name: "legacy skipped visual assertion counts as not run",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+				visualAssertion(1, 2, AssertionSkipped, ""),
+			},
+			wantStatus:      CaseRunInconclusive,
+			wantReason:      VerdictReasonVisualAssertionNotRun,
+			wantVisualIncon: 1,
+		},
+		{
+			name: "missing baseline is inconclusive case",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+				visualAssertion(1, 2, AssertionInconclusive, "missing_visual_baseline"),
+			},
+			wantStatus:      CaseRunInconclusive,
+			wantReason:      "missing_visual_baseline",
+			wantVisualIncon: 1,
+		},
+		{
+			name: "environment mismatch is inconclusive environment",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+				visualAssertion(1, 2, AssertionInconclusive, "visual_environment_mismatch"),
+			},
+			wantStatus:      CaseRunInconclusive,
+			wantClass:       FailureClassEnvironment,
+			wantReason:      "visual_environment_mismatch",
+			wantVisualIncon: 1,
+		},
+		{
+			name: "config change is inconclusive case",
+			assertions: []AssertionResult{
+				passedAssertion(1, 1, "ui"),
+				visualAssertion(1, 2, AssertionInconclusive, "visual_config_changed"),
+			},
+			wantStatus:      CaseRunInconclusive,
+			wantReason:      "visual_config_changed",
+			wantVisualIncon: 1,
+		},
 	}
-	var reasonErr *domain.ReasonError
-	if !errors.As(err, &reasonErr) {
-		t.Fatalf("ValidateFinish error type = %T, want *domain.ReasonError", err)
-	}
-	if reasonErr.Reason != want {
-		t.Fatalf("ValidateFinish reason = %q, want %q (%v)", reasonErr.Reason, want, err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, class, summary, err := Aggregate(VerdictInput{
+				Case:       visualCaseSnapshot(),
+				Steps:      []StepResult{passedStep(1)},
+				Assertions: tc.assertions,
+			})
+			if err != nil {
+				t.Fatalf("Aggregate: %v", err)
+			}
+			if status != tc.wantStatus || class != tc.wantClass || summary.VerdictReason != tc.wantReason {
+				t.Fatalf("got %s/%s reason=%q, want %s/%s reason=%q",
+					status, class, summary.VerdictReason, tc.wantStatus, tc.wantClass, tc.wantReason)
+			}
+			if summary.VisualPassed != tc.wantVisualPassed ||
+				summary.VisualFailed != tc.wantVisualFailed ||
+				summary.VisualInconclusive != tc.wantVisualIncon {
+				t.Fatalf("visual counts = %d/%d/%d, want %d/%d/%d",
+					summary.VisualPassed, summary.VisualFailed, summary.VisualInconclusive,
+					tc.wantVisualPassed, tc.wantVisualFailed, tc.wantVisualIncon)
+			}
+			if summary.VisualSkipped != 0 {
+				t.Fatalf("visual skipped = %d, want 0", summary.VisualSkipped)
+			}
+		})
 	}
 }
 
-func TestValidateFinishRequiresEvidenceForPassed(t *testing.T) {
-	requireFinishReason(t, domain.ValidateFinish(
-		finishSnapshot(), withoutEvidence(passedSteps()), passedAssertions(), passedFinish(), 0,
-	), "evidence_missing")
-}
-
-// TestValidateFinishCountsDBAssertionEvidence pins spec §6.6.2's evidence rule:
-// passed/failed require at least one evidence artifact and db evidence counts.
-// The evidence argument is the case run's evidence total, not the step-only
-// count, so an assertion/db artifact satisfies the gate with zero step evidence.
-func TestValidateFinishCountsDBAssertionEvidence(t *testing.T) {
-	steps := withoutEvidence(passedSteps())
-	if err := domain.ValidateFinish(
-		finishDBSnapshot(), steps, dbPassedAssertions(), passedFinish(), 1,
-	); err != nil {
-		t.Fatalf("ValidateFinish with db evidence returned %v, want nil", err)
+func TestAggregateCountsFailures(t *testing.T) {
+	in := VerdictInput{
+		Case: caseSnapshotForVerdict(1, 2),
+		Steps: []StepResult{
+			{CaseRunID: 1, Seq: 1, Status: StepPassed},
+			{CaseRunID: 1, Seq: 2, Status: StepFailed},
+		},
+		Assertions: []AssertionResult{
+			{CaseRunID: 1, StepSeq: 1, AssertionSeq: 1, Kind: "ui", Verdict: AssertionPassed},
+			{CaseRunID: 1, StepSeq: 2, AssertionSeq: 1, Kind: "ui", Verdict: AssertionFailed},
+			{CaseRunID: 1, StepSeq: 2, AssertionSeq: 2, Kind: "api", Verdict: AssertionFailed},
+		},
 	}
-
-	requireFinishReason(t, domain.ValidateFinish(
-		finishDBSnapshot(), withoutEvidence(passedSteps()), dbPassedAssertions(), passedFinish(), 0,
-	), "evidence_missing")
-
-	// failed is subject to the same gate.
-	requireFinishReason(t, domain.ValidateFinish(
-		finishDBSnapshot(), withoutEvidence(passedSteps()), dbFailedAssertions(),
-		domain.FinishDecision{
-			Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
-		}, 0,
-	), "evidence_missing")
+	status, class, summary, err := Aggregate(in)
+	if err != nil {
+		t.Fatalf("Aggregate error: %v", err)
+	}
+	if status != CaseRunFailed || class != FailureClassApplication {
+		t.Fatalf("got %s/%s", status, class)
+	}
+	if summary.AssertionFailed != 2 || summary.StepFailed != 1 {
+		t.Fatalf("got assertion_failed=%d step_failed=%d", summary.AssertionFailed, summary.StepFailed)
+	}
 }
 
-// TestValidateFinishRequiresDBAssertion pins the P7 rule (spec §6.6.2): a db
-// assertion is an ordinary assertion for the finish gate. It must be submitted
-// exactly once, and an all-passed submission including it is admissible.
-func TestValidateFinishRequiresDBAssertion(t *testing.T) {
-	requireFinishReason(t, domain.ValidateFinish(
-		finishDBSnapshot(), passedSteps(), passedAssertions(), passedFinish(), finishEvidenceCount(passedSteps()),
-	), "invalid_assertion_results")
+func TestAggregateRejectsInvalidFinishStatus(t *testing.T) {
+	in := VerdictInput{
+		Case:   caseSnapshotForVerdict(1),
+		Finish: &FinishCandidate{Verdict: CaseRunStatus("bogus")},
+	}
+	if _, _, _, err := Aggregate(in); err == nil {
+		t.Fatal("invalid finish verdict must be rejected")
+	}
+}
 
-	if err := domain.ValidateFinish(
-		finishDBSnapshot(), passedSteps(), dbPassedAssertions(), passedFinish(), finishEvidenceCount(passedSteps()),
-	); err != nil {
-		t.Fatalf("ValidateFinish with the db assertion passed returned %v, want nil", err)
+func TestVisualMissingBaselineBlockedStepIsInconclusive(t *testing.T) {
+	in := VerdictInput{
+		Case: visualCaseSnapshot(),
+		Steps: []StepResult{
+			{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline: no approved baseline available"},
+		},
+		Assertions: []AssertionResult{
+			passedAssertion(1, 1, "ui"),
+			visualAssertion(1, 2, AssertionInconclusive, "missing_visual_baseline"),
+		},
+	}
+	status, class, summary, err := Aggregate(in)
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	if status != CaseRunInconclusive || class != "" || summary.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("got %s/%s reason=%q", status, class, summary.VerdictReason)
+	}
+	if summary.VisualInconclusive != 1 {
+		t.Fatalf("visual inconclusive = %d", summary.VisualInconclusive)
+	}
+}
+
+func TestVisualResultOverridesAgentBlocked(t *testing.T) {
+	in := VerdictInput{
+		Case:         visualCaseSnapshot(),
+		AgentFailure: FailureClassBlocked,
+		Steps:        []StepResult{{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline"}},
+		Assertions: []AssertionResult{
+			passedAssertion(1, 1, "ui"),
+			visualAssertion(1, 2, AssertionInconclusive, "missing_visual_baseline"),
+		},
+	}
+	status, class, summary, err := Aggregate(in)
+	if err != nil || status != CaseRunInconclusive || class != "" || summary.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("got %s/%s reason=%q err=%v", status, class, summary.VerdictReason, err)
+	}
+}
+
+func TestVisualEnvironmentOverridesAgentFailure(t *testing.T) {
+	in := VerdictInput{
+		Case:         visualCaseSnapshot(),
+		AgentFailure: FailureClassEnvironment,
+		Steps:        []StepResult{{Seq: 1, Status: StepFailed}},
+		Assertions: []AssertionResult{
+			passedAssertion(1, 1, "ui"),
+			visualAssertion(1, 2, AssertionInconclusive, "visual_environment_mismatch"),
+		},
+	}
+	status, class, summary, err := Aggregate(in)
+	if err != nil || status != CaseRunInconclusive || class != FailureClassEnvironment || summary.VerdictReason != "visual_environment_mismatch" {
+		t.Fatalf("got %s/%s reason=%q err=%v", status, class, summary.VerdictReason, err)
+	}
+}
+
+func TestNormalizeVisualStepsClearsBlockedStep(t *testing.T) {
+	steps := NormalizeVisualSteps(
+		[]StepResult{{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline: no baseline"}},
+		[]AssertionResult{visualAssertion(1, 1, AssertionInconclusive, "missing_visual_baseline")},
+	)
+	if len(steps) != 1 || steps[0].Status != StepPassed || steps[0].Error != "" {
+		t.Fatalf("steps = %+v", steps)
+	}
+}
+
+func TestApplyVisualOutcomeOverridesBlocked(t *testing.T) {
+	summary := CaseRunSummary{VerdictReason: VerdictReasonBlocked, VisualInconclusive: 1}
+	status, class, got := ApplyVisualOutcome(CaseRunBlocked, FailureClassBlocked, summary, []AssertionResult{
+		visualAssertion(1, 1, AssertionInconclusive, "missing_visual_baseline"),
+	})
+	if status != CaseRunInconclusive || class != "" || got.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("got %s/%s reason=%q", status, class, got.VerdictReason)
+	}
+}
+
+func TestApplyVisualOutcomeOverridesFailedEnvironment(t *testing.T) {
+	summary := CaseRunSummary{VerdictReason: VerdictReasonStepFailed, VisualInconclusive: 1}
+	status, class, got := ApplyVisualOutcome(CaseRunFailed, FailureClassEnvironment, summary, []AssertionResult{
+		visualAssertion(1, 1, AssertionInconclusive, "visual_environment_mismatch"),
+	})
+	if status != CaseRunInconclusive || class != FailureClassEnvironment || got.VerdictReason != "visual_environment_mismatch" {
+		t.Fatalf("got %s/%s reason=%q", status, class, got.VerdictReason)
+	}
+}
+
+func TestAggregateFailedStepDoesNotUpgradeToApplication(t *testing.T) {
+	in := VerdictInput{
+		Case: caseSnapshotForVerdict(1),
+		Steps: []StepResult{
+			{CaseRunID: 1, Seq: 1, Status: StepFailed, Observed: map[string]any{"output": "boom"}},
+		},
+		Finish: &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassApplication},
+	}
+	status, class, _, err := Aggregate(in)
+	if err != nil || status != CaseRunFailed || class != FailureClassAutomation {
+		t.Fatalf("got %s/%s err=%v", status, class, err)
 	}
 }

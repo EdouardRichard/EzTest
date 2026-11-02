@@ -9,8 +9,9 @@ export type AuthStatus = "active" | "disabled"
 
 /** The public account shape returned by the API. Never contains secrets. */
 export type AuthUser = {
-  id: number
+  id: string
   username: string
+  display_name: string
   role: AuthRole
   status: AuthStatus
 }
@@ -37,7 +38,7 @@ function write(key: string, value: string): void {
     getStorage()?.setItem(key, value)
   } catch {
     // Storage can be unavailable or full (private mode). The in-memory auth
-    // state still works for the current page; the next reload will sign out.
+    // state still works for the current page; the next reload signs the user out.
   }
 }
 
@@ -47,6 +48,12 @@ function remove(key: string): void {
   } catch {
     // Ignore storage failures: there is nothing else to clean up.
   }
+}
+
+function readId(value: unknown): string | null {
+  if (typeof value === "string" && value.trim().length > 0) return value
+  if (typeof value === "number" && Number.isFinite(value)) return String(value)
+  return null
 }
 
 /** Reads the bearer token from sessionStorage (never from a URL or log). */
@@ -70,30 +77,42 @@ export function clearToken(): void {
   }
 }
 
-export function getStoredUser(): AuthUser | null {
-  const raw = read(USER_KEY)
-  if (!raw) return null
+/**
+ * Validates and normalizes an API account payload into the public AuthUser
+ * shape. Login and /me responses reuse it so every session has one shape.
+ */
+export function toAuthUser(value: unknown): AuthUser | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null
+  const candidate = value as Record<string, unknown>
+  const id = readId(candidate.id)
+  const username = candidate.username
+  const role = candidate.role
+  const status = candidate.status
+  if (typeof username !== "string" || username.length === 0) return null
+  if (id === null) return null
+  if (role !== "admin" && role !== "user") return null
+  if (status !== "active" && status !== "disabled") return null
+  const displayName =
+    typeof candidate.display_name === "string" && candidate.display_name.length > 0
+      ? candidate.display_name
+      : username
+  return { id, username, display_name: displayName, role, status }
+}
+
+function parseUser(raw: string): AuthUser | null {
+  let parsed: unknown
   try {
-    const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== "object" || parsed === null) return null
-    const candidate = parsed as Partial<AuthUser>
-    if (
-      typeof candidate.id !== "number" ||
-      typeof candidate.username !== "string" ||
-      (candidate.role !== "admin" && candidate.role !== "user") ||
-      (candidate.status !== "active" && candidate.status !== "disabled")
-    ) {
-      return null
-    }
-    return {
-      id: candidate.id,
-      username: candidate.username,
-      role: candidate.role,
-      status: candidate.status,
-    }
+    parsed = JSON.parse(raw)
   } catch {
     return null
   }
+  return toAuthUser(parsed)
+}
+
+export function getStoredUser(): AuthUser | null {
+  const raw = read(USER_KEY)
+  if (!raw) return null
+  return parseUser(raw)
 }
 
 export function setStoredUser(user: AuthUser): void {

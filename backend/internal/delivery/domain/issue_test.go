@@ -1,350 +1,350 @@
-package domain
+package delivery
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"reflect"
-	"strings"
 	"testing"
-	"time"
 )
 
-// issueTestDedupeKey returns a deterministic 64-hex dedupe key.
-func issueTestDedupeKey(seed string) string {
-	sum := sha256.Sum256([]byte(seed))
-	return hex.EncodeToString(sum[:])
-}
+func int64Pointer(value int64) *int64 { return &value }
 
-// issueTestValidDraft is a complete AI defect draft every test can mutate.
-func issueTestValidDraft() IssueDraft {
-	caseNodeID := int64(9001)
-	caseRunID := int64(777)
-	return IssueDraft{
-		DedupeKey:    issueTestDedupeKey("defect"),
-		Title:        "登录按钮无响应",
-		Description:  "点击登录后页面停留在原处",
-		ReproSteps:   "1. 打开登录页\n2. 点击登录",
-		Expected:     "进入首页",
-		Actual:       "页面无变化",
-		Severity:     SeverityMajor,
-		Confidence:   ConfidenceHigh,
-		Category:     CategoryDefect,
-		FailureClass: FailureClassApplication,
-		CaseRunID:    &caseRunID,
-		CaseNodeID:   &caseNodeID,
-		EvidenceIDs:  []int64{31},
+func TestIssueStatusTransitionTable(t *testing.T) {
+	allowed := []struct{ from, to IssueStatus }{
+		{IssueStatusOpen, IssueStatusConfirmed},
+		{IssueStatusOpen, IssueStatusDismissed},
+		{IssueStatusOpen, IssueStatusMerged},
+		{IssueStatusConfirmed, IssueStatusOpen},
+		{IssueStatusConfirmed, IssueStatusMerged},
+		{IssueStatusDismissed, IssueStatusOpen},
+		{IssueStatusDismissed, IssueStatusMerged},
+	}
+	for _, tc := range allowed {
+		if !CanTransitionIssue(tc.from, tc.to) {
+			t.Errorf("%s -> %s must be allowed", tc.from, tc.to)
+		}
+	}
+
+	rejected := []struct{ from, to IssueStatus }{
+		{IssueStatusOpen, IssueStatusOpen},
+		{IssueStatusConfirmed, IssueStatusConfirmed},
+		{IssueStatusDismissed, IssueStatusDismissed},
+		{IssueStatusMerged, IssueStatusMerged},
+		{IssueStatusConfirmed, IssueStatusDismissed},
+		{IssueStatusDismissed, IssueStatusConfirmed},
+		{IssueStatusMerged, IssueStatusOpen},
+		{IssueStatusMerged, IssueStatusConfirmed},
+		{IssueStatusMerged, IssueStatusDismissed},
+		{IssueStatus("unknown"), IssueStatusOpen},
+		{IssueStatusOpen, IssueStatus("unknown")},
+		{IssueStatus(""), IssueStatusOpen},
+	}
+	for _, tc := range rejected {
+		if CanTransitionIssue(tc.from, tc.to) {
+			t.Errorf("%s -> %s must be rejected", tc.from, tc.to)
+		}
 	}
 }
 
-// issueTestRequirementGapDraft is a complete AI requirement-gap draft without a
-// case (spec §5.4: a requirement gap must reference a requirement, a case is
-// optional).
-func issueTestRequirementGapDraft() IssueDraft {
-	requirementID := int64(55)
-	return IssueDraft{
-		DedupeKey:      issueTestDedupeKey("requirement-gap"),
-		Title:          "缺少密码找回需求",
-		Severity:       SeverityMajor,
-		Confidence:     ConfidenceMedium,
-		Category:       CategoryRequirementGap,
-		RequirementIDs: []int64{requirementID},
+func TestIssueMergedTerminal(t *testing.T) {
+	for _, to := range []IssueStatus{
+		IssueStatusOpen, IssueStatusConfirmed, IssueStatusDismissed, IssueStatusMerged,
+	} {
+		if CanTransitionIssue(IssueStatusMerged, to) {
+			t.Errorf("merged is terminal in P4, but merged -> %s was allowed", to)
+		}
 	}
 }
 
-// issueTestInvalid asserts err is an invalid domain error with reason.
-func issueTestInvalid(t *testing.T, err error, reason string) {
+func requireMergeReason(t *testing.T, err error, want string) {
 	t.Helper()
 	if err == nil {
-		t.Fatal("expected an error, got nil")
+		t.Fatalf("merge error = nil, want a %q state conflict", want)
 	}
-	var domainErr *Error
-	if !errors.As(err, &domainErr) {
-		t.Fatalf("error type = %T, want *Error", err)
+	if !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("merge error = %v, want errors.Is(ErrStateConflict)", err)
 	}
-	if domainErr.Kind != KindInvalid {
-		t.Fatalf("error kind = %q, want %q (%v)", domainErr.Kind, KindInvalid, err)
+	var mergeErr *MergeError
+	if !errors.As(err, &mergeErr) {
+		t.Fatalf("merge error = %v, want a *MergeError with reason %q", err, want)
 	}
-	if domainErr.Reason != reason {
-		t.Fatalf("error reason = %q, want %q (%v)", domainErr.Reason, reason, err)
+	if mergeErr.Reason != want {
+		t.Fatalf("merge reason = %q, want %q", mergeErr.Reason, want)
 	}
 }
 
-func TestIssueStateTransitions(t *testing.T) {
-	cases := []struct {
-		from, to string
-		want     bool
-	}{
-		{StatusOpen, StatusConfirmed, true},
-		{StatusOpen, StatusDismissed, true},
-		{StatusOpen, StatusOpen, false},
-		{StatusConfirmed, StatusDismissed, false},
-		{StatusConfirmed, StatusOpen, false},
-		{StatusDismissed, StatusConfirmed, false},
-		{StatusDismissed, StatusOpen, false},
-	}
-	for _, tc := range cases {
-		if got := CanTransition(tc.from, tc.to); got != tc.want {
-			t.Errorf("CanTransition(%q, %q) = %v, want %v", tc.from, tc.to, got, tc.want)
+// mergeChainLookup builds a lookup for nodes consecutive non-merged issues
+// starting at firstID, each pointing at the next. The last node points at
+// terminalID when it is positive and otherwise ends the chain. The target's
+// own first link to firstID is counted in addition to these nodes.
+func mergeChainLookup(firstID int64, nodes int, terminalID int64) func(int64) (Issue, bool) {
+	chain := make(map[int64]Issue, nodes)
+	for offset := 0; offset < nodes; offset++ {
+		id := firstID + int64(offset)
+		node := Issue{ID: id, VersionID: 7, Status: IssueStatusConfirmed}
+		switch {
+		case offset < nodes-1:
+			node.MergedIntoID = int64Pointer(id + 1)
+		case terminalID > 0:
+			node.MergedIntoID = int64Pointer(terminalID)
 		}
+		chain[id] = node
 	}
-	for _, status := range []string{StatusOpen, StatusConfirmed, StatusDismissed} {
-		want := status != StatusOpen
-		if got := IsTerminalStatus(status); got != want {
-			t.Errorf("IsTerminalStatus(%q) = %v, want %v", status, got, want)
-		}
-	}
-	if IsTerminalStatus("bogus") {
-		t.Error("IsTerminalStatus(bogus) = true, want false")
+	return func(id int64) (Issue, bool) {
+		node, ok := chain[id]
+		return node, ok
 	}
 }
 
-func TestConfidenceRank(t *testing.T) {
-	if ConfidenceRank(ConfidenceHigh) <= ConfidenceRank(ConfidenceMedium) {
-		t.Fatal("high confidence must outrank medium")
-	}
-	if ConfidenceRank(ConfidenceMedium) <= ConfidenceRank(ConfidenceLow) {
-		t.Fatal("medium confidence must outrank low")
-	}
-	if ConfidenceRank("bogus") != 0 {
-		t.Fatalf("ConfidenceRank(bogus) = %d, want 0", ConfidenceRank("bogus"))
-	}
-}
+func TestIssueValidateMerge(t *testing.T) {
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusOpen}
+	target := Issue{ID: 20, VersionID: 7, Status: IssueStatusConfirmed}
 
-func TestValidateIssueRef(t *testing.T) {
-	valid := []struct {
-		kind, id string
-	}{
-		{RefKindCaseRun, "777"},
-		{RefKindCaseNode, "9001"},
-		{RefKindStepResult, "12"},
-		{RefKindEvidence, "31"},
-		{RefKindRequirement, "55"},
-		{RefKindBatch, "700"},
-		{RefKindCodeAnchor, "123"},
-		{RefKindCommit, strings.Repeat("a", 40)},
+	if err := ValidateMerge(source, target, nil); err != nil {
+		t.Fatalf("valid merge rejected: %v", err)
 	}
-	for _, tc := range valid {
-		if err := ValidateIssueRef(tc.kind, tc.id); err != nil {
-			t.Errorf("ValidateIssueRef(%q, %q) = %v, want nil", tc.kind, tc.id, err)
+	for _, status := range []IssueStatus{IssueStatusConfirmed, IssueStatusDismissed, IssueStatusOpen} {
+		candidate := source
+		candidate.Status = status
+		if err := ValidateMerge(candidate, target, nil); err != nil {
+			t.Fatalf("%s -> merged rejected: %v", status, err)
 		}
 	}
 
-	invalid := []struct {
-		kind, id string
-	}{
-		{"bogus", "1"},
-		{RefKindCaseRun, ""},
-		{RefKindCaseRun, "0"},
-		{RefKindCaseRun, "-3"},
-		{RefKindCaseRun, "abc"},
-		{RefKindEvidence, "12.5"},
-		{RefKindCommit, strings.Repeat("A", 40)},
-		{RefKindCommit, strings.Repeat("a", 39)},
-		{RefKindCommit, "z" + strings.Repeat("a", 39)},
+	selfTarget := target
+	selfTarget.ID = source.ID
+	requireMergeReason(t, ValidateMerge(source, selfTarget, nil), MergeReasonTargetInvalid)
+
+	crossVersion := target
+	crossVersion.VersionID = source.VersionID + 1
+	requireMergeReason(t, ValidateMerge(source, crossVersion, nil), MergeReasonTargetInvalid)
+
+	alreadyMerged := target
+	alreadyMerged.Status = IssueStatusMerged
+	requireMergeReason(t, ValidateMerge(source, alreadyMerged, nil), MergeReasonTargetInvalid)
+
+	invalidTargetStatus := target
+	invalidTargetStatus.Status = IssueStatus("unknown")
+	requireMergeReason(t, ValidateMerge(source, invalidTargetStatus, nil), MergeReasonTargetInvalid)
+
+	directCycle := target
+	directCycle.MergedIntoID = int64Pointer(source.ID)
+	requireMergeReason(t, ValidateMerge(source, directCycle, nil), MergeReasonCycle)
+
+	indirectCycle := target
+	indirectCycle.MergedIntoID = int64Pointer(30)
+	middle := Issue{ID: 30, VersionID: 7, Status: IssueStatusConfirmed, MergedIntoID: int64Pointer(source.ID)}
+	lookup := func(id int64) (Issue, bool) {
+		if id == middle.ID {
+			return middle, true
+		}
+		return Issue{}, false
 	}
-	for _, tc := range invalid {
-		issueTestInvalid(t, ValidateIssueRef(tc.kind, tc.id), ReasonIssueRefInvalid)
+	requireMergeReason(t, ValidateMerge(source, indirectCycle, lookup), MergeReasonCycle)
+
+	brokenChain := target
+	brokenChain.MergedIntoID = int64Pointer(99)
+	requireMergeReason(t, ValidateMerge(source, brokenChain, func(int64) (Issue, bool) {
+		return Issue{}, false
+	}), MergeReasonTargetInvalid)
+
+	// The merged_into walk is bounded by MaxIssueMergeChain hops. A finite chain
+	// of exactly the budget is accepted, while a longer chain is rejected as an
+	// invalid target (never as a cycle, because no cycle was proven).
+	atBudget := target
+	atBudget.MergedIntoID = int64Pointer(100)
+	if err := ValidateMerge(source, atBudget, mergeChainLookup(100, MaxIssueMergeChain, 0)); err != nil {
+		t.Fatalf("%d-link finite chain rejected: %v", MaxIssueMergeChain, err)
+	}
+
+	overBudget := target
+	overBudget.MergedIntoID = int64Pointer(200)
+	requireMergeReason(t,
+		ValidateMerge(source, overBudget, mergeChainLookup(200, MaxIssueMergeChain+1, 0)),
+		MergeReasonTargetInvalid,
+	)
+
+	// A source reached within the budget remains a cycle: the target's first
+	// link plus MaxIssueMergeChain-1 node links make exactly the budget.
+	cycleAtBudget := target
+	cycleAtBudget.MergedIntoID = int64Pointer(400)
+	requireMergeReason(t,
+		ValidateMerge(source, cycleAtBudget, mergeChainLookup(400, MaxIssueMergeChain-1, source.ID)),
+		MergeReasonCycle,
+	)
+
+	mergedSource := source
+	mergedSource.Status = IssueStatusMerged
+	if err := ValidateMerge(mergedSource, target, nil); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("merged source error = %v, want errors.Is(ErrStateConflict)", err)
+	}
+
+	if err := ValidateMerge(Issue{}, target, nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("missing source ID error = %v, want errors.Is(ErrInvalidArgument)", err)
+	}
+	if err := ValidateMerge(source, Issue{}, nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("missing target ID error = %v, want errors.Is(ErrInvalidArgument)", err)
 	}
 }
 
-func TestNormalizeIssueRefsSortsAndDeduplicates(t *testing.T) {
-	refs := []IssueRef{
-		{RefKind: RefKindEvidence, RefID: "31"},
-		{RefKind: RefKindCaseRun, RefID: "777"},
-		{RefKind: RefKindEvidence, RefID: "31"},
-		{RefKind: RefKindCaseNode, RefID: "9001"},
-		{RefKind: RefKindCaseRun, RefID: "777"},
+// mergeChainFixture builds a lookup over the given issues plus the source.
+func mergeChainFixture(source Issue, issues ...Issue) (Issue, func(int64) (Issue, bool)) {
+	nodes := make(map[int64]Issue, len(issues))
+	for _, issue := range issues {
+		nodes[issue.ID] = issue
 	}
-	got := NormalizeIssueRefs(refs)
-	want := []IssueRef{
-		{RefKind: RefKindCaseNode, RefID: "9001"},
-		{RefKind: RefKindCaseRun, RefID: "777"},
-		{RefKind: RefKindEvidence, RefID: "31"},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("NormalizeIssueRefs = %+v, want %+v", got, want)
-	}
-	if len(NormalizeIssueRefs(nil)) != 0 {
-		t.Fatal("NormalizeIssueRefs(nil) must be empty")
+	return source, func(id int64) (Issue, bool) {
+		issue, ok := nodes[id]
+		return issue, ok
 	}
 }
 
-func TestValidateIssueDraft(t *testing.T) {
-	if err := ValidateIssueDraft(issueTestValidDraft()); err != nil {
-		t.Fatalf("valid defect draft rejected: %v", err)
+func mergeChainIDs(issues []Issue) []int64 {
+	ids := make([]int64, 0, len(issues))
+	for _, issue := range issues {
+		ids = append(ids, issue.ID)
 	}
-	if err := ValidateIssueDraft(issueTestRequirementGapDraft()); err != nil {
-		t.Fatalf("valid requirement-gap draft rejected: %v", err)
+	return ids
+}
+
+func requireMergeChainIDs(t *testing.T, got []Issue, want ...int64) {
+	t.Helper()
+	ids := mergeChainIDs(got)
+	if len(ids) != len(want) {
+		t.Fatalf("merge chain = %v, want %v", ids, want)
+	}
+	for index := range want {
+		if ids[index] != want[index] {
+			t.Fatalf("merge chain = %v, want %v", ids, want)
+		}
+	}
+}
+
+func TestIssueMergeChainFollowsMergedLinksToTarget(t *testing.T) {
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)}
+	source, lookup := mergeChainFixture(source,
+		Issue{ID: 20, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(30)},
+		Issue{ID: 30, VersionID: 7, Status: IssueStatusOpen},
+	)
+	chain, ok := MergeChain(source, lookup)
+	if !ok {
+		t.Fatal("MergeChain() ok = false, want the resolved target")
+	}
+	requireMergeChainIDs(t, chain, 20, 30)
+	if chain[len(chain)-1].Status != IssueStatusOpen {
+		t.Fatalf("terminal target status = %q, want open", chain[len(chain)-1].Status)
 	}
 
-	cases := []struct {
-		name   string
-		mutate func(*IssueDraft)
-		field  string
-	}{
-		{"missing dedupe", func(d *IssueDraft) { d.DedupeKey = "" }, "dedupeKey"},
-		{"uppercase dedupe", func(d *IssueDraft) { d.DedupeKey = strings.ToUpper(strings.Repeat("a", 64)) }, "dedupeKey"},
-		{"short dedupe", func(d *IssueDraft) { d.DedupeKey = "abc" }, "dedupeKey"},
-		{"missing title", func(d *IssueDraft) { d.Title = "  " }, "title"},
-		{"long title", func(d *IssueDraft) { d.Title = strings.Repeat("x", 201) }, "title"},
-		{"missing severity", func(d *IssueDraft) { d.Severity = "" }, "severity"},
-		{"bad severity", func(d *IssueDraft) { d.Severity = "urgent" }, "severity"},
-		{"missing confidence", func(d *IssueDraft) { d.Confidence = "" }, "confidence"},
-		{"bad confidence", func(d *IssueDraft) { d.Confidence = "certain" }, "confidence"},
-		{"missing failure class", func(d *IssueDraft) { d.FailureClass = "" }, "failureClass"},
-		{"non-application failure class", func(d *IssueDraft) { d.FailureClass = FailureClassEnvironment }, "failureClass"},
-		{"missing case node", func(d *IssueDraft) { d.CaseNodeID = nil }, "caseNodeId"},
-		{"zero case node", func(d *IssueDraft) { zero := int64(0); d.CaseNodeID = &zero }, "caseNodeId"},
-		{"zero case run", func(d *IssueDraft) { zero := int64(0); d.CaseRunID = &zero }, "caseRunId"},
-		{"zero evidence", func(d *IssueDraft) { d.EvidenceIDs = []int64{0} }, "evidenceIds"},
-		{"zero merge target", func(d *IssueDraft) { zero := int64(0); d.MergeIntoIssueID = &zero }, "mergeIntoIssueId"},
+	// A non-merged issue has no target chain.
+	open := Issue{ID: 40, VersionID: 7, Status: IssueStatusOpen}
+	if chain, ok := MergeChain(open, lookup); !ok || len(chain) != 0 {
+		t.Fatalf("open MergeChain = %v/%v, want an empty ok chain", mergeChainIDs(chain), ok)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			draft := issueTestValidDraft()
-			tc.mutate(&draft)
-			err := ValidateIssueDraft(draft)
-			issueTestInvalid(t, err, ReasonInvalidArgument)
-			var domainErr *Error
-			if !errors.As(err, &domainErr) {
-				t.Fatalf("error type = %T", err)
-			}
-			if domainErr.Field != tc.field {
-				t.Fatalf("field = %q, want %q (%v)", domainErr.Field, tc.field, err)
-			}
+	// A merged issue without a recorded link is also an empty chain, not a
+	// failure: the caller only redirects when a link exists.
+	unlinked := Issue{ID: 50, VersionID: 7, Status: IssueStatusMerged}
+	if chain, ok := MergeChain(unlinked, lookup); !ok || len(chain) != 0 {
+		t.Fatalf("unlinked MergeChain = %v/%v, want an empty ok chain", mergeChainIDs(chain), ok)
+	}
+}
+
+func TestIssueMergeChainRejectsBrokenCycleAndForeignTargets(t *testing.T) {
+	t.Run("missing target", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(99)}
+		source, lookup := mergeChainFixture(source)
+		if chain, ok := MergeChain(source, lookup); ok || len(chain) != 0 {
+			t.Fatalf("broken MergeChain = %v/%v, want no chain", mergeChainIDs(chain), ok)
+		}
+	})
+
+	t.Run("self cycle", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(10)}
+		source, lookup := mergeChainFixture(source, source)
+		if chain, ok := MergeChain(source, lookup); ok {
+			t.Fatalf("self-cycle MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+		}
+	})
+
+	t.Run("indirect cycle", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)}
+		source, lookup := mergeChainFixture(source,
+			Issue{ID: 20, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(30)},
+			Issue{ID: 30, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)},
+		)
+		if chain, ok := MergeChain(source, lookup); ok {
+			t.Fatalf("cyclic MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+		}
+	})
+
+	t.Run("cross version target", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)}
+		source, lookup := mergeChainFixture(source,
+			Issue{ID: 20, VersionID: 8, Status: IssueStatusOpen},
+		)
+		if chain, ok := MergeChain(source, lookup); ok {
+			t.Fatalf("cross-version MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+		}
+	})
+}
+
+func TestIssueMergeChainBudget(t *testing.T) {
+	// A finite chain of exactly MaxIssueMergeChain hops is resolvable.
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(100)}
+	nodes := make([]Issue, 0, MaxIssueMergeChain)
+	for offset := 0; offset < MaxIssueMergeChain; offset++ {
+		node := Issue{ID: int64(100 + offset), VersionID: 7, Status: IssueStatusMerged}
+		if offset == MaxIssueMergeChain-1 {
+			node.Status = IssueStatusConfirmed
+		} else {
+			node.MergedIntoID = int64Pointer(int64(100 + offset + 1))
+		}
+		nodes = append(nodes, node)
+	}
+	source, lookup := mergeChainFixture(source, nodes...)
+	chain, ok := MergeChain(source, lookup)
+	if !ok || len(chain) != MaxIssueMergeChain {
+		t.Fatalf("at-budget MergeChain = %v/%v, want %d resolved targets", mergeChainIDs(chain), ok, MaxIssueMergeChain)
+	}
+
+	// One additional merged hop is over budget: the redirect fails after the
+	// bounded walk instead of guessing.
+	over := make([]Issue, 0, MaxIssueMergeChain)
+	for offset := 0; offset < MaxIssueMergeChain; offset++ {
+		over = append(over, Issue{
+			ID:           int64(200 + offset),
+			VersionID:    7,
+			Status:       IssueStatusMerged,
+			MergedIntoID: int64Pointer(int64(200 + offset + 1)),
 		})
 	}
-
-	t.Run("requirement gap without requirement", func(t *testing.T) {
-		draft := issueTestRequirementGapDraft()
-		draft.RequirementIDs = nil
-		issueTestInvalid(t, ValidateIssueDraft(draft), ReasonInvalidArgument)
-	})
-	t.Run("defect without any case reference", func(t *testing.T) {
-		draft := issueTestValidDraft()
-		draft.CaseRunID = nil
-		draft.CaseNodeID = nil
-		issueTestInvalid(t, ValidateIssueDraft(draft), ReasonInvalidArgument)
-	})
-}
-
-// TestValidateIssueDraftRequirementGapFailureClass pins spec §5.4/DDL: a
-// requirement gap may leave failure_class empty but, when present, it only has to
-// be a valid failure class (the defect-only "application" rule must not leak).
-func TestValidateIssueDraftRequirementGapFailureClass(t *testing.T) {
-	draft := issueTestRequirementGapDraft()
-	draft.FailureClass = FailureClassEnvironment
-	if err := ValidateIssueDraft(draft); err != nil {
-		t.Fatalf("requirement-gap draft with failure class %q rejected: %v", draft.FailureClass, err)
+	overSource := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(200)}
+	source, lookup = mergeChainFixture(overSource, over...)
+	chain, ok = MergeChain(source, lookup)
+	if ok {
+		t.Fatalf("over-budget MergeChain = %v, want redirect failure", mergeChainIDs(chain))
 	}
-
-	draft.FailureClass = "bogus"
-	issueTestInvalid(t, ValidateIssueDraft(draft), ReasonInvalidArgument)
-}
-
-func TestMergeOccurrence(t *testing.T) {
-	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
-	base := Issue{
-		ID:              500,
-		VersionID:       1,
-		Status:          StatusOpen,
-		Confidence:      ConfidenceLow,
-		Actual:          "旧现象",
-		RecurrenceCount: 0,
-		Revision:        3,
-		DismissedReason: "",
-	}
-
-	merged := MergeOccurrence(base, ConfidenceHigh, "新现象", 44, now)
-	if merged.RecurrenceCount != 1 {
-		t.Errorf("recurrence_count = %d, want 1", merged.RecurrenceCount)
-	}
-	if merged.Confidence != ConfidenceHigh {
-		t.Errorf("confidence = %q, want high", merged.Confidence)
-	}
-	if merged.Actual != "新现象" {
-		t.Errorf("actual = %q, want the new actual", merged.Actual)
-	}
-	if merged.Revision != 4 {
-		t.Errorf("revision = %d, want 4", merged.Revision)
-	}
-	if merged.Status != StatusOpen {
-		t.Errorf("status = %q, want open", merged.Status)
-	}
-	if merged.UpdatedBy != 44 || !merged.UpdatedAt.Equal(now) {
-		t.Errorf("updated = (%d, %s), want (44, %s)", merged.UpdatedBy, merged.UpdatedAt, now)
-	}
-
-	downgraded := MergeOccurrence(merged, ConfidenceLow, "", 45, now)
-	if downgraded.Confidence != ConfidenceHigh {
-		t.Errorf("confidence was downgraded to %q", downgraded.Confidence)
-	}
-	if downgraded.Actual != "新现象" {
-		t.Errorf("empty actual overwrote the stored actual: %q", downgraded.Actual)
-	}
-	if downgraded.RecurrenceCount != 2 {
-		t.Errorf("recurrence_count = %d, want 2", downgraded.RecurrenceCount)
-	}
-
-	terminal := base
-	terminal.Status = StatusConfirmed
-	confirmed := MergeOccurrence(terminal, ConfidenceMedium, "", 44, now)
-	if confirmed.Status != StatusConfirmed {
-		t.Errorf("terminal status changed to %q", confirmed.Status)
-	}
-	if confirmed.RecurrenceCount != 1 || confirmed.Revision != 4 {
-		t.Errorf("terminal merge = recurrence %d revision %d, want 1/4",
-			confirmed.RecurrenceCount, confirmed.Revision)
-	}
-
-	dismissed := base
-	dismissed.Status = StatusDismissed
-	dismissed.DismissedReason = "环境问题"
-	recurring := MergeOccurrence(dismissed, ConfidenceMedium, "again", 44, now)
-	if recurring.Status != StatusDismissed || recurring.DismissedReason != "环境问题" {
-		t.Errorf("dismissed issue reopened: %+v", recurring)
+	if len(chain) != MaxIssueMergeChain {
+		t.Fatalf("over-budget chain length = %d, want the %d walked targets", len(chain), MaxIssueMergeChain)
 	}
 }
 
-func TestIssueFieldValidators(t *testing.T) {
-	title, err := ValidateTitle("  登录失败  ")
-	if err != nil {
-		t.Fatalf("ValidateTitle(valid) = %v", err)
-	}
-	if title != "登录失败" {
-		t.Errorf("title = %q, want trimmed", title)
-	}
-	if _, err := ValidateTitle("   "); err != nil {
-		issueTestInvalid(t, err, ReasonInvalidArgument)
-	} else {
-		t.Fatal("empty title was accepted")
-	}
-	if _, err := ValidateTitle(strings.Repeat("x", 201)); err != nil {
-		issueTestInvalid(t, err, ReasonInvalidArgument)
-	} else {
-		t.Fatal("over-long title was accepted")
-	}
+func TestIssueValidateMergeMergedTargetWithLongChain(t *testing.T) {
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusOpen}
 
-	for _, severity := range []string{SeverityBlocker, SeverityMajor, SeverityMinor, SeverityInfo} {
-		if err := ValidateSeverity(severity); err != nil {
-			t.Errorf("ValidateSeverity(%q) = %v", severity, err)
-		}
+	// A merged target is terminal: it must be rejected before its chain is
+	// followed, so a long chain cannot surface as merge_cycle.
+	longChainTarget := Issue{
+		ID:           20,
+		VersionID:    7,
+		Status:       IssueStatusMerged,
+		MergedIntoID: int64Pointer(300),
 	}
-	issueTestInvalid(t, ValidateSeverity(""), ReasonInvalidArgument)
-	issueTestInvalid(t, ValidateSeverity("urgent"), ReasonInvalidArgument)
+	requireMergeReason(t,
+		ValidateMerge(source, longChainTarget, mergeChainLookup(300, 20, 0)),
+		MergeReasonTargetInvalid,
+	)
 
-	for _, category := range []string{CategoryDefect, CategoryRequirementGap, CategoryOther} {
-		if err := ValidateCategory(category); err != nil {
-			t.Errorf("ValidateCategory(%q) = %v", category, err)
-		}
-	}
-	issueTestInvalid(t, ValidateCategory("bug"), ReasonInvalidArgument)
-
-	for _, confidence := range []string{ConfidenceHigh, ConfidenceMedium, ConfidenceLow} {
-		if err := ValidateConfidence(confidence); err != nil {
-			t.Errorf("ValidateConfidence(%q) = %v", confidence, err)
-		}
-	}
-	issueTestInvalid(t, ValidateConfidence("certain"), ReasonInvalidArgument)
+	// Nor may a merged target whose chain points straight back at the source be
+	// reported as a cycle: the invalid target status wins.
+	mergedToSource := longChainTarget
+	mergedToSource.MergedIntoID = int64Pointer(source.ID)
+	requireMergeReason(t, ValidateMerge(source, mergedToSource, nil), MergeReasonTargetInvalid)
 }

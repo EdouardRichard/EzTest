@@ -1,244 +1,392 @@
-package domain
+package execution
 
-import (
-	"fmt"
-	"strings"
-)
+import "fmt"
 
-// Finish-validation reason identifiers. Every rejection is an invalid_arguments
-// tool error (spec §5.5) whose Reason carries the stable, machine-readable
-// cause; evidence_missing is the spec §6.4 identifier.
+// Verdict reasons written to case_run.summary.verdict_reason. They are stable
+// strings: P4 and the UI display them.
 const (
-	reasonInvalidFinishVerdict    = "invalid_finish_verdict"
-	reasonInvalidStepResults      = "invalid_step_results"
-	reasonInvalidAssertionResults = "invalid_assertion_results"
-	reasonInvalidFailureClass     = "invalid_failure_class"
-	reasonVerdictNotJustified     = "verdict_not_justified"
-	reasonBudgetExhausted         = "budget_exhausted"
+	VerdictReasonPassed          = "passed"
+	VerdictReasonAssertionFailed = "assertion_failed"
+	VerdictReasonStepFailed      = "step_failed"
+	VerdictReasonIncomplete      = "incomplete"
+	VerdictReasonEmptyCase       = "empty_case"
+	VerdictReasonNoAssertions    = "no_assertions"
+	VerdictReasonBlocked         = "blocked"
+	VerdictReasonAgentFailure    = "agent_failure"
+	// VerdictReasonVisualAssertionNotRun is the P5 finalizer: a case_version
+	// with visual assertions but no executed visual result must not pass.
+	VerdictReasonVisualAssertionNotRun = "visual_assertion_not_run"
 )
 
-func finishError(reason, message string) error {
-	return NewReasonError("invalid_arguments", reason, message, false, nil)
+// FinishCandidate is the model-submitted execution.case_finish candidate. The
+// server never trusts it directly: Aggregate overwrites it with the
+// deterministic §4.3 verdict.
+type FinishCandidate struct {
+	Verdict      CaseRunStatus
+	Summary      string
+	FailureClass FailureClass
 }
 
-// ValidateFinish is the server-side gate for a case_finish submission. It
-// enforces spec §5.5/§5.8 plus the P7 db-assertion rules of spec §6.6.2 before
-// the finish is persisted:
-//
-//   - every snapshot step has exactly one result, recorded once in ascending seq
-//     order, and no result refers to a step outside the snapshot;
-//   - every snapshot assertion — including a db assertion — is submitted
-//     exactly once, and no result refers to an assertion outside the snapshot;
-//   - passed and failed require at least one piece of evidence; evidenceCount is
-//     the case run's evidence total (step evidence plus assertion/db and finish
-//     evidence, spec §6.6.2);
-//   - passed requires every step passed and every assertion passed, including
-//     db assertions;
-//   - failed requires at least one failed assertion, including a db assertion;
-//   - the verdict/failure-class matrix of spec §5.8 must hold; the one §9.3
-//     extension is inconclusive(environment) justified by a recorded visual
-//     environment mismatch;
-//   - a budget-exhausted finish must be inconclusive(model).
-//
-// It returns nil when the decision is admissible. Rejections are
-// *ReasonError values so the recorder can surface a correctable tool error.
-func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []AssertionResult, decision FinishDecision, evidenceCount int) error {
-	switch decision.Verdict {
-	case VerdictPassed, VerdictFailed, VerdictBlocked, VerdictInconclusive:
+// Valid reports whether the candidate verdict is one of the four result states.
+func (c FinishCandidate) Valid() bool { return c.Verdict.FourState() }
+
+// VerdictInput is the deterministic aggregation input for one finished run.
+type VerdictInput struct {
+	Case         CaseSnapshot
+	Steps        []StepResult
+	Assertions   []AssertionResult
+	Finish       *FinishCandidate
+	AgentFailure FailureClass
+}
+
+// Aggregate applies the §4.3 four-state aggregation. The model candidate is
+// only a hint: assertion failures are authoritative for application defects,
+// step failures keep their mapped class, missing required results are
+// inconclusive, and blocked prerequisites win over incomplete.
+func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, error) {
+	if in.Finish != nil && !in.Finish.Valid() {
+		return "", "", CaseRunSummary{}, fmt.Errorf("%w: %q", ErrInvalidVerdict, in.Finish.Verdict)
+	}
+	summary := CaseRunSummary{
+		AssertionTotal: len(in.Case.Assertions),
+		StepTotal:      len(in.Case.Steps),
+		VerdictReason:  VerdictReasonPassed,
+	}
+	if len(in.Case.Steps) == 0 {
+		summary.VerdictReason = VerdictReasonEmptyCase
+		return CaseRunInconclusive, "", summary, nil
+	}
+
+	stepResults := make(map[int]StepResult, len(in.Steps))
+	var failedStep *StepResult
+	var blockedStep *StepResult
+	for i := range in.Steps {
+		result := in.Steps[i]
+		stepResults[result.Seq] = result
+		switch result.Status {
+		case StepFailed:
+			summary.StepFailed++
+			if failedStep == nil {
+				failedStep = &in.Steps[i]
+			}
+		case StepBlocked:
+			if blockedStep == nil {
+				blockedStep = &in.Steps[i]
+			}
+		}
+	}
+
+	assertionResults := make(map[[2]int]AssertionResult, len(in.Assertions))
+	var failedAssertion *AssertionResult
+	for i := range in.Assertions {
+		result := in.Assertions[i]
+		assertionResults[[2]int{result.StepSeq, result.AssertionSeq}] = result
+		if result.Verdict == AssertionFailed {
+			summary.AssertionFailed++
+			if failedAssertion == nil {
+				failedAssertion = &in.Assertions[i]
+			}
+		}
+	}
+
+	summary.countVisualResults(in.Case.Assertions, assertionResults)
+	if failedStep != nil && failedStep.Error != "" {
+		summary.LastError = failedStep.Error
+	}
+
+	// Executor loss is infrastructure state, not a visual verdict.
+	if in.AgentFailure == FailureClassExecutorLost {
+		summary.VerdictReason = VerdictReasonAgentFailure
+		return CaseRunInterrupted, FailureClassExecutorLost, summary, nil
+	}
+
+	// Assertion failures are the strongest evidence: only they may produce
+	// failed(application). The model may downgrade to automation but never
+	// upgrade.
+	if failedAssertion != nil {
+		class := FailureClassApplication
+		if in.Finish != nil && in.Finish.FailureClass == FailureClassAutomation {
+			class = FailureClassAutomation
+		}
+		summary.VerdictReason = VerdictReasonAssertionFailed
+		return CaseRunFailed, class, summary, nil
+	}
+
+	// P5 removes the P3 "visual skipped but case passed" shortcut: a visual
+	// assertion that never ran (or is inconclusive) makes the case inconclusive
+	// instead of silently green (spec §7.3). The visual result is authoritative
+	// over an agent/model "blocked" or step failure for the same visual reason.
+	if reason, environment, inconclusive := visualBlock(in.Case.Assertions, assertionResults); inconclusive {
+		summary.VerdictReason = reason
+		if environment {
+			return CaseRunInconclusive, FailureClassEnvironment, summary, nil
+		}
+		return CaseRunInconclusive, "", summary, nil
+	}
+
+	// Agent-level failures that are not a deterministic result.
+	switch in.AgentFailure {
+	case FailureClassBlocked:
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
+	case "", FailureClassApplication:
+		// application needs assertion evidence; handled deterministically below.
 	default:
-		return finishError(reasonInvalidFinishVerdict,
-			fmt.Sprintf("verdict %q is not a valid case-finish verdict", decision.Verdict))
-	}
-
-	if err := validateFinishClass(decision); err != nil {
-		return err
-	}
-
-	// Budget exhaustion means the case did not finish; spec §5.8 forbids
-	// turning it into failed.
-	if isBudgetExhaustionReason(decision.Reason) {
-		if decision.Verdict != VerdictInconclusive ||
-			decision.FailureClass == nil || *decision.FailureClass != FailureClassModel {
-			return finishError(reasonBudgetExhausted,
-				"budget exhaustion must finish as inconclusive(model)")
+		if in.AgentFailure.Valid() {
+			summary.VerdictReason = VerdictReasonAgentFailure
+			return CaseRunFailed, in.AgentFailure, summary, nil
 		}
 	}
 
-	if err := validateFinishSteps(snapshot, steps); err != nil {
-		return err
-	}
-	results, err := validateFinishAssertions(snapshot, assertions)
-	if err != nil {
-		return err
+	if blockedStep != nil {
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
 	}
 
-	// Design spec §9.3 adds one admissible inconclusive(environment) case: a
-	// visual assertion whose comparison could not run because the live
-	// viewport/DPR differs from the approved baseline. It stays inconclusive
-	// rather than blocked, but requires the recorded §9.3 reason so the matrix is
-	// not widened for arbitrary cases.
-	if decision.Verdict == VerdictInconclusive && decision.FailureClass != nil &&
-		*decision.FailureClass == FailureClassEnvironment &&
-		!hasVisualEnvironmentMismatch(snapshot, results) {
-		return finishError(reasonInvalidFailureClass,
-			"inconclusive(environment) requires a visual environment mismatch")
+	if failedStep != nil {
+		summary.VerdictReason = VerdictReasonStepFailed
+		return CaseRunFailed, stepFailureClass(in.Finish), summary, nil
 	}
 
-	if decision.Verdict == VerdictPassed || decision.Verdict == VerdictFailed {
-		if evidenceCount <= 0 {
-			return finishError(reasonEvidenceMissing,
-				"passed and failed finishes require at least one evidence item")
+	// A blocked candidate with no executed result is a genuine pre-execution
+	// blocked verdict (missing account/DB/page/environment).
+	if in.Finish != nil && in.Finish.Verdict == CaseRunBlocked && len(in.Steps) == 0 && len(in.Assertions) == 0 {
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
+	}
+
+	// An application candidate without any assertion/step evidence is not
+	// allowed to report an application defect (P3-D-12).
+	if in.Finish != nil && in.Finish.FailureClass == FailureClassApplication &&
+		len(in.Assertions) == 0 && !hasObservedStep(in.Steps) {
+		summary.VerdictReason = VerdictReasonIncomplete
+		return CaseRunInconclusive, "", summary, nil
+	}
+
+	// A non-application infra failure candidate with no results at all is
+	// accepted: there is nothing to contradict it and no assertion evidence to
+	// preserve.
+	if in.Finish != nil && in.Finish.Verdict == CaseRunFailed &&
+		len(in.Steps) == 0 && len(in.Assertions) == 0 && in.Finish.FailureClass.Valid() &&
+		in.Finish.FailureClass != "" && in.Finish.FailureClass != FailureClassApplication {
+		summary.VerdictReason = VerdictReasonAgentFailure
+		return CaseRunFailed, in.Finish.FailureClass, summary, nil
+	}
+
+	if status, class, complete := completeResults(in, stepResults, assertionResults, &summary); !complete {
+		return status, class, summary, nil
+	}
+	summary.VerdictReason = VerdictReasonPassed
+	return CaseRunPassed, "", summary, nil
+}
+
+// completeResults checks that every required step and non-visual assertion has a
+// final passing result. Visual assertions are evaluated by visualBlock before
+// this point (P5 four-state mapping), so they are not re-checked here.
+func completeResults(
+	in VerdictInput,
+	stepResults map[int]StepResult,
+	assertionResults map[[2]int]AssertionResult,
+	summary *CaseRunSummary,
+) (CaseRunStatus, FailureClass, bool) {
+	if len(in.Case.Assertions) == 0 && len(in.Assertions) == 0 {
+		summary.VerdictReason = VerdictReasonNoAssertions
+		return CaseRunInconclusive, "", false
+	}
+	for _, step := range in.Case.Steps {
+		result, ok := stepResults[step.Seq]
+		if !ok || result.Status != StepPassed {
+			summary.VerdictReason = VerdictReasonIncomplete
+			return CaseRunInconclusive, "", false
 		}
 	}
-
-	switch decision.Verdict {
-	case VerdictPassed:
-		for _, step := range steps {
-			if step.Status != StepStatusPassed {
-				return finishError(reasonVerdictNotJustified,
-					fmt.Sprintf("passed requires every step passed, step %d is %q", step.Seq, step.Status))
+	if len(in.Case.Assertions) > 0 {
+		for _, assertion := range in.Case.Assertions {
+			if assertion.Kind == AssertionKindVisual {
+				continue
+			}
+			result, ok := assertionResults[[2]int{assertion.StepSeq, assertion.AssertionSeq}]
+			if !ok || result.Verdict != AssertionPassed {
+				summary.VerdictReason = VerdictReasonIncomplete
+				return CaseRunInconclusive, "", false
 			}
 		}
-		for _, assertion := range snapshot.Assertions {
-			if !verdictEquals(results[assertion.ID].Verdict, "passed") {
-				return finishError(reasonVerdictNotJustified,
-					fmt.Sprintf("passed requires assertion %d passed", assertion.ID))
+	} else {
+		for _, result := range in.Assertions {
+			if result.Kind == AssertionKindVisual {
+				continue
+			}
+			if result.Verdict != AssertionPassed {
+				summary.VerdictReason = VerdictReasonIncomplete
+				return CaseRunInconclusive, "", false
 			}
 		}
-	case VerdictFailed:
-		if !hasFailedAssertion(snapshot, results) {
-			return finishError(reasonVerdictNotJustified,
-				"failed requires at least one failed assertion")
-		}
 	}
-
-	return nil
+	return "", "", true
 }
 
-func validateFinishClass(decision FinishDecision) error {
-	switch decision.Verdict {
-	case VerdictPassed:
-		if decision.FailureClass != nil {
-			return finishError(reasonInvalidFailureClass, "passed must not carry a failure class")
-		}
-	case VerdictFailed:
-		if decision.FailureClass == nil || *decision.FailureClass != FailureClassApplication {
-			return finishError(reasonInvalidFailureClass, "failed requires failure class application")
-		}
-	case VerdictBlocked:
-		if decision.FailureClass == nil ||
-			(*decision.FailureClass != FailureClassEnvironment && *decision.FailureClass != FailureClassSession) {
-			return finishError(reasonInvalidFailureClass,
-				"blocked requires failure class environment or session")
-		}
-	case VerdictInconclusive:
-		if decision.FailureClass == nil ||
-			(*decision.FailureClass != FailureClassModel && *decision.FailureClass != FailureClassCase &&
-				*decision.FailureClass != FailureClassEnvironment) {
-			return finishError(reasonInvalidFailureClass,
-				"inconclusive requires failure class model, case or a visual environment mismatch")
-		}
-	}
-	return nil
-}
-
-// hasVisualEnvironmentMismatch reports whether a submitted visual assertion is
-// the §9.3 environment mismatch (not_run with the stable reason). It is the only
-// justification that admits inconclusive(environment) at finish time.
-func hasVisualEnvironmentMismatch(snapshot CaseSnapshot, results map[int64]AssertionResult) bool {
-	for _, assertion := range snapshot.Assertions {
-		if !strings.EqualFold(strings.TrimSpace(assertion.Kind), "visual") {
+// countVisualResults fills the P5 four-state visual counters. A missing or
+// legacy-skipped visual result counts as inconclusive, never as skipped: the
+// false-pass shortcut is removed (spec §7.3). VisualSkipped stays 0.
+func (s *CaseRunSummary) countVisualResults(assertions []CaseAssertion, results map[[2]int]AssertionResult) {
+	s.VisualSkipped = 0
+	seen := make(map[[2]int]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		if assertion.Kind != AssertionKindVisual {
 			continue
 		}
-		result, ok := results[assertion.ID]
-		if !ok {
+		key := [2]int{assertion.StepSeq, assertion.AssertionSeq}
+		seen[key] = struct{}{}
+		result, ok := results[key]
+		s.countVisualResult(result, ok)
+	}
+	for key, result := range results {
+		if result.Kind != AssertionKindVisual {
 			continue
 		}
-		if verdictEquals(result.Verdict, "not_run") &&
-			strings.EqualFold(strings.TrimSpace(result.FailureReason), "visual_environment_mismatch") {
-			return true
+		if _, ok := seen[key]; ok {
+			continue
 		}
+		s.countVisualResult(result, true)
 	}
-	return false
 }
 
-// validateFinishSteps requires exactly the snapshot steps, once each, supplied
-// in ascending seq order.
-func validateFinishSteps(snapshot CaseSnapshot, steps []StepResult) error {
-	snapshotSeqs := make(map[int]struct{}, len(snapshot.Steps))
-	for _, step := range snapshot.Steps {
-		snapshotSeqs[step.Seq] = struct{}{}
+func (s *CaseRunSummary) countVisualResult(result AssertionResult, ok bool) {
+	if !ok || result.Verdict == AssertionSkipped || result.Verdict == AssertionInconclusive {
+		s.VisualInconclusive++
+		return
 	}
-	if len(steps) != len(snapshotSeqs) {
-		return finishError(reasonInvalidStepResults,
-			fmt.Sprintf("recorded %d steps, snapshot has %d", len(steps), len(snapshotSeqs)))
+	switch result.Verdict {
+	case AssertionPassed:
+		s.VisualPassed++
+	case AssertionFailed:
+		s.VisualFailed++
+	default:
+		s.VisualInconclusive++
 	}
-
-	seen := make(map[int]struct{}, len(steps))
-	previous := 0
-	for _, step := range steps {
-		if _, ok := snapshotSeqs[step.Seq]; !ok {
-			return finishError(reasonInvalidStepResults,
-				fmt.Sprintf("step %d is not part of the case snapshot", step.Seq))
-		}
-		if _, ok := seen[step.Seq]; ok {
-			return finishError(reasonInvalidStepResults,
-				fmt.Sprintf("step %d was recorded more than once", step.Seq))
-		}
-		if step.Seq <= previous {
-			return finishError(reasonInvalidStepResults,
-				fmt.Sprintf("step %d is out of seq order", step.Seq))
-		}
-		seen[step.Seq] = struct{}{}
-		previous = step.Seq
-	}
-	return nil
 }
 
-// validateFinishAssertions requires every snapshot assertion, including a db
-// assertion, to be submitted exactly once and rejects results for assertions
-// outside the snapshot. It returns the submitted results indexed by assertion id.
-func validateFinishAssertions(snapshot CaseSnapshot, assertions []AssertionResult) (map[int64]AssertionResult, error) {
-	snapshotByID := make(map[int64]CaseSnapshotAssertion, len(snapshot.Assertions))
-	for _, assertion := range snapshot.Assertions {
-		snapshotByID[assertion.ID] = assertion
-	}
-
-	results := make(map[int64]AssertionResult, len(assertions))
+// visualBlock returns the inconclusive verdict reason of the first visual
+// assertion that did not pass. environment=true maps the environment-mismatch
+// reason to the environment failure class; "case" reasons keep the empty class.
+// NormalizeVisualSteps removes a free-form blocked/failed step status that the
+// Case Executor attached to a visual assertion whose concrete visual result is
+// inconclusive. The visual tool result is authoritative (spec §7.3); without
+// this, a model-authored blocked status hides the visual verdict from Aggregate.
+func NormalizeVisualSteps(steps []StepResult, assertions []AssertionResult) []StepResult {
+	visual := map[int]bool{}
 	for _, result := range assertions {
-		if _, ok := snapshotByID[result.AssertionID]; !ok {
-			return nil, finishError(reasonInvalidAssertionResults,
-				fmt.Sprintf("assertion %d is not part of the case snapshot", result.AssertionID))
-		}
-		if _, ok := results[result.AssertionID]; ok {
-			return nil, finishError(reasonInvalidAssertionResults,
-				fmt.Sprintf("assertion %d was submitted more than once", result.AssertionID))
-		}
-		results[result.AssertionID] = result
-	}
-
-	for _, assertion := range snapshot.Assertions {
-		if _, ok := results[assertion.ID]; !ok {
-			return nil, finishError(reasonInvalidAssertionResults,
-				fmt.Sprintf("assertion %d was not submitted", assertion.ID))
+		if result.Kind == AssertionKindVisual && result.Verdict == AssertionInconclusive {
+			visual[result.StepSeq] = true
 		}
 	}
-	return results, nil
+	if len(visual) == 0 {
+		return steps
+	}
+	normalized := append([]StepResult(nil), steps...)
+	for i := range normalized {
+		if normalized[i].Status != StepBlocked && normalized[i].Status != StepFailed {
+			continue
+		}
+		if visual[normalized[i].Seq] {
+			normalized[i].Status = StepPassed
+			normalized[i].Error = ""
+		}
+	}
+	return normalized
 }
 
-func hasFailedAssertion(snapshot CaseSnapshot, results map[int64]AssertionResult) bool {
-	for _, assertion := range snapshot.Assertions {
-		if verdictEquals(results[assertion.ID].Verdict, "failed") {
+// ApplyVisualOutcome is the final defense-in-depth guard for the P5 visual
+// four-state contract: a concrete inconclusive visual assertion result must not
+// be reported as blocked or failed(environment) because the Case Executor used a
+// free-form step status or finish candidate. It only overrides those two
+// aggregate outcomes; application failures with real assertion evidence stay.
+func ApplyVisualOutcome(status CaseRunStatus, class FailureClass, summary CaseRunSummary, assertions []AssertionResult) (CaseRunStatus, FailureClass, CaseRunSummary) {
+	if status != CaseRunBlocked && !(status == CaseRunFailed && class == FailureClassEnvironment) {
+		return status, class, summary
+	}
+	for _, result := range assertions {
+		if result.Kind != AssertionKindVisual || result.Verdict != AssertionInconclusive {
+			continue
+		}
+		reason := result.Reason
+		if reason == "" {
+			reason = VerdictReasonVisualAssertionNotRun
+		}
+		summary.VerdictReason = reason
+		if reason == "visual_environment_mismatch" {
+			return CaseRunInconclusive, FailureClassEnvironment, summary
+		}
+		return CaseRunInconclusive, "", summary
+	}
+	return status, class, summary
+}
+
+// visualBlock reports whether a visual assertion has no usable verdict.
+func visualBlock(assertions []CaseAssertion, results map[[2]int]AssertionResult) (reason string, environment bool, inconclusive bool) {
+	seen := make(map[[2]int]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		if assertion.Kind != AssertionKindVisual {
+			continue
+		}
+		key := [2]int{assertion.StepSeq, assertion.AssertionSeq}
+		seen[key] = struct{}{}
+		result, ok := results[key]
+		if block, env, blocked := visualResultBlock(result, ok); blocked {
+			return block, env, true
+		}
+	}
+	for key, result := range results {
+		if result.Kind != AssertionKindVisual {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		if block, env, ok := visualResultBlock(result, true); ok {
+			return block, env, true
+		}
+	}
+	return "", false, false
+}
+
+func visualResultBlock(result AssertionResult, ok bool) (string, bool, bool) {
+	if !ok || result.Verdict == AssertionSkipped {
+		return VerdictReasonVisualAssertionNotRun, false, true
+	}
+	if result.Verdict != AssertionInconclusive {
+		return "", false, false
+	}
+	reason := result.Reason
+	if reason == "" {
+		reason = VerdictReasonVisualAssertionNotRun
+	}
+	return reason, reason == "visual_environment_mismatch", true
+}
+
+func hasObservedStep(steps []StepResult) bool {
+	for _, step := range steps {
+		if len(step.Observed) > 0 || step.Error != "" {
 			return true
 		}
 	}
 	return false
 }
 
-func verdictEquals(value, want string) bool {
-	return strings.EqualFold(strings.TrimSpace(value), want)
-}
-
-func isBudgetExhaustionReason(reason string) bool {
-	return strings.Contains(strings.ToLower(reason), "budget")
+// stepFailureClass maps a failed step to a failure class. The model candidate
+// is only accepted when it is a non-application, non-blocked class.
+func stepFailureClass(candidate *FinishCandidate) FailureClass {
+	if candidate == nil {
+		return FailureClassAutomation
+	}
+	class := candidate.FailureClass
+	if class == "" || !class.Valid() {
+		return FailureClassAutomation
+	}
+	switch class {
+	case FailureClassApplication, FailureClassBlocked, FailureClassExecutorLost:
+		return FailureClassAutomation
+	default:
+		return class
+	}
 }

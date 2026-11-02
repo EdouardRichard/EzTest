@@ -1,115 +1,247 @@
-package postgres
+package codeintelpg
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
-// FactVersionRepo implements domain.FactVersionRepository on a pgx pool.
-type FactVersionRepo struct {
+// FactRepository stores immutable code_fact versions and their projection.
+type FactRepository struct {
 	pool *pgxpool.Pool
+	ids  platformid.Generator
+	now  func() time.Time
 }
 
-// NewFactVersionRepository returns a fact-version repository backed by pg.
-func NewFactVersionRepository(pg *pgxpool.Pool) *FactVersionRepo {
-	return &FactVersionRepo{pool: pg}
+// NewFactRepository wires the fact repository.
+func NewFactRepository(pool *pgxpool.Pool, ids platformid.Generator) *FactRepository {
+	return &FactRepository{pool: pool, ids: ids, now: time.Now}
 }
 
-var _ domain.FactVersionRepository = (*FactVersionRepo)(nil)
+var _ codeintelapp.FactRepository = (*FactRepository)(nil)
 
-// Current returns the current entity snapshot of a fact together with its
-// current version. A missing entity is a not-found error.
-func (r *FactVersionRepo) Current(ctx context.Context, repoID int64, commit, factKey string) (*domain.CodeEntity, int, error) {
-	entity, err := scanEntity(r.pool.QueryRow(ctx,
-		`SELECT `+entityColumnList+`
-		 FROM code_entity
-		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
-		repoID, commit, factKey))
+const factColumns = `id, repo_id, commit_sha, fact_key, version, kind, path, name, signature,
+	start_line, end_line, blob_hash, body, evidence, source, confidence, model, prompt_version,
+	analysis_id, superseded_at, created_at, updated_at`
+
+func scanFact(row rowScanner) (codeintel.Fact, error) {
+	var fact codeintel.Fact
+	var kind, confidence, source string
+	var body, evidence []byte
+	if err := row.Scan(&fact.ID, &fact.RepoID, &fact.CommitSHA, &fact.FactKey, &fact.Version,
+		&kind, &fact.Path, &fact.Name, &fact.Signature, &fact.StartLine, &fact.EndLine,
+		&fact.BlobHash, &body, &evidence, &source, &confidence, &fact.Model, &fact.PromptVersion,
+		&fact.AnalysisID, &fact.SupersededAt, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
+		return codeintel.Fact{}, err
+	}
+	fact.Kind = codeintel.EntityKind(kind)
+	fact.Source = source
+	fact.Confidence = codeintel.Confidence(confidence)
+	fact.Body = body
+	fact.Evidence = evidence
+	return fact, nil
+}
+
+// InsertVersion stores one immutable fact version. The current version is
+// reused when the semantic body is unchanged; otherwise it is superseded and a
+// new version+1 row is inserted (spec §5.2).
+func (r *FactRepository) InsertVersion(ctx context.Context, fact codeintel.Fact) (codeintel.Fact, bool, error) {
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, 0, domain.NewNotFound("fact_not_found",
-				fmt.Sprintf("codeintel: current fact %q not found at commit %s", factKey, commit))
-		}
-		return nil, 0, fmt.Errorf("postgres: get current fact: %w", err)
+		return codeintel.Fact{}, false, wrapDB("begin fact version insert", err)
 	}
-	if entity.FactVersion == nil {
-		return nil, 0, domain.NewNotFound("fact_not_found",
-			fmt.Sprintf("codeintel: current fact %q has no version at commit %s", factKey, commit))
-	}
-	return &entity, *entity.FactVersion, nil
-}
+	defer func() { _ = tx.Rollback(ctx) }()
 
-// GetVersion returns the canonical body stored for one fact version. The stored
-// body is what the analysis service compares against a newly computed body
-// before deciding whether the current version can be reused or must be bumped
-// (design spec §6.4). A version without a stored body is a not-found error.
-func (r *FactVersionRepo) GetVersion(ctx context.Context, repoID int64, commit, factKey string, version int) ([]byte, error) {
-	var body []byte
-	err := r.pool.QueryRow(ctx,
-		`SELECT body FROM code_fact_version
-		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3 AND version = $4`,
-		repoID, commit, factKey, version).Scan(&body)
+	version := 1
+	var existingID int64
+	var existingVersion int
+	var existingBody []byte
+	err = tx.QueryRow(ctx, `
+		SELECT id, version, body FROM code_fact
+		WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3
+		ORDER BY version DESC
+		LIMIT 1
+		FOR UPDATE
+	`, fact.RepoID, fact.CommitSHA, fact.FactKey).Scan(&existingID, &existingVersion, &existingBody)
+	switch {
+	case err == nil:
+		if sameJSONBody(existingBody, fact.Body) {
+			stored, loadErr := scanFact(tx.QueryRow(ctx, `SELECT `+factColumns+` FROM code_fact WHERE id = $1`, existingID))
+			if loadErr != nil {
+				return codeintel.Fact{}, false, wrapDB("load reused fact version", loadErr)
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return codeintel.Fact{}, false, wrapDB("commit reused fact version", commitErr)
+			}
+			return stored, true, nil
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE code_fact SET superseded_at = now(), updated_at = now() WHERE id = $1
+		`, existingID); err != nil {
+			return codeintel.Fact{}, false, wrapDB("supersede fact version", err)
+		}
+		version = existingVersion + 1
+	case errors.Is(err, pgx.ErrNoRows):
+		// First version.
+	default:
+		return codeintel.Fact{}, false, wrapDB("look up current fact version", err)
+	}
+
+	stored, err := scanFact(tx.QueryRow(ctx, `
+		INSERT INTO code_fact (id, repo_id, commit_sha, fact_key, version, kind, path, name,
+			signature, start_line, end_line, blob_hash, body, evidence, source, confidence,
+			model, prompt_version, analysis_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb,
+			$15, $16, $17, $18, $19, $20, $20)
+		RETURNING `+factColumns,
+		r.ids.Next(), fact.RepoID, fact.CommitSHA, fact.FactKey, version, string(fact.Kind),
+		fact.Path, fact.Name, fact.Signature, fact.StartLine, fact.EndLine, fact.BlobHash,
+		jsonText(fact.Body, `{}`), jsonText(fact.Evidence, `[]`), fact.Source,
+		string(fact.Confidence), fact.Model, fact.PromptVersion, nullableInt64(fact.AnalysisID), r.now()))
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.NewNotFound("fact_not_found",
-				fmt.Sprintf("codeintel: fact %q version %d not found at commit %s", factKey, version, commit))
+		return codeintel.Fact{}, false, wrapDB("insert fact version", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return codeintel.Fact{}, false, wrapDB("commit fact version", err)
+	}
+	return stored, false, nil
+}
+
+// LatestByPath returns the current versions of one file's facts.
+func (r *FactRepository) LatestByPath(ctx context.Context, repoID int64, commitSHA, filePath string) ([]codeintel.Fact, error) {
+	return r.queryFacts(ctx, `
+		SELECT `+factColumns+` FROM code_fact
+		WHERE repo_id = $1 AND commit_sha = $2 AND path = $3 AND superseded_at IS NULL
+		ORDER BY fact_key ASC
+	`, repoID, commitSHA, filePath)
+}
+
+// LatestByCommit returns the current versions of the selected kinds.
+func (r *FactRepository) LatestByCommit(ctx context.Context, repoID int64, commitSHA string, kinds []codeintel.EntityKind) ([]codeintel.Fact, error) {
+	if len(kinds) == 0 {
+		return r.queryFacts(ctx, `
+			SELECT `+factColumns+` FROM code_fact
+			WHERE repo_id = $1 AND commit_sha = $2 AND superseded_at IS NULL
+			ORDER BY path ASC, fact_key ASC
+		`, repoID, commitSHA)
+	}
+	names := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		names = append(names, string(kind))
+	}
+	return r.queryFacts(ctx, `
+		SELECT `+factColumns+` FROM code_fact
+		WHERE repo_id = $1 AND commit_sha = $2 AND superseded_at IS NULL
+		  AND kind = ANY($3::text[])
+		ORDER BY path ASC, fact_key ASC
+	`, repoID, commitSHA, names)
+}
+
+// List pages one commit's current facts with an ID cursor.
+func (r *FactRepository) List(ctx context.Context, repoID int64, commitSHA, kind, filePath, cursor string, limit int) ([]codeintel.Fact, string, bool, error) {
+	args := []any{repoID, commitSHA}
+	where := `repo_id = $1 AND commit_sha = $2 AND superseded_at IS NULL`
+	if kind != "" {
+		args = append(args, kind)
+		where += fmt.Sprintf(` AND kind = $%d`, len(args))
+	}
+	if filePath != "" {
+		args = append(args, filePath)
+		where += fmt.Sprintf(` AND (path = $%d OR path LIKE $%d || '/%%')`, len(args), len(args))
+	}
+	if cursor != "" {
+		args = append(args, cursor)
+		where += fmt.Sprintf(` AND id > $%d`, len(args))
+	}
+	args = append(args, limit+1)
+	rows, err := r.pool.Query(ctx, `SELECT `+factColumns+` FROM code_fact WHERE `+where+
+		fmt.Sprintf(` ORDER BY id ASC LIMIT $%d`, len(args)), args...)
+	if err != nil {
+		return nil, "", false, wrapDB("list code facts", err)
+	}
+	defer rows.Close()
+
+	facts := make([]codeintel.Fact, 0, limit)
+	for rows.Next() {
+		fact, scanErr := scanFact(rows)
+		if scanErr != nil {
+			return nil, "", false, wrapDB("scan code fact", scanErr)
 		}
-		return nil, fmt.Errorf("postgres: get fact version body: %w", err)
+		facts = append(facts, fact)
 	}
-	return body, nil
+	if err := rows.Err(); err != nil {
+		return nil, "", false, wrapDB("iterate code facts", err)
+	}
+	hasMore := len(facts) > limit
+	if hasMore {
+		facts = facts[:limit]
+	}
+	nextCursor := ""
+	if hasMore && len(facts) > 0 {
+		nextCursor = platformid.Format(facts[len(facts)-1].ID)
+	}
+	return facts, nextCursor, hasMore, nil
 }
 
-// Create appends one fact body version under the caller-supplied Snowflake id.
-// Versions are append-only: callers bump the version instead of updating an
-// existing row (design spec §6.4). A zero id is rejected with
-// ErrInvalid/missing_id because this package never mints ids (D29).
-func (r *FactVersionRepo) Create(ctx context.Context, id int64, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error {
-	if id == 0 {
-		return missingIDError("fact version")
+// ByID loads one fact version.
+func (r *FactRepository) ByID(ctx context.Context, id int64) (codeintel.Fact, error) {
+	fact, err := scanFact(r.pool.QueryRow(ctx, `SELECT `+factColumns+` FROM code_fact WHERE id = $1`, id))
+	if err != nil {
+		return codeintel.Fact{}, wrapDB("get code fact", err)
 	}
-	const query = `INSERT INTO code_fact_version
-		(id, repo_id, commit_sha, fact_key, version, model, prompt_version, body, analysis_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`
-	if _, err := r.pool.Exec(ctx, query,
-		id, repoID, commit, factKey, version, model, prompt,
-		jsonParam(body, jsonFallbackEmptyObject), nullableID(analysisID),
-	); err != nil {
-		if isUniqueViolation(err) {
-			return domain.NewConflict("duplicate_key",
-				fmt.Sprintf("codeintel: fact %q version %d already exists", factKey, version))
+	return fact, nil
+}
+
+func (r *FactRepository) queryFacts(ctx context.Context, query string, args ...any) ([]codeintel.Fact, error) {
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, wrapDB("query code facts", err)
+	}
+	defer rows.Close()
+
+	facts := make([]codeintel.Fact, 0)
+	for rows.Next() {
+		fact, scanErr := scanFact(rows)
+		if scanErr != nil {
+			return nil, wrapDB("scan code fact", scanErr)
 		}
-		return fmt.Errorf("postgres: create fact version: %w", err)
+		facts = append(facts, fact)
 	}
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("iterate code facts", err)
+	}
+	return facts, nil
 }
 
-// Supersede marks every version of a fact older than before as superseded at
-// at. The current version is never superseded, and an already superseded
-// version keeps its original timestamp.
-func (r *FactVersionRepo) Supersede(ctx context.Context, repoID int64, commit, factKey string, before int, at time.Time) error {
-	if _, err := r.pool.Exec(ctx,
-		`UPDATE code_fact_version
-		 SET superseded_at = $5
-		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3
-		   AND version < $4 AND superseded_at IS NULL`,
-		repoID, commit, factKey, before, at); err != nil {
-		return fmt.Errorf("postgres: supersede fact versions: %w", err)
+// sameJSONBody compares two JSON documents semantically. Malformed documents
+// fall back to a byte comparison.
+func sameJSONBody(left, right []byte) bool {
+	if bytes.Equal(bytes.TrimSpace(left), bytes.TrimSpace(right)) {
+		return true
 	}
-	return nil
-}
-
-// nullableID renders an optional logical reference as a SQL parameter: the zero
-// id means "no reference".
-func nullableID(id int64) any {
-	if id == 0 {
-		return nil
+	var leftValue, rightValue any
+	if err := json.Unmarshal(left, &leftValue); err != nil {
+		return false
 	}
-	return id
+	if err := json.Unmarshal(right, &rightValue); err != nil {
+		return false
+	}
+	leftCanonical, err := json.Marshal(leftValue)
+	if err != nil {
+		return false
+	}
+	rightCanonical, err := json.Marshal(rightValue)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(leftCanonical, rightCanonical)
 }

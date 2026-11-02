@@ -1,56 +1,54 @@
-// Package eventing is the eventing context's domain model: immutable stream
-// events addressed by a channel-local sequence number. The V1 envelope is
-// frozen for the P0 API, so its field set matches the persisted columns and the
-// SSE payload one-to-one.
+// Package eventing is the persistent event-log domain. Events are scoped to a
+// channel and ordered by a channel-local cursor (seq).
 package eventing
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"time"
 )
 
-// Refs groups the references an event points at. The four arrays are always
-// present in the API envelope; a missing reference is an empty array, never
-// null. The JSON keys are the frozen lowercase envelope names the refs JSONB
-// column stores.
-type Refs struct {
-	Evidence    []string `json:"evidence"`
-	Case        []string `json:"case"`
-	Requirement []string `json:"requirement"`
-	Code        []string `json:"code"`
-}
+// ErrNotFound is returned by Repository.Get when no event matches the
+// requested channel cursor.
+var ErrNotFound = errors.New("event not found")
 
-// Event is one persisted stream event. Seq is assigned by the store and is
-// monotonic per channel. Detail is a JSON object no larger than 64 KiB.
+// Event is one persisted event. Seq is the channel-scoped cursor; it is not a
+// business entity ID.
 type Event struct {
-	Seq       int64
 	Channel   string
+	Seq       int64
 	Type      string
-	VersionID *string
-	BatchID   *string
-	CaseID    *string
-	StepID    *string
-	AgentRole *string
-	SessionID *string
-	TS        time.Time
-	Summary   string
-	Detail    json.RawMessage
-	Refs      Refs
+	Scope     map[string]any
+	Payload   map[string]any
+	ActorID   *int64
+	RequestID string
+	CreatedAt time.Time
 }
 
-// NewEvent is an event waiting to be published: the store assigns Seq. A zero
-// TS is replaced with the current time.
-type NewEvent struct {
-	Channel   string
-	Type      string
-	VersionID *string
-	BatchID   *string
-	CaseID    *string
-	StepID    *string
-	AgentRole *string
-	SessionID *string
-	Summary   string
-	Detail    json.RawMessage
-	Refs      Refs
-	TS        time.Time
+// SnapshotPage is one page of events plus the channel cursor observed when the
+// page was read.
+type SnapshotPage struct {
+	Events  []Event
+	Cursor  int64
+	HasMore bool
+}
+
+// Bounds describes the cursor range currently persisted for a channel. Both
+// values are zero for a channel that has no events yet.
+type Bounds struct {
+	FirstSeq int64
+	LastSeq  int64
+}
+
+// Repository appends events and reads channel-scoped snapshots.
+type Repository interface {
+	// Append allocates the next channel-local seq and persists the event,
+	// returning the stored event including Seq and CreatedAt.
+	Append(ctx context.Context, event Event) (Event, error)
+	// Snapshot returns a page of events. after == 0 requests the newest page
+	// (returned in ascending seq order); after > 0 returns events with
+	// seq > after in ascending order. Cursor is the channel's last_seq.
+	Snapshot(ctx context.Context, channel string, after int64, limit int) (SnapshotPage, error)
+	// Bounds returns the first and last persisted seq for the channel.
+	Bounds(ctx context.Context, channel string) (Bounds, error)
 }

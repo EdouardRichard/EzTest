@@ -1,30 +1,23 @@
 import type { Metadata } from "next"
-import { ThemeProvider } from "next-themes"
 import type { ReactNode } from "react"
 
 import { AuthProvider } from "@/features/auth/AuthProvider"
+
 import "@/styles/globals.css"
 
 export const metadata: Metadata = {
   title: {
-    default: "EzTest · AI 端到端测试平台",
+    default: "EzTest · AI 驱动端到端测试",
     template: "%s · EzTest",
   },
-  description: "AI 自主端到端测试平台：版本、需求、用例、执行与证据的可观察闭环。",
+  description: "EzTest 0.2 平台底座：登录、全局壳、资源与版本工作区。",
 }
 
-export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
+export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="zh-CN" suppressHydrationWarning>
+    <html lang="zh-CN">
       <body>
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <AuthProvider>{children}</AuthProvider>
-        </ThemeProvider>
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   )

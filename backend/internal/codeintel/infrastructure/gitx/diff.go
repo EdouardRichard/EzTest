@@ -2,314 +2,260 @@ package gitx
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
-const (
-	// defaultMaxDiffBytes mirrors the design spec §4.2 default of
-	// EZTEST_CODEINTEL_MAX_DIFF_BYTES.
-	defaultMaxDiffBytes = 256 << 10
-	// hardMaxDiffBytes is the highest configured diff bound of design spec §4.2.
-	hardMaxDiffBytes = 1 << 20
-)
+// defaultMaxDiffBytes is the hard fallback for on-demand file patches; the
+// application normally passes codeintel.max_diff_bytes.
+const defaultMaxDiffBytes = 256 << 10
 
-// Diff builds the deterministic file-level change set between base and head by
-// merging `git diff --raw -z` and `git diff --numstat -z` on path (design spec
-// §6.1). Files are sorted by path and cut at MaxChangedFilesStored.
-func (r *GitReader) Diff(ctx context.Context, localPath, base, head string) (domain.ChangeSetData, error) {
-	if !validCommit(base) || !validCommit(head) {
-		return domain.ChangeSetData{}, commitNotFound()
-	}
-	dir, err := r.openRepo(ctx, localPath)
-	if err != nil {
-		return domain.ChangeSetData{}, err
-	}
-	return r.diffAt(ctx, dir, base, head)
-}
-
-// FileDiff returns the on-demand unified diff of one changed file. The change
-// set lookup supplies the authoritative status (so a rename keeps R<score>)
-// and rejects paths outside the change set. Binary and deleted files return an
-// empty patch; a patch over maxBytes or over the 4 MiB command-output bound
-// also returns an empty patch with Truncated=true and no error (design spec
-// §6.1, ruling R18), so an oversized file can never block the UI.
-func (r *GitReader) FileDiff(ctx context.Context, localPath, base, head, path string, maxBytes int) (domain.FileDiff, error) {
-	if !validCommit(base) || !validCommit(head) {
-		return domain.FileDiff{}, commitNotFound()
-	}
-	normalized, err := normalizeRepoPath(path)
-	if err != nil {
-		return domain.FileDiff{}, err
-	}
-	limit := maxBytes
-	if limit <= 0 {
-		limit = defaultMaxDiffBytes
-	}
-	if limit > hardMaxDiffBytes {
-		limit = hardMaxDiffBytes
-	}
-	dir, err := r.openRepo(ctx, localPath)
-	if err != nil {
-		return domain.FileDiff{}, err
-	}
-	changes, err := r.diffAt(ctx, dir, base, head)
-	if err != nil {
-		return domain.FileDiff{}, err
-	}
-	var changed *domain.ChangedFile
-	for index := range changes.Files {
-		if changes.Files[index].Path == normalized {
-			changed = &changes.Files[index]
-			break
-		}
-	}
-	if changed == nil {
-		return domain.FileDiff{}, notChanged()
-	}
-	result := domain.FileDiff{
-		BaseCommit: base,
-		HeadCommit: head,
-		Path:       normalized,
-		Status:     changed.Status,
-		Binary:     changed.Binary,
-	}
-	if changed.Status == "D" || changed.Binary {
-		return result, nil
-	}
-
-	// --no-textconv keeps a repository-configured textconv driver from
-	// executing or rewriting the returned patch; binary files are already
-	// identified by the numstat "-" of the change set above.
-	output, err := r.run(ctx, dir, "diff", "--no-ext-diff", "--no-textconv", "--find-renames", "--unified=3",
-		base+".."+head, "--", literalPathspec(normalized))
-	if err != nil {
-		// R18: an oversized single-file patch is reported as truncated with an
-		// empty patch, never as an operational error that would map to 503.
-		if errors.Is(err, errCommandOutputTooLarge) {
-			result.Truncated = true
-			return result, nil
-		}
-		if operationalError(err) {
-			return domain.FileDiff{}, err
-		}
-		if missingObject(err) {
-			return domain.FileDiff{}, commitNotFound()
-		}
-		return domain.FileDiff{}, fmt.Errorf("gitx: file diff: %w", err)
-	}
-	patch := string(output)
-	// Binary detection comes only from the change set (numstat "-"); sniffing
-	// the patch text would empty a valid text patch whose content happens to
-	// contain a marker such as "Binary files ".
-	if len(patch) > limit {
-		result.Truncated = true
-		return result, nil
-	}
-	result.Patch = patch
-	return result, nil
-}
-
-// diffAt is the shared change-set implementation used by Diff and FileDiff.
-func (r *GitReader) diffAt(ctx context.Context, dir, base, head string) (domain.ChangeSetData, error) {
-	commitRange := base + ".." + head
-	// --no-abbrev is required: raw diff abbreviates object ids by default, but
-	// design spec §6.1 defines headBlobHash as "git-sha1:<40hex>".
-	rawOutput, err := r.run(ctx, dir, "diff", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--find-renames=50%", "--no-abbrev", commitRange)
-	if err != nil {
-		return domain.ChangeSetData{}, diffCommandError(err)
-	}
-	numstatOutput, err := r.run(ctx, dir, "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--find-renames=50%", commitRange)
-	if err != nil {
-		return domain.ChangeSetData{}, diffCommandError(err)
-	}
-	rawChanges, err := parseRawDiff(rawOutput)
-	if err != nil {
-		return domain.ChangeSetData{}, err
-	}
-	numstat, err := parseNumstatDiff(numstatOutput)
-	if err != nil {
-		return domain.ChangeSetData{}, err
-	}
-	files := mergeChangedFiles(rawChanges, numstat)
-	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-
-	stats := changeSetStats{}
-	for _, file := range files {
-		stats.Additions += file.Additions
-		stats.Deletions += file.Deletions
-	}
-	stats.ChangedFiles = len(files)
-	if len(files) > domain.MaxChangedFilesStored {
-		files = files[:domain.MaxChangedFilesStored]
-		stats.ChangedFiles = len(files)
-		stats.Truncated = true
-	}
-	statsJSON, err := json.Marshal(stats)
-	if err != nil {
-		return domain.ChangeSetData{}, fmt.Errorf("gitx: encode change set stats: %w", err)
-	}
-	return domain.ChangeSetData{
-		Stats:     statsJSON,
-		Files:     files,
-		Truncated: stats.Truncated,
-	}, nil
-}
-
-// changeSetStats is the deterministic change-set summary (design spec §6.9
-// event stats shape).
-type changeSetStats struct {
-	Additions    int  `json:"additions"`
-	ChangedFiles int  `json:"changedFiles"`
-	Deletions    int  `json:"deletions"`
-	Truncated    bool `json:"truncated"`
-}
-
-// rawChange is one parsed record of `git diff --raw -z`.
-type rawChange struct {
-	path    string
+// rawDiffEntry is one `git diff --raw -z` record before augmentation by numstat.
+type rawDiffEntry struct {
 	oldPath string
-	status  string
-	newSHA  string
+	newPath string
+	status  byte
+	headSHA string
 }
 
-// numstatChange is one parsed record of `git diff --numstat -z`.
-type numstatChange struct {
+// numstatEntry is one `git diff --numstat -z` record.
+type numstatEntry struct {
 	additions int
 	deletions int
 	binary    bool
 }
 
-// parseRawDiff parses the NUL-separated raw diff records:
-// ":<oldmode> <newmode> <oldsha> <newsha> <status>\x00<path>\x00" for ordinary
-// changes and two path records for renames and copies.
-func parseRawDiff(output []byte) ([]rawChange, error) {
-	records := strings.Split(string(output), "\x00")
-	changes := make([]rawChange, 0, len(records))
-	for index := 0; index < len(records); {
-		header := records[index]
-		index++
-		if header == "" {
-			continue
-		}
-		if !strings.HasPrefix(header, ":") {
-			return nil, fmt.Errorf("%w: raw diff record does not start with ':'", errMalformedOutput)
-		}
-		fields := strings.Fields(header[1:])
-		if len(fields) != 5 || fields[4] == "" {
-			return nil, fmt.Errorf("%w: raw diff record has %d fields", errMalformedOutput, len(fields))
-		}
-		change := rawChange{status: fields[4], newSHA: fields[3]}
-		switch change.status[0] {
-		case 'R', 'C':
-			if index+1 >= len(records) {
-				return nil, fmt.Errorf("%w: raw rename record without two paths", errMalformedOutput)
-			}
-			change.oldPath = records[index]
-			change.path = records[index+1]
-			index += 2
-		default:
-			if index >= len(records) {
-				return nil, fmt.Errorf("%w: raw record without a path", errMalformedOutput)
-			}
-			change.path = records[index]
-			index++
-		}
-		if change.path == "" {
-			return nil, fmt.Errorf("%w: raw record with an empty path", errMalformedOutput)
-		}
-		changes = append(changes, change)
+// Diff returns the bounded base..head change set. It parses the raw status
+// stream (A/M/D/R/C/T, rename old path) and the numstat stream (additions,
+// deletions, binary marker); both use -z so filenames with spaces or shell
+// metacharacters are never re-tokenized.
+func (g *Git) Diff(ctx context.Context, repoPath, base, head string, max int) (codeintel.DiffResult, error) {
+	if max <= 0 {
+		max = codeintel.MaxChangedFilesStored
 	}
-	return changes, nil
+	baseSHA, err := g.resolveVerified(ctx, repoPath, base)
+	if err != nil {
+		return codeintel.DiffResult{}, err
+	}
+	headSHA, err := g.resolveVerified(ctx, repoPath, head)
+	if err != nil {
+		return codeintel.DiffResult{}, err
+	}
+	if baseSHA == headSHA {
+		return codeintel.DiffResult{Files: []codeintel.ChangedFile{}}, nil
+	}
+
+	rawOutput, stderr, err := g.execute(ctx, repoPath, "diff", "--raw", "--no-abbrev", "-z", "--no-ext-diff",
+		"--find-renames=50%", "--find-copies=50%", baseSHA, headSHA)
+	if err != nil {
+		return codeintel.DiffResult{}, g.mapExecutionError(stderr, err)
+	}
+	rawEntries, err := parseRawDiff(rawOutput)
+	if err != nil {
+		return codeintel.DiffResult{}, apiError(http.StatusInternalServerError, CodeCommandFailed, "git returned malformed raw diff output")
+	}
+	numstatOutput, stderr, err := g.execute(ctx, repoPath, "diff", "--numstat", "-z", "--no-ext-diff",
+		"--find-renames=50%", "--find-copies=50%", baseSHA, headSHA)
+	if err != nil {
+		return codeintel.DiffResult{}, g.mapExecutionError(stderr, err)
+	}
+	numstats := parseNumstat(numstatOutput)
+
+	files := make([]codeintel.ChangedFile, 0, len(rawEntries))
+	for _, entry := range rawEntries {
+		stats := numstats[entry.newPath]
+		changed := codeintel.ChangedFile{
+			Path:        entry.newPath,
+			Status:      changedFileStatus(entry.status),
+			Additions:   stats.additions,
+			Deletions:   stats.deletions,
+			Binary:      stats.binary,
+			HeadBlobSHA: headBlobSHA(entry.status, entry.headSHA),
+		}
+		if entry.oldPath != entry.newPath {
+			changed.OldPath = entry.oldPath
+		}
+		files = append(files, changed)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	total := len(files)
+	truncated := total > max
+	if truncated {
+		files = files[:max]
+	}
+	return codeintel.DiffResult{Files: files, Truncated: truncated}, nil
 }
 
-// parseNumstatDiff parses the NUL-separated numstat records. A rename record
-// carries an empty path field followed by the old and new path records.
-func parseNumstatDiff(output []byte) (map[string]numstatChange, error) {
-	records := strings.Split(string(output), "\x00")
-	changes := make(map[string]numstatChange, len(records))
-	for index := 0; index < len(records); {
-		record := records[index]
+// FileDiff returns one on-demand unified=3 patch. Binary, deleted and oversized
+// files return an empty patch with the matching flag (spec §5.1).
+func (g *Git) FileDiff(ctx context.Context, repoPath, base, head, filePath string, maxBytes int) (codeintel.FileDiff, error) {
+	normalized, err := normalizeGitPath(filePath)
+	if err != nil {
+		return codeintel.FileDiff{}, err
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxDiffBytes
+	}
+	baseSHA, err := g.resolveVerified(ctx, repoPath, base)
+	if err != nil {
+		return codeintel.FileDiff{}, err
+	}
+	headSHA, err := g.resolveVerified(ctx, repoPath, head)
+	if err != nil {
+		return codeintel.FileDiff{}, err
+	}
+	filter := ":(literal)" + normalized
+
+	rawOutput, stderr, err := g.execute(ctx, repoPath, "diff", "--raw", "--no-abbrev", "-z", "--no-ext-diff",
+		"--find-renames=50%", "--find-copies=50%", baseSHA, headSHA, "--", filter)
+	if err != nil {
+		return codeintel.FileDiff{}, g.mapExecutionError(stderr, err)
+	}
+	rawEntries, err := parseRawDiff(rawOutput)
+	if err != nil {
+		return codeintel.FileDiff{}, apiError(http.StatusInternalServerError, CodeCommandFailed, "git returned malformed raw diff output")
+	}
+	if len(rawEntries) == 0 {
+		return codeintel.FileDiff{Path: normalized}, nil
+	}
+	entry := rawEntries[0]
+	if entry.status == 'D' {
+		return codeintel.FileDiff{Path: normalized, Deleted: true}, nil
+	}
+
+	numstatOutput, stderr, err := g.execute(ctx, repoPath, "diff", "--numstat", "-z", "--no-ext-diff",
+		"--find-renames=50%", "--find-copies=50%", baseSHA, headSHA, "--", filter)
+	if err != nil {
+		return codeintel.FileDiff{}, g.mapExecutionError(stderr, err)
+	}
+	if stats, ok := parseNumstat(numstatOutput)[normalized]; ok && stats.binary {
+		return codeintel.FileDiff{Path: normalized, Binary: true}, nil
+	}
+
+	patchOutput, stderr, err := g.execute(ctx, repoPath, "diff", "--unified=3", "--no-ext-diff",
+		baseSHA, headSHA, "--", filter)
+	if err != nil {
+		return codeintel.FileDiff{}, g.mapExecutionError(stderr, err)
+	}
+	if len(patchOutput) > maxBytes {
+		return codeintel.FileDiff{Path: normalized, Truncated: true}, nil
+	}
+	if !utf8.Valid(patchOutput) {
+		return codeintel.FileDiff{Path: normalized, Binary: true}, nil
+	}
+	return codeintel.FileDiff{Path: normalized, Patch: string(patchOutput)}, nil
+}
+
+// parseRawDiff parses `git diff --raw -z` records. Rename/copy records carry
+// two NUL-separated path tokens, so filenames cannot inject extra entries.
+func parseRawDiff(raw []byte) ([]rawDiffEntry, error) {
+	tokens := splitNUL(raw)
+	entries := make([]rawDiffEntry, 0, len(tokens))
+	for index := 0; index < len(tokens); {
+		record := tokens[index]
+		if record == "" {
+			index++
+			continue
+		}
+		if !strings.HasPrefix(record, ":") {
+			return nil, fmt.Errorf("raw diff record does not start with ':'")
+		}
+		fields := strings.Fields(record[1:])
+		if len(fields) != 5 || len(fields[4]) == 0 {
+			return nil, fmt.Errorf("raw diff record has %d fields", len(fields))
+		}
+		status := fields[4][0]
+		index++
+		entry := rawDiffEntry{status: status, headSHA: fields[3]}
+		if status == 'R' || status == 'C' {
+			if index+1 >= len(tokens) {
+				return nil, fmt.Errorf("raw diff rename record is truncated")
+			}
+			entry.oldPath = tokens[index]
+			entry.newPath = tokens[index+1]
+			index += 2
+		} else {
+			if index >= len(tokens) {
+				return nil, fmt.Errorf("raw diff record is truncated")
+			}
+			entry.newPath = tokens[index]
+			entry.oldPath = entry.newPath
+			index++
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// parseNumstat parses `git diff --numstat -z` records. Binary files carry "-"
+// for both counts; rename/copy records put an empty path first and the old/new
+// paths in the following two NUL tokens.
+func parseNumstat(raw []byte) map[string]numstatEntry {
+	tokens := splitNUL(raw)
+	entries := make(map[string]numstatEntry, len(tokens))
+	for index := 0; index < len(tokens); {
+		record := tokens[index]
 		index++
 		if record == "" {
 			continue
 		}
 		fields := strings.SplitN(record, "\t", 3)
 		if len(fields) != 3 {
-			return nil, fmt.Errorf("%w: numstat record has %d fields", errMalformedOutput, len(fields))
+			continue
 		}
-		path := fields[2]
-		if path == "" {
-			if index+1 >= len(records) {
-				return nil, fmt.Errorf("%w: numstat rename without two paths", errMalformedOutput)
-			}
-			path = records[index+1]
+		filePath := fields[2]
+		if filePath == "" && index+1 < len(tokens) {
+			filePath = tokens[index+1]
 			index += 2
 		}
-		if path == "" {
-			return nil, fmt.Errorf("%w: numstat record with an empty path", errMalformedOutput)
+		entry := numstatEntry{binary: fields[0] == "-" && fields[1] == "-"}
+		if !entry.binary {
+			entry.additions, _ = strconv.Atoi(fields[0])
+			entry.deletions, _ = strconv.Atoi(fields[1])
 		}
-		change := numstatChange{}
-		if fields[0] == "-" && fields[1] == "-" {
-			change.binary = true
-		} else {
-			additions, err := strconv.Atoi(fields[0])
-			if err != nil {
-				return nil, fmt.Errorf("%w: numstat additions %q", errMalformedOutput, fields[0])
-			}
-			deletions, err := strconv.Atoi(fields[1])
-			if err != nil {
-				return nil, fmt.Errorf("%w: numstat deletions %q", errMalformedOutput, fields[1])
-			}
-			change.additions = additions
-			change.deletions = deletions
-		}
-		changes[path] = change
+		entries[filePath] = entry
 	}
-	return changes, nil
+	return entries
 }
 
-// mergeChangedFiles joins the raw statuses and the numstat line counts by path.
-func mergeChangedFiles(raw []rawChange, numstat map[string]numstatChange) []domain.ChangedFile {
-	files := make([]domain.ChangedFile, 0, len(raw))
-	for _, change := range raw {
-		file := domain.ChangedFile{Path: change.path, Status: change.status}
-		if change.oldPath != "" {
-			oldPath := change.oldPath
-			file.OldPath = &oldPath
-		}
-		if !isZeroSHA(change.newSHA) {
-			file.HeadBlobHash = "git-sha1:" + change.newSHA
-		}
-		if stats, ok := numstat[change.path]; ok {
-			file.Additions = stats.additions
-			file.Deletions = stats.deletions
-			file.Binary = stats.binary
-		}
-		files = append(files, file)
+// changedFileStatus maps a raw status letter to the four API status values.
+func changedFileStatus(status byte) string {
+	switch status {
+	case 'A':
+		return "added"
+	case 'D':
+		return "deleted"
+	case 'R':
+		return "renamed"
+	case 'C':
+		// A copy is a new file on the head side; old_path is kept for context.
+		return "added"
+	default:
+		return "modified"
 	}
-	return files
 }
 
-// isZeroSHA reports the all-zero object id git prints for the absent side of an
-// added, deleted or type-changed entry.
-func isZeroSHA(sha string) bool {
-	return strings.Trim(sha, "0") == ""
+// headBlobSHA returns the head-side blob SHA, or nil for a deletion.
+func headBlobSHA(status byte, sha string) *string {
+	if status == 'D' || sha == "" || strings.Trim(sha, "0") == "" {
+		return nil
+	}
+	value := sha
+	return &value
 }
 
-// diffCommandError maps a failed diff command to the domain vocabulary.
-func diffCommandError(err error) error {
-	if operationalError(err) {
-		return err
+// normalizeGitPath applies the shared repo-relative path rules and maps any
+// rejection to the stable path_escape code.
+func normalizeGitPath(raw string) (string, error) {
+	normalized, err := codeintel.NormalizeRepoPath(raw)
+	if err != nil {
+		return "", apiError(http.StatusUnprocessableEntity, CodePathEscape, "path must be a normalized repo-relative path")
 	}
-	if missingObject(err) {
-		return commitNotFound()
-	}
-	return fmt.Errorf("gitx: diff: %w", err)
+	return normalized, nil
 }

@@ -1,185 +1,220 @@
-/** Shared DTOs for the P2 public-resource API (spec §7). */
+/** Wire types shared by the resources console (contracts/openapi.yaml). */
 
-export type SystemDTO = {
-  id: number
-  key: string
-  name: string
-  kind: "web" | "api"
-  baseUrl: string
-  defaultSessionTtlSeconds: number
-  notes: string
-  status: string
-  createdAt: string
-  updatedAt: string
-}
+export type ResourceTab = "suts" | "pages" | "data" | "repos"
 
-export type EnvironmentDTO = {
-  id: number
-  systemId: number
-  key: string
-  name: string
-  baseUrl: string
-  kind: string
-  isProd: boolean
-  allowedHosts: string[]
-  loginCheck: { url: string; expectStatus: number[]; bodyContains: string } | null
-  allowAutoLogin: boolean
-  requireApproval: boolean
-}
+export type ResourceStatus = "active" | "disabled"
 
-export type AppModelNodeDTO = {
-  id: number
-  systemId: number
-  parentId: number | null
-  kind: string
-  key: string
-  name: string
-  path: string
-  method: string
-  source: string
-  meta: unknown
-}
+export type ApiMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
 
-export type AccountDTO = {
-  id: number
-  key: string
-  label: string
-  username: string
-  kind: string
-  status: string
-  notes: string
-}
+export type PageStatus = "approved" | "proposed" | "rejected"
 
-export type AccessDTO = {
-  id: number
-  accountId: number
-  systemId: number
-  authType: string
-  credentialSet: boolean
-  usernameOverride: string
-  loginUrl: string
-  enabled: boolean
-  concurrencyLimit: number
-  sessionTtlSeconds: number | null
-  permissionNote: string
-  /** Bound auto-login recipe id (decimal string) or null (spec §3.4). */
-  login_flow_id?: string | null
-}
+export type PageSource = "admin" | "ai" | "import"
 
-/** Minimal form login recipe definition (spec §3.4). */
-export type AuthFlowDefinitionDTO = {
-  login_url: string
-  username_selector: string
-  password_selector: string
-  submit_selector: string
-  success: { url_contains?: string; selector?: string }
-  failure: { mfa_selector?: string; captcha_selector?: string; invalid_selector?: string }
-  timeout_ms: number
-}
+export type ApiSource = "code" | "openapi" | "ai" | "manual" | "import"
 
-/** Login recipe (auth_flow) of one system; ids are decimal strings (spec §6.1). */
-export type AuthFlowDTO = {
+export type SutPage = {
   id: string
-  system_id: string
+  sut_id: string
+  environment_id: string
   name: string
-  kind: string
-  definition: AuthFlowDefinitionDTO
-  enabled: boolean
+  url: string
+  route_template: string
+  page_type: string
+  auth_role: string
+  module: string
+  status: PageStatus
+  source: PageSource
   created_at: string
   updated_at: string
 }
 
-export type SnapshotDTO = {
-  id: number
-  sessionId: number
-  kind: string
-  items: unknown
-  summary: unknown
-  permissionHash: string
-  degraded: boolean
-  capturedAt: string
-}
-
-export type SessionDTO = {
-  id: number
-  accountId: number
-  systemId: number
-  environmentId: number
-  accessId: number
-  state: string
-  acquisition: string
-  storageStateKind: string
-  cookieCount: number
-  originCount: number
-  storageStateHash: string
-  expiresAt: string | null
-  lastValidatedAt: string | null
-  lastUsedAt: string | null
-  failureReason: string
-  invalidatedReason: string
-  expiring: boolean
-  latestSnapshot?: SnapshotDTO | null
-  activeLease?: { holder: string; expiresAt: string } | null
-  latestTakeover?: { id: number; status: string; reason: string } | null
-}
-
-/** Normalized cursor page used by every resource list call. */
-export type Page<T> = {
-  items: T[]
-  nextCursor: string | null
-  hasMore: boolean
-}
-
-/**
- * Environment read-only PostgreSQL target (spec §7.8). Snowflake ids stay
- * decimal strings; the password never appears in the DTO, only `credentialSet`.
- */
-export type DBTargetDTO = {
+export type SutApi = {
   id: string
+  sut_id: string
+  environment_id: string
+  method: ApiMethod
+  path_template: string
+  name: string
+  auth_role: string
+  source: ApiSource
+  status: PageStatus
+  schema_ref: string
+  created_at: string
+  updated_at: string
+}
+
+export type TargetDatabase = {
+  id: string
+  sut_id: string
+  environment_id: string
+  name: string
+  dsn: string
+  username: string
+  password_set: boolean
+  read_only: boolean
+  status: ResourceStatus
+  created_at: string
+  updated_at: string
+}
+
+export type TestAccount = {
+  id: string
+  sut_id: string
+  environment_id: string
+  username: string
+  roles: string[]
+  notes: string
+  password_set: boolean
+  status: ResourceStatus
+  created_at: string
+  updated_at: string
+}
+
+export type SutEnvironment = {
+  id: string
+  sut_id: string
+  name: string
+  base_url: string
+  is_default: boolean
+  status: ResourceStatus
+  pages: SutPage[]
+  apis: SutApi[]
+  databases: TargetDatabase[]
+  accounts: TestAccount[]
+  created_at: string
+  updated_at: string
+}
+
+export type Sut = {
+  id: string
+  name: string
+  intro: string
+  /** Optional lowercase system family used by `knowledge.scope='system'` (P7). */
+  family?: string | null
+  environments: SutEnvironment[]
+  created_at: string
+  updated_at: string
+}
+
+export type CodeRepository = {
+  id: string
+  name: string
+  path: string
+  branch: string
+  include: string[]
+  exclude: string[]
+  created_by: string
+  status: ResourceStatus
+  created_at: string
+  updated_at: string
+}
+
+export type ImportResult<T> = {
+  created: number
+  skipped: number
+  items: T[]
+}
+
+/* ---------------------------- page/API proposals --------------------------- */
+
+/** `CodeProposalCounts` from `POST /versions/{id}/code/page-api-proposals`. */
+export type CodeProposalCounts = {
+  created: number
+  skipped: number
+  ids: string[]
+}
+
+/** `CodeProposalResultView` (server runs synchronously, ≤200 items). */
+export type CodeProposalResult = {
+  pages: CodeProposalCounts
+  apis: CodeProposalCounts
+}
+
+export type CodeProposalKind = "page" | "api"
+
+/** `CodeProposalView`: a proposed resource plus its code/network evidence. */
+export type CodeProposal = {
+  kind: CodeProposalKind
+  id: string
+  name: string
+  url?: string | null
+  route_template?: string | null
+  method?: string | null
+  path_template?: string | null
+  status: "proposed"
+  source: "ai" | "code"
+  evidence?: Record<string, unknown>[]
+  created_at: string
+}
+
+/** Editable shape of the create-SUT form (SUT + its first default environment). */
+export type SutFormValues = {
+  name: string
+  intro: string
+  family?: string
+  environmentName: string
+  baseUrl: string
+}
+
+export type EnvironmentFormValues = {
+  name: string
+  baseUrl: string
+  isDefault: boolean
+  status: ResourceStatus
+}
+
+export type PageFormValues = {
+  name: string
+  url: string
+  routeTemplate: string
+  pageType: string
+  authRole: string
+  module: string
+}
+
+export type ApiFormValues = {
+  name: string
+  method: ApiMethod
+  pathTemplate: string
+  authRole: string
+  schemaRef: string
+}
+
+export type DatabaseFormValues = {
   environmentId: string
   name: string
-  host: string
-  port: number
-  database: string
+  dsn: string
   username: string
-  credentialSet: boolean
-  sslmode: string
-  connectTimeoutMs: number
-  statementTimeoutMs: number
-  maxRows: number
-  enabled: boolean
-  lastTestedAt: string | null
-  lastTestStatus: string
-  lastTestMessage: string
-  createdAt: string
-  updatedAt: string
+  password: string
+  readOnly: boolean
 }
 
-/**
- * Writable db target fields of spec §7.8. `password` is omitted when the user
- * leaves the field blank, which keeps the stored credential.
- */
-export type DBTargetWriteInput = {
-  name?: string
-  host: string
-  port: number
-  database: string
+export type AccountFormValues = {
+  environmentId: string
   username: string
-  password?: string
-  sslmode?: string
-  connectTimeoutMs?: number
-  statementTimeoutMs?: number
-  maxRows?: number
-  enabled?: boolean
+  password: string
+  roles: string
+  notes: string
 }
 
-/** Result of one connection probe; a failed probe is a 200 with ok=false. */
-export type DBTargetTestResultDTO = {
-  ok: boolean
-  latencyMs: number
-  serverVersion?: string
-  currentUser?: string
-  transactionReadOnly: boolean
-  warnings: string[]
-  error?: { reason: string; message: string }
+export type RepositoryFormValues = {
+  name: string
+  path: string
+  branch: string
+  include: string
+  exclude: string
+}
+
+export type FormErrors<T> = Partial<Record<keyof T, string>>
+
+/** Shared page-level resource scope (selected SUT + environment). */
+export type ResourceScope = {
+  suts: Sut[]
+  sutId: string
+  environmentId: string
+  detail: Sut | null
+  loading: boolean
+  detailLoading: boolean
+  error: unknown
+  detailError: unknown
 }

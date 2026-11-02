@@ -1,6 +1,9 @@
+import type { Metadata } from "next"
+
 import { KnowledgePage } from "@/features/knowledge/KnowledgePage"
 
-/** `/knowledge` route: the global read-only approved knowledge centre (spec §9.4). */
-export default function KnowledgeRoutePage() {
+export const metadata: Metadata = { title: "知识" }
+
+export default function KnowledgeRoute() {
   return <KnowledgePage />
 }

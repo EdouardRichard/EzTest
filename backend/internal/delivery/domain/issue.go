@@ -1,424 +1,182 @@
-package domain
+package delivery
 
-import (
-	"fmt"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
-	"unicode/utf8"
+import "errors"
+
+// Domain sentinel errors. Repositories and use cases translate them onto the
+// stable platform API envelope outside this package (spec §4/§5.2).
+var (
+	// ErrInvalidArgument reports a malformed issue candidate or merge input.
+	ErrInvalidArgument = errors.New("delivery: invalid argument")
+	// ErrStateConflict reports an illegal issue lifecycle transition.
+	ErrStateConflict = errors.New("delivery: state conflict")
+	// ErrNotFound reports a missing delivery entity.
+	ErrNotFound = errors.New("not found")
 )
 
-// Issue field vocabularies (spec §5.4). They mirror the issue DDL CHECK
-// constraints so a rejected value is a domain error, never a raw adapter error.
+// MaxIssueMergeChain bounds how many merged_into hops ValidateMerge follows
+// (spec §5.2) and how many hops recurrence redirection walks (spec §4.6). A
+// chain still open after this budget is rejected as merge_target_invalid, never
+// as merge_cycle: the walk stops before it could prove that the chain reaches
+// the source.
+const MaxIssueMergeChain = 16
+
+// IssueRefRoleRecurrence is the ref role of a recurring failure redirected to a
+// merge target (spec §4.6). Source refs keep IssueRefRoleSource; the unique
+// (issue_id, kind, ref_id, role) key makes a repeated recurrence ref a no-op.
+const IssueRefRoleRecurrence = "recurrence"
+
+// Stable merge conflict reasons (spec §5.2 details.reason subcodes).
 const (
-	SourceAI    = "ai"
-	SourceHuman = "human"
-
-	CategoryDefect         = "defect"
-	CategoryRequirementGap = "requirement_gap"
-	CategoryOther          = "other"
-
-	SeverityBlocker = "blocker"
-	SeverityMajor   = "major"
-	SeverityMinor   = "minor"
-	SeverityInfo    = "info"
-
-	StatusOpen      = "open"
-	StatusConfirmed = "confirmed"
-	StatusDismissed = "dismissed"
-
-	ConfidenceHigh   = "high"
-	ConfidenceMedium = "medium"
-	ConfidenceLow    = "low"
-
-	FailureClassApplication = "application"
-	FailureClassEnvironment = "environment"
-	FailureClassSession     = "session"
-	FailureClassModel       = "model"
-	FailureClassCase        = "case"
-
-	// MaxIssueTitleRunes is the issue.title CHECK bound (spec §4.2.1).
-	MaxIssueTitleRunes = 200
-	// MaxIssueQueryRunes bounds the issue list's fuzzy title filter (spec §7.3).
-	MaxIssueQueryRunes = 100
+	// MergeReasonTargetInvalid marks a self, cross-version, unknown or already
+	// merged target.
+	MergeReasonTargetInvalid = "merge_target_invalid"
+	// MergeReasonCycle marks a merge whose target chain reaches the source.
+	MergeReasonCycle = "merge_cycle"
 )
 
-// IssueRef kinds (spec §4.2.1). ref_id is text so a commit SHA and Snowflake
-// ids share one column.
-const (
-	RefKindCaseRun     = "case_run"
-	RefKindCaseNode    = "case_node"
-	RefKindStepResult  = "step_result"
-	RefKindEvidence    = "evidence"
-	RefKindRequirement = "requirement"
-	RefKindBatch       = "batch"
-	RefKindCommit      = "commit"
-	RefKindCodeAnchor  = "code_anchor"
-)
-
-// Issue is the durable, deduplicated defect or requirement gap (spec §4.2.1,
-// plan Shared Interfaces). The issue table is the aggregate root; references
-// live in IssueRef rows.
-type Issue struct {
-	ID              int64
-	VersionID       int64
-	BatchID         *int64
-	CaseRunID       *int64
-	CaseNodeID      *int64
-	StepResultID    *int64
-	Source          string
-	Category        string
-	Severity        string
-	Status          string
-	Confidence      string
-	FailureClass    string
-	DedupeKey       string
-	Title           string
-	Description     string
-	ReproSteps      string
-	Expected        string
-	Actual          string
-	RerunSuggestion string
-	ExternalRef     string
-	RecurrenceCount int
-	Revision        int
-	CreatedBy       int64
-	UpdatedBy       int64
-	ConfirmedBy     *int64
-	DismissedBy     *int64
-	ConfirmedAt     *time.Time
-	DismissedAt     *time.Time
-	DismissedReason string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-}
-
-// IssueRef is one durable reference of an issue (spec §4.2.1). RefID is the
-// decimal string form of a Snowflake id, a 40-hex commit, or a code_anchor id.
-type IssueRef struct {
-	IssueID int64
-	RefKind string
-	RefID   string
-}
-
-// CodeRef is one code location reported with an AI issue candidate. The service
-// validates it against the version's repository before it creates a code anchor
-// (spec §5.4); a malformed entry is dropped best-effort and never blocks the
-// issue from landing.
-type CodeRef struct {
-	Path   string
-	Line   int
+// MergeError is a rejected merge with the stable business reason required by
+// the API envelope. It unwraps to ErrStateConflict so callers can map it to 409
+// while preserving details.reason.
+type MergeError struct {
 	Reason string
 }
 
-// IssueDraft is one AI issue candidate produced by failure analysis, issue
-// triage or supplement escalation (spec §5.6, plan Shared Interfaces). The
-// service hard-dedupes every draft by (version_id, dedupe_key): source is always
-// ai for a draft, human issues are created through CreateHuman.
-type IssueDraft struct {
-	DedupeKey        string
-	Title            string
-	Description      string
-	ReproSteps       string
-	Expected         string
-	Actual           string
-	RerunSuggestion  string
-	Severity         string
-	Confidence       string
-	Category         string
-	FailureClass     string
-	CaseRunID        *int64
-	CaseNodeID       *int64
-	EvidenceIDs      []int64
-	CodeRefs         []CodeRef
-	RequirementIDs   []int64
-	MergeIntoIssueID *int64
-}
+// Error implements error.
+func (e *MergeError) Error() string { return "delivery: merge rejected: " + e.Reason }
 
-// CanTransition reports whether the issue state machine allows from -> to
-// (spec §5.4): open may become confirmed or dismissed; both are terminal and
-// P7 never reopens them.
-func CanTransition(from, to string) bool {
-	return from == StatusOpen && (to == StatusConfirmed || to == StatusDismissed)
-}
+// Unwrap exposes ErrStateConflict to errors.Is.
+func (e *MergeError) Unwrap() error { return ErrStateConflict }
 
-// IsTerminalStatus reports whether status is a terminal issue state.
-func IsTerminalStatus(status string) bool {
-	return status == StatusConfirmed || status == StatusDismissed
-}
-
-// ConfidenceRank orders confidence so a recurrence can raise it and never lower
-// it (spec §5.4). Unknown values rank lowest.
-func ConfidenceRank(confidence string) int {
-	switch confidence {
-	case ConfidenceHigh:
-		return 3
-	case ConfidenceMedium:
-		return 2
-	case ConfidenceLow:
-		return 1
+// CanTransitionIssue reports whether the P4 issue state machine allows moving
+// from one status to another (spec §5.2). merged is terminal in P4: it has no
+// outgoing transition, including unmerge or reopen.
+func CanTransitionIssue(from, to IssueStatus) bool {
+	switch from {
+	case IssueStatusOpen:
+		return to == IssueStatusConfirmed || to == IssueStatusDismissed || to == IssueStatusMerged
+	case IssueStatusConfirmed, IssueStatusDismissed:
+		return to == IssueStatusOpen || to == IssueStatusMerged
 	default:
-		return 0
-	}
-}
-
-// SeverityRank orders severity for the issue list (spec §7.3): blocker first,
-// then major, minor and info.
-func SeverityRank(severity string) int {
-	switch severity {
-	case SeverityBlocker:
-		return 0
-	case SeverityMajor:
-		return 1
-	case SeverityMinor:
-		return 2
-	case SeverityInfo:
-		return 3
-	default:
-		return 4
-	}
-}
-
-// ValidateTitle trims and bounds an issue title (spec §4.2.1: non-empty, at
-// most 200 characters) and returns the stored form.
-func ValidateTitle(title string) (string, error) {
-	trimmed := strings.TrimSpace(title)
-	if trimmed == "" {
-		return "", NewInvalid("title", ReasonInvalidArgument, "title must not be empty")
-	}
-	if utf8.RuneCountInString(trimmed) > MaxIssueTitleRunes {
-		return "", NewInvalid("title", ReasonInvalidArgument,
-			fmt.Sprintf("title must be at most %d characters", MaxIssueTitleRunes))
-	}
-	return trimmed, nil
-}
-
-// ValidateSeverity enforces the severity enum.
-func ValidateSeverity(severity string) error {
-	switch severity {
-	case SeverityBlocker, SeverityMajor, SeverityMinor, SeverityInfo:
-		return nil
-	default:
-		return NewInvalid("severity", ReasonInvalidArgument,
-			fmt.Sprintf("severity %q is not blocker, major, minor or info", severity))
-	}
-}
-
-// ValidateCategory enforces the category enum.
-func ValidateCategory(category string) error {
-	switch category {
-	case CategoryDefect, CategoryRequirementGap, CategoryOther:
-		return nil
-	default:
-		return NewInvalid("category", ReasonInvalidArgument,
-			fmt.Sprintf("category %q is not defect, requirement_gap or other", category))
-	}
-}
-
-// ValidateConfidence enforces the confidence enum.
-func ValidateConfidence(confidence string) error {
-	switch confidence {
-	case ConfidenceHigh, ConfidenceMedium, ConfidenceLow:
-		return nil
-	default:
-		return NewInvalid("confidence", ReasonInvalidArgument,
-			fmt.Sprintf("confidence %q is not high, medium or low", confidence))
-	}
-}
-
-// ValidateFailureClass enforces the failure class enum.
-func ValidateFailureClass(class string) error {
-	switch class {
-	case FailureClassApplication, FailureClassEnvironment, FailureClassSession,
-		FailureClassModel, FailureClassCase:
-		return nil
-	default:
-		return NewInvalid("failureClass", ReasonInvalidArgument,
-			fmt.Sprintf("failure class %q is not application, environment, session, model or case", class))
-	}
-}
-
-// ValidateDedupeKey enforces the lowercase sha256 shape of spec §4.2.1.
-func ValidateDedupeKey(key string) error {
-	if !isLowerHex(key, 64) {
-		return NewInvalid("dedupeKey", ReasonInvalidArgument,
-			"dedupeKey must be a lowercase 64-character sha256")
-	}
-	return nil
-}
-
-// ValidateIssueRef validates one ref against its kind (spec §5.4): id kinds are
-// positive decimal ids, a commit is 40 lowercase hex, and the kind is one of the
-// durable issue_ref kinds. Cross-context ownership is checked by the service's
-// IssueRefValidator port, never by the domain.
-func ValidateIssueRef(refKind, refID string) error {
-	switch refKind {
-	case RefKindCaseRun, RefKindCaseNode, RefKindStepResult, RefKindEvidence,
-		RefKindRequirement, RefKindBatch, RefKindCodeAnchor:
-		id, err := strconv.ParseInt(refID, 10, 64)
-		if err != nil || id <= 0 || strconv.FormatInt(id, 10) != refID {
-			return NewInvalid("refs", ReasonIssueRefInvalid,
-				fmt.Sprintf("%s issue ref %q is not a positive decimal id", refKind, refID))
-		}
-		return nil
-	case RefKindCommit:
-		if !isLowerHex(refID, 40) {
-			return NewInvalid("refs", ReasonIssueRefInvalid,
-				fmt.Sprintf("commit issue ref %q is not a 40-character lowercase sha", refID))
-		}
-		return nil
-	default:
-		return NewInvalid("refs", ReasonIssueRefInvalid,
-			fmt.Sprintf("issue ref kind %q is not valid", refKind))
-	}
-}
-
-// NormalizeIssueRefs returns the refs sorted by kind then id with duplicates
-// removed. The stored order is therefore deterministic for every caller.
-func NormalizeIssueRefs(refs []IssueRef) []IssueRef {
-	if len(refs) == 0 {
-		return nil
-	}
-	unique := make(map[string]IssueRef, len(refs))
-	keys := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		key := ref.RefKind + "\x00" + ref.RefID
-		if _, exists := unique[key]; exists {
-			continue
-		}
-		unique[key] = ref
-		keys = append(keys, key)
-	}
-	normalized := make([]IssueRef, 0, len(keys))
-	for _, key := range keys {
-		normalized = append(normalized, unique[key])
-	}
-	sort.Slice(normalized, func(i, j int) bool {
-		if normalized[i].RefKind != normalized[j].RefKind {
-			return normalized[i].RefKind < normalized[j].RefKind
-		}
-		return issueRefIDLess(normalized[i].RefID, normalized[j].RefID)
-	})
-	return normalized
-}
-
-// MergeOccurrence folds one repeated occurrence into an existing issue (spec
-// §5.4): recurrence_count increments, the confidence is raised to the higher
-// value, a non-empty actual replaces the stored one, the revision is bumped for
-// the OCC contract, and the status is never changed (confirmed/dismissed issues
-// receive occurrences without reopening).
-func MergeOccurrence(issue Issue, confidence, actual string, actor int64, now time.Time) Issue {
-	issue.RecurrenceCount++
-	if ConfidenceRank(confidence) > ConfidenceRank(issue.Confidence) {
-		issue.Confidence = confidence
-	}
-	if strings.TrimSpace(actual) != "" {
-		issue.Actual = actual
-	}
-	issue.Revision++
-	issue.UpdatedBy = actor
-	issue.UpdatedAt = now
-	return issue
-}
-
-// ValidateIssueDraft enforces the AI single-issue rules of spec §5.4: a dedupe
-// key, a title, a severity, a confidence and a category are mandatory; a defect
-// needs failure_class=application and a case node; a requirement gap needs at
-// least one requirement and may leave the failure class empty. It never mutates
-// the draft; the service normalizes defaults after validation.
-func ValidateIssueDraft(draft IssueDraft) error {
-	if err := ValidateDedupeKey(draft.DedupeKey); err != nil {
-		return err
-	}
-	if _, err := ValidateTitle(draft.Title); err != nil {
-		return err
-	}
-	if err := ValidateSeverity(draft.Severity); err != nil {
-		return err
-	}
-	if err := ValidateConfidence(draft.Confidence); err != nil {
-		return err
-	}
-	category := draft.Category
-	if category == "" {
-		category = CategoryDefect
-	}
-	if err := ValidateCategory(category); err != nil {
-		return err
-	}
-	if draft.CaseRunID != nil && *draft.CaseRunID <= 0 {
-		return NewInvalid("caseRunId", ReasonInvalidArgument, "caseRunId must be a positive id")
-	}
-	if draft.CaseNodeID != nil && *draft.CaseNodeID <= 0 {
-		return NewInvalid("caseNodeId", ReasonInvalidArgument, "caseNodeId must be a positive id")
-	}
-	if draft.MergeIntoIssueID != nil && *draft.MergeIntoIssueID <= 0 {
-		return NewInvalid("mergeIntoIssueId", ReasonInvalidArgument, "mergeIntoIssueId must be a positive id")
-	}
-	for _, evidenceID := range draft.EvidenceIDs {
-		if evidenceID <= 0 {
-			return NewInvalid("evidenceIds", ReasonInvalidArgument,
-				fmt.Sprintf("evidence id %d must be positive", evidenceID))
-		}
-	}
-	for _, requirementID := range draft.RequirementIDs {
-		if requirementID <= 0 {
-			return NewInvalid("requirementIds", ReasonInvalidArgument,
-				fmt.Sprintf("requirement id %d must be positive", requirementID))
-		}
-	}
-
-	if category == CategoryRequirementGap {
-		if len(draft.RequirementIDs) == 0 {
-			return NewInvalid("requirementIds", ReasonInvalidArgument,
-				"a requirement_gap issue must reference at least one requirement")
-		}
-		// Spec §5.4 only requires failure_class to be valid (or empty) for a
-		// requirement gap; the defect-only application rule must not leak here.
-		if draft.FailureClass != "" {
-			if err := ValidateFailureClass(draft.FailureClass); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if draft.FailureClass == "" {
-		return NewInvalid("failureClass", ReasonInvalidArgument,
-			"an AI defect issue requires failureClass=application")
-	}
-	if draft.FailureClass != FailureClassApplication {
-		return NewInvalid("failureClass", ReasonInvalidArgument,
-			"an AI defect issue failure class must be application")
-	}
-	if draft.CaseNodeID == nil {
-		return NewInvalid("caseNodeId", ReasonInvalidArgument,
-			"an AI defect issue requires a caseNodeId")
-	}
-	return nil
-}
-
-// isLowerHex reports whether value is exactly n lowercase hexadecimal chars.
-func isLowerHex(value string, n int) bool {
-	if len(value) != n {
 		return false
 	}
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
-// issueRefIDLess orders two ref ids deterministically: decimal ids compare
-// numerically and anything else compares as text.
-func issueRefIDLess(left, right string) bool {
-	leftID, leftErr := strconv.ParseInt(left, 10, 64)
-	rightID, rightErr := strconv.ParseInt(right, 10, 64)
-	if leftErr == nil && rightErr == nil {
-		return leftID < rightID
+// ValidateMerge checks one source->target merge request before persistence
+// (spec §5.2): the target must belong to the same version, be a known
+// non-merged issue, differ from the source and not close a merged_into cycle.
+// lookup resolves a merged_into target; it is only consulted while walking a
+// target's merge chain (a nil lookup treats a non-empty chain as unresolvable).
+func ValidateMerge(source Issue, target Issue, lookup func(int64) (Issue, bool)) error {
+	if source.ID <= 0 || target.ID <= 0 {
+		return ErrInvalidArgument
 	}
-	return left < right
+	if source.VersionID <= 0 || target.VersionID <= 0 {
+		return ErrInvalidArgument
+	}
+	if source.ID == target.ID {
+		return &MergeError{Reason: MergeReasonTargetInvalid}
+	}
+	if source.VersionID != target.VersionID {
+		return &MergeError{Reason: MergeReasonTargetInvalid}
+	}
+	if !CanTransitionIssue(source.Status, IssueStatusMerged) {
+		return ErrStateConflict
+	}
+	if !target.Status.Valid() || target.Status == IssueStatusMerged {
+		// A merged target is terminal, so it must be rejected before its chain
+		// is followed: otherwise a long or cyclic chain would be reported as
+		// merge_cycle even though the target itself is simply invalid.
+		return &MergeError{Reason: MergeReasonTargetInvalid}
+	}
+
+	return mergeChainError(target, source.ID, lookup)
+}
+
+// mergeChainError follows target's merged_into chain for at most
+// MaxIssueMergeChain hops (spec §5.2). It returns nil when the chain ends
+// without reaching the source, merge_cycle when the source is reached inside
+// the budget, and merge_target_invalid when a reference cannot be resolved or
+// the chain is still open after the budget. The over-budget case is deliberately
+// not a cycle: the bounded walk cannot prove that the chain ever reaches the
+// source, so it is reported as an invalid target instead. A source lying beyond
+// the budget is therefore also reported as merge_target_invalid.
+func mergeChainError(target Issue, sourceID int64, lookup func(int64) (Issue, bool)) error {
+	current := target
+	for hop := 0; hop < MaxIssueMergeChain; hop++ {
+		if current.MergedIntoID == nil {
+			return nil
+		}
+		nextID := *current.MergedIntoID
+		if nextID == sourceID {
+			return &MergeError{Reason: MergeReasonCycle}
+		}
+		if nextID <= 0 || lookup == nil {
+			return &MergeError{Reason: MergeReasonTargetInvalid}
+		}
+		next, ok := lookup(nextID)
+		if !ok {
+			return &MergeError{Reason: MergeReasonTargetInvalid}
+		}
+		current = next
+	}
+	// The budget followed MaxIssueMergeChain links; the chain is finite only if
+	// the last node has no further link.
+	if current.MergedIntoID == nil {
+		return nil
+	}
+	return &MergeError{Reason: MergeReasonTargetInvalid}
+}
+
+// MergeChain follows the merged_into links of a merged issue up to
+// MaxIssueMergeChain hops (spec §4.6) and returns the resolved target issues in
+// walk order: the direct merge target first, the first non-merged issue last.
+// A non-merged issue yields an empty chain.
+//
+// ok is false when the chain cannot be redirected: a link is missing or has no
+// positive ID, a target belongs to another version, the walk revisits a node
+// (cycle), or the chain is still merged after the hop budget. Callers treat a
+// false walk as a redirect failure and fall back to the pre-P7 dedupe behavior;
+// the returned slice then holds the targets resolved before the failure.
+func MergeChain(issue Issue, lookup func(int64) (Issue, bool)) ([]Issue, bool) {
+	if issue.MergedIntoID == nil {
+		return nil, true
+	}
+	visited := map[int64]struct{}{issue.ID: {}}
+	targets := make([]Issue, 0, 4)
+	current := issue
+	for hop := 0; hop < MaxIssueMergeChain; hop++ {
+		if current.MergedIntoID == nil {
+			// The last resolved node is not merged, so the chain terminated
+			// before consuming the budget.
+			return targets, true
+		}
+		nextID := *current.MergedIntoID
+		if nextID <= 0 {
+			return targets, false
+		}
+		if _, seen := visited[nextID]; seen {
+			return targets, false
+		}
+		visited[nextID] = struct{}{}
+		if lookup == nil {
+			return targets, false
+		}
+		next, ok := lookup(nextID)
+		if !ok || next.ID != nextID {
+			return targets, false
+		}
+		if next.VersionID != issue.VersionID {
+			// P4 merges are same-version; a foreign target cannot receive the
+			// recurrence refs of this version's issue.
+			return targets, false
+		}
+		targets = append(targets, next)
+		if next.Status != IssueStatusMerged {
+			return targets, true
+		}
+		current = next
+	}
+	// The budget followed MaxIssueMergeChain links and the last target is still
+	// merged: the chain may continue beyond the budget, so it is not redirectable.
+	return targets, false
 }

@@ -13,11 +13,13 @@ import { pathToFileURL } from "node:url"
 
 import { ContextManager } from "./contexts.mjs"
 import { parseAllowedHosts } from "./limits.mjs"
+import { startPushFromEnv } from "./push.mjs"
 import {
   DEFAULT_MAX_CONTEXTS,
   ExecutorError,
   MAX_ACTION_REQUEST_BYTES,
   MAX_REQUEST_BYTES,
+  visualActionRequestLimit,
 } from "./security.mjs"
 
 const PACKAGE_VERSION = (() => {
@@ -120,8 +122,7 @@ export function readBody(req, limit = MAX_REQUEST_BYTES) {
   })
 }
 
-async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
-  const buffer = await readBody(req, limit)
+function parseJsonObject(buffer) {
   if (buffer.length === 0) {
     return {}
   }
@@ -135,6 +136,10 @@ async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
     throw new ExecutorError("invalid_request", "request body must be a JSON object")
   }
   return value
+}
+
+async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
+  return parseJsonObject(await readBody(req, limit))
 }
 
 function decodeId(raw) {
@@ -204,6 +209,12 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
     }
 
     if (pathname === "/v1/contexts") {
+      if (req.method === "GET") {
+        // P3 extension (execution design §6.1): context inventory used by the
+        // API for orphan reconciliation and executor capacity accounting.
+        const contexts = typeof executor.list === "function" ? executor.list() : []
+        return sendJson(res, 200, { contexts })
+      }
       if (req.method !== "POST") {
         return sendError(res, 405, "invalid_request", "method not allowed")
       }
@@ -218,7 +229,14 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
         return sendError(res, 405, "invalid_request", "method not allowed")
       }
       const contextId = decodeId(actionMatch[1])
-      const body = await readJsonBody(req, MAX_ACTION_REQUEST_BYTES)
+      // Only visual.compare may carry the ~6.7 MiB base64 baseline copy; every
+      // other action keeps the normal 1 MiB body cap (executor protocol §11.1).
+      const rawBody = await readBody(req, MAX_ACTION_REQUEST_BYTES)
+      const body = parseJsonObject(rawBody)
+      const limit = body.action === "visual.compare" ? visualActionRequestLimit() : MAX_REQUEST_BYTES
+      if (rawBody.length > limit) {
+        throw new ExecutorError("too_large", `request body exceeds the ${limit} byte limit`)
+      }
       const envelope = await executor.runAction(contextId, body)
       const status = envelope.ok ? 200 : ACTION_ERROR_STATUS[envelope.error.code] ?? 200
       return sendJson(res, status, envelope)
@@ -275,7 +293,7 @@ export function parseMaxContexts(value) {
   return DEFAULT_MAX_CONTEXTS
 }
 
-export async function startFromEnv(env = process.env) {
+export async function startFromEnv(env = process.env, { manager: injectedManager = null } = {}) {
   const token = String(env.EZTEST_EXECUTOR_TOKEN ?? "").trim()
   if (token.length === 0) {
     console.error("[executor] EZTEST_EXECUTOR_TOKEN is required")
@@ -288,12 +306,14 @@ export async function startFromEnv(env = process.env) {
   // It defaults to loopback; remote targets must be listed explicitly.
   const allowedHosts = parseAllowedHosts(env.EZTEST_EXEC_ALLOWED_HOSTS)
   const logger = console
-  const manager = new ContextManager({ maxContexts, logger, allowedHosts })
+  const manager =
+    injectedManager ?? new ContextManager({ maxContexts, logger, allowedHosts })
+  const version = env.EZTEST_EXECUTOR_VERSION ?? PACKAGE_VERSION
   const server = createExecutorServer({
     token,
     manager,
     logger,
-    version: env.EZTEST_EXECUTOR_VERSION ?? PACKAGE_VERSION,
+    version,
   })
   await new Promise((resolve, reject) => {
     server.once("error", reject)
@@ -301,8 +321,16 @@ export async function startFromEnv(env = process.env) {
   })
   console.log(`[executor] listening on http://${host}:${port} (max contexts ${maxContexts})`)
 
+  // Optional push registration/heartbeat (executor-protocol §12.4). A missing
+  // EZTEST_API_URL keeps the P3 pull-only behavior.
+  const push = startPushFromEnv({ env, manager, version, logger })
+  if (push) {
+    console.log("[executor] push registration enabled (EZTEST_API_URL is set)")
+  }
+
   const shutdown = async (signal) => {
     console.log(`[executor] received ${signal}, shutting down`)
+    push?.stop()
     await new Promise((resolve) => server.close(resolve))
     await manager.close()
     process.exit(0)
@@ -313,7 +341,7 @@ export async function startFromEnv(env = process.env) {
   process.once("SIGTERM", () => {
     void shutdown("SIGTERM")
   })
-  return { server, manager }
+  return { server, manager, push }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

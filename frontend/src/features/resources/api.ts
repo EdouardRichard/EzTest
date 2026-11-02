@@ -1,433 +1,380 @@
-import { ApiError, apiDelete, apiGet, apiPatch, apiPost, apiPut } from "@/lib/api-client"
+import { apiDelete, apiGet, apiGetPage, apiPatch, apiPost } from "@/lib/api-client"
 
 import type {
-  AccessDTO,
-  AccountDTO,
-  AppModelNodeDTO,
-  AuthFlowDefinitionDTO,
-  AuthFlowDTO,
-  DBTargetDTO,
-  DBTargetTestResultDTO,
-  DBTargetWriteInput,
-  EnvironmentDTO,
-  Page,
-  SessionDTO,
-  SnapshotDTO,
-  SystemDTO,
+  AccountFormValues,
+  ApiFormValues,
+  CodeProposal,
+  CodeProposalResult,
+  CodeRepository,
+  DatabaseFormValues,
+  EnvironmentFormValues,
+  ImportResult,
+  PageFormValues,
+  RepositoryFormValues,
+  Sut,
+  SutApi,
+  SutEnvironment,
+  SutPage,
+  TargetDatabase,
+  TestAccount,
 } from "./types"
+import { splitList } from "./validation"
+
+const PAGE_LIMIT = 100
+
+// --- SUT ------------------------------------------------------------------
+
+/** First page of SUTs; the P0 console lists up to the API maximum per request. */
+export async function listSuts(): Promise<Sut[]> {
+  const page = await apiGetPage<Sut>(`/api/resources/suts?limit=${PAGE_LIMIT}`)
+  return page.items
+}
+
+/** One SUT aggregate with its environments and nested resources. */
+export function getSut(id: string): Promise<Sut> {
+  return apiGet<Sut>(`/api/resources/suts/${encodeURIComponent(id)}`)
+}
+
+export type SutInput = {
+  name: string
+  intro: string
+  /** Optional P7 family slug; omitted when blank. */
+  family?: string
+}
+
+/** Builds the SUT create/patch body, omitting the optional family when blank. */
+function sutPayload(input: SutInput): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    name: input.name.trim(),
+    intro: input.intro.trim(),
+  }
+  const family = input.family?.trim() ?? ""
+  if (family.length > 0) payload.family = family
+  return payload
+}
+
+export function createSut(input: SutInput): Promise<Sut> {
+  return apiPost<Sut>("/api/resources/suts", sutPayload(input))
+}
+
+export function updateSut(id: string, input: SutInput): Promise<Sut> {
+  return apiPatch<Sut>(`/api/resources/suts/${encodeURIComponent(id)}`, sutPayload(input))
+}
+
+export function deleteSut(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/suts/${encodeURIComponent(id)}`)
+}
+
+export type CreateSutWithDefaultEnvironmentInput = {
+  sut: SutInput
+  environment: {
+    name: string
+    base_url: string
+  }
+}
+
+export type CreateSutWithDefaultEnvironmentResult = {
+  sut: Sut
+  environment: SutEnvironment
+}
 
 /**
- * API functions for the P2 public-resource context (spec §7). This module only
- * joins paths, types the calls and normalizes list pages; all transport,
- * auth and error-envelope handling stays in `@/lib/api-client`.
+ * A SUT create that stores the SUT but fails to create its default environment.
+ * The SUT exists at this point; the UI refreshes the list and lets the user add
+ * the environment from the environment section instead of retrying the create.
  */
+export class DefaultEnvironmentError extends Error {
+  readonly sut: Sut
+  readonly originalError: unknown
 
-const RESOURCES_ROOT = "/api/resources"
-
-type QueryValue = string | number | undefined
-
-function withQuery(path: string, query: Record<string, QueryValue>): string {
-  const search = new URLSearchParams()
-  for (const [key, value] of Object.entries(query)) {
-    if (value === undefined) continue
-    search.set(key, String(value))
+  constructor(sut: Sut, originalError: unknown) {
+    const detail = originalError instanceof Error ? originalError.message : "未知错误"
+    super(`SUT「${sut.name}」已创建，但默认环境创建失败：${detail}。请在环境列表中补建环境。`)
+    this.name = "DefaultEnvironmentError"
+    this.sut = sut
+    this.originalError = originalError
   }
-  const suffix = search.toString()
-  return suffix === "" ? path : `${path}?${suffix}`
-}
-
-type RawPage<T> = {
-  items?: T[]
-  data?: T[]
-  nextCursor?: string | null
-  next_cursor?: string | null
-  hasMore?: boolean
-  has_more?: boolean
 }
 
 /**
- * Normalizes a list response into `Page<T>`.
- *
- * The shared `apiGet` unwraps the `{"data": [...]}` envelope, so a list call
- * normally arrives here as a bare array and its cursor metadata is no longer
- * observable; list panels therefore request the backend's maximum page size
- * (100). A nested page payload is still mapped field by field when present so
- * pagination keeps working if the API ever returns one.
+ * Creates a SUT and its first default environment in one user flow. The API has
+ * no atomic SUT+environment create, so a partial failure is surfaced with the
+ * created SUT attached.
  */
-function toPage<T>(payload: unknown): Page<T> {
-  if (Array.isArray(payload)) {
-    return { items: payload as T[], nextCursor: null, hasMore: false }
+export async function createSutWithDefaultEnvironment(
+  input: CreateSutWithDefaultEnvironmentInput,
+): Promise<CreateSutWithDefaultEnvironmentResult> {
+  const sut = await createSut(input.sut)
+  try {
+    const environment = await createEnvironment(sut.id, {
+      name: input.environment.name,
+      baseUrl: input.environment.base_url,
+      isDefault: true,
+      status: "active",
+    })
+    return { sut, environment }
+  } catch (error) {
+    throw new DefaultEnvironmentError(sut, error)
   }
-  if (payload !== null && typeof payload === "object") {
-    const page = payload as RawPage<T>
-    const items = Array.isArray(page.items) ? page.items : Array.isArray(page.data) ? page.data : []
-    return {
-      items,
-      nextCursor: page.nextCursor ?? page.next_cursor ?? null,
-      hasMore: page.hasMore ?? page.has_more ?? false,
-    }
+}
+
+// --- environments ---------------------------------------------------------
+
+function environmentPayload(values: EnvironmentFormValues): Record<string, unknown> {
+  return {
+    name: values.name.trim(),
+    base_url: values.baseUrl.trim(),
+    is_default: values.isDefault,
+    status: values.status,
   }
-  return { items: [], nextCursor: null, hasMore: false }
-}
-
-function systemPath(id: number): string {
-  return `${RESOURCES_ROOT}/systems/${id}`
-}
-
-function environmentPath(id: number): string {
-  return `${RESOURCES_ROOT}/environments/${id}`
-}
-
-function appModelPath(id: number): string {
-  return `${RESOURCES_ROOT}/app-models/${id}`
-}
-
-function accountPath(id: number): string {
-  return `${RESOURCES_ROOT}/accounts/${id}`
-}
-
-function accessPath(id: number): string {
-  return `${RESOURCES_ROOT}/accesses/${id}`
-}
-
-function authFlowPath(id: string): string {
-  return `${RESOURCES_ROOT}/auth-flows/${id}`
-}
-
-function sessionPath(id: number): string {
-  return `${RESOURCES_ROOT}/sessions/${id}`
-}
-
-function takeoverPath(id: number): string {
-  return `${RESOURCES_ROOT}/takeovers/${id}`
-}
-
-// --- Systems & environments (spec §7.2) -------------------------------------
-
-export async function listSystems(
-  params: { limit?: number; cursor?: string; status?: string } = {},
-): Promise<Page<SystemDTO>> {
-  const path = withQuery(`${RESOURCES_ROOT}/systems`, {
-    limit: params.limit,
-    cursor: params.cursor,
-    status: params.status,
-  })
-  return toPage<SystemDTO>(await apiGet<unknown>(path))
-}
-
-export function createSystem(input: Partial<SystemDTO>): Promise<SystemDTO> {
-  return apiPost<SystemDTO>(`${RESOURCES_ROOT}/systems`, input)
-}
-
-export function updateSystem(id: number, input: Partial<SystemDTO>): Promise<SystemDTO> {
-  return apiPatch<SystemDTO>(systemPath(id), input)
-}
-
-export async function deleteSystem(id: number): Promise<void> {
-  await apiDelete<void>(systemPath(id))
-}
-
-export function listEnvironments(systemId: number): Promise<EnvironmentDTO[]> {
-  return apiGet<EnvironmentDTO[]>(`${systemPath(systemId)}/environments`)
 }
 
 export function createEnvironment(
-  systemId: number,
-  input: Partial<EnvironmentDTO>,
-): Promise<EnvironmentDTO> {
-  return apiPost<EnvironmentDTO>(`${systemPath(systemId)}/environments`, input)
-}
-
-export function updateEnvironment(
-  id: number,
-  input: Partial<EnvironmentDTO>,
-): Promise<EnvironmentDTO> {
-  return apiPatch<EnvironmentDTO>(environmentPath(id), input)
-}
-
-export async function deleteEnvironment(id: number): Promise<void> {
-  await apiDelete<void>(environmentPath(id))
-}
-
-// --- App models (spec §7.3) -------------------------------------------------
-
-export async function listAppModels(
-  systemId: number,
-  params: { kind?: string; limit?: number; cursor?: string } = {},
-): Promise<Page<AppModelNodeDTO>> {
-  const path = withQuery(`${systemPath(systemId)}/app-models`, {
-    kind: params.kind,
-    limit: params.limit,
-    cursor: params.cursor,
-  })
-  return toPage<AppModelNodeDTO>(await apiGet<unknown>(path))
-}
-
-export function createAppModel(
-  systemId: number,
-  input: Partial<AppModelNodeDTO>,
-): Promise<AppModelNodeDTO> {
-  return apiPost<AppModelNodeDTO>(`${systemPath(systemId)}/app-models`, input)
-}
-
-export function importAppModels(
-  systemId: number,
-  nodes: Partial<AppModelNodeDTO>[],
-): Promise<{ created: number; updated: number }> {
-  return apiPost<{ created: number; updated: number }>(
-    `${systemPath(systemId)}/app-models/import`,
-    { nodes },
+  sutId: string,
+  values: EnvironmentFormValues,
+): Promise<SutEnvironment> {
+  return apiPost<SutEnvironment>(
+    `/api/resources/suts/${encodeURIComponent(sutId)}/environments`,
+    environmentPayload(values),
   )
 }
 
-export function updateAppModel(
-  id: number,
-  input: Partial<AppModelNodeDTO>,
-): Promise<AppModelNodeDTO> {
-  return apiPatch<AppModelNodeDTO>(appModelPath(id), input)
+export function updateEnvironment(
+  id: string,
+  values: EnvironmentFormValues,
+): Promise<SutEnvironment> {
+  return apiPatch<SutEnvironment>(
+    `/api/resources/environments/${encodeURIComponent(id)}`,
+    environmentPayload(values),
+  )
 }
 
-export async function deleteAppModel(id: number): Promise<void> {
-  await apiDelete<void>(appModelPath(id))
+export function deleteEnvironment(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/environments/${encodeURIComponent(id)}`)
 }
 
-// --- Accounts & accesses (spec §7.4) ----------------------------------------
+// --- pages ----------------------------------------------------------------
 
-export async function listAccounts(
-  params: { limit?: number; cursor?: string; status?: string } = {},
-): Promise<Page<AccountDTO>> {
-  const path = withQuery(`${RESOURCES_ROOT}/accounts`, {
-    limit: params.limit,
-    cursor: params.cursor,
-    status: params.status,
-  })
-  return toPage<AccountDTO>(await apiGet<unknown>(path))
-}
-
-export function createAccount(input: Partial<AccountDTO>): Promise<AccountDTO> {
-  return apiPost<AccountDTO>(`${RESOURCES_ROOT}/accounts`, input)
-}
-
-export function updateAccount(id: number, input: Partial<AccountDTO>): Promise<AccountDTO> {
-  return apiPatch<AccountDTO>(accountPath(id), input)
-}
-
-export async function deleteAccount(id: number): Promise<void> {
-  await apiDelete<void>(accountPath(id))
-}
-
-export async function listAccesses(
-  accountId: number,
-  params: { limit?: number; cursor?: string } = {},
-): Promise<AccessDTO[]> {
-  const path = withQuery(`${accountPath(accountId)}/accesses`, {
-    limit: params.limit,
-    cursor: params.cursor,
-  })
-  return apiGet<AccessDTO[]>(path)
-}
-
-export function createAccess(
-  accountId: number,
-  input: Partial<AccessDTO> & { credential?: string },
-): Promise<AccessDTO> {
-  return apiPost<AccessDTO>(`${accountPath(accountId)}/accesses`, input)
-}
-
-export function updateAccess(
-  id: number,
-  input: Partial<AccessDTO> & { credential?: string },
-): Promise<AccessDTO> {
-  return apiPatch<AccessDTO>(accessPath(id), input)
-}
-
-export async function deleteAccess(id: number): Promise<void> {
-  await apiDelete<void>(accessPath(id))
-}
-
-// --- Login recipes (spec §3.4/§6.2, admin-only) -----------------------------
-
-/** Writable login recipe fields; `system_id` is only accepted on create. */
-export type AuthFlowWriteInput = {
-  system_id?: string
-  name: string
-  kind: string
-  definition: AuthFlowDefinitionDTO
-  enabled: boolean
-}
-
-export async function listAuthFlows(
-  params: { systemId?: number; limit?: number; cursor?: string } = {},
-): Promise<Page<AuthFlowDTO>> {
-  const path = withQuery(`${RESOURCES_ROOT}/auth-flows`, {
-    system_id: params.systemId,
-    limit: params.limit,
-    cursor: params.cursor,
-  })
-  return toPage<AuthFlowDTO>(await apiGet<unknown>(path))
-}
-
-export function createAuthFlow(
-  input: AuthFlowWriteInput & { system_id: string },
-): Promise<AuthFlowDTO> {
-  return apiPost<AuthFlowDTO>(`${RESOURCES_ROOT}/auth-flows`, input)
-}
-
-export function updateAuthFlow(id: string, input: AuthFlowWriteInput): Promise<AuthFlowDTO> {
-  return apiPatch<AuthFlowDTO>(authFlowPath(id), input)
-}
-
-export async function deleteAuthFlow(id: string): Promise<void> {
-  await apiDelete<void>(authFlowPath(id))
-}
-
-// --- Sessions (spec §7.5) ---------------------------------------------------
-
-export async function listSessions(
-  params: {
-    accountId?: number
-    systemId?: number
-    environmentId?: number
-    state?: string
-    limit?: number
-    cursor?: string
-  } = {},
-): Promise<Page<SessionDTO>> {
-  const path = withQuery(`${RESOURCES_ROOT}/sessions`, {
-    accountId: params.accountId,
-    systemId: params.systemId,
-    environmentId: params.environmentId,
-    state: params.state,
-    limit: params.limit,
-    cursor: params.cursor,
-  })
-  return toPage<SessionDTO>(await apiGet<unknown>(path))
-}
-
-export function getSession(id: number): Promise<SessionDTO> {
-  return apiGet<SessionDTO>(sessionPath(id))
-}
-
-export function importSession(
-  accessId: number,
-  input: {
-    environmentId: number
-    kind: "storage_state" | "token"
-    storageState?: unknown
-    headers?: Record<string, string>
-    expiresAt?: string
-    note?: string
-  },
-): Promise<SessionDTO> {
-  return apiPost<SessionDTO>(`${accessPath(accessId)}/sessions`, input)
-}
-
-export function validateSession(id: number): Promise<SessionDTO> {
-  return apiPost<SessionDTO>(`${sessionPath(id)}/validate`)
-}
-
-export function confirmSession(id: number, note?: string): Promise<SessionDTO> {
-  return apiPost<SessionDTO>(`${sessionPath(id)}/confirm`, note === undefined ? {} : { note })
-}
-
-export function invalidateSession(id: number, reason: string): Promise<SessionDTO> {
-  return apiPost<SessionDTO>(`${sessionPath(id)}/invalidate`, { reason })
-}
-
-export function revokeSession(id: number, reason: string): Promise<SessionDTO> {
-  return apiPost<SessionDTO>(`${sessionPath(id)}/revoke`, { reason })
-}
-
-export async function listSnapshots(sessionId: number): Promise<Page<SnapshotDTO>> {
-  return toPage<SnapshotDTO>(await apiGet<unknown>(`${sessionPath(sessionId)}/snapshots`))
-}
-
-// --- Takeovers (spec §7.6) --------------------------------------------------
-
-type TakeoverResponse = {
-  takeover: { id: number; status: string }
-  session: SessionDTO
-}
-
-export function requestTakeover(
-  sessionId: number,
-  input: { reason: string; instructions?: unknown; expiresInSeconds?: number },
-): Promise<TakeoverResponse> {
-  return apiPost<TakeoverResponse>(`${sessionPath(sessionId)}/takeovers`, input)
-}
-
-export function completeTakeover(
-  id: number,
-  input: {
-    kind: "storage_state" | "token"
-    storageState?: unknown
-    headers?: Record<string, string>
-  },
-): Promise<TakeoverResponse> {
-  return apiPost<TakeoverResponse>(`${takeoverPath(id)}/complete`, input)
-}
-
-export function cancelTakeover(id: number): Promise<{ id: number; status: string }> {
-  return apiPost<{ id: number; status: string }>(`${takeoverPath(id)}/cancel`)
-}
-
-// --- DB target (spec §7.8, admin-only) --------------------------------------
-
-function dbTargetPath(environmentId: number): string {
-  return `${environmentPath(environmentId)}/db-target`
-}
-
-/**
- * Reads the environment's read-only database target. The API answers 200 with
- * `data:null` when nothing is configured yet, so this resolves to null instead
- * of throwing.
- */
-export function getDbTarget(environmentId: number): Promise<DBTargetDTO | null> {
-  return apiGet<DBTargetDTO | null>(dbTargetPath(environmentId))
-}
-
-/** Creates or replaces the target; an omitted `password` keeps the stored one. */
-export function upsertDbTarget(
-  environmentId: number,
-  input: DBTargetWriteInput,
-): Promise<DBTargetDTO> {
-  return apiPut<DBTargetDTO>(dbTargetPath(environmentId), input)
-}
-
-export async function deleteDbTarget(environmentId: number): Promise<void> {
-  await apiDelete<void>(dbTargetPath(environmentId))
-}
-
-/**
- * Probes the connection. With `input` the unsaved form values are tested and
- * nothing is persisted; without it the stored configuration is probed.
- */
-export function testDbTarget(
-  environmentId: number,
-  input?: DBTargetWriteInput,
-): Promise<DBTargetTestResultDTO> {
-  return apiPost<DBTargetTestResultDTO>(`${dbTargetPath(environmentId)}/test`, input)
-}
-
-/**
- * Maps DB target write/test failures onto readable Chinese messages. The stable
- * reason codes of spec §7.11 stay visible because they drive the form guidance.
- */
-export function describeDBTargetError(error: unknown): string {
-  if (error instanceof ApiError) {
-    if (error.status === 0) return "无法连接 API 服务，请确认后端已启动。"
-    if (error.status === 403) return "当前账户没有管理员权限，无法维护目标数据库。"
-    if (error.status === 404) return "环境不存在或已被删除。"
-    const reason = typeof error.details.reason === "string" ? error.details.reason : ""
-    const field = typeof error.details.field === "string" ? error.details.field : ""
-    if (reason === "db_target_invalid") {
-      return field === ""
-        ? `目标数据库配置不合法：${error.message}`
-        : `目标数据库配置不合法（${field}）：${error.message}`
-    }
-    if (reason === "db_target_missing") return "该环境尚未配置可用的目标数据库。"
-    if (error.retryable) return `${error.message}（可重试）`
-    return error.message
+function pagePayload(values: PageFormValues): Record<string, unknown> {
+  return {
+    name: values.name.trim(),
+    url: values.url.trim(),
+    route_template: values.routeTemplate.trim(),
+    page_type: values.pageType.trim() || "page",
+    auth_role: values.authRole.trim(),
+    module: values.module.trim(),
   }
-  return error instanceof Error ? error.message : "未知错误"
+}
+
+export function createPage(environmentId: string, values: PageFormValues): Promise<SutPage> {
+  return apiPost<SutPage>(
+    `/api/resources/environments/${encodeURIComponent(environmentId)}/pages`,
+    pagePayload(values),
+  )
+}
+
+export function updatePage(id: string, values: PageFormValues): Promise<SutPage> {
+  return apiPatch<SutPage>(`/api/resources/pages/${encodeURIComponent(id)}`, pagePayload(values))
+}
+
+export function deletePage(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/pages/${encodeURIComponent(id)}`)
+}
+
+export function importPages(
+  environmentId: string,
+  items: PageFormValues[],
+): Promise<ImportResult<SutPage>> {
+  return apiPost<ImportResult<SutPage>>(
+    `/api/resources/environments/${encodeURIComponent(environmentId)}/pages/import`,
+    { items: items.map(pagePayload) },
+  )
+}
+
+// --- APIs -----------------------------------------------------------------
+
+function apiPayload(values: ApiFormValues): Record<string, unknown> {
+  return {
+    method: values.method,
+    path_template: values.pathTemplate.trim(),
+    name: values.name.trim(),
+    auth_role: values.authRole.trim(),
+    schema_ref: values.schemaRef.trim(),
+  }
+}
+
+export function createApi(environmentId: string, values: ApiFormValues): Promise<SutApi> {
+  return apiPost<SutApi>(
+    `/api/resources/environments/${encodeURIComponent(environmentId)}/apis`,
+    apiPayload(values),
+  )
+}
+
+export function updateApi(id: string, values: ApiFormValues): Promise<SutApi> {
+  return apiPatch<SutApi>(`/api/resources/apis/${encodeURIComponent(id)}`, apiPayload(values))
+}
+
+export function deleteApi(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/apis/${encodeURIComponent(id)}`)
+}
+
+export function importApis(
+  environmentId: string,
+  items: ApiFormValues[],
+): Promise<ImportResult<SutApi>> {
+  return apiPost<ImportResult<SutApi>>(
+    `/api/resources/environments/${encodeURIComponent(environmentId)}/apis/import`,
+    { items: items.map(apiPayload) },
+  )
+}
+
+// --- target databases -----------------------------------------------------
+
+export type DatabasePatch = {
+  name: string
+  dsn: string
+  username: string
+  readOnly: boolean
+  /** Omitted keeps the stored password; an empty string clears it. */
+  password?: string
+}
+
+export function createDatabase(sutId: string, values: DatabaseFormValues): Promise<TargetDatabase> {
+  return apiPost<TargetDatabase>(`/api/resources/suts/${encodeURIComponent(sutId)}/databases`, {
+    environment_id: values.environmentId,
+    name: values.name.trim(),
+    dsn: values.dsn.trim(),
+    username: values.username.trim(),
+    password: values.password,
+    read_only: values.readOnly,
+  })
+}
+
+export function updateDatabase(id: string, patch: DatabasePatch): Promise<TargetDatabase> {
+  const body: Record<string, unknown> = {
+    name: patch.name.trim(),
+    dsn: patch.dsn.trim(),
+    username: patch.username.trim(),
+    read_only: patch.readOnly,
+  }
+  if (patch.password !== undefined) body.password = patch.password
+  return apiPatch<TargetDatabase>(`/api/resources/databases/${encodeURIComponent(id)}`, body)
+}
+
+export function deleteDatabase(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/databases/${encodeURIComponent(id)}`)
+}
+
+// --- test accounts --------------------------------------------------------
+
+export type AccountPatch = {
+  username: string
+  roles: string[]
+  notes: string
+  /** Omitted keeps the stored password; an empty string clears it. */
+  password?: string
+}
+
+export function createAccount(sutId: string, values: AccountFormValues): Promise<TestAccount> {
+  return apiPost<TestAccount>(`/api/resources/suts/${encodeURIComponent(sutId)}/accounts`, {
+    environment_id: values.environmentId,
+    username: values.username.trim(),
+    password: values.password,
+    roles: splitList(values.roles),
+    notes: values.notes.trim(),
+  })
+}
+
+export function updateAccount(id: string, patch: AccountPatch): Promise<TestAccount> {
+  const body: Record<string, unknown> = {
+    username: patch.username.trim(),
+    roles: patch.roles,
+    notes: patch.notes.trim(),
+  }
+  if (patch.password !== undefined) body.password = patch.password
+  return apiPatch<TestAccount>(`/api/resources/accounts/${encodeURIComponent(id)}`, body)
+}
+
+export function deleteAccount(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/accounts/${encodeURIComponent(id)}`)
+}
+
+// --- code repositories ----------------------------------------------------
+
+/** First page of code repositories; repositories are not SUT-scoped. */
+export async function listRepositories(): Promise<CodeRepository[]> {
+  const page = await apiGetPage<CodeRepository>(`/api/resources/code-repos?limit=${PAGE_LIMIT}`)
+  return page.items
+}
+
+function repositoryPayload(values: RepositoryFormValues): Record<string, unknown> {
+  return {
+    name: values.name.trim(),
+    path: values.path.trim(),
+    branch: values.branch.trim(),
+    include: splitList(values.include),
+    exclude: splitList(values.exclude),
+  }
+}
+
+export function createRepository(values: RepositoryFormValues): Promise<CodeRepository> {
+  return apiPost<CodeRepository>("/api/resources/code-repos", repositoryPayload(values))
+}
+
+export function updateRepository(
+  id: string,
+  values: RepositoryFormValues,
+): Promise<CodeRepository> {
+  return apiPatch<CodeRepository>(
+    `/api/resources/code-repos/${encodeURIComponent(id)}`,
+    repositoryPayload(values),
+  )
+}
+
+export function deleteRepository(id: string): Promise<void> {
+  return apiDelete<void>(`/api/resources/code-repos/${encodeURIComponent(id)}`)
+}
+
+// --- page/API proposals (P5) ----------------------------------------------
+
+/**
+ * Generates proposed pages/APIs from indexed code facts and execution network
+ * evidence (spec §8.1). The optional `repoId` narrows a multi-repo version;
+ * omitted means the server walks every bound repository.
+ */
+export function generatePageApiProposals(
+  versionId: string,
+  options: { repoId?: string } = {},
+): Promise<CodeProposalResult> {
+  const body = options.repoId !== undefined ? { repoId: options.repoId } : undefined
+  return apiPost<CodeProposalResult>(
+    `/api/versions/${encodeURIComponent(versionId)}/code/page-api-proposals`,
+    body,
+  )
+}
+
+/** Lists the version's `status=proposed` pages/APIs with their source/evidence. */
+export async function listPageApiProposals(versionId: string): Promise<CodeProposal[]> {
+  const page = await apiGetPage<CodeProposal>(
+    `/api/versions/${encodeURIComponent(versionId)}/code/page-api-proposals`,
+  )
+  return page.items
+}
+
+/** Admin-only: proposed page → approved (409 when the state changed). */
+export function confirmPageProposal(id: string): Promise<SutPage> {
+  return apiPost<SutPage>(`/api/resources/pages/${encodeURIComponent(id)}/confirm`)
+}
+
+export function rejectPageProposal(id: string): Promise<SutPage> {
+  return apiPost<SutPage>(`/api/resources/pages/${encodeURIComponent(id)}/reject`)
+}
+
+/** Admin-only: proposed API → approved/rejected. */
+export function confirmApiProposal(id: string): Promise<SutApi> {
+  return apiPost<SutApi>(`/api/resources/apis/${encodeURIComponent(id)}/confirm`)
+}
+
+export function rejectApiProposal(id: string): Promise<SutApi> {
+  return apiPost<SutApi>(`/api/resources/apis/${encodeURIComponent(id)}/reject`)
 }

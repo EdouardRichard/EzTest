@@ -1,108 +1,187 @@
-package domain
+package version
 
 import (
-	"fmt"
-	"regexp"
+	"context"
+	"errors"
+	"path"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// Attachment kinds, mirrored from the requirement_attachment.kind CHECK
-// constraint.
+// Attachment limits from spec §7.
 const (
-	AttachmentText  = "text"
-	AttachmentImage = "image"
+	MaxAttachmentBytes     int64 = 10 << 20 // upload cap (POST /api/content)
+	MaxExtractedTextBytes  int64 = 2 << 20  // extracted text cap
+	MaxOOXMLBytes          int64 = 20 << 20 // uncompressed OOXML XML cap
+	MaxPDFPages                  = 50
+	MaxAttachmentNameRunes       = 255
 )
 
-// attachmentMIMETypes is the frozen allow-list of spec §6.7. Both the MIME type
-// and the filename extension are checked by the attachment service; this map
-// owns the MIME half and the text/image classification.
-var attachmentMIMETypes = map[string]string{
-	"text/plain":       AttachmentText,
-	"text/markdown":    AttachmentText,
-	"application/json": AttachmentText,
-	"application/yaml": AttachmentText,
-	"text/yaml":        AttachmentText,
-	"image/png":        AttachmentImage,
-	"image/jpeg":       AttachmentImage,
+// Attachment extraction statuses.
+const (
+	AttachmentPending    = "pending"
+	AttachmentProcessing = "processing"
+	AttachmentDone       = "done"
+	AttachmentFailed     = "failed"
+	AttachmentSkipped    = "skipped"
+)
+
+// AttachmentView error codes are stable and exposed to clients.
+const (
+	AttachmentErrorUnsupported = "unsupported_attachment_format"
+	AttachmentErrorExtraction  = "extraction_failed"
+)
+
+// Attachment content roles in the storage ledger.
+const (
+	AttachmentContentRole = "attachment"
+	AttachmentTextRole    = "extracted_text"
+	AttachmentOwnerKind   = "requirement_attachment"
+)
+
+// AttachmentKind classifies the supported formats.
+type AttachmentKind string
+
+// Supported attachment kinds.
+const (
+	AttachmentMarkdown    AttachmentKind = "markdown"
+	AttachmentText        AttachmentKind = "text"
+	AttachmentDOCX        AttachmentKind = "docx"
+	AttachmentPPTX        AttachmentKind = "pptx"
+	AttachmentPDF         AttachmentKind = "pdf"
+	AttachmentImage       AttachmentKind = "image"
+	AttachmentUnsupported AttachmentKind = "unsupported"
+)
+
+// IsImage reports whether the attachment is an image reference only.
+func (k AttachmentKind) IsImage() bool { return k == AttachmentImage }
+
+// SupportsExtraction reports whether the parser can extract text for the kind.
+func (k AttachmentKind) SupportsExtraction() bool {
+	switch k {
+	case AttachmentMarkdown, AttachmentText, AttachmentDOCX, AttachmentPPTX, AttachmentPDF:
+		return true
+	default:
+		return false
+	}
 }
 
-// sha256RE mirrors the sha256 CHECK constraint: 64 lowercase hexadecimal
-// characters.
-var sha256RE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+// Attachment parser sentinel errors. Infrastructure parser implementations
+// wrap these so the application can classify the extraction outcome.
+var (
+	ErrUnsupportedAttachmentFormat = errors.New("unsupported attachment format")
+	ErrAttachmentTooLarge          = errors.New("attachment exceeds the extraction limit")
+	ErrAttachmentCorrupt           = errors.New("attachment cannot be parsed")
+	ErrAttachmentNotFound          = errors.New("attachment not found")
+)
 
-// Attachment is one filesystem-backed requirement attachment. StoragePath is a
-// path relative to EZTEST_VERSION_ATTACHMENT_DIR; absolute paths are resolved
-// only inside the filesystem adapter.
+// Attachment is the runtime state of one message attachment. The binary lives
+// in the content ledger; extracted text is stored as a second content object
+// and referenced here, never copied into a requirement version.
 type Attachment struct {
-	ID            int64
-	VersionID     int64
-	RequirementID int64
-	Kind          string
-	Filename      string
-	MIMEType      string
-	SizeBytes     int64
-	SHA256        string
-	StoragePath   string
-	CreatedBy     int64
-	CreatedAt     time.Time
+	ID                    int64
+	VersionID             int64
+	RequirementID         *int64
+	RequirementVersionID  *int64
+	ConversationMessageID *int64
+	ContentRefID          int64
+	Name                  string
+	MIME                  string
+	Size                  int64
+	ExtractionStatus      string
+	ExtractedContentRefID *int64
+	ExtractionErrorCode   string
+	ExtractionErrorText   string
+	CreatedBy             *int64
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
-// KindForMIMEType classifies an allowed attachment MIME type as text or image.
-// Anything outside the frozen allow-list is rejected as unsupported.
-func KindForMIMEType(mimeType string) (string, error) {
-	kind, ok := attachmentMIMETypes[mimeType]
-	if !ok {
-		return "", NewInvalid("mimeType", "unsupported_attachment_type",
-			"attachment type must be txt, md, json, yaml, png or jpg")
-	}
-	return kind, nil
+// AttachmentRepository persists requirement_attachment runtime rows and their
+// idempotent extraction state transitions.
+type AttachmentRepository interface {
+	Create(ctx context.Context, attachment Attachment) error
+	Get(ctx context.Context, attachmentID int64) (Attachment, error)
+	GetInVersion(ctx context.Context, versionID, attachmentID int64) (Attachment, error)
+	ListByRequirement(ctx context.Context, versionID, requirementID int64) ([]Attachment, error)
+	ListByConversation(ctx context.Context, versionID, conversationID int64) ([]Attachment, error)
+	ConversationExists(ctx context.Context, versionID, conversationID int64) (bool, error)
+	MarkProcessing(ctx context.Context, attachmentID int64, updatedAt time.Time) (bool, error)
+	MarkDone(ctx context.Context, attachmentID int64, extractedContentRefID int64, updatedAt time.Time) error
+	MarkFailed(ctx context.Context, attachmentID int64, code, message string, updatedAt time.Time) error
+	// ListPendingForIngest returns the oldest pending attachments for the P1
+	// attachment.ingest reconciler.
+	ListPendingForIngest(ctx context.Context, limit int) ([]PendingAttachment, error)
 }
 
-// Validate enforces the attachment bounds of spec §6.7 and the
-// requirement_attachment CHECK constraints.
-func (a *Attachment) Validate() error {
-	if a == nil {
-		return NewInvalid("", "invalid_attachment", "attachment is required")
+// SanitizeAttachmentName strips directory components and control characters.
+// The name is display-only; the server never writes files under it.
+func SanitizeAttachmentName(raw string) (string, error) {
+	name := strings.ReplaceAll(raw, "\\", "/")
+	name = path.Base(name)
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return "", platform.Invalid("name", "attachment name is required")
 	}
-	if a.VersionID <= 0 {
-		return NewInvalid("versionId", "invalid_id", "versionId must be a positive id")
+	if utf8.RuneCountInString(name) > MaxAttachmentNameRunes {
+		return "", platform.Invalid("name", "must be at most 255 characters")
 	}
-	if a.RequirementID <= 0 {
-		return NewInvalid("requirementId", "invalid_id", "requirementId must be a positive id")
+	return name, nil
+}
+
+// DetectAttachmentKind classifies an attachment by extension, falling back to
+// the MIME type. Legacy binary .doc/.ppt are deliberately unsupported.
+func DetectAttachmentKind(name, mime string) AttachmentKind {
+	name = strings.ToLower(strings.TrimSpace(name))
+	mime = strings.ToLower(strings.TrimSpace(mime))
+	switch {
+	case strings.HasSuffix(name, ".md"), strings.HasSuffix(name, ".markdown"):
+		return AttachmentMarkdown
+	case strings.HasSuffix(name, ".txt"):
+		return AttachmentText
+	case strings.HasSuffix(name, ".docx"):
+		return AttachmentDOCX
+	case strings.HasSuffix(name, ".pptx"):
+		return AttachmentPPTX
+	case strings.HasSuffix(name, ".pdf"):
+		return AttachmentPDF
+	case strings.HasSuffix(name, ".png"), strings.HasSuffix(name, ".jpg"), strings.HasSuffix(name, ".jpeg"),
+		strings.HasSuffix(name, ".webp"):
+		return AttachmentImage
+	case strings.HasSuffix(name, ".doc"), strings.HasSuffix(name, ".ppt"):
+		return AttachmentUnsupported
 	}
-	if a.Kind != AttachmentText && a.Kind != AttachmentImage {
-		return NewInvalid("kind", "invalid_kind", "kind must be text or image")
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return AttachmentImage
+	case mime == "text/plain", mime == "text/markdown":
+		return AttachmentText
+	case mime == "application/pdf":
+		return AttachmentPDF
+	case strings.Contains(mime, "wordprocessingml"):
+		return AttachmentDOCX
+	case strings.Contains(mime, "presentationml"):
+		return AttachmentPPTX
+	default:
+		return AttachmentUnsupported
 	}
-	kind, err := KindForMIMEType(a.MIMEType)
-	if err != nil {
-		return err
-	}
-	if kind != a.Kind {
-		return NewInvalid("kind", "invalid_kind",
-			fmt.Sprintf("kind %q does not match mime type %q", a.Kind, a.MIMEType))
-	}
-	if strings.TrimSpace(a.Filename) == "" {
-		return NewInvalid("filename", "invalid_filename", "filename is required")
-	}
-	if utf8.RuneCountInString(a.Filename) > MaxAttachmentFilenameChars {
-		return NewInvalid("filename", "invalid_filename",
-			fmt.Sprintf("filename must be at most %d characters", MaxAttachmentFilenameChars))
-	}
-	if a.SizeBytes <= 0 {
-		return NewInvalid("sizeBytes", "invalid_attachment_size", "sizeBytes must be positive")
-	}
-	if a.SizeBytes > MaxAttachmentBytes {
-		return NewInvalid("sizeBytes", "attachment_too_large",
-			fmt.Sprintf("sizeBytes must be at most %d bytes", MaxAttachmentBytes))
-	}
-	if !sha256RE.MatchString(a.SHA256) {
-		return NewInvalid("sha256", "invalid_sha256",
-			"sha256 must be 64 lowercase hexadecimal characters")
-	}
-	if strings.TrimSpace(a.StoragePath) == "" {
-		return NewInvalid("storagePath", "invalid_storage_path", "storagePath is required")
-	}
-	return nil
+}
+
+// PendingAttachment is the ingest reconciler row: a pending attachment plus the
+// conversation/message that owns it when linked.
+type PendingAttachment struct {
+	ID             int64
+	VersionID      int64
+	ConversationID int64
+	MessageID      int64
 }

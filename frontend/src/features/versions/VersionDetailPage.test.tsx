@@ -1,1765 +1,573 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import "@testing-library/jest-dom/vitest"
 
 import { ApiError } from "@/lib/api-client"
 
-const codeIntelMocks = vi.hoisted(() => ({
-  getVersionChanges: vi.fn(),
-  getLatestIndexRun: vi.fn(),
-  getLatestAnalysis: vi.fn(),
-  startAnalysis: vi.fn(),
-  getFileDiff: vi.fn(),
-}))
+import type { Version } from "./types"
 
-vi.mock("@/features/code-intel/api", () => ({
-  getVersionChanges: codeIntelMocks.getVersionChanges,
-  getLatestIndexRun: codeIntelMocks.getLatestIndexRun,
-  getLatestAnalysis: codeIntelMocks.getLatestAnalysis,
-  startAnalysis: codeIntelMocks.startAnalysis,
-  getFileDiff: codeIntelMocks.getFileDiff,
-}))
-
-const mocks = vi.hoisted(() => ({
+const api = vi.hoisted(() => ({
+  listVersions: vi.fn(),
   getVersion: vi.fn(),
-  startClarification: vi.fn(),
-  enterDesign: vi.fn(),
-  listRequirements: vi.fn(),
-  listRelations: vi.fn(),
-  listAttachments: vi.fn(),
-  getClarification: vi.fn(),
-  listClarificationMessages: vi.fn(),
-  sendClarificationMessage: vi.fn(),
-  startClarificationSession: vi.fn(),
-  analyzeClarification: vi.fn(),
-  reconClarification: vi.fn(),
-  listClarificationQuestions: vi.fn(),
-  createClarificationQuestion: vi.fn(),
-  updateClarificationQuestion: vi.fn(),
-  listDecisions: vi.fn(),
-  createDecision: vi.fn(),
-  updateDecision: vi.fn(),
-  fetchVersionEvents: vi.fn(),
-  useVersionStream: vi.fn(),
-  useBatches: vi.fn(),
-  useBatch: vi.fn(),
-  useCaseRuns: vi.fn(),
-  useCaseRun: vi.fn(),
-  useReport: vi.fn(),
-  useExecution: vi.fn(),
-  useExecutionActions: vi.fn(),
-  listExecutionSessions: vi.fn(),
-  createBatch: vi.fn(),
-  pauseBatch: vi.fn(),
-  resumeBatch: vi.fn(),
-  createRequirement: vi.fn(),
-  getIncrementalPlan: vi.fn(),
-  useIssues: vi.fn(),
-  useReports: vi.fn(),
-  issuesProps: vi.fn(),
-  reportsProps: vi.fn(),
-  explorationProps: vi.fn(),
-  mindmapProps: vi.fn(),
-  getEvidenceMeta: vi.fn(),
-  getEvidenceUrl: vi.fn(),
+  createVersion: vi.fn(),
+  getResourceCatalog: vi.fn(),
+  reopenVersion: vi.fn(),
+}))
+vi.mock("./api", () => api)
+
+const deliveryApi = vi.hoisted(() => ({
+  listIssues: vi.fn(),
+  listReports: vi.fn(),
+}))
+vi.mock("@/features/delivery/api", () => deliveryApi)
+
+const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+vi.mock("@/features/execution/api", () => executionApi)
+
+const chainProps = vi.hoisted(() => ({
+  onVersionChanged: null as (() => void) | null,
 }))
 
-vi.mock("./api", () => ({
-  getVersion: mocks.getVersion,
-  startClarification: mocks.startClarification,
-  enterDesign: mocks.enterDesign,
-  createRequirement: mocks.createRequirement,
-  getIncrementalPlan: mocks.getIncrementalPlan,
-  listRequirements: mocks.listRequirements,
-  listRelations: mocks.listRelations,
-  listAttachments: mocks.listAttachments,
-  getClarification: mocks.getClarification,
-  listClarificationMessages: mocks.listClarificationMessages,
-  sendClarificationMessage: mocks.sendClarificationMessage,
-  startClarificationSession: mocks.startClarificationSession,
-  analyzeClarification: mocks.analyzeClarification,
-  reconClarification: mocks.reconClarification,
-  listClarificationQuestions: mocks.listClarificationQuestions,
-  createClarificationQuestion: mocks.createClarificationQuestion,
-  updateClarificationQuestion: mocks.updateClarificationQuestion,
-  listDecisions: mocks.listDecisions,
-  createDecision: mocks.createDecision,
-  updateDecision: mocks.updateDecision,
-  fetchVersionEvents: mocks.fetchVersionEvents,
+const sse = vi.hoisted(() => ({
+  handlers: null as Record<string, (event: unknown) => void> | null,
+  calls: 0,
 }))
-
-// The execution tabs are covered by their own suites; this container test only
-// needs their empty projections to prove the slots and header controls are wired.
-vi.mock("@/features/execution/hooks/useExecution", () => ({
-  useBatches: mocks.useBatches,
-  useBatch: mocks.useBatch,
-  useCaseRuns: mocks.useCaseRuns,
-  useCaseRun: mocks.useCaseRun,
-  useReport: mocks.useReport,
-  useExecution: mocks.useExecution,
-  useExecutionActions: mocks.useExecutionActions,
-}))
-
-vi.mock("@/features/execution/api", () => ({
-  listExecutionSessions: mocks.listExecutionSessions,
-  getEvidenceMeta: mocks.getEvidenceMeta,
-  getEvidenceUrl: mocks.getEvidenceUrl,
-}))
-
-// The delivery tabs are covered by their own suites; the overview data is
-// projected through the delivery hooks, which this container test stubs with
-// empty projections unless a case sets them.
-vi.mock("@/features/delivery/hooks/useIssues", () => ({ useIssues: mocks.useIssues }))
-vi.mock("@/features/delivery/hooks/useReports", () => ({
-  useReports: mocks.useReports,
-  useReport: mocks.useReport,
-}))
-vi.mock("@/features/delivery/components/IssuesTab", () => ({
-  IssuesTab: (props: {
-    versionId: string
-    issueId?: string
-    degraded?: boolean
-    onIssueChange?: (issueId: string) => void
-  }) => {
-    mocks.issuesProps(props)
-    return <div data-testid="issues-tab">issues for {props.versionId}</div>
-  },
-}))
-vi.mock("@/features/delivery/components/ReportsTab", () => ({
-  ReportsTab: (props: {
-    versionId: string
-    batchId?: string
-    reportId?: string
-    onBatchChange?: (batchId: string) => void
-    onReportChange?: (reportId: string) => void
-  }) => {
-    mocks.reportsProps(props)
-    return <div data-testid="report-tab">reports for {props.versionId}</div>
-  },
-}))
-
-// The real exploration tab is covered by its own suite; the container test
-// pins the deep-link wiring (params in, URL writes out) and the issue callback.
-vi.mock("@/features/execution/components/ExplorationTab", () => ({
-  ExplorationTab: (props: {
-    versionId: string
-    batchId?: string
-    initialFilters?: {
-      requirementId?: string
-      resultStatus?: string
-      abnormalOnly?: boolean
-      q?: string
-    }
-    selectedNodeId?: string
-    onFiltersChange?: (filters: {
-      requirementId: string
-      resultStatus: string
-      abnormalOnly: boolean
-      q: string
-    }) => void
-    onSelectedNodeChange?: (nodeId: string) => void
-    onNavigate?: (target: { kind: "issue"; id: string } | { kind: "case"; id: string }) => void
-  }) => {
-    mocks.explorationProps(props)
-    return (
-      <div data-testid="exploration-tab">
-        exploration for {props.versionId}
-        <button
-          type="button"
-          data-testid="exploration-issue-link"
-          onClick={() => props.onNavigate?.({ kind: "issue", id: "1844674407370955410" })}
-        >
-          探索问题
-        </button>
-        <button
-          type="button"
-          data-testid="exploration-case-link"
-          onClick={() => props.onNavigate?.({ kind: "case", id: MINDMAP_CASE_ID })}
-        >
-          打开脑图用例
-        </button>
-        <button
-          type="button"
-          data-testid="exploration-node-link"
-          onClick={() => props.onSelectedNodeChange?.("case:1844674407370955210")}
-        >
-          打开节点
-        </button>
-        <button
-          type="button"
-          data-testid="exploration-node-close"
-          onClick={() => props.onSelectedNodeChange?.("")}
-        >
-          关闭节点
-        </button>
-        <button
-          type="button"
-          data-testid="exploration-filter-link"
-          onClick={() =>
-            props.onFiltersChange?.({
-              requirementId: "1844674407370955101",
-              resultStatus: "failed",
-              abnormalOnly: true,
-              q: "登录",
-            })
-          }
-        >
-          筛选
-        </button>
-      </div>
-    )
-  },
-}))
-
-vi.mock("@/features/mindmap/api", () => ({
-  getGraph: vi.fn(async () => ({
-    versionId: "1844674407370955161",
-    versionStatus: "clarifying",
-    editable: false,
-    nodes: [],
-    coverage: {
-      requirementIds: [],
-      uncoveredRequirementIds: [],
-      staleRequirementIds: [],
-      matrix: [],
+vi.mock("@/features/clarification/useVersionEvents", async () => {
+  const React = await import("react")
+  return {
+    useVersionEvents: (
+      _versionId: string,
+      handlers: Record<string, (event: unknown) => void>,
+    ): string => {
+      sse.handlers = handlers
+      React.useEffect(() => {
+        sse.calls += 1
+      }, [])
+      return "live"
     },
-    baseline: null,
-    latestRuns: {},
-  })),
+  }
+})
+
+vi.mock("@/features/clarification/RequirementsTab", async () => {
+  const React = await import("react")
+  return {
+    RequirementsTab: (props: {
+      versionId: string
+      initialConversationId?: string
+      initialRequirementId?: string
+    }) =>
+      React.createElement("div", {
+        "data-testid": "clarification-workspace",
+        "data-version-id": props.versionId,
+        "data-conversation-id": props.initialConversationId,
+        "data-requirement-id": props.initialRequirementId,
+      }),
+  }
+})
+
+vi.mock("@/features/design/DesignTab", async () => {
+  const React = await import("react")
+  return {
+    DesignTab: (props: {
+      versionId: string
+      initialCaseId?: string
+      initialConversationId?: string
+    }) =>
+      React.createElement("div", {
+        "data-testid": "design-workspace",
+        "data-version-id": props.versionId,
+        "data-case-id": props.initialCaseId,
+        "data-conversation-id": props.initialConversationId,
+      }),
+  }
+})
+
+vi.mock("@/features/execution/ExecutionTab", async () => {
+  const React = await import("react")
+  return {
+    ExecutionTab: (props: {
+      versionId: string
+      initialWaveId?: string
+      initialCaseRunId?: string
+    }) =>
+      React.createElement("div", {
+        "data-testid": "execution-workspace",
+        "data-version-id": props.versionId,
+        "data-wave-id": props.initialWaveId,
+        "data-case-run-id": props.initialCaseRunId,
+      }),
+  }
+})
+
+vi.mock("@/features/delivery/IssuesTab", async () => {
+  const React = await import("react")
+  return {
+    IssuesTab: (props: { versionId: string }) =>
+      React.createElement("div", {
+        "data-testid": "issues-workspace",
+        "data-version-id": props.versionId,
+      }),
+  }
+})
+
+vi.mock("@/features/delivery/ReportsTab", async () => {
+  const React = await import("react")
+  return {
+    ReportsTab: (props: { versionId: string }) =>
+      React.createElement("div", {
+        "data-testid": "reports-workspace",
+        "data-version-id": props.versionId,
+      }),
+  }
+})
+
+vi.mock("@/features/chain/ChainTab", async () => {
+  const React = await import("react")
+  return {
+    ChainTab: (props: { versionId: string; onVersionChanged?: () => void }) => {
+      chainProps.onVersionChanged = props.onVersionChanged ?? null
+      return React.createElement("div", {
+        "data-testid": "chain-workspace",
+        "data-version-id": props.versionId,
+      })
+    },
+  }
+})
+
+vi.mock("@/features/code-intel/CodeTab", async () => {
+  const React = await import("react")
+  return {
+    CodeTab: (props: { versionId: string }) =>
+      React.createElement("div", {
+        "data-testid": "code-workspace",
+        "data-version-id": props.versionId,
+      }),
+  }
+})
+
+const navigation = vi.hoisted(() => ({
+  push: vi.fn(),
+  replace: vi.fn(),
+  refresh: vi.fn(),
+  back: vi.fn(),
+  forward: vi.fn(),
+  prefetch: vi.fn(),
+}))
+const search = vi.hoisted(() => ({ params: new URLSearchParams() }))
+vi.mock("next/navigation", () => ({
+  useRouter: () => navigation,
+  usePathname: () => "/versions/2001",
+  useSearchParams: () => search.params,
 }))
 
-// The embedded mindmap page owns its own suite; this container test pins the
-// tab wiring: the embedded flag, the `?case=` read/write and the shared version
-// stream/version it receives from this page.
-vi.mock("@/features/mindmap/MindmapPage", () => ({
-  MindmapPage: (props: {
-    versionId: string
-    embedded?: boolean
-    initialCaseId?: string
-    onCaseChange?: (caseId: string) => void
-    stream?: { events: unknown[]; status: string }
-    version?: { id: string }
-  }) => {
-    mocks.mindmapProps(props)
-    return (
-      <div data-testid="mindmap-tab">
-        mindmap for {props.versionId}
-        <button
-          type="button"
-          data-testid="mindmap-case-link"
-          onClick={() => props.onCaseChange?.(MINDMAP_CASE_ID)}
-        >
-          选择用例
-        </button>
-        <button
-          type="button"
-          data-testid="mindmap-case-clear"
-          onClick={() => props.onCaseChange?.("")}
-        >
-          清除用例
-        </button>
-      </div>
-    )
-  },
-}))
-
-// The workbench owns the version stream; this suite only covers the tab shell.
-vi.mock("./useVersionStream", () => ({ useVersionStream: mocks.useVersionStream }))
-
-// The bindings form reads the P2 resource APIs; the container test stays focused
-// on the tab shell and header actions, while T17's own suite covers bindings.
-vi.mock("./VersionBindingsForm", () => ({
-  VersionBindingsForm: () => null,
-}))
-
-import VersionDetailRoutePage from "@/app/(app)/versions/[id]/page"
-
-import type { Analysis, ChangeList, IndexRun } from "@/features/code-intel/types"
-import type { Batch } from "@/features/execution/types"
-
-import type { Requirement, Version, VersionEvent } from "./types"
+import { versionFixture } from "./test-fixtures"
 import { VersionDetailPage } from "./VersionDetailPage"
 
-/** A snowflake ID that a JS number cannot hold; it must stay a string verbatim. */
-const VERSION_ID = "1844674407370955161"
-
-const VERSION: Version = {
-  id: VERSION_ID,
-  name: "订单系统 2.0",
-  label: "v2.0",
-  description: "订单系统第二阶段",
-  status: "clarifying",
-  systemId: 1,
-  environmentId: 2,
-  codeRepositoryId: 3,
-  codeBranch: "main",
-  codeBaselineCommit: "0123456789abcdef0123456789abcdef01234567",
-  bindings: {
-    system: { id: 1, name: "订单系统", available: true },
-    environment: { id: 2, name: "staging", available: true },
-    codeRepository: { id: 3, name: "order-web", available: true },
-  },
-  requirementCount: 3,
-  clarifiedCount: 1,
-  openQuestionCount: 2,
-  revision: 2,
-  createdBy: 1,
-  updatedBy: 1,
-  createdAt: "2026-10-27T10:00:00Z",
-  updatedAt: "2026-10-27T10:00:00Z",
-}
-
-const TAB_LABELS = [
-  "需求与澄清",
-  "用例脑图",
-  "总览",
-  "执行会话",
-  "探索链路",
-  "实时播报",
-  "结果与证据",
-  "问题",
-  "报告",
-  "代码与变更",
-]
-
-/** The four P6 execution tab slots and the root test id each real tab renders. */
-const EXECUTION_TAB_SLOTS = [
-  ["执行会话", "sessions-tab"],
-  ["探索链路", "exploration-tab"],
-  ["实时播报", "broadcast-tab"],
-  ["结果与证据", "results-tab"],
-] as const
-
-/** The two P7 delivery tabs mounted in place of the P3 placeholders. */
-const DELIVERY_TAB_SLOTS = [
-  ["问题", "issues-tab"],
-  ["报告", "report-tab"],
-] as const
-
-/** Result sent by POST requirements; the backend DTO keys stay camelCase. */
-const CREATED_REQUIREMENT: Requirement = {
-  id: "1844674407370956009",
-  versionId: VERSION_ID,
-  title: "退款审核",
-  description: "",
-  acceptanceCriteria: "",
-  priority: "should",
-  status: "draft",
-  source: "user",
-  lastUpdateSource: "user",
-  revision: 1,
-  confirmedAt: null,
-  confirmedBy: null,
-  openQuestionCount: 0,
-  relationCount: 0,
-  attachmentCount: 0,
-  createdBy: 1,
-  updatedBy: 1,
-  createdAt: "2026-10-28T10:00:00Z",
-  updatedAt: "2026-10-28T10:00:00Z",
-}
-
-function versionEvent(seq: number, type: string): VersionEvent {
-  return {
-    seq,
-    channel: `version:${VERSION_ID}`,
-    type,
-    version_id: VERSION_ID,
-    batch_id: null,
-    case_id: null,
-    step_id: null,
-    agent_role: null,
-    session_id: null,
-    ts: "2026-10-28T10:00:00Z",
-    summary: "版本状态变化",
-    detail: { phase: "clarifying", reason: "new_requirement" },
-    refs: { evidence: [], case: [], requirement: [], code: [] },
-  }
-}
-
-const ACTIVE_BATCH_ID = "1844674407370955165"
-/** Batches for the header selector / overview report entry. */
-const HEADER_BATCH_1 = "1844674407370955171"
-const HEADER_BATCH_2 = "1844674407370955172"
-const ISSUE_ID = "1844674407370955410"
-const REPORT_ID = "1844674407370955501"
-const SECOND_REPORT_ID = "1844674407370955502"
-/** Evidence deep link ids of a results-tab evidence pair. */
-const EVIDENCE_ID = "1844674407370955402"
-const COMPARE_EVIDENCE_ID = "1844674407370955403"
-/** A mindmap node id for the `?case=` deep link of the embedded mindmap tab. */
-const MINDMAP_CASE_ID = "1844674407370955210"
-
-function batchFixture(overrides: Partial<Batch> = {}): Batch {
-  return {
-    id: ACTIVE_BATCH_ID,
-    version_id: VERSION_ID,
-    batch_no: 1,
-    status: "running",
-    paused: false,
-    pause_mode: "",
-    pause_reason: "",
-    baseline_hash: "a".repeat(64),
-    code_baseline_commit: null,
-    head_commit: null,
-    counts: {
-      total: 2,
-      passed: 1,
-      failed: 0,
-      blocked: 0,
-      inconclusive: 0,
-      skipped: 0,
-      interrupted: 0,
-    },
-    created_by: "1",
-    started_at: "2026-10-28T00:00:00Z",
-    finished_at: null,
-    failure_reason: "",
-    ...overrides,
-  }
-}
-
-function batchesResult(batches: Batch[] = []) {
-  return {
-    batches,
-    nextCursor: "",
-    hasMore: false,
-    loading: false,
-    error: "",
-    streamStatus: "live" as const,
-    refresh: vi.fn().mockResolvedValue(undefined),
-  }
-}
-
-function deliveryPage<T>(items: T[] = []) {
-  return {
-    items,
-    reports: items,
-    issues: items,
-    nextCursor: "",
-    hasMore: false,
-    loading: false,
-    loadingMore: false,
-    error: "",
-    streamStatus: "live" as const,
-    refresh: vi.fn().mockResolvedValue(undefined),
-  }
-}
-
-/** A resolved (or empty) report resource for the page-level `?report=` sync. */
-function reportResult(report: object | null) {
-  return {
-    data: report,
-    report,
-    loading: false,
-    error: "",
-    streamStatus: "live" as const,
-    refresh: vi.fn(),
-  }
-}
-
-function actionsResult() {
-  return {
-    createBatch: mocks.createBatch,
-    pause: mocks.pauseBatch,
-    resume: mocks.resumeBatch,
-    cancel: vi.fn(),
-    rerun: vi.fn(),
-    exportReport: vi.fn(),
-    pending: "" as const,
-    error: "",
-    clearError: vi.fn(),
-  }
-}
-
-const CODE_BASE = "0123456789abcdef0123456789abcdef01234567"
-const CODE_HEAD = "89abcdef0123456789abcdef0123456789abcdef"
-
-const CODE_CHANGES: ChangeList = {
-  changeSetId: "1844674407370955163",
-  baseCommit: CODE_BASE,
-  headCommit: CODE_HEAD,
-  stats: { files: 1, additions: 12, deletions: 1, truncated: false },
-  files: [
-    {
-      path: "src/api/refund.ts",
-      oldPath: null,
-      status: "M",
-      additions: 12,
-      deletions: 1,
-      binary: false,
-      headBlobHash: "git-sha1:1111111111111111111111111111111111111111",
-    },
-  ],
-  nextCursor: null,
-  hasMore: false,
-}
-
-const CODE_INDEX: IndexRun = {
-  runId: "1844674407370955164",
-  repoId: 3,
-  commit: CODE_HEAD,
-  status: "done",
-  stats: { files: 20, truncated: false },
-  startedAt: "2026-10-28T00:50:00Z",
-  finishedAt: "2026-10-28T00:52:03Z",
-}
-
-const CODE_ANALYSIS: Analysis = {
-  id: "1844674407370955162",
-  versionId: VERSION_ID,
-  repoId: 3,
-  baseCommit: CODE_BASE,
-  headCommit: CODE_HEAD,
-  status: "done",
-  degraded: false,
-  analysisVersion: 1,
-  model: "deepseek-chat",
-  promptVersion: "p4.1",
-  changeSetId: "1844674407370955163",
-  changeSummary: "退款接口新增 reason 参数",
-  stats: null,
-  factVersions: [],
-  candidates: [],
-  unmapped: [],
-  errors: [],
-  createdAt: "2026-10-28T01:00:00Z",
-  startedAt: "2026-10-28T01:00:00Z",
-  finishedAt: "2026-10-28T01:02:03Z",
-}
-
-/** Minimal report list item for the page-level degraded flag / deep-link tests. */
-const REPORT_SUMMARY = {
-  id: REPORT_ID,
-  versionId: VERSION_ID,
-  batchId: HEADER_BATCH_1,
-  revision: 1,
-  status: "published",
-  title: "Batch 1 报告",
-  inputFingerprint: "f".repeat(64),
-  markdown: { sha256: "e".repeat(64), sizeBytes: 1024, downloadPath: "" },
-  staleReason: "",
-  publishedAt: "2026-10-28T11:00:00Z",
-  createdAt: "2026-10-28T11:00:00Z",
-  updatedAt: "2026-10-28T11:00:00Z",
-}
-
-const DEGRADED_REPORT = {
-  ...REPORT_SUMMARY,
-  batchNo: 1,
-  batchKind: "baseline",
-  content: { degraded: true, requirements: [] },
+const completedVersion: Version = {
+  ...versionFixture,
+  status: "completed",
+  closed_at: "2026-11-01T03:00:00Z",
+  close_reason: "需求全部闭环，报告已发布",
 }
 
 describe("VersionDetailPage", () => {
   beforeEach(() => {
-    for (const mock of Object.values(mocks)) mock.mockReset()
-    mocks.getVersion.mockResolvedValue(VERSION)
-    // The mounted workbench loads these on mount; empty data keeps the shell
-    // assertions deterministic.
-    mocks.listRequirements.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
-    mocks.listRelations.mockResolvedValue([])
-    mocks.listAttachments.mockResolvedValue([])
-    mocks.getClarification.mockResolvedValue({
-      session: null,
-      questions: { open: 0, answered: 0, dismissed: 0 },
-      decisions: { proposed: 0, accepted: 0, rejected: 0 },
-    })
-    mocks.listClarificationMessages.mockResolvedValue({
-      items: [],
-      nextCursor: "",
-      hasMore: false,
-    })
-    mocks.listClarificationQuestions.mockResolvedValue({
-      items: [],
-      nextCursor: "",
-      hasMore: false,
-    })
-    mocks.listDecisions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
-    mocks.useVersionStream.mockReturnValue({ events: [], status: "live", reconnect: vi.fn() })
-    mocks.fetchVersionEvents.mockResolvedValue({ events: [], cursor: 0, hasMore: false })
-    mocks.useBatches.mockReturnValue(batchesResult())
-    mocks.useBatch.mockReturnValue({
-      batch: null,
-      loading: false,
-      error: "",
-      streamStatus: "live",
-      refresh: vi.fn(),
-    })
-    mocks.useCaseRuns.mockReturnValue({
-      caseRuns: [],
-      nextCursor: "",
-      hasMore: false,
-      loading: false,
-      error: "",
-      streamStatus: "live",
-      refresh: vi.fn(),
-    })
-    mocks.useCaseRun.mockReturnValue({
-      caseRun: null,
-      loading: false,
-      error: "",
-      streamStatus: "live",
-      refresh: vi.fn(),
-    })
-    mocks.useReport.mockReturnValue({
-      report: null,
-      loading: false,
-      error: "",
-      streamStatus: "live",
-      refresh: vi.fn(),
-    })
-    mocks.useExecution.mockReturnValue({
-      batches: [],
-      activeBatch: null,
-      loading: false,
-      error: "",
-      streamStatus: "live",
-      refresh: vi.fn(),
-      actions: actionsResult(),
-    })
-    mocks.useExecutionActions.mockReturnValue(actionsResult())
-    mocks.listExecutionSessions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
-    // Keep the evidence viewer of a `?evidence=` deep link pending: the test
-    // only pins that the query parameter survives the tab normalization.
-    mocks.getEvidenceMeta.mockReturnValue(new Promise(() => {}))
-    mocks.getEvidenceUrl.mockReturnValue(
-      `/api/versions/${VERSION_ID}/evidence/1844674407370955402/bytes`,
-    )
-    mocks.createBatch.mockResolvedValue(batchFixture())
-    mocks.pauseBatch.mockResolvedValue(true)
-    mocks.resumeBatch.mockResolvedValue(true)
-    for (const mock of Object.values(codeIntelMocks)) mock.mockReset()
-    codeIntelMocks.getVersionChanges.mockResolvedValue(CODE_CHANGES)
-    codeIntelMocks.getLatestIndexRun.mockResolvedValue(CODE_INDEX)
-    codeIntelMocks.getLatestAnalysis.mockResolvedValue(CODE_ANALYSIS)
-    mocks.useIssues.mockImplementation(() => deliveryPage())
-    mocks.useReports.mockReturnValue(deliveryPage())
-    mocks.useReport.mockReturnValue({
-      data: null,
-      report: null,
-      loading: false,
-      error: "",
-      streamStatus: "live",
-      refresh: vi.fn(),
-    })
-    mocks.createRequirement.mockResolvedValue(CREATED_REQUIREMENT)
-    mocks.getIncrementalPlan.mockResolvedValue({
-      versionId: VERSION_ID,
-      phase: "clarifying",
-      parentBatchId: null,
-      run: null,
-      newCases: [],
-      affectedCases: [],
-      unmappedChanges: [],
-      defaultCaseIds: [],
-      warnings: [],
-      degraded: false,
-    })
+    api.getVersion.mockReset()
+    api.getVersion.mockResolvedValue(versionFixture)
+    api.reopenVersion.mockReset()
+    deliveryApi.listIssues.mockReset()
+    deliveryApi.listIssues.mockResolvedValue([])
+    deliveryApi.listReports.mockReset()
+    deliveryApi.listReports.mockResolvedValue([])
+    executionApi.listHumanRequests.mockReset()
+    executionApi.listHumanRequests.mockResolvedValue([])
+    navigation.replace.mockReset()
+    search.params = new URLSearchParams()
+    sse.handlers = null
+    sse.calls = 0
+    chainProps.onVersionChanged = null
   })
 
-  afterEach(() => {
-    cleanup()
-    window.history.replaceState(null, "", "/")
+  afterEach(cleanup)
+
+  it("renders the header, SUT chips, all eight tabs and the binding overview", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+
+    expect(
+      await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" }),
+    ).toBeInTheDocument()
+    expect(api.getVersion).toHaveBeenCalledWith("2001")
+
+    expect(screen.getByText("运行中")).toBeInTheDocument()
+    expect(screen.getByText("订单中心")).toBeInTheDocument()
+    expect(screen.getByText("支付网关")).toBeInTheDocument()
+
+    expect(screen.getAllByRole("tab")).toHaveLength(8)
+    expect(screen.getByRole("tab", { name: "总览" })).toHaveAttribute("aria-selected", "true")
+
+    const overview = screen.getByRole("region", { name: "绑定概览" })
+    expect(overview).toHaveTextContent("测试环境")
+    expect(overview).toHaveTextContent("https://order.test")
+    expect(overview).toHaveTextContent("2 个页面")
+    expect(overview).toHaveTextContent("1 个 API")
+    expect(overview).toHaveTextContent("1 个目标库")
+    expect(overview).toHaveTextContent("2 个测试账号")
+    expect(overview).toHaveTextContent("order-center-web")
+    expect(overview).toHaveTextContent("未绑定代码仓")
   })
 
-  it("renders the ten tabs with requirements active by default", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
+  it("shows issue and report tab counts from the list projections", async () => {
+    deliveryApi.listIssues.mockResolvedValue([
+      { id: "9101", status: "open" },
+      { id: "9102", status: "open" },
+    ])
+    deliveryApi.listReports.mockResolvedValue([
+      { id: "8101", kind: "version", current_revision: { revision: 2 } },
+    ])
 
-    expect(await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
-    expect(mocks.getVersion).toHaveBeenCalledWith(VERSION_ID)
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
 
-    const tabs = screen.getAllByRole("tab")
-    expect(tabs.map((tab) => tab.textContent)).toEqual(TAB_LABELS)
-    expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
-      "true",
-    )
-    expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
+    await waitFor(() => expect(screen.getByRole("tab", { name: /问题/ })).toHaveTextContent("2"))
+    expect(screen.getByRole("tab", { name: /报告/ })).toHaveTextContent("2")
   })
 
-  it("does not mount the embedded mindmap tab before it is opened", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+  it("subscribes once and refreshes the header and tab counts on version events", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+    const issueCalls = deliveryApi.listIssues.mock.calls.length
+    const reportCalls = deliveryApi.listReports.mock.calls.length
 
-    // Radix keeps inactive panels unmounted: no MindmapPage, therefore no
-    // `useMindmap` mount and no `GET /mindmap` request. The inactive panel
-    // wrapper stays in the DOM but is hidden and empty.
-    const panel = screen.getByTestId("version-tab-mindmap")
-    expect(panel.hidden).toBe(true)
-    expect(screen.queryByTestId("mindmap-tab")).toBeNull()
-    expect(mocks.mindmapProps).not.toHaveBeenCalled()
+    expect(sse.calls).toBe(1)
+    expect(sse.handlers).not.toBeNull()
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "用例脑图" }))
-
-    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
-    expect(mocks.mindmapProps).toHaveBeenCalledTimes(1)
-    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        embedded: true,
-        version: expect.objectContaining({ id: VERSION_ID }),
-      }),
-    )
-  })
-
-  it("renders the embedded mindmap tab from ?tab=mindmap&case= and syncs the case deep link", async () => {
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?tab=mindmap&case=${MINDMAP_CASE_ID}`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "用例脑图" }).getAttribute("aria-selected")).toBe(
-        "true",
-      ),
-    )
-    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
-    expect(screen.getByTestId("version-tab-mindmap").textContent).toContain(
-      `mindmap for ${VERSION_ID}`,
-    )
-    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        versionId: VERSION_ID,
-        embedded: true,
-        initialCaseId: MINDMAP_CASE_ID,
-        version: expect.objectContaining({ id: VERSION_ID }),
-      }),
-    )
-    const params = new URLSearchParams(window.location.search)
-    expect(params.get("tab")).toBe("mindmap")
-    expect(params.get("case")).toBe(MINDMAP_CASE_ID)
-
+    api.getVersion.mockResolvedValue(completedVersion)
     act(() => {
-      mocks.mindmapProps.mock.calls.at(-1)?.[0].onCaseChange?.("1844674407370955211")
-    })
-    await waitFor(() =>
-      expect(new URLSearchParams(window.location.search).get("case")).toBe("1844674407370955211"),
-    )
-    expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap")
-
-    act(() => {
-      mocks.mindmapProps.mock.calls.at(-1)?.[0].onCaseChange?.("")
-    })
-    await waitFor(() => expect(new URLSearchParams(window.location.search).get("case")).toBeNull())
-    expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap")
-  })
-
-  it("opens the embedded mindmap tab from the tab bar without losing other deep links", async () => {
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?batch=${HEADER_BATCH_1}`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "用例脑图" }))
-
-    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
-    await waitFor(() =>
-      expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap"),
-    )
-    expect(new URLSearchParams(window.location.search).get("batch")).toBe(HEADER_BATCH_1)
-    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
-      expect.objectContaining({ embedded: true, initialCaseId: "" }),
-    )
-  })
-
-  it("opens the embedded mindmap tab from an exploration case link", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
-    fireEvent.click(await screen.findByTestId("exploration-case-link"))
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "用例脑图" }).getAttribute("aria-selected")).toBe(
-        "true",
-      ),
-    )
-    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
-    expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap")
-    expect(new URLSearchParams(window.location.search).get("case")).toBe(MINDMAP_CASE_ID)
-    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
-      expect.objectContaining({ initialCaseId: MINDMAP_CASE_ID }),
-    )
-  })
-
-  it("opens the overview tab from the ?tab=overview deep link", async () => {
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
-    )
-
-    const metrics = screen.getByTestId("overview-metrics")
-    expect(within(metrics).getByRole("heading", { name: "需求覆盖" })).toBeTruthy()
-    expect(within(metrics).getByText(/已确认 1 \/ 已覆盖 — \/ 缺口 —/)).toBeTruthy()
-    expect(within(metrics).getByRole("heading", { name: "用例结果" })).toBeTruthy()
-    expect(within(metrics).getByText("暂无执行结果")).toBeTruthy()
-    expect(within(metrics).getByRole("heading", { name: "问题" })).toBeTruthy()
-    expect(within(metrics).getByText("未解决 0 · 已确认 0")).toBeTruthy()
-    expect(within(metrics).getByRole("heading", { name: "当前批次" })).toBeTruthy()
-
-    expect(screen.getByTestId("overview-coverage-matrix")).toBeTruthy()
-    expect(screen.getByText("暂无报告，生成批次报告后展示覆盖矩阵。")).toBeTruthy()
-    expect(screen.getByTestId("overview-batch-timeline")).toBeTruthy()
-    expect(screen.getAllByText("暂无批次").length).toBeGreaterThan(0)
-    expect(screen.getByTestId("overview-issue-top")).toBeTruthy()
-    expect(screen.getByText("暂无未解决问题。")).toBeTruthy()
-    expect(screen.getByTestId("overview-code-summary")).toBeTruthy()
-    expect(screen.getByRole("button", { name: "查看代码与变更" })).toBeTruthy()
-  })
-
-  it("switches tabs, syncs ?tab= and returns from the issues tab", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "问题" }))
-
-    await waitFor(() => expect(window.location.search).toContain("tab=issues"))
-    expect(await screen.findByTestId("issues-tab")).toBeTruthy()
-    expect(screen.queryByText("阶段 P7")).toBeNull()
-    expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "需求与澄清" }))
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
-        "true",
-      ),
-    )
-    expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
-    await waitFor(() => expect(window.location.search).toContain("tab=requirements"))
-  })
-
-  it("renders the four P6 execution tab slots instead of placeholders", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    for (const [label, testId] of EXECUTION_TAB_SLOTS) {
-      fireEvent.mouseDown(screen.getByRole("tab", { name: label }))
-
-      expect(await screen.findByTestId(testId)).toBeTruthy()
-      expect(screen.queryByText("阶段 P6")).toBeNull()
-      expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
-    }
-  })
-
-  it("mounts the real delivery issues and report tabs", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    for (const [label, testId] of DELIVERY_TAB_SLOTS) {
-      fireEvent.mouseDown(screen.getByRole("tab", { name: label }))
-
-      expect(await screen.findByTestId(testId)).toBeTruthy()
-      expect(screen.queryByText("阶段 P7")).toBeNull()
-      expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
-    }
-  })
-
-  it("shows 开始执行 only when an executing version has no active batch", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
-
-    const { unmount } = render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.click(await screen.findByTestId("exec-start-btn"))
-    await waitFor(() => expect(mocks.createBatch).toHaveBeenCalled())
-
-    unmount()
-    mocks.useBatches.mockReturnValue(batchesResult([batchFixture()]))
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    expect(screen.queryByTestId("exec-start-btn")).toBeNull()
-    expect(screen.getByTestId("exec-batch-selector")).toBeTruthy()
-    expect(screen.getByTestId("exec-pause-btn")).toBeTruthy()
-  })
-
-  it("shows the paused banner and resume action for a paused batch", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
-    mocks.useBatches.mockReturnValue(
-      batchesResult([batchFixture({ paused: true, pause_mode: "graceful" })]),
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    expect(await screen.findByTestId("paused-banner")).toBeTruthy()
-    expect(screen.getAllByText(/优雅暂停/).length).toBeGreaterThan(0)
-    expect(screen.getByText(/已完成 1\/2 个用例/)).toBeTruthy()
-
-    fireEvent.click(screen.getByTestId("exec-resume-btn"))
-    await waitFor(() => expect(mocks.resumeBatch).toHaveBeenCalledWith(ACTIVE_BATCH_ID))
-  })
-
-  it("mounts the real code changes tab instead of the P4 placeholder", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "代码与变更" }))
-
-    expect(await screen.findByRole("heading", { name: "变更文件" })).toBeTruthy()
-    expect(screen.getByText("src/api/refund.ts")).toBeTruthy()
-    expect(screen.queryByText("阶段 P4")).toBeNull()
-    expect(screen.queryByText(/代码与变更在 P4 阶段接入/)).toBeNull()
-    expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
-
-    expect(codeIntelMocks.getVersionChanges).toHaveBeenCalledWith(VERSION_ID)
-    expect(codeIntelMocks.getLatestIndexRun).toHaveBeenCalledWith(3)
-    expect(codeIntelMocks.getLatestAnalysis).toHaveBeenCalledWith(VERSION_ID)
-  })
-
-  it("shows the header status, binding summary and action for the current state", async () => {
-    mocks.getVersion.mockResolvedValue({
-      ...VERSION,
-      bindings: {
-        ...VERSION.bindings,
-        codeRepository: { id: 3, name: "order-web", available: false },
-      },
-    })
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    expect(screen.getByText("澄清中")).toBeTruthy()
-    expect(screen.getByText("系统：订单系统")).toBeTruthy()
-    expect(screen.getByText("环境：staging")).toBeTruthy()
-    expect(screen.getByText("代码仓：order-web（已删除）")).toBeTruthy()
-    expect(screen.getByText("未澄清需求 2")).toBeTruthy()
-    expect(screen.getByText("待澄清问题 2")).toBeTruthy()
-    expect(screen.getByRole("button", { name: "进入设计" })).toBeTruthy()
-    expect(screen.queryByRole("button", { name: "开始澄清" })).toBeNull()
-    expect(screen.getByRole("link", { name: "返回版本列表" }).getAttribute("href")).toBe(
-      "/versions",
-    )
-  })
-
-  it("starts clarification from the draft header and refreshes on demand", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "draft" })
-    mocks.startClarification.mockResolvedValue({
-      ...VERSION,
-      status: "clarifying",
-      revision: 3,
-    })
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    const versionHeader = screen.getAllByRole("banner")[0]
-    expect(within(versionHeader).getByText("草稿")).toBeTruthy()
-
-    fireEvent.click(screen.getByRole("button", { name: "开始澄清" }))
-
-    await waitFor(() => expect(mocks.startClarification).toHaveBeenCalledWith(VERSION_ID))
-    expect(await screen.findByText("澄清中")).toBeTruthy()
-    expect(screen.getByRole("button", { name: "进入设计" })).toBeTruthy()
-
-    fireEvent.click(screen.getByRole("button", { name: "刷新" }))
-    await waitFor(() => expect(mocks.getVersion).toHaveBeenCalledTimes(2))
-  })
-
-  it("asks for confirmation when entering design with unclarified requirements", async () => {
-    mocks.enterDesign.mockRejectedValueOnce(
-      new ApiError({
-        status: 409,
-        code: "conflict",
-        message: "unclarified requirements",
-        details: {
-          reason: "unclarified_requirements",
-          unclarifiedRequirementIds: ["1001", "1002"],
-          openQuestionCount: 1,
-        },
-      }),
-    )
-    mocks.enterDesign.mockResolvedValueOnce({
-      version: { ...VERSION, status: "designing", revision: 6 },
-      warnings: ["2 个需求未澄清"],
-    })
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.click(screen.getByRole("button", { name: "进入设计" }))
-
-    const confirm = await screen.findByRole("alertdialog")
-    expect(confirm.textContent).toContain("2 条需求")
-    expect(confirm.textContent).toContain("1 个待澄清问题")
-    expect(mocks.enterDesign).toHaveBeenCalledWith(VERSION_ID, false)
-
-    fireEvent.click(within(confirm).getByRole("button", { name: "确认进入设计" }))
-
-    await waitFor(() => expect(mocks.enterDesign).toHaveBeenLastCalledWith(VERSION_ID, true))
-    expect(await screen.findByText("设计中")).toBeTruthy()
-    expect(await screen.findByText("2 个需求未澄清")).toBeTruthy()
-  })
-
-  it("shows 继续中（第 2 批） after creating a requirement on a completed version", async () => {
-    const completed: Version = { ...VERSION, status: "completed", batch_no: 1, continuePhase: null }
-    const continuing: Version = {
-      ...VERSION,
-      status: "continuing",
-      batch_no: 1,
-      continuePhase: "clarifying",
-      revision: 4,
-    }
-    mocks.getVersion.mockReset()
-    mocks.getVersion.mockResolvedValueOnce(completed).mockResolvedValue(continuing)
-    // Start outside the workbench so the header entry is what navigates.
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
-    )
-    expect(screen.queryByTestId("continuing-badge")).toBeNull()
-
-    // The completed-version entry opens the requirements workbench, where the
-    // requirement is created; the backend turns the version into continuing.
-    fireEvent.click(screen.getByTestId("add-requirement-btn"))
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
-        "true",
-      ),
-    )
-    expect(await screen.findByRole("heading", { name: "新增需求" })).toBeTruthy()
-
-    fireEvent.change(screen.getByLabelText("标题"), { target: { value: "退款审核" } })
-    fireEvent.click(screen.getByRole("button", { name: "创建需求" }))
-
-    await waitFor(() => expect(mocks.createRequirement).toHaveBeenCalled())
-    await waitFor(() => expect(mocks.getVersion).toHaveBeenCalledTimes(2))
-
-    expect((await screen.findByTestId("continuing-badge")).textContent).toContain(
-      "继续中（第 2 批）",
-    )
-    expect(screen.getByTestId("continuing-banner").textContent).toContain("增量澄清")
-    expect(screen.getByTestId("add-requirement-btn")).toBeTruthy()
-    expect(screen.getByTestId("view-changes-btn")).toBeTruthy()
-  })
-
-  it("refetches the version when a version.status_changed event arrives", async () => {
-    const completed: Version = { ...VERSION, status: "completed", batch_no: 1, continuePhase: null }
-    const continuing: Version = {
-      ...VERSION,
-      status: "continuing",
-      batch_no: 1,
-      continuePhase: "designing",
-      revision: 4,
-    }
-    mocks.getVersion.mockReset()
-    mocks.getVersion.mockResolvedValueOnce(completed).mockResolvedValue(continuing)
-
-    const { rerender } = render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    expect(screen.queryByTestId("continuing-banner")).toBeNull()
-
-    mocks.useVersionStream.mockReturnValue({
-      events: [versionEvent(7, "version.status_changed")],
-      status: "live",
-      reconnect: vi.fn(),
-    })
-    rerender(<VersionDetailPage versionId={VERSION_ID} />)
-
-    await waitFor(() => expect(mocks.getVersion).toHaveBeenCalledTimes(2))
-    expect((await screen.findByTestId("continuing-badge")).textContent).toContain(
-      "继续中（第 2 批）",
-    )
-    expect(screen.getByTestId("continue-phase-label").textContent).toContain("增量设计")
-  })
-
-  it("keeps the last data, reports a load failure and retries", async () => {
-    mocks.getVersion
-      .mockRejectedValueOnce(
-        new ApiError({ status: 0, code: "network_error", message: "connection refused" }),
-      )
-      .mockResolvedValueOnce(VERSION)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-
-    const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("无法连接 API 服务")
-
-    fireEvent.click(screen.getByRole("button", { name: "重试" }))
-
-    expect(await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
-    expect(mocks.getVersion).toHaveBeenCalledTimes(2)
-  })
-
-  it("surfaces the API request id when loading the version fails", async () => {
-    mocks.getVersion.mockRejectedValueOnce(
-      new ApiError({
-        status: 500,
-        code: "internal",
-        message: "the API is unavailable",
-        requestId: "req-server-1",
-      }),
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-
-    const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("加载版本失败")
-    expect(alert.textContent).toContain("请求 ID：req-server-1")
-  })
-
-  it("honours ?tab=issues&issue= and syncs the URL when the issue opens or closes", async () => {
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=issues&issue=${ISSUE_ID}`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(mocks.issuesProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ issueId: ISSUE_ID }),
-      ),
-    )
-    expect(window.location.search).toContain("tab=issues")
-    expect(window.location.search).toContain(`issue=${ISSUE_ID}`)
-
-    act(() => {
-      mocks.issuesProps.mock.calls.at(-1)?.[0].onIssueChange?.("")
-    })
-    await waitFor(() => expect(window.location.search).not.toContain("issue="))
-    expect(window.location.search).toContain("tab=issues")
-    await waitFor(() =>
-      expect(mocks.issuesProps).toHaveBeenLastCalledWith(expect.objectContaining({ issueId: "" })),
-    )
-
-    act(() => {
-      mocks.issuesProps.mock.calls.at(-1)?.[0].onIssueChange?.(ISSUE_ID)
-    })
-    await waitFor(() => expect(window.location.search).toContain(`issue=${ISSUE_ID}`))
-    expect(window.location.search).toContain("tab=issues")
-  })
-
-  it("honours ?tab=report&report= and syncs the URL when the report changes", async () => {
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=report&report=${REPORT_ID}`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ reportId: REPORT_ID }),
-      ),
-    )
-    expect(window.location.search).toContain("tab=report")
-    expect(window.location.search).toContain(`report=${REPORT_ID}`)
-
-    act(() => {
-      mocks.reportsProps.mock.calls.at(-1)?.[0].onReportChange?.(SECOND_REPORT_ID)
-    })
-    await waitFor(() => expect(window.location.search).toContain(`report=${SECOND_REPORT_ID}`))
-    expect(window.location.search).toContain("tab=report")
-
-    act(() => {
-      mocks.reportsProps.mock.calls.at(-1)?.[0].onReportChange?.("")
-    })
-    await waitFor(() => expect(window.location.search).not.toContain("report="))
-    expect(window.location.search).toContain("tab=report")
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ reportId: "" }),
-      ),
-    )
-  })
-
-  it("adopts the deep-linked report's batch for the header selector", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
-    const earlier = batchFixture({
-      id: HEADER_BATCH_1,
-      batch_no: 1,
-      status: "done",
-      finished_at: "2026-10-28T01:00:00Z",
-    })
-    const later = batchFixture({
-      id: HEADER_BATCH_2,
-      batch_no: 2,
-      status: "done",
-      finished_at: "2026-10-28T02:00:00Z",
-    })
-    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
-    // The deep-linked report belongs to the older batch; the newest batch is
-    // what the container would otherwise select.
-    const deepLinkedReport = { ...REPORT_SUMMARY, batchId: HEADER_BATCH_1 }
-    mocks.useReport.mockImplementation((_versionId: string, nextReportId: string) =>
-      reportResult(nextReportId === REPORT_ID ? deepLinkedReport : null),
-    )
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=report&report=${REPORT_ID}`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ reportId: REPORT_ID, batchId: HEADER_BATCH_1 }),
-      ),
-    )
-    expect((screen.getByTestId("exec-batch-selector") as HTMLSelectElement).value).toBe(
-      HEADER_BATCH_1,
-    )
-  })
-
-  it("removes the ?report= deep link when the header batch changes", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
-    const earlier = batchFixture({
-      id: HEADER_BATCH_1,
-      batch_no: 1,
-      status: "done",
-      finished_at: "2026-10-28T01:00:00Z",
-    })
-    const later = batchFixture({
-      id: HEADER_BATCH_2,
-      batch_no: 2,
-      status: "done",
-      finished_at: "2026-10-28T02:00:00Z",
-    })
-    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=report&report=${REPORT_ID}`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ reportId: REPORT_ID }),
-      ),
-    )
-
-    fireEvent.change(screen.getByTestId("exec-batch-selector"), {
-      target: { value: HEADER_BATCH_1 },
-    })
-
-    await waitFor(() => expect(window.location.search).not.toContain("report="))
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ reportId: "" }),
-      ),
-    )
-    expect(window.location.search).toContain("tab=report")
-  })
-
-  it("selects the overview report batch and the header batch selector for the report tab", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
-    const earlier = batchFixture({
-      id: HEADER_BATCH_1,
-      batch_no: 1,
-      status: "done",
-      finished_at: "2026-10-28T01:00:00Z",
-    })
-    const later = batchFixture({
-      id: HEADER_BATCH_2,
-      batch_no: 2,
-      status: "done",
-      finished_at: "2026-10-28T02:00:00Z",
-    })
-    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
-    )
-
-    fireEvent.click(screen.getByRole("button", { name: "查看 Batch 1 报告" }))
-
-    await waitFor(() => expect(window.location.search).toContain("tab=report"))
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ batchId: HEADER_BATCH_1 }),
-      ),
-    )
-
-    fireEvent.change(screen.getByTestId("exec-batch-selector"), {
-      target: { value: HEADER_BATCH_2 },
-    })
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ batchId: HEADER_BATCH_2 }),
-      ),
-    )
-    expect(window.location.search).toContain("tab=report")
-  })
-
-  it("replaces a stale ?report= deep link when opening a batch report from the overview", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
-    const earlier = batchFixture({
-      id: HEADER_BATCH_1,
-      batch_no: 1,
-      status: "done",
-      finished_at: "2026-10-28T01:00:00Z",
-    })
-    const later = batchFixture({
-      id: HEADER_BATCH_2,
-      batch_no: 2,
-      status: "done",
-      finished_at: "2026-10-28T02:00:00Z",
-    })
-    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
-    // The old deep link points at the newest batch, so only the overview entry
-    // can move the shared selection to the clicked (older) batch.
-    const deepLinkedReport = { ...REPORT_SUMMARY, batchId: HEADER_BATCH_2 }
-    mocks.useReport.mockImplementation((_versionId: string, nextReportId: string) =>
-      reportResult(nextReportId === REPORT_ID ? deepLinkedReport : null),
-    )
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?tab=overview&report=${REPORT_ID}`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
-    )
-
-    fireEvent.click(await screen.findByRole("button", { name: "查看 Batch 1 报告" }))
-
-    await waitFor(() => expect(window.location.search).toContain("tab=report"))
-    await waitFor(() =>
-      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ batchId: HEADER_BATCH_1, reportId: "" }),
-      ),
-    )
-    expect(window.location.search).not.toContain(`report=${REPORT_ID}`)
-  })
-
-  it("opens the requirement create editor from 新增需求 with a non-empty requirement list", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
-    mocks.listRequirements.mockResolvedValue({
-      items: [CREATED_REQUIREMENT],
-      nextCursor: "",
-      hasMore: false,
-    })
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.click(await screen.findByTestId("add-requirement-btn"))
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
-        "true",
-      ),
-    )
-    expect(await screen.findByRole("heading", { name: "新增需求" })).toBeTruthy()
-    expect(screen.getByRole("button", { name: "创建需求" })).toBeTruthy()
-    expect(screen.queryByRole("heading", { name: "编辑需求" })).toBeNull()
-  })
-
-  it("selects the requirement of ?tab=requirements&requirement=", async () => {
-    const first: Requirement = {
-      ...CREATED_REQUIREMENT,
-      id: "1844674407370956008",
-      title: "订单创建",
-    }
-    const deepLinked: Requirement = { ...CREATED_REQUIREMENT, title: "退款审核" }
-    mocks.listRequirements.mockResolvedValue({
-      items: [first, deepLinked],
-      nextCursor: "",
-      hasMore: false,
-    })
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?tab=requirements&requirement=${deepLinked.id}`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect((screen.getByLabelText("标题") as HTMLInputElement).value).toBe("退款审核"),
-    )
-    expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
-      "true",
-    )
-  })
-
-  it("does not crash on an unknown ?requirement= deep link", async () => {
-    mocks.listRequirements.mockResolvedValue({
-      items: [CREATED_REQUIREMENT],
-      nextCursor: "",
-      hasMore: false,
-    })
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?tab=requirements&requirement=1844674407370956999`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    expect(await screen.findByTestId("requirement-deep-link-missing")).toBeTruthy()
-    expect(screen.getByText("未选择需求")).toBeTruthy()
-    expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
-      "true",
-    )
-  })
-
-  it("keeps ?req= as the exploration requirement filter", async () => {
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?tab=exploration&req=1844674407370956001`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          initialFilters: expect.objectContaining({ requirementId: "1844674407370956001" }),
-        }),
-      ),
-    )
-    expect(screen.getByRole("tab", { name: "探索链路" }).getAttribute("aria-selected")).toBe("true")
-  })
-
-  it("opens the issues deep link when exploration navigates to an issue", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
-    fireEvent.click(await screen.findByTestId("exploration-issue-link"))
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "问题" }).getAttribute("aria-selected")).toBe("true"),
-    )
-    expect(window.location.search).toContain("tab=issues")
-    expect(window.location.search).toContain(`issue=1844674407370955410`)
-    expect(mocks.issuesProps).toHaveBeenLastCalledWith(
-      expect.objectContaining({ issueId: "1844674407370955410" }),
-    )
-  })
-
-  it("passes ?node/?batch/?req/?status/?abnormal/?q to the exploration tab", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
-    const earlier = batchFixture({
-      id: HEADER_BATCH_1,
-      batch_no: 1,
-      status: "done",
-      finished_at: "2026-10-28T01:00:00Z",
-    })
-    const later = batchFixture({
-      id: HEADER_BATCH_2,
-      batch_no: 2,
-      status: "done",
-      finished_at: "2026-10-28T02:00:00Z",
-    })
-    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
-    const caseNodeId = "1844674407370955210"
-    const requirementId = "1844674407370955101"
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?tab=exploration&node=case:${caseNodeId}&batch=${HEADER_BATCH_1}&req=${requirementId}&status=failed&abnormal=1&q=${encodeURIComponent("登录")}`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          batchId: HEADER_BATCH_1,
-          selectedNodeId: `case:${caseNodeId}`,
-          initialFilters: expect.objectContaining({
-            requirementId,
-            resultStatus: "failed",
-            abnormalOnly: true,
-            q: "登录",
-          }),
-        }),
-      ),
-    )
-    expect((screen.getByTestId("exec-batch-selector") as HTMLSelectElement).value).toBe(
-      HEADER_BATCH_1,
-    )
-  })
-
-  it("opens the exploration tab and the Sheet from ?node= without ?tab=", async () => {
-    const caseNodeId = "1844674407370955210"
-    const evidenceId = "1844674407370955402"
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?node=case:${caseNodeId}&evidence=${evidenceId}`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "探索链路" }).getAttribute("aria-selected")).toBe(
-        "true",
-      ),
-    )
-    // The inferred tab is persisted so closing the Sheet (which deletes `node`)
-    // cannot fall back to the requirements tab on refresh.
-    await waitFor(() =>
-      expect(new URLSearchParams(window.location.search).get("tab")).toBe("exploration"),
-    )
-    const params = new URLSearchParams(window.location.search)
-    expect(params.get("node")).toBe(`case:${caseNodeId}`)
-    expect(params.get("evidence")).toBe(evidenceId)
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ selectedNodeId: `case:${caseNodeId}` }),
-      ),
-    )
-  })
-
-  it("opens the evidence comparison from the ?evidence=&compare= deep link", async () => {
-    window.history.replaceState(
-      null,
-      "",
-      `/versions/${VERSION_ID}?evidence=${EVIDENCE_ID}&compare=${COMPARE_EVIDENCE_ID}`,
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    expect(await screen.findByTestId("evidence-viewer")).toBeTruthy()
-    // The primary artifact and the comparison artifact are both loaded through
-    // the existing viewer (the second read proves `compareWith` is wired).
-    await waitFor(() =>
-      expect(mocks.getEvidenceMeta).toHaveBeenCalledWith(
-        VERSION_ID,
-        EVIDENCE_ID,
-        expect.anything(),
-      ),
-    )
-    await waitFor(() =>
-      expect(mocks.getEvidenceMeta).toHaveBeenCalledWith(
-        VERSION_ID,
-        COMPARE_EVIDENCE_ID,
-        expect.anything(),
-      ),
-    )
-    expect(new URLSearchParams(window.location.search).get("compare")).toBe(COMPARE_EVIDENCE_ID)
-  })
-
-  it("announces a reconnecting version stream without replacing the loaded page", async () => {
-    const reconnect = vi.fn()
-    mocks.useVersionStream.mockReturnValue({
-      events: [],
-      status: "reconnecting",
-      reconnect,
-    })
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    const status = await screen.findByTestId("version-stream-status")
-    expect(status.textContent).toContain("重连中")
-    // The reconnect action is not part of the live region: an interactive
-    // control inside role="status" would be announced as status content.
-    expect(status.querySelector("button")).toBeNull()
-    // The loaded data is kept: reconnecting is not an empty state.
-    expect(screen.getByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
-    expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
-
-    fireEvent.click(
-      within(screen.getByTestId("version-stream-banner")).getByRole("button", {
-        name: "重新连接",
-      }),
-    )
-    expect(reconnect).toHaveBeenCalledTimes(1)
-  })
-
-  it("uses the 正在连接 copy for the initial stream connection", async () => {
-    mocks.useVersionStream.mockReturnValue({
-      events: [],
-      status: "connecting",
-      reconnect: vi.fn(),
-    })
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    const status = await screen.findByTestId("version-stream-status")
-    expect(status.textContent).toContain("正在连接")
-    // "重连中" is the overview's reconnect wording; a first connection must not
-    // duplicate it.
-    expect(status.textContent).not.toContain("重连中")
-    expect(status.querySelector("button")).toBeNull()
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "总览" }))
-    await screen.findByTestId("overview-metrics")
-    expect(screen.queryByTestId("overview-stream-status")).toBeNull()
-  })
-
-  it("surfaces the API request id when a refresh fails and keeps the last data", async () => {
-    mocks.getVersion.mockResolvedValueOnce(VERSION).mockRejectedValueOnce(
-      new ApiError({
-        status: 500,
-        code: "internal",
-        message: "the API is unavailable",
-        requestId: "req-refresh-1",
-      }),
-    )
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.click(screen.getByRole("button", { name: "刷新" }))
-
-    const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("刷新版本失败")
-    expect(alert.textContent).toContain("请求 ID：req-refresh-1")
-    // The last successful version stays on screen.
-    expect(screen.getByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
-  })
-
-  it("syncs exploration Sheet open/close to ?node=", async () => {
-    const caseNodeId = "1844674407370955210"
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
-    await screen.findByTestId("exploration-tab")
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ selectedNodeId: "" }),
-      ),
-    )
-
-    act(() => {
-      mocks.explorationProps.mock.calls.at(-1)?.[0].onSelectedNodeChange?.(`case:${caseNodeId}`)
-    })
-    await waitFor(() =>
-      expect(new URLSearchParams(window.location.search).get("node")).toBe(`case:${caseNodeId}`),
-    )
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ selectedNodeId: `case:${caseNodeId}` }),
-      ),
-    )
-
-    act(() => {
-      mocks.explorationProps.mock.calls.at(-1)?.[0].onSelectedNodeChange?.("")
-    })
-    await waitFor(() => expect(new URLSearchParams(window.location.search).get("node")).toBeNull())
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ selectedNodeId: "" }),
-      ),
-    )
-  })
-
-  it("syncs exploration filters to ?req/?status/?abnormal/?q=", async () => {
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
-    await screen.findByTestId("exploration-tab")
-
-    act(() => {
-      mocks.explorationProps.mock.calls.at(-1)?.[0].onFiltersChange?.({
-        requirementId: "1844674407370955101",
-        resultStatus: "failed",
-        abnormalOnly: true,
-        q: "登录",
+      sse.handlers?.onVersionChanged?.({
+        type: "version.closed",
+        payload: { version_id: "2001" },
       })
     })
 
-    await waitFor(() => {
-      const params = new URLSearchParams(window.location.search)
-      expect(params.get("req")).toBe("1844674407370955101")
-      expect(params.get("status")).toBe("failed")
-      expect(params.get("abnormal")).toBe("1")
-      expect(params.get("q")).toBe("登录")
-      expect(params.get("tab")).toBe("exploration")
+    expect(await screen.findByText("已完成")).toBeInTheDocument()
+    await waitFor(() => expect(api.getVersion).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(issueCalls + 1), {
+      timeout: 2000,
     })
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          initialFilters: expect.objectContaining({
-            requirementId: "1844674407370955101",
-            resultStatus: "failed",
-            abnormalOnly: true,
-            q: "登录",
-          }),
+    await waitFor(() => expect(deliveryApi.listReports).toHaveBeenCalledTimes(reportCalls + 1), {
+      timeout: 2000,
+    })
+    expect(sse.calls).toBe(1)
+  })
+
+  it("refreshes the issue and report counts on P4 tab events", async () => {
+    deliveryApi.listIssues.mockResolvedValue([{ id: "9101", status: "open" }])
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+    const issueCalls = deliveryApi.listIssues.mock.calls.length
+    const reportCalls = deliveryApi.listReports.mock.calls.length
+
+    deliveryApi.listIssues.mockResolvedValue([
+      { id: "9101", status: "open" },
+      { id: "9102", status: "open" },
+      { id: "9103", status: "open" },
+    ])
+    act(() => {
+      sse.handlers?.onIssueChanged?.({ type: "issue.created", payload: { issue_id: "9103" } })
+      sse.handlers?.onReportChanged?.({ type: "report.stale", payload: { report_id: "8101" } })
+    })
+
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(issueCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(deliveryApi.listReports).toHaveBeenCalledTimes(reportCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(screen.getByRole("tab", { name: /问题/ })).toHaveTextContent("3"))
+    expect(api.getVersion).toHaveBeenCalledTimes(1)
+  })
+
+  it("refetches the version and counts on stream.reset", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      sse.handlers?.onStreamReset?.({ reason: "cursor_too_old", snapshot_cursor: 99 })
+    })
+
+    await waitFor(() => expect(api.getVersion).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(deliveryApi.listReports).toHaveBeenCalledTimes(2))
+  })
+
+  it("hands the version-change refresh into the chain tab", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="chain" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+
+    expect(chainProps.onVersionChanged).not.toBeNull()
+    act(() => {
+      chainProps.onVersionChanged?.()
+    })
+
+    await waitFor(() => expect(api.getVersion).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(2), {
+      timeout: 2000,
+    })
+  })
+
+  it("opens the current-version todo drawer from the version header", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByTestId("version-todo-entry"))
+
+    expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+  })
+
+  it("honours a deep-linked execution tab and mounts the execution workspace", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="execution" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    expect(screen.getByRole("tab", { name: "执行" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("execution-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).not.toHaveAttribute("data-wave-id")
+    expect(workspace).not.toHaveAttribute("data-case-run-id")
+    expect(screen.queryByText("执行将在 P3 阶段提供")).not.toBeInTheDocument()
+    expect(screen.queryByRole("region", { name: "绑定概览" })).not.toBeInTheDocument()
+  })
+
+  it("forwards ?wave= and ?case_run= deep links to the execution workspace", async () => {
+    search.params = new URLSearchParams("tab=execution&wave=9202&case_run=9302")
+
+    render(<VersionDetailPage versionId="2001" initialTab="execution" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    const workspace = screen.getByTestId("execution-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).toHaveAttribute("data-wave-id", "9202")
+    expect(workspace).toHaveAttribute("data-case-run-id", "9302")
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("keeps execution deep links when switching to the execution tab", async () => {
+    search.params = new URLSearchParams("tab=overview&wave=9202&case_run=9302")
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "执行" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=execution&wave=9202&case_run=9302",
+    )
+  })
+
+  it("honours a deep-linked issues tab and mounts the issues workspace", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="issues" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: /^问题/ })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("issues-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("问题将在 P4 阶段提供")).not.toBeInTheDocument()
+    expect(screen.queryByRole("region", { name: "绑定概览" })).not.toBeInTheDocument()
+  })
+
+  it("keeps the ?issue= deep link when switching to the issues tab", async () => {
+    search.params = new URLSearchParams("tab=overview&issue=9101")
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: /^问题/ }))
+
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=issues&issue=9101")
+  })
+
+  it("honours a deep-linked reports tab and mounts the reports workspace", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="reports" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "报告" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("reports-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("报告将在 P4 阶段提供")).not.toBeInTheDocument()
+  })
+
+  it("keeps ?report= and ?revision= deep links when switching to the reports tab", async () => {
+    search.params = new URLSearchParams("tab=overview&report=8101&revision=1")
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "报告" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=reports&report=8101&revision=1",
+    )
+  })
+
+  it("honours a deep-linked chain tab and mounts the chain workspace", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="chain" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "探索链路" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("chain-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("探索链路将在 P4 阶段提供")).not.toBeInTheDocument()
+  })
+
+  it("keeps ?node/issue/report/wave deep links when switching to the chain tab", async () => {
+    search.params = new URLSearchParams("tab=overview&node=issue%3A9101&wave=9201")
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "探索链路" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=chain&node=issue%3A9101&wave=9201",
+    )
+  })
+
+  it("honours a deep-linked code tab and mounts the code workspace", async () => {
+    search.params = new URLSearchParams(
+      "tab=code&repo=1201&analysis=7001&candidate=8101&anchor=8201&fact=9101",
+    )
+
+    render(<VersionDetailPage versionId="2001" initialTab="code" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "代码与变更" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("code-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("代码与变更将在 P5 阶段提供")).not.toBeInTheDocument()
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("keeps code deep links when switching to the code tab", async () => {
+    search.params = new URLSearchParams(
+      "tab=overview&repo=1201&analysis=7001&candidate=8101&anchor=8201&fact=9101",
+    )
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "代码与变更" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=code&repo=1201&analysis=7001&candidate=8101&anchor=8201&fact=9101",
+    )
+  })
+
+  it("falls back to the overview tab for an unknown deep link", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab={"unknown" as never} />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "总览" })).toHaveAttribute("aria-selected", "true")
+  })
+
+  it("switches tabs, updates the URL and mounts the design workspace", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "用例设计" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=design")
+    expect(screen.getByRole("tab", { name: "用例设计" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("design-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("用例设计将在 P2 阶段提供")).not.toBeInTheDocument()
+  })
+
+  it("forwards the design deep links (?case= and ?conversation=) to the design tab", async () => {
+    search.params = new URLSearchParams("tab=design&case=7001&conversation=4009")
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    const workspace = screen.getByTestId("design-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).toHaveAttribute("data-case-id", "7001")
+    expect(workspace).toHaveAttribute("data-conversation-id", "4009")
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("mounts the clarification workspace when the requirements tab is selected", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "需求与澄清" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=requirements")
+    const workspace = screen.getByTestId("clarification-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).not.toHaveAttribute("data-conversation-id")
+    expect(workspace).not.toHaveAttribute("data-requirement-id")
+  })
+
+  it("forwards clarification deep links from the URL to the workspace", async () => {
+    render(
+      <VersionDetailPage
+        versionId="2001"
+        initialTab="requirements"
+        initialConversationId="4001"
+        initialRequirementId="6001"
+      />,
+    )
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "需求与澄清" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("clarification-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).toHaveAttribute("data-conversation-id", "4001")
+    expect(workspace).toHaveAttribute("data-requirement-id", "6001")
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("keeps clarification deep links when switching back to the requirements tab", async () => {
+    render(
+      <VersionDetailPage
+        versionId="2001"
+        initialTab="overview"
+        initialConversationId="4001"
+        initialRequirementId="6001"
+      />,
+    )
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "需求与澄清" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=requirements&conversation=4001&requirement=6001",
+    )
+  })
+
+  it("shows a retryable error state when the version cannot be loaded", async () => {
+    api.getVersion
+      .mockRejectedValueOnce(
+        new ApiError({
+          status: 404,
+          code: "not_found",
+          message: "版本不存在",
+          requestId: "req_version",
         }),
-      ),
-    )
-  })
+      )
+      .mockResolvedValueOnce(versionFixture)
 
-  it("updates ?batch= when the header batch selector changes", async () => {
-    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
-    const earlier = batchFixture({
-      id: HEADER_BATCH_1,
-      batch_no: 1,
-      status: "done",
-      finished_at: "2026-10-28T01:00:00Z",
-    })
-    const later = batchFixture({
-      id: HEADER_BATCH_2,
-      batch_no: 2,
-      status: "done",
-      finished_at: "2026-10-28T02:00:00Z",
-    })
-    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+    render(<VersionDetailPage versionId="2001" />)
 
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+    expect(await screen.findByText("版本不存在")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "重试" }))
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
-    await screen.findByTestId("exploration-tab")
-
-    fireEvent.change(screen.getByTestId("exec-batch-selector"), {
-      target: { value: HEADER_BATCH_1 },
-    })
-
-    await waitFor(() =>
-      expect(new URLSearchParams(window.location.search).get("batch")).toBe(HEADER_BATCH_1),
-    )
-    await waitFor(() =>
-      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ batchId: HEADER_BATCH_1 }),
-      ),
-    )
-  })
-
-  it("passes the latest report degraded flag to the issues tab", async () => {
-    mocks.useReports.mockReturnValue(deliveryPage([REPORT_SUMMARY]))
-    mocks.useReport.mockReturnValue({
-      data: DEGRADED_REPORT,
-      report: DEGRADED_REPORT,
-      loading: false,
-      error: "",
-      streamStatus: "live" as const,
-      refresh: vi.fn(),
-    })
-
-    render(<VersionDetailPage versionId={VERSION_ID} />)
-    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "问题" }))
-
-    await waitFor(() =>
-      expect(mocks.issuesProps).toHaveBeenLastCalledWith(
-        expect.objectContaining({ degraded: true }),
-      ),
-    )
-  })
-
-  it("renders the detail route with the string id from the dynamic segment", async () => {
-    const route = await VersionDetailRoutePage({ params: Promise.resolve({ id: VERSION_ID }) })
-
-    render(route)
-
-    expect(await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
-    expect(mocks.getVersion).toHaveBeenCalledWith(VERSION_ID)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(api.getVersion).toHaveBeenCalledTimes(2)
   })
 })

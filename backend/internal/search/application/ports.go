@@ -1,133 +1,94 @@
-// Package application holds the P8 global-search read model: the cross-context
-// provider ports it consumes and the read-only service that aggregates them
-// (design spec §6.2/D55).
+// Package searchapp implements the P6 read-only global-search use case. It
+// aggregates five per-type providers (version, requirement, case, issue,
+// report), validates the documented query bounds and degrades a failing
+// provider to an empty group instead of failing the whole request (spec
+// §4.3.1/§6).
 //
-// This file is the single home of the search cross-context port declarations.
-// It contains value types and interfaces only: no pgx, HTTP or other-context
-// imports. Adapters live in each context's infrastructure/search package and
-// are wired by the composition root, so the search context never imports
-// another bounded context.
-package application
+// The application layer owns the cross-context port only: it declares the
+// Provider interface and the wire value types. Adapters live in
+// infrastructure/providers and call each owning context's QueryService; this
+// package never imports another context and never touches SQL.
+package searchapp
 
-import (
-	"context"
-	"strings"
-	"unicode/utf8"
-)
+import "context"
 
-// Result types rendered by the global search (spec §6.2).
+// Search result types and the canonical group order of the response
+// (openapi.yaml `SearchGroup.type`).
 const (
 	TypeVersion     = "version"
 	TypeRequirement = "requirement"
 	TypeCase        = "case"
 	TypeIssue       = "issue"
+	TypeReport      = "report"
 )
 
-// AllTypes is the canonical group order and the default `types` filter of the
-// search endpoint.
-var AllTypes = []string{TypeVersion, TypeRequirement, TypeCase, TypeIssue}
+// AllTypes is the canonical group order and the default `types` filter.
+var AllTypes = []string{TypeVersion, TypeRequirement, TypeCase, TypeIssue, TypeReport}
 
-// Query bounds of spec §6.2: `limit` is the per-type cap (default 5, max 20)
-// and `q` is 1–100 characters.
+// Query bounds of spec §4.3.1: q is 1–100 characters after trimming and limit
+// is the per-type cap (default 5, maximum 20, so at most 100 items overall).
 const (
-	DefaultLimit   = 5
-	MaxLimit       = 20
-	MinLimit       = 1
-	MinQueryLength = 1
-	MaxQueryLength = 100
+	DefaultLimit  = 5
+	MinLimit      = 1
+	MaxLimit      = 20
+	MinQueryRunes = 1
+	MaxQueryRunes = 100
 )
 
-// ReasonInvalidArgument is the stable details.reason of the 400 envelope the
-// HTTP layer renders for invalid query parameters.
-const ReasonInvalidArgument = "invalid_argument"
-
-// ErrInvalidArgument reports a rejected query parameter. Field is the public
-// parameter name (`q`, `types` or `limit`); the handler renders it as
-// invalid_argument{field}.
-type ErrInvalidArgument struct {
-	Field   string
-	Reason  string
-	Message string
-}
-
-// Error implements the error interface. The message is user-facing and never
-// carries provider or database details.
-func (e *ErrInvalidArgument) Error() string {
-	if e == nil {
-		return "invalid argument"
-	}
-	if e.Message != "" {
-		return e.Message
-	}
-	return "invalid " + e.Field
-}
-
-// Item is one search result (spec §6.2). Every id crosses the JSON boundary as a
-// decimal string (D29); the URL is the frontend deep link into the owning
-// version tab. No credential, evidence body or other sensitive field is part of
+// Item is one cross-entity search result (openapi.yaml `SearchItem`). IDs are
+// decimal strings at the API boundary; URL is the server-built deep link of the
+// 0.2 workspace. No credential, evidence body, prompt or transcript is part of
 // the projection.
 type Item struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Subtitle    string `json:"subtitle"`
-	VersionID   string `json:"versionId"`
-	VersionName string `json:"versionName"`
-	Status      string `json:"status"`
-	URL         string `json:"url"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Subtitle     string `json:"subtitle"`
+	VersionID    string `json:"version_id"`
+	VersionTitle string `json:"version_title"`
+	Status       string `json:"status"`
+	URL          string `json:"url"`
 }
 
-// Group is the per-type result group. Items is always a non-nil slice so the
-// JSON envelope renders `[]`, never `null`, for an empty group.
+// Group is the per-type result group. Items is always a non-nil slice so an
+// empty group renders `[]`, never `null`.
 type Group struct {
 	Type  string `json:"type"`
 	Items []Item `json:"items"`
 }
 
-// Snapshot is the global-search read model. Degraded is true when at least one
-// provider failed: the healthy groups are still returned and the HTTP layer
-// answers 200 instead of failing the whole request (spec §6.2).
+// Snapshot is the global-search response (openapi.yaml `SearchResultView`).
+// Degraded is true when at least one requested provider failed; the healthy
+// groups are still returned and the endpoint answers 200 instead of 5xx.
 type Snapshot struct {
 	Groups    []Group `json:"groups"`
 	Total     int     `json:"total"`
 	Truncated bool    `json:"truncated"`
-	Degraded  bool    `json:"degraded,omitempty"`
+	Degraded  bool    `json:"degraded"`
 }
 
-// Query is one global-search request. Text is the keyword, Types the requested
-// groups (empty means every type) and Limit the per-type cap.
-type Query struct {
-	Text  string
-	Types []string
-	Limit int
-}
-
-// Provider supplies the result groups a bounded context owns: the version
-// context owns version and requirement results, the mindmap context owns cases
-// and the delivery context owns issues (spec §3.3). Implementations issue
-// read-only queries against their own context only.
+// Provider is one search-type adapter. A provider is bound to exactly one type
+// by Service's provider map, so it returns items of that type only and issues
+// exactly one read-only call against its owning context. Implementations must
+// honor the passed per-type limit.
 type Provider interface {
-	Search(ctx context.Context, keyword string, limit int) ([]Group, error)
+	Search(ctx context.Context, q string, limit int) ([]Item, error)
 }
 
-// Providers groups the three cross-context search providers.
+// VersionTitleReader is the narrow version application port used to decorate
+// items whose provider cannot read another context's version table. It resolves
+// every requested version ID in one batch (spec §9: version_title comes from the
+// version context, never from another context's SQL). The version application
+// QueryService satisfies it without an adapter.
+type VersionTitleReader interface {
+	VersionTitles(ctx context.Context, ids []int64) (map[int64]string, error)
+}
+
+// Providers groups the five per-type adapters. A nil adapter degrades its group
+// (the search still succeeds with degraded=true).
 type Providers struct {
-	Version  Provider
-	Mindmap  Provider
-	Delivery Provider
-}
-
-// ValidateQueryText validates and normalizes the search keyword. It is exported
-// so the HTTP layer can reject a bad query before it constructs a request (and
-// so both layers share the exact bounds).
-func ValidateQueryText(raw string) (string, error) {
-	text := strings.TrimSpace(raw)
-	length := utf8.RuneCountInString(text)
-	if length < MinQueryLength || length > MaxQueryLength {
-		return "", &ErrInvalidArgument{
-			Field:   "q",
-			Reason:  ReasonInvalidArgument,
-			Message: "q must be between 1 and 100 characters",
-		}
-	}
-	return text, nil
+	Version     Provider
+	Requirement Provider
+	Case        Provider
+	Issue       Provider
+	Report      Provider
 }

@@ -1,262 +1,239 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  ApiError,
+  apiDelete,
+  apiFetch,
+  apiGetPage,
+  apiPatch,
+  apiPost,
+  getApiBaseUrl,
+  resolveApiUrl,
+} from "./api-client"
+import { AUTH_CLEARED_EVENT, getToken, setToken } from "./auth-storage"
 
-import { ApiError, apiFetch, apiGet, apiGetPage, apiStreamFetch } from "./api-client"
-import { getToken, setToken } from "./auth-storage"
-
-function jsonResponse(body: unknown, init: ResponseInit = {}) {
+function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(init.headers as Record<string, string> | undefined),
-    },
+    status,
+    headers: { "Content-Type": "application/json", ...headers },
   })
 }
 
-function stubFetch(response: Response) {
-  const fetchMock = vi.fn().mockResolvedValue(response)
-  vi.stubGlobal("fetch", fetchMock)
-  return fetchMock
+function readHeaders(init: RequestInit | undefined): Headers {
+  return new Headers(init?.headers)
 }
+
+const fetchMock = vi.fn<typeof fetch>()
+
+describe("resolveApiUrl", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it("defaults to the local API origin", () => {
+    vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", "")
+    expect(getApiBaseUrl()).toBe("http://localhost:13333")
+    expect(resolveApiUrl("/api/auth/me")).toBe("http://localhost:13333/api/auth/me")
+  })
+
+  it("uses the configured origin and trims trailing slashes", () => {
+    vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", "http://192.168.1.9:13333/")
+    expect(resolveApiUrl("api/health")).toBe("http://192.168.1.9:13333/api/health")
+  })
+
+  it("keeps absolute URLs untouched", () => {
+    expect(resolveApiUrl("https://example.test/x")).toBe("https://example.test/x")
+  })
+})
 
 describe("apiFetch", () => {
   beforeEach(() => {
-    sessionStorage.clear()
+    window.sessionStorage.clear()
+    fetchMock.mockReset()
+    vi.stubGlobal("fetch", fetchMock)
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it("wraps error envelope and attaches bearer", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          error: {
-            code: "invalid_argument",
-            message: "bad",
-            request_id: "req_1",
-            retryable: false,
-          },
-        }),
-        { status: 400, headers: { "content-type": "application/json" } },
-      ),
-    )
-    vi.stubGlobal("fetch", fetchMock)
-    await expect(apiFetch("/api/users", { token: "ezt_x" })).rejects.toMatchObject({
-      status: 400,
-      code: "invalid_argument",
-    })
-    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe("Bearer ezt_x")
+  it("attaches the bearer token, Accept and a request id", async () => {
+    setToken("ezt_token")
+    fetchMock.mockResolvedValue(jsonResponse({ data: { ok: true } }))
+
+    await expect(apiFetch<{ ok: boolean }>("/api/auth/me")).resolves.toEqual({ ok: true })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/auth/me")
+    const headers = readHeaders(init)
+    expect(headers.get("Authorization")).toBe("Bearer ezt_token")
+    expect(headers.get("Accept")).toBe("application/json")
+    expect(headers.get("X-Request-ID")).toMatch(/^req_[0-9a-f]{12}$/)
   })
 
-  it("uses the session token and unwraps the data envelope", async () => {
-    setToken("ezt_session")
-    const fetchMock = stubFetch(jsonResponse({ data: { status: "ok" } }))
+  it("generates a distinct request id per call and honours an explicit one", async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({ data: null }))
 
-    await expect(apiFetch<{ status: string }>("/api/health")).resolves.toEqual({ status: "ok" })
+    await apiFetch("/a")
+    await apiFetch("/b")
+    await apiFetch("/c", { requestId: "req_fixed000000" })
 
-    const init = fetchMock.mock.calls[0][1]
-    expect(init.headers.Authorization).toBe("Bearer ezt_session")
-    expect(init.headers["Content-Type"]).toBeUndefined()
+    const first = readHeaders(fetchMock.mock.calls[0][1]).get("X-Request-ID")
+    const second = readHeaders(fetchMock.mock.calls[1][1]).get("X-Request-ID")
+    const third = readHeaders(fetchMock.mock.calls[2][1]).get("X-Request-ID")
+    expect(first).not.toBe(second)
+    expect(third).toBe("req_fixed000000")
   })
 
-  it("clears the stored token on 401", async () => {
-    setToken("ezt_expired")
-    stubFetch(
-      jsonResponse(
-        {
-          error: {
-            code: "unauthenticated",
-            message: "authentication required",
-            request_id: "req_401",
-            retryable: false,
-          },
-        },
-        { status: 401 },
-      ),
-    )
-
-    await expect(apiFetch("/api/users")).rejects.toMatchObject({
-      status: 401,
-      code: "unauthenticated",
-    })
-    expect(getToken()).toBeNull()
+  it("unwraps the data envelope", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: [1, 2, 3] }))
+    await expect(apiFetch<number[]>("/api/numbers")).resolves.toEqual([1, 2, 3])
   })
 
-  it("forwards a client request id and falls back to the response request id", async () => {
-    const fetchMock = stubFetch(
+  it("returns undefined for a 204 response", async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await expect(apiFetch("/api/x")).resolves.toBeUndefined()
+  })
+
+  it("maps the shared error envelope to ApiError", async () => {
+    fetchMock.mockResolvedValue(
       jsonResponse(
         {
           error: {
             code: "invalid_argument",
-            message: "bad",
-            request_id: "",
+            message: "title is required",
+            request_id: "req_body",
             retryable: false,
+            details: { field: "title" },
           },
         },
-        { status: 400, headers: { "x-request-id": "req_header" } },
+        400,
       ),
     )
 
-    await expect(apiFetch("/api/users", { requestId: "req_client" })).rejects.toMatchObject({
-      requestId: "req_header",
-    })
-    expect(fetchMock.mock.calls[0][1].headers["X-Request-ID"]).toBe("req_client")
-  })
-
-  it("wraps network failures in an ApiError", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")))
-
-    const error = await apiFetch("/api/health").catch((caught: unknown) => caught)
+    const error = await apiFetch("/api/versions").catch((cause: unknown) => cause)
     expect(error).toBeInstanceOf(ApiError)
-    expect(error).toMatchObject({
-      status: 0,
-      code: "network_error",
-      retryable: true,
-    })
+    const apiError = error as ApiError
+    expect(apiError.status).toBe(400)
+    expect(apiError.code).toBe("invalid_argument")
+    expect(apiError.message).toBe("title is required")
+    expect(apiError.requestId).toBe("req_body")
+    expect(apiError.retryable).toBe(false)
+    expect(apiError.details).toEqual({ field: "title" })
   })
 
-  it("returns undefined for 204 responses", async () => {
-    stubFetch(new Response(null, { status: 204 }))
-
-    await expect(apiFetch<void>("/api/auth/logout", { method: "POST" })).resolves.toBeUndefined()
-  })
-
-  it("keeps the session when a 401 request carried no bearer", async () => {
-    setToken("ezt_current")
-    stubFetch(
-      jsonResponse(
-        {
-          error: {
-            code: "unauthenticated",
-            message: "invalid username or password",
-            request_id: "req_login",
-            retryable: false,
-          },
-        },
-        { status: 401 },
-      ),
+  it("falls back to HTTP semantics when the body is not an error envelope", async () => {
+    fetchMock.mockResolvedValue(
+      new Response("oops", { status: 503, headers: { "X-Request-ID": "req_header" } }),
     )
 
-    await expect(
-      apiFetch("/api/auth/login", { method: "POST", token: null, body: "{}" }),
-    ).rejects.toMatchObject({ status: 401 })
-    expect(getToken()).toBe("ezt_current")
+    const error = (await apiFetch("/api/x").catch((cause: unknown) => cause)) as ApiError
+    expect(error.code).toBe("unavailable")
+    expect(error.requestId).toBe("req_header")
+    expect(error.retryable).toBe(true)
+    expect(error.details).toEqual({})
+  })
+
+  it("wraps network failures as a retryable ApiError", async () => {
+    fetchMock.mockRejectedValue(new Error("connection refused"))
+
+    const error = (await apiFetch("/api/x").catch((cause: unknown) => cause)) as ApiError
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error.status).toBe(0)
+    expect(error.code).toBe("network_error")
+    expect(error.retryable).toBe(true)
+    expect(error.message).toContain("connection refused")
+  })
+
+  it("clears the local session on an authenticated 401", async () => {
+    setToken("ezt_expired")
+    const cleared = vi.fn()
+    window.addEventListener(AUTH_CLEARED_EVENT, cleared)
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: "unauthenticated", message: "login required" } }, 401),
+    )
+
+    await expect(apiFetch("/api/auth/me")).rejects.toBeInstanceOf(ApiError)
+
+    expect(getToken()).toBeNull()
+    expect(cleared).toHaveBeenCalledTimes(1)
+    window.removeEventListener(AUTH_CLEARED_EVENT, cleared)
+  })
+
+  it("does not dispatch a clear event for a 401 without a bearer", async () => {
+    const cleared = vi.fn()
+    window.addEventListener(AUTH_CLEARED_EVENT, cleared)
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: "unauthenticated", message: "login required" } }, 401),
+    )
+
+    await expect(apiFetch("/api/auth/login")).rejects.toBeInstanceOf(ApiError)
+
+    expect(cleared).not.toHaveBeenCalled()
+    window.removeEventListener(AUTH_CLEARED_EVENT, cleared)
+  })
+
+  it("rejects a success response that is not JSON", async () => {
+    fetchMock.mockResolvedValue(new Response("not json", { status: 200 }))
+    const error = (await apiFetch("/api/x").catch((cause: unknown) => cause)) as ApiError
+    expect(error.code).toBe("invalid_response")
+  })
+
+  it("sends JSON bodies and the idempotency key through the helpers", async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({ data: { id: "1" } }))
+
+    await apiPost("/api/versions", { title: "v" }, { idempotencyKey: "key-1" })
+    await apiPatch("/api/versions/1", { title: "t" })
+    await apiDelete("/api/versions/1")
+
+    const [postUrl, postInit] = fetchMock.mock.calls[0]
+    expect(postUrl).toBe("http://localhost:13333/api/versions")
+    expect(postInit?.method).toBe("POST")
+    const postHeaders = readHeaders(postInit)
+    expect(postHeaders.get("Content-Type")).toBe("application/json")
+    expect(postHeaders.get("Idempotency-Key")).toBe("key-1")
+    expect(postInit?.body).toBe(JSON.stringify({ title: "v" }))
+
+    const patchInit = fetchMock.mock.calls[1][1]
+    expect(patchInit?.method).toBe("PATCH")
+    expect(patchInit?.body).toBe(JSON.stringify({ title: "t" }))
+
+    const deleteInit = fetchMock.mock.calls[2][1]
+    expect(deleteInit?.method).toBe("DELETE")
+    expect(deleteInit?.body).toBeUndefined()
   })
 })
 
 describe("apiGetPage", () => {
   beforeEach(() => {
-    sessionStorage.clear()
+    window.sessionStorage.clear()
+    fetchMock.mockReset()
+    vi.stubGlobal("fetch", fetchMock)
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it("preserves the list envelope cursor and has_more fields", async () => {
-    const fetchMock = stubFetch(
-      jsonResponse({ data: [{ id: "1844674407370955161" }], next_cursor: "c2", has_more: true }),
+  it("keeps the pagination envelope alongside the data", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: [{ id: "1" }], next_cursor: "1", has_more: true }),
     )
 
-    await expect(apiGetPage("/api/versions?limit=20")).resolves.toEqual({
-      items: [{ id: "1844674407370955161" }],
-      nextCursor: "c2",
+    await expect(apiGetPage<{ id: string }>("/api/versions")).resolves.toEqual({
+      items: [{ id: "1" }],
+      nextCursor: "1",
       hasMore: true,
     })
-    expect(fetchMock.mock.calls[0][1].method).toBe("GET")
   })
 
-  it("reads the numeric snapshot_cursor used by the events snapshot", async () => {
-    stubFetch(jsonResponse({ data: [{ seq: 7 }], snapshot_cursor: 7, has_more: false }))
+  it("reads snapshot_cursor for the events endpoint", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: [], snapshot_cursor: 7, has_more: false }))
 
-    await expect(apiGetPage("/api/versions/1/events?limit=50")).resolves.toEqual({
-      items: [{ seq: 7 }],
+    await expect(apiGetPage("/api/events?channel=system")).resolves.toEqual({
+      items: [],
       nextCursor: "7",
       hasMore: false,
-    })
-  })
-
-  it("keeps apiGet unwrapping only data for the same envelope", async () => {
-    stubFetch(
-      jsonResponse({ data: [{ id: "1844674407370955161" }], next_cursor: "c2", has_more: true }),
-    )
-
-    await expect(apiGet("/api/versions")).resolves.toEqual([{ id: "1844674407370955161" }])
-  })
-
-  it("surfaces list error envelopes as ApiError", async () => {
-    stubFetch(
-      jsonResponse(
-        {
-          error: {
-            code: "invalid_argument",
-            message: "invalid cursor",
-            request_id: "req_page",
-            retryable: false,
-          },
-        },
-        { status: 400 },
-      ),
-    )
-
-    await expect(apiGetPage("/api/versions?cursor=bad")).rejects.toMatchObject({
-      status: 400,
-      code: "invalid_argument",
-    })
-  })
-})
-
-describe("apiStreamFetch", () => {
-  beforeEach(() => {
-    sessionStorage.clear()
-  })
-
-  afterEach(() => {
-    vi.unstubAllGlobals()
-  })
-
-  it("returns the raw streaming response with the bearer attached", async () => {
-    const fetchMock = stubFetch(
-      new Response('event: llm.delta\ndata: {"delta":"hi"}\n\n', {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      }),
-    )
-
-    const response = await apiStreamFetch("/api/admin/llm/configs/1/test", {
-      method: "POST",
-      body: "{}",
-      token: "ezt_stream",
-    })
-
-    await expect(response.text()).resolves.toContain("llm.delta")
-    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe("Bearer ezt_stream")
-    expect(fetchMock.mock.calls[0][1].headers.Accept).toBe("application/json")
-  })
-
-  it("wraps stream error envelopes in ApiError", async () => {
-    stubFetch(
-      jsonResponse(
-        {
-          error: {
-            code: "invalid_argument",
-            message: "streaming is disabled for this LLM configuration",
-            request_id: "req_stream",
-            retryable: false,
-          },
-        },
-        { status: 400 },
-      ),
-    )
-
-    await expect(
-      apiStreamFetch("/api/admin/llm/configs/1/test", { method: "POST", body: "{}" }),
-    ).rejects.toMatchObject({
-      status: 400,
-      code: "invalid_argument",
-      message: "streaming is disabled for this LLM configuration",
     })
   })
 })

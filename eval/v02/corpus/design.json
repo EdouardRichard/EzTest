@@ -1,0 +1,52 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "scenarios": [
+    { "ref": "S1", "requirement_key": "R1", "title": "订单列表" },
+    { "ref": "S2", "requirement_key": "R2", "title": "订单筛选" },
+    { "ref": "S3", "requirement_key": "R3", "title": "订单详情退款" },
+    { "ref": "S4", "requirement_key": "R4", "title": "退款权限" }
+  ],
+  "cases": [
+    {
+      "ref": "C1",
+      "scenario_ref": "S1",
+      "requirement_key": "R1",
+      "title": "登录后展示订单列表",
+      "kind": "ui",
+      "expected_confirmed": true
+    },
+    {
+      "ref": "C2",
+      "scenario_ref": "S2",
+      "requirement_key": "R2",
+      "title": "按状态筛选订单",
+      "kind": "ui",
+      "expected_confirmed": true
+    },
+    {
+      "ref": "C3",
+      "scenario_ref": "S3",
+      "requirement_key": "R3",
+      "title": "订单详情展示退款入口",
+      "kind": "ui",
+      "expected_confirmed": true
+    },
+    {
+      "ref": "C4",
+      "scenario_ref": "S4",
+      "requirement_key": "R4",
+      "title": "无权限用户不显示退款入口",
+      "kind": "ui",
+      "expected_confirmed": true
+    }
+  ],
+  "expected": {
+    "case_titles": [
+      "登录后展示订单列表",
+      "按状态筛选订单",
+      "订单详情展示退款入口",
+      "无权限用户不显示退款入口"
+    ],
+    "confirmed_case_count": 4
+  }
+}

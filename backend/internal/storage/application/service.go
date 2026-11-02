@@ -1,145 +1,302 @@
-// Package application implements the object-storage use cases. It coordinates
-// the storage port, validates upload inputs and records the audit trail; the
-// HTTP interface depends only on this package.
-package application
+// Package storageapp implements the content-object application service:
+// uploads with SHA-256 de-duplication, verified downloads and the reference
+// ledger used by later phases.
+package storageapp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
+	"net/http"
+	"regexp"
 	"strings"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
-	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
-	storage "github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
 )
 
-// Service is the object-storage use case: it validates the upload Content-Type,
-// delegates to the storage port, persists the durable object metadata and
-// records the create audit entry. Reads take the media type from the metadata
-// row, the single durable source of truth.
+const (
+	// MaxUploadBytes is the hard content upload limit (10 MiB).
+	MaxUploadBytes int64 = 10 << 20
+	// DataRootSettingKey is the settings key holding the content root.
+	DataRootSettingKey = "paths.data_root"
+	// DefaultRefRole is used when a reference does not name a role.
+	DefaultRefRole = "attachment"
+)
+
+var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// ValidSHA256 reports whether value is a lowercase hex SHA-256.
+func ValidSHA256(value string) bool {
+	return sha256Pattern.MatchString(value)
+}
+
+// Service stores content objects and their references. audit and events are
+// best-effort sinks and may be nil in unit tests.
 type Service struct {
-	store    storage.Store
-	metadata MetadataRepository
-	recorder auditapp.Recorder
+	repo     storage.Repository
+	files    FileStore
+	settings SettingsReader
+	ids      id.Generator
+	audit    auditapp.Recorder
+	events   eventingapp.Publisher
 }
 
-// NewService returns the storage use case. metadata is the insert-only
-// storage_object repository. A nil recorder degrades to a no-op so a
-// partially wired process cannot panic on the first upload.
-func NewService(store storage.Store, metadata MetadataRepository, recorder auditapp.Recorder) *Service {
-	if recorder == nil {
-		recorder = auditapp.NopRecorder{}
-	}
-	return &Service{store: store, metadata: metadata, recorder: recorder}
+// New wires the content service.
+func New(
+	repo storage.Repository,
+	files FileStore,
+	settings SettingsReader,
+	ids id.Generator,
+	audit auditapp.Recorder,
+	events eventingapp.Publisher,
+) *Service {
+	return &Service{repo: repo, files: files, settings: settings, ids: ids, audit: audit, events: events}
 }
 
-// Put stores an object, persists its metadata row and records
-// storage.object_created only when that row was newly inserted. A re-upload of
-// bytes that are already stored is a dedupe: no new row is created, so no
-// created audit is written, and the object is reported with the persisted
-// content type. The Content-Type is required: it is the media type an object is
-// first stored with and the one reported by later reads.
-func (s *Service) Put(ctx context.Context, r io.Reader, contentType string) (storage.Object, error) {
-	contentType = strings.TrimSpace(contentType)
-	if contentType == "" {
-		return storage.Object{}, storage.ErrInvalidContentType
+// Upload stores a content blob. filename and declaredMIME are transport
+// metadata only: the original name is never persisted and the MIME type is
+// always detected from the bytes (http.DetectContentType), per the design.
+func (s *Service) Upload(ctx context.Context, filename, declaredMIME string, r io.Reader, maxBytes int64, actorID int64) (storage.Object, error) {
+	if r == nil {
+		return storage.Object{}, platform.Invalid("file", "file content is required")
 	}
-	obj, err := s.store.Put(ctx, r, contentType)
+	if maxBytes <= 0 || maxBytes > MaxUploadBytes {
+		maxBytes = MaxUploadBytes
+	}
+	root, err := s.dataRoot(ctx)
 	if err != nil {
 		return storage.Object{}, err
 	}
-	created, err := s.metadata.Insert(ctx, ObjectMetadata{
-		SHA256:       obj.SHA256,
-		Size:         obj.Size,
-		ContentType:  contentType,
-		RelativePath: obj.RelativePath,
+	data, err := readUpload(r, maxBytes)
+	if err != nil {
+		return storage.Object{}, err
+	}
+
+	sum := sha256.Sum256(data)
+	sha := hex.EncodeToString(sum[:])
+
+	existing, err := s.repo.GetObject(ctx, sha)
+	if err == nil {
+		s.recordUpload(ctx, existing, actorID)
+		return existing, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return storage.Object{}, err
+	}
+
+	relativePath, err := s.files.Put(ctx, root, sha, data)
+	if err != nil {
+		return storage.Object{}, err
+	}
+	object := storage.Object{
+		SHA256:       sha,
+		Size:         int64(len(data)),
+		MIME:         http.DetectContentType(data),
+		RelativePath: relativePath,
+	}
+	stored, _, err := s.repo.PutObject(ctx, object)
+	if err != nil {
+		return storage.Object{}, err
+	}
+	s.recordUpload(ctx, stored, actorID)
+	return stored, nil
+}
+
+// Open returns a content object and a reader over verified bytes. The object
+// row must exist and the stored bytes must still hash to the object key and
+// match its recorded size; otherwise ErrCorrupt is returned.
+func (s *Service) Open(ctx context.Context, sha string) (storage.Object, io.ReadCloser, error) {
+	if !ValidSHA256(sha) {
+		return storage.Object{}, nil, platform.Invalid("sha256", "sha256 must be 64 lowercase hex characters")
+	}
+	object, err := s.repo.GetObject(ctx, sha)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return storage.Object{}, nil, platform.NotFound("content")
+		}
+		return storage.Object{}, nil, err
+	}
+	root, err := s.dataRoot(ctx)
+	if err != nil {
+		return storage.Object{}, nil, err
+	}
+	reader, err := s.files.Open(ctx, root, object.RelativePath)
+	if err != nil {
+		return storage.Object{}, nil, fmt.Errorf("open stored content %s: %w", sha, err)
+	}
+	defer reader.Close()
+
+	limit := object.Size + 1
+	if limit <= 0 || limit > MaxUploadBytes+1 {
+		limit = MaxUploadBytes + 1
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, limit))
+	if err != nil {
+		return storage.Object{}, nil, fmt.Errorf("read stored content %s: %w", sha, err)
+	}
+	sum := sha256.Sum256(data)
+	if int64(len(data)) != object.Size || hex.EncodeToString(sum[:]) != object.SHA256 {
+		return storage.Object{}, nil, fmt.Errorf("%w: content %s", storage.ErrCorrupt, sha)
+	}
+	return object, io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// AddRef records that an owner uses a content object. A blank role defaults to
+// DefaultRefRole.
+func (s *Service) AddRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (storage.Ref, error) {
+	objectID, ownerKind, ownerID, role, err := s.validateRef(ctx, objectID, ownerKind, ownerID, role)
+	if err != nil {
+		return storage.Ref{}, err
+	}
+	if s.ids == nil {
+		return storage.Ref{}, platform.NewError(http.StatusInternalServerError, "internal", "id generator is not configured")
+	}
+	return s.repo.AddRef(ctx, storage.Ref{
+		ID:        s.ids.Next(),
+		ObjectID:  objectID,
+		OwnerKind: ownerKind,
+		OwnerID:   ownerID,
+		Role:      role,
 	})
+}
+
+// ReplaceRef records objectID as the single active reference of
+// (ownerKind, ownerID, role). It is the idempotent write used by renderers that
+// may re-run (report PDFs): a repeat replaces/reuses the existing ref instead
+// of appending a duplicate. The role is required; a blank role keeps its
+// AddRef default.
+func (s *Service) ReplaceRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (storage.Ref, error) {
+	objectID, ownerKind, ownerID, role, err := s.validateRef(ctx, objectID, ownerKind, ownerID, role)
 	if err != nil {
-		// The bytes are durable but their metadata is not; fail the request so
-		// the caller can retry instead of returning an object the database
-		// does not know about.
-		return storage.Object{}, fmt.Errorf("storage: persist object metadata: %w", err)
+		return storage.Ref{}, err
 	}
-	if !created {
-		// Report the durable content type of the object this upload deduped
-		// to, not the type the duplicate request happened to send.
-		existing, ok, err := s.metadata.Find(ctx, obj.SHA256)
-		if err != nil {
-			return storage.Object{}, fmt.Errorf("storage: load object metadata: %w", err)
+	if s.ids == nil {
+		return storage.Ref{}, platform.NewError(http.StatusInternalServerError, "internal", "id generator is not configured")
+	}
+	return s.repo.ReplaceRef(ctx, storage.Ref{
+		ID:        s.ids.Next(),
+		ObjectID:  objectID,
+		OwnerKind: ownerKind,
+		OwnerID:   ownerID,
+		Role:      role,
+	})
+}
+
+// validateRef shares the content reference argument validation of AddRef and
+// ReplaceRef.
+func (s *Service) validateRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (string, string, int64, string, error) {
+	if !ValidSHA256(objectID) {
+		return "", "", 0, "", platform.Invalid("object_id", "object_id must be a lowercase hex SHA-256")
+	}
+	ownerKind = strings.TrimSpace(ownerKind)
+	if err := validation.String("owner_kind", ownerKind, 1, 64); err != nil {
+		return "", "", 0, "", err
+	}
+	if ownerID <= 0 {
+		return "", "", 0, "", platform.Invalid("owner_id", "owner_id must be a positive decimal ID")
+	}
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = DefaultRefRole
+	}
+	if err := validation.String("role", role, 1, 64); err != nil {
+		return "", "", 0, "", err
+	}
+	if _, err := s.repo.GetObject(ctx, objectID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return "", "", 0, "", platform.NotFound("content")
 		}
-		if ok {
-			obj.ContentType = existing.ContentType
+		return "", "", 0, "", err
+	}
+	return objectID, ownerKind, ownerID, role, nil
+}
+
+// ListRefs lists the active references of one owner.
+func (s *Service) ListRefs(ctx context.Context, ownerKind string, ownerID int64) ([]storage.Ref, error) {
+	ownerKind = strings.TrimSpace(ownerKind)
+	if err := validation.String("owner_kind", ownerKind, 1, 64); err != nil {
+		return nil, err
+	}
+	if ownerID <= 0 {
+		return nil, platform.Invalid("owner_id", "owner_id must be a positive decimal ID")
+	}
+	return s.repo.ListRefs(ctx, ownerKind, ownerID)
+}
+
+// SoftDeleteRef soft-deletes a reference.
+func (s *Service) SoftDeleteRef(ctx context.Context, refID int64) error {
+	if refID <= 0 {
+		return platform.Invalid("id", "ref id must be a positive decimal ID")
+	}
+	if err := s.repo.SoftDeleteRef(ctx, refID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return platform.NotFound("content_ref")
 		}
-		return obj, nil
-	}
-	s.recordCreated(ctx, obj)
-	return obj, nil
-}
-
-// Open returns the verified bytes of an object with its persisted media type.
-func (s *Service) Open(ctx context.Context, id string) (io.ReadCloser, storage.Object, error) {
-	rc, obj, err := s.store.Open(ctx, id)
-	if err != nil {
-		return nil, storage.Object{}, err
-	}
-	if err := s.fillContentType(ctx, &obj); err != nil {
-		_ = rc.Close()
-		return nil, storage.Object{}, err
-	}
-	return rc, obj, nil
-}
-
-// Stat returns an object's metadata with its persisted media type.
-func (s *Service) Stat(ctx context.Context, id string) (storage.Object, error) {
-	obj, err := s.store.Stat(ctx, id)
-	if err != nil {
-		return storage.Object{}, err
-	}
-	if err := s.fillContentType(ctx, &obj); err != nil {
-		return storage.Object{}, err
-	}
-	return obj, nil
-}
-
-// fillContentType copies the durable Content-Type onto obj. An object whose
-// metadata row is missing keeps an empty type; the HTTP layer then falls back
-// to application/octet-stream.
-func (s *Service) fillContentType(ctx context.Context, obj *storage.Object) error {
-	metadata, ok, err := s.metadata.Find(ctx, obj.SHA256)
-	if err != nil {
-		return fmt.Errorf("storage: load object metadata: %w", err)
-	}
-	if ok {
-		obj.ContentType = metadata.ContentType
+		return err
 	}
 	return nil
 }
 
-// recordCreated writes storage.object_created for a genuinely new object, that
-// is, one whose metadata row was just inserted. Auditing is best-effort: the
-// upload response is still returned when the audit write fails, and only the
-// failure is logged (never the object bytes).
-func (s *Service) recordCreated(ctx context.Context, obj storage.Object) {
-	entry := auditdomain.Entry{
-		Action:     auditapp.ActionStorageObjectCreated,
-		TargetType: "storage_object",
-		TargetID:   obj.SHA256,
-		Metadata: map[string]any{
-			"sha256":       obj.SHA256,
-			"size":         obj.Size,
-			"content_type": obj.ContentType,
-		},
+func (s *Service) dataRoot(ctx context.Context) (string, error) {
+	if s.settings == nil {
+		return "", platform.NewError(http.StatusInternalServerError, "internal", "settings reader is not configured")
 	}
-	meta := auditapp.MetaFromContext(ctx)
-	entry.RequestID = meta.RequestID
-	entry.IP = meta.IP
-	entry.UserAgent = meta.UserAgent
-	if actorID, ok := auditapp.ActorIDFromContext(ctx); ok {
-		entry.ActorUserID = &actorID
+	root, err := s.settings.String(ctx, DataRootSettingKey)
+	if err != nil {
+		return "", err
 	}
-	if err := s.recorder.Record(ctx, entry); err != nil {
-		slog.ErrorContext(ctx, "audit: record storage object entry", "action", entry.Action, "error", err)
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", platform.NewError(http.StatusInternalServerError, "internal", "paths.data_root is not configured")
 	}
+	return root, nil
+}
+
+func (s *Service) recordUpload(ctx context.Context, object storage.Object, actorID int64) {
+	requestID := requestid.From(ctx)
+	metadata := map[string]any{"sha256": object.SHA256, "size": object.Size, "mime": object.MIME}
+	if s.audit != nil {
+		actor := actorID
+		_ = s.audit.Record(ctx, auditapp.Event{
+			ActorID:    &actor,
+			Action:     "content.uploaded",
+			TargetKind: "content_object",
+			TargetID:   object.SHA256,
+			RequestID:  requestID,
+			Metadata:   metadata,
+		})
+	}
+	if s.events != nil {
+		actor := actorID
+		_ = s.events.Publish(ctx, eventingapp.Event{
+			Channel:   "system",
+			Type:      "content.uploaded",
+			Scope:     map[string]any{},
+			Payload:   metadata,
+			ActorID:   &actor,
+			RequestID: requestID,
+		})
+	}
+}
+
+func readUpload(r io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read upload: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, platform.NewError(http.StatusRequestEntityTooLarge, "payload_too_large",
+			fmt.Sprintf("content exceeds the %d MiB limit", maxBytes>>20))
+	}
+	return data, nil
 }

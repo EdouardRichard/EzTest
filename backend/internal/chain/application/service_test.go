@@ -1,1043 +1,934 @@
-package application_test
+package chainapp
 
 import (
 	"context"
 	"errors"
-	"fmt"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
-	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
+	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// ---------------------------------------------------------------------------
-// Fakes
-// ---------------------------------------------------------------------------
+var errProviderBoom = errors.New("provider boom")
 
-// fakeVersion is the VersionProvider fake. It records the resolved version and
-// batch arguments so the batch-selection tests can assert the service contract.
-type fakeVersion struct {
-	batch           chain.BatchRow
-	batchErr        error
-	requirements    []chain.RequirementRow
-	requirementsErr error
-
-	getBatchCalls int
-	gotVersionID  int64
-	gotBatchID    *int64
-	reqCalls      int
+type fakeClock struct {
+	now time.Time
 }
 
-func (f *fakeVersion) GetBatch(_ context.Context, versionID int64, batchID *int64) (chain.BatchRow, error) {
-	f.getBatchCalls++
-	f.gotVersionID = versionID
-	if batchID == nil {
-		f.gotBatchID = nil
-	} else {
-		value := *batchID
-		f.gotBatchID = &value
-	}
-	return f.batch, f.batchErr
+func (c fakeClock) Now() time.Time { return c.now }
+
+// fakeProviders implements every chain provider port, so one value can be
+// handed to every constructor argument and records which ports were called.
+type fakeProviders struct {
+	requirements     []chain.Node
+	versionSUTs      []chain.Node
+	scenarios        []chain.Node
+	cases            []chain.Node
+	historical       map[int64]chain.Node
+	waves            []chain.Node
+	caseRuns         []chain.Node
+	issues           []chain.Node
+	reports          []chain.Node
+	closures         []chain.Node
+	sutNames         map[int64]string
+	pageNames        map[int64]string
+	cursor           int64
+	eventTimes       map[int64]time.Time
+	eventTimeSeqs    []int64
+	eventTimeChannel string
+	errs             map[string]error
+	calls            []string
+	versionIDs       map[string]int64
+	requirementLimit int
+	// requirementOverflow makes Requirements ignore limit, mimicking a provider
+	// that returns a larger page than the chain service asked for.
+	requirementOverflow bool
+	historicalIDs       []int64
+	cursorChannel       string
 }
 
-func (f *fakeVersion) Requirements(_ context.Context, _ int64) ([]chain.RequirementRow, error) {
-	f.reqCalls++
-	return f.requirements, f.requirementsErr
-}
-
-// fakeMindmap is the MindmapProvider fake.
-type fakeMindmap struct {
-	cases    []chain.CaseRow
-	coverage []chain.CoverageCell
-	err      error
-}
-
-func (f *fakeMindmap) Cases(_ context.Context, _ int64) ([]chain.CaseRow, error) {
-	return f.cases, f.err
-}
-
-func (f *fakeMindmap) Coverage(_ context.Context, _ int64) ([]chain.CoverageCell, error) {
-	return f.coverage, f.err
-}
-
-// fakeExecution is the ExecutionProvider fake.
-type fakeExecution struct {
-	results  []chain.ResultRow
-	err      error
-	gotBatch *int64
-	calls    int
-}
-
-func (f *fakeExecution) LatestResults(_ context.Context, _ int64, batchID *int64) ([]chain.ResultRow, error) {
-	f.calls++
-	f.gotBatch = cloneID(batchID)
-	return f.results, f.err
-}
-
-// fakeDelivery is the DeliveryProvider fake.
-type fakeDelivery struct {
-	issues   []chain.IssueRow
-	err      error
-	gotBatch *int64
-	calls    int
-}
-
-func (f *fakeDelivery) Issues(_ context.Context, _ int64, batchID *int64) ([]chain.IssueRow, error) {
-	f.calls++
-	f.gotBatch = cloneID(batchID)
-	return f.issues, f.err
-}
-
-// fakeCodeIntel is the CodeIntelProvider fake.
-type fakeCodeIntel struct {
-	impact []chain.ImpactRow
-	err    error
-	calls  int
-}
-
-func (f *fakeCodeIntel) Impact(_ context.Context, _ int64) ([]chain.ImpactRow, error) {
-	f.calls++
-	return f.impact, f.err
-}
-
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
-type fixture struct {
-	version   *fakeVersion
-	mindmap   *fakeMindmap
-	execution *fakeExecution
-	delivery  *fakeDelivery
-	codeIntel *fakeCodeIntel
-}
-
-func newFixture() *fixture {
-	return &fixture{
-		version: &fakeVersion{
-			batch: chain.BatchRow{ID: 7001, BatchNo: 2, Kind: "incremental", Status: "done"},
-		},
-		mindmap:   &fakeMindmap{},
-		execution: &fakeExecution{},
-		delivery:  &fakeDelivery{},
-		codeIntel: &fakeCodeIntel{},
+func newFakeProviders() *fakeProviders {
+	return &fakeProviders{
+		historical: map[int64]chain.Node{},
+		sutNames:   map[int64]string{},
+		pageNames:  map[int64]string{},
+		eventTimes: map[int64]time.Time{},
+		errs:       map[string]error{},
+		versionIDs: map[string]int64{},
 	}
 }
 
-func (f *fixture) providers() chain.Providers {
-	return chain.Providers{
-		Version:   f.version,
-		Mindmap:   f.mindmap,
-		Execution: f.execution,
-		Delivery:  f.delivery,
-		CodeIntel: f.codeIntel,
-	}
+func (f *fakeProviders) begin(operation string, versionID int64) error {
+	f.calls = append(f.calls, operation)
+	f.versionIDs[operation] = versionID
+	return f.errs[operation]
 }
 
-// query is the valid default query every test starts from.
-func query() chain.Query {
-	return chain.Query{
-		VersionID:         "101",
-		Limit:             300,
-		RequirementLimit:  100,
-		IncludeSupplement: true,
+func (f *fakeProviders) Requirements(ctx context.Context, versionID int64, limit int) ([]chain.Node, error) {
+	if err := f.begin("requirements", versionID); err != nil {
+		return nil, err
 	}
+	f.requirementLimit = limit
+	// Mirror the real VersionProvider pagination: return at most limit roots.
+	if !f.requirementOverflow && limit > 0 && len(f.requirements) > limit {
+		return f.requirements[:limit], nil
+	}
+	return f.requirements, nil
 }
 
-// build runs Service.Build with the default query mutated by configure.
-func (f *fixture) build(t *testing.T, configure func(*chain.Query)) chain.Snapshot {
-	t.Helper()
-	q := query()
-	if configure != nil {
-		configure(&q)
+func (f *fakeProviders) VersionSUTs(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("version_suts", versionID); err != nil {
+		return nil, err
 	}
-	snapshot, err := chain.NewService(f.providers()).Build(context.Background(), q)
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
-	return snapshot
+	return f.versionSUTs, nil
 }
 
-func cloneID(id *int64) *int64 {
-	if id == nil {
-		return nil
+func (f *fakeProviders) Scenarios(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("scenarios", versionID); err != nil {
+		return nil, err
 	}
-	value := *id
-	return &value
+	return f.scenarios, nil
 }
 
-func idPtr(value int64) *int64 { return &value }
+func (f *fakeProviders) Cases(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("cases", versionID); err != nil {
+		return nil, err
+	}
+	return f.cases, nil
+}
 
-func idsPtr(values ...int64) []int64 { return values }
-
-func nodesOfKind(snapshot chain.Snapshot, kind string) []chain.NodeDTO {
-	nodes := make([]chain.NodeDTO, 0, len(snapshot.Nodes))
-	for _, node := range snapshot.Nodes {
-		if node.Kind == kind {
-			nodes = append(nodes, node)
+func (f *fakeProviders) CaseVersionsByIDs(ctx context.Context, versionID int64, ids []int64) ([]chain.Node, error) {
+	if err := f.begin("historical", versionID); err != nil {
+		return nil, err
+	}
+	f.historicalIDs = append([]int64(nil), ids...)
+	out := make([]chain.Node, 0, len(ids))
+	for _, id := range ids {
+		if node, ok := f.historical[id]; ok {
+			out = append(out, node)
 		}
+	}
+	return out, nil
+}
+
+func (f *fakeProviders) Waves(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("waves", versionID); err != nil {
+		return nil, err
+	}
+	return f.waves, nil
+}
+
+func (f *fakeProviders) CaseRuns(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("case_runs", versionID); err != nil {
+		return nil, err
+	}
+	return f.caseRuns, nil
+}
+
+func (f *fakeProviders) Issues(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("issues", versionID); err != nil {
+		return nil, err
+	}
+	return f.issues, nil
+}
+
+func (f *fakeProviders) Reports(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("reports", versionID); err != nil {
+		return nil, err
+	}
+	return f.reports, nil
+}
+
+func (f *fakeProviders) Closures(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("closures", versionID); err != nil {
+		return nil, err
+	}
+	return f.closures, nil
+}
+
+func (f *fakeProviders) SUTNames(ctx context.Context, versionID int64) (map[int64]string, error) {
+	if err := f.begin("sut_names", versionID); err != nil {
+		return nil, err
+	}
+	return f.sutNames, nil
+}
+
+func (f *fakeProviders) PageNames(ctx context.Context, versionID int64) (map[int64]string, error) {
+	if err := f.begin("page_names", versionID); err != nil {
+		return nil, err
+	}
+	return f.pageNames, nil
+}
+
+func (f *fakeProviders) LatestCursor(ctx context.Context, channel string) (int64, error) {
+	f.calls = append(f.calls, "cursor")
+	f.cursorChannel = channel
+	if err := f.errs["cursor"]; err != nil {
+		return 0, err
+	}
+	return f.cursor, nil
+}
+
+func (f *fakeProviders) EventTime(ctx context.Context, channel string, seq int64) (time.Time, bool, error) {
+	f.calls = append(f.calls, "event_time")
+	f.eventTimeChannel = channel
+	f.eventTimeSeqs = append(f.eventTimeSeqs, seq)
+	if err := f.errs["event_time"]; err != nil {
+		return time.Time{}, false, err
+	}
+	at, ok := f.eventTimes[seq]
+	return at, ok, nil
+}
+
+func chainNode(kind chain.NodeKind, refID int64, label string) chain.Node {
+	return chain.Node{
+		ID:    chain.NodeID(kind, refID),
+		Kind:  kind,
+		RefID: strconv.FormatInt(refID, 10),
+		Label: label,
+	}
+}
+
+func ptr(value int64) *int64 { return &value }
+
+func completeFakes() *fakeProviders {
+	fakes := newFakeProviders()
+
+	requirement := chainNode(chain.NodeRequirement, 1, "Checkout")
+	requirement.Status = "clarified"
+	requirement.Meta = map[string]any{"target_version_sut_ids": []int64{5}}
+
+	scenario := chainNode(chain.NodeScenario, 10, "Happy path")
+	scenario.RequirementID = ptr(1)
+
+	caseVersion := chainNode(chain.NodeCaseVersion, 100, "Pays with card")
+	caseVersion.RequirementID = ptr(1)
+	caseVersion.ScenarioID = ptr(10)
+	caseVersion.VersionSUTID = ptr(5)
+	caseVersion.VersionSUTIDs = []int64{5}
+	caseVersion.PageID = ptr(50)
+	caseVersion.Status = "confirmed"
+	caseVersion.Meta = map[string]any{
+		"page_ids": []int64{50},
+	}
+
+	wave := chainNode(chain.NodeWave, 7, "Wave 1")
+	wave.Status = "completed"
+
+	caseRun := chainNode(chain.NodeCaseRun, 200, "Pays with card")
+	caseRun.CaseVersionID = ptr(100)
+	caseRun.WaveID = ptr(7)
+	caseRun.VersionSUTIDs = []int64{5}
+	caseRun.Status = "done"
+	caseRun.Meta = map[string]any{"evidence_count": 2}
+
+	issue := chainNode(chain.NodeIssue, 300, "Amount mismatch")
+	issue.RequirementID = ptr(1)
+	issue.CaseRunID = ptr(200)
+	issue.WaveID = ptr(7)
+	issue.ReportID = ptr(900)
+	issue.Status = "open"
+
+	report := chainNode(chain.NodeReport, 900, "Wave 1 report")
+	report.WaveID = ptr(7)
+	report.Status = "published"
+
+	closure := chainNode(chain.NodeClosure, 400, "Closed")
+	closure.RequirementID = ptr(1)
+
+	fakes.requirements = []chain.Node{requirement}
+	fakes.versionSUTs = []chain.Node{{
+		ID:    "version_sut:5",
+		RefID: "5",
+		Label: "Pay (version binding)",
+	}}
+	fakes.scenarios = []chain.Node{scenario}
+	fakes.cases = []chain.Node{caseVersion}
+	fakes.waves = []chain.Node{wave}
+	fakes.caseRuns = []chain.Node{caseRun}
+	fakes.issues = []chain.Node{issue}
+	fakes.reports = []chain.Node{report}
+	fakes.closures = []chain.Node{closure}
+	fakes.sutNames = map[int64]string{5: "Pay"}
+	fakes.pageNames = map[int64]string{50: "Checkout"}
+	fakes.cursor = 123
+	return fakes
+}
+
+func newService(fakes *fakeProviders, now time.Time) *ChainService {
+	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now})
+}
+
+// newServiceWithBudget wires the same fakes with an explicit chain budget, the
+// way P4 settings wiring (task 23) constructs the service.
+func newServiceWithBudget(fakes *fakeProviders, now time.Time, budget chain.Budget) *ChainService {
+	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now}, budget)
+}
+
+// requirementRoots returns count bare requirement roots. Their zero timestamps
+// make the builder's tie-break select the highest ref IDs.
+func requirementRoots(count int) []chain.Node {
+	nodes := make([]chain.Node, 0, count)
+	for id := int64(1); id <= int64(count); id++ {
+		nodes = append(nodes, chainNode(chain.NodeRequirement, id, "Requirement "+strconv.FormatInt(id, 10)))
 	}
 	return nodes
 }
 
-func nodeIDs(nodes []chain.NodeDTO) []string {
-	ids := make([]string, 0, len(nodes))
-	for _, node := range nodes {
-		ids = append(ids, node.ID)
-	}
-	return ids
-}
+func TestChainServiceReadAssemblesView(t *testing.T) {
+	fakes := completeFakes()
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	service := newService(fakes, now)
 
-func requireNodeIDs(t *testing.T, nodes []chain.NodeDTO, want ...string) {
-	t.Helper()
-	got := nodeIDs(nodes)
-	if len(got) != len(want) {
-		t.Fatalf("node ids = %v, want %v", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("node ids = %v, want %v", got, want)
-		}
-	}
-}
-
-func findNode(t *testing.T, snapshot chain.Snapshot, id string) chain.NodeDTO {
-	t.Helper()
-	for _, node := range snapshot.Nodes {
-		if node.ID == id {
-			return node
-		}
-	}
-	t.Fatalf("node %q is missing from %v", id, nodeIDs(snapshot.Nodes))
-	return chain.NodeDTO{}
-}
-
-func findEdge(snapshot chain.Snapshot, id string) (chain.EdgeDTO, bool) {
-	for _, edge := range snapshot.Edges {
-		if edge.ID == id {
-			return edge, true
-		}
-	}
-	return chain.EdgeDTO{}, false
-}
-
-// edgeEndpoints maps an edge kind to its source/target node kind.
-var edgeEndpoints = map[string][2]string{
-	chain.EdgeKindRequirementCase: {chain.NodeKindRequirement, chain.NodeKindCase},
-	chain.EdgeKindCaseResult:      {chain.NodeKindCase, chain.NodeKindResult},
-	chain.EdgeKindResultIssue:     {chain.NodeKindResult, chain.NodeKindIssue},
-	chain.EdgeKindCaseIssue:       {chain.NodeKindCase, chain.NodeKindIssue},
-	chain.EdgeKindImpactCase:      {chain.NodeKindRequirement, chain.NodeKindCase},
-}
-
-// requireEdge asserts the edge identified by its domain ids. The edge id uses
-// the domain ids while its source/target carry the prefixed node ids.
-func requireEdge(t *testing.T, snapshot chain.Snapshot, kind, source, target string) chain.EdgeDTO {
-	t.Helper()
-	id := kind + ":" + source + ":" + target
-	edge, ok := findEdge(snapshot, id)
-	if !ok {
-		t.Fatalf("edge %q is missing from %v", id, snapshot.Edges)
-	}
-	kinds, ok := edgeEndpoints[kind]
-	if !ok {
-		t.Fatalf("unknown edge kind %q", kind)
-	}
-	if edge.Kind != kind || edge.Source != kinds[0]+":"+source || edge.Target != kinds[1]+":"+target {
-		t.Fatalf("edge %q = %+v", id, edge)
-	}
-	return edge
-}
-
-func requireNoEdge(t *testing.T, snapshot chain.Snapshot, id string) {
-	t.Helper()
-	if edge, ok := findEdge(snapshot, id); ok {
-		t.Fatalf("edge %q must not exist: %+v", id, edge)
-	}
-}
-
-func requireString(t *testing.T, got, label, want string) {
-	t.Helper()
-	if got != want {
-		t.Fatalf("%s = %q, want %q", label, got, want)
-	}
-}
-
-func requireStringPtr(t *testing.T, got *string, label, want string) {
-	t.Helper()
-	if got == nil {
-		t.Fatalf("%s = nil, want %q", label, want)
-	}
-	if *got != want {
-		t.Fatalf("%s = %q, want %q", label, *got, want)
-	}
-}
-
-func requireIntPtr(t *testing.T, got *int, label string, want int) {
-	t.Helper()
-	if got == nil {
-		t.Fatalf("%s = nil, want %d", label, want)
-	}
-	if *got != want {
-		t.Fatalf("%s = %d, want %d", label, *got, want)
-	}
-}
-
-func requireInt64Ptr(t *testing.T, got *int64, label string, want int64) {
-	t.Helper()
-	if got == nil {
-		t.Fatalf("%s = nil, want %d", label, want)
-	}
-	if *got != want {
-		t.Fatalf("%s = %d, want %d", label, *got, want)
-	}
-}
-
-func requireBoolPtr(t *testing.T, got *bool, label string, want bool) {
-	t.Helper()
-	if got == nil {
-		t.Fatalf("%s = nil, want %v", label, want)
-	}
-	if *got != want {
-		t.Fatalf("%s = %v, want %v", label, *got, want)
-	}
-}
-
-func requireStringIDs(t *testing.T, got *[]string, label string, want ...string) {
-	t.Helper()
-	if got == nil {
-		t.Fatalf("%s = nil, want %v", label, want)
-	}
-	values := *got
-	if len(values) != len(want) {
-		t.Fatalf("%s = %v, want %v", label, values, want)
-	}
-	for index := range want {
-		if values[index] != want[index] {
-			t.Fatalf("%s = %v, want %v", label, values, want)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Step 1 rules
-// ---------------------------------------------------------------------------
-
-// TestLatestAttemptPerCase proves only the newest attempt of a case is returned
-// as its result node, with the attempt descending sort and a single case_result
-// edge (spec §5.1).
-func TestLatestAttemptPerCase(t *testing.T) {
-	f := newFixture()
-	f.version.requirements = []chain.RequirementRow{
-		{ID: 1, Title: "login", Status: "clarified", Priority: "must", SortOrder: 0},
-	}
-	f.mindmap.cases = []chain.CaseRow{
-		{ID: 11, Title: "login succeeds", Status: "executed", Source: "user_input",
-			RequirementIDs: idsPtr(1), StepCount: 3, AssertionCount: 2, SortOrder: 0},
-	}
-	f.execution.results = []chain.ResultRow{
-		{ID: 1101, CaseNodeID: 11, Attempt: 1, Status: "blocked", BatchID: 7001},
-		{ID: 1103, CaseNodeID: 11, Attempt: 3, Status: "passed", BatchID: 7001,
-			DurationMs: 2100, Summary: "ok", EvidenceCount: 2},
-		{ID: 1102, CaseNodeID: 11, Attempt: 2, Status: "failed", BatchID: 7001},
-	}
-
-	snapshot := f.build(t, nil)
-
-	results := nodesOfKind(snapshot, chain.NodeKindResult)
-	requireNodeIDs(t, results, "result:1103")
-	result := results[0]
-	if result.Title != "login succeeds" {
-		t.Fatalf("result title = %q, want the case title", result.Title)
-	}
-	requireString(t, result.Status, "result status", "passed")
-	requireStringPtr(t, result.CaseRunID, "result caseRunId", "1103")
-	requireStringPtr(t, result.CaseNodeID, "result caseNodeId", "11")
-	requireIntPtr(t, result.Attempt, "result attempt", 3)
-	requireInt64Ptr(t, result.DurationMs, "result durationMs", 2100)
-	requireIntPtr(t, result.EvidenceCount, "result evidenceCount", 2)
-	requireStringPtr(t, result.BatchID, "result batchId", "7001")
-
-	requireEdge(t, snapshot, chain.EdgeKindCaseResult, "11", "1103")
-	for _, stale := range []string{"case_result:11:1101", "case_result:11:1102"} {
-		requireNoEdge(t, snapshot, stale)
-	}
-	if snapshot.Counts.Results != 1 {
-		t.Fatalf("counts.results = %d, want 1 (latest per case only)", snapshot.Counts.Results)
-	}
-	if snapshot.Counts.ByResultStatus["passed"] != 1 ||
-		snapshot.Counts.ByResultStatus["failed"] != 0 {
-		t.Fatalf("counts.byResultStatus = %v, want only one passed latest result", snapshot.Counts.ByResultStatus)
-	}
-}
-
-// TestIssueEdgePrefersLatestResult proves an issue whose caseRunId hits the
-// latest result of its case draws a result_issue edge; every other issue falls
-// back to case_issue (or stays unlinked), per spec §5.1.
-func TestIssueEdgePrefersLatestResult(t *testing.T) {
-	f := newFixture()
-	f.mindmap.cases = []chain.CaseRow{
-		{ID: 11, Title: "login", Status: "executed", Source: "user_input", SortOrder: 0},
-	}
-	f.execution.results = []chain.ResultRow{
-		{ID: 1103, CaseNodeID: 11, Attempt: 3, Status: "failed", BatchID: 7001},
-	}
-	f.delivery.issues = []chain.IssueRow{
-		{ID: 31, Title: "latest run", Severity: "major", Status: "open",
-			CaseRunID: idPtr(1103), CaseNodeID: idPtr(11)},
-		{ID: 32, Title: "older run", Severity: "major", Status: "open",
-			CaseRunID: idPtr(1101), CaseNodeID: idPtr(11)},
-		{ID: 33, Title: "case only", Severity: "minor", Status: "confirmed",
-			CaseNodeID: idPtr(11)},
-		{ID: 34, Title: "unlinked", Severity: "info", Status: "dismissed"},
-	}
-
-	snapshot := f.build(t, nil)
-
-	requireEdge(t, snapshot, chain.EdgeKindResultIssue, "1103", "31")
-	requireEdge(t, snapshot, chain.EdgeKindCaseIssue, "11", "32")
-	requireEdge(t, snapshot, chain.EdgeKindCaseIssue, "11", "33")
-	for _, id := range []string{
-		"result_issue:1101:32", "case_issue:11:31", "case_issue:11:34", "result_issue:1103:34",
-	} {
-		requireNoEdge(t, snapshot, id)
-	}
-	if snapshot.Counts.Issues != 4 {
-		t.Fatalf("counts.issues = %d, want 4", snapshot.Counts.Issues)
-	}
-	if _, ok := findEdge(snapshot, "case_issue:11:34"); ok {
-		t.Fatal("an issue without a case must not draw an edge")
-	}
-}
-
-// TestTruncationKeepsTrueCounts proves Limit truncates the returned nodes while
-// Counts keeps the real pre-truncation totals (spec §5.2).
-func TestTruncationKeepsTrueCounts(t *testing.T) {
-	f := newFixture()
-	for index := 0; index < 5; index++ {
-		f.mindmap.cases = append(f.mindmap.cases, chain.CaseRow{
-			ID:        int64(100 + index),
-			Title:     fmt.Sprintf("case %d", index),
-			Status:    "executed",
-			Source:    "user_input",
-			SortOrder: index,
-		})
-		f.execution.results = append(f.execution.results, chain.ResultRow{
-			ID: int64(1100 + index), CaseNodeID: int64(100 + index), Attempt: 1, Status: "passed",
-		})
-	}
-
-	snapshot := f.build(t, func(q *chain.Query) { q.Limit = 2 })
-
-	if !snapshot.Truncated.Cases {
-		t.Fatalf("truncated.cases = false, want true (5 cases, limit 2)")
-	}
-	if snapshot.Counts.Cases != 5 {
-		t.Fatalf("counts.cases = %d, want the real total 5", snapshot.Counts.Cases)
-	}
-	if got := len(nodesOfKind(snapshot, chain.NodeKindCase)); got != 2 {
-		t.Fatalf("returned cases = %d, want 2", got)
-	}
-	if !snapshot.Truncated.Results {
-		t.Fatalf("truncated.results = false, want true (the node budget is exhausted)")
-	}
-	if snapshot.Counts.Results != 5 {
-		t.Fatalf("counts.results = %d, want the real total 5", snapshot.Counts.Results)
-	}
-	if snapshot.Truncated.Requirements || snapshot.Truncated.Issues {
-		t.Fatalf("truncated = %+v, want only cases and results", snapshot.Truncated)
-	}
-}
-
-// TestRequirementLimitTruncatesRoots proves RequirementLimit caps the root layer
-// while Counts.Requirements keeps the true total.
-func TestRequirementLimitTruncatesRoots(t *testing.T) {
-	f := newFixture()
-	for index := 0; index < 5; index++ {
-		f.version.requirements = append(f.version.requirements, chain.RequirementRow{
-			ID: int64(index + 1), Title: fmt.Sprintf("requirement %d", index), SortOrder: index,
-		})
-	}
-
-	snapshot := f.build(t, func(q *chain.Query) { q.RequirementLimit = 2 })
-
-	if !snapshot.Truncated.Requirements {
-		t.Fatal("truncated.requirements = false, want true")
-	}
-	if snapshot.Counts.Requirements != 5 {
-		t.Fatalf("counts.requirements = %d, want 5", snapshot.Counts.Requirements)
-	}
-	if got := len(nodesOfKind(snapshot, chain.NodeKindRequirement)); got != 2 {
-		t.Fatalf("returned requirements = %d, want 2", got)
-	}
-}
-
-// TestTotalLimitCapsRootLayer proves the global node budget also caps the
-// requirement layer.
-func TestTotalLimitCapsRootLayer(t *testing.T) {
-	f := newFixture()
-	for index := 0; index < 5; index++ {
-		f.version.requirements = append(f.version.requirements, chain.RequirementRow{
-			ID: int64(index + 1), Title: fmt.Sprintf("requirement %d", index), SortOrder: index,
-		})
-		f.mindmap.cases = append(f.mindmap.cases, chain.CaseRow{
-			ID: int64(100 + index), Title: fmt.Sprintf("case %d", index), SortOrder: index,
-		})
-	}
-
-	snapshot := f.build(t, func(q *chain.Query) { q.Limit = 2 })
-
-	if got := len(nodesOfKind(snapshot, chain.NodeKindRequirement)); got != 2 {
-		t.Fatalf("returned requirements = %d, want 2", got)
-	}
-	if got := len(nodesOfKind(snapshot, chain.NodeKindCase)); got != 0 {
-		t.Fatalf("returned cases = %d, want 0 (budget consumed by requirements)", got)
-	}
-	if !snapshot.Truncated.Requirements || !snapshot.Truncated.Cases {
-		t.Fatalf("truncated = %+v, want requirements and cases", snapshot.Truncated)
-	}
-	if snapshot.Counts.Requirements != 5 || snapshot.Counts.Cases != 5 {
-		t.Fatalf("counts = %+v, want real totals 5/5", snapshot.Counts)
-	}
-}
-
-// TestInvalidArguments proves the service rejects malformed queries with the
-// typed ErrInvalidArgument before reaching any provider (spec §5.1).
-func TestInvalidArguments(t *testing.T) {
-	tests := []struct {
-		name  string
-		query chain.Query
-		field string
-	}{
-		{name: "limit zero", query: chain.Query{VersionID: "101", Limit: 0, RequirementLimit: 100}, field: "limit"},
-		{name: "limit negative", query: chain.Query{VersionID: "101", Limit: -3, RequirementLimit: 100}, field: "limit"},
-		{name: "requirement limit zero", query: chain.Query{VersionID: "101", Limit: 300, RequirementLimit: 0}, field: "requirementLimit"},
-		{name: "empty version", query: chain.Query{VersionID: "", Limit: 300, RequirementLimit: 100}, field: "versionId"},
-		{name: "malformed version", query: chain.Query{VersionID: "abc", Limit: 300, RequirementLimit: 100}, field: "versionId"},
-		{name: "malformed batch", query: chain.Query{VersionID: "101", BatchID: "batch", Limit: 300, RequirementLimit: 100}, field: "batchId"},
-		{name: "zero batch", query: chain.Query{VersionID: "101", BatchID: "0", Limit: 300, RequirementLimit: 100}, field: "batchId"},
-		{name: "malformed requirement", query: chain.Query{VersionID: "101", RequirementID: "x", Limit: 300, RequirementLimit: 100}, field: "requirementId"},
-		{name: "unknown result status", query: chain.Query{VersionID: "101", ResultStatus: "running", Limit: 300, RequirementLimit: 100}, field: "resultStatus"},
-		{name: "unknown issue status", query: chain.Query{VersionID: "101", IssueStatus: "closed", Limit: 300, RequirementLimit: 100}, field: "issueStatus"},
-		{name: "unknown issue severity", query: chain.Query{VersionID: "101", IssueSeverity: "critical", Limit: 300, RequirementLimit: 100}, field: "issueSeverity"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			f := newFixture()
-			_, err := chain.NewService(f.providers()).Build(context.Background(), test.query)
-			var invalid *chain.ErrInvalidArgument
-			if !errors.As(err, &invalid) {
-				t.Fatalf("Build() error = %v, want ErrInvalidArgument", err)
-			}
-			if invalid.Field != test.field {
-				t.Fatalf("ErrInvalidArgument.Field = %q, want %q", invalid.Field, test.field)
-			}
-			if invalid.Reason != chain.ReasonInvalidArgument {
-				t.Fatalf("ErrInvalidArgument.Reason = %q, want %q", invalid.Reason, chain.ReasonInvalidArgument)
-			}
-			if f.version.getBatchCalls != 0 || f.version.reqCalls != 0 || f.execution.calls != 0 {
-				t.Fatal("providers must not be called for an invalid query")
-			}
-		})
-	}
-}
-
-// TestSearchTooLongRejects proves the q length constraint of spec §5.1.
-func TestSearchTooLongRejects(t *testing.T) {
-	f := newFixture()
-	q := query()
-	q.Search = string(make([]rune, 101))
-	_, err := chain.NewService(f.providers()).Build(context.Background(), q)
-	var invalid *chain.ErrInvalidArgument
-	if !errors.As(err, &invalid) || invalid.Field != "q" {
-		t.Fatalf("Build() error = %v, want ErrInvalidArgument{field:q}", err)
-	}
-}
-
-// TestUnknownVersionReturnsNotFound proves a missing version surfaces
-// ErrNotFound (spec §5.1: unknown version 404).
-func TestUnknownVersionReturnsNotFound(t *testing.T) {
-	f := newFixture()
-	f.version.batchErr = &chain.ErrNotFound{Resource: "version", ID: 999}
-
-	_, err := chain.NewService(f.providers()).Build(context.Background(), query())
-	var notFound *chain.ErrNotFound
-	if !errors.As(err, &notFound) {
-		t.Fatalf("Build() error = %v, want ErrNotFound", err)
-	}
-	if notFound.Resource != "version" || notFound.ID != 999 {
-		t.Fatalf("ErrNotFound = %+v, want version/999", notFound)
-	}
-}
-
-// TestForeignBatchReturnsNotFound proves an explicit batch outside the version
-// surfaces the provider's ErrNotFound unchanged.
-func TestForeignBatchReturnsNotFound(t *testing.T) {
-	f := newFixture()
-	f.version.batchErr = &chain.ErrNotFound{Resource: "batch", ID: 88}
-	q := query()
-	q.BatchID = "88"
-
-	_, err := chain.NewService(f.providers()).Build(context.Background(), q)
-	var notFound *chain.ErrNotFound
-	if !errors.As(err, &notFound) || notFound.Resource != "batch" || notFound.ID != 88 {
-		t.Fatalf("Build() error = %v, want ErrNotFound{batch,88}", err)
-	}
-}
-
-// TestMissingProvidersRejected proves a structural wiring error is not silently
-// turned into an empty graph.
-func TestMissingProvidersRejected(t *testing.T) {
-	cases := []struct {
-		name      string
-		providers chain.Providers
-	}{
-		{name: "no version", providers: chain.Providers{Mindmap: &fakeMindmap{}, Execution: &fakeExecution{}}},
-		{name: "no mindmap", providers: chain.Providers{Version: &fakeVersion{}, Execution: &fakeExecution{}}},
-		{name: "no execution", providers: chain.Providers{Version: &fakeVersion{}, Mindmap: &fakeMindmap{}}},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			if _, err := chain.NewService(test.providers).Build(context.Background(), query()); err == nil {
-				t.Fatal("Build() error = nil, want a wiring error")
-			}
-		})
-	}
-}
-
-// TestProviderErrorPropagates proves unexpected provider failures are surfaced
-// (the HTTP layer maps them to 500) instead of being swallowed.
-func TestProviderErrorPropagates(t *testing.T) {
-	f := newFixture()
-	f.version.batchErr = errors.New("db down")
-
-	_, err := chain.NewService(f.providers()).Build(context.Background(), query())
-	if err == nil || !contains(err.Error(), "db down") {
-		t.Fatalf("Build() error = %v, want the provider failure", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Filters
-// ---------------------------------------------------------------------------
-
-// filterFixture builds a four-case, three-requirement graph covering every
-// filter dimension of spec §5.1.
-func filterFixture() *fixture {
-	f := newFixture()
-	f.version.requirements = []chain.RequirementRow{
-		{ID: 1, Title: "Alpha requirement", Status: "clarified", Priority: "must", SortOrder: 2},
-		{ID: 2, Title: "Beta requirement", Status: "clarified", Priority: "should", SortOrder: 1},
-		{ID: 3, Title: "Gamma requirement", Status: "clarified", Priority: "could", SortOrder: 3},
-	}
-	f.mindmap.cases = []chain.CaseRow{
-		{ID: 11, Title: "Alpha login", Status: "executed", Source: "user_input",
-			RequirementIDs: idsPtr(1), StepCount: 3, AssertionCount: 2, SortOrder: 2},
-		{ID: 12, Title: "Beta login supplement", Status: "needs_revalidation", Source: "ai_supplement",
-			RequirementIDs: idsPtr(1, 2), SortOrder: 1},
-		{ID: 13, Title: "Beta checkout", Status: "executed", Source: "user_input",
-			RequirementIDs: idsPtr(2), SortOrder: 3},
-		{ID: 14, Title: "Gamma flow", Status: "needs_revalidation", Source: "ai_supplement",
-			RequirementIDs: idsPtr(3), SortOrder: 0},
-	}
-	f.execution.results = []chain.ResultRow{
-		{ID: 1101, CaseNodeID: 11, Attempt: 1, Status: "passed", BatchID: 7001},
-		{ID: 1201, CaseNodeID: 12, Attempt: 1, Status: "failed", BatchID: 7001},
-		{ID: 1301, CaseNodeID: 13, Attempt: 2, Status: "blocked", BatchID: 7001},
-		{ID: 1401, CaseNodeID: 14, Attempt: 1, Status: "passed", BatchID: 7001},
-	}
-	f.delivery.issues = []chain.IssueRow{
-		{ID: 31, Title: "major issue", Severity: "major", Status: "open", CaseNodeID: idPtr(11)},
-		{ID: 32, Title: "blocker issue", Severity: "blocker", Status: "confirmed", CaseNodeID: idPtr(12)},
-		{ID: 33, Title: "unlinked issue", Severity: "info", Status: "dismissed"},
-	}
-	return f
-}
-
-func TestFilters(t *testing.T) {
-	t.Run("requirement id scopes the graph", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) { q.RequirementID = "2" })
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindRequirement), "requirement:2")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase), "case:12", "case:13")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindResult), "result:1301", "result:1201")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindIssue), "issue:32", "issue:33")
-		requireStringIDs(t, findNode(t, snapshot, "case:12").RequirementIDs, "case 12 requirementIds", "1", "2")
-		if snapshot.Counts.Requirements != 1 || snapshot.Counts.Cases != 2 ||
-			snapshot.Counts.Results != 2 || snapshot.Counts.Issues != 2 {
-			t.Fatalf("counts = %+v", snapshot.Counts)
-		}
+	view, err := service.Read(context.Background(), 42, chain.ChainFilter{
+		Status:    " Open ",
+		FocusNode: " issue:300 ",
 	})
-
-	t.Run("result status cascades to cases and requirements", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) { q.ResultStatus = "passed" })
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindRequirement), "requirement:1", "requirement:3")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase), "case:14", "case:11")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindResult), "result:1101", "result:1401")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindIssue), "issue:31", "issue:33")
-		if snapshot.Counts.ByResultStatus["passed"] != 2 ||
-			snapshot.Counts.ByResultStatus["failed"] != 0 ||
-			snapshot.Counts.ByResultStatus["blocked"] != 0 {
-			t.Fatalf("byResultStatus = %v, want only the filtered passed results", snapshot.Counts.ByResultStatus)
-		}
-	})
-
-	t.Run("abnormal only", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) { q.AbnormalOnly = true })
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase), "case:12", "case:13")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindResult), "result:1301", "result:1201")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindRequirement), "requirement:2", "requirement:1")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindIssue), "issue:32", "issue:33")
-	})
-
-	t.Run("issue status and severity filter only the issue layer", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) {
-			q.IssueStatus = "open"
-			q.IssueSeverity = "major"
-		})
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindIssue), "issue:31")
-		if got := len(nodesOfKind(snapshot, chain.NodeKindRequirement)); got != 3 {
-			t.Fatalf("requirements = %d, want all three (issue filters do not cascade)", got)
-		}
-		if got := len(nodesOfKind(snapshot, chain.NodeKindCase)); got != 4 {
-			t.Fatalf("cases = %d, want all four (issue filters do not cascade)", got)
-		}
-		if snapshot.Counts.Issues != 1 || snapshot.Counts.ByIssueSeverity["major"] != 1 ||
-			snapshot.Counts.ByIssueSeverity["blocker"] != 0 {
-			t.Fatalf("counts = %+v, want only the major issue", snapshot.Counts)
-		}
-	})
-
-	t.Run("search is case insensitive and keeps connected nodes", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) { q.Search = "ALPHA" })
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindRequirement), "requirement:2", "requirement:1")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase), "case:12", "case:11")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindResult), "result:1101", "result:1201")
-	})
-
-	t.Run("include supplement false drops AI supplement cases", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) { q.IncludeSupplement = false })
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase), "case:11", "case:13")
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindRequirement),
-			"requirement:2", "requirement:1", "requirement:3")
-	})
-
-	t.Run("revalidation only drops everything else", func(t *testing.T) {
-		snapshot := filterFixture().build(t, func(q *chain.Query) { q.RevalidationOnly = true })
-
-		requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase), "case:14", "case:12")
-		for _, caseNode := range nodesOfKind(snapshot, chain.NodeKindCase) {
-			requireBoolPtr(t, caseNode.Revalidation, caseNode.ID+" revalidation", true)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Sorting
-// ---------------------------------------------------------------------------
-
-func TestLayerOrdering(t *testing.T) {
-	f := newFixture()
-	f.version.requirements = []chain.RequirementRow{
-		{ID: 20, Title: "late", SortOrder: 5},
-		{ID: 30, Title: "second", SortOrder: 0},
-		{ID: 10, Title: "first", SortOrder: 0},
-	}
-	f.mindmap.cases = []chain.CaseRow{
-		{ID: 200, Title: "late", SortOrder: 2},
-		{ID: 300, Title: "second", SortOrder: 0},
-		{ID: 100, Title: "first", SortOrder: 0},
-	}
-	f.execution.results = []chain.ResultRow{
-		{ID: 2001, CaseNodeID: 200, Attempt: 2, Status: "passed"},
-		{ID: 3001, CaseNodeID: 300, Attempt: 5, Status: "passed"},
-		{ID: 1001, CaseNodeID: 100, Attempt: 3, Status: "passed"},
-	}
-	older := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
-	newer := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
-	newest := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
-	f.delivery.issues = []chain.IssueRow{
-		{ID: 41, Title: "minor", Severity: "minor", Status: "open", CreatedAt: newer},
-		{ID: 42, Title: "blocker", Severity: "blocker", Status: "open", CreatedAt: older},
-		{ID: 43, Title: "major new", Severity: "major", Status: "open", CreatedAt: newest},
-		{ID: 44, Title: "major old", Severity: "major", Status: "open", CreatedAt: newer},
-		{ID: 45, Title: "info", Severity: "info", Status: "open", CreatedAt: newest},
-	}
-
-	snapshot := f.build(t, nil)
-
-	requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindRequirement),
-		"requirement:10", "requirement:30", "requirement:20")
-	requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindCase),
-		"case:100", "case:300", "case:200")
-	requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindResult),
-		"result:3001", "result:1001", "result:2001")
-	requireNodeIDs(t, nodesOfKind(snapshot, chain.NodeKindIssue),
-		"issue:42", "issue:43", "issue:44", "issue:41", "issue:45")
-}
-
-// ---------------------------------------------------------------------------
-// Coverage, counts and impact
-// ---------------------------------------------------------------------------
-
-// TestCoverageUnionAndCounts proves coverage.matrix contributes requirement →
-// case links (union with case_source), uncovered requirements are flagged and
-// the aggregate counters of spec §5.1 are filled.
-func TestCoverageUnionAndCounts(t *testing.T) {
-	f := newFixture()
-	f.version.requirements = []chain.RequirementRow{
-		{ID: 1, Title: "covered", Status: "clarified", SortOrder: 0,
-			OpenQuestionCount: 2},
-		{ID: 2, Title: "uncovered", Status: "clarified", SortOrder: 1},
-	}
-	f.mindmap.cases = []chain.CaseRow{
-		{ID: 11, Title: "covered case", Status: "executed", Source: "user_input",
-			StepCount: 1, AssertionCount: 1, SortOrder: 0},
-		{ID: 12, Title: "supplement", Status: "needs_revalidation", Source: "ai_supplement",
-			RequirementIDs: idsPtr(1), SortOrder: 1},
-	}
-	// Case 11 is only linked through the coverage matrix, exercising the union.
-	f.mindmap.coverage = []chain.CoverageCell{
-		{RequirementID: 1, CaseIDs: []int64{11}},
-	}
-	f.execution.results = []chain.ResultRow{
-		{ID: 1101, CaseNodeID: 11, Attempt: 1, Status: "passed"},
-		{ID: 1201, CaseNodeID: 12, Attempt: 1, Status: "failed"},
-	}
-	f.delivery.issues = []chain.IssueRow{
-		{ID: 31, Title: "blocker", Severity: "blocker", Status: "open"},
-		{ID: 32, Title: "major", Severity: "major", Status: "confirmed"},
-	}
-
-	snapshot := f.build(t, nil)
-
-	requireEdge(t, snapshot, chain.EdgeKindRequirementCase, "1", "11")
-
-	covered := findNode(t, snapshot, "requirement:1")
-	requireBoolPtr(t, covered.Uncovered, "requirement 1 uncovered", false)
-	requireIntPtr(t, covered.CaseCount, "requirement 1 caseCount", 2)
-	requireIntPtr(t, covered.ExecutedCount, "requirement 1 executedCount", 2)
-	requireIntPtr(t, covered.FailedCount, "requirement 1 failedCount", 1)
-	requireIntPtr(t, covered.OpenQuestionCount, "requirement 1 openQuestionCount", 2)
-	requireStringPtr(t, covered.Priority, "requirement 1 priority", "")
-	requireString(t, covered.Status, "requirement 1 status", "clarified")
-
-	uncovered := findNode(t, snapshot, "requirement:2")
-	requireBoolPtr(t, uncovered.Uncovered, "requirement 2 uncovered", true)
-	requireIntPtr(t, uncovered.CaseCount, "requirement 2 caseCount", 0)
-
-	counts := snapshot.Counts
-	if counts.Requirements != 2 || counts.Cases != 2 || counts.Results != 2 || counts.Issues != 2 {
-		t.Fatalf("counts = %+v", counts)
-	}
-	if counts.UncoveredRequirements != 1 {
-		t.Fatalf("counts.uncoveredRequirements = %d, want 1", counts.UncoveredRequirements)
-	}
-	if counts.RevalidationCases != 1 {
-		t.Fatalf("counts.revalidationCases = %d, want 1", counts.RevalidationCases)
-	}
-	if counts.SupplementCases != 1 {
-		t.Fatalf("counts.supplementCases = %d, want 1", counts.SupplementCases)
-	}
-	if counts.ByResultStatus["passed"] != 1 || counts.ByResultStatus["failed"] != 1 {
-		t.Fatalf("byResultStatus = %v", counts.ByResultStatus)
-	}
-	for _, status := range []string{"pending", "running", "passed", "failed", "blocked",
-		"inconclusive", "skipped", "interrupted"} {
-		if _, ok := counts.ByResultStatus[status]; !ok {
-			t.Fatalf("byResultStatus is missing %q: %v", status, counts.ByResultStatus)
-		}
-	}
-	if counts.ByIssueSeverity["blocker"] != 1 || counts.ByIssueSeverity["major"] != 1 ||
-		counts.ByIssueSeverity["minor"] != 0 || counts.ByIssueSeverity["info"] != 0 {
-		t.Fatalf("byIssueSeverity = %v", counts.ByIssueSeverity)
-	}
-}
-
-// TestImpactEdges proves selected / high / medium requirement candidates produce
-// impact_case edges and mark their case nodes.
-func TestImpactEdges(t *testing.T) {
-	f := newFixture()
-	f.version.requirements = []chain.RequirementRow{
-		{ID: 1, Title: "one", SortOrder: 0},
-		{ID: 2, Title: "two", SortOrder: 1},
-	}
-	f.mindmap.cases = []chain.CaseRow{
-		{ID: 11, Title: "one case", RequirementIDs: idsPtr(1), SortOrder: 0},
-		{ID: 12, Title: "two case", RequirementIDs: idsPtr(2), SortOrder: 1},
-	}
-	f.codeIntel.impact = []chain.ImpactRow{
-		{SubjectKind: "requirement", SubjectID: 1, Confidence: "low", Reason: "ignored"},
-		{SubjectKind: "requirement", SubjectID: 1, Confidence: "high", Reason: "changed API"},
-		{SubjectKind: "requirement", SubjectID: 2, Selected: true, Confidence: "low", Reason: "selected"},
-		{SubjectKind: "app_model", SubjectID: 9, Selected: true, Confidence: "high", Reason: "app model"},
-	}
-
-	snapshot := f.build(t, nil)
-
-	requireEdge(t, snapshot, chain.EdgeKindImpactCase, "1", "11")
-	requireEdge(t, snapshot, chain.EdgeKindImpactCase, "2", "12")
-	requireNoEdge(t, snapshot, "impact_case:1:12")
-	requireNoEdge(t, snapshot, "impact_case:9:11")
-
-	impacted := findNode(t, snapshot, "case:11")
-	requireBoolPtr(t, impacted.Impacted, "case 11 impacted", true)
-	requireStringPtr(t, impacted.ImpactReason, "case 11 impactReason", "changed API")
-
-	if len(snapshot.Edges) != 4 { // 2 requirement_case + 2 impact_case
-		t.Fatalf("edges = %v, want exactly two requirement_case and two impact_case edges", snapshot.Edges)
-	}
-}
-
-// TestImpactAbsentWithoutProvider proves the optional P4 provider degrades to
-// no impact information.
-func TestImpactAbsentWithoutProvider(t *testing.T) {
-	f := newFixture()
-	f.version.requirements = []chain.RequirementRow{{ID: 1, Title: "one"}}
-	f.mindmap.cases = []chain.CaseRow{{ID: 11, Title: "one case", RequirementIDs: idsPtr(1)}}
-
-	snapshot, err := chain.NewService(chain.Providers{
-		Version:   f.version,
-		Mindmap:   f.mindmap,
-		Execution: f.execution,
-	}).Build(context.Background(), query())
 	if err != nil {
-		t.Fatalf("Build() error = %v", err)
+		t.Fatalf("Read() error = %v", err)
 	}
-	for _, edge := range snapshot.Edges {
-		if edge.Kind == chain.EdgeKindImpactCase {
-			t.Fatalf("impact edge without a P4 provider: %+v", edge)
+
+	if view.VersionID != "42" {
+		t.Errorf("VersionID = %q, want 42", view.VersionID)
+	}
+	if view.SnapshotCursor != 123 {
+		t.Errorf("SnapshotCursor = %d, want 123", view.SnapshotCursor)
+	}
+	if !view.GeneratedAt.Equal(now) {
+		t.Errorf("GeneratedAt = %v, want %v", view.GeneratedAt, now)
+	}
+	if view.Filters.Status != "open" || view.Filters.FocusNode != "issue:300" {
+		t.Errorf("Filters = %+v, want the normalized filter", view.Filters)
+	}
+	if view.Replay.Mode != chain.ReplayModeLive || !view.Replay.Approximate {
+		t.Errorf("Replay = %+v, want live/approximate", view.Replay)
+	}
+
+	nodes := make(map[string]chain.Node, len(view.Nodes))
+	for _, node := range view.Nodes {
+		nodes[node.ID] = node
+	}
+	for _, id := range []string{
+		"requirement:1", "scenario:10", "case_version:100",
+		"wave:7", "case_run:200", "issue:300",
+	} {
+		if _, ok := nodes[id]; !ok {
+			t.Errorf("node %q missing after filter+focus: %v", id, view.Nodes)
 		}
 	}
-	caseNode := findNode(t, snapshot, "case:11")
-	requireBoolPtr(t, caseNode.Impacted, "case impacted", false)
-	requireStringPtr(t, caseNode.ImpactReason, "case impactReason", "")
+	for _, id := range []string{"report:900", "closure:400"} {
+		if _, ok := nodes[id]; ok {
+			t.Errorf("filtered node %q unexpectedly kept", id)
+		}
+	}
+
+	edges := make(map[string]bool, len(view.Edges))
+	for _, edge := range view.Edges {
+		edges[string(edge.Kind)+"|"+edge.From+"|"+edge.To] = true
+	}
+	for _, want := range []string{
+		"has_scenario|requirement:1|scenario:10",
+		"has_case|scenario:10|case_version:100",
+		"executed_by|case_version:100|case_run:200",
+		"contains|wave:7|case_run:200",
+		"raised|case_run:200|issue:300",
+	} {
+		if !edges[want] {
+			t.Errorf("edge %q missing from %v", want, view.Edges)
+		}
+	}
+
+	caseNode := nodes["case_version:100"]
+	if got := caseNode.Meta["sut_labels"]; !slices.Equal(got.([]string), []string{"Pay"}) {
+		t.Errorf("case sut_labels = %v, want [Pay] from ResourceChainProvider", got)
+	}
+	if got := caseNode.Meta["page_labels"]; !slices.Equal(got.([]string), []string{"Checkout"}) {
+		t.Errorf("case page_labels = %v, want [Checkout]", got)
+	}
+
+	for _, operation := range []string{
+		"requirements", "version_suts", "scenarios", "cases", "waves",
+		"case_runs", "issues", "reports", "closures", "sut_names", "page_names", "cursor",
+	} {
+		if !slices.Contains(fakes.calls, operation) {
+			t.Errorf("provider operation %q was not called (calls=%v)", operation, fakes.calls)
+		}
+		if operation != "cursor" && fakes.versionIDs[operation] != 42 {
+			t.Errorf("%s got versionID %d, want 42", operation, fakes.versionIDs[operation])
+		}
+	}
+	if slices.Contains(fakes.calls, "historical") {
+		t.Errorf("historical reader called without a missing case version: %v", fakes.calls)
+	}
+	if fakes.requirementLimit != chain.DefaultMaxRequirements+1 {
+		t.Errorf("Requirements limit = %d, want MaxRequirements+1 = %d", fakes.requirementLimit, chain.DefaultMaxRequirements+1)
+	}
+	if fakes.cursorChannel != "version:42" {
+		t.Errorf("cursor channel = %q, want version:42", fakes.cursorChannel)
+	}
 }
 
-// ---------------------------------------------------------------------------
-// Batch selection
-// ---------------------------------------------------------------------------
+// TestChainServiceRequirementBudgetTruncation covers the end-to-end path of the
+// requirement root budget: the service asks the provider for one root more than
+// chain.max_requirements so BuildChain can truncate and report
+// requirement_budget instead of silently serving exactly the budget page.
+func TestChainServiceRequirementBudgetTruncation(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 
-func TestBatchSelection(t *testing.T) {
-	t.Run("default selects the latest batch", func(t *testing.T) {
-		f := newFixture()
-		f.build(t, nil)
+	t.Run("requests one root beyond the budget and reports truncation", func(t *testing.T) {
+		fakes := newFakeProviders()
+		fakes.cursor = 7
+		fakes.requirements = requirementRoots(chain.DefaultMaxRequirements + 1)
 
-		if f.version.gotVersionID != 101 {
-			t.Fatalf("version id = %d, want 101", f.version.gotVersionID)
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
 		}
-		if f.version.gotBatchID != nil {
-			t.Fatalf("GetBatch batch id = %v, want nil (latest)", f.version.gotBatchID)
+
+		if got := fakes.requirementLimit; got != chain.DefaultMaxRequirements+1 {
+			t.Errorf("Requirements limit = %d, want MaxRequirements+1 = %d", got, chain.DefaultMaxRequirements+1)
 		}
-		requireInt64Ptr(t, f.execution.gotBatch, "execution batch", 7001)
-		requireInt64Ptr(t, f.delivery.gotBatch, "delivery batch", 7001)
+		if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonRequirementBudget {
+			t.Fatalf("truncation = %+v, want requirement_budget", view.Truncation)
+		}
+		if got := view.Truncation.MaxRequirements; got != chain.DefaultMaxRequirements {
+			t.Errorf("Truncation.MaxRequirements = %d, want %d", got, chain.DefaultMaxRequirements)
+		}
+		if got := len(view.Nodes); got != chain.DefaultMaxRequirements {
+			t.Errorf("nodes = %d, want the %d selected requirements", got, chain.DefaultMaxRequirements)
+		}
+		if got := view.Counts["requirements"]; got != chain.DefaultMaxRequirements+1 {
+			t.Errorf("Counts[requirements] = %d, want the provider page %d before truncation", got, chain.DefaultMaxRequirements+1)
+		}
+		nodes := make(map[string]bool, len(view.Nodes))
+		for _, node := range view.Nodes {
+			nodes[node.ID] = true
+		}
+		if nodes[chain.NodeID(chain.NodeRequirement, 1)] {
+			t.Errorf("oldest requirement survived the root budget: %v", view.Nodes)
+		}
+		if !nodes[chain.NodeID(chain.NodeRequirement, int64(chain.DefaultMaxRequirements+1))] {
+			t.Errorf("newest requirement missing after the root budget: %v", view.Nodes)
+		}
 	})
 
-	t.Run("all scopes results and issues to every batch", func(t *testing.T) {
-		f := newFixture()
-		f.build(t, func(q *chain.Query) { q.BatchID = "all" })
+	t.Run("a provider returning more than the requested page is still truncated", func(t *testing.T) {
+		fakes := newFakeProviders()
+		fakes.cursor = 7
+		fakes.requirementOverflow = true
+		fakes.requirements = requirementRoots(chain.DefaultMaxRequirements + 5)
 
-		if f.version.gotBatchID != nil {
-			t.Fatalf("GetBatch batch id = %v, want nil (latest for display)", f.version.gotBatchID)
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
 		}
-		if f.execution.gotBatch != nil || f.delivery.gotBatch != nil {
-			t.Fatalf("provider batch = %v/%v, want nil (all batches)",
-				f.execution.gotBatch, f.delivery.gotBatch)
+		if got := fakes.requirementLimit; got != chain.DefaultMaxRequirements+1 {
+			t.Errorf("Requirements limit = %d, want MaxRequirements+1 = %d", got, chain.DefaultMaxRequirements+1)
 		}
-	})
-
-	t.Run("explicit batch is forwarded", func(t *testing.T) {
-		f := newFixture()
-		f.version.batch = chain.BatchRow{ID: 8888, BatchNo: 9, Kind: "baseline", Status: "done"}
-		snapshot := f.build(t, func(q *chain.Query) { q.BatchID = "8888" })
-
-		requireInt64Ptr(t, f.version.gotBatchID, "GetBatch batch id", 8888)
-		requireInt64Ptr(t, f.execution.gotBatch, "execution batch", 8888)
-		requireInt64Ptr(t, f.delivery.gotBatch, "delivery batch", 8888)
-		if snapshot.Batch.ID != "8888" || snapshot.Batch.BatchNo != 9 ||
-			snapshot.Batch.Kind != "baseline" || snapshot.Batch.Status != "done" {
-			t.Fatalf("batch = %+v", snapshot.Batch)
+		if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonRequirementBudget {
+			t.Fatalf("truncation = %+v, want requirement_budget", view.Truncation)
+		}
+		if got := len(view.Nodes); got != chain.DefaultMaxRequirements {
+			t.Errorf("nodes = %d, want %d", got, chain.DefaultMaxRequirements)
+		}
+		if got := view.Counts["requirements"]; got != chain.DefaultMaxRequirements+5 {
+			t.Errorf("Counts[requirements] = %d, want the full provider page %d", got, chain.DefaultMaxRequirements+5)
 		}
 	})
 }
 
-// ---------------------------------------------------------------------------
-// Empty data and envelope basics
-// ---------------------------------------------------------------------------
+// TestChainServiceUsesConfiguredBudget pins the constructor budget: the service
+// must apply the configured chain.max_nodes/chain.max_edges/
+// chain.max_requirements instead of ClampBudget(Budget{}), and ChainFilter.Limit
+// stays a lower-only override of the configured node budget. Task 23 passes the
+// settings through the same constructor.
+func TestChainServiceUsesConfiguredBudget(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 
-// TestEmptyVersionReturnsEmptyGraph proves a known version without data returns
-// empty arrays (never null) and a complete zero counts object.
-func TestEmptyVersionReturnsEmptyGraph(t *testing.T) {
-	f := newFixture()
-	f.version.batch = chain.BatchRow{}
+	fakes := completeFakes()
+	service := newServiceWithBudget(fakes, now, chain.Budget{MaxNodes: 3, MaxEdges: 2, MaxRequirements: 2})
+	view, err := service.Read(context.Background(), 42, chain.ChainFilter{})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
 
-	snapshot := f.build(t, nil)
+	if view.Truncation.MaxNodes != 3 || view.Truncation.MaxEdges != 2 || view.Truncation.MaxRequirements != 2 {
+		t.Errorf("Truncation = %+v, want the configured maxima nodes=3 edges=2 requirements=2", view.Truncation)
+	}
+	if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonNodeBudget {
+		t.Errorf("truncation = %+v, want node_budget", view.Truncation)
+	}
+	if got := len(view.Nodes); got != 3 {
+		t.Errorf("nodes = %d, want the configured node budget 3: %v", got, view.Nodes)
+	}
+	if got := fakes.requirementLimit; got != 3 {
+		t.Errorf("Requirements limit = %d, want MaxRequirements+1 = 3", got)
+	}
 
-	if snapshot.Nodes == nil || len(snapshot.Nodes) != 0 {
-		t.Fatalf("nodes = %#v, want an empty non-nil slice", snapshot.Nodes)
+	lower := completeFakes()
+	lowered, err := newServiceWithBudget(lower, now, chain.Budget{MaxNodes: 5}).
+		Read(context.Background(), 42, chain.ChainFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
 	}
-	if snapshot.Edges == nil || len(snapshot.Edges) != 0 {
-		t.Fatalf("edges = %#v, want an empty non-nil slice", snapshot.Edges)
+	if got := lowered.Truncation.MaxNodes; got != 5 {
+		t.Errorf("Truncation.MaxNodes = %d, want the configured budget 5 (limit is lower-only)", got)
 	}
-	if snapshot.VersionID != "101" {
-		t.Fatalf("versionId = %q, want 101", snapshot.VersionID)
-	}
-	if snapshot.Batch.ID != "" || snapshot.Batch.BatchNo != 0 {
-		t.Fatalf("batch = %+v, want the zero batch", snapshot.Batch)
-	}
-	counts := snapshot.Counts
-	if counts.Requirements != 0 || counts.Cases != 0 || counts.Results != 0 ||
-		counts.Issues != 0 || counts.UncoveredRequirements != 0 ||
-		counts.RevalidationCases != 0 || counts.SupplementCases != 0 {
-		t.Fatalf("counts = %+v, want zeros", counts)
-	}
-	if len(counts.ByResultStatus) != 8 || len(counts.ByIssueSeverity) != 4 {
-		t.Fatalf("counts maps = %v / %v", counts.ByResultStatus, counts.ByIssueSeverity)
-	}
-	if snapshot.Truncated.Requirements || snapshot.Truncated.Cases ||
-		snapshot.Truncated.Results || snapshot.Truncated.Issues {
-		t.Fatalf("truncated = %+v, want false", snapshot.Truncated)
-	}
-	if snapshot.GeneratedAt.IsZero() {
-		t.Fatal("generatedAt is zero")
+	if got := lower.requirementLimit; got != chain.DefaultMaxRequirements+1 {
+		t.Errorf("Requirements limit = %d, want the default MaxRequirements+1 = %d", got, chain.DefaultMaxRequirements+1)
 	}
 }
 
-// TestVersionIDCanonicalized proves the service normalizes a decimal version id
-// and passes the numeric form to its providers.
-func TestVersionIDCanonicalized(t *testing.T) {
-	f := newFixture()
-	snapshot := f.build(t, func(q *chain.Query) { q.VersionID = "000101" })
+func TestChainServiceLoadsHistoricalCaseVersions(t *testing.T) {
+	fakes := completeFakes()
+	historical := chainNode(chain.NodeCaseVersion, 101, "Superseded title")
+	historical.Status = "superseded"
+	historical.ScenarioID = ptr(10)
+	historical.RequirementID = ptr(1)
+	fakes.historical[101] = historical
 
-	if snapshot.VersionID != "101" {
-		t.Fatalf("versionId = %q, want canonical 101", snapshot.VersionID)
-	}
-	if f.version.gotVersionID != 101 {
-		t.Fatalf("provider version id = %d, want 101", f.version.gotVersionID)
-	}
-}
+	supersededRun := chainNode(chain.NodeCaseRun, 201, "Superseded title")
+	supersededRun.CaseVersionID = ptr(101)
+	supersededRun.WaveID = ptr(7)
+	supersededRun.Status = "done"
+	fakes.caseRuns = append(fakes.caseRuns, supersededRun)
 
-// contains is a tiny substring helper so the test does not depend on the error
-// wrapping style of the service.
-func contains(haystack, needle string) bool {
-	for index := 0; index+len(needle) <= len(haystack); index++ {
-		if haystack[index:index+len(needle)] == needle {
-			return true
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if !slices.Equal(fakes.historicalIDs, []int64{101}) {
+		t.Errorf("historical ids = %v, want [101]", fakes.historicalIDs)
+	}
+	nodes := make(map[string]chain.Node, len(view.Nodes))
+	for _, node := range view.Nodes {
+		nodes[node.ID] = node
+	}
+	if node, ok := nodes["case_version:101"]; !ok {
+		t.Fatalf("superseded case version missing: %v", view.Nodes)
+	} else if node.Label != "Superseded title" {
+		t.Errorf("historical case label = %q, want Superseded title", node.Label)
+	}
+	found := false
+	for _, edge := range view.Edges {
+		if edge.Kind == chain.EdgeExecutedBy && edge.From == "case_version:101" && edge.To == "case_run:201" {
+			found = true
 		}
 	}
-	return false
+	if !found {
+		t.Errorf("executed_by edge for the historical case version missing: %v", view.Edges)
+	}
 }
 
-// ensure the fakes satisfy the exported ports at compile time.
-var (
-	_ chain.VersionProvider   = (*fakeVersion)(nil)
-	_ chain.MindmapProvider   = (*fakeMindmap)(nil)
-	_ chain.ExecutionProvider = (*fakeExecution)(nil)
-	_ chain.DeliveryProvider  = (*fakeDelivery)(nil)
-	_ chain.CodeIntelProvider = (*fakeCodeIntel)(nil)
-)
+func TestChainServiceErrors(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	t.Run("rejects a non-positive version id before calling providers", func(t *testing.T) {
+		fakes := completeFakes()
+		if _, err := newService(fakes, now).Read(context.Background(), 0, chain.ChainFilter{}); err == nil {
+			t.Fatal("Read(versionID=0) error = nil, want an error")
+		}
+		if len(fakes.calls) != 0 {
+			t.Errorf("providers were called for an invalid version id: %v", fakes.calls)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		operation string
+		layer     string
+		mutate    func(*fakeProviders)
+	}{
+		{name: "requirements", operation: "requirements", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
+			f.errs["requirements"] = errProviderBoom
+		}},
+		{name: "version suts", operation: "version_suts", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
+			f.errs["version_suts"] = errProviderBoom
+		}},
+		{name: "scenarios", operation: "scenarios", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
+			f.errs["scenarios"] = errProviderBoom
+		}},
+		{name: "cases", operation: "cases", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
+			f.errs["cases"] = errProviderBoom
+		}},
+		{name: "waves", operation: "waves", layer: chain.LayerExecution, mutate: func(f *fakeProviders) {
+			f.errs["waves"] = errProviderBoom
+		}},
+		{name: "case runs", operation: "case_runs", layer: chain.LayerExecution, mutate: func(f *fakeProviders) {
+			f.errs["case_runs"] = errProviderBoom
+		}},
+		{name: "issues", operation: "issues", layer: chain.LayerDelivery, mutate: func(f *fakeProviders) {
+			f.errs["issues"] = errProviderBoom
+		}},
+		{name: "reports", operation: "reports", layer: chain.LayerDelivery, mutate: func(f *fakeProviders) {
+			f.errs["reports"] = errProviderBoom
+		}},
+		{name: "closures", operation: "closures", layer: chain.LayerDelivery, mutate: func(f *fakeProviders) {
+			f.errs["closures"] = errProviderBoom
+		}},
+		{name: "SUT names", operation: "sut_names", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
+			f.errs["sut_names"] = errProviderBoom
+		}},
+		{name: "page names", operation: "page_names", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
+			f.errs["page_names"] = errProviderBoom
+		}},
+		{name: "cursor", operation: "cursor", layer: chain.LayerExecution, mutate: func(f *fakeProviders) {
+			f.errs["cursor"] = errProviderBoom
+		}},
+		{name: "historical case versions", operation: "historical", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
+			f.caseRuns = append(f.caseRuns, chain.Node{
+				ID:            "case_run:202",
+				Kind:          chain.NodeCaseRun,
+				RefID:         "202",
+				CaseVersionID: ptr(102),
+				WaveID:        ptr(7),
+			})
+			f.errs["historical"] = errProviderBoom
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakes := completeFakes()
+			tc.mutate(fakes)
+			view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+			if err != nil {
+				// P6 only lets explicit 4xx provider errors abort the read.
+				if !slices.Contains(fakes.calls, tc.operation) {
+					t.Errorf("provider operation %q was not attempted: %v", tc.operation, fakes.calls)
+				}
+				return
+			}
+			if !slices.Contains(view.DegradedLayers, tc.layer) {
+				t.Errorf("degraded_layers = %v, want %q for the %s provider failure",
+					view.DegradedLayers, tc.layer, tc.operation)
+			}
+			if !slices.Contains(fakes.calls, tc.operation) {
+				t.Errorf("provider operation %q was not attempted: %v", tc.operation, fakes.calls)
+			}
+		})
+	}
+}
+
+func TestChainServiceReplayModes(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		filter     chain.ChainFilter
+		wantMode   string
+		wantWave   *int64
+		wantFrom   *int64
+		wantTo     *int64
+		wantFilter chain.ChainFilter
+	}{
+		{
+			name:       "live",
+			filter:     chain.ChainFilter{},
+			wantMode:   chain.ReplayModeLive,
+			wantFilter: chain.ChainFilter{},
+		},
+		{
+			name:       "wave",
+			filter:     chain.ChainFilter{WaveID: ptr(7)},
+			wantMode:   chain.ReplayModeWave,
+			wantWave:   ptr(7),
+			wantFilter: chain.ChainFilter{WaveID: ptr(7)},
+		},
+		{
+			name:       "range",
+			filter:     chain.ChainFilter{EventFrom: ptr(9), EventTo: ptr(5)},
+			wantMode:   chain.ReplayModeRange,
+			wantFrom:   ptr(5),
+			wantTo:     ptr(9),
+			wantFilter: chain.ChainFilter{EventFrom: ptr(5), EventTo: ptr(9)},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakes := newFakeProviders()
+			fakes.cursor = 7
+			fakes.waves = []chain.Node{chainNode(chain.NodeWave, 7, "Wave 1")}
+			fakes.eventTimes[5] = now.Add(-time.Hour)
+			fakes.eventTimes[9] = now.Add(time.Hour)
+			view, err := newService(fakes, now).Read(context.Background(), 42, tc.filter)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if view.Replay.Mode != tc.wantMode {
+				t.Errorf("Replay.Mode = %q, want %q", view.Replay.Mode, tc.wantMode)
+			}
+			if !view.Replay.Approximate {
+				t.Errorf("Replay.Approximate = false, want true")
+			}
+			if !samePtr(view.Replay.WaveID, tc.wantWave) ||
+				!samePtr(view.Replay.EventFrom, tc.wantFrom) ||
+				!samePtr(view.Replay.EventTo, tc.wantTo) {
+				t.Errorf("Replay = %+v, want wave=%v from=%v to=%v", view.Replay, tc.wantWave, tc.wantFrom, tc.wantTo)
+			}
+			if !sameFilter(view.Filters, tc.wantFilter) {
+				t.Errorf("Filters = %+v, want %+v", view.Filters, tc.wantFilter)
+			}
+		})
+	}
+}
+
+func TestChainServiceEventRangeFiltersNodes(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 10, 0, 0, time.UTC)
+	base := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	fakes := completeFakes()
+	// seq 5 -> base+1m (lower bound), seq 7 -> base+4m (upper bound).
+	fakes.eventTimes[5] = base.Add(time.Minute)
+	fakes.eventTimes[7] = base.Add(4 * time.Minute)
+
+	fakes.requirements[0].CreatedAt = base
+	fakes.requirements[0].UpdatedAt = base
+	fakes.scenarios[0].CreatedAt = base.Add(time.Minute)
+	fakes.scenarios[0].UpdatedAt = base.Add(time.Minute)
+	fakes.cases[0].CreatedAt = base.Add(2 * time.Minute)
+	fakes.cases[0].UpdatedAt = base.Add(2 * time.Minute)
+	fakes.caseRuns[0].CreatedAt = base.Add(3 * time.Minute)
+	fakes.caseRuns[0].UpdatedAt = base.Add(3 * time.Minute)
+	fakes.waves[0].CreatedAt = base.Add(4 * time.Minute)
+	fakes.waves[0].UpdatedAt = base.Add(4 * time.Minute)
+	fakes.issues[0].CreatedAt = base.Add(5 * time.Minute)
+	fakes.issues[0].UpdatedAt = base.Add(5 * time.Minute)
+	fakes.reports[0].CreatedAt = time.Time{} // zero timestamps are always kept
+	fakes.reports[0].UpdatedAt = time.Time{}
+	fakes.closures[0].CreatedAt = base.Add(5 * time.Minute)
+	fakes.closures[0].UpdatedAt = base.Add(5 * time.Minute)
+
+	view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{
+		EventFrom: ptr(5),
+		EventTo:   ptr(7),
+	})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if view.Replay.Mode != chain.ReplayModeRange || !view.Replay.Approximate {
+		t.Errorf("Replay = %+v, want range/approximate", view.Replay)
+	}
+	if !samePtr(view.Replay.EventFrom, ptr(5)) || !samePtr(view.Replay.EventTo, ptr(7)) {
+		t.Errorf("Replay bounds = %v/%v, want 5/7", view.Replay.EventFrom, view.Replay.EventTo)
+	}
+	if fakes.eventTimeChannel != "version:42" {
+		t.Errorf("event time channel = %q, want version:42", fakes.eventTimeChannel)
+	}
+	if !slices.Equal(fakes.eventTimeSeqs, []int64{5, 7}) {
+		t.Errorf("event time seqs = %v, want [5 7]", fakes.eventTimeSeqs)
+	}
+
+	nodes := make(map[string]chain.Node, len(view.Nodes))
+	for _, node := range view.Nodes {
+		nodes[node.ID] = node
+	}
+	for _, id := range []string{
+		"scenario:10", "case_version:100", "wave:7", "case_run:200", "report:900",
+	} {
+		if _, ok := nodes[id]; !ok {
+			t.Errorf("node %q missing from the event range: %v", id, view.Nodes)
+		}
+	}
+	for _, id := range []string{"requirement:1", "issue:300", "closure:400"} {
+		if _, ok := nodes[id]; ok {
+			t.Errorf("node %q outside the event range was not filtered", id)
+		}
+	}
+	if got := view.Counts["requirements"]; got != 0 {
+		t.Errorf("Counts[requirements] = %d, want 0", got)
+	}
+	if got := view.Counts["reports"]; got != 1 {
+		t.Errorf("Counts[reports] = %d, want the zero-timestamp report", got)
+	}
+
+	edges := make(map[string]bool, len(view.Edges))
+	for _, edge := range view.Edges {
+		edges[string(edge.Kind)+"|"+edge.From+"|"+edge.To] = true
+	}
+	for _, want := range []string{
+		"has_case|scenario:10|case_version:100",
+		"executed_by|case_version:100|case_run:200",
+		"contains|wave:7|case_run:200",
+		"reports|wave:7|report:900",
+	} {
+		if !edges[want] {
+			t.Errorf("edge %q missing from the induced range graph: %v", want, view.Edges)
+		}
+	}
+	for _, unwanted := range []string{
+		"has_scenario|requirement:1|scenario:10",
+		"raised|case_run:200|issue:300",
+		"closed_by|requirement:1|closure:400",
+	} {
+		if edges[unwanted] {
+			t.Errorf("edge %q survived with a filtered endpoint", unwanted)
+		}
+	}
+}
+
+func TestChainServiceEventRangeOneSidedAndZeroUnset(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 10, 0, 0, time.UTC)
+	base := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	t.Run("zero event bounds are unset", func(t *testing.T) {
+		fakes := completeFakes()
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{
+			EventFrom: ptr(0),
+			EventTo:   ptr(0),
+		})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if view.Replay.Mode != chain.ReplayModeLive {
+			t.Errorf("Replay.Mode = %q, want live for zero bounds", view.Replay.Mode)
+		}
+		if view.Filters.EventFrom != nil || view.Filters.EventTo != nil {
+			t.Errorf("Filters event bounds = %v/%v, want nil/nil", view.Filters.EventFrom, view.Filters.EventTo)
+		}
+		if slices.Contains(fakes.calls, "event_time") {
+			t.Errorf("event time reader was called for unset bounds: %v", fakes.calls)
+		}
+	})
+
+	t.Run("event_from alone filters only the lower bound", func(t *testing.T) {
+		fakes := completeFakes()
+		fakes.eventTimes[5] = base.Add(2 * time.Minute)
+		fakes.requirements[0].CreatedAt = base.Add(time.Minute)
+		fakes.issues[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.reports[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.scenarios[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.cases[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.waves[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.caseRuns[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.closures[0].CreatedAt = base.Add(3 * time.Minute)
+
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{EventFrom: ptr(5)})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if view.Replay.Mode != chain.ReplayModeRange || !view.Replay.Approximate {
+			t.Errorf("Replay = %+v, want range/approximate", view.Replay)
+		}
+		if !samePtr(view.Replay.EventFrom, ptr(5)) || view.Replay.EventTo != nil {
+			t.Errorf("Replay bounds = %v/%v, want 5/nil", view.Replay.EventFrom, view.Replay.EventTo)
+		}
+		nodes := make(map[string]bool, len(view.Nodes))
+		for _, node := range view.Nodes {
+			nodes[node.ID] = true
+		}
+		if nodes["requirement:1"] {
+			t.Errorf("requirement before the lower bound survived")
+		}
+		if !nodes["issue:300"] || !nodes["report:900"] {
+			t.Errorf("upper-unbounded nodes missing: %v", view.Nodes)
+		}
+		if !slices.Equal(fakes.eventTimeSeqs, []int64{5}) {
+			t.Errorf("event time seqs = %v, want [5]", fakes.eventTimeSeqs)
+		}
+	})
+}
+
+func TestChainServiceRejectsInvalidEventBounds(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	t.Run("negative bound", func(t *testing.T) {
+		fakes := completeFakes()
+		_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{EventFrom: ptr(-1)})
+		if err == nil {
+			t.Fatal("Read() error = nil, want an invalid event bound error")
+		}
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+			t.Fatalf("error = %v, want a 400 platform error", err)
+		}
+		if len(fakes.calls) != 0 {
+			t.Errorf("providers were called for an invalid event bound: %v", fakes.calls)
+		}
+	})
+
+	t.Run("unknown event seq", func(t *testing.T) {
+		fakes := completeFakes()
+		_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{
+			EventFrom: ptr(5),
+			EventTo:   ptr(7),
+		})
+		if err == nil {
+			t.Fatal("Read() error = nil, want an unknown event seq error")
+		}
+		if !slices.Equal(fakes.eventTimeSeqs, []int64{5}) {
+			t.Errorf("event time seqs = %v, want [5] before rejecting the missing bound", fakes.eventTimeSeqs)
+		}
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+			t.Fatalf("error = %v, want a 400 platform error", err)
+		}
+	})
+
+	t.Run("event reader failure", func(t *testing.T) {
+		fakes := completeFakes()
+		fakes.eventTimes[5] = now
+		fakes.errs["event_time"] = errProviderBoom
+		_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{EventFrom: ptr(5)})
+		if !errors.Is(err, errProviderBoom) {
+			t.Fatalf("Read() error = %v, want the event reader error", err)
+		}
+	})
+}
+
+func TestChainServiceLimitOverride(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	fakes := newFakeProviders()
+	fakes.cursor = 7
+
+	view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := view.Truncation.MaxNodes; got != 50 {
+		t.Errorf("Truncation.MaxNodes = %d, want the filter limit 50", got)
+	}
+	if view.Filters.Limit != 50 {
+		t.Errorf("Filters.Limit = %d, want 50", view.Filters.Limit)
+	}
+
+	capped, err := newService(newFakeProviders(), now).Read(context.Background(), 42, chain.ChainFilter{Limit: 1000})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := capped.Truncation.MaxNodes; got != chain.DefaultMaxNodes {
+		t.Errorf("Truncation.MaxNodes = %d, want the configured budget %d for limit 1000", got, chain.DefaultMaxNodes)
+	}
+
+	invalid, err := newService(newFakeProviders(), now).Read(context.Background(), 42, chain.ChainFilter{Limit: 5000})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := invalid.Truncation.MaxNodes; got != chain.DefaultMaxNodes {
+		t.Errorf("Truncation.MaxNodes = %d, want the default %d", got, chain.DefaultMaxNodes)
+	}
+}
+
+func sameFilter(left, right chain.ChainFilter) bool {
+	return samePtr(left.VersionSUTID, right.VersionSUTID) &&
+		samePtr(left.PageID, right.PageID) &&
+		samePtr(left.WaveID, right.WaveID) &&
+		left.Status == right.Status &&
+		left.Result == right.Result &&
+		left.FocusNode == right.FocusNode &&
+		samePtr(left.EventFrom, right.EventFrom) &&
+		samePtr(left.EventTo, right.EventTo) &&
+		left.Limit == right.Limit
+}
+
+func samePtr(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}

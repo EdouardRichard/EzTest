@@ -1,0 +1,20 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "P4 impact ground truth of the deterministic fixture repository. The pair is the two reproducible commits created by scripts/fixture-codeintel-repo.ps1; the changed refund call/route/component must surface the R1 requirement and therefore the case sourced from R1. The runner compares the P4 analysis candidates (selected requirement candidates) against this expectation: recall = expected cases hit / expected cases, precision = hit candidates / selected requirement candidates.",
+  "repository": {
+    "kind": "deterministic-fixture",
+    "script": "scripts/fixture-codeintel-repo.ps1",
+    "branch": "main",
+    "baseCommit": "69e994d5f06130089d4f7260eda326a22a3ba930",
+    "headCommit": "a4a6d36fed168630e2c5f42fd87f3920c15f090e",
+    "anchorFile": "src/api/refund.ts",
+    "anchorLine": 1
+  },
+  "expected": [
+    {
+      "caseTitle": "P5 正常主流程用例",
+      "requirementKey": "R1",
+      "reason": "src/api/refund.ts 的退款调用新增 reason 参数，直接命中 R1 的退款/下单链路。"
+    }
+  ]
+}

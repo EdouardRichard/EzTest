@@ -1,129 +1,223 @@
-package domain
+package version_test
 
 import (
-	"strings"
+	"encoding/json"
+	"regexp"
 	"testing"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// validRequirement is the smallest valid aggregate; each case changes one
-// aspect.
-func validRequirement() Requirement {
-	return Requirement{
-		VersionID:        11,
-		Title:            "Checkout supports coupons",
-		Priority:         PriorityShould,
-		Status:           RequirementDraft,
-		Source:           SourceUser,
-		LastUpdateSource: SourceUser,
+func validRequirementVersion() version.RequirementVersion {
+	return version.RequirementVersion{
+		Title:              "Checkout supports coupons",
+		Description:        "Users can apply a coupon code at checkout.",
+		AcceptanceCriteria: "A valid coupon reduces the total by its discount.",
+		Priority:           "P1",
+		Constraints:        json.RawMessage(`{"business_rules":["one coupon per order"],"preconditions":["signed in"]}`),
+		TargetVersionSUTs:  []string{"5001"},
+		TargetPages:        []string{"6001", "6002"},
+		TargetAPIs:         []string{"7001"},
 	}
 }
 
-func TestRequirementValidate(t *testing.T) {
-	tests := []struct {
-		name   string
-		build  func(*Requirement)
-		valid  bool
-		field  string
-		reason string
+func requirementAPIField(t *testing.T, err error) string {
+	t.Helper()
+	apiErr, ok := err.(*platform.Error)
+	if !ok {
+		t.Fatalf("error %v is not a platform error", err)
+	}
+	if apiErr.Status != 400 {
+		t.Fatalf("status = %d, want 400", apiErr.Status)
+	}
+	field, _ := apiErr.Details["field"].(string)
+	return field
+}
+
+func TestRequirementStatusTransitions(t *testing.T) {
+	allowed := []struct {
+		from, to version.RequirementStatus
 	}{
-		{name: "minimal valid requirement", valid: true},
-		{
-			name: "valid clarified requirement",
-			build: func(r *Requirement) {
-				r.Status = RequirementClarified
-				r.Priority = PriorityMust
-			},
-			valid: true,
-		},
-		{
-			name:   "version id required",
-			build:  func(r *Requirement) { r.VersionID = 0 },
-			field:  "versionId",
-			reason: "invalid_id",
-		},
-		{
-			name:   "title required",
-			build:  func(r *Requirement) { r.Title = "" },
-			field:  "title",
-			reason: "invalid_title",
-		},
-		{
-			name:  "title at limit counts runes",
-			build: func(r *Requirement) { r.Title = strings.Repeat("需", MaxTitleChars) },
-			valid: true,
-		},
-		{
-			name:   "title too long counts runes",
-			build:  func(r *Requirement) { r.Title = strings.Repeat("需", MaxTitleChars+1) },
-			field:  "title",
-			reason: "invalid_title",
-		},
-		{
-			name:  "description at limit",
-			build: func(r *Requirement) { r.Description = strings.Repeat("d", MaxDescriptionChars) },
-			valid: true,
-		},
-		{
-			name:   "description too long",
-			build:  func(r *Requirement) { r.Description = strings.Repeat("d", MaxDescriptionChars+1) },
-			field:  "description",
-			reason: "invalid_description",
-		},
-		{
-			name: "acceptance criteria at limit",
-			build: func(r *Requirement) {
-				r.AcceptanceCriteria = strings.Repeat("c", MaxAcceptanceCriteriaChars)
-			},
-			valid: true,
-		},
-		{
-			name: "acceptance criteria too long",
-			build: func(r *Requirement) {
-				r.AcceptanceCriteria = strings.Repeat("c", MaxAcceptanceCriteriaChars+1)
-			},
-			field:  "acceptanceCriteria",
-			reason: "invalid_acceptance_criteria",
-		},
-		{
-			name:   "priority must be must/should/could",
-			build:  func(r *Requirement) { r.Priority = "critical" },
-			field:  "priority",
-			reason: "invalid_priority",
-		},
-		{
-			name:   "status must be a known enum value",
-			build:  func(r *Requirement) { r.Status = "done" },
-			field:  "status",
-			reason: "invalid_status",
-		},
-		{
-			name:   "source must be user/ai",
-			build:  func(r *Requirement) { r.Source = "agent" },
-			field:  "source",
-			reason: "invalid_source",
-		},
-		{
-			name:   "last update source must be user/ai",
-			build:  func(r *Requirement) { r.LastUpdateSource = "agent" },
-			field:  "lastUpdateSource",
-			reason: "invalid_last_update_source",
-		},
+		{version.RequirementDraft, version.RequirementClarified},
+		{version.RequirementClarified, version.RequirementDraft},
+		{version.RequirementClosed, version.RequirementDraft},
+	}
+	for _, tc := range allowed {
+		if !version.CanTransitionRequirement(tc.from, tc.to) {
+			t.Fatalf("%s -> %s should be allowed", tc.from, tc.to)
+		}
 	}
 
-	for _, tc := range tests {
+	rejected := []struct {
+		from, to version.RequirementStatus
+	}{
+		{version.RequirementDraft, version.RequirementClosed},
+		{version.RequirementDraft, version.RequirementObsolete},
+		{version.RequirementClarified, version.RequirementClosed},
+		{version.RequirementObsolete, version.RequirementClarified},
+		{version.RequirementDraft, version.RequirementDraft},
+		{version.RequirementClarified, version.RequirementClarified},
+		{version.RequirementClosed, version.RequirementClarified},
+	}
+	for _, tc := range rejected {
+		if version.CanTransitionRequirement(tc.from, tc.to) {
+			t.Fatalf("%s -> %s should be rejected", tc.from, tc.to)
+		}
+	}
+}
+
+func TestRequirementPriorityNormalization(t *testing.T) {
+	cases := map[string]string{"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3", "": "P2", "  ": "P2"}
+	for raw, want := range cases {
+		got, err := version.NormalizePriority(raw)
+		if err != nil {
+			t.Fatalf("NormalizePriority(%q): %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("NormalizePriority(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	for _, raw := range []string{"P4", "p0", "urgent"} {
+		if _, err := version.NormalizePriority(raw); err == nil {
+			t.Fatalf("NormalizePriority(%q) accepted an invalid priority", raw)
+		} else if field := requirementAPIField(t, err); field != "priority" {
+			t.Fatalf("field = %q, want priority", field)
+		}
+	}
+}
+
+func TestRequirementVersionValidatesDraft(t *testing.T) {
+	if err := validRequirementVersion().ValidateDraft(); err != nil {
+		t.Fatalf("valid draft rejected: %v", err)
+	}
+
+	tooLongTitle := validRequirementVersion()
+	tooLongTitle.Title = string(make([]rune, version.RequirementTitleMax+1))
+	tooLongDescription := validRequirementVersion()
+	tooLongDescription.Description = string(make([]rune, version.RequirementDescriptionMax+1))
+	tooLongAcceptance := validRequirementVersion()
+	tooLongAcceptance.AcceptanceCriteria = string(make([]rune, version.RequirementAcceptanceMax+1))
+	badTarget := validRequirementVersion()
+	badTarget.TargetPages = []string{"not-an-id"}
+	zeroTarget := validRequirementVersion()
+	zeroTarget.TargetVersionSUTs = []string{"0"}
+	badConstraints := validRequirementVersion()
+	badConstraints.Constraints = json.RawMessage(`[1,2,3]`)
+	badJSON := validRequirementVersion()
+	badJSON.Constraints = json.RawMessage(`{"oops"`)
+
+	cases := []struct {
+		name      string
+		content   version.RequirementVersion
+		wantField string
+	}{
+		{"blank title", version.RequirementVersion{Title: "  ", Priority: "P1"}, "title"},
+		{"long title", tooLongTitle, "title"},
+		{"long description", tooLongDescription, "description"},
+		{"long acceptance", tooLongAcceptance, "acceptance_criteria"},
+		{"bad target", badTarget, "target_pages"},
+		{"zero target", zeroTarget, "target_version_suts"},
+		{"bad constraints", badConstraints, "constraints"},
+		{"bad constraints json", badJSON, "constraints"},
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			requirement := validRequirement()
-			if tc.build != nil {
-				tc.build(&requirement)
+			err := tc.content.ValidateDraft()
+			if err == nil {
+				t.Fatal("invalid draft accepted")
 			}
-			err := requirement.Validate()
-			if tc.valid {
-				if err != nil {
-					t.Fatalf("want valid requirement, got %v", err)
-				}
-				return
+			if field := requirementAPIField(t, err); field != tc.wantField {
+				t.Fatalf("field = %q, want %q", field, tc.wantField)
 			}
-			assertDomainError(t, err, tc.field, tc.reason)
 		})
+	}
+
+	// The OpenAPI Create/Update request requires every content field, so a draft
+	// is already complete before confirmation.
+	missingDescription := validRequirementVersion()
+	missingDescription.Description = ""
+	if err := missingDescription.ValidateDraft(); err == nil {
+		t.Fatal("draft without description accepted")
+	} else if field := requirementAPIField(t, err); field != "description" {
+		t.Fatalf("field = %q, want description", field)
+	}
+}
+
+func TestRequirementVersionValidatesConfirmation(t *testing.T) {
+	content := validRequirementVersion()
+	if err := content.ValidateConfirmed(); err != nil {
+		t.Fatalf("valid confirmation content rejected: %v", err)
+	}
+
+	missingDescription := validRequirementVersion()
+	missingDescription.Description = ""
+	missingAcceptance := validRequirementVersion()
+	missingAcceptance.AcceptanceCriteria = ""
+	blankTitle := validRequirementVersion()
+	blankTitle.Title = "   "
+
+	cases := []struct {
+		name      string
+		content   version.RequirementVersion
+		wantField string
+	}{
+		{"missing description", missingDescription, "description"},
+		{"missing acceptance", missingAcceptance, "acceptance_criteria"},
+		{"blank title", blankTitle, "title"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.content.ValidateConfirmed()
+			if err == nil {
+				t.Fatal("incomplete requirement was confirmable")
+			}
+			if field := requirementAPIField(t, err); field != tc.wantField {
+				t.Fatalf("field = %q, want %q", field, tc.wantField)
+			}
+		})
+	}
+}
+
+func TestContentHashIsStableAndNormalized(t *testing.T) {
+	base := validRequirementVersion()
+	hash, err := base.ComputeContentHash()
+	if err != nil {
+		t.Fatalf("ContentHash: %v", err)
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(hash) {
+		t.Fatalf("hash %q is not sha256 hex", hash)
+	}
+	again, err := base.ComputeContentHash()
+	if err != nil || again != hash {
+		t.Fatalf("hash is not deterministic: %q/%q (%v)", hash, again, err)
+	}
+
+	reordered := validRequirementVersion()
+	reordered.TargetPages = []string{"6002", "6001", "6002"}
+	reordered.Constraints = json.RawMessage(`{"preconditions":["signed in"],"business_rules":["one coupon per order"]}`)
+	reorderedHash, err := reordered.ComputeContentHash()
+	if err != nil || reorderedHash != hash {
+		t.Fatalf("equivalent content produced a different hash: %q vs %q (%v)", hash, reorderedHash, err)
+	}
+
+	changed := validRequirementVersion()
+	changed.Title = "Checkout supports gift cards"
+	changedHash, err := changed.ComputeContentHash()
+	if err != nil || changedHash == hash {
+		t.Fatalf("different content produced the same hash: %q", changedHash)
+	}
+}
+
+func TestValidRelationKind(t *testing.T) {
+	for _, kind := range []string{"depends_on", "conflicts_with", "overlaps", "shares_scope"} {
+		if !version.ValidRelationKind(kind) {
+			t.Fatalf("%q should be a valid relation kind", kind)
+		}
+	}
+	for _, kind := range []string{"", "blocks", "DEPENDS_ON"} {
+		if version.ValidRelationKind(kind) {
+			t.Fatalf("%q should be invalid", kind)
+		}
 	}
 }

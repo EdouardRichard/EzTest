@@ -1,89 +1,50 @@
-// Package application holds the P8 todo-centre read model: the cross-context
-// provider ports it consumes and the read-only service that aggregates them
-// (design spec §6.3/D56).
-//
-// This file is the single home of the workspace cross-context port
-// declarations. It contains value types and interfaces only: no pgx, HTTP or
-// other-context imports. Adapters live in each context's
-// infrastructure/workspace package and are wired by the composition root, so
-// the workspace context never imports another bounded context.
-package application
+// Package workspaceapp aggregates the read-only cross-context todo feed of the
+// P6 workspace endpoint (spec §4.3.2/§7).
+package workspaceapp
 
 import (
 	"context"
-	"time"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// Todo kinds rendered by the todo centre (spec §6.3).
+// The six todo kinds of the frozen P6 contract. Each kind is owned by exactly
+// one source context; the workspace context only aggregates and orders them.
 const (
-	KindReview   = "review"
-	KindTakeover = "takeover"
-	KindGate     = "gate"
+	KindRequirementConfirmation = "requirement_confirmation"
+	KindCaseConfirmation        = "case_confirmation"
+	KindIssueConfirmation       = "issue_confirmation"
+	KindDesignPending           = "design_pending"
+	KindHumanRequest            = "human_request"
+	KindDeadWorkItem            = "dead_work_item"
 )
 
-// Severity vocabulary of the todo items. The values are the rank hints the
-// topbar panel uses for its badges; review is informational, a waiting takeover
-// is urgent and an unresolved gate needs an administrator.
+// Severity values of the todo contract (spec §4.3.2).
 const (
-	SeverityInfo    = "info"
-	SeverityWarning = "warning"
 	SeverityMajor   = "major"
+	SeverityWarning = "warning"
+	SeverityInfo    = "info"
 )
 
-// DefaultLimit and MaxLimit bound the aggregated item list (env
-// EZTEST_TODOS_MAX, spec §11.4).
+// Limit bounds of GET /api/todos (spec §4.3.2): 1–200, default 50.
 const (
 	DefaultLimit = 50
 	MaxLimit     = 200
 )
 
-// ReasonInvalidArgument is the stable details.reason of the 400 envelope the
-// HTTP layer renders for an out-of-range limit.
-const ReasonInvalidArgument = "invalid_argument"
-
-// ReviewRow is one version currently in the reviewing state (spec §6.3). The
-// provider owns the version status filter; the service only aggregates.
-type ReviewRow struct {
-	VersionID   int64
-	VersionName string
-	Status      string
-	// ReviewingAt is the timestamp surfaced as the item's createdAt. A version
-	// row does not persist the exact transition time, so the provider uses the
-	// last update, which is when the version most recently entered/refreshed
-	// the reviewing state.
-	ReviewingAt time.Time
+// Provider is the read-only todo source of one owning context. Items are
+// returned without a limit so the service can count the full feed before it
+// truncates the visible items; each provider must therefore fetch its source
+// with the workspace maximum (MaxLimit) and never write.
+type Provider interface {
+	Items(ctx context.Context, viewer platform.Actor) ([]TodoItem, error)
 }
 
-// PendingRow is one execution case run that needs a human decision (spec
-// §6.3). A non-nil TakeoverID means a waiting manual takeover exists for the
-// run's session (`takeover`); a nil TakeoverID is an unresolved human gate with
-// no waiting takeover (`gate`, the administrator-driven recovery case).
-type PendingRow struct {
-	CaseRunID     int64
-	VersionID     int64
-	VersionName   string
-	CaseTitle     string
-	FailureReason string
-	CreatedAt     time.Time
-	TakeoverID    *int64
-}
-
-// ReviewProvider supplies the versions currently waiting for review. The
-// version context adapts its own tables to this port.
-type ReviewProvider interface {
-	ReviewingVersions(ctx context.Context) ([]ReviewRow, error)
-}
-
-// ExecutionProvider supplies the execution case runs waiting for a human
-// takeover or gate escalation. The execution context adapts its own tables to
-// this port.
-type ExecutionProvider interface {
-	PendingTakeovers(ctx context.Context) ([]PendingRow, error)
-}
-
-// Providers groups the todo-centre providers. Review is required by the service;
-// Execution is optional and only queried for administrators.
-type Providers struct {
-	Review    ReviewProvider
-	Execution ExecutionProvider
+// VersionTitleReader is the narrow version application port used to decorate
+// the todo items whose provider cannot read another context's version table. It
+// resolves every requested version ID in one batch (spec §9: version_title
+// comes from the version context, never from another context's SQL). The
+// version application QueryService satisfies it without an adapter.
+type VersionTitleReader interface {
+	VersionTitles(ctx context.Context, ids []int64) (map[int64]string, error)
 }

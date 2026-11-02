@@ -1,311 +1,153 @@
-// Package llm is the LLM gateway context's domain model: provider
-// configurations, their retry/timeout policy, the cached model catalog and the
-// validation rules shared by the repository port and the application layer.
+// Package llm is the domain model for LLM gateway configurations and their
+// model catalog. The package is dependency-free apart from the shared platform
+// validation helpers.
 package llm
 
 import (
-	"errors"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
-// Protocol selects the upstream API dialect used by an LLM configuration.
-type Protocol string
-
+// Provider/protocol/status values frozen by the P0 schema (llm_0001_llm.sql).
 const (
-	// ProtocolChat is the OpenAI-compatible chat completions protocol.
-	ProtocolChat Protocol = "chat_completions"
-	// ProtocolResponses is the OpenAI-compatible responses protocol.
-	ProtocolResponses Protocol = "responses"
+	ProviderOpenAI = "openai"
+
+	ProtocolOpenAI           = "openai"
+	ProtocolOpenAICompatible = "openai_compatible"
+
+	StatusActive   = "active"
+	StatusDisabled = "disabled"
 )
 
-// Valid reports whether p is a protocol the service accepts.
-func (p Protocol) Valid() bool {
-	return p == ProtocolChat || p == ProtocolResponses
-}
+// P0 defaults and validation limits. They mirror the migration check
+// constraints so the application fails with a typed 400 before PostgreSQL
+// rejects the row.
+const (
+	DefaultProvider       = ProviderOpenAI
+	DefaultProtocol       = ProtocolOpenAI
+	DefaultStatus         = StatusActive
+	DefaultTimeoutSeconds = 60
+	DefaultMaxRetries     = 2
 
-// ModelInfo is one entry of the cached upstream model catalog.
-type ModelInfo struct {
-	ID              string   `json:"id"`
-	ContextWindow   *int64   `json:"context_window,omitempty"`
-	MaxOutputTokens *int64   `json:"max_output_tokens,omitempty"`
-	InputModalities []string `json:"input_modalities,omitempty"`
-}
+	MinTimeoutSeconds = 1
+	MaxTimeoutSeconds = 600
+	MinMaxRetries     = 0
+	MaxMaxRetries     = 10
 
-// Config is one stored LLM gateway configuration. APIKey and Headers are
-// secrets: the repository encrypts them at rest and decrypts them when a
-// configuration is loaded for internal use. They are never returned by an API
-// as plaintext.
+	MaxNameLength      = 100
+	MaxProviderLength  = 100
+	MaxBaseURLLength   = 2048
+	MaxAPIKeyLength    = 8192
+	MaxHeaders         = 50
+	MaxHeaderNameLen   = 256
+	MaxHeaderValueLen  = 8192
+	MaxModelNameLength = 200
+	MaxContextWindow   = 10_000_000
+	MaxMaxOutput       = 10_000_000
+)
+
+// Config is one LLM gateway configuration. APIKey is stored in plain text by
+// design (P0-D3) and must never be serialized to an API response: the HTTP
+// DTOs expose api_key_set instead.
 type Config struct {
-	ID       int64
-	Name     string
-	Protocol Protocol
-	BaseURL  string
-	Model    string
-	APIKey   string
-	// KeyVersion is the keyring version that encrypted APIKey and Headers.
-	KeyVersion        int
-	Headers           map[string]string
-	RetryCount        int
-	RetryIntervalMS   int
-	TimeoutMS         int
-	StreamEnabled     bool
-	MultimodalEnabled bool
-	IsDefault         bool
-	ModelCatalog      []ModelInfo
-	CatalogFetchedAt  *time.Time
+	ID             int64
+	Name           string
+	Provider       string
+	Protocol       string
+	BaseURL        string
+	APIKey         string
+	Headers        map[string]string
+	TimeoutSeconds int
+	MaxRetries     int
+	IsDefault      bool
+	Status         string
+	CreatedBy      *int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
-// Retry and timeout bounds from the design. Values outside them are rejected
-// before they reach the database CHECK constraints.
-const (
-	MinRetryCount      = 0
-	MaxRetryCount      = 5
-	MinRetryIntervalMS = 100
-	MaxRetryIntervalMS = 30000
-	MinTimeoutMS       = 1000
-	MaxTimeoutMS       = 300000
-)
+// APIKeySet reports whether a secret is configured.
+func (c Config) APIKeySet() bool { return strings.TrimSpace(c.APIKey) != "" }
 
-// Defaults used when a create request omits a timing field. Zero is outside
-// both valid ranges, so it unambiguously means "not provided"; these mirror the
-// database column defaults. Retry count accepts an explicit zero, so callers
-// that omit it must resolve DefaultRetryCount themselves (the HTTP layer uses
-// application.DefaultCreateParams).
-const (
-	DefaultRetryCount      = 2
-	DefaultRetryIntervalMS = 500
-	DefaultTimeoutMS       = 60000
-)
-
-// Settings applied when a configuration is seeded from the environment.
-const (
-	SeedConfigName        = "default"
-	SeedRetryCount        = 2
-	SeedStreamEnabled     = true
-	SeedMultimodalEnabled = true
-)
-
-// CreateParams describes a new configuration. The repository encrypts the API
-// key and headers before inserting the row.
-type CreateParams struct {
-	Name              string
-	Protocol          Protocol
-	BaseURL           string
-	Model             string
-	APIKey            string
-	Headers           map[string]string
-	RetryCount        int
-	RetryIntervalMS   int
-	TimeoutMS         int
-	StreamEnabled     bool
-	MultimodalEnabled bool
-	IsDefault         bool
-}
-
-// UpdateParams describes a partial update: nil fields keep their stored value.
-// Headers and APIKey are re-encrypted with the active key version whenever any
-// part of the configuration is saved.
-type UpdateParams struct {
-	Name              *string
-	Protocol          *Protocol
-	BaseURL           *string
-	Model             *string
-	APIKey            *string
-	Headers           *map[string]string
-	RetryCount        *int
-	RetryIntervalMS   *int
-	TimeoutMS         *int
-	StreamEnabled     *bool
-	MultimodalEnabled *bool
-	IsDefault         *bool
-	ModelCatalog      *[]ModelInfo
-	CatalogFetchedAt  *time.Time
-}
-
-// Domain errors shared by the repository port, the configuration service and
-// the HTTP layer. Callers use errors.Is rather than comparing messages.
-var (
-	// ErrConfigNotFound means no configuration matches the requested identifier.
-	ErrConfigNotFound = errors.New("llm: configuration not found")
-	// ErrNameTaken means another configuration already uses the name.
-	ErrNameTaken = errors.New("llm: configuration name already taken")
-	// ErrDefaultConflict means a concurrent writer created a default
-	// configuration first; the partial unique index allows only one.
-	ErrDefaultConflict = errors.New("llm: another configuration became the default")
-	// ErrInvalidName means the configuration name is empty.
-	ErrInvalidName = errors.New("llm: configuration name is required")
-	// ErrInvalidModel means the model name is empty.
-	ErrInvalidModel = errors.New("llm: model is required")
-	// ErrInvalidProtocol means the protocol is not one of the supported dialects.
-	ErrInvalidProtocol = errors.New("llm: protocol must be chat_completions or responses")
-	// ErrInvalidBaseURL means base_url is not an absolute http or https URL.
-	ErrInvalidBaseURL = errors.New("llm: base_url must be an http or https URL")
-	// ErrInvalidRetryCount means retry_count is outside 0-5.
-	ErrInvalidRetryCount = errors.New("llm: retry_count must be between 0 and 5")
-	// ErrInvalidRetryInterval means retry_interval_ms is outside 100-30000.
-	ErrInvalidRetryInterval = errors.New("llm: retry_interval_ms must be between 100 and 30000")
-	// ErrInvalidTimeout means timeout_ms is outside 1000-300000.
-	ErrInvalidTimeout = errors.New("llm: timeout_ms must be between 1000 and 300000")
-	// ErrReservedHeader means a custom header would override a transport header
-	// that the client sets itself.
-	ErrReservedHeader = errors.New("llm: headers must not override Authorization or Content-Type")
-	// ErrInvalidHeaderName means a custom header has an empty name.
-	ErrInvalidHeaderName = errors.New("llm: header names must not be empty")
-	// ErrSecretsUnavailable means the stored API key or headers cannot be
-	// decrypted, for example because their key version is not configured.
-	// The HTTP layer maps it to storage_corrupted.
-	ErrSecretsUnavailable = errors.New("llm: stored credentials cannot be decrypted")
-)
-
-// ValidateName enforces a non-blank configuration name.
-func ValidateName(name string) error {
-	if strings.TrimSpace(name) == "" {
-		return ErrInvalidName
+// Validate checks the invariants shared by create and update. The caller is
+// expected to have applied defaults and trimmed the user-provided fields.
+func (c Config) Validate() error {
+	if err := validation.String("name", c.Name, 1, MaxNameLength); err != nil {
+		return err
+	}
+	if err := validation.String("provider", c.Provider, 1, MaxProviderLength); err != nil {
+		return err
+	}
+	if !ValidProtocol(c.Protocol) {
+		return platform.Invalid("protocol", "must be one of openai, openai_compatible")
+	}
+	if err := validation.URL("base_url", c.BaseURL); err != nil {
+		return err
+	}
+	if len(c.BaseURL) > MaxBaseURLLength {
+		return platform.Invalid("base_url", "must be at most "+strconv.Itoa(MaxBaseURLLength)+" characters")
+	}
+	if len(c.APIKey) > MaxAPIKeyLength {
+		return platform.Invalid("api_key", "must be at most "+strconv.Itoa(MaxAPIKeyLength)+" characters")
+	}
+	if err := ValidateHeaders(c.Headers); err != nil {
+		return err
+	}
+	if c.TimeoutSeconds < MinTimeoutSeconds || c.TimeoutSeconds > MaxTimeoutSeconds {
+		return platform.Invalid("timeout_seconds", "must be between "+strconv.Itoa(MinTimeoutSeconds)+" and "+strconv.Itoa(MaxTimeoutSeconds))
+	}
+	if c.MaxRetries < MinMaxRetries || c.MaxRetries > MaxMaxRetries {
+		return platform.Invalid("max_retries", "must be between "+strconv.Itoa(MinMaxRetries)+" and "+strconv.Itoa(MaxMaxRetries))
+	}
+	if !ValidStatus(c.Status) {
+		return platform.Invalid("status", "must be one of active, disabled")
 	}
 	return nil
 }
 
-// ValidateModel enforces a non-blank model name.
-func ValidateModel(model string) error {
-	if strings.TrimSpace(model) == "" {
-		return ErrInvalidModel
-	}
-	return nil
-}
-
-// ValidateProtocol enforces the protocol enum.
-func ValidateProtocol(protocol Protocol) error {
-	if !protocol.Valid() {
-		return ErrInvalidProtocol
-	}
-	return nil
-}
-
-// ValidateBaseURL enforces an absolute http or https URL with a host.
-func ValidateBaseURL(raw string) error {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return ErrInvalidBaseURL
-	}
-	parsed, err := url.Parse(trimmed)
-	if err != nil {
-		return ErrInvalidBaseURL
-	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if (scheme != "http" && scheme != "https") || parsed.Host == "" {
-		return ErrInvalidBaseURL
-	}
-	return nil
-}
-
-// ValidateRetryCount enforces the documented retry-count range.
-func ValidateRetryCount(count int) error {
-	if count < MinRetryCount || count > MaxRetryCount {
-		return ErrInvalidRetryCount
-	}
-	return nil
-}
-
-// ValidateRetryIntervalMS enforces the documented retry-interval range.
-func ValidateRetryIntervalMS(intervalMS int) error {
-	if intervalMS < MinRetryIntervalMS || intervalMS > MaxRetryIntervalMS {
-		return ErrInvalidRetryInterval
-	}
-	return nil
-}
-
-// ValidateTimeoutMS enforces the documented timeout range.
-func ValidateTimeoutMS(timeoutMS int) error {
-	if timeoutMS < MinTimeoutMS || timeoutMS > MaxTimeoutMS {
-		return ErrInvalidTimeout
-	}
-	return nil
-}
-
-// ValidateHeaders rejects empty names and the transport headers the client
-// sets itself. The comparison is case-insensitive because HTTP header names are.
+// ValidateHeaders rejects blank header names and reserved authentication
+// headers, which would otherwise override the configured API key.
 func ValidateHeaders(headers map[string]string) error {
-	for name := range headers {
-		if strings.TrimSpace(name) == "" {
-			return ErrInvalidHeaderName
+	if len(headers) > MaxHeaders {
+		return platform.Invalid("headers", "must contain at most "+strconv.Itoa(MaxHeaders)+" items")
+	}
+	for name, value := range headers {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			return platform.Invalid("headers", "header names must not be empty")
 		}
-		switch strings.ToLower(strings.TrimSpace(name)) {
-		case "authorization", "content-type":
-			return ErrReservedHeader
+		if len(trimmed) > MaxHeaderNameLen {
+			return platform.Invalid("headers", "header name is too long")
+		}
+		if len(value) > MaxHeaderValueLen {
+			return platform.Invalid("headers", "header value is too long")
+		}
+		if strings.EqualFold(trimmed, "authorization") {
+			return platform.Invalid("headers", "Authorization is managed by api_key and must not be set")
 		}
 	}
 	return nil
 }
 
-// Validate checks every field of a create request.
-func (p CreateParams) Validate() error {
-	if err := ValidateName(p.Name); err != nil {
-		return err
+// NormalizeHeaders returns a copy with trimmed names and a non-nil map.
+func NormalizeHeaders(headers map[string]string) map[string]string {
+	normalized := make(map[string]string, len(headers))
+	for name, value := range headers {
+		normalized[strings.TrimSpace(name)] = strings.TrimSpace(value)
 	}
-	if err := ValidateProtocol(p.Protocol); err != nil {
-		return err
-	}
-	if err := ValidateBaseURL(p.BaseURL); err != nil {
-		return err
-	}
-	if err := ValidateModel(p.Model); err != nil {
-		return err
-	}
-	if err := ValidateRetryCount(p.RetryCount); err != nil {
-		return err
-	}
-	if err := ValidateRetryIntervalMS(p.RetryIntervalMS); err != nil {
-		return err
-	}
-	if err := ValidateTimeoutMS(p.TimeoutMS); err != nil {
-		return err
-	}
-	return ValidateHeaders(p.Headers)
+	return normalized
 }
 
-// Validate checks the fields an update request explicitly sets.
-func (p UpdateParams) Validate() error {
-	if p.Name != nil {
-		if err := ValidateName(*p.Name); err != nil {
-			return err
-		}
-	}
-	if p.Protocol != nil {
-		if err := ValidateProtocol(*p.Protocol); err != nil {
-			return err
-		}
-	}
-	if p.BaseURL != nil {
-		if err := ValidateBaseURL(*p.BaseURL); err != nil {
-			return err
-		}
-	}
-	if p.Model != nil {
-		if err := ValidateModel(*p.Model); err != nil {
-			return err
-		}
-	}
-	if p.RetryCount != nil {
-		if err := ValidateRetryCount(*p.RetryCount); err != nil {
-			return err
-		}
-	}
-	if p.RetryIntervalMS != nil {
-		if err := ValidateRetryIntervalMS(*p.RetryIntervalMS); err != nil {
-			return err
-		}
-	}
-	if p.TimeoutMS != nil {
-		if err := ValidateTimeoutMS(*p.TimeoutMS); err != nil {
-			return err
-		}
-	}
-	if p.Headers != nil {
-		if err := ValidateHeaders(*p.Headers); err != nil {
-			return err
-		}
-	}
-	return nil
+// ValidProtocol reports whether protocol is one of the frozen P0 values.
+func ValidProtocol(protocol string) bool {
+	return protocol == ProtocolOpenAI || protocol == ProtocolOpenAICompatible
+}
+
+// ValidStatus reports whether status is one of the frozen P0 values.
+func ValidStatus(status string) bool {
+	return status == StatusActive || status == StatusDisabled
 }

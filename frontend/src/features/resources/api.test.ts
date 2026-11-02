@@ -1,528 +1,498 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-
-import { ApiError } from "@/lib/api-client"
-
 import {
-  cancelTakeover,
-  completeTakeover,
-  confirmSession,
-  createAccess,
   createAccount,
-  createAppModel,
+  createApi,
+  createDatabase,
   createEnvironment,
-  createSystem,
-  deleteAccess,
+  createPage,
+  createRepository,
+  createSut,
+  createSutWithDefaultEnvironment,
+  DefaultEnvironmentError,
   deleteAccount,
-  deleteAppModel,
-  deleteDbTarget,
+  deleteApi,
   deleteEnvironment,
-  deleteSystem,
-  describeDBTargetError,
-  getDbTarget,
-  getSession,
-  importAppModels,
-  importSession,
-  invalidateSession,
-  listAccesses,
-  listAccounts,
-  listAppModels,
-  listEnvironments,
-  listSessions,
-  listSnapshots,
-  listSystems,
-  requestTakeover,
-  revokeSession,
-  testDbTarget,
-  updateAccess,
+  deletePage,
+  deleteRepository,
+  deleteSut,
+  getSut,
+  importApis,
+  importPages,
+  listRepositories,
+  listSuts,
   updateAccount,
-  updateAppModel,
+  updateApi,
+  updateDatabase,
   updateEnvironment,
-  updateSystem,
-  upsertDbTarget,
-  validateSession,
+  updatePage,
+  updateRepository,
+  updateSut,
 } from "./api"
+import {
+  accountFixture,
+  apiFixture,
+  databaseFixture,
+  environmentFixture,
+  pageFixture,
+  repositoryFixture,
+  sutFixture,
+  sutListItemFixture,
+} from "./test-fixtures"
 import type {
-  AccessDTO,
-  AccountDTO,
-  AppModelNodeDTO,
-  DBTargetDTO,
-  DBTargetTestResultDTO,
-  EnvironmentDTO,
-  SessionDTO,
-  SnapshotDTO,
-  SystemDTO,
+  AccountFormValues,
+  ApiFormValues,
+  DatabaseFormValues,
+  EnvironmentFormValues,
+  PageFormValues,
+  RepositoryFormValues,
 } from "./types"
 
-const fetchMock = vi.fn()
-
-const SYSTEM: SystemDTO = {
-  id: 1,
-  key: "shop",
-  name: "Shop",
-  kind: "web",
-  baseUrl: "http://localhost:13335",
-  defaultSessionTtlSeconds: 3600,
-  notes: "",
-  status: "active",
-  createdAt: "2026-10-27T00:00:00Z",
-  updatedAt: "2026-10-27T00:00:00Z",
-}
-
-const ENVIRONMENT: EnvironmentDTO = {
-  id: 2,
-  systemId: 1,
-  key: "staging",
-  name: "Staging",
-  baseUrl: "http://localhost:13335",
-  kind: "staging",
-  isProd: false,
-  allowedHosts: [],
-  loginCheck: null,
-  allowAutoLogin: false,
-  requireApproval: false,
-}
-
-const NODE: AppModelNodeDTO = {
-  id: 5,
-  systemId: 1,
-  parentId: null,
-  kind: "route",
-  key: "route:/orders",
-  name: "Orders",
-  path: "/orders",
-  method: "",
-  source: "manual",
-  meta: {},
-}
-
-const ACCOUNT: AccountDTO = {
-  id: 3,
-  key: "qa01",
-  label: "QA 01",
-  username: "qa01",
-  kind: "human",
-  status: "active",
-  notes: "",
-}
-
-const ACCESS: AccessDTO = {
-  id: 4,
-  accountId: 3,
-  systemId: 1,
-  authType: "manual",
-  credentialSet: false,
-  usernameOverride: "",
-  loginUrl: "",
-  enabled: true,
-  concurrencyLimit: 1,
-  sessionTtlSeconds: null,
-  permissionNote: "",
-}
-
-const SESSION: SessionDTO = {
-  id: 7,
-  accountId: 3,
-  systemId: 1,
-  environmentId: 2,
-  accessId: 4,
-  state: "valid",
-  acquisition: "import",
-  storageStateKind: "storage_state",
-  cookieCount: 2,
-  originCount: 1,
-  storageStateHash: "hash",
-  expiresAt: null,
-  lastValidatedAt: null,
-  lastUsedAt: null,
-  failureReason: "",
-  invalidatedReason: "",
-  expiring: false,
-}
-
-/** DB target ids stay decimal strings (D29); the password never appears. */
-const DB_TARGET: DBTargetDTO = {
-  id: "1844674407370955162",
-  environmentId: "2",
-  name: "orders",
-  host: "127.0.0.1",
-  port: 5432,
-  database: "eztest_target",
-  username: "eztest_ro",
-  credentialSet: true,
-  sslmode: "disable",
-  connectTimeoutMs: 3000,
-  statementTimeoutMs: 5000,
-  maxRows: 100,
-  enabled: true,
-  lastTestedAt: null,
-  lastTestStatus: "",
-  lastTestMessage: "",
-  createdAt: "2026-10-28T00:00:00Z",
-  updatedAt: "2026-10-28T00:00:00Z",
-}
-
-const DB_TARGET_TEST_OK: DBTargetTestResultDTO = {
-  ok: true,
-  latencyMs: 12,
-  serverVersion: "PostgreSQL 16.4",
-  currentUser: "eztest_ro",
-  transactionReadOnly: true,
-  warnings: ["role_has_write_privileges"],
-}
-
-const SNAPSHOT: SnapshotDTO = {
-  id: 8,
-  sessionId: 7,
-  kind: "import",
-  items: [],
-  summary: {},
-  permissionHash: "",
-  degraded: false,
-  capturedAt: "2026-10-27T00:00:00Z",
-}
-
-/** Builds a JSON Response the way the real API envelope is shaped. */
-function jsonResponse(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "Content-Type": "application/json" },
   })
 }
 
-/** Returns the URL and init of the most recent fetch call. */
-function lastRequest(): { url: string; init: RequestInit } {
-  const [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
-  return { url: String(url), init }
+function errorResponse(status: number, code: string, message: string): Response {
+  return new Response(
+    JSON.stringify({
+      error: { code, message, request_id: "req_resources", retryable: false, details: {} },
+    }),
+    { status, headers: { "Content-Type": "application/json" } },
+  )
 }
 
-describe("resources api", () => {
+function readBody(init: RequestInit | undefined): unknown {
+  if (typeof init?.body !== "string") return undefined
+  return JSON.parse(init.body) as unknown
+}
+
+const fetchMock = vi.fn<typeof fetch>()
+
+const pageValues: PageFormValues = {
+  name: "订单列表",
+  url: "https://order.test/orders",
+  routeTemplate: "/orders",
+  pageType: "page",
+  authRole: "",
+  module: "订单",
+}
+
+const apiValues: ApiFormValues = {
+  name: "查询订单",
+  method: "GET",
+  pathTemplate: "/api/orders",
+  authRole: "",
+  schemaRef: "",
+}
+
+const databaseValues: DatabaseFormValues = {
+  environmentId: "1101",
+  name: "order_db",
+  dsn: "postgres://order-db:5432/order",
+  username: "order",
+  password: "secret",
+  readOnly: true,
+}
+
+const accountValues: AccountFormValues = {
+  environmentId: "1101",
+  username: "buyer",
+  password: "secret",
+  roles: "buyer, order_admin",
+  notes: "",
+}
+
+const repositoryValues: RepositoryFormValues = {
+  name: "order-center-web",
+  path: "D:/code/order-center-web",
+  branch: "main",
+  include: "src/**, tests/**",
+  exclude: "node_modules/**",
+}
+
+const environmentValues: EnvironmentFormValues = {
+  name: "测试环境",
+  baseUrl: "https://order.test",
+  isDefault: true,
+  status: "active",
+}
+
+describe("resources API", () => {
   beforeEach(() => {
+    window.sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
+    vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", "")
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
   })
 
-  it("calls the system and environment endpoints from spec §7.2", async () => {
+  it("lists SUTs through the cursor pagination envelope", async () => {
     fetchMock.mockResolvedValue(
-      jsonResponse({ data: [SYSTEM], next_cursor: "next-page", has_more: true }),
-    )
-    const page = await listSystems({ limit: 20, cursor: "abc", status: "active" })
-    expect(page.items).toEqual([SYSTEM])
-    expect(
-      lastRequest().url.endsWith("/api/resources/systems?limit=20&cursor=abc&status=active"),
-    ).toBe(true)
-    expect(lastRequest().init.method).toBe("GET")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: SYSTEM }, 201))
-    await expect(createSystem({ key: "shop", name: "Shop" })).resolves.toEqual(SYSTEM)
-    expect(lastRequest().url.endsWith("/api/resources/systems")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({ key: "shop", name: "Shop" })
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: { ...SYSTEM, name: "Shop 2" } }))
-    await expect(updateSystem(1, { name: "Shop 2" })).resolves.toMatchObject({ name: "Shop 2" })
-    expect(lastRequest().url.endsWith("/api/resources/systems/1")).toBe(true)
-    expect(lastRequest().init.method).toBe("PATCH")
-
-    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
-    await expect(deleteSystem(1)).resolves.toBeUndefined()
-    expect(lastRequest().url.endsWith("/api/resources/systems/1")).toBe(true)
-    expect(lastRequest().init.method).toBe("DELETE")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: [ENVIRONMENT] }))
-    await expect(listEnvironments(1)).resolves.toEqual([ENVIRONMENT])
-    expect(lastRequest().url.endsWith("/api/resources/systems/1/environments")).toBe(true)
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: ENVIRONMENT }, 201))
-    await expect(createEnvironment(1, { key: "staging" })).resolves.toEqual(ENVIRONMENT)
-    expect(lastRequest().url.endsWith("/api/resources/systems/1/environments")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: ENVIRONMENT }))
-    await expect(updateEnvironment(2, { name: "Staging" })).resolves.toEqual(ENVIRONMENT)
-    expect(lastRequest().url.endsWith("/api/resources/environments/2")).toBe(true)
-    expect(lastRequest().init.method).toBe("PATCH")
-
-    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
-    await expect(deleteEnvironment(2)).resolves.toBeUndefined()
-    expect(lastRequest().url.endsWith("/api/resources/environments/2")).toBe(true)
-    expect(lastRequest().init.method).toBe("DELETE")
-  })
-
-  it("maps cursor page metadata when the API payload nests its items", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({ data: { items: [SYSTEM], next_cursor: "c1", has_more: true } }),
+      jsonResponse({ data: [sutListItemFixture], next_cursor: null, has_more: false }),
     )
 
-    await expect(listSystems()).resolves.toEqual({
-      items: [SYSTEM],
-      nextCursor: "c1",
-      hasMore: true,
-    })
-    expect(lastRequest().url.endsWith("/api/resources/systems")).toBe(true)
+    await expect(listSuts()).resolves.toEqual([sutListItemFixture])
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/resources/suts?limit=100")
+    expect(init?.method).toBe("GET")
   })
 
-  it("calls the app model endpoints from spec §7.3", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ data: [NODE] }))
-    await expect(listAppModels(1, { kind: "route", limit: 100 })).resolves.toEqual({
-      items: [NODE],
-      nextCursor: null,
-      hasMore: false,
+  it("reads a SUT aggregate by its path id", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: sutFixture }))
+
+    await expect(getSut("1001")).resolves.toEqual(sutFixture)
+
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/resources/suts/1001")
+  })
+
+  it("creates and updates a SUT with the contract body", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+
+    await createSut({ name: "订单中心", intro: "订单主链路" })
+    await updateSut("1001", { name: "订单中心 v2", intro: "新简介" })
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0]
+    expect(createUrl).toBe("http://localhost:13333/api/resources/suts")
+    expect(createInit?.method).toBe("POST")
+    expect(readBody(createInit)).toEqual({ name: "订单中心", intro: "订单主链路" })
+
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1]
+    expect(updateUrl).toBe("http://localhost:13333/api/resources/suts/1001")
+    expect(updateInit?.method).toBe("PATCH")
+    expect(readBody(updateInit)).toEqual({ name: "订单中心 v2", intro: "新简介" })
+  })
+
+  it("includes the optional SUT family in create and update bodies", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+
+    await createSut({ name: "订单中心", intro: "订单主链路", family: "payments" })
+    await updateSut("1001", { name: "订单中心", intro: "订单主链路", family: "order-center" })
+
+    expect(readBody(fetchMock.mock.calls[0][1])).toEqual({
+      name: "订单中心",
+      intro: "订单主链路",
+      family: "payments",
     })
-    expect(
-      lastRequest().url.endsWith("/api/resources/systems/1/app-models?kind=route&limit=100"),
-    ).toBe(true)
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({
+      name: "订单中心",
+      intro: "订单主链路",
+      family: "order-center",
+    })
+  })
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: NODE }, 201))
-    await expect(createAppModel(1, { key: "route:/orders", kind: "route" })).resolves.toEqual(NODE)
-    expect(lastRequest().url.endsWith("/api/resources/systems/1/app-models")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: { created: 2, updated: 1 } }))
-    await expect(importAppModels(1, [NODE])).resolves.toEqual({ created: 2, updated: 1 })
-    expect(lastRequest().url.endsWith("/api/resources/systems/1/app-models/import")).toBe(true)
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({ nodes: [NODE] })
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: NODE }))
-    await expect(updateAppModel(5, { name: "Orders" })).resolves.toEqual(NODE)
-    expect(lastRequest().url.endsWith("/api/resources/app-models/5")).toBe(true)
-    expect(lastRequest().init.method).toBe("PATCH")
-
+  it("deletes a SUT with DELETE", async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
-    await expect(deleteAppModel(5)).resolves.toBeUndefined()
-    expect(lastRequest().url.endsWith("/api/resources/app-models/5")).toBe(true)
-    expect(lastRequest().init.method).toBe("DELETE")
+
+    await deleteSut("1001")
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/resources/suts/1001")
+    expect(init?.method).toBe("DELETE")
   })
 
-  it("calls the account and access endpoints from spec §7.4", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({ data: [ACCOUNT], next_cursor: null, has_more: false }),
-    )
-    await expect(listAccounts({ limit: 20, status: "active" })).resolves.toMatchObject({
-      items: [ACCOUNT],
-    })
-    expect(lastRequest().url.endsWith("/api/resources/accounts?limit=20&status=active")).toBe(true)
+  it("creates the SUT and then its default environment in one flow", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: environmentFixture }, 201))
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: ACCOUNT }, 201))
-    await expect(createAccount({ key: "qa01" })).resolves.toEqual(ACCOUNT)
-    expect(lastRequest().url.endsWith("/api/resources/accounts")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: ACCOUNT }))
-    await expect(updateAccount(3, { label: "QA 01" })).resolves.toEqual(ACCOUNT)
-    expect(lastRequest().url.endsWith("/api/resources/accounts/3")).toBe(true)
-    expect(lastRequest().init.method).toBe("PATCH")
-
-    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
-    await expect(deleteAccount(3)).resolves.toBeUndefined()
-    expect(lastRequest().url.endsWith("/api/resources/accounts/3")).toBe(true)
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: [ACCESS] }))
-    await expect(listAccesses(3, { limit: 100 })).resolves.toEqual([ACCESS])
-    expect(lastRequest().url.endsWith("/api/resources/accounts/3/accesses?limit=100")).toBe(true)
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: ACCESS }, 201))
-    await expect(createAccess(3, { systemId: 1, authType: "manual" })).resolves.toEqual(ACCESS)
-    expect(lastRequest().url.endsWith("/api/resources/accounts/3/accesses")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: ACCESS }))
-    await expect(updateAccess(4, { credential: "secret" })).resolves.toEqual(ACCESS)
-    expect(lastRequest().url.endsWith("/api/resources/accesses/4")).toBe(true)
-    expect(lastRequest().init.method).toBe("PATCH")
-
-    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
-    await expect(deleteAccess(4)).resolves.toBeUndefined()
-    expect(lastRequest().url.endsWith("/api/resources/accesses/4")).toBe(true)
-  })
-
-  it("calls the session endpoints and actions from spec §7.5", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ data: [SESSION] }))
-    await expect(
-      listSessions({
-        accountId: 3,
-        systemId: 1,
-        environmentId: 2,
-        state: "valid",
-        limit: 20,
-        cursor: "next",
-      }),
-    ).resolves.toMatchObject({ items: [SESSION] })
-    expect(
-      lastRequest().url.endsWith(
-        "/api/resources/sessions?accountId=3&systemId=1&environmentId=2&state=valid&limit=20&cursor=next",
-      ),
-    ).toBe(true)
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: SESSION }))
-    await expect(getSession(7)).resolves.toEqual(SESSION)
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7")).toBe(true)
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: SESSION }, 201))
-    await expect(
-      importSession(4, { environmentId: 2, kind: "storage_state", storageState: { cookies: [] } }),
-    ).resolves.toEqual(SESSION)
-    expect(lastRequest().url.endsWith("/api/resources/accesses/4/sessions")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({
-      environmentId: 2,
-      kind: "storage_state",
-      storageState: { cookies: [] },
+    const result = await createSutWithDefaultEnvironment({
+      sut: { name: "订单中心", intro: "订单主链路" },
+      environment: { name: "测试环境", base_url: "https://order.test" },
     })
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: SESSION }))
-    await expect(validateSession(7)).resolves.toEqual(SESSION)
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7/validate")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
+    expect(result).toEqual({ sut: sutListItemFixture, environment: environmentFixture })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: SESSION }))
-    await expect(confirmSession(7, "人工确认")).resolves.toEqual(SESSION)
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7/confirm")).toBe(true)
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({ note: "人工确认" })
+    const [sutUrl, sutInit] = fetchMock.mock.calls[0]
+    expect(sutUrl).toBe("http://localhost:13333/api/resources/suts")
+    expect(readBody(sutInit)).toEqual({ name: "订单中心", intro: "订单主链路" })
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: SESSION }))
-    await expect(invalidateSession(7, "mfa")).resolves.toEqual(SESSION)
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7/invalidate")).toBe(true)
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({ reason: "mfa" })
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: SESSION }))
-    await expect(revokeSession(7, "compromised")).resolves.toEqual(SESSION)
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7/revoke")).toBe(true)
-
-    fetchMock.mockResolvedValue(
-      jsonResponse({ data: [SNAPSHOT], next_cursor: null, has_more: false }),
-    )
-    await expect(listSnapshots(7)).resolves.toMatchObject({ items: [SNAPSHOT] })
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7/snapshots")).toBe(true)
-  })
-
-  it("calls the takeover endpoints from spec §7.6", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({ data: { takeover: { id: 11, status: "waiting" }, session: SESSION } }),
-    )
-    await expect(requestTakeover(7, { reason: "mfa" })).resolves.toEqual({
-      takeover: { id: 11, status: "waiting" },
-      session: SESSION,
+    const [environmentUrl, environmentInit] = fetchMock.mock.calls[1]
+    expect(environmentUrl).toBe("http://localhost:13333/api/resources/suts/1001/environments")
+    expect(readBody(environmentInit)).toEqual({
+      name: "测试环境",
+      base_url: "https://order.test",
+      is_default: true,
+      status: "active",
     })
-    expect(lastRequest().url.endsWith("/api/resources/sessions/7/takeovers")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({ reason: "mfa" })
-
-    fetchMock.mockResolvedValue(
-      jsonResponse({ data: { takeover: { id: 11, status: "completed" }, session: SESSION } }),
-    )
-    await expect(
-      completeTakeover(11, { kind: "token", headers: { Authorization: "Bearer fixture" } }),
-    ).resolves.toMatchObject({ takeover: { id: 11, status: "completed" } })
-    expect(lastRequest().url.endsWith("/api/resources/takeovers/11/complete")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-
-    fetchMock.mockResolvedValue(jsonResponse({ data: { id: 11, status: "cancelled" } }))
-    await expect(cancelTakeover(11)).resolves.toEqual({ id: 11, status: "cancelled" })
-    expect(lastRequest().url.endsWith("/api/resources/takeovers/11/cancel")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
   })
 
-  it("calls the DB target endpoints from spec §7.8 with string ids", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET }))
-    const target = await getDbTarget(2)
-    expect(target).toEqual(DB_TARGET)
-    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target")).toBe(true)
-    expect(lastRequest().init.method).toBe("GET")
-    // The DTO keeps snowflake ids as decimal strings; this module never parses them.
-    expect(typeof target?.id).toBe("string")
-    expect(typeof target?.environmentId).toBe("string")
-    expect(target).not.toHaveProperty("password")
+  it("keeps the created SUT when the default environment fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
+      .mockResolvedValueOnce(errorResponse(409, "conflict", "environment name already exists"))
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: null }))
-    await expect(getDbTarget(3)).resolves.toBeNull()
+    const caught = await createSutWithDefaultEnvironment({
+      sut: { name: "订单中心", intro: "订单主链路" },
+      environment: { name: "测试环境", base_url: "https://order.test" },
+    }).catch((error: unknown) => error)
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET }))
-    await expect(
-      upsertDbTarget(2, {
-        host: "127.0.0.1",
-        port: 5432,
-        database: "eztest_target",
-        username: "eztest_ro",
-        password: "s3cret",
-        sslmode: "disable",
-        connectTimeoutMs: 3000,
-        statementTimeoutMs: 5000,
-        maxRows: 100,
-        enabled: true,
-      }),
-    ).resolves.toEqual(DB_TARGET)
-    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target")).toBe(true)
-    expect(lastRequest().init.method).toBe("PUT")
-    expect(JSON.parse(String(lastRequest().init.body))).toMatchObject({ password: "s3cret" })
+    expect(caught).toBeInstanceOf(DefaultEnvironmentError)
+    if (caught instanceof DefaultEnvironmentError) {
+      expect(caught.sut.id).toBe("1001")
+      expect(caught.message).toContain("默认环境创建失败")
+      expect(caught.message).toContain("environment name already exists")
+    }
+  })
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET_TEST_OK }))
-    await expect(
-      testDbTarget(2, {
-        host: "127.0.0.1",
-        port: 5432,
-        database: "eztest_target",
-        username: "eztest_ro",
-      }),
-    ).resolves.toEqual(DB_TARGET_TEST_OK)
-    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target/test")).toBe(true)
-    expect(lastRequest().init.method).toBe("POST")
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({
-      host: "127.0.0.1",
-      port: 5432,
-      database: "eztest_target",
-      username: "eztest_ro",
+  it("maps environment create/update/delete to the environment routes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: environmentFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: environmentFixture }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    await createEnvironment("1001", environmentValues)
+    await updateEnvironment("1101", { ...environmentValues, name: "预发环境" })
+    await deleteEnvironment("1101")
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0]
+    expect(createUrl).toBe("http://localhost:13333/api/resources/suts/1001/environments")
+    expect(readBody(createInit)).toEqual({
+      name: "测试环境",
+      base_url: "https://order.test",
+      is_default: true,
+      status: "active",
     })
 
-    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET_TEST_OK }))
-    await testDbTarget(2)
-    expect(JSON.parse(String(lastRequest().init.body ?? "{}"))).toEqual({})
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1]
+    expect(updateUrl).toBe("http://localhost:13333/api/resources/environments/1101")
+    expect(updateInit?.method).toBe("PATCH")
+    expect(readBody(updateInit)).toEqual({
+      name: "预发环境",
+      base_url: "https://order.test",
+      is_default: true,
+      status: "active",
+    })
 
-    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
-    await expect(deleteDbTarget(2)).resolves.toBeUndefined()
-    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target")).toBe(true)
-    expect(lastRequest().init.method).toBe("DELETE")
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[2]
+    expect(deleteUrl).toBe("http://localhost:13333/api/resources/environments/1101")
+    expect(deleteInit?.method).toBe("DELETE")
   })
 
-  it("describes DB target failures with the stable reason and field", () => {
-    expect(
-      describeDBTargetError(
-        new ApiError({ status: 403, code: "forbidden", message: "admin only" }),
-      ),
-    ).toContain("管理员")
-    expect(
-      describeDBTargetError(
-        new ApiError({
-          status: 422,
-          code: "invalid_argument",
-          message: "port must be between 1 and 65535",
-          details: { reason: "db_target_invalid", field: "port" },
-        }),
-      ),
-    ).toContain("port")
-    expect(
-      describeDBTargetError(
-        new ApiError({
-          status: 409,
-          code: "conflict",
-          message: "no target",
-          details: { reason: "db_target_missing" },
-        }),
-      ),
-    ).toContain("未配置")
-    expect(
-      describeDBTargetError(
-        new ApiError({
-          status: 0,
-          code: "network_error",
-          message: "offline",
-          retryable: true,
-        }),
-      ),
-    ).toContain("无法连接")
-    expect(describeDBTargetError(new Error("boom"))).toBe("boom")
+  it("maps page CRUD and import to the page routes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: pageFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: pageFixture }))
+      .mockResolvedValueOnce(
+        jsonResponse({ data: { created: 1, skipped: 0, items: [pageFixture] } }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    await createPage("1101", pageValues)
+    await updatePage("1301", { ...pageValues, name: "订单列表 v2" })
+    const imported = await importPages("1101", [pageValues])
+    await deletePage("1301")
+
+    expect(imported).toEqual({ created: 1, skipped: 0, items: [pageFixture] })
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0]
+    expect(createUrl).toBe("http://localhost:13333/api/resources/environments/1101/pages")
+    expect(readBody(createInit)).toEqual({
+      name: "订单列表",
+      url: "https://order.test/orders",
+      route_template: "/orders",
+      page_type: "page",
+      auth_role: "",
+      module: "订单",
+    })
+
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1]
+    expect(updateUrl).toBe("http://localhost:13333/api/resources/pages/1301")
+    expect(updateInit?.method).toBe("PATCH")
+
+    const [importUrl, importInit] = fetchMock.mock.calls[2]
+    expect(importUrl).toBe("http://localhost:13333/api/resources/environments/1101/pages/import")
+    expect(readBody(importInit)).toEqual({
+      items: [
+        {
+          name: "订单列表",
+          url: "https://order.test/orders",
+          route_template: "/orders",
+          page_type: "page",
+          auth_role: "",
+          module: "订单",
+        },
+      ],
+    })
+
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[3]
+    expect(deleteUrl).toBe("http://localhost:13333/api/resources/pages/1301")
+    expect(deleteInit?.method).toBe("DELETE")
+  })
+
+  it("maps API CRUD and import to the API routes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: apiFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: apiFixture }))
+      .mockResolvedValueOnce(
+        jsonResponse({ data: { created: 1, skipped: 0, items: [apiFixture] } }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    await createApi("1101", apiValues)
+    await updateApi("1401", { ...apiValues, name: "查询订单 v2" })
+    const imported = await importApis("1101", [apiValues])
+    await deleteApi("1401")
+
+    expect(imported).toEqual({ created: 1, skipped: 0, items: [apiFixture] })
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0]
+    expect(createUrl).toBe("http://localhost:13333/api/resources/environments/1101/apis")
+    expect(readBody(createInit)).toEqual({
+      method: "GET",
+      path_template: "/api/orders",
+      name: "查询订单",
+      auth_role: "",
+      schema_ref: "",
+    })
+
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1]
+    expect(updateUrl).toBe("http://localhost:13333/api/resources/apis/1401")
+    expect(updateInit?.method).toBe("PATCH")
+
+    const [importUrl, importInit] = fetchMock.mock.calls[2]
+    expect(importUrl).toBe("http://localhost:13333/api/resources/environments/1101/apis/import")
+    expect(readBody(importInit)).toEqual({
+      items: [
+        {
+          method: "GET",
+          path_template: "/api/orders",
+          name: "查询订单",
+          auth_role: "",
+          schema_ref: "",
+        },
+      ],
+    })
+
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[3]
+    expect(deleteUrl).toBe("http://localhost:13333/api/resources/apis/1401")
+    expect(deleteInit?.method).toBe("DELETE")
+  })
+
+  it("creates a target database under the SUT with environment_id", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: databaseFixture }, 201))
+
+    await createDatabase("1001", databaseValues)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/resources/suts/1001/databases")
+    expect(readBody(init)).toEqual({
+      environment_id: "1101",
+      name: "order_db",
+      dsn: "postgres://order-db:5432/order",
+      username: "order",
+      password: "secret",
+      read_only: true,
+    })
+  })
+
+  it("omits an unchanged database password and sends an empty string to clear it", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: databaseFixture }))
+      .mockResolvedValueOnce(jsonResponse({ data: databaseFixture }))
+
+    const { password: _password, ...unchanged } = databaseValues
+    await updateDatabase("1501", unchanged)
+    await updateDatabase("1501", { ...unchanged, password: "" })
+
+    const [keepUrl, keepInit] = fetchMock.mock.calls[0]
+    expect(keepUrl).toBe("http://localhost:13333/api/resources/databases/1501")
+    expect(readBody(keepInit)).toEqual({
+      name: "order_db",
+      dsn: "postgres://order-db:5432/order",
+      username: "order",
+      read_only: true,
+    })
+
+    const [clearUrl, clearInit] = fetchMock.mock.calls[1]
+    expect(clearUrl).toBe("http://localhost:13333/api/resources/databases/1501")
+    expect(readBody(clearInit)).toMatchObject({ password: "" })
+  })
+
+  it("creates and updates accounts with roles arrays and optional password clearing", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: accountFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: accountFixture }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    await createAccount("1001", accountValues)
+    await updateAccount("1601", {
+      username: "buyer",
+      roles: ["buyer"],
+      notes: "",
+      password: "",
+    })
+    await deleteAccount("1601")
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0]
+    expect(createUrl).toBe("http://localhost:13333/api/resources/suts/1001/accounts")
+    expect(readBody(createInit)).toEqual({
+      environment_id: "1101",
+      username: "buyer",
+      password: "secret",
+      roles: ["buyer", "order_admin"],
+      notes: "",
+    })
+
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1]
+    expect(updateUrl).toBe("http://localhost:13333/api/resources/accounts/1601")
+    expect(readBody(updateInit)).toEqual({
+      username: "buyer",
+      roles: ["buyer"],
+      notes: "",
+      password: "",
+    })
+
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[2]
+    expect(deleteUrl).toBe("http://localhost:13333/api/resources/accounts/1601")
+    expect(deleteInit?.method).toBe("DELETE")
+  })
+
+  it("lists, creates, updates and deletes code repositories", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ data: [repositoryFixture], next_cursor: null, has_more: false }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ data: repositoryFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: repositoryFixture }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    await expect(listRepositories()).resolves.toEqual([repositoryFixture])
+    await createRepository(repositoryValues)
+    await updateRepository("1201", repositoryValues)
+    await deleteRepository("1201")
+
+    const [listUrl] = fetchMock.mock.calls[0]
+    expect(listUrl).toBe("http://localhost:13333/api/resources/code-repos?limit=100")
+
+    const [createUrl, createInit] = fetchMock.mock.calls[1]
+    expect(createUrl).toBe("http://localhost:13333/api/resources/code-repos")
+    expect(readBody(createInit)).toEqual({
+      name: "order-center-web",
+      path: "D:/code/order-center-web",
+      branch: "main",
+      include: ["src/**", "tests/**"],
+      exclude: ["node_modules/**"],
+    })
+
+    const [updateUrl, updateInit] = fetchMock.mock.calls[2]
+    expect(updateUrl).toBe("http://localhost:13333/api/resources/code-repos/1201")
+    expect(updateInit?.method).toBe("PATCH")
+
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[3]
+    expect(deleteUrl).toBe("http://localhost:13333/api/resources/code-repos/1201")
+    expect(deleteInit?.method).toBe("DELETE")
   })
 })

@@ -1,1380 +1,1107 @@
-package application
+package codeintelapp
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
-// Impact-service bounds and stable values. The defaults follow design spec
-// §4.2/§6.6 (the impact prompt must stay bounded: R15) and configuration may
-// only lower the hard caps.
-const (
-	// defaultImpactMaxRequirements mirrors domain.MaxRequirementsInPrompt
-	// (design spec §6.6: the AI requirement list is capped at 100).
-	defaultImpactMaxRequirements = domain.MaxRequirementsInPrompt
-	// defaultImpactMaxFacts is R15's fact-count budget for one impact prompt.
-	defaultImpactMaxFacts = 200
-	// defaultImpactMaxPromptBytes is R15's total prompt byte budget (64 KiB).
-	defaultImpactMaxPromptBytes = 64 << 10
-	// minImpactMaxPromptBytes keeps a configured prompt budget usable.
-	minImpactMaxPromptBytes = 4 << 10
-	// maxImpactMaxPromptBytes is R15's documented hard upper bound (64 KiB);
-	// configuration may only lower it.
-	maxImpactMaxPromptBytes = defaultImpactMaxPromptBytes
-
-	// maxImpactCandidateEvidence is §6.6 step 4's merged evidence cap.
-	maxImpactCandidateEvidence = 5
-	// impactReasonSeparator joins the reasons of one merged candidate.
-	impactReasonSeparator = "；"
-	// impactPromptSchemaMarker is the trailing section BuildImpactPrompt emits;
-	// truncation markers are inserted in front of it.
-	impactPromptSchemaMarker = "\n\n输出 JSON schema：\n"
-	// impactSummaryTruncatedMarker marks the truncated changeSummary section of
-	// the impact prompt (R15).
-	impactSummaryTruncatedMarker = "\n……（变更摘要已截断）"
-)
-
-// Impact-result unmapped suggestions (the deleted-file suggestion is verbatim
-// from design spec §6.6 step 7).
-const (
-	impactSuggestionDeleted     = "人工确认删除影响"
-	impactSuggestionUnsupported = "人工确认内容是否可分析"
-	impactSuggestionNoFact      = "人工确认是否影响需求"
-	impactSuggestionAI          = "AI 不可用，请人工确认"
-	impactSuggestionContract    = "人工确认跨栈契约"
-)
-
-// AnchorRepository and EdgeRepository alias the domain repository ports so the
-// shared ImpactServiceDeps/AnchorServiceDeps field types read exactly like the
-// task interfaces while the implementations stay in codeintel/domain.
-type (
-	AnchorRepository = domain.AnchorRepository
-	EdgeRepository   = domain.EdgeRepository
-)
-
-// ImpactServiceDeps are the ports of the impact-analysis planner. AppModels and
-// Versions are owned by this service (the analysis service has no app model
-// catalog, R27); Repos resolves the checkout path used to verify the AI
-// candidate evidence against commit content (R14). A nil optional port degrades
-// gracefully: the deterministic candidates are still produced.
-type ImpactServiceDeps struct {
-	LLM       LLMCompleter
-	Versions  VersionCatalog
-	AppModels AppModelCatalog
-	Anchors   AnchorRepository
-	Edges     EdgeRepository
-	Git       GitReader
-	Repos     RepoCatalog
-	IDs       IDGenerator
-
-	MaxRequirements int
-	MaxFacts        int
-	MaxPromptBytes  int
+// CandidateRepository persists code_impact_candidate rows. ReplaceForAnalysis
+// atomically replaces the candidate set of one analysis; UpdateSelection
+// applies one explicit selection and records the actor/time.
+type CandidateRepository interface {
+	ReplaceForAnalysis(ctx context.Context, analysisID int64, candidates []codeintel.ImpactCandidate) error
+	ListByAnalysis(ctx context.Context, analysisID int64) ([]codeintel.ImpactCandidate, error)
+	UpdateSelection(ctx context.Context, analysisID, candidateID, actorID int64, selected bool) (codeintel.ImpactCandidate, error)
 }
 
-// ImpactService implements the deterministic + AI impact pipeline of design
-// spec §6.6 as the T10 ImpactPlanner. It never writes storage: the analysis
-// service persists the returned candidates, unmapped entries and stats.
+// ImpactEdge is the edge projection needed by one-hop contract propagation. It
+// carries the fact keys of both endpoints so the service never needs entity IDs.
+type ImpactEdge struct {
+	SrcFactKey string
+	DstFactKey string
+	Rel        codeintel.EdgeRel
+	Confidence codeintel.Confidence
+}
+
+// ImpactEdgeReader reads the materialized code_edge rows of one commit.
+type ImpactEdgeReader interface {
+	ImpactEdges(ctx context.Context, repoID int64, commitSHA string) ([]ImpactEdge, error)
+}
+
+// CaseSourceRef is one design case_source of kind=code (read-only compatibility,
+// spec §6.1): a case version pointing at a repository path.
+type CaseSourceRef struct {
+	CaseVersionID int64
+	RepoID        int64
+	Path          string
+}
+
+// CaseSourceReader reads the design case sources of a version. The design
+// context implements it; P2 tables are never written.
+type CaseSourceReader interface {
+	CaseSources(ctx context.Context, versionID int64) ([]CaseSourceRef, error)
+}
+
+// ImpactCandidateView tags one candidate with its analysis repo and the version
+// SUTs bound to that repo (multi-repo union, spec §5.4).
+type ImpactCandidateView struct {
+	codeintel.ImpactCandidate
+	RepoID        int64
+	VersionSUTIDs []int64
+}
+
+// ImpactDeps is the impact-analysis wiring. Edges, CaseSources, Reviews and
+// Subjects are optional: without them contract/case-source/review rules are
+// skipped, which keeps the deterministic anchor/fact rules available.
+type ImpactDeps struct {
+	Analyses    AnalysisRepository
+	Candidates  CandidateRepository
+	Facts       FactRepository
+	Entities    EntityRepository
+	Anchors     AnchorRepository
+	Reviews     ReviewRepository
+	Edges       ImpactEdgeReader
+	CaseSources CaseSourceReader
+	Design      DesignReader
+	Resources   ResourceReader
+	Versions    VersionReader
+	Extractor   FactExtractor
+	Bulk        FileWindowReader
+	Subjects    AnchorSubjectReader
+	Events      EventPublisher
+	Audit       AuditRecorder
+	Settings    SettingsReader
+	Clock       Clock
+	IDs         IDGenerator
+}
+
+// ImpactService computes and maintains the impact candidates of one analysis
+// (spec §5.4): deterministic direct/contract/relation/case candidates plus one
+// AI inference call. The deterministic result survives an AI failure (degraded).
 type ImpactService struct {
-	deps   ImpactServiceDeps
-	config impactConfig
+	analyses    AnalysisRepository
+	candidates  CandidateRepository
+	facts       FactRepository
+	entities    EntityRepository
+	anchors     AnchorRepository
+	reviews     ReviewRepository
+	edges       ImpactEdgeReader
+	caseSources CaseSourceReader
+	design      DesignReader
+	resources   ResourceReader
+	versions    VersionReader
+	extractor   FactExtractor
+	bulk        FileWindowReader
+	subjects    AnchorSubjectReader
+	events      EventPublisher
+	audit       AuditRecorder
+	settings    SettingsReader
+	clock       Clock
+	ids         IDGenerator
 }
 
-// impactConfig is the normalised prompt/reasoning budget of one planning call.
-type impactConfig struct {
-	maxRequirements int
-	maxFacts        int
-	maxPromptBytes  int
+// NewImpactService wires the impact service with test-friendly defaults.
+func NewImpactService(deps ImpactDeps) *ImpactService {
+	return &ImpactService{
+		analyses:    deps.Analyses,
+		candidates:  deps.Candidates,
+		facts:       deps.Facts,
+		entities:    deps.Entities,
+		anchors:     deps.Anchors,
+		reviews:     deps.Reviews,
+		edges:       deps.Edges,
+		caseSources: deps.CaseSources,
+		design:      deps.Design,
+		resources:   deps.Resources,
+		versions:    deps.Versions,
+		extractor:   deps.Extractor,
+		bulk:        deps.Bulk,
+		subjects:    deps.Subjects,
+		events:      deps.Events,
+		audit:       deps.Audit,
+		settings:    deps.Settings,
+		clock:       clockOrSystem(deps.Clock),
+		ids:         idsOrFallback(deps.IDs),
+	}
 }
 
-// NewImpactService wires the impact planner and normalises its bounds.
-func NewImpactService(deps ImpactServiceDeps) *ImpactService {
-	return &ImpactService{deps: deps, config: normalizeImpactConfig(deps)}
-}
-
-// normalizeImpactConfig applies the documented defaults and hard caps.
-func normalizeImpactConfig(deps ImpactServiceDeps) impactConfig {
-	cfg := impactConfig{
-		maxRequirements: deps.MaxRequirements,
-		maxFacts:        deps.MaxFacts,
-		maxPromptBytes:  deps.MaxPromptBytes,
-	}
-	if cfg.maxRequirements <= 0 {
-		cfg.maxRequirements = defaultImpactMaxRequirements
-	}
-	if cfg.maxRequirements > domain.MaxRequirementsInPrompt {
-		cfg.maxRequirements = domain.MaxRequirementsInPrompt
-	}
-	if cfg.maxFacts <= 0 {
-		cfg.maxFacts = defaultImpactMaxFacts
-	}
-	if cfg.maxFacts > defaultImpactMaxFacts {
-		cfg.maxFacts = defaultImpactMaxFacts
-	}
-	if cfg.maxPromptBytes <= 0 {
-		cfg.maxPromptBytes = defaultImpactMaxPromptBytes
-	}
-	if cfg.maxPromptBytes < minImpactMaxPromptBytes {
-		cfg.maxPromptBytes = minImpactMaxPromptBytes
-	}
-	if cfg.maxPromptBytes > maxImpactMaxPromptBytes {
-		cfg.maxPromptBytes = maxImpactMaxPromptBytes
-	}
-	return cfg
-}
-
-// impactPlanState is the immutable planning input of one Plan call plus the
-// derived deterministic views and mutable counters.
-type impactPlanState struct {
-	in ImpactInput
-
-	changed      map[string]domain.ChangedFile
-	changedPaths []string
-
-	anchors       []domain.CodeAnchor
-	appModels     []AppModelNode
-	edges         []domain.CodeEdge
-	facts         []domain.CodeEntity
-	coverageFacts []domain.CodeEntity
-	changedFacts  []domain.CodeEntity
-	requirements  []RequirementInfo
-	relations     []RelationInfo
-
-	stats impactStats
-
-	aiUnavailable          bool
-	unmatchedContractPaths []string
-	localPathResolved      bool
-	localPath              string
-	fileContent            map[string]impactCommitFile
-}
-
-// impactCommitFile is one commit-pinned file read used to validate AI evidence.
-type impactCommitFile struct {
-	content   []byte
-	ok        bool
-	truncated bool
-}
-
-// impactStats is the planner stats document merged into code_analysis.stats by
-// the analysis service. It carries counters only (never code content, reasons or
-// paths), so events/UI can explain the run without leaking source.
-type impactStats struct {
-	Candidates         int  `json:"candidates"`
-	Requirements       int  `json:"requirements"`
-	AppModels          int  `json:"appModels"`
-	Direct             int  `json:"direct"`
-	Contract           int  `json:"contract"`
-	Relation           int  `json:"relation"`
-	AI                 int  `json:"ai"`
-	AIEvidenceChecks   int  `json:"aiEvidenceChecks"`
-	AIEvidenceFailures int  `json:"aiEvidenceFailures"`
-	UnmatchedContracts int  `json:"unmatchedContracts"`
-	Unmapped           int  `json:"unmapped"`
-	UnmappedTruncated  bool `json:"unmappedTruncated,omitempty"`
-	InvalidCandidates  int  `json:"invalidCandidates,omitempty"`
-	PromptFacts        int  `json:"promptFacts"`
-	PromptTruncated    bool `json:"promptTruncated,omitempty"`
-	AIUnavailable      bool `json:"aiUnavailable,omitempty"`
-	AIErrors           int  `json:"aiErrors,omitempty"`
-}
-
-// Plan implements ImpactPlanner: it returns the merged/deduped candidates, the
-// unmapped changes and the stats document of one analysis (design spec §6.6).
-func (s *ImpactService) Plan(ctx context.Context, in ImpactInput) (ImpactResult, error) {
-	state, err := s.prepare(ctx, in)
+// Compute builds, persists and returns the candidate set of one done analysis.
+// It also merges analysis unmapped entries and flips analysis.degraded when the
+// AI impact call is unavailable; deterministic candidates never fail the run.
+func (s *ImpactService) Compute(ctx context.Context, analysisID int64) ([]codeintel.ImpactCandidate, error) {
+	analysis, err := s.analyses.Get(ctx, analysisID)
 	if err != nil {
-		return ImpactResult{}, err
+		return nil, mapDomainError(err, "code analysis")
 	}
-
-	candidates := make([]domain.ImpactCandidate, 0)
-	directRequirements := make(map[int64]string)
-	directEvidence := make(map[int64][]domain.Evidence)
-	for _, candidate := range s.anchorCandidates(state) {
-		candidates = append(candidates, candidate)
-		if candidate.SubjectKind == domain.CandidateRequirement {
-			directRequirements[candidate.SubjectID] = strongerImpactConfidence(
-				directRequirements[candidate.SubjectID], candidate.Confidence)
-			// A relation candidate inherits the triggering direct requirement's
-			// changed-file evidence so every automatic candidate stays traceable
-			// to a changed file (INV-2).
-			directEvidence[candidate.SubjectID] = mergeImpactEvidence(
-				directEvidence[candidate.SubjectID], candidate.Evidence)
-		}
+	if analysis.Status != codeintel.AnalysisDone {
+		return nil, stateConflict("analysis_not_done", "impact analysis requires a done code analysis")
 	}
-	candidates = append(candidates, s.appModelCandidates(state)...)
-	candidates = append(candidates, s.contractCandidates(state)...)
-	candidates = append(candidates, s.relationCandidates(state, directRequirements, directEvidence)...)
-
-	aiCandidates, err := s.aiCandidates(ctx, state)
+	repository, err := s.resources.CodeRepository(ctx, analysis.RepoID)
 	if err != nil {
-		return ImpactResult{}, err
+		return nil, mapDomainError(err, "code repository")
 	}
-	candidates = append(candidates, aiCandidates...)
-
-	merged := mergeImpactCandidates(candidates, s.deps.IDs)
-	domain.SortCandidates(merged)
-	unmapped, unmappedTruncated := s.unmappedChanges(state)
-	return ImpactResult{
-		Candidates: merged,
-		Unmapped:   unmapped,
-		Stats:      marshalImpactStats(state, merged, unmapped, unmappedTruncated),
-	}, nil
-}
-
-// prepare validates/resolves the planning input. Storage failures surface so the
-// analysis fails deterministically; an empty optional input is filled from the
-// injected catalogs/repositories (R27) when possible.
-func (s *ImpactService) prepare(ctx context.Context, in ImpactInput) (*impactPlanState, error) {
-	state := &impactPlanState{
-		in:          in,
-		changed:     make(map[string]domain.ChangedFile, len(in.ChangedFiles)),
-		fileContent: make(map[string]impactCommitFile),
+	bindings, err := s.versions.VersionSUTBindings(ctx, analysis.VersionID)
+	if err != nil {
+		return nil, err
 	}
-	for _, file := range in.ChangedFiles {
-		state.changed[file.Path] = file
-		state.changedPaths = append(state.changedPaths, file.Path)
+	versionSUTIDs := versionSUTIDsForRepo(bindings, analysis.RepoID)
+	changedPaths, changedFiles := decodeChangedFilesJSON(analysis.ChangedFiles)
+	pages, apis, err := s.sutResources(ctx, versionSUTIDs)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(state.changedPaths)
-
-	versionID := in.Version.ID
-	if versionID == 0 {
-		versionID = in.Analysis.VersionID
+	requirements, caseVersions, relations, err := s.designInputs(ctx, analysis.VersionID)
+	if err != nil {
+		return nil, err
 	}
 
-	state.requirements = in.Requirements
-	if len(state.requirements) == 0 && versionID > 0 && s.deps.Versions != nil {
-		loaded, err := s.deps.Versions.ListRequirements(ctx, versionID)
-		if err != nil {
-			return nil, err
+	facts, analyzedKeys, err := s.analysisFacts(ctx, analysis)
+	if err != nil {
+		return nil, err
+	}
+	incorrect := map[string]bool{}
+	if s.reviews != nil && len(facts) > 0 {
+		keys := make([]string, 0, len(facts))
+		for _, fact := range facts {
+			keys = append(keys, fact.FactKey)
 		}
-		state.requirements = loaded
-	}
-	state.relations = in.Relations
-	if len(state.relations) == 0 && versionID > 0 && s.deps.Versions != nil {
-		loaded, err := s.deps.Versions.ListRelations(ctx, versionID)
-		if err != nil {
-			return nil, err
+		verdicts, verdictErr := s.reviews.LatestVerdicts(ctx, analysis.RepoID, analysis.HeadCommitSHA, keys)
+		if verdictErr != nil {
+			return nil, verdictErr
 		}
-		state.relations = loaded
-	}
-
-	state.anchors = append([]domain.CodeAnchor(nil), in.Anchors...)
-	if len(state.anchors) == 0 && s.deps.Anchors != nil && versionID > 0 {
-		loaded, err := s.deps.Anchors.ListByPaths(ctx, versionID, state.changedPaths)
-		if err != nil {
-			return nil, err
-		}
-		state.anchors = loaded
-	}
-	sort.SliceStable(state.anchors, func(i, j int) bool { return state.anchors[i].ID < state.anchors[j].ID })
-
-	// App model matching requires the version's bound system (design spec
-	// §6.6 input 4 / R27); without one, no app model candidate may be created.
-	if in.Version.HasSystem && in.Version.SystemID > 0 {
-		state.appModels = append([]AppModelNode(nil), in.AppModels...)
-		if len(state.appModels) == 0 && s.deps.AppModels != nil {
-			loaded, err := s.deps.AppModels.ListBySystem(ctx, in.Version.SystemID, nil)
-			if err != nil {
-				return nil, err
+		for key, verdict := range verdicts {
+			if verdict == string(codeintel.ReviewIncorrect) {
+				incorrect[key] = true
 			}
-			state.appModels = loaded
-		}
-	}
-	sort.SliceStable(state.appModels, func(i, j int) bool {
-		if state.appModels[i].Kind != state.appModels[j].Kind {
-			return state.appModels[i].Kind < state.appModels[j].Kind
-		}
-		if state.appModels[i].Key != state.appModels[j].Key {
-			return state.appModels[i].Key < state.appModels[j].Key
-		}
-		return state.appModels[i].ID < state.appModels[j].ID
-	})
-
-	state.edges = append([]domain.CodeEdge(nil), in.Edges...)
-	if len(state.edges) == 0 && s.deps.Edges != nil {
-		loaded, err := s.deps.Edges.ListByRel(ctx, in.Analysis.RepoID, in.Analysis.HeadCommit, domain.RelRouteToAPI)
-		if err != nil {
-			return nil, err
-		}
-		state.edges = loaded
-	}
-	sort.SliceStable(state.edges, func(i, j int) bool { return state.edges[i].ID < state.edges[j].ID })
-
-	state.facts = highMediumImpactFacts(in.FactsAtHead)
-	state.coverageFacts = impactCoverageFacts(in.FactsAtHead)
-	for _, fact := range state.facts {
-		if impactFactTouchesPaths(fact, state.changed) {
-			state.changedFacts = append(state.changedFacts, fact)
-		}
-	}
-	return state, nil
-}
-
-// highMediumImpactFacts keeps the high/medium AI facts (INV-1: low clues and T0
-// file entities never produce automatic candidates) in deterministic order.
-func highMediumImpactFacts(facts []domain.CodeEntity) []domain.CodeEntity {
-	kept := make([]domain.CodeEntity, 0, len(facts))
-	for _, fact := range facts {
-		if !isImpactFactKind(fact.Kind) {
-			continue
-		}
-		if fact.Confidence != domain.ConfidenceHigh && fact.Confidence != domain.ConfidenceMedium {
-			continue
-		}
-		kept = append(kept, fact)
-	}
-	sort.SliceStable(kept, func(i, j int) bool {
-		left, right := kept[i], kept[j]
-		if impactFactKey(left) != impactFactKey(right) {
-			return impactFactKey(left) < impactFactKey(right)
-		}
-		if left.Kind != right.Kind {
-			return left.Kind < right.Kind
-		}
-		if left.Path != right.Path {
-			return left.Path < right.Path
-		}
-		return left.ID < right.ID
-	})
-	return kept
-}
-
-// isImpactFactKind reports whether kind is an AI fact kind (never the T0 file
-// entity kind).
-func isImpactFactKind(kind string) bool {
-	switch kind {
-	case domain.KindPage, domain.KindRoute, domain.KindAPI,
-		domain.KindClientCall, domain.KindComponent, domain.KindModule, domain.KindSymbol:
-		return true
-	default:
-		return false
-	}
-}
-
-// impactCoverageFacts keeps the facts that can cover a changed file in the
-// unmapped_changes view (design spec §6.6 step 7 / INV-8): AI fact kinds with
-// verified evidence regardless of confidence, never the T0 file entities. A low
-// clue still proves the file was analysed; only automatic candidate generation
-// is restricted to high/medium facts (INV-1).
-func impactCoverageFacts(facts []domain.CodeEntity) []domain.CodeEntity {
-	kept := make([]domain.CodeEntity, 0, len(facts))
-	for _, fact := range facts {
-		if !isImpactFactKind(fact.Kind) {
-			continue
-		}
-		if !impactFactHasVerifiedEvidence(fact) {
-			continue
-		}
-		kept = append(kept, fact)
-	}
-	return kept
-}
-
-// impactFactHasVerifiedEvidence reports whether the fact carries at least one
-// verified evidence location. Analysis drops invalid evidence before
-// materialisation, so a non-empty file entry is the persistence marker of a
-// verified excerpt.
-func impactFactHasVerifiedEvidence(fact domain.CodeEntity) bool {
-	for _, evidence := range fact.Evidence {
-		if evidence.File != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// impactFactKey returns the fact identity or "" when the entity has none.
-func impactFactKey(entity domain.CodeEntity) string {
-	if entity.FactKey == nil {
-		return ""
-	}
-	return *entity.FactKey
-}
-
-// impactFactTouchesPaths reports whether fact was produced for (or its verified
-// evidence points at) one of the changed files.
-func impactFactTouchesPaths(fact domain.CodeEntity, changed map[string]domain.ChangedFile) bool {
-	if _, ok := changed[fact.Path]; ok {
-		return true
-	}
-	for _, evidence := range fact.Evidence {
-		if _, ok := changed[evidence.File]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// impactAppModelFacts returns the facts allowed to produce app model candidates:
-// facts that touch a changed file (their path or verified evidence) plus facts
-// this analysis run produced even when the model attributed them to an
-// out-of-path file (design spec §6.6 input 3). The head-wide FactsAtHead
-// snapshot also carries facts from other analyses/versions; none of those may
-// become a direct candidate (review finding 1). state.facts is deterministic, so
-// the filtered view is too.
-func impactAppModelFacts(state *impactPlanState) []domain.CodeEntity {
-	analysisID := state.in.Analysis.ID
-	kept := make([]domain.CodeEntity, 0, len(state.changedFacts))
-	for _, fact := range state.facts {
-		if impactFactTouchesPaths(fact, state.changed) ||
-			(analysisID != 0 && fact.AnalysisID != nil && *fact.AnalysisID == analysisID) {
-			kept = append(kept, fact)
-		}
-	}
-	return kept
-}
-
-// anchorCandidates projects every anchor of a changed file onto a candidate.
-// Version anchors are display-only (design spec §6.6 step 3).
-func (s *ImpactService) anchorCandidates(state *impactPlanState) []domain.ImpactCandidate {
-	candidates := make([]domain.ImpactCandidate, 0)
-	for _, anchor := range state.anchors {
-		if _, ok := state.changed[anchor.FilePath]; !ok {
-			continue
-		}
-		switch anchor.SubjectKind {
-		case domain.CandidateRequirement, domain.CandidateAppModel:
-		default:
-			continue
-		}
-		candidates = append(candidates, domain.ImpactCandidate{
-			SubjectKind: anchor.SubjectKind,
-			SubjectID:   anchor.SubjectID,
-			Reason:      "changed file " + anchor.FilePath,
-			Confidence:  impactAnchorConfidence(anchor.Confidence),
-			Source:      domain.CandidateDirect,
-			Evidence:    []domain.Evidence{{File: anchor.FilePath}},
-		})
-	}
-	return candidates
-}
-
-// impactAnchorConfidence defaults an anchor confidence to high, matching the
-// repository's DDL default.
-func impactAnchorConfidence(confidence string) string {
-	if confidence == "" {
-		return domain.ConfidenceHigh
-	}
-	return confidence
-}
-
-// appModelCandidates matches the facts of this change against the version-bound
-// system's app model nodes by exact key (design spec §6.6 step 3). Only facts
-// that touch the change set (or were produced by this run) are considered, so
-// the head-wide fact snapshot cannot turn an unrelated fact into a candidate.
-func (s *ImpactService) appModelCandidates(state *impactPlanState) []domain.ImpactCandidate {
-	byKey := impactAppModelNodeIndex(state.appModels)
-	candidates := make([]domain.ImpactCandidate, 0)
-	for _, fact := range impactAppModelFacts(state) {
-		key, ok := impactAppModelKeyForFact(fact)
-		if !ok {
-			continue
-		}
-		node, ok := byKey[fact.Kind+"\x00"+key]
-		if !ok {
-			continue
-		}
-		candidates = append(candidates, domain.ImpactCandidate{
-			SubjectKind: domain.CandidateAppModel,
-			SubjectID:   node.ID,
-			Reason:      fmt.Sprintf("changed %s %s", fact.Kind, fact.Name),
-			Confidence:  fact.Confidence,
-			Source:      domain.CandidateDirect,
-			Evidence:    cloneImpactEvidence(fact.Evidence),
-		})
-	}
-	return candidates
-}
-
-// impactAppModelNodeIndex indexes the app model nodes by kind and key. The first
-// node wins so a duplicate key stays deterministic (state.appModels is sorted by
-// kind, key and id).
-func impactAppModelNodeIndex(appModels []AppModelNode) map[string]AppModelNode {
-	index := make(map[string]AppModelNode, len(appModels))
-	for _, node := range appModels {
-		switch node.Kind {
-		case domain.KindPage, domain.KindRoute, domain.KindAPI, domain.KindComponent:
-		default:
-			continue
-		}
-		key := node.Kind + "\x00" + node.Key
-		if _, exists := index[key]; !exists {
-			index[key] = node
-		}
-	}
-	return index
-}
-
-// impactAppModelKeyForFact returns the P2 app model key of one fact
-// (page:<path>, route:<path>, api:<METHOD> <path>, component:<Name>).
-func impactAppModelKeyForFact(fact domain.CodeEntity) (string, bool) {
-	name := strings.TrimSpace(fact.Name)
-	if name == "" {
-		return "", false
-	}
-	switch fact.Kind {
-	case domain.KindPage:
-		return "page:" + impactLeadingSlash(name), true
-	case domain.KindRoute:
-		return "route:" + impactLeadingSlash(name), true
-	case domain.KindAPI:
-		method, path := domain.NormalizeMethodPath("", name)
-		if method == "" || path == "" {
-			return "", false
-		}
-		return "api:" + method + " " + path, true
-	case domain.KindComponent:
-		return "component:" + name, true
-	default:
-		return "", false
-	}
-}
-
-// impactLeadingSlash gives a UI/route path its leading slash so a fact name
-// without one still matches the P2 app model key convention.
-func impactLeadingSlash(value string) string {
-	if strings.HasPrefix(value, "/") {
-		return value
-	}
-	return "/" + value
-}
-
-// contractCandidates propagates changed client_call/api facts one hop over the
-// route_to_api edges (design spec §6.5/§6.6, CI-M0):
-//
-//   - a changed client_call reaches the counterpart api node (api:<METHOD> <path>);
-//   - a changed api reaches the component/page facts recorded at the counterpart
-//     client_call's path and matches their app model nodes (R38: the analysis
-//     service supplies those companion facts in FactsAtHead).
-func (s *ImpactService) contractCandidates(state *impactPlanState) []domain.ImpactCandidate {
-	nodes := impactAppModelNodeIndex(state.appModels)
-	factsByID := make(map[int64]domain.CodeEntity, len(state.facts))
-	for _, fact := range state.facts {
-		if _, exists := factsByID[fact.ID]; !exists {
-			factsByID[fact.ID] = fact
 		}
 	}
 
-	unmatchedPaths := make(map[string]struct{})
-	candidates := make([]domain.ImpactCandidate, 0)
-	for _, fact := range state.changedFacts {
-		if fact.Kind != domain.KindClientCall && fact.Kind != domain.KindAPI {
-			continue
+	merge := newCandidateMerge()
+	anchorPaths := map[string]bool{}
+	if s.anchors != nil {
+		anchors, anchorErr := s.anchors.List(ctx, analysis.VersionID, "", 0)
+		if anchorErr != nil {
+			return nil, anchorErr
 		}
-		touched := false
-		for _, edge := range state.edges {
-			if edge.Rel != domain.RelRouteToAPI {
+		for _, anchor := range anchors {
+			if anchor.RepoID != analysis.RepoID || !changedPaths[anchor.FilePath] {
 				continue
 			}
-			if edge.SrcEntityID != fact.ID && edge.DstEntityID != fact.ID {
-				continue
-			}
-			touched = true
-			method, path, ok := impactContractEndpoint(edge, fact, state.facts)
+			anchorPaths[anchor.FilePath] = true
+			kind, ok := impactAnchorSubjectKind(anchor.SubjectKind)
 			if !ok {
 				continue
 			}
-			if fact.Kind == domain.KindAPI {
-				// Changed api → counterpart client_call → its component/page
-				// facts → their app model nodes (design spec §6.5 传播).
-				counterpartID := edge.SrcEntityID
-				if counterpartID == fact.ID {
-					counterpartID = edge.DstEntityID
-				}
-				counterpart, ok := factsByID[counterpartID]
-				if !ok || counterpart.Kind != domain.KindClientCall {
+			merge.add(kind, anchor.SubjectID, codeintel.CandidateDirect, codeintel.ConfidenceHigh,
+				"anchor path is in the change set", nil)
+		}
+	}
+	if s.caseSources != nil {
+		sources, sourceErr := s.caseSources.CaseSources(ctx, analysis.VersionID)
+		if sourceErr != nil {
+			return nil, sourceErr
+		}
+		for _, source := range sources {
+			if source.RepoID != 0 && source.RepoID != analysis.RepoID {
+				continue
+			}
+			if !changedPaths[source.Path] {
+				continue
+			}
+			anchorPaths[source.Path] = true
+			merge.add(codeintel.SubjectCaseVersion, source.CaseVersionID, codeintel.CandidateDirect,
+				codeintel.ConfidenceHigh, "case source path is in the change set", nil)
+		}
+	}
+
+	// Direct page/API facts (incorrect facts never enter automatic impact).
+	for _, fact := range facts {
+		if incorrect[fact.FactKey] {
+			continue
+		}
+		if route, ok := impactFactRoute(fact); ok {
+			if page, found := pages.byRoute[route]; found {
+				merge.add(codeintel.SubjectSUTPage, page.ID, codeintel.CandidateDirect, fact.Confidence,
+					"route fact matches a SUT page", factEvidence(fact))
+			}
+		}
+		if method, path, ok := impactFactAPI(fact); ok {
+			if api, found := apis.byRoute[apiRouteKey(method, path)]; found {
+				merge.add(codeintel.SubjectSUTAPI, api.ID, codeintel.CandidateDirect, fact.Confidence,
+					"api fact matches a SUT API", factEvidence(fact))
+			}
+		}
+	}
+
+	// One-hop contract propagation through route_to_api edges.
+	var impactEdges []ImpactEdge
+	if s.edges != nil {
+		edges, edgeErr := s.edges.ImpactEdges(ctx, analysis.RepoID, analysis.HeadCommitSHA)
+		if edgeErr != nil {
+			return nil, edgeErr
+		}
+		impactEdges = edges
+		for _, edge := range edges {
+			if edge.Rel != codeintel.EdgeRouteToAPI {
+				continue
+			}
+			srcChanged := analyzedKeys[edge.SrcFactKey]
+			dstChanged := analyzedKeys[edge.DstFactKey]
+			if !srcChanged && !dstChanged {
+				continue
+			}
+			method, path, ok := parseImpactFactKey(edge.DstFactKey)
+			if !ok {
+				continue
+			}
+			if api, found := apis.byRoute[apiRouteKey(method, path)]; found {
+				merge.add(codeintel.SubjectSUTAPI, api.ID, codeintel.CandidateContract, edge.Confidence,
+					"route_to_api edge connects a changed call", nil)
+			}
+		}
+	}
+
+	// One-hop requirement relation propagation from directly impacted requirements.
+	directRequirements := merge.requirementIDs()
+	relatedRequirements := map[int64]bool{}
+	for _, relation := range relations {
+		if !relationKindValid(relation.Kind) {
+			continue
+		}
+		switch {
+		case directRequirements[relation.FromRequirementID]:
+			relatedRequirements[relation.ToRequirementID] = true
+		case directRequirements[relation.ToRequirementID]:
+			relatedRequirements[relation.FromRequirementID] = true
+		}
+	}
+	affectedRequirements := map[int64]bool{}
+	for id := range directRequirements {
+		affectedRequirements[id] = true
+	}
+	for id := range relatedRequirements {
+		affectedRequirements[id] = true
+		merge.add(codeintel.SubjectRequirement, id, codeintel.CandidateRelation, codeintel.ConfidenceMedium,
+			"related requirement is directly impacted", nil)
+	}
+	// Current+confirmed case versions under impacted requirements.
+	for _, caseVersion := range caseVersions {
+		if !affectedRequirements[caseVersion.RequirementID] {
+			continue
+		}
+		merge.add(codeintel.SubjectCaseVersion, caseVersion.ID, codeintel.CandidateRelation,
+			codeintel.ConfidenceMedium, "current case version of an impacted requirement", nil)
+	}
+
+	// Single AI inference call; failures degrade instead of failing the run.
+	aiAvailable := s.extractor != nil
+	if aiAvailable {
+		output, aiErr := s.extractor.Impact(ctx, ImpactInferenceInput{
+			Repo:            repository,
+			CommitSHA:       analysis.HeadCommitSHA,
+			ChangedFiles:    changedFiles,
+			Facts:           withoutIncorrectFacts(facts, incorrect),
+			Edges:           impactEdgesToDomain(impactEdges),
+			Requirements:    limitRequirements(requirements, codeintel.MaxRequirementsInPrompt),
+			Selected:        merge.candidates(),
+			MaxRequirements: codeintel.MaxRequirementsInPrompt,
+			PromptVersion:   readStringSetting(ctx, s.settings, SettingPromptVersion, defaultPromptVersion),
+		})
+		if aiErr != nil {
+			aiAvailable = false
+		} else {
+			for _, draft := range output.Candidates {
+				reason := s.validateAIDraft(ctx, analysis, repository, draft, requirements, caseVersions, pages, apis)
+				if reason == "" {
 					continue
 				}
-				for _, companion := range impactCompanionFacts(state.facts, counterpart.Path) {
-					key, ok := impactAppModelKeyForFact(companion)
-					if !ok {
-						continue
-					}
-					node, ok := nodes[companion.Kind+"\x00"+key]
-					if !ok {
-						continue
-					}
-					candidates = append(candidates, domain.ImpactCandidate{
-						SubjectKind: domain.CandidateAppModel,
-						SubjectID:   node.ID,
-						Reason:      fmt.Sprintf("contract %s %s changed", method, path),
-						Confidence: weakerConfidence(
-							weakerConfidence(fact.Confidence, impactEdgeConfidence(edge.Confidence)),
-							companion.Confidence),
-						Source:   domain.CandidateContract,
-						Evidence: mergeImpactEvidence(fact.Evidence, edge.Evidence, companion.Evidence),
-					})
+				evidence := s.validateImpactEvidence(ctx, repository, analysis.HeadCommitSHA, draft.Evidence)
+				confidence := draft.Confidence
+				if !confidence.Valid() {
+					confidence = codeintel.ConfidenceMedium
 				}
-				continue
-			}
-			node, ok := nodes[domain.KindAPI+"\x00"+"api:"+method+" "+path]
-			if !ok {
-				continue
-			}
-			candidates = append(candidates, domain.ImpactCandidate{
-				SubjectKind: domain.CandidateAppModel,
-				SubjectID:   node.ID,
-				Reason:      fmt.Sprintf("contract %s %s changed", method, path),
-				Confidence:  weakerConfidence(fact.Confidence, impactEdgeConfidence(edge.Confidence)),
-				Source:      domain.CandidateContract,
-				Evidence:    mergeImpactEvidence(edge.Evidence, fact.Evidence),
-			})
-		}
-		if !touched {
-			state.stats.UnmatchedContracts++
-			if path := impactFactChangedPath(fact, state.changed); path != "" {
-				unmatchedPaths[path] = struct{}{}
+				if len(draft.Evidence) > 0 && len(evidence) == 0 {
+					confidence = codeintel.ConfidenceLow
+				}
+				merge.add(draft.SubjectKind, draft.SubjectID, codeintel.CandidateAI, confidence, reason, evidence)
 			}
 		}
 	}
-	for path := range unmatchedPaths {
-		state.unmatchedContractPaths = append(state.unmatchedContractPaths, path)
-	}
-	sort.Strings(state.unmatchedContractPaths)
-	return candidates
-}
 
-// impactCompanionFacts returns the high/medium component/page facts recorded at
-// one contract-counterpart path (R38) in deterministic fact order.
-func impactCompanionFacts(facts []domain.CodeEntity, path string) []domain.CodeEntity {
-	if path == "" {
-		return nil
+	candidates := merge.candidates()
+	now := s.clock.Now()
+	for index := range candidates {
+		candidates[index].CreatedAt = now
+		candidates[index].UpdatedAt = now
 	}
-	companions := make([]domain.CodeEntity, 0)
-	for _, fact := range facts {
-		if fact.Path != path {
-			continue
-		}
-		if fact.Kind != domain.KindComponent && fact.Kind != domain.KindPage {
-			continue
-		}
-		companions = append(companions, fact)
+	unmapped := s.mergeUnmapped(analysis, changedPaths, facts, anchorPaths, aiAvailable)
+	if !aiAvailable {
+		analysis.Degraded = true
 	}
-	return companions
-}
-
-// impactContractEndpoint resolves the api side of one route_to_api edge from its
-// meta document, falling back to the triggering fact name and then to the
-// endpoint fact name when the meta is absent/corrupt.
-func impactContractEndpoint(edge domain.CodeEdge, trigger domain.CodeEntity, facts []domain.CodeEntity) (string, string, bool) {
-	if len(edge.Meta) > 0 {
-		var meta struct {
-			Method         string `json:"method"`
-			NormalizedPath string `json:"normalizedPath"`
-		}
-		if err := json.Unmarshal(edge.Meta, &meta); err == nil &&
-			strings.TrimSpace(meta.Method) != "" && strings.TrimSpace(meta.NormalizedPath) != "" {
-			return strings.ToUpper(strings.TrimSpace(meta.Method)), strings.TrimSpace(meta.NormalizedPath), true
+	analysis.Unmapped = mustJSON(unmapped)
+	if err := s.analyses.Update(ctx, analysis); err != nil {
+		return nil, err
+	}
+	if err := s.candidates.ReplaceForAnalysis(ctx, analysis.ID, candidates); err != nil {
+		return nil, err
+	}
+	stored, err := s.candidates.ListByAnalysis(ctx, analysis.ID)
+	if err != nil {
+		return nil, mapDomainError(err, "code impact candidate")
+	}
+	countsBySource := map[string]int{}
+	countsByKind := map[string]int{}
+	selected := 0
+	for _, candidate := range candidates {
+		countsBySource[string(candidate.Source)]++
+		countsByKind[string(candidate.SubjectKind)]++
+		if candidate.Selected {
+			selected++
 		}
 	}
-	if method, path := domain.NormalizeMethodPath("", trigger.Name); method != "" && path != "" {
-		return method, path, true
-	}
-	for _, fact := range facts {
-		if fact.ID != edge.SrcEntityID && fact.ID != edge.DstEntityID {
-			continue
-		}
-		method, path := domain.NormalizeMethodPath("", fact.Name)
-		if method != "" && path != "" {
-			return method, path, true
-		}
-	}
-	return "", "", false
-}
-
-// impactFactChangedPath returns the changed file a contract fact belongs to.
-func impactFactChangedPath(fact domain.CodeEntity, changed map[string]domain.ChangedFile) string {
-	if _, ok := changed[fact.Path]; ok {
-		return fact.Path
-	}
-	for _, evidence := range fact.Evidence {
-		if _, ok := changed[evidence.File]; ok {
-			return evidence.File
-		}
-	}
-	return ""
-}
-
-// impactEdgeConfidence defaults a contract edge confidence to medium.
-func impactEdgeConfidence(confidence string) string {
-	if confidence == "" {
-		return domain.ConfidenceMedium
-	}
-	return confidence
-}
-
-// relationCandidates expands the directly hit requirements one hop through the
-// requirement relations in any direction (design spec §6.6 step 3). It never
-// recurses and never adds an already directly hit requirement. The relation
-// candidate carries the triggering direct candidate's evidence so it stays
-// traceable to the changed file (INV-2).
-func (s *ImpactService) relationCandidates(state *impactPlanState, direct map[int64]string, directEvidence map[int64][]domain.Evidence) []domain.ImpactCandidate {
-	type relationHit struct {
-		relatedID int64
-		triggerID int64
-		relation  string
-	}
-	relations := append([]RelationInfo(nil), state.relations...)
-	sort.SliceStable(relations, func(i, j int) bool {
-		if relations[i].FromID != relations[j].FromID {
-			return relations[i].FromID < relations[j].FromID
-		}
-		if relations[i].ToID != relations[j].ToID {
-			return relations[i].ToID < relations[j].ToID
-		}
-		return relations[i].Type < relations[j].Type
+	publishEvent(ctx, s.events, "code.impact_computed", analysis.VersionID, map[string]any{
+		"analysis_id":          platformid.Format(analysis.ID),
+		"candidates_by_source": countsBySource,
+		"candidates_by_kind":   countsByKind,
+		"selected_count":       selected,
 	})
+	return stored, nil
+}
 
-	hits := make([]relationHit, 0)
-	for _, relation := range relations {
-		_, fromDirect := direct[relation.FromID]
-		_, toDirect := direct[relation.ToID]
-		switch {
-		case fromDirect && !toDirect:
-			hits = append(hits, relationHit{
-				relatedID: relation.ToID, triggerID: relation.FromID,
-				relation: fmt.Sprintf("related to R%d via %s", relation.FromID, relation.Type),
-			})
-		case toDirect && !fromDirect:
-			hits = append(hits, relationHit{
-				relatedID: relation.FromID, triggerID: relation.ToID,
-				relation: fmt.Sprintf("related to R%d via %s", relation.ToID, relation.Type),
-			})
+// List returns the stored candidates of one analysis with repo/SUT tags.
+func (s *ImpactService) List(ctx context.Context, analysisID int64) ([]ImpactCandidateView, error) {
+	analysis, err := s.analyses.Get(ctx, analysisID)
+	if err != nil {
+		return nil, mapDomainError(err, "code analysis")
+	}
+	candidates, err := s.candidates.ListByAnalysis(ctx, analysisID)
+	if err != nil {
+		return nil, mapDomainError(err, "code impact candidate")
+	}
+	bindings, err := s.versions.VersionSUTBindings(ctx, analysis.VersionID)
+	if err != nil {
+		return nil, err
+	}
+	sutIDs := versionSUTIDsForRepo(bindings, analysis.RepoID)
+	views := make([]ImpactCandidateView, 0, len(candidates))
+	for _, candidate := range candidates {
+		views = append(views, ImpactCandidateView{ImpactCandidate: candidate, RepoID: analysis.RepoID, VersionSUTIDs: sutIDs})
+	}
+	return views, nil
+}
+
+// AnalysisVersion returns the version of one analysis; the HTTP layer uses it to
+// reject cross-version candidate patches with 404.
+func (s *ImpactService) AnalysisVersion(ctx context.Context, analysisID int64) (int64, error) {
+	analysis, err := s.analyses.Get(ctx, analysisID)
+	if err != nil {
+		return 0, mapDomainError(err, "code analysis")
+	}
+	return analysis.VersionID, nil
+}
+
+// Detail returns one analysis with its tagged candidate set. It backs the
+// analysis-detail view so GET analyses/{id} can include candidates (spec §4.2
+// #15) without the T1 service depending on the impact cache.
+func (s *ImpactService) Detail(ctx context.Context, analysisID int64) (codeintel.Analysis, []ImpactCandidateView, error) {
+	analysis, err := s.analyses.Get(ctx, analysisID)
+	if err != nil {
+		return codeintel.Analysis{}, nil, mapDomainError(err, "code analysis")
+	}
+	views, err := s.List(ctx, analysisID)
+	if err != nil {
+		return codeintel.Analysis{}, nil, err
+	}
+	return analysis, views, nil
+}
+
+// SetSelected records one explicit candidate selection.
+func (s *ImpactService) SetSelected(ctx context.Context, analysisID, candidateID, actorID int64, selected bool) (codeintel.ImpactCandidate, error) {
+	if _, err := s.analyses.Get(ctx, analysisID); err != nil {
+		return codeintel.ImpactCandidate{}, mapDomainError(err, "code analysis")
+	}
+	updated, err := s.candidates.UpdateSelection(ctx, analysisID, candidateID, actorID, selected)
+	if err != nil {
+		return codeintel.ImpactCandidate{}, mapDomainError(err, "code impact candidate")
+	}
+	recordAudit(ctx, s.audit, "code.impact.candidate_selected", "code_impact_candidate", platformid.Format(updated.ID), map[string]any{
+		"analysis_id": platformid.Format(analysisID),
+		"selected":    selected,
+		"actor_id":    platformid.Format(actorID),
+	})
+	return updated, nil
+}
+
+// Union merges the latest candidate set of every repository bound to the
+// version. Evidence is never merged across repositories; the highest-priority
+// source wins and reasons are joined (spec §5.4).
+func (s *ImpactService) Union(ctx context.Context, versionID int64) ([]ImpactCandidateView, error) {
+	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
+	repos := distinctRepoIDs(bindings)
+	merged := newCandidateMerge()
+	repoBySubject := map[string]int64{}
+	sutsBySubject := map[string][]int64{}
+	for _, repoID := range repos {
+		analysis, latestErr := s.analyses.Latest(ctx, versionID, repoID)
+		if latestErr != nil {
+			if errors.Is(latestErr, codeintel.ErrNotFound) {
+				continue
+			}
+			return nil, mapDomainError(latestErr, "code analysis")
+		}
+		candidates, listErr := s.candidates.ListByAnalysis(ctx, analysis.ID)
+		if listErr != nil {
+			return nil, mapDomainError(listErr, "code impact candidate")
+		}
+		sutIDs := versionSUTIDsForRepo(bindings, repoID)
+		for _, candidate := range candidates {
+			key := candidateSubjectKey(candidate.SubjectKind, candidate.SubjectID)
+			merged.addCandidate(candidate)
+			if _, ok := repoBySubject[key]; !ok {
+				repoBySubject[key] = repoID
+				sutsBySubject[key] = sutIDs
+			}
 		}
 	}
-
-	candidates := make([]domain.ImpactCandidate, 0, len(hits))
-	for _, hit := range hits {
-		candidates = append(candidates, domain.ImpactCandidate{
-			SubjectKind: domain.CandidateRequirement,
-			SubjectID:   hit.relatedID,
-			Reason:      hit.relation,
-			Confidence:  weakerConfidence(domain.ConfidenceMedium, direct[hit.triggerID]),
-			Source:      domain.CandidateRelation,
-			Evidence:    mergeImpactEvidence(directEvidence[hit.triggerID]),
+	candidates := merged.candidates()
+	views := make([]ImpactCandidateView, 0, len(candidates))
+	sorted := sortCandidates(candidates)
+	for _, candidate := range sorted {
+		key := candidateSubjectKey(candidate.SubjectKind, candidate.SubjectID)
+		views = append(views, ImpactCandidateView{
+			ImpactCandidate: candidate, RepoID: repoBySubject[key], VersionSUTIDs: sutsBySubject[key],
 		})
 	}
-	return candidates
+	return views, nil
 }
 
-// aiCandidates runs the one impact-reasoning call and validates its output
-// (design spec §6.6 step 3, §8.4). Every failure degrades only the AI source: it
-// records stats/aiUnavailable and never fails the analysis.
-func (s *ImpactService) aiCandidates(ctx context.Context, state *impactPlanState) ([]domain.ImpactCandidate, error) {
-	if state.in.Degraded {
-		state.aiUnavailable = true
-		return nil, nil
-	}
-	if s.deps.LLM == nil {
-		state.aiUnavailable = true
-		return nil, nil
-	}
-	if len(state.requirements) == 0 {
-		return nil, nil
-	}
+// ImpactWorkHandler composes the code.analyze handler with impact computation:
+// after the T1 analysis succeeds the deterministic+AI candidates are persisted.
+type ImpactWorkHandler struct {
+	Analysis Handler
+	Impact   *ImpactService
+}
 
-	system, user, promptPlan := s.buildImpactPrompt(state)
-	state.stats.PromptFacts = len(promptPlan.facts)
-	state.stats.PromptTruncated = promptPlan.truncated
-
-	raw, err := s.deps.LLM.Complete(ctx, system, user)
+// Handle runs the wrapped analysis handler, then computes the impact candidates.
+func (h ImpactWorkHandler) Handle(ctx context.Context, item WorkItem) error {
+	if h.Analysis != nil {
+		if err := h.Analysis.Handle(ctx, item); err != nil {
+			return err
+		}
+	}
+	if h.Impact == nil {
+		return nil
+	}
+	analysisID, err := decodeWorkItemID(item.Payload, "analysis_id")
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		state.aiUnavailable = true
-		state.stats.AIErrors++
-		return nil, nil
+		return err
 	}
-	parsed, err := parseImpactReasoning(raw)
-	if err != nil {
-		state.aiUnavailable = true
-		state.stats.AIErrors++
-		return nil, nil
+	_, err = h.Impact.Compute(ctx, analysisID)
+	return err
+}
+
+// --- candidate merge --------------------------------------------------------------
+
+type candidateMerge struct {
+	entries map[string]*candidateEntry
+}
+
+type candidateEntry struct {
+	kind       codeintel.SubjectKind
+	id         int64
+	source     codeintel.CandidateSource
+	confidence codeintel.Confidence
+	reasons    []string
+	evidence   []map[string]any
+	// meta preserves the persisted candidate row (id/analysis/timestamps/
+	// selection) of the highest-priority source so union views stay PATCHable.
+	meta codeintel.ImpactCandidate
+}
+
+func newCandidateMerge() *candidateMerge {
+	return &candidateMerge{entries: map[string]*candidateEntry{}}
+}
+
+func candidateSubjectKey(kind codeintel.SubjectKind, id int64) string {
+	return string(kind) + ":" + platformid.Format(id)
+}
+
+func (m *candidateMerge) add(kind codeintel.SubjectKind, id int64, source codeintel.CandidateSource, confidence codeintel.Confidence, reason string, evidence []map[string]any) {
+	m.addEntry(codeintel.ImpactCandidate{
+		SubjectKind: kind, SubjectID: id, Source: source, Confidence: confidence,
+		Reason: reason, Evidence: mustJSON(evidence),
+	}, evidence)
+}
+
+func (m *candidateMerge) addCandidate(candidate codeintel.ImpactCandidate) {
+	m.addEntry(candidate, decodeEvidence(candidate.Evidence))
+}
+
+func (m *candidateMerge) addEntry(candidate codeintel.ImpactCandidate, evidence []map[string]any) {
+	kind, id := candidate.SubjectKind, candidate.SubjectID
+	source, confidence, reason := candidate.Source, candidate.Confidence, candidate.Reason
+	if !kind.Valid() || id <= 0 {
+		return
 	}
-
-	requirements := make(map[int64]struct{}, len(state.requirements))
-	for _, requirement := range state.requirements {
-		requirements[requirement.ID] = struct{}{}
+	if !confidence.Valid() {
+		confidence = codeintel.ConfidenceMedium
 	}
-
-	candidates := make([]domain.ImpactCandidate, 0, len(parsed))
-	for _, affected := range parsed {
-		if affected.RequirementID == nil || affected.Reason == nil || affected.Confidence == nil {
-			state.stats.InvalidCandidates++
-			continue
+	key := candidateSubjectKey(kind, id)
+	entry, ok := m.entries[key]
+	if !ok {
+		entry = &candidateEntry{kind: kind, id: id, source: source, confidence: confidence, meta: candidate}
+		m.entries[key] = entry
+	} else {
+		if candidateSourceRank(source) < candidateSourceRank(entry.source) {
+			entry.source = source
+			entry.meta = candidate
 		}
-		requirementID, convErr := strconv.ParseInt(strings.TrimSpace(*affected.RequirementID), 10, 64)
-		if convErr != nil {
-			state.stats.InvalidCandidates++
-			continue
+		if confidenceRank(confidence) > confidenceRank(entry.confidence) {
+			entry.confidence = confidence
 		}
-		if _, known := requirements[requirementID]; !known {
-			state.stats.InvalidCandidates++
-			continue
-		}
-		confidence := strings.TrimSpace(*affected.Confidence)
-		if confidence != domain.ConfidenceHigh && confidence != domain.ConfidenceMedium && confidence != domain.ConfidenceLow {
-			state.stats.InvalidCandidates++
-			continue
-		}
-		reason := strings.TrimSpace(*affected.Reason)
-		if reason == "" {
-			state.stats.InvalidCandidates++
-			continue
-		}
-
-		evidence := make([]domain.Evidence, 0, len(affected.Evidence))
-		for index, rawEvidence := range affected.Evidence {
-			if index >= domain.MaxEvidencePerFact {
-				// The per-fact evidence cap of design spec §6.2 applies to the
-				// model output regardless of which prompt produced it.
+	}
+	reason = strings.TrimSpace(reason)
+	if reason != "" && len([]rune(reason)) <= codeintel.MaxReasonChars {
+		duplicate := false
+		for _, existing := range entry.reasons {
+			if existing == reason {
+				duplicate = true
 				break
 			}
-			state.stats.AIEvidenceChecks++
-			if rawEvidence.File == nil || rawEvidence.StartLine == nil || rawEvidence.EndLine == nil {
-				state.stats.AIEvidenceFailures++
-				continue
-			}
-			validated, ok := s.validateAIEvidence(ctx, state, *rawEvidence.File, *rawEvidence.StartLine, *rawEvidence.EndLine)
-			if !ok {
-				state.stats.AIEvidenceFailures++
-				continue
-			}
-			evidence = append(evidence, validated)
 		}
-		mergedEvidence := mergeImpactEvidence(evidence)
-		if len(mergedEvidence) == 0 {
-			confidence = domain.ConfidenceLow
-		}
-		candidates = append(candidates, domain.ImpactCandidate{
-			SubjectKind: domain.CandidateRequirement,
-			SubjectID:   requirementID,
-			Reason:      reason,
-			Confidence:  confidence,
-			Source:      domain.CandidateAI,
-			Evidence:    mergedEvidence,
-		})
-	}
-	if ctx.Err() != nil {
-		// A worker deadline during evidence validation must fail the run, not
-		// silently degrade the AI source.
-		return nil, ctx.Err()
-	}
-	return candidates, nil
-}
-
-// impactReasoningEntry is one affected requirement of the §8.4 output schema.
-// Required fields are pointers so a missing value is distinguishable.
-type impactReasoningEntry struct {
-	RequirementID *string       `json:"requirementId"`
-	Reason        *string       `json:"reason"`
-	Confidence    *string       `json:"confidence"`
-	Evidence      []rawEvidence `json:"evidence"`
-}
-
-// parseImpactReasoning strictly parses the `{affected:[...]}` object of the
-// impact prompt. A Markdown fence/explanation is tolerated by extracting the
-// first balanced object; missing/ill-typed required fields fail the parse.
-func parseImpactReasoning(raw string) ([]impactReasoningEntry, error) {
-	payload, err := extractJSONObject(raw)
-	if err != nil {
-		return nil, err
-	}
-	var document struct {
-		Affected *[]impactReasoningEntry `json:"affected"`
-	}
-	if err := json.Unmarshal([]byte(payload), &document); err != nil {
-		return nil, err
-	}
-	if document.Affected == nil {
-		return nil, errors.New("codeintel: impact response is missing affected")
-	}
-	return *document.Affected, nil
-}
-
-// validateAIEvidence verifies one model-supplied evidence interval against the
-// head commit content (design spec §6.3/R14: any file of the commit) and
-// returns it with the server-recomputed excerpt hash.
-func (s *ImpactService) validateAIEvidence(ctx context.Context, state *impactPlanState, file string, startLine, endLine int) (domain.Evidence, bool) {
-	if s.deps.Git == nil || state.in.Analysis.HeadCommit == "" {
-		return domain.Evidence{}, false
-	}
-	normalized, err := normalizeRepoRelativePath(file)
-	if err != nil {
-		return domain.Evidence{}, false
-	}
-	content, ok := s.commitFileContent(ctx, state, normalized)
-	if !ok {
-		return domain.Evidence{}, false
-	}
-	validated, err := ValidateEvidence(content, domain.Evidence{
-		File:      normalized,
-		StartLine: startLine,
-		EndLine:   endLine,
-	}, defaultMaxExcerptLines)
-	if err != nil {
-		return domain.Evidence{}, false
-	}
-	return validated, true
-}
-
-// commitFileContent lazily reads one commit-pinned file for evidence validation.
-// The read is bounded by the domain file-read cap; an oversized/binary file is
-// treated as unverifiable.
-func (s *ImpactService) commitFileContent(ctx context.Context, state *impactPlanState, file string) ([]byte, bool) {
-	if cached, ok := state.fileContent[file]; ok {
-		return cached.content, cached.ok && !cached.truncated
-	}
-	entry := impactCommitFile{}
-	content, truncated, err := s.deps.Git.ReadAll(ctx, s.repositoryLocalPath(ctx, state),
-		state.in.Analysis.HeadCommit, file, domain.MaxFileReadBytes)
-	if err != nil {
-		entry = impactCommitFile{truncated: truncated}
-	} else if truncated {
-		entry = impactCommitFile{truncated: true}
-	} else {
-		entry = impactCommitFile{content: content, ok: true}
-	}
-	state.fileContent[file] = entry
-	return entry.content, entry.ok
-}
-
-// repositoryLocalPath resolves the repository checkout once per Plan call so the
-// AI evidence validator can read commit content. A missing Repos port leaves the
-// path empty; a Git double may still serve content and a real adapter fails
-// closed.
-func (s *ImpactService) repositoryLocalPath(ctx context.Context, state *impactPlanState) string {
-	if state.localPathResolved {
-		return state.localPath
-	}
-	state.localPathResolved = true
-	repoID := state.in.Analysis.RepoID
-	if repoID == 0 {
-		repoID = state.in.Version.RepoID
-	}
-	if s.deps.Repos == nil || repoID <= 0 {
-		return ""
-	}
-	repo, err := s.deps.Repos.Get(ctx, repoID)
-	if err != nil {
-		return ""
-	}
-	state.localPath = repo.LocalPath
-	return state.localPath
-}
-
-// impactPromptPlan is the selected, bounded prompt content of one AI call.
-type impactPromptPlan struct {
-	facts     []AIFact
-	truncated bool
-}
-
-// buildImpactPrompt renders the §8.4 prompt with the R15 caps: the fact count is
-// capped by MaxFacts and the whole prompt by MaxPromptBytes (first reached
-// wins), and every cut is marked inside the user message. The changeSummary is
-// the last section to shrink so the final system+user prompt never exceeds the
-// configured byte budget.
-func (s *ImpactService) buildImpactPrompt(state *impactPlanState) (string, string, impactPromptPlan) {
-	allFacts := impactPromptFacts(state.changedFacts)
-	files := append([]domain.ChangedFile(nil), state.in.ChangedFiles...)
-	sort.SliceStable(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	requirements := append([]RequirementInfo(nil), state.requirements...)
-	sort.SliceStable(requirements, func(i, j int) bool { return requirements[i].ID < requirements[j].ID })
-
-	factLimit := len(allFacts)
-	if factLimit > s.config.maxFacts {
-		factLimit = s.config.maxFacts
-	}
-	fileLimit := len(files)
-	requirementLimit := len(requirements)
-	if requirementLimit > s.config.maxRequirements {
-		requirementLimit = s.config.maxRequirements
-	}
-
-	summary := impactChangeSummary(state.in.Analysis.Stats)
-	build := func(summary string, factCount, fileCount, requirementCount int) (string, string, bool) {
-		system, user := BuildImpactPrompt(ImpactPromptInput{
-			Requirements:  requirements[:requirementCount],
-			ChangedFiles:  files[:fileCount],
-			Facts:         allFacts[:factCount],
-			ChangeSummary: summary,
-		})
-		truncated := factCount < len(allFacts) || fileCount < len(files) || requirementCount < len(requirements)
-		if truncated {
-			user = injectImpactPromptMarkers(user, factCount, len(allFacts), fileCount, len(files), requirementCount, len(requirements))
-		}
-		return system, user, truncated
-	}
-	fits := func(system, user string) bool {
-		return len(system)+len(user) <= s.config.maxPromptBytes
-	}
-
-	system, user, truncated := build(summary, factLimit, len(files), requirementLimit)
-	if !fits(system, user) {
-		// Facts first: they are the largest and least stable section of the
-		// prompt; changed files and the requirement list stay complete as long
-		// as the byte budget allows.
-		factLimit = largestImpactFit(factLimit, func(count int) bool {
-			candidateSystem, candidateUser, _ := build(summary, count, len(files), requirementLimit)
-			return fits(candidateSystem, candidateUser)
-		})
-		fileLimit = largestImpactFit(len(files), func(count int) bool {
-			candidateSystem, candidateUser, _ := build(summary, factLimit, count, requirementLimit)
-			return fits(candidateSystem, candidateUser)
-		})
-		requirementLimit = largestImpactFit(requirementLimit, func(count int) bool {
-			candidateSystem, candidateUser, _ := build(summary, factLimit, fileLimit, count)
-			return fits(candidateSystem, candidateUser)
-		})
-		system, user, truncated = build(summary, factLimit, fileLimit, requirementLimit)
-	}
-	if !fits(system, user) && summary != "" {
-		// The summary is the only unbounded free-text section left. Cut it down
-		// (with an explicit marker) until the whole prompt fits the budget.
-		summaryRunes := []rune(summary)
-		summaryLimit := 0
-		if len(summaryRunes) > 1 {
-			summaryLimit = largestImpactFit(len(summaryRunes)-1, func(count int) bool {
-				candidateSystem, candidateUser, _ := build(
-					impactTruncatedChangeSummary(summaryRunes, count), factLimit, fileLimit, requirementLimit)
-				return fits(candidateSystem, candidateUser)
-			})
-		}
-		system, user, truncated = build(
-			impactTruncatedChangeSummary(summaryRunes, summaryLimit), factLimit, fileLimit, requirementLimit)
-		truncated = true
-		if !fits(system, user) {
-			// The marker itself no longer fits: drop the summary entirely.
-			system, user, _ = build("", factLimit, fileLimit, requirementLimit)
+		if !duplicate {
+			entry.reasons = append(entry.reasons, reason)
 		}
 	}
-	return system, user, impactPromptPlan{
-		facts:     allFacts[:factLimit],
-		truncated: truncated,
+	for _, item := range evidence {
+		if len(entry.evidence) >= codeintel.MaxEvidencePerFact {
+			break
+		}
+		entry.evidence = append(entry.evidence, item)
 	}
 }
 
-// impactTruncatedChangeSummary returns the first count runes of the summary with
-// the R15 truncation marker appended.
-func impactTruncatedChangeSummary(summary []rune, count int) string {
-	if count <= 0 {
-		return impactSummaryTruncatedMarker
+func (m *candidateMerge) candidates() []codeintel.ImpactCandidate {
+	result := make([]codeintel.ImpactCandidate, 0, len(m.entries))
+	for _, entry := range m.entries {
+		reason := strings.Join(entry.reasons, "; ")
+		if len([]rune(reason)) > codeintel.MaxReasonChars {
+			reason = string([]rune(reason)[:codeintel.MaxReasonChars])
+		}
+		evidence := entry.evidence
+		if evidence == nil {
+			evidence = []map[string]any{}
+		}
+		candidate := entry.meta
+		candidate.SubjectKind = entry.kind
+		candidate.SubjectID = entry.id
+		candidate.Reason = reason
+		candidate.Confidence = entry.confidence
+		candidate.Source = entry.source
+		candidate.Evidence = mustJSON(evidence)
+		if candidate.ID <= 0 {
+			candidate.Selected = entry.confidence != codeintel.ConfidenceLow
+		}
+		result = append(result, candidate)
 	}
-	return string(summary[:count]) + impactSummaryTruncatedMarker
+	return sortCandidates(result)
 }
 
-// largestImpactFit returns the largest n in [0, limit] for which fits(n) holds.
-// fits is expected to be monotonic (a larger section never shrinks the prompt).
-func largestImpactFit(limit int, fits func(int) bool) int {
-	if limit <= 0 {
-		return 0
-	}
-	if !fits(0) {
-		return 0
-	}
-	low, high := 0, limit
-	for low < high {
-		mid := (low + high + 1) / 2
-		if fits(mid) {
-			low = mid
-		} else {
-			high = mid - 1
+func (m *candidateMerge) requirementIDs() map[int64]bool {
+	result := map[int64]bool{}
+	for _, entry := range m.entries {
+		if entry.kind == codeintel.SubjectRequirement {
+			result[entry.id] = true
 		}
 	}
-	return low
+	return result
 }
 
-// injectImpactPromptMarkers inserts the truncation notices in front of the
-// output schema so the model knows a section is incomplete.
-func injectImpactPromptMarkers(user string, factsShown, factsTotal, filesShown, filesTotal, requirementsShown, requirementsTotal int) string {
-	markers := make([]string, 0, 3)
-	if factsShown < factsTotal {
-		markers = append(markers, fmt.Sprintf("……（事实过多，仅显示前 %d 条，其余已截断）", factsShown))
-	}
-	if filesShown < filesTotal {
-		markers = append(markers, fmt.Sprintf("……（变更文件过多，仅显示前 %d 个，其余已截断）", filesShown))
-	}
-	if requirementsShown < requirementsTotal {
-		markers = append(markers, fmt.Sprintf("……（需求过多，仅显示前 %d 条，其余已截断）", requirementsShown))
-	}
-	if len(markers) == 0 {
-		return user
-	}
-	return strings.Replace(user, impactPromptSchemaMarker,
-		"\n"+strings.Join(markers, "\n")+impactPromptSchemaMarker, 1)
-}
-
-// impactPromptFacts projects the changed AI facts onto the prompt fact entries.
-// The fact entity has no summary field, so the fact signature is the prompt
-// summary.
-func impactPromptFacts(facts []domain.CodeEntity) []AIFact {
-	promptFacts := make([]AIFact, 0, len(facts))
-	for _, fact := range facts {
-		promptFacts = append(promptFacts, AIFact{
-			Kind:       fact.Kind,
-			Name:       fact.Name,
-			Path:       fact.Path,
-			Signature:  fact.Signature,
-			Confidence: fact.Confidence,
-			Summary:    fact.Signature,
-			Evidence:   cloneImpactEvidence(fact.Evidence),
-		})
-	}
-	return promptFacts
-}
-
-// impactChangeSummary reads the aggregated AI change summary persisted by the
-// analysis service in stats["changeSummary"] (R28).
-func impactChangeSummary(raw []byte) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var stats map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &stats); err != nil {
-		return ""
-	}
-	summary, ok := stats["changeSummary"]
-	if !ok {
-		return ""
-	}
-	var value string
-	if err := json.Unmarshal(summary, &value); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(value)
-}
-
-// mergeImpactCandidates deduplicates by (subject_kind, subject_id): the highest
-// priority source (direct < contract < relation < ai), the highest confidence,
-// the concatenated reasons and the merged evidence win (design spec §6.6 step
-// 4), then the default selection and the snowflake id are assigned.
-func mergeImpactCandidates(items []domain.ImpactCandidate, ids IDGenerator) []domain.ImpactCandidate {
-	byKey := make(map[string]*domain.ImpactCandidate, len(items))
-	for _, item := range items {
-		key := item.SubjectKind + "\x00" + strconv.FormatInt(item.SubjectID, 10)
-		existing, ok := byKey[key]
-		if !ok {
-			copied := item
-			copied.Evidence = cloneImpactEvidence(item.Evidence)
-			byKey[key] = &copied
-			continue
+// sortCandidates applies source priority, confidence, subject kind and id.
+func sortCandidates(candidates []codeintel.ImpactCandidate) []codeintel.ImpactCandidate {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if candidateSourceRank(left.Source) != candidateSourceRank(right.Source) {
+			return candidateSourceRank(left.Source) < candidateSourceRank(right.Source)
 		}
-		if impactSourceRank(item.Source) < impactSourceRank(existing.Source) {
-			existing.Source = item.Source
+		if confidenceRank(left.Confidence) != confidenceRank(right.Confidence) {
+			return confidenceRank(left.Confidence) > confidenceRank(right.Confidence)
 		}
-		if impactConfidenceRank(item.Confidence) < impactConfidenceRank(existing.Confidence) {
-			existing.Confidence = item.Confidence
+		if subjectKindRank(left.SubjectKind) != subjectKindRank(right.SubjectKind) {
+			return subjectKindRank(left.SubjectKind) < subjectKindRank(right.SubjectKind)
 		}
-		existing.Reason = mergeImpactReason(existing.Reason, item.Reason)
-		existing.Evidence = mergeImpactEvidence(existing.Evidence, item.Evidence)
-	}
-
-	keys := make([]string, 0, len(byKey))
-	for key := range byKey {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	merged := make([]domain.ImpactCandidate, 0, len(keys))
-	for _, key := range keys {
-		candidate := *byKey[key]
-		if len([]rune(candidate.Reason)) > domain.MaxReasonChars {
-			candidate.Reason = truncateRunesLimit(candidate.Reason, domain.MaxReasonChars)
-		}
-		candidate.Evidence = mergeImpactEvidence(candidate.Evidence)
-		candidate.Selected = domain.DefaultSelected(candidate.Confidence)
-		if ids != nil {
-			candidate.ID = ids.Next()
-		}
-		merged = append(merged, candidate)
-	}
-	return merged
+		return left.SubjectID < right.SubjectID
+	})
+	return candidates
 }
 
-// mergeImpactReason concatenates two non-empty reasons once each.
-func mergeImpactReason(left, right string) string {
-	left = strings.TrimSpace(left)
-	right = strings.TrimSpace(right)
-	switch {
-	case left == "":
-		return right
-	case right == "" || left == right:
-		return left
-	default:
-		return left + impactReasonSeparator + right
-	}
-}
-
-// mergeImpactEvidence deduplicates, sorts and caps candidate evidence at the
-// §6.6 step 4 cap.
-func mergeImpactEvidence(parts ...[]domain.Evidence) []domain.Evidence {
-	merged := mergeContractEvidence(parts...)
-	if len(merged) > maxImpactCandidateEvidence {
-		merged = merged[:maxImpactCandidateEvidence]
-	}
-	return merged
-}
-
-// cloneImpactEvidence copies an evidence slice so candidates never alias
-// repository state.
-func cloneImpactEvidence(evidence []domain.Evidence) []domain.Evidence {
-	if len(evidence) == 0 {
-		return nil
-	}
-	cloned := make([]domain.Evidence, len(evidence))
-	copy(cloned, evidence)
-	return cloned
-}
-
-// impactSourceRank orders candidate sources by merge priority.
-func impactSourceRank(source string) int {
+func candidateSourceRank(source codeintel.CandidateSource) int {
 	switch source {
-	case domain.CandidateDirect:
-		return 0
-	case domain.CandidateContract:
+	case codeintel.CandidateDirect:
 		return 1
-	case domain.CandidateRelation:
+	case codeintel.CandidateContract:
 		return 2
-	case domain.CandidateAI:
+	case codeintel.CandidateRelation:
 		return 3
 	default:
 		return 4
 	}
 }
 
-// impactConfidenceRank orders high < medium < low.
-func impactConfidenceRank(confidence string) int {
+func confidenceRank(confidence codeintel.Confidence) int {
 	switch confidence {
-	case domain.ConfidenceHigh:
-		return 0
-	case domain.ConfidenceMedium:
-		return 1
-	case domain.ConfidenceLow:
+	case codeintel.ConfidenceHigh:
+		return 3
+	case codeintel.ConfidenceMedium:
 		return 2
 	default:
+		return 1
+	}
+}
+
+func subjectKindRank(kind codeintel.SubjectKind) int {
+	switch kind {
+	case codeintel.SubjectRequirement:
+		return 1
+	case codeintel.SubjectRequirementVersion:
+		return 2
+	case codeintel.SubjectCaseVersion:
 		return 3
+	case codeintel.SubjectSUTPage:
+		return 4
+	default:
+		return 5
 	}
 }
 
-// strongerImpactConfidence returns the higher of two confidence levels.
-func strongerImpactConfidence(left, right string) string {
-	if impactConfidenceRank(right) < impactConfidenceRank(left) {
-		return right
-	}
-	return left
+// --- deterministic inputs ---------------------------------------------------------
+
+type pageIndex struct {
+	byRoute map[string]PageRef
+	byID    map[int64]PageRef
 }
 
-// unmappedChanges builds the §6.6 step 7 list: one entry per uncovered changed
-// file plus the extra unmatched-contract entries, sorted together by path and
-// capped at the documented maximum with the truncation flag. Sorting the combined
-// list keeps the output deterministic and path-ordered even though the
-// unmatched-contract extras are not part of the per-file dedupe.
-func (s *ImpactService) unmappedChanges(state *impactPlanState) ([]domain.UnmappedChange, bool) {
-	covered := make(map[string]struct{})
-	for _, anchor := range state.anchors {
-		covered[anchor.FilePath] = struct{}{}
+type apiIndex struct {
+	byRoute map[string]APIRef
+	byID    map[int64]APIRef
+}
+
+func (s *ImpactService) sutResources(ctx context.Context, versionSUTIDs []int64) (pageIndex, apiIndex, error) {
+	pages := pageIndex{byRoute: map[string]PageRef{}, byID: map[int64]PageRef{}}
+	apis := apiIndex{byRoute: map[string]APIRef{}, byID: map[int64]APIRef{}}
+	if s.resources == nil {
+		return pages, apis, nil
 	}
-	for _, fact := range state.coverageFacts {
-		if fact.Path != "" {
-			covered[fact.Path] = struct{}{}
+	for _, versionSUTID := range versionSUTIDs {
+		refs, err := s.resources.SUTPages(ctx, versionSUTID)
+		if err != nil {
+			return pages, apis, err
 		}
-		for _, evidence := range fact.Evidence {
-			if evidence.File != "" {
-				covered[evidence.File] = struct{}{}
+		for _, page := range refs {
+			if page.Status == "rejected" {
+				continue
+			}
+			pages.byRoute[page.RouteTemplate] = page
+			pages.byID[page.ID] = page
+		}
+		apiRefs, err := s.resources.SUTAPIs(ctx, versionSUTID)
+		if err != nil {
+			return pages, apis, err
+		}
+		for _, api := range apiRefs {
+			if api.Status == "rejected" {
+				continue
+			}
+			apis.byRoute[apiRouteKey(api.Method, api.PathTemplate)] = api
+			apis.byID[api.ID] = api
+		}
+	}
+	return pages, apis, nil
+}
+
+func (s *ImpactService) designInputs(ctx context.Context, versionID int64) ([]RequirementRef, []CaseVersionRef, []RequirementRelationRef, error) {
+	if s.design == nil {
+		return nil, nil, nil, nil
+	}
+	requirements, err := s.design.Requirements(ctx, versionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caseVersions, err := s.design.CaseVersions(ctx, versionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	relations, err := s.design.RequirementRelations(ctx, versionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return requirements, caseVersions, relations, nil
+}
+
+// analysisFacts returns the facts recorded in the analysis snapshot (falling
+// back to all head facts) and the analyzed fact-key set.
+func (s *ImpactService) analysisFacts(ctx context.Context, analysis codeintel.Analysis) ([]codeintel.Fact, map[string]bool, error) {
+	facts, err := s.facts.LatestByCommit(ctx, analysis.RepoID, analysis.HeadCommitSHA, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	snapshot := map[string]int{}
+	if len(analysis.FactVersions) > 0 {
+		_ = json.Unmarshal(analysis.FactVersions, &snapshot)
+	}
+	analyzedKeys := map[string]bool{}
+	for key := range snapshot {
+		analyzedKeys[key] = true
+	}
+	result := make([]codeintel.Fact, 0, len(facts))
+	for _, fact := range facts {
+		if len(snapshot) > 0 {
+			if _, ok := snapshot[fact.FactKey]; !ok {
+				continue
+			}
+		}
+		analyzedKeys[fact.FactKey] = true
+		result = append(result, fact)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].FactKey < result[j].FactKey })
+	return result, analyzedKeys, nil
+}
+
+func withoutIncorrectFacts(facts []codeintel.Fact, incorrect map[string]bool) []codeintel.Fact {
+	result := make([]codeintel.Fact, 0, len(facts))
+	for _, fact := range facts {
+		if !incorrect[fact.FactKey] {
+			result = append(result, fact)
+		}
+	}
+	return result
+}
+
+// --- AI validation ----------------------------------------------------------------
+
+// validateAIDraft returns the reason when the draft subject exists in the
+// version, or "" when the draft must be dropped.
+func (s *ImpactService) validateAIDraft(ctx context.Context, analysis codeintel.Analysis, repository RepoRef, draft ImpactDraft, requirements []RequirementRef, caseVersions []CaseVersionRef, pages pageIndex, apis apiIndex) string {
+	kind := codeintel.SubjectKind(strings.TrimSpace(string(draft.SubjectKind)))
+	if !kind.Valid() || draft.SubjectID <= 0 || strings.TrimSpace(draft.Reason) == "" {
+		return ""
+	}
+	switch kind {
+	case codeintel.SubjectRequirement:
+		for _, requirement := range requirements {
+			if requirement.ID == draft.SubjectID {
+				return truncateString(strings.TrimSpace(draft.Reason), codeintel.MaxReasonChars)
+			}
+		}
+		return ""
+	case codeintel.SubjectCaseVersion:
+		for _, caseVersion := range caseVersions {
+			if caseVersion.ID == draft.SubjectID {
+				return truncateString(strings.TrimSpace(draft.Reason), codeintel.MaxReasonChars)
+			}
+		}
+		return ""
+	case codeintel.SubjectSUTPage:
+		if _, ok := pages.byID[draft.SubjectID]; ok {
+			return truncateString(strings.TrimSpace(draft.Reason), codeintel.MaxReasonChars)
+		}
+		return ""
+	case codeintel.SubjectSUTAPI:
+		if _, ok := apis.byID[draft.SubjectID]; ok {
+			return truncateString(strings.TrimSpace(draft.Reason), codeintel.MaxReasonChars)
+		}
+		return ""
+	case codeintel.SubjectRequirementVersion:
+		if s.subjects == nil {
+			return ""
+		}
+		ok, err := s.subjects.RequirementVersionInVersion(ctx, analysis.VersionID, draft.SubjectID)
+		if err != nil || !ok {
+			return ""
+		}
+		return truncateString(strings.TrimSpace(draft.Reason), codeintel.MaxReasonChars)
+	default:
+		return ""
+	}
+}
+
+// validateImpactEvidence re-reads the head content and recomputes excerpt
+// hashes. Invalid evidence is dropped; the caller downgrades confidence when the
+// model supplied evidence but none survived.
+func (s *ImpactService) validateImpactEvidence(ctx context.Context, repository RepoRef, commit string, drafts []EvidenceDraft) []map[string]any {
+	if s.bulk == nil || len(drafts) == 0 {
+		return nil
+	}
+	maxBytes := readIntSetting(ctx, s.settings, SettingMaxFileBytes, defaultMaxFileBytes, 1<<20)
+	maxExcerpt := readIntSetting(ctx, s.settings, SettingMaxExcerptLines, defaultMaxExcerptLines, codeintel.MaxExcerptLines)
+	result := make([]map[string]any, 0, len(drafts))
+	for _, draft := range drafts {
+		if len(result) >= codeintel.MaxEvidencePerFact {
+			break
+		}
+		path, err := codeintel.NormalizeRepoPath(draft.File)
+		if err != nil || draft.StartLine < 1 || draft.EndLine < draft.StartLine ||
+			draft.EndLine-draft.StartLine+1 > maxExcerpt {
+			continue
+		}
+		window, readErr := s.bulk.ReadFileWindow(ctx, repository.Path, commit, path, maxBytes, 0)
+		if readErr != nil || draft.EndLine > window.TotalLines {
+			continue
+		}
+		offset := draft.StartLine - window.StartLine
+		if window.StartLine < 1 || offset < 0 || draft.EndLine > len(window.Lines) {
+			continue
+		}
+		result = append(result, map[string]any{
+			"file":         path,
+			"start_line":   draft.StartLine,
+			"end_line":     draft.EndLine,
+			"excerpt_hash": codeintel.ExcerptHash(window.Lines[offset : offset+draft.EndLine-draft.StartLine+1]),
+		})
+	}
+	return result
+}
+
+// --- unmapped ---------------------------------------------------------------------
+
+func (s *ImpactService) mergeUnmapped(analysis codeintel.Analysis, changedPaths map[string]bool, facts []codeintel.Fact, anchorPaths map[string]bool, aiAvailable bool) []map[string]any {
+	unmapped := make([]map[string]any, 0)
+	seen := map[string]bool{}
+	appendEntry := func(path, reason string) {
+		key := path + "\x00" + reason
+		if seen[key] || len(unmapped) >= codeintel.MaxUnmappedEntries {
+			return
+		}
+		seen[key] = true
+		unmapped = append(unmapped, map[string]any{"path": path, "reason": reason})
+	}
+	if len(analysis.Unmapped) > 0 {
+		var existing []map[string]any
+		if err := json.Unmarshal(analysis.Unmapped, &existing); err == nil {
+			for _, entry := range existing {
+				path, _ := entry["path"].(string)
+				reason, _ := entry["reason"].(string)
+				if reason != "" {
+					appendEntry(path, reason)
+				}
 			}
 		}
 	}
-
-	entries := make([]domain.UnmappedChange, 0, len(state.changedPaths))
-	for _, path := range state.changedPaths {
-		if _, ok := covered[path]; ok {
-			continue
+	factPaths := map[string]bool{}
+	for _, fact := range facts {
+		factPaths[fact.Path] = true
+	}
+	for path := range changedPaths {
+		if !factPaths[path] && !anchorPaths[path] {
+			appendEntry(path, "no_fact_or_anchor")
 		}
-		file := state.changed[path]
-		reason := domain.UnmappedNoFact
-		suggestion := impactSuggestionNoFact
-		switch {
-		case file.Status == statusChangedFileDeleted:
-			reason = domain.UnmappedDeleted
-			suggestion = impactSuggestionDeleted
-		case file.Binary || file.HeadBlobHash == "":
-			reason = domain.UnmappedUnsupported
-			suggestion = impactSuggestionUnsupported
-		case state.aiUnavailable || state.in.Degraded || s.deps.LLM == nil:
-			reason = domain.UnmappedAIUnavailable
-			suggestion = impactSuggestionAI
-		}
-		entries = append(entries, domain.UnmappedChange{
-			Path:       path,
-			Status:     file.Status,
-			Reason:     reason,
-			Suggestion: suggestion,
-		})
 	}
-
-	for _, path := range state.unmatchedContractPaths {
-		file := state.changed[path]
-		entries = append(entries, domain.UnmappedChange{
-			Path:       path,
-			Status:     file.Status,
-			Reason:     domain.UnmappedContract,
-			Suggestion: impactSuggestionContract,
-		})
+	if !aiAvailable {
+		appendEntry("", "ai_unavailable")
 	}
-
-	// Deterministic, path-ascending combined order. The sort is stable so a
-	// regular file entry stays before the unmatched-contract extra of the same
-	// path.
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-
-	truncated := false
-	if len(entries) > domain.MaxUnmappedEntries {
-		entries = entries[:domain.MaxUnmappedEntries]
-		truncated = true
-	}
-	return entries, truncated
+	return unmapped
 }
 
-// marshalImpactStats encodes the planner counters. The struct has no map fields
-// and no timestamps, so the document is deterministic (INV-4).
-func marshalImpactStats(state *impactPlanState, candidates []domain.ImpactCandidate, unmapped []domain.UnmappedChange, unmappedTruncated bool) []byte {
-	stats := state.stats
-	stats.Candidates = len(candidates)
-	stats.Unmapped = len(unmapped)
-	stats.UnmappedTruncated = unmappedTruncated
-	stats.AIUnavailable = state.aiUnavailable
-	for _, candidate := range candidates {
-		switch candidate.SubjectKind {
-		case domain.CandidateRequirement:
-			stats.Requirements++
-		case domain.CandidateAppModel:
-			stats.AppModels++
+// --- small helpers ----------------------------------------------------------------
+
+func versionSUTIDsForRepo(bindings []VersionSUTBinding, repoID int64) []int64 {
+	ids := make([]int64, 0)
+	seen := map[int64]bool{}
+	for _, binding := range bindings {
+		if binding.RepoID != repoID || seen[binding.VersionSUTID] {
+			continue
 		}
-		switch candidate.Source {
-		case domain.CandidateDirect:
-			stats.Direct++
-		case domain.CandidateContract:
-			stats.Contract++
-		case domain.CandidateRelation:
-			stats.Relation++
-		case domain.CandidateAI:
-			stats.AI++
+		seen[binding.VersionSUTID] = true
+		ids = append(ids, binding.VersionSUTID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func distinctRepoIDs(bindings []VersionSUTBinding) []int64 {
+	ids := make([]int64, 0)
+	seen := map[int64]bool{}
+	for _, binding := range bindings {
+		if binding.RepoID <= 0 || seen[binding.RepoID] {
+			continue
 		}
+		seen[binding.RepoID] = true
+		ids = append(ids, binding.RepoID)
 	}
-	raw, err := json.Marshal(stats)
-	if err != nil {
-		// The struct only contains JSON-safe scalar fields; this line is
-		// unreachable but keeps the function total without panicking.
-		return []byte("{}")
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func impactAnchorSubjectKind(kind codeintel.AnchorSubject) (codeintel.SubjectKind, bool) {
+	switch kind {
+	case codeintel.AnchorSubjectRequirement:
+		return codeintel.SubjectRequirement, true
+	case codeintel.AnchorSubjectRequirementVersion:
+		return codeintel.SubjectRequirementVersion, true
+	case codeintel.AnchorSubjectCaseVersion:
+		return codeintel.SubjectCaseVersion, true
+	default:
+		return "", false
 	}
-	return raw
+}
+
+func relationKindValid(kind string) bool {
+	switch kind {
+	case "depends_on", "conflicts_with", "overlaps", "shares_scope":
+		return true
+	default:
+		return false
+	}
+}
+
+func limitRequirements(requirements []RequirementRef, limit int) []RequirementRef {
+	if len(requirements) > limit {
+		return requirements[:limit]
+	}
+	return requirements
+}
+
+func factEvidence(fact codeintel.Fact) []map[string]any {
+	if len(fact.Evidence) == 0 {
+		return nil
+	}
+	var evidence []map[string]any
+	if err := json.Unmarshal(fact.Evidence, &evidence); err != nil {
+		return nil
+	}
+	return evidence
+}
+
+func decodeEvidence(raw json.RawMessage) []map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var evidence []map[string]any
+	if err := json.Unmarshal(raw, &evidence); err != nil {
+		return nil
+	}
+	return evidence
+}
+
+// impactFactRoute returns the normalized route of a route/page fact.
+func impactFactRoute(fact codeintel.Fact) (string, bool) {
+	switch fact.Kind {
+	case codeintel.EntityRoute, codeintel.EntityPage:
+	default:
+		return "", false
+	}
+	route := ""
+	if strings.HasPrefix(fact.FactKey, "route:") {
+		route = strings.TrimPrefix(fact.FactKey, "route:")
+	} else if strings.HasPrefix(fact.FactKey, "page:") {
+		route = strings.TrimPrefix(fact.FactKey, "page:")
+	} else {
+		route = strings.TrimSpace(fact.Name)
+	}
+	if route == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(route, "/") {
+		route = "/" + route
+	}
+	return route, true
+}
+
+// impactFactAPI returns the normalized method/path of an api/client_call fact.
+func impactFactAPI(fact codeintel.Fact) (string, string, bool) {
+	switch fact.Kind {
+	case codeintel.EntityAPI, codeintel.EntityClientCall:
+	default:
+		return "", "", false
+	}
+	return parseImpactFactKey(fact.FactKey)
+}
+
+func parseImpactFactKey(key string) (string, string, bool) {
+	key = strings.TrimSpace(key)
+	if colon := strings.IndexByte(key, ':'); colon >= 0 {
+		key = key[colon+1:]
+	}
+	fields := strings.Fields(key)
+	if len(fields) != 2 {
+		return "", "", false
+	}
+	method := strings.ToUpper(fields[0])
+	path := codeintel.NormalizeAPIPath(fields[1])
+	if method == "" || path == "" {
+		return "", "", false
+	}
+	return method, path, true
+}
+
+func apiRouteKey(method, path string) string {
+	return strings.ToUpper(strings.TrimSpace(method)) + " " + normalizeAPITemplate(path)
+}
+
+// normalizeAPITemplate keeps declared {param} placeholders while folding
+// concrete ID segments, so an API template and a normalized fact path key meet.
+func normalizeAPITemplate(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return codeintel.NormalizeAPIPath(path)
+}
+
+// decodeChangedFilesJSON parses the persisted changed_files array (snake_case)
+// into the domain shape and a path lookup.
+func decodeChangedFilesJSON(raw json.RawMessage) (map[string]bool, []codeintel.ChangedFile) {
+	paths := map[string]bool{}
+	if len(raw) == 0 {
+		return paths, nil
+	}
+	var rows []struct {
+		Path         string  `json:"path"`
+		OldPath      *string `json:"old_path"`
+		Status       string  `json:"status"`
+		Additions    int     `json:"additions"`
+		Deletions    int     `json:"deletions"`
+		Binary       bool    `json:"binary"`
+		HeadBlobHash *string `json:"head_blob_hash"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return paths, nil
+	}
+	files := make([]codeintel.ChangedFile, 0, len(rows))
+	for _, row := range rows {
+		if row.Path == "" {
+			continue
+		}
+		paths[row.Path] = true
+		file := codeintel.ChangedFile{
+			Path: row.Path, Status: row.Status, Additions: row.Additions,
+			Deletions: row.Deletions, Binary: row.Binary, HeadBlobSHA: row.HeadBlobHash,
+		}
+		if row.OldPath != nil {
+			file.OldPath = *row.OldPath
+		}
+		files = append(files, file)
+	}
+	return paths, files
+}
+
+func impactEdgesToDomain(edges []ImpactEdge) []codeintel.Edge {
+	result := make([]codeintel.Edge, 0, len(edges))
+	for _, edge := range edges {
+		result = append(result, codeintel.Edge{
+			Rel:        edge.Rel,
+			Confidence: edge.Confidence,
+			FactKey:    truncateString(edge.SrcFactKey+"->"+edge.DstFactKey, codeintel.MaxFactKeyChars),
+		})
+	}
+	return result
 }

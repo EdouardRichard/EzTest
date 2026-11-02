@@ -1,255 +1,412 @@
-package application_test
+package workspaceapp_test
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strings"
+	"reflect"
 	"testing"
 	"time"
 
-	workspace "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	workspaceapp "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
 )
 
-// fakeReviewProvider is the version-side todo provider seam (spec §6.3).
-type fakeReviewProvider struct {
-	rows  []workspace.ReviewRow
-	err   error
-	calls int
+// fakeProvider is one todo source owned by a context. It records the viewer it
+// was called with so the tests can assert the admin gate and provider fan-out.
+type fakeProvider struct {
+	items  []workspaceapp.TodoItem
+	err    error
+	calls  int
+	viewer platform.Actor
 }
 
-func (f *fakeReviewProvider) ReviewingVersions(context.Context) ([]workspace.ReviewRow, error) {
+func (f *fakeProvider) Items(_ context.Context, viewer platform.Actor) ([]workspaceapp.TodoItem, error) {
 	f.calls++
-	return f.rows, f.err
+	f.viewer = viewer
+	return f.items, f.err
 }
 
-// fakeExecutionProvider is the execution-side todo provider seam. It records
-// whether a non-admin request ever reached it: the service must filter the
-// takeover/gate groups before querying (spec §6.3).
-type fakeExecutionProvider struct {
-	rows  []workspace.PendingRow
-	err   error
-	calls int
-}
-
-func (f *fakeExecutionProvider) PendingTakeovers(context.Context) ([]workspace.PendingRow, error) {
-	f.calls++
-	return f.rows, f.err
-}
-
-func int64Pointer(value int64) *int64 { return &value }
-
-// reviewRows is a two-version review fixture with one duplicate row: the service
-// returns one item per version even when a provider reports it twice.
-func reviewRows(base time.Time) []workspace.ReviewRow {
-	return []workspace.ReviewRow{
-		{VersionID: 11, VersionName: "版本甲", Status: "reviewing", ReviewingAt: base.Add(time.Hour)},
-		{VersionID: 12, VersionName: "版本乙", Status: "reviewing", ReviewingAt: base},
-		{VersionID: 11, VersionName: "版本甲", Status: "reviewing", ReviewingAt: base.Add(time.Hour)},
+func item(kind, title string, createdAt time.Time) workspaceapp.TodoItem {
+	return workspaceapp.TodoItem{
+		Kind:         kind,
+		Title:        title,
+		VersionID:    2001,
+		VersionTitle: "订单中心",
+		Severity:     "warning",
+		CreatedAt:    createdAt,
+		URL:          "/versions/2001?tab=issues",
 	}
 }
 
-// TestListAggregatesReviewTakeoverAndGate proves the §6.3 aggregation for an
-// administrator: review rows are deduped per version, waiting takeovers become
-// `takeover` items, blocked runs without a waiting takeover become `gate` items,
-// and a case run is emitted at most once (takeover/gate dedupe).
-func TestListAggregatesReviewTakeoverAndGate(t *testing.T) {
-	base := time.Date(2026, 10, 29, 9, 0, 0, 0, time.UTC)
-	takeoverID := int64(9001)
-	review := &fakeReviewProvider{rows: reviewRows(base)}
-	execution := &fakeExecutionProvider{rows: []workspace.PendingRow{
-		{
-			CaseRunID: 21, VersionID: 12, VersionName: "版本乙", CaseTitle: "登录流程",
-			FailureReason: "mfa", CreatedAt: base.Add(2 * time.Hour), TakeoverID: &takeoverID,
-		},
-		{
-			CaseRunID: 22, VersionID: 12, VersionName: "版本乙", CaseTitle: "下单流程",
-			FailureReason: "no session", CreatedAt: base.Add(3 * time.Hour),
-		},
-		// The same case run reported twice must not duplicate the item.
-		{
-			CaseRunID: 21, VersionID: 12, VersionName: "版本乙", CaseTitle: "登录流程",
-			FailureReason: "mfa", CreatedAt: base.Add(2 * time.Hour), TakeoverID: &takeoverID,
-		},
-	}}
-
-	service := workspace.NewService(workspace.Providers{Review: review, Execution: execution})
-	snapshot, err := service.List(context.Background(), workspace.Query{Admin: true})
-	if err != nil {
-		t.Fatalf("List: %v", err)
+func kinds(items []workspaceapp.TodoItem) []string {
+	result := make([]string, 0, len(items))
+	for _, it := range items {
+		result = append(result, it.Kind)
 	}
-
-	if snapshot.Counts.Review != 2 || snapshot.Counts.Takeover != 1 || snapshot.Counts.Gate != 1 {
-		t.Fatalf("counts = %+v, want review=2 takeover=1 gate=1", snapshot.Counts)
-	}
-	if len(snapshot.Items) != 4 {
-		t.Fatalf("items = %d, want 4: %+v", len(snapshot.Items), snapshot.Items)
-	}
-
-	byKind := map[string][]workspace.Item{}
-	for _, item := range snapshot.Items {
-		byKind[item.Kind] = append(byKind[item.Kind], item)
-	}
-	if len(byKind[workspace.KindReview]) != 2 {
-		t.Fatalf("review items = %+v, want 2", byKind[workspace.KindReview])
-	}
-	if len(byKind[workspace.KindTakeover]) != 1 || len(byKind[workspace.KindGate]) != 1 {
-		t.Fatalf("takeover/gate items = %+v/%+v, want 1/1",
-			byKind[workspace.KindTakeover], byKind[workspace.KindGate])
-	}
-
-	reviewByVersion := map[string]workspace.Item{}
-	for _, item := range byKind[workspace.KindReview] {
-		reviewByVersion[item.VersionID] = item
-	}
-	first := reviewByVersion["11"]
-	if first.Title != "版本甲" || first.VersionName != "版本甲" || first.Severity != workspace.SeverityInfo {
-		t.Fatalf("review item 11 = %+v", first)
-	}
-	if first.URL != "/versions/11?tab=mindmap" {
-		t.Fatalf("review item 11 url = %q, want the mindmap deep link", first.URL)
-	}
-	if !first.CreatedAt.Equal(base.Add(time.Hour)) {
-		t.Fatalf("review item 11 createdAt = %v, want %v", first.CreatedAt, base.Add(time.Hour))
-	}
-
-	takeover := byKind[workspace.KindTakeover][0]
-	if takeover.Title != "登录流程" || takeover.VersionID != "12" || takeover.VersionName != "版本乙" {
-		t.Fatalf("takeover item = %+v", takeover)
-	}
-	if takeover.Severity != workspace.SeverityWarning {
-		t.Fatalf("takeover severity = %q, want %q", takeover.Severity, workspace.SeverityWarning)
-	}
-	if takeover.URL != "/versions/12?tab=sessions" {
-		t.Fatalf("takeover url = %q, want the execution-tab deep link", takeover.URL)
-	}
-
-	gate := byKind[workspace.KindGate][0]
-	if gate.Title != "下单流程" || gate.VersionID != "12" {
-		t.Fatalf("gate item = %+v", gate)
-	}
-	if gate.Severity != workspace.SeverityMajor {
-		t.Fatalf("gate severity = %q, want %q", gate.Severity, workspace.SeverityMajor)
-	}
-	if gate.URL != "/versions/12?tab=sessions" {
-		t.Fatalf("gate url = %q, want the execution-tab deep link", gate.URL)
-	}
+	return result
 }
 
-// TestListNormalUserSeesOnlyReview proves the permission filter of §6.3: a
-// regular user never reaches the execution provider and gets zero takeover/gate
-// counts, even when the fake provider could return rows.
-func TestListNormalUserSeesOnlyReview(t *testing.T) {
-	base := time.Date(2026, 10, 29, 9, 0, 0, 0, time.UTC)
-	takeoverID := int64(9001)
-	review := &fakeReviewProvider{rows: reviewRows(base)}
-	execution := &fakeExecutionProvider{rows: []workspace.PendingRow{{
-		CaseRunID: 21, VersionID: 12, VersionName: "版本乙", CaseTitle: "登录流程",
-		CreatedAt: base, TakeoverID: &takeoverID,
-	}}}
-
-	snapshot, err := workspace.NewService(workspace.Providers{
-		Review: review, Execution: execution,
-	}).List(context.Background(), workspace.Query{})
-	if err != nil {
-		t.Fatalf("List: %v", err)
+func assertKinds(t *testing.T, got []workspaceapp.TodoItem, want []string) {
+	t.Helper()
+	gotKinds := kinds(got)
+	if len(gotKinds) != len(want) {
+		t.Fatalf("kinds = %v, want %v", gotKinds, want)
 	}
-
-	if execution.calls != 0 {
-		t.Fatalf("execution provider calls = %d, want 0 for a regular user", execution.calls)
-	}
-	if snapshot.Counts.Takeover != 0 || snapshot.Counts.Gate != 0 {
-		t.Fatalf("counts = %+v, want takeover/gate zero", snapshot.Counts)
-	}
-	if snapshot.Counts.Review != 2 || len(snapshot.Items) != 2 {
-		t.Fatalf("snapshot = %+v, want the two review items only", snapshot)
-	}
-	for _, item := range snapshot.Items {
-		if item.Kind != workspace.KindReview {
-			t.Fatalf("regular user item = %+v, want kind review", item)
+	for index := range want {
+		if gotKinds[index] != want[index] {
+			t.Fatalf("kinds = %v, want %v", gotKinds, want)
 		}
 	}
 }
 
-// TestListDefaultsAndTruncatesLimit covers `limit`: zero selects the documented
-// default of 50, explicit values truncate the item list but never the counts.
-func TestListDefaultsAndTruncatesLimit(t *testing.T) {
-	base := time.Date(2026, 10, 29, 9, 0, 0, 0, time.UTC)
-	rows := make([]workspace.ReviewRow, 0, 55)
-	for index := 0; index < 55; index++ {
-		rows = append(rows, workspace.ReviewRow{
-			VersionID:   int64(100 + index),
-			VersionName: fmt.Sprintf("版本 %02d", index),
-			Status:      "reviewing",
-			ReviewingAt: base.Add(time.Duration(index) * time.Minute),
-		})
-	}
-	service := workspace.NewService(workspace.Providers{Review: &fakeReviewProvider{rows: rows}})
+func TestSnapshotAggregatesAndOrdersSixKinds(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	versionProvider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindDesignPending, "2 条待设计", now),
+		item(workspaceapp.KindRequirementConfirmation, "需求 A", now.Add(-time.Hour)),
+	}}
+	designProvider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindCaseConfirmation, "用例 A", now),
+	}}
+	executionProvider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindDeadWorkItem, "死任务 A", now),
+		item(workspaceapp.KindHumanRequest, "人工请求 A", now),
+	}}
+	deliveryProvider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindIssueConfirmation, "问题 A", now),
+	}}
 
-	defaulted, err := service.List(context.Background(), workspace.Query{})
+	service := workspaceapp.NewService(versionProvider, designProvider, executionProvider, deliveryProvider)
+	snapshot, err := service.Snapshot(context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
 	if err != nil {
-		t.Fatalf("List(default): %v", err)
-	}
-	if len(defaulted.Items) != 50 {
-		t.Fatalf("default items = %d, want 50", len(defaulted.Items))
-	}
-	if defaulted.Counts.Review != 55 {
-		t.Fatalf("default counts.review = %d, want the pre-truncation 55", defaulted.Counts.Review)
+		t.Fatalf("Snapshot: %v", err)
 	}
 
-	limited, err := service.List(context.Background(), workspace.Query{Limit: 3})
-	if err != nil {
-		t.Fatalf("List(limit=3): %v", err)
-	}
-	if len(limited.Items) != 3 {
-		t.Fatalf("limited items = %d, want 3", len(limited.Items))
-	}
-	if limited.Counts.Review != 55 {
-		t.Fatalf("limited counts.review = %d, want 55", limited.Counts.Review)
-	}
-}
-
-// TestListProviderErrors proves a provider failure aborts the aggregation (the
-// HTTP layer renders the shared 500 envelope) instead of returning partial data.
-func TestListProviderErrors(t *testing.T) {
-	service := workspace.NewService(workspace.Providers{
-		Review: &fakeReviewProvider{err: errors.New("version db unavailable")},
+	assertKinds(t, snapshot.Items, []string{
+		workspaceapp.KindHumanRequest,
+		workspaceapp.KindDesignPending,
+		workspaceapp.KindIssueConfirmation,
+		workspaceapp.KindRequirementConfirmation,
+		workspaceapp.KindCaseConfirmation,
+		workspaceapp.KindDeadWorkItem,
 	})
-	_, err := service.List(context.Background(), workspace.Query{})
-	if err == nil || !strings.Contains(err.Error(), "load reviews") {
-		t.Fatalf("review error = %v, want a wrapped load reviews error", err)
+	if snapshot.Counts.HumanRequest != 1 || snapshot.Counts.DesignPending != 1 ||
+		snapshot.Counts.IssueConfirmation != 1 || snapshot.Counts.RequirementConfirmation != 1 ||
+		snapshot.Counts.CaseConfirmation != 1 || snapshot.Counts.DeadWorkItem != 1 {
+		t.Fatalf("counts = %+v, want one of each kind", snapshot.Counts)
 	}
-
-	service = workspace.NewService(workspace.Providers{
-		Review:    &fakeReviewProvider{},
-		Execution: &fakeExecutionProvider{err: errors.New("execution db unavailable")},
-	})
-	_, err = service.List(context.Background(), workspace.Query{Admin: true})
-	if err == nil || !strings.Contains(err.Error(), "load takeovers") {
-		t.Fatalf("execution error = %v, want a wrapped load takeovers error", err)
+	for _, provider := range []*fakeProvider{versionProvider, designProvider, executionProvider, deliveryProvider} {
+		if provider.calls != 1 {
+			t.Fatalf("provider calls = %d, want 1", provider.calls)
+		}
+	}
+	if executionProvider.viewer.IsAdmin() != true {
+		t.Fatalf("execution provider viewer = %+v, want the admin actor", executionProvider.viewer)
 	}
 }
 
-// TestListAdminWithoutExecutionProvider proves the execution port is optional:
-// a process that wires only the version provider still serves the review group.
-func TestListAdminWithoutExecutionProvider(t *testing.T) {
-	base := time.Date(2026, 10, 29, 9, 0, 0, 0, time.UTC)
-	snapshot, err := workspace.NewService(workspace.Providers{
-		Review: &fakeReviewProvider{rows: reviewRows(base)},
-	}).List(context.Background(), workspace.Query{Admin: true})
+func TestSnapshotCountsAreComputedBeforeLimit(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindRequirementConfirmation, "需求 1", now),
+		item(workspaceapp.KindRequirementConfirmation, "需求 2", now.Add(-time.Minute)),
+		item(workspaceapp.KindRequirementConfirmation, "需求 3", now.Add(-2*time.Minute)),
+	}}
+
+	snapshot, err := workspaceapp.NewService(provider).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 2)
 	if err != nil {
-		t.Fatalf("List: %v", err)
+		t.Fatalf("Snapshot: %v", err)
 	}
-	if snapshot.Counts.Review != 2 || len(snapshot.Items) != 2 {
-		t.Fatalf("snapshot = %+v, want the two review items", snapshot)
+	if len(snapshot.Items) != 2 {
+		t.Fatalf("items = %d, want 2 after the limit", len(snapshot.Items))
+	}
+	if snapshot.Counts.RequirementConfirmation != 3 {
+		t.Fatalf("requirement count = %d, want the pre-limit 3", snapshot.Counts.RequirementConfirmation)
 	}
 }
 
-// TestNewServiceRequiresReviewProvider proves a process without the review port
-// fails loudly instead of silently serving an empty todo centre.
-func TestNewServiceRequiresReviewProvider(t *testing.T) {
-	_, err := workspace.NewService(workspace.Providers{}).List(context.Background(), workspace.Query{})
-	if err == nil || !strings.Contains(err.Error(), "review provider is not configured") {
-		t.Fatalf("error = %v, want the missing review provider error", err)
+func TestSnapshotSortsWithinKindByCreatedAtDesc(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	older := item(workspaceapp.KindIssueConfirmation, "旧问题", now.Add(-time.Hour))
+	newer := item(workspaceapp.KindIssueConfirmation, "新问题", now)
+	tied := item(workspaceapp.KindIssueConfirmation, "同时间问题", now)
+
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{older, newer, tied}}
+	snapshot, err := workspaceapp.NewService(provider).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	assertKinds(t, snapshot.Items, []string{
+		workspaceapp.KindIssueConfirmation,
+		workspaceapp.KindIssueConfirmation,
+		workspaceapp.KindIssueConfirmation,
+	})
+	if snapshot.Items[0].Title != "新问题" || snapshot.Items[1].Title != "同时间问题" || snapshot.Items[2].Title != "旧问题" {
+		t.Fatalf("titles = %q, %q, %q; want newest first and stable ties",
+			snapshot.Items[0].Title, snapshot.Items[1].Title, snapshot.Items[2].Title)
+	}
+}
+
+func TestSnapshotDropsAdminOnlyDeadWorkItemsForRegularUsers(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindHumanRequest, "冲突请求", now),
+		item(workspaceapp.KindDeadWorkItem, "死任务", now),
+	}}
+
+	snapshot, err := workspaceapp.NewService(provider).Snapshot(
+		context.Background(), platform.Actor{ID: 9001, Role: "user"}, 50)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	assertKinds(t, snapshot.Items, []string{workspaceapp.KindHumanRequest})
+	if snapshot.Counts.DeadWorkItem != 0 {
+		t.Fatalf("dead count = %d, want 0 for a regular user", snapshot.Counts.DeadWorkItem)
+	}
+}
+
+func TestSnapshotKeepsAdminOnlyDeadWorkItemsForAdmins(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindDeadWorkItem, "死任务", now),
+	}}
+
+	snapshot, err := workspaceapp.NewService(provider).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	assertKinds(t, snapshot.Items, []string{workspaceapp.KindDeadWorkItem})
+	if snapshot.Counts.DeadWorkItem != 1 {
+		t.Fatalf("dead count = %d, want 1", snapshot.Counts.DeadWorkItem)
+	}
+}
+
+func TestSnapshotEmptyState(t *testing.T) {
+	snapshot, err := workspaceapp.NewService(&fakeProvider{}).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.Items == nil {
+		t.Fatal("items must be an empty non-nil slice")
+	}
+	if len(snapshot.Items) != 0 {
+		t.Fatalf("items = %d, want 0", len(snapshot.Items))
+	}
+	if snapshot.Counts != (workspaceapp.Counts{}) {
+		t.Fatalf("counts = %+v, want all zero", snapshot.Counts)
+	}
+}
+
+func TestSnapshotPropagatesProviderErrors(t *testing.T) {
+	sentinel := errors.New("query reader unavailable")
+	provider := &fakeProvider{err: sentinel}
+
+	_, err := workspaceapp.NewService(provider).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Snapshot error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestSnapshotNormalizesLimit(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	makeItems := func(count int) []workspaceapp.TodoItem {
+		items := make([]workspaceapp.TodoItem, 0, count)
+		for index := 0; index < count; index++ {
+			items = append(items, item(workspaceapp.KindCaseConfirmation, "用例", now.Add(-time.Duration(index)*time.Second)))
+		}
+		return items
+	}
+
+	t.Run("zero falls back to the default 50", func(t *testing.T) {
+		snapshot, err := workspaceapp.NewService(&fakeProvider{items: makeItems(51)}).Snapshot(
+			context.Background(), platform.Actor{ID: 1, Role: "admin"}, 0)
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		if len(snapshot.Items) != workspaceapp.DefaultLimit {
+			t.Fatalf("items = %d, want default %d", len(snapshot.Items), workspaceapp.DefaultLimit)
+		}
+		if snapshot.Counts.CaseConfirmation != 51 {
+			t.Fatalf("count = %d, want the pre-limit 51", snapshot.Counts.CaseConfirmation)
+		}
+	})
+
+	t.Run("above the maximum is capped at 200", func(t *testing.T) {
+		snapshot, err := workspaceapp.NewService(&fakeProvider{items: makeItems(201)}).Snapshot(
+			context.Background(), platform.Actor{ID: 1, Role: "admin"}, 201)
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		if len(snapshot.Items) != workspaceapp.MaxLimit {
+			t.Fatalf("items = %d, want max %d", len(snapshot.Items), workspaceapp.MaxLimit)
+		}
+		if snapshot.Counts.CaseConfirmation != 201 {
+			t.Fatalf("count = %d, want 201", snapshot.Counts.CaseConfirmation)
+		}
+	})
+}
+
+func TestSnapshotDefaultsTo50ForNegativeLimit(t *testing.T) {
+	items := make([]workspaceapp.TodoItem, 0, 51)
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	for index := 0; index < 51; index++ {
+		items = append(items, item(workspaceapp.KindCaseConfirmation, "用例", now))
+	}
+	snapshot, err := workspaceapp.NewService(&fakeProvider{items: items}).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, -1)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(snapshot.Items) != workspaceapp.DefaultLimit {
+		t.Fatalf("items = %d, want default %d", len(snapshot.Items), workspaceapp.DefaultLimit)
+	}
+}
+
+// --- version title decoration -------------------------------------------------
+
+// fakeTitleReader is the narrow version application port used to decorate todo
+// items whose provider cannot read another context's version titles. It records
+// every batch so the tests can prove a single deduplicated call.
+type fakeTitleReader struct {
+	titles map[int64]string
+	err    error
+
+	calls int
+	ids   [][]int64
+}
+
+func (f *fakeTitleReader) VersionTitles(_ context.Context, ids []int64) (map[int64]string, error) {
+	f.calls++
+	f.ids = append(f.ids, append([]int64(nil), ids...))
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.titles, nil
+}
+
+func untitledItem(kind, title string, versionID int64, createdAt time.Time) workspaceapp.TodoItem {
+	return workspaceapp.TodoItem{
+		Kind:      kind,
+		Title:     title,
+		VersionID: versionID,
+		Severity:  "warning",
+		CreatedAt: createdAt,
+	}
+}
+
+func todoByKind(t *testing.T, items []workspaceapp.TodoItem, kind string) workspaceapp.TodoItem {
+	t.Helper()
+	for _, it := range items {
+		if it.Kind == kind {
+			return it
+		}
+	}
+	t.Fatalf("todo kind %q not found in %v", kind, kinds(items))
+	return workspaceapp.TodoItem{}
+}
+
+func TestSnapshotDecoratesMissingVersionTitlesInOneBatch(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		untitledItem(workspaceapp.KindRequirementConfirmation, "需求 A", 2001, now),
+		untitledItem(workspaceapp.KindCaseConfirmation, "用例 A", 2002, now.Add(-time.Minute)),
+		untitledItem(workspaceapp.KindIssueConfirmation, "问题 A", 2001, now.Add(-2*time.Minute)),
+		{
+			Kind:         workspaceapp.KindDesignPending,
+			Title:        "2 条待设计",
+			VersionID:    2003,
+			VersionTitle: "既有标题",
+			Severity:     workspaceapp.SeverityWarning,
+			CreatedAt:    now.Add(-3 * time.Minute),
+		},
+		untitledItem(workspaceapp.KindHumanRequest, "人工请求", 0, now.Add(-4*time.Minute)),
+		untitledItem(workspaceapp.KindDeadWorkItem, "死任务", -1, now.Add(-5*time.Minute)),
+	}}
+	titles := &fakeTitleReader{titles: map[int64]string{
+		2001: "订单中心",
+		2002: "结算中心",
+	}}
+
+	snapshot, err := workspaceapp.NewService(provider).WithVersionTitles(titles).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if titles.calls != 1 {
+		t.Fatalf("VersionTitles calls = %d, want 1 batch call", titles.calls)
+	}
+	if want := []int64{2001, 2002}; !reflect.DeepEqual(titles.ids[0], want) {
+		t.Fatalf("VersionTitles ids = %v, want deduplicated %v", titles.ids[0], want)
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindRequirementConfirmation).VersionTitle; got != "订单中心" {
+		t.Fatalf("requirement version_title = %q, want %q", got, "订单中心")
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindCaseConfirmation).VersionTitle; got != "结算中心" {
+		t.Fatalf("case version_title = %q, want %q", got, "结算中心")
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindIssueConfirmation).VersionTitle; got != "订单中心" {
+		t.Fatalf("issue version_title = %q, want %q", got, "订单中心")
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindDesignPending).VersionTitle; got != "既有标题" {
+		t.Fatalf("prefilled version_title = %q, want unchanged %q", got, "既有标题")
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindHumanRequest).VersionTitle; got != "" {
+		t.Fatalf("human request with version_id 0 = %q, want empty", got)
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindDeadWorkItem).VersionTitle; got != "" {
+		t.Fatalf("dead work item with a non-positive version_id = %q, want empty", got)
+	}
+}
+
+func TestSnapshotSkipsVersionTitleReadWhenNoTitleMissing(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		item(workspaceapp.KindCaseConfirmation, "用例 A", now),
+		untitledItem(workspaceapp.KindHumanRequest, "人工请求", 0, now),
+	}}
+	titles := &fakeTitleReader{titles: map[int64]string{2001: "订单中心"}}
+
+	if _, err := workspaceapp.NewService(provider).WithVersionTitles(titles).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if titles.calls != 0 {
+		t.Fatalf("VersionTitles calls = %d, want 0 when every title is present", titles.calls)
+	}
+}
+
+func TestSnapshotPropagatesVersionTitleErrors(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	sentinel := errors.New("version titles unavailable")
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		untitledItem(workspaceapp.KindCaseConfirmation, "用例 A", 2001, now),
+	}}
+
+	_, err := workspaceapp.NewService(provider).
+		WithVersionTitles(&fakeTitleReader{err: sentinel}).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Snapshot error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestSnapshotWithoutVersionTitleReaderKeepsTitlesEmpty(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{items: []workspaceapp.TodoItem{
+		untitledItem(workspaceapp.KindCaseConfirmation, "用例 A", 2001, now),
+	}}
+
+	snapshot, err := workspaceapp.NewService(provider).Snapshot(
+		context.Background(), platform.Actor{ID: 1, Role: "admin"}, 50)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := todoByKind(t, snapshot.Items, workspaceapp.KindCaseConfirmation).VersionTitle; got != "" {
+		t.Fatalf("case version_title = %q, want empty without a wired reader", got)
 	}
 }

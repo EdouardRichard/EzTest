@@ -2,335 +2,111 @@ package gitx_test
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/gitx"
 )
 
-// TestFileDiffOversizedPatchReturnsEmptyTruncated pins design spec §6.1 and
-// ruling R18: a patch over maxBytes returns no error, an empty patch and
-// truncated=true; an exact fit is still returned whole.
-func TestFileDiffOversizedPatchReturnsEmptyTruncated(t *testing.T) {
-	fx := newTestRepo(t)
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+func diffByPath(t *testing.T, files []codeintel.ChangedFile) map[string]codeintel.ChangedFile {
+	t.Helper()
+	byPath := make(map[string]codeintel.ChangedFile, len(files))
+	for _, file := range files {
+		byPath[file.Path] = file
+	}
+	return byPath
+}
+
+func TestDiffParsesRawAndNumstat(t *testing.T) {
+	fixture := newGitFixture(t)
+	client := newClient(t)
 	ctx := context.Background()
 
-	full, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(full): %v", err)
-	}
-	if full.Truncated || full.Patch == "" {
-		t.Fatalf("FileDiff(full) patch=%q truncated=%v want the whole patch", full.Patch, full.Truncated)
-	}
-
-	exact, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", len(full.Patch))
-	if err != nil {
-		t.Fatalf("FileDiff(exact): %v", err)
-	}
-	if exact.Truncated || exact.Patch != full.Patch {
-		t.Fatalf("FileDiff(exact) len=%d truncated=%v want the exact-fit patch", len(exact.Patch), exact.Truncated)
-	}
-
-	oversized, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", len(full.Patch)-1)
-	if err != nil {
-		t.Fatalf("FileDiff(oversized) returned %v, want the empty-patch contract", err)
-	}
-	if !oversized.Truncated || oversized.Patch != "" {
-		t.Fatalf("FileDiff(oversized) patch=%q truncated=%v want an empty patch marked truncated", oversized.Patch, oversized.Truncated)
-	}
-	if oversized.Status != "M" || oversized.Path != "src/api/refund.ts" || oversized.Binary {
-		t.Fatalf("FileDiff(oversized)=%+v want the change-set metadata preserved", oversized)
-	}
-}
-
-// TestFileDiffOutputOverflowReturnsTruncated pins R18 for the command bound: a
-// single-file patch above the 4 MiB stdout limit returns an empty truncated
-// patch, never an error.
-func TestFileDiffOutputOverflowReturnsTruncated(t *testing.T) {
-	dir := t.TempDir()
-	runGit(t, dir, "init", "-q", "-b", "main")
-	runGit(t, dir, "config", "user.email", testEmail)
-	runGit(t, dir, "config", "user.name", testAuthor)
-	runGit(t, dir, "config", "core.autocrlf", "false")
-	writeRepoFile(t, dir, "base.txt", "base\n")
-	base := commitRepo(t, dir, "base", commit1Date)
-	writeRepoFile(t, dir, "large.txt", strings.Repeat("x", 4<<20+1024)+"\n")
-	head := commitRepo(t, dir, "large", commit2Date)
-
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second})
-	diff, err := r.FileDiff(context.Background(), dir, base, head, "large.txt", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(overflow) returned %v, want an empty truncated patch", err)
-	}
-	if !diff.Truncated || diff.Patch != "" {
-		t.Fatalf("FileDiff(overflow) patch=%q truncated=%v want an empty patch marked truncated", diff.Patch, diff.Truncated)
-	}
-}
-
-// TestFileDiffKeepsTextPatchContainingBinaryMarker is the regression test for
-// the removed text sniff: a text patch whose content contains the literal
-// "Binary files " must not be emptied or marked binary. Binary detection comes
-// only from the numstat "-" / change-set Binary flag.
-func TestFileDiffKeepsTextPatchContainingBinaryMarker(t *testing.T) {
-	fx := newTestRepo(t)
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
-
-	diff, err := r.FileDiff(context.Background(), fx.dir, fx.commit1, fx.commit2, "src/notes/binary-note.txt", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(binary-marker): %v", err)
-	}
-	if diff.Binary {
-		t.Fatalf("FileDiff(binary-marker).Binary=true want false for a text file")
-	}
-	if diff.Truncated {
-		t.Fatalf("FileDiff(binary-marker).Truncated=true want false")
-	}
-	if !strings.Contains(diff.Patch, "@@") {
-		t.Fatalf("FileDiff(binary-marker) patch=%q want a unified diff", diff.Patch)
-	}
-	if !strings.Contains(diff.Patch, "Binary files a/logo.png and b/logo.png differ") {
-		t.Fatalf("FileDiff(binary-marker) patch=%q want the text line preserved", diff.Patch)
-	}
-}
-
-// TestFileDiffDisablesTextconv pins --no-textconv: a repository-configured
-// textconv driver must not execute or rewrite the returned patch.
-func TestFileDiffDisablesTextconv(t *testing.T) {
-	dir := t.TempDir()
-	runGit(t, dir, "init", "-q", "-b", "main")
-	runGit(t, dir, "config", "user.email", testEmail)
-	runGit(t, dir, "config", "user.name", testAuthor)
-	runGit(t, dir, "config", "core.autocrlf", "false")
-	runGit(t, dir, "config", "core.safecrlf", "false")
-	writeRepoFile(t, dir, "notes.txt", "alpha\nbeta\n")
-	base := commitRepo(t, dir, "base", commit1Date)
-	writeRepoFile(t, dir, "notes.txt", "alpha\ngamma\n")
-	writeRepoFile(t, dir, ".gitattributes", "notes.txt diff=upper\n")
-	head := commitRepo(t, dir, "head", commit2Date)
-	runGit(t, dir, "config", "diff.upper.textconv", "echo TEXTCONV")
-
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
-	diff, err := r.FileDiff(context.Background(), dir, base, head, "notes.txt", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(textconv): %v", err)
-	}
-	if strings.Contains(diff.Patch, "TEXTCONV") {
-		t.Fatalf("FileDiff(textconv) patch=%q ran the repository textconv driver", diff.Patch)
-	}
-	if !strings.Contains(diff.Patch, "gamma") {
-		t.Fatalf("FileDiff(textconv) patch=%q want the real text content", diff.Patch)
-	}
-}
-
-// TestDiffStatuses pins the two-command file-level diff: statuses, rename old
-// paths, binary detection, head blob hashes, -z special file names and ordering.
-func TestDiffStatuses(t *testing.T) {
-	fx := newTestRepo(t)
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
-	ctx := context.Background()
-
-	changes, err := r.Diff(ctx, fx.dir, fx.commit1, fx.commit2)
+	result, err := client.Diff(ctx, fixture.dir, fixture.c1, fixture.c2, 100)
 	if err != nil {
 		t.Fatalf("Diff: %v", err)
 	}
-	if changes.Truncated {
-		t.Fatal("Diff.Truncated=true want false")
+	if result.Truncated {
+		t.Fatal("Diff unexpectedly truncated")
 	}
-	if changes.ChangeSetID != nil {
-		t.Fatalf("Diff.ChangeSetID=%v want nil for a preview read", *changes.ChangeSetID)
+	byPath := diffByPath(t, result.Files)
+
+	renamed, ok := byPath["src/renamed a.ts"]
+	if !ok {
+		t.Fatalf("renamed file missing from %v", result.Files)
 	}
-	if len(changes.Files) == 0 {
-		t.Fatal("Diff returned no changed files")
+	if renamed.Status != "renamed" || renamed.OldPath != "src/a.ts" ||
+		renamed.Additions != 0 || renamed.HeadBlobSHA == nil || len(*renamed.HeadBlobSHA) != 40 {
+		t.Fatalf("renamed entry = %+v", renamed)
 	}
 
-	index := make(map[string]domain.ChangedFile, len(changes.Files))
-	for _, file := range changes.Files {
-		if _, duplicate := index[file.Path]; duplicate {
-			t.Fatalf("Diff returned duplicate path %q", file.Path)
+	added, ok := byPath["src/new.ts"]
+	if !ok || added.Status != "added" || added.Additions != 1 || added.Deletions != 0 {
+		t.Fatalf("added entry = %+v (ok=%v)", added, ok)
+	}
+
+	deleted, ok := byPath["src/old.ts"]
+	if !ok || deleted.Status != "deleted" || deleted.HeadBlobSHA != nil {
+		t.Fatalf("deleted entry = %+v (ok=%v)", deleted, ok)
+	}
+
+	binary, ok := byPath["src/assets/logo.bin"]
+	if !ok || !binary.Binary || binary.Status != "modified" {
+		t.Fatalf("binary entry = %+v (ok=%v)", binary, ok)
+	}
+
+	weird, ok := byPath["src/weird name$().ts"]
+	if !ok || weird.Status != "modified" || weird.Additions != 1 {
+		t.Fatalf("shell-metacharacter path entry = %+v (ok=%v)", weird, ok)
+	}
+
+	sorted := true
+	for index := 1; index < len(result.Files); index++ {
+		if result.Files[index-1].Path > result.Files[index].Path {
+			sorted = false
+			break
 		}
-		index[file.Path] = file
 	}
-	for i := 1; i < len(changes.Files); i++ {
-		if changes.Files[i-1].Path >= changes.Files[i].Path {
-			t.Fatalf("Diff files are not path sorted: %q then %q", changes.Files[i-1].Path, changes.Files[i].Path)
-		}
-	}
-
-	refund, ok := index["src/api/refund.ts"]
-	if !ok {
-		t.Fatalf("Diff missing modified src/api/refund.ts (got %v)", keys(index))
-	}
-	wantHash := "git-sha1:" + runGit(t, fx.dir, "rev-parse", fx.commit2+":src/api/refund.ts")
-	if refund.Status != "M" || refund.Additions == 0 || refund.Deletions == 0 || refund.Binary {
-		t.Fatalf("refund change=%+v want modified non-binary with stats", refund)
-	}
-	if refund.HeadBlobHash != wantHash {
-		t.Fatalf("refund HeadBlobHash=%q want %q", refund.HeadBlobHash, wantHash)
-	}
-
-	added, ok := index["src/api/refund.test.ts"]
-	if !ok || added.Status != "A" || added.OldPath != nil {
-		t.Fatalf("added change=%+v present=%v want status A without old path", added, ok)
-	}
-
-	deleted, ok := index["docs/guide.md"]
-	if !ok {
-		t.Fatalf("Diff missing deleted docs/guide.md (got %v)", keys(index))
-	}
-	if deleted.Status != "D" || deleted.HeadBlobHash != "" || deleted.Additions != 0 || deleted.Deletions != 3 {
-		t.Fatalf("deleted change=%+v want status D, empty head hash, 3 deletions", deleted)
-	}
-
-	renamed, ok := index["src/api/refund-v2.ts"]
-	if !ok {
-		t.Fatalf("Diff missing renamed src/api/refund-v2.ts (got %v)", keys(index))
-	}
-	if renamed.Status != "R100" || renamed.OldPath == nil || *renamed.OldPath != "src/api/legacy.ts" {
-		t.Fatalf("renamed change=%+v want status R100 oldPath src/api/legacy.ts", renamed)
-	}
-	if !strings.HasPrefix(renamed.HeadBlobHash, "git-sha1:") {
-		t.Fatalf("renamed HeadBlobHash=%q want a git-sha1 hash", renamed.HeadBlobHash)
-	}
-
-	logo, ok := index["assets/logo.png"]
-	if !ok || !logo.Binary || logo.Status != "M" || logo.Additions != 0 || logo.Deletions != 0 {
-		t.Fatalf("binary change=%+v present=%v want status M binary with no line stats", logo, ok)
-	}
-
-	notes, ok := index["src/notes/说明 文档.md"]
-	if !ok || notes.Status != "M" {
-		t.Fatalf("special-name change=%+v present=%v want status M", notes, ok)
-	}
-
-	var stats struct {
-		Additions    int  `json:"additions"`
-		ChangedFiles int  `json:"changedFiles"`
-		Deletions    int  `json:"deletions"`
-		Truncated    bool `json:"truncated"`
-	}
-	if len(changes.Stats) == 0 {
-		t.Fatal("Diff.Stats is empty")
-	}
-	if err := json.Unmarshal(changes.Stats, &stats); err != nil {
-		t.Fatalf("Diff.Stats is not JSON: %v (%s)", err, changes.Stats)
-	}
-	if stats.ChangedFiles != len(changes.Files) || stats.Truncated {
-		t.Fatalf("Diff.Stats=%+v want changedFiles=%d truncated=false", stats, len(changes.Files))
-	}
-
-	same, err := r.Diff(ctx, fx.dir, fx.commit2, fx.commit2)
-	if err != nil {
-		t.Fatalf("Diff(same commit): %v", err)
-	}
-	if len(same.Files) != 0 || same.Truncated {
-		t.Fatalf("Diff(same commit)=%+v want no changes", same)
-	}
-
-	_, err = r.Diff(ctx, fx.dir, strings.Repeat("0", 40), fx.commit2)
-	requireDomainInvalid(t, err, "commit_not_found")
-}
-
-// TestDiffTruncatesAt2000 pins the stored change-set bound: the listing is
-// sorted by path and cut at domain.MaxChangedFilesStored with truncated=true.
-func TestDiffTruncatesAt2000(t *testing.T) {
-	if testing.Short() {
-		t.Skip("creates 2000+ files")
-	}
-	dir := t.TempDir()
-	runGit(t, dir, "init", "-q", "-b", "main")
-	runGit(t, dir, "config", "user.email", testEmail)
-	runGit(t, dir, "config", "user.name", testAuthor)
-	writeRepoFile(t, dir, "base.txt", "base\n")
-	base := commitRepo(t, dir, "base", commit1Date)
-
-	const added = domain.MaxChangedFilesStored + 1
-	for i := 0; i < added; i++ {
-		writeRepoFile(t, dir, fmt.Sprintf("bulk/file-%04d.txt", i), "x\n")
-	}
-	head := commitRepo(t, dir, "bulk", commit2Date)
-
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second})
-	changes, err := r.Diff(context.Background(), dir, base, head)
-	if err != nil {
-		t.Fatalf("Diff(bulk): %v", err)
-	}
-	if !changes.Truncated {
-		t.Fatalf("Diff(bulk).Truncated=false want true for %d files", added)
-	}
-	if len(changes.Files) != domain.MaxChangedFilesStored {
-		t.Fatalf("Diff(bulk) files=%d want %d", len(changes.Files), domain.MaxChangedFilesStored)
-	}
-	if changes.Files[0].Path != "bulk/file-0000.txt" {
-		t.Fatalf("Diff(bulk) first path=%q want bulk/file-0000.txt", changes.Files[0].Path)
-	}
-	if last := changes.Files[len(changes.Files)-1].Path; last != "bulk/file-1999.txt" {
-		t.Fatalf("Diff(bulk) last path=%q want bulk/file-1999.txt", last)
+	if !sorted {
+		t.Fatalf("diff entries are not sorted by path: %+v", result.Files)
 	}
 }
 
-// TestFileDiffStatusBinaryAndTruncation pins the on-demand unified diff:
-// change-set status, the binary/deleted empty-patch rule, the oversize
-// empty-patch contract and the not_changed rejection.
-func TestFileDiffStatusBinaryAndTruncation(t *testing.T) {
-	fx := newTestRepo(t)
-	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
-	ctx := context.Background()
-
-	text, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", 1<<20)
+func TestDiffTruncatesAtMax(t *testing.T) {
+	fixture := newGitFixture(t)
+	client := newClient(t)
+	result, err := client.Diff(context.Background(), fixture.dir, fixture.c1, fixture.c2, 1)
 	if err != nil {
-		t.Fatalf("FileDiff(text): %v", err)
+		t.Fatalf("Diff truncated: %v", err)
 	}
-	if text.BaseCommit != fx.commit1 || text.HeadCommit != fx.commit2 || text.Path != "src/api/refund.ts" {
-		t.Fatalf("FileDiff(text)=%+v want pinned commits and path", text)
+	if len(result.Files) != 1 || !result.Truncated {
+		t.Fatalf("truncated diff = %d files, truncated=%v", len(result.Files), result.Truncated)
 	}
-	if text.Status != "M" || text.Binary || text.Truncated {
-		t.Fatalf("FileDiff(text) status=%q binary=%v truncated=%v want M/false/false", text.Status, text.Binary, text.Truncated)
-	}
-	if !strings.Contains(text.Patch, "@@") || !strings.Contains(text.Patch, "export function refund") {
-		t.Fatalf("FileDiff(text) patch=%q want a unified diff", text.Patch)
-	}
+}
 
-	binary, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "assets/logo.png", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(binary): %v", err)
+func TestDiffRejectsUnknownCommits(t *testing.T) {
+	fixture := newGitFixture(t)
+	client := newClient(t)
+	const missing = "0000000000000000000000000000000000000000"
+	if _, err := client.Diff(context.Background(), fixture.dir, missing, fixture.c2, 10); errorCode(t, err) != "commit_not_found" {
+		t.Fatalf("bad base code = %q", errorCode(t, err))
 	}
-	if !binary.Binary || binary.Status != "M" || binary.Patch != "" || binary.Truncated {
-		t.Fatalf("FileDiff(binary)=%+v want binary M with an empty un-truncated patch", binary)
+	if _, err := client.Diff(context.Background(), fixture.dir, fixture.c1, missing, 10); errorCode(t, err) != "commit_not_found" {
+		t.Fatalf("bad head code = %q", errorCode(t, err))
 	}
+}
 
-	deleted, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "docs/guide.md", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(deleted): %v", err)
+func TestGitTimeoutIsPerCommand(t *testing.T) {
+	fixture := newGitFixture(t)
+	client := gitx.New(nil, time.Nanosecond)
+	// A nanosecond timeout is enough to prove the timeout is enforced on every
+	// command rather than only at construction time.
+	_, err := client.Diff(context.Background(), fixture.dir, fixture.c1, fixture.c2, 10)
+	if err == nil {
+		t.Fatal("expected a timeout error")
 	}
-	if deleted.Status != "D" || deleted.Patch != "" || deleted.Binary {
-		t.Fatalf("FileDiff(deleted)=%+v want status D with an empty patch", deleted)
+	if code := errorCode(t, err); code != "git_unavailable" {
+		t.Fatalf("timeout code = %q", code)
 	}
-
-	truncated, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", 20)
-	if err != nil {
-		t.Fatalf("FileDiff(truncated): %v", err)
-	}
-	if !truncated.Truncated || truncated.Patch != "" {
-		t.Fatalf("FileDiff(truncated) patch=%q truncated=%v want an empty patch marked truncated", truncated.Patch, truncated.Truncated)
-	}
-
-	renamed, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund-v2.ts", 1<<20)
-	if err != nil {
-		t.Fatalf("FileDiff(renamed): %v", err)
-	}
-	if renamed.Status != "R100" {
-		t.Fatalf("FileDiff(renamed).Status=%q want R100 from the change set", renamed.Status)
-	}
-
-	_, err = r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/data/lines.txt", 1<<20)
-	requireDomainInvalid(t, err, "not_changed")
-	_, err = r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "../secret", 1<<20)
-	requireDomainInvalid(t, err, "path_escape")
-	_, err = r.FileDiff(ctx, fx.dir, fx.commit1, strings.Repeat("0", 40), "src/api/refund.ts", 1<<20)
-	requireDomainInvalid(t, err, "commit_not_found")
 }

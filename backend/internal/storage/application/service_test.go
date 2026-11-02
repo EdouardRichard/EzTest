@@ -1,231 +1,545 @@
-package application
+package storageapp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
-	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
-	storage "github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
 )
 
-const (
-	testSHA  = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
-	testPath = "8f/43/8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
-)
+var fixedTime = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
-// fakeStore is a storage.Store whose results the test controls.
-type fakeStore struct {
-	putObject    storage.Object
-	putErr       error
-	openReader   io.ReadCloser
-	openObject   storage.Object
-	openErr      error
-	statObject   storage.Object
-	statErr      error
-	putCalls     int
-	lastType     string
-	lastPutBytes string
+type fakeRepository struct {
+	mu       sync.Mutex
+	objects  map[string]storage.Object
+	refs     map[int64]storage.Ref
+	nextRef  int64
+	putCalls int
+	getErr   error
 }
 
-func (f *fakeStore) Put(_ context.Context, r io.Reader, contentType string) (storage.Object, error) {
+func newFakeRepository() *fakeRepository {
+	return &fakeRepository{
+		objects: make(map[string]storage.Object),
+		refs:    make(map[int64]storage.Ref),
+	}
+}
+
+func (f *fakeRepository) PutObject(_ context.Context, object storage.Object) (storage.Object, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.putCalls++
-	f.lastType = contentType
-	if r != nil {
-		data, _ := io.ReadAll(r)
-		f.lastPutBytes = string(data)
+	if existing, ok := f.objects[object.SHA256]; ok {
+		return existing, false, nil
 	}
-	obj := f.putObject
-	obj.ContentType = contentType
-	return obj, f.putErr
-}
-
-func (f *fakeStore) Open(context.Context, string) (io.ReadCloser, storage.Object, error) {
-	return f.openReader, f.openObject, f.openErr
-}
-
-func (f *fakeStore) Stat(context.Context, string) (storage.Object, error) {
-	return f.statObject, f.statErr
-}
-
-// fakeMetadata is an in-memory MetadataRepository with insert-only semantics.
-type fakeMetadata struct {
-	mu        sync.Mutex
-	rows      map[string]ObjectMetadata
-	insertErr error
-	findErr   error
-}
-
-func newFakeMetadata() *fakeMetadata {
-	return &fakeMetadata{rows: make(map[string]ObjectMetadata)}
-}
-
-func (m *fakeMetadata) Insert(_ context.Context, metadata ObjectMetadata) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.insertErr != nil {
-		return false, m.insertErr
+	if object.CreatedAt.IsZero() {
+		object.CreatedAt = fixedTime
 	}
-	if _, ok := m.rows[metadata.SHA256]; ok {
-		return false, nil
+	f.objects[object.SHA256] = object
+	return object, true, nil
+}
+
+func (f *fakeRepository) GetObject(_ context.Context, sha string) (storage.Object, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return storage.Object{}, f.getErr
 	}
-	m.rows[metadata.SHA256] = metadata
-	return true, nil
-}
-
-func (m *fakeMetadata) Find(_ context.Context, sha256 string) (ObjectMetadata, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.findErr != nil {
-		return ObjectMetadata{}, false, m.findErr
+	object, ok := f.objects[sha]
+	if !ok {
+		return storage.Object{}, storage.ErrNotFound
 	}
-	metadata, ok := m.rows[sha256]
-	return metadata, ok, nil
+	return object, nil
 }
 
-// capturingRecorder keeps the audit entries recorded during a test.
-type capturingRecorder struct {
-	entries []auditdomain.Entry
+func (f *fakeRepository) AddRef(_ context.Context, ref storage.Ref) (storage.Ref, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextRef++
+	ref.ID = f.nextRef
+	if ref.CreatedAt.IsZero() {
+		ref.CreatedAt = fixedTime
+	}
+	f.refs[ref.ID] = ref
+	return ref, nil
 }
 
-func (r *capturingRecorder) Record(_ context.Context, entry auditdomain.Entry) error {
-	r.entries = append(r.entries, entry)
+func (f *fakeRepository) ReplaceRef(_ context.Context, ref storage.Ref) (storage.Ref, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := int64(1); id <= f.nextRef; id++ {
+		existing, ok := f.refs[id]
+		if !ok || existing.OwnerKind != ref.OwnerKind || existing.OwnerID != ref.OwnerID ||
+			existing.Role != ref.Role || existing.DeletedAt != nil {
+			continue
+		}
+		if existing.ObjectID != ref.ObjectID {
+			existing.ObjectID = ref.ObjectID
+			f.refs[id] = existing
+		}
+		ref.ID = existing.ID
+		ref.CreatedAt = existing.CreatedAt
+		return ref, nil
+	}
+	f.nextRef++
+	ref.ID = f.nextRef
+	if ref.CreatedAt.IsZero() {
+		ref.CreatedAt = fixedTime
+	}
+	f.refs[ref.ID] = ref
+	return ref, nil
+}
+
+func (f *fakeRepository) ListRefs(_ context.Context, ownerKind string, ownerID int64) ([]storage.Ref, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make([]storage.Ref, 0)
+	for id := int64(1); id <= f.nextRef; id++ {
+		ref, ok := f.refs[id]
+		if !ok || ref.OwnerKind != ownerKind || ref.OwnerID != ownerID || ref.DeletedAt != nil {
+			continue
+		}
+		result = append(result, ref)
+	}
+	return result, nil
+}
+
+func (f *fakeRepository) SoftDeleteRef(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ref, ok := f.refs[id]
+	if !ok || ref.DeletedAt != nil {
+		return storage.ErrNotFound
+	}
+	at := fixedTime
+	ref.DeletedAt = &at
+	f.refs[id] = ref
 	return nil
 }
 
-func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Entry, bool, error) {
-	return r.entries, false, nil
+type putCall struct {
+	root string
+	sha  string
+	data []byte
 }
 
-func (r *capturingRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
-	return r.entries, false, nil
+type fakeFileStore struct {
+	mu      sync.Mutex
+	puts    []putCall
+	objects map[string][]byte
+	putErr  error
+	openErr error
 }
 
-// newTestService wires a fake store and the in-memory metadata repository.
-func newTestService(store *fakeStore) (*Service, *fakeMetadata, *capturingRecorder) {
-	metadata := newFakeMetadata()
-	recorder := &capturingRecorder{}
-	return NewService(store, metadata, recorder), metadata, recorder
+func newFakeFileStore() *fakeFileStore {
+	return &fakeFileStore{objects: make(map[string][]byte)}
 }
 
-// TestPutAuditsOnlyNewObjects proves storage_object is the source of truth for
-// the create audit: the first upload inserts the metadata row and records
-// storage.object_created, while a later re-upload of the same bytes dedupes,
-// records nothing, and reports the persisted content type.
-func TestPutAuditsOnlyNewObjects(t *testing.T) {
-	ctx := context.Background()
-	store := &fakeStore{putObject: storage.Object{
-		SHA256:       testSHA,
-		Size:         5,
-		RelativePath: testPath,
-	}}
-	svc, metadata, recorder := newTestService(store)
+func relativePathFor(sha string) string {
+	return "objects/" + sha[0:2] + "/" + sha[2:4] + "/" + sha
+}
 
-	first, err := svc.Put(ctx, strings.NewReader("hello"), "text/plain")
-	if err != nil {
-		t.Fatal(err)
+func (f *fakeFileStore) Put(_ context.Context, root, sha string, data []byte) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.putErr != nil {
+		return "", f.putErr
 	}
-	if first.SHA256 != testSHA || first.Size != 5 || first.ContentType != "text/plain" {
-		t.Fatalf("first object=%+v", first)
+	f.puts = append(f.puts, putCall{root: root, sha: sha, data: append([]byte(nil), data...)})
+	rel := relativePathFor(sha)
+	f.objects[rel] = append([]byte(nil), data...)
+	return rel, nil
+}
+
+func (f *fakeFileStore) Open(_ context.Context, _, rel string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.openErr != nil {
+		return nil, f.openErr
 	}
-	row, ok := metadata.rows[testSHA]
+	data, ok := f.objects[rel]
 	if !ok {
-		t.Fatalf("metadata row was not inserted: %+v", metadata.rows)
+		return nil, storage.ErrNotFound
 	}
-	if row.SHA256 != testSHA || row.Size != 5 || row.ContentType != "text/plain" || row.RelativePath != testPath {
-		t.Fatalf("metadata row=%+v", row)
-	}
-	if len(recorder.entries) != 1 {
-		t.Fatalf("audit entries after first put=%d want 1: %+v", len(recorder.entries), recorder.entries)
-	}
-	entry := recorder.entries[0]
-	if entry.Action != auditapp.ActionStorageObjectCreated || entry.TargetType != "storage_object" || entry.TargetID != testSHA {
-		t.Fatalf("audit entry=%+v", entry)
-	}
-	if entry.Metadata["sha256"] != testSHA || entry.Metadata["size"] != int64(5) || entry.Metadata["content_type"] != "text/plain" {
-		t.Fatalf("audit metadata=%v", entry.Metadata)
-	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
 
-	// A second upload of the same bytes deduplicates to the existing row: it
-	// must not claim a new object was created, and the durable content type
-	// (not the newly requested one) is reported.
-	second, err := svc.Put(ctx, strings.NewReader("hello"), "application/octet-stream")
-	if err != nil {
-		t.Fatal(err)
+func (f *fakeFileStore) putCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.puts)
+}
+
+func (f *fakeFileStore) tamper(rel string, data []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.objects[rel] = append([]byte(nil), data...)
+}
+
+type fakeSettings struct {
+	root string
+	err  error
+}
+
+func (f *fakeSettings) String(context.Context, string) (string, error) {
+	if f.err != nil {
+		return "", f.err
 	}
-	if second.SHA256 != testSHA || second.Size != 5 {
-		t.Fatalf("deduped object=%+v", second)
-	}
-	if second.ContentType != "text/plain" {
-		t.Fatalf("deduped content type=%q want persisted text/plain", second.ContentType)
-	}
-	if len(recorder.entries) != 1 {
-		t.Fatalf("deduped upload recorded an audit entry: %+v", recorder.entries)
-	}
-	if len(metadata.rows) != 1 {
-		t.Fatalf("metadata rows=%d want 1", len(metadata.rows))
+	return f.root, nil
+}
+
+type fakeIDs struct {
+	next int64
+}
+
+func (f *fakeIDs) Next() int64 {
+	f.next++
+	return f.next
+}
+
+type fakePublisher struct {
+	mu     sync.Mutex
+	events []eventingapp.Event
+}
+
+func (f *fakePublisher) Publish(_ context.Context, event eventingapp.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, event)
+	return nil
+}
+
+func (f *fakePublisher) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.events)
+}
+
+type fakeAuditor struct {
+	mu     sync.Mutex
+	events []auditapp.Event
+}
+
+func (f *fakeAuditor) Record(_ context.Context, event auditapp.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, event)
+	return nil
+}
+
+func (f *fakeAuditor) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.events)
+}
+
+type fixture struct {
+	svc       *Service
+	repo      *fakeRepository
+	files     *fakeFileStore
+	settings  *fakeSettings
+	ids       *fakeIDs
+	events    *fakePublisher
+	auditor   *fakeAuditor
+	root      string
+	imageData []byte
+}
+
+func newFixture() *fixture {
+	repo := newFakeRepository()
+	files := newFakeFileStore()
+	settings := &fakeSettings{root: "/var/lib/eztest"}
+	ids := &fakeIDs{}
+	events := &fakePublisher{}
+	auditor := &fakeAuditor{}
+	return &fixture{
+		svc:      New(repo, files, settings, ids, auditor, events),
+		repo:     repo,
+		files:    files,
+		settings: settings,
+		ids:      ids,
+		events:   events,
+		auditor:  auditor,
+		root:     settings.root,
 	}
 }
 
-// TestPutRequiresMetadataInsert proves an object is not reported as stored when
-// its durable metadata could not be persisted; the request fails instead of
-// claiming a creation that the database does not know about.
-func TestPutRequiresMetadataInsert(t *testing.T) {
-	ctx := context.Background()
-	boom := errors.New("metadata database is down")
-	store := &fakeStore{putObject: storage.Object{SHA256: testSHA, Size: 5, RelativePath: testPath}}
-	svc, metadata, recorder := newTestService(store)
-	metadata.insertErr = boom
+func shaHex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
 
-	if _, err := svc.Put(ctx, strings.NewReader("hello"), "text/plain"); !errors.Is(err, boom) {
-		t.Fatalf("put error=%v, want %v", err, boom)
+func TestUploadStoresContentAddressedObject(t *testing.T) {
+	f := newFixture()
+	data := []byte("hello content")
+	wantSHA := shaHex(data)
+
+	object, err := f.svc.Upload(context.Background(), "note.txt", "application/octet-stream", bytes.NewReader(data), MaxUploadBytes, 42)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
 	}
-	if len(recorder.entries) != 0 {
-		t.Fatalf("failed put recorded audit entries: %+v", recorder.entries)
+	if object.SHA256 != wantSHA {
+		t.Fatalf("sha = %q, want %q", object.SHA256, wantSHA)
+	}
+	if object.Size != int64(len(data)) {
+		t.Fatalf("size = %d", object.Size)
+	}
+	if object.MIME != "text/plain; charset=utf-8" {
+		t.Fatalf("mime = %q, want detected text/plain", object.MIME)
+	}
+	if object.RelativePath != relativePathFor(wantSHA) {
+		t.Fatalf("relative path = %q", object.RelativePath)
+	}
+	if f.files.putCount() != 1 {
+		t.Fatalf("file put calls = %d", f.files.putCount())
+	}
+	stored := f.repo.objects[wantSHA]
+	if stored.Size != int64(len(data)) || stored.MIME != object.MIME || stored.RelativePath != object.RelativePath {
+		t.Fatalf("stored object = %#v", stored)
+	}
+
+	if f.events.count() != 1 {
+		t.Fatalf("event count = %d", f.events.count())
+	}
+	event := f.events.events[0]
+	if event.Channel != "system" || event.Type != "content.uploaded" {
+		t.Fatalf("event = %#v", event)
+	}
+	if event.ActorID == nil || *event.ActorID != 42 {
+		t.Fatalf("event actor = %v", event.ActorID)
+	}
+	if event.Payload["sha256"] != wantSHA {
+		t.Fatalf("event payload = %#v", event.Payload)
+	}
+	if f.auditor.count() != 1 || f.auditor.events[0].Action != "content.uploaded" {
+		t.Fatalf("audit = %#v", f.auditor.events)
 	}
 }
 
-// TestOpenAndStatFillContentTypeFromMetadata proves read paths take the media
-// type from the durable metadata row instead of returning an empty type.
-func TestOpenAndStatFillContentTypeFromMetadata(t *testing.T) {
-	ctx := context.Background()
-	store := &fakeStore{
-		openReader: io.NopCloser(strings.NewReader("hello")),
-		openObject: storage.Object{SHA256: testSHA, Size: 5, RelativePath: testPath},
-		statObject: storage.Object{SHA256: testSHA, Size: 5, RelativePath: testPath},
+func TestUploadUsesDataRootSetting(t *testing.T) {
+	f := newFixture()
+	f.settings.root = t.TempDir()
+	if _, err := f.svc.Upload(context.Background(), "a.bin", "", strings.NewReader("abc"), MaxUploadBytes, 1); err != nil {
+		t.Fatalf("Upload: %v", err)
 	}
-	svc, metadata, _ := newTestService(store)
-	if _, err := metadata.Insert(ctx, ObjectMetadata{
-		SHA256:       testSHA,
-		Size:         5,
-		ContentType:  "text/plain; charset=utf-8",
-		RelativePath: testPath,
-	}); err != nil {
-		t.Fatal(err)
+	if len(f.files.puts) != 1 || f.files.puts[0].root != f.settings.root {
+		t.Fatalf("root used = %#v", f.files.puts)
+	}
+}
+
+func TestUploadDeduplicatesExistingContent(t *testing.T) {
+	f := newFixture()
+	data := []byte("same content twice")
+	first, err := f.svc.Upload(context.Background(), "one.txt", "", bytes.NewReader(data), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("first Upload: %v", err)
+	}
+	second, err := f.svc.Upload(context.Background(), "two.txt", "", bytes.NewReader(data), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("second Upload: %v", err)
+	}
+	if first != second {
+		t.Fatalf("dedupe object mismatch: %#v vs %#v", first, second)
+	}
+	if f.files.putCount() != 1 {
+		t.Fatalf("file put calls = %d, want 1", f.files.putCount())
+	}
+	if f.repo.putCalls != 1 {
+		t.Fatalf("object put calls = %d, want 1", f.repo.putCalls)
+	}
+}
+
+func TestUploadRejectsOversizeContent(t *testing.T) {
+	f := newFixture()
+	data := make([]byte, MaxUploadBytes+1)
+	_, err := f.svc.Upload(context.Background(), "big.bin", "", bytes.NewReader(data), MaxUploadBytes, 1)
+	if err == nil {
+		t.Fatal("expected oversize error")
+	}
+	apiErr := platform.AsError(err)
+	if apiErr.Status != http.StatusRequestEntityTooLarge || apiErr.Code != "payload_too_large" {
+		t.Fatalf("error = %#v", apiErr)
+	}
+	if f.files.putCount() != 0 || f.repo.putCalls != 0 {
+		t.Fatalf("oversize content was persisted")
+	}
+}
+
+func TestUploadPropagatesSettingsFailure(t *testing.T) {
+	f := newFixture()
+	wantErr := errors.New("settings unavailable")
+	f.settings.err = wantErr
+	_, err := f.svc.Upload(context.Background(), "a.txt", "", strings.NewReader("abc"), MaxUploadBytes, 1)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestOpenReturnsVerifiedContent(t *testing.T) {
+	f := newFixture()
+	data := []byte("download me")
+	object, err := f.svc.Upload(context.Background(), "a.txt", "", bytes.NewReader(data), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
 	}
 
-	rc, opened, err := svc.Open(ctx, testSHA)
+	opened, reader, err := f.svc.Open(context.Background(), object.SHA256)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
-	data, err := io.ReadAll(rc)
-	if err != nil || string(data) != "hello" {
-		t.Fatalf("read=%q err=%v", data, err)
+	defer reader.Close()
+	if opened.SHA256 != object.SHA256 || opened.MIME != object.MIME {
+		t.Fatalf("opened = %#v", opened)
 	}
-	if opened.ContentType != "text/plain; charset=utf-8" {
-		t.Fatalf("open content type=%q", opened.ContentType)
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestOpenDetectsHashMismatch(t *testing.T) {
+	f := newFixture()
+	data := []byte("original bytes")
+	object, err := f.svc.Upload(context.Background(), "a.txt", "", bytes.NewReader(data), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	f.files.tamper(object.RelativePath, []byte("tampered bytes"))
+
+	_, reader, err := f.svc.Open(context.Background(), object.SHA256)
+	if err == nil {
+		t.Fatal("expected hash mismatch error")
+	}
+	if reader != nil {
+		t.Fatal("reader should be nil on mismatch")
+	}
+	if !errors.Is(err, storage.ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestOpenMissingObjectIsNotFound(t *testing.T) {
+	f := newFixture()
+	_, _, err := f.svc.Open(context.Background(), strings.Repeat("a", 64))
+	apiErr := platform.AsError(err)
+	if apiErr.Status != http.StatusNotFound {
+		t.Fatalf("status = %d", apiErr.Status)
+	}
+}
+
+func TestAddRefListAndSoftDelete(t *testing.T) {
+	f := newFixture()
+	object, err := f.svc.Upload(context.Background(), "a.txt", "", strings.NewReader("ref me"), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
 	}
 
-	stat, err := svc.Stat(ctx, testSHA)
+	ref, err := f.svc.AddRef(context.Background(), object.SHA256, "version", 1001, "")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("AddRef: %v", err)
 	}
-	if stat.ContentType != "text/plain; charset=utf-8" {
-		t.Fatalf("stat content type=%q", stat.ContentType)
+	if ref.ID == 0 || ref.Role != "attachment" {
+		t.Fatalf("ref = %#v", ref)
+	}
+	if ref.CreatedAt.IsZero() {
+		t.Fatal("created_at is zero")
+	}
+
+	refs, err := f.svc.ListRefs(context.Background(), "version", 1001)
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if len(refs) != 1 || refs[0].ID != ref.ID {
+		t.Fatalf("refs = %#v", refs)
+	}
+
+	if err := f.svc.SoftDeleteRef(context.Background(), ref.ID); err != nil {
+		t.Fatalf("SoftDeleteRef: %v", err)
+	}
+	refs, err = f.svc.ListRefs(context.Background(), "version", 1001)
+	if err != nil {
+		t.Fatalf("ListRefs after delete: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("deleted ref still listed: %#v", refs)
+	}
+	if err := f.svc.SoftDeleteRef(context.Background(), ref.ID); platform.AsError(err).Status != http.StatusNotFound {
+		t.Fatalf("second delete status = %d", platform.AsError(err).Status)
+	}
+}
+
+func TestAddRefValidatesInput(t *testing.T) {
+	f := newFixture()
+	object, err := f.svc.Upload(context.Background(), "a.txt", "", strings.NewReader("ref me"), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	cases := []struct {
+		name     string
+		objectID string
+		owner    string
+		ownerID  int64
+		role     string
+		status   int
+	}{
+		{"bad sha", "not-a-sha", "version", 1, "", http.StatusBadRequest},
+		{"empty owner kind", object.SHA256, " ", 1, "", http.StatusBadRequest},
+		{"zero owner id", object.SHA256, "version", 0, "", http.StatusBadRequest},
+		{"missing object", strings.Repeat("b", 64), "version", 1, "", http.StatusNotFound},
+		{"role too long", object.SHA256, "version", 1, strings.Repeat("r", 65), http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := f.svc.AddRef(context.Background(), tc.objectID, tc.owner, tc.ownerID, tc.role)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if got := platform.AsError(err).Status; got != tc.status {
+				t.Fatalf("status = %d, want %d", got, tc.status)
+			}
+		})
+	}
+}
+
+func TestListRefsAndSoftDeleteValidateInput(t *testing.T) {
+	f := newFixture()
+	if _, err := f.svc.ListRefs(context.Background(), "", 1); err == nil {
+		t.Fatal("empty owner kind: expected error")
+	}
+	if _, err := f.svc.ListRefs(context.Background(), "version", 0); err == nil {
+		t.Fatal("zero owner id: expected error")
+	}
+	if err := f.svc.SoftDeleteRef(context.Background(), 0); err == nil {
+		t.Fatal("zero ref id: expected error")
+	}
+	if err := f.svc.SoftDeleteRef(context.Background(), 999); platform.AsError(err).Status != http.StatusNotFound {
+		t.Fatalf("missing ref status = %d", platform.AsError(err).Status)
+	}
+}
+
+func TestUploadDetectsImageMIME(t *testing.T) {
+	f := newFixture()
+	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	object, err := f.svc.Upload(context.Background(), "image.bin", "text/plain", bytes.NewReader(png), MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if object.MIME != "image/png" {
+		t.Fatalf("mime = %q", object.MIME)
 	}
 }

@@ -1,13 +1,11 @@
-package httpapi
+package workspaceapi
 
-import (
-	"context"
+import "net/http"
 
-	workspaceapp "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
-)
-
-// Lister is the read-model use case consumed by the todo handler. The workspace
-// application Service satisfies it; tests can substitute a fake.
-type Lister interface {
-	List(ctx context.Context, query workspaceapp.Query) (workspaceapp.Snapshot, error)
+// RegisterRoutes mounts the workspace read-only routes behind the supplied
+// authentication middleware. The P6 server wiring (Task 22) owns the actual
+// mounting, exactly like the other P6 contexts, so this context never edits the
+// shared server routes.
+func RegisterRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, handler *Handler) {
+	mux.Handle("GET /api/todos", authenticated(http.HandlerFunc(handler.ListTodos)))
 }

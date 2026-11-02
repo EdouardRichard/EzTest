@@ -1,530 +1,501 @@
-// Package server assembles the HTTP routes and the middleware chain. It
-// contains no business logic.
 package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"log/slog"
-	"net"
 	"net/http"
-	"os"
-	"strings"
-	"time"
 
-	agenthttp "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
-	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
-	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
-	chainhttp "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
-	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
+	chainapi "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
+	codeintelapi "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
-	deliveryhttp "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
-	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
-	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	deliveryapi "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	designapi "github.com/EdouardRichard/EzTest/backend/internal/design/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
 	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
-	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
-	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
-	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
-	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
-	mindmaphttp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
+	knowledgeapi "github.com/EdouardRichard/EzTest/backend/internal/knowledge/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
+	orchestrationapi "github.com/EdouardRichard/EzTest/backend/internal/orchestration/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
-	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
-	qualityhttp "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
-	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
-	searchhttp "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
-	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
-	versionhttp "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
-	workspacehttp "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
+	qualityapi "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
+	searchapi "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/settings/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/settings/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
+	visualapi "github.com/EdouardRichard/EzTest/backend/internal/visual/interfaces/httpapi"
+	workspaceapi "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Pinger reports whether a backing dependency (for example the database) is
-// reachable.
-type Pinger interface {
-	Ping(ctx context.Context) error
+// CodeIntelHandlers groups the P5 code-intelligence HTTP surfaces. The
+// composition root builds it only when the codeintel context is wired; a nil
+// group keeps a P0-P4 deployment unchanged.
+type CodeIntelHandlers struct {
+	Index     *codeintelapi.Handler
+	Anchors   *codeintelapi.AnchorHandler
+	Reviews   *codeintelapi.ReviewHandler
+	Impact    *codeintelapi.ImpactHandler
+	Proposals *codeintelapi.ProposalHandler
 }
 
-// EventService is the eventing use case the server mounts: the snapshot query
-// and the admin test publisher. The eventing application Service satisfies it.
-type EventService interface {
-	eventinghttp.Snapshotter
-	eventinghttp.Publisher
+// Deps is the fully constructed application surface the HTTP layer exposes.
+type Deps struct {
+	Config        config.Config
+	Pool          *pgxpool.Pool
+	Version       string
+	Settings      *settingsapp.Service
+	Identity      *identityapp.Service
+	Audit         *auditapp.Service
+	Events        *eventingapp.Service
+	Storage       *storageapp.Service
+	LLM           *llmapp.Service
+	Resource      *resourceapp.Service
+	Versions      *versionapp.Service
+	Requirements  *versionapp.RequirementService
+	Conversations *versionapp.ConversationService
+	TeamRoom      *agentapp.TeamRoom
+	DesignGraph   *designapp.GraphService
+	DesignExports *designapp.ExportService
+	DesignStarter versionapp.DesignStarter
+	Execution     *executionhttp.Handler
+	// P4 delivery/chain/steward surfaces. They are optional (nil keeps a
+	// P0-P3 deployment unchanged) and are always mounted behind the bearer
+	// authentication middleware.
+	Delivery     *deliveryapi.Handler
+	Chain        *chainapi.Handler
+	Closure      *versionapp.ClosureService
+	VersionClose *versionapp.VersionCloseService
+	// P5 code-intelligence and visual surfaces. They are optional and are
+	// always mounted behind the bearer authentication middleware.
+	CodeIntel *CodeIntelHandlers
+	Visual    *visualapi.Handler
+	// P6 quality/search/todos/global read surfaces. Optional; nil keeps a
+	// P0-P5 deployment unchanged.
+	P6 *P6Handlers
+	// P7 knowledge/orchestration/GC surfaces. Optional; nil keeps a P0-P6
+	// deployment unchanged and the internal executor push routes are mounted
+	// whenever the execution handler exists (the token middleware fails closed
+	// without a settings service).
+	P7 *P7Handlers
+	// Load counts in-flight API requests for drain/rolling-upgrade observability
+	// (P8). Nil disables the counter.
+	Load *load.Counter
 }
 
-// GCService is the P8 evidence GC use case mounted at POST /api/admin/gc
-// (spec §10.2). The execution application GCService satisfies it.
-type GCService interface {
-	Run(ctx context.Context, req executionapp.GCRequest) (executionapp.GCReport, error)
+// P7Handlers groups the optional P7 HTTP surfaces. The readiness probe is
+// registered by the orchestration handler itself (public), knowledge and GC
+// carry their own middleware classes, and the internal executor push routes are
+// mounted from the execution handler in registerP7Routes.
+type P7Handlers struct {
+	Knowledge     *knowledgeapi.Handler
+	Orchestration *orchestrationapi.Handler
+	GC            *storageapi.GCHandler
 }
 
-// AgentDependencies holds the Agent use cases the server mounts. They are
-// grouped so a process without an Agent runtime (and most unit tests) can leave
-// the whole /api/agents surface unmounted by leaving Dependencies.Agent nil.
-type AgentDependencies struct {
-	Profiles agenthttp.ProfileService
-	Sessions agenthttp.SessionService
-	Runs     agenthttp.RunControl
-	Tools    agenthttp.ToolCatalog
-	// Center is the read-only P8 Agent-centre use case (13-role catalogue, run
-	// observation, latest quality metrics). Unlike the P1 /api/agents surface it
-	// is readable by every logged-in user, so the server mounts
-	// /api/agent-center/* without the per-route admin guard (spec §8.1/D60).
-	Center agenthttp.CenterReader
+// P6Handlers groups the P6 read-model HTTP surfaces. Agent Center handlers are
+// added by the Agent Center wiring once that context lands.
+type P6Handlers struct {
+	Quality     *qualityapi.Handler
+	Search      *searchapi.Handler
+	Todos       *workspaceapi.Handler
+	Global      *deliveryapi.GlobalHandler
+	AgentCenter *agentapi.AgentCenterHandler
+	Profiles    *agentapi.ProfileHandler
 }
 
-// Dependencies holds the collaborators wired into the HTTP layer. Later tasks
-// extend this struct.
-type Dependencies struct {
-	Pinger Pinger
-	// Auth is the identity auth use-case port. When set, the composition root
-	// has wired authentication, so the /api/auth routes are mounted and the
-	// protected /api routes require a bearer token.
-	Auth identityhttp.AuthService
-	// Users is the identity user-management use case. When set, the admin user
-	// routes are mounted. They rely on the global bearer-token middleware and
-	// apply the per-route admin guard.
-	Users identityhttp.UserService
-	// Audit is the audit recorder. When set, the admin audit query endpoint is
-	// mounted and the auth handlers record the login rejections that happen
-	// before the auth service (invalid username, limiter lockout).
-	Audit auditapp.Recorder
-	// Idempotency stores replayable write responses. A nil store disables
-	// idempotent replay (for example in unit tests that do not exercise it).
-	Idempotency idempotency.Store
-	// Events is the eventing use case. When set, GET /api/stream/events is
-	// mounted and, when test endpoints are enabled, the admin test publisher.
-	Events EventService
-	// EventReader replays persisted events for GET /api/stream. The stream route
-	// is mounted only when EventReader and EventHub are both set.
-	EventReader eventinghttp.EventReader
-	// EventHub delivers live events to GET /api/stream.
-	EventHub eventinghttp.EventSubscriber
-	// LLMConfigs is the LLM configuration use case. When both LLMConfigs and
-	// LLMClientFactory are set, the admin LLM routes are mounted behind the
-	// global bearer auth and the per-route admin guard.
-	LLMConfigs llmhttp.ConfigService
-	// LLMClientFactory builds a protocol client from a stored configuration.
-	// It applies the configuration's retry, interval and timeout policy.
-	LLMClientFactory llmapp.ClientFactory
-	// Storage is the object-storage use case. When set, the admin storage
-	// routes are mounted behind the global bearer auth and the per-route admin
-	// guard. Reads expose the content type persisted by the metadata
-	// repository wired into the use case by the composition root.
-	Storage storagehttp.ObjectService
-	// Agent holds the Agent use cases. When set, the admin /api/agents routes
-	// are mounted behind the global bearer auth and the per-route admin guard.
-	Agent *AgentDependencies
-	// Resources holds the resource context's HTTP handlers (P2). When set, the
-	// /api/resources routes are mounted; reads require only the global bearer
-	// auth, while writes and actions apply the per-route admin guard.
-	Resources *resourcehttp.Handlers
-	// Version holds the version context's HTTP handlers (P3). When set, the
-	// /api/versions routes are mounted. They rely on the global bearer
-	// middleware and add no per-route guard: the P3 contract makes every route
-	// available to any authenticated user.
-	Version *versionhttp.Handlers
-	// CodeIntel holds the code-intelligence context's HTTP handlers (P4). When
-	// set, the /api/code and /api/versions/{id}/code routes are mounted. They
-	// rely on the global bearer auth; only the T0 index trigger adds the
-	// per-route admin guard (design spec §6.10).
-	CodeIntel *codeintelhttp.Handler
-	// Mindmap holds the case-mindmap HTTP handler group (P5). When set, the
-	// /api/versions/{versionId}/mindmap routes are mounted. They rely on the
-	// global bearer auth; the exploration run kind and the anchor-delete
-	// ownership rule enforce their own authorization in the handler (design
-	// spec §7.1/§7.2), so no per-route guard is added here.
-	Mindmap *mindmaphttp.Handler
-	// Execution holds the execution context's HTTP handlers (P6). When set, the
-	// /api/versions/{id}/batches|evidence|execution routes are mounted. They
-	// rely on the global bearer auth: every logged-in user may create and
-	// control batches and read execution data (design spec §5.11), so no
-	// per-route guard is added here.
-	Execution *executionhttp.Handlers
-	// Delivery holds the delivery context's HTTP handlers (P7): issues, reports,
-	// analysis runs and the global issue/report centres. When set, the P7
-	// delivery routes are mounted under /api/versions/{id} and /api. They rely
-	// on the global bearer auth and add no per-route guard (spec §11.1).
-	Delivery *deliveryhttp.Handlers
-	// Chain holds the P8 exploration-chain read-model handlers. When set,
-	// GET /api/versions/{versionId}/exploration-chain is mounted. The route
-	// relies on the global bearer auth and adds no per-route guard: every
-	// logged-in user may read a version's chain (spec §5.1).
-	Chain *chainhttp.Handlers
-	// Workspace holds the P8 todo-centre handler group. When set,
-	// GET /api/todos is mounted. The route relies on the global bearer auth and
-	// resolves the administrator flag from the authenticated identity itself:
-	// every logged-in user gets the review group, administrators additionally
-	// get takeover/gate items (spec §6.3).
-	Workspace *workspacehttp.Handlers
-	// Search holds the P8 global-search handler group. When set, GET /api/search
-	// is mounted. It relies on the global bearer auth and adds no per-route
-	// guard: every logged-in user may search (spec §6.2).
-	Search *searchhttp.Handlers
-	// Quality holds the P8 evaluation-results handler group. When set, the
-	// /api/quality/eval-runs routes are mounted behind the global bearer auth
-	// and the per-route admin guard: the eval runner and the quality dashboard
-	// are administrator-only (spec §9.1/§11.5).
-	Quality *qualityhttp.Handlers
-	// GC is the P8 evidence GC use case. When set, POST /api/admin/gc is
-	// mounted behind the global bearer auth and the per-route admin guard
-	// (spec §10.2). Non-dry-run execution is additionally gated by
-	// EZTEST_GC_ENABLED, which the handler checks (409 when disabled).
-	GC GCService
-}
-
-// New assembles the HTTP handler. Middleware runs in the order
-// recover -> request ID -> logging -> CORS -> auth -> idempotency -> routes.
-func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler {
-	if logger == nil {
-		logger = slog.Default()
-	}
+// New assembles the HTTP middleware chain and every P0 route.
+func New(deps Deps) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /api/health", handleAPIHealth(cfg, deps.Pinger, deps.LLMConfigs))
-	// The OpenAPI document is public (see requiresAuthentication) so tooling can
-	// discover the API without a bearer token.
-	mux.HandleFunc("GET /api/openapi.yaml", handleOpenAPIDocument(cfg.OpenAPIPath))
-	if deps.Auth != nil {
-		identityhttp.RegisterAuthRoutes(mux, deps.Auth, identityhttp.NewLoginLimiter(time.Now), deps.Audit)
+
+	executorURL := ""
+	if deps.Settings != nil {
+		executorURL, _ = deps.Settings.String(context.Background(), "execution.executor_url")
 	}
-	if deps.Users != nil {
-		identityhttp.RegisterUserRoutes(mux, deps.Users)
+	health := &Health{
+		Version:        deps.Version,
+		SettingsLoaded: true,
+		ExecutorURL:    executorURL,
 	}
-	if deps.Audit != nil {
-		// The route is mounted here because the admin guard lives in the
-		// identity interface package; the audit handler itself only lists.
-		mux.Handle("GET /api/admin/audit", identityhttp.RequireAdmin(audithttp.NewHandler(deps.Audit)))
+	if deps.Pool != nil {
+		health.DB = deps.Pool
 	}
-	if deps.GC != nil {
-		// Evidence GC (P8) is admin-only; the guard also stamps the request
-		// metadata the audit entry carries. A non-dry-run purge is rejected
-		// with 409 unless EZTEST_GC_ENABLED=true (spec §10.2).
-		mux.Handle("POST /api/admin/gc",
-			identityhttp.RequireAdmin(auditRequestContext(handleAdminGC(deps.GC, cfg.GCEnabled))))
+	health.Register(mux)
+
+	authn := identityAuthenticator{svc: deps.Identity}
+	authenticated := RequireAuth(authn)
+	admin := RequireAdmin(authn)
+
+	identityapi.New(deps.Identity).Register(mux, authenticated, admin)
+	registerSettingsRoutes(mux, admin, settingsapi.New(deps.Settings))
+	registerAuditRoutes(mux, admin, auditapi.New(deps.Audit))
+	registerLLMRoutes(mux, admin, llmapi.New(deps.LLM))
+	registerContentRoutes(mux, authenticated, storageapi.New(deps.Storage))
+	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
+	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
+	versionHandler := versionapi.New(deps.Versions, versionapi.WithVersionReopener(deps.VersionClose))
+	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements,
+		versionapi.WithRequirementReopener(deps.Closure),
+		versionapi.WithRequirementClosures(deps.Closure),
+	)
+	registerVersionRoutes(mux, authenticated, versionHandler)
+	registerRequirementRoutes(mux, authenticated, requirementHandler)
+	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
+	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
+	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
+	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
+	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
+	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
+	registerChainRoutes(mux, authenticated, deps.Chain)
+	registerCodeIntelRoutes(mux, authenticated, deps.CodeIntel)
+	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
+	registerP6Routes(mux, authenticated, admin, deps.P6)
+	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
+
+	var chain http.Handler = mux
+	if deps.Settings != nil {
+		chain = RateLimit(deps.Settings)(chain)
 	}
-	if deps.Events != nil {
-		mux.Handle("GET /api/stream/events", agentChannelAdminOnly(eventinghttp.NewSnapshotHandler(deps.Events)))
-	}
-	if deps.EventReader != nil && deps.EventHub != nil {
-		mux.Handle("GET /api/stream",
-			agentChannelAdminOnly(eventinghttp.NewSSEHandler(deps.EventReader, deps.EventHub, eventinghttp.DefaultHeartbeat)))
-	}
-	if deps.LLMConfigs != nil && deps.LLMClientFactory != nil {
-		// Authentication is the global middleware; each route only adds the
-		// admin guard and attaches the audit actor/request metadata.
-		llmHandler := llmhttp.NewHandler(deps.LLMConfigs, deps.LLMClientFactory, deps.Audit)
-		adminGuard := func(next http.Handler) http.Handler {
-			return identityhttp.RequireAdmin(auditRequestContext(next))
-		}
-		llmhttp.RegisterRoutes(mux, llmHandler, adminGuard)
-	}
-	if deps.Storage != nil {
-		// As with the LLM routes, authentication is the global middleware and
-		// each route only adds the admin guard plus the audit metadata.
-		storageHandler := storagehttp.NewHandler(deps.Storage)
-		adminGuard := func(next http.Handler) http.Handler {
-			return identityhttp.RequireAdmin(auditRequestContext(next))
-		}
-		storagehttp.RegisterRoutes(mux, storageHandler, adminGuard)
-	}
-	if deps.Agent != nil {
-		// The Agent API is admin-only: the global middleware authenticates, the
-		// per-route guard enforces the role and attaches the audit actor the
-		// Agent handlers record on every write.
-		agentHandler := agenthttp.NewHandler(deps.Agent.Profiles, deps.Agent.Sessions, deps.Agent.Runs, deps.Agent.Tools)
-		adminGuard := func(next http.Handler) http.Handler {
-			return identityhttp.RequireAdmin(auditRequestContext(next))
-		}
-		agenthttp.RegisterRoutes(mux, agentHandler, adminGuard)
-		// The P8 Agent centre is a separate read-only surface: every logged-in
-		// user may read the role catalogue, run observation and quality metrics,
-		// while the profile writes above stay admin-only (spec §8.1/D60).
-		agenthttp.RegisterCenterRoutes(mux, agenthttp.NewCenterHandler(deps.Agent.Center))
-	}
-	if deps.Resources != nil {
-		// The resource reads need only the global bearer auth; every write and
-		// action route carries the per-route admin guard. P7 adds the
-		// administrator-only environment db target routes (spec §7.8) to the
-		// same group; the guard also stamps the P0 request metadata so the
-		// resource audit entries (resource.db_target.*) carry request
-		// correlation. The handlers derive the audit actor from the identity
-		// context.
-		resourceGuard := func(next http.Handler) http.Handler {
-			return identityhttp.RequireAdmin(auditRequestContext(next))
-		}
-		resourcehttp.RegisterRoutes(mux, *deps.Resources, resourceGuard)
-	}
-	if deps.Version != nil {
-		// The version routes (P3) rely on the global bearer auth and add no
-		// per-route guard. RegisterRoutes skips a nil handler group, so a
-		// partially wired process mounts only the groups it has.
-		versionhttp.RegisterRoutes(mux, *deps.Version)
-	}
-	if deps.CodeIntel != nil {
-		// The codeintel routes (P4) rely on the global bearer auth too; the
-		// handler group wraps only the T0 index trigger in the identity
-		// context's RequireAdmin guard (design spec §6.10). Register mounts each
-		// group only when its application service is wired, so a partially
-		// assembled process never exposes a route backed by nil dependencies.
-		deps.CodeIntel.Register(mux)
-	}
-	if deps.Mindmap != nil {
-		// The mindmap routes (P5) sit under /api/versions/{versionId}/mindmap
-		// and rely on the global bearer auth. Register mounts each group only
-		// when its services are wired, so a partially assembled process never
-		// exposes a route backed by nil dependencies.
-		deps.Mindmap.Register(mux)
-	}
-	if deps.Execution != nil {
-		// The execution routes (P6) sit under /api/versions/{id}/batches,
-		// .../evidence and .../execution. They rely on the global bearer auth
-		// and add no per-route guard (spec §5.11). RegisterRoutes skips nil
-		// groups so a partially wired process mounts only what it has.
-		deps.Execution.RegisterRoutes(mux)
-	}
-	if deps.Delivery != nil {
-		// The delivery routes (P7) sit under /api/versions/{id}/issues,
-		// .../reports, .../batches/{batchId}/analysis and the global
-		// /api/issues|reports centres. They rely on the global bearer auth and
-		// add no per-route guard (spec §11.1); RegisterRoutes skips nil groups
-		// so a partially wired process mounts only what it has.
-		deps.Delivery.RegisterRoutes(mux)
-	}
-	if deps.Chain != nil {
-		// The exploration-chain read model (P8) is mounted at
-		// GET /api/versions/{versionId}/exploration-chain. It relies on the
-		// global bearer auth and adds no per-route guard (spec §5.1: every
-		// logged-in user may read it).
-		deps.Chain.RegisterRoutes(mux)
-	}
-	if deps.Workspace != nil {
-		// The todo centre (P8) is mounted at GET /api/todos. It relies on the
-		// global bearer auth; the handler resolves the admin flag from the
-		// identity context and the service filters takeover/gate server-side
-		// (spec §6.3).
-		deps.Workspace.RegisterRoutes(mux)
-	}
-	if deps.Search != nil {
-		// The global search (P8) is mounted at GET /api/search. It relies on the
-		// global bearer auth and adds no per-route guard: every logged-in user
-		// may search (spec §6.2).
-		deps.Search.RegisterRoutes(mux)
-	}
-	if deps.Quality != nil {
-		// The evaluation results (P8) are mounted at /api/quality/eval-runs.
-		// Authentication is the global middleware; every route adds the admin
-		// guard because evaluation is administrator-only (spec §9.1/§11.5).
-		qualityGuard := func(next http.Handler) http.Handler {
-			return identityhttp.RequireAdmin(next)
-		}
-		deps.Quality.RegisterRoutes(mux, qualityGuard)
-	}
-	if deps.Events != nil && cfg.EnableTestEndpoints {
-		auditor := deps.Audit
-		if auditor == nil {
-			auditor = auditapp.NopRecorder{}
-		}
-		publisher := eventinghttp.NewTestPublisher(deps.Events, auditor, cfg.EnableTestEndpoints)
-		mux.Handle("POST /api/admin/stream/test-events",
-			identityhttp.RequireAdmin(auditRequestContext(publisher)))
-	}
-	return withMiddleware(mux, cfg, deps, logger)
+	// CORS must wrap the rate limiter so a 429 (written before the wrapped mux
+	// runs) still carries Access-Control-Allow-Origin; otherwise browsers see a
+	// network error instead of the frozen rate_limited envelope.
+	chain = CORS(deps.Config)(chain)
+	chain = TrackInflight(deps.Load)(chain)
+	return RequestID(Recover(Logging(chain)))
 }
 
-// withMiddleware composes the process-wide middleware chain around the routes
-// mux. It is a separate function so tests can exercise the chain with a local
-// mux. Auth runs before idempotency: idempotency keys are scoped to the
-// authenticated user, so it must see the user that auth stores in the context.
-// The rate limiter sits between auth and the business chain so authenticated
-// requests are keyed by user ID; public routes pass through auth and use the
-// client IP (spec §10.1).
-func withMiddleware(next http.Handler, cfg config.Config, deps Dependencies, logger *slog.Logger) http.Handler {
-	if logger == nil {
-		logger = slog.Default()
+// registerP7Routes mounts the optional P7 surfaces: knowledge, orchestration
+// (including the public GET /api/health/ready probe), storage GC admin routes
+// and the internal executor push endpoints. Nil handlers keep the route table
+// of a P0-P6 deployment unchanged. The internal routes need only the execution
+// handler; a nil settings service makes InternalTokenAuth fail closed (401)
+// instead of exposing them.
+func registerP7Routes(
+	mux *http.ServeMux,
+	authenticated, admin func(http.Handler) http.Handler,
+	execution *executionhttp.Handler,
+	settings *settingsapp.Service,
+	h *P7Handlers,
+) {
+	if h != nil {
+		if h.Knowledge != nil {
+			knowledgeapi.RegisterRoutes(mux, authenticated, admin, h.Knowledge)
+		}
+		if h.Orchestration != nil {
+			orchestrationapi.RegisterRoutes(mux, authenticated, admin, h.Orchestration)
+		}
+		if h.GC != nil {
+			storageapi.RegisterGCRoutes(mux, admin, h.GC)
+		}
 	}
-	limiter := NewRateLimiter(cfg, time.Now)
-	limiter.logger = logger
-	var handler http.Handler = next
-	handler = idempotency.Middleware(deps.Idempotency, authenticatedUserID)(handler)
-	handler = limiter.Middleware()(handler)
-	if deps.Auth != nil {
-		handler = authenticatedAPI(deps.Auth)(handler)
-	}
-	handler = CORS(cfg.WebOrigin)(handler)
-	handler = loggingMiddleware(logger)(handler)
-	handler = requestIDMiddleware(handler)
-	handler = recoverMiddleware(logger)(handler)
-	return handler
-}
-
-// authenticatedAPI applies the bearer-token middleware to the protected /api
-// routes. Public routes (health, the OpenAPI document) and the auth context's
-// own routes (login is public; me and logout authenticate inside their
-// handlers) are passed through untouched.
-func authenticatedAPI(authenticator identityhttp.Authenticator) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		authenticate := identityhttp.AuthMiddleware(authenticator)(next)
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !requiresAuthentication(r) {
-				next.ServeHTTP(w, r)
-				return
-			}
-			authenticate.ServeHTTP(w, r)
-		})
+	if execution != nil {
+		var tokenAuth func(http.Handler) http.Handler
+		if settings != nil {
+			tokenAuth = executionhttp.InternalTokenAuth(settings)
+		}
+		executionhttp.RegisterInternalRoutes(mux, tokenAuth, execution)
 	}
 }
 
-// openAPIContentType is the media type of the hand-maintained OpenAPI document.
-const openAPIContentType = "application/yaml"
-
-// handleOpenAPIDocument serves the hand-maintained OpenAPI document from path.
-// A missing or unreadable file is a 404 in the shared error envelope rather
-// than a 500: the deployment simply did not ship the document.
-func handleOpenAPIDocument(path string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		document, err := os.ReadFile(path)
-		if err != nil {
-			platform.WriteError(w, r, http.StatusNotFound, platform.CodeNotFound, "openapi document not found")
-			return
-		}
-		w.Header().Set("Content-Type", openAPIContentType)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(document)
+// registerP6Routes mounts the optional P6 read-model surfaces. A nil handler
+// keeps the route table identical to a P0-P5 deployment.
+func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *P6Handlers) {
+	if h == nil {
+		return
+	}
+	if h.Quality != nil {
+		qualityapi.RegisterRoutes(mux, authenticated, admin, h.Quality)
+	}
+	if h.Search != nil {
+		searchapi.RegisterRoutes(mux, authenticated, h.Search)
+	}
+	if h.Todos != nil {
+		workspaceapi.RegisterRoutes(mux, authenticated, h.Todos)
+	}
+	if h.Global != nil {
+		deliveryapi.RegisterGlobal(mux, authenticated, h.Global)
+	}
+	if h.AgentCenter != nil {
+		agentapi.RegisterAgentCenterRoutes(mux, authenticated, h.AgentCenter)
+	}
+	if h.Profiles != nil {
+		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
 	}
 }
 
-// requiresAuthentication reports whether the request targets a protected /api
-// route. Auth routes are excluded because the identity package mounts its own
-// authentication on me/logout while login stays public.
-func requiresAuthentication(r *http.Request) bool {
-	if r.Method == http.MethodOptions {
-		return false
+type identityAuthenticator struct {
+	svc *identityapp.Service
+}
+
+// versionExistence adapts the version application service to the agent team
+// room handler's local Exists port; missing versions become 404, other errors
+// propagate.
+type versionExistence struct {
+	svc *versionapp.Service
+}
+
+func (v versionExistence) Exists(ctx context.Context, id int64) (bool, error) {
+	if v.svc == nil {
+		return false, platform.NewError(http.StatusInternalServerError, "internal", "version service is not configured")
 	}
-	switch r.URL.Path {
-	case "/api/health", "/api/openapi.yaml":
-		return false
+	_, err := v.svc.Get(ctx, id)
+	if err == nil {
+		return true, nil
 	}
-	return strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/api/auth/")
-}
-
-// authenticatedUserID adapts the identity context to idempotency's user lookup.
-func authenticatedUserID(ctx context.Context) (int64, bool) {
-	user, ok := identityhttp.UserFromContext(ctx)
-	if !ok {
-		return 0, false
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) && apiErr.Code == "not_found" {
+		return false, nil
 	}
-	return user.ID, true
+	return false, err
 }
 
-// auditRequestContext attaches the request metadata and the authenticated actor
-// to the context for handlers that record their own audit entries (the eventing
-// test publisher). It must run after authentication; the route applies the
-// admin guard outside it.
-func auditRequestContext(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := auditapp.WithMeta(r.Context(), auditapp.RequestMeta{
-			RequestID: platform.RequestID(r.Context()),
-			IP:        remoteIP(r),
-			UserAgent: r.UserAgent(),
-		})
-		if user, ok := identityhttp.UserFromContext(ctx); ok {
-			ctx = auditapp.WithActorID(ctx, user.ID)
-		}
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// agentChannelAdminOnly restricts the Agent activity channels to administrators.
-// P1 activity lives on the `agent:{session_id}` channels (design spec §9.5), so
-// any channel with that prefix requires the admin role; the P0 `system` channel
-// and every other channel keep their previous authenticated-only behaviour. It
-// is mounted on the stream routes and therefore runs after the global auth
-// middleware.
-func agentChannelAdminOnly(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Query().Get("channel"), "agent:") {
-			if user, ok := identityhttp.UserFromContext(r.Context()); !ok || user.Role != identity.RoleAdmin {
-				platform.WriteError(w, r, http.StatusForbidden, platform.CodeForbidden, "admin role required")
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// gcMaxBodyBytes bounds the admin GC request body. The contract is a tiny JSON
-// object ({dryRun, reason}), so 4 KiB is ample.
-const gcMaxBodyBytes = 4 << 10
-
-// gcRequest is the POST /api/admin/gc body. DryRun is a pointer so an omitted
-// field selects the safe default (dry-run) instead of the zero value.
-type gcRequest struct {
-	DryRun *bool  `json:"dryRun"`
-	Reason string `json:"reason"`
-}
-
-// gcEnvelope wraps the GC report in the shared data envelope.
-type gcEnvelope struct {
-	Data executionapp.GCReport `json:"data"`
-}
-
-// handleAdminGC serves POST /api/admin/gc (spec §10.2). The request defaults to
-// dry-run; an explicit non-dry-run is rejected with 409 when EZTEST_GC_ENABLED
-// is false. The execution service performs the same fail-closed check, so a
-// caller that bypasses the handler cannot purge either.
-func handleAdminGC(service GCService, enabled bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if service == nil {
-			platform.WriteError(w, r, http.StatusServiceUnavailable, platform.CodeUnavailable,
-				"evidence GC is not configured")
-			return
-		}
-		var body gcRequest
-		if err := platform.DecodeJSON(r, &body, gcMaxBodyBytes); err != nil {
-			platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument,
-				"invalid gc request body")
-			return
-		}
-		dryRun := true
-		if body.DryRun != nil {
-			dryRun = *body.DryRun
-		}
-		if !dryRun && !enabled {
-			platform.WriteError(w, r, http.StatusConflict, platform.CodeConflict,
-				"evidence GC execution is disabled; set EZTEST_GC_ENABLED=true")
-			return
-		}
-		actorID := int64(0)
-		if user, ok := identityhttp.UserFromContext(r.Context()); ok {
-			actorID = user.ID
-		}
-		report, err := service.Run(r.Context(), executionapp.GCRequest{
-			DryRun:  dryRun,
-			ActorID: actorID,
-			Reason:  body.Reason,
-		})
-		if err != nil {
-			if errors.Is(err, executionapp.ErrGCDisabled) {
-				platform.WriteError(w, r, http.StatusConflict, platform.CodeConflict,
-					"evidence GC execution is disabled; set EZTEST_GC_ENABLED=true")
-				return
-			}
-			platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal,
-				"evidence GC run failed")
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(gcEnvelope{Data: report})
-	}
-}
-
-// remoteIP extracts the peer address of the request. Forwarding headers are
-// client-controlled and deliberately ignored, matching the login limiter.
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+func (a identityAuthenticator) Authenticate(ctx context.Context, token string) (platform.Actor, error) {
+	user, err := a.svc.Authenticate(ctx, token)
 	if err != nil {
-		return r.RemoteAddr
+		return platform.Actor{}, err
 	}
-	return host
+	return platform.Actor{ID: user.ID, Role: string(user.Role)}, nil
+}
+
+func registerSettingsRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, h *settingsapi.Handler) {
+	mux.Handle("GET /api/admin/settings", admin(http.HandlerFunc(h.List)))
+	mux.Handle("GET /api/admin/settings/revisions", admin(http.HandlerFunc(h.Revisions)))
+	mux.Handle("GET /api/admin/settings/{key}", admin(http.HandlerFunc(h.Get)))
+	mux.Handle("PATCH /api/admin/settings/{key}", admin(http.HandlerFunc(h.Update)))
+}
+
+func registerAuditRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, h *auditapi.Handler) {
+	mux.Handle("GET /api/admin/audit-logs", admin(http.HandlerFunc(h.List)))
+}
+
+func registerLLMRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, h *llmapi.Handler) {
+	mux.Handle("GET /api/admin/llm/configs", admin(http.HandlerFunc(h.ListConfigs)))
+	mux.Handle("POST /api/admin/llm/configs", admin(http.HandlerFunc(h.CreateConfig)))
+	mux.Handle("GET /api/admin/llm/configs/{id}", admin(http.HandlerFunc(h.GetConfig)))
+	mux.Handle("PATCH /api/admin/llm/configs/{id}", admin(http.HandlerFunc(h.UpdateConfig)))
+	mux.Handle("DELETE /api/admin/llm/configs/{id}", admin(http.HandlerFunc(h.DeleteConfig)))
+	mux.Handle("POST /api/admin/llm/configs/{id}/test", admin(http.HandlerFunc(h.TestConfig)))
+	mux.Handle("POST /api/admin/llm/configs/{id}/refresh-models", admin(http.HandlerFunc(h.RefreshModels)))
+	mux.Handle("POST /api/admin/llm/configs/{id}/models", admin(http.HandlerFunc(h.AddModel)))
+	mux.Handle("DELETE /api/admin/llm/configs/{id}/models/{modelId}", admin(http.HandlerFunc(h.DeleteModel)))
+	mux.Handle("GET /api/admin/llm/models", admin(http.HandlerFunc(h.ListModels)))
+}
+
+func registerContentRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *storageapi.Handler) {
+	mux.Handle("POST /api/content", authenticated(http.HandlerFunc(h.Upload)))
+	mux.Handle("GET /api/content/{sha256}", authenticated(http.HandlerFunc(h.Download)))
+}
+
+func registerEventRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *eventingapi.Handler) {
+	mux.Handle("GET /api/events", authenticated(http.HandlerFunc(h.Snapshot)))
+	mux.Handle("GET /api/stream", authenticated(http.HandlerFunc(h.Stream)))
+}
+
+func registerVersionRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.Handler) {
+	mux.Handle("GET /api/versions", authenticated(http.HandlerFunc(h.List)))
+	mux.Handle("POST /api/versions", authenticated(http.HandlerFunc(h.Create)))
+	mux.Handle("GET /api/versions/{id}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("PATCH /api/versions/{id}", authenticated(http.HandlerFunc(h.Update)))
+}
+
+func registerRequirementRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.RequirementHandler) {
+	mux.Handle("GET /api/versions/{id}/requirements", authenticated(http.HandlerFunc(h.List)))
+	mux.Handle("POST /api/versions/{id}/requirements", authenticated(http.HandlerFunc(h.Create)))
+	mux.Handle("POST /api/versions/{id}/requirements/confirmations", authenticated(http.HandlerFunc(h.BatchConfirm)))
+	mux.Handle("GET /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("PATCH /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Update)))
+	mux.Handle("POST /api/versions/{id}/requirements/{rid}/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	mux.Handle("POST /api/versions/{id}/requirements/{rid}/rollback", authenticated(http.HandlerFunc(h.Rollback)))
+	mux.Handle("GET /api/versions/{id}/requirements/{rid}/relations", authenticated(http.HandlerFunc(h.ListRelations)))
+}
+
+func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.ConversationHandler) {
+	mux.Handle("GET /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.List)))
+	mux.Handle("POST /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.Create)))
+	mux.Handle("GET /api/versions/{id}/conversations/{cid}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("GET /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.Messages)))
+	mux.Handle("POST /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.PostMessage)))
+}
+
+func registerTeamRoomRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *agentapi.TeamRoomHandler) {
+	mux.Handle("GET /api/versions/{id}/team-rooms/{team}", authenticated(http.HandlerFunc(h.Read)))
+}
+
+// registerDesignRoutes mounts the P2 design graph/confirmation/export API.
+func registerDesignRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *designapi.Handler) {
+	mux.Handle("GET /api/versions/{id}/design/graph", authenticated(http.HandlerFunc(h.ReadGraph)))
+	mux.Handle("GET /api/versions/{id}/design/overview", authenticated(http.HandlerFunc(h.Overview)))
+	mux.Handle("GET /api/versions/{id}/design/cases/{caseId}", authenticated(http.HandlerFunc(h.GetCase)))
+	mux.Handle("POST /api/versions/{id}/design/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	mux.Handle("POST /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.CreateExport)))
+	mux.Handle("GET /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.ListExports)))
+	mux.Handle("GET /api/exports/{exportId}", authenticated(http.HandlerFunc(h.GetExport)))
+	mux.Handle("GET /api/exports/{exportId}/download", authenticated(http.HandlerFunc(h.DownloadExport)))
+}
+
+func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *resourceapi.Handler) {
+	// Catalog and SUT roots.
+	mux.Handle("GET /api/resources/catalog", authenticated(http.HandlerFunc(h.Catalog)))
+	mux.Handle("GET /api/resources/suts", authenticated(http.HandlerFunc(h.ListSUTs)))
+	mux.Handle("POST /api/resources/suts", admin(http.HandlerFunc(h.CreateSUT)))
+	mux.Handle("GET /api/resources/suts/{id}", authenticated(http.HandlerFunc(h.GetSUT)))
+	mux.Handle("PATCH /api/resources/suts/{id}", admin(http.HandlerFunc(h.UpdateSUT)))
+	mux.Handle("DELETE /api/resources/suts/{id}", admin(http.HandlerFunc(h.DeleteSUT)))
+
+	// Environments.
+	mux.Handle("GET /api/resources/suts/{id}/environments", authenticated(http.HandlerFunc(h.ListEnvironments)))
+	mux.Handle("POST /api/resources/suts/{id}/environments", admin(http.HandlerFunc(h.CreateEnvironment)))
+	mux.Handle("PATCH /api/resources/environments/{id}", admin(http.HandlerFunc(h.UpdateEnvironment)))
+	mux.Handle("DELETE /api/resources/environments/{id}", admin(http.HandlerFunc(h.DeleteEnvironment)))
+
+	// Pages.
+	mux.Handle("GET /api/resources/environments/{id}/pages", authenticated(http.HandlerFunc(h.ListPages)))
+	mux.Handle("POST /api/resources/environments/{id}/pages", admin(http.HandlerFunc(h.CreatePage)))
+	mux.Handle("POST /api/resources/environments/{id}/pages/import", admin(http.HandlerFunc(h.ImportPages)))
+	mux.Handle("PATCH /api/resources/pages/{id}", admin(http.HandlerFunc(h.UpdatePage)))
+	mux.Handle("DELETE /api/resources/pages/{id}", admin(http.HandlerFunc(h.DeletePage)))
+
+	// APIs.
+	mux.Handle("GET /api/resources/environments/{id}/apis", authenticated(http.HandlerFunc(h.ListAPIs)))
+	mux.Handle("POST /api/resources/environments/{id}/apis", admin(http.HandlerFunc(h.CreateAPI)))
+	mux.Handle("POST /api/resources/environments/{id}/apis/import", admin(http.HandlerFunc(h.ImportAPIs)))
+	mux.Handle("PATCH /api/resources/apis/{id}", admin(http.HandlerFunc(h.UpdateAPI)))
+	mux.Handle("DELETE /api/resources/apis/{id}", admin(http.HandlerFunc(h.DeleteAPI)))
+
+	// Target databases.
+	mux.Handle("GET /api/resources/suts/{id}/databases", authenticated(http.HandlerFunc(h.ListDatabases)))
+	mux.Handle("POST /api/resources/suts/{id}/databases", admin(http.HandlerFunc(h.CreateDatabase)))
+	mux.Handle("PATCH /api/resources/databases/{id}", admin(http.HandlerFunc(h.UpdateDatabase)))
+	mux.Handle("DELETE /api/resources/databases/{id}", admin(http.HandlerFunc(h.DeleteDatabase)))
+
+	// Test accounts.
+	mux.Handle("GET /api/resources/suts/{id}/accounts", authenticated(http.HandlerFunc(h.ListAccounts)))
+	mux.Handle("POST /api/resources/suts/{id}/accounts", admin(http.HandlerFunc(h.CreateAccount)))
+	mux.Handle("PATCH /api/resources/accounts/{id}", admin(http.HandlerFunc(h.UpdateAccount)))
+	mux.Handle("DELETE /api/resources/accounts/{id}", admin(http.HandlerFunc(h.DeleteAccount)))
+
+	// Code repositories: any authenticated user, per D09/architecture.
+	mux.Handle("GET /api/resources/code-repos", authenticated(http.HandlerFunc(h.ListRepositories)))
+	mux.Handle("POST /api/resources/code-repos", authenticated(http.HandlerFunc(h.CreateRepository)))
+	mux.Handle("GET /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.GetRepository)))
+	mux.Handle("PATCH /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.UpdateRepository)))
+	mux.Handle("DELETE /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.DeleteRepository)))
+
+	// P5 page/API proposal lifecycle (spec §4.2 #26-#29): the AI/code
+	// candidate writers are open to logged-in users, confirmation/rejection is
+	// admin-only.
+	mux.Handle("POST /api/resources/pages/{pageId}/confirm", admin(http.HandlerFunc(h.ConfirmPage)))
+	mux.Handle("POST /api/resources/pages/{pageId}/reject", admin(http.HandlerFunc(h.RejectPage)))
+	mux.Handle("POST /api/resources/apis/{apiId}/confirm", admin(http.HandlerFunc(h.ConfirmAPI)))
+	mux.Handle("POST /api/resources/apis/{apiId}/reject", admin(http.HandlerFunc(h.RejectAPI)))
+}
+
+// registerExecutionRoutes mounts the P3 execution API (21 path items / 22
+// operations, spec §9.2). A nil handler keeps P0–P2 deployments unchanged.
+func registerExecutionRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *executionhttp.Handler) {
+	if h == nil {
+		return
+	}
+	h.Register(mux, authenticated, admin)
+}
+
+// registerVersionP4Routes mounts the P4 version/requirement reopen endpoints.
+// They are always registered (an unwired service answers 500) so the contract
+// path is stable across deployments; the versions handler stays optional.
+func registerVersionP4Routes(
+	mux *http.ServeMux,
+	authenticated func(http.Handler) http.Handler,
+	versionHandler *versionapi.Handler,
+	requirementHandler *versionapi.RequirementHandler,
+) {
+	if versionHandler == nil && requirementHandler == nil {
+		return
+	}
+	if versionHandler != nil {
+		mux.Handle("POST /api/versions/{versionId}/reopen", authenticated(http.HandlerFunc(versionHandler.Reopen)))
+	}
+	if requirementHandler != nil {
+		mux.Handle("POST /api/versions/{versionId}/requirements/{requirementId}/reopen", authenticated(http.HandlerFunc(requirementHandler.Reopen)))
+	}
+}
+
+// registerDeliveryRoutes mounts the P4 delivery API (issues and reports,
+// including the verified report HTML download) behind the bearer middleware.
+func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *deliveryapi.Handler) {
+	if h == nil {
+		return
+	}
+	mux.Handle("GET /api/versions/{versionId}/issues", authenticated(http.HandlerFunc(h.ListIssues)))
+	mux.Handle("GET /api/versions/{versionId}/issues/{issueId}", authenticated(http.HandlerFunc(h.GetIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/confirm", authenticated(http.HandlerFunc(h.ConfirmIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", authenticated(http.HandlerFunc(h.DismissIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", authenticated(http.HandlerFunc(h.ReopenIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", authenticated(http.HandlerFunc(h.MergeIssue)))
+
+	mux.Handle("GET /api/versions/{versionId}/reports", authenticated(http.HandlerFunc(h.ListReports)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}", authenticated(http.HandlerFunc(h.GetReport)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}", authenticated(http.HandlerFunc(h.GetReportRevision)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", authenticated(http.HandlerFunc(h.DownloadReportHTML)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", authenticated(http.HandlerFunc(h.DownloadReportPDF)))
+	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", authenticated(http.HandlerFunc(h.RegenerateReport)))
+}
+
+// registerChainRoutes mounts the P4 read-only exploration-chain endpoint behind
+// the bearer middleware.
+func registerChainRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *chainapi.Handler) {
+	if h == nil {
+		return
+	}
+	mux.Handle("GET /api/versions/{versionId}/exploration-chain", authenticated(http.HandlerFunc(h.Read)))
+}
+
+// registerCodeIntelRoutes mounts the P5 code-intelligence surfaces (spec §4.2
+// ops #1-#25). Each handler is self-contained and all routes stay behind the
+// bearer middleware; a nil group leaves a P0-P4 deployment unchanged.
+func registerCodeIntelRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *CodeIntelHandlers) {
+	if h == nil {
+		return
+	}
+	if h.Index != nil {
+		h.Index.Register(mux, authenticated)
+	}
+	if h.Anchors != nil {
+		h.Anchors.Register(mux, authenticated)
+	}
+	if h.Reviews != nil {
+		h.Reviews.Register(mux, authenticated)
+	}
+	if h.Impact != nil {
+		h.Impact.Register(mux, authenticated)
+	}
+	if h.Proposals != nil {
+		h.Proposals.Register(mux, authenticated)
+	}
+}
+
+// registerVisualRoutes mounts the P5 visual API (spec §4.2 ops #30-#38).
+// Configuration/read routes require a logged-in user; baseline approval is
+// admin-only. A nil handler leaves a P0-P4 deployment unchanged.
+func registerVisualRoutes(
+	mux *http.ServeMux,
+	authenticated, admin func(http.Handler) http.Handler,
+	h *visualapi.Handler,
+) {
+	if h == nil {
+		return
+	}
+	h.Register(mux, authenticated, admin)
 }

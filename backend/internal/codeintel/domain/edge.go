@@ -1,31 +1,47 @@
-package domain
+package codeintel
 
-import "time"
-
-// Edge relations from design spec §5.1.
-const (
-	RelContains   = "contains"
-	RelImports    = "imports"
-	RelDefines    = "defines"
-	RelCalls      = "calls"
-	RelRenders    = "renders"
-	RelRouteToAPI = "route_to_api"
+import (
+	"encoding/json"
+	"time"
 )
 
-// CodeEdge is one materialised relation between two code entities at a commit.
-type CodeEdge struct {
+// EdgeRel is the code_edge.rel enum (spec §3.2).
+type EdgeRel string
+
+const (
+	EdgeContains   EdgeRel = "contains"
+	EdgeImports    EdgeRel = "imports"
+	EdgeDefines    EdgeRel = "defines"
+	EdgeCalls      EdgeRel = "calls"
+	EdgeRenders    EdgeRel = "renders"
+	EdgeRouteToAPI EdgeRel = "route_to_api"
+)
+
+// Valid reports whether rel is a persisted edge relation.
+func (r EdgeRel) Valid() bool {
+	switch r {
+	case EdgeContains, EdgeImports, EdgeDefines, EdgeCalls, EdgeRenders, EdgeRouteToAPI:
+		return true
+	default:
+		return false
+	}
+}
+
+// Edge is one materialized relation between two entities (spec §3.2).
+type Edge struct {
 	ID          int64
 	RepoID      int64
-	Commit      string
+	CommitSHA   string
+	AnalysisID  *int64
 	SrcEntityID int64
 	DstEntityID int64
-	Rel         string
+	Rel         EdgeRel
 	Source      string
-	Confidence  string
-	Evidence    []Evidence
-	Meta        []byte // JSONB
-	FactKey     *string
-	FactVersion *int
-	AnalysisID  *int64
+	Confidence  Confidence
+	Evidence    json.RawMessage
+	Meta        json.RawMessage
+	FactKey     string
+	FactVersion int
 	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

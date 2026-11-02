@@ -1,115 +1,120 @@
-// Package platform holds the cross-cutting HTTP conventions shared by every
-// EzTest context: the error envelope, cursor pagination, JSON body decoding and
-// request IDs. It contains no business logic.
+// Package platform contains the shared, dependency-free kernel: errors,
+// request IDs, pagination, validation, clocks and snowflake IDs.
 package platform
 
 import (
-	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 )
 
-// RequestIDHeader is the HTTP header that carries the request ID on requests
-// and responses.
-const RequestIDHeader = "X-Request-ID"
-
-// API error codes from the design's §9.1 and §8.5. Handlers must use these
-// constants instead of ad-hoc strings so clients can rely on a closed set.
-const (
-	CodeInvalidArgument     = "invalid_argument"
-	CodeUnauthenticated     = "unauthenticated"
-	CodeForbidden           = "forbidden"
-	CodeNotFound            = "not_found"
-	CodeConflict            = "conflict"
-	CodeIdempotencyConflict = "idempotency_conflict"
-	CodeRateLimited         = "rate_limited"
-	CodeInternal            = "internal"
-	CodeUnavailable         = "unavailable"
-	CodeStorageCorrupted    = "storage_corrupted"
-
-	CodeLLMNotConfigured   = "llm_not_configured"
-	CodeLLMAuthFailed      = "llm_auth_failed"
-	CodeLLMRateLimited     = "llm_rate_limited"
-	CodeLLMBadRequest      = "llm_bad_request"
-	CodeLLMUpstreamError   = "llm_upstream_error"
-	CodeLLMTimeout         = "llm_timeout"
-	CodeLLMInvalidResponse = "llm_invalid_response"
-)
-
-// APIError is the JSON shape of one error inside the shared envelope:
-//
-//	{"error":{"code":...,"message":...,"request_id":...,"retryable":...,"details":{}}}
-type APIError struct {
-	Code      string         `json:"code"`
-	Message   string         `json:"message"`
-	RequestID string         `json:"request_id"`
-	Retryable bool           `json:"retryable"`
-	Details   map[string]any `json:"details"`
+// Error is the stable API error shape. HTTP handlers turn it into the shared
+// {@code {"error":{...}}} envelope.
+type Error struct {
+	Status    int
+	Code      string
+	Message   string
+	Retryable bool
+	Details   map[string]any
 }
 
-type errorEnvelope struct {
-	Error APIError `json:"error"`
+func (e *Error) Error() string {
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
-// ErrorOption customises an APIError written by WriteError.
-type ErrorOption func(*APIError)
-
-// WithDetails attaches non-sensitive, structured error details.
-func WithDetails(details map[string]any) ErrorOption {
-	return func(err *APIError) { err.Details = details }
+// NewError builds an error with an explicit status and code.
+func NewError(status int, code, message string) *Error {
+	return &Error{Status: status, Code: code, Message: message}
 }
 
-// WithRetryable marks whether the caller may safely retry the failed request.
-func WithRetryable(retryable bool) ErrorOption {
-	return func(err *APIError) { err.Retryable = retryable }
-}
-
-// WriteError writes the shared JSON error envelope. The request ID comes from
-// the request context first and from the response header as a fallback, so the
-// envelope, the X-Request-ID header and the logs always agree.
-func WriteError(w http.ResponseWriter, r *http.Request, status int, code, message string, opts ...ErrorOption) {
-	apiErr := APIError{
-		Code:    code,
+// Invalid is a 400 for a field-level validation failure.
+func Invalid(field, message string) *Error {
+	return &Error{
+		Status:  http.StatusBadRequest,
+		Code:    "invalid_argument",
 		Message: message,
-		Details: map[string]any{},
+		Details: map[string]any{"field": field},
 	}
-	if r != nil {
-		apiErr.RequestID = RequestID(r.Context())
-	}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&apiErr)
-		}
-	}
-	if apiErr.RequestID == "" {
-		apiErr.RequestID = w.Header().Get(RequestIDHeader)
-	}
-	if apiErr.Details == nil {
-		apiErr.Details = map[string]any{}
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if apiErr.RequestID != "" {
-		w.Header().Set(RequestIDHeader, apiErr.RequestID)
-	}
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorEnvelope{Error: apiErr})
 }
 
-// requestIDContextKey is the private context key that carries the request ID.
-type requestIDContextKey struct{}
-
-// WithRequestID stores id in ctx as the request ID for this request.
-func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, requestIDContextKey{}, id)
+// Unauthenticated is a 401.
+func Unauthenticated() *Error {
+	return NewError(http.StatusUnauthorized, "unauthenticated", "authentication required")
 }
 
-// RequestID returns the request ID stored by WithRequestID, or "" when the
-// context carries none.
-func RequestID(ctx context.Context) string {
-	if ctx == nil {
-		return ""
+// Forbidden is a 403.
+func Forbidden() *Error {
+	return NewError(http.StatusForbidden, "forbidden", "insufficient permissions")
+}
+
+// NotFound is a 404 for a missing entity kind.
+func NotFound(kind string) *Error {
+	return &Error{
+		Status:  http.StatusNotFound,
+		Code:    "not_found",
+		Message: kind + " not found",
+		Details: map[string]any{"kind": kind},
 	}
-	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
-	return requestID
+}
+
+// Conflict is a 409 for uniqueness/state conflicts.
+func Conflict(message string) *Error {
+	return NewError(http.StatusConflict, "conflict", message)
+}
+
+// StateConflict is a 409 for invalid state transitions.
+func StateConflict(message string) *Error {
+	return NewError(http.StatusConflict, "state_conflict", message)
+}
+
+// LeaseLost is a 409 when a work-item write-back no longer owns the lease.
+func LeaseLost() *Error {
+	return NewError(http.StatusConflict, "lease_lost", "work item lease was lost")
+}
+
+// AIUnavailable is a retryable 503 when no usable LLM target is configured or
+// the upstream is temporarily unreachable.
+func AIUnavailable(message string) *Error {
+	return &Error{
+		Status:    http.StatusServiceUnavailable,
+		Code:      "ai_unavailable",
+		Message:   message,
+		Retryable: true,
+	}
+}
+
+// ContextOverflow is a retryable 503 when a run could not fit even after
+// deterministic compaction. It is not used for recoverable compaction.
+func ContextOverflow(message string) *Error {
+	return &Error{
+		Status:    http.StatusServiceUnavailable,
+		Code:      "context_overflow",
+		Message:   message,
+		Retryable: true,
+	}
+}
+
+// AttachmentError is a 422 for an attachment that was accepted but could not
+// be parsed. The message POST itself still succeeds.
+func AttachmentError(code, message string) *Error {
+	return NewError(http.StatusUnprocessableEntity, code, message)
+}
+
+// Unavailable is a 503 for a temporary dependency failure.
+func Unavailable(message string) *Error {
+	return &Error{
+		Status:    http.StatusServiceUnavailable,
+		Code:      "unavailable",
+		Message:   message,
+		Retryable: true,
+	}
+}
+
+// AsError unwraps a *Error or maps an unknown error to a safe 500.
+func AsError(err error) *Error {
+	var target *Error
+	if errors.As(err, &target) {
+		return target
+	}
+	return NewError(http.StatusInternalServerError, "internal", "internal server error")
 }
