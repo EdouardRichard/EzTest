@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -30,8 +30,25 @@ function renderMindmap(overrides: Partial<Parameters<typeof DesignMindmap>[0]> =
     onConfirmRequirement: vi.fn(),
     ...overrides,
   }
-  render(<DesignMindmap {...props} />)
-  return props
+  const view = render(<DesignMindmap {...props} />)
+  const rerender = (next: Partial<Parameters<typeof DesignMindmap>[0]>) => {
+    view.rerender(<DesignMindmap {...props} {...next} />)
+  }
+  return { props, rerender }
+}
+
+/** A refetch that returns the same graph hash but new object instances. */
+function sameHashRefreshedGraph(): typeof designGraphFixture {
+  return {
+    ...designGraphFixture,
+    requirements: designGraphFixture.requirements.map((requirement) => ({
+      ...requirement,
+      scenarios: requirement.scenarios.map((scenario) => ({
+        ...scenario,
+        cases: scenario.cases.map((designCase) => ({ ...designCase })),
+      })),
+    })),
+  }
 }
 
 function changeFilter(testId: string, value: string): void {
@@ -51,7 +68,10 @@ describe("DesignMindmap status colours", () => {
     reactFlow.zoomOut.mockReset()
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+  })
 
   it("colours case nodes by version status", async () => {
     renderMindmap()
@@ -150,37 +170,120 @@ describe("DesignMindmap status colours", () => {
     expect(options.nodes?.map((node) => node.id)).toEqual(["case-7001"])
   })
 
-  it("throttles fitView while the search query changes rapidly", async () => {
+  it("throttles fitView while the search query changes rapidly", () => {
+    vi.useFakeTimers()
     renderMindmap()
-    await screen.findByTestId("case-card-7001")
     const search = screen.getByTestId("design-search")
 
     fireEvent.change(search, { target: { value: "退" } })
     fireEvent.change(search, { target: { value: "退款" } })
     fireEvent.change(search, { target: { value: "退款 T" } })
 
-    await waitFor(() => expect(reactFlow.fitView).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    // Leading edge fires once; the burst is coalesced into one trailing fit.
+    expect(reactFlow.fitView).toHaveBeenCalledTimes(1)
+    act(() => vi.advanceTimersByTime(249))
+    expect(reactFlow.fitView).toHaveBeenCalledTimes(1)
+    act(() => vi.advanceTimersByTime(1))
+    expect(reactFlow.fitView).toHaveBeenCalledTimes(2)
+
+    const options = reactFlow.fitView.mock.calls.at(-1)?.[0] as {
+      nodes?: Array<{ id: string }>
+    }
+    expect(options.nodes?.map((node) => node.id)).toEqual(["case-7001"])
   })
 
-  it("does not fit a stale match after the search is cleared", async () => {
+  it("does not fit a stale match after the search is cleared", () => {
+    vi.useFakeTimers()
     renderMindmap()
-    await screen.findByTestId("case-card-7001")
     const search = screen.getByTestId("design-search")
 
     fireEvent.change(search, { target: { value: "退款" } })
     fireEvent.change(search, { target: { value: "退款 T" } })
     fireEvent.change(search, { target: { value: "" } })
 
-    await new Promise((resolve) => setTimeout(resolve, 400))
+    act(() => vi.advanceTimersByTime(400))
     expect(reactFlow.fitView).toHaveBeenCalledTimes(1)
   })
 
-  it("reuses the layout for an unchanged graph version", async () => {
+  it("disables the result filter until results exist and resets it when they disappear", async () => {
+    const { rerender } = renderMindmap()
+    await screen.findByTestId("case-card-7001")
+
+    expect(screen.getByTestId("design-filter-result")).toBeDisabled()
+    expect(screen.getByTestId("design-filter-result")).toHaveAttribute(
+      "title",
+      "暂无执行结果，执行后可筛选",
+    )
+
+    rerender({ executionResults: ALL_RESULTS })
+    await waitFor(() => expect(screen.getByTestId("design-filter-result")).toBeEnabled())
+    changeFilter("design-filter-result", "failed")
+    await waitFor(() => expect(screen.queryByTestId("case-card-7001")).not.toBeInTheDocument())
+    expect(screen.getByTestId("case-card-7003")).toBeInTheDocument()
+
+    rerender({ executionResults: {} })
+    await waitFor(() => expect(screen.getByTestId("design-filter-result")).toBeDisabled())
+    expect(screen.getByTestId("design-filter-result")).toHaveValue("all")
+    expect(screen.getByTestId("case-card-7001")).toBeInTheDocument()
+  })
+
+  it("labels filter options by title/name without id suffixes", async () => {
+    renderMindmap()
+    await screen.findByTestId("case-card-7001")
+
+    // Option labels stay the plain graph titles; node text is asserted through
+    // the React Flow node test ids instead of a `· #id` collision workaround.
+    expect(screen.getByRole("option", { name: "退款到账时效" })).toBeInTheDocument()
+    expect(screen.getByRole("option", { name: "正常退款" })).toBeInTheDocument()
+    expect(screen.getByTestId("rf__node-requirement-6001")).toHaveTextContent("退款到账时效")
+    expect(screen.getByTestId("rf__node-scenario-5001")).toHaveTextContent("正常退款")
+  })
+
+  it("keeps the mindmap full height instead of a fixed canvas height", async () => {
+    renderMindmap()
+
+    const section = await screen.findByTestId("design-mindmap")
+    expect(section).toHaveClass("h-full")
+    expect(section).not.toHaveClass("h-[560px]")
+  })
+
+  it("refreshes rendered scenario data after a same-hash graph refresh", async () => {
+    const { rerender } = renderMindmap()
+    await screen.findByTestId("scenario-node-5001")
+    expect(screen.getByTestId("scenario-node-5001")).toHaveTextContent("SUT 1 个 · 页面 1 个")
+
+    const refreshedGraph = sameHashRefreshedGraph()
+    const scenario = refreshedGraph.requirements[0]?.scenarios[0]
+    if (scenario === undefined) throw new Error("fixture is missing the scenario")
+    scenario.version_sut_ids = ["1001", "1002"]
+    scenario.page_ids = ["2301", "2302"]
+    scenario.description = "审核通过后原路退回（更新）"
+
+    rerender({ graph: refreshedGraph })
+
+    await waitFor(() =>
+      expect(screen.getByTestId("scenario-node-5001")).toHaveTextContent("SUT 2 个 · 页面 2 个"),
+    )
+  })
+
+  it("reuses cached positions but rebuilds node data for a same-hash refresh", async () => {
     const { cachedLayoutDesignGraph } = await import("./layout")
 
     const first = cachedLayoutDesignGraph(designGraphFixture)
-    const refreshed = cachedLayoutDesignGraph({ ...designGraphFixture })
-    expect(refreshed).toBe(first)
+    const refreshedGraph = sameHashRefreshedGraph()
+    const refreshed = cachedLayoutDesignGraph(refreshedGraph)
+
+    expect(refreshed).not.toBe(first)
+    expect(refreshed.nodes.map((node) => [node.id, node.position])).toEqual(
+      first.nodes.map((node) => [node.id, node.position]),
+    )
+
+    const requirementNode = refreshed.nodes.find((node) => node.id === "requirement-6001")
+    expect(requirementNode?.data.requirement).toBe(refreshedGraph.requirements[0])
+    const caseNode = refreshed.nodes.find((node) => node.id === "case-7001")
+    expect(caseNode?.data.kind).toBe("case")
+    if (caseNode?.data.kind !== "case") throw new Error("expected a case node")
+    expect(caseNode.data.case).toBe(refreshedGraph.requirements[0]?.scenarios[0]?.cases[0])
 
     const changed = cachedLayoutDesignGraph({
       ...designGraphFixture,
@@ -188,5 +291,25 @@ describe("DesignMindmap status colours", () => {
     })
     expect(changed).not.toBe(first)
     expect(changed.nodes).not.toBe(first.nodes)
+  })
+
+  it("returns refreshed scenario data when its description changes under the same graph hash", async () => {
+    const { cachedLayoutDesignGraph, matchDesignNodes } = await import("./layout")
+
+    const first = cachedLayoutDesignGraph(designGraphFixture)
+    const refreshedGraph = sameHashRefreshedGraph()
+    const scenario = refreshedGraph.requirements[0]?.scenarios[0]
+    if (scenario === undefined) throw new Error("fixture is missing the scenario")
+    scenario.description = "审核通过后原路退回（更新）"
+
+    const refreshed = cachedLayoutDesignGraph(refreshedGraph)
+    const firstScenarioNode = first.nodes.find((node) => node.id === "scenario-5001")
+    const refreshedScenarioNode = refreshed.nodes.find((node) => node.id === "scenario-5001")
+
+    expect(refreshedScenarioNode?.position).toEqual(firstScenarioNode?.position)
+    expect(refreshedScenarioNode?.data.kind).toBe("scenario")
+    if (refreshedScenarioNode?.data.kind !== "scenario") throw new Error("expected a scenario node")
+    expect(refreshedScenarioNode.data.scenario.description).toBe("审核通过后原路退回（更新）")
+    expect(matchDesignNodes(refreshed, "更新").map((node) => node.id)).toEqual(["scenario-5001"])
   })
 })

@@ -26,8 +26,10 @@ describe("DesignMindmap", () => {
     renderMindmap()
 
     expect(screen.getByTestId("design-mindmap")).toBeInTheDocument()
-    expect(await screen.findByText("退款到账时效")).toBeInTheDocument()
-    expect(screen.getByText("正常退款")).toBeInTheDocument()
+    // Titles are asserted through the React Flow node test ids: the filter
+    // options now carry the same plain titles, so getByText would be ambiguous.
+    expect(await screen.findByTestId("rf__node-requirement-6001")).toHaveTextContent("退款到账时效")
+    expect(screen.getByTestId("rf__node-scenario-5001")).toHaveTextContent("正常退款")
     expect(screen.getByText("退款 T+1 到账")).toBeInTheDocument()
     expect(screen.getByText("已澄清 v2")).toBeInTheDocument()
     expect(screen.getByTestId("case-card-7001")).toBeInTheDocument()

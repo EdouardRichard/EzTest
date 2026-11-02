@@ -3,8 +3,10 @@
 import { Field } from "@/components/ui/Field"
 import { Input } from "@/components/ui/Input"
 import { Select } from "@/components/ui/Select"
+import type { CaseRunVerdict } from "@/features/execution/types"
 
 import { ALL_FILTER_VALUE, type CaseFilterValues } from "./layout"
+import type { CaseVersionStatus } from "./types"
 
 export type CaseFilterOption = { value: string; label: string }
 
@@ -14,22 +16,33 @@ export type CaseFiltersProps = {
   values: CaseFilterValues
   requirementOptions: CaseFilterOption[]
   scenarioOptions: CaseFilterOption[]
+  /** Result filtering needs execution verdicts; without them the select is disabled. */
+  resultFilterEnabled: boolean
   onChange: (key: CaseFilterKey, value: string) => void
+}
+
+/** A graph case is never `superseded`, so that status has no filter option. */
+const STATUS_LABELS: Record<Exclude<CaseVersionStatus, "superseded">, string> = {
+  draft: "草案",
+  confirmed: "已确认",
+  stale: "已过期",
+}
+
+const RESULT_LABELS: Record<CaseRunVerdict, string> = {
+  passed: "通过",
+  failed: "失败",
+  blocked: "阻塞",
+  inconclusive: "未定",
 }
 
 const STATUS_OPTIONS: CaseFilterOption[] = [
   { value: ALL_FILTER_VALUE, label: "全部状态" },
-  { value: "draft", label: "草案" },
-  { value: "confirmed", label: "已确认" },
-  { value: "stale", label: "已过期" },
+  ...Object.entries(STATUS_LABELS).map(([value, label]) => ({ value, label })),
 ]
 
 const RESULT_OPTIONS: CaseFilterOption[] = [
   { value: ALL_FILTER_VALUE, label: "全部结果" },
-  { value: "passed", label: "通过" },
-  { value: "failed", label: "失败" },
-  { value: "blocked", label: "阻塞" },
-  { value: "inconclusive", label: "未定" },
+  ...Object.entries(RESULT_LABELS).map(([value, label]) => ({ value, label })),
 ]
 
 /**
@@ -41,6 +54,7 @@ export function CaseFilters({
   values,
   requirementOptions,
   scenarioOptions,
+  resultFilterEnabled,
   onChange,
 }: CaseFiltersProps) {
   return (
@@ -70,7 +84,11 @@ export function CaseFilters({
         >
           <option value={ALL_FILTER_VALUE}>全部需求</option>
           {requirementOptions.map((option) => (
-            <option key={option.value} value={option.value}>
+            <option
+              key={option.value}
+              value={option.value}
+              data-testid={`design-filter-requirement-option-${option.value}`}
+            >
               {option.label}
             </option>
           ))}
@@ -86,7 +104,11 @@ export function CaseFilters({
         >
           <option value={ALL_FILTER_VALUE}>全部场景</option>
           {scenarioOptions.map((option) => (
-            <option key={option.value} value={option.value}>
+            <option
+              key={option.value}
+              value={option.value}
+              data-testid={`design-filter-scenario-option-${option.value}`}
+            >
               {option.label}
             </option>
           ))}
@@ -113,6 +135,8 @@ export function CaseFilters({
           id="design-filter-result-field"
           data-testid="design-filter-result"
           value={values.result}
+          disabled={!resultFilterEnabled}
+          title={resultFilterEnabled ? undefined : "暂无执行结果，执行后可筛选"}
           onChange={(event) => onChange("result", event.target.value)}
         >
           {RESULT_OPTIONS.map((option) => (

@@ -56,13 +56,17 @@ function collectDraftCount(requirement: DesignRequirement): number {
   )
 }
 
+type LayoutPosition = { x: number; y: number }
+
+type PositionLookup = (nodeId: string) => LayoutPosition | undefined
+
 /**
- * Pure deterministic column layout: requirement → scenario → case. Node
- * positions are local UI state only and are never persisted (spec §6.3); the
- * same graph always produces the same coordinates, so a refresh restores the
- * default view without a DB round-trip.
+ * Builds the full layout for `graph`, reusing a position from `positionFor`
+ * when it has one. Node `data` is always read from the graph argument, never
+ * from a cache: graph_hash does not cover every node field (e.g. scenario
+ * description / SUT / page ids), so data must be rebuilt on every call.
  */
-export function layoutDesignGraph(graph: DesignGraph): DesignLayout {
+function buildDesignLayout(graph: DesignGraph, positionFor: PositionLookup): DesignLayout {
   const nodes: DesignLayoutNode[] = []
   const edges: DesignLayoutEdge[] = []
   let cursor = 0
@@ -87,7 +91,7 @@ export function layoutDesignGraph(graph: DesignGraph): DesignLayout {
         nodes.push({
           id: caseId,
           type: "case",
-          position: { x: LAYOUT_COLUMNS.case, y: cursor },
+          position: positionFor(caseId) ?? { x: LAYOUT_COLUMNS.case, y: cursor },
           data: { kind: "case", requirement, scenario, case: designCase },
         })
         cursor += LAYOUT_ROW_GAP
@@ -97,7 +101,7 @@ export function layoutDesignGraph(graph: DesignGraph): DesignLayout {
       nodes.push({
         id: scenarioId,
         type: "scenario",
-        position: { x: LAYOUT_COLUMNS.scenario, y: scenarioY },
+        position: positionFor(scenarioId) ?? { x: LAYOUT_COLUMNS.scenario, y: scenarioY },
         data: {
           kind: "scenario",
           requirement,
@@ -111,13 +115,18 @@ export function layoutDesignGraph(graph: DesignGraph): DesignLayout {
     nodes.push({
       id: requirementId,
       type: "requirement",
-      position: { x: LAYOUT_COLUMNS.requirement, y: requirementY },
+      position: positionFor(requirementId) ?? { x: LAYOUT_COLUMNS.requirement, y: requirementY },
       data: { kind: "requirement", requirement },
     })
     cursor += LAYOUT_SECTION_GAP
   }
 
   return { nodes, edges }
+}
+
+/** Pure deterministic layout of the current graph; always fresh node data. */
+export function layoutDesignGraph(graph: DesignGraph): DesignLayout {
+  return buildDesignLayout(graph, () => undefined)
 }
 
 /** Number of draft cases below a requirement; drives the confirm-all button. */
@@ -267,21 +276,32 @@ export function matchDesignNodes(layout: DesignLayout, query: string): DesignLay
 }
 
 const LAYOUT_CACHE_LIMIT = 8
-const layoutCache = new Map<string, DesignLayout>()
+
+/**
+ * Cached node geometry only (`node id → position`). Node data is deliberately
+ * excluded: `graph_hash` covers requirement/scenario/case identity and case
+ * content hashes, but not scenario `description`/`version_sut_ids`/`page_ids`/
+ * `api_ids` (or requirement status/target SUTs), so a refresh that changes
+ * those fields keeps the same hash. The cached positions are reused, the data
+ * and edges are rebuilt from the graph passed in.
+ */
+const layoutCache = new Map<string, Map<string, LayoutPosition>>()
 
 /**
  * Lightweight memoization keyed by `version_id:graph_hash`: an SSE refresh that
- * rebuilds the graph object with unchanged content reuses the same layout
- * instead of recomputing every position. The cache is bounded because the list
- * view can hop between versions.
+ * rebuilds the graph object with unchanged geometry reuses the same node
+ * positions instead of recomputing every coordinate. The cache is bounded
+ * because the list view can hop between versions.
  */
 export function cachedLayoutDesignGraph(graph: DesignGraph): DesignLayout {
   const key = `${graph.version_id}:${graph.graph_hash}`
   const cached = layoutCache.get(key)
-  if (cached !== undefined) return cached
+  if (cached !== undefined) {
+    return buildDesignLayout(graph, (nodeId) => cached.get(nodeId))
+  }
 
   const computed = layoutDesignGraph(graph)
-  layoutCache.set(key, computed)
+  layoutCache.set(key, new Map(computed.nodes.map((node) => [node.id, node.position])))
   if (layoutCache.size > LAYOUT_CACHE_LIMIT) {
     const oldest = layoutCache.keys().next().value
     if (oldest !== undefined) layoutCache.delete(oldest)

@@ -93,6 +93,16 @@ function MindmapCanvas({
 }: DesignMindmapProps) {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const [filters, setFilters] = useState<CaseFilterValues>(DEFAULT_CASE_FILTERS)
+  const hasExecutionResults = Object.keys(executionResults).length > 0
+
+  // A result filter without execution data would hide every case behind the
+  // no-match overlay, so it only becomes active once a caller passes verdicts.
+  useEffect(() => {
+    if (hasExecutionResults) return
+    setFilters((current) =>
+      current.result === ALL_FILTER_VALUE ? current : { ...current, result: ALL_FILTER_VALUE },
+    )
+  }, [hasExecutionResults])
 
   const actions = useMemo<DesignNodeActions>(
     () => ({
@@ -124,7 +134,11 @@ function MindmapCanvas({
   // keystrokes are coalesced into one trailing fit with the latest matches.
   const fitState = useRef<FitState>({ timer: null, pending: null })
   const fitViewRef = useRef(fitView)
-  fitViewRef.current = fitView
+  // `useReactFlow()` is stable today, but keep the ref current without writing
+  // it during render (StrictMode- and lint-safe).
+  useEffect(() => {
+    fitViewRef.current = fitView
+  }, [fitView])
 
   const scheduleFitView = useCallback((nodeIds: string[]) => {
     const state = fitState.current
@@ -169,9 +183,7 @@ function MindmapCanvas({
     () =>
       graph.requirements.map((requirement) => ({
         value: requirement.requirement_id,
-        // The id disambiguates same-titled requirements and keeps the option
-        // label distinct from the node's own title text.
-        label: `${requirement.title} · #${requirement.requirement_id}`,
+        label: requirement.title,
       })),
     [graph.requirements],
   )
@@ -186,7 +198,7 @@ function MindmapCanvas({
     return requirements.flatMap((requirement) =>
       requirement.scenarios.map((scenario) => ({
         value: scenario.id,
-        label: `${scenario.name} · #${scenario.id}`,
+        label: scenario.name,
       })),
     )
   }, [graph.requirements, filters.requirementId])
@@ -244,6 +256,7 @@ function MindmapCanvas({
         values={filters}
         requirementOptions={requirementOptions}
         scenarioOptions={scenarioOptions}
+        resultFilterEnabled={hasExecutionResults}
         onChange={handleFilterChange}
       />
 
