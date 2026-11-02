@@ -1,8 +1,8 @@
 # Phase 08 Handoff — P8 硬化与验收
 
-> 状态：**implementation complete；sign-off BLOCKED on S9 long-execution evidence（L16/L17/L18）**
-> 已通过：契约冻结、S0–S6 全旅程、S8、S9 长上下文（pinned 未触发）、S10 版本/限流/保留、S11、S12、S13、P7 回归。
-> 未通过/部分：S9 长执行未覆盖 12 例/2 波、`/p8/large`、checkpoint/head+ref；resilience teardown 未干净退出。
+> 状态：**completed（用户 2026-11-02 选择 B：批准 L16–L18 豁免并发布 v0.2；S9 长执行按 partial 记录；之后回到 A 继续补 S9）**
+> 已通过：契约冻结、S0–S6 全旅程（3 轮澄清）、S8、S9 长上下文（pinned 未触发）、S10 版本/限流/保留、S11、S12、S13、P7 回归。
+> 已批准 partial：S9 长执行未覆盖 12 例/2 波、`/p8/large`、checkpoint/head+ref；pinned facts 未触发；resilience teardown 未干净退出（L16–L18，D6）。
 > 用户批准的 SLO/安全审计/fake-LLM/性能/Docker 偏离已记录。
 > 日期：2026-11-02
 > 阶段：P8（`docs/version-V0.2/phases/phase-08-hardening-acceptance.md`）
@@ -95,8 +95,8 @@
 
 见 [known-limitations.md](../acceptance/p8/known-limitations.md)：
 
-- D1 SLO 不测；D2 安全审计不做；D3 fake-LLM 回归不做；D4 性能基准不做；D5 Docker 不实跑（静态校验）。
-- L11 Curator 重复 draft（3 轮验收未触发但未修产品）；L12 视觉 inconclusive 无 P8 waiver；L13 close 重试上限；L14 真实 LLM 自由文本步骤；L15 一次性 DB 缺 code repo/报告对象；L16 pinned facts 为 0；L17 长执行 12 例/2 波未覆盖；L18 resilience teardown 挂起。
+- D1 SLO 不测；D2 安全审计不做；D3 fake-LLM 回归不做；D4 性能基准不做；D5 Docker 不实跑（静态校验）；**D6 L16–L18 经用户选择 B 批准豁免，v0.2 以 partial S9 长执行发布，之后回到 A 补齐。**
+- L11 Curator 重复 draft（3 轮验收未触发但未修产品）；L12 视觉 inconclusive 无 P8 waiver；L13 close 重试上限；L14 真实 LLM 自由文本步骤；L15 一次性 DB 缺 code repo/报告对象；L16 pinned facts 为 0；L17 长执行 12 例/2 波未覆盖；L18 resilience teardown 挂起。**L16–L18 已经用户 2026-11-02 选择 B 批准豁免（D6），发布后回到 A 继续补。**
 - 多副本限流仍为实例级，文档写明总速率=副本数×限额。
 - Docker Compose 仅静态校验，不宣称运行。
 

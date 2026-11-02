@@ -1,6 +1,6 @@
 # EzTest 开发状态（0.2 / P8）
 
-> 状态：**P8 实施完成；验收签核待 S9 长执行证据（L17）**（2026-11-02，`feat/v0.2-p8` 已合回 `feat/v0.2`，merge `f5c5801` + 后续修复）。
+> 状态：**P8 已按用户选择 B 签核发布（S9 长执行 partial，L16–L18 已豁免）；之后回到 A 继续补 S9**（2026-11-02，`feat/v0.2-p8` 已合回 `feat/v0.2`，merge `f5c5801` + 后续修复）。
 > 产品定位：AI 驱动、半自主、端到端测试系统；0.2 为完整替代版（0.1 P0–P8 全功能对齐 + P9 五项）。
 > 设计权威：[docs/version-V0.2/README.md](docs/version-V0.2/README.md) 与
 > [docs/version-V0.2/contracts/README.md](docs/version-V0.2/contracts/README.md)。
@@ -8,11 +8,12 @@
 
 ## 0. 验证状态（先读）
 
-- **P8 核心验收已 PASS**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
+- **P8 已按 B 签核发布**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
   全旅程 S0–S6（620s，3 轮澄清）、S10、多副本 S8（72 PASS/0 FAIL）、37 行能力矩阵
-  （28 PASS/9 PASS(prior)/0 FAIL）、浏览器 E2E（11 passed/0 skipped，44 张截图）、静态门 18/18 均通过；
-  **S9 长执行 12 例/2 波仍未覆盖（P3 fallback 6 例，L17）**，pinned facts 未触发（L16），resilience
-  teardown 未干净退出（L18）。证据与限制见 [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
+  （28 PASS/9 PASS(prior)/0 FAIL）、浏览器 E2E（11 passed/0 skipped，44 张截图）、静态门 18/18 均通过。
+  用户 2026-11-02 选择 B：**批准 L16–L18 豁免**（S9 长执行 P3 fallback 6 例、pinned facts 未触发、
+  resilience teardown 未干净退出），先发布 v0.2，之后回到 A 严格补 S9。证据与限制见
+  [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
 - **已记录证据**：P6（`acceptance/p6/`，真实 LLM + 真实 Chrome，S0–S9 PASS，9 张截图）与 P7
   （`acceptance/p7/`，13/13 场景、156 checks、21 张 E2E 截图，覆盖 P9 五项）。
 - **Docker 未实跑**：`deploy/` 的 Compose/Dockerfile 已交付并静态校验；本机未安装 Docker，从未构建

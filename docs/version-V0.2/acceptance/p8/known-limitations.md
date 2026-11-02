@@ -13,6 +13,7 @@
 | D3 | phase-08 原列 **fake-LLM 回归**；P8 不做 | 用户确认 phase-08 未提交修改为 P8 范围基线 | 验收全部真实 LLM/Chrome；无确定性 fake-LLM 门禁（P6 U4 已裁定） |
 | D4 | phase-08 原列 **性能/SLO**；P8 不做性能基准 | 同上 | 不设性能阈值；验收记录真实耗时但不作为门禁 |
 | D5 | 计划要求 **Docker 实跑**；本机无 Docker | 2026-11-02：静态校验 + 文档，明确记录未实跑 | `deploy/` 只做 compose/Dockerfile 静态校验；不宣称已运行 |
+| D6 | S9 长执行/`/p8/large`/checkpoint/head+ref、pinned facts、resilience teardown（L16–L18） | 2026-11-02：用户选择 **B（批准豁免，先发布版本；之后回到 A 继续补 S9）** | v0.2 发布签核接受 S9 长执行为 partial；L16–L18 明确记录；后续在独立分支继续补齐，不改变本次发布 |
 
 ## 产品/工程已知限制
 
@@ -33,9 +34,9 @@
 | L13 | `requirement.close` 依赖 work-item 重试预算（当前 10 次，即上限） | 若同需求的设计/分析任务持续超过约 3 分钟，close 任务仍可能 dead | 验收覆盖 `design.gap` 排空后成功关闭；更长阻塞需人工/后续阶段调重试模型 |
 | L14 | 真实 LLM 设计输出可能是自由文本步骤，而非可执行 action | 个别用例会在编译阶段 automation/inconclusive | P8 验收对跨系统用例失败做公开 manual-intent 重试；E2E 将无法执行的 UI 变更记为显式 gap，不伪造通过 |
 | L15 | 一次性 P7→P8 数据库常无 code_repository 行，或报告内容对象缺失 | B4 只能按 prior 证据、报告下载测试可能只能 skip | Capability B4 记 PASS(prior) 并注明原因；E2E 发现报告字节不可读时 `test.skip`，不记 PASS |
-| L16 | S9 pinned facts 在最终 long-context run 中为 0 | 上下文包“保留 pinned facts”未被实际触发 | 文档如实记录 `pinned_facts=0`；保留 S9 的“无 pinned 则不伪造”分支；后续应补一条显式 pin 的用例 |
-| L17 | S9/S10 长执行在最终 run 使用 P3 fallback（6 个执行用例，非 spec 的 12 用例/2 波） | 12 用例、`/p8/large?bytes=20000` head+ref、checkpoint 恢复仍无 P8 证据 | 文档把长执行标为“部分覆盖/P3 fallback”；不得作为 12 用例通过；需后续补 fixture 与确定性 12 用例验收，或取得用户豁免 |
-| L18 | Resilience 脚本在 P3 fallback 后 teardown 挂起，未打印自身 exit code | S9/S10 证据来自运行日志与数据库，不是脚本 exit 0 | 如实记录并停止进程；不得把脚本宣称 exit 0；需修复 teardown 后再签完整 PASS |
+| L16 | S9 pinned facts 在最终 long-context run 中为 0 | 上下文包“保留 pinned facts”未被实际触发 | 用户已批准豁免（D6）；文档如实记录 `pinned_facts=0`；后续 A 阶段补显式 pin 用例 |
+| L17 | S9/S10 长执行在最终 run 使用 P3 fallback（6 个执行用例，非 spec 的 12 用例/2 波） | 12 用例、`/p8/large?bytes=20000` head+ref、checkpoint 恢复仍无 P8 证据 | 用户已批准豁免（D6）；不得作为 12 用例通过；后续 A 阶段补 fixture 与确定性 12 用例验收 |
+| L18 | Resilience 脚本在 P3 fallback 后 teardown 挂起，未打印自身 exit code | S9/S10 证据来自运行日志与数据库，不是脚本 exit 0 | 用户已批准豁免（D6）；后续 A 阶段修复 teardown 并重跑完整 exit-0 |
 
 ## 未纳入 0.3 前必须知悉的边界
 
