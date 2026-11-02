@@ -264,6 +264,10 @@ const partPathBlock = (() => {
 check(/conversation_message\.id/.test(partPathBlock), "parts path documents {mid} = conversation_message.id")
 check(/seq/.test(partPathBlock), "parts path documents seq ordering")
 check(/conversation_id|归属/.test(partPathBlock), "parts path documents conversation ownership filtering")
+check(
+  /P6-T3/.test(openapi) && /会话中可切/.test(openapi),
+  "openapi notes P6-T3 implements the conversation model override (spec §1.2/§9.1)",
+)
 
 const operationIds = [...openapi.matchAll(/^      operationId: ([A-Za-z0-9_]+)$/gm)].map((match) => match[1])
 for (const operationId of [
