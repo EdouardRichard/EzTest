@@ -441,3 +441,232 @@ func renderedSection(rendered, title string) string {
 	}
 	return strings.TrimSuffix(rest, "\n")
 }
+
+type briefingSectionCap struct {
+	title  string
+	budget int
+}
+
+// briefingSectionCaps mirrors the per-section budgets from spec §6.2.
+func briefingSectionCaps() []briefingSectionCap {
+	return []briefingSectionCap{
+		{"需求", 600},
+		{"用例", 300},
+		{"计划", 300},
+		{"发现", 500},
+		{"执行", 200},
+		{"知识", 200},
+	}
+}
+
+// totalSectionBudgetTokens is the most the six regular sections may use when
+// each sits exactly at its own cap.
+func totalSectionBudgetTokens() int {
+	total := 0
+	for _, section := range briefingSectionCaps() {
+		total += section.budget
+	}
+	return total
+}
+
+func buildBriefing(t *testing.T, source agentcontext.Source, versionID int64) agentcontext.Briefing {
+	t.Helper()
+	briefing, err := agentcontext.NewBriefingBuilder(&fakeBriefingReader{source: source}).BuildBriefing(context.Background(), versionID)
+	if err != nil {
+		t.Fatalf("BuildBriefing: %v", err)
+	}
+	return briefing
+}
+
+// protectedHeavySource is the total-budget fixture: the six regular groups are
+// pushed to their standalone caps (through oversizedSource), while the open
+// questions are large enough to break the 2.5k total on their own when combined
+// with those caps, but not large enough to exceed the envelope by themselves.
+func protectedHeavySource() agentcontext.Source {
+	source := oversizedSource()
+	source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
+		Questions: []string{
+			strings.Repeat("大规模未决问题描述", 38) + " OPENQ-END-MARKER",
+			strings.Repeat("另一个未决问题", 40),
+			strings.Repeat("待补充的边界问题", 40),
+		},
+		HumanRequests: []string{
+			strings.Repeat("人工确认请求", 40),
+			strings.Repeat("需要补充资料", 40),
+		},
+	}
+	return source
+}
+
+// TestBriefingTotalBudget pins the total envelope from spec §6.2. The
+// per-section caps alone (600+300+300+500+200+200 = 2100) plus a large
+// protected open-questions group can exceed 2500, so Render must squeeze the six
+// regular groups until the whole text fits, while never cutting the goal, stage
+// or open questions. If the protected content plus the fixed headings and the
+// one-rune marker each regular group needs already exceeds the envelope, the
+// render is returned unchanged: that is the documented, unavoidable exception.
+func TestBriefingTotalBudget(t *testing.T) {
+	t.Run("large open questions shrink the regular sections", func(t *testing.T) {
+		briefing := buildBriefing(t, protectedHeavySource(), 77)
+
+		// Fixture precondition: the protected content is large but does not
+		// exceed the envelope on its own.
+		protectedOnly := agentcontext.Briefing{
+			Goal:          briefing.Goal,
+			Stage:         briefing.Stage,
+			OpenQuestions: briefing.OpenQuestions,
+		}
+		if got := briefingTokens(protectedOnly.Render()); got > agentcontext.BriefingTokenBudget {
+			t.Fatalf("fixture precondition: protected content alone uses %d tokens, want <= %d", got, agentcontext.BriefingTokenBudget)
+		}
+
+		rendered := briefing.Render()
+		if got := briefingTokens(rendered); got > agentcontext.BriefingTokenBudget {
+			t.Fatalf("rendered briefing uses %d tokens, want <= %d", got, agentcontext.BriefingTokenBudget)
+		}
+
+		// The protected group must survive verbatim: the total-budget pass may
+		// only touch the regular groups.
+		if got, want := renderedSection(rendered, "未决"), renderedSection(protectedOnly.Render(), "未决"); got != want {
+			t.Fatalf("protected open questions changed:\n%s\n---\n%s", got, want)
+		}
+		for _, want := range []string{"目标：预算测试目标", "OPENQ-END-MARKER", "人工请求："} {
+			if !strings.Contains(rendered, want) {
+				t.Fatalf("protected content %q was dropped:\n%s", want, rendered)
+			}
+		}
+
+		// Each regular group still respects its own cap, but the combined usage
+		// is now below the sum of those caps: the total-budget pass squeezed it.
+		regularTokens := 0
+		for _, section := range briefingSectionCaps() {
+			body := renderedSection(rendered, section.title)
+			if body == "" {
+				t.Fatalf("section %q is missing:\n%s", section.title, rendered)
+			}
+			if got := briefingTokens(body); got > section.budget {
+				t.Fatalf("section %q uses %d tokens, want <= %d", section.title, got, section.budget)
+			}
+			regularTokens += briefingTokens(body)
+		}
+		if regularTokens >= totalSectionBudgetTokens() {
+			t.Fatalf("regular sections still use %d tokens; the total-budget pass did not squeeze them", regularTokens)
+		}
+
+		// The total-budget pass is deterministic.
+		if rendered != briefing.Render() {
+			t.Fatal("total-budget render is not deterministic")
+		}
+		if again := buildBriefing(t, protectedHeavySource(), 77); again.Render() != rendered {
+			t.Fatal("total-budget render changed between builds")
+		}
+	})
+
+	t.Run("protected content alone over the envelope is returned unchanged", func(t *testing.T) {
+		source := oversizedSource()
+		huge := strings.Repeat("超出总预算的保护内容", 700)
+		source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
+			Questions:     []string{huge},
+			HumanRequests: []string{"需要人工确认"},
+		}
+		briefing := buildBriefing(t, source, 78)
+		rendered := briefing.Render()
+
+		if got := briefingTokens(rendered); got <= agentcontext.BriefingTokenBudget {
+			t.Fatalf("documented exception not exercised: render uses %d tokens, want > %d", got, agentcontext.BriefingTokenBudget)
+		}
+		if open := renderedSection(rendered, "未决"); !strings.Contains(open, huge) {
+			t.Fatal("protected open questions were truncated in the exception render")
+		}
+		// In the exception the six regular groups are left at their standalone
+		// per-section caps instead of being squeezed.
+		for _, section := range briefingSectionCaps() {
+			body := renderedSection(rendered, section.title)
+			if body == "" {
+				t.Fatalf("section %q is missing in the exception render:\n%s", section.title, rendered)
+			}
+			if got := briefingTokens(body); got > section.budget {
+				t.Fatalf("section %q uses %d tokens, want <= %d", section.title, got, section.budget)
+			}
+		}
+		if rendered != briefing.Render() {
+			t.Fatal("exception render is not deterministic")
+		}
+	})
+}
+
+// TestBriefingProtectedBudgetBoundary pins the exact boundary of the documented
+// exception from both sides. While the protected content still leaves a rune
+// for every regular section marker, Render squeezes the regular groups and the
+// total stays inside the envelope; one rune more of protected content pushes
+// the protected content alone over the envelope, and Render returns the
+// per-section-truncated text unchanged.
+func TestBriefingProtectedBudgetBoundary(t *testing.T) {
+	build := func(openRunes int) agentcontext.Briefing {
+		t.Helper()
+		source := oversizedSource()
+		source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
+			Questions: []string{strings.Repeat("边", openRunes)},
+		}
+		return buildBriefing(t, source, 79)
+	}
+	renderedTokens := func(openRunes int) int {
+		return briefingTokens(build(openRunes).Render())
+	}
+
+	// The boundary is found by binary search because the rendered size is
+	// monotone non-decreasing in the protected content: Render either fits the
+	// envelope exactly or, once the protected content alone is too large,
+	// returns text that only grows.
+	const upper = 8192
+	if got := renderedTokens(upper); got <= agentcontext.BriefingTokenBudget {
+		t.Fatalf("fixture precondition: protected content of %d runes uses only %d tokens", upper, got)
+	}
+	low, high := 0, upper
+	for low < high {
+		middle := low + (high-low)/2
+		if renderedTokens(middle) > agentcontext.BriefingTokenBudget {
+			high = middle
+		} else {
+			low = middle + 1
+		}
+	}
+	over := low
+	if over <= 0 {
+		t.Fatalf("no protected-content boundary found below %d runes", upper)
+	}
+
+	// Just inside the boundary the regular groups are squeezed to their
+	// one-rune markers so the total still fits.
+	preBoundary := build(over - 1)
+	inside := preBoundary.Render()
+	if got := briefingTokens(inside); got > agentcontext.BriefingTokenBudget {
+		t.Fatalf("render at the last in-budget protected size uses %d tokens, want <= %d", got, agentcontext.BriefingTokenBudget)
+	}
+	regularTokens := 0
+	for _, section := range briefingSectionCaps() {
+		regularTokens += briefingTokens(renderedSection(inside, section.title))
+	}
+	if regularTokens >= totalSectionBudgetTokens() {
+		t.Fatalf("regular sections use %d tokens just inside the boundary; they were not squeezed", regularTokens)
+	}
+
+	// One rune past the boundary only the protected content can be responsible:
+	// Render returns the per-section-truncated text unchanged.
+	atBoundary := build(over)
+	rendered := atBoundary.Render()
+	if got := briefingTokens(rendered); got <= agentcontext.BriefingTokenBudget {
+		t.Fatalf("render at the boundary uses %d tokens, want > %d", got, agentcontext.BriefingTokenBudget)
+	}
+	protectedOnly := agentcontext.Briefing{
+		Goal:          atBoundary.Goal,
+		Stage:         atBoundary.Stage,
+		OpenQuestions: atBoundary.OpenQuestions,
+	}
+	if got := briefingTokens(protectedOnly.Render()); got <= agentcontext.BriefingTokenBudget {
+		t.Fatalf("exception triggered although the protected content alone uses only %d tokens", got)
+	}
+	if got, want := renderedSection(rendered, "未决"), renderedSection(protectedOnly.Render(), "未决"); got != want {
+		t.Fatalf("protected open questions changed at the exception boundary:\n%s\n---\n%s", got, want)
+	}
+}

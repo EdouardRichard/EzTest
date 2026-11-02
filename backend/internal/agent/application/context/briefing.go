@@ -18,10 +18,20 @@ import (
 )
 
 // BriefingTokenBudget is the total render envelope from spec §6.2 (≤2.5k
-// tokens). The goal/stage head and the open questions are protected content:
-// their size is not capped, so a pathological version can exceed this envelope
-// while every regular section still respects its own budget.
+// tokens). Render enforces it in two passes: it first cuts every regular group
+// to its own section budget, then, when the whole text is still over the
+// envelope, it squeezes the six regular groups deterministically until the
+// render fits. The goal/stage head and the open questions are protected and are
+// never truncated. The only render allowed to exceed the envelope is the
+// documented exception where the protected content (head and open questions)
+// plus the fixed headings and the one-rune truncation marker every regular group
+// needs already exceed it; that render is returned unchanged.
 const BriefingTokenBudget = 2500
+
+// briefingBudgetRunes is the largest rune count whose conservative estimate
+// still fits BriefingTokenBudget: the estimator is ceil(0.6×runes), so
+// ceil(0.6 × 2500×5/3) = 2500.
+const briefingBudgetRunes = BriefingTokenBudget * 5 / 3
 
 // Stable section names. They are the machine identity of a briefing group and
 // stay fixed across renders.
@@ -156,19 +166,17 @@ func briefingSection(name, title, body string) []Section {
 // Render formats the briefing deterministically. The section order is fixed
 // (head, requirements, cases, plan, findings, execution, knowledge, open
 // questions). Over-budget regular sections are truncated independently; the
-// goal/stage head and the open questions are never truncated.
+// goal/stage head and the open questions are never truncated. When the
+// independently truncated text still exceeds BriefingTokenBudget, the six
+// regular groups are squeezed proportionally until the total fits. Only the
+// documented protected-content exception can leave the render above the
+// envelope.
 func (b Briefing) Render() string {
-	var out strings.Builder
-	out.WriteString("## ")
-	out.WriteString(sectionTitleGoal)
-	out.WriteString("\n目标：")
-	out.WriteString(orNone(b.Goal))
-	out.WriteString("\n阶段：")
-	out.WriteString(orNone(b.Stage))
-	for _, group := range briefingGroups(b) {
-		out.WriteString("\n\n## ")
-		out.WriteString(group.title)
-		out.WriteString("\n")
+	groups := briefingGroups(b)
+	head := renderHead(b)
+
+	bodies := make([]string, len(groups))
+	for index, group := range groups {
 		body := renderSectionBody(group.sections)
 		if strings.TrimSpace(body) == "" {
 			body = noneText
@@ -176,9 +184,106 @@ func (b Briefing) Render() string {
 		if group.budget > 0 {
 			body = truncateToBudget(body, group.budget)
 		}
-		out.WriteString(body)
+		bodies[index] = body
+	}
+
+	rendered := assembleBriefing(head, groups, bodies)
+	if estimateBriefingTokens(rendered) <= BriefingTokenBudget {
+		return rendered
+	}
+
+	// The last group (open questions) is protected; everything before it is a
+	// regular group that the total-budget pass may shrink.
+	regularGroups := len(groups) - 1
+	regularRunes := 0
+	for index := 0; index < regularGroups; index++ {
+		regularRunes += utf8.RuneCountInString(bodies[index])
+	}
+	fixedRunes := utf8.RuneCountInString(rendered) - regularRunes
+	if fixedRunes+regularGroups > briefingBudgetRunes {
+		// Documented exception: the protected content plus the fixed headings
+		// and the smallest possible body for every regular group already exceed
+		// the envelope. Nothing can be cut without touching protected content,
+		// so the per-section-truncated render is returned unchanged.
+		return rendered
+	}
+
+	allocations := regularSectionAllocations(groups[:regularGroups], briefingBudgetRunes-fixedRunes)
+	for index := 0; index < regularGroups; index++ {
+		bodies[index] = truncateToRunes(bodies[index], allocations[index])
+	}
+	return assembleBriefing(head, groups, bodies)
+}
+
+// renderHead renders the always-present goal/stage head. It is never truncated.
+func renderHead(b Briefing) string {
+	var out strings.Builder
+	out.WriteString("## ")
+	out.WriteString(sectionTitleGoal)
+	out.WriteString("\n目标：")
+	out.WriteString(orNone(b.Goal))
+	out.WriteString("\n阶段：")
+	out.WriteString(orNone(b.Stage))
+	return out.String()
+}
+
+// assembleBriefing concatenates the head and the groups in fixed order. Every
+// body is already non-empty; the callers substitute noneText when a group has no
+// content.
+func assembleBriefing(head string, groups []briefingGroup, bodies []string) string {
+	var out strings.Builder
+	out.WriteString(head)
+	for index, group := range groups {
+		out.WriteString("\n\n## ")
+		out.WriteString(group.title)
+		out.WriteString("\n")
+		out.WriteString(bodies[index])
 	}
 	return out.String()
+}
+
+// regularSectionAllocations splits the rune allowance left after the protected
+// content over the regular groups. Each group first reserves one rune for its
+// truncation marker; the rest is shared proportionally to the group's own
+// section budget, so a group with a larger spec budget keeps a larger share.
+// Integer arithmetic and a fixed remainder order make the split deterministic,
+// and no group ever receives more than its own section budget allows.
+func regularSectionAllocations(groups []briefingGroup, availableRunes int) []int {
+	allocations := make([]int, len(groups))
+	if len(groups) == 0 {
+		return allocations
+	}
+	weights := make([]int, len(groups))
+	weightTotal := 0
+	for index, group := range groups {
+		weight := group.budget * 5 / 3
+		if weight < 1 {
+			weight = 1
+		}
+		weights[index] = weight
+		weightTotal += weight
+		allocations[index] = 1
+	}
+	remaining := availableRunes - len(groups)
+	if remaining < 0 {
+		remaining = 0
+	}
+	assigned := 0
+	for index := range groups {
+		share := remaining * weights[index] / weightTotal
+		allocations[index] += share
+		assigned += share
+	}
+	for index := 0; assigned < remaining; index = (index + 1) % len(groups) {
+		allocations[index]++
+		assigned++
+	}
+	for index := range groups {
+		if allocations[index] > weights[index] {
+			allocations[index] = weights[index]
+		}
+	}
+	return allocations
 }
 
 // briefingGroup couples one rendered group with its content budget. A zero
@@ -229,22 +334,30 @@ func renderSectionBody(sections []Section) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// truncateToBudget cuts text down to the conservative token estimate. The
-// ellipsis is reserved inside the budget, so the truncated body never exceeds
-// it. A non-positive budget means "do not truncate".
+// truncateToBudget cuts text down to the conservative token estimate of one
+// section budget. A non-positive budget means "do not truncate".
 func truncateToBudget(text string, budget int) string {
-	if budget <= 0 || estimateBriefingTokens(text) <= budget {
+	if budget <= 0 {
 		return text
 	}
-	maxRunes := budget*5/3 - 1
-	if maxRunes < 0 {
-		maxRunes = 0
+	return truncateToRunes(text, budget*5/3)
+}
+
+// truncateToRunes cuts text to at most maxRunes runes while staying UTF-8 safe,
+// reserving the ellipsis inside the limit so a truncated body never exceeds it.
+// Callers only pass positive limits; a zero limit yields an empty body.
+func truncateToRunes(text string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
 	}
 	runes := []rune(text)
-	if maxRunes > len(runes) {
-		maxRunes = len(runes)
+	if len(runes) <= maxRunes {
+		return text
 	}
-	prefix := strings.TrimRight(string(runes[:maxRunes]), " \t\r\n")
+	if maxRunes == 1 {
+		return truncationMarker
+	}
+	prefix := strings.TrimRight(string(runes[:maxRunes-1]), " \t\r\n")
 	if prefix == "" {
 		return truncationMarker
 	}
