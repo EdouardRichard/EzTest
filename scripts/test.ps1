@@ -35,17 +35,26 @@ try {
 $frontend = Join-Path $repoRoot "frontend"
 if (Test-Path (Join-Path $frontend "node_modules")) {
     Push-Location $frontend
+    $previousErrorAction = $ErrorActionPreference
+    # pnpm/Biome/tsc write progress to stderr; with ErrorActionPreference=Stop
+    # Windows PowerShell 5.1 turns that into a NativeCommandError even when the
+    # command succeeded. Judge the gate by $LASTEXITCODE instead.
+    $ErrorActionPreference = "Continue"
     try {
         Write-Host "== frontend lint =="
         & pnpm lint
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $lintExit = $LASTEXITCODE
+        if ($lintExit -ne 0) { exit $lintExit }
         Write-Host "== frontend typecheck =="
         & pnpm typecheck
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $typeExit = $LASTEXITCODE
+        if ($typeExit -ne 0) { exit $typeExit }
         Write-Host "== frontend test =="
         & pnpm test
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $testExit = $LASTEXITCODE
+        if ($testExit -ne 0) { exit $testExit }
     } finally {
+        $ErrorActionPreference = $previousErrorAction
         Pop-Location
     }
 } else {
