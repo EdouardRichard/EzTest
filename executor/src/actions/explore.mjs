@@ -24,6 +24,7 @@ import path from "node:path"
 import { chromium } from "playwright"
 
 import { withAbort } from "../actions.mjs"
+import { captureStorageState, splitStorageState } from "../contexts.mjs"
 import { isWebSocketAllowed, parseAllowedHosts } from "../limits.mjs"
 import {
   DEFAULT_ACTION_TIMEOUT_MS,
@@ -307,6 +308,29 @@ function blockWorkers() {
   }
   block("Worker")
   block("SharedWorker")
+}
+
+/**
+ * Re-seeds sessionStorage for every stored origin before any page script runs.
+ * Used only when an explore page is opened from a captured storage state.
+ */
+async function installSessionStorage(context, sessionStorage) {
+  if (!sessionStorage || Object.keys(sessionStorage).length === 0) {
+    return
+  }
+  await context.addInitScript((entries) => {
+    try {
+      const items = entries[window.location.origin]
+      if (!items) {
+        return
+      }
+      for (const item of items) {
+        window.sessionStorage.setItem(item.name, item.value)
+      }
+    } catch {
+      // Opaque origins (about:blank, sandboxed frames) cannot store data.
+    }
+  }, sessionStorage)
 }
 
 async function installRouteGuard(entry) {
@@ -599,6 +623,10 @@ export class ExploreRuntime {
   #browser = null
   #browserPromise = null
   #pages = new Map()
+  // Captured storage states addressable by a stable `storage_state_ref`. The
+  // page/session lifecycle is independent: closing a page (or all pages) keeps
+  // the session, so the next page can reuse it.
+  #sessions = new Map()
   #nextPageId = 1
   #launcher
   #logger
@@ -606,6 +634,9 @@ export class ExploreRuntime {
   #allowedHosts
   #closed = false
   #controllers = new Set()
+  // Page creations that are still between the browser launch and registration.
+  // They are associated with their action so cancel/timeout can abort them.
+  #pending = new Set()
   #current = null
   #tail = Promise.resolve()
 
@@ -644,7 +675,12 @@ export class ExploreRuntime {
     }
     if (!this.#browserPromise) {
       this.#browserPromise = this.#launcher().then(
-        (browser) => {
+        async (browser) => {
+          if (this.#closed) {
+            // close() ran while the first browser launch was still in flight.
+            await browser.close().catch(() => {})
+            throw new ExecutorError("internal", "explore runtime is shutting down")
+          }
           this.#browser = browser
           return browser
         },
@@ -657,35 +693,63 @@ export class ExploreRuntime {
     return this.#browserPromise
   }
 
-  async #createPage(allowedHosts, viewport, operation) {
-    const browser = await this.#ensureBrowser()
-    if (this.#pages.size >= this.#maxPages) {
-      throw new ExecutorError(
-        "page_limit",
-        `maximum of ${this.#maxPages} concurrent explore pages reached`,
-      )
-    }
-    const context = await browser.newContext({
-      acceptDownloads: false,
-      serviceWorkers: "block",
-      ...(viewport ? { viewport } : {}),
+  async #createPage(allowedHosts, viewport, operation, storageStateInput) {
+    // Track the creation before its first await: a cancel/hard timeout that lands
+    // while the browser is still launching must have something to abort, or the
+    // page would be registered after the action already failed.
+    const creation = { operation, context: null, entry: null, canceled: false }
+    creation.done = new Promise((resolve) => {
+      creation.resolveDone = resolve
     })
-    const pageId = `page_${this.#nextPageId++}`
-    const entry = {
-      pageId,
-      context,
-      page: null,
-      allowedHosts: [...allowedHosts],
-      consoleItems: [],
-      networkItems: [],
-      pendingRequests: new Map(),
-      secrets: new Set(),
-      blocked: null,
-      cdpSession: null,
-      closed: false,
+    this.#pending.add(creation)
+    if (operation) {
+      operation.pending = creation
     }
     try {
+      const browser = await this.#ensureBrowser()
+      this.#requireLiveCreation(creation)
+      // In-flight creations count against the page limit so a burst of opens
+      // cannot exceed it while contexts are still being built.
+      if (this.#pages.size + this.#pending.size > this.#maxPages) {
+        throw new ExecutorError(
+          "page_limit",
+          `maximum of ${this.#maxPages} concurrent explore pages reached`,
+        )
+      }
+      // A captured session is re-seeded at context creation, exactly like an
+      // execution context: cookies/localStorage are Playwright's storageState and
+      // sessionStorage is injected through an init script.
+      const { storageState, sessionStorage } = splitStorageState(storageStateInput)
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+        ...(viewport ? { viewport } : {}),
+        ...(storageState ? { storageState } : {}),
+      })
+      creation.context = context
+      this.#requireLiveCreation(creation)
+      const pageId = `page_${this.#nextPageId++}`
+      const entry = {
+        pageId,
+        context,
+        page: null,
+        allowedHosts: [...allowedHosts],
+        consoleItems: [],
+        networkItems: [],
+        pendingRequests: new Map(),
+        secrets: new Set(),
+        blocked: null,
+        cdpSession: null,
+        closed: false,
+      }
+      // Associate the page with the operation before the setup awaits so a
+      // cancel that lands mid-setup drops the context instead of orphaning it.
+      creation.entry = entry
+      if (operation) {
+        operation.entry = entry
+      }
       await context.addInitScript(blockWorkers)
+      await installSessionStorage(context, sessionStorage)
       await installRouteGuard(entry)
       await installWebSocketGuard(entry, this.#allowedHosts)
       const page = await context.newPage()
@@ -697,15 +761,71 @@ export class ExploreRuntime {
       })
       attachTelemetry(entry)
       await installCdpGuard(entry, page)
+      // Never register a page for an action that was canceled or timed out while
+      // its creation was in flight.
+      this.#requireLiveCreation(creation)
       this.#pages.set(pageId, entry)
-      if (operation) {
-        operation.entry = entry
-      }
       return entry
     } catch (error) {
-      await context.close().catch(() => {})
+      if (creation.context) {
+        await creation.context.close().catch(() => {})
+      }
       throw error
+    } finally {
+      this.#pending.delete(creation)
+      if (operation && operation.pending === creation) {
+        operation.pending = null
+      }
+      creation.resolveDone?.()
     }
+  }
+
+  /** Throws when a pending page creation was canceled, dropped or shut down. */
+  #requireLiveCreation(creation) {
+    if (
+      this.#closed ||
+      creation.canceled ||
+      creation.entry?.closed === true ||
+      creation.operation?.controller?.signal.aborted
+    ) {
+      throw new ExecutorError("canceled", "explore page creation was aborted")
+    }
+  }
+
+  /**
+   * Stores one captured storage state under a stable, content-addressed ref so a
+   * later explore.open can restore it without receiving the session bytes again.
+   */
+  #storeStorageState(state) {
+    const canonical = JSON.stringify(state)
+    const ref = `ss_${sha256(Buffer.from(canonical)).slice(0, 16)}`
+    this.#sessions.set(ref, state)
+    return ref
+  }
+
+  /** Resolves storage_state_ref / storage_state arguments for a new page. */
+  #resolveStorageState(args) {
+    const hasRef = args.storage_state_ref !== undefined
+    const hasInline = args.storage_state !== undefined
+    if (hasRef && hasInline) {
+      throw invalidArguments("storage_state_ref and storage_state are mutually exclusive")
+    }
+    if (hasRef) {
+      if (typeof args.storage_state_ref !== "string" || args.storage_state_ref.length === 0) {
+        throw invalidArguments("storage_state_ref must be a non-empty string")
+      }
+      const state = this.#sessions.get(args.storage_state_ref)
+      if (!state) {
+        throw invalidArguments(`unknown storage_state_ref: ${args.storage_state_ref}`)
+      }
+      return state
+    }
+    if (hasInline) {
+      // Validates the shape and throws invalid_arguments when malformed.
+      splitStorageState(args.storage_state)
+      return args.storage_state
+    }
+    return undefined
   }
 
   #requirePage(pageId, operation) {
@@ -783,6 +903,9 @@ export class ExploreRuntime {
     }
     let entry
     if (args.page_id !== undefined) {
+      if (args.storage_state !== undefined || args.storage_state_ref !== undefined) {
+        throw invalidArguments("storage_state can only be applied to a new explore page")
+      }
       entry = this.#enterPage(args.page_id, operation)
       if (args.allowed_hosts !== undefined) {
         entry.allowedHosts = parseAllowedHostsArg(args.allowed_hosts)
@@ -799,13 +922,18 @@ export class ExploreRuntime {
           `url host is not allowed: ${hostFromUrl(url) ?? url}`,
         )
       }
-      entry = await this.#createPage(hosts, viewport, operation)
+      const storageStateInput = this.#resolveStorageState(args)
+      entry = await this.#createPage(hosts, viewport, operation, storageStateInput)
     }
     if (!isAllowedUrl(url, { allowedHosts: entry.allowedHosts })) {
       throw new ExecutorError(
         "host_not_allowed",
         `url host is not allowed: ${hostFromUrl(url) ?? url}`,
       )
+    }
+    // A cancel that landed after the page object existed must not navigate it.
+    if (operation?.controller?.signal.aborted || operation?.pending?.canceled) {
+      throw new ExecutorError("canceled", "explore.open was canceled before navigation")
     }
     let response
     try {
@@ -838,15 +966,33 @@ export class ExploreRuntime {
 
   async #snapshot(args, operation) {
     const entry = this.#enterPage(args.page_id, operation)
-    return {
-      result: {
-        page_id: entry.pageId,
-        route: scrubText(routeOf(entry.page), entry),
-        dom_snapshot: await this.#domSnapshot(entry),
-        requests: this.#requests(entry),
-        console: this.#console(entry),
-      },
+    let includeStorageState = false
+    if (args.include_storage_state !== undefined) {
+      if (typeof args.include_storage_state !== "boolean") {
+        throw invalidArguments("include_storage_state must be a boolean")
+      }
+      includeStorageState = args.include_storage_state
     }
+    const result = {
+      page_id: entry.pageId,
+      route: scrubText(routeOf(entry.page), entry),
+      dom_snapshot: await this.#domSnapshot(entry),
+      requests: this.#requests(entry),
+      console: this.#console(entry),
+    }
+    if (includeStorageState) {
+      // Opt-in only: the payload carries live session cookies. The backend
+      // stores it as a session reference, never in a fact or knowledge item.
+      const state = await captureStorageState(entry.page)
+      result.storage_state = state
+      result.storage_state_ref = this.#storeStorageState(state)
+    }
+    await settle()
+    const blocked = this.#takeBlocked(entry)
+    if (blocked) {
+      throw blocked
+    }
+    return { result }
   }
 
   async #click(args, timeoutMs, operation) {
@@ -941,12 +1087,18 @@ export class ExploreRuntime {
         items = [items[index]]
       }
     }
+    const domSnapshot = await this.#domSnapshot(entry)
+    await settle()
+    const blocked = this.#takeBlocked(entry)
+    if (blocked) {
+      throw blocked
+    }
     return {
       result: {
         page_id: entry.pageId,
         route: scrubText(routeOf(entry.page), entry),
         items,
-        dom_snapshot: await this.#domSnapshot(entry),
+        dom_snapshot: domSnapshot,
         requests: this.#requests(entry),
         console: this.#console(entry),
       },
@@ -971,6 +1123,11 @@ export class ExploreRuntime {
       target = { selector, index }
     }
     ensureArtifactSize(buffer)
+    await settle()
+    const blocked = this.#takeBlocked(entry)
+    if (blocked) {
+      throw blocked
+    }
     const digest = sha256(buffer)
     const screenshotRef = {
       kind: "screenshot",
@@ -1067,9 +1224,10 @@ export class ExploreRuntime {
           controller.signal.aborted ||
           (error instanceof ExecutorError && error.code === "executor_timeout")
         ) {
-          // Aborting the promise does not stop Playwright; dropping the page is
-          // what actually terminates the browser-side operation.
-          await this.#dropPage(operation.entry)
+          // Aborting the promise does not stop Playwright; dropping the page (or
+          // the half-created page) is what actually terminates the browser-side
+          // operation.
+          await this.#discardOperation(operation)
         }
         throw mapped
       } finally {
@@ -1111,6 +1269,29 @@ export class ExploreRuntime {
     this.#logger?.info?.(`[executor] explore page ${entry.pageId} dropped`)
   }
 
+  /**
+   * Cleanup for a canceled/timed-out action: drops a registered page and, when
+   * the action is still creating its page, marks the creation aborted and closes
+   * a context that already exists. The creation itself never registers the page.
+   */
+  async #discardOperation(operation) {
+    const creation = operation?.pending ?? null
+    if (creation) {
+      creation.canceled = true
+    }
+    const entry = operation?.entry ?? creation?.entry ?? null
+    if (entry) {
+      await this.#dropPage(entry)
+      return
+    }
+    if (creation?.context) {
+      await withAbort(creation.context.close(), {
+        timeoutMs: 5_000,
+        label: "close of in-flight explore page",
+      }).catch(() => {})
+    }
+  }
+
   /** Aborts every in-flight and queued explore action; drops the live page. */
   async cancel() {
     let canceled = false
@@ -1121,17 +1302,18 @@ export class ExploreRuntime {
       }
     }
     const current = this.#current
-    if (canceled && current?.entry) {
+    if (canceled && current) {
       // Drop the page now so the canceled browser operation is terminated before
       // the endpoint returns; the action's own cleanup call is then a no-op.
-      await this.#dropPage(current.entry)
+      await this.#discardOperation(current)
     }
     return { canceled }
   }
 
   /**
    * Closes every explore page without shutting the runtime down, so a new
-   * explore.open can be used again. In-flight actions are canceled first.
+   * explore.open can be used again. In-flight actions and page creations are
+   * canceled first.
    */
   async closePages() {
     for (const controller of this.#controllers) {
@@ -1140,11 +1322,26 @@ export class ExploreRuntime {
       }
     }
     this.#controllers.clear()
+    const creations = [...this.#pending]
+    for (const creation of creations) {
+      creation.canceled = true
+      if (creation.context) {
+        await creation.context.close().catch(() => {})
+      }
+    }
     const entries = [...this.#pages.values()]
     this.#pages.clear()
     for (const entry of entries) {
       entry.closed = true
       await entry.context.close().catch(() => {})
+    }
+    // A creation waiting on a browser call settles once that call returns; wait
+    // briefly so shutdown drops its context too instead of returning early.
+    if (creations.length > 0) {
+      await withAbort(
+        Promise.all(creations.map((creation) => creation.done)),
+        { timeoutMs: 5_000, label: "close of pending explore page creations" },
+      ).catch(() => {})
     }
     return { closed: true }
   }
@@ -1156,6 +1353,7 @@ export class ExploreRuntime {
     }
     this.#closed = true
     await this.closePages()
+    this.#sessions.clear()
     if (this.#browser) {
       await this.#browser.close().catch(() => {})
       this.#browser = null

@@ -2,6 +2,8 @@ import test, { after, before } from "node:test"
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 
+import { chromium } from "playwright"
+
 import { EXPLORE_ACTIONS, createExploreRuntime } from "../src/actions/explore.mjs"
 import { createExecutorServer } from "../src/server.mjs"
 import { httpClient, startLocalPage } from "./helpers.mjs"
@@ -36,11 +38,33 @@ async function act(action, args = {}) {
 async function openPage(path = "/home") {
   const opened = await act("explore.open", {
     url: `${pageServer.url}${path}`,
-    allowedHosts: ["127.0.0.1"],
+    allowed_hosts: ["127.0.0.1"],
   })
   assert.equal(opened.status, 200, opened.text)
   assert.equal(opened.json.ok, true, opened.text)
   return opened.json.result
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** Launches Chromium for the isolated cold-start tests (same fallbacks as the runtime). */
+async function launchColdBrowser() {
+  const attempts = [
+    { headless: true },
+    { headless: true, channel: "chrome" },
+    { headless: true, channel: "msedge" },
+  ]
+  let lastError
+  for (const options of attempts) {
+    try {
+      return await chromium.launch(options)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError
 }
 
 test("explore actions run the full open→snapshot→click→fill→extract→screenshot chain", async () => {
@@ -141,6 +165,18 @@ test("explore actions report page_not_found for an unknown page_id", async () =>
   assert.equal(response.json.error.code, "page_not_found")
 })
 
+test("explore.open rejects a url outside the page allow list", async () => {
+  const before = explore.size
+  const response = await act("explore.open", {
+    url: `${pageServer.url}/home`,
+    allowed_hosts: ["example.com"],
+  })
+  assert.equal(response.status, 200, response.text)
+  assert.equal(response.json.ok, false)
+  assert.equal(response.json.error.code, "host_not_allowed")
+  assert.equal(explore.size, before, "rejected open must not create a page")
+})
+
 test("explore outputs redact fill(secret=true) values", async () => {
   const opened = await openPage("/secret-leak")
   const pageId = opened.page_id
@@ -213,7 +249,7 @@ test("the explore action family is closed and has no shell path", async () => {
 test("explore.cancel aborts an in-flight action", async () => {
   const pending = act("explore.open", {
     url: `${pageServer.url}/slow`,
-    allowedHosts: ["127.0.0.1"],
+    allowed_hosts: ["127.0.0.1"],
     timeout_ms: 5000,
   })
   await new Promise((resolve) => setTimeout(resolve, 300))
@@ -226,4 +262,122 @@ test("explore.cancel aborts an in-flight action", async () => {
   assert.equal(outcome.status, 200, outcome.text)
   assert.equal(outcome.json.ok, false)
   assert.equal(outcome.json.error.code, "canceled")
+})
+
+test("explore.cancel during a cold page creation leaves no orphan page", async () => {
+  // A cold runtime has no browser yet, so the open is still inside
+  // `#createPage` when cancel() lands. The delayed launcher makes that window
+  // deterministic on fast machines.
+  const cold = createExploreRuntime({
+    logger: null,
+    launch: async () => {
+      await delay(500)
+      return launchColdBrowser()
+    },
+  })
+  try {
+    const pending = cold.runAction({
+      action: "explore.open",
+      args: {
+        url: `${pageServer.url}/slow`,
+        allowed_hosts: ["127.0.0.1"],
+        timeout_ms: 5000,
+      },
+    })
+    await delay(150)
+    const canceled = await cold.cancel()
+    assert.equal(canceled.canceled, true)
+
+    const outcome = await pending
+    assert.equal(outcome.ok, false, JSON.stringify(outcome))
+    assert.equal(outcome.error.code, "canceled")
+
+    // Let the in-flight launch/creation finish; the canceled creation must close
+    // its context and never register the page.
+    await delay(2500)
+    assert.equal(cold.size, 0, "canceled page creation leaked an explore page")
+
+    const reopened = await cold.runAction({
+      action: "explore.open",
+      args: { url: `${pageServer.url}/home`, allowed_hosts: ["127.0.0.1"] },
+    })
+    assert.equal(reopened.ok, true, JSON.stringify(reopened))
+    assert.equal(reopened.result.page_id, "page_1")
+  } finally {
+    await delay(1000)
+    await cold.close().catch(() => {})
+  }
+})
+
+test("executor_timeout during a cold page creation drops the pending page", async () => {
+  const cold = createExploreRuntime({
+    logger: null,
+    launch: async () => {
+      await delay(500)
+      return launchColdBrowser()
+    },
+  })
+  try {
+    const outcome = await cold.runAction({
+      action: "explore.open",
+      args: {
+        url: `${pageServer.url}/home`,
+        allowed_hosts: ["127.0.0.1"],
+        // Hard deadline is timeout_ms + 250ms, so it fires while the browser is
+        // still launching and the page creation is in flight.
+        timeout_ms: 100,
+      },
+    })
+    assert.equal(outcome.ok, false, JSON.stringify(outcome))
+    assert.equal(outcome.error.code, "executor_timeout")
+
+    await delay(3000)
+    assert.equal(cold.size, 0, "timed-out page creation leaked an explore page")
+
+    const reopened = await cold.runAction({
+      action: "explore.open",
+      args: { url: `${pageServer.url}/home`, allowed_hosts: ["127.0.0.1"] },
+    })
+    assert.equal(reopened.ok, true, JSON.stringify(reopened))
+    assert.equal(reopened.result.page_id, "page_1")
+  } finally {
+    await delay(1000)
+    await cold.close().catch(() => {})
+  }
+})
+
+test("close during the first browser launch closes the launched browser", async () => {
+  let launched = false
+  let browserClosed = false
+  const fakeBrowser = {
+    isConnected: () => true,
+    async close() {
+      browserClosed = true
+    },
+    async newContext() {
+      throw new Error("newContext must not run after close()")
+    },
+  }
+  const cold = createExploreRuntime({
+    logger: null,
+    launch: async () => {
+      await delay(200)
+      launched = true
+      return fakeBrowser
+    },
+  })
+  const pending = cold.runAction({
+    action: "explore.open",
+    args: { url: `${pageServer.url}/home`, allowed_hosts: ["127.0.0.1"] },
+  })
+  await delay(50)
+  await cold.close()
+  const outcome = await pending
+  assert.equal(outcome.ok, false, JSON.stringify(outcome))
+  // The launcher resolves only after close(); the runtime must close it instead
+  // of keeping a browser nothing will ever shut down.
+  await delay(300)
+  assert.equal(launched, true)
+  assert.equal(browserClosed, true)
+  assert.equal(cold.size, 0)
 })
