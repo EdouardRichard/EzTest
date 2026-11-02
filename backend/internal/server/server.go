@@ -67,6 +67,9 @@ type Deps struct {
 	Versions      *versionapp.Service
 	Requirements  *versionapp.RequirementService
 	Conversations *versionapp.ConversationService
+	// Stage is the deterministic version stage machine (spec §5.3). It is
+	// optional; nil leaves the stage-machine routes unmounted.
+	Stage *versionapp.StageMachine
 	TeamRoom      *agentapp.TeamRoom
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
@@ -153,6 +156,11 @@ func New(deps Deps) http.Handler {
 	)
 	registerVersionRoutes(mux, authenticated, versionHandler)
 	registerRequirementRoutes(mux, authenticated, requirementHandler)
+	var stageHandler *versionapi.StageHandler
+	if deps.Stage != nil {
+		stageHandler = versionapi.NewStageHandler(deps.Stage)
+	}
+	registerStageRoutes(mux, authenticated, stageHandler)
 	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
 	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
@@ -320,6 +328,20 @@ func registerRequirementRoutes(mux *http.ServeMux, authenticated func(http.Handl
 	mux.Handle("POST /api/versions/{id}/requirements/{rid}/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
 	mux.Handle("POST /api/versions/{id}/requirements/{rid}/rollback", authenticated(http.HandlerFunc(h.Rollback)))
 	mux.Handle("GET /api/versions/{id}/requirements/{rid}/relations", authenticated(http.HandlerFunc(h.ListRelations)))
+}
+
+// registerStageRoutes mounts the deterministic version stage-machine API: the
+// stage read plus the two user-only hard gates and the gate reject. A nil
+// handler keeps the route table of a deployment without the stage machine
+// unchanged.
+func registerStageRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.StageHandler) {
+	if h == nil {
+		return
+	}
+	mux.Handle("GET /api/versions/{id}/stage", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("POST /api/versions/{id}/stage/confirm-requirements", authenticated(http.HandlerFunc(h.ConfirmRequirements)))
+	mux.Handle("POST /api/versions/{id}/stage/confirm-cases", authenticated(http.HandlerFunc(h.ConfirmCases)))
+	mux.Handle("POST /api/versions/{id}/stage/reject", authenticated(http.HandlerFunc(h.Reject)))
 }
 
 func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.ConversationHandler) {

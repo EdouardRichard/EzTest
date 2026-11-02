@@ -571,6 +571,11 @@ func main() {
 	p5Bindings := newP5CodeBindings(p5Git, resourceSvc)
 	versionRepo := versionpg.New(pool, ids)
 	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, p5Bindings)
+	// Deterministic stage machine (0.2.1 §5.3). The stage-entry job enqueuer is
+	// nil until the work-item dispatcher lands (P2-T2 Task 7); until then a
+	// transition is still persisted, published and audited (gate decisions),
+	// and the missing dispatch is recoverable by the dispatcher's reconciler.
+	stageMachine := versionapp.NewStageMachine(versionRepo, nil, auditSvc, eventSvc, clk)
 	p5Bindings.SetVersionService(versionSvc, versionRepo)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
@@ -1088,6 +1093,7 @@ func main() {
 		Versions:      versionSvc,
 		Requirements:  requirementSvc,
 		Conversations: conversationSvc,
+		Stage:         stageMachine,
 		TeamRoom:      teamRoom,
 		DesignGraph:   designGraph,
 		DesignExports: designExports,
