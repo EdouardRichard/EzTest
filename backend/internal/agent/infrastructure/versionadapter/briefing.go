@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	knowledge "github.com/EdouardRichard/EzTest/backend/internal/knowledge/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -30,6 +31,7 @@ const (
 	briefingOpenItemLimit         = 20
 	briefingFactSummaryRunes      = 240
 	briefingKnowledgeSummaryRunes = 240
+	briefingOpenItemLabelRunes    = 240
 )
 
 // briefingSource is the narrow read seam behind the production briefing
@@ -297,11 +299,14 @@ func loadBriefingPlan(ctx context.Context, tx pgx.Tx, versionID int64, source *a
 }
 
 func loadBriefingFacts(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
+	// The candidate order mirrors the briefing renderer's fact ranking
+	// (confidence first, missing confidence last, then newest), so the top
+	// findings survive the read limit on a version with many facts.
 	rows, err := tx.Query(ctx, `
 		SELECT id, kind, key, payload, confidence, created_at
 		FROM version_fact
 		WHERE version_id = $1 AND superseded_by IS NULL
-		ORDER BY created_at DESC, id DESC
+		ORDER BY confidence DESC NULLS LAST, created_at DESC, id DESC
 		LIMIT $2
 	`, versionID, briefingFactLimit)
 	if err != nil {
@@ -325,8 +330,13 @@ func loadBriefingFacts(ctx context.Context, tx pgx.Tx, versionID int64, source *
 
 func loadBriefingExecution(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
 	var waveID int64
+	// pause_reason survives the resume/finish transitions (the wave repository
+	// keeps it when a transition passes an empty reason), so only a paused wave
+	// may contribute a blocker. A running/done/cancelled wave must never surface
+	// the previous pause reason.
 	err := tx.QueryRow(ctx, `
-		SELECT id, status, COALESCE(pause_reason, '')
+		SELECT id, status,
+			CASE WHEN status = 'paused' THEN COALESCE(pause_reason, '') ELSE '' END
 		FROM run_wave
 		WHERE version_id = $1
 		ORDER BY id DESC
@@ -423,6 +433,11 @@ func loadBriefingKnowledge(ctx context.Context, tx pgx.Tx, versionID int64, sour
 		return err
 	}
 
+	// Binding/scope filtering happens in Go, so the candidate pool is bounded to
+	// the top approved items by confidence. This is a deterministic bounded
+	// top-K trade-off: a version with more than briefingKnowledgeCandidates
+	// higher-confidence items that are invisible to it could miss a visible
+	// lower-confidence item that would still make the rendered top-K.
 	rows, err := tx.Query(ctx, `
 		SELECT id, scope, COALESCE(system_key, ''), title, content, confidence, bindings
 		FROM knowledge_item
@@ -623,7 +638,10 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 
 // visible reports whether one approved knowledge item is visible to the
 // version: a system-scoped item must match one of the bound SUT families, and
-// every binding dimension set on the item must match a version binding.
+// every binding dimension set on the item must match a version binding. The
+// dimensions are matched independently against the union of the version
+// bindings (not against a single version_sut row); an unset dimension is
+// unconstrained.
 func (s briefingKnowledgeScope) visible(scope, systemKey string, bindings knowledge.Bindings) bool {
 	switch scope {
 	case "global":
@@ -668,7 +686,8 @@ func (s briefingKnowledgeScope) visible(scope, systemKey string, bindings knowle
 // normalizeBriefingSource applies the reader bounds and the required empty
 // semantics. The SQL source already orders and limits its rows; this pass makes
 // the contract explicit for every source (including test fakes): no nil slices,
-// dependency-first plan order, and bounded collections.
+// dependency-first plan order, bounded collections, only a paused wave keeps a
+// blocker, and open-question labels are bounded.
 func normalizeBriefingSource(source agentcontext.Source) agentcontext.Source {
 	source.Requirements.Confirmed = limitBriefingSlice(source.Requirements.Confirmed, briefingRequirementLimit)
 	source.Requirements.Gaps = limitBriefingSlice(source.Requirements.Gaps, briefingRequirementLimit)
@@ -677,9 +696,37 @@ func normalizeBriefingSource(source agentcontext.Source) agentcontext.Source {
 	source.Plan = limitBriefingSlice(source.Plan, briefingPlanLimit)
 	source.Findings = limitBriefingSlice(source.Findings, briefingFactLimit)
 	source.Knowledge = limitBriefingSlice(source.Knowledge, briefingKnowledgeLimit)
-	source.OpenQuestions.Questions = limitBriefingSlice(source.OpenQuestions.Questions, briefingOpenItemLimit)
-	source.OpenQuestions.HumanRequests = limitBriefingSlice(source.OpenQuestions.HumanRequests, briefingOpenItemLimit)
+	source.Execution = normalizeBriefingExecution(source.Execution)
+	source.OpenQuestions.Questions = capBriefingLabels(
+		limitBriefingSlice(source.OpenQuestions.Questions, briefingOpenItemLimit), briefingOpenItemLabelRunes)
+	source.OpenQuestions.HumanRequests = capBriefingLabels(
+		limitBriefingSlice(source.OpenQuestions.HumanRequests, briefingOpenItemLimit), briefingOpenItemLabelRunes)
 	return source
+}
+
+// normalizeBriefingExecution enforces the ExecutionSnapshot contract: only a
+// paused wave carries a blocker, and the internal waiting_human pause token is
+// not user-visible text. A human pause keeps its user-visible reason in the open
+// human request (rendered in the open-questions section), so the token is
+// dropped instead of leaked into the prompt.
+func normalizeBriefingExecution(in agentcontext.ExecutionSnapshot) agentcontext.ExecutionSnapshot {
+	blocker := oneLineBriefingText(in.Blocker)
+	if in.WaveStatus != string(execution.WavePaused) || blocker == execution.PauseReasonWaitingHuman {
+		blocker = ""
+	}
+	in.Blocker = blocker
+	return in
+}
+
+// capBriefingLabels bounds every open-question label. The open-questions section
+// is protected from the renderer's truncation, so an unbounded human request
+// reason could otherwise grow the briefing without limit.
+func capBriefingLabels(labels []string, maxRunes int) []string {
+	capped := make([]string, len(labels))
+	for index, label := range labels {
+		capped[index] = truncateBriefingText(label, maxRunes)
+	}
+	return capped
 }
 
 func limitBriefingSlice[T any](items []T, limit int) []T {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -77,21 +78,23 @@ func TestBriefingReaderSQL(t *testing.T) {
 		t.Fatalf("plan dependency = %#v", source.Plan[1].DependsOn)
 	}
 
-	// Facts: current rows only, newest first, with a deterministic summary.
+	// Facts: current rows only, ranked by confidence then recency (the same
+	// order the briefing renderer uses for its top-K), with a deterministic
+	// summary.
 	if len(source.Findings) != 3 {
 		t.Fatalf("findings = %#v", source.Findings)
 	}
-	if source.Findings[0].ID != 9604 || source.Findings[1].ID != 9601 || source.Findings[2].ID != 9602 {
+	if source.Findings[0].ID != 9601 || source.Findings[1].ID != 9602 || source.Findings[2].ID != 9604 {
 		t.Fatalf("findings order = %#v", source.Findings)
 	}
-	if source.Findings[1].Summary != "结算页可访问" {
-		t.Fatalf("fact summary = %q", source.Findings[1].Summary)
+	if source.Findings[0].Summary != "结算页可访问" {
+		t.Fatalf("fact summary = %q", source.Findings[0].Summary)
 	}
-	if source.Findings[1].Confidence == nil || *source.Findings[1].Confidence != 0.9 {
-		t.Fatalf("fact confidence = %#v", source.Findings[1].Confidence)
+	if source.Findings[0].Confidence == nil || *source.Findings[0].Confidence != 0.9 {
+		t.Fatalf("fact confidence = %#v", source.Findings[0].Confidence)
 	}
-	if !source.Findings[0].CreatedAt.Equal(base.Add(3 * time.Hour)) {
-		t.Fatalf("fact created_at = %v", source.Findings[0].CreatedAt)
+	if !source.Findings[2].CreatedAt.Equal(base.Add(3 * time.Hour)) {
+		t.Fatalf("fact created_at = %v", source.Findings[2].CreatedAt)
 	}
 
 	// Execution summary of the latest wave.
@@ -202,10 +205,17 @@ func TestBriefingReaderSQLEmptyAndLimits(t *testing.T) {
 		exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order)
 			VALUES ($1, 9003, 'execute', $2, 'pending', $3)`,
 			int64(9601+index), fmt.Sprintf("计划-%02d", index), index)
+		// The oldest fact carries the highest confidence: the candidate read must
+		// rank by confidence before recency so it survives the limit.
+		var confidence *float64
+		if index == 0 {
+			high := 0.99
+			confidence = &high
+		}
 		exec(`INSERT INTO version_fact
-			(id, version_id, kind, key, payload, source, content_hash, created_at)
-			VALUES ($1, 9003, 'page', $2, '{}'::jsonb, 'tool', $3, $4)`,
-			int64(9501+index), fmt.Sprintf("key-%02d", index), hash(index+200),
+			(id, version_id, kind, key, payload, confidence, source, content_hash, created_at)
+			VALUES ($1, 9003, 'page', $2, '{}'::jsonb, $3, 'tool', $4, $5)`,
+			int64(9501+index), fmt.Sprintf("key-%02d", index), confidence, hash(index+200),
 			base.Add(time.Duration(index)*time.Minute))
 		exec(`INSERT INTO knowledge_item
 			(id, scope, title, content, status, confidence)
@@ -227,8 +237,105 @@ func TestBriefingReaderSQLEmptyAndLimits(t *testing.T) {
 			t.Fatalf("large version %s length = %d, want the reader limit 20", name, length)
 		}
 	}
-	if large.Requirements.Confirmed[0].Title != "需求-00" || large.Findings[0].ID != 9525 {
-		t.Fatalf("large version order changed: %#v %#v", large.Requirements.Confirmed[0], large.Findings[0])
+	// The highest-confidence fact wins the candidate cut even though it is the
+	// oldest; among the equal-confidence rows the newest comes first.
+	if large.Requirements.Confirmed[0].Title != "需求-00" ||
+		large.Findings[0].ID != 9501 || large.Findings[1].ID != 9525 {
+		t.Fatalf("large version order changed: %#v %#v", large.Requirements.Confirmed[0], large.Findings[:2])
+	}
+}
+
+// TestBriefingReaderSQLExecutionBlocker pins the latest-wave blocker mapping.
+// postgres.WaveRepository.Transition keeps pause_reason when a transition passes
+// an empty reason, so a resumed or finished wave still carries the previous
+// reason in the row. Only a paused wave may surface it, and the internal
+// waiting_human token must never reach the prompt: the user-visible reason is
+// the open human request.
+func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v\nSQL: %s", err, sql)
+		}
+	}
+	reader, err := NewBriefingReader(pool)
+	if err != nil {
+		t.Fatalf("NewBriefingReader: %v", err)
+	}
+	load := func() agentcontext.Source {
+		t.Helper()
+		source, err := reader.Load(ctx, 9004)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return source
+	}
+	assertBlocker := func(wantStatus, wantBlocker string) agentcontext.Source {
+		t.Helper()
+		source := load()
+		if source.Execution.WaveStatus != wantStatus {
+			t.Fatalf("wave status = %q, want %q", source.Execution.WaveStatus, wantStatus)
+		}
+		if source.Execution.Blocker != wantBlocker {
+			t.Fatalf("%s wave blocker = %q, want %q", wantStatus, source.Execution.Blocker, wantBlocker)
+		}
+		return source
+	}
+
+	exec(`INSERT INTO version (id, title, status, created_by, stage)
+		VALUES (9004, '阻塞版本', 'running', 1, 'executing')`)
+
+	// A login-takeover pause was resumed: the internal token is still on the
+	// running wave, but the briefing must not show a stale blocker.
+	exec(`INSERT INTO run_wave (id, version_id, status, pause_reason)
+		VALUES (9911, 9004, 'running', 'waiting_human')`)
+	assertBlocker("running", "")
+
+	// A wave that finished after a pause also keeps the last reason.
+	exec(`UPDATE run_wave SET status = 'done' WHERE id = 9911`)
+	assertBlocker("done", "")
+
+	// A paused wave with a user-entered display reason keeps it.
+	exec(`INSERT INTO run_wave (id, version_id, status, pause_reason)
+		VALUES (9912, 9004, 'paused', '等待人工登录')`)
+	assertBlocker("paused", "等待人工登录")
+
+	// The internal waiting_human token is not user-visible text; the open human
+	// request carries the user-visible reason instead.
+	exec(`UPDATE run_wave SET pause_reason = 'waiting_human' WHERE id = 9912`)
+	if source := assertBlocker("paused", ""); len(source.OpenQuestions.HumanRequests) != 0 {
+		t.Fatalf("human requests before seeding = %#v", source.OpenQuestions.HumanRequests)
+	}
+	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
+		VALUES (10011, 9004, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'open', now())`)
+	source := assertBlocker("paused", "")
+	if !reflect.DeepEqual(source.OpenQuestions.HumanRequests, []string{"需要短信验证码"}) {
+		t.Fatalf("human requests = %#v", source.OpenQuestions.HumanRequests)
+	}
+
+	// Resuming a user pause keeps the display reason on the row, but a running
+	// wave carries no blocker.
+	exec(`UPDATE run_wave SET status = 'running', pause_reason = '等待人工登录' WHERE id = 9912`)
+	assertBlocker("running", "")
+
+	// Cancelling a paused wave keeps it too; a cancelled wave carries none.
+	exec(`UPDATE run_wave SET status = 'cancelled' WHERE id = 9912`)
+	assertBlocker("cancelled", "")
+
+	// Open-question labels are capped, because the open-questions section is
+	// never truncated by the renderer.
+	longReason := strings.Repeat("验", 300)
+	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
+		VALUES (10012, 9004, 'other', jsonb_build_object('reason', $1::text), 'open', now())`, longReason)
+	source = assertBlocker("cancelled", "")
+	if len(source.OpenQuestions.Questions) != 1 {
+		t.Fatalf("questions = %#v", source.OpenQuestions.Questions)
+	}
+	label := source.OpenQuestions.Questions[0]
+	if runes := []rune(label); len(runes) != 241 || !strings.HasSuffix(label, "…") {
+		t.Fatalf("question label uses %d runes, want the 240-rune cap plus an ellipsis: %q", len(runes), label)
 	}
 }
 

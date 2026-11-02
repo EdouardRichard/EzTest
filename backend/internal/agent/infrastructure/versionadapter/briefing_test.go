@@ -234,3 +234,123 @@ func TestBriefingReaderOrdersAndLimits(t *testing.T) {
 		t.Fatalf("plan dependency text = %#v, want [plan-102]", dependent.DependsOn)
 	}
 }
+
+// TestBriefingReaderExecutionBlocker pins the execution blocker contract for
+// every source: only a paused wave carries a blocker, and the internal
+// waiting_human pause token is never user-visible text (the open human request
+// carries the user-visible reason instead).
+func TestBriefingReaderExecutionBlocker(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  string
+		blocker string
+		want    string
+	}{
+		{"paused wave keeps a display reason", "paused", "等待人工登录", "等待人工登录"},
+		{"paused wave omits the internal human token", "paused", "waiting_human", ""},
+		{"paused wave omits a one-lined empty reason", "paused", "   ", ""},
+		{"running wave has no stale blocker", "running", "waiting_human", ""},
+		{"done wave has no stale blocker", "done", "等待人工登录", ""},
+		{"cancelled wave has no stale blocker", "cancelled", "等待人工登录", ""},
+		{"failed wave has no stale blocker", "failed", "等待人工登录", ""},
+		{"planned wave has no blocker", "planned", "等待人工登录", ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := newBriefingReader(&fakeBriefingSource{source: agentcontext.Source{
+				Execution: agentcontext.ExecutionSnapshot{
+					WaveStatus: testCase.status,
+					Blocker:    testCase.blocker,
+					Passed:     2,
+					Failed:     1,
+				},
+			}}).Load(context.Background(), 9)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got.Execution.WaveStatus != testCase.status {
+				t.Fatalf("wave status = %q, want %q", got.Execution.WaveStatus, testCase.status)
+			}
+			if got.Execution.Blocker != testCase.want {
+				t.Fatalf("%s wave blocker = %q, want %q", testCase.status, got.Execution.Blocker, testCase.want)
+			}
+			if got.Execution.Passed != 2 || got.Execution.Failed != 1 {
+				t.Fatalf("wave counts changed: %#v", got.Execution)
+			}
+		})
+	}
+}
+
+// TestBriefingReaderOpenQuestionLabelCap pins the bound on open-question labels.
+// The renderer never truncates the open-questions section, so one long human
+// request reason must not grow the briefing without limit.
+func TestBriefingReaderOpenQuestionLabelCap(t *testing.T) {
+	long := strings.Repeat("验", briefingOpenItemLabelRunes+50)
+	got, err := newBriefingReader(&fakeBriefingSource{source: agentcontext.Source{
+		OpenQuestions: agentcontext.OpenQuestionsSnapshot{
+			Questions:     []string{long, "短问题"},
+			HumanRequests: []string{long},
+		},
+	}}).Load(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got.OpenQuestions.Questions) != 2 || len(got.OpenQuestions.HumanRequests) != 1 {
+		t.Fatalf("open questions were dropped: %#v", got.OpenQuestions)
+	}
+	if got.OpenQuestions.Questions[1] != "短问题" {
+		t.Fatalf("short label changed: %q", got.OpenQuestions.Questions[1])
+	}
+	for name, label := range map[string]string{
+		"question":      got.OpenQuestions.Questions[0],
+		"human request": got.OpenQuestions.HumanRequests[0],
+	} {
+		if runes := []rune(label); len(runes) != briefingOpenItemLabelRunes+1 || !strings.HasSuffix(label, "…") {
+			t.Fatalf("%s label uses %d runes, want the %d-rune cap plus an ellipsis",
+				name, len(runes), briefingOpenItemLabelRunes)
+		}
+	}
+}
+
+// TestBriefingReaderPlanOrderEdges pins the two non-happy paths of the
+// dependency ordering: a single item skips the ordering pass, and a dependency
+// cycle falls back to the supplied order instead of hanging.
+func TestBriefingReaderPlanOrderEdges(t *testing.T) {
+	t.Run("single item keeps its dependency reference", func(t *testing.T) {
+		got, err := newBriefingReader(&fakeBriefingSource{source: agentcontext.Source{
+			Plan: []agentcontext.PlanItemSnapshot{
+				{ID: 1, Title: "唯一计划", Status: "pending", DependsOn: []string{"999"}},
+			},
+		}}).Load(context.Background(), 9)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(got.Plan) != 1 || got.Plan[0].ID != 1 || got.Plan[0].Title != "唯一计划" {
+			t.Fatalf("single plan item = %#v", got.Plan)
+		}
+		if len(got.Plan[0].DependsOn) != 1 || got.Plan[0].DependsOn[0] != "999" {
+			t.Fatalf("single plan dependency = %#v, want the unknown reference [999]", got.Plan[0].DependsOn)
+		}
+	})
+
+	t.Run("cycle falls back to the supplied order", func(t *testing.T) {
+		got, err := newBriefingReader(&fakeBriefingSource{source: agentcontext.Source{
+			Plan: []agentcontext.PlanItemSnapshot{
+				{ID: 2, Title: "乙", Status: "pending", DependsOn: []string{"3"}},
+				{ID: 3, Title: "甲", Status: "pending", DependsOn: []string{"2"}},
+			},
+		}}).Load(context.Background(), 9)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(got.Plan) != 2 || got.Plan[0].ID != 2 || got.Plan[1].ID != 3 {
+			t.Fatalf("cycle plan order = %#v, want the supplied order [2 3]", got.Plan)
+		}
+		if len(got.Plan[0].DependsOn) != 1 || got.Plan[0].DependsOn[0] != "甲" {
+			t.Fatalf("cycle dependency text = %#v, want [甲]", got.Plan[0].DependsOn)
+		}
+		if len(got.Plan[1].DependsOn) != 1 || got.Plan[1].DependsOn[0] != "乙" {
+			t.Fatalf("cycle dependency text = %#v, want [乙]", got.Plan[1].DependsOn)
+		}
+	})
+}

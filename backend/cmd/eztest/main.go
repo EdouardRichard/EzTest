@@ -727,10 +727,11 @@ func main() {
 
 	// P3-T5 production version-briefing read path. The reader is a read-only,
 	// deterministic SQL source over the version/design/execution/knowledge
-	// tables; it is injected here (not through a package singleton) so the
-	// cache-first context assembler can consume the builder without rebuilding
-	// it per round. The runtime consumer lands with the context wiring
-	// (Task 13/14/33), which is why the builder is only held alive today.
+	// tables. Reader and builder are constructed here at the assembly root (not
+	// a package singleton) so the future cache-first context assembler can take
+	// the builder as a dependency. That consumer is not wired yet (Task 13/14/33
+	// owns it), so the builder is held with a blank assignment instead of being
+	// added to the runner dependency set ahead of its consumer.
 	briefingReader, err := versionadapter.NewBriefingReader(pool)
 	if err != nil {
 		log.Fatalf("eztest: wire version briefing reader: %v", err)
