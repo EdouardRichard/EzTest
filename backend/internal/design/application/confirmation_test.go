@@ -3,6 +3,7 @@ package designapp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -336,5 +337,31 @@ func TestConfirmCasesByIDsRejectsInvalidAndForeign(t *testing.T) {
 	}
 	if len(repo.confirmations) != 0 {
 		t.Fatalf("failed selection wrote confirmations: %#v", repo.confirmations)
+	}
+}
+
+// TestConfirmCasesEmptyNoCases pins the spec §5.3 entry condition for executing
+// ("有已确认用例"): confirming "all" over a version with no draft case must not
+// report success; the gate answers a typed 409 no_cases_to_confirm and writes
+// no confirmation, event or audit.
+func TestConfirmCasesEmptyNoCases(t *testing.T) {
+	service, repo, publisher, audit := newConfirmFixture(t)
+
+	for _, selection := range [][]int64{nil, {}} {
+		err := service.ConfirmCasesByIDs(context.Background(), 1001, selection)
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("selection %#v: error = %v, want a typed *platform.Error", selection, err)
+		}
+		if apiErr.Status != http.StatusConflict || apiErr.Code != "no_cases_to_confirm" {
+			t.Fatalf("selection %#v: error = %d/%s, want 409/no_cases_to_confirm",
+				selection, apiErr.Status, apiErr.Code)
+		}
+	}
+	if len(repo.confirmations) != 0 {
+		t.Fatalf("confirmation rows = %d, want 0", len(repo.confirmations))
+	}
+	if len(publisher.events) != 0 || len(audit.events) != 0 {
+		t.Fatalf("failed confirm-all published events=%#v audit=%#v", publisher.events, audit.events)
 	}
 }

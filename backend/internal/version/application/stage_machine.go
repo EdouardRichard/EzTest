@@ -41,7 +41,9 @@ const (
 )
 
 // StageJob is one task the stage machine asks the dispatcher to create. An
-// empty RequirementIDs or CaseIDs list means "all items of that kind"; a
+// empty RequirementIDs or CaseIDs list means "all items of that kind": the hard
+// gate expands an empty confirm selection to the version's current draft items
+// before the stage advances, so the stage-entry job stays unrestricted. A
 // non-empty list is a partial confirmation (D23) and narrows the job.
 type StageJob struct {
 	VersionID      int64
@@ -58,16 +60,19 @@ type StageJobEnqueuer interface {
 }
 
 // RequirementGateConfirmer freezes the requirement rows selected by the
-// requirement hard gate before the stage machine advances. The underlying
-// requirement batch-confirm use case validates the selection (a foreign or
-// missing ID is a typed not-found and an empty list is invalid).
+// requirement hard gate before the stage machine advances. An empty selection
+// means "all current draft requirements of the version" (contract
+// StageConfirmRequirementsRequest); an implementation must expand it and reject
+// a version with no draft requirement with a typed 409
+// no_requirements_to_confirm. A foreign or missing ID is a typed not-found.
 type RequirementGateConfirmer interface {
 	BatchConfirm(ctx context.Context, versionID int64, requirementIDs []int64) error
 }
 
 // CaseGateConfirmer freezes the case rows selected by the case hard gate before
 // the stage machine advances. An empty list means "all confirmed-eligible cases
-// of the version".
+// of the version"; a version with no eligible draft case must be rejected with a
+// typed 409 no_cases_to_confirm (spec §5.3: executing requires confirmed cases).
 type CaseGateConfirmer interface {
 	ConfirmCases(ctx context.Context, versionID int64, caseIDs []int64) error
 }
@@ -226,7 +231,9 @@ func (m *StageMachine) ResumeTo(ctx context.Context, versionID int64, target ver
 
 // OnRequirementConfirmed applies the requirement hard gate
 // (requirement_review -> designing), after freezing the selected requirement
-// rows, and dispatches design.cases for them. The version must be exactly at
+// rows, and dispatches design.cases for them. An empty selection is expanded by
+// the confirmer to every current draft requirement; a version with none is a
+// typed 409 no_requirements_to_confirm. The version must be exactly at
 // requirement_review: the graph also has a legitimate case_review -> designing
 // reject edge, so the source stage must be pinned explicitly.
 func (m *StageMachine) OnRequirementConfirmed(ctx context.Context, versionID int64, requirementIDs []int64) (StageView, error) {
@@ -262,7 +269,8 @@ func (m *StageMachine) OnRequirementConfirmed(ctx context.Context, versionID int
 // OnCasesConfirmed applies the case hard gate (case_review -> executing),
 // after freezing the selected case rows, and dispatches execute.batch. A
 // non-empty caseIDs list confirms only those cases (D23); an empty list means
-// every confirmed-eligible case. The version must be exactly at case_review.
+// every confirmed-eligible case, and a version with no eligible draft case is a
+// typed 409 no_cases_to_confirm. The version must be exactly at case_review.
 func (m *StageMachine) OnCasesConfirmed(ctx context.Context, versionID int64, caseIDs []int64) (StageView, error) {
 	ids, err := normalizeStageIDs("case_ids", caseIDs)
 	if err != nil {

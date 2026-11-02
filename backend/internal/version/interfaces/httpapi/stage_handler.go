@@ -61,7 +61,9 @@ func (h *StageHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 // ConfirmRequirements POST /api/versions/{id}/stage/confirm-requirements.
 // Only a user token may confirm the requirement hard gate; assistant and
-// service tokens are rejected with 403 and an audit entry.
+// service tokens are rejected with 403 and an audit entry. An empty
+// requirement_ids list confirms every current draft requirement (409
+// no_requirements_to_confirm when the version has none).
 func (h *StageHandler) ConfirmRequirements(w http.ResponseWriter, r *http.Request) {
 	versionID, err := stagePathID(r)
 	if err != nil {
@@ -91,7 +93,8 @@ func (h *StageHandler) ConfirmRequirements(w http.ResponseWriter, r *http.Reques
 
 // ConfirmCases POST /api/versions/{id}/stage/confirm-cases. Only a user token
 // may confirm the case hard gate. A non-empty case_ids list is a partial
-// confirmation; an empty list confirms/executes all confirmed cases.
+// confirmation; an empty list confirms every current draft case (409
+// no_cases_to_confirm when the version has none).
 func (h *StageHandler) ConfirmCases(w http.ResponseWriter, r *http.Request) {
 	versionID, err := stagePathID(r)
 	if err != nil {

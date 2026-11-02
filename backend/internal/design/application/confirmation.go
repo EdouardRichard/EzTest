@@ -3,6 +3,7 @@ package designapp
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -54,7 +55,9 @@ func countOrLen(count, length int) int {
 
 // ConfirmCasesByIDs freezes explicit current-version cases selected by the
 // version case hard gate. An empty list confirms every confirmed-eligible
-// current case of the version (the POST /stage/confirm-cases "all" case).
+// current case of the version (the POST /stage/confirm-cases "all" case); a
+// version with no eligible draft case is a typed 409 no_cases_to_confirm, since
+// spec §5.3 only enters executing when confirmed cases exist.
 //
 // It is deliberately layered on the single confirmation use case: stale,
 // foreign, already-confirmed and old-requirement-version cases get exactly the
@@ -70,7 +73,15 @@ func (s *GraphService) ConfirmCasesByIDs(ctx context.Context, versionID int64, c
 	}
 	actorID := confirmationActorID(ctx)
 	if len(ids) == 0 {
-		return s.confirmAllCases(ctx, versionID, actorID)
+		confirmed, err := s.confirmAllCases(ctx, versionID, actorID)
+		if err != nil {
+			return err
+		}
+		if confirmed == 0 {
+			return platform.NewError(http.StatusConflict, "no_cases_to_confirm",
+				"the version has no draft case to confirm")
+		}
+		return nil
 	}
 
 	// Validate the whole selection before changing anything, so a foreign or
@@ -92,25 +103,30 @@ func (s *GraphService) ConfirmCasesByIDs(ctx context.Context, versionID int64, c
 }
 
 // confirmAllCases confirms every draft current case of the version by reusing
-// the requirement-scope confirmation, one clarified requirement at a time. A
-// requirement without draft cases is skipped: "all" means all eligible cases,
-// not "fail when some requirement has nothing to confirm".
-func (s *GraphService) confirmAllCases(ctx context.Context, versionID int64, actorID int64) error {
+// the requirement-scope confirmation, one clarified requirement at a time, and
+// reports how many case versions were frozen. A requirement without draft cases
+// is skipped: "all" means all eligible cases, not "fail when some requirement
+// has nothing to confirm". Zero confirmations means the version has no eligible
+// draft case, which the gate rejects instead of advancing to executing.
+func (s *GraphService) confirmAllCases(ctx context.Context, versionID int64, actorID int64) (int, error) {
 	graph, err := s.repo.ReadGraph(ctx, versionID)
 	if err != nil {
-		return mapDesignError(err, "version")
+		return 0, mapDesignError(err, "version")
 	}
+	confirmed := 0
 	for _, requirement := range graph.Requirements {
 		if !hasDraftCurrentCase(requirement) {
 			continue
 		}
-		if _, err := s.Confirm(ctx, versionID, ConfirmInput{
+		result, err := s.Confirm(ctx, versionID, ConfirmInput{
 			Scope: design.ConfirmScopeRequirement, TargetID: requirement.Requirement.ID,
-		}, actorID); err != nil {
-			return err
+		}, actorID)
+		if err != nil {
+			return 0, err
 		}
+		confirmed += len(result.Confirmed)
 	}
-	return nil
+	return confirmed, nil
 }
 
 // hasDraftCurrentCase reports whether a requirement graph node has at least one
