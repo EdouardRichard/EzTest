@@ -1,0 +1,321 @@
+package agentapp
+
+// Task 46 (P2-T6): the user-facing job control API. A 0.2.1 work item is the
+// UI's "job"; this service owns the two user actions on it:
+//
+//   - Cancel: open/claimed/running jobs only. The lease is released, the active
+//     attempt is closed and the row is stored terminal. The frozen work_item
+//     schema has no 'cancelled' status, so a canceled job is persisted as
+//     failed with the attempt budget exhausted (the same terminal shape
+//     ClaimWorkItem already uses at the attempt cap) and LastError set to
+//     JobCanceledReason. The API projection reports state=cancelled.
+//   - Retry: failed jobs below max_attempts only. The row returns to open with
+//     available_at=now and the lease cleared. The attempt count is deliberately
+//     NOT reset: the retry consumes the remaining budget, so a job can never be
+//     retried forever. The model/inputs/budget are never touched (no automatic
+//     model switch).
+//
+// Every accepted action records one audit entry and publishes one
+// version-channel event (job.canceled / job.requeued). Both are best effort:
+// a failed audit or publish never rolls back the lifecycle write.
+//
+// Ownership is version-scoped: a caller that addresses a job through a version
+// gets not_found for a row owned by another version, and the service re-checks
+// the version itself in addition to the repository's scope.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+)
+
+// JobStateCancelled is the API lifecycle value of a canceled job (spec §5.4).
+// The frozen work_item schema stores 'failed' and this service projects it.
+const JobStateCancelled = "cancelled"
+
+// JobCanceledReason is the work_item.last_error marker of a user-canceled job.
+// It is also how the retry guard recognizes a canceled row despite the frozen
+// schema storing it as failed.
+const JobCanceledReason = "cancelled by user"
+
+// Audit actions of the two job control operations.
+const (
+	ActionJobCanceled = "job.canceled"
+	ActionJobRequeued = "job.requeued"
+)
+
+// Version-channel event types of the two job control operations
+// (contracts/events.md §18; job_id is work_item.id).
+const (
+	EventJobCanceled = "job.canceled"
+	EventJobRequeued = "job.requeued"
+)
+
+// JobControlRepository is the narrow persistence surface of the job control
+// API. *agentpg.WorkItemRepository satisfies it. Implementations must:
+//   - scope every read/write by versionID when it is positive (version 0 means
+//     the caller addressed the job directly, so the job's own version owns it);
+//   - return agent.ErrNotFound for a missing or foreign row;
+//   - return agent.ErrConflict when the lease epoch or the guarded state no
+//     longer matches (a concurrent claim/complete won the race).
+type JobControlRepository interface {
+	// GetJob loads one work item, scoped to versionID when positive.
+	GetJob(ctx context.Context, versionID, id int64) (agent.WorkItem, error)
+	// CancelJob atomically turns an open/claimed/running item terminal:
+	// status failed, lease cleared, lease_epoch incremented (fencing the old
+	// owner), attempts set to max_attempts, available_at/updated_at set to now,
+	// last_error set to reason, and the active attempt closed. leaseEpoch is
+	// the epoch read by GetJob.
+	CancelJob(ctx context.Context, versionID, id, leaseEpoch int64, reason string, now time.Time) (agent.WorkItem, error)
+	// RetryJob atomically re-opens a failed item below max_attempts:
+	// status open, lease cleared, last_error cleared, available_at and
+	// updated_at set to now. The attempt count is preserved.
+	RetryJob(ctx context.Context, versionID, id int64, now time.Time) (agent.WorkItem, error)
+}
+
+// JobControlDeps wires the job control service. Jobs is required; Audit and
+// Events are best-effort and Clock defaults to the system clock.
+type JobControlDeps struct {
+	Jobs   JobControlRepository
+	Audit  auditapp.Recorder
+	Events eventingapp.Publisher
+	Clock  clock.Clock
+}
+
+// JobControl implements the cancel/retry use cases.
+type JobControl struct {
+	jobs   JobControlRepository
+	audit  auditapp.Recorder
+	events eventingapp.Publisher
+	clock  clock.Clock
+}
+
+// NewJobControl wires the service.
+func NewJobControl(deps JobControlDeps) *JobControl {
+	clk := deps.Clock
+	if clk == nil {
+		clk = clock.System{}
+	}
+	return &JobControl{jobs: deps.Jobs, audit: deps.Audit, events: deps.Events, clock: clk}
+}
+
+// JobView is the API projection of one job after a control action.
+type JobView struct {
+	JobID       int64
+	VersionID   int64
+	Kind        string
+	State       string
+	Attempts    int
+	MaxAttempts int
+	UpdatedAt   time.Time
+}
+
+// Cancel cancels one pending/claimed/running job. actorID is the authenticated
+// user; versionID is 0 when the caller used the direct job route, otherwise it
+// is the version the caller addressed.
+func (s *JobControl) Cancel(ctx context.Context, actorID, versionID, jobID int64) (JobView, error) {
+	if err := s.requireConfigured(); err != nil {
+		return JobView{}, err
+	}
+	if err := validateJobControlIDs(versionID, jobID); err != nil {
+		return JobView{}, err
+	}
+	item, err := s.jobs.GetJob(ctx, versionID, jobID)
+	if err != nil {
+		return JobView{}, mapJobControlReadError(err)
+	}
+	if versionID > 0 && item.VersionID != versionID {
+		return JobView{}, platform.NotFound("job")
+	}
+	if !cancellableJobStatus(item.Status) {
+		return JobView{}, platform.StateConflict(fmt.Sprintf(
+			"job %d cannot be canceled from status %s", jobID, item.Status,
+		))
+	}
+
+	updated, err := s.jobs.CancelJob(ctx, versionID, jobID, item.LeaseEpoch, JobCanceledReason, s.now())
+	if err != nil {
+		return JobView{}, mapJobControlWriteError(err)
+	}
+	s.record(ctx, ActionJobCanceled, actorID, item, updated)
+	s.publish(ctx, EventJobCanceled, actorID, updated, JobStateCancelled)
+	return jobControlView(updated), nil
+}
+
+// Retry re-opens one failed job below its attempt cap.
+func (s *JobControl) Retry(ctx context.Context, actorID, versionID, jobID int64) (JobView, error) {
+	if err := s.requireConfigured(); err != nil {
+		return JobView{}, err
+	}
+	if err := validateJobControlIDs(versionID, jobID); err != nil {
+		return JobView{}, err
+	}
+	item, err := s.jobs.GetJob(ctx, versionID, jobID)
+	if err != nil {
+		return JobView{}, mapJobControlReadError(err)
+	}
+	if versionID > 0 && item.VersionID != versionID {
+		return JobView{}, platform.NotFound("job")
+	}
+	if isCanceledJob(item) {
+		return JobView{}, platform.StateConflict(fmt.Sprintf(
+			"job %d was canceled and cannot be retried", jobID,
+		))
+	}
+	if item.Status != agent.WorkItemFailed {
+		return JobView{}, platform.StateConflict(fmt.Sprintf(
+			"job %d cannot be retried from status %s", jobID, item.Status,
+		))
+	}
+	if item.Attempts >= item.MaxAttempts {
+		return JobView{}, platform.StateConflict(fmt.Sprintf(
+			"job %d has exhausted its attempt budget (%d/%d)", jobID, item.Attempts, item.MaxAttempts,
+		))
+	}
+
+	updated, err := s.jobs.RetryJob(ctx, versionID, jobID, s.now())
+	if err != nil {
+		return JobView{}, mapJobControlWriteError(err)
+	}
+	s.record(ctx, ActionJobRequeued, actorID, item, updated)
+	s.publish(ctx, EventJobRequeued, actorID, updated, string(agent.WorkItemOpen))
+	return jobControlView(updated), nil
+}
+
+// ---------- internals ----------
+
+func (s *JobControl) requireConfigured() error {
+	if s == nil || s.jobs == nil {
+		return platform.Unavailable("job control service is not configured")
+	}
+	return nil
+}
+
+func (s *JobControl) now() time.Time {
+	if s != nil && s.clock != nil {
+		return s.clock.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func validateJobControlIDs(versionID, jobID int64) error {
+	if versionID < 0 {
+		return platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if jobID <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	return nil
+}
+
+func cancellableJobStatus(status agent.WorkItemStatus) bool {
+	switch status {
+	case agent.WorkItemOpen, agent.WorkItemClaimed, agent.WorkItemRunning:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCanceledJob(item agent.WorkItem) bool {
+	return item.Status == agent.WorkItemFailed &&
+		item.LastError != nil && *item.LastError == JobCanceledReason
+}
+
+func jobControlView(item agent.WorkItem) JobView {
+	state := string(item.Status)
+	if isCanceledJob(item) {
+		state = JobStateCancelled
+	}
+	return JobView{
+		JobID:       item.ID,
+		VersionID:   item.VersionID,
+		Kind:        item.Kind,
+		State:       state,
+		Attempts:    item.Attempts,
+		MaxAttempts: item.MaxAttempts,
+		UpdatedAt:   item.UpdatedAt,
+	}
+}
+
+func mapJobControlReadError(err error) error {
+	if errors.Is(err, agent.ErrNotFound) {
+		return platform.NotFound("job")
+	}
+	return err
+}
+
+func mapJobControlWriteError(err error) error {
+	switch {
+	case errors.Is(err, agent.ErrNotFound):
+		return platform.NotFound("job")
+	case errors.Is(err, agent.ErrConflict), errors.Is(err, agent.ErrLeaseLost):
+		return platform.StateConflict("job state changed before the request could be applied; refresh and try again")
+	default:
+		return err
+	}
+}
+
+// record writes the best-effort audit entry of one accepted control action. The
+// metadata captures the pre-action lifecycle values plus the updated ones.
+func (s *JobControl) record(ctx context.Context, action string, actorID int64, before, after agent.WorkItem) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	var actor *int64
+	if actorID > 0 {
+		actor = &actorID
+	}
+	job := platformid.Format(after.ID)
+	_ = s.audit.Record(ctx, auditapp.Event{
+		ActorID:    actor,
+		Action:     action,
+		TargetKind: "work_item",
+		TargetID:   job,
+		RequestID:  requestid.From(ctx),
+		Metadata: map[string]any{
+			"job_id":       job,
+			"kind":         after.Kind,
+			"from_status":  string(before.Status),
+			"to_status":    string(after.Status),
+			"attempts":     before.Attempts,
+			"max_attempts": before.MaxAttempts,
+		},
+	})
+}
+
+// publish emits one version-channel job event. It follows the job.progress /
+// job.finished shape (job_id/kind/status, decimal string IDs) so the UI can
+// consume cancel/requeue on the same stream.
+func (s *JobControl) publish(ctx context.Context, eventType string, actorID int64, item agent.WorkItem, status string) {
+	if s == nil || s.events == nil || item.VersionID <= 0 || item.ID <= 0 {
+		return
+	}
+	var actor *int64
+	if actorID > 0 {
+		actor = &actorID
+	}
+	version := platformid.Format(item.VersionID)
+	job := platformid.Format(item.ID)
+	_ = s.events.Publish(ctx, eventingapp.Event{
+		Channel: "version:" + version,
+		Type:    eventType,
+		Scope:   map[string]any{"version_id": version, "job_id": job},
+		Payload: map[string]any{
+			"job_id": job,
+			"kind":   item.Kind,
+			"status": status,
+		},
+		ActorID:   actor,
+		RequestID: requestid.From(ctx),
+	})
+}

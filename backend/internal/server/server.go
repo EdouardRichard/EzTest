@@ -69,7 +69,7 @@ type Deps struct {
 	Conversations *versionapp.ConversationService
 	// Stage is the deterministic version stage machine (spec §5.3). It is
 	// optional; nil leaves the stage-machine routes unmounted.
-	Stage *versionapp.StageMachine
+	Stage         *versionapp.StageMachine
 	TeamRoom      *agentapp.TeamRoom
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
@@ -94,6 +94,9 @@ type Deps struct {
 	// whenever the execution handler exists (the token middleware fails closed
 	// without a settings service).
 	P7 *P7Handlers
+	// Jobs is the optional 0.2.1 job control surface (cancel/retry). Nil leaves
+	// both the direct and the version-scoped routes unmounted.
+	Jobs *agentapi.JobControlHandler
 	// Load counts in-flight API requests for drain/rolling-upgrade observability
 	// (P8). Nil disables the counter.
 	Load *load.Counter
@@ -173,6 +176,7 @@ func New(deps Deps) http.Handler {
 	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
 	registerP6Routes(mux, authenticated, admin, deps.P6)
 	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
+	registerJobRoutes(mux, authenticated, deps.Jobs)
 
 	var chain http.Handler = mux
 	if deps.Settings != nil {
@@ -243,6 +247,16 @@ func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler
 	if h.Profiles != nil {
 		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
 	}
+}
+
+// registerJobRoutes mounts the optional 0.2.1 job control API (cancel/retry).
+// A nil handler keeps the route table of a deployment without job control
+// unchanged.
+func registerJobRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *agentapi.JobControlHandler) {
+	if h == nil {
+		return
+	}
+	h.Register(mux, authenticated)
 }
 
 type identityAuthenticator struct {
