@@ -326,10 +326,31 @@ var roleSpecs = []RoleSpec{
 			agent.WorkItemKindKnowledgePropose,
 		},
 		Tools: []string{
+			// Read-only curation inputs (spec §5.2/§6.4: findings/evidence/
+			// recipe, source version, existing knowledge) plus the single
+			// propose tool; the curator never executes, edits requirements/cases
+			// or changes review state.
+			tools.ToolContextVersionPack,
+			tools.ToolContextTaskPack,
+			tools.ToolContextTeamRoomRead,
+			tools.ToolRequirementRead,
+			tools.ToolExecutionResultRead,
+			tools.ToolExecutionEvidenceRead,
+			tools.ToolSUTList,
+			tools.ToolSUTPageList,
+			tools.ToolCodeFacts,
+			tools.ToolCodeRoutes,
+			tools.ToolCodeAPIs,
 			tools.ToolKnowledgePropose,
+			// Structured retrieval tools (spec §10.2) are registered by the
+			// retrieval task; whitelisting their names here keeps the role a
+			// closed list while allowing that task to land without widening it.
+			"knowledge.search",
+			"knowledge.read",
 		},
 		// No dedicated agent_profile exists in 0.2.1; the success hook runs the
-		// role directly. Later knowledge tasks extend this whitelist.
+		// role directly. knowledge.search/read are registered by the retrieval
+		// task (their whitelist entries above are already reserved).
 		Profiles:     nil,
 		SystemPrompt: knowledgeCuratorRolePrompt,
 		MaxTokens:    roleDefaultMaxTokens,

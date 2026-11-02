@@ -45,6 +45,7 @@ type caseRunnerFixture struct {
 	ids        *caseRunnerIDs
 	events     *caseRunnerEvents
 	audit      *caseRunnerAudit
+	knowledge  *fakeCaseSuccessHook
 	runCtx     context.Context
 	runCancel  context.CancelFunc
 }
@@ -104,10 +105,11 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 			"execution.human_request_timeout_seconds": 600,
 			"execution.case_max_wait_seconds":         300,
 		}},
-		clock:  &caseRunnerClock{now: time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)},
-		ids:    &caseRunnerIDs{next: 5000},
-		events: &caseRunnerEvents{},
-		audit:  &caseRunnerAudit{},
+		clock:     &caseRunnerClock{now: time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)},
+		ids:       &caseRunnerIDs{next: 5000},
+		events:    &caseRunnerEvents{},
+		audit:     &caseRunnerAudit{},
+		knowledge: &fakeCaseSuccessHook{},
 	}
 	fixture.runCtx, fixture.runCancel = context.WithCancel(context.Background())
 	t.Cleanup(fixture.runCancel)
@@ -121,29 +123,30 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 		Attempts: 1, OwnerInstance: "api-1",
 	}
 	fixture.runner = executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
-		Intents:     fixture.intents,
-		CaseRuns:    fixture.caseRuns,
-		SUTContexts: fixture.sutContext,
-		Results:     fixture.results,
-		Evidence:    fixture.evidence,
-		Humans:      fixture.humans,
-		Cases:       fixture.cases,
-		Bindings:    fixture.bindings,
-		Browser:     fixture.browser,
-		Credentials: fixture.creds,
-		Content:     fixture.content,
-		HTTPClient:  fixture.http,
-		Database:    fixture.db,
-		Gaps:        fixture.gaps,
-		Coverage:    fixture.coverage,
-		TeamRoom:    fixture.room,
-		Visual:      fixture.visual,
-		Settings:    fixture.settings,
-		Clock:       fixture.clock,
-		IDs:         fixture.ids,
-		Events:      fixture.events,
-		Audit:       fixture.audit,
-		InstanceID:  "api-1",
+		Intents:       fixture.intents,
+		CaseRuns:      fixture.caseRuns,
+		SUTContexts:   fixture.sutContext,
+		Results:       fixture.results,
+		Evidence:      fixture.evidence,
+		Humans:        fixture.humans,
+		Cases:         fixture.cases,
+		Bindings:      fixture.bindings,
+		Browser:       fixture.browser,
+		Credentials:   fixture.creds,
+		Content:       fixture.content,
+		HTTPClient:    fixture.http,
+		Database:      fixture.db,
+		Gaps:          fixture.gaps,
+		Coverage:      fixture.coverage,
+		TeamRoom:      fixture.room,
+		Visual:        fixture.visual,
+		Settings:      fixture.settings,
+		Clock:         fixture.clock,
+		IDs:           fixture.ids,
+		Events:        fixture.events,
+		Audit:         fixture.audit,
+		KnowledgeHook: fixture.knowledge,
+		InstanceID:    "api-1",
 	})
 	return fixture
 }
@@ -169,6 +172,22 @@ func p3Scope() tools.Scope {
 		VersionID: 10, WaveID: 2001, CaseRunID: 3001, IntentID: 1001,
 		CaseVersionID: 41, DispatchEpoch: 3, DispatchToken: "dispatch-token", AgentRunID: 7001,
 	}
+}
+
+// fakeCaseSuccessHook records passed-case observations. A configured error or
+// panic proves the executor treats the hook as best effort.
+type fakeCaseSuccessHook struct {
+	facts []executionapp.CaseSuccessFact
+	err   error
+	panic bool
+}
+
+func (h *fakeCaseSuccessHook) OnCaseRunPassed(_ context.Context, fact executionapp.CaseSuccessFact) error {
+	h.facts = append(h.facts, fact)
+	if h.panic {
+		panic("knowledge hook exploded")
+	}
+	return h.err
 }
 
 func prepareCaseRun(t *testing.T, fixture *caseRunnerFixture) execution.TaskSnapshot {
@@ -374,6 +393,99 @@ func TestFinishMissingResultsIsInconclusive(t *testing.T) {
 	if finished.Summary.VerdictReason != execution.VerdictReasonIncomplete {
 		t.Fatalf("verdict reason = %q", finished.Summary.VerdictReason)
 	}
+}
+
+func TestFinishPassedNotifiesKnowledgeHookBestEffort(t *testing.T) {
+	finishPassed := func(t *testing.T, fixture *caseRunnerFixture) (execution.CaseRun, error) {
+		t.Helper()
+		prepareCaseRun(t, fixture)
+		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+			t.Fatalf("StepRecord: %v", err)
+		}
+		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+			StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
+		}); err != nil {
+			t.Fatalf("AssertionRecord: %v", err)
+		}
+		return fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	}
+
+	t.Run("notifies once with the run fact", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		finished, err := finishPassed(t, fixture)
+		if err != nil {
+			t.Fatalf("Finish: %v", err)
+		}
+		if finished.Status != execution.CaseRunPassed {
+			t.Fatalf("status = %q", finished.Status)
+		}
+		if len(fixture.knowledge.facts) != 1 {
+			t.Fatalf("hook calls = %d, want 1", len(fixture.knowledge.facts))
+		}
+		fact := fixture.knowledge.facts[0]
+		if fact.VersionID != 10 || fact.CaseRunID != 3001 || fact.CaseVersionID != 41 {
+			t.Fatalf("fact = %+v", fact)
+		}
+		if fact.Title != "登录流程" {
+			t.Fatalf("fact title = %q", fact.Title)
+		}
+		if len(fact.AccountRoles) != 1 || fact.AccountRoles[0] != "admin" {
+			t.Fatalf("fact account roles = %v", fact.AccountRoles)
+		}
+		if len(fact.PageIDs) != 1 || fact.PageIDs[0] != 71 {
+			t.Fatalf("fact page ids = %v", fact.PageIDs)
+		}
+		if len(fact.APIIDs) != 0 {
+			t.Fatalf("fact api ids = %v", fact.APIIDs)
+		}
+	})
+
+	t.Run("hook error does not fail the case run", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		fixture.knowledge.err = errors.New("knowledge service down")
+		finished, err := finishPassed(t, fixture)
+		if err != nil {
+			t.Fatalf("Finish must ignore a hook failure, got %v", err)
+		}
+		if finished.Status != execution.CaseRunPassed {
+			t.Fatalf("status = %q", finished.Status)
+		}
+	})
+
+	t.Run("hook panic does not fail the case run", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		fixture.knowledge.panic = true
+		finished, err := finishPassed(t, fixture)
+		if err != nil {
+			t.Fatalf("Finish must recover a hook panic, got %v", err)
+		}
+		if finished.Status != execution.CaseRunPassed {
+			t.Fatalf("status = %q", finished.Status)
+		}
+	})
+
+	t.Run("non passed runs do not notify", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		prepareCaseRun(t, fixture)
+		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+			t.Fatalf("StepRecord: %v", err)
+		}
+		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+			StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "Login 按钮不存在",
+		}); err != nil {
+			t.Fatalf("AssertionRecord: %v", err)
+		}
+		finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+		if err != nil {
+			t.Fatalf("Finish: %v", err)
+		}
+		if finished.Status != execution.CaseRunFailed {
+			t.Fatalf("status = %q", finished.Status)
+		}
+		if len(fixture.knowledge.facts) != 0 {
+			t.Fatalf("hook calls = %d, want 0 for a failed run", len(fixture.knowledge.facts))
+		}
+	})
 }
 
 func TestWaitBoundedAndInterruptible(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,31 @@ type SUTAPI struct {
 // http.request requires a literal path instead of api_id.
 type SUTAPIResolver interface {
 	API(ctx context.Context, versionID, versionSUTID, apiID int64) (SUTAPI, error)
+}
+
+// CaseSuccessFact is the passed-case observation handed to the optional
+// knowledge success hook (spec §10.1 成功钩子). It carries identifiers only:
+// page/API/account references, the case title and the evidence count, never
+// knowledge content or credentials. The knowledge context turns it into
+// page_locator / api_auth / login_recipe candidates; the executor itself stays
+// knowledge-agnostic.
+type CaseSuccessFact struct {
+	VersionID     int64
+	CaseRunID     int64
+	CaseVersionID int64
+	Title         string
+	AccountRoles  []string
+	PageIDs       []int64
+	APIIDs        []int64
+	EvidenceCount int
+}
+
+// CaseSuccessHook is notified once when a case_run finishes passed. It is best
+// effort: a returned error or a panic is logged and never changes the case_run
+// result or blocks the run (spec §10.1; knowledge hooks are supplemental).
+// A nil hook (the default before assembly wiring) disables the notification.
+type CaseSuccessHook interface {
+	OnCaseRunPassed(ctx context.Context, fact CaseSuccessFact) error
 }
 
 // BrowserContextSpec is one lazily created executor browser context.
@@ -189,12 +215,15 @@ type CaseRunnerDeps struct {
 	TeamRoom    TeamRoom
 	Human       HumanRequestService
 	Visual      VisualAssertPort
-	Settings    SettingsReader
-	Clock       Clock
-	IDs         IDGenerator
-	Events      EventPublisher
-	Audit       AuditRecorder
-	InstanceID  string
+	// KnowledgeHook receives passed-case observations for knowledge
+	// sedimentation (spec §10.1). Optional and best effort.
+	KnowledgeHook CaseSuccessHook
+	Settings      SettingsReader
+	Clock         Clock
+	IDs           IDGenerator
+	Events        EventPublisher
+	Audit         AuditRecorder
+	InstanceID    string
 	// LeaseTTL overrides the case_run lease. Values below 80s (the executor
 	// client bound is 75s) are raised to the minimum; zero selects the 90s
 	// default.
@@ -228,6 +257,7 @@ type CaseRunner struct {
 	teamRoom    TeamRoom
 	human       HumanRequestService
 	visual      VisualAssertPort
+	knowledge   CaseSuccessHook
 	settings    SettingsReader
 	clock       Clock
 	ids         IDGenerator
@@ -290,6 +320,7 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		teamRoom:    deps.TeamRoom,
 		human:       deps.Human,
 		visual:      deps.Visual,
+		knowledge:   deps.KnowledgeHook,
 		settings:    deps.Settings,
 		clock:       deps.Clock,
 		ids:         deps.IDs,
@@ -657,6 +688,9 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		"evidence_count":   summary.EvidenceCount,
 	})
 	s.forgetWaitTracking(caseRun.ID)
+	// Knowledge sedimentation is supplemental: a hook failure never changes the
+	// persisted verdict (spec §10.1, best effort).
+	s.notifyCaseSuccess(ctx, scope.VersionID, finished, caseSnapshot, finished.Summary)
 	return finished, nil
 }
 
@@ -1178,6 +1212,62 @@ func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {
 			return nil
 		})
 	}
+}
+
+// notifyCaseSuccess invokes the optional knowledge success hook for one passed
+// case_run. The hook never blocks or fails the executed case: an error is
+// logged and a panic is recovered (spec §10.1 best effort).
+func (s *CaseRunner) notifyCaseSuccess(ctx context.Context, versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary) {
+	if s.knowledge == nil || caseRun.Status != execution.CaseRunPassed || versionID <= 0 {
+		return
+	}
+	fact := caseSuccessFact(versionID, caseRun, snapshot, summary)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Default().ErrorContext(ctx, "knowledge success hook panicked",
+				"case_run_id", caseRun.ID, "panic", recovered)
+		}
+	}()
+	if err := s.knowledge.OnCaseRunPassed(ctx, fact); err != nil {
+		slog.Default().WarnContext(ctx, "knowledge success hook failed",
+			"case_run_id", caseRun.ID, "error", err)
+	}
+}
+
+// caseSuccessFact projects one passed case snapshot into the hook observation:
+// identifiers only, deduplicated and in case order.
+func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary) CaseSuccessFact {
+	fact := CaseSuccessFact{
+		VersionID:     versionID,
+		CaseRunID:     caseRun.ID,
+		CaseVersionID: caseRun.CaseVersionID,
+		Title:         snapshot.Title,
+		EvidenceCount: summary.EvidenceCount,
+	}
+	roles := map[string]struct{}{}
+	pages := map[int64]struct{}{}
+	apis := map[int64]struct{}{}
+	for _, step := range snapshot.Steps {
+		if role := strings.TrimSpace(step.AccountRole); role != "" {
+			if _, seen := roles[role]; !seen {
+				roles[role] = struct{}{}
+				fact.AccountRoles = append(fact.AccountRoles, role)
+			}
+		}
+		if step.TargetPageID != nil && *step.TargetPageID > 0 {
+			if _, seen := pages[*step.TargetPageID]; !seen {
+				pages[*step.TargetPageID] = struct{}{}
+				fact.PageIDs = append(fact.PageIDs, *step.TargetPageID)
+			}
+		}
+		if step.TargetAPIID != nil && *step.TargetAPIID > 0 {
+			if _, seen := apis[*step.TargetAPIID]; !seen {
+				apis[*step.TargetAPIID] = struct{}{}
+				fact.APIIDs = append(fact.APIIDs, *step.TargetAPIID)
+			}
+		}
+	}
+	return fact
 }
 
 func (s *CaseRunner) resetWaitTracking(caseRunID int64, now time.Time) {
