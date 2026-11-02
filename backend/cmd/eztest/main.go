@@ -18,6 +18,7 @@ import (
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/designadapter"
@@ -703,6 +704,19 @@ func main() {
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
+
+	// P3-T5 production version-briefing read path. The reader is a read-only,
+	// deterministic SQL source over the version/design/execution/knowledge
+	// tables; it is injected here (not through a package singleton) so the
+	// cache-first context assembler can consume the builder without rebuilding
+	// it per round. The runtime consumer lands with the context wiring
+	// (Task 13/14/33), which is why the builder is only held alive today.
+	briefingReader, err := versionadapter.NewBriefingReader(pool)
+	if err != nil {
+		log.Fatalf("eztest: wire version briefing reader: %v", err)
+	}
+	briefingBuilder := agentcontext.NewBriefingBuilder(briefingReader)
+	_ = briefingBuilder
 
 	// P2 design services and cross-context adapters.
 	designTeamRoom := designTeamRoomAdapter{room: teamRoom}
