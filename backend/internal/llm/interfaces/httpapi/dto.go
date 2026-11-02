@@ -172,6 +172,39 @@ type modelDTO struct {
 	UpdatedAt      string           `json:"updated_at"`
 }
 
+// publicModelDTO is the login-user model catalog item (OpenAPI
+// PublicModelView). It deliberately omits api_key/base_url/headers and the
+// internal catalog metadata: only what a model picker needs.
+type publicModelDTO struct {
+	ID            string           `json:"id"`
+	ConfigID      string           `json:"config_id"`
+	ConfigName    string           `json:"config_name"`
+	Model         string           `json:"model"`
+	DisplayName   string           `json:"display_name"`
+	ContextWindow int              `json:"context_window"`
+	Capabilities  llm.Capabilities `json:"capabilities"`
+	Default       bool             `json:"default"`
+	Deprecated    bool             `json:"deprecated"`
+}
+
+// toPublicModelDTO maps one selectable model of an active configuration. Default
+// is true only for the configuration's explicit default_model_id; the picker
+// must never fall back to models[0] (D24).
+func toPublicModelDTO(model llm.Model, cfg llm.Config) publicModelDTO {
+	capabilities := model.EffectiveCapabilities()
+	return publicModelDTO{
+		ID:            strconv.FormatInt(model.ID, 10),
+		ConfigID:      strconv.FormatInt(model.ConfigID, 10),
+		ConfigName:    cfg.Name,
+		Model:         model.Model,
+		DisplayName:   model.DisplayName,
+		ContextWindow: capabilities.ContextWindow,
+		Capabilities:  capabilities,
+		Default:       cfg.DefaultModelID == model.ID,
+		Deprecated:    model.Deprecated,
+	}
+}
+
 func toModelDTO(model llm.Model) modelDTO {
 	return modelDTO{
 		ID:             strconv.FormatInt(model.ID, 10),

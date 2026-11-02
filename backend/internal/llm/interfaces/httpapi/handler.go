@@ -307,6 +307,42 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 	httpx.List(w, http.StatusOK, items, "", false)
 }
 
+// ListPublicModels GET /api/llm/models.
+//
+// The login-user model catalog backs the conversation model selector. Only
+// models of an active LLM configuration that are themselves enabled and not
+// deprecated are returned (spec §7.3/§9.1); deprecated rows stay in the admin
+// catalog for display but can never be selected for a run. The response carries
+// the 0.2.1 capability set and the config's default marker, and never any
+// gateway credential or base URL.
+func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
+	configs, err := h.svc.ListConfigs(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	models, err := h.svc.ListModels(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	active := make(map[int64]llm.Config, len(configs))
+	for _, cfg := range configs {
+		if cfg.Status == llm.StatusActive {
+			active[cfg.ID] = cfg
+		}
+	}
+	items := make([]publicModelDTO, 0, len(models))
+	for _, model := range models {
+		cfg, ok := active[model.ConfigID]
+		if !ok || !model.Selectable() {
+			continue
+		}
+		items = append(items, toPublicModelDTO(model, cfg))
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
 func requireActor(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	actor, ok := platform.ActorFrom(r.Context())
 	if !ok || actor.ID <= 0 {

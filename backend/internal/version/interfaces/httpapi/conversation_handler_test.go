@@ -31,15 +31,35 @@ type stubConversationService struct {
 	lastClientID  string
 	lastParts     []version.MessagePart
 	lastActor     int64
-	calls         []string
+	// lastModelOverride records the override passed to CreateWithModel /
+	// SetModelOverride and overrideCalled distinguishes "cleared" from "not
+	// called at all".
+	lastModelOverride *string
+	overrideCalled    bool
+	setOverrideCalled bool
+	calls             []string
 }
 
-func (s *stubConversationService) Create(_ context.Context, versionID int64, kind, title string, actorID int64) (versionapp.ConversationView, error) {
+func (s *stubConversationService) CreateWithModel(_ context.Context, versionID int64, kind, title string, modelOverride *string, actorID int64) (versionapp.ConversationView, error) {
 	s.calls = append(s.calls, "create")
 	s.lastVersionID = versionID
 	s.lastKind = kind
 	s.lastTitle = title
 	s.lastActor = actorID
+	s.lastModelOverride = modelOverride
+	s.overrideCalled = true
+	if s.err != nil {
+		return versionapp.ConversationView{}, s.err
+	}
+	return s.conversation, nil
+}
+
+func (s *stubConversationService) SetModelOverride(_ context.Context, versionID, conversationID int64, modelOverride *string) (versionapp.ConversationView, error) {
+	s.calls = append(s.calls, "set_model_override")
+	s.lastVersionID = versionID
+	s.lastCID = conversationID
+	s.lastModelOverride = modelOverride
+	s.setOverrideCalled = true
 	if s.err != nil {
 		return versionapp.ConversationView{}, s.err
 	}
@@ -103,6 +123,7 @@ func newConversationServer(t *testing.T) (http.Handler, *stubConversationService
 	mux.HandleFunc("GET /api/versions/{id}/conversations", handler.List)
 	mux.HandleFunc("POST /api/versions/{id}/conversations", handler.Create)
 	mux.HandleFunc("GET /api/versions/{id}/conversations/{cid}", handler.Get)
+	mux.HandleFunc("PATCH /api/versions/{id}/conversations/{cid}", handler.UpdateModel)
 	mux.HandleFunc("GET /api/versions/{id}/conversations/{cid}/messages", handler.Messages)
 	mux.HandleFunc("POST /api/versions/{id}/conversations/{cid}/messages", handler.PostMessage)
 	return mux, stub
@@ -112,14 +133,18 @@ func sampleConversationView() versionapp.ConversationView {
 	summary := "Latest thread summary"
 	lastMessageAt := testTime
 	createdBy := int64(42)
+	modelOverride := "vision-plus"
+	effectiveModel := "vision-plus"
 	return versionapp.ConversationView{
 		ID: 8001, VersionID: 101, Kind: "clarification", Title: "需求澄清 2026-10-31 12:00",
 		Status: "active", MessageCount: 3, LastMessageAt: &lastMessageAt,
 		CreatedBy: &createdBy, CreatedAt: testTime, UpdatedAt: testTime, Summary: &summary,
+		ModelOverride: &modelOverride, EffectiveModel: &effectiveModel,
 	}
 }
 
 func sampleMessageView() versionapp.MessageView {
+	actualModel := "gpt-4o"
 	return versionapp.MessageView{
 		ID: 8101, ConversationID: 8001, Role: "assistant",
 		Parts: []version.MessagePart{
@@ -128,8 +153,9 @@ func sampleMessageView() versionapp.MessageView {
 			{Type: "rollback_proposal", RequirementID: 9001, Reason: "scope changed"},
 			{Type: "attachment", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Name: "spec.md", MIME: "text/markdown", Size: 12},
 		},
-		Refs:      []version.MessageRef{{Kind: "requirement", ID: "9001"}},
-		CreatedAt: testTime,
+		Refs:        []version.MessageRef{{Kind: "requirement", ID: "9001"}},
+		ActualModel: &actualModel,
+		CreatedAt:   testTime,
 	}
 }
 
@@ -334,10 +360,15 @@ func TestConversationHandlerValidationAndErrors(t *testing.T) {
 		{"bad before", http.MethodGet, "/api/versions/101/conversations?before=abc", "", actor(), 400, "before"},
 		{"bad after", http.MethodGet, "/api/versions/101/conversations/8001/messages?after=abc", "", actor(), 400, "after"},
 		{"malformed create", http.MethodPost, "/api/versions/101/conversations", `{"kind":`, actor(), 400, "body"},
+		{"malformed patch", http.MethodPatch, "/api/versions/101/conversations/8001", `{"model_override":`, actor(), 400, "body"},
+		{"missing model_override", http.MethodPatch, "/api/versions/101/conversations/8001", `{}`, actor(), 400, "model_override"},
+		{"bad model_override type", http.MethodPatch, "/api/versions/101/conversations/8001", `{"model_override":5}`, actor(), 400, "model_override"},
+		{"bad cid patch", http.MethodPatch, "/api/versions/101/conversations/xyz", `{"model_override":null}`, actor(), 400, "cid"},
 		{"malformed message", http.MethodPost, "/api/versions/101/conversations/8001/messages", `{`, actor(), 400, "body"},
 		{"bad part type", http.MethodPost, "/api/versions/101/conversations/8001/messages", `{"parts":[{"type":"video"}]}`, actor(), 400, "parts[0]"},
 		{"bad part json", http.MethodPost, "/api/versions/101/conversations/8001/messages", `{"parts":[{"type":"text","text":5}]}`, actor(), 400, "parts[0]"},
 		{"missing actor create", http.MethodPost, "/api/versions/101/conversations", `{"kind":"clarification"}`, nil, 401, ""},
+		{"missing actor patch", http.MethodPatch, "/api/versions/101/conversations/8001", `{"model_override":null}`, nil, 401, ""},
 		{"missing actor post", http.MethodPost, "/api/versions/101/conversations/8001/messages", `{"parts":[{"type":"text","text":"x"}]}`, nil, 401, ""},
 	}
 	for _, tc := range cases {
@@ -420,5 +451,134 @@ func TestConversationHandlerCallsStartRoundForDesignConversation(t *testing.T) {
 	}
 	if len(starter.calls) != 2 {
 		t.Fatalf("clarification triggered StartRound: %#v", starter.calls)
+	}
+}
+
+// TestCreateConversationPassesModelOverride pins the 0.2.1 create path: an
+// optional model_override is forwarded to the service and the detail DTO
+// exposes model_override/effective_model.
+func TestCreateConversationPassesModelOverride(t *testing.T) {
+	handler, stub := newConversationServer(t)
+	stub.conversation = sampleConversationView()
+
+	recorder := call(t, handler, http.MethodPost, "/api/versions/101/conversations",
+		`{"kind":"clarification","model_override":"vision-plus"}`, actor())
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !stub.overrideCalled || stub.lastModelOverride == nil || *stub.lastModelOverride != "vision-plus" {
+		t.Fatalf("override = %#v (called=%v)", stub.lastModelOverride, stub.overrideCalled)
+	}
+	data := dataBody(t, recorder)
+	if data["model_override"] != "vision-plus" || data["effective_model"] != "vision-plus" {
+		t.Fatalf("data = %#v", data)
+	}
+
+	// An omitted model_override means "use the config default": the service
+	// receives nil and the DTO reports a null override.
+	stub.overrideCalled = false
+	stub.lastModelOverride = nil
+	plain := sampleConversationView()
+	plain.ModelOverride = nil
+	defaultModel := "gpt-4o"
+	plain.EffectiveModel = &defaultModel
+	stub.conversation = plain
+	recorder = call(t, handler, http.MethodPost, "/api/versions/101/conversations", `{"kind":"clarification"}`, actor())
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("plain status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !stub.overrideCalled || stub.lastModelOverride != nil {
+		t.Fatalf("plain override = %#v (called=%v)", stub.lastModelOverride, stub.overrideCalled)
+	}
+	data = dataBody(t, recorder)
+	if value, ok := data["model_override"]; !ok || value != nil {
+		t.Fatalf("plain model_override = %#v", data["model_override"])
+	}
+	if data["effective_model"] != "gpt-4o" {
+		t.Fatalf("plain effective_model = %#v", data["effective_model"])
+	}
+}
+
+// TestUpdateConversationModelOverride pins PATCH /conversations/{cid}: a model
+// string sets the override, JSON null clears it, and the response is the
+// updated conversation detail.
+func TestUpdateConversationModelOverride(t *testing.T) {
+	handler, stub := newConversationServer(t)
+	view := sampleConversationView()
+	stub.conversation = view
+
+	recorder := call(t, handler, http.MethodPatch, "/api/versions/101/conversations/8001",
+		`{"model_override":"vision-plus"}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !stub.setOverrideCalled || stub.lastVersionID != 101 || stub.lastCID != 8001 ||
+		stub.lastModelOverride == nil || *stub.lastModelOverride != "vision-plus" {
+		t.Fatalf("args = %#v", stub)
+	}
+	data := dataBody(t, recorder)
+	if data["id"] != "8001" || data["model_override"] != "vision-plus" ||
+		data["effective_model"] != "vision-plus" {
+		t.Fatalf("data = %#v", data)
+	}
+
+	// A null override clears the conversation override.
+	cleared := sampleConversationView()
+	cleared.ModelOverride = nil
+	effective := "gpt-4o"
+	cleared.EffectiveModel = &effective
+	stub.conversation = cleared
+	stub.setOverrideCalled = false
+	stub.lastModelOverride = view.ModelOverride
+	recorder = call(t, handler, http.MethodPatch, "/api/versions/101/conversations/8001",
+		`{"model_override":null}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !stub.setOverrideCalled || stub.lastModelOverride != nil {
+		t.Fatalf("clear override = %#v (called=%v)", stub.lastModelOverride, stub.setOverrideCalled)
+	}
+	data = dataBody(t, recorder)
+	if value, ok := data["model_override"]; !ok || value != nil {
+		t.Fatalf("clear model_override = %#v", data["model_override"])
+	}
+	if data["effective_model"] != "gpt-4o" {
+		t.Fatalf("clear effective_model = %#v", data["effective_model"])
+	}
+
+	// A typed service error keeps its status (unknown model is a 400).
+	stub.err = platform.Invalid("model_override", "must name a model of the default llm configuration")
+	recorder = call(t, handler, http.MethodPatch, "/api/versions/101/conversations/8001",
+		`{"model_override":"unknown-llm"}`, actor())
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("error status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestConversationMessageExposesActualModel pins the 0.2.1 message field: the
+// assistant message reports the model that actually generated it; a user
+// message reports null.
+func TestConversationMessageExposesActualModel(t *testing.T) {
+	handler, stub := newConversationServer(t)
+	assistant := sampleMessageView()
+	stub.messages = []versionapp.MessageView{assistant}
+
+	recorder := call(t, handler, http.MethodGet, "/api/versions/101/conversations/8001/messages", "", actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	message := dataList(t, recorder)[0].(map[string]any)
+	if message["actual_model"] != "gpt-4o" {
+		t.Fatalf("actual_model = %#v", message["actual_model"])
+	}
+
+	user := assistant
+	user.Role = "user"
+	user.ActualModel = nil
+	stub.messages = []versionapp.MessageView{user}
+	recorder = call(t, handler, http.MethodGet, "/api/versions/101/conversations/8001/messages", "", actor())
+	message = dataList(t, recorder)[0].(map[string]any)
+	if value, ok := message["actual_model"]; !ok || value != nil {
+		t.Fatalf("user actual_model = %#v", message["actual_model"])
 	}
 }

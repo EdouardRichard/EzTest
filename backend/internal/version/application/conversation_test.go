@@ -42,6 +42,17 @@ func (f *fakeConversationRepo) Create(_ context.Context, conversation version.Co
 	return nil
 }
 
+func (f *fakeConversationRepo) UpdateModelOverride(_ context.Context, versionID, conversationID int64, modelOverride *string, updatedAt time.Time) (version.Conversation, error) {
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return version.Conversation{}, version.ErrConversationNotFound
+	}
+	conversation.ModelOverride = modelOverride
+	conversation.UpdatedAt = updatedAt
+	f.conversations[conversationID] = conversation
+	return conversation, nil
+}
+
 func (f *fakeConversationRepo) Get(_ context.Context, versionID, conversationID int64) (version.Conversation, *version.ConversationSummary, error) {
 	conversation, ok := f.conversations[conversationID]
 	if !ok || conversation.VersionID != versionID {

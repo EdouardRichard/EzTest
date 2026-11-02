@@ -3,6 +3,7 @@ package llmapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -324,6 +325,65 @@ func (s *Service) ListModels(ctx context.Context) ([]llm.Model, error) {
 		return nil, mapRepositoryError(err)
 	}
 	return list, nil
+}
+
+// ResolveSelectableModel resolves a conversation-level model override to a
+// selectable catalog row of the default LLM configuration. An empty override
+// resolves the configuration's explicit default_model_id (models[0] is never
+// used, D24). Deprecated/disabled models and models outside the configuration
+// are rejected with a non-retryable typed error so a conversation can never pin
+// a model that the runtime would refuse to dispatch.
+//
+// This is deliberately narrower than ResolveModel: selecting a model for a
+// conversation must not depend on the chat gateway being configured, and the
+// vision/tool gates are applied when the draft/message is dispatched.
+func (s *Service) ResolveSelectableModel(ctx context.Context, modelOverride string) (llm.Model, error) {
+	cfg, err := s.selectConfig(ctx, 0)
+	if err != nil {
+		return llm.Model{}, err
+	}
+	models, err := s.repo.ListModelsByConfig(ctx, cfg.ID)
+	if err != nil {
+		return llm.Model{}, mapRepositoryError(err)
+	}
+
+	name := strings.TrimSpace(modelOverride)
+	if name == "" {
+		if cfg.DefaultModelID <= 0 {
+			return llm.Model{}, &platform.Error{
+				Status:  400,
+				Code:    CodeLLMConfigInvalid,
+				Message: "llm config has no default model; set default_model_id before selecting a model (models[0] is never used)",
+				Details: map[string]any{"field": "default_model_id"},
+			}
+		}
+		for i := range models {
+			if models[i].ID != cfg.DefaultModelID {
+				continue
+			}
+			if !models[i].Selectable() {
+				return llm.Model{}, llmConfigError(fmt.Sprintf(
+					"default model %q is deprecated or disabled; set default_model_id to an active model", models[i].Model))
+			}
+			return models[i], nil
+		}
+		return llm.Model{}, llmConfigError(fmt.Sprintf(
+			"default model %d is not in the catalog of llm config %q; refresh the model catalog or set default_model_id",
+			cfg.DefaultModelID, cfg.Name))
+	}
+
+	for i := range models {
+		if models[i].Model != name {
+			continue
+		}
+		if !models[i].Selectable() {
+			return llm.Model{}, platform.Invalid("model_override",
+				"must name an active model that is not deprecated")
+		}
+		return models[i], nil
+	}
+	return llm.Model{}, platform.Invalid("model_override",
+		"must name a model of the default llm configuration")
 }
 
 // buildConfig merges a partial input into base. On create the P0 defaults are

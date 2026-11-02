@@ -9,28 +9,34 @@ import (
 
 // ConversationView is the conversation detail. Summary is the latest summary
 // text (nil until the runtime generates one); summaries are also exposed via
-// the service port for the agent runtime.
+// the service port for the agent runtime. ModelOverride is the stored 0.2.1
+// conversation-level model (nil = config default) and EffectiveModel is the
+// model a new assistant turn would use today.
 type ConversationView struct {
-	ID            int64
-	VersionID     int64
-	Kind          string
-	Title         string
-	Status        string
-	MessageCount  int
-	LastMessageAt *time.Time
-	CreatedBy     *int64
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	Summary       *string
+	ID             int64
+	VersionID      int64
+	Kind           string
+	Title          string
+	Status         string
+	MessageCount   int
+	LastMessageAt  *time.Time
+	ModelOverride  *string
+	EffectiveModel *string
+	CreatedBy      *int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	Summary        *string
 }
 
-// MessageView is the UI-thread message projection.
+// MessageView is the UI-thread message projection. ActualModel is set for
+// assistant messages from the linked agent_run (`actual_model`).
 type MessageView struct {
 	ID             int64
 	ConversationID int64
 	Role           string
 	Parts          []version.MessagePart
 	Refs           []version.MessageRef
+	ActualModel    *string
 	CreatedAt      time.Time
 }
 
@@ -62,6 +68,7 @@ func toConversationView(conversation version.Conversation, summary *version.Conv
 		Status:        conversation.Status,
 		MessageCount:  conversation.MessageCount,
 		LastMessageAt: conversation.LastMessageAt,
+		ModelOverride: conversation.ModelOverride,
 		CreatedBy:     conversation.CreatedBy,
 		CreatedAt:     conversation.CreatedAt,
 		UpdatedAt:     conversation.UpdatedAt,
@@ -74,7 +81,7 @@ func toConversationView(conversation version.Conversation, summary *version.Conv
 }
 
 func toMessageView(message version.Message) MessageView {
-	return MessageView{
+	view := MessageView{
 		ID:             message.ID,
 		ConversationID: message.ConversationID,
 		Role:           message.Role,
@@ -82,6 +89,11 @@ func toMessageView(message version.Message) MessageView {
 		Refs:           nonNilRefs(message.Refs),
 		CreatedAt:      message.CreatedAt,
 	}
+	if message.ActualModel != "" {
+		actualModel := message.ActualModel
+		view.ActualModel = &actualModel
+	}
+	return view
 }
 
 func nonNilParts(parts []version.MessagePart) []version.MessagePart {

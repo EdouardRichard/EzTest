@@ -145,7 +145,7 @@ func New(deps Deps) http.Handler {
 	identityapi.New(deps.Identity).Register(mux, authenticated, admin)
 	registerSettingsRoutes(mux, admin, settingsapi.New(deps.Settings))
 	registerAuditRoutes(mux, admin, auditapi.New(deps.Audit))
-	registerLLMRoutes(mux, admin, llmapi.New(deps.LLM))
+	registerLLMRoutes(mux, authenticated, admin, llmapi.New(deps.LLM))
 	registerContentRoutes(mux, authenticated, storageapi.New(deps.Storage))
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
@@ -290,7 +290,10 @@ func registerAuditRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handl
 	mux.Handle("GET /api/admin/audit-logs", admin(http.HandlerFunc(h.List)))
 }
 
-func registerLLMRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, h *llmapi.Handler) {
+func registerLLMRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *llmapi.Handler) {
+	// The public catalog backs the conversation model selector; it is readable
+	// by any logged-in user and never exposes credentials (spec §9.1).
+	mux.Handle("GET /api/llm/models", authenticated(http.HandlerFunc(h.ListPublicModels)))
 	mux.Handle("GET /api/admin/llm/configs", admin(http.HandlerFunc(h.ListConfigs)))
 	mux.Handle("POST /api/admin/llm/configs", admin(http.HandlerFunc(h.CreateConfig)))
 	mux.Handle("GET /api/admin/llm/configs/{id}", admin(http.HandlerFunc(h.GetConfig)))
@@ -350,6 +353,7 @@ func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Hand
 	mux.Handle("GET /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.List)))
 	mux.Handle("POST /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.Create)))
 	mux.Handle("GET /api/versions/{id}/conversations/{cid}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("PATCH /api/versions/{id}/conversations/{cid}", authenticated(http.HandlerFunc(h.UpdateModel)))
 	mux.Handle("GET /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.Messages)))
 	mux.Handle("POST /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.PostMessage)))
 }

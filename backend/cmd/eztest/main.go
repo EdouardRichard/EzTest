@@ -224,6 +224,25 @@ func (c designConversationCreator) CreateDesign(ctx context.Context, versionID i
 	return view.ID, nil
 }
 
+// conversationModelCatalog adapts the LLM model catalog to the version
+// conversation model-override port. It resolves an explicit override (or the
+// configuration default when empty) and rejects models outside the selectable
+// catalog, so a conversation can never pin a model the runtime would refuse.
+type conversationModelCatalog struct {
+	svc *llmapp.Service
+}
+
+func (c conversationModelCatalog) ResolveConversationModel(ctx context.Context, modelOverride string) (string, error) {
+	if c.svc == nil {
+		return "", errors.New("conversation model catalog has no llm service")
+	}
+	model, err := c.svc.ResolveSelectableModel(ctx, modelOverride)
+	if err != nil {
+		return "", err
+	}
+	return model.Model, nil
+}
+
 // designVersionStarter projects a version to running for design activation.
 type designVersionStarter struct {
 	svc *versionapp.Service
@@ -703,6 +722,7 @@ func main() {
 		attachments.NewParser(), attachments.NewImageProber(), eventSvc, ids, clk)
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
+	conversationSvc.SetModelCatalog(conversationModelCatalog{svc: llmSvc})
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
 
 	// P3-T5 production version-briefing read path. The reader is a read-only,

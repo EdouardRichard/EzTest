@@ -66,6 +66,10 @@ export type ConversationSummary = {
   status: ConversationStatus
   message_count: number
   last_message_at: string | null
+  /** 0.2.1 conversation override; null follows the LLM config default model. */
+  model_override?: string | null
+  /** 0.2.1 model a new assistant turn would use (override or config default). */
+  effective_model?: string | null
   created_at: string
 }
 
@@ -132,6 +136,8 @@ export type ConversationMessage = {
   role: MessageRole
   parts: MessagePart[]
   refs: MessageRef[]
+  /** 0.2.1 assistant model that actually generated the message; null for user messages. */
+  actual_model?: string | null
   created_at: string
 }
 

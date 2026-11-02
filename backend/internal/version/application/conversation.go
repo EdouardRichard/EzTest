@@ -22,6 +22,7 @@ type ConversationService struct {
 	queue       TaskEnqueuer
 	attachments MessageAttachmentRegistrar
 	versions    VersionReader
+	models      ConversationModelCatalog
 	ids         platformid.Generator
 	clock       clock.Clock
 	events      eventingapp.Publisher
@@ -43,10 +44,26 @@ func NewConversationService(
 	}
 }
 
+// SetModelCatalog wires the default LLM configuration's selectable model
+// catalog. It is set by the composition root after construction; a nil catalog
+// keeps conversation creation working but rejects model overrides, which is the
+// safe behavior when no LLM context is configured.
+func (s *ConversationService) SetModelCatalog(catalog ConversationModelCatalog) {
+	s.models = catalog
+}
+
 // Create creates a clarification or design conversation and ensures the
 // opening chat task. Creating an empty conversation does not project the
 // version to running.
 func (s *ConversationService) Create(ctx context.Context, versionID int64, kind, title string, actorID int64) (ConversationView, error) {
+	return s.CreateWithModel(ctx, versionID, kind, title, nil, actorID)
+}
+
+// CreateWithModel is Create plus the optional 0.2.1 conversation-level model
+// override. A non-empty override must name a selectable model of the default
+// LLM configuration; omitting it (nil) uses the configuration's
+// default_model_id and never switches models automatically (D24).
+func (s *ConversationService) CreateWithModel(ctx context.Context, versionID int64, kind, title string, modelOverride *string, actorID int64) (ConversationView, error) {
 	if versionID <= 0 {
 		return ConversationView{}, platform.Invalid("id", "must be a positive decimal ID")
 	}
@@ -71,17 +88,22 @@ func (s *ConversationService) Create(ctx context.Context, versionID int64, kind,
 	if err := version.ValidateConversationTitle(title); err != nil {
 		return ConversationView{}, err
 	}
+	normalizedOverride, effectiveModel, err := s.resolveModelOverride(ctx, modelOverride)
+	if err != nil {
+		return ConversationView{}, err
+	}
 
 	now := s.clock.Now()
 	conversation := version.Conversation{
-		ID:        s.ids.Next(),
-		VersionID: versionID,
-		Kind:      kind,
-		Title:     title,
-		Status:    version.ConversationActive,
-		CreatedBy: optionalActor(actorID),
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:            s.ids.Next(),
+		VersionID:     versionID,
+		Kind:          kind,
+		Title:         title,
+		Status:        version.ConversationActive,
+		ModelOverride: normalizedOverride,
+		CreatedBy:     optionalActor(actorID),
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	if err := s.repo.Create(ctx, conversation); err != nil {
 		return ConversationView{}, mapConversationRepositoryError(err)
@@ -103,7 +125,34 @@ func (s *ConversationService) Create(ctx context.Context, versionID int64, kind,
 			"trigger":         "opening",
 		},
 	})
-	return toConversationView(conversation, nil), nil
+	view := toConversationView(conversation, nil)
+	view.EffectiveModel = effectiveModel
+	return view, nil
+}
+
+// SetModelOverride sets or clears one conversation's model override. A nil
+// override clears it and falls back to the LLM configuration's default model;
+// an explicit model must be selectable (the switch is user-initiated, never
+// automatic, D24).
+func (s *ConversationService) SetModelOverride(ctx context.Context, versionID, conversationID int64, modelOverride *string) (ConversationView, error) {
+	if err := validateConversationIDs(versionID, conversationID); err != nil {
+		return ConversationView{}, err
+	}
+	_, summary, err := s.repo.Get(ctx, versionID, conversationID)
+	if err != nil {
+		return ConversationView{}, mapConversationRepositoryError(err)
+	}
+	normalizedOverride, effectiveModel, err := s.resolveModelOverride(ctx, modelOverride)
+	if err != nil {
+		return ConversationView{}, err
+	}
+	conversation, err := s.repo.UpdateModelOverride(ctx, versionID, conversationID, normalizedOverride, s.clock.Now())
+	if err != nil {
+		return ConversationView{}, mapConversationRepositoryError(err)
+	}
+	view := toConversationView(conversation, summary)
+	view.EffectiveModel = effectiveModel
+	return view, nil
 }
 
 // List returns one id-descending page of conversations.
@@ -129,9 +178,12 @@ func (s *ConversationService) List(ctx context.Context, versionID int64, kind st
 	if hasMore {
 		conversations = conversations[:limit]
 	}
+	resolveEffectiveModel := s.effectiveModelResolver(ctx)
 	views := make([]ConversationView, 0, len(conversations))
 	for _, conversation := range conversations {
-		views = append(views, toConversationView(conversation, nil))
+		view := toConversationView(conversation, nil)
+		view.EffectiveModel = resolveEffectiveModel(conversation.ModelOverride)
+		views = append(views, view)
 	}
 	return views, hasMore, nil
 }
@@ -145,7 +197,9 @@ func (s *ConversationService) Get(ctx context.Context, versionID, conversationID
 	if err != nil {
 		return ConversationView{}, mapConversationRepositoryError(err)
 	}
-	return toConversationView(conversation, summary), nil
+	view := toConversationView(conversation, summary)
+	view.EffectiveModel = s.effectiveModel(ctx, conversation.ModelOverride)
+	return view, nil
 }
 
 // Messages returns messages with id > after in ascending order. The default
@@ -490,4 +544,75 @@ func validateConversationIDs(versionID, conversationID int64) error {
 		return platform.Invalid("cid", "must be a positive decimal ID")
 	}
 	return nil
+}
+
+// ---------- model override resolution ----------
+
+// resolveModelOverride normalizes a requested override and returns both the
+// value to persist and the effective model name. nil/blank clears the override
+// and resolves the configuration default best effort; an explicit model must
+// resolve through the catalog, whose typed error is returned unchanged.
+func (s *ConversationService) resolveModelOverride(ctx context.Context, modelOverride *string) (*string, *string, error) {
+	if modelOverride == nil || strings.TrimSpace(*modelOverride) == "" {
+		return nil, s.effectiveModel(ctx, nil), nil
+	}
+	trimmed := strings.TrimSpace(*modelOverride)
+	if len(trimmed) > 128 {
+		return nil, nil, platform.Invalid("model_override", "must be at most 128 characters")
+	}
+	if s.models == nil {
+		return nil, nil, platform.Unavailable("llm model catalog is not configured")
+	}
+	name, err := s.models.ResolveConversationModel(ctx, trimmed)
+	if err != nil {
+		return nil, nil, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, nil, platform.Invalid("model_override", "must name a model of the default llm configuration")
+	}
+	return &name, &name, nil
+}
+
+// effectiveModel resolves the model a conversation currently uses, best effort:
+// read paths must render a conversation even when the LLM configuration is
+// temporarily unusable, so a resolution failure yields null (contract nullable).
+func (s *ConversationService) effectiveModel(ctx context.Context, override *string) *string {
+	if s.models == nil {
+		return nil
+	}
+	requested := ""
+	if override != nil {
+		requested = strings.TrimSpace(*override)
+	}
+	name, err := s.models.ResolveConversationModel(ctx, requested)
+	if err != nil {
+		return nil
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	return &name
+}
+
+// effectiveModelResolver memoizes effectiveModel per requested override so a
+// conversation page resolves the shared configuration default only once.
+func (s *ConversationService) effectiveModelResolver(ctx context.Context) func(*string) *string {
+	if s.models == nil {
+		return func(*string) *string { return nil }
+	}
+	cache := make(map[string]*string)
+	return func(override *string) *string {
+		key := ""
+		if override != nil {
+			key = strings.TrimSpace(*override)
+		}
+		if value, ok := cache[key]; ok {
+			return value
+		}
+		value := s.effectiveModel(ctx, override)
+		cache[key] = value
+		return value
+	}
 }

@@ -16,9 +16,10 @@ import (
 // ConversationService is the application surface the conversation handlers
 // need.
 type ConversationService interface {
-	Create(ctx context.Context, versionID int64, kind, title string, actorID int64) (versionapp.ConversationView, error)
+	CreateWithModel(ctx context.Context, versionID int64, kind, title string, modelOverride *string, actorID int64) (versionapp.ConversationView, error)
 	List(ctx context.Context, versionID int64, kind string, limit int, beforeID *int64) ([]versionapp.ConversationView, bool, error)
 	Get(ctx context.Context, versionID, conversationID int64) (versionapp.ConversationView, error)
+	SetModelOverride(ctx context.Context, versionID, conversationID int64, modelOverride *string) (versionapp.ConversationView, error)
 	Messages(ctx context.Context, versionID, conversationID int64, after int64, limit int) ([]versionapp.MessageView, bool, error)
 	PostUserMessage(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart, clientMessageID string, actorID int64) (versionapp.MessageView, error)
 }
@@ -89,7 +90,7 @@ func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.Create(r.Context(), versionID, request.Kind, request.Title, actorID)
+	view, err := h.svc.CreateWithModel(r.Context(), versionID, request.Kind, request.Title, request.ModelOverride, actorID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -111,6 +112,39 @@ func (h *ConversationHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view, err := h.svc.Get(r.Context(), versionID, conversationID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toConversationDTO(view))
+}
+
+// UpdateModel PATCH /api/versions/{id}/conversations/{cid}.
+//
+// It sets or clears the 0.2.1 conversation-level model override. The model must
+// be an enabled, non-deprecated model of the default LLM configuration; the
+// switch is user-initiated only (D24). A null model_override clears the
+// override and falls back to the configuration default_model_id.
+func (h *ConversationHandler) UpdateModel(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireActor(w, r); !ok {
+		return
+	}
+	versionID, conversationID, err := conversationPathIDs(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request updateConversationRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	modelOverride, err := request.modelOverride()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.SetModelOverride(r.Context(), versionID, conversationID, modelOverride)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return

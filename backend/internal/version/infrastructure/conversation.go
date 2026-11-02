@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -13,13 +14,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.created_by,
+const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.model_override, c.created_by,
 	c.created_at, c.updated_at,
 	(SELECT count(*) FROM conversation_message m WHERE m.conversation_id = c.id),
 	(SELECT max(m.created_at) FROM conversation_message m WHERE m.conversation_id = c.id)`
 
 const conversationMessageColumns = `id, conversation_id, role, parts, refs, token_usage,
 	actor_id, agent_run_id, client_message_id, reply_to_message_id, created_at`
+
+// conversationMessageSelectColumns reads a message together with the model that
+// actually generated it. actual_model is empty for user messages and for
+// assistant messages whose run link is absent; the DTO maps empty to null.
+const conversationMessageSelectColumns = `m.id, m.conversation_id, m.role, m.parts, m.refs, m.token_usage,
+	m.actor_id, m.agent_run_id, m.client_message_id, m.reply_to_message_id, m.created_at,
+	COALESCE(run.model, '')`
 
 const conversationSummaryColumns = `id, conversation_id, summary, pinned_facts,
 	token_estimate, version, updated_at`
@@ -41,10 +49,10 @@ func NewConversationRepository(pool *pgxpool.Pool, ids platformid.Generator) *Co
 // Create inserts one conversation.
 func (r *ConversationRepository) Create(ctx context.Context, conversation version.Conversation) error {
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO conversation (id, version_id, kind, title, status, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO conversation (id, version_id, kind, title, status, model_override, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`, conversation.ID, conversation.VersionID, conversation.Kind, conversation.Title, conversation.Status,
-		conversation.CreatedBy, conversation.CreatedAt, conversation.UpdatedAt)
+		conversation.ModelOverride, conversation.CreatedBy, conversation.CreatedAt, conversation.UpdatedAt)
 	if err != nil {
 		return wrapConversationDB("insert conversation", err)
 	}
@@ -75,6 +83,21 @@ func (r *ConversationRepository) GetByID(ctx context.Context, conversationID int
 	`, conversationID))
 	if err != nil {
 		return version.Conversation{}, wrapConversationDB("get conversation", err)
+	}
+	return conversation, nil
+}
+
+// UpdateModelOverride sets or clears the conversation-level model override and
+// returns the updated row (including its message counters).
+func (r *ConversationRepository) UpdateModelOverride(ctx context.Context, versionID, conversationID int64, modelOverride *string, updatedAt time.Time) (version.Conversation, error) {
+	conversation, err := scanConversation(r.pool.QueryRow(ctx, `
+		UPDATE conversation c
+		SET model_override = $3, updated_at = $4
+		WHERE c.id = $1 AND c.version_id = $2
+		RETURNING `+conversationColumns,
+		conversationID, versionID, modelOverride, updatedAt))
+	if err != nil {
+		return version.Conversation{}, wrapConversationDB("update conversation model override", err)
 	}
 	return conversation, nil
 }
@@ -111,8 +134,10 @@ func (r *ConversationRepository) List(ctx context.Context, versionID int64, kind
 // FindMessageByClientID resolves the idempotency key inside one conversation.
 func (r *ConversationRepository) FindMessageByClientID(ctx context.Context, conversationID int64, clientMessageID string) (*version.Message, error) {
 	message, err := scanMessage(r.pool.QueryRow(ctx, `
-		SELECT `+conversationMessageColumns+` FROM conversation_message
-		WHERE conversation_id = $1 AND client_message_id = $2
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE m.conversation_id = $1 AND m.client_message_id = $2
 	`, conversationID, clientMessageID))
 	if err != nil {
 		return nil, wrapMessageDB("find message by client id", err)
@@ -123,9 +148,11 @@ func (r *ConversationRepository) FindMessageByClientID(ctx context.Context, conv
 // Messages returns messages with id > after in ascending order.
 func (r *ConversationRepository) Messages(ctx context.Context, conversationID int64, after int64, limit int) ([]version.Message, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT `+conversationMessageColumns+` FROM conversation_message
-		WHERE conversation_id = $1 AND id > $2
-		ORDER BY id
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE m.conversation_id = $1 AND m.id > $2
+		ORDER BY m.id
 		LIMIT $3
 	`, conversationID, after, limit)
 	if err != nil {
@@ -219,8 +246,10 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 			return nil, false, fmt.Errorf("post user message: insert was ignored without a client message id")
 		}
 		existing, err := scanMessage(tx.QueryRow(ctx, `
-			SELECT `+conversationMessageColumns+` FROM conversation_message
-			WHERE conversation_id = $1 AND client_message_id = $2
+			SELECT `+conversationMessageSelectColumns+`
+			FROM conversation_message m
+			LEFT JOIN agent_run run ON run.id = m.agent_run_id
+			WHERE m.conversation_id = $1 AND m.client_message_id = $2
 		`, conversationID, *message.ClientMessageID))
 		if err != nil {
 			return nil, false, wrapMessageDB("get existing message", err)
@@ -386,7 +415,7 @@ func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int
 func scanConversation(row rowScanner) (version.Conversation, error) {
 	var conversation version.Conversation
 	if err := row.Scan(&conversation.ID, &conversation.VersionID, &conversation.Kind, &conversation.Title,
-		&conversation.Status, &conversation.CreatedBy, &conversation.CreatedAt, &conversation.UpdatedAt,
+		&conversation.Status, &conversation.ModelOverride, &conversation.CreatedBy, &conversation.CreatedAt, &conversation.UpdatedAt,
 		&conversation.MessageCount, &conversation.LastMessageAt); err != nil {
 		return version.Conversation{}, err
 	}
@@ -398,7 +427,7 @@ func scanMessage(row rowScanner) (version.Message, error) {
 	var parts, refs, tokenUsage []byte
 	if err := row.Scan(&message.ID, &message.ConversationID, &message.Role, &parts, &refs, &tokenUsage,
 		&message.ActorID, &message.AgentRunID, &message.ClientMessageID,
-		&message.ReplyToMessageID, &message.CreatedAt); err != nil {
+		&message.ReplyToMessageID, &message.CreatedAt, &message.ActualModel); err != nil {
 		return version.Message{}, err
 	}
 	if len(parts) > 0 {

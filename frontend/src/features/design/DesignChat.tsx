@@ -18,6 +18,7 @@ import type {
   NewMessagePart,
 } from "@/features/clarification/types"
 import { useConversation } from "@/features/clarification/useConversation"
+import { ModelSelector } from "@/features/conversation/ModelSelector"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -109,6 +110,14 @@ export function DesignChat({
         <div className="ml-auto flex items-center gap-1.5">
           {collapsed ? null : (
             <>
+              {activeConversationId === null ? null : (
+                <ModelSelector
+                  key={activeConversationId}
+                  versionId={versionId}
+                  conversationId={activeConversationId}
+                  modelOverride={active?.model_override ?? null}
+                />
+              )}
               <span data-testid="design-sse-status" className="text-[10px] text-muted-foreground">
                 {SSE_STATUS_LABEL[sseStatus]}
               </span>

@@ -1,9 +1,11 @@
 package versionapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
@@ -13,13 +15,15 @@ import (
 // ---------- response DTOs (OpenAPI P1 Conversation* schemas) ----------
 
 type conversationSummaryDTO struct {
-	ID            string  `json:"id"`
-	Title         string  `json:"title"`
-	Kind          string  `json:"kind"`
-	Status        string  `json:"status"`
-	MessageCount  int     `json:"message_count"`
-	LastMessageAt *string `json:"last_message_at"`
-	CreatedAt     string  `json:"created_at"`
+	ID             string  `json:"id"`
+	Title          string  `json:"title"`
+	Kind           string  `json:"kind"`
+	Status         string  `json:"status"`
+	MessageCount   int     `json:"message_count"`
+	LastMessageAt  *string `json:"last_message_at"`
+	ModelOverride  *string `json:"model_override"`
+	EffectiveModel *string `json:"effective_model"`
+	CreatedAt      string  `json:"created_at"`
 }
 
 type conversationDTO struct {
@@ -34,6 +38,7 @@ type conversationMessageDTO struct {
 	Role           string                `json:"role"`
 	Parts          []version.MessagePart `json:"parts"`
 	Refs           []version.MessageRef  `json:"refs"`
+	ActualModel    *string               `json:"actual_model"`
 	CreatedAt      string                `json:"created_at"`
 }
 
@@ -84,6 +89,39 @@ type MessagePart struct {
 type createConversationRequest struct {
 	Kind  string `json:"kind"`
 	Title string `json:"title"`
+	// ModelOverride is the optional 0.2.1 conversation-level model override;
+	// null/omitted follows the LLM configuration default_model_id.
+	ModelOverride *string `json:"model_override"`
+}
+
+// updateConversationRequest is the PATCH /conversations/{cid} payload. Raw
+// JSON keeps "omitted" (400) distinct from an explicit null (clear the
+// override), matching the contract's required+nullable model_override.
+type updateConversationRequest struct {
+	ModelOverride json.RawMessage `json:"model_override"`
+}
+
+// modelOverride parses the required-but-nullable field. null and "" clear the
+// override; a non-string value or an over-long identifier is a typed 400.
+func (r updateConversationRequest) modelOverride() (*string, error) {
+	if len(r.ModelOverride) == 0 {
+		return nil, platform.Invalid("model_override", "is required; send null to clear the override")
+	}
+	if bytes.Equal(bytes.TrimSpace(r.ModelOverride), []byte("null")) {
+		return nil, nil
+	}
+	var value string
+	if err := json.Unmarshal(r.ModelOverride, &value); err != nil {
+		return nil, platform.Invalid("model_override", "must be a model identifier string or null")
+	}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if len(trimmed) > 128 {
+		return nil, platform.Invalid("model_override", "must be at most 128 characters")
+	}
+	return &trimmed, nil
 }
 
 type postMessageRequest struct {
@@ -109,13 +147,15 @@ func (r postMessageRequest) messageParts() ([]version.MessagePart, error) {
 
 func toConversationSummaryDTO(view versionapp.ConversationView) conversationSummaryDTO {
 	return conversationSummaryDTO{
-		ID:            strconv.FormatInt(view.ID, 10),
-		Title:         view.Title,
-		Kind:          view.Kind,
-		Status:        view.Status,
-		MessageCount:  view.MessageCount,
-		LastMessageAt: formatOptionalTime(view.LastMessageAt),
-		CreatedAt:     formatTime(view.CreatedAt),
+		ID:             strconv.FormatInt(view.ID, 10),
+		Title:          view.Title,
+		Kind:           view.Kind,
+		Status:         view.Status,
+		MessageCount:   view.MessageCount,
+		LastMessageAt:  formatOptionalTime(view.LastMessageAt),
+		ModelOverride:  view.ModelOverride,
+		EffectiveModel: view.EffectiveModel,
+		CreatedAt:      formatTime(view.CreatedAt),
 	}
 }
 
@@ -142,6 +182,7 @@ func toConversationMessageDTO(view versionapp.MessageView) conversationMessageDT
 		Role:           view.Role,
 		Parts:          parts,
 		Refs:           refs,
+		ActualModel:    view.ActualModel,
 		CreatedAt:      formatTime(view.CreatedAt),
 	}
 }

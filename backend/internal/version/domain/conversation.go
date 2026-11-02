@@ -63,6 +63,10 @@ type Conversation struct {
 	Kind          string
 	Title         string
 	Status        string
+	// ModelOverride is the 0.2.1 conversation-level model identifier
+	// (`llm_model.model`). Nil means "use the LLM config default_model_id";
+	// the runtime never switches models on its own (D24).
+	ModelOverride *string
 	CreatedBy     *int64
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
@@ -100,7 +104,11 @@ type Message struct {
 	AgentRunID       *int64
 	ClientMessageID  *string
 	ReplyToMessageID *int64
-	CreatedAt        time.Time
+	// ActualModel is the model that actually generated an assistant message,
+	// read from the linked agent_run. Empty for user messages and for
+	// assistant messages without a run (contracts `actual_model`).
+	ActualModel string
+	CreatedAt   time.Time
 }
 
 // MessagePart is the discriminated union of message parts. The JSON shape is
@@ -280,6 +288,9 @@ type ConversationRepository interface {
 	Create(ctx context.Context, conversation Conversation) error
 	Get(ctx context.Context, versionID, conversationID int64) (Conversation, *ConversationSummary, error)
 	GetByID(ctx context.Context, conversationID int64) (Conversation, error)
+	// UpdateModelOverride sets or clears the conversation-level model override
+	// and bumps updated_at, returning the stored conversation.
+	UpdateModelOverride(ctx context.Context, versionID, conversationID int64, modelOverride *string, updatedAt time.Time) (Conversation, error)
 	List(ctx context.Context, versionID int64, kind string, limit int, beforeID *int64) ([]Conversation, error)
 	FindMessageByClientID(ctx context.Context, conversationID int64, clientMessageID string) (*Message, error)
 	Messages(ctx context.Context, conversationID int64, after int64, limit int) ([]Message, error)

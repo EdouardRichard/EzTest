@@ -40,3 +40,11 @@ type MessageAttachmentRegistrar interface {
 	// message without re-reading the content or re-running extraction.
 	LinkFromMessage(ctx context.Context, versionID, messageID int64, attachmentIDs []int64) error
 }
+
+// ConversationModelCatalog resolves a conversation-level model override against
+// the default LLM configuration's selectable catalog. An empty override resolves
+// the configuration's explicit default_model_id (models[0] is never used,
+// D24). The LLM application service backs it in production.
+type ConversationModelCatalog interface {
+	ResolveConversationModel(ctx context.Context, modelOverride string) (string, error)
+}

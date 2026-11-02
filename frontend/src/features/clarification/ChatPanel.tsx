@@ -8,6 +8,7 @@ import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { ModelSelector } from "@/features/conversation/ModelSelector"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -75,6 +76,14 @@ export function ChatPanel({
           </p>
         </div>
         <div className="ml-auto flex items-center gap-1.5">
+          {conversationId === null ? null : (
+            <ModelSelector
+              key={conversationId}
+              versionId={versionId}
+              conversationId={conversationId}
+              modelOverride={active?.model_override ?? null}
+            />
+          )}
           <span data-testid="sse-status" className="text-[10px] text-muted-foreground">
             {SSE_STATUS_LABEL[sseStatus]}
           </span>
