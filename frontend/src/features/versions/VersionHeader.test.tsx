@@ -1,303 +1,155 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import "@testing-library/jest-dom/vitest"
 
-const mocks = vi.hoisted(() => ({
-  useCaseRuns: vi.fn(),
-}))
+import type { HumanRequest } from "@/features/execution/types"
+import { versionFixture } from "@/features/versions/test-fixtures"
+import { ApiError } from "@/lib/api-client"
 
-vi.mock("@/features/execution/hooks/useExecution", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/features/execution/hooks/useExecution")>()
-  return { ...actual, useCaseRuns: mocks.useCaseRuns }
-})
-
-// The plan panel owns its own data loading; the header test only asserts that
-// the banner action opens it.
-vi.mock("./IncrementalPlanPanel", () => ({
-  IncrementalPlanPanel: ({ versionId }: { versionId: string }) => (
-    <div data-testid="incremental-plan">plan for {versionId}</div>
-  ),
-}))
-
-import type { UseExecutionActionsResult } from "@/features/execution/hooks/useExecution"
-import type { Batch } from "@/features/execution/types"
 import type { Version } from "./types"
-import { VersionHeader, type VersionHeaderExecution } from "./VersionHeader"
 
-const VERSION_ID = "1844674407370955161"
-const ACTIVE_BATCH_ID = "1844674407370955165"
+const api = vi.hoisted(() => ({ reopenVersion: vi.fn() }))
+vi.mock("./api", () => api)
 
-function version(overrides: Partial<Version> = {}): Version {
-  return {
-    id: VERSION_ID,
-    name: "订单系统 2.0",
-    label: "v2.0",
-    description: "",
-    status: "continuing",
-    batch_no: 1,
-    continuePhase: "designing",
-    systemId: 1,
-    environmentId: 2,
-    codeRepositoryId: null,
-    codeBranch: "main",
-    codeBaselineCommit: null,
-    bindings: {
-      system: { id: 1, name: "订单系统", available: true },
-      environment: { id: 2, name: "staging", available: true },
-      codeRepository: null,
-    },
-    requirementCount: 4,
-    clarifiedCount: 4,
-    openQuestionCount: 0,
-    revision: 4,
-    createdBy: 1,
-    updatedBy: 1,
-    createdAt: "2026-10-27T10:00:00Z",
-    updatedAt: "2026-10-27T10:00:00Z",
-    ...overrides,
-  }
+const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+vi.mock("@/features/execution/api", () => executionApi)
+
+import { VersionHeader } from "./VersionHeader"
+
+const openRequest: HumanRequest = {
+  id: "9501",
+  version_id: "2001",
+  case_run_id: "9301",
+  kind: "login_takeover",
+  status: "open",
+  payload: {
+    reason: "需要输入短信验证码",
+    version_sut_id: "3001",
+    account_role: "buyer",
+    page_url: "https://order.test/login",
+    challenge_kind: "sms",
+  },
+  expires_at: "2026-11-01T08:00:00Z",
+  created_at: "2026-11-01T07:00:00Z",
 }
 
-function batchFixture(overrides: Partial<Batch> = {}): Batch {
-  return {
-    id: ACTIVE_BATCH_ID,
-    version_id: VERSION_ID,
-    batch_no: 2,
-    status: "running",
-    paused: false,
-    pause_mode: "",
-    pause_reason: "",
-    baseline_hash: "a".repeat(64),
-    code_baseline_commit: null,
-    head_commit: null,
-    counts: {
-      total: 3,
-      passed: 1,
-      failed: 0,
-      blocked: 0,
-      inconclusive: 0,
-      skipped: 0,
-      interrupted: 0,
-    },
-    created_by: "1",
-    started_at: "2026-10-28T00:00:00Z",
-    finished_at: null,
-    failure_reason: "",
-    ...overrides,
-  }
+const runningVersion: Version = {
+  ...versionFixture,
+  pending_design_count: 2,
 }
 
-function actions(): UseExecutionActionsResult {
-  return {
-    createBatch: vi.fn(),
-    pause: vi.fn(),
-    resume: vi.fn(),
-    cancel: vi.fn(),
-    rerun: vi.fn(),
-    exportReport: vi.fn(),
-    pending: "",
-    error: "",
-    clearError: vi.fn(),
-  }
+const completedVersion: Version = {
+  ...versionFixture,
+  status: "completed",
+  closed_at: "2026-11-01T03:00:00Z",
+  close_reason: "需求全部闭环，报告已发布",
 }
 
-function execution(activeBatch: Batch | null = null): VersionHeaderExecution {
-  return {
-    batches: activeBatch === null ? [] : [activeBatch],
-    activeBatch,
-    selectedBatchId: activeBatch?.id ?? "",
-    stream: { events: [], status: "live", reconnect: vi.fn() },
-    actions: actions(),
-    onBatchChange: vi.fn(),
-    onOpenReport: vi.fn(),
-    onOpenSessions: vi.fn(),
-    onOpenResults: vi.fn(),
-  }
+const reopenedVersion: Version = {
+  ...completedVersion,
+  status: "running",
+  closed_at: null,
+  close_reason: null,
 }
 
-describe("VersionHeader continuing state", () => {
+describe("VersionHeader", () => {
   beforeEach(() => {
-    mocks.useCaseRuns.mockReturnValue({ caseRuns: [] })
+    api.reopenVersion.mockReset()
+    executionApi.listHumanRequests.mockReset()
+    executionApi.listHumanRequests.mockResolvedValue([openRequest])
   })
 
   afterEach(cleanup)
 
-  it("shows the continuing badge, banner, change entry and plan action", () => {
-    const onAddRequirement = vi.fn()
-    const onViewChanges = vi.fn()
-    render(
-      <VersionHeader
-        version={version()}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={onAddRequirement}
-        onViewChanges={onViewChanges}
-        execution={execution()}
-      />,
+  it("renders the status badge, SUT chips, chain link, todo count and pending-design entry", async () => {
+    render(<VersionHeader version={runningVersion} onOpenTodo={vi.fn()} onReopened={vi.fn()} />)
+
+    expect(screen.getByRole("heading", { name: runningVersion.title })).toBeInTheDocument()
+    expect(screen.getByText("运行中")).toBeInTheDocument()
+    expect(screen.getByText("订单中心")).toBeInTheDocument()
+    expect(screen.getByText("支付网关")).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "查看探索链路" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=chain",
     )
 
-    const badge = screen.getByTestId("continuing-badge")
-    expect(badge.textContent).toContain("继续中（第 2 批）")
+    const todo = screen.getByTestId("version-todo-entry")
+    await waitFor(() => expect(todo).toHaveTextContent("1"))
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
 
-    const banner = screen.getByTestId("continuing-banner")
-    expect(banner.textContent).toContain("继续中（第 2 批）")
-    expect(screen.getByTestId("continue-phase-label").textContent).toContain("增量设计")
-
-    fireEvent.click(screen.getByRole("button", { name: "新增需求" }))
-    expect(onAddRequirement).toHaveBeenCalledTimes(1)
-
-    fireEvent.click(screen.getByTestId("view-changes-btn"))
-    expect(onViewChanges).toHaveBeenCalledTimes(1)
-
-    fireEvent.click(screen.getByRole("button", { name: "查看增量计划" }))
-    expect(screen.getByTestId("incremental-plan")).toBeTruthy()
+    const pending = screen.getByTestId("version-pending-design")
+    expect(pending).toHaveTextContent("2 条待设计")
+    expect(pending).toHaveAttribute("href", "/versions/2001?tab=design")
+    expect(screen.queryByRole("button", { name: "重新打开" })).not.toBeInTheDocument()
   })
 
-  it("uses the active batch number instead of batch_no + 1 while a batch is running", () => {
-    render(
-      <VersionHeader
-        version={version({ continuePhase: "executing", batch_no: 2 })}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={vi.fn()}
-        execution={execution(batchFixture({ batch_no: 2 }))}
-      />,
-    )
+  it("opens the todo drawer through the header entry", async () => {
+    const onOpenTodo = vi.fn()
+    render(<VersionHeader version={runningVersion} onOpenTodo={onOpenTodo} />)
 
-    expect(screen.getByTestId("continuing-badge").textContent).toContain("继续中（第 2 批）")
-    expect(screen.getByTestId("continuing-banner").textContent).toContain("继续中（第 2 批）")
+    fireEvent.click(screen.getByTestId("version-todo-entry"))
+
+    expect(onOpenTodo).toHaveBeenCalledTimes(1)
   })
 
-  it("maps the server-shaped VersionDTO keys batch_no/pause_mode without renaming", () => {
-    // getVersion returns the wire DTO verbatim: the P6 fields are snake_case.
-    const serverVersion: Version = {
-      id: VERSION_ID,
-      name: "订单系统 2.0",
-      label: "v2.0",
-      description: "",
-      status: "continuing",
-      paused: true,
-      pause_mode: "graceful",
-      batch_no: 3,
-      continuePhase: "clarifying",
-      continuedAt: null,
-      systemId: null,
-      environmentId: null,
-      codeRepositoryId: null,
-      codeBranch: null,
-      codeBaselineCommit: null,
-      bindings: { system: null, environment: null, codeRepository: null },
-      requirementCount: 4,
-      clarifiedCount: 4,
-      openQuestionCount: 0,
-      revision: 5,
-      createdBy: 1,
-      updatedBy: 1,
-      createdAt: "2026-10-27T10:00:00Z",
-      updatedAt: "2026-10-27T10:00:00Z",
-    }
+  it("shows initial status without closed information", async () => {
+    render(<VersionHeader version={{ ...versionFixture, status: "initial" }} />)
 
-    render(
-      <VersionHeader
-        version={serverVersion}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={vi.fn()}
-      />,
-    )
-
-    expect(screen.getByTestId("continuing-badge").textContent).toContain("继续中（第 4 批）")
+    expect(screen.getByText("初始")).toBeInTheDocument()
+    expect(screen.queryByTestId("version-closed-info")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "重新打开" })).not.toBeInTheDocument()
   })
 
-  it("offers the add-requirement entry but no continuing badge on a completed version", () => {
-    const onAddRequirement = vi.fn()
-    render(
-      <VersionHeader
-        version={version({ status: "completed", continuePhase: null, batch_no: 2 })}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={onAddRequirement}
-        execution={execution()}
-      />,
+  it("shows closed metadata and reopens a completed version with a required reason", async () => {
+    api.reopenVersion.mockResolvedValue(reopenedVersion)
+    const onReopened = vi.fn()
+
+    render(<VersionHeader version={completedVersion} onReopened={onReopened} />)
+
+    expect(screen.getByText("已完成")).toBeInTheDocument()
+    const closed = screen.getByTestId("version-closed-info")
+    expect(closed).toHaveTextContent("2026-11-01")
+    expect(closed).toHaveTextContent(completedVersion.close_reason ?? "")
+
+    fireEvent.click(screen.getByRole("button", { name: "重新打开" }))
+    const dialog = await screen.findByRole("dialog", { name: "重新打开版本" })
+    const submit = within(dialog).getByRole("button", { name: "重新打开" })
+    expect(submit).toBeDisabled()
+
+    fireEvent.change(within(dialog).getByLabelText("重开原因"), {
+      target: { value: "需要补充一个用例" },
+    })
+    expect(submit).not.toBeDisabled()
+    fireEvent.click(submit)
+
+    await waitFor(() =>
+      expect(api.reopenVersion).toHaveBeenCalledWith("2001", { reason: "需要补充一个用例" }),
     )
-
-    expect(screen.queryByTestId("continuing-badge")).toBeNull()
-    expect(screen.queryByTestId("continuing-banner")).toBeNull()
-    expect(screen.queryByTestId("view-changes-btn")).toBeNull()
-
-    fireEvent.click(screen.getByRole("button", { name: "新增需求" }))
-    expect(onAddRequirement).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(onReopened).toHaveBeenCalledWith(reopenedVersion))
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "重新打开版本" })).not.toBeInTheDocument()
+    })
   })
 
-  it("disables pause when the continuing version has no active batch", () => {
-    render(
-      <VersionHeader
-        version={version()}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={vi.fn()}
-        execution={execution()}
-      />,
+  it("keeps the reopen dialog open and shows the API error", async () => {
+    api.reopenVersion.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "state_conflict",
+        message: "版本状态已变化",
+        requestId: "req_reopen",
+      }),
     )
 
-    const pause = screen.getByTestId("exec-pause-btn") as HTMLButtonElement
-    expect(pause.disabled).toBe(true)
-  })
+    render(<VersionHeader version={completedVersion} />)
+    fireEvent.click(screen.getByRole("button", { name: "重新打开" }))
+    const dialog = await screen.findByRole("dialog", { name: "重新打开版本" })
+    fireEvent.change(within(dialog).getByLabelText("重开原因"), {
+      target: { value: "再次打开" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "重新打开" }))
 
-  it("enables pause while the continuing version has a running batch", () => {
-    render(
-      <VersionHeader
-        version={version({ continuePhase: "executing" })}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={vi.fn()}
-        execution={execution(batchFixture())}
-      />,
-    )
-
-    const pause = screen.getByTestId("exec-pause-btn") as HTMLButtonElement
-    expect(pause.disabled).toBe(false)
-    expect(screen.getByTestId("continuing-banner").textContent).toContain("增量执行")
-  })
-
-  it("stacks the paused overlay and only offers the add-requirement entry", () => {
-    render(
-      <VersionHeader
-        version={version({ paused: true, continuePhase: "executing" })}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={vi.fn()}
-        execution={execution(batchFixture({ paused: true, pause_mode: "graceful" }))}
-      />,
-    )
-
-    expect(screen.getByTestId("continuing-banner").textContent).toContain("已暂停")
-    expect(screen.getByRole("button", { name: "新增需求" })).toBeTruthy()
-    // The paused banner owns resume; pause is not offered a second time.
-    expect(screen.queryByTestId("exec-pause-btn")).toBeNull()
-    expect(screen.getByTestId("exec-resume-btn")).toBeTruthy()
-  })
-
-  it("hides the continuing and add-requirement entries before completion", () => {
-    render(
-      <VersionHeader
-        version={version({ status: "designing", continuePhase: null })}
-        refreshing={false}
-        onRefresh={vi.fn()}
-        onUpdated={vi.fn()}
-        onAddRequirement={vi.fn()}
-        execution={execution()}
-      />,
-    )
-
-    expect(screen.queryByTestId("continuing-badge")).toBeNull()
-    expect(screen.queryByTestId("add-requirement-btn")).toBeNull()
-    expect(screen.queryByTestId("view-changes-btn")).toBeNull()
+    expect(await within(dialog).findByText("版本状态已变化")).toBeInTheDocument()
+    expect(screen.getByRole("dialog", { name: "重新打开版本" })).toBeInTheDocument()
   })
 })

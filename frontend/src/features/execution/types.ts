@@ -1,316 +1,359 @@
 /**
- * Shared DTOs for the P6 execution API (spec §6.2, §6.3, §6.4).
+ * Wire types for the P3 execution workspace.
  *
- * Every execution-owned identifier is a 64-bit Snowflake serialized as a
- * decimal string. IDs must never be converted with `Number()`: values above
- * `Number.MAX_SAFE_INTEGER` would silently lose precision.
+ * Field names are pinned by the approved P3 spec §9.3 (`ExecutionOverview`,
+ * `RunWaveView`, `CaseRunView`, `CaseRunDetail`, `EvidenceView`,
+ * `HumanRequestView`, `IntentView`) and §10.1 (events). IDs are decimal
+ * strings, timestamps RFC3339 UTC, list endpoints use
+ * `{data, next_cursor, has_more}` and detail endpoints use `{data: ...}`.
  */
 
-/** Run batch statuses (spec §5.1, DDL `run_batch.status`). */
-export type BatchStatus = "planned" | "running" | "done" | "failed" | "cancelled"
+/* ---------------------------------- enums ---------------------------------- */
 
-/**
- * Batch provenance (spec §5.3/§7.7). A P6 historical batch without a stored
- * kind reads as `baseline` (the backend applies the same default).
- */
-export type BatchKind = "baseline" | "incremental" | "supplement"
-
-/** Pause modes accepted by `POST .../pause` (spec §5.4). */
-export type PauseMode = "graceful" | "immediate"
-
-/** Case run statuses (spec §5.8). */
+/** Four-state verdicts plus the P3 process states (spec §4.3). */
 export type CaseRunStatus =
   | "pending"
   | "running"
+  | "paused"
   | "passed"
   | "failed"
   | "blocked"
   | "inconclusive"
   | "skipped"
   | "interrupted"
+  | "superseded"
 
-/** Failure classes of a non-passed case run (spec §5.8). `flaky` is derived. */
-export type FailureClass = "application" | "environment" | "session" | "model" | "case"
+/** The four terminal verdicts (spec §4.3: 四态). */
+export type CaseRunVerdict = "passed" | "failed" | "blocked" | "inconclusive"
 
-/** Step result statuses (spec §5.4). */
-export type StepStatus = "pending" | "running" | "passed" | "failed" | "interrupted"
+/** Wave lifecycle (spec §4.2). */
+export type WaveStatus = "planned" | "running" | "paused" | "done" | "failed" | "cancelled"
 
-/** Assertion-level verdict; distinct from the case-level four-state verdict. */
-export type AssertionVerdict = "passed" | "failed" | "not_run"
+export type WaveTrigger = "auto" | "manual" | "retest"
 
-/**
- * Stable `details.reason` values of spec §6.4. The union keeps the Chinese
- * message map exhaustive: a new reason fails typecheck until it has copy.
- */
-export type ExecutionErrorReason =
-  | "version_not_executable"
-  | "baseline_required"
-  | "baseline_changed"
-  | "batch_active"
-  | "no_cases"
-  | "too_many_cases"
-  | "invalid_case_ids"
-  | "environment_required"
-  | "batch_finished"
-  | "already_paused"
-  | "not_paused"
-  | "case_run_terminal"
-  | "evidence_missing"
-  | "executor_unavailable"
-  | "session_unavailable"
-  | "unsupported_assertion_kind"
-  | "export_failed"
-  | "auth_flow_invalid"
-  | "takeover_required"
+export type PauseMode = "graceful" | "immediate"
 
-/** Per-status counters of one batch (spec §6.3). */
-export type BatchCounts = {
+/** Failure classification (spec §4.5) plus the empty no-class value. */
+export type FailureClass =
+  | ""
+  | "application"
+  | "environment"
+  | "session"
+  | "model"
+  | "automation"
+  | "timeout"
+  | "executor_lost"
+  | "blocked"
+  | "unknown"
+
+export type IntentPurpose = "initial" | "retest" | "manual"
+
+export type IntentStatus =
+  | "open"
+  | "claimed"
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled"
+  | "superseded"
+
+export type HumanRequestKind = "login_takeover" | "conflict" | "other"
+
+export type HumanRequestStatus = "open" | "resolved" | "cancelled" | "expired"
+
+export type EvidenceKind =
+  | "screenshot"
+  | "snapshot"
+  | "console"
+  | "network"
+  | "http"
+  | "db"
+  | "download"
+  | "text"
+  | "visual_actual"
+  | "visual_diff"
+
+export type StepResultStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "skipped"
+
+export type AssertionKind = "ui" | "api" | "db" | "text" | "visual"
+
+export type AssertionVerdict = "passed" | "failed" | "inconclusive" | "skipped"
+
+export type ExecutorStatus = "active" | "draining" | "offline"
+
+/* ---------------------------------- counts --------------------------------- */
+
+/** `run_wave.counts` (spec §5.6). */
+export type WaveCounts = {
   total: number
+  pending: number
+  running: number
+  paused: number
   passed: number
   failed: number
   blocked: number
   inconclusive: number
   skipped: number
   interrupted: number
+  superseded: number
+  evidence: number
+  /** Per-version-SUT projection keyed by decimal `version_sut_id`. */
+  by_version_sut?: Record<string, SutWaveCounts>
 }
 
-/** `BatchDTO` of spec §6.3 plus the P7 chain fields of spec §7.7. */
-export type Batch = {
+/** The per-SUT counters the spec §5.6 example pins. */
+export type SutWaveCounts = {
+  total: number
+  passed: number
+  failed: number
+  blocked: number
+  inconclusive: number
+}
+
+/** Version-wide case-run projection (no `evidence`/`by_version_sut` keys). */
+export type CaseRunCounts = {
+  total: number
+  pending: number
+  running: number
+  paused: number
+  passed: number
+  failed: number
+  blocked: number
+  inconclusive: number
+  skipped: number
+  interrupted: number
+  superseded: number
+}
+
+/* --------------------------------- overview -------------------------------- */
+
+export type ExecutionQuotas = {
+  global: number
+  per_sut: number
+  cross_system: number
+}
+
+/** `executor` block of `GET /api/versions/{id}/execution/overview`. */
+export type ExecutorStatusView = {
+  id?: string | null
+  status: ExecutorStatus
+  endpoint: string
+  capacity: number
+  active_contexts: number
+  last_heartbeat: string | null
+  version: string
+}
+
+/** `ExecutionOverview` (spec §9.3). Empty state is valid (no active wave). */
+export type ExecutionOverview = {
+  version_id: string
+  active_wave: RunWave | null
+  counts: WaveCounts
+  case_run_counts: CaseRunCounts
+  open_human_requests: number
+  executor: ExecutorStatusView | null
+  quotas: ExecutionQuotas
+  human_request_timeout_seconds: number
+}
+
+/* ----------------------------------- wave ---------------------------------- */
+
+/** `RunWaveView` (spec §9.3). */
+export type RunWave = {
   id: string
   version_id: string
-  batch_no: number
-  status: BatchStatus
-  /** P7 provenance; absent on a P6 historical row (reads as `baseline`). */
-  kind?: BatchKind
-  /** Parent batch of a supplement/incremental batch, as a decimal string. */
-  parentBatchId?: string | null
-  paused: boolean
-  pause_mode: PauseMode | ""
-  pause_reason: string
-  baseline_hash: string
-  code_baseline_commit: string | null
-  head_commit: string | null
-  counts: BatchCounts
-  created_by: string
+  status: WaveStatus
+  trigger: WaveTrigger
+  counts: WaveCounts
   started_at: string | null
   finished_at: string | null
-  failure_reason: string
-  created_at?: string
-  updated_at?: string
-}
-
-/** Filters accepted by `GET /api/versions/{id}/batches`. */
-export type BatchQuery = {
-  status?: BatchStatus
-  limit?: number
-  cursor?: string
-}
-
-/** Body of `POST /api/versions/{id}/batches`; omitted `caseIds` means all cases. */
-export type CreateBatchBody = {
-  caseIds?: string[]
-}
-
-/** The P1 session a case run executed under (credential-free projection). */
-export type CaseRunSession = {
-  id: string
-  account: string
-  state: string
-}
-
-/** Resume checkpoint of an interrupted/paused case run (spec §5.4). */
-export type CaseCheckpoint = {
-  completed_seqs: number[]
-  cleanup_required: boolean
-  interrupted_step_seq: number | null
-}
-
-/** One recorded step of a case run (spec §6.3). */
-export type StepResultView = {
-  id?: string
-  seq: number
-  action: string
-  expected: string
-  actual: string
-  status: StepStatus
-  evidence_ids: string[]
-  started_at?: string | null
-  finished_at?: string | null
-}
-
-/** One recorded assertion outcome (spec §6.3). */
-export type AssertionView = {
-  id: string
-  kind: string
-  target: string
-  expected: string
-  actual: string
-  verdict: AssertionVerdict
-  evidence_ids: string[]
-  step_seq?: number
-  failure_reason?: string
-}
-
-/** Evidence summary embedded in a case run / report (spec §6.3). */
-export type EvidenceView = {
-  id: string
-  kind: string
-  mime: string
-  size_bytes: number
-  sha256: string
-}
-
-/** Evidence metadata returned by `GET .../evidence/{evidenceId}/meta`. */
-export type EvidenceMeta = EvidenceView & {
-  batch_id?: string
-  case_run_id?: string | null
-  step_result_id?: string | null
-  metadata: Record<string, unknown>
+  paused_at: string | null
+  pause_mode: PauseMode | ""
+  pause_reason: string
   created_at: string
 }
 
-/** Waiting human takeover attached to a case run (spec §5.9, §9.3). */
-export type PendingTakeover = {
-  id: string
-  reason: string
-  instructions: Record<string, unknown>
-  expires_at: string
-  account?: string | null
-  system?: string | null
+/* --------------------------------- case run -------------------------------- */
+
+/** `case_run.summary` fields the UI reads; unknown keys are ignored. */
+export type CaseRunSummary = {
+  verdict_reason?: string
+  assertion_total?: number
+  assertion_failed?: number
+  step_total?: number
+  step_failed?: number
+  evidence_count?: number
+  human_request_id?: string | null
+  /** P5 visual counters (spec §7.3); `visual_skipped` stays compatible. */
+  visual_skipped?: number
+  visual_passed?: number
+  visual_failed?: number
+  visual_inconclusive?: number
 }
 
-/** `CaseRunDTO` detail of spec §6.3. List responses may omit the detail arrays. */
+/** `CaseRunView` (spec §9.3). */
 export type CaseRun = {
   id: string
-  batch_id: string
-  case_node_id: string
-  case_revision: number
-  attempt: number
-  status: CaseRunStatus
-  failure_class: FailureClass | null
-  failure_reason: string
-  summary: string
-  duration_ms: number
+  wave_id: string
+  intent_id: string
+  case_id: string
+  case_version_id: string
   title: string
-  session: CaseRunSession | null
-  checkpoint: CaseCheckpoint
-  steps: StepResultView[]
-  assertions: AssertionView[]
-  evidence: EvidenceView[]
-  pending_takeover: PendingTakeover | null
-  agent_run_id?: string | null
-  agent_session_id?: string | null
-  retry_of_case_run_id?: string | null
-  started_at?: string | null
-  finished_at?: string | null
-}
-
-/** Filters accepted by `GET .../case-runs`. */
-export type CaseRunQuery = {
-  status?: CaseRunStatus
-  limit?: number
-  cursor?: string
-}
-
-/** Batch identity embedded in a report (spec §6.3). */
-export type ReportBatch = {
-  id: string
-  batch_no: number
-  status: BatchStatus
-  baseline_hash: string
-  code_baseline_commit: string | null
-}
-
-/** Aggregated report counters (spec §6.3). */
-export type ReportSummary = {
-  case_count: number
-  by_status: Partial<Record<CaseRunStatus, number>>
-  by_failure_class: Partial<Record<FailureClass, number>>
-  flaky_case_ids: string[]
-  duration_ms: number
+  status: CaseRunStatus
+  failure_class: FailureClass
+  attempts: number
+  summary: CaseRunSummary
+  started_at: string | null
+  finished_at: string | null
+  version_sut_ids: string[]
   evidence_count: number
 }
 
-/** One case row of the report (spec §6.3). */
-export type ReportCase = {
-  case_run_id: string
-  case_node_id: string
-  title: string
-  status: CaseRunStatus
-  failure_class: FailureClass | null
-  steps: number
-  assertions: number
-  evidence: number
-  duration_ms: number
+/** `step_result.observed` (spec §4.4). */
+export type StepObserved = {
+  summary?: string
+  output?: string
+  [key: string]: unknown
 }
 
-/** Environment identity the batch executed against. */
-export type ReportEnvironment = {
-  system: string
-  environment: string
-  base_url: string
+export type StepResult = {
+  seq: number
+  target_version_sut_id: string | null
+  status: StepResultStatus
+  observed: StepObserved
+  error: string
+  started_at: string | null
+  finished_at: string | null
 }
 
-/** `ReportDTO` of spec §6.3 — the Batch 1 report derived at read time. */
-export type ReportView = {
-  batch: ReportBatch
-  summary: ReportSummary
-  cases: ReportCase[]
-  environment: ReportEnvironment
-  generated_at: string
+export type AssertionResult = {
+  step_seq: number
+  assertion_seq: number
+  kind: AssertionKind
+  verdict: AssertionVerdict
+  expected: string
+  actual: string
+  reason: string
+  target_version_sut_id: string | null
 }
 
-/** Report export formats; P6 only ships server-rendered Markdown (spec §6.2). */
-export type ReportFormat = "markdown"
-
-/** A downloaded report plus the filename advertised by `Content-Disposition`. */
-export type ReportDownload = {
-  blob: Blob
-  filename: string
-}
-
-/**
- * One execution Agent session of the version channel. The P1 projection may
- * omit the current-case fields, so they stay optional and nullable.
- */
-export type ExecutionSession = {
+/** `EvidenceView` / the evidence summary embedded in `CaseRunDetail`. */
+export type Evidence = {
   id: string
-  channel: string
-  title: string
-  status: string
-  running: boolean
-  agent_role?: string | null
-  profile_key?: string
-  current_case_run_id?: string | null
-  case_node_id?: string | null
-  case_title?: string | null
-  last_activity_at?: string | null
-  created_at?: string
-  updated_at?: string
+  case_run_id: string
+  version_sut_id: string | null
+  step_seq?: number | null
+  assertion_seq?: number | null
+  kind: EvidenceKind
+  sha256: string
+  size_bytes: number
+  mime: string
+  filename: string
+  created_at: string
 }
 
-/** Filters accepted by `GET .../execution/sessions`. */
-export type ExecutionSessionQuery = {
-  channel?: string
+/** `CaseRunDetail` (spec §9.3): run + step/assertion/evidence snapshot. */
+export type CaseRunDetail = {
+  case_run: CaseRun
+  steps: StepResult[]
+  assertions: AssertionResult[]
+  evidence: Evidence[]
+}
+
+/* ------------------------------- human request ----------------------------- */
+
+export type HumanRequestPayload = {
+  reason: string
+  /** Nullable in the contract when the request is not tied to one SUT. */
+  version_sut_id?: string | null
+  account_role: string
+  page_url: string
+  challenge_kind: string
+  evidence_id?: string | null
+}
+
+/** `ResolveHumanRequestRequest.response` (the code is never echoed back). */
+export type HumanRequestResponseInput = {
+  code?: string
+  note?: string
+}
+
+/** `HumanRequestResponseView`: P3 only echoes the note summary (spec §4.7). */
+export type HumanRequestResponseView = {
+  note?: string
+}
+
+/** `HumanRequestView` (spec §9.3). The response never echoes the plaintext code. */
+export type HumanRequest = {
+  id: string
+  version_id: string
+  case_run_id: string | null
+  kind: HumanRequestKind
+  status: HumanRequestStatus
+  payload: HumanRequestPayload
+  response?: HumanRequestResponseView | null
+  expires_at: string
+  resolved_by?: string | null
+  resolved_at?: string | null
+  created_at: string
+}
+
+/* ---------------------------------- intent --------------------------------- */
+
+/** `IntentView` (spec §9.3). */
+export type Intent = {
+  id: string
+  version_id: string
+  case_version_id: string
+  case_id?: string | null
+  case_title: string
+  version_sut_ids: string[]
+  purpose: IntentPurpose
+  status: IntentStatus
+  attempt_no: number
+  created_at: string
+}
+
+/* --------------------------------- requests -------------------------------- */
+
+export type PauseWaveInput = {
+  mode: PauseMode
+  reason?: string
+}
+
+/** Case-level pause is immediate-only in the frozen contract (spec §5.7). */
+export type PauseCaseRunInput = {
+  mode: "immediate"
+}
+
+export type CreateIntentInput = {
+  case_version_id: string
+  purpose: "retest" | "manual"
+}
+
+export type WaveListOptions = {
+  before?: string
   limit?: number
-  cursor?: string
 }
 
-/**
- * The eight P7 event types of spec §8.1 that can change the execution
- * projection. The backend serializes every ID in their refs/detail as a
- * decimal string (D29); the UI only uses them as refetch triggers.
- */
-export const P7_EVENT_TYPES = [
-  "case.supplemented",
-  "case.revalidation_marked",
-  "issue.created",
-  "issue.updated",
-  "report.published",
-  "report.stale",
-  "analysis.started",
-  "analysis.finished",
-] as const
+export type CaseRunListOptions = WaveListOptions & {
+  status?: CaseRunStatus
+}
 
-/** Union of the P7 event type strings (spec §8.1/§8.3). */
-export type P7EventType = (typeof P7_EVENT_TYPES)[number]
+export type EvidenceListOptions = {
+  caseRunId?: string
+  versionSutId?: string
+  kind?: EvidenceKind
+  before?: string
+  limit?: number
+}
+
+export type IntentListOptions = {
+  status?: IntentStatus
+  before?: string
+  limit?: number
+}
+
+export type HumanRequestListOptions = {
+  status?: HumanRequestStatus
+}

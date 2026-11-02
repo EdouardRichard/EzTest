@@ -1,313 +1,291 @@
-// Package domain holds the evaluation-run aggregate of the P8 quality platform
-// (design spec §9.1/D61): the corpus metrics, their deterministic/report
-// thresholds, the regression rule and the persisted run shape. It has no
-// infrastructure or HTTP dependency.
-package domain
+// Package quality contains the P6 quality domain: the real-LLM evaluation
+// sample, the 6+1 metric derivation with report thresholds and baseline
+// regression marking, and the operational-metric read model. It is pure: no
+// I/O, no storage and no dependency on another bounded context.
+package quality
 
 import (
 	"errors"
-	"fmt"
-	"time"
+	"math"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// Mode is the evaluation track. The deterministic track is the regression gate;
-// the real-LLM track is a gated report that never blocks a release (D61).
-type Mode string
+// EvalMode is the only evaluation track of P6. The deterministic fake-LLM
+// track of 0.1 P8 is intentionally not implemented (spec §5.4/P6-D-12).
+const EvalModeRealLLM = "real_llm"
 
+// Terminal statuses of one eval run (contracts/openapi.yaml EvalRunView).
 const (
-	// ModeDeterministic runs the fixed corpus against the deterministic fake LLM
-	// and executor; its metrics and baseline regression rule are the CI gate.
-	ModeDeterministic Mode = "deterministic"
-	// ModeRealLLM records a real-model report. Its thresholds are report-only.
-	ModeRealLLM Mode = "real_llm"
+	StatusRunning = "running"
+	StatusPassed  = "passed"
+	StatusFailed  = "failed"
+	StatusError   = "error"
 )
 
-// Status is the terminal state of one eval run.
-type Status string
-
+// Metric names of spec §5.3. The impact KPI reports recall and precision
+// separately; the optional visual metric is the "+1".
 const (
-	// StatusRunning is kept for compatibility with the migration CHECK; the
-	// runner posts only terminal runs.
-	StatusRunning Status = "running"
-	// StatusPassed means every metric cleared its threshold and regression rule.
-	StatusPassed Status = "passed"
-	// StatusFailed means at least one metric failed.
-	StatusFailed Status = "failed"
-	// StatusError means the scenario itself could not be evaluated; no metric is
-	// invented for it.
-	StatusError Status = "error"
+	MetricDesignCoverage               = "design_coverage"
+	MetricImpactRecall                 = "impact_recall"
+	MetricImpactPrecision              = "impact_precision"
+	MetricClassificationAccuracy       = "classification_accuracy"
+	MetricIssueFalsePositiveRate       = "issue_false_positive_rate"
+	MetricSupplementHitRate            = "supplement_hit_rate"
+	MetricVisualClassificationAccuracy = "visual_classification_accuracy"
 )
 
-// Metric names of design spec §9.1. The impact KPI reports recall and precision
-// separately; the dashboard groups them as one row.
+// Real-LLM report thresholds of spec §5.3. They are observable quality
+// signals only; they never block the phase acceptance (P6-D-12).
 const (
-	MetricDesignCoverage         = "design_coverage"
-	MetricImpactRecall           = "impact_recall"
-	MetricImpactPrecision        = "impact_precision"
-	MetricClassificationAccuracy = "classification_accuracy"
-	MetricIssueFalsePositiveRate = "issue_false_positive_rate"
-	MetricSupplementHitRate      = "supplement_hit_rate"
+	ThresholdDesignCoverage               = 0.80
+	ThresholdImpactRecall                 = 0.70
+	ThresholdImpactPrecision              = 0.60
+	ThresholdClassificationAccuracy       = 0.80
+	ThresholdIssueFalsePositiveRate       = 0.15
+	ThresholdSupplementHitRate            = 0.50
+	ThresholdVisualClassificationAccuracy = 0.80
 )
 
-// Metric failure reasons recorded in the metric detail document.
+// Metric failure reasons recorded in MetricDetail (contract enum).
 const (
-	MetricReasonOK                 = "ok"
-	MetricReasonBelowThreshold     = "below_threshold"
-	MetricReasonAboveThreshold     = "above_threshold"
-	MetricReasonBaselineRegression = "baseline_regression"
+	ReasonOK                 = "ok"
+	ReasonBelowThreshold     = "below_threshold"
+	ReasonAboveThreshold     = "above_threshold"
+	ReasonBaselineRegression = "baseline_regression"
 )
 
-// RegressionTolerance is the §9.1 rule: no deterministic metric may fall more
-// than 0.05 below the committed baseline.
-const RegressionTolerance = 0.05
+// DefaultRegressionTolerance is the settings default of
+// quality.eval_baseline_regression (contracts/settings.md).
+const DefaultRegressionTolerance = 0.05
 
-// comparisonEpsilon absorbs binary floating error around exact thresholds; it
+// comparisonEpsilon absorbs binary floating error around exact thresholds. It
 // is far below the NUMERIC(8,5) precision of the stored values.
 const comparisonEpsilon = 1e-9
 
-// Threshold is one metric's acceptance rule. Max marks a metric that must stay
-// at or below Value (the issue false-positive rate); every other metric must
-// stay at or above it.
-type Threshold struct {
-	Value float64
-	Max   bool
-}
+// ErrNotFound is returned by the eval repository when a run does not exist. The
+// application service maps it onto the shared 404 envelope.
+var ErrNotFound = errors.New("quality: eval run not found")
 
-// DeterministicThresholds are the hard gate thresholds of spec §9.1.
-var DeterministicThresholds = map[string]Threshold{
-	MetricDesignCoverage:         {Value: 0.90},
-	MetricImpactRecall:           {Value: 0.90},
-	MetricImpactPrecision:        {Value: 0.80},
-	MetricClassificationAccuracy: {Value: 1.00},
-	MetricIssueFalsePositiveRate: {Value: 0.05, Max: true},
-	MetricSupplementHitRate:      {Value: 0.80},
-}
-
-// RealLLMThresholds are the report-only thresholds of spec §9.1. The impact
-// precision value is a reporting guideline because the spec lists only recall
-// as a real-LLM report threshold; it never gates a release.
-var RealLLMThresholds = map[string]Threshold{
-	MetricDesignCoverage:         {Value: 0.80},
-	MetricImpactRecall:           {Value: 0.70},
-	MetricImpactPrecision:        {Value: 0.60},
-	MetricClassificationAccuracy: {Value: 0.80},
-	MetricIssueFalsePositiveRate: {Value: 0.15, Max: true},
-	MetricSupplementHitRate:      {Value: 0.50},
-}
-
-// ThresholdsFor returns the threshold table of a mode. An unknown mode returns
-// the deterministic table (callers validate the mode before evaluation).
-func ThresholdsFor(mode Mode) map[string]Threshold {
-	if mode == ModeRealLLM {
-		return RealLLMThresholds
-	}
-	return DeterministicThresholds
-}
-
-// IsValid reports whether mode is one of the two documented tracks.
-func (m Mode) IsValid() bool {
-	return m == ModeDeterministic || m == ModeRealLLM
-}
-
-// IsTerminal reports whether status is one of the persisted terminal states.
-func (s Status) IsTerminal() bool {
-	return s == StatusPassed || s == StatusFailed || s == StatusError
-}
-
-// Sample is one corpus observation. It carries only counts: the runner derives
-// them from the real API data and the committed ground truth, so the stored
-// metrics stay auditable without persisting case titles, prompts or evidence.
+// Sample is one real-LLM evaluation observation. It carries counts only: the
+// runner derives them from the real API data and the committed ground truth, so
+// stored metrics stay auditable without persisting prompts, evidence or corpus
+// text. VisualInjected/VisualCorrect are optional and must be provided together.
 type Sample struct {
-	ConfirmedRequirements  int `json:"confirmedRequirements"`
-	CoveredRequirements    int `json:"coveredRequirements"`
-	ImpactExpected         int `json:"impactExpected"`
-	ImpactHit              int `json:"impactHit"`
-	ImpactSelected         int `json:"impactSelected"`
-	InjectedFailures       int `json:"injectedFailures"`
-	CorrectClassifications int `json:"correctClassifications"`
-	AIIssues               int `json:"aiIssues"`
-	TruePositiveIssues     int `json:"truePositiveIssues"`
-	SupplementCases        int `json:"supplementCases"`
-	SupplementHits         int `json:"supplementHits"`
+	ConfirmedRequirements  int
+	CoveredRequirements    int
+	ImpactExpected         int
+	ImpactHit              int
+	ImpactSelected         int
+	InjectedFailures       int
+	CorrectClassifications int
+	AIIssues               int
+	TruePositiveIssues     int
+	SupplementCases        int
+	SupplementHits         int
+	VisualInjected         *int
+	VisualCorrect          *int
 }
 
-// Validate rejects a physically impossible observation. The runner must never
-// be able to raise a metric by reporting more hits than opportunities.
-func (s Sample) Validate() error {
+// MetricDetail explains one metric verdict without exposing corpus content.
+type MetricDetail struct {
+	Numerator       int      `json:"numerator"`
+	Denominator     int      `json:"denominator"`
+	ThresholdPassed bool     `json:"threshold_passed"`
+	Baseline        *float64 `json:"baseline,omitempty"`
+	Regressed       bool     `json:"regressed"`
+	Reason          string   `json:"reason"`
+	ZeroDenominator bool     `json:"zero_denominator"`
+}
+
+// Metric is one derived evaluation KPI.
+type Metric struct {
+	Name      string
+	Value     float64
+	Threshold float64
+	Passed    bool
+	Detail    MetricDetail
+}
+
+type threshold struct {
+	value float64
+	// max marks an upper-bound metric (issue false-positive rate). Every other
+	// metric has a lower bound.
+	max bool
+}
+
+var realLLMThresholds = map[string]threshold{
+	MetricDesignCoverage:               {value: ThresholdDesignCoverage},
+	MetricImpactRecall:                 {value: ThresholdImpactRecall},
+	MetricImpactPrecision:              {value: ThresholdImpactPrecision},
+	MetricClassificationAccuracy:       {value: ThresholdClassificationAccuracy},
+	MetricIssueFalsePositiveRate:       {value: ThresholdIssueFalsePositiveRate, max: true},
+	MetricSupplementHitRate:            {value: ThresholdSupplementHitRate},
+	MetricVisualClassificationAccuracy: {value: ThresholdVisualClassificationAccuracy},
+}
+
+// ValidateSample rejects a physically impossible observation. The runner must
+// never be able to raise a metric by reporting more hits than opportunities.
+// Field names match the snake_case request contract so the HTTP layer can
+// return 400 details.field without remapping.
+func ValidateSample(sample Sample) error {
 	nonNegative := []struct {
 		field string
 		value int
 	}{
-		{"confirmedRequirements", s.ConfirmedRequirements},
-		{"coveredRequirements", s.CoveredRequirements},
-		{"impactExpected", s.ImpactExpected},
-		{"impactHit", s.ImpactHit},
-		{"impactSelected", s.ImpactSelected},
-		{"injectedFailures", s.InjectedFailures},
-		{"correctClassifications", s.CorrectClassifications},
-		{"aiIssues", s.AIIssues},
-		{"truePositiveIssues", s.TruePositiveIssues},
-		{"supplementCases", s.SupplementCases},
-		{"supplementHits", s.SupplementHits},
+		{"confirmed_requirements", sample.ConfirmedRequirements},
+		{"covered_requirements", sample.CoveredRequirements},
+		{"impact_expected", sample.ImpactExpected},
+		{"impact_hit", sample.ImpactHit},
+		{"impact_selected", sample.ImpactSelected},
+		{"injected_failures", sample.InjectedFailures},
+		{"correct_classifications", sample.CorrectClassifications},
+		{"ai_issues", sample.AIIssues},
+		{"true_positive_issues", sample.TruePositiveIssues},
+		{"supplement_cases", sample.SupplementCases},
+		{"supplement_hits", sample.SupplementHits},
 	}
 	for _, item := range nonNegative {
 		if item.value < 0 {
-			return fmt.Errorf("%s must not be negative", item.field)
+			return platform.Invalid(item.field, "must not be negative")
 		}
 	}
-	if s.CoveredRequirements > s.ConfirmedRequirements {
-		return errors.New("coveredRequirements must not exceed confirmedRequirements")
+	if sample.VisualInjected != nil && *sample.VisualInjected < 0 {
+		return platform.Invalid("visual_injected", "must not be negative")
 	}
-	if s.ImpactHit > s.ImpactExpected {
-		return errors.New("impactHit must not exceed impactExpected")
+	if sample.VisualCorrect != nil && *sample.VisualCorrect < 0 {
+		return platform.Invalid("visual_correct", "must not be negative")
 	}
-	if s.ImpactHit > s.ImpactSelected {
-		return errors.New("impactHit must not exceed impactSelected")
+	// The optional visual counters form a pair; half an observation cannot be
+	// evaluated into a ratio.
+	if sample.VisualInjected == nil && sample.VisualCorrect != nil {
+		return platform.Invalid("visual_injected", "must be provided together with visual_correct")
 	}
-	if s.CorrectClassifications > s.InjectedFailures {
-		return errors.New("correctClassifications must not exceed injectedFailures")
+	if sample.VisualInjected != nil && sample.VisualCorrect == nil {
+		return platform.Invalid("visual_correct", "must be provided together with visual_injected")
 	}
-	if s.TruePositiveIssues > s.AIIssues {
-		return errors.New("truePositiveIssues must not exceed aiIssues")
+
+	if sample.CoveredRequirements > sample.ConfirmedRequirements {
+		return platform.Invalid("covered_requirements", "must not exceed confirmed_requirements")
 	}
-	if s.SupplementHits > s.SupplementCases {
-		return errors.New("supplementHits must not exceed supplementCases")
+	if sample.ImpactHit > sample.ImpactExpected {
+		return platform.Invalid("impact_hit", "must not exceed impact_expected")
+	}
+	if sample.ImpactHit > sample.ImpactSelected {
+		return platform.Invalid("impact_hit", "must not exceed impact_selected")
+	}
+	if sample.CorrectClassifications > sample.InjectedFailures {
+		return platform.Invalid("correct_classifications", "must not exceed injected_failures")
+	}
+	if sample.TruePositiveIssues > sample.AIIssues {
+		return platform.Invalid("true_positive_issues", "must not exceed ai_issues")
+	}
+	if sample.SupplementHits > sample.SupplementCases {
+		return platform.Invalid("supplement_hits", "must not exceed supplement_cases")
+	}
+	if sample.VisualInjected != nil && sample.VisualCorrect != nil &&
+		*sample.VisualCorrect > *sample.VisualInjected {
+		return platform.Invalid("visual_correct", "must not exceed visual_injected")
 	}
 	return nil
 }
 
-// SampleFieldError is a validated Sample failure that names the offending
-// request field for the HTTP layer.
-type SampleFieldError struct {
-	Field   string
-	Message string
-}
-
-// Error implements error.
-func (e *SampleFieldError) Error() string { return e.Message }
-
-// ValidateFields validates the sample and names the first offending field.
-func (s Sample) ValidateFields() error {
-	if err := s.Validate(); err != nil {
-		return &SampleFieldError{Field: fieldOf(err.Error()), Message: err.Error()}
+// Evaluate derives the 6+1 metrics from one validated sample and returns the
+// run status together with the metrics in stable order. baseline may be nil and
+// is only used to mark regressions; regressionTolerance is the configured
+// quality.eval_baseline_regression tolerance. A metric with a zero denominator
+// gets value 0, zero_denominator=true and never passes: an absent opportunity is
+// recorded, never turned into a fake pass (spec §5.3).
+func Evaluate(sample Sample, baseline map[string]float64, regressionTolerance float64) (string, []Metric) {
+	if regressionTolerance < 0 {
+		regressionTolerance = 0
 	}
-	return nil
-}
-
-// fieldOf maps a Sample.Validate message back to its request field. Keeping the
-// mapping here makes the validation messages and the HTTP field names agree.
-func fieldOf(message string) string {
-	for _, field := range []string{
-		"confirmedRequirements", "coveredRequirements", "impactExpected", "impactHit",
-		"impactSelected", "injectedFailures", "correctClassifications", "aiIssues",
-		"truePositiveIssues", "supplementCases", "supplementHits",
-	} {
-		if len(message) >= len(field) && message[:len(field)] == field {
-			return field
+	metrics := make([]Metric, 0, 7)
+	metrics = append(metrics,
+		evaluateRatio(MetricDesignCoverage, sample.CoveredRequirements, sample.ConfirmedRequirements, baseline, regressionTolerance),
+		evaluateRatio(MetricImpactRecall, sample.ImpactHit, sample.ImpactExpected, baseline, regressionTolerance),
+		evaluateRatio(MetricImpactPrecision, sample.ImpactHit, sample.ImpactSelected, baseline, regressionTolerance),
+		evaluateRatio(MetricClassificationAccuracy, sample.CorrectClassifications, sample.InjectedFailures, baseline, regressionTolerance),
+		evaluateRatio(MetricIssueFalsePositiveRate, sample.AIIssues-sample.TruePositiveIssues, sample.AIIssues, baseline, regressionTolerance),
+		evaluateRatio(MetricSupplementHitRate, sample.SupplementHits, sample.SupplementCases, baseline, regressionTolerance),
+	)
+	if sample.VisualInjected != nil && sample.VisualCorrect != nil {
+		metrics = append(metrics,
+			evaluateRatio(MetricVisualClassificationAccuracy, *sample.VisualCorrect, *sample.VisualInjected, baseline, regressionTolerance))
+	}
+	status := StatusPassed
+	for _, metric := range metrics {
+		if !metric.Passed {
+			status = StatusFailed
+			break
 		}
 	}
-	return "sample"
+	return status, metrics
 }
 
-// Metric is one evaluated KPI. Detail carries the numerator/denominator (and
-// the baseline when present) so the dashboard and a failing gate can explain
-// the verdict without exposing corpus content.
-type Metric struct {
-	Name      string         `json:"name"`
-	Value     float64        `json:"value"`
-	Threshold float64        `json:"threshold"`
-	Passed    bool           `json:"passed"`
-	Detail    map[string]any `json:"detail"`
-}
-
-// Run is one persisted evaluation. FinishedAt is nil only for a running run.
-type Run struct {
-	ID            int64
-	Mode          Mode
-	CorpusVersion string
-	Model         string
-	Status        Status
-	Summary       map[string]any
-	StartedAt     time.Time
-	FinishedAt    *time.Time
-	Metrics       []Metric
-}
-
-// Evaluate derives the six §9.1 metrics from one Sample and applies the mode's
-// thresholds. In deterministic mode it additionally applies the +0.05 baseline
-// regression rule; the real-LLM report never does (D61). The caller must pass a
-// validated sample and a known mode.
-func Evaluate(sample Sample, mode Mode, baseline map[string]float64) []Metric {
-	thresholds := ThresholdsFor(mode)
-	metrics := []Metric{
-		metricOf(MetricDesignCoverage, sample.CoveredRequirements, sample.ConfirmedRequirements,
-			thresholds, baseline, mode),
-		metricOf(MetricImpactRecall, sample.ImpactHit, sample.ImpactExpected,
-			thresholds, baseline, mode),
-		metricOf(MetricImpactPrecision, sample.ImpactHit, sample.ImpactSelected,
-			thresholds, baseline, mode),
-		metricOf(MetricClassificationAccuracy, sample.CorrectClassifications, sample.InjectedFailures,
-			thresholds, baseline, mode),
-		metricOf(MetricIssueFalsePositiveRate, sample.AIIssues-sample.TruePositiveIssues, sample.AIIssues,
-			thresholds, baseline, mode),
-		metricOf(MetricSupplementHitRate, sample.SupplementHits, sample.SupplementCases,
-			thresholds, baseline, mode),
-	}
-	return metrics
-}
-
-// metricOf builds one ratio metric. A zero denominator reports 0.0 rather than
-// NaN; the deterministic corpus guarantees non-zero opportunities for every
-// gated metric, so the value only appears on the report track where an empty
-// scenario is itself a finding.
-func metricOf(name string, numerator, denominator int, thresholds map[string]Threshold,
-	baseline map[string]float64, mode Mode) Metric {
+func evaluateRatio(name string, numerator, denominator int, baseline map[string]float64, tolerance float64) Metric {
+	rule := realLLMThresholds[name]
+	zeroDenominator := denominator <= 0
 	value := 0.0
-	if denominator > 0 {
+	if !zeroDenominator {
 		value = float64(numerator) / float64(denominator)
 	}
-	threshold := thresholds[name]
+
+	// No opportunity means no evidence, so the metric cannot pass even for the
+	// upper-bound false-positive rate where a numeric 0 would look ideal.
 	thresholdPassed := false
-	if threshold.Max {
-		thresholdPassed = value <= threshold.Value+comparisonEpsilon
-	} else {
-		thresholdPassed = value+comparisonEpsilon >= threshold.Value
+	if !zeroDenominator {
+		if rule.max {
+			thresholdPassed = value <= rule.value+comparisonEpsilon
+		} else {
+			thresholdPassed = value+comparisonEpsilon >= rule.value
+		}
 	}
 
-	detail := map[string]any{
-		"numerator":       numerator,
-		"denominator":     denominator,
-		"thresholdPassed": thresholdPassed,
-	}
+	var baselineValue *float64
 	regressed := false
 	if base, ok := baseline[name]; ok {
-		detail["baseline"] = base
-		if mode == ModeDeterministic {
-			if threshold.Max {
-				regressed = value > base+RegressionTolerance+comparisonEpsilon
+		baselineCopy := base
+		baselineValue = &baselineCopy
+		if !zeroDenominator {
+			if rule.max {
+				regressed = value > base+tolerance+comparisonEpsilon
 			} else {
-				regressed = value < base-RegressionTolerance-comparisonEpsilon
+				regressed = value < base-tolerance-comparisonEpsilon
 			}
 		}
 	}
-	detail["regressed"] = regressed
 
-	reason := MetricReasonOK
+	reason := ReasonOK
 	switch {
+	case zeroDenominator:
+		reason = ReasonBelowThreshold
 	case regressed:
-		reason = MetricReasonBaselineRegression
-	case !thresholdPassed && threshold.Max:
-		reason = MetricReasonAboveThreshold
+		reason = ReasonBaselineRegression
+	case !thresholdPassed && rule.max:
+		reason = ReasonAboveThreshold
 	case !thresholdPassed:
-		reason = MetricReasonBelowThreshold
+		reason = ReasonBelowThreshold
 	}
-	detail["reason"] = reason
+	// Keep math imported and explicitly reject non-finite values; JSON cannot
+	// carry them and a corrupted sample must not produce one.
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		value = 0
+	}
 
 	return Metric{
 		Name:      name,
 		Value:     value,
-		Threshold: threshold.Value,
+		Threshold: rule.value,
 		Passed:    thresholdPassed && !regressed,
-		Detail:    detail,
+		Detail: MetricDetail{
+			Numerator:       numerator,
+			Denominator:     denominator,
+			ThresholdPassed: thresholdPassed,
+			Baseline:        baselineValue,
+			Regressed:       regressed,
+			Reason:          reason,
+			ZeroDenominator: zeroDenominator,
+		},
 	}
 }

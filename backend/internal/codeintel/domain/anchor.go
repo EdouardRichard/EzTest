@@ -1,53 +1,67 @@
-package domain
+package codeintel
 
 import "time"
 
-// Anchor subject kinds. version, requirement and app_model are the P4 subjects;
-// case is added by P5 (D37) and issue by P7 (design spec §4.2.8/§7.9).
+// AnchorSubject is the code_anchor.subject_kind enum (spec §3.4).
+type AnchorSubject string
+
 const (
-	SubjectVersion     = "version"
-	SubjectRequirement = "requirement"
-	SubjectAppModel    = "app_model"
-	SubjectCase        = "case"
-	SubjectIssue       = "issue"
+	AnchorSubjectVersion            AnchorSubject = "version"
+	AnchorSubjectRequirement        AnchorSubject = "requirement"
+	AnchorSubjectRequirementVersion AnchorSubject = "requirement_version"
+	AnchorSubjectCaseVersion        AnchorSubject = "case_version"
+	AnchorSubjectIssue              AnchorSubject = "issue"
 )
 
-// CodeAnchor binds a version-scoped subject to a file/location in a repository.
-type CodeAnchor struct {
-	ID            int64
-	VersionID     int64
-	RepoID        int64
-	SubjectKind   string
-	SubjectID     int64
-	FilePath      string
-	StartLine     *int
-	EndLine       *int
-	EntityID      *int64
-	CommitSHA     *string
-	Confidence    string
-	CreatedByKind string
-	CreatedBy     int64
-	CreatedAt     time.Time
-}
-
-// CreateAnchorParams is the validated input of an anchor creation.
-type CreateAnchorParams struct {
-	SubjectKind string
-	SubjectID   int64
-	FilePath    string
-	StartLine   *int
-	EndLine     *int
-}
-
-// ValidateSubjectKind accepts the five anchor subject kinds of P7 (D37/§7.9) and
-// rejects every other kind with reason unsupported_subject_kind (design spec
-// §6.7/§7.9).
-func ValidateSubjectKind(kind string) error {
-	switch kind {
-	case SubjectVersion, SubjectRequirement, SubjectAppModel, SubjectCase, SubjectIssue:
-		return nil
+// Valid reports whether subject is a persisted anchor subject kind.
+func (s AnchorSubject) Valid() bool {
+	switch s {
+	case AnchorSubjectVersion, AnchorSubjectRequirement, AnchorSubjectRequirementVersion,
+		AnchorSubjectCaseVersion, AnchorSubjectIssue:
+		return true
 	default:
-		return NewInvalid("subjectKind", "unsupported_subject_kind",
-			"codeintel: subjectKind must be one of version, requirement, app_model, case or issue")
+		return false
 	}
+}
+
+// AnchorStatus is the code_anchor.status enum (spec §3.4).
+type AnchorStatus string
+
+const (
+	AnchorValid  AnchorStatus = "valid"
+	AnchorStale  AnchorStatus = "stale"
+	AnchorBroken AnchorStatus = "broken"
+)
+
+// Valid reports whether status is a persisted anchor status.
+func (s AnchorStatus) Valid() bool {
+	switch s {
+	case AnchorValid, AnchorStale, AnchorBroken:
+		return true
+	default:
+		return false
+	}
+}
+
+// Anchor is one unified code anchor (spec §3.4/§6.1). Status, Confidence and
+// CreatedByKind keep their persisted string form for repository scanning.
+type Anchor struct {
+	ID              int64
+	VersionID       int64
+	RepoID          int64
+	SubjectKind     AnchorSubject
+	SubjectID       int64
+	FilePath        string
+	StartLine       *int
+	EndLine         *int
+	EntityID        *int64
+	CommitSHA       string
+	ExcerptSHA      string
+	Status          string
+	Confidence      string
+	CreatedByKind   string
+	CreatedBy       *int64
+	LastValidatedAt *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }

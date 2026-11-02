@@ -1,1275 +1,1592 @@
-package application
+package deliveryapp
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // ---------------------------------------------------------------------------
-// fakes
+// Fake repository
 // ---------------------------------------------------------------------------
 
-type reportFakeClock struct{ now time.Time }
-
-func (c reportFakeClock) Now() time.Time { return c.now }
-
-type reportFakeIDs struct{ next int64 }
-
-func (f *reportFakeIDs) Next() int64 {
-	id := f.next
-	f.next++
-	return id
+type fakeReportRepo struct {
+	mu        sync.Mutex
+	reports   map[int64]delivery.Report
+	revisions map[int64]map[int32]delivery.ReportRevision
+	refs      map[int64][]delivery.ReportRef
+	nextID    int64
+	log       *[]string
+	failNext  error
 }
 
-type reportFakeVersionReader struct {
-	version ReportVersionSource
-	err     error
-}
-
-func (f *reportFakeVersionReader) GetReportVersion(context.Context, int64) (ReportVersionSource, error) {
-	return f.version, f.err
-}
-
-// reportFakeBatchLookup records one PreviousBatchID call.
-type reportFakeBatchLookup struct {
-	VersionID int64
-	BatchID   int64
-}
-
-type reportFakeExecutionReader struct {
-	batch ReportBatchSource
-	cases []ReportCaseRunSource
-	err   error
-
-	previousBatchID  int64
-	hasPreviousBatch bool
-	previousBatchErr error
-	previousCalls    []reportFakeBatchLookup
-}
-
-func (f *reportFakeExecutionReader) GetReportBatch(context.Context, int64, int64) (ReportBatchSource, error) {
-	return f.batch, f.err
-}
-
-func (f *reportFakeExecutionReader) ListReportCaseRuns(context.Context, int64) ([]ReportCaseRunSource, error) {
-	out := make([]ReportCaseRunSource, len(f.cases))
-	copy(out, f.cases)
-	return out, f.err
-}
-
-// PreviousBatchID implements the batch_no-1 lookup independently of any report
-// creation order.
-func (f *reportFakeExecutionReader) PreviousBatchID(_ context.Context, versionID, batchID int64) (int64, bool, error) {
-	f.previousCalls = append(f.previousCalls, reportFakeBatchLookup{VersionID: versionID, BatchID: batchID})
-	if f.previousBatchErr != nil {
-		return 0, false, f.previousBatchErr
+func newFakeReportRepo(log *[]string) *fakeReportRepo {
+	return &fakeReportRepo{
+		reports:   make(map[int64]delivery.Report),
+		revisions: make(map[int64]map[int32]delivery.ReportRevision),
+		refs:      make(map[int64][]delivery.ReportRef),
+		nextID:    1000,
+		log:       log,
 	}
-	return f.previousBatchID, f.hasPreviousBatch, nil
 }
 
-type reportFakeGraphReader struct {
-	requirements []ReportRequirementSource
-	err          error
-}
-
-func (f *reportFakeGraphReader) ListReportRequirements(context.Context, int64) ([]ReportRequirementSource, error) {
-	out := make([]ReportRequirementSource, len(f.requirements))
-	copy(out, f.requirements)
-	return out, f.err
-}
-
-type reportFakeIssueReader struct {
-	issues []ReportIssueSource
-	err    error
-}
-
-func (f *reportFakeIssueReader) ListReportIssues(context.Context, int64, int64) ([]ReportIssueSource, error) {
-	out := make([]ReportIssueSource, len(f.issues))
-	copy(out, f.issues)
-	return out, f.err
-}
-
-type reportFakeEvents struct {
-	events []ReportEvent
-	err    error
-}
-
-func (f *reportFakeEvents) PublishReportEvent(_ context.Context, event ReportEvent) error {
-	if f.err != nil {
-		return f.err
+func (r *fakeReportRepo) record(label string) {
+	if r.log != nil {
+		*r.log = append(*r.log, label)
 	}
-	f.events = append(f.events, event)
-	return nil
 }
 
-func (f *reportFakeEvents) types() []string {
-	out := make([]string, 0, len(f.events))
-	for _, event := range f.events {
-		out = append(out, event.Type)
+func (r *fakeReportRepo) newID() int64 {
+	r.nextID++
+	return r.nextID
+}
+
+func (r *fakeReportRepo) seedReport(report delivery.Report) delivery.Report {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if report.ID == 0 {
+		report.ID = r.newID()
 	}
-	return out
-}
-
-func (f *reportFakeEvents) countType(eventType string) int {
-	total := 0
-	for _, event := range f.events {
-		if event.Type == eventType {
-			total++
-		}
+	if report.Status == "" {
+		report.Status = delivery.ReportStatusDraft
 	}
-	return total
-}
-
-type reportFakeAudit struct {
-	events []ReportAuditEvent
-	err    error
-}
-
-func (f *reportFakeAudit) RecordReportAudit(_ context.Context, event ReportAuditEvent) error {
-	if f.err != nil {
-		return f.err
+	if report.CreatedAt.IsZero() {
+		report.CreatedAt = time.Unix(1000, 0).UTC()
 	}
-	f.events = append(f.events, event)
-	return nil
-}
-
-func (f *reportFakeAudit) actions() []string {
-	out := make([]string, 0, len(f.events))
-	for _, event := range f.events {
-		out = append(out, event.Action)
+	if report.UpdatedAt.IsZero() {
+		report.UpdatedAt = report.CreatedAt
 	}
-	return out
+	r.reports[report.ID] = report
+	return report
 }
 
-type reportFakeFiles struct {
-	files    map[string][]byte
-	writeErr error
-	openErr  error
-}
-
-func newReportFakeFiles() *reportFakeFiles {
-	return &reportFakeFiles{files: make(map[string][]byte)}
-}
-
-func (f *reportFakeFiles) Write(_ context.Context, rel string, data []byte) (string, string, int64, error) {
-	if f.writeErr != nil {
-		return "", "", 0, f.writeErr
+func (r *fakeReportRepo) seedRevision(revision delivery.ReportRevision) delivery.ReportRevision {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if revision.ID == 0 {
+		revision.ID = r.newID()
 	}
-	stored := append([]byte(nil), data...)
-	f.files[rel] = stored
-	sum := sha256.Sum256(stored)
-	return rel, hex.EncodeToString(sum[:]), int64(len(stored)), nil
-}
-
-func (f *reportFakeFiles) Open(_ context.Context, rel string) (io.ReadCloser, error) {
-	if f.openErr != nil {
-		return nil, f.openErr
+	if revision.Status == "" {
+		revision.Status = delivery.ReportStatusDraft
 	}
-	data, ok := f.files[rel]
-	if !ok {
-		return nil, fs.ErrNotExist
+	if revision.RenderStatus == "" {
+		revision.RenderStatus = "pending"
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
-}
-
-func (f *reportFakeFiles) corrupt(rel string) {
-	data := f.files[rel]
-	if len(data) == 0 {
-		f.files[rel] = []byte("corrupted")
-		return
+	if revision.TemplateVersion == "" {
+		revision.TemplateVersion = "1"
 	}
-	mutated := append([]byte(nil), data...)
-	mutated[len(mutated)-1] ^= 0xff
-	f.files[rel] = mutated
-}
-
-type reportFakeStore struct {
-	reports     map[int64]domain.Report
-	createErr   error
-	markedStale int
-	deleted     []int64
-}
-
-func newReportFakeStore() *reportFakeStore {
-	return &reportFakeStore{reports: make(map[int64]domain.Report)}
-}
-
-func (s *reportFakeStore) Create(_ context.Context, report domain.Report) (domain.Report, error) {
-	if s.createErr != nil {
-		return domain.Report{}, s.createErr
+	if revision.InputFingerprint == "" {
+		revision.InputFingerprint = strings.Repeat("a", 64)
 	}
-	for _, existing := range s.reports {
-		if existing.BatchID == report.BatchID && existing.Revision == report.Revision {
-			return domain.Report{}, fmt.Errorf("%w: batch %d revision %d",
-				domain.ErrReportRevisionConflict, report.BatchID, report.Revision)
-		}
+	if revision.AsOf.IsZero() {
+		revision.AsOf = time.Unix(2000, 0).UTC()
 	}
-	s.reports[report.ID] = report
-	return report, nil
+	if revision.CreatedAt.IsZero() {
+		revision.CreatedAt = time.Unix(2000, 0).UTC()
+	}
+	if revision.UpdatedAt.IsZero() {
+		revision.UpdatedAt = revision.CreatedAt
+	}
+	if r.revisions[revision.ReportID] == nil {
+		r.revisions[revision.ReportID] = make(map[int32]delivery.ReportRevision)
+	}
+	r.revisions[revision.ReportID][revision.Revision] = revision
+	return revision
 }
 
-func (s *reportFakeStore) Get(_ context.Context, versionID, reportID int64) (domain.Report, error) {
-	report, ok := s.reports[reportID]
-	if !ok || report.VersionID != versionID {
-		return domain.Report{}, fmt.Errorf("%w: report %d", domain.ErrReportNotFound, reportID)
-	}
-	return report, nil
+func (r *fakeReportRepo) seedPublished(report delivery.Report, revision delivery.ReportRevision, htmlRef int64, fingerprint string) (delivery.Report, delivery.ReportRevision) {
+	report.Status = delivery.ReportStatusPublished
+	report.InputFingerprint = fingerprint
+	seeded := r.seedReport(report)
+	revision.Status = delivery.ReportStatusPublished
+	revision.RenderStatus = "done"
+	revision.HTMLRef = &htmlRef
+	revision.InputFingerprint = fingerprint
+	seededRevision := r.seedRevision(revision)
+	seeded.CurrentRevisionID = &seededRevision.ID
+	r.reports[seeded.ID] = seeded
+	return seeded, seededRevision
 }
 
-func (s *reportFakeStore) LatestByBatch(_ context.Context, versionID, batchID int64) (domain.Report, error) {
-	var latest domain.Report
-	found := false
-	for _, report := range s.reports {
-		if report.VersionID != versionID || report.BatchID != batchID {
+func (r *fakeReportRepo) CreateReport(_ context.Context, report delivery.Report) (delivery.Report, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failNext != nil {
+		err := r.failNext
+		r.failNext = nil
+		return delivery.Report{}, err
+	}
+	for _, existing := range r.reports {
+		if existing.VersionID != report.VersionID || existing.Kind != report.Kind {
 			continue
 		}
-		if !found || report.Revision > latest.Revision {
-			latest, found = report, true
+		if report.Kind == delivery.ReportKindVersion ||
+			(existing.WaveID != nil && report.WaveID != nil && *existing.WaveID == *report.WaveID) {
+			return existing, nil
 		}
 	}
-	if !found {
-		return domain.Report{}, fmt.Errorf("%w: batch %d", domain.ErrReportNotFound, batchID)
+	if report.ID == 0 {
+		report.ID = r.newID()
 	}
-	return latest, nil
+	if report.Status == "" {
+		report.Status = delivery.ReportStatusDraft
+	}
+	if report.CreatedAt.IsZero() {
+		report.CreatedAt = time.Unix(1000, 0).UTC()
+	}
+	if report.UpdatedAt.IsZero() {
+		report.UpdatedAt = report.CreatedAt
+	}
+	r.reports[report.ID] = report
+	r.record("repo.create-report")
+	return report, nil
 }
 
-func (s *reportFakeStore) List(_ context.Context, versionID int64, filter ReportFilter) ([]domain.Report, string, bool, error) {
-	limit := filter.Limit
-	if limit <= 0 || limit > platform.MaxLimit {
-		limit = platform.DefaultLimit
+func (r *fakeReportRepo) GetReport(_ context.Context, versionID, reportID int64) (delivery.Report, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	report, ok := r.reports[reportID]
+	if !ok || report.VersionID != versionID {
+		return delivery.Report{}, ErrReportNotFound
 	}
-	matched := make([]domain.Report, 0, len(s.reports))
-	for _, report := range s.reports {
+	return report, nil
+}
+
+func (r *fakeReportRepo) GetReportByID(_ context.Context, reportID int64) (delivery.Report, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	report, ok := r.reports[reportID]
+	if !ok {
+		return delivery.Report{}, ErrReportNotFound
+	}
+	return report, nil
+}
+
+func (r *fakeReportRepo) ListReports(_ context.Context, versionID int64, f ReportFilter) ([]delivery.Report, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]delivery.Report, 0)
+	for _, report := range r.reports {
 		if report.VersionID != versionID {
 			continue
 		}
-		if filter.BatchID != nil && report.BatchID != *filter.BatchID {
+		if f.Kind != nil && report.Kind != *f.Kind {
 			continue
 		}
-		if filter.Status != "" && report.Status != filter.Status {
+		if f.Before > 0 && report.ID >= f.Before {
 			continue
 		}
-		matched = append(matched, report)
+		result = append(result, report)
 	}
-	sort.SliceStable(matched, func(i, j int) bool {
-		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
-			return matched[i].CreatedAt.After(matched[j].CreatedAt)
+	sort.Slice(result, func(i, j int) bool { return result[i].ID > result[j].ID })
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (r *fakeReportRepo) NextRevision(_ context.Context, reportID int64) (int32, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.reports[reportID]; !ok {
+		return 0, ErrReportNotFound
+	}
+	var max int32
+	for revision := range r.revisions[reportID] {
+		if revision > max {
+			max = revision
 		}
-		return matched[i].ID > matched[j].ID
-	})
-	if filter.Cursor != "" {
-		cursorID, err := platform.DecodeCursor(filter.Cursor)
-		if err != nil {
-			return nil, "", false, err
-		}
-		cursorIndex := -1
-		for index, report := range matched {
-			if report.ID == cursorID {
-				cursorIndex = index
-				break
+	}
+	return max + 1, nil
+}
+
+func (r *fakeReportRepo) CreateRevision(_ context.Context, revision delivery.ReportRevision) (delivery.ReportRevision, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.reports[revision.ReportID]; !ok {
+		return delivery.ReportRevision{}, ErrReportNotFound
+	}
+	if revision.Revision <= 0 {
+		var max int32
+		for number := range r.revisions[revision.ReportID] {
+			if number > max {
+				max = number
 			}
 		}
-		if cursorIndex >= 0 {
-			matched = matched[cursorIndex+1:]
-		}
+		revision.Revision = max + 1
 	}
-	hasMore := len(matched) > limit
-	if hasMore {
-		matched = matched[:limit]
+	if _, exists := r.revisions[revision.ReportID][revision.Revision]; exists {
+		return delivery.ReportRevision{}, delivery.ErrStateConflict
 	}
-	nextCursor := ""
-	if hasMore && len(matched) > 0 {
-		nextCursor = platform.EncodeCursor(matched[len(matched)-1].ID)
+	if revision.ID == 0 {
+		revision.ID = r.newID()
 	}
-	return matched, nextCursor, hasMore, nil
+	if revision.Status == "" {
+		revision.Status = delivery.ReportStatusDraft
+	}
+	if revision.RenderStatus == "" {
+		revision.RenderStatus = "pending"
+	}
+	if revision.TemplateVersion == "" {
+		revision.TemplateVersion = "1"
+	}
+	if revision.AsOf.IsZero() {
+		revision.AsOf = time.Unix(2000, 0).UTC()
+	}
+	if revision.CreatedAt.IsZero() {
+		revision.CreatedAt = time.Unix(2000, 0).UTC()
+	}
+	if revision.UpdatedAt.IsZero() {
+		revision.UpdatedAt = revision.CreatedAt
+	}
+	if r.revisions[revision.ReportID] == nil {
+		r.revisions[revision.ReportID] = make(map[int32]delivery.ReportRevision)
+	}
+	r.revisions[revision.ReportID][revision.Revision] = revision
+	r.record("repo.create-revision")
+	return revision, nil
 }
 
-func (s *reportFakeStore) NextRevision(_ context.Context, _ int64, batchID int64) (int, error) {
-	maxRevision := 0
-	for _, report := range s.reports {
-		if report.BatchID == batchID && report.Revision > maxRevision {
-			maxRevision = report.Revision
-		}
+func (r *fakeReportRepo) FinalizePublished(_ context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	report, ok := r.reports[reportID]
+	if !ok {
+		return ErrReportNotFound
 	}
-	return maxRevision + 1, nil
+	row, ok := r.revisions[reportID][revision]
+	if !ok {
+		return ErrReportNotFound
+	}
+	if row.Status == delivery.ReportStatusPublished {
+		return delivery.ErrStateConflict
+	}
+	row.Status = delivery.ReportStatusPublished
+	row.RenderStatus = "done"
+	row.HTMLRef = &htmlRef
+	row.InputFingerprint = fingerprint
+	r.revisions[reportID][revision] = row
+	report.CurrentRevisionID = &row.ID
+	report.Status = delivery.ReportStatusPublished
+	report.InputFingerprint = fingerprint
+	r.reports[reportID] = report
+	r.record("repo.finalize")
+	return nil
 }
 
-func (s *reportFakeStore) MarkStale(_ context.Context, versionID, reportID int64, fingerprint, reason string, at time.Time) (bool, error) {
-	report, ok := s.reports[reportID]
-	if !ok || report.VersionID != versionID || report.Status != domain.ReportStatusPublished {
+func (r *fakeReportRepo) MarkRenderMetadata(_ context.Context, revisionID int64, status, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for reportID, revisions := range r.revisions {
+		for number, revision := range revisions {
+			if revision.ID != revisionID {
+				continue
+			}
+			if revision.Status == delivery.ReportStatusPublished {
+				return delivery.ErrStateConflict
+			}
+			revision.RenderStatus = status
+			r.revisions[reportID][number] = revision
+			r.record("repo.render-" + status)
+			return nil
+		}
+	}
+	return ErrReportNotFound
+}
+
+func (r *fakeReportRepo) MarkStale(_ context.Context, reportID int64) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	report, ok := r.reports[reportID]
+	if !ok {
+		return false, ErrReportNotFound
+	}
+	if report.Status != delivery.ReportStatusPublished {
 		return false, nil
 	}
-	if report.InputFingerprint != fingerprint {
-		return false, nil
-	}
-	report.Status = domain.ReportStatusStale
-	report.StaleReason = reason
-	report.UpdatedAt = at
-	s.reports[reportID] = report
-	s.markedStale++
+	report.Status = delivery.ReportStatusStale
+	r.reports[reportID] = report
+	r.record("repo.mark-stale")
 	return true, nil
 }
 
-func (s *reportFakeStore) MarkPublished(_ context.Context, versionID, reportID int64, at time.Time) (bool, error) {
-	report, ok := s.reports[reportID]
-	if !ok || report.VersionID != versionID || report.Status != domain.ReportStatusDraft {
-		return false, nil
+func (r *fakeReportRepo) GetRevision(_ context.Context, reportID int64, revision int32) (delivery.ReportRevision, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	row, ok := r.revisions[reportID][revision]
+	if !ok {
+		return delivery.ReportRevision{}, ErrReportNotFound
 	}
-	report.Status = domain.ReportStatusPublished
-	report.PublishedAt = &at
-	report.UpdatedAt = at
-	s.reports[reportID] = report
-	return true, nil
+	return row, nil
 }
 
-func (s *reportFakeStore) Delete(_ context.Context, versionID, reportID int64) error {
-	if report, ok := s.reports[reportID]; ok && report.VersionID == versionID {
-		delete(s.reports, reportID)
+func (r *fakeReportRepo) ListRevisions(_ context.Context, reportID int64) ([]delivery.ReportRevision, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]delivery.ReportRevision, 0, len(r.revisions[reportID]))
+	for _, revision := range r.revisions[reportID] {
+		result = append(result, revision)
 	}
-	s.deleted = append(s.deleted, reportID)
+	sort.Slice(result, func(i, j int) bool { return result[i].Revision > result[j].Revision })
+	return result, nil
+}
+
+func (r *fakeReportRepo) InsertRefs(_ context.Context, revisionID int64, refs []delivery.ReportRef) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var reportID int64
+	for candidateReportID, revisions := range r.revisions {
+		for _, revision := range revisions {
+			if revision.ID == revisionID {
+				reportID = candidateReportID
+			}
+		}
+	}
+	if reportID == 0 {
+		return ErrReportNotFound
+	}
+	existing := make(map[string]bool, len(r.refs[reportID]))
+	for _, ref := range r.refs[reportID] {
+		existing[fmt.Sprintf("%s:%d", ref.Kind, ref.RefID)] = true
+	}
+	for _, ref := range refs {
+		key := fmt.Sprintf("%s:%d", ref.Kind, ref.RefID)
+		if existing[key] {
+			continue
+		}
+		existing[key] = true
+		ref.ID = r.newID()
+		ref.ReportID = reportID
+		ref.ReportRevisionID = revisionID
+		r.refs[reportID] = append(r.refs[reportID], ref)
+	}
+	r.record("repo.insert-refs")
+	return nil
+}
+
+func (r *fakeReportRepo) ListRefs(_ context.Context, reportID int64) ([]delivery.ReportRef, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]delivery.ReportRef(nil), r.refs[reportID]...), nil
+}
+
+func (r *fakeReportRepo) SetWaveReportID(_ context.Context, _, waveID, reportID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failNext != nil {
+		err := r.failNext
+		r.failNext = nil
+		return err
+	}
+	r.record(fmt.Sprintf("repo.set-wave:%d:%d", waveID, reportID))
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// setup
+// Other fakes
 // ---------------------------------------------------------------------------
 
-type reportTestSetup struct {
-	versions  *reportFakeVersionReader
-	execution *reportFakeExecutionReader
-	graph     *reportFakeGraphReader
-	issues    *reportFakeIssueReader
-	reports   *reportFakeStore
-	files     *reportFakeFiles
-	events    *reportFakeEvents
-	audit     *reportFakeAudit
-	ids       *reportFakeIDs
-	clock     reportFakeClock
-	service   *ReportService
+type fakeReportRenderer struct {
+	log           *[]string
+	output        []byte
+	err           error
+	lastSnapshot  delivery.ReportSnapshot
+	lastNarrative string
+	lastOptions   delivery.SectionOptions
+	templateVer   string
+	calls         int
 }
 
-func reportTestTimePointer(value time.Time) *time.Time { return &value }
+// TemplateVersion implements delivery.ReportTemplateVersioner so a test can
+// prove the service records the renderer's built-in version (P7-D-03).
+func (r *fakeReportRenderer) TemplateVersion() string { return r.templateVer }
 
-func newReportTestSetup(t *testing.T) *reportTestSetup {
-	t.Helper()
-	started := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
-	finished := started.Add(30 * time.Minute)
-	updatedRun := finished.Add(-5 * time.Minute)
-	updatedIssue := finished.Add(-10 * time.Minute)
-	setup := &reportTestSetup{
-		versions: &reportFakeVersionReader{version: ReportVersionSource{
-			ID: 10, Name: "结算系统", Label: "v1.2", Status: "executing",
-			CodeBaselineCommit: strings.Repeat("c", 40),
-		}},
-		execution: &reportFakeExecutionReader{
-			previousBatchID:  19,
-			hasPreviousBatch: true,
-			batch: ReportBatchSource{
-				ID: 20, VersionID: 10, BatchNo: 2, Kind: "incremental", Status: "done",
-				BaselineHash: strings.Repeat("a", 64), GraphHash: strings.Repeat("b", 64),
-				CodeBaseCommit: strings.Repeat("c", 40), HeadCommit: strings.Repeat("d", 40),
-				StartedAt: reportTestTimePointer(started), FinishedAt: reportTestTimePointer(finished),
-				Environment: "staging", System: "payment",
-				CaseCount: 3, PassedCount: 1, FailedCount: 1, BlockedCount: 1,
-				FlakyCaseIDs: []int64{12},
-			},
-			cases: []ReportCaseRunSource{
-				{
-					CaseRunID: 102, CaseNodeID: 12, Title: "结算失败", Source: "baseline",
-					Status: "failed", FailureClass: "application", Attempt: 1,
-					StepCount: 3, AssertionCount: 2, EvidenceCount: 4, UpdatedAt: updatedRun,
-				},
-				{
-					CaseRunID: 101, CaseNodeID: 11, Title: "结算成功", Source: "ai_supplement",
-					Status: "passed", Attempt: 1, StepCount: 2, AssertionCount: 1,
-					EvidenceCount: 1, UpdatedAt: updatedRun,
-				},
-				{
-					CaseRunID: 103, CaseNodeID: 13, Title: "退款阻塞", Source: "baseline",
-					Status: "blocked", FailureClass: "environment", Attempt: 1,
-					StepCount: 1, AssertionCount: 1, EvidenceCount: 2, UpdatedAt: updatedRun,
-				},
-			},
-		},
-		graph: &reportFakeGraphReader{requirements: []ReportRequirementSource{
-			{RequirementID: 32, Title: "退款需求", Status: "clarified", CaseNodeIDs: []int64{11}},
-			{RequirementID: 31, Title: "结算需求", Status: "clarified", CaseNodeIDs: []int64{13, 12}},
-		}},
-		issues: &reportFakeIssueReader{issues: []ReportIssueSource{
-			{
-				IssueID: 41, Title: "轻微问题", Severity: "minor", Status: "open",
-				Confidence: "medium", Category: "defect",
-				CodeRefs: []domain.ReportCodeRef{
-					{Path: "src/b.ts", Line: 20},
-					{Path: "src/a.ts", Line: 10},
-				},
-				Revision: 1, UpdatedAt: updatedIssue,
-			},
-			{
-				IssueID: 43, Title: "另一个轻微问题", Severity: "minor", Status: "open",
-				Confidence: "low", Category: "defect", Revision: 1, UpdatedAt: updatedIssue,
-			},
-			{
-				IssueID: 42, Title: "阻塞问题", Severity: "blocker", Status: "confirmed",
-				Confidence: "high", Category: "defect", CaseNodeID: reportTestInt64(12),
-				Revision: 2, UpdatedAt: updatedIssue,
-			},
-		}},
-		reports: newReportFakeStore(),
-		files:   newReportFakeFiles(),
-		events:  &reportFakeEvents{},
-		audit:   &reportFakeAudit{},
-		ids:     &reportFakeIDs{next: 1000},
-		clock:   reportFakeClock{now: time.Date(2026, 10, 28, 11, 0, 0, 0, time.UTC)},
+func (r *fakeReportRenderer) Render(_ context.Context, snapshot delivery.ReportSnapshot, narrative string, opts delivery.SectionOptions) ([]byte, error) {
+	r.calls++
+	r.lastSnapshot = snapshot
+	r.lastNarrative = narrative
+	r.lastOptions = opts
+	if r.log != nil {
+		*r.log = append(*r.log, "render")
 	}
-	setup.service = NewReportService(ReportServiceDeps{
-		Versions:  setup.versions,
-		Execution: setup.execution,
-		Graph:     setup.graph,
-		Issues:    setup.issues,
-		Reports:   setup.reports,
-		Files:     setup.files,
-		Events:    setup.events,
-		Audit:     setup.audit,
-		IDs:       setup.ids,
-		Clock:     setup.clock,
-	})
-	return setup
-}
-
-func reportTestInt64(value int64) *int64 { return &value }
-
-func (s *reportTestSetup) ensure(t *testing.T) (domain.Report, bool) {
-	t.Helper()
-	report, created, err := s.service.Ensure(context.Background(), 10, 20, 7)
-	if err != nil {
-		t.Fatalf("ensure report: %v", err)
+	if r.err != nil {
+		return nil, r.err
 	}
-	return report, created
+	if r.output != nil {
+		return append([]byte(nil), r.output...), nil
+	}
+	return []byte("<!doctype html><html><body>report</body></html>"), nil
 }
 
-func reportTestSHA(data []byte) string {
+type fakeReportContent struct {
+	mu          sync.Mutex
+	log         *[]string
+	puts        map[int64][]byte
+	putErr      error
+	openErr     error
+	openSHA     string
+	entries     map[int64]fakeReportContentEntry
+	pdfs        map[int64]fakeReportContentEntry
+	pdfRefs     map[int64]ReportContentRef
+	pdfErr      error
+	putPDFErr   error
+	putPDFCalls int
+	nextRef     int64
+	putCalls    int
+	openCalls   int
+	lastOpenID  int64
+}
+
+type fakeReportContentEntry struct {
+	data []byte
+	sha  string
+	size int64
+}
+
+func newFakeReportContent(log *[]string) *fakeReportContent {
+	return &fakeReportContent{
+		log: log, puts: make(map[int64][]byte), entries: make(map[int64]fakeReportContentEntry),
+		pdfs: make(map[int64]fakeReportContentEntry), pdfRefs: make(map[int64]ReportContentRef), nextRef: 5000,
+	}
+}
+
+func reportContentSHA(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-func reportTestContentJSON(t *testing.T, report domain.Report) []byte {
+func (c *fakeReportContent) PutReportHTML(_ context.Context, revisionID int64, html []byte) (int64, string, int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putCalls++
+	if c.log != nil {
+		*c.log = append(*c.log, "content.put")
+	}
+	if c.putErr != nil {
+		return 0, "", 0, c.putErr
+	}
+	refID := c.nextRef
+	c.nextRef++
+	sha := reportContentSHA(html)
+	size := int64(len(html))
+	c.puts[revisionID] = append([]byte(nil), html...)
+	c.entries[refID] = fakeReportContentEntry{data: append([]byte(nil), html...), sha: sha, size: size}
+	return refID, sha, size, nil
+}
+
+func (c *fakeReportContent) OpenReportHTML(_ context.Context, contentRefID int64) ([]byte, string, int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.openCalls++
+	c.lastOpenID = contentRefID
+	if c.log != nil {
+		*c.log = append(*c.log, "content.open")
+	}
+	if c.openErr != nil {
+		return nil, "", 0, c.openErr
+	}
+	entry, ok := c.entries[contentRefID]
+	if !ok {
+		return nil, "", 0, ErrReportContentNotFound
+	}
+	sha := entry.sha
+	if c.openSHA != "" {
+		sha = c.openSHA
+	}
+	return append([]byte(nil), entry.data...), sha, entry.size, nil
+}
+
+func (c *fakeReportContent) seed(refID, revisionID int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sha := reportContentSHA(data)
+	c.entries[refID] = fakeReportContentEntry{data: append([]byte(nil), data...), sha: sha, size: int64(len(data))}
+	c.puts[revisionID] = append([]byte(nil), data...)
+}
+
+// GetReportHTML implements RenderContent.
+func (c *fakeReportContent) GetReportHTML(_ context.Context, contentRefID int64) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.openErr != nil {
+		return nil, c.openErr
+	}
+	entry, ok := c.entries[contentRefID]
+	if !ok {
+		return nil, ErrReportContentNotFound
+	}
+	return append([]byte(nil), entry.data...), nil
+}
+
+// PutReportPDF implements RenderContent.
+func (c *fakeReportContent) PutReportPDF(_ context.Context, revisionID int64, data []byte) (ReportContentRef, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putPDFCalls++
+	if c.putPDFErr != nil {
+		return ReportContentRef{}, c.putPDFErr
+	}
+	refID := c.nextRef
+	c.nextRef++
+	sha := reportContentSHA(data)
+	size := int64(len(data))
+	c.pdfs[refID] = fakeReportContentEntry{data: append([]byte(nil), data...), sha: sha, size: size}
+	ref := ReportContentRef{RefID: refID, SHA256: sha, Size: size}
+	c.pdfRefs[revisionID] = ref
+	return ref, nil
+}
+
+// OpenReportPDF implements ContentStore.
+func (c *fakeReportContent) OpenReportPDF(_ context.Context, contentRefID int64) ([]byte, string, int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pdfErr != nil {
+		return nil, "", 0, c.pdfErr
+	}
+	entry, ok := c.pdfs[contentRefID]
+	if !ok {
+		return nil, "", 0, ErrReportContentNotFound
+	}
+	return append([]byte(nil), entry.data...), entry.sha, entry.size, nil
+}
+
+// seedPDF stores one PDF content entry for the OpenPDF read path.
+func (c *fakeReportContent) seedPDF(refID int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pdfs[refID] = fakeReportContentEntry{data: append([]byte(nil), data...), sha: reportContentSHA(data), size: int64(len(data))}
+}
+
+type fakeReportData struct {
+	mu          sync.Mutex
+	log         *[]string
+	wave        map[string]delivery.ReportSnapshot
+	version     map[int64]delivery.ReportSnapshot
+	waveErr     error
+	versionErr  error
+	waveCalls   int
+	versionCall int
+	// versionReady optionally gates version report generation (the optional
+	// ReportTriggerReader input for active intents/human requests).
+	versionReady    *bool
+	versionReadyErr error
+}
+
+func newFakeReportData(log *[]string) *fakeReportData {
+	return &fakeReportData{log: log, wave: make(map[string]delivery.ReportSnapshot), version: make(map[int64]delivery.ReportSnapshot)}
+}
+
+func reportDataWaveKey(versionID, waveID int64) string {
+	return fmt.Sprintf("%d:%d", versionID, waveID)
+}
+
+func (d *fakeReportData) WaveSnapshot(_ context.Context, versionID, waveID int64) (delivery.ReportSnapshot, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.waveCalls++
+	if d.log != nil {
+		*d.log = append(*d.log, "data.wave")
+	}
+	if d.waveErr != nil {
+		return delivery.ReportSnapshot{}, d.waveErr
+	}
+	snapshot, ok := d.wave[reportDataWaveKey(versionID, waveID)]
+	if !ok {
+		return delivery.ReportSnapshot{}, fmt.Errorf("no wave snapshot for %d/%d", versionID, waveID)
+	}
+	return snapshot, nil
+}
+
+func (d *fakeReportData) VersionSnapshot(_ context.Context, versionID int64) (delivery.ReportSnapshot, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.versionCall++
+	if d.log != nil {
+		*d.log = append(*d.log, "data.version")
+	}
+	if d.versionErr != nil {
+		return delivery.ReportSnapshot{}, d.versionErr
+	}
+	snapshot, ok := d.version[versionID]
+	if !ok {
+		return delivery.ReportSnapshot{}, fmt.Errorf("no version snapshot for %d", versionID)
+	}
+	return snapshot, nil
+}
+
+func (d *fakeReportData) VersionReportReady(_ context.Context, _ int64) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.versionReadyErr != nil {
+		return false, d.versionReadyErr
+	}
+	if d.versionReady == nil {
+		return true, nil
+	}
+	return *d.versionReady, nil
+}
+
+type fakeReportEvents struct {
+	mu        sync.Mutex
+	log       *[]string
+	published []fakeReportEvent
+	err       error
+}
+
+type fakeReportEvent struct {
+	eventType string
+	versionID int64
+	payload   map[string]any
+}
+
+func (e *fakeReportEvents) Publish(_ context.Context, eventType string, versionID int64, payload map[string]any) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.log != nil {
+		*e.log = append(*e.log, "event:"+eventType)
+	}
+	if e.err != nil {
+		return e.err
+	}
+	e.published = append(e.published, fakeReportEvent{eventType: eventType, versionID: versionID, payload: payload})
+	return nil
+}
+
+func (e *fakeReportEvents) count(eventType string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	count := 0
+	for _, event := range e.published {
+		if event.eventType == eventType {
+			count++
+		}
+	}
+	return count
+}
+
+type fakeReportAudit struct {
+	mu    sync.Mutex
+	log   *[]string
+	calls []string
+	err   error
+}
+
+func (a *fakeReportAudit) Write(_ context.Context, _ int64, action, _, _ string, _ map[string]any) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.log != nil {
+		*a.log = append(*a.log, "audit:"+action)
+	}
+	if a.err != nil {
+		return a.err
+	}
+	a.calls = append(a.calls, action)
+	return nil
+}
+
+type fakeReportClock struct{ now time.Time }
+
+func (c fakeReportClock) Now() time.Time { return c.now }
+
+type fakeReportTasks struct {
+	mu    sync.Mutex
+	log   *[]string
+	calls []string
+	err   error
+}
+
+func (t *fakeReportTasks) EnsureReportTask(_ context.Context, reportID int64, revision int32) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	call := fmt.Sprintf("task:%d:%d", reportID, revision)
+	t.calls = append(t.calls, call)
+	if t.log != nil {
+		*t.log = append(*t.log, call)
+	}
+	return t.err
+}
+
+func (t *fakeReportTasks) EnsureIssueTriage(context.Context, int64, int64) error { return nil }
+func (t *fakeReportTasks) EnsureRequirementClose(context.Context, int64, int64, int32) error {
+	return nil
+}
+func (t *fakeReportTasks) EnsureVersionClose(context.Context, int64, int64, string) error {
+	return nil
+}
+
+type reportFixture struct {
+	repo     *fakeReportRepo
+	renderer *fakeReportRenderer
+	content  *fakeReportContent
+	data     *fakeReportData
+	events   *fakeReportEvents
+	audit    *fakeReportAudit
+	tasks    *fakeReportTasks
+	clock    fakeReportClock
+	svc      *ReportService
+	log      *[]string
+}
+
+func newReportFixture(t *testing.T) *reportFixture {
 	t.Helper()
-	encoded, err := report.Content.CanonicalJSON()
-	if err != nil {
-		t.Fatalf("canonical content json: %v", err)
+	log := make([]string, 0, 64)
+	fixture := &reportFixture{
+		repo:     newFakeReportRepo(&log),
+		renderer: &fakeReportRenderer{log: &log},
+		content:  newFakeReportContent(&log),
+		data:     newFakeReportData(&log),
+		events:   &fakeReportEvents{log: &log},
+		audit:    &fakeReportAudit{log: &log},
+		tasks:    &fakeReportTasks{log: &log},
+		clock:    fakeReportClock{now: time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)},
+		log:      &log,
 	}
-	return encoded
+	fixture.svc = NewReportService(
+		fixture.repo,
+		fixture.renderer,
+		fixture.content,
+		fixture.data,
+		fixture.events,
+		fixture.audit,
+		fixture.clock,
+		fixture.tasks,
+		delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true},
+	)
+	return fixture
+}
+
+func reportTestFingerprint(char string) string { return strings.Repeat(char, 64) }
+
+func reportTestWaveSnapshot(versionID, waveID int64) delivery.ReportSnapshot {
+	return delivery.ReportSnapshot{
+		Kind:      delivery.ReportKindWave,
+		VersionID: versionID,
+		WaveID:    &waveID,
+		Waves:     []delivery.WaveSnapshot{{ID: waveID, VersionID: versionID, Status: "done", Trigger: "manual"}},
+		CaseRuns: []delivery.CaseRunSnapshot{{
+			ID: 3001, VersionID: versionID, WaveID: waveID, CaseVersionID: 4001,
+			CaseTitle: "用例", Status: "failed", Category: "api", Severity: "major",
+		}},
+		Issues: []delivery.IssueSnapshot{{
+			ID: 5001, VersionID: versionID, Title: "问题", Status: delivery.IssueStatusOpen,
+			Category: "api", Severity: "major",
+		}},
+		VersionSUTs: []delivery.VersionSUTSnapshot{{ID: 6001, SUTID: 7001, SUTName: "API"}},
+	}
+}
+
+func reportTestVersionSnapshot(versionID int64) delivery.ReportSnapshot {
+	return delivery.ReportSnapshot{
+		Kind:      delivery.ReportKindVersion,
+		VersionID: versionID,
+		Requirements: []delivery.RequirementSnapshot{
+			{ID: 101, VersionID: versionID, Title: "需求", Status: "closed"},
+		},
+		Waves:    []delivery.WaveSnapshot{{ID: 12, VersionID: versionID, Status: "done"}},
+		CaseRuns: []delivery.CaseRunSnapshot{{ID: 3001, VersionID: versionID, WaveID: 12, CaseVersionID: 4001, Status: "passed"}},
+		Issues:   []delivery.IssueSnapshot{{ID: 5001, VersionID: versionID, Title: "问题", Status: delivery.IssueStatusConfirmed}},
+		Coverage: delivery.CoverageSnapshot{RequirementsTotal: 1, RequirementsCovered: 1},
+	}
+}
+
+func (f *reportFixture) seedWaveReport(versionID, waveID int64) (delivery.Report, delivery.ReportRevision) {
+	wave := waveID
+	f.data.wave[reportDataWaveKey(versionID, waveID)] = reportTestWaveSnapshot(versionID, waveID)
+	report := f.repo.seedReport(delivery.Report{
+		ID: 100, VersionID: versionID, WaveID: &wave, Kind: delivery.ReportKindWave,
+	})
+	revision := f.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 1})
+	return report, revision
+}
+
+func (f *reportFixture) seedPublishedWaveReport(versionID, waveID int64, fingerprint string) (delivery.Report, delivery.ReportRevision) {
+	wave := waveID
+	report := f.repo.seedReport(delivery.Report{
+		ID: 100, VersionID: versionID, WaveID: &wave, Kind: delivery.ReportKindWave,
+	})
+	revision := f.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 1})
+	f.data.wave[reportDataWaveKey(versionID, waveID)] = reportTestWaveSnapshot(versionID, waveID)
+	published, publishedRevision := f.repo.seedPublished(report, revision, 5001, fingerprint)
+	return published, publishedRevision
+}
+
+func (f *reportFixture) seedPublishedVersionReport(versionID int64, fingerprint string) (delivery.Report, delivery.ReportRevision) {
+	report := f.repo.seedReport(delivery.Report{ID: 200, VersionID: versionID, Kind: delivery.ReportKindVersion})
+	revision := f.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 1})
+	f.data.version[versionID] = reportTestVersionSnapshot(versionID)
+	published, publishedRevision := f.repo.seedPublished(report, revision, 5002, fingerprint)
+	return published, publishedRevision
+}
+
+func (f *reportFixture) repoRevision(t *testing.T, reportID int64, revision int32) delivery.ReportRevision {
+	t.Helper()
+	row, err := f.repo.GetRevision(context.Background(), reportID, revision)
+	if err != nil {
+		t.Fatalf("GetRevision(%d, %d): %v", reportID, revision, err)
+	}
+	return row
+}
+
+func assertLogOrder(t *testing.T, log []string, wanted ...string) {
+	t.Helper()
+	position := 0
+	for _, entry := range log {
+		if position < len(wanted) && entry == wanted[position] {
+			position++
+		}
+	}
+	if position != len(wanted) {
+		t.Fatalf("log order = %v, missing or out of order: %v", log, wanted[position:])
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Ensure / determinism
+// Tests
 // ---------------------------------------------------------------------------
 
-// TestReportEnsurePublishesDeterministicRevisionOne pins the §5.5/§6.5 first
-// generation: revision 1, published, deterministic snapshot/fingerprint/Markdown
-// and a file whose sha256/size match the row.
-func TestReportEnsurePublishesDeterministicRevisionOne(t *testing.T) {
-	setup := newReportTestSetup(t)
-	report, created := setup.ensure(t)
-	if !created {
-		t.Fatal("first Ensure must create the report")
+func TestReportServicePublishWritesContentThenPublishes(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, _ := fixture.seedWaveReport(7, 12)
+
+	published, err := fixture.svc.Publish(context.Background(), report.ID, 1, "叙述文本")
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
 	}
-	if report.Revision != 1 {
-		t.Fatalf("revision = %d, want 1", report.Revision)
+	if published.Status != delivery.ReportStatusPublished || published.RenderStatus != "done" ||
+		published.HTMLRef == nil || *published.HTMLRef != 5000 || published.InputFingerprint == "" {
+		t.Fatalf("published revision = %+v", published)
 	}
-	if report.Status != domain.ReportStatusPublished {
-		t.Fatalf("status = %q, want published", report.Status)
+	if published.AsOf.IsZero() {
+		t.Fatal("published revision as_of is zero")
 	}
-	if report.GeneratedBy == nil || *report.GeneratedBy != 7 {
-		t.Fatalf("generatedBy = %v, want 7", report.GeneratedBy)
+	stored, err := fixture.repo.GetReport(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("GetReport after publish: %v", err)
 	}
-	if report.PublishedAt == nil {
-		t.Fatal("publishedAt must be set")
+	if stored.Status != delivery.ReportStatusPublished || stored.CurrentRevisionID == nil ||
+		*stored.CurrentRevisionID != published.ID || stored.InputFingerprint != published.InputFingerprint {
+		t.Fatalf("stored report = %+v", stored)
 	}
-	if report.MarkdownPath == "" {
-		t.Fatal("markdown path must be set")
+	if fixture.renderer.lastNarrative != "叙述文本" || fixture.renderer.lastOptions.Summary != true {
+		t.Fatalf("renderer narrative/options = %q/%+v", fixture.renderer.lastNarrative, fixture.renderer.lastOptions)
 	}
-	if len(report.InputFingerprint) != 64 {
-		t.Fatalf("inputFingerprint = %q, want 64 hex chars", report.InputFingerprint)
+	if fixture.renderer.lastSnapshot.GeneratedAt != fixture.clock.now {
+		t.Fatalf("snapshot generated_at = %v", fixture.renderer.lastSnapshot.GeneratedAt)
 	}
-	markdown := setup.files.files[report.MarkdownPath]
-	if len(markdown) == 0 {
-		t.Fatalf("markdown file %q was not written", report.MarkdownPath)
+	// The v2 appendix metadata is stamped by the service, never trusted from a
+	// reader: report id, revision number and the final input fingerprint.
+	if fixture.renderer.lastSnapshot.ReportID != report.ID ||
+		fixture.renderer.lastSnapshot.ReportRevision != published.Revision ||
+		fixture.renderer.lastSnapshot.InputFingerprint != published.InputFingerprint {
+		t.Fatalf("renderer appendix metadata = id:%d revision:%d fingerprint:%q",
+			fixture.renderer.lastSnapshot.ReportID, fixture.renderer.lastSnapshot.ReportRevision,
+			fixture.renderer.lastSnapshot.InputFingerprint)
 	}
-	if got := reportTestSHA(markdown); got != report.MarkdownSHA256 {
-		t.Fatalf("markdown sha256 = %q, row has %q", got, report.MarkdownSHA256)
+	if len(fixture.renderer.lastSnapshot.Issues) != 1 || len(fixture.renderer.lastSnapshot.CaseRuns) != 1 {
+		t.Fatalf("renderer snapshot = %+v", fixture.renderer.lastSnapshot)
 	}
-	if int64(len(markdown)) != report.MarkdownSize {
-		t.Fatalf("markdown size = %d, row has %d", len(markdown), report.MarkdownSize)
+	if *published.HTMLRef != 5000 {
+		t.Fatalf("html_ref = %d", *published.HTMLRef)
+	}
+	// The snapshot kind/wave are stamped from the report, not trusted from the
+	// reader (defends a mis-scoped reader).
+	if fixture.renderer.lastSnapshot.Kind != delivery.ReportKindWave ||
+		fixture.renderer.lastSnapshot.WaveID == nil || *fixture.renderer.lastSnapshot.WaveID != 12 {
+		t.Fatalf("renderer snapshot scope = %+v", fixture.renderer.lastSnapshot)
 	}
 
-	content := report.Content
-	wantCases := []string{"11", "12", "13"}
-	for index, want := range wantCases {
-		if content.Cases[index].CaseNodeID != want {
-			t.Fatalf("cases[%d].caseNodeId = %q, want %q", index, content.Cases[index].CaseNodeID, want)
-		}
-	}
-	wantIssues := []string{"42", "43", "41"}
-	for index, want := range wantIssues {
-		if content.Issues[index].IssueID != want {
-			t.Fatalf("issues[%d].issueId = %q, want %q", index, content.Issues[index].IssueID, want)
-		}
-	}
-	if got, want := content.Requirements[0].RequirementID, "31"; got != want {
-		t.Fatalf("requirements[0].requirementId = %q, want %q", got, want)
-	}
-	if got := content.Summary; got.CaseCount != 3 || got.Passed != 1 || got.Failed != 1 ||
-		got.Blocked != 1 || got.FlakyCount != 1 {
-		t.Fatalf("summary = %+v, want 3 cases / 1 passed / 1 failed / 1 blocked / 1 flaky", got)
-	}
-	if got := content.Requirements[0]; got.CaseCount != 2 || got.Passed != 0 || got.Failed != 1 {
-		t.Fatalf("requirement 31 coverage = %+v, want 2 cases / 0 passed / 1 failed", got)
-	}
-	if got := content.Appendix; got.Environment != "staging" || got.System != "payment" ||
-		got.GeneratedAt != "2026-10-28T10:30:00Z" {
-		t.Fatalf("appendix = %+v", got)
-	}
+	assertLogOrder(t, *fixture.log,
+		"data.wave",
+		"render",
+		"content.put",
+		"repo.insert-refs",
+		"repo.finalize",
+		"repo.set-wave:12:"+fmt.Sprint(report.ID),
+		"event:report.published",
+		"audit:report.published",
+	)
 
-	body := string(markdown)
-	for _, needle := range []string{
-		"# 结算系统 — Batch 2 报告（incremental，revision 1）",
-		"## 1. 执行摘要",
-		"## 2. 需求覆盖",
-		"## 3. 用例结果",
-		"## 4. 问题",
-		"## 5. 风险与结论",
-		"## 6. 附录",
-		"## 7. 覆盖关系图",
-		"```mermaid",
-		"graph LR",
-		"- 报告指纹：" + report.InputFingerprint,
-	} {
-		if !strings.Contains(body, needle) {
-			t.Fatalf("markdown missing %q:\n%s", needle, body)
-		}
-	}
-
-	contentJSON := reportTestContentJSON(t, report)
-	lowerJSON := strings.ToLower(string(contentJSON))
-	lowerMarkdown := strings.ToLower(body)
-	for _, needle := range []string{
-		"password", "storagestate", "authorization", "cookie", "llm_prompt",
-		"evidencebody", "sqlresult", "connectionstring", "markdownpath",
-	} {
-		if strings.Contains(lowerJSON, needle) {
-			t.Fatalf("content JSON leaked sensitive key %q: %s", needle, contentJSON)
-		}
-		if strings.Contains(lowerMarkdown, needle) {
-			t.Fatalf("markdown leaked sensitive key %q", needle)
-		}
-	}
-
-	// A second, independent generation of the same input must produce identical
-	// content bytes, fingerprint and Markdown.
-	other := newReportTestSetup(t)
-	otherReport, otherCreated := other.ensure(t)
-	if !otherCreated {
-		t.Fatal("second setup must create the report")
-	}
-	if !bytes.Equal(contentJSON, reportTestContentJSON(t, otherReport)) {
-		t.Fatal("content bytes differ for identical inputs")
-	}
-	if report.InputFingerprint != otherReport.InputFingerprint {
-		t.Fatal("input fingerprint differs for identical inputs")
-	}
-	if !bytes.Equal(markdown, other.files.files[otherReport.MarkdownPath]) {
-		t.Fatal("markdown bytes differ for identical inputs")
-	}
-	if got := setup.events.countType(ReportEventPublished); got != 1 {
+	if got := fixture.events.count("report.published"); got != 1 {
 		t.Fatalf("report.published events = %d, want 1", got)
 	}
-	if got := setup.audit.actions(); len(got) != 1 || got[0] != ReportActionPublished {
-		t.Fatalf("audit actions = %v, want [%s]", got, ReportActionPublished)
+	event := fixture.events.published[0]
+	if event.versionID != 7 || event.payload["kind"] != "wave" ||
+		event.payload["report_id"] != fmt.Sprint(report.ID) ||
+		event.payload["report_revision_id"] != fmt.Sprint(published.ID) ||
+		event.payload["wave_id"] != "12" ||
+		event.payload["html_ref"] != "5000" {
+		t.Fatalf("report.published event = %+v", event)
 	}
-}
-
-// TestReportEnsureReturnsExistingReport pins that Ensure only creates revision 1
-// once and returns the existing report afterwards.
-func TestReportEnsureReturnsExistingReport(t *testing.T) {
-	setup := newReportTestSetup(t)
-	first, created := setup.ensure(t)
-	if !created {
-		t.Fatal("first Ensure must create")
+	if fixture.audit.calls[0] != "report.published" {
+		t.Fatalf("audit = %v", fixture.audit.calls)
 	}
-	second, created := setup.ensure(t)
-	if created {
-		t.Fatal("second Ensure must not create a report")
-	}
-	if second.ID != first.ID || second.Revision != first.Revision || second.Status != domain.ReportStatusPublished {
-		t.Fatalf("second Ensure returned %+v, want report %d revision 1", second, first.ID)
-	}
-	if len(setup.reports.reports) != 1 {
-		t.Fatalf("stored reports = %d, want 1", len(setup.reports.reports))
-	}
-	if got := setup.events.countType(ReportEventPublished); got != 1 {
-		t.Fatalf("report.published events = %d, want 1", got)
-	}
-}
-
-// TestReportEnsureRejectsForeignBatch pins the version-scoping guard: a batch
-// that belongs to another version must never leak into a report snapshot.
-func TestReportEnsureRejectsForeignBatch(t *testing.T) {
-	setup := newReportTestSetup(t)
-	setup.execution.batch.VersionID = 99
-	_, _, err := setup.service.Ensure(context.Background(), 10, 20, 7)
-	if err == nil {
-		t.Fatal("a batch of another version must be rejected")
-	}
-	var domainErr *domain.Error
-	if !errors.As(err, &domainErr) || domainErr.Kind != domain.KindInvalid {
-		t.Fatalf("error = %v, want a domain invalid error", err)
-	}
-	if len(setup.reports.reports) != 0 {
-		t.Fatal("no report may be created for a foreign batch")
-	}
-}
-
-// TestReportEnsureCleansRowWhenMarkdownWriteFails pins the spec §6.5 retry
-// contract: the row is removed (and no event/audit is emitted) when the
-// Markdown file cannot be written, so the next tick starts clean.
-func TestReportEnsureCleansRowWhenMarkdownWriteFails(t *testing.T) {
-	setup := newReportTestSetup(t)
-	setup.files.writeErr = errors.New("disk full")
-	if _, _, err := setup.service.Ensure(context.Background(), 10, 20, 7); err == nil {
-		t.Fatal("Ensure must report the file write failure")
-	}
-	if len(setup.reports.reports) != 0 {
-		t.Fatalf("stored reports = %d, want 0 after cleanup", len(setup.reports.reports))
-	}
-	if len(setup.reports.deleted) != 1 {
-		t.Fatalf("deleted rows = %v, want one compensating delete", setup.reports.deleted)
-	}
-	if got := setup.events.countType(ReportEventPublished); got != 0 {
-		t.Fatalf("report.published events = %d, want 0", got)
-	}
-	if got := len(setup.audit.actions()); got != 0 {
-		t.Fatalf("audit actions = %d, want 0", got)
-	}
-}
-
-// TestReportStaleMarksOnceAndEnsureRegenerates pins the stale rule of spec
-// §5.5/§6.5: a changed fingerprint flips published→stale exactly once, and the
-// next Ensure appends revision 2 while keeping revision 1.
-func TestReportStaleMarksOnceAndEnsureRegenerates(t *testing.T) {
-	setup := newReportTestSetup(t)
-	first, _ := setup.ensure(t)
-
-	// A rerun changed the latest case run: the fingerprint must change now.
-	setup.execution.cases[0].Status = "passed"
-	setup.execution.cases[0].UpdatedAt = setup.clock.now
-	setup.execution.batch.PassedCount = 2
-	setup.execution.batch.FailedCount = 0
-
-	stale, err := setup.service.Get(context.Background(), 10, first.ID)
+	refs, err := fixture.repo.ListRefs(context.Background(), report.ID)
 	if err != nil {
-		t.Fatalf("get report: %v", err)
+		t.Fatalf("ListRefs: %v", err)
 	}
-	if stale.Status != domain.ReportStatusStale {
-		t.Fatalf("status = %q, want stale", stale.Status)
+	refKinds := make(map[string][]int64, len(refs))
+	for _, ref := range refs {
+		refKinds[ref.Kind] = append(refKinds[ref.Kind], ref.RefID)
 	}
-	if stale.StaleReason == "" {
-		t.Fatal("stale reason must be set")
+	if len(refKinds["wave"]) != 1 || refKinds["wave"][0] != 12 {
+		t.Fatalf("wave refs = %v", refKinds["wave"])
 	}
-	if got := setup.events.countType(ReportEventStale); got != 1 {
+	if len(refKinds["case_run"]) != 1 || refKinds["case_run"][0] != 3001 {
+		t.Fatalf("case_run refs = %v", refKinds["case_run"])
+	}
+	if len(refKinds["issue"]) != 1 || refKinds["issue"][0] != 5001 {
+		t.Fatalf("issue refs = %v", refKinds["issue"])
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Fatalf("Publish ensured tasks: %v", fixture.tasks.calls)
+	}
+}
+
+// TestReportServiceRecordsRendererTemplateVersion pins P7-D-03: every new
+// revision records the template version of the renderer that will render it,
+// not a stale hard-coded constant.
+func TestReportServiceRecordsRendererTemplateVersion(t *testing.T) {
+	fixture := newReportFixture(t)
+	fixture.renderer.templateVer = "2"
+	fixture.data.wave[reportDataWaveKey(7, 12)] = reportTestWaveSnapshot(7, 12)
+
+	report, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport: %v", err)
+	}
+	revision := fixture.repoRevision(t, report.ID, 1)
+	if revision.TemplateVersion != "2" {
+		t.Fatalf("draft template_version = %q, want the renderer version 2", revision.TemplateVersion)
+	}
+	published, err := fixture.svc.Publish(context.Background(), report.ID, 1, "")
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if published.TemplateVersion != "2" {
+		t.Fatalf("published template_version = %q, want 2", published.TemplateVersion)
+	}
+
+	// A renderer that does not report a version keeps the frozen P4 version.
+	fallback := newReportFixture(t)
+	fallback.data.wave[reportDataWaveKey(7, 12)] = reportTestWaveSnapshot(7, 12)
+	fallbackReport, err := fallback.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport fallback: %v", err)
+	}
+	if got := fallback.repoRevision(t, fallbackReport.ID, 1).TemplateVersion; got != "1" {
+		t.Fatalf("fallback template_version = %q, want 1", got)
+	}
+}
+
+// TestReportServiceGetReturnsOnlyCurrentRevisionRefs pins P7-E2E-BUG-01: report
+// detail must project the current revision's refs only (deduplicated by
+// kind/ref_id), never the append-only history of every revision.
+func TestReportServiceGetReturnsOnlyCurrentRevisionRefs(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, first := fixture.seedPublishedWaveReport(7, 12, reportTestFingerprint("a"))
+	second := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	third := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 3})
+	report.CurrentRevisionID = &third.ID
+	fixture.repo.reports[report.ID] = report
+	fixture.repo.refs[report.ID] = []delivery.ReportRef{
+		{ID: 1, ReportID: report.ID, ReportRevisionID: first.ID, Kind: "case_run", RefID: 3001},
+		{ID: 2, ReportID: report.ID, ReportRevisionID: second.ID, Kind: "case_run", RefID: 3001},
+		{ID: 3, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "case_run", RefID: 3001},
+		{ID: 4, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "issue", RefID: 5001},
+		// A duplicate of the same logical ref inside the current revision is
+		// collapsed too (the schema allows append-only duplicates).
+		{ID: 5, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "case_run", RefID: 3001},
+	}
+
+	detail, err := fixture.svc.Get(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(detail.Refs) != 2 {
+		t.Fatalf("detail refs = %+v, want 2 unique current-revision refs", detail.Refs)
+	}
+	if detail.Refs[0].ID != 3 || detail.Refs[0].Kind != "case_run" ||
+		detail.Refs[1].ID != 4 || detail.Refs[1].Kind != "issue" {
+		t.Fatalf("detail refs = %+v, want current revision refs [3 4]", detail.Refs)
+	}
+	for _, ref := range detail.Refs {
+		if ref.ReportRevisionID != third.ID {
+			t.Fatalf("detail ref %+v is not from the current revision %d", ref, third.ID)
+		}
+	}
+	if len(detail.Revisions) != 3 {
+		t.Fatalf("detail revisions = %d, want the full history (3)", len(detail.Revisions))
+	}
+}
+
+// TestReportServiceGetWithoutCurrentRevisionDedupes covers a draft report (no
+// current revision): the detail falls back to the deduplicated union instead of
+// repeating append-only history rows.
+func TestReportServiceGetWithoutCurrentRevisionDedupes(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, revision := fixture.seedWaveReport(7, 12)
+	second := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	fixture.repo.refs[report.ID] = []delivery.ReportRef{
+		{ID: 1, ReportID: report.ID, ReportRevisionID: revision.ID, Kind: "case_run", RefID: 3001},
+		{ID: 2, ReportID: report.ID, ReportRevisionID: second.ID, Kind: "case_run", RefID: 3001},
+	}
+	detail, err := fixture.svc.Get(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(detail.Refs) != 1 || detail.Refs[0].Kind != "case_run" || detail.Refs[0].RefID != 3001 {
+		t.Fatalf("detail refs = %+v, want one deduplicated ref", detail.Refs)
+	}
+}
+
+func TestReportServicePublishIsIdempotentForPublishedRevision(t *testing.T) {
+	fixture := newReportFixture(t)
+	fingerprint := reportTestFingerprint("a")
+	report, revision := fixture.seedPublishedWaveReport(7, 12, fingerprint)
+
+	published, err := fixture.svc.Publish(context.Background(), report.ID, revision.Revision, "ignored")
+	if err != nil {
+		t.Fatalf("Publish published revision: %v", err)
+	}
+	if published.ID != revision.ID || published.Status != delivery.ReportStatusPublished {
+		t.Fatalf("idempotent publish = %+v", published)
+	}
+	if fixture.renderer.calls != 0 || fixture.content.putCalls != 0 {
+		t.Fatalf("idempotent publish re-rendered/wrote: render=%d put=%d", fixture.renderer.calls, fixture.content.putCalls)
+	}
+	if fixture.events.count("report.published") != 0 {
+		t.Fatal("idempotent publish re-emitted report.published")
+	}
+	if got := fixture.events.count("report.published"); got != 0 {
+		t.Fatalf("events = %d", got)
+	}
+	// The wave backfill is still ensured on retry (crash between finalize and
+	// the run_wave update is healed).
+	assertLogOrder(t, *fixture.log, "repo.set-wave:12:"+fmt.Sprint(report.ID))
+}
+
+func TestReportServicePublishRenderFailureMarksFailed(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, revision := fixture.seedWaveReport(7, 12)
+	fixture.renderer.err = errors.New("template exploded")
+
+	if _, err := fixture.svc.Publish(context.Background(), report.ID, revision.Revision, ""); err == nil {
+		t.Fatal("Publish with a renderer error must fail")
+	}
+	failed := fixture.repoRevision(t, report.ID, revision.Revision)
+	if failed.RenderStatus != "failed" || failed.Status != delivery.ReportStatusDraft {
+		t.Fatalf("revision after render failure = %+v", failed)
+	}
+	stored, err := fixture.repo.GetReport(context.Background(), 7, report.ID)
+	if err != nil || stored.Status != delivery.ReportStatusDraft || stored.CurrentRevisionID != nil {
+		t.Fatalf("report after render failure = %+v err=%v", stored, err)
+	}
+	if fixture.content.putCalls != 0 {
+		t.Fatalf("content written after render failure: %d", fixture.content.putCalls)
+	}
+	if fixture.events.count("report.published") != 0 || len(fixture.audit.calls) != 0 {
+		t.Fatal("render failure still emitted event/audit")
+	}
+}
+
+func TestReportServicePublishContentFailureMarksFailed(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, revision := fixture.seedWaveReport(7, 12)
+	fixture.content.putErr = errors.New("content ledger down")
+
+	if _, err := fixture.svc.Publish(context.Background(), report.ID, revision.Revision, ""); err == nil {
+		t.Fatal("Publish with a content error must fail")
+	}
+	failed := fixture.repoRevision(t, report.ID, revision.Revision)
+	if failed.RenderStatus != "failed" {
+		t.Fatalf("revision after content failure = %+v", failed)
+	}
+	stored, _ := fixture.repo.GetReport(context.Background(), 7, report.ID)
+	if stored.Status != delivery.ReportStatusDraft {
+		t.Fatalf("report published after content failure: %+v", stored)
+	}
+}
+
+func TestReportServicePublishRejectsInvalidArguments(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, _ := fixture.seedWaveReport(7, 12)
+
+	if _, err := fixture.svc.Publish(context.Background(), 0, 1, ""); platform.AsError(err).Status != 400 {
+		t.Fatalf("report_id 0 error = %v", err)
+	}
+	if _, err := fixture.svc.Publish(context.Background(), report.ID, 0, ""); platform.AsError(err).Status != 400 {
+		t.Fatalf("revision 0 error = %v", err)
+	}
+	if _, err := fixture.svc.Publish(context.Background(), 999999, 1, ""); platform.AsError(err).Status != 404 {
+		t.Fatalf("missing report error = %v", err)
+	}
+	if _, err := fixture.svc.Publish(context.Background(), report.ID, 99, ""); platform.AsError(err).Status != 404 {
+		t.Fatalf("missing revision error = %v", err)
+	}
+}
+
+func TestReportServiceEnsureWaveReportCreatesDraftAndTask(t *testing.T) {
+	fixture := newReportFixture(t)
+	fixture.data.wave[reportDataWaveKey(7, 12)] = reportTestWaveSnapshot(7, 12)
+
+	first, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport: %v", err)
+	}
+	if first.ID == 0 || first.Kind != delivery.ReportKindWave || first.Status != delivery.ReportStatusDraft {
+		t.Fatalf("ensured report = %+v", first)
+	}
+	revisions, err := fixture.repo.ListRevisions(context.Background(), first.ID)
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("revisions = %+v err=%v", revisions, err)
+	}
+	if revisions[0].Revision != 1 || revisions[0].Status != delivery.ReportStatusDraft ||
+		revisions[0].RenderStatus != "pending" || revisions[0].InputFingerprint == "" {
+		t.Fatalf("draft revision = %+v", revisions[0])
+	}
+	if len(fixture.tasks.calls) != 1 || fixture.tasks.calls[0] != fmt.Sprintf("task:%d:1", first.ID) {
+		t.Fatalf("tasks = %v", fixture.tasks.calls)
+	}
+
+	// A second ensure while the draft is pending reuses the revision and
+	// ensures the same task (idempotent reconciler call).
+	second, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil || second.ID != first.ID {
+		t.Fatalf("second EnsureWaveReport = %+v err=%v", second, err)
+	}
+	revisions, _ = fixture.repo.ListRevisions(context.Background(), first.ID)
+	if len(revisions) != 1 {
+		t.Fatalf("second ensure created revisions: %d", len(revisions))
+	}
+	if len(fixture.tasks.calls) != 2 || fixture.tasks.calls[1] != fixture.tasks.calls[0] {
+		t.Fatalf("tasks after second ensure = %v", fixture.tasks.calls)
+	}
+
+	// A failed draft is left for audit; the next ensure allocates a new
+	// revision and task.
+	if err := fixture.repo.MarkRenderMetadata(context.Background(), revisions[0].ID, "failed", "boom"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	third, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil || third.ID != first.ID {
+		t.Fatalf("third EnsureWaveReport = %+v err=%v", third, err)
+	}
+	revisions, _ = fixture.repo.ListRevisions(context.Background(), first.ID)
+	if len(revisions) != 2 || revisions[0].Revision != 2 || revisions[1].Status != delivery.ReportStatusDraft {
+		t.Fatalf("revisions after failed draft = %+v", revisions)
+	}
+	if fixture.tasks.calls[len(fixture.tasks.calls)-1] != fmt.Sprintf("task:%d:2", first.ID) {
+		t.Fatalf("tasks after failed draft = %v", fixture.tasks.calls)
+	}
+}
+
+func TestReportServiceEnsureVersionReportCreatesDraftAndTask(t *testing.T) {
+	fixture := newReportFixture(t)
+	fixture.data.version[7] = reportTestVersionSnapshot(7)
+
+	report, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("EnsureVersionReport: %v", err)
+	}
+	if report.Kind != delivery.ReportKindVersion || report.WaveID != nil || report.Status != delivery.ReportStatusDraft {
+		t.Fatalf("ensured version report = %+v", report)
+	}
+	revisions, err := fixture.repo.ListRevisions(context.Background(), report.ID)
+	if err != nil || len(revisions) != 1 || revisions[0].Revision != 1 {
+		t.Fatalf("version revisions = %+v err=%v", revisions, err)
+	}
+	if len(fixture.tasks.calls) != 1 || fixture.tasks.calls[0] != fmt.Sprintf("task:%d:1", report.ID) {
+		t.Fatalf("tasks = %v", fixture.tasks.calls)
+	}
+}
+
+func TestReportServiceRegenerateCreatesNextRevision(t *testing.T) {
+	fixture := newReportFixture(t)
+	fingerprint := reportTestFingerprint("a")
+	report, _ := fixture.seedPublishedWaveReport(7, 12, fingerprint)
+
+	next, err := fixture.svc.Regenerate(context.Background(), 7, report.ID)
+	if err != nil || next != 2 {
+		t.Fatalf("Regenerate = %d err=%v, want 2", next, err)
+	}
+	revision := fixture.repoRevision(t, report.ID, 2)
+	if revision.Status != delivery.ReportStatusDraft || revision.RenderStatus != "pending" || revision.InputFingerprint == "" {
+		t.Fatalf("regenerated revision = %+v", revision)
+	}
+	if fixture.tasks.calls[len(fixture.tasks.calls)-1] != fmt.Sprintf("task:%d:2", report.ID) {
+		t.Fatalf("tasks = %v", fixture.tasks.calls)
+	}
+	// Old published revision stays published and readable.
+	old := fixture.repoRevision(t, report.ID, 1)
+	if old.Status != delivery.ReportStatusPublished || old.HTMLRef == nil || *old.HTMLRef != 5001 {
+		t.Fatalf("old revision changed: %+v", old)
+	}
+
+	// A pending next revision is idempotent: the same revision/task is reused.
+	again, err := fixture.svc.Regenerate(context.Background(), 7, report.ID)
+	if err != nil || again != 2 {
+		t.Fatalf("second Regenerate = %d err=%v, want 2", again, err)
+	}
+	revisions, _ := fixture.repo.ListRevisions(context.Background(), report.ID)
+	if len(revisions) != 2 {
+		t.Fatalf("second regenerate created revisions: %d", len(revisions))
+	}
+	if got := fixture.tasks.calls[len(fixture.tasks.calls)-1]; got != fmt.Sprintf("task:%d:2", report.ID) {
+		t.Fatalf("task after second regenerate = %q", got)
+	}
+
+	// A failed draft is skipped and the next number is used.
+	if err := fixture.repo.MarkRenderMetadata(context.Background(), revision.ID, "failed", "boom"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	third, err := fixture.svc.Regenerate(context.Background(), 7, report.ID)
+	if err != nil || third != 3 {
+		t.Fatalf("third Regenerate = %d err=%v, want 3", third, err)
+	}
+}
+
+func TestReportServiceMarkStaleIfChangedOnlyCurrentOnce(t *testing.T) {
+	fixture := newReportFixture(t)
+	// The wave report's stored fingerprint matches the recomputed one.
+	waveReport, _ := fixture.seedPublishedWaveReport(7, 12, "")
+	waveSnapshot := reportTestWaveSnapshot(7, 12)
+	waveReport.InputFingerprint = delivery.Fingerprint(waveSnapshot)
+	fixture.repo.reports[waveReport.ID] = waveReport
+	// The version report is stale (stored fingerprint all "a").
+	versionReport, versionRevision := fixture.seedPublishedVersionReport(7, reportTestFingerprint("a"))
+
+	changed, err := fixture.svc.MarkStaleIfChanged(context.Background(), 7)
+	if err != nil || !changed {
+		t.Fatalf("MarkStaleIfChanged = %v err=%v, want true", changed, err)
+	}
+	waveAfter, _ := fixture.repo.GetReportByID(context.Background(), waveReport.ID)
+	if waveAfter.Status != delivery.ReportStatusPublished {
+		t.Fatalf("matching wave report was staled: %+v", waveAfter)
+	}
+	versionAfter, _ := fixture.repo.GetReportByID(context.Background(), versionReport.ID)
+	if versionAfter.Status != delivery.ReportStatusStale {
+		t.Fatalf("changed version report = %+v, want stale", versionAfter)
+	}
+	// The published revision itself remains published (content immutable).
+	revisionAfter := fixture.repoRevision(t, versionReport.ID, versionRevision.Revision)
+	if revisionAfter.Status != delivery.ReportStatusPublished {
+		t.Fatalf("stale marking changed the revision: %+v", revisionAfter)
+	}
+	if got := fixture.events.count("report.stale"); got != 1 {
 		t.Fatalf("report.stale events = %d, want 1", got)
 	}
-	if _, err := setup.service.Get(context.Background(), 10, first.ID); err != nil {
-		t.Fatalf("get stale report again: %v", err)
-	}
-	if got := setup.events.countType(ReportEventStale); got != 1 {
-		t.Fatalf("report.stale events after second read = %d, want 1", got)
+	if event := fixture.events.published[0]; event.payload["reason"] != "input_changed" ||
+		event.payload["kind"] != "version" || event.payload["current_revision"] != int32(1) {
+		t.Fatalf("report.stale event = %+v", event)
 	}
 
-	regenerated, created := setup.ensure(t)
-	if !created {
-		t.Fatal("Ensure on a stale report must create a new revision")
+	// Second pass: already stale, so no change and no duplicate event.
+	changed, err = fixture.svc.MarkStaleIfChanged(context.Background(), 7)
+	if err != nil || changed {
+		t.Fatalf("second MarkStaleIfChanged = %v err=%v, want false", changed, err)
 	}
-	if regenerated.Revision != 2 {
-		t.Fatalf("revision = %d, want 2", regenerated.Revision)
-	}
-	if regenerated.ID == first.ID {
-		t.Fatal("regenerated report reused the old id")
-	}
-	if got := setup.reports.reports[first.ID].Status; got != domain.ReportStatusStale {
-		t.Fatalf("old revision status = %q, want stale", got)
-	}
-	if got := setup.events.countType(ReportEventPublished); got != 2 {
-		t.Fatalf("report.published events = %d, want 2", got)
+	if got := fixture.events.count("report.stale"); got != 1 {
+		t.Fatalf("report.stale events after second pass = %d, want 1", got)
 	}
 }
 
-// TestReportSnapshotRecordsBaseFallback pins the D49 snapshot fields of §7.3:
-// the batch's base_fallback_reason is recorded both as the raw reason and as
-// the history_rewritten flag, and the Markdown export carries the code baseline
-// and fallback marker.
-func TestReportSnapshotRecordsBaseFallback(t *testing.T) {
-	setup := newReportTestSetup(t)
-	setup.execution.batch.BaseFallbackReason = "history_rewritten"
-	report, _ := setup.ensure(t)
+func TestReportServiceOpenHTMLValidatesOwnership(t *testing.T) {
+	fixture := newReportFixture(t)
+	fingerprint := reportTestFingerprint("a")
+	report, revision := fixture.seedPublishedWaveReport(7, 12, fingerprint)
+	html := []byte("<!doctype html><html><body>report</body></html>")
+	fixture.content.seed(5001, revision.ID, html)
 
-	if report.Content.Batch.BaseFallbackReason == nil ||
-		*report.Content.Batch.BaseFallbackReason != "history_rewritten" {
-		t.Fatalf("baseFallbackReason = %v, want history_rewritten",
-			report.Content.Batch.BaseFallbackReason)
+	got, gotRevision, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, revision.Revision)
+	if err != nil {
+		t.Fatalf("OpenHTML: %v", err)
 	}
-	if report.Content.Batch.HistoryRewritten == nil || !*report.Content.Batch.HistoryRewritten {
-		t.Fatalf("historyRewritten = %v, want true", report.Content.Batch.HistoryRewritten)
+	if string(got) != string(html) || gotRevision.ID != revision.ID {
+		t.Fatalf("OpenHTML = %q revision=%+v", got, gotRevision)
 	}
-	body := string(setup.files.files[report.MarkdownPath])
-	for _, needle := range []string{
-		"- 代码基线：" + setup.versions.version.CodeBaselineCommit,
-		"- 回退标记：history_rewritten（历史已回退）",
-	} {
-		if !strings.Contains(body, needle) {
-			t.Fatalf("markdown missing %q:\n%s", needle, body)
+	if fixture.content.lastOpenID != 5001 {
+		t.Fatalf("opened content ref = %d, want 5001", fixture.content.lastOpenID)
+	}
+
+	// Version ownership: a report from another version is not found.
+	if _, _, err := fixture.svc.OpenHTML(context.Background(), 8, report.ID, revision.Revision); platform.AsError(err).Status != 404 {
+		t.Fatalf("wrong version error = %v, want 404", err)
+	}
+	// A draft revision is not readable.
+	draft := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	if _, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, draft.Revision); platform.AsError(err).Status != 404 {
+		t.Fatalf("draft revision error = %v, want 404", err)
+	}
+	// Missing revision is not found.
+	if _, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, 99); platform.AsError(err).Status != 404 {
+		t.Fatalf("missing revision error = %v, want 404", err)
+	}
+}
+
+func TestReportServiceOpenHTMLMapsContentFailures(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, revision := fixture.seedPublishedWaveReport(7, 12, reportTestFingerprint("a"))
+
+	fixture.content.openErr = ErrReportContentNotFound
+	if _, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, revision.Revision); platform.AsError(err).Status != 404 {
+		t.Fatalf("missing content error = %v, want 404", err)
+	}
+	fixture.content.openErr = ErrReportContentCorrupt
+	_, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, revision.Revision)
+	if platform.AsError(err).Status != 409 || platform.AsError(err).Details["reason"] != "report_content_corrupt" {
+		t.Fatalf("corrupt content error = %#v", platform.AsError(err))
+	}
+	// A returned SHA that is not a lowercase hex sha256 is also a 409.
+	fixture.content.openErr = nil
+	html := []byte("bytes")
+	fixture.content.seed(5001, revision.ID, html)
+	fixture.content.openSHA = "not-a-sha"
+	if _, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, revision.Revision); platform.AsError(err).Status != 409 {
+		t.Fatalf("sha mismatch error = %v, want 409", err)
+	}
+}
+
+func TestReportServiceOpenHTMLOldRevisionStaysReadable(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, first := fixture.seedPublishedWaveReport(7, 12, reportTestFingerprint("a"))
+	second := fixture.repo.seedRevision(delivery.ReportRevision{
+		ReportID: report.ID, Revision: 2, Status: delivery.ReportStatusPublished,
+		RenderStatus: "done", HTMLRef: func() *int64 { value := int64(5002); return &value }(),
+		InputFingerprint: reportTestFingerprint("b"),
+	})
+	fixture.content.seed(5001, first.ID, []byte("first"))
+	fixture.content.seed(5002, second.ID, []byte("second"))
+
+	firstBody, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, 1)
+	if err != nil || string(firstBody) != "first" {
+		t.Fatalf("old revision read = %q err=%v", firstBody, err)
+	}
+	secondBody, _, err := fixture.svc.OpenHTML(context.Background(), 7, report.ID, 2)
+	if err != nil || string(secondBody) != "second" {
+		t.Fatalf("new revision read = %q err=%v", secondBody, err)
+	}
+}
+
+func TestReportServicePublishesEmptySnapshot(t *testing.T) {
+	fixture := newReportFixture(t)
+	fixture.data.wave[reportDataWaveKey(7, 12)] = delivery.ReportSnapshot{Kind: delivery.ReportKindWave, VersionID: 7}
+	report, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport empty: %v", err)
+	}
+	revision := fixture.repoRevision(t, report.ID, 1)
+	published, err := fixture.svc.Publish(context.Background(), report.ID, revision.Revision, "")
+	if err != nil {
+		t.Fatalf("Publish empty snapshot: %v", err)
+	}
+	if published.InputFingerprint == "" || len(published.InputFingerprint) != 64 {
+		t.Fatalf("empty snapshot fingerprint = %q", published.InputFingerprint)
+	}
+	if fixture.renderer.lastSnapshot.Issues == nil && fixture.renderer.lastSnapshot.Waves == nil {
+		// nil slices are acceptable; the renderer normalizes them to empty
+		// sections. This assertion only documents that empty data is valid.
+	}
+	if fixture.content.putCalls != 1 {
+		t.Fatalf("empty snapshot content writes = %d", fixture.content.putCalls)
+	}
+}
+
+func TestReportServiceCapsOversizedSnapshot(t *testing.T) {
+	fixture := newReportFixture(t)
+	snapshot := delivery.ReportSnapshot{Kind: delivery.ReportKindWave, VersionID: 7}
+	waveID := int64(12)
+	snapshot.WaveID = &waveID
+	for id := int64(delivery.MaxReportIssues + 2); id >= 1; id-- {
+		snapshot.Issues = append(snapshot.Issues, delivery.IssueSnapshot{ID: id, VersionID: 7, Title: "issue"})
+	}
+	for id := int64(delivery.MaxReportWaves + 1); id >= 1; id-- {
+		snapshot.Waves = append(snapshot.Waves, delivery.WaveSnapshot{ID: id, VersionID: 7, Status: "done"})
+	}
+	for id := int64(delivery.MaxReportCaseRuns + 3); id >= 1; id-- {
+		snapshot.CaseRuns = append(snapshot.CaseRuns, delivery.CaseRunSnapshot{ID: id, VersionID: 7, WaveID: 12})
+	}
+	fixture.data.wave[reportDataWaveKey(7, 12)] = snapshot
+	report, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport: %v", err)
+	}
+	if _, err := fixture.svc.Publish(context.Background(), report.ID, 1, ""); err != nil {
+		t.Fatalf("Publish oversized: %v", err)
+	}
+	captured := fixture.renderer.lastSnapshot
+	if len(captured.Issues) != delivery.MaxReportIssues ||
+		len(captured.Waves) != delivery.MaxReportWaves ||
+		len(captured.CaseRuns) != delivery.MaxReportCaseRuns {
+		t.Fatalf("caps not applied: issues=%d waves=%d case_runs=%d",
+			len(captured.Issues), len(captured.Waves), len(captured.CaseRuns))
+	}
+	want := []string{delivery.ReportTruncationIssues, delivery.ReportTruncationWaves, delivery.ReportTruncationCaseRuns}
+	if len(captured.TruncatedSections) != len(want) {
+		t.Fatalf("TruncatedSections = %v, want %v", captured.TruncatedSections, want)
+	}
+	for index := range want {
+		if captured.TruncatedSections[index] != want[index] {
+			t.Fatalf("TruncatedSections = %v, want %v", captured.TruncatedSections, want)
 		}
 	}
-}
-
-// TestReportSnapshotRecordsNoFallbackForNewReport pins that a freshly generated
-// report always records the D49 fields: an absent reason is the explicit "no
-// fallback" state, distinct from the legacy "unrecorded" state.
-func TestReportSnapshotRecordsNoFallbackForNewReport(t *testing.T) {
-	setup := newReportTestSetup(t)
-	report, _ := setup.ensure(t)
-
-	if report.Content.Batch.BaseFallbackReason == nil ||
-		*report.Content.Batch.BaseFallbackReason != "" {
-		t.Fatalf("baseFallbackReason = %v, want recorded empty reason",
-			report.Content.Batch.BaseFallbackReason)
+	if captured.Issues[0].ID != 1 || captured.Issues[len(captured.Issues)-1].ID != delivery.MaxReportIssues {
+		t.Fatalf("issues are not the first N by id: first=%d last=%d",
+			captured.Issues[0].ID, captured.Issues[len(captured.Issues)-1].ID)
 	}
-	if report.Content.Batch.HistoryRewritten == nil || *report.Content.Batch.HistoryRewritten {
-		t.Fatalf("historyRewritten = %v, want recorded false", report.Content.Batch.HistoryRewritten)
+	stored, err := fixture.repo.GetReport(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("GetReport: %v", err)
 	}
-	body := string(setup.files.files[report.MarkdownPath])
-	if !strings.Contains(body, "- 回退标记：无") {
-		t.Fatalf("markdown missing the no-fallback marker:\n%s", body)
+	if stored.InputFingerprint != delivery.Fingerprint(captured) {
+		t.Fatal("stored fingerprint is not the fingerprint of the capped snapshot")
 	}
 }
 
-// TestReportLegacyD49SnapshotStaysUnrecorded pins "missing D49 fields display as
-// unrecorded and never rewrite history": reading a legacy revision whose stored
-// snapshot predates the fields keeps them nil and does not add them to the JSON.
-func TestReportLegacyD49SnapshotStaysUnrecorded(t *testing.T) {
-	setup := newReportTestSetup(t)
-	fingerprint, err := setup.service.currentFingerprint(context.Background(), 10, 20)
-	if err != nil {
-		t.Fatalf("current fingerprint: %v", err)
-	}
-	legacy := reportTestStoredReport(901, 10, 20, domain.ReportStatusPublished,
-		domain.ReportContent{
-			Schema: domain.ReportSchemaV1,
-			Batch:  domain.ReportBatch{ID: "20", BatchNo: 2, Kind: "incremental", Status: "done"},
-		}, setup.clock.now)
-	legacy.InputFingerprint = fingerprint
-	setup.reports.reports[legacy.ID] = legacy
-
-	loaded, err := setup.service.Get(context.Background(), 10, legacy.ID)
-	if err != nil {
-		t.Fatalf("get legacy report: %v", err)
-	}
-	if loaded.Status != domain.ReportStatusPublished {
-		t.Fatalf("legacy status = %q, want published (matching fingerprint)", loaded.Status)
-	}
-	if loaded.Content.Batch.BaseFallbackReason != nil || loaded.Content.Batch.HistoryRewritten != nil {
-		t.Fatalf("legacy D49 fields were rewritten: %+v", loaded.Content.Batch)
-	}
-	encoded := string(reportTestContentJSON(t, loaded))
-	for _, key := range []string{"baseFallbackReason", "historyRewritten"} {
-		if strings.Contains(encoded, key) {
-			t.Fatalf("legacy snapshot gained %q on read: %s", key, encoded)
+func TestReportServiceEnsureReports(t *testing.T) {
+	t.Run("creates terminal wave reports only", func(t *testing.T) {
+		fixture := newReportFixture(t)
+		versionID := int64(7)
+		terminalA, terminalB := int64(11), int64(12)
+		active := int64(13)
+		fixture.data.version[versionID] = delivery.ReportSnapshot{
+			Kind: delivery.ReportKindVersion, VersionID: versionID,
+			Requirements: []delivery.RequirementSnapshot{{ID: 101, VersionID: versionID, Status: "draft"}},
+			Waves: []delivery.WaveSnapshot{
+				{ID: terminalA, VersionID: versionID, Status: "done"},
+				{ID: terminalB, VersionID: versionID, Status: "failed"},
+				{ID: active, VersionID: versionID, Status: "running"},
+			},
 		}
-	}
-}
+		fixture.data.wave[reportDataWaveKey(versionID, terminalA)] = reportTestWaveSnapshot(versionID, terminalA)
+		fixture.data.wave[reportDataWaveKey(versionID, terminalB)] = reportTestWaveSnapshot(versionID, terminalB)
 
-// TestReportStaleOnEvidenceCountChange pins the §7.3 stale linkage: an evidence
-// count change alone marks the published report stale and emits report.stale
-// exactly once with a reason; the old revision keeps its snapshot and Markdown,
-// and Ensure appends revision+1.
-func TestReportStaleOnEvidenceCountChange(t *testing.T) {
-	setup := newReportTestSetup(t)
-	first, _ := setup.ensure(t)
-	oldContentJSON := reportTestContentJSON(t, first)
-	oldMarkdown := append([]byte(nil), setup.files.files[first.MarkdownPath]...)
-
-	// A new evidence row was attached to the latest run: only the evidence count
-	// changes (status, failure class, batch tallies and timestamps are unchanged).
-	setup.execution.cases[0].EvidenceCount++
-
-	stale, err := setup.service.Get(context.Background(), 10, first.ID)
-	if err != nil {
-		t.Fatalf("get report after evidence change: %v", err)
-	}
-	if stale.Status != domain.ReportStatusStale {
-		t.Fatalf("status = %q, want stale after an evidence count change", stale.Status)
-	}
-	if stale.StaleReason != ReportStaleReasonInputChanged {
-		t.Fatalf("stale reason = %q, want %q", stale.StaleReason, ReportStaleReasonInputChanged)
-	}
-	if got := setup.events.countType(ReportEventStale); got != 1 {
-		t.Fatalf("report.stale events = %d, want 1", got)
-	}
-	for _, event := range setup.events.events {
-		if event.Type == ReportEventStale && event.Detail["reason"] != ReportStaleReasonInputChanged {
-			t.Fatalf("report.stale detail reason = %v, want %q",
-				event.Detail["reason"], ReportStaleReasonInputChanged)
+		if err := fixture.svc.EnsureReports(context.Background(), versionID); err != nil {
+			t.Fatalf("EnsureReports: %v", err)
 		}
-	}
-
-	// A second read must not publish a second report.stale event.
-	if _, err := setup.service.Get(context.Background(), 10, first.ID); err != nil {
-		t.Fatalf("get stale report again: %v", err)
-	}
-	if got := setup.events.countType(ReportEventStale); got != 1 {
-		t.Fatalf("report.stale events after second read = %d, want 1", got)
-	}
-
-	regenerated, created := setup.ensure(t)
-	if !created {
-		t.Fatal("Ensure on a stale report must create a new revision")
-	}
-	if regenerated.Revision != first.Revision+1 {
-		t.Fatalf("revision = %d, want %d", regenerated.Revision, first.Revision+1)
-	}
-	if got := reportTestCaseEvidenceCount(t, regenerated.Content, "12"); got != 5 {
-		t.Fatalf("regenerated evidence count = %d, want 5", got)
-	}
-	if got := reportTestCaseEvidenceCount(t, first.Content, "12"); got != 4 {
-		t.Fatalf("old revision evidence count = %d, want 4", got)
-	}
-
-	// The old revision keeps its snapshot and Markdown bytes untouched (only its
-	// status/staleReason change, which is the stale linkage itself).
-	storedOld := setup.reports.reports[first.ID]
-	if !bytes.Equal(reportTestContentJSON(t, storedOld), oldContentJSON) {
-		t.Fatal("old revision snapshot was rewritten")
-	}
-	if !bytes.Equal(setup.files.files[storedOld.MarkdownPath], oldMarkdown) {
-		t.Fatal("old revision markdown was rewritten")
-	}
-	if storedOld.Status != domain.ReportStatusStale {
-		t.Fatalf("old revision status = %q, want stale", storedOld.Status)
-	}
-	if got := setup.events.countType(ReportEventPublished); got != 2 {
-		t.Fatalf("report.published events = %d, want 2", got)
-	}
-}
-
-// TestReportRegenerateCreatesNextRevision pins POST regenerate semantics:
-// revision max+1, old revision retained, and a newer revision returned as-is.
-func TestReportRegenerateCreatesNextRevision(t *testing.T) {
-	setup := newReportTestSetup(t)
-	first, _ := setup.ensure(t)
-
-	regenerated, err := setup.service.Regenerate(context.Background(), 10, first.ID, 8)
-	if err != nil {
-		t.Fatalf("regenerate: %v", err)
-	}
-	if regenerated.Revision != 2 || regenerated.ID == first.ID {
-		t.Fatalf("regenerated = id %d revision %d, want a new id at revision 2", regenerated.ID, regenerated.Revision)
-	}
-	if _, ok := setup.reports.reports[first.ID]; !ok {
-		t.Fatal("old revision must be retained")
-	}
-	if got := setup.reports.reports[regenerated.ID].MarkdownPath; got == setup.reports.reports[first.ID].MarkdownPath {
-		t.Fatal("each revision must write its own Markdown file")
-	}
-
-	latest, err := setup.service.Regenerate(context.Background(), 10, first.ID, 9)
-	if err != nil {
-		t.Fatalf("regenerate old id: %v", err)
-	}
-	if latest.ID != regenerated.ID || latest.Revision != 2 {
-		t.Fatalf("regenerating an old revision returned id %d revision %d, want latest report %d", latest.ID, latest.Revision, regenerated.ID)
-	}
-}
-
-// TestReportMarkdownDegradedWarning pins the degraded warning of §6.3.
-func TestReportMarkdownDegradedWarning(t *testing.T) {
-	setup := newReportTestSetup(t)
-	setup.execution.batch.Degraded = true
-	report, _ := setup.ensure(t)
-	body := string(setup.files.files[report.MarkdownPath])
-	if !strings.Contains(body, "降级") {
-		t.Fatalf("markdown missing the degraded warning:\n%s", body)
-	}
-	if !report.Content.Degraded {
-		t.Fatal("content degraded flag must be true")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// diff / export / publish / list
-// ---------------------------------------------------------------------------
-
-func reportTestStoredReport(id, versionID, batchID int64, status string, content domain.ReportContent, createdAt time.Time) domain.Report {
-	report := domain.Report{
-		ID:               id,
-		VersionID:        versionID,
-		BatchID:          batchID,
-		Revision:         1,
-		Status:           status,
-		Title:            "报告",
-		Content:          content,
-		InputFingerprint: strings.Repeat("e", 64),
-		CreatedAt:        createdAt,
-		UpdatedAt:        createdAt,
-	}
-	if status == domain.ReportStatusPublished {
-		report.PublishedAt = &createdAt
-	}
-	return report
-}
-
-// TestReportDiffUsesExplicitAndDefaultBase pins the diff wiring: explicit base,
-// default previous report, batch numbers and the classified counts.
-func TestReportDiffUsesExplicitAndDefaultBase(t *testing.T) {
-	setup := newReportTestSetup(t)
-	baseContent := domain.ReportContent{
-		Schema: domain.ReportSchemaV1,
-		Batch:  domain.ReportBatch{ID: "19", BatchNo: 1, Kind: "baseline", Status: "done"},
-		Cases: []domain.ReportCase{
-			{CaseRunID: "201", CaseNodeID: "101", Title: "A", Source: "baseline", Status: "passed", Attempt: 1},
-			{CaseRunID: "202", CaseNodeID: "102", Title: "B", Source: "baseline", Status: "failed", Attempt: 1},
-			{CaseRunID: "203", CaseNodeID: "103", Title: "C", Source: "baseline", Status: "passed", Attempt: 1},
-		},
-		Issues: []domain.ReportIssue{
-			{IssueID: "201", Title: "旧问题", Severity: "major", Status: "open"},
-		},
-	}
-	targetContent := domain.ReportContent{
-		Schema: domain.ReportSchemaV1,
-		Batch:  domain.ReportBatch{ID: "20", BatchNo: 2, Kind: "incremental", Status: "done"},
-		Cases: []domain.ReportCase{
-			{CaseRunID: "301", CaseNodeID: "101", Title: "A", Source: "baseline", Status: "passed", Attempt: 1},
-			{CaseRunID: "302", CaseNodeID: "102", Title: "B", Source: "baseline", Status: "passed", Attempt: 1},
-			{CaseRunID: "303", CaseNodeID: "103", Title: "C", Source: "baseline", Status: "failed", Attempt: 1},
-			{CaseRunID: "304", CaseNodeID: "104", Title: "D", Source: "ai_supplement", Status: "passed", Attempt: 1},
-		},
-		Issues: []domain.ReportIssue{
-			{IssueID: "202", Title: "新问题", Severity: "blocker", Status: "open"},
-		},
-	}
-	baseTime := time.Date(2026, 10, 28, 9, 0, 0, 0, time.UTC)
-	targetTime := baseTime.Add(time.Hour)
-	base := reportTestStoredReport(500, 10, 19, domain.ReportStatusPublished, baseContent, baseTime)
-	target := reportTestStoredReport(501, 10, 20, domain.ReportStatusPublished, targetContent, targetTime)
-	setup.reports.reports[base.ID] = base
-	setup.reports.reports[target.ID] = target
-
-	explicit, err := setup.service.Diff(context.Background(), 10, target.ID, &base.ID)
-	if err != nil {
-		t.Fatalf("diff with explicit base: %v", err)
-	}
-	if explicit.BaseReportID != base.ID || explicit.TargetReportID != target.ID {
-		t.Fatalf("diff ids = (%d,%d), want (%d,%d)", explicit.BaseReportID, explicit.TargetReportID, base.ID, target.ID)
-	}
-	if explicit.BaseBatchNo != 1 || explicit.TargetBatchNo != 2 {
-		t.Fatalf("batch numbers = (%d,%d), want (1,2)", explicit.BaseBatchNo, explicit.TargetBatchNo)
-	}
-	want := domain.ReportDiffSummary{
-		AddedIssues: 1, FixedIssues: 1, Regressed: 1, Recovered: 1, NewCases: 1,
-	}
-	if explicit.Summary != want {
-		t.Fatalf("summary = %+v, want %+v", explicit.Summary, want)
-	}
-	if len(explicit.RegressedCases) != 1 || explicit.RegressedCases[0].CaseNodeID != 103 {
-		t.Fatalf("regressed cases = %+v", explicit.RegressedCases)
-	}
-	if len(explicit.RecoveredCases) != 1 || explicit.RecoveredCases[0].CaseNodeID != 102 {
-		t.Fatalf("recovered cases = %+v", explicit.RecoveredCases)
-	}
-
-	byDefault, err := setup.service.Diff(context.Background(), 10, target.ID, nil)
-	if err != nil {
-		t.Fatalf("diff with default base: %v", err)
-	}
-	if byDefault.BaseReportID != base.ID {
-		t.Fatalf("default base report = %d, want %d", byDefault.BaseReportID, base.ID)
-	}
-	if byDefault.Summary != explicit.Summary {
-		t.Fatalf("default diff summary = %+v, want %+v", byDefault.Summary, explicit.Summary)
-	}
-}
-
-// TestReportDiffDefaultBaseIsPreviousBatchLatest pins spec §6.5/§7.4: the
-// default diff base is the latest report of the previous batch (batch_no-1),
-// even when that report was regenerated after the target report was created.
-func TestReportDiffDefaultBaseIsPreviousBatchLatest(t *testing.T) {
-	setup := newReportTestSetup(t)
-	baseContent := domain.ReportContent{
-		Schema: domain.ReportSchemaV1,
-		Batch:  domain.ReportBatch{ID: "19", BatchNo: 1, Kind: "baseline", Status: "done"},
-		Cases: []domain.ReportCase{
-			{CaseRunID: "201", CaseNodeID: "101", Title: "A", Source: "baseline", Status: "failed", Attempt: 1},
-		},
-	}
-	targetContent := domain.ReportContent{
-		Schema: domain.ReportSchemaV1,
-		Batch:  domain.ReportBatch{ID: "20", BatchNo: 2, Kind: "incremental", Status: "done"},
-		Cases: []domain.ReportCase{
-			{CaseRunID: "301", CaseNodeID: "101", Title: "A", Source: "baseline", Status: "passed", Attempt: 1},
-		},
-	}
-	created := time.Date(2026, 10, 28, 9, 0, 0, 0, time.UTC)
-	target := reportTestStoredReport(501, 10, 20, domain.ReportStatusPublished, targetContent, created)
-	// Revision 1 of the previous batch predates the target; revision 2, the
-	// latest, was regenerated afterwards. The default base must be revision 2.
-	oldBase := reportTestStoredReport(500, 10, 19, domain.ReportStatusPublished, baseContent, created.Add(-time.Hour))
-	regeneratedBase := reportTestStoredReport(502, 10, 19, domain.ReportStatusPublished, baseContent, created.Add(2*time.Hour))
-	regeneratedBase.Revision = 2
-	setup.reports.reports[target.ID] = target
-	setup.reports.reports[oldBase.ID] = oldBase
-	setup.reports.reports[regeneratedBase.ID] = regeneratedBase
-
-	diff, err := setup.service.Diff(context.Background(), 10, target.ID, nil)
-	if err != nil {
-		t.Fatalf("diff with default base: %v", err)
-	}
-	if diff.BaseReportID != regeneratedBase.ID {
-		t.Fatalf("default base = report %d, want previous batch's latest report %d",
-			diff.BaseReportID, regeneratedBase.ID)
-	}
-	if diff.BaseBatchNo != 1 || diff.TargetBatchNo != 2 {
-		t.Fatalf("batch numbers = (%d,%d), want (1,2)", diff.BaseBatchNo, diff.TargetBatchNo)
-	}
-	if want := (domain.ReportDiffSummary{Recovered: 1}); diff.Summary != want {
-		t.Fatalf("summary = %+v, want %+v", diff.Summary, want)
-	}
-	wantLookup := reportFakeBatchLookup{VersionID: 10, BatchID: 20}
-	if len(setup.execution.previousCalls) != 1 || setup.execution.previousCalls[0] != wantLookup {
-		t.Fatalf("PreviousBatchID calls = %+v, want [%+v]", setup.execution.previousCalls, wantLookup)
-	}
-}
-
-// TestReportDiffWithoutPreviousReportIsClearNotFound pins the missing default
-// base contract: no previous batch, or a previous batch without a report, is a
-// clear 404 that names no target id. Another batch's report is never borrowed
-// as the base.
-func TestReportDiffWithoutPreviousReportIsClearNotFound(t *testing.T) {
-	setup := newReportTestSetup(t)
-	content := domain.ReportContent{
-		Schema: domain.ReportSchemaV1,
-		Batch:  domain.ReportBatch{ID: "20", BatchNo: 2, Kind: "incremental", Status: "done"},
-	}
-	created := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
-	target := reportTestStoredReport(501, 10, 20, domain.ReportStatusPublished, content, created)
-	// Created before the target, but not the previous batch: it must not be used.
-	older := reportTestStoredReport(500, 10, 18, domain.ReportStatusPublished, content, created.Add(-2*time.Hour))
-	setup.reports.reports[target.ID] = target
-	setup.reports.reports[older.ID] = older
-
-	cases := []struct {
-		name            string
-		hasPrevious     bool
-		previousBatchID int64
-	}{
-		{name: "no previous batch", hasPrevious: false},
-		{name: "previous batch has no report", hasPrevious: true, previousBatchID: 19},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			setup.execution.hasPreviousBatch = testCase.hasPrevious
-			setup.execution.previousBatchID = testCase.previousBatchID
-			_, err := setup.service.Diff(context.Background(), 10, target.ID, nil)
-			reportTestWantReason(t, err, domain.KindNotFound, domain.ReportReasonNotFound)
-			if strings.Contains(err.Error(), fmt.Sprintf("%d", target.ID)) {
-				t.Fatalf("error message mentions the target id: %v", err)
+		reports, err := fixture.repo.ListReports(context.Background(), versionID, ReportFilter{Limit: 100})
+		if err != nil {
+			t.Fatalf("ListReports: %v", err)
+		}
+		if len(reports) != 2 {
+			t.Fatalf("reports = %d, want 2 terminal wave reports", len(reports))
+		}
+		for _, report := range reports {
+			if report.Kind != delivery.ReportKindWave {
+				t.Fatalf("unexpected report kind: %+v", report)
 			}
-		})
-	}
-}
-
-// TestReportExportFailureHidesFilesystemPath pins that report_export_failed
-// carries a fixed message: a cause that embeds an OS path stays in the log.
-func TestReportExportFailureHidesFilesystemPath(t *testing.T) {
-	setup := newReportTestSetup(t)
-	report, _ := setup.ensure(t)
-	setup.files.openErr = &fs.PathError{
-		Op:   "open",
-		Path: `C:\private\reports\secret.md`,
-		Err:  fs.ErrPermission,
-	}
-	_, err := setup.service.Export(context.Background(), 10, report.ID)
-	reportTestWantReason(t, err, "internal", domain.ReportReasonExportFailed)
-	if strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), `C:\`) {
-		t.Fatalf("export error message leaks the filesystem path: %v", err)
-	}
-}
-
-// TestReportExportVerifiesSHA pins the export contract: bytes are verified
-// against sha256/size, and a missing or corrupted file is report_export_failed.
-func TestReportExportVerifiesSHA(t *testing.T) {
-	setup := newReportTestSetup(t)
-	report, _ := setup.ensure(t)
-
-	exported, err := setup.service.Export(context.Background(), 10, report.ID)
-	if err != nil {
-		t.Fatalf("export: %v", err)
-	}
-	stored := setup.files.files[report.MarkdownPath]
-	if !bytes.Equal(exported.Content, stored) {
-		t.Fatal("export content does not match the stored file")
-	}
-	if exported.SHA256 != report.MarkdownSHA256 || exported.Size != report.MarkdownSize {
-		t.Fatalf("export sha/size = (%s,%d), row has (%s,%d)",
-			exported.SHA256, exported.Size, report.MarkdownSHA256, report.MarkdownSize)
-	}
-	if exported.ReportID != report.ID || exported.VersionID != report.VersionID ||
-		exported.BatchID != report.BatchID || exported.Revision != report.Revision {
-		t.Fatalf("export metadata = %+v", exported)
-	}
-	if got := setup.audit.actions(); !reportTestContains(got, ReportActionExported) {
-		t.Fatalf("audit actions = %v, want %s", got, ReportActionExported)
-	}
-
-	setup.files.corrupt(report.MarkdownPath)
-	_, err = setup.service.Export(context.Background(), 10, report.ID)
-	reportTestWantReason(t, err, "internal", domain.ReportReasonExportFailed)
-
-	delete(setup.files.files, report.MarkdownPath)
-	_, err = setup.service.Export(context.Background(), 10, report.ID)
-	reportTestWantReason(t, err, "internal", domain.ReportReasonExportFailed)
-}
-
-// TestReportPublishDraft pins the manual publish transition of §7.4.
-func TestReportPublishDraft(t *testing.T) {
-	setup := newReportTestSetup(t)
-	draft := reportTestStoredReport(600, 10, 20, domain.ReportStatusDraft,
-		domain.ReportContent{Schema: domain.ReportSchemaV1}, setup.clock.now)
-	setup.reports.reports[draft.ID] = draft
-
-	published, err := setup.service.Publish(context.Background(), 10, draft.ID, 3)
-	if err != nil {
-		t.Fatalf("publish draft: %v", err)
-	}
-	if published.Status != domain.ReportStatusPublished || published.PublishedAt == nil {
-		t.Fatalf("published report = %+v", published)
-	}
-	if _, err := setup.service.Publish(context.Background(), 10, draft.ID, 3); err == nil {
-		t.Fatal("publishing an already published report must fail")
-	} else {
-		reportTestWantReason(t, err, domain.KindStateConflict, domain.ReportReasonNotPublishable)
-	}
-}
-
-// TestReportListFiltersAndValidates pins list filtering, pagination and status
-// validation.
-func TestReportListFiltersAndValidates(t *testing.T) {
-	setup := newReportTestSetup(t)
-	base := time.Date(2026, 10, 28, 9, 0, 0, 0, time.UTC)
-	for index, batchID := range []int64{20, 21} {
-		report := reportTestStoredReport(int64(700+index), 10, batchID, domain.ReportStatusPublished,
-			domain.ReportContent{Schema: domain.ReportSchemaV1}, base.Add(time.Duration(index)*time.Hour))
-		setup.reports.reports[report.ID] = report
-	}
-
-	all, hasMore, err := setup.service.List(context.Background(), 10, ReportFilter{})
-	if err != nil {
-		t.Fatalf("list reports: %v", err)
-	}
-	if len(all) != 2 || hasMore {
-		t.Fatalf("list = %d reports, hasMore=%v; want 2, false", len(all), hasMore)
-	}
-	batchID := int64(21)
-	filtered, _, _, err := setup.service.ListPage(context.Background(), 10, ReportFilter{BatchID: &batchID})
-	if err != nil {
-		t.Fatalf("list filtered: %v", err)
-	}
-	if len(filtered) != 1 || filtered[0].BatchID != 21 {
-		t.Fatalf("filtered list = %+v", filtered)
-	}
-	firstPage, cursor, hasMore, err := setup.service.ListPage(context.Background(), 10, ReportFilter{Limit: 1})
-	if err != nil {
-		t.Fatalf("list first page: %v", err)
-	}
-	if len(firstPage) != 1 || !hasMore || cursor == "" {
-		t.Fatalf("first page = %d reports, cursor=%q, hasMore=%v", len(firstPage), cursor, hasMore)
-	}
-	secondPage, _, _, err := setup.service.ListPage(context.Background(), 10, ReportFilter{Limit: 1, Cursor: cursor})
-	if err != nil {
-		t.Fatalf("list second page: %v", err)
-	}
-	if len(secondPage) != 1 || secondPage[0].ID == firstPage[0].ID {
-		t.Fatalf("second page = %+v", secondPage)
-	}
-
-	_, _, err = setup.service.List(context.Background(), 10, ReportFilter{Status: "exploded"})
-	reportTestWantReason(t, err, domain.KindInvalid, domain.ReportReasonInvalidFilter)
-}
-
-// TestReportListRefreshesStale pins the list-read stale check of §5.5.
-func TestReportListRefreshesStale(t *testing.T) {
-	setup := newReportTestSetup(t)
-	staleCandidate := reportTestStoredReport(800, 10, 20, domain.ReportStatusPublished,
-		domain.ReportContent{Schema: domain.ReportSchemaV1}, setup.clock.now)
-	staleCandidate.InputFingerprint = strings.Repeat("f", 64)
-	setup.reports.reports[staleCandidate.ID] = staleCandidate
-
-	listed, _, err := setup.service.List(context.Background(), 10, ReportFilter{})
-	if err != nil {
-		t.Fatalf("list reports: %v", err)
-	}
-	if len(listed) != 1 || listed[0].Status != domain.ReportStatusStale {
-		t.Fatalf("listed = %+v, want one stale report", listed)
-	}
-	if got := setup.events.countType(ReportEventStale); got != 1 {
-		t.Fatalf("report.stale events = %d, want 1", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-// reportTestCaseEvidenceCount returns the evidence count of one case node.
-func reportTestCaseEvidenceCount(t *testing.T, content domain.ReportContent, caseNodeID string) int {
-	t.Helper()
-	for _, item := range content.Cases {
-		if item.CaseNodeID == caseNodeID {
-			return item.EvidenceCount
 		}
-	}
-	t.Fatalf("case node %s not found in the content", caseNodeID)
-	return 0
-}
-
-func reportTestContains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
+		if len(fixture.tasks.calls) != 2 {
+			t.Fatalf("tasks = %v, want 2", fixture.tasks.calls)
 		}
-	}
-	return false
+	})
+
+	t.Run("creates version report when all requirements closed and no active wave", func(t *testing.T) {
+		fixture := newReportFixture(t)
+		versionID := int64(7)
+		fixture.data.version[versionID] = reportTestVersionSnapshot(versionID)
+		fixture.data.wave[reportDataWaveKey(versionID, 12)] = reportTestWaveSnapshot(versionID, 12)
+
+		if err := fixture.svc.EnsureReports(context.Background(), versionID); err != nil {
+			t.Fatalf("EnsureReports: %v", err)
+		}
+		versionKind := delivery.ReportKindVersion
+		versions, err := fixture.repo.ListReports(context.Background(), versionID, ReportFilter{Kind: &versionKind, Limit: 100})
+		if err != nil || len(versions) != 1 {
+			t.Fatalf("version reports = %+v err=%v", versions, err)
+		}
+		if len(fixture.tasks.calls) < 1 {
+			t.Fatal("version report task not ensured")
+		}
+	})
+
+	t.Run("skips the version report while an active intent blocks generation", func(t *testing.T) {
+		fixture := newReportFixture(t)
+		versionID := int64(7)
+		fixture.data.version[versionID] = reportTestVersionSnapshot(versionID)
+		fixture.data.wave[reportDataWaveKey(versionID, 12)] = reportTestWaveSnapshot(versionID, 12)
+		notReady := false
+		fixture.data.versionReady = &notReady
+
+		if err := fixture.svc.EnsureReports(context.Background(), versionID); err != nil {
+			t.Fatalf("EnsureReports: %v", err)
+		}
+		versionKind := delivery.ReportKindVersion
+		versions, err := fixture.repo.ListReports(context.Background(), versionID, ReportFilter{Kind: &versionKind, Limit: 100})
+		if err != nil {
+			t.Fatalf("ListReports: %v", err)
+		}
+		if len(versions) != 0 {
+			t.Fatalf("version report created while an active intent blocks generation: %+v", versions)
+		}
+	})
+
+	t.Run("regenerates a stale version report", func(t *testing.T) {
+		fixture := newReportFixture(t)
+		versionID := int64(7)
+		report, _ := fixture.seedPublishedVersionReport(versionID, reportTestFingerprint("a"))
+		// The reader returns a different fingerprint than the stored one.
+		fixture.data.version[versionID] = reportTestVersionSnapshot(versionID)
+		fixture.data.wave[reportDataWaveKey(versionID, 12)] = reportTestWaveSnapshot(versionID, 12)
+
+		if err := fixture.svc.EnsureReports(context.Background(), versionID); err != nil {
+			t.Fatalf("EnsureReports: %v", err)
+		}
+		revisions, err := fixture.repo.ListRevisions(context.Background(), report.ID)
+		if err != nil || len(revisions) != 2 {
+			t.Fatalf("revisions = %+v err=%v, want a regeneration revision", revisions, err)
+		}
+		if fixture.tasks.calls[len(fixture.tasks.calls)-1] != fmt.Sprintf("task:%d:2", report.ID) {
+			t.Fatalf("tasks = %v", fixture.tasks.calls)
+		}
+	})
 }
 
-func reportTestWantReason(t *testing.T, err error, kind, reason string) {
-	t.Helper()
-	var domainErr *domain.Error
-	if !errors.As(err, &domainErr) {
-		t.Fatalf("error = %v, want *domain.Error", err)
+func TestReportServiceListAndGet(t *testing.T) {
+	fixture := newReportFixture(t)
+	waveReport, waveRevision := fixture.seedWaveReport(7, 12)
+	versionReport := fixture.repo.seedReport(delivery.Report{ID: 200, VersionID: 7, Kind: delivery.ReportKindVersion})
+	if err := fixture.repo.InsertRefs(context.Background(), waveRevision.ID, []delivery.ReportRef{{Kind: "wave", RefID: 12}}); err != nil {
+		t.Fatalf("InsertRefs: %v", err)
 	}
-	if domainErr.Kind != kind || domainErr.Reason != reason {
-		t.Fatalf("error = %+v, want kind %q reason %q", domainErr, kind, reason)
+
+	waveKind := delivery.ReportKindWave
+	waves, err := fixture.svc.List(context.Background(), 7, &waveKind)
+	if err != nil || len(waves) != 1 || waves[0].ID != waveReport.ID {
+		t.Fatalf("List waves = %+v err=%v", waves, err)
+	}
+	all, err := fixture.svc.List(context.Background(), 7, nil)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("List all = %+v err=%v", all, err)
+	}
+	if _, err := fixture.svc.List(context.Background(), 0, nil); platform.AsError(err).Status != 400 {
+		t.Fatalf("List version 0 error = %v", err)
+	}
+
+	detail, err := fixture.svc.Get(context.Background(), 7, waveReport.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if detail.Report.ID != waveReport.ID || len(detail.Revisions) != 1 || len(detail.Refs) != 1 {
+		t.Fatalf("detail = %+v", detail)
+	}
+	if _, err := fixture.svc.Get(context.Background(), 8, waveReport.ID); platform.AsError(err).Status != 404 {
+		t.Fatalf("Get wrong version error = %v", err)
+	}
+	if _, err := fixture.svc.Get(context.Background(), 7, versionReport.ID); err != nil {
+		t.Fatalf("Get version report: %v", err)
 	}
 }

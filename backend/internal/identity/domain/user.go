@@ -1,94 +1,56 @@
-// Package identity is the identity context's domain model: users with their
-// roles and statuses, the repository port that persists them and the domain
-// errors shared by the application layer.
+// Package identity is the identity bounded context: application users, their
+// opaque bearer tokens, and the persistence ports behind both.
 package identity
 
 import (
 	"errors"
-	"regexp"
 	"time"
-	"unicode/utf8"
 )
 
-// Role is a user's authorization role. P0 has exactly one admin, seeded at
-// startup; the API only creates regular users.
+// Role is the account role. P0 knows exactly one administrator.
 type Role string
 
 const (
+	// RoleAdmin is the single seeded administrator.
 	RoleAdmin Role = "admin"
-	RoleUser  Role = "user"
+	// RoleUser is a regular user created through the admin API.
+	RoleUser Role = "user"
 )
 
-// Status is a user's lifecycle status.
+// Status is the account lifecycle state.
 type Status string
 
 const (
-	StatusActive   Status = "active"
+	// StatusActive accounts may log in and use their tokens.
+	StatusActive Status = "active"
+	// StatusDisabled accounts may not log in and their tokens are revoked.
 	StatusDisabled Status = "disabled"
 )
 
-// Valid reports whether s is a status the API accepts.
-func (s Status) Valid() bool {
-	return s == StatusActive || s == StatusDisabled
-}
+// Domain errors. The application layer maps them onto the shared API error
+// envelope; the PostgreSQL adapter maps its driver errors onto them.
+var (
+	ErrUserNotFound  = errors.New("identity: user not found")
+	ErrTokenNotFound = errors.New("identity: token not found")
+	ErrUsernameTaken = errors.New("identity: username already exists")
+	ErrAdminExists   = errors.New("identity: administrator already exists")
+)
 
-// User is an account. PasswordHash is a bcrypt hash and is never returned to
-// clients nor written to logs.
+// User is one application account. PasswordHash never leaves the backend: the
+// HTTP DTOs omit it and audit events never carry it.
 type User struct {
 	ID           int64
 	Username     string
+	DisplayName  string
 	PasswordHash string
 	Role         Role
 	Status       Status
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
-	LastLoginAt  *time.Time
 }
 
-const (
-	// MinPasswordLength and MaxPasswordLength bound the accepted password
-	// length in characters.
-	MinPasswordLength = 10
-	MaxPasswordLength = 128
-)
+// IsAdmin reports whether the user has the administrator role.
+func (u User) IsAdmin() bool { return u.Role == RoleAdmin }
 
-// usernamePattern is the documented username format. Usernames are matched
-// case-sensitively and stored verbatim.
-var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,64}$`)
-
-// ValidateUsername enforces the username format.
-func ValidateUsername(username string) error {
-	if !usernamePattern.MatchString(username) {
-		return ErrInvalidUsername
-	}
-	return nil
-}
-
-// ValidatePassword enforces the password length limits.
-func ValidatePassword(password string) error {
-	length := utf8.RuneCountInString(password)
-	if length < MinPasswordLength || length > MaxPasswordLength {
-		return ErrWeakPassword
-	}
-	return nil
-}
-
-// Domain errors shared by the repository port, the user service and the HTTP
-// layer. Callers use errors.Is rather than comparing messages.
-var (
-	// ErrUsernameTaken means another account already uses the username.
-	ErrUsernameTaken = errors.New("identity: username already taken")
-	// ErrUserNotFound means no account matches the requested identifier.
-	ErrUserNotFound = errors.New("identity: user not found")
-	// ErrLastAdmin means the operation would leave P0 without its single admin.
-	ErrLastAdmin = errors.New("identity: cannot disable the last admin")
-	// ErrInvalidUsername means the username does not match the documented format.
-	ErrInvalidUsername = errors.New("identity: invalid username")
-	// ErrWeakPassword means the password length is outside the documented range.
-	ErrWeakPassword = errors.New("identity: password must be between 10 and 128 characters")
-	// ErrAdminExists means the single-admin index rejected a second admin. It is
-	// returned to EnsureAdmin so a concurrent startup can treat it as success.
-	ErrAdminExists = errors.New("identity: an admin already exists")
-	// ErrInvalidStatus means the requested status is not active or disabled.
-	ErrInvalidStatus = errors.New("identity: invalid user status")
-)
+// IsActive reports whether the account may authenticate.
+func (u User) IsActive() bool { return u.Status == StatusActive }

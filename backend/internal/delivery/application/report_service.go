@@ -1,942 +1,967 @@
-package application
+package deliveryapp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
+	"sort"
 	"strconv"
 	"time"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
-// ReportServiceDeps are the ports of the report use cases. Versions, Execution,
-// Graph, Issues, Reports, Files and IDs are mandatory; Events, Audit and Logger
-// are optional enrichment (a nil port is skipped). Clock defaults to the wall
-// clock.
-type ReportServiceDeps struct {
-	Versions  ReportVersionReader
-	Execution ReportExecutionReader
-	Graph     ReportCaseGraphReader
-	Issues    ReportIssueReader
-	Reports   ReportStore
-	Files     ReportFileStore
-	Events    ReportEventPublisher
-	Audit     ReportAuditRecorder
-	IDs       ReportIDGenerator
-	Clock     ReportClock
-	Logger    *slog.Logger
-}
+// Report event types (spec §4.3).
+const (
+	reportEventPublished = "report.published"
+	reportEventStale     = "report.stale"
+)
 
-// ReportService implements the report use cases of spec §6.5: deterministic
-// generation, read-time stale detection, revision regeneration, diff and export.
-// It reads the execution/mindmap/version contexts only through the narrow ports
-// in report_ports.go and never touches their tables.
+// Report lifecycle constants. template_version falls back to "1" (the frozen
+// P4 built-in template) when the renderer does not report a version; renderers
+// implementing delivery.ReportTemplateVersioner supply the actual version.
+const (
+	reportTemplateVersion = "1"
+	reportRenderPending   = "pending"
+	reportRenderDone      = "done"
+	reportRenderFailed    = "failed"
+)
+
+// ReportService owns the report lifecycle: ensuring report rows and generation
+// tasks, publishing rendered HTML into the content ledger, stale detection and
+// verified reads (spec §6.3–§6.5).
 type ReportService struct {
-	deps ReportServiceDeps
+	repo     ReportRepository
+	renderer delivery.ReportRenderer
+	content  ContentStore
+	data     ReportDataReader
+	events   EventPublisher
+	audit    AuditSink
+	clock    Clock
+	tasks    TaskEnsurer
+	sections delivery.SectionOptions
+
+	// P6 cross-version read ports. They stay optional so the P4 constructor
+	// and its tests keep compiling; WithGlobalReader attaches them.
+	global GlobalReportReader
+	titles VersionTitleReader
+
+	// P7 PDF pipeline (spec §4.2). Attached with WithRenderJobs; nil keeps the
+	// P4 HTML-only lifecycle so older wirings keep compiling.
+	renderJobs     RenderJobRepository
+	renderPDF      bool
+	renderAttempts int
 }
 
-// NewReportService wires the report use cases to their ports.
-func NewReportService(deps ReportServiceDeps) *ReportService {
-	return &ReportService{deps: deps}
+// NewReportService wires the report use cases. events, audit and tasks may be
+// nil in unit tests; the clock defaults to the system clock.
+func NewReportService(
+	repo ReportRepository,
+	renderer delivery.ReportRenderer,
+	content ContentStore,
+	data ReportDataReader,
+	events EventPublisher,
+	audit AuditSink,
+	clock Clock,
+	tasks TaskEnsurer,
+	opts delivery.SectionOptions,
+) *ReportService {
+	if clock == nil {
+		clock = systemClock{}
+	}
+	return &ReportService{
+		repo:     repo,
+		renderer: renderer,
+		content:  content,
+		data:     data,
+		events:   events,
+		audit:    audit,
+		clock:    clock,
+		tasks:    tasks,
+		sections: opts,
+	}
 }
 
-// Ensure returns the report of a batch, generating and publishing revision 1
-// (or max+1 when the previous revision is stale) when needed. The boolean is
-// true only when this call created the revision. A concurrent uniqueness
-// conflict is resolved by returning the winning revision.
-func (s *ReportService) Ensure(ctx context.Context, versionID, batchID, actor int64) (domain.Report, bool, error) {
-	if err := s.ready(); err != nil {
-		return domain.Report{}, false, err
-	}
-	if versionID <= 0 || batchID <= 0 {
-		return domain.Report{}, false, reportInvalidID("versionId and batchId must be positive")
-	}
+// systemClock is the default Clock.
+type systemClock struct{}
 
-	existing, err := s.deps.Reports.LatestByBatch(ctx, versionID, batchID)
-	switch {
-	case err == nil:
-		refreshed, refreshErr := s.refreshReportStale(ctx, existing)
-		if refreshErr != nil {
-			return domain.Report{}, false, refreshErr
-		}
-		if refreshed.Status != domain.ReportStatusStale {
-			return refreshed, false, nil
-		}
-	case errors.Is(err, domain.ErrReportNotFound):
-		// No report yet: generate revision 1.
-	default:
-		return domain.Report{}, false, fmt.Errorf("delivery: load report of batch %d: %w", batchID, err)
-	}
+// Now implements Clock.
+func (systemClock) Now() time.Time { return time.Now().UTC() }
 
-	generated, err := s.generate(ctx, versionID, batchID, actor)
-	if err != nil {
-		if errors.Is(err, domain.ErrReportRevisionConflict) {
-			latest, latestErr := s.deps.Reports.LatestByBatch(ctx, versionID, batchID)
-			if latestErr != nil {
-				return domain.Report{}, false, fmt.Errorf("delivery: reload report after conflict: %w", latestErr)
-			}
-			return latest, false, nil
-		}
-		return domain.Report{}, false, err
+// WithRenderJobs attaches the P7 PDF render-job pipeline. renderEnabled mirrors
+// report.render_pdf (when false, Publish marks new revisions disabled instead of
+// booking a render job) and maxAttempts mirrors report.render_max_attempts. It
+// returns the service so the composition root can chain it.
+func (s *ReportService) WithRenderJobs(jobs RenderJobRepository, renderEnabled bool, maxAttempts int) *ReportService {
+	s.renderJobs = jobs
+	s.renderPDF = renderEnabled
+	if maxAttempts < MinRenderAttempts || maxAttempts > MaxRenderAttempts {
+		maxAttempts = DefaultRenderMaxAttempts
 	}
-	return generated, true, nil
+	s.renderAttempts = maxAttempts
+	return s
 }
 
-// Regenerate appends a new published revision (max+1) to the batch of reportID.
-// When a newer revision already exists that revision is returned unchanged
-// (spec §7.4). Old revisions and their Markdown files are never deleted.
-func (s *ReportService) Regenerate(ctx context.Context, versionID, reportID, actor int64) (domain.Report, error) {
-	if err := s.ready(); err != nil {
-		return domain.Report{}, err
-	}
-	if versionID <= 0 || reportID <= 0 {
-		return domain.Report{}, reportInvalidID("versionId and reportId must be positive")
-	}
-	report, err := s.getReport(ctx, versionID, reportID)
-	if err != nil {
-		return domain.Report{}, err
-	}
-	latest, err := s.deps.Reports.LatestByBatch(ctx, versionID, report.BatchID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: load latest report of batch %d: %w", report.BatchID, err)
-	}
-	if latest.Revision > report.Revision {
-		return latest, nil
-	}
-	generated, err := s.generate(ctx, versionID, report.BatchID, actor)
-	if err != nil {
-		if errors.Is(err, domain.ErrReportRevisionConflict) {
-			latest, latestErr := s.deps.Reports.LatestByBatch(ctx, versionID, report.BatchID)
-			if latestErr != nil {
-				return domain.Report{}, fmt.Errorf("delivery: reload report after conflict: %w", latestErr)
-			}
-			return latest, nil
-		}
-		return domain.Report{}, err
-	}
-	return generated, nil
-}
-
-// Get returns one report revision, refreshing its stale state first (spec §5.5).
-func (s *ReportService) Get(ctx context.Context, versionID, reportID int64) (domain.Report, error) {
-	if err := s.ready(); err != nil {
-		return domain.Report{}, err
-	}
-	if versionID <= 0 || reportID <= 0 {
-		return domain.Report{}, reportInvalidID("versionId and reportId must be positive")
-	}
-	report, err := s.getReport(ctx, versionID, reportID)
-	if err != nil {
-		return domain.Report{}, err
-	}
-	return s.refreshReportStale(ctx, report)
-}
-
-// List returns one page of the reports of versionID newest first. Published
-// reports are refreshed during the read, like Get.
-func (s *ReportService) List(ctx context.Context, versionID int64, filter ReportFilter) ([]domain.Report, bool, error) {
-	reports, _, hasMore, err := s.listPage(ctx, versionID, filter)
-	return reports, hasMore, err
-}
-
-// ListPage is List plus the opaque cursor of the next page (the shared
-// ReportService.List signature has no cursor return, but spec §7.4 exposes one).
-func (s *ReportService) ListPage(ctx context.Context, versionID int64, filter ReportFilter) ([]domain.Report, string, bool, error) {
-	return s.listPage(ctx, versionID, filter)
-}
-
-// listPage implements the version-scoped report list.
-func (s *ReportService) listPage(ctx context.Context, versionID int64, filter ReportFilter) ([]domain.Report, string, bool, error) {
-	if err := s.ready(); err != nil {
-		return nil, "", false, err
-	}
+// EnsureWaveReport makes sure a wave report exists for a terminal wave and has
+// an in-flight draft revision with a report.wave work item. It is idempotent:
+// a published report is returned untouched; a pending draft re-ensures the
+// same task; a failed draft gets the next revision (spec §6.3/§6.5).
+func (s *ReportService) EnsureWaveReport(ctx context.Context, versionID, waveID int64) (delivery.Report, error) {
 	if versionID <= 0 {
-		return nil, "", false, reportInvalidID("versionId must be positive")
+		return delivery.Report{}, platform.Invalid("version_id", "must be a positive decimal ID")
 	}
-	if filter.BatchID != nil && *filter.BatchID <= 0 {
-		return nil, "", false, domain.NewInvalid("batchId", domain.ReportReasonInvalidFilter,
-			"batchId must be positive")
+	if waveID <= 0 {
+		return delivery.Report{}, platform.Invalid("wave_id", "must be a positive decimal ID")
 	}
-	if filter.Status != "" && !domain.IsValidReportStatus(filter.Status) {
-		return nil, "", false, domain.NewInvalid("status", domain.ReportReasonInvalidFilter,
-			fmt.Sprintf("report status %q is invalid", filter.Status))
-	}
-	if filter.Limit <= 0 {
-		filter.Limit = platform.DefaultLimit
-	}
-	if filter.Limit > platform.MaxLimit {
-		filter.Limit = platform.MaxLimit
-	}
-
-	reports, cursor, hasMore, err := s.deps.Reports.List(ctx, versionID, filter)
+	kind := delivery.ReportKindWave
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &kind, Limit: 100})
 	if err != nil {
-		return nil, "", false, fmt.Errorf("delivery: list reports: %w", err)
+		return delivery.Report{}, mapReportError(err)
 	}
-	refreshed := make([]domain.Report, 0, len(reports))
 	for _, report := range reports {
-		updated, refreshErr := s.refreshReportStale(ctx, report)
-		if refreshErr != nil {
-			return nil, "", false, refreshErr
+		if report.WaveID != nil && *report.WaveID == waveID {
+			return s.ensureGeneration(ctx, report)
 		}
-		refreshed = append(refreshed, updated)
 	}
-	return refreshed, cursor, hasMore, nil
+	report, err := s.repo.CreateReport(ctx, delivery.Report{
+		VersionID: versionID,
+		WaveID:    &waveID,
+		Kind:      delivery.ReportKindWave,
+		Status:    delivery.ReportStatusDraft,
+	})
+	if err != nil {
+		return delivery.Report{}, mapReportError(err)
+	}
+	return s.ensureGeneration(ctx, report)
 }
 
-// Diff compares reportID with baseReportID, or with the latest report of the
-// previous batch (batch_no-1) when baseReportID is nil (spec §5.5/§7.4).
-func (s *ReportService) Diff(ctx context.Context, versionID, reportID int64, baseReportID *int64) (domain.ReportDiff, error) {
-	if err := s.ready(); err != nil {
-		return domain.ReportDiff{}, err
+// EnsureVersionReport makes sure one version report exists and has an
+// in-flight draft revision with a report.version work item. The reconciler
+// only calls it when the §7.4 conditions hold (all requirements closed or
+// obsolete, no active wave, latest report missing or stale).
+func (s *ReportService) EnsureVersionReport(ctx context.Context, versionID int64) (delivery.Report, error) {
+	if versionID <= 0 {
+		return delivery.Report{}, platform.Invalid("version_id", "must be a positive decimal ID")
 	}
-	if versionID <= 0 || reportID <= 0 {
-		return domain.ReportDiff{}, reportInvalidID("versionId and reportId must be positive")
-	}
-	target, err := s.getReport(ctx, versionID, reportID)
+	kind := delivery.ReportKindVersion
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &kind, Limit: 100})
 	if err != nil {
-		return domain.ReportDiff{}, err
+		return delivery.Report{}, mapReportError(err)
 	}
-	var base domain.Report
-	if baseReportID != nil {
-		if *baseReportID <= 0 {
-			return domain.ReportDiff{}, reportInvalidID("baseReportId must be positive")
-		}
-		base, err = s.getReport(ctx, versionID, *baseReportID)
-	} else {
-		var previousBatchID int64
-		var ok bool
-		previousBatchID, ok, err = s.deps.Execution.PreviousBatchID(ctx, versionID, target.BatchID)
-		if err != nil {
-			return domain.ReportDiff{}, fmt.Errorf("delivery: resolve previous batch: %w", err)
-		}
-		if !ok {
-			return domain.ReportDiff{}, reportNoPreviousBatch()
-		}
-		base, err = s.deps.Reports.LatestByBatch(ctx, versionID, previousBatchID)
-		if errors.Is(err, domain.ErrReportNotFound) {
-			return domain.ReportDiff{}, reportNoPreviousBatch()
-		}
+	if len(reports) > 0 {
+		return s.ensureGeneration(ctx, reports[0])
 	}
+	report, err := s.repo.CreateReport(ctx, delivery.Report{
+		VersionID: versionID,
+		Kind:      delivery.ReportKindVersion,
+		Status:    delivery.ReportStatusDraft,
+	})
 	if err != nil {
-		return domain.ReportDiff{}, err
+		return delivery.Report{}, mapReportError(err)
 	}
-	if base.VersionID != target.VersionID {
-		return domain.ReportDiff{}, domain.NewInvalid("baseReportId", domain.ReportReasonVersionMismatch,
-			"base and target reports belong to different versions")
-	}
-	diff := domain.BuildReportDiff(base.Content, target.Content)
-	diff.BaseReportID = base.ID
-	diff.TargetReportID = target.ID
-	return diff, nil
+	return s.ensureGeneration(ctx, report)
 }
 
-// Export returns the verified Markdown bytes of one report revision. The stored
-// file must match markdown_sha256 and markdown_size; a missing or corrupted file
-// is report_export_failed (spec §6.5). The file is never silently regenerated.
-func (s *ReportService) Export(ctx context.Context, versionID, reportID int64) (domain.ReportExport, error) {
-	if err := s.ready(); err != nil {
-		return domain.ReportExport{}, err
+// EnsureReports is the reconciler entry point (spec §4.4/§7.4): it creates the
+// missing terminal-wave reports and, when every requirement is closed or
+// obsolete and no wave is active, marks changed reports stale and ensures the
+// version report (regenerating it when stale). Active-intent checks are owned
+// by the reader/wiring layer; this method consumes the version snapshot.
+func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) error {
+	if versionID <= 0 {
+		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
-	if versionID <= 0 || reportID <= 0 {
-		return domain.ReportExport{}, reportInvalidID("versionId and reportId must be positive")
+	if s.data == nil {
+		return reportServiceNotConfigured("report data reader")
 	}
-	report, err := s.getReport(ctx, versionID, reportID)
+	snapshot, err := s.data.VersionSnapshot(ctx, versionID)
 	if err != nil {
-		return domain.ReportExport{}, err
+		return err
 	}
-	reader, err := s.deps.Files.Open(ctx, report.MarkdownPath)
+	existing, err := s.repo.ListReports(ctx, versionID, ReportFilter{Limit: 100})
 	if err != nil {
-		return domain.ReportExport{}, s.exportFailure(ctx, report.ID, err)
+		return mapReportError(err)
 	}
-	content, readErr := io.ReadAll(reader)
-	closeErr := reader.Close()
-	if readErr != nil {
-		return domain.ReportExport{}, s.exportFailure(ctx, report.ID, readErr)
-	}
-	if closeErr != nil {
-		return domain.ReportExport{}, s.exportFailure(ctx, report.ID, closeErr)
-	}
-	sum := sha256.Sum256(content)
-	if hex.EncodeToString(sum[:]) != report.MarkdownSHA256 || int64(len(content)) != report.MarkdownSize {
-		return domain.ReportExport{}, s.exportFailure(ctx, report.ID, errors.New("sha256/size mismatch"))
-	}
-	exported := domain.ReportExport{
-		ReportID:  report.ID,
-		VersionID: report.VersionID,
-		BatchID:   report.BatchID,
-		Revision:  report.Revision,
-		Content:   content,
-		SHA256:    report.MarkdownSHA256,
-		Size:      report.MarkdownSize,
-		Filename:  fmt.Sprintf("report-%d-r%d.md", report.ID, report.Revision),
-	}
-	s.recordExportedAudit(ctx, exported)
-	return exported, nil
-}
-
-// Publish flips a draft report to published (spec §7.4). A report that is
-// already published or stale is report_not_publishable.
-func (s *ReportService) Publish(ctx context.Context, versionID, reportID, actor int64) (domain.Report, error) {
-	if err := s.ready(); err != nil {
-		return domain.Report{}, err
-	}
-	if versionID <= 0 || reportID <= 0 {
-		return domain.Report{}, reportInvalidID("versionId and reportId must be positive")
-	}
-	report, err := s.getReport(ctx, versionID, reportID)
-	if err != nil {
-		return domain.Report{}, err
-	}
-	if report.Status != domain.ReportStatusDraft {
-		return domain.Report{}, domain.NewStateConflict(domain.ReportReasonNotPublishable,
-			fmt.Sprintf("report %d is %s, only draft reports can be published", report.ID, report.Status))
-	}
-	now := s.now()
-	published, err := s.deps.Reports.MarkPublished(ctx, versionID, reportID, now)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: publish report %d: %w", reportID, err)
-	}
-	if !published {
-		return domain.Report{}, domain.NewStateConflict(domain.ReportReasonNotPublishable,
-			fmt.Sprintf("report %d is no longer a draft", reportID))
-	}
-	report.Status = domain.ReportStatusPublished
-	report.PublishedAt = &now
-	report.UpdatedAt = now
-	s.publishReportPublished(ctx, report, actor)
-	s.recordPublishedAudit(ctx, report, actor)
-	return report, nil
-}
-
-// RefreshStale recomputes the input fingerprint of one report and marks a
-// published report stale (once) when it changed.
-func (s *ReportService) RefreshStale(ctx context.Context, versionID, reportID int64) (domain.Report, error) {
-	if err := s.ready(); err != nil {
-		return domain.Report{}, err
-	}
-	if versionID <= 0 || reportID <= 0 {
-		return domain.Report{}, reportInvalidID("versionId and reportId must be positive")
-	}
-	report, err := s.getReport(ctx, versionID, reportID)
-	if err != nil {
-		return domain.Report{}, err
-	}
-	return s.refreshReportStale(ctx, report)
-}
-
-// generate produces the snapshot, Markdown file and report row of one new
-// revision. The row is inserted before the file is written (spec §6.5); if the
-// file write fails the row is removed so the next tick retries cleanly.
-func (s *ReportService) generate(ctx context.Context, versionID, batchID, actor int64) (domain.Report, error) {
-	version, err := s.deps.Versions.GetReportVersion(ctx, versionID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: load report version: %w", err)
-	}
-	batch, err := s.deps.Execution.GetReportBatch(ctx, versionID, batchID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: load report batch: %w", err)
-	}
-	// Defense in depth: the adapters are version-scoped, but a foreign batch
-	// must never become part of a version's report snapshot.
-	if version.ID != 0 && version.ID != versionID {
-		return domain.Report{}, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
-			fmt.Sprintf("version reader returned version %d for %d", version.ID, versionID))
-	}
-	if batch.VersionID != 0 && batch.VersionID != versionID {
-		return domain.Report{}, domain.NewInvalid("batchId", domain.ReasonInvalidArgument,
-			fmt.Sprintf("batch %d does not belong to version %d", batch.ID, versionID))
-	}
-	runs, err := s.deps.Execution.ListReportCaseRuns(ctx, batchID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: load report case runs: %w", err)
-	}
-	requirements, err := s.deps.Graph.ListReportRequirements(ctx, versionID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: load report requirements: %w", err)
-	}
-	issues, err := s.deps.Issues.ListReportIssues(ctx, versionID, batchID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: load report issues: %w", err)
-	}
-
-	content, requirementCases := s.buildContent(version, batch, runs, requirements, issues)
-	fingerprint, err := reportFingerprint(batch, runs, issues)
-	if err != nil {
-		return domain.Report{}, err
-	}
-	revision, err := s.deps.Reports.NextRevision(ctx, versionID, batchID)
-	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: next report revision: %w", err)
-	}
-	reportID := s.deps.IDs.Next()
-	if reportID <= 0 {
-		return domain.Report{}, errors.New("delivery: id generator returned a non-positive id")
-	}
-	markdown := renderReportMarkdown(content, revision, fingerprint, requirementCases)
-	sum := sha256.Sum256(markdown)
-	now := s.now()
-	report := domain.Report{
-		ID:               reportID,
-		VersionID:        versionID,
-		BatchID:          batchID,
-		Revision:         revision,
-		Status:           domain.ReportStatusPublished,
-		Title:            reportTitle(version, batch),
-		Content:          content,
-		InputFingerprint: fingerprint,
-		MarkdownPath:     reportMarkdownPath(versionID, reportID, revision),
-		MarkdownSHA256:   hex.EncodeToString(sum[:]),
-		MarkdownSize:     int64(len(markdown)),
-		GeneratedBy:      reportActorPointer(actor),
-		PublishedAt:      &now,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}
-	if err := report.Validate(); err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: generated report is invalid: %w", err)
-	}
-	created, err := s.deps.Reports.Create(ctx, report)
-	if err != nil {
-		if errors.Is(err, domain.ErrReportRevisionConflict) {
-			return domain.Report{}, err
+	waveReports := make(map[int64]delivery.Report)
+	for _, report := range existing {
+		if report.Kind == delivery.ReportKindWave && report.WaveID != nil {
+			waveReports[*report.WaveID] = report
 		}
-		return domain.Report{}, fmt.Errorf("delivery: create report: %w", err)
-	}
-	if _, _, _, err := s.deps.Files.Write(ctx, report.MarkdownPath, markdown); err != nil {
-		if deleteErr := s.deps.Reports.Delete(ctx, versionID, reportID); deleteErr != nil {
-			s.warn(ctx, "delivery report row cleanup failed",
-				"report_id", reportID, "error", deleteErr)
-		}
-		return domain.Report{}, fmt.Errorf("delivery: write report markdown: %w", err)
-	}
-	s.publishReportPublished(ctx, created, actor)
-	s.recordPublishedAudit(ctx, created, actor)
-	return created, nil
-}
-
-// buildContent assembles the deterministic snapshot and the requirement→case
-// coverage mapping used only by the Markdown graph. The snapshot is normalized
-// before it is returned, so the stored JSON and the Markdown share one order.
-func (s *ReportService) buildContent(
-	version ReportVersionSource,
-	batch ReportBatchSource,
-	runs []ReportCaseRunSource,
-	requirements []ReportRequirementSource,
-	issues []ReportIssueSource,
-) (domain.ReportContent, map[int64][]int64) {
-	summary := domain.ReportSummary{CaseCount: len(runs), FlakyCount: len(batch.FlakyCaseIDs)}
-	cases := make([]domain.ReportCase, 0, len(runs))
-	statusByNode := make(map[int64]string, len(runs))
-	for _, run := range runs {
-		statusByNode[run.CaseNodeID] = run.Status
-		switch run.Status {
-		case "passed":
-			summary.Passed++
-		case "failed":
-			summary.Failed++
-		case "blocked":
-			summary.Blocked++
-		case "inconclusive":
-			summary.Inconclusive++
-		case "skipped":
-			summary.Skipped++
-		case "interrupted":
-			summary.Interrupted++
-		}
-		cases = append(cases, domain.ReportCase{
-			CaseRunID:      reportIDString(run.CaseRunID),
-			CaseNodeID:     reportIDString(run.CaseNodeID),
-			Title:          run.Title,
-			Source:         run.Source,
-			Status:         run.Status,
-			FailureClass:   run.FailureClass,
-			Attempt:        run.Attempt,
-			StepCount:      run.StepCount,
-			AssertionCount: run.AssertionCount,
-			EvidenceCount:  run.EvidenceCount,
-		})
 	}
 
-	requirementRows := make([]domain.ReportRequirement, 0, len(requirements))
-	requirementCases := make(map[int64][]int64, len(requirements))
-	for _, requirement := range requirements {
-		covered := make([]int64, 0, len(requirement.CaseNodeIDs))
-		seen := make(map[int64]bool, len(requirement.CaseNodeIDs))
-		passed, failed := 0, 0
-		for _, caseNodeID := range requirement.CaseNodeIDs {
-			if seen[caseNodeID] {
-				continue
-			}
-			status, inBatch := statusByNode[caseNodeID]
-			if !inBatch {
-				continue
-			}
-			seen[caseNodeID] = true
-			covered = append(covered, caseNodeID)
-			switch status {
-			case "passed":
-				passed++
-			case "failed":
-				failed++
-			}
-		}
-		requirementCases[requirement.RequirementID] = covered
-		requirementRows = append(requirementRows, domain.ReportRequirement{
-			RequirementID: reportIDString(requirement.RequirementID),
-			Title:         requirement.Title,
-			Status:        requirement.Status,
-			CaseCount:     len(covered),
-			Passed:        passed,
-			Failed:        failed,
-		})
-	}
-
-	issueRows := make([]domain.ReportIssue, 0, len(issues))
-	seenIssues := make(map[int64]bool, len(issues))
-	for _, issue := range issues {
-		if seenIssues[issue.IssueID] {
+	for _, wave := range snapshot.Waves {
+		if !terminalWaveStatus(wave.Status) {
 			continue
 		}
-		seenIssues[issue.IssueID] = true
-		caseNodeID := ""
-		if issue.CaseNodeID != nil {
-			caseNodeID = reportIDString(*issue.CaseNodeID)
+		if report, ok := waveReports[wave.ID]; ok && reportHasPublishedRevision(report) {
+			continue
 		}
-		codeRefs := append([]domain.ReportCodeRef(nil), issue.CodeRefs...)
-		issueRows = append(issueRows, domain.ReportIssue{
-			IssueID:    reportIDString(issue.IssueID),
-			Title:      issue.Title,
-			Severity:   issue.Severity,
-			Status:     issue.Status,
-			Confidence: issue.Confidence,
-			Category:   issue.Category,
-			CaseNodeID: caseNodeID,
-			CodeRefs:   codeRefs,
-		})
+		if _, err := s.EnsureWaveReport(ctx, versionID, wave.ID); err != nil {
+			return err
+		}
 	}
-
-	generatedAt := s.now().UTC().Format(time.RFC3339)
-	if batch.FinishedAt != nil {
-		generatedAt = batch.FinishedAt.UTC().Format(time.RFC3339)
+	// The §7.4 condition also excludes active execution intents and open human
+	// requests. They are outside the report snapshot, so a reader that can
+	// observe them implements ReportTriggerReader.
+	if trigger, ok := s.data.(ReportTriggerReader); ok {
+		ready, err := trigger.VersionReportReady(ctx, versionID)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return nil
+		}
 	}
-	baseFallbackReason, historyRewritten := reportBatchD49Fields(batch.BaseFallbackReason)
-	content := domain.ReportContent{
-		Schema: domain.ReportSchemaV1,
-		Version: domain.ReportVersion{
-			ID:                 reportIDString(version.ID),
-			Name:               version.Name,
-			Label:              version.Label,
-			Status:             version.Status,
-			CodeBaselineCommit: version.CodeBaselineCommit,
-		},
-		Batch: domain.ReportBatch{
-			ID:                 reportIDString(batch.ID),
-			BatchNo:            batch.BatchNo,
-			Kind:               batch.Kind,
-			Status:             batch.Status,
-			BaselineHash:       batch.BaselineHash,
-			GraphHash:          batch.GraphHash,
-			CodeBaseCommit:     batch.CodeBaseCommit,
-			HeadCommit:         batch.HeadCommit,
-			StartedAt:          reportFormatOptionalTime(batch.StartedAt),
-			FinishedAt:         reportFormatOptionalTime(batch.FinishedAt),
-			BaseFallbackReason: baseFallbackReason,
-			HistoryRewritten:   historyRewritten,
-		},
-		Summary:      summary,
-		Cases:        cases,
-		Requirements: requirementRows,
-		Issues:       issueRows,
-		Risks:        reportRisks(summary, issues, batch.Degraded),
-		Degraded:     batch.Degraded,
-		Appendix: domain.ReportAppendix{
-			Environment: batch.Environment,
-			System:      batch.System,
-			Commit:      batch.HeadCommit,
-			GeneratedAt: generatedAt,
-		},
+	if !versionReportDue(snapshot) {
+		return nil
 	}
-	return content.Normalized(), requirementCases
+	if _, err := s.MarkStaleIfChanged(ctx, versionID); err != nil {
+		return err
+	}
+	refreshKind := delivery.ReportKindVersion
+	refreshed, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &refreshKind, Limit: 1})
+	if err != nil {
+		return mapReportError(err)
+	}
+	if len(refreshed) == 0 {
+		_, err := s.EnsureVersionReport(ctx, versionID)
+		return err
+	}
+	current := refreshed[0]
+	switch current.Status {
+	case delivery.ReportStatusStale:
+		_, err := s.Regenerate(ctx, versionID, current.ID)
+		return err
+	case delivery.ReportStatusDraft:
+		_, err := s.EnsureVersionReport(ctx, versionID)
+		return err
+	default:
+		return nil
+	}
 }
 
-// refreshReportStale applies the read-time stale rule of spec §5.5: recompute the
-// fingerprint, and for a published report with a different fingerprint flip it
-// to stale via CAS and publish report.stale exactly once.
-func (s *ReportService) refreshReportStale(ctx context.Context, report domain.Report) (domain.Report, error) {
-	if report.Status != domain.ReportStatusPublished {
-		return report, nil
+// Regenerate allocates the next revision of one report and ensures its
+// report.wave/report.version task. An in-flight pending draft is idempotent
+// (the same revision/task is returned); a published or failed revision gets
+// the next number. Old revisions are never deleted (spec §6.5).
+func (s *ReportService) Regenerate(ctx context.Context, versionID, reportID int64) (int32, error) {
+	if versionID <= 0 || reportID <= 0 {
+		return 0, platform.Invalid("report_id", "must be a positive decimal ID")
 	}
-	fingerprint, err := s.currentFingerprint(ctx, report.VersionID, report.BatchID)
+	report, err := s.repo.GetReport(ctx, versionID, reportID)
 	if err != nil {
-		return domain.Report{}, err
+		return 0, mapReportError(err)
 	}
-	if fingerprint == report.InputFingerprint {
-		return report, nil
-	}
-	now := s.now()
-	updated, err := s.deps.Reports.MarkStale(ctx, report.VersionID, report.ID,
-		report.InputFingerprint, ReportStaleReasonInputChanged, now)
+	revisions, err := s.repo.ListRevisions(ctx, reportID)
 	if err != nil {
-		return domain.Report{}, fmt.Errorf("delivery: mark report %d stale: %w", report.ID, err)
+		return 0, mapReportError(err)
 	}
-	if !updated {
-		// A concurrent reader already flipped it: return the current row without
-		// publishing a second report.stale event.
-		current, currentErr := s.getReport(ctx, report.VersionID, report.ID)
-		if currentErr != nil {
-			return domain.Report{}, currentErr
+	if len(revisions) > 0 {
+		latest := revisions[0]
+		if latest.Status == delivery.ReportStatusDraft && latest.RenderStatus != reportRenderFailed {
+			if err := s.ensureTask(ctx, reportID, latest.Revision); err != nil {
+				return 0, err
+			}
+			return latest.Revision, nil
+		}
+	}
+	revision, err := s.createNextDraft(ctx, report)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.ensureTask(ctx, reportID, revision.Revision); err != nil {
+		return 0, err
+	}
+	return revision.Revision, nil
+}
+
+// Publish renders one draft revision from the current deterministic snapshot,
+// writes the HTML into the content ledger, then finalizes the revision/report
+// atomically and appends report.published + the audit entry. A failed render
+// or content write leaves the revision visible as render_status='failed' and
+// never publishes. An already-published revision is returned idempotently
+// (the wave.report_id backfill is still healed). Old revisions are immutable.
+func (s *ReportService) Publish(ctx context.Context, reportID int64, revision int32, narrative string) (delivery.ReportRevision, error) {
+	if reportID <= 0 {
+		return delivery.ReportRevision{}, platform.Invalid("report_id", "must be a positive decimal ID")
+	}
+	if revision <= 0 {
+		return delivery.ReportRevision{}, platform.Invalid("revision", "must be a positive integer")
+	}
+	report, err := s.repo.GetReportByID(ctx, reportID)
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	current, err := s.repo.GetRevision(ctx, reportID, revision)
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	if current.Status == delivery.ReportStatusPublished {
+		if err := s.ensureWaveLink(ctx, report); err != nil {
+			return current, err
 		}
 		return current, nil
 	}
-	report.Status = domain.ReportStatusStale
-	report.StaleReason = ReportStaleReasonInputChanged
-	report.UpdatedAt = now
-	s.publishReportStale(ctx, report)
-	return report, nil
+	if current.Status != delivery.ReportStatusDraft {
+		return delivery.ReportRevision{}, platform.StateConflict("report revision is not a draft")
+	}
+	if s.renderer == nil || s.content == nil {
+		return delivery.ReportRevision{}, reportServiceNotConfigured("report renderer or content store")
+	}
+
+	asOf := s.clock.Now().UTC()
+	snapshot, err := s.snapshotFor(ctx, report)
+	if err != nil {
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, err
+	}
+	snapshot.GeneratedAt = asOf
+	fingerprint := delivery.Fingerprint(snapshot)
+	if fingerprint == "" {
+		err := fmt.Errorf("%w: report input fingerprint is empty", delivery.ErrInvalidArgument)
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, err
+	}
+	// Stamp the v2 appendix metadata from the authoritative report/revision
+	// rows. These fields never participate in the fingerprint.
+	snapshot.ReportID = report.ID
+	snapshot.ReportRevision = revision
+	snapshot.InputFingerprint = fingerprint
+
+	html, err := s.renderer.Render(ctx, snapshot, narrative, s.sections)
+	if err != nil {
+		err = fmt.Errorf("render report %d revision %d: %w", reportID, revision, err)
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, err
+	}
+	contentRefID, sha, size, err := s.content.PutReportHTML(ctx, current.ID, html)
+	if err != nil {
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, err
+	}
+	if !validReportSHA(sha) || size != int64(len(html)) {
+		err := fmt.Errorf("%w: content store returned an inconsistent sha/size", ErrReportContentCorrupt)
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, err
+	}
+	if err := s.repo.InsertRefs(ctx, current.ID, reportRefsForSnapshot(report, snapshot)); err != nil {
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	if err := s.repo.FinalizePublished(ctx, reportID, revision, contentRefID, fingerprint); err != nil {
+		s.failRevision(ctx, current.ID, err)
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	published, err := s.repo.GetRevision(ctx, reportID, revision)
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	if err := s.ensureWaveLink(ctx, report); err != nil {
+		return published, err
+	}
+	s.bookPDF(ctx, report, published)
+	s.publishPublishedEvent(ctx, report, published)
+	s.recordPublishedAudit(ctx, report, published)
+	return published, nil
 }
 
-// currentFingerprint recomputes the §5.5 fingerprint from the current ports.
-func (s *ReportService) currentFingerprint(ctx context.Context, versionID, batchID int64) (string, error) {
-	batch, err := s.deps.Execution.GetReportBatch(ctx, versionID, batchID)
-	if err != nil {
-		return "", fmt.Errorf("delivery: load report batch for fingerprint: %w", err)
+// bookPDF books the P7 PDF work for one published revision (spec §4.2). It is
+// best-effort: HTML publishing never waits for PDF, and the reconciler backfills
+// any ensure that failed here. With report.render_pdf off the revision is marked
+// disabled instead of booking a task.
+func (s *ReportService) bookPDF(ctx context.Context, report delivery.Report, revision delivery.ReportRevision) {
+	if s == nil || s.renderJobs == nil {
+		return
 	}
-	runs, err := s.deps.Execution.ListReportCaseRuns(ctx, batchID)
-	if err != nil {
-		return "", fmt.Errorf("delivery: load case runs for fingerprint: %w", err)
+	if !s.renderPDF {
+		_ = s.renderJobs.MarkPDFDisabled(ctx, revision.ID)
+		return
 	}
-	issues, err := s.deps.Issues.ListReportIssues(ctx, versionID, batchID)
-	if err != nil {
-		return "", fmt.Errorf("delivery: load issues for fingerprint: %w", err)
+	attempts := s.renderAttempts
+	if attempts < MinRenderAttempts || attempts > MaxRenderAttempts {
+		attempts = DefaultRenderMaxAttempts
 	}
-	return reportFingerprint(batch, runs, issues)
+	dedupeKey := fmt.Sprintf("report:%d:rev:%d", report.ID, revision.Revision)
+	_ = s.renderJobs.EnsureRenderJob(ctx, revision.ID, report.ID, report.VersionID, dedupeKey, attempts)
 }
 
-// getReport loads one revision and maps the repository not-found to the report
-// reason.
-func (s *ReportService) getReport(ctx context.Context, versionID, reportID int64) (domain.Report, error) {
-	report, err := s.deps.Reports.Get(ctx, versionID, reportID)
+// MarkStaleIfChanged recomputes the current input fingerprint of every
+// published report of a version and marks the report stale when it differs.
+// Exactly one report.stale event is emitted per report while it stays stale
+// (spec §6.5). It reports whether any report changed.
+func (s *ReportService) MarkStaleIfChanged(ctx context.Context, versionID int64) (bool, error) {
+	if versionID <= 0 {
+		return false, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if s.data == nil {
+		return false, reportServiceNotConfigured("report data reader")
+	}
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Limit: 100})
 	if err != nil {
-		if errors.Is(err, domain.ErrReportNotFound) {
-			return domain.Report{}, reportNotFound(reportID)
+		return false, mapReportError(err)
+	}
+	changedAny := false
+	for _, report := range reports {
+		if report.Status != delivery.ReportStatusPublished {
+			continue
 		}
-		return domain.Report{}, fmt.Errorf("delivery: get report %d: %w", reportID, err)
+		snapshot, err := s.snapshotFor(ctx, report)
+		if err != nil {
+			return changedAny, err
+		}
+		fingerprint := delivery.Fingerprint(snapshot)
+		if fingerprint == "" {
+			return changedAny, fmt.Errorf("%w: report input fingerprint is empty", delivery.ErrInvalidArgument)
+		}
+		if fingerprint == report.InputFingerprint {
+			continue
+		}
+		changed, err := s.repo.MarkStale(ctx, report.ID)
+		if err != nil {
+			return changedAny, mapReportError(err)
+		}
+		if !changed {
+			continue
+		}
+		changedAny = true
+		s.publishStaleEvent(ctx, report)
 	}
-	return report, nil
+	return changedAny, nil
 }
 
-// publishReportPublished emits report.published after the revision commits.
-func (s *ReportService) publishReportPublished(ctx context.Context, report domain.Report, actor int64) {
-	if s.deps.Events == nil {
-		return
+// List returns one descending-ID page of a version's reports, optionally
+// filtered by kind.
+func (s *ReportService) List(ctx context.Context, versionID int64, kind *delivery.ReportKind) ([]delivery.Report, error) {
+	if versionID <= 0 {
+		return nil, platform.Invalid("version_id", "must be a positive decimal ID")
 	}
-	event := ReportEvent{
-		VersionID: report.VersionID,
-		BatchID:   report.BatchID,
-		Type:      ReportEventPublished,
-		Summary:   fmt.Sprintf("report published: %d revision %d", report.ID, report.Revision),
-		ActorID:   actor,
-		Detail: map[string]any{
-			"reportId": reportIDString(report.ID),
-			"batchId":  reportIDString(report.BatchID),
-			"revision": report.Revision,
-			"degraded": report.Content.Degraded,
-		},
+	if kind != nil && !kind.Valid() {
+		return nil, platform.Invalid("kind", "must be wave or version")
 	}
-	if err := s.deps.Events.PublishReportEvent(ctx, event); err != nil {
-		s.warn(ctx, "delivery report event publish failed",
-			"type", event.Type, "report_id", report.ID, "error", err)
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: kind, Limit: 100})
+	if err != nil {
+		return nil, mapReportError(err)
 	}
+	return reports, nil
 }
 
-// publishReportStale emits report.stale after the CAS flip.
-func (s *ReportService) publishReportStale(ctx context.Context, report domain.Report) {
-	if s.deps.Events == nil {
-		return
+// Get returns one report with its revisions (newest first) and the logical refs
+// of its current revision. delivery_report_ref is append-only across revisions,
+// so the projection must not expose the historical refs: the report detail
+// shows only the current revision's refs (deduplicated by kind/ref_id), never
+// the union of every revision.
+func (s *ReportService) Get(ctx context.Context, versionID, reportID int64) (ReportDetail, error) {
+	if versionID <= 0 || reportID <= 0 {
+		return ReportDetail{}, platform.Invalid("report_id", "must be a positive decimal ID")
 	}
-	event := ReportEvent{
-		VersionID: report.VersionID,
-		BatchID:   report.BatchID,
-		Type:      ReportEventStale,
-		Summary:   fmt.Sprintf("report stale: %d", report.ID),
-		Detail: map[string]any{
-			"reportId": reportIDString(report.ID),
-			"batchId":  reportIDString(report.BatchID),
-			"reason":   report.StaleReason,
-		},
+	report, err := s.repo.GetReport(ctx, versionID, reportID)
+	if err != nil {
+		return ReportDetail{}, mapReportError(err)
 	}
-	if err := s.deps.Events.PublishReportEvent(ctx, event); err != nil {
-		s.warn(ctx, "delivery report stale event publish failed",
-			"report_id", report.ID, "error", err)
+	revisions, err := s.repo.ListRevisions(ctx, reportID)
+	if err != nil {
+		return ReportDetail{}, mapReportError(err)
 	}
+	refs, err := s.repo.ListRefs(ctx, reportID)
+	if err != nil {
+		return ReportDetail{}, mapReportError(err)
+	}
+	return ReportDetail{Report: report, Revisions: revisions, Refs: currentRevisionRefs(refs, report.CurrentRevisionID)}, nil
 }
 
-// recordPublishedAudit records delivery.report.published (ids/revision/sha only).
-func (s *ReportService) recordPublishedAudit(ctx context.Context, report domain.Report, actor int64) {
-	if s.deps.Audit == nil {
-		return
+// currentRevisionRefs keeps the refs of the current report revision only and
+// collapses duplicate (kind, ref_id) rows, preserving insertion order. A report
+// without a current revision (draft) falls back to the deduplicated union, since
+// no revision is authoritative yet.
+func currentRevisionRefs(refs []delivery.ReportRef, currentRevisionID *int64) []delivery.ReportRef {
+	current := make([]delivery.ReportRef, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	filterByRevision := currentRevisionID != nil && *currentRevisionID > 0
+	for _, ref := range refs {
+		if filterByRevision && ref.ReportRevisionID != *currentRevisionID {
+			continue
+		}
+		key := ref.Kind + ":" + strconv.FormatInt(ref.RefID, 10)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		current = append(current, ref)
 	}
-	event := ReportAuditEvent{
-		Action:     ReportActionPublished,
-		ActorID:    actor,
-		TargetType: "report",
-		TargetID:   reportIDString(report.ID),
-		Metadata: map[string]any{
-			"report_id": reportIDString(report.ID),
-			"batch_id":  reportIDString(report.BatchID),
-			"revision":  report.Revision,
-			"sha256":    report.MarkdownSHA256,
-		},
-	}
-	if err := s.deps.Audit.RecordReportAudit(ctx, event); err != nil {
-		s.warn(ctx, "delivery report publish audit failed",
-			"report_id", report.ID, "error", err)
-	}
+	return current
 }
 
-// recordExportedAudit records delivery.report.exported. Export's shared
-// signature has no actor argument, so the actor comes from WithReportActor when
-// the HTTP layer attached it (0 otherwise).
-func (s *ReportService) recordExportedAudit(ctx context.Context, exported domain.ReportExport) {
-	if s.deps.Audit == nil {
-		return
+// OpenHTML returns the verified HTML bytes of one published revision. The
+// report must belong to the path version and the revision to the report; the
+// revision must be published with render_status='done'. The content adapter
+// re-validates owner/role/sha/size. Missing rows are 404; an integrity failure
+// is 409 state_conflict with details.reason=report_content_corrupt (spec §6.4).
+func (s *ReportService) OpenHTML(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error) {
+	if versionID <= 0 || reportID <= 0 || revision <= 0 {
+		return nil, delivery.ReportRevision{}, platform.Invalid("report_id", "must be a positive decimal ID and revision a positive integer")
 	}
-	event := ReportAuditEvent{
-		Action:     ReportActionExported,
-		ActorID:    reportActorFromContext(ctx),
-		TargetType: "report",
-		TargetID:   reportIDString(exported.ReportID),
-		Metadata: map[string]any{
-			"report_id": reportIDString(exported.ReportID),
-			"batch_id":  reportIDString(exported.BatchID),
-			"revision":  exported.Revision,
-			"sha256":    exported.SHA256,
-		},
+	if _, err := s.repo.GetReport(ctx, versionID, reportID); err != nil {
+		return nil, delivery.ReportRevision{}, mapReportError(err)
 	}
-	if err := s.deps.Audit.RecordReportAudit(ctx, event); err != nil {
-		s.warn(ctx, "delivery report export audit failed",
-			"report_id", exported.ReportID, "error", err)
+	stored, err := s.repo.GetRevision(ctx, reportID, revision)
+	if err != nil {
+		return nil, delivery.ReportRevision{}, mapReportError(err)
 	}
+	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != reportRenderDone || stored.HTMLRef == nil {
+		return nil, stored, platform.NotFound("report revision")
+	}
+	if s.content == nil {
+		return nil, stored, reportServiceNotConfigured("content store")
+	}
+	html, sha, size, err := s.content.OpenReportHTML(ctx, *stored.HTMLRef)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrReportContentNotFound):
+			return nil, stored, platform.NotFound("report content")
+		case errors.Is(err, ErrReportContentCorrupt):
+			return nil, stored, reportContentCorrupt()
+		default:
+			if apiErr := platform.AsError(err); apiErr.Status == 404 {
+				return nil, stored, platform.NotFound("report content")
+			}
+			return nil, stored, err
+		}
+	}
+	if !validReportSHA(sha) || size != int64(len(html)) {
+		return nil, stored, reportContentCorrupt()
+	}
+	return html, stored, nil
 }
 
-// ready validates the mandatory ports.
-func (s *ReportService) ready() error {
-	switch {
-	case s.deps.Versions == nil, s.deps.Execution == nil, s.deps.Graph == nil,
-		s.deps.Issues == nil, s.deps.Reports == nil, s.deps.Files == nil,
-		s.deps.IDs == nil:
-		return errors.New("delivery: report service is not configured")
+// OpenPDF returns the verified PDF bytes of one published revision (spec §6.4).
+// The report must belong to the path version and the revision to the report. A
+// revision whose PDF is pending/running is 409 pdf_not_ready; a failed render is
+// 409 pdf_failed; a disabled or missing PDF is 404. The content adapter
+// re-validates owner/role/sha/size and the service additionally checks the
+// %PDF- magic.
+func (s *ReportService) OpenPDF(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error) {
+	if versionID <= 0 || reportID <= 0 || revision <= 0 {
+		return nil, delivery.ReportRevision{}, platform.Invalid("report_id", "must be a positive decimal ID and revision a positive integer")
+	}
+	if _, err := s.repo.GetReport(ctx, versionID, reportID); err != nil {
+		return nil, delivery.ReportRevision{}, mapReportError(err)
+	}
+	stored, err := s.repo.GetRevision(ctx, reportID, revision)
+	if err != nil {
+		return nil, delivery.ReportRevision{}, mapReportError(err)
+	}
+	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != reportRenderDone {
+		return nil, stored, platform.NotFound("report revision")
+	}
+	switch stored.PDFStatus {
+	case delivery.PDFStatusDone:
+		if stored.PDFRef == nil {
+			return nil, stored, platform.NotFound("report PDF")
+		}
+	case delivery.PDFStatusPending, delivery.PDFStatusRunning:
+		return nil, stored, pdfNotReady()
+	case delivery.PDFStatusFailed:
+		return nil, stored, pdfFailed(stored.PDFError)
 	default:
-		return nil
+		return nil, stored, platform.NotFound("report PDF")
+	}
+	if s.content == nil {
+		return nil, stored, reportServiceNotConfigured("content store")
+	}
+	pdf, sha, size, err := s.content.OpenReportPDF(ctx, *stored.PDFRef)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrReportContentNotFound):
+			return nil, stored, platform.NotFound("report PDF content")
+		case errors.Is(err, ErrReportContentCorrupt):
+			return nil, stored, reportContentCorrupt()
+		default:
+			if apiErr := platform.AsError(err); apiErr.Status == 404 {
+				return nil, stored, platform.NotFound("report PDF content")
+			}
+			return nil, stored, err
+		}
+	}
+	if !validReportSHA(sha) || size != int64(len(pdf)) || !validPDFHeader(pdf) {
+		return nil, stored, reportContentCorrupt()
+	}
+	return pdf, stored, nil
+}
+
+// ensureGeneration returns a report with an in-flight draft revision: it
+// creates the first revision when none exists, re-ensures the task of a
+// pending draft, and allocates the next revision after a failed one.
+func (s *ReportService) ensureGeneration(ctx context.Context, report delivery.Report) (delivery.Report, error) {
+	revisions, err := s.repo.ListRevisions(ctx, report.ID)
+	if err != nil {
+		return delivery.Report{}, mapReportError(err)
+	}
+	if len(revisions) == 0 {
+		revision, err := s.createNextDraft(ctx, report)
+		if err != nil {
+			return delivery.Report{}, err
+		}
+		if err := s.ensureTask(ctx, report.ID, revision.Revision); err != nil {
+			return delivery.Report{}, err
+		}
+		return report, nil
+	}
+	latest := revisions[0]
+	switch {
+	case latest.Status == delivery.ReportStatusPublished:
+		return report, nil
+	case latest.Status == delivery.ReportStatusDraft && latest.RenderStatus != reportRenderFailed:
+		if err := s.ensureTask(ctx, report.ID, latest.Revision); err != nil {
+			return delivery.Report{}, err
+		}
+		return report, nil
+	default:
+		revision, err := s.createNextDraft(ctx, report)
+		if err != nil {
+			return delivery.Report{}, err
+		}
+		if err := s.ensureTask(ctx, report.ID, revision.Revision); err != nil {
+			return delivery.Report{}, err
+		}
+		return report, nil
 	}
 }
 
-// now returns the injected clock time in UTC.
-func (s *ReportService) now() time.Time {
-	if s.deps.Clock != nil {
-		return s.deps.Clock.Now().UTC()
+// createNextDraft computes the current snapshot fingerprint and inserts the
+// next draft revision (revision = max+1) with as_of=now.
+func (s *ReportService) createNextDraft(ctx context.Context, report delivery.Report) (delivery.ReportRevision, error) {
+	snapshot, err := s.snapshotFor(ctx, report)
+	if err != nil {
+		return delivery.ReportRevision{}, err
 	}
-	return time.Now().UTC()
+	asOf := s.clock.Now().UTC()
+	snapshot.GeneratedAt = asOf
+	fingerprint := delivery.Fingerprint(snapshot)
+	if fingerprint == "" {
+		return delivery.ReportRevision{}, fmt.Errorf("%w: report input fingerprint is empty", delivery.ErrInvalidArgument)
+	}
+	next, err := s.repo.NextRevision(ctx, report.ID)
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	revision, err := s.repo.CreateRevision(ctx, delivery.ReportRevision{
+		ReportID:         report.ID,
+		Revision:         next,
+		Status:           delivery.ReportStatusDraft,
+		InputFingerprint: fingerprint,
+		AsOf:             asOf,
+		TemplateVersion:  s.templateVersion(),
+		RenderStatus:     reportRenderPending,
+	})
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	return revision, nil
 }
 
-// warn logs a best-effort failure through the optional logger.
-func (s *ReportService) warn(ctx context.Context, message string, args ...any) {
-	if s.deps.Logger == nil {
+// templateVersion resolves the built-in template version new revisions record:
+// the renderer is the source of truth (P7-D-03); a renderer that does not
+// report one keeps the frozen P4 version.
+func (s *ReportService) templateVersion() string {
+	if versioner, ok := s.renderer.(delivery.ReportTemplateVersioner); ok {
+		if version := versioner.TemplateVersion(); version != "" {
+			return version
+		}
+	}
+	return reportTemplateVersion
+}
+
+// snapshotFor reads and caps the deterministic report input for one report and
+// stamps the report's authoritative scope onto it (a mis-scoped reader can
+// never cross versions or waves).
+func (s *ReportService) snapshotFor(ctx context.Context, report delivery.Report) (delivery.ReportSnapshot, error) {
+	if s.data == nil {
+		return delivery.ReportSnapshot{}, reportServiceNotConfigured("report data reader")
+	}
+	var snapshot delivery.ReportSnapshot
+	var err error
+	switch report.Kind {
+	case delivery.ReportKindWave:
+		if report.WaveID == nil || *report.WaveID <= 0 {
+			return delivery.ReportSnapshot{}, fmt.Errorf("%w: wave report has no wave", delivery.ErrInvalidArgument)
+		}
+		snapshot, err = s.data.WaveSnapshot(ctx, report.VersionID, *report.WaveID)
+	case delivery.ReportKindVersion:
+		snapshot, err = s.data.VersionSnapshot(ctx, report.VersionID)
+	default:
+		return delivery.ReportSnapshot{}, fmt.Errorf("%w: unknown report kind %q", delivery.ErrInvalidArgument, report.Kind)
+	}
+	if err != nil {
+		return delivery.ReportSnapshot{}, err
+	}
+	snapshot = delivery.CapReportSnapshot(snapshot)
+	snapshot.Kind = report.Kind
+	snapshot.VersionID = report.VersionID
+	if report.Kind == delivery.ReportKindWave {
+		snapshot.WaveID = report.WaveID
+	} else {
+		snapshot.WaveID = nil
+	}
+	return snapshot, nil
+}
+
+// failRevision best-effort records a failed render. The revision stays a draft
+// for audit and the next retry allocates a new revision (spec §6.3).
+func (s *ReportService) failRevision(ctx context.Context, revisionID int64, cause error) {
+	if s.repo == nil {
 		return
 	}
-	s.deps.Logger.WarnContext(ctx, message, args...)
+	_ = s.repo.MarkRenderMetadata(ctx, revisionID, reportRenderFailed, cause.Error())
 }
 
-// reportFingerprint maps the ports to the domain fingerprint input and computes
-// its sha256. The per-case evidence count and the failure-class tally are part
-// of the input (spec §7.3), so a new evidence row or a reclassification flips a
-// published report to stale on the next read.
-func reportFingerprint(batch ReportBatchSource, runs []ReportCaseRunSource, issues []ReportIssueSource) (string, error) {
-	caseRuns := make([]domain.ReportFingerprintCaseRun, 0, len(runs))
-	failureClasses := domain.ReportFingerprintFailureClasses{}
-	for _, run := range runs {
-		switch run.FailureClass {
-		case "application":
-			failureClasses.Application++
-		case "environment":
-			failureClasses.Environment++
-		case "session":
-			failureClasses.Session++
-		case "model":
-			failureClasses.Model++
-		case "case":
-			failureClasses.Case++
-		}
-		caseRuns = append(caseRuns, domain.ReportFingerprintCaseRun{
-			CaseRunID:     reportIDString(run.CaseRunID),
-			Attempt:       run.Attempt,
-			Status:        run.Status,
-			FailureClass:  run.FailureClass,
-			EvidenceCount: run.EvidenceCount,
-			UpdatedAt:     reportFormatFingerprintTime(run.UpdatedAt),
-		})
-	}
-	issueRows := make([]domain.ReportFingerprintIssue, 0, len(issues))
-	for _, issue := range issues {
-		issueRows = append(issueRows, domain.ReportFingerprintIssue{
-			IssueID:   reportIDString(issue.IssueID),
-			Status:    issue.Status,
-			Revision:  issue.Revision,
-			UpdatedAt: reportFormatFingerprintTime(issue.UpdatedAt),
-		})
-	}
-	input := domain.ReportFingerprintInput{
-		Batch: domain.ReportFingerprintBatch{
-			ID:         reportIDString(batch.ID),
-			Status:     batch.Status,
-			FinishedAt: reportFormatOptionalFingerprintTime(batch.FinishedAt),
-			Counts: domain.ReportFingerprintCounts{
-				CaseCount:    batch.CaseCount,
-				Passed:       batch.PassedCount,
-				Failed:       batch.FailedCount,
-				Blocked:      batch.BlockedCount,
-				Inconclusive: batch.InconclusiveCount,
-				Skipped:      batch.SkippedCount,
-				Interrupted:  batch.InterruptedCount,
-			},
-			FailureClasses: failureClasses,
-		},
-		LatestCaseRuns: caseRuns,
-		Issues:         issueRows,
-	}
-	return input.Compute()
-}
-
-// reportBatchD49Fields records D49 for a freshly generated snapshot. Both values
-// are always set for a new revision: an empty reason is the explicit "no
-// fallback" state. A legacy snapshot without the fields stays nil/unrecorded;
-// history is never rewritten on read.
-func reportBatchD49Fields(reason string) (*string, *bool) {
-	recorded := reason
-	rewritten := reason == domain.ReportBaseFallbackHistoryRewritten
-	return &recorded, &rewritten
-}
-
-// reportRisks derives the deterministic risk bullets of the report.
-func reportRisks(summary domain.ReportSummary, issues []ReportIssueSource, degraded bool) []string {
-	risks := make([]string, 0, 7)
-	if summary.Failed > 0 {
-		risks = append(risks, fmt.Sprintf("存在 %d 个失败用例", summary.Failed))
-	}
-	if summary.Blocked > 0 {
-		risks = append(risks, fmt.Sprintf("存在 %d 个阻塞用例", summary.Blocked))
-	}
-	if summary.Inconclusive > 0 {
-		risks = append(risks, fmt.Sprintf("存在 %d 个不确定结果", summary.Inconclusive))
-	}
-	if summary.FlakyCount > 0 {
-		risks = append(risks, fmt.Sprintf("存在 %d 个不稳定用例", summary.FlakyCount))
-	}
-	active := map[string]int{}
-	for _, issue := range issues {
-		if issue.Status == "open" || issue.Status == "confirmed" {
-			active[issue.Severity]++
-		}
-	}
-	if active["blocker"] > 0 {
-		risks = append(risks, fmt.Sprintf("存在 %d 个阻塞级未关闭问题", active["blocker"]))
-	}
-	if active["major"] > 0 {
-		risks = append(risks, fmt.Sprintf("存在 %d 个严重级未关闭问题", active["major"]))
-	}
-	if degraded {
-		risks = append(risks, "AI 分析或补全降级，报告结论可能不完整")
-	}
-	return risks
-}
-
-// reportMarkdownPath builds the root-relative Markdown path of one revision.
-func reportMarkdownPath(versionID, reportID int64, revision int) string {
-	return fmt.Sprintf("versions/%d/reports/%d-r%d.md", versionID, reportID, revision)
-}
-
-// reportTitle builds the human-readable report title.
-func reportTitle(version ReportVersionSource, batch ReportBatchSource) string {
-	return fmt.Sprintf("%s 批次 %d 报告", version.Name, batch.BatchNo)
-}
-
-// reportIDString renders a domain id as the decimal string used by the JSON
-// boundary and event details (D29).
-func reportIDString(id int64) string {
-	return strconv.FormatInt(id, 10)
-}
-
-// reportActorPointer renders the optional generated_by value.
-func reportActorPointer(actor int64) *int64 {
-	if actor <= 0 {
+// ensureWaveLink backfills run_wave.report_id for a wave report.
+func (s *ReportService) ensureWaveLink(ctx context.Context, report delivery.Report) error {
+	if report.Kind != delivery.ReportKindWave {
 		return nil
 	}
-	return &actor
-}
-
-// reportFormatOptionalTime renders an optional timestamp for the snapshot.
-func reportFormatOptionalTime(value *time.Time) string {
-	if value == nil {
-		return ""
+	if report.WaveID == nil || *report.WaveID <= 0 {
+		return fmt.Errorf("%w: wave report has no wave", delivery.ErrInvalidArgument)
 	}
-	return value.UTC().Format(time.RFC3339)
-}
-
-// reportFormatFingerprintTime renders a timestamp for the fingerprint.
-func reportFormatFingerprintTime(value time.Time) string {
-	return value.UTC().Format(time.RFC3339Nano)
-}
-
-// reportFormatOptionalFingerprintTime renders an optional fingerprint timestamp.
-func reportFormatOptionalFingerprintTime(value *time.Time) string {
-	if value == nil {
-		return ""
+	if err := s.repo.SetWaveReportID(ctx, report.VersionID, *report.WaveID, report.ID); err != nil {
+		return mapReportError(err)
 	}
-	return reportFormatFingerprintTime(*value)
+	return nil
 }
 
-// reportNotFound builds the 404 report error.
-func reportNotFound(reportID int64) *domain.Error {
-	return domain.NewNotFound("report", reportID)
+// ensureTask ensures the report.wave/report.version work item for a revision.
+func (s *ReportService) ensureTask(ctx context.Context, reportID int64, revision int32) error {
+	if s.tasks == nil {
+		return reportServiceNotConfigured("task ensurer")
+	}
+	return s.tasks.EnsureReportTask(ctx, reportID, revision)
 }
 
-// reportNoPreviousBatch builds the 404 returned when baseReportId is omitted and
-// the batch has no previous-batch report to diff against. The target report
-// exists, so the message deliberately never mentions its id.
-func reportNoPreviousBatch() *domain.Error {
-	return &domain.Error{
-		Kind:    domain.KindNotFound,
-		Reason:  domain.ReportReasonNotFound,
-		Message: "no report of the previous batch to diff against",
+// publishPublishedEvent emits report.published on the version channel. Event
+// failures are best-effort and never roll back the publish (spec §4.3).
+func (s *ReportService) publishPublishedEvent(ctx context.Context, report delivery.Report, revision delivery.ReportRevision) {
+	if s.events == nil {
+		return
+	}
+	payload := map[string]any{
+		"report_id":          platformid.Format(report.ID),
+		"report_revision_id": platformid.Format(revision.ID),
+		"kind":               string(report.Kind),
+		"revision":           revision.Revision,
+		"as_of":              revision.AsOf.UTC().Format(time.RFC3339Nano),
+	}
+	if report.WaveID != nil {
+		payload["wave_id"] = platformid.Format(*report.WaveID)
+	}
+	if revision.HTMLRef != nil {
+		payload["html_ref"] = platformid.Format(*revision.HTMLRef)
+	}
+	_ = s.events.Publish(ctx, reportEventPublished, report.VersionID, payload)
+}
+
+// recordPublishedAudit writes the best-effort publish audit entry.
+func (s *ReportService) recordPublishedAudit(ctx context.Context, report delivery.Report, revision delivery.ReportRevision) {
+	if s.audit == nil {
+		return
+	}
+	metadata := map[string]any{
+		"report_revision_id": platformid.Format(revision.ID),
+		"revision":           revision.Revision,
+		"kind":               string(report.Kind),
+	}
+	if revision.HTMLRef != nil {
+		metadata["html_ref"] = platformid.Format(*revision.HTMLRef)
+	}
+	_ = s.audit.Write(ctx, 0, reportEventPublished, "report", platformid.Format(report.ID), metadata)
+}
+
+// publishStaleEvent emits report.stale for one report with the current
+// published revision number.
+func (s *ReportService) publishStaleEvent(ctx context.Context, report delivery.Report) {
+	if s.events == nil {
+		return
+	}
+	currentRevision := int32(0)
+	if report.CurrentRevisionID != nil {
+		revisions, err := s.repo.ListRevisions(ctx, report.ID)
+		if err == nil {
+			for _, revision := range revisions {
+				if revision.ID == *report.CurrentRevisionID {
+					currentRevision = revision.Revision
+					break
+				}
+			}
+		}
+	}
+	payload := map[string]any{
+		"report_id":        platformid.Format(report.ID),
+		"kind":             string(report.Kind),
+		"current_revision": currentRevision,
+		"reason":           "input_changed",
+	}
+	if report.WaveID != nil {
+		payload["wave_id"] = platformid.Format(*report.WaveID)
+	}
+	_ = s.events.Publish(ctx, reportEventStale, report.VersionID, payload)
+}
+
+// reportRefsForSnapshot derives the append-only logical refs of one revision:
+// requirements, waves, case versions, case runs, issues and version SUTs. The
+// list is deduplicated and sorted by (kind, ref_id) for replay determinism.
+func reportRefsForSnapshot(report delivery.Report, snapshot delivery.ReportSnapshot) []delivery.ReportRef {
+	seen := make(map[string]bool)
+	refs := make([]delivery.ReportRef, 0)
+	add := func(kind string, refID int64) {
+		if refID <= 0 {
+			return
+		}
+		key := fmt.Sprintf("%s:%d", kind, refID)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		refs = append(refs, delivery.ReportRef{Kind: kind, RefID: refID})
+	}
+	if report.Kind == delivery.ReportKindWave && report.WaveID != nil {
+		add("wave", *report.WaveID)
+	}
+	for _, requirement := range snapshot.Requirements {
+		add("requirement", requirement.ID)
+	}
+	for _, wave := range snapshot.Waves {
+		add("wave", wave.ID)
+	}
+	for _, run := range snapshot.CaseRuns {
+		add("case_version", run.CaseVersionID)
+		add("case_run", run.ID)
+		if run.WaveID > 0 {
+			add("wave", run.WaveID)
+		}
+		if run.VersionSUTID != nil {
+			add("version_sut", *run.VersionSUTID)
+		}
+		for _, versionSUTID := range run.VersionSUTIDs {
+			add("version_sut", versionSUTID)
+		}
+	}
+	for _, issue := range snapshot.Issues {
+		add("issue", issue.ID)
+	}
+	for _, versionSUT := range snapshot.VersionSUTs {
+		add("version_sut", versionSUT.ID)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Kind != refs[j].Kind {
+			return refs[i].Kind < refs[j].Kind
+		}
+		return refs[i].RefID < refs[j].RefID
+	})
+	return refs
+}
+
+// terminalWaveStatus reports a run_wave terminal status (done/failed/cancelled).
+func terminalWaveStatus(status string) bool {
+	switch status {
+	case "done", "failed", "cancelled":
+		return true
+	default:
+		return false
 	}
 }
 
-// reportInvalidID builds the generic invalid-id error.
-func reportInvalidID(message string) *domain.Error {
-	return domain.NewInvalid("id", domain.ReasonInvalidArgument, message)
+// versionReportDue applies the §7.4 version-report condition that is visible
+// from the version snapshot: every requirement is closed or obsolete and no
+// wave is active. The active-intent/human-request checks belong to the close
+// predicate and the reader/wiring layer.
+func versionReportDue(snapshot delivery.ReportSnapshot) bool {
+	for _, requirement := range snapshot.Requirements {
+		if requirement.Status != "closed" && requirement.Status != "obsolete" {
+			return false
+		}
+	}
+	for _, wave := range snapshot.Waves {
+		switch wave.Status {
+		case "planned", "running", "paused":
+			return false
+		}
+	}
+	return true
 }
 
-// exportFailure logs the underlying cause, which may embed an OS path, and
-// returns the fixed report_export_failed error.
-func (s *ReportService) exportFailure(ctx context.Context, reportID int64, cause error) *domain.Error {
-	s.warn(ctx, "delivery report export failed", "report_id", reportID, "cause", cause)
-	return reportExportFailed()
+// reportHasPublishedRevision reports whether the report has a published
+// current revision (a stale report still has one and is only regenerated
+// explicitly or through the stale path).
+func reportHasPublishedRevision(report delivery.Report) bool {
+	return report.Status == delivery.ReportStatusPublished || report.Status == delivery.ReportStatusStale
 }
 
-// reportExportFailed builds the 500 report_export_failed error. The delivery
-// context has no "internal" Kind constant, so this literal is mapped to the
-// generic 500 by the HTTP layer while details.reason stays stable. The message
-// is fixed and never embeds the cause (which can carry a filesystem path).
-func reportExportFailed() *domain.Error {
-	return &domain.Error{
-		Kind:    "internal",
-		Reason:  domain.ReportReasonExportFailed,
-		Message: "report export failed: the stored markdown file is missing or corrupted",
+// validReportSHA reports a lowercase hex sha256.
+func validReportSHA(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validPDFHeader reports the PDF file signature of stored bytes.
+func validPDFHeader(data []byte) bool {
+	return len(data) >= 5 && string(data[:5]) == "%PDF-"
+}
+
+// pdfNotReady is the stable 409 of a revision whose PDF is still rendering
+// (spec §6.4).
+func pdfNotReady() error {
+	apiErr := platform.NewError(409, "pdf_not_ready", "report PDF is not ready")
+	apiErr.Details = map[string]any{"reason": "pdf_not_ready"}
+	return apiErr
+}
+
+// pdfFailed is the stable 409 of a revision whose PDF rendering failed. The
+// readable failure reason travels in details.error (already bounded on write).
+func pdfFailed(message string) error {
+	apiErr := platform.NewError(409, "pdf_failed", "report PDF rendering failed")
+	details := map[string]any{"reason": "pdf_failed"}
+	if message != "" {
+		details["error"] = message
+	}
+	apiErr.Details = details
+	return apiErr
+}
+
+// reportContentCorrupt is the stable 409 for a failed report content integrity
+// check (spec §6.4).
+func reportContentCorrupt() error {
+	apiErr := platform.StateConflict("report content failed its integrity check")
+	apiErr.Details = map[string]any{"reason": "report_content_corrupt"}
+	return apiErr
+}
+
+// reportServiceNotConfigured is the internal error of a missing wired port.
+func reportServiceNotConfigured(kind string) error {
+	return platform.NewError(500, "internal", kind+" is not configured")
+}
+
+// mapReportError maps the report repository/content sentinels onto the stable
+// API envelope.
+func mapReportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, ErrReportNotFound):
+		return platform.NotFound("report")
+	case errors.Is(err, delivery.ErrInvalidArgument):
+		return platform.Invalid("report", "report input is not valid")
+	case errors.Is(err, delivery.ErrStateConflict):
+		return platform.StateConflict("report is not in a valid state")
+	default:
+		return err
 	}
 }

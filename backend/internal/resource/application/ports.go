@@ -1,35 +1,28 @@
-// Package application holds the resource context's use cases and the ports
-// they consume from the outside world: the clock, the read-only login checker
-// and the read-only local Git validator. The domain and application layers
-// depend on these interfaces; adapters live in infrastructure.
-package application
+package resourceapp
 
-import (
-	"context"
-	"time"
+import "context"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
-)
-
-// Clock returns the current time. It is injectable so TTL and expiry rules can
-// be tested without sleeping.
-type Clock interface {
-	Now() time.Time
+// CatalogReader is the read port consumed by the version context. The resource
+// application Service implements it.
+type CatalogReader interface {
+	GetSUT(context.Context, int64) (SUTView, error)
+	GetEnvironment(context.Context, int64) (EnvironmentView, error)
+	GetPage(context.Context, int64) (PageView, error)
+	GetAPI(context.Context, int64) (APIView, error)
+	GetDatabase(context.Context, int64) (DatabaseView, error)
+	GetAccount(context.Context, int64) (AccountView, error)
+	GetRepository(context.Context, int64) (CodeRepositoryView, error)
 }
 
-// LoginChecker performs the environment's read-only login_check (spec §6.3).
-// A non-nil error means the check could not be performed at all; a denied or
-// unreachable result is reported in LoginCheckResult.
-type LoginChecker interface {
-	Check(ctx context.Context, env domain.Environment, state domain.StorageState) (domain.LoginCheckResult, error)
+// UsageChecker answers whether a resource is still referenced by a version
+// binding. The version context implements it; the resource context never
+// imports the version package.
+type UsageChecker interface {
+	SUTInUse(context.Context, int64) (bool, error)
+	EnvironmentInUse(context.Context, int64) (bool, error)
+	PageInUse(context.Context, int64) (bool, error)
+	APIInUse(context.Context, int64) (bool, error)
+	DatabaseInUse(context.Context, int64) (bool, error)
+	AccountInUse(context.Context, int64) (bool, error)
+	RepositoryInUse(context.Context, int64) (bool, error)
 }
-
-// GitValidator validates a local Git checkout read-only and returns the commit
-// the fixed branch points at (spec §6.7).
-type GitValidator interface {
-	Validate(ctx context.Context, path, branch string) (domain.GitValidation, error)
-}
-
-// DefaultCompanyKey is the key of the single seeded company that owns every P2
-// resource. Requests never carry a company id.
-const DefaultCompanyKey = "default"

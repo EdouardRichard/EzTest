@@ -1,13 +1,14 @@
 package httpapi
 
-import (
-	"context"
+import "net/http"
 
-	searchapp "github.com/EdouardRichard/EzTest/backend/internal/search/application"
-)
-
-// Searcher is the global-search use case consumed by the HTTP handler. The
-// search application Service satisfies it; tests can substitute a fake.
-type Searcher interface {
-	Search(ctx context.Context, query searchapp.Query) (searchapp.Snapshot, error)
+// RegisterRoutes mounts GET /api/search behind the server's bearer
+// authentication middleware. Every logged-in user may search (spec §4.2/§6);
+// there is no admin-only guard. The composition root calls this from the P6
+// wiring task.
+func RegisterRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, handler *Handler) {
+	if mux == nil || handler == nil {
+		return
+	}
+	mux.Handle("GET /api/search", authenticated(http.HandlerFunc(handler.Search)))
 }

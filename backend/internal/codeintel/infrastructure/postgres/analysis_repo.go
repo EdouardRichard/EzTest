@@ -1,408 +1,162 @@
-package postgres
+package codeintelpg
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"time"
 
+	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
-// analysisColumnList is the shared column order of every analysis query and the
-// order scanAnalysis expects.
-const analysisColumnList = `id, version_id, repo_id, base_commit, head_commit, change_set_id,
-	status, degraded, model, prompt_version, analysis_version,
-	fact_versions, stats, errors, unmapped, created_by, created_at, started_at, finished_at`
-
-// analysisErrorJSON, unmappedChangeJSON and factVersionRefJSON are the
-// persisted shapes of the analyses' JSONB arrays. The domain types carry no
-// JSON tags, so the repository owns the stored document shape; the keys match
-// the API field names.
-type analysisErrorJSON struct {
-	Code    string `json:"code"`
-	Path    string `json:"path,omitempty"`
-	Message string `json:"message,omitempty"`
-}
-
-type unmappedChangeJSON struct {
-	Path       string `json:"path"`
-	Status     string `json:"status"`
-	Reason     string `json:"reason"`
-	Suggestion string `json:"suggestion,omitempty"`
-}
-
-type factVersionRefJSON struct {
-	FactKey string `json:"factKey"`
-	Version int    `json:"version"`
-}
-
-// marshalAnalysisErrors encodes the error entries as a JSONB array.
-func marshalAnalysisErrors(items []domain.AnalysisError) (string, error) {
-	entries := make([]analysisErrorJSON, 0, len(items))
-	for _, item := range items {
-		entries = append(entries, analysisErrorJSON{Code: item.Code, Path: item.Path, Message: item.Message})
-	}
-	raw, err := json.Marshal(entries)
-	if err != nil {
-		return "", err
-	}
-	return string(raw), nil
-}
-
-// decodeAnalysisErrors decodes a stored error-entry array.
-func decodeAnalysisErrors(raw []byte) ([]domain.AnalysisError, error) {
-	if len(raw) == 0 {
-		return []domain.AnalysisError{}, nil
-	}
-	var entries []analysisErrorJSON
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, err
-	}
-	items := make([]domain.AnalysisError, 0, len(entries))
-	for _, entry := range entries {
-		items = append(items, domain.AnalysisError{Code: entry.Code, Path: entry.Path, Message: entry.Message})
-	}
-	return items, nil
-}
-
-// marshalUnmappedChanges encodes the unmapped-change entries as a JSONB array.
-func marshalUnmappedChanges(items []domain.UnmappedChange) (string, error) {
-	entries := make([]unmappedChangeJSON, 0, len(items))
-	for _, item := range items {
-		entries = append(entries, unmappedChangeJSON{
-			Path:       item.Path,
-			Status:     item.Status,
-			Reason:     item.Reason,
-			Suggestion: item.Suggestion,
-		})
-	}
-	raw, err := json.Marshal(entries)
-	if err != nil {
-		return "", err
-	}
-	return string(raw), nil
-}
-
-// decodeUnmappedChanges decodes a stored unmapped-change array.
-func decodeUnmappedChanges(raw []byte) ([]domain.UnmappedChange, error) {
-	if len(raw) == 0 {
-		return []domain.UnmappedChange{}, nil
-	}
-	var entries []unmappedChangeJSON
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, err
-	}
-	items := make([]domain.UnmappedChange, 0, len(entries))
-	for _, entry := range entries {
-		items = append(items, domain.UnmappedChange{
-			Path:       entry.Path,
-			Status:     entry.Status,
-			Reason:     entry.Reason,
-			Suggestion: entry.Suggestion,
-		})
-	}
-	return items, nil
-}
-
-// marshalFactVersionRefs encodes the fact-version snapshot as a JSONB array.
-func marshalFactVersionRefs(items []domain.FactVersionRef) (string, error) {
-	entries := make([]factVersionRefJSON, 0, len(items))
-	for _, item := range items {
-		entries = append(entries, factVersionRefJSON{FactKey: item.FactKey, Version: item.Version})
-	}
-	raw, err := json.Marshal(entries)
-	if err != nil {
-		return "", err
-	}
-	return string(raw), nil
-}
-
-// decodeFactVersionRefs decodes a stored fact-version snapshot.
-func decodeFactVersionRefs(raw []byte) ([]domain.FactVersionRef, error) {
-	if len(raw) == 0 {
-		return []domain.FactVersionRef{}, nil
-	}
-	var entries []factVersionRefJSON
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, err
-	}
-	items := make([]domain.FactVersionRef, 0, len(entries))
-	for _, entry := range entries {
-		items = append(items, domain.FactVersionRef{FactKey: entry.FactKey, Version: entry.Version})
-	}
-	return items, nil
-}
-
-// scanAnalysis scans one row in analysisColumnList order and decodes the JSONB
-// columns.
-func scanAnalysis(row rowScanner) (domain.CodeAnalysis, error) {
-	var (
-		analysis     domain.CodeAnalysis
-		factVersions []byte
-		stats        []byte
-		errorsJSON   []byte
-		unmapped     []byte
-	)
-	if err := row.Scan(
-		&analysis.ID,
-		&analysis.VersionID,
-		&analysis.RepoID,
-		&analysis.BaseCommit,
-		&analysis.HeadCommit,
-		&analysis.ChangeSetID,
-		&analysis.Status,
-		&analysis.Degraded,
-		&analysis.Model,
-		&analysis.PromptVersion,
-		&analysis.AnalysisVersion,
-		&factVersions,
-		&stats,
-		&errorsJSON,
-		&unmapped,
-		&analysis.CreatedBy,
-		&analysis.CreatedAt,
-		&analysis.StartedAt,
-		&analysis.FinishedAt,
-	); err != nil {
-		return domain.CodeAnalysis{}, err
-	}
-	decodedFactVersions, err := decodeFactVersionRefs(factVersions)
-	if err != nil {
-		return domain.CodeAnalysis{}, fmt.Errorf("decode analysis fact versions: %w", err)
-	}
-	decodedErrors, err := decodeAnalysisErrors(errorsJSON)
-	if err != nil {
-		return domain.CodeAnalysis{}, fmt.Errorf("decode analysis errors: %w", err)
-	}
-	decodedUnmapped, err := decodeUnmappedChanges(unmapped)
-	if err != nil {
-		return domain.CodeAnalysis{}, fmt.Errorf("decode analysis unmapped changes: %w", err)
-	}
-	analysis.FactVersions = decodedFactVersions
-	analysis.Stats = stats
-	analysis.Errors = decodedErrors
-	analysis.Unmapped = decodedUnmapped
-	return analysis, nil
-}
-
-// AnalysisRepo implements domain.AnalysisRepository on a pgx pool.
-type AnalysisRepo struct {
+// AnalysisRepository stores code_analysis rows.
+type AnalysisRepository struct {
 	pool *pgxpool.Pool
 }
 
-// NewAnalysisRepository returns an impact-analysis repository backed by pg.
-func NewAnalysisRepository(pg *pgxpool.Pool) *AnalysisRepo {
-	return &AnalysisRepo{pool: pg}
+// NewAnalysisRepository wires the analysis-run repository.
+func NewAnalysisRepository(pool *pgxpool.Pool) *AnalysisRepository {
+	return &AnalysisRepository{pool: pool}
 }
 
-var _ domain.AnalysisRepository = (*AnalysisRepo)(nil)
+var _ codeintelapp.AnalysisRepository = (*AnalysisRepository)(nil)
 
-// Create inserts a queued analysis run with its application-generated id. An
-// empty status/analysis version falls back to the DDL defaults.
-func (r *AnalysisRepo) Create(ctx context.Context, analysis domain.CodeAnalysis) error {
-	status := analysis.Status
-	if status == "" {
-		status = domain.RunQueued
+const analysisColumns = `id, version_id, repo_id, base_commit_sha, head_commit_sha, status,
+	degraded, model, prompt_version, analysis_version, changed_files, stats, unmapped, errors,
+	fact_versions, created_by, started_at, finished_at, created_at, updated_at`
+
+func scanAnalysis(row rowScanner) (codeintel.Analysis, error) {
+	var analysis codeintel.Analysis
+	var status string
+	var changedFiles, stats, unmapped, errorsRaw, factVersions []byte
+	if err := row.Scan(&analysis.ID, &analysis.VersionID, &analysis.RepoID, &analysis.BaseCommitSHA,
+		&analysis.HeadCommitSHA, &status, &analysis.Degraded, &analysis.Model, &analysis.PromptVersion,
+		&analysis.AnalysisVersion, &changedFiles, &stats, &unmapped, &errorsRaw, &factVersions,
+		&analysis.CreatedBy, &analysis.StartedAt, &analysis.FinishedAt,
+		&analysis.CreatedAt, &analysis.UpdatedAt); err != nil {
+		return codeintel.Analysis{}, err
 	}
-	analysisVersion := analysis.AnalysisVersion
-	if analysisVersion == 0 {
-		analysisVersion = 1
-	}
-	encodedFactVersions, err := marshalFactVersionRefs(analysis.FactVersions)
-	if err != nil {
-		return fmt.Errorf("postgres: encode analysis fact versions: %w", err)
-	}
-	encodedErrors, err := marshalAnalysisErrors(analysis.Errors)
-	if err != nil {
-		return fmt.Errorf("postgres: encode analysis errors: %w", err)
-	}
-	encodedUnmapped, err := marshalUnmappedChanges(analysis.Unmapped)
-	if err != nil {
-		return fmt.Errorf("postgres: encode analysis unmapped changes: %w", err)
-	}
-	const query = `INSERT INTO code_analysis
-		(id, version_id, repo_id, base_commit, head_commit, change_set_id,
-		 status, degraded, model, prompt_version, analysis_version,
-		 fact_versions, stats, errors, unmapped, created_by, started_at, finished_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-		        $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16, $17, $18)`
-	if _, err := r.pool.Exec(ctx, query,
-		analysis.ID, analysis.VersionID, analysis.RepoID, analysis.BaseCommit,
-		analysis.HeadCommit, analysis.ChangeSetID, status, analysis.Degraded,
-		analysis.Model, analysis.PromptVersion, analysisVersion,
-		encodedFactVersions, jsonParam(analysis.Stats, jsonFallbackEmptyObject),
-		encodedErrors, encodedUnmapped, analysis.CreatedBy,
-		analysis.StartedAt, analysis.FinishedAt,
-	); err != nil {
-		if isUniqueViolation(err) {
-			return domain.NewConflict("duplicate_key",
-				fmt.Sprintf("codeintel: analysis %d already exists", analysis.ID))
-		}
-		return fmt.Errorf("postgres: create analysis: %w", err)
-	}
-	return nil
+	analysis.Status = codeintel.AnalysisStatus(status)
+	analysis.ChangedFiles = json.RawMessage(changedFiles)
+	analysis.Stats = json.RawMessage(stats)
+	analysis.Unmapped = json.RawMessage(unmapped)
+	analysis.Errors = json.RawMessage(errorsRaw)
+	analysis.FactVersions = json.RawMessage(factVersions)
+	return analysis, nil
 }
 
-// Update rewrites the run state of one analysis: change set, status, degraded
-// flag, fact-version snapshot, stats, errors, unmapped entries and the
-// start/finish timestamps. The analysis identity is immutable (§6.4/INV-6).
-func (r *AnalysisRepo) Update(ctx context.Context, analysis domain.CodeAnalysis) error {
-	encodedFactVersions, err := marshalFactVersionRefs(analysis.FactVersions)
+// Create inserts one queued analysis run.
+func (r *AnalysisRepository) Create(ctx context.Context, analysis codeintel.Analysis) (codeintel.Analysis, error) {
+	stored, err := scanAnalysis(r.pool.QueryRow(ctx, `
+		INSERT INTO code_analysis (id, version_id, repo_id, base_commit_sha, head_commit_sha, status,
+			degraded, model, prompt_version, analysis_version, changed_files, stats, unmapped,
+			errors, fact_versions, created_by, started_at, finished_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb,
+			$14::jsonb, $15::jsonb, $16, $17, $18, $19, $20)
+		RETURNING `+analysisColumns,
+		analysis.ID, analysis.VersionID, analysis.RepoID, analysis.BaseCommitSHA, analysis.HeadCommitSHA,
+		string(analysis.Status), analysis.Degraded, analysis.Model, analysis.PromptVersion,
+		analysis.AnalysisVersion, jsonText(analysis.ChangedFiles, `[]`), jsonText(analysis.Stats, `{}`),
+		jsonText(analysis.Unmapped, `[]`), jsonText(analysis.Errors, `[]`),
+		jsonText(analysis.FactVersions, `{}`), analysis.CreatedBy, analysis.StartedAt,
+		analysis.FinishedAt, analysis.CreatedAt, analysis.UpdatedAt))
 	if err != nil {
-		return fmt.Errorf("postgres: encode analysis fact versions: %w", err)
+		return codeintel.Analysis{}, wrapDB("create code analysis", err)
 	}
-	encodedErrors, err := marshalAnalysisErrors(analysis.Errors)
+	return stored, nil
+}
+
+// Get loads one analysis.
+func (r *AnalysisRepository) Get(ctx context.Context, id int64) (codeintel.Analysis, error) {
+	analysis, err := scanAnalysis(r.pool.QueryRow(ctx, `SELECT `+analysisColumns+` FROM code_analysis WHERE id = $1`, id))
 	if err != nil {
-		return fmt.Errorf("postgres: encode analysis errors: %w", err)
+		return codeintel.Analysis{}, wrapDB("get code analysis", err)
 	}
-	encodedUnmapped, err := marshalUnmappedChanges(analysis.Unmapped)
+	return analysis, nil
+}
+
+// Latest returns the newest analysis of one version×repo.
+func (r *AnalysisRepository) Latest(ctx context.Context, versionID, repoID int64) (codeintel.Analysis, error) {
+	analysis, err := scanAnalysis(r.pool.QueryRow(ctx, `
+		SELECT `+analysisColumns+` FROM code_analysis
+		WHERE version_id = $1 AND repo_id = $2
+		ORDER BY id DESC
+		LIMIT 1
+	`, versionID, repoID))
 	if err != nil {
-		return fmt.Errorf("postgres: encode analysis unmapped changes: %w", err)
+		return codeintel.Analysis{}, wrapDB("latest code analysis", err)
 	}
-	const query = `UPDATE code_analysis
-		SET change_set_id = $3, status = $4, degraded = $5,
-		    fact_versions = $6::jsonb, stats = $7::jsonb,
-		    errors = $8::jsonb, unmapped = $9::jsonb,
-		    started_at = $10, finished_at = $11
-		WHERE id = $1 AND version_id = $2`
-	tag, err := r.pool.Exec(ctx, query,
-		analysis.ID, analysis.VersionID, analysis.ChangeSetID, analysis.Status,
-		analysis.Degraded, encodedFactVersions,
-		jsonParam(analysis.Stats, jsonFallbackEmptyObject),
-		encodedErrors, encodedUnmapped,
-		analysis.StartedAt, analysis.FinishedAt,
-	)
+	return analysis, nil
+}
+
+// Update writes the mutable analysis status/result columns.
+func (r *AnalysisRepository) Update(ctx context.Context, analysis codeintel.Analysis) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE code_analysis
+		SET status = $2, degraded = $3, model = $4, prompt_version = $5, analysis_version = $6,
+		    changed_files = $7::jsonb, stats = $8::jsonb, unmapped = $9::jsonb,
+		    errors = $10::jsonb, fact_versions = $11::jsonb, started_at = $12,
+		    finished_at = $13, updated_at = $14
+		WHERE id = $1
+	`, analysis.ID, string(analysis.Status), analysis.Degraded, analysis.Model, analysis.PromptVersion,
+		analysis.AnalysisVersion, jsonText(analysis.ChangedFiles, `[]`), jsonText(analysis.Stats, `{}`),
+		jsonText(analysis.Unmapped, `[]`), jsonText(analysis.Errors, `[]`),
+		jsonText(analysis.FactVersions, `{}`), analysis.StartedAt, analysis.FinishedAt, analysis.UpdatedAt)
 	if err != nil {
-		return fmt.Errorf("postgres: update analysis: %w", err)
+		return wrapDB("update code analysis", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return notFoundError("analysis", analysis.ID)
+		return codeintel.ErrNotFound
 	}
 	return nil
 }
 
-// GetByID returns one analysis of versionID.
-func (r *AnalysisRepo) GetByID(ctx context.Context, versionID, id int64) (domain.CodeAnalysis, error) {
-	analysis, err := scanAnalysis(r.pool.QueryRow(ctx,
-		`SELECT `+analysisColumnList+`
-		 FROM code_analysis WHERE id = $1 AND version_id = $2`, id, versionID))
+// Active returns the queued/running analysis of one version×repo.
+func (r *AnalysisRepository) Active(ctx context.Context, versionID, repoID int64) (codeintel.Analysis, bool, error) {
+	analysis, err := scanAnalysis(r.pool.QueryRow(ctx, `
+		SELECT `+analysisColumns+` FROM code_analysis
+		WHERE version_id = $1 AND repo_id = $2 AND status IN ('queued', 'running')
+		ORDER BY id DESC
+		LIMIT 1
+	`, versionID, repoID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.CodeAnalysis{}, notFoundError("analysis", id)
+			return codeintel.Analysis{}, false, nil
 		}
-		return domain.CodeAnalysis{}, fmt.Errorf("postgres: get analysis: %w", err)
+		return codeintel.Analysis{}, false, wrapDB("active code analysis", err)
 	}
-	return analysis, nil
+	return analysis, true, nil
 }
 
-// GetLatest returns the newest analysis of versionID (any status).
-func (r *AnalysisRepo) GetLatest(ctx context.Context, versionID int64) (domain.CodeAnalysis, error) {
-	analysis, err := scanAnalysis(r.pool.QueryRow(ctx,
-		`SELECT `+analysisColumnList+`
-		 FROM code_analysis
-		 WHERE version_id = $1
-		 ORDER BY created_at DESC, id DESC
-		 LIMIT 1`, versionID))
+// DoneByRange returns a completed analysis for the same version×repo×range.
+func (r *AnalysisRepository) DoneByRange(ctx context.Context, versionID, repoID int64, base, head string) (codeintel.Analysis, bool, error) {
+	analysis, err := scanAnalysis(r.pool.QueryRow(ctx, `
+		SELECT `+analysisColumns+` FROM code_analysis
+		WHERE version_id = $1 AND repo_id = $2 AND base_commit_sha = $3 AND head_commit_sha = $4
+		  AND status = 'done'
+		ORDER BY id DESC
+		LIMIT 1
+	`, versionID, repoID, base, head))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.CodeAnalysis{}, domain.NewNotFound("analysis_not_found",
-				fmt.Sprintf("codeintel: version %d has no analysis", versionID))
+			return codeintel.Analysis{}, false, nil
 		}
-		return domain.CodeAnalysis{}, fmt.Errorf("postgres: get latest analysis: %w", err)
+		return codeintel.Analysis{}, false, wrapDB("done code analysis", err)
 	}
-	return analysis, nil
+	return analysis, true, nil
 }
 
-// FindReusable returns the newest done analysis of the exact
-// (version, repo, base, head, model, prompt_version) input, or nil when the
-// input was never analysed (design spec §6.4). A degraded done analysis is
-// reusable: degraded is a terminal state.
-func (r *AnalysisRepo) FindReusable(ctx context.Context, versionID, repoID int64, base, head, model, prompt string) (*domain.CodeAnalysis, error) {
-	analysis, err := scanAnalysis(r.pool.QueryRow(ctx,
-		`SELECT `+analysisColumnList+`
-		 FROM code_analysis
-		 WHERE version_id = $1 AND repo_id = $2
-		   AND base_commit = $3 AND head_commit = $4
-		   AND model = $5 AND prompt_version = $6
-		   AND status = 'done'
-		 ORDER BY analysis_version DESC, created_at DESC, id DESC
-		 LIMIT 1`,
-		versionID, repoID, base, head, model, prompt))
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("postgres: find reusable analysis: %w", err)
-	}
-	return &analysis, nil
-}
-
-// HasActive reports whether versionID has a queued or running analysis
-// (409 analysis_in_progress).
-func (r *AnalysisRepo) HasActive(ctx context.Context, versionID int64) (bool, error) {
-	var active bool
-	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS (
-			SELECT 1 FROM code_analysis
-			WHERE version_id = $1 AND status IN ('queued', 'running')
-		)`, versionID).Scan(&active); err != nil {
-		return false, fmt.Errorf("postgres: check active analysis: %w", err)
-	}
-	return active, nil
-}
-
-// NextAnalysisVersion returns COALESCE(MAX(analysis_version), 0) + 1 for the
-// (version, base, head) triple (INV-6).
-func (r *AnalysisRepo) NextAnalysisVersion(ctx context.Context, versionID int64, base, head string) (int, error) {
+// MaxVersion returns the highest analysis_version of one version×repo (0 when
+// no analysis exists).
+func (r *AnalysisRepository) MaxVersion(ctx context.Context, versionID, repoID int64) (int, error) {
 	var version int
 	if err := r.pool.QueryRow(ctx, `
-		SELECT COALESCE(MAX(analysis_version), 0) + 1
-		FROM code_analysis
-		WHERE version_id = $1 AND base_commit = $2 AND head_commit = $3`,
-		versionID, base, head).Scan(&version); err != nil {
-		return 0, fmt.Errorf("postgres: next analysis version: %w", err)
+		SELECT COALESCE(MAX(analysis_version), 0) FROM code_analysis
+		WHERE version_id = $1 AND repo_id = $2
+	`, versionID, repoID).Scan(&version); err != nil {
+		return 0, wrapDB("max code analysis version", err)
 	}
 	return version, nil
-}
-
-// RecoverStale marks analyses a previous process left queued or running before
-// before as failed(interrupted), the startup recovery rule of design spec §6.8.
-// A queued analysis is aged by created_at, a running one by started_at (with
-// created_at as fallback). It returns the number of recovered analyses.
-func (r *AnalysisRepo) RecoverStale(ctx context.Context, before time.Time) (int64, error) {
-	const query = `UPDATE code_analysis
-		SET status = 'failed',
-		    finished_at = now(),
-		    errors = errors || '[{"code":"interrupted"}]'::jsonb
-		WHERE status IN ('queued', 'running')
-		  AND ((status = 'queued' AND created_at < $1)
-		    OR (status = 'running' AND COALESCE(started_at, created_at) < $1))`
-	tag, err := r.pool.Exec(ctx, query, before)
-	if err != nil {
-		return 0, fmt.Errorf("postgres: recover stale analyses: %w", err)
-	}
-	return tag.RowsAffected(), nil
-}
-
-// UpdateCandidateSelection persists a human candidate selection. It is
-// last-write-wins by design (design spec §6.11): the actor and timestamp are
-// recorded, no revision is introduced.
-func (r *AnalysisRepo) UpdateCandidateSelection(ctx context.Context, analysisID, candidateID, actorID int64, selected bool) error {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE code_impact_candidate
-		SET selected = $4, selection_updated_by = $3, selection_updated_at = now()
-		WHERE id = $2 AND analysis_id = $1`,
-		analysisID, candidateID, actorID, selected)
-	if err != nil {
-		return fmt.Errorf("postgres: update candidate selection: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return notFoundError("candidate", candidateID)
-	}
-	return nil
 }

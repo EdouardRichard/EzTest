@@ -1,453 +1,611 @@
-package httpapi
+package deliveryapi
 
-import "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
 
-// ---------------------------------------------------------------------------
-// Issue DTOs (spec §7.3)
-// ---------------------------------------------------------------------------
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/pagination"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
+)
 
-// issueRefDTO is one durable issue reference. Both ids are decimal strings
-// (a commit ref keeps its 40-hex form).
-type issueRefDTO struct {
-	Kind string `json:"kind"`
-	ID   string `json:"id"`
+const (
+	// maxRequestBody is the shared request-body cap.
+	maxRequestBody = 1 << 20
+	// maxIssueReasonRunes bounds the issue action reason (contract 1..2000).
+	maxIssueReasonRunes = 2000
+)
+
+/* -------------------------------- requests -------------------------------- */
+
+// issueActionRequest is the optional body of confirm/dismiss and the shared
+// shape of reopen/merge (contract IssueActionRequest).
+type issueActionRequest struct {
+	Reason           *string `json:"reason"`
+	ExpectedRevision *int64  `json:"expected_revision"`
 }
 
-// issueCodeRefDTO is one code anchor of an issue. Anchors are populated by the
-// codeintel adapter (T17); until it is wired the array is empty.
-type issueCodeRefDTO struct {
-	AnchorID string `json:"anchorId"`
-	Path     string `json:"path"`
-	Line     int    `json:"line"`
-	Kind     string `json:"kind"`
-	Label    string `json:"label"`
+// issueAction is the normalized action input handed to the application service.
+type issueAction struct {
+	Reason   string
+	Expected *int32
 }
 
-// issueCaseSummaryDTO is the lightweight case summary of the issue detail.
-type issueCaseSummaryDTO struct {
-	CaseRunID  *string `json:"caseRunId"`
-	CaseNodeID *string `json:"caseNodeId"`
-}
-
-// issueBatchSummaryDTO is the lightweight batch summary of the issue detail.
-type issueBatchSummaryDTO struct {
-	ID string `json:"id"`
-}
-
-// issueRequirementSummaryDTO is the lightweight requirement summary of the issue
-// detail.
-type issueRequirementSummaryDTO struct {
-	ID string `json:"id"`
-}
-
-// issueSummaryDTO is the issue list item. Every id is a decimal string; bodies
-// are limited to the fields the spec allows and never include evidence content.
-type issueSummaryDTO struct {
-	ID              string            `json:"id"`
-	VersionID       string            `json:"versionId"`
-	BatchID         *string           `json:"batchId"`
-	CaseRunID       *string           `json:"caseRunId"`
-	CaseNodeID      *string           `json:"caseNodeId"`
-	StepResultID    *string           `json:"stepResultId"`
-	Source          string            `json:"source"`
-	Category        string            `json:"category"`
-	Severity        string            `json:"severity"`
-	Status          string            `json:"status"`
-	Confidence      string            `json:"confidence"`
-	FailureClass    *string           `json:"failureClass"`
-	Title           string            `json:"title"`
-	RerunSuggestion string            `json:"rerunSuggestion"`
-	RecurrenceCount int               `json:"recurrenceCount"`
-	Revision        int               `json:"revision"`
-	Refs            []issueRefDTO     `json:"refs"`
-	CodeRefs        []issueCodeRefDTO `json:"codeRefs"`
-	DismissedReason string            `json:"dismissedReason"`
-	CreatedBy       string            `json:"createdBy"`
-	ConfirmedBy     *string           `json:"confirmedBy"`
-	ConfirmedAt     *string           `json:"confirmedAt"`
-	DismissedBy     *string           `json:"dismissedBy"`
-	DismissedAt     *string           `json:"dismissedAt"`
-	CreatedAt       string            `json:"createdAt"`
-	UpdatedAt       string            `json:"updatedAt"`
-}
-
-// issueDTO is the issue detail: the summary plus the long bodies and the
-// case/batch/requirement summaries that save the front end a second request.
-type issueDTO struct {
-	issueSummaryDTO
-	Description string                      `json:"description"`
-	ReproSteps  string                      `json:"reproSteps"`
-	Expected    string                      `json:"expected"`
-	Actual      string                      `json:"actual"`
-	Case        *issueCaseSummaryDTO        `json:"case"`
-	Requirement *issueRequirementSummaryDTO `json:"requirement"`
-	Batch       *issueBatchSummaryDTO       `json:"batch"`
-}
-
-// newIssueCodeRefDTOs maps the optional codeintel anchors to the codeRefs array
-// (never nil: an unwired or failing reader yields []).
-func newIssueCodeRefDTOs(refs []IssueCodeRef) []issueCodeRefDTO {
-	out := make([]issueCodeRefDTO, 0, len(refs))
-	for _, ref := range refs {
-		out = append(out, issueCodeRefDTO{
-			AnchorID: formatID(ref.AnchorID),
-			Path:     ref.Path,
-			Line:     ref.Line,
-			Kind:     ref.Kind,
-			Label:    ref.Label,
-		})
-	}
-	return out
-}
-
-// newIssueSummaryDTO maps one issue row, its refs and code anchors to the list
-// shape.
-func newIssueSummaryDTO(issue domain.Issue, refs []domain.IssueRef, codeRefs []IssueCodeRef) issueSummaryDTO {
-	refDTOs := make([]issueRefDTO, 0, len(refs))
-	for _, ref := range refs {
-		refDTOs = append(refDTOs, issueRefDTO{Kind: ref.RefKind, ID: ref.RefID})
-	}
-	return issueSummaryDTO{
-		ID:              formatID(issue.ID),
-		VersionID:       formatID(issue.VersionID),
-		BatchID:         formatOptionalID(issue.BatchID),
-		CaseRunID:       formatOptionalID(issue.CaseRunID),
-		CaseNodeID:      formatOptionalID(issue.CaseNodeID),
-		StepResultID:    formatOptionalID(issue.StepResultID),
-		Source:          issue.Source,
-		Category:        issue.Category,
-		Severity:        issue.Severity,
-		Status:          issue.Status,
-		Confidence:      issue.Confidence,
-		FailureClass:    formatOptionalString(issue.FailureClass),
-		Title:           issue.Title,
-		RerunSuggestion: issue.RerunSuggestion,
-		RecurrenceCount: issue.RecurrenceCount,
-		Revision:        issue.Revision,
-		Refs:            refDTOs,
-		CodeRefs:        newIssueCodeRefDTOs(codeRefs),
-		DismissedReason: issue.DismissedReason,
-		CreatedBy:       formatID(issue.CreatedBy),
-		ConfirmedBy:     formatOptionalID(issue.ConfirmedBy),
-		ConfirmedAt:     formatOptionalTime(issue.ConfirmedAt),
-		DismissedBy:     formatOptionalID(issue.DismissedBy),
-		DismissedAt:     formatOptionalTime(issue.DismissedAt),
-		CreatedAt:       formatTime(issue.CreatedAt),
-		UpdatedAt:       formatTime(issue.UpdatedAt),
-	}
-}
-
-// newIssueDTO maps one issue row and its refs to the detail shape.
-func newIssueDTO(issue domain.Issue, refs []domain.IssueRef, codeRefs []IssueCodeRef) issueDTO {
-	return issueDTO{
-		issueSummaryDTO: newIssueSummaryDTO(issue, refs, codeRefs),
-		Description:     issue.Description,
-		ReproSteps:      issue.ReproSteps,
-		Expected:        issue.Expected,
-		Actual:          issue.Actual,
-		Case:            issueCaseSummary(issue, refs),
-		Requirement:     issueRequirementSummary(refs),
-		Batch:           issueBatchSummary(issue, refs),
-	}
-}
-
-// issueCaseSummary derives the case summary from the issue links and refs.
-func issueCaseSummary(issue domain.Issue, refs []domain.IssueRef) *issueCaseSummaryDTO {
-	caseRunID := issue.CaseRunID
-	caseNodeID := issue.CaseNodeID
-	for _, ref := range refs {
-		switch ref.RefKind {
-		case domain.RefKindCaseRun:
-			if caseRunID == nil {
-				if id, err := parseDecimalID("caseRunId", ref.RefID); err == nil {
-					caseRunID = &id
-				}
-			}
-		case domain.RefKindCaseNode:
-			if caseNodeID == nil {
-				if id, err := parseDecimalID("caseNodeId", ref.RefID); err == nil {
-					caseNodeID = &id
-				}
-			}
+// parse trims and bounds the reason and validates the optional CAS revision.
+// reopen requires a non-empty reason; the other transitions accept an empty one.
+func (r issueActionRequest) parse(requireReason bool) (issueAction, error) {
+	reason := ""
+	if r.Reason != nil {
+		reason = strings.TrimSpace(*r.Reason)
+		if utf8.RuneCountInString(reason) > maxIssueReasonRunes {
+			return issueAction{}, platform.Invalid("reason", "must be at most 2000 characters")
 		}
 	}
-	if caseRunID == nil && caseNodeID == nil {
+	if requireReason && reason == "" {
+		return issueAction{}, platform.Invalid("reason", "must not be empty")
+	}
+	expected, err := parseExpectedRevision(r.ExpectedRevision)
+	if err != nil {
+		return issueAction{}, err
+	}
+	return issueAction{Reason: reason, Expected: expected}, nil
+}
+
+// parseExpectedRevision converts the optional JSON revision into the service's
+// int32 CAS value. A present value must be a positive 32-bit integer.
+func parseExpectedRevision(raw *int64) (*int32, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if *raw <= 0 {
+		return nil, platform.Invalid("expected_revision", "must be a positive integer")
+	}
+	if *raw > math.MaxInt32 {
+		return nil, platform.Invalid("expected_revision", "must be a 32-bit positive integer")
+	}
+	value := int32(*raw)
+	return &value, nil
+}
+
+// mergeIssueRequest is POST .../issues/{issueId}/merge (contract
+// MergeIssueRequest).
+type mergeIssueRequest struct {
+	TargetIssueID    string  `json:"target_issue_id"`
+	Reason           *string `json:"reason"`
+	ExpectedRevision *int64  `json:"expected_revision"`
+}
+
+// parse resolves the required target and the optional reason/revision.
+func (r mergeIssueRequest) parse() (int64, issueAction, error) {
+	targetID, err := validation.NonEmptyID("target_issue_id", r.TargetIssueID)
+	if err != nil {
+		return 0, issueAction{}, err
+	}
+	action, err := issueActionRequest{Reason: r.Reason, ExpectedRevision: r.ExpectedRevision}.parse(false)
+	if err != nil {
+		return 0, issueAction{}, err
+	}
+	return targetID, action, nil
+}
+
+/* ---------------------------------- views --------------------------------- */
+
+// IssueView is the list/action projection of one issue (contract IssueView).
+// RecurrenceCount/LastRecurredAt are the P7 recurrence projection; MergedChain
+// is the read-time merged_into target chain (direct target first, terminal
+// target last, at most MaxIssueMergeChain IDs) and is null for a non-merged
+// issue (spec §4.6).
+type IssueView struct {
+	ID               string           `json:"id"`
+	VersionID        string           `json:"version_id"`
+	Title            string           `json:"title"`
+	Summary          string           `json:"summary"`
+	Status           string           `json:"status"`
+	Category         string           `json:"category"`
+	Severity         string           `json:"severity"`
+	Source           string           `json:"source"`
+	ExpectedRevision int32            `json:"expected_revision"`
+	MergedIntoID     *string          `json:"merged_into_id"`
+	MergedAt         *string          `json:"merged_at"`
+	ReopenCount      int              `json:"reopen_count"`
+	RecurrenceCount  int              `json:"recurrence_count"`
+	LastRecurredAt   *string          `json:"last_recurred_at"`
+	MergedChain      []string         `json:"merged_chain"`
+	Refs             []IssueRefView   `json:"refs"`
+	Triage           *IssueTriageView `json:"triage"`
+	CreatedAt        string           `json:"created_at"`
+	UpdatedAt        string           `json:"updated_at"`
+}
+
+// IssueRefView is one append-only issue reference (contract IssueRefView).
+type IssueRefView struct {
+	Kind         string  `json:"kind"`
+	RefID        string  `json:"ref_id"`
+	VersionSUTID *string `json:"version_sut_id"`
+	Role         string  `json:"role"`
+}
+
+// IssueTriageView is the latest issue.triage analysis-run projection.
+type IssueTriageView struct {
+	AnalysisRunID      *string `json:"analysis_run_id"`
+	Status             *string `json:"status"`
+	Classification     *string `json:"classification"`
+	DuplicateOfIssueID *string `json:"duplicate_of_issue_id"`
+	Summary            *string `json:"summary"`
+}
+
+// IssueHistoryView is one append-only status history entry.
+type IssueHistoryView struct {
+	FromStatus *string `json:"from_status"`
+	ToStatus   string  `json:"to_status"`
+	Reason     string  `json:"reason"`
+	ActorID    *string `json:"actor_id"`
+	ActorKind  string  `json:"actor_kind"`
+	CreatedAt  string  `json:"created_at"`
+}
+
+// IssueDetailView is IssueView plus history and per-kind related-ref counts.
+type IssueDetailView struct {
+	IssueView
+	History     []IssueHistoryView `json:"history"`
+	RelatedRefs map[string]int     `json:"related_refs"`
+}
+
+func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *delivery.AnalysisRun, mergedChain []int64) IssueView {
+	source := issue.Source
+	if source == "" {
+		source = delivery.IssueCandidateSource
+	}
+	view := IssueView{
+		ID:               platformid.Format(issue.ID),
+		VersionID:        platformid.Format(issue.VersionID),
+		Title:            issue.Title,
+		Summary:          issue.Summary,
+		Status:           string(issue.Status),
+		Category:         issue.Category,
+		Severity:         issue.Severity,
+		Source:           source,
+		ExpectedRevision: issue.ExpectedRevision,
+		MergedIntoID:     optionalIDString(issue.MergedIntoID),
+		MergedAt:         formatOptionalTime(issue.MergedAt),
+		ReopenCount:      issue.ReopenCount,
+		RecurrenceCount:  issue.RecurrenceCount,
+		LastRecurredAt:   formatOptionalTime(issue.LastRecurredAt),
+		MergedChain:      formatIssueChain(mergedChain),
+		Refs:             make([]IssueRefView, 0, len(refs)),
+		Triage:           toIssueTriageView(triage),
+		CreatedAt:        formatTime(issue.CreatedAt),
+		UpdatedAt:        formatTime(issue.UpdatedAt),
+	}
+	for _, ref := range refs {
+		view.Refs = append(view.Refs, toIssueRefView(ref))
+	}
+	return view
+}
+
+// formatIssueChain maps the read-time merge chain onto decimal-string IDs. An
+// empty chain projects as null (the optional contract field).
+func formatIssueChain(chain []int64) []string {
+	if len(chain) == 0 {
 		return nil
 	}
-	return &issueCaseSummaryDTO{
-		CaseRunID:  formatOptionalID(caseRunID),
-		CaseNodeID: formatOptionalID(caseNodeID),
+	ids := make([]string, 0, len(chain))
+	for _, id := range chain {
+		ids = append(ids, platformid.Format(id))
+	}
+	return ids
+}
+
+func toIssueRefView(ref delivery.IssueRef) IssueRefView {
+	role := ref.Role
+	if role == "" {
+		role = delivery.IssueRefRoleSource
+	}
+	return IssueRefView{
+		Kind:         ref.Kind,
+		RefID:        platformid.Format(ref.RefID),
+		VersionSUTID: optionalIDString(ref.VersionSUTID),
+		Role:         role,
 	}
 }
 
-// issueBatchSummary derives the batch summary from the issue row and refs.
-func issueBatchSummary(issue domain.Issue, refs []domain.IssueRef) *issueBatchSummaryDTO {
-	if issue.BatchID != nil {
-		return &issueBatchSummaryDTO{ID: formatID(*issue.BatchID)}
+// toIssueTriageView projects the analysis-run output consumed by the UI. The
+// output is an agent proposal JSON object; an absent or malformed output still
+// yields the run identity/status with null proposal fields.
+func toIssueTriageView(run *delivery.AnalysisRun) *IssueTriageView {
+	if run == nil {
+		return nil
 	}
+	view := &IssueTriageView{}
+	if run.ID > 0 {
+		view.AnalysisRunID = strPtr(platformid.Format(run.ID))
+	}
+	if status := strings.TrimSpace(string(run.Status)); status != "" {
+		view.Status = strPtr(status)
+	}
+	var output map[string]any
+	if len(run.Output) > 0 {
+		_ = json.Unmarshal(run.Output, &output)
+	}
+	view.Classification = payloadText(output, "classification")
+	view.DuplicateOfIssueID = payloadDecimalID(output, "duplicate_of_issue_id")
+	view.Summary = payloadText(output, "summary")
+	if view.Summary == nil {
+		// issue.propose has no dedicated summary field; the merge reason is the
+		// human-readable explanation of the proposal.
+		view.Summary = payloadText(output, "merge_reason")
+	}
+	return view
+}
+
+func toIssueHistoryView(change delivery.IssueStatusChange) IssueHistoryView {
+	actorKind := change.ActorKind
+	if actorKind == "" {
+		actorKind = "system"
+	}
+	return IssueHistoryView{
+		FromStatus: optionalIssueStatus(change.From),
+		ToStatus:   string(change.To),
+		Reason:     change.Reason,
+		ActorID:    optionalIDString(change.ActorID),
+		ActorKind:  actorKind,
+		CreatedAt:  formatTime(change.CreatedAt),
+	}
+}
+
+// relatedRefCounts groups the detail refs by kind (related_refs contract).
+func relatedRefCounts(refs []delivery.IssueRef) map[string]int {
+	counts := make(map[string]int, len(refs))
 	for _, ref := range refs {
-		if ref.RefKind != domain.RefKindBatch {
+		if ref.Kind == "" {
 			continue
 		}
-		if id, err := parseDecimalID("batchId", ref.RefID); err == nil {
-			return &issueBatchSummaryDTO{ID: formatID(id)}
+		counts[ref.Kind]++
+	}
+	return counts
+}
+
+func optionalIssueStatus(status *delivery.IssueStatus) *string {
+	if status == nil {
+		return nil
+	}
+	return strPtr(string(*status))
+}
+
+/* --------------------------------- reports -------------------------------- */
+
+// regenerateReportRequest is POST .../reports/{reportId}/regenerate (contract
+// RegenerateReportRequest). The reason is optional and bounded to 2000 runes.
+type regenerateReportRequest struct {
+	Reason *string `json:"reason"`
+}
+
+func (r regenerateReportRequest) parse() error {
+	if r.Reason == nil {
+		return nil
+	}
+	reason := strings.TrimSpace(*r.Reason)
+	if utf8.RuneCountInString(reason) > maxIssueReasonRunes {
+		return platform.Invalid("reason", "must be at most 2000 characters")
+	}
+	return nil
+}
+
+// ReportView is the list/detail report header projection (contract ReportView).
+type ReportView struct {
+	ID               string              `json:"id"`
+	VersionID        string              `json:"version_id"`
+	WaveID           *string             `json:"wave_id"`
+	Kind             string              `json:"kind"`
+	Status           string              `json:"status"`
+	InputFingerprint *string             `json:"input_fingerprint"`
+	CurrentRevision  *ReportRevisionView `json:"current_revision"`
+	CreatedAt        string              `json:"created_at"`
+	UpdatedAt        string              `json:"updated_at"`
+}
+
+// ReportRevisionView is one append-only revision projection (contract
+// ReportRevisionView). PDF fields are the P7 non-breaking widening.
+type ReportRevisionView struct {
+	ID               string  `json:"id"`
+	ReportID         string  `json:"report_id"`
+	Revision         int32   `json:"revision"`
+	Status           string  `json:"status"`
+	AsOf             string  `json:"as_of"`
+	InputFingerprint string  `json:"input_fingerprint"`
+	TemplateVersion  string  `json:"template_version"`
+	RenderStatus     string  `json:"render_status"`
+	HTMLAvailable    bool    `json:"html_available"`
+	PDFAvailable     bool    `json:"pdf_available"`
+	PDFStatus        string  `json:"pdf_status"`
+	PDFError         *string `json:"pdf_error"`
+	PDFRenderedAt    *string `json:"pdf_rendered_at"`
+	CreatedAt        string  `json:"created_at"`
+}
+
+// ReportRefView is one report revision logical reference.
+type ReportRefView struct {
+	Kind  string `json:"kind"`
+	RefID string `json:"ref_id"`
+}
+
+// ReportDetailView is ReportView plus revisions and logical refs.
+type ReportDetailView struct {
+	ReportView
+	Revisions []ReportRevisionView `json:"revisions"`
+	Refs      []ReportRefView      `json:"refs"`
+}
+
+// RegenerateReportResult is the 202 body of report regeneration.
+type RegenerateReportResult struct {
+	ReportID   string  `json:"report_id"`
+	Revision   int32   `json:"revision"`
+	WorkItemID *string `json:"work_item_id"`
+}
+
+// reportRenderDone is the render_status of a downloadable revision.
+const reportRenderDone = "done"
+
+func toReportView(report delivery.Report, current *delivery.ReportRevision) ReportView {
+	view := ReportView{
+		ID:               platformid.Format(report.ID),
+		VersionID:        platformid.Format(report.VersionID),
+		WaveID:           optionalIDString(report.WaveID),
+		Kind:             string(report.Kind),
+		Status:           string(report.Status),
+		InputFingerprint: optionalFingerprint(report.InputFingerprint),
+		CreatedAt:        formatTime(report.CreatedAt),
+		UpdatedAt:        formatTime(report.UpdatedAt),
+	}
+	if current != nil {
+		revision := toReportRevisionView(*current)
+		view.CurrentRevision = &revision
+	}
+	return view
+}
+
+func toReportRevisionView(revision delivery.ReportRevision) ReportRevisionView {
+	return ReportRevisionView{
+		ID:               platformid.Format(revision.ID),
+		ReportID:         platformid.Format(revision.ReportID),
+		Revision:         revision.Revision,
+		Status:           string(revision.Status),
+		AsOf:             formatTime(revision.AsOf),
+		InputFingerprint: revision.InputFingerprint,
+		TemplateVersion:  revision.TemplateVersion,
+		RenderStatus:     revision.RenderStatus,
+		HTMLAvailable: revision.Status == delivery.ReportStatusPublished &&
+			revision.RenderStatus == reportRenderDone && revision.HTMLRef != nil,
+		PDFAvailable:  revision.PDFStatus == delivery.PDFStatusDone && revision.PDFRef != nil,
+		PDFStatus:     string(revision.PDFStatus),
+		PDFError:      optionalString(revision.PDFError),
+		PDFRenderedAt: formatOptionalTime(revision.PDFRenderedAt),
+		CreatedAt:     formatTime(revision.CreatedAt),
+	}
+}
+
+func toReportRefView(ref delivery.ReportRef) ReportRefView {
+	return ReportRefView{
+		Kind:  ref.Kind,
+		RefID: platformid.Format(ref.RefID),
+	}
+}
+
+// findReportRevision resolves one revision number in a newest-first list.
+func findReportRevision(revisions []delivery.ReportRevision, revision int32) (delivery.ReportRevision, bool) {
+	for _, candidate := range revisions {
+		if candidate.Revision == revision {
+			return candidate, true
+		}
+	}
+	return delivery.ReportRevision{}, false
+}
+
+// currentReportRevision resolves the report's current revision id.
+func currentReportRevision(report delivery.Report, revisions []delivery.ReportRevision) *delivery.ReportRevision {
+	if report.CurrentRevisionID == nil || *report.CurrentRevisionID <= 0 {
+		return nil
+	}
+	for index := range revisions {
+		if revisions[index].ID == *report.CurrentRevisionID {
+			revision := revisions[index]
+			return &revision
 		}
 	}
 	return nil
 }
 
-// issueRequirementSummary derives the first requirement summary from the refs.
-func issueRequirementSummary(refs []domain.IssueRef) *issueRequirementSummaryDTO {
-	for _, ref := range refs {
-		if ref.RefKind != domain.RefKindRequirement {
-			continue
+func optionalFingerprint(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+/* -------------------------------- helpers --------------------------------- */
+
+// pathID parses one positive decimal path parameter.
+func pathID(r *http.Request, name, field string) (int64, error) {
+	return validation.NonEmptyID(field, r.PathValue(name))
+}
+
+// pageLimit parses the shared limit (default 20, capped at 100).
+func pageLimit(r *http.Request) int {
+	return pagination.Limit(r.URL.Query().Get("limit"), pagination.DefaultLimit, pagination.MaxLimit)
+}
+
+// issuePageParams parses the issue list limit and exclusive before cursor.
+func issuePageParams(r *http.Request) (int, int64, error) {
+	limit := pageLimit(r)
+	before, err := parseBefore(r.URL.Query().Get("before"))
+	if err != nil {
+		return 0, 0, err
+	}
+	return limit, before, nil
+}
+
+// parseBefore parses the optional exclusive before cursor (0 means absent).
+func parseBefore(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := pagination.Cursor(raw)
+	if err != nil || value <= 0 {
+		return 0, platform.Invalid("before", "must be a positive decimal ID")
+	}
+	return value, nil
+}
+
+// optionalQueryID parses an optional positive decimal query ID filter.
+func optionalQueryID(r *http.Request, field string) (*int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(field))
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := validation.NonEmptyID(field, raw)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+// optionalEnum validates an optional enum query filter.
+func optionalEnum(field, raw string, allowed ...string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return value, nil
 		}
-		if id, err := parseDecimalID("requirementId", ref.RefID); err == nil {
-			return &issueRequirementSummaryDTO{ID: formatID(id)}
+	}
+	return "", platform.Invalid(field, "must be one of "+strings.Join(allowed, ", "))
+}
+
+// decodeBody decodes one JSON request body with the shared size cap. An empty
+// body is accepted unless the operation requires a body.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any, required bool) error {
+	if r.Body == nil {
+		if required {
+			return platform.Invalid("body", "request body must be a valid JSON object")
 		}
+		return nil
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err := decoder.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) && !required {
+			return nil
+		}
+		return platform.Invalid("body", "request body must be a valid JSON object")
 	}
 	return nil
 }
 
-// issueDeepLinkDTO is the deep link of the global issue centre (spec §7.10).
-type issueDeepLinkDTO struct {
-	VersionID string `json:"versionId"`
-	Tab       string `json:"tab"`
-	IssueID   string `json:"issueId"`
+// writeNotConfigured reports a missing wired application service.
+func writeNotConfigured(w http.ResponseWriter, r *http.Request, kind string) {
+	httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", kind+" is not configured"))
 }
 
-// globalIssueDTO is one row of GET /api/issues.
-type globalIssueDTO struct {
-	issueSummaryDTO
-	VersionName string           `json:"versionName"`
-	DeepLink    issueDeepLinkDTO `json:"deepLink"`
+/* ------------------------------ value helpers ----------------------------- */
+
+func formatTime(value time.Time) string {
+	return value.UTC().Format(time.RFC3339)
 }
 
-// newGlobalIssueDTO maps one global issue row and its code anchors.
-func newGlobalIssueDTO(row GlobalIssueRow, codeRefs []IssueCodeRef) globalIssueDTO {
-	return globalIssueDTO{
-		issueSummaryDTO: newIssueSummaryDTO(row.Issue, row.Refs, codeRefs),
-		VersionName:     row.VersionName,
-		DeepLink: issueDeepLinkDTO{
-			VersionID: formatID(row.Issue.VersionID),
-			Tab:       "issues",
-			IssueID:   formatID(row.Issue.ID),
-		},
+func formatOptionalTime(value *time.Time) *string {
+	if value == nil {
+		return nil
+	}
+	return strPtr(formatTime(*value))
+}
+
+// optionalString maps an empty string to JSON null.
+func optionalString(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	trimmed := value
+	return &trimmed
+}
+
+func optionalIDString(value *int64) *string {
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	return strPtr(platformid.Format(*value))
+}
+
+func strPtr(value string) *string { return &value }
+
+// payloadText reads a non-empty string field from a decoded JSON object.
+func payloadText(payload map[string]any, key string) *string {
+	if payload == nil {
+		return nil
+	}
+	value, present := payload[key]
+	if !present || value == nil {
+		return nil
+	}
+	switch typed := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil
+		}
+		return &trimmed
+	case json.Number:
+		return strPtr(typed.String())
+	case float64:
+		return strPtr(strconv.FormatFloat(typed, 'f', -1, 64))
+	default:
+		return nil
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Report DTOs (spec §7.4)
-// ---------------------------------------------------------------------------
-
-// reportMarkdownDTO is the Markdown artifact summary. It exposes the API
-// download path only, never the stored filesystem path (D30).
-type reportMarkdownDTO struct {
-	SHA256       string `json:"sha256"`
-	SizeBytes    int64  `json:"sizeBytes"`
-	DownloadPath string `json:"downloadPath"`
-}
-
-// reportSummaryDTO is the report list item (no content, no stored path).
-type reportSummaryDTO struct {
-	ID               string            `json:"id"`
-	VersionID        string            `json:"versionId"`
-	BatchID          string            `json:"batchId"`
-	Revision         int               `json:"revision"`
-	Status           string            `json:"status"`
-	Title            string            `json:"title"`
-	InputFingerprint string            `json:"inputFingerprint"`
-	Markdown         reportMarkdownDTO `json:"markdown"`
-	StaleReason      string            `json:"staleReason"`
-	PublishedAt      *string           `json:"publishedAt"`
-	CreatedAt        string            `json:"createdAt"`
-	UpdatedAt        string            `json:"updatedAt"`
-}
-
-// reportDTO is the report detail: the summary plus the deterministic snapshot.
-type reportDTO struct {
-	reportSummaryDTO
-	BatchNo   int                  `json:"batchNo"`
-	BatchKind string               `json:"batchKind"`
-	Content   domain.ReportContent `json:"content"`
-}
-
-// reportDeepLinkDTO is the deep link of the global report centre (spec §7.10).
-type reportDeepLinkDTO struct {
-	VersionID string `json:"versionId"`
-	Tab       string `json:"tab"`
-	ReportID  string `json:"reportId"`
-}
-
-// globalReportDTO is one row of GET /api/reports.
-type globalReportDTO struct {
-	reportSummaryDTO
-	VersionName string            `json:"versionName"`
-	BatchNo     int               `json:"batchNo"`
-	DeepLink    reportDeepLinkDTO `json:"deepLink"`
-}
-
-// newReportSummaryDTO maps one report row to the list shape.
-func newReportSummaryDTO(report domain.Report) reportSummaryDTO {
-	return reportSummaryDTO{
-		ID:               formatID(report.ID),
-		VersionID:        formatID(report.VersionID),
-		BatchID:          formatID(report.BatchID),
-		Revision:         report.Revision,
-		Status:           report.Status,
-		Title:            report.Title,
-		InputFingerprint: report.InputFingerprint,
-		Markdown: reportMarkdownDTO{
-			SHA256:       report.MarkdownSHA256,
-			SizeBytes:    report.MarkdownSize,
-			DownloadPath: reportDownloadPath(report.VersionID, report.ID),
-		},
-		StaleReason: report.StaleReason,
-		PublishedAt: formatOptionalTime(report.PublishedAt),
-		CreatedAt:   formatTime(report.CreatedAt),
-		UpdatedAt:   formatTime(report.UpdatedAt),
+// payloadDecimalID reads a decimal-string ID field; JSON numbers are accepted.
+func payloadDecimalID(payload map[string]any, key string) *string {
+	if payload == nil {
+		return nil
 	}
-}
-
-// newReportDTO maps one report row to the detail shape.
-func newReportDTO(report domain.Report) reportDTO {
-	return reportDTO{
-		reportSummaryDTO: newReportSummaryDTO(report),
-		BatchNo:          report.Content.Batch.BatchNo,
-		BatchKind:        report.Content.Batch.Kind,
-		Content:          report.Content,
+	value, present := payload[key]
+	if !present || value == nil {
+		return nil
 	}
-}
-
-// newGlobalReportDTO maps one global report row.
-func newGlobalReportDTO(row GlobalReportRow) globalReportDTO {
-	return globalReportDTO{
-		reportSummaryDTO: newReportSummaryDTO(row.Report),
-		VersionName:      row.VersionName,
-		BatchNo:          row.BatchNo,
-		DeepLink: reportDeepLinkDTO{
-			VersionID: formatID(row.Report.VersionID),
-			Tab:       "report",
-			ReportID:  formatID(row.Report.ID),
-		},
+	switch typed := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil
+		}
+		if _, err := validation.NonEmptyID(key, trimmed); err != nil {
+			return nil
+		}
+		return &trimmed
+	case json.Number:
+		text := typed.String()
+		if _, err := validation.NonEmptyID(key, text); err != nil {
+			return nil
+		}
+		return &text
+	case float64:
+		if typed <= 0 || typed != math.Trunc(typed) || typed > math.MaxInt64 {
+			return nil
+		}
+		return strPtr(platformid.Format(int64(typed)))
+	default:
+		return nil
 	}
-}
-
-// reportDownloadPath builds the API download path of a report revision.
-func reportDownloadPath(versionID, reportID int64) string {
-	return "/api/versions/" + formatID(versionID) + "/reports/" + formatID(reportID) +
-		"/export?format=markdown"
-}
-
-// ---------------------------------------------------------------------------
-// Report diff DTOs (spec §7.4)
-// ---------------------------------------------------------------------------
-
-// reportDiffIssueDTO is one added or fixed issue of the diff.
-type reportDiffIssueDTO struct {
-	IssueID  string `json:"issueId"`
-	Title    string `json:"title"`
-	Severity string `json:"severity"`
-}
-
-// reportDiffCaseDTO is one regressed, recovered or changed case of the diff.
-type reportDiffCaseDTO struct {
-	CaseNodeID string `json:"caseNodeId"`
-	Title      string `json:"title"`
-	From       string `json:"from"`
-	To         string `json:"to"`
-}
-
-// reportDiffNewCaseDTO is one new or removed case of the diff.
-type reportDiffNewCaseDTO struct {
-	CaseNodeID string `json:"caseNodeId"`
-	Title      string `json:"title"`
-	Source     string `json:"source"`
-}
-
-// reportDiffDTO is the difference between two report revisions.
-type reportDiffDTO struct {
-	BaseReportID   string                   `json:"baseReportId"`
-	TargetReportID string                   `json:"targetReportId"`
-	BaseBatchNo    int                      `json:"baseBatchNo"`
-	TargetBatchNo  int                      `json:"targetBatchNo"`
-	Summary        domain.ReportDiffSummary `json:"summary"`
-	AddedIssues    []reportDiffIssueDTO     `json:"addedIssues"`
-	FixedIssues    []reportDiffIssueDTO     `json:"fixedIssues"`
-	RegressedCases []reportDiffCaseDTO      `json:"regressedCases"`
-	RecoveredCases []reportDiffCaseDTO      `json:"recoveredCases"`
-	ChangedCases   []reportDiffCaseDTO      `json:"changedCases"`
-	NewCases       []reportDiffNewCaseDTO   `json:"newCases"`
-	RemovedCases   []reportDiffNewCaseDTO   `json:"removedCases"`
-}
-
-// newReportDiffDTO renders the diff with decimal-string ids (the domain type is
-// internal and keeps int64 ids).
-func newReportDiffDTO(diff domain.ReportDiff) reportDiffDTO {
-	return reportDiffDTO{
-		BaseReportID:   formatID(diff.BaseReportID),
-		TargetReportID: formatID(diff.TargetReportID),
-		BaseBatchNo:    diff.BaseBatchNo,
-		TargetBatchNo:  diff.TargetBatchNo,
-		Summary:        diff.Summary,
-		AddedIssues:    newReportDiffIssueDTOs(diff.AddedIssues),
-		FixedIssues:    newReportDiffIssueDTOs(diff.FixedIssues),
-		RegressedCases: newReportDiffCaseDTOs(diff.RegressedCases),
-		RecoveredCases: newReportDiffCaseDTOs(diff.RecoveredCases),
-		ChangedCases:   newReportDiffCaseDTOs(diff.ChangedCases),
-		NewCases:       newReportDiffNewCaseDTOs(diff.NewCases),
-		RemovedCases:   newReportDiffNewCaseDTOs(diff.RemovedCases),
-	}
-}
-
-// newReportDiffIssueDTOs maps issue rows (never nil).
-func newReportDiffIssueDTOs(rows []domain.ReportDiffIssue) []reportDiffIssueDTO {
-	out := make([]reportDiffIssueDTO, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, reportDiffIssueDTO{
-			IssueID: formatID(row.IssueID), Title: row.Title, Severity: row.Severity,
-		})
-	}
-	return out
-}
-
-// newReportDiffCaseDTOs maps case rows (never nil).
-func newReportDiffCaseDTOs(rows []domain.ReportDiffCase) []reportDiffCaseDTO {
-	out := make([]reportDiffCaseDTO, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, reportDiffCaseDTO{
-			CaseNodeID: formatID(row.CaseNodeID), Title: row.Title, From: row.From, To: row.To,
-		})
-	}
-	return out
-}
-
-// newReportDiffNewCaseDTOs maps new/removed cases (never nil).
-func newReportDiffNewCaseDTOs(rows []domain.ReportDiffNewCase) []reportDiffNewCaseDTO {
-	out := make([]reportDiffNewCaseDTO, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, reportDiffNewCaseDTO{
-			CaseNodeID: formatID(row.CaseNodeID), Title: row.Title, Source: row.Source,
-		})
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Analysis DTOs (spec §7.5)
-// ---------------------------------------------------------------------------
-
-// newAnalysisDTO maps one run to the JSON-safe projection. The input document
-// (which carries candidate summaries) and any prompt text are never exposed.
-func newAnalysisDTO(run domain.AnalysisRun) domain.AnalysisView {
-	return domain.NewAnalysisView(run)
-}
-
-// newAnalysisDTOs maps a run slice to a non-nil view slice.
-func newAnalysisDTOs(runs []domain.AnalysisRun) []domain.AnalysisView {
-	out := make([]domain.AnalysisView, 0, len(runs))
-	for _, run := range runs {
-		out = append(out, newAnalysisDTO(run))
-	}
-	return out
 }

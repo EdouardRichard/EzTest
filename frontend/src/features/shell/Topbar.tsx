@@ -1,175 +1,161 @@
 "use client"
 
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu"
-import { ChevronDown, FlaskConical, LogOut, Moon, ShieldCheck, Sun } from "lucide-react"
-import Link from "next/link"
-import { useTheme } from "next-themes"
+import { ChevronDown, KeyRound, LogOut } from "lucide-react"
+import { usePathname, useRouter } from "next/navigation"
 import { useEffect, useState } from "react"
-import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
+import { cn } from "@/components/ui/cn"
 import { useAuth } from "@/features/auth/AuthProvider"
+import { ChangePasswordDialog } from "@/features/auth/ChangePasswordDialog"
+import { CommandPalette } from "@/features/search/CommandPalette"
+import { getApiBaseUrl } from "@/lib/api-client"
+import { connectSSE, type SSEStatus } from "@/lib/sse-client"
+import { findNavItem } from "@/navigation/nav-items"
 
-import { MobileMenuButton } from "./MobileNav"
-import { SearchCommand } from "./search/SearchCommand"
-import { TodoButton } from "./todos/TodoButton"
-import { VersionSwitcher } from "./VersionSwitcher"
+import { TodoDrawerButton } from "./TodoDrawer"
 
-type EnvironmentMeta = {
-  label: string
-  variant: StatusBadgeVariant
+const STATUS_META: Record<SSEStatus, { label: string; dotClassName: string }> = {
+  connecting: { label: "连接中", dotClassName: "bg-warning animate-pulse" },
+  live: { label: "实时", dotClassName: "bg-success" },
+  reconnecting: { label: "重连中", dotClassName: "bg-warning animate-pulse" },
+  closed: { label: "已断开", dotClassName: "bg-muted-foreground" },
 }
 
-function resolveEnvironment(): EnvironmentMeta {
-  const environment = process.env.NEXT_PUBLIC_APP_ENV ?? "development"
-  if (environment === "production") return { label: "生产环境", variant: "warning" }
-  if (environment === "test") return { label: "测试环境", variant: "info" }
-  return { label: "开发环境", variant: "info" }
+const ROLE_LABELS: Record<string, string> = {
+  admin: "管理员",
+  user: "普通用户",
 }
 
-const ENVIRONMENT = resolveEnvironment()
+function useSystemStreamStatus(token: string | null): SSEStatus {
+  const [status, setStatus] = useState<SSEStatus>("closed")
 
-function ThemeToggle() {
-  const { resolvedTheme, setTheme } = useTheme()
-  const [mounted, setMounted] = useState(false)
+  useEffect(() => {
+    if (token === null) {
+      setStatus("closed")
+      return undefined
+    }
+    return connectSSE({
+      url: `${getApiBaseUrl()}/api/stream?channel=system`,
+      token,
+      onEvent: () => {},
+      onStatus: setStatus,
+    })
+  }, [token])
 
-  useEffect(() => setMounted(true), [])
-
-  const isDark = mounted && resolvedTheme === "dark"
-  return (
-    <button
-      type="button"
-      onClick={() => setTheme(isDark ? "light" : "dark")}
-      aria-label={isDark ? "切换到浅色主题" : "切换到深色主题"}
-      className="grid h-9 w-9 place-items-center rounded-lg border border-border bg-card text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      {mounted ? (
-        isDark ? (
-          <Sun className="h-4 w-4" aria-hidden="true" />
-        ) : (
-          <Moon className="h-4 w-4" aria-hidden="true" />
-        )
-      ) : (
-        <Moon className="h-4 w-4 opacity-0" aria-hidden="true" />
-      )}
-    </button>
-  )
+  return status
 }
 
-function UserMenu() {
-  const { user, logout } = useAuth()
+/** Top bar: current page title, system-channel SSE dot and the user menu. */
+export function Topbar() {
+  const pathname = usePathname()
+  const router = useRouter()
+  const { user, token, logout } = useAuth()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [passwordOpen, setPasswordOpen] = useState(false)
+  const [loggingOut, setLoggingOut] = useState(false)
+  const status = useSystemStreamStatus(token)
+  const statusMeta = STATUS_META[status]
 
-  if (!user) {
-    return <div className="h-9 w-9 animate-pulse rounded-full bg-muted" aria-hidden="true" />
+  const title = findNavItem(pathname)?.label ?? "EzTest"
+  const currentVersionId = /^\/versions\/([^/]+)(?:\/|$)/.exec(pathname)?.[1] ?? null
+  const displayName = user?.display_name ?? "访客"
+  const roleLabel = user ? (ROLE_LABELS[user.role] ?? user.role) : "未登录"
+  const avatarText = displayName.slice(0, 1).toUpperCase()
+
+  async function handleLogout(): Promise<void> {
+    setMenuOpen(false)
+    setLoggingOut(true)
+    try {
+      await logout()
+    } finally {
+      setLoggingOut(false)
+      router.replace("/login")
+    }
   }
 
-  const roleLabel = user.role === "admin" ? "管理员" : "普通用户"
-  const statusLabel = user.status === "active" ? "活跃" : "已禁用"
-  const initial = user.username.slice(0, 1).toUpperCase()
-
   return (
-    <DropdownMenu.Root>
-      <DropdownMenu.Trigger asChild>
-        <button
-          type="button"
-          className="flex items-center gap-2 rounded-full border border-transparent p-1 pr-2 transition-colors hover:border-border hover:bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label="打开用户菜单"
+    <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-card/90 px-4 backdrop-blur sm:px-6">
+      <div className="min-w-0">
+        <span data-testid="topbar-title" className="block truncate text-sm font-semibold">
+          {title}
+        </span>
+        <span className="block truncate text-[10px] text-muted-foreground">
+          EzTest · AI 驱动端到端测试
+        </span>
+      </div>
+
+      <div className="ml-auto flex items-center gap-2">
+        <CommandPalette />
+        <TodoDrawerButton versionId={currentVersionId} />
+
+        <span
+          data-testid="sse-status"
+          data-state={status}
+          title={`系统事件流：${statusMeta.label}`}
+          className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] text-muted-foreground"
         >
-          <span className="grid h-8 w-8 place-items-center rounded-full bg-primary/15 text-sm font-semibold text-primary">
-            {initial}
-          </span>
-          <span className="hidden text-left sm:block">
-            <span className="block text-sm font-medium leading-tight">{user.username}</span>
-            <span className="block text-[11px] leading-tight text-muted-foreground">
-              {roleLabel}
-            </span>
-          </span>
-          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="end"
-          sideOffset={10}
-          className="z-50 w-60 rounded-xl border border-border bg-card p-1.5 shadow-xl shadow-black/10"
-        >
-          <div className="px-2.5 py-2">
-            <p className="truncate text-sm font-medium">{user.username}</p>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              {roleLabel} · {statusLabel}
-            </p>
-          </div>
-          <DropdownMenu.Separator className="my-1 h-px bg-border" />
-          <DropdownMenu.Item asChild>
-            <Link
-              href="/settings"
-              className="flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-sm outline-none transition-colors data-[highlighted]:bg-muted"
-            >
-              账户设置
-            </Link>
-          </DropdownMenu.Item>
-          <DropdownMenu.Item
-            onSelect={() => void logout()}
-            className="flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+          <span
+            className={cn("size-1.5 rounded-full", statusMeta.dotClassName)}
+            aria-hidden="true"
+          />
+          {statusMeta.label}
+        </span>
+
+        <div className="relative">
+          <button
+            type="button"
+            aria-label="打开用户菜单"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            onClick={() => setMenuOpen((open) => !open)}
+            className="flex items-center gap-2 rounded-lg border border-border bg-card px-2 py-1 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <LogOut className="h-4 w-4" aria-hidden="true" />
-            退出登录
-          </DropdownMenu.Item>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  )
-}
+            <span className="flex size-7 items-center justify-center rounded-full bg-accent text-[11px] font-semibold text-accent-foreground">
+              {avatarText}
+            </span>
+            <span className="hidden leading-tight sm:block">
+              <span className="block max-w-32 truncate text-xs font-semibold">{displayName}</span>
+              <span className="block text-[10px] text-muted-foreground">{roleLabel}</span>
+            </span>
+            <ChevronDown className="size-3.5 text-muted-foreground" aria-hidden="true" />
+          </button>
 
-export type TopbarProps = {
-  /** Whether the mobile navigation drawer is open (drives `aria-expanded`). */
-  navOpen: boolean
-  onToggleNav: () => void
-}
-
-export function Topbar({ navOpen, onToggleNav }: TopbarProps) {
-  return (
-    <header className="sticky top-0 z-20 border-b border-border bg-background/80 backdrop-blur-xl">
-      {/*
-        Phones wrap the version switcher and search onto a second row; from `sm`
-        up the header returns to its original single-row layout whenever the
-        content fits, and wraps instead of overflowing when it does not. Only the
-        <sm order changes, so the desktop tab order stays hamburger → version →
-        search → actions.
-      */}
-      <div className="flex min-h-16 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-6 sm:py-0 lg:px-10">
-        <MobileMenuButton open={navOpen} onToggle={onToggleNav} />
-
-        <Link href="/" className="flex items-center gap-2 max-sm:order-2 sm:order-none lg:hidden">
-          <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-blue-500 to-sky-400 text-white">
-            <FlaskConical className="h-4 w-4" aria-hidden="true" />
-          </span>
-          <span className="text-sm font-semibold tracking-tight">EzTest</span>
-        </Link>
-
-        {/* P8 global shell slot (spec §6.1): current version + status badge. */}
-        <div className="min-w-0 max-sm:order-4 sm:order-none">
-          <VersionSwitcher />
-        </div>
-
-        {/* P8 global search (spec §6.2): trigger + Ctrl/Cmd+K command palette. */}
-        <div className="flex items-center max-sm:order-5 sm:order-none">
-          <SearchCommand />
-        </div>
-
-        <div className="hidden items-center gap-2 max-sm:order-6 sm:order-none sm:flex">
-          <StatusBadge variant={ENVIRONMENT.variant}>{ENVIRONMENT.label}</StatusBadge>
-          <span className="hidden items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground md:inline-flex">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" />
-            P8 · 体验硬化
-          </span>
-        </div>
-
-        <div className="ml-auto flex items-center gap-1.5 max-sm:order-3 sm:order-none sm:gap-2">
-          <TodoButton />
-          <ThemeToggle />
-          <span className="h-6 w-px bg-border" aria-hidden="true" />
-          <UserMenu />
+          {menuOpen ? (
+            <div
+              role="menu"
+              aria-label="用户菜单"
+              className="absolute right-0 top-full z-40 mt-1 w-48 overflow-hidden rounded-lg border border-border bg-card py-1 shadow-xl"
+            >
+              <div className="border-b border-border px-3 py-2 text-[11px] text-muted-foreground">
+                当前账号：{user?.username ?? "未登录"}
+              </div>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenuOpen(false)
+                  setPasswordOpen(true)
+                }}
+                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              >
+                <KeyRound className="size-3.5" aria-hidden="true" />
+                修改密码
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={loggingOut}
+                onClick={() => void handleLogout()}
+                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-60"
+              >
+                <LogOut className="size-3.5" aria-hidden="true" />
+                退出登录
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
+
+      <ChangePasswordDialog open={passwordOpen} onClose={() => setPasswordOpen(false)} />
     </header>
   )
 }

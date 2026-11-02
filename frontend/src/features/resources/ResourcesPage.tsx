@@ -1,187 +1,210 @@
 "use client"
 
-import * as Tabs from "@radix-ui/react-tabs"
-import { Boxes, Globe, KeyRound, Layers, Server } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useRouter } from "next/navigation"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-import { EmptyState } from "@/components/ui/EmptyState"
-import { StatusBadge } from "@/components/ui/StatusBadge"
-import { useAuth } from "@/features/auth/AuthProvider"
+import { type TabItem, Tabs } from "@/components/ui/Tabs"
 
-import { AccountsPanel } from "./AccountsPanel"
-import { AppModelsPanel } from "./AppModelsPanel"
-import { EnvironmentsPanel } from "./EnvironmentsPanel"
-import { SessionsPanel } from "./SessionsPanel"
-import { SystemsPanel } from "./SystemsPanel"
+import { getSut, listSuts } from "./api"
+import { CodeRepoPanel } from "./CodeRepoPanel"
+import { DataAccessPanel } from "./DataAccessPanel"
+import { PageAPIPanel } from "./PageAPIPanel"
+import { SUTPanel } from "./SUTPanel"
+import type { ResourceScope, ResourceTab, Sut } from "./types"
 
-const TABS = [
-  { value: "systems", label: "系统与环境", icon: Server },
-  { value: "app-models", label: "应用模型", icon: Boxes },
-  { value: "accounts", label: "账号与访问", icon: KeyRound },
-  { value: "sessions", label: "会话", icon: Layers },
-] as const
+export const RESOURCE_TABS: TabItem[] = [
+  { value: "suts", label: "SUT 与环境" },
+  { value: "pages", label: "页面与 API" },
+  { value: "data", label: "数据与账号" },
+  { value: "repos", label: "代码仓库" },
+]
 
-type ResourceTab = (typeof TABS)[number]["value"]
+const TAB_VALUES: ResourceTab[] = ["suts", "pages", "data", "repos"]
 
-const TAB_VALUES = new Set<string>(TABS.map((tab) => tab.value))
-
-function isResourceTab(value: string | null): value is ResourceTab {
-  return value !== null && TAB_VALUES.has(value)
+/** Normalizes a `?tab=` value; unknown/absent values fall back to the SUT tab. */
+export function parseResourceTab(value: string | string[] | null | undefined): ResourceTab {
+  const candidate = Array.isArray(value) ? value[0] : value
+  return TAB_VALUES.includes(candidate as ResourceTab) ? (candidate as ResourceTab) : "suts"
 }
 
-/** Reads `?tab=` from the location so the route needs no Suspense boundary. */
-function readTabParam(): ResourceTab {
-  if (typeof window === "undefined") return "systems"
-  const raw = new URLSearchParams(window.location.search).get("tab")
-  return isResourceTab(raw) ? raw : "systems"
+function tabLabel(tab: ResourceTab): string {
+  return RESOURCE_TABS.find((item) => item.value === tab)?.label ?? "SUT 与环境"
 }
 
-function readPositiveIntParam(name: string): number | null {
-  if (typeof window === "undefined") return null
-  const raw = new URLSearchParams(window.location.search).get(name)
-  if (raw === null) return null
-  const parsed = Number(raw)
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+function pickEnvironmentId(detail: Sut, currentId: string): string {
+  if (detail.environments.some((environment) => environment.id === currentId)) return currentId
+  return (
+    detail.environments.find((environment) => environment.is_default)?.id ??
+    detail.environments[0]?.id ??
+    ""
+  )
 }
 
-/** Writes one query parameter back with replaceState so deep links survive refresh. */
-function writeQueryParam(name: string, value: string | null): void {
-  if (typeof window === "undefined") return
-  const url = new URL(window.location.href)
-  if (value === null) url.searchParams.delete(name)
-  else url.searchParams.set(name, value)
-  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`)
-}
+/** `?tab=` deep link for the resources console (spec §11.1). */
+export function ResourcesPage({ initialTab }: { initialTab?: string | string[] | null }) {
+  const router = useRouter()
+  const [tab, setTab] = useState<ResourceTab>(() => parseResourceTab(initialTab))
+  const [suts, setSuts] = useState<Sut[]>([])
+  const [selectedSutId, setSelectedSutId] = useState("")
+  const [detail, setDetail] = useState<Sut | null>(null)
+  const [selectedEnvironmentId, setSelectedEnvironmentId] = useState("")
+  const [sutsLoading, setSutsLoading] = useState(true)
+  const [sutsError, setSutsError] = useState<unknown>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState<unknown>(null)
 
-const tabTriggerClass =
-  "flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=active]:bg-card data-[state=active]:text-foreground data-[state=active]:shadow-sm"
+  const selectedSutIdRef = useRef("")
+  const detailRequestRef = useRef(0)
 
-/**
- * `/resources` shell: four tabs for the public-resource areas. The active tab,
- * the selected system and the selected session live in the URL (`?tab=`,
- * `?system=`, `?session=`) so the panels can be deep-linked. Normal users get a
- * read-only badge and never see write controls.
- */
-export function ResourcesPage() {
-  const { user, loading } = useAuth()
-  const canWrite = user?.role === "admin"
-  // While the session is being restored, `user` is still null; showing the
-  // readonly badge then would flash for admins, so wait for the restore.
-  const readonly = !loading && user !== null && !canWrite
+  const loadDetail = useCallback(async (sutId: string): Promise<void> => {
+    if (sutId.length === 0) {
+      detailRequestRef.current += 1
+      setDetail(null)
+      setDetailError(null)
+      setDetailLoading(false)
+      setSelectedEnvironmentId("")
+      return
+    }
 
-  const [tab, setTab] = useState<ResourceTab>("systems")
-  const [selectedSystemId, setSelectedSystemId] = useState<number | null>(null)
-  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
-
-  useEffect(() => {
-    setTab(readTabParam())
-    setSelectedSystemId(readPositiveIntParam("system"))
-    setSelectedSessionId(readPositiveIntParam("session"))
+    const requestId = detailRequestRef.current + 1
+    detailRequestRef.current = requestId
+    setDetailLoading(true)
+    setDetailError(null)
+    try {
+      const next = await getSut(sutId)
+      if (detailRequestRef.current !== requestId) return
+      setDetail(next)
+      setSelectedEnvironmentId((current) => pickEnvironmentId(next, current))
+    } catch (caught) {
+      if (detailRequestRef.current !== requestId) return
+      setDetail(null)
+      setDetailError(caught)
+    } finally {
+      if (detailRequestRef.current === requestId) setDetailLoading(false)
+    }
   }, [])
 
-  function handleTabChange(value: string) {
-    if (!isResourceTab(value)) return
-    setTab(value)
-    writeQueryParam("tab", value)
+  const loadSuts = useCallback(async (preferredSutId?: string): Promise<string> => {
+    setSutsLoading(true)
+    setSutsError(null)
+    try {
+      const items = await listSuts()
+      setSuts(items)
+      const current = selectedSutIdRef.current
+      const nextId =
+        preferredSutId && items.some((sut) => sut.id === preferredSutId)
+          ? preferredSutId
+          : items.some((sut) => sut.id === current)
+            ? current
+            : (items[0]?.id ?? "")
+      selectedSutIdRef.current = nextId
+      setSelectedSutId(nextId)
+      return nextId
+    } catch (caught) {
+      setSutsError(caught)
+      return ""
+    } finally {
+      setSutsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void (async () => {
+      const sutId = await loadSuts()
+      await loadDetail(sutId)
+    })()
+  }, [loadSuts, loadDetail])
+
+  const refresh = useCallback(
+    async (preferredSutId?: string) => {
+      const sutId = await loadSuts(preferredSutId)
+      await loadDetail(sutId)
+    },
+    [loadSuts, loadDetail],
+  )
+
+  const selectSut = useCallback(
+    (id: string) => {
+      selectedSutIdRef.current = id
+      setSelectedSutId(id)
+      void loadDetail(id)
+    },
+    [loadDetail],
+  )
+
+  function changeTab(value: string): void {
+    const next = parseResourceTab(value)
+    setTab(next)
+    router.replace(`/resources?tab=${next}`)
   }
 
-  function handleSelectSystem(id: number) {
-    setSelectedSystemId(id)
-    writeQueryParam("system", String(id))
-  }
+  const scope = useMemo<ResourceScope>(
+    () => ({
+      suts,
+      sutId: selectedSutId,
+      environmentId: selectedEnvironmentId,
+      detail,
+      loading: sutsLoading,
+      detailLoading,
+      error: sutsError,
+      detailError,
+    }),
+    [
+      suts,
+      selectedSutId,
+      selectedEnvironmentId,
+      detail,
+      sutsLoading,
+      detailLoading,
+      sutsError,
+      detailError,
+    ],
+  )
 
-  function handleSelectSession(id: number) {
-    setSelectedSessionId(id)
-    writeQueryParam("session", String(id))
-  }
+  const retry = useCallback(() => {
+    void refresh()
+  }, [refresh])
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-2xl font-semibold tracking-tight">公共资源</h1>
-            <StatusBadge variant="info">P2</StatusBadge>
-            {readonly ? <StatusBadge variant="warning">只读</StatusBadge> : null}
-          </div>
-          <p className="mt-1 text-sm text-muted-foreground">
-            系统、环境、应用模型、账号与 Session 等公共资源；普通用户只读，管理员可维护。
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+            工作区
+          </p>
+          <h1 className="mt-1 text-xl font-semibold text-foreground">资源</h1>
+          <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
+            以 SUT 为中心管理环境、页面/API、目标库、测试账号与代码仓；版本创建向导会复用这些资源。
           </p>
         </div>
       </header>
 
-      <Tabs.Root value={tab} onValueChange={handleTabChange}>
-        <Tabs.List
-          aria-label="资源分类"
-          className="grid grid-cols-2 gap-1 rounded-xl bg-muted p-1 sm:grid-cols-4"
-        >
-          {TABS.map((item) => {
-            const Icon = item.icon
-            return (
-              <Tabs.Trigger key={item.value} value={item.value} className={tabTriggerClass}>
-                <Icon className="h-4 w-4" aria-hidden="true" />
-                {item.label}
-              </Tabs.Trigger>
-            )
-          })}
-        </Tabs.List>
+      <Tabs items={RESOURCE_TABS} value={tab} onValueChange={changeTab} ariaLabel="资源分类" />
 
-        <Tabs.Content value="systems" className="pt-4">
-          <div className="grid items-start gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
-            <SystemsPanel
-              canWrite={canWrite}
-              selectedId={selectedSystemId}
-              onSelect={handleSelectSystem}
-            />
-            {selectedSystemId === null ? (
-              <EmptyState
-                icon={Globe}
-                title="选择一个系统"
-                description="从左侧选择一个系统后查看和维护它的环境。"
-              />
-            ) : (
-              <EnvironmentsPanel
-                key={selectedSystemId}
-                systemId={selectedSystemId}
-                canWrite={canWrite}
-              />
-            )}
-          </div>
-        </Tabs.Content>
-
-        <Tabs.Content value="app-models" className="pt-4">
-          {selectedSystemId === null ? (
-            <EmptyState
-              icon={Boxes}
-              title="请选择系统"
-              description="应用模型按系统归属；请先在「系统与环境」中选择一个系统。"
-              action={
-                <button
-                  type="button"
-                  onClick={() => handleTabChange("systems")}
-                  className={tabTriggerClass}
-                >
-                  前往系统与环境
-                </button>
-              }
-            />
-          ) : (
-            <AppModelsPanel systemId={selectedSystemId} canWrite={canWrite} />
-          )}
-        </Tabs.Content>
-
-        <Tabs.Content value="accounts" className="pt-4">
-          <AccountsPanel canWrite={canWrite} />
-        </Tabs.Content>
-
-        <Tabs.Content value="sessions" className="pt-4">
-          <SessionsPanel
-            canWrite={canWrite}
-            initialSessionId={selectedSessionId ?? undefined}
-            onSelectSession={handleSelectSession}
+      <section role="tabpanel" aria-label={tabLabel(tab)}>
+        {tab === "suts" ? (
+          <SUTPanel scope={scope} onSelectSut={selectSut} onRefresh={refresh} onRetry={retry} />
+        ) : null}
+        {tab === "pages" ? (
+          <PageAPIPanel
+            scope={scope}
+            onSelectSut={selectSut}
+            onSelectEnvironment={setSelectedEnvironmentId}
+            onRefresh={() => refresh()}
+            onRetry={retry}
           />
-        </Tabs.Content>
-      </Tabs.Root>
+        ) : null}
+        {tab === "data" ? (
+          <DataAccessPanel
+            scope={scope}
+            onSelectSut={selectSut}
+            onSelectEnvironment={setSelectedEnvironmentId}
+            onRefresh={() => refresh()}
+            onRetry={retry}
+          />
+        ) : null}
+        {tab === "repos" ? <CodeRepoPanel /> : null}
+      </section>
     </div>
   )
 }

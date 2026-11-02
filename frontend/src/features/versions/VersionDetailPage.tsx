@@ -1,582 +1,460 @@
 "use client"
 
-import { Loader2 } from "lucide-react"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { ArrowLeft, Database, FileCode2, Server } from "lucide-react"
+import Link from "next/link"
+import { useRouter, useSearchParams } from "next/navigation"
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
 
+import { Badge } from "@/components/ui/Badge"
+import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
-import { Skeleton } from "@/components/ui/Skeleton"
-import { CodeChangesTab } from "@/features/code-intel/CodeChangesTab"
-import { useReport } from "@/features/delivery/hooks/useReports"
-import { BroadcastTab } from "@/features/execution/components/BroadcastTab"
-import { EvidenceViewer } from "@/features/execution/components/EvidenceViewer"
-import {
-  type ExplorationDeepLink,
-  type ExplorationFilters,
-  ExplorationTab,
-} from "@/features/execution/components/ExplorationTab"
-import { ResultsTab } from "@/features/execution/components/ResultsTab"
-import { SessionsTab } from "@/features/execution/components/SessionsTab"
-import { useBatches, useExecutionActions } from "@/features/execution/hooks/useExecution"
-import type { Batch, PendingTakeover } from "@/features/execution/types"
-import { MindmapPage } from "@/features/mindmap/MindmapPage"
-import { TakeoverDialog } from "@/features/resources/TakeoverDialog"
-import { ApiError } from "@/lib/api-client"
-import { getStoredUser } from "@/lib/auth-storage"
+import { LoadingCard } from "@/components/ui/Spinner"
+import { Tabs } from "@/components/ui/Tabs"
+import { ChainTab } from "@/features/chain/ChainTab"
+import { RequirementsTab } from "@/features/clarification/RequirementsTab"
+import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import { CodeTab } from "@/features/code-intel/CodeTab"
+import { listIssues, listReports } from "@/features/delivery/api"
+import { IssuesTab } from "@/features/delivery/IssuesTab"
+import { ReportsTab } from "@/features/delivery/ReportsTab"
+import { DesignTab } from "@/features/design/DesignTab"
+import { ExecutionTab } from "@/features/execution/ExecutionTab"
+import { TodoDrawer } from "@/features/shell/TodoDrawer"
+import { formatDateTime } from "@/lib/format"
 
 import { getVersion } from "./api"
-import { OverviewTab } from "./OverviewTab"
-import type { Version } from "./types"
-import { useVersionStream } from "./useVersionStream"
+import { parseVersionTab, VERSION_TABS } from "./tabs"
+import type { Version, VersionBinding, VersionTab } from "./types"
 import { VersionHeader } from "./VersionHeader"
-import { isVersionTab, VersionTabs, type VersionTabValue } from "./VersionTabs"
-import { Workbench } from "./Workbench"
 
-const DEFAULT_TAB: VersionTabValue = "requirements"
+/** SSE bursts (issue.created + report.published + version.closed) collapse into one refresh. */
+const SSE_REFRESH_DEBOUNCE_MS = 350
 
-/** The batch statuses that occupy the single active-batch slot (spec §5.1). */
-const ACTIVE_BATCH_STATUSES = new Set(["planned", "running"])
-
-/** Reads `?tab=` from the location; an explicit node deep link implies exploration. */
-function readTabParam(): VersionTabValue {
-  if (typeof window === "undefined") return DEFAULT_TAB
-  const params = new URLSearchParams(window.location.search)
-  const raw = params.get("tab")
-  if (isVersionTab(raw)) return raw
-  if ((params.get("node") ?? "") !== "") return "exploration"
-  return DEFAULT_TAB
+type CountProps = {
+  icon: ReactNode
+  label: string
+  value: string
 }
 
-/** Reads the exploration filter deep links (`req/status/abnormal/q`). */
-function readExplorationFilters(): ExplorationFilters {
-  if (typeof window === "undefined") {
-    return { requirementId: "", resultStatus: "", abnormalOnly: false, q: "" }
-  }
-  const params = new URLSearchParams(window.location.search)
-  const abnormal = params.get("abnormal") ?? ""
-  return {
-    requirementId: params.get("req") ?? "",
-    resultStatus: params.get("status") ?? "",
-    abnormalOnly: abnormal === "1" || abnormal === "true",
-    q: params.get("q") ?? "",
-  }
-}
-
-/** Reads the `?node=<kind>:<id>` exploration Sheet deep link. */
-function readExplorationNodeParam(): string {
-  if (typeof window === "undefined") return ""
-  return new URLSearchParams(window.location.search).get("node") ?? ""
-}
-
-/** Reads the `?batch=` deep link of the selected execution batch. */
-function readBatchParam(): string {
-  if (typeof window === "undefined") return ""
-  return new URLSearchParams(window.location.search).get("batch") ?? ""
-}
-
-/** Reads the `?evidence=` deep link of the broadcast/results links. */
-function readEvidenceParam(): string {
-  if (typeof window === "undefined") return ""
-  return new URLSearchParams(window.location.search).get("evidence") ?? ""
-}
-
-/** Reads the `?compare=` sibling of the `?evidence=` deep link (spec §8.3). */
-function readCompareParam(): string {
-  if (typeof window === "undefined") return ""
-  return new URLSearchParams(window.location.search).get("compare") ?? ""
-}
-
-/** Reads the `?issue=` / `?report=` / `?case=` deep links (spec §10.3/§10.4, P8 §7.1). */
-function readDeepLinkParam(name: "issue" | "report" | "case"): string {
-  if (typeof window === "undefined") return ""
-  return new URLSearchParams(window.location.search).get(name) ?? ""
-}
-
-/**
- * Reads the `?requirement=` deep link emitted by global search (P8 §6.2). It
- * selects that requirement in the requirements workbench; `?req=` remains the
- * separate exploration filter of the execution tabs.
- */
-function readRequirementParam(): string {
-  if (typeof window === "undefined") return ""
-  return new URLSearchParams(window.location.search).get("requirement") ?? ""
-}
-
-/** Writes one query parameter with replaceState, removing it for an empty value. */
-function writeQueryParam(name: string, value: string): void {
-  if (typeof window === "undefined") return
-  const url = new URL(window.location.href)
-  if (value === "") url.searchParams.delete(name)
-  else url.searchParams.set(name, value)
-  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`)
-}
-
-/** Writes the active tab back with replaceState so the deep link survives refresh. */
-function writeTabParam(value: VersionTabValue): void {
-  writeQueryParam("tab", value)
-}
-
-function describeLoadError(error: unknown): string {
-  if (!(error instanceof ApiError)) {
-    return error instanceof Error ? error.message : "未知错误"
-  }
-  if (error.status === 0) return "无法连接 API 服务，请确认后端已启动。"
-  if (error.status === 404) return "版本不存在或已被删除。"
-  if (error.status === 401) return "登录状态已失效，请重新登录。"
-  return error.message
-}
-
-type RequirementsWorkbenchSlotProps = {
-  version: Version
-  onChanged: () => void
-  /** Header 新增需求 intent: non-zero opens the create editor in the workbench. */
-  openCreateToken: number
-  onOpenCreateIntentConsumed: () => void
-  /** Requirement selected by the global-search `?requirement=` deep link. */
-  initialRequirementId: string
-}
-
-/**
- * Requirements tab content. T17 owns the workbench; T18 extends it with the
- * clarification column. `onChanged` refetches the version so the header
- * counters stay in sync after requirement writes.
- */
-function RequirementsWorkbenchSlot({
-  version,
-  onChanged,
-  openCreateToken,
-  onOpenCreateIntentConsumed,
-  initialRequirementId,
-}: RequirementsWorkbenchSlotProps) {
+function OverviewStat({ icon, label, value }: CountProps) {
   return (
-    <Workbench
-      version={version}
-      onChanged={onChanged}
-      openCreateToken={openCreateToken}
-      onOpenCreateIntentConsumed={onOpenCreateIntentConsumed}
-      initialRequirementId={initialRequirementId}
-    />
+    <div className="rounded-lg border border-border bg-card px-3 py-2.5">
+      <dt className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        <span className="text-muted-foreground" aria-hidden="true">
+          {icon}
+        </span>
+        {label}
+      </dt>
+      <dd className="mt-0.5 text-sm font-semibold text-foreground">{value}</dd>
+    </div>
+  )
+}
+
+function BindingCard({ binding, index }: { binding: VersionBinding; index: number }) {
+  const repositoryName = binding.repository?.name ?? "未绑定代码仓"
+  return (
+    <article className="surface-card p-4">
+      <header className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">
+            绑定 {index + 1} · {binding.sut.name}
+          </h2>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            {binding.environment.name} · {binding.environment.base_url}
+          </p>
+        </div>
+        <Badge tone={binding.environment.status === "active" ? "success" : "neutral"}>
+          {binding.environment.status === "active" ? "环境启用" : "环境停用"}
+        </Badge>
+      </header>
+
+      <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
+        <div>
+          <dt className="text-muted-foreground">页面</dt>
+          <dd className="font-medium text-foreground">{binding.pages.length} 个页面</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">API</dt>
+          <dd className="font-medium text-foreground">{binding.apis.length} 个 API</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">目标库</dt>
+          <dd className="font-medium text-foreground">{binding.databases.length} 个目标库</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">测试账号</dt>
+          <dd className="font-medium text-foreground">{binding.accounts.length} 个测试账号</dd>
+        </div>
+      </dl>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3 text-[11px]">
+        <span className="text-muted-foreground">代码仓</span>
+        <span className="font-medium text-foreground">{repositoryName}</span>
+        {binding.pages.length > 0 ? (
+          <span className="text-muted-foreground">
+            页面范围：{binding.pages.map((page) => page.name).join("、")}
+          </span>
+        ) : null}
+      </div>
+    </article>
+  )
+}
+
+function VersionOverview({ version }: { version: Version }) {
+  const totals = version.bindings.reduce(
+    (sum, binding) => ({
+      pages: sum.pages + binding.pages.length,
+      apis: sum.apis + binding.apis.length,
+      databases: sum.databases + binding.databases.length,
+      accounts: sum.accounts + binding.accounts.length,
+      repositories: sum.repositories + (binding.repository ? 1 : 0),
+    }),
+    { pages: 0, apis: 0, databases: 0, accounts: 0, repositories: 0 },
+  )
+
+  return (
+    <div className="space-y-4">
+      <dl className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+        <OverviewStat
+          icon={<FileCode2 className="size-3.5" />}
+          label="页面"
+          value={`${totals.pages} 个页面`}
+        />
+        <OverviewStat
+          icon={<Server className="size-3.5" />}
+          label="API"
+          value={`${totals.apis} 个 API`}
+        />
+        <OverviewStat
+          icon={<Database className="size-3.5" />}
+          label="目标库"
+          value={`${totals.databases} 个目标库`}
+        />
+        <OverviewStat
+          icon={<Database className="size-3.5" />}
+          label="测试账号"
+          value={`${totals.accounts} 个测试账号`}
+        />
+        <OverviewStat
+          icon={<FileCode2 className="size-3.5" />}
+          label="代码仓"
+          value={`${totals.repositories} 个代码仓`}
+        />
+      </dl>
+
+      <section aria-label="绑定概览" className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-foreground">SUT 绑定概览</h2>
+          <span className="text-[11px] text-muted-foreground">
+            共 {version.bindings.length} 个 SUT · 更新于 {formatDateTime(version.updated_at)}
+          </span>
+        </div>
+
+        {version.bindings.length === 0 ? (
+          <EmptyState
+            title="该版本暂无 SUT 绑定"
+            description="P0 创建接口要求至少一个绑定，请检查数据或重新创建版本。"
+          />
+        ) : (
+          <div className="grid gap-3 lg:grid-cols-2">
+            {version.bindings.map((binding, index) => (
+              <BindingCard key={binding.id} binding={binding} index={index} />
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-dashed border-border bg-card/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
+        需求与澄清（P1）、用例设计（P2）、执行（P3）、探索链路/问题/报告（P4）与代码与变更（P5）
+        已在对应 Tab 提供。
+      </section>
+    </div>
   )
 }
 
 export type VersionDetailPageProps = {
-  /** P3-owned ID; a decimal string from the dynamic route segment. */
   versionId: string
+  initialTab?: VersionTab
+  /** Deep link `?conversation=` forwarded to the clarification workspace. */
+  initialConversationId?: string
+  /** Deep link `?requirement=` forwarded to the clarification workspace. */
+  initialRequirementId?: string
 }
 
-/**
- * Version detail container (spec §9.1/§9.2): loads the version, renders the
- * header with the P6 batch/pause controls, and hosts the nine-tab shell. The
- * five execution tabs share this container's batch selection and version
- * stream, evidence opens in one viewer owned here, and completing a human
- * takeover reuses the existing admin-only `TakeoverDialog`.
- */
-export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
+/** `/versions/{id}` shell: header, eight URL-backed tabs and the overview. */
+export function VersionDetailPage({
+  versionId,
+  initialTab,
+  initialConversationId,
+  initialRequirementId,
+}: VersionDetailPageProps) {
+  const router = useRouter()
+  const searchParams = useSearchParams()
   const [version, setVersion] = useState<Version | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState("")
-  const [errorRequestId, setErrorRequestId] = useState("")
-  const [tab, setTab] = useState<VersionTabValue>(DEFAULT_TAB)
-  const [evidenceId, setEvidenceId] = useState("")
-  /** Second artifact of the `?evidence=&compare=` deep link (spec §8.3). */
-  const [compareEvidenceId, setCompareEvidenceId] = useState("")
-  const [issueId, setIssueId] = useState("")
-  const [reportId, setReportId] = useState("")
-  /** Selected mindmap node of the `?case=` deep link (P8 §7.1). */
-  const [caseId, setCaseId] = useState("")
-  /** Requirement of the global-search `?requirement=` deep link (P8 §6.2). */
-  const [requirementId, setRequirementId] = useState("")
-  const [createToken, setCreateToken] = useState(0)
-  const [takeover, setTakeover] = useState<PendingTakeover | null>(null)
-  const [selectedBatchId, setSelectedBatchId] = useState("")
-  const [explorationFilters, setExplorationFilters] = useState<ExplorationFilters>({
-    requirementId: "",
-    resultStatus: "",
-    abnormalOnly: false,
-    q: "",
-  })
-  const [explorationNodeId, setExplorationNodeId] = useState("")
-  const [role, setRole] = useState<string | undefined>(undefined)
-  const requestRef = useRef(0)
-  /** Highest stream seq already inspected for a version-level refetch. */
-  const versionEventSeqRef = useRef<number | null>(null)
+  const [error, setError] = useState<unknown>(null)
+  const [activeTab, setActiveTab] = useState<VersionTab>(() => parseVersionTab(initialTab))
+  const [issueCount, setIssueCount] = useState<number | undefined>(undefined)
+  const [reportRevision, setReportRevision] = useState<number | undefined>(undefined)
+  const [todoOpen, setTodoOpen] = useState(false)
 
-  const stream = useVersionStream(versionId)
-  const batchPage = useBatches(versionId, {}, stream)
-  const actions = useExecutionActions(versionId, { onChanged: batchPage.refresh })
-  // Resolve a `?report=` deep link so the shared batch selection can follow the
-  // report's own batch even when the newest batch is a different one.
-  const deepLinkedReport = useReport(versionId, reportId, stream)
+  // `?case=` / `?conversation=` deep links for the design workspace. The route
+  // already forwards `conversation` for clarification; read the URL here so the
+  // case deep link works without changing `src/app` routing.
+  const designConversationId =
+    initialConversationId ?? searchParams.get("conversation") ?? undefined
+  const designCaseId = searchParams.get("case") ?? undefined
+  // `?wave=` / `?case_run=` select a wave/case run inside the execution tab.
+  const executionWaveId = searchParams.get("wave") ?? undefined
+  const executionCaseRunId = searchParams.get("case_run") ?? undefined
 
-  const activeBatch = useMemo(
-    () => batchPage.batches.find((batch) => ACTIVE_BATCH_STATUSES.has(batch.status)) ?? null,
-    [batchPage.batches],
-  )
-  const selectedBatch = useMemo<Batch | null>(() => {
-    if (selectedBatchId !== "") {
-      const chosen = batchPage.batches.find((batch) => batch.id === selectedBatchId)
-      if (chosen !== undefined) return chosen
-    }
-    return activeBatch ?? batchPage.batches[0] ?? null
-  }, [batchPage.batches, selectedBatchId, activeBatch])
-
-  const load = useCallback(async (): Promise<void> => {
-    const requestId = ++requestRef.current
+  const load = useCallback(async () => {
     setLoading(true)
-    setError("")
-    setErrorRequestId("")
+    setError(null)
     try {
-      const data = await getVersion(versionId)
-      if (requestRef.current === requestId) setVersion(data)
-    } catch (caught) {
-      if (requestRef.current === requestId) {
-        setError(describeLoadError(caught))
-        setErrorRequestId(caught instanceof ApiError ? caught.requestId : "")
-      }
+      setVersion(await getVersion(versionId))
+    } catch (cause) {
+      setVersion(null)
+      setError(cause)
     } finally {
-      if (requestRef.current === requestId) setLoading(false)
+      setLoading(false)
+    }
+  }, [versionId])
+
+  /** Silent projection refresh used by SSE events (no full-page loading flash). */
+  const refreshVersion = useCallback(async () => {
+    try {
+      setVersion(await getVersion(versionId))
+    } catch {
+      // Keep the last projection; the next event or retry refreshes it.
+    }
+  }, [versionId])
+
+  // Tab counts come from the real list projections; a failed/missing query
+  // leaves the count absent instead of rendering a misleading zero (spec §9.1).
+  const refreshCounts = useCallback(async () => {
+    try {
+      const items = await listIssues(versionId, { status: "open", limit: 100 })
+      setIssueCount(items.filter((issue) => issue.status === "open").length)
+    } catch {
+      setIssueCount(undefined)
+    }
+    try {
+      const items = await listReports(versionId, { kind: "version", limit: 20 })
+      const versionReport = items.find((report) => report.kind === "version")
+      setReportRevision(versionReport?.current_revision?.revision)
+    } catch {
+      setReportRevision(undefined)
     }
   }, [versionId])
 
   useEffect(() => {
-    const initialTab = readTabParam()
-    setTab(initialTab)
-    // A `?node=` deep link implies the exploration tab. Persist the inferred tab
-    // so removing `node` (Sheet close) or changing filters later cannot fall
-    // back to the requirements tab on refresh; every other query parameter is
-    // preserved by writeQueryParam.
-    if (typeof window !== "undefined") {
-      const rawTab = new URLSearchParams(window.location.search).get("tab")
-      if (initialTab === "exploration" && !isVersionTab(rawTab)) writeTabParam("exploration")
-    }
-    setEvidenceId(readEvidenceParam())
-    setCompareEvidenceId(readCompareParam())
-    setIssueId(readDeepLinkParam("issue"))
-    setReportId(readDeepLinkParam("report"))
-    setCaseId(readDeepLinkParam("case"))
-    setRequirementId(readRequirementParam())
-    setExplorationFilters(readExplorationFilters())
-    setExplorationNodeId(readExplorationNodeParam())
-    setSelectedBatchId(readBatchParam())
-    setRole(getStoredUser()?.role)
-  }, [])
-
-  // The report detail carries its batch id. Once it matches the selected deep
-  // link, adopt that batch so the header selector, the execution tabs and the
-  // report tab agree on the report's batch instead of the newest one.
-  const deepLinkedReportBatchId =
-    reportId !== "" && deepLinkedReport.report?.id === reportId
-      ? deepLinkedReport.report.batchId
-      : ""
-
-  useEffect(() => {
-    if (deepLinkedReportBatchId !== "") setSelectedBatchId(deepLinkedReportBatchId)
-  }, [deepLinkedReportBatchId])
-
-  useEffect(() => {
-    void load()
-    return () => {
-      // Invalidate any request still in flight for this mount/version.
-      requestRef.current += 1
-    }
-  }, [load])
-
-  // Continuing transitions happen on the backend (creating a requirement on a
-  // completed version, phase changes, another window's writes). The persisted
-  // SSE event is the authoritative trigger for a header refetch; the first
-  // snapshot is already covered by the initial load.
-  useEffect(() => {
-    const events = stream.events.filter(
-      (event) => event.version_id === null || event.version_id === versionId,
-    )
-    if (events.length === 0) {
-      versionEventSeqRef.current = null
-      return
-    }
-    const maxSeq = events.reduce((latest, event) => Math.max(latest, event.seq), 0)
-    const previousSeq = versionEventSeqRef.current
-    versionEventSeqRef.current = maxSeq
-    if (previousSeq === null && stream.status !== "live") return
-    const changed = events.some(
-      (event) =>
-        event.seq > (previousSeq ?? -1) &&
-        (event.type.startsWith("version.") || event.type === "requirement.added"),
-    )
-    if (changed) void load()
-  }, [stream.events, stream.status, versionId, load])
-
-  const refresh = useCallback(() => {
     void load()
   }, [load])
 
-  function handleTabChange(value: VersionTabValue): void {
-    setTab(value)
-    writeTabParam(value)
-  }
+  useEffect(() => {
+    setActiveTab(parseVersionTab(initialTab))
+  }, [initialTab])
 
-  function handleIssueChange(nextIssueId: string): void {
-    setIssueId(nextIssueId)
-    writeQueryParam("issue", nextIssueId)
-  }
+  useEffect(() => {
+    void refreshCounts()
+  }, [refreshCounts])
 
-  function handleReportChange(nextReportId: string): void {
-    setReportId(nextReportId)
-    writeQueryParam("report", nextReportId)
-  }
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingRefresh = useRef({ version: false, counts: false })
 
-  /** The mindmap node deep link is owned here so refresh reproduces selection. */
-  function handleCaseChange(nextCaseId: string): void {
-    setCaseId(nextCaseId)
-    writeQueryParam("case", nextCaseId)
-  }
+  const runPendingRefresh = useCallback(() => {
+    const pending = pendingRefresh.current
+    pendingRefresh.current = { version: false, counts: false }
+    if (pending.version) void refreshVersion()
+    if (pending.counts) void refreshCounts()
+  }, [refreshVersion, refreshCounts])
 
-  function handleBatchChange(nextBatchId: string): void {
-    setSelectedBatchId(nextBatchId)
-    writeQueryParam("batch", nextBatchId)
-    // A different batch cannot keep the previous batch's report deep link.
-    setReportId("")
-    writeQueryParam("report", "")
-  }
+  const scheduleRefresh = useCallback(
+    (includeVersion: boolean) => {
+      pendingRefresh.current = {
+        version: pendingRefresh.current.version || includeVersion,
+        counts: true,
+      }
+      if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+      refreshTimer.current = setTimeout(() => {
+        refreshTimer.current = null
+        runPendingRefresh()
+      }, SSE_REFRESH_DEBOUNCE_MS)
+    },
+    [runPendingRefresh],
+  )
 
-  function handleExplorationFiltersChange(nextFilters: ExplorationFilters): void {
-    setExplorationFilters(nextFilters)
-    writeQueryParam("req", nextFilters.requirementId)
-    writeQueryParam("status", nextFilters.resultStatus)
-    writeQueryParam("abnormal", nextFilters.abnormalOnly ? "1" : "")
-    writeQueryParam("q", nextFilters.q)
-  }
+  const refreshVersionAndCounts = useCallback(() => scheduleRefresh(true), [scheduleRefresh])
+  const refreshCountsOnly = useCallback(() => scheduleRefresh(false), [scheduleRefresh])
 
-  function handleExplorationNodeChange(nextNodeId: string): void {
-    setExplorationNodeId(nextNodeId)
-    writeQueryParam("node", nextNodeId)
-  }
-
-  function handleExplorationNavigate(target: ExplorationDeepLink): void {
-    if (target.kind === "result") {
-      handleTabChange("results")
-      return
+  const refreshSnapshotNow = useCallback(() => {
+    if (refreshTimer.current !== null) {
+      clearTimeout(refreshTimer.current)
+      refreshTimer.current = null
     }
-    if (target.kind === "issue") {
-      handleIssueChange(target.id)
-      handleTabChange("issues")
-      return
+    pendingRefresh.current = { version: true, counts: true }
+    runPendingRefresh()
+  }, [runPendingRefresh])
+
+  useEffect(
+    () => () => {
+      if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+    },
+    [],
+  )
+
+  // One page-level subscription keeps the header projection and the tab counts
+  // live while the mounted tab owns its own workspace subscription.
+  useVersionEvents(versionId, {
+    onVersionChanged: refreshVersionAndCounts,
+    onRequirementChanged: refreshVersionAndCounts,
+    onIssueChanged: refreshCountsOnly,
+    onReportChanged: refreshCountsOnly,
+    onStreamReset: refreshSnapshotNow,
+  })
+
+  const tabItems = useMemo(
+    () =>
+      VERSION_TABS.map((tab) => {
+        if (tab.value === "issues" && issueCount !== undefined) return { ...tab, count: issueCount }
+        if (tab.value === "reports" && reportRevision !== undefined) {
+          return { ...tab, count: reportRevision }
+        }
+        return tab
+      }),
+    [issueCount, reportRevision],
+  )
+
+  function handleTabChange(value: string): void {
+    const next = parseVersionTab(value)
+    setActiveTab(next)
+    const params = new URLSearchParams({ tab: next })
+    if (next === "requirements") {
+      if (initialConversationId) params.set("conversation", initialConversationId)
+      if (initialRequirementId) params.set("requirement", initialRequirementId)
     }
-    if (target.kind === "case") {
-      // P8 §7.1 keeps the mindmap inside the version detail: a case link opens
-      // the embedded tab instead of leaving for the full-screen route.
-      handleCaseChange(target.id)
-      handleTabChange("mindmap")
-      return
+    if (next === "design") {
+      const conversationId = searchParams.get("conversation") ?? initialConversationId
+      const caseId = searchParams.get("case")
+      if (conversationId) params.set("conversation", conversationId)
+      if (caseId) params.set("case", caseId)
     }
-    handleTabChange("requirements")
+    if (next === "execution") {
+      const waveId = searchParams.get("wave")
+      const caseRunId = searchParams.get("case_run")
+      if (waveId) params.set("wave", waveId)
+      if (caseRunId) params.set("case_run", caseRunId)
+    }
+    if (next === "issues") {
+      const issueId = searchParams.get("issue")
+      if (issueId) params.set("issue", issueId)
+    }
+    if (next === "reports") {
+      const reportId = searchParams.get("report")
+      const revision = searchParams.get("revision")
+      if (reportId) params.set("report", reportId)
+      if (revision) params.set("revision", revision)
+    }
+    if (next === "chain") {
+      for (const key of ["node", "issue", "report", "wave"]) {
+        const value = searchParams.get(key)
+        if (value) params.set(key, value)
+      }
+    }
+    if (next === "code") {
+      for (const key of ["repo", "analysis", "candidate", "anchor", "fact"]) {
+        const value = searchParams.get(key)
+        if (value) params.set(key, value)
+      }
+    }
+    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
-  function handleCompleteTakeover(next: PendingTakeover): void {
-    setTakeover(next)
-  }
-
-  if (version === null) {
+  if (loading) {
     return (
       <div className="space-y-4">
-        {error === "" ? (
-          <Skeleton label="正在加载版本…" lines={4} />
-        ) : (
-          <ErrorState
-            title="加载版本失败"
-            message={error}
-            requestId={errorRequestId}
-            onRetry={refresh}
-          />
-        )}
+        <Link
+          href="/versions"
+          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="size-3.5" aria-hidden="true" />
+          返回版本列表
+        </Link>
+        <LoadingCard label="正在加载版本详情…" />
       </div>
     )
   }
 
-  const batchId = selectedBatch?.id ?? ""
-  /** First connection and a dropped live connection are different states. */
-  const streamConnecting = stream.status === "connecting"
-  const streamReconnecting = stream.status === "reconnecting"
-  const streamStatusVisible = streamConnecting || streamReconnecting
+  if (error !== null || version === null) {
+    return (
+      <div className="space-y-4">
+        <Link
+          href="/versions"
+          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="size-3.5" aria-hidden="true" />
+          返回版本列表
+        </Link>
+        <ErrorState error={error} title="版本详情加载失败" onRetry={() => void load()} />
+      </div>
+    )
+  }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
+      <Link
+        href="/versions"
+        className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+      >
+        <ArrowLeft className="size-3.5" aria-hidden="true" />
+        返回版本列表
+      </Link>
+
       <VersionHeader
         version={version}
-        refreshing={loading}
-        onRefresh={refresh}
-        onUpdated={setVersion}
-        onAddRequirement={() => {
-          setCreateToken((previous) => previous + 1)
-          handleTabChange("requirements")
-        }}
-        onViewChanges={() => handleTabChange("code")}
-        onOpenClarification={() => handleTabChange("requirements")}
-        execution={{
-          batches: batchPage.batches,
-          activeBatch,
-          selectedBatchId: batchId,
-          stream,
-          actions,
-          onBatchChange: handleBatchChange,
-          onOpenReport: () => handleTabChange("report"),
-          onOpenSessions: () => handleTabChange("sessions"),
-          onOpenResults: () => handleTabChange("results"),
-        }}
+        onOpenTodo={() => setTodoOpen(true)}
+        onReopened={(next) => setVersion(next)}
       />
 
-      {/*
-        The live region stays mounted so a status change is announced; the
-        reconnect button stays outside role="status" (interactive controls are
-        not live-region content). The wrapper hides itself when not needed.
-      */}
-      <div
-        data-testid="version-stream-banner"
-        data-state={stream.status}
-        className={
-          streamStatusVisible
-            ? "flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-            : "sr-only"
-        }
-      >
-        {streamStatusVisible ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-        ) : null}
-        <span
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-          data-testid="version-stream-status"
-          data-state={stream.status}
-        >
-          {streamConnecting ? "正在连接实时通道，最新事件可能延迟。" : null}
-          {streamReconnecting ? "实时连接重连中，正在保留上次数据。" : null}
-        </span>
-        {streamStatusVisible ? (
-          <button
-            type="button"
-            onClick={() => stream.reconnect()}
-            className="ml-auto rounded-lg border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            重新连接
-          </button>
-        ) : null}
-      </div>
-
-      {error === "" ? null : (
-        <p
-          role="alert"
-          className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          刷新版本失败：{error}（正在展示上次数据）
-          {errorRequestId === "" ? null : <> 请求 ID：{errorRequestId}</>}
-        </p>
-      )}
-
-      <VersionTabs
-        versionId={versionId}
-        active={tab}
-        onTabChange={handleTabChange}
-        stream={stream}
-        requirements={
-          <RequirementsWorkbenchSlot
-            version={version}
-            onChanged={refresh}
-            openCreateToken={createToken}
-            onOpenCreateIntentConsumed={() => setCreateToken(0)}
-            initialRequirementId={requirementId}
-          />
-        }
-        mindmap={
-          <MindmapPage
-            versionId={versionId}
-            embedded
-            initialCaseId={caseId}
-            onCaseChange={handleCaseChange}
-            // The tab and the full-screen route share the same data hook; the
-            // container's version/stream keep the tab from re-reading either.
-            stream={stream}
-            version={version}
-          />
-        }
-        issueId={issueId}
-        onIssueChange={handleIssueChange}
-        reportId={reportId}
-        onReportChange={handleReportChange}
-        batchId={batchId}
-        onBatchChange={handleBatchChange}
-        overview={
-          <OverviewTab
-            version={version}
-            batches={batchPage.batches}
-            stream={stream}
-            onOpenIssues={() => handleTabChange("issues")}
-            onOpenCode={() => handleTabChange("code")}
-            onOpenReports={(batchIdValue) => {
-              // A batch entry supersedes any deep-linked report revision;
-              // handleBatchChange also clears the stale `?report=`.
-              handleBatchChange(batchIdValue)
-              handleTabChange("report")
-            }}
-          />
-        }
-        sessions={
-          <SessionsTab
-            versionId={versionId}
-            role={role}
-            onOpenEvidence={setEvidenceId}
-            onCompleteTakeover={handleCompleteTakeover}
-          />
-        }
-        exploration={
-          <ExplorationTab
-            versionId={versionId}
-            batchId={batchId}
-            stream={stream}
-            onOpenEvidence={setEvidenceId}
-            onNavigate={handleExplorationNavigate}
-            initialFilters={explorationFilters}
-            onFiltersChange={handleExplorationFiltersChange}
-            selectedNodeId={explorationNodeId}
-            onSelectedNodeChange={handleExplorationNodeChange}
-          />
-        }
-        broadcast={<BroadcastTab versionId={versionId} />}
-        results={
-          <ResultsTab
-            versionId={versionId}
-            batchId={batchId}
-            batchNo={selectedBatch?.batch_no}
-            stream={stream}
-          />
-        }
-        code={<CodeChangesTab versionId={versionId} repoId={version.codeRepositoryId} />}
+      <Tabs
+        items={tabItems}
+        value={activeTab}
+        onValueChange={handleTabChange}
+        ariaLabel="版本工作区"
       />
 
-      {evidenceId === "" ? null : (
-        <EvidenceViewer
+      {activeTab === "overview" ? (
+        <VersionOverview version={version} />
+      ) : activeTab === "requirements" ? (
+        <RequirementsTab
           versionId={versionId}
-          evidenceId={evidenceId}
-          compareWith={compareEvidenceId}
-          onClose={() => {
-            setEvidenceId("")
-            setCompareEvidenceId("")
-          }}
+          initialConversationId={initialConversationId}
+          initialRequirementId={initialRequirementId}
         />
+      ) : activeTab === "design" ? (
+        <DesignTab
+          versionId={versionId}
+          initialCaseId={designCaseId}
+          initialConversationId={designConversationId}
+        />
+      ) : activeTab === "execution" ? (
+        <ExecutionTab
+          versionId={versionId}
+          initialWaveId={executionWaveId}
+          initialCaseRunId={executionCaseRunId}
+        />
+      ) : activeTab === "chain" ? (
+        <ChainTab versionId={versionId} onVersionChanged={refreshVersionAndCounts} />
+      ) : activeTab === "issues" ? (
+        <IssuesTab versionId={versionId} />
+      ) : activeTab === "reports" ? (
+        <ReportsTab versionId={versionId} />
+      ) : (
+        <CodeTab versionId={versionId} />
       )}
 
-      {takeover === null ? null : (
-        <TakeoverDialog
-          mode="complete"
-          // P2's dialog still types the id as number; P6 serializes it as a
-          // decimal string, so it is passed through verbatim (never Number()).
-          takeoverId={takeover.id as unknown as number}
-          onClose={() => setTakeover(null)}
-          onDone={() => {
-            setTakeover(null)
-            void batchPage.refresh()
-            void stream.reconnect()
-          }}
-        />
-      )}
+      <TodoDrawer versionId={versionId} open={todoOpen} onClose={() => setTodoOpen(false)} />
     </div>
   )
 }

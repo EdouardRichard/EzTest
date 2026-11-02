@@ -1,1647 +1,1510 @@
-package application
+package deliveryapp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
-	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 )
 
-const (
-	issueTestVersionID = int64(1)
-	issueTestActor     = int64(42)
-)
+var errIssueTestBoom = errors.New("issue test boom")
 
-// issueTestNow is the frozen clock every service test runs on.
-var issueTestNow = time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+var issueServiceTestNow = time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)
 
-// --- test doubles -----------------------------------------------------------
-
-type issueTestIDs struct{ next int64 }
-
-func (g *issueTestIDs) Next() int64 {
-	g.next++
-	return g.next
+// issueGetCall records one version-scoped Get.
+type issueGetCall struct {
+	versionID int64
+	issueID   int64
 }
 
-type issueTestClock struct{ now time.Time }
+// issueListCall records one List request.
+type issueListCall struct {
+	versionID int64
+	filter    IssueFilter
+}
 
-func (c *issueTestClock) Now() time.Time { return c.now }
+type issueTriageCall struct {
+	issueID   int64
+	versionID int64
+}
 
-type issueFakeEvents struct{ published []IssueEvent }
+// fakeIssueRepository is the in-memory IssueRepository of the issue service
+// tests. Every behavior is injectable so a test can force one port outcome
+// without touching SQL.
+type fakeIssueRepository struct {
+	createResult     delivery.Issue
+	createCreated    bool
+	createErr        error
+	createCalls      int
+	createdCandidate delivery.Issue
+	createdRefs      []delivery.IssueRef
 
-func (f *issueFakeEvents) Publish(_ context.Context, event IssueEvent) error {
-	f.published = append(f.published, event)
+	getIssues  map[int64]delivery.Issue
+	getCalls   []issueGetCall
+	getErr     error
+	getErrByID map[int64]error
+
+	refs       []delivery.IssueRef
+	refsErr    error
+	history    []delivery.IssueStatusChange
+	historyErr error
+
+	findByCaseRun map[int64]delivery.Issue
+	findErrByCase map[int64]error
+	findCalls     []int64
+
+	updateResult delivery.Issue
+	updateErr    error
+	updateCalls  []IssueStatusUpdate
+
+	mergeResult delivery.Issue
+	mergeErr    error
+	mergeCalls  []IssueMerge
+
+	applyResult delivery.Issue
+	applyErr    error
+	applyCalls  []IssueRecurrence
+
+	appendRefsErr   error
+	appendRefsCalls []issueAppendRefsCall
+
+	listResult []delivery.Issue
+	listErr    error
+	listCalls  []issueListCall
+}
+
+// issueAppendRefsCall records one AppendRefs fallback.
+type issueAppendRefsCall struct {
+	issueID int64
+	refs    []delivery.IssueRef
+}
+
+func (r *fakeIssueRepository) CreateCandidate(_ context.Context, issue delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, bool, error) {
+	r.createCalls++
+	r.createdCandidate = issue
+	r.createdRefs = append([]delivery.IssueRef(nil), refs...)
+	if r.createErr != nil {
+		return delivery.Issue{}, false, r.createErr
+	}
+	return r.createResult, r.createCreated, nil
+}
+
+func (r *fakeIssueRepository) Get(_ context.Context, versionID, issueID int64) (delivery.Issue, error) {
+	r.getCalls = append(r.getCalls, issueGetCall{versionID: versionID, issueID: issueID})
+	if err := r.getErrByID[issueID]; err != nil {
+		return delivery.Issue{}, err
+	}
+	if r.getErr != nil {
+		return delivery.Issue{}, r.getErr
+	}
+	issue, ok := r.getIssues[issueID]
+	if !ok || (issue.VersionID != 0 && issue.VersionID != versionID) {
+		return delivery.Issue{}, delivery.ErrNotFound
+	}
+	return issue, nil
+}
+
+func (r *fakeIssueRepository) GetByID(_ context.Context, issueID int64) (delivery.Issue, error) {
+	if err := r.getErrByID[issueID]; err != nil {
+		return delivery.Issue{}, err
+	}
+	issue, ok := r.getIssues[issueID]
+	if !ok {
+		return delivery.Issue{}, delivery.ErrNotFound
+	}
+	return issue, nil
+}
+
+func (r *fakeIssueRepository) List(_ context.Context, versionID int64, f IssueFilter) ([]delivery.Issue, error) {
+	r.listCalls = append(r.listCalls, issueListCall{versionID: versionID, filter: f})
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return r.listResult, nil
+}
+
+func (r *fakeIssueRepository) UpdateStatus(_ context.Context, u IssueStatusUpdate) (delivery.Issue, error) {
+	r.updateCalls = append(r.updateCalls, u)
+	if r.updateErr != nil {
+		return delivery.Issue{}, r.updateErr
+	}
+	return r.updateResult, nil
+}
+
+func (r *fakeIssueRepository) Merge(_ context.Context, m IssueMerge) (delivery.Issue, error) {
+	r.mergeCalls = append(r.mergeCalls, m)
+	if r.mergeErr != nil {
+		return delivery.Issue{}, r.mergeErr
+	}
+	return r.mergeResult, nil
+}
+
+func (r *fakeIssueRepository) ApplyRecurrence(_ context.Context, rec IssueRecurrence) (delivery.Issue, error) {
+	r.applyCalls = append(r.applyCalls, IssueRecurrence{
+		VersionID: rec.VersionID,
+		SourceID:  rec.SourceID,
+		TargetID:  rec.TargetID,
+		Refs:      append([]delivery.IssueRef(nil), rec.Refs...),
+	})
+	if r.applyErr != nil {
+		return delivery.Issue{}, r.applyErr
+	}
+	return r.applyResult, nil
+}
+
+func (r *fakeIssueRepository) AppendRefs(_ context.Context, issueID int64, refs []delivery.IssueRef) error {
+	r.appendRefsCalls = append(r.appendRefsCalls, issueAppendRefsCall{
+		issueID: issueID,
+		refs:    append([]delivery.IssueRef(nil), refs...),
+	})
+	return r.appendRefsErr
+}
+
+func (r *fakeIssueRepository) AppendHistory(context.Context, delivery.IssueStatusChange) error {
 	return nil
 }
 
-type issueFakeAudit struct{ recorded []IssueAuditEvent }
+func (r *fakeIssueRepository) ListRefs(context.Context, int64) ([]delivery.IssueRef, error) {
+	if r.refsErr != nil {
+		return nil, r.refsErr
+	}
+	return r.refs, nil
+}
 
-func (f *issueFakeAudit) Record(_ context.Context, event IssueAuditEvent) error {
-	f.recorded = append(f.recorded, event)
+func (r *fakeIssueRepository) ListHistory(context.Context, int64) ([]delivery.IssueStatusChange, error) {
+	if r.historyErr != nil {
+		return nil, r.historyErr
+	}
+	return r.history, nil
+}
+
+func (r *fakeIssueRepository) FindByCaseRun(_ context.Context, _, caseRunID int64) (delivery.Issue, bool, error) {
+	r.findCalls = append(r.findCalls, caseRunID)
+	if err := r.findErrByCase[caseRunID]; err != nil {
+		return delivery.Issue{}, false, err
+	}
+	issue, ok := r.findByCaseRun[caseRunID]
+	return issue, ok, nil
+}
+
+var _ IssueRepository = (*fakeIssueRepository)(nil)
+
+// fakeIssueExecution is the in-memory ExecutionReader of the scan/ingest tests.
+type fakeIssueExecution struct {
+	failed      []CaseRunSnapshot
+	failedErr   error
+	failedCalls []int64
+
+	snapshots         map[int64]CaseRunSnapshot
+	snapshotErrByCase map[int64]error
+	snapshotCalls     []int64
+}
+
+func (e *fakeIssueExecution) ListFailedApplicationCaseRuns(_ context.Context, versionID int64) ([]CaseRunSnapshot, error) {
+	e.failedCalls = append(e.failedCalls, versionID)
+	if e.failedErr != nil {
+		return nil, e.failedErr
+	}
+	return e.failed, nil
+}
+
+func (e *fakeIssueExecution) CaseRunSnapshot(_ context.Context, caseRunID int64) (CaseRunSnapshot, error) {
+	e.snapshotCalls = append(e.snapshotCalls, caseRunID)
+	if err := e.snapshotErrByCase[caseRunID]; err != nil {
+		return CaseRunSnapshot{}, err
+	}
+	snapshot, ok := e.snapshots[caseRunID]
+	if !ok {
+		return CaseRunSnapshot{}, errIssueTestBoom
+	}
+	return snapshot, nil
+}
+
+func (e *fakeIssueExecution) WaveSnapshot(context.Context, int64, int64) (WaveSnapshot, error) {
+	return WaveSnapshot{}, nil
+}
+
+func (e *fakeIssueExecution) VersionSnapshot(context.Context, int64) (VersionSnapshot, error) {
+	return VersionSnapshot{}, nil
+}
+
+var _ ExecutionReader = (*fakeIssueExecution)(nil)
+
+type recordedIssueEvent struct {
+	eventType string
+	versionID int64
+	payload   map[string]any
+}
+
+type fakeIssueEvents struct {
+	records []recordedIssueEvent
+	err     error
+}
+
+func (p *fakeIssueEvents) Publish(_ context.Context, eventType string, versionID int64, payload map[string]any) error {
+	copied := make(map[string]any, len(payload))
+	for key, value := range payload {
+		copied[key] = value
+	}
+	p.records = append(p.records, recordedIssueEvent{eventType: eventType, versionID: versionID, payload: copied})
+	return p.err
+}
+
+var _ EventPublisher = (*fakeIssueEvents)(nil)
+
+type recordedIssueAudit struct {
+	actorID    int64
+	action     string
+	targetKind string
+	targetID   string
+	metadata   map[string]any
+}
+
+type fakeIssueAudit struct {
+	records []recordedIssueAudit
+	err     error
+}
+
+func (a *fakeIssueAudit) Write(_ context.Context, actorID int64, action, targetKind, targetID string, metadata map[string]any) error {
+	copied := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		copied[key] = value
+	}
+	a.records = append(a.records, recordedIssueAudit{
+		actorID:    actorID,
+		action:     action,
+		targetKind: targetKind,
+		targetID:   targetID,
+		metadata:   copied,
+	})
+	return a.err
+}
+
+var _ AuditSink = (*fakeIssueAudit)(nil)
+
+type fakeIssueClock struct{ now time.Time }
+
+func (c fakeIssueClock) Now() time.Time { return c.now }
+
+type fakeIssueTasks struct {
+	calls []issueTriageCall
+	err   error
+}
+
+func (t *fakeIssueTasks) EnsureIssueTriage(_ context.Context, issueID, versionID int64) error {
+	t.calls = append(t.calls, issueTriageCall{issueID: issueID, versionID: versionID})
+	return t.err
+}
+
+func (t *fakeIssueTasks) EnsureReportTask(context.Context, int64, int32) error { return nil }
+
+func (t *fakeIssueTasks) EnsureRequirementClose(context.Context, int64, int64, int32) error {
 	return nil
 }
 
-// issueFakeVersionReader is the in-memory IssueVersionReader. The test version
-// exists by default; err makes the lookup fail.
-type issueFakeVersionReader struct {
-	versions map[int64]bool
-	calls    []int64
-	err      error
+func (t *fakeIssueTasks) EnsureVersionClose(context.Context, int64, int64, string) error {
+	return nil
 }
 
-func newIssueFakeVersionReader() *issueFakeVersionReader {
-	return &issueFakeVersionReader{versions: map[int64]bool{issueTestVersionID: true}}
+var _ TaskEnsurer = (*fakeIssueTasks)(nil)
+
+type fakeIssueTriageReader struct {
+	run   delivery.AnalysisRun
+	found bool
+	err   error
+	calls []int64
 }
 
-func (r *issueFakeVersionReader) VersionExists(_ context.Context, versionID int64) (bool, error) {
-	r.calls = append(r.calls, versionID)
+func (r *fakeIssueTriageReader) LatestByIssue(_ context.Context, issueID int64) (delivery.AnalysisRun, bool, error) {
+	r.calls = append(r.calls, issueID)
 	if r.err != nil {
-		return false, r.err
+		return delivery.AnalysisRun{}, false, r.err
 	}
-	return r.versions[versionID], nil
+	return r.run, r.found, nil
 }
 
-// issueFakeStore is an in-memory IssueStore. Its InTx snapshots the maps and
-// restores them when the callback fails, so rollback semantics are exercised by
-// the unit tests without PostgreSQL. Reference ownership is not a store concern:
-// issueFakeRefValidator stands in for the IssueRefValidator port.
-type issueFakeStore struct {
-	issues  map[int64]domain.Issue
-	refs    map[int64][]domain.IssueRef
-	creates int
-	updates int
-	inTx    int
-	failAt  int
+var _ IssueTriageReader = (*fakeIssueTriageReader)(nil)
+
+type issueServiceFixture struct {
+	repo   *fakeIssueRepository
+	exec   *fakeIssueExecution
+	events *fakeIssueEvents
+	audit  *fakeIssueAudit
+	clock  *fakeIssueClock
+	tasks  *fakeIssueTasks
+	svc    *IssueService
 }
 
-func newIssueFakeStore() *issueFakeStore {
-	return &issueFakeStore{
-		issues: make(map[int64]domain.Issue),
-		refs:   make(map[int64][]domain.IssueRef),
+func newIssueServiceFixture() *issueServiceFixture {
+	fixture := &issueServiceFixture{
+		repo: &fakeIssueRepository{
+			getIssues:     map[int64]delivery.Issue{},
+			getErrByID:    map[int64]error{},
+			findByCaseRun: map[int64]delivery.Issue{},
+			findErrByCase: map[int64]error{},
+		},
+		exec: &fakeIssueExecution{
+			snapshots:         map[int64]CaseRunSnapshot{},
+			snapshotErrByCase: map[int64]error{},
+		},
+		events: &fakeIssueEvents{},
+		audit:  &fakeIssueAudit{},
+		clock:  &fakeIssueClock{now: issueServiceTestNow},
+		tasks:  &fakeIssueTasks{},
 	}
+	fixture.svc = NewIssueService(fixture.repo, fixture.exec, fixture.events, fixture.audit, fixture.clock, fixture.tasks)
+	return fixture
 }
 
-func issueTestOwnerKey(kind string, id int64) string {
-	return fmt.Sprintf("%s:%d", kind, id)
-}
-
-// issueFakeRefValidator is the in-memory IssueRefValidator: allow registers the
-// version each (kind, id) target belongs to, mimicking the cross-context
-// execution/mindmap/version/codeintel adapters that T17 wires.
-type issueFakeRefValidator struct {
-	owners map[string]int64
-	calls  int
-}
-
-func newIssueFakeRefValidator() *issueFakeRefValidator {
-	return &issueFakeRefValidator{owners: make(map[string]int64)}
-}
-
-func (v *issueFakeRefValidator) allow(kind string, id, versionID int64) {
-	v.owners[issueTestOwnerKey(kind, id)] = versionID
-}
-
-func (v *issueFakeRefValidator) ValidateRefs(_ context.Context, versionID int64, refs []domain.IssueRef) error {
-	v.calls++
-	for _, ref := range refs {
-		if err := domain.ValidateIssueRef(ref.RefKind, ref.RefID); err != nil {
-			return err
-		}
-		if ref.RefKind == domain.RefKindCommit {
-			continue
-		}
-		id, err := strconv.ParseInt(ref.RefID, 10, 64)
-		if err != nil {
-			return domain.NewInvalid("refs", domain.ReasonIssueRefInvalid,
-				fmt.Sprintf("issue ref %s:%s is not a decimal id", ref.RefKind, ref.RefID))
-		}
-		owner, ok := v.owners[issueTestOwnerKey(ref.RefKind, id)]
-		if !ok {
-			return domain.NewInvalid("refs", domain.ReasonIssueRefInvalid,
-				fmt.Sprintf("issue ref %s:%s does not exist", ref.RefKind, ref.RefID))
-		}
-		if owner != versionID {
-			return domain.NewInvalid("refs", domain.ReasonIssueRefInvalid,
-				fmt.Sprintf("issue ref %s:%s belongs to version %d", ref.RefKind, ref.RefID, owner))
-		}
-	}
-	return nil
-}
-
-func (s *issueFakeStore) InTx(_ context.Context, fn func(IssueStore) error) error {
-	s.inTx++
-	issues := make(map[int64]domain.Issue, len(s.issues))
-	for id, issue := range s.issues {
-		issues[id] = issue
-	}
-	refs := make(map[int64][]domain.IssueRef, len(s.refs))
-	for id, list := range s.refs {
-		refs[id] = append([]domain.IssueRef(nil), list...)
-	}
-	if err := fn(s); err != nil {
-		s.issues = issues
-		s.refs = refs
-		return err
-	}
-	return nil
-}
-
-func (s *issueFakeStore) Create(_ context.Context, issue domain.Issue, refs []domain.IssueRef) (domain.Issue, error) {
-	s.creates++
-	if s.failAt > 0 && s.creates == s.failAt {
-		return domain.Issue{}, errors.New("issue store: create failed")
-	}
-	if issue.DedupeKey != "" {
-		for _, existing := range s.issues {
-			if existing.VersionID == issue.VersionID && existing.DedupeKey == issue.DedupeKey {
-				return domain.Issue{}, domain.NewConflict(domain.ReasonIssueStateConflict,
-					"issue dedupe key already exists")
-			}
-		}
-	}
-	s.issues[issue.ID] = issue
-	s.refs[issue.ID] = nil
-	s.AddRefs(nil, issue.ID, refs) //nolint:errcheck // in-memory append cannot fail
-	return issue, nil
-}
-
-func (s *issueFakeStore) Get(_ context.Context, versionID, issueID int64) (domain.Issue, bool, error) {
-	issue, ok := s.issues[issueID]
-	if !ok || issue.VersionID != versionID {
-		return domain.Issue{}, false, nil
-	}
-	return issue, true, nil
-}
-
-func (s *issueFakeStore) FindByDedupeKey(_ context.Context, versionID int64, dedupeKey string) (domain.Issue, bool, error) {
-	if dedupeKey == "" {
-		return domain.Issue{}, false, nil
-	}
-	ids := make([]int64, 0, len(s.issues))
-	for id := range s.issues {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for _, id := range ids {
-		issue := s.issues[id]
-		if issue.VersionID == versionID && issue.DedupeKey == dedupeKey {
-			return issue, true, nil
-		}
-	}
-	return domain.Issue{}, false, nil
-}
-
-func (s *issueFakeStore) Update(_ context.Context, issue domain.Issue, expectedRevision int) (domain.Issue, error) {
-	current, ok := s.issues[issue.ID]
-	if !ok || current.VersionID != issue.VersionID {
-		return domain.Issue{}, domain.NewNotFound("issue", issue.ID)
-	}
-	if current.Revision != expectedRevision {
-		return domain.Issue{}, domain.NewStateConflict(domain.ReasonIssueStateConflict,
-			"issue revision changed")
-	}
-	s.updates++
-	s.issues[issue.ID] = issue
-	return issue, nil
-}
-
-func (s *issueFakeStore) AddRefs(_ context.Context, issueID int64, refs []domain.IssueRef) error {
-	existing := s.refs[issueID]
-	seen := make(map[string]struct{}, len(existing)+len(refs))
-	for _, ref := range existing {
-		seen[issueTestOwnerKey(ref.RefKind, 0)+":"+ref.RefID] = struct{}{}
-	}
-	for _, ref := range refs {
-		key := issueTestOwnerKey(ref.RefKind, 0) + ":" + ref.RefID
-		if _, duplicate := seen[key]; duplicate {
-			continue
-		}
-		seen[key] = struct{}{}
-		ref.IssueID = issueID
-		existing = append(existing, ref)
-	}
-	s.refs[issueID] = existing
-	return nil
-}
-
-func (s *issueFakeStore) ListRefs(_ context.Context, issueID int64) ([]domain.IssueRef, error) {
-	return append([]domain.IssueRef(nil), s.refs[issueID]...), nil
-}
-
-func (s *issueFakeStore) List(_ context.Context, versionID int64, filter IssueFilter) ([]domain.Issue, bool, error) {
-	items := make([]domain.Issue, 0)
-	for _, issue := range s.issues {
-		if issue.VersionID != versionID {
-			continue
-		}
-		if filter.Status != "" && issue.Status != filter.Status {
-			continue
-		}
-		if filter.Severity != "" && issue.Severity != filter.Severity {
-			continue
-		}
-		if filter.Category != "" && issue.Category != filter.Category {
-			continue
-		}
-		if filter.BatchID != nil && (issue.BatchID == nil || *issue.BatchID != *filter.BatchID) {
-			continue
-		}
-		if filter.CaseRunID != nil && (issue.CaseRunID == nil || *issue.CaseRunID != *filter.CaseRunID) {
-			continue
-		}
-		if filter.CaseNodeID != nil && (issue.CaseNodeID == nil || *issue.CaseNodeID != *filter.CaseNodeID) {
-			continue
-		}
-		if filter.Query != "" && !strings.Contains(strings.ToLower(issue.Title), strings.ToLower(filter.Query)) {
-			continue
-		}
-		if filter.Cursor > 0 {
-			// The keyset cursor is severity-rank aware: the page continues
-			// after (rank, id) in the severity-weight then id-desc order. The
-			// cursor row is resolved within the same version, matching the
-			// version-scoped repository subquery.
-			cursorIssue, ok := s.issues[filter.Cursor]
-			if !ok || cursorIssue.VersionID != versionID {
-				continue
-			}
-			cursorRank := domain.SeverityRank(cursorIssue.Severity)
-			rank := domain.SeverityRank(issue.Severity)
-			if rank < cursorRank || (rank == cursorRank && issue.ID >= filter.Cursor) {
-				continue
-			}
-		}
-		items = append(items, issue)
-	}
-	sort.Slice(items, func(i, j int) bool {
-		left, right := domain.SeverityRank(items[i].Severity), domain.SeverityRank(items[j].Severity)
-		if left != right {
-			return left < right
-		}
-		return items[i].ID > items[j].ID
-	})
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	if len(items) > limit {
-		return items[:limit], true, nil
-	}
-	return items, false, nil
-}
-
-// issueRaceStore models a concurrent transaction that commits the same dedupe
-// key between the service's pre-read and its Create. InTx does not snapshot or
-// restore: the concurrent row belongs to another transaction, so it must survive
-// the failed transaction's rollback and be visible to the retry.
-type issueRaceStore struct {
-	*issueFakeStore
-	raceDedupeKey string
-	raced         bool
-}
-
-func (s *issueRaceStore) InTx(ctx context.Context, fn func(IssueStore) error) error {
-	s.issueFakeStore.inTx++
-	return fn(s)
-}
-
-func (s *issueRaceStore) Create(ctx context.Context, issue domain.Issue, refs []domain.IssueRef) (domain.Issue, error) {
-	if !s.raced && issue.DedupeKey == s.raceDedupeKey {
-		s.raced = true
-		existing := issue
-		existing.ID = 9001
-		existing.Title = "并发落库的问题"
-		existing.CaseRunID = nil
-		existing.CaseNodeID = issueTestPtr(8000)
-		existing.RecurrenceCount = 0
-		existing.Revision = 3
-		existing.CreatedAt = issueTestNow.Add(-time.Hour)
-		existing.UpdatedAt = issueTestNow.Add(-time.Hour)
-		s.issues[existing.ID] = existing
-		s.refs[existing.ID] = []domain.IssueRef{
-			{IssueID: existing.ID, RefKind: domain.RefKindCaseNode, RefID: "8000"},
-		}
-		return domain.Issue{}, ErrIssueDedupeConflict
-	}
-	return s.issueFakeStore.Create(ctx, issue, refs)
-}
-
-// --- test environment -------------------------------------------------------
-
-type issueTestEnv struct {
-	svc      *IssueManager
-	store    *issueFakeStore
-	refs     *issueFakeRefValidator
-	versions *issueFakeVersionReader
-	events   *issueFakeEvents
-	audit    *issueFakeAudit
-	ids      *issueTestIDs
-	clock    *issueTestClock
-}
-
-func newIssueTestEnv(t *testing.T) *issueTestEnv {
+func (f *issueServiceFixture) requireSingleEvent(t *testing.T, eventType string) recordedIssueEvent {
 	t.Helper()
-	store := newIssueFakeStore()
-	refs := newIssueFakeRefValidator()
-	versions := newIssueFakeVersionReader()
-	events := &issueFakeEvents{}
-	audit := &issueFakeAudit{}
-	ids := &issueTestIDs{next: 1000}
-	clock := &issueTestClock{now: issueTestNow}
-	svc := NewIssueService(IssueServiceDeps{
-		Store:    store,
-		Versions: versions,
-		Refs:     refs,
-		IDs:      ids,
-		Clock:    clock,
-		Events:   events,
-		Audit:    audit,
-	})
-	return &issueTestEnv{svc: svc, store: store, refs: refs, versions: versions,
-		events: events, audit: audit, ids: ids, clock: clock}
+	if len(f.events.records) != 1 {
+		t.Fatalf("publish calls = %d, want 1", len(f.events.records))
+	}
+	record := f.events.records[0]
+	if record.eventType != eventType {
+		t.Fatalf("event type = %q, want %q", record.eventType, eventType)
+	}
+	return record
 }
 
-func (e *issueTestEnv) allow(kind string, id, versionID int64) {
-	e.refs.allow(kind, id, versionID)
+func (f *issueServiceFixture) requireSingleAudit(t *testing.T, action string) recordedIssueAudit {
+	t.Helper()
+	if len(f.audit.records) != 1 {
+		t.Fatalf("audit writes = %d, want 1", len(f.audit.records))
+	}
+	record := f.audit.records[0]
+	if record.action != action {
+		t.Fatalf("audit action = %q, want %q", record.action, action)
+	}
+	return record
 }
 
-func (e *issueTestEnv) seed(issue domain.Issue, refs ...domain.IssueRef) {
-	e.store.issues[issue.ID] = issue
-	for _, ref := range refs {
-		ref.IssueID = issue.ID
-		e.store.refs[issue.ID] = append(e.store.refs[issue.ID], ref)
+func (f *issueServiceFixture) requireSingleTriageCall(t *testing.T) issueTriageCall {
+	t.Helper()
+	if len(f.tasks.calls) != 1 {
+		t.Fatalf("EnsureIssueTriage calls = %d, want 1", len(f.tasks.calls))
+	}
+	return f.tasks.calls[0]
+}
+
+func issueServiceTestSnapshot(caseRunID int64) CaseRunSnapshot {
+	return CaseRunSnapshot{
+		ID:                       caseRunID,
+		VersionID:                7,
+		WaveID:                   11,
+		CaseVersionID:            21,
+		RequirementID:            31,
+		CaseTitle:                "login fails",
+		Status:                   "failed",
+		FailureClass:             "application",
+		DedupeHint:               "0123456789abcdef0123456789abcdef",
+		Summary:                  "",
+		FailedStepSeq:            2,
+		FailedAssertionSeq:       1,
+		FailedStepResultID:       41,
+		FailedAssertionResultIDs: []int64{51, 52},
+		FailedExpected:           "HTTP 200",
+		FailedActual:             "HTTP 500",
+		FailedReason:             "unexpected status",
+		Category:                 "api",
+		Severity:                 "major",
+		EvidenceIDs:              []int64{61, 62},
 	}
 }
 
-// issueTestPtr returns a pointer to id.
-func issueTestPtr(id int64) *int64 { return &id }
+func issueServiceTestInt32(value int32) *int32 { return &value }
+func issueServiceTestInt64(value int64) *int64 { return &value }
 
-// issueTestDraftKey returns a deterministic 64-hex key for the service tests.
-func issueTestDraftKey(seed string) string {
-	sum := sha256.Sum256([]byte(seed))
-	return hex.EncodeToString(sum[:])
-}
-
-func issueTestDraftKeyN(n int) string {
-	return fmt.Sprintf("%064x", n+1)
-}
-
-// issueTestValidAIDraft is a complete AI defect draft.
-func issueTestValidAIDraft() domain.IssueDraft {
-	return domain.IssueDraft{
-		DedupeKey:    issueTestDraftKey("defect"),
-		Title:        "登录按钮无响应",
-		Description:  "点击登录后页面停留在原处",
-		ReproSteps:   "1. 打开登录页\n2. 点击登录",
-		Expected:     "进入首页",
-		Actual:       "页面无变化",
-		Severity:     domain.SeverityMajor,
-		Confidence:   domain.ConfidenceHigh,
-		Category:     domain.CategoryDefect,
-		FailureClass: domain.FailureClassApplication,
-		CaseRunID:    issueTestPtr(777),
-		CaseNodeID:   issueTestPtr(9001),
-		EvidenceIDs:  []int64{31},
+func requireIssueError(t *testing.T, err, want error) {
+	t.Helper()
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want errors.Is(%v)", err, want)
 	}
 }
 
-// issueTestSeedOpenIssue stores one open issue with an existing occurrence ref.
-func (e *issueTestEnv) seedOpenIssue(id int64, dedupeKey string) domain.Issue {
-	caseNodeID := int64(8000)
-	issue := domain.Issue{
-		ID:              id,
-		VersionID:       issueTestVersionID,
-		BatchID:         issueTestPtr(600),
-		CaseRunID:       issueTestPtr(700),
-		CaseNodeID:      &caseNodeID,
-		Source:          domain.SourceAI,
-		Category:        domain.CategoryDefect,
-		Severity:        domain.SeverityMajor,
-		Status:          domain.StatusOpen,
-		Confidence:      domain.ConfidenceLow,
-		FailureClass:    domain.FailureClassApplication,
-		DedupeKey:       dedupeKey,
-		Title:           "登录按钮无响应",
-		Description:     "旧描述",
-		Actual:          "",
-		RecurrenceCount: 0,
-		Revision:        3,
-		CreatedBy:       7,
-		UpdatedBy:       7,
-		CreatedAt:       issueTestNow.Add(-time.Hour),
-		UpdatedAt:       issueTestNow.Add(-time.Hour),
+func requireIssueConflictReason(t *testing.T, err error, want string) {
+	t.Helper()
+	if !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("error = %v, want errors.Is(ErrStateConflict)", err)
 	}
-	e.seed(issue, domain.IssueRef{RefKind: domain.RefKindCaseNode, RefID: "8000"})
-	return issue
+	var conflict *IssueStateConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("error = %v, want *IssueStateConflictError", err)
+	}
+	if conflict.Reason != want {
+		t.Fatalf("conflict reason = %q, want %q", conflict.Reason, want)
+	}
 }
 
-// --- CreateHuman ------------------------------------------------------------
-
-func TestCreateHumanIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindRequirement, 55, issueTestVersionID)
-
-	cmd := CreateIssueCommand{
-		Title:         "  登录按钮无响应  ",
-		Description:   "点击登录后页面停留在原处",
-		ReproSteps:    "打开登录页并点击登录",
-		Expected:      "进入首页",
-		Actual:        "页面无变化",
-		Severity:      domain.SeverityMajor,
-		CaseRunID:     issueTestPtr(777),
-		CaseNodeID:    issueTestPtr(9001),
-		RequirementID: issueTestPtr(55),
+func requireIssueMergeReason(t *testing.T, err error, want string) {
+	t.Helper()
+	if !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("error = %v, want errors.Is(ErrStateConflict)", err)
 	}
-	issue, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, cmd)
+	var mergeErr *delivery.MergeError
+	if !errors.As(err, &mergeErr) {
+		t.Fatalf("error = %v, want *delivery.MergeError", err)
+	}
+	if mergeErr.Reason != want {
+		t.Fatalf("merge reason = %q, want %q", mergeErr.Reason, want)
+	}
+}
+
+func TestScanFailuresCreatesIssuesAndSkips(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.createResult = delivery.Issue{
+		ID:        900,
+		VersionID: 7,
+		Status:    delivery.IssueStatusOpen,
+		Category:  "api",
+		Severity:  "major",
+		Source:    delivery.IssueCandidateSource,
+	}
+	fixture.repo.createCreated = true
+	fixture.exec.failed = []CaseRunSnapshot{
+		issueServiceTestSnapshot(101),
+		{ID: 102, VersionID: 7, Status: "failed", FailureClass: "infrastructure", Category: "api", Severity: "major"},
+		issueServiceTestSnapshot(103),
+	}
+	fixture.repo.findByCaseRun[103] = delivery.Issue{ID: 903, VersionID: 7}
+
+	count, err := fixture.svc.ScanFailures(context.Background(), 7)
 	if err != nil {
-		t.Fatalf("CreateHuman = %v", err)
+		t.Fatalf("ScanFailures() error = %v", err)
 	}
-	if issue.ID != 1001 {
-		t.Errorf("id = %d, want the first generated id 1001", issue.ID)
+	if count != 1 {
+		t.Fatalf("ScanFailures() count = %d, want 1", count)
 	}
-	if issue.Title != "登录按钮无响应" {
-		t.Errorf("title = %q, want the trimmed value", issue.Title)
+	if len(fixture.exec.failedCalls) != 1 || fixture.exec.failedCalls[0] != 7 {
+		t.Fatalf("ListFailedApplicationCaseRuns calls = %v, want [7]", fixture.exec.failedCalls)
 	}
-	if issue.Source != domain.SourceHuman {
-		t.Errorf("source = %q, want human", issue.Source)
+	if len(fixture.repo.findCalls) != 2 || fixture.repo.findCalls[0] != 101 || fixture.repo.findCalls[1] != 103 {
+		t.Fatalf("FindByCaseRun calls = %v, want [101 103]", fixture.repo.findCalls)
 	}
-	if issue.DedupeKey != "" {
-		t.Errorf("dedupe key = %q, want empty for a human issue", issue.DedupeKey)
+	if fixture.repo.createCalls != 1 {
+		t.Fatalf("CreateCandidate calls = %d, want 1", fixture.repo.createCalls)
 	}
-	if issue.Status != domain.StatusOpen || issue.Revision != 1 || issue.RecurrenceCount != 0 {
-		t.Errorf("initial state = (%q, revision %d, recurrence %d)", issue.Status, issue.Revision, issue.RecurrenceCount)
+	if fixture.repo.createdCandidate.VersionID != 7 {
+		t.Errorf("candidate version = %d, want 7", fixture.repo.createdCandidate.VersionID)
 	}
-	if issue.Category != domain.CategoryDefect || issue.Confidence != domain.ConfidenceMedium {
-		t.Errorf("defaults = (%q, %q), want (defect, medium)", issue.Category, issue.Confidence)
+	if fixture.repo.createdCandidate.Status != delivery.IssueStatusOpen {
+		t.Errorf("candidate status = %q, want open", fixture.repo.createdCandidate.Status)
 	}
-	if issue.CreatedBy != issueTestActor || issue.UpdatedBy != issueTestActor {
-		t.Errorf("actor = (%d, %d), want %d", issue.CreatedBy, issue.UpdatedBy, issueTestActor)
+	if fixture.repo.createdCandidate.DedupeKey != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("candidate dedupe key = %q, want the P3 hint", fixture.repo.createdCandidate.DedupeKey)
 	}
-	if !issue.CreatedAt.Equal(issueTestNow) || !issue.UpdatedAt.Equal(issueTestNow) {
-		t.Errorf("timestamps = (%s, %s), want the injected clock", issue.CreatedAt, issue.UpdatedAt)
+	if !fixture.repo.createdCandidate.CreatedAt.Equal(issueServiceTestNow) {
+		t.Errorf("candidate created_at = %v, want the injected clock %v",
+			fixture.repo.createdCandidate.CreatedAt, issueServiceTestNow)
 	}
-	if issue.BatchID != nil || issue.StepResultID != nil {
-		t.Errorf("human issue has unexpected batch/step links: %+v", issue)
+	wantKinds := []string{
+		delivery.IssueRefKindCaseRun,
+		delivery.IssueRefKindCaseVersion,
+		delivery.IssueRefKindWave,
+		delivery.IssueRefKindStepResult,
+		delivery.IssueRefKindAssertionResult,
+		delivery.IssueRefKindAssertionResult,
+		delivery.IssueRefKindEvidence,
+		delivery.IssueRefKindEvidence,
+		delivery.IssueRefKindRequirement,
 	}
-
-	refs := env.store.refs[issue.ID]
-	if len(refs) != 3 {
-		t.Fatalf("refs = %+v, want case_run, case_node and requirement", refs)
+	if len(fixture.repo.createdRefs) != len(wantKinds) {
+		t.Fatalf("candidate refs = %d, want %d (%v)", len(fixture.repo.createdRefs), len(wantKinds), wantKinds)
 	}
-	wantRefs := map[string]string{
-		domain.RefKindCaseNode:    "9001",
-		domain.RefKindCaseRun:     "777",
-		domain.RefKindRequirement: "55",
-	}
-	for _, ref := range refs {
-		if wantRefs[ref.RefKind] != ref.RefID {
-			t.Errorf("unexpected ref %+v", ref)
+	for i, kind := range wantKinds {
+		if fixture.repo.createdRefs[i].Kind != kind {
+			t.Errorf("ref[%d].kind = %q, want %q", i, fixture.repo.createdRefs[i].Kind, kind)
 		}
 	}
 
-	if len(env.events.published) != 1 {
-		t.Fatalf("events = %+v, want one issue.created", env.events.published)
+	event := fixture.requireSingleEvent(t, "issue.created")
+	if event.versionID != 7 {
+		t.Errorf("event version = %d, want 7", event.versionID)
 	}
-	event := env.events.published[0]
-	if event.Type != "issue.created" || event.VersionID != issueTestVersionID {
-		t.Errorf("event = %+v", event)
+	if event.payload["issue_id"] != "900" || event.payload["status"] != "open" ||
+		event.payload["category"] != "api" || event.payload["severity"] != "major" {
+		t.Errorf("issue.created payload = %v", event.payload)
 	}
-	if event.Detail["issueId"] != "1001" {
-		t.Errorf("event issueId = %v (%T), want the decimal string", event.Detail["issueId"], event.Detail["issueId"])
+	if event.payload["wave_id"] != "11" || event.payload["case_run_id"] != "101" {
+		t.Errorf("issue.created refs payload = %v, want wave_id=11 case_run_id=101", event.payload)
 	}
-	if event.Detail["source"] != domain.SourceHuman || event.Detail["severity"] != domain.SeverityMajor ||
-		event.Detail["status"] != domain.StatusOpen || event.Detail["confidence"] != domain.ConfidenceMedium {
-		t.Errorf("event detail = %+v", event.Detail)
+	audit := fixture.requireSingleAudit(t, "delivery.issue.created")
+	if audit.targetKind != "issue" || audit.targetID != "900" {
+		t.Errorf("audit target = %s/%s, want issue/900", audit.targetKind, audit.targetID)
 	}
-	if _, leaked := event.Detail["title"]; leaked {
-		t.Error("event detail leaks the issue title")
-	}
-
-	if len(env.audit.recorded) != 1 {
-		t.Fatalf("audit = %+v, want one delivery.issue.created", env.audit.recorded)
-	}
-	entry := env.audit.recorded[0]
-	if entry.Action != "delivery.issue.created" || entry.TargetType != "issue" || entry.TargetID != "1001" {
-		t.Errorf("audit = %+v", entry)
-	}
-	if entry.ActorID != issueTestActor {
-		t.Errorf("audit actor = %d, want %d", entry.ActorID, issueTestActor)
-	}
-	if entry.Metadata["version_id"] != issueTestVersionID || entry.Metadata["source"] != domain.SourceHuman ||
-		entry.Metadata["severity"] != domain.SeverityMajor || entry.Metadata["category"] != domain.CategoryDefect {
-		t.Errorf("audit metadata = %+v", entry.Metadata)
-	}
-	if _, leaked := entry.Metadata["title"]; leaked {
-		t.Error("audit metadata leaks the issue title")
+	if fixture.requireSingleTriageCall(t) != (issueTriageCall{issueID: 900, versionID: 7}) {
+		t.Fatalf("EnsureIssueTriage call = %+v, want {900 7}", fixture.tasks.calls[0])
 	}
 }
 
-// TestCreateHumanIssueChecksVersionExists pins the T2b version gate: a human
-// issue is only created for an existing version, and a missing version is a
-// 404 version_not_found with no row, event or audit entry.
-func TestCreateHumanIssueChecksVersionExists(t *testing.T) {
-	command := func() CreateIssueCommand {
-		return CreateIssueCommand{Title: "login fails", Severity: domain.SeverityMajor}
+func TestScanFailuresAggregatesPerItemFailures(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.createResult = delivery.Issue{ID: 900, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.createCreated = true
+	fixture.exec.failed = []CaseRunSnapshot{
+		issueServiceTestSnapshot(101),
+		issueServiceTestSnapshot(102),
+	}
+	fixture.repo.findErrByCase[101] = errIssueTestBoom
+
+	count, err := fixture.svc.ScanFailures(context.Background(), 7)
+	if count != 1 {
+		t.Fatalf("ScanFailures() count = %d, want 1", count)
+	}
+	requireIssueError(t, err, errIssueTestBoom)
+	if len(fixture.repo.findCalls) != 2 {
+		t.Fatalf("FindByCaseRun calls = %v, want both case runs", fixture.repo.findCalls)
+	}
+	if fixture.repo.createCalls != 1 {
+		t.Fatalf("CreateCandidate calls = %d, want 1", fixture.repo.createCalls)
+	}
+}
+
+func TestScanFailuresRejectsInvalidVersion(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	count, err := fixture.svc.ScanFailures(context.Background(), 0)
+	if count != 0 {
+		t.Fatalf("ScanFailures() count = %d, want 0", count)
+	}
+	requireIssueError(t, err, ErrInvalidArgument)
+	if len(fixture.exec.failedCalls) != 0 {
+		t.Fatalf("ListFailedApplicationCaseRuns calls = %v, want none", fixture.exec.failedCalls)
+	}
+}
+
+func TestIngestCandidateCreatesIssue(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[50] = issueServiceTestSnapshot(50)
+	fixture.repo.createResult = delivery.Issue{ID: 901, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.createCreated = true
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("IngestCandidate() error = %v", err)
+	}
+	if !created {
+		t.Fatal("IngestCandidate() created = false, want true")
+	}
+	if issue.ID != 901 {
+		t.Fatalf("issue.ID = %d, want 901", issue.ID)
+	}
+	if len(fixture.exec.snapshotCalls) != 1 || fixture.exec.snapshotCalls[0] != 50 {
+		t.Fatalf("CaseRunSnapshot calls = %v, want [50]", fixture.exec.snapshotCalls)
 	}
 
-	t.Run("existing version passes", func(t *testing.T) {
-		env := newIssueTestEnv(t)
-		issue, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, command())
-		if err != nil {
-			t.Fatalf("CreateHuman = %v", err)
-		}
-		if issue.VersionID != issueTestVersionID {
-			t.Errorf("version = %d, want %d", issue.VersionID, issueTestVersionID)
-		}
-		if env.store.creates != 1 || len(env.events.published) != 1 || len(env.audit.recorded) != 1 {
-			t.Fatalf("create side effects = %d/%d/%d, want 1/1/1",
-				env.store.creates, len(env.events.published), len(env.audit.recorded))
-		}
-		if len(env.versions.calls) != 1 || env.versions.calls[0] != issueTestVersionID {
-			t.Errorf("version lookups = %v, want one lookup of %d", env.versions.calls, issueTestVersionID)
+	candidate := fixture.repo.createdCandidate
+	if candidate.VersionID != 7 {
+		t.Errorf("candidate version = %d, want 7", candidate.VersionID)
+	}
+	if candidate.Title != "login fails · step 2: api failure" {
+		t.Errorf("candidate title = %q", candidate.Title)
+	}
+	wantSummary := "expected: HTTP 200\nactual: HTTP 500\nreason: unexpected status"
+	if candidate.Summary != wantSummary {
+		t.Errorf("candidate summary = %q, want %q", candidate.Summary, wantSummary)
+	}
+	if candidate.Status != delivery.IssueStatusOpen || candidate.Category != "api" || candidate.Severity != "major" {
+		t.Errorf("candidate = %+v, want open/api/major", candidate)
+	}
+	if candidate.Source != delivery.IssueCandidateSource || candidate.ExpectedRevision != 1 {
+		t.Errorf("candidate source/revision = %q/%d", candidate.Source, candidate.ExpectedRevision)
+	}
+	if len(candidate.Fingerprint) != 64 {
+		t.Errorf("candidate fingerprint = %q, want 64 hex chars", candidate.Fingerprint)
+	}
+	if !candidate.CreatedAt.Equal(issueServiceTestNow) || !candidate.UpdatedAt.Equal(issueServiceTestNow) {
+		t.Errorf("candidate timestamps = %v/%v, want %v", candidate.CreatedAt, candidate.UpdatedAt, issueServiceTestNow)
+	}
+	if len(fixture.repo.createdRefs) != 9 {
+		t.Fatalf("candidate refs = %d, want 9", len(fixture.repo.createdRefs))
+	}
+	if fixture.repo.createdRefs[0].Kind != delivery.IssueRefKindCaseRun || fixture.repo.createdRefs[0].RefID != 50 {
+		t.Errorf("case_run ref = %+v, want case_run/50", fixture.repo.createdRefs[0])
+	}
+	if fixture.repo.createdRefs[8].Kind != delivery.IssueRefKindRequirement || fixture.repo.createdRefs[8].RefID != 31 {
+		t.Errorf("requirement ref = %+v, want requirement/31", fixture.repo.createdRefs[8])
+	}
+
+	event := fixture.requireSingleEvent(t, "issue.created")
+	if event.payload["case_run_id"] != "50" {
+		t.Errorf("issue.created case_run_id = %v, want 50", event.payload["case_run_id"])
+	}
+	fixture.requireSingleAudit(t, "delivery.issue.created")
+	if call := fixture.requireSingleTriageCall(t); call != (issueTriageCall{issueID: 901, versionID: 7}) {
+		t.Fatalf("EnsureIssueTriage call = %+v, want {901 7}", call)
+	}
+}
+
+func TestIngestCandidateIsIdempotentOnDedupe(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[51] = issueServiceTestSnapshot(51)
+	fixture.repo.createResult = delivery.Issue{ID: 902, VersionID: 7, Status: delivery.IssueStatusConfirmed}
+	fixture.repo.createCreated = false
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 51)
+	if err != nil {
+		t.Fatalf("IngestCandidate() error = %v", err)
+	}
+	if created {
+		t.Fatal("IngestCandidate() created = true on a dedupe hit, want false")
+	}
+	if issue.ID != 902 {
+		t.Fatalf("issue.ID = %d, want the existing 902", issue.ID)
+	}
+	if len(fixture.events.records) != 0 {
+		t.Errorf("dedupe hit published %d events, want none", len(fixture.events.records))
+	}
+	if len(fixture.audit.records) != 0 {
+		t.Errorf("dedupe hit wrote %d audits, want none", len(fixture.audit.records))
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Errorf("dedupe hit ensured %d triage tasks, want none", len(fixture.tasks.calls))
+	}
+}
+
+func TestIngestCandidateRejectsInvalidSnapshots(t *testing.T) {
+	t.Run("non-positive case run id", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		_, _, err := fixture.svc.IngestCandidate(context.Background(), 0)
+		requireIssueError(t, err, ErrInvalidArgument)
+		if len(fixture.exec.snapshotCalls) != 0 {
+			t.Fatalf("CaseRunSnapshot calls = %v, want none", fixture.exec.snapshotCalls)
 		}
 	})
 
-	t.Run("missing version is version_not_found", func(t *testing.T) {
-		const missingVersionID = int64(4040)
-		env := newIssueTestEnv(t)
-		_, err := env.svc.CreateHuman(context.Background(), missingVersionID, issueTestActor, command())
-		var domainErr *domain.Error
-		if !errors.As(err, &domainErr) {
-			t.Fatalf("error type = %T (%v)", err, err)
+	t.Run("non-application failure class", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		snapshot := issueServiceTestSnapshot(50)
+		snapshot.FailureClass = "infrastructure"
+		fixture.exec.snapshots[50] = snapshot
+		_, _, err := fixture.svc.IngestCandidate(context.Background(), 50)
+		requireIssueError(t, err, ErrInvalidArgument)
+		if fixture.repo.createCalls != 0 {
+			t.Fatalf("CreateCandidate calls = %d, want 0", fixture.repo.createCalls)
 		}
-		if domainErr.Kind != domain.KindNotFound || domainErr.Reason != "version_not_found" {
-			t.Fatalf("error = %+v, want 404 version_not_found", domainErr)
+	})
+
+	t.Run("invalid category", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		snapshot := issueServiceTestSnapshot(50)
+		snapshot.Category = "network"
+		fixture.exec.snapshots[50] = snapshot
+		_, _, err := fixture.svc.IngestCandidate(context.Background(), 50)
+		requireIssueError(t, err, ErrInvalidArgument)
+		if fixture.repo.createCalls != 0 {
+			t.Fatalf("CreateCandidate calls = %d, want 0", fixture.repo.createCalls)
 		}
-		if env.store.creates != 0 || len(env.store.issues) != 0 {
-			t.Fatalf("missing version wrote %d creates and %d rows", env.store.creates, len(env.store.issues))
-		}
-		if len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
-			t.Fatalf("missing version published %d events and %d audit entries",
-				len(env.events.published), len(env.audit.recorded))
-		}
-		if len(env.versions.calls) != 1 || env.versions.calls[0] != missingVersionID {
-			t.Errorf("version lookups = %v, want one lookup of %d", env.versions.calls, missingVersionID)
+	})
+
+	t.Run("execution read error", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.exec.snapshotErrByCase[50] = errIssueTestBoom
+		_, _, err := fixture.svc.IngestCandidate(context.Background(), 50)
+		requireIssueError(t, err, errIssueTestBoom)
+		if fixture.repo.createCalls != 0 {
+			t.Fatalf("CreateCandidate calls = %d, want 0", fixture.repo.createCalls)
 		}
 	})
 }
 
-// TestCreateHumanIssueFailsClosedWithoutVersionReader proves an unwired version
-// port cannot silently skip the target-version check and create an orphan issue.
-func TestCreateHumanIssueFailsClosedWithoutVersionReader(t *testing.T) {
-	store := newIssueFakeStore()
-	events := &issueFakeEvents{}
-	audit := &issueFakeAudit{}
-	svc := NewIssueService(IssueServiceDeps{
-		Store:  store,
-		IDs:    &issueTestIDs{next: 1000},
-		Clock:  &issueTestClock{now: issueTestNow},
-		Events: events,
-		Audit:  audit,
-	})
-	_, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
-		Title:    "login fails",
-		Severity: domain.SeverityMajor,
-	})
-	if err == nil {
-		t.Fatal("CreateHuman accepted a version without a version reader")
+func TestIngestCandidateReportsTriageEnsureFailure(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[50] = issueServiceTestSnapshot(50)
+	fixture.repo.createResult = delivery.Issue{ID: 901, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.createCreated = true
+	fixture.tasks.err = errIssueTestBoom
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 50)
+	requireIssueError(t, err, errIssueTestBoom)
+	if !created || issue.ID != 901 {
+		t.Fatalf("IngestCandidate() = (%d, %v), want the created issue and true", issue.ID, created)
 	}
-	if store.creates != 0 || len(store.issues) != 0 || len(events.published) != 0 || len(audit.recorded) != 0 {
-		t.Fatalf("unconfigured version reader wrote state: creates=%d rows=%d events=%d audit=%d",
-			store.creates, len(store.issues), len(events.published), len(audit.recorded))
+	if len(fixture.events.records) != 1 || len(fixture.audit.records) != 1 {
+		t.Errorf("side effects = %d events/%d audits, want 1/1 before the ensure failure",
+			len(fixture.events.records), len(fixture.audit.records))
 	}
 }
 
-// TestCreateHumanIssuePropagatesVersionLookupFailure proves a version-reader
-// error is not mistaken for a missing version and writes no issue.
-func TestCreateHumanIssuePropagatesVersionLookupFailure(t *testing.T) {
-	env := newIssueTestEnv(t)
-	lookupErr := errors.New("version store unavailable")
-	env.versions.err = lookupErr
-	_, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
-		Title:    "login fails",
-		Severity: domain.SeverityMajor,
-	})
-	if !errors.Is(err, lookupErr) {
-		t.Fatalf("error = %v, want the wrapped version lookup failure", err)
+func TestIssueServiceListPassesFilterThrough(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.listResult = []delivery.Issue{
+		{ID: 9, VersionID: 7, Status: delivery.IssueStatusOpen},
+		{ID: 8, VersionID: 7, Status: delivery.IssueStatusOpen},
 	}
-	if env.store.creates != 0 || len(env.store.issues) != 0 ||
-		len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
-		t.Fatalf("failed version lookup wrote state: creates=%d rows=%d events=%d audit=%d",
-			env.store.creates, len(env.store.issues), len(env.events.published), len(env.audit.recorded))
+	filter := IssueFilter{
+		Status:       "open",
+		Category:     "api",
+		Severity:     "minor",
+		VersionSUTID: issueServiceTestInt64(5),
+		Before:       100,
+		Limit:        10,
 	}
-}
-
-// TestApplyDraftsChecksVersionExists proves the AI materialization path also
-// refuses to write issues for a nonexistent version.
-func TestApplyDraftsChecksVersionExists(t *testing.T) {
-	const missingVersionID = int64(4040)
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-
-	_, err := env.svc.ApplyDrafts(context.Background(), missingVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{issueTestValidAIDraft()})
-	var domainErr *domain.Error
-	if !errors.As(err, &domainErr) {
-		t.Fatalf("error type = %T (%v)", err, err)
+	issues, err := fixture.svc.List(context.Background(), 7, filter)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
 	}
-	if domainErr.Kind != domain.KindNotFound || domainErr.Reason != "version_not_found" {
-		t.Fatalf("error = %+v, want 404 version_not_found", domainErr)
+	if len(issues) != 2 || issues[0].ID != 9 || issues[1].ID != 8 {
+		t.Fatalf("List() = %+v, want the repository page", issues)
 	}
-	if env.store.creates != 0 || len(env.store.issues) != 0 || env.store.inTx != 0 {
-		t.Fatalf("missing version wrote state: creates=%d rows=%d transactions=%d",
-			env.store.creates, len(env.store.issues), env.store.inTx)
+	if len(fixture.repo.listCalls) != 1 {
+		t.Fatalf("List calls = %d, want 1", len(fixture.repo.listCalls))
 	}
-	if len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
-		t.Fatalf("missing version published %d events and %d audit entries",
-			len(env.events.published), len(env.audit.recorded))
-	}
-	if len(env.versions.calls) != 1 || env.versions.calls[0] != missingVersionID {
-		t.Errorf("version lookups = %v, want one lookup of %d", env.versions.calls, missingVersionID)
+	if call := fixture.repo.listCalls[0]; call.versionID != 7 || call.filter != filter {
+		t.Fatalf("List call = %+v, want version 7 and the caller filter", call)
 	}
 }
 
-func TestCreateHumanIssueRejectsInvalidInput(t *testing.T) {
-	foreign := int64(9999)
+func TestIssueServiceListRejectsInvalidArguments(t *testing.T) {
 	cases := []struct {
-		name   string
-		mutate func(*CreateIssueCommand)
-		reason string
-		field  string
+		name    string
+		version int64
+		filter  IssueFilter
 	}{
-		{"empty title", func(c *CreateIssueCommand) { c.Title = "  " }, domain.ReasonInvalidArgument, "title"},
-		{"long title", func(c *CreateIssueCommand) { c.Title = strings.Repeat("x", 201) }, domain.ReasonInvalidArgument, "title"},
-		{"missing severity", func(c *CreateIssueCommand) { c.Severity = "" }, domain.ReasonInvalidArgument, "severity"},
-		{"bad severity", func(c *CreateIssueCommand) { c.Severity = "urgent" }, domain.ReasonInvalidArgument, "severity"},
-		{"bad category", func(c *CreateIssueCommand) { c.Category = "bug" }, domain.ReasonInvalidArgument, "category"},
-		{"bad confidence", func(c *CreateIssueCommand) { c.Confidence = "certain" }, domain.ReasonInvalidArgument, "confidence"},
-		{"foreign case node", func(c *CreateIssueCommand) { c.CaseNodeID = &foreign }, domain.ReasonIssueRefInvalid, "refs"},
+		{name: "version", version: 0},
+		{name: "status", version: 7, filter: IssueFilter{Status: "closed"}},
+		{name: "category", version: 7, filter: IssueFilter{Category: "network"}},
+		{name: "severity", version: 7, filter: IssueFilter{Severity: "critical"}},
+		{name: "version_sut", version: 7, filter: IssueFilter{VersionSUTID: issueServiceTestInt64(0)}},
+		{name: "before", version: 7, filter: IssueFilter{Before: -1}},
+		{name: "limit", version: 7, filter: IssueFilter{Limit: -1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := newIssueTestEnv(t)
-			env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-			cmd := CreateIssueCommand{Title: "登录失败", Severity: domain.SeverityMajor, CaseNodeID: issueTestPtr(9001)}
-			tc.mutate(&cmd)
-			issue, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, cmd)
-			if err == nil {
-				t.Fatalf("CreateHuman succeeded with %+v", issue)
-			}
-			var domainErr *domain.Error
-			if !errors.As(err, &domainErr) {
-				t.Fatalf("error type = %T (%v)", err, err)
-			}
-			if domainErr.Reason != tc.reason || domainErr.Field != tc.field {
-				t.Fatalf("error = %+v, want field %q reason %q", domainErr, tc.field, tc.reason)
-			}
-			if env.store.creates != 0 || len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
-				t.Fatalf("invalid command wrote state: creates=%d events=%d audit=%d",
-					env.store.creates, len(env.events.published), len(env.audit.recorded))
+			fixture := newIssueServiceFixture()
+			_, err := fixture.svc.List(context.Background(), tc.version, tc.filter)
+			requireIssueError(t, err, ErrInvalidArgument)
+			if len(fixture.repo.listCalls) != 0 {
+				t.Fatalf("List calls = %d, want none", len(fixture.repo.listCalls))
 			}
 		})
 	}
 }
 
-// --- ApplyDrafts ------------------------------------------------------------
-
-func TestApplyDraftsRejectsIncompleteAIDraft(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(*domain.IssueDraft)
-		field  string
-	}{
-		{"missing dedupe", func(d *domain.IssueDraft) { d.DedupeKey = "" }, "dedupeKey"},
-		{"malformed dedupe", func(d *domain.IssueDraft) { d.DedupeKey = "abc" }, "dedupeKey"},
-		{"missing failure class", func(d *domain.IssueDraft) { d.FailureClass = "" }, "failureClass"},
-		{"non-application failure class", func(d *domain.IssueDraft) {
-			d.FailureClass = domain.FailureClassEnvironment
-		}, "failureClass"},
-		{"missing case node", func(d *domain.IssueDraft) { d.CaseNodeID = nil }, "caseNodeId"},
-		{"missing severity", func(d *domain.IssueDraft) { d.Severity = "" }, "severity"},
-		{"missing confidence", func(d *domain.IssueDraft) { d.Confidence = "" }, "confidence"},
+func TestIssueServiceGetReturnsRefsHistoryAndTriage(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Title: "boom", Status: delivery.IssueStatusOpen}
+	fixture.repo.refs = []delivery.IssueRef{{ID: 1, IssueID: 42, Kind: delivery.IssueRefKindCaseRun, RefID: 50}}
+	from := delivery.IssueStatusOpen
+	fixture.repo.history = []delivery.IssueStatusChange{
+		{ID: 1, IssueID: 42, From: &from, To: delivery.IssueStatusConfirmed},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			env := newIssueTestEnv(t)
-			draft := issueTestValidAIDraft()
-			tc.mutate(&draft)
-			issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-				[]domain.IssueDraft{draft})
-			if err == nil {
-				t.Fatalf("ApplyDrafts succeeded with %+v", issues)
-			}
-			var domainErr *domain.Error
-			if !errors.As(err, &domainErr) {
-				t.Fatalf("error type = %T (%v)", err, err)
-			}
-			if domainErr.Kind != domain.KindInvalid || domainErr.Field != tc.field {
-				t.Fatalf("error = %+v, want invalid field %q", domainErr, tc.field)
-			}
-			if env.store.creates != 0 || env.store.inTx != 0 || len(env.events.published) != 0 {
-				t.Fatalf("invalid draft touched the store: creates=%d tx=%d events=%d",
-					env.store.creates, env.store.inTx, len(env.events.published))
-			}
-		})
-	}
-}
+	run := delivery.AnalysisRun{ID: 77, VersionID: 7, Kind: "triage", Status: delivery.AnalysisStatusDone}
+	reader := &fakeIssueTriageReader{run: run, found: true}
+	fixture.svc.WithTriageReader(reader)
 
-func TestApplyDraftsCreatesAIIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-	env.allow(domain.RefKindRequirement, 55, issueTestVersionID)
-
-	draft := issueTestValidAIDraft()
-	draft.RequirementIDs = []int64{55}
-	issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
+	detail, err := fixture.svc.Get(context.Background(), 7, 42)
 	if err != nil {
-		t.Fatalf("ApplyDrafts = %v", err)
+		t.Fatalf("Get() error = %v", err)
 	}
-	if len(issues) != 1 {
-		t.Fatalf("issues = %+v, want one materialized issue", issues)
+	if detail.Issue.ID != 42 || detail.Issue.Title != "boom" {
+		t.Fatalf("detail issue = %+v", detail.Issue)
 	}
-	issue := issues[0]
-	if issue.Source != domain.SourceAI || issue.DedupeKey != draft.DedupeKey {
-		t.Errorf("source/dedupe = (%q, %q)", issue.Source, issue.DedupeKey)
+	if len(detail.Refs) != 1 || detail.Refs[0].RefID != 50 {
+		t.Fatalf("detail refs = %+v", detail.Refs)
 	}
-	if issue.FailureClass != domain.FailureClassApplication || issue.Category != domain.CategoryDefect {
-		t.Errorf("classification = (%q, %q)", issue.FailureClass, issue.Category)
+	if len(detail.History) != 1 || detail.History[0].To != delivery.IssueStatusConfirmed {
+		t.Fatalf("detail history = %+v", detail.History)
 	}
-	if issue.BatchID == nil || *issue.BatchID != 700 {
-		t.Errorf("batch = %v, want 700", issue.BatchID)
+	if detail.Triage == nil || detail.Triage.ID != 77 {
+		t.Fatalf("detail triage = %+v, want the latest analysis run", detail.Triage)
 	}
-	if issue.CaseRunID == nil || *issue.CaseRunID != 777 || issue.CaseNodeID == nil || *issue.CaseNodeID != 9001 {
-		t.Errorf("case links = (%v, %v)", issue.CaseRunID, issue.CaseNodeID)
-	}
-	if issue.CreatedBy != issueTestActor || issue.UpdatedBy != issueTestActor {
-		t.Errorf("created_by = %d", issue.CreatedBy)
-	}
-	if issue.Status != domain.StatusOpen || issue.Revision != 1 || issue.RecurrenceCount != 0 {
-		t.Errorf("initial state = (%q, %d, %d)", issue.Status, issue.Revision, issue.RecurrenceCount)
-	}
-
-	refs := domain.NormalizeIssueRefs(env.store.refs[issue.ID])
-	if len(refs) != 4 {
-		t.Fatalf("refs = %+v, want case_run, case_node, evidence and requirement", refs)
-	}
-	want := []domain.IssueRef{
-		{IssueID: issue.ID, RefKind: domain.RefKindCaseNode, RefID: "9001"},
-		{IssueID: issue.ID, RefKind: domain.RefKindCaseRun, RefID: "777"},
-		{IssueID: issue.ID, RefKind: domain.RefKindEvidence, RefID: "31"},
-		{IssueID: issue.ID, RefKind: domain.RefKindRequirement, RefID: "55"},
-	}
-	for i := range want {
-		if refs[i] != want[i] {
-			t.Errorf("ref[%d] = %+v, want %+v", i, refs[i], want[i])
-		}
-	}
-
-	if len(env.events.published) != 1 {
-		t.Fatalf("events = %+v, want one issue.created", env.events.published)
-	}
-	event := env.events.published[0]
-	if event.Type != "issue.created" || event.Detail["issueId"] != fmt.Sprint(issue.ID) ||
-		event.Detail["source"] != domain.SourceAI {
-		t.Errorf("event = %+v", event)
-	}
-	if event.Detail["confidence"] != domain.ConfidenceHigh || event.Detail["severity"] != domain.SeverityMajor {
-		t.Errorf("event detail = %+v", event.Detail)
-	}
-	if len(event.RefCaseIDs) != 1 || event.RefCaseIDs[0] != 9001 {
-		t.Errorf("event case refs = %+v", event.RefCaseIDs)
-	}
-	if len(event.RefEvidenceIDs) != 1 || event.RefEvidenceIDs[0] != 31 {
-		t.Errorf("event evidence refs = %+v", event.RefEvidenceIDs)
-	}
-
-	if len(env.audit.recorded) != 1 || env.audit.recorded[0].Action != "delivery.issue.created" {
-		t.Fatalf("audit = %+v", env.audit.recorded)
-	}
-	if env.audit.recorded[0].Metadata["source"] != domain.SourceAI {
-		t.Errorf("audit metadata = %+v", env.audit.recorded[0].Metadata)
+	if len(reader.calls) != 1 || reader.calls[0] != 42 {
+		t.Fatalf("LatestByIssue calls = %v, want [42]", reader.calls)
 	}
 }
 
-func TestApplyDraftsDedupesOpenIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	existing := env.seedOpenIssue(500, issueTestDraftKey("defect"))
-	for _, target := range []struct {
-		kind string
-		id   int64
-	}{
-		{domain.RefKindCaseRun, 777},
-		{domain.RefKindCaseNode, 9001},
-		{domain.RefKindEvidence, 31},
-	} {
-		env.allow(target.kind, target.id, issueTestVersionID)
-	}
-	draft := issueTestValidAIDraft()
-	draft.Actual = "服务端返回 500"
+func TestIssueServiceGetWithoutTriageReader(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen}
 
-	issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
+	detail, err := fixture.svc.Get(context.Background(), 7, 42)
 	if err != nil {
-		t.Fatalf("ApplyDrafts = %v", err)
+		t.Fatalf("Get() error = %v", err)
 	}
-	if len(issues) != 1 || issues[0].ID != existing.ID {
-		t.Fatalf("issues = %+v, want the existing issue %d", issues, existing.ID)
-	}
-	merged := issues[0]
-	if merged.Status != domain.StatusOpen {
-		t.Errorf("status = %q, want open", merged.Status)
-	}
-	if merged.RecurrenceCount != 1 {
-		t.Errorf("recurrence_count = %d, want 1", merged.RecurrenceCount)
-	}
-	if merged.Revision != 4 {
-		t.Errorf("revision = %d, want 4", merged.Revision)
-	}
-	if merged.Confidence != domain.ConfidenceHigh {
-		t.Errorf("confidence = %q, want high (never downgraded)", merged.Confidence)
-	}
-	if merged.Actual != "服务端返回 500" {
-		t.Errorf("actual = %q, want the newest actual", merged.Actual)
-	}
-	if merged.UpdatedBy != issueTestActor {
-		t.Errorf("updated_by = %d", merged.UpdatedBy)
-	}
-	if len(env.store.refs[existing.ID]) != 4 {
-		t.Errorf("refs = %+v, want the old ref plus the new occurrence refs", env.store.refs[existing.ID])
-	}
-	if env.store.creates != 0 || env.store.updates != 1 {
-		t.Errorf("store calls = creates %d updates %d, want 0/1", env.store.creates, env.store.updates)
-	}
-	if len(env.events.published) != 1 || env.events.published[0].Type != "issue.updated" {
-		t.Fatalf("events = %+v, want one issue.updated", env.events.published)
-	}
-	event := env.events.published[0]
-	if event.Detail["issueId"] != fmt.Sprint(existing.ID) {
-		t.Errorf("event issueId = %v", event.Detail["issueId"])
-	}
-	if event.Detail["revision"] != 4 || event.Detail["recurrenceCount"] != 1 {
-		t.Errorf("event detail = %+v", event.Detail)
-	}
-	if len(env.audit.recorded) != 0 {
-		t.Errorf("recurrence must not record delivery.issue.created: %+v", env.audit.recorded)
+	if detail.Triage != nil {
+		t.Fatalf("detail triage = %+v, want nil without a reader", detail.Triage)
 	}
 }
 
-func TestApplyDraftsRecurrenceKeepsTerminalStatus(t *testing.T) {
-	for _, terminal := range []string{domain.StatusConfirmed, domain.StatusDismissed} {
-		t.Run(terminal, func(t *testing.T) {
-			env := newIssueTestEnv(t)
-			existing := env.seedOpenIssue(500, issueTestDraftKey("defect"))
-			existing.Status = terminal
-			if terminal == domain.StatusDismissed {
-				existing.DismissedReason = "历史驳回"
-			}
-			env.store.issues[existing.ID] = existing
-			env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-			env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-			env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
+func TestIssueServiceGetErrors(t *testing.T) {
+	t.Run("not found", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		_, err := fixture.svc.Get(context.Background(), 7, 42)
+		requireIssueError(t, err, ErrNotFound)
+	})
 
-			issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-				[]domain.IssueDraft{issueTestValidAIDraft()})
-			if err != nil {
-				t.Fatalf("ApplyDrafts = %v", err)
-			}
-			if len(issues) != 1 || issues[0].ID != existing.ID {
-				t.Fatalf("issues = %+v", issues)
-			}
-			if issues[0].Status != terminal {
-				t.Errorf("status = %q, want the terminal status %q", issues[0].Status, terminal)
-			}
-			if issues[0].RecurrenceCount != 1 {
-				t.Errorf("recurrence_count = %d, want 1", issues[0].RecurrenceCount)
-			}
-			if len(env.events.published) != 1 || env.events.published[0].Type != "issue.updated" {
-				t.Fatalf("events = %+v, want issue.updated", env.events.published)
-			}
-		})
-	}
+	t.Run("invalid ids", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			versionID int64
+			issueID   int64
+		}{
+			{name: "version", versionID: 0, issueID: 42},
+			{name: "issue", versionID: 7, issueID: 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				fixture := newIssueServiceFixture()
+				_, err := fixture.svc.Get(context.Background(), tc.versionID, tc.issueID)
+				requireIssueError(t, err, ErrInvalidArgument)
+			})
+		}
+	})
+
+	t.Run("triage read error", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen}
+		fixture.svc.WithTriageReader(&fakeIssueTriageReader{err: errIssueTestBoom})
+		_, err := fixture.svc.Get(context.Background(), 7, 42)
+		requireIssueError(t, err, errIssueTestBoom)
+	})
 }
 
-func TestApplyDraftsRejectsCrossVersionRef(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseNode, 9001, 999) // belongs to another version
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
+func TestIssueServiceConfirm(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen, ExpectedRevision: 1}
+	fixture.repo.updateResult = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusConfirmed, ExpectedRevision: 2}
+	expected := issueServiceTestInt32(1)
 
-	_, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{issueTestValidAIDraft()})
-	if err == nil {
-		t.Fatal("ApplyDrafts accepted a cross-version reference")
-	}
-	var domainErr *domain.Error
-	if !errors.As(err, &domainErr) {
-		t.Fatalf("error type = %T (%v)", err, err)
-	}
-	if domainErr.Kind != domain.KindInvalid || domainErr.Reason != domain.ReasonIssueRefInvalid {
-		t.Fatalf("error = %+v, want issue_ref_invalid", domainErr)
-	}
-	if env.store.creates != 0 || len(env.store.issues) != 0 || len(env.events.published) != 0 {
-		t.Fatalf("rejected draft wrote state: issues=%d creates=%d events=%d",
-			len(env.store.issues), env.store.creates, len(env.events.published))
-	}
-}
-
-func TestApplyDraftsRollsBackOnStoreFailure(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-	env.store.failAt = 2
-
-	first := issueTestValidAIDraft()
-	second := issueTestValidAIDraft()
-	second.DedupeKey = issueTestDraftKeyN(21)
-	second.Title = "第二个问题"
-	_, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{first, second})
-	if err == nil {
-		t.Fatal("ApplyDrafts swallowed a store failure")
-	}
-	if len(env.store.issues) != 0 {
-		t.Errorf("rollback left issues behind: %+v", env.store.issues)
-	}
-	if len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
-		t.Errorf("failed transaction published events/audit: %+v %+v", env.events.published, env.audit.recorded)
-	}
-}
-
-func TestApplyDraftsMergesIntoExplicitIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	existing := env.seedOpenIssue(500, issueTestDraftKeyN(7))
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-
-	draft := issueTestValidAIDraft()
-	draft.MergeIntoIssueID = issueTestPtr(existing.ID)
-	issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
+	updated, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, "  needs fix  ", expected)
 	if err != nil {
-		t.Fatalf("ApplyDrafts = %v", err)
+		t.Fatalf("Confirm() error = %v", err)
 	}
-	if len(issues) != 1 || issues[0].ID != existing.ID {
-		t.Fatalf("issues = %+v, want the explicitly merged issue %d", issues, existing.ID)
+	if updated.Status != delivery.IssueStatusConfirmed {
+		t.Fatalf("Confirm() status = %q, want confirmed", updated.Status)
 	}
-	if issues[0].RecurrenceCount != 1 || issues[0].Revision != 4 {
-		t.Errorf("merged issue = recurrence %d revision %d, want 1/4",
-			issues[0].RecurrenceCount, issues[0].Revision)
+	if len(fixture.repo.updateCalls) != 1 {
+		t.Fatalf("UpdateStatus calls = %d, want 1", len(fixture.repo.updateCalls))
 	}
-	if len(env.store.issues) != 1 || env.store.creates != 0 {
-		t.Errorf("explicit merge created a second issue: %+v", env.store.issues)
+	update := fixture.repo.updateCalls[0]
+	if update.VersionID != 7 || update.IssueID != 42 || update.To != delivery.IssueStatusConfirmed {
+		t.Errorf("UpdateStatus = %+v", update)
+	}
+	if update.Reason != "needs fix" {
+		t.Errorf("UpdateStatus reason = %q, want trimmed reason", update.Reason)
+	}
+	if update.ActorID != 99 || update.ActorKind != "user" {
+		t.Errorf("UpdateStatus actor = %d/%q, want 99/user", update.ActorID, update.ActorKind)
+	}
+	if update.ExpectedRevision == nil || *update.ExpectedRevision != 1 {
+		t.Errorf("UpdateStatus expected revision = %v, want 1", update.ExpectedRevision)
 	}
 
-	t.Run("foreign merge target", func(t *testing.T) {
-		env := newIssueTestEnv(t)
-		env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-		env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-		env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-		draft := issueTestValidAIDraft()
-		draft.MergeIntoIssueID = issueTestPtr(4242) // no such issue in this version
-		_, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-			[]domain.IssueDraft{draft})
-		if err == nil {
-			t.Fatal("ApplyDrafts merged into a missing issue")
-		}
-		var domainErr *domain.Error
-		if !errors.As(err, &domainErr) || domainErr.Reason != domain.ReasonIssueRefInvalid {
-			t.Fatalf("error = %v, want issue_ref_invalid", err)
-		}
-		if len(env.store.issues) != 0 || len(env.events.published) != 0 {
-			t.Fatalf("failed merge wrote state")
+	event := fixture.requireSingleEvent(t, "issue.updated")
+	if event.payload["issue_id"] != "42" || event.payload["from_status"] != "open" ||
+		event.payload["to_status"] != "confirmed" || event.payload["reason"] != "needs fix" {
+		t.Errorf("issue.updated payload = %v", event.payload)
+	}
+	audit := fixture.requireSingleAudit(t, "delivery.issue.confirmed")
+	if audit.actorID != 99 || audit.targetKind != "issue" || audit.targetID != "42" {
+		t.Errorf("audit = %+v", audit)
+	}
+}
+
+func TestIssueServiceConfirmRejectsInvalidTransition(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusConfirmed}
+
+	_, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, "", nil)
+	requireIssueConflictReason(t, err, "issue_not_open")
+	if len(fixture.repo.updateCalls) != 0 {
+		t.Fatalf("UpdateStatus calls = %d, want none", len(fixture.repo.updateCalls))
+	}
+	if len(fixture.events.records) != 0 {
+		t.Fatalf("events = %d, want none", len(fixture.events.records))
+	}
+}
+
+func TestIssueServiceConfirmArgumentValidation(t *testing.T) {
+	t.Run("stale expected revision", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		expected := issueServiceTestInt32(0)
+		_, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, "", expected)
+		requireIssueError(t, err, ErrInvalidArgument)
+	})
+
+	t.Run("reason too long", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		_, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, strings.Repeat("x", 2001), nil)
+		requireIssueError(t, err, ErrInvalidArgument)
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		_, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, "", nil)
+		requireIssueError(t, err, ErrNotFound)
+	})
+
+	t.Run("repository state conflict", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen}
+		fixture.repo.updateErr = delivery.ErrStateConflict
+		_, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, "", nil)
+		requireIssueError(t, err, delivery.ErrStateConflict)
+		if len(fixture.events.records) != 0 {
+			t.Fatalf("events = %d, want none on a failed write", len(fixture.events.records))
 		}
 	})
 }
 
-func TestApplyDraftsReplayIsIdempotent(t *testing.T) {
-	env := newIssueTestEnv(t)
-	draft := issueTestValidAIDraft()
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
+func TestIssueServiceDismiss(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.updateResult = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusDismissed}
 
-	first, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
+	updated, err := fixture.svc.Dismiss(context.Background(), 7, 42, 99, "not a product bug", nil)
 	if err != nil {
-		t.Fatalf("first ApplyDrafts = %v", err)
+		t.Fatalf("Dismiss() error = %v", err)
 	}
-	env.events.published = nil
-
-	second, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
-	if err != nil {
-		t.Fatalf("replayed ApplyDrafts = %v", err)
+	if updated.Status != delivery.IssueStatusDismissed {
+		t.Fatalf("Dismiss() status = %q, want dismissed", updated.Status)
 	}
-	if len(second) != 1 || second[0].ID != first[0].ID {
-		t.Fatalf("replay returned %+v, want the same issue", second)
+	if len(fixture.repo.updateCalls) != 1 || fixture.repo.updateCalls[0].To != delivery.IssueStatusDismissed {
+		t.Fatalf("UpdateStatus = %+v, want dismissed", fixture.repo.updateCalls)
 	}
-	if second[0].RecurrenceCount != 0 {
-		t.Errorf("replay counted a recurrence: %d", second[0].RecurrenceCount)
+	event := fixture.requireSingleEvent(t, "issue.updated")
+	if event.payload["to_status"] != "dismissed" || event.payload["reason"] != "not a product bug" {
+		t.Errorf("issue.updated payload = %v", event.payload)
 	}
-	if second[0].Revision != 1 {
-		t.Errorf("replay bumped the revision: %d", second[0].Revision)
-	}
-	if env.store.updates != 0 || env.store.creates != 1 {
-		t.Errorf("replay store calls = updates %d creates %d, want 0/1", env.store.updates, env.store.creates)
-	}
-	if len(env.events.published) != 0 {
-		t.Errorf("replay published events: %+v", env.events.published)
-	}
+	fixture.requireSingleAudit(t, "delivery.issue.dismissed")
 }
 
-// TestApplyDraftsNewRefIsRecurrence pins the Lead replay ruling: a draft whose
-// refs are all already linked is a replay (no bump, no event), while a genuine
-// recurrence carrying at least one new ref increments recurrence_count and emits
-// issue.updated.
-func TestApplyDraftsNewRefIsRecurrence(t *testing.T) {
-	env := newIssueTestEnv(t)
-	draft := issueTestValidAIDraft()
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
+func TestIssueServiceDismissRejectsNonOpenIssue(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusDismissed}
 
-	first, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
-	if err != nil {
-		t.Fatalf("first ApplyDrafts = %v", err)
-	}
-	env.events.published = nil
-
-	draft.EvidenceIDs = append(draft.EvidenceIDs, 32)
-	env.allow(domain.RefKindEvidence, 32, issueTestVersionID)
-	second, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
-	if err != nil {
-		t.Fatalf("recurring ApplyDrafts = %v", err)
-	}
-	if len(second) != 1 || second[0].ID != first[0].ID {
-		t.Fatalf("recurrence returned %+v, want the same issue", second)
-	}
-	if second[0].RecurrenceCount != 1 {
-		t.Errorf("recurrence_count = %d, want 1", second[0].RecurrenceCount)
-	}
-	if second[0].Revision != 2 {
-		t.Errorf("revision = %d, want 2", second[0].Revision)
-	}
-	if len(env.events.published) != 1 || env.events.published[0].Type != "issue.updated" {
-		t.Fatalf("events = %+v, want one issue.updated", env.events.published)
-	}
-	if got := len(env.events.published[0].RefEvidenceIDs); got != 2 {
-		t.Errorf("event evidence refs = %v, want both occurrences", env.events.published[0].RefEvidenceIDs)
-	}
+	_, err := fixture.svc.Dismiss(context.Background(), 7, 42, 99, "", nil)
+	requireIssueConflictReason(t, err, "issue_not_open")
 }
 
-// TestApplyDraftsRetriesConcurrentDedupeConflict pins spec §6.9: when Create
-// loses the unique-key race to a concurrent transaction that has since committed,
-// the service re-reads in one fresh transaction and merges instead of returning a
-// 409. The next-visible issue already carries an earlier occurrence ref.
-func TestApplyDraftsRetriesConcurrentDedupeConflict(t *testing.T) {
-	store := &issueRaceStore{issueFakeStore: newIssueFakeStore()}
-	refs := newIssueFakeRefValidator()
-	refs.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	refs.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	refs.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-	events := &issueFakeEvents{}
-	audit := &issueFakeAudit{}
-	draft := issueTestValidAIDraft()
-	store.raceDedupeKey = draft.DedupeKey
-	svc := NewIssueService(IssueServiceDeps{
-		Store:    store,
-		Versions: newIssueFakeVersionReader(),
-		Refs:     refs,
-		IDs:      &issueTestIDs{next: 1000},
-		Clock:    &issueTestClock{now: issueTestNow},
-		Events:   events,
-		Audit:    audit,
-	})
+func TestIssueServiceReopen(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusConfirmed, ReopenCount: 0}
+	fixture.repo.updateResult = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen, ReopenCount: 1}
 
-	issues, err := svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
+	updated, err := fixture.svc.Reopen(context.Background(), 7, 42, 99, "  regression seen  ", nil)
 	if err != nil {
-		t.Fatalf("ApplyDrafts = %v", err)
+		t.Fatalf("Reopen() error = %v", err)
 	}
-	if !store.raced {
-		t.Fatal("the fake store never reported the concurrent dedupe conflict")
+	if updated.Status != delivery.IssueStatusOpen || updated.ReopenCount != 1 {
+		t.Fatalf("Reopen() = %+v, want open with reopen_count 1", updated)
 	}
-	if len(issues) != 1 || issues[0].ID != 9001 {
-		t.Fatalf("issues = %+v, want the concurrently created issue 9001", issues)
+	if len(fixture.repo.updateCalls) != 1 || fixture.repo.updateCalls[0].To != delivery.IssueStatusOpen {
+		t.Fatalf("UpdateStatus = %+v, want open", fixture.repo.updateCalls)
 	}
-	merged := issues[0]
-	if merged.RecurrenceCount != 1 || merged.Revision != 4 {
-		t.Errorf("merged = recurrence %d revision %d, want 1/4",
-			merged.RecurrenceCount, merged.Revision)
+	if reason := fixture.repo.updateCalls[0].Reason; reason != "regression seen" {
+		t.Errorf("UpdateStatus reason = %q, want trimmed reason", reason)
 	}
-	if store.inTx != 2 {
-		t.Errorf("transactions = %d, want the failed attempt plus one retry", store.inTx)
+	event := fixture.requireSingleEvent(t, "issue.reopened")
+	if event.payload["issue_id"] != "42" || event.payload["reason"] != "regression seen" {
+		t.Errorf("issue.reopened payload = %v", event.payload)
 	}
-	refsAfter := domain.NormalizeIssueRefs(store.refs[merged.ID])
-	if len(refsAfter) != 4 {
-		t.Errorf("refs = %+v, want the earlier ref plus the three occurrence refs", refsAfter)
+	if event.payload["reopen_count"] != 1 {
+		t.Errorf("issue.reopened reopen_count = %v, want 1", event.payload["reopen_count"])
 	}
-	if len(events.published) != 1 || events.published[0].Type != "issue.updated" {
-		t.Fatalf("events = %+v, want exactly one issue.updated", events.published)
-	}
-	if events.published[0].Detail["recurrenceCount"] != 1 {
-		t.Errorf("event detail = %+v", events.published[0].Detail)
-	}
-	if len(audit.recorded) != 0 {
-		t.Errorf("recurrence recorded audit entries: %+v", audit.recorded)
-	}
+	fixture.requireSingleAudit(t, "delivery.issue.reopened")
 }
 
-// TestApplyDraftsCopiesRerunSuggestion pins the additive IssueDraft field: the
-// failure-analysis rerun suggestion is persisted on the materialized issue.
-func TestApplyDraftsCopiesRerunSuggestion(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-	draft := issueTestValidAIDraft()
-	draft.RerunSuggestion = "重新执行并用 network 面板确认 500 的来源"
-
-	issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
-		[]domain.IssueDraft{draft})
-	if err != nil {
-		t.Fatalf("ApplyDrafts = %v", err)
-	}
-	if len(issues) != 1 || issues[0].RerunSuggestion != draft.RerunSuggestion {
-		t.Fatalf("rerun suggestion = %q, want %q", issues[0].RerunSuggestion, draft.RerunSuggestion)
-	}
-	if got := env.store.issues[issues[0].ID].RerunSuggestion; got != draft.RerunSuggestion {
-		t.Errorf("stored rerun suggestion = %q", got)
-	}
-}
-
-func TestApplyDraftsEmptyIsNoOp(t *testing.T) {
-	env := newIssueTestEnv(t)
-	issues, err := env.svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor, nil)
-	if err != nil {
-		t.Fatalf("ApplyDrafts(nil) = %v", err)
-	}
-	if len(issues) != 0 || env.store.inTx != 0 || len(env.events.published) != 0 {
-		t.Fatalf("empty draft list wrote state: issues=%d tx=%d events=%d",
-			len(issues), env.store.inTx, len(env.events.published))
-	}
-}
-
-// --- Confirm / Dismiss ------------------------------------------------------
-
-func TestConfirmIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.seedOpenIssue(500, issueTestDraftKey("defect"))
-
-	confirmed, err := env.svc.Confirm(context.Background(), issueTestVersionID, 500, issueTestActor, 3, "确认是缺陷")
-	if err != nil {
-		t.Fatalf("Confirm = %v", err)
-	}
-	if confirmed.Status != domain.StatusConfirmed {
-		t.Errorf("status = %q, want confirmed", confirmed.Status)
-	}
-	if confirmed.Revision != 4 {
-		t.Errorf("revision = %d, want 4", confirmed.Revision)
-	}
-	if confirmed.ConfirmedBy == nil || *confirmed.ConfirmedBy != issueTestActor {
-		t.Errorf("confirmed_by = %v", confirmed.ConfirmedBy)
-	}
-	if confirmed.ConfirmedAt == nil || !confirmed.ConfirmedAt.Equal(issueTestNow) {
-		t.Errorf("confirmed_at = %v", confirmed.ConfirmedAt)
-	}
-	if confirmed.UpdatedBy != issueTestActor || !confirmed.UpdatedAt.Equal(issueTestNow) {
-		t.Errorf("updated = (%d, %s)", confirmed.UpdatedBy, confirmed.UpdatedAt)
-	}
-	if env.store.updates != 1 {
-		t.Errorf("updates = %d, want 1 CAS write", env.store.updates)
-	}
-	if len(env.events.published) != 1 || env.events.published[0].Type != "issue.updated" {
-		t.Fatalf("events = %+v", env.events.published)
-	}
-	if env.events.published[0].Detail["status"] != domain.StatusConfirmed ||
-		env.events.published[0].Detail["revision"] != 4 {
-		t.Errorf("event detail = %+v", env.events.published[0].Detail)
-	}
-	if len(env.events.published[0].RefCaseIDs) != 1 || env.events.published[0].RefCaseIDs[0] != 8000 {
-		t.Errorf("event case refs = %+v, want the issue's case_node ref", env.events.published[0].RefCaseIDs)
-	}
-	if len(env.audit.recorded) != 1 || env.audit.recorded[0].Action != "delivery.issue.confirmed" {
-		t.Fatalf("audit = %+v", env.audit.recorded)
-	}
-	if env.audit.recorded[0].TargetID != "500" || env.audit.recorded[0].ActorID != issueTestActor {
-		t.Errorf("audit = %+v", env.audit.recorded[0])
-	}
-	// §11.2 allows a reason only for dismissals; a confirmation comment is not
-	// an audit field and must not be stored as the free-text reason.
-	if _, recorded := env.audit.recorded[0].Metadata["reason"]; recorded {
-		t.Errorf("confirmation comment was recorded as the audit reason: %+v", env.audit.recorded[0].Metadata)
-	}
-	if fmt.Sprint(env.audit.recorded[0].Metadata) != "map[]" {
-		t.Errorf("confirmation audit metadata = %+v, want no fields", env.audit.recorded[0].Metadata)
-	}
-}
-
-func TestConfirmIssueRejectsInvalidState(t *testing.T) {
-	terminal := []string{domain.StatusConfirmed, domain.StatusDismissed}
-	for _, status := range terminal {
-		t.Run(status, func(t *testing.T) {
-			env := newIssueTestEnv(t)
-			issue := env.seedOpenIssue(500, issueTestDraftKey("defect"))
-			issue.Status = status
-			env.seed(issue)
-			_, err := env.svc.Confirm(context.Background(), issueTestVersionID, 500, issueTestActor, 3, "")
-			issueTestStateConflict(t, err)
-			if env.store.updates != 0 || len(env.events.published) != 0 {
-				t.Errorf("terminal confirm wrote state")
-			}
-		})
-	}
-	t.Run("revision mismatch", func(t *testing.T) {
-		env := newIssueTestEnv(t)
-		env.seedOpenIssue(500, issueTestDraftKey("defect"))
-		_, err := env.svc.Confirm(context.Background(), issueTestVersionID, 500, issueTestActor, 2, "")
-		issueTestStateConflict(t, err)
-		if env.store.updates != 0 || len(env.events.published) != 0 {
-			t.Errorf("stale confirm wrote state")
-		}
-	})
-	t.Run("missing issue", func(t *testing.T) {
-		env := newIssueTestEnv(t)
-		_, err := env.svc.Confirm(context.Background(), issueTestVersionID, 404, issueTestActor, 1, "")
-		issueTestNotFound(t, err)
-	})
-}
-
-func TestDismissIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.seedOpenIssue(500, issueTestDraftKey("defect"))
-
-	dismissed, err := env.svc.Dismiss(context.Background(), issueTestVersionID, 500, issueTestActor, 3, "  环境问题，非应用缺陷  ")
-	if err != nil {
-		t.Fatalf("Dismiss = %v", err)
-	}
-	if dismissed.Status != domain.StatusDismissed {
-		t.Errorf("status = %q, want dismissed", dismissed.Status)
-	}
-	if dismissed.DismissedReason != "环境问题，非应用缺陷" {
-		t.Errorf("dismissed_reason = %q", dismissed.DismissedReason)
-	}
-	if dismissed.Revision != 4 {
-		t.Errorf("revision = %d, want 4", dismissed.Revision)
-	}
-	if dismissed.DismissedBy == nil || *dismissed.DismissedBy != issueTestActor {
-		t.Errorf("dismissed_by = %v", dismissed.DismissedBy)
-	}
-	if dismissed.DismissedAt == nil || !dismissed.DismissedAt.Equal(issueTestNow) {
-		t.Errorf("dismissed_at = %v", dismissed.DismissedAt)
-	}
-	if len(env.events.published) != 1 || env.events.published[0].Detail["status"] != domain.StatusDismissed {
-		t.Fatalf("events = %+v", env.events.published)
-	}
-	if len(env.events.published[0].RefCaseIDs) != 1 || env.events.published[0].RefCaseIDs[0] != 8000 {
-		t.Errorf("event case refs = %+v, want the issue's case_node ref", env.events.published[0].RefCaseIDs)
-	}
-	if len(env.audit.recorded) != 1 || env.audit.recorded[0].Action != "delivery.issue.dismissed" {
-		t.Fatalf("audit = %+v", env.audit.recorded)
-	}
-	if env.audit.recorded[0].Metadata["reason"] != "环境问题，非应用缺陷" {
-		t.Errorf("audit metadata = %+v", env.audit.recorded[0].Metadata)
-	}
-}
-
-func TestDismissIssueRequiresReason(t *testing.T) {
+func TestIssueServiceReopenRequiresReason(t *testing.T) {
+	fixture := newIssueServiceFixture()
 	for _, reason := range []string{"", "   "} {
-		env := newIssueTestEnv(t)
-		env.seedOpenIssue(500, issueTestDraftKey("defect"))
-		_, err := env.svc.Dismiss(context.Background(), issueTestVersionID, 500, issueTestActor, 3, reason)
-		if err == nil {
-			t.Fatalf("Dismiss(%q) succeeded without a reason", reason)
-		}
-		var domainErr *domain.Error
-		if !errors.As(err, &domainErr) {
-			t.Fatalf("error type = %T (%v)", err, err)
-		}
-		if domainErr.Kind != domain.KindInvalid || domainErr.Reason != domain.ReasonIssueDismissReasonRequired {
-			t.Fatalf("error = %+v, want issue_dismiss_reason_required", domainErr)
-		}
-		if env.store.updates != 0 || len(env.events.published) != 0 {
-			t.Errorf("reasonless dismiss wrote state")
-		}
+		_, err := fixture.svc.Reopen(context.Background(), 7, 42, 99, reason, nil)
+		requireIssueError(t, err, ErrInvalidArgument)
+	}
+	if len(fixture.repo.getCalls) != 0 {
+		t.Fatalf("Get calls = %d, want none for an invalid reason", len(fixture.repo.getCalls))
+	}
+	if len(fixture.repo.updateCalls) != 0 {
+		t.Fatalf("UpdateStatus calls = %d, want none", len(fixture.repo.updateCalls))
 	}
 }
 
-func TestDismissIssueRejectsRevisionMismatch(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.seedOpenIssue(500, issueTestDraftKey("defect"))
-	_, err := env.svc.Dismiss(context.Background(), issueTestVersionID, 500, issueTestActor, 9, "重复")
-	issueTestStateConflict(t, err)
+func TestIssueServiceReopenRejectsNonReopenableIssue(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen}
+
+	_, err := fixture.svc.Reopen(context.Background(), 7, 42, 99, "still broken", nil)
+	requireIssueConflictReason(t, err, "issue_not_reopenable")
+	if len(fixture.repo.updateCalls) != 0 {
+		t.Fatalf("UpdateStatus calls = %d, want none", len(fixture.repo.updateCalls))
+	}
 }
 
-// --- Get / List / refs ------------------------------------------------------
+func TestIssueServiceMerge(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[10] = delivery.Issue{ID: 10, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.getIssues[20] = delivery.Issue{ID: 20, VersionID: 7, Status: delivery.IssueStatusConfirmed}
+	fixture.repo.mergeResult = delivery.Issue{
+		ID:           10,
+		VersionID:    7,
+		Status:       delivery.IssueStatusMerged,
+		MergedIntoID: issueServiceTestInt64(20),
+	}
+	expected := issueServiceTestInt32(1)
 
-func TestGetIssue(t *testing.T) {
-	env := newIssueTestEnv(t)
-	seeded := env.seedOpenIssue(500, issueTestDraftKey("defect"))
-
-	issue, err := env.svc.Get(context.Background(), issueTestVersionID, 500)
+	merged, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "duplicate", expected)
 	if err != nil {
-		t.Fatalf("Get = %v", err)
+		t.Fatalf("Merge() error = %v", err)
 	}
-	if issue.ID != seeded.ID || issue.Status != domain.StatusOpen {
-		t.Errorf("issue = %+v", issue)
+	if merged.Status != delivery.IssueStatusMerged || merged.MergedIntoID == nil || *merged.MergedIntoID != 20 {
+		t.Fatalf("Merge() = %+v, want merged into 20", merged)
 	}
-	if _, err := env.svc.Get(context.Background(), issueTestVersionID, 404); err == nil {
-		t.Fatal("Get(missing) returned no error")
-	} else {
-		issueTestNotFound(t, err)
+	if len(fixture.repo.mergeCalls) != 1 {
+		t.Fatalf("Merge calls = %d, want 1", len(fixture.repo.mergeCalls))
 	}
-	if _, err := env.svc.Get(context.Background(), 2, 500); err == nil {
-		t.Fatal("Get(foreign version) returned no error")
-	} else {
-		issueTestNotFound(t, err)
+	call := fixture.repo.mergeCalls[0]
+	if call.VersionID != 7 || call.SourceID != 10 || call.TargetID != 20 {
+		t.Errorf("Merge call = %+v", call)
 	}
-}
-
-func TestListIssuesFilters(t *testing.T) {
-	env := newIssueTestEnv(t)
-	blockerID := int64(701)
-	env.seed(domain.Issue{
-		ID: 701, VersionID: issueTestVersionID, BatchID: issueTestPtr(601), CaseRunID: issueTestPtr(801),
-		CaseNodeID: &blockerID, Source: domain.SourceAI, Category: domain.CategoryDefect,
-		Severity: domain.SeverityBlocker, Status: domain.StatusOpen, Confidence: domain.ConfidenceHigh,
-		Title: "登录页崩溃", Revision: 1,
-	})
-	env.seed(domain.Issue{
-		ID: 702, VersionID: issueTestVersionID, BatchID: issueTestPtr(601),
-		Source: domain.SourceAI, Category: domain.CategoryDefect, Severity: domain.SeverityMajor,
-		Status: domain.StatusOpen, Confidence: domain.ConfidenceMedium, Title: "登录按钮无响应", Revision: 1,
-	})
-	env.seed(domain.Issue{
-		ID: 703, VersionID: issueTestVersionID, Source: domain.SourceHuman,
-		Category: domain.CategoryOther, Severity: domain.SeverityMinor,
-		Status: domain.StatusConfirmed, Confidence: domain.ConfidenceMedium, Title: "文案问题", Revision: 2,
-	})
-	env.seed(domain.Issue{
-		ID: 704, VersionID: issueTestVersionID, Source: domain.SourceAI, Category: domain.CategoryDefect,
-		Severity: domain.SeverityMajor, Status: domain.StatusDismissed, Confidence: domain.ConfidenceLow,
-		Title: "已驳回问题", Revision: 2,
-	})
-	env.seed(domain.Issue{
-		ID: 705, VersionID: 2, Source: domain.SourceAI, Category: domain.CategoryDefect,
-		Severity: domain.SeverityBlocker, Status: domain.StatusOpen, Confidence: domain.ConfidenceHigh,
-		Title: "其他版本问题", Revision: 1,
-	})
-
-	cases := []struct {
-		name   string
-		filter IssueFilter
-		want   []int64
-	}{
-		{"status", IssueFilter{Status: domain.StatusOpen, Limit: 10}, []int64{701, 702}},
-		{"severity", IssueFilter{Severity: domain.SeverityMajor, Limit: 10}, []int64{704, 702}},
-		{"category", IssueFilter{Category: domain.CategoryOther, Limit: 10}, []int64{703}},
-		{"batch", IssueFilter{BatchID: issueTestPtr(601), Limit: 10}, []int64{701, 702}},
-		{"case run", IssueFilter{CaseRunID: issueTestPtr(801), Limit: 10}, []int64{701}},
-		{"query", IssueFilter{Query: "登录", Limit: 10}, []int64{701, 702}},
+	if call.ActorID != 99 || call.Reason != "duplicate" {
+		t.Errorf("Merge actor/reason = %d/%q", call.ActorID, call.Reason)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			issues, more, err := env.svc.List(context.Background(), issueTestVersionID, tc.filter)
-			if err != nil {
-				t.Fatalf("List = %v", err)
-			}
-			if more {
-				t.Errorf("hasMore = true for %d results", len(issues))
-			}
-			got := make([]int64, len(issues))
-			for i, issue := range issues {
-				got[i] = issue.ID
-			}
-			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
-				t.Fatalf("ids = %v, want %v (severity weight then id desc)", got, tc.want)
-			}
-		})
+	if call.ExpectedRevision == nil || *call.ExpectedRevision != 1 {
+		t.Errorf("Merge expected revision = %v, want 1", call.ExpectedRevision)
+	}
+	event := fixture.requireSingleEvent(t, "issue.merged")
+	if event.payload["issue_id"] != "10" || event.payload["merged_into_id"] != "20" ||
+		event.payload["reason"] != "duplicate" {
+		t.Errorf("issue.merged payload = %v", event.payload)
+	}
+	audit := fixture.requireSingleAudit(t, "delivery.issue.merged")
+	if audit.targetID != "10" || audit.metadata["merged_into_id"] != "20" {
+		t.Errorf("audit = %+v", audit)
 	}
 }
 
-func TestListIssuesPagination(t *testing.T) {
-	env := newIssueTestEnv(t)
-	for id := int64(701); id <= 706; id++ {
-		severity := domain.SeverityMajor
-		if id == 701 || id == 705 {
-			severity = domain.SeverityBlocker
+func TestIssueServiceMergeRejections(t *testing.T) {
+	t.Run("self merge", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 10, 99, "", nil)
+		requireIssueMergeReason(t, err, "merge_target_invalid")
+		if len(fixture.repo.mergeCalls) != 0 {
+			t.Fatalf("Merge calls = %d, want none", len(fixture.repo.mergeCalls))
 		}
-		env.seed(domain.Issue{
-			ID: id, VersionID: issueTestVersionID, Source: domain.SourceAI,
-			Category: domain.CategoryDefect, Severity: severity, Status: domain.StatusOpen,
-			Confidence: domain.ConfidenceHigh, Title: fmt.Sprintf("问题 %d", id), Revision: 1,
-		})
-	}
+	})
 
-	first, more, err := env.svc.List(context.Background(), issueTestVersionID, IssueFilter{Limit: 2})
-	if err != nil {
-		t.Fatalf("List first page = %v", err)
-	}
-	if !more || len(first) != 2 {
-		t.Fatalf("first page = %d issues more=%v, want 2/true", len(first), more)
-	}
-	wantFirst := []int64{705, 701}
-	for i, want := range wantFirst {
-		if first[i].ID != want {
-			t.Fatalf("first page ids = %d %d, want %v", first[0].ID, first[1].ID, wantFirst)
+	t.Run("missing target is a state conflict", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[10] = delivery.Issue{ID: 10, VersionID: 7, Status: delivery.IssueStatusOpen}
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "", nil)
+		requireIssueMergeReason(t, err, "merge_target_invalid")
+		if len(fixture.repo.mergeCalls) != 0 {
+			t.Fatalf("Merge calls = %d, want none", len(fixture.repo.mergeCalls))
 		}
-	}
-
-	second, more, err := env.svc.List(context.Background(), issueTestVersionID,
-		IssueFilter{Limit: 2, Cursor: first[len(first)-1].ID})
-	if err != nil {
-		t.Fatalf("List second page = %v", err)
-	}
-	if !more || len(second) != 2 {
-		t.Fatalf("second page = %d issues more=%v, want 2/true", len(second), more)
-	}
-	if second[0].ID != 706 || second[1].ID != 704 {
-		t.Fatalf("second page ids = %d %d, want [706 704]", second[0].ID, second[1].ID)
-	}
-
-	last, more, err := env.svc.List(context.Background(), issueTestVersionID,
-		IssueFilter{Limit: 2, Cursor: second[len(second)-1].ID})
-	if err != nil {
-		t.Fatalf("List last page = %v", err)
-	}
-	if more || len(last) != 2 || last[0].ID != 703 || last[1].ID != 702 {
-		t.Fatalf("last page = %+v more=%v", last, more)
-	}
-}
-
-func TestListIssuesRejectsInvalidFilter(t *testing.T) {
-	env := newIssueTestEnv(t)
-	cases := []struct {
-		name   string
-		filter IssueFilter
-		field  string
-	}{
-		{"bad status", IssueFilter{Status: "bogus", Limit: 10}, "status"},
-		{"bad severity", IssueFilter{Severity: "urgent", Limit: 10}, "severity"},
-		{"bad category", IssueFilter{Category: "bug", Limit: 10}, "category"},
-		{"long query", IssueFilter{Query: strings.Repeat("x", 101), Limit: 10}, "q"},
-		{"negative cursor", IssueFilter{Cursor: -1, Limit: 10}, "cursor"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := env.svc.List(context.Background(), issueTestVersionID, tc.filter)
-			var domainErr *domain.Error
-			if !errors.As(err, &domainErr) || domainErr.Kind != domain.KindInvalid || domainErr.Field != tc.field {
-				t.Fatalf("error = %v, want invalid field %q", err, tc.field)
-			}
-		})
-	}
-}
-
-func TestListRefs(t *testing.T) {
-	env := newIssueTestEnv(t)
-	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
-	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
-	issue, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor,
-		CreateIssueCommand{
-			Title:      "登录失败",
-			Severity:   domain.SeverityMajor,
-			CaseNodeID: issueTestPtr(9001),
-		})
-	if err != nil {
-		t.Fatalf("CreateHuman = %v", err)
-	}
-	refs, err := env.svc.ListRefs(context.Background(), issueTestVersionID, issue.ID)
-	if err != nil {
-		t.Fatalf("ListRefs = %v", err)
-	}
-	if len(refs) != 1 || refs[0].RefKind != domain.RefKindCaseNode || refs[0].RefID != "9001" {
-		t.Fatalf("refs = %+v", refs)
-	}
-	if _, err := env.svc.ListRefs(context.Background(), issueTestVersionID, 404); err == nil {
-		t.Fatal("ListRefs(missing) returned no error")
-	} else {
-		issueTestNotFound(t, err)
-	}
-}
-
-func TestIssueServiceSatisfiesFrozenInterface(t *testing.T) {
-	var _ IssueService = (*IssueManager)(nil)
-	var _ IssueRefReader = (*IssueManager)(nil)
-}
-
-func TestIssueServiceRequiresStore(t *testing.T) {
-	svc := NewIssueService(IssueServiceDeps{})
-	if _, err := svc.Get(context.Background(), 1, 2); err == nil {
-		t.Fatal("Get without a store returned no error")
-	}
-}
-
-func TestCreateHumanIssueRequiresRefValidator(t *testing.T) {
-	store := newIssueFakeStore()
-	svc := NewIssueService(IssueServiceDeps{
-		Store:    store,
-		Versions: newIssueFakeVersionReader(),
-		IDs:      &issueTestIDs{next: 1000},
-		Clock:    &issueTestClock{now: issueTestNow},
 	})
-	_, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
-		Title:      "登录失败",
-		Severity:   domain.SeverityMajor,
-		CaseNodeID: issueTestPtr(9001),
-	})
-	if err == nil {
-		t.Fatal("CreateHuman accepted an owned ref without a ref validator")
-	}
-	if store.creates != 0 {
-		t.Errorf("ref validation failure still created %d issues", store.creates)
-	}
 
-	// An issue without refs needs no cross-context validation.
-	if _, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
-		Title:    "无引用问题",
-		Severity: domain.SeverityMinor,
-	}); err != nil {
-		t.Fatalf("CreateHuman without refs = %v", err)
+	t.Run("cross-version target", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[10] = delivery.Issue{ID: 10, VersionID: 7, Status: delivery.IssueStatusOpen}
+		fixture.repo.getIssues[20] = delivery.Issue{ID: 20, VersionID: 8, Status: delivery.IssueStatusConfirmed}
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "", nil)
+		requireIssueMergeReason(t, err, "merge_target_invalid")
+	})
+
+	t.Run("merged source is terminal", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[10] = delivery.Issue{ID: 10, VersionID: 7, Status: delivery.IssueStatusMerged}
+		fixture.repo.getIssues[20] = delivery.Issue{ID: 20, VersionID: 7, Status: delivery.IssueStatusOpen}
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "", nil)
+		requireIssueError(t, err, delivery.ErrStateConflict)
+	})
+
+	t.Run("merge cycle", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[10] = delivery.Issue{ID: 10, VersionID: 7, Status: delivery.IssueStatusOpen}
+		fixture.repo.getIssues[20] = delivery.Issue{
+			ID:           20,
+			VersionID:    7,
+			Status:       delivery.IssueStatusConfirmed,
+			MergedIntoID: issueServiceTestInt64(10),
+		}
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "", nil)
+		requireIssueMergeReason(t, err, "merge_cycle")
+		if len(fixture.repo.mergeCalls) != 0 {
+			t.Fatalf("Merge calls = %d, want none", len(fixture.repo.mergeCalls))
+		}
+	})
+
+	t.Run("source not found", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "", nil)
+		requireIssueError(t, err, ErrNotFound)
+	})
+
+	t.Run("repository CAS conflict", func(t *testing.T) {
+		fixture := newIssueServiceFixture()
+		fixture.repo.getIssues[10] = delivery.Issue{ID: 10, VersionID: 7, Status: delivery.IssueStatusOpen}
+		fixture.repo.getIssues[20] = delivery.Issue{ID: 20, VersionID: 7, Status: delivery.IssueStatusOpen}
+		fixture.repo.mergeErr = delivery.ErrStateConflict
+		_, err := fixture.svc.Merge(context.Background(), 7, 10, 20, 99, "", issueServiceTestInt32(9))
+		requireIssueError(t, err, delivery.ErrStateConflict)
+		if len(fixture.events.records) != 0 || len(fixture.audit.records) != 0 {
+			t.Fatalf("side effects = %d events/%d audits, want none on a failed write",
+				len(fixture.events.records), len(fixture.audit.records))
+		}
+	})
+
+	t.Run("invalid ids", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			versionID int64
+			sourceID  int64
+			targetID  int64
+			expected  *int32
+		}{
+			{name: "version", versionID: 0, sourceID: 10, targetID: 20},
+			{name: "source", versionID: 7, sourceID: 0, targetID: 20},
+			{name: "target", versionID: 7, sourceID: 10, targetID: 0},
+			{name: "expected revision", versionID: 7, sourceID: 10, targetID: 20, expected: issueServiceTestInt32(0)},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				fixture := newIssueServiceFixture()
+				_, err := fixture.svc.Merge(context.Background(), tc.versionID, tc.sourceID, tc.targetID, 99, "", tc.expected)
+				requireIssueError(t, err, ErrInvalidArgument)
+				if len(fixture.repo.mergeCalls) != 0 {
+					t.Fatalf("Merge calls = %d, want none", len(fixture.repo.mergeCalls))
+				}
+			})
+		}
+	})
+}
+
+func TestIssueServiceProjectionsAreBestEffort(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.updateResult = delivery.Issue{ID: 42, VersionID: 7, Status: delivery.IssueStatusConfirmed}
+	fixture.events.err = errIssueTestBoom
+	fixture.audit.err = errIssueTestBoom
+
+	updated, err := fixture.svc.Confirm(context.Background(), 7, 42, 99, "", nil)
+	if err != nil {
+		t.Fatalf("Confirm() error = %v, projection failures must not roll back the write", err)
+	}
+	if updated.Status != delivery.IssueStatusConfirmed {
+		t.Fatalf("Confirm() status = %q, want confirmed", updated.Status)
+	}
+	if len(fixture.events.records) != 1 || len(fixture.audit.records) != 1 {
+		t.Fatalf("projection attempts = %d events/%d audits, want 1/1",
+			len(fixture.events.records), len(fixture.audit.records))
 	}
 }
 
-func TestIssueServiceWithoutIDGeneratorFailsWrites(t *testing.T) {
-	store := newIssueFakeStore()
-	refs := newIssueFakeRefValidator()
-	svc := NewIssueService(IssueServiceDeps{
-		Store:    store,
-		Versions: newIssueFakeVersionReader(),
-		Refs:     refs,
-		Clock:    &issueTestClock{now: issueTestNow},
-	})
-	_, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
-		Title:    "缺少 ID 生成器",
-		Severity: domain.SeverityMajor,
-	})
-	if err == nil {
-		t.Fatal("CreateHuman succeeded without an injected id generator")
-	}
-	if store.creates != 0 || len(store.issues) != 0 {
-		t.Fatalf("write without ids left state behind: %+v", store.issues)
+/* ------------------------------ recurrence ------------------------------ */
+
+// recurrenceIssue returns one issue fixture of the recurrence tests.
+func recurrenceIssue(id int64, status delivery.IssueStatus, mergedInto *int64, recurrenceCount int) delivery.Issue {
+	return delivery.Issue{
+		ID:              id,
+		VersionID:       7,
+		Status:          status,
+		Category:        "api",
+		Severity:        "major",
+		DedupeKey:       "0123456789abcdef0123456789abcdef",
+		MergedIntoID:    mergedInto,
+		RecurrenceCount: recurrenceCount,
 	}
 }
 
-// TestIssueEventRefsCapsTotal pins spec §8.2: the case and evidence refs of one
-// event share a single total cap of 20, not a cap per kind.
-func TestIssueEventRefsCapsTotal(t *testing.T) {
-	refs := make([]domain.IssueRef, 0, 30)
-	for id := int64(1); id <= 15; id++ {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindCaseNode, RefID: strconv.FormatInt(id, 10)})
-	}
-	for id := int64(1); id <= 10; id++ {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindEvidence, RefID: strconv.FormatInt(id, 10)})
-	}
-	caseIDs, evidenceIDs := issueEventRefs(domain.NormalizeIssueRefs(refs))
-	if len(caseIDs)+len(evidenceIDs) != issueMaxEventRefs {
-		t.Fatalf("event refs = %d case + %d evidence, want a total of %d",
-			len(caseIDs), len(evidenceIDs), issueMaxEventRefs)
-	}
-	if len(caseIDs) != 15 || len(evidenceIDs) != 5 {
-		t.Errorf("refs = %d case + %d evidence, want 15/5 (case_node sorts first)",
-			len(caseIDs), len(evidenceIDs))
-	}
-}
-
-// issueTestStateConflict asserts err is the 409 issue_state_conflict.
-func issueTestStateConflict(t *testing.T, err error) {
+// recurrenceMergeFixture seeds a merged source A (dedupe key of the test
+// snapshot) and its merge target(s), then returns the fixture.
+func recurrenceMergeFixture(t *testing.T,
+	source delivery.Issue,
+	targets ...delivery.Issue) *issueServiceFixture {
 	t.Helper()
-	var domainErr *domain.Error
-	if !errors.As(err, &domainErr) {
-		t.Fatalf("error type = %T (%v)", err, err)
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[52] = issueServiceTestSnapshot(52)
+	fixture.repo.createCreated = false
+	fixture.repo.createResult = source
+	fixture.repo.getIssues[source.ID] = source
+	for _, target := range targets {
+		fixture.repo.getIssues[target.ID] = target
 	}
-	if domainErr.Kind != domain.KindStateConflict || domainErr.Reason != domain.ReasonIssueStateConflict {
-		t.Fatalf("error = %+v, want issue_state_conflict", domainErr)
+	return fixture
+}
+
+// recurrenceEventPayloadInt reads one integer payload field.
+func recurrenceEventPayloadInt(t *testing.T, payload map[string]any, key string) int {
+	t.Helper()
+	value, ok := payload[key].(int)
+	if !ok {
+		t.Fatalf("payload[%q] = %#v, want an int", key, payload[key])
+	}
+	return value
+}
+
+func TestIssueServiceRecurrenceRedirectsToMergeTarget(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	target := recurrenceIssue(903, delivery.IssueStatusConfirmed, nil, 0)
+	target.DedupeKey = strings.Repeat("c", 32)
+	fixture := recurrenceMergeFixture(t, source, target)
+	recurredAt := issueServiceTestNow.Add(time.Minute)
+	fixture.repo.applyResult = delivery.Issue{
+		ID: 903, VersionID: 7, Status: delivery.IssueStatusConfirmed,
+		RecurrenceCount: 1, LastRecurredAt: &recurredAt,
+	}
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil {
+		t.Fatalf("IngestCandidate() error = %v", err)
+	}
+	if created {
+		t.Fatal("recurrence redirect created = true, want false")
+	}
+	if issue.ID != 903 || issue.RecurrenceCount != 1 || issue.LastRecurredAt == nil {
+		t.Fatalf("IngestCandidate() issue = %+v, want the redirected target with count 1", issue)
+	}
+
+	if len(fixture.repo.applyCalls) != 1 {
+		t.Fatalf("ApplyRecurrence calls = %d, want 1", len(fixture.repo.applyCalls))
+	}
+	rec := fixture.repo.applyCalls[0]
+	if rec.VersionID != 7 || rec.SourceID != 902 || rec.TargetID != 903 {
+		t.Fatalf("recurrence = %+v, want version 7 source 902 -> target 903", rec)
+	}
+	if len(rec.Refs) != 9 {
+		t.Fatalf("recurrence refs = %d, want the 9 candidate refs", len(rec.Refs))
+	}
+	for index, ref := range rec.Refs {
+		if ref.Role != delivery.IssueRefRoleRecurrence {
+			t.Errorf("ref[%d].role = %q, want %q", index, ref.Role, delivery.IssueRefRoleRecurrence)
+		}
+	}
+	if rec.Refs[0].Kind != delivery.IssueRefKindCaseRun || rec.Refs[0].RefID != 52 {
+		t.Errorf("first recurrence ref = %+v, want case_run/52", rec.Refs[0])
+	}
+	if len(fixture.repo.appendRefsCalls) != 0 {
+		t.Fatalf("source refs appended on a successful redirect: %+v", fixture.repo.appendRefsCalls)
+	}
+
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.versionID != 7 {
+		t.Errorf("event version = %d, want 7", event.versionID)
+	}
+	if event.payload["issue_id"] != "903" || event.payload["source_issue_id"] != "902" {
+		t.Errorf("event IDs = %v, want target 903 / source 902", event.payload)
+	}
+	if event.payload["dedupe_key"] != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("event dedupe_key = %v", event.payload["dedupe_key"])
+	}
+	if count := recurrenceEventPayloadInt(t, event.payload, "recurrence_count"); count != 1 {
+		t.Errorf("event recurrence_count = %d, want 1", count)
+	}
+	if failed, present := event.payload["redirect_failed"]; present && failed != false {
+		t.Errorf("successful redirect payload has redirect_failed = %v", failed)
+	}
+
+	audit := fixture.requireSingleAudit(t, "delivery.issue.recurred")
+	if audit.actorID != 0 || audit.targetKind != "issue" || audit.targetID != "903" {
+		t.Errorf("audit = %+v, want system issue/903", audit)
+	}
+	if audit.metadata["source_issue_id"] != "902" || audit.metadata["issue_id"] != "903" {
+		t.Errorf("audit metadata = %v", audit.metadata)
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Fatalf("recurrence ensured %d triage tasks, want none", len(fixture.tasks.calls))
 	}
 }
 
-// issueTestNotFound asserts err is the 404 issue_not_found.
-func issueTestNotFound(t *testing.T, err error) {
-	t.Helper()
-	var domainErr *domain.Error
-	if !errors.As(err, &domainErr) {
-		t.Fatalf("error type = %T (%v)", err, err)
+func TestIssueServiceRecurrenceWalksMergedChain(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	middle := recurrenceIssue(903, delivery.IssueStatusMerged, issueServiceTestInt64(904), 2)
+	final := recurrenceIssue(904, delivery.IssueStatusOpen, nil, 0)
+	fixture := recurrenceMergeFixture(t, source, middle, final)
+	fixture.repo.applyResult = delivery.Issue{ID: 904, VersionID: 7, Status: delivery.IssueStatusOpen, RecurrenceCount: 3}
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the final target", issue, created, err)
 	}
-	if domainErr.Kind != domain.KindNotFound || domainErr.Reason != "issue_not_found" {
-		t.Fatalf("error = %+v, want issue_not_found", domainErr)
+	if issue.ID != 904 {
+		t.Fatalf("redirected issue = %d, want the chain terminal 904", issue.ID)
+	}
+	if len(fixture.repo.applyCalls) != 1 || fixture.repo.applyCalls[0].TargetID != 904 {
+		t.Fatalf("ApplyRecurrence calls = %+v, want target 904", fixture.repo.applyCalls)
+	}
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["issue_id"] != "904" || event.payload["source_issue_id"] != "902" {
+		t.Errorf("event IDs = %v, want target 904 / source 902", event.payload)
+	}
+	if count := recurrenceEventPayloadInt(t, event.payload, "recurrence_count"); count != 3 {
+		t.Errorf("event recurrence_count = %d, want the repository count 3", count)
+	}
+	fixture.requireSingleAudit(t, "delivery.issue.recurred")
+}
+
+func TestIssueServiceRecurrenceBrokenChainFallsBackToSource(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 2)
+	fixture := recurrenceMergeFixture(t, source)
+	// 903 is intentionally absent: the chain is broken.
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the source fallback", issue, created, err)
+	}
+	if issue.ID != 902 {
+		t.Fatalf("fallback issue = %d, want the source 902", issue.ID)
+	}
+	if len(fixture.repo.applyCalls) != 0 {
+		t.Fatalf("ApplyRecurrence calls = %+v, want none on a broken chain", fixture.repo.applyCalls)
+	}
+	if len(fixture.repo.appendRefsCalls) != 1 {
+		t.Fatalf("AppendRefs calls = %d, want the source fallback", len(fixture.repo.appendRefsCalls))
+	}
+	appended := fixture.repo.appendRefsCalls[0]
+	if appended.issueID != 902 || len(appended.refs) != 9 {
+		t.Fatalf("fallback append = %+v, want the 9 candidate refs on source 902", appended)
+	}
+	if appended.refs[0].Role != delivery.IssueRefRoleSource {
+		t.Errorf("fallback ref role = %q, want source", appended.refs[0].Role)
+	}
+
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["issue_id"] != "902" || event.payload["source_issue_id"] != "902" {
+		t.Errorf("failure event IDs = %v, want source 902", event.payload)
+	}
+	if event.payload["redirect_failed"] != true {
+		t.Errorf("failure event redirect_failed = %v, want true", event.payload["redirect_failed"])
+	}
+	if count := recurrenceEventPayloadInt(t, event.payload, "recurrence_count"); count != 2 {
+		t.Errorf("failure event recurrence_count = %d, want the stored 2", count)
+	}
+	audit := fixture.requireSingleAudit(t, "delivery.issue.recurred")
+	if audit.metadata["redirect_failed"] != true || audit.targetID != "902" {
+		t.Errorf("failure audit = %+v, want redirect_failed on the source", audit)
+	}
+}
+
+func TestIssueServiceRecurrenceCycleFallsBackToSource(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	target := recurrenceIssue(903, delivery.IssueStatusMerged, issueServiceTestInt64(902), 0)
+	fixture := recurrenceMergeFixture(t, source, target)
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the source fallback", issue, created, err)
+	}
+	if issue.ID != 902 {
+		t.Fatalf("cycle fallback issue = %d, want the source 902", issue.ID)
+	}
+	if len(fixture.repo.applyCalls) != 0 || len(fixture.repo.appendRefsCalls) != 1 {
+		t.Fatalf("calls apply=%d append=%d, want 0/1", len(fixture.repo.applyCalls), len(fixture.repo.appendRefsCalls))
+	}
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["redirect_failed"] != true {
+		t.Errorf("cycle event redirect_failed = %v, want true", event.payload["redirect_failed"])
+	}
+	fixture.requireSingleAudit(t, "delivery.issue.recurred")
+}
+
+func TestIssueServiceRecurrenceTargetChangedFallsBackToSource(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	target := recurrenceIssue(903, delivery.IssueStatusOpen, nil, 0)
+	fixture := recurrenceMergeFixture(t, source, target)
+	fixture.repo.applyErr = delivery.ErrStateConflict
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the source fallback", issue, created, err)
+	}
+	if issue.ID != 902 {
+		t.Fatalf("fallback issue = %d, want the source 902", issue.ID)
+	}
+	if len(fixture.repo.appendRefsCalls) != 1 {
+		t.Fatalf("AppendRefs calls = %d, want the source fallback", len(fixture.repo.appendRefsCalls))
+	}
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["redirect_failed"] != true {
+		t.Errorf("event redirect_failed = %v, want true", event.payload["redirect_failed"])
+	}
+}
+
+func TestIssueServiceRecurrenceRepositoryFailureReturnsError(t *testing.T) {
+	t.Run("redirect write", func(t *testing.T) {
+		source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+		target := recurrenceIssue(903, delivery.IssueStatusOpen, nil, 0)
+		fixture := recurrenceMergeFixture(t, source, target)
+		fixture.repo.applyErr = errIssueTestBoom
+
+		if _, _, err := fixture.svc.IngestCandidate(context.Background(), 52); !errors.Is(err, errIssueTestBoom) {
+			t.Fatalf("IngestCandidate() error = %v, want the repository failure", err)
+		}
+		if len(fixture.events.records) != 0 || len(fixture.audit.records) != 0 {
+			t.Fatalf("side effects = %d events/%d audits, want none", len(fixture.events.records), len(fixture.audit.records))
+		}
+	})
+
+	t.Run("fallback append", func(t *testing.T) {
+		source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+		fixture := recurrenceMergeFixture(t, source)
+		fixture.repo.appendRefsErr = errIssueTestBoom
+
+		if _, _, err := fixture.svc.IngestCandidate(context.Background(), 52); !errors.Is(err, errIssueTestBoom) {
+			t.Fatalf("IngestCandidate() error = %v, want the repository failure", err)
+		}
+	})
+}
+
+func TestIssueServiceDedupeHitOnOpenIssueKeepsP4Behavior(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[52] = issueServiceTestSnapshot(52)
+	fixture.repo.createCreated = false
+	fixture.repo.createResult = delivery.Issue{
+		ID: 902, VersionID: 7, Status: delivery.IssueStatusConfirmed, RecurrenceCount: 4,
+	}
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v", issue, created, err)
+	}
+	if issue.ID != 902 || issue.RecurrenceCount != 4 {
+		t.Fatalf("issue = %+v, want the stored confirmed row untouched", issue)
+	}
+	if len(fixture.repo.applyCalls) != 0 || len(fixture.repo.appendRefsCalls) != 0 {
+		t.Fatalf("non-merged dedupe calls apply=%d append=%d, want none (P4 behavior stays in the repository)",
+			len(fixture.repo.applyCalls), len(fixture.repo.appendRefsCalls))
+	}
+	if len(fixture.events.records) != 0 || len(fixture.audit.records) != 0 {
+		t.Fatalf("non-merged dedupe side effects = %d events/%d audits, want none",
+			len(fixture.events.records), len(fixture.audit.records))
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Fatalf("non-merged dedupe ensured %d triage tasks, want none", len(fixture.tasks.calls))
+	}
+}
+
+func TestIssueServiceGetProjectsMergedChain(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = recurrenceIssue(42, delivery.IssueStatusMerged, issueServiceTestInt64(43), 0)
+	fixture.repo.getIssues[43] = recurrenceIssue(43, delivery.IssueStatusMerged, issueServiceTestInt64(44), 0)
+	fixture.repo.getIssues[44] = recurrenceIssue(44, delivery.IssueStatusOpen, nil, 0)
+
+	detail, err := fixture.svc.Get(context.Background(), 7, 42)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if len(detail.MergedChain) != 2 || detail.MergedChain[0] != 43 || detail.MergedChain[1] != 44 {
+		t.Fatalf("MergedChain = %v, want [43 44]", detail.MergedChain)
+	}
+
+	open := recurrenceIssue(45, delivery.IssueStatusOpen, nil, 0)
+	fixture.repo.getIssues[45] = open
+	detail, err = fixture.svc.Get(context.Background(), 7, 45)
+	if err != nil || len(detail.MergedChain) != 0 {
+		t.Fatalf("open issue MergedChain = %v err=%v, want empty", detail.MergedChain, err)
+	}
+}
+
+func TestIssueServiceGetPropagatesMergedChainReadError(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = recurrenceIssue(42, delivery.IssueStatusMerged, issueServiceTestInt64(43), 0)
+	// 43 is unknown (broken chain) but that is not an error; a read failure is.
+	fixture.repo.getErrByID[43] = errIssueTestBoom
+
+	if _, err := fixture.svc.Get(context.Background(), 7, 42); !errors.Is(err, errIssueTestBoom) {
+		t.Fatalf("Get() error = %v, want the read failure", err)
 	}
 }

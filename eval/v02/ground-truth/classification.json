@@ -1,0 +1,21 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "injected_failures": [
+    {
+      "case_title": "按状态筛选订单",
+      "expected_failure_class": "ui_selector"
+    },
+    {
+      "case_title": "订单详情展示退款入口",
+      "expected_failure_class": "api_contract"
+    }
+  ],
+  "expected_counts": {
+    "injected_failures": 2,
+    "correct_classifications": 2
+  },
+  "failure_classes": [
+    "ui_selector",
+    "api_contract"
+  ]
+}

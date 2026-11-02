@@ -1,2242 +1,1061 @@
-package application
+package codeintelapp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"path"
-	"reflect"
-	"regexp"
+	"net/http"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// Analysis-service constants. The configuration bounds mirror design spec §4.1;
-// the reasons are the stable §7.1 reason codes persisted in code_analysis.
-const (
-	// auditActionCodeAnalyze is the design spec §6.10 analysis audit action. The
-	// detail carries identifiers and status only.
-	auditActionCodeAnalyze = "code.analyze"
-
-	// defaultMaxChangedFiles / hardMaxChangedFiles mirror
-	// EZTEST_CODEINTEL_MAX_CHANGED_FILES (default 20, hard cap 200).
-	defaultMaxChangedFiles = 20
-	hardMaxChangedFiles    = 200
-
-	// defaultMaxFileBytes / minMaxFileBytes / hardMaxFileBytes mirror
-	// EZTEST_CODEINTEL_MAX_FILE_BYTES (default 64 KiB, 1 KiB–1 MiB).
-	defaultMaxFileBytes = 64 << 10
-	minMaxFileBytes     = 1 << 10
-	hardMaxFileBytes    = 1 << 20
-
-	// defaultMaxExcerptLines mirrors EZTEST_CODEINTEL_MAX_EXCERPT_LINES (40),
-	// bounded by the domain hard cap.
-	defaultMaxExcerptLines = 40
-
-	// contractFactPageSize is the entity page size used while collecting the
-	// head-commit contract facts.
-	contractFactPageSize = domain.MaxTreeEntriesPerPage
-
-	// reasonAnalysisInProgress / reasonAnalysisNotDone are the §7.1 reasons of
-	// the trigger and PATCH state rules.
-	reasonAnalysisInProgress = "analysis_in_progress"
-	reasonAnalysisNotDone    = "analysis_not_done"
-
-	// reasonCommitNotFound is the T0 Git verdict for a commit id the repository
-	// cannot resolve (P4 design spec §7.1). An explicit analysis base that Git
-	// cannot resolve is reported as invalid_base_commit (P7 design spec §7.11).
-	reasonCommitNotFound = "commit_not_found"
-
-	// Per-file analysis error codes persisted in code_analysis.errors.
-	reasonLLMUnavailable = "llm_unavailable"
-	reasonLLMError       = "llm_error"
-	reasonParseError     = "parse_error"
-	reasonReadFailed     = "read_failed"
-
-	// reasonUnsupportedContent and reasonPathNotFile are the Git verdicts of a
-	// non-text read and of a symlink/submodule/directory. Design spec §6.2
-	// excludes those files from AI analysis: they are skipped, not degraded.
-	reasonUnsupportedContent = "unsupported_content"
-	reasonPathNotFile        = "path_not_file"
-
-	// statusChangedFileDeleted is the git diff status of a deleted file.
-	statusChangedFileDeleted = "D"
-
-	// analysisSummaryMaxRunes bounds the joined file change summaries.
-	analysisSummaryMaxRunes = 2000
-	// eventPathLimit is the design spec §6.9/§7.4 refs.code cap.
-	eventPathLimit = 20
-)
-
-// commitHashPattern matches the lowercase 40-hex commit ids the DDL and the
-// explicit head contract require.
-var commitHashPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-
-// ImpactPlanner is the impact-analysis port implemented by T13's ImpactService.
-// The fixed signature reserves the concrete impact service (candidate merge,
-// anchors, contract propagation, requirement relations, AI reasoning, unmapped)
-// behind one application boundary; the analysis service only persists its
-// result.
-type ImpactPlanner interface {
-	Plan(ctx context.Context, in ImpactInput) (ImpactResult, error)
+// AnalysisRepository persists code_analysis rows.
+type AnalysisRepository interface {
+	Create(ctx context.Context, analysis codeintel.Analysis) (codeintel.Analysis, error)
+	Get(ctx context.Context, id int64) (codeintel.Analysis, error)
+	Latest(ctx context.Context, versionID, repoID int64) (codeintel.Analysis, error)
+	Update(ctx context.Context, analysis codeintel.Analysis) error
+	Active(ctx context.Context, versionID, repoID int64) (codeintel.Analysis, bool, error)
+	DoneByRange(ctx context.Context, versionID, repoID int64, base, head string) (codeintel.Analysis, bool, error)
+	MaxVersion(ctx context.Context, versionID, repoID int64) (int, error)
 }
 
-// ImpactInput is the complete deterministic + T1 state of one analysis passed
-// to the impact planner (design spec §6.6).
-//
-// AppModels is left empty by the analysis service: the fixed AnalysisServiceDeps
-// of the plan has no AppModelCatalog, so the impact service (T13) owns that port
-// and resolves the version system's nodes itself.
-type ImpactInput struct {
-	Version      VersionInfo
-	Analysis     domain.CodeAnalysis
-	Requirements []RequirementInfo
-	Relations    []RelationInfo
-	AppModels    []AppModelNode
-	Anchors      []domain.CodeAnchor
-	ChangedFiles []domain.ChangedFile
-	FactsAtHead  []domain.CodeEntity
-	Edges        []domain.CodeEdge
-	Degraded     bool
+// FactRepository persists immutable code_fact versions and reads the current
+// projection used by T1 caching and cross-stack contract matching.
+type FactRepository interface {
+	InsertVersion(ctx context.Context, fact codeintel.Fact) (codeintel.Fact, bool, error)
+	LatestByPath(ctx context.Context, repoID int64, commitSHA, path string) ([]codeintel.Fact, error)
+	LatestByCommit(ctx context.Context, repoID int64, commitSHA string, kinds []codeintel.EntityKind) ([]codeintel.Fact, error)
+	List(ctx context.Context, repoID int64, commitSHA, kind, path, cursor string, limit int) ([]codeintel.Fact, string, bool, error)
+	ByID(ctx context.Context, id int64) (codeintel.Fact, error)
 }
 
-// ImpactResult is the impact planner output persisted by the analysis service:
-// the candidates (ids are reassigned by the analysis service), the unmapped
-// changes and the planner's own stats document to merge into the analysis
-// stats.
-type ImpactResult struct {
-	Candidates []domain.ImpactCandidate
-	Unmapped   []domain.UnmappedChange
-	Stats      []byte
+// AnalysisDeps is the T1 analysis wiring.
+type AnalysisDeps struct {
+	Analyses  AnalysisRepository
+	Facts     FactRepository
+	Entities  EntityRepository
+	Git       GitClient
+	Extractor FactExtractor
+	Models    ModelResolver
+	Bulk      FileWindowReader
+	Versions  VersionReader
+	Resources ResourceReader
+	Design    DesignReader
+	Queue     WorkQueue
+	Events    EventPublisher
+	Audit     AuditRecorder
+	Settings  SettingsReader
+	Clock     Clock
+	IDs       IDGenerator
 }
 
-// AnalysisConfig bounds one analysis service (design spec §4.1). Zero values
-// fall back to the documented defaults and configured values may only lower the
-// hard bounds.
-type AnalysisConfig struct {
-	// MaxChangedFiles bounds the number of changed files sent to the LLM.
-	MaxChangedFiles int
-	// MaxFileBytes bounds one analysed file's content (evidence reads share the
-	// bound, per design spec §6.3 step 4).
-	MaxFileBytes int
-	// MaxExcerptLines bounds one evidence excerpt.
-	MaxExcerptLines int
-	// MaxIndexFiles bounds the head-commit fact scan used by contract matching,
-	// mirroring the P4 index cap so one analysis cannot walk an unbounded fact
-	// table.
-	MaxIndexFiles int
-	// PromptVersion participates in the file cache key and the fact versions.
-	PromptVersion string
-	// Timeout bounds one direct Run call. The worker normally applies the same
-	// analysis timeout; a zero value leaves the caller's deadline untouched.
-	Timeout time.Duration
-}
-
-// AnalysisServiceDeps are the ports of the version-scoped analysis use case.
-// Git, the repositories, the P2/P3 catalogs, the worker queue, the LLM, the
-// impact planner, the notifier, the audit recorder, the id generator, the
-// clock and the configuration are injected by the composition root.
-type AnalysisServiceDeps struct {
-	Git        GitReader
-	Repos      RepoCatalog
-	Versions   VersionCatalog
-	ChangeSets domain.ChangeSetRepository
-	Entities   domain.EntityRepository
-	Edges      domain.EdgeRepository
-	Facts      domain.FactVersionRepository
-	Cache      domain.CacheRepository
-	Analyses   domain.AnalysisRepository
-	Candidates domain.CandidateRepository
-	Anchors    domain.AnchorRepository
-	Queue      Enqueuer
-	LLM        LLMCompleter
-	Planner    ImpactPlanner
-	Notifier   ImpactNotifier
-	Audit      AuditRecorder
-	IDs        IDGenerator
-	Clock      Clock
-	Config     AnalysisConfig
-}
-
-// analysisRunRef is the in-process information the worker Job cannot carry:
-// GetByID is version-scoped while Job only carries the analysis id, and the
-// worker alone cannot know whether the trigger asked for a forced re-run.
-//
-// The registry is populated by Start and consumed by Run. P4 runs a single
-// worker in the API process and startup recovery marks leftover queued/running
-// analyses failed, so a job is never executed by another process; a Job whose
-// analysis is not in the registry is reported as analysis_not_found rather than
-// risking a cross-version lookup.
-type analysisRunRef struct {
-	versionID int64
-	force     bool
-	// requestID is the HTTP request id of the trigger. The worker re-attaches it
-	// to the run context so the completion audit stays request-correlated (P0).
-	requestID string
-}
-
-// AnalysisService implements the version-scoped impact analysis run (design
-// spec §6.2–§6.6): trigger/reuse/force, the deterministic change set, T1 file
-// analysis with the file cache, evidence-validated fact/edge/contract
-// materialisation with fact versioning, the impact planner handoff and the
-// persisted terminal state.
+// AnalysisService owns T1 analyses: Start validates the version baseline/head
+// and enqueues code.analyze; Execute extracts AI facts, validates evidence and
+// materializes the code_entity/code_edge projection.
 type AnalysisService struct {
-	deps   AnalysisServiceDeps
-	config AnalysisConfig
-
-	// startMu serialises Start so two concurrent triggers cannot both observe
-	// "no active analysis" and create duplicate runs. P4 is single-instance and
-	// the active check has no database constraint to fall back on.
-	startMu sync.Mutex
-
-	mu   sync.Mutex
-	runs map[int64]analysisRunRef
+	analyses  AnalysisRepository
+	facts     FactRepository
+	entities  EntityRepository
+	git       GitClient
+	extractor FactExtractor
+	models    ModelResolver
+	bulk      FileWindowReader
+	versions  VersionReader
+	resources ResourceReader
+	queue     WorkQueue
+	events    EventPublisher
+	audit     AuditRecorder
+	settings  SettingsReader
+	clock     Clock
+	ids       IDGenerator
 }
 
-// NewAnalysisService wires the analysis use case and normalises its config.
-func NewAnalysisService(deps AnalysisServiceDeps) *AnalysisService {
+// NewAnalysisService wires the T1 service with test-friendly defaults.
+func NewAnalysisService(deps AnalysisDeps) *AnalysisService {
 	return &AnalysisService{
-		deps:   deps,
-		config: normalizeAnalysisConfig(deps.Config),
-		runs:   make(map[int64]analysisRunRef),
+		analyses:  deps.Analyses,
+		facts:     deps.Facts,
+		entities:  deps.Entities,
+		git:       deps.Git,
+		extractor: deps.Extractor,
+		models:    deps.Models,
+		bulk:      deps.Bulk,
+		versions:  deps.Versions,
+		resources: deps.Resources,
+		queue:     deps.Queue,
+		events:    deps.Events,
+		audit:     deps.Audit,
+		settings:  deps.Settings,
+		clock:     clockOrSystem(deps.Clock),
+		ids:       idsOrFallback(deps.IDs),
 	}
 }
 
-// normalizeAnalysisConfig applies the design spec §4.1 bounds.
-func normalizeAnalysisConfig(cfg AnalysisConfig) AnalysisConfig {
-	if cfg.MaxChangedFiles <= 0 {
-		cfg.MaxChangedFiles = defaultMaxChangedFiles
-	}
-	if cfg.MaxChangedFiles > hardMaxChangedFiles {
-		cfg.MaxChangedFiles = hardMaxChangedFiles
-	}
-	if cfg.MaxFileBytes <= 0 {
-		cfg.MaxFileBytes = defaultMaxFileBytes
-	}
-	if cfg.MaxFileBytes < minMaxFileBytes {
-		cfg.MaxFileBytes = minMaxFileBytes
-	}
-	if cfg.MaxFileBytes > hardMaxFileBytes {
-		cfg.MaxFileBytes = hardMaxFileBytes
-	}
-	if cfg.MaxExcerptLines <= 0 {
-		cfg.MaxExcerptLines = defaultMaxExcerptLines
-	}
-	if cfg.MaxExcerptLines > domain.MaxExcerptLines {
-		cfg.MaxExcerptLines = domain.MaxExcerptLines
-	}
-	if cfg.MaxIndexFiles <= 0 {
-		cfg.MaxIndexFiles = defaultMaxIndexFiles
-	}
-	if cfg.MaxIndexFiles > hardMaxIndexFiles {
-		cfg.MaxIndexFiles = hardMaxIndexFiles
-	}
-	cfg.PromptVersion = strings.TrimSpace(cfg.PromptVersion)
-	if cfg.PromptVersion == "" {
-		cfg.PromptVersion = PromptVersionDefault
-	}
-	return cfg
+// ChangeSet is the GET /changes preview model (base = version_sut baseline).
+type ChangeSet struct {
+	RepoID        int64
+	BaseCommitSHA string
+	HeadCommitSHA string
+	Files         []codeintel.ChangedFile
+	Truncated     bool
 }
 
-// StartAnalysisInput is the optional trigger input of design spec §7.9: an
-// explicit head commit (default: the repository fixed branch tip), an explicit
-// base commit (default: the version's code baseline commit) and the force flag
-// that bypasses reuse. Both commits, when present, must be lowercase 40-hex
-// ids; the base must additionally be an ancestor of the resolved head.
-type StartAnalysisInput struct {
-	HeadCommit string
-	BaseCommit string
-	Force      bool
-}
-
-// Start validates the version binding, resolves the base/head commits, reuses a
-// done analysis for the same input unless force is set, and creates+enqueues a
-// queued analysis with the next analysis version (design spec §6.4/§6.8/§7.9).
-//
-// The base defaults to the version's code baseline commit and the head to the
-// live fixed-branch tip; an explicit base must be a 40-hex ancestor of the head
-// (422 invalid_base_commit otherwise). The resolved base participates in the
-// reuse lookup and the analysis-version allocation, so one version can hold
-// analyses of several commit ranges.
-//
-// The returned bool reports reuse: a reused analysis is returned unchanged with
-// reused=true and nothing is created or enqueued. A full worker queue persists
-// the new analysis as failed(analysis_queue_full) and returns the retryable
-// error chain.
-func (s *AnalysisService) Start(ctx context.Context, versionID, actorID int64, in StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
-	s.startMu.Lock()
-	defer s.startMu.Unlock()
-
-	info, err := s.deps.Versions.Get(ctx, versionID)
+// Start creates or reuses a version×repo analysis. A missing baseline maps to
+// baseline_commit_missing; a non-descendant head maps to invalid_head.
+func (s *AnalysisService) Start(ctx context.Context, versionID, repoID int64, headCommit string, force bool) (codeintel.Analysis, bool, error) {
+	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
 	if err != nil {
-		return domain.CodeAnalysis{}, false, err
+		return codeintel.Analysis{}, false, err
 	}
-	if !info.HasRepo || info.RepoID <= 0 {
-		return domain.CodeAnalysis{}, false, domain.NewInvalid("versionId", "code_repository_not_bound",
-			fmt.Sprintf("codeintel: version %d has no code repository binding", versionID))
+	if _, ok := bindingForRepo(bindings, repoID); !ok {
+		return codeintel.Analysis{}, false, unprocessable("repo_not_bound", "repository is not bound to this version")
 	}
-	base, baseExplicit, err := s.resolveBase(info, in.BaseCommit)
+	base, baselineErr := baselineForRepo(bindings, repoID)
+	if baselineErr != nil {
+		return codeintel.Analysis{}, false, baselineErr
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return codeintel.Analysis{}, false, unprocessable("baseline_commit_missing", "the version baseline commit is not resolved; index the repository first")
+	}
+	if !ValidCommitSHA(base) {
+		return codeintel.Analysis{}, false, unprocessable("baseline_commit_missing", "the version baseline commit is not valid")
+	}
+	repository, err := s.resources.CodeRepository(ctx, repoID)
 	if err != nil {
-		return domain.CodeAnalysis{}, false, err
+		return codeintel.Analysis{}, false, mapDomainError(err, "code repository")
 	}
-	repo, err := s.activeRepo(ctx, info.RepoID)
-	if err != nil {
-		return domain.CodeAnalysis{}, false, err
-	}
-	head, err := s.resolveHead(ctx, repo, base, baseExplicit, in.HeadCommit)
-	if err != nil {
-		return domain.CodeAnalysis{}, false, err
-	}
-	force := in.Force
-
-	model := ""
-	if s.deps.LLM != nil {
-		model = s.deps.LLM.Model()
-	}
-	prompt := s.config.PromptVersion
-
-	if !force {
-		reusable, err := s.deps.Analyses.FindReusable(ctx, versionID, repo.ID, base, head, model, prompt)
-		if err != nil {
-			return domain.CodeAnalysis{}, false, err
-		}
-		if reusable != nil {
-			s.auditTrigger(ctx, actorID, *reusable)
-			return *reusable, true, nil
-		}
-	}
-
-	active, err := s.deps.Analyses.HasActive(ctx, versionID)
-	if err != nil {
-		return domain.CodeAnalysis{}, false, err
-	}
-	if active {
-		return domain.CodeAnalysis{}, false, domain.NewConflict(reasonAnalysisInProgress,
-			fmt.Sprintf("codeintel: version %d already has an active analysis", versionID))
-	}
-
-	analysisVersion, err := s.deps.Analyses.NextAnalysisVersion(ctx, versionID, base, head)
-	if err != nil {
-		return domain.CodeAnalysis{}, false, err
-	}
-	now := s.now()
-	analysis := domain.CodeAnalysis{
-		ID:              s.deps.IDs.Next(),
-		VersionID:       versionID,
-		RepoID:          repo.ID,
-		BaseCommit:      base,
-		HeadCommit:      head,
-		Status:          domain.RunQueued,
-		Model:           model,
-		PromptVersion:   prompt,
-		AnalysisVersion: analysisVersion,
-		Stats:           []byte("{}"),
-		CreatedBy:       actorID,
-		CreatedAt:       now,
-	}
-	if analysis.ID == 0 {
-		return domain.CodeAnalysis{}, false, errors.New("codeintel: id generator returned a zero analysis id")
-	}
-	if err := s.deps.Analyses.Create(ctx, analysis); err != nil {
-		return domain.CodeAnalysis{}, false, err
-	}
-	s.rememberAnalysis(analysis.ID, versionID, force, platform.RequestID(ctx))
-	if err := s.enqueueAnalysis(analysis); err != nil {
-		return s.failEnqueuedAnalysis(ctx, analysis, err)
-	}
-	s.auditTrigger(ctx, actorID, analysis)
-	return analysis, false, nil
-}
-
-// enqueueAnalysis dispatches the queued analysis. A missing queue is an internal
-// mis-wiring error so a silently stuck queued analysis is impossible.
-func (s *AnalysisService) enqueueAnalysis(analysis domain.CodeAnalysis) error {
-	if s.deps.Queue == nil {
-		return errors.New("codeintel: analysis queue is not configured")
-	}
-	return s.deps.Queue.Enqueue(Job{Kind: JobKindAnalysis, ID: analysis.ID})
-}
-
-// failEnqueuedAnalysis records the enqueue failure and returns the caller-facing
-// error. A full queue keeps ErrQueueFull and the retryable analysis_queue_full
-// reason in the chain.
-func (s *AnalysisService) failEnqueuedAnalysis(ctx context.Context, analysis domain.CodeAnalysis, queueErr error) (domain.CodeAnalysis, bool, error) {
-	code := reasonInternal
-	callerErr := queueErr
-	if errors.Is(queueErr, ErrQueueFull) {
-		code = reasonQueueFull
-		callerErr = fmt.Errorf("%w: %w",
-			domain.NewConflict(reasonQueueFull, "codeintel: the analysis queue is full"), ErrQueueFull)
-	}
-
-	finishedAt := s.now()
-	failed := analysis
-	failed.Status = domain.RunFailed
-	failed.FinishedAt = &finishedAt
-	failed.Errors = append(failed.Errors, domain.AnalysisError{
-		Code:    code,
-		Message: truncateRunError(queueErr.Error()),
-	})
-	failed.Stats = []byte("{}")
-
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), indexFailureWriteTimeout)
-	defer cancel()
-	s.forgetAnalysis(analysis.ID)
-	if err := s.deps.Analyses.Update(writeCtx, failed); err != nil {
-		return failed, false, errors.Join(callerErr,
-			fmt.Errorf("codeintel: persist failed analysis %d: %w", analysis.ID, err))
-	}
-	return failed, false, callerErr
-}
-
-// resolveBase resolves the analysed base commit (design spec §6.8/§7.9). An
-// explicit base must be a lowercase 40-hex commit id (422 invalid_base_commit);
-// otherwise the version's code baseline commit is used and its absence remains
-// the P4 baseline_commit_missing verdict. The explicit flag lets the head
-// resolution attribute a non-ancestor range to the explicit base and allows an
-// explicit base to be analysed even when the version baseline is unset.
-func (s *AnalysisService) resolveBase(info VersionInfo, baseCommit string) (string, bool, error) {
-	explicit := strings.TrimSpace(baseCommit)
-	if explicit == "" {
-		base := strings.TrimSpace(info.BaselineCommit)
-		if base == "" || !commitHashPattern.MatchString(base) {
-			return "", false, domain.NewInvalid("versionId", "baseline_commit_missing",
-				fmt.Sprintf("codeintel: version %d has no valid code baseline commit", info.ID))
-		}
-		return base, false, nil
-	}
-	if !commitHashPattern.MatchString(explicit) {
-		return "", true, domain.NewInvalid("baseCommit", "invalid_base_commit",
-			"codeintel: baseCommit must be a lowercase 40-hex commit id")
-	}
-	return explicit, true, nil
-}
-
-// resolveHead validates an explicit head commit (40 hex and a descendant of the
-// resolved base) or resolves the live tip of the repository fixed branch
-// (design spec §6.1/INV-3: the version's code_branch is display metadata, never
-// a Git source; QueryService/IndexService resolve the same fixed branch). An
-// explicit base must itself be an ancestor of the resolved head (design spec
-// §7.9): a rejected range is reported as invalid_base_commit when the base was
-// supplied by the caller, so the caller can correct that field, and as
-// invalid_head for the P4 default-base contract. base == head is legal.
-func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, base string, baseExplicit bool, headCommit string) (string, error) {
 	head := strings.TrimSpace(headCommit)
 	if head != "" {
-		if !commitHashPattern.MatchString(head) {
-			return "", domain.NewInvalid("headCommit", "invalid_head",
-				"codeintel: headCommit must be a lowercase 40-hex commit id")
+		resolved, resolveErr := s.git.ResolveCommit(ctx, repository.Path, head)
+		if resolveErr != nil {
+			return codeintel.Analysis{}, false, resolveErr
 		}
-		ancestor, err := s.deps.Git.IsAncestor(ctx, repo.LocalPath, base, head)
-		if err != nil {
-			if baseExplicit && domain.Reason(err) == reasonCommitNotFound {
-				return "", invalidBaseCommit(base)
-			}
-			return "", err
+		head = resolved
+	} else {
+		resolved, headErr := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
+		if headErr != nil {
+			return codeintel.Analysis{}, false, headErr
+		}
+		head = resolved
+	}
+	if head != base {
+		ancestor, ancestorErr := s.git.IsAncestor(ctx, repository.Path, base, head)
+		if ancestorErr != nil {
+			return codeintel.Analysis{}, false, ancestorErr
 		}
 		if !ancestor {
-			if baseExplicit {
-				return "", invalidBaseCommit(base)
-			}
-			return "", domain.NewInvalid("headCommit", "invalid_head",
-				fmt.Sprintf("codeintel: commit %s is not a descendant of the baseline %s", head, base))
-		}
-		return head, nil
-	}
-	tip, err := s.deps.Git.Head(ctx, repo.LocalPath, repo.FixedBranch)
-	if err != nil {
-		return "", err
-	}
-	if !baseExplicit {
-		return tip, nil
-	}
-	ancestor, err := s.deps.Git.IsAncestor(ctx, repo.LocalPath, base, tip)
-	if err != nil {
-		if domain.Reason(err) == reasonCommitNotFound {
-			return "", invalidBaseCommit(base)
-		}
-		return "", err
-	}
-	if !ancestor {
-		return "", invalidBaseCommit(base)
-	}
-	return tip, nil
-}
-
-// invalidBaseCommit is the §7.11 verdict of an explicit analysis base that is
-// malformed, does not resolve in the repository, or is not an ancestor of the
-// resolved head.
-func invalidBaseCommit(base string) error {
-	return domain.NewInvalid("baseCommit", "invalid_base_commit",
-		fmt.Sprintf("codeintel: base commit %s must be a 40-hex ancestor of the analysed HEAD", base))
-}
-
-// activeRepo loads the repository and rejects a disabled one (design spec §7.1
-// code_repository_disabled).
-func (s *AnalysisService) activeRepo(ctx context.Context, repoID int64) (RepoInfo, error) {
-	repo, err := s.deps.Repos.Get(ctx, repoID)
-	if err != nil {
-		return RepoInfo{}, err
-	}
-	if repo.Status != codeRepositoryActive {
-		return RepoInfo{}, domain.NewInvalid("repoId", "code_repository_disabled",
-			fmt.Sprintf("codeintel: code repository %d is disabled", repoID))
-	}
-	return repo, nil
-}
-
-// Get returns one analysis of the version.
-func (s *AnalysisService) Get(ctx context.Context, versionID, analysisID int64) (domain.CodeAnalysis, error) {
-	return s.deps.Analyses.GetByID(ctx, versionID, analysisID)
-}
-
-// GetLatest returns the newest analysis of the version (any status).
-func (s *AnalysisService) GetLatest(ctx context.Context, versionID int64) (domain.CodeAnalysis, error) {
-	return s.deps.Analyses.GetLatest(ctx, versionID)
-}
-
-// ListCandidates returns the candidates of one analysis in the deterministic
-// repository order.
-func (s *AnalysisService) ListCandidates(ctx context.Context, analysisID int64) ([]domain.ImpactCandidate, error) {
-	return s.deps.Candidates.List(ctx, analysisID)
-}
-
-// PatchCandidate persists one human candidate selection of a finished analysis
-// (design spec §6.6/§6.11). The analysis must belong to the version and be
-// done; the candidate must belong to the analysis. The updated candidate is
-// returned so the HTTP layer can echo it.
-func (s *AnalysisService) PatchCandidate(ctx context.Context, versionID, analysisID, candidateID, actorID int64, selected bool) (domain.ImpactCandidate, error) {
-	analysis, err := s.deps.Analyses.GetByID(ctx, versionID, analysisID)
-	if err != nil {
-		return domain.ImpactCandidate{}, err
-	}
-	if analysis.Status != domain.RunDone {
-		return domain.ImpactCandidate{}, domain.NewConflict(reasonAnalysisNotDone,
-			fmt.Sprintf("codeintel: analysis %d is not done", analysisID))
-	}
-	candidate, err := s.deps.Candidates.Get(ctx, analysisID, candidateID)
-	if err != nil {
-		return domain.ImpactCandidate{}, err
-	}
-	if err := s.deps.Analyses.UpdateCandidateSelection(ctx, analysisID, candidateID, actorID, selected); err != nil {
-		return domain.ImpactCandidate{}, err
-	}
-	now := s.now()
-	candidate.Selected = selected
-	candidate.SelectionUpdatedBy = &actorID
-	candidate.SelectionUpdatedAt = &now
-	return candidate, nil
-}
-
-// Run executes one queued analysis (design spec §6.2–§6.6/§6.8). Terminal
-// analyses are idempotent no-ops and a duplicate running job is a conflict. Any
-// failure (including a panic or an expired worker deadline) is persisted as
-// failed and returned; the error never carries code content.
-func (s *AnalysisService) Run(ctx context.Context, analysisID int64) (err error) {
-	ref, ok := s.analysisRef(analysisID)
-	if !ok {
-		return domain.NewNotFound("analysis_not_found",
-			fmt.Sprintf("codeintel: analysis %d is not owned by this service", analysisID))
-	}
-	// The worker goroutine is detached from the trigger request; re-attach the
-	// request id so the completion audit stays correlated (P0).
-	if ref.requestID != "" {
-		ctx = platform.WithRequestID(ctx, ref.requestID)
-	}
-	analysis, err := s.deps.Analyses.GetByID(ctx, ref.versionID, analysisID)
-	if err != nil {
-		s.forgetAnalysis(analysisID)
-		return err
-	}
-	switch analysis.Status {
-	case domain.RunDone, domain.RunFailed:
-		s.forgetAnalysis(analysisID)
-		return nil
-	case domain.RunRunning:
-		return domain.NewConflict(reasonAnalysisInProgress,
-			fmt.Sprintf("codeintel: analysis %d is already running", analysisID))
-	}
-	if s.config.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.config.Timeout)
-		defer cancel()
-	}
-
-	startedAt := s.now()
-	analysis.Status = domain.RunRunning
-	analysis.StartedAt = &startedAt
-	if err := s.deps.Analyses.Update(ctx, analysis); err != nil {
-		return err
-	}
-	state := &analysisRunState{
-		analysis: analysis,
-		content:  make(map[string]*commitContent),
-	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = s.failRun(ctx, state.analysis, reasonInternal,
-				fmt.Errorf("codeintel: analysis %d panicked: %v", analysisID, recovered))
-		}
-	}()
-
-	runStart := time.Now()
-	if err := s.executeRun(ctx, state, ref.force, runStart); err != nil {
-		return s.failRun(ctx, state.analysis, failureReason(ctx, err), err)
-	}
-	s.forgetAnalysis(analysisID)
-	return nil
-}
-
-// failRun persists the failed terminal state and returns the original cause.
-// The write is detached from the worker deadline so a timeout is still
-// recorded.
-func (s *AnalysisService) failRun(ctx context.Context, analysis domain.CodeAnalysis, code string, cause error) error {
-	finishedAt := s.now()
-	analysis.Status = domain.RunFailed
-	analysis.FinishedAt = &finishedAt
-	if len(analysis.Errors) < domain.MaxAnalysisErrors {
-		analysis.Errors = append(analysis.Errors, domain.AnalysisError{
-			Code:    code,
-			Message: truncateRunError(cause.Error()),
-		})
-	}
-
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), indexFailureWriteTimeout)
-	defer cancel()
-	s.forgetAnalysis(analysis.ID)
-	if err := s.deps.Analyses.Update(writeCtx, analysis); err != nil {
-		return errors.Join(cause, fmt.Errorf("codeintel: persist failed analysis %d: %w", analysis.ID, err))
-	}
-	return cause
-}
-
-// analysisRunState is the mutable state of one Run.
-type analysisRunState struct {
-	analysis         domain.CodeAnalysis
-	repo             RepoInfo
-	stats            analysisStats
-	content          map[string]*commitContent
-	degraded         bool
-	llmErrorRecorded bool
-}
-
-// commitContent is one lazily read commit-pinned file used for evidence and fact
-// line validation. The content is shared by every fact that points at the file.
-type commitContent struct {
-	content   []byte
-	lines     []string
-	ok        bool
-	truncated bool
-	err       error
-}
-
-// analysisStats is the JSONB stats document of one analysis (design spec §7.3
-// plus the file-level counters needed to explain a degraded run).
-type analysisStats struct {
-	ChangedFiles       int    `json:"changedFiles"`
-	AnalyzedFiles      int    `json:"analyzedFiles"`
-	CacheHits          int    `json:"cacheHits"`
-	Skipped            int    `json:"skipped"`
-	FailedFiles        int    `json:"failedFiles"`
-	Facts              int    `json:"facts"`
-	Edges              int    `json:"edges"`
-	Contracts          int    `json:"contracts"`
-	EvidenceChecks     int    `json:"evidenceChecks"`
-	EvidenceFailures   int    `json:"evidenceFailures"`
-	InvalidFacts       int    `json:"invalidFacts"`
-	DuplicateFacts     int    `json:"duplicateFacts"`
-	UnmatchedContracts int    `json:"unmatchedContracts"`
-	ContractTruncated  int    `json:"contractTruncated"`
-	UnresolvedEdges    int    `json:"unresolvedEdges"`
-	TruncatedEntries   int    `json:"truncatedEntries"`
-	Truncated          bool   `json:"truncated"`
-	Conflicts          int    `json:"conflicts"`
-	Unmapped           int    `json:"unmapped"`
-	Candidates         int    `json:"candidates"`
-	ChangeSummary      string `json:"changeSummary"`
-}
-
-// executeRun is the analysis pipeline. The caller owns the running state and the
-// failure persistence.
-func (s *AnalysisService) executeRun(ctx context.Context, state *analysisRunState, force bool, runStart time.Time) error {
-	analysis := &state.analysis
-	info, err := s.deps.Versions.Get(ctx, analysis.VersionID)
-	if err != nil {
-		return err
-	}
-	repo, err := s.activeRepo(ctx, analysis.RepoID)
-	if err != nil {
-		return err
-	}
-	state.repo = repo
-
-	diff, err := s.deps.Git.Diff(ctx, repo.LocalPath, analysis.BaseCommit, analysis.HeadCommit)
-	if err != nil {
-		return err
-	}
-	changeSet, _, err := s.deps.ChangeSets.GetOrCreate(ctx, domain.CodeChangeSet{
-		ID:         s.deps.IDs.Next(),
-		RepoID:     analysis.RepoID,
-		BaseCommit: analysis.BaseCommit,
-		HeadCommit: analysis.HeadCommit,
-		Stats:      diff.Stats,
-		Files:      diff.Files,
-		Truncated:  diff.Truncated,
-		CreatedAt:  s.now(),
-	})
-	if err != nil {
-		return err
-	}
-	changeSetID := changeSet.ID
-	analysis.ChangeSetID = &changeSetID
-	state.stats.ChangedFiles = len(changeSet.Files)
-	state.stats.Truncated = changeSet.Truncated
-	s.publishChanged(ctx, analysis.VersionID, *analysis, changeSet)
-
-	if len(changeSet.Files) == 0 {
-		// base == head (design spec §6.1): done with zero candidates, no LLM and
-		// no planner call. Clear any previous candidate set so a repeated run is
-		// deterministic.
-		if err := s.deps.Candidates.Replace(ctx, analysis.ID, nil); err != nil {
-			return err
-		}
-		return s.finish(ctx, state, nil, ImpactResult{}, nil, false, runStart)
-	}
-
-	changedPaths := changedFilePaths(changeSet.Files)
-	anchors, err := s.deps.Anchors.ListByPaths(ctx, analysis.VersionID, changedPaths)
-	if err != nil {
-		return err
-	}
-	selected := s.selectFiles(changeSet.Files, anchors)
-	state.stats.Skipped = len(changeSet.Files) - len(selected)
-
-	results := make([]analysisFileResult, 0, len(selected))
-	for _, file := range selected {
-		result, err := s.analyzeFile(ctx, state, file, force)
-		if err != nil {
-			return err
-		}
-		results = append(results, result)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return codeintel.Analysis{}, false, unprocessable("invalid_head", "head commit must descend from the version baseline commit")
 		}
 	}
 
-	facts, duplicates := mergeMaterializedFacts(results)
-	state.stats.DuplicateFacts = duplicates
-	state.stats.Facts = len(facts)
-	allEdges := make([]validatedAIEdge, 0)
-	for _, result := range results {
-		allEdges = append(allEdges, result.edges...)
+	if _, active, activeErr := s.analyses.Active(ctx, versionID, repoID); activeErr != nil {
+		return codeintel.Analysis{}, false, activeErr
+	} else if active {
+		return codeintel.Analysis{}, false, stateConflict("analysis_in_progress", "an analysis is already in progress for this version and repository")
 	}
-	if summary := joinedChangeSummaries(results); summary != "" {
-		state.stats.ChangeSummary = truncateRunesLimit(summary, analysisSummaryMaxRunes)
-	}
-
-	factRefs, factEntities, err := s.materializeFacts(ctx, state, facts)
-	if err != nil {
-		return err
-	}
-	headFacts, err := s.materializeEdges(ctx, state, factEntities, allEdges)
-	if err != nil {
-		return err
-	}
-
-	requirements, err := s.deps.Versions.ListRequirements(ctx, analysis.VersionID)
-	if err != nil {
-		return err
-	}
-	relations, err := s.deps.Versions.ListRelations(ctx, analysis.VersionID)
-	if err != nil {
-		return err
-	}
-	factsAtHead, err := s.factsAtHead(ctx, state, changedPaths, factEntities, headFacts)
-	if err != nil {
-		return err
-	}
-	contractEdges, err := s.deps.Edges.ListByRel(ctx, analysis.RepoID, analysis.HeadCommit, domain.RelRouteToAPI)
-	if err != nil {
-		return err
-	}
-	// The planner sees the aggregated T1 stats (including the joined
-	// changeSummary) at Plan time; the final persisted document merges the
-	// planner's own counters afterwards (design spec §6.6 input 3 / R28).
-	planStats, err := mergeAnalysisStats(state.stats, nil)
-	if err != nil {
-		return err
-	}
-	analysisInput := *analysis
-	analysisInput.Stats = planStats
-	input := ImpactInput{
-		Version:      info,
-		Analysis:     analysisInput,
-		Requirements: requirements,
-		Relations:    relations,
-		Anchors:      anchors,
-		ChangedFiles: changeSet.Files,
-		FactsAtHead:  factsAtHead,
-		Edges:        contractEdges,
-		Degraded:     state.degraded,
-	}
-	if s.deps.Planner == nil {
-		return errors.New("codeintel: impact planner is not configured")
-	}
-	result, err := s.deps.Planner.Plan(ctx, input)
-	if err != nil {
-		return err
-	}
-	candidates := s.prepareCandidates(analysis.ID, result.Candidates)
-	if err := s.deps.Candidates.Replace(ctx, analysis.ID, candidates); err != nil {
-		return err
-	}
-	return s.finish(ctx, state, factRefs, result, candidates, state.degraded, runStart)
-}
-
-// finish persists the done terminal state, publishes code.impact_computed and
-// records the completion audit. The candidate rows must already be persisted by
-// the caller (design spec §6.11: candidates have their own transaction). runStart
-// is accepted for symmetry with the worker timing and is not part of the
-// deterministic stats document.
-func (s *AnalysisService) finish(ctx context.Context, state *analysisRunState, factRefs []domain.FactVersionRef, result ImpactResult, candidates []domain.ImpactCandidate, degraded bool, _ time.Time) error {
-	analysis := &state.analysis
-	state.stats.Unmapped = len(result.Unmapped)
-	state.stats.Candidates = len(candidates)
-	stats, err := mergeAnalysisStats(state.stats, result.Stats)
-	if err != nil {
-		return err
-	}
-	finishedAt := s.now()
-	analysis.Status = domain.RunDone
-	analysis.Degraded = degraded
-	analysis.FactVersions = factRefs
-	analysis.Unmapped = result.Unmapped
-	analysis.Stats = stats
-	analysis.FinishedAt = &finishedAt
-	if err := s.deps.Analyses.Update(ctx, *analysis); err != nil {
-		return err
-	}
-	s.publishImpact(ctx, *analysis, candidates, result.Unmapped)
-	s.auditCompletion(ctx, *analysis)
-	return nil
-}
-
-// selectFiles filters the analyzable changed files and applies the deterministic
-// order of design spec §6.2: anchored files first, then path ascending, capped at
-// MaxChangedFiles. Deleted, binary and hash-less entries are excluded (they are
-// counted in stats.skipped).
-func (s *AnalysisService) selectFiles(files []domain.ChangedFile, anchors []domain.CodeAnchor) []domain.ChangedFile {
-	anchored := make(map[string]struct{}, len(anchors))
-	for _, anchor := range anchors {
-		anchored[anchor.FilePath] = struct{}{}
-	}
-	eligible := make([]domain.ChangedFile, 0, len(files))
-	for _, file := range files {
-		if file.Status == statusChangedFileDeleted || file.Binary || file.HeadBlobHash == "" {
-			continue
-		}
-		eligible = append(eligible, file)
-	}
-	sort.SliceStable(eligible, func(i, j int) bool {
-		_, leftAnchored := anchored[eligible[i].Path]
-		_, rightAnchored := anchored[eligible[j].Path]
-		if leftAnchored != rightAnchored {
-			return leftAnchored
-		}
-		return eligible[i].Path < eligible[j].Path
-	})
-	if len(eligible) > s.config.MaxChangedFiles {
-		eligible = eligible[:s.config.MaxChangedFiles]
-	}
-	return eligible
-}
-
-// analysisFileResult is one selected file's validated T1 result.
-type analysisFileResult struct {
-	path          string
-	changeSummary string
-	facts         []*materializedFact
-	edges         []validatedAIEdge
-	analyzed      bool
-}
-
-// materializedFact is one fact after validation, before versioning. Key is the
-// domain identity; Clue reports a low-confidence clue fact (INV-1).
-type materializedFact struct {
-	Key             string
-	Kind            string
-	Name            string
-	Path            string
-	StartLine       int
-	EndLine         int
-	Signature       string
-	Confidence      string
-	Summary         string
-	Evidence        []domain.Evidence
-	Clue            bool
-	LinesValid      bool
-	InvalidEvidence int
-}
-
-// validatedAIEdge is one AI edge after evidence validation. FactPath is the
-// analysed file used to resolve component/symbol endpoint identities.
-type validatedAIEdge struct {
-	From       AIEdgeEndpoint
-	To         AIEdgeEndpoint
-	Rel        string
-	Confidence string
-	Evidence   []domain.Evidence
-	FactPath   string
-}
-
-// analyzeFile runs one file through the cache or the LLM, then validates its
-// evidence against commit content. Infrastructure failures (cache repository)
-// are returned; file-level failures are recorded in the run state and degrade
-// it.
-func (s *AnalysisService) analyzeFile(ctx context.Context, state *analysisRunState, file domain.ChangedFile, force bool) (analysisFileResult, error) {
-	result := analysisFileResult{path: file.Path}
-	analysis := state.analysis
-
 	if !force {
-		cached, hit, err := s.deps.Cache.Get(ctx, analysis.RepoID, analysis.HeadCommit, file.Path,
-			file.HeadBlobHash, analysis.Model, analysis.PromptVersion)
-		if err != nil {
-			return result, err
-		}
-		if hit {
-			if decoded, decodeErr := decodeCachedFileAnalysis(cached.Facts); decodeErr == nil {
-				state.stats.CacheHits++
-				state.stats.AnalyzedFiles++
-				result.analyzed = true
-				result.changeSummary = decoded.ChangeSummary
-				result.facts, result.edges = materializeCachedFileAnalysis(file.Path, decoded)
-				return result, nil
-			}
-			// A corrupt cache document behaves as a miss; the successful
-			// re-analysis overwrites it.
+		if existing, found, doneErr := s.analyses.DoneByRange(ctx, versionID, repoID, base, head); doneErr != nil {
+			return codeintel.Analysis{}, false, doneErr
+		} else if found {
+			return existing, false, nil
 		}
 	}
 
-	content := s.contentFor(ctx, state, file.Path)
-	switch {
-	case content.err != nil:
-		if isRunContextError(ctx, content.err) {
-			return result, content.err
-		}
-		// Deleted, binary, non-UTF-8 and symlink/submodule files are outside
-		// the §6.2 analysable set: counted as skipped, never degraded.
-		switch domain.Reason(content.err) {
-		case reasonUnsupportedContent, reasonPathNotFile:
-			state.stats.Skipped++
-			return result, nil
-		}
-		s.recordFileError(state, file.Path, reasonReadFailed, content.err)
-		state.stats.FailedFiles++
-		state.degraded = true
-		return result, nil
-	case content.truncated:
-		// Larger than EZTEST_CODEINTEL_MAX_FILE_BYTES: unsupported content.
-		state.stats.Skipped++
-		return result, nil
-	case !content.ok:
-		state.stats.Skipped++
-		return result, nil
-	}
-
-	if s.deps.LLM == nil {
-		s.recordLLMUnavailable(state)
-		state.stats.FailedFiles++
-		state.degraded = true
-		return result, nil
-	}
-	system, user := BuildFilePrompt(state.repo.Key, analysis.HeadCommit, file.Path, content.content)
-	raw, err := s.deps.LLM.Complete(ctx, system, user)
+	version, err := s.analyses.MaxVersion(ctx, versionID, repoID)
 	if err != nil {
-		if isRunContextError(ctx, err) {
-			// A worker deadline must fail the run (analysis_timeout), not turn it
-			// into a degraded done analysis.
-			return result, err
+		return codeintel.Analysis{}, false, err
+	}
+	now := s.clock.Now()
+	analysis := codeintel.Analysis{
+		ID:              s.ids.Next(),
+		VersionID:       versionID,
+		RepoID:          repoID,
+		BaseCommitSHA:   base,
+		HeadCommitSHA:   head,
+		Status:          codeintel.AnalysisQueued,
+		AnalysisVersion: version + 1,
+		ChangedFiles:    json.RawMessage(`[]`),
+		Stats:           json.RawMessage(`{}`),
+		Unmapped:        json.RawMessage(`[]`),
+		Errors:          json.RawMessage(`[]`),
+		FactVersions:    json.RawMessage(`{}`),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
+		actorID := actor.ID
+		analysis.CreatedBy = &actorID
+	}
+
+	if base == head {
+		// A zero-change range is completed synchronously; no LLM and no work
+		// item are needed (spec §5.3 step 5).
+		analysis.Status = codeintel.AnalysisDone
+		analysis.FinishedAt = &now
+		analysis.Stats = mustJSON(map[string]any{"changedFiles": 0, "facts": 0, "edges": 0})
+		stored, createErr := s.analyses.Create(ctx, analysis)
+		if createErr != nil {
+			return codeintel.Analysis{}, false, createErr
 		}
-		code := reasonLLMError
-		if errors.Is(err, ErrLLMNotConfigured) {
-			code = reasonLLMUnavailable
-			s.recordLLMUnavailable(state)
+		s.publishAnalysis(ctx, "code.analysis_finished", stored, map[string]any{
+			"analysis_id":   platformidFormat(stored.ID),
+			"status":        string(stored.Status),
+			"degraded":      stored.Degraded,
+			"changed_files": 0,
+			"facts":         0,
+			"candidates":    0,
+			"unmapped":      0,
+		})
+		return stored, true, nil
+	}
+
+	stored, err := s.analyses.Create(ctx, analysis)
+	if err != nil {
+		return codeintel.Analysis{}, false, err
+	}
+	payload := map[string]any{
+		"analysis_id":     platformidFormat(stored.ID),
+		"repo_id":         platformidFormat(repoID),
+		"base_commit_sha": base,
+		"head_commit_sha": head,
+	}
+	if _, _, err := s.queue.Ensure(ctx, NewWorkItem{
+		VersionID:   versionID,
+		Team:        CodeTeam,
+		Type:        WorkTypeCodeAnalyze,
+		Priority:    codePriority,
+		DedupeKey:   "code:analyze:" + platformidFormat(stored.ID),
+		Payload:     payload,
+		MaxAttempts: codeMaxAttempts,
+	}); err != nil {
+		s.failAnalysis(ctx, stored, err)
+		return codeintel.Analysis{}, false, err
+	}
+	s.recordAudit(ctx, "code.analysis.start", "code_analysis", platformidFormat(stored.ID), map[string]any{
+		"version_id":      platformidFormat(versionID),
+		"repo_id":         platformidFormat(repoID),
+		"base_commit_sha": base,
+		"head_commit_sha": head,
+	})
+	return stored, true, nil
+}
+
+// analysisAccumulator collects bounded T1 results while Execute walks files.
+type analysisAccumulator struct {
+	changedFiles   []map[string]any
+	dominantFacts  []codeintel.Fact
+	factVersions   map[string]int
+	unmapped       []map[string]any
+	errors         []map[string]any
+	analyzedFiles  int
+	skipped        int
+	cacheHits      int
+	aiUnavailable  int
+	invalidFacts   int
+	evidenceChecks int
+	evidenceFail   int
+	factsStored    int
+	edgesStored    int
+	truncated      bool
+	edgeDrafts     []edgeCandidate
+}
+
+type edgeCandidate struct {
+	srcKey     string
+	dstKey     string
+	rel        codeintel.EdgeRel
+	confidence codeintel.Confidence
+}
+
+func (a *analysisAccumulator) addUnmapped(path, reason string) {
+	if len(a.unmapped) >= codeintel.MaxUnmappedEntries {
+		return
+	}
+	a.unmapped = append(a.unmapped, map[string]any{"path": path, "reason": reason})
+}
+
+func (a *analysisAccumulator) addError(code, message string) {
+	if len(a.errors) >= codeintel.MaxAnalysisErrors {
+		return
+	}
+	a.errors = append(a.errors, map[string]any{"code": code, "message": truncateString(message, 500)})
+}
+
+func (a *analysisAccumulator) addFactVersion(factKey string, version int) {
+	if len(a.factVersions) >= codeintel.MaxFactVersionsSnapshot {
+		return
+	}
+	a.factVersions[factKey] = version
+}
+
+// Execute runs one queued T1 analysis. LLM failures degrade the run to
+// done+degraded; git/internal failures mark it failed so the worker can retry.
+func (s *AnalysisService) Execute(ctx context.Context, analysisID int64) error {
+	analysis, err := s.analyses.Get(ctx, analysisID)
+	if err != nil {
+		return err
+	}
+	repository, err := s.resources.CodeRepository(ctx, analysis.RepoID)
+	if err != nil {
+		s.failAnalysis(ctx, analysis, err)
+		return mapDomainError(err, "code repository")
+	}
+
+	timeoutSeconds := readIntSetting(ctx, s.settings, SettingAnalysisTimeout, defaultAnalysisTimeout, 1800)
+	if timeoutSeconds < 10 {
+		timeoutSeconds = 10
+	}
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+	settleCtx := context.WithoutCancel(ctx)
+
+	now := s.clock.Now()
+	analysis.Status = codeintel.AnalysisRunning
+	analysis.StartedAt = &now
+	analysis.UpdatedAt = now
+	if err := s.analyses.Update(settleCtx, analysis); err != nil {
+		return err
+	}
+	s.publishAnalysis(ctx, "code.analysis_started", analysis, map[string]any{
+		"analysis_id":     platformidFormat(analysis.ID),
+		"repo_id":         platformidFormat(analysis.RepoID),
+		"base_commit_sha": analysis.BaseCommitSHA,
+		"head_commit_sha": analysis.HeadCommitSHA,
+	})
+
+	diffResult, err := s.git.Diff(runCtx, repository.Path, analysis.BaseCommitSHA, analysis.HeadCommitSHA, codeintel.MaxChangedFilesStored)
+	if err != nil {
+		if runCtx.Err() != nil {
+			err = analysisTimeoutError()
+		}
+		s.failAnalysis(settleCtx, analysis, err)
+		return err
+	}
+	acc := &analysisAccumulator{
+		changedFiles: make([]map[string]any, 0, len(diffResult.Files)),
+		unmapped:     make([]map[string]any, 0),
+		errors:       make([]map[string]any, 0),
+		factVersions: map[string]int{},
+		truncated:    diffResult.Truncated,
+	}
+	for _, file := range diffResult.Files {
+		acc.changedFiles = append(acc.changedFiles, changedFileJSON(file))
+	}
+
+	promptVersion := readStringSetting(ctx, s.settings, SettingPromptVersion, defaultPromptVersion)
+	maxChangedFiles := readIntSetting(ctx, s.settings, SettingMaxChangedFiles, defaultMaxChangedFiles, codeintel.MaxChangedFilesStored)
+	maxFileBytes := readIntSetting(ctx, s.settings, SettingMaxFileBytes, defaultMaxFileBytes, 1<<20)
+	maxExcerptLines := readIntSetting(ctx, s.settings, SettingMaxExcerptLines, defaultMaxExcerptLines, codeintel.MaxExcerptLines)
+
+	model := ""
+	aiAvailable := s.extractor != nil && s.bulk != nil
+	if aiAvailable && s.models != nil {
+		resolved, modelErr := s.models.Model(runCtx)
+		if modelErr != nil {
+			aiAvailable = false
+			acc.aiUnavailable++
+			acc.addError("ai_unavailable", "the configured language model is unavailable")
 		} else {
-			s.recordFileError(state, file.Path, code, err)
+			model = resolved
 		}
-		state.stats.FailedFiles++
-		state.degraded = true
-		return result, nil
 	}
-	parsed, parseStats, err := ParseFileAnalysis(raw)
-	if err != nil {
-		s.recordFileError(state, file.Path, reasonParseError, err)
-		state.stats.FailedFiles++
-		state.degraded = true
-		return result, nil
-	}
-	state.stats.TruncatedEntries += parseStats.TruncatedEntries
 
-	result.facts, result.edges = s.validateFileAnalysis(ctx, state, file.Path, parsed)
-	result.changeSummary = parsed.ChangeSummary
-	result.analyzed = true
-	state.stats.AnalyzedFiles++
+	candidates := make([]codeintel.ChangedFile, 0, len(diffResult.Files))
+	for _, file := range diffResult.Files {
+		switch {
+		case file.Status == "deleted":
+			acc.addUnmapped(file.Path, "deleted_file")
+		case file.Binary:
+			acc.addUnmapped(file.Path, "unsupported_content")
+		default:
+			candidates = append(candidates, file)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
+	if len(candidates) > maxChangedFiles {
+		acc.skipped = len(candidates) - maxChangedFiles
+		candidates = candidates[:maxChangedFiles]
+	}
 
-	if err := s.storeCachedFileAnalysis(ctx, state, file, result, parseStats); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-// recordLLMUnavailable records the run-level missing-LLM error once.
-func (s *AnalysisService) recordLLMUnavailable(state *analysisRunState) {
-	if state.llmErrorRecorded {
-		return
-	}
-	state.llmErrorRecorded = true
-	state.addError(domain.AnalysisError{
-		Code:    reasonLLMUnavailable,
-		Message: "codeintel: LLM is not configured",
-	})
-}
-
-// recordFileError appends one bounded file-scoped error (never code content).
-func (s *AnalysisService) recordFileError(state *analysisRunState, filePath, code string, cause error) {
-	state.addError(domain.AnalysisError{
-		Code:    code,
-		Path:    filePath,
-		Message: truncateRunError(cause.Error()),
-	})
-}
-
-// addError appends one bounded analysis error, capped at MaxAnalysisErrors.
-func (state *analysisRunState) addError(entry domain.AnalysisError) {
-	if len(state.analysis.Errors) >= domain.MaxAnalysisErrors {
-		return
-	}
-	entry.Message = truncateRunError(entry.Message)
-	state.analysis.Errors = append(state.analysis.Errors, entry)
-}
-
-// contentFor lazily reads and normalises one commit-pinned file. Errors are
-// stored on the entry so fact/evidence validation can degrade individual facts
-// without failing the run.
-func (s *AnalysisService) contentFor(ctx context.Context, state *analysisRunState, filePath string) *commitContent {
-	if entry, ok := state.content[filePath]; ok {
-		return entry
-	}
-	entry := &commitContent{}
-	content, truncated, err := s.deps.Git.ReadAll(ctx, state.repo.LocalPath, state.analysis.HeadCommit, filePath, s.config.MaxFileBytes)
-	if err != nil {
-		entry.err = err
-		state.content[filePath] = entry
-		return entry
-	}
-	if truncated {
-		entry.truncated = true
-		state.content[filePath] = entry
-		return entry
-	}
-	lines, err := commitContentLines(content)
-	if err != nil {
-		entry.err = err
-		state.content[filePath] = entry
-		return entry
-	}
-	entry.content = content
-	entry.lines = lines
-	entry.ok = true
-	state.content[filePath] = entry
-	return entry
-}
-
-// validateFileAnalysis validates every fact and edge of one parsed file against
-// the commit content (design spec §6.2/§6.3): facts with missing/invalid
-// evidence or invalid path/line ranges become low clues, invalid facts and edges
-// are counted, and only verified evidence is kept.
-func (s *AnalysisService) validateFileAnalysis(ctx context.Context, state *analysisRunState, analysedPath string, parsed FileAnalysis) ([]*materializedFact, []validatedAIEdge) {
-	facts := make([]*materializedFact, 0, len(parsed.Facts))
-	for _, fact := range parsed.Facts {
-		normalizedPath, err := normalizeFactEntityPath(fact.Path)
-		if err != nil {
-			state.stats.InvalidFacts++
+	entityIDs := make(map[string]int64)
+	for _, file := range candidates {
+		if !aiAvailable {
+			acc.addUnmapped(file.Path, "ai_unavailable")
 			continue
 		}
-		key, err := domain.FactKey(fact.Kind, fact.Name, normalizedPath)
-		if err != nil {
-			state.stats.InvalidFacts++
+		blobHash := ""
+		if file.HeadBlobSHA != nil {
+			blobHash = "git-sha1:" + *file.HeadBlobSHA
+		}
+		cached, cacheErr := s.facts.LatestByPath(runCtx, analysis.RepoID, analysis.HeadCommitSHA, file.Path)
+		if cacheErr != nil {
+			s.failAnalysis(settleCtx, analysis, cacheErr)
+			return cacheErr
+		}
+		if isFileCacheHit(cached, blobHash, model, promptVersion) {
+			acc.cacheHits++
+			acc.analyzedFiles++
+			for _, fact := range cached {
+				acc.addFactVersion(fact.FactKey, fact.Version)
+				acc.dominantFacts = append(acc.dominantFacts, fact)
+			}
 			continue
 		}
 
-		linesValid := true
-		if content := s.contentFor(ctx, state, normalizedPath); content.err != nil ||
-			content.truncated || !content.ok ||
-			domain.ValidateEvidenceRange(fact.StartLine, fact.EndLine, len(content.lines), 0) != nil {
-			linesValid = false
+		window, readErr := s.bulk.ReadFileWindow(runCtx, repository.Path, analysis.HeadCommitSHA, file.Path, maxFileBytes, 0)
+		if readErr != nil {
+			if errors.Is(readErr, context.DeadlineExceeded) || runCtx.Err() != nil {
+				timeoutErr := analysisTimeoutError()
+				s.failAnalysis(settleCtx, analysis, timeoutErr)
+				return timeoutErr
+			}
+			acc.addUnmapped(file.Path, "unsupported_content")
+			acc.skipped++
+			continue
+		}
+		output, extractErr := s.extractor.Extract(runCtx, FactExtractInput{
+			Repo:            repository,
+			CommitSHA:       analysis.HeadCommitSHA,
+			Path:            file.Path,
+			Lines:           window.Lines,
+			MaxFacts:        codeintel.MaxFactsPerFile,
+			MaxEdges:        codeintel.MaxEdgesPerFile,
+			MaxExcerptLines: maxExcerptLines,
+			PromptVersion:   promptVersion,
+		})
+		if extractErr != nil {
+			if errors.Is(extractErr, context.DeadlineExceeded) || runCtx.Err() != nil {
+				timeoutErr := analysisTimeoutError()
+				s.failAnalysis(settleCtx, analysis, timeoutErr)
+				return timeoutErr
+			}
+			acc.aiUnavailable++
+			acc.addUnmapped(file.Path, "ai_unavailable")
+			acc.addError("ai_unavailable", "t1 fact extraction failed for one file")
+			continue
+		}
+		acc.analyzedFiles++
+		facts, drafts, factStats := s.validateDrafts(analysis, file.Path, window.Lines, output, blobHash, model, promptVersion, maxExcerptLines)
+		acc.invalidFacts += factStats.invalid
+		acc.evidenceChecks += factStats.checks
+		acc.evidenceFail += factStats.failures
+		for _, fact := range facts {
+			stored, reused, insertErr := s.facts.InsertVersion(runCtx, fact)
+			if insertErr != nil {
+				s.failAnalysis(settleCtx, analysis, insertErr)
+				return insertErr
+			}
+			_ = reused
+			acc.factsStored++
+			acc.addFactVersion(stored.FactKey, stored.Version)
+			acc.dominantFacts = append(acc.dominantFacts, stored)
+			entity := codeintel.Entity{
+				RepoID:      analysis.RepoID,
+				CommitSHA:   analysis.HeadCommitSHA,
+				Kind:        stored.Kind,
+				Path:        stored.Path,
+				Name:        stored.Name,
+				Signature:   stored.Signature,
+				StartLine:   stored.StartLine,
+				EndLine:     stored.EndLine,
+				BlobHash:    stored.BlobHash,
+				Source:      "ai",
+				Confidence:  stored.Confidence,
+				Evidence:    stored.Evidence,
+				Meta:        json.RawMessage(`{}`),
+				FactKey:     stored.FactKey,
+				FactVersion: stored.Version,
+				AnalysisID:  &analysis.ID,
+			}
+			projected, projectionErr := s.entities.UpsertFactEntity(runCtx, entity)
+			if projectionErr != nil {
+				s.failAnalysis(settleCtx, analysis, projectionErr)
+				return projectionErr
+			}
+			entityIDs[stored.FactKey] = projected.ID
+		}
+		for _, draft := range drafts {
+			acc.edgeDrafts = append(acc.edgeDrafts, draft)
+		}
+	}
+
+	if aiAvailable {
+		if len(acc.dominantFacts) > 0 {
+			keys := make([]string, 0, len(acc.dominantFacts))
+			for _, fact := range acc.dominantFacts {
+				keys = append(keys, fact.FactKey)
+			}
+			projected, projectionErr := s.entities.EntitiesByFactKeys(runCtx, analysis.RepoID, analysis.HeadCommitSHA, keys)
+			if projectionErr != nil {
+				s.failAnalysis(settleCtx, analysis, projectionErr)
+				return projectionErr
+			}
+			for _, entity := range projected {
+				entityIDs[entity.FactKey] = entity.ID
+			}
 		}
 
-		evidence := make([]domain.Evidence, 0, len(fact.Evidence))
-		invalidEvidence := 0
-		for _, raw := range fact.Evidence {
-			state.stats.EvidenceChecks++
-			evidencePath, pathErr := normalizeRepoRelativePath(raw.File)
-			if pathErr != nil {
-				state.stats.EvidenceFailures++
-				invalidEvidence++
+		for _, draft := range acc.edgeDrafts {
+			srcID, srcOK := entityIDs[draft.srcKey]
+			dstID, dstOK := entityIDs[draft.dstKey]
+			if !srcOK || !dstOK {
 				continue
 			}
-			content := s.contentFor(ctx, state, evidencePath)
-			if content.err != nil || content.truncated || !content.ok {
-				state.stats.EvidenceFailures++
-				invalidEvidence++
-				continue
+			edge := codeintel.Edge{
+				ID: s.ids.Next(), RepoID: analysis.RepoID, CommitSHA: analysis.HeadCommitSHA,
+				AnalysisID: &analysis.ID, SrcEntityID: srcID, DstEntityID: dstID,
+				Rel: draft.rel, Source: "ai", Confidence: draft.confidence,
+				Evidence: json.RawMessage(`[]`), Meta: json.RawMessage(`{}`),
+				FactKey:     truncateString(draft.srcKey+"->"+draft.dstKey, codeintel.MaxFactKeyChars),
+				FactVersion: 1, CreatedAt: s.clock.Now(), UpdatedAt: s.clock.Now(),
 			}
-			normalized := raw
-			normalized.File = evidencePath
-			validated, err := ValidateEvidence(content.content, normalized, s.config.MaxExcerptLines)
-			if err != nil {
-				state.stats.EvidenceFailures++
-				invalidEvidence++
-				continue
+			if err := s.entities.UpsertEdge(runCtx, edge); err != nil {
+				s.failAnalysis(settleCtx, analysis, err)
+				return err
 			}
-			evidence = append(evidence, validated)
+			acc.edgesStored++
 		}
-		mergedEvidence := mergeContractEvidence(evidence)
+		if err := s.insertContractEdges(runCtx, analysis, entityIDs, acc); err != nil {
+			s.failAnalysis(settleCtx, analysis, err)
+			return err
+		}
+	}
 
-		confidence := fact.Confidence
-		// §6.2/§6.3: any failed evidence validation (even when another entry
-		// survives) forces the fact to a low clue.
-		clue := !linesValid || len(mergedEvidence) == 0 || invalidEvidence > 0
-		if clue {
-			confidence = domain.ConfidenceLow
+	finished := s.clock.Now()
+	analysis.Status = codeintel.AnalysisDone
+	analysis.Degraded = acc.aiUnavailable > 0 || (len(candidates) > 0 && !aiAvailable)
+	analysis.Model = model
+	analysis.PromptVersion = promptVersion
+	analysis.ChangedFiles = mustJSON(acc.changedFiles)
+	analysis.Stats = mustJSON(map[string]any{
+		"changedFiles":     len(acc.changedFiles),
+		"truncated":        acc.truncated,
+		"analyzedFiles":    acc.analyzedFiles,
+		"skipped":          acc.skipped,
+		"cacheHits":        acc.cacheHits,
+		"aiUnavailable":    acc.aiUnavailable,
+		"invalidFacts":     acc.invalidFacts,
+		"evidenceChecks":   acc.evidenceChecks,
+		"evidenceFailures": acc.evidenceFail,
+		"facts":            acc.factsStored,
+		"edges":            acc.edgesStored,
+		"unmapped":         len(acc.unmapped),
+	})
+	analysis.Unmapped = mustJSON(acc.unmapped)
+	analysis.Errors = mustJSON(acc.errors)
+	analysis.FactVersions = mustJSON(acc.factVersions)
+	analysis.FinishedAt = &finished
+	analysis.UpdatedAt = finished
+	if err := s.analyses.Update(settleCtx, analysis); err != nil {
+		return err
+	}
+	s.publishAnalysis(settleCtx, "code.analysis_finished", analysis, map[string]any{
+		"analysis_id":   platformidFormat(analysis.ID),
+		"status":        string(analysis.Status),
+		"degraded":      analysis.Degraded,
+		"changed_files": len(acc.changedFiles),
+		"facts":         acc.factsStored,
+		"candidates":    0,
+		"unmapped":      len(acc.unmapped),
+	})
+	return nil
+}
+
+// factDraftStats counts the server-side evidence checks of one file.
+type factDraftStats struct {
+	invalid  int
+	checks   int
+	failures int
+}
+
+// validateDrafts turns model drafts into server-validated facts. The model never
+// supplies excerpt hashes; the server re-reads the window lines and recomputes
+// them. Invalid evidence downgrades the fact to low (clue) instead of failing.
+func (s *AnalysisService) validateDrafts(
+	analysis codeintel.Analysis,
+	filePath string,
+	lines []string,
+	output FactExtractOutput,
+	blobHash, model, promptVersion string,
+	maxExcerptLines int,
+) ([]codeintel.Fact, []edgeCandidate, factDraftStats) {
+	stats := factDraftStats{invalid: output.InvalidFacts}
+	facts := make([]codeintel.Fact, 0, len(output.Facts))
+	seenKeys := make(map[string]bool, len(output.Facts))
+	maxFacts := len(output.Facts)
+	if maxFacts > codeintel.MaxFactsPerFile {
+		maxFacts = codeintel.MaxFactsPerFile
+	}
+
+	for index, draft := range output.Facts {
+		if index >= maxFacts {
+			stats.invalid++
+			continue
 		}
-		facts = append(facts, &materializedFact{
-			Key:             key,
-			Kind:            fact.Kind,
-			Name:            strings.TrimSpace(fact.Name),
-			Path:            normalizedPath,
-			StartLine:       fact.StartLine,
-			EndLine:         fact.EndLine,
-			Signature:       fact.Signature,
-			Confidence:      confidence,
-			Summary:         fact.Summary,
-			Evidence:        mergedEvidence,
-			Clue:            clue,
-			LinesValid:      linesValid,
-			InvalidEvidence: invalidEvidence,
+		kind := codeintel.EntityKind(strings.TrimSpace(string(draft.Kind)))
+		if !kind.Valid() || kind == codeintel.EntityFile {
+			stats.invalid++
+			continue
+		}
+		name := truncateString(strings.TrimSpace(draft.Name), 512)
+		if name == "" || strings.ContainsAny(name, "\x00\r\n") {
+			stats.invalid++
+			continue
+		}
+		factKey, ok := codeintel.FactKey(kind, filePath, name, "", "")
+		if !ok || seenKeys[factKey] {
+			if !ok {
+				stats.invalid++
+			}
+			continue
+		}
+		seenKeys[factKey] = true
+
+		startLine, endLine := validDraftLines(draft.StartLine, draft.EndLine, len(lines))
+		evidence := make([]map[string]any, 0, len(draft.Evidence))
+		invalidEvidence := false
+		for _, candidate := range draft.Evidence {
+			stats.checks++
+			evidencePath := filePath
+			if strings.TrimSpace(candidate.File) != "" {
+				normalized, normalizeErr := codeintel.NormalizeRepoPath(candidate.File)
+				if normalizeErr != nil || normalized != filePath {
+					stats.failures++
+					invalidEvidence = true
+					continue
+				}
+				evidencePath = normalized
+			}
+			if candidate.StartLine < 1 || candidate.EndLine < candidate.StartLine ||
+				candidate.EndLine > len(lines) || candidate.EndLine-candidate.StartLine+1 > maxExcerptLines {
+				stats.failures++
+				invalidEvidence = true
+				continue
+			}
+			evidence = append(evidence, map[string]any{
+				"file":         evidencePath,
+				"start_line":   candidate.StartLine,
+				"end_line":     candidate.EndLine,
+				"excerpt_hash": codeintel.ExcerptHash(lines[candidate.StartLine-1 : candidate.EndLine]),
+			})
+			if len(evidence) >= codeintel.MaxEvidencePerFact {
+				break
+			}
+		}
+		confidence := draft.Confidence
+		if !confidence.Valid() {
+			confidence = codeintel.ConfidenceMedium
+		}
+		meta := map[string]any{}
+		if len(evidence) == 0 || invalidEvidence {
+			confidence = codeintel.ConfidenceLow
+			if len(evidence) == 0 && !invalidEvidence {
+				meta["clue"] = true
+			}
+		}
+		if invalidEvidence {
+			meta["invalidEvidence"] = true
+		}
+		body := validJSONObject(draft.Body)
+		if len(meta) > 0 {
+			body = bodyWithMarkers(body, meta)
+		}
+		facts = append(facts, codeintel.Fact{
+			RepoID:        analysis.RepoID,
+			CommitSHA:     analysis.HeadCommitSHA,
+			FactKey:       factKey,
+			Kind:          kind,
+			Path:          filePath,
+			Name:          name,
+			Signature:     truncateString(strings.TrimSpace(draft.Signature), 2000),
+			StartLine:     startLine,
+			EndLine:       endLine,
+			BlobHash:      blobHash,
+			Body:          body,
+			Evidence:      mustJSON(evidence),
+			Source:        "ai",
+			Confidence:    confidence,
+			Model:         model,
+			PromptVersion: promptVersion,
+			AnalysisID:    analysisIDPtr(analysis.ID),
+			CreatedAt:     s.clock.Now(),
+			UpdatedAt:     s.clock.Now(),
 		})
 	}
 
-	edges := make([]validatedAIEdge, 0, len(parsed.Edges))
-	for _, edge := range parsed.Edges {
-		if edge.Rel == domain.RelRouteToAPI {
-			// Contract edges are generated only by the §6.5 matcher; an AI-emitted
-			// route_to_api edge is not trusted.
-			continue
-		}
-		evidence := make([]domain.Evidence, 0, len(edge.Evidence))
-		invalidEvidence := 0
-		for _, raw := range edge.Evidence {
-			state.stats.EvidenceChecks++
-			evidencePath, pathErr := normalizeRepoRelativePath(raw.File)
-			if pathErr != nil {
-				state.stats.EvidenceFailures++
-				invalidEvidence++
-				continue
-			}
-			content := s.contentFor(ctx, state, evidencePath)
-			if content.err != nil || content.truncated || !content.ok {
-				state.stats.EvidenceFailures++
-				invalidEvidence++
-				continue
-			}
-			normalized := raw
-			normalized.File = evidencePath
-			validated, err := ValidateEvidence(content.content, normalized, s.config.MaxExcerptLines)
-			if err != nil {
-				state.stats.EvidenceFailures++
-				invalidEvidence++
-				continue
-			}
-			evidence = append(evidence, validated)
-		}
-		mergedEvidence := mergeContractEvidence(evidence)
-		confidence := edge.Confidence
-		// Any invalid edge evidence entry downgrades the edge (§6.2/§6.3),
-		// not only a fully empty valid set.
-		if len(mergedEvidence) == 0 || invalidEvidence > 0 {
-			confidence = domain.ConfidenceLow
-		}
-		edges = append(edges, validatedAIEdge{
-			From:       edge.From,
-			To:         edge.To,
-			Rel:        edge.Rel,
-			Confidence: confidence,
-			Evidence:   mergedEvidence,
-			FactPath:   analysedPath,
-		})
-	}
-	return facts, edges
-}
-
-// materializeFacts versions and upserts every merged fact and returns the
-// fact-version snapshot plus the current fact entities keyed by fact_key.
-//
-// The persisted entity row is always resolved back from the repository: a fact
-// version bump updates the existing row in place (ON CONFLICT keeps its id), so
-// the newly minted candidate id must never leak into code_edge /
-// ImpactInput.FactsAtHead.
-func (s *AnalysisService) materializeFacts(ctx context.Context, state *analysisRunState, facts []*materializedFact) ([]domain.FactVersionRef, map[string]domain.CodeEntity, error) {
-	factEntities := make(map[string]domain.CodeEntity, len(facts))
-	refs := make([]domain.FactVersionRef, 0, len(facts))
-
-	for _, fact := range facts {
-		entity, version, err := s.materializeFact(ctx, state, fact)
-		if err != nil {
-			return nil, nil, err
-		}
-		factEntities[fact.Key] = entity
-		refs = append(refs, domain.FactVersionRef{FactKey: fact.Key, Version: version})
-	}
-
-	sort.Slice(refs, func(i, j int) bool { return refs[i].FactKey < refs[j].FactKey })
-	if len(refs) > domain.MaxFactVersionsSnapshot {
-		refs = refs[:domain.MaxFactVersionsSnapshot]
-	}
-	return refs, factEntities, nil
-}
-
-// materializeFact persists one fact and returns the current persisted entity
-// snapshot plus its version. An unchanged body reuses the current version; a
-// changed body bumps it.
-func (s *AnalysisService) materializeFact(ctx context.Context, state *analysisRunState, fact *materializedFact) (domain.CodeEntity, int, error) {
-	analysis := state.analysis
-	body := marshalFactBody(fact)
-	current, currentVersion, err := s.deps.Facts.Current(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key)
-	switch {
-	case err == nil:
-		existingBody, bodyErr := s.deps.Facts.GetVersion(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, currentVersion)
-		if bodyErr != nil {
-			return domain.CodeEntity{}, 0, bodyErr
-		}
-		if jsonSemanticEqual(existingBody, body) {
-			return *current, currentVersion, nil
-		}
-		return s.writeFactVersion(ctx, state, fact, body, currentVersion+1, current)
-	case errors.Is(err, domain.ErrNotFound):
-		// New fact (or a previous attempt left only the version row): version 1.
-		return s.writeFactVersion(ctx, state, fact, body, 1, nil)
-	default:
-		return domain.CodeEntity{}, 0, err
-	}
-}
-
-// factIDCollisionAttempts bounds the fresh-id retries of an INSERT whose
-// duplicate-key error came from the caller-minted id rather than the fact
-// version identity.
-const factIDCollisionAttempts = 3
-
-// writeFactVersion appends one fact version, tolerating the partial states left
-// by an interrupted earlier attempt (R30). Equal persisted bodies are accepted
-// as the same version; a different persisted body is the DB authority (design
-// spec §6.11 "以 DB 现有记录为准") and is recorded as stats.conflicts instead of
-// wedging every retry on duplicate_key. Finally the upserted entity is read back
-// so callers always receive the persisted row id.
-func (s *AnalysisService) writeFactVersion(ctx context.Context, state *analysisRunState, fact *materializedFact, body []byte, version int, current *domain.CodeEntity) (domain.CodeEntity, int, error) {
-	analysis := state.analysis
-	if version > 1 {
-		if err := s.deps.Facts.Supersede(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, version, s.now()); err != nil {
-			return domain.CodeEntity{}, 0, err
-		}
-	}
-
-	persistedFact := fact
-	for attempt := 0; ; attempt++ {
-		id := s.deps.IDs.Next()
-		if id == 0 {
-			return domain.CodeEntity{}, 0, errors.New("codeintel: id generator returned a zero fact version id")
-		}
-		err := s.deps.Facts.Create(ctx, id, analysis.RepoID, analysis.HeadCommit, fact.Key,
-			analysis.Model, analysis.PromptVersion, version, body, analysis.ID)
-		if err == nil {
+	drafts := make([]edgeCandidate, 0, len(output.Edges))
+	for _, draft := range output.Edges {
+		if len(drafts) >= codeintel.MaxEdgesPerFile {
 			break
 		}
-		if domain.Reason(err) != "duplicate_key" {
-			return domain.CodeEntity{}, 0, err
+		if !draft.Rel.Valid() {
+			continue
 		}
-		stored, getErr := s.deps.Facts.GetVersion(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, version)
-		switch {
-		case getErr == nil && jsonSemanticEqual(stored, body):
-			// The interrupted attempt left the exact same version body.
-		case getErr == nil:
-			adopted, decodeErr := materializedFactFromBody(fact.Key, stored)
-			if decodeErr != nil {
-				return domain.CodeEntity{}, 0,
-					fmt.Errorf("codeintel: decode persisted fact %q version %d: %w", fact.Key, version, decodeErr)
-			}
-			persistedFact = adopted
-			state.stats.Conflicts++
-		case errors.Is(getErr, domain.ErrNotFound):
-			// The duplicate came from another unique constraint (the caller
-			// id): mint a fresh snowflake and retry the same version.
-			if attempt+1 < factIDCollisionAttempts {
-				continue
-			}
-			return domain.CodeEntity{}, 0, err
-		default:
-			return domain.CodeEntity{}, 0, getErr
+		src := strings.TrimSpace(draft.SrcFactKey)
+		dst := strings.TrimSpace(draft.DstFactKey)
+		if src == "" || dst == "" || src == dst || len(src) > codeintel.MaxFactKeyChars || len(dst) > codeintel.MaxFactKeyChars {
+			continue
 		}
-		break
+		confidence := draft.Confidence
+		if !confidence.Valid() {
+			confidence = codeintel.ConfidenceMedium
+		}
+		drafts = append(drafts, edgeCandidate{srcKey: src, dstKey: dst, rel: draft.Rel, confidence: confidence})
 	}
-
-	entity := s.factEntity(state, persistedFact, version)
-	if current != nil {
-		// ON CONFLICT updates the existing row in place: reuse its id so the
-		// edges materialised below never reference the discarded minted id.
-		entity.ID = current.ID
-		entity.CreatedAt = current.CreatedAt
-	}
-	if err := s.deps.Entities.Upsert(ctx, entity); err != nil {
-		return domain.CodeEntity{}, 0, err
-	}
-	persisted, err := s.deps.Entities.GetByFactKey(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key)
-	if err != nil {
-		return domain.CodeEntity{}, 0,
-			fmt.Errorf("codeintel: resolve persisted fact %q: %w", fact.Key, err)
-	}
-	return persisted, version, nil
+	return facts, drafts, stats
 }
 
-// materializedFactFromBody reconstructs the fact fields of one persisted
-// canonical fact body so the DB-authoritative version can refresh the current
-// entity after a retry conflict.
-func materializedFactFromBody(key string, body []byte) (*materializedFact, error) {
-	var document factBodyJSON
-	if err := json.Unmarshal(body, &document); err != nil {
-		return nil, err
-	}
-	return &materializedFact{
-		Key:             key,
-		Kind:            document.Kind,
-		Name:            document.Name,
-		Path:            document.Path,
-		StartLine:       document.StartLine,
-		EndLine:         document.EndLine,
-		Signature:       document.Signature,
-		Confidence:      document.Confidence,
-		Summary:         document.Summary,
-		Evidence:        document.Evidence,
-		Clue:            document.Clue,
-		LinesValid:      true,
-		InvalidEvidence: document.InvalidEvidence,
-	}, nil
-}
-
-// factEntity builds the current code_entity snapshot of one fact version. The
-// snowflake id is minted by the application layer (D29); the repository keeps
-// the existing row id when it updates a fact in place.
-func (s *AnalysisService) factEntity(state *analysisRunState, fact *materializedFact, version int) domain.CodeEntity {
-	analysis := state.analysis
-	key := fact.Key
-	versionCopy := version
-	analysisID := analysis.ID
-	startLine := fact.StartLine
-	endLine := fact.EndLine
-	now := s.now()
-	return domain.CodeEntity{
-		ID:          s.deps.IDs.Next(),
-		RepoID:      analysis.RepoID,
-		Commit:      analysis.HeadCommit,
-		Kind:        fact.Kind,
-		Path:        fact.Path,
-		Name:        fact.Name,
-		StartLine:   &startLine,
-		EndLine:     &endLine,
-		Signature:   fact.Signature,
-		Source:      domain.SourceAI,
-		Confidence:  fact.Confidence,
-		Evidence:    fact.Evidence,
-		Meta:        marshalFactMeta(fact),
-		FactKey:     &key,
-		FactVersion: &versionCopy,
-		AnalysisID:  &analysisID,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
-}
-
-// materializeEdges resolves AI edges against the current fact entities,
-// generates the cross-stack contract edges, and replaces the edge set of every
-// materialised fact exactly once (design spec §6.2/§6.5). Endpoints that cannot
-// be resolved are counted in stats.unresolvedEdges. The returned map is the
-// full fact view at head (materialised facts + the head contract facts) handed
-// to the planner.
-func (s *AnalysisService) materializeEdges(ctx context.Context, state *analysisRunState, factEntities map[string]domain.CodeEntity, edges []validatedAIEdge) (map[string]domain.CodeEntity, error) {
-	analysis := state.analysis
-	ownerEdges := make(map[string][]domain.CodeEdge, len(factEntities))
-	for key := range factEntities {
-		ownerEdges[key] = nil
-	}
-
-	for _, edge := range edges {
-		fromKey, err := domain.FactKey(edge.From.Kind, edge.From.Name, edge.FactPath)
-		if err != nil {
-			state.stats.UnresolvedEdges++
-			continue
-		}
-		toKey, err := domain.FactKey(edge.To.Kind, edge.To.Name, edge.FactPath)
-		if err != nil {
-			state.stats.UnresolvedEdges++
-			continue
-		}
-		fromEntity, ok := factEntities[fromKey]
-		if !ok {
-			state.stats.UnresolvedEdges++
-			continue
-		}
-		toEntity, ok := factEntities[toKey]
-		if !ok {
-			state.stats.UnresolvedEdges++
-			continue
-		}
-		ownerEdges[fromKey] = append(ownerEdges[fromKey], s.codeEdge(analysis, fromEntity, toEntity, edge.Rel,
-			edge.Confidence, edge.Evidence, fromKey, fromEntity, edgeMeta(fromEntity, toEntity)))
-	}
-
-	factsAtHead, err := s.loadContractFacts(ctx, analysis.RepoID, analysis.HeadCommit)
-	if err != nil {
-		return nil, err
-	}
-	allFacts := make(map[string]domain.CodeEntity, len(factsAtHead)+len(factEntities))
-	for _, entity := range factsAtHead {
-		if entity.FactKey != nil {
-			allFacts[*entity.FactKey] = entity
-		}
-	}
-	for key, entity := range factEntities {
-		allFacts[key] = entity
-	}
-	contractFacts := make([]domain.CodeEntity, 0, len(allFacts))
-	for _, entity := range allFacts {
-		contractFacts = append(contractFacts, entity)
-	}
-	sort.Slice(contractFacts, func(i, j int) bool {
-		return factKeyOf(contractFacts[i]) < factKeyOf(contractFacts[j])
-	})
-	matched := matchContractStats(contractFacts)
-	state.stats.Contracts = len(matched.pairs)
-	state.stats.UnmatchedContracts = matched.unmatched
-	state.stats.ContractTruncated = matched.truncated
-	// Exactly one owner per matched pair (R31): the client side when this run
-	// materialised it, else the api side. A pair materialised by neither side
-	// belongs to an earlier analysis and is not rewritten here, so ownership can
-	// never be double-written inside one run.
-	ownedPairs := make(map[string]struct{}, len(matched.pairs))
-	for _, pair := range matched.pairs {
-		clientEntity, clientOK := allFacts[pair.ClientFactKey]
-		apiEntity, apiOK := allFacts[pair.APIFactKey]
-		if !clientOK || !apiOK {
-			continue
-		}
-		ownerKey, owner, ok := contractPairOwner(pair, factEntities)
-		if !ok {
-			continue
-		}
-		edgeIdentity := pair.ClientFactKey + "\x00" + pair.APIFactKey
-		if _, duplicate := ownedPairs[edgeIdentity]; duplicate {
-			continue
-		}
-		ownedPairs[edgeIdentity] = struct{}{}
-		meta := contractEdgeMeta(pair.Method, pair.NormalizedPath)
-		ownerEdges[ownerKey] = append(ownerEdges[ownerKey], s.codeEdge(analysis, clientEntity, apiEntity,
-			domain.RelRouteToAPI, pair.Confidence, pair.Evidence, ownerKey, owner, meta))
-	}
-
-	keys := make([]string, 0, len(factEntities))
-	for key := range factEntities {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	edgeCount := 0
-	for _, key := range keys {
-		entity := factEntities[key]
-		version := factVersionOf(entity)
-		owns := ownerEdges[key]
-		if err := s.deps.Edges.ReplaceFactEdges(ctx, analysis.RepoID, analysis.HeadCommit, key, version, owns); err != nil {
-			return nil, err
-		}
-		edgeCount += len(owns)
-	}
-	state.stats.Edges = edgeCount
-	return allFacts, nil
-}
-
-// contractPairOwner applies the deterministic R31 owner preference: a client
-// fact materialised by this run wins, otherwise the materialised api fact. A
-// pair with no materialised side is left untouched.
-func contractPairOwner(pair ContractPair, materialized map[string]domain.CodeEntity) (string, domain.CodeEntity, bool) {
-	if entity, ok := materialized[pair.ClientFactKey]; ok {
-		return pair.ClientFactKey, entity, true
-	}
-	if entity, ok := materialized[pair.APIFactKey]; ok {
-		return pair.APIFactKey, entity, true
-	}
-	return "", domain.CodeEntity{}, false
-}
-
-// codeEdge builds one materialised AI edge owned by factKey.
-func (s *AnalysisService) codeEdge(analysis domain.CodeAnalysis, src, dst domain.CodeEntity, rel, confidence string,
-	evidence []domain.Evidence, factKey string, owner domain.CodeEntity, meta []byte) domain.CodeEdge {
-	key := factKey
-	version := factVersionOf(owner)
-	analysisID := analysis.ID
-	return domain.CodeEdge{
-		ID:          s.deps.IDs.Next(),
-		RepoID:      analysis.RepoID,
-		Commit:      analysis.HeadCommit,
-		SrcEntityID: src.ID,
-		DstEntityID: dst.ID,
-		Rel:         rel,
-		Source:      domain.SourceAI,
-		Confidence:  confidence,
-		Evidence:    evidence,
-		Meta:        meta,
-		FactKey:     &key,
-		FactVersion: &version,
-		AnalysisID:  &analysisID,
-	}
-}
-
-// loadContractFacts collects the client_call and api fact entities at the head
-// commit so the contract matcher can pair a changed side with an unchanged one.
-// The scan is bounded by MaxIndexFiles.
-func (s *AnalysisService) loadContractFacts(ctx context.Context, repoID int64, commit string) ([]domain.CodeEntity, error) {
-	facts := make([]domain.CodeEntity, 0)
-	seen := make(map[int64]struct{})
-	for _, kind := range []string{domain.KindClientCall, domain.KindAPI} {
-		cursor := ""
-		for len(facts) < s.config.MaxIndexFiles {
-			page, next, more, err := s.deps.Entities.List(ctx, repoID, domain.EntityFilter{
-				Commit: commit,
-				Kind:   kind,
-				Limit:  contractFactPageSize,
-				Cursor: cursor,
-			})
-			if err != nil {
-				return nil, err
-			}
-			for _, entity := range page {
-				if entity.FactKey == nil {
-					continue
-				}
-				if _, ok := seen[entity.ID]; ok {
-					continue
-				}
-				seen[entity.ID] = struct{}{}
-				facts = append(facts, entity)
-			}
-			if !more {
-				break
-			}
-			if next == "" || next == cursor {
-				return nil, errors.New("codeintel: contract fact cursor did not advance")
-			}
-			cursor = next
-		}
-	}
-	return facts, nil
-}
-
-// factsAtHead loads the current fact entities for the planner handoff (本次分析
-// 产出 + 既有缓存/实体, design spec §6.6 input 3). The changed files supply the
-// existing facts (from earlier analyses or the file cache); materialized
-// supplies every fact produced by this run, including facts the model
-// attributed to a file outside the change set (for example a route declared in
-// a router file while another file was analysed); headFacts (the bounded
-// contract scan) supplies the unchanged counterpart of a contract pair so T13
-// can propagate api→client. The facts declared at those counterpart paths are
-// loaded too (R38), so T13 can continue client→page/component at the same path.
-// Precedence: materialized > headFacts > path scan > companion load.
-func (s *AnalysisService) factsAtHead(ctx context.Context, state *analysisRunState, changedPaths []string, materialized, headFacts map[string]domain.CodeEntity) ([]domain.CodeEntity, error) {
-	entities, err := s.deps.Entities.ListByPaths(ctx, state.analysis.RepoID, state.analysis.HeadCommit, changedPaths)
-	if err != nil {
-		return nil, err
-	}
-	byKey := make(map[string]domain.CodeEntity, len(entities)+len(headFacts)+len(materialized))
-	for _, entity := range entities {
-		if entity.FactKey != nil {
-			byKey[*entity.FactKey] = entity
-		}
-	}
-	for key, entity := range headFacts {
-		byKey[key] = entity
-	}
-	for key, entity := range materialized {
-		byKey[key] = entity
-	}
-	// R38: the contract scan only loads the counterpart client_call/api fact
-	// itself. Companion facts at the counterpart's path (page/component/…) are
-	// what T13 indexes a propagation hit to, so load every fact at the
-	// counterpart paths that the changed-file scan did not already supply. The
-	// path list and the number of merged companion facts reuse MaxIndexFiles,
-	// the existing bound of one analysis' head fact scan.
-	companionPaths := contractCounterpartPaths(headFacts, changedPaths, s.config.MaxIndexFiles)
-	if len(companionPaths) > 0 {
-		companions, err := s.deps.Entities.ListByPaths(ctx, state.analysis.RepoID, state.analysis.HeadCommit, companionPaths)
-		if err != nil {
-			return nil, err
-		}
-		seenIDs := make(map[int64]struct{}, len(byKey))
-		for _, entity := range byKey {
-			if entity.ID != 0 {
-				seenIDs[entity.ID] = struct{}{}
-			}
-		}
-		added := 0
-		for _, entity := range companions {
-			if entity.FactKey == nil {
-				continue
-			}
-			if _, ok := byKey[*entity.FactKey]; ok {
-				continue
-			}
-			if entity.ID != 0 {
-				if _, ok := seenIDs[entity.ID]; ok {
-					continue
-				}
-			}
-			if added >= s.config.MaxIndexFiles {
-				break
-			}
-			byKey[*entity.FactKey] = entity
-			if entity.ID != 0 {
-				seenIDs[entity.ID] = struct{}{}
-			}
-			added++
-		}
-	}
-	facts := make([]domain.CodeEntity, 0, len(byKey))
-	for _, entity := range byKey {
-		facts = append(facts, entity)
-	}
-	sort.Slice(facts, func(i, j int) bool {
-		if factKeyOf(facts[i]) != factKeyOf(facts[j]) {
-			return factKeyOf(facts[i]) < factKeyOf(facts[j])
-		}
-		return facts[i].ID < facts[j].ID
-	})
-	return facts, nil
-}
-
-// contractCounterpartPaths returns the deterministic, capped set of paths that
-// carry an eligible contract fact at head and are not part of the changed-file
-// scan. The head contract facts are the client_call/api facts of the bounded
-// contract scan; the changed paths are already loaded as a whole by
-// factsAtHead, so only the counterpart paths need a second read (R38).
-func contractCounterpartPaths(headFacts map[string]domain.CodeEntity, changedPaths []string, limit int) []string {
-	changed := make(map[string]struct{}, len(changedPaths))
-	for _, path := range changedPaths {
-		changed[path] = struct{}{}
-	}
-	seen := make(map[string]struct{}, len(headFacts))
-	paths := make([]string, 0, len(headFacts))
-	for _, entity := range headFacts {
-		if entity.Kind != domain.KindClientCall && entity.Kind != domain.KindAPI {
-			continue
-		}
-		if entity.Path == "" {
-			continue
-		}
-		if _, ok := changed[entity.Path]; ok {
-			continue
-		}
-		if _, ok := seen[entity.Path]; ok {
-			continue
-		}
-		seen[entity.Path] = struct{}{}
-		paths = append(paths, entity.Path)
-	}
-	sort.Strings(paths)
-	if limit > 0 && len(paths) > limit {
-		paths = paths[:limit]
-	}
-	return paths
-}
-
-// prepareCandidates assigns the application snowflake ids, the analysis id and
-// the default selection of design spec §6.6 step 6 / INV-7.
-func (s *AnalysisService) prepareCandidates(analysisID int64, candidates []domain.ImpactCandidate) []domain.ImpactCandidate {
-	prepared := make([]domain.ImpactCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		candidate.ID = s.deps.IDs.Next()
-		candidate.AnalysisID = analysisID
-		candidate.Selected = domain.DefaultSelected(candidate.Confidence)
-		if len(candidate.Reason) > domain.MaxReasonChars {
-			candidate.Reason = truncateRunesLimit(candidate.Reason, domain.MaxReasonChars)
-		}
-		prepared = append(prepared, candidate)
-	}
-	return prepared
-}
-
-// storeCachedFileAnalysis caches one successful, evidence-validated file
-// analysis under a snowflake id (design spec §6.4/§6.11).
-func (s *AnalysisService) storeCachedFileAnalysis(ctx context.Context, state *analysisRunState, file domain.ChangedFile, result analysisFileResult, parseStats ParseStats) error {
-	analysis := state.analysis
-	document := cachedFileAnalysisFrom(result)
-	factsJSON, err := json.Marshal(document)
+// insertContractEdges materializes route_to_api edges for exact
+// (method, normalizedPath) client_call × api matches (spec §5.2).
+func (s *AnalysisService) insertContractEdges(ctx context.Context, analysis codeintel.Analysis, entityIDs map[string]int64, acc *analysisAccumulator) error {
+	latest, err := s.facts.LatestByCommit(ctx, analysis.RepoID, analysis.HeadCommitSHA,
+		[]codeintel.EntityKind{codeintel.EntityAPI, codeintel.EntityClientCall})
 	if err != nil {
 		return err
 	}
-	statsJSON, err := json.Marshal(parseStats)
-	if err != nil {
-		return err
+	// Facts may come from an earlier analysis, so their entity projection is not
+	// necessarily in the in-memory map.
+	factKeys := make([]string, 0, len(latest))
+	for _, fact := range latest {
+		factKeys = append(factKeys, fact.FactKey)
 	}
-	now := s.now()
-	return s.deps.Cache.Upsert(ctx, domain.CachedFile{
-		ID:            s.deps.IDs.Next(),
-		RepoID:        analysis.RepoID,
-		Commit:        analysis.HeadCommit,
-		Path:          file.Path,
-		FileHash:      file.HeadBlobHash,
-		Model:         analysis.Model,
-		PromptVersion: analysis.PromptVersion,
-		Facts:         factsJSON,
-		Stats:         statsJSON,
-		CreatedAt:     now,
-		LastUsedAt:    now,
-	})
-}
-
-// publishChanged publishes code.changed after the change set is ready. Event
-// failures are ignored: the database is authoritative (design spec §6.9).
-func (s *AnalysisService) publishChanged(ctx context.Context, versionID int64, analysis domain.CodeAnalysis, changeSet domain.CodeChangeSet) {
-	if s.deps.Notifier == nil {
-		return
-	}
-	paths := changedFilePaths(changeSet.Files)
-	if len(paths) > eventPathLimit {
-		paths = paths[:eventPathLimit]
-	}
-	_ = s.deps.Notifier.Changed(ctx, versionID, ChangedEvent{
-		AnalysisID: analysis.ID,
-		BaseCommit: analysis.BaseCommit,
-		HeadCommit: analysis.HeadCommit,
-		Stats:      changeSet.Stats,
-		Paths:      paths,
-	})
-}
-
-// publishImpact publishes code.impact_computed with counts and evidence paths
-// only (never code content, design spec §6.9).
-func (s *AnalysisService) publishImpact(ctx context.Context, analysis domain.CodeAnalysis, candidates []domain.ImpactCandidate, unmapped []domain.UnmappedChange) {
-	if s.deps.Notifier == nil {
-		return
-	}
-	counts := map[string]int{
-		"requirements": 0,
-		"appModels":    0,
-		"unmapped":     len(unmapped),
-		"candidates":   len(candidates),
-	}
-	pathSet := make(map[string]struct{})
-	for _, candidate := range candidates {
-		switch candidate.SubjectKind {
-		case domain.CandidateRequirement:
-			counts["requirements"]++
-		case domain.CandidateAppModel:
-			counts["appModels"]++
+	if len(factKeys) > 0 {
+		projected, projectionErr := s.entities.EntitiesByFactKeys(ctx, analysis.RepoID, analysis.HeadCommitSHA, factKeys)
+		if projectionErr != nil {
+			return projectionErr
 		}
-		for _, evidence := range candidate.Evidence {
-			if evidence.File != "" {
-				pathSet[evidence.File] = struct{}{}
-			}
+		for _, entity := range projected {
+			entityIDs[entity.FactKey] = entity.ID
 		}
 	}
-	paths := make([]string, 0, len(pathSet))
-	for path := range pathSet {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	if len(paths) > eventPathLimit {
-		paths = paths[:eventPathLimit]
-	}
-	_ = s.deps.Notifier.ImpactComputed(ctx, analysis.VersionID, ImpactEvent{
-		AnalysisID:      analysis.ID,
-		AnalysisVersion: int64(analysis.AnalysisVersion),
-		Status:          analysis.Status,
-		Degraded:        analysis.Degraded,
-		Counts:          counts,
-		Paths:           paths,
-	})
-}
-
-// auditTrigger records the analysis trigger (or reuse) with identifiers only.
-func (s *AnalysisService) auditTrigger(ctx context.Context, actorID int64, analysis domain.CodeAnalysis) {
-	if s.deps.Audit == nil {
-		return
-	}
-	_ = s.deps.Audit.Record(ctx, actorID, auditActionCodeAnalyze,
-		"analysis:"+strconv.FormatInt(analysis.ID, 10), map[string]any{
-			"versionId":  strconv.FormatInt(analysis.VersionID, 10),
-			"analysisId": strconv.FormatInt(analysis.ID, 10),
-			"baseCommit": analysis.BaseCommit,
-			"headCommit": analysis.HeadCommit,
-			"status":     analysis.Status,
-		})
-}
-
-// auditCompletion records the analysis completion with identifiers only.
-func (s *AnalysisService) auditCompletion(ctx context.Context, analysis domain.CodeAnalysis) {
-	if s.deps.Audit == nil {
-		return
-	}
-	_ = s.deps.Audit.Record(ctx, analysis.CreatedBy, auditActionCodeAnalyze,
-		"analysis:"+strconv.FormatInt(analysis.ID, 10), map[string]any{
-			"versionId":  strconv.FormatInt(analysis.VersionID, 10),
-			"analysisId": strconv.FormatInt(analysis.ID, 10),
-			"baseCommit": analysis.BaseCommit,
-			"headCommit": analysis.HeadCommit,
-			"status":     analysis.Status,
-		})
-}
-
-// mergeAnalysisStats encodes the file-level stats and overlays the planner's
-// own stats keys. The map encoding is deterministic (encoding/json sorts map
-// keys), which keeps INV-4 reproducible.
-func mergeAnalysisStats(stats analysisStats, extra []byte) ([]byte, error) {
-	base, err := json.Marshal(stats)
-	if err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(extra)) == 0 {
-		return base, nil
-	}
-	var merged map[string]any
-	if err := json.Unmarshal(base, &merged); err != nil {
-		return nil, err
-	}
-	var overlay map[string]any
-	if err := json.Unmarshal(extra, &overlay); err != nil {
-		return nil, fmt.Errorf("codeintel: decode planner stats: %w", err)
-	}
-	for key, value := range overlay {
-		merged[key] = value
-	}
-	return json.Marshal(merged)
-}
-
-// marshalFactBody encodes the canonical body of one fact version (fact + valid
-// evidence + summary, no floats; evidence is sorted so the bytes are
-// deterministic).
-func marshalFactBody(fact *materializedFact) []byte {
-	body := factBodyJSON{
-		Kind:            fact.Kind,
-		Name:            fact.Name,
-		Path:            fact.Path,
-		StartLine:       fact.StartLine,
-		EndLine:         fact.EndLine,
-		Signature:       fact.Signature,
-		Confidence:      fact.Confidence,
-		Summary:         fact.Summary,
-		Evidence:        fact.Evidence,
-		Clue:            fact.Clue,
-		InvalidEvidence: fact.InvalidEvidence,
-	}
-	raw, _ := json.Marshal(body)
-	return raw
-}
-
-// marshalFactMeta encodes the JSONB meta of one fact entity.
-func marshalFactMeta(fact *materializedFact) []byte {
-	meta := factMetaJSON{Clue: fact.Clue, InvalidEvidence: fact.InvalidEvidence}
-	if !fact.Clue && fact.InvalidEvidence == 0 {
-		return []byte("{}")
-	}
-	raw, _ := json.Marshal(meta)
-	return raw
-}
-
-// jsonSemanticEqual compares two JSON documents semantically, so a JSONB
-// round-trip (key order, whitespace) never looks like a fact change.
-func jsonSemanticEqual(left, right []byte) bool {
-	leftValue, err := decodeJSONValue(left)
-	if err != nil {
-		return false
-	}
-	rightValue, err := decodeJSONValue(right)
-	if err != nil {
-		return false
-	}
-	return reflect.DeepEqual(leftValue, rightValue)
-}
-
-// decodeJSONValue decodes one JSON document with json.Number so integer ids and
-// line numbers never pass through float64.
-func decodeJSONValue(raw []byte) (any, error) {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return nil, err
-	}
-	return value, nil
-}
-
-// mergeMaterializedFacts merges same-run duplicate fact_keys in file order
-// (design spec §6.4): the higher confidence wins, evidence is merged and the
-// first non-empty summary is kept. The result is sorted by fact_key.
-func mergeMaterializedFacts(results []analysisFileResult) ([]*materializedFact, int) {
-	byKey := make(map[string]*materializedFact)
-	duplicates := 0
-	for _, result := range results {
-		for _, fact := range result.facts {
-			existing, ok := byKey[fact.Key]
-			if !ok {
-				copied := *fact
-				copied.Evidence = append([]domain.Evidence(nil), fact.Evidence...)
-				byKey[fact.Key] = &copied
-				continue
-			}
-			duplicates++
-			existing.Evidence = mergeContractEvidence(existing.Evidence, fact.Evidence)
-			if confidenceRankForContract(fact.Confidence) < confidenceRankForContract(existing.Confidence) {
-				existing.Confidence = fact.Confidence
-			}
-			if existing.Summary == "" {
-				existing.Summary = fact.Summary
-			}
-			existing.LinesValid = existing.LinesValid || fact.LinesValid
-			existing.InvalidEvidence += fact.InvalidEvidence
-			existing.Clue = !existing.LinesValid || len(existing.Evidence) == 0 || existing.InvalidEvidence > 0
-			if existing.Clue {
-				existing.Confidence = domain.ConfidenceLow
-			}
+	apis := make(map[string]codeintel.Fact)
+	clients := make([]codeintel.Fact, 0, len(latest))
+	for _, fact := range latest {
+		switch fact.Kind {
+		case codeintel.EntityAPI:
+			apis[strings.TrimPrefix(fact.FactKey, "api:")] = fact
+		case codeintel.EntityClientCall:
+			clients = append(clients, fact)
 		}
 	}
-	keys := make([]string, 0, len(byKey))
-	for key := range byKey {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	facts := make([]*materializedFact, 0, len(keys))
-	for _, key := range keys {
-		facts = append(facts, byKey[key])
-	}
-	return facts, duplicates
-}
+	sort.Slice(clients, func(i, j int) bool { return clients[i].FactKey < clients[j].FactKey })
 
-// joinedChangeSummaries joins the per-file change summaries in deterministic
-// file order.
-func joinedChangeSummaries(results []analysisFileResult) string {
-	ordered := make([]analysisFileResult, len(results))
-	copy(ordered, results)
-	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].path < ordered[j].path })
-	parts := make([]string, 0, len(ordered))
-	for _, result := range ordered {
-		summary := strings.TrimSpace(result.changeSummary)
-		if summary != "" {
-			parts = append(parts, summary)
+	remaining := codeintel.MaxEdgesPerFile
+	for _, client := range clients {
+		if remaining <= 0 {
+			break
 		}
+		tail := strings.TrimPrefix(client.FactKey, "client:")
+		api, ok := apis[tail]
+		if !ok {
+			acc.addUnmapped(client.Path, "unmatched_contract")
+			continue
+		}
+		srcID, srcOK := entityIDs[client.FactKey]
+		dstID, dstOK := entityIDs[api.FactKey]
+		if !srcOK || !dstOK {
+			acc.addUnmapped(client.Path, "unmatched_contract")
+			continue
+		}
+		edge := codeintel.Edge{
+			ID: s.ids.Next(), RepoID: analysis.RepoID, CommitSHA: analysis.HeadCommitSHA,
+			AnalysisID: &analysis.ID, SrcEntityID: srcID, DstEntityID: dstID,
+			Rel: codeintel.EdgeRouteToAPI, Source: "ai",
+			Confidence: minConfidence(client.Confidence, api.Confidence),
+			Evidence:   json.RawMessage(`[]`), Meta: json.RawMessage(`{}`),
+			FactKey:     truncateString(client.FactKey+"->"+api.FactKey, codeintel.MaxFactKeyChars),
+			FactVersion: 1, CreatedAt: s.clock.Now(), UpdatedAt: s.clock.Now(),
+		}
+		if err := s.entities.UpsertEdge(ctx, edge); err != nil {
+			return err
+		}
+		acc.edgesStored++
+		remaining--
 	}
-	return strings.Join(parts, "；")
+	return nil
 }
 
-// changedFilePaths returns the sorted paths of the change set.
-func changedFilePaths(files []domain.ChangedFile) []string {
-	paths := make([]string, 0, len(files))
-	for _, file := range files {
-		paths = append(paths, file.Path)
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-// normalizeRepoRelativePath validates and cleans one repository-relative slash
-// path. It rejects empty, absolute and escaping paths and bounds the length; the
-// fact identity additionally rejects '#' (see normalizeFactEntityPath), while
-// evidence may legitimately reference a file whose name contains '#'.
-func normalizeRepoRelativePath(raw string) (string, error) {
-	normalized := strings.TrimSpace(strings.ReplaceAll(raw, `\`, "/"))
-	if normalized == "" {
-		return "", errors.New("codeintel: path is required")
-	}
-	if strings.HasPrefix(normalized, "/") || path.IsAbs(normalized) {
-		return "", errors.New("codeintel: path must be repository-relative")
-	}
-	cleaned := path.Clean(normalized)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", errors.New("codeintel: path escapes the repository root")
-	}
-	if len(cleaned) > domain.MaxPathChars {
-		return "", errors.New("codeintel: path exceeds the path bound")
-	}
-	return cleaned, nil
-}
-
-// normalizeFactEntityPath validates and cleans one fact path so an entity row can
-// never point outside the repository or exceed the DDL bound.
-func normalizeFactEntityPath(raw string) (string, error) {
-	cleaned, err := normalizeRepoRelativePath(raw)
+// Latest returns the newest analysis of a version×repo.
+func (s *AnalysisService) Latest(ctx context.Context, versionID, repoID int64) (codeintel.Analysis, error) {
+	analysis, err := s.analyses.Latest(ctx, versionID, repoID)
 	if err != nil {
-		return "", err
+		return codeintel.Analysis{}, mapDomainError(err, "code analysis")
 	}
-	if strings.Contains(cleaned, "#") {
-		return "", errors.New("codeintel: fact path must not contain '#'")
-	}
-	return cleaned, nil
+	return analysis, nil
 }
 
-// isRunContextError reports whether err (or the run context) is a cancellation
-// or deadline, which must fail the run rather than degrade a single file.
-func isRunContextError(ctx context.Context, err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
+// Get returns one analysis.
+func (s *AnalysisService) Get(ctx context.Context, analysisID int64) (codeintel.Analysis, error) {
+	analysis, err := s.analyses.Get(ctx, analysisID)
+	if err != nil {
+		return codeintel.Analysis{}, mapDomainError(err, "code analysis")
 	}
-	if ctx == nil {
-		return false
-	}
-	return errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled)
+	return analysis, nil
 }
 
-// truncateRunesLimit cuts s to at most limit runes and marks the cut.
-func truncateRunesLimit(s string, limit int) string {
+// Facts pages the current facts of a commit.
+func (s *AnalysisService) Facts(ctx context.Context, repoID int64, commit, kind, pathFilter, cursor string, limit int) ([]codeintel.Fact, string, bool, error) {
+	commit = strings.TrimSpace(commit)
+	if !ValidCommitSHA(commit) {
+		return nil, "", false, platform.Invalid("commit", "must be a 40-character lowercase hex commit SHA")
+	}
+	if kind != "" && !codeintel.EntityKind(kind).Valid() {
+		return nil, "", false, platform.Invalid("kind", "must be a supported code entity kind")
+	}
+	if pathFilter != "" {
+		normalized, err := codeintel.NormalizeRepoPath(pathFilter)
+		if err != nil {
+			return nil, "", false, unprocessable("path_escape", "path must be a normalized repo-relative path")
+		}
+		pathFilter = normalized
+	}
 	if limit <= 0 {
-		return ""
+		limit = 50
 	}
-	runes := []rune(s)
-	if len(runes) <= limit {
-		return s
+	if limit > 100 {
+		limit = 100
 	}
-	return string(runes[:limit])
+	return s.facts.List(ctx, repoID, commit, kind, pathFilter, strings.TrimSpace(cursor), limit)
 }
 
-// edgeMeta encodes the JSONB meta of one AI edge.
-func edgeMeta(from, to domain.CodeEntity) []byte {
-	raw, _ := json.Marshal(aiEdgeMetaJSON{
-		From: cachedEdgeEndpointJSON{Kind: from.Kind, Name: from.Name},
-		To:   cachedEdgeEndpointJSON{Kind: to.Kind, Name: to.Name},
+// Search finds entities by path/name substring.
+func (s *AnalysisService) Search(ctx context.Context, repoID int64, commit, query, kind string, limit int) ([]codeintel.Entity, error) {
+	commit = strings.TrimSpace(commit)
+	if !ValidCommitSHA(commit) {
+		return nil, platform.Invalid("commit", "must be a 40-character lowercase hex commit SHA")
+	}
+	query = strings.TrimSpace(query)
+	if query == "" || len([]rune(query)) > 500 {
+		return nil, platform.Invalid("q", "must be between 1 and 500 characters")
+	}
+	if kind != "" && !codeintel.EntityKind(kind).Valid() {
+		return nil, platform.Invalid("kind", "must be a supported code entity kind")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	return s.entities.Search(ctx, repoID, commit, query, kind, limit)
+}
+
+// Changes previews the version baseline..head change set without persisting it.
+func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, headCommit string) (ChangeSet, error) {
+	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	if _, ok := bindingForRepo(bindings, repoID); !ok {
+		return ChangeSet{}, platform.NotFound("repository")
+	}
+	base, baselineErr := baselineForRepo(bindings, repoID)
+	if baselineErr != nil {
+		return ChangeSet{}, baselineErr
+	}
+	base = strings.TrimSpace(base)
+	if base == "" || !ValidCommitSHA(base) {
+		return ChangeSet{}, unprocessable("baseline_commit_missing", "the version baseline commit is not resolved; index the repository first")
+	}
+	repository, err := s.resources.CodeRepository(ctx, repoID)
+	if err != nil {
+		return ChangeSet{}, mapDomainError(err, "code repository")
+	}
+	head := strings.TrimSpace(headCommit)
+	if head != "" {
+		resolved, resolveErr := s.git.ResolveCommit(ctx, repository.Path, head)
+		if resolveErr != nil {
+			return ChangeSet{}, resolveErr
+		}
+		head = resolved
+	} else {
+		resolved, headErr := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
+		if headErr != nil {
+			return ChangeSet{}, headErr
+		}
+		head = resolved
+	}
+	if head != base {
+		ancestor, ancestorErr := s.git.IsAncestor(ctx, repository.Path, base, head)
+		if ancestorErr != nil {
+			return ChangeSet{}, ancestorErr
+		}
+		if !ancestor {
+			return ChangeSet{}, unprocessable("invalid_head", "head commit must descend from the version baseline commit")
+		}
+	}
+	result, err := s.git.Diff(ctx, repository.Path, base, head, codeintel.MaxChangedFilesStored)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	return ChangeSet{RepoID: repoID, BaseCommitSHA: base, HeadCommitSHA: head, Files: result.Files, Truncated: result.Truncated}, nil
+}
+
+// failAnalysis persists the failed terminal state and publishes the failure.
+func (s *AnalysisService) failAnalysis(ctx context.Context, analysis codeintel.Analysis, cause error) {
+	code := "internal"
+	message := "code analysis failed"
+	var apiErr *platform.Error
+	if errors.As(cause, &apiErr) {
+		code = apiErr.Code
+		if strings.TrimSpace(apiErr.Message) != "" {
+			message = apiErr.Message
+		}
+	}
+	var recorded []map[string]any
+	if len(analysis.Errors) > 0 {
+		_ = json.Unmarshal(analysis.Errors, &recorded)
+	}
+	if len(recorded) < codeintel.MaxAnalysisErrors {
+		recorded = append(recorded, map[string]any{"code": code, "message": truncateString(message, 500)})
+	}
+	now := s.clock.Now()
+	analysis.Status = codeintel.AnalysisFailed
+	analysis.FinishedAt = &now
+	analysis.UpdatedAt = now
+	analysis.Errors = mustJSON(recorded)
+	if err := s.analyses.Update(ctx, analysis); err != nil {
+		return
+	}
+	s.publishAnalysis(ctx, "code.analysis_failed", analysis, map[string]any{
+		"analysis_id": platformidFormat(analysis.ID),
+		"error_code":  code,
+		"message":     truncateString(message, 500),
 	})
+}
+
+// publishAnalysis emits one analysis event on the version channel.
+func (s *AnalysisService) publishAnalysis(ctx context.Context, eventType string, analysis codeintel.Analysis, payload map[string]any) {
+	publishEvent(ctx, s.events, eventType, analysis.VersionID, payload)
+}
+
+func (s *AnalysisService) recordAudit(ctx context.Context, action, targetKind, targetID string, metadata map[string]any) {
+	recordAudit(ctx, s.audit, action, targetKind, targetID, metadata)
+}
+
+// AnalysisWorkHandler adapts AnalysisService.Execute to the code.analyze work
+// type.
+type AnalysisWorkHandler struct {
+	Service *AnalysisService
+}
+
+// Handle decodes {analysis_id} and executes that T1 analysis.
+func (h AnalysisWorkHandler) Handle(ctx context.Context, item WorkItem) error {
+	analysisID, err := decodeWorkItemID(item.Payload, "analysis_id")
+	if err != nil {
+		return err
+	}
+	if h.Service == nil {
+		return platform.Unavailable("codeintel analysis service is not configured")
+	}
+	return h.Service.Execute(ctx, analysisID)
+}
+
+// analysisTimeoutError is the stable retryable timeout used by the worker.
+func analysisTimeoutError() error {
+	apiErr := platform.NewError(http.StatusServiceUnavailable, "analysis_timeout", "code analysis timed out")
+	apiErr.Retryable = true
+	return apiErr
+}
+
+func analysisIDPtr(id int64) *int64 { return &id }
+
+// validDraftLines bounds the model-provided fact line range to the file.
+func validDraftLines(start, end, total int) (*int, *int) {
+	if start < 1 || end < start || end > total {
+		return nil, nil
+	}
+	return &start, &end
+}
+
+// validJSONObject returns the draft body when it is a JSON object, otherwise an
+// empty object.
+func validJSONObject(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return json.RawMessage(`{}`)
+	}
 	return raw
 }
 
-// contractEdgeMeta encodes the design spec §6.5 contract edge meta.
-func contractEdgeMeta(method, normalizedPath string) []byte {
-	raw, _ := json.Marshal(contractEdgeMetaJSON{
-		Method:         method,
-		NormalizedPath: normalizedPath,
-		Match:          "exact",
-	})
-	return raw
-}
-
-// now returns the injected clock time (falling back to wall time when a
-// partially wired process leaves Clock nil).
-func (s *AnalysisService) now() time.Time {
-	if s.deps.Clock != nil {
-		return s.deps.Clock.Now()
+// bodyWithMarkers merges reserved validation markers (clue/invalidEvidence) into
+// the structured fact body. code_fact has no meta column (spec §3.3), so the
+// low-confidence markers travel with the body object.
+func bodyWithMarkers(body json.RawMessage, markers map[string]any) json.RawMessage {
+	var value map[string]any
+	if err := json.Unmarshal(body, &value); err != nil || value == nil {
+		value = map[string]any{}
 	}
-	return time.Now().UTC()
-}
-
-// rememberAnalysis records the version/force/request id of a queued analysis.
-func (s *AnalysisService) rememberAnalysis(analysisID, versionID int64, force bool, requestID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.runs[analysisID] = analysisRunRef{versionID: versionID, force: force, requestID: requestID}
-}
-
-// analysisRef returns the registry entry of one analysis.
-func (s *AnalysisService) analysisRef(analysisID int64) (analysisRunRef, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ref, ok := s.runs[analysisID]
-	return ref, ok
-}
-
-// forgetAnalysis drops one registry entry.
-func (s *AnalysisService) forgetAnalysis(analysisID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.runs, analysisID)
-}
-
-// json shapes -----------------------------------------------------------------
-
-// cachedFileAnalysis is the JSON document stored in code_analysis_cache.facts.
-// It is the validated file result (facts + edges + change summary), so a cache
-// hit reproduces the analysis without trusting model output again.
-type cachedFileAnalysis struct {
-	ChangeSummary string           `json:"changeSummary"`
-	Facts         []cachedFactJSON `json:"facts"`
-	Edges         []cachedEdgeJSON `json:"edges"`
-}
-
-type cachedFactJSON struct {
-	Kind            string            `json:"kind"`
-	Name            string            `json:"name"`
-	Path            string            `json:"path"`
-	StartLine       int               `json:"startLine"`
-	EndLine         int               `json:"endLine"`
-	Signature       string            `json:"signature,omitempty"`
-	Confidence      string            `json:"confidence"`
-	Summary         string            `json:"summary,omitempty"`
-	Evidence        []domain.Evidence `json:"evidence"`
-	Clue            bool              `json:"clue,omitempty"`
-	InvalidEvidence int               `json:"invalidEvidence,omitempty"`
-}
-
-type cachedEdgeEndpointJSON struct {
-	Kind string `json:"kind"`
-	Name string `json:"name"`
-}
-
-type cachedEdgeJSON struct {
-	From       cachedEdgeEndpointJSON `json:"from"`
-	To         cachedEdgeEndpointJSON `json:"to"`
-	Rel        string                 `json:"rel"`
-	Confidence string                 `json:"confidence"`
-	Evidence   []domain.Evidence      `json:"evidence"`
-}
-
-type factBodyJSON struct {
-	Kind            string            `json:"kind"`
-	Name            string            `json:"name"`
-	Path            string            `json:"path"`
-	StartLine       int               `json:"startLine"`
-	EndLine         int               `json:"endLine"`
-	Signature       string            `json:"signature,omitempty"`
-	Confidence      string            `json:"confidence"`
-	Summary         string            `json:"summary,omitempty"`
-	Evidence        []domain.Evidence `json:"evidence"`
-	Clue            bool              `json:"clue,omitempty"`
-	InvalidEvidence int               `json:"invalidEvidence,omitempty"`
-}
-
-type factMetaJSON struct {
-	Clue            bool `json:"clue,omitempty"`
-	InvalidEvidence int  `json:"invalidEvidence,omitempty"`
-}
-
-type aiEdgeMetaJSON struct {
-	From cachedEdgeEndpointJSON `json:"from"`
-	To   cachedEdgeEndpointJSON `json:"to"`
-}
-
-type contractEdgeMetaJSON struct {
-	Method         string `json:"method"`
-	NormalizedPath string `json:"normalizedPath"`
-	Match          string `json:"match"`
-}
-
-// cachedFileAnalysisFrom projects one validated file result onto the cache
-// document.
-func cachedFileAnalysisFrom(result analysisFileResult) cachedFileAnalysis {
-	document := cachedFileAnalysis{ChangeSummary: result.changeSummary}
-	for _, fact := range result.facts {
-		document.Facts = append(document.Facts, cachedFactJSON{
-			Kind:            fact.Kind,
-			Name:            fact.Name,
-			Path:            fact.Path,
-			StartLine:       fact.StartLine,
-			EndLine:         fact.EndLine,
-			Signature:       fact.Signature,
-			Confidence:      fact.Confidence,
-			Summary:         fact.Summary,
-			Evidence:        fact.Evidence,
-			Clue:            fact.Clue,
-			InvalidEvidence: fact.InvalidEvidence,
-		})
+	for key, marker := range markers {
+		value[key] = marker
 	}
-	for _, edge := range result.edges {
-		document.Edges = append(document.Edges, cachedEdgeJSON{
-			From:       cachedEdgeEndpointJSON{Kind: edge.From.Kind, Name: edge.From.Name},
-			To:         cachedEdgeEndpointJSON{Kind: edge.To.Kind, Name: edge.To.Name},
-			Rel:        edge.Rel,
-			Confidence: edge.Confidence,
-			Evidence:   edge.Evidence,
-		})
-	}
-	if document.Facts == nil {
-		document.Facts = []cachedFactJSON{}
-	}
-	if document.Edges == nil {
-		document.Edges = []cachedEdgeJSON{}
-	}
-	return document
+	return mustJSON(value)
 }
 
-// decodeCachedFileAnalysis decodes one stored cache document.
-func decodeCachedFileAnalysis(raw []byte) (cachedFileAnalysis, error) {
-	var document cachedFileAnalysis
-	if err := json.Unmarshal(raw, &document); err != nil {
-		return cachedFileAnalysis{}, err
+// isFileCacheHit implements the file-level fact cache:
+// (repo, commit, path, blob_hash, model, prompt_version) already extracted.
+func isFileCacheHit(facts []codeintel.Fact, blobHash, model, promptVersion string) bool {
+	if len(facts) == 0 {
+		return false
 	}
-	return document, nil
-}
-
-// materializeCachedFileAnalysis converts one cached document back into the
-// materialisation input. Fact identities are recomputed through the domain
-// rules so a stale cache cannot inject an invalid entity.
-func materializeCachedFileAnalysis(analysedPath string, document cachedFileAnalysis) ([]*materializedFact, []validatedAIEdge) {
-	facts := make([]*materializedFact, 0, len(document.Facts))
-	for _, fact := range document.Facts {
-		normalizedPath, err := normalizeFactEntityPath(fact.Path)
-		if err != nil {
-			continue
+	for _, fact := range facts {
+		if fact.BlobHash != blobHash || fact.PromptVersion != promptVersion {
+			return false
 		}
-		key, err := domain.FactKey(fact.Kind, fact.Name, normalizedPath)
-		if err != nil {
-			continue
+		if model != "" && fact.Model != model {
+			return false
 		}
-		evidence := mergeContractEvidence(fact.Evidence)
-		clue := fact.Clue || len(evidence) == 0 || fact.InvalidEvidence > 0
-		confidence := fact.Confidence
-		if clue {
-			confidence = domain.ConfidenceLow
-		}
-		facts = append(facts, &materializedFact{
-			Key:             key,
-			Kind:            fact.Kind,
-			Name:            strings.TrimSpace(fact.Name),
-			Path:            normalizedPath,
-			StartLine:       fact.StartLine,
-			EndLine:         fact.EndLine,
-			Signature:       fact.Signature,
-			Confidence:      confidence,
-			Summary:         fact.Summary,
-			Evidence:        evidence,
-			Clue:            clue,
-			LinesValid:      true,
-			InvalidEvidence: fact.InvalidEvidence,
-		})
 	}
-	edges := make([]validatedAIEdge, 0, len(document.Edges))
-	for _, edge := range document.Edges {
-		if edge.Rel == domain.RelRouteToAPI {
-			continue
-		}
-		evidence := mergeContractEvidence(edge.Evidence)
-		confidence := edge.Confidence
-		if len(evidence) == 0 {
-			confidence = domain.ConfidenceLow
-		}
-		edges = append(edges, validatedAIEdge{
-			From:       AIEdgeEndpoint{Kind: edge.From.Kind, Name: edge.From.Name},
-			To:         AIEdgeEndpoint{Kind: edge.To.Kind, Name: edge.To.Name},
-			Rel:        edge.Rel,
-			Confidence: confidence,
-			Evidence:   evidence,
-			FactPath:   analysedPath,
-		})
-	}
-	return facts, edges
+	return true
 }
+
+// minConfidence returns the weaker of two confidences.
+func minConfidence(left, right codeintel.Confidence) codeintel.Confidence {
+	rank := func(value codeintel.Confidence) int {
+		switch value {
+		case codeintel.ConfidenceHigh:
+			return 3
+		case codeintel.ConfidenceMedium:
+			return 2
+		default:
+			return 1
+		}
+	}
+	if rank(left) <= rank(right) {
+		return left
+	}
+	return right
+}
+
+// changedFileJSON renders one changed file in the persisted/changed_files shape.
+func changedFileJSON(file codeintel.ChangedFile) map[string]any {
+	var oldPath any
+	if file.OldPath != "" {
+		oldPath = file.OldPath
+	}
+	var headBlob any
+	if file.HeadBlobSHA != nil {
+		headBlob = *file.HeadBlobSHA
+	}
+	return map[string]any{
+		"path":           file.Path,
+		"old_path":       oldPath,
+		"status":         file.Status,
+		"additions":      file.Additions,
+		"deletions":      file.Deletions,
+		"binary":         file.Binary,
+		"head_blob_hash": headBlob,
+	}
+}
+
+// platformidFormat keeps the decimal-string contract in one place.
+func platformidFormat(value int64) string { return formatID(value) }

@@ -32,6 +32,11 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // Dev only: the local scripts serve the UI at http://localhost:6868 and the 0.2
+  // API derives its two CORS origins from EZTEST_WEB_PORT. Allowing the loopback
+  // hosts here stops the Next dev server from blocking its own HMR/dev resources
+  // when the UI is opened through 127.0.0.1.
+  allowedDevOrigins: ["localhost", "127.0.0.1"],
   // The deploy/Dockerfile.web image copies the standalone build.
   output: "standalone",
   async headers() {

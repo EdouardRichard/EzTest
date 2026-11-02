@@ -1,237 +1,363 @@
-import { type ApiPage, apiDelete, apiGet, apiGetPage, apiPatch, apiPost } from "@/lib/api-client"
+import {
+  ApiError,
+  type ApiPage,
+  apiDelete,
+  apiGet,
+  apiGetPage,
+  apiPatch,
+  apiPost,
+} from "@/lib/api-client"
 
 import type {
-  Analysis,
-  Anchor,
-  AnchorQuery,
-  Candidate,
-  ChangeList,
-  CodeEntity,
-  CreateAnchorBody,
-  CreateFactReviewBody,
-  DiffQuery,
-  FactReview,
-  FactsQuery,
-  FileDiff,
-  FileDiffQuery,
-  FileQuery,
-  FileWindow,
-  IndexRun,
-  IndexRunAccepted,
-  RepoQuality,
-  RepoSummary,
-  SearchQuery,
-  StartAnalysisBody,
-  StartAnalysisResult,
-  TreeEntry,
-  TreePage,
-  TreeQuery,
+  CodeAnalysisDetailView,
+  CodeAnalysisInput,
+  CodeAnalysisView,
+  CodeAnchorFilters,
+  CodeAnchorView,
+  CodeChangedFileView,
+  CodeChangeSetView,
+  CodeChangesQuery,
+  CodeCommitView,
+  CodeDiffQuery,
+  CodeEntityView,
+  CodeFactListQuery,
+  CodeFactReviewView,
+  CodeFactView,
+  CodeFileDiffQuery,
+  CodeFileDiffView,
+  CodeFileQuery,
+  CodeFileWindowView,
+  CodeImpactCandidateView,
+  CodeImpactView,
+  CodeIndexInput,
+  CodeIndexRunView,
+  CodeProposalInput,
+  CodeProposalResultView,
+  CodeProposalView,
+  CodeRepoStatusView,
+  CodeSearchQuery,
+  CodeTreeEntryView,
+  CodeTreeQuery,
+  CreateCodeAnchorInput,
+  CreateCodeFactReviewInput,
 } from "./types"
 
-/** Repository-level prefix (spec §7.1). */
-const CODE_REPOS_PATH = "/api/code/repos"
-
-type QueryValue = string | number | null | undefined
-
-/**
- * Appends only the defined, non-empty filters so optional reads never send
- * `commit=`/`cursor=` placeholders. Keys keep the API's camelCase spelling.
- */
-function withQuery(path: string, query: Record<string, QueryValue>): string {
-  const params = new URLSearchParams()
-  for (const [key, value] of Object.entries(query)) {
-    if (value === undefined || value === null || value === "") continue
-    params.set(key, String(value))
+/** Builds `?a=1&b=2`, skipping empty values (P0/P1 pagination style). */
+function query(params: Record<string, string | number | boolean | undefined>): string {
+  const search = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === "") continue
+    search.set(key, String(value))
   }
-  const suffix = params.toString()
-  return suffix === "" ? path : `${path}?${suffix}`
+  const text = search.toString()
+  return text.length > 0 ? `?${text}` : ""
 }
 
-/** Repo-scoped path; the repo id is a decimal number in the URL (spec §7.1). */
-function repoPath(repoId: number): string {
-  return `${CODE_REPOS_PATH}/${repoId}`
+function versionPath(versionId: string): string {
+  return `/api/versions/${encodeURIComponent(versionId)}`
 }
 
-/**
- * Version-scoped prefix. The version id is a decimal string that is never
- * re-parsed as a number and is encoded as a single path segment (spec §7.1).
- */
-function versionCodePath(versionId: string): string {
-  return `/api/versions/${encodeURIComponent(versionId)}/code`
+function repoPath(repoId: string): string {
+  return `/api/code/repos/${encodeURIComponent(repoId)}`
 }
 
-/** Analysis collection path for one version. */
-function analysesPath(versionId: string): string {
-  return `${versionCodePath(versionId)}/analyses`
+function isNotFound(cause: unknown): boolean {
+  return cause instanceof ApiError && cause.status === 404
 }
 
-/** Anchor collection path for one version. */
-function anchorsPath(versionId: string): string {
-  return `${versionCodePath(versionId)}/anchors`
+/* ------------------------------ repositories ------------------------------- */
+
+/** `GET /api/versions/{id}/code/repos`: bound repos + latest index + baseline. */
+export async function listCodeRepos(versionId: string): Promise<CodeRepoStatusView[]> {
+  const page = await apiGetPage<CodeRepoStatusView>(`${versionPath(versionId)}/code/repos`)
+  return page.items
 }
 
-/** GET /api/code/repos — repositories plus their latest index projection. */
-export function getCodeRepos(): Promise<RepoSummary[]> {
-  return apiGet<RepoSummary[]>(CODE_REPOS_PATH)
+/** `POST /api/versions/{id}/code/index`: 202 queued, 200 reused, 409 in progress. */
+export function triggerIndex(versionId: string, input: CodeIndexInput): Promise<CodeIndexRunView> {
+  const body: { repoId: string; commit?: string; branch?: string } = { repoId: input.repoId }
+  if (input.commit !== undefined && input.commit.length > 0) body.commit = input.commit
+  if (input.branch !== undefined && input.branch.length > 0) body.branch = input.branch
+  return apiPost<CodeIndexRunView>(`${versionPath(versionId)}/code/index`, body)
 }
 
-/** POST /api/code/repos/{repoId}/index — triggers a T0 index run (admin). */
-export function startIndex(repoId: number): Promise<IndexRunAccepted> {
-  return apiPost<IndexRunAccepted>(`${repoPath(repoId)}/index`)
+/** `GET /api/code/repos/{id}/index-runs/latest`; 404 means the repo was never indexed. */
+export async function latestIndexRun(repoId: string): Promise<CodeIndexRunView | null> {
+  try {
+    return await apiGet<CodeIndexRunView>(`${repoPath(repoId)}/index-runs/latest`)
+  } catch (cause) {
+    if (isNotFound(cause)) return null
+    throw cause
+  }
 }
 
-/** GET /api/code/repos/{repoId}/index-runs/latest — newest index run. */
-export function getLatestIndexRun(repoId: number): Promise<IndexRun> {
-  return apiGet<IndexRun>(`${repoPath(repoId)}/index-runs/latest`)
+/** `GET /api/code/repos/{id}/index-runs/{runId}`: one index run by decimal-string id. */
+export function getIndexRun(repoId: string, runId: string): Promise<CodeIndexRunView> {
+  return apiGet<CodeIndexRunView>(`${repoPath(repoId)}/index-runs/${encodeURIComponent(runId)}`)
 }
 
-/** GET /api/code/repos/{repoId}/tree — one cursor page of tree entries. */
-export async function getTree(repoId: number, params: TreeQuery = {}): Promise<TreePage> {
-  const page = await apiGetPage<TreeEntry>(
-    withQuery(`${repoPath(repoId)}/tree`, {
-      commit: params.commit,
-      path: params.path,
-      cursor: params.cursor,
-      limit: params.limit,
-    }),
-  )
-  return { entries: page.items, nextCursor: page.nextCursor, hasMore: page.hasMore }
-}
+/* ---------------------------------- tree ----------------------------------- */
 
-/** GET /api/code/repos/{repoId}/file — a 1-based line window (audited read). */
-export function getFile(repoId: number, params: FileQuery): Promise<FileWindow> {
-  return apiGet<FileWindow>(
-    withQuery(`${repoPath(repoId)}/file`, {
-      commit: params.commit,
-      path: params.path,
-      startLine: params.startLine,
-      endLine: params.endLine,
-    }),
+/** `GET /api/code/repos/{id}/tree`: cursor page of file/directory entries. */
+export function listTree(repoId: string, tree: CodeTreeQuery): Promise<ApiPage<CodeTreeEntryView>> {
+  return apiGetPage<CodeTreeEntryView>(
+    `${repoPath(repoId)}/tree${query({
+      commit: tree.commit,
+      path: tree.path,
+      cursor: tree.cursor,
+      limit: tree.limit,
+    })}`,
   )
 }
 
-/** GET /api/code/repos/{repoId}/diff — file-level change list page. */
-export function getDiff(repoId: number, params: DiffQuery): Promise<ChangeList> {
-  return apiGet<ChangeList>(
-    withQuery(`${repoPath(repoId)}/diff`, {
-      base: params.base,
-      head: params.head,
-      cursor: params.cursor,
-      limit: params.limit,
-    }),
+/** `GET /api/code/repos/{id}/file`: the only audited code-text window (≤400 lines). */
+export function readFile(repoId: string, file: CodeFileQuery): Promise<CodeFileWindowView> {
+  return apiGet<CodeFileWindowView>(
+    `${repoPath(repoId)}/file${query({
+      commit: file.commit,
+      path: file.path,
+      startLine: file.startLine,
+      endLine: file.endLine,
+    })}`,
   )
 }
 
-/** GET /api/code/repos/{repoId}/diff/file — one unified diff. */
-export function getFileDiff(repoId: number, params: FileDiffQuery): Promise<FileDiff> {
-  return apiGet<FileDiff>(
-    withQuery(`${repoPath(repoId)}/diff/file`, {
-      base: params.base,
-      head: params.head,
-      path: params.path,
-    }),
+/* ----------------------------------- diff ---------------------------------- */
+
+/** `GET /api/code/repos/{id}/diff`: change-set file page (no patch text). */
+export function listDiff(
+  repoId: string,
+  diff: CodeDiffQuery,
+): Promise<ApiPage<CodeChangedFileView>> {
+  return apiGetPage<CodeChangedFileView>(
+    `${repoPath(repoId)}/diff${query({
+      base: diff.base,
+      head: diff.head,
+      cursor: diff.cursor,
+      limit: diff.limit,
+    })}`,
   )
 }
 
-/** GET /api/code/repos/{repoId}/facts — one cursor page of fact entities. */
-export function getFacts(repoId: number, params: FactsQuery = {}): Promise<ApiPage<CodeEntity>> {
-  return apiGetPage<CodeEntity>(
-    withQuery(`${repoPath(repoId)}/facts`, {
-      commit: params.commit,
-      kind: params.kind,
-      path: params.path,
-      cursor: params.cursor,
-      limit: params.limit,
-    }),
+/** `GET /api/code/repos/{id}/diff/file`: one on-demand patch (binary/large/deleted safe). */
+export function readDiffFile(repoId: string, diff: CodeFileDiffQuery): Promise<CodeFileDiffView> {
+  return apiGet<CodeFileDiffView>(
+    `${repoPath(repoId)}/diff/file${query({
+      base: diff.base,
+      head: diff.head,
+      path: diff.path,
+    })}`,
   )
 }
 
-/** GET /api/code/repos/{repoId}/search — path/name substring search (not full text). */
-export function searchFacts(repoId: number, params: SearchQuery): Promise<ApiPage<CodeEntity>> {
-  return apiGetPage<CodeEntity>(
-    withQuery(`${repoPath(repoId)}/search`, {
-      commit: params.commit,
-      q: params.q,
-      kind: params.kind,
-      cursor: params.cursor,
-      limit: params.limit,
-    }),
+/* -------------------------------- facts/search ----------------------------- */
+
+/** `GET /api/code/repos/{id}/facts`: cursor page of T1 facts (≤100). */
+export function listFacts(
+  repoId: string,
+  options: CodeFactListQuery,
+): Promise<ApiPage<CodeFactView>> {
+  return apiGetPage<CodeFactView>(
+    `${repoPath(repoId)}/facts${query({
+      commit: options.commit,
+      kind: options.kind,
+      path: options.path,
+      cursor: options.cursor,
+      limit: options.limit,
+    })}`,
   )
 }
 
-/**
- * POST /api/code/repos/{repoId}/facts/{factId}/reviews — records the logged-in
- * user's verdict on one fact at its commit (spec §7.2). The same fact/commit is
- * unique: a new verdict overwrites the previous one.
- */
-export function createFactReview(
-  repoId: number,
-  factId: string,
-  body: CreateFactReviewBody,
-): Promise<FactReview> {
-  return apiPost<FactReview>(
-    `${repoPath(repoId)}/facts/${encodeURIComponent(factId)}/reviews`,
-    body,
+/** `GET /api/code/repos/{id}/search`: path/name substring search (≤50). */
+export function searchCode(
+  repoId: string,
+  options: CodeSearchQuery,
+): Promise<ApiPage<CodeEntityView>> {
+  return apiGetPage<CodeEntityView>(
+    `${repoPath(repoId)}/search${query({
+      commit: options.commit,
+      q: options.q,
+      kind: options.kind,
+      cursor: options.cursor,
+      limit: options.limit,
+    })}`,
   )
 }
 
-/** GET /api/code/repos/{repoId}/quality — evidence/review/impact aggregate. */
-export function getRepoQuality(repoId: number): Promise<RepoQuality> {
-  return apiGet<RepoQuality>(`${repoPath(repoId)}/quality`)
+/** `GET /api/code/repos/{id}/commits/{sha}`: commit metadata only. */
+export function getCommit(repoId: string, sha: string): Promise<CodeCommitView> {
+  return apiGet<CodeCommitView>(`${repoPath(repoId)}/commits/${encodeURIComponent(sha)}`)
 }
 
-/** GET /api/versions/{id}/code/changes — read-only version change preview. */
-export function getVersionChanges(versionId: string, head?: string): Promise<ChangeList> {
-  return apiGet<ChangeList>(withQuery(`${versionCodePath(versionId)}/changes`, { head }))
+/* -------------------------------- changes/analysis ------------------------- */
+
+/** `GET /api/versions/{id}/code/changes`: preview only; 422 when no baseline commit. */
+export function getCodeChanges(
+  versionId: string,
+  changes: CodeChangesQuery,
+): Promise<CodeChangeSetView> {
+  return apiGet<CodeChangeSetView>(
+    `${versionPath(versionId)}/code/changes${query({
+      repoId: changes.repoId,
+      head: changes.head,
+    })}`,
+  )
 }
 
-/** POST /api/versions/{id}/code/analyses — triggers or reuses an analysis. */
+/** `POST /api/versions/{id}/code/analyses`: 202 queued, 200 reused, 409 in progress. */
 export function startAnalysis(
   versionId: string,
-  body: StartAnalysisBody = {},
-): Promise<StartAnalysisResult> {
-  return apiPost<StartAnalysisResult>(analysesPath(versionId), body)
+  input: CodeAnalysisInput,
+): Promise<CodeAnalysisView> {
+  const body: { repoId: string; headCommit?: string; force?: boolean } = { repoId: input.repoId }
+  if (input.headCommit !== undefined && input.headCommit.length > 0) {
+    body.headCommit = input.headCommit
+  }
+  if (input.force === true) body.force = true
+  return apiPost<CodeAnalysisView>(`${versionPath(versionId)}/code/analyses`, body)
 }
 
-/** GET /api/versions/{id}/code/analyses/latest — newest analysis for the version. */
-export function getLatestAnalysis(versionId: string): Promise<Analysis> {
-  return apiGet<Analysis>(`${analysesPath(versionId)}/latest`)
+/** `GET /api/versions/{id}/code/analyses/latest?repoId=`: 404 means not analysed yet. */
+export async function latestAnalysis(
+  versionId: string,
+  repoId: string,
+): Promise<CodeAnalysisView | null> {
+  try {
+    return await apiGet<CodeAnalysisView>(
+      `${versionPath(versionId)}/code/analyses/latest${query({ repoId })}`,
+    )
+  } catch (cause) {
+    if (isNotFound(cause)) return null
+    throw cause
+  }
 }
 
-/** GET /api/versions/{id}/code/analyses/{analysisId} — one analysis by id. */
-export function getAnalysis(versionId: string, analysisId: string): Promise<Analysis> {
-  return apiGet<Analysis>(`${analysesPath(versionId)}/${encodeURIComponent(analysisId)}`)
+/** `GET /api/versions/{id}/code/analyses/{analysisId}`: detail projection. */
+export function getAnalysis(
+  versionId: string,
+  analysisId: string,
+): Promise<CodeAnalysisDetailView> {
+  return apiGet<CodeAnalysisDetailView>(
+    `${versionPath(versionId)}/code/analyses/${encodeURIComponent(analysisId)}`,
+  )
 }
 
-/** PATCH .../analyses/{analysisId}/candidates/{candidateId} — manual selection. */
+/** `PATCH .../candidates/{candidateId}`: persist one selection. */
 export function patchCandidate(
   versionId: string,
   analysisId: string,
   candidateId: string,
   selected: boolean,
-): Promise<Candidate> {
-  const analysisPath = `${analysesPath(versionId)}/${encodeURIComponent(analysisId)}`
-  return apiPatch<Candidate>(`${analysisPath}/candidates/${encodeURIComponent(candidateId)}`, {
-    selected,
-  })
-}
-
-/** GET /api/versions/{id}/code/anchors — anchors filtered by subject. */
-export function listAnchors(versionId: string, params: AnchorQuery = {}): Promise<Anchor[]> {
-  return apiGet<Anchor[]>(
-    withQuery(anchorsPath(versionId), {
-      subjectKind: params.subjectKind,
-      subjectId: params.subjectId,
-    }),
+): Promise<CodeImpactCandidateView> {
+  return apiPatch<CodeImpactCandidateView>(
+    `${versionPath(versionId)}/code/analyses/${encodeURIComponent(analysisId)}/candidates/${encodeURIComponent(candidateId)}`,
+    { selected },
   )
 }
 
-/** POST /api/versions/{id}/code/anchors — creates an anchor for a subject. */
-export function createAnchor(versionId: string, body: CreateAnchorBody): Promise<Anchor> {
-  return apiPost<Anchor>(anchorsPath(versionId), body)
+/** `GET /api/versions/{id}/code/impact`: merged multi-repo impact view. */
+export function getCodeImpact(versionId: string, repoId?: string): Promise<CodeImpactView> {
+  return apiGet<CodeImpactView>(`${versionPath(versionId)}/code/impact${query({ repoId })}`)
 }
 
-/** DELETE /api/versions/{id}/code/anchors/{anchorId} — 204 on success. */
+/* --------------------------------- anchors --------------------------------- */
+
+/** `GET /api/versions/{id}/code/anchors`: version anchors, optionally by subject. */
+export async function listAnchors(
+  versionId: string,
+  filters: CodeAnchorFilters = {},
+): Promise<CodeAnchorView[]> {
+  const page = await apiGetPage<CodeAnchorView>(
+    `${versionPath(versionId)}/code/anchors${query({
+      subjectKind: filters.subjectKind,
+      subjectId: filters.subjectId,
+    })}`,
+  )
+  return page.items
+}
+
+/** `POST /api/versions/{id}/code/anchors`: duplicate anchors answer 409. */
+export function createAnchor(
+  versionId: string,
+  input: CreateCodeAnchorInput,
+): Promise<CodeAnchorView> {
+  const body: {
+    subjectKind: string
+    subjectId: string
+    repoId: string
+    filePath: string
+    startLine?: number
+    endLine?: number
+    excerptSha?: string
+  } = {
+    subjectKind: input.subjectKind,
+    subjectId: input.subjectId,
+    repoId: input.repoId,
+    filePath: input.filePath,
+  }
+  if (input.startLine !== undefined) body.startLine = input.startLine
+  if (input.endLine !== undefined) body.endLine = input.endLine
+  if (input.excerptSha !== undefined && input.excerptSha.length > 0) {
+    body.excerptSha = input.excerptSha
+  }
+  return apiPost<CodeAnchorView>(`${versionPath(versionId)}/code/anchors`, body)
+}
+
+/** `POST .../anchors/{anchorId}/validate`: recomputes valid/stale/broken. */
+export function validateAnchor(versionId: string, anchorId: string): Promise<CodeAnchorView> {
+  return apiPost<CodeAnchorView>(
+    `${versionPath(versionId)}/code/anchors/${encodeURIComponent(anchorId)}/validate`,
+  )
+}
+
+/** `DELETE .../anchors/{anchorId}`: 204. */
 export function deleteAnchor(versionId: string, anchorId: string): Promise<void> {
-  return apiDelete<void>(`${anchorsPath(versionId)}/${encodeURIComponent(anchorId)}`)
+  return apiDelete<void>(`${versionPath(versionId)}/code/anchors/${encodeURIComponent(anchorId)}`)
+}
+
+/* -------------------------------- fact reviews ----------------------------- */
+
+/** `GET .../facts/{factId}/reviews`: append-only history. */
+export async function listReviews(
+  versionId: string,
+  factId: string,
+): Promise<CodeFactReviewView[]> {
+  const page = await apiGetPage<CodeFactReviewView>(
+    `${versionPath(versionId)}/code/facts/${encodeURIComponent(factId)}/reviews`,
+  )
+  return page.items
+}
+
+/** `POST .../facts/{factId}/reviews`: 201 append-only verdict. */
+export function createReview(
+  versionId: string,
+  factId: string,
+  input: CreateCodeFactReviewInput,
+): Promise<CodeFactReviewView> {
+  const body: { verdict: string; reason?: string } = { verdict: input.verdict }
+  if (input.reason !== undefined && input.reason.trim().length > 0) body.reason = input.reason
+  return apiPost<CodeFactReviewView>(
+    `${versionPath(versionId)}/code/facts/${encodeURIComponent(factId)}/reviews`,
+    body,
+  )
+}
+
+/* --------------------------------- proposals ------------------------------- */
+
+/** `POST .../page-api-proposals`: idempotent proposed-resource generation. */
+export function generateProposals(
+  versionId: string,
+  input: CodeProposalInput = {},
+): Promise<CodeProposalResultView> {
+  const body: { repoId?: string } = {}
+  if (input.repoId !== undefined && input.repoId.length > 0) body.repoId = input.repoId
+  return apiPost<CodeProposalResultView>(`${versionPath(versionId)}/code/page-api-proposals`, body)
+}
+
+/** `GET .../page-api-proposals`: proposed pages/APIs with evidence. */
+export async function listProposals(versionId: string): Promise<CodeProposalView[]> {
+  const page = await apiGetPage<CodeProposalView>(
+    `${versionPath(versionId)}/code/page-api-proposals`,
+  )
+  return page.items
 }

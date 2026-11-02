@@ -1,0 +1,14 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "Injected failure classification ground truth. The deterministic execution batch runs with the fake LLM P6 mode `fail`, so every corpus case fails with the application class. classification_accuracy = correctly classified injected failures / injected failures (threshold 1.00).",
+  "injectedFailures": [
+    {
+      "caseTitle": "P5 正常主流程用例",
+      "expectedFailureClass": "application"
+    },
+    {
+      "caseTitle": "P5 异常边界用例",
+      "expectedFailureClass": "application"
+    }
+  ]
+}

@@ -1,866 +1,779 @@
-package application
+package deliveryapp
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
-	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	platformclock "github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 )
 
-// issueMaxEventRefs bounds the total refs of one issue event (spec §8.2:
-// refs ≤ 20, case and evidence refs share the budget).
-const issueMaxEventRefs = 20
+// P4 issue event types (spec §4.3, events.md §13.1). Events are UI projections:
+// a publish failure never rolls back the issue write.
+const (
+	issueEventCreated  = "issue.created"
+	issueEventUpdated  = "issue.updated"
+	issueEventReopened = "issue.reopened"
+	issueEventMerged   = "issue.merged"
+	// issueEventRecurred is the P7 recurrence event (spec §7): emitted on both a
+	// successful redirect and a broken/cyclic chain fallback.
+	issueEventRecurred = "issue.recurred"
+)
 
-// IssueFilter is the issue list filter of GET /versions/{id}/issues (spec §7.3).
-// Empty status/severity/category match everything; a nil link matches every
-// issue; Cursor is the exclusive id of the last item of the previous page.
-type IssueFilter struct {
-	Status     string
-	Severity   string
-	Category   string
-	BatchID    *int64
-	CaseRunID  *int64
-	CaseNodeID *int64
-	Query      string
-	Cursor     int64
-	Limit      int
+// Audit actions of the issue lifecycle (D52). Audit is best effort.
+const (
+	issueAuditCreated   = "delivery.issue.created"
+	issueAuditConfirmed = "delivery.issue.confirmed"
+	issueAuditDismissed = "delivery.issue.dismissed"
+	issueAuditReopened  = "delivery.issue.reopened"
+	issueAuditMerged    = "delivery.issue.merged"
+	// issueAuditRecurred records a recurrence redirect, including the fallback
+	// that keeps the pre-P7 dedupe behavior.
+	issueAuditRecurred = "delivery.issue.recurred"
+)
+
+const (
+	// issueReasonMax is the issue action reason bound of the API contract.
+	issueReasonMax = 2000
+	// issueActorKindUser is the actor kind persisted for human transitions.
+	issueActorKindUser = "user"
+	// issueActorKindSystem is the actor kind persisted for system transitions.
+	issueActorKindSystem = "system"
+	// issueReasonRecurrence is the status-history reason of a recurrence
+	// redirect (spec §4.6); the status itself does not change.
+	issueReasonRecurrence = "recurrence"
+)
+
+// IssueDetail is the read projection of one issue: its row plus the append-only
+// refs and status history and the latest triage analysis run, when one is
+// attached through IssueTriageReader. MergedChain is the read-time merged_into
+// target chain of a merged issue (direct target first, terminal target last);
+// it is empty for a non-merged issue and never persisted (spec §4.6).
+type IssueDetail struct {
+	Issue       delivery.Issue
+	Refs        []delivery.IssueRef
+	History     []delivery.IssueStatusChange
+	Triage      *delivery.AnalysisRun
+	MergedChain []int64
 }
 
-// CreateIssueCommand is the human-issue body of POST /versions/{id}/issues
-// (spec §7.3). Source is always human, the dedupe key is null, the category
-// defaults to defect and the confidence defaults to medium.
-type CreateIssueCommand struct {
-	Title         string
-	Description   string
-	ReproSteps    string
-	Expected      string
-	Actual        string
-	Severity      string
-	Category      string
-	Confidence    string
-	CaseRunID     *int64
-	CaseNodeID    *int64
-	RequirementID *int64
+// IssueTriageReader is the optional triage projection of an issue detail. It is
+// satisfied by AnalysisRepository; the assembly root attaches it with
+// WithTriageReader so the issue service does not depend on the analysis
+// workstream. A nil reader leaves IssueDetail.Triage nil.
+type IssueTriageReader interface {
+	LatestByIssue(ctx context.Context, issueID int64) (delivery.AnalysisRun, bool, error)
 }
 
-// IssueService is the frozen issue use-case surface (plan Shared Interfaces).
-// The delivery HTTP handlers and the analysis materialization consume it; the
-// names, parameters and return semantics must not change.
-type IssueService interface {
-	CreateHuman(ctx context.Context, versionID, actor int64, cmd CreateIssueCommand) (domain.Issue, error)
-	ApplyDrafts(ctx context.Context, versionID, batchID, actor int64, drafts []domain.IssueDraft) ([]domain.Issue, error)
-	Confirm(ctx context.Context, versionID, issueID, actor int64, expectedRevision int, comment string) (domain.Issue, error)
-	Dismiss(ctx context.Context, versionID, issueID, actor int64, expectedRevision int, reason string) (domain.Issue, error)
-	Get(ctx context.Context, versionID, issueID int64) (domain.Issue, error)
-	List(ctx context.Context, versionID int64, f IssueFilter) ([]domain.Issue, bool, error)
+// IssueService is the single server-side truth for issue candidate ingestion,
+// reconciliation and lifecycle transitions (spec §5.1-§5.3). It owns no SQL and
+// calls no LLM: the repository and execution ports provide persistence and the
+// deterministic candidate truth, while events and audit are best-effort
+// projections of the committed write.
+type IssueService struct {
+	repo   IssueRepository
+	exec   ExecutionReader
+	events EventPublisher
+	audit  AuditSink
+	clock  Clock
+	tasks  TaskEnsurer
+	triage IssueTriageReader
+
+	// P6 cross-version read ports. They stay optional so the P4 constructor
+	// and its tests keep compiling; WithGlobalReader attaches them.
+	global GlobalIssueReader
+	titles VersionTitleReader
 }
 
-// IssueRefReader is the issue_ref read used by the detail handler (spec §7.3's
-// refs field). It is deliberately separate from IssueService: the frozen
-// interface returns the issue row only.
-type IssueRefReader interface {
-	ListRefs(ctx context.Context, versionID, issueID int64) ([]domain.IssueRef, error)
-}
-
-// IssueManager implements IssueService and IssueRefReader. It never writes
-// across contexts: issue persistence goes through IssueStore and every other
-// effect goes through an optional event/audit port.
-type IssueManager struct {
-	deps IssueServiceDeps
-	now  func() time.Time
-}
-
-// NewIssueService wires the issue use cases to their ports. IDs must be injected
-// for write use cases: P7 has no per-context Snowflake fallback, because two
-// fallbacks on the same node id can mint colliding ids (D29).
-func NewIssueService(deps IssueServiceDeps) *IssueManager {
-	now := time.Now
-	if deps.Clock != nil {
-		now = deps.Clock.Now
+// NewIssueService wires the issue use cases. Events, audit and the triage
+// reader are optional; the clock defaults to the system clock.
+func NewIssueService(repo IssueRepository, exec ExecutionReader, events EventPublisher, audit AuditSink, clock Clock, tasks TaskEnsurer) *IssueService {
+	if clock == nil {
+		clock = platformclock.System{}
 	}
-	return &IssueManager{deps: deps, now: now}
+	return &IssueService{
+		repo:   repo,
+		exec:   exec,
+		events: events,
+		audit:  audit,
+		clock:  clock,
+		tasks:  tasks,
+	}
 }
 
-var _ IssueService = (*IssueManager)(nil)
-var _ IssueRefReader = (*IssueManager)(nil)
-
-// CreateHuman creates a human-authored open issue (spec §5.4, §7.3): source
-// human, dedupe key null, category defect and confidence medium by default. The
-// target version must exist (version_not_found otherwise) and the referenced
-// case run/node/requirement must belong to the version.
-func (s *IssueManager) CreateHuman(ctx context.Context, versionID, actor int64, cmd CreateIssueCommand) (domain.Issue, error) {
-	if err := s.ready(); err != nil {
-		return domain.Issue{}, err
+// WithTriageReader attaches the optional triage projection returned by Get. It
+// returns the service so the assembly root can chain it after construction.
+func (s *IssueService) WithTriageReader(reader IssueTriageReader) *IssueService {
+	if s != nil {
+		s.triage = reader
 	}
+	return s
+}
+
+// ScanFailures is the reconciler hook of spec §5.1: it ingests every
+// failed(application) case_run of one version that has no issue yet and
+// returns how many issues were created. Per-case-run failures are collected
+// and do not stop the scan; projection failures (events, audit) never fail it.
+func (s *IssueService) ScanFailures(ctx context.Context, versionID int64) (int, error) {
 	if versionID <= 0 {
-		return domain.Issue{}, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
-			"versionId must be a positive id")
+		return 0, invalidArgumentf("version id must be a positive decimal ID")
 	}
-	if err := s.validateVersion(ctx, versionID); err != nil {
-		return domain.Issue{}, err
+	if err := s.requireIssueRepository(); err != nil {
+		return 0, err
 	}
-	title, err := domain.ValidateTitle(cmd.Title)
+	if err := s.requireExecutionReader(); err != nil {
+		return 0, err
+	}
+	snapshots, err := s.exec.ListFailedApplicationCaseRuns(ctx, versionID)
 	if err != nil {
-		return domain.Issue{}, err
+		return 0, mapIssueRepositoryError("scan failed application case runs", err)
 	}
-	if err := domain.ValidateSeverity(cmd.Severity); err != nil {
-		return domain.Issue{}, err
+	createdCount := 0
+	var failures []error
+	for _, snapshot := range snapshots {
+		// The execution read port already filters, but the reconciler stays
+		// defensive: only application failures become issues (spec §5.1).
+		if snapshot.FailureClass != "application" {
+			continue
+		}
+		if snapshot.ID <= 0 {
+			failures = append(failures, invalidArgumentf("case run snapshot has no ID"))
+			continue
+		}
+		if snapshot.VersionID > 0 && snapshot.VersionID != versionID {
+			failures = append(failures, invalidArgumentf(
+				"case run %d belongs to version %d, not %d", snapshot.ID, snapshot.VersionID, versionID))
+			continue
+		}
+		_, found, err := s.repo.FindByCaseRun(ctx, versionID, snapshot.ID)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("find issue for case run %d: %w", snapshot.ID, err))
+			continue
+		}
+		if found {
+			continue
+		}
+		_, created, err := s.ingestSnapshot(ctx, snapshot)
+		if created {
+			createdCount++
+		}
+		if err != nil {
+			failures = append(failures, err)
+		}
 	}
-	category := cmd.Category
-	if category == "" {
-		category = domain.CategoryDefect
-	}
-	if err := domain.ValidateCategory(category); err != nil {
-		return domain.Issue{}, err
-	}
-	confidence := cmd.Confidence
-	if confidence == "" {
-		confidence = domain.ConfidenceMedium
-	}
-	if err := domain.ValidateConfidence(confidence); err != nil {
-		return domain.Issue{}, err
-	}
-
-	refs := issueHumanRefs(cmd)
-	if err := issueValidateRefFormats(refs); err != nil {
-		return domain.Issue{}, err
-	}
-	if err := s.validateRefs(ctx, versionID, refs); err != nil {
-		return domain.Issue{}, err
-	}
-
-	id, err := s.nextID()
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	now := s.now()
-	issue := domain.Issue{
-		ID:              id,
-		VersionID:       versionID,
-		CaseRunID:       issueCopyInt64(cmd.CaseRunID),
-		CaseNodeID:      issueCopyInt64(cmd.CaseNodeID),
-		Source:          domain.SourceHuman,
-		Category:        category,
-		Severity:        cmd.Severity,
-		Status:          domain.StatusOpen,
-		Confidence:      confidence,
-		Title:           title,
-		Description:     cmd.Description,
-		ReproSteps:      cmd.ReproSteps,
-		Expected:        cmd.Expected,
-		Actual:          cmd.Actual,
-		RecurrenceCount: 0,
-		Revision:        1,
-		CreatedBy:       actor,
-		UpdatedBy:       actor,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-	}
-	created, err := s.deps.Store.Create(ctx, issue, issueWithID(refs, id))
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	s.publishCreated(ctx, created, refs)
-	s.auditCreated(ctx, created, actor)
-	return created, nil
+	return createdCount, errors.Join(failures...)
 }
 
-// ApplyDrafts materializes AI issue drafts (spec §5.4, §6.3): the target
-// version must exist, then every draft is validated before anything is written,
-// and one transaction dedupes by (version_id, dedupe_key), appends the new
-// occurrence refs and raises the recurrence count, or inserts a new issue. A
-// draft whose incoming refs are all already linked is a replay and changes
-// nothing (Lead replay ruling: identical ref set = replay, no recurrence bump
-// and no issue.updated). A lost unique-key race is retried once outside the
-// failed transaction and merged instead of failing (spec §6.9). Events and audit
-// are published only after the commit.
-func (s *IssueManager) ApplyDrafts(ctx context.Context, versionID, batchID, actor int64, drafts []domain.IssueDraft) ([]domain.Issue, error) {
-	if err := s.ready(); err != nil {
-		return nil, err
+// IngestCandidate builds and persists the deterministic issue candidate of one
+// failed(application) case_run (spec §5.1). The bool reports whether a new issue
+// row was created; a dedupe hit returns the existing issue with false and emits
+// no event, audit entry or triage task.
+func (s *IssueService) IngestCandidate(ctx context.Context, caseRunID int64) (delivery.Issue, bool, error) {
+	if caseRunID <= 0 {
+		return delivery.Issue{}, false, invalidArgumentf("case run id must be a positive decimal ID")
 	}
-	if versionID <= 0 {
-		return nil, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
-			"versionId must be a positive id")
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, false, err
 	}
-	if len(drafts) == 0 {
-		return []domain.Issue{}, nil
+	if err := s.requireExecutionReader(); err != nil {
+		return delivery.Issue{}, false, err
 	}
-	if err := s.validateVersion(ctx, versionID); err != nil {
-		return nil, err
-	}
-
-	prepared := make([]issuePreparedDraft, len(drafts))
-	for index, draft := range drafts {
-		if err := domain.ValidateIssueDraft(draft); err != nil {
-			return nil, err
-		}
-		refs := issueDraftRefs(draft)
-		if err := issueValidateRefFormats(refs); err != nil {
-			return nil, err
-		}
-		prepared[index] = issuePreparedDraft{draft: draft, refs: refs}
-	}
-	// Cross-context ownership is checked before the write transaction so no row
-	// is written when a reference is foreign (spec §5.4).
-	for _, item := range prepared {
-		if err := s.validateRefs(ctx, versionID, item.refs); err != nil {
-			return nil, err
-		}
-	}
-
-	now := s.now()
-	outcomes, err := s.applyDraftsTx(ctx, versionID, batchID, actor, prepared, now)
-	if errors.Is(err, ErrIssueDedupeConflict) {
-		// One safe retry outside the failed transaction: the concurrent writer's
-		// issue is committed and visible now, so the fresh transaction's
-		// FindByDedupeKey merges the occurrence instead of creating it (spec
-		// §6.9: a dedupe conflict appends refs/recurrence, never a 409).
-		outcomes, err = s.applyDraftsTx(ctx, versionID, batchID, actor, prepared, now)
-	}
+	snapshot, err := s.exec.CaseRunSnapshot(ctx, caseRunID)
 	if err != nil {
+		return delivery.Issue{}, false, mapIssueRepositoryError("load case run snapshot", err)
+	}
+	if snapshot.ID <= 0 {
+		snapshot.ID = caseRunID
+	}
+	return s.ingestSnapshot(ctx, snapshot)
+}
+
+// List returns one descending-ID issue page of a version.
+func (s *IssueService) List(ctx context.Context, versionID int64, f IssueFilter) ([]delivery.Issue, error) {
+	if versionID <= 0 {
+		return nil, invalidArgumentf("version id must be a positive decimal ID")
+	}
+	if err := validateIssueFilter(f); err != nil {
 		return nil, err
 	}
-
-	issues := make([]domain.Issue, 0, len(outcomes))
-	for _, outcome := range outcomes {
-		issues = append(issues, outcome.issue)
-		switch {
-		case outcome.created:
-			s.publishCreated(ctx, outcome.issue, outcome.refs)
-			s.auditCreated(ctx, outcome.issue, actor)
-		case outcome.updated:
-			s.publishUpdated(ctx, outcome.issue, outcome.refs)
-		}
+	if err := s.requireIssueRepository(); err != nil {
+		return nil, err
+	}
+	issues, err := s.repo.List(ctx, versionID, f)
+	if err != nil {
+		return nil, mapIssueRepositoryError("list issues", err)
 	}
 	return issues, nil
 }
 
-// applyDraftsTx runs one dedupe/create transaction over the prepared drafts.
-// Outcomes are built per attempt so a retry after a dedupe conflict starts from
-// a clean result set.
-func (s *IssueManager) applyDraftsTx(ctx context.Context, versionID, batchID, actor int64, prepared []issuePreparedDraft, now time.Time) ([]issueDraftOutcome, error) {
-	outcomes := make([]issueDraftOutcome, 0, len(prepared))
-	indexByID := make(map[int64]int, len(prepared))
-	record := func(issue domain.Issue, refs []domain.IssueRef, created, updated bool) {
-		if index, exists := indexByID[issue.ID]; exists {
-			outcomes[index].issue = issue
-			outcomes[index].refs = refs
-			outcomes[index].created = outcomes[index].created || created
-			outcomes[index].updated = outcomes[index].updated || updated
-			return
-		}
-		indexByID[issue.ID] = len(outcomes)
-		outcomes = append(outcomes, issueDraftOutcome{
-			issue: issue, refs: refs, created: created, updated: updated,
-		})
+// Get returns one issue with its append-only refs/history and the latest triage
+// analysis run when a triage reader is attached.
+func (s *IssueService) Get(ctx context.Context, versionID, issueID int64) (IssueDetail, error) {
+	if versionID <= 0 || issueID <= 0 {
+		return IssueDetail{}, invalidArgumentf("version and issue IDs must be positive decimal IDs")
 	}
-
-	err := s.deps.Store.InTx(ctx, func(tx IssueStore) error {
-		for _, item := range prepared {
-			existing, found, err := s.findDraftTarget(ctx, tx, versionID, item.draft)
-			if err != nil {
-				return err
-			}
-			if found {
-				existingRefs, err := tx.ListRefs(ctx, existing.ID)
-				if err != nil {
-					return err
-				}
-				addedRefs := issueMissingRefs(item.refs, existingRefs)
-				if len(addedRefs) == 0 {
-					// Lead replay ruling: the incoming ref set is already fully
-					// linked (the same occurrence was applied before), so this is
-					// a replay: no recurrence bump, revision change or event.
-					record(existing, existingRefs, false, false)
-					continue
-				}
-				// A genuine recurrence carries at least one new ref and always
-				// increments recurrence_count and emits issue.updated, even when
-				// the issue already reached a terminal status.
-				updated := domain.MergeOccurrence(existing, item.draft.Confidence, item.draft.Actual, actor, now)
-				if err := tx.AddRefs(ctx, existing.ID, issueWithID(addedRefs, existing.ID)); err != nil {
-					return err
-				}
-				mergedRefs := domain.NormalizeIssueRefs(append(append([]domain.IssueRef(nil), existingRefs...), addedRefs...))
-				stored, err := tx.Update(ctx, updated, existing.Revision)
-				if err != nil {
-					return err
-				}
-				record(stored, mergedRefs, false, true)
-				continue
-			}
-
-			id, err := s.nextID()
-			if err != nil {
-				return err
-			}
-			issue := s.newAIIssue(id, versionID, batchID, actor, item.draft, now)
-			stored, err := tx.Create(ctx, issue, issueWithID(item.refs, id))
-			if err != nil {
-				return err
-			}
-			record(stored, item.refs, true, false)
-		}
-		return nil
-	})
+	if err := s.requireIssueRepository(); err != nil {
+		return IssueDetail{}, err
+	}
+	issue, err := s.repo.Get(ctx, versionID, issueID)
 	if err != nil {
-		return nil, err
+		return IssueDetail{}, mapIssueRepositoryError("get issue", err)
 	}
-	return outcomes, nil
-}
-
-// findDraftTarget resolves the issue a draft merges into: the explicit
-// mergeIntoIssueId when the triage agent supplied one, otherwise the hard
-// (version_id, dedupe_key) match of spec §5.4.
-func (s *IssueManager) findDraftTarget(ctx context.Context, store IssueStore, versionID int64, draft domain.IssueDraft) (domain.Issue, bool, error) {
-	if draft.MergeIntoIssueID != nil {
-		issue, found, err := store.Get(ctx, versionID, *draft.MergeIntoIssueID)
+	refs, err := s.repo.ListRefs(ctx, issueID)
+	if err != nil {
+		return IssueDetail{}, mapIssueRepositoryError("list issue refs", err)
+	}
+	history, err := s.repo.ListHistory(ctx, issueID)
+	if err != nil {
+		return IssueDetail{}, mapIssueRepositoryError("list issue history", err)
+	}
+	detail := IssueDetail{Issue: issue, Refs: refs, History: history}
+	if issue.MergedIntoID != nil {
+		chain, _, err := s.resolveMergeChain(ctx, issue)
 		if err != nil {
-			return domain.Issue{}, false, err
+			return IssueDetail{}, fmt.Errorf("resolve issue %d merge chain: %w", issueID, err)
 		}
-		if !found {
-			return domain.Issue{}, false, domain.NewInvalid("mergeIntoIssueId", domain.ReasonIssueRefInvalid,
-				fmt.Sprintf("issue %d is not in version %d", *draft.MergeIntoIssueID, versionID))
+		detail.MergedChain = issueIDs(chain)
+	}
+	if s.triage != nil {
+		run, found, err := s.triage.LatestByIssue(ctx, issueID)
+		if err != nil {
+			return IssueDetail{}, fmt.Errorf("load issue %d triage: %w", issueID, err)
 		}
-		return issue, true, nil
-	}
-	return store.FindByDedupeKey(ctx, versionID, draft.DedupeKey)
-}
-
-// Confirm moves an open issue to confirmed under the revision CAS (spec §5.4).
-// A non-open issue or a stale expectedRevision is issue_state_conflict.
-func (s *IssueManager) Confirm(ctx context.Context, versionID, issueID, actor int64, expectedRevision int, comment string) (domain.Issue, error) {
-	issue, err := s.loadOpenIssueForCAS(ctx, versionID, issueID, expectedRevision)
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	now := s.now()
-	confirmed := issue
-	confirmed.Status = domain.StatusConfirmed
-	confirmed.ConfirmedBy = issueCopyInt64(&actor)
-	confirmed.ConfirmedAt = issueCopyTime(&now)
-	confirmed.Revision++
-	confirmed.UpdatedBy = actor
-	confirmed.UpdatedAt = now
-	stored, err := s.deps.Store.Update(ctx, confirmed, expectedRevision)
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	s.publishUpdated(ctx, stored, s.refsForEvent(ctx, stored.ID))
-	// §11.2 allows the free-text reason only for dismissals; a confirmation
-	// comment is not an audit field, so it is intentionally omitted.
-	s.auditTransition(ctx, "delivery.issue.confirmed", stored, actor, "")
-	return stored, nil
-}
-
-// Dismiss moves an open issue to dismissed under the revision CAS (spec §5.4).
-// The dismissal reason is mandatory (issue_dismiss_reason_required).
-func (s *IssueManager) Dismiss(ctx context.Context, versionID, issueID, actor int64, expectedRevision int, reason string) (domain.Issue, error) {
-	if err := s.ready(); err != nil {
-		return domain.Issue{}, err
-	}
-	trimmedReason := strings.TrimSpace(reason)
-	if trimmedReason == "" {
-		return domain.Issue{}, domain.NewInvalid("comment", domain.ReasonIssueDismissReasonRequired,
-			"dismissing an issue requires a reason")
-	}
-	issue, err := s.loadOpenIssueForCAS(ctx, versionID, issueID, expectedRevision)
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	now := s.now()
-	dismissed := issue
-	dismissed.Status = domain.StatusDismissed
-	dismissed.DismissedReason = trimmedReason
-	dismissed.DismissedBy = issueCopyInt64(&actor)
-	dismissed.DismissedAt = issueCopyTime(&now)
-	dismissed.Revision++
-	dismissed.UpdatedBy = actor
-	dismissed.UpdatedAt = now
-	stored, err := s.deps.Store.Update(ctx, dismissed, expectedRevision)
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	s.publishUpdated(ctx, stored, s.refsForEvent(ctx, stored.ID))
-	s.auditTransition(ctx, "delivery.issue.dismissed", stored, actor, trimmedReason)
-	return stored, nil
-}
-
-// loadOpenIssueForCAS loads the issue and enforces the open state plus the
-// revision CAS precondition shared by Confirm and Dismiss.
-func (s *IssueManager) loadOpenIssueForCAS(ctx context.Context, versionID, issueID int64, expectedRevision int) (domain.Issue, error) {
-	if err := s.ready(); err != nil {
-		return domain.Issue{}, err
-	}
-	if versionID <= 0 {
-		return domain.Issue{}, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
-			"versionId must be a positive id")
-	}
-	issue, found, err := s.deps.Store.Get(ctx, versionID, issueID)
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	if !found {
-		return domain.Issue{}, domain.NewNotFound("issue", issueID)
-	}
-	if issue.Status != domain.StatusOpen {
-		return domain.Issue{}, domain.NewStateConflict(domain.ReasonIssueStateConflict,
-			fmt.Sprintf("issue %d is %s; only an open issue can transition", issueID, issue.Status))
-	}
-	if issue.Revision != expectedRevision {
-		return domain.Issue{}, domain.NewStateConflict(domain.ReasonIssueStateConflict,
-			fmt.Sprintf("issue %d revision is %d, expected %d", issueID, issue.Revision, expectedRevision))
-	}
-	return issue, nil
-}
-
-// Get returns one issue of the version; a missing or foreign issue is
-// issue_not_found.
-func (s *IssueManager) Get(ctx context.Context, versionID, issueID int64) (domain.Issue, error) {
-	if err := s.ready(); err != nil {
-		return domain.Issue{}, err
-	}
-	if versionID <= 0 {
-		return domain.Issue{}, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
-			"versionId must be a positive id")
-	}
-	issue, found, err := s.deps.Store.Get(ctx, versionID, issueID)
-	if err != nil {
-		return domain.Issue{}, err
-	}
-	if !found {
-		return domain.Issue{}, domain.NewNotFound("issue", issueID)
-	}
-	return issue, nil
-}
-
-// List returns one page of the version's issues ordered by severity weight then
-// id descending (spec §7.3).
-func (s *IssueManager) List(ctx context.Context, versionID int64, filter IssueFilter) ([]domain.Issue, bool, error) {
-	if err := s.ready(); err != nil {
-		return nil, false, err
-	}
-	if versionID <= 0 {
-		return nil, false, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
-			"versionId must be a positive id")
-	}
-	normalized, err := issueNormalizeFilter(filter)
-	if err != nil {
-		return nil, false, err
-	}
-	return s.deps.Store.List(ctx, versionID, normalized)
-}
-
-// ListRefs returns the refs of one issue of the version, sorted by kind then id.
-func (s *IssueManager) ListRefs(ctx context.Context, versionID, issueID int64) ([]domain.IssueRef, error) {
-	if _, err := s.Get(ctx, versionID, issueID); err != nil {
-		return nil, err
-	}
-	refs, err := s.deps.Store.ListRefs(ctx, issueID)
-	if err != nil {
-		return nil, err
-	}
-	return domain.NormalizeIssueRefs(refs), nil
-}
-
-// newAIIssue builds a new open AI issue from a validated draft.
-func (s *IssueManager) newAIIssue(id, versionID, batchID, actor int64, draft domain.IssueDraft, now time.Time) domain.Issue {
-	title, _ := domain.ValidateTitle(draft.Title) // already validated; just trimmed
-	category := draft.Category
-	if category == "" {
-		category = domain.CategoryDefect
-	}
-	return domain.Issue{
-		ID:              id,
-		VersionID:       versionID,
-		BatchID:         issueBatchID(batchID),
-		CaseRunID:       issueCopyInt64(draft.CaseRunID),
-		CaseNodeID:      issueCopyInt64(draft.CaseNodeID),
-		Source:          domain.SourceAI,
-		Category:        category,
-		Severity:        draft.Severity,
-		Status:          domain.StatusOpen,
-		Confidence:      draft.Confidence,
-		FailureClass:    draft.FailureClass,
-		DedupeKey:       draft.DedupeKey,
-		Title:           title,
-		Description:     draft.Description,
-		ReproSteps:      draft.ReproSteps,
-		Expected:        draft.Expected,
-		Actual:          draft.Actual,
-		RerunSuggestion: draft.RerunSuggestion,
-		ExternalRef:     "",
-		RecurrenceCount: 0,
-		Revision:        1,
-		CreatedBy:       actor,
-		UpdatedBy:       actor,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-	}
-}
-
-// issueDraftRefs converts a draft's links to durable issue_ref rows.
-func issueDraftRefs(draft domain.IssueDraft) []domain.IssueRef {
-	refs := make([]domain.IssueRef, 0, 4+len(draft.EvidenceIDs)+len(draft.RequirementIDs))
-	if draft.CaseRunID != nil {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindCaseRun, RefID: issueFormatID(*draft.CaseRunID)})
-	}
-	if draft.CaseNodeID != nil {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindCaseNode, RefID: issueFormatID(*draft.CaseNodeID)})
-	}
-	for _, evidenceID := range draft.EvidenceIDs {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindEvidence, RefID: issueFormatID(evidenceID)})
-	}
-	for _, requirementID := range draft.RequirementIDs {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindRequirement, RefID: issueFormatID(requirementID)})
-	}
-	return domain.NormalizeIssueRefs(refs)
-}
-
-// issueHumanRefs converts the optional human links to issue_ref rows.
-func issueHumanRefs(cmd CreateIssueCommand) []domain.IssueRef {
-	refs := make([]domain.IssueRef, 0, 3)
-	if cmd.CaseRunID != nil {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindCaseRun, RefID: issueFormatID(*cmd.CaseRunID)})
-	}
-	if cmd.CaseNodeID != nil {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindCaseNode, RefID: issueFormatID(*cmd.CaseNodeID)})
-	}
-	if cmd.RequirementID != nil {
-		refs = append(refs, domain.IssueRef{RefKind: domain.RefKindRequirement, RefID: issueFormatID(*cmd.RequirementID)})
-	}
-	return domain.NormalizeIssueRefs(refs)
-}
-
-// issueValidateRefFormats checks the per-kind ref format before the validator
-// checks ownership, so a mis-wired validator can never persist a malformed ref.
-func issueValidateRefFormats(refs []domain.IssueRef) error {
-	for _, ref := range refs {
-		if err := domain.ValidateIssueRef(ref.RefKind, ref.RefID); err != nil {
-			return err
+		if found {
+			detail.Triage = &run
 		}
 	}
-	return nil
+	return detail, nil
 }
 
-// validateVersion rejects an issue write whose target version does not exist.
-// The port is required: without it the check would silently disappear and an
-// orphan issue could be written. A missing version is the stable
-// version_not_found 404; any other lookup failure propagates.
-func (s *IssueManager) validateVersion(ctx context.Context, versionID int64) error {
-	if s.deps.Versions == nil {
-		return errors.New("delivery: issue version reader is not configured")
-	}
-	exists, err := s.deps.Versions.VersionExists(ctx, versionID)
-	if err != nil {
-		return fmt.Errorf("delivery: validate version %d: %w", versionID, err)
-	}
-	if !exists {
-		return domain.NewNotFound("version", versionID)
-	}
-	return nil
-}
-
-// validateRefs delegates cross-context ownership to the IssueRefValidator port
-// (spec §3.2: delivery never reads another context's tables). A ref-less issue
-// needs no validator; a ref-carrying issue fails closed when the port is not
-// wired instead of silently skipping the ownership check.
-func (s *IssueManager) validateRefs(ctx context.Context, versionID int64, refs []domain.IssueRef) error {
-	if len(refs) == 0 {
-		return nil
-	}
-	if s.deps.Refs == nil {
-		return errors.New("delivery: issue ref validator is not configured")
-	}
-	return s.deps.Refs.ValidateRefs(ctx, versionID, refs)
-}
-
-// issueMissingRefs returns the incoming refs whose (kind, id) is not linked yet,
-// sorted deterministically.
-func issueMissingRefs(incoming, existing []domain.IssueRef) []domain.IssueRef {
-	linked := make(map[string]struct{}, len(existing))
-	for _, ref := range existing {
-		linked[ref.RefKind+"\x00"+ref.RefID] = struct{}{}
-	}
-	missing := make([]domain.IssueRef, 0, len(incoming))
-	for _, ref := range incoming {
-		if _, exists := linked[ref.RefKind+"\x00"+ref.RefID]; exists {
-			continue
-		}
-		missing = append(missing, ref)
-	}
-	return domain.NormalizeIssueRefs(missing)
-}
-
-// issueWithID stamps the persisted issue id onto the refs of a new issue.
-func issueWithID(refs []domain.IssueRef, issueID int64) []domain.IssueRef {
-	stamped := make([]domain.IssueRef, len(refs))
-	for index, ref := range refs {
-		ref.IssueID = issueID
-		stamped[index] = ref
-	}
-	return stamped
-}
-
-// issueNormalizeFilter validates and bounds an issue list filter (spec §7.3).
-func issueNormalizeFilter(filter IssueFilter) (IssueFilter, error) {
-	if filter.Status != "" {
-		switch filter.Status {
-		case domain.StatusOpen, domain.StatusConfirmed, domain.StatusDismissed:
-		default:
-			return IssueFilter{}, domain.NewInvalid("status", domain.ReasonInvalidArgument,
-				fmt.Sprintf("status %q is not open, confirmed or dismissed", filter.Status))
-		}
-	}
-	if filter.Severity != "" {
-		if err := domain.ValidateSeverity(filter.Severity); err != nil {
-			return IssueFilter{}, domain.NewInvalid("severity", domain.ReasonInvalidArgument,
-				fmt.Sprintf("severity %q is not blocker, major, minor or info", filter.Severity))
-		}
-	}
-	if filter.Category != "" {
-		if err := domain.ValidateCategory(filter.Category); err != nil {
-			return IssueFilter{}, domain.NewInvalid("category", domain.ReasonInvalidArgument,
-				fmt.Sprintf("category %q is not defect, requirement_gap or other", filter.Category))
-		}
-	}
-	if utf8.RuneCountInString(filter.Query) > domain.MaxIssueQueryRunes {
-		return IssueFilter{}, domain.NewInvalid("q", domain.ReasonInvalidArgument,
-			fmt.Sprintf("q must be at most %d characters", domain.MaxIssueQueryRunes))
-	}
-	if filter.Cursor < 0 {
-		return IssueFilter{}, domain.NewInvalid("cursor", domain.ReasonInvalidArgument,
-			"cursor must not be negative")
-	}
-	if filter.BatchID != nil && *filter.BatchID <= 0 {
-		return IssueFilter{}, domain.NewInvalid("batchId", domain.ReasonInvalidArgument,
-			"batchId must be a positive id")
-	}
-	if filter.CaseRunID != nil && *filter.CaseRunID <= 0 {
-		return IssueFilter{}, domain.NewInvalid("caseRunId", domain.ReasonInvalidArgument,
-			"caseRunId must be a positive id")
-	}
-	if filter.CaseNodeID != nil && *filter.CaseNodeID <= 0 {
-		return IssueFilter{}, domain.NewInvalid("caseNodeId", domain.ReasonInvalidArgument,
-			"caseNodeId must be a positive id")
-	}
-	switch {
-	case filter.Limit <= 0:
-		filter.Limit = platform.DefaultLimit
-	case filter.Limit > platform.MaxLimit:
-		filter.Limit = platform.MaxLimit
-	}
-	return filter, nil
-}
-
-// publishCreated emits issue.created with decimal-string ids and no issue body.
-func (s *IssueManager) publishCreated(ctx context.Context, issue domain.Issue, refs []domain.IssueRef) {
-	caseIDs, evidenceIDs := issueEventRefs(refs)
-	s.publish(ctx, IssueEvent{
-		Type:      "issue.created",
-		VersionID: issue.VersionID,
-		IssueID:   issue.ID,
-		Summary:   "issue created",
-		Detail: map[string]any{
-			"issueId":    issueFormatID(issue.ID),
-			"severity":   issue.Severity,
-			"status":     issue.Status,
-			"source":     issue.Source,
-			"confidence": issue.Confidence,
-		},
-		RefCaseIDs:     caseIDs,
-		RefEvidenceIDs: evidenceIDs,
+// Confirm moves an open issue to confirmed (spec §5.2).
+func (s *IssueService) Confirm(ctx context.Context, versionID, issueID, actorID int64, reason string, expected *int32) (delivery.Issue, error) {
+	return s.transition(ctx, issueTransition{
+		versionID:      versionID,
+		issueID:        issueID,
+		actorID:        actorID,
+		to:             delivery.IssueStatusConfirmed,
+		reason:         reason,
+		expected:       expected,
+		conflictReason: IssueConflictNotOpen,
+		eventType:      issueEventUpdated,
+		auditAction:    issueAuditConfirmed,
 	})
 }
 
-// publishUpdated emits issue.updated for a recurrence or a state transition.
-func (s *IssueManager) publishUpdated(ctx context.Context, issue domain.Issue, refs []domain.IssueRef) {
-	caseIDs, evidenceIDs := issueEventRefs(refs)
-	s.publish(ctx, IssueEvent{
-		Type:      "issue.updated",
-		VersionID: issue.VersionID,
-		IssueID:   issue.ID,
-		Summary:   "issue updated",
-		Detail: map[string]any{
-			"issueId":         issueFormatID(issue.ID),
-			"status":          issue.Status,
-			"revision":        issue.Revision,
-			"recurrenceCount": issue.RecurrenceCount,
-		},
-		RefCaseIDs:     caseIDs,
-		RefEvidenceIDs: evidenceIDs,
+// Dismiss moves an open issue to dismissed (spec §5.2).
+func (s *IssueService) Dismiss(ctx context.Context, versionID, issueID, actorID int64, reason string, expected *int32) (delivery.Issue, error) {
+	return s.transition(ctx, issueTransition{
+		versionID:      versionID,
+		issueID:        issueID,
+		actorID:        actorID,
+		to:             delivery.IssueStatusDismissed,
+		reason:         reason,
+		expected:       expected,
+		conflictReason: IssueConflictNotOpen,
+		eventType:      issueEventUpdated,
+		auditAction:    issueAuditDismissed,
 	})
 }
 
-// refsForEvent loads the refs of one issue for an event envelope. The read is
-// enrichment only: a failure yields no refs and never blocks the transition.
-func (s *IssueManager) refsForEvent(ctx context.Context, issueID int64) []domain.IssueRef {
-	refs, err := s.deps.Store.ListRefs(ctx, issueID)
-	if err != nil {
-		slog.WarnContext(ctx, "delivery issue refs read for event failed",
-			"issue_id", issueID, "error", err)
-		return nil
+// Reopen moves a confirmed or dismissed issue back to open and increments
+// reopen_count in the repository (spec §5.2). The reason is mandatory.
+func (s *IssueService) Reopen(ctx context.Context, versionID, issueID, actorID int64, reason string, expected *int32) (delivery.Issue, error) {
+	return s.transition(ctx, issueTransition{
+		versionID:      versionID,
+		issueID:        issueID,
+		actorID:        actorID,
+		to:             delivery.IssueStatusOpen,
+		reason:         reason,
+		expected:       expected,
+		reasonRequired: true,
+		conflictReason: IssueConflictNotReopenable,
+		eventType:      issueEventReopened,
+		auditAction:    issueAuditReopened,
+	})
+}
+
+// Merge marks sourceID merged into a valid targetID of the same version
+// (spec §5.2). The domain validator enforces self/cross-version/merged-target
+// rejection and the bounded cycle walk; the repository re-checks the target
+// inside its transaction. Source refs are not migrated in P4.
+func (s *IssueService) Merge(ctx context.Context, versionID, sourceID, targetID, actorID int64, reason string, expected *int32) (delivery.Issue, error) {
+	if versionID <= 0 || sourceID <= 0 || targetID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("version, source and target IDs must be positive decimal IDs")
 	}
-	return domain.NormalizeIssueRefs(refs)
-}
-
-// auditCreated records delivery.issue.created with the spec §11.2 fields only.
-func (s *IssueManager) auditCreated(ctx context.Context, issue domain.Issue, actor int64) {
-	s.audit(ctx, IssueAuditEvent{
-		Action:     "delivery.issue.created",
-		ActorID:    actor,
-		TargetType: "issue",
-		TargetID:   issueFormatID(issue.ID),
-		Metadata: map[string]any{
-			"version_id": issue.VersionID,
-			"source":     issue.Source,
-			"severity":   issue.Severity,
-			"category":   issue.Category,
-		},
+	if expected != nil && *expected <= 0 {
+		return delivery.Issue{}, invalidArgumentf("expected revision must be a positive integer")
+	}
+	reason, err := normalizeIssueReason(reason, false)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	if sourceID == targetID {
+		return delivery.Issue{}, &delivery.MergeError{Reason: delivery.MergeReasonTargetInvalid}
+	}
+	source, err := s.repo.Get(ctx, versionID, sourceID)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("load merge source", err)
+	}
+	target, err := s.repo.Get(ctx, versionID, targetID)
+	if err != nil {
+		if errors.Is(err, delivery.ErrNotFound) {
+			// An unknown or foreign target is a stable merge state conflict, not
+			// a missing issue: the API contract reports merge_target_invalid.
+			return delivery.Issue{}, &delivery.MergeError{Reason: delivery.MergeReasonTargetInvalid}
+		}
+		return delivery.Issue{}, mapIssueRepositoryError("load merge target", err)
+	}
+	lookup := func(id int64) (delivery.Issue, bool) {
+		issue, err := s.repo.GetByID(ctx, id)
+		if err != nil {
+			return delivery.Issue{}, false
+		}
+		return issue, true
+	}
+	if err := delivery.ValidateMerge(source, target, lookup); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate issue merge", err)
+	}
+	merged, err := s.repo.Merge(ctx, IssueMerge{
+		VersionID:        versionID,
+		SourceID:         sourceID,
+		TargetID:         targetID,
+		ActorID:          actorID,
+		Reason:           reason,
+		ExpectedRevision: expected,
 	})
-}
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("merge issue", err)
+	}
 
-// auditTransition records delivery.issue.confirmed/dismissed. The reason is the
-// only free text allowed by spec §11.2.
-func (s *IssueManager) auditTransition(ctx context.Context, action string, issue domain.Issue, actor int64, reason string) {
-	metadata := map[string]any{}
-	if strings.TrimSpace(reason) != "" {
+	mergedID := merged.ID
+	if mergedID <= 0 {
+		mergedID = sourceID
+	}
+	payload := map[string]any{
+		"issue_id":       formatIssueID(mergedID),
+		"merged_into_id": formatIssueID(targetID),
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	s.publishIssueEvent(ctx, issueEventMerged, versionID, payload)
+	metadata := map[string]any{"merged_into_id": formatIssueID(targetID)}
+	if reason != "" {
 		metadata["reason"] = reason
 	}
-	s.audit(ctx, IssueAuditEvent{
-		Action:     action,
-		ActorID:    actor,
-		TargetType: "issue",
-		TargetID:   issueFormatID(issue.ID),
-		Metadata:   metadata,
+	s.recordIssueAudit(ctx, actorID, issueAuditMerged, mergedID, metadata)
+	return merged, nil
+}
+
+// issueTransition is one status-machine action of the issue service.
+type issueTransition struct {
+	versionID      int64
+	issueID        int64
+	actorID        int64
+	to             delivery.IssueStatus
+	reason         string
+	expected       *int32
+	reasonRequired bool
+	conflictReason string
+	eventType      string
+	auditAction    string
+}
+
+// transition validates the state machine before touching the repository, then
+// persists the transition (the repository writes history and the revision bump
+// atomically) and publishes the best-effort projections.
+func (s *IssueService) transition(ctx context.Context, spec issueTransition) (delivery.Issue, error) {
+	if spec.versionID <= 0 || spec.issueID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("version and issue IDs must be positive decimal IDs")
+	}
+	if spec.expected != nil && *spec.expected <= 0 {
+		return delivery.Issue{}, invalidArgumentf("expected revision must be a positive integer")
+	}
+	reason, err := normalizeIssueReason(spec.reason, spec.reasonRequired)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	issue, err := s.repo.Get(ctx, spec.versionID, spec.issueID)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("load issue", err)
+	}
+	if !delivery.CanTransitionIssue(issue.Status, spec.to) {
+		return delivery.Issue{}, &IssueStateConflictError{Reason: spec.conflictReason}
+	}
+	updated, err := s.repo.UpdateStatus(ctx, IssueStatusUpdate{
+		VersionID:        spec.versionID,
+		IssueID:          spec.issueID,
+		To:               spec.to,
+		Reason:           reason,
+		ActorID:          spec.actorID,
+		ActorKind:        issueActorKindUser,
+		ExpectedRevision: spec.expected,
 	})
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("update issue status", err)
+	}
+
+	updatedID := updated.ID
+	if updatedID <= 0 {
+		updatedID = spec.issueID
+	}
+	if spec.eventType == issueEventReopened {
+		s.publishIssueEvent(ctx, issueEventReopened, spec.versionID, map[string]any{
+			"issue_id":     formatIssueID(updatedID),
+			"reopen_count": updated.ReopenCount,
+			"reason":       reason,
+		})
+	} else {
+		payload := map[string]any{
+			"issue_id":    formatIssueID(updatedID),
+			"from_status": string(issue.Status),
+			"to_status":   string(spec.to),
+		}
+		if reason != "" {
+			payload["reason"] = reason
+		}
+		s.publishIssueEvent(ctx, spec.eventType, spec.versionID, payload)
+	}
+	metadata := map[string]any{
+		"from_status": string(issue.Status),
+		"to_status":   string(spec.to),
+	}
+	if reason != "" {
+		metadata["reason"] = reason
+	}
+	if spec.eventType == issueEventReopened {
+		metadata["reopen_count"] = updated.ReopenCount
+	}
+	s.recordIssueAudit(ctx, spec.actorID, spec.auditAction, updatedID, metadata)
+	return updated, nil
 }
 
-// publish emits one issue event after the commit. A publication failure is
-// logged and swallowed (spec §8.2).
-func (s *IssueManager) publish(ctx context.Context, event IssueEvent) {
-	if s.deps.Events == nil {
+// ingestSnapshot builds and persists the candidate of one already loaded
+// case_run snapshot. It is shared by the reconciler scan and manual ingestion.
+func (s *IssueService) ingestSnapshot(ctx context.Context, snapshot CaseRunSnapshot) (delivery.Issue, bool, error) {
+	issue, refs, err := delivery.NewIssueCandidate(issueCandidateInput(snapshot))
+	if err != nil {
+		return delivery.Issue{}, false, fmt.Errorf("build issue candidate for case run %d: %w", snapshot.ID, err)
+	}
+	now := s.nowUTC()
+	issue.CreatedAt = now
+	issue.UpdatedAt = now
+	stored, created, err := s.repo.CreateCandidate(ctx, issue, refs)
+	if err != nil {
+		return delivery.Issue{}, false, mapIssueRepositoryError("create issue candidate", err)
+	}
+	if !created {
+		if stored.Status == delivery.IssueStatusMerged {
+			// A merged source means the candidate recurs (spec §4.6): redirect
+			// the new refs/count/event/audit to the merge target instead of
+			// writing the source. The repository deliberately did not append
+			// the candidate refs on this dedupe hit.
+			redirected, err := s.redirectRecurrence(ctx, stored, issue, refs)
+			return redirected, false, err
+		}
+		return stored, false, nil
+	}
+	// The adapter returns the persisted row; fall back to the snapshot version
+	// only if a custom repository omitted it so projections never target 0.
+	projected := stored
+	if projected.VersionID <= 0 {
+		projected.VersionID = snapshot.VersionID
+	}
+	s.publishIssueCreated(ctx, projected, snapshot)
+	s.recordIssueCreatedAudit(ctx, projected)
+	if s.tasks == nil {
+		return stored, true, issueServiceNotConfigured("task ensurer")
+	}
+	if err := s.tasks.EnsureIssueTriage(ctx, projected.ID, projected.VersionID); err != nil {
+		return stored, true, fmt.Errorf("ensure issue.triage for %d: %w", projected.ID, err)
+	}
+	return stored, true, nil
+}
+
+// issueCandidateInput maps the execution projection onto the deterministic
+// candidate input of spec §5.1.
+func issueCandidateInput(snapshot CaseRunSnapshot) delivery.CandidateInput {
+	var waveID *int64
+	if snapshot.WaveID > 0 {
+		wave := snapshot.WaveID
+		waveID = &wave
+	}
+	return delivery.CandidateInput{
+		VersionID:                snapshot.VersionID,
+		CaseRunID:                snapshot.ID,
+		CaseVersionID:            snapshot.CaseVersionID,
+		RequirementID:            snapshot.RequirementID,
+		CaseTitle:                snapshot.CaseTitle,
+		CaseRunSummary:           snapshot.Summary,
+		StepSeq:                  snapshot.FailedStepSeq,
+		AssertionSeq:             snapshot.FailedAssertionSeq,
+		FailedStepResultID:       snapshot.FailedStepResultID,
+		FailedAssertionResultIDs: snapshot.FailedAssertionResultIDs,
+		FailureClass:             snapshot.FailureClass,
+		Category:                 snapshot.Category,
+		Severity:                 snapshot.Severity,
+		FailedExpected:           snapshot.FailedExpected,
+		FailedActual:             snapshot.FailedActual,
+		FailedReason:             snapshot.FailedReason,
+		DedupeHint:               snapshot.DedupeHint,
+		VersionSUTID:             snapshot.VersionSUTID,
+		WaveID:                   waveID,
+		EvidenceIDs:              snapshot.EvidenceIDs,
+	}
+}
+
+// redirectRecurrence resolves the merge target of a merged dedupe hit and
+// applies the recurrence there (spec §4.6). The source issue keeps its refs and
+// history untouched. A broken, cyclic, foreign-version or over-budget chain —
+// or a target that changed concurrently — falls back to the pre-P7 dedupe
+// behavior (append the refs to the source) and reports redirect_failed.
+func (s *IssueService) redirectRecurrence(ctx context.Context, stored delivery.Issue, candidate delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, error) {
+	targets, ok, err := s.resolveMergeChain(ctx, stored)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("resolve issue recurrence chain", err)
+	}
+	if !ok || len(targets) == 0 {
+		return s.fallbackRecurrence(ctx, stored, candidate, refs)
+	}
+	target := targets[len(targets)-1]
+	recurrenceRefs := make([]delivery.IssueRef, 0, len(refs))
+	for _, ref := range refs {
+		ref.Role = delivery.IssueRefRoleRecurrence
+		recurrenceRefs = append(recurrenceRefs, ref)
+	}
+	updated, err := s.repo.ApplyRecurrence(ctx, IssueRecurrence{
+		VersionID: stored.VersionID,
+		SourceID:  stored.ID,
+		TargetID:  target.ID,
+		Refs:      recurrenceRefs,
+	})
+	if err != nil {
+		if errors.Is(err, delivery.ErrStateConflict) || errors.Is(err, delivery.ErrNotFound) {
+			// The target was merged/deleted between the chain walk and the
+			// write. Preserve the candidate data on the source; the event/audit
+			// records the failed redirect.
+			return s.fallbackRecurrence(ctx, stored, candidate, refs)
+		}
+		return delivery.Issue{}, mapIssueRepositoryError("apply issue recurrence", err)
+	}
+	s.recordIssueRecurrence(ctx, updated.VersionID, updated.ID, stored.ID, candidate.DedupeKey, updated.RecurrenceCount, false)
+	return updated, nil
+}
+
+// fallbackRecurrence keeps the pre-P7 dedupe behavior when the merge chain
+// cannot be redirected: the candidate refs are appended to the source (the
+// repository skipped them on the merged dedupe hit) and the failure is
+// projected as issue.recurred redirect_failed + audit (spec §4.6).
+func (s *IssueService) fallbackRecurrence(ctx context.Context, stored delivery.Issue, candidate delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, error) {
+	if err := s.repo.AppendRefs(ctx, stored.ID, refs); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("append recurrent issue refs", err)
+	}
+	s.recordIssueRecurrence(ctx, stored.VersionID, stored.ID, stored.ID, candidate.DedupeKey, stored.RecurrenceCount, true)
+	return stored, nil
+}
+
+// resolveMergeChain walks the merged_into chain of one issue with the bounded
+// domain walk. A missing link is a data condition (ok=false), while an
+// unexpected repository failure is returned as an error.
+func (s *IssueService) resolveMergeChain(ctx context.Context, issue delivery.Issue) ([]delivery.Issue, bool, error) {
+	if issue.MergedIntoID == nil {
+		return nil, true, nil
+	}
+	var lookupErr error
+	chain, ok := delivery.MergeChain(issue, func(id int64) (delivery.Issue, bool) {
+		next, err := s.repo.GetByID(ctx, id)
+		if err != nil {
+			if !errors.Is(err, delivery.ErrNotFound) {
+				lookupErr = err
+			}
+			return delivery.Issue{}, false
+		}
+		return next, true
+	})
+	if lookupErr != nil {
+		return nil, false, lookupErr
+	}
+	return chain, ok, nil
+}
+
+// recordIssueRecurrence publishes issue.recurred on the version channel and
+// writes the delivery.issue.recurred audit entry. Both are best effort: the
+// business write already committed. On a failed redirect the source issue is
+// reported (there is no target) and redirect_failed is set.
+func (s *IssueService) recordIssueRecurrence(ctx context.Context, versionID, issueID, sourceID int64, dedupeKey string, recurrenceCount int, redirectFailed bool) {
+	payload := map[string]any{
+		"issue_id":         formatIssueID(issueID),
+		"source_issue_id":  formatIssueID(sourceID),
+		"dedupe_key":       dedupeKey,
+		"recurrence_count": recurrenceCount,
+	}
+	if redirectFailed {
+		payload["redirect_failed"] = true
+	}
+	s.publishIssueEvent(ctx, issueEventRecurred, versionID, payload)
+
+	metadata := map[string]any{
+		"issue_id":         formatIssueID(issueID),
+		"source_issue_id":  formatIssueID(sourceID),
+		"dedupe_key":       dedupeKey,
+		"recurrence_count": recurrenceCount,
+	}
+	if redirectFailed {
+		metadata["redirect_failed"] = true
+	}
+	s.recordIssueAudit(ctx, 0, issueAuditRecurred, issueID, metadata)
+}
+
+// issueIDs maps issue rows onto their IDs, preserving walk order.
+func issueIDs(issues []delivery.Issue) []int64 {
+	if len(issues) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(issues))
+	for _, issue := range issues {
+		ids = append(ids, issue.ID)
+	}
+	return ids
+}
+
+// publishIssueCreated publishes issue.created with only IDs/status/classification
+// (events.md §13.2).
+func (s *IssueService) publishIssueCreated(ctx context.Context, issue delivery.Issue, snapshot CaseRunSnapshot) {
+	payload := map[string]any{
+		"issue_id": formatIssueID(issue.ID),
+		"status":   string(issue.Status),
+		"category": issue.Category,
+		"severity": issue.Severity,
+	}
+	if snapshot.WaveID > 0 {
+		payload["wave_id"] = formatIssueID(snapshot.WaveID)
+	}
+	if snapshot.ID > 0 {
+		payload["case_run_id"] = formatIssueID(snapshot.ID)
+	}
+	s.publishIssueEvent(ctx, issueEventCreated, issue.VersionID, payload)
+}
+
+// publishIssueEvent is best effort: the business write already committed.
+func (s *IssueService) publishIssueEvent(ctx context.Context, eventType string, versionID int64, payload map[string]any) {
+	if s.events == nil {
 		return
 	}
-	if err := s.deps.Events.Publish(ctx, event); err != nil {
-		slog.WarnContext(ctx, "delivery issue event publish failed",
-			"type", event.Type,
-			"version_id", event.VersionID,
-			"issue_id", event.IssueID,
-			"error", err,
-		)
-	}
+	_ = s.events.Publish(ctx, eventType, versionID, payload)
 }
 
-// audit records one issue audit entry. A failure is logged and never returned.
-func (s *IssueManager) audit(ctx context.Context, event IssueAuditEvent) {
-	if s.deps.Audit == nil {
+// recordIssueCreatedAudit records the system creation audit (D52: only
+// id/status/classification/source, never body or evidence content).
+func (s *IssueService) recordIssueCreatedAudit(ctx context.Context, issue delivery.Issue) {
+	metadata := map[string]any{
+		"version_id": formatIssueID(issue.VersionID),
+		"status":     string(issue.Status),
+		"category":   issue.Category,
+		"severity":   issue.Severity,
+		"source":     issue.Source,
+	}
+	s.recordIssueAudit(ctx, 0, issueAuditCreated, issue.ID, metadata)
+}
+
+// recordIssueAudit writes one best-effort audit entry; a nil sink or a sink
+// failure never rolls the transition back.
+func (s *IssueService) recordIssueAudit(ctx context.Context, actorID int64, action string, issueID int64, metadata map[string]any) {
+	if s.audit == nil {
 		return
 	}
-	if err := s.deps.Audit.Record(ctx, event); err != nil {
-		slog.WarnContext(ctx, "delivery issue audit failed",
-			"action", event.Action,
-			"issue_id", event.TargetID,
-			"error", err,
-		)
-	}
+	_ = s.audit.Write(ctx, actorID, action, "issue", formatIssueID(issueID), metadata)
 }
 
-// ready rejects a mis-wired manager before it touches the store.
-func (s *IssueManager) ready() error {
-	if s == nil || s.deps.Store == nil {
-		return errors.New("delivery: issue store is not configured")
+// normalizeIssueReason trims and bounds a transition reason. Reopen requires a
+// non-empty reason; the other transitions accept an empty one (spec §5.2).
+func normalizeIssueReason(reason string, required bool) (string, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		if required {
+			return "", invalidArgumentf("reason must not be empty")
+		}
+		return "", nil
+	}
+	if len([]rune(reason)) > issueReasonMax {
+		return "", invalidArgumentf("reason must be at most %d characters", issueReasonMax)
+	}
+	return reason, nil
+}
+
+// validateIssueFilter rejects malformed list filters before they reach SQL.
+func validateIssueFilter(f IssueFilter) error {
+	if f.Status != "" && !delivery.IssueStatus(f.Status).Valid() {
+		return invalidArgumentf("status must be one of open, confirmed, dismissed, merged")
+	}
+	if f.Category != "" && !validIssueFilterCategory(f.Category) {
+		return invalidArgumentf("category must be one of ui, api, db")
+	}
+	if f.Severity != "" && !validIssueFilterSeverity(f.Severity) {
+		return invalidArgumentf("severity must be one of major, minor, trivial")
+	}
+	if f.VersionSUTID != nil && *f.VersionSUTID <= 0 {
+		return invalidArgumentf("version SUT id must be a positive decimal ID")
+	}
+	if f.Before < 0 {
+		return invalidArgumentf("before must not be negative")
+	}
+	if f.Limit < 0 {
+		return invalidArgumentf("limit must not be negative")
 	}
 	return nil
 }
 
-// nextID mints one application-generated Snowflake id (D29).
-func (s *IssueManager) nextID() (int64, error) {
-	if s.deps.IDs == nil {
-		return 0, errors.New("delivery: id generator is not configured")
+func validIssueFilterCategory(category string) bool {
+	switch category {
+	case "ui", "api", "db":
+		return true
+	default:
+		return false
 	}
-	id := s.deps.IDs.Next()
-	if id <= 0 {
-		return 0, fmt.Errorf("delivery: id generator returned a non-positive id %d", id)
+}
+
+func validIssueFilterSeverity(severity string) bool {
+	switch severity {
+	case "major", "minor", "trivial":
+		return true
+	default:
+		return false
 	}
-	return id, nil
 }
 
-// issueFormatID renders an id for an event detail (D29/§8.2).
-func issueFormatID(id int64) string {
-	return strconv.FormatInt(id, 10)
-}
-
-// issueEventRefs extracts the case and evidence targets of an event envelope.
-// The two slices share the total refs bound of spec §8.2 (refs ≤ 20); refs are
-// expected in normalized order so the truncated set is deterministic.
-func issueEventRefs(refs []domain.IssueRef) (caseIDs, evidenceIDs []int64) {
-	total := 0
-	for _, ref := range refs {
-		if total == issueMaxEventRefs {
-			break
-		}
-		id, err := strconv.ParseInt(ref.RefID, 10, 64)
-		if err != nil || id <= 0 {
-			continue
-		}
-		switch ref.RefKind {
-		case domain.RefKindCaseNode:
-			caseIDs = append(caseIDs, id)
-		case domain.RefKindEvidence:
-			evidenceIDs = append(evidenceIDs, id)
-		default:
-			continue
-		}
-		total++
+func (s *IssueService) requireIssueRepository() error {
+	if s.repo == nil {
+		return issueServiceNotConfigured("issue repository")
 	}
-	return caseIDs, evidenceIDs
+	return nil
 }
 
-// issueBatchID renders an optional ApplyDrafts batch id.
-func issueBatchID(batchID int64) *int64 {
-	if batchID <= 0 {
-		return nil
+func (s *IssueService) requireExecutionReader() error {
+	if s.exec == nil {
+		return issueServiceNotConfigured("execution reader")
 	}
-	return &batchID
+	return nil
 }
 
-// issueCopyInt64 copies an optional id so callers cannot mutate stored state.
-func issueCopyInt64(value *int64) *int64 {
-	if value == nil {
-		return nil
+func (s *IssueService) nowUTC() time.Time {
+	if s.clock == nil {
+		return time.Now().UTC()
 	}
-	copied := *value
-	return &copied
+	return s.clock.Now().UTC()
 }
 
-// issueCopyTime copies an optional timestamp.
-func issueCopyTime(value *time.Time) *time.Time {
-	if value == nil {
-		return nil
-	}
-	copied := *value
-	return &copied
-}
-
-// issuePreparedDraft is one validated draft and its normalized refs.
-type issuePreparedDraft struct {
-	draft domain.IssueDraft
-	refs  []domain.IssueRef
-}
-
-// issueDraftOutcome is the committed result of one draft, keyed by issue id so a
-// merge of a just-created issue is published once with its final state.
-type issueDraftOutcome struct {
-	issue   domain.Issue
-	refs    []domain.IssueRef
-	created bool
-	updated bool
-}
+// formatIssueID renders a 64-bit ID as the decimal string required on the
+// event/audit wire (D29).
+func formatIssueID(id int64) string { return strconv.FormatInt(id, 10) }

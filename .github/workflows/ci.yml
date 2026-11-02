@@ -1,0 +1,134 @@
+# Baseline EzTest 0.2 CI. It runs the same Go, frontend and executor test gates
+# as the local scripts/test.ps1 gate, plus the P8 static gate
+# (scripts/p8-static-check.ps1) and the frontend compose validator it invokes.
+# Playwright E2E and real-LLM acceptance stay out of scope. The executor tests
+# launch Chromium, so that job installs the browser explicitly instead of
+# relying on the runner image.
+#
+# The static gate runs on a Windows runner because it is the PowerShell gate over
+# the 0.2 docs, contracts and deploy files; it needs no PostgreSQL and no Go
+# toolchain. The 0.1 gate scripts are kept in the repository as legacy and are
+# intentionally not referenced here.
+
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go, frontend and executor tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: eztest
+          POSTGRES_DB: eztest_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U eztest -d eztest_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      EZTEST_TEST_DATABASE_URL: postgres://eztest@127.0.0.1:5433/eztest_test?sslmode=disable
+      # Skip the implicit browser download during `pnpm install`; the dedicated
+      # "Install Playwright Chromium" step below installs exactly what the
+      # executor tests need.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            executor/pnpm-lock.yaml
+
+      - name: Go unit tests
+        working-directory: backend
+        run: go test -count=1 ./...
+
+      - name: Go integration tests
+        working-directory: backend
+        run: go test -tags=integration -count=1 ./...
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend lint
+        working-directory: frontend
+        run: pnpm lint
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: pnpm typecheck
+
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: pnpm test
+
+      - name: Install executor dependencies
+        working-directory: executor
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        working-directory: executor
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Executor unit tests
+        working-directory: executor
+        run: pnpm test
+
+  static-acceptance:
+    name: Static acceptance gate
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies (OpenAPI + Compose YAML parsers)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: P8 static gate
+        run: pwsh -NoProfile -File scripts/p8-static-check.ps1

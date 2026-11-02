@@ -1,566 +1,835 @@
 //go:build integration
 
-package server
+package server_test
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
-	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
+	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
+	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
+	chainproviders "github.com/EdouardRichard/EzTest/backend/internal/chain/infrastructure/providers"
+	chainapi "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
-	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
-	eventinginfra "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
-	eventpostgres "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure/postgres"
+	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	deliveryadapters "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/adapters"
+	deliverycontent "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/content"
+	deliverypg "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
+	deliveryrender "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/render"
+	deliveryapi "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
+	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	executionadapters "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/adapters"
+	executionpg "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/postgres"
+	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
-	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
-	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
-	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure"
+	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure"
+	"github.com/EdouardRichard/EzTest/backend/internal/server"
+	"github.com/EdouardRichard/EzTest/backend/internal/settings/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/settings/infrastructure"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
+	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 )
 
-// TestUserAndAuditAPIsAgainstDatabase is the Task 7 end-to-end check on the
-// real PostgreSQL repositories: admin login, user create/list/pagination,
-// non-admin 403, status update, password reset with token revocation and the
-// persisted audit trail carrying the actor and the request metadata.
-func TestUserAndAuditAPIsAgainstDatabase(t *testing.T) {
-	pool := testutil.OpenTestDB(t)
-	ctx := context.Background()
-	userRepo := identitypostgres.NewUserRepository(pool)
-	tokenRepo := identitypostgres.NewTokenRepository(pool)
-	hasher := password.NewHasher(12)
-	auditor := auditapp.NewService(auditpostgres.NewRepository(pool))
-
-	userSvc := application.NewUserService(userRepo, hasher, auditor, tokenRepo)
-	if err := userSvc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
-		t.Fatal(err)
-	}
-	authSvc := application.NewAuthService(userRepo, tokenRepo, hasher, time.Now, auditor)
-
-	h := New(config.Config{Env: "test"}, testLogger(), Dependencies{
-		Pinger: fakePinger{},
-		Auth:   authSvc,
-		Users:  userSvc,
-		Audit:  auditor,
-	})
-
-	adminToken := doLogin(t, h, "admin", "admin-pass-123")
-
-	// The admin creates a regular user.
-	rec := doJSON(t, h, http.MethodPost, "/api/users",
-		`{"username":"qa01","password":"qa-pass-1234"}`, adminToken, "req_int_create_1")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create=%d %s", rec.Code, rec.Body)
-	}
-	var created struct {
-		Data struct {
-			ID       int64  `json:"id"`
-			Username string `json:"username"`
-			Role     string `json:"role"`
-			Status   string `json:"status"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("decode create %q: %v", rec.Body, err)
-	}
-	if created.Data.ID != 2 || created.Data.Username != "qa01" ||
-		created.Data.Role != string(identity.RoleUser) || created.Data.Status != string(identity.StatusActive) {
-		t.Fatalf("created=%+v", created.Data)
-	}
-
-	// The list is paginated with an opaque cursor and has_more.
-	rec = doJSON(t, h, http.MethodGet, "/api/users?limit=1", "", adminToken, "req_int_list_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("list=%d %s", rec.Code, rec.Body)
-	}
-	var firstPage struct {
-		Data       []json.RawMessage `json:"data"`
-		NextCursor string            `json:"next_cursor"`
-		HasMore    bool              `json:"has_more"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &firstPage); err != nil {
-		t.Fatalf("decode list %q: %v", rec.Body, err)
-	}
-	if len(firstPage.Data) != 1 || !firstPage.HasMore || firstPage.NextCursor == "" {
-		t.Fatalf("first page=%s", rec.Body)
-	}
-	rec = doJSON(t, h, http.MethodGet,
-		"/api/users?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor), "", adminToken, "req_int_list_2")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("second page=%d %s", rec.Code, rec.Body)
-	}
-	var secondPage struct {
-		Data []struct {
-			Username string `json:"username"`
-		} `json:"data"`
-		HasMore bool `json:"has_more"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &secondPage); err != nil {
-		t.Fatalf("decode second page %q: %v", rec.Body, err)
-	}
-	if len(secondPage.Data) != 1 || secondPage.Data[0].Username != "qa01" || secondPage.HasMore {
-		t.Fatalf("second page=%s", rec.Body)
-	}
-
-	// A regular user cannot reach the admin users API.
-	userToken := doLogin(t, h, "qa01", "qa-pass-1234")
-	rec = doJSON(t, h, http.MethodGet, "/api/users", "", userToken, "req_int_forbidden_1")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("user list=%d %s want 403", rec.Code, rec.Body)
-	}
-
-	// Disabling the user immediately invalidates its sessions.
-	rec = doJSON(t, h, http.MethodPatch, "/api/users/2", `{"status":"disabled"}`, adminToken, "req_int_disable_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("disable=%d %s", rec.Code, rec.Body)
-	}
-	rec = doJSON(t, h, http.MethodGet, "/api/auth/me", "", userToken, "req_int_me_disabled")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("disabled user me=%d %s want 401", rec.Code, rec.Body)
-	}
-	// The single admin cannot disable itself.
-	rec = doJSON(t, h, http.MethodPatch, "/api/users/1", `{"status":"disabled"}`, adminToken, "req_int_self_disable")
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("self-disable=%d %s want 409", rec.Code, rec.Body)
-	}
-
-	// Re-enable the user, log in again, then reset its password: every token
-	// of that user must be revoked.
-	rec = doJSON(t, h, http.MethodPatch, "/api/users/2", `{"status":"active"}`, adminToken, "req_int_enable_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("enable=%d %s", rec.Code, rec.Body)
-	}
-	// The disable revoked the token; the re-enable must not resurrect it.
-	rec = doJSON(t, h, http.MethodGet, "/api/auth/me", "", userToken, "req_int_me_reenabled")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("token issued before disable became valid again after re-enable: me=%d %s", rec.Code, rec.Body)
-	}
-	userToken = doLogin(t, h, "qa01", "qa-pass-1234")
-	rec = doJSON(t, h, http.MethodPost, "/api/users/2/reset-password",
-		`{"new_password":"new-pass-1234"}`, adminToken, "req_int_reset_1")
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("reset=%d %s want 204", rec.Code, rec.Body)
-	}
-	rec = doJSON(t, h, http.MethodGet, "/api/auth/me", "", userToken, "req_int_me_reset")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("token survived password reset: me=%d %s", rec.Code, rec.Body)
-	}
-	doLogin(t, h, "qa01", "new-pass-1234")
-
-	// The audit log is persisted and carries the actor and the request
-	// metadata the HTTP handlers attached.
-	rec = doJSON(t, h, http.MethodGet, "/api/admin/audit?limit=100", "", adminToken, "req_int_audit_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("audit=%d %s", rec.Code, rec.Body)
-	}
-	var auditPage struct {
-		Data []struct {
-			ActorUserID *int64         `json:"actor_user_id"`
-			Action      string         `json:"action"`
-			TargetID    string         `json:"target_id"`
-			RequestID   string         `json:"request_id"`
-			IP          string         `json:"ip"`
-			UserAgent   string         `json:"user_agent"`
-			Metadata    map[string]any `json:"metadata"`
-		} `json:"data"`
-		HasMore bool `json:"has_more"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &auditPage); err != nil {
-		t.Fatalf("decode audit %q: %v", rec.Body, err)
-	}
-	if len(auditPage.Data) == 0 {
-		t.Fatal("audit log is empty")
-	}
-	byAction := make(map[string]int, len(auditPage.Data))
-	for i, entry := range auditPage.Data {
-		byAction[entry.Action] = i
-	}
-	for _, action := range []string{
-		auditapp.ActionUserCreated,
-		auditapp.ActionUserUpdated,
-		auditapp.ActionUserPasswordReset,
-		auditapp.ActionLoginSucceeded,
-	} {
-		if _, ok := byAction[action]; !ok {
-			t.Fatalf("audit log has no %s entry: %+v", action, auditPage.Data)
-		}
-	}
-	createdEntry := auditPage.Data[byAction[auditapp.ActionUserCreated]]
-	if createdEntry.ActorUserID == nil || *createdEntry.ActorUserID != 1 {
-		t.Fatalf("user.created actor=%v want admin 1", createdEntry.ActorUserID)
-	}
-	if createdEntry.TargetID != "2" {
-		t.Fatalf("user.created target=%q want 2", createdEntry.TargetID)
-	}
-	if createdEntry.RequestID != "req_int_create_1" {
-		t.Fatalf("user.created request_id=%q want req_int_create_1", createdEntry.RequestID)
-	}
-	if createdEntry.IP != "192.0.2.1" {
-		t.Fatalf("user.created ip=%q want 192.0.2.1", createdEntry.IP)
-	}
-	if createdEntry.UserAgent != "eztest-integration/1.0" {
-		t.Fatalf("user.created user_agent=%q", createdEntry.UserAgent)
-	}
-	if createdEntry.Metadata["username"] != "qa01" {
-		t.Fatalf("user.created metadata=%v", createdEntry.Metadata)
-	}
-	resetEntry := auditPage.Data[byAction[auditapp.ActionUserPasswordReset]]
-	if resetEntry.ActorUserID == nil || *resetEntry.ActorUserID != 1 {
-		t.Fatalf("password reset actor=%v want admin 1", resetEntry.ActorUserID)
-	}
+type testAPI struct {
+	t         *testing.T
+	baseURL   string
+	token     string
+	pool      *pgxpool.Pool
+	reportSvc *deliveryapp.ReportService
+	issueSvc  *deliveryapp.IssueService
 }
 
-// doJSON sends one JSON request through h and returns the recorder. requestID
-// is sent as X-Request-ID so the audit tests can correlate the persisted entry
-// with the request that produced it.
-func doJSON(t *testing.T, h http.Handler, method, path, body, token, requestID string) *httptest.ResponseRecorder {
+func newTestAPI(t *testing.T) *testAPI {
 	t.Helper()
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+
+	settingsRepo := settingspg.New(pool)
+	defs := settingsapp.Definitions("http://127.0.0.1:13336")
+	ids, err := id.NewSnowflake(1)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	clk := clock.System{}
+	auditSvc := auditapp.New(auditpg.New(pool), ids, clk)
+	eventSvc := eventingapp.New(eventingpg.New(pool), eventingapp.NewHub(eventingapp.DefaultHubBuffer))
+	settingsSvc := settingsapp.New(settingsRepo, defs, ids, clk, auditSvc, eventSvc)
+	if err := settingsSvc.SeedDefaults(ctx); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	identitySvc := identityapp.New(identityinfra.NewRepository(pool), identityinfra.NewHasher(identityinfra.DefaultBcryptCost), ids, clk, auditSvc)
+	if _, err := identitySvc.EnsureSeedAdmin(ctx); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	llmSvc := llmapp.New(llminfra.NewRepository(pool), llminfra.NewClient(), ids, clk, auditSvc, eventSvc)
+	storageSvc := storageapp.New(storagepg.New(pool), storagepg.NewFileStore(), settingsSvc, ids, auditSvc, eventSvc)
+	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
+	versionRepo := versionpg.New(pool, ids)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, nil)
+	resourceSvc.SetUsageChecker(versionSvc)
+	designRepo := designpg.New(pool)
+	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, nil)
+	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
+	requirementRepo := versionpg.NewRequirementRepository(pool)
+	requirementSvc := versionapp.NewRequirementService(
+		requirementRepo, versionSvc, resourceSvc, designStale, auditSvc, eventSvc, ids, clk)
+	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
+	designExports := designapp.NewExportService(designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
+
+	// Keep integration uploads out of the repository working tree.
+	if _, err := settingsSvc.Update(ctx, "paths.data_root", t.TempDir(), 1); err != nil {
+		t.Fatalf("set data root: %v", err)
+	}
+
+	// P3 execution surface: real repositories/services over the test schema; the
+	// executor probe is left unregistered because the routes test never polls.
+	executionRepo := executionpg.NewRepository(pool, ids)
+	executionVersions := executionadapters.NewVersionAdapter(versionSvc)
+	executionCases := executionadapters.NewDesignCaseReader(designGraph)
+	executionContent := executionadapters.NewContentStore(storageSvc)
+	executionRegistry := executionapp.NewRegistry(executionapp.RegistryDeps{
+		Repo: executionRepo.Executors, Settings: settingsSvc, Clock: clk, IDs: ids,
+	})
+	executionHumans := executionapp.NewHumanService(executionapp.HumanServiceDeps{
+		Humans: executionRepo.Humans, CaseRuns: executionRepo.CaseRuns, Waves: executionRepo.Waves,
+		Settings: settingsSvc, IDs: ids, Clock: clk, Events: eventSvc, Audit: auditSvc,
+		Timeout: 1800 * time.Second,
+	})
+	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
+		Intents: executionRepo.Intents, Cases: executionCases, Versions: executionVersions,
+		IDs: ids, Clock: clk, Events: eventSvc, Audit: auditSvc,
+	})
+	executionPause := executionapp.NewPauseService(executionapp.PauseServiceDeps{
+		Intents: executionRepo.Intents, Waves: executionRepo.Waves, CaseRuns: executionRepo.CaseRuns,
+		Humans: executionRepo.Humans, Clock: clk, Events: eventSvc, Audit: auditSvc,
+	})
+	executionHandler := executionhttp.New(executionhttp.Deps{
+		Intents: executionRepo.Intents, Waves: executionRepo.Waves, CaseRuns: executionRepo.CaseRuns,
+		Results: executionRepo.Results, Evidence: executionRepo.Evidence, Humans: executionRepo.Humans,
+		Executors: executionRepo.Executors, Cases: executionCases, Versions: executionVersions,
+		Content: executionContent, Settings: settingsSvc,
+		IntentService: executionIntents, PauseService: executionPause, HumanService: executionHumans,
+		Registry: executionRegistry,
+	})
+
+	// P4 delivery/chain/steward composition (mirrors cmd/eztest with real
+	// repositories and the real adapters).
+	workQueue := agentapp.NewWorkQueue(agentpg.NewWorkItemRepository(pool, ids), clk, 30*time.Second, 3)
+	issueRepo := deliverypg.NewIssueRepository(pool, ids)
+	analysisRepo := deliverypg.NewAnalysisRepository(pool, ids)
+	reportRepo := deliverypg.NewReportRepository(pool, ids)
+	closureRepo := versionpg.NewClosureRepository(pool)
+	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
+	reportRenderer, err := deliveryrender.NewHTMLRenderer("1")
+	if err != nil {
+		t.Fatalf("report renderer: %v", err)
+	}
+	p4Tasks := p4.NewTaskEnsurer(workQueue, reportRepo, testRequirementVersionLookup{repo: requirementRepo})
+	readDeps := deliveryadapters.Deps{
+		Versions: versionSvc, Requirements: requirementSvc, Closures: closureRepo, Design: designGraph,
+		Waves: executionRepo.Waves, CaseRuns: executionRepo.CaseRuns, Results: executionRepo.Results,
+		Evidence: executionRepo.Evidence, SUTContexts: executionRepo.SUTContexts,
+		Intents: executionRepo.Intents, Humans: executionRepo.Humans, Issues: issueRepo,
+	}
+	deliveryEvents := deliveryadapters.NewEventPublisher(eventSvc)
+	deliveryAudit := deliveryadapters.NewAuditSink(auditSvc)
+	issueSvc := deliveryapp.NewIssueService(
+		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
+	issueSvc.WithTriageReader(analysisRepo)
+	reportSvc := deliveryapp.NewReportService(
+		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
+		deliveryEvents, deliveryAudit, clk, p4Tasks,
+		delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true})
+	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
+		Requirements: requirementRepo, Design: designGraph, CaseRuns: executionRepo.CaseRuns,
+		Waves: executionRepo.Waves, Intents: executionRepo.Intents, Humans: executionRepo.Humans,
+		WorkItems: workQueue, Issues: issueRepo,
+	})
+	versionCloseSvc := versionapp.NewVersionCloseService(versionapp.VersionCloseServiceDeps{
+		Versions: versionRepo, WorkItems: closureReaders, Execution: versionadapters.NewVersionCloseExecution(closureReaders),
+		HumanRequests: closureReaders, Requirements: requirementRepo,
+		Reports: versionadapters.NewReportStatusReader(reportSvc), ReportStaler: reportSvc,
+		Tasks: p4Tasks, Audit: auditSvc, Events: eventSvc, Clock: clk,
+	})
+	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
+		Closures: closureRepo, Requirements: requirementRepo, Cases: closureReaders,
+		Runs: closureReaders, Coverage: closureReaders, Issues: closureReaders,
+		WorkItems: closureReaders, Versions: versionCloseSvc, Tasks: p4Tasks,
+		Audit: auditSvc, Events: eventSvc, IDs: ids, Clock: clk,
+	})
+	requirementSvc.SetVersionReopener(versionCloseSvc)
+	designGraph.SetVersionReopener(versionCloseSvc)
+	executionVersions.SetVersionReopener(versionCloseSvc)
+
+	chainVersionProvider := chainproviders.NewVersionProvider(requirementSvc, versionSvc)
+	chainDesignProvider := chainproviders.NewDesignProvider(designGraph)
+	chainExecutionProvider := chainproviders.NewExecutionProvider(
+		executionRepo.Waves, executionRepo.CaseRuns, executionRepo.SUTContexts)
+	chainDeliveryProvider := chainproviders.NewDeliveryProvider(issueRepo, reportRepo, requirementSvc, closureSvc)
+	chainResourceProvider := chainproviders.NewResourceProvider(versionSvc, resourceSvc)
+	chainCursorProvider := chainproviders.NewEventCursorProvider(eventSvc)
+	chainSvc := chainapp.NewChainService(
+		chainVersionProvider, chainDesignProvider, chainExecutionProvider, chainDeliveryProvider,
+		chainResourceProvider, chainCursorProvider, chainCursorProvider, clk)
+	deliveryHandler := deliveryapi.New(issueSvc, deliveryapi.WithReports(reportSvc))
+	chainHandler := chainapi.New(chainSvc)
+
+	handler := server.New(server.Deps{
+		Config:   config.Config{APIPort: 0, WebPort: 6868, ExecutorPort: 13336},
+		Pool:     pool,
+		Version:  "test",
+		Settings: settingsSvc,
+		Identity: identitySvc,
+		Audit:    auditSvc,
+		Events:   eventSvc,
+		Storage:  storageSvc,
+		LLM:      llmSvc,
+		Resource: resourceSvc,
+		Versions: versionSvc,
+
+		Requirements:  requirementSvc,
+		DesignGraph:   designGraph,
+		DesignExports: designExports,
+		Execution:     executionHandler,
+		Delivery:      deliveryHandler,
+		Chain:         chainHandler,
+		Closure:       closureSvc,
+		VersionClose:  versionCloseSvc,
+	})
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+	return &testAPI{t: t, baseURL: httpServer.URL, pool: pool, reportSvc: reportSvc, issueSvc: issueSvc}
+}
+
+func (a *testAPI) do(method, path string, body any, wantStatus int) map[string]any {
+	a.t.Helper()
 	var reader io.Reader
-	if body != "" {
-		reader = strings.NewReader(body)
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			a.t.Fatalf("marshal request: %v", err)
+		}
+		reader = bytes.NewReader(raw)
 	}
-	req := httptest.NewRequest(method, path, reader)
-	req.Header.Set("X-Request-ID", requestID)
-	req.Header.Set("User-Agent", "eztest-integration/1.0")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	req, err := http.NewRequest(method, a.baseURL+path, reader)
+	if err != nil {
+		a.t.Fatalf("new request: %v", err)
 	}
-	if body != "" {
+	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
-// doLogin logs in over HTTP and returns the raw bearer token.
-func doLogin(t *testing.T, h http.Handler, username, password string) string {
-	t.Helper()
-	body, err := json.Marshal(map[string]string{"username": username, "password": password})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec := doJSON(t, h, http.MethodPost, "/api/auth/login", string(body), "", "req_int_login_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("login %q=%d %s", username, rec.Code, rec.Body)
-	}
-	var payload struct {
-		Data struct {
-			Token string `json:"token"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode login %q: %v", rec.Body, err)
-	}
-	if payload.Data.Token == "" {
-		t.Fatalf("login %q returned no token: %s", username, rec.Body)
-	}
-	return payload.Data.Token
-}
-
-// TestEventStreamAPIsAgainstDatabase is the Task 8 end-to-end check on the real
-// PostgreSQL store and the in-process hub: unknown-channel 404, the admin test
-// publisher (seqs, audit, 403/401), the snapshot envelope and cursor, and an SSE
-// reconnect that replays without duplicates or gaps.
-func TestEventStreamAPIsAgainstDatabase(t *testing.T) {
-	pool := testutil.OpenTestDB(t)
-	ctx := context.Background()
-	userRepo := identitypostgres.NewUserRepository(pool)
-	tokenRepo := identitypostgres.NewTokenRepository(pool)
-	hasher := password.NewHasher(12)
-	auditor := auditapp.NewService(auditpostgres.NewRepository(pool))
-
-	userSvc := application.NewUserService(userRepo, hasher, auditor, tokenRepo)
-	if err := userSvc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
-		t.Fatal(err)
-	}
-	authSvc := application.NewAuthService(userRepo, tokenRepo, hasher, time.Now, auditor)
-
-	eventStore := eventpostgres.NewEventStore(pool)
-	eventHub := eventinginfra.NewHub()
-	eventSvc := eventingapp.NewService(eventStore, eventHub)
-
-	h := New(config.Config{Env: "test", EnableTestEndpoints: true}, testLogger(), Dependencies{
-		Pinger:      fakePinger{},
-		Auth:        authSvc,
-		Users:       userSvc,
-		Audit:       auditor,
-		Events:      eventSvc,
-		EventReader: eventStore,
-		EventHub:    eventHub,
-	})
-
-	adminToken := doLogin(t, h, "admin", "admin-pass-123")
-	rec := doJSON(t, h, http.MethodPost, "/api/users",
-		`{"username":"qa01","password":"qa-pass-1234"}`, adminToken, "req_int_stream_create_1")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create user=%d %s", rec.Code, rec.Body)
-	}
-	userToken := doLogin(t, h, "qa01", "qa-pass-1234")
-
-	// Unknown channels are reported as 404 by the snapshot endpoint.
-	rec = doJSON(t, h, http.MethodGet, "/api/stream/events?channel=system", "", adminToken,
-		"req_int_stream_snapshot_empty")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("empty channel snapshot=%d %s want 404", rec.Code, rec.Body)
-	}
-
-	// The admin test publisher writes three synthetic events and returns seqs.
-	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events",
-		`{"count":3,"summary":"admin test event","detail":{"index":1}}`, adminToken,
-		"req_int_stream_publish_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("test publish=%d %s", rec.Code, rec.Body)
-	}
-	var published struct {
-		Data struct {
-			Seqs []int64 `json:"seqs"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &published); err != nil {
-		t.Fatalf("decode publish %q: %v", rec.Body, err)
-	}
-	if len(published.Data.Seqs) != 3 || published.Data.Seqs[0] != 1 ||
-		published.Data.Seqs[1] != 2 || published.Data.Seqs[2] != 3 {
-		t.Fatalf("seqs=%v want [1 2 3]", published.Data.Seqs)
-	}
-
-	// The publish is audited with the admin actor and the request metadata.
-	rec = doJSON(t, h, http.MethodGet, "/api/admin/audit?limit=100", "", adminToken,
-		"req_int_stream_audit_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("audit=%d %s", rec.Code, rec.Body)
-	}
-	var auditPage struct {
-		Data []struct {
-			ActorUserID *int64         `json:"actor_user_id"`
-			Action      string         `json:"action"`
-			RequestID   string         `json:"request_id"`
-			IP          string         `json:"ip"`
-			Metadata    map[string]any `json:"metadata"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &auditPage); err != nil {
-		t.Fatalf("decode audit %q: %v", rec.Body, err)
-	}
-	var publishEntry *struct {
-		ActorUserID *int64         `json:"actor_user_id"`
-		Action      string         `json:"action"`
-		RequestID   string         `json:"request_id"`
-		IP          string         `json:"ip"`
-		Metadata    map[string]any `json:"metadata"`
-	}
-	for i := range auditPage.Data {
-		if auditPage.Data[i].Action == "sse.test_published" {
-			publishEntry = &auditPage.Data[i]
-			break
-		}
-	}
-	if publishEntry == nil {
-		t.Fatalf("audit log has no sse.test_published entry: %+v", auditPage.Data)
-	}
-	if publishEntry.ActorUserID == nil || *publishEntry.ActorUserID != 1 {
-		t.Fatalf("publish audit actor=%v want admin 1", publishEntry.ActorUserID)
-	}
-	if publishEntry.RequestID != "req_int_stream_publish_1" {
-		t.Fatalf("publish audit request_id=%q", publishEntry.RequestID)
-	}
-	if publishEntry.IP != "192.0.2.1" {
-		t.Fatalf("publish audit ip=%q", publishEntry.IP)
-	}
-	if publishEntry.Metadata["count"] != float64(3) {
-		t.Fatalf("publish audit metadata=%v", publishEntry.Metadata)
-	}
-
-	// The snapshot returns the newest events below the cursor, ascending, with
-	// the channel's latest seq and a has_more flag.
-	rec = doJSON(t, h, http.MethodGet, "/api/stream/events?channel=system&limit=2", "", userToken,
-		"req_int_stream_snapshot_1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("snapshot=%d %s", rec.Code, rec.Body)
-	}
-	var snapshot struct {
-		Data struct {
-			Items []struct {
-				Seq     int64          `json:"seq"`
-				Channel string         `json:"channel"`
-				Type    string         `json:"type"`
-				Summary string         `json:"summary"`
-				Detail  map[string]any `json:"detail"`
-				Refs    map[string]any `json:"refs"`
-			} `json:"items"`
-			SnapshotCursor int64 `json:"snapshot_cursor"`
-			HasMore        bool  `json:"has_more"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
-		t.Fatalf("decode snapshot %q: %v", rec.Body, err)
-	}
-	if snapshot.Data.SnapshotCursor != 3 || !snapshot.Data.HasMore || len(snapshot.Data.Items) != 2 {
-		t.Fatalf("snapshot=%s", rec.Body)
-	}
-	if snapshot.Data.Items[0].Seq != 2 || snapshot.Data.Items[1].Seq != 3 {
-		t.Fatalf("snapshot seqs=%+v want [2 3]", snapshot.Data.Items)
-	}
-	if snapshot.Data.Items[0].Summary != "admin test event" ||
-		snapshot.Data.Items[0].Detail["index"] != float64(1) ||
-		snapshot.Data.Items[0].Refs["evidence"] == nil {
-		t.Fatalf("snapshot item=%+v", snapshot.Data.Items[0])
-	}
-	rec = doJSON(t, h, http.MethodGet, "/api/stream/events?channel=system&limit=1&before_seq=3", "", adminToken,
-		"req_int_stream_snapshot_2")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("before_seq snapshot=%d %s", rec.Code, rec.Body)
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
-		t.Fatalf("decode before_seq snapshot %q: %v", rec.Body, err)
-	}
-	if len(snapshot.Data.Items) != 1 || snapshot.Data.Items[0].Seq != 2 ||
-		snapshot.Data.SnapshotCursor != 3 || !snapshot.Data.HasMore {
-		t.Fatalf("before_seq snapshot=%s", rec.Body)
-	}
-
-	// The test publisher is admin-only and requires authentication.
-	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events", `{"count":1}`, userToken,
-		"req_int_stream_forbidden_1")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("test publish as user=%d %s want 403", rec.Code, rec.Body)
-	}
-	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events", `{"count":1}`, "",
-		"req_int_stream_unauth_1")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("test publish anonymous=%d %s want 401", rec.Code, rec.Body)
-	}
-
-	// Open the SSE stream from seq 1: the persisted events 2 and 3 replay, then
-	// an event published while connected arrives live, exactly once.
-	srv := httptest.NewServer(h)
-	defer srv.Close()
-	streamCtx, cancelStream := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelStream()
-	stream := openEventStream(t, streamCtx, srv.URL+"/api/stream?channel=system&since=1", adminToken, "")
-	defer stream.Body.Close()
-	if got := stream.Header.Get("X-Snapshot-Cursor"); got != "3" {
-		t.Fatalf("X-Snapshot-Cursor=%q want 3", got)
-	}
-	reader := bufio.NewReader(stream.Body)
-	assertStreamEvent(t, readStreamFrame(t, reader), "2")
-	assertStreamEvent(t, readStreamFrame(t, reader), "3")
-
-	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events", `{"count":1,"summary":"live"}`, adminToken,
-		"req_int_stream_publish_2")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("live publish=%d %s", rec.Code, rec.Body)
-	}
-	assertStreamEvent(t, readStreamFrame(t, reader), "4")
-	stream.Body.Close()
-
-	// Reconnect with Last-Event-ID: only the missing event is replayed.
-	reconnectCtx, cancelReconnect := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelReconnect()
-	reconnected := openEventStream(t, reconnectCtx, srv.URL+"/api/stream?channel=system&since=1", adminToken, "3")
-	defer reconnected.Body.Close()
-	if got := reconnected.Header.Get("X-Snapshot-Cursor"); got != "4" {
-		t.Fatalf("reconnect X-Snapshot-Cursor=%q want 4", got)
-	}
-	assertStreamEvent(t, readStreamFrame(t, bufio.NewReader(reconnected.Body)), "4")
-}
-
-// openEventStream opens an SSE response and fails on a non-200 status.
-func openEventStream(t *testing.T, ctx context.Context, url, token, lastEventID string) *http.Response {
-	t.Helper()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "eztest-integration/1.0")
-	if lastEventID != "" {
-		req.Header.Set("Last-Event-ID", lastEventID)
+	if a.token != "" {
+		req.Header.Set("Authorization", "Bearer "+a.token)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		a.t.Fatalf("%s %s: %v", method, path, err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		t.Fatalf("stream status=%d body=%s", resp.StatusCode, body)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != wantStatus {
+		a.t.Fatalf("%s %s status = %d, want %d: %s", method, path, resp.StatusCode, wantStatus, raw)
 	}
-	return resp
+	if len(raw) == 0 {
+		return nil
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		a.t.Fatalf("%s %s decode: %v (%s)", method, path, err, raw)
+	}
+	return envelope
 }
 
-// streamFrame is one parsed SSE frame.
-type streamFrame struct {
-	ID    string
-	Event string
-	Data  string
+func (a *testAPI) login(username, password string) {
+	a.t.Helper()
+	a.token = ""
+	body := a.do(http.MethodPost, "/api/auth/login", map[string]any{"username": username, "password": password}, http.StatusOK)
+	data := body["data"].(map[string]any)
+	a.token = data["token"].(string)
+	if a.token == "" {
+		a.t.Fatal("empty token")
+	}
 }
 
-// readStreamFrame reads one event frame, skipping comment-only heartbeats.
-func readStreamFrame(t *testing.T, reader *bufio.Reader) streamFrame {
-	t.Helper()
-	for {
-		frame := streamFrame{}
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				t.Fatalf("read SSE frame: %v", err)
-			}
-			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
-			if line == "" {
-				break
-			}
-			if strings.HasPrefix(line, ":") {
-				continue
-			}
-			field, value, _ := strings.Cut(line, ":")
-			value = strings.TrimPrefix(value, " ")
-			switch field {
-			case "id":
-				frame.ID = value
-			case "event":
-				frame.Event = value
-			case "data":
-				frame.Data = value
-			}
+func (a *testAPI) data(body map[string]any) map[string]any {
+	a.t.Helper()
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		a.t.Fatalf("missing data object: %#v", body)
+	}
+	return data
+}
+
+func (a *testAPI) listData(body map[string]any) []any {
+	a.t.Helper()
+	data, ok := body["data"].([]any)
+	if !ok {
+		a.t.Fatalf("missing data list: %#v", body)
+	}
+	return data
+}
+
+func TestP0EndToEndFlow(t *testing.T) {
+	api := newTestAPI(t)
+
+	api.login("admin", "admin123")
+	me := api.data(api.do(http.MethodGet, "/api/auth/me", nil, http.StatusOK))
+	if me["username"] != "admin" || me["role"] != "admin" {
+		t.Fatalf("me = %#v", me)
+	}
+
+	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
+	if len(settings) != 85 {
+		t.Fatalf("settings count = %d, want 85 (P8 83->85)", len(settings))
+	}
+	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
+	if updated["value"] != float64(5) {
+		t.Fatalf("updated setting = %#v", updated)
+	}
+
+	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "Order Center", "intro": "e2e"}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
+	environmentID := environment["id"].(string)
+	page := api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/pages", map[string]any{"name": "Home", "url": "http://localhost:8080/home", "route_template": "/home"}, http.StatusCreated))
+	pageID := page["id"].(string)
+	apiEndpoint := api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/apis", map[string]any{"name": "Orders", "method": "GET", "path_template": "/api/orders"}, http.StatusCreated))
+	apiID := apiEndpoint["id"].(string)
+	database := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/databases", map[string]any{"environment_id": environmentID, "name": "order_db", "dsn": "postgres://localhost/order", "username": "readonly", "password": "secret", "read_only": true}, http.StatusCreated))
+	databaseID := database["id"].(string)
+	if database["password_set"] != true {
+		t.Fatalf("database password_set = %#v", database["password_set"])
+	}
+	account := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/accounts", map[string]any{"environment_id": environmentID, "username": "buyer", "password": "secret", "roles": []string{"buyer"}}, http.StatusCreated))
+	accountID := account["id"].(string)
+	repository := api.data(api.do(http.MethodPost, "/api/resources/code-repos", map[string]any{"name": "order-service", "path": "D:/repo", "branch": "main"}, http.StatusCreated))
+	repositoryID := repository["id"].(string)
+
+	catalog := api.data(api.do(http.MethodGet, "/api/resources/catalog", nil, http.StatusOK))
+	if len(catalog["suts"].([]any)) != 1 || len(catalog["repositories"].([]any)) != 1 {
+		t.Fatalf("catalog = %#v", catalog)
+	}
+
+	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "Order Center Q4",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID, "code_repository_id": repositoryID,
+			"page_ids": []string{pageID}, "api_ids": []string{apiID}, "database_ids": []string{databaseID},
+			"accounts": []any{map[string]any{"account_id": accountID, "role": "buyer"}},
+		}},
+	}, http.StatusCreated))
+	versionID := version["id"].(string)
+	if version["status"] != "initial" {
+		t.Fatalf("version = %#v", version)
+	}
+	detail := api.data(api.do(http.MethodGet, "/api/versions/"+versionID, nil, http.StatusOK))
+	bindings := detail["bindings"].([]any)
+	if len(bindings) != 1 {
+		t.Fatalf("detail = %#v", detail)
+	}
+	binding := bindings[0].(map[string]any)
+	if binding["sut"].(map[string]any)["name"] != "Order Center" {
+		t.Fatalf("binding = %#v", binding)
+	}
+	if len(binding["pages"].([]any)) != 1 || len(binding["accounts"].([]any)) != 1 {
+		t.Fatalf("binding = %#v", binding)
+	}
+
+	events := api.do(http.MethodGet, "/api/events?channel=version:"+versionID, nil, http.StatusOK)
+	eventItems := events["data"].([]any)
+	if len(eventItems) != 1 || eventItems[0].(map[string]any)["type"] != "version.created" {
+		t.Fatalf("version events = %#v", events)
+	}
+
+	// Usage guard: a version-bound SUT cannot be deleted.
+	api.do(http.MethodDelete, "/api/resources/suts/"+sutID, nil, http.StatusConflict)
+
+	// Admin creates a normal user; that user cannot read admin settings.
+	user := api.data(api.do(http.MethodPost, "/api/admin/users", map[string]any{"username": "tester", "display_name": "Tester", "password": "tester-pass"}, http.StatusCreated))
+	if user["role"] != "user" {
+		t.Fatalf("created user = %#v", user)
+	}
+	api.login("tester", "tester-pass")
+	api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusForbidden)
+
+	// Content upload/download over multipart.
+	api.login("admin", "admin123")
+	var buffer bytes.Buffer
+	writer := multipart.NewWriter(&buffer)
+	part, err := writer.CreateFormFile("file", "hello.txt")
+	if err != nil {
+		t.Fatalf("multipart: %v", err)
+	}
+	_, _ = part.Write([]byte("hello eztest"))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("multipart close: %v", err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, api.baseURL+"/api/content", &buffer)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+api.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	uploadRaw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload status = %d: %s", resp.StatusCode, uploadRaw)
+	}
+	var upload struct {
+		Data struct {
+			SHA256 string `json:"sha256"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(uploadRaw, &upload); err != nil {
+		t.Fatalf("upload decode: %v", err)
+	}
+	downloadReq, _ := http.NewRequest(http.MethodGet, api.baseURL+"/api/content/"+upload.Data.SHA256, nil)
+	downloadReq.Header.Set("Authorization", "Bearer "+api.token)
+	downloadResp, err := http.DefaultClient.Do(downloadReq)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	downloaded, _ := io.ReadAll(downloadResp.Body)
+	if downloadResp.StatusCode != http.StatusOK || string(downloaded) != "hello eztest" {
+		t.Fatalf("download status=%d body=%q", downloadResp.StatusCode, downloaded)
+	}
+	if got := downloadResp.Header.Get("X-Content-SHA256"); got != upload.Data.SHA256 {
+		t.Fatalf("sha header = %q", got)
+	}
+
+	auditBody := api.do(http.MethodGet, "/api/admin/audit-logs?limit=10", nil, http.StatusOK)
+	if len(auditBody["data"].([]any)) == 0 {
+		t.Fatal("audit log is empty")
+	}
+
+	// Health stays public and reports the database.
+	healthResp, err := http.Get(api.baseURL + "/api/health")
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	healthRaw, _ := io.ReadAll(healthResp.Body)
+	healthResp.Body.Close()
+	if healthResp.StatusCode != http.StatusOK || !strings.Contains(string(healthRaw), `"db":"ok"`) {
+		t.Fatalf("health status=%d body=%s", healthResp.StatusCode, healthRaw)
+	}
+
+	t.Logf("P0 flow ok: version=%s sha=%s", versionID, upload.Data.SHA256)
+}
+
+func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
+	api := newTestAPI(t)
+	api.login("admin", "admin123")
+
+	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P2 Design SUT", "intro": "p2"}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
+	environmentID := environment["id"].(string)
+	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "P2 Design Version",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID,
+			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
+		}},
+	}, http.StatusCreated))
+	versionID := version["id"].(string)
+
+	graph := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/design/graph", nil, http.StatusOK))
+	if graph["version_id"] != versionID {
+		t.Fatalf("graph version_id = %#v", graph["version_id"])
+	}
+	if graph["pending_design_count"] != float64(0) {
+		t.Fatalf("graph pending_design_count = %#v", graph["pending_design_count"])
+	}
+	if len(graph["requirements"].([]any)) != 0 {
+		t.Fatalf("empty version graph requirements = %#v", graph["requirements"])
+	}
+
+	overview := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/design/overview", nil, http.StatusOK))
+	if overview["active_round"] != nil || overview["round_count"] != float64(0) {
+		t.Fatalf("overview = %#v", overview)
+	}
+
+	list := api.do(http.MethodGet, "/api/versions/"+versionID+"/exports", nil, http.StatusOK)
+	if len(list["data"].([]any)) != 0 {
+		t.Fatalf("initial export list = %#v", list)
+	}
+
+	export := api.data(api.do(http.MethodPost, "/api/versions/"+versionID+"/exports", map[string]any{
+		"owner_kind": "case", "owner_id": versionID, "format": "markdown",
+	}, http.StatusCreated))
+	exportID := export["id"].(string)
+	if export["version_id"] != versionID || export["format"] != "markdown" || export["sha256"] == "" {
+		t.Fatalf("export view = %#v", export)
+	}
+	api.do(http.MethodGet, "/api/exports/"+exportID, nil, http.StatusOK)
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/exports", nil, http.StatusOK)
+	api.do(http.MethodPost, "/api/versions/"+versionID+"/exports", map[string]any{
+		"owner_kind": "case", "owner_id": versionID, "format": "pdf",
+	}, http.StatusBadRequest)
+
+	api.token = ""
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/design/graph", nil, http.StatusUnauthorized)
+	api.login("admin", "admin123")
+}
+
+// TestP3ExecutionRoutes pins the P3 routing/auth/empty-state contract (spec
+// §9.2): 401 without a session, an empty but well-formed overview, empty list
+// envelopes, 404 for unknown wave/evidence/human ids and admin-only executor
+// management.
+func TestP3ExecutionRoutes(t *testing.T) {
+	api := newTestAPI(t)
+
+	// Unauthenticated execution routes are 401.
+	api.do(http.MethodGet, "/api/versions/1/execution/overview", nil, http.StatusUnauthorized)
+
+	api.login("admin", "admin123")
+	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P3 Execution SUT", "intro": "p3"}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
+	environmentID := environment["id"].(string)
+	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "P3 Execution Version",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID,
+			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
+		}},
+	}, http.StatusCreated))
+	versionID := version["id"].(string)
+
+	// Overview is readable in the empty state (no wave yet).
+	overview := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/execution/overview", nil, http.StatusOK))
+	if overview["version_id"] != versionID || overview["active_wave"] != nil {
+		t.Fatalf("empty overview = %#v", overview)
+	}
+	if overview["counts"].(map[string]any)["total"] != float64(0) {
+		t.Fatalf("empty counts = %#v", overview["counts"])
+	}
+	if overview["case_run_counts"].(map[string]any)["total"] != float64(0) {
+		t.Fatalf("empty case_run_counts = %#v", overview["case_run_counts"])
+	}
+	if overview["open_human_requests"] != float64(0) {
+		t.Fatalf("open_human_requests = %#v", overview["open_human_requests"])
+	}
+	executor := overview["executor"].(map[string]any)
+	if executor["status"] != "offline" || executor["endpoint"] != "http://127.0.0.1:13336" {
+		t.Fatalf("executor = %#v", executor)
+	}
+	quotas := overview["quotas"].(map[string]any)
+	if quotas["global"] != float64(3) || quotas["per_sut"] != float64(2) || quotas["cross_system"] != float64(1) {
+		t.Fatalf("quotas = %#v", quotas)
+	}
+	if overview["human_request_timeout_seconds"] != float64(1800) {
+		t.Fatalf("human_request_timeout_seconds = %#v", overview["human_request_timeout_seconds"])
+	}
+
+	// Empty list envelopes.
+	waves := api.do(http.MethodGet, "/api/versions/"+versionID+"/waves", nil, http.StatusOK)
+	if len(waves["data"].([]any)) != 0 || waves["has_more"] != false {
+		t.Fatalf("waves = %#v", waves)
+	}
+	intents := api.do(http.MethodGet, "/api/versions/"+versionID+"/execution/intents", nil, http.StatusOK)
+	if len(intents["data"].([]any)) != 0 || intents["has_more"] != false {
+		t.Fatalf("intents = %#v", intents)
+	}
+	evidence := api.do(http.MethodGet, "/api/versions/"+versionID+"/evidence", nil, http.StatusOK)
+	if len(evidence["data"].([]any)) != 0 {
+		t.Fatalf("evidence = %#v", evidence)
+	}
+	humans := api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=open", nil, http.StatusOK)
+	if len(humans["data"].([]any)) != 0 {
+		t.Fatalf("human requests = %#v", humans)
+	}
+
+	// Unknown entities are 404.
+	api.do(http.MethodPost, "/api/versions/"+versionID+"/waves/999999999/pause", map[string]any{"mode": "graceful"}, http.StatusNotFound)
+	api.do(http.MethodPost, "/api/versions/"+versionID+"/waves/999999999/resume", nil, http.StatusNotFound)
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/case-runs/999999999", nil, http.StatusNotFound)
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/evidence/999999999", nil, http.StatusNotFound)
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/evidence/999999999/content", nil, http.StatusNotFound)
+	api.do(http.MethodPost, "/api/human-requests/999999999/resolve", map[string]any{"response": map[string]any{"code": "246810"}}, http.StatusNotFound)
+	api.do(http.MethodPost, "/api/human-requests/999999999/cancel", nil, http.StatusNotFound)
+	api.do(http.MethodPost, "/api/versions/"+versionID+"/execution/intents/999999999/cancel", nil, http.StatusNotFound)
+
+	// Admin settings expose the P3 secret masked, never in clear text.
+	token := api.data(api.do(http.MethodGet, "/api/admin/settings/execution.executor_token", nil, http.StatusOK))
+	if token["is_secret"] != true || token["value"] != nil {
+		t.Fatalf("executor token setting = %#v", token)
+	}
+
+	// Executor administration is admin-only.
+	executors := api.do(http.MethodGet, "/api/admin/executors", nil, http.StatusOK)
+	if len(executors["data"].([]any)) != 0 || executors["has_more"] != false {
+		t.Fatalf("executors = %#v", executors)
+	}
+	api.do(http.MethodPost, "/api/admin/executors/999999999/drain", nil, http.StatusNotFound)
+	api.do(http.MethodPost, "/api/admin/executors/999999999/activate", nil, http.StatusNotFound)
+
+	api.data(api.do(http.MethodPost, "/api/admin/users", map[string]any{
+		"username": "p3-user", "display_name": "P3 User", "password": "p3-user-pass",
+	}, http.StatusCreated))
+	api.login("p3-user", "p3-user-pass")
+	api.do(http.MethodGet, "/api/admin/executors", nil, http.StatusForbidden)
+	// Normal users can still read the execution overview.
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/execution/overview", nil, http.StatusOK)
+	api.do(http.MethodGet, "/api/versions/1/execution/overview", nil, http.StatusNotFound)
+}
+
+// TestP3ExecutionReadAPIAndHumanResolve is the server-level happy path that does
+// not need a live executor or LLM: a paused wave/case with a real content-ledger
+// evidence blob and an open login takeover are read through the P3 API, the
+// evidence bytes are downloaded and sha-verified, the human request is resolved
+// and the wave is cancelled.
+func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
+	api := newTestAPI(t)
+	api.login("admin", "admin123")
+
+	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P3 Happy SUT", "intro": "p3"}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
+	environmentID := environment["id"].(string)
+	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "P3 Happy Version",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID,
+			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
+		}},
+	}, http.StatusCreated))
+	versionID := version["id"].(string)
+	versionIDValue, err := strconv.ParseInt(versionID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse version id: %v", err)
+	}
+
+	// Upload the evidence bytes through the P0 content ledger.
+	payload := []byte("p3-evidence-payload")
+	var buffer bytes.Buffer
+	writer := multipart.NewWriter(&buffer)
+	part, err := writer.CreateFormFile("file", "p3-shot.txt")
+	if err != nil {
+		t.Fatalf("multipart: %v", err)
+	}
+	_, _ = part.Write(payload)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("multipart close: %v", err)
+	}
+	uploadReq, _ := http.NewRequest(http.MethodPost, api.baseURL+"/api/content", &buffer)
+	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadReq.Header.Set("Authorization", "Bearer "+api.token)
+	uploadResp, err := http.DefaultClient.Do(uploadReq)
+	if err != nil {
+		t.Fatalf("upload evidence: %v", err)
+	}
+	uploadRaw, _ := io.ReadAll(uploadResp.Body)
+	uploadResp.Body.Close()
+	if uploadResp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload evidence status = %d: %s", uploadResp.StatusCode, uploadRaw)
+	}
+	var upload struct {
+		Data struct {
+			SHA256 string `json:"sha256"`
+			Size   int64  `json:"size"`
+			MIME   string `json:"mime"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(uploadRaw, &upload); err != nil {
+		t.Fatalf("decode upload: %v", err)
+	}
+
+	// Seed one paused wave/case with an open human takeover (executor/LLM-free).
+	ctx := context.Background()
+	seed := []struct {
+		statement string
+		args      []any
+	}{
+		{`INSERT INTO run_wave (id, version_id, status, trigger, counts, started_at, paused_at, pause_reason, pause_mode)
+		  VALUES ($1, $2, 'paused', 'manual', $3::jsonb, now(), now(), 'waiting_human', 'graceful')`,
+			[]any{int64(910001), versionIDValue, `{"total":1,"paused":1}`}},
+		{`INSERT INTO execution_intent (id, version_id, case_version_id, version_sut_ids, environment_fingerprint, purpose, status, dedupe_key)
+		  VALUES ($1, $2, $3, $4::jsonb, $5, 'manual', 'running', 'exec:happy')`,
+			[]any{int64(920001), versionIDValue, int64(999001), `[1]`, strings.Repeat("a", 64)}},
+		{`INSERT INTO case_run (id, wave_id, intent_id, case_version_id, status, attempts, summary, started_at, paused_at, pause_reason, dispatch_epoch)
+		  VALUES ($1, $2, $3, $4, 'paused', 1, $5::jsonb, now(), now(), 'waiting_human', 2)`,
+			[]any{int64(930001), int64(910001), int64(920001), int64(999001), `{"assertion_total":1,"assertion_failed":0,"step_total":1,"step_failed":0,"evidence_count":1}`}},
+		{`INSERT INTO step_result (id, case_run_id, seq, target_version_sut_id, status, observed, error)
+		  VALUES ($1, $2, 1, $3, 'passed', $4::jsonb, '')`,
+			[]any{int64(940001), int64(930001), int64(1), `{"summary":"clicked login"}`}},
+		{`INSERT INTO assertion_result (id, case_run_id, step_seq, assertion_seq, kind, verdict, reason, expected, actual, target_version_sut_id)
+		  VALUES ($1, $2, 1, 1, 'ui', 'passed', '', 'home visible', 'home visible', $3)`,
+			[]any{int64(950001), int64(930001), int64(1)}},
+		{`INSERT INTO evidence (id, case_run_id, version_sut_id, step_seq, assertion_seq, kind, content_ref_id, sha256, size_bytes, mime, filename)
+		  VALUES ($1, $2, $3, 1, NULL, 'screenshot', 555, $4, $5, $6, 'p3-shot.txt')`,
+			[]any{int64(960001), int64(930001), int64(1), upload.Data.SHA256, upload.Data.Size, upload.Data.MIME}},
+		{`INSERT INTO human_request (id, version_id, case_run_id, kind, payload, status, expires_at)
+		  VALUES ($1, $2, $3, 'login_takeover', $4::jsonb, 'open', now() + interval '30 minutes')`,
+			[]any{int64(970001), versionIDValue, int64(930001), `{"reason":"2FA code required","version_sut_id":"1","account_role":"admin","page_url":"http://127.0.0.1:13337/p3/2fa","challenge_kind":"totp"}`}},
+	}
+	for _, item := range seed {
+		if _, err := api.pool.Exec(ctx, item.statement, item.args...); err != nil {
+			t.Fatalf("seed execution row: %v\n%s", err, item.statement)
 		}
-		if frame.ID != "" || frame.Event != "" {
-			return frame
-		}
 	}
-}
 
-// assertStreamEvent checks one replayed event frame's id, type and payload.
-func assertStreamEvent(t *testing.T, frame streamFrame, wantSeq string) {
-	t.Helper()
-	if frame.ID != wantSeq {
-		t.Fatalf("stream id=%q want %q (event=%q data=%q)", frame.ID, wantSeq, frame.Event, frame.Data)
+	// Overview projects the paused wave, open human and stored counts.
+	overview := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/execution/overview", nil, http.StatusOK))
+	activeWave := overview["active_wave"].(map[string]any)
+	if activeWave["id"] != "910001" || activeWave["status"] != "paused" || activeWave["pause_reason"] != "waiting_human" {
+		t.Fatalf("active wave = %#v", activeWave)
 	}
-	if frame.Event != "system.test" {
-		t.Fatalf("stream event=%q want system.test", frame.Event)
+	if overview["counts"].(map[string]any)["paused"] != float64(1) || overview["case_run_counts"].(map[string]any)["total"] != float64(1) {
+		t.Fatalf("overview counts = %#v / %#v", overview["counts"], overview["case_run_counts"])
 	}
-	var payload struct {
-		Seq     int64  `json:"seq"`
-		Channel string `json:"channel"`
-		Type    string `json:"type"`
+	if overview["open_human_requests"] != float64(1) {
+		t.Fatalf("open human requests = %#v", overview["open_human_requests"])
 	}
-	if err := json.Unmarshal([]byte(frame.Data), &payload); err != nil {
-		t.Fatalf("decode stream data %q: %v", frame.Data, err)
+
+	waves := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/waves", nil, http.StatusOK))
+	if len(waves) != 1 || waves[0].(map[string]any)["status"] != "paused" {
+		t.Fatalf("waves = %#v", waves)
 	}
-	if fmt.Sprint(payload.Seq) != wantSeq {
-		t.Fatalf("stream payload seq=%d want %s", payload.Seq, wantSeq)
+	wave := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/waves/910001", nil, http.StatusOK))
+	if wave["status"] != "paused" || wave["trigger"] != "manual" {
+		t.Fatalf("wave = %#v", wave)
 	}
-	if payload.Channel != "system" || payload.Type != "system.test" {
-		t.Fatalf("stream payload=%+v", payload)
+
+	runs := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/waves/910001/case-runs", nil, http.StatusOK))
+	if len(runs) != 1 {
+		t.Fatalf("case runs = %#v", runs)
+	}
+	runView := runs[0].(map[string]any)
+	if runView["id"] != "930001" || runView["status"] != "paused" || runView["evidence_count"] != float64(1) {
+		t.Fatalf("case run view = %#v", runView)
+	}
+	if suts := runView["version_sut_ids"].([]any); len(suts) != 1 || suts[0] != "1" {
+		t.Fatalf("case run version_sut_ids = %#v", runView["version_sut_ids"])
+	}
+
+	detail := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/case-runs/930001", nil, http.StatusOK))
+	if len(detail["steps"].([]any)) != 1 || len(detail["assertions"].([]any)) != 1 {
+		t.Fatalf("case run detail = %#v", detail)
+	}
+	detailEvidence := detail["evidence"].([]any)
+	if len(detailEvidence) != 1 || detailEvidence[0].(map[string]any)["sha256"] != upload.Data.SHA256 {
+		t.Fatalf("detail evidence = %#v", detailEvidence)
+	}
+
+	evidenceList := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/evidence?kind=screenshot", nil, http.StatusOK))
+	if len(evidenceList) != 1 {
+		t.Fatalf("evidence list = %#v", evidenceList)
+	}
+	evidenceView := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/evidence/960001", nil, http.StatusOK))
+	if evidenceView["sha256"] != upload.Data.SHA256 || evidenceView["filename"] != "p3-shot.txt" {
+		t.Fatalf("evidence view = %#v", evidenceView)
+	}
+	if _, leaked := evidenceView["content_ref_id"]; leaked {
+		t.Fatal("evidence view leaked content_ref_id")
+	}
+
+	// Authenticated download re-verifies sha256/size and never exposes a path.
+	downloadReq, _ := http.NewRequest(http.MethodGet, api.baseURL+"/api/versions/"+versionID+"/evidence/960001/content", nil)
+	downloadReq.Header.Set("Authorization", "Bearer "+api.token)
+	downloadResp, err := http.DefaultClient.Do(downloadReq)
+	if err != nil {
+		t.Fatalf("download evidence: %v", err)
+	}
+	downloaded, _ := io.ReadAll(downloadResp.Body)
+	downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK || !bytes.Equal(downloaded, payload) {
+		t.Fatalf("download status=%d body=%q", downloadResp.StatusCode, downloaded)
+	}
+	if got := downloadResp.Header.Get("X-Content-SHA256"); got != upload.Data.SHA256 {
+		t.Fatalf("download sha header = %q", got)
+	}
+	if disposition := downloadResp.Header.Get("Content-Disposition"); !strings.Contains(disposition, "p3-shot.txt") {
+		t.Fatalf("content disposition = %q", disposition)
+	}
+
+	// Evidence of one version is not downloadable through another version.
+	otherVersion := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "P3 Other Version",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID,
+			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
+		}},
+	}, http.StatusCreated))
+	api.do(http.MethodGet, "/api/versions/"+otherVersion["id"].(string)+"/evidence/960001/content", nil, http.StatusNotFound)
+
+	// Human takeover: list open, resolve once, never echo the one-time code.
+	humanList := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=open", nil, http.StatusOK))
+	if len(humanList) != 1 {
+		t.Fatalf("human requests = %#v", humanList)
+	}
+	resolved := api.data(api.do(http.MethodPost, "/api/human-requests/970001/resolve", map[string]any{
+		"response": map[string]any{"code": "246810", "note": "code entered"},
+	}, http.StatusOK))
+	if resolved["status"] != "resolved" {
+		t.Fatalf("resolved human request = %#v", resolved)
+	}
+	response, _ := resolved["response"].(map[string]any)
+	if response == nil || response["note"] != "code entered" {
+		t.Fatalf("human response = %#v", resolved["response"])
+	}
+	if _, leaked := response["code"]; leaked {
+		t.Fatal("human request response leaked the one-time code")
+	}
+	// Resolving the same request again is a state conflict.
+	api.do(http.MethodPost, "/api/human-requests/970001/resolve", map[string]any{
+		"response": map[string]any{"note": "again"},
+	}, http.StatusConflict)
+
+	// Resolve resumed the case_run (pending) and the wave (running).
+	runAfterResolve := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/case-runs/930001", nil, http.StatusOK))
+	if status := runAfterResolve["case_run"].(map[string]any)["status"]; status != "pending" {
+		t.Fatalf("case run after resolve = %#v", status)
+	}
+	waveAfterResolve := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/waves/910001", nil, http.StatusOK))
+	if waveAfterResolve["status"] != "running" {
+		t.Fatalf("wave after resolve = %#v", waveAfterResolve["status"])
+	}
+
+	// Cancel the wave: non-terminal case runs become superseded, intents cancelled.
+	cancelled := api.data(api.do(http.MethodPost, "/api/versions/"+versionID+"/waves/910001/cancel", nil, http.StatusOK))
+	if cancelled["status"] != "cancelled" {
+		t.Fatalf("cancelled wave = %#v", cancelled)
+	}
+	runCancelled := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/case-runs/930001", nil, http.StatusOK))
+	if status := runCancelled["case_run"].(map[string]any)["status"]; status != "superseded" {
+		t.Fatalf("case run after cancel = %#v", status)
+	}
+	intents := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/execution/intents", nil, http.StatusOK))
+	if len(intents) != 1 || intents[0].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("intents after cancel = %#v", intents)
 	}
 }

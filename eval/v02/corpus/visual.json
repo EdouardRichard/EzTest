@@ -1,0 +1,29 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "assertions": [
+    {
+      "case_title": "登录后展示订单列表",
+      "selector": "#order-list",
+      "expected_classification": "passed"
+    },
+    {
+      "case_title": "按状态筛选订单",
+      "selector": "#order-filter",
+      "expected_classification": "failed"
+    },
+    {
+      "case_title": "订单详情展示退款入口",
+      "selector": "#refund-entry",
+      "expected_classification": "passed"
+    },
+    {
+      "case_title": "无权限用户不显示退款入口",
+      "selector": "#refund-entry",
+      "expected_classification": "passed"
+    }
+  ],
+  "expected": {
+    "injected": 4,
+    "correct": 4
+  }
+}

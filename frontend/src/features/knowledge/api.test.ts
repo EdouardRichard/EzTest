@@ -1,159 +1,141 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const client = vi.hoisted(() => ({
+  apiGet: vi.fn(),
+  apiGetPage: vi.fn(),
+  apiPost: vi.fn(),
+  apiPatch: vi.fn(),
+}))
+vi.mock("@/lib/api-client", () => client)
 
 import {
+  approveKnowledge,
   createKnowledge,
-  listGlobalKnowledge,
-  listVersionKnowledge,
-  normalizeKnowledgeEntries,
-  reviewKnowledge,
+  getKnowledge,
+  listKnowledge,
+  listKnowledgeRevisions,
+  rejectKnowledge,
+  revokeKnowledge,
   updateKnowledge,
 } from "./api"
 
-function jsonResponse(body: unknown, status = 200): Response {
-  const text = JSON.stringify(body)
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    headers: new Headers({ "content-type": "application/json" }),
-    text: async () => text,
-    json: async () => body,
-  } as unknown as Response
+function lastPath(): URL {
+  const call = [
+    ...client.apiGet.mock.calls,
+    ...client.apiGetPage.mock.calls,
+    ...client.apiPost.mock.calls,
+    ...client.apiPatch.mock.calls,
+  ].at(-1)
+  if (call === undefined) throw new Error("the api client was not called")
+  return new URL(String(call[0]), "http://localhost")
 }
-
-const ENTRY = {
-  id: "1844674407370955161",
-  versionId: "100",
-  versionName: "订单系统",
-  kind: "pitfall",
-  title: "支付超时必须用假时钟",
-  body: "沙箱网关 30s 超时，测试请使用假时钟。",
-  tags: ["payment"],
-  sourceRefs: [{ kind: "requirement", id: "200" }],
-  status: "approved",
-  confidence: "high",
-  createdBy: 42,
-  reviewedBy: 43,
-  reviewNote: "符合沙箱行为",
-  revision: 2,
-  createdAt: "2026-10-29T10:00:00Z",
-  updatedAt: "2026-10-29T11:00:00Z",
-}
-
-let fetchMock: ReturnType<typeof vi.fn>
-
-beforeEach(() => {
-  fetchMock = vi.fn()
-  vi.stubGlobal("fetch", fetchMock)
-})
-
-afterEach(() => {
-  vi.unstubAllGlobals()
-})
 
 describe("knowledge api", () => {
-  it("reads one version's knowledge page and normalizes the payload", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({
-        data: [ENTRY, { ...ENTRY, id: "2", tags: null, sourceRefs: null, reviewedBy: null }],
-        next_cursor: "opaque",
-        has_more: true,
-      }),
-    )
+  beforeEach(() => {
+    vi.clearAllMocks()
+    client.apiGet.mockResolvedValue({})
+    client.apiGetPage.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+    client.apiPost.mockResolvedValue({})
+    client.apiPatch.mockResolvedValue({})
+  })
 
-    const page = await listVersionKnowledge("100", {
+  it("builds the filtered knowledge list path with the default page size", async () => {
+    await listKnowledge({
+      scope: "system",
       status: "approved",
-      kind: "pitfall",
-      limit: 5,
+      systemKey: "order-center",
+      tag: "结算",
+      q: "校验",
+      limit: 10,
     })
 
-    const url = String(fetchMock.mock.calls[0]?.[0])
-    expect(url).toContain("/api/versions/100/knowledge")
-    expect(url).toContain("status=approved")
-    expect(url).toContain("kind=pitfall")
-    expect(url).toContain("limit=5")
-    expect(page.hasMore).toBe(true)
-    expect(page.nextCursor).toBe("opaque")
-    expect(page.items).toHaveLength(2)
-    expect(page.items[0]?.sourceRefs).toEqual([{ kind: "requirement", id: "200" }])
-    expect(page.items[1]?.tags).toEqual([])
-    expect(page.items[1]?.sourceRefs).toEqual([])
+    const url = lastPath()
+    expect(url.pathname).toBe("/api/knowledge/items")
+    expect(url.searchParams.get("scope")).toBe("system")
+    expect(url.searchParams.get("status")).toBe("approved")
+    expect(url.searchParams.get("system_key")).toBe("order-center")
+    expect(url.searchParams.get("tag")).toBe("结算")
+    expect(url.searchParams.get("q")).toBe("校验")
+    expect(url.searchParams.get("limit")).toBe("10")
+    expect(url.searchParams.has("cursor")).toBe(false)
   })
 
-  it("defaults the global read to approved and maps the version filter", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ data: [ENTRY], has_more: false }))
+  it("defaults the page size to 20, omits empty filters and appends the cursor", async () => {
+    await listKnowledge(undefined, "7000")
 
-    await listGlobalKnowledge({ versionId: "100", kind: "decision", limit: 20 })
-
-    const url = String(fetchMock.mock.calls[0]?.[0])
-    expect(url).toContain("/api/knowledge")
-    expect(url).toContain("status=approved")
-    expect(url).toContain("versionId=100")
-    expect(url).toContain("kind=decision")
-
-    await listGlobalKnowledge({ status: "draft", limit: 50 })
-    const draftUrl = String(fetchMock.mock.calls[1]?.[0])
-    expect(draftUrl).toContain("status=draft")
+    const url = lastPath()
+    expect(url.pathname).toBe("/api/knowledge/items")
+    expect(url.searchParams.get("limit")).toBe("20")
+    expect(url.searchParams.get("cursor")).toBe("7000")
+    expect(url.searchParams.has("scope")).toBe(false)
+    expect(url.searchParams.has("status")).toBe(false)
+    expect(url.searchParams.has("system_key")).toBe(false)
+    expect(url.searchParams.has("tag")).toBe(false)
+    expect(url.searchParams.has("q")).toBe(false)
   })
 
-  it("creates, updates and reviews entries with decimal string ids in the URL", async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: ENTRY }, 201))
-      .mockResolvedValueOnce(jsonResponse({ data: ENTRY }))
-      .mockResolvedValueOnce(jsonResponse({ data: { ...ENTRY, status: "rejected" } }))
+  it("targets one item detail and its append-only revisions", async () => {
+    await getKnowledge("7001")
+    expect(lastPath().pathname).toBe("/api/knowledge/items/7001")
 
-    await createKnowledge("100", {
-      kind: "pitfall",
-      title: "支付超时",
-      body: "使用假时钟",
-      confidence: "high",
-      tags: ["payment"],
-      sourceRefs: [{ kind: "requirement", id: "200" }],
+    client.apiGetPage.mockResolvedValue({
+      items: [{ id: "1", knowledge_id: "7001", revision: 1 }],
+      nextCursor: "",
+      hasMore: false,
     })
-    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/api/versions/100/knowledge")
-    const createInit = fetchMock.mock.calls[0]?.[1] as RequestInit
-    expect(createInit.method).toBe("POST")
-    expect(JSON.parse(String(createInit.body))).toMatchObject({
-      kind: "pitfall",
-      title: "支付超时",
+    const revisions = await listKnowledgeRevisions("7001")
+    expect(lastPath().pathname).toBe("/api/knowledge/items/7001/revisions")
+    expect(revisions).toHaveLength(1)
+  })
+
+  it("creates a draft through POST /api/knowledge/items", async () => {
+    await createKnowledge({
+      title: "结算校验",
+      content: "提交前必须校验支付方式。",
+      scope: "global",
+      system_key: null,
+      tags: ["结算"],
     })
 
-    await updateKnowledge("100", "9007199254740994", { revision: 2, title: "新标题" })
-    expect(String(fetchMock.mock.calls[1]?.[0])).toContain(
-      "/api/versions/100/knowledge/9007199254740994",
-    )
-    const updateInit = fetchMock.mock.calls[1]?.[1] as RequestInit
-    expect(updateInit.method).toBe("PATCH")
-    expect(JSON.parse(String(updateInit.body))).toEqual({ revision: 2, title: "新标题" })
-
-    await reviewKnowledge("100", "9007199254740994", {
-      revision: 2,
-      status: "rejected",
-      reason: "重复条目",
-    })
-    expect(String(fetchMock.mock.calls[2]?.[0])).toContain(
-      "/api/versions/100/knowledge/9007199254740994/review",
-    )
-    const reviewInit = fetchMock.mock.calls[2]?.[1] as RequestInit
-    expect(reviewInit.method).toBe("POST")
-    expect(JSON.parse(String(reviewInit.body))).toEqual({
-      revision: 2,
-      status: "rejected",
-      reason: "重复条目",
+    const url = lastPath()
+    expect(url.pathname).toBe("/api/knowledge/items")
+    const [path, body] = client.apiPost.mock.calls.at(-1) ?? []
+    expect(String(path)).toBe("/api/knowledge/items")
+    expect(body).toEqual({
+      title: "结算校验",
+      content: "提交前必须校验支付方式。",
+      scope: "global",
+      system_key: null,
+      tags: ["结算"],
     })
   })
 
-  it("normalizes a partial or malformed entry list without inventing fields", () => {
-    const items = normalizeKnowledgeEntries([
-      null,
-      { id: 12, title: "short shape" },
-      { ...ENTRY, status: "unknown-status", kind: "unknown-kind" },
+  it("edits an item through PATCH", async () => {
+    await updateKnowledge("7001", { title: "新标题" })
+
+    expect(lastPath().pathname).toBe("/api/knowledge/items/7001")
+    expect(client.apiPatch.mock.calls.at(-1)).toEqual([
+      "/api/knowledge/items/7001",
+      { title: "新标题" },
     ])
-    expect(items).toHaveLength(2)
-    expect(items[0]?.id).toBe("")
-    expect(items[0]?.title).toBe("short shape")
-    expect(items[0]?.status).toBe("draft")
-    expect(items[0]?.confidence).toBe("medium")
-    expect(items[1]?.status).toBe("draft")
-    expect(items[1]?.kind).toBe("pattern")
+  })
+
+  it("posts the review transitions to their admin paths", async () => {
+    await approveKnowledge("7001")
+    expect(lastPath().pathname).toBe("/api/knowledge/items/7001/approve")
+
+    await rejectKnowledge("7001", "标题不清晰")
+    expect(lastPath().pathname).toBe("/api/knowledge/items/7001/reject")
+    expect(client.apiPost.mock.calls.at(-1)).toEqual([
+      "/api/knowledge/items/7001/reject",
+      { reason: "标题不清晰" },
+    ])
+
+    await revokeKnowledge("7001", "来源版本已废弃")
+    expect(lastPath().pathname).toBe("/api/knowledge/items/7001/revoke")
+    expect(client.apiPost.mock.calls.at(-1)).toEqual([
+      "/api/knowledge/items/7001/revoke",
+      { reason: "来源版本已废弃" },
+    ])
   })
 })

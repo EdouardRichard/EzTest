@@ -216,6 +216,58 @@ test("request bodies over 1MB are rejected with 413 too_large", async () => {
   assert.equal(response.json.error.code, "too_large")
 })
 
+test("action bodies over 1MB are rejected unless the action is visual.compare", async () => {
+  const created = await createContext()
+  try {
+    const oversized = {
+      action: "snapshot",
+      args: { pad: "x".repeat(MAX_REQUEST_BYTES + 1024) },
+    }
+    const rejected = await request(`/v1/contexts/${created.contextId}/actions`, {
+      method: "POST",
+      body: oversized,
+    })
+    assert.equal(rejected.status, 413)
+    assert.equal(rejected.json.error.code, "too_large")
+  } finally {
+    await request(`/v1/contexts/${created.contextId}`, { method: "DELETE" })
+  }
+})
+
+test("visual.compare keeps the larger visual action body limit", async () => {
+  let received = null
+  const fakeManager = {
+    runAction: async (_contextId, body) => {
+      received = body
+      return { ok: true, result: {} }
+    },
+  }
+  const visualServer = createExecutorServer({
+    token: TOKEN,
+    manager: fakeManager,
+    logger: null,
+    version: "test",
+  })
+  visualServer.listen(0, "127.0.0.1")
+  await new Promise((resolve) => visualServer.once("listening", resolve))
+  const { port } = visualServer.address()
+  const call = httpClient(`http://127.0.0.1:${port}`, TOKEN)
+  try {
+    const body = {
+      action: "visual.compare",
+      args: { pad: "x".repeat(MAX_REQUEST_BYTES + 1024) },
+    }
+    const response = await call("/v1/contexts/ctx_visual/actions", {
+      method: "POST",
+      body,
+    })
+    assert.equal(response.status, 200, response.text)
+    assert.equal(received.action, "visual.compare")
+  } finally {
+    await new Promise((resolve) => visualServer.close(resolve))
+  }
+})
+
 test("context limit rejects additional contexts", async () => {
   const created = await createContext()
   try {
@@ -259,8 +311,64 @@ test("unknown routes and methods are rejected", async () => {
   const missing = await request("/nope")
   assert.equal(missing.status, 404)
 
-  const wrongMethod = await request("/v1/contexts", { method: "GET" })
+  const wrongMethod = await request("/v1/contexts", { method: "PUT" })
   assert.equal(wrongMethod.status, 405)
+})
+
+test("POST /v1/contexts saves metadata and GET /v1/contexts lists contexts", async () => {
+  const metadata = {
+    case_run_id: 42,
+    version_sut_id: 7,
+    account_role: "admin",
+    dispatch_epoch: 3,
+    dispatch_token: "dispatch-token",
+  }
+  const created = await createContext({ key: "run:42:vs:7:role:admin", metadata })
+  try {
+    const listed = await request("/v1/contexts")
+    assert.equal(listed.status, 200, listed.text)
+    assert.equal(Array.isArray(listed.json.contexts), true)
+    const entry = listed.json.contexts.find((context) => context.id === created.contextId)
+    assert.ok(entry, `context ${created.contextId} is missing from GET /v1/contexts`)
+    assert.equal(entry.key, "run:42:vs:7:role:admin")
+    assert.deepEqual(entry.metadata, metadata)
+    assert.equal(typeof entry.createdAt, "string")
+    assert.ok(Number.isFinite(Date.parse(entry.createdAt)))
+  } finally {
+    await request(`/v1/contexts/${created.contextId}`, { method: "DELETE" })
+  }
+})
+
+test("GET /v1/contexts requires the bearer token", async () => {
+  const missing = await request("/v1/contexts", { token: undefined })
+  assert.equal(missing.status, 401)
+  assert.equal(missing.json.error.code, "unauthorized")
+})
+
+test("POST /v1/contexts rejects metadata over 2KB and non-object metadata", async () => {
+  const oversized = await request("/v1/contexts", {
+    method: "POST",
+    body: {
+      key: "server:metadata",
+      allowedHosts: ["127.0.0.1"],
+      baseUrl: pageServer.url,
+      metadata: { blob: "x".repeat(3000) },
+    },
+  })
+  assert.equal(oversized.status, 400)
+  assert.equal(oversized.json.error.code, "invalid_arguments")
+
+  const notObject = await request("/v1/contexts", {
+    method: "POST",
+    body: {
+      key: "server:metadata",
+      allowedHosts: ["127.0.0.1"],
+      baseUrl: pageServer.url,
+      metadata: ["not", "an", "object"],
+    },
+  })
+  assert.equal(notObject.status, 400)
+  assert.equal(notObject.json.error.code, "invalid_arguments")
 })
 
 test("startFromEnv wires EZTEST_EXEC_ALLOWED_HOSTS into the context manager", async () => {

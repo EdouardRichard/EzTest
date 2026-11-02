@@ -1,218 +1,182 @@
-package application
+package searchapp
 
 import (
 	"context"
-	"errors"
-	"log/slog"
+	"sort"
+	"strconv"
 	"strings"
-	"sync"
+	"unicode/utf8"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// providerBinding pairs one cross-context provider with the result types it
-// owns (spec §3.3).
-type providerBinding struct {
-	name     string
-	provider Provider
-	types    []string
-}
-
-// Service aggregates the per-context providers into the global-search read
-// model. It holds no state and performs no caching: every Search call is
-// independent.
+// Service aggregates the per-type providers into the global-search snapshot. It
+// is stateless and performs no caching: every Search call is independent.
 type Service struct {
-	providers Providers
-	logger    *slog.Logger
+	providers map[string]Provider
+	titles    VersionTitleReader
 }
 
-// Option customizes the search service's optional collaborators. It keeps the
-// zero-config NewService(providers) call site (the composition root) unchanged.
-type Option func(*Service)
+// NewService wires the five search-type providers.
+func NewService(providers Providers) *Service {
+	return &Service{providers: map[string]Provider{
+		TypeVersion:     providers.Version,
+		TypeRequirement: providers.Requirement,
+		TypeCase:        providers.Case,
+		TypeIssue:       providers.Issue,
+		TypeReport:      providers.Report,
+	}}
+}
 
-// WithLogger makes the service record provider failures. Without it the process
-// default logger is used, so the composition root logs with its configured
-// logger without an extra wiring change.
-func WithLogger(logger *slog.Logger) Option {
-	return func(service *Service) {
-		if logger != nil {
-			service.logger = logger
-		}
+// WithVersionTitles attaches the version title resolver used to fill the items
+// whose provider cannot see another context's version table. A nil resolver
+// leaves the titles empty instead of degrading the search; the production
+// assembly root must wire the version QueryService.
+func (s *Service) WithVersionTitles(titles VersionTitleReader) *Service {
+	if s != nil {
+		s.titles = titles
 	}
+	return s
 }
 
-// NewService builds the global-search aggregation service.
-func NewService(providers Providers, options ...Option) *Service {
-	service := &Service{providers: providers}
-	for _, option := range options {
-		if option != nil {
-			option(service)
-		}
-	}
-	return service
-}
-
-// loggerOrDefault returns the injected logger or the process default.
-func (s *Service) loggerOrDefault() *slog.Logger {
-	if s != nil && s.logger != nil {
-		return s.logger
-	}
-	return slog.Default()
-}
-
-// Search validates the query, calls the relevant providers in parallel and
-// assembles the canonical group order. A provider failure only marks the
-// snapshot degraded: the healthy groups are still returned (spec §6.2).
-func (s *Service) Search(ctx context.Context, query Query) (Snapshot, error) {
+// Search validates the request, queries each requested type exactly once and
+// assembles the canonical group order. A provider failure only empties its own
+// group and sets degraded=true: the healthy groups are still returned and a
+// total provider outage is a 200 snapshot, never a 5xx (spec §4.3.1).
+func (s *Service) Search(ctx context.Context, q string, types []string, limit int) (Snapshot, error) {
 	if s == nil {
-		return Snapshot{}, errors.New("search: service is not configured")
+		return Snapshot{}, platform.Unavailable("search service is not configured")
 	}
-	text, err := ValidateQueryText(query.Text)
+	text, err := NormalizeQuery(q)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	requestedTypes, err := normalizeTypes(query.Types)
+	requested, err := NormalizeTypes(types)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	requested := make(map[string]struct{}, len(requestedTypes))
-	for _, typeName := range requestedTypes {
-		requested[typeName] = struct{}{}
-	}
-	limit := normalizeLimit(query.Limit)
-
-	bindings := []providerBinding{
-		{name: "version", provider: s.providers.Version, types: []string{TypeVersion, TypeRequirement}},
-		{name: "mindmap", provider: s.providers.Mindmap, types: []string{TypeCase}},
-		{name: "delivery", provider: s.providers.Delivery, types: []string{TypeIssue}},
+	perTypeLimit, err := NormalizeLimit(limit)
+	if err != nil {
+		return Snapshot{}, err
 	}
 
-	// Every provider owns at least one requested type: query it concurrently.
-	outcomes := make([]providerOutcome, len(bindings))
-	var wait sync.WaitGroup
-	for index, binding := range bindings {
-		if !ownsRequested(binding.types, requested) {
-			continue
-		}
-		if binding.provider == nil {
-			outcomes[index].err = errors.New("search: provider is not configured")
-			continue
-		}
-		wait.Add(1)
-		go func(index int, provider Provider) {
-			defer wait.Done()
-			groups, searchErr := provider.Search(ctx, text, limit)
-			outcomes[index] = providerOutcome{groups: groups, err: searchErr}
-		}(index, binding.provider)
-	}
-	wait.Wait()
-
-	itemsByType := make(map[string][]Item, len(requestedTypes))
-	for _, typeName := range requestedTypes {
-		itemsByType[typeName] = make([]Item, 0)
-	}
-	degraded := false
-	truncated := false
-	for index, binding := range bindings {
-		if !ownsRequested(binding.types, requested) {
-			continue
-		}
-		outcome := outcomes[index]
-		if outcome.err != nil {
+	snapshot := Snapshot{Groups: make([]Group, 0, len(requested))}
+	for _, typeName := range requested {
+		items := make([]Item, 0, perTypeLimit)
+		provider := s.providers[typeName]
+		if provider == nil {
+			snapshot.Degraded = true
+		} else if hits, searchErr := provider.Search(ctx, text, perTypeLimit); searchErr != nil {
 			// One failing context must not fail the whole search: keep the
-			// healthy groups and tell the caller the result is partial. The
-			// cause is logged server-side only; the client gets degraded=true.
-			degraded = true
-			s.logProviderFailure(ctx, binding, outcome.err)
-			continue
+			// healthy groups and tell the caller the result is partial.
+			snapshot.Degraded = true
+		} else {
+			if len(hits) > perTypeLimit {
+				hits = hits[:perTypeLimit]
+			}
+			if len(hits) >= perTypeLimit {
+				snapshot.Truncated = true
+			}
+			items = append(items, hits...)
 		}
-		for _, group := range outcome.groups {
-			if _, wanted := requested[group.Type]; !wanted {
-				// A provider may only return its own types; ignore anything else
-				// so a buggy adapter cannot smuggle a group into the response.
+		snapshot.Total += len(items)
+		snapshot.Groups = append(snapshot.Groups, Group{Type: typeName, Items: items})
+	}
+	s.decorateVersionTitles(ctx, &snapshot)
+	return snapshot, nil
+}
+
+// decorateVersionTitles fills the missing version titles in one batch read. The
+// lookup is best-effort: a failing title reader marks the snapshot degraded and
+// keeps the titles that the providers already resolved, because the groups
+// themselves are healthy and spec §4.3.1 requires a 200 partial result rather
+// than a 5xx. A nil reader is an unwired decoration and stays silent.
+func (s *Service) decorateVersionTitles(ctx context.Context, snapshot *Snapshot) {
+	if s == nil || s.titles == nil {
+		return
+	}
+	ids := missingVersionTitleIDs(snapshot.Groups)
+	if len(ids) == 0 {
+		return
+	}
+	titles, err := s.titles.VersionTitles(ctx, ids)
+	if err != nil {
+		snapshot.Degraded = true
+		return
+	}
+	applyVersionTitles(snapshot.Groups, titles)
+}
+
+// missingVersionTitleIDs returns the deduplicated positive version IDs of the
+// items that still need a title, sorted so the single batch read is
+// deterministic.
+func missingVersionTitleIDs(groups []Group) []int64 {
+	seen := make(map[int64]struct{})
+	ids := make([]int64, 0)
+	for _, group := range groups {
+		for _, item := range group.Items {
+			if item.VersionTitle != "" {
 				continue
 			}
-			items := group.Items
-			if items == nil {
-				items = make([]Item, 0)
+			id, ok := parseVersionID(item.VersionID)
+			if !ok {
+				continue
 			}
-			if len(items) > limit {
-				items = items[:limit]
+			if _, duplicate := seen[id]; duplicate {
+				continue
 			}
-			if len(items) >= limit {
-				truncated = true
-			}
-			itemsByType[group.Type] = append(itemsByType[group.Type], items...)
+			seen[id] = struct{}{}
+			ids = append(ids, id)
 		}
 	}
+	sort.Slice(ids, func(left, right int) bool { return ids[left] < ids[right] })
+	return ids
+}
 
-	groups := make([]Group, 0, len(requestedTypes))
-	total := 0
-	for _, typeName := range requestedTypes {
-		items := itemsByType[typeName]
-		if items == nil {
-			items = make([]Item, 0)
-		}
-		total += len(items)
-		groups = append(groups, Group{Type: typeName, Items: items})
+func applyVersionTitles(groups []Group, titles map[int64]string) {
+	if len(titles) == 0 {
+		return
 	}
-
-	return Snapshot{
-		Groups:    groups,
-		Total:     total,
-		Truncated: truncated,
-		Degraded:  degraded,
-	}, nil
-}
-
-// providerOutcome is the result slot of one provider goroutine. Each goroutine
-// writes a distinct slice element, so no lock is needed.
-type providerOutcome struct {
-	groups []Group
-	err    error
-}
-
-// logProviderFailure records the server-side cause of a degraded snapshot. The
-// provider error is never part of the response: the client only learns that the
-// result is partial (degraded=true), while operators get the context and cause.
-func (s *Service) logProviderFailure(ctx context.Context, binding providerBinding, cause error) {
-	s.loggerOrDefault().WarnContext(ctx,
-		"search provider failed; returning partial results",
-		"provider", binding.name,
-		"types", strings.Join(binding.types, ","),
-		"error", cause)
-}
-
-// ownsRequested reports whether any type of the provider was requested.
-func ownsRequested(owned []string, requested map[string]struct{}) bool {
-	for _, typeName := range owned {
-		if _, ok := requested[typeName]; ok {
-			return true
+	for groupIndex := range groups {
+		items := groups[groupIndex].Items
+		for itemIndex := range items {
+			if items[itemIndex].VersionTitle != "" {
+				continue
+			}
+			id, ok := parseVersionID(items[itemIndex].VersionID)
+			if !ok {
+				continue
+			}
+			if title, found := titles[id]; found {
+				items[itemIndex].VersionTitle = title
+			}
 		}
 	}
-	return false
 }
 
-// ValidateTypes validates the requested type filter. It is exported so the HTTP
-// layer can reject an unknown type before it constructs a request.
-func ValidateTypes(types []string) error {
-	_, err := normalizeTypes(types)
-	return err
-}
-
-// normalizeLimit applies the documented per-type bounds: a zero/negative limit
-// selects the default and anything above the maximum is clamped.
-func normalizeLimit(limit int) int {
-	if limit <= 0 {
-		return DefaultLimit
+// parseVersionID decodes the decimal-string ID of the JSON boundary and drops
+// the zero, negative and malformed IDs that cannot name a version.
+func parseVersionID(raw string) (int64, bool) {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
 	}
-	if limit > MaxLimit {
-		return MaxLimit
-	}
-	return limit
+	return id, true
 }
 
-// normalizeTypes validates the requested type filter and returns it in canonical
-// order. An empty filter selects every type.
-func normalizeTypes(types []string) ([]string, error) {
+// NormalizeQuery trims the raw keyword and enforces the 1–100 character bound.
+func NormalizeQuery(raw string) (string, error) {
+	text := strings.TrimSpace(raw)
+	length := utf8.RuneCountInString(text)
+	if length < MinQueryRunes || length > MaxQueryRunes {
+		return "", platform.Invalid("q", "q must be between 1 and 100 characters")
+	}
+	return text, nil
+}
+
+// NormalizeTypes validates and canonicalizes the requested type filter. An empty
+// filter selects every type.
+func NormalizeTypes(types []string) ([]string, error) {
 	if len(types) == 0 {
 		return append([]string(nil), AllTypes...), nil
 	}
@@ -223,20 +187,12 @@ func normalizeTypes(types []string) ([]string, error) {
 			continue
 		}
 		if !isSupportedType(typeName) {
-			return nil, &ErrInvalidArgument{
-				Field:   "types",
-				Reason:  ReasonInvalidArgument,
-				Message: "types must be a subset of version,requirement,case,issue",
-			}
+			return nil, invalidTypesError()
 		}
 		requested[typeName] = struct{}{}
 	}
 	if len(requested) == 0 {
-		return nil, &ErrInvalidArgument{
-			Field:   "types",
-			Reason:  ReasonInvalidArgument,
-			Message: "types must be a subset of version,requirement,case,issue",
-		}
+		return nil, invalidTypesError()
 	}
 	ordered := make([]string, 0, len(requested))
 	for _, typeName := range AllTypes {
@@ -247,7 +203,23 @@ func normalizeTypes(types []string) ([]string, error) {
 	return ordered, nil
 }
 
-// isSupportedType reports whether typeName is one of the four search types.
+// NormalizeLimit applies the documented per-type bounds: zero selects the
+// default and negative or above-maximum values are rejected.
+func NormalizeLimit(limit int) (int, error) {
+	if limit == 0 {
+		return DefaultLimit, nil
+	}
+	if limit < MinLimit || limit > MaxLimit {
+		return 0, platform.Invalid("limit", "limit must be between 1 and 20")
+	}
+	return limit, nil
+}
+
+func invalidTypesError() *platform.Error {
+	return platform.Invalid("types",
+		"types must be a subset of version,requirement,case,issue,report")
+}
+
 func isSupportedType(typeName string) bool {
 	for _, candidate := range AllTypes {
 		if candidate == typeName {

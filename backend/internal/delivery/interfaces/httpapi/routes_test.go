@@ -1,194 +1,96 @@
-package httpapi
+package deliveryapi
 
 import (
-	"context"
-	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
-	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
-	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 )
 
-// successDeps wires every delivery handler group with fakes that answer 200/201/
-// 202 so the route table can be exercised end to end.
-func successDeps() HandlerDeps {
-	issue := sampleIssue()
-	report := sampleReport()
-	run := sampleAnalysisRun()
-	return HandlerDeps{
-		Issues: &fakeIssueService{
-			createHuman: func(context.Context, int64, int64, deliveryapp.CreateIssueCommand) (domain.Issue, error) {
-				return issue, nil
-			},
-			applyDrafts: func(context.Context, int64, int64, int64, []domain.IssueDraft) ([]domain.Issue, error) {
-				return nil, nil
-			},
-			confirm: func(context.Context, int64, int64, int64, int, string) (domain.Issue, error) {
-				return issue, nil
-			},
-			dismiss: func(context.Context, int64, int64, int64, int, string) (domain.Issue, error) {
-				return issue, nil
-			},
-			get: func(context.Context, int64, int64) (domain.Issue, error) { return issue, nil },
-			list: func(context.Context, int64, deliveryapp.IssueFilter) ([]domain.Issue, bool, error) {
-				return []domain.Issue{issue}, false, nil
-			},
-		},
-		IssueRefs: &fakeIssueRefs{refs: map[int64][]domain.IssueRef{issue.ID: sampleIssueRefs(issue.ID)}},
-		Reports: &fakeReportService{
-			ensure: func(context.Context, int64, int64, int64) (domain.Report, bool, error) {
-				return report, true, nil
-			},
-			regenerate: func(context.Context, int64, int64, int64) (domain.Report, error) {
-				next := report
-				next.ID = 9102
-				next.Revision = 2
-				return next, nil
-			},
-			get: func(context.Context, int64, int64) (domain.Report, error) { return report, nil },
-			listPage: func(context.Context, int64, deliveryapp.ReportFilter) ([]domain.Report, string, bool, error) {
-				return []domain.Report{report}, "", false, nil
-			},
-			diff: func(context.Context, int64, int64, *int64) (domain.ReportDiff, error) {
-				return domain.ReportDiff{BaseReportID: 9000, TargetReportID: testReportID}, nil
-			},
-			export: func(context.Context, int64, int64) (domain.ReportExport, error) {
-				return domain.ReportExport{
-					ReportID: testReportID, VersionID: testVersionID, BatchID: testBatchID,
-					Revision: 1, Content: []byte("# r"), SHA256: sha256Hex([]byte("# r")),
-					Size: 3, Filename: "report-9101-r1.md",
-				}, nil
-			},
-			publish: func(context.Context, int64, int64, int64) (domain.Report, error) { return report, nil },
-		},
-		Analyses: &fakeAnalysisService{
-			startFailure: func(context.Context, int64, int64, int64) (domain.AnalysisRun, error) {
-				return run, nil
-			},
-			get: func(context.Context, int64, int64, int64) (domain.AnalysisRun, error) { return run, nil },
-			list: func(context.Context, int64, int64) ([]domain.AnalysisRun, error) {
-				return []domain.AnalysisRun{run}, nil
-			},
-		},
-		Batches:      &fakeBatchReader{batch: terminalBatch(testVersionID, testBatchID)},
-		GlobalIssues: &fakeGlobalIssues{rows: []GlobalIssueRow{{Issue: issue, VersionName: "v1"}}},
-		GlobalReports: &fakeGlobalReports{
-			rows: []GlobalReportRow{{Report: report, VersionName: "v1", BatchNo: 2}},
-		},
+// TestIssueRoutesAreRegistered exercises the local mux registration used by the
+// server assembly: Register must mount every issue path with the contract's
+// parameter names and reach the application service only.
+func TestIssueRoutesAreRegistered(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusConfirmed)
+	service := &fakeIssueService{
+		listResult:  []delivery.Issue{issue},
+		actionIssue: issue,
+		details:     map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)},
 	}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodGet, "/api/versions/42/issues", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if service.listCalls != 1 || service.versionID != 42 {
+		t.Fatalf("list route did not reach the service: calls=%d version=%d", service.listCalls, service.versionID)
+	}
+
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/issues/1001", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if len(service.getCalls) == 0 || service.getCalls[0].issueID != 1001 {
+		t.Fatalf("detail route did not reach the service: %#v", service.getCalls)
+	}
+
+	recorder = deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/confirm", `{}`, userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	if len(service.confirmCalls) != 1 || service.confirmCalls[0].issueID != 1001 {
+		t.Fatalf("confirm route did not reach the service: %#v", service.confirmCalls)
+	}
+
+	// The mux must reject unsupported methods instead of falling through.
+	recorder = deliveryCall(t, mux, http.MethodDelete, "/api/versions/42/issues/1001", "", nil)
+	requireStatus(t, recorder, http.StatusMethodNotAllowed)
 }
 
-// TestDeliveryRouteTable proves every P7 delivery route is mounted with the
-// documented method and success status.
-func TestDeliveryRouteTable(t *testing.T) {
-	h := newTestServer(t, successDeps())
-	routes := []struct {
-		method, path, body string
-		want               int
-	}{
-		{http.MethodGet, "/api/versions/101/issues", "", http.StatusOK},
-		{http.MethodPost, "/api/versions/101/issues", `{"title":"t","severity":"major"}`, http.StatusCreated},
-		{http.MethodGet, "/api/versions/101/issues/9001", "", http.StatusOK},
-		{http.MethodPatch, "/api/versions/101/issues/9001", `{"status":"confirmed","expectedRevision":3}`, http.StatusOK},
-		{http.MethodGet, "/api/versions/101/reports", "", http.StatusOK},
-		{http.MethodPost, "/api/versions/101/reports", `{"batchId":"7001"}`, http.StatusCreated},
-		{http.MethodGet, "/api/versions/101/reports/9101", "", http.StatusOK},
-		{http.MethodPost, "/api/versions/101/reports/9101/publish", "", http.StatusOK},
-		{http.MethodPost, "/api/versions/101/reports/9101/regenerate", "", http.StatusCreated},
-		{http.MethodGet, "/api/versions/101/reports/9101/export?format=markdown", "", http.StatusOK},
-		{http.MethodGet, "/api/versions/101/reports/9101/diff", "", http.StatusOK},
-		{http.MethodGet, "/api/versions/101/batches/7001/analysis", "", http.StatusOK},
-		{http.MethodGet, "/api/versions/101/batches/7001/analysis/9201", "", http.StatusOK},
-		{http.MethodPost, "/api/versions/101/batches/7001/analysis", `{"kind":"failure"}`, http.StatusAccepted},
-		{http.MethodGet, "/api/issues", "", http.StatusOK},
-		{http.MethodGet, "/api/reports", "", http.StatusOK},
-	}
-	for _, route := range routes {
-		t.Run(route.method+" "+route.path, func(t *testing.T) {
-			rec := doRequest(h, route.method, route.path, "ezt_user", route.body)
-			requireStatus(t, rec, route.want)
-		})
-	}
-}
+// TestReportRoutesAreRegistered exercises the local report mux registration:
+// Register must mount list/detail/revision/HTML/regenerate and reach the report
+// application service only. The issue service may be absent in such an
+// assembly; report routes must still work.
+func TestReportRoutesAreRegistered(t *testing.T) {
+	reports, _ := reportFixture()
+	html := []byte("<html>report</html>")
+	pdf := []byte("%PDF-1.7 report")
+	reports.html = html
+	reports.htmlRevision = sampleRevision(900, 300, 2, delivery.ReportStatusPublished, "done", int64Ptr(500))
+	reports.pdf = pdf
+	reports.pdfRevision = samplePDFRevision(300, 600)
+	reports.regenerateRevision = 2
+	mux := newDeliveryMux(t, New(nil, WithReports(reports)))
 
-// TestDeliveryHandlersNilSafe proves a partially assembled process mounts
-// nothing instead of panicking.
-func TestDeliveryHandlersNilSafe(t *testing.T) {
-	if handlers := NewHandlers(HandlerDeps{}); handlers == nil {
-		t.Fatal("NewHandlers must never return nil")
-	}
-	mux := http.NewServeMux()
-	var nilHandlers *Handlers
-	nilHandlers.RegisterRoutes(mux)
-	NewHandlers(HandlerDeps{}).RegisterRoutes(mux)
-
-	h := identityhttp.AuthMiddleware(testTokens)(mux)
-	for _, path := range []string{
-		"/api/versions/101/issues",
-		"/api/versions/101/reports",
-		"/api/versions/101/batches/7001/analysis",
-		"/api/issues",
-		"/api/reports",
-	} {
-		rec := doRequest(h, http.MethodGet, path, "ezt_user", "")
-		requireStatus(t, rec, http.StatusNotFound)
-	}
-}
-
-// TestP6DerivedReportRouteUnaffected proves the P6 batch report endpoint keeps
-// its own route and is not shadowed by the P7 report routes.
-func TestP6DerivedReportRouteUnaffected(t *testing.T) {
-	mux := http.NewServeMux()
-	p6Hit := false
-	mux.HandleFunc("GET /api/versions/{id}/batches/{batchId}/report", func(w http.ResponseWriter, r *http.Request) {
-		p6Hit = true
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"data":{"batch":{"id":"7001"},"summary":{"case_count":1}}}`)
-	})
-	NewHandlers(successDeps()).RegisterRoutes(mux)
-	h := identityhttp.AuthMiddleware(testTokens)(mux)
-
-	rec := doRequest(h, http.MethodGet, "/api/versions/101/batches/7001/report", "ezt_user", "")
-	requireStatus(t, rec, http.StatusOK)
-	if !p6Hit {
-		t.Fatal("P6 derived report handler did not receive its request")
-	}
-	if body := rec.Body.String(); body == "" || body[0] != '{' || !strings.Contains(body, `"case_count"`) {
-		t.Fatalf("P6 report body changed: %s", body)
+	recorder := deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if reports.listCalls != 1 || reports.listVersion != 42 {
+		t.Fatalf("list route did not reach the report service: calls=%d version=%d", reports.listCalls, reports.listVersion)
 	}
 
-	// The P7 report routes are distinct and still work next to the P6 route.
-	rec = doRequest(h, http.MethodGet, "/api/versions/101/reports", "ezt_user", "")
-	requireStatus(t, rec, http.StatusOK)
-	rec = doRequest(h, http.MethodGet, "/api/versions/101/reports/9101/export?format=markdown", "ezt_user", "")
-	requireStatus(t, rec, http.StatusOK)
-}
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports/300", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if len(reports.getCalls) == 0 || reports.getCalls[0].reportID != 300 {
+		t.Fatalf("detail route did not reach the report service: %#v", reports.getCalls)
+	}
 
-// TestDTOsDoNotExposeSensitiveFields proves no P7 DTO leaks credentials, prompt
-// text, evidence bodies or the stored Markdown path (spec §11.3).
-func TestDTOsDoNotExposeSensitiveFields(t *testing.T) {
-	h := newTestServer(t, successDeps())
-	for _, path := range []string{
-		"/api/versions/101/issues/9001",
-		"/api/versions/101/reports/9101",
-		"/api/versions/101/reports/9101/diff",
-		"/api/versions/101/batches/7001/analysis/9201",
-		"/api/issues",
-		"/api/reports",
-	} {
-		rec := doRequest(h, http.MethodGet, path, "ezt_user", "")
-		requireStatus(t, rec, http.StatusOK)
-		body := rec.Body.String()
-		for _, forbidden := range []string{
-			"password", "storageState", "Authorization", "Cookie",
-			"markdownPath", "versions/101/reports/9101-r1.md",
-		} {
-			if strings.Contains(body, forbidden) {
-				t.Fatalf("%s leaks %q: %s", path, forbidden, body)
-			}
-		}
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports/300/revisions/2", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports/300/revisions/2/html", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if recorder.Body.String() != string(html) {
+		t.Fatalf("html route body = %q", recorder.Body.String())
+	}
+
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports/300/revisions/2/pdf", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if recorder.Body.String() != string(pdf) {
+		t.Fatalf("pdf route body = %q", recorder.Body.String())
+	}
+	if len(reports.pdfCalls) != 1 || reports.pdfCalls[0].reportID != 300 {
+		t.Fatalf("pdf route did not reach the report service: %#v", reports.pdfCalls)
+	}
+
+	recorder = deliveryCall(t, mux, http.MethodPost, "/api/versions/42/reports/300/regenerate", "", userActor())
+	requireStatus(t, recorder, http.StatusAccepted)
+	if len(reports.regenerateCalls) != 1 || reports.regenerateCalls[0].reportID != 300 {
+		t.Fatalf("regenerate route did not reach the report service: %#v", reports.regenerateCalls)
 	}
 }

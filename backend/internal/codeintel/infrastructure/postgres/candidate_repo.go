@@ -1,199 +1,161 @@
-package postgres
+package codeintelpg
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"time"
+	"encoding/json"
 
-	"github.com/jackc/pgx/v5"
+	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
-// candidateColumnList is the shared column order of every candidate query and
-// the order scanCandidate expects. ImpactCandidate carries no created_at, so
-// the column stays internal to the table.
-const candidateColumnList = `id, analysis_id, subject_kind, subject_id, reason,
-	confidence, source, evidence, selected, selection_updated_by,
-	selection_updated_at`
+// CandidateRepository stores code_impact_candidate rows. ReplaceForAnalysis
+// atomically replaces the candidate set; selection updates are the only mutable
+// columns.
+type CandidateRepository struct {
+	pool *pgxpool.Pool
+	ids  platformid.Generator
+}
 
-// scanCandidate scans one row in candidateColumnList order and decodes the
-// JSONB evidence.
-func scanCandidate(row rowScanner) (domain.ImpactCandidate, error) {
-	var (
-		candidate domain.ImpactCandidate
-		evidence  []byte
-	)
-	if err := row.Scan(
-		&candidate.ID,
-		&candidate.AnalysisID,
-		&candidate.SubjectKind,
-		&candidate.SubjectID,
-		&candidate.Reason,
-		&candidate.Confidence,
-		&candidate.Source,
-		&evidence,
-		&candidate.Selected,
-		&candidate.SelectionUpdatedBy,
-		&candidate.SelectionUpdatedAt,
-	); err != nil {
-		return domain.ImpactCandidate{}, err
+// NewCandidateRepository wires the impact-candidate repository.
+func NewCandidateRepository(pool *pgxpool.Pool, ids platformid.Generator) *CandidateRepository {
+	return &CandidateRepository{pool: pool, ids: ids}
+}
+
+var _ codeintelapp.CandidateRepository = (*CandidateRepository)(nil)
+
+const candidateColumns = `id, analysis_id, subject_kind, subject_id, reason, confidence,
+	source, evidence, selected, selection_updated_by, selection_updated_at, created_at, updated_at`
+
+func scanCandidate(row rowScanner) (codeintel.ImpactCandidate, error) {
+	var candidate codeintel.ImpactCandidate
+	var subjectKind, confidence, source string
+	var evidence []byte
+	if err := row.Scan(&candidate.ID, &candidate.AnalysisID, &subjectKind, &candidate.SubjectID,
+		&candidate.Reason, &confidence, &source, &evidence, &candidate.Selected,
+		&candidate.SelectionUpdatedBy, &candidate.SelectionUpdatedAt,
+		&candidate.CreatedAt, &candidate.UpdatedAt); err != nil {
+		return codeintel.ImpactCandidate{}, err
 	}
-	decodedEvidence, err := decodeEvidence(evidence)
-	if err != nil {
-		return domain.ImpactCandidate{}, fmt.Errorf("decode candidate evidence: %w", err)
-	}
-	candidate.Evidence = decodedEvidence
+	candidate.SubjectKind = codeintel.SubjectKind(subjectKind)
+	candidate.Confidence = codeintel.Confidence(confidence)
+	candidate.Source = codeintel.CandidateSource(source)
+	candidate.Evidence = json.RawMessage(evidence)
 	return candidate, nil
 }
 
-// candidateOrder is the deterministic ordering of design spec §6.6 step 5
-// (source priority, confidence, subject kind, subject id) with the id as final
-// tie-break so the order is total and reproducible (INV-4).
-const candidateOrder = `ORDER BY
-	CASE source WHEN 'direct' THEN 0 WHEN 'contract' THEN 1 WHEN 'relation' THEN 2 WHEN 'ai' THEN 3 ELSE 4 END,
-	CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,
-	CASE subject_kind WHEN 'requirement' THEN 0 WHEN 'app_model' THEN 1 ELSE 2 END,
-	subject_id ASC, id ASC`
-
-// CandidateRepo implements domain.CandidateRepository on a pgx pool.
-type CandidateRepo struct {
-	pool *pgxpool.Pool
-}
-
-// NewCandidateRepository returns an impact-candidate repository backed by pg.
-func NewCandidateRepository(pg *pgxpool.Pool) *CandidateRepo {
-	return &CandidateRepo{pool: pg}
-}
-
-var _ domain.CandidateRepository = (*CandidateRepo)(nil)
-
-// preparedCandidate carries one fully encoded candidate of a replacement
-// batch.
-type preparedCandidate struct {
-	id          int64
-	subjectKind string
-	subjectID   int64
-	reason      string
-	confidence  string
-	source      string
-	evidence    string
-	selected    bool
-	selectedBy  *int64
-	selectedAt  *time.Time
-}
-
-// Replace atomically replaces the whole candidate set of one analysis: the
-// previous rows are deleted inside the same transaction that inserts the new
-// ones (design spec §6.11). Every candidate must carry the caller-supplied
-// Snowflake id; a zero id is rejected with ErrInvalid/missing_id before the
-// previous set is touched (D29). Duplicate candidates are left to the database's
-// unique constraint and skipped.
-func (r *CandidateRepo) Replace(ctx context.Context, analysisID int64, items []domain.ImpactCandidate) error {
-	prepared := make([]preparedCandidate, 0, len(items))
-	for _, item := range items {
-		if item.ID == 0 {
-			return missingIDError("impact candidate")
-		}
-		encodedEvidence, err := marshalEvidence(item.Evidence)
-		if err != nil {
-			return fmt.Errorf("postgres: encode candidate evidence: %w", err)
-		}
-		prepared = append(prepared, preparedCandidate{
-			id:          item.ID,
-			subjectKind: item.SubjectKind,
-			subjectID:   item.SubjectID,
-			reason:      item.Reason,
-			confidence:  item.Confidence,
-			source:      item.Source,
-			evidence:    encodedEvidence,
-			selected:    item.Selected,
-			selectedBy:  item.SelectionUpdatedBy,
-			selectedAt:  item.SelectionUpdatedAt,
-		})
-	}
-
+// ReplaceForAnalysis deletes the previous candidate set and inserts the new one
+// in a single transaction.
+func (r *CandidateRepository) ReplaceForAnalysis(ctx context.Context, analysisID int64, candidates []codeintel.ImpactCandidate) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("postgres: begin replace candidates: %w", err)
+		return wrapDB("begin impact candidate replace", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
 	if _, err := tx.Exec(ctx, `DELETE FROM code_impact_candidate WHERE analysis_id = $1`, analysisID); err != nil {
-		return fmt.Errorf("postgres: delete analysis candidates: %w", err)
+		return wrapDB("delete impact candidates", err)
 	}
-	if len(prepared) > 0 {
-		const insert = `INSERT INTO code_impact_candidate
-			(id, analysis_id, subject_kind, subject_id, reason, confidence, source,
-			 evidence, selected, selection_updated_by, selection_updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
-			ON CONFLICT DO NOTHING`
-		batch := &pgx.Batch{}
-		for _, candidate := range prepared {
-			batch.Queue(insert, candidate.id, analysisID, candidate.subjectKind,
-				candidate.subjectID, candidate.reason, candidate.confidence,
-				candidate.source, candidate.evidence, candidate.selected,
-				candidate.selectedBy, candidate.selectedAt)
-		}
-		results := tx.SendBatch(ctx, batch)
-		for range prepared {
-			if _, err := results.Exec(); err != nil {
-				_ = results.Close()
-				return fmt.Errorf("postgres: insert impact candidate: %w", err)
-			}
-		}
-		if err := results.Close(); err != nil {
-			return fmt.Errorf("postgres: insert impact candidates: %w", err)
+	for _, candidate := range candidates {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO code_impact_candidate (id, analysis_id, subject_kind, subject_id, reason,
+				confidence, source, evidence, selected, selection_updated_by, selection_updated_at,
+				created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13)
+		`, r.ids.Next(), analysisID, string(candidate.SubjectKind), candidate.SubjectID,
+			candidate.Reason, string(candidate.Confidence), string(candidate.Source),
+			jsonText(candidate.Evidence, `[]`), candidate.Selected, candidate.SelectionUpdatedBy,
+			candidate.SelectionUpdatedAt, candidate.CreatedAt, candidate.UpdatedAt); err != nil {
+			return wrapDB("create impact candidate", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("postgres: commit replace candidates: %w", err)
+		return wrapDB("commit impact candidate replace", err)
 	}
 	return nil
 }
 
-// List returns every candidate of one analysis in the deterministic order of
-// design spec §6.6 step 5.
-func (r *CandidateRepo) List(ctx context.Context, analysisID int64) ([]domain.ImpactCandidate, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+candidateColumnList+`
-		 FROM code_impact_candidate
-		 WHERE analysis_id = $1
-		 `+candidateOrder,
-		analysisID)
+// ListByAnalysis returns the stored candidates in creation order.
+func (r *CandidateRepository) ListByAnalysis(ctx context.Context, analysisID int64) ([]codeintel.ImpactCandidate, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+candidateColumns+` FROM code_impact_candidate
+		WHERE analysis_id = $1
+		ORDER BY id ASC
+	`, analysisID)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: list impact candidates: %w", err)
+		return nil, wrapDB("list impact candidates", err)
 	}
 	defer rows.Close()
-
-	candidates := make([]domain.ImpactCandidate, 0)
+	candidates := make([]codeintel.ImpactCandidate, 0)
 	for rows.Next() {
-		candidate, err := scanCandidate(rows)
-		if err != nil {
-			return nil, fmt.Errorf("postgres: scan impact candidate: %w", err)
+		candidate, scanErr := scanCandidate(rows)
+		if scanErr != nil {
+			return nil, wrapDB("scan impact candidate", scanErr)
 		}
 		candidates = append(candidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("postgres: list impact candidates: %w", err)
+		return nil, wrapDB("list impact candidates", err)
 	}
 	return candidates, nil
 }
 
-// Get returns one candidate of one analysis.
-func (r *CandidateRepo) Get(ctx context.Context, analysisID, candidateID int64) (domain.ImpactCandidate, error) {
-	candidate, err := scanCandidate(r.pool.QueryRow(ctx,
-		`SELECT `+candidateColumnList+`
-		 FROM code_impact_candidate
-		 WHERE analysis_id = $1 AND id = $2`,
-		analysisID, candidateID))
+// UpdateSelection records one explicit selection change.
+func (r *CandidateRepository) UpdateSelection(ctx context.Context, analysisID, candidateID, actorID int64, selected bool) (codeintel.ImpactCandidate, error) {
+	candidate, err := scanCandidate(r.pool.QueryRow(ctx, `
+		UPDATE code_impact_candidate
+		SET selected = $3, selection_updated_by = $4, selection_updated_at = now(), updated_at = now()
+		WHERE id = $2 AND analysis_id = $1
+		RETURNING `+candidateColumns,
+		analysisID, candidateID, selected, actorID))
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ImpactCandidate{}, notFoundError("candidate", candidateID)
-		}
-		return domain.ImpactCandidate{}, fmt.Errorf("postgres: get impact candidate: %w", err)
+		return codeintel.ImpactCandidate{}, wrapDB("update impact candidate selection", err)
 	}
 	return candidate, nil
+}
+
+// ImpactEdgeRepository reads the one-hop contract edges of one commit (spec
+// §5.2). Both endpoint fact keys are joined from the entity projection.
+type ImpactEdgeRepository struct {
+	pool *pgxpool.Pool
+}
+
+// NewImpactEdgeRepository wires the impact edge reader.
+func NewImpactEdgeRepository(pool *pgxpool.Pool) *ImpactEdgeRepository {
+	return &ImpactEdgeRepository{pool: pool}
+}
+
+var _ codeintelapp.ImpactEdgeReader = (*ImpactEdgeRepository)(nil)
+
+// ImpactEdges returns the route_to_api edges whose endpoints both carry a fact
+// key, ordered by edge id.
+func (r *ImpactEdgeRepository) ImpactEdges(ctx context.Context, repoID int64, commitSHA string) ([]codeintelapp.ImpactEdge, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT src.fact_key, dst.fact_key, e.rel, e.confidence
+		FROM code_edge e
+		JOIN code_entity src ON src.id = e.src_entity_id
+		JOIN code_entity dst ON dst.id = e.dst_entity_id
+		WHERE e.repo_id = $1 AND e.commit_sha = $2 AND e.rel = 'route_to_api'
+		  AND src.fact_key <> '' AND dst.fact_key <> ''
+		ORDER BY e.id ASC
+	`, repoID, commitSHA)
+	if err != nil {
+		return nil, wrapDB("list impact edges", err)
+	}
+	defer rows.Close()
+	edges := make([]codeintelapp.ImpactEdge, 0)
+	for rows.Next() {
+		var edge codeintelapp.ImpactEdge
+		var rel, confidence string
+		if err := rows.Scan(&edge.SrcFactKey, &edge.DstFactKey, &rel, &confidence); err != nil {
+			return nil, wrapDB("scan impact edge", err)
+		}
+		edge.Rel = codeintel.EdgeRel(rel)
+		edge.Confidence = codeintel.Confidence(confidence)
+		edges = append(edges, edge)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("list impact edges", err)
+	}
+	return edges, nil
 }

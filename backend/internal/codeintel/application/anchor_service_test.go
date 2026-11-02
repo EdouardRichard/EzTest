@@ -1,588 +1,529 @@
-package application
+package codeintelapp
 
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
+	"time"
 
-	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// impactIssueID is the delivery issue id served by the anchor fixture's issue
-// catalog. Its foreign counterpart belongs to another version and must be
-// rejected by the anchor ownership check.
-const (
-	impactIssueID        int64 = 9301
-	impactForeignIssueID int64 = 9302
-)
+// --- fakes for the anchor/review services ---------------------------------------
 
-// issueCatalogCall records one IssueCatalog lookup.
-type issueCatalogCall struct {
-	versionID int64
-	issueID   int64
-}
-
-// stubIssueCatalog is the application IssueCatalog double. It serves the issues
-// registered for their own version and reports a missing/foreign issue as
-// found=false, like the delivery adapter maps its version-scoped not-found.
-type stubIssueCatalog struct {
-	owners map[int64]int64 // issueID -> versionID
-	err    error
-	calls  []issueCatalogCall
-}
-
-func newStubIssueCatalog() *stubIssueCatalog {
-	return &stubIssueCatalog{owners: make(map[int64]int64)}
-}
-
-func (s *stubIssueCatalog) add(versionID, issueID int64) {
-	s.owners[issueID] = versionID
-}
-
-func (s *stubIssueCatalog) GetIssue(_ context.Context, versionID, issueID int64) (IssueInfo, bool, error) {
-	s.calls = append(s.calls, issueCatalogCall{versionID: versionID, issueID: issueID})
-	if s.err != nil {
-		return IssueInfo{}, false, s.err
-	}
-	owner, ok := s.owners[issueID]
-	if !ok {
-		return IssueInfo{}, false, nil
-	}
-	return IssueInfo{ID: issueID, VersionID: owner}, true, nil
-}
-
-// anchorStore is a stateful in-memory AnchorRepository used by the anchor
-// service unit tests. It enforces the same point uniqueness and version-scoped
-// delete rules as the PostgreSQL adapter.
-type anchorStore struct {
-	mu        sync.Mutex
-	anchors   map[int64]domain.CodeAnchor
+type fakeAnchorStore struct {
+	anchors   map[int64]codeintel.Anchor
+	order     []int64
+	nextID    int64
 	createErr error
-	listErr   error
+	updateErr error
 	deleteErr error
-
-	listCalls   []domain.AnchorFilter
-	pathCalls   [][]string
-	deleteCalls []string
+	getErr    error
+	listErr   error
 }
 
-func newAnchorStore() *anchorStore {
-	return &anchorStore{anchors: make(map[int64]domain.CodeAnchor)}
+func newFakeAnchorStore() *fakeAnchorStore {
+	return &fakeAnchorStore{anchors: map[int64]codeintel.Anchor{}}
 }
 
-func (s *anchorStore) Create(_ context.Context, anchor domain.CodeAnchor) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.createErr != nil {
-		return s.createErr
+func (f *fakeAnchorStore) Create(_ context.Context, anchor codeintel.Anchor) (codeintel.Anchor, error) {
+	if f.createErr != nil {
+		return codeintel.Anchor{}, f.createErr
 	}
-	for _, existing := range s.anchors {
-		if existing.VersionID == anchor.VersionID &&
-			existing.SubjectKind == anchor.SubjectKind &&
-			existing.SubjectID == anchor.SubjectID &&
-			existing.FilePath == anchor.FilePath &&
-			anchorLine(existing.StartLine) == anchorLine(anchor.StartLine) &&
-			anchorLine(existing.EndLine) == anchorLine(anchor.EndLine) {
-			return domain.NewConflict("anchor_duplicate", "duplicate anchor")
+	for _, existing := range f.anchors {
+		if existing.VersionID == anchor.VersionID && existing.SubjectKind == anchor.SubjectKind &&
+			existing.SubjectID == anchor.SubjectID && existing.FilePath == anchor.FilePath &&
+			sameLine(existing.StartLine, anchor.StartLine) && sameLine(existing.EndLine, anchor.EndLine) {
+			return codeintel.Anchor{}, codeintel.ErrConflict
 		}
 	}
-	s.anchors[anchor.ID] = anchor
-	return nil
+	f.nextID++
+	anchor.ID = f.nextID
+	f.anchors[anchor.ID] = anchor
+	f.order = append(f.order, anchor.ID)
+	return anchor, nil
 }
 
-func anchorLine(value *int) int {
-	if value == nil {
-		return 0
+func sameLine(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
 	}
-	return *value
+	return *left == *right
 }
 
-func (s *anchorStore) Delete(_ context.Context, versionID, id int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.deleteErr != nil {
-		return s.deleteErr
+func (f *fakeAnchorStore) List(_ context.Context, versionID int64, subjectKind string, subjectID int64) ([]codeintel.Anchor, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
 	}
-	anchor, ok := s.anchors[id]
-	if !ok || anchor.VersionID != versionID {
-		return domain.NewNotFound("anchor_not_found", "anchor not found")
+	result := make([]codeintel.Anchor, 0, len(f.order))
+	for _, id := range f.order {
+		anchor := f.anchors[id]
+		if anchor.VersionID != versionID {
+			continue
+		}
+		if subjectKind != "" && string(anchor.SubjectKind) != subjectKind {
+			continue
+		}
+		if subjectID > 0 && anchor.SubjectID != subjectID {
+			continue
+		}
+		result = append(result, anchor)
 	}
-	delete(s.anchors, id)
-	s.deleteCalls = append(s.deleteCalls, anchor.FilePath)
-	return nil
+	return result, nil
 }
 
-func (s *anchorStore) Get(_ context.Context, versionID, id int64) (domain.CodeAnchor, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	anchor, ok := s.anchors[id]
-	if !ok || anchor.VersionID != versionID {
-		return domain.CodeAnchor{}, domain.NewNotFound("anchor_not_found", "anchor not found")
+func (f *fakeAnchorStore) Get(_ context.Context, id int64) (codeintel.Anchor, error) {
+	if f.getErr != nil {
+		return codeintel.Anchor{}, f.getErr
+	}
+	anchor, ok := f.anchors[id]
+	if !ok {
+		return codeintel.Anchor{}, codeintel.ErrNotFound
 	}
 	return anchor, nil
 }
 
-func (s *anchorStore) List(_ context.Context, versionID int64, filter domain.AnchorFilter) ([]domain.CodeAnchor, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.listCalls = append(s.listCalls, filter)
-	if s.listErr != nil {
-		return nil, s.listErr
+func (f *fakeAnchorStore) UpdateStatus(_ context.Context, id int64, status string, validatedAt time.Time) (codeintel.Anchor, error) {
+	if f.updateErr != nil {
+		return codeintel.Anchor{}, f.updateErr
 	}
-	anchors := make([]domain.CodeAnchor, 0)
-	for _, anchor := range s.anchors {
-		if anchor.VersionID != versionID {
-			continue
-		}
-		if filter.SubjectKind != "" && anchor.SubjectKind != filter.SubjectKind {
-			continue
-		}
-		if filter.SubjectID != nil && anchor.SubjectID != *filter.SubjectID {
-			continue
-		}
-		anchors = append(anchors, anchor)
+	anchor, ok := f.anchors[id]
+	if !ok {
+		return codeintel.Anchor{}, codeintel.ErrNotFound
 	}
-	sortAnchorsByID(anchors)
-	return anchors, nil
+	anchor.Status = status
+	anchor.LastValidatedAt = &validatedAt
+	anchor.UpdatedAt = validatedAt
+	f.anchors[id] = anchor
+	return anchor, nil
 }
 
-func (s *anchorStore) ListByPaths(_ context.Context, versionID int64, paths []string) ([]domain.CodeAnchor, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pathCalls = append(s.pathCalls, append([]string(nil), paths...))
-	wanted := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
-		wanted[path] = struct{}{}
+func (f *fakeAnchorStore) Delete(_ context.Context, id int64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
 	}
-	anchors := make([]domain.CodeAnchor, 0)
-	for _, anchor := range s.anchors {
-		if anchor.VersionID != versionID {
-			continue
-		}
-		if _, ok := wanted[anchor.FilePath]; ok {
-			anchors = append(anchors, anchor)
-		}
+	if _, ok := f.anchors[id]; !ok {
+		return codeintel.ErrNotFound
 	}
-	sortAnchorsByID(anchors)
-	return anchors, nil
+	delete(f.anchors, id)
+	return nil
 }
 
-func sortAnchorsByID(anchors []domain.CodeAnchor) {
-	for i := 1; i < len(anchors); i++ {
-		for j := i; j > 0 && anchors[j].ID < anchors[j-1].ID; j-- {
-			anchors[j], anchors[j-1] = anchors[j-1], anchors[j]
-		}
+type fakeAnchorSubjects struct {
+	requirements        map[int64]bool
+	requirementVersions map[int64]bool
+	caseVersions        map[int64]bool
+	issues              map[int64]bool
+	err                 error
+}
+
+func (f *fakeAnchorSubjects) RequirementInVersion(_ context.Context, _, id int64) (bool, error) {
+	return f.requirements[id], f.err
+}
+
+func (f *fakeAnchorSubjects) RequirementVersionInVersion(_ context.Context, _, id int64) (bool, error) {
+	return f.requirementVersions[id], f.err
+}
+
+func (f *fakeAnchorSubjects) CaseVersionInVersion(_ context.Context, _, id int64) (bool, error) {
+	return f.caseVersions[id], f.err
+}
+
+func (f *fakeAnchorSubjects) IssueInVersion(_ context.Context, _, id int64) (bool, error) {
+	return f.issues[id], f.err
+}
+
+// --- harness ---------------------------------------------------------------------
+
+const (
+	anchorCommitA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	anchorCommitB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
+type anchorHarness struct {
+	service  *AnchorService
+	anchors  *fakeAnchorStore
+	git      *fakeGit
+	versions *fakeVersionReader
+	resource *fakeResourceReader
+	runs     *fakeIndexRepo
+	subjects *fakeAnchorSubjects
+	events   *fakeEvents
+	audit    *fakeAudit
+	now      time.Time
+	ctx      context.Context
+}
+
+func newAnchorHarness() *anchorHarness {
+	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	ctx := platform.WithActor(context.Background(), platform.Actor{ID: 42, Role: "admin"})
+	git := &fakeGit{windows: map[string]codeintel.FileWindow{}}
+	versions := &fakeVersionReader{bindings: []VersionSUTBinding{{
+		VersionSUTID: 11, VersionID: 1, SUTID: 21, RepoID: 10, Branch: "main",
+		CodeBaselineCommit: anchorCommitA,
+	}}}
+	resources := &fakeResourceReader{repos: map[int64]RepoRef{10: {
+		ID: 10, Name: "fixture", Path: "/repo", Branch: "main",
+	}}}
+	runs := newFakeIndexRepo()
+	subjects := &fakeAnchorSubjects{
+		requirements:        map[int64]bool{100: true},
+		requirementVersions: map[int64]bool{110: true},
+		caseVersions:        map[int64]bool{200: true},
+		issues:              map[int64]bool{300: true},
+	}
+	events := &fakeEvents{}
+	audit := &fakeAudit{}
+	service := NewAnchorService(AnchorDeps{
+		Anchors:   newFakeAnchorStore(),
+		Git:       git,
+		Versions:  versions,
+		Resources: resources,
+		Runs:      runs,
+		Subjects:  subjects,
+		Events:    events,
+		Audit:     audit,
+		Settings:  &fakeSettings{ints: map[string]int64{"codeintel.max_excerpt_lines": 40}},
+		Clock:     fakeClock{now: now},
+		IDs:       &fakeIDs{},
+	})
+	return &anchorHarness{
+		service: service, anchors: service.anchors.(*fakeAnchorStore), git: git,
+		versions: versions, resource: resources, runs: runs, subjects: subjects,
+		events: events, audit: audit, now: now, ctx: ctx,
 	}
 }
 
-// anchorFixture assembles the anchor service over deterministic test doubles.
-type anchorFixture struct {
-	repos     *stubRepos
-	versions  *stubVersions
-	appModels *impactAppModels
-	issues    *stubIssueCatalog
-	git       *stubGit
-	anchors   *anchorStore
-	ids       *stubIDs
-	clock     *stubClock
-	svc       *AnchorService
+func (h *anchorHarness) seedWindow(path string, lines ...string) {
+	h.git.windows[path] = codeintel.FileWindow{
+		Path: path, Commit: anchorCommitA, Lines: lines,
+		StartLine: 1, EndLine: len(lines), TotalLines: len(lines),
+	}
 }
 
-func newAnchorFixture(t *testing.T) *anchorFixture {
+func (h *anchorHarness) seedDoneRun(commit string) {
+	_, _ = h.runs.CreateRun(h.ctx, codeintel.IndexRun{
+		ID: 501, VersionID: 1, RepoID: 10, CommitSHA: commit, Status: string(codeintel.IndexDone),
+	})
+}
+
+func intPtr(value int) *int { return &value }
+
+// --- create ----------------------------------------------------------------------
+
+func TestAnchorCreateComputesExcerptAndAudits(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/orders.ts", "line one", "line two", "line three")
+	h.git.windows["src/orders.ts"] = codeintel.FileWindow{
+		Path: "src/orders.ts", Lines: []string{"line two"}, StartLine: 2, EndLine: 2, TotalLines: 3,
+	}
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/orders.ts", StartLine: intPtr(2), EndLine: intPtr(2),
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if anchor.Status != string(codeintel.AnchorValid) || anchor.LastValidatedAt == nil {
+		t.Fatalf("anchor = %+v", anchor)
+	}
+	if anchor.ExcerptSHA != codeintel.ExcerptHash([]string{"line two"}) {
+		t.Fatalf("excerpt sha = %q", anchor.ExcerptSHA)
+	}
+	if anchor.CommitSHA != anchorCommitA || anchor.CreatedBy == nil || *anchor.CreatedBy != 42 {
+		t.Fatalf("anchor commit/actor = %+v", anchor)
+	}
+	if len(h.events.events) != 0 {
+		t.Fatalf("create must not publish anchor events: %v", h.events.types())
+	}
+	if len(h.audit.entries) != 1 || h.audit.entries[0].Action != "code.anchor.created" {
+		t.Fatalf("audit = %+v", h.audit.entries)
+	}
+	if h.audit.entries[0].Metadata["subject_kind"] != "requirement" ||
+		h.audit.entries[0].Metadata["subject_id"] != "100" {
+		t.Fatalf("audit metadata = %+v", h.audit.entries[0].Metadata)
+	}
+}
+
+func TestAnchorCreateRejectsInvalidSubjectsAndRepo(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/a.ts", "a")
+	h.seedWindow("src/b.ts", "b")
+
+	_, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 999,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	assertPlatformError(t, err, 422, "invalid_subject")
+
+	_, err = h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: "unknown", SubjectID: 100, RepoID: 10, FilePath: "src/a.ts",
+	})
+	assertPlatformError(t, err, 422, "invalid_subject")
+
+	_, err = h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectCaseVersion, SubjectID: 999,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	assertPlatformError(t, err, 422, "invalid_subject")
+
+	_, err = h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectVersion, SubjectID: 2, RepoID: 10, FilePath: "src/a.ts",
+	})
+	assertPlatformError(t, err, 422, "invalid_subject")
+
+	_, err = h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 99, FilePath: "src/a.ts",
+	})
+	assertPlatformError(t, err, 422, "repo_not_bound")
+}
+
+func TestAnchorCreateRejectsPathAndRangeViolations(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/a.ts", "one", "two")
+	base := CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts",
+	}
+
+	escape := base
+	escape.FilePath = "../secrets.txt"
+	_, err := h.service.Create(h.ctx, escape)
+	assertPlatformError(t, err, 422, "path_escape")
+
+	outOfRange := base
+	outOfRange.StartLine, outOfRange.EndLine = intPtr(2), intPtr(9)
+	_, err = h.service.Create(h.ctx, outOfRange)
+	assertPlatformError(t, err, 422, "invalid_range")
+
+	inverted := base
+	inverted.StartLine, inverted.EndLine = intPtr(2), intPtr(1)
+	_, err = h.service.Create(h.ctx, inverted)
+	assertPlatformError(t, err, 422, "invalid_range")
+
+	onlyStart := base
+	onlyStart.StartLine = intPtr(1)
+	_, err = h.service.Create(h.ctx, onlyStart)
+	assertPlatformError(t, err, 422, "invalid_range")
+
+	badHash := base
+	badHash.StartLine, badHash.EndLine = intPtr(1), intPtr(1)
+	badHash.ExcerptSHA = "sha256:" + "00"
+	_, err = h.service.Create(h.ctx, badHash)
+	assertPlatformError(t, err, 422, "invalid_excerpt")
+
+	hashWithoutLines := base
+	hashWithoutLines.ExcerptSHA = codeintel.ExcerptHash([]string{"one"})
+	_, err = h.service.Create(h.ctx, hashWithoutLines)
+	assertPlatformError(t, err, 422, "invalid_excerpt")
+}
+
+func TestAnchorCreateExplicitCommitAndDuplicate(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/a.ts", "one")
+	input := CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts", CommitSHA: anchorCommitB,
+	}
+	anchor, err := h.service.Create(h.ctx, input)
+	if err != nil {
+		t.Fatalf("Create explicit commit: %v", err)
+	}
+	if anchor.CommitSHA != anchorCommitB {
+		t.Fatalf("commit = %q", anchor.CommitSHA)
+	}
+
+	_, err = h.service.Create(h.ctx, input)
+	assertPlatformError(t, err, 409, "anchor_duplicate")
+
+	bad := input
+	bad.CommitSHA = "not-a-sha"
+	_, err = h.service.Create(h.ctx, bad)
+	assertPlatformError(t, err, 422, "invalid_commit")
+}
+
+func TestAnchorCreateFallsBackToLatestIndexCommit(t *testing.T) {
+	h := newAnchorHarness()
+	h.versions.bindings[0].CodeBaselineCommit = ""
+	h.seedWindow("src/a.ts", "one")
+	h.seedDoneRun(anchorCommitB)
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectIssue, SubjectID: 300,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if anchor.CommitSHA != anchorCommitB {
+		t.Fatalf("commit = %q", anchor.CommitSHA)
+	}
+}
+
+// --- validate --------------------------------------------------------------------
+
+func TestAnchorValidateReportsValidStaleBroken(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/a.ts", "one", "two")
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts", StartLine: intPtr(1), EndLine: intPtr(2),
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	h.seedDoneRun(anchorCommitB)
+
+	valid, err := h.service.Validate(h.ctx, 1, anchor.ID)
+	if err != nil {
+		t.Fatalf("Validate valid: %v", err)
+	}
+	if valid.Status != string(codeintel.AnchorValid) {
+		t.Fatalf("valid status = %q", valid.Status)
+	}
+	if len(h.events.events) != 1 || h.events.events[0].Type != "code.anchor_validated" {
+		t.Fatalf("events = %v", h.events.types())
+	}
+	if _, ok := h.events.events[0].Payload["file_path"]; ok {
+		t.Fatal("anchor event must not contain a file path")
+	}
+
+	// The excerpt changed in the target commit -> stale.
+	h.git.windows["src/a.ts"] = codeintel.FileWindow{
+		Path: "src/a.ts", Lines: []string{"one", "changed"}, StartLine: 1, EndLine: 2, TotalLines: 2,
+	}
+	stale, err := h.service.Validate(h.ctx, 1, anchor.ID)
+	if err != nil {
+		t.Fatalf("Validate stale: %v", err)
+	}
+	if stale.Status != string(codeintel.AnchorStale) {
+		t.Fatalf("stale status = %q", stale.Status)
+	}
+
+	// The file disappeared -> broken.
+	h.git.readErr = &platform.Error{Status: 404, Code: "path_not_found", Message: "missing"}
+	broken, err := h.service.Validate(h.ctx, 1, anchor.ID)
+	if err != nil {
+		t.Fatalf("Validate broken: %v", err)
+	}
+	if broken.Status != string(codeintel.AnchorBroken) {
+		t.Fatalf("broken status = %q", broken.Status)
+	}
+
+	if len(h.audit.entries) != 4 { // created + three validations
+		t.Fatalf("audit entries = %+v", h.audit.entries)
+	}
+}
+
+func TestAnchorValidateMarksMovedCommitStaleWithoutExcerpt(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/a.ts", "one")
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts", CommitSHA: anchorCommitA,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	h.seedDoneRun(anchorCommitB)
+	updated, err := h.service.Validate(h.ctx, 1, anchor.ID)
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if updated.Status != string(codeintel.AnchorStale) {
+		t.Fatalf("status = %q", updated.Status)
+	}
+}
+
+func TestAnchorValidateUnknownAnchorOrVersion(t *testing.T) {
+	h := newAnchorHarness()
+	_, err := h.service.Validate(h.ctx, 1, 999)
+	assertPlatformError(t, err, 404, "not_found")
+
+	h.seedWindow("src/a.ts", "one")
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, err = h.service.Validate(h.ctx, 2, anchor.ID)
+	assertPlatformError(t, err, 404, "not_found")
+}
+
+// --- list/delete -----------------------------------------------------------------
+
+func TestAnchorListAndDelete(t *testing.T) {
+	h := newAnchorHarness()
+	h.seedWindow("src/a.ts", "one")
+	first, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create first: %v", err)
+	}
+	second, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectCaseVersion, SubjectID: 200,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create second: %v", err)
+	}
+
+	list, err := h.service.List(h.ctx, 1, "requirement", 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != first.ID {
+		t.Fatalf("list = %+v", list)
+	}
+	list, err = h.service.List(h.ctx, 1, "", 200)
+	if err != nil {
+		t.Fatalf("List by subject: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != second.ID {
+		t.Fatalf("list by subject = %+v", list)
+	}
+	if _, err := h.service.List(h.ctx, 1, "unknown", 0); err == nil {
+		t.Fatal("invalid subject kind must fail")
+	}
+
+	if err := h.service.Delete(h.ctx, 1, first.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := h.service.Delete(h.ctx, 1, first.ID); err == nil {
+		t.Fatal("second delete must fail")
+	}
+	if err := h.service.Delete(h.ctx, 2, second.ID); err == nil {
+		t.Fatal("delete from another version must fail")
+	}
+	entries := 0
+	for _, entry := range h.audit.entries {
+		if entry.Action == "code.anchor.deleted" {
+			entries++
+		}
+	}
+	if entries != 1 {
+		t.Fatalf("delete audits = %d", entries)
+	}
+}
+
+// --- shared assertions -----------------------------------------------------------
+
+func assertPlatformError(t *testing.T, err error, status int, code string) *platform.Error {
 	t.Helper()
-	f := &anchorFixture{
-		repos: &stubRepos{infos: map[int64]RepoInfo{
-			impactRepoID: {
-				ID:          impactRepoID,
-				Key:         "web",
-				LocalPath:   "/repo",
-				FixedBranch: "main",
-				Status:      "active",
-			},
-		}},
-		versions: &stubVersions{
-			info: VersionInfo{
-				ID:             impactVersionID,
-				SystemID:       impactSystemID,
-				HasSystem:      true,
-				RepoID:         impactRepoID,
-				HasRepo:        true,
-				Branch:         "main",
-				BaselineCommit: testCommitA,
-			},
-			requirements: []RequirementInfo{{ID: impactRequirementID, Title: "退款"}},
-		},
-		appModels: &impactAppModels{nodes: []AppModelNode{{
-			ID:       impactAppModelID,
-			SystemID: impactSystemID,
-			Kind:     domain.KindPage,
-			Key:      "page:/orders",
-			Name:     "Orders",
-			Path:     "/orders",
-		}}},
-		issues:  newStubIssueCatalog(),
-		git:     &stubGit{head: testCommitA},
-		anchors: newAnchorStore(),
-		ids:     &stubIDs{next: 6000},
-		clock:   &stubClock{now: impactTestTime},
+	if err == nil {
+		t.Fatalf("expected %d/%s, got nil", status, code)
 	}
-	f.issues.add(impactVersionID, impactIssueID)
-	f.issues.add(impactVersionID+1, impactForeignIssueID)
-	f.svc = NewAnchorService(AnchorServiceDeps{
-		Repos:     f.repos,
-		Versions:  f.versions,
-		AppModels: f.appModels,
-		Issues:    f.issues,
-		Git:       f.git,
-		Anchors:   f.anchors,
-		IDs:       f.ids,
-		Clock:     f.clock,
-	})
-	return f
-}
-
-// TestAnchorCreateValidationAndDuplicate pins design spec §6.7: subject
-// ownership, file existence at the fixed branch tip, line validation, path
-// normalisation, uniqueness, version-scoped deletion, the case acceptance and
-// the issue rejection.
-func TestAnchorCreateValidationAndDuplicate(t *testing.T) {
-	f := newAnchorFixture(t)
-	ctx := context.Background()
-	start, end := 2, 3
-
-	anchor, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement,
-		SubjectID:   impactRequirementID,
-		FilePath:    impactClientPath,
-		StartLine:   &start,
-		EndLine:     &end,
-	})
-	if err != nil {
-		t.Fatalf("Create error = %v", err)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error %v is not *platform.Error", err)
 	}
-	if anchor.ID == 0 || anchor.VersionID != impactVersionID || anchor.RepoID != impactRepoID {
-		t.Fatalf("created anchor = %+v, want snowflake id and the version repository", anchor)
+	if apiErr.Status != status || apiErr.Code != code {
+		t.Fatalf("error = %d/%s, want %d/%s (%v)", apiErr.Status, apiErr.Code, status, code, err)
 	}
-	if anchor.SubjectKind != domain.SubjectRequirement || anchor.SubjectID != impactRequirementID {
-		t.Fatalf("created subject = %s/%d", anchor.SubjectKind, anchor.SubjectID)
-	}
-	if anchor.FilePath != impactClientPath || anchorLine(anchor.StartLine) != 2 || anchorLine(anchor.EndLine) != 3 {
-		t.Fatalf("created anchor location = %+v", anchor)
-	}
-	if anchor.Confidence != domain.ConfidenceHigh || anchor.CreatedByKind != "user" || anchor.CreatedBy != 7 {
-		t.Fatalf("created anchor provenance = %+v", anchor)
-	}
-	if !anchor.CreatedAt.Equal(impactTestTime) {
-		t.Fatalf("created at = %v, want the injected clock", anchor.CreatedAt)
-	}
-	if len(f.git.fileCalls) != 1 || f.git.fileCalls[0].commit != testCommitA ||
-		f.git.fileCalls[0].path != impactClientPath || f.git.fileCalls[0].localPath != "/repo" {
-		t.Fatalf("file validation calls = %+v, want the fixed branch tip", f.git.fileCalls)
-	}
-
-	// Duplicate point: same version/subject/file/lines -> 409 anchor_duplicate.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath, StartLine: &start, EndLine: &end,
-	}); domain.Reason(err) != "anchor_duplicate" {
-		t.Fatalf("duplicate error = %v, want anchor_duplicate", err)
-	}
-
-	// Same point without the line range is a different anchor.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath,
-	}); err != nil {
-		t.Fatalf("same-file anchor without lines error = %v", err)
-	}
-
-	// App model anchor: node must belong to the version's bound system.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectAppModel, SubjectID: impactAppModelID,
-		FilePath: impactServerPath,
-	}); err != nil {
-		t.Fatalf("app model anchor error = %v", err)
-	}
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectAppModel, SubjectID: 999999,
-		FilePath: impactServerPath,
-	}); domain.Reason(err) != "app_model_not_found" {
-		t.Fatalf("unknown app model error = %v, want app_model_not_found", err)
-	}
-	// A version without a system binding cannot accept app model anchors.
-	f.versions.info.HasSystem = false
-	f.versions.info.SystemID = 0
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectAppModel, SubjectID: impactAppModelID,
-		FilePath: impactServerPath,
-	}); domain.Reason(err) != "app_model_not_found" {
-		t.Fatalf("unbound system app model error = %v, want app_model_not_found", err)
-	}
-	f.versions.info.HasSystem = true
-	f.versions.info.SystemID = impactSystemID
-
-	// Version subject must equal the path version.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectVersion, SubjectID: impactVersionID,
-		FilePath: impactServerPath,
-	}); err != nil {
-		t.Fatalf("version anchor error = %v", err)
-	}
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectVersion, SubjectID: impactVersionID + 1,
-		FilePath: impactServerPath,
-	}); domain.Reason(err) != "subject_not_in_version" {
-		t.Fatalf("version subject mismatch error = %v, want subject_not_in_version", err)
-	}
-
-	// Requirement must belong to the version.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: 999999,
-		FilePath: impactServerPath,
-	}); domain.Reason(err) != "subject_not_in_version" {
-		t.Fatalf("foreign requirement error = %v, want subject_not_in_version", err)
-	}
-
-	// Case anchors are accepted (D37); the mindmap context owns the subject
-	// lookup. Issue anchors are accepted by P7 (design spec §7.9).
-	caseAnchor, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectCase, SubjectID: impactRequirementID, FilePath: impactServerPath,
-	})
-	if err != nil {
-		t.Fatalf("case anchor error = %v", err)
-	}
-	if caseAnchor.SubjectKind != domain.SubjectCase {
-		t.Fatalf("case anchor subject=%q", caseAnchor.SubjectKind)
-	}
-	issueAnchor, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactClientPath,
-	})
-	if err != nil {
-		t.Fatalf("issue anchor error = %v", err)
-	}
-	if issueAnchor.SubjectKind != domain.SubjectIssue || issueAnchor.SubjectID != impactIssueID {
-		t.Fatalf("issue anchor subject=%s/%d", issueAnchor.SubjectKind, issueAnchor.SubjectID)
-	}
-
-	// Escaping paths are rejected; backslashes are normalised.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: "../outside.ts",
-	}); domain.Reason(err) != "path_escape" {
-		t.Fatalf("escape error = %v, want path_escape", err)
-	}
-	normalized, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: `web\src\utils.ts`,
-	})
-	if err != nil {
-		t.Fatalf("normalized path error = %v", err)
-	}
-	if normalized.FilePath != "web/src/utils.ts" {
-		t.Fatalf("normalized path = %q, want web/src/utils.ts", normalized.FilePath)
-	}
-
-	// Line ranges must be complete and ordered.
-	wideStart, narrowEnd := 5, 2
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath, StartLine: &wideStart, EndLine: &narrowEnd,
-	}); domain.Reason(err) != "invalid_line_range" {
-		t.Fatalf("reversed line range error = %v, want invalid_line_range", err)
-	}
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath, StartLine: &start,
-	}); domain.Reason(err) != "invalid_line_range" {
-		t.Fatalf("start without end error = %v, want invalid_line_range", err)
-	}
-
-	// Missing or non-regular files are rejected at the fixed branch tip.
-	f.git.fileErr = domain.NewInvalid("path", "path_not_found", "missing file")
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactPlainPath,
-	}); domain.Reason(err) != "path_not_found" {
-		t.Fatalf("missing file error = %v, want path_not_found", err)
-	}
-	f.git.fileErr = nil
-
-	// Listing applies the subject filter.
-	requirementSubject := impactRequirementID
-	listed, err := f.svc.List(ctx, impactVersionID, domain.AnchorFilter{
-		SubjectKind: domain.SubjectRequirement, SubjectID: &requirementSubject,
-	})
-	if err != nil {
-		t.Fatalf("List error = %v", err)
-	}
-	if len(listed) != 3 {
-		t.Fatalf("listed anchors = %+v, want the three requirement anchors", listed)
-	}
-	for _, item := range listed {
-		if item.SubjectKind != domain.SubjectRequirement || item.SubjectID != impactRequirementID {
-			t.Fatalf("filtered anchor = %+v", item)
-		}
-	}
-	if len(f.anchors.listCalls) == 0 {
-		t.Fatal("List did not reach the repository")
-	}
-}
-
-// TestAnchorIssueSubjectOwnership pins design spec §7.9: an issue anchor may
-// only reference an issue of the path version, a foreign/missing issue is the
-// P4 ownership reason subject_not_in_version, and the issue anchors are listable
-// and deletable through the version-scoped service.
-func TestAnchorIssueSubjectOwnership(t *testing.T) {
-	f := newAnchorFixture(t)
-	ctx := context.Background()
-
-	created, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactClientPath,
-	})
-	if err != nil {
-		t.Fatalf("issue anchor Create error = %v", err)
-	}
-	if created.SubjectKind != domain.SubjectIssue || created.SubjectID != impactIssueID {
-		t.Fatalf("issue anchor subject = %s/%d, want issue/%d", created.SubjectKind, created.SubjectID, impactIssueID)
-	}
-	if len(f.issues.calls) != 1 ||
-		f.issues.calls[0] != (issueCatalogCall{versionID: impactVersionID, issueID: impactIssueID}) {
-		t.Fatalf("issue catalog calls = %+v, want one (%d, %d)", f.issues.calls, impactVersionID, impactIssueID)
-	}
-
-	// An issue of another version is rejected before the file is validated.
-	fileCalls := len(f.git.fileCalls)
-	_, err = f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectIssue, SubjectID: impactForeignIssueID, FilePath: impactServerPath,
-	})
-	if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "subject_not_in_version" {
-		t.Fatalf("foreign issue error = %v, want invalid subject_not_in_version", err)
-	}
-	if len(f.git.fileCalls) != fileCalls {
-		t.Fatal("a foreign issue must be rejected before the file validation")
-	}
-
-	// An unknown issue is rejected the same way.
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectIssue, SubjectID: 999999, FilePath: impactServerPath,
-	}); domain.Reason(err) != "subject_not_in_version" {
-		t.Fatalf("unknown issue error = %v, want subject_not_in_version", err)
-	}
-
-	// A catalog failure is an operational error, not a domain verdict.
-	f.issues.err = errors.New("delivery down")
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactServerPath,
-	}); err == nil || !errors.Is(err, f.issues.err) {
-		t.Fatalf("catalog failure error = %v, want the delivery error", err)
-	}
-	f.issues.err = nil
-
-	// Querying issue anchors by subject returns them (version-scoped list).
-	issueSubject := impactIssueID
-	listed, err := f.svc.List(ctx, impactVersionID, domain.AnchorFilter{
-		SubjectKind: domain.SubjectIssue, SubjectID: &issueSubject,
-	})
-	if err != nil {
-		t.Fatalf("List issue anchors error = %v", err)
-	}
-	if len(listed) != 1 || listed[0].ID != created.ID || listed[0].SubjectKind != domain.SubjectIssue {
-		t.Fatalf("listed issue anchors = %+v, want the created one", listed)
-	}
-
-	// Deletion stays version-scoped.
-	if err := f.svc.Delete(ctx, impactVersionID+1, created.ID); domain.Reason(err) != "anchor_not_found" {
-		t.Fatalf("foreign delete error = %v, want anchor_not_found", err)
-	}
-	if err := f.svc.Delete(ctx, impactVersionID, created.ID); err != nil {
-		t.Fatalf("Delete issue anchor error = %v", err)
-	}
-}
-
-// TestAnchorIssueSubjectRequiresCatalog pins the fail-loud wiring contract: an
-// issue anchor without the delivery issue catalog is a configuration error, not
-// a silently accepted cross-version subject.
-func TestAnchorIssueSubjectRequiresCatalog(t *testing.T) {
-	f := newAnchorFixture(t)
-	svc := NewAnchorService(AnchorServiceDeps{
-		Repos:     f.repos,
-		Versions:  f.versions,
-		AppModels: f.appModels,
-		Git:       f.git,
-		Anchors:   f.anchors,
-		IDs:       f.ids,
-		Clock:     f.clock,
-	})
-	if _, err := svc.Create(context.Background(), impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactClientPath,
-	}); err == nil {
-		t.Fatal("Create error = nil, want the missing issue catalog to fail loudly")
-	}
-}
-
-// TestAnchorDeleteScopedToVersion pins §6.7's delete ownership: an anchor must
-// belong to the path version, deleting it twice is a not-found.
-func TestAnchorDeleteScopedToVersion(t *testing.T) {
-	f := newAnchorFixture(t)
-	ctx := context.Background()
-
-	created, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath,
-	})
-	if err != nil {
-		t.Fatalf("Create error = %v", err)
-	}
-	// A foreign version id must not delete the anchor.
-	if err := f.svc.Delete(ctx, impactVersionID+1, created.ID); domain.Reason(err) != "anchor_not_found" {
-		t.Fatalf("foreign delete error = %v, want anchor_not_found", err)
-	}
-	if err := f.svc.Delete(ctx, impactVersionID, created.ID); err != nil {
-		t.Fatalf("Delete error = %v", err)
-	}
-	if err := f.svc.Delete(ctx, impactVersionID, created.ID); domain.Reason(err) != "anchor_not_found" {
-		t.Fatalf("second delete error = %v, want anchor_not_found", err)
-	}
-}
-
-// TestAnchorCreateRequiresRepositoryPorts pins the fail-loud wiring contract: a
-// missing anchor repository is a configuration error before any lookup, never a
-// nil-interface panic on the uniqueness check.
-func TestAnchorCreateRequiresRepositoryPorts(t *testing.T) {
-	f := newAnchorFixture(t)
-	svc := NewAnchorService(AnchorServiceDeps{
-		Repos:     f.repos,
-		Versions:  f.versions,
-		AppModels: f.appModels,
-		Git:       f.git,
-		IDs:       f.ids,
-		Clock:     f.clock,
-	})
-	if _, err := svc.Create(context.Background(), impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath,
-	}); err == nil {
-		t.Fatal("Create error = nil, want the missing anchor repository to fail loudly")
-	}
-}
-
-// TestAnchorCreateRequiresFixedBranch pins the fixed-branch contract: a
-// repository without a fixed branch must fail instead of guessing "main".
-func TestAnchorCreateRequiresFixedBranch(t *testing.T) {
-	f := newAnchorFixture(t)
-	repo := f.repos.infos[impactRepoID]
-	repo.FixedBranch = ""
-	f.repos.infos[impactRepoID] = repo
-
-	if _, err := f.svc.Create(context.Background(), impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
-		FilePath: impactClientPath,
-	}); domain.Reason(err) != "code_repository_not_bound" {
-		t.Fatalf("Create error = %v (reason %q), want code_repository_not_bound",
-			err, domain.Reason(err))
-	}
-	if len(f.git.headCalls) != 0 {
-		t.Fatalf("git head calls = %+v, want none (the empty fixed branch must not guess main)", f.git.headCalls)
-	}
+	return apiErr
 }

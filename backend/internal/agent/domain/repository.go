@@ -1,93 +1,111 @@
-package domain
+package agent
 
-import "context"
+import (
+	"context"
+	"errors"
+	"time"
+)
 
-// ProfileRepository is the persistence port for agent profiles.
-type ProfileRepository interface {
-	// List returns every profile ordered by ID ascending.
-	List(ctx context.Context) ([]AgentProfile, error)
-	// Get returns one profile or ErrNotFound.
-	Get(ctx context.Context, id int64) (AgentProfile, error)
-	// Update applies a partial update, validates the merged profile and
-	// returns the stored row. It returns ErrNotFound for an unknown profile.
-	Update(ctx context.Context, id int64, params UpdateParams) (AgentProfile, error)
-	// EnsureBuiltin inserts profile when its key does not exist yet and never
-	// overwrites an existing row. created reports whether it inserted.
-	EnsureBuiltin(ctx context.Context, profile AgentProfile) (bool, error)
+// Persistence errors raised by the agent repositories.
+var (
+	// ErrNotFound means the requested row does not exist.
+	ErrNotFound = errors.New("agent: not found")
+	// ErrLeaseLost means the write was fenced by a newer lease_epoch.
+	ErrLeaseLost = errors.New("agent: lease lost")
+	// ErrConflict means a uniqueness constraint rejected the write.
+	ErrConflict = errors.New("agent: conflict")
+)
+
+// WorkItemRepository is the persistence port for the single execution queue.
+// Every mutation that carries an epoch must fence on (id, lease_epoch) and
+// report ErrLeaseLost when zero rows match.
+type WorkItemRepository interface {
+	// Ensure inserts an open item or returns the existing row for
+	// (version_id, type, dedupe_key); created distinguishes both cases.
+	Ensure(ctx context.Context, in NewWorkItem) (item WorkItem, created bool, err error)
+	// Claim picks the highest-priority available open item with
+	// FOR UPDATE SKIP LOCKED and leases it to claimant.
+	Claim(ctx context.Context, claimant string, lease time.Duration) (item WorkItem, ok bool, err error)
+	// ClaimForTeams is Claim restricted to the given teams. An empty team set
+	// claims nothing.
+	ClaimForTeams(ctx context.Context, claimant string, teams []Team, lease time.Duration) (item WorkItem, ok bool, err error)
+	// ClaimForTypes is Claim restricted to the given work item types. Unlike
+	// Claim it also takes over claimed/running items whose lease expired, so a
+	// crashed render/worker instance cannot strand its item until recovery.
+	// An empty type set claims nothing.
+	ClaimForTypes(ctx context.Context, claimant string, types []string, lease time.Duration) (item WorkItem, ok bool, err error)
+	// Get loads one work item, or ErrNotFound.
+	Get(ctx context.Context, id int64) (WorkItem, error)
+	// MarkRunning moves a claimed item to running.
+	MarkRunning(ctx context.Context, id, epoch int64) error
+	// Renew extends the lease of a claimed/running item.
+	Renew(ctx context.Context, id, epoch int64, lease time.Duration) error
+	// Complete finishes an item.
+	Complete(ctx context.Context, id, epoch int64) error
+	// MarkWaitingHuman parks a running item for a human takeover. It fences on
+	// (id, lease_epoch) and reports ErrLeaseLost when zero rows match.
+	MarkWaitingHuman(ctx context.Context, id, epoch int64) error
+	// Finish closes a waiting_human/pending item without a failure, recording
+	// the reason in last_error. It is idempotent for an already-done item.
+	Finish(ctx context.Context, id int64, reason string) error
+	// Fail records a failure. The repository decides between open (retry with
+	// the supplied backoff) and dead based on retryable/attempts/max_attempts.
+	Fail(ctx context.Context, id, epoch int64, message string, retryable bool, backoff time.Duration) error
+	// RecoverExpired re-opens claimed/running items whose lease expired and
+	// marks them dead when attempts already reached max_attempts. It returns
+	// the number of affected items.
+	RecoverExpired(ctx context.Context) (recovered int64, err error)
+	// ListByVersion lists a version's items newest first.
+	ListByVersion(ctx context.Context, versionID int64, limit int) ([]WorkItem, error)
+	// ListAttempts returns the attempt log for one work item, oldest first.
+	ListAttempts(ctx context.Context, workItemID int64) ([]WorkItemAttempt, error)
 }
 
-// SessionRepository is the persistence port for agent sessions.
-type SessionRepository interface {
-	// List returns up to limit sessions ordered by ID descending. A cursor > 0
-	// starts after that ID. When profileID is non-nil only sessions of that
-	// profile are returned. hasMore reports whether another row exists after
-	// the returned page. Every session carries its ProfileKey and, when
-	// present, its active (running) run and its newest terminal run.
-	List(ctx context.Context, cursor int64, limit int, profileID *int64) ([]SessionSummary, bool, error)
-	// Create inserts a session and returns the stored row with ProfileKey.
-	Create(ctx context.Context, profileID int64, title string, createdBy *int64) (Session, error)
-	// Get returns one session with ProfileKey or ErrNotFound.
-	Get(ctx context.Context, id int64) (Session, error)
-	// UpdateTitle changes the title and returns the stored row. It returns
-	// ErrNotFound for an unknown session.
-	UpdateTitle(ctx context.Context, id int64, title string) (Session, error)
-	// Delete removes a session; messages and runs are removed by the schema's
-	// cascades. It returns ErrNotFound for an unknown session.
-	Delete(ctx context.Context, id int64) error
+// TeamRoomRepository persists team-room posts and bounded digest versions.
+type TeamRoomRepository interface {
+	// EnsurePost inserts a post, returning the stored row. Re-inserting the
+	// same ID is a no-op that returns the existing row.
+	EnsurePost(ctx context.Context, post TeamRoomPost) (TeamRoomPost, error)
+	// ListPosts returns the newest posts for a version/team pair, ID descending.
+	ListPosts(ctx context.Context, versionID int64, team Team, limit int) ([]TeamRoomPost, error)
+	// ListPostsSince returns posts created strictly after since, oldest first.
+	ListPostsSince(ctx context.Context, versionID int64, team Team, since time.Time, limit int) ([]TeamRoomPost, error)
+	// CountPosts counts posts for a version/team pair.
+	CountPosts(ctx context.Context, versionID int64, team Team) (int, error)
+	// CountPostsSince counts posts created strictly after since.
+	CountPostsSince(ctx context.Context, versionID int64, team Team, since time.Time) (int, error)
+	// LatestDigest returns the newest digest, or ErrNotFound.
+	LatestDigest(ctx context.Context, versionID int64, team Team) (TeamRoomDigest, error)
+	// SaveDigest inserts one digest version; a duplicate version is
+	// ErrConflict.
+	SaveDigest(ctx context.Context, digest TeamRoomDigest) (TeamRoomDigest, error)
+	// PruneDigests keeps only the newest keep digest versions and deletes the
+	// rest.
+	PruneDigests(ctx context.Context, versionID int64, team Team, keep int) error
 }
 
-// ChannelSessionRepository is the additive P6 query over sessions stamped with
-// an activity channel (agent_session.activity_channel). It is a separate port so
-// P1–P5 SessionRepository implementations stay valid; the postgres repository
-// implements both.
-type ChannelSessionRepository interface {
-	// ListByChannel returns up to limit sessions whose activity_channel equals
-	// channel, ordered by updated_at DESC, id DESC. A positive beforeSeq is the
-	// id of the last row of the previous page; the query resumes strictly after
-	// that row's (updated_at, id) pair so inserts and updates cannot reorder the
-	// remaining pages. hasMore reports whether another row exists after the
-	// returned page.
-	ListByChannel(ctx context.Context, channel string, beforeSeq int64, limit int) ([]Session, bool, error)
-}
-
-// RunRepository is the persistence port for agent runs.
-type RunRepository interface {
-	// CreateTurn atomically inserts a running run, its user message and
-	// refreshes the session's title/activity in one statement. It returns
-	// ErrRunActive when the session already has a running run and ErrNotFound
-	// when the session does not exist.
-	CreateTurn(ctx context.Context, sessionID int64, content []Part, titlePreview string) (TurnIDs, error)
-	// Get returns one run or ErrNotFound.
-	Get(ctx context.Context, id int64) (Run, error)
-	// Active returns the session's running run or ErrNotFound.
-	Active(ctx context.Context, sessionID int64) (Run, error)
-	// Latest returns the session's newest terminal run (a run whose status is
-	// not running) or ErrNotFound. A running run is returned by Active.
-	Latest(ctx context.Context, sessionID int64) (Run, error)
-	// UpdateProgress records the turns and accumulated token usage completed
-	// so far. It returns ErrNotFound for an unknown run.
-	UpdateProgress(ctx context.Context, runID int64, turns int, usage Usage) error
-	// Finish writes the terminal fields and ended_at. It returns ErrNotFound
-	// for an unknown run.
-	Finish(ctx context.Context, runID int64, result RunResult) error
-	// MarkRunningInterrupted marks every running run as interrupted (process
-	// restart recovery) and returns how many runs were changed.
-	MarkRunningInterrupted(ctx context.Context) (int64, error)
-}
-
-// MessageRepository is the persistence port for agent messages.
-type MessageRepository interface {
-	// ListBySession returns the session's messages ordered by ID ascending.
-	ListBySession(ctx context.Context, sessionID int64) ([]Message, error)
-	// Get returns one message or ErrNotFound.
-	Get(ctx context.Context, id int64) (Message, error)
-	// Append inserts a message and returns the stored row.
-	Append(ctx context.Context, message Message) (Message, error)
-	// AppendAssistantPlaceholder inserts the empty assistant message that
-	// anchors one model turn's streamed parts and returns its ID.
-	AppendAssistantPlaceholder(ctx context.Context, sessionID, runID int64) (int64, error)
-	// CompleteAssistant replaces the placeholder's content, reasoning, tool
-	// calls and usage. It returns ErrNotFound when the message is missing or
-	// is not an assistant message.
-	CompleteAssistant(ctx context.Context, messageID int64, parts []Part, reasoning string, calls []ToolCall, usage *Usage) error
+// RuntimeRepository persists profiles, runs, LLM transcripts and context
+// packets.
+type RuntimeRepository interface {
+	// EnsureProfile inserts a profile by key when missing. An existing profile
+	// is returned unchanged (created=false) so admin edits are never
+	// overwritten by the startup seed.
+	EnsureProfile(ctx context.Context, profile AgentProfile) (stored AgentProfile, created bool, err error)
+	// GetProfile loads a profile by key, or ErrNotFound.
+	GetProfile(ctx context.Context, key string) (AgentProfile, error)
+	// ListProfiles returns every profile ordered by key.
+	ListProfiles(ctx context.Context) ([]AgentProfile, error)
+	// CreateRun inserts a running agent_run row.
+	CreateRun(ctx context.Context, run AgentRun) (AgentRun, error)
+	// FinishRun persists the terminal status/counters. It fences on
+	// (id, lease_epoch) and returns ErrLeaseLost when the run was taken over.
+	FinishRun(ctx context.Context, run AgentRun) error
+	// AppendMessage inserts one transcript row.
+	AppendMessage(ctx context.Context, message AgentMessage) (AgentMessage, error)
+	// ListRunMessages returns a run's transcript in ID order.
+	ListRunMessages(ctx context.Context, runID int64, limit int) ([]AgentMessage, error)
+	// SaveContextPacket inserts a packet and points its run at it.
+	SaveContextPacket(ctx context.Context, packet ContextPacket) (ContextPacket, error)
+	// GetContextPacket loads one packet, or ErrNotFound.
+	GetContextPacket(ctx context.Context, id int64) (ContextPacket, error)
 }

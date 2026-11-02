@@ -1,82 +1,56 @@
-//go:build integration
-
-package db_test
+package db
 
 import (
-	"context"
-	"errors"
+	"strings"
 	"testing"
-	"testing/fstest"
-
-	"github.com/EdouardRichard/EzTest/backend/internal/db"
-	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
-func TestMigrateIdempotentAndChecksum(t *testing.T) {
-	// OpenRawTestDB skips the embedded migrations: this test owns the whole
-	// schema and starts its custom MapFS at version 1.
-	pool := testutil.OpenRawTestDB(t)
-	ctx := context.Background()
-	fsys := fstest.MapFS{
-		"migrations/order.txt":       {Data: []byte("0001_test_a.sql\n0002_test_b.sql\n")},
-		"migrations/0001_test_a.sql": {Data: []byte("CREATE TABLE test_a (id INT PRIMARY KEY);")},
-		"migrations/0002_test_b.sql": {Data: []byte("CREATE TABLE test_b (id INT PRIMARY KEY);")},
+func TestOrderCoversEverySQLFile(t *testing.T) {
+	migrations, err := orderedMigrations()
+	if err != nil {
+		t.Fatalf("orderedMigrations: %v", err)
 	}
-	if err := db.Migrate(ctx, pool, fsys); err != nil {
-		t.Fatal(err)
+	if len(migrations) != 42 {
+		t.Fatalf("len = %d, want 42", len(migrations))
 	}
-	if err := db.Migrate(ctx, pool, fsys); err != nil {
-		t.Fatal(err)
+	for _, item := range migrations {
+		if !strings.HasSuffix(item.Name, ".sql") {
+			t.Fatalf("migration %q does not end in .sql", item.Name)
+		}
+		if len(item.Checksum) != 64 {
+			t.Fatalf("migration %q checksum = %q", item.Name, item.Checksum)
+		}
+		if strings.TrimSpace(item.SQL) == "" {
+			t.Fatalf("migration %q is empty", item.Name)
+		}
 	}
-	var n int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
-		t.Fatal(err)
+	if migrations[0].Name != "settings_0001_settings.sql" {
+		t.Fatalf("first migration = %q", migrations[0].Name)
 	}
-	if n != 2 {
-		t.Fatalf("migrations=%d", n)
+	wantTail := []string{
+		"codeintel_0001_code_index.sql",
+		"codeintel_0002_code_analysis.sql",
+		"codeintel_0003_anchor_review.sql",
+		"visual_0001_visual_assertion.sql",
+		"execution_0004_visual_evidence.sql",
+		"version_0006_version_sut_code_baseline.sql",
+		"agent_0004_code_team.sql",
+		"quality_0001_eval.sql",
+		"agent_0005_profile_prompt_revision.sql",
+		"knowledge_0001_knowledge.sql",
+		"storage_0003_gc.sql",
+		"delivery_0004_report_pdf.sql",
+		"orchestration_0001_instance.sql",
+		"resource_0002_sut_family.sql",
+		"delivery_0005_issue_recurrence.sql",
+		"agent_0006_ops_team.sql",
+		"orchestration_0002_instance_inflight.sql",
+		"execution_0005_case_run_sut_context_executor.sql",
 	}
-	// 篡改已应用文件后应失败
-	fsys["migrations/0001_test_a.sql"] = &fstest.MapFile{Data: []byte("CREATE TABLE changed (id INT);")}
-	if err := db.Migrate(ctx, pool, fsys); !errors.Is(err, db.ErrMigrationChecksum) {
-		t.Fatalf("err=%v, want ErrMigrationChecksum", err)
-	}
-}
-
-// TestMigrateEmbeddedIsIdempotent exercises the embedded migration set
-// (migrations/order.txt is empty in this task) and proves repeated startup
-// migrations are a no-op.
-func TestMigrateEmbeddedIsIdempotent(t *testing.T) {
-	pool := testutil.OpenTestDB(t)
-	ctx := context.Background()
-	if err := db.MigrateEmbedded(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.MigrateEmbedded(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestOpenRawTestDBStartsWithoutLedger pins the isolation that
-// TestMigrateIdempotentAndChecksum relies on: OpenRawTestDB must hand out an
-// empty public schema (no schema_migrations, no embedded tables), so a custom
-// MapFS starting at version 1 never collides with the embedded migrations
-// added by later tasks.
-func TestOpenRawTestDBStartsWithoutLedger(t *testing.T) {
-	ctx := context.Background()
-	// Seed the shared schema with the embedded migration ledger first. The
-	// helpers hold a cross-package advisory lock for the lifetime of a test, so
-	// the seed runs in a subtest: its cleanup (truncate, unlock, pool close)
-	// finishes before OpenRawTestDB takes the lock for the rest of this test.
-	t.Run("seed", func(t *testing.T) {
-		testutil.OpenTestDB(t)
-	})
-	pool := testutil.OpenRawTestDB(t)
-	var hasLedger bool
-	if err := pool.QueryRow(ctx,
-		`SELECT to_regclass('public.schema_migrations') IS NOT NULL`).Scan(&hasLedger); err != nil {
-		t.Fatal(err)
-	}
-	if hasLedger {
-		t.Fatal("schema_migrations exists after OpenRawTestDB; expected an empty public schema")
+	tail := migrations[len(migrations)-len(wantTail):]
+	for i, want := range wantTail {
+		if tail[i].Name != want {
+			t.Fatalf("migration %d = %q, want %q", len(migrations)-len(wantTail)+i+1, tail[i].Name, want)
+		}
 	}
 }

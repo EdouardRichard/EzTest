@@ -1,0 +1,48 @@
+{
+  "schema": "p6-eval-observation/v1",
+  "note": "模板/契约示例，不是验收证据。真实运行必须由 P6 验收流程（真实 DeepSeek + 真实 Chrome）生成 observation；不得用本文件伪造评测结论。",
+  "mode": "real_llm",
+  "model": "deepseek-flash",
+  "corpus_version": "v02-2026-11-01.1",
+  "generated_at": "2026-11-01T12:00:00Z",
+  "started_at": "2026-11-01T11:40:00Z",
+  "finished_at": "2026-11-01T12:00:00Z",
+  "version_id": "9001",
+  "source": "p6-acceptance",
+  "requirements": {
+    "confirmed_keys": ["R1", "R2", "R3", "R4"]
+  },
+  "design": {
+    "covered_requirement_keys": ["R1", "R2", "R3", "R4"]
+  },
+  "impact": {
+    "selected_requirement_keys": ["R1", "R3"]
+  },
+  "execution": {
+    "case_runs": [
+      { "case_title": "登录后展示订单列表", "status": "passed" },
+      { "case_title": "按状态筛选订单", "status": "failed", "failure_class": "ui_selector" },
+      { "case_title": "订单详情展示退款入口", "status": "failed", "failure_class": "api_contract" },
+      { "case_title": "无权限用户不显示退款入口", "status": "passed" }
+    ]
+  },
+  "issues": {
+    "ai_issues": [
+      { "title": "订单状态筛选结果未刷新" },
+      { "title": "退款入口权限判断错误" },
+      { "title": "退款入口金额展示错误" }
+    ]
+  },
+  "supplement": {
+    "ai_case_titles": ["筛选后空结果展示空态", "无权限用户直接访问退款链接被拒绝"]
+  },
+  "visual": {
+    "injected": 4,
+    "cases": [
+      { "case_title": "登录后展示订单列表", "classification": "passed" },
+      { "case_title": "按状态筛选订单", "classification": "failed" },
+      { "case_title": "订单详情展示退款入口", "classification": "passed" },
+      { "case_title": "无权限用户不显示退款入口", "classification": "passed" }
+    ]
+  }
+}

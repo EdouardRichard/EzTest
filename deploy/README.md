@@ -1,96 +1,141 @@
-# EzTest deployment (Docker Compose)
+# EzTest deployment
 
-This directory contains the container deployment for the EzTest platform: a multi-stage Go API image, a
-Next.js standalone web image, a Playwright executor image and a single-instance Docker Compose file with
-PostgreSQL 17.
+This directory contains the container deployment for the EzTest 0.2 platform:
+a multi-stage Go API image, a Next.js standalone web image, a Playwright
+executor image, a Playwright PDF renderer image and a Compose file
+with PostgreSQL 17 and **two API replicas**.
 
-> **Validation status:** the maintainers did not run Docker on the development host, so the images have
-> never been built and the Compose stack has never been started there. Only static validation is
-> performed (`cd frontend; node scripts/validate-compose.mjs`). Do not treat the Compose path as a
-> verified installation — validate it in your environment. For a Docker-free installation see
-> [Option B in the root README](../README.md#option-b--portable-packages-windows--linux).
+> **Validation status:** Docker is not installed on the development host, so the
+> images have never been built and the Compose stack has never been started
+> there. Only static validation is performed:
+> `cd frontend && node scripts/validate-compose.mjs` and
+> `scripts/check-docs.ps1`. Do not report the Compose deployment as
+> "verified" — it is delivered and statically checked, not run. See
+> `../docs/deployment.md` for the full deployment/runbook guidance.
+
+P8 contract baseline: OpenAPI `0.2.0-p8` (`x-frozen: P8`) with **162 paths /
+200 operations / 264 schemas**, **42 migrations**, **85 business tables** and
+**85 database settings**. P8 adds no Compose service and no new startup
+environment variable.
 
 ## Layout
 
 | File | Purpose |
 |---|---|
-| `Dockerfile.api` | Multi-stage Go build; Alpine runtime; non-root `eztest` user; creates `/data/{objects,version-attachments,evidence,reports,exports}`; ships `docs/openapi/api.yaml`. |
+| `Dockerfile.api` | Multi-stage Go build; Alpine runtime; non-root `eztest` user; shared `/data` volume; `/app/.data -> /data` so the DB `paths.*` defaults land on the shared volume. |
+| `Dockerfile.renderer` | Official Playwright image; only `renderer/` sources; non-root `pwuser`; listens on 13337; never contains API/executor/frontend source. |
 | `Dockerfile.web` | Multi-stage Next.js `standalone` build; non-root `nextjs` user; listens on 6868. |
-| `docker-compose.yml` | `api`, `web`, `postgres:17`, internal `executor`; health checks; named volumes; startup ordering; commented read-only code-repo mount example. |
-| `../docs/openapi/api.yaml` | Hand-maintained OpenAPI document served at `GET /api/openapi.yaml`. |
+| `docker-compose.yml` | `postgres` + `api` + `api2` + `renderer` + internal `executor` + `web`; readiness checks; one shared `data` volume; startup ordering. |
 
 ## Prerequisites
 
 - Docker Engine 24+ with Compose v2 (`docker compose`, not `docker-compose`).
-- A repository-root `.env` created from `.env.example` with real deployment values. It is gitignored and
-  must never be committed.
-- The repository checked out at the build-context root (the Compose `build.context` is `..`, so the
-  Dockerfiles can copy `backend/`, `frontend/`, `executor/` and `docs/`).
-- The repository-root `.dockerignore` keeps `.git`, `.tools`, `node_modules`, `.next`, local logs and
-  `.env` out of the build context; do not remove it.
-- ≥ 4 vCPU / 8 GiB RAM / 20 GiB disk to start; the executor runs Chromium (`shm_size: 1gb`) and real
-  execution needs more memory.
+- A repository-root `.env` created from `.env.example` with real deployment
+  values. It is gitignored and must never be committed.
+- The repository checked out at the build context root (the Compose
+  `build.context` is `..`, so Dockerfiles can copy `backend/`, `frontend/`,
+  `executor/`, `renderer/` and `docs/`).
+- The repository-root `.dockerignore` keeps `.git`, `.tools`, `node_modules`,
+  `.next`, local logs, `.env` and `.data` out of the build context.
 
 ## Required environment
 
-Compose interpolates `POSTGRES_*` from the environment / `--env-file .env` and passes the repository
-`.env` to the API container with `env_file`.
+Compose interpolates `POSTGRES_*` from the environment / `--env-file .env` and
+passes the repository `.env` to both API containers with `env_file`.
 
 | Variable | Used by | Notes |
 |---|---|---|
 | `POSTGRES_USER` | postgres + api URL | Defaults to `eztest`. |
-| `POSTGRES_PASSWORD` | postgres + api URL | **Required**, no default. Must match the password in `EZTEST_DATABASE_URL`. |
+| `POSTGRES_PASSWORD` | postgres + api URL | **Required**, no default. |
 | `POSTGRES_DB` | postgres + api URL | Defaults to `eztest`. |
-| `EZTEST_SECRET_KEYS` / `EZTEST_SECRET_KEY_ACTIVE` | api | Required AES-256-GCM keyring; generate as shown in `.env.example`. Back it up separately. |
-| `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD` | api | Seeds the single administrator on first boot. |
-| `EZTEST_EXECUTOR_TOKEN` | api + executor | **Required**; shared bearer token. The executor publishes no host port. |
-| `EZTEST_WEB_ORIGIN` | api | Browser origin for CORS, default `http://localhost:6868`. |
+| `EZTEST_EXECUTOR_TOKEN` | api + executor | **Required**; shared Bearer token. |
+| `EZTEST_RENDER_TOKEN` | renderer (optional) | PDF renderer Bearer token. Defaults to the DB seed value `eztest-dev-render-token`; if set, also set the DB setting `report.render_token` to the same value. |
 | `NEXT_PUBLIC_API_BASE_URL` | web build | Build-time browser API origin, default `http://localhost:13333`. |
-| `EZTEST_ENABLE_TEST_ENDPOINTS` | api | Default `false` in Compose. Set `true` only for the SSE test endpoint. |
-| `EZTEST_AGENT_FILE_ROOT` | api | Optional read-only root for the Agent file tools. Empty (default) disables them. |
-| `EZTEST_AGENT_HTTP_ALLOWLIST` / `EZTEST_AGENT_TOOL_TIMEOUT_MS` / `EZTEST_AGENT_MAX_CONCURRENT_RUNS` | api | Optional Agent limits; defaults `127.0.0.1,localhost`, `10000` and `4`. |
-| `EZTEST_RATE_LIMIT_RPS` / `EZTEST_RATE_LIMIT_BURST` / `EZTEST_RATE_LIMIT_SSE_MAX` | api | Per-instance rate limits (defaults 50 / 100 / 10). |
-| `EZTEST_GC_ENABLED` / `EZTEST_GC_RETENTION_DAYS` / `EZTEST_GC_BATCH_KEEP` | api | Evidence GC (default false / 30 / 3); a non-dry-run purge requires `true`. |
-| `EZTEST_INSTANCE_ID` / `EZTEST_LEADER_LOCK_KEY` | api | Multi-instance leader lock; the instance id must be unique, the lock key shared. |
-| `EZTEST_KNOWLEDGE_MAX_INJECT` / `EZTEST_KNOWLEDGE_MAX_BYTES` | api | Knowledge injection budgets (default 5 / 4096). |
-| `EZTEST_EXEC_MAX_TOOL_CALLS` | api | Per-case Agent tool-call budget, 1–200, default `30`. |
-| `EZTEST_ANALYSIS_MAX_CASES` / `EZTEST_SUPPLEMENT_MAX_CASES` / `EZTEST_AUTONOMY_BATCHES_PER_TICK` | api | Analysis 1–50 (default 20), supplement 1–20 (default 5), autonomy 1–20 (default 4). |
-| `EZTEST_EXEC_ALLOWED_HOSTS` | executor | Executor-wide WebSocket allow list (comma-separated, default `localhost,127.0.0.1`); remote targets must be added explicitly. |
-| `EZTEST_VISUAL_BASELINE_MAX_BYTES` | api + executor process | Approved visual baseline / comparison cap, 64 KiB–20 MiB, default `5242880` (5 MiB). |
-| `llm_base_url` / `llm_key` / `llm_model_name` | api | Optional first-boot LLM seed (lowercase names are intentional). Leave the key empty to configure the LLM in the UI. |
+| `EZTEST_API_URL` | executor (optional) | Leave unset for pull-only registration; see below. |
 
-Other `EZTEST_*` values from `.env` are passed to the `api` service unchanged; Compose overrides
-`EZTEST_DATABASE_URL`, `EZTEST_HTTP_ADDR`, `EZTEST_OPENAPI_PATH` and the content directories so the
-containers talk to the `postgres` service and use the mounted volumes. The `executor` service has an
-explicit environment list; extend it if the container needs extra executor variables.
+The API process itself still reads only the four documented 0.2 startup
+variables: `EZTEST_DATABASE_URL`, `EZTEST_API_PORT`, `EZTEST_WEB_PORT`,
+`EZTEST_EXECUTOR_PORT`. Every other runtime knob lives in the database settings
+center (paths, renderer URL/token, instance heartbeat, snowflake node id, ...).
 
-### Content directories and volumes
+### Renderer settings (required for PDFs)
 
-| Volume | Container path | Key | Content |
-|---|---|---|---|
-| `objects` | `/data/objects` | `EZTEST_STORAGE_DIR` | Content-addressed objects. |
-| `attachments` | `/data/version-attachments` | `EZTEST_VERSION_ATTACHMENT_DIR` | Requirement attachments. |
-| `evidence` | `/data/evidence` | `EZTEST_EVIDENCE_DIR` | Execution evidence (the only GC target). |
-| `reports` | `/data/reports` | `EZTEST_REPORT_DIR` | Report Markdown. |
-| `exports` | `/data/exports` | `EZTEST_EXPORT_DIR` | Mindmap exports. |
-| `pgdata` | `/var/lib/postgresql/data` | — | PostgreSQL data. |
+The renderer container cannot configure the API: the API reads two DB settings
+at boot/worker time. A fresh Compose boot must therefore point the API at the
+Compose service name (the catalogue default `http://127.0.0.1:13337` is the
+standalone/local default, not the container):
 
-Back up PostgreSQL and the five content directories together. The backup and restore scripts are not part
-of this public snapshot; use `pg_dump -Fc` plus a tar of the directories, and keep the three parts
-(database dump, content archive, manifest) together.
+| DB setting | Compose value | Notes |
+|---|---|---|
+| `report.render_worker_url` | `http://renderer:13337` | Set once per stack (admin Settings UI or SQL below), then all revisions' PDFs render. |
+| `report.render_token` | `eztest-dev-render-token` | Matches the renderer's default `EZTEST_RENDER_TOKEN`; override both together. |
 
-### Read-only code repositories
+Set the URL once after the first boot (Compose seeds no business settings):
 
-The API must be able to read the local Git worktrees registered as code repositories. Compose includes a
-commented example:
+```sql
+UPDATE system_setting
+SET value = '"http://renderer:13337"'::jsonb, updated_at = now()
+WHERE key = 'report.render_worker_url';
+```
+
+(Use the admin Settings UI instead where available; the token is a secret and is
+masked there.) After this, the leader-gated ensurer/worker backfills PDFs and
+the compose validator remains the only required check (Docker is not installed
+on the development host).
+
+### Instance counters, rate limiting and retention (P8)
+
+The two API replicas coordinate through PostgreSQL; P8 adds observability and
+safety knobs without new containers or startup variables:
+
+| DB setting | Default | Behaviour |
+|---|---|---|
+| `security.rate_limit_per_minute` | `0` (off) | Per-instance global token bucket. When enabled, excess requests get `429` with `rate_limited` and `Retry-After`; health/readiness/SSE/static paths are skipped. Total allowed rate = replicas × limit (two API replicas at 30/min allow roughly 60/min). |
+| `retention.event_days` | `90` | Leader-gated daily cleanup of `event` rows older than the cutoff; `security.audit_retention_days` (default 90) does the same for audit rows. Uses `retention.gc_batch_size` per batch and writes the audit action `retention.cleanup`. |
+
+`GET /api/admin/instances` reports `active_requests` and `active_work` per
+instance, and `GET /api/health/ready` exposes the same counters as
+`inflight_requests` / `inflight_work`. During a rolling upgrade, drain the old
+instance and wait for both counters to reach 0 before stopping the process.
+
+Both settings are hot-loaded. The retention worker runs on the elected leader;
+rate limiting is enforced independently by each API replica.
+
+### Executor push (optional)
+
+The executor image defaults to P3 pull registration (`GET /healthz` polled by
+the API). To enable the P7 push register/heartbeat as well, open
+`docker-compose.yml`, add `EZTEST_API_URL: http://api:13333` to the executor
+environment and restart the stack. Push registration stores the executor row
+once; the pull healthz remains active. With two API replicas either replica may
+poll; both write the same `executor_instance` row.
+
+## Data volume
+
+| Volume | Container path | Contents |
+|---|---|---|
+| `data` | `/data` on both `api` and `api2` | Content-addressed objects, requirement attachments, execution evidence, report HTML/PDF and exports (DB `paths.*` defaults resolve through `/app/.data -> /data`). |
+| `pgdata` | `/var/lib/postgresql/data` | PostgreSQL data. |
+
+Back up PostgreSQL and the `data` volume together; see
+`../docs/operations.md`. The volume contract requires every API replica to share
+one filesystem (a named volume on one Docker host, NFS/equivalent in a
+multi-host deployment). Different `paths.data_root` values make readiness fail.
+
+### Read-only code repositories (P4)
+
+The API must be able to read the local Git worktrees registered as P2
+`localPath`. Compose includes a commented example on `api`:
 
 ```yaml
 # api.volumes:
 #   - ${EZTEST_CODE_REPO_MOUNT:-./repos}:/repos:ro
 ```
 
-Uncomment/adjust it, mount the repo tree at `/repos` (read-only), then register `/repos/<name>` as the
-repository `localPath` in `/code-repos`. EzTest only reads the worktree; do not grant write access.
+Uncomment/adjust it on **both** `api` and `api2`, mount the repo tree at
+`/repos` (read-only), then register `/repos/<name>` as the repository
+`localPath` in `/code-repos`. P4 only reads the worktree; do not grant write
+access.
 
 ## Build and run
 
@@ -99,13 +144,17 @@ From the repository root:
 ```powershell
 # 1. Prepare a deployment environment file (never commit it).
 Copy-Item .env.example .env
-# Edit .env: set POSTGRES_PASSWORD, EZTEST_ADMIN_PASSWORD, EZTEST_EXECUTOR_TOKEN
-# and generate EZTEST_SECRET_KEYS (see the comments in .env.example).
+# Edit .env: set POSTGRES_PASSWORD and EZTEST_EXECUTOR_TOKEN.
+# EZTEST_RENDER_TOKEN is optional (defaults to the DB seed token); set it only
+# together with the DB setting report.render_token.
 
 # 2. Build and start the stack.
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 
-# 3. Inspect health and logs.
+# 3. One-time: point the API at the Compose renderer (DB setting).
+#    See "Renderer settings" above; then PDFs render on a fresh boot.
+
+# 4. Inspect health and logs.
 docker compose --env-file .env -f deploy/docker-compose.yml ps
 docker compose --env-file .env -f deploy/docker-compose.yml logs -f api
 ```
@@ -114,8 +163,13 @@ Then open:
 
 - Web UI: <http://localhost:6868>
 - API liveness: <http://localhost:13333/healthz>
-- API readiness: <http://localhost:13333/api/health>
-- OpenAPI: <http://localhost:13333/api/openapi.yaml>
+- API readiness: <http://localhost:13333/api/health/ready>
+- Admin instance registry: <http://localhost:13333/api/admin/instances>
+
+Rolling upgrade drill: start the replacement, wait for readiness, drain the old
+instance through `POST /api/admin/instances/{instanceId}/drain`, wait for
+`active_requests`/`active_work` to reach 0 (readiness turns 503 while draining),
+then stop it.
 
 Stop the stack without deleting data:
 
@@ -123,41 +177,38 @@ Stop the stack without deleting data:
 docker compose --env-file .env -f deploy/docker-compose.yml down
 ```
 
-`down -v` deletes the `pgdata`, `objects`, `attachments`, `evidence`, `reports` and `exports` volumes.
+`down -v` deletes the `pgdata` and `data` volumes.
 
 ## Ports, volumes and health
 
 | Service | Published port | Health check | Persistent data |
 |---|---|---|---|
-| `api` | 13333 | `GET /healthz` via wget | `objects`, `attachments`, `evidence`, `reports`, `exports` |
-| `web` | 6868 | `GET /login` via wget | — |
-| `postgres` | 5433 → 5432 | `pg_isready` | `pgdata` |
+| `api` | 13333 | `GET /api/health/ready` | `data` -> `/data` |
+| `api2` | none (internal 13333) | `GET /api/health/ready` | `data` -> `/data` |
+| `renderer` | none (internal 13337) | `GET /healthz` via node fetch | — (PDF bytes go to the API content ledger) |
 | `executor` | none (internal 13336) | `node src/healthcheck.mjs` | — (browser contexts are ephemeral) |
+| `web` | 6868 | `GET /login` via wget | — |
+| `postgres` | 5433 -> 5432 | `pg_isready` | `pgdata` -> `/var/lib/postgresql/data` |
 
-Startup order is `postgres` (healthy) → `api` (healthy) → `web`; `executor` runs alongside and is only used
-when a batch executes. The API applies all embedded migrations and seeds the administrator on startup;
-repeated starts are idempotent.
+Startup order is `postgres` (healthy) -> `api`/`api2` (ready) -> `web`; the
+renderer and executor run alongside. The API applies all embedded migrations and
+seeds the administrator on startup; repeated starts are idempotent. The second
+replica gets a free `node_id` from the P7 instance registry automatically.
 
 ## Security notes
 
-- No secrets are stored in this repository. `.env`, `.tools/` and `*.local.md` are gitignored; `.env` must
-  never be committed.
-- Both runtime images run as non-root users (`eztest` UID 10001, `nextjs` UID 1001).
-- The API stores LLM credentials encrypted with `EZTEST_SECRET_KEYS`. Losing that keyring makes stored
-  credentials unrecoverable; back it up separately (never inside the backup archive).
-- Resource access credentials and browser session state are stored unencrypted by design (internal-tool
-  boundary). Treat the database and its backups as sensitive.
-- EzTest does not provide TLS, multi-tenant isolation, a reverse proxy or public object URLs. Put a
-  TLS-terminating proxy in front of 13333/6868 if exposed beyond localhost, restrict the PostgreSQL port,
-  and keep the executor internal-only.
-- The Next image sets `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, `Permissions-Policy`
-  and a report-only CSP; the proxy should add HSTS and any enforcing CSP. API responses do not carry the
-  Next headers.
-- Agent endpoints are administrator-only. Agent file tools are disabled unless `EZTEST_AGENT_FILE_ROOT` is
-  set; keep that root read-only and minimal. `http.get` only reaches `EZTEST_AGENT_HTTP_ALLOWLIST` hosts
-  (loopback by default).
-- Rate limiting is in-process (per instance), not a cluster-wide quota. Evidence GC is dry-run by default
-  and only removes execution evidence files.
+- No secrets are stored in this repository. `.env`, `.tools/` and
+  `*.local.md` are gitignored.
+- All runtime images run as non-root users.
+- The executor and renderer are internal-only: they publish no host ports and
+  share one Bearer token each with the API. Keep them on the private Compose
+  network; never expose 13336/13337.
+- EzTest does not provide TLS, multi-tenant isolation, a reverse proxy or public
+  object URLs. Put a TLS-terminating proxy in front of 13333/6868 if exposed
+  beyond localhost and restrict the PostgreSQL port.
+- Back up the database settings that hold secrets (the DB dump contains the
+  settings table; the key material to decrypt LLM credentials lives in the
+  deployment environment). See `../docs/operations.md`.
 
 ## Static validation
 
@@ -166,9 +217,11 @@ cd frontend
 node scripts/validate-compose.mjs
 ```
 
-The script uses the `yaml` dev dependency to assert the four services, published ports (the executor
-publishes none and exposes only the internal `13336`), health checks on all four services, the named
-volumes and API mounts, the `depends_on` / `service_healthy` ordering, and that the three Dockerfiles
-exist. It does not need or contact a Docker daemon, and it does not build an image or start a container.
-
-See the root README for the overall project status, installation options and known limitations.
+The script uses the `yaml` dev dependency to assert the six services
+(`api`/`api2`/`web`/`postgres`/`executor`/`renderer`), published ports (only
+`api`, `web` and `postgres`; executor/renderer publish none), health checks on
+all services, both API health checks targeting `/api/health/ready`, the shared
+`data` volume mounted at `/data` by both replicas, the absence of the 0.1
+content volumes and environment keys, the `depends_on` / `service_healthy`
+ordering, and that the four Dockerfiles exist. It fails with exit code 1 and a
+list of problems. It does not need or contact a Docker daemon.

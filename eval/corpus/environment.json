@@ -1,0 +1,28 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "Fixed fixture environment/accounts of the deterministic evaluation. The ports are distinct from the dev API (:13333), the E2E harness (:13334-:13336) and the acceptance API (:13333), so an evaluation run can never attach to a developer process. baseUrl must stay on the loopback fixture target scripts/fixture-target.cjs starts.",
+  "environment": {
+    "key": "p8-eval-env",
+    "name": "P8 评测环境",
+    "kind": "dev",
+    "baseUrl": "http://127.0.0.1:13345",
+    "allowedHosts": ["127.0.0.1"]
+  },
+  "accounts": [
+    {
+      "key": "p8-eval-account",
+      "label": "P8 评测账号",
+      "username": "fixture",
+      "kind": "human"
+    }
+  ],
+  "fixture": {
+    "targetPort": 13345,
+    "executorPort": 13346,
+    "fakeLlmPort": 13344,
+    "apiPort": 13343,
+    "executorToken": "p8-eval-executor-token",
+    "databaseName": "eztest_eval",
+    "fakeLlmModel": "fake-p8-eval"
+  }
+}

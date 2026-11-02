@@ -1,61 +1,79 @@
-import { TriangleAlert } from "lucide-react"
+import type { ReactNode } from "react"
 
-import { cn } from "@/lib/utils"
+import { ApiError } from "@/lib/api-client"
+
+import { Button } from "./Button"
+import { cn } from "./cn"
 
 export type ErrorStateProps = {
-  /** Short headline naming the failed operation. */
-  title: string
-  /** User-facing explanation; never a raw server stack trace. */
-  message: string
-  /** API request id for support correlation, when the failure carried one. */
-  requestId?: string
-  /** Recovers the failed read; the button is omitted when recovery is impossible. */
+  error: unknown
+  title?: string
   onRetry?: () => void
-  retryLabel?: string
   className?: string
 }
 
-/**
- * Shared error state (spec §8.3): alert semantics, an optional request id for
- * correlation, and a retry action when the caller can re-run the read. It is
- * deliberately content-only so pages can keep their surrounding data visible.
- */
-export function ErrorState({
-  title,
-  message,
-  requestId,
-  onRetry,
-  retryLabel = "重试",
-  className,
-}: ErrorStateProps) {
+type ErrorDescription = {
+  message: string
+  requestId?: string
+  code?: string
+  retryable?: boolean
+}
+
+function describeError(error: unknown): ErrorDescription {
+  if (error instanceof ApiError) {
+    return {
+      message: error.message,
+      requestId: error.requestId,
+      code: error.code,
+      retryable: error.retryable,
+    }
+  }
+  if (error instanceof Error) return { message: error.message }
+  if (typeof error === "string" && error.length > 0) return { message: error }
+  return { message: "发生未知错误，请稍后重试" }
+}
+
+export function ErrorState({ error, title = "加载失败", onRetry, className }: ErrorStateProps) {
+  const description = describeError(error)
+
   return (
     <div
-      role="alert"
-      data-testid="error-state"
       className={cn(
-        "space-y-3 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-4 text-sm text-destructive",
+        "flex flex-col items-start gap-2 rounded-xl border border-destructive/30",
+        "bg-destructive/5 px-5 py-4",
         className,
       )}
     >
-      <p className="flex items-start gap-2 font-medium">
-        <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-        <span>{title}</span>
+      <p className="text-sm font-semibold text-destructive">{title}</p>
+      <p className="text-xs text-foreground">{description.message}</p>
+      <p className="text-[11px] text-muted-foreground">
+        {description.code ? <span className="mr-2">{description.code}</span> : null}
+        {description.requestId ? <span>请求 ID：{description.requestId}</span> : null}
       </p>
-      <p className="break-words">{message}</p>
-      {requestId === undefined || requestId === "" ? null : (
-        <p data-testid="error-state-request-id" className="font-mono text-xs opacity-80">
-          {`请求 ID：${requestId}`}
-        </p>
-      )}
-      {onRetry === undefined ? null : (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {retryLabel}
-        </button>
-      )}
+      {onRetry ? (
+        <Button variant="secondary" size="sm" onClick={onRetry}>
+          重试
+        </Button>
+      ) : null}
     </div>
+  )
+}
+
+export type InlineErrorProps = {
+  error: unknown
+  children?: ReactNode
+}
+
+/** Compact one-line error for toolbars and forms. */
+export function InlineError({ error, children }: InlineErrorProps) {
+  const description = describeError(error)
+  return (
+    <p role="alert" className="text-xs text-destructive">
+      {description.message}
+      {description.requestId ? (
+        <span className="ml-2 text-muted-foreground">({description.requestId})</span>
+      ) : null}
+      {children}
+    </p>
   )
 }

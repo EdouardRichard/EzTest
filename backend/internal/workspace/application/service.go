@@ -1,193 +1,227 @@
-package application
+package workspaceapp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"time"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// Item is one todo-centre entry (spec §6.3). Every id crosses the JSON boundary
-// as a decimal string (D29).
-type Item struct {
-	Kind        string    `json:"kind"`
-	Title       string    `json:"title"`
-	VersionID   string    `json:"versionId"`
-	VersionName string    `json:"versionName"`
-	Severity    string    `json:"severity"`
-	CreatedAt   time.Time `json:"createdAt"`
-	URL         string    `json:"url"`
+// TodoItem is the workspace projection of one pending-work item. Its fields are
+// exactly the TodoItem contract fields (spec §4.3.2); ID is deliberately not
+// exposed, so providers keep their owning rows private and the feed stays
+// read-only.
+type TodoItem struct {
+	Kind         string
+	Title        string
+	VersionID    int64
+	VersionTitle string
+	Severity     string
+	CreatedAt    time.Time
+	ExpiresAt    *time.Time
+	URL          string
 }
 
-// Counts holds the per-group totals before the limit is applied (spec §6.3).
+// Counts holds the pre-limit per-kind counts. The zero value is a valid empty
+// feed and always contains all six contract keys.
 type Counts struct {
-	Review   int `json:"review"`
-	Takeover int `json:"takeover"`
-	Gate     int `json:"gate"`
+	RequirementConfirmation int
+	CaseConfirmation        int
+	IssueConfirmation       int
+	DesignPending           int
+	HumanRequest            int
+	DeadWorkItem            int
 }
 
-// Snapshot is the todo-centre read model. Items is always a non-nil slice so the
-// JSON envelope renders `[]`, never `null`, for an empty centre.
+// Total returns the sum of all kind counts.
+func (c Counts) Total() int {
+	return c.RequirementConfirmation + c.CaseConfirmation + c.IssueConfirmation +
+		c.DesignPending + c.HumanRequest + c.DeadWorkItem
+}
+
+func (c *Counts) add(kind string) {
+	switch kind {
+	case KindRequirementConfirmation:
+		c.RequirementConfirmation++
+	case KindCaseConfirmation:
+		c.CaseConfirmation++
+	case KindIssueConfirmation:
+		c.IssueConfirmation++
+	case KindDesignPending:
+		c.DesignPending++
+	case KindHumanRequest:
+		c.HumanRequest++
+	case KindDeadWorkItem:
+		c.DeadWorkItem++
+	}
+}
+
+// Snapshot is the GET /api/todos payload: items truncated to the requested
+// limit and counts measured before the truncation.
 type Snapshot struct {
-	Items  []Item `json:"items"`
-	Counts Counts `json:"counts"`
+	Items  []TodoItem
+	Counts Counts
 }
 
-// Query is the todo-centre read request. Admin is resolved at the HTTP boundary
-// from the authenticated identity; a regular user only receives the review
-// group and never reaches the execution provider (spec §6.3/§11.5).
-type Query struct {
-	Limit int
-	Admin bool
+// kindOrder is the contract order of spec §4.3.2. Unknown kinds sort last so a
+// future source cannot displace the frozen ordering.
+var kindOrder = map[string]int{
+	KindHumanRequest:            0,
+	KindDesignPending:           1,
+	KindIssueConfirmation:       2,
+	KindRequirementConfirmation: 3,
+	KindCaseConfirmation:        4,
+	KindDeadWorkItem:            5,
 }
 
-// Service aggregates the provider snapshots into the todo read model. It holds
-// no state and performs no caching: every List call is independent.
+// Service aggregates the todo providers into one read-only snapshot. It owns
+// ordering, pre-limit counting, admin-only filtering and limit normalization;
+// it never writes and never queries another context's storage directly.
 type Service struct {
-	providers Providers
+	providers []Provider
+	titles    VersionTitleReader
 }
 
-// NewService builds the aggregation service from the todo providers.
-func NewService(providers Providers) *Service {
+// NewService wires the todo providers in any order.
+func NewService(providers ...Provider) *Service {
 	return &Service{providers: providers}
 }
 
-// List assembles the todo centre. A zero/negative limit defaults to 50; values
-// above 200 are clamped. Provider failures abort the aggregation so the HTTP
-// layer can answer the shared 500 envelope instead of serving partial data.
-func (s *Service) List(ctx context.Context, q Query) (Snapshot, error) {
-	if s == nil {
-		return Snapshot{}, errors.New("workspace: service is not configured")
+// WithVersionTitles attaches the version title resolver used to fill the items
+// whose provider cannot see another context's version table. A nil resolver
+// leaves the titles empty; the production assembly root must wire the version
+// QueryService.
+func (s *Service) WithVersionTitles(titles VersionTitleReader) *Service {
+	if s != nil {
+		s.titles = titles
 	}
-	providers := s.providers
-	if providers.Review == nil {
-		return Snapshot{}, errors.New("workspace: review provider is not configured")
+	return s
+}
+
+// Snapshot returns the aggregated todo feed for the viewer (spec §4.3.2).
+//
+// Counts are computed over every provider item before the limit is applied.
+// A non-admin viewer never receives dead work items, even if a provider or a
+// direct caller bypassed the execution-side admin gate: the workspace service
+// enforces the admin-only rule as defense in depth. Provider failures are
+// propagated instead of returning a silently partial feed.
+func (s *Service) Snapshot(ctx context.Context, viewer platform.Actor, limit int) (Snapshot, error) {
+	if s == nil {
+		return Snapshot{}, platform.Unavailable("workspace service is not configured")
+	}
+	limit = normalizeLimit(limit)
+
+	items := make([]TodoItem, 0)
+	for _, provider := range s.providers {
+		if provider == nil {
+			continue
+		}
+		next, err := provider.Items(ctx, viewer)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		items = append(items, next...)
 	}
 
-	limit := q.Limit
+	if !viewer.IsAdmin() {
+		filtered := make([]TodoItem, 0, len(items))
+		for _, item := range items {
+			if item.Kind == KindDeadWorkItem {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		items = filtered
+	}
+
+	counts := Counts{}
+	for _, item := range items {
+		counts.add(item.Kind)
+	}
+
+	sort.SliceStable(items, func(left, right int) bool {
+		leftOrder, leftKnown := kindOrder[items[left].Kind]
+		rightOrder, rightKnown := kindOrder[items[right].Kind]
+		if !leftKnown {
+			leftOrder = len(kindOrder)
+		}
+		if !rightKnown {
+			rightOrder = len(kindOrder)
+		}
+		if leftOrder != rightOrder {
+			return leftOrder < rightOrder
+		}
+		return items[left].CreatedAt.After(items[right].CreatedAt)
+	})
+
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	if err := s.decorateVersionTitles(ctx, items); err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{Items: items, Counts: counts}, nil
+}
+
+// decorateVersionTitles fills the missing version titles of the visible items
+// in one batch read. Only positive version IDs are resolved, so the
+// version-less human requests and dead work items are skipped. A reader failure
+// is propagated, matching the feed's provider error semantics: a todo feed with
+// silently empty titles would hide the regression this decoration fixes.
+func (s *Service) decorateVersionTitles(ctx context.Context, items []TodoItem) error {
+	if s == nil || s.titles == nil {
+		return nil
+	}
+	ids := missingVersionTitleIDs(items)
+	if len(ids) == 0 {
+		return nil
+	}
+	titles, err := s.titles.VersionTitles(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("resolve version titles: %w", err)
+	}
+	if len(titles) == 0 {
+		return nil
+	}
+	for index := range items {
+		if items[index].VersionTitle != "" || items[index].VersionID <= 0 {
+			continue
+		}
+		if title, found := titles[items[index].VersionID]; found {
+			items[index].VersionTitle = title
+		}
+	}
+	return nil
+}
+
+// missingVersionTitleIDs returns the deduplicated positive version IDs of the
+// items that still need a title, sorted so the single batch read is
+// deterministic.
+func missingVersionTitleIDs(items []TodoItem) []int64 {
+	seen := make(map[int64]struct{})
+	ids := make([]int64, 0)
+	for _, item := range items {
+		if item.VersionTitle != "" || item.VersionID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[item.VersionID]; duplicate {
+			continue
+		}
+		seen[item.VersionID] = struct{}{}
+		ids = append(ids, item.VersionID)
+	}
+	sort.Slice(ids, func(left, right int) bool { return ids[left] < ids[right] })
+	return ids
+}
+
+func normalizeLimit(limit int) int {
 	if limit <= 0 {
-		limit = DefaultLimit
+		return DefaultLimit
 	}
 	if limit > MaxLimit {
-		limit = MaxLimit
+		return MaxLimit
 	}
-
-	reviewRows, err := providers.Review.ReviewingVersions(ctx)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("workspace: load reviews: %w", err)
-	}
-
-	var pendingRows []PendingRow
-	if q.Admin && providers.Execution != nil {
-		pendingRows, err = providers.Execution.PendingTakeovers(ctx)
-		if err != nil {
-			return Snapshot{}, fmt.Errorf("workspace: load takeovers: %w", err)
-		}
-	}
-
-	snapshot := Snapshot{Items: make([]Item, 0, len(reviewRows)+len(pendingRows))}
-
-	seenVersions := make(map[int64]struct{}, len(reviewRows))
-	for _, row := range reviewRows {
-		if _, duplicate := seenVersions[row.VersionID]; duplicate {
-			continue
-		}
-		seenVersions[row.VersionID] = struct{}{}
-		snapshot.Counts.Review++
-		snapshot.Items = append(snapshot.Items, Item{
-			Kind:        KindReview,
-			Title:       row.VersionName,
-			VersionID:   strconv.FormatInt(row.VersionID, 10),
-			VersionName: row.VersionName,
-			Severity:    SeverityInfo,
-			CreatedAt:   row.ReviewingAt,
-			URL:         versionURL(row.VersionID, "mindmap"),
-		})
-	}
-
-	seenRuns := make(map[int64]struct{}, len(pendingRows))
-	for _, row := range pendingRows {
-		if _, duplicate := seenRuns[row.CaseRunID]; duplicate {
-			continue
-		}
-		seenRuns[row.CaseRunID] = struct{}{}
-
-		kind := KindGate
-		severity := SeverityMajor
-		if row.TakeoverID != nil {
-			kind = KindTakeover
-			severity = SeverityWarning
-		}
-		switch kind {
-		case KindTakeover:
-			snapshot.Counts.Takeover++
-		default:
-			snapshot.Counts.Gate++
-		}
-
-		snapshot.Items = append(snapshot.Items, Item{
-			Kind:        kind,
-			Title:       pendingTitle(row, kind),
-			VersionID:   strconv.FormatInt(row.VersionID, 10),
-			VersionName: row.VersionName,
-			Severity:    severity,
-			CreatedAt:   row.CreatedAt,
-			URL:         versionURL(row.VersionID, "sessions"),
-		})
-	}
-
-	sortItems(snapshot.Items)
-	if len(snapshot.Items) > limit {
-		snapshot.Items = snapshot.Items[:limit]
-	}
-	return snapshot, nil
-}
-
-// sortItems orders the groups review → takeover → gate and, within a group, the
-// newest entry first. The id tie-break keeps the order deterministic across
-// repeated reads.
-func sortItems(items []Item) {
-	rank := func(kind string) int {
-		switch kind {
-		case KindReview:
-			return 0
-		case KindTakeover:
-			return 1
-		default:
-			return 2
-		}
-	}
-	sort.SliceStable(items, func(left, right int) bool {
-		leftRank, rightRank := rank(items[left].Kind), rank(items[right].Kind)
-		if leftRank != rightRank {
-			return leftRank < rightRank
-		}
-		if !items[left].CreatedAt.Equal(items[right].CreatedAt) {
-			return items[left].CreatedAt.After(items[right].CreatedAt)
-		}
-		if items[left].VersionID != items[right].VersionID {
-			return items[left].VersionID > items[right].VersionID
-		}
-		return items[left].URL < items[right].URL
-	})
-}
-
-// pendingTitle is the displayed case title; an empty snapshot title falls back
-// to a stable group label so an item is never rendered blank.
-func pendingTitle(row PendingRow, kind string) string {
-	if row.CaseTitle != "" {
-		return row.CaseTitle
-	}
-	if kind == KindTakeover {
-		return "待人工接管的用例"
-	}
-	return "待升级的用例"
-}
-
-// versionURL is the deep link of one todo item: review opens the mindmap tab,
-// execution items open the execution sessions tab (spec §6.3).
-func versionURL(versionID int64, tab string) string {
-	return "/versions/" + strconv.FormatInt(versionID, 10) + "?tab=" + tab
+	return limit
 }

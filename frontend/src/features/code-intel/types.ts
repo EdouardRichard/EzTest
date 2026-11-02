@@ -1,475 +1,548 @@
 /**
- * DTOs for the P4 code-intelligence API (spec §7.2/§7.3).
+ * Wire types for the P5 code & changes tab (spec §4.2, §5, §9.2).
  *
- * ID rules (spec §7.1): codeintel-owned IDs (analysis/indexRun/changeSet/entity/
- * anchor/candidate) and subject IDs are decimal strings, while `repoId`,
- * `createdBy` and `selectionUpdatedBy` stay numbers. Timestamps are ISO strings.
+ * Field names and enum values are pinned by the frozen P5 OpenAPI contract
+ * (`0.2.0-p5`). IDs are decimal strings everywhere, timestamps are RFC3339 and
+ * list endpoints use the `{data, next_cursor, has_more}` envelope. No code body
+ * is ever part of these types except the explicitly audited `CodeFileWindowView`.
  */
 
-/** One code evidence range; anchor-sourced evidence only carries `file`. */
-export type Evidence = {
-  file: string
-  startLine?: number
-  endLine?: number
-  excerptHash?: string
-}
+import type { CodeRepositoryResource } from "@/features/versions/types"
 
-/** Human fact-review verdicts of the P8 correction API (spec §7.2). */
-export type FactReviewVerdict = "correct" | "incorrect"
+/* ---------------------------------- index ---------------------------------- */
 
-/**
- * One human verdict on a code fact at a commit (spec §7.2). `id`/`factId` are
- * decimal strings (D29), `createdBy` stays a number and `reason` is the human
- * note. A fact is reviewed at most once per commit; a new verdict overwrites the
- * previous row.
- */
-export type FactReview = {
+export type CodeIndexStatus = "queued" | "running" | "done" | "failed"
+
+/** `CodeIndexRunView`: T0 indexing run summary. */
+export type CodeIndexRunView = {
   id: string
-  factId: string
-  commit: string
-  verdict: FactReviewVerdict
-  reason: string
-  createdBy: number
-  createdAt: string
+  version_id?: string | null
+  repo_id: string
+  commit_sha: string
+  branch: string
+  source: "git"
+  status: CodeIndexStatus
+  files_total: number
+  files_indexed: number
+  truncated: boolean
+  stats: Record<string, unknown>
+  errors: Array<Record<string, unknown>>
+  started_at?: string | null
+  finished_at?: string | null
+  created_by?: string | null
+  created_at: string
+  updated_at: string
 }
 
-/** Request body of `POST /api/code/repos/{repoId}/facts/{factId}/reviews`. */
-export type CreateFactReviewBody = {
-  verdict: FactReviewVerdict
-  reason?: string
+/** `CodeRepoStatusView`: bound repository + latest index + resolved baseline. */
+export type CodeRepoStatusView = {
+  repo_id: string
+  repository: CodeRepositoryResource
+  latest_index: CodeIndexRunView | null
+  baseline_commit: string | null
+  index_in_progress: boolean
 }
 
-/** Evidence-verification projection of the repository quality block. */
-export type QualityEvidence = {
-  checks: number
-  failures: number
-  /** (checks-failures)/checks, or null when no evidence was checked. */
-  passRate: number | null
-}
+/* ----------------------------------- tree ---------------------------------- */
 
-/** Confidence distribution of the AI facts at the quality head commit. */
-export type QualityConfidence = {
-  high: number
-  medium: number
-  low: number
-  total: number
-}
-
-/** Human review counters of one repository. */
-export type QualityReviews = {
-  total: number
-  correct: number
-  incorrect: number
-}
-
-/**
- * Newest evaluation run's impact metrics. When the evaluation is unavailable
- * (or has never run) precision/recall are null, `available` is false and
- * `reason` names the degraded source (`no_eval_run` | `no_impact_metric` |
- * `eval_store_unavailable`).
- */
-export type QualityImpact = {
-  precision: number | null
-  recall: number | null
-  available: boolean
-  reason?: string
-  /** Evaluation run id, a decimal string (D29). */
-  evalRunId: string | null
-  evaluatedAt: string | null
-}
-
-/** Newest done analysis that supplied the quality counters. */
-export type QualityAnalysisRef = {
-  id: string
-  headCommit: string
-  analyzedAt: string
-}
-
-/**
- * `GET /api/code/repos/{repoId}/quality` (spec §9.2): evidence pass rate,
- * invalid facts, confidence distribution, human review counters, the newest
- * evaluation's impact precision/recall and the cache hit rate. Missing sources
- * stay null/zero and are flagged; `analysis` is null for a never-analysed
- * repository.
- */
-export type RepoQuality = {
-  repoId: number
-  generatedAt: string
-  evidence: QualityEvidence
-  invalidFacts: number
-  confidence: QualityConfidence
-  reviews: QualityReviews
-  impact: QualityImpact
-  cacheHitRate: number | null
-  analysis: QualityAnalysisRef | null
-  indexedCommit: string
-}
-
-/** A file-level change inside a persisted change set (spec §7.2). */
-export type ChangedFile = {
+export type CodeTreeEntryView = {
   path: string
-  oldPath: string | null
-  status: string
-  additions: number
-  deletions: number
+  name: string
+  kind: "file" | "directory"
+  size_bytes?: number | null
+  blob_hash?: string | null
+}
+
+/** `CodeFileWindowView`: the only response that carries code text. */
+export type CodeFileWindowView = {
+  repo_id: string
+  commit_sha: string
+  path: string
+  start_line: number
+  end_line: number
+  total_lines: number
+  truncated: boolean
   binary: boolean
-  headBlobHash: string
-}
-
-/** Aggregate diff counters for a change set. */
-export type ChangeSetStats = {
-  files: number
-  additions: number
-  deletions: number
-  truncated: boolean
-}
-
-/**
- * One changed entity summary inside a batch snapshot item (spec §4.2: route |
- * api | component).
- */
-export type VersionChangeSubject = {
-  kind: string
-  name: string
-}
-
-/**
- * One persisted summary of a changed file inside a version_change snapshot.
- * It never carries code content or a diff; `unmapped` is the P4 INV-8 verdict.
- */
-export type VersionChangeItem = {
-  file: string
-  changeKind: string
-  subjects: VersionChangeSubject[]
-  /** Case node ids, decimal strings that are never re-parsed (spec §7.1). */
-  caseIds: string[]
-  unmapped: boolean
-}
-
-/**
- * One batchTimeline entry of `GET /api/versions/{id}/code/changes` (P8 D58): the
- * batch identity, its commit range, counters and summary items. `batchId` is a
- * decimal string (D29).
- */
-export type VersionChangeBatch = {
-  batchId: string
-  batchNo: number
-  batchStatus: string
-  baseCommit: string
-  headCommit: string
-  historyRewritten: boolean
-  changedFiles: number
-  impactedCases: number
-  unmappedCount: number
-  items: VersionChangeItem[]
-  computedAt: string
-  /**
-   * Additive P8 degraded flag: the batch head has no analysis mapping data yet,
-   * so the snapshot is computed provisionally on every read and never reflects
-   * a durable unmapped verdict. The UI says「映射生成中」and suppresses the
-   * pre-analysis unmapped badges. Older backends omit the field (false).
-   */
-  provisional?: boolean
-  /**
-   * Additive P8 degraded flag: this batch's deterministic diff could not be
-   * computed. The rest of the timeline still renders; the batch says
-   *「本批变更暂不可用」instead of pretending it has no changes.
-   */
-  unavailable?: boolean
-}
-
-/**
- * `/api/code/repos/{repoId}/diff` and `/api/versions/{id}/code/changes` share
- * this DTO (spec §7.2). `changeSetId` is null for a version preview that has
- * not persisted a change set yet (spec §7.3). `batchTimeline` is additive in
- * P8: an older backend omits it and the tab renders the unchanged change list.
- */
-export type ChangeList = {
-  changeSetId: string | null
-  baseCommit: string
-  headCommit: string
-  stats: ChangeSetStats
-  files: ChangedFile[]
-  nextCursor: string | null
-  hasMore: boolean
-  batchTimeline?: VersionChangeBatch[]
-}
-
-/** Counters produced by one T0 index run. */
-export type IndexRunStats = {
-  files: number
-  truncated: boolean
-}
-
-/** A T0 index run; `runId` is a decimal string (spec §7.1). */
-export type IndexRun = {
-  runId: string
-  repoId?: number
-  commit: string
-  source?: string
-  status: string
-  stats?: IndexRunStats | null
-  errors?: AnalysisError[]
-  startedAt: string | null
-  finishedAt: string | null
-  createdBy?: number
-  createdAt?: string
-}
-
-/** Accepted (202) body of `POST /api/code/repos/{repoId}/index`. */
-export type IndexRunAccepted = Pick<IndexRun, "runId" | "status" | "commit">
-
-/** Repository plus its latest index-run projection (spec §7.2). */
-export type RepoSummary = {
-  id: number
-  key: string
-  name: string
-  status: string
-  fixedBranch: string
-  lastCommit: string
-  lastIndexedAt: string | null
-  index: IndexRun | null
-}
-
-/** One entry of a repository tree page (spec §7.2). */
-export type TreeEntry = {
-  path: string
-  type: "blob" | "tree"
-  size: number
-  gitObjectId: string
-  mode: string
-  unsupported: boolean
-}
-
-/** One cursor page of tree entries. */
-export type TreePage = {
-  entries: TreeEntry[]
-  nextCursor: string
-  hasMore: boolean
-}
-
-/** A 1-based line window of one file at a commit (spec §7.2). */
-export type FileWindow = {
-  commit: string
-  path: string
-  startLine: number
-  endLine: number
-  totalLines: number
-  truncated: boolean
   content: string
+  sha256: string
 }
 
-/** Unified diff of a single file (spec §7.2). */
-export type FileDiff = {
-  baseCommit: string
-  headCommit: string
+/* ---------------------------------- diff ----------------------------------- */
+
+export type CodeChangedFileStatus = "added" | "modified" | "deleted" | "renamed"
+
+/** `CodeChangedFileView`: change-set row without patch text. */
+export type CodeChangedFileView = {
   path: string
-  status: string
+  old_path?: string | null
+  status: CodeChangedFileStatus
+  additions: number
+  deletions: number
   binary: boolean
-  truncated: boolean
-  patch: string
+  head_blob_hash?: string | null
 }
 
-/** A changed file that produced no requirement or app-model candidate. */
-export type UnmappedChange = {
+/** `CodeFileDiffView`: one on-demand patch (≤256 KiB) with reduce-content flags. */
+export type CodeFileDiffView = {
   path: string
-  status: string
-  reason: string
-  suggestion: string
+  old_path?: string | null
+  status: CodeChangedFileStatus
+  additions: number
+  deletions: number
+  binary: boolean
+  large: boolean
+  deleted: boolean
+  patch?: string | null
 }
 
-/** One non-fatal analysis error. */
-export type AnalysisError = {
-  code: string
-  path?: string
-  message: string
+/** `CodeChangeSetView`: preview-only change set (never persisted by the API). */
+export type CodeChangeSetView = {
+  repo_id: string
+  base_commit_sha: string
+  head_commit_sha: string
+  files: CodeChangedFileView[]
+  stats: Record<string, unknown>
+  truncated: boolean
 }
 
-/** The fact version snapshot recorded by an analysis (spec §7.3). */
-export type FactVersionRef = {
-  factKey: string
+/* --------------------------------- entities -------------------------------- */
+
+export type CodeFactKind =
+  | "file"
+  | "module"
+  | "route"
+  | "api"
+  | "client_call"
+  | "component"
+  | "page"
+  | "symbol"
+
+export type CodeConfidence = "low" | "medium" | "high"
+
+export type CodeSource = "git" | "ai"
+
+/** `CodeFactView`: immutable T1 fact projection used by the facts panel. */
+export type CodeFactView = {
+  id: string
+  repo_id: string
+  commit_sha: string
+  fact_key: string
   version: number
+  kind: CodeFactKind
+  path: string
+  name?: string
+  signature?: string
+  start_line?: number | null
+  end_line?: number | null
+  body?: Record<string, unknown>
+  evidence?: Array<Record<string, unknown>>
+  source: CodeSource
+  confidence: CodeConfidence
+  model?: string
+  prompt_version?: string
+  analysis_id?: string | null
+  superseded_at?: string | null
+  created_at: string
 }
 
-/** Analysis counters reported by the backend. */
-export type AnalysisStats = {
-  changedFiles: number
-  analyzedFiles: number
-  cacheHits: number
-  facts: number
-  edges: number
-  contracts: number
-  evidenceChecks: number
-  evidenceFailures: number
-  unmapped: number
-  invalidFacts: number
-  duplicateFacts: number
-  unmatchedContracts: number
-  truncated: boolean
-  /** True when the server truncated the unmapped list at 200 entries. */
-  unmappedTruncated?: boolean
-  skipped?: number
-}
-
-/** Subject kinds accepted by candidate/impact DTOs (spec §7.3). */
-export type CandidateSubjectKind = "requirement" | "app_model"
-
-/** One impact candidate; `subjectId` stays a decimal string (spec §7.1). */
-export type Candidate = {
+/** `CodeEntityView`: search/tree entity projection. */
+export type CodeEntityView = {
   id: string
-  subjectKind: CandidateSubjectKind
-  subjectId: string
-  reason: string
-  confidence: string
-  source: string
-  evidence: Evidence[]
-  selected: boolean
-  selectionUpdatedBy?: number | null
-  selectionUpdatedAt?: string | null
+  repo_id: string
+  commit_sha: string
+  kind: CodeFactKind
+  path: string
+  name?: string
+  signature?: string
+  start_line?: number | null
+  end_line?: number | null
+  source: CodeSource
+  confidence: CodeConfidence
 }
 
-/** Subject kinds accepted by anchors; `case`/`issue` are rejected in P4. */
-export type AnchorSubjectKind = "version" | "requirement" | "app_model"
-
-/** A code anchor DTO (spec §7.3). */
-export type Anchor = {
-  id: string
-  versionId: string
-  subjectKind: AnchorSubjectKind
-  subjectId: string
-  filePath: string
-  startLine?: number | null
-  endLine?: number | null
-  commitSha?: string | null
-  confidence: string
-  createdByKind: string
-  createdBy: number
-  createdAt: string
+/** `CodeCommitView`: commit metadata (never file bodies). */
+export type CodeCommitView = {
+  sha: string
+  branch?: string | null
+  message: string
+  author_name?: string | null
+  authored_at: string
+  committed_at: string
+  parents: string[]
+  is_head: boolean
 }
 
-/** A code-impact analysis with its candidates/unmapped projection (spec §7.3). */
-export type Analysis = {
+/* --------------------------------- analysis -------------------------------- */
+
+export type CodeAnalysisStatus = "queued" | "running" | "done" | "failed"
+
+/** `CodeAnalysisView`: T1 analysis run summary. */
+export type CodeAnalysisView = {
   id: string
-  versionId: string
-  repoId: number
-  baseCommit: string
-  headCommit: string
-  status: string
+  version_id: string
+  repo_id: string
+  base_commit_sha: string
+  head_commit_sha: string
+  status: CodeAnalysisStatus
   degraded: boolean
-  analysisVersion: number
-  model: string
-  promptVersion: string
-  changeSetId: string | null
-  changeSummary: string
-  stats: AnalysisStats | null
-  factVersions: FactVersionRef[]
-  candidates: Candidate[]
-  unmapped: UnmappedChange[]
-  errors: AnalysisError[]
-  createdBy?: number
-  createdAt: string
-  startedAt: string | null
-  finishedAt: string | null
+  model?: string
+  prompt_version?: string
+  analysis_version?: number
+  stats: Record<string, unknown>
+  changed_files_count?: number
+  candidates_count?: number
+  selected_count?: number
+  unmapped_count?: number
+  errors_count?: number
+  error?: string | null
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
 }
 
-/** A persisted code entity/fact entry returned by the facts/search reads. */
-export type CodeEntity = {
+export type CodeAnalysisUnmapped = {
+  path: string
+  reason: string
+}
+
+export type CodeImpactSubjectKind =
+  | "requirement"
+  | "requirement_version"
+  | "case_version"
+  | "sut_page"
+  | "sut_api"
+
+export type CodeImpactSource = "direct" | "contract" | "relation" | "ai"
+
+/** `CodeImpactCandidateView`: deterministic or AI impact candidate. */
+export type CodeImpactCandidateView = {
   id: string
-  repoId: number
-  commit: string
-  kind: string
-  path: string
+  analysis_id: string
+  repo_id?: string | null
+  version_sut_id?: string | null
+  subject_kind: CodeImpactSubjectKind
+  subject_id: string
+  reason: string
+  confidence: CodeConfidence
+  source: CodeImpactSource
+  evidence?: Array<Record<string, unknown>>
+  selected: boolean
+  selection_updated_by?: string | null
+  selection_updated_at?: string | null
+  created_at: string
+}
+
+/** `CodeAnalysisDetailView`: analysis plus changed files, unmapped and candidates. */
+export type CodeAnalysisDetailView = {
+  analysis: CodeAnalysisView
+  changed_files: CodeChangedFileView[]
+  unmapped: CodeAnalysisUnmapped[]
+  candidates: CodeImpactCandidateView[]
+  fact_versions?: Record<string, number>
+  errors?: Array<Record<string, unknown>>
+}
+
+export type CodeImpactAnalysisRef = {
+  repo_id: string
+  analysis_id: string
+  base_commit_sha: string
+  head_commit_sha: string
+  status: CodeAnalysisStatus
+  degraded: boolean
+  candidates_count?: number
+}
+
+/** `CodeImpactView`: merged multi-repository impact projection. */
+export type CodeImpactView = {
+  version_id: string
+  analyses: CodeImpactAnalysisRef[]
+  candidates: CodeImpactCandidateView[]
+}
+
+/* ---------------------------------- anchors -------------------------------- */
+
+export type CodeAnchorSubjectKind =
+  | "version"
+  | "requirement"
+  | "requirement_version"
+  | "case_version"
+  | "issue"
+
+export type CodeAnchorStatus = "valid" | "stale" | "broken"
+
+export type CodeAnchorCreatorKind = "user" | "ai" | "system"
+
+/** `CodeAnchorView`: requirement/case/issue/version → file:line anchor. */
+export type CodeAnchorView = {
+  id: string
+  version_id: string
+  repo_id: string
+  subject_kind: CodeAnchorSubjectKind
+  subject_id: string
+  file_path: string
+  start_line?: number | null
+  end_line?: number | null
+  entity_id?: string | null
+  commit_sha?: string | null
+  excerpt_sha?: string | null
+  status: CodeAnchorStatus
+  confidence: CodeConfidence
+  created_by_kind: CodeAnchorCreatorKind
+  created_by?: string | null
+  last_validated_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+/* -------------------------------- fact review ------------------------------ */
+
+export type CodeFactReviewVerdict = "correct" | "incorrect"
+
+/** `CodeFactReviewView`: append-only fact review record. */
+export type CodeFactReviewView = {
+  id: string
+  fact_id: string
+  fact_version: number
+  repo_id: string
+  commit_sha: string
+  verdict: CodeFactReviewVerdict
+  reason: string
+  reviewer_id: string
+  created_at: string
+}
+
+/* --------------------------------- proposals ------------------------------- */
+
+export type CodeProposalKind = "page" | "api"
+
+/** `CodeProposalView`: proposed page/API generated from code facts. */
+export type CodeProposalView = {
+  kind: CodeProposalKind
+  id: string
   name: string
-  startLine?: number | null
-  endLine?: number | null
-  signature: string
-  blobHash: string
-  source: string
-  confidence: string
-  evidence: Evidence[]
-  factKey?: string | null
-  factVersion?: number | null
-  analysisId?: string | null
-  /** Additive P8 human verdict at this commit; null/absent when unreviewed. */
-  review?: FactReview | null
-  createdAt?: string
-  updatedAt?: string
+  url?: string | null
+  route_template?: string | null
+  method?: string | null
+  path_template?: string | null
+  status: "proposed"
+  source: "ai" | "code"
+  evidence?: Array<Record<string, unknown>>
+  created_at: string
 }
 
-/** Query for `GET /api/code/repos/{repoId}/tree` (spec §7.2). */
-export type TreeQuery = {
+export type CodeProposalCounts = {
+  created: number
+  skipped: number
+  ids: string[]
+}
+
+export type CodeProposalResultView = {
+  pages: CodeProposalCounts
+  apis: CodeProposalCounts
+}
+
+/* --------------------------------- requests -------------------------------- */
+
+export type CodeIndexInput = {
+  repoId: string
   commit?: string
-  path?: string
-  cursor?: string
-  limit?: number
+  branch?: string
 }
 
-/** Query for `GET /api/code/repos/{repoId}/file` (spec §7.2). */
-export type FileQuery = {
-  commit?: string
-  path: string
-  startLine?: number
-  endLine?: number
-}
-
-/** Query for `GET /api/code/repos/{repoId}/diff` (spec §7.2). */
-export type DiffQuery = {
-  base: string
-  head: string
-  cursor?: string
-  limit?: number
-}
-
-/** Query for `GET /api/code/repos/{repoId}/diff/file` (spec §7.2). */
-export type FileDiffQuery = {
-  base: string
-  head: string
-  path: string
-}
-
-/** Query for `GET /api/code/repos/{repoId}/facts` (spec §7.2). */
-export type FactsQuery = {
-  commit?: string
-  kind?: string
-  path?: string
-  cursor?: string
-  limit?: number
-}
-
-/** Query for `GET /api/code/repos/{repoId}/search` (spec §7.2). */
-export type SearchQuery = {
-  commit?: string
-  q: string
-  kind?: string
-  cursor?: string
-  limit?: number
-}
-
-/** Query for `GET /api/versions/{id}/code/anchors` (spec §7.3). */
-export type AnchorQuery = {
-  subjectKind?: AnchorSubjectKind
-  subjectId?: string
-}
-
-/** Request body of `POST /api/versions/{id}/code/analyses` (spec §7.3). */
-export type StartAnalysisBody = {
+export type CodeAnalysisInput = {
+  repoId: string
   headCommit?: string
   force?: boolean
 }
 
-/** New-or-reused analysis returned by `POST /api/versions/{id}/code/analyses`. */
-export type StartAnalysisResult = {
-  id: string
-  status: string
-  analysisVersion: number
-  reused: boolean
-}
-
-/** Request body of `POST /api/versions/{id}/code/anchors` (spec §7.3). */
-export type CreateAnchorBody = {
-  subjectKind: AnchorSubjectKind
+export type CreateCodeAnchorInput = {
+  subjectKind: CodeAnchorSubjectKind
   subjectId: string
+  repoId: string
   filePath: string
   startLine?: number
   endLine?: number
+  excerptSha?: string
+}
+
+export type CreateCodeFactReviewInput = {
+  verdict: CodeFactReviewVerdict
+  reason?: string
+}
+
+export type CodeProposalInput = {
+  repoId?: string
+}
+
+export type CodeTreeQuery = {
+  commit: string
+  path?: string
+  cursor?: string
+  limit?: number
+}
+
+export type CodeFileQuery = {
+  commit: string
+  path: string
+  startLine?: number
+  endLine?: number
+}
+
+export type CodeDiffQuery = {
+  base: string
+  head: string
+  cursor?: string
+  limit?: number
+}
+
+export type CodeFileDiffQuery = {
+  base: string
+  head: string
+  path: string
+}
+
+export type CodeFactListQuery = {
+  commit: string
+  kind?: CodeFactKind
+  path?: string
+  cursor?: string
+  limit?: number
+}
+
+export type CodeSearchQuery = {
+  commit: string
+  q: string
+  kind?: CodeFactKind
+  cursor?: string
+  limit?: number
+}
+
+export type CodeChangesQuery = {
+  repoId: string
+  head?: string
+}
+
+export type CodeAnchorFilters = {
+  subjectKind?: CodeAnchorSubjectKind
+  subjectId?: string
+}
+
+/* ------------------------------- UI metadata ------------------------------- */
+
+export const CODE_INDEX_STATUS_LABELS: Record<CodeIndexStatus, string> = {
+  queued: "排队中",
+  running: "运行中",
+  done: "已完成",
+  failed: "失败",
+}
+
+export const CODE_ANALYSIS_STATUS_LABELS: Record<CodeAnalysisStatus, string> = {
+  queued: "排队中",
+  running: "运行中",
+  done: "已完成",
+  failed: "失败",
+}
+
+export const CODE_CHANGED_STATUS_LABELS: Record<CodeChangedFileStatus, string> = {
+  added: "新增",
+  modified: "修改",
+  deleted: "删除",
+  renamed: "重命名",
+}
+
+export const CODE_CHANGED_STATUS_LETTERS: Record<CodeChangedFileStatus, string> = {
+  added: "A",
+  modified: "M",
+  deleted: "D",
+  renamed: "R",
+}
+
+export const CODE_FACT_KIND_LABELS: Record<CodeFactKind, string> = {
+  file: "文件",
+  module: "模块",
+  route: "路由",
+  api: "API",
+  client_call: "客户端调用",
+  component: "组件",
+  page: "页面",
+  symbol: "符号",
+}
+
+export const CODE_FACT_KIND_ORDER: readonly CodeFactKind[] = [
+  "file",
+  "route",
+  "page",
+  "api",
+  "client_call",
+  "component",
+  "symbol",
+  "module",
+]
+
+/** Low confidence is surfaced as a clue, never as a confirmed fact (spec §5.2). */
+export const CODE_CONFIDENCE_LABELS: Record<CodeConfidence, string> = {
+  low: "线索",
+  medium: "中置信",
+  high: "高置信",
+}
+
+export const CODE_CONFIDENCE_ORDER: Record<CodeConfidence, number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+}
+
+export const CODE_IMPACT_SUBJECT_KIND_LABELS: Record<CodeImpactSubjectKind, string> = {
+  requirement: "需求",
+  requirement_version: "需求版本",
+  case_version: "用例版本",
+  sut_page: "页面",
+  sut_api: "API",
+}
+
+export const CODE_IMPACT_SUBJECT_KIND_ORDER: readonly CodeImpactSubjectKind[] = [
+  "requirement",
+  "requirement_version",
+  "case_version",
+  "sut_page",
+  "sut_api",
+]
+
+export const CODE_IMPACT_SOURCE_LABELS: Record<CodeImpactSource, string> = {
+  direct: "直接",
+  contract: "契约",
+  relation: "关系",
+  ai: "AI 推理",
+}
+
+export const CODE_ANCHOR_STATUS_LABELS: Record<CodeAnchorStatus, string> = {
+  valid: "有效",
+  stale: "内容已变",
+  broken: "失效",
+}
+
+export const CODE_ANCHOR_SUBJECT_LABELS: Record<CodeAnchorSubjectKind, string> = {
+  version: "版本",
+  requirement: "需求",
+  requirement_version: "需求版本",
+  case_version: "用例版本",
+  issue: "问题",
+}
+
+export const CODE_UNMAPPED_REASON_LABELS: Record<string, string> = {
+  deleted_file: "文件已删除",
+  unsupported_content: "内容不支持分析",
+  no_fact_or_anchor: "无事实或锚点",
+  ai_unavailable: "AI 不可用",
+  unmatched_contract: "契约未匹配",
+}
+
+export const CODE_REVIEW_VERDICT_LABELS: Record<CodeFactReviewVerdict, string> = {
+  correct: "正确",
+  incorrect: "错误",
+}
+
+export const CODE_PROPOSAL_KIND_LABELS: Record<CodeProposalKind, string> = {
+  page: "页面",
+  api: "API",
 }

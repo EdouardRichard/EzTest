@@ -1,231 +1,94 @@
-// Package application holds the P8 exploration-chain read model: the
-// cross-context provider ports it consumes and the aggregation service that
-// turns their per-layer snapshots into one deterministic graph.
-//
-// This file is the single home of the chain cross-context port declarations. It
-// contains value types and interfaces only: no pgx, HTTP or other-context
-// imports. Adapters live in each context's infrastructure/chain package and are
-// wired by the composition root (Task 7), so the chain context never imports
-// another bounded context.
-package application
+// Package chainapp implements the read-only exploration-chain use case and
+// declares the provider ports it consumes. Domain packages never import
+// another context; every provider returns chain domain nodes whose Kind
+// identifies the entity, so the builder can group them without knowing the
+// provider's context.
+package chainapp
 
 import (
 	"context"
-	"fmt"
 	"time"
+
+	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
 )
 
-// Node kinds rendered by the exploration chain (spec §5.1). The node id is
-// "<kind>:<domainId>" so a node can always be resolved without a second lookup.
-const (
-	NodeKindRequirement = "requirement"
-	NodeKindCase        = "case"
-	NodeKindResult      = "result"
-	NodeKindIssue       = "issue"
-)
-
-// Edge kinds rendered by the exploration chain (spec §5.1).
-const (
-	EdgeKindRequirementCase = "requirement_case"
-	EdgeKindCaseResult      = "case_result"
-	EdgeKindResultIssue     = "result_issue"
-	EdgeKindCaseIssue       = "case_issue"
-	EdgeKindImpactCase      = "impact_case"
-)
-
-// ReasonInvalidArgument is the stable details.reason of the chain context's 400
-// invalid_argument errors (spec §5.1).
-const ReasonInvalidArgument = "invalid_argument"
-
-// ErrInvalidArgument reports a rejected query field. Field names the offending
-// request parameter; Min and Max carry the accepted bounds when the rejection is
-// a range violation (zero means "not applicable"). The HTTP layer renders them
-// as details{field,min,max,reason}.
-type ErrInvalidArgument struct {
-	Field   string
-	Reason  string
-	Min     int
-	Max     int
-	Message string
+// VersionChainProvider supplies requirement and version SUT nodes (spec §8.1).
+// Requirements must return up to limit roots, paging its backing reader when one
+// reader page is capped; the service asks for MaxRequirements+1 so BuildChain
+// can report requirement_budget truncation.
+type VersionChainProvider interface {
+	Requirements(ctx context.Context, versionID int64, limit int) ([]chain.Node, error)
+	VersionSUTs(ctx context.Context, versionID int64) ([]chain.Node, error)
 }
 
-// Error implements error.
-func (e *ErrInvalidArgument) Error() string {
-	if e == nil {
-		return ""
-	}
-	if e.Message != "" {
-		return e.Message
-	}
-	if e.Field != "" {
-		return "invalid " + e.Field
-	}
-	return ReasonInvalidArgument
+// DesignChainProvider supplies scenario and case-version nodes. CaseVersionsByIDs
+// is the historical reader: it must return superseded rows with their title.
+type DesignChainProvider interface {
+	Scenarios(ctx context.Context, versionID int64) ([]chain.Node, error)
+	Cases(ctx context.Context, versionID int64) ([]chain.Node, error)
+	CaseVersionsByIDs(ctx context.Context, versionID int64, ids []int64) ([]chain.Node, error)
 }
 
-// ErrNotFound reports a missing version or a batch that does not belong to the
-// addressed version (spec §5.1: both are 404). Resource is "version" or
-// "batch".
-type ErrNotFound struct {
-	Resource string
-	ID       int64
-	Message  string
+// ExecutionChainProvider supplies wave and case-run nodes (spec §8.1).
+type ExecutionChainProvider interface {
+	Waves(ctx context.Context, versionID int64) ([]chain.Node, error)
+	CaseRuns(ctx context.Context, versionID int64) ([]chain.Node, error)
 }
 
-// Error implements error.
-func (e *ErrNotFound) Error() string {
-	if e == nil {
-		return ""
-	}
-	if e.Message != "" {
-		return e.Message
-	}
-	if e.Resource != "" {
-		return fmt.Sprintf("%s %d not found", e.Resource, e.ID)
-	}
-	return "not found"
+// DeliveryChainProvider supplies issue, report and closure nodes (spec §8.1).
+type DeliveryChainProvider interface {
+	Issues(ctx context.Context, versionID int64) ([]chain.Node, error)
+	Reports(ctx context.Context, versionID int64) ([]chain.Node, error)
+	Closures(ctx context.Context, versionID int64) ([]chain.Node, error)
 }
 
-// ---------------------------------------------------------------------------
-// Provider DTOs
-// ---------------------------------------------------------------------------
-
-// BatchRow is the version provider's resolved batch. A zero ID means the
-// version exists but has no batch yet.
-type BatchRow struct {
-	ID      int64
-	BatchNo int
-	Kind    string
-	Status  string
+// ResourceChainProvider resolves display names for version SUTs and pages
+// (spec §8.1).
+type ResourceChainProvider interface {
+	SUTNames(ctx context.Context, versionID int64) (map[int64]string, error)
+	PageNames(ctx context.Context, versionID int64) (map[int64]string, error)
 }
 
-// RequirementRow is one requirement of the explored version, including the
-// declaration-order fields used to sort the root layer.
-type RequirementRow struct {
-	ID                int64
-	Title             string
-	Status            string
-	Priority          string
-	SortOrder         int
-	OpenQuestionCount int
+// CursorReader reads the latest event seq of one channel; the chain service
+// returns it as ChainView.SnapshotCursor (spec §8.4).
+type CursorReader interface {
+	LatestCursor(ctx context.Context, channel string) (int64, error)
 }
 
-// CaseRow is one case node of the version's mindmap. RequirementIDs are the
-// requirement sources attached to the case (case_source ref_kind=requirement);
-// the service unions them with coverage.matrix.
-type CaseRow struct {
-	ID             int64
-	Title          string
-	Status         string
-	Source         string
-	Priority       string
-	RequirementIDs []int64
-	StepCount      int
-	AssertionCount int
-	SortOrder      int
+// EventTimeReader maps one event seq of a channel to the event's created_at
+// timestamp. The chain service uses it to turn event_from/event_to into
+// approximate entity created_at bounds (spec §8.4); found=false means the
+// channel no longer exposes a row for that seq.
+type EventTimeReader interface {
+	EventTime(ctx context.Context, channel string, seq int64) (createdAt time.Time, found bool, err error)
 }
 
-// CoverageCell is one row of the requirement coverage matrix: the requirement
-// and the case nodes covering it (mindmap domain BuildCoverage).
-type CoverageCell struct {
-	RequirementID int64
-	CaseIDs       []int64
+// SettingsReader is the hot settings cache surface consumed per request by the
+// P6 chain service (spec §4.3.6). Int must return the currently cached value;
+// the settings application service satisfies it, so a PATCH settings update is
+// visible on the next chain request without a service rebuild. Read failures
+// fall back to the statically wired budget.
+type SettingsReader interface {
+	Int(ctx context.Context, key string) (int64, error)
 }
 
-// ResultRow is the latest execution attempt of one case node in the selected
-// batch scope. Providers may return every attempt; the service keeps the newest
-// (attempt, then id) per case.
-type ResultRow struct {
-	ID            int64
-	CaseNodeID    int64
-	BatchID       int64
-	Attempt       int
-	Status        string
-	DurationMs    int64
-	FailureClass  string
-	Summary       string
-	EvidenceCount int
+// DesignSnapshotProvider is the optional one-read fast path of the design
+// provider. When implemented, the service fetches scenarios and cases from the
+// same design graph snapshot instead of reading the graph twice. The query
+// budget test counts this as one bounded SQL read.
+type DesignSnapshotProvider interface {
+	DesignSnapshot(ctx context.Context, versionID int64) (scenarios, cases []chain.Node, err error)
 }
 
-// IssueRow is one delivery issue. CaseRunID and CaseNodeID are nil for
-// requirement-gap or otherwise unlinked issues.
-type IssueRow struct {
-	ID            int64
-	Title         string
-	Severity      string
-	Status        string
-	Category      string
-	Confidence    string
-	CaseRunID     *int64
-	CaseNodeID    *int64
-	EvidenceCount int
-	CodeRefCount  int
-	CreatedAt     time.Time
+// ExecutionSnapshotProvider is the optional one-read fast path of the execution
+// provider: waves and case runs come from one wave walk.
+type ExecutionSnapshotProvider interface {
+	ExecutionSnapshot(ctx context.Context, versionID int64) (waves, caseRuns []chain.Node, err error)
 }
 
-// ImpactRow is one candidate of the latest P4 code analysis. The service keeps
-// requirement candidates that are selected or of high/medium confidence and
-// turns them into impact_case edges (spec §5.1).
-type ImpactRow struct {
-	SubjectKind string
-	SubjectID   int64
-	Reason      string
-	Confidence  string
-	Selected    bool
-}
-
-// ---------------------------------------------------------------------------
-// Provider ports
-// ---------------------------------------------------------------------------
-
-// VersionProvider supplies the version/batch resolution and the requirement
-// layer (spec §5.2 queries 1–2). Requirements returns the complete layer of the
-// version: the service applies the query filters and truncation itself, so an
-// adapter must not pre-filter by the request query.
-type VersionProvider interface {
-	// GetBatch resolves the selected batch of versionID. A nil batchID means
-	// "the most recent batch"; the returned BatchRow is zero when the version
-	// exists but has no batch. A missing version, and an explicit batchID that
-	// does not belong to versionID, return ErrNotFound.
-	GetBatch(ctx context.Context, versionID int64, batchID *int64) (BatchRow, error)
-	Requirements(ctx context.Context, versionID int64) ([]RequirementRow, error)
-}
-
-// MindmapProvider supplies the case layer and the requirement coverage matrix
-// (spec §5.2 queries 3–4/9). Both methods return the complete version layer.
-type MindmapProvider interface {
-	Cases(ctx context.Context, versionID int64) ([]CaseRow, error)
-	Coverage(ctx context.Context, versionID int64) ([]CoverageCell, error)
-}
-
-// ExecutionProvider supplies the result layer (spec §5.2 query 6). A nil
-// batchID means "every batch of the version"; otherwise rows are restricted to
-// that batch. Adapters may return one row per attempt or already-latest rows:
-// the service deterministically keeps the newest attempt per case.
-type ExecutionProvider interface {
-	LatestResults(ctx context.Context, versionID int64, batchID *int64) ([]ResultRow, error)
-}
-
-// DeliveryProvider supplies the issue layer (spec §5.2 query 8). A nil batchID
-// means "every batch of the version"; otherwise issues are restricted to that
-// batch. IssueStatus/IssueSeverity are applied by the service, not the adapter.
-type DeliveryProvider interface {
-	Issues(ctx context.Context, versionID int64, batchID *int64) ([]IssueRow, error)
-}
-
-// CodeIntelProvider supplies the latest P4 impact candidates (spec §5.2 query
-// 10). It returns an empty slice when the version has no analysis.
-type CodeIntelProvider interface {
-	Impact(ctx context.Context, versionID int64) ([]ImpactRow, error)
-}
-
-// Providers groups the five layer providers. Version, Mindmap and Execution are
-// required; Delivery and CodeIntel are optional and degrade to an empty
-// issue/impact layer when nil.
-type Providers struct {
-	Version   VersionProvider
-	Mindmap   MindmapProvider
-	Execution ExecutionProvider
-	Delivery  DeliveryProvider
-	CodeIntel CodeIntelProvider
+// ResourceSnapshotProvider is the optional one-read fast path of the resource
+// provider: version-SUT labels and page labels are resolved from one version
+// binding read.
+type ResourceSnapshotProvider interface {
+	ResourceSnapshot(ctx context.Context, versionID int64) (sutNames, pageNames map[int64]string, err error)
 }
