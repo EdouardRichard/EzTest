@@ -83,20 +83,41 @@ type LocalBroadcaster interface {
 	BroadcastLoaded(event eventing.Event)
 }
 
+// EventObserver is notified after a persisted event has been broadcast to the
+// local hub. The settings service uses it to reload its per-process cache when
+// another replica publishes settings.updated. The observer runs after broadcast
+// so a slow/failing observer never delays SSE delivery.
+type EventObserver func(context.Context, eventing.Event) error
+
+// DispatcherOption customizes a Dispatcher.
+type DispatcherOption func(*Dispatcher)
+
+// WithDispatcherObserver installs an observer invoked once per delivered event.
+func WithDispatcherObserver(observer EventObserver) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.observer = observer
+	}
+}
+
 // Dispatcher turns cross-instance NOTIFY payloads into local hub deliveries:
 // decode the reference, de-duplicate repeated notifications, load the row from
 // the event log (DB is the truth) and broadcast it. It performs no I/O other
 // than the repository load, so it is unit-testable without PostgreSQL.
 type Dispatcher struct {
-	events EventReader
-	sink   LocalBroadcaster
-	recent *recentEvents
+	events   EventReader
+	sink     LocalBroadcaster
+	observer EventObserver
+	recent   *recentEvents
 }
 
 // NewDispatcher wires a dispatcher. A nil reader or sink makes Handle fail
 // without panicking (the listener logs and retries on the next notification).
-func NewDispatcher(events EventReader, sink LocalBroadcaster) *Dispatcher {
-	return &Dispatcher{events: events, sink: sink, recent: newRecentEvents(RecentEventLimit)}
+func NewDispatcher(events EventReader, sink LocalBroadcaster, options ...DispatcherOption) *Dispatcher {
+	dispatcher := &Dispatcher{events: events, sink: sink, recent: newRecentEvents(RecentEventLimit)}
+	for _, option := range options {
+		option(dispatcher)
+	}
+	return dispatcher
 }
 
 // Handle processes one NOTIFY payload. Duplicate references are ignored;
@@ -119,6 +140,11 @@ func (d *Dispatcher) Handle(ctx context.Context, payload string) error {
 	}
 	d.sink.BroadcastLoaded(event)
 	d.recent.add(ref.Key())
+	if d.observer != nil {
+		if err := d.observer(ctx, event); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

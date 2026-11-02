@@ -135,6 +135,19 @@ export function InstancePanel() {
       ),
     },
     {
+      key: "inflight",
+      header: "在飞",
+      render: (instance) => (
+        <span
+          data-testid={`instance-inflight-${instance.id}`}
+          className="font-mono text-xs text-muted-foreground"
+          title="active_requests / active_work"
+        >
+          {instance.active_requests ?? 0}/{instance.active_work ?? 0}
+        </span>
+      ),
+    },
+    {
       key: "heartbeat",
       header: "心跳",
       render: (instance) => (

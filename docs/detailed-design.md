@@ -1,3 +1,5 @@
+> **0.1 归档；0.2 权威文档见 [docs/version-V0.2/](version-V0.2/README.md) 与 [deploy/README.md](../deploy/README.md)。**
+
 # EzTest 详细设计文档
 | 项目 | 内容 |
 |---|---|

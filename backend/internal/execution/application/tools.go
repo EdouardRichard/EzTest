@@ -74,7 +74,7 @@ func (s *CaseRunner) Browser(ctx context.Context, scope tools.Scope, action stri
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.browser.Action(ctx, contextID, action, actionArgs)
+	result, err := s.browser.Action(ctx, caseRunExecutorID(caseRun), contextID, action, actionArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +103,15 @@ func (s *CaseRunner) Browser(ctx context.Context, scope tools.Scope, action stri
 	return out, nil
 }
 
+// caseRunExecutorID returns the owning executor id (0 = single-endpoint
+// fallback when the run has no owner, e.g. a historical row).
+func caseRunExecutorID(caseRun execution.CaseRun) int64 {
+	if caseRun.OwnerExecutorID == nil {
+		return 0
+	}
+	return *caseRun.OwnerExecutorID
+}
+
 func (s *CaseRunner) ensureBrowserContext(ctx context.Context, caseRun execution.CaseRun, binding execution.SUTBinding, role string, allowedHosts []string) (string, error) {
 	rows, err := s.sutContexts.ListByCaseRun(ctx, caseRun.ID)
 	if err != nil {
@@ -129,6 +138,7 @@ func (s *CaseRunner) ensureBrowserContext(ctx context.Context, caseRun execution
 		Key:          caseContextKey(caseRun.ID, binding.VersionSUTID, role),
 		AllowedHosts: allowedHosts,
 		BaseURL:      baseURL,
+		ExecutorID:   caseRunExecutorID(caseRun),
 		Metadata: map[string]any{
 			"case_run_id":    platformid.Format(caseRun.ID),
 			"version_sut_id": platformid.Format(binding.VersionSUTID),
@@ -149,13 +159,14 @@ func (s *CaseRunner) ensureBrowserContext(ctx context.Context, caseRun execution
 			VersionSUTID:     binding.VersionSUTID,
 			AccountRole:      role,
 			BrowserContextID: contextID,
+			ExecutorID:       caseRun.OwnerExecutorID,
 			LeaseEpoch:       caseRun.DispatchEpoch,
 			Status:           execution.SUTContextActive,
 			CreatedAt:        s.now(),
 			UpdatedAt:        s.now(),
 		}
 		if createErr := s.sutContexts.Create(ctx, created); createErr != nil {
-			_ = s.browser.Close(ctx, contextID)
+			_ = s.browser.Close(ctx, caseRunExecutorID(caseRun), contextID)
 			return "", mapExecutionError(createErr, "case_run_sut_context")
 		}
 		return contextID, nil
@@ -163,6 +174,7 @@ func (s *CaseRunner) ensureBrowserContext(ctx context.Context, caseRun execution
 	rowID := row.ID
 	ok, updateErr := s.sutContexts.UpdateCAS(ctx, rowID, func(target *execution.CaseRunSUTContext) error {
 		target.BrowserContextID = contextID
+		target.ExecutorID = caseRun.OwnerExecutorID
 		target.Status = execution.SUTContextActive
 		target.LeaseEpoch = caseRun.DispatchEpoch
 		return nil

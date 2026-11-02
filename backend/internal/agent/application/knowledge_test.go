@@ -191,14 +191,16 @@ type fakeKnowledgeReader struct {
 	calls      int
 	versionID  int64
 	systemKeys []string
+	query      string
 }
 
-func (f *fakeKnowledgeReader) RetrieveForVersion(_ context.Context, versionID int64, systemKeys []string) ([]agentapp.KnowledgeRef, int, error) {
+func (f *fakeKnowledgeReader) RetrieveForVersion(_ context.Context, versionID int64, systemKeys []string, query string) ([]agentapp.KnowledgeRef, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.versionID = versionID
 	f.systemKeys = append([]string(nil), systemKeys...)
+	f.query = query
 	if f.err != nil {
 		return nil, 0, f.err
 	}
@@ -245,6 +247,9 @@ func TestRunnerInjectsKnowledgeAndRecordsUsageOnce(t *testing.T) {
 	}
 	if len(reader.systemKeys) != 0 {
 		t.Fatalf("runner must let the adapter derive system keys, got %v", reader.systemKeys)
+	}
+	if !strings.Contains(reader.query, "订单系统") || !strings.Contains(reader.query, "登录") {
+		t.Fatalf("runner did not derive the FTS query from the version pack: %q", reader.query)
 	}
 	if len(fixture.repo.packets) != 1 {
 		t.Fatalf("context packets = %d", len(fixture.repo.packets))
@@ -435,5 +440,33 @@ func TestRunnerRejectsKnowledgeProposeOutsideWhitelist(t *testing.T) {
 	}
 	if !strings.Contains(toolContent, "not allowed") {
 		t.Fatalf("tool result = %q", toolContent)
+	}
+}
+
+func TestKnowledgeQueryUsesTitleAndRequirements(t *testing.T) {
+	query := agentapp.KnowledgeQuery(agentapp.VersionPack{
+		Title: "  订单系统   Q4 ",
+		Requirements: []string{
+			"#501 draft 登录",
+			"#501 draft   登录",
+			"退款时效",
+		},
+	})
+	if query != "订单系统 Q4 #501 draft 登录 退款时效" {
+		t.Fatalf("query = %q", query)
+	}
+}
+
+func TestKnowledgeQueryEmptyPack(t *testing.T) {
+	if query := agentapp.KnowledgeQuery(agentapp.VersionPack{}); query != "" {
+		t.Fatalf("empty query = %q", query)
+	}
+}
+
+func TestKnowledgeQueryIsBounded(t *testing.T) {
+	pack := agentapp.VersionPack{Title: strings.Repeat("长", 2000)}
+	query := agentapp.KnowledgeQuery(pack)
+	if len([]rune(query)) > agentapp.KnowledgeQueryMaxChars {
+		t.Fatalf("query runes = %d, want <= %d", len([]rune(query)), agentapp.KnowledgeQueryMaxChars)
 	}
 }

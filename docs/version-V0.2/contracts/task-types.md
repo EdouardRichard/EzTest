@@ -62,9 +62,9 @@
 
 ## 4. P4+ 保留类型（不实现、不创建）
 
-`report.render_pdf`、`knowledge.review`、`gc.run`、`visual.*`、`search.*`。
+`knowledge.review`、`gc.run`、`visual.*`、`search.*`。
 
-P4 已把 5 个预留类型移入 §6 并实现；P5 把 `index.repo` 移入 §7 并实现（`code.analyze` 为 P5 新增类型，非预留）；`report.render_pdf` 仍保留、不注册（PDF 属 P7）。`visual.*` 不是独立任务类型：视觉断言在用例执行任务内执行（见 §7 与 `executor-protocol.md` v1.2），`search.*` 仍保留。其余保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
+P4 已把 5 个预留类型移入 §6 并实现；P5 把 `index.repo` 移入 §7 并实现（`code.analyze` 为 P5 新增类型，非预留）；P7 已把 `report.render_pdf` 移入 §8 并实现（PDF 属 P7），本节不再重复保留。`visual.*` 不是独立任务类型：视觉断言在用例执行任务内执行（见 §7 与 `executor-protocol.md` v1.2），`search.*` 仍保留。其余保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
 
 ## 5. P3 任务类型（实现；`frozen: P3`，2026-11-01）
 
@@ -96,7 +96,7 @@ P4 把 `issue.triage`、`report.wave`、`report.version`、`requirement.close`�
 | `version.close` | steward | `version_steward` | `ver-close:{version_id}:{report_revision_id}:{predicate_fingerprint}` | `{version_id,report_revision_id,predicate_fingerprint}` | version `completed` + `closed_at/close_reason/close_run_id` + 事件 | 事务复核失败 409；最终 dead 可见；不自动降级 |
 
 - **创建者**：reconciler 检测到 wave 终态且无 published wave report → 创建 report 行 + ensure `report.wave`；版本报告条件满足 → ensure `report.version`；issue 候选创建后 ensure `issue.triage`；需求闭环条件满足 → ensure `requirement.close`；版本 close 谓词满足 → ensure `version.close`；API `regenerate` 计算 `revision = max+1` 后 ensure 新任务。重复 ensure 返回既有行，不新增。
-- `report.render_pdf` 继续保留、**不注册**（P7）。
+- `report.render_pdf` 在 P4 保留、**不注册**；P7 已在 §8 实现（team=`ops`，`RenderWorker` 按类型领取），本节不再重复声明其为保留类型。
 - 任务租约/心跳/退避/`dead` 沿用 P1/P3；`requirement.close`/`version.close` 不写 `waiting_human`。
 - `version.close` 任务自身从版本 close 谓词的“无开放任务”中排除；`predicate_fingerprint = sha256(canonical(version_id, requirement 状态集合, report_revision_id, open_counts...))`，状态变化自然产生新 dedupe key。
 - `report.wave`/`report.version` 的 revision 在任务创建时确定；同一 next revision 的活跃任务存在时幂等返回 202；旧 revision 不删除。

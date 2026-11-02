@@ -496,17 +496,18 @@ func (f *fakeBindingResolver) Resolve(context.Context, int64) ([]execution.SUTBi
 }
 
 type fakeBrowserExecutor struct {
-	mu        sync.Mutex
-	contexts  int
-	actions   []string
-	lastArgs  json.RawMessage
-	contextID string
-	actionErr error
-	result    executionapp.BrowserActionResult
-	closed    int
-	canceled  int
-	lastSpec  executionapp.BrowserContextSpec
-	createErr error
+	mu             sync.Mutex
+	contexts       int
+	actions        []string
+	lastArgs       json.RawMessage
+	contextID      string
+	actionErr      error
+	result         executionapp.BrowserActionResult
+	closed         int
+	canceled       int
+	lastSpec       executionapp.BrowserContextSpec
+	lastExecutorID int64
+	createErr      error
 }
 
 func (f *fakeBrowserExecutor) CreateContext(_ context.Context, spec executionapp.BrowserContextSpec) (string, error) {
@@ -523,29 +524,30 @@ func (f *fakeBrowserExecutor) CreateContext(_ context.Context, spec executionapp
 	return "ctx_1", nil
 }
 
-func (f *fakeBrowserExecutor) Action(_ context.Context, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
+func (f *fakeBrowserExecutor) Action(_ context.Context, executorID int64, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastExecutorID = executorID
 	f.actions = append(f.actions, action)
 	f.lastArgs = args
 	return f.result, f.actionErr
 }
 
-func (f *fakeBrowserExecutor) Cancel(context.Context, string) error {
+func (f *fakeBrowserExecutor) Cancel(context.Context, int64, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.canceled++
 	return nil
 }
 
-func (f *fakeBrowserExecutor) Close(context.Context, string) error {
+func (f *fakeBrowserExecutor) Close(context.Context, int64, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed++
 	return nil
 }
 
-func (f *fakeBrowserExecutor) ListContexts(context.Context) ([]executionapp.BrowserContextRef, error) {
+func (f *fakeBrowserExecutor) ListContexts(context.Context, int64) ([]executionapp.BrowserContextRef, error) {
 	return nil, nil
 }
 

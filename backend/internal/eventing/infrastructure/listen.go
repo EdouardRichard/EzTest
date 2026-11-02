@@ -25,6 +25,9 @@ const (
 // connection, which is why the connection is not taken from the pool.
 type Listener struct {
 	pool       *pgxpool.Pool
+	events     eventingapp.EventReader
+	sink       eventingapp.LocalBroadcaster
+	observer   eventingapp.EventObserver
 	dispatcher *eventingapp.Dispatcher
 	logger     *slog.Logger
 	retry      time.Duration
@@ -54,6 +57,14 @@ func WithListenerRetry(delay time.Duration) ListenerOption {
 	}
 }
 
+// WithListenerObserver installs an observer invoked after each persisted event
+// is broadcast to this replica's local hub (for example, to reload settings).
+func WithListenerObserver(observer eventingapp.EventObserver) ListenerOption {
+	return func(l *Listener) {
+		l.observer = observer
+	}
+}
+
 // NewListener builds the cross-instance listener. events loads persisted events
 // (the PostgreSQL repository) and sink is the local hub.
 func NewListener(
@@ -63,15 +74,22 @@ func NewListener(
 	options ...ListenerOption,
 ) *Listener {
 	listener := &Listener{
-		pool:       pool,
-		dispatcher: eventingapp.NewDispatcher(events, sink),
-		logger:     slog.Default(),
-		retry:      defaultListenerRetry,
-		ready:      make(chan struct{}),
+		pool:   pool,
+		events: events,
+		sink:   sink,
+		logger: slog.Default(),
+		retry:  defaultListenerRetry,
+		ready:  make(chan struct{}),
 	}
 	for _, option := range options {
 		option(listener)
 	}
+	dispatcherOptions := []eventingapp.DispatcherOption{}
+	if listener.observer != nil {
+		dispatcherOptions = append(dispatcherOptions,
+			eventingapp.WithDispatcherObserver(listener.observer))
+	}
+	listener.dispatcher = eventingapp.NewDispatcher(events, sink, dispatcherOptions...)
 	return listener
 }
 

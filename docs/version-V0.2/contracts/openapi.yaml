@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
-  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3/P4/P5/P6/P7 冻结）
-  version: 0.2.0-p7
+  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3–P7 冻结 + P8 冻结）
+  version: 0.2.0-p8
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -13,14 +13,16 @@ info:
       没有响应体的成功操作返回 204（登出、改密、重置密码、各 DELETE）。
     - 错误统一为
       `{"error": {"code": "...", "message": "...", "request_id": "...", "retryable": false, "details": {}}}`；
-      HTTP 状态码使用 400/401/403/404/409/413/500/503。`X-Request-ID` 在响应头回显。
+      HTTP 状态码使用 400/401/403/404/409/413/429/500/503。`X-Request-ID` 在响应头回显。
+      设置 `security.rate_limit_per_minute > 0` 时，非 health/SSE 请求超过每实例限额返回
+      429 `rate_limited`，并带 `Retry-After`（秒）；限额为 0（默认）时关闭限流。
     - 所有业务实体 ID 在 JSON/URL 中都是十进制字符串（Go 内部 int64）。例外：
       `Event.seq` 与 `snapshot_cursor` 是**频道内事件游标**（整数），不是业务实体 ID；
       `content_object.sha256` 是 64 位小写 hex 内容主键；设置键 `system_setting.key` 是自然键。
     - 时间一律 RFC3339 UTC；未知请求字段默认忽略；写请求使用
       `Content-Type: application/json`（上传除外）。
     - 鉴权：`Authorization: Bearer <token>`。公开端点只有 `/healthz`、`/api/health`、
-      `/api/auth/login`。Token 为不透明随机串，固定 7 天 TTL，不刷新。
+      `/api/health/ready`、`/api/auth/login`。Token 为不透明随机串，固定 7 天 TTL，不刷新。
     - 权限：`admin` 组要求 `role=admin`；资源读为登录用户、写为 admin；**代码仓读/写均为登录用户**；
       版本读/写均为登录用户；`/api/events` 与 `/api/stream` 为登录用户。
 
@@ -52,7 +54,7 @@ info:
     ## P1 增量（frozen，2026-10-31）
 
     来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p1-runtime-clarification-design.md`
-    §3/§8/§9/§11/§12。P0 段落保留为历史；P1 增量保持冻结，当前文件级标记为 `x-frozen: P2`。
+    §3/§8/§9/§11/§12。P0 段落保留为历史；P1 增量保持冻结，当前文件级标记为 `x-frozen: P8`。
     P1 端点全部要求 Bearer 登录（单团队信任模型，无 admin 限制）；ID 仍为十进制字符串，
     时间 RFC3339 UTC，列表沿用 `{data,next_cursor,has_more}` 信封。
 
@@ -96,7 +98,7 @@ info:
     新增 design graph/overview/case detail/confirmation、版本级 case 导出创建/列表/元数据/鉴权下载。
     最新 design 对话始终为当前轮，不新增关闭 API；确认只允许 user/server；导出覆盖整个版本并支持
     Markdown/Mermaid/OPML/CSV，导出字节写入 P0 内容账本。
-    ### P3 增量（draft，2026-11-01）
+    ### P3 增量（frozen，2026-11-01）
 
     来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p3-execution-design.md` §9/§10/§11/§14。
     P0/P1/P2 paths/schemas 保持不变；P3 新增 22 个 path（执行概览/intents/waves/case-runs/evidence/
@@ -151,7 +153,18 @@ info:
     `GET /api/health/ready` 返回 `{"data": ReadinessView}`（200/503）；报告 PDF 下载的
     404/409 语义见 operation 说明。内部 executor 端点使用 `execution.executor_token` Bearer，
     不是用户登录 token。事件见 `contracts/events.md` §16；P7 不新增通用 `Idempotency-Key`。
-x-frozen: P7
+    ### P8 增量（frozen，2026-11-02）
+
+    来源：`docs/superpowers/specs/2026-11-02-eztest-v02-p8-hardening-acceptance-design.md` §6。
+    P0–P7 paths/operations/schemas 语义不变；P8 **不新增 path/operation/schema**，只追加可选响应字段与错误说明：
+    `InstanceView` 新增 `active_requests`/`active_work`（integer，默认 0）；`ReadinessView`
+    新增 `inflight_requests`/`inflight_work`（integer，默认 0）；错误码新增 `rate_limited`，
+    429 响应说明见通用约定与 `components/responses/TooManyRequests`（`Retry-After`）。
+    设置 `security.rate_limit_per_minute`（默认 0=关闭）为每实例每分钟请求上限，总速率=副本数×限额；
+    `/healthz`、`/api/health`、`/api/health/ready`、`/api/stream` 与静态资源跳过限流。
+    多执行器派发在 API 内部按执行器路由（见 `executor-protocol.md` §12.3），不改变本文件任何 action/path。
+    事件/任务/profile 计数不变（118/19/14）；不新增通用 `Idempotency-Key`。
+x-frozen: P8
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -2925,7 +2938,7 @@ paths:
           $ref: '#/components/responses/Internal'
 
   # -------------------------------------------------------------------------
-  # P3 execution increments (draft, 2026-11-01)
+  # P3 execution increments (frozen, 2026-11-01)
   # -------------------------------------------------------------------------
   /api/versions/{id}/execution/overview:
     get:
@@ -3565,7 +3578,7 @@ paths:
       tags: [Execution]
       operationId: listExecutors
       summary: 执行器实例列表（admin）
-      description: P3 只有一个 endpoint；返回注册/心跳投影，不含 token/token_hash。执行器不可达时 `executor_unavailable`（503）只影响派发，不影响本列表。
+      description: P7 起支持 push 注册/心跳与 `execution.executor_urls` 多端点；P8 起多端点均参与按执行器派发。返回注册/心跳投影，不含 token/token_hash。执行器不可达时 `executor_unavailable`（503）只影响派发，不影响本列表。
       responses:
         '200':
           description: 执行器列表
@@ -6320,7 +6333,7 @@ paths:
       summary: 平台就绪探针（公开）
       description: |
         DB ping + 共享存储写探针 + 本实例非 draining；全部通过 200，否则 503。
-        响应固定 `{"data":{status,database,storage,draining,instance_id}}`；
+        响应固定 `{"data":{status,database,storage,draining,instance_id,inflight_requests,inflight_work}}`；
         `database`/`storage` 失败值为 `down`，`status` 为 `degraded`。
       security: []
       responses:
@@ -7417,6 +7430,31 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
+    TooManyRequests:
+      description: 每实例请求超限（rate_limited；设置 security.rate_limit_per_minute>0 时生效；health/SSE 跳过）
+      headers:
+        Retry-After:
+          description: 建议重试等待秒数
+          schema:
+            type: integer
+            minimum: 1
+        X-RateLimit-Limit:
+          description: 当前每实例每分钟限额
+          schema:
+            type: integer
+            minimum: 0
+        X-RateLimit-Remaining:
+          description: 当前窗口剩余额度
+          schema:
+            type: integer
+            minimum: 0
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
     NotFound:
       description: 实体不存在（not_found）
       headers:
@@ -7478,7 +7516,7 @@ components:
           properties:
             code:
               type: string
-              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / provider_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / evidence_too_large / executor_unavailable / unavailable / internal
+              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / provider_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / evidence_too_large / executor_unavailable / rate_limited / unavailable / internal
             message:
               type: string
             request_id:
@@ -9808,7 +9846,7 @@ components:
           type: string
 
     # -----------------------------------------------------------------------
-    # P3 execution schemas (draft, 2026-11-01)
+    # P3 execution schemas (frozen, 2026-11-01)
     # -----------------------------------------------------------------------
     WaveSUTCounts:
       type: object
@@ -13697,7 +13735,7 @@ components:
                 $ref: '#/components/schemas/GCRunView'
     InstanceView:
       type: object
-      description: API 实例注册表（contracts/db-schema.md §16.4）
+      description: API 实例注册表（contracts/db-schema.md §16.4；P8 在飞计数见 §17.1）
       required: [id, instance_key, hostname, pid, api_port, node_id, status, version, started_at, heartbeat_at, created_at, updated_at]
       properties:
         id:
@@ -13724,6 +13762,16 @@ components:
           enum: [active, draining, offline, stopped]
         version:
           type: string
+        active_requests:
+          type: integer
+          minimum: 0
+          default: 0
+          description: P8 本实例当前在飞 HTTP 请求数（每轮 heartbeat 回写；health/SSE 不计）
+        active_work:
+          type: integer
+          minimum: 0
+          default: 0
+          description: P8 本实例当前在飞 agent/case run 数（每轮 heartbeat 回写；drain 等待归零后停进程）
         last_error:
           type: string
           nullable: true
@@ -13774,6 +13822,16 @@ components:
         instance_id:
           type: string
           description: 本实例 api_instance ID 的十进制字符串；未注册时为空串
+        inflight_requests:
+          type: integer
+          minimum: 0
+          default: 0
+          description: P8 本实例当前在飞 HTTP 请求数（与 InstanceView.active_requests 同源）
+        inflight_work:
+          type: integer
+          minimum: 0
+          default: 0
+          description: P8 本实例当前在飞 agent/case run 数（与 InstanceView.active_work 同源）
     ExecutorInstanceView:
       type: object
       description: 内部 register/heartbeat 的执行器实例视图（无 token hash/labels）

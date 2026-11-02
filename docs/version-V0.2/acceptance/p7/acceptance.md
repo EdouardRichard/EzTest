@@ -1,13 +1,13 @@
-# EzTest 0.2 P7 API/DB acceptance (Task 21)
+﻿# EzTest 0.2 P7 API/DB acceptance (Task 21)
 
-- Date: 2026-11-02 01:16:24 +08:00
+- Date: 2026-11-02 08:00:37 +08:00
 - Branch: feat/v0.2-p7 (no git commands were run)
 - Database: eztest_v02_p7 cloned from eztest_v02_p6
 - Content root: D:\Project_new\EzTest\.tmp\p7-acceptance\data
 - API A: http://127.0.0.1:13333 ; API B: http://127.0.0.1:13344
 - Renderer: http://127.0.0.1:13337 ; Executor: http://127.0.0.1:13345
 - Real LLM: .env DeepSeek configuration stored in the cloned settings center
-- Wall time: 170s (00:02:49)
+- Wall time: 124s (00:02:03)
 - Exit status: 0 (all scenarios PASS)
 
 ## Results
@@ -18,13 +18,13 @@
 | S1 | PASS | 7s | checks=13 failures=0 |
 | S3 | PASS | 20s | checks=12 failures=0 |
 | S4 | PASS | 7s | checks=12 failures=0 |
-| S5 | PASS | 5s | checks=11 failures=0 |
+| S5 | PASS | 7s | checks=11 failures=0 |
 | S6 | PASS | 0s | checks=15 failures=0 |
 | S7 | PASS | 1s | checks=25 failures=0 |
-| S2 | PASS | 31s | checks=10 failures=0 |
+| S2 | PASS | 26s | checks=10 failures=0 |
 | S8 | PASS | 7s | checks=4 failures=0 |
 | S9 | PASS | 2s | checks=12 failures=0 |
-| S10 | PASS | 5s | checks=10 failures=0 |
+| S10 | PASS | 6s | checks=10 failures=0 |
 | S11 | PASS | 5s | checks=14 failures=0 |
 | S12 | PASS | 27s | checks=12 failures=0 |
 
@@ -36,8 +36,8 @@ No product defects observed.
 
 ### S0 - PASS
 
-- PASS migrations=40 :: got 40
-- PASS settings=83 :: status=200 count=83
+- PASS migrations>=40 :: got 42
+- PASS settings>=83 :: status=200 count=85
 - PASS renderer health=200 :: browser=156.0.8078.73
 - PASS api ready=200 :: status=200 db=ok
 - PASS real LLM config reachable
@@ -52,7 +52,7 @@ No product defects observed.
 - PASS PDF download=200 :: status=200
 - PASS PDF magic=%PDF- :: magic=%PDF-
 - PASS PDF size :: bytes=211002
-- PASS PDF sha matches ledger :: sha=91e626b466a7cba4246d31fa829386114483cb121a871398fff8598e08353e5b
+- PASS PDF sha matches ledger :: sha=ee5097a581b713cac8cd834385571dd0ace3400e737f043d974817425e0524aa
 - PASS PDF size matches ledger :: ledger=211002
 - PASS as_of unchanged :: 2026-11-01 08:02:57.279301+08 -> 2026-11-01 08:02:57.279301+08
 - PASS html_ref unchanged :: 375072234701590529 -> 375072234701590529
@@ -79,15 +79,15 @@ No product defects observed.
 
 ### S4 - PASS
 
-- PASS knowledge draft created (version-sourced) :: status=201 id=375331879336812544
+- PASS knowledge draft created (version-sourced) :: status=201 id=375433618060746752
 - PASS draft carries source_version_id :: source=375072010541207552
 - PASS admin approve :: status=200
-- PASS context_packet carries [K-375331879336812544] :: run=375331880762875904
+- PASS context_packet carries [K-375433618060746752] :: run=375433619390341121
 - PASS context_packet has knowledge section
 - PASS knowledge_usage row for the run :: rows=1
 - PASS admin revoke :: status=200
 - PASS post-revoke clarification run produced a context packet
-- PASS revoked knowledge excluded from later run :: packet=375331890825011200
+- PASS revoked knowledge excluded from later run :: packet=375433629477642240
 - PASS no new knowledge_usage after revoke :: rows=0
 - PASS re-approve restores item :: status=200
 - PASS re-approved knowledge injected again
@@ -97,8 +97,8 @@ No product defects observed.
 
 - PASS create system/*orders* draft :: status=201
 - PASS create system/*payments* draft :: status=201
-- PASS V2 injects matching system knowledge :: orders=375331908629831680
-- PASS V2 excludes non-matching p4-payments item :: payments=375331908667580416
+- PASS V2 injects matching system knowledge :: orders=375433647248908288
+- PASS V2 excludes non-matching p4-payments item :: payments=375433647290851328
 - PASS V1 injects matching orders system knowledge
 - PASS V1 injects matching payments system knowledge
 - PASS full-text/tag search hits system item :: status=200
@@ -173,24 +173,24 @@ No product defects observed.
 ### S8 - PASS
 
 - PASS two active replicas with distinct node_id :: active=2 nodes=0,1
-- PASS instance keys are distinct :: DESKTOP-EHU22NB:18028 / DESKTOP-EHU22NB:36644
+- PASS instance keys are distinct :: DESKTOP-EHU22NB:22116 / DESKTOP-EHU22NB:31996
 - PASS replica B SSE received an event published via A :: event_id=124
 - PASS Last-Event-ID replay re-sends the event :: cursor=123 event=124
 
 
 ### S9 - PASS
 
-- PASS no duplicate runs while both replicas were up :: before=72|75|8|40 after=72|75|8|40
+- PASS no duplicate runs while both replicas were up :: before=72|75|8|42 after=72|75|8|42
 - PASS no duplicate work_item dedupe rows :: duplicates=0
-- PASS migrations re-applied once only :: count=40 expected=40
+- PASS migrations re-applied once only :: count=42 expected>=40
 - PASS two active instances before drain
-- PASS leader advisory lock held :: pids=7664
+- PASS leader advisory lock held :: pids=15516
 - PASS drain A accepted :: status=200 state=draining
 - PASS A readiness becomes 503 :: last=503
 - PASS B readiness stays 200
-- PASS leader lock moved to replica B :: before=7664 after=29976
+- PASS leader lock moved to replica B :: before=15516 after=15508
 - PASS B is ready after takeover
-- PASS no duplicate work_item/agent_run/case_run after takeover :: before=72|75|8|40 after=72|75|8|40
+- PASS no duplicate work_item/agent_run/case_run after takeover :: before=72|75|8|42 after=72|75|8|42
 - PASS no duplicate work_item dedupe rows after takeover :: duplicates=0
 
 
@@ -198,7 +198,7 @@ No product defects observed.
 
 - PASS executor registration visible (pull/push) :: status=active capacity=8
 - PASS executor push registration logged :: log=D:\Project_new\EzTest\.tmp\p7-acceptance\executor.log
-- PASS executor row id present :: id=375331757844598784
+- PASS executor row id present :: id=375433497759715328
 - PASS executor becomes offline after stop :: status=offline
 - PASS executor log retained
 - PASS running case_run interrupted(executor_lost)->pending :: row=2|executor_lost|executor_lost|null|null
@@ -215,7 +215,7 @@ No product defects observed.
 - PASS source issue merged into target via API :: status=200 into=990200
 - PASS merge chain B -> target reaches the merged target :: source_target_merged_into=990200
 - PASS first recurrence lands on merge target (count=1) :: target=990200 count=1
-- PASS last_recurred_at recorded :: 1|2026-11-02 01:15:53.1525+08
+- PASS last_recurred_at recorded :: 1|2026-11-02 08:00:05.975136+08
 - PASS recurrence ref role=recurrence on target :: rows=1
 - PASS merge source unchanged after first recurrence :: before=0|merged|375072108880855040|15 after=0|merged|375072108880855040|15
 - PASS issue.recurred event for target :: rows=1
@@ -234,7 +234,7 @@ No product defects observed.
 - PASS old report identity columns unchanged
 - PASS version report regenerate accepted :: status=202
 - PASS new version-report revision published :: revision=3
-- PASS new revision input_fingerprint reflects current state :: old=267f09e44ee1... new=b640de217d45...
+- PASS new revision input_fingerprint reflects current state :: old=267f09e44ee1... new=ad1d8cdcb269...
 - PASS new report HTML includes the merged target issue :: status=200 target=990200
 - PASS new report HTML includes the recurrent failed case_run :: case_run=990420
 - PASS old report HTML does not include post-merge state
@@ -272,15 +272,3 @@ No product defects observed.
 - S6/S7 GC candidates are inserted into the cloned database and the isolated content root; all timestamps are backdated deterministically.
 - S9 stops API A after draining it; API B is the surviving replica for S10-S12.
 - No product code, contract or other script was modified by this acceptance run.
-
-## Final verification run (s17, post-fix-wave)
-
-- Run timestamp: 2026-11-02 01:13:34 +08 start / 2026-11-02 01:16:24 +08 report
-- Command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\p7-acceptance.ps1` (defaults: `-ExpectedMigrations 40`; clone `eztest_v02_p6` -> `eztest_v02_p7`)
-- Exit code: 0 - `P7 ACCEPTANCE PASSED`
-- Scenarios: 13/13 PASS (S0, S1, S3, S4, S5, S6, S7, S2, S8, S9, S10, S11, S12); checks: 156 PASS / 0 FAIL
-- Wall time: 170 s (00:02:49) in script; 171 s including the driver wrapper
-- Product defects: none observed on this run; stale `bug-notes.txt` lines from older runs were not re-emitted (the current report says "No product defects observed")
-- Harness patches: none. `scripts/p7-acceptance.ps1` ran unmodified; no stale-assumption patch (including the PDF single-ref assumption) was required.
-- Fix-wave areas exercised green: automatic `report.render_pdf` + PDF ledger (S1/S2), GC dry-run/apply ledger (S6/S7), drain/instance roster (S9/S10), report revisions/refs (S1/S3/S12)
-- Evidence: `.tmp/p7-acceptance/final2/` (scenarios.txt, acceptance.log, console log, API/renderer/executor logs); live artifacts under `.tmp/p7-acceptance/`

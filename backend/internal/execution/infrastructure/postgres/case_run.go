@@ -293,7 +293,7 @@ func collectCaseRuns(rows pgx.Rows) ([]execution.CaseRun, error) {
 type SUTContextRepository struct{ base }
 
 const sutContextColumns = `id, case_run_id, version_sut_id, account_role, account_id,
-	browser_context_id, storage_state, lease_epoch, status, closed_at, created_at, updated_at`
+	browser_context_id, executor_id, storage_state, lease_epoch, status, closed_at, created_at, updated_at`
 
 // CreateSUTContext inserts one per-SUT executor context reservation.
 func (r *SUTContextRepository) CreateSUTContext(ctx context.Context, item execution.CaseRunSUTContext) error {
@@ -304,10 +304,10 @@ func (r *SUTContextRepository) CreateSUTContext(ctx context.Context, item execut
 	}
 	_, err = r.pool.Exec(ctx, `
 		INSERT INTO case_run_sut_context (id, case_run_id, version_sut_id, account_role,
-			account_id, browser_context_id, storage_state, lease_epoch, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, COALESCE($10, now()), COALESCE($11, now()))
+			account_id, browser_context_id, executor_id, storage_state, lease_epoch, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, COALESCE($11, now()), COALESCE($12, now()))
 	`, r.insertID(item.ID), item.CaseRunID, item.VersionSUTID, item.AccountRole,
-		item.AccountID, item.BrowserContextID, storageState, item.LeaseEpoch, string(item.Status),
+		item.AccountID, item.BrowserContextID, item.ExecutorID, storageState, item.LeaseEpoch, string(item.Status),
 		nullableTime(item.CreatedAt), nullableTime(item.UpdatedAt))
 	return wrapDB("insert case run sut context", err)
 }
@@ -357,10 +357,10 @@ func (r *SUTContextRepository) UpdateCAS(ctx context.Context, id int64, mutate f
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE case_run_sut_context SET account_role = $2, account_id = $3,
-			browser_context_id = $4, storage_state = $5::jsonb, lease_epoch = $6,
-			status = $7, closed_at = $8, updated_at = now()
+			browser_context_id = $4, executor_id = $5, storage_state = $6::jsonb, lease_epoch = $7,
+			status = $8, closed_at = $9, updated_at = now()
 		WHERE id = $1
-	`, item.ID, item.AccountRole, item.AccountID, item.BrowserContextID, storageState,
+	`, item.ID, item.AccountRole, item.AccountID, item.BrowserContextID, item.ExecutorID, storageState,
 		item.LeaseEpoch, string(item.Status), item.ClosedAt); err != nil {
 		return false, wrapDB("sut context CAS: update", err)
 	}
@@ -421,15 +421,16 @@ func (r *SUTContextRepository) ListAll(ctx context.Context) ([]execution.CaseRun
 func scanSUTContext(row rowScanner) (execution.CaseRunSUTContext, error) {
 	var item execution.CaseRunSUTContext
 	var storageStateRaw []byte
-	var accountID *int64
+	var accountID, executorID *int64
 	var status string
 	err := row.Scan(&item.ID, &item.CaseRunID, &item.VersionSUTID, &item.AccountRole,
-		&accountID, &item.BrowserContextID, &storageStateRaw, &item.LeaseEpoch, &status,
+		&accountID, &item.BrowserContextID, &executorID, &storageStateRaw, &item.LeaseEpoch, &status,
 		&item.ClosedAt, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return execution.CaseRunSUTContext{}, err
 	}
 	item.AccountID = accountID
+	item.ExecutorID = executorID
 	item.Status = execution.SUTContextStatus(status)
 	if len(storageStateRaw) > 0 {
 		var state map[string]any

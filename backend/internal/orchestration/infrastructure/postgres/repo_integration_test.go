@@ -390,9 +390,16 @@ func TestDrainActivateAndReadinessPersistThroughRepository(t *testing.T) {
 
 	// The heartbeat keeps working while draining and reports the persisted
 	// status so the process can mirror a remote drain.
-	status, updated, err := repo.Heartbeat(ctx, instance.ID, time.Now())
+	status, updated, err := repo.Heartbeat(ctx, instance.ID, time.Now(), 5, 4)
 	if err != nil || !updated || status != domain.StatusDraining {
 		t.Fatalf("draining heartbeat = %q/%v/%v", status, updated, err)
+	}
+	loaded, err = repo.Get(ctx, instance.ID)
+	if err != nil {
+		t.Fatalf("Get after heartbeat: %v", err)
+	}
+	if loaded.ActiveRequests != 5 || loaded.ActiveWork != 4 {
+		t.Fatalf("persisted inflight = %d/%d, want 5/4", loaded.ActiveRequests, loaded.ActiveWork)
 	}
 	if readiness := service.Readiness(ctx); !readiness.Draining {
 		t.Fatalf("readiness after drain = %+v", readiness)

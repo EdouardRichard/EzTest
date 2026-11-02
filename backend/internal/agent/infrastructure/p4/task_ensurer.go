@@ -29,6 +29,13 @@ const (
 	teamSteward  = "steward"
 )
 
+// requirementCloseMaxAttempts keeps the Steward's requirement.close task alive
+// while sibling work (design.gap/analyze.failure/issue.triage) drains. A close
+// attempt rejected with no_open_work is transient; with the default 3 attempts
+// the task can die before those siblings finish and no newer close task is
+// ensured for the same close round.
+const requirementCloseMaxAttempts = 10
+
 // Queue ensures an idempotent work item (agentapp.WorkQueue satisfies it).
 type Queue interface {
 	Ensure(ctx context.Context, in agent.NewWorkItem) (agent.WorkItem, bool, error)
@@ -142,10 +149,11 @@ func (e *TaskEnsurer) EnsureRequirementClose(ctx context.Context, requirementID,
 		return err
 	}
 	_, _, err = e.ensure(ctx, agent.NewWorkItem{
-		VersionID: versionID,
-		Team:      teamSteward,
-		Type:      taskRequirementClose,
-		DedupeKey: "req-close:" + idText(requirementID) + ":" + idText(requirementVersionID) + ":" + idText(int64(closeRound)),
+		VersionID:   versionID,
+		Team:        teamSteward,
+		Type:        taskRequirementClose,
+		MaxAttempts: requirementCloseMaxAttempts,
+		DedupeKey:   "req-close:" + idText(requirementID) + ":" + idText(requirementVersionID) + ":" + idText(int64(closeRound)),
 		Payload: map[string]any{
 			"requirement_id":         idText(requirementID),
 			"requirement_version_id": idText(requirementVersionID),

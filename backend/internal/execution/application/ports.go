@@ -168,17 +168,18 @@ type ExecutorRegistry interface {
 }
 
 // ExecutorContext is one executor-side browser context as listed by the
-// executor client.
+// executor client. ExecutorID identifies which endpoint returned it.
 type ExecutorContext struct {
-	ID  string
-	Key string
+	ExecutorID int64
+	ID         string
+	Key        string
 }
 
 // ExecutorControl is the executor control port used by pause/cancel/context
-// cleanup. Endpoint/token are bound by the adapter.
+// cleanup. executorID selects the owning endpoint (0 = primary fallback).
 type ExecutorControl interface {
-	CancelContext(ctx context.Context, contextID string) error
-	DeleteContext(ctx context.Context, contextID string) error
+	CancelContext(ctx context.Context, executorID int64, contextID string) error
+	DeleteContext(ctx context.Context, executorID int64, contextID string) error
 	ListContexts(ctx context.Context) ([]ExecutorContext, error)
 }
 

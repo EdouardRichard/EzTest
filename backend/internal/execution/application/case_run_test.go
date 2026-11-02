@@ -469,6 +469,12 @@ func TestEvidenceImmutableAndMaxBytes(t *testing.T) {
 func TestBrowserToolCreatesContextLazilyAndStoresEvidence(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
+	owner := int64(7)
+	fixture.caseRuns.mu.Lock()
+	caseRow := fixture.caseRuns.rows[3001]
+	caseRow.OwnerExecutorID = &owner
+	fixture.caseRuns.rows[3001] = caseRow
+	fixture.caseRuns.mu.Unlock()
 
 	// goto: creates one context for (7, admin) and runs the action.
 	if _, err := fixture.runner.Browser(context.Background(), p3Scope(), "goto",
@@ -481,12 +487,18 @@ func TestBrowserToolCreatesContextLazilyAndStoresEvidence(t *testing.T) {
 	if fixture.browser.lastSpec.BaseURL != "http://127.0.0.1:13335" {
 		t.Fatalf("context spec = %+v", fixture.browser.lastSpec)
 	}
+	if fixture.browser.lastSpec.ExecutorID != 7 {
+		t.Fatalf("context spec executor = %d, want 7", fixture.browser.lastSpec.ExecutorID)
+	}
 	row, ok := fixture.sutContext.row(7, "admin")
 	if !ok || row.Status != execution.SUTContextActive || row.BrowserContextID != "ctx_1" {
 		t.Fatalf("sut context = %+v", row)
 	}
-	if fixture.browser.actions[0] != "goto" {
-		t.Fatalf("actions = %v", fixture.browser.actions)
+	if row.ExecutorID == nil || *row.ExecutorID != 7 {
+		t.Fatalf("sut context executor = %v, want 7", row.ExecutorID)
+	}
+	if fixture.browser.actions[0] != "goto" || fixture.browser.lastExecutorID != 7 {
+		t.Fatalf("actions = %v executor = %d", fixture.browser.actions, fixture.browser.lastExecutorID)
 	}
 
 	// A second action reuses the same context.

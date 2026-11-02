@@ -18,7 +18,7 @@ import (
 
 const instanceColumns = `id, instance_key, hostname, pid, api_port, node_id, status,
 	version, last_error, started_at, heartbeat_at, draining_at, stopped_at,
-	created_at, updated_at`
+	created_at, updated_at, active_requests, active_work`
 
 // PostgreSQL unique-constraint names from orchestration_0001_instance.sql.
 const (
@@ -185,17 +185,17 @@ func (r *Repository) List(ctx context.Context) ([]domain.Instance, error) {
 // Heartbeat refreshes heartbeat_at for an active/draining instance and reports
 // the persisted status. updated=false means the row is offline/stopped (or
 // gone), which the caller logs as a lost registration.
-func (r *Repository) Heartbeat(ctx context.Context, id int64, at time.Time) (domain.Status, bool, error) {
+func (r *Repository) Heartbeat(ctx context.Context, id int64, at time.Time, activeRequests, activeWork int) (domain.Status, bool, error) {
 	if r == nil || r.pool == nil {
 		return "", false, errors.New("orchestration repository is not configured")
 	}
 	var status string
 	err := r.pool.QueryRow(ctx, `
 		UPDATE api_instance
-		SET heartbeat_at = $2, updated_at = $2
+		SET heartbeat_at = $2, updated_at = $2, active_requests = $3, active_work = $4
 		WHERE id = $1 AND status IN ('active', 'draining')
 		RETURNING status
-	`, id, at).Scan(&status)
+	`, id, at, activeRequests, activeWork).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
@@ -321,7 +321,7 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 		&instance.APIPort, &instance.NodeID, &status, &instance.Version,
 		&instance.LastError, &instance.StartedAt, &instance.HeartbeatAt,
 		&instance.DrainingAt, &instance.StoppedAt, &instance.CreatedAt,
-		&instance.UpdatedAt,
+		&instance.UpdatedAt, &instance.ActiveRequests, &instance.ActiveWork,
 	); err != nil {
 		return domain.Instance{}, err
 	}

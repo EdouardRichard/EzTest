@@ -152,3 +152,18 @@ func TestClientRenderPDFRejectsInvalidInput(t *testing.T) {
 		t.Fatalf("invalid URL error = %v, want ErrRenderRejected", err)
 	}
 }
+
+func TestMaxPDFBytesMatchesContentLedger(t *testing.T) {
+	if renderclient.MaxPDFBytes != 10<<20 {
+		t.Fatalf("MaxPDFBytes = %d, want 10 MiB (content ledger cap)", renderclient.MaxPDFBytes)
+	}
+}
+
+func TestPDFOverLimitIsRejected(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), renderclient.MaxPDFBytes+1)
+	server, _, _ := newPDFServer(t, http.StatusOK, body, "application/pdf")
+	client := renderclient.New(server.URL, "token", 30*time.Second)
+	if _, err := client.RenderPDF(context.Background(), []byte("<html></html>")); !errors.Is(err, deliveryapp.ErrRenderRejected) {
+		t.Fatalf("RenderPDF error = %v, want ErrRenderRejected", err)
+	}
+}

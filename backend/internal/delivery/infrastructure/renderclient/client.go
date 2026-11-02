@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	// MaxPDFBytes is the hard cap of one rendered PDF (spec plan Task 8).
-	MaxPDFBytes = 20 << 20
+	// MaxPDFBytes is the hard cap of one rendered PDF. It matches the content
+	// ledger's MaxUploadBytes (storage/application/service.go) so a PDF that the
+	// ledger would reject can never be produced (P8 alignment).
+	MaxPDFBytes = 10 << 20
 	// DefaultTimeout is used when the configured timeout is not positive.
 	DefaultTimeout = 60 * time.Second
 	// maxErrorBody bounds the renderer error response read into the message.

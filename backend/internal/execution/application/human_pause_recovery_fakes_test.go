@@ -315,14 +315,14 @@ type fakeExecutorControl struct {
 	live    []ExecutorContext
 }
 
-func (c *fakeExecutorControl) CancelContext(_ context.Context, contextID string) error {
+func (c *fakeExecutorControl) CancelContext(_ context.Context, _ int64, contextID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cancels = append(c.cancels, contextID)
 	return nil
 }
 
-func (c *fakeExecutorControl) DeleteContext(_ context.Context, contextID string) error {
+func (c *fakeExecutorControl) DeleteContext(_ context.Context, _ int64, contextID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleted = append(c.deleted, contextID)

@@ -39,8 +39,10 @@ type fakeRepo struct {
 	status    orchestration.Status
 	statusErr error
 
-	heartbeatFn    func(id int64, at time.Time) (orchestration.Status, bool, error)
-	heartbeatCalls int
+	heartbeatFn       func(id int64, at time.Time) (orchestration.Status, bool, error)
+	heartbeatCalls    int
+	heartbeatRequests int
+	heartbeatWork     int
 
 	setStatusFn    func(id int64, from, to orchestration.Status, at time.Time) (orchestration.Instance, bool, error)
 	setStatusCalls []statusCall
@@ -93,8 +95,10 @@ func (f *fakeRepo) List(context.Context) ([]orchestration.Instance, error) {
 	return f.list, nil
 }
 
-func (f *fakeRepo) Heartbeat(_ context.Context, _ int64, _ time.Time) (orchestration.Status, bool, error) {
+func (f *fakeRepo) Heartbeat(_ context.Context, _ int64, _ time.Time, activeRequests, activeWork int) (orchestration.Status, bool, error) {
 	f.heartbeatCalls++
+	f.heartbeatRequests = activeRequests
+	f.heartbeatWork = activeWork
 	if f.heartbeatFn != nil {
 		return f.heartbeatFn(0, time.Time{})
 	}
@@ -796,5 +800,33 @@ func TestListDelegates(t *testing.T) {
 	}
 	if len(instances) != 1 || instances[0].ID != 1 {
 		t.Fatalf("instances = %#v", instances)
+	}
+}
+
+type fakeLoad struct {
+	requests int
+	work     int
+}
+
+func (f *fakeLoad) InflightRequests() int { return f.requests }
+func (f *fakeLoad) InflightWork() int     { return f.work }
+
+func TestHeartbeatReportsLoadMetrics(t *testing.T) {
+	h := newHarness()
+	h.start(t)
+	h.service.SetLoadTracker(&fakeLoad{requests: 3, work: 2})
+
+	h.service.heartbeatOnce(context.Background())
+	if h.repo.heartbeatRequests != 3 || h.repo.heartbeatWork != 2 {
+		t.Fatalf("heartbeat counters = %d/%d, want 3/2", h.repo.heartbeatRequests, h.repo.heartbeatWork)
+	}
+}
+
+func TestReadinessCarriesInflightCounts(t *testing.T) {
+	h := newHarness()
+	h.service.SetLoadTracker(&fakeLoad{requests: 4, work: 1})
+	readiness := h.service.Readiness(context.Background())
+	if readiness.InflightRequests != 4 || readiness.InflightWork != 1 {
+		t.Fatalf("readiness counters = %d/%d, want 4/1", readiness.InflightRequests, readiness.InflightWork)
 	}
 }

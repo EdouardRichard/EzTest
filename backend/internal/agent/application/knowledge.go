@@ -31,10 +31,46 @@ type KnowledgeRef struct {
 // KnowledgeReader retrieves the approved knowledge visible to a version. The
 // adapter owns the settings-driven item/token budget, the source_stale filter
 // and the ts_rank ordering; systemKeys is an optional caller override (nil or
-// empty lets the adapter derive the version's SUT families). The second return
-// value is the sum of the injected token estimates.
+// empty lets the adapter derive the version's SUT families). query is the
+// version/requirement title text used for full-text ranking (empty keeps the
+// repository's id ordering). The second return value is the sum of the injected
+// token estimates.
 type KnowledgeReader interface {
-	RetrieveForVersion(ctx context.Context, versionID int64, systemKeys []string) ([]KnowledgeRef, int, error)
+	RetrieveForVersion(ctx context.Context, versionID int64, systemKeys []string, query string) ([]KnowledgeRef, int, error)
+}
+
+// KnowledgeQueryMaxChars bounds the derived FTS query. The repository uses
+// websearch_to_tsquery, which tolerates punctuation; the cap only prevents a
+// huge version/requirement title set from bloating every prompt request.
+const KnowledgeQueryMaxChars = 512
+
+// KnowledgeQuery builds the full-text query for one run from the version title
+// and the requirement titles in the context pack. Duplicates are removed and
+// whitespace is normalized; an empty pack yields "".
+func KnowledgeQuery(pack VersionPack) string {
+	parts := make([]string, 0, len(pack.Requirements)+1)
+	seen := map[string]struct{}{}
+	add := func(value string) {
+		value = strings.Join(strings.Fields(value), " ")
+		if value == "" {
+			return
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return
+		}
+		seen[value] = struct{}{}
+		parts = append(parts, value)
+	}
+	add(pack.Title)
+	for _, requirement := range pack.Requirements {
+		add(requirement)
+	}
+	query := strings.Join(parts, " ")
+	runes := []rune(query)
+	if len(runes) > KnowledgeQueryMaxChars {
+		query = strings.TrimSpace(string(runes[:KnowledgeQueryMaxChars]))
+	}
+	return query
 }
 
 // KnowledgeUsageRecorder appends one knowledge_usage row per injected item. The
@@ -111,13 +147,14 @@ func knowledgeRefsResult(refs []KnowledgeRef) []map[string]any {
 // knowledgeForVersion loads the injected knowledge for one run. Injection is
 // supplemental context: a retrieval failure is logged and the run continues
 // without knowledge instead of blocking the task.
-func (r *Runner) knowledgeForVersion(ctx context.Context, versionID int64) []KnowledgeRef {
+func (r *Runner) knowledgeForVersion(ctx context.Context, pack VersionPack) []KnowledgeRef {
 	if r.knowledge == nil {
 		return nil
 	}
-	refs, _, err := r.knowledge.RetrieveForVersion(ctx, versionID, nil)
+	query := KnowledgeQuery(pack)
+	refs, _, err := r.knowledge.RetrieveForVersion(ctx, pack.VersionID, nil, query)
 	if err != nil {
-		r.logKnowledgeFailure(ctx, "knowledge retrieval failed", versionID, err)
+		r.logKnowledgeFailure(ctx, "knowledge retrieval failed", pack.VersionID, err)
 		return nil
 	}
 	return refs

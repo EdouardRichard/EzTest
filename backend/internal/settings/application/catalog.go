@@ -58,6 +58,8 @@ func Definitions(executorURL string) []settings.Definition {
 	minConcurrentAnalyses, maxConcurrentAnalyses := numberRange(1, 4)
 	minVisualThreshold, maxVisualThreshold := numberRange(0, 0.1)
 	minBaselineBytes, maxBaselineBytes := numberRange(65536, 20971520)
+	minRateLimit, maxRateLimit := numberRange(0, 60000)
+	minEventDays, maxEventDays := numberRange(1, 3650)
 	minViewport, maxViewport := numberRange(1, 10000)
 	minDPR, maxDPR := numberRange(0.5, 4)
 	minCompareTimeout, maxCompareTimeout := numberRange(5, 300)
@@ -136,6 +138,7 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "retention.gc_dry_run", Category: "retention", Type: settings.TypeBool, Default: boolean(true), Description: "Run GC in dry-run mode by default."},
 		{Key: "retention.gc_interval_minutes", Category: "retention", Type: settings.TypeNumber, Default: num(1440), Integer: true, Min: minGCInterval, Max: maxGCInterval, Description: "Interval between leader-scheduled GC runs in minutes."},
 		{Key: "retention.gc_batch_size", Category: "retention", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minGCBatch, Max: maxGCBatch, Description: "Maximum candidate rows scanned by one GC pass."},
+		{Key: "retention.event_days", Category: "retention", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: minEventDays, Max: maxEventDays, Description: "Event-log retention in days; the leader-gated cleanup deletes older rows in batches."},
 
 		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("2"), Description: "Built-in report template version (\"1\" or \"2\")."},
 		{Key: "report.render_pdf", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Render PDF alongside the authoritative HTML report."},
@@ -160,6 +163,7 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "knowledge.review_required", Category: "knowledge", Type: settings.TypeBool, Default: boolean(true), Description: "Require admin review before knowledge is approved."},
 
 		{Key: "security.audit_retention_days", Category: "security", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: number(1, 0), Description: "Audit log retention in days."},
+		{Key: "security.rate_limit_per_minute", Category: "security", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: minRateLimit, Max: maxRateLimit, Description: "Per-instance API request limit per minute; 0 disables limiting. Total rate is replicas x limit."},
 		{Key: "security.mask_secrets", Category: "security", Type: settings.TypeBool, Default: boolean(true), Description: "Mask secrets in admin responses (must stay on in 0.2)."},
 
 		{Key: "feature.auto_gap_design", Category: "feature", Type: settings.TypeBool, Default: boolean(true), Description: "Allow automatic design proposals for coverage gaps."},

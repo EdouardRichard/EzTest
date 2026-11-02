@@ -457,6 +457,8 @@
 | chain (P4) | 无迁移、无表 | 只读读模型：请求级聚合 version/design/execution/delivery/resource 的 application 端口，不建 chain 表 |
 | db/migrate | 迁移执行器 | `schema_migrations` |
 
+业务表合计 **85**（按迁移 `CREATE TABLE` 计数，不含 `schema_migrations`；P7 后 85，P8 不新增表）。
+
 ## 6. 迁移幂等与数据不变量（摘要）
 
 - 重复执行迁移不产生变化（`schema_migrations` 已有记录且 checksum 一致 → 跳过）。
@@ -1689,4 +1691,37 @@
 9. **报告 revision 不可变**：§16.3 列出的内容字段在发布后不可变；P7 的 PDF 元数据更新必须使用 fencing（`pdf_ref` 为空且 `pdf_status IN ('pending','failed','running')`）。
 10. 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；JSONB 对象列显式 `jsonb_typeof='object'`；跨上下文不建 FK。
 11. **work_item team 7 值**：`clarification/design/execution/delivery/steward/code/ops`；`ops` 只承载确定性 worker 任务（P7 `report.render_pdf`），不建 team room；agent worker 只领取 5 个产品团队，`RenderWorker` 按 type 领取。
+
+## 17. P8 增量表结构（frozen: P8，2026-11-02）
+
+> 来源：`docs/superpowers/specs/2026-11-02-eztest-v02-p8-hardening-acceptance-design.md` §5。
+> 迁移：#41 `orchestration_0002_instance_inflight.sql`、#42 `execution_0005_case_run_sut_context_executor.sql`（`order.txt` 第 41–42 个）。P8 **不新增表**（业务表合计仍 **85**），只对既有表追加两处列；P0–P7 表/迁移/checksum 不变。
+
+### 17.1 `orchestration_0002_instance_inflight.sql`（#41，orchestration 上下文，ALTER 1 表）
+
+**`api_instance` 新增列**：
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `active_requests` | INTEGER | NOT NULL DEFAULT 0，`ck_api_instance_active_requests` CHECK `active_requests >= 0`（本实例在飞 HTTP 请求数；P8 heartbeat 回写） |
+| `active_work` | INTEGER | NOT NULL DEFAULT 0，`ck_api_instance_active_work` CHECK `active_work >= 0`（本实例在飞 agent/case run 数；P8 heartbeat 回写） |
+
+- 语义：进程内原子计数（H2 `platform/load.Counter`），**不跨上下文读表、不新增 DB 查询**；`Service.runHeartbeat` 每轮随心跳写回；`InstanceView` 暴露 `active_requests`/`active_work`，readiness 暴露 `inflight_requests`/`inflight_work`。`draining` 时 readiness 仍 503，滚动升级等待两计数归零后再停进程；不改变 drain“停止新认领”语义。只追加列，已有行默认 0。
+
+### 17.2 `execution_0005_case_run_sut_context_executor.sql`（#42，execution 上下文，ALTER 1 表）
+
+**`case_run_sut_context` 新增列**：
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `executor_id` | BIGINT | NULL，`ck_case_run_sut_context_executor` CHECK `executor_id IS NULL OR executor_id > 0`（逻辑引用 `executor_instance.id`，**不建 FK**） |
+
+- 语义：per-executor 派发落地后，创建 browser context 时写入真实 `owner_executor_id`；历史行为 NULL。跨上下文只做逻辑引用（§4.1）；API 按该列路由 `Action`/`Cancel`/`Close`。线协议仍 v1.2，不新增 action。
+
+### 17.3 P8 数据不变量
+
+1. **只追加**：#41/#42 不改 #1–#40 的文件与 checksum；P8 不新增表（业务表合计 **85**）、不新增索引、不改既有列语义。
+2. **实例计数**：`active_requests`/`active_work` 非负；只由本实例写自己的行，不跨实例写；缺省/未实现时按 0 处理，不阻断 readiness。
+3. **执行器归属**：`executor_id` 可空、>0；不建 FK 与级联；同一 case_run/context 的执行器在恢复时可由 `owner_executor_id` 重新解析；不跨执行器迁移 context。
+4. 命名/结构沿用 §16.8：字段 snake_case、时间 RFC3339 UTC、跨上下文不建 FK。
 

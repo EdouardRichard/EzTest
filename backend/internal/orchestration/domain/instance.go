@@ -40,13 +40,18 @@ type Instance struct {
 	NodeID      int
 	Status      Status
 	Version     string
-	LastError   *string
-	StartedAt   time.Time
-	HeartbeatAt time.Time
-	DrainingAt  *time.Time
-	StoppedAt   *time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// ActiveRequests/ActiveWork are the in-flight counters reported by the
+	// replica's heartbeat (P8 drain observability). They never affect
+	// scheduling; they tell an operator when a draining replica is idle.
+	ActiveRequests int
+	ActiveWork     int
+	LastError      *string
+	StartedAt      time.Time
+	HeartbeatAt    time.Time
+	DrainingAt     *time.Time
+	StoppedAt      *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Reclaimable reports whether the instance's node ID may be reallocated to a

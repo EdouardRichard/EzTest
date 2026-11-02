@@ -184,12 +184,16 @@ type CaseRunSUTContext struct {
 	AccountRole      string
 	AccountID        *int64
 	BrowserContextID string
-	StorageState     map[string]any
-	LeaseEpoch       int64
-	Status           SUTContextStatus
-	ClosedAt         *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// ExecutorID is the executor_instance that owns BrowserContextID (P8
+	// per-executor routing). Nil for historical rows created before P8; those
+	// fall back to the primary executor endpoint.
+	ExecutorID   *int64
+	StorageState map[string]any
+	LeaseEpoch   int64
+	Status       SUTContextStatus
+	ClosedAt     *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // Valid reports whether status is a persisted SUT context status.
