@@ -293,12 +293,20 @@ func Profiles() []agent.AgentProfile {
 
 // EnsureProfiles idempotently seeds the P1, P2, P3 and P4 profiles plus the P5
 // and P7 allowed_tools increments. Existing rows (including administrator
-// edits) are returned unchanged by the repository.
+// edits) are returned unchanged by the repository. The assembled seeds are
+// validated against the seven-role tool whitelist before the first write.
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
 	seeds := Profiles()
 	for i := range seeds {
 		seeds[i] = applyP5ProfileTools(seeds[i])
 		seeds[i] = applyP7ProfileTools(seeds[i])
+	}
+	// The seven-role catalog is the outer permission boundary: a seed profile
+	// that executes a catalog role must stay inside that role's tool whitelist.
+	// Fail closed before writing so a profile/tool edit cannot silently widen a
+	// role (0.2.1 review focus 5).
+	if err := ValidateRoleProfiles(seeds); err != nil {
+		return nil, err
 	}
 	stored := make([]agent.AgentProfile, 0, len(seeds))
 	for _, seed := range seeds {
