@@ -78,12 +78,11 @@ func TestSizeLimit(t *testing.T) {
 
 func TestExtractOfficeFormats(t *testing.T) {
 	cases := []struct {
-		name    string
-		file    string
-		mime    string
-		data    []byte
-		wants   []string
-		ordered []string
+		name string
+		file string
+		mime string
+		data []byte
+		want string
 	}{
 		{
 			name: "docx",
@@ -93,29 +92,28 @@ func TestExtractOfficeFormats(t *testing.T) {
 				[]string{"Attachment matrix paragraph"},
 				[][]string{{"Cell A", "Cell B"}},
 			),
-			wants: []string{"Attachment matrix paragraph", "Cell A", "Cell B"},
+			want: "Attachment matrix paragraph\nCell A\nCell B",
 		},
 		{
-			name:  "pptx",
-			file:  "slides.pptx",
-			mime:  "application/octet-stream",
-			data:  pptxFixture([]string{"First slide", "Second slide"}),
-			wants: []string{"First slide", "Second slide"},
+			name: "pptx",
+			file: "slides.pptx",
+			mime: "application/octet-stream",
+			data: pptxFixture([]string{"First slide", "Second slide"}),
+			want: "First slide\nSecond slide",
 		},
 		{
-			name:    "xlsx",
-			file:    "matrix.xlsx",
-			mime:    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			data:    xlsxFixture(),
-			wants:   []string{"Requirement", "Expected", "Login works", "inline value", "42", "Expected result"},
-			ordered: []string{"Requirement", "Login works", "42"},
+			name: "xlsx",
+			file: "matrix.xlsx",
+			mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			data: xlsxFixture(),
+			want: "Requirement\tExpected\nLogin works\tinline value\nTRUE\t2\tFALSE\n42\tExpected result",
 		},
 		{
-			name:  "xlsx by MIME",
-			file:  "spreadsheet",
-			mime:  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			data:  xlsxFixture(),
-			wants: []string{"Requirement", "42"},
+			name: "xlsx by MIME",
+			file: "spreadsheet",
+			mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			data: xlsxFixture(),
+			want: "Requirement\tExpected\nLogin works\tinline value\nTRUE\t2\tFALSE\n42\tExpected result",
 		},
 	}
 	for _, tc := range cases {
@@ -124,21 +122,15 @@ func TestExtractOfficeFormats(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", tc.name, err)
 			}
-			if strings.TrimSpace(text) == "" {
-				t.Fatalf("%s extraction is empty", tc.name)
+			// Exact output catches a whole document being appended once per
+			// text run; the markup check reports leaked XML explicitly.
+			if got := strings.TrimSpace(text); got != tc.want {
+				t.Fatalf("%s extraction = %q, want %q", tc.name, got, tc.want)
 			}
-			for _, want := range tc.wants {
-				if !strings.Contains(text, want) {
-					t.Fatalf("%s extraction missing %q: %q", tc.name, want, text)
+			for _, markup := range []string{"<w:", "<a:", "<?xml"} {
+				if strings.Contains(text, markup) {
+					t.Fatalf("%s extraction leaked %q: %q", tc.name, markup, text)
 				}
-			}
-			previous := -1
-			for _, want := range tc.ordered {
-				position := strings.Index(text, want)
-				if position <= previous {
-					t.Fatalf("%s extraction order wrong at %q: %q", tc.name, want, text)
-				}
-				previous = position
 			}
 		})
 	}
@@ -165,6 +157,7 @@ func TestLegacyFormatsRejected(t *testing.T) {
 
 func TestExtractHTML(t *testing.T) {
 	document := []byte("\ufeff<!doctype html><html><body><h1>标题</h1><p>body text</p></body></html>")
+	const want = "<!doctype html><html><body><h1>标题</h1><p>body text</p></body></html>"
 	for _, tc := range []struct{ name, mime string }{
 		{"page.html", "text/html"},
 		{"page.htm", "text/html"},
@@ -174,8 +167,8 @@ func TestExtractHTML(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		if !strings.Contains(text, "标题") || !strings.Contains(text, "body text") {
-			t.Fatalf("%s = %q", tc.name, text)
+		if text != want {
+			t.Fatalf("%s = %q, want %q", tc.name, text, want)
 		}
 	}
 }
@@ -286,9 +279,9 @@ func TestExtractRejectsLegacyAndImageFormats(t *testing.T) {
 }
 
 // xlsxFixture builds a minimal spreadsheet with two worksheets: shared strings
-// (including a rich-text run) on the first sheet, and an inline string plus a
-// numeric cell on the second. Worksheet files are not zero padded, and the
-// sheet order is what the extractor must preserve.
+// (including a rich-text run), an inline string, numeric, boolean and formula
+// cells on the first sheet, and a numeric cell on the second. Worksheet files
+// are not zero padded, and the sheet order is what the extractor must preserve.
 func xlsxFixture() []byte {
 	const sharedStrings = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="4" uniqueCount="4">
@@ -301,6 +294,7 @@ func xlsxFixture() []byte {
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
 <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
 <row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2" t="inlineStr"><is><t>inline value</t></is></c></row>
+<row r="3"><c r="A3" t="b"><v>1</v></c><c r="B3"><f>1+1</f><v>2</v></c><c r="C3" t="b"><v>0</v></c></row>
 </sheetData></worksheet>`
 	const sheet2 = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>

@@ -330,7 +330,7 @@ func extractXMLText(raw []byte) (string, error) {
 			}
 		case xml.CharData:
 			if inText {
-				builder.Write(raw)
+				builder.Write(element)
 			}
 		case xml.EndElement:
 			switch element.Name.Local {

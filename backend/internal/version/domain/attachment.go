@@ -200,8 +200,9 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 
 // IsLegacyOfficeFormat reports whether name is a pre-OOXML Word (.doc) or
 // PowerPoint (.ppt) file. They are rejected instead of parsed so the user is
-// told to save as .docx/.pptx; .xls is not part of the supported matrix either
-// but has no OOXML save-as sibling here.
+// told to save as .docx/.pptx. .xls is outside the supported matrix too, but
+// the spec only requires the .doc/.ppt save-as hint, so .xls keeps the generic
+// unsupported-format error.
 func IsLegacyOfficeFormat(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	return strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".ppt")
