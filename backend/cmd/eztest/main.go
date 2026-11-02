@@ -81,23 +81,33 @@ func hostName() string {
 	return name
 }
 
-// runReconciler runs one leader-gated startup scan and then the event-driven
-// wake loop (spec §5.7: a 250–500ms debounce replaces the old 3s poll). Every
-// persisted event is a hint that control-plane state may need repair; the
-// reconciler coalesces bursts into one pass. The leader gate is evaluated per
-// pass, so a leadership change takes effect without restarting the loop. The
+// leaderAcquisitionAware is implemented by leader gates that can report every
+// acquisition of the advisory lock (*orchestrationpg.Leader). runReconciler
+// registers a wake on it so a failover reconciles immediately instead of
+// waiting for the next unrelated event; the reconciler's own re-arm covers a
+// gate implementation without this hook.
+type leaderAcquisitionAware interface {
+	OnAcquired(func())
+}
+
+// runReconciler starts the event-driven reconciliation loop (spec §5.7: a
+// 250–500ms debounce replaces the old 3s poll). Every persisted event is a hint
+// that control-plane state may need repair; the reconciler coalesces bursts
+// into one pass. Startup is a normal (debounced) wake, so a replica that is not
+// leader yet keeps the pass armed instead of losing it. Leadership acquisition
+// is a second wake, so a failover reconciles without an unrelated event. The
 // EZTEST_RECONCILER_POLL_INTERVAL compatibility switch can restore periodic
 // polling until the P10 acceptance run retires it.
 func runReconciler(ctx context.Context, gate orchestrationapp.LeaderGate, reconciler *agentapp.Reconciler) {
 	if reconciler == nil {
 		return
 	}
-	reconcile := func() {
-		if err := reconciler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("eztest: reconcile: %v", err)
-		}
+	reconciler.Notify("startup", 0)
+	if aware, ok := gate.(leaderAcquisitionAware); ok {
+		aware.OnAcquired(func() {
+			reconciler.Notify("leader_acquired", 0)
+		})
 	}
-	p7RunGated(gate, reconcile)
 	shouldRun := func() bool { return gate != nil && gate.IsLeader() }
 	if err := reconciler.Run(ctx, shouldRun); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("eztest: reconciler loop stopped: %v", err)
@@ -112,7 +122,12 @@ func reconcilerPollInterval() time.Duration {
 	if raw == "" || raw == "0" || strings.EqualFold(raw, "off") {
 		return 0
 	}
-	if interval, err := time.ParseDuration(raw); err == nil && interval > 0 {
+	if interval, err := time.ParseDuration(raw); err == nil {
+		// "0s" (and any non-positive duration) is the same disabled switch as
+		// the bare "0"/"off" spellings, not an invalid value.
+		if interval <= 0 {
+			return 0
+		}
 		return interval
 	}
 	log.Printf("eztest: invalid EZTEST_RECONCILER_POLL_INTERVAL %q; keeping the 3s compatibility poll", raw)
@@ -425,22 +440,34 @@ func (a executionSUTContexts) ListAll(ctx context.Context) ([]execution.CaseRunS
 
 var _ executionapp.SUTContextRepository = executionSUTContexts{}
 
-// runExecutionScheduler drives the deterministic intent scan, wave planner and
-// recovery sweep. Intent generation scans version content every few seconds
-// because case confirmations can arrive without an execution event; the scan is
-// idempotent (P3 §5.1). Errors are logged and retried; the loops exit with the
-// process context. The whole tick is leader-gated (P7 §4.5: scheduler+recovery
-// run on the leader only; in-flight work stays protected by leases).
+// runExecutionScheduler drives the event-driven intent scan, wave planner and
+// recovery sweep. Case confirmations wake the intent scan through the eventing
+// observer seam (design.case_confirmed); a positive scanInterval additionally
+// runs the old periodic full scan as a compatibility switch until P10
+// acceptance. The scan is idempotent (P3 §5.1). Errors are logged and retried;
+// the loop exits with the process context. The whole tick is leader-gated
+// (P7 §4.5: scheduler+recovery run on the leader only; in-flight work stays
+// protected by leases).
 func runExecutionScheduler(
 	ctx context.Context,
 	gate orchestrationapp.LeaderGate,
-	intents *executionapp.IntentService,
-	versions *versionapp.Service,
+	intents intentEnsurer,
+	versions versionSummaryLister,
 	scheduler *executionapp.Scheduler,
 	recovery *executionapp.Recovery,
+	wake *executionIntentWake,
+	scanInterval time.Duration,
 ) {
 	if scheduler == nil && recovery == nil && intents == nil {
 		return
+	}
+	ensureIntents := func(versionID int64) {
+		if intents == nil || versionID <= 0 {
+			return
+		}
+		if _, err := intents.EnsureInitialIntents(ctx, versionID); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("eztest: execution intent scan: version %d: %v", versionID, err)
+		}
 	}
 	scanIntents := func() {
 		if intents == nil || versions == nil {
@@ -454,16 +481,28 @@ func runExecutionScheduler(
 			return
 		}
 		for _, summary := range summaries {
-			if _, err := intents.EnsureInitialIntents(ctx, summary.ID); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("eztest: execution intent scan: version %d: %v", summary.ID, err)
-			}
+			ensureIntents(summary.ID)
 		}
 	}
-	tick := func(scan bool) {
+	// flushIntents only consumes the pending wake while this replica is the
+	// leader, so a follower keeps the request armed until it acquires
+	// leadership (the 1s tick retries the flush).
+	flushIntents := func() {
+		if wake == nil {
+			return
+		}
 		p7RunGated(gate, func() {
-			if scan {
+			versionIDs, scanAll := wake.take()
+			if scanAll {
 				scanIntents()
 			}
+			for _, versionID := range versionIDs {
+				ensureIntents(versionID)
+			}
+		})
+	}
+	tick := func() {
+		p7RunGated(gate, func() {
 			if scheduler != nil {
 				if err := scheduler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf("eztest: execution scheduler: %v", err)
@@ -476,17 +515,30 @@ func runExecutionScheduler(
 			}
 		})
 	}
-	tick(true)
+	tick()
+	if wake != nil {
+		wake.NotifyScanAll()
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	ticks := 0
+	var scanTicker *time.Ticker
+	var scan <-chan time.Time
+	if scanInterval > 0 {
+		scanTicker = time.NewTicker(scanInterval)
+		defer scanTicker.Stop()
+		scan = scanTicker.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ticks++
-			tick(ticks%5 == 0)
+			tick()
+			flushIntents()
+		case <-scan:
+			p7RunGated(gate, scanIntents)
+		case <-wake.events():
+			flushIntents()
 		}
 	}
 }
@@ -1113,9 +1165,11 @@ func main() {
 		P4:              p4.NewEnsurer(issueSvc, reportSvc, closureSvc, versionCloseSvc),
 		RunningVersions: versionSvc,
 		// R49 stage-entry-job recovery: read the stage and re-enqueue through
-		// the same idempotent dispatcher the stage machine uses.
-		Stages:    versionRepo,
-		StageJobs: dispatcher,
+		// the same idempotent dispatcher the stage machine uses. The presence
+		// query uses kind + stage-entered floor, not a newest-page scan.
+		Stages:           versionRepo,
+		StageJobs:        dispatcher,
+		StageJobPresence: workItems,
 		// The event-driven loop is the default; the env switch restores the old
 		// periodic scan until P10 acceptance.
 		PollInterval: reconcilerPollInterval(),
@@ -1127,8 +1181,16 @@ func main() {
 	// channel, so a slow observer never delays SSE delivery. Both delivery
 	// paths are wired: local publishes (this replica) and cross-instance events
 	// loaded by the P7 listener, so a worker on any replica wakes the leader.
+	// Case confirmation additionally wakes the execution intent scan; the
+	// observer only records the version and the leader-gated scheduler loop
+	// performs the database work.
+	intentWake := newExecutionIntentWake()
 	wake := func(_ context.Context, event eventingdomain.Event) error {
-		reconciler.Notify(event.Type, reconcilerEventVersionID(event))
+		versionID := reconcilerEventVersionID(event)
+		reconciler.Notify(event.Type, versionID)
+		if event.Type == designCaseConfirmedEvent {
+			intentWake.Notify(versionID)
+		}
 		return nil
 	}
 	eventSvc.Observe(wake)
@@ -1143,7 +1205,8 @@ func main() {
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExecutionScheduler(ctx, p7OrchestrationRuntime.Leader, executionIntents, versionSvc, executionScheduler, executionRecovery)
+		runExecutionScheduler(ctx, p7OrchestrationRuntime.Leader, executionIntents, versionSvc,
+			executionScheduler, executionRecovery, intentWake, intentScanIntervalFromEnv())
 	}()
 	background.Add(1)
 	go func() {

@@ -118,11 +118,15 @@ func TestPublishNotifiesObservers(t *testing.T) {
 		return errors.New("observer failure must not fail the publish")
 	})
 
+	// Publish a contract-valid job.progress payload so the observer seam test
+	// cannot be mistaken for a second, weaker payload validator.
 	if err := svc.Publish(context.Background(), Event{
 		Channel: "version:42",
 		Type:    EventJobProgress,
-		Scope:   map[string]any{"version_id": "42"},
-		Payload: map[string]any{"job_id": "77"},
+		Scope:   map[string]any{"version_id": "42", "job_id": "77"},
+		Payload: map[string]any{
+			"job_id": "77", "kind": "execute.batch", "current": 0, "total": 0, "status": JobStatusOpen,
+		},
 	}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}

@@ -66,3 +66,49 @@ func TestJobProgressSSEMapping(t *testing.T) {
 		}
 	}
 }
+
+// TestJobFinishedSSEMapping pins the terminal counterpart: the persisted
+// job.finished type is the SSE event name and result_ref/status reach the UI.
+func TestJobFinishedSSEMapping(t *testing.T) {
+	finished := eventingapp.JobFinished{
+		JobID:     77,
+		Kind:      "execute.batch",
+		Status:    eventingapp.JobStatusDone,
+		ResultRef: "content:1234",
+	}
+	event, err := finished.Event(1001)
+	if err != nil {
+		t.Fatalf("Event: %v", err)
+	}
+	stored := eventingdomain.Event{
+		Channel:   event.Channel,
+		Seq:       12,
+		Type:      event.Type,
+		Scope:     event.Scope,
+		Payload:   event.Payload,
+		CreatedAt: fixedTime,
+	}
+
+	svc := newFakeService()
+	svc.bounds = eventingdomain.Bounds{FirstSeq: 1, LastSeq: 11}
+	svc.subCh = make(chan eventingdomain.Event, 1)
+	svc.subCh <- stored
+	handler := New(svc)
+	scanner, cleanup := startStream(t, handler, "/api/stream?channel=version:1001", nil)
+	defer cleanup()
+
+	frame := readFrame(t, scanner)
+	if frame.id != "12" || frame.event != string(eventingapp.EventJobFinished) {
+		t.Fatalf("frame = %#v", frame)
+	}
+	var dto eventDTO
+	if err := json.Unmarshal([]byte(frame.data), &dto); err != nil {
+		t.Fatalf("decode data: %v", err)
+	}
+	if dto.Type != eventingapp.EventJobFinished {
+		t.Fatalf("dto = %#v", dto)
+	}
+	if dto.Payload["result_ref"] != "content:1234" || dto.Payload["status"] != "done" {
+		t.Fatalf("SSE job.finished payload = %#v", dto.Payload)
+	}
+}

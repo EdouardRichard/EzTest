@@ -375,6 +375,57 @@ func TestRunnerStopsAtMaxTurnsBudget(t *testing.T) {
 	}
 }
 
+// TestRunnerSettlesOnTurnFuse pins that the default turn fuse leaves exactly
+// one loop turn for the tool-less settlement turn. Before the fix the fuse
+// equalled the loop cap, so Decide could never observe turns >= fuse and the
+// loop hard-failed without ever asking the model to wrap up.
+func TestRunnerSettlesOnTurnFuse(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.settings.ints["agent.max_turns"] = 2
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolContextVersionPack, `{}`),
+		{Content: "回合上限已到，以下为收尾回复。"},
+	}
+
+	result, err := mustRun(t, fixture, hostItem())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone || result.Turns != 2 {
+		t.Fatalf("result = %#v, want a settled done run at the fuse turn", result)
+	}
+	if count := len(fixture.chat.request(1).Tools); count != 0 {
+		t.Fatalf("fuse turn still exposes %d tools, want the settlement surface", count)
+	}
+}
+
+// TestRunnerSettlesWhenZeroTotalReportsComponents pins the usage aggregation:
+// providers that report total_tokens=0 plus a component breakdown must still
+// hit the token budget, otherwise the settlement turn never triggers.
+func TestRunnerSettlesWhenZeroTotalReportsComponents(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	item := hostItem()
+	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":12}`)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{
+			ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
+			Usage:     map[string]int{"total_tokens": 0, "prompt_tokens": 7, "completion_tokens": 7},
+		},
+		{Content: "预算已用尽，以下为收尾回复。"},
+	}
+
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %#v, want a settled done run", result)
+	}
+	if count := len(fixture.chat.request(1).Tools); count != 0 {
+		t.Fatalf("settlement turn still exposes %d tools; the component breakdown was ignored", count)
+	}
+}
+
 func TestRunnerSoftTimeoutDropsTools(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	profile := fixture.repo.profiles[agentapp.ProfileKeyClarificationHost]

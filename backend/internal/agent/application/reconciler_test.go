@@ -191,7 +191,7 @@ func (e *fakeEnsurer) Ensure(_ context.Context, in agent.NewWorkItem) (agent.Wor
 	return item, true, nil
 }
 
-func (e *fakeEnsurer) ListByVersion(_ context.Context, versionID int64, _ int) ([]agent.WorkItem, error) {
+func (e *fakeEnsurer) ListByVersion(_ context.Context, versionID int64, limit int) ([]agent.WorkItem, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	list := make([]agent.WorkItem, 0)
@@ -200,7 +200,31 @@ func (e *fakeEnsurer) ListByVersion(_ context.Context, versionID int64, _ int) (
 			list = append(list, item)
 		}
 	}
+	// Mirror the repository's newest-first page: the R49 tests need a real cap
+	// so a valid job outside the newest page is actually hidden.
+	if limit > 0 && len(list) > limit {
+		list = list[len(list)-limit:]
+	}
+	slices.Reverse(list)
 	return list, nil
+}
+
+// HasWorkItemKindSince mirrors the R49 SQL query: it scans every stored item
+// (no newest-page bound), matches the 0.2.1 kind or the legacy type and applies
+// the creation floor.
+func (e *fakeEnsurer) HasWorkItemKindSince(_ context.Context, versionID int64, kind string, since time.Time) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, item := range e.items {
+		if item.VersionID != versionID || (item.Type != kind && item.Kind != kind) {
+			continue
+		}
+		if item.CreatedAt.Before(since) {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (e *fakeEnsurer) ensured() []string {
@@ -214,12 +238,16 @@ func (e *fakeEnsurer) ensured() []string {
 }
 
 func (e *fakeEnsurer) addItem(versionID int64, workType, dedupeKey string, status agent.WorkItemStatus) {
+	e.addItemAt(versionID, workType, dedupeKey, status, time.Now())
+}
+
+func (e *fakeEnsurer) addItemAt(versionID int64, workType, dedupeKey string, status agent.WorkItemStatus, createdAt time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.nextID++
 	e.items = append(e.items, agent.WorkItem{
 		ID: e.nextID, VersionID: versionID, Team: agent.TeamClarification,
-		Type: workType, Status: status, DedupeKey: dedupeKey,
+		Type: workType, Status: status, DedupeKey: dedupeKey, CreatedAt: createdAt,
 	})
 }
 
@@ -234,6 +262,11 @@ type reconcilerFixture struct {
 }
 
 func newReconcilerFixture(t *testing.T) *reconcilerFixture {
+	t.Helper()
+	return newReconcilerFixtureWithDebounce(t, agentapp.DefaultReconcileDebounce)
+}
+
+func newReconcilerFixtureWithDebounce(t *testing.T, debounce time.Duration) *reconcilerFixture {
 	t.Helper()
 	fixture := &reconcilerFixture{
 		projector:     &fakeProjector{},
@@ -251,9 +284,54 @@ func newReconcilerFixture(t *testing.T) *reconcilerFixture {
 		Queue:         fixture.queue,
 		Events:        fixture.events,
 		Clock:         &manualClock{now: runnerClockStart},
+		Debounce:      debounce,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	return fixture
+}
+
+// waitFor polls cond until it is true or the timeout elapses. Tests use it
+// instead of a fixed sleep so the event-driven loop assertions are as
+// deterministic as the scheduler allows.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !cond() {
+		t.Fatal(message)
+	}
+}
+
+// countingLeaderGate reports leadership and counts the checks, so a test can
+// prove a gate-closed pass was re-armed rather than dropped.
+type countingLeaderGate struct {
+	mu     sync.Mutex
+	leader bool
+	checks int
+}
+
+func (g *countingLeaderGate) IsLeader() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.checks++
+	return g.leader
+}
+
+func (g *countingLeaderGate) setLeader(value bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.leader = value
+}
+
+func (g *countingLeaderGate) checkCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.checks
 }
 
 func expectedKeys(keys ...string) map[string]bool {
@@ -667,33 +745,69 @@ func (e *fakeEnsurer) itemsOfType(versionID int64, workType string) []agent.Work
 }
 
 // TestNotifyDebounces proves the event-driven wake coalesces a burst: ten
-// Notify calls inside 100ms schedule exactly one reconciliation pass, and
-// cancellation stops the loop. This is what lets the 3s poll be removed
-// without losing wakeups (spec §5.7).
+// Notify calls schedule exactly one reconciliation pass, and cancellation stops
+// the loop. The burst is queued before Run starts so the one-slot coalescing
+// channel makes the "exactly one pass" assertion deterministic instead of
+// depending on goroutine scheduling.
 func TestNotifyDebounces(t *testing.T) {
-	fixture := newReconcilerFixture(t)
+	fixture := newReconcilerFixtureWithDebounce(t, 20*time.Millisecond)
+	for i := 0; i < 10; i++ {
+		fixture.reconciler.Notify("test.burst", 10)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- fixture.reconciler.Run(ctx, nil) }()
 
-	for i := 0; i < 10; i++ {
-		fixture.reconciler.Notify("test.burst", 10)
-		time.Sleep(10 * time.Millisecond)
-	}
-	// The default debounce is 300ms; wait for the coalesced pass, then one full
-	// window more to prove no second pass was scheduled.
-	deadline := time.Now().Add(2 * time.Second)
-	for fixture.design.callCount() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 2*time.Second, func() bool { return fixture.design.callCount() >= 1 },
+		"the coalesced burst never produced a reconciliation pass")
+	// No further notification exists, so a second pass would be a coalescing
+	// bug. One full debounce window plus margin is enough to catch it.
+	time.Sleep(100 * time.Millisecond)
 	if calls := fixture.design.callCount(); calls != 1 {
-		t.Fatalf("reconcile passes = %d after a 10-notify burst, want 1", calls)
+		t.Fatalf("reconcile passes = %d after a 10-notify burst, want exactly 1", calls)
 	}
-	time.Sleep(500 * time.Millisecond)
-	if calls := fixture.design.callCount(); calls != 1 {
-		t.Fatalf("reconcile passes = %d, want exactly one coalesced pass", calls)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v on cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop on context cancellation")
 	}
+}
+
+// TestGateClosedPassRearms pins the startup/failover wake: when the leader
+// gate is still closed a pass must not be dropped. The reconciler re-arms the
+// pending wake and runs it as soon as the gate opens, without a compatibility
+// poll and without another external event.
+func TestGateClosedPassRearms(t *testing.T) {
+	fixture := newReconcilerFixtureWithDebounce(t, 10*time.Millisecond)
+	gate := &countingLeaderGate{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fixture.reconciler.Run(ctx, gate.IsLeader) }()
+
+	fixture.reconciler.Notify("test.gate_closed", 10)
+	waitFor(t, 2*time.Second, func() bool { return gate.checkCount() >= 1 },
+		"the wake never reached the leader gate")
+	if calls := fixture.design.callCount(); calls != 0 {
+		t.Fatalf("reconcile ran %d times on a follower, want 0", calls)
+	}
+	// Several debounce windows pass while leadership is still false; the wake
+	// must remain armed rather than being forgotten.
+	time.Sleep(60 * time.Millisecond)
+	if calls := fixture.design.callCount(); calls != 0 {
+		t.Fatalf("reconcile ran %d times on a follower, want 0", calls)
+	}
+
+	gate.setLeader(true)
+	waitFor(t, 2*time.Second, func() bool { return fixture.design.callCount() >= 1 },
+		"the re-armed gate-closed pass was dropped after leadership was acquired")
 
 	cancel()
 	select {
@@ -732,8 +846,9 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 				Stages: &fakeStageReader{states: map[int64]version.StageState{
 					10: {VersionID: 10, Stage: testCase.stage},
 				}},
-				StageJobs: jobs,
-				Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+				StageJobs:        jobs,
+				StageJobPresence: queue,
+				Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
 			for pass := 0; pass < 2; pass++ {
 				if err := reconciler.Reconcile(context.Background()); err != nil {
@@ -767,8 +882,9 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 			Stages: &fakeStageReader{states: map[int64]version.StageState{
 				10: {VersionID: 10, Stage: version.StageCaseReview},
 			}},
-			StageJobs: jobs,
-			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			StageJobs:        jobs,
+			StageJobPresence: queue,
+			Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
 		if err := reconciler.Reconcile(context.Background()); err != nil {
 			t.Fatalf("Reconcile: %v", err)
@@ -789,8 +905,9 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 			Stages: &fakeStageReader{states: map[int64]version.StageState{
 				10: {VersionID: 10, Stage: version.StageDesigning},
 			}},
-			StageJobs: jobs,
-			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			StageJobs:        jobs,
+			StageJobPresence: queue,
+			Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
 		if err := reconciler.Reconcile(context.Background()); err != nil {
 			t.Fatalf("Reconcile: %v", err)
@@ -813,8 +930,9 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 			Stages: &fakeStageReader{states: map[int64]version.StageState{
 				10: {VersionID: 10, Stage: version.StageClarifying},
 			}},
-			StageJobs: jobs,
-			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			StageJobs:        jobs,
+			StageJobPresence: queue,
+			Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
 		if err := reconciler.Reconcile(context.Background()); err != nil {
 			t.Fatalf("Reconcile: %v", err)
@@ -825,6 +943,105 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 	})
 }
 
+// TestReconcileIgnoresPreStageJobs pins the R49 creation floor: a job of the
+// expected kind from an earlier visit to the same stage must not mask a lost
+// job in the current stage visit. Only jobs created at/after the stage-entry
+// floor (minus the clock-skew grace) count as present.
+func TestReconcileIgnoresPreStageJobs(t *testing.T) {
+	enteredAt := time.Now().Add(-time.Minute)
+	queue := &fakeEnsurer{}
+	queue.addItemAt(10, versionapp.StageJobDesignCases, "10:design.cases:previous-cycle",
+		agent.WorkItemDone, enteredAt.Add(-2*time.Minute))
+	jobs := &fakeStageJobs{queue: queue}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions:        &fakeProjector{},
+		Queue:           queue,
+		RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+		Stages: &fakeStageReader{states: map[int64]version.StageState{
+			10: {VersionID: 10, Stage: version.StageDesigning, StageEnteredAt: enteredAt},
+		}},
+		StageJobs:        jobs,
+		StageJobPresence: queue,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for pass := 0; pass < 2; pass++ {
+		if err := reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile pass %d: %v", pass, err)
+		}
+	}
+	recorded := jobs.recorded()
+	if len(recorded) != 1 {
+		t.Fatalf("stage jobs = %#v, want one re-enqueue for the current stage visit", recorded)
+	}
+	if recorded[0].Kind != versionapp.StageJobDesignCases {
+		t.Fatalf("re-enqueued kind = %q, want %q", recorded[0].Kind, versionapp.StageJobDesignCases)
+	}
+}
+
+// TestReconcileDoesNotDuplicatePartialSelection pins the other side of the
+// R49 detection rule: a gate selection creates a different idempotency key but
+// the same kind in the current stage visit, so it must count as present and
+// never be duplicated by the recovery pass.
+func TestReconcileDoesNotDuplicatePartialSelection(t *testing.T) {
+	enteredAt := time.Now().Add(-time.Minute)
+	queue := &fakeEnsurer{}
+	queue.addItemAt(10, versionapp.StageJobExecuteBatch, "10:execute.batch:partial-selection",
+		agent.WorkItemOpen, enteredAt.Add(10*time.Second))
+	jobs := &fakeStageJobs{queue: queue}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions:        &fakeProjector{},
+		Queue:           queue,
+		RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+		Stages: &fakeStageReader{states: map[int64]version.StageState{
+			10: {VersionID: 10, Stage: version.StageExecuting, StageEnteredAt: enteredAt},
+		}},
+		StageJobs:        jobs,
+		StageJobPresence: queue,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := reconciler.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if recorded := jobs.recorded(); len(recorded) != 0 {
+		t.Fatalf("stage jobs = %#v, want none while a partial selection exists", recorded)
+	}
+	if items := queue.itemsOfType(10, versionapp.StageJobExecuteBatch); len(items) != 1 {
+		t.Fatalf("execute.batch items = %#v, want only the partial selection", items)
+	}
+}
+
+// TestReconcileBeyondWindow pins that R49 does not trust the newest 100-row
+// page: a valid stage job older than many newer unrelated items must still be
+// found, otherwise recovery would enqueue a duplicate.
+func TestReconcileBeyondWindow(t *testing.T) {
+	enteredAt := time.Now().Add(-10 * time.Minute)
+	queue := &fakeEnsurer{}
+	queue.addItemAt(10, versionapp.StageJobDesignCases, "10:design.cases:entry",
+		agent.WorkItemDone, enteredAt.Add(time.Second))
+	for i := 0; i < 120; i++ {
+		queue.addItemAt(10, agentapp.WorkTypeChatTurn, fmt.Sprintf("filler:%d", i),
+			agent.WorkItemDone, enteredAt.Add(2*time.Minute+time.Duration(i)*time.Millisecond))
+	}
+	jobs := &fakeStageJobs{queue: queue}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions:        &fakeProjector{},
+		Queue:           queue,
+		RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+		Stages: &fakeStageReader{states: map[int64]version.StageState{
+			10: {VersionID: 10, Stage: version.StageDesigning, StageEnteredAt: enteredAt},
+		}},
+		StageJobs:        jobs,
+		StageJobPresence: queue,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := reconciler.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if recorded := jobs.recorded(); len(recorded) != 0 {
+		t.Fatalf("stage jobs = %#v, want none: the entry job is outside the newest page but still present", recorded)
+	}
+}
+
 var _ agentapp.VersionStageReader = (*fakeStageReader)(nil)
 var _ versionapp.StageJobEnqueuer = (*fakeStageJobs)(nil)
 
@@ -833,4 +1050,5 @@ var _ agentapp.ConversationReader = (*fakeConversationReader)(nil)
 var _ agentapp.PendingAttachmentReader = (*fakePendingAttachments)(nil)
 var _ agentapp.DesignReconciler = (*fakeDesignReconciler)(nil)
 var _ agentapp.WorkQueueEnsurer = (*fakeEnsurer)(nil)
+var _ agentapp.StageJobPresence = (*fakeEnsurer)(nil)
 var _ = time.Second

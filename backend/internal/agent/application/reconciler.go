@@ -18,6 +18,23 @@ import (
 // reconcilerLimit bounds how many rows each reconciliation rule scans per pass.
 const reconcilerLimit = 100
 
+// stageJobGrace is the clock-skew allowance subtracted from StageEnteredAt when
+// R49 decides whether a stage-entry job belongs to the current stage visit. A
+// job created a little before the recorded transition (transaction latency,
+// replica clock skew) still counts as present; an older one is from a previous
+// visit and must not mask a lost job.
+const stageJobGrace = 30 * time.Second
+
+// StageJobPresence answers R49's "does the current stage visit already own a
+// job of this kind?" question. It must query by kind and creation floor instead
+// of trusting a bounded newest-first page: a long-lived version can push the
+// legitimate job outside the page, and a job from a previous visit to the same
+// stage must not hide a later-cycle loss. *agentpg.WorkItemRepository
+// implements it with a SQL EXISTS; nil disables the R49 rule.
+type StageJobPresence interface {
+	HasWorkItemKindSince(ctx context.Context, versionID int64, kind string, since time.Time) (bool, error)
+}
+
 // DefaultReconcileDebounce is the event-driven wake window (spec §5.7:
 // 250–500ms). A burst of Notify calls inside the window coalesces into one
 // reconciliation pass; the window is anchored at the first notification so a
@@ -58,9 +75,13 @@ type ReconcilerDeps struct {
 	// Stages reads the version stage for the R49 stage-entry-job recovery.
 	// Nil disables the rule (earlier-rule unit tests and degraded wiring).
 	Stages VersionStageReader
-	// StageJobs re-enqueues a missing stage-entry job with the same idempotency
-	// key (R49). *Dispatcher satisfies it; nil disables the rule.
+	// StageJobs re-enqueues a missing stage-entry job (R49). *Dispatcher
+	// satisfies it; nil disables the rule.
 	StageJobs versionapp.StageJobEnqueuer
+	// StageJobPresence checks the current stage visit for an existing job. It
+	// is queried by kind and created_at floor, never by a bounded page.
+	// *agentpg.WorkItemRepository satisfies it; nil disables the rule.
+	StageJobPresence StageJobPresence
 	// Debounce overrides the event-driven wake window. Zero uses
 	// DefaultReconcileDebounce; tests may shorten it.
 	Debounce time.Duration
@@ -90,6 +111,7 @@ type Reconciler struct {
 	p7              P7Ensurer
 	stages          VersionStageReader
 	stageJobs       versionapp.StageJobEnqueuer
+	stageJobLookup  StageJobPresence
 	events          eventingapp.Publisher
 	clock           clock.Clock
 	logger          *slog.Logger
@@ -130,6 +152,7 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		p7:              deps.P7,
 		stages:          deps.Stages,
 		stageJobs:       deps.StageJobs,
+		stageJobLookup:  deps.StageJobPresence,
 		events:          deps.Events,
 		clock:           deps.Clock,
 		logger:          logger,
@@ -194,11 +217,7 @@ func (r *Reconciler) Notify(kind string, versionID int64) {
 	r.lastWakeKind = kind
 	r.lastWakeVersion = versionID
 	r.mu.Unlock()
-	select {
-	case r.wake <- struct{}{}:
-	default:
-		// A pass is already pending for this burst.
-	}
+	r.signal()
 }
 
 // Run is the event-driven reconciliation loop (spec §5.7: 250–500ms debounce,
@@ -207,9 +226,11 @@ func (r *Reconciler) Notify(kind string, versionID int64) {
 // PollInterval additionally runs a compatibility ticker until P10 acceptance.
 //
 // shouldRun gates each pass (nil runs on every wake); the composition root
-// passes the leader gate so only one replica reconciles. Startup state
-// reconciliation is the caller's responsibility (the main loop runs one gated
-// pass before calling Run), so a burst always maps to exactly one pass.
+// passes the leader gate so only one replica reconciles. Startup is the
+// caller's responsibility (the main loop Notifies a "startup" wake before
+// calling Run). A gate-closed pass is never dropped: without the compatibility
+// poll the pending wake is re-armed, so a pass that arrives before leadership
+// is acquired runs as soon as the gate opens.
 func (r *Reconciler) Run(ctx context.Context, shouldRun func() bool) error {
 	if r == nil {
 		return nil
@@ -228,10 +249,25 @@ func (r *Reconciler) Run(ctx context.Context, shouldRun func() bool) error {
 			if !r.waitDebounce(ctx) {
 				return nil
 			}
-			r.runPass(ctx, shouldRun)
+			if !r.runPass(ctx, shouldRun) && r.pollInterval <= 0 && ctx.Err() == nil {
+				// Leadership is acquired asynchronously. Keep the pending pass
+				// armed instead of silently consuming the wake; the re-arm uses
+				// the normal debounce window so a follower does not spin.
+				r.signal()
+			}
 		case <-poll:
 			r.runPass(ctx, shouldRun)
 		}
+	}
+}
+
+// signal re-arms the one-slot wake channel without changing the diagnostic
+// event context of the pending pass.
+func (r *Reconciler) signal() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+		// A pass is already pending.
 	}
 }
 
@@ -253,12 +289,16 @@ func (r *Reconciler) waitDebounce(ctx context.Context) bool {
 	}
 }
 
-func (r *Reconciler) runPass(ctx context.Context, shouldRun func() bool) {
+// runPass runs one gated pass and reports whether the pass actually ran. A
+// false result means the caller still owns a pending wake (gate closed) or the
+// context was cancelled.
+func (r *Reconciler) runPass(ctx context.Context, shouldRun func() bool) bool {
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 	if shouldRun != nil && !shouldRun() {
-		return
+		r.logger.Debug("agent reconciler pass deferred: not the leader")
+		return false
 	}
 	r.mu.Lock()
 	kind, versionID := r.lastWakeKind, r.lastWakeVersion
@@ -269,6 +309,7 @@ func (r *Reconciler) runPass(ctx context.Context, shouldRun func() bool) {
 	if err := r.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		r.logger.Warn("agent reconciler pass failed", "error", err)
 	}
+	return true
 }
 
 // reconcileStageJobs implements R49: scan running versions in a stage that owns
@@ -277,7 +318,7 @@ func (r *Reconciler) runPass(ctx context.Context, shouldRun func() bool) {
 // this rule is the repair path for that silent loss. It only ensures work; it
 // never executes or writes the stage.
 func (r *Reconciler) reconcileStageJobs(ctx context.Context) error {
-	if r.stageJobs == nil || r.stages == nil || r.runningVersions == nil || r.queue == nil {
+	if r.stageJobs == nil || r.stages == nil || r.runningVersions == nil || r.stageJobLookup == nil {
 		return nil
 	}
 	versionIDs, err := r.runningVersions.ListRunningVersions(ctx, r.limit)
@@ -305,7 +346,7 @@ func (r *Reconciler) reconcileStageJobs(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		missing, err := r.missingStageJob(ctx, versionID, kind)
+		missing, err := r.missingStageJob(ctx, versionID, kind, state.StageEnteredAt)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -342,22 +383,21 @@ func stageEntryJobKind(stage version.Stage) (string, bool) {
 	}
 }
 
-// missingStageJob reports whether the version has no work item of the expected
-// stage-entry kind. Any status counts as present: a failed stage job is retried
-// by the claim/attempt policy, and a done one already ran. Matching by kind
-// (not by a recomputed idempotency key) also avoids adding a second row for a
-// partial gate selection, which has a different key but the same kind.
-func (r *Reconciler) missingStageJob(ctx context.Context, versionID int64, kind string) (bool, error) {
-	items, err := r.queue.ListByVersion(ctx, versionID, r.limit)
+// missingStageJob reports whether the current stage visit has no work item of
+// the expected stage-entry kind. The visit starts at StageEnteredAt (minus the
+// clock-skew grace), so a done/cancelled job from an earlier visit to the same
+// stage cannot mask a lost later-cycle job. Any status within the visit counts
+// as present: a failed stage job is retried by the claim/attempt policy, and a
+// done one already ran. Matching by kind (not by a recomputed idempotency key)
+// also avoids adding a second row for a partial gate selection, which has a
+// different key but the same kind.
+func (r *Reconciler) missingStageJob(ctx context.Context, versionID int64, kind string, enteredAt time.Time) (bool, error) {
+	since := enteredAt.Add(-stageJobGrace)
+	present, err := r.stageJobLookup.HasWorkItemKindSince(ctx, versionID, kind, since)
 	if err != nil {
-		return false, fmt.Errorf("list work items for version %d: %w", versionID, err)
+		return false, fmt.Errorf("query %s work item for version %d: %w", kind, versionID, err)
 	}
-	for _, item := range items {
-		if item.Type == kind || item.Kind == kind {
-			return false, nil
-		}
-	}
-	return true, nil
+	return !present, nil
 }
 
 // reconcileP7 runs the P7 ensure surface (report PDF backfill). It is optional

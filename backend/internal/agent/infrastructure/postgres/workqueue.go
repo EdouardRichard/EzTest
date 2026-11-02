@@ -900,6 +900,36 @@ func (r *WorkItemRepository) ListByVersion(ctx context.Context, versionID int64,
 	return items, nil
 }
 
+// HasWorkItemKindSince reports whether a version owns a work item whose 0.2.1
+// kind (or frozen legacy type) equals kind and whose created_at is at/after
+// since. R49 uses it with the version's stage-entered floor so:
+//   - a job from an earlier visit to the same stage cannot mask a lost
+//     later-cycle job, and
+//   - the answer does not depend on the newest-page bound of ListByVersion
+//     (a long-lived version can push the legitimate job out of that page).
+func (r *WorkItemRepository) HasWorkItemKindSince(ctx context.Context, versionID int64, kind string, since time.Time) (bool, error) {
+	if versionID <= 0 {
+		return false, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		return false, platform.Invalid("kind", "must not be empty")
+	}
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM work_item
+			WHERE version_id = $1
+			  AND (kind = $2 OR type = $2)
+			  AND created_at >= $3
+		)
+	`, versionID, kind, since.UTC()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check %s work item for version %d: %w", kind, versionID, err)
+	}
+	return exists, nil
+}
+
 // ListAttempts returns the attempt log of one work item, oldest first.
 func (r *WorkItemRepository) ListAttempts(ctx context.Context, workItemID int64) ([]agent.WorkItemAttempt, error) {
 	rows, err := r.pool.Query(ctx, `

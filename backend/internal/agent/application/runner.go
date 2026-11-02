@@ -809,12 +809,18 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			return strings.TrimSpace(response.Content), nil
 		}
 		if soft {
-			// Tools are disabled at soft timeout; treat a tool-call-only reply as
-			// the model ignoring the wrap-up instruction.
+			// Tools are disabled during settlement; a tool-call-only reply means
+			// the model ignored the wrap-up instruction. This is a budget
+			// exhaustion (the settlement turn is consumed without an answer),
+			// not a transient model error: another attempt cannot succeed.
 			if text := strings.TrimSpace(response.Content); text != "" {
 				return text, nil
 			}
-			return "", &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("model requested tools after the soft timeout")}
+			return "", &RunError{
+				Reason:    "budget",
+				Retryable: false,
+				Cause:     errors.New("model requested tools during the settlement turn"),
+			}
 		}
 		if err := r.executeTools(ctx, state, response.ToolCalls); err != nil {
 			return "", err
@@ -1775,6 +1781,19 @@ func isP3Profile(key string) bool {
 	}
 }
 
+// turnFuse is the turn-circuit-breaker value used by the default resource
+// budget. It is one below the loop cap so the final allowed turn is the
+// tool-less settlement turn: the loop can still execute it, Decide sees
+// Turns >= fuse and asks for settlement instead of the loop silently ending
+// with a hard budget error. A degenerate one-turn cap keeps fuse=1.
+func (r *Runner) turnFuse(profile agent.AgentProfile) int {
+	fuse := r.maxTurns(profile) - 1
+	if fuse < 1 {
+		fuse = 1
+	}
+	return fuse
+}
+
 func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 	seconds := profile.Budgets.SoftSeconds
 	if seconds <= 0 {
@@ -1792,9 +1811,12 @@ func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 // token default is the contract default when neither source sets it.
 func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile) Budget {
 	budget := Budget{
-		MaxTokens:    DefaultBudgetMaxTokens,
-		RunSeconds:   r.softSeconds(profile),
-		MaxTurnsFuse: r.maxTurns(profile),
+		MaxTokens:  DefaultBudgetMaxTokens,
+		RunSeconds: r.softSeconds(profile),
+		// Reserve the last loop turn for settlement. With the fuse equal to the
+		// loop cap the loop exits before Decide can observe the fuse, so the
+		// budget policy would never get to ask for a wrap-up turn.
+		MaxTurnsFuse: r.turnFuse(profile),
 	}
 	trimmed := strings.TrimSpace(string(item.Budget))
 	if trimmed == "" || trimmed == "null" {
@@ -1835,17 +1857,19 @@ func (r *Runner) elapsedSeconds(state *runState) int {
 
 // usageTokens returns the aggregated token usage the budget compares against.
 // Providers report total_tokens; a provider that only reports the components is
-// summed instead of treated as zero usage.
+// summed instead of treated as zero usage. A present-but-zero total_tokens is
+// treated as "not reported" because some providers emit it alongside a real
+// component breakdown.
 func usageTokens(usage map[string]int) int {
-	if total, ok := usage["total_tokens"]; ok && total >= 0 {
+	if total, ok := usage["total_tokens"]; ok && total > 0 {
 		return total
 	}
 	total := 0
-	for _, value := range usage {
+	for key, value := range usage {
+		if key == "total_tokens" || value <= 0 {
+			continue
+		}
 		total += value
-	}
-	if total < 0 {
-		return 0
 	}
 	return total
 }
