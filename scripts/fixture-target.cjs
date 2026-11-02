@@ -50,6 +50,7 @@
 //   GET  /p3/payments     -> refund list (REF-5001, ¥5,000.00, created).
 //   GET  /p3/2fa          -> standalone MFA page; POST code 246810 logs in.
 //   GET  /p3/slow?ms=8000 -> deliberately slow page for pause tests.
+//   GET  /p8/large?bytes=20000 -> large JSON tool result (test-only fixture).
 //   GET  /p3/timeout-window?ms=10000 -> #confirm-dialog stays visible for ms,
 //                            then is removed and #window-expired appears
 //                            (ms is supported up to 120000).
@@ -1034,6 +1035,32 @@ async function handleRequest(req, res) {
       return;
     }
     handleProfile(req, res);
+    return;
+  }
+
+  if (pathname === "/p8/large") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    const requested = Number.parseInt(requestUrl.searchParams.get("bytes") || "20000", 10);
+    const bytes = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 1 << 20) : 20000;
+    const body = JSON.stringify({
+      marker: "P8-LARGE-BEGIN",
+      bytes,
+      payload: "x".repeat(bytes),
+      end_marker: "P8-LARGE-END",
+    });
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Length": Buffer.byteLength(body),
+    });
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    res.end(body);
     return;
   }
 

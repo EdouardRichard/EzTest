@@ -890,6 +890,18 @@ function Invoke-P8ScenarioS9 {
         }
         Write-P8Check $checks ($accepted -eq 30) "S9 posted 30 user messages" ("accepted=$accepted failures=" + (($postFailures | Select-Object -First 5) -join ","))
 
+        $pinText = "P8 S9 pinned fact: the deployment region for this version is ap-east-1. Use context.summary_update to pin exactly this fact: P8-S9-REGION=ap-east-1. Do not drop it when compacting."
+        $pinResponse = Send-P8ConversationMessage -VersionID $versionID -ConversationID $conversationID -Text $pinText -ClientMessageID ("p8-s9-pin-" + $script:runSuffix)
+        Write-P8Check $checks ($pinResponse.Status -eq 201) "S9 pin request accepted" ("status=" + $pinResponse.Status)
+
+        $pinWait = Wait-P8Until -TimeoutSeconds 240 -IntervalMilliseconds 3000 -Description "S9 pinned fact" -Condition {
+            $count = [int](Get-P8Scalar -Sql ("SELECT COALESCE(max(CASE WHEN jsonb_typeof(pinned_facts) = 'array' THEN jsonb_array_length(pinned_facts) ELSE 0 END),0) FROM conversation_summary WHERE conversation_id = " + [int64]$conversationID + ";"))
+            if ($count -gt 0) { return $true }
+            return $null
+        }
+        $pinCountAfter = [int](Get-P8Scalar -Sql ("SELECT COALESCE(max(CASE WHEN jsonb_typeof(pinned_facts) = 'array' THEN jsonb_array_length(pinned_facts) ELSE 0 END),0) FROM conversation_summary WHERE conversation_id = " + [int64]$conversationID + ";"))
+        Write-P8Check $checks ($null -ne $pinWait -and $pinCountAfter -gt 0) "S9 real LLM pinned a fact" ("pinned_facts=$pinCountAfter")
+
         $messages = @(Get-P8ConversationMessages -VersionID $versionID -ConversationID $conversationID)
         $userMessages = @($messages | Where-Object { [string]$_.role -eq "user" })
         Write-P8Check $checks ($userMessages.Count -ge 30) "S9 30 user messages readable as original text" ("user_messages=" + $userMessages.Count + " total=" + $messages.Count)
@@ -964,7 +976,7 @@ function Invoke-P8ScenarioS9 {
         if ($packetID -gt 0 -and $pinnedCount -gt 0) {
             $pinnedPresent = [int](Get-P8Scalar -Sql ("SELECT CASE WHEN EXISTS (SELECT 1 FROM conversation_summary cs, jsonb_array_elements_text(cs.pinned_facts) f WHERE cs.conversation_id = " + [int64]$conversationID + " AND position(f in (SELECT COALESCE(s->>'content','') FROM context_packet p, jsonb_array_elements(p.sections) s WHERE p.run_id = " + [int64]$runID + " AND s->>'name' = 'conversation' LIMIT 1)) > 0) THEN 1 ELSE 0 END;"))
         }
-        Write-P8Check $checks ($pinnedCount -eq 0 -or $pinnedPresent -eq 1) "S9 context packet preserves pinned facts when present" ("pinned_facts=$pinnedCount present_in_packet=$pinnedPresent")
+        Write-P8Check $checks ($pinnedCount -gt 0 -and $pinnedPresent -eq 1) "S9 context packet preserves pinned facts" ("pinned_facts=$pinnedCount present_in_packet=$pinnedPresent")
 
         $snapshot = [pscustomobject]@{
             version_id = $versionID
@@ -1350,11 +1362,13 @@ function Invoke-P8ScenarioS10LongExecution {
             }
             $designConversationID = [string]$designConversation.Json.data.id
             $designPrompt = ("Create exactly 12 independent, executable UI test cases in the design graph now. " +
+                "Every step action MUST be executable English instructions, not a Chinese description: write them exactly in the form 'Use browser.goto to open <url> with version_sut_id=$versionSutID and account_role=user. Then use browser.snapshot and browser.screenshot.' or 'Call http.request with method=GET, url=<url>, version_sut_id=$versionSutID.' " +
                 "The version is bound to the local orders fixture at http://127.0.0.1:$OrdersPort. " +
                 "Use version_sut_id=$versionSutID and account_role=user on every step. " +
                 "Cases 1-6 must open http://127.0.0.1:$OrdersPort/p3/orders/1, call browser.snapshot and browser.screenshot, and assert stable visible content such as #order-no ORD-1001, #paid-amount 5200.00, or #refund-amount 5000.00. " +
-                "Cases 7-12 must open http://127.0.0.1:$OrdersPort/p3/login or http://127.0.0.1:$OrdersPort/p3/slow?ms=500, call browser.snapshot, and assert a stable heading or completion text. " +
-                "Each case must have exactly one step and at least one ui assertion. Do not ask questions; produce the 12 cases now.")
+                "Cases 7-10 must open http://127.0.0.1:$OrdersPort/p3/login or http://127.0.0.1:$OrdersPort/p3/slow?ms=500, call browser.snapshot, and assert a stable heading or completion text. " +
+                "Cases 11-12 must call http.request with method=GET and url=http://127.0.0.1:$OrdersPort/p8/large?bytes=20000 using version_sut_id=$versionSutID, then assert the HTTP status is 200 and the response marker P8-LARGE-BEGIN is visible. The response is intentionally larger than agent.tool_result_max_bytes, so the platform must spill it to content storage with head+content_ref. " +
+                "Each case must have at least one step and at least one assertion. Do not ask questions; produce the 12 cases now.")
             $message = Send-P8ConversationMessage -VersionID $versionID -ConversationID $designConversationID -Text $designPrompt -ClientMessageID ("p8-long-design-" + $script:runSuffix)
             if ($message.Status -ne 201) { throw "design prompt rejected: status=$($message.Status) $($message.Text)" }
 
@@ -1435,7 +1449,8 @@ function Invoke-P8ScenarioS10LongExecution {
             $distinct = @($allRuns | Where-Object { $caseVersionIDs -contains [string]$_.case_version_id } | ForEach-Object { [string]$_.case_version_id } | Sort-Object -Unique)
             Write-P8Check $checks ([string]$wave1ID -ne [string]$wave2ID) "S10 long execution used two waves" ("wave1=$wave1ID wave2=$wave2ID")
             Write-P8Check $checks ($distinct.Count -ge 12) "S10 long execution recorded 12 case runs across two waves" ("case_versions=" + $distinct.Count + " runs=" + $allRuns.Count)
-            Write-P8Check $checks (@($allRuns | Where-Object { @("done", "failed", "cancelled") -contains [string]$_.status }).Count -ge 12) "S10 long execution runs reached terminal states" ("terminal=" + @($allRuns | Where-Object { @("done", "failed", "cancelled") -contains [string]$_.status }).Count)
+            $terminalRuns = @($allRuns | Where-Object { @("pending", "running") -notcontains [string]$_.status })
+            Write-P8Check $checks ($terminalRuns.Count -ge 12) "S10 long execution runs reached terminal states" ("terminal=" + $terminalRuns.Count + " statuses=" + ((@($allRuns | ForEach-Object { [string]$_.status } | Sort-Object -Unique)) -join ","))
             $path = "real-design"
             $summaryText = "path=real-design cases=$($distinct.Count) wave1=$wave1ID wave2=$wave2ID"
             $snapshot = [pscustomobject]@{ path = $path; version_id = $versionID; case_versions = $caseVersionIDs; wave1 = $wave1ID; wave2 = $wave2ID; runs = @($allRuns | ForEach-Object { [pscustomobject]@{ id = $_.id; case_version_id = $_.case_version_id; status = $_.status } }) }
