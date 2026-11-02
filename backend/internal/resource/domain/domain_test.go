@@ -141,7 +141,7 @@ func TestPageValidate(t *testing.T) {
 		{name: "empty name", mutate: func(p *Page) { p.Name = "" }, wantErr: true, field: "name"},
 		{name: "invalid url", mutate: func(p *Page) { p.URL = "/orders" }, wantErr: true, field: "url"},
 		{name: "route without slash", mutate: func(p *Page) { p.RouteTemplate = "orders" }, wantErr: true, field: "route_template"},
-		{name: "empty route", mutate: func(p *Page) { p.RouteTemplate = "" }, wantErr: true, field: "route_template"},
+		{name: "empty route is optional", mutate: func(p *Page) { p.RouteTemplate = "" }},
 		{name: "unknown status", mutate: func(p *Page) { p.Status = "draft" }, wantErr: true, field: "status"},
 		{name: "unknown source", mutate: func(p *Page) { p.Source = "bogus" }, wantErr: true, field: "source"},
 	}
@@ -181,6 +181,44 @@ func TestDeriveRouteTemplate(t *testing.T) {
 			}
 			if !tc.wantErr && got != tc.want {
 				t.Fatalf("DeriveRouteTemplate(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizePageURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "lowercases scheme and host", raw: "HTTPS://App.Example.COM/Orders", want: "https://app.example.com/Orders"},
+		{name: "strips https default port", raw: "https://app.example.com:443/orders", want: "https://app.example.com/orders"},
+		{name: "strips http default port", raw: "http://app.example.com:80/orders", want: "http://app.example.com/orders"},
+		{name: "keeps non-default port", raw: "https://app.example.com:8443/orders", want: "https://app.example.com:8443/orders"},
+		{name: "strips trailing slashes", raw: "https://app.example.com/orders///", want: "https://app.example.com/orders"},
+		{name: "keeps root slash", raw: "https://app.example.com/", want: "https://app.example.com/"},
+		{name: "adds root for empty path", raw: "https://app.example.com", want: "https://app.example.com/"},
+		{name: "drops query", raw: "https://app.example.com/orders?state=open", want: "https://app.example.com/orders"},
+		{name: "keeps fragment", raw: "https://app.example.com/orders#/detail", want: "https://app.example.com/orders#/detail"},
+		{name: "drops query keeps fragment", raw: "https://app.example.com/orders?x=1#/detail", want: "https://app.example.com/orders#/detail"},
+		{name: "preserves userinfo", raw: "https://user:pass@App.Example.com:443/orders", want: "https://user:pass@app.example.com/orders"},
+		{name: "rejects relative url", raw: "/orders", wantErr: true},
+		{name: "rejects non-http scheme", raw: "ftp://app.example.com/orders", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NormalizePageURL(tc.raw)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("NormalizePageURL(%q) error = %v, wantErr %v", tc.raw, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				assertInvalidField(t, err, "url")
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("NormalizePageURL(%q) = %q, want %q", tc.raw, got, tc.want)
 			}
 		})
 	}

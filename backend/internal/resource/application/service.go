@@ -6,6 +6,7 @@ package resourceapp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -482,7 +483,7 @@ func (s *Service) CreatePage(ctx context.Context, environmentID int64, input Pag
 	}
 	created, err := s.insertPage(ctx, page, actorID)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	return toPageView(created), nil
 }
@@ -536,7 +537,8 @@ func (s *Service) insertPage(ctx context.Context, page resource.Page, actorID in
 	return created, nil
 }
 
-// UpdatePage applies a partial page update.
+// UpdatePage applies a partial page update. Clearing route_template re-derives
+// it from the (possibly patched) URL.
 func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, actorID int64) (PageView, error) {
 	page, err := s.repo.GetPage(ctx, id)
 	if err != nil {
@@ -560,13 +562,20 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 	if patch.Module != nil {
 		page.Module = *patch.Module
 	}
+	if strings.TrimSpace(page.RouteTemplate) == "" {
+		derived, deriveErr := resource.DeriveRouteTemplate(page.URL)
+		if deriveErr != nil {
+			return PageView{}, deriveErr
+		}
+		page.RouteTemplate = derived
+	}
 	page.UpdatedAt = s.clock.Now()
 	if err := page.Validate(); err != nil {
 		return PageView{}, err
 	}
 	updated, err := s.repo.UpdatePage(ctx, page)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	s.record(ctx, actorID, "resource.page.updated", "page", platformid.Format(updated.ID), map[string]any{
 		"sut_id":         platformid.Format(updated.SUTID),
@@ -616,8 +625,9 @@ func (s *Service) GetPage(ctx context.Context, id int64) (PageView, error) {
 	return toPageView(page), nil
 }
 
-// ImportPages validates the whole batch first, then inserts it. Duplicate
-// route templates are skipped; any invalid item rejects the batch with 400.
+// ImportPages validates the whole batch first, then inserts it. Pages whose
+// normalized URL already exists are skipped; any invalid item rejects the batch
+// with 400.
 func (s *Service) ImportPages(ctx context.Context, environmentID int64, inputs []PageInput, actorID int64) (ImportPagesResult, error) {
 	environment, err := s.repo.GetEnvironment(ctx, environmentID)
 	if err != nil {
@@ -883,13 +893,18 @@ func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInpu
 	if err := page.Validate(); err != nil {
 		return PageView{}, err
 	}
+	normalizedURL, err := resource.NormalizePageURL(page.URL)
+	if err != nil {
+		return PageView{}, err
+	}
 
 	existing, listErr := s.repo.ListPages(ctx, environment.ID)
 	if listErr != nil {
 		return PageView{}, listErr
 	}
 	for _, candidate := range existing {
-		if candidate.RouteTemplate != routeTemplate {
+		candidateURL, normalizeErr := resource.NormalizePageURL(candidate.URL)
+		if normalizeErr != nil || candidateURL != normalizedURL {
 			continue
 		}
 		if candidate.Status == resource.PageStatusProposed {
@@ -897,7 +912,7 @@ func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInpu
 			page.CreatedAt = candidate.CreatedAt
 			updated, updateErr := s.repo.UpdatePage(ctx, page)
 			if updateErr != nil {
-				return PageView{}, mapRepoError(updateErr, "page", "page route already exists in this environment")
+				return PageView{}, mapPageError(updateErr)
 			}
 			s.record(ctx, 0, "resource.page.proposed", "page", platformid.Format(updated.ID), map[string]any{
 				"sut_id":         platformid.Format(updated.SUTID),
@@ -913,7 +928,7 @@ func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInpu
 	page.ID = s.ids.Next()
 	created, createErr := s.repo.CreatePage(ctx, page)
 	if createErr != nil {
-		return PageView{}, mapRepoError(createErr, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(createErr)
 	}
 	s.record(ctx, 0, "resource.page.proposed", "page", platformid.Format(created.ID), map[string]any{
 		"sut_id":         platformid.Format(created.SUTID),
@@ -937,7 +952,7 @@ func (s *Service) ConfirmPage(ctx context.Context, pageID, actorID int64) (PageV
 	page.UpdatedAt = s.clock.Now()
 	updated, err := s.repo.UpdatePage(ctx, page)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	s.record(ctx, actorID, "resource.page.confirmed", "page", platformid.Format(updated.ID), map[string]any{
 		"sut_id":         platformid.Format(updated.SUTID),
@@ -961,7 +976,7 @@ func (s *Service) RejectPage(ctx context.Context, pageID, actorID int64) (PageVi
 	page.UpdatedAt = s.clock.Now()
 	updated, err := s.repo.UpdatePage(ctx, page)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	s.record(ctx, actorID, "resource.page.rejected", "page", platformid.Format(updated.ID), map[string]any{
 		"sut_id":         platformid.Format(updated.SUTID),
@@ -1574,6 +1589,18 @@ func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (b
 		return platform.Conflict(kind + " is referenced by a version binding")
 	}
 	return nil
+}
+
+// mapPageError maps page write failures. A normalized-URL collision is a
+// field-level 409 so clients can highlight the URL input instead of showing a
+// generic "page route already exists" conflict.
+func mapPageError(err error) error {
+	if errors.Is(err, resource.ErrPageURLDuplicate) {
+		apiErr := platform.NewError(http.StatusConflict, "page_url_exists", "page url already exists in this environment")
+		apiErr.Details = map[string]any{"field": "url"}
+		return apiErr
+	}
+	return mapRepoError(err, "page", "page already exists in this environment")
 }
 
 func mapRepoError(err error, kind, conflictMessage string) error {
