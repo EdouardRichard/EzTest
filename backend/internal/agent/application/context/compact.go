@@ -3,6 +3,7 @@ package agentcontext
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -14,11 +15,12 @@ import (
 // superseded by the next boundary compaction.
 const SegmentSummary = "summary"
 
-// CompactionKeepRecent is the number of compactable suffix segments replayed
-// verbatim when a boundary compacts. Older history/tool-result segments are
-// folded into the rolling summary (spec §6.4: summary + 近 N 条). The value
-// mirrors the P1 conversation-window budget so both context paths keep the same
-// amount of recent transcript.
+// CompactionKeepRecent is the default number of compactable suffix segments
+// replayed verbatim when a boundary compacts. Older history/tool-result
+// segments are folded into the rolling summary (spec §6.4: summary + 近 N 条).
+// The default mirrors the P1 conversation-window budget so both context paths
+// keep the same amount of recent transcript. Callers that honor
+// context.keep_recent_messages override it with NewCompactor(..., WithKeepRecent(n)).
 const CompactionKeepRecent = 12
 
 const (
@@ -40,18 +42,86 @@ type Summarizer interface {
 	Summarize(ctx context.Context, messages []Message) (string, error)
 }
 
+// CompactorOption customizes a Compactor built by NewCompactor.
+type CompactorOption func(*Compactor)
+
+// WithKeepRecent overrides the number of compactable suffix segments replayed
+// verbatim at a boundary. It mirrors context.keep_recent_messages (default 12,
+// min 0); a negative value is ignored so the default stays in effect. Zero is
+// valid: every compactable segment folds into the rolling summary.
+func WithKeepRecent(n int) CompactorOption {
+	return func(c *Compactor) {
+		if c == nil || n < 0 {
+			return
+		}
+		c.keepRecent = n
+		c.keepRecentSet = true
+	}
+}
+
+// WithLogger sets the logger used to report compaction degradation. A
+// summarizer failure falls back to the deterministic summary and is logged;
+// nil keeps slog.Default().
+func WithLogger(logger *slog.Logger) CompactorOption {
+	return func(c *Compactor) {
+		if c == nil || logger == nil {
+			return
+		}
+		c.logger = logger
+	}
+}
+
 // Compactor folds the compactable suffix of a packet into a rolling summary
 // when the packet was assembled at a declared cache-invalidation boundary.
-// The zero value is not useful for LLM summaries but is safe: a nil summarizer
-// falls back to the deterministic summary.
+// The zero value is useful for deterministic summaries and keeps the default
+// recent window; a nil summarizer also falls back to the deterministic summary.
 type Compactor struct {
-	summarizer Summarizer
+	summarizer    Summarizer
+	keepRecent    int
+	keepRecentSet bool
+	logger        *slog.Logger
 }
 
 // NewCompactor wires the compaction summarizer. A nil summarizer is allowed;
-// boundary compaction then uses the deterministic fallback.
-func NewCompactor(summarizer Summarizer) *Compactor {
-	return &Compactor{summarizer: summarizer}
+// boundary compaction then uses the deterministic fallback. The recent window
+// defaults to CompactionKeepRecent and can be configured with WithKeepRecent.
+func NewCompactor(summarizer Summarizer, options ...CompactorOption) *Compactor {
+	compactor := &Compactor{
+		summarizer:    summarizer,
+		keepRecent:    CompactionKeepRecent,
+		keepRecentSet: true,
+	}
+	for _, option := range options {
+		if option != nil {
+			option(compactor)
+		}
+	}
+	return compactor
+}
+
+// recentWindow returns the configured number of recent compactable segments.
+// The zero-value Compactor has no explicit setting and falls back to the
+// package default.
+func (c *Compactor) recentWindow() int {
+	if c == nil || !c.keepRecentSet {
+		return CompactionKeepRecent
+	}
+	return c.keepRecent
+}
+
+// logWarn reports compaction degradation through the configured logger.
+func (c *Compactor) logWarn(ctx context.Context, message string, args ...any) {
+	logger := (*slog.Logger)(nil)
+	if c != nil {
+		logger = c.logger
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logger.WarnContext(ctx, message, args...)
 }
 
 // Compact is the frozen package-level entry point from the P3-T4 contract. It
@@ -105,10 +175,12 @@ func (c *Compactor) Compact(ctx context.Context, packet ContextPacket) (ContextP
 	}
 
 	var summarizer Summarizer
+	keepRecent := CompactionKeepRecent
 	if c != nil {
 		summarizer = c.summarizer
+		keepRecent = c.recentWindow()
 	}
-	compacted, summary := compactSegments(ctx, packet.Segments, summarizer)
+	compacted, summary := compactSegments(ctx, packet.Segments, summarizer, keepRecent, c)
 	if summary == nil {
 		// Nothing compactable (or the boundary arrived before the transcript
 		// outgrew the verbatim window): keep the packet unchanged.
@@ -136,10 +208,11 @@ func compactableSegment(segment Segment) bool {
 }
 
 // compactSegments returns the compacted segment list and the appended summary
-// segment, or (nil, nil) when the packet does not need compaction. It is a pure
-// function: the input slice is never mutated, so callers can keep the original
-// packet for audit.
-func compactSegments(ctx context.Context, segments []Segment, summarizer Summarizer) ([]Segment, *Segment) {
+// segment, or (nil, nil) when the packet does not need compaction. keepRecent
+// bounds how many compactable segments stay verbatim (0 is allowed). It is a
+// pure function: the input slice is never mutated, so callers can keep the
+// original packet for audit.
+func compactSegments(ctx context.Context, segments []Segment, summarizer Summarizer, keepRecent int, compactor *Compactor) ([]Segment, *Segment) {
 	compactable := make([]int, 0, len(segments))
 	priorSummaries := make([]Segment, 0, 1)
 	for index, segment := range segments {
@@ -150,13 +223,13 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 			compactable = append(compactable, index)
 		}
 	}
-	if len(compactable) <= CompactionKeepRecent {
+	if len(compactable) <= keepRecent {
 		// The newest transcript already fits the verbatim window. This also
 		// makes a repeated Compact on the same boundary a no-op: compaction
-		// keeps exactly CompactionKeepRecent segments.
+		// keeps exactly keepRecent compactable segments.
 		return nil, nil
 	}
-	foldCount := len(compactable) - CompactionKeepRecent
+	foldCount := len(compactable) - keepRecent
 	folded := make([]int, 0, foldCount)
 	for _, index := range compactable[:foldCount] {
 		folded = append(folded, index)
@@ -182,9 +255,18 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 
 	summaryText := ""
 	if summarizer != nil {
-		if generated, err := summarizer.Summarize(ctx, messages); err == nil {
+		generated, err := summarizer.Summarize(ctx, messages)
+		if err != nil {
+			compactor.logWarn(ctx, "context compaction: summarizer failed; using deterministic summary", "error", err)
+		} else {
 			summaryText = strings.TrimSpace(generated)
 		}
+	}
+	if summaryText != "" {
+		// Model-generated summaries are untrusted input: bound them to the same
+		// budget as the deterministic fallback so one bad response cannot blow
+		// up the suffix.
+		summaryText = truncateCompactionRunes(summaryText, maxCompactionSummaryRunes)
 	}
 	if summaryText == "" {
 		summaryText = deterministicCompactionSummary(messages)
@@ -207,7 +289,10 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 	// briefing, conversation summary, 近 N 条): it is a new segment appended to
 	// the packet before the retained recent messages, and it supersedes any
 	// previous summary without touching history or the pinned segments.
-	firstRetained := compactable[foldCount]
+	firstRetained := compactable[0]
+	if foldCount < len(compactable) {
+		firstRetained = compactable[foldCount]
+	}
 	inserted := false
 	for index, segment := range segments {
 		if index == firstRetained {
@@ -225,8 +310,8 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 		out = append(out, segment)
 	}
 	if !inserted {
-		// Defensive: every compactable segment was folded (not reachable with a
-		// positive recent window); still append the summary as a new segment.
+		// Defensive: every compactable segment was folded and the insertion
+		// index was not reached; still append the summary as a new segment.
 		out = append(out, summarySegment)
 	}
 	return out, &summarySegment

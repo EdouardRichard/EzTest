@@ -1,15 +1,19 @@
 package agentcontext_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
@@ -365,9 +369,12 @@ func TestPinnedFactsSurviveCompaction(t *testing.T) {
 	}
 
 	// A failing summarizer falls back to the deterministic summary instead of
-	// failing the run, and never duplicates pinned content.
+	// failing the run, and never duplicates pinned content. The failure is
+	// logged; the discard logger keeps this test's output pristine.
 	failing := &recordingSummarizer{err: errors.New("gateway down")}
-	fallback, err := agentcontext.NewCompactor(failing).Compact(context.Background(), built.Packet)
+	discardLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fallback, err := agentcontext.NewCompactor(failing, agentcontext.WithLogger(discardLogger)).
+		Compact(context.Background(), built.Packet)
 	if err != nil {
 		t.Fatalf("fallback Compact: %v", err)
 	}
@@ -416,6 +423,193 @@ func TestPinnedFactsSurviveCompaction(t *testing.T) {
 	}
 }
 
+// TestBuildDropsSummaryOnSessionReset proves a fresh session cannot inherit a
+// summary from a previous prompt chain: session_reset starts with no carried
+// transcript, even when the caller still passes the compacted Previous packet.
+func TestBuildDropsSummaryOnSessionReset(t *testing.T) {
+	assembler := agentcontext.NewAssembler()
+	boundary := longHistoryRequest()
+	boundary.Stage = "designing"
+	boundary.Invalidation = agentcontext.InvalidationStageBoundary
+	built, err := assembler.Build(context.Background(), boundary)
+	if err != nil {
+		t.Fatalf("boundary Build: %v", err)
+	}
+	compacted, err := agentcontext.Compact(context.Background(), built.Packet)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	_, staleSummary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok {
+		t.Fatalf("fixture compacted packet has no summary: %#v", compacted.Segments)
+	}
+
+	resetRequest := longHistoryRequest()
+	resetRequest.Stage = "clarifying"
+	resetRequest.Invalidation = agentcontext.InvalidationSessionReset
+	resetRequest.Previous = &compacted
+	resetRequest.History = []agentcontext.Message{
+		{ID: 900, Role: "user", Content: "fresh-session-question"},
+	}
+	fresh, err := assembler.Build(context.Background(), resetRequest)
+	if err != nil {
+		t.Fatalf("session_reset Build: %v", err)
+	}
+	if got := countSegments(fresh.Packet, agentcontext.SegmentSummary); got != 0 {
+		t.Fatalf("session_reset carried %d stale summary segments into the fresh chain", got)
+	}
+	if strings.Contains(suffixText(fresh), staleSummary.Content) {
+		t.Fatalf("session_reset leaked the previous summary into the fresh chain:\n%s", suffixText(fresh))
+	}
+	if !strings.Contains(suffixText(fresh), "fresh-session-question") {
+		t.Fatalf("session_reset lost the fresh transcript:\n%s", suffixText(fresh))
+	}
+	if fresh.Packet.InvalidationReason != "session_reset" {
+		t.Fatalf("session_reset InvalidationReason = %q", fresh.Packet.InvalidationReason)
+	}
+}
+
+// TestCompactionKeepRecentOption pins the configurable recent window: Task 48
+// injects context.keep_recent_messages (default 12, min 0) instead of relying
+// on the package default, so the configured value must control how many recent
+// segments stay verbatim and how much is folded into the rolling summary.
+func TestCompactionKeepRecentOption(t *testing.T) {
+	assembler := agentcontext.NewAssembler()
+	request := longHistoryRequest()
+	request.Stage = "designing"
+	request.Invalidation = agentcontext.InvalidationStageBoundary
+	built, err := assembler.Build(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	const keepRecent = 3
+	compacted, err := agentcontext.NewCompactor(nil, agentcontext.WithKeepRecent(keepRecent)).
+		Compact(context.Background(), built.Packet)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	retained := compactableSegments(compacted)
+	if len(retained) != keepRecent {
+		t.Fatalf("retained compactable segments = %d, want the configured %d", len(retained), keepRecent)
+	}
+	if newest := retained[len(retained)-1].Content; !strings.Contains(newest, "compactable-history-14") {
+		t.Fatalf("newest transcript was not retained verbatim: %q", newest)
+	}
+	_, summary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok {
+		t.Fatalf("compacted packet has no summary: %#v", compacted.Segments)
+	}
+	if !strings.Contains(summary.Content, "compactable-history-00") {
+		t.Fatalf("summary does not cover the newly folded oldest transcript: %q", summary.Content)
+	}
+	if strings.Contains(summary.Content, "compactable-history-14") {
+		t.Fatalf("summary includes the retained recent transcript: %q", summary.Content)
+	}
+}
+
+// TestCompactionKeepRecentZero covers the configured minimum (0): every
+// compactable segment folds and the summary still lands after the pinned head,
+// without panicking on an empty retained window.
+func TestCompactionKeepRecentZero(t *testing.T) {
+	assembler := agentcontext.NewAssembler()
+	request := longHistoryRequest()
+	request.Stage = "designing"
+	request.Invalidation = agentcontext.InvalidationStageBoundary
+	built, err := assembler.Build(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	compactor := agentcontext.NewCompactor(nil, agentcontext.WithKeepRecent(0))
+	compacted, err := compactor.Compact(context.Background(), built.Packet)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if got := len(compactableSegments(compacted)); got != 0 {
+		t.Fatalf("retained compactable segments = %d, want 0", got)
+	}
+	if got := countSegments(compacted, agentcontext.SegmentSummary); got != 1 {
+		t.Fatalf("summary segments = %d, want 1", got)
+	}
+	if len(compacted.Segments) < 4 || compacted.Segments[3].Name != agentcontext.SegmentSummary {
+		t.Fatalf("summary was not inserted right after the pinned head: %#v", compacted.Segments)
+	}
+	if compacted.Segments[0].Name != agentcontext.SegmentPrefix || compacted.Segments[2].Name != agentcontext.SegmentFacts {
+		t.Fatalf("pinned head changed: %#v", compacted.Segments[:3])
+	}
+
+	again, err := compactor.Compact(context.Background(), compacted)
+	if err != nil {
+		t.Fatalf("repeated Compact: %v", err)
+	}
+	if !reflect.DeepEqual(again, compacted) {
+		t.Fatal("the same boundary compacted twice with a zero recent window")
+	}
+}
+
+// TestCompactionBoundsInjectedSummary proves model-generated summaries cannot
+// enter the packet unbounded: the injected output is truncated to the same
+// budget as the deterministic fallback.
+func TestCompactionBoundsInjectedSummary(t *testing.T) {
+	assembler := agentcontext.NewAssembler()
+	request := longHistoryRequest()
+	request.Stage = "designing"
+	request.Invalidation = agentcontext.InvalidationStageBoundary
+	built, err := assembler.Build(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	longSummary := strings.Repeat("摘要", 3000) // 6000 runes, above the bound
+	compactor := agentcontext.NewCompactor(&recordingSummarizer{summary: longSummary})
+	compacted, err := compactor.Compact(context.Background(), built.Packet)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	_, summary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok {
+		t.Fatalf("compacted packet has no summary: %#v", compacted.Segments)
+	}
+	const maxSummaryRunes = 2000
+	if got := utf8.RuneCountInString(summary.Content); got > maxSummaryRunes {
+		t.Fatalf("injected summary has %d runes, want at most %d", got, maxSummaryRunes)
+	}
+	if !strings.HasSuffix(summary.Content, "…") {
+		t.Fatalf("bounded summary is not marked as truncated: %q", summary.Content[len(summary.Content)-16:])
+	}
+}
+
+// TestCompactionLogsSummarizerFailure pins observability for the fallback path:
+// a summary failure is logged (without failing the run) so operators can see
+// degraded rolling summaries.
+func TestCompactionLogsSummarizerFailure(t *testing.T) {
+	assembler := agentcontext.NewAssembler()
+	request := longHistoryRequest()
+	request.Stage = "designing"
+	request.Invalidation = agentcontext.InvalidationStageBoundary
+	built, err := assembler.Build(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	failing := &recordingSummarizer{err: errors.New("gateway down")}
+	compacted, err := agentcontext.NewCompactor(failing, agentcontext.WithLogger(logger)).
+		Compact(context.Background(), built.Packet)
+	if err != nil {
+		t.Fatalf("Compact with a failing summarizer: %v", err)
+	}
+	if got := countSegments(compacted, agentcontext.SegmentSummary); got != 1 {
+		t.Fatalf("summary segments after a summarizer failure = %d, want the deterministic fallback", got)
+	}
+	logged := logOutput.String()
+	if !strings.Contains(logged, "summarizer") || !strings.Contains(logged, "gateway down") {
+		t.Fatalf("summarizer failure was not logged: %q", logged)
+	}
+}
+
 /* -------------------------------- read API ------------------------------- */
 
 // fakeContextPacketReader is the narrow read port fake of the packet API.
@@ -435,13 +629,20 @@ func (f *fakeContextPacketReader) LatestContextPacket(_ context.Context, version
 	return f.packet, nil
 }
 
+// contextPacketAuth mirrors the production middleware: it injects an actor
+// with the requested role and defaults to admin so handler tests can exercise
+// the admin-only route. X-Test-Anon simulates a missing session.
 func contextPacketAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Test-Anon") != "" {
 			httpx.Error(w, r, platform.Unauthenticated())
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(platform.WithActor(r.Context(), platform.Actor{ID: 42})))
+		role := r.Header.Get("X-Test-Role")
+		if role == "" {
+			role = "admin"
+		}
+		next.ServeHTTP(w, r.WithContext(platform.WithActor(r.Context(), platform.Actor{ID: 42, Role: role})))
 	})
 }
 
@@ -484,7 +685,7 @@ func TestContextPacketReadAPI(t *testing.T) {
 	if reader.calls != 1 || reader.versionID != 7 {
 		t.Fatalf("reader calls = %d, version = %d; want 1 call for version 7", reader.calls, reader.versionID)
 	}
-	var payload struct {
+	type decodedContextPacket struct {
 		Data struct {
 			PrefixHash         string `json:"prefix_hash"`
 			CachedTokens       int    `json:"cached_tokens"`
@@ -501,6 +702,7 @@ func TestContextPacketReadAPI(t *testing.T) {
 			} `json:"segments"`
 		} `json:"data"`
 	}
+	var payload decodedContextPacket
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode body %q: %v", recorder.Body.String(), err)
 	}
@@ -519,6 +721,55 @@ func TestContextPacketReadAPI(t *testing.T) {
 	}
 	if data.Segments[0].Content == "" || data.Segments[0].Tokens <= 0 {
 		t.Fatalf("first segment = %#v", data.Segments[0])
+	}
+	if data.CachedTokens != built.Packet.CachedTokens || data.CacheHit != built.Packet.CacheHit {
+		t.Fatalf("cache bookkeeping = cached_tokens:%d cache_hit:%v, want %d/%v",
+			data.CachedTokens, data.CacheHit, built.Packet.CachedTokens, built.Packet.CacheHit)
+	}
+
+	// A later round with an unchanged prefix reports a cache hit, and a tool
+	// result keeps its tool_call_id on the wire.
+	firstRequest := baseRequest()
+	firstBuilt, err := assembler.Build(context.Background(), firstRequest)
+	if err != nil {
+		t.Fatalf("cache fixture first Build: %v", err)
+	}
+	cachedRequest := baseRequest()
+	cachedRequest.Previous = &firstBuilt.Packet
+	cachedRequest.History = append(append([]agentcontext.Message(nil), firstRequest.History...),
+		agentcontext.Message{ID: 13, Role: "assistant", Content: "第二轮回复"})
+	cachedRequest.ToolResults = []agentcontext.ToolResult{
+		{CallID: "call-7", Name: "read", Content: "工具原始结果"},
+	}
+	cachedBuilt, err := assembler.Build(context.Background(), cachedRequest)
+	if err != nil {
+		t.Fatalf("cache fixture second Build: %v", err)
+	}
+	if !cachedBuilt.Packet.CacheHit || cachedBuilt.Packet.CachedTokens <= 0 {
+		t.Fatalf("cache fixture did not produce a cache hit: %#v", cachedBuilt.Packet)
+	}
+	cachedReader := &fakeContextPacketReader{packet: cachedBuilt.Packet}
+	cachedHandler := newContextPacketServer(t, cachedReader)
+	cachedRecorder := getContextPacket(t, cachedHandler, "/api/versions/7/context-packets/latest", nil)
+	if cachedRecorder.Code != http.StatusOK {
+		t.Fatalf("cached status = %d, body = %s", cachedRecorder.Code, cachedRecorder.Body.String())
+	}
+	var cachedPayload decodedContextPacket
+	if err := json.Unmarshal(cachedRecorder.Body.Bytes(), &cachedPayload); err != nil {
+		t.Fatalf("decode cached body %q: %v", cachedRecorder.Body.String(), err)
+	}
+	if cachedPayload.Data.CachedTokens != cachedBuilt.Packet.CachedTokens || !cachedPayload.Data.CacheHit {
+		t.Fatalf("cache bookkeeping = cached_tokens:%d cache_hit:%v, want %d/true",
+			cachedPayload.Data.CachedTokens, cachedPayload.Data.CacheHit, cachedBuilt.Packet.CachedTokens)
+	}
+	toolCallID := ""
+	for _, segment := range cachedPayload.Data.Segments {
+		if segment.Name == agentcontext.SegmentToolResult {
+			toolCallID = segment.ToolCallID
+		}
+	}
+	if toolCallID != "call-7" {
+		t.Fatalf("tool_result tool_call_id = %q, want call-7 (segments %#v)", toolCallID, cachedPayload.Data.Segments)
 	}
 
 	// Authentication is mandatory and must not touch the reader.
@@ -567,5 +818,35 @@ func TestContextPacketReadAPI(t *testing.T) {
 	handler.ServeHTTP(postRecorder, postRequest)
 	if postRecorder.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST status = %d", postRecorder.Code)
+	}
+}
+
+// TestContextPacketReadAPIAdminOnly pins the permission decision for the packet
+// read API: the payload contains the stable system-prompt prefix and the
+// replayed transcript, so it is admin-only like the profile prompt read APIs.
+// Ordinary logged-in users must not receive prompt content.
+func TestContextPacketReadAPIAdminOnly(t *testing.T) {
+	assembler := agentcontext.NewAssembler()
+	built, err := assembler.Build(context.Background(), baseRequest())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	reader := &fakeContextPacketReader{packet: built.Packet}
+	handler := newContextPacketServer(t, reader)
+
+	for _, role := range []string{"member", "user"} {
+		forbidden := getContextPacket(t, handler, "/api/versions/7/context-packets/latest",
+			map[string]string{"X-Test-Role": role})
+		if forbidden.Code != http.StatusForbidden {
+			t.Fatalf("%s status = %d, body = %s", role, forbidden.Code, forbidden.Body.String())
+		}
+	}
+	if reader.calls != 0 {
+		t.Fatalf("non-admin requests reached the reader: %d calls", reader.calls)
+	}
+
+	admin := getContextPacket(t, handler, "/api/versions/7/context-packets/latest", nil)
+	if admin.Code != http.StatusOK {
+		t.Fatalf("admin status = %d, body = %s", admin.Code, admin.Body.String())
 	}
 }

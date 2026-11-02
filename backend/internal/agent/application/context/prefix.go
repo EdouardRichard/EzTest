@@ -243,15 +243,20 @@ func (a *Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembl
 	// describes older history the caller no longer replays. This is how a
 	// compacted packet re-enters the next assembly; without it the summary would
 	// only survive on the persisted packet and the next round would lose it.
-	for _, summary := range previousSummaries(previous) {
-		summary.Prefix = false
-		summary = withTokens(summary)
-		segments = append(segments, summary)
-		messages = append(messages, Message{
-			Role:       summary.Role,
-			Content:    summary.Content,
-			ToolCallID: summary.ToolCallID,
-		})
+	// A session_reset starts a fresh prompt chain: a stale summary from the
+	// previous chain must not leak into the new session, even when a caller
+	// still passes the previous packet.
+	if request.Invalidation != InvalidationSessionReset {
+		for _, summary := range previousSummaries(previous) {
+			summary.Prefix = false
+			summary = withTokens(summary)
+			segments = append(segments, summary)
+			messages = append(messages, Message{
+				Role:       summary.Role,
+				Content:    summary.Content,
+				ToolCallID: summary.ToolCallID,
+			})
+		}
 	}
 	// History is replayed verbatim: no merging, reordering or truncation. IDs
 	// and tool-call identities are preserved so an earlier append is never
@@ -397,7 +402,8 @@ func withTokens(segment Segment) Segment {
 // previousSummaries returns the rolling summary segments of the previous
 // packet in packet order. Build carries them into the next assembly verbatim
 // (only the token estimate is recomputed), so a compacted packet's summary
-// survives a rebuild without being re-rendered from the transcript.
+// survives a rebuild without being re-rendered from the transcript. Callers
+// must not use them for a session_reset chain.
 func previousSummaries(previous *ContextPacket) []Segment {
 	if previous == nil {
 		return nil

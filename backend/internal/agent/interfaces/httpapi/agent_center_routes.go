@@ -26,7 +26,8 @@ func RegisterAgentCenterRoutes(mux *http.ServeMux, auth func(http.Handler) http.
 
 // ContextPacketReader is the narrow read port behind
 // GET /api/versions/{id}/context-packets/latest. The production adapter reads
-// the latest persisted context_packet of one version; it is wired together with
+// the latest persisted context_packet of one version (resolving the version via
+// agent_run when the stored row only carries run_id); it is wired together with
 // context_packet persistence by the P3-T6 runner wiring (Task 48), because the
 // existing context_packet row stores the P1 builder shape, not the cache-first
 // packet. Tests inject an in-memory fake. It returns ErrContextPacketNotFound
@@ -50,7 +51,9 @@ func NewContextPacketHandler(reader ContextPacketReader) *ContextPacketHandler {
 
 // RegisterContextPacketRoutes mounts the context_packet read API. The assembly
 // root owns the mount call and middleware (as with RegisterAgentCenterRoutes),
-// so this package stays independent from server.
+// so this package stays independent from server. The composition root must pass
+// the Task 48 production reader; a nil reader is reported as 503, never mounted
+// as a working endpoint.
 func RegisterContextPacketRoutes(mux *http.ServeMux, auth func(http.Handler) http.Handler, h *ContextPacketHandler) {
 	if mux == nil || auth == nil || h == nil {
 		return
@@ -58,11 +61,14 @@ func RegisterContextPacketRoutes(mux *http.ServeMux, auth func(http.Handler) htt
 	mux.Handle("GET /api/versions/{id}/context-packets/latest", auth(http.HandlerFunc(h.Latest)))
 }
 
-// Latest GET /api/versions/{id}/context-packets/latest (any logged-in user).
-// It returns the latest persisted cache-first context packet of one version,
-// or 404 when no packet has been recorded yet.
+// Latest GET /api/versions/{id}/context-packets/latest (admin only). The packet
+// contains the stable system-prompt prefix and the replayed transcript, so it
+// follows the profile prompt read APIs: ordinary logged-in users must not
+// receive prompt content (spec R9). It returns the latest persisted cache-first
+// context packet of one version, or 404 when no packet has been recorded yet.
 func (h *ContextPacketHandler) Latest(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireActor(w, r); !ok {
+	if _, err := requireAdminActor(r); err != nil {
+		httpx.Error(w, r, err)
 		return
 	}
 	versionID, err := validation.NonEmptyID("id", r.PathValue("id"))
@@ -99,8 +105,9 @@ type contextPacketDTO struct {
 }
 
 // contextSegmentDTO is one ordered packet segment. Content is included because
-// this endpoint is the read API of the persisted packet; it stays behind the
-// logged-in middleware and is never part of the Agent center read model.
+// this admin-only endpoint is the read API of the persisted packet; the route
+// is never part of the ordinary Agent center read model, which never exposes
+// prompts or transcripts.
 type contextSegmentDTO struct {
 	Name       string `json:"name"`
 	Role       string `json:"role"`
