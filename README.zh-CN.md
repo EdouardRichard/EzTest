@@ -16,16 +16,16 @@
 </p>
 
 > **状态：v0.2（P8）。** 0.2 是完整替代版本：对齐 0.1 P0–P8 的全部能力，并补齐 P9 五项（HTML/PDF
-> 报告、跨版本知识、统一 GC、多副本安全、问题重开/合并/跨波次去重）。当前分支功能已完成到 P7，
-> 正在 P8 收口。
+> 报告、跨版本知识、统一 GC、多副本安全、问题重开/合并/跨波次去重）。P8 硬化与验收已完成并合回
+> `feat/v0.2`。
 >
 > **验证状态（请先阅读）。**
 >
 > - 已落盘证据：P6（`docs/version-V0.2/acceptance/p6/`）与 P7
 >   （`docs/version-V0.2/acceptance/p7/`），均使用真实 LLM 与真实 Chrome 执行。
-> - P8 验收入口与证据目录：`docs/version-V0.2/acceptance/p8/`（runbook 已落盘；
->   `acceptance.md`、`resilience.md`、`multi.md`、`e2e.md`、`capability-signoff.md`、`static.md`
->   在最终 P8 验收运行后记录到该目录）。
+> - P8 证据已记录到 `docs/version-V0.2/acceptance/p8/`：全旅程 S0–S6、韧性 S9/S10、多副本 S8、
+>   37 行能力矩阵、浏览器 E2E 与静态门均通过（1 个 E2E 报告对象数据缺口已显式记录；SLO 与安全审计
+>   按用户裁定跳过）。
 > - `deploy/` 下的 Docker Compose **已交付并做了静态校验，但从未在本机构建或启动**（本机未安装
 >   Docker）。
 > - 0.2 的 SLO 测量与安全审计**按用户裁定跳过**，本文不作任何相关宣称。
@@ -252,7 +252,7 @@ cd renderer; node --test           # 渲染器 node:test
 | [docs/version-V0.2/contracts/README.md](docs/version-V0.2/contracts/README.md) | 各阶段冻结契约与计数 |
 | [docs/version-V0.2/acceptance/p6/](docs/version-V0.2/acceptance/p6/) | P6 能力、提示词对齐与截图证据 |
 | [docs/version-V0.2/acceptance/p7/](docs/version-V0.2/acceptance/p7/) | P7/P9 API/DB 验收与浏览器 E2E 证据 |
-| [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/) | P8 runbook 与验收证据（结果在最终运行后记录） |
+| [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/) | P8 全旅程、韧性、多副本、能力矩阵、E2E 与静态证据 |
 | [deploy/README.md](deploy/README.md) | Compose 栈、卷、端口与验证状态 |
 | [DEVELOPMENT_STATUS.md](DEVELOPMENT_STATUS.md) | P0–P8 状态、测试/契约计数与已知限制 |
 | [docs/version-V0.1/README.md](docs/version-V0.1/README.md) | 0.1 文档归档索引 |

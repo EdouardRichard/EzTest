@@ -17,16 +17,17 @@
 
 > **Status: v0.2 (P8).** 0.2 is the full replacement line: it re-aligns every 0.1 P0–P8 capability and
 > adds the five P9 items (HTML/PDF reports, cross-version knowledge, unified GC, multi-replica safety,
-> issue reopen/merge/cross-wave dedupe). The branch is feature-complete through P7 and is being
-> finalized in P8.
+> issue reopen/merge/cross-wave dedupe). P8 hardening and acceptance are complete and merged into
+> `feat/v0.2`.
 >
 > **Validation status — read this first.**
 >
 > - Recorded evidence: P6 (`docs/version-V0.2/acceptance/p6/`) and P7
 >   (`docs/version-V0.2/acceptance/p7/`), both exercised with a real LLM and a real Chrome browser.
-> - P8 acceptance entry and evidence directory: `docs/version-V0.2/acceptance/p8/` (the runbook is
->   there now; `acceptance.md`, `resilience.md`, `multi.md`, `e2e.md`, `capability-signoff.md` and
->   `static.md` are recorded there after the final P8 acceptance run).
+> - P8 evidence is recorded in `docs/version-V0.2/acceptance/p8/`: full journey S0–S6, resilience
+>   S9/S10, multi-replica S8, the 37-row capability matrix, browser E2E and the static gate all
+>   passed (one E2E report-object data gap is recorded explicitly; SLO and the security audit were
+>   waived by the user).
 > - The Docker Compose stack in `deploy/` is **delivered and statically validated, but it has never
 >   been built or started on this host** (Docker is not installed here).
 > - SLO measurement and the security audit were **skipped by user decision** for 0.2 and are not
@@ -274,7 +275,7 @@ known limitations — is [docs/version-V0.2/acceptance/p8/runbook.md](docs/versi
 | [docs/version-V0.2/contracts/README.md](docs/version-V0.2/contracts/README.md) | Frozen per-phase contracts and counts |
 | [docs/version-V0.2/acceptance/p6/](docs/version-V0.2/acceptance/p6/) | P6 capability, prompt-parity and screenshot evidence |
 | [docs/version-V0.2/acceptance/p7/](docs/version-V0.2/acceptance/p7/) | P7/P9 API/DB acceptance and browser E2E evidence |
-| [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/) | P8 runbook and acceptance evidence (results recorded after the final run) |
+| [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/) | P8 full-journey, resilience, multi-replica, capability, E2E and static evidence |
 | [deploy/README.md](deploy/README.md) | Compose stack, volumes, ports, validation status |
 | [DEVELOPMENT_STATUS.md](DEVELOPMENT_STATUS.md) | P0–P8 status, test/contract counts and known limitations |
 | [docs/version-V0.1/README.md](docs/version-V0.1/README.md) | Archived 0.1 documentation index |

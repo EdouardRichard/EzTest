@@ -1,6 +1,6 @@
 # EzTest 开发状态（0.2 / P8）
 
-> 状态：**0.2 P8 硬化与验收阶段**（2026-11-02，分支 `feat/v0.2-p8`）。
+> 状态：**0.2 P8 硬化与验收已完成**（2026-11-02，`feat/v0.2-p8` 已合回 `feat/v0.2`，merge `f5c5801`）。
 > 产品定位：AI 驱动、半自主、端到端测试系统；0.2 为完整替代版（0.1 P0–P8 全功能对齐 + P9 五项）。
 > 设计权威：[docs/version-V0.2/README.md](docs/version-V0.2/README.md) 与
 > [docs/version-V0.2/contracts/README.md](docs/version-V0.2/contracts/README.md)。
@@ -8,10 +8,10 @@
 
 ## 0. 验证状态（先读）
 
-- **P8 最终验收待记录**：入口与证据索引已落盘到
-  [docs/version-V0.2/acceptance/p8/runbook.md](docs/version-V0.2/acceptance/p8/runbook.md)；
-  `acceptance / resilience / multi / e2e / capability-signoff / static` 等结果文档在 P8 最终验收
-  运行后记录到同一目录。本文件不预写 P8 PASS。
+- **P8 验收已 PASS**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
+  全旅程 S0–S6（568s）、韧性 S9/S10、多副本 S8（72 PASS/0 FAIL）、37 行能力矩阵
+  （28 PASS/9 PASS(prior)/0 FAIL）、浏览器 E2E（10 passed/1 显式数据 gap）、静态门 18/18 均通过；
+  证据与限制见 [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
 - **已记录证据**：P6（`acceptance/p6/`，真实 LLM + 真实 Chrome，S0–S9 PASS，9 张截图）与 P7
   （`acceptance/p7/`，13/13 场景、156 checks、21 张 E2E 截图，覆盖 P9 五项）。
 - **Docker 未实跑**：`deploy/` 的 Compose/Dockerfile 已交付并静态校验；本机未安装 Docker，从未构建
@@ -32,7 +32,7 @@
 | P5 | 代码智能 + 视觉断言 | 只读本地 Git 索引/树/diff/影响/锚点/事实复核、视觉断言与 diff 证据、质量指标 | [phase-05-handoff](docs/version-V0.2/phases/phase-05-handoff.md) |
 | P6 | 全功能补齐 | 全局搜索/待办、质量中心/评测、Agent 中心、全局问题/报告、链路 v2、提示词版本化 | [phase-06-handoff](docs/version-V0.2/phases/phase-06-handoff.md) |
 | P7 | P9 五项 | 报告 HTML/PDF 与模板、跨版本知识、统一 GC、多实例/滚动升级、问题重开/合并/跨波次去重 | [phase-07-handoff](docs/version-V0.2/phases/phase-07-handoff.md)、[acceptance/p7](docs/version-V0.2/acceptance/p7/) |
-| P8 | 硬化与验收 | H1–H11 硬化（跨实例设置失效、in-flight 计数、知识 FTS、per-executor 派发、PDF 上限、版本串、动态 E2E seed、雪花/实例 ID、CI 去 0.1 化、事件/审计保留、限流）、P8 契约冻结、全量验收、文档 0.2 化 | [p8 runbook](docs/version-V0.2/acceptance/p8/runbook.md)；最终结果待记录 |
+| P8 | 硬化与验收 | H1–H11 硬化（跨实例设置失效、in-flight 计数、知识 FTS、per-executor 派发、PDF 上限、版本串、动态 E2E seed、雪花/实例 ID、CI 去 0.1 化、事件/审计保留、限流）、P8 契约冻结、全量验收、文档 0.2 化 | [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)、[acceptance/p8](docs/version-V0.2/acceptance/p8/) |
 
 ## 2. 契约与规模计数（P8 冻结）
 
@@ -67,7 +67,7 @@
 |---|---|---|
 | P6 | [docs/version-V0.2/acceptance/p6/](docs/version-V0.2/acceptance/p6/) | S0–S9 PASS；质量/搜索/待办/Agent 中心/全局中心/链路 v2；真实 LLM 评测；9 张截图 |
 | P7 | [docs/version-V0.2/acceptance/p7/](docs/version-V0.2/acceptance/p7/) | S0–S12 共 13 场景、156 checks PASS；PDF/知识/GC/多副本/SSE/离线重派/问题复发；5/5 E2E、21 张截图 |
-| P8 | [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/) | runbook 已落盘；最终验收结果待记录 |
+| P8 | [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/) | 全旅程/韧性/多副本/能力矩阵/E2E/静态门 PASS；限制见 handoff/known-limitations |
 
 P8 验收入口（详见 runbook）：`p7-acceptance.ps1`（P9 回归）→ 克隆 `eztest_v02_p7` 为
 `eztest_v02_p8` → `p8-acceptance.ps1`（S0–S6）→ `p8-resilience.ps1`（S9–S10）→ `p8-multi.ps1`
