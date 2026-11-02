@@ -57,6 +57,8 @@ func TestMigrations021Schema(t *testing.T) {
 		{"version", "stage", "text", "text", "NO", "NEVER", "'created'::text"},
 		{"version", "stage_entered_at", "timestamp with time zone", "timestamptz", "NO", "NEVER", "now()"},
 		{"version", "blocker", "text", "text", "YES", "NEVER", ""},
+		// version: the stage recorded when the version entered blocked/paused.
+		{"version", "suspended_from", "text", "text", "YES", "NEVER", ""},
 		// work_item: the new 0.2.1 task contract.
 		{"work_item", "kind", "text", "text", "NO", "NEVER", "''::text"},
 		{"work_item", "goal", "text", "text", "NO", "NEVER", "''::text"},
@@ -121,8 +123,8 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
-	if len(applied) != 47 {
-		t.Fatalf("applied %d migrations, want 47: %v", len(applied), applied)
+	if len(applied) != 48 {
+		t.Fatalf("applied %d migrations, want 48: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -183,6 +185,30 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
+	// version.suspended_from records the pre-suspension workflow stage so a
+	// resume can return to it instead of jumping ahead. Probe the named CHECK on
+	// the version table (not DB-wide) and pin the allowed stage values.
+	var suspendedFromCheck string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'version'::regclass AND conname = 'chk_version_suspended_from'
+	`).Scan(&suspendedFromCheck); err != nil {
+		t.Fatalf("read chk_version_suspended_from: %v", err)
+	}
+	for _, stage := range []string{
+		"created", "clarifying", "requirement_review", "designing",
+		"case_review", "executing", "reporting",
+	} {
+		if !strings.Contains(suspendedFromCheck, "'"+stage+"'") {
+			t.Errorf("chk_version_suspended_from rejects workflow stage %q: %s", stage, suspendedFromCheck)
+		}
+	}
+	for _, stage := range []string{"completed", "blocked", "paused"} {
+		if strings.Contains(suspendedFromCheck, "'"+stage+"'") {
+			t.Errorf("chk_version_suspended_from allows non-workflow stage %q: %s", stage, suspendedFromCheck)
+		}
+	}
+
 	// Same-context FK: parts reference conversation_message (version context),
 	// never agent_message (agent context).
 	var fkTargetsConversationMessage bool
@@ -223,6 +249,26 @@ func TestMigrations021Schema(t *testing.T) {
 		INSERT INTO version (id, title, created_by) VALUES (210001, '0.2.1 migration test', 1)
 	`); err != nil {
 		t.Fatalf("insert version: %v", err)
+	}
+
+	// suspended_from stores a workflow stage; suspension/terminal values are
+	// rejected and NULL (not suspended) stays valid.
+	if _, err := pool.Exec(ctx, `
+		UPDATE version SET suspended_from = 'clarifying' WHERE id = 210001
+	`); err != nil {
+		t.Errorf("store workflow suspended_from: %v", err)
+	}
+	for _, stage := range []string{"completed", "blocked", "paused"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE version SET suspended_from = $1 WHERE id = 210001
+		`, stage); err == nil {
+			t.Errorf("suspended_from accepted non-workflow stage %q", stage)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE version SET suspended_from = NULL WHERE id = 210001
+	`); err != nil {
+		t.Errorf("clear suspended_from: %v", err)
 	}
 
 	// version_fact is append-only and conflict-unique per content hash.

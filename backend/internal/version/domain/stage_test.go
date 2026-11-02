@@ -41,12 +41,6 @@ func TestStageTransitions(t *testing.T) {
 			transition{stage, version.StagePaused},
 		)
 	}
-	for _, stage := range workflow {
-		allowed = append(allowed,
-			transition{version.StageBlocked, stage},
-			transition{version.StagePaused, stage},
-		)
-	}
 	for _, tc := range allowed {
 		if !tc.from.CanTransitionTo(tc.to) {
 			t.Errorf("%s -> %s must be allowed", tc.from, tc.to)
@@ -71,7 +65,12 @@ func TestStageTransitions(t *testing.T) {
 		{version.StageCompleted, version.StageExecuting},
 		{version.StageCompleted, version.StageBlocked},
 		{version.StageCompleted, version.StagePaused},
-		// Resume restores a workflow stage; it never finishes or re-suspends.
+		// A suspended version never resumes through CanTransitionTo: the resume
+		// target must be checked against the persisted suspended_from stage
+		// (CanResumeTo), so no arbitrary workflow stage is reachable here.
+		{version.StageBlocked, version.StageClarifying},
+		{version.StageBlocked, version.StageExecuting},
+		{version.StagePaused, version.StageDesigning},
 		{version.StageBlocked, version.StageCompleted},
 		{version.StagePaused, version.StageCompleted},
 		{version.StageBlocked, version.StagePaused},
@@ -90,6 +89,81 @@ func TestStageTransitions(t *testing.T) {
 	for _, tc := range denied {
 		if tc.from.CanTransitionTo(tc.to) {
 			t.Errorf("%s -> %s must be rejected", tc.from, tc.to)
+		}
+	}
+}
+
+func TestSuspensionRequiresRecordedStage(t *testing.T) {
+	// Entering a suspension is a normal forward edge from any workflow stage.
+	if !version.StageClarifying.CanTransitionTo(version.StageBlocked) {
+		t.Error("clarifying -> blocked must be allowed")
+	}
+	// Leaving a suspension is never a regular transition: it must be checked
+	// against the stage recorded in version.suspended_from via CanResumeTo.
+	if version.StageClarifying.CanTransitionTo(version.StageExecuting) {
+		t.Error("clarifying -> executing must be rejected (two hard gates)")
+	}
+	if version.StageBlocked.CanTransitionTo(version.StageExecuting) {
+		t.Error("blocked -> executing must be rejected; resume needs the recorded stage")
+	}
+
+	// A recorded stage is always a workflow stage: a version can be blocked or
+	// paused at any point of the workflow, including while executing.
+	resumable := []struct{ from, prev version.Stage }{
+		{version.StageBlocked, version.StageCreated},
+		{version.StageBlocked, version.StageClarifying},
+		{version.StageBlocked, version.StageRequirementReview},
+		{version.StagePaused, version.StageDesigning},
+		{version.StagePaused, version.StageCaseReview},
+		{version.StageBlocked, version.StageExecuting},
+		{version.StagePaused, version.StageReporting},
+	}
+	for _, tc := range resumable {
+		if !tc.from.CanResumeTo(tc.prev) {
+			t.Errorf("%s.CanResumeTo(%s) = false, want true", tc.from, tc.prev)
+		}
+	}
+	// A resume never finishes the version, re-suspends it or accepts garbage.
+	for _, prev := range []version.Stage{
+		version.StageCompleted, version.StageBlocked, version.StagePaused,
+		version.Stage("bogus"),
+	} {
+		if version.StageBlocked.CanResumeTo(prev) {
+			t.Errorf("blocked.CanResumeTo(%s) = true, want false", prev)
+		}
+	}
+	// Only a suspended stage resumes; a workflow or terminal stage cannot.
+	for _, from := range []version.Stage{
+		version.StageCreated, version.StageClarifying, version.StageRequirementReview,
+		version.StageExecuting, version.StageReporting, version.StageCompleted,
+		version.Stage("bogus"),
+	} {
+		if from.CanResumeTo(version.StageClarifying) {
+			t.Errorf("%s.CanResumeTo(clarifying) = true, want false", from)
+		}
+	}
+}
+
+func TestStageSuspended(t *testing.T) {
+	cases := []struct {
+		stage     version.Stage
+		suspended bool
+	}{
+		{version.StageCreated, false},
+		{version.StageClarifying, false},
+		{version.StageRequirementReview, false},
+		{version.StageDesigning, false},
+		{version.StageCaseReview, false},
+		{version.StageExecuting, false},
+		{version.StageReporting, false},
+		{version.StageCompleted, false},
+		{version.StageBlocked, true},
+		{version.StagePaused, true},
+		{version.Stage("bogus"), false},
+	}
+	for _, tc := range cases {
+		if got := tc.stage.IsSuspended(); got != tc.suspended {
+			t.Errorf("%s.IsSuspended() = %v, want %v", tc.stage, got, tc.suspended)
 		}
 	}
 }

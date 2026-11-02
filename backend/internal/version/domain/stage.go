@@ -25,15 +25,14 @@ const (
 // transitions that skip a hard gate are always rejected.
 //
 // blocked and paused are suspension stages orthogonal to the workflow: every
-// workflow stage may enter them, and resuming accepts any workflow stage
-// because only the persisted stage machine knows the pre-suspension stage.
-// completed is terminal and is never a suspension or resume target.
+// workflow stage may enter them, but a suspended version never leaves a
+// suspension through CanTransitionTo. Resuming is guarded separately by
+// CanResumeTo with the stage recorded in version.suspended_from, so a resume
+// cannot jump ahead and skip a hard gate. completed is terminal and is never a
+// suspension or resume target.
 func (s Stage) CanTransitionTo(next Stage) bool {
 	if next == StageBlocked || next == StagePaused {
-		return canSuspend(s)
-	}
-	if s == StageBlocked || s == StagePaused {
-		return canSuspend(next)
+		return isWorkflowStage(s)
 	}
 	switch s {
 	case StageCreated:
@@ -64,6 +63,19 @@ func (s Stage) CanTransitionTo(next Stage) bool {
 	}
 }
 
+// IsSuspended reports whether stage is a suspension state (blocked or paused).
+func (s Stage) IsSuspended() bool { return s == StageBlocked || s == StagePaused }
+
+// CanResumeTo reports whether a version suspended at s may resume to prev.
+// prev must be the workflow stage recorded in version.suspended_from when the
+// version entered the suspension; the caller is responsible for passing that
+// recorded value, so a suspended version cannot resume to any other stage and
+// skip a hard gate. Terminal, suspended and unknown targets are rejected, as
+// is any source that is not suspended.
+func (s Stage) CanResumeTo(prev Stage) bool {
+	return s.IsSuspended() && isWorkflowStage(prev)
+}
+
 // IsHumanGate reports whether stage is one of the two hard gates of the
 // version lifecycle (spec §5.5). Only an explicit user decision may confirm a
 // human gate; assistants and background roles never can.
@@ -77,10 +89,10 @@ func (s Stage) IsHumanGate() bool {
 // increment (spec §5.3).
 func (s Stage) IsTerminal() bool { return s == StageCompleted }
 
-// canSuspend reports whether stage is a workflow stage that may be blocked or
-// paused and is therefore a legal resume target. Suspended and terminal stages
+// isWorkflowStage reports whether stage is a workflow stage: the stages a
+// version can be suspended from and resumed to. Suspended and terminal stages
 // are excluded.
-func canSuspend(s Stage) bool {
+func isWorkflowStage(s Stage) bool {
 	switch s {
 	case StageCreated, StageClarifying, StageRequirementReview, StageDesigning,
 		StageCaseReview, StageExecuting, StageReporting:
