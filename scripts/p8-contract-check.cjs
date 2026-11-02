@@ -17,8 +17,10 @@
  *   - executor-protocol §12.3 per-executor dispatch promoted to P8 implemented
  *     (wire protocol v1.2 unchanged)
  *
- * Totals below are the frozen P8 totals; a later phase should relax them to
- * ">=" instead of editing this file.
+ * Totals below are the frozen P8 minimums. Later phases only append
+ * paths/operations/schemas/events/migrations/tables, so this gate uses ">="
+ * (same forward-compatibility rule as p2-p7) and keeps the P8 increments
+ * present by name.
  */
 const fs = require("node:fs")
 const path = require("node:path")
@@ -120,7 +122,10 @@ try {
 // OpenAPI identity, frozen totals and P8 additive fields.
 // ---------------------------------------------------------------------------
 if (openapi && typeof openapi === "object") {
-  check(openapi.info?.version === "0.2.0-p8", `openapi info.version = 0.2.0-p8 (got ${openapi.info?.version})`)
+  check(
+    openapi.info?.version === "0.2.0-p8" || /^0\.2\.[1-9][0-9]*/.test(openapi.info?.version ?? ""),
+    `openapi info.version = 0.2.0-p8 or later 0.2.x (got ${openapi.info?.version})`,
+  )
   check(openapi["x-frozen"] === "P8", `openapi x-frozen: P8 (got ${openapi["x-frozen"]})`)
   check(openapi["x-draft"] === undefined, "openapi has no x-draft marker")
   check(!openapiText.includes("x-draft:"), "openapi text has no x-draft: marker")
@@ -133,9 +138,9 @@ if (openapi && typeof openapi === "object") {
     }
   }
   const schemas = Object.keys(openapi.components?.schemas ?? {})
-  check(paths.length === 162, `openapi paths = 162 (got ${paths.length})`)
-  check(operations.length === 200, `openapi operations = 200 (got ${operations.length})`)
-  check(schemas.length === 264, `openapi schemas = 264 (got ${schemas.length})`)
+  check(paths.length >= 162, `openapi paths >= 162 (got ${paths.length})`)
+  check(operations.length >= 200, `openapi operations >= 200 (got ${operations.length})`)
+  check(schemas.length >= 264, `openapi schemas >= 264 (got ${schemas.length})`)
 
   const instance = openapi.components?.schemas?.InstanceView
   for (const field of ["active_requests", "active_work"]) {
@@ -306,11 +311,11 @@ if (fs.existsSync(orderPath)) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
-  check(order.length === 42, `order.txt = 42 migrations (got ${order.length})`)
+  check(order.length >= 42, `order.txt >= 42 migrations (got ${order.length})`)
   check(new Set(order).size === order.length, "order.txt has no duplicate entries")
   check(
-    JSON.stringify(order.slice(-2)) === JSON.stringify(p8MigrationFiles),
-    "order.txt tail = P8 #41-#42",
+    JSON.stringify(order.slice(40, 42)) === JSON.stringify(p8MigrationFiles),
+    "order.txt positions #41-#42 = P8 migrations (later phases append after)",
   )
   check(
     JSON.stringify(order.slice(33, 40)) === JSON.stringify(p7MigrationFiles),
@@ -318,7 +323,7 @@ if (fs.existsSync(orderPath)) {
   )
 }
 const sqlFiles = fs.readdirSync(migrationsDir).filter((name) => name.endsWith(".sql"))
-check(sqlFiles.length === 42, `migrations/*.sql = 42 files (got ${sqlFiles.length})`)
+check(sqlFiles.length >= 42, `migrations/*.sql >= 42 files (got ${sqlFiles.length})`)
 for (const file of p8MigrationFiles) {
   check(fs.existsSync(path.join(migrationsDir, file)), `migration file ${file}`)
 }
@@ -346,7 +351,7 @@ const tableCount = sqlFiles.reduce((sum, file) => {
   const sql = fs.readFileSync(path.join(migrationsDir, file), "utf8")
   return sum + countMatches(sql, /CREATE TABLE /g)
 }, 0)
-check(tableCount === 85, `business tables (CREATE TABLE count) = 85 (got ${tableCount})`)
+check(tableCount >= 85, `business tables (CREATE TABLE count) >= 85 (got ${tableCount})`)
 
 // ---------------------------------------------------------------------------
 // db-schema.md: §17 P8 columns, §5 total 85, P7 section preserved.
@@ -433,7 +438,7 @@ if (fs.existsSync(catalogPath)) {
 // events.md: 118 event types (no P8 event) + P8 audit action retention.cleanup.
 // ---------------------------------------------------------------------------
 const eventTypes = countEventTypes(events)
-check(eventTypes.size === 118, `events.md event types = 118 (got ${eventTypes.size})`)
+check(eventTypes.size >= 118, `events.md event types >= 118 (got ${eventTypes.size})`)
 check(/^## 17\. P8 增量（frozen: P8/m.test(events), "events.md §17 P8 frozen")
 check(/不新增事件类型|无新事件类型/.test(events.slice(events.indexOf("## 17."))), "events.md P8 adds no event type")
 check(events.includes("`retention.cleanup`"), "events.md P8 audit action retention.cleanup")
@@ -540,5 +545,5 @@ if (failures > 0) {
   process.exit(1)
 }
 console.log(
-  "P8 contract check OK: 0.2.0-p8 / P8 frozen / 162 paths / 200 operations / 264 schemas / 42 migrations / 85 tables / 85 settings / 118 events / 19 tasks / 14 profiles / audit retention.cleanup / executor per-executor dispatch",
+  "P8 contract check OK: 0.2.0-p8 or later / P8 increments present / paths, operations, schemas, migrations, tables and events >= frozen totals / 85 settings / 19 tasks / 14 profiles / audit retention.cleanup / executor per-executor dispatch",
 )
