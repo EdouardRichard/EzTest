@@ -5,23 +5,32 @@
 
 .DESCRIPTION
     Starts, in order: the Go API (bin\eztest.exe), the Playwright executor
-    (runtime\node\node.exe executor\src\server.mjs) and the Next.js web server
-    (runtime\node\node.exe web\server.js). Each process gets a pid file under
-    run\ and a log under logs\; startup waits for the documented health checks
-    (API /healthz + /api/health db=ok, executor /healthz with a browserVersion,
-    web /login) before reporting success.
+    (runtime\node\node.exe executor\src\server.mjs), the Next.js web server
+    (runtime\node\node.exe web\server.js) and the PDF renderer
+    (runtime\node\node.exe renderer\src\server.mjs). Each process gets a pid file
+    under run\ and a log under logs\; startup waits for the documented health
+    checks (API /healthz + /api/health db=ok, executor /healthz with a
+    browserVersion, web /login, renderer /healthz with a browser version) before
+    reporting success.
+
+    EzTest 0.2 keeps its runtime configuration in the database settings center.
+    The API only reads four startup variables (EZTEST_DATABASE_URL,
+    EZTEST_API_PORT, EZTEST_WEB_PORT, EZTEST_EXECUTOR_PORT); this script exports
+    exactly those before starting it and creates the .data content directories
+    (attachments, evidence, reports, exports) the settings center defaults to.
 
     Before starting anything the script refuses to run when:
       - .env is missing (run init-config.ps1 first),
-      - a required package file or the OpenAPI document is missing,
+      - a required package file is missing,
       - EZTEST_DATABASE_URL is unset/placeholder or PostgreSQL is not reachable
         over TCP,
-      - one of the packaged ports (13333/6868/13336 by default) is in use,
+      - one of the packaged ports (13333/6868/13336/13337 by default) is in use,
       - a pid recorded in run\ belongs to a live process (use stop first).
 
     If any component fails to become healthy the already-started processes are
     stopped again and a non-zero exit code is returned. Secrets are never
-    printed; the administrator password lives in .env.
+    printed; the administrator password is the fixed first-start seed admin123
+    and must be changed in the UI after the first login.
 
     Windows PowerShell 5.1 compatible. On Linux use start-eztest.sh.
 #>
@@ -48,13 +57,13 @@ $paths = @{
     Env        = Join-Path $PackageRoot ".env"
     Api        = Join-Path $PackageRoot "bin\eztest.exe"
     Node       = Join-Path $PackageRoot "runtime\node\node.exe"
-    WebServer  = Join-Path $PackageRoot "web\server.js"
-    ExecServer = Join-Path $PackageRoot "executor\src\server.mjs"
-    OpenApi    = Join-Path $PackageRoot "docs\openapi\api.yaml"
-    Logs       = Join-Path $PackageRoot "logs"
-    Run        = Join-Path $PackageRoot "run"
-    Data       = Join-Path $PackageRoot "data"
-    Browsers   = Join-Path $PackageRoot "playwright-browsers"
+    WebServer    = Join-Path $PackageRoot "web\server.js"
+    ExecServer   = Join-Path $PackageRoot "executor\src\server.mjs"
+    RenderServer = Join-Path $PackageRoot "renderer\src\server.mjs"
+    Logs         = Join-Path $PackageRoot "logs"
+    Run          = Join-Path $PackageRoot "run"
+    Data         = Join-Path $PackageRoot ".data"
+    Browsers     = Join-Path $PackageRoot "playwright-browsers"
 }
 $script:Started = New-Object System.Collections.ArrayList
 
@@ -257,7 +266,7 @@ function Stop-ProcessTree {
 
 function Stop-StartedProcesses {
     if ($script:Started.Count -eq 0) { return }
-    # Started order is api, executor, web; stop in reverse order, API last.
+    # Started order is api, executor, web, renderer; stop in reverse order, API last.
     $ordered = @($script:Started | Sort-Object { $_.Name -eq "api" })
     foreach ($entry in $ordered) {
         $process = $entry.Process
@@ -363,6 +372,38 @@ function Wait-ExecutorReady {
     throw "The Playwright executor did not become ready within $Seconds seconds (last: $lastDetail).$([Environment]::NewLine)Bundled Chromium could not be launched; check logs\executor.err.log and the PACKAGE.md troubleshooting section.$([Environment]::NewLine)$(Get-LogHint executor)"
 }
 
+function Wait-RendererReady {
+    param([string]$BaseUrl, [System.Diagnostics.Process]$Process, [int]$Seconds = 90)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $lastDetail = "no response"
+    while ((Get-Date) -lt $deadline) {
+        try { $Process.Refresh() } catch { }
+        if ($Process.HasExited) {
+            throw "The PDF renderer exited during startup (exit code $($Process.ExitCode)).$([Environment]::NewLine)$(Get-LogHint renderer)"
+        }
+        try {
+            $response = Invoke-RawHttp -Url "$BaseUrl/healthz" -TimeoutSec 5
+            if ($response.Status -eq 200) {
+                $json = $response.Body | ConvertFrom-Json
+                $browser = "$($json.browser)"
+                if ([string]::IsNullOrWhiteSpace($browser)) { $browser = "$($json.browserVersion)" }
+                if ($json.status -eq "ok" -and -not [string]::IsNullOrWhiteSpace($browser)) {
+                    return $json
+                }
+                $lastDetail = "status=$($json.status) browser=$browser error=$($json.error)"
+            } else {
+                $body = $response.Body
+                if ($body.Length -gt 300) { $body = $body.Substring(0, 300) }
+                $lastDetail = "HTTP $($response.Status) $body"
+            }
+        } catch {
+            $lastDetail = "connection not ready"
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "The PDF renderer did not become ready within $Seconds seconds (last: $lastDetail).$([Environment]::NewLine)Bundled Chromium could not be launched; check logs\renderer.err.log and the PACKAGE.md troubleshooting section.$([Environment]::NewLine)$(Get-LogHint renderer)"
+}
+
 function Wait-WebReady {
     param([string]$BaseUrl, [System.Diagnostics.Process]$Process, [int]$Seconds = 60)
     $deadline = (Get-Date).AddSeconds($Seconds)
@@ -416,7 +457,7 @@ function Resolve-PackagePath {
 # Preconditions
 # ---------------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $paths.Env -PathType Leaf)) {
-    Write-FailAndExit "Missing $($paths.Env). Run init-config.ps1 first (it creates .env and generates the secrets)."
+    Write-FailAndExit "Missing $($paths.Env). Run init-config.ps1 first (it creates .env)."
 }
 Import-DotEnv -Path $paths.Env
 
@@ -425,7 +466,7 @@ $required = @(
     @{ Path = $paths.Node; Hint = "The bundled Node runtime is missing; extract the complete package archive." },
     @{ Path = $paths.WebServer; Hint = "web\server.js is missing; extract the complete package archive." },
     @{ Path = $paths.ExecServer; Hint = "executor\src\server.mjs is missing; extract the complete package archive." },
-    @{ Path = $paths.OpenApi; Hint = "docs\openapi\api.yaml is missing; it is required by GET /api/openapi.yaml." },
+    @{ Path = $paths.RenderServer; Hint = "renderer\src\server.mjs is missing; extract the complete package archive." },
     @{ Path = $paths.Browsers; Hint = "playwright-browsers\ is missing; extract the complete package archive." }
 )
 foreach ($entry in $required) {
@@ -434,42 +475,51 @@ foreach ($entry in $required) {
     }
 }
 
-# Absolute package paths: repair hand-written relative values in .env.
-$pathSettings = @(
-    @{ Key = "EZTEST_OPENAPI_PATH"; Default = "docs/openapi/api.yaml" },
-    @{ Key = "EZTEST_STORAGE_DIR"; Default = "data/objects" },
-    @{ Key = "EZTEST_VERSION_ATTACHMENT_DIR"; Default = "data/version-attachments" },
-    @{ Key = "EZTEST_EVIDENCE_DIR"; Default = "data/evidence" },
-    @{ Key = "EZTEST_REPORT_DIR"; Default = "data/reports" },
-    @{ Key = "EZTEST_EXPORT_DIR"; Default = "data/exports" }
-)
-foreach ($setting in $pathSettings) {
-    $resolved = Resolve-PackagePath -Value (Get-EnvValue -Name $setting.Key) -DefaultRelative $setting.Default -SettingName $setting.Key
-    [Environment]::SetEnvironmentVariable($setting.Key, $resolved, "Process")
-    if ($setting.Key -ne "EZTEST_OPENAPI_PATH") {
-        New-Item -ItemType Directory -Force -Path $resolved | Out-Null
-    }
+# Content storage: the 0.2 settings center defaults to ./.data (attachments,
+# evidence, reports, exports) relative to the API working directory, which is the
+# package root. Create them before the API starts; the archive does not ship .data.
+foreach ($name in @("attachments", "evidence", "reports", "exports")) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $paths.Data $name) | Out-Null
 }
 $browsersPath = Resolve-PackagePath -Value (Get-EnvValue -Name "PLAYWRIGHT_BROWSERS_PATH") -DefaultRelative "playwright-browsers" -SettingName "PLAYWRIGHT_BROWSERS_PATH"
 [Environment]::SetEnvironmentVariable("PLAYWRIGHT_BROWSERS_PATH", $browsersPath, "Process")
-$agentRoot = Get-EnvValue -Name "EZTEST_AGENT_FILE_ROOT"
-if ($agentRoot.Length -gt 0) {
-    $agentRoot = Resolve-PackagePath -Value $agentRoot -DefaultRelative "" -SettingName "EZTEST_AGENT_FILE_ROOT"
-    [Environment]::SetEnvironmentVariable("EZTEST_AGENT_FILE_ROOT", $agentRoot, "Process")
-}
 foreach ($directory in @($paths.Logs, $paths.Run)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
-# Endpoints and ports.
-$apiEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_HTTP_ADDR" -Default "127.0.0.1:13333") -DefaultPort 13333 -SettingName "EZTEST_HTTP_ADDR"
-$execEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_EXECUTOR_ADDR" -Default "127.0.0.1:13336") -DefaultPort 13336 -SettingName "EZTEST_EXECUTOR_ADDR"
-$webPortValue = Get-EnvValue -Name "PORT" -Default "6868"
-if ($webPortValue -notmatch '^\d+$') { Write-FailAndExit "PORT in .env must be a number (got '$webPortValue')." }
-$webPort = [int]$webPortValue
+# Endpoints and ports. 0.2 has no bind-address variables: the API listens on the
+# EZTEST_API_PORT port, the executor/renderer on their own address variables, and
+# the API derives its CORS origins from EZTEST_WEB_PORT.
+function ConvertTo-Port {
+    param([string]$Value, [int]$Fallback, [string]$SettingName)
+    $raw = "$Value".Trim()
+    if ($raw.Length -eq 0) { return $Fallback }
+    if ($raw -notmatch '^\d+$') { Write-FailAndExit "$SettingName in .env must be a number (got '$raw')." }
+    $port = [int]$raw
+    if ($port -lt 1 -or $port -gt 65535) { Write-FailAndExit "$SettingName has an out-of-range port $port." }
+    return $port
+}
+$apiPort = ConvertTo-Port -Value (Get-EnvValue -Name "EZTEST_API_PORT") -Fallback 13333 -SettingName "EZTEST_API_PORT"
+$webPort = ConvertTo-Port -Value (Get-EnvValue -Name "EZTEST_WEB_PORT") -Fallback 6868 -SettingName "EZTEST_WEB_PORT"
+$execPort = ConvertTo-Port -Value (Get-EnvValue -Name "EZTEST_EXECUTOR_PORT") -Fallback 13336 -SettingName "EZTEST_EXECUTOR_PORT"
+$execEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_EXECUTOR_ADDR" -Default "127.0.0.1:$execPort") -DefaultPort $execPort -SettingName "EZTEST_EXECUTOR_ADDR"
+$renderEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_RENDERER_ADDR" -Default "127.0.0.1:13337") -DefaultPort 13337 -SettingName "EZTEST_RENDERER_ADDR"
+if ($execEndpoint.Port -ne $execPort) {
+    Write-Host "WARNING: EZTEST_EXECUTOR_ADDR port ($($execEndpoint.Port)) differs from EZTEST_EXECUTOR_PORT ($execPort); the API seeds its executor URL from EZTEST_EXECUTOR_PORT. Keep them equal." -ForegroundColor Yellow
+}
+if ($renderEndpoint.Port -ne 13337) {
+    Write-Host "WARNING: EZTEST_RENDERER_ADDR port ($($renderEndpoint.Port)) differs from the settings-center default render_worker_url (13337); update 'report.render_worker_url' in the admin settings center." -ForegroundColor Yellow
+}
+# The web process reads PORT/HOSTNAME; keep PORT in sync with EZTEST_WEB_PORT so
+# the API's CORS origins match the browser URL.
+$webProcessPort = ConvertTo-Port -Value (Get-EnvValue -Name "PORT" -Default "$webPort") -Fallback $webPort -SettingName "PORT"
+if ($webProcessPort -ne $webPort) {
+    Write-FailAndExit "PORT ($webProcessPort) and EZTEST_WEB_PORT ($webPort) differ in .env; keep them equal so the API's CORS origins match the web UI."
+}
 $webHost = Get-EnvValue -Name "HOSTNAME" -Default "127.0.0.1"
-$apiBaseUrl = "http://$(Get-ProbeHost -BindHost $apiEndpoint.Host):$($apiEndpoint.Port)"
+$apiBaseUrl = "http://127.0.0.1:$apiPort"
 $execBaseUrl = "http://$(Get-ProbeHost -BindHost $execEndpoint.Host):$($execEndpoint.Port)"
+$renderBaseUrl = "http://$(Get-ProbeHost -BindHost $renderEndpoint.Host):$($renderEndpoint.Port)"
 $webBaseUrl = "http://$(Get-ProbeHost -BindHost $webHost):$webPort"
 
 # Database preflight.
@@ -497,9 +547,13 @@ $executorToken = Get-EnvValue -Name "EZTEST_EXECUTOR_TOKEN"
 if ($executorToken.Length -eq 0) {
     Write-FailAndExit "EZTEST_EXECUTOR_TOKEN is empty in .env. Re-run init-config.ps1 -Force or set it manually."
 }
+$renderToken = Get-EnvValue -Name "EZTEST_RENDER_TOKEN"
+if ($renderToken.Length -eq 0) {
+    Write-FailAndExit "EZTEST_RENDER_TOKEN is empty in .env. Re-run init-config.ps1 -Force or set it manually."
+}
 
 # Already-running and port checks.
-$components = @("api", "executor", "web")
+$components = @("api", "executor", "web", "renderer")
 foreach ($component in $components) {
     $recordedPid = Get-RecordedPid -Name $component
     if (Test-PidAlive -ProcessId $recordedPid) {
@@ -509,8 +563,9 @@ foreach ($component in $components) {
     if (Test-Path -LiteralPath $stalePidPath) { Remove-Item -LiteralPath $stalePidPath -Force -ErrorAction SilentlyContinue }
 }
 $portChecks = @(
-    @{ Host = (Get-ProbeHost -BindHost $apiEndpoint.Host); Port = $apiEndpoint.Port; Label = "API (EZTEST_HTTP_ADDR)" },
+    @{ Host = "127.0.0.1"; Port = $apiPort; Label = "API (EZTEST_API_PORT)" },
     @{ Host = (Get-ProbeHost -BindHost $execEndpoint.Host); Port = $execEndpoint.Port; Label = "executor (EZTEST_EXECUTOR_ADDR)" },
+    @{ Host = (Get-ProbeHost -BindHost $renderEndpoint.Host); Port = $renderEndpoint.Port; Label = "renderer (EZTEST_RENDERER_ADDR)" },
     @{ Host = (Get-ProbeHost -BindHost $webHost); Port = $webPort; Label = "web (PORT)" }
 )
 foreach ($check in $portChecks) {
@@ -520,23 +575,31 @@ foreach ($check in $portChecks) {
 }
 
 Write-Host "Starting EzTest from $PackageRoot" -ForegroundColor Cyan
-Write-Host "  API      : $apiBaseUrl"
+Write-Host "  API      : $apiBaseUrl (startup vars: EZTEST_API_PORT/EZTEST_WEB_PORT/EZTEST_EXECUTOR_PORT)"
 Write-Host "  executor : $execBaseUrl"
+Write-Host "  renderer : $renderBaseUrl"
 Write-Host "  web      : $webBaseUrl"
 Write-Host "  database : $($dbEndpoint.Host):$($dbEndpoint.Port) (credentials from .env)"
+Write-Host "  storage  : $($paths.Data) (attachments, evidence, reports, exports)"
 Write-Host ""
 
 try {
     # --- API ---------------------------------------------------------------
-    Write-Host "[1/3] API ..." -NoNewline
+    # The 0.2 API reads ONLY these four startup variables; all other settings are
+    # in the database settings center.
+    [Environment]::SetEnvironmentVariable("EZTEST_DATABASE_URL", $databaseUrl, "Process")
+    [Environment]::SetEnvironmentVariable("EZTEST_API_PORT", "$apiPort", "Process")
+    [Environment]::SetEnvironmentVariable("EZTEST_WEB_PORT", "$webPort", "Process")
+    [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_PORT", "$execPort", "Process")
+    Write-Host "[1/4] API ..." -NoNewline
     $apiProcess = Start-EztestProcess -Name "api" -Exe $paths.Api -Arguments "" -WorkingDirectory $PackageRoot
-    $health = Wait-ApiReady -BaseUrl $apiBaseUrl -Process $apiProcess -Seconds 60
+    $health = Wait-ApiReady -BaseUrl $apiBaseUrl -Process $apiProcess -Seconds 90
     Write-Host " ready (version $($health.version), db=$($health.db))" -ForegroundColor Green
 
     # --- executor ----------------------------------------------------------
-    Write-Host "[2/3] Playwright executor ..." -NoNewline
+    Write-Host "[2/4] Playwright executor ..." -NoNewline
     [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_TOKEN", $executorToken, "Process")
-    [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_ADDR", (Get-EnvValue -Name "EZTEST_EXECUTOR_ADDR" -Default "127.0.0.1:13336"), "Process")
+    [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_ADDR", "$(Get-EnvValue -Name 'EZTEST_EXECUTOR_ADDR' -Default "127.0.0.1:$execPort")", "Process")
     $maxContexts = Get-EnvValue -Name "EZTEST_EXECUTOR_MAX_CONTEXTS" -Default "8"
     [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_MAX_CONTEXTS", $maxContexts, "Process")
     $allowedHosts = Get-EnvValue -Name "EZTEST_EXEC_ALLOWED_HOSTS" -Default "localhost,127.0.0.1"
@@ -545,11 +608,11 @@ try {
     [Environment]::SetEnvironmentVariable("EZTEST_VISUAL_BASELINE_MAX_BYTES", $baselineBytes, "Process")
     $execArgs = '"' + $paths.ExecServer + '"'
     $execProcess = Start-EztestProcess -Name "executor" -Exe $paths.Node -Arguments $execArgs -WorkingDirectory $PackageRoot
-    $execHealth = Wait-ExecutorReady -BaseUrl $execBaseUrl -Process $execProcess -Seconds 90
+    $execHealth = Wait-ExecutorReady -BaseUrl $execBaseUrl -Process $execProcess -Seconds 120
     Write-Host " ready (browser $($execHealth.browserVersion))" -ForegroundColor Green
 
     # --- web ---------------------------------------------------------------
-    Write-Host "[3/3] web ..." -NoNewline
+    Write-Host "[3/4] web ..." -NoNewline
     [Environment]::SetEnvironmentVariable("NODE_ENV", "production", "Process")
     [Environment]::SetEnvironmentVariable("PORT", "$webPort", "Process")
     [Environment]::SetEnvironmentVariable("HOSTNAME", $webHost, "Process")
@@ -557,6 +620,15 @@ try {
     $webProcess = Start-EztestProcess -Name "web" -Exe $paths.Node -Arguments $webArgs -WorkingDirectory (Join-Path $PackageRoot "web")
     Wait-WebReady -BaseUrl $webBaseUrl -Process $webProcess -Seconds 60 | Out-Null
     Write-Host " ready" -ForegroundColor Green
+
+    # --- PDF renderer ------------------------------------------------------
+    Write-Host "[4/4] PDF renderer ..." -NoNewline
+    [Environment]::SetEnvironmentVariable("EZTEST_RENDER_TOKEN", $renderToken, "Process")
+    [Environment]::SetEnvironmentVariable("EZTEST_RENDERER_ADDR", "$(Get-EnvValue -Name 'EZTEST_RENDERER_ADDR' -Default "127.0.0.1:13337")", "Process")
+    $renderArgs = '"' + $paths.RenderServer + '"'
+    $renderProcess = Start-EztestProcess -Name "renderer" -Exe $paths.Node -Arguments $renderArgs -WorkingDirectory $PackageRoot
+    $renderHealth = Wait-RendererReady -BaseUrl $renderBaseUrl -Process $renderProcess -Seconds 120
+    Write-Host " ready (browser $($renderHealth.browser))" -ForegroundColor Green
 } catch {
     Write-Host ""
     Write-Host "EzTest failed to start." -ForegroundColor Red
@@ -566,13 +638,15 @@ try {
 
 Write-Host ""
 Write-Host "EzTest is running." -ForegroundColor Green
-Write-Host "  Web UI        : http://localhost:$webPort"
+Write-Host "  Web UI        : http://localhost:$webPort (sign in as admin, initial password admin123)"
 Write-Host "  API health    : $apiBaseUrl/api/health"
 Write-Host "  API liveness  : $apiBaseUrl/healthz"
-Write-Host "  OpenAPI       : $apiBaseUrl/api/openapi.yaml"
 Write-Host "  Executor      : $execBaseUrl/healthz"
-Write-Host "  Administrator : admin (password is in .env - never printed)"
+Write-Host "  Renderer      : $renderBaseUrl/healthz (PDF reports)"
+Write-Host "  Administrator : admin / admin123 - change the password in the UI after the first login"
 Write-Host ""
+Write-Host "  Ports         : web $webPort / API $apiPort / executor $($execEndpoint.Port) / renderer $($renderEndpoint.Port)"
+Write-Host "  Data dirs     : $($paths.Data) (attachments, evidence, reports, exports)"
 Write-Host "  Logs          : $(Join-Path $PackageRoot 'logs')"
 Write-Host "  Pid files     : $(Join-Path $PackageRoot 'run')"
 Write-Host "  Status/stop   : .\status-eztest.ps1 / .\stop-eztest.ps1"

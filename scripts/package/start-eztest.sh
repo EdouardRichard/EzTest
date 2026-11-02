@@ -3,24 +3,33 @@
 # Starts the EzTest stack of an extracted Linux package.
 #
 # Starts, in order: the Go API (bin/eztest), the Playwright executor
-# (runtime/node/bin/node executor/src/server.mjs) and the Next.js web server
-# (runtime/node/bin/node web/server.js). Each process gets a pid file under
-# run/ and a log under logs/; startup waits for the documented health checks
-# (API /healthz + /api/health db=ok, executor /healthz with a browserVersion,
-# web /login) before reporting success.
+# (runtime/node/bin/node executor/src/server.mjs), the Next.js web server
+# (runtime/node/bin/node web/server.js) and the PDF renderer
+# (runtime/node/bin/node renderer/src/server.mjs). Each process gets a pid file
+# under run/ and a log under logs/; startup waits for the documented health
+# checks (API /healthz + /api/health db=ok, executor /healthz with a
+# browserVersion, web /login, renderer /healthz with a browser version) before
+# reporting success.
+#
+# EzTest 0.2 keeps its runtime configuration in the database settings center.
+# The API only reads four startup variables (EZTEST_DATABASE_URL,
+# EZTEST_API_PORT, EZTEST_WEB_PORT, EZTEST_EXECUTOR_PORT); this script exports
+# exactly those before starting it and creates the .data content directories
+# (attachments, evidence, reports, exports) the settings center defaults to.
 #
 # Before starting anything the script refuses to run when:
 #   - .env is missing (run init-config.sh first),
-#   - a required package file or the OpenAPI document is missing,
+#   - a required package file is missing,
 #   - EZTEST_DATABASE_URL is unset/placeholder or PostgreSQL is not reachable
 #     over TCP,
-#   - one of the packaged ports (13333/6868/13336 by default) is in use,
+#   - one of the packaged ports (13333/6868/13336/13337 by default) is in use,
 #   - a pid recorded in run/ belongs to a live process (use stop first).
 #
 # Processes are started with setsid so stop-eztest.sh can kill whole process
-# groups (Chromium children of the executor included). If any component fails
-# to become healthy the already-started processes are stopped again and a
-# non-zero exit code is returned. Secrets are never printed.
+# groups (Chromium children of the executor/renderer included). If any component
+# fails to become healthy the already-started processes are stopped again and a
+# non-zero exit code is returned. Secrets are never printed; the administrator
+# password is the fixed first-start seed admin123 and must be changed in the UI.
 #
 # Works on Debian/Ubuntu bash 4+. No curl/jq needed: HTTP probes use the
 # bundled Node runtime.
@@ -35,17 +44,18 @@ BIN="$PKG/bin/eztest"
 NODE="$PKG/runtime/node/bin/node"
 WEB_SERVER="$PKG/web/server.js"
 EXEC_SERVER="$PKG/executor/src/server.mjs"
-OPENAPI="$PKG/docs/openapi/api.yaml"
+RENDER_SERVER="$PKG/renderer/src/server.mjs"
 BROWSERS="$PKG/playwright-browsers"
 LOGS="$PKG/logs"
 RUN="$PKG/run"
-DATA="$PKG/data"
+DATA="$PKG/.data"
 
 STARTED=()
 LAST_PID=""
 WAIT_LAST=""
 API_HEALTH_BODY=""
 EXEC_BROWSER=""
+RENDER_BROWSER=""
 
 fail() {
     printf 'ERROR: %s\n' "$1" >&2
@@ -342,6 +352,43 @@ $(log_hint executor)"
     return 1
 }
 
+wait_renderer_ready() { # base-url pid seconds
+    local base="$1" pid="$2" seconds="${3:-90}" last="no response" response body status browser status_code
+    local deadline=$((SECONDS + seconds))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if ! process_alive "$pid"; then
+            WAIT_LAST="The PDF renderer exited during startup.
+$(log_hint renderer)"
+            return 1
+        fi
+        if response="$(http_req "$base/healthz" GET "" "" 2>/dev/null)"; then
+            status_code="${response%%$'\n'*}"
+            body="${response#*$'\n'}"
+            if [ "$status_code" = "200" ]; then
+                status="$(printf '%s' "$body" | json_field 'status' 2>/dev/null || true)"
+                browser="$(printf '%s' "$body" | json_field 'browser' 2>/dev/null || true)"
+                [ -z "$browser" ] && browser="$(printf '%s' "$body" | json_field 'browserVersion' 2>/dev/null || true)"
+                if [ "$status" = "ok" ] && [ -n "$browser" ]; then
+                    RENDER_BROWSER="$browser"
+                    return 0
+                fi
+                last="status=${status} browser=${browser}"
+            else
+                last="HTTP $status_code $body"
+            fi
+        else
+            last="connection not ready"
+        fi
+        sleep 0.5
+    done
+    WAIT_LAST="The PDF renderer did not become ready within ${seconds}s (last: ${last}).
+Bundled Chromium could not be launched. On Debian/Ubuntu install the browser system libraries:
+  sudo bash install-linux-deps.sh
+See PACKAGE.md troubleshooting and logs/renderer.err.log.
+$(log_hint renderer)"
+    return 1
+}
+
 wait_web_ready() { # base-url pid seconds
     local base="$1" pid="$2" seconds="${3:-60}" last="no response" response
     local deadline=$((SECONDS + seconds))
@@ -380,7 +427,7 @@ prepare_permissions() {
 # ---------------------------------------------------------------------------
 # Start.
 # ---------------------------------------------------------------------------
-[ -f "$ENV_FILE" ] || fail "Missing $ENV_FILE. Run 'bash init-config.sh' first (it creates .env and generates the secrets)."
+[ -f "$ENV_FILE" ] || fail "Missing $ENV_FILE. Run 'bash init-config.sh' first (it creates .env)."
 
 load_env
 
@@ -389,43 +436,63 @@ require_file "$BIN" "The API binary is missing (bin/eztest). Extract the complet
 require_file "$NODE" "The bundled Node runtime is missing. Extract the complete package archive."
 require_file "$WEB_SERVER" "web/server.js is missing. Extract the complete package archive."
 require_file "$EXEC_SERVER" "executor/src/server.mjs is missing. Extract the complete package archive."
-require_file "$OPENAPI" "docs/openapi/api.yaml is missing; it is required by GET /api/openapi.yaml."
+require_file "$RENDER_SERVER" "renderer/src/server.mjs is missing. Extract the complete package archive."
 require_file "$BROWSERS" "playwright-browsers/ is missing. Extract the complete package archive."
 
 prepare_permissions
 mkdir -p "$LOGS" "$RUN"
-for directory in objects version-attachments evidence reports exports; do
+# Content storage: the 0.2 settings center defaults to ./.data (attachments,
+# evidence, reports, exports) relative to the API working directory (the package
+# root). Create them before the API starts; the archive does not ship .data.
+for directory in attachments evidence reports exports; do
     mkdir -p "$DATA/$directory"
 done
 
 # Absolute package paths in the environment (repair hand-written relative values).
-resolve_pkg_path() { # value default-relative [--create]
-    local value="$1" default_relative="$2" create="${3:-}"
+resolve_pkg_path() { # value default-relative
+    local value="$1" default_relative="$2"
     [ -z "$value" ] && value="$default_relative"
     case "$value" in
         /*) : ;;
         *) value="$PKG/$value" ;;
     esac
-    if [ "$create" = "create" ]; then mkdir -p "$value"; fi
     printf '%s' "$value"
 }
-export EZTEST_OPENAPI_PATH="$(resolve_pkg_path "$(env_value EZTEST_OPENAPI_PATH 'docs/openapi/api.yaml')" 'docs/openapi/api.yaml')"
-export EZTEST_STORAGE_DIR="$(resolve_pkg_path "$(env_value EZTEST_STORAGE_DIR '')" 'data/objects' create)"
-export EZTEST_VERSION_ATTACHMENT_DIR="$(resolve_pkg_path "$(env_value EZTEST_VERSION_ATTACHMENT_DIR '')" 'data/version-attachments' create)"
-export EZTEST_EVIDENCE_DIR="$(resolve_pkg_path "$(env_value EZTEST_EVIDENCE_DIR '')" 'data/evidence' create)"
-export EZTEST_REPORT_DIR="$(resolve_pkg_path "$(env_value EZTEST_REPORT_DIR '')" 'data/reports' create)"
-export EZTEST_EXPORT_DIR="$(resolve_pkg_path "$(env_value EZTEST_EXPORT_DIR '')" 'data/exports' create)"
 export PLAYWRIGHT_BROWSERS_PATH="$(resolve_pkg_path "$(env_value PLAYWRIGHT_BROWSERS_PATH '')" 'playwright-browsers')"
 
-api_addr="$(env_value EZTEST_HTTP_ADDR '127.0.0.1:13333')"
-read -r api_host api_port <<<"$(split_host_port "$api_addr" 13333)" || fail "Invalid EZTEST_HTTP_ADDR: $api_addr"
-exec_addr="$(env_value EZTEST_EXECUTOR_ADDR '127.0.0.1:13336')"
-read -r exec_host exec_port <<<"$(split_host_port "$exec_addr" 13336)" || fail "Invalid EZTEST_EXECUTOR_ADDR: $exec_addr"
-web_port="$(env_value PORT '6868')"
-case "$web_port" in ''|*[!0-9]*) fail "PORT in .env must be a number (got '$web_port')." ;; esac
+# Ports: 0.2 has no bind-address variables. The API listens on EZTEST_API_PORT,
+# the executor/renderer on their own address variables and the API derives its
+# CORS origins from EZTEST_WEB_PORT.
+valid_port() { # name value default
+    local name="$1" value="$2" fallback="$3"
+    [ -z "$value" ] && value="$fallback"
+    case "$value" in ''|*[!0-9]*) fail "$name in .env must be a number (got '$value')." ;; esac
+    if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then fail "$name has an out-of-range port $value."; fi
+    printf '%s' "$value"
+}
+api_port="$(valid_port EZTEST_API_PORT "$(env_value EZTEST_API_PORT '')" 13333)"
+web_port="$(valid_port EZTEST_WEB_PORT "$(env_value EZTEST_WEB_PORT '')" 6868)"
+exec_default_port="$(valid_port EZTEST_EXECUTOR_PORT "$(env_value EZTEST_EXECUTOR_PORT '')" 13336)"
+exec_addr="$(env_value EZTEST_EXECUTOR_ADDR "127.0.0.1:$exec_default_port")"
+read -r exec_host exec_port <<<"$(split_host_port "$exec_addr" "$exec_default_port")" || fail "Invalid EZTEST_EXECUTOR_ADDR: $exec_addr"
+render_addr="$(env_value EZTEST_RENDERER_ADDR '127.0.0.1:13337')"
+read -r render_host render_port <<<"$(split_host_port "$render_addr" 13337)" || fail "Invalid EZTEST_RENDERER_ADDR: $render_addr"
+if [ "$exec_port" != "$exec_default_port" ]; then
+    printf 'WARNING: EZTEST_EXECUTOR_ADDR port (%s) differs from EZTEST_EXECUTOR_PORT (%s); the API seeds its executor URL from EZTEST_EXECUTOR_PORT. Keep them equal.\n' "$exec_port" "$exec_default_port" >&2
+fi
+if [ "$render_port" != "13337" ]; then
+    printf 'WARNING: EZTEST_RENDERER_ADDR port (%s) differs from the settings-center default render_worker_url (13337); update report.render_worker_url in the admin settings center.\n' "$render_port" >&2
+fi
+# The web process reads PORT/HOSTNAME; keep PORT in sync with EZTEST_WEB_PORT so
+# the API's CORS origins match the browser URL.
+web_process_port="$(valid_port PORT "$(env_value PORT '')" "$web_port")"
+if [ "$web_process_port" != "$web_port" ]; then
+    fail "PORT ($web_process_port) and EZTEST_WEB_PORT ($web_port) differ in .env; keep them equal so the API's CORS origins match the web UI."
+fi
 web_host="$(env_value HOSTNAME '127.0.0.1')"
-api_base="http://$(probe_host "$api_host"):$api_port"
+api_base="http://127.0.0.1:$api_port"
 exec_base="http://$(probe_host "$exec_host"):$exec_port"
+render_base="http://$(probe_host "$render_host"):$render_port"
 web_base="http://$(probe_host "$web_host"):$web_port"
 
 # Database preflight.
@@ -447,9 +514,11 @@ See PACKAGE.md (\"PostgreSQL 17\") for the exact commands."
 fi
 executor_token="$(env_value EZTEST_EXECUTOR_TOKEN '')"
 [ -n "$executor_token" ] || fail "EZTEST_EXECUTOR_TOKEN is empty in .env. Re-run 'bash init-config.sh --force' or set it manually."
+render_token="$(env_value EZTEST_RENDER_TOKEN '')"
+[ -n "$render_token" ] || fail "EZTEST_RENDER_TOKEN is empty in .env. Re-run 'bash init-config.sh --force' or set it manually."
 
 # Already-running and port checks.
-for component in api executor web; do
+for component in api executor web renderer; do
     pid_file="$RUN/$component.pid"
     if [ -f "$pid_file" ]; then
         recorded_pid="$(cat "$pid_file" 2>/dev/null || true)"
@@ -467,8 +536,9 @@ check_port_free() { # label host port
         fail "Port $3 is already in use ($1). Stop the process using it or change the port in .env."
     fi
 }
-check_port_free "API (EZTEST_HTTP_ADDR)" "$(probe_host "$api_host")" "$api_port"
+check_port_free "API (EZTEST_API_PORT)" "127.0.0.1" "$api_port"
 check_port_free "executor (EZTEST_EXECUTOR_ADDR)" "$(probe_host "$exec_host")" "$exec_port"
+check_port_free "renderer (EZTEST_RENDERER_ADDR)" "$(probe_host "$render_host")" "$render_port"
 check_port_free "web (PORT)" "$(probe_host "$web_host")" "$web_port"
 
 # Warn about a world-readable .env without printing it.
@@ -482,24 +552,32 @@ if command -v stat >/dev/null 2>&1; then
 fi
 
 info "Starting EzTest from $PKG"
-info "  API      : $api_base"
+info "  API      : $api_base (startup vars: EZTEST_API_PORT/EZTEST_WEB_PORT/EZTEST_EXECUTOR_PORT)"
 info "  executor : $exec_base"
+info "  renderer : $render_base"
 info "  web      : $web_base"
 info "  database : ${db_host}:${db_port} (credentials from .env)"
+info "  storage  : $DATA (attachments, evidence, reports, exports)"
 printf '\n'
 
 # --- API -------------------------------------------------------------------
-printf '[1/3] API ...'
+# The 0.2 API reads ONLY these four startup variables; all other settings live in
+# the database settings center.
+export EZTEST_DATABASE_URL="$database_url"
+export EZTEST_API_PORT="$api_port"
+export EZTEST_WEB_PORT="$web_port"
+export EZTEST_EXECUTOR_PORT="$exec_default_port"
+printf '[1/4] API ...'
 start_detached api "$PKG" "$LOGS/api.log" "$LOGS/api.err.log" "$BIN"
 api_pid=$LAST_PID
-if ! wait_api_ready "$api_base" "$api_pid" 60; then
+if ! wait_api_ready "$api_base" "$api_pid" 90; then
     fail_with_rollback "$WAIT_LAST"
 fi
 api_version="$(printf '%s' "$API_HEALTH_BODY" | json_field 'data.version' 2>/dev/null || true)"
 ok "ready (version ${api_version:-unknown})"
 
 # --- executor --------------------------------------------------------------
-printf '[2/3] Playwright executor ...'
+printf '[2/4] Playwright executor ...'
 export EZTEST_EXECUTOR_TOKEN="$executor_token"
 export EZTEST_EXECUTOR_ADDR="$exec_addr"
 export EZTEST_EXECUTOR_MAX_CONTEXTS="$(env_value EZTEST_EXECUTOR_MAX_CONTEXTS '8')"
@@ -507,13 +585,13 @@ export EZTEST_EXEC_ALLOWED_HOSTS="$(env_value EZTEST_EXEC_ALLOWED_HOSTS 'localho
 export EZTEST_VISUAL_BASELINE_MAX_BYTES="$(env_value EZTEST_VISUAL_BASELINE_MAX_BYTES '5242880')"
 start_detached executor "$PKG" "$LOGS/executor.log" "$LOGS/executor.err.log" "$NODE" "$EXEC_SERVER"
 exec_pid=$LAST_PID
-if ! wait_executor_ready "$exec_base" "$exec_pid" 90; then
+if ! wait_executor_ready "$exec_base" "$exec_pid" 120; then
     fail_with_rollback "$WAIT_LAST"
 fi
 ok "ready (browser $EXEC_BROWSER)"
 
 # --- web -------------------------------------------------------------------
-printf '[3/3] web ...'
+printf '[3/4] web ...'
 export NODE_ENV="production"
 export PORT="$web_port"
 export HOSTNAME="$web_host"
@@ -524,15 +602,28 @@ if ! wait_web_ready "$web_base" "$web_pid" 60; then
 fi
 ok "ready"
 
+# --- PDF renderer ----------------------------------------------------------
+printf '[4/4] PDF renderer ...'
+export EZTEST_RENDER_TOKEN="$render_token"
+export EZTEST_RENDERER_ADDR="$render_addr"
+start_detached renderer "$PKG" "$LOGS/renderer.log" "$LOGS/renderer.err.log" "$NODE" "$RENDER_SERVER"
+render_pid=$LAST_PID
+if ! wait_renderer_ready "$render_base" "$render_pid" 120; then
+    fail_with_rollback "$WAIT_LAST"
+fi
+ok "ready (browser $RENDER_BROWSER)"
+
 printf '\n'
 printf 'EzTest is running.\n'
-printf '  Web UI        : http://localhost:%s\n' "$web_port"
+printf '  Web UI        : http://localhost:%s (sign in as admin, initial password admin123)\n' "$web_port"
 printf '  API health    : %s/api/health\n' "$api_base"
 printf '  API liveness  : %s/healthz\n' "$api_base"
-printf '  OpenAPI       : %s/api/openapi.yaml\n' "$api_base"
 printf '  Executor      : %s/healthz\n' "$exec_base"
-printf '  Administrator : admin (password is in .env - never printed)\n'
+printf '  Renderer      : %s/healthz (PDF reports)\n' "$render_base"
+printf '  Administrator : admin / admin123 - change the password in the UI after the first login\n'
 printf '\n'
+printf '  Ports         : web %s / API %s / executor %s / renderer %s\n' "$web_port" "$api_port" "$exec_port" "$render_port"
+printf '  Data dirs     : %s (attachments, evidence, reports, exports)\n' "$DATA"
 printf '  Logs          : %s\n' "$LOGS"
 printf '  Pid files     : %s\n' "$RUN"
 printf '  Status/stop   : bash status-eztest.sh / bash stop-eztest.sh\n'
