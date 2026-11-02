@@ -34,6 +34,12 @@ const (
 // context and retrying; on its own it is not a terminal run failure.
 var ErrContextOverflow = errors.New("llm context overflow")
 
+// ErrNotImplemented marks a protocol adapter whose wire implementation has not
+// landed yet. The OpenAI Responses adapter is a fail-closed placeholder until
+// P4-T2 implements infrastructure/responses.go; callers must surface this
+// error instead of silently falling back to chat completions.
+var ErrNotImplemented = errors.New("llm protocol adapter is not implemented")
+
 // IsContextOverflow reports whether err is a classified context-window
 // overflow, either as the raw sentinel or as the mapped platform error.
 func IsContextOverflow(err error) bool {
@@ -85,6 +91,36 @@ type ChatResponse struct {
 	ToolCalls    []ToolCall
 	Usage        map[string]int
 	FinishReason string
+}
+
+// Delta is one normalized streaming chunk emitted by an Adapter. Usually one
+// payload field is set per chunk: Content for assistant text, ReasoningContent
+// for thinking text, ToolCall for one function-call fragment. The terminal
+// chunk carries FinishReason and, when the upstream reports it, Usage.
+type Delta struct {
+	Content          string
+	ReasoningContent string
+	ToolCall         *ToolCallDelta
+	FinishReason     string
+	Usage            map[string]int
+}
+
+// ToolCallDelta is one streamed fragment of a function call. Index identifies
+// the call being assembled; Arguments is the raw JSON fragment as received.
+type ToolCallDelta struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// Adapter is one config-bound upstream protocol implementation. The chat
+// gateway selects the adapter from the configuration protocol and delegates
+// every completion and stream to it. Implementations must never include the
+// configured API key (or request headers) in returned errors.
+type Adapter interface {
+	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+	Stream(ctx context.Context, req ChatRequest, onDelta func(Delta)) error
 }
 
 // ModelInfo is the resolved target for an agent run: the default LLM

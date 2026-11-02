@@ -16,6 +16,10 @@ import (
 const (
 	ProviderOpenAI = "openai"
 
+	// ProtocolOpenAI and ProtocolOpenAICompatible are the legacy P0 storage
+	// values. They stay valid on read and are normalized to
+	// ProtocolOpenAIChatCompletions by NormalizeProtocol, so no data migration
+	// is needed for existing rows (spec §7.1).
 	ProtocolOpenAI           = "openai"
 	ProtocolOpenAICompatible = "openai_compatible"
 
@@ -23,11 +27,24 @@ const (
 	StatusDisabled = "disabled"
 )
 
+// Protocol is the upstream wire protocol spoken by one LLM configuration.
+// The current values behave differently: chat completions posts to
+// /chat/completions, Responses posts to /responses (spec §7.1).
+type Protocol string
+
+const (
+	ProtocolOpenAIChatCompletions Protocol = "openai_chat_completions"
+	ProtocolOpenAIResponses       Protocol = "openai_responses"
+)
+
 // P0 defaults and validation limits. They mirror the migration check
 // constraints so the application fails with a typed 400 before PostgreSQL
 // rejects the row.
 const (
-	DefaultProvider       = ProviderOpenAI
+	DefaultProvider = ProviderOpenAI
+	// DefaultProtocol stays the legacy P0 storage value: llm_0001_llm.sql still
+	// constrains the column to openai/openai_compatible. The adapter factory
+	// reads it as ProtocolOpenAIChatCompletions.
 	DefaultProtocol       = ProtocolOpenAI
 	DefaultStatus         = StatusActive
 	DefaultTimeoutSeconds = 60
@@ -83,7 +100,7 @@ func (c Config) Validate() error {
 		return err
 	}
 	if !ValidProtocol(c.Protocol) {
-		return platform.Invalid("protocol", "must be one of openai, openai_compatible")
+		return platform.Invalid("protocol", "must be one of openai_chat_completions, openai_responses (legacy openai/openai_compatible accepted)")
 	}
 	if err := validation.URL("base_url", c.BaseURL); err != nil {
 		return err
@@ -142,9 +159,27 @@ func NormalizeHeaders(headers map[string]string) map[string]string {
 	return normalized
 }
 
-// ValidProtocol reports whether protocol is one of the frozen P0 values.
+// ValidProtocol reports whether protocol is supported. Legacy P0 values stay
+// accepted while stored rows still use them; the adapter factory normalizes
+// both legacy values to chat completions.
 func ValidProtocol(protocol string) bool {
-	return protocol == ProtocolOpenAI || protocol == ProtocolOpenAICompatible
+	_, ok := NormalizeProtocol(protocol)
+	return ok
+}
+
+// NormalizeProtocol maps a configured protocol value to the canonical enum.
+// The legacy P0 values openai and openai_compatible read as
+// openai_chat_completions, so existing rows keep working without a data
+// migration (spec §7.1). A blank or unknown value reports ok=false.
+func NormalizeProtocol(protocol string) (Protocol, bool) {
+	switch Protocol(strings.TrimSpace(protocol)) {
+	case ProtocolOpenAIChatCompletions, ProtocolOpenAI, ProtocolOpenAICompatible:
+		return ProtocolOpenAIChatCompletions, true
+	case ProtocolOpenAIResponses:
+		return ProtocolOpenAIResponses, true
+	default:
+		return "", false
+	}
 }
 
 // ValidStatus reports whether status is one of the frozen P0 values.

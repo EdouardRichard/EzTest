@@ -21,6 +21,66 @@ const chatRetryBaseDelay = 25 * time.Millisecond
 
 var _ llmapp.ChatClient = (*Client)(nil)
 
+// NewAdapter returns the config-bound protocol adapter for cfg.Protocol.
+// Legacy P0 values (openai/openai_compatible) read as the chat-completions
+// protocol, so stored rows keep working without a data migration. An unknown
+// protocol is rejected instead of silently defaulting. The OpenAI Responses
+// protocol currently returns a fail-closed placeholder until P4-T2 implements
+// the /responses wire adapter in responses.go.
+func NewAdapter(cfg llm.Config) (llmapp.Adapter, error) {
+	return newAdapter(cfg, NewClient())
+}
+
+// newAdapter lets Client.Chat reuse its injected HTTP client while keeping the
+// exported factory free of transport placement details.
+func newAdapter(cfg llm.Config, client *Client) (llmapp.Adapter, error) {
+	protocol, ok := llm.NormalizeProtocol(cfg.Protocol)
+	if !ok {
+		return nil, fmt.Errorf("unknown llm protocol %q", cfg.Protocol)
+	}
+	switch protocol {
+	case llm.ProtocolOpenAIChatCompletions:
+		return &chatCompletionsAdapter{client: client, cfg: cfg}, nil
+	case llm.ProtocolOpenAIResponses:
+		return &responsesProtocolAdapter{cfg: cfg}, nil
+	default:
+		return nil, fmt.Errorf("unknown llm protocol %q", cfg.Protocol)
+	}
+}
+
+// responsesProtocolAdapter is the P4-T1 fail-closed placeholder for the OpenAI
+// Responses protocol. It deliberately never posts to /chat/completions:
+// P4-T2 replaces it with the real wire adapter in responses.go, which speaks
+// POST /responses with input/output items and streaming events.
+type responsesProtocolAdapter struct {
+	cfg llm.Config
+}
+
+var _ llmapp.Adapter = (*responsesProtocolAdapter)(nil)
+
+func (a *responsesProtocolAdapter) Chat(context.Context, llmapp.ChatRequest) (llmapp.ChatResponse, error) {
+	return llmapp.ChatResponse{}, a.notImplemented("chat")
+}
+
+func (a *responsesProtocolAdapter) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
+	return a.notImplemented("stream")
+}
+
+// notImplemented is the stable, actionable error returned until P4-T2 replaces
+// this placeholder. It wraps ErrNotImplemented so callers can classify it.
+func (a *responsesProtocolAdapter) notImplemented(operation string) error {
+	return fmt.Errorf("llm protocol %q %s is not implemented yet: %w", llm.ProtocolOpenAIResponses, operation, llmapp.ErrNotImplemented)
+}
+
+// chatCompletionsAdapter binds one configuration to the
+// POST /chat/completions wire protocol.
+type chatCompletionsAdapter struct {
+	client *Client
+	cfg    llm.Config
+}
+
+var _ llmapp.Adapter = (*chatCompletionsAdapter)(nil)
+
 // toolNameMapping maps upstream-safe tool names back to the frozen internal
 // names. DeepSeek rejects function names outside ^[a-zA-Z0-9_-]+$, so dotted
 // names such as requirement.draft_create are sent as requirement_draft_create.
@@ -56,17 +116,28 @@ func sanitizeToolName(name string) string {
 	return builder.String()
 }
 
+// Chat performs one completion using the protocol adapter selected from
+// cfg.Protocol. The chat-completions behavior (retries, timeout and error
+// classification) is unchanged.
+func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
+	adapter, err := newAdapter(cfg, c)
+	if err != nil {
+		return llmapp.ChatResponse{}, err
+	}
+	return adapter.Chat(ctx, req)
+}
+
 // Chat performs one OpenAI-compatible chat completion with tools. Transient
 // failures (network, timeout, HTTP 429 and 5xx) are retried up to
 // cfg.MaxRetries; other 4xx responses are returned immediately. Context-window
 // overflows are wrapped with llmapp.ErrContextOverflow so the runtime can
 // compact and retry. The configured API key is never included in errors.
-func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
+func (a *chatCompletionsAdapter) Chat(ctx context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
 	payload, names, err := buildChatPayload(req)
 	if err != nil {
 		return llmapp.ChatResponse{}, err
 	}
-	attempts := cfg.MaxRetries + 1
+	attempts := a.cfg.MaxRetries + 1
 	if attempts < 1 {
 		attempts = 1
 	}
@@ -78,7 +149,7 @@ func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatReques
 				return llmapp.ChatResponse{}, contextErr(ctx, err)
 			}
 		}
-		response, retryable, err := c.doChat(ctx, cfg, payload, names)
+		response, retryable, err := a.doChat(ctx, payload, names)
 		if err == nil {
 			return response, nil
 		}
@@ -93,9 +164,17 @@ func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatReques
 	return llmapp.ChatResponse{}, lastErr
 }
 
+// Stream is not implemented for the chat-completions adapter yet: the P1
+// gateway only requires non-streaming completions. It fails closed with the
+// same sentinel as the Responses placeholder instead of pretending to stream.
+func (a *chatCompletionsAdapter) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
+	return fmt.Errorf("llm chat completions streaming is not implemented yet: %w", llmapp.ErrNotImplemented)
+}
+
 // doChat performs one attempt with the per-config request timeout and returns
 // whether the failure is retryable.
-func (c *Client) doChat(ctx context.Context, cfg llm.Config, payload chatRequestPayload, names *toolNameMapping) (llmapp.ChatResponse, bool, error) {
+func (a *chatCompletionsAdapter) doChat(ctx context.Context, payload chatRequestPayload, names *toolNameMapping) (llmapp.ChatResponse, bool, error) {
+	cfg := a.cfg
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -103,11 +182,11 @@ func (c *Client) doChat(ctx context.Context, cfg llm.Config, payload chatRequest
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	request, err := c.newRequest(attemptCtx, cfg, http.MethodPost, "/chat/completions", payload)
+	request, err := a.client.newRequest(attemptCtx, cfg, http.MethodPost, "/chat/completions", payload)
 	if err != nil {
 		return llmapp.ChatResponse{}, false, err
 	}
-	response, err := c.http.Do(request)
+	response, err := a.client.http.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
 			return llmapp.ChatResponse{}, false, contextErr(ctx, err)
