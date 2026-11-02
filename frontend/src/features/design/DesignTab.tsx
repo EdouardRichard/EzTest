@@ -1,9 +1,17 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  type KeyboardEvent,
+  type PointerEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 
 import { Button } from "@/components/ui/Button"
+import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
@@ -42,11 +50,53 @@ function activityText(payload: Record<string, unknown>): string | null {
   return "AI 正在处理…"
 }
 
+/** The two draggable boundaries of the vertical three-layer workspace. */
+type DividerKind = "chat" | "mindmap"
+
+/** Chat / mindmap / detail share of the workspace height, in percent. */
+type LayerSplits = { chat: number; mindmap: number; detail: number }
+
+const DEFAULT_LAYER_SPLITS: LayerSplits = { chat: 35, mindmap: 40, detail: 25 }
+const MIN_LAYER_PERCENT = 10
+const KEYBOARD_RESIZE_STEP = 5
+/** `.app-content` bottom padding, reserved so the page itself never scrolls. */
+const PAGE_BOTTOM_INSET = 48
+const MIN_WORKSPACE_HEIGHT = 320
+
+function clampPercent(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
+
+function roundPercent(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
 /**
- * P2 design workspace: React Flow mindmap + design chat (top row) and the
- * full-width case detail (bottom row). The URL is the deep-link source of truth
- * and the `version:{id}` SSE channel drives debounced snapshot refreshes; node
- * positions stay local (`layout.ts`) and are never persisted.
+ * Move one divider by `delta` percent. A boundary always keeps the combined
+ * height of its two neighbouring layers constant (chat+mindmap / mindmap+detail),
+ * so dragging never changes the third layer.
+ */
+function resizeLayerSplits(current: LayerSplits, divider: DividerKind, delta: number): LayerSplits {
+  if (divider === "chat") {
+    const total = current.chat + current.mindmap
+    const chat = roundPercent(
+      clampPercent(current.chat + delta, MIN_LAYER_PERCENT, total - MIN_LAYER_PERCENT),
+    )
+    return { chat, mindmap: roundPercent(total - chat), detail: current.detail }
+  }
+  const total = current.mindmap + current.detail
+  const mindmap = roundPercent(
+    clampPercent(current.mindmap + delta, MIN_LAYER_PERCENT, total - MIN_LAYER_PERCENT),
+  )
+  return { chat: current.chat, mindmap, detail: roundPercent(total - mindmap) }
+}
+
+/**
+ * P2 design workspace: a full-height, vertically stacked three-layer layout
+ * (design chat / React Flow mindmap / case detail) with draggable separators.
+ * The URL is the deep-link source of truth and the `version:{id}` SSE channel
+ * drives debounced snapshot refreshes; node positions stay local (`layout.ts`)
+ * and are never persisted.
  */
 export function DesignTab({ versionId, initialCaseId, initialConversationId }: DesignTabProps) {
   const router = useRouter()
@@ -74,7 +124,19 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
 
+  const [layerSplits, setLayerSplits] = useState<LayerSplits>(DEFAULT_LAYER_SPLITS)
+  const [chatCollapsed, setChatCollapsed] = useState(false)
+  const [activeDivider, setActiveDivider] = useState<DividerKind | null>(null)
+  const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
+
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const workspaceRef = useRef<HTMLDivElement>(null)
+  const layersRef = useRef<HTMLDivElement>(null)
+  const dividerDrag = useRef<{
+    divider: DividerKind
+    startY: number
+    startSplits: LayerSplits
+  } | null>(null)
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true)
@@ -284,6 +346,25 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     )
   }, [])
 
+  const toggleChatCollapsed = useCallback(() => setChatCollapsed((value) => !value), [])
+
+  // The version page is not a flex column, so the workspace measures the space
+  // left below its own top edge and caps itself to the viewport. That keeps the
+  // document from growing: only the three layers (and their panels) scroll.
+  useEffect(() => {
+    if (loading || graph === null) return undefined
+    const updateHeight = () => {
+      const workspace = workspaceRef.current
+      if (workspace === null) return
+      const top = workspace.getBoundingClientRect().top
+      const available = Math.max(MIN_WORKSPACE_HEIGHT, window.innerHeight - top - PAGE_BOTTOM_INSET)
+      setWorkspaceHeight(`${Math.round(available)}px`)
+    }
+    updateHeight()
+    window.addEventListener("resize", updateHeight)
+    return () => window.removeEventListener("resize", updateHeight)
+  }, [loading, graph])
+
   if (loading) {
     return (
       <div data-testid="design-tab">
@@ -312,9 +393,69 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     ? `设计轮次 #${overview.active_round.round_no}`
     : "暂无设计轮次"
 
+  const chatPairTotal = layerSplits.chat + layerSplits.mindmap
+  const mindmapPairTotal = layerSplits.mindmap + layerSplits.detail
+
+  function dividerDisabled(divider: DividerKind): boolean {
+    return divider === "chat" && chatCollapsed
+  }
+
+  function handleDividerPointerDown(
+    divider: DividerKind,
+    event: PointerEvent<HTMLDivElement>,
+  ): void {
+    if (dividerDisabled(divider)) return
+    dividerDrag.current = { divider, startY: event.clientY, startSplits: layerSplits }
+    setActiveDivider(divider)
+    if (typeof event.currentTarget.setPointerCapture === "function") {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    }
+    event.preventDefault()
+  }
+
+  function handleDividerPointerMove(
+    divider: DividerKind,
+    event: PointerEvent<HTMLDivElement>,
+  ): void {
+    const drag = dividerDrag.current
+    if (drag === null || drag.divider !== divider) return
+    const height = layersRef.current?.getBoundingClientRect().height ?? 0
+    if (height <= 0) return
+    const delta = ((event.clientY - drag.startY) / height) * 100
+    setLayerSplits(resizeLayerSplits(drag.startSplits, divider, delta))
+  }
+
+  function handleDividerPointerUp(divider: DividerKind): void {
+    if (dividerDrag.current?.divider !== divider) return
+    dividerDrag.current = null
+    setActiveDivider(null)
+  }
+
+  function handleDividerKeyDown(divider: DividerKind, event: KeyboardEvent<HTMLDivElement>): void {
+    if (dividerDisabled(divider)) return
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return
+    event.preventDefault()
+    const delta = event.key === "ArrowDown" ? KEYBOARD_RESIZE_STEP : -KEYBOARD_RESIZE_STEP
+    setLayerSplits((current) => resizeLayerSplits(current, divider, delta))
+  }
+
+  const chatLayerStyle = chatCollapsed
+    ? { flexGrow: 0, flexShrink: 0, flexBasis: "auto" }
+    : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.chat}%` }
+  // Collapsed chat takes only its content height; the mindmap grows into the rest.
+  const mindmapLayerStyle = chatCollapsed
+    ? { flexGrow: 1, flexShrink: 1, flexBasis: "0%" }
+    : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.mindmap}%` }
+  const detailLayerStyle = { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.detail}%` }
+
   return (
-    <div data-testid="design-tab" className="space-y-3">
-      <header className="flex flex-wrap items-center gap-2">
+    <div
+      ref={workspaceRef}
+      data-testid="design-tab"
+      className="flex min-h-0 flex-col gap-3 overflow-hidden"
+      style={{ height: workspaceHeight }}
+    >
+      <header className="flex shrink-0 flex-wrap items-center gap-2">
         <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
         <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
           需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
@@ -366,10 +507,71 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
         />
       ) : null}
 
-      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_380px]">
-        <div className="min-w-0">
+      <div
+        ref={layersRef}
+        data-testid="design-layers"
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+      >
+        <div
+          data-testid="design-layer-chat"
+          data-collapsed={chatCollapsed ? "true" : "false"}
+          className="min-h-0 overflow-auto"
+          style={chatLayerStyle}
+        >
+          <DesignChat
+            versionId={versionId}
+            conversations={conversations}
+            activeConversationId={activeConversationId}
+            onSelectConversation={selectConversation}
+            onCreateConversation={createConversation}
+            creatingConversation={creatingConversation}
+            liveMessages={liveMessages}
+            activity={activity}
+            sseStatus={sseStatus}
+            staleNotice={staleNotice}
+            draftText={chatDraft}
+            onDraftTextChange={setChatDraft}
+            refreshToken={teamRoomToken}
+            collapsed={chatCollapsed}
+            onToggleCollapsed={toggleChatCollapsed}
+          />
+        </div>
+
+        <hr
+          data-testid="design-divider-chat"
+          // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="调整对话与脑图高度"
+          aria-valuemin={MIN_LAYER_PERCENT}
+          aria-valuemax={Math.round(chatPairTotal - MIN_LAYER_PERCENT)}
+          aria-valuenow={Math.round(layerSplits.chat)}
+          aria-disabled={chatCollapsed ? true : undefined}
+          tabIndex={chatCollapsed ? -1 : 0}
+          onPointerDown={(event) => handleDividerPointerDown("chat", event)}
+          onPointerMove={(event) => handleDividerPointerMove("chat", event)}
+          onPointerUp={() => handleDividerPointerUp("chat")}
+          onPointerCancel={() => handleDividerPointerUp("chat")}
+          onKeyDown={(event) => handleDividerKeyDown("chat", event)}
+          className={cn(
+            "group relative m-0 h-2 w-full shrink-0 touch-none select-none border-0 bg-transparent",
+            "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
+            "after:rounded-full after:bg-border after:transition-colors after:content-['']",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            chatCollapsed
+              ? "cursor-not-allowed opacity-60"
+              : "cursor-row-resize hover:after:bg-primary/60",
+            activeDivider === "chat" && "after:bg-primary",
+          )}
+        />
+
+        <div
+          data-testid="design-layer-mindmap"
+          className="flex min-h-0 flex-col overflow-auto [&>section]:min-h-0 [&>section]:flex-1"
+          style={mindmapLayerStyle}
+        >
           {graph.requirements.length === 0 ? (
-            <div className="surface-card flex min-h-[560px] items-center justify-center p-6">
+            <div className="surface-card flex h-full items-center justify-center p-6">
               <EmptyState
                 title={EMPTY_REQUIREMENTS_COPY}
                 description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
@@ -394,23 +596,35 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           )}
         </div>
 
-        <DesignChat
-          versionId={versionId}
-          conversations={conversations}
-          activeConversationId={activeConversationId}
-          onSelectConversation={selectConversation}
-          onCreateConversation={createConversation}
-          creatingConversation={creatingConversation}
-          liveMessages={liveMessages}
-          activity={activity}
-          sseStatus={sseStatus}
-          staleNotice={staleNotice}
-          draftText={chatDraft}
-          onDraftTextChange={setChatDraft}
-          refreshToken={teamRoomToken}
+        <hr
+          data-testid="design-divider-mindmap"
+          // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="调整脑图与详情高度"
+          aria-valuemin={MIN_LAYER_PERCENT}
+          aria-valuemax={Math.round(mindmapPairTotal - MIN_LAYER_PERCENT)}
+          aria-valuenow={Math.round(layerSplits.mindmap)}
+          tabIndex={0}
+          onPointerDown={(event) => handleDividerPointerDown("mindmap", event)}
+          onPointerMove={(event) => handleDividerPointerMove("mindmap", event)}
+          onPointerUp={() => handleDividerPointerUp("mindmap")}
+          onPointerCancel={() => handleDividerPointerUp("mindmap")}
+          onKeyDown={(event) => handleDividerKeyDown("mindmap", event)}
+          className={cn(
+            "group relative m-0 h-2 w-full shrink-0 cursor-row-resize touch-none select-none border-0 bg-transparent",
+            "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
+            "after:rounded-full after:bg-border after:transition-colors after:content-[''] hover:after:bg-primary/60",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            activeDivider === "mindmap" && "after:bg-primary",
+          )}
         />
 
-        <div className="lg:col-span-2">
+        <div
+          data-testid="design-layer-detail"
+          className="min-h-0 overflow-auto"
+          style={detailLayerStyle}
+        >
           <CaseDetailPanel
             versionId={versionId}
             caseId={selectedCaseId}

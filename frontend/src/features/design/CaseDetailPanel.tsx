@@ -458,7 +458,11 @@ export function CaseDetailPanel({
   const retry = useCallback(() => setReloadToken((token) => token + 1), [])
 
   return (
-    <section data-testid="case-detail" aria-label="用例详情" className="surface-card p-4">
+    <section
+      data-testid="case-detail"
+      aria-label="用例详情"
+      className="surface-card h-full min-h-0 overflow-auto p-4"
+    >
       {caseId === null ? (
         <p className="text-xs text-muted-foreground">选择用例查看详情</p>
       ) : loading && detail === null ? (
