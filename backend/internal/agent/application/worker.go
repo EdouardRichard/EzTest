@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,9 @@ const (
 	defaultWorkerConcurrency      = 4
 	workerShutdownWait            = 5 * time.Second
 	workerWriteBackTimeout        = 5 * time.Second
+	// DefaultJobProgressWindow is the 0.2.1 per-job coalescing window for
+	// job.progress (contracts/events.md §18.2 #4 requires 250–500ms).
+	DefaultJobProgressWindow = 300 * time.Millisecond
 )
 
 // agentProductTeams is the set of teams claimed by the agent worker. The
@@ -78,6 +82,16 @@ func WithWorkerEvents(publisher eventingapp.Publisher) WorkerOption {
 	return func(w *Worker) { w.events = publisher }
 }
 
+// WithWorkerJobProgressWindow overrides the job.progress coalescing window. The
+// default is DefaultJobProgressWindow; a non-positive value keeps it.
+func WithWorkerJobProgressWindow(window time.Duration) WorkerOption {
+	return func(w *Worker) {
+		if window > 0 {
+			w.jobProgressWindow = window
+		}
+	}
+}
+
 // WithWorkerDrainGate injects the replica drain signal. While the gate returns
 // true the worker finishes in-flight runs but claims no new work; nil means the
 // replica never drains. cmd/eztest wires the orchestration service's
@@ -110,12 +124,16 @@ type Worker struct {
 	events     eventingapp.Publisher
 	runSink    RunSink
 	drainGate  func() bool
+	// jobEvents coalesces the 0.2.1 job.progress/finished stream for every run
+	// this worker owns. It is nil when no publisher is wired.
+	jobEvents *JobProgressEmitter
 
 	pollInterval        time.Duration
 	heartbeatInterval   time.Duration
 	recoveryInterval    time.Duration
 	concurrencyOverride int
 	shutdownWait        time.Duration
+	jobProgressWindow   time.Duration
 
 	mu      sync.Mutex
 	running map[int64]*workerRun
@@ -142,10 +160,14 @@ func NewWorker(queue WorkerQueue, runner RunExecutor, settings SettingsReader, l
 		heartbeatInterval: DefaultHeartbeat,
 		recoveryInterval:  DefaultWorkerRecoveryInterval,
 		shutdownWait:      workerShutdownWait,
+		jobProgressWindow: DefaultJobProgressWindow,
 		running:           map[int64]*workerRun{},
 	}
 	for _, option := range options {
 		option(worker)
+	}
+	if worker.events != nil {
+		worker.jobEvents = NewJobProgressEmitter(worker.events, worker.logger, worker.jobProgressWindow)
 	}
 	return worker
 }
@@ -231,6 +253,9 @@ func (w *Worker) claim(ctx context.Context, sem chan struct{}, inflight *sync.Wa
 
 func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 	runCtx, cancel := context.WithCancel(parent)
+	// The runner reports its completed turns through the same per-job
+	// coalescer, so start/progress/finished cannot race each other.
+	runCtx = withJobEvents(runCtx, w.jobEvents)
 	entry := &workerRun{epoch: item.LeaseEpoch, cancel: cancel}
 	w.track(item.ID, entry)
 	defer w.untrack(item.ID)
@@ -242,7 +267,7 @@ func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 			return
 		}
 		w.logger.Error("agent worker: mark running failed", "work_item_id", item.ID, "error", err)
-		w.recordFailure(item, err, true)
+		w.recordFailure(item, err, true, RunResult{})
 		return
 	}
 	w.publish(item, "work_item.claimed", map[string]any{
@@ -250,6 +275,13 @@ func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 		"type":         item.Type,
 		"claimed_by":   w.instanceID,
 		"lease_epoch":  item.LeaseEpoch,
+	})
+	// Job start (contracts/events.md §18.1): the item is now running in this
+	// worker. current/total stay 0 ("unknown") until the run reports a real
+	// counter; no percentage is ever fabricated.
+	w.jobProgress(item, eventingapp.JobProgress{
+		Status: eventingapp.JobStatusRunning,
+		Total:  0,
 	})
 
 	result, runErr := w.runner.Run(runCtx, item)
@@ -264,8 +296,12 @@ func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 	}
 	if runErr == nil && result.Status == agent.AgentRunDone {
 		if err := w.complete(item); err != nil {
+			// The DB is the source of truth: without a persisted terminal state
+			// there is no terminal event to publish.
 			w.logger.Error("agent worker: complete failed", "work_item_id", item.ID, "error", err)
+			return
 		}
+		w.jobFinished(item, result, eventingapp.JobStatusDone, nil)
 		return
 	}
 	retryable := IsRetryable(runErr)
@@ -273,7 +309,7 @@ func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 		retryable = true
 		runErr = fmt.Errorf("agent run finished with status %s", result.Status)
 	}
-	w.recordFailure(item, runErr, retryable)
+	w.recordFailure(item, runErr, retryable, result)
 }
 
 // isRunLeaseLost reports whether a finished run lost its lease, either as a
@@ -309,7 +345,7 @@ func (w *Worker) notifyRunFinished(item agent.WorkItem, result RunResult, runErr
 	}
 }
 
-func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool) {
+func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool, result RunResult) {
 	ctx, cancel := context.WithTimeout(context.Background(), workerWriteBackTimeout)
 	defer cancel()
 	if err := w.queue.Fail(ctx, item.ID, item.LeaseEpoch, cause, retryable); err != nil {
@@ -323,10 +359,12 @@ func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool)
 	// The repository decides dead vs retryable open; the event must reflect the
 	// persisted outcome, so read the row back after the write.
 	eventType := "work_item.failed"
+	terminal := false
 	if items, err := w.queue.ListByVersion(ctx, item.VersionID, 100); err == nil {
 		for _, current := range items {
 			if current.ID == item.ID && current.Status == agent.WorkItemDead {
 				eventType = "work_item.dead"
+				terminal = true
 			}
 		}
 	}
@@ -343,6 +381,18 @@ func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool)
 		"type":         item.Type,
 		"attempt":      attempt,
 		"error":        errorText,
+	})
+	// The job projection follows the persisted work-item outcome: a dead item
+	// (attempts exhausted) is terminal failed, while a retryable failed item
+	// stays on the version stream so a later attempt can reopen it.
+	if terminal {
+		w.jobFinished(item, result, eventingapp.JobStatusFailed, cause)
+		return
+	}
+	w.jobProgress(item, eventingapp.JobProgress{
+		Status:  eventingapp.JobStatusFailed,
+		Total:   0,
+		Message: errorText,
 	})
 }
 
@@ -431,4 +481,250 @@ func (w *Worker) publish(item agent.WorkItem, eventType string, payload map[stri
 		},
 		Payload: payload,
 	})
+}
+
+// --- 0.2.1 job events (Task 47) ---------------------------------------------
+
+// JobProgressEmitter coalesces job.progress events per work item and publishes
+// exactly one job.finished per job. It is safe for concurrent use and never
+// returns errors: event publication is best effort and the DB stays the source
+// of truth (contracts/events.md §18.2 #7).
+//
+// The first update for a job anchors a coalescing window (250-500ms); every
+// update inside the window replaces the pending snapshot, and the window close
+// publishes the latest snapshot once. current never moves backwards for the
+// same job and a known total is never downgraded to "unknown" (0), so a late
+// start or status event cannot make the card regress. Progress after the
+// terminal event is dropped.
+type JobProgressEmitter struct {
+	publisher eventingapp.Publisher
+	logger    *slog.Logger
+	window    time.Duration
+
+	mu   sync.Mutex
+	jobs map[int64]*jobProgressState
+}
+
+// jobProgressState is the per-job coalescing buffer. versionID is fixed by the
+// first event so a buggy caller cannot retarget the job to another version.
+type jobProgressState struct {
+	versionID int64
+	latest    eventingapp.JobProgress
+	pending   bool
+	timer     *time.Timer
+	current   int
+	total     int
+	finished  bool
+}
+
+// NewJobProgressEmitter builds the per-job coalescer. A nil logger falls back
+// to slog.Default and a non-positive window to DefaultJobProgressWindow.
+func NewJobProgressEmitter(publisher eventingapp.Publisher, logger *slog.Logger, window time.Duration) *JobProgressEmitter {
+	if window <= 0 {
+		window = DefaultJobProgressWindow
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &JobProgressEmitter{
+		publisher: publisher,
+		logger:    logger,
+		window:    window,
+		jobs:      map[int64]*jobProgressState{},
+	}
+}
+
+// Progress records one job.progress update. It validates the contract shape
+// before buffering and logs (never returns) a validation or publish failure.
+func (e *JobProgressEmitter) Progress(versionID int64, progress eventingapp.JobProgress) {
+	if e == nil || e.publisher == nil {
+		return
+	}
+	if versionID <= 0 {
+		e.logger.Warn("job progress: invalid version", "version_id", versionID, "job_id", progress.JobID)
+		return
+	}
+	if err := progress.Validate(); err != nil {
+		e.logger.Warn("job progress: contract validation failed",
+			"version_id", versionID, "job_id", progress.JobID, "error", err)
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state, ok := e.stateLocked(progress.JobID, versionID)
+	if !ok || state.finished {
+		return
+	}
+	// Monotonic snapshot: a status-only update (current 0) or a retried run
+	// (turn counter reset) must not pull the visible progress backwards, and a
+	// total learned once stays known.
+	if progress.Current < state.current {
+		progress.Current = state.current
+	}
+	state.current = progress.Current
+	switch {
+	case progress.Total > 0:
+		state.total = progress.Total
+	case state.total > 0:
+		progress.Total = state.total
+	}
+	state.latest = progress
+	if state.pending {
+		return
+	}
+	state.pending = true
+	jobID := progress.JobID
+	state.timer = time.AfterFunc(e.window, func() { e.flush(jobID) })
+}
+
+// Finished publishes the one-time terminal job.finished. It first flushes the
+// pending progress snapshot (so a job that finishes inside one window still
+// reports its start/last state), then marks the job terminal; later progress
+// and repeated terminal calls are dropped.
+func (e *JobProgressEmitter) Finished(versionID int64, finished eventingapp.JobFinished) {
+	if e == nil || e.publisher == nil {
+		return
+	}
+	if versionID <= 0 {
+		e.logger.Warn("job finished: invalid version", "version_id", versionID, "job_id", finished.JobID)
+		return
+	}
+	if err := finished.Validate(); err != nil {
+		e.logger.Warn("job finished: contract validation failed",
+			"version_id", versionID, "job_id", finished.JobID, "error", err)
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state, ok := e.stateLocked(finished.JobID, versionID)
+	if !ok || state.finished {
+		return
+	}
+	if state.pending {
+		state.pending = false
+		if state.timer != nil {
+			state.timer.Stop()
+			state.timer = nil
+		}
+		e.publishProgressLocked(state)
+	}
+	if err := eventingapp.PublishJobFinished(context.Background(), e.publisher, versionID, finished); err != nil {
+		e.logger.Warn("job finished: publish failed",
+			"version_id", versionID, "job_id", finished.JobID, "error", err)
+	}
+	state.finished = true
+}
+
+// stateLocked returns the job state, creating it for the first event. A
+// different version for an already-seen job is a caller bug: it is logged and
+// dropped rather than leaking the job onto a foreign version stream.
+func (e *JobProgressEmitter) stateLocked(jobID, versionID int64) (*jobProgressState, bool) {
+	state := e.jobs[jobID]
+	if state == nil {
+		state = &jobProgressState{versionID: versionID}
+		e.jobs[jobID] = state
+		return state, true
+	}
+	if state.versionID != versionID {
+		e.logger.Warn("job events: version mismatch ignored",
+			"job_id", jobID, "version_id", versionID, "job_version_id", state.versionID)
+		return nil, false
+	}
+	return state, true
+}
+
+// flush publishes the pending snapshot once and closes the window. Publication
+// runs under the emitter lock so two windows of the same job can never publish
+// out of order.
+func (e *JobProgressEmitter) flush(jobID int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state := e.jobs[jobID]
+	if state == nil || !state.pending {
+		return
+	}
+	state.pending = false
+	state.timer = nil
+	if state.finished {
+		return
+	}
+	e.publishProgressLocked(state)
+}
+
+func (e *JobProgressEmitter) publishProgressLocked(state *jobProgressState) {
+	progress := state.latest
+	progress.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := eventingapp.PublishJobProgress(context.Background(), e.publisher, state.versionID, progress); err != nil {
+		e.logger.Warn("job progress: publish failed",
+			"version_id", state.versionID, "job_id", progress.JobID, "error", err)
+	}
+}
+
+// jobProgress reports one coalesced progress update for a work item.
+func (w *Worker) jobProgress(item agent.WorkItem, progress eventingapp.JobProgress) {
+	if w == nil || w.jobEvents == nil {
+		return
+	}
+	progress.JobID = item.ID
+	progress.Kind = jobKind(item)
+	w.jobEvents.Progress(item.VersionID, progress)
+}
+
+// jobFinished reports the one-time terminal event for a work item.
+func (w *Worker) jobFinished(item agent.WorkItem, result RunResult, status string, cause error) {
+	if w == nil || w.jobEvents == nil {
+		return
+	}
+	finished := eventingapp.JobFinished{
+		JobID:     item.ID,
+		Kind:      jobKind(item),
+		Status:    status,
+		ResultRef: jobResultRef(result),
+	}
+	if cause != nil {
+		finished.Error = truncateRunes(cause.Error(), 500)
+		finished.Attempt = item.Attempts
+		if finished.Attempt < 1 {
+			finished.Attempt = 1
+		}
+	}
+	w.jobEvents.Finished(item.VersionID, finished)
+}
+
+// jobKind is the 0.2.1 job kind of a work item. Legacy P1-P8 rows carry no Kind
+// value; their frozen type is the best available label.
+func jobKind(item agent.WorkItem) string {
+	if kind := strings.TrimSpace(item.Kind); kind != "" {
+		return kind
+	}
+	return strings.TrimSpace(item.Type)
+}
+
+// jobResultRef points the terminal event at the run row that holds the job's
+// outputs. It is empty when no run row was created (contract allows it).
+func jobResultRef(result RunResult) string {
+	if result.AgentRunID <= 0 {
+		return ""
+	}
+	return "agent_run:" + idText(result.AgentRunID)
+}
+
+// jobEventsContextKey carries the worker's per-job emitter on a run context.
+// The runner reports its turn progress through the same coalescer that the
+// worker uses for start/finished, so one job never has two racing producers.
+type jobEventsContextKey struct{}
+
+func withJobEvents(ctx context.Context, emitter *JobProgressEmitter) context.Context {
+	if emitter == nil || ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, jobEventsContextKey{}, emitter)
+}
+
+func jobEventsFromContext(ctx context.Context) *JobProgressEmitter {
+	if ctx == nil {
+		return nil
+	}
+	emitter, _ := ctx.Value(jobEventsContextKey{}).(*JobProgressEmitter)
+	return emitter
 }

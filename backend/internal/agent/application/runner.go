@@ -793,6 +793,9 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		}
 		state.turns++
 		mergeUsage(state.usage, response.Usage)
+		// 0.2.1 job.progress: every completed model turn is a real step of the
+		// work item. It goes through the worker's per-job coalescer.
+		r.reportJobProgress(ctx, state)
 
 		if err := r.persistAssistant(ctx, state, response); err != nil {
 			return "", err
@@ -1696,6 +1699,28 @@ func (r *Runner) publish(state *runState, eventType string, payload map[string]a
 		Type:    eventType,
 		Scope:   scope,
 		Payload: payload,
+	})
+}
+
+// reportJobProgress advances the job card's step counter with the completed
+// model turns of this run. The emitter is the worker's per-job coalescer
+// carried on the run context; without one (P1-P8 call paths and runner unit
+// tests) this is a no-op. total stays 0 ("unknown") so the UI never derives a
+// fabricated percentage (contracts/events.md §18.2 #4).
+func (r *Runner) reportJobProgress(ctx context.Context, state *runState) {
+	if state == nil {
+		return
+	}
+	emitter := jobEventsFromContext(ctx)
+	if emitter == nil {
+		return
+	}
+	emitter.Progress(state.item.VersionID, eventingapp.JobProgress{
+		JobID:   state.item.ID,
+		Kind:    jobKind(state.item),
+		Current: state.turns,
+		Total:   0,
+		Status:  eventingapp.JobStatusRunning,
 	})
 }
 
