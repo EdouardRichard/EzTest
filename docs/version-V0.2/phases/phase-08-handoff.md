@@ -101,7 +101,7 @@
 
 - 实施分支：`feat/v0.2-p8`，基 `feat/v0.2` @`e2cf110`。
 - 关键提交：`b8e9e5b` spec/phase 基线；`dece5ff` plan；`efdb8d1` 迁移/设置；`8ed6f1a` H1；`5c7b5ec` H2；`54476be` H3；`9915a7a` H4；`9db85b6` H5–H8；`b9471cf` H10/H11；`3712266` wiring；`9d70252` 契约；`0ff837b` 85 设置测试；`c70a27a` 文档/静态门/CI；`9f35dbc` 契约文字；`d07eac6`/`69b8d16`/`040fb24` 验收缺陷修复；`8a238a2` W2 脚本；`16284b6` 验收证据与 harness 修复。
-- 合并：`feat/v0.2` ← `feat/v0.2-p8`（合并提交见仓库历史）。
+- 合并：`feat/v0.2` ← `feat/v0.2-p8` @ merge `f5c5801`（`--no-ff`）。
 - 不修改 `docs/version-V0.2` 设计文档；只更新 handoff/contracts/验收证据/迁移。
 
 ## 7. 下一阶段边界
