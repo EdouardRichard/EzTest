@@ -88,6 +88,9 @@ type fakeCaseRunRepo struct {
 	updates       int
 	claimFailures int
 	claimAttempts int
+	// beforeUpdateCAS simulates a concurrent owner racing the next CAS write. It
+	// runs with the repository lock held and must only touch f.rows directly.
+	beforeUpdateCAS func()
 }
 
 func newFakeCaseRunRepo() *fakeCaseRunRepo {
@@ -134,6 +137,11 @@ func (f *fakeCaseRunRepo) Create(_ context.Context, caseRun execution.CaseRun) e
 func (f *fakeCaseRunRepo) UpdateCAS(_ context.Context, id, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.beforeUpdateCAS != nil {
+		hook := f.beforeUpdateCAS
+		f.beforeUpdateCAS = nil
+		hook()
+	}
 	row, ok := f.rows[id]
 	if !ok {
 		return false, nil

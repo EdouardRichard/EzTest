@@ -101,22 +101,43 @@ func (s *Service) OnAPIAuthSuccess(ctx context.Context, fact SuccessFact) (knowl
 	return s.createSuccessDraft(ctx, KindAPIAuth, fact)
 }
 
-// AutoApprove promotes one draft to approved when (and only when) its kind is
-// one of the three low-risk kinds and the item carries no credential or secret
-// field. A successful promotion writes the knowledge.auto_approved audit entry
-// and publishes the same system event; both are best effort and never fail the
-// caller. AutoApprove never approves an already reviewed/verified item.
+// AutoApprove promotes one stored draft to approved when (and only when) its
+// kind is one of the three low-risk kinds and the item carries no credential or
+// secret field. The caller-supplied item is treated as a handle: the stored row
+// is re-read by ID and scanned, so a draft edited after the caller read it
+// cannot be approved on stale content. A successful promotion writes the
+// knowledge.auto_approved audit entry and publishes the same system event; both
+// are best effort and never fail the caller. AutoApprove never approves an
+// already reviewed/verified item.
 func (s *Service) AutoApprove(ctx context.Context, item knowledge.Item) bool {
-	kind, ok := KindOf(item)
-	if !ok || !kind.LowRisk() {
-		return false
+	_, ok := s.autoApprove(ctx, item)
+	return ok
+}
+
+// autoApprove is the shared implementation of AutoApprove. It returns the
+// approved row so the success hooks can hand the stored truth back to their
+// callers instead of the pre-approval draft.
+func (s *Service) autoApprove(ctx context.Context, item knowledge.Item) (knowledge.Item, bool) {
+	if err := s.requireID(item.ID); err != nil {
+		return knowledge.Item{}, false
 	}
-	if item.Status != knowledge.StatusDraft || itemHasSecrets(item) {
-		return false
+	if err := s.requireRepo(); err != nil {
+		return knowledge.Item{}, false
 	}
-	approved, err := s.UpdateStatus(ctx, item.ID, knowledge.StatusApproved, "")
+	stored, err := s.repo.Get(ctx, item.ID)
 	if err != nil {
-		return false
+		return knowledge.Item{}, false
+	}
+	kind, ok := KindOf(stored)
+	if !ok || !kind.LowRisk() {
+		return knowledge.Item{}, false
+	}
+	if stored.Status != knowledge.StatusDraft || itemHasSecrets(stored) {
+		return knowledge.Item{}, false
+	}
+	approved, err := s.UpdateStatus(ctx, stored.ID, knowledge.StatusApproved, "")
+	if err != nil {
+		return knowledge.Item{}, false
 	}
 
 	metadata := map[string]any{
@@ -141,7 +162,7 @@ func (s *Service) AutoApprove(ctx context.Context, item knowledge.Item) bool {
 		payload["source_version_id"] = platformid.Format(*approved.SourceVersionID)
 	}
 	s.publish(ctx, platform.Actor{}, EventAutoApproved, payload)
-	return true
+	return approved, true
 }
 
 // KindOf returns the knowledge kind carried by an item, reading the "kind:"
@@ -200,6 +221,13 @@ func (s *Service) createSuccessDraft(ctx context.Context, kind Kind, fact Succes
 	})
 	if err != nil {
 		return knowledge.Item{}, err
+	}
+	// The success pipeline continues past the draft: low-risk kinds are
+	// auto-approved by default (the settings toggle is a later task). This is
+	// best effort — a failed promotion leaves the draft for review and never
+	// fails the hook caller (spec §10.1).
+	if approved, ok := s.autoApprove(ctx, item); ok {
+		return approved, nil
 	}
 	return item, nil
 }
@@ -321,21 +349,40 @@ func truncateRunes(value string, limit int) string {
 
 /* ---------------------------- secret rejection ---------------------------- */
 
-// secretAssignmentPattern catches a credential written into free text
-// ("password=hunter2", "token: ..."). Structured recipe fields are checked by
-// key; this catches values that embed an assignment.
-var secretAssignmentPattern = regexp.MustCompile(
-	`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|cookie|credential)s?\b\s*[:=]\s*\S+`,
+var (
+	// secretAssignmentPattern catches a credential written into free text
+	// ("password=hunter2", "token: ..."). Structured recipe fields are checked
+	// by key; this catches values that embed an assignment. The second group is
+	// the assigned value so template placeholders can be allowed.
+	secretAssignmentPattern = regexp.MustCompile(
+		`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|cookie|credential)s?\b\s*[:=]\s*(\S+)`,
+	)
+	// bearerCredentialPattern catches a raw bearer credential under any key
+	// ("Bearer eyJ..."). Only the token part decides, so a template placeholder
+	// ("Bearer {{access_token}}") stays allowed.
+	bearerCredentialPattern = regexp.MustCompile(`(?i)\bbearer\s+(\S+)`)
+	// jwtPattern catches a raw JSON Web Token (header.payload.signature) under a
+	// generic key, where no credential field name marks it.
+	jwtPattern = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
 )
 
 // successFactHasSecrets reports whether a hook input carries a credential or
-// secret field. A template placeholder ({{token}}, <token>, ${token}) is not a
-// credential and is allowed so recipes can describe the injection point.
+// secret value in any field the hook persists: title, system key and the
+// structured page/API/account bindings, plus every nested recipe string. A
+// template placeholder ({{token}}, <token>, ${token}) is not a credential and is
+// allowed so recipes can describe the injection point.
 func successFactHasSecrets(fact SuccessFact) bool {
-	raw, err := json.Marshal(map[string]any{
-		"title":  fact.Title,
-		"recipe": fact.Recipe,
-	})
+	for _, text := range []string{
+		fact.Title, fact.SystemKey, fact.PageKey, fact.APIKey, fact.AccountRole,
+	} {
+		if textHasCredential(text) {
+			return true
+		}
+	}
+	if len(fact.Recipe) == 0 {
+		return false
+	}
+	raw, err := json.Marshal(fact.Recipe)
 	if err != nil {
 		// Reject unencodable recipes: they cannot be stored safely anyway.
 		return true
@@ -347,29 +394,100 @@ func successFactHasSecrets(fact SuccessFact) bool {
 	return payloadHasSecrets(payload)
 }
 
-// itemHasSecrets reports whether a stored item carries a credential field. It
-// inspects the title, tags and the structured content; a non-JSON content is
-// scanned as free text. The top-level "bindings" object is skipped: those are
-// SUT identifiers validated by the binding rules, never credentials
-// (spec §10.2).
+// itemHasSecrets reports whether a stored item carries a credential value. It
+// inspects the title, tags, system key, every string binding and the content;
+// a non-JSON content is scanned as free text. The structured success content
+// repeats the bindings as SUT identifiers, so a top-level "bindings" object is
+// scanned by value for raw credentials rather than by key name: "api_key" there
+// is the endpoint identifier, not a credential field. Other keys inside a
+// bindings object keep the full key-based checks.
 func itemHasSecrets(item knowledge.Item) bool {
-	if secretAssignmentPattern.MatchString(item.Title) {
+	if textHasCredential(item.Title) {
 		return true
 	}
 	for _, tag := range item.Tags {
-		if secretAssignmentPattern.MatchString(tag) {
+		if textHasCredential(tag) {
 			return true
 		}
+	}
+	if item.SystemKey != nil && textHasCredential(*item.SystemKey) {
+		return true
+	}
+	if bindingsHaveSecrets(item.Bindings) {
+		return true
 	}
 	var payload any
 	if err := json.Unmarshal([]byte(item.Content), &payload); err == nil {
 		if object, ok := payload.(map[string]any); ok {
-			delete(object, "bindings")
-			payload = object
+			if rawBindings, ok := object["bindings"]; ok {
+				if bindingValuesHaveSecrets(rawBindings) {
+					return true
+				}
+				delete(object, "bindings")
+			}
+			return payloadHasSecrets(object)
 		}
 		return payloadHasSecrets(payload)
 	}
-	return secretAssignmentPattern.MatchString(item.Content)
+	return textHasCredential(item.Content)
+}
+
+// bindingsHaveSecrets scans the persisted typed binding strings (page, API and
+// account role). They are identifiers, so only raw credential markers decide.
+func bindingsHaveSecrets(bindings knowledge.Bindings) bool {
+	for _, value := range []*string{bindings.PageKey, bindings.APIKey, bindings.AccountRole} {
+		if value != nil && textHasCredential(*value) {
+			return true
+		}
+	}
+	return false
+}
+
+// bindingValuesHaveSecrets scans the top-level structured bindings object that
+// repeats the typed bindings in the content: the known binding fields are
+// identifiers, so only their values are checked for raw credentials; any other
+// key keeps the key-based credential check.
+func bindingValuesHaveSecrets(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return payloadHasSecrets(value)
+	}
+	for key, field := range object {
+		switch normalizeKey(key) {
+		case "systemid", "environmentid", "pagekey", "apikey", "accountrole":
+			if payloadStringsHaveSecrets(field) {
+				return true
+			}
+		default:
+			if sensitiveKey(key) && !placeholderValue(field) {
+				return true
+			}
+			if payloadHasSecrets(field) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func payloadStringsHaveSecrets(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, item := range typed {
+			if payloadStringsHaveSecrets(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if payloadStringsHaveSecrets(item) {
+				return true
+			}
+		}
+	case string:
+		return textHasCredential(typed)
+	}
+	return false
 }
 
 func payloadHasSecrets(value any) bool {
@@ -390,18 +508,48 @@ func payloadHasSecrets(value any) bool {
 			}
 		}
 	case string:
-		return secretAssignmentPattern.MatchString(typed)
+		return textHasCredential(typed)
 	}
 	return false
 }
 
-func sensitiveKey(key string) bool {
-	normalized := strings.Map(func(r rune) rune {
+// textHasCredential reports whether free text embeds a credential value: a
+// secret assignment ("password=hunter2"), a JWT, or a raw bearer token whose
+// value is not a template placeholder. It is applied to every persisted string
+// field, including strings under keys that do not name a credential.
+func textHasCredential(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, match := range secretAssignmentPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) > 2 && !placeholderText(match[2]) {
+			return true
+		}
+	}
+	if jwtPattern.MatchString(text) {
+		return true
+	}
+	for _, match := range bearerCredentialPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) > 1 && !placeholderText(match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeKey lowercases a field name and drops all non-alphanumeric runes so
+// "api-key", "api_key" and "apiKey" compare equal.
+func normalizeKey(key string) string {
+	return strings.Map(func(r rune) rune {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			return unicode.ToLower(r)
 		}
 		return -1
 	}, key)
+}
+
+func sensitiveKey(key string) bool {
+	normalized := normalizeKey(key)
 	switch normalized {
 	case "password", "passwd", "pwd", "secret", "clientsecret", "secretkey",
 		"token", "accesstoken", "refreshtoken", "idtoken", "authtoken", "bearer",
@@ -432,6 +580,12 @@ func placeholderValue(value any) bool {
 		// as a concrete secret, not a placeholder.
 		return false
 	}
+	return placeholderText(text)
+}
+
+// placeholderText reports whether a value is a template placeholder rather than
+// a concrete credential. Placeholders describe an injection point, not a secret.
+func placeholderText(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return true

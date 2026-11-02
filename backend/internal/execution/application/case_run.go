@@ -671,7 +671,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if caseRun.Summary.HumanRequestID > 0 {
 		summary.HumanRequestID = caseRun.Summary.HumanRequestID
 	}
-	finished, err := s.writeTerminal(ctx, caseRun, status, class, summary)
+	finished, terminalWrote, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
 		return execution.CaseRun{}, err
 	}
@@ -689,8 +689,12 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	})
 	s.forgetWaitTracking(caseRun.ID)
 	// Knowledge sedimentation is supplemental: a hook failure never changes the
-	// persisted verdict (spec §10.1, best effort).
-	s.notifyCaseSuccess(ctx, scope.VersionID, finished, caseSnapshot, finished.Summary)
+	// persisted verdict (spec §10.1, best effort). Only the owner that won the
+	// terminal CAS notifies; an idempotent Finish that read another owner's
+	// passed row must not sediment it a second time.
+	if terminalWrote {
+		s.notifyCaseSuccess(ctx, scope.VersionID, finished, caseSnapshot, finished.Summary)
+	}
 	return finished, nil
 }
 
@@ -779,7 +783,7 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
-	finished, err := s.writeTerminal(ctx, caseRun, status, class, summary)
+	finished, _, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
 		return err
 	}
@@ -978,7 +982,11 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 	return execution.FailureClassUnknown, agentapp.IsRetryable(err)
 }
 
-func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary) (execution.CaseRun, error) {
+// writeTerminal persists the terminal verdict when this owner still holds the
+// dispatch fence. The bool reports whether this call won the CAS: false means
+// another owner already finalized the run (or the fence was lost), so callers
+// must not repeat one-time side effects such as the knowledge success hook.
+func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary) (execution.CaseRun, bool, error) {
 	now := s.now()
 	ok, err := s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
 		run.Status = status
@@ -992,21 +1000,25 @@ func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRu
 		return nil
 	})
 	if err != nil {
-		return execution.CaseRun{}, mapExecutionError(err, "case_run")
+		return execution.CaseRun{}, false, mapExecutionError(err, "case_run")
 	}
 	if !ok {
 		// Another owner already finalized the run; return the stored truth
 		// (Finish is idempotent for terminal rows).
 		current, getErr := s.caseRuns.Get(ctx, caseRun.ID)
 		if getErr != nil {
-			return execution.CaseRun{}, mapExecutionError(getErr, "case_run")
+			return execution.CaseRun{}, false, mapExecutionError(getErr, "case_run")
 		}
 		if current.Status.Finished() {
-			return current, nil
+			return current, false, nil
 		}
-		return execution.CaseRun{}, platform.LeaseLost()
+		return execution.CaseRun{}, false, platform.LeaseLost()
 	}
-	return s.caseRuns.Get(ctx, caseRun.ID)
+	finished, err := s.caseRuns.Get(ctx, caseRun.ID)
+	if err != nil {
+		return execution.CaseRun{}, false, mapExecutionError(err, "case_run")
+	}
+	return finished, true, nil
 }
 
 func (s *CaseRunner) caseSnapshot(ctx context.Context, scope tools.Scope, caseRun execution.CaseRun) (execution.CaseSnapshot, error) {

@@ -440,6 +440,37 @@ func TestFinishPassedNotifiesKnowledgeHookBestEffort(t *testing.T) {
 		}
 	})
 
+	t.Run("another owner's terminal write does not notify", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		prepareCaseRun(t, fixture)
+		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+			t.Fatalf("StepRecord: %v", err)
+		}
+		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+			StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
+		}); err != nil {
+			t.Fatalf("AssertionRecord: %v", err)
+		}
+		// Another owner persisted the terminal row just before this owner's CAS:
+		// this Finish reads the passed truth but must not sediment it a second
+		// time.
+		fixture.caseRuns.beforeUpdateCAS = func() {
+			row := fixture.caseRuns.rows[3001]
+			row.Status = execution.CaseRunPassed
+			fixture.caseRuns.rows[3001] = row
+		}
+		finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+		if err != nil {
+			t.Fatalf("Finish: %v", err)
+		}
+		if finished.Status != execution.CaseRunPassed {
+			t.Fatalf("status = %q, want the stored passed truth", finished.Status)
+		}
+		if len(fixture.knowledge.facts) != 0 {
+			t.Fatalf("hook calls = %d, want 0 when another owner won the terminal CAS", len(fixture.knowledge.facts))
+		}
+	})
+
 	t.Run("hook error does not fail the case run", func(t *testing.T) {
 		fixture := newCaseRunnerFixture(t)
 		fixture.knowledge.err = errors.New("knowledge service down")
