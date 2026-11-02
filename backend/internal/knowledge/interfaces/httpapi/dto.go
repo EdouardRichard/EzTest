@@ -93,27 +93,30 @@ func parseOptionalID(field string, raw *string) (*int64, error) {
 /* ---------------------------------- views ---------------------------------- */
 
 // knowledgeItemView is the frozen KnowledgeItemView field set (contracts/
-// p7-api.md §3).
+// p7-api.md §3) plus the 0.2.1 structured bindings and verification timestamp
+// (contracts/openapi.yaml KnowledgeItemView).
 type knowledgeItemView struct {
-	ID                    string   `json:"id"`
-	Scope                 string   `json:"scope"`
-	SystemKey             *string  `json:"system_key"`
-	Title                 string   `json:"title"`
-	Content               string   `json:"content"`
-	Tags                  []string `json:"tags"`
-	Status                string   `json:"status"`
-	Confidence            *float64 `json:"confidence"`
-	SourceVersionID       *string  `json:"source_version_id"`
-	PromotedFromVersionID *string  `json:"promoted_from_version_id"`
-	Revision              int      `json:"revision"`
-	ReviewReason          *string  `json:"review_reason"`
-	ReviewedBy            *string  `json:"reviewed_by"`
-	ReviewedAt            *string  `json:"reviewed_at"`
-	RevokedAt             *string  `json:"revoked_at"`
-	SourceStale           bool     `json:"source_stale"`
-	CreatedBy             *string  `json:"created_by"`
-	CreatedAt             string   `json:"created_at"`
-	UpdatedAt             string   `json:"updated_at"`
+	ID                    string                `json:"id"`
+	Scope                 string                `json:"scope"`
+	SystemKey             *string               `json:"system_key"`
+	Title                 string                `json:"title"`
+	Content               string                `json:"content"`
+	Tags                  []string              `json:"tags"`
+	Status                string                `json:"status"`
+	LastVerifiedAt        *string               `json:"last_verified_at"`
+	Bindings              knowledgeBindingsView `json:"bindings"`
+	Confidence            *float64              `json:"confidence"`
+	SourceVersionID       *string               `json:"source_version_id"`
+	PromotedFromVersionID *string               `json:"promoted_from_version_id"`
+	Revision              int                   `json:"revision"`
+	ReviewReason          *string               `json:"review_reason"`
+	ReviewedBy            *string               `json:"reviewed_by"`
+	ReviewedAt            *string               `json:"reviewed_at"`
+	RevokedAt             *string               `json:"revoked_at"`
+	SourceStale           bool                  `json:"source_stale"`
+	CreatedBy             *string               `json:"created_by"`
+	CreatedAt             string                `json:"created_at"`
+	UpdatedAt             string                `json:"updated_at"`
 }
 
 // knowledgeItemDetailView is the GET detail: the item fields plus the
@@ -121,6 +124,17 @@ type knowledgeItemView struct {
 type knowledgeItemDetailView struct {
 	knowledgeItemView
 	Revisions []knowledgeRevisionView `json:"revisions"`
+}
+
+// knowledgeBindingsView is the 0.2.1 structured SUT binding projection. IDs are
+// decimal strings at the wire boundary and every string is an identifier (page
+// route, API endpoint, account role), never a credential.
+type knowledgeBindingsView struct {
+	SystemID      *string `json:"system_id"`
+	EnvironmentID *string `json:"environment_id"`
+	PageKey       *string `json:"page_key"`
+	APIKey        *string `json:"api_key"`
+	AccountRole   *string `json:"account_role"`
 }
 
 // knowledgeRevisionView is the frozen KnowledgeRevisionView field set.
@@ -144,6 +158,8 @@ func toItemView(item knowledge.Item) knowledgeItemView {
 		Content:               item.Content,
 		Tags:                  tagsView(item.Tags),
 		Status:                string(item.Status),
+		LastVerifiedAt:        timeStringPointer(item.LastVerifiedAt),
+		Bindings:              toBindingsView(item.Bindings),
 		Confidence:            item.Confidence,
 		SourceVersionID:       idStringPointer(item.SourceVersionID),
 		PromotedFromVersionID: idStringPointer(item.PromotedFromVersionID),
@@ -177,6 +193,18 @@ func toRevisionView(revision knowledge.Revision) knowledgeRevisionView {
 		Tags:        tagsView(revision.Tags),
 		ChangedBy:   idStringPointer(revision.ChangedBy),
 		CreatedAt:   formatTime(revision.CreatedAt),
+	}
+}
+
+// toBindingsView projects the structured SUT bindings, formatting IDs as
+// decimal strings. Unset dimensions render as null so the view shape is stable.
+func toBindingsView(bindings knowledge.Bindings) knowledgeBindingsView {
+	return knowledgeBindingsView{
+		SystemID:      idStringPointer(bindings.SystemID),
+		EnvironmentID: idStringPointer(bindings.EnvironmentID),
+		PageKey:       bindings.PageKey,
+		APIKey:        bindings.APIKey,
+		AccountRole:   bindings.AccountRole,
 	}
 }
 

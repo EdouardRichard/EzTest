@@ -206,6 +206,9 @@ func registerP7Routes(
 	if h != nil {
 		if h.Knowledge != nil {
 			knowledgeapi.RegisterRoutes(mux, authenticated, admin, h.Knowledge)
+			// 0.2.1 structured search is a login-only read surface; it is
+			// mounted explicitly so it never inherits the admin middleware.
+			h.Knowledge.RegisterSearch(mux, authenticated)
 		}
 		if h.Orchestration != nil {
 			orchestrationapi.RegisterRoutes(mux, authenticated, admin, h.Orchestration)

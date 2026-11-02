@@ -1,6 +1,7 @@
 // Package httpapi exposes the P7 knowledge REST API (frozen contract):
 //
 //	GET   /api/knowledge/items                          login  list/search
+//	GET   /api/knowledge/search                         login  structured search
 //	POST  /api/knowledge/items                          login  create draft
 //	GET   /api/knowledge/items/{knowledgeId}            login  detail + revisions
 //	PATCH /api/knowledge/items/{knowledgeId}            login  edit draft/rejected
