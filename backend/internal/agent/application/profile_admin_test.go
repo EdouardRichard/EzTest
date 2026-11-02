@@ -445,6 +445,71 @@ func TestProfileAdminPatchValidation(t *testing.T) {
 	}
 }
 
+func TestProfileAdminPatchRejectsToolOutsideRoleWhitelist(t *testing.T) {
+	repo := newFakeProfileAdminRepo(t)
+	audit := &fakeProfileAudit{}
+	registry := tools.NewRegistry(
+		stubProfileTool{name: tools.ToolContextTaskPack},
+		stubProfileTool{name: tools.ToolExecutionCaseFinish},
+	)
+	service := agentapp.NewProfileAdminService(repo, registry, nil, audit)
+	before := repo.profiles[agentapp.ProfileKeyClarificationHost]
+
+	// execution.case_finish is registered, so the pre-fix registry-membership
+	// check accepted it; it is outside the assistant role whitelist.
+	widened := []string{tools.ToolContextTaskPack, tools.ToolExecutionCaseFinish}
+	_, _, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyClarificationHost,
+		agentapp.PatchInput{AllowedTools: &widened})
+	if err == nil {
+		t.Fatal("Patch accepted a registered tool outside the role whitelist")
+	}
+	apiErr := platform.AsError(err)
+	if apiErr.Status != 400 || apiErr.Code != "invalid_argument" {
+		t.Fatalf("widened role tool error = %#v (%v), want typed 400 invalid_argument", apiErr, err)
+	}
+	if apiErr.Details["field"] != "allowed_tools" ||
+		apiErr.Details["reason"] != "role_whitelist" ||
+		apiErr.Details["role"] != string(agentapp.RoleAssistant) ||
+		apiErr.Details["tool"] != tools.ToolExecutionCaseFinish {
+		t.Fatalf("widened role tool details = %#v", apiErr.Details)
+	}
+	if repo.updateCalls != 0 {
+		t.Fatalf("rejected role edit reached the repository: %d update calls", repo.updateCalls)
+	}
+	if !sameStrings(repo.profiles[agentapp.ProfileKeyClarificationHost].AllowedTools, before.AllowedTools) {
+		t.Fatalf("rejected role edit changed stored tools: %v", repo.profiles[agentapp.ProfileKeyClarificationHost].AllowedTools)
+	}
+	if len(audit.events) != 1 {
+		t.Fatalf("denial audit events = %d, want 1", len(audit.events))
+	}
+	denial := audit.events[0]
+	if denial.Action != "agent.profile.tool_denied" || denial.TargetKind != "agent_profile" {
+		t.Fatalf("denial audit = %#v", denial)
+	}
+	if denial.ActorID == nil || *denial.ActorID != 7 {
+		t.Fatalf("denial actor = %v", denial.ActorID)
+	}
+	if denial.Metadata["profile_key"] != agentapp.ProfileKeyClarificationHost ||
+		denial.Metadata["role"] != string(agentapp.RoleAssistant) ||
+		denial.Metadata["tool"] != tools.ToolExecutionCaseFinish {
+		t.Fatalf("denial metadata = %#v", denial.Metadata)
+	}
+
+	// Allowed role tools still pass and still write the normal profile audit.
+	allowed := []string{tools.ToolContextTaskPack}
+	view, changed, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyClarificationHost,
+		agentapp.PatchInput{AllowedTools: &allowed})
+	if err != nil {
+		t.Fatalf("allowed role tool Patch: %v", err)
+	}
+	if !changed || len(view.AllowedTools) != 1 || view.AllowedTools[0] != tools.ToolContextTaskPack {
+		t.Fatalf("allowed role tool view = %#v changed=%v", view, changed)
+	}
+	if len(audit.events) != 2 || audit.events[1].Action != agentapp.ActionProfileUpdated {
+		t.Fatalf("audit after allowed edit = %#v", audit.events)
+	}
+}
+
 func TestProfileAdminPatchRequiresAdmin(t *testing.T) {
 	service, repo, audit, _ := newProfileAdminService(t)
 	_, _, err := service.Patch(context.Background(), platform.Actor{ID: 9, Role: "user"}, agentapp.ProfileKeyClarificationHost, agentapp.PatchInput{})

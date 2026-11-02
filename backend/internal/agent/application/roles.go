@@ -364,6 +364,22 @@ func cloneRoleSpec(spec RoleSpec) RoleSpec {
 	return spec
 }
 
+// RoleForProfile returns the catalog role that executes a stored profile key.
+// ProfileAdminService uses it to apply the role whitelist to administrator
+// edits, and ValidateRoleProfiles uses the same mapping at startup. Profiles
+// outside the seven roles (case_executor, coverage_analyst, version_steward,
+// ...) report false: they keep their own frozen contract whitelist.
+func RoleForProfile(profileKey string) (RoleSpec, bool) {
+	for _, spec := range roleSpecs {
+		for _, mapped := range spec.Profiles {
+			if mapped == profileKey {
+				return cloneRoleSpec(spec), true
+			}
+		}
+	}
+	return RoleSpec{}, false
+}
+
 // ToolAllowed reports whether a role may see and call a tool. Unknown roles and
 // unknown tool names are denied: the whitelist is closed (spec §5.2/§5.8).
 func ToolAllowed(role RoleKey, tool string) bool {

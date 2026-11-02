@@ -316,5 +316,13 @@ func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.
 		}
 		stored = append(stored, profile)
 	}
+	// Existing rows (including administrator edits and rows widened before the
+	// role guard existed) are returned unchanged by the repository, so they must
+	// be validated too: a stored profile outside its role whitelist fails the
+	// startup closed instead of reaching the runner (Task 8 fix round 1). The
+	// runner call-site guard itself remains R51 / Task 10.
+	if err := ValidateRoleProfiles(stored); err != nil {
+		return nil, err
+	}
 	return stored, nil
 }

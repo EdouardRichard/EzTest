@@ -10,6 +10,7 @@ import (
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
@@ -166,7 +167,63 @@ func TestRoleCatalogComplete(t *testing.T) {
 	}
 }
 
-func TestToolWhitelist(t *testing.T) {
+// TestEnsureProfilesRejectsStoredProfileOutsideRoleWhitelist is the startup
+// half of the permission-bypass defence (Task 8 fix round 1): a stored
+// agent_profile row that exposes a tool outside its role — edited around the
+// admin PATCH guard or written before this fix — must fail closed on the next
+// startup instead of being returned to the runner.
+func TestEnsureProfilesRejectsStoredProfileOutsideRoleWhitelist(t *testing.T) {
+	repo := newFakeRuntimeRepo()
+	ctx := context.Background()
+	if _, err := agentapp.EnsureProfiles(ctx, repo); err != nil {
+		t.Fatalf("seed EnsureProfiles: %v", err)
+	}
+
+	host := repo.profiles[agentapp.ProfileKeyClarificationHost]
+	host.AllowedTools = append(append([]string(nil), host.AllowedTools...), tools.ToolExecutionCaseFinish)
+	repo.profiles[agentapp.ProfileKeyClarificationHost] = host
+
+	stored, err := agentapp.EnsureProfiles(ctx, repo)
+	if err == nil {
+		t.Fatalf("EnsureProfiles accepted a widened stored profile: %v", stored)
+	}
+	if stored != nil {
+		t.Fatalf("EnsureProfiles returned %d profiles with error %v", len(stored), err)
+	}
+	apiErr := platform.AsError(err)
+	if apiErr.Status != 400 || apiErr.Code != "invalid_argument" || apiErr.Details["field"] != "allowed_tools" {
+		t.Fatalf("stored-profile validation error = %#v", apiErr)
+	}
+	if !strings.Contains(apiErr.Message, agentapp.ProfileKeyClarificationHost) {
+		t.Fatalf("error message = %q, want the profile key", apiErr.Message)
+	}
+	if !strings.Contains(apiErr.Message, tools.ToolExecutionCaseFinish) {
+		t.Fatalf("error message = %q, want the offending tool", apiErr.Message)
+	}
+
+	// Restore the role profile and prove the startup check is role-scoped:
+	// unmapped profiles (case_executor is deterministic, not one of the seven
+	// roles) keep their own contract whitelist and must not block startup.
+	restored := make([]string, 0, len(host.AllowedTools))
+	for _, name := range host.AllowedTools {
+		if name != tools.ToolExecutionCaseFinish {
+			restored = append(restored, name)
+		}
+	}
+	host.AllowedTools = restored
+	repo.profiles[agentapp.ProfileKeyClarificationHost] = host
+	executor := repo.profiles[agentapp.ProfileKeyCaseExecutor]
+	executor.AllowedTools = append(append([]string(nil), executor.AllowedTools...), "future.unmapped.tool")
+	repo.profiles[agentapp.ProfileKeyCaseExecutor] = executor
+	if _, err := agentapp.EnsureProfiles(ctx, repo); err != nil {
+		t.Fatalf("EnsureProfiles rejected an unmapped profile edit: %v", err)
+	}
+}
+
+// TestRoleToolMatrix is the plan-named role tool-matrix test. It is the
+// existing whitelist matrix (the brief's TestRoleToolMatrix) plus the frozen
+// 0.2.1 work-item budget defaults.
+func TestRoleToolMatrix(t *testing.T) {
 	allowed := map[agentapp.RoleKey][]string{
 		agentapp.RoleAssistant: {
 			tools.ToolContextVersionPack, tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose,
@@ -215,6 +272,14 @@ func TestToolWhitelist(t *testing.T) {
 		agentapp.RoleKnowledgeCurator: {
 			tools.ToolRequirementDraftCreate, tools.ToolCaseGraphPropose, "browser.goto", "case.confirm",
 		},
+	}
+
+	// Spec §5.4 default work-item budgets are frozen for every role.
+	for _, spec := range agentapp.RoleCatalog() {
+		if spec.MaxTokens != 20000 || spec.RunSeconds != 120 || spec.MaxTurnsFuse != 24 {
+			t.Fatalf("role %q budget = {%d,%d,%d}, want {20000,120,24}",
+				spec.Key, spec.MaxTokens, spec.RunSeconds, spec.MaxTurnsFuse)
+		}
 	}
 
 	for role, names := range allowed {
