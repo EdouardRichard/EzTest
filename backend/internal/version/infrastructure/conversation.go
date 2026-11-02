@@ -146,6 +146,50 @@ func (r *ConversationRepository) Messages(ctx context.Context, conversationID in
 	return messages, nil
 }
 
+// MessageParts returns the streaming parts of one conversation message in seq
+// order. The message must belong to the version-scoped conversation: a foreign
+// or missing message is ErrMessageNotFound (404 at the API edge).
+func (r *ConversationRepository) MessageParts(ctx context.Context, versionID, conversationID, messageID int64) ([]version.ConversationMessagePart, error) {
+	var owned bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM conversation_message m
+			JOIN conversation c ON c.id = m.conversation_id
+			WHERE m.id = $1 AND m.conversation_id = $2 AND c.version_id = $3
+		)
+	`, messageID, conversationID, versionID).Scan(&owned); err != nil {
+		return nil, fmt.Errorf("check conversation message scope: %w", err)
+	}
+	if !owned {
+		return nil, version.ErrMessageNotFound
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT seq, part_type, payload, created_at
+		FROM conversation_message_part
+		WHERE message_id = $1
+		ORDER BY seq
+	`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation message parts: %w", err)
+	}
+	defer rows.Close()
+	parts := make([]version.ConversationMessagePart, 0)
+	for rows.Next() {
+		var part version.ConversationMessagePart
+		var payload []byte
+		if err := rows.Scan(&part.Seq, &part.Type, &payload, &part.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan conversation message part: %w", err)
+		}
+		part.Payload = json.RawMessage(payload)
+		parts = append(parts, part)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list conversation message parts: %w", err)
+	}
+	return parts, nil
+}
+
 // PostUserMessage inserts the user message and bumps the conversation
 // timestamp. A client_message_id conflict returns the existing message with
 // created=false.

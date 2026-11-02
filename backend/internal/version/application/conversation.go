@@ -181,6 +181,27 @@ func (s *ConversationService) Messages(ctx context.Context, versionID, conversat
 	return views, hasMore, nil
 }
 
+// MessageParts returns the append-only streaming parts of one UI message in
+// seq order. The message must belong to the conversation and version; a
+// foreign message is reported as a 404, never leaked across versions.
+func (s *ConversationService) MessageParts(ctx context.Context, versionID, conversationID, messageID int64) ([]MessagePartView, error) {
+	if err := validateConversationIDs(versionID, conversationID); err != nil {
+		return nil, err
+	}
+	if messageID <= 0 {
+		return nil, platform.Invalid("mid", "must be a positive decimal ID")
+	}
+	parts, err := s.repo.MessageParts(ctx, versionID, conversationID, messageID)
+	if err != nil {
+		return nil, mapConversationRepositoryError(err)
+	}
+	views := make([]MessagePartView, 0, len(parts))
+	for _, part := range parts {
+		views = append(views, toMessagePartView(part))
+	}
+	return views, nil
+}
+
 // PostUserMessage validates and stores one user message. A repeated
 // client_message_id returns the already-stored message without new side
 // effects. Attachment rows are pre-registered before the insert so the §8.5

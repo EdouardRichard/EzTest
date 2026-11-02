@@ -76,6 +76,17 @@ type MessageRef struct {
 	ID   string `json:"id"`
 }
 
+// ConversationMessagePart is one append-only streaming part row of a
+// conversation message (`conversation_message_part`, spec §9.1/§12.2). Type is
+// the DB `part_type`; Payload is the opaque JSON payload owned by the part kind
+// (the read API forwards it without interpreting or rewriting it).
+type ConversationMessagePart struct {
+	Seq       int
+	Type      string
+	Payload   json.RawMessage
+	CreatedAt time.Time
+}
+
 // Message is one UI-thread message (user or assistant). The LLM transcript
 // lives in the agent context, not here.
 type Message struct {
@@ -272,6 +283,10 @@ type ConversationRepository interface {
 	List(ctx context.Context, versionID int64, kind string, limit int, beforeID *int64) ([]Conversation, error)
 	FindMessageByClientID(ctx context.Context, conversationID int64, clientMessageID string) (*Message, error)
 	Messages(ctx context.Context, conversationID int64, after int64, limit int) ([]Message, error)
+	// MessageParts returns the append-only streaming parts of one UI message,
+	// ascending by seq. The message must belong to the conversation and the
+	// conversation to the version; otherwise it returns ErrMessageNotFound.
+	MessageParts(ctx context.Context, versionID, conversationID, messageID int64) ([]ConversationMessagePart, error)
 	// PostUserMessage inserts the message and bumps the conversation
 	// timestamp. When the client_message_id uniqueness constraint fires it
 	// returns the already-stored message instead of an error.

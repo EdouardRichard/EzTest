@@ -162,6 +162,7 @@ func New(deps Deps) http.Handler {
 	}
 	registerStageRoutes(mux, authenticated, stageHandler)
 	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
+	versionapi.RegisterMessageParts(mux, authenticated, versionapi.NewMessagePartsHandler(deps.Conversations))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
 	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)

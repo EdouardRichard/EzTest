@@ -1,6 +1,7 @@
 package versionapp
 
 import (
+	"encoding/json"
 	"time"
 
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -31,6 +32,15 @@ type MessageView struct {
 	Parts          []version.MessagePart
 	Refs           []version.MessageRef
 	CreatedAt      time.Time
+}
+
+// MessagePartView is one append-only streaming part row of a message. Payload
+// is forwarded verbatim: the read API does not interpret the part kind.
+type MessagePartView struct {
+	Seq       int
+	Type      string
+	Payload   json.RawMessage
+	CreatedAt time.Time
 }
 
 // SummaryView is the latest thread memory of one conversation.
@@ -79,6 +89,15 @@ func nonNilParts(parts []version.MessagePart) []version.MessagePart {
 		return []version.MessagePart{}
 	}
 	return parts
+}
+
+func toMessagePartView(part version.ConversationMessagePart) MessagePartView {
+	return MessagePartView{
+		Seq:       part.Seq,
+		Type:      part.Type,
+		Payload:   part.Payload,
+		CreatedAt: part.CreatedAt,
+	}
 }
 
 func nonNilRefs(refs []version.MessageRef) []version.MessageRef {

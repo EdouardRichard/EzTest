@@ -37,6 +37,48 @@ type conversationMessageDTO struct {
 	CreatedAt      string                `json:"created_at"`
 }
 
+// ---------- 0.2.1 streaming parts ----------
+
+// MessagePartType is the closed part-type enum of the 0.2.1 parts contract
+// (OpenAPI MessagePartView.part_type, DB chk_conversation_message_part_type).
+type MessagePartType string
+
+const (
+	MessagePartTypeText            MessagePartType = "text"
+	MessagePartTypeThinking        MessagePartType = "thinking"
+	MessagePartTypeToolCall        MessagePartType = "tool_call"
+	MessagePartTypeJobCard         MessagePartType = "job_card"
+	MessagePartTypeAttachment      MessagePartType = "attachment"
+	MessagePartTypeRequirementCard MessagePartType = "requirement_card"
+	MessagePartTypeCaseCard        MessagePartType = "case_card"
+	MessagePartTypeError           MessagePartType = "error"
+)
+
+// MessagePartTypes returns the closed part-type enum in contract order.
+func MessagePartTypes() []string {
+	return []string{
+		string(MessagePartTypeText),
+		string(MessagePartTypeThinking),
+		string(MessagePartTypeToolCall),
+		string(MessagePartTypeJobCard),
+		string(MessagePartTypeAttachment),
+		string(MessagePartTypeRequirementCard),
+		string(MessagePartTypeCaseCard),
+		string(MessagePartTypeError),
+	}
+}
+
+// MessagePart is one append-only streaming part row returned by
+// GET /api/versions/{id}/conversations/{cid}/messages/{mid}/parts
+// (OpenAPI MessagePartView). Type is the DB part_type serialized as
+// `part_type`; Payload is the opaque part-shaped JSON object.
+type MessagePart struct {
+	Seq       int             `json:"seq"`
+	Type      MessagePartType `json:"part_type"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt string          `json:"created_at"`
+}
+
 // ---------- request payloads ----------
 
 type createConversationRequest struct {
@@ -101,5 +143,18 @@ func toConversationMessageDTO(view versionapp.MessageView) conversationMessageDT
 		Parts:          parts,
 		Refs:           refs,
 		CreatedAt:      formatTime(view.CreatedAt),
+	}
+}
+
+func toMessagePart(view versionapp.MessagePartView) MessagePart {
+	payload := view.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	return MessagePart{
+		Seq:       view.Seq,
+		Type:      MessagePartType(view.Type),
+		Payload:   payload,
+		CreatedAt: formatTime(view.CreatedAt),
 	}
 }

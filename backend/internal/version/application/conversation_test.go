@@ -21,6 +21,7 @@ import (
 type fakeConversationRepo struct {
 	conversations       map[int64]version.Conversation
 	messages            map[int64][]version.Message
+	messageParts        map[int64][]version.ConversationMessagePart
 	summaries           map[int64][]version.ConversationSummary
 	forceExisting       *version.Message
 	reconcilable        []version.ReconcilerConversation
@@ -31,6 +32,7 @@ func newFakeConversationRepo() *fakeConversationRepo {
 	return &fakeConversationRepo{
 		conversations: map[int64]version.Conversation{},
 		messages:      map[int64][]version.Message{},
+		messageParts:  map[int64][]version.ConversationMessagePart{},
 		summaries:     map[int64][]version.ConversationSummary{},
 	}
 }
@@ -99,6 +101,26 @@ func (f *fakeConversationRepo) Messages(_ context.Context, conversationID int64,
 		items = items[:limit]
 	}
 	return items, nil
+}
+
+func (f *fakeConversationRepo) MessageParts(_ context.Context, versionID, conversationID, messageID int64) ([]version.ConversationMessagePart, error) {
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return nil, version.ErrConversationNotFound
+	}
+	found := false
+	for _, message := range f.messages[conversationID] {
+		if message.ID == messageID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, version.ErrMessageNotFound
+	}
+	parts := append([]version.ConversationMessagePart(nil), f.messageParts[messageID]...)
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Seq < parts[j].Seq })
+	return parts, nil
 }
 
 func (f *fakeConversationRepo) PostUserMessage(_ context.Context, conversationID int64, message version.Message) (*version.Message, bool, error) {
@@ -648,6 +670,62 @@ func TestConversationMessagesPagination(t *testing.T) {
 		t.Fatal("cross-version messages returned")
 	} else if apiError(t, err).Status != http.StatusNotFound {
 		t.Fatalf("status = %d", apiError(t, err).Status)
+	}
+}
+
+func TestConversationMessagePartsScopedAndOrdered(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation, err := env.svc.Create(requestContext(), env.versionID, "clarification", "Chat", 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	message := postUserMessage(t, env, conversation.ID, []version.MessagePart{{Type: "text", Text: "hi"}}, "")
+	env.repo.messageParts[message.ID] = []version.ConversationMessagePart{
+		{Seq: 2, Type: "job_card", Payload: json.RawMessage(`{"job_id":"7"}`), CreatedAt: testTime},
+		{Seq: 1, Type: "text", Payload: json.RawMessage(`{"text":"hi"}`), CreatedAt: testTime},
+	}
+
+	parts, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, message.ID)
+	if err != nil {
+		t.Fatalf("MessageParts: %v", err)
+	}
+	if len(parts) != 2 || parts[0].Seq != 1 || parts[1].Seq != 2 ||
+		parts[0].Type != "text" || parts[1].Type != "job_card" {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if string(parts[1].Payload) != `{"job_id":"7"}` || !parts[0].CreatedAt.Equal(testTime) {
+		t.Fatalf("part payload/time = %#v", parts[1])
+	}
+
+	// Cross-version and foreign-message reads are 404; a zero mid is a 400.
+	notFound := []struct {
+		name      string
+		versionID int64
+		mid       int64
+	}{
+		{"foreign version", env.versionID + 1, message.ID},
+		{"unknown message", env.versionID, message.ID + 999},
+	}
+	for _, testCase := range notFound {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := env.svc.MessageParts(requestContext(), testCase.versionID, conversation.ID, testCase.mid); err == nil {
+				t.Fatal("out-of-scope message parts returned")
+			} else if apiError(t, err).Status != http.StatusNotFound {
+				t.Fatalf("status = %d", apiError(t, err).Status)
+			}
+		})
+	}
+	if _, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, 0); err == nil {
+		t.Fatal("zero message id accepted")
+	} else if apiError(t, err).Status != http.StatusBadRequest {
+		t.Fatalf("status = %d", apiError(t, err).Status)
+	}
+
+	// A scoped message with no appended parts is an empty list, not a 404.
+	other := postUserMessage(t, env, conversation.ID, []version.MessagePart{{Type: "text", Text: "no parts"}}, "")
+	empty, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, other.ID)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty parts = %#v, %v", empty, err)
 	}
 }
 
