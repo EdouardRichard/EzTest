@@ -316,15 +316,20 @@ type AttachmentMeta struct {
 	Status         string
 }
 
-// AttachmentText is one page of extracted attachment text.
+// AttachmentText is one page of extracted attachment text plus the structured
+// parse status. A non-done status is data, never a tool error: the model is
+// told "解析中，可重试" or the concrete parse failure reason (§8.5).
 type AttachmentText struct {
 	AttachmentID int64
 	Name         string
 	MIME         string
+	Status       string
 	Offset       int
 	Text         string
 	TotalChars   int
 	Truncated    bool
+	Error        string
+	Retryable    bool
 }
 
 // AttachmentImage is image metadata; P1 performs no vision understanding.

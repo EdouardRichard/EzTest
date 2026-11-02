@@ -64,7 +64,7 @@ type AttachmentService interface {
 	Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
 	GetAttachmentInfo(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
 	ListAttachments(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
-	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error)
+	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
 	AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
 	// ListPendingForIngest feeds the P1 reconciler (attachment.ingest).
 	ListPendingForIngest(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)

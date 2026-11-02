@@ -1,12 +1,12 @@
 "use client"
 
-import { type KeyboardEvent, useState } from "react"
+import { type ClipboardEvent, type DragEvent, type KeyboardEvent, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { InlineError } from "@/components/ui/ErrorState"
 
-import { AttachmentUploader } from "./AttachmentUploader"
+import { AttachmentUploader, type AttachmentUploaderHandle } from "./AttachmentUploader"
 import type { NewMessagePart, UploadedAttachment } from "./types"
 
 export type ComposerProps = {
@@ -23,14 +23,15 @@ export type ComposerProps = {
 /**
  * Chat composer: Enter sends, Shift+Enter inserts a newline, the send button is
  * disabled while a message/attachment is in flight, and the draft survives a
- * failed send. `text`/`onTextChange` make the draft controllable so other UI
- * (design case detail) can prefill it without sending.
+ * failed send. Files can be selected, pasted or dropped; all three paths use the
+ * same upload pipeline (spec §8.4). `text`/`onTextChange` make the draft
+ * controllable so other UI (design case detail) can prefill it without sending.
  */
 export function Composer({
   onSend,
   error,
   disabled = false,
-  placeholder = "描述需求，或上传 doc / pdf / md / ppt…",
+  placeholder = "描述需求，或粘贴 / 拖拽上传 doc / pdf / md / ppt…",
   text,
   onTextChange,
 }: ComposerProps) {
@@ -38,6 +39,7 @@ export function Composer({
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([])
   const [uploading, setUploading] = useState(false)
   const [sending, setSending] = useState(false)
+  const uploaderRef = useRef<AttachmentUploaderHandle>(null)
 
   const value = text ?? internalValue
   const hasContent = value.trim().length > 0 || attachments.length > 0
@@ -84,6 +86,25 @@ export function Composer({
     void submit()
   }
 
+  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>): void {
+    const files = event.clipboardData?.files
+    if (files === undefined || files.length === 0) return
+    event.preventDefault()
+    uploaderRef.current?.addFiles(files)
+  }
+
+  function handleDragOver(event: DragEvent<HTMLTextAreaElement>): void {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return
+    event.preventDefault()
+  }
+
+  function handleDrop(event: DragEvent<HTMLTextAreaElement>): void {
+    const files = event.dataTransfer?.files
+    if (files === undefined || files.length === 0) return
+    event.preventDefault()
+    uploaderRef.current?.addFiles(files)
+  }
+
   return (
     <div className="border-t border-border px-3 py-2.5">
       <div
@@ -101,6 +122,9 @@ export function Composer({
           placeholder={placeholder}
           onChange={(event) => updateValue(event.target.value)}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
           className={cn(
             "w-full resize-none bg-transparent text-sm text-foreground outline-none",
             "placeholder:text-muted-foreground disabled:cursor-not-allowed",
@@ -108,6 +132,7 @@ export function Composer({
         />
         <div className="mt-1 flex items-center gap-2">
           <AttachmentUploader
+            ref={uploaderRef}
             items={attachments}
             onChange={setAttachments}
             onUploadingChange={setUploading}

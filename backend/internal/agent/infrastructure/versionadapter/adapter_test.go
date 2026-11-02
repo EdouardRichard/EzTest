@@ -100,7 +100,7 @@ type fakeAttachments struct {
 	extractFn  func(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
 	getInfoFn  func(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
 	listFn     func(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
-	readTextFn func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error)
+	readTextFn func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
 	imageRefFn func(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
 	pendingFn  func(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
 }
@@ -117,7 +117,7 @@ func (f *fakeAttachments) ListAttachments(ctx context.Context, versionID, conver
 	return f.listFn(ctx, versionID, conversationID)
 }
 
-func (f *fakeAttachments) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error) {
+func (f *fakeAttachments) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error) {
 	return f.readTextFn(ctx, versionID, conversationID, attachmentID, offset, maxChars)
 }
 
@@ -531,9 +531,12 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 		getInfoFn: func(_ context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error) {
 			return versionapp.AttachmentInfo{ID: 9, Name: "spec.md", MIME: "text/markdown", Status: "done"}, nil
 		},
-		readTextFn: func(_ context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error) {
+		readTextFn: func(_ context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error) {
 			readOffset, readMax = offset, maxChars
-			return "page", 10, nil
+			return versionapp.AttachmentTextRead{
+				AttachmentID: attachmentID, Name: "spec.md", MIME: "text/markdown", Status: "done",
+				Offset: offset, Text: "page", TotalChars: 10, Truncated: true,
+			}, nil
 		},
 		imageRefFn: func(_ context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
 			return versionapp.AttachmentImageRef{AttachmentID: 9, SHA256: sha, Name: "login.png", MIME: "image/png", Size: 5}, nil

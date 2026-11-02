@@ -135,4 +135,46 @@ describe("Composer", () => {
     expect(screen.getByText("AI 暂不可用")).toBeInTheDocument()
     expect(textarea).toHaveValue("退款 T+1 到账")
   })
+
+  it("uploads pasted files through the same attachment pipeline", async () => {
+    api.uploadContent.mockResolvedValue({ ...CONTENT, mime: "image/png" })
+    const onSend = vi.fn().mockResolvedValue(true)
+    render(<Composer onSend={onSend} />)
+
+    const file = new File(["png-bytes"], "登录截图.png", { type: "image/png" })
+    fireEvent.paste(screen.getByTestId("composer-textarea"), {
+      clipboardData: { files: [file] },
+    })
+
+    await screen.findByText("登录截图.png")
+    expect(api.uploadContent).toHaveBeenCalledWith(file)
+
+    fireEvent.change(screen.getByTestId("composer-textarea"), { target: { value: "请看截图" } })
+    fireEvent.keyDown(screen.getByTestId("composer-textarea"), { key: "Enter" })
+
+    await waitFor(() => expect(onSend).toHaveBeenCalled())
+    const parts = onSend.mock.calls[0][0] as NewMessagePart[]
+    expect(parts[0]).toEqual({ type: "text", text: "请看截图" })
+    expect(parts[1]).toEqual({
+      type: "attachment",
+      sha256: CONTENT.sha256,
+      name: "登录截图.png",
+      mime: "image/png",
+      size: 12,
+    })
+  })
+
+  it("uploads files dropped onto the composer through the same attachment pipeline", async () => {
+    api.uploadContent.mockResolvedValue({ ...CONTENT, mime: "application/pdf" })
+    const onSend = vi.fn().mockResolvedValue(true)
+    render(<Composer onSend={onSend} />)
+
+    const file = new File(["pdf-bytes"], "需求说明.pdf", { type: "application/pdf" })
+    fireEvent.drop(screen.getByTestId("composer-textarea"), {
+      dataTransfer: { files: [file], types: ["Files"] },
+    })
+
+    await screen.findByText("需求说明.pdf")
+    expect(api.uploadContent).toHaveBeenCalledWith(file)
+  })
 })

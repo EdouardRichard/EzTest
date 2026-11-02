@@ -20,6 +20,10 @@ const (
 	MaxOOXMLBytes          int64 = 20 << 20 // uncompressed OOXML XML cap
 	MaxPDFPages                  = 50
 	MaxAttachmentNameRunes       = 255
+	// Image parts are sent to vision models, so their pixel dimensions are
+	// bounded instead of downscaled by the server (spec §8.3).
+	MaxImageDimension = 16384
+	MaxImagePixels    = 40_000_000
 )
 
 // Attachment extraction statuses.
@@ -206,6 +210,32 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 func IsLegacyOfficeFormat(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	return strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".ppt")
+}
+
+// IsSupportedImageMIME reports whether an image part can be sent to a vision
+// model (spec §8.1/§8.3: png/jpg/webp).
+func IsSupportedImageMIME(mime string) bool {
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "image/png", "image/jpeg", "image/jpg", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateImageDimensions enforces the vision image bounds. The server rejects
+// rather than silently downscales oversized images (spec §8.3).
+func ValidateImageDimensions(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return platform.Invalid("width", "image width and height must be positive")
+	}
+	if width > MaxImageDimension || height > MaxImageDimension {
+		return platform.Invalid("width", "image dimensions must not exceed 16384 pixels")
+	}
+	if int64(width)*int64(height) > MaxImagePixels {
+		return platform.Invalid("width", "image must not exceed 40 megapixels")
+	}
+	return nil
 }
 
 // PendingAttachment is the ingest reconciler row: a pending attachment plus the

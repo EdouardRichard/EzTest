@@ -197,6 +197,13 @@ func conversationPart(part version.MessagePart) agentapp.ConversationPart {
 			"mime":   part.MIME,
 			"size":   part.Size,
 		}
+	case version.MessagePartImage:
+		mapped.Data = map[string]any{
+			"mime":     part.MIME,
+			"data_ref": part.DataRef,
+			"width":    part.Width,
+			"height":   part.Height,
+		}
 	case version.MessagePartRequirementCard:
 		mapped.Data = map[string]any{
 			"requirement_id": platformid.Format(part.RequirementID),
@@ -237,6 +244,14 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 		return version.MessagePart{
 			Type: part.Type, SHA256: sha256, Name: name, MIME: mime, Size: size,
 		}, nil
+	case version.MessagePartImage:
+		mime, _ := dataString(part.Data, "mime")
+		dataRef, _ := dataString(part.Data, "data_ref")
+		width, _ := dataInt(part.Data, "width")
+		height, _ := dataInt(part.Data, "height")
+		return version.MessagePart{
+			Type: part.Type, MIME: mime, DataRef: dataRef, Width: int(width), Height: int(height),
+		}, nil
 	case version.MessagePartRequirementCard:
 		requirementID, ok := dataInt(part.Data, "requirement_id")
 		if !ok || requirementID <= 0 {
@@ -259,7 +274,7 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 			Type: part.Type, RequirementID: requirementID, Reason: reason,
 		}, nil
 	default:
-		return version.MessagePart{}, platform.Invalid("type", "must be text, attachment, requirement_card or rollback_proposal")
+		return version.MessagePart{}, platform.Invalid("type", "must be text, attachment, image, requirement_card or rollback_proposal")
 	}
 }
 

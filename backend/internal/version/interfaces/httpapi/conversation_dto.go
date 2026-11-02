@@ -56,7 +56,7 @@ func (r postMessageRequest) messageParts() ([]version.MessagePart, error) {
 		var part version.MessagePart
 		if err := json.Unmarshal(raw, &part); err != nil {
 			return nil, platform.Invalid(fmt.Sprintf("parts[%d]", index),
-				"must be a text, attachment, requirement_card or rollback_proposal part")
+				"must be a text, attachment, image, requirement_card or rollback_proposal part")
 		}
 		parts = append(parts, part)
 	}

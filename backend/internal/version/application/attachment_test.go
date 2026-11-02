@@ -2,7 +2,9 @@ package versionapp_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -510,20 +512,20 @@ func TestListAttachmentsAndReadExtractedText(t *testing.T) {
 		t.Fatalf("image meta = %#v", attachments[1])
 	}
 
-	text, total, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, markdown.ID, 6, 9)
+	text, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, markdown.ID, 6, 9)
 	if err != nil {
 		t.Fatalf("ReadAttachmentText: %v", err)
 	}
-	if text != "extracted" || total != len("hello extracted text") {
-		t.Fatalf("text = %q, total = %d", text, total)
+	if text.Text != "extracted" || text.TotalChars != len("hello extracted text") || text.Status != version.AttachmentDone {
+		t.Fatalf("text = %#v", text)
 	}
-	if _, _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, markdown.ID, 0, 0); err != nil {
+	if _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, markdown.ID, 0, 0); err != nil {
 		t.Fatalf("default max chars: %v", err)
 	}
-	if _, _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, image.ID, 0, 10); err == nil {
-		t.Fatal("text read from an image attachment")
+	if _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, image.ID, 0, 10); err != nil {
+		t.Fatalf("image read: %v", err)
 	}
-	if _, _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, 999999, 0, 10); err == nil {
+	if _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, 999999, 0, 10); err == nil {
 		t.Fatal("missing attachment text read")
 	} else if apiError(t, err).Status != http.StatusNotFound {
 		t.Fatalf("status = %d", apiError(t, err).Status)
@@ -594,5 +596,188 @@ func TestListPendingForIngestClampsLimit(t *testing.T) {
 	}
 	if env.repo.lastPendingLimit != 1 {
 		t.Fatalf("zero limit = %d, want clamped 1", env.repo.lastPendingLimit)
+	}
+}
+
+// TestReadPendingAttachmentReturnsStructuredStatus covers the 0.2.1 §8.5
+// contract: a non-done attachment is a structured status, not a 409
+// "attachment text is not available".
+func TestReadPendingAttachmentReturnsStructuredStatus(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.conversationMessages = map[int64]int64{7001: 8001}
+	env.repo.conversations = map[int64]int64{8001: env.versionID}
+	sha := strings.Repeat("a", 64)
+	pending := registerAttachment(t, env, sha, "spec.md", "text/markdown", []byte("# Spec"))
+
+	result, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, pending.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("pending read returned a Go error: %v", err)
+	}
+	if result.Status != version.AttachmentPending || !result.Retryable || result.Text != "" {
+		t.Fatalf("pending result = %#v", result)
+	}
+	if !strings.Contains(result.Error, "解析中") {
+		t.Fatalf("pending error = %q, want a retry hint", result.Error)
+	}
+	if result.AttachmentID != pending.ID || result.Name != "spec.md" || result.MIME != "text/markdown" {
+		t.Fatalf("pending metadata = %#v", result)
+	}
+
+	env.extractor.text = "hello extracted text"
+	if _, err := env.svc.Extract(requestContext(), pending.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	done, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, pending.ID, 6, 9)
+	if err != nil {
+		t.Fatalf("done read: %v", err)
+	}
+	if done.Status != version.AttachmentDone || done.Text != "extracted" || done.Retryable ||
+		done.TotalChars != len("hello extracted text") {
+		t.Fatalf("done result = %#v", done)
+	}
+
+	image := registerAttachment(t, env, strings.Repeat("b", 64), "shot.png", "image/png", []byte("png"))
+	skipped, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, image.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("skipped read returned a Go error: %v", err)
+	}
+	if skipped.Status != version.AttachmentSkipped || skipped.Retryable || skipped.Error == "" {
+		t.Fatalf("skipped result = %#v", skipped)
+	}
+
+	legacy := registerAttachment(t, env, strings.Repeat("c", 64), "legacy.doc", "application/msword", []byte("doc"))
+	failed, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, legacy.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("failed read returned a Go error: %v", err)
+	}
+	if failed.Status != version.AttachmentFailed || failed.Retryable {
+		t.Fatalf("failed result = %#v", failed)
+	}
+	if !strings.Contains(strings.ToLower(failed.Error), "docx") {
+		t.Fatalf("failed error = %q, want the save-as hint", failed.Error)
+	}
+}
+
+// TestImageRequiresVisionModel covers §8.3: an image part may only be sent to
+// a model whose catalog entry sets supports_vision.
+func TestImageRequiresVisionModel(t *testing.T) {
+	if err := versionapp.ValidateVision(versionapp.Model{ID: "gpt-4o", SupportsVision: true}); err != nil {
+		t.Fatalf("vision model rejected: %v", err)
+	}
+	err := versionapp.ValidateVision(versionapp.Model{ID: "text-only"})
+	if err == nil {
+		t.Fatal("model without supports_vision accepted an image")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d", apiErr.Status)
+	}
+	if !strings.Contains(apiErr.Message, "supports_vision") || !strings.Contains(apiErr.Message, "vision") {
+		t.Fatalf("message = %q, want an explicit vision capability error", apiErr.Message)
+	}
+
+	part := versionapp.ImagePart{
+		Mime:    "image/png",
+		DataRef: strings.Repeat("d", 64),
+		Width:   800,
+		Height:  600,
+	}
+	if part.Mime != "image/png" || part.Width != 800 || part.Height != 600 {
+		t.Fatalf("image part = %#v", part)
+	}
+}
+
+// TestUserMessageImagePartPayload pins the R5 image part shape on the
+// conversation message: {type:"image", mime, data_ref, width, height}.
+func TestUserMessageImagePartPayload(t *testing.T) {
+	sha := strings.Repeat("e", 64)
+	part := version.MessagePart{Type: version.MessagePartImage, MIME: "image/png", DataRef: sha, Width: 800, Height: 600}
+	if err := version.ValidateUserMessageParts([]version.MessagePart{part}); err != nil {
+		t.Fatalf("valid image part rejected: %v", err)
+	}
+	raw, err := json.Marshal(part)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["type"] != "image" || payload["mime"] != "image/png" || payload["data_ref"] != sha ||
+		payload["width"] != float64(800) || payload["height"] != float64(600) {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if _, ok := payload["sha256"]; ok {
+		t.Fatalf("image payload leaked attachment fields: %#v", payload)
+	}
+	var decoded version.MessagePart
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Type != version.MessagePartImage || decoded.DataRef != sha || decoded.Width != 800 || decoded.Height != 600 {
+		t.Fatalf("decoded = %#v", decoded)
+	}
+
+	bad := []version.MessagePart{
+		{Type: version.MessagePartImage, MIME: "text/plain", DataRef: sha, Width: 1, Height: 1},
+		{Type: version.MessagePartImage, MIME: "image/png", DataRef: "nope", Width: 1, Height: 1},
+		{Type: version.MessagePartImage, MIME: "image/png", DataRef: sha, Width: 0, Height: 1},
+	}
+	for _, candidate := range bad {
+		if err := version.ValidateUserMessageParts([]version.MessagePart{candidate}); err == nil {
+			t.Fatalf("invalid image part accepted: %#v", candidate)
+		}
+	}
+}
+
+// TestLegacyAttachmentSaveAsHint covers R26: the upload path must use
+// version.IsLegacyOfficeFormat instead of a generic unsupported-format
+// message, and failExtraction must preserve a detailed parser error.
+func TestLegacyAttachmentSaveAsHint(t *testing.T) {
+	env := newAttachmentEnv(t)
+	generic := "upload md/txt/docx/pptx/pdf or an image"
+	for index, tc := range []struct {
+		name string
+		mime string
+	}{
+		{"requirements.doc", "application/msword"},
+		{"deck.ppt", "application/vnd.ms-powerpoint"},
+	} {
+		view := registerAttachment(t, env, strings.Repeat(fmt.Sprintf("%d", index+1), 64), tc.name, tc.mime, []byte("legacy"))
+		if view.ExtractionStatus != version.AttachmentFailed || view.ExtractionErrorCode != version.AttachmentErrorUnsupported {
+			t.Fatalf("%s view = %#v", tc.name, view)
+		}
+		message := strings.ToLower(view.ExtractionErrorText)
+		for _, want := range []string{"save", "docx", "pptx"} {
+			if !strings.Contains(message, want) {
+				t.Fatalf("%s error = %q, want %q", tc.name, view.ExtractionErrorText, want)
+			}
+		}
+		if strings.Contains(message, generic) {
+			t.Fatalf("%s kept the generic unsupported-format message: %q", tc.name, view.ExtractionErrorText)
+		}
+	}
+
+	// A parser that still yields the detailed legacy error must have that
+	// detail persisted by failExtraction instead of the generic message.
+	docx := registerAttachment(t, env, strings.Repeat("f", 64), "broken.docx", "application/octet-stream", []byte("docx"))
+	env.extractor.err = fmt.Errorf("%w: requirements.doc", version.ErrUnsupportedLegacyAttachment)
+	result, err := env.svc.Extract(requestContext(), docx.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.ErrorCode != version.AttachmentErrorUnsupported {
+		t.Fatalf("error code = %q", result.ErrorCode)
+	}
+	stored := env.repo.attachments[docx.ID]
+	if stored.ExtractionErrorText == "" || !strings.Contains(strings.ToLower(stored.ExtractionErrorText), "requirements.doc") {
+		t.Fatalf("parser detail overwritten: %q", stored.ExtractionErrorText)
+	}
+	if strings.Contains(stored.ExtractionErrorText, generic) {
+		t.Fatalf("parser detail replaced by generic message: %q", stored.ExtractionErrorText)
+	}
+	lastEvent := env.events.events[len(env.events.events)-1]
+	if lastEvent.Type != "requirement.attachment_failed" || !strings.Contains(lastEvent.Payload["message"].(string), "requirements.doc") {
+		t.Fatalf("event = %#v", lastEvent)
 	}
 }

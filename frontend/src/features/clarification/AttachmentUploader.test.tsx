@@ -117,4 +117,26 @@ describe("AttachmentUploader", () => {
     expect(onChange).toHaveBeenCalledWith([])
     expect(screen.queryByText("退款规则V2.pdf")).not.toBeInTheDocument()
   })
+
+  it("accepts xlsx and html files from the picker", () => {
+    render(<Harness />)
+
+    const accept = screen.getByTestId("attachment-input").getAttribute("accept") ?? ""
+    for (const extension of [".xlsx", ".html", ".htm"]) {
+      expect(accept).toContain(extension)
+    }
+  })
+
+  it("rejects legacy doc and ppt files with the save-as hint", async () => {
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["legacy"], "需求说明.doc")] },
+    })
+
+    expect(await screen.findByText(/另存为 \.docx\/\.pptx/)).toBeInTheDocument()
+    expect(api.uploadContent).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+  })
 })

@@ -398,6 +398,11 @@ func partPayload(part version.MessagePart) map[string]any {
 		payload["name"] = part.Name
 		payload["mime"] = part.MIME
 		payload["size"] = part.Size
+	case version.MessagePartImage:
+		payload["mime"] = part.MIME
+		payload["data_ref"] = part.DataRef
+		payload["width"] = part.Width
+		payload["height"] = part.Height
 	case version.MessagePartRequirementCard:
 		payload["requirement_id"] = platformid.Format(part.RequirementID)
 		payload["title"] = part.Title

@@ -102,10 +102,17 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 	switch {
 	case kind.IsImage():
 		status = version.AttachmentSkipped
+	case version.IsLegacyOfficeFormat(name):
+		// The pre-OOXML .doc/.ppt binary formats never reach the parser: the
+		// upload path must still return the same save-as hint the parser would
+		// (R26), not the generic unsupported-format message.
+		status = version.AttachmentFailed
+		errorCode = version.AttachmentErrorUnsupported
+		errorText = version.ErrUnsupportedLegacyAttachment.Error() + ": " + name
 	case !kind.SupportsExtraction():
 		status = version.AttachmentFailed
 		errorCode = version.AttachmentErrorUnsupported
-		errorText = "unsupported attachment format; upload md/txt/docx/pptx/pdf or an image"
+		errorText = "unsupported attachment format; upload md/txt/html/docx/pptx/xlsx/pdf or an image"
 	}
 
 	attachment := version.Attachment{
@@ -178,6 +185,54 @@ type AttachmentInfo struct {
 	ErrorText             string
 	Text                  string
 	TotalChars            int
+}
+
+// ImagePart is one image content part sent to a vision model. DataRef is the
+// content-ledger SHA-256; the model gateway resolves it to bytes at call time.
+// It mirrors the R5 image payload shape: {mime, data_ref, width, height}.
+type ImagePart struct {
+	Mime    string `json:"mime"`
+	DataRef string `json:"data_ref"`
+	Width   int    `json:"width"`
+	Height  int    `json:"height"`
+}
+
+// Model is the minimal LLM model capability metadata needed to attach image
+// parts. The composition root adapts the selected llm.Model into it.
+type Model struct {
+	ID             string
+	SupportsVision bool
+}
+
+// ValidateVision rejects image attachments when the selected model does not
+// advertise supports_vision (§8.3). The error is explicit so the user can pick
+// a vision-capable model or remove the image.
+func ValidateVision(model Model) error {
+	if model.SupportsVision {
+		return nil
+	}
+	name := strings.TrimSpace(model.ID)
+	if name == "" {
+		name = "the selected model"
+	}
+	return platform.Invalid("model",
+		name+" does not support vision (supports_vision=false); choose a vision-capable model or remove the image")
+}
+
+// AttachmentTextRead is the structured outcome of reading attachment text. A
+// non-done status is a normal result: callers report it to the model instead
+// of turning it into a 409 state_conflict (§8.5).
+type AttachmentTextRead struct {
+	AttachmentID int64
+	Name         string
+	MIME         string
+	Status       string
+	Text         string
+	Offset       int
+	TotalChars   int
+	Truncated    bool
+	Error        string
+	Retryable    bool
 }
 
 // AttachmentMeta is the compact attachment list entry for agent tools.
@@ -267,12 +322,13 @@ func (s *AttachmentService) ListAttachments(ctx context.Context, versionID, conv
 	return metas, nil
 }
 
-// ReadAttachmentText returns a character window of the extracted text of one
-// conversation attachment. offset is a rune offset; maxChars defaults to 4000
-// and is capped at 20000.
-func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error) {
+// ReadAttachmentText returns the structured status and a character window of
+// the extracted text of one conversation attachment. offset is a rune offset;
+// maxChars defaults to 4000 and is capped at 20000. A non-done status is
+// returned as data, never as a state_conflict error.
+func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (AttachmentTextRead, error) {
 	if offset < 0 {
-		return "", 0, platform.Invalid("offset", "must be zero or positive")
+		return AttachmentTextRead{}, platform.Invalid("offset", "must be zero or positive")
 	}
 	if maxChars <= 0 {
 		maxChars = DefaultAttachmentReadChars
@@ -282,25 +338,60 @@ func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, c
 	}
 	attachment, err := s.conversationAttachment(ctx, versionID, conversationID, attachmentID)
 	if err != nil {
-		return "", 0, err
+		return AttachmentTextRead{}, err
 	}
-	if attachment.ExtractionStatus != version.AttachmentDone {
-		return "", 0, platform.StateConflict("attachment text is not available")
+	result := AttachmentTextRead{
+		AttachmentID: attachment.ID,
+		Name:         attachment.Name,
+		MIME:         attachment.MIME,
+		Status:       attachment.ExtractionStatus,
+		Offset:       offset,
 	}
-	text, err := s.readExtractedText(ctx, attachment)
-	if err != nil {
-		return "", 0, err
+	switch attachment.ExtractionStatus {
+	case version.AttachmentDone:
+		text, err := s.readExtractedText(ctx, attachment)
+		if err != nil {
+			return AttachmentTextRead{}, err
+		}
+		runes := []rune(text)
+		result.TotalChars = len(runes)
+		if offset < len(runes) {
+			end := offset + maxChars
+			if end > len(runes) {
+				end = len(runes)
+			}
+			result.Text = string(runes[offset:end])
+			result.Truncated = end < len(runes)
+		}
+	case version.AttachmentPending, version.AttachmentProcessing:
+		result.Error = AttachmentParsingMessage
+		result.Retryable = true
+	case version.AttachmentFailed:
+		result.Error = attachmentFailureText(attachment)
+	case version.AttachmentSkipped:
+		result.Error = "attachment was skipped because it has no extractable text; use an image part for vision"
+	default:
+		result.Error = "attachment text is not available yet"
 	}
-	runes := []rune(text)
-	total := len(runes)
-	if offset >= total {
-		return "", total, nil
+	return result, nil
+}
+
+// AttachmentParsingMessage is the explicit "still parsing, retry later" result
+// returned by attachment.read_text instead of a 409 (§8.5).
+const AttachmentParsingMessage = "附件解析中，可重试"
+
+// attachmentFailureText renders the stored parse failure reason. It keeps the
+// parser detail (for example the legacy .doc/.ppt save-as hint) instead of
+// collapsing it into a generic "text is not available" message.
+func attachmentFailureText(attachment version.Attachment) string {
+	switch {
+	case attachment.ExtractionErrorCode == "":
+		return attachment.ExtractionErrorText
+	case attachment.ExtractionErrorText == "":
+		return attachment.ExtractionErrorCode
+	default:
+		return attachment.ExtractionErrorCode + ": " + attachment.ExtractionErrorText
 	}
-	end := offset + maxChars
-	if end > total {
-		end = total
-	}
-	return string(runes[offset:end]), total, nil
 }
 
 // AttachmentImageRef returns the original content reference of an image
@@ -474,10 +565,12 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 
 func (s *AttachmentService) failExtraction(ctx context.Context, attachment version.Attachment, extractErr error) (ExtractionResult, error) {
 	code := version.AttachmentErrorExtraction
-	message := "attachment text extraction failed"
+	message := "attachment text extraction failed: " + extractErr.Error()
 	if errors.Is(extractErr, version.ErrUnsupportedAttachmentFormat) {
 		code = version.AttachmentErrorUnsupported
-		message = "unsupported attachment format"
+		// Keep the parser's detailed reason (the legacy .doc/.ppt save-as hint
+		// wraps this sentinel) instead of overwriting it.
+		message = extractErr.Error()
 	}
 	now := s.clock.Now()
 	if err := s.repo.MarkFailed(ctx, attachment.ID, code, message, now); err != nil {

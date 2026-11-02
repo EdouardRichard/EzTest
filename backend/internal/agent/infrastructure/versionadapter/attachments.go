@@ -2,7 +2,6 @@ package versionadapter
 
 import (
 	"context"
-	"unicode/utf8"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
@@ -73,28 +72,28 @@ func (a *Adapter) ListAttachments(ctx context.Context, versionID, conversationID
 }
 
 // ReadAttachmentText implements tools.AttachmentPort for attachment.read_text.
-// The version service applies the rune offset/maxChars rules and only serves
-// extracted text for done attachments (state_conflict otherwise).
+// The version service applies the rune offset/maxChars rules and returns the
+// structured parse status (done/pending/failed/skipped) as data, so callers do
+// not see a 409 state_conflict for an attachment that is still parsing.
 func (a *Adapter) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (tools.AttachmentText, error) {
 	if a.attachments == nil {
 		return tools.AttachmentText{}, a.missing("attachments")
 	}
-	info, err := a.attachments.GetAttachmentInfo(ctx, versionID, attachmentID)
-	if err != nil {
-		return tools.AttachmentText{}, err
-	}
-	text, totalChars, err := a.attachments.ReadAttachmentText(ctx, versionID, conversationID, attachmentID, offset, maxChars)
+	read, err := a.attachments.ReadAttachmentText(ctx, versionID, conversationID, attachmentID, offset, maxChars)
 	if err != nil {
 		return tools.AttachmentText{}, err
 	}
 	return tools.AttachmentText{
-		AttachmentID: attachmentID,
-		Name:         info.Name,
-		MIME:         info.MIME,
-		Offset:       offset,
-		Text:         text,
-		TotalChars:   totalChars,
-		Truncated:    offset+utf8.RuneCountInString(text) < totalChars,
+		AttachmentID: read.AttachmentID,
+		Name:         read.Name,
+		MIME:         read.MIME,
+		Status:       read.Status,
+		Offset:       read.Offset,
+		Text:         read.Text,
+		TotalChars:   read.TotalChars,
+		Truncated:    read.Truncated,
+		Error:        read.Error,
+		Retryable:    read.Retryable,
 	}, nil
 }
 

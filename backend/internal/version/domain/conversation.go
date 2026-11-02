@@ -30,6 +30,7 @@ const (
 
 	MessagePartText             = "text"
 	MessagePartAttachment       = "attachment"
+	MessagePartImage            = "image"
 	MessagePartRequirementCard  = "requirement_card"
 	MessagePartRollbackProposal = "rollback_proposal"
 )
@@ -100,6 +101,9 @@ type MessagePart struct {
 	Name          string
 	MIME          string
 	Size          int64
+	DataRef       string
+	Width         int
+	Height        int
 	RequirementID int64
 	Title         string
 	Status        string
@@ -123,6 +127,14 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 			MIME   string `json:"mime"`
 			Size   int64  `json:"size"`
 		}{Type: p.Type, SHA256: p.SHA256, Name: p.Name, MIME: p.MIME, Size: p.Size})
+	case MessagePartImage:
+		return json.Marshal(struct {
+			Type    string `json:"type"`
+			MIME    string `json:"mime"`
+			DataRef string `json:"data_ref"`
+			Width   int    `json:"width"`
+			Height  int    `json:"height"`
+		}{Type: p.Type, MIME: p.MIME, DataRef: p.DataRef, Width: p.Width, Height: p.Height})
 	case MessagePartRequirementCard:
 		return json.Marshal(struct {
 			Type          string `json:"type"`
@@ -180,6 +192,17 @@ func (p *MessagePart) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		*p = MessagePart{Type: probe.Type, SHA256: payload.SHA256, Name: payload.Name, MIME: payload.MIME, Size: payload.Size}
+	case MessagePartImage:
+		var payload struct {
+			MIME    string `json:"mime"`
+			DataRef string `json:"data_ref"`
+			Width   int    `json:"width"`
+			Height  int    `json:"height"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		*p = MessagePart{Type: probe.Type, MIME: payload.MIME, DataRef: payload.DataRef, Width: payload.Width, Height: payload.Height}
 	case MessagePartRequirementCard:
 		var payload struct {
 			RequirementID json.RawMessage `json:"requirement_id"`
@@ -295,8 +318,9 @@ func ValidateClientMessageID(raw string) error {
 	return nil
 }
 
-// ValidateUserMessageParts validates one user message: text and attachment
-// parts only, at most ten attachments, and text within the contract bounds.
+// ValidateUserMessageParts validates one user message: text, attachment and
+// image parts only, at most ten attachments/images, and text within the
+// contract bounds.
 func ValidateUserMessageParts(parts []MessagePart) error {
 	if len(parts) == 0 {
 		return platform.Invalid("parts", "must contain at least one part")
@@ -314,8 +338,13 @@ func ValidateUserMessageParts(parts []MessagePart) error {
 				return err
 			}
 			attachments++
+		case MessagePartImage:
+			if err := validateImageMessagePart(part, field); err != nil {
+				return err
+			}
+			attachments++
 		default:
-			return platform.Invalid(field("type"), "must be text or attachment")
+			return platform.Invalid(field("type"), "must be text, attachment or image")
 		}
 	}
 	if attachments > MaxMessageAttachments {
@@ -379,6 +408,21 @@ func validateAttachmentPart(part MessagePart, field func(string) string) error {
 	}
 	if part.Size <= 0 || part.Size > MaxAttachmentBytes {
 		return platform.Invalid(field("size"), "must be between 1 and 10485760 bytes")
+	}
+	return nil
+}
+
+// validateImageMessagePart validates the R5 image payload: a supported image
+// MIME, a content-ledger SHA-256 data_ref and bounded pixel dimensions.
+func validateImageMessagePart(part MessagePart, field func(string) string) error {
+	if !IsSupportedImageMIME(part.MIME) {
+		return platform.Invalid(field("mime"), "must be image/png, image/jpeg or image/webp")
+	}
+	if !messageSHA256Pattern.MatchString(part.DataRef) {
+		return platform.Invalid(field("data_ref"), "must be the 64 lowercase hex content sha256")
+	}
+	if err := ValidateImageDimensions(part.Width, part.Height); err != nil {
+		return err
 	}
 	return nil
 }

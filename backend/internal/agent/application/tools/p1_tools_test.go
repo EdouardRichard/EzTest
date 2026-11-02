@@ -437,6 +437,44 @@ func TestAttachmentReadTextPaging(t *testing.T) {
 	}
 }
 
+// TestAttachmentReadTextReportsPendingStatus covers §8.5: a pending or failed
+// attachment is reported as a structured status, not a 409/tool error.
+func TestAttachmentReadTextReportsPendingStatus(t *testing.T) {
+	port := &fakeAttachmentPort{text: AttachmentText{
+		AttachmentID: 9001, Name: "需求.md", MIME: "text/markdown",
+		Status: "pending", Error: "附件解析中，可重试", Retryable: true,
+	}}
+	registry := NewP1Registry(Deps{Attachment: port})
+	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9001"}`)
+	if err != nil {
+		t.Fatalf("pending read returned a tool error: %v", err)
+	}
+	body := resultMap(t, result)
+	if body["status"] != "pending" || body["retryable"] != true || body["text"] != "" {
+		t.Fatalf("body = %#v", body)
+	}
+	if body["error"] != "附件解析中，可重试" {
+		t.Fatalf("error = %#v", body["error"])
+	}
+
+	port.text = AttachmentText{
+		AttachmentID: 9002, Name: "legacy.doc", MIME: "application/msword",
+		Status: "failed", Error: "unsupported_attachment_format: save it as .docx/.pptx", Retryable: false,
+	}
+	port.textID = 0
+	result, err = execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9002"}`)
+	if err != nil {
+		t.Fatalf("failed read returned a tool error: %v", err)
+	}
+	body = resultMap(t, result)
+	if body["status"] != "failed" || body["retryable"] != false {
+		t.Fatalf("body = %#v", body)
+	}
+	if !strings.Contains(body["error"].(string), "docx") {
+		t.Fatalf("error = %#v", body["error"])
+	}
+}
+
 func TestAttachmentDefaultMaxChars(t *testing.T) {
 	port := &fakeAttachmentPort{}
 	registry := NewP1Registry(Deps{Attachment: port})

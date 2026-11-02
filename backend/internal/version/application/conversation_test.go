@@ -2,6 +2,7 @@ package versionapp_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -740,5 +741,43 @@ func TestListReconcilableClampsLimit(t *testing.T) {
 	}
 	if env.repo.lastReconcilerLimit != 1 {
 		t.Fatalf("negative limit = %d, want clamped 1", env.repo.lastReconcilerLimit)
+	}
+}
+
+// TestPostUserMessageStoresImagePart covers R5/§8.3: an image the client sends
+// is persisted as an `image` part, not an attachment part or extracted text.
+func TestPostUserMessageStoresImagePart(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation, err := env.svc.Create(requestContext(), env.versionID, "clarification", "Chat", 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sha := strings.Repeat("e", 64)
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "这张截图说明了什么？"},
+		{Type: version.MessagePartImage, MIME: "image/png", DataRef: sha, Width: 800, Height: 600},
+	}
+	message := postUserMessage(t, env, conversation.ID, parts, "image-1")
+	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartImage ||
+		message.Parts[1].DataRef != sha || message.Parts[1].Width != 800 || message.Parts[1].Height != 600 {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+	if len(env.registrar.calls) != 0 {
+		t.Fatalf("image part registered as a text attachment: %#v", env.registrar.calls)
+	}
+	raw, err := json.Marshal(message.Parts[1])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["type"] != "image" || payload["data_ref"] != sha || payload["mime"] != "image/png" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	stored := env.repo.messages[conversation.ID][0]
+	if stored.Parts[1].Type != version.MessagePartImage {
+		t.Fatalf("stored = %#v", stored.Parts)
 	}
 }
