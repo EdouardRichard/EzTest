@@ -2,6 +2,7 @@ package designapp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -49,6 +50,110 @@ func countOrLen(count, length int) int {
 		return count
 	}
 	return length
+}
+
+// ConfirmCasesByIDs freezes explicit current-version cases selected by the
+// version case hard gate. An empty list confirms every confirmed-eligible
+// current case of the version (the POST /stage/confirm-cases "all" case).
+//
+// It is deliberately layered on the single confirmation use case: stale,
+// foreign, already-confirmed and old-requirement-version cases get exactly the
+// same typed behavior as POST /design/confirmations, and the gate only advances
+// when every confirmation succeeded.
+func (s *GraphService) ConfirmCasesByIDs(ctx context.Context, versionID int64, caseIDs []int64) error {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return err
+	}
+	ids, err := normalizeCaseSelectionIDs(caseIDs)
+	if err != nil {
+		return err
+	}
+	actorID := confirmationActorID(ctx)
+	if len(ids) == 0 {
+		return s.confirmAllCases(ctx, versionID, actorID)
+	}
+
+	// Validate the whole selection before changing anything, so a foreign or
+	// missing ID can never leave an earlier case of the same selection
+	// confirmed while the gate reports failure.
+	for _, caseID := range ids {
+		if _, err := s.repo.ResolveConfirmationTarget(ctx, versionID, design.ConfirmScopeCase, caseID); err != nil {
+			return mapDesignError(err, "case")
+		}
+	}
+	for _, caseID := range ids {
+		if _, err := s.Confirm(ctx, versionID, ConfirmInput{
+			Scope: design.ConfirmScopeCase, TargetID: caseID,
+		}, actorID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// confirmAllCases confirms every draft current case of the version by reusing
+// the requirement-scope confirmation, one clarified requirement at a time. A
+// requirement without draft cases is skipped: "all" means all eligible cases,
+// not "fail when some requirement has nothing to confirm".
+func (s *GraphService) confirmAllCases(ctx context.Context, versionID int64, actorID int64) error {
+	graph, err := s.repo.ReadGraph(ctx, versionID)
+	if err != nil {
+		return mapDesignError(err, "version")
+	}
+	for _, requirement := range graph.Requirements {
+		if !hasDraftCurrentCase(requirement) {
+			continue
+		}
+		if _, err := s.Confirm(ctx, versionID, ConfirmInput{
+			Scope: design.ConfirmScopeRequirement, TargetID: requirement.Requirement.ID,
+		}, actorID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasDraftCurrentCase reports whether a requirement graph node has at least one
+// draft case on a scenario of the requirement's current revision. Cases bound
+// to an older revision are excluded, matching ConfirmationTx.CasesByRequirement.
+func hasDraftCurrentCase(requirement design.RequirementGraph) bool {
+	for _, scenario := range requirement.Scenarios {
+		if scenario.Scenario.RequirementVersionID != requirement.Requirement.CurrentVersionID {
+			continue
+		}
+		for _, item := range scenario.Cases {
+			if item.Current.Status == design.CaseStatusDraft {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeCaseSelectionIDs(raw []int64) ([]int64, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	ids := make([]int64, 0, len(raw))
+	seen := make(map[int64]struct{}, len(raw))
+	for index, id := range raw {
+		if id <= 0 {
+			return nil, platform.Invalid(fmt.Sprintf("case_ids[%d]", index), "must be a positive decimal ID")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func confirmationActorID(ctx context.Context) int64 {
+	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
+		return actor.ID
+	}
+	return 0
 }
 
 // Confirm freezes the selected draft case versions in one transaction. The

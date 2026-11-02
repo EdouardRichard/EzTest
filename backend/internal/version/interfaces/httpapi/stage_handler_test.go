@@ -63,7 +63,42 @@ func (a *handlerStageAudit) Record(_ context.Context, event auditapp.Event) erro
 	return nil
 }
 
+// handlerGateConfirmer stands in for the requirement/case entity confirmation
+// ports so the handler tests can assert the machine confirms before advancing
+// and propagates confirmation failures without moving the stage.
+type handlerGateConfirmer struct {
+	requirementCalls [][]int64
+	caseCalls        [][]int64
+	requirementErr   error
+	caseErr          error
+}
+
+func (c *handlerGateConfirmer) BatchConfirm(_ context.Context, _ int64, requirementIDs []int64) error {
+	c.requirementCalls = append(c.requirementCalls, append([]int64(nil), requirementIDs...))
+	return c.requirementErr
+}
+
+func (c *handlerGateConfirmer) ConfirmCases(_ context.Context, _ int64, caseIDs []int64) error {
+	c.caseCalls = append(c.caseCalls, append([]int64(nil), caseIDs...))
+	return c.caseErr
+}
+
+var (
+	_ versionapp.RequirementGateConfirmer = (*handlerGateConfirmer)(nil)
+	_ versionapp.CaseGateConfirmer        = (*handlerGateConfirmer)(nil)
+)
+
 func newStageTestServer(t *testing.T, initial version.Stage) (http.Handler, *handlerStageRepo, *handlerStageJobs, *handlerStageAudit) {
+	t.Helper()
+	mux, repo, jobs, audit, _ := newStageTestServerWithConfirmer(t, initial, &handlerGateConfirmer{})
+	return mux, repo, jobs, audit
+}
+
+func newStageTestServerWithConfirmer(
+	t *testing.T,
+	initial version.Stage,
+	confirmer *handlerGateConfirmer,
+) (http.Handler, *handlerStageRepo, *handlerStageJobs, *handlerStageAudit, *handlerGateConfirmer) {
 	t.Helper()
 	repo := &handlerStageRepo{
 		state: version.StageState{Stage: initial, StageEnteredAt: testTime},
@@ -71,14 +106,17 @@ func newStageTestServer(t *testing.T, initial version.Stage) (http.Handler, *han
 	}
 	jobs := &handlerStageJobs{}
 	audit := &handlerStageAudit{}
-	machine := versionapp.NewStageMachine(repo, jobs, audit, nil, handlerClock{at: testTime})
+	machine := versionapp.NewStageMachine(repo, jobs, audit, nil, handlerClock{at: testTime},
+		versionapp.WithRequirementGateConfirmer(confirmer),
+		versionapp.WithCaseGateConfirmer(confirmer),
+	)
 	handler := versionapi.NewStageHandler(machine)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/versions/{id}/stage", handler.Get)
 	mux.HandleFunc("POST /api/versions/{id}/stage/confirm-requirements", handler.ConfirmRequirements)
 	mux.HandleFunc("POST /api/versions/{id}/stage/confirm-cases", handler.ConfirmCases)
 	mux.HandleFunc("POST /api/versions/{id}/stage/reject", handler.Reject)
-	return mux, repo, jobs, audit
+	return mux, repo, jobs, audit, confirmer
 }
 
 func stageDeniedAudit(t *testing.T, audit *handlerStageAudit) auditapp.Event {
@@ -159,6 +197,134 @@ func TestStageConfirmRequiresUser(t *testing.T) {
 	if len(audit.events) != 1 || audit.events[0].Action != "version.stage_decision" {
 		t.Fatalf("audit = %#v", audit.events)
 	}
+}
+
+// TestStageGateRejectsWrongSourceStage pins the source-stage guard through the
+// HTTP surface: a gate endpoint called at the wrong stage returns a typed 409
+// and writes no stage, job or decision audit.
+func TestStageGateRejectsWrongSourceStage(t *testing.T) {
+	cases := []struct {
+		name  string
+		path  string
+		body  string
+		stage version.Stage
+	}{
+		{
+			"requirement gate from case_review",
+			"/api/versions/101/stage/confirm-requirements",
+			`{"requirement_ids":["701"]}`,
+			version.StageCaseReview,
+		},
+		{
+			"requirement gate from designing",
+			"/api/versions/101/stage/confirm-requirements",
+			`{"requirement_ids":["701"]}`,
+			version.StageDesigning,
+		},
+		{
+			"case gate from requirement_review",
+			"/api/versions/101/stage/confirm-cases",
+			`{"case_ids":["501"]}`,
+			version.StageRequirementReview,
+		},
+		{
+			"case gate from designing",
+			"/api/versions/101/stage/confirm-cases",
+			`{"case_ids":["501"]}`,
+			version.StageDesigning,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux, repo, jobs, audit, confirmer := newStageTestServerWithConfirmer(t, tc.stage, &handlerGateConfirmer{})
+			recorder := call(t, mux, http.MethodPost, tc.path, tc.body, actor())
+			if recorder.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if code := errorBody(t, recorder)["code"]; code != "invalid_stage_for_gate" {
+				t.Fatalf("error code = %#v, want invalid_stage_for_gate", code)
+			}
+			if len(repo.applied) != 0 || repo.state.Stage != tc.stage {
+				t.Fatalf("wrong-source gate moved the stage: %#v", repo.state)
+			}
+			if len(jobs.jobs) != 0 || len(audit.events) != 0 {
+				t.Fatalf("wrong-source gate wrote jobs=%#v audits=%#v", jobs.jobs, audit.events)
+			}
+			if len(confirmer.requirementCalls) != 0 || len(confirmer.caseCalls) != 0 {
+				t.Fatalf("wrong-source gate confirmed entities: %#v/%#v",
+					confirmer.requirementCalls, confirmer.caseCalls)
+			}
+		})
+	}
+}
+
+// TestStageConfirmConfirmsEntities pins the gate order: the entities are
+// confirmed first, and only then does the stage advance. A confirmation failure
+// returns the typed entity error and leaves the stage, job and audit untouched.
+func TestStageConfirmConfirmsEntities(t *testing.T) {
+	t.Run("requirements are confirmed before designing", func(t *testing.T) {
+		confirmer := &handlerGateConfirmer{}
+		mux, repo, jobs, audit, _ := newStageTestServerWithConfirmer(t, version.StageRequirementReview, confirmer)
+		recorder := call(t, mux, http.MethodPost, "/api/versions/101/stage/confirm-requirements",
+			`{"requirement_ids":["701","702"]}`, actor())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if len(confirmer.requirementCalls) != 1 || len(confirmer.requirementCalls[0]) != 2 ||
+			confirmer.requirementCalls[0][0] != 701 || confirmer.requirementCalls[0][1] != 702 {
+			t.Fatalf("requirement confirmer calls = %#v", confirmer.requirementCalls)
+		}
+		if repo.state.Stage != version.StageDesigning || len(jobs.jobs) != 1 || len(audit.events) != 1 {
+			t.Fatalf("stage=%q jobs=%#v audits=%#v", repo.state.Stage, jobs.jobs, audit.events)
+		}
+	})
+
+	t.Run("empty case_ids confirms all", func(t *testing.T) {
+		confirmer := &handlerGateConfirmer{}
+		mux, repo, _, _, _ := newStageTestServerWithConfirmer(t, version.StageCaseReview, confirmer)
+		recorder := call(t, mux, http.MethodPost, "/api/versions/101/stage/confirm-cases", `{"case_ids":[]}`, actor())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if len(confirmer.caseCalls) != 1 || confirmer.caseCalls[0] != nil {
+			t.Fatalf("case confirmer calls = %#v, want one nil (all) call", confirmer.caseCalls)
+		}
+		if repo.state.Stage != version.StageExecuting {
+			t.Fatalf("stage = %q, want executing", repo.state.Stage)
+		}
+	})
+
+	t.Run("foreign case id leaves the stage untouched", func(t *testing.T) {
+		confirmer := &handlerGateConfirmer{caseErr: platform.NotFound("case")}
+		mux, repo, jobs, audit, _ := newStageTestServerWithConfirmer(t, version.StageCaseReview, confirmer)
+		recorder := call(t, mux, http.MethodPost, "/api/versions/101/stage/confirm-cases",
+			`{"case_ids":["999"]}`, actor())
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if len(repo.applied) != 0 || repo.state.Stage != version.StageCaseReview {
+			t.Fatalf("failed confirmation moved the stage: %#v", repo.state)
+		}
+		if len(jobs.jobs) != 0 || len(audit.events) != 0 {
+			t.Fatalf("failed confirmation wrote jobs=%#v audits=%#v", jobs.jobs, audit.events)
+		}
+	})
+
+	t.Run("foreign requirement id leaves the stage untouched", func(t *testing.T) {
+		confirmer := &handlerGateConfirmer{requirementErr: platform.NotFound("requirement")}
+		mux, repo, jobs, audit, _ := newStageTestServerWithConfirmer(t, version.StageRequirementReview, confirmer)
+		recorder := call(t, mux, http.MethodPost, "/api/versions/101/stage/confirm-requirements",
+			`{"requirement_ids":["999"]}`, actor())
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if len(repo.applied) != 0 || repo.state.Stage != version.StageRequirementReview {
+			t.Fatalf("failed confirmation moved the stage: %#v", repo.state)
+		}
+		if len(jobs.jobs) != 0 || len(audit.events) != 0 {
+			t.Fatalf("failed confirmation wrote jobs=%#v audits=%#v", jobs.jobs, audit.events)
+		}
+	})
 }
 
 func TestStageGetReturnsStageProjection(t *testing.T) {

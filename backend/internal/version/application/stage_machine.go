@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -56,6 +57,43 @@ type StageJobEnqueuer interface {
 	EnqueueStageJob(ctx context.Context, job StageJob) error
 }
 
+// RequirementGateConfirmer freezes the requirement rows selected by the
+// requirement hard gate before the stage machine advances. The underlying
+// requirement batch-confirm use case validates the selection (a foreign or
+// missing ID is a typed not-found and an empty list is invalid).
+type RequirementGateConfirmer interface {
+	BatchConfirm(ctx context.Context, versionID int64, requirementIDs []int64) error
+}
+
+// CaseGateConfirmer freezes the case rows selected by the case hard gate before
+// the stage machine advances. An empty list means "all confirmed-eligible cases
+// of the version".
+type CaseGateConfirmer interface {
+	ConfirmCases(ctx context.Context, versionID int64, caseIDs []int64) error
+}
+
+// StageMachineOption configures optional StageMachine collaborators without
+// widening the positional constructor for every caller.
+type StageMachineOption func(*StageMachine)
+
+// WithRequirementGateConfirmer installs the requirement gate entity-confirmation
+// port. Production must set it; unit tests may omit it only when they never call
+// the requirement gate.
+func WithRequirementGateConfirmer(confirmer RequirementGateConfirmer) StageMachineOption {
+	return func(m *StageMachine) {
+		m.requirements = confirmer
+	}
+}
+
+// WithCaseGateConfirmer installs the case gate entity-confirmation port.
+// Production must set it; unit tests may omit it only when they never call the
+// case gate.
+func WithCaseGateConfirmer(confirmer CaseGateConfirmer) StageMachineOption {
+	return func(m *StageMachine) {
+		m.cases = confirmer
+	}
+}
+
 // StageView is the user-facing stage projection (contracts/openapi.yaml
 // StageView).
 type StageView struct {
@@ -75,6 +113,11 @@ type StageMachine struct {
 	audit  auditapp.Recorder
 	events eventingapp.Publisher
 	clock  clock.Clock
+	// requirements and cases confirm the selected entities before a hard gate
+	// advances. They are narrow ports so the version context never imports the
+	// requirement or design services.
+	requirements RequirementGateConfirmer
+	cases        CaseGateConfirmer
 }
 
 // NewStageMachine wires the deterministic stage machine. jobs, audit and
@@ -86,11 +129,18 @@ func NewStageMachine(
 	audit auditapp.Recorder,
 	events eventingapp.Publisher,
 	clk clock.Clock,
+	options ...StageMachineOption,
 ) *StageMachine {
 	if clk == nil {
 		clk = clock.System{}
 	}
-	return &StageMachine{repo: repo, jobs: jobs, audit: audit, events: events, clock: clk}
+	machine := &StageMachine{repo: repo, jobs: jobs, audit: audit, events: events, clock: clk}
+	for _, option := range options {
+		if option != nil {
+			option(machine)
+		}
+	}
+	return machine
 }
 
 // Stage returns the current stage projection.
@@ -175,14 +225,29 @@ func (m *StageMachine) ResumeTo(ctx context.Context, versionID int64, target ver
 }
 
 // OnRequirementConfirmed applies the requirement hard gate
-// (requirement_review -> designing) and dispatches design.cases for the
-// confirmed requirements. An empty requirementIDs list means "all".
+// (requirement_review -> designing), after freezing the selected requirement
+// rows, and dispatches design.cases for them. The version must be exactly at
+// requirement_review: the graph also has a legitimate case_review -> designing
+// reject edge, so the source stage must be pinned explicitly.
 func (m *StageMachine) OnRequirementConfirmed(ctx context.Context, versionID int64, requirementIDs []int64) (StageView, error) {
 	ids, err := normalizeStageIDs("requirement_ids", requirementIDs)
 	if err != nil {
 		return StageView{}, err
 	}
-	next, err := m.transition(ctx, versionID, version.StageDesigning, "requirement_confirmed", &StageJob{
+	current, err := m.load(ctx, versionID)
+	if err != nil {
+		return StageView{}, err
+	}
+	if current.Stage != version.StageRequirementReview {
+		return StageView{}, invalidStageForGate(stageGateRequirement, version.StageRequirementReview, current.Stage)
+	}
+	if m.requirements == nil {
+		return StageView{}, fmt.Errorf("stage machine: requirement gate confirmer is not configured")
+	}
+	if err := m.requirements.BatchConfirm(ctx, versionID, ids); err != nil {
+		return StageView{}, err
+	}
+	next, err := m.transitionFrom(ctx, current, version.StageDesigning, "requirement_confirmed", &StageJob{
 		VersionID:      versionID,
 		Kind:           StageJobDesignCases,
 		RequirementIDs: ids,
@@ -194,15 +259,29 @@ func (m *StageMachine) OnRequirementConfirmed(ctx context.Context, versionID int
 	return viewFromState(next), nil
 }
 
-// OnCasesConfirmed applies the case hard gate (case_review -> executing) and
-// dispatches execute.batch. A non-empty caseIDs list executes only those
-// confirmed cases (D23); an empty list means every confirmed case.
+// OnCasesConfirmed applies the case hard gate (case_review -> executing),
+// after freezing the selected case rows, and dispatches execute.batch. A
+// non-empty caseIDs list confirms only those cases (D23); an empty list means
+// every confirmed-eligible case. The version must be exactly at case_review.
 func (m *StageMachine) OnCasesConfirmed(ctx context.Context, versionID int64, caseIDs []int64) (StageView, error) {
 	ids, err := normalizeStageIDs("case_ids", caseIDs)
 	if err != nil {
 		return StageView{}, err
 	}
-	next, err := m.transition(ctx, versionID, version.StageExecuting, "cases_confirmed", &StageJob{
+	current, err := m.load(ctx, versionID)
+	if err != nil {
+		return StageView{}, err
+	}
+	if current.Stage != version.StageCaseReview {
+		return StageView{}, invalidStageForGate(stageGateCase, version.StageCaseReview, current.Stage)
+	}
+	if m.cases == nil {
+		return StageView{}, fmt.Errorf("stage machine: case gate confirmer is not configured")
+	}
+	if err := m.cases.ConfirmCases(ctx, versionID, ids); err != nil {
+		return StageView{}, err
+	}
+	next, err := m.transitionFrom(ctx, current, version.StageExecuting, "cases_confirmed", &StageJob{
 		VersionID: versionID,
 		Kind:      StageJobExecuteBatch,
 		CaseIDs:   ids,
@@ -275,7 +354,8 @@ func (m *StageMachine) RecordGateDenied(ctx context.Context, versionID int64, ga
 // ---------- internals ----------
 
 func (m *StageMachine) transition(ctx context.Context, versionID int64, to version.Stage, reason string, job *StageJob) (version.StageState, error) {
-	if err := validateStageText("reason", strings.TrimSpace(reason), stageReasonMax); err != nil {
+	reason = strings.TrimSpace(reason)
+	if err := validateStageText("reason", reason, stageReasonMax); err != nil {
 		return version.StageState{}, err
 	}
 	current, err := m.load(ctx, versionID)
@@ -432,14 +512,13 @@ func viewFromState(state version.StageState) StageView {
 }
 
 // stageEntryJob maps a target stage to the deterministic stage-entry job
-// (spec §5.4). Stages without a stage-entry job return nil.
+// (spec §5.4). Stages without a stage-entry job return nil: case_review is
+// entered after generation+review, so it must not enqueue review.cases.
 func stageEntryJob(versionID int64, to version.Stage) *StageJob {
 	kind := ""
 	switch to {
 	case version.StageDesigning:
 		kind = StageJobDesignCases
-	case version.StageCaseReview:
-		kind = StageJobReviewCases
 	case version.StageExecuting:
 		kind = StageJobExecuteBatch
 	case version.StageReporting:
@@ -496,4 +575,15 @@ func mapStageRepositoryError(err error) error {
 	default:
 		return err
 	}
+}
+
+// invalidStageForGate is the typed 409 returned when a hard gate is called at a
+// stage other than its single source stage. Reusing the plain transition
+// validator is not enough: the graph has legitimate back edges (for example
+// case_review -> designing), so a gate must pin its source explicitly to avoid
+// walking the version backwards.
+func invalidStageForGate(gate string, want, current version.Stage) error {
+	return platform.NewError(http.StatusConflict, "invalid_stage_for_gate", fmt.Sprintf(
+		"%s gate requires stage %s, but the version is at %s", gate, want, current,
+	))
 }

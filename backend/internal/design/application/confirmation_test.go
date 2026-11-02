@@ -246,3 +246,95 @@ func TestConfirmValidatesInput(t *testing.T) {
 		t.Fatalf("missing target err = %v, want not_found", err)
 	}
 }
+
+// TestConfirmCasesByIDsConfirmsOnlySelected pins the explicit-selection gate
+// path: only the requested current case versions are frozen, the rest stay
+// draft, and an already-confirmed case is idempotent.
+func TestConfirmCasesByIDsConfirmsOnlySelected(t *testing.T) {
+	service, repo, _, _ := newConfirmFixture(t)
+	seedFakeCase(t, repo, 7001, 5001, "用例一", design.CaseStatusDraft)
+	seedFakeCase(t, repo, 7002, 5001, "用例二", design.CaseStatusDraft)
+	seedFakeCase(t, repo, 7003, 5001, "用例三", design.CaseStatusConfirmed)
+
+	if err := service.ConfirmCasesByIDs(context.Background(), 1001, []int64{7001}); err != nil {
+		t.Fatalf("ConfirmCasesByIDs: %v", err)
+	}
+	if status := repo.cases[7001].current.Status; status != design.CaseStatusConfirmed {
+		t.Fatalf("case 7001 status = %q, want confirmed", status)
+	}
+	if status := repo.cases[7002].current.Status; status != design.CaseStatusDraft {
+		t.Fatalf("case 7002 status = %q, want draft", status)
+	}
+	if status := repo.cases[7003].current.Status; status != design.CaseStatusConfirmed {
+		t.Fatalf("case 7003 status = %q, want confirmed", status)
+	}
+	if len(repo.confirmations) != 1 {
+		t.Fatalf("confirmation rows = %d, want 1", len(repo.confirmations))
+	}
+	if repo.confirmations[0].Scope != design.ConfirmScopeCase || repo.confirmations[0].TargetScopeID != 7001 {
+		t.Fatalf("confirmation = %+v", repo.confirmations[0])
+	}
+
+	// Confirming an already-confirmed case is idempotent.
+	before := len(repo.confirmations)
+	if err := service.ConfirmCasesByIDs(context.Background(), 1001, []int64{7003}); err != nil {
+		t.Fatalf("idempotent ConfirmCasesByIDs: %v", err)
+	}
+	if len(repo.confirmations) != before {
+		t.Fatalf("idempotent confirmation wrote %d rows", len(repo.confirmations)-before)
+	}
+}
+
+// TestConfirmCasesByIDsAllConfirmsEveryDraft pins the empty-list meaning: all
+// current confirmed-eligible cases of the version are confirmed.
+func TestConfirmCasesByIDsAllConfirmsEveryDraft(t *testing.T) {
+	for _, selection := range [][]int64{nil, {}} {
+		service, repo, _, _ := newConfirmFixture(t)
+		seedFakeCase(t, repo, 7001, 5001, "用例一", design.CaseStatusDraft)
+		seedFakeCase(t, repo, 7002, 5001, "用例二", design.CaseStatusDraft)
+		seedFakeCase(t, repo, 7003, 5001, "用例三", design.CaseStatusConfirmed)
+
+		if err := service.ConfirmCasesByIDs(context.Background(), 1001, selection); err != nil {
+			t.Fatalf("ConfirmCasesByIDs(%#v): %v", selection, err)
+		}
+		for _, caseID := range []int64{7001, 7002, 7003} {
+			if status := repo.cases[caseID].current.Status; status != design.CaseStatusConfirmed {
+				t.Fatalf("selection %#v: case %d status = %q, want confirmed", selection, caseID, status)
+			}
+		}
+		if len(repo.confirmations) != 2 {
+			t.Fatalf("selection %#v: confirmation rows = %d, want 2", selection, len(repo.confirmations))
+		}
+	}
+}
+
+// TestConfirmCasesByIDsRejectsInvalidAndForeign pins the typed validation: a
+// zero ID is a 400 and an unknown/foreign case ID is a 404, both without
+// confirming anything.
+func TestConfirmCasesByIDsRejectsInvalidAndForeign(t *testing.T) {
+	service, repo, _, _ := newConfirmFixture(t)
+	seedFakeCase(t, repo, 7001, 5001, "用例一", design.CaseStatusDraft)
+
+	var apiErr *platform.Error
+	err := service.ConfirmCasesByIDs(context.Background(), 1001, []int64{0})
+	if !errors.As(err, &apiErr) || apiErr.Code != "invalid_argument" {
+		t.Fatalf("zero id err = %v, want invalid_argument", err)
+	}
+
+	err = service.ConfirmCasesByIDs(context.Background(), 1001, []int64{9999})
+	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
+		t.Fatalf("foreign case err = %v, want not_found", err)
+	}
+
+	err = service.ConfirmCasesByIDs(context.Background(), 1002, []int64{7001})
+	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
+		t.Fatalf("foreign version err = %v, want not_found", err)
+	}
+
+	if status := repo.cases[7001].current.Status; status != design.CaseStatusDraft {
+		t.Fatalf("failed selection confirmed case 7001: %q", status)
+	}
+	if len(repo.confirmations) != 0 {
+		t.Fatalf("failed selection wrote confirmations: %#v", repo.confirmations)
+	}
+}

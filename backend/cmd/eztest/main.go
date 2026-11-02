@@ -212,6 +212,20 @@ func (a designMetricsAdapter) CaseCounts(ctx context.Context, versionID int64) (
 	return versionapp.CaseCounts{Draft: counts.Draft, Confirmed: counts.Confirmed, Stale: counts.Stale}, nil
 }
 
+// designCaseGateConfirmer adapts the design context's case confirmation use
+// case to the version stage machine's narrow case-gate port. The composition
+// root is the only place that knows both bounded contexts.
+type designCaseGateConfirmer struct {
+	svc *designapp.GraphService
+}
+
+func (c designCaseGateConfirmer) ConfirmCases(ctx context.Context, versionID int64, caseIDs []int64) error {
+	if c.svc == nil {
+		return errors.New("case gate confirmer is not configured")
+	}
+	return c.svc.ConfirmCasesByIDs(ctx, versionID, caseIDs)
+}
+
 // designTeamRoomAdapter maps the design context's post port to the agent team
 // room service, keeping both contexts independent.
 type designTeamRoomAdapter struct {
@@ -571,11 +585,6 @@ func main() {
 	p5Bindings := newP5CodeBindings(p5Git, resourceSvc)
 	versionRepo := versionpg.New(pool, ids)
 	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, p5Bindings)
-	// Deterministic stage machine (0.2.1 §5.3). The stage-entry job enqueuer is
-	// nil until the work-item dispatcher lands (P2-T2 Task 7); until then a
-	// transition is still persisted, published and audited (gate decisions),
-	// and the missing dispatch is recoverable by the dispatcher's reconciler.
-	stageMachine := versionapp.NewStageMachine(versionRepo, nil, auditSvc, eventSvc, clk)
 	p5Bindings.SetVersionService(versionSvc, versionRepo)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
@@ -609,6 +618,15 @@ func main() {
 		designStale,
 	)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, designTeamRoom)
+	// Deterministic stage machine (0.2.1 §5.3/§5.5). Both hard gates confirm
+	// their selected entities before advancing. The stage-entry job enqueuer is
+	// nil until the work-item dispatcher lands (P2-T2 Task 7); until then a
+	// transition is still persisted, published and audited (gate decisions),
+	// and the missing dispatch is recoverable by the dispatcher's reconciler.
+	stageMachine := versionapp.NewStageMachine(versionRepo, nil, auditSvc, eventSvc, clk,
+		versionapp.WithRequirementGateConfirmer(versionapp.NewRequirementGateConfirmer(requirementSvc)),
+		versionapp.WithCaseGateConfirmer(designCaseGateConfirmer{svc: designGraph}),
+	)
 	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
 	designExports := designapp.NewExportService(
 		designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
