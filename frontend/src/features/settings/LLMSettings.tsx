@@ -28,13 +28,80 @@ import {
   type LLMConfig,
   type LLMConfigInput,
   type LLMModel,
+  type LLMModelCapabilities,
   type LLMProtocol,
+  type LLMReasoningEffort,
   type LLMStatus,
   type LLMTestResult,
+  type LLMThinkingType,
   refreshLLMModels,
   testLLMConfig,
   updateLLMConfig,
 } from "./api"
+
+/** Canonical protocols offered to new/updated configurations. */
+const CANONICAL_PROTOCOLS: ReadonlyArray<{ value: LLMProtocol; label: string }> = [
+  { value: "openai_chat_completions", label: "OpenAI Chat Completions" },
+  { value: "openai_responses", label: "OpenAI Responses" },
+]
+
+const PROTOCOL_LABELS: Record<LLMProtocol, string> = {
+  openai_chat_completions: "OpenAI Chat Completions",
+  openai_responses: "OpenAI Responses",
+  openai: "OpenAI 兼容",
+  openai_compatible: "OpenAI 兼容",
+}
+
+function protocolLabel(protocol: LLMProtocol | string): string {
+  return PROTOCOL_LABELS[protocol as LLMProtocol] ?? protocol
+}
+
+function isLegacyProtocol(protocol: LLMProtocol): boolean {
+  return protocol === "openai" || protocol === "openai_compatible"
+}
+
+const THINKING_OPTIONS: ReadonlyArray<{ value: LLMThinkingType; label: string }> = [
+  { value: "auto", label: "自动（auto）" },
+  { value: "enabled", label: "启用（enabled）" },
+  { value: "disabled", label: "禁用（disabled）" },
+]
+
+const EFFORT_OPTIONS: ReadonlyArray<{ value: LLMReasoningEffort; label: string }> = [
+  { value: "none", label: "none（无）" },
+  { value: "low", label: "low（低）" },
+  { value: "medium", label: "medium（中）" },
+  { value: "high", label: "high（高）" },
+  { value: "xhigh", label: "xhigh（极高）" },
+  { value: "max", label: "max（最高）" },
+]
+
+type CapabilityFlag =
+  | "supports_tools"
+  | "supports_vision"
+  | "supports_reasoning"
+  | "supports_prompt_cache"
+
+const CAPABILITY_FIELDS: ReadonlyArray<{ key: CapabilityFlag; label: string; id: string }> = [
+  { key: "supports_tools", label: "支持工具", id: "llm-capability-tools" },
+  { key: "supports_vision", label: "支持视觉", id: "llm-capability-vision" },
+  { key: "supports_reasoning", label: "支持推理", id: "llm-capability-reasoning" },
+  { key: "supports_prompt_cache", label: "提示缓存", id: "llm-capability-prompt-cache" },
+]
+
+/**
+ * Merges the 0.2.1 capability object with the legacy flat columns so a partial
+ * payload (or an older API build) still renders sensible checkbox state.
+ */
+function modelCapabilities(model: LLMModel | undefined): LLMModelCapabilities {
+  const capabilities = model?.capabilities
+  return {
+    supports_tools: capabilities?.supports_tools ?? model?.supports_tools ?? false,
+    supports_vision: capabilities?.supports_vision ?? model?.supports_vision ?? false,
+    supports_reasoning: capabilities?.supports_reasoning ?? false,
+    supports_prompt_cache: capabilities?.supports_prompt_cache ?? false,
+    context_window: capabilities?.context_window ?? model?.context_window ?? 0,
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -74,13 +141,17 @@ function parseHeaders(
 
 type ConfigFormDialogProps = {
   config: LLMConfig | null
+  /** Catalog rows belonging to this config (empty while creating). */
+  models: LLMModel[]
   onClose: () => void
   onSaved: (saved: LLMConfig, created: boolean) => void
 }
 
-function ConfigFormDialog({ config, onClose, onSaved }: ConfigFormDialogProps) {
+function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialogProps) {
   const [name, setName] = useState(config?.name ?? "")
-  const [protocol, setProtocol] = useState<LLMProtocol>(config?.protocol ?? "openai_compatible")
+  const [protocol, setProtocol] = useState<LLMProtocol>(
+    config?.protocol ?? "openai_chat_completions",
+  )
   const [baseUrl, setBaseUrl] = useState(config?.base_url ?? "")
   const [apiKey, setApiKey] = useState("")
   const [headers, setHeaders] = useState(JSON.stringify(config?.headers ?? {}, null, 2))
@@ -88,8 +159,20 @@ function ConfigFormDialog({ config, onClose, onSaved }: ConfigFormDialogProps) {
   const [maxRetries, setMaxRetries] = useState(String(config?.max_retries ?? 2))
   const [isDefault, setIsDefault] = useState(config?.is_default ?? false)
   const [status, setStatus] = useState<LLMStatus>(config?.status ?? "active")
+  const [thinkingType, setThinkingType] = useState<LLMThinkingType>(config?.thinking_type ?? "auto")
+  const [reasoningEffort, setReasoningEffort] = useState<LLMReasoningEffort>(
+    config?.reasoning_effort ?? "none",
+  )
+  const [defaultModelID, setDefaultModelID] = useState(config?.default_model_id ?? "")
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
+
+  const selectableModels = models.filter(
+    (model) => !model.deprecated && model.status !== "disabled",
+  )
+  const defaultModelRequired = selectableModels.length > 0
+  const selectedModel = models.find((model) => model.id === defaultModelID)
+  const selectedCapabilities = modelCapabilities(selectedModel)
 
   function buildInput(): ConfigParseResult {
     const trimmedName = name.trim()
@@ -119,6 +202,15 @@ function ConfigFormDialog({ config, onClose, onSaved }: ConfigFormDialogProps) {
       return { ok: false, error: "最大重试必须是 0–10 的整数" }
     }
 
+    if (defaultModelRequired) {
+      if (defaultModelID.trim().length === 0) {
+        return { ok: false, error: "请选择默认模型" }
+      }
+      if (!selectableModels.some((model) => model.id === defaultModelID)) {
+        return { ok: false, error: "默认模型已下线或不可用，请重新选择" }
+      }
+    }
+
     const parsedHeaders = parseHeaders(headers)
     if (!parsedHeaders.ok) return parsedHeaders
 
@@ -131,8 +223,11 @@ function ConfigFormDialog({ config, onClose, onSaved }: ConfigFormDialogProps) {
       max_retries: retries,
       is_default: isDefault,
       status,
+      thinking_type: thinkingType,
+      reasoning_effort: reasoningEffort,
     }
     if (apiKey.length > 0) input.api_key = apiKey
+    if (defaultModelID.trim().length > 0) input.default_model_id = defaultModelID.trim()
     return { ok: true, input }
   }
 
@@ -183,8 +278,14 @@ function ConfigFormDialog({ config, onClose, onSaved }: ConfigFormDialogProps) {
               value={protocol}
               onChange={(event) => setProtocol(event.target.value as LLMProtocol)}
             >
-              <option value="openai_compatible">OpenAI 兼容</option>
-              <option value="openai">OpenAI</option>
+              {isLegacyProtocol(protocol) ? (
+                <option value={protocol}>{protocolLabel(protocol)}</option>
+              ) : null}
+              {CANONICAL_PROTOCOLS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
             </Select>
           </Field>
         </div>
@@ -245,6 +346,86 @@ function ConfigFormDialog({ config, onClose, onSaved }: ConfigFormDialogProps) {
             </Select>
           </Field>
         </div>
+
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field id="llm-thinking-type" label="思考模式">
+            <Select
+              id="llm-thinking-type"
+              value={thinkingType}
+              onChange={(event) => setThinkingType(event.target.value as LLMThinkingType)}
+            >
+              {THINKING_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field id="llm-reasoning-effort" label="思考强度">
+            <Select
+              id="llm-reasoning-effort"
+              value={reasoningEffort}
+              onChange={(event) => setReasoningEffort(event.target.value as LLMReasoningEffort)}
+            >
+              {EFFORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field
+            id="llm-default-model"
+            label="默认模型"
+            required={defaultModelRequired}
+            hint={models.length === 0 ? "保存配置并刷新模型目录后可选" : "必须选择一个未下线的模型"}
+          >
+            <Select
+              id="llm-default-model"
+              value={defaultModelID}
+              disabled={models.length === 0}
+              onChange={(event) => setDefaultModelID(event.target.value)}
+            >
+              <option value="">请选择默认模型</option>
+              {models.map((model) => (
+                <option
+                  key={model.id}
+                  value={model.id}
+                  disabled={Boolean(model.deprecated) || model.status === "disabled"}
+                >
+                  {model.model}
+                  {model.deprecated ? "（已下线）" : ""}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+
+        <fieldset className="rounded-md border border-border px-3 py-2">
+          <legend className="px-1 text-xs font-medium text-foreground">
+            模型能力（来自模型目录）
+          </legend>
+          <div className="flex flex-wrap items-center gap-4 text-xs text-foreground">
+            {CAPABILITY_FIELDS.map((field) => (
+              <label key={field.key} htmlFor={field.id} className="flex items-center gap-2">
+                <input
+                  id={field.id}
+                  type="checkbox"
+                  checked={selectedCapabilities[field.key]}
+                  disabled
+                  readOnly
+                />
+                {field.label}
+              </label>
+            ))}
+            <span className="text-muted-foreground">
+              上下文窗口 {selectedModel ? selectedCapabilities.context_window : "—"}
+            </span>
+          </div>
+          {selectedModel === undefined ? (
+            <p className="mt-1 text-xs text-muted-foreground">选择默认模型后显示其能力。</p>
+          ) : null}
+        </fieldset>
 
         <Field
           id="llm-headers"
@@ -641,7 +822,7 @@ export function LLMSettings() {
                 </div>
                 <div className="text-right text-[10px] text-muted-foreground">
                   <p>更新于 {formatDateTime(config.updated_at)}</p>
-                  <p>协议 {config.protocol}</p>
+                  <p>协议 {protocolLabel(config.protocol)}</p>
                 </div>
               </header>
 
@@ -653,6 +834,21 @@ export function LLMSettings() {
                 <div>
                   <dt className="text-muted-foreground">最大重试</dt>
                   <dd className="font-mono text-foreground">{config.max_retries}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">思考模式</dt>
+                  <dd className="font-mono text-foreground">{config.thinking_type ?? "auto"}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">思考强度</dt>
+                  <dd className="font-mono text-foreground">{config.reasoning_effort ?? "none"}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">默认模型</dt>
+                  <dd className="text-foreground">
+                    {configModels.find((model) => model.id === config.default_model_id)?.model ??
+                      "未设置"}
+                  </dd>
                 </div>
                 <div>
                   <dt className="text-muted-foreground">模型数</dt>
@@ -746,37 +942,51 @@ export function LLMSettings() {
                     </p>
                   ) : (
                     <ul className="mt-2 divide-y divide-border rounded-lg border border-border">
-                      {configModels.map((model) => (
-                        <li
-                          key={model.id}
-                          data-testid={`llm-model-${model.id}`}
-                          className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
-                        >
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <code className="font-mono text-[11px] font-semibold text-foreground">
-                                {model.model}
-                              </code>
-                              <Badge tone={model.source === "manual" ? "info" : "neutral"}>
-                                {model.source === "manual" ? "手工" : "目录"}
-                              </Badge>
-                              {model.supports_tools ? <Badge tone="success">工具</Badge> : null}
-                              {model.supports_vision ? <Badge tone="success">视觉</Badge> : null}
-                            </div>
-                            <p className="mt-0.5 text-[10px] text-muted-foreground">
-                              上下文 {model.context_window} · 输出 {model.max_output}
-                            </p>
-                          </div>
-                          <Button
-                            variant="danger"
-                            size="sm"
-                            disabled={busy}
-                            onClick={() => void handleDeleteModel(config, model)}
+                      {configModels.map((model) => {
+                        const capabilities = modelCapabilities(model)
+                        return (
+                          <li
+                            key={model.id}
+                            data-testid={`llm-model-${model.id}`}
+                            className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
                           >
-                            删除模型
-                          </Button>
-                        </li>
-                      ))}
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <code className="font-mono text-[11px] font-semibold text-foreground">
+                                  {model.model}
+                                </code>
+                                <Badge tone={model.source === "manual" ? "info" : "neutral"}>
+                                  {model.source === "manual" ? "手工" : "目录"}
+                                </Badge>
+                                {model.deprecated ? <Badge tone="danger">已下线</Badge> : null}
+                                {capabilities.supports_tools ? (
+                                  <Badge tone="success">工具</Badge>
+                                ) : null}
+                                {capabilities.supports_vision ? (
+                                  <Badge tone="success">视觉</Badge>
+                                ) : null}
+                                {capabilities.supports_reasoning ? (
+                                  <Badge tone="success">推理</Badge>
+                                ) : null}
+                                {capabilities.supports_prompt_cache ? (
+                                  <Badge tone="success">提示缓存</Badge>
+                                ) : null}
+                              </div>
+                              <p className="mt-0.5 text-[10px] text-muted-foreground">
+                                上下文 {capabilities.context_window} · 输出 {model.max_output}
+                              </p>
+                            </div>
+                            <Button
+                              variant="danger"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => void handleDeleteModel(config, model)}
+                            >
+                              删除模型
+                            </Button>
+                          </li>
+                        )
+                      })}
                     </ul>
                   )}
                 </section>
@@ -790,6 +1000,11 @@ export function LLMSettings() {
         <ConfigFormDialog
           key={formState.mode === "edit" ? formState.config.id : "new"}
           config={formState.mode === "edit" ? formState.config : null}
+          models={
+            formState.mode === "edit"
+              ? models.filter((model) => model.config_id === formState.config.id)
+              : []
+          }
           onClose={() => setFormState(null)}
           onSaved={handleSaved}
         />

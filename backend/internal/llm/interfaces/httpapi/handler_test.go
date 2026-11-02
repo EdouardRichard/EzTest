@@ -340,7 +340,9 @@ func TestGetConfigValidatesPathAndMasksKey(t *testing.T) {
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid id status = %d", invalid.Code)
 	}
-	if calls := len(stub.calls); calls != 1 {
+	// The valid GET lists configs plus their catalog rows; an invalid path id
+	// must not reach the service at all.
+	if calls := len(stub.calls); calls != 2 {
 		t.Fatalf("service called for invalid id: %#v", stub.calls)
 	}
 
@@ -534,4 +536,226 @@ func TestListModelsReturnsAllModels(t *testing.T) {
 	if first["id"] != "201" || first["created_at"] != "2026-10-31T12:00:00Z" {
 		t.Fatalf("model = %#v", first)
 	}
+}
+
+// TestLLMConfigSettingsAPI pins the 0.2.1 settings surface added by Task 44:
+// protocol (canonical values, legacy passthrough), thinking_type,
+// reasoning_effort, default_model_id and the embedded models[] capability
+// flags. It also pins the typed 400s: unknown enums/protocols are rejected at
+// the HTTP boundary, and an invalid default model surfaces the service's typed
+// 400 unchanged.
+func TestLLMConfigSettingsAPI(t *testing.T) {
+	t.Run("exposes protocol thinking effort default model and capabilities", func(t *testing.T) {
+		handler, stub := newTestServer(t)
+		cfg := sampleConfig()
+		cfg.Protocol = string(llm.ProtocolOpenAIResponses)
+		cfg.ThinkingType = llm.ThinkingTypeEnabled
+		cfg.ReasoningEffort = llm.ReasoningEffortXHigh
+		cfg.DefaultModelID = 201
+		stub.config = cfg
+		stub.configs = []llm.Config{cfg}
+
+		active := sampleModel()
+		active.SupportsVision = false
+		active.Capabilities = llm.Capabilities{
+			SupportsTools:       true,
+			SupportsVision:      false,
+			SupportsReasoning:   true,
+			SupportsPromptCache: true,
+			ContextWindow:       64000,
+		}
+		deprecated := sampleModel()
+		deprecated.ID = 202
+		deprecated.Model = "gpt-4o-old"
+		deprecated.DisplayName = "gpt-4o-old"
+		deprecated.Deprecated = true
+		stub.models = []llm.Model{active, deprecated}
+
+		recorder := call(t, handler, http.MethodGet, "/api/admin/llm/configs/101", "", adminActor())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if strings.Contains(recorder.Body.String(), secretKey) || strings.Contains(recorder.Body.String(), `"api_key"`) {
+			t.Fatalf("response leaked the api key: %s", recorder.Body.String())
+		}
+
+		data := dataBody(t, recorder)
+		if data["protocol"] != string(llm.ProtocolOpenAIResponses) {
+			t.Fatalf("protocol = %#v", data["protocol"])
+		}
+		if data["thinking_type"] != llm.ThinkingTypeEnabled || data["reasoning_effort"] != llm.ReasoningEffortXHigh {
+			t.Fatalf("thinking settings = %#v/%#v", data["thinking_type"], data["reasoning_effort"])
+		}
+		if data["default_model_id"] != "201" {
+			t.Fatalf("default_model_id = %#v", data["default_model_id"])
+		}
+
+		models, ok := data["models"].([]any)
+		if !ok || len(models) != 2 {
+			t.Fatalf("models = %#v", data["models"])
+		}
+		first, _ := models[0].(map[string]any)
+		capabilities, ok := first["capabilities"].(map[string]any)
+		if !ok {
+			t.Fatalf("capabilities = %#v", first["capabilities"])
+		}
+		if capabilities["supports_tools"] != true ||
+			capabilities["supports_vision"] != false ||
+			capabilities["supports_reasoning"] != true ||
+			capabilities["supports_prompt_cache"] != true ||
+			capabilities["context_window"] != float64(64000) {
+			t.Fatalf("capabilities = %#v", capabilities)
+		}
+		if first["deprecated"] != false {
+			t.Fatalf("active model deprecated = %#v", first["deprecated"])
+		}
+		second, _ := models[1].(map[string]any)
+		if second["deprecated"] != true {
+			t.Fatalf("deprecated model flag = %#v", second["deprecated"])
+		}
+
+		listed := call(t, handler, http.MethodGet, "/api/admin/llm/configs", "", adminActor())
+		if listed.Code != http.StatusOK {
+			t.Fatalf("list status = %d, body = %s", listed.Code, listed.Body.String())
+		}
+		items := dataList(t, listed)
+		if len(items) != 1 {
+			t.Fatalf("configs = %#v", items)
+		}
+		item, _ := items[0].(map[string]any)
+		listedModels, _ := item["models"].([]any)
+		if item["thinking_type"] != llm.ThinkingTypeEnabled || len(listedModels) != 2 {
+			t.Fatalf("listed config = %#v", item)
+		}
+	})
+
+	t.Run("keeps legacy protocols visible", func(t *testing.T) {
+		handler, stub := newTestServer(t)
+		cfg := sampleConfig()
+		cfg.Protocol = llm.ProtocolOpenAICompatible
+		stub.config = cfg
+
+		recorder := call(t, handler, http.MethodGet, "/api/admin/llm/configs/101", "", adminActor())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		data := dataBody(t, recorder)
+		if data["protocol"] != llm.ProtocolOpenAICompatible {
+			t.Fatalf("legacy protocol was rewritten: %#v", data["protocol"])
+		}
+		// Fields written before the 0.2.1 columns existed read as schema defaults.
+		if data["thinking_type"] != llm.DefaultThinkingType || data["reasoning_effort"] != llm.DefaultReasoningEffort {
+			t.Fatalf("effective defaults = %#v/%#v", data["thinking_type"], data["reasoning_effort"])
+		}
+		if _, present := data["default_model_id"]; present {
+			t.Fatalf("unset default_model_id should be omitted: %#v", data["default_model_id"])
+		}
+	})
+
+	t.Run("create and update accept the new settings", func(t *testing.T) {
+		handler, stub := newTestServer(t)
+		cfg := sampleConfig()
+		cfg.Protocol = string(llm.ProtocolOpenAIResponses)
+		cfg.ThinkingType = llm.ThinkingTypeDisabled
+		cfg.ReasoningEffort = llm.ReasoningEffortLow
+		cfg.DefaultModelID = 201
+		stub.config = cfg
+
+		createBody := `{
+			"name": "Primary",
+			"base_url": "http://127.0.0.1:13334/v1",
+			"protocol": "openai_chat_completions",
+			"thinking_type": "disabled",
+			"reasoning_effort": "low",
+			"default_model_id": "201",
+			"status": "active"
+		}`
+		recorder := call(t, handler, http.MethodPost, "/api/admin/llm/configs", createBody, adminActor())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("create status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if stub.lastInput.Protocol == nil || *stub.lastInput.Protocol != string(llm.ProtocolOpenAIChatCompletions) {
+			t.Fatalf("protocol = %#v", stub.lastInput.Protocol)
+		}
+		if stub.lastInput.ThinkingType == nil || *stub.lastInput.ThinkingType != llm.ThinkingTypeDisabled {
+			t.Fatalf("thinking_type = %#v", stub.lastInput.ThinkingType)
+		}
+		if stub.lastInput.ReasoningEffort == nil || *stub.lastInput.ReasoningEffort != llm.ReasoningEffortLow {
+			t.Fatalf("reasoning_effort = %#v", stub.lastInput.ReasoningEffort)
+		}
+		if stub.lastInput.DefaultModelID == nil || *stub.lastInput.DefaultModelID != 201 {
+			t.Fatalf("default_model_id = %#v", stub.lastInput.DefaultModelID)
+		}
+		if data := dataBody(t, recorder); data["default_model_id"] != "201" || data["protocol"] != string(llm.ProtocolOpenAIResponses) {
+			t.Fatalf("create response = %#v", data)
+		}
+
+		updateBody := `{"thinking_type":"enabled","reasoning_effort":"max","default_model_id":"202"}`
+		update := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101", updateBody, adminActor())
+		if update.Code != http.StatusOK {
+			t.Fatalf("update status = %d, body = %s", update.Code, update.Body.String())
+		}
+		if stub.lastInput.ThinkingType == nil || *stub.lastInput.ThinkingType != llm.ThinkingTypeEnabled {
+			t.Fatalf("updated thinking_type = %#v", stub.lastInput.ThinkingType)
+		}
+		if stub.lastInput.ReasoningEffort == nil || *stub.lastInput.ReasoningEffort != llm.ReasoningEffortMax {
+			t.Fatalf("updated reasoning_effort = %#v", stub.lastInput.ReasoningEffort)
+		}
+		if stub.lastInput.DefaultModelID == nil || *stub.lastInput.DefaultModelID != 202 {
+			t.Fatalf("updated default_model_id = %#v", stub.lastInput.DefaultModelID)
+		}
+	})
+
+	t.Run("rejects invalid enums and protocols with a typed 400", func(t *testing.T) {
+		handler, stub := newTestServer(t)
+		cases := []struct {
+			name  string
+			body  string
+			field string
+		}{
+			{"thinking_type", `{"thinking_type":"sometimes"}`, "thinking_type"},
+			{"reasoning_effort", `{"reasoning_effort":"extreme"}`, "reasoning_effort"},
+			{"protocol", `{"protocol":"anthropic"}`, "protocol"},
+			{"default_model_id", `{"default_model_id":"not-an-id"}`, "default_model_id"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				stub.calls = nil
+				recorder := call(t, handler, http.MethodPost, "/api/admin/llm/configs", tc.body, adminActor())
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+				}
+				payload := decodeBody(t, recorder)
+				apiErr, _ := payload["error"].(map[string]any)
+				if apiErr["code"] != "invalid_argument" {
+					t.Fatalf("error = %#v", apiErr)
+				}
+				details, _ := apiErr["details"].(map[string]any)
+				if details["field"] != tc.field {
+					t.Fatalf("details = %#v", details)
+				}
+				if len(stub.calls) != 0 {
+					t.Fatalf("service called for invalid input: %#v", stub.calls)
+				}
+			})
+		}
+	})
+
+	t.Run("maps a missing default model to a typed 400", func(t *testing.T) {
+		handler, stub := newTestServer(t)
+		stub.err = platform.Invalid("default_model_id", "must reference a model of this LLM configuration")
+
+		recorder := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101", `{"default_model_id":"999"}`, adminActor())
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		payload := decodeBody(t, recorder)
+		apiErr, _ := payload["error"].(map[string]any)
+		if apiErr["code"] != "invalid_argument" {
+			t.Fatalf("error = %#v", apiErr)
+		}
+		if details, _ := apiErr["details"].(map[string]any); details["field"] != "default_model_id" {
+			t.Fatalf("error details = %#v", details)
+		}
+	})
 }

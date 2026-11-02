@@ -72,9 +72,25 @@ export function updateSetting(key: string, value: unknown): Promise<Setting> {
 
 // --- LLM configurations ----------------------------------------------------
 
-export type LLMProtocol = "openai" | "openai_compatible"
+/** Canonical 0.2.1 protocols plus the legacy P0 values kept readable. */
+export type LLMProtocol =
+  | "openai"
+  | "openai_compatible"
+  | "openai_chat_completions"
+  | "openai_responses"
 export type LLMStatus = "active" | "disabled"
 export type LLMModelSource = "catalog" | "manual"
+export type LLMThinkingType = "auto" | "enabled" | "disabled"
+export type LLMReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max"
+
+/** Merged capability set returned for a model (`llm.Model.Capabilities`). */
+export type LLMModelCapabilities = {
+  supports_tools: boolean
+  supports_vision: boolean
+  supports_reasoning: boolean
+  supports_prompt_cache: boolean
+  context_window: number
+}
 
 export type LLMConfig = {
   id: string
@@ -88,6 +104,13 @@ export type LLMConfig = {
   max_retries: number
   is_default: boolean
   status: LLMStatus
+  /** Effective values: rows written before 0.2.1 read as auto/none. */
+  thinking_type?: LLMThinkingType
+  reasoning_effort?: LLMReasoningEffort
+  /** Decimal `llm_model.id`; omitted when the config has no default model. */
+  default_model_id?: string
+  /** Embedded catalog rows (0.2.1 config DTO); the standalone list still exists. */
+  models?: LLMModel[]
   created_by?: string
   created_at: string
   updated_at: string
@@ -102,6 +125,10 @@ export type LLMModel = {
   max_output: number
   supports_tools: boolean
   supports_vision: boolean
+  /** 0.2.1 capability set; optional for older/partial payloads. */
+  capabilities?: LLMModelCapabilities
+  /** Deprecated catalog rows stay visible but are not selectable. */
+  deprecated?: boolean
   source: LLMModelSource
   status: LLMStatus
   created_at: string
@@ -134,6 +161,9 @@ export type LLMConfigInput = {
   max_retries?: number
   is_default?: boolean
   status?: LLMStatus
+  thinking_type?: LLMThinkingType
+  reasoning_effort?: LLMReasoningEffort
+  default_model_id?: string
 }
 
 export type AddLLMModelInput = {

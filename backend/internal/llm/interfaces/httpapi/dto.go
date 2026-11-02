@@ -2,33 +2,42 @@ package llmapi
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // configRequest is the create/update payload. Pointer fields distinguish
 // "omitted" (keep/default) from an explicit zero value. api_key is write-only:
-// it is accepted but never echoed back.
+// it is accepted but never echoed back. default_model_id is a decimal ID string
+// to match the IDs used by every response; the empty string clears it.
 type configRequest struct {
-	Name           *string            `json:"name"`
-	Provider       *string            `json:"provider"`
-	Protocol       *string            `json:"protocol"`
-	BaseURL        *string            `json:"base_url"`
-	APIKey         *string            `json:"api_key"`
-	Headers        *map[string]string `json:"headers"`
-	TimeoutSeconds *int               `json:"timeout_seconds"`
-	MaxRetries     *int               `json:"max_retries"`
-	IsDefault      *bool              `json:"is_default"`
-	Status         *string            `json:"status"`
+	Name            *string            `json:"name"`
+	Provider        *string            `json:"provider"`
+	Protocol        *string            `json:"protocol"`
+	BaseURL         *string            `json:"base_url"`
+	APIKey          *string            `json:"api_key"`
+	Headers         *map[string]string `json:"headers"`
+	TimeoutSeconds  *int               `json:"timeout_seconds"`
+	MaxRetries      *int               `json:"max_retries"`
+	IsDefault       *bool              `json:"is_default"`
+	Status          *string            `json:"status"`
+	ThinkingType    *string            `json:"thinking_type"`
+	ReasoningEffort *string            `json:"reasoning_effort"`
+	DefaultModelID  *string            `json:"default_model_id"`
 }
 
-func (r configRequest) input() llmapp.ConfigInput {
-	return llmapp.ConfigInput{
+// input validates the 0.2.1 enums at the HTTP boundary (so unknown values are a
+// typed 400 even before the service runs) and maps the payload onto ConfigInput.
+// The cross-row rule that default_model_id must name an active model of the
+// config stays in the application service, which owns the repository.
+func (r configRequest) input() (llmapp.ConfigInput, error) {
+	input := llmapp.ConfigInput{
 		Name:           r.Name,
 		Provider:       r.Provider,
-		Protocol:       r.Protocol,
 		BaseURL:        r.BaseURL,
 		APIKey:         r.APIKey,
 		Headers:        r.Headers,
@@ -37,44 +46,108 @@ func (r configRequest) input() llmapp.ConfigInput {
 		IsDefault:      r.IsDefault,
 		Status:         r.Status,
 	}
+	if r.Protocol != nil {
+		protocol := strings.TrimSpace(*r.Protocol)
+		if !llm.ValidProtocol(protocol) {
+			return llmapp.ConfigInput{}, platform.Invalid("protocol",
+				"must be one of openai_chat_completions, openai_responses (legacy openai/openai_compatible accepted)")
+		}
+		input.Protocol = &protocol
+	}
+	if r.ThinkingType != nil {
+		thinking := strings.TrimSpace(*r.ThinkingType)
+		if !llm.ValidThinkingType(thinking) {
+			return llmapp.ConfigInput{}, platform.Invalid("thinking_type", "must be one of auto, enabled, disabled")
+		}
+		input.ThinkingType = &thinking
+	}
+	if r.ReasoningEffort != nil {
+		effort := strings.TrimSpace(*r.ReasoningEffort)
+		if !llm.ValidReasoningEffort(effort) {
+			return llmapp.ConfigInput{}, platform.Invalid("reasoning_effort",
+				"must be one of none, low, medium, high, xhigh, max")
+		}
+		input.ReasoningEffort = &effort
+	}
+	if r.DefaultModelID != nil {
+		value, err := parseDefaultModelID(*r.DefaultModelID)
+		if err != nil {
+			return llmapp.ConfigInput{}, err
+		}
+		input.DefaultModelID = &value
+	}
+	return input, nil
+}
+
+// parseDefaultModelID accepts the decimal ID string used by responses and maps
+// the empty string to 0 ("not configured"). Negative and non-numeric values are
+// a typed 400 so a malformed client cannot reach the repository.
+func parseDefaultModelID(raw string) (int64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil || value < 0 {
+		return 0, platform.Invalid("default_model_id", "must be a non-negative decimal model ID")
+	}
+	return value, nil
 }
 
 type configDTO struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Provider       string            `json:"provider"`
-	Protocol       string            `json:"protocol"`
-	BaseURL        string            `json:"base_url"`
-	APIKeySet      bool              `json:"api_key_set"`
-	Headers        map[string]string `json:"headers"`
-	TimeoutSeconds int               `json:"timeout_seconds"`
-	MaxRetries     int               `json:"max_retries"`
-	IsDefault      bool              `json:"is_default"`
-	Status         string            `json:"status"`
-	CreatedBy      string            `json:"created_by,omitempty"`
-	CreatedAt      string            `json:"created_at"`
-	UpdatedAt      string            `json:"updated_at"`
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Provider        string            `json:"provider"`
+	Protocol        string            `json:"protocol"`
+	BaseURL         string            `json:"base_url"`
+	APIKeySet       bool              `json:"api_key_set"`
+	Headers         map[string]string `json:"headers"`
+	TimeoutSeconds  int               `json:"timeout_seconds"`
+	MaxRetries      int               `json:"max_retries"`
+	IsDefault       bool              `json:"is_default"`
+	Status          string            `json:"status"`
+	ThinkingType    string            `json:"thinking_type"`
+	ReasoningEffort string            `json:"reasoning_effort"`
+	DefaultModelID  string            `json:"default_model_id,omitempty"`
+	Models          []modelDTO        `json:"models"`
+	CreatedBy       string            `json:"created_by,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+	UpdatedAt       string            `json:"updated_at"`
 }
 
-func toConfigDTO(cfg llm.Config) configDTO {
+// toConfigDTO maps one config plus its catalog rows. Protocol is the stored
+// value: canonical values round-trip unchanged and legacy P0 values
+// (openai/openai_compatible) stay visible so the admin UI can label them
+// "OpenAI 兼容" instead of hiding existing configurations.
+func toConfigDTO(cfg llm.Config, models []llm.Model) configDTO {
 	headers := cfg.Headers
 	if headers == nil {
 		headers = map[string]string{}
 	}
+	items := make([]modelDTO, 0, len(models))
+	for _, model := range models {
+		items = append(items, toModelDTO(model))
+	}
 	dto := configDTO{
-		ID:             strconv.FormatInt(cfg.ID, 10),
-		Name:           cfg.Name,
-		Provider:       cfg.Provider,
-		Protocol:       cfg.Protocol,
-		BaseURL:        cfg.BaseURL,
-		APIKeySet:      cfg.APIKeySet(),
-		Headers:        headers,
-		TimeoutSeconds: cfg.TimeoutSeconds,
-		MaxRetries:     cfg.MaxRetries,
-		IsDefault:      cfg.IsDefault,
-		Status:         cfg.Status,
-		CreatedAt:      formatTime(cfg.CreatedAt),
-		UpdatedAt:      formatTime(cfg.UpdatedAt),
+		ID:              strconv.FormatInt(cfg.ID, 10),
+		Name:            cfg.Name,
+		Provider:        cfg.Provider,
+		Protocol:        cfg.Protocol,
+		BaseURL:         cfg.BaseURL,
+		APIKeySet:       cfg.APIKeySet(),
+		Headers:         headers,
+		TimeoutSeconds:  cfg.TimeoutSeconds,
+		MaxRetries:      cfg.MaxRetries,
+		IsDefault:       cfg.IsDefault,
+		Status:          cfg.Status,
+		ThinkingType:    cfg.EffectiveThinkingType(),
+		ReasoningEffort: cfg.EffectiveReasoningEffort(),
+		Models:          items,
+		CreatedAt:       formatTime(cfg.CreatedAt),
+		UpdatedAt:       formatTime(cfg.UpdatedAt),
+	}
+	if cfg.DefaultModelID > 0 {
+		dto.DefaultModelID = strconv.FormatInt(cfg.DefaultModelID, 10)
 	}
 	if cfg.CreatedBy != nil {
 		dto.CreatedBy = strconv.FormatInt(*cfg.CreatedBy, 10)
@@ -83,18 +156,20 @@ func toConfigDTO(cfg llm.Config) configDTO {
 }
 
 type modelDTO struct {
-	ID             string `json:"id"`
-	ConfigID       string `json:"config_id"`
-	Model          string `json:"model"`
-	DisplayName    string `json:"display_name"`
-	ContextWindow  int    `json:"context_window"`
-	MaxOutput      int    `json:"max_output"`
-	SupportsTools  bool   `json:"supports_tools"`
-	SupportsVision bool   `json:"supports_vision"`
-	Source         string `json:"source"`
-	Status         string `json:"status"`
-	CreatedAt      string `json:"created_at"`
-	UpdatedAt      string `json:"updated_at"`
+	ID             string           `json:"id"`
+	ConfigID       string           `json:"config_id"`
+	Model          string           `json:"model"`
+	DisplayName    string           `json:"display_name"`
+	ContextWindow  int              `json:"context_window"`
+	MaxOutput      int              `json:"max_output"`
+	SupportsTools  bool             `json:"supports_tools"`
+	SupportsVision bool             `json:"supports_vision"`
+	Capabilities   llm.Capabilities `json:"capabilities"`
+	Deprecated     bool             `json:"deprecated"`
+	Source         string           `json:"source"`
+	Status         string           `json:"status"`
+	CreatedAt      string           `json:"created_at"`
+	UpdatedAt      string           `json:"updated_at"`
 }
 
 func toModelDTO(model llm.Model) modelDTO {
@@ -107,6 +182,8 @@ func toModelDTO(model llm.Model) modelDTO {
 		MaxOutput:      model.MaxOutput,
 		SupportsTools:  model.SupportsTools,
 		SupportsVision: model.SupportsVision,
+		Capabilities:   model.EffectiveCapabilities(),
+		Deprecated:     model.Deprecated,
 		Source:         model.Source,
 		Status:         model.Status,
 		CreatedAt:      formatTime(model.CreatedAt),

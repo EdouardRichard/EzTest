@@ -50,9 +50,18 @@ func (h *Handler) ListConfigs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	models, err := h.svc.ListModels(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	byConfig := make(map[int64][]llm.Model, len(configs))
+	for _, model := range models {
+		byConfig[model.ConfigID] = append(byConfig[model.ConfigID], model)
+	}
 	items := make([]configDTO, 0, len(configs))
 	for _, cfg := range configs {
-		items = append(items, toConfigDTO(cfg))
+		items = append(items, toConfigDTO(cfg, byConfig[cfg.ID]))
 	}
 	httpx.List(w, http.StatusOK, items, "", false)
 }
@@ -68,12 +77,17 @@ func (h *Handler) CreateConfig(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	cfg, err := h.svc.CreateConfig(r.Context(), request.input(), actorID)
+	input, err := request.input()
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg))
+	cfg, err := h.svc.CreateConfig(r.Context(), input, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	h.writeConfig(w, r, cfg)
 }
 
 // GetConfig GET /api/admin/llm/configs/{id}.
@@ -88,7 +102,7 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg))
+	h.writeConfig(w, r, cfg)
 }
 
 // UpdateConfig PATCH /api/admin/llm/configs/{id}.
@@ -107,12 +121,34 @@ func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	cfg, err := h.svc.UpdateConfig(r.Context(), id, request.input(), actorID)
+	input, err := request.input()
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg))
+	cfg, err := h.svc.UpdateConfig(r.Context(), id, input, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	h.writeConfig(w, r, cfg)
+}
+
+// writeConfig renders one config with its catalog rows. Model listing failures
+// are surfaced as the same typed error the list endpoints use.
+func (h *Handler) writeConfig(w http.ResponseWriter, r *http.Request, cfg llm.Config) {
+	models, err := h.svc.ListModels(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	owned := make([]llm.Model, 0, len(models))
+	for _, model := range models {
+		if model.ConfigID == cfg.ID {
+			owned = append(owned, model)
+		}
+	}
+	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg, owned))
 }
 
 // DeleteConfig DELETE /api/admin/llm/configs/{id}.
