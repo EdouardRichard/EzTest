@@ -1,9 +1,9 @@
 # Phase 08 Handoff — P8 硬化与验收
 
-> 状态：**completed（用户 2026-11-02 选择 B：批准 L16–L18 豁免并发布 v0.2；S9 长执行按 partial 记录；之后回到 A 继续补 S9）**
-> 已通过：契约冻结、S0–S6 全旅程（3 轮澄清）、S8、S9 长上下文（pinned 未触发）、S10 版本/限流/保留、S11、S12、S13、P7 回归。
-> 已批准 partial：S9 长执行未覆盖 12 例/2 波、`/p8/large`、checkpoint/head+ref；pinned facts 未触发；resilience teardown 未干净退出（L16–L18，D6）。
-> 用户批准的 SLO/安全审计/fake-LLM/性能/Docker 偏离已记录。
+> 状态：**completed（严格 A 补跑完成；用户先按 B 发布 v0.2 的分支保留在 `main`/`dev`）**
+> 已通过：契约冻结、S0–S6 全旅程（3 轮澄清）、S8、S9 长上下文（pinned facts=4 且 packet 保留）、S10 版本/限流/保留、S10 长执行 12 用例/2 波/暂停-检查点/`/p8/large` head+ref/无重复步骤、S11、S12、S13、P7 回归。
+> S9/S10 严格 run：`p8-resilience -Scenarios S9,S10` **exit 0**，12/12 用例 passed，无 P3 fallback，teardown 干净退出。
+> 早先 B 豁免的 L16–L18 已由本次严格 run 关闭；用户批准的 SLO/安全审计/fake-LLM/性能/Docker 偏离仍记录。
 > 日期：2026-11-02
 > 阶段：P8（`docs/version-V0.2/phases/phase-08-hardening-acceptance.md`）
 > 实施分支：`feat/v0.2-p8`（从 `feat/v0.2` @`e2cf110` 拉出）→ 合回 `feat/v0.2`
@@ -52,10 +52,11 @@
 
 ### 3.1 最终测试
 
-- `scripts/test.ps1`：**exit 0**（直接运行；`.tmp/p8-tests/direct-test.log`）。Go unit + integration 全 PASS；frontend lint/typecheck 0；Vitest 105 files / 808 tests PASS。
+- `scripts/test.ps1`：**exit 0**（最终 A 树；`.tmp/p8-tests/final-test-A.log`）。Go unit + integration 全 PASS；frontend lint/typecheck 0；Vitest 105 files / 808 tests PASS。
+- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/p8-resilience.ps1 -Scenarios @('S9','S10') -SkipDatabaseReset`：**RESULT: PASS，exit 0**（483.2s；`.tmp/p8-resilience/final-full-console.log`）。
 - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/p7-acceptance.ps1`：**P7 ACCEPTANCE PASSED**（124s；`.tmp/p8-tests/p7-regression3.log`），P7 脚本已做 P8 前向兼容（settings≥83、migrations≥40）。
 - `node scripts/p8-contract-check.cjs`：OK。
-- `scripts/p8-static-check.ps1`：**18/18 PASS**（`acceptance/p8/static.md`）。
+- `scripts/p8-static-check.ps1`：**18/18 PASS**（本地开发静态门；hosted CI 为 tests-only）。
 
 ### 3.2 真实 P8 验收
 
@@ -63,9 +64,9 @@
 |---|---|---|
 | S0–S6 全旅程（真实 DeepSeek + Chrome，双 SUT，3 轮澄清） | **PASS**；S0 16/16、S1 38/38、S2 13/13、S3 27/27、S4 25/25、S5 29/29、S6 32/32，620s | [acceptance.md](../acceptance/p8/acceptance.md)、`.tmp/p8-acceptance-run/full18-console.log` |
 | S8 多副本（双 API/共享 DB/SSE/drain/leader/roll/kill-9/真实 executor loss） | **PASS**；72 PASS / 0 FAIL / 1 SKIP | [multi.md](../acceptance/p8/multi.md)、`.tmp/p8-multi/` |
-| S9 长上下文（30 消息、window 8000） | **PASS（pinned 未触发）**；4 summary、4 `context.compacted`、packet 含摘要；最终 run `pinned_facts=0`，不宣称已验证 pinned 保留（L16） | [resilience.md](../acceptance/p8/resilience.md)、`.tmp/p8-resilience/` |
+| S9 长上下文（30 消息、window 8000） | **PASS**；2 summary、4 `context.compacted`、`pinned_facts=4` 且 packet 含摘要与 pinned fact；run `done`，无 overflow | [resilience.md](../acceptance/p8/resilience.md)、`.tmp/p8-resilience/final-full-console.log` |
 | S10 版本/就绪/限流/保留 | **PASS**；限流 38×429 + Retry-After + 恢复；旧行删除/新行保留/`retention.cleanup` | 同上 |
-| S10 长执行（12 例尝试 → P3 fallback） | **PARTIAL**；真实 design 未产出 12 例，P3 fallback 16/16 场景但只有 6 个执行用例；`/p8/large`、checkpoint、12 例/2 波未覆盖（L17）；脚本 teardown 挂起（L18） | 同上 |
+| S10 长执行（12 用例/2 波/暂停-检查点/大结果） | **PASS**；12/12 passed，2 waves，暂停时 2 个在飞 run 带 `paused_at`，恢复后无重复步骤；2 个 `/p8/large` 用例通过 head+ref 断言；无 P3 fallback，exit 0 | 同上 |
 | S11 37 行能力矩阵 | **PASS**；28 PASS / 9 PASS(prior) / 0 FAIL | [capability-signoff.md](../acceptance/p8/capability-signoff.md)、`.tmp/p8-capability/` |
 | S12 浏览器 E2E | **PASS**；11 passed / 0 skipped，44 张截图（报告下载与版本重开均已真实执行） | [e2e.md](../acceptance/p8/e2e.md)、`acceptance/p8/screenshots/` |
 | S13 静态门 | **PASS**；18/18 | [static.md](../acceptance/p8/static.md) |
@@ -95,8 +96,8 @@
 
 见 [known-limitations.md](../acceptance/p8/known-limitations.md)：
 
-- D1 SLO 不测；D2 安全审计不做；D3 fake-LLM 回归不做；D4 性能基准不做；D5 Docker 不实跑（静态校验）；**D6 L16–L18 经用户选择 B 批准豁免，v0.2 以 partial S9 长执行发布，之后回到 A 补齐。**
-- L11 Curator 重复 draft（3 轮验收未触发但未修产品）；L12 视觉 inconclusive 无 P8 waiver；L13 close 重试上限；L14 真实 LLM 自由文本步骤；L15 一次性 DB 缺 code repo/报告对象；L16 pinned facts 为 0；L17 长执行 12 例/2 波未覆盖；L18 resilience teardown 挂起。**L16–L18 已经用户 2026-11-02 选择 B 批准豁免（D6），发布后回到 A 继续补。**
+- D1 SLO 不测；D2 安全审计不做；D3 fake-LLM 回归不做；D4 性能基准不做；D5 Docker 不实跑（静态校验）；**D6 是发布时的临时 B 豁免（L16–L18），已由本次严格 A run 关闭，不再是当前限制。**
+- L11 Curator 重复 draft（3 轮验收未触发但未修产品）；L12 视觉 inconclusive 无 P8 waiver；L13 close 重试上限；L14 真实 LLM 自由文本步骤；L15 一次性 DB 缺 code repo/报告对象。**L16–L18（pinned=0、12 例/2 波未覆盖、teardown 挂起）已关闭：本次严格 run pinned=4、12/12 passed、exit 0。**
 - 多副本限流仍为实例级，文档写明总速率=副本数×限额。
 - Docker Compose 仅静态校验，不宣称运行。
 

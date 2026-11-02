@@ -1,47 +1,42 @@
 # EzTest 0.2 P8 resilience / long-run acceptance (S9–S10)
 
-- Date: 2026-11-02 06:31:46 +08:00
-- **Result: S9 long-context PASS; S9 long-execution PARTIAL; S10 PASS. Script exit code: not captured (teardown hang).**
-- Branch: `feat/v0.2-p8`
-- Database: `eztest_v02_p8`, cloned from `eztest_v02_p7`
+- Date: 2026-11-02 12:40:57 +08:00
+- **Result: S9 PASS; S10 PASS; script exit code 0.** No P3 fallback; real-design path completed.
+- Branch: `feat/v0.2` (strict A follow-up)
+- Database: `eztest_v02_p8` (reused acceptance DB, `-SkipDatabaseReset`)
 - API: `http://127.0.0.1:13333`; renderer 13337; executors 13345/13346
 - Fixtures: orders 14080, payments 14081
 - LLM: real DeepSeek configuration from `.env`; real Chrome 156.0.8078.73
-- Command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/p8-resilience.ps1`
-- Evidence: `.tmp/p8-resilience/`, console log `.tmp/p8-acceptance-run/resilience5-console.log`
+- Command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& scripts/p8-resilience.ps1 -Scenarios @('S9','S10') -SkipDatabaseReset"`
+- Evidence: `.tmp/p8-resilience/`, console log `.tmp/p8-resilience/final-full-console.log`
 
 ## Results
 
 | Scenario | Result | Duration | Evidence |
 |---|---|---|---|
-| S9 long context (30 messages, window 8000) | PASS | 9s | 4 rolling summaries, 4 `context.compacted` events, context packet contains the summary; latest **completed** run `done`, no `context_overflow`; final run had `pinned_facts=0`, so pinned-fact preservation is **not proven** |
+| S9 long context (30 messages + pin, window 8000) | PASS | 23s | 30 user messages, 2 rolling summaries, 4 `context.compacted`, `pinned_facts=4`, packet contains summary and the pinned `P8-S9-REGION` fact, latest run `done`, no `context_overflow` |
 | S10 version/readiness | PASS | 0s | `/api/health` = `0.2.0-p8`; readiness has `inflight_requests`/`inflight_work` |
 | S10 rate limit (30/min, 40 requests) | PASS | 3s | 2 accepted, 38× HTTP 429, `Retry-After: 2`, restored to 0 |
 | S10 retention (event + audit) | PASS | 5s | old rows deleted, recent rows retained, `retention.cleanup` audit metadata `1|1|<cutoff>` |
-| S10 long execution (12-case attempt → P3 fallback) | **PARTIAL** | 389s | P3 acceptance: 16/16 scenarios PASS, 0 fail; only **6 execution cases**, one wave-level scenario. Spec's 12 cases/2 waves, `/p8/large?bytes=20000` head+ref, checkpoint resume are NOT covered |
-
-The script's PowerShell process hung in teardown after the P3 fallback and did not print
-its own summary or exit code; every scenario result above was already written to the
-console and `.tmp/p8-resilience/` before teardown. The process was stopped after collecting
-the evidence. This teardown hang is a script issue (L18) and means this document cannot
-claim an exit-0 script PASS.
+| S10 long execution (12 cases / 2 waves) | PASS | 445s | Real design graph produced 10 UI + 2 `P8-LARGE` cases; 12/12 runs `passed`; wave1 ≠ wave2; no P3 fallback; exit 0 |
+| S10 pause/checkpoint | PASS | — | Wave paused while 2 case runs were in flight (`paused_at` set), resumed to running, then completed with no duplicate step results |
+| S10 `/p8/large` head+ref | PASS | — | `P8-LARGE-11` asserts HTTP 200 + marker; `P8-LARGE-12` asserts `truncated=true`, `head`, and non-empty `content_ref`; step summary records both |
 
 ## Notes
 
-- The "12-case real-design" attempt could not start: the cloned P7 data has no
-  orders fixture binding in an idle version. The script fell back to
-  `scripts/p3-acceptance.ps1`, whose S2–S5 cover seeded cases, a wave, single-SUT
-  and cross-SUT execution; it passed 16/16 scenarios in 389s, but this is not the
-  spec's 12 deterministic cases / 2 waves and must not be counted as that PASS.
-- The startup retention pass now waits for the leader gate instead of being lost
-  when the restarted API starts as follower.
-- Rate-limit restore succeeded immediately after the internal-control-plane
-  bypass fix; before the fix, executor heartbeats starved the bucket.
-- Long-context runs are intentionally allowed to remain queued after compaction;
-  S9 asserts the compaction and packet evidence, not that all 30 chat turns are
-  drained. This avoids a 15-minute wait and is not a product gap.
+- The long-execution design prompt requires executable English actions. The first
+  10 cases target `/p3/orders/1`; the last 2 are dedicated `P8-LARGE` HTTP cases.
+- Confirmation can create new current case versions; the script re-resolves case
+  version ids after both batches before creating intents.
+- The pause probe waits for a running case, pauses immediately, requires at least
+  one `case_run.paused_at`, and resumes; the resumed wave completes without
+  duplicate `(case_run_id, seq)` step results.
+- The previous P3 fallback and teardown hang are no longer used on this path; the
+  strict run is exit-0.
+- Rate-limit restore and retention startup were already fixed in P8; they remain
+  covered here.
 
 ## Related limitations
 
-See `known-limitations.md` for the user-approved SLO and security-audit waivers
-and the visual-inconclusive closure limitation.
+See `known-limitations.md`. The former L16–L18 gaps are closed by this run; the
+remaining limitations are unrelated to S9/S10 (L11–L15).

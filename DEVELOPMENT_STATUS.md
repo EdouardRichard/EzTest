@@ -1,6 +1,6 @@
 # EzTest 开发状态（0.2 / P8）
 
-> 状态：**P8 已按用户选择 B 签核发布（S9 长执行 partial，L16–L18 已豁免）；之后回到 A 继续补 S9**（2026-11-02，`feat/v0.2-p8` 已合回 `feat/v0.2`，merge `f5c5801` + 后续修复）。
+> 状态：**P8 已严格签核完成（S9/S10 补跑 PASS；L16–L18 已关闭）**（2026-11-02；发布分支 `main`/`dev` 保留 B 时点，当前 `feat/v0.2` 继续 A 补强）。
 > 产品定位：AI 驱动、半自主、端到端测试系统；0.2 为完整替代版（0.1 P0–P8 全功能对齐 + P9 五项）。
 > 设计权威：[docs/version-V0.2/README.md](docs/version-V0.2/README.md) 与
 > [docs/version-V0.2/contracts/README.md](docs/version-V0.2/contracts/README.md)。
@@ -8,11 +8,10 @@
 
 ## 0. 验证状态（先读）
 
-- **P8 已按 B 签核发布**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
+- **P8 已严格签核完成**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
   全旅程 S0–S6（620s，3 轮澄清）、S10、多副本 S8（72 PASS/0 FAIL）、37 行能力矩阵
   （28 PASS/9 PASS(prior)/0 FAIL）、浏览器 E2E（11 passed/0 skipped，44 张截图）、静态门 18/18 均通过。
-  用户 2026-11-02 选择 B：**批准 L16–L18 豁免**（S9 长执行 P3 fallback 6 例、pinned facts 未触发、
-  resilience teardown 未干净退出），先发布 v0.2，之后回到 A 严格补 S9。证据与限制见
+  **A 补跑 S9/S10：exit 0，S9 `pinned_facts=4` 且 packet 保留，S10 12 用例/2 波/暂停-检查点/`/p8/large` head+ref/无重复步骤，12/12 passed；L16–L18 已关闭。** 证据与限制见
   [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
 - **已记录证据**：P6（`acceptance/p6/`，真实 LLM + 真实 Chrome，S0–S9 PASS，9 张截图）与 P7
   （`acceptance/p7/`，13/13 场景、156 checks、21 张 E2E 截图，覆盖 P9 五项）。

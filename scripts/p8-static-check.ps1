@@ -445,7 +445,12 @@ function Check-CiWorkflow {
 
     $staticBlock = Get-CiJobBlock -Lines $lines -JobName 'static-acceptance'
     if ($null -eq $staticBlock) {
-        $problems.Add('the static-acceptance job is missing')
+        # The public main tree intentionally excludes docs/contracts, so the
+        # development static gate is local-only. Accept the explicitly
+        # documented tests-only CI shape, but never silently drop the gate.
+        if ($text -notmatch '(?i)static acceptance gate' -or $text -notmatch '(?i)not a[\s#]+hosted CI job') {
+            $problems.Add('the static-acceptance job is missing (and tests-only CI is not documented)')
+        }
     } else {
         if ($staticBlock -notmatch 'scripts/p8-static-check\.ps1') {
             $problems.Add('static-acceptance does not run scripts/p8-static-check.ps1')
@@ -480,7 +485,11 @@ function Check-CiWorkflow {
         Write-Fail $name ($relative + ': ' + ($problems -join '; '))
         return
     }
-    Write-Pass $name 'Ubuntu test job kept; static-acceptance runs scripts/p8-static-check.ps1; no 0.1 gate/env references'
+    if ($null -eq $staticBlock) {
+        Write-Pass $name 'Ubuntu test job kept; tests-only CI documents the local-only static gate; no 0.1 gate/env references'
+    } else {
+        Write-Pass $name 'Ubuntu test job kept; static-acceptance runs scripts/p8-static-check.ps1; no 0.1 gate/env references'
+    }
 }
 
 function Check-P8Scripts {
