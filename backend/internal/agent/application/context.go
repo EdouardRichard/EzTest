@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
@@ -61,12 +62,10 @@ type VersionPack struct {
 }
 
 // Message is one conversation message supplied to the context builder and the
-// summarizer.
-type Message struct {
-	ID      int64
-	Role    string
-	Content string
-}
+// summarizer. The cache-first assembler in the context subpackage renders the
+// same message shape, so both context paths share one type (including the tool
+// call identity used by appended tool results).
+type Message = agentcontext.Message
 
 // ConversationContext is the session memory: rolling summary, pinned facts and
 // the recent window kept verbatim.
