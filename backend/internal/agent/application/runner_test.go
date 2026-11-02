@@ -14,28 +14,30 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 )
 
 var runnerClockStart = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
 type runnerFixture struct {
-	runner         *agentapp.Runner
-	repo           *fakeRuntimeRepo
-	chat           *scriptedChat
-	conv           *fakeConversationPort
-	versions       *fakeVersionReader
-	attachments    *fakeAttachmentReader
-	team           *fakeTeamRoomPort
-	content        *fakeContentWriter
-	settings       *fakeSettings
-	clock          *manualClock
-	events         *fakePublisher
-	audit          *fakeAuditRecorder
-	requirement    *fakeRequirementPort
-	design         *fakeDesignPort
-	knowledge      *fakeKnowledgeReader
-	knowledgeUsage *fakeKnowledgeUsageRecorder
+	runner          *agentapp.Runner
+	repo            *fakeRuntimeRepo
+	chat            *scriptedChat
+	conv            *fakeConversationPort
+	versions        *fakeVersionReader
+	attachments     *fakeAttachmentReader
+	team            *fakeTeamRoomPort
+	content         *fakeContentWriter
+	settings        *fakeSettings
+	clock           *manualClock
+	events          *fakePublisher
+	audit           *fakeAuditRecorder
+	requirement     *fakeRequirementPort
+	design          *fakeDesignPort
+	knowledge       *fakeKnowledgeReader
+	knowledgeUsage  *fakeKnowledgeUsageRecorder
 	knowledgeWriter *fakeKnowledgeWriter
+	load            *load.Counter
 }
 
 func newRunnerFixture(t *testing.T) *runnerFixture {
@@ -82,28 +84,30 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 			updated: tools.RequirementSummary{ID: 501, CurrentVersionID: 701, Revision: 2, Status: "draft", Title: "登录功能"},
 			detail:  tools.RequirementDetail{RequirementSummary: tools.RequirementSummary{ID: 501, Status: "draft"}},
 		},
-		design: &fakeDesignPort{},
-		knowledge:      &fakeKnowledgeReader{},
-		knowledgeUsage: &fakeKnowledgeUsageRecorder{},
+		design:          &fakeDesignPort{},
+		knowledge:       &fakeKnowledgeReader{},
+		knowledgeUsage:  &fakeKnowledgeUsageRecorder{},
 		knowledgeWriter: &fakeKnowledgeWriter{},
+		load:            &load.Counter{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
-		Runtime:      repo,
-		Chat:         fixture.chat,
-		Settings:     fixture.settings,
-		Clock:        fixture.clock,
-		IDs:          &seqIDGenerator{},
-		Events:       fixture.events,
-		Audit:        fixture.audit,
-		Conversation: fixture.conv,
-		Versions:     fixture.versions,
-		Attachments:  fixture.attachments,
-		TeamRoom:     fixture.team,
-		Content:      fixture.content,
+		Runtime:        repo,
+		Chat:           fixture.chat,
+		Settings:       fixture.settings,
+		Clock:          fixture.clock,
+		IDs:            &seqIDGenerator{},
+		Events:         fixture.events,
+		Audit:          fixture.audit,
+		Conversation:   fixture.conv,
+		Versions:       fixture.versions,
+		Attachments:    fixture.attachments,
+		TeamRoom:       fixture.team,
+		Content:        fixture.content,
 		Knowledge:      fixture.knowledge,
 		KnowledgeUsage: fixture.knowledgeUsage,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		TaskProvider: taskProvider,
+		Load:           fixture.load,
+		TaskProvider:   taskProvider,
 		ToolDeps: tools.Deps{
 			Requirement: fixture.requirement,
 			Attachment:  &fakeAttachmentPort{},
@@ -739,5 +743,24 @@ func TestProfileKeyForWorkType(t *testing.T) {
 	// work type must still not map to a P1/P2 profile.
 	if _, ok := agentapp.ProfileKeyForWorkType("report.render_pdf"); ok {
 		t.Fatal("P4+ work type must not map to a P1/P2 profile")
+	}
+}
+
+func TestRunnerTracksLoadDuringRun(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "请补充登录方式与验收标准？"}}
+	observed := -1
+	fixture.chat.onChat = func(int, llmapp.ChatRequest) {
+		observed = fixture.load.Value()
+	}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if observed != 1 {
+		t.Fatalf("load during run = %d, want 1", observed)
+	}
+	if got := fixture.load.Value(); got != 0 {
+		t.Fatalf("load after run = %d, want 0", got)
 	}
 }

@@ -132,8 +132,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 83 {
-		t.Fatalf("catalog has %d keys, want 83 (P7: 72 -> 83)", len(defs))
+	if len(defs) != 85 {
+		t.Fatalf("catalog has %d keys, want 85 (P8: 83 -> 85)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {

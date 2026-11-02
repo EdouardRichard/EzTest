@@ -68,7 +68,7 @@ var (
 // caller may pass systemKeys explicitly; nil/empty lets the adapter derive the
 // version's SUT families. The knowledge service owns the approved/source_stale
 // filters, the ts_rank ordering and the settings-driven item/token budget.
-func (a *Adapter) RetrieveForVersion(ctx context.Context, versionID int64, systemKeys []string) ([]agentapp.KnowledgeRef, int, error) {
+func (a *Adapter) RetrieveForVersion(ctx context.Context, versionID int64, systemKeys []string, query string) ([]agentapp.KnowledgeRef, int, error) {
 	if versionID <= 0 {
 		return nil, 0, platform.Invalid("version_id", "must be a positive decimal ID")
 	}
@@ -86,6 +86,7 @@ func (a *Adapter) RetrieveForVersion(ctx context.Context, versionID int64, syste
 	injected, err := a.knowledge.Inject(ctx, knowledgeapp.InjectInput{
 		VersionID:  versionID,
 		SystemKeys: keys,
+		Query:      query,
 	})
 	if err != nil {
 		return nil, 0, err

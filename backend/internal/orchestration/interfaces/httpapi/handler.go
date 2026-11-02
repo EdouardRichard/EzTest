@@ -21,38 +21,44 @@ const readinessTimeout = 3 * time.Second
 // instanceView is the public api_instance representation. IDs stay decimal
 // strings and timestamps are RFC3339 UTC, matching the rest of the 0.2 API.
 type instanceView struct {
-	ID          string  `json:"id"`
-	InstanceKey string  `json:"instance_key"`
-	Hostname    string  `json:"hostname"`
-	PID         int     `json:"pid"`
-	APIPort     int     `json:"api_port"`
-	NodeID      int     `json:"node_id"`
-	Status      string  `json:"status"`
-	Version     string  `json:"version"`
-	LastError   *string `json:"last_error"`
-	StartedAt   string  `json:"started_at"`
-	HeartbeatAt string  `json:"heartbeat_at"`
-	DrainingAt  *string `json:"draining_at"`
-	StoppedAt   *string `json:"stopped_at"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
+	ID          string `json:"id"`
+	InstanceKey string `json:"instance_key"`
+	Hostname    string `json:"hostname"`
+	PID         int    `json:"pid"`
+	APIPort     int    `json:"api_port"`
+	NodeID      int    `json:"node_id"`
+	Status      string `json:"status"`
+	Version     string `json:"version"`
+	// ActiveRequests/ActiveWork are the in-flight counters reported by the last
+	// heartbeat (P8 drain observability). They are informational only.
+	ActiveRequests int     `json:"active_requests"`
+	ActiveWork     int     `json:"active_work"`
+	LastError      *string `json:"last_error"`
+	StartedAt      string  `json:"started_at"`
+	HeartbeatAt    string  `json:"heartbeat_at"`
+	DrainingAt     *string `json:"draining_at"`
+	StoppedAt      *string `json:"stopped_at"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
 }
 
 func toInstanceView(instance orchestration.Instance) instanceView {
 	view := instanceView{
-		ID:          platformid.Format(instance.ID),
-		InstanceKey: instance.InstanceKey,
-		Hostname:    instance.Hostname,
-		PID:         instance.PID,
-		APIPort:     instance.APIPort,
-		NodeID:      instance.NodeID,
-		Status:      string(instance.Status),
-		Version:     instance.Version,
-		LastError:   instance.LastError,
-		StartedAt:   formatTime(instance.StartedAt),
-		HeartbeatAt: formatTime(instance.HeartbeatAt),
-		CreatedAt:   formatTime(instance.CreatedAt),
-		UpdatedAt:   formatTime(instance.UpdatedAt),
+		ID:             platformid.Format(instance.ID),
+		InstanceKey:    instance.InstanceKey,
+		Hostname:       instance.Hostname,
+		PID:            instance.PID,
+		APIPort:        instance.APIPort,
+		NodeID:         instance.NodeID,
+		Status:         string(instance.Status),
+		Version:        instance.Version,
+		ActiveRequests: instance.ActiveRequests,
+		ActiveWork:     instance.ActiveWork,
+		LastError:      instance.LastError,
+		StartedAt:      formatTime(instance.StartedAt),
+		HeartbeatAt:    formatTime(instance.HeartbeatAt),
+		CreatedAt:      formatTime(instance.CreatedAt),
+		UpdatedAt:      formatTime(instance.UpdatedAt),
 	}
 	if instance.DrainingAt != nil {
 		formatted := formatTime(*instance.DrainingAt)
@@ -79,15 +85,21 @@ type readyView struct {
 	Storage    string `json:"storage"`
 	Draining   bool   `json:"draining"`
 	InstanceID string `json:"instance_id"`
+	// Inflight counters are observed for drain/rolling-upgrade; Ready() ignores
+	// them (a draining replica stays 503 while its work finishes).
+	InflightRequests int `json:"inflight_requests"`
+	InflightWork     int `json:"inflight_work"`
 }
 
 func toReadyView(readiness orchestrationapp.Readiness) readyView {
 	view := readyView{
-		Status:     "ok",
-		Database:   "ok",
-		Storage:    "ok",
-		Draining:   readiness.Draining,
-		InstanceID: platformid.Format(readiness.InstanceID),
+		Status:           "ok",
+		Database:         "ok",
+		Storage:          "ok",
+		Draining:         readiness.Draining,
+		InstanceID:       platformid.Format(readiness.InstanceID),
+		InflightRequests: readiness.InflightRequests,
+		InflightWork:     readiness.InflightWork,
 	}
 	if readiness.InstanceID <= 0 {
 		view.InstanceID = ""

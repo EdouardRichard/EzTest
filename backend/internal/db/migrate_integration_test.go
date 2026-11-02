@@ -20,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 40 {
-		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
+	if len(applied) != 42 {
+		t.Fatalf("applied %d migrations, want 42: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -175,8 +175,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 40 {
-		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
+	if len(applied) != 42 {
+		t.Fatalf("applied %d migrations, want 42: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -316,8 +316,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 40 {
-		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
+	if len(applied) != 42 {
+		t.Fatalf("applied %d migrations, want 42: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1052,5 +1052,74 @@ func TestSchemaConstraints(t *testing.T) {
 		) VALUES (181, 30, 'case', 30, 1, 'markdown', repeat('f', 64), 1, 'text/markdown', 'case2.md')
 	`); err == nil {
 		t.Fatal("duplicate export artifact revision accepted")
+	}
+}
+
+func TestP8HardeningSchema(t *testing.T) {
+	pool := testutil.NewEmptyDB(t)
+	ctx := context.Background()
+
+	applied, err := db.Migrate(ctx, pool)
+	if err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if len(applied) != 42 {
+		t.Fatalf("applied %d migrations, want 42: %v", len(applied), applied)
+	}
+
+	columns := []struct {
+		table  string
+		column string
+	}{
+		{"api_instance", "active_requests"},
+		{"api_instance", "active_work"},
+		{"case_run_sut_context", "executor_id"},
+	}
+	for _, tc := range columns {
+		var exists bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+			)
+		`, tc.table, tc.column).Scan(&exists); err != nil {
+			t.Fatalf("query %s.%s: %v", tc.table, tc.column, err)
+		}
+		if !exists {
+			t.Errorf("missing P8 column %s.%s", tc.table, tc.column)
+		}
+	}
+
+	constraints := []string{
+		"ck_api_instance_active_requests",
+		"ck_api_instance_active_work",
+		"ck_case_run_sut_context_executor",
+	}
+	for _, name := range constraints {
+		var exists bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = $1
+			)
+		`, name).Scan(&exists); err != nil {
+			t.Fatalf("query constraint %s: %v", name, err)
+		}
+		if !exists {
+			t.Errorf("missing P8 constraint %s", name)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO api_instance (id, instance_key, hostname, pid, api_port, node_id, status, version, started_at, heartbeat_at)
+		VALUES (900001, 'p8:1', 'p8', 1, 13333, 1, 'active', '0.2.0-p8', now(), now())
+	`); err != nil {
+		t.Fatalf("insert api_instance: %v", err)
+	}
+	var requests, work int
+	if err := pool.QueryRow(ctx, `SELECT active_requests, active_work FROM api_instance WHERE id = 900001`).Scan(&requests, &work); err != nil {
+		t.Fatalf("read defaults: %v", err)
+	}
+	if requests != 0 || work != 0 {
+		t.Fatalf("api_instance inflight defaults = %d/%d, want 0/0", requests, work)
 	}
 }

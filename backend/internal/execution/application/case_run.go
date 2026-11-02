@@ -51,7 +51,10 @@ type BrowserContextSpec struct {
 	Key          string
 	AllowedHosts []string
 	BaseURL      string
-	Metadata     map[string]any
+	// ExecutorID selects the owning executor endpoint. Zero/unknown ids fall
+	// back to the primary executor endpoint for single-endpoint deployments.
+	ExecutorID int64
+	Metadata   map[string]any
 }
 
 // BrowserArtifact is one binary action artifact (base64 transport).
@@ -80,17 +83,20 @@ type BrowserActionResult struct {
 
 // BrowserContextRef is one executor context (orphan reconciliation).
 type BrowserContextRef struct {
-	ID  string
-	Key string
+	ExecutorID int64
+	ID         string
+	Key        string
 }
 
 // BrowserExecutor is the executor protocol port consumed by the browser tools.
+// executorID selects the endpoint that owns the context (P8 multi-executor
+// routing); zero falls back to the primary endpoint.
 type BrowserExecutor interface {
 	CreateContext(ctx context.Context, spec BrowserContextSpec) (string, error)
-	Action(ctx context.Context, contextID, action string, args json.RawMessage) (BrowserActionResult, error)
-	Cancel(ctx context.Context, contextID string) error
-	Close(ctx context.Context, contextID string) error
-	ListContexts(ctx context.Context) ([]BrowserContextRef, error)
+	Action(ctx context.Context, executorID int64, contextID, action string, args json.RawMessage) (BrowserActionResult, error)
+	Cancel(ctx context.Context, executorID int64, contextID string) error
+	Close(ctx context.Context, executorID int64, contextID string) error
+	ListContexts(ctx context.Context, executorID int64) ([]BrowserContextRef, error)
 }
 
 // HTTPRequestData is one target-SUT HTTP request issued by http.request.
@@ -916,6 +922,7 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 			rowID := row.ID
 			if _, updateErr := s.sutContexts.UpdateCAS(ctx, rowID, func(target *execution.CaseRunSUTContext) error {
 				target.LeaseEpoch = epoch
+				target.ExecutorID = caseRun.OwnerExecutorID
 				if target.Status == execution.SUTContextClosed || target.Status == execution.SUTContextFailed {
 					target.Status = execution.SUTContextCreating
 					target.BrowserContextID = ""
@@ -932,6 +939,7 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 			CaseRunID:    caseRun.ID,
 			VersionSUTID: step.TargetVersionSUTID,
 			AccountRole:  step.AccountRole,
+			ExecutorID:   caseRun.OwnerExecutorID,
 			LeaseEpoch:   epoch,
 			Status:       execution.SUTContextCreating,
 			CreatedAt:    s.now(),
@@ -997,8 +1005,12 @@ func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {
 		return
 	}
 	for _, row := range rows {
+		executorID := int64(0)
+		if row.ExecutorID != nil {
+			executorID = *row.ExecutorID
+		}
 		if row.BrowserContextID != "" && s.browser != nil {
-			_ = s.browser.Close(ctx, row.BrowserContextID)
+			_ = s.browser.Close(ctx, executorID, row.BrowserContextID)
 		}
 		if row.Status == execution.SUTContextClosed {
 			continue

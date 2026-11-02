@@ -1,3 +1,5 @@
+> **0.1 归档；0.2 权威文档见 [docs/version-V0.2/](docs/version-V0.2/README.md) 与 [deploy/README.md](deploy/README.md)。**
+
 # EzTest P7 全自主闭环 — 真实浏览器人工验收记录（Task 32b 重跑）
 
 - 验收日期：2026-10-29（02:06–02:30，Asia/Shanghai）

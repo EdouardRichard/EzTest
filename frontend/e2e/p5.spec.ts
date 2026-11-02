@@ -360,7 +360,7 @@ test("phase A: code tab, visual approve/retest/diff, quality page, resource prop
   await page.goto(`/quality?version=${VERSION_ID}`)
   await expect(page.getByTestId("visual-quality-page")).toBeVisible({ timeout: 60_000 })
   await expect(page.getByTestId("quality-metrics-panel")).toBeVisible({ timeout: 60_000 })
-  const qualityText = await page.getByTestId("quality-metrics-panel").innerText()
+  const qualityText = (await page.getByTestId("quality-metrics-panel").textContent()) ?? ""
   for (const label of ["断言总数", "已批准基线", "基线覆盖率", "通过率", "未定率", "视觉比对"]) {
     expect(qualityText).toContain(label)
   }

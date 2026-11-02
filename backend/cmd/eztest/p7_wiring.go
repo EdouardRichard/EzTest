@@ -31,6 +31,7 @@ import (
 	deliverypg "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/renderclient"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	eventing "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
 	eventingpg "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	knowledgeapp "github.com/EdouardRichard/EzTest/backend/internal/knowledge/application"
@@ -643,12 +644,20 @@ func newP7Runtime(ctx context.Context, deps p7RuntimeDeps) (*p7Runtime, error) {
 	})
 
 	// Cross-instance SSE fan-out: every replica runs one LISTEN connection and
-	// replays the persisted event into its local hub.
+	// replays the persisted event into its local hub. P8 also reloads the
+	// settings cache when another replica publishes settings.updated, so hot
+	// updates apply to every replica within one heartbeat.
 	listener := eventingpg.NewListener(
 		deps.Pool,
 		eventingpg.New(deps.Pool),
 		deps.Hub,
 		eventingpg.WithListenerLogger(logger),
+		eventingpg.WithListenerObserver(func(ctx context.Context, event eventing.Event) error {
+			if event.Type != "settings.updated" {
+				return nil
+			}
+			return deps.Settings.Reload(ctx)
+		}),
 	)
 
 	return &p7Runtime{

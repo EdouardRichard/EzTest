@@ -119,3 +119,51 @@ func TestTwoListenersReceiveOnePublishedEventAndDropDuplicateNotify(t *testing.T
 		}
 	}
 }
+
+func TestListenerObserverFiresForCrossInstanceNotification(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := eventingpg.New(pool)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hub := eventingapp.NewHub(8)
+	observed := make(chan eventing.Event, 8)
+	listener := eventingpg.NewListener(pool, repo, hub,
+		eventingpg.WithListenerRetry(50*time.Millisecond),
+		eventingpg.WithListenerObserver(func(_ context.Context, event eventing.Event) error {
+			observed <- event
+			return nil
+		}))
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- listener.Run(ctx) }()
+	waitReady(t, listener)
+
+	service := eventingapp.New(repo, eventingapp.NewHub(8), eventingpg.NewNotifier(pool))
+	if err := service.Publish(ctx, eventingapp.Event{
+		Channel: "system",
+		Type:    "settings.updated",
+		Payload: map[string]any{"key": "retention.gc_dry_run"},
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case event := <-observed:
+		if event.Type != "settings.updated" || event.Seq <= 0 {
+			t.Fatalf("observed event = %#v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener observer did not receive the event")
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("listener Run = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener did not stop after cancel")
+	}
+}

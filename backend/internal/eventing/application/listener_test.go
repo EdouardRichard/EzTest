@@ -3,6 +3,7 @@ package eventingapp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
@@ -209,5 +210,52 @@ func TestEventRefRoundTrip(t *testing.T) {
 	}
 	if decoded != ref {
 		t.Fatalf("decoded = %#v, want %#v", decoded, ref)
+	}
+}
+
+func TestDispatcherObserverReceivesLoadedEventOnce(t *testing.T) {
+	event := fixtureEvent(8)
+	reader := &fakeEventReader{events: map[string]eventing.Event{"system|8": event}}
+	sink := &fakeBroadcaster{}
+	var observed []eventing.Event
+	dispatcher := NewDispatcher(reader, sink, WithDispatcherObserver(func(_ context.Context, got eventing.Event) error {
+		observed = append(observed, got)
+		return nil
+	}))
+	payload := storedRef(t, event)
+
+	if err := dispatcher.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(observed) != 1 || observed[0].Seq != 8 || observed[0].Type != "settings.updated" {
+		t.Fatalf("observer events = %#v", observed)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("broadcast events = %d, want 1", len(sink.events))
+	}
+
+	// A duplicate NOTIFY is dropped before the observer runs.
+	if err := dispatcher.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("second Handle: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("observer ran for a duplicate: %d", len(observed))
+	}
+}
+
+func TestDispatcherObserverErrorDoesNotSkipBroadcast(t *testing.T) {
+	event := fixtureEvent(9)
+	reader := &fakeEventReader{events: map[string]eventing.Event{"system|9": event}}
+	sink := &fakeBroadcaster{}
+	dispatcher := NewDispatcher(reader, sink, WithDispatcherObserver(func(context.Context, eventing.Event) error {
+		return errors.New("reload failed")
+	}))
+
+	err := dispatcher.Handle(context.Background(), storedRef(t, event))
+	if err == nil || !strings.Contains(err.Error(), "reload failed") {
+		t.Fatalf("Handle error = %v, want observer error", err)
+	}
+	if len(sink.events) != 1 || sink.events[0].Seq != 9 {
+		t.Fatalf("broadcast events = %#v", sink.events)
 	}
 }

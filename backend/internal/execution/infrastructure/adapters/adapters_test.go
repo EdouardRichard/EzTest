@@ -319,7 +319,7 @@ func TestExecutorAdapters(t *testing.T) {
 		client.created.Metadata["case_run_id"] != "1" {
 		t.Fatalf("create input = %+v", client.created)
 	}
-	result, err := browser.Action(context.Background(), "ctx_1", "screenshot", json.RawMessage(`{}`))
+	result, err := browser.Action(context.Background(), 0, "ctx_1", "screenshot", json.RawMessage(`{}`))
 	if err != nil || !result.OK || client.actionName != "screenshot" {
 		t.Fatalf("Action = %+v, %v", result, err)
 	}
@@ -328,11 +328,11 @@ func TestExecutorAdapters(t *testing.T) {
 	}
 
 	client.cancelErr = platform.NewError(404, "context_not_found", "unknown context")
-	if err := browser.Cancel(context.Background(), "ctx_gone"); err != nil {
+	if err := browser.Cancel(context.Background(), 0, "ctx_gone"); err != nil {
 		t.Fatalf("Cancel of a missing context must be a no-op: %v", err)
 	}
 	client.closeErr = platform.NewError(404, "context_not_found", "unknown context")
-	if err := browser.Close(context.Background(), "ctx_gone"); err != nil {
+	if err := browser.Close(context.Background(), 0, "ctx_gone"); err != nil {
 		t.Fatalf("Close of a missing context must be a no-op: %v", err)
 	}
 

@@ -2,7 +2,7 @@
 
 This directory contains the container deployment for the EzTest 0.2 platform:
 a multi-stage Go API image, a Next.js standalone web image, a Playwright
-executor image, a Playwright PDF renderer image and a P7 Docker Compose file
+executor image, a Playwright PDF renderer image and a Compose file
 with PostgreSQL 17 and **two API replicas**.
 
 > **Validation status:** Docker is not installed on the development host, so the
@@ -12,6 +12,11 @@ with PostgreSQL 17 and **two API replicas**.
 > `scripts/check-docs.ps1`. Do not report the Compose deployment as
 > "verified" — it is delivered and statically checked, not run. See
 > `../docs/deployment.md` for the full deployment/runbook guidance.
+
+P8 contract baseline: OpenAPI `0.2.0-p8` (`x-frozen: P8`) with **162 paths /
+200 operations / 264 schemas**, **42 migrations**, **85 business tables** and
+**85 database settings**. P8 adds no Compose service and no new startup
+environment variable.
 
 ## Layout
 
@@ -77,6 +82,24 @@ WHERE key = 'report.render_worker_url';
 masked there.) After this, the leader-gated ensurer/worker backfills PDFs and
 the compose validator remains the only required check (Docker is not installed
 on the development host).
+
+### Instance counters, rate limiting and retention (P8)
+
+The two API replicas coordinate through PostgreSQL; P8 adds observability and
+safety knobs without new containers or startup variables:
+
+| DB setting | Default | Behaviour |
+|---|---|---|
+| `security.rate_limit_per_minute` | `0` (off) | Per-instance global token bucket. When enabled, excess requests get `429` with `rate_limited` and `Retry-After`; health/readiness/SSE/static paths are skipped. Total allowed rate = replicas × limit (two API replicas at 30/min allow roughly 60/min). |
+| `retention.event_days` | `90` | Leader-gated daily cleanup of `event` rows older than the cutoff; `security.audit_retention_days` (default 90) does the same for audit rows. Uses `retention.gc_batch_size` per batch and writes the audit action `retention.cleanup`. |
+
+`GET /api/admin/instances` reports `active_requests` and `active_work` per
+instance, and `GET /api/health/ready` exposes the same counters as
+`inflight_requests` / `inflight_work`. During a rolling upgrade, drain the old
+instance and wait for both counters to reach 0 before stopping the process.
+
+Both settings are hot-loaded. The retention worker runs on the elected leader;
+rate limiting is enforced independently by each API replica.
 
 ### Executor push (optional)
 
@@ -144,8 +167,9 @@ Then open:
 - Admin instance registry: <http://localhost:13333/api/admin/instances>
 
 Rolling upgrade drill: start the replacement, wait for readiness, drain the old
-instance through `POST /api/admin/instances/{instanceId}/drain`, wait for its
-in-flight work to finish (readiness turns 503), then stop it.
+instance through `POST /api/admin/instances/{instanceId}/drain`, wait for
+`active_requests`/`active_work` to reach 0 (readiness turns 503 while draining),
+then stop it.
 
 Stop the stack without deleting data:
 

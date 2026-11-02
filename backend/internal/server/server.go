@@ -25,6 +25,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
 	orchestrationapi "github.com/EdouardRichard/EzTest/backend/internal/orchestration/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 	qualityapi "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
@@ -90,6 +91,9 @@ type Deps struct {
 	// whenever the execution handler exists (the token middleware fails closed
 	// without a settings service).
 	P7 *P7Handlers
+	// Load counts in-flight API requests for drain/rolling-upgrade observability
+	// (P8). Nil disables the counter.
+	Load *load.Counter
 }
 
 // P7Handlers groups the optional P7 HTTP surfaces. The readiness probe is
@@ -161,7 +165,11 @@ func New(deps Deps) http.Handler {
 	registerP6Routes(mux, authenticated, admin, deps.P6)
 	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
 
-	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
+	chain := TrackInflight(deps.Load)(CORS(deps.Config)(mux))
+	if deps.Settings != nil {
+		chain = RateLimit(deps.Settings)(chain)
+	}
+	return RequestID(Recover(Logging(chain)))
 }
 
 // registerP7Routes mounts the optional P7 surfaces: knowledge, orchestration
