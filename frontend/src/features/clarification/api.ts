@@ -1,5 +1,6 @@
 import {
   type ApiDownload,
+  type ApiPage,
   apiDownload,
   apiGet,
   apiGetPage,
@@ -80,19 +81,22 @@ export function getConversation(versionId: string, conversationId: string): Prom
   return apiGet<Conversation>(conversationPath(versionId, conversationId))
 }
 
-/** Loads the conversation thread in ascending id order. */
-export async function listMessages(
+/**
+ * Loads one page of the conversation thread in ascending id order and keeps the
+ * server pagination envelope (`next_cursor`/`has_more`). The history cursor must
+ * come from here, never from the last live/optimistic message in the thread.
+ */
+export function listMessages(
   versionId: string,
   conversationId: string,
   options: { after?: string; limit?: number } = {},
-): Promise<ConversationMessage[]> {
-  const page = await apiGetPage<ConversationMessage>(
+): Promise<ApiPage<ConversationMessage>> {
+  return apiGetPage<ConversationMessage>(
     `${conversationPath(versionId, conversationId)}/messages${query({
       after: options.after,
       limit: options.limit ?? 100,
     })}`,
   )
-  return page.items
 }
 
 /** Appends one user message (text and/or attachments). */

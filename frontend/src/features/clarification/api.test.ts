@@ -108,12 +108,16 @@ describe("clarification api", () => {
     )
   })
 
-  it("lists messages in ascending order with an after cursor", async () => {
+  it("lists one message page with the after cursor and pagination envelope", async () => {
     fetchMock.mockResolvedValue(
-      jsonResponse({ data: [messageFixture], next_cursor: "5001", has_more: false }),
+      jsonResponse({ data: [messageFixture], next_cursor: "5001", has_more: true }),
     )
 
-    await expect(listMessages("2001", "4001", { after: "5000" })).resolves.toEqual([messageFixture])
+    await expect(listMessages("2001", "4001", { after: "5000" })).resolves.toEqual({
+      items: [messageFixture],
+      nextCursor: "5001",
+      hasMore: true,
+    })
 
     expect(fetchMock.mock.calls[0][0]).toBe(
       "http://localhost:13333/api/versions/2001/conversations/4001/messages?after=5000&limit=100",

@@ -85,14 +85,22 @@ function mergeJobView(part: JobCardPart, view: JobViewResponse): JobCardPart {
  * `/jobs/{id}/cancel|retry` endpoints unless a parent supplies an override.
  */
 export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
-  const [job, setJob] = useState<JobCardPart>(part)
+  // Only the local result of cancel/retry lives here; the streamed snapshot is
+  // always the base so job.progress updates keep flowing.
+  const [actionResult, setActionResult] = useState<JobCardPart | null>(null)
   const [pending, setPending] = useState<"cancel" | "retry" | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
 
-  // The streamed snapshot (or a streamed job.progress merge) always wins.
+  // A streamed job id/status change owns the card again. A parent re-render (or
+  // a progress-only update) with the same id/status must not restore the stale
+  // running snapshot over a just-completed cancel/retry.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: job id/status are the reset triggers; progress-only updates must not reset
   useEffect(() => {
-    setJob(part)
-  }, [part])
+    setActionResult(null)
+    setActionError(null)
+  }, [part.job_id, part.status])
+
+  const job = actionResult === null ? part : { ...part, ...actionResult }
 
   const total = typeof job.total === "number" && job.total > 0 ? job.total : null
   const current = typeof job.current === "number" && job.current >= 0 ? job.current : 0
@@ -111,7 +119,7 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
           jobActionPath(versionId, job.job_id, "cancel"),
           {},
         )
-        setJob((currentJob) => mergeJobView(currentJob, view))
+        setActionResult((current) => mergeJobView(current ?? part, view))
         return
       }
       if (onRetry !== undefined) {
@@ -119,7 +127,7 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
         return
       }
       const view = await apiPost<JobViewResponse>(jobActionPath(versionId, job.job_id, "retry"))
-      setJob((currentJob) => mergeJobView(currentJob, view))
+      setActionResult((current) => mergeJobView(current ?? part, view))
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "作业操作失败，请重试。")
     } finally {

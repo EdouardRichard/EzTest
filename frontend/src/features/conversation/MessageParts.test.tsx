@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import type { ConversationMessage } from "@/features/clarification/types"
+import type { ApiPage } from "@/lib/api-client"
 
 import type {
   ErrorPart as ErrorPartPayload,
@@ -55,6 +56,14 @@ function assistantMessage(id: string, parts: SequencedPart[]): ConversationMessa
   }
 }
 
+function pageOf(
+  items: ConversationMessage[],
+  nextCursor = "",
+  hasMore = false,
+): ApiPage<ConversationMessage> {
+  return { items, nextCursor, hasMore }
+}
+
 function eventFrame(type: string, payload: Record<string, unknown>): string {
   return JSON.stringify({
     seq: 1,
@@ -80,7 +89,7 @@ let connectOptions: ConnectOptions
 beforeEach(() => {
   api.listMessages.mockReset()
   api.postMessage.mockReset()
-  api.listMessages.mockResolvedValue([])
+  api.listMessages.mockResolvedValue(pageOf([]))
   apiClient.apiPost.mockReset()
   sse.connectSSE.mockReset()
   sse.connectSSE.mockImplementation((options: ConnectOptions) => {
@@ -128,10 +137,11 @@ function JobStreamHarness({ part }: { part: JobCardPart }) {
   )
 }
 
-function PaginationHarness() {
+function PaginationHarness({ liveMessages = [] }: { liveMessages?: ConversationMessage[] }) {
   const { messages, hasMore, loadingMore, loadMore } = useConversation({
     versionId: "2001",
     conversationId: "4001",
+    liveMessages,
   })
   return (
     <div>
@@ -139,6 +149,55 @@ function PaginationHarness() {
       <span data-testid="has-more">{String(hasMore)}</span>
       <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
         加载更多
+      </button>
+    </div>
+  )
+}
+
+function LoadMoreHarness() {
+  const { messages, hasMore, loadingMore, loadMore, loadMoreError, error } = useConversation({
+    versionId: "2001",
+    conversationId: "4001",
+  })
+  return (
+    <div>
+      <span data-testid="thread-error">{error === null ? "none" : "error"}</span>
+      <span data-testid="thread-count">{messages.length}</span>
+      <MessageList
+        versionId="2001"
+        messages={messages}
+        activity={null}
+        onRequirementSelect={() => {}}
+        hasMore={hasMore}
+        loadingMore={loadingMore}
+        loadMoreError={loadMoreError}
+        onLoadMore={() => void loadMore()}
+        onRetryLoadMore={() => void loadMore()}
+      />
+      <textarea data-testid="composer-draft" />
+    </div>
+  )
+}
+
+function SwitchHarness({
+  conversationId,
+  liveMessages = [],
+}: {
+  conversationId: string
+  liveMessages?: ConversationMessage[]
+}) {
+  const { messages, hasMore, loadingMore, loadMore, loadMoreError } = useConversation({
+    versionId: "2001",
+    conversationId,
+    liveMessages,
+  })
+  return (
+    <div>
+      <span data-testid="switch-count">{messages.length}</span>
+      <span data-testid="switch-has-more">{String(hasMore)}</span>
+      <span data-testid="switch-load-error">{loadMoreError === null ? "none" : "error"}</span>
+      <button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
+        加载下一页
       </button>
     </div>
   )
@@ -239,6 +298,20 @@ describe("job card part", () => {
     fireEvent.click(screen.getByRole("button", { name: "重试作业" }))
     await waitFor(() => expect(onRetry).toHaveBeenCalledWith("501"))
   })
+
+  it("keeps the cancelled local state when the parent re-renders", async () => {
+    apiClient.apiPost.mockResolvedValue({ state: "cancelled", current: 12, total: 27 })
+    const { rerender } = render(<JobCard versionId="2001" part={runningJob} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "取消作业" }))
+    expect(await screen.findByText("已取消")).toBeInTheDocument()
+
+    // A parent re-render hands down a fresh but stale snapshot of the same job.
+    rerender(<JobCard versionId="2001" part={{ ...runningJob }} />)
+
+    expect(screen.getByText("已取消")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+  })
 })
 
 describe("error part", () => {
@@ -256,6 +329,20 @@ describe("error part", () => {
     expect(screen.getByText("模型调用失败，请重试。")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "重试" }))
     expect(onAction).toHaveBeenCalledWith(part)
+  })
+
+  it("does not render a clickable no-op action when no handler is supplied", () => {
+    const part: ErrorPartPayload = {
+      type: "error",
+      code: "model_error",
+      message: "模型调用失败，请重试。",
+      retryable: true,
+      action: "重试",
+    }
+    render(<ErrorPart part={part} />)
+
+    expect(screen.getByText("模型调用失败，请重试。")).toBeInTheDocument()
+    expect(screen.queryByRole("button")).not.toBeInTheDocument()
   })
 })
 
@@ -340,7 +427,7 @@ describe("streamed parts in the conversation thread", () => {
     expect(screen.getByText("完成")).toBeInTheDocument()
   })
 
-  it("loads the next history page after the newest loaded message", async () => {
+  it("loads the next history page from the server cursor after a live insert", async () => {
     const firstPage = Array.from({ length: 100 }, (_, index) =>
       assistantMessage(String(index + 1), [{ type: "text", text: `历史消息 ${index + 1}` }]),
     )
@@ -348,14 +435,22 @@ describe("streamed parts in the conversation thread", () => {
       assistantMessage("101", [{ type: "text", text: "历史消息 101" }]),
       assistantMessage("102", [{ type: "text", text: "历史消息 102" }]),
     ]
-    api.listMessages.mockResolvedValueOnce(firstPage).mockResolvedValueOnce(secondPage)
+    api.listMessages
+      .mockResolvedValueOnce(pageOf(firstPage, "100", true))
+      .mockResolvedValueOnce(pageOf(secondPage, "", false))
+    const live = assistantMessage("999", [{ type: "text", text: "实时消息 999" }])
 
-    render(<PaginationHarness />)
+    const { rerender } = render(<PaginationHarness />)
     await waitFor(() => expect(screen.getByTestId("has-more")).toHaveTextContent("true"))
     expect(screen.getByTestId("message-count")).toHaveTextContent("100")
 
+    // A live SSE/optimistic message with a higher id must not move the history
+    // cursor; the next page still starts after the last snapshot message.
+    rerender(<PaginationHarness liveMessages={[live]} />)
+    await waitFor(() => expect(screen.getByTestId("message-count")).toHaveTextContent("101"))
+
     fireEvent.click(screen.getByRole("button", { name: "加载更多" }))
-    await waitFor(() => expect(screen.getByTestId("message-count")).toHaveTextContent("102"))
+    await waitFor(() => expect(screen.getByTestId("message-count")).toHaveTextContent("103"))
     expect(screen.getByTestId("has-more")).toHaveTextContent("false")
     expect(api.listMessages).toHaveBeenLastCalledWith("2001", "4001", {
       after: "100",
@@ -363,13 +458,82 @@ describe("streamed parts in the conversation thread", () => {
     })
   })
 
+  it("keeps the thread mounted with an inline retry when loadMore fails", async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
+      assistantMessage(String(index + 1), [{ type: "text", text: `历史消息 ${index + 1}` }]),
+    )
+    api.listMessages
+      .mockResolvedValueOnce(pageOf(firstPage, "100", true))
+      .mockRejectedValueOnce(new Error("page failed"))
+      .mockResolvedValueOnce(
+        pageOf([assistantMessage("101", [{ type: "text", text: "历史消息 101" }])], "", false),
+      )
+
+    render(<LoadMoreHarness />)
+    await waitFor(() => expect(screen.getByTestId("thread-count")).toHaveTextContent("100"))
+
+    fireEvent.click(screen.getByRole("button", { name: "加载更多消息" }))
+
+    expect(await screen.findByTestId("load-more-error")).toHaveTextContent("加载更多消息失败")
+    expect(screen.getByTestId("thread-error")).toHaveTextContent("none")
+    expect(screen.getByTestId("thread-count")).toHaveTextContent("100")
+    expect(screen.getByTestId("composer-draft")).toBeInTheDocument()
+    expect(screen.getByTestId("message-list")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "重试加载" }))
+    await waitFor(() => expect(screen.getByTestId("thread-count")).toHaveTextContent("101"))
+    expect(screen.queryByTestId("load-more-error")).not.toBeInTheDocument()
+  })
+
+  it("ignores a loadMore result that arrives after switching conversations", async () => {
+    let resolvePending: (page: ApiPage<ConversationMessage>) => void = () => {}
+    const pending = new Promise<ApiPage<ConversationMessage>>((resolve) => {
+      resolvePending = resolve
+    })
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
+      assistantMessage(String(index + 1), [{ type: "text", text: `历史消息 ${index + 1}` }]),
+    )
+    api.listMessages.mockImplementation(
+      (_versionId: string, conversationId: string, options?: { after?: string }) => {
+        if (conversationId === "4001" && options?.after === undefined) {
+          return Promise.resolve(pageOf(firstPage, "100", true))
+        }
+        if (conversationId === "4001") return pending
+        return Promise.resolve(
+          pageOf([assistantMessage("7001", [{ type: "text", text: "新对话消息" }])], "", false),
+        )
+      },
+    )
+
+    const { rerender } = render(<SwitchHarness conversationId="4001" />)
+    await waitFor(() => expect(screen.getByTestId("switch-has-more")).toHaveTextContent("true"))
+    fireEvent.click(screen.getByRole("button", { name: "加载下一页" }))
+
+    rerender(<SwitchHarness conversationId="4002" />)
+    await waitFor(() => expect(screen.getByTestId("switch-count")).toHaveTextContent("1"))
+
+    await act(async () => {
+      resolvePending(
+        pageOf([assistantMessage("101", [{ type: "text", text: "旧对话下一页" }])], "", false),
+      )
+      await pending
+    })
+
+    expect(screen.getByTestId("switch-count")).toHaveTextContent("1")
+    expect(screen.getByTestId("switch-load-error")).toHaveTextContent("none")
+  })
+
   it("refetches the conversation snapshot on stream.reset", async () => {
     api.listMessages
-      .mockResolvedValueOnce([assistantMessage("5001", [{ type: "text", text: "首条消息" }])])
-      .mockResolvedValueOnce([
-        assistantMessage("5001", [{ type: "text", text: "首条消息" }]),
-        assistantMessage("5002", [{ type: "text", text: "重置后消息" }]),
-      ])
+      .mockResolvedValueOnce(
+        pageOf([assistantMessage("5001", [{ type: "text", text: "首条消息" }])]),
+      )
+      .mockResolvedValueOnce(
+        pageOf([
+          assistantMessage("5001", [{ type: "text", text: "首条消息" }]),
+          assistantMessage("5002", [{ type: "text", text: "重置后消息" }]),
+        ]),
+      )
 
     render(<ResetHarness />)
     await waitFor(() => expect(screen.getByTestId("thread-count")).toHaveTextContent("1"))

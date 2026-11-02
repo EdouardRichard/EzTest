@@ -1,14 +1,33 @@
 "use client"
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react"
 
 import type { JobStatus } from "@/features/conversation/types"
+import type { ApiPage } from "@/lib/api-client"
 
 import { listMessages, postMessage } from "./api"
 import type { ConversationMessage, NewMessagePart } from "./types"
 
 /** Matches the messages endpoint default: a full page implies another page. */
 const MESSAGES_PAGE_SIZE = 100
+
+/**
+ * The messages endpoint returns one cursor page. A bare item list (older caller
+ * or test double) is still accepted and promoted to a page; the page-size
+ * heuristic only applies when the server envelope is absent.
+ */
+function toMessagePage(
+  value: ApiPage<ConversationMessage> | ConversationMessage[],
+): ApiPage<ConversationMessage> {
+  if (!Array.isArray(value)) return value
+  const last = value.length > 0 ? value[value.length - 1].id : ""
+  const hasMore = value.length >= MESSAGES_PAGE_SIZE
+  return { items: value, nextCursor: hasMore ? last : "", hasMore }
+}
+
+function newestMessageId(messages: readonly ConversationMessage[]): string {
+  return messages.length > 0 ? messages[messages.length - 1].id : ""
+}
 
 /* --------------------------- streamed part merge ---------------------------- */
 
@@ -219,8 +238,10 @@ export type UseConversationResult = {
   /** True when the messages endpoint may still have a newer page. */
   hasMore: boolean
   loadingMore: boolean
+  /** Error from the last `loadMore`; inline only, the thread stays mounted. */
+  loadMoreError: unknown
   reload: () => void
-  /** Appends the next page after the newest loaded message. */
+  /** Appends the next history page from the stored server cursor. */
   loadMore: () => Promise<void>
   /** Returns true when the API accepted the message (draft can be cleared). */
   send: (parts: NewMessagePart[]) => Promise<boolean>
@@ -241,36 +262,63 @@ export function useConversation({
   const [error, setError] = useState<unknown>(null)
   const [hasMore, setHasMore] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
+  const [loadMoreError, setLoadMoreError] = useState<unknown>(null)
   const [reloadToken, setReloadToken] = useState(0)
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<unknown>(null)
 
+  // The history cursor belongs to the loaded snapshot only: live SSE messages
+  // and optimistic sends never move it, so a higher live id cannot skip
+  // unloaded history.
+  const historyCursorRef = useRef("")
+  // Bumped by every snapshot fetch and by unmount/switch, so a late `loadMore`
+  // response can be recognized as stale and ignored.
+  const generationRef = useRef(0)
+  const identity = conversationId === null ? "" : `${versionId}:${conversationId}`
+  const identityRef = useRef(identity)
+  identityRef.current = identity
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: reloadToken is a manual refresh trigger
   useEffect(() => {
+    generationRef.current += 1
+    const generation = generationRef.current
     let cancelled = false
+    const isCurrent = () => !cancelled && generationRef.current === generation
+    const invalidate = () => {
+      generationRef.current += 1
+    }
+    historyCursorRef.current = ""
+
     if (conversationId === null) {
       setMessages([])
       setLoading(false)
       setError(null)
       setHasMore(false)
       setLoadingMore(false)
+      setLoadMoreError(null)
       return () => {
         cancelled = true
+        invalidate()
       }
     }
 
     setLoading(true)
     setError(null)
     setHasMore(false)
+    setLoadingMore(false)
+    setLoadMoreError(null)
     void listMessages(versionId, conversationId).then(
       (next) => {
-        if (cancelled) return
-        setMessages(sortMessages(next))
-        setHasMore(next.length >= MESSAGES_PAGE_SIZE)
+        if (!isCurrent()) return
+        const page = toMessagePage(next)
+        const sorted = sortMessages(page.items)
+        setMessages(sorted)
+        historyCursorRef.current = page.nextCursor || newestMessageId(sorted)
+        setHasMore(page.hasMore)
         setLoading(false)
       },
       (cause: unknown) => {
-        if (cancelled) return
+        if (!isCurrent()) return
         setError(cause)
         setLoading(false)
       },
@@ -278,6 +326,7 @@ export function useConversation({
 
     return () => {
       cancelled = true
+      invalidate()
     }
   }, [versionId, conversationId, reloadToken])
 
@@ -300,21 +349,34 @@ export function useConversation({
 
   const loadMore = useCallback(async (): Promise<void> => {
     if (conversationId === null || loadingMore || !hasMore) return
-    const newest = messages[messages.length - 1]
+    const cursor = historyCursorRef.current
+    if (cursor === "") return
+    const identityAtStart = `${versionId}:${conversationId}`
+    const generationAtStart = generationRef.current
+    const isCurrent = () =>
+      identityRef.current === identityAtStart && generationRef.current === generationAtStart
+
     setLoadingMore(true)
+    setLoadMoreError(null)
     try {
-      const next = await listMessages(versionId, conversationId, {
-        after: newest?.id,
-        limit: MESSAGES_PAGE_SIZE,
-      })
-      setMessages((current) => mergeConversationMessages(current, next))
-      setHasMore(next.length >= MESSAGES_PAGE_SIZE)
+      const page = toMessagePage(
+        await listMessages(versionId, conversationId, {
+          after: cursor,
+          limit: MESSAGES_PAGE_SIZE,
+        }),
+      )
+      if (!isCurrent()) return
+      setMessages((current) => mergeConversationMessages(current, page.items))
+      const pageCursor = page.nextCursor || newestMessageId(sortMessages(page.items))
+      historyCursorRef.current = pageCursor || cursor
+      setHasMore(page.hasMore && pageCursor !== "")
     } catch (cause) {
-      setError(cause)
+      if (!isCurrent()) return
+      setLoadMoreError(cause)
     } finally {
-      setLoadingMore(false)
+      if (isCurrent()) setLoadingMore(false)
     }
-  }, [versionId, conversationId, loadingMore, hasMore, messages])
+  }, [versionId, conversationId, loadingMore, hasMore])
 
   const reload = useCallback(() => {
     setReloadToken((token) => token + 1)
@@ -354,6 +416,7 @@ export function useConversation({
     sendError,
     hasMore,
     loadingMore,
+    loadMoreError,
     reload,
     loadMore,
     send,

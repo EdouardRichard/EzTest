@@ -31,11 +31,11 @@ export function ErrorPart({ part, onAction }: ErrorPartProps) {
         <p className="text-[11px] font-medium text-destructive">{part.message}</p>
         <p className="mt-0.5 text-[10px] text-muted-foreground">错误码：{part.code}</p>
       </div>
-      {actionLabel !== null ? (
+      {actionLabel !== null && onAction !== undefined ? (
         <Button
           variant={part.retryable === true ? "primary" : "secondary"}
           size="sm"
-          onClick={() => onAction?.(part)}
+          onClick={() => onAction(part)}
         >
           {actionLabel}
         </Button>

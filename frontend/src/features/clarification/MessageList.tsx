@@ -1,7 +1,7 @@
 "use client"
 
 import { Paperclip } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
@@ -35,7 +35,10 @@ export type MessageListProps = {
   /** History pagination: true while the messages endpoint has a newer page. */
   hasMore?: boolean
   loadingMore?: boolean
+  /** Non-fatal `loadMore` failure: rendered inline so the thread stays mounted. */
+  loadMoreError?: unknown
   onLoadMore?: () => void
+  onRetryLoadMore?: () => void
   /** Runs the action button of a `error` part. */
   onErrorAction?: (part: ErrorPayload) => void
 }
@@ -105,7 +108,14 @@ function MessageImage({ part }: { part: ImagePart }) {
 
 function JobCardHost({ versionId, part }: { versionId: string; part: JobCardPart }) {
   const update = useJobCardUpdate(versionId, part.job_id)
-  return <JobCard versionId={versionId} part={update === null ? part : { ...part, ...update }} />
+  // Keep the merged part identity stable across unrelated parent renders: a new
+  // object every render used to make JobCard think the job snapshot had moved
+  // and discard the local cancel/retry result.
+  const mergedPart = useMemo(
+    () => (update === null ? part : { ...part, ...update }),
+    [part, update],
+  )
+  return <JobCard versionId={versionId} part={mergedPart} />
 }
 
 function MessagePartView({
@@ -236,8 +246,19 @@ function MessageBubble({
           />
         ))}
       </div>
-      <span className="text-[10px] text-muted-foreground">
+      <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
         {formatDateTime(message.created_at)}
+        {/* 0.2.1: the assistant message shows the model that actually generated
+            it (from the linked agent_run), never the currently selected one. */}
+        {!isUser && (message.actual_model ?? "").trim() !== "" ? (
+          <span
+            data-testid="actual-model-badge"
+            title="实际生成该消息的模型"
+            className="rounded-full border border-border bg-muted px-1.5 py-0.5 font-medium"
+          >
+            {message.actual_model}
+          </span>
+        ) : null}
       </span>
     </article>
   )
@@ -252,7 +273,9 @@ export function MessageList({
   onRequirementChanged,
   hasMore = false,
   loadingMore = false,
+  loadMoreError,
   onLoadMore,
+  onRetryLoadMore,
   onErrorAction,
 }: MessageListProps) {
   return (
@@ -279,7 +302,20 @@ export function MessageList({
         />
       ))}
 
-      {hasMore && onLoadMore !== undefined ? (
+      {loadMoreError !== undefined && loadMoreError !== null ? (
+        <div
+          data-testid="load-more-error"
+          role="alert"
+          className="flex flex-wrap items-center justify-center gap-2"
+        >
+          <p className="text-[11px] text-destructive">加载更多消息失败。</p>
+          {onRetryLoadMore !== undefined ? (
+            <Button variant="secondary" size="sm" disabled={loadingMore} onClick={onRetryLoadMore}>
+              重试加载
+            </Button>
+          ) : null}
+        </div>
+      ) : hasMore && onLoadMore !== undefined ? (
         <div className="flex justify-center">
           <Button variant="secondary" size="sm" disabled={loadingMore} onClick={onLoadMore}>
             {loadingMore ? "加载中…" : "加载更多消息"}
