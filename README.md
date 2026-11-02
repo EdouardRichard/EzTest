@@ -245,9 +245,22 @@ cd .\eztest\eztest-0.2.0-preview.1-windows-x64
 Run these commands from the folder that directly contains `init-config.ps1` and
 `start-eztest.ps1` (the `eztest-0.2.0-preview.1-windows-x64` directory inside the extraction
 destination). If PowerShell says `.\init-config.ps1` is not recognized, you are in a parent folder —
-use `Get-ChildItem -Recurse -Filter init-config.ps1` to locate the package folder and `cd` into it. If
-script execution is blocked by the execution policy, run
-`powershell -NoProfile -ExecutionPolicy Bypass -File .\init-config.ps1 -DatabaseUrl "..."` instead.
+use `Get-ChildItem -Recurse -Filter init-config.ps1` to locate the package folder and `cd` into it.
+
+The package scripts are not code-signed. If PowerShell refuses to load them with
+"... is not digitally signed. You cannot run this script on the current system", allow just the
+current window (no system-wide change) and run the commands normally:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\init-config.ps1 -DatabaseUrl "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
+.\start-eztest.ps1
+```
+
+Alternatively run each script through a bypassed process instead:
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\init-config.ps1 -DatabaseUrl "..."` (same for
+`start-eztest.ps1` / `stop-eztest.ps1` / `status-eztest.ps1` / `smoke-test.ps1`). The Linux `.sh`
+scripts are not affected.
 
 ```bash
 # Linux (x64) — extract and enter the package folder
