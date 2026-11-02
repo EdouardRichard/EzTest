@@ -30,6 +30,8 @@ var _ llmapp.Adapter = (*responsesAdapter)(nil)
 // ProtocolError is a non-retryable upstream protocol/capability rejection: the
 // request shape, model capability or credentials are wrong, so a retry cannot
 // help. It carries the upstream HTTP status and the redacted provider message.
+// It implements llmapp.ClassifiedError and classifies as llmapp.ErrProtocol so
+// the application can map it without importing infrastructure (R25).
 type ProtocolError struct {
 	StatusCode int
 	Message    string
@@ -47,10 +49,34 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("llm provider protocol error (HTTP %d): %s", e.StatusCode, e.Message)
 }
 
+// LLMErrorKind classifies the failure as a non-retryable protocol rejection.
+func (e *ProtocolError) LLMErrorKind() llmapp.LLMErrorKind { return llmapp.LLMKindProtocol }
+
+// HTTPStatusCode returns the upstream HTTP status that caused the rejection.
+func (e *ProtocolError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.StatusCode
+}
+
+// UpstreamMessage returns the already redacted provider message.
+func (e *ProtocolError) UpstreamMessage() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+// Is maps the typed error onto the application sentinel.
+func (e *ProtocolError) Is(target error) bool { return target == llmapp.ErrProtocol }
+
 // TransientError marks an upstream/transport failure that a later attempt may
-// recover from: HTTP 429/5xx, an empty response or a broken stream.
+// recover from: HTTP 429/5xx, an empty response or a broken stream. It
+// implements llmapp.ClassifiedError and classifies as llmapp.ErrTransient.
 type TransientError struct {
-	Err error
+	StatusCode int
+	Err        error
 }
 
 // Error delegates to the wrapped failure.
@@ -68,6 +94,23 @@ func (e *TransientError) Unwrap() error {
 	}
 	return e.Err
 }
+
+// LLMErrorKind classifies the failure as retryable transient.
+func (e *TransientError) LLMErrorKind() llmapp.LLMErrorKind { return llmapp.LLMKindTransient }
+
+// HTTPStatusCode returns the upstream HTTP status (0 for transport failures).
+func (e *TransientError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.StatusCode
+}
+
+// UpstreamMessage returns the redacted transport/provider message.
+func (e *TransientError) UpstreamMessage() string { return e.Error() }
+
+// Is maps the typed error onto the application sentinel.
+func (e *TransientError) Is(target error) bool { return target == llmapp.ErrTransient }
 
 // Chat performs one non-streaming POST /responses completion and normalizes the
 // output items back into the application response. Transient failures are
@@ -208,7 +251,7 @@ func responsesHTTPError(cfg llm.Config, status int, raw []byte) error {
 		return fmt.Errorf("%w: provider returned HTTP %d", llmapp.ErrContextOverflow, status)
 	}
 	if status == http.StatusTooManyRequests || status >= 500 {
-		return &TransientError{Err: fmt.Errorf("llm provider returned HTTP %d: %s", status, message)}
+		return &TransientError{StatusCode: status, Err: fmt.Errorf("llm provider returned HTTP %d: %s", status, message)}
 	}
 	return &ProtocolError{StatusCode: status, Message: message}
 }
@@ -317,7 +360,8 @@ func buildResponsesPayload(cfg llm.Config, req llmapp.ChatRequest, stream bool) 
 func parseResponsesResponse(raw []byte, cfg llm.Config, names *toolNameMapping) (llmapp.ChatResponse, error) {
 	var payload responsesResponsePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return llmapp.ChatResponse{}, errors.New("decode llm responses response failed")
+		// A malformed success body is a protocol failure, not a transient one.
+		return llmapp.ChatResponse{}, &ProtocolError{StatusCode: http.StatusOK, Message: "decode llm responses response failed"}
 	}
 	response, empty := normalizeResponsesResponse(payload, names)
 	if payload.Status == "failed" {

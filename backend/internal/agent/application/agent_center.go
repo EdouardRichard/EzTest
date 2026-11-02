@@ -115,12 +115,19 @@ type RunRow struct {
 	TerminalReason *string
 	Turns          int
 	Usage          map[string]int
+	Model          string
+	ConfigID       int64
+	FallbackFrom   string
+	Tokens         map[string]int
+	Cache          map[string]int
 	StartedAt      *time.Time
 	FinishedAt     *time.Time
 }
 
 // RunView is one AgentRunView of the frozen contract. VersionTitle is resolved
 // through the version application port and omitted when the version is gone.
+// Model/ConfigID/FallbackFrom/Tokens/Cache expose the actual run target and the
+// token/cache accounting recorded on agent_run (spec §7.3/§7.5).
 type RunView struct {
 	ID             int64
 	ProfileKey     string
@@ -133,6 +140,11 @@ type RunView struct {
 	TerminalReason *string
 	Turns          int
 	Usage          map[string]int
+	Model          string
+	ConfigID       int64
+	FallbackFrom   string
+	Tokens         map[string]int
+	Cache          map[string]int
 	StartedAt      *time.Time
 	FinishedAt     *time.Time
 }
@@ -308,6 +320,11 @@ func (s *AgentCenterService) Runs(ctx context.Context, filter RunFilter) ([]RunV
 			TerminalReason: row.TerminalReason,
 			Turns:          row.Turns,
 			Usage:          row.Usage,
+			Model:          row.Model,
+			ConfigID:       row.ConfigID,
+			FallbackFrom:   row.FallbackFrom,
+			Tokens:         runAccounting(row.Tokens),
+			Cache:          runAccounting(row.Cache),
 			StartedAt:      row.StartedAt,
 			FinishedAt:     row.FinishedAt,
 		}
@@ -349,6 +366,15 @@ func (s *AgentCenterService) Quality(ctx context.Context) (QualityView, error) {
 		}
 	}
 	return QualityView{Latest: latest, RunStats: total}, nil
+}
+
+// runAccounting returns a non-nil JSON object for the token/cache columns so
+// the run view never renders null.
+func runAccounting(values map[string]int) map[string]int {
+	if values == nil {
+		return map[string]int{}
+	}
+	return values
 }
 
 func normalizeRunFilter(filter RunFilter) (RunQuery, error) {

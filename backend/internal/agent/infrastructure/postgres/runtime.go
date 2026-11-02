@@ -19,7 +19,7 @@ const profileColumns = `id, key, name, system_prompt, allowed_tools, model, budg
 
 const runColumns = `id, profile_key, work_item_id, conversation_id, status, terminal_reason,
 	turns, usage, owner_instance, lease_epoch, context_packet_id, started_at, finished_at,
-	model, config_id, fallback_from`
+	model, config_id, fallback_from, tokens, cache`
 
 const messageColumns = `id, run_id, conversation_id, role, parts, tool_calls, tool_call_id,
 	usage, created_at`
@@ -132,6 +132,22 @@ func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (
 	if err != nil {
 		return agent.AgentRun{}, err
 	}
+	tokens := run.Tokens
+	if tokens == nil {
+		tokens = map[string]int{}
+	}
+	encodedTokens, err := encodeJSONObject("run tokens", tokens)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
+	cache := run.Cache
+	if cache == nil {
+		cache = map[string]int{}
+	}
+	encodedCache, err := encodeJSONObject("run cache", cache)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
 	startedAt := timeOrNow(run.StartedAt)
 	var configID *int64
 	if run.ConfigID > 0 {
@@ -147,11 +163,12 @@ func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (
 	stored, err := scanRun(r.pool.QueryRow(ctx, `
 		INSERT INTO agent_run (id, profile_key, work_item_id, conversation_id, status,
 			terminal_reason, turns, usage, owner_instance, lease_epoch, context_packet_id,
-			started_at, finished_at, model, config_id, fallback_from)
-		VALUES ($1, $2, $3, $4, 'running', NULL, 0, $5::jsonb, $6, $7, NULL, $8, NULL, $9, $10, $11)
+			started_at, finished_at, model, config_id, fallback_from, tokens, cache)
+		VALUES ($1, $2, $3, $4, 'running', NULL, 0, $5::jsonb, $6, $7, NULL, $8, NULL, $9, $10, $11, $12::jsonb, $13::jsonb)
 		RETURNING `+runColumns,
 		run.ID, run.ProfileKey, run.WorkItemID, run.ConversationID, encodedUsage,
-		run.OwnerInstance, run.LeaseEpoch, startedAt, run.Model, configID, fallbackFrom))
+		run.OwnerInstance, run.LeaseEpoch, startedAt, run.Model, configID, fallbackFrom,
+		encodedTokens, encodedCache))
 	if err != nil {
 		return agent.AgentRun{}, wrapDB("create agent run", err)
 	}
@@ -176,6 +193,22 @@ func (r *RuntimeRepository) FinishRun(ctx context.Context, run agent.AgentRun) e
 	if err != nil {
 		return err
 	}
+	tokens := run.Tokens
+	if tokens == nil {
+		tokens = map[string]int{}
+	}
+	encodedTokens, err := encodeJSONObject("run tokens", tokens)
+	if err != nil {
+		return err
+	}
+	cache := run.Cache
+	if cache == nil {
+		cache = map[string]int{}
+	}
+	encodedCache, err := encodeJSONObject("run cache", cache)
+	if err != nil {
+		return err
+	}
 	finishedAt := time.Now().UTC()
 	if run.FinishedAt != nil {
 		finishedAt = timeOrNow(*run.FinishedAt)
@@ -187,10 +220,10 @@ func (r *RuntimeRepository) FinishRun(ctx context.Context, run agent.AgentRun) e
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE agent_run
 		SET status = $3, terminal_reason = $4, turns = $5, usage = $6::jsonb,
-		    finished_at = $7
+		    tokens = $7::jsonb, cache = $8::jsonb, finished_at = $9
 		WHERE id = $1 AND lease_epoch = $2
 	`, run.ID, run.LeaseEpoch, string(run.Status), reason, run.Turns,
-		encodedUsage, finishedAt)
+		encodedUsage, encodedTokens, encodedCache, finishedAt)
 	if err != nil {
 		return wrapDB("finish agent run", err)
 	}
@@ -347,13 +380,13 @@ func scanProfile(row rowScanner) (agent.AgentProfile, error) {
 func scanRun(row rowScanner) (agent.AgentRun, error) {
 	var run agent.AgentRun
 	var status string
-	var usageRaw []byte
+	var usageRaw, tokensRaw, cacheRaw []byte
 	var configID *int64
 	var fallbackFrom *string
 	if err := row.Scan(&run.ID, &run.ProfileKey, &run.WorkItemID, &run.ConversationID,
 		&status, &run.TerminalReason, &run.Turns, &usageRaw, &run.OwnerInstance,
 		&run.LeaseEpoch, &run.ContextPacketID, &run.StartedAt, &run.FinishedAt,
-		&run.Model, &configID, &fallbackFrom); err != nil {
+		&run.Model, &configID, &fallbackFrom, &tokensRaw, &cacheRaw); err != nil {
 		return agent.AgentRun{}, err
 	}
 	if configID != nil {
@@ -367,6 +400,18 @@ func scanRun(row rowScanner) (agent.AgentRun, error) {
 	if len(usageRaw) > 0 {
 		if err := json.Unmarshal(usageRaw, &run.Usage); err != nil {
 			return agent.AgentRun{}, fmt.Errorf("decode run usage: %w", err)
+		}
+	}
+	run.Tokens = map[string]int{}
+	if len(tokensRaw) > 0 {
+		if err := json.Unmarshal(tokensRaw, &run.Tokens); err != nil {
+			return agent.AgentRun{}, fmt.Errorf("decode run tokens: %w", err)
+		}
+	}
+	run.Cache = map[string]int{}
+	if len(cacheRaw) > 0 {
+		if err := json.Unmarshal(cacheRaw, &run.Cache); err != nil {
+			return agent.AgentRun{}, fmt.Errorf("decode run cache: %w", err)
 		}
 	}
 	return run, nil

@@ -221,23 +221,13 @@ func WithSettingsReader(reader SettingsReader) Option {
 // cfgID selects that configuration (0 selects the default configuration), and
 // a non-empty modelID selects that catalog model. An empty modelID selects the
 // configuration's explicit default_model_id; models[0] is never used.
+//
+// The same capability gate backs the direct Chat path (R42): thinking settings
+// that make the adapter send reasoning parameters require a reasoning-capable
+// model in both paths.
 func (s *Service) ResolveModel(ctx context.Context, cfgID int64, modelID string, required ...ModelRequirements) (ModelInfo, error) {
-	cfg, chosen, err := s.resolveChatTarget(ctx, cfgID, modelID)
+	_, chosen, err := s.resolveModelTarget(ctx, cfgID, modelID, required...)
 	if err != nil {
-		return ModelInfo{}, err
-	}
-	requirements := append([]ModelRequirements(nil), required...)
-	if err := validateThinkingSettings(cfg); err != nil {
-		return ModelInfo{}, err
-	}
-	// Both adapters forward any non-none reasoning effort, independent of the
-	// thinking mode, so an explicit effort also requires a reasoning-capable
-	// model (spec §7.2/§7.3).
-	if cfg.EffectiveThinkingType() == llm.ThinkingTypeEnabled ||
-		cfg.EffectiveReasoningEffort() != llm.ReasoningEffortNone {
-		requirements = append(requirements, ModelRequirements{Reasoning: true})
-	}
-	if err := validateModelCapabilities(chosen, requirements...); err != nil {
 		return ModelInfo{}, err
 	}
 	capabilities := chosen.EffectiveCapabilities()
@@ -252,6 +242,32 @@ func (s *Service) ResolveModel(ctx context.Context, cfgID int64, modelID string,
 		SupportsTools: capabilities.SupportsTools,
 		Capabilities:  capabilities,
 	}, nil
+}
+
+// resolveModelTarget selects the configuration/model and validates every
+// capability requirement implied by the caller and by the stored thinking
+// settings. It is shared by ResolveModel and the direct Chat path so a
+// reasoning config can never bypass the capability gate (R42, spec §7.3).
+func (s *Service) resolveModelTarget(ctx context.Context, cfgID int64, modelID string, required ...ModelRequirements) (llm.Config, llm.Model, error) {
+	cfg, chosen, err := s.resolveChatTarget(ctx, cfgID, modelID)
+	if err != nil {
+		return llm.Config{}, llm.Model{}, err
+	}
+	requirements := append([]ModelRequirements(nil), required...)
+	if err := validateThinkingSettings(cfg); err != nil {
+		return llm.Config{}, llm.Model{}, err
+	}
+	// Both adapters forward any non-none reasoning effort, independent of the
+	// thinking mode, so an explicit effort also requires a reasoning-capable
+	// model (spec §7.2/§7.3).
+	if cfg.EffectiveThinkingType() == llm.ThinkingTypeEnabled ||
+		cfg.EffectiveReasoningEffort() != llm.ReasoningEffortNone {
+		requirements = append(requirements, ModelRequirements{Reasoning: true})
+	}
+	if err := validateModelCapabilities(chosen, requirements...); err != nil {
+		return llm.Config{}, llm.Model{}, err
+	}
+	return cfg, chosen, nil
 }
 
 // validateThinkingSettings rejects the contradictory combination of disabled
@@ -278,12 +294,12 @@ func validateThinkingSettings(cfg llm.Config) error {
 }
 
 // Chat performs one completion against the default OpenAI-compatible upstream.
+// It resolves the target through the same capability gate as ResolveModel
+// (including the reasoning settings) so the direct path used by the summarizer
+// cannot send reasoning parameters to a non-reasoning model (R42).
 func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	cfg, chosen, err := s.resolveChatTarget(ctx, 0, req.Model)
+	cfg, chosen, err := s.resolveModelTarget(ctx, 0, req.Model)
 	if err != nil {
-		return ChatResponse{}, err
-	}
-	if err := validateThinkingSettings(cfg); err != nil {
 		return ChatResponse{}, err
 	}
 	if s.settings != nil {
@@ -470,12 +486,19 @@ func contextOverflowError() *platform.Error {
 	}
 }
 
-// mapChatError normalizes upstream failures: context overflows stay
-// recognizable as such (the runner compacts and retries), everything else
-// becomes a retryable ai_unavailable with the API key redacted.
+// mapChatError normalizes upstream failures through the application taxonomy:
+// context overflows stay recognizable as such (the runner compacts and
+// retries), classified protocol/capability/auth rejections become non-retryable
+// typed 400s with an actionable next step, classified transient failures stay a
+// retryable 503 ai_unavailable, and unclassified errors keep the legacy generic
+// 503. Infrastructure types are never imported (R25); classification travels
+// through errors.Is/errors.As. The API key is always redacted.
 func mapChatError(err error, secret string) error {
 	if IsContextOverflow(err) {
 		return contextOverflowError()
+	}
+	if classified, ok := classifyLLMError(err); ok {
+		return classifiedPlatformError(classified, secret)
 	}
 	var apiErr *platform.Error
 	if errors.As(err, &apiErr) {

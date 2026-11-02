@@ -584,6 +584,8 @@ func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile age
 		Model:         model.Model,
 		ConfigID:      model.ConfigID,
 		FallbackFrom:  model.FallbackFrom,
+		Tokens:        map[string]int{},
+		Cache:         map[string]int{},
 		WorkItemID:    &item.ID,
 		Status:        agent.AgentRunRunning,
 		OwnerInstance: r.instanceID,
@@ -752,7 +754,11 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return "", contextRunError(ctxErr)
 			}
-			return "", &RunError{Reason: "model_error", Retryable: true, Cause: err}
+			// A protocol/capability rejection cannot succeed on a later work-item
+			// attempt: the model is never switched automatically (D24), so the
+			// run fails after the single upstream call and the user is asked to
+			// check the capability/protocol (spec §5.6).
+			return "", &RunError{Reason: "model_error", Retryable: !llmapp.IsProtocol(err), Cause: err}
 		}
 		state.turns++
 		mergeUsage(state.usage, response.Usage)
@@ -1139,6 +1145,13 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 	state.run.Status = status
 	state.run.Turns = state.turns
 	state.run.Usage = state.usage
+	// Tokens mirrors the aggregated usage into the 0.2.1 token-accounting column;
+	// cache stays a persisted (possibly empty) object until a provider reports
+	// prompt-cache statistics (spec §7.5).
+	state.run.Tokens = copyUsage(state.usage)
+	if state.run.Cache == nil {
+		state.run.Cache = map[string]int{}
+	}
 	state.run.FinishedAt = &finishedAt
 	state.run.TerminalReason = nil
 	if reason != "" {
@@ -2124,6 +2137,16 @@ func mergeUsage(target map[string]int, addition map[string]int) {
 	for key, value := range addition {
 		target[key] += value
 	}
+}
+
+// copyUsage returns a non-nil copy so the persisted token snapshot cannot be
+// mutated by a later usage merge.
+func copyUsage(source map[string]int) map[string]int {
+	target := make(map[string]int, len(source))
+	for key, value := range source {
+		target[key] = value
+	}
+	return target
 }
 
 func contextRunError(err error) error {

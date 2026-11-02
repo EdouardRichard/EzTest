@@ -125,12 +125,15 @@ func (a *chatCompletionsAdapter) Chat(ctx context.Context, req llmapp.ChatReques
 				return llmapp.ChatResponse{}, contextErr(ctx, err)
 			}
 		}
-		response, retryable, err := a.doChat(ctx, payload, names)
+		response, err := a.doChat(ctx, payload, names)
 		if err == nil {
 			return response, nil
 		}
 		lastErr = err
-		if !retryable || ctx.Err() != nil {
+		// Only errors classified as transient are retried: a 4xx
+		// parameter/capability rejection is never replayed, and no retry ever
+		// switches to a different model (D24).
+		if !errors.Is(err, llmapp.ErrTransient) || ctx.Err() != nil {
 			break
 		}
 	}
@@ -148,9 +151,11 @@ func (a *chatCompletionsAdapter) Stream(context.Context, llmapp.ChatRequest, fun
 	return fmt.Errorf("llm chat completions streaming is not implemented yet: %w", llmapp.ErrNotImplemented)
 }
 
-// doChat performs one attempt with the per-config request timeout and returns
-// whether the failure is retryable.
-func (a *chatCompletionsAdapter) doChat(ctx context.Context, payload chatRequestPayload, names *toolNameMapping) (llmapp.ChatResponse, bool, error) {
+// doChat performs one attempt with the per-config request timeout. Failures are
+// typed with the application classification: ErrTransient marks a retryable
+// transport/429/5xx/empty response, ProtocolError marks a non-retryable
+// parameter/capability rejection.
+func (a *chatCompletionsAdapter) doChat(ctx context.Context, payload chatRequestPayload, names *toolNameMapping) (llmapp.ChatResponse, error) {
 	cfg := a.cfg
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -161,40 +166,39 @@ func (a *chatCompletionsAdapter) doChat(ctx context.Context, payload chatRequest
 
 	request, err := a.client.newRequest(attemptCtx, cfg, http.MethodPost, "/chat/completions", payload)
 	if err != nil {
-		return llmapp.ChatResponse{}, false, err
+		return llmapp.ChatResponse{}, err
 	}
 	response, err := a.client.http.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
-			return llmapp.ChatResponse{}, false, contextErr(ctx, err)
+			return llmapp.ChatResponse{}, contextErr(ctx, err)
 		}
 		if isTimeout(err) {
-			return llmapp.ChatResponse{}, true, errors.New("llm provider request timed out")
+			return llmapp.ChatResponse{}, &TransientError{Err: errors.New("llm provider request timed out")}
 		}
-		return llmapp.ChatResponse{}, true, errors.New("llm provider request failed")
+		return llmapp.ChatResponse{}, &TransientError{Err: errors.New("llm provider request failed")}
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBytes))
-		retryable, err := classifyChatFailure(cfg, response.StatusCode, raw)
-		return llmapp.ChatResponse{}, retryable, err
+		return llmapp.ChatResponse{}, classifyChatFailure(cfg, response.StatusCode, raw)
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
 	if err != nil {
-		return llmapp.ChatResponse{}, true, fmt.Errorf("read llm chat response failed: %w", err)
+		return llmapp.ChatResponse{}, &TransientError{Err: fmt.Errorf("read llm chat response failed: %w", err)}
 	}
 	parsed, err := parseChatCompletion(raw, names)
 	if err != nil {
-		return llmapp.ChatResponse{}, false, err
+		return llmapp.ChatResponse{}, err
 	}
-	return parsed, false, nil
+	return parsed, nil
 }
 
-// classifyChatFailure turns a non-2xx upstream response into a safe error and
-// reports whether it may be retried. 429/5xx are transient; 4xx are permanent.
-func classifyChatFailure(cfg llm.Config, status int, raw []byte) (bool, error) {
+// classifyChatFailure turns a non-2xx upstream response into a safe typed error.
+// 429/5xx are transient; other 4xx are non-retryable protocol rejections.
+func classifyChatFailure(cfg llm.Config, status int, raw []byte) error {
 	var payload chatErrorPayload
 	message := ""
 	code := ""
@@ -212,10 +216,12 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) (bool, error) {
 	}
 	message = sanitizeUpstreamMessage(message, cfg.APIKey, 300)
 	if isChatContextOverflow(status, code, message) {
-		return false, fmt.Errorf("%w: provider returned HTTP %d", llmapp.ErrContextOverflow, status)
+		return fmt.Errorf("%w: provider returned HTTP %d", llmapp.ErrContextOverflow, status)
 	}
-	retryable := status == http.StatusTooManyRequests || status >= 500
-	return retryable, fmt.Errorf("llm provider returned HTTP %d: %s", status, message)
+	if status == http.StatusTooManyRequests || status >= 500 {
+		return &TransientError{StatusCode: status, Err: fmt.Errorf("llm provider returned HTTP %d: %s", status, message)}
+	}
+	return &ProtocolError{StatusCode: status, Message: message}
 }
 
 // buildChatPayload maps the application request to the OpenAI wire format.
@@ -311,10 +317,12 @@ func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayloa
 func parseChatCompletion(raw []byte, names *toolNameMapping) (llmapp.ChatResponse, error) {
 	var payload chatCompletionPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return llmapp.ChatResponse{}, errors.New("decode llm chat response failed")
+		// A malformed success body is a protocol failure, not a transient one.
+		return llmapp.ChatResponse{}, &ProtocolError{StatusCode: http.StatusOK, Message: "decode llm chat response failed"}
 	}
 	if len(payload.Choices) == 0 {
-		return llmapp.ChatResponse{}, errors.New("llm provider returned no choices")
+		// An empty completion is retryable (spec §5.6: 空响应按退避重试).
+		return llmapp.ChatResponse{}, &TransientError{Err: errors.New("llm provider returned no choices")}
 	}
 	choice := payload.Choices[0]
 	response := llmapp.ChatResponse{

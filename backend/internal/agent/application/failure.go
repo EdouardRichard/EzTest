@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
@@ -29,6 +30,8 @@ const (
 const (
 	FailureActionRetry            = "自动重试"
 	FailureActionSwitchModel      = "更换模型或调整模型配置"
+	FailureActionCheckModel       = "检查模型能力/协议"
+	FailureActionCheckCredentials = "检查模型配置与凭据"
 	FailureActionSettlement       = "写回部分产物并生成摘要"
 	FailureActionToolRetry        = "重试、更换策略或转人工"
 	FailureActionExecutorRecovery = "等待执行器恢复后重排或更换执行器"
@@ -94,7 +97,11 @@ func Classify(err error) Failure {
 				// Transient LLM failures are retried with backoff and not shown.
 				return Failure{Kind: FailureKindModelError, Retryable: true, UserVisible: false, Action: FailureActionRetry}
 			}
-			return Failure{Kind: FailureKindModelError, Retryable: false, UserVisible: true, Action: FailureActionSwitchModel}
+			// Protocol/capability/config rejections are not a "try another
+			// model" problem only: the operator must check the capability and
+			// the parameter shape first (spec §5.6/§7.4).
+			return Failure{Kind: FailureKindModelError, Retryable: false, UserVisible: true,
+				Action: modelFailureAction(err)}
 		default:
 			return Failure{Kind: FailureKindToolFailure, Retryable: runErr.Retryable, UserVisible: true, Action: FailureActionRetryOrEscalate}
 		}
@@ -111,6 +118,12 @@ func Classify(err error) Failure {
 			return Failure{Kind: FailureKindToolFailure, Retryable: true, UserVisible: true, Action: FailureActionExecutorRecovery}
 		case "ai_unavailable", "rate_limited", "provider_unavailable":
 			return Failure{Kind: FailureKindModelError, Retryable: true, UserVisible: false, Action: FailureActionRetry}
+		case "llm_protocol_error", "invalid_model", "llm_capability_mismatch", "llm_config_invalid":
+			return Failure{Kind: FailureKindModelError, Retryable: false, UserVisible: true,
+				Action: FailureActionCheckModel}
+		case "llm_auth_failed":
+			return Failure{Kind: FailureKindModelError, Retryable: false, UserVisible: true,
+				Action: FailureActionCheckCredentials}
 		case "unavailable":
 			return Failure{Kind: FailureKindToolFailure, Retryable: true, UserVisible: true, Action: FailureActionToolRetry}
 		}
@@ -126,4 +139,24 @@ func Classify(err error) Failure {
 		return Failure{Kind: FailureKindInterrupted, Retryable: false, UserVisible: false, Action: FailureActionRequeue}
 	}
 	return Failure{Kind: FailureKindToolFailure, Retryable: true, UserVisible: true, Action: FailureActionRetryOrEscalate}
+}
+
+// modelFailureAction picks the actionable next step of a non-retryable model
+// failure from the stable LLM error code. A protocol/capability rejection asks
+// the operator to check the capability/protocol; unknown causes keep the
+// switch-model hint (spec §7.4: the message must be executable).
+func modelFailureAction(err error) string {
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) {
+		return FailureActionSwitchModel
+	}
+	switch apiErr.Code {
+	case llmapp.CodeLLMProtocolError, llmapp.CodeInvalidModel,
+		llmapp.CodeLLMCapabilityMismatch, llmapp.CodeLLMConfigInvalid:
+		return FailureActionCheckModel
+	case llmapp.CodeLLMAuthFailed:
+		return FailureActionCheckCredentials
+	default:
+		return FailureActionSwitchModel
+	}
 }
