@@ -183,8 +183,10 @@ func (s *ConversationService) Messages(ctx context.Context, versionID, conversat
 
 // PostUserMessage validates and stores one user message. A repeated
 // client_message_id returns the already-stored message without new side
-// effects; attachments are registered only after the message insert wins so a
-// failed or idempotent post cannot leave attachment rows for a missing message.
+// effects. Attachment rows are pre-registered before the insert so the §8.5
+// gate can observe a brand-new upload's extraction status; a rejected post may
+// therefore leave an unlinked row, which the retry reuses (it can never leave a
+// message row for a failed attachment).
 func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart, clientMessageID string, actorID int64) (MessageView, error) {
 	if err := validateConversationIDs(versionID, conversationID); err != nil {
 		return MessageView{}, err
@@ -212,15 +214,14 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		}
 	}
 
-	// Image attachments become image parts before the message is stored so the
-	// persisted thread (and therefore the LLM transcript) carries the vision
-	// content. A referenced attachment still parsing is a typed 409 here, before
-	// any row is written (spec §8.5). The original attachment parts are kept for
-	// the post-insert registration below: its content ref row keeps the uploaded
-	// bytes alive for the storage GC and the attachment tools.
-	registrationParts := parts
+	// Attachment rows are pre-registered before the message is stored so a
+	// brand-new upload can be gated on its real extraction status (spec §8.5):
+	// if any is still parsing the typed 409 is returned here and no message row
+	// is written. Image parts are already converted, and the returned attachment
+	// IDs are the pre-registered rows linked after a successful insert.
+	attachmentIDs := []int64{}
 	if s.attachments != nil {
-		prepared, err := s.attachments.PrepareUserMessageParts(ctx, versionID, conversationID, parts)
+		prepared, ids, err := s.attachments.PrepareUserMessageParts(ctx, versionID, conversationID, parts, actorID)
 		if err != nil {
 			return MessageView{}, err
 		}
@@ -228,6 +229,7 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 			return MessageView{}, err
 		}
 		parts = prepared
+		attachmentIDs = ids
 	}
 
 	now := s.clock.Now()
@@ -255,19 +257,12 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		return toMessageView(*existing), nil
 	}
 
-	if s.attachments != nil {
-		// Registration is side-effectful (content refs + ingest tasks); do it
-		// only after the message insert wins so a failed/idempotent post never
-		// leaves attachment rows pointing at a message that does not exist. Image
-		// parts are registered from their original attachment part so the
-		// content-ledger ref exists; their row is extraction-skipped (no text is
-		// extracted from an image) while the stored message keeps the image part.
-		for _, part := range registrationParts {
-			if part.Type != version.MessagePartAttachment {
-				continue
-			}
-			_, _ = s.attachments.RegisterFromMessage(ctx, versionID, conversationID, message.ID, part, actorID)
-		}
+	if s.attachments != nil && len(attachmentIDs) > 0 {
+		// The rows already exist (pre-registered during preflight with content
+		// refs and ingest tasks); only the message linkage is missing. Linking is
+		// best effort, like the previous post-insert registration, and avoids
+		// opening the content or extracting it a second time.
+		_ = s.attachments.LinkFromMessage(ctx, versionID, message.ID, attachmentIDs)
 	}
 
 	s.publishMessageEvent(ctx, versionID, message)

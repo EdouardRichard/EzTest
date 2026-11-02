@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { useState } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -23,6 +24,23 @@ function ErrorHarness(props: {
   error: unknown
 }) {
   return <Composer onSend={props.onSend} error={props.error} />
+}
+
+function PendingRetryHarness(props: {
+  onSend: (parts: NewMessagePart[]) => Promise<boolean>
+  pendingError: ApiError
+}) {
+  const [error, setError] = useState<unknown>(undefined)
+  return (
+    <Composer
+      error={error}
+      onSend={async (parts) => {
+        const sent = await props.onSend(parts)
+        setError(sent ? undefined : props.pendingError)
+        return sent
+      }}
+    />
+  )
 }
 
 describe("Composer", () => {
@@ -263,5 +281,38 @@ describe("Composer", () => {
         size: 12,
       },
     ])
+  })
+
+  it("keeps the message and retries after a 409 attachment_pending", async () => {
+    api.uploadContent.mockResolvedValue({ ...CONTENT, mime: "text/markdown" })
+    const pendingError = new ApiError({
+      status: 409,
+      code: "attachment_pending",
+      message: "附件解析中，可重试",
+      retryable: true,
+    })
+    const onSend = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+
+    render(<PendingRetryHarness onSend={onSend} pendingError={pendingError} />)
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["# spec"], "spec.md", { type: "text/markdown" })] },
+    })
+    await screen.findByText("spec.md")
+
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText("附件解析中，可重试")).toBeInTheDocument()
+    // The draft and the uploaded attachment survive the rejected send.
+    expect(textarea).toHaveValue("请读附件")
+    expect(screen.getByText("spec.md")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "重试发送" }))
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][0]).toEqual(onSend.mock.calls[0][0])
+    await waitFor(() => expect(textarea).toHaveValue(""))
+    await waitFor(() => expect(screen.queryByText("spec.md")).not.toBeInTheDocument())
   })
 })

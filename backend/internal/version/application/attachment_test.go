@@ -85,6 +85,31 @@ func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, co
 	return items, nil
 }
 
+func (f *fakeAttachmentRepo) ListUnlinkedByVersion(_ context.Context, versionID int64) ([]version.Attachment, error) {
+	items := make([]version.Attachment, 0)
+	for _, attachment := range f.attachments {
+		if attachment.VersionID == versionID && attachment.ConversationMessageID == nil {
+			items = append(items, attachment)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items, nil
+}
+
+func (f *fakeAttachmentRepo) LinkMessage(_ context.Context, attachmentID, messageID int64, updatedAt time.Time) error {
+	attachment, ok := f.attachments[attachmentID]
+	if !ok {
+		return version.ErrAttachmentNotFound
+	}
+	if attachment.ConversationMessageID != nil {
+		return nil
+	}
+	attachment.ConversationMessageID = &messageID
+	attachment.UpdatedAt = updatedAt
+	f.attachments[attachmentID] = attachment
+	return nil
+}
+
 func (f *fakeAttachmentRepo) ConversationExists(_ context.Context, versionID, conversationID int64) (bool, error) {
 	if len(f.conversations) == 0 {
 		return true, nil

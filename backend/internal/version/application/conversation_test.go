@@ -179,34 +179,47 @@ func (f *fakeQueue) find(taskType, dedupeKey string) (versionapp.TaskInput, bool
 }
 
 type registrarCall struct {
-	versionID int64
-	messageID int64
-	part      version.MessagePart
-	actorID   int64
+	versionID      int64
+	conversationID int64
+	messageID      int64
+	parts          []version.MessagePart
+	attachmentIDs  []int64
+	actorID        int64
 }
 
 type fakeRegistrar struct {
-	calls []registrarCall
-	err   error
-	id    int64
+	prepares []registrarCall
+	links    []registrarCall
+	err      error
+	id       int64
 }
 
-// PrepareUserMessageParts is the conversion hook: the fake keeps the parts
-// unchanged so conversation tests stay focused on message persistence.
-func (f *fakeRegistrar) PrepareUserMessageParts(_ context.Context, _, _ int64, parts []version.MessagePart) ([]version.MessagePart, error) {
-	return parts, nil
-}
-
-func (f *fakeRegistrar) RegisterFromMessage(_ context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (versionapp.AttachmentView, error) {
-	f.calls = append(f.calls, registrarCall{versionID: versionID, messageID: messageID, part: part, actorID: actorID})
+// PrepareUserMessageParts is the conversion/pre-registration hook: the fake
+// keeps the parts unchanged and hands back one attachment row for each
+// attachment part so conversation tests stay focused on message persistence.
+func (f *fakeRegistrar) PrepareUserMessageParts(_ context.Context, versionID, conversationID int64, parts []version.MessagePart, actorID int64) ([]version.MessagePart, []int64, error) {
 	if f.err != nil {
-		return versionapp.AttachmentView{}, f.err
+		return nil, nil, f.err
 	}
-	f.id++
-	return versionapp.AttachmentView{
-		ID: f.id, Name: part.Name, MIME: part.MIME, Size: part.Size,
-		ExtractionStatus: version.AttachmentPending, CreatedAt: testTime,
-	}, nil
+	ids := make([]int64, 0)
+	for _, part := range parts {
+		if part.Type != version.MessagePartAttachment {
+			continue
+		}
+		f.id++
+		ids = append(ids, f.id)
+	}
+	f.prepares = append(f.prepares, registrarCall{
+		versionID: versionID, conversationID: conversationID, parts: parts, actorID: actorID,
+	})
+	return parts, ids, nil
+}
+
+func (f *fakeRegistrar) LinkFromMessage(_ context.Context, versionID, messageID int64, attachmentIDs []int64) error {
+	f.links = append(f.links, registrarCall{
+		versionID: versionID, messageID: messageID, attachmentIDs: attachmentIDs,
+	})
+	return nil
 }
 
 // ---------- conversation test environment ----------
@@ -450,12 +463,17 @@ func TestPostUserMessageRegistersAttachmentsAndEnqueuesTasks(t *testing.T) {
 		t.Fatalf("client id = %#v", storedMessage.ClientMessageID)
 	}
 
-	if len(env.registrar.calls) != 1 {
-		t.Fatalf("registrar calls = %#v", env.registrar.calls)
+	if len(env.registrar.prepares) != 1 || len(env.registrar.links) != 1 {
+		t.Fatalf("registrar prepares = %#v, links = %#v", env.registrar.prepares, env.registrar.links)
 	}
-	call := env.registrar.calls[0]
-	if call.versionID != env.versionID || call.messageID != message.ID || call.actorID != 42 || call.part.Name != "spec.md" {
-		t.Fatalf("registrar call = %#v", call)
+	prepare := env.registrar.prepares[0]
+	if prepare.versionID != env.versionID || prepare.conversationID != conversation.ID || prepare.actorID != 42 ||
+		len(prepare.parts) != 2 || prepare.parts[1].Name != "spec.md" {
+		t.Fatalf("registrar prepare = %#v", prepare)
+	}
+	link := env.registrar.links[0]
+	if link.versionID != env.versionID || link.messageID != message.ID || len(link.attachmentIDs) != 1 {
+		t.Fatalf("registrar link = %#v", link)
 	}
 
 	replyKey := "reply:" + idString(message.ID)
@@ -504,7 +522,8 @@ func TestPostUserMessageIsIdempotent(t *testing.T) {
 	parts := []version.MessagePart{{Type: "text", Text: "hello"}}
 	first := postUserMessage(t, env, conversation.ID, parts, "same-id")
 	eventsAfterFirst := len(env.events.events)
-	registrarAfterFirst := len(env.registrar.calls)
+	preparesAfterFirst := len(env.registrar.prepares)
+	linksAfterFirst := len(env.registrar.links)
 
 	second, err := env.svc.PostUserMessage(requestContext(), env.versionID, conversation.ID, parts, "same-id", 42)
 	if err != nil {
@@ -519,7 +538,7 @@ func TestPostUserMessageIsIdempotent(t *testing.T) {
 	if len(env.events.events) != eventsAfterFirst {
 		t.Fatal("idempotent post emitted an event")
 	}
-	if len(env.registrar.calls) != registrarAfterFirst {
+	if len(env.registrar.prepares) != preparesAfterFirst || len(env.registrar.links) != linksAfterFirst {
 		t.Fatal("idempotent post registered attachments again")
 	}
 
@@ -769,8 +788,15 @@ func TestPostUserMessageStoresImagePart(t *testing.T) {
 		message.Parts[1].DataRef != sha || message.Parts[1].Width != 800 || message.Parts[1].Height != 600 {
 		t.Fatalf("parts = %#v", message.Parts)
 	}
-	if len(env.registrar.calls) != 0 {
-		t.Fatalf("image part registered as a text attachment: %#v", env.registrar.calls)
+	if len(env.registrar.links) != 0 {
+		t.Fatalf("image part registered as a text attachment: %#v", env.registrar.links)
+	}
+	for _, prepare := range env.registrar.prepares {
+		for _, part := range prepare.parts {
+			if part.Type == version.MessagePartAttachment {
+				t.Fatalf("image part sent to attachment registration: %#v", part)
+			}
+		}
 	}
 	raw, err := json.Marshal(message.Parts[1])
 	if err != nil {
@@ -936,5 +962,97 @@ func TestPostUserMessageBlocksPendingAttachment(t *testing.T) {
 	}
 	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartAttachment {
 		t.Fatalf("parts = %#v", message.Parts)
+	}
+}
+
+// TestPostUserMessageBlocksNewAttachmentUntilExtractionDone covers the normal
+// Composer flow: the content is uploaded and posted immediately, so no
+// attachment row exists before the message insert. The preflight must register
+// the row first, observe that it is still parsing, return the typed 409 and
+// leave the message uninserted. The retry after extraction must insert the
+// message, link the same row and not extract/register it twice.
+func TestPostUserMessageBlocksNewAttachmentUntilExtractionDone(t *testing.T) {
+	env := newImageConversationEnv(t)
+	data := []byte("# 需求")
+	sha := strings.Repeat("d", 64)
+	env.attachments.store.put(sha, data, "text/markdown")
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请读附件"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "spec.md", MIME: "text/markdown", Size: int64(len(data))},
+	}
+
+	_, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "new-attachment-1", 42)
+	if err == nil {
+		t.Fatal("message referencing a brand-new attachment was accepted while extraction is pending")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusConflict || apiErr.Code != "attachment_pending" || !apiErr.Retryable {
+		t.Fatalf("error = %#v, want a retryable 409 attachment_pending", apiErr)
+	}
+	if !strings.Contains(apiErr.Message, "解析中") {
+		t.Fatalf("error message = %q, want the parsing hint", apiErr.Message)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 {
+		t.Fatalf("blocked message was stored: %#v", env.repo.messages[env.conversation.ID])
+	}
+	if len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("pre-registered attachment rows = %#v", env.attachments.repo.attachments)
+	}
+	var pending version.Attachment
+	for _, row := range env.attachments.repo.attachments {
+		pending = row
+	}
+	if pending.ConversationMessageID != nil {
+		t.Fatalf("attachment row was linked before the message insert: %#v", pending)
+	}
+	if pending.ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("status = %q, want pending", pending.ExtractionStatus)
+	}
+	if _, ok := env.attachments.queue.find("attachment.ingest", "attachment:"+idString(pending.ID)); !ok {
+		t.Fatalf("pre-registered attachment did not enqueue extraction: %#v", env.attachments.queue.tasks)
+	}
+
+	// A retry while the row is still pending is rejected again, still leaving
+	// the message uninserted and the row single.
+	if _, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "new-attachment-1", 42); err == nil {
+		t.Fatal("message accepted while the pre-registered attachment is still pending")
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 || len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("pending retry inserted rows: messages=%d rows=%d",
+			len(env.repo.messages[env.conversation.ID]), len(env.attachments.repo.attachments))
+	}
+
+	env.attachments.extractor.text = "附件正文"
+	if _, err := env.attachments.svc.Extract(requestContext(), pending.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	message, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "new-attachment-2", 42)
+	if err != nil {
+		t.Fatalf("PostUserMessage after extraction: %v", err)
+	}
+	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartAttachment ||
+		message.Parts[1].SHA256 != sha || message.Parts[1].Name != "spec.md" {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+	if len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("retry created duplicate attachment rows: %#v", env.attachments.repo.attachments)
+	}
+	linked := env.attachments.repo.attachments[pending.ID]
+	if linked.ConversationMessageID == nil || *linked.ConversationMessageID != message.ID {
+		t.Fatalf("existing row was not linked to the message: %#v (message %d)", linked, message.ID)
+	}
+	if linked.ExtractionStatus != version.AttachmentDone {
+		t.Fatalf("linked row status = %q", linked.ExtractionStatus)
+	}
+	if env.attachments.extractor.calls != 1 || len(env.attachments.store.uploads) != 1 {
+		t.Fatalf("retry extracted twice: calls=%d uploads=%d",
+			env.attachments.extractor.calls, len(env.attachments.store.uploads))
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 1 {
+		t.Fatalf("messages = %d", len(env.repo.messages[env.conversation.ID]))
 	}
 }

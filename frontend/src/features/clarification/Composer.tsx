@@ -5,6 +5,7 @@ import { type ClipboardEvent, type DragEvent, type KeyboardEvent, useRef, useSta
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { InlineError } from "@/components/ui/ErrorState"
+import { ApiError } from "@/lib/api-client"
 
 import { AttachmentUploader, type AttachmentUploaderHandle } from "./AttachmentUploader"
 import type { NewMessagePart, UploadedAttachment } from "./types"
@@ -47,6 +48,10 @@ export function Composer({
   // submitted (spec §8.5); the server repeats this with a typed 409
   // attachment_pending when a referenced attachment is still parsing.
   const blocked = disabled || sending || uploading
+  // The server rejects a send whose attachment is still parsing with a typed
+  // 409. Keep the draft/attachments and offer an explicit retry instead of
+  // silently re-submitting or dropping the message.
+  const attachmentPending = error instanceof ApiError && error.code === "attachment_pending"
 
   function updateValue(next: string): void {
     if (text === undefined) setInternalValue(next)
@@ -156,8 +161,20 @@ export function Composer({
         </div>
       </div>
       {error !== undefined ? (
-        <div className="pt-1.5">
+        <div className="flex flex-wrap items-center gap-2 pt-1.5">
           <InlineError error={error} />
+          {attachmentPending ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={blocked || !hasContent}
+              onClick={() => {
+                void submit()
+              }}
+            >
+              重试发送
+            </Button>
+          ) : null}
         </div>
       ) : null}
     </div>

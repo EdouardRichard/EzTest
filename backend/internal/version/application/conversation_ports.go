@@ -26,13 +26,17 @@ type TaskEnqueuer interface {
 
 // MessageAttachmentRegistrar validates a message attachment part against the
 // content ledger, converts image attachments into image parts before the
-// message is stored, guards pending references, and persists the
-// requirement_attachment runtime row. The attachment service implements it;
-// conversation messages never block on extraction.
+// message is stored, pre-registers/reuses the requirement_attachment runtime
+// rows, and enforces the §8.5 "done or parsing" submit gate. The attachment
+// service implements it.
 type MessageAttachmentRegistrar interface {
-	// PrepareUserMessageParts converts image attachment parts into image parts
-	// and returns the typed 409 attachment_pending when the message references
-	// an attachment that is still parsing.
-	PrepareUserMessageParts(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart) ([]version.MessagePart, error)
-	RegisterFromMessage(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error)
+	// PrepareUserMessageParts converts image attachment parts into image parts,
+	// pre-registers (or reuses) the attachment rows for the message's attachment
+	// parts and returns the typed 409 attachment_pending when any referenced
+	// attachment is still parsing. attachmentIDs are the unlinked rows that
+	// must be linked to the message once the insert wins.
+	PrepareUserMessageParts(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart, actorID int64) ([]version.MessagePart, []int64, error)
+	// LinkFromMessage binds pre-registered attachment rows to the inserted
+	// message without re-reading the content or re-running extraction.
+	LinkFromMessage(ctx context.Context, versionID, messageID int64, attachmentIDs []int64) error
 }

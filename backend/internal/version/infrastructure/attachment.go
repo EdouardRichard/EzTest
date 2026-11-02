@@ -116,6 +116,33 @@ func (r *AttachmentRepository) ListByConversation(ctx context.Context, versionID
 	return attachments, nil
 }
 
+// ListUnlinkedByVersion returns the attachment rows pre-registered before their
+// message insert. They have no conversation linkage yet and are reused by the
+// message post retry so extraction is not duplicated.
+func (r *AttachmentRepository) ListUnlinkedByVersion(ctx context.Context, versionID int64) ([]version.Attachment, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+attachmentColumns+` FROM requirement_attachment
+		WHERE version_id = $1 AND conversation_message_id IS NULL
+		ORDER BY id
+	`, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("list unlinked attachments: %w", err)
+	}
+	defer rows.Close()
+	attachments := make([]version.Attachment, 0)
+	for rows.Next() {
+		attachment, err := scanAttachment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan unlinked attachment: %w", err)
+		}
+		attachments = append(attachments, attachment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list unlinked attachments: %w", err)
+	}
+	return attachments, nil
+}
+
 // ConversationExists reports whether the conversation exists in the version.
 // Attachments never cross versions.
 func (r *AttachmentRepository) ConversationExists(ctx context.Context, versionID, conversationID int64) (bool, error) {
@@ -206,6 +233,24 @@ func (r *AttachmentRepository) MarkFailed(ctx context.Context, attachmentID int6
 		return nil
 	}
 	return r.ensureAttachmentExists(ctx, attachmentID, "mark attachment failed")
+}
+
+// LinkMessage binds a pre-registered row to the inserted message. Linking the
+// same message twice is idempotent; a row already owned by another message is
+// left untouched.
+func (r *AttachmentRepository) LinkMessage(ctx context.Context, attachmentID, messageID int64, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE requirement_attachment
+		SET conversation_message_id = $2, updated_at = $3
+		WHERE id = $1 AND (conversation_message_id IS NULL OR conversation_message_id = $2)
+	`, attachmentID, messageID, updatedAt)
+	if err != nil {
+		return fmt.Errorf("link attachment to message: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	return r.ensureAttachmentExists(ctx, attachmentID, "link attachment to message")
 }
 
 func (r *AttachmentRepository) ensureAttachmentExists(ctx context.Context, attachmentID int64, op string) error {

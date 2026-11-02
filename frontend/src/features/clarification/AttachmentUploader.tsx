@@ -139,7 +139,8 @@ export const AttachmentUploader = forwardRef<AttachmentUploaderHandle, Attachmen
     async function uploadBatch(entries: PendingUpload[]): Promise<void> {
       let failure: string | null = null
       const finished = new Set<number>()
-      setError(null)
+      // Do not clear a previous batch's inline error up front: a later batch
+      // succeeding must not hide an earlier failed upload.
       try {
         for (const entry of entries) {
           const result = await uploadEntry(entry)

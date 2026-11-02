@@ -125,7 +125,15 @@ type AttachmentRepository interface {
 	GetInVersion(ctx context.Context, versionID, attachmentID int64) (Attachment, error)
 	ListByRequirement(ctx context.Context, versionID, requirementID int64) ([]Attachment, error)
 	ListByConversation(ctx context.Context, versionID, conversationID int64) ([]Attachment, error)
+	// ListUnlinkedByVersion returns attachment rows that were pre-registered
+	// before their message was inserted (nil conversation_message_id). The
+	// message post preflight reuses them on retry instead of inserting a
+	// duplicate row or re-running extraction.
+	ListUnlinkedByVersion(ctx context.Context, versionID int64) ([]Attachment, error)
 	ConversationExists(ctx context.Context, versionID, conversationID int64) (bool, error)
+	// LinkMessage binds a pre-registered attachment row to the message that was
+	// inserted after the extraction pending gate passed.
+	LinkMessage(ctx context.Context, attachmentID, messageID int64, updatedAt time.Time) error
 	MarkProcessing(ctx context.Context, attachmentID int64, updatedAt time.Time) (bool, error)
 	MarkDone(ctx context.Context, attachmentID int64, extractedContentRefID int64, updatedAt time.Time) error
 	MarkFailed(ctx context.Context, attachmentID int64, code, message string, updatedAt time.Time) error

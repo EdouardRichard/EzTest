@@ -139,4 +139,25 @@ describe("AttachmentUploader", () => {
     expect(api.uploadContent).not.toHaveBeenCalled()
     expect(onChange).not.toHaveBeenCalled()
   })
+
+  it("keeps an earlier upload failure when a later batch succeeds", async () => {
+    api.uploadContent
+      .mockRejectedValueOnce(
+        new ApiError({ status: 413, code: "payload_too_large", message: "附件超过 10 MiB" }),
+      )
+      .mockResolvedValueOnce(CONTENT)
+    render(<Harness />)
+
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["x"], "big.pdf")] },
+    })
+    expect(await screen.findByText(/附件超过 10 MiB/)).toBeInTheDocument()
+
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["ok"], "ok.txt", { type: "text/plain" })] },
+    })
+    await waitFor(() => expect(api.uploadContent).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("ok.txt")).toBeInTheDocument()
+    expect(screen.getByText(/附件超过 10 MiB/)).toBeInTheDocument()
+  })
 })
