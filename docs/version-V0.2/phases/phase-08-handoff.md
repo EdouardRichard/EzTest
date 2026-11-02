@@ -49,8 +49,8 @@
 
 ### 3.1 最终测试
 
-- `scripts/test.ps1`：见 `.tmp/p8-tests/final-test.log`（最终树；结果以该日志为准）。
-- `go test -count=1 ./...` 与 `go test -tags=integration -count=1 ./...`：全 PASS（P8 改动前基线，最终树由 `scripts/test.ps1` 覆盖）。
+- `scripts/test.ps1`：**exit 0**（直接运行；`.tmp/p8-tests/direct-test.log`）。Go unit + integration 全 PASS；frontend lint/typecheck 0；Vitest 105 files / 808 tests PASS。
+- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/p7-acceptance.ps1`：**P7 ACCEPTANCE PASSED**（124s；`.tmp/p8-tests/p7-regression3.log`），P7 脚本已做 P8 前向兼容（settings≥83、migrations≥40）。
 - `node scripts/p8-contract-check.cjs`：OK。
 - `scripts/p8-static-check.ps1`：**18/18 PASS**（`acceptance/p8/static.md`）。
 
