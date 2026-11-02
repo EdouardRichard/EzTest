@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
@@ -44,6 +46,61 @@ func (s WorkItemStatus) Terminal() bool {
 	}
 }
 
+// Work item kinds introduced by the 0.2.1 contract (spec §5.4,
+// task-types.md §9.1). The DB keeps them in work_item.kind; the frozen P1–P8
+// work_item.type column continues to carry the legacy task types.
+const (
+	WorkItemKindExploreLogin     = "explore.login"
+	WorkItemKindExplorePage      = "explore.page"
+	WorkItemKindExploreAPI       = "explore.api"
+	WorkItemKindExploreCoverage  = "explore.coverage"
+	WorkItemKindExploreGap       = "explore.gap"
+	WorkItemKindDesignCases      = "design.cases"
+	WorkItemKindReviewCases      = "review.cases"
+	WorkItemKindExecuteBatch     = "execute.batch"
+	WorkItemKindAnalyzeFailure   = "analyze.failure"
+	WorkItemKindReportVersion    = "report.version"
+	WorkItemKindKnowledgePropose = "knowledge.propose"
+)
+
+// ValidWorkItemKind reports whether kind is one of the eleven 0.2.1 kinds.
+func ValidWorkItemKind(kind string) bool {
+	switch kind {
+	case WorkItemKindExploreLogin, WorkItemKindExplorePage, WorkItemKindExploreAPI,
+		WorkItemKindExploreCoverage, WorkItemKindExploreGap,
+		WorkItemKindDesignCases, WorkItemKindReviewCases, WorkItemKindExecuteBatch,
+		WorkItemKindAnalyzeFailure, WorkItemKindReportVersion, WorkItemKindKnowledgePropose:
+		return true
+	default:
+		return false
+	}
+}
+
+// The four allowed work_item.created_by values (D21, task-types.md §9.3). Only
+// the dispatch layer creates items; executors claim them.
+const (
+	WorkItemCreatedByStateMachine = "state_machine"
+	WorkItemCreatedByPlanner      = "planner"
+	WorkItemCreatedByAssistant    = "assistant"
+	WorkItemCreatedByTrigger      = "trigger"
+)
+
+// ValidWorkItemCreatedBy reports whether value is one of the four creators.
+func ValidWorkItemCreatedBy(value string) bool {
+	switch value {
+	case WorkItemCreatedByStateMachine, WorkItemCreatedByPlanner,
+		WorkItemCreatedByAssistant, WorkItemCreatedByTrigger:
+		return true
+	default:
+		return false
+	}
+}
+
+// DefaultWorkItemLease is the lease ClaimWorkItem grants. It must be longer
+// than one executor action (spec §5.7: lease > 75s); callers renew it
+// independently with RenewLease while the item runs.
+const DefaultWorkItemLease = 5 * time.Minute
+
 // AttemptStatus is the outcome of one lease attempt.
 type AttemptStatus string
 
@@ -75,25 +132,40 @@ const (
 )
 
 // WorkItem is one row of the single execution queue.
+//
+// Kind/Goal/Target/Inputs/Expected/Budget/CreatedBy/IdempotencyKey/Result are
+// the 0.2.1 contract fields. They coexist with the frozen P1–P8 Type/Team/
+// DedupeKey columns: new rows use Kind as the authoritative task kind while
+// Type stays available for the legacy worker mapping. DependsOn is a nullable
+// array; nil and an empty slice both mean "ready".
 type WorkItem struct {
-	ID          int64
-	VersionID   int64
-	Team        Team
-	Type        string
-	Status      WorkItemStatus
-	Priority    int
-	DedupeKey   string
-	DependsOn   *int64
-	Payload     json.RawMessage
-	ClaimedBy   *string
-	LeaseUntil  *time.Time
-	LeaseEpoch  int64
-	Attempts    int
-	MaxAttempts int
-	LastError   *string
-	AvailableAt time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID             int64
+	VersionID      int64
+	Team           Team
+	Type           string
+	Kind           string
+	Goal           string
+	Target         json.RawMessage
+	Inputs         json.RawMessage
+	Expected       json.RawMessage
+	Budget         json.RawMessage
+	Status         WorkItemStatus
+	Priority       int
+	DedupeKey      string
+	DependsOn      []int64
+	Payload        json.RawMessage
+	CreatedBy      string
+	IdempotencyKey *string
+	Result         json.RawMessage
+	ClaimedBy      *string
+	LeaseUntil     *time.Time
+	LeaseEpoch     int64
+	Attempts       int
+	MaxAttempts    int
+	LastError      *string
+	AvailableAt    time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // NewWorkItem is the idempotent Ensure input. Payload holds references and
@@ -150,6 +222,162 @@ func (in NewWorkItem) EncodePayload() (json.RawMessage, error) {
 	raw, err := json.Marshal(in.Payload)
 	if err != nil {
 		return nil, platform.Invalid("payload", "must be JSON-encodable")
+	}
+	return raw, nil
+}
+
+// CreateWorkItemParams is the 0.2.1 idempotent dispatch input. The repository
+// fills the frozen P1–P8 columns with compatibility defaults: Team=ops (the one
+// team the legacy agent worker never claims), Type=Kind, an empty Payload and a
+// new unique dedupe key when IdempotencyKey is NULL.
+type CreateWorkItemParams struct {
+	VersionID      int64
+	Kind           string
+	Goal           string
+	Target         json.RawMessage
+	Inputs         json.RawMessage
+	Expected       json.RawMessage
+	Budget         json.RawMessage
+	DependsOn      []int64
+	CreatedBy      string
+	IdempotencyKey string
+
+	// Legacy P1–P8 columns. Zero values select the defaults described above.
+	Team        Team
+	Type        string
+	Priority    int
+	MaxAttempts int
+	Payload     json.RawMessage
+}
+
+// Normalize trims strings, applies contract defaults and removes duplicate
+// dependency IDs. It never errors; Validate performs the checks.
+func (in CreateWorkItemParams) Normalize() CreateWorkItemParams {
+	in.Kind = strings.TrimSpace(in.Kind)
+	in.Goal = strings.TrimSpace(in.Goal)
+	in.CreatedBy = strings.TrimSpace(in.CreatedBy)
+	in.IdempotencyKey = strings.TrimSpace(in.IdempotencyKey)
+	in.Type = strings.TrimSpace(in.Type)
+	if in.CreatedBy == "" {
+		in.CreatedBy = WorkItemCreatedByStateMachine
+	}
+	if in.Team == "" {
+		in.Team = TeamOps
+	}
+	if in.Type == "" {
+		in.Type = in.Kind
+	}
+	if in.MaxAttempts == 0 {
+		in.MaxAttempts = DefaultMaxAttempts
+	}
+	in.DependsOn = normalizeDependsOn(in.DependsOn)
+	return in
+}
+
+// Validate checks the 0.2.1 contract fields. The repository calls Normalize
+// first, so zero CreatedBy/Team/MaxAttempts are accepted here for convenience.
+func (in CreateWorkItemParams) Validate() error {
+	if in.VersionID <= 0 {
+		return platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if !ValidWorkItemKind(in.Kind) {
+		return platform.Invalid("kind", "must be one of explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose")
+	}
+	if utf8.RuneCountInString(in.Goal) > 500 {
+		return platform.Invalid("goal", "must be at most 500 characters")
+	}
+	if in.CreatedBy != "" && !ValidWorkItemCreatedBy(in.CreatedBy) {
+		return platform.Invalid("created_by", "must be one of state_machine, planner, assistant, trigger")
+	}
+	if len(in.IdempotencyKey) > 200 {
+		return platform.Invalid("idempotency_key", "must be at most 200 characters")
+	}
+	for _, dependency := range in.DependsOn {
+		if dependency <= 0 {
+			return platform.Invalid("depends_on", "must contain only positive decimal work item IDs")
+		}
+	}
+	if in.Team != "" && !in.Team.Valid() {
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code, ops")
+	}
+	if in.MaxAttempts != 0 && (in.MaxAttempts < MinMaxAttempts || in.MaxAttempts > MaxMaxAttempts) {
+		return platform.Invalid("max_attempts", "must be between 1 and 10")
+	}
+	objects := []struct {
+		field string
+		raw   json.RawMessage
+	}{
+		{"target", in.Target},
+		{"inputs", in.Inputs},
+		{"expected", in.Expected},
+		{"budget", in.Budget},
+		{"payload", in.Payload},
+	}
+	for _, object := range objects {
+		if err := validateJSONObject(object.field, object.raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// EncodeObjects renders the optional JSON object fields, defaulting nil to {}.
+func (in CreateWorkItemParams) EncodeObjects() (json.RawMessage, json.RawMessage, json.RawMessage, json.RawMessage, json.RawMessage, error) {
+	var target, inputs, expected, budget, payload json.RawMessage
+	fields := []struct {
+		name string
+		raw  json.RawMessage
+		out  *json.RawMessage
+	}{
+		{"target", in.Target, &target},
+		{"inputs", in.Inputs, &inputs},
+		{"expected", in.Expected, &expected},
+		{"budget", in.Budget, &budget},
+		{"payload", in.Payload, &payload},
+	}
+	for _, field := range fields {
+		encoded, err := encodeJSONObject(field.name, field.raw)
+		if err != nil {
+			return nil, nil, nil, nil, nil, err
+		}
+		*field.out = encoded
+	}
+	return target, inputs, expected, budget, payload, nil
+}
+
+func normalizeDependsOn(ids []int64) []int64 {
+	if ids == nil {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	normalized := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	return normalized
+}
+
+func validateJSONObject(field string, raw json.RawMessage) error {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return platform.Invalid(field, "must be a JSON object")
+	}
+	return nil
+}
+
+func encodeJSONObject(field string, raw json.RawMessage) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	if err := validateJSONObject(field, raw); err != nil {
+		return nil, err
 	}
 	return raw, nil
 }

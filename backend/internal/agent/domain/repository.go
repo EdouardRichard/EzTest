@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -59,6 +60,32 @@ type WorkItemRepository interface {
 	ListByVersion(ctx context.Context, versionID int64, limit int) ([]WorkItem, error)
 	// ListAttempts returns the attempt log for one work item, oldest first.
 	ListAttempts(ctx context.Context, workItemID int64) ([]WorkItemAttempt, error)
+}
+
+// WorkItemContractRepository is the additive 0.2.1 work_item surface used by
+// the dispatcher and executor runtime. It is intentionally separate from
+// WorkItemRepository so the frozen P1–P8 workers and their fakes keep
+// compiling. Implementations must fence every epoch-bearing write on
+// (id, lease_epoch) and report ErrLeaseLost when zero rows match.
+type WorkItemContractRepository interface {
+	// CreateWorkItem inserts an open item, or returns the existing row for
+	// (version_id, kind, idempotency_key). An empty idempotency key is stored
+	// as NULL and every call inserts a new row.
+	CreateWorkItem(ctx context.Context, in CreateWorkItemParams) (WorkItem, error)
+	// ClaimWorkItem leases the next runnable item to owner as of now. Runnable
+	// means open, retryable failed, or a claimed/running item whose lease
+	// expired; all depends_on items must be done (NULL/{} means no deps). It
+	// increments lease_epoch, attempts and inserts a claimed attempt row. A nil
+	// item with a nil error means nothing is runnable.
+	ClaimWorkItem(ctx context.Context, owner string, now time.Time) (*WorkItem, error)
+	// RenewLease extends the lease to the absolute until. A stale epoch is
+	// ErrLeaseLost.
+	RenewLease(ctx context.Context, id, epoch int64, until time.Time) error
+	// CompleteWorkItem marks a claimed/running item done and stores result.
+	CompleteWorkItem(ctx context.Context, id, epoch int64, result json.RawMessage) error
+	// FailWorkItem records a failure. Failed items remain retryable by
+	// ClaimWorkItem until attempts reach max_attempts.
+	FailWorkItem(ctx context.Context, id, epoch int64, reason string) error
 }
 
 // TeamRoomRepository persists team-room posts and bounded digest versions.

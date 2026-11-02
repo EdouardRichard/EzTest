@@ -1,7 +1,9 @@
 package agentpg
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,8 +16,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const workItemColumns = `id, version_id, team, type, status, priority, dedupe_key, depends_on,
-	payload, claimed_by, lease_until, lease_epoch, attempts, max_attempts, last_error,
+const workItemColumns = `id, version_id, team, type, kind, goal, target, inputs, expected,
+	budget, status, priority, dedupe_key, depends_on, payload, created_by, idempotency_key,
+	result, claimed_by, lease_until, lease_epoch, attempts, max_attempts, last_error,
 	available_at, created_at, updated_at`
 
 const attemptColumns = `id, work_item_id, attempt, status, error, started_at, finished_at`
@@ -154,7 +157,8 @@ func (r *WorkItemRepository) ClaimForTypes(ctx context.Context, claimant string,
 	var id int64
 	err = tx.QueryRow(ctx, `
 		SELECT id FROM work_item
-		WHERE type = ANY($1::text[])
+		WHERE kind = ''
+		  AND type = ANY($1::text[])
 		  AND ((status = 'open' AND available_at <= now())
 		       OR (status IN ('claimed', 'running')
 		           AND lease_until IS NOT NULL AND lease_until < now()))
@@ -220,7 +224,7 @@ func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams [
 	if len(teams) == 0 {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM work_item
-			WHERE status = 'open' AND available_at <= now()
+			WHERE kind = '' AND status = 'open' AND available_at <= now()
 			ORDER BY priority DESC, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -228,7 +232,7 @@ func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams [
 	} else {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM work_item
-			WHERE status = 'open' AND available_at <= now()
+			WHERE kind = '' AND status = 'open' AND available_at <= now()
 			  AND team = ANY($1::text[])
 			ORDER BY priority DESC, id ASC
 			FOR UPDATE SKIP LOCKED
@@ -269,6 +273,271 @@ func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams [
 		return agent.WorkItem{}, false, fmt.Errorf("claim work item: commit: %w", err)
 	}
 	return item, true, nil
+}
+
+// CreateWorkItem inserts one open 0.2.1 item, or returns the row already stored
+// for the same (version_id, kind, idempotency_key). A NULL/empty idempotency
+// key is exempt from the lookup, so every such call inserts a new row.
+func (r *WorkItemRepository) CreateWorkItem(ctx context.Context, in agent.CreateWorkItemParams) (agent.WorkItem, error) {
+	in = in.Normalize()
+	if err := in.Validate(); err != nil {
+		return agent.WorkItem{}, err
+	}
+	target, inputs, expected, budget, payload, err := in.EncodeObjects()
+	if err != nil {
+		return agent.WorkItem{}, err
+	}
+
+	id := r.ids.Next()
+	dedupeKey := in.IdempotencyKey
+	if dedupeKey == "" {
+		dedupeKey = fmt.Sprintf("v021:%s:%d", in.Kind, id)
+	}
+	var idempotencyKey *string
+	if in.IdempotencyKey != "" {
+		key := in.IdempotencyKey
+		idempotencyKey = &key
+	}
+
+	item, err := scanWorkItem(r.pool.QueryRow(ctx, `
+		INSERT INTO work_item (id, version_id, team, type, kind, goal, target, inputs,
+			expected, budget, status, priority, dedupe_key, depends_on, payload,
+			created_by, idempotency_key, result, max_attempts, available_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb,
+			'open', $11, $12, $13::bigint[], $14::jsonb, $15, $16, '{}'::jsonb, $17,
+			now(), now(), now())
+		ON CONFLICT DO NOTHING
+		RETURNING `+workItemColumns,
+		id, in.VersionID, string(in.Team), in.Type, in.Kind, in.Goal,
+		string(target), string(inputs), string(expected), string(budget),
+		in.Priority, dedupeKey, in.DependsOn, string(payload), in.CreatedBy,
+		idempotencyKey, in.MaxAttempts))
+	if err == nil {
+		return item, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return agent.WorkItem{}, wrapDB("insert 0.2.1 work item", err)
+	}
+	if idempotencyKey == nil {
+		return agent.WorkItem{}, fmt.Errorf("insert 0.2.1 work item: %w", agent.ErrConflict)
+	}
+
+	existing, err := scanWorkItem(r.pool.QueryRow(ctx, `
+		SELECT `+workItemColumns+` FROM work_item
+		WHERE version_id = $1 AND kind = $2 AND idempotency_key = $3
+	`, in.VersionID, in.Kind, in.IdempotencyKey))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agent.WorkItem{}, fmt.Errorf("insert 0.2.1 work item: %w", agent.ErrConflict)
+	}
+	if err != nil {
+		return agent.WorkItem{}, wrapDB("look up work item by idempotency key", err)
+	}
+	return existing, nil
+}
+
+// ClaimWorkItem leases the next runnable 0.2.1 item to owner. Runnable means
+// open, retryable failed (attempts below max_attempts), or a claimed/running
+// item whose lease expired before now. Items whose depends_on set is not fully
+// done are skipped; NULL and {} both mean no dependencies. The claim increments
+// lease_epoch and attempts, which fences every older owner out of later writes.
+func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, now time.Time) (*agent.WorkItem, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return nil, platform.Invalid("owner", "must not be empty")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("claim 0.2.1 work item: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var id int64
+	err = tx.QueryRow(ctx, `
+		SELECT w.id FROM work_item w
+		WHERE w.kind <> ''
+		  AND w.available_at <= $1
+		  AND (w.status = 'open'
+		       OR (w.status = 'failed' AND w.attempts < w.max_attempts)
+		       OR (w.status IN ('claimed', 'running')
+		           AND w.lease_until IS NOT NULL AND w.lease_until < $1))
+		  AND (w.depends_on IS NULL
+		       OR cardinality(w.depends_on) = 0
+		       OR NOT EXISTS (
+		           SELECT 1 FROM unnest(w.depends_on) AS dependency(id)
+		           WHERE NOT EXISTS (
+		               SELECT 1 FROM work_item done
+		               WHERE done.id = dependency.id AND done.status = 'done')))
+		ORDER BY w.priority DESC, w.id ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`, now).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("claim 0.2.1 work item: commit empty: %w", err)
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, wrapDB("select claimable 0.2.1 work item", err)
+	}
+
+	item, err := scanWorkItem(tx.QueryRow(ctx, `
+		UPDATE work_item
+		SET status = 'claimed',
+		    lease_epoch = lease_epoch + 1,
+		    attempts = attempts + 1,
+		    claimed_by = $2,
+		    lease_until = $3::timestamptz + make_interval(secs => $4),
+		    updated_at = $3
+		WHERE id = $1
+		RETURNING `+workItemColumns,
+		id, owner, now, agent.DefaultWorkItemLease.Seconds()))
+	if err != nil {
+		return nil, wrapDB("claim 0.2.1 work item", err)
+	}
+
+	// Taking over an expired lease abandons the previous attempt. Retries of a
+	// failed item leave the already-closed attempt untouched.
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'recovered', error = COALESCE(error, 'lease expired'), finished_at = $3
+		WHERE work_item_id = $1 AND attempt < $2 AND status IN ('claimed', 'running')
+	`, item.ID, item.Attempts, now); err != nil {
+		return nil, wrapDB("recover abandoned 0.2.1 work item attempts", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
+		VALUES ($1, $2, $3, 'claimed', $4)
+	`, r.ids.Next(), item.ID, item.Attempts, now); err != nil {
+		return nil, wrapDB("insert 0.2.1 work item attempt", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("claim 0.2.1 work item: commit: %w", err)
+	}
+	return &item, nil
+}
+
+// RenewLease extends a claimed/running 0.2.1 item's lease to the absolute
+// until. A stale epoch reports agent.ErrLeaseLost.
+func (r *WorkItemRepository) RenewLease(ctx context.Context, id, epoch int64, until time.Time) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if until.IsZero() {
+		return platform.Invalid("until", "must not be zero")
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE work_item
+		SET lease_until = $3, updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
+	`, id, epoch, until)
+	if err != nil {
+		return wrapDB("renew 0.2.1 work item lease", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrLeaseLost
+	}
+	return nil
+}
+
+// CompleteWorkItem marks a claimed/running 0.2.1 item done and stores result.
+// A stale epoch reports agent.ErrLeaseLost and changes nothing.
+func (r *WorkItemRepository) CompleteWorkItem(ctx context.Context, id, epoch int64, result json.RawMessage) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	encoded, err := normalizeResultObject(result)
+	if err != nil {
+		return err
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("complete 0.2.1 work item: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE work_item
+		SET status = 'done',
+		    result = $3::jsonb,
+		    claimed_by = NULL,
+		    lease_until = NULL,
+		    updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
+	`, id, epoch, string(encoded))
+	if err != nil {
+		return wrapDB("complete 0.2.1 work item", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrLeaseLost
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'done', finished_at = now()
+		WHERE work_item_id = $1
+		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
+		  AND status IN ('claimed', 'running')
+	`, id); err != nil {
+		return wrapDB("complete 0.2.1 work item attempt", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// FailWorkItem records a failure for a claimed/running 0.2.1 item. The item
+// becomes failed and stays retryable by ClaimWorkItem until attempts reaches
+// max_attempts. A stale epoch reports agent.ErrLeaseLost.
+func (r *WorkItemRepository) FailWorkItem(ctx context.Context, id, epoch int64, reason string) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("fail 0.2.1 work item: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE work_item
+		SET status = 'failed',
+		    last_error = $3,
+		    claimed_by = NULL,
+		    lease_until = NULL,
+		    available_at = now(),
+		    updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
+	`, id, epoch, reason)
+	if err != nil {
+		return wrapDB("fail 0.2.1 work item", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrLeaseLost
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'failed', error = COALESCE(NULLIF($2, ''), error), finished_at = now()
+		WHERE work_item_id = $1
+		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
+		  AND status IN ('claimed', 'running')
+	`, id, reason); err != nil {
+		return wrapDB("fail 0.2.1 work item attempt", err)
+	}
+	return tx.Commit(ctx)
+}
+
+func normalizeResultObject(raw json.RawMessage) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, platform.Invalid("result", "must be a JSON object")
+	}
+	return raw, nil
 }
 
 // Get loads one work item, or agent.ErrNotFound.
@@ -491,7 +760,8 @@ func (r *WorkItemRepository) RecoverExpired(ctx context.Context) (int64, error) 
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT id, attempts, max_attempts FROM work_item
-		WHERE status IN ('claimed', 'running')
+		WHERE kind = ''
+		  AND status IN ('claimed', 'running')
 		  AND lease_until IS NOT NULL
 		  AND lease_until < now()
 		ORDER BY id
@@ -618,8 +888,10 @@ func (r *WorkItemRepository) ListAttempts(ctx context.Context, workItemID int64)
 func scanWorkItem(row rowScanner) (agent.WorkItem, error) {
 	var item agent.WorkItem
 	var team, status string
-	if err := row.Scan(&item.ID, &item.VersionID, &team, &item.Type, &status, &item.Priority,
-		&item.DedupeKey, &item.DependsOn, &item.Payload, &item.ClaimedBy, &item.LeaseUntil,
+	if err := row.Scan(&item.ID, &item.VersionID, &team, &item.Type, &item.Kind, &item.Goal,
+		&item.Target, &item.Inputs, &item.Expected, &item.Budget, &status, &item.Priority,
+		&item.DedupeKey, &item.DependsOn, &item.Payload, &item.CreatedBy,
+		&item.IdempotencyKey, &item.Result, &item.ClaimedBy, &item.LeaseUntil,
 		&item.LeaseEpoch, &item.Attempts, &item.MaxAttempts, &item.LastError,
 		&item.AvailableAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return agent.WorkItem{}, err
@@ -630,3 +902,4 @@ func scanWorkItem(row rowScanner) (agent.WorkItem, error) {
 }
 
 var _ agent.WorkItemRepository = (*WorkItemRepository)(nil)
+var _ agent.WorkItemContractRepository = (*WorkItemRepository)(nil)
