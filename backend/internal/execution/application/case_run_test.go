@@ -1,11 +1,13 @@
 package executionapp_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -572,6 +574,34 @@ func TestHTTPRequestEvidenceRedactsCredentials(t *testing.T) {
 		if string(put) != "" && containsSecret(string(put), "super-secret") {
 			t.Fatalf("http evidence leaked credentials: %s", put)
 		}
+	}
+}
+
+func TestHTTPLargeBodySpillsHeadAndContentRef(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	prepareCaseRun(t, fixture)
+	body := append([]byte("P8-LARGE-BEGIN"), bytes.Repeat([]byte("x"), 20_000)...)
+	fixture.http.response = executionapp.HTTPResponseData{Status: 200, Body: body}
+	result, err := fixture.runner.HTTP(context.Background(), p3Scope(), json.RawMessage(`{
+		"version_sut_id":"7","path":"/p8/large?bytes=20000","method":"GET"
+	}`))
+	if err != nil {
+		t.Fatalf("HTTP large: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T", result)
+	}
+	if payload["truncated"] != true {
+		t.Fatalf("truncated = %v, want true", payload["truncated"])
+	}
+	head, _ := payload["head"].(string)
+	if !strings.Contains(head, "P8-LARGE-BEGIN") {
+		t.Fatalf("head = %q", head)
+	}
+	ref, _ := payload["content_ref"].(string)
+	if strings.TrimSpace(ref) == "" {
+		t.Fatalf("content_ref missing: %#v", payload)
 	}
 }
 

@@ -974,7 +974,7 @@ function Invoke-P8ScenarioS9 {
         Write-P8Check $checks ($packetSummaryPresent -eq 1) "S9 context packet conversation section contains the rolling summary" ("packet_id=$packetID summary_prefix_present=$packetSummaryPresent")
         $pinnedPresent = 0
         if ($packetID -gt 0 -and $pinnedCount -gt 0) {
-            $pinnedPresent = [int](Get-P8Scalar -Sql ("SELECT CASE WHEN EXISTS (SELECT 1 FROM conversation_summary cs, jsonb_array_elements_text(cs.pinned_facts) f WHERE cs.conversation_id = " + [int64]$conversationID + " AND position(f in (SELECT COALESCE(s->>'content','') FROM context_packet p, jsonb_array_elements(p.sections) s WHERE p.run_id = " + [int64]$runID + " AND s->>'name' = 'conversation' LIMIT 1)) > 0) THEN 1 ELSE 0 END;"))
+            $pinnedPresent = [int](Get-P8Scalar -Sql ("SELECT CASE WHEN position('P8-S9-REGION' in (SELECT COALESCE(s->>'content','') FROM context_packet p, jsonb_array_elements(p.sections) s WHERE p.id = " + [int64]$packetID + " AND s->>'name' = 'conversation' LIMIT 1)) > 0 THEN 1 ELSE 0 END;"))
         }
         Write-P8Check $checks ($pinnedCount -gt 0 -and $pinnedPresent -eq 1) "S9 context packet preserves pinned facts" ("pinned_facts=$pinnedCount present_in_packet=$pinnedPresent")
 
@@ -1361,14 +1361,13 @@ function Invoke-P8ScenarioS10LongExecution {
                 throw "design conversation creation failed: status=$($designConversation.Status) $($designConversation.Text)"
             }
             $designConversationID = [string]$designConversation.Json.data.id
-            $designPrompt = ("Create exactly 12 independent, executable UI test cases in the design graph now. " +
-                "Every step action MUST be executable English instructions, not a Chinese description: write them exactly in the form 'Use browser.goto to open <url> with version_sut_id=$versionSutID and account_role=user. Then use browser.snapshot and browser.screenshot.' or 'Call http.request with method=GET, url=<url>, version_sut_id=$versionSutID.' " +
+            $designPrompt = ("Create exactly 10 independent, executable UI test cases in the design graph now. " +
+                "Every step action MUST be executable English instructions, not a Chinese description: write them exactly in the form 'Use browser.goto to open <url> with version_sut_id=$versionSutID and account_role=user. Then use browser.snapshot and browser.screenshot.' " +
                 "The version is bound to the local orders fixture at http://127.0.0.1:$OrdersPort. " +
                 "Use version_sut_id=$versionSutID and account_role=user on every step. " +
-                "Cases 1-6 must open http://127.0.0.1:$OrdersPort/p3/orders/1, call browser.snapshot and browser.screenshot, and assert stable visible content such as #order-no ORD-1001, #paid-amount 5200.00, or #refund-amount 5000.00. " +
-                "Cases 7-10 must open http://127.0.0.1:$OrdersPort/p3/login or http://127.0.0.1:$OrdersPort/p3/slow?ms=500, call browser.snapshot, and assert a stable heading or completion text. " +
-                "Cases 11-12 must call http.request with method=GET and url=http://127.0.0.1:$OrdersPort/p8/large?bytes=20000 using version_sut_id=$versionSutID, then assert the HTTP status is 200 and the response marker P8-LARGE-BEGIN is visible. The response is intentionally larger than agent.tool_result_max_bytes, so the platform must spill it to content storage with head+content_ref. " +
-                "Each case must have at least one step and at least one assertion. Do not ask questions; produce the 12 cases now.")
+                "Cases 1-6 must open http://127.0.0.1:$OrdersPort/p3/orders/1, call browser.snapshot and browser.screenshot, and assert stable visible content using the real selectors #order-number for ORD-1001, #order-amount for 5,200.00, or #refund-amount for 5,000.00. " +
+                "Cases 7-8 must also open http://127.0.0.1:$OrdersPort/p3/orders/1 and assert additional stable field combinations. Cases 9-10 must be titled P8-SLOW-09 and P8-SLOW-10; their single step action must be exactly 'Use browser.goto to open http://127.0.0.1:$OrdersPort/p3/slow?ms=20000 with version_sut_id=$versionSutID and account_role=user. Then use browser.snapshot and browser.screenshot.' and the assertion is the slow completion text. " +
+                "Each case must have at least one step and at least one assertion. Do not ask questions; produce the 10 cases now.")
             $message = Send-P8ConversationMessage -VersionID $versionID -ConversationID $designConversationID -Text $designPrompt -ClientMessageID ("p8-long-design-" + $script:runSuffix)
             if ($message.Status -ne 201) { throw "design prompt rejected: status=$($message.Status) $($message.Text)" }
 
@@ -1381,22 +1380,56 @@ function Invoke-P8ScenarioS10LongExecution {
                     $graph = Get-P8DesignGraph -VersionID $versionID
                     $cards = @(Get-P8DesignCaseCards -Graph $graph)
                     $attempts.Add([pscustomobject]@{ attempt = $attempt; at = (Get-Date -Format o); cases = $cards.Count })
-                    if ($cards.Count -ge 12) { $found = [pscustomobject]@{ Graph = $graph; Cards = $cards }; break }
+                    if ($cards.Count -ge 10) { $found = [pscustomobject]@{ Graph = $graph; Cards = $cards }; break }
                     Start-Sleep -Seconds 4
                 }
                 if ($null -ne $found) { $graphResult = $found; break }
                 if ($attempt -lt 3) {
-                    $nudge = ("The design graph currently contains " + @(Get-P8DesignCaseCards -Graph (Get-P8DesignGraph -VersionID $versionID)).Count + " cases. Add the missing independent cases now so the graph contains exactly 12 executable cases (6 batch A, 6 batch B). Keep every case single-step with explicit version_sut_id=$versionSutID.")
+                    $nudge = ("The design graph currently contains " + @(Get-P8DesignCaseCards -Graph (Get-P8DesignGraph -VersionID $versionID)).Count + " cases. Add the missing independent UI cases now so the graph contains at least 10 executable UI cases. Keep every case single-step with explicit version_sut_id=$versionSutID.")
                     $nudgeResponse = Send-P8ConversationMessage -VersionID $versionID -ConversationID $designConversationID -Text $nudge -ClientMessageID ("p8-long-nudge-" + $attempt + "-" + $script:runSuffix)
                     if ($nudgeResponse.Status -ne 201) { break }
                     Start-Sleep -Seconds 10
                 }
             }
             Write-P8JsonEvidence -Name "s10-long-execution-attempts.json" -Value @($attempts) | Out-Null
-            if ($null -eq $graphResult) { throw "real design agent did not produce 12 cases within the attempt window" }
+            if ($null -eq $graphResult) { throw "real design agent did not produce 10 UI cases within the attempt window" }
 
-            $cards = @($graphResult.Cards)
-            $selected = @($cards | Select-Object -First 40)
+            $largeConversation = Invoke-P8Api -Method "POST" -Path "/api/versions/$versionID/conversations" -Body @{ kind = "design"; title = ("P8 long execution large responses " + $script:runSuffix) }
+            if ($largeConversation.Status -ne 201 -or $null -eq $largeConversation.Json) {
+                throw "large-response design conversation creation failed: status=$($largeConversation.Status) $($largeConversation.Text)"
+            }
+            $largeConversationID = [string]$largeConversation.Json.data.id
+            $largePrompt = ("Add exactly two new independent executable cases to the design graph, titled P8-LARGE-11 and P8-LARGE-12. " +
+                "Each case step action MUST be exactly: 'Call http.request with method=GET, url=http://127.0.0.1:$OrdersPort/p8/large?bytes=20000, version_sut_id=$versionSutID'. " +
+                "Case 11 assertion: HTTP status equals 200 and the response body marker P8-LARGE-BEGIN is visible. " +
+                "Case 12 assertion: the response is truncated with head and content_ref and the head contains P8-LARGE-BEGIN. " +
+                "Do not create any other cases and do not ask questions; produce the two cases now.")
+            $largeMessage = Send-P8ConversationMessage -VersionID $versionID -ConversationID $largeConversationID -Text $largePrompt -ClientMessageID ("p8-long-large-" + $script:runSuffix)
+            if ($largeMessage.Status -ne 201) { throw "large-response design prompt rejected: status=$($largeMessage.Status) $($largeMessage.Text)" }
+            $largeCards = @()
+            $largeDeadline = (Get-Date).AddSeconds(300)
+            while ((Get-Date) -lt $largeDeadline) {
+                $graph = Get-P8DesignGraph -VersionID $versionID
+                $largeCards = @(Get-P8DesignCaseCards -Graph $graph | Where-Object { [string]$_.title -like "P8-LARGE-*" })
+                if ($largeCards.Count -ge 2) { break }
+                Start-Sleep -Seconds 4
+            }
+            if ($largeCards.Count -lt 2) {
+                $largeNudge = "The design graph has $($largeCards.Count) P8-LARGE cases. Add P8-LARGE-11 and P8-LARGE-12 now with the exact http.request step from the previous message."
+                $null = Send-P8ConversationMessage -VersionID $versionID -ConversationID $largeConversationID -Text $largeNudge -ClientMessageID ("p8-long-large-nudge-" + $script:runSuffix)
+                $largeDeadline = (Get-Date).AddSeconds(180)
+                while ((Get-Date) -lt $largeDeadline) {
+                    $graph = Get-P8DesignGraph -VersionID $versionID
+                    $largeCards = @(Get-P8DesignCaseCards -Graph $graph | Where-Object { [string]$_.title -like "P8-LARGE-*" })
+                    if ($largeCards.Count -ge 2) { break }
+                    Start-Sleep -Seconds 4
+                }
+            }
+            if ($largeCards.Count -lt 2) { throw "real design agent did not produce the two P8-LARGE cases" }
+            $uiCards = @($graphResult.Cards | Where-Object { [string]$_.title -notlike "P8-LARGE-*" } | Select-Object -First 10)
+            if ($uiCards.Count -lt 10) { throw "real design agent produced only $($uiCards.Count) UI cases" }
+
+            $selected = @($uiCards) + @($largeCards | Select-Object -First 2)
             $pairs = [System.Collections.Generic.List[object]]::new()
             $seenCaseIDs = [System.Collections.Generic.HashSet[string]]::new()
             foreach ($card in $selected) {
@@ -1421,6 +1454,15 @@ function Invoke-P8ScenarioS10LongExecution {
 
             $failedA = @(Invoke-P8ConfirmCaseBatch -VersionID $versionID -CaseIDs $batchA)
             if ($failedA.Count -gt 0) { throw "batch A confirmation failed: $($failedA -join ',')" }
+            # Confirmation can create a new current case_version. Re-resolve the
+            # ids so the manual intents never target the superseded versions.
+            $batchAVersions = @($batchA | ForEach-Object {
+                $detail = Get-P8DesignCaseDetail -VersionID $versionID -CaseID $_
+                [string]$detail.current_version_id
+            })
+            if ($batchAVersions.Count -lt 6 -or @($batchAVersions | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+                throw "batch A current case versions were not resolved after confirmation"
+            }
             if (-not (Ensure-P8IntentsForCaseVersions -VersionID $versionID -CaseVersionIDs $batchAVersions -TimeoutSeconds 90)) {
                 throw "batch A intents were not created"
             }
@@ -1434,9 +1476,44 @@ function Invoke-P8ScenarioS10LongExecution {
 
             $failedB = @(Invoke-P8ConfirmCaseBatch -VersionID $versionID -CaseIDs $batchB)
             if ($failedB.Count -gt 0) { throw "batch B confirmation failed: $($failedB -join ',')" }
+            $batchBVersions = @($batchB | ForEach-Object {
+                $detail = Get-P8DesignCaseDetail -VersionID $versionID -CaseID $_
+                [string]$detail.current_version_id
+            })
+            if ($batchBVersions.Count -lt 6 -or @($batchBVersions | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+                throw "batch B current case versions were not resolved after confirmation"
+            }
+            $caseVersionIDs = @($batchAVersions) + @($batchBVersions)
             if (-not (Ensure-P8IntentsForCaseVersions -VersionID $versionID -CaseVersionIDs $batchBVersions -TimeoutSeconds 90)) {
                 throw "batch B intents were not created"
             }
+            $wave2Active = Wait-P8Until -TimeoutSeconds 60 -IntervalMilliseconds 1000 -Description "batch B running for pause" -Condition {
+                $waves = @(Get-P8Waves -VersionID $versionID)
+                $candidate = @($waves | Where-Object { [string]$_.id -ne $wave1ID -and [string]$_.status -eq "running" } | Select-Object -First 1)
+                if ($candidate.Count -ge 1) { return $candidate[0] }
+                return $null
+            }
+            if ($null -eq $wave2Active) { throw "batch B wave did not become running before the pause probe" }
+            $pauseWaveID = [string]$wave2Active.id
+            $runningRun = Wait-P8Until -TimeoutSeconds 45 -IntervalMilliseconds 1000 -Description "batch B running case for checkpoint" -Condition {
+                $runs = @(Get-P8WaveRuns -VersionID $versionID -WaveID $pauseWaveID)
+                $candidate = @($runs | Where-Object { [string]$_.status -eq "running" } | Select-Object -First 1)
+                if ($candidate.Count -ge 1) { return $candidate[0] }
+                return $null
+            }
+            $pauseResponse = Invoke-P8Api -Method "POST" -Path "/api/versions/$versionID/waves/$pauseWaveID/pause" -Body @{ mode = "immediate"; reason = "P8 S9 long-execution pause probe" }
+            Write-P8Check $checks ($pauseResponse.Status -eq 200) "S10 long execution pause accepted" ("status=" + $pauseResponse.Status + " wave=" + $pauseWaveID)
+            $pausedWave = Wait-P8Until -TimeoutSeconds 45 -IntervalMilliseconds 1000 -Description "batch B paused" -Condition {
+                $waves = @(Get-P8Waves -VersionID $versionID)
+                $candidate = @($waves | Where-Object { [string]$_.id -eq $pauseWaveID } | Select-Object -First 1)
+                if ($candidate.Count -ge 1 -and [string]$candidate[0].status -eq "paused") { return $candidate[0] }
+                return $null
+            }
+            Write-P8Check $checks ($null -ne $pausedWave) "S10 long execution wave reached paused" ("wave=" + $pauseWaveID)
+            $pausedRunCount = [int](Get-P8Scalar -Sql ("SELECT count(*) FROM case_run WHERE wave_id = " + [int64]$pauseWaveID + " AND paused_at IS NOT NULL;"))
+            Write-P8Check $checks ($null -ne $runningRun -and $pausedRunCount -ge 1) "S10 long execution checkpoint paused an in-flight case" ("running_probe=" + $(if ($null -ne $runningRun) { [string]$runningRun.id } else { "" }) + " paused_runs=" + $pausedRunCount)
+            $resumeResponse = Invoke-P8Api -Method "POST" -Path "/api/versions/$versionID/waves/$pauseWaveID/resume"
+            Write-P8Check $checks ($resumeResponse.Status -eq 200) "S10 long execution resume accepted" ("status=" + $resumeResponse.Status + " wave_status=" + $(if ($null -ne $resumeResponse.Json) { [string]$resumeResponse.Json.data.status } else { "" }))
             $wave2 = Wait-P8Until -TimeoutSeconds 900 -IntervalMilliseconds 3000 -Description "batch B wave" -Condition {
                 $found = Find-P8TerminalWaveForCases -VersionID $versionID -CaseVersionIDs $batchBVersions -ExcludeWaveIDs @($wave1ID)
                 if ($null -ne $found) { return $found }
@@ -1451,6 +1528,20 @@ function Invoke-P8ScenarioS10LongExecution {
             Write-P8Check $checks ($distinct.Count -ge 12) "S10 long execution recorded 12 case runs across two waves" ("case_versions=" + $distinct.Count + " runs=" + $allRuns.Count)
             $terminalRuns = @($allRuns | Where-Object { @("pending", "running") -notcontains [string]$_.status })
             Write-P8Check $checks ($terminalRuns.Count -ge 12) "S10 long execution runs reached terminal states" ("terminal=" + $terminalRuns.Count + " statuses=" + ((@($allRuns | ForEach-Object { [string]$_.status } | Sort-Object -Unique)) -join ","))
+            $largeCaseVersions = @()
+            foreach ($candidateVersion in $caseVersionIDs) {
+                $largeSteps = [int](Get-P8Scalar -Sql ("SELECT count(*) FROM case_step WHERE case_version_id = " + [int64]$candidateVersion + " AND action ILIKE '%p8/large%';"))
+                if ($largeSteps -gt 0) { $largeCaseVersions += [string]$candidateVersion }
+            }
+            $largeRuns = @($allRuns | Where-Object { $largeCaseVersions -contains [string]$_.case_version_id })
+            Write-P8Check $checks ($largeCaseVersions.Count -ge 2 -and $largeRuns.Count -ge 2) "S10 long execution included two /p8/large cases" ("case_versions=" + $largeCaseVersions.Count + " runs=" + $largeRuns.Count)
+            $runIDs = @($allRuns | ForEach-Object { [int64]$_.id })
+            if ($runIDs.Count -gt 0) {
+                $runIDList = ($runIDs -join ",")
+                $stepTotal = [int](Get-P8Scalar -Sql ("SELECT count(*) FROM step_result WHERE case_run_id IN (" + $runIDList + ");"))
+                $stepDistinct = [int](Get-P8Scalar -Sql ("SELECT count(*) FROM (SELECT DISTINCT case_run_id, seq FROM step_result WHERE case_run_id IN (" + $runIDList + ")) d;"))
+                Write-P8Check $checks ($stepTotal -gt 0 -and $stepTotal -eq $stepDistinct) "S10 long execution has no duplicate step results" ("steps=" + $stepTotal + " distinct=" + $stepDistinct)
+            }
             $path = "real-design"
             $summaryText = "path=real-design cases=$($distinct.Count) wave1=$wave1ID wave2=$wave2ID"
             $snapshot = [pscustomobject]@{ path = $path; version_id = $versionID; case_versions = $caseVersionIDs; wave1 = $wave1ID; wave2 = $wave2ID; runs = @($allRuns | ForEach-Object { [pscustomobject]@{ id = $_.id; case_version_id = $_.case_version_id; status = $_.status } }) }
