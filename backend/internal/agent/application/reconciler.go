@@ -25,6 +25,19 @@ const reconcilerLimit = 100
 // visit and must not mask a lost job.
 const stageJobGrace = 30 * time.Second
 
+// Stage-machine transition reasons that create a stage-entry job (spec §5.3,
+// version/application/stage_machine.go). R49 repairs only these visits: a
+// resumed, rejected, blocked/paused or legacy/unknown transition re-entered the
+// stage without enqueueing a job, so the pre-visit job is the legitimate one.
+// Dispatching the canonical empty target next to it would insert a second work
+// item (a partial gate selection uses a different idempotency key, so the
+// unique index cannot dedupe).
+const (
+	stageReasonRequirementConfirmed = "requirement_confirmed"
+	stageReasonCasesConfirmed       = "cases_confirmed"
+	stageReasonWaveTerminal         = "wave_terminal"
+)
+
 // StageJobPresence answers R49's "does the current stage visit already own a
 // job of this kind?" question. It must query by kind and creation floor instead
 // of trusting a bounded newest-first page: a long-lived version can push the
@@ -33,6 +46,23 @@ const stageJobGrace = 30 * time.Second
 // implements it with a SQL EXISTS; nil disables the R49 rule.
 type StageJobPresence interface {
 	HasWorkItemKindSince(ctx context.Context, versionID int64, kind string, since time.Time) (bool, error)
+}
+
+// StageTransitionReader answers R49's "why was the current stage visit
+// entered?" question from the version's persisted stage transition record. It
+// is read-only: the reason decides whether the visit owns a stage-entry job at
+// all. The stage machine enqueues one only for requirement_confirmed ->
+// designing (design.cases), cases_confirmed -> executing (execute.batch) and
+// wave_terminal -> reporting (report.version). A resumed, rejected or suspended
+// visit re-enters a stage without enqueueing a job, and a legacy/unknown reason
+// cannot prove one was expected.
+type StageTransitionReader interface {
+	// LastStageReason returns the reason recorded on the stage transition that
+	// created the stage visit which started at enteredAt. It returns "" when
+	// the transition record is missing (unknown/legacy reason, retention, or
+	// an event not yet persisted) or belongs to a different visit; callers
+	// must treat that as "unknown" and never repair.
+	LastStageReason(ctx context.Context, versionID int64, enteredAt time.Time) (string, error)
 }
 
 // DefaultReconcileDebounce is the event-driven wake window (spec §5.7:
@@ -82,6 +112,10 @@ type ReconcilerDeps struct {
 	// is queried by kind and created_at floor, never by a bounded page.
 	// *agentpg.WorkItemRepository satisfies it; nil disables the rule.
 	StageJobPresence StageJobPresence
+	// StageTransitions tells R49 whether the current stage visit was created by
+	// a transition that owns the stage-entry job. eventingpg.StageTransitionReader
+	// satisfies it; nil disables the rule.
+	StageTransitions StageTransitionReader
 	// Debounce overrides the event-driven wake window. Zero uses
 	// DefaultReconcileDebounce; tests may shorten it.
 	Debounce time.Duration
@@ -101,23 +135,24 @@ type ReconcilerDeps struct {
 // Notify wake); every ensure uses a dedupe key, so repeated passes never add
 // duplicate work.
 type Reconciler struct {
-	versions        VersionProjector
-	conversations   ConversationReader
-	attachments     PendingAttachmentReader
-	design          DesignReconciler
-	queue           WorkQueueEnsurer
-	p4              P4Ensurer
-	runningVersions P4VersionLister
-	p7              P7Ensurer
-	stages          VersionStageReader
-	stageJobs       versionapp.StageJobEnqueuer
-	stageJobLookup  StageJobPresence
-	events          eventingapp.Publisher
-	clock           clock.Clock
-	logger          *slog.Logger
-	limit           int
-	debounce        time.Duration
-	pollInterval    time.Duration
+	versions         VersionProjector
+	conversations    ConversationReader
+	attachments      PendingAttachmentReader
+	design           DesignReconciler
+	queue            WorkQueueEnsurer
+	p4               P4Ensurer
+	runningVersions  P4VersionLister
+	p7               P7Ensurer
+	stages           VersionStageReader
+	stageJobs        versionapp.StageJobEnqueuer
+	stageJobLookup   StageJobPresence
+	stageTransitions StageTransitionReader
+	events           eventingapp.Publisher
+	clock            clock.Clock
+	logger           *slog.Logger
+	limit            int
+	debounce         time.Duration
+	pollInterval     time.Duration
 
 	mu              sync.Mutex
 	lastWakeKind    string
@@ -142,24 +177,25 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		pollInterval = 0
 	}
 	return &Reconciler{
-		versions:        deps.Versions,
-		conversations:   deps.Conversations,
-		attachments:     deps.Attachments,
-		design:          deps.Design,
-		queue:           deps.Queue,
-		p4:              deps.P4,
-		runningVersions: deps.RunningVersions,
-		p7:              deps.P7,
-		stages:          deps.Stages,
-		stageJobs:       deps.StageJobs,
-		stageJobLookup:  deps.StageJobPresence,
-		events:          deps.Events,
-		clock:           deps.Clock,
-		logger:          logger,
-		limit:           reconcilerLimit,
-		debounce:        debounce,
-		pollInterval:    pollInterval,
-		wake:            make(chan struct{}, 1),
+		versions:         deps.Versions,
+		conversations:    deps.Conversations,
+		attachments:      deps.Attachments,
+		design:           deps.Design,
+		queue:            deps.Queue,
+		p4:               deps.P4,
+		runningVersions:  deps.RunningVersions,
+		p7:               deps.P7,
+		stages:           deps.Stages,
+		stageJobs:        deps.StageJobs,
+		stageJobLookup:   deps.StageJobPresence,
+		stageTransitions: deps.StageTransitions,
+		events:           deps.Events,
+		clock:            deps.Clock,
+		logger:           logger,
+		limit:            reconcilerLimit,
+		debounce:         debounce,
+		pollInterval:     pollInterval,
+		wake:             make(chan struct{}, 1),
 	}
 }
 
@@ -317,8 +353,17 @@ func (r *Reconciler) runPass(ctx context.Context, shouldRun func() bool) bool {
 // intentionally discards the enqueue error (the DB stage row is the truth), so
 // this rule is the repair path for that silent loss. It only ensures work; it
 // never executes or writes the stage.
+//
+// Only a visit created by the transition that owns the stage-entry job is
+// repairable. A resume or a gate reject re-enters the stage and bumps
+// StageEnteredAt without enqueueing a job; the legitimate item from before the
+// suspension/reject then sits before the stage-entry floor, so repairing by
+// kind+floor alone would dispatch the empty-target job and insert a duplicate
+// work item next to the earlier partial selection. The persisted transition
+// reason is therefore checked before the presence query.
 func (r *Reconciler) reconcileStageJobs(ctx context.Context) error {
-	if r.stageJobs == nil || r.stages == nil || r.runningVersions == nil || r.stageJobLookup == nil {
+	if r.stageJobs == nil || r.stages == nil || r.runningVersions == nil ||
+		r.stageJobLookup == nil || r.stageTransitions == nil {
 		return nil
 	}
 	versionIDs, err := r.runningVersions.ListRunningVersions(ctx, r.limit)
@@ -344,6 +389,16 @@ func (r *Reconciler) reconcileStageJobs(ctx context.Context) error {
 		}
 		kind, ok := stageEntryJobKind(state.Stage)
 		if !ok {
+			continue
+		}
+		reason, err := r.stageTransitions.LastStageReason(ctx, versionID, state.StageEnteredAt)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read stage transition for version %d: %w", versionID, err))
+			continue
+		}
+		if reason != stageEntryJobReason(state.Stage) {
+			// Unknown/legacy or a transition that owns no entry job (resumed,
+			// rejected, suspended): the pre-visit job is the legitimate one.
 			continue
 		}
 		missing, err := r.missingStageJob(ctx, versionID, kind, state.StageEnteredAt)
@@ -380,6 +435,24 @@ func stageEntryJobKind(stage version.Stage) (string, bool) {
 		return versionapp.StageJobReportVersion, true
 	default:
 		return "", false
+	}
+}
+
+// stageEntryJobReason returns the transition reason that created the visit which
+// owns the stage's entry job. Only the stage machine's hard-gate and
+// wave-terminal transitions are repairable: a resume or reject re-enters a stage
+// without a job, and a generic Transition reason cannot be proven to own one. A
+// stage without an entry job returns "".
+func stageEntryJobReason(stage version.Stage) string {
+	switch stage {
+	case version.StageDesigning:
+		return stageReasonRequirementConfirmed
+	case version.StageExecuting:
+		return stageReasonCasesConfirmed
+	case version.StageReporting:
+		return stageReasonWaveTerminal
+	default:
+		return ""
 	}
 }
 

@@ -1166,10 +1166,13 @@ func main() {
 		RunningVersions: versionSvc,
 		// R49 stage-entry-job recovery: read the stage and re-enqueue through
 		// the same idempotent dispatcher the stage machine uses. The presence
-		// query uses kind + stage-entered floor, not a newest-page scan.
+		// query uses kind + stage-entered floor, not a newest-page scan, and the
+		// transition reason proves the visit was created by a transition that
+		// owns the entry job (a resume/reject re-entry must not be repaired).
 		Stages:           versionRepo,
 		StageJobs:        dispatcher,
 		StageJobPresence: workItems,
+		StageTransitions: eventingpg.NewStageTransitionReader(pool),
 		// The event-driven loop is the default; the env switch restores the old
 		// periodic scan until P10 acceptance.
 		PollInterval: reconcilerPollInterval(),
