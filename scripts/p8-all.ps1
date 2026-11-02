@@ -103,7 +103,65 @@ CREATE DATABASE eztest_v02_p8 TEMPLATE eztest_v02_p7;
 Run-Step "acceptance" "scripts\p8-acceptance.ps1"
 Run-Step "resilience" "scripts\p8-resilience.ps1"
 Run-Step "multi" "scripts\p8-multi.ps1"
-Run-Step "capability" "scripts\p8-capability.ps1"
+
+# Capability needs a live API on 13333; acceptance/resilience/multi stop their
+# own stacks. Start a temporary API from the acceptance binary for this smoke.
+$capabilityApi = $null
+if (Want-Step "capability") {
+  $healthy = $false
+  try {
+    $probe = Invoke-RestMethod -Uri "http://127.0.0.1:13333/api/health" -TimeoutSec 3
+    $healthy = $probe.data.status -eq "ok"
+  } catch { }
+  if (-not $healthy) {
+    $binary = Join-Path $evidence "eztest-p8.exe"
+    if (-not (Test-Path $binary)) { throw "capability API binary not found: $binary" }
+    $dbUrl = $databaseUrl
+    $envFile = Join-Path $repoRoot ".env"
+    if (-not $dbUrl -and (Test-Path $envFile)) {
+      foreach ($line in Get-Content $envFile) {
+        if ($line -match '^\s*EZTEST_DATABASE_URL\s*=\s*(.+)$') { $dbUrl = $Matches[1].Trim() }
+      }
+    }
+    if (-not $dbUrl) { throw "EZTEST_DATABASE_URL is required for the capability API" }
+    $dbUrl = $dbUrl -replace '/eztest_v02[^/?]*(\?|$)', '/eztest_v02_p8$1'
+    $previous = @{
+      EZTEST_DATABASE_URL = $env:EZTEST_DATABASE_URL
+      EZTEST_API_PORT     = $env:EZTEST_API_PORT
+      EZTEST_WEB_PORT     = $env:EZTEST_WEB_PORT
+      EZTEST_EXECUTOR_PORT = $env:EZTEST_EXECUTOR_PORT
+    }
+    $env:EZTEST_DATABASE_URL = $dbUrl
+    $env:EZTEST_API_PORT = "13333"
+    $env:EZTEST_WEB_PORT = "6868"
+    $env:EZTEST_EXECUTOR_PORT = "13345"
+    try {
+      $capabilityApi = Start-Process -FilePath $binary -PassThru -NoNewWindow `
+        -RedirectStandardOutput (Join-Path $evidence "capability-api.log") `
+        -RedirectStandardError (Join-Path $evidence "capability-api.err.log")
+    } finally {
+      foreach ($key in $previous.Keys) { Set-Item -Path ("Env:" + $key) -Value $previous[$key] }
+    }
+    $deadline = (Get-Date).AddSeconds(120)
+    $healthy = $false
+    while ((Get-Date) -lt $deadline) {
+      try {
+        $probe = Invoke-RestMethod -Uri "http://127.0.0.1:13333/api/health" -TimeoutSec 3
+        if ($probe.data.status -eq "ok") { $healthy = $true; break }
+      } catch { }
+      Start-Sleep -Milliseconds 500
+    }
+    if (-not $healthy) { throw "capability API did not become healthy on 13333" }
+  }
+}
+
+try {
+  Run-Step "capability" "scripts\p8-capability.ps1"
+} finally {
+  if ($null -ne $capabilityApi -and -not $capabilityApi.HasExited) {
+    Stop-Process -Id $capabilityApi.Id -Force -ErrorAction SilentlyContinue
+  }
+}
 Run-Step "e2e" "scripts\p8-e2e.ps1"
 Run-Step "static" "scripts\p8-static-check.ps1"
 
