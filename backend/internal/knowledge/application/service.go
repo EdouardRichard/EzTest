@@ -65,7 +65,11 @@ func (s *Service) List(ctx context.Context, filter ListFilter) (Page, error) {
 	}
 	status := filter.Status
 	if status != "" && !status.Valid() {
-		return Page{}, platform.Invalid("status", "status must be draft, approved, rejected or revoked")
+		return Page{}, platform.Invalid("status", "status must be draft, approved, rejected, revoked, suspect or stale")
+	}
+	bindings, err := filter.Bindings.Normalize()
+	if err != nil {
+		return Page{}, err
 	}
 	if filter.Cursor < 0 {
 		return Page{}, platform.Invalid("cursor", "must not be negative")
@@ -84,6 +88,7 @@ func (s *Service) List(ctx context.Context, filter ListFilter) (Page, error) {
 		SystemKey: systemKey,
 		Tag:       strings.TrimSpace(filter.Tag),
 		Query:     strings.TrimSpace(filter.Query),
+		Bindings:  bindings,
 		BeforeID:  filter.Cursor,
 		Limit:     limit + 1,
 	})
@@ -135,6 +140,10 @@ func (s *Service) Create(ctx context.Context, actor platform.Actor, input Create
 	if err != nil {
 		return knowledge.Item{}, err
 	}
+	bindings, err := input.Bindings.Normalize()
+	if err != nil {
+		return knowledge.Item{}, err
+	}
 	scope := input.Scope
 	if scope == "" {
 		if input.SystemKey != nil && strings.TrimSpace(*input.SystemKey) != "" {
@@ -169,6 +178,7 @@ func (s *Service) Create(ctx context.Context, actor platform.Actor, input Create
 		Content:         content,
 		Tags:            tags,
 		Status:          knowledge.StatusDraft,
+		Bindings:        bindings,
 		SourceVersionID: input.SourceVersionID,
 		// Promoting from a version defaults the promoted marker to the source
 		// version (spec §4.3).
@@ -437,6 +447,59 @@ func (s *Service) Revoke(ctx context.Context, actor platform.Actor, id int64, re
 		"knowledge_id": platformid.Format(item.ID),
 		"reason":       normalizedReason,
 	})
+	return item, nil
+}
+
+// UpdateStatus applies one verification-lifecycle transition outside the admin
+// review path: draft -> approved (low-risk auto-approval), approved -> suspect
+// when reuse fails, approved -> stale when the bound page/route/account
+// changed, and suspect/stale -> approved when the item is re-verified. Only the
+// lifecycle targets approved/suspect/stale are accepted; reject/revoke stay in
+// the admin-only methods. The optional reason is stored as the review reason.
+// The method performs no actor check: callers are trusted lifecycle code.
+func (s *Service) UpdateStatus(ctx context.Context, id int64, status knowledge.Status, reason string) (knowledge.Item, error) {
+	if err := s.requireID(id); err != nil {
+		return knowledge.Item{}, err
+	}
+	if err := s.requireRepo(); err != nil {
+		return knowledge.Item{}, err
+	}
+	switch status {
+	case knowledge.StatusApproved, knowledge.StatusSuspect, knowledge.StatusStale:
+	default:
+		return knowledge.Item{}, platform.Invalid("status", "status must be approved, suspect or stale")
+	}
+	item, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return knowledge.Item{}, mapRepoError(err)
+	}
+	from := item.Status
+	if !knowledge.CanTransition(from, status) {
+		return knowledge.Item{}, stateConflict("invalid_transition")
+	}
+	var normalizedReason *string
+	if strings.TrimSpace(reason) != "" {
+		value, err := knowledge.ValidateReason(reason)
+		if err != nil {
+			return knowledge.Item{}, err
+		}
+		normalizedReason = &value
+	}
+
+	now := s.now()
+	item.Status = status
+	item.UpdatedAt = now
+	switch status {
+	case knowledge.StatusApproved:
+		item.ReviewReason = nil
+		item.RevokedAt = nil
+	case knowledge.StatusSuspect, knowledge.StatusStale:
+		// The review metadata is historical; only the reason and timestamp move.
+		item.ReviewReason = normalizedReason
+	}
+	if err := s.repo.UpdateStatus(ctx, item, from); err != nil {
+		return knowledge.Item{}, mapRepoError(err)
+	}
 	return item, nil
 }
 

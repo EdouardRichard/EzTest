@@ -6,6 +6,7 @@ package knowledgepg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,7 +18,7 @@ import (
 
 const itemColumns = `id, scope, system_key, title, content, tags, status, confidence::float8,
 	source_version_id, promoted_from_version_id, revision, review_reason, reviewed_by,
-	reviewed_at, revoked_at, created_by, created_at, updated_at`
+	reviewed_at, revoked_at, created_by, created_at, updated_at, bindings, last_verified_at`
 
 const revisionColumns = `id, knowledge_id, revision, title, content, tags, changed_by, created_at`
 
@@ -37,6 +38,10 @@ func (r *Repository) Insert(ctx context.Context, item knowledge.Item, revision k
 	if err := r.ready(); err != nil {
 		return err
 	}
+	bindings, err := encodeBindings(item.Bindings)
+	if err != nil {
+		return err
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin knowledge insert: %w", err)
@@ -46,12 +51,14 @@ func (r *Repository) Insert(ctx context.Context, item knowledge.Item, revision k
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO knowledge_item (id, scope, system_key, title, content, tags, status,
 			confidence, source_version_id, promoted_from_version_id, revision, review_reason,
-			reviewed_by, reviewed_at, revoked_at, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+			reviewed_by, reviewed_at, revoked_at, created_by, created_at, updated_at,
+			bindings, last_verified_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			$17, $17, $18::jsonb, $19)
 	`, item.ID, string(item.Scope), item.SystemKey, item.Title, item.Content, tagsForWrite(item.Tags),
 		string(item.Status), item.Confidence, item.SourceVersionID, item.PromotedFromVersionID,
 		item.Revision, item.ReviewReason, item.ReviewedBy, item.ReviewedAt, item.RevokedAt,
-		item.CreatedBy, item.CreatedAt); err != nil {
+		item.CreatedBy, item.CreatedAt, bindings, item.LastVerifiedAt); err != nil {
 		return fmt.Errorf("insert knowledge item: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -108,6 +115,14 @@ func (r *Repository) List(ctx context.Context, filter knowledge.Filter) ([]knowl
 		args = append(args, filter.Tag)
 		where = append(where, fmt.Sprintf("tags @> ARRAY[$%d]::text[]", len(args)))
 	}
+	if !filter.Bindings.IsZero() {
+		bindings, err := encodeBindings(filter.Bindings)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, bindings)
+		where = append(where, fmt.Sprintf("bindings @> $%d::jsonb", len(args)))
+	}
 	order := "id DESC"
 	if filter.Query != "" {
 		args = append(args, filter.Query)
@@ -160,6 +175,10 @@ func (r *Repository) Update(ctx context.Context, item knowledge.Item, revision k
 	if err := r.ready(); err != nil {
 		return err
 	}
+	bindings, err := encodeBindings(item.Bindings)
+	if err != nil {
+		return err
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin knowledge update: %w", err)
@@ -169,11 +188,13 @@ func (r *Repository) Update(ctx context.Context, item knowledge.Item, revision k
 	tag, err := tx.Exec(ctx, `
 		UPDATE knowledge_item SET title = $2, content = $3, tags = $4, scope = $5,
 			system_key = $6, status = $7, revision = $8, review_reason = $9,
-			reviewed_by = $10, reviewed_at = $11, revoked_at = $12, updated_at = $13
+			reviewed_by = $10, reviewed_at = $11, revoked_at = $12, updated_at = $13,
+			bindings = $15::jsonb, last_verified_at = $16
 		WHERE id = $1 AND revision = $14
 	`, item.ID, item.Title, item.Content, tagsForWrite(item.Tags), string(item.Scope),
 		item.SystemKey, string(item.Status), item.Revision, item.ReviewReason, item.ReviewedBy,
-		item.ReviewedAt, item.RevokedAt, item.UpdatedAt, item.Revision-1)
+		item.ReviewedAt, item.RevokedAt, item.UpdatedAt, item.Revision-1, bindings,
+		item.LastVerifiedAt)
 	if err != nil {
 		return fmt.Errorf("update knowledge item: %w", err)
 	}
@@ -202,10 +223,10 @@ func (r *Repository) UpdateStatus(ctx context.Context, item knowledge.Item, from
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE knowledge_item SET status = $2, review_reason = $3, reviewed_by = $4,
-			reviewed_at = $5, revoked_at = $6, updated_at = $7
-		WHERE id = $1 AND status = $8
+			reviewed_at = $5, revoked_at = $6, updated_at = $7, last_verified_at = $8
+		WHERE id = $1 AND status = $9
 	`, item.ID, string(item.Status), item.ReviewReason, item.ReviewedBy, item.ReviewedAt,
-		item.RevokedAt, item.UpdatedAt, string(from))
+		item.RevokedAt, item.UpdatedAt, item.LastVerifiedAt, string(from))
 	if err != nil {
 		return fmt.Errorf("update knowledge status: %w", err)
 	}
@@ -243,8 +264,9 @@ func (r *Repository) ListRevisions(ctx context.Context, knowledgeID int64) ([]kn
 }
 
 // ListForInjection returns approved candidates visible to the requested system
-// keys, ordered by ts_rank desc then id desc. Source staleness is filtered by
-// the application service.
+// keys, ordered by ts_rank desc then id desc. Only status=approved rows are
+// returned, so revoked/suspect/stale/draft items never inject. Source
+// staleness is filtered by the application service.
 func (r *Repository) ListForInjection(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
@@ -257,12 +279,25 @@ func (r *Repository) ListForInjection(ctx context.Context, query knowledge.Injec
 	if keys == nil {
 		keys = []string{}
 	}
-	sql := `SELECT ` + itemColumns + ` FROM knowledge_item
-		WHERE status = 'approved'
-		  AND (scope = 'global' OR (scope = 'system' AND system_key = ANY($1::text[])))
+	args := []any{keys, query.Query}
+	where := []string{
+		"status = 'approved'",
+		"(scope = 'global' OR (scope = 'system' AND system_key = ANY($1::text[])))",
+	}
+	if !query.Bindings.IsZero() {
+		bindings, err := encodeBindings(query.Bindings)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, bindings)
+		where = append(where, fmt.Sprintf("bindings @> $%d::jsonb", len(args)))
+	}
+	args = append(args, limit)
+	sql := fmt.Sprintf(`SELECT `+itemColumns+` FROM knowledge_item
+		WHERE %s
 		ORDER BY ts_rank(search_vector, websearch_to_tsquery('simple', $2)) DESC, id DESC
-		LIMIT $3`
-	rows, err := r.pool.Query(ctx, sql, keys, query.Query, limit)
+		LIMIT $%d`, strings.Join(where, " AND "), len(args))
+	rows, err := r.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list knowledge for injection: %w", err)
 	}
@@ -336,10 +371,11 @@ type rowScanner interface {
 func scanItem(row rowScanner) (knowledge.Item, error) {
 	var item knowledge.Item
 	var scope, status string
+	var bindingsRaw []byte
 	if err := row.Scan(&item.ID, &scope, &item.SystemKey, &item.Title, &item.Content, &item.Tags,
 		&status, &item.Confidence, &item.SourceVersionID, &item.PromotedFromVersionID,
 		&item.Revision, &item.ReviewReason, &item.ReviewedBy, &item.ReviewedAt, &item.RevokedAt,
-		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		&item.CreatedBy, &item.CreatedAt, &item.UpdatedAt, &bindingsRaw, &item.LastVerifiedAt); err != nil {
 		return knowledge.Item{}, err
 	}
 	item.Scope = knowledge.Scope(scope)
@@ -347,7 +383,25 @@ func scanItem(row rowScanner) (knowledge.Item, error) {
 	if item.Tags == nil {
 		item.Tags = []string{}
 	}
+	if len(bindingsRaw) > 0 {
+		if err := json.Unmarshal(bindingsRaw, &item.Bindings); err != nil {
+			return knowledge.Item{}, fmt.Errorf("decode knowledge bindings: %w", err)
+		}
+	}
 	return item, nil
+}
+
+// encodeBindings renders the bindings JSONB object; a zero value stays "{}" so
+// the NOT NULL column and the jsonb_typeof CHECK both hold.
+func encodeBindings(bindings knowledge.Bindings) (string, error) {
+	encoded, err := json.Marshal(bindings)
+	if err != nil {
+		return "", fmt.Errorf("encode knowledge bindings: %w", err)
+	}
+	if string(encoded) == "null" {
+		return "{}", nil
+	}
+	return string(encoded), nil
 }
 
 // tagsForWrite keeps the NOT NULL TEXT[] column an empty array rather than

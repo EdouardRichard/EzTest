@@ -4,23 +4,28 @@ import "context"
 
 // Filter narrows one knowledge list page. Empty string fields mean "no
 // filter". BeforeID is the exclusive id-desc cursor; Limit is the requested
-// page size (the application asks for one row more than it returns).
+// page size (the application asks for one row more than it returns). Bindings
+// narrows rows by JSONB containment: every dimension set on the filter must
+// equal the stored binding.
 type Filter struct {
 	Scope     Scope
 	Status    Status
 	SystemKey string
 	Tag       string
 	Query     string
+	Bindings  Bindings
 	BeforeID  int64
 	Limit     int
 }
 
 // InjectionQuery selects approved knowledge for one prompt injection. The
 // adapter must return only status=approved rows whose scope is global or whose
-// system_key is in SystemKeys, ordered by ts_rank desc then id desc.
+// system_key is in SystemKeys, ordered by ts_rank desc then id desc. A non-zero
+// Bindings value applies the same containment filter as Filter.Bindings.
 type InjectionQuery struct {
 	SystemKeys []string
 	Query      string
+	Bindings   Bindings
 	Limit      int
 }
 

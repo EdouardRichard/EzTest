@@ -690,6 +690,200 @@ func TestRevokeDraftIsAStateConflict(t *testing.T) {
 	assertAPIError(t, err, 409, "state_conflict", "invalid_transition")
 }
 
+/* ---------------------------- bindings/lifecycle -------------------------- */
+
+func TestKnowledgeBindingsAndStatus(t *testing.T) {
+	t.Run("creates and filters by structured bindings", func(t *testing.T) {
+		f := newFixture(t)
+		systemID, environmentID := int64(7001), int64(7101)
+		item, err := f.svc.Create(context.Background(), platform.Actor{ID: 7, Role: "user"},
+			knowledgeapp.CreateInput{
+				Title:   "Login recipe",
+				Content: "Fill the form and submit.",
+				Bindings: knowledge.Bindings{
+					SystemID:      &systemID,
+					EnvironmentID: &environmentID,
+					PageKey:       ptr(" /login "),
+					APIKey:        ptr(" POST /api/auth/login "),
+					AccountRole:   ptr(" admin "),
+				},
+			})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		bindings := item.Bindings
+		if bindings.SystemID == nil || *bindings.SystemID != systemID ||
+			bindings.EnvironmentID == nil || *bindings.EnvironmentID != environmentID {
+			t.Fatalf("id bindings = %+v", bindings)
+		}
+		if bindings.PageKey == nil || *bindings.PageKey != "/login" ||
+			bindings.APIKey == nil || *bindings.APIKey != "POST /api/auth/login" ||
+			bindings.AccountRole == nil || *bindings.AccountRole != "admin" {
+			t.Fatalf("string bindings = %+v", bindings)
+		}
+		if f.repo.insertedItem.Bindings.PageKey == nil || *f.repo.insertedItem.Bindings.PageKey != "/login" {
+			t.Fatalf("inserted bindings = %+v", f.repo.insertedItem.Bindings)
+		}
+
+		if _, err := f.svc.List(context.Background(), knowledgeapp.ListFilter{
+			Bindings: knowledge.Bindings{
+				SystemID:    &systemID,
+				PageKey:     ptr(" /login "),
+				AccountRole: ptr(" admin "),
+			},
+		}); err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		filter := f.repo.listFilter.Bindings
+		if filter.SystemID == nil || *filter.SystemID != systemID ||
+			filter.PageKey == nil || *filter.PageKey != "/login" ||
+			filter.AccountRole == nil || *filter.AccountRole != "admin" {
+			t.Fatalf("binding filter = %+v", filter)
+		}
+		if filter.APIKey != nil || filter.EnvironmentID != nil {
+			t.Fatalf("unset binding filters leaked: %+v", filter)
+		}
+	})
+
+	t.Run("rejects invalid bindings", func(t *testing.T) {
+		longPageKey := strings.Repeat("p", 501)
+		negativeID := int64(-1)
+		tests := []struct {
+			name     string
+			bindings knowledge.Bindings
+			field    string
+		}{
+			{name: "negative system", bindings: knowledge.Bindings{SystemID: &negativeID}, field: "bindings.system_id"},
+			{name: "long page key", bindings: knowledge.Bindings{PageKey: &longPageKey}, field: "bindings.page_key"},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				f := newFixture(t)
+				_, err := f.svc.Create(context.Background(), platform.Actor{ID: 7, Role: "user"},
+					knowledgeapp.CreateInput{Title: "Title", Content: "Body", Bindings: test.bindings})
+				if apiErr := platform.AsError(err); apiErr.Status != 400 || apiErr.Details["field"] != test.field {
+					t.Fatalf("error = %+v, want invalid %s", apiErr, test.field)
+				}
+				if f.repo.insertCalls != 0 {
+					t.Fatalf("rejected create must not write: insert=%d", f.repo.insertCalls)
+				}
+			})
+		}
+	})
+
+	t.Run("draft approved suspect stale lifecycle", func(t *testing.T) {
+		f := newFixture(t)
+		verifiedAt := testNow.Add(-2 * time.Hour)
+		item := draftItem(42, 7)
+		item.LastVerifiedAt = &verifiedAt
+		f.repo.items[42] = item
+
+		approved, err := f.svc.Approve(context.Background(), platform.Actor{ID: 88, Role: "admin"}, 42, "")
+		if err != nil {
+			t.Fatalf("approve: %v", err)
+		}
+		if approved.Status != knowledge.StatusApproved {
+			t.Fatalf("status = %s, want approved", approved.Status)
+		}
+		f.repo.items[42] = approved
+
+		suspect, err := f.svc.UpdateStatus(context.Background(), 42, knowledge.StatusSuspect, " login callback failed ")
+		if err != nil {
+			t.Fatalf("mark suspect: %v", err)
+		}
+		if suspect.Status != knowledge.StatusSuspect {
+			t.Fatalf("status = %s, want suspect", suspect.Status)
+		}
+		if suspect.ReviewReason == nil || *suspect.ReviewReason != "login callback failed" {
+			t.Fatalf("review reason = %v", suspect.ReviewReason)
+		}
+		if suspect.LastVerifiedAt == nil || !suspect.LastVerifiedAt.Equal(verifiedAt) {
+			t.Fatalf("last verified = %v", suspect.LastVerifiedAt)
+		}
+		if f.repo.statusFrom != knowledge.StatusApproved || !f.repo.statusItem.UpdatedAt.Equal(testNow) {
+			t.Fatalf("repo status write = from %s item %+v", f.repo.statusFrom, f.repo.statusItem)
+		}
+		f.repo.items[42] = suspect
+
+		stale, err := f.svc.UpdateStatus(context.Background(), 42, knowledge.StatusStale, "route template changed")
+		if err != nil {
+			t.Fatalf("mark stale: %v", err)
+		}
+		if stale.Status != knowledge.StatusStale || stale.ReviewReason == nil ||
+			*stale.ReviewReason != "route template changed" {
+			t.Fatalf("stale item = %+v", stale)
+		}
+		if f.repo.statusFrom != knowledge.StatusSuspect {
+			t.Fatalf("from status = %s, want suspect", f.repo.statusFrom)
+		}
+		f.repo.items[42] = stale
+
+		reapproved, err := f.svc.UpdateStatus(context.Background(), 42, knowledge.StatusApproved, "")
+		if err != nil {
+			t.Fatalf("re-approve: %v", err)
+		}
+		if reapproved.Status != knowledge.StatusApproved || reapproved.ReviewReason != nil {
+			t.Fatalf("re-approved item = %+v", reapproved)
+		}
+		if f.repo.statusFrom != knowledge.StatusStale {
+			t.Fatalf("from status = %s, want stale", f.repo.statusFrom)
+		}
+	})
+
+	t.Run("draft auto approval uses the lifecycle transition", func(t *testing.T) {
+		f := newFixture(t)
+		f.repo.items[42] = draftItem(42, 7)
+		approved, err := f.svc.UpdateStatus(context.Background(), 42, knowledge.StatusApproved, "")
+		if err != nil {
+			t.Fatalf("auto approve: %v", err)
+		}
+		if approved.Status != knowledge.StatusApproved || f.repo.statusFrom != knowledge.StatusDraft {
+			t.Fatalf("item = %+v from = %s", approved, f.repo.statusFrom)
+		}
+	})
+
+	t.Run("rejects illegal lifecycle transitions", func(t *testing.T) {
+		f := newFixture(t)
+		f.repo.items[42] = draftItem(42, 7)
+		_, err := f.svc.UpdateStatus(context.Background(), 42, knowledge.StatusSuspect, "not approved yet")
+		assertAPIError(t, err, 409, "state_conflict", "invalid_transition")
+		if f.repo.statusItem.ID != 0 {
+			t.Fatalf("illegal transition must not write: %+v", f.repo.statusItem)
+		}
+		_, err = f.svc.UpdateStatus(context.Background(), 42, knowledge.StatusRevoked, "not a lifecycle target")
+		assertAPIError(t, err, 400, "invalid_argument", "")
+		_, err = f.svc.UpdateStatus(context.Background(), 42, knowledge.Status("pending"), "")
+		assertAPIError(t, err, 400, "invalid_argument", "")
+		_, err = f.svc.UpdateStatus(context.Background(), 404, knowledge.StatusSuspect, "")
+		assertAPIError(t, err, 404, "not_found", "")
+		_, err = f.svc.UpdateStatus(context.Background(), 0, knowledge.StatusSuspect, "")
+		assertAPIError(t, err, 400, "invalid_argument", "")
+	})
+
+	t.Run("revoked stale and suspect items are not injected", func(t *testing.T) {
+		f := newFixture(t)
+		f.repo.items[42] = approvedItem(42, knowledge.ScopeGlobal, "")
+		revoked, err := f.svc.Revoke(context.Background(), platform.Actor{ID: 88, Role: "admin"}, 42, "obsolete")
+		if err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+		stale := approvedItem(43, knowledge.ScopeGlobal, "")
+		stale.Status = knowledge.StatusStale
+		suspect := approvedItem(44, knowledge.ScopeGlobal, "")
+		suspect.Status = knowledge.StatusSuspect
+		keep := approvedItem(45, knowledge.ScopeGlobal, "")
+		f.repo.injectionItems = []knowledge.Item{revoked, stale, suspect, keep}
+
+		injected, err := f.svc.Inject(context.Background(), knowledgeapp.InjectInput{VersionID: 1})
+		if err != nil {
+			t.Fatalf("inject: %v", err)
+		}
+		if len(injected) != 1 || injected[0].ID != 45 {
+			t.Fatalf("injected = %+v, want only the approved item", injected)
+		}
+	})
+}
+
 /* ---------------------------------- list ---------------------------------- */
 
 func TestListNormalizesLimitAndPaginates(t *testing.T) {

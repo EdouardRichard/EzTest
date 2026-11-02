@@ -85,13 +85,15 @@ type Clock = clock.Clock
 type IDGenerator = platformid.Generator
 
 // ListFilter narrows one knowledge page. Zero-value string fields mean no
-// filter; Limit is normalized by the service.
+// filter; Limit is normalized by the service. Bindings filters rows by
+// structured SUT bindings (system/environment/page/api/account role).
 type ListFilter struct {
 	Scope     knowledge.Scope
 	Status    knowledge.Status
 	SystemKey string
 	Tag       string
 	Query     string
+	Bindings  knowledge.Bindings
 	Cursor    int64
 	Limit     int
 }
@@ -105,13 +107,15 @@ type Page struct {
 }
 
 // CreateInput is one POST /api/knowledge/items request (or a knowledge.propose
-// tool call after conversion). AgentRunID is optional audit metadata.
+// tool call after conversion). AgentRunID is optional audit metadata. Bindings
+// are the structured SUT identifiers the item is bound to.
 type CreateInput struct {
 	Title                 string
 	Content               string
 	Scope                 knowledge.Scope
 	SystemKey             *string
 	Tags                  []string
+	Bindings              knowledge.Bindings
 	SourceVersionID       *int64
 	PromotedFromVersionID *int64
 	AgentRunID            *int64
