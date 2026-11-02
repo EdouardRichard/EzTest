@@ -26,7 +26,6 @@
 ## Table of contents
 
 - [Overview](#overview)
-  - [Who it is for](#who-it-is-for)
 - [How it works](#how-it-works)
 - [Screenshots](#screenshots)
 - [Getting started](#getting-started)
@@ -57,15 +56,6 @@ desired and actual state, four agent teams plus a Version Steward, and persisten
 collaboration channels. Agents only submit structured candidates; the server validates scope, state and
 evidence before anything is written, and every verdict is bound to content-addressed, immutable
 evidence.
-
-### Who it is for
-
-| User | Typical job |
-|---|---|
-| QA / test engineers | Turn release requirements into reviewed, executable E2E coverage without hand-writing every step |
-| Developers self-testing a change | Run a focused regression against the real UI/API and get evidence for a fix |
-| Test leads / release owners | Read coverage, results, issues and per-batch report diffs; know what was tested against which commit |
-| Platform administrator (single) | Onboard systems, environments, accounts, local Git repositories, LLMs and users; manage audit |
 
 ---
 
@@ -135,9 +125,6 @@ sequenceDiagram
 ---
 
 ## Screenshots
-
-Captured from the v0.2 build against acceptance fixtures. The web UI is Simplified Chinese in this
-preview (a known limitation); the screenshots below illustrate the workflows, not localized copy.
 
 ![Clarify requirements in a conversation with the AI team](assets/screenshots/01-hero-requirements.png)
 
