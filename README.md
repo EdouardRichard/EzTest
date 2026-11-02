@@ -17,16 +17,15 @@
 </p>
 
 > **Status: v0.2-preview (pre-release).** EzTest implements the complete pipeline below and has been
-> exercised end-to-end on the maintainers' host with a real browser and a real OpenAI-compatible model
-> (see [Verification](#verification)). This is a preview for evaluation, not a production release —
-> read [Preview status & known limitations](#preview-status--known-limitations) before relying on it.
+> exercised end-to-end on the maintainers' host with a real browser and a real OpenAI-compatible model.
+> This is a preview for evaluation, not a production release — validate it in your own environment
+> before relying on it.
 
 ---
 
 ## Table of contents
 
 - [Overview](#overview)
-  - [What makes EzTest different](#what-makes-eztest-different)
   - [Who it is for](#who-it-is-for)
 - [How it works](#how-it-works)
 - [Screenshots](#screenshots)
@@ -37,8 +36,6 @@
   - [First-run configuration](#first-run-configuration)
   - [Ports and health endpoints](#ports-and-health-endpoints)
 - [Architecture and technical route](#architecture-and-technical-route)
-- [Verification](#verification)
-- [Preview status & known limitations](#preview-status--known-limitations)
 - [Project layout](#project-layout)
 - [License](#license)
 
@@ -60,34 +57,6 @@ desired and actual state, four agent teams plus a Version Steward, and persisten
 collaboration channels. Agents only submit structured candidates; the server validates scope, state and
 evidence before anything is written, and every verdict is bound to content-addressed, immutable
 evidence.
-
-### What makes EzTest different
-
-- **Version-first, not script-first.** A version bundles multiple related requirements, SUT bindings,
-  executions, evidence and reports. Clarification, design, execution and delivery are all scoped to that
-  version, and the version reopens automatically when a new goal appears.
-- **Code-aware design.** A read-only local Git worktree is the source of truth for the code baseline.
-  Design and regression scope derive from requirement relations plus code diffs and anchors — not from
-  hand-maintained page objects.
-- **Confirmation, not manual authoring.** AI authors the scenario / case / step / assertion graph with
-  requirement sources, SUT targets and code anchors; a human confirms cases (per case, scenario or
-  requirement) instead of writing every step. Confirmation freezes an immutable case version.
-- **Real browser + API execution with evidence.** A separate Playwright executor drives Chromium,
-  captures screenshots, console, network and API evidence, and supports read-only PostgreSQL assertions
-  and pixel-level visual assertions.
-- **Autonomous loop, not a one-shot run.** Failures are classified and triaged, coverage gaps are
-  supplemented with marked AI-supplement cases, and completed versions enter incremental batches when
-  new requirements arrive.
-- **No central orchestrator.** Work is a `work_item` on a shared task board; a reconciler creates what
-  is missing, agents claim with leases and fencing epochs, and teams hand off through artifacts instead
-  of calling each other.
-- **Observable and interruptible.** Server-Sent Events stream agent activity with replay; runs can be
-  paused gracefully or immediately and resumed from the last completed step; the exploration chain
-  explains *why* a case failed.
-- **Bring your own LLM.** Any OpenAI-compatible endpoint, configured by an administrator, with model
-  catalog refresh and connectivity tests. AI behavior is not the only path: without a working LLM the
-  deterministic parts keep functioning and AI paths return retryable errors instead of failing the
-  product.
 
 ### Who it is for
 
@@ -160,7 +129,7 @@ sequenceDiagram
     DL->>DB: issue candidates, wave report revision
     CP->>DL: all requirements closed, no open work, report published
     DL->>DB: version summary report and version.close_propose
-    DB-->>W: version completed; reopened later by a new goal
+    DB-->>W: version completed, reopened later by a new goal
 ```
 
 ---
@@ -511,63 +480,6 @@ stateDiagram-v2
   directory. Rate limiting is per instance (total rate = replicas × limit; default disabled), and
   event/audit retention cleanup runs daily on the leader.
 - Back up PostgreSQL and all content directories together; keep `EZTEST_SECRET_KEYS` separately.
-
----
-
-## Verification
-
-Recorded on the maintainers' development host (single Windows machine, 2026-11-02) against the v0.2
-build, with a real OpenAI-compatible model and a real Chromium browser, and stored in the repository's
-acceptance records:
-
-| Check | Result |
-|---|---|
-| Automated test suite (`scripts/test.ps1`) | Go unit + integration pass; frontend lint / typecheck / Vitest pass (105 test files) |
-| Full-journey acceptance S0–S6 (real model + real Chrome, two SUTs) | Pass — 180/180 checks |
-| Multi-replica acceptance S8 (two API replicas, shared database and content dir, drain, leader lock, executor loss and re-dispatch) | Pass — 72 pass / 0 fail / 1 structural skip |
-| Capability matrix (37 capability rows) | 28 pass in this phase + 9 pass on prior-phase evidence, 0 fail |
-| Browser E2E (Playwright against the real API and web UI) | 11 scenarios pass, 44 screenshots |
-| Static acceptance gate | 18/18 checks pass |
-| Frozen contract | OpenAPI `0.2.0-p8`: 162 paths / 200 operations / 264 schemas; 85 tables; 42 migrations; 19 task types; 14 agent profiles; executor wire protocol v1.2 |
-
-This is a preview: the numbers above describe the maintainers' environment and a single-model run, not
-a hosted CI guarantee or a production SLA. See the next section for the parts that are *not* verified.
-
----
-
-## Preview status & known limitations
-
-EzTest v0.2-preview is an evaluation build. The most important limitations:
-
-1. **Not production-hardened.** It is a single-team, self-hosted preview: no RBAC, multi-tenancy, SSO,
-   TLS termination or autoscaling, and no production security or performance hardening. Expose it only
-   on a trusted network.
-2. **Credentials are stored in the database and masked in the UI, not encrypted at rest.** This
-   includes LLM API keys, test-account passwords and browser session state by design. Treat the
-   database and its backups as sensitive, and protect the executor and renderer tokens. A fresh
-   database seeds the administrator `admin` / `admin123` — change it immediately.
-3. **Docker Compose is statically validated only.** The images have never been built and the stack has
-   never been started by the maintainers; validate it on a Docker host before use.
-4. **No SLO, performance, load or security-audit evidence.** No availability, throughput or security
-   baseline is claimed. Hosted CI is present but is not a release gate for this preview.
-5. **Long-execution evidence is partial.** The final acceptance run covered the main journey and
-   multi-replica behavior; the long 12-case / two-wave run, large tool-result spill and checkpoint
-   recovery are not fully evidenced in that run and are tracked for a follow-up (approved as a waiver
-   for this preview).
-6. **Model behavior is non-deterministic.** The recorded acceptance is one model and one run, not a
-   model matrix. Multi-turn clarification can occasionally produce duplicate requirement drafts, and a
-   model may emit free-text steps that cannot be compiled into executable actions.
-7. **Visual assertions can end `inconclusive`.** There is no waiver endpoint yet, so auto-confirming
-   every visual gap case can keep a requirement from closing; leave such drafts unconfirmed until
-   reviewed.
-8. **Multi-replica boundaries.** Rate limiting is per instance (total = replicas × limit; default
-   disabled), all API replicas must share one content directory, and SSE hubs and agent runners are
-   in-process. No Redis/NATS/object storage, no autoscaling and no cross-region HA.
-9. **No data migration from 0.1-preview.** v0.2 uses a new database schema; the previous preview's data
-   is not migrated in place. Migrations are append-only once applied; roll back by restoring a backup.
-10. **Web UI is Simplified Chinese only** in this preview; there is no i18n layer or language switch.
-11. **Scope boundaries:** PostgreSQL-only database assertions, web UI and HTTP API functional testing
-    only (no performance, security or mobile testing), and no external ticket/CI/IM integrations.
 
 ---
 
