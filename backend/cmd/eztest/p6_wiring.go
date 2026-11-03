@@ -33,6 +33,7 @@ import (
 	settingsapp "github.com/EdouardRichard/EzTest/backend/internal/settings/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
+	versionapi "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 	workspaceapp "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
 	workspaceproviders "github.com/EdouardRichard/EzTest/backend/internal/workspace/infrastructure/providers"
 	workspaceapi "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
@@ -84,6 +85,7 @@ func newP6ReadRuntime(deps p6ReadDeps) (*p6ReadRuntime, error) {
 		return nil, err
 	}
 	versionQuery := versionapp.NewQueryService(versionReader)
+	versionRead := versionapp.NewVersionReadService(versionReader)
 
 	executionReader, err := executionpg.NewQueryReader(deps.Pool, agentQuery)
 	if err != nil {
@@ -133,6 +135,9 @@ func newP6ReadRuntime(deps p6ReadDeps) (*p6ReadRuntime, error) {
 			Search:  searchapi.New(searchSvc),
 			Todos:   workspaceapi.New(todosSvc),
 			Global:  deliveryapi.NewGlobal(deps.Issues, deps.Reports),
+			// 0.2.1 version-scoped reads: facts/plan items come from the
+			// version read source, work items from the agent query service.
+			VersionRead: versionapi.NewVersionReadHandler(versionRead, agentQuery),
 		},
 		VersionQuery: versionQuery,
 		DesignQuery:  designQuery,

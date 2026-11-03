@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -90,4 +91,77 @@ func (r *QueryReader) ListDeadWorkItems(ctx context.Context, limit int) ([]agent
 		return nil, fmt.Errorf("scan dead work items: %w", err)
 	}
 	return items, nil
+}
+
+// ListWorkItems returns one version-scoped page of 0.2.1 work items ordered by
+// id DESC. Legacy rows (empty kind) are fenced out: they are dispatched by the
+// pre-0.2.1 claim path and are not part of the frozen WorkItemView enum. A
+// canceled row is stored failed with the cancel marker; the cancelled/failed
+// state filters translate that marker so the API state and the stored status
+// never disagree. The reader fetches limit+1 rows so the application can report
+// has_more without a COUNT query.
+func (r *QueryReader) ListWorkItems(ctx context.Context, query agentapp.WorkItemQuery) ([]agent.WorkItem, bool, error) {
+	if query.VersionID <= 0 {
+		return nil, false, fmt.Errorf("list work items: version id must be positive")
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+workItemColumns+` FROM work_item
+		WHERE version_id = $1
+		  AND kind <> ''
+		  AND ($2 = '' OR kind = $2)
+		  AND (
+		        $3 = ''
+		     OR ($3 = 'cancelled' AND status = 'failed' AND last_error IS NOT DISTINCT FROM $6)
+		     OR ($3 = 'failed' AND status = 'failed' AND last_error IS DISTINCT FROM $6)
+		     OR ($3 NOT IN ('cancelled', 'failed') AND status = $3)
+		  )
+		  AND ($4 = '' OR created_by = $4)
+		  AND ($5::bigint IS NULL OR id < $5)
+		ORDER BY id DESC
+		LIMIT $7
+	`, query.VersionID, query.Kind, query.State, query.CreatedBy, query.BeforeID,
+		agentapp.JobCanceledReason, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("list work items: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]agent.WorkItem, 0)
+	for rows.Next() {
+		item, err := scanWorkItem(rows)
+		if err != nil {
+			return nil, false, fmt.Errorf("scan work item: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("scan work items: %w", err)
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	return items, hasMore, nil
+}
+
+// GetWorkItem loads one work item scoped to versionID. A row of another version
+// and a missing row are both agent.ErrNotFound; legacy rows (empty kind) are
+// fenced out like the list. The frozen work_item schema has no read that can
+// cross versions, so a foreign ID can never leak another version's job.
+func (r *QueryReader) GetWorkItem(ctx context.Context, versionID, id int64) (agent.WorkItem, error) {
+	if versionID <= 0 || id <= 0 {
+		return agent.WorkItem{}, fmt.Errorf("get work item: version id and id must be positive")
+	}
+	item, err := scanWorkItem(r.pool.QueryRow(ctx, `
+		SELECT `+workItemColumns+` FROM work_item
+		WHERE id = $1 AND version_id = $2 AND kind <> ''
+	`, id, versionID))
+	if err != nil {
+		return agent.WorkItem{}, wrapDB("get work item", err)
+	}
+	return item, nil
 }

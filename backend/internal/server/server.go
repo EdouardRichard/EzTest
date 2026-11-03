@@ -121,6 +121,10 @@ type P6Handlers struct {
 	Global      *deliveryapi.GlobalHandler
 	AgentCenter *agentapi.AgentCenterHandler
 	Profiles    *agentapi.ProfileHandler
+	// VersionRead is the 0.2.1 version-scoped read surface (facts, plan items
+	// and work items). Nil leaves those routes unmounted so a P0-P5
+	// deployment keeps its route table.
+	VersionRead *versionapi.VersionReadHandler
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -249,6 +253,9 @@ func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler
 	}
 	if h.Profiles != nil {
 		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
+	}
+	if h.VersionRead != nil {
+		versionapi.RegisterVersionReadRoutes(mux, authenticated, h.VersionRead)
 	}
 }
 
