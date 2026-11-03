@@ -174,6 +174,18 @@ func TestP3ProfilesToolsAndBudgets(t *testing.T) {
 			t.Fatalf("failure_analyst prompt is missing the %q handoff contract", required)
 		}
 	}
+	// Fix round 1: the prompt may only claim what the server actually supplies.
+	// execution.result_read carries the four-value attribution; the analyst has
+	// no issue.propose tool, so the prompt must name it as a boundary instead of
+	// implying the model creates problem reports.
+	for _, required := range []string{"execution.result_read", "attribution", "application/automation/environment/data", "issue.propose"} {
+		if !strings.Contains(failure.SystemPrompt, required) {
+			t.Fatalf("failure_analyst prompt is missing the %q contract detail", required)
+		}
+	}
+	if hasTool(failure, "issue.propose") {
+		t.Fatal("failure_analyst must not hold issue.propose; the server owns the issue candidate")
+	}
 
 	coverage, ok := profileByKey(profiles, agentapp.ProfileKeyCoverageAnalyst)
 	if !ok {

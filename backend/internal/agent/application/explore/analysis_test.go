@@ -740,6 +740,41 @@ func TestFailureAttribution(t *testing.T) {
 		t.Fatalf("data attribution = %+v", data)
 	}
 
+	// The P3 execution taxonomy (nine values, supplied by execution.result_read)
+	// is mapped onto the four attribution classes when the failure reason itself
+	// carries no keyword evidence.
+	environmentClass, err := attribution.Classify(context.Background(), 1001, exploreapp.FailureSignal{
+		CaseRunID:    9006,
+		FailureClass: string(exploreapp.FailureClassificationEnvironment),
+	})
+	if err != nil {
+		t.Fatalf("environment class signal: %v", err)
+	}
+	if environmentClass.Classification != exploreapp.FailureClassificationEnvironment ||
+		environmentClass.Action != exploreapp.FailureActionRetry {
+		t.Fatalf("environment class attribution = %+v", environmentClass)
+	}
+	automationClass, err := attribution.Classify(context.Background(), 1001, exploreapp.FailureSignal{
+		CaseRunID:    9007,
+		FailureClass: string(exploreapp.FailureClassificationAutomation),
+	})
+	if err != nil {
+		t.Fatalf("automation class signal: %v", err)
+	}
+	if automationClass.Classification != exploreapp.FailureClassificationAutomation {
+		t.Fatalf("automation class attribution = %+v", automationClass)
+	}
+	sessionClass, err := attribution.Classify(context.Background(), 1001, exploreapp.FailureSignal{
+		CaseRunID:    9008,
+		FailureClass: "session",
+	})
+	if err != nil {
+		t.Fatalf("session class signal: %v", err)
+	}
+	if sessionClass.Classification != exploreapp.FailureClassificationData {
+		t.Fatalf("session class attribution = %+v", sessionClass)
+	}
+
 	if _, err := attribution.Classify(context.Background(), 0, exploreapp.FailureSignal{}); err == nil {
 		t.Fatal("Classify must reject a non-positive version id")
 	}

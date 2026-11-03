@@ -11,6 +11,7 @@ import (
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -295,6 +296,9 @@ type CaseRunner struct {
 	instanceID       string
 	leaseTTL         time.Duration
 	heartbeat        time.Duration
+	// attribution is the deterministic four-value failure attribution the
+	// analyze.failure result exposes to the failure_analyst model (Task 37).
+	attribution *exploreapp.FailureAttribution
 
 	mu          sync.Mutex
 	activeRuns  map[int64]context.CancelFunc
@@ -361,6 +365,7 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		instanceID:       deps.InstanceID,
 		leaseTTL:         lease,
 		heartbeat:        heartbeat,
+		attribution:      exploreapp.NewFailureAttribution(),
 		activeRuns:       map[int64]context.CancelFunc{},
 		heartbeats:       map[int64]*leaseHeartbeat{},
 		waitTotals:       map[int64]time.Duration{},

@@ -607,7 +607,7 @@ func (s *CaseRunner) ResultRead(ctx context.Context, scope tools.Scope, in tools
 				"expected": assertion.Expected, "actual": assertion.Actual, "reason": assertion.Reason,
 			})
 		}
-		results = append(results, map[string]any{
+		result := map[string]any{
 			"case_run_id":     platformid.Format(caseRun.ID),
 			"case_version_id": platformid.Format(caseRun.CaseVersionID),
 			"status":          string(caseRun.Status),
@@ -616,7 +616,11 @@ func (s *CaseRunner) ResultRead(ctx context.Context, scope tools.Scope, in tools
 			"steps":           stepEntries,
 			"assertions":      assertionEntries,
 			"evidence_count":  evidenceCount,
-		})
+		}
+		if attribution := s.resultFailureAttribution(ctx, scope.VersionID, caseRun, steps, assertions); attribution != nil {
+			result["attribution"] = attribution
+		}
+		results = append(results, result)
 	}
 	return map[string]any{"wave_id": platformid.Format(scope.WaveID), "case_runs": results}, nil
 }

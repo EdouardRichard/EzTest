@@ -9,12 +9,13 @@ package main
 // same executor-page cleanup (DELETE /v1/explore?page_id=<id>, scoped to the
 // throwaway verification page so concurrent explore pages stay open).
 //
-// Task 37 adds the analysis consumer (gap / coverage / case augmentation /
-// failure attribution) and binds it to that same runtime: the deterministic
-// analysis opens pages only after Login, serializes its actions and closes
-// exactly the pages it opened. The consumer is leader-gated and event-triggered
-// with a per-version minimum interval, so the wiring is live in production
-// without a background write storm.
+// Task 37 adds the analysis consumer (discovery pre-pass, gap / coverage / case
+// augmentation) and binds it to that same runtime: the deterministic analysis
+// logs in first, crawls the bound SUT pages and scans the bound repositories for
+// API facts, then opens pages only after that Login, serializes its actions and
+// closes exactly the pages it opened. The consumer is leader-gated and event-
+// triggered with a per-version minimum interval, so the wiring is live in
+// production without a background write storm.
 //
 // The CaseSuccessHook is intentionally not wired here: the knowledge adapter
 // does not implement executionapp.CaseSuccessHook yet, and inventing one is not
@@ -43,11 +44,14 @@ import (
 )
 
 // P9 analysis bounds. A refresh is a bounded read plus a bounded set of live
-// page probes; the per-version interval coalesces event storms.
+// page probes; the per-version interval coalesces event storms. Discovery adds
+// a bounded crawl and a bounded static source scan before the analysis reads
+// the facts back.
 const (
 	p9AnalysisMinInterval     = 10 * time.Minute
 	p9AnalysisMaxRequirements = 50
 	p9AnalysisMaxProbes       = 3
+	p9AnalysisMaxDiscovered   = 20
 	p9AnalysisWakeBuffer      = 64
 )
 
@@ -130,14 +134,25 @@ func newP9Runtime(deps p9RuntimeDeps) (*p9Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Case-augmentation drafts are persisted through the design service. The
+	// composition interface is draft-only (CreateAugmentedDraftCase); a design
+	// reader that does not expose it leaves augmentation draft-only, which is a
+	// safe degradation rather than a silent confirm path.
+	var draftWriter exploreapp.DraftCaseWriter
+	if designer, ok := deps.Design.(p9AugmentedDraftDesigner); ok {
+		draftWriter = newP9DraftCaseWriter(designer, deps.Versions)
+	}
 	analysis, err := newP9Analysis(p9AnalysisDeps{
 		Runtime:      wiring,
+		Executor:     executor,
+		Sources:      newP9SourceProvider(deps.Versions),
 		Pages:        executor,
 		Facts:        facts,
 		Recorder:     facts,
 		Requirements: &p9RequirementSource{requirements: deps.Requirements, versions: deps.Versions},
 		Cases:        &p9CaseSource{graph: deps.Design, versions: deps.Versions},
 		Roles:        &p9RoleSource{versions: deps.Versions},
+		DraftWriter:  draftWriter,
 		Versions:     deps.Versions,
 		Now:          deps.Now,
 	})
@@ -159,23 +174,34 @@ func newP9Runtime(deps p9RuntimeDeps) (*p9Runtime, error) {
 // is the *same* process-wide explore wiring built above (never a rebuilt one),
 // and Pages is the same HTTP executor's page-scoped closer.
 type p9AnalysisDeps struct {
-	Runtime      exploreapp.Runtime
+	Runtime exploreapp.Runtime
+	// Executor is the raw explore-action executor the runtime page crawl drives.
+	// Executor/Sources are optional: without Executor the page crawl is skipped,
+	// without Sources the static API scan is skipped, and the analysis keeps its
+	// static/probe behavior.
+	Executor     exploreapp.Executor
+	Sources      exploreapp.SourceProvider
 	Pages        exploreapp.PageCloser
 	Facts        exploreapp.FactReader
 	Recorder     exploreapp.FactRecorder
 	Requirements exploreapp.RequirementSource
 	Cases        exploreapp.CaseSource
 	Roles        exploreapp.RoleSource
-	Versions     versionadapter.VersionService
-	Now          func() time.Time
+	// DraftWriter persists augmented case drafts. It is optional: without it the
+	// augmentation stays draft-only (computed but not persisted).
+	DraftWriter exploreapp.DraftCaseWriter
+	Versions    versionadapter.VersionService
+	Now         func() time.Time
 }
 
 // p9Analysis is the deterministic exploration analysis bundle plus the
 // leader-gated, event-driven refresh loop that consumes the explore runtime.
+// Failure attribution is not part of this bundle: execution.result_read invokes
+// the same explore FailureAttribution in the analyze.failure result (Task 37 fix
+// round 1), so there is no unused construction here.
 type p9Analysis struct {
 	Coverage *exploreapp.Coverage
 	Augment  *exploreapp.CaseAugment
-	Failure  *exploreapp.FailureAttribution
 
 	deps     p9AnalysisDeps
 	debounce *p9AnalysisDebounce
@@ -185,7 +211,8 @@ type p9Analysis struct {
 
 // newP9Analysis wires the analysis services over the explore runtime. Coverage
 // and case augmentation read the same fact store the other explore capabilities
-// write; failure attribution is deterministic and dependency-free.
+// write; discovery is the pre-pass that records those facts, and case
+// augmentation persists its drafts through the design draft writer.
 func newP9Analysis(deps p9AnalysisDeps) (*p9Analysis, error) {
 	if deps.Runtime == nil {
 		return nil, errors.New("p9 explore analysis: nil explore runtime")
@@ -211,10 +238,10 @@ func newP9Analysis(deps p9AnalysisDeps) (*p9Analysis, error) {
 			Roles:        deps.Roles,
 		}),
 		Augment: exploreapp.NewCaseAugment(exploreapp.CaseAugmentConfig{}, exploreapp.CaseAugmentDeps{
-			Facts: deps.Facts,
-			Cases: deps.Cases,
+			Facts:  deps.Facts,
+			Cases:  deps.Cases,
+			Writer: deps.DraftWriter,
 		}),
-		Failure:  exploreapp.NewFailureAttribution(),
 		deps:     deps,
 		debounce: newP9AnalysisDebounce(p9AnalysisMinInterval, now),
 		wake:     make(chan int64, p9AnalysisWakeBuffer),
@@ -224,14 +251,16 @@ func newP9Analysis(deps p9AnalysisDeps) (*p9Analysis, error) {
 
 // p9AnalysisResult is the bounded summary of one refreshed version.
 type p9AnalysisResult struct {
-	Requirements int
-	Cases        int
-	Pages        int
-	APIs         int
-	Roles        int
-	Gaps         int
-	Drafts       int
-	LoginStatus  string
+	Requirements    int
+	Cases           int
+	Pages           int
+	APIs            int
+	Roles           int
+	Gaps            int
+	Drafts          int
+	LoginStatus     string
+	DiscoveredPages int
+	DiscoveredAPIs  int
 }
 
 // Notify coalesces one version refresh request. A full buffer drops the hint
@@ -282,11 +311,12 @@ func (a *p9Analysis) Run(ctx context.Context, shouldRun func() bool) {
 	}
 }
 
-// Refresh runs one deterministic analysis pass for a version: the static gap
-// dimensions and, when the version binds a SUT/role, the authenticated live page
-// probes through the shared explore runtime. It builds a per-version gap
-// analysis because the login binding (version SUT / role / entry page) is
-// version-scoped, then records the gap facts and reads coverage/draft gaps back.
+// Refresh runs one deterministic analysis pass for a version: first the
+// authenticated discovery pre-pass (runtime page crawl + static API scan), then
+// the static gap dimensions and the live page probes over the facts discovery
+// just recorded. It builds a per-version gap analysis because the login binding
+// (version SUT / role / entry page) is version-scoped, then records the gap
+// facts and reads coverage/draft gaps back.
 func (a *p9Analysis) Refresh(ctx context.Context, versionID int64) (p9AnalysisResult, error) {
 	result := p9AnalysisResult{}
 	if a == nil || a.deps.Requirements == nil {
@@ -302,10 +332,20 @@ func (a *p9Analysis) Refresh(ctx context.Context, versionID int64) (p9AnalysisRe
 		Facts:        a.deps.Recorder,
 		FactReader:   a.deps.Facts,
 	}
+	runtime := a.deps.Runtime
 	// The runtime is only used when a login binding exists: probing without a
 	// resolvable account would fail every action. Static gaps still run.
 	if login.role != "" && login.versionSUTID > 0 {
-		gapDeps.Runtime = a.deps.Runtime
+		// Discovery must run with an authenticated session: log in once here,
+		// record page/API facts, then hand the same session to the gap probes so
+		// they do not log in a second time.
+		if fact, ok := a.loginForDiscovery(ctx, versionID, login); ok {
+			if fact.Status == exploreapp.SessionActive {
+				a.discover(ctx, versionID, login, fact, &result)
+				runtime = p9SessionRuntime{runtime: runtime, fact: fact}
+			}
+		}
+		gapDeps.Runtime = runtime
 		gapDeps.Pages = a.deps.Pages
 	}
 	gaps := exploreapp.NewGapAnalysis(exploreapp.GapAnalysisConfig{
@@ -337,8 +377,130 @@ func (a *p9Analysis) Refresh(ctx context.Context, versionID int64) (p9AnalysisRe
 	if err != nil {
 		return result, err
 	}
-	result.Drafts = len(augmented.Drafts)
+	if a.deps.DraftWriter != nil {
+		// Report the drafts that actually reached the design store, not the
+		// candidates that were only computed.
+		result.Drafts = len(augmented.Created)
+	} else {
+		result.Drafts = len(augmented.Drafts)
+	}
 	return result, nil
+}
+
+// p9SessionRuntime re-surfaces an already-established session to the gap
+// probes. Login does not touch the underlying runtime again: the analysis logged
+// in once before discovery and the shared session cache owns the credentials.
+type p9SessionRuntime struct {
+	runtime exploreapp.Runtime
+	fact    exploreapp.SessionFact
+}
+
+func (r p9SessionRuntime) Login(context.Context, exploreapp.LoginFlowConfig) (exploreapp.SessionFact, error) {
+	return r.fact, nil
+}
+
+func (r p9SessionRuntime) OpenWithSession(ctx context.Context, cfg exploreapp.LoginFlowConfig, url string) (exploreapp.Page, exploreapp.SessionFact, error) {
+	if r.runtime == nil {
+		return exploreapp.Page{}, exploreapp.SessionFact{}, errors.New("p9 explore analysis: session runtime is not configured")
+	}
+	return r.runtime.OpenWithSession(ctx, cfg, url)
+}
+
+// loginForDiscovery logs in once for the discovery pre-pass. A blocked or failed
+// login is reported in the result and skips discovery, but never fails the
+// static analysis. ok is false when there is no runtime to log in with.
+func (a *p9Analysis) loginForDiscovery(ctx context.Context, versionID int64, binding p9LoginBinding) (exploreapp.SessionFact, bool) {
+	if a.deps.Runtime == nil {
+		return exploreapp.SessionFact{}, false
+	}
+	fact, err := a.deps.Runtime.Login(ctx, exploreapp.LoginFlowConfig{
+		VersionID:     versionID,
+		VersionSUTID:  binding.versionSUTID,
+		EnvironmentID: binding.environmentID,
+		Role:          binding.role,
+		LoginURL:      binding.loginURL,
+	})
+	if err != nil {
+		a.logf("eztest: P9 explore analysis version=%d login for discovery failed: %v", versionID, err)
+		return exploreapp.SessionFact{}, false
+	}
+	return fact, true
+}
+
+// discover runs the bounded discovery pre-pass and records page/API facts. The
+// crawl is DOM-based (no browser network capture), uses the session captured by
+// Login, and closes exactly the page it created through the shared page-scoped
+// closer. Every failure is best effort: the static analysis still runs, and the
+// next refresh retries the discovery.
+func (a *p9Analysis) discover(ctx context.Context, versionID int64, binding p9LoginBinding, session exploreapp.SessionFact, result *p9AnalysisResult) {
+	if a.deps.Executor != nil {
+		if startURL, seedURLs, ok := p9DiscoverySeeds(binding); ok {
+			discovery := exploreapp.NewPageDiscovery(exploreapp.PageDiscoveryConfig{
+				VersionSUTID:    binding.versionSUTID,
+				EnvironmentID:   binding.environmentID,
+				StartURL:        startURL,
+				SeedURLs:        seedURLs,
+				StorageStateRef: session.StorageStateRef,
+				MaxPages:        p9AnalysisMaxDiscovered,
+			}, exploreapp.PageDiscoveryDeps{
+				Executor:   a.deps.Executor,
+				Facts:      a.deps.Recorder,
+				PageCloser: a.deps.Pages,
+			})
+			pageResult, err := discovery.Run(ctx, versionID)
+			if err != nil {
+				a.logf("eztest: P9 explore analysis version=%d page discovery failed: %v", versionID, err)
+			} else {
+				result.DiscoveredPages = len(pageResult.Pages)
+				// A result page id only appears when discovery had no PageCloser;
+				// release it here so a degraded assembly cannot leak the page.
+				if pageID := strings.TrimSpace(pageResult.PageID); pageID != "" && a.deps.Pages != nil {
+					_ = a.deps.Pages.ClosePage(context.WithoutCancel(ctx), pageID)
+				}
+			}
+		}
+	}
+	if a.deps.Sources != nil {
+		discovery := exploreapp.NewAPIDiscovery(exploreapp.APIDiscoveryConfig{
+			VersionSUTID:  binding.versionSUTID,
+			EnvironmentID: binding.environmentID,
+		}, exploreapp.APIDiscoveryDeps{
+			Sources: a.deps.Sources,
+			Facts:   a.deps.Recorder,
+		})
+		apiResult, err := discovery.Run(ctx, versionID)
+		if err != nil {
+			a.logf("eztest: P9 explore analysis version=%d api discovery failed: %v", versionID, err)
+			return
+		}
+		result.DiscoveredAPIs = len(apiResult.APIs)
+	}
+}
+
+// p9DiscoverySeeds builds the crawl seeds from the bound pages. Only absolute
+// http(s) URLs can seed the crawl; route templates are knowledge keys, not
+// navigable locations. The login page stays first when no application page is
+// bound so a fresh deployment still discovers something.
+func p9DiscoverySeeds(binding p9LoginBinding) (string, []string, bool) {
+	urls := make([]string, 0, len(binding.pageURLs)+1)
+	seen := make(map[string]bool, len(binding.pageURLs)+1)
+	appendURL := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		lowered := strings.ToLower(trimmed)
+		if trimmed == "" || (!strings.HasPrefix(lowered, "http://") && !strings.HasPrefix(lowered, "https://")) || seen[trimmed] {
+			return
+		}
+		seen[trimmed] = true
+		urls = append(urls, trimmed)
+	}
+	for _, pageURL := range binding.pageURLs {
+		appendURL(pageURL)
+	}
+	appendURL(binding.loginURL)
+	if len(urls) == 0 {
+		return "", nil, false
+	}
+	return urls[0], urls[1:], true
 }
 
 // p9LoginBinding is the version-scoped login/probe binding resolved from the
@@ -349,6 +511,8 @@ type p9LoginBinding struct {
 	environmentID int64
 	role          string
 	loginURL      string
+	// pageURLs are the absolute bound page URLs the discovery crawl can seed.
+	pageURLs []string
 }
 
 func (a *p9Analysis) loginBinding(ctx context.Context, versionID int64) p9LoginBinding {
@@ -369,9 +533,21 @@ func (a *p9Analysis) loginBinding(ctx context.Context, versionID int64) p9LoginB
 			environmentID: parseCaseBindingID(binding.Environment.ID),
 			role:          role,
 			loginURL:      p9LoginPageURL(binding.Pages),
+			pageURLs:      p9PageURLs(binding.Pages),
 		}
 	}
 	return p9LoginBinding{}
+}
+
+// p9PageURLs lists the navigable bound pages in binding order.
+func p9PageURLs(pages []resourceapp.PageView) []string {
+	urls := make([]string, 0, len(pages))
+	for _, page := range pages {
+		if url := strings.TrimSpace(page.URL); url != "" {
+			urls = append(urls, url)
+		}
+	}
+	return urls
 }
 
 // p9LoginPageURL prefers a bound page whose URL/route looks like a login page

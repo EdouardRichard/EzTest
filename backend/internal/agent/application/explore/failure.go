@@ -154,12 +154,33 @@ func classifyFailure(signal FailureSignal) string {
 			}
 		}
 	}
-	// A blocked run without a recognisable cause is an environment problem (the
-	// case never executed); a failed run defaults to an application defect.
-	if strings.EqualFold(strings.TrimSpace(signal.FailureClass), "blocked") {
-		return FailureClassificationEnvironment
+	// The execution layer hands the nine-value P3 failure taxonomy to
+	// execution.result_read; map it onto the four attribution classes when the
+	// failure reason carries no keyword evidence of its own.
+	if classification, ok := failureClassFromSignal(signal.FailureClass); ok {
+		return classification
 	}
+	// An unrecognised class falls back to an application defect; the blocked
+	// class is already mapped to environment above.
 	return FailureClassificationApplication
+}
+
+// failureClassFromSignal maps the P3 nine-value failure class (and the
+// four-value attribution class) onto the attribution enum. An unknown value
+// falls through to the application default.
+func failureClassFromSignal(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case FailureClassificationApplication, "failed":
+		return FailureClassificationApplication, true
+	case FailureClassificationAutomation, "model":
+		return FailureClassificationAutomation, true
+	case FailureClassificationEnvironment, "timeout", "executor_lost", "blocked":
+		return FailureClassificationEnvironment, true
+	case FailureClassificationData, "session":
+		return FailureClassificationData, true
+	default:
+		return "", false
+	}
 }
 
 func defaultFailureCategory(classification string) string {

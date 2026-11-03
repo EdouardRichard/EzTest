@@ -29,12 +29,18 @@ type fakeP9Runtime struct {
 	openErr   error
 	active    int
 	maxActive int
+	// log is the optional shared log the discovery test uses to prove the
+	// cross-component ordering (login before discovery/probes).
+	log *p9EventLog
 }
 
 func (f *fakeP9Runtime) Login(_ context.Context, cfg exploreapp.LoginFlowConfig) (exploreapp.SessionFact, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.events = append(f.events, "login")
+	if f.log != nil {
+		f.log.add("login")
+	}
 	if f.blocked {
 		return exploreapp.SessionFact{Status: exploreapp.SessionBlocked, Reason: "invalid_credentials", AccountRole: cfg.Role}, nil
 	}
@@ -44,6 +50,9 @@ func (f *fakeP9Runtime) Login(_ context.Context, cfg exploreapp.LoginFlowConfig)
 func (f *fakeP9Runtime) OpenWithSession(_ context.Context, _ exploreapp.LoginFlowConfig, url string) (exploreapp.Page, exploreapp.SessionFact, error) {
 	f.mu.Lock()
 	f.events = append(f.events, "open:"+url)
+	if f.log != nil {
+		f.log.add("open:" + url)
+	}
 	f.opens = append(f.opens, url)
 	f.active++
 	if f.active > f.maxActive {
@@ -59,6 +68,20 @@ func (f *fakeP9Runtime) OpenWithSession(_ context.Context, _ exploreapp.LoginFlo
 		return exploreapp.Page{}, exploreapp.SessionFact{}, f.openErr
 	}
 	return exploreapp.Page{ID: "page_1", URL: url}, exploreapp.SessionFact{}, nil
+}
+
+// loginCount reports how many times the runtime was asked to log in. The
+// analysis pre-pass logs in once and hands the same session to the probes.
+func (f *fakeP9Runtime) loginCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, event := range f.events {
+		if event == "login" {
+			count++
+		}
+	}
+	return count
 }
 
 type fakeP9Closer struct {
@@ -92,6 +115,10 @@ func (f *fakeP9Facts) Record(_ context.Context, fact versiondomain.Fact) (versio
 	defer f.mu.Unlock()
 	fact.ID = int64(500 + len(f.written))
 	f.written = append(f.written, fact)
+	if f.byKind == nil {
+		f.byKind = map[string][]versiondomain.Fact{}
+	}
+	f.byKind[fact.Kind] = append(f.byKind[fact.Kind], fact)
 	return fact, false, nil
 }
 
