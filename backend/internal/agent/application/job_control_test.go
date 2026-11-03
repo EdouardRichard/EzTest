@@ -10,6 +10,7 @@ package agentapp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -19,6 +20,41 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 )
+
+// ---------- Task 63: persisted job card updater ----------
+
+// jobCardUpdateCall is one best-effort conversation-card write-back requested by
+// a cancel.
+type jobCardUpdateCall struct {
+	VersionID      int64
+	ConversationID int64
+	JobID          int64
+}
+
+// fakeJobCardUpdater records the cancel card write-back. Its error models the
+// card store being unavailable: the cancel must still succeed.
+type fakeJobCardUpdater struct {
+	mu    sync.Mutex
+	calls []jobCardUpdateCall
+	err   error
+}
+
+func (u *fakeJobCardUpdater) CancelJobCard(_ context.Context, versionID, conversationID, jobID int64) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.calls = append(u.calls, jobCardUpdateCall{
+		VersionID: versionID, ConversationID: conversationID, JobID: jobID,
+	})
+	return u.err
+}
+
+func (u *fakeJobCardUpdater) recorded() []jobCardUpdateCall {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	calls := make([]jobCardUpdateCall, len(u.calls))
+	copy(calls, u.calls)
+	return calls
+}
 
 // ---------- fake job control repository ----------
 
@@ -170,26 +206,29 @@ func jobStringPtr(value string) *string { return &value }
 // ---------- fixture ----------
 
 type jobControlFixture struct {
-	service *agentapp.JobControl
-	repo    *fakeJobControlRepo
-	audit   *fakeAuditRecorder
-	events  *fakePublisher
-	clock   *fakeClock
+	service  *agentapp.JobControl
+	repo     *fakeJobControlRepo
+	audit    *fakeAuditRecorder
+	events   *fakePublisher
+	jobCards *fakeJobCardUpdater
+	clock    *fakeClock
 }
 
 func newJobControlFixture(t *testing.T, now time.Time) *jobControlFixture {
 	t.Helper()
 	fixture := &jobControlFixture{
-		repo:   newFakeJobControlRepo(),
-		audit:  &fakeAuditRecorder{},
-		events: &fakePublisher{},
-		clock:  &fakeClock{now: now},
+		repo:     newFakeJobControlRepo(),
+		audit:    &fakeAuditRecorder{},
+		events:   &fakePublisher{},
+		jobCards: &fakeJobCardUpdater{},
+		clock:    &fakeClock{now: now},
 	}
 	fixture.service = agentapp.NewJobControl(agentapp.JobControlDeps{
-		Jobs:   fixture.repo,
-		Audit:  fixture.audit,
-		Events: fixture.events,
-		Clock:  fixture.clock,
+		Jobs:     fixture.repo,
+		Audit:    fixture.audit,
+		Events:   fixture.events,
+		JobCards: fixture.jobCards,
+		Clock:    fixture.clock,
 	})
 	return fixture
 }
@@ -752,4 +791,135 @@ func TestJobControlOwnership(t *testing.T) {
 		_, err := service.Cancel(context.Background(), 71, 10, 501)
 		assertAPIError(t, err, http.StatusServiceUnavailable, "unavailable")
 	})
+}
+
+// ---------- Task 63: cancel persists the conversation card ----------
+
+// TestJobCardCancelUpdaterWiring pins the Task 63 wiring: a successful cancel
+// names the job's conversation card (version/conversation/job) so the version
+// context can rewrite the persisted card to cancelled. The live SSE job.finished
+// and the reloaded card must agree. The card write is best effort: a card-store
+// failure never rolls back the committed cancel or its events.
+func TestJobCardCancelUpdaterWiring(t *testing.T) {
+	t.Run("rewrites the canceled job's card", func(t *testing.T) {
+		fixture := newJobControlFixture(t, jobTestNow)
+		item := jobControlItem(520, 10, agent.WorkItemRunning, 1, 3)
+		// Task 61 stores the conversation association in the frozen payload
+		// column; the card lookup must use it.
+		item.Payload = json.RawMessage(`{"conversation_id":"77","model":"deepseek-chat"}`)
+		before := fixture.repo.add(item)
+
+		view, err := fixture.service.Cancel(context.Background(), 71, before.VersionID, before.ID)
+		if err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if view.State != agentapp.JobStateCancelled {
+			t.Fatalf("view state = %q, want %q", view.State, agentapp.JobStateCancelled)
+		}
+
+		calls := fixture.jobCards.recorded()
+		if len(calls) != 1 {
+			t.Fatalf("card updates = %d, want 1: %#v", len(calls), calls)
+		}
+		want := jobCardUpdateCall{VersionID: before.VersionID, ConversationID: 77, JobID: before.ID}
+		if calls[0] != want {
+			t.Fatalf("card update = %#v, want %#v", calls[0], want)
+		}
+
+		// The cancel state and both contract events stay intact: the card
+		// write-back is an after-the-fact projection, not part of the cancel.
+		stored := fixture.repo.get(before.ID)
+		if stored.Status != agent.WorkItemFailed || stored.LastError == nil ||
+			*stored.LastError != agentapp.JobCanceledReason {
+			t.Fatalf("stored canceled row = %#v", stored)
+		}
+		events := fixture.publishedEvents()
+		if len(events) != 2 || events[0].Type != "job.canceled" ||
+			events[1].Type != eventingapp.EventJobFinished {
+			t.Fatalf("events = %#v, want job.canceled + job.finished", events)
+		}
+	})
+
+	t.Run("a card failure does not roll back the cancel", func(t *testing.T) {
+		fixture := newJobControlFixture(t, jobTestNow)
+		fixture.jobCards.err = errors.New("conversation card store unavailable")
+		item := jobControlItem(521, 10, agent.WorkItemRunning, 1, 3)
+		item.Payload = json.RawMessage(`{"conversation_id":"78"}`)
+		before := fixture.repo.add(item)
+
+		view, err := fixture.service.Cancel(context.Background(), 71, before.VersionID, before.ID)
+		if err != nil {
+			t.Fatalf("Cancel with a failing card update: %v", err)
+		}
+		if view.State != agentapp.JobStateCancelled {
+			t.Fatalf("view state = %q, want %q", view.State, agentapp.JobStateCancelled)
+		}
+		if stored := fixture.repo.get(before.ID); stored.Status != agent.WorkItemFailed {
+			t.Fatalf("stored status = %q, want the canceled (failed) row", stored.Status)
+		}
+		if calls := fixture.jobCards.recorded(); len(calls) != 1 {
+			t.Fatalf("card updates = %d, want the one attempted best-effort write", len(calls))
+		}
+	})
+}
+
+// TestJobCardCancelUpdaterNoCardNoop pins the no-card path: a 0.2.1 job that
+// was never associated with a conversation never projected a card, so cancel
+// must not call the card updater and must still succeed. A malformed frozen
+// payload is treated the same way instead of failing the cancel.
+func TestJobCardCancelUpdaterNoCardNoop(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		payload json.RawMessage
+	}{
+		{"no conversation association", json.RawMessage(`{"model":"deepseek-chat"}`)},
+		{"empty payload", nil},
+		{"malformed conversation id", json.RawMessage(`{"conversation_id":"not-a-number"}`)},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newJobControlFixture(t, jobTestNow)
+			item := jobControlItem(522, 10, agent.WorkItemOpen, 0, 3)
+			item.Payload = testCase.payload
+			before := fixture.repo.add(item)
+
+			view, err := fixture.service.Cancel(context.Background(), 71, before.VersionID, before.ID)
+			if err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+			if view.State != agentapp.JobStateCancelled {
+				t.Fatalf("view state = %q, want %q", view.State, agentapp.JobStateCancelled)
+			}
+			if calls := fixture.jobCards.recorded(); len(calls) != 0 {
+				t.Fatalf("card updates = %#v, want no card update", calls)
+			}
+			if stored := fixture.repo.get(before.ID); stored.Status != agent.WorkItemFailed {
+				t.Fatalf("stored status = %q, want the canceled (failed) row", stored.Status)
+			}
+		})
+	}
+}
+
+// TestJobCardCancelUpdaterLegacyNoop pins the legacy fence: pre-0.2.1 work
+// items (empty kind) never had a job card and remain not-found for the control
+// API, so the card updater must never run for them.
+func TestJobCardCancelUpdaterLegacyNoop(t *testing.T) {
+	fixture := newJobControlFixture(t, jobTestNow)
+	legacy := jobControlItem(523, 10, agent.WorkItemRunning, 1, 3)
+	legacy.Kind = ""
+	legacy.Payload = json.RawMessage(`{"conversation_id":"79"}`)
+	legacy = fixture.repo.add(legacy)
+
+	_, err := fixture.service.Cancel(context.Background(), 71, legacy.VersionID, legacy.ID)
+	assertAPIError(t, err, http.StatusNotFound, "not_found")
+
+	if fixture.repo.cancelCalls != 0 {
+		t.Fatalf("cancel calls = %d, want 0 for a legacy row", fixture.repo.cancelCalls)
+	}
+	if calls := fixture.jobCards.recorded(); len(calls) != 0 {
+		t.Fatalf("card updates = %#v, want none for a legacy row", calls)
+	}
+	if stored := fixture.repo.get(legacy.ID); stored.Status != agent.WorkItemRunning {
+		t.Fatalf("legacy row changed: %#v", stored)
+	}
 }

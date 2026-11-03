@@ -4,9 +4,15 @@ import (
 	"encoding/json"
 	"testing"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
+
+// Task 63: the job control service consumes this narrow port, so the deferred
+// composition-root wiring is a compile-time guarantee here.
+var _ agentapp.JobCardUpdater = (*versionapp.ConversationService)(nil)
 
 // lastConversationMessageEvent returns the newest conversation.message event
 // for one message id. The job-card upsert republishes the message as its
@@ -192,5 +198,147 @@ func TestPartsJobCardUpsert(t *testing.T) {
 	// conversation.
 	if _, _, err := env.svc.UpsertJobCard(requestContext(), env.versionID+1, conversation.ID, start); err == nil {
 		t.Fatal("UpsertJobCard succeeded for a foreign version")
+	}
+}
+
+// TestCancelUpdatesPersistedJobCard pins the Task 63 persisted-side cancel: the
+// same job_card message the runner projected is rewritten to the terminal
+// cancelled snapshot (status cancelled, cancelable false) with no second card,
+// and the usual conversation.message frame is republished so the live UI and a
+// reload agree. Cancelling twice is idempotent.
+func TestCancelUpdatesPersistedJobCard(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation := newChatConversation(t, env)
+	cancelable := true
+	start := version.MessagePart{
+		Type: "job_card", JobID: 601, JobKind: "requirement.curate",
+		Status: "running", Current: 2, Total: 5, Cancelable: &cancelable,
+	}
+	cardMessage, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversation.ID, start)
+	if err != nil {
+		t.Fatalf("UpsertJobCard: %v", err)
+	}
+	if !created {
+		t.Fatal("fixture did not create the job card message")
+	}
+	if got := len(env.repo.messages[conversation.ID]); got != 1 {
+		t.Fatalf("messages before cancel = %d, want one card", got)
+	}
+
+	if err := env.svc.CancelJobCard(requestContext(), env.versionID, conversation.ID, 601); err != nil {
+		t.Fatalf("CancelJobCard: %v", err)
+	}
+
+	// One card per job: the cancel rewrote the existing message, it did not
+	// append a second card.
+	if got := len(env.repo.messages[conversation.ID]); got != 1 {
+		t.Fatalf("messages after cancel = %d, want the one existing card", got)
+	}
+	stored := env.repo.messages[conversation.ID][0]
+	if stored.ID != cardMessage.ID {
+		t.Fatalf("card message = %d, want the original %d", stored.ID, cardMessage.ID)
+	}
+	if len(stored.Parts) != 1 || stored.Parts[0].Type != version.MessagePartJobCard ||
+		stored.Parts[0].JobID != 601 {
+		t.Fatalf("stored card parts = %#v", stored.Parts)
+	}
+	card := stored.Parts[0]
+	if card.Status != "cancelled" {
+		t.Fatalf("stored card status = %q, want cancelled", card.Status)
+	}
+	if card.Cancelable == nil || *card.Cancelable {
+		t.Fatalf("stored card cancelable = %v, want false on a terminal card", card.Cancelable)
+	}
+	if card.JobKind != start.JobKind || card.Current != start.Current || card.Total != start.Total {
+		t.Fatalf("cancel rewrote the card snapshot beyond the terminal fields: %#v", card)
+	}
+
+	// The streaming row and the SSE frame carry the same terminal snapshot.
+	rows, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, cardMessage.ID)
+	if err != nil {
+		t.Fatalf("MessageParts: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Seq != 1 || rows[0].Type != version.MessagePartJobCard {
+		t.Fatalf("card stream rows = %#v, want the original one seq=1 row", rows)
+	}
+	payload := decodedStreamParts(t, rows)[0]
+	if payload["status"] != "cancelled" || payload["cancelable"] != false {
+		t.Fatalf("card row payload = %#v, want the cancelled terminal snapshot", payload)
+	}
+	event := eventParts(t, lastConversationMessageEvent(t, env, cardMessage.ID))
+	if event[0]["status"] != "cancelled" || event[0]["job_id"] != "601" {
+		t.Fatalf("republished card event = %#v, want cancelled job 601", event[0])
+	}
+
+	// A repeated cancel republishes the same terminal card, never a duplicate.
+	if err := env.svc.CancelJobCard(requestContext(), env.versionID, conversation.ID, 601); err != nil {
+		t.Fatalf("second CancelJobCard: %v", err)
+	}
+	if got := len(env.repo.messages[conversation.ID]); got != 1 {
+		t.Fatalf("messages after repeated cancel = %d, want one", got)
+	}
+	if got := env.repo.messages[conversation.ID][0].Parts[0].Status; got != "cancelled" {
+		t.Fatalf("repeated cancel card status = %q, want cancelled", got)
+	}
+}
+
+// TestCancelWithoutCardNoop pins the no-card cancellation paths: a job whose
+// card was never projected, or whose conversation is not owned by the addressed
+// version, has nothing to rewrite, so CancelJobCard is a silent no-op and the
+// authoritative cancel state is never put at risk.
+func TestCancelWithoutCardNoop(t *testing.T) {
+	t.Run("conversation without a card", func(t *testing.T) {
+		env := newConversationEnv(t)
+		conversation := newChatConversation(t, env)
+		eventsBefore := len(env.events.events)
+
+		if err := env.svc.CancelJobCard(requestContext(), env.versionID, conversation.ID, 601); err != nil {
+			t.Fatalf("CancelJobCard without a card: %v", err)
+		}
+		if got := len(env.repo.messages[conversation.ID]); got != 0 {
+			t.Fatalf("messages = %d, want no card appended", got)
+		}
+		if got := len(env.events.events); got != eventsBefore {
+			t.Fatalf("events = %d, want no republish for a missing card", got-eventsBefore)
+		}
+	})
+
+	t.Run("foreign version", func(t *testing.T) {
+		env := newConversationEnv(t)
+		conversation := newChatConversation(t, env)
+		eventsBefore := len(env.events.events)
+
+		if err := env.svc.CancelJobCard(requestContext(), env.versionID+1, conversation.ID, 603); err != nil {
+			t.Fatalf("CancelJobCard for a foreign version: %v", err)
+		}
+		if got := len(env.repo.messages[conversation.ID]); got != 0 {
+			t.Fatalf("messages = %d, want no cross-version card write", got)
+		}
+		if got := len(env.events.events); got != eventsBefore {
+			t.Fatalf("events = %d, want no cross-version republish", got-eventsBefore)
+		}
+	})
+}
+
+// TestCancelLegacyNoCard pins the legacy thread path: a conversation written
+// before the 0.2.1 job-card projection has no job_card part at all, so a cancel
+// must rewrite nothing and append nothing.
+func TestCancelLegacyNoCard(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation := newChatConversation(t, env)
+	if _, err := env.svc.AppendAssistantMessage(requestContext(), conversation.ID,
+		[]version.MessagePart{{Type: "text", Text: "legacy reply"}}, 0); err != nil {
+		t.Fatalf("AppendAssistantMessage: %v", err)
+	}
+	eventsBefore := len(env.events.events)
+
+	if err := env.svc.CancelJobCard(requestContext(), env.versionID, conversation.ID, 602); err != nil {
+		t.Fatalf("CancelJobCard on a legacy thread: %v", err)
+	}
+	if got := len(env.repo.messages[conversation.ID]); got != 1 {
+		t.Fatalf("messages = %d, want the legacy message and no card", got)
+	}
+	if got := len(env.events.events); got != eventsBefore {
+		t.Fatalf("events = %d, want no republish for a legacy thread", got-eventsBefore)
 	}
 }

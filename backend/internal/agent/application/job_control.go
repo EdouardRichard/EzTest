@@ -95,21 +95,33 @@ type JobControlRepository interface {
 	RetryJob(ctx context.Context, versionID, id int64, now time.Time) (agent.WorkItem, error)
 }
 
-// JobControlDeps wires the job control service. Jobs is required; Audit and
-// Events are best-effort and Clock defaults to the system clock.
+// JobCardUpdater is the narrow persisted-conversation-card surface of the job
+// control API (Task 63). It rewrites the one job_card message of a canceled job
+// to the terminal cancelled snapshot, in place. The version context owns the
+// lookup, the one-card-per-job rule and the SSE republication; the agent side
+// only names the job. A job without a card (legacy or non-conversation job) is
+// a no-op. *versionapp.ConversationService satisfies it.
+type JobCardUpdater interface {
+	CancelJobCard(ctx context.Context, versionID, conversationID, jobID int64) error
+}
+
+// JobControlDeps wires the job control service. Jobs is required; Audit,
+// Events and JobCards are best-effort and Clock defaults to the system clock.
 type JobControlDeps struct {
-	Jobs   JobControlRepository
-	Audit  auditapp.Recorder
-	Events eventingapp.Publisher
-	Clock  clock.Clock
+	Jobs     JobControlRepository
+	Audit    auditapp.Recorder
+	Events   eventingapp.Publisher
+	JobCards JobCardUpdater
+	Clock    clock.Clock
 }
 
 // JobControl implements the cancel/retry use cases.
 type JobControl struct {
-	jobs   JobControlRepository
-	audit  auditapp.Recorder
-	events eventingapp.Publisher
-	clock  clock.Clock
+	jobs     JobControlRepository
+	audit    auditapp.Recorder
+	events   eventingapp.Publisher
+	jobCards JobCardUpdater
+	clock    clock.Clock
 }
 
 // NewJobControl wires the service.
@@ -118,7 +130,10 @@ func NewJobControl(deps JobControlDeps) *JobControl {
 	if clk == nil {
 		clk = clock.System{}
 	}
-	return &JobControl{jobs: deps.Jobs, audit: deps.Audit, events: deps.Events, clock: clk}
+	return &JobControl{
+		jobs: deps.Jobs, audit: deps.Audit, events: deps.Events,
+		jobCards: deps.JobCards, clock: clk,
+	}
 }
 
 // JobView is the API projection of one job after a control action.
@@ -168,6 +183,13 @@ func (s *JobControl) Cancel(ctx context.Context, actorID, versionID, jobID int64
 	// stored status is failed (no cancelled value in the frozen schema), so the
 	// projected cancelled state is passed explicitly.
 	s.publishFinished(ctx, updated)
+	// Task 63 (P2-T10): the live stream now says cancelled, but the persisted
+	// conversation card still snapshots the job as running. Rewrite that same
+	// card to the terminal cancelled state so a reload agrees with the live UI.
+	// It runs after the state/audit/event writes and is best effort: a job
+	// without a card is a no-op, and a failed card write never rolls back the
+	// cancel.
+	s.cancelJobCard(ctx, updated)
 	// The no-migration persistence compromise stores the canceled row at
 	// attempts=max_attempts so the dispatcher can never claim it again. That
 	// terminal marker is storage bookkeeping, not the job's attempt position:
@@ -380,4 +402,28 @@ func (s *JobControl) publishFinished(ctx context.Context, item agent.WorkItem) {
 		Kind:   item.Kind,
 		Status: eventingapp.JobStatusCancelled,
 	})
+}
+
+// jobCardUpdateTimeout bounds the best-effort persisted-card write-back. The
+// cancel itself is already committed and published; a stuck card store must not
+// hold the HTTP response open indefinitely.
+const jobCardUpdateTimeout = 5 * time.Second
+
+// cancelJobCard asks the version context to rewrite the conversation card of a
+// canceled job to the terminal cancelled snapshot. The conversation association
+// is the only card linkage (Task 61 stores it in the frozen work_item payload
+// column), so a job without one never had a card and is a no-op — that covers
+// both legacy rows and non-conversation jobs. The error is deliberately dropped:
+// the committed work item and its events are the truth, never the card.
+func (s *JobControl) cancelJobCard(ctx context.Context, item agent.WorkItem) {
+	if s == nil || s.jobCards == nil || item.VersionID <= 0 || item.ID <= 0 {
+		return
+	}
+	payload, err := ParseWorkItemPayload(item.Payload)
+	if err != nil || payload.ConversationID <= 0 {
+		return
+	}
+	cardCtx, cancel := context.WithTimeout(ctx, jobCardUpdateTimeout)
+	defer cancel()
+	_ = s.jobCards.CancelJobCard(cardCtx, item.VersionID, payload.ConversationID, item.ID)
 }

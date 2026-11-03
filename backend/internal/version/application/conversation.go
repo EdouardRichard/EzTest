@@ -470,6 +470,66 @@ func replaceJobCardPart(parts []version.MessagePart, card version.MessagePart) [
 	return updated
 }
 
+// CancelJobCard rewrites the persisted conversation card of one canceled job to
+// the terminal cancelled snapshot, in place (Task 63, P2-T10). It is the
+// persisted-side counterpart of the live job.finished{status:"cancelled"}
+// event: after a reload the thread shows the same terminal card the live UI
+// already received instead of a stale "running" snapshot. The card is located
+// by job id inside the addressed conversation and its original kind/current/
+// total are preserved; only status and cancelable become terminal, and the
+// usual conversation.message frame is republished.
+//
+// It is a no-op when no card was ever projected for the job (legacy thread or a
+// job that never ran through the conversation projection). The caller treats
+// the whole operation as best effort: the cancel state is already committed, so
+// an error must never roll it back.
+func (s *ConversationService) CancelJobCard(ctx context.Context, versionID, conversationID, jobID int64) error {
+	if err := validateConversationIDs(versionID, conversationID); err != nil {
+		return err
+	}
+	if jobID <= 0 {
+		return platform.Invalid("job_id", "must be a positive decimal ID")
+	}
+	existing, err := s.repo.FindJobCardMessage(ctx, versionID, conversationID, jobID)
+	if err != nil {
+		if errors.Is(err, version.ErrMessageNotFound) {
+			return nil
+		}
+		return mapConversationRepositoryError(err)
+	}
+	if existing == nil {
+		return nil
+	}
+	card, ok := findJobCardPart(existing.Parts, jobID)
+	if !ok {
+		return nil
+	}
+	card.Status = eventingapp.JobStatusCancelled
+	cancelable := false
+	card.Cancelable = &cancelable
+	if err := s.repo.UpdateJobCardMessage(ctx, versionID, conversationID, existing.ID, jobID, card); err != nil {
+		if errors.Is(err, version.ErrMessageNotFound) {
+			// The card disappeared between the lookup and the rewrite; there is
+			// nothing left to update and the cancel already stands.
+			return nil
+		}
+		return mapConversationRepositoryError(err)
+	}
+	existing.Parts = replaceJobCardPart(existing.Parts, card)
+	s.publishMessageEvent(ctx, versionID, *existing)
+	return nil
+}
+
+// findJobCardPart returns jobID's job_card part from a message snapshot.
+func findJobCardPart(parts []version.MessagePart, jobID int64) (version.MessagePart, bool) {
+	for _, part := range parts {
+		if part.Type == version.MessagePartJobCard && part.JobID == jobID {
+			return part, true
+		}
+	}
+	return version.MessagePart{}, false
+}
+
 // ---------- tasks and events ----------
 
 func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID int64, kind string, conversationID, messageID int64) {
