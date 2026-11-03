@@ -3,18 +3,27 @@
  * EzTest 0.2.1 contract presence gate.
  *
  * Dependency-free (node:fs / node:path only). Verifies that the 0.2.1
- * increments were synced into the four contracts owned by P0-T2:
- *   - docs/version-V0.2/contracts/events.md        (7 new event types)
- *   - docs/version-V0.2/contracts/openapi.yaml     (new paths/fields/schemas)
- *   - docs/version-V0.2/contracts/db-schema.md     (new tables + altered columns)
- *   - docs/version-V0.2/contracts/task-types.md    (11 work_item kinds, 7 roles,
- *                                                   four-way creation, created_by)
+ * increments were synced into the contracts:
+ *   - docs/version-V0.2/contracts/events.md          (10 new event types,
+ *                                                    3 new audit actions)
+ *   - docs/version-V0.2/contracts/openapi.yaml       (new paths/fields/schemas,
+ *                                                    canonical LLM/job/knowledge/
+ *                                                    context-packet surfaces)
+ *   - docs/version-V0.2/contracts/db-schema.md       (new tables + altered
+ *                                                    columns + attempt marker +
+ *                                                    pg_trgm reservation)
+ *   - docs/version-V0.2/contracts/task-types.md      (11 work_item kinds, 7 roles,
+ *                                                    four-way creation, created_by)
+ *   - docs/version-V0.2/contracts/executor-protocol.md (storageState capture/
+ *                                                    reuse, page-scoped close,
+ *                                                    network capture is 0.3)
  *
  * The check proves the names from spec §5.2/§5.4/§12.3/§12.4 exist in the
  * frozen-version contract directory, plus the review-round-1 shape rules that
  * must not regress: parts belong to conversation_message (not agent_message),
  * nullable DB columns stay out of `required`, attachment enums match the DDL,
- * seq starts at 1, the role/kind/created_by catalogs are exact, and the counts
+ * seq starts at 1, the role/kind/created_by catalogs are exact, the implemented
+ * knowledge-search shape replaced the old score/version_id one, and the counts
  * in the final summary are asserted rather than printed from constants. It
  * deliberately does not assert P0-P8 phase totals, so later 0.2.1 work
  * packages can keep appending.
@@ -51,10 +60,11 @@ const events = read("events.md")
 const openapi = read("openapi.yaml")
 const db = read("db-schema.md")
 const tasks = read("task-types.md")
+const executor = read("executor-protocol.md")
 const readme = read("README.md")
 
 // ---------------------------------------------------------------------------
-// events.md §18: seven 0.2.1 event types and their required payload fields.
+// events.md §18: ten 0.2.1 event types and their required payload fields.
 // ---------------------------------------------------------------------------
 const eventsSection = section(events, "## 18. 0.2.1", "\n## 19.")
 check(eventsSection.length > 0, "events.md has a §18 0.2.1 increment section")
@@ -65,11 +75,16 @@ const eventPayloads = {
   "fact.recorded": ["fact_id", "kind", "key", "confidence", "source", "content_hash", "conflict"],
   "job.progress": ["job_id", "kind", "current", "total", "status"],
   "job.finished": ["job_id", "kind", "status", "result_ref"],
+  "job.canceled": ["job_id", "kind", "status"],
+  "job.requeued": ["job_id", "kind", "status"],
+  "case_run.blocked": ["wave_id", "case_run_id", "intent_id", "reason", "action"],
   "knowledge.auto_approved": ["knowledge_id", "kind", "scope"],
   "context.cache_stats": ["run_id", "prefix_hash", "cached_tokens", "cache_hit", "briefing_hash"],
 }
 for (const [eventType, fields] of Object.entries(eventPayloads)) {
-  const row = eventsSection.split("\n").find((line) => line.includes("`" + eventType + "`"))
+  const row = eventsSection
+    .split("\n")
+    .find((line) => new RegExp("^\\|\\s*`" + eventType.replace(/[.]/g, "\\.") + "`\\s*\\|").test(line))
   check(Boolean(row), `events.md §18 declares ${eventType}`)
   if (!row) continue
   for (const field of fields) {
@@ -110,12 +125,30 @@ check(
     eventsSection.includes("`status`"),
   "events.md documents the part_type/type and state/status naming mapping",
 )
-const auditSection18 = section(eventsSection, "### 18.3", "")
-check(auditSection18.length > 0, "events.md §18.3 lists the 0.2.1 audit action")
 check(
-  /`knowledge\.auto_approved`/.test(auditSection18),
-  "events.md audit catalog contains knowledge.auto_approved",
+  /job\.finished[\s\S]{0,120}cancelled/.test(eventsSection),
+  "events.md documents job.finished{cancelled} as the cancel terminal event",
 )
+check(
+  /job\.canceled[\s\S]{0,400}job\.finished[\s\S]{0,120}cancelled/.test(eventsSection),
+  "events.md orders job.canceled before exactly-one job.finished{cancelled}",
+)
+check(
+  /(?:no_executor|executor_degraded|executor_unavailable)/.test(eventsSection),
+  "events.md lists case_run.blocked reasons",
+)
+check(
+  /case_run_id[\s\S]{0,120}reason[\s\S]{0,120}(?:不重复|去重)/.test(eventsSection),
+  "events.md documents case_run.blocked dedupe (same case_run+reason not repeated)",
+)
+check(eventsSection.includes("128") && eventsSection.includes("15"), "events.md 0.2.1 counts are 128 events / 15 audit actions")
+check(/version:\{id\}[\s\S]{0,80}system/.test(eventsSection), "events.md documents 0.2.1 SSE channel scopes")
+
+const auditSection18 = section(eventsSection, "### 18.3", "")
+check(auditSection18.length > 0, "events.md §18.3 lists the 0.2.1 audit actions")
+for (const action of ["knowledge.auto_approved", "job.canceled", "job.requeued"]) {
+  check(auditSection18.includes("`" + action + "`"), `events.md audit catalog contains ${action}`)
+}
 
 // ---------------------------------------------------------------------------
 // openapi.yaml: 0.2.1 description marker, paths/operations, schemas, fields.
@@ -139,6 +172,25 @@ const parsePaths = (text) => {
   return map
 }
 const openapiPaths = parsePaths(openapi)
+const openapiOperationCount = [...openapiPaths.values()].reduce((total, methods) => total + methods.size, 0)
+const countSchemas = (text) => {
+  let inComponents = false
+  let inSchemas = false
+  let count = 0
+  for (const line of text.split("\n")) {
+    if (line === "components:") {
+      inComponents = true
+      continue
+    }
+    if (inComponents && /^  [a-zA-Z]+:/.test(line)) {
+      inSchemas = line === "  schemas:"
+      continue
+    }
+    if (inSchemas && /^    [A-Za-z][A-Za-z0-9_]*:/.test(line)) count++
+  }
+  return count
+}
+const openapiSchemaCount = countSchemas(openapi)
 
 const apiChecks = [
   ["/api/llm/models", "get", "公开模型列表"],
@@ -153,9 +205,13 @@ const apiChecks = [
   ["/api/versions/{id}/plan-items", "get", "plan 查询"],
   ["/api/versions/{id}/facts", "get", "facts 查询"],
   ["/api/knowledge/search", "get", "知识结构化检索"],
-  ["/api/versions/{id}/jobs/{jobId}", "get", "作业状态"],
-  ["/api/versions/{id}/jobs/{jobId}/cancel", "post", "作业取消"],
-  ["/api/versions/{id}/jobs/{jobId}/retry", "post", "作业重试"],
+  ["/api/versions/{id}/jobs/{jobId}", "get", "作业状态（0.3 预留，deprecated）"],
+  ["/api/jobs/{id}/cancel", "post", "作业取消 canonical 路由"],
+  ["/api/jobs/{id}/retry", "post", "作业重试 canonical 路由"],
+  ["/api/versions/{versionId}/jobs/{jobId}/cancel", "post", "作业取消版本级别名"],
+  ["/api/versions/{versionId}/jobs/{jobId}/retry", "post", "作业重试版本级别名"],
+  ["/api/versions/{id}/context-packets/latest", "get", "最新上下文包（admin-only）"],
+  ["/api/admin/llm/configs/{id}/models/{modelId}", "patch", "模型能力 PATCH"],
 ]
 for (const [route, method, label] of apiChecks) {
   check(Boolean(openapiPaths.get(route)?.has(method)), `openapi ${method.toUpperCase()} ${route} (${label})`)
@@ -180,11 +236,17 @@ const schemaChecks = [
   "MessagePartView",
   "JobView",
   "PublicModelView",
-  "KnowledgeSearchHit",
+  "KnowledgeListEnvelope",
+  "KnowledgeItemView",
+  "ContextPacketView",
+  "ContextPacketSegment",
+  "UpdateLLMModelRequest",
+  "UpdateLLMConfigRequest",
 ]
 for (const schema of schemaChecks) {
   check(new RegExp("^    " + schema + ":", "m").test(openapi), `openapi schema ${schema}`)
 }
+check(!/^    KnowledgeSearchHit:/m.test(openapi), "openapi removed the old KnowledgeSearchHit score schema")
 
 // Shape rules from review round 1: nullable DB columns must not be required,
 // the attachment enum must match the DDL, and seq starts at 1.
@@ -240,6 +302,75 @@ check(!/type: object/.test(parseErrorProp), "AttachmentView.parse_error is not a
 
 const partViewBlock = schemaBlock("MessagePartView")
 check(/minimum:\s*1/.test(propertyOf(partViewBlock, "seq")), "MessagePartView.seq minimum 1 (DB CHECK seq > 0)")
+check(
+  /enum: \[text, thinking, tool_call, job_card, attachment, requirement_card, case_card, error\]/.test(
+    propertyOf(partViewBlock, "part_type"),
+  ),
+  "MessagePartView.part_type is the 8-type conversation_message_part enum",
+)
+check(!/enum: \[[^\]]*image/.test(propertyOf(partViewBlock, "part_type")), "image is snapshot-only, not a streamed part_type")
+
+// 0.2.1 image part payload is {type,mime,data_ref,width,height} (R39), never
+// the attachment {sha256,name,size} shape.
+const messagePartBlock = schemaBlock("MessagePart")
+const imageStart = messagePartBlock.indexOf("enum: [image]")
+const imageBlock = imageStart < 0 ? "" : messagePartBlock.slice(imageStart)
+check(imageBlock.includes("data_ref"), "openapi image part carries data_ref")
+check(imageBlock.includes("image/png") && imageBlock.includes("image/webp"), "openapi image part MIME enum")
+check(/width[\s\S]{0,120}minimum:\s*1/.test(imageBlock), "openapi image part width bound")
+check(/height[\s\S]{0,120}minimum:\s*1/.test(imageBlock), "openapi image part height bound")
+check(!/sha256:/.test(imageBlock), "openapi image part does not use the attachment sha256 field")
+check(
+  /enum: \[job_card\][\s\S]{0,900}cancelable/.test(messagePartBlock),
+  "openapi job_card part carries optional cancelable",
+)
+
+const jobViewBlock = schemaBlock("JobView")
+const jobViewRequired = requiredOf(jobViewBlock)
+check(jobViewRequired.includes("attempts") && jobViewRequired.includes("max_attempts"), "JobView requires attempts/max_attempts")
+check(!jobViewRequired.includes("current") && !jobViewRequired.includes("total"), "JobView does not require 0.3-only progress fields")
+check(/取消前的真实/.test(propertyOf(jobViewBlock, "attempts")), "JobView.attempts documents the pre-cancel projection")
+
+const llmConfigBlock = schemaBlock("LLMConfig")
+check(
+  /enum: \[openai, openai_compatible, openai_chat_completions, openai_responses\]/.test(
+    propertyOf(llmConfigBlock, "protocol"),
+  ),
+  "LLMConfig.protocol accepts canonical + legacy values",
+)
+for (const field of ["thinking_type", "reasoning_effort", "default_model_id", "models"]) {
+  check(Boolean(propertyOf(llmConfigBlock, field)), `LLMConfig exposes ${field}`)
+}
+const llmModelBlock = schemaBlock("LLMModel")
+for (const field of ["capabilities", "deprecated"]) {
+  check(Boolean(propertyOf(llmModelBlock, field)), `LLMModel exposes ${field}`)
+}
+for (const field of ["supports_tools", "supports_vision", "supports_reasoning", "context_window", "supports_prompt_cache"]) {
+  check(llmModelBlock.includes(field), `LLMModel.capabilities exposes ${field}`)
+}
+const updateModelBlock = schemaBlock("UpdateLLMModelRequest")
+for (const field of ["context_window", "supports_tools", "supports_vision", "supports_reasoning", "supports_prompt_cache", "deprecated"]) {
+  check(Boolean(propertyOf(updateModelBlock, field)), `UpdateLLMModelRequest patch field ${field}`)
+}
+
+const designCardBlock = schemaBlock("DesignCaseCard")
+check(
+  /enum: \[passed, failed, blocked, inconclusive\]/.test(propertyOf(designCardBlock, "execution_verdict")),
+  "DesignCaseCard.execution_verdict enum",
+)
+
+const knowledgeViewBlock = schemaBlock("KnowledgeItemView")
+check(Boolean(propertyOf(knowledgeViewBlock, "bindings")), "KnowledgeItemView exposes bindings")
+check(Boolean(propertyOf(knowledgeViewBlock, "last_verified_at")), "KnowledgeItemView exposes last_verified_at")
+check(
+  requiredOf(knowledgeViewBlock).includes("bindings") && requiredOf(knowledgeViewBlock).includes("last_verified_at"),
+  "KnowledgeItemView requires bindings/last_verified_at",
+)
+
+const contextPacketBlock = schemaBlock("ContextPacketView")
+for (const field of ["prefix_hash", "segments", "cached_tokens", "cache_hit", "invalidation_reason", "briefing_hash"]) {
+  check(Boolean(propertyOf(contextPacketBlock, field)), `ContextPacketView.${field}`)
+}
 
 // {mid} is conversation_message.id (the UI message), never agent_message.id.
 const parameterBlock = (name) => {
@@ -286,6 +417,10 @@ for (const operationId of [
   "getJob",
   "cancelJob",
   "retryJob",
+  "cancelVersionJob",
+  "retryVersionJob",
+  "getLatestContextPacket",
+  "updateLLMModel",
 ]) {
   check(
     operationIds.filter((candidate) => candidate === operationId).length === 1,
@@ -302,6 +437,93 @@ for (const needle of [
   ["enum: [job_card]", "job_card part"],
   ["enum: [case_card]", "case_card part"],
   ["enum: [image]", "image part"],
+]) {
+  check(openapi.includes(needle[0]), `openapi contains ${needle[0]} (${needle[1]})`)
+}
+
+// Path block (start marker inclusive to the next two-space path key).
+const pathBlock = (route) => {
+  const marker = "\n  " + route + ":\n"
+  const start = openapi.indexOf(marker)
+  if (start < 0) return ""
+  const rest = openapi.slice(start + marker.length)
+  const end = rest.search(/\n  \/[^\n]+:\n/)
+  return end < 0 ? rest : rest.slice(0, end)
+}
+
+// Knowledge search must match the implemented 0.2.1 shape, not the old score
+// projection: query/q + five structured bindings + status + cursor/limit,
+// returning the regular KnowledgeItemView page.
+const searchBlock = pathBlock("/api/knowledge/search")
+check(searchBlock.length > 0, "openapi knowledge search path block")
+for (const parameter of [
+  "name: query",
+  "name: q",
+  "name: system_id",
+  "name: environment_id",
+  "name: page_key",
+  "name: api_key",
+  "name: account_role",
+  "KnowledgeStatusFilter",
+  "Cursor",
+  "Limit",
+]) {
+  check(searchBlock.includes(parameter), `openapi knowledge search has ${parameter}`)
+}
+check(searchBlock.includes("KnowledgeListEnvelope"), "openapi knowledge search returns KnowledgeListEnvelope")
+check(!searchBlock.includes("KnowledgeSearchHit"), "openapi knowledge search does not return KnowledgeSearchHit")
+for (const removed of ["name: version_id", "name: system_key", "score:", "match_reasons:"]) {
+  check(!searchBlock.includes(removed), `openapi knowledge search removed ${removed}`)
+}
+
+// Canonical job control routes (plan Task 46) plus the version-scoped aliases
+// the conversation JobCard uses. Cancel excludes waiting_human and retry
+// resets attempts; GET job status is retained only as 0.3-reserved.
+const canonicalCancel = pathBlock("/api/jobs/{id}/cancel")
+const canonicalRetry = pathBlock("/api/jobs/{id}/retry")
+const versionCancel = pathBlock("/api/versions/{versionId}/jobs/{jobId}/cancel")
+const getJobBlock = pathBlock("/api/versions/{id}/jobs/{jobId}")
+check(canonicalCancel.includes("operationId: cancelJob"), "openapi canonical cancel route operationId")
+check(canonicalRetry.includes("operationId: retryJob"), "openapi canonical retry route operationId")
+check(versionCancel.includes("operationId: cancelVersionJob"), "openapi version-scoped cancel alias")
+check(versionCancel.includes("versionId"), "openapi version-scoped cancel forwards versionId")
+check(/open\/claimed\/running/.test(canonicalCancel), "openapi cancel documents only open/claimed/running")
+check(/waiting_human[\s\S]{0,80}(?:不可|排除|409)/.test(canonicalCancel), "openapi cancel rejects waiting_human")
+check(/attempts[\s\S]{0,40}(?:重置|reset)/.test(canonicalRetry), "openapi retry documents attempts reset")
+check(/job\.finished\{status:"cancelled"\}/.test(canonicalCancel), "openapi cancel documents job.finished{cancelled}")
+check(getJobBlock.includes("deprecated: true"), "openapi GET job is deprecated/0.3-reserved")
+check(
+  /legacy[\s\S]{0,80}kind=''/.test(canonicalCancel) && /legacy[\s\S]{0,80}kind=''/.test(canonicalRetry),
+  "openapi job control fences legacy kind='' work items",
+)
+
+const contextPacketPath = pathBlock("/api/versions/{id}/context-packets/latest")
+check(contextPacketPath.includes("ContextPacketView"), "openapi context packet route returns ContextPacketView")
+check(/admin/i.test(contextPacketPath) && /403/.test(contextPacketPath), "openapi context packet route is admin-only (403)")
+
+const llmModelPatch = pathBlock("/api/admin/llm/configs/{id}/models/{modelId}")
+check(llmModelPatch.includes("patch:"), "openapi LLM model path has PATCH")
+check(llmModelPatch.includes("UpdateLLMModelRequest"), "openapi LLM model PATCH uses UpdateLLMModelRequest")
+
+for (const needle of [
+  ["openai_chat_completions", "canonical Chat Completions protocol"],
+  ["openai_responses", "canonical Responses protocol"],
+  ["thinking_type", "thinking mode field"],
+  ["reasoning_effort", "reasoning effort field"],
+  ["default_model_id", "explicit default model field"],
+  ["supports_prompt_cache", "prompt-cache capability"],
+  ["execution_verdict", "design execution verdict"],
+  ["invalid_stage_for_gate", "stage gate error code"],
+  ["no_requirements_to_confirm", "empty requirement gate error"],
+  ["no_cases_to_confirm", "empty case gate error"],
+  ["attachment_pending", "attachment pending error"],
+  ["page_url_exists", "page URL conflict error"],
+  ["invalid_protocol", "LLM protocol error"],
+  ["llm_capability_mismatch", "LLM capability error"],
+  ["llm_config_invalid", "LLM config error"],
+  ["llm_protocol_error", "LLM upstream protocol error"],
+  ["llm_auth_failed", "LLM credential error"],
+  ["invalid_model", "invalid model error"],
 ]) {
   check(openapi.includes(needle[0]), `openapi contains ${needle[0]} (${needle[1]})`)
 }
@@ -400,6 +622,40 @@ check(
   "db-schema.md sut_page normalized_url unique key",
 )
 
+// 0.2.1 job-control persistence has no schema change: user cancel is stored as
+// failed + marker + exhausted attempts, retry resets attempts, and the attempt
+// log stays append-only/decoupled.
+for (const needle of [
+  ["cancelled by user", "cancel last_error marker"],
+  ["GREATEST(attempts", "cancel exhausted-attempts marker"],
+  ["重置为 0", "manual retry resets attempts"],
+  ["work_item_attempt", "append-only attempt log"],
+  ["marker", "cancel marker is query-excluded"],
+]) {
+  check(dbSection.includes(needle[0]), `db-schema.md §18 documents ${needle[1]}`)
+}
+
+// pg_trgm migration (Task 57) is committed with its GIN index.
+check(dbSection.includes("pg_trgm"), "db-schema.md §18 documents pg_trgm retrieval")
+check(
+  dbSection.includes("knowledge_0003_trgm.sql"),
+  "db-schema.md §18 names knowledge_0003_trgm.sql",
+)
+check(
+  dbSection.includes("idx_knowledge_item_trgm") && dbSection.includes("gin_trgm_ops"),
+  "db-schema.md §18 documents the GIN trigram index",
+)
+check(!/待提交|尚未进入已提交/.test(dbSection), "db-schema.md §18 no longer marks pg_trgm as pending")
+check(
+  dbSection.includes("login_session") && dbSection.includes("page:env:") && dbSection.includes("api:env:"),
+  "db-schema.md §18 documents the page/api/login_session fact kinds",
+)
+check(
+  dbSection.includes("context_packet") && /admin-only|admin only|admin/i.test(dbSection),
+  "db-schema.md §18 documents the admin-only context_packet read semantics",
+)
+check(dbSection.includes("cancelable"), "db-schema.md §18 documents job_card.cancelable")
+
 // ---------------------------------------------------------------------------
 // task-types.md §9: 11 work_item kinds, 7 roles, four-way creation, created_by.
 // ---------------------------------------------------------------------------
@@ -495,12 +751,44 @@ for (const kind of ["design.cases", "review.cases"]) {
 }
 
 // ---------------------------------------------------------------------------
+// executor-protocol.md §13: storageState capture/reuse, page-scoped close,
+// visible element inventory, and network capture explicitly deferred to 0.3.
+// ---------------------------------------------------------------------------
+for (const needle of [
+  ["storage_state_ref", "storageState ref reuse"],
+  ["storage_state", "inline storageState"],
+  ["include_storage_state", "opt-in storageState capture"],
+  ["page_id", "page-scoped close"],
+  ["visible", "element visibility inventory"],
+  ["unknown storage_state_ref", "unknown ref is a cache miss"],
+  ["0.3", "network capture is deferred to 0.3"],
+  ["requests", "passive request buffer is not a discovery source"],
+]) {
+  check(executor.includes(needle[0]), `executor-protocol.md documents ${needle[1]}`)
+}
+check(
+  /DELETE \/v1\/explore[\s\S]{0,160}page_id/.test(executor),
+  "executor-protocol.md documents page-scoped DELETE /v1/explore?page_id=",
+)
+check(
+  /网络捕获[\s\S]{0,160}(?:0\.3|推迟)/.test(executor),
+  "executor-protocol.md marks network capture as 0.3",
+)
+
+// ---------------------------------------------------------------------------
 // contracts/README.md: 0.2.1 status line, without rewriting the P8 totals.
 // ---------------------------------------------------------------------------
 check(/0\.2\.1 契约状态/.test(readme), "contracts README has a 0.2.1 status line")
-for (const needle of ["176 paths", "215 operations", "275 schemas", "125 events", "draft: 0.2.1"]) {
+for (const needle of ["179 paths", "219 operations", "277 schemas", "128 events", "draft: 0.2.1"]) {
   check(readme.includes(needle), `contracts README 0.2.1 status contains ${needle}`)
 }
+check(/19 个 0\.2\.1 operation/.test(readme), "contracts README documents the 19 0.2.1 operations")
+check(
+  readme.includes(`${openapiPaths.size} paths`) &&
+    readme.includes(`${openapiOperationCount} operations`) &&
+    readme.includes(`${openapiSchemaCount} schemas`),
+  `contracts README status matches the parsed openapi (${openapiPaths.size}/${openapiOperationCount}/${openapiSchemaCount})`,
+)
 
 // ---------------------------------------------------------------------------
 // Result. Counts are derived from the parsed catalogs above, not hardcoded.
@@ -514,8 +802,8 @@ const summary = {
   roles: declaredRoles.size,
   createdBy: declaredCreators.size,
 }
-check(summary.events === 7, `summary event count = 7 (got ${summary.events})`)
-check(summary.operations === 15, `summary operation count = 15 (got ${summary.operations})`)
+check(summary.events === 10, `summary event count = 10 (got ${summary.events})`)
+check(summary.operations === 19, `summary operation count = 19 (got ${summary.operations})`)
 check(summary.newTables === 3, `summary new table count = 3 (got ${summary.newTables})`)
 check(summary.alteredTables === 9, `summary altered table count = 9 (got ${summary.alteredTables})`)
 check(summary.kinds === 11, `summary work_item kind count = 11 (got ${summary.kinds})`)
@@ -528,6 +816,7 @@ if (failures > 0) {
 }
 console.log(
   `0.2.1 contract check OK: ${summary.events} events / ${summary.operations} operations / ` +
+    `${openapiPaths.size} paths / ${openapiOperationCount} openapi operations / ${openapiSchemaCount} schemas / ` +
     `${summary.newTables} new tables / ${summary.alteredTables} altered tables / ` +
     `${summary.kinds} work_item kinds / ${summary.roles} roles / created_by ${summary.createdBy} values`,
 )
