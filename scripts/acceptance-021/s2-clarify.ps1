@@ -948,9 +948,9 @@ $baselineText
                             Add-AcceptanceCheck -Scenario $scenario -Name "no full-document requirement set imported" `
                                 -Passed ([bool]$setCheck.Passed -and -not [bool]$FullSutDoc) -Severity assertion `
                                 -Detail ("mode=$($requirementProfile.Mode) input=$($requirementProfile.Name) expected=$($requirementProfile.ExpectedRequirements) actual=$($requirementCount) full_sut_doc_opt_in=$([bool]$FullSutDoc)")
-                            Add-AcceptanceCheck -Scenario $scenario -Name "requirement source is the explicit small input file" `
-                                -Passed ($requirementProfile.Mode -eq "small-input" -and $requirementProfile.Path -eq $documentPathFull) -Severity assertion `
-                                -Detail ("input=$documentPathFull sha256=$($requirementProfile.Sha256)")
+                            Add-AcceptanceCheck -Scenario $scenario -Name "uploaded requirement source is the explicit small-input file (server sha256)" `
+                                -Passed ($requirementProfile.Mode -eq "small-input" -and -not [bool]$FullSutDoc -and $null -ne $upload -and [string](Get-JsonProp -Object $upload.Data -Name "sha256" -Default "") -eq $requirementProfile.Sha256) -Severity assertion `
+                                -Detail ("mode=$($requirementProfile.Mode) input=$($requirementProfile.Path) upload_sha256=$(if ($null -ne $upload) { [string](Get-JsonProp -Object $upload.Data -Name 'sha256' -Default '') } else { 'missing' }) profile_sha256=$($requirementProfile.Sha256)")
                         }
                         Add-AcceptanceCheck -Scenario $scenario -Name "V1 FR requirements ingested ($frCovered/$frTotal)" -Passed ($frTotal -gt 0 -and $frCovered -eq $frTotal) -Severity assertion `
                             -Detail "covered=$frCovered/$frTotal missing=$(@($coverage.Missing | Where-Object { $_ -like 'FR-0*' }) -join ',')"

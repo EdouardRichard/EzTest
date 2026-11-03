@@ -288,6 +288,44 @@ function Test-S3ReusesSmallInputVersion {
     Assert-True -Condition ($text -match 'RequirementInput') -Message "S3 records the supplied requirement input file"
 }
 
+# ---------------------------------------------------------------------------
+# Fix round 1: the S3 clarification fallback must be mode-aware. Small-input
+# mode may only reference the explicit input count/FR set; legacy mode keeps the
+# historical generic 4-requirement wording. A post-gate exact-set recheck must
+# also exist so a fallback cannot introduce out-of-set requirements.
+# ---------------------------------------------------------------------------
+
+function Test-S3SmallModeFallbackReferencesInputSet {
+    if (-not (Get-Command Get-AcceptanceRequirementNudgeText -ErrorAction SilentlyContinue)) {
+        Assert-True -Condition $false -Message "Get-AcceptanceRequirementNudgeText helper must exist for the mode-aware S3 fallback"
+        return
+    }
+    $profile = Resolve-AcceptanceRequirementProfile -RequirementInput $smallMarkdown -RepoRoot $repoRoot
+    foreach ($kind in @("goal", "draft", "confirm")) {
+        $text = Get-AcceptanceRequirementNudgeText -Mode $profile.Mode -ExpectedRequirements $profile.ExpectedRequirements -ExpectedFrIds @($profile.ExpectedFrIds) -Kind $kind
+        Assert-True -Condition ($text -match '3 条' -and $text -match 'FR-011' -and $text -match 'FR-014' -and $text -match 'FR-025') -Message "S3 small-mode $kind fallback references only the explicit 3-requirement input set"
+        Assert-True -Condition ($text -notmatch '4 条|登录、文章、评论、后台管理') -Message "S3 small-mode $kind fallback never asks for the generic 4-requirement drafts"
+        Assert-True -Condition ($text -match '不要新增') -Message "S3 small-mode $kind fallback forbids requirements outside the input set"
+    }
+}
+
+function Test-LegacyFallbackKeepsGenericWording {
+    if (-not (Get-Command Get-AcceptanceRequirementNudgeText -ErrorAction SilentlyContinue)) {
+        Assert-True -Condition $false -Message "Get-AcceptanceRequirementNudgeText helper must exist for the legacy fallback wording check"
+        return
+    }
+    $text = Get-AcceptanceRequirementNudgeText -Mode "legacy" -ExpectedRequirements 0 -ExpectedFrIds @() -Kind "draft"
+    Assert-True -Condition ($text -match '4 条左右') -Message "legacy full-document/standalone mode keeps its historical generic 4-requirement nudge"
+}
+
+function Test-S3FallbackAndPostGateGuardWiring {
+    $text = Get-Content -LiteralPath (Join-Path $scriptsDir "s3-design.ps1") -Raw -Encoding UTF8
+    Assert-Equal -Expected 3 -Actual ([regex]::Matches($text, 'Get-AcceptanceRequirementNudgeText')).Count -Message "S3 builds all three clarification fallback texts from the mode-aware helper"
+    Assert-True -Condition ($text -notmatch '4 条左右') -Message "S3 has no hardcoded generic 4-requirement nudge left"
+    Assert-True -Condition ($text -match 'requirementsAfterGate' -and $text -match 'post-gate requirement set') -Message "S3 re-reads the live requirement set after the requirement hard gate"
+    Assert-True -Condition (([regex]::Matches($text, 'Compare-AcceptanceRequirementSet')).Count -ge 3) -Message "S3 re-runs Compare-AcceptanceRequirementSet after the requirement hard gate"
+}
+
 function Test-AcceptanceScriptsParse {
     foreach ($file in @(Get-ChildItem -LiteralPath $scriptsDir -Filter "*.ps1" -File)) {
         $tokens = $null
@@ -398,6 +436,9 @@ Test-RunnerDeclaresSmallInputProfile
 Test-S1DeclaresAndRecordsRequirementInput
 Test-S2UsesSmallInputOnly
 Test-S3ReusesSmallInputVersion
+Test-S3SmallModeFallbackReferencesInputSet
+Test-LegacyFallbackKeepsGenericWording
+Test-S3FallbackAndPostGateGuardWiring
 Test-AcceptanceScriptsParse
 Test-RunnerRejectsMissingRequirementInput
 Test-RunnerRejectsExpectedCountMismatch

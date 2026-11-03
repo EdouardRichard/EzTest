@@ -53,11 +53,13 @@
 
 .PARAMETER FullSutDoc
     Explicit legacy mode: import the full SUT requirement document. Requires
-    -FullSutDocPath (or the scenario scripts' legacy default path) and cannot be
-    combined with -RequirementInput.
+    -FullSutDocPath: the preflight resolves the document itself and fails
+    instead of falling back to a scenario default. Cannot be combined with
+    -RequirementInput.
 
 .PARAMETER FullSutDocPath
-    Path of the explicit legacy full SUT requirement document.
+    Path of the explicit legacy full SUT requirement document. Required when
+    -FullSutDoc is set; validated by the runner preflight.
 
 .PARAMETER KeepGoing
     Run every available scenario instead of stopping at the first non-passing

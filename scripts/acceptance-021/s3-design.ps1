@@ -28,10 +28,13 @@
     (small_input_version_id in the shared state) and asserts that its live
     requirement count and FR ID set are exactly the supplied input. Small-input
     mode never creates an unrelated version or posts the old generic
-    4-requirement goal. -FullSutDoc keeps the explicit legacy full-document
-    traceability mode. Case traceability must stay inside the selected FR set.
-    The Task 79 full requirement matrix is not overwritten by the small-input
-    profile (default small matrix: docs/version-V0.2.1/acceptance/small-input-matrix.md).
+    4-requirement goal; the clarification fallback text references only the
+    explicit input count/FR IDs, and the exact-set comparison is re-run after the
+    requirement hard gate so a fallback cannot add out-of-set requirements.
+    -FullSutDoc keeps the explicit legacy full-document traceability mode. Case
+    traceability must stay inside the selected FR set. The Task 79 full
+    requirement matrix is not overwritten by the small-input profile (default
+    small matrix: docs/version-V0.2.1/acceptance/small-input-matrix.md).
 
     Task 86 (P10-T11) adds the design-input resource gate: the version the
     design runs on must bind the pages/APIs P9 discovery proposed (pages > 0,
@@ -131,6 +134,12 @@ if (-not [string]::IsNullOrWhiteSpace($RequirementInput) -or $FullSutDoc) {
     }
 }
 $isSmallInput = ($null -ne $requirementProfile -and $requirementProfile.Mode -eq "small-input")
+# Fix round 1: every clarification fallback text is mode-aware. Small-input mode
+# references only the explicit input count/FR IDs; the legacy modes keep their
+# historical generic wording.
+$fallbackMode = if ($isSmallInput) { $requirementProfile.Mode } else { "legacy" }
+$fallbackCount = if ($isSmallInput) { [int]$requirementProfile.ExpectedRequirements } else { 0 }
+$fallbackIds = if ($isSmallInput) { @($requirementProfile.ExpectedFrIds) } else { @() }
 
 $statePath = Get-AcceptanceStatePath -Context $context -StatePath $StatePath
 if ([string]::IsNullOrWhiteSpace($MatrixPath)) {
@@ -537,10 +546,11 @@ try {
 
             if (-not $requirementsAlreadyImported) {
                 if ($conversationId -ne "") {
+                    $goalInstruction = Get-AcceptanceRequirementNudgeText -Mode $fallbackMode -ExpectedRequirements $fallbackCount -ExpectedFrIds $fallbackIds -Kind "goal"
                     $goal = @"
 【版本描述】墨栈博客：Vue 前端 + Go 后端博客系统，SUT 前端 $($context.SutWebBaseUrl)，后端 API $($context.SutApiBaseUrl)/api/v1，测试账号 admin/openClaw/Hermes。
 【版本目标】验收登录与会话、文章列表与详情、文章评论、后台管理四项主流程，并覆盖未登录/越权与文章状态边界。
-【本轮要求】请在澄清中直接整理并写入一份精简需求草案（4 条左右，覆盖上述主流程），不要反复提问；整理完停在需求确认门，等待用户确认，不要自动开始设计。
+【本轮要求】$goalInstruction
 "@
                     try {
                         $message = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId -Text $goal
@@ -563,7 +573,7 @@ try {
                         # first instead of writing the draft.
                         try {
                             $nudge = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId `
-                                -Text "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），不需要继续提问；写完后停在需求确认门等待用户确认。"
+                                -Text (Get-AcceptanceRequirementNudgeText -Mode $fallbackMode -ExpectedRequirements $fallbackCount -ExpectedFrIds $fallbackIds -Kind "draft")
                             Write-AcceptanceLog -Scenario $scenario -Message ("posted requirement-draft nudge message=" + [string](Get-JsonProp -Object $nudge -Name 'id' -Default ''))
                         } catch {
                             Write-AcceptanceLog -Scenario $scenario -Level warn -Message "nudge failed: $($_.Exception.Message)"
@@ -714,9 +724,9 @@ try {
                 Add-AcceptanceCheck -Scenario $scenario -Name "design input is traceable to the small-input FR IDs ($frCoveredBefore/$frTotalBefore)" `
                     -Passed ($frTotalBefore -gt 0 -and $frCoveredBefore -eq $frTotalBefore -and $nfrCoveredBefore -eq $nfrTotalBefore) -Severity assertion `
                     -Detail "input=$($requirementProfile.Name) fr=$frCoveredBefore/$frTotalBefore nfr=$nfrCoveredBefore/$nfrTotalBefore missing=$(@($coverageBefore.Missing) -join ',')"
-                Add-AcceptanceCheck -Scenario $scenario -Name "design input has no full-document requirements" `
-                    -Passed ($v2Baseline.Count -eq 0 -and $baselineEntries.Count -eq $requirements.Count) -Severity assertion `
-                    -Detail "mode=$($requirementProfile.Mode) baseline=$($baselineEntries.Count) live=$($requirements.Count) v2=$($v2Baseline.Count)"
+                Add-AcceptanceCheck -Scenario $scenario -Name "design input matches the explicit small-input set ($($baselineEntries.Count)/$($requirementProfile.ExpectedRequirements))" `
+                    -Passed ([bool]$smallSetCheck.Passed -and $baselineEntries.Count -eq $requirementProfile.ExpectedRequirements -and $requirementProfile.V2Count -eq 0 -and $v2Baseline.Count -eq 0) -Severity assertion `
+                    -Detail "mode=$($requirementProfile.Mode) input=$($requirementProfile.Name) profile_expected=$($requirementProfile.ExpectedRequirements) profile_v2=$($requirementProfile.V2Count) baseline=$($baselineEntries.Count) live=$($requirements.Count) live_v2=$($v2Baseline.Count) set=$($smallSetCheck.Detail)"
                 if ($p0Baseline.Count -gt 0) {
                     Add-AcceptanceCheck -Scenario $scenario -Name "small-input P0 design requirements covered ($($coverageBefore.P0Covered)/$($coverageBefore.P0Total))" `
                         -Passed ($coverageBefore.P0Covered -eq $coverageBefore.P0Total) -Severity assertion `
@@ -775,7 +785,7 @@ try {
                 if (-not $stageWait.Ok -and $conversationId -ne "") {
                     try {
                         $convergeNudge = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId `
-                            -Text "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），并在回复末尾明确给出『需求确认请求』；随后停在需求确认门等待用户确认，不要开始设计。"
+                            -Text (Get-AcceptanceRequirementNudgeText -Mode $fallbackMode -ExpectedRequirements $fallbackCount -ExpectedFrIds $fallbackIds -Kind "confirm")
                         Write-AcceptanceLog -Scenario $scenario -Message ("posted requirement-confirmation nudge message=" + [string](Get-JsonProp -Object $convergeNudge -Name 'id' -Default ''))
                     } catch {
                         Write-AcceptanceLog -Scenario $scenario -Level warn -Message "confirmation nudge failed: $($_.Exception.Message)"
@@ -906,6 +916,28 @@ try {
                 [void](Write-S3Evidence -Name "requirements-after.json" -Value $requirementsAfter -Note "requirements after confirmation")
                 Add-AcceptanceCheck -Scenario $scenario -Name "requirements leave draft after confirmation" -Passed ($requirementsAfter.Count -gt 0 -and @($statuses | Where-Object { $_ -eq "draft" }).Count -eq 0) -Severity assertion `
                     -Detail "statuses=$($statuses -join ",")"
+                # Fix round 1: the clarification fallback above is mode-aware, but
+                # a model can still add drafts while converging. Re-run the exact-set
+                # comparison on the requirements read after the hard gate so an
+                # out-of-set requirement cannot slip into the confirmed design input.
+                if ($isSmallInput) {
+                    $requirementsAfterGate = @($requirementsAfter)
+                    $postGateSetCheck = Compare-AcceptanceRequirementSet -ExpectedFrIds (@($requirementProfile.ExpectedFrIds) -join ",") `
+                        -ExpectedRequirements $requirementProfile.ExpectedRequirements -Requirements $requirementsAfterGate
+                    [void](Write-S3Evidence -Name "requirements-after-gate.json" -Value ([pscustomobject]@{
+                        gate_stage            = $stageAfterGateValue
+                        expected_requirements = $requirementProfile.ExpectedRequirements
+                        expected_fr_ids       = @($requirementProfile.ExpectedFrIds)
+                        actual_requirements   = $requirementsAfterGate.Count
+                        set_check             = $postGateSetCheck
+                        requirements          = @($requirementsAfterGate)
+                    }) -Kind "input" -Note "post-gate small-input exact-set recheck")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "post-gate requirement set still matches the small input exactly ($($postGateSetCheck.ActualCount)/$($postGateSetCheck.ExpectedCount))" `
+                        -Passed ([bool]$postGateSetCheck.Passed) -Severity assertion -Detail $postGateSetCheck.Detail
+                    if (-not $postGateSetCheck.Passed) {
+                        $scenario.ErrorMessage = "S3 failed: requirements no longer match the small input after the requirement hard gate ($($postGateSetCheck.Detail)); the clarification fallback must not introduce out-of-set requirements"
+                    }
+                }
                 # The matrix and case traceability must show the post-gate
                 # requirement status, not the pre-gate draft snapshot.
                 $requirements = @($requirementsAfter)

@@ -2388,3 +2388,57 @@ function Compare-AcceptanceRequirementSet {
         Detail                     = $detail
     }
 }
+
+function Get-AcceptanceRequirementNudgeText {
+    <#
+        Builds the S3 clarification fallback text. Small-input mode must point at
+        the explicit input's requirement count and FR IDs only: a generic
+        "4 条左右" draft request would invite requirements outside the selected
+        input. The legacy full-document/standalone mode keeps its historical
+        wording. Callers must still re-check the live requirement set after the
+        requirement hard gate.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [ValidateSet("small-input", "full-sut-doc", "legacy")] [string] $Mode = "legacy",
+        [Parameter(Mandatory = $false)] [int] $ExpectedRequirements = 0,
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $ExpectedFrIds = @(),
+        [Parameter(Mandatory = $false)] [ValidateSet("goal", "draft", "confirm")] [string] $Kind = "draft"
+    )
+    if ($Mode -eq "small-input") {
+        $idText = (@($ExpectedFrIds) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join "、"
+        $count = $ExpectedRequirements
+        if ($count -le 0) { $count = @($ExpectedFrIds).Count }
+        $scope = if ($count -gt 0 -and $idText -ne "") {
+            "仅限输入中的 $count 条需求：$idText；"
+        } elseif ($count -gt 0) {
+            "仅限输入中的 $count 条需求；"
+        } elseif ($idText -ne "") {
+            "仅限输入中的这些需求：$idText；"
+        } else {
+            "仅限输入中的需求；"
+        }
+        switch ($Kind) {
+            "goal" {
+                return "请在澄清中直接整理并写入一份精简需求草案（${scope}不要新增、删除或改写需求），不要反复提问；整理完停在需求确认门，等待用户确认，不要自动开始设计。"
+            }
+            "confirm" {
+                return "请现在把需求草案写入需求列表（${scope}不要新增、删除或改写需求），并在回复末尾明确给出『需求确认请求』；随后停在需求确认门等待用户确认，不要开始设计。"
+            }
+            default {
+                return "请现在把需求草案写入需求列表（${scope}不要新增、删除或改写需求），不需要继续提问；写完后停在需求确认门等待用户确认。"
+            }
+        }
+    }
+    # Legacy full-document/standalone mode keeps the historical generic wording.
+    switch ($Kind) {
+        "goal" {
+            return "请在澄清中直接整理并写入一份精简需求草案（4 条左右，覆盖上述主流程），不要反复提问；整理完停在需求确认门，等待用户确认，不要自动开始设计。"
+        }
+        "confirm" {
+            return "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），并在回复末尾明确给出『需求确认请求』；随后停在需求确认门等待用户确认，不要开始设计。"
+        }
+        default {
+            return "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），不需要继续提问；写完后停在需求确认门等待用户确认。"
+        }
+    }
+}
