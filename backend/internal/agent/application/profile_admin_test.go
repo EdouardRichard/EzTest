@@ -284,8 +284,8 @@ func TestProfileAdminList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(views) != 14 {
-		t.Fatalf("views = %d, want 14", len(views))
+	if len(views) != 15 {
+		t.Fatalf("views = %d, want 15 (14 frozen P1-P4 + the P7 knowledge_curator profile)", len(views))
 	}
 	host := findProfileView(t, views, agentapp.ProfileKeyClarificationHost)
 	if host.ID == 0 || host.Key != agentapp.ProfileKeyClarificationHost {

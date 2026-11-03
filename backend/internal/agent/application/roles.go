@@ -131,8 +131,8 @@ const (
 
 // roleSpecs is the immutable 7-role catalog. Tool entries are exact registered
 // names or "namespace.*" wildcards for tools later phases register (explore.*).
-// Profiles lists the existing 14 seed profiles that execute the role; roles
-// without a dedicated profile yet (knowledge_curator) legitimately have none.
+// Profiles lists the seed profiles that execute the role; every role has at
+// least one (knowledge_curator is seeded by the P7 knowledge increment).
 var roleSpecs = []RoleSpec{
 	{
 		Key:   RoleAssistant,
@@ -348,10 +348,11 @@ var roleSpecs = []RoleSpec{
 			"knowledge.search",
 			"knowledge.read",
 		},
-		// No dedicated agent_profile exists in 0.2.1; the success hook runs the
-		// role directly. knowledge.search/read are registered by the retrieval
-		// task (their whitelist entries above are already reserved).
-		Profiles:     nil,
+		// The knowledge_curator profile seed (p7_profiles.go) executes this
+		// role, so the structured retrieval tools (knowledge.search/read,
+		// registered by the retrieval task) are model-visible while the runtime
+		// RoleToolGuard keeps the surface closed.
+		Profiles:     []string{ProfileKeyKnowledgeCurator},
 		SystemPrompt: knowledgeCuratorRolePrompt,
 		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,

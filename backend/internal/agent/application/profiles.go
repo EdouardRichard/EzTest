@@ -269,19 +269,21 @@ func P2Profiles() []agent.AgentProfile {
 	}
 }
 
-// Profiles returns every seed profile (P1 then P2 then P3 then P4) in startup
-// seeding order. P4 profiles are appended without duplicating a key that an
-// earlier phase already seeds; EnsureProfiles still returns existing database
-// rows unchanged so administrator edits always win.
+// Profiles returns every seed profile (P1 then P2 then P3 then P4 then the P7
+// background role seed) in startup seeding order. Later phases are appended
+// without duplicating a key that an earlier phase already seeds; EnsureProfiles
+// still returns existing database rows unchanged so administrator edits always
+// win.
 func Profiles() []agent.AgentProfile {
 	profiles := P1Profiles()
 	profiles = append(profiles, P2Profiles()...)
 	profiles = append(profiles, P3Profiles()...)
-	seen := make(map[string]struct{}, len(profiles)+len(P4Profiles()))
+	seen := make(map[string]struct{}, len(profiles)+len(P4Profiles())+len(P7Profiles()))
 	for _, profile := range profiles {
 		seen[profile.Key] = struct{}{}
 	}
-	for _, profile := range P4Profiles() {
+	appended := append(P4Profiles(), P7Profiles()...)
+	for _, profile := range appended {
 		if _, duplicate := seen[profile.Key]; duplicate {
 			continue
 		}
@@ -291,10 +293,11 @@ func Profiles() []agent.AgentProfile {
 	return profiles
 }
 
-// EnsureProfiles idempotently seeds the P1, P2, P3 and P4 profiles plus the P5
-// and P7 allowed_tools increments. Existing rows (including administrator
-// edits) are returned unchanged by the repository. The assembled seeds are
-// validated against the seven-role tool whitelist before the first write.
+// EnsureProfiles idempotently seeds the P1, P2, P3 and P4 profiles plus the P7
+// knowledge_curator role profile and the P5 and P7 allowed_tools increments.
+// Existing rows (including administrator edits) are returned unchanged by the
+// repository. The assembled seeds are validated against the seven-role tool
+// whitelist before the first write.
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
 	seeds := Profiles()
 	for i := range seeds {

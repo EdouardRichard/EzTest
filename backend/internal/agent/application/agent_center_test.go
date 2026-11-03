@@ -76,8 +76,11 @@ func (f *fakeLatestEvalReader) LatestEval(_ context.Context) (*agentapp.EvalSumm
 func agentCenterCatalogRows(t *testing.T) []agentapp.CatalogProfileRow {
 	t.Helper()
 	profiles := agentapp.Profiles()
-	if len(profiles) != 14 {
-		t.Fatalf("seed profiles = %d, want 14", len(profiles))
+	// The frozen agent-center team map covers 14 profiles; the P7
+	// knowledge_curator background profile is seeded but intentionally outside
+	// that catalog, so the seed list is one larger than the catalog.
+	if len(profiles) != 15 {
+		t.Fatalf("seed profiles = %d, want 15", len(profiles))
 	}
 	rows := make([]agentapp.CatalogProfileRow, 0, len(profiles))
 	for _, profile := range profiles {

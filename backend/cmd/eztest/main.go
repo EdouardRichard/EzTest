@@ -22,6 +22,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/designadapter"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/knowledgeadapter"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
@@ -483,6 +484,109 @@ func (a executionSUTContexts) ListAll(ctx context.Context) ([]execution.CaseRunS
 
 var _ executionapp.SUTContextRepository = executionSUTContexts{}
 
+// versionCaseBindingSource is the version read-model surface consumed by the
+// knowledge success-hook binding adapter (*versionapp.Service satisfies it).
+type versionCaseBindingSource interface {
+	Get(ctx context.Context, id int64) (versionapp.VersionView, error)
+}
+
+// p7VersionCaseBindings resolves the page/API/account binding keys of one
+// version for the knowledge success hook (Task 51). The version read model
+// already exposes the SUT family, environment IDs, route templates, API
+// method/path templates and account roles; this adapter only projects them, so
+// the agent knowledge adapter never imports the version context.
+type p7VersionCaseBindings struct {
+	versions versionCaseBindingSource
+}
+
+// VersionBindings implements knowledgeadapter.VersionBindingReader.
+func (b p7VersionCaseBindings) VersionBindings(ctx context.Context, versionID int64) ([]knowledgeadapter.VersionBinding, error) {
+	if b.versions == nil {
+		return nil, errors.New("knowledge case bindings: version read model is not configured")
+	}
+	if versionID <= 0 {
+		return nil, errors.New("knowledge case bindings: version id must be positive")
+	}
+	view, err := b.versions.Get(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
+	bindings := make([]knowledgeadapter.VersionBinding, 0, len(view.Bindings))
+	for _, item := range view.Bindings {
+		binding := knowledgeadapter.VersionBinding{
+			SystemID:      parseCaseBindingID(item.SUT.ID),
+			EnvironmentID: parseCaseBindingID(item.Environment.ID),
+		}
+		if item.SUT.Family != nil {
+			binding.SystemKey = strings.TrimSpace(*item.SUT.Family)
+		}
+		for _, page := range item.Pages {
+			// The page binding key is the route template (spec §10.2); a page
+			// without a template falls back to its URL so the locator is still
+			// addressable.
+			key := strings.TrimSpace(page.RouteTemplate)
+			if key == "" {
+				key = strings.TrimSpace(page.URL)
+			}
+			id := parseCaseBindingID(page.ID)
+			if id <= 0 || key == "" {
+				continue
+			}
+			binding.Pages = append(binding.Pages, knowledgeadapter.PageBinding{ID: id, Key: key})
+		}
+		for _, api := range item.APIs {
+			key := caseBindingAPIKey(api.Method, api.PathTemplate)
+			id := parseCaseBindingID(api.ID)
+			if id <= 0 || key == "" {
+				continue
+			}
+			binding.APIs = append(binding.APIs, knowledgeadapter.APIBinding{ID: id, Key: key})
+		}
+		seenRoles := make(map[string]struct{}, len(item.Accounts))
+		for _, account := range item.Accounts {
+			for _, role := range account.Roles {
+				role = strings.TrimSpace(role)
+				if role == "" {
+					continue
+				}
+				if _, duplicate := seenRoles[role]; duplicate {
+					continue
+				}
+				seenRoles[role] = struct{}{}
+				binding.AccountRoles = append(binding.AccountRoles, role)
+			}
+		}
+		bindings = append(bindings, binding)
+	}
+	return bindings, nil
+}
+
+// caseBindingAPIKey is the structured api_key of a version SUT API: the
+// uppercase method plus the route template (the same shape the execution
+// version adapter uses for http.request).
+func caseBindingAPIKey(method, pathTemplate string) string {
+	path := strings.TrimSpace(pathTemplate)
+	if path == "" {
+		return ""
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = "GET"
+	}
+	return method + " " + path
+}
+
+// parseCaseBindingID parses a decimal resource-view ID. Invalid IDs degrade to
+// zero so the knowledge adapter leaves that binding dimension unset instead of
+// writing a zero ID.
+func parseCaseBindingID(value string) int64 {
+	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0
+	}
+	return parsed
+}
+
 // runExecutionScheduler drives the event-driven intent scan, wave planner and
 // recovery sweep. Case confirmations wake the intent scan through the eventing
 // observer seam (design.case_confirmed); a positive scanInterval additionally
@@ -867,39 +971,6 @@ func main() {
 		Audit:     auditSvc,
 		Timeout:   1800 * time.Second,
 	})
-	executionRunner := executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
-		Intents:     executionRepo.Intents,
-		CaseRuns:    executionRepo.CaseRuns,
-		SUTContexts: executionSUTContextRepo,
-		Results:     executionRepo.Results,
-		Evidence:    executionRepo.Evidence,
-		Humans:      executionRepo.Humans,
-		Cases:       executionCases,
-		Bindings:    executionVersionAdapter,
-		APIs:        executionVersionAdapter,
-		Browser:     executionadapters.NewBrowserAdapterWithRouter(executorRouter),
-		Credentials: executionCredentials,
-		Content:     executionContent,
-		HTTPClient:  executionHTTPClient,
-		Database:    executionDatabase,
-		Coverage:    executionCoverage,
-		Gaps:        executionGaps,
-		TeamRoom:    executionTeamRoom,
-		Human:       executionHumans,
-		Visual:      p5.VisualPort,
-		Settings:    settingsSvc,
-		Clock:       clk,
-		IDs:         ids,
-		Events:      eventSvc,
-		Audit:       auditSvc,
-		InstanceID:  instanceID,
-		// TODO(Task 51, P8-T5): KnowledgeHook stays nil until
-		// knowledgeadapter implements executionapp.CaseSuccessHook (page/API ID
-		// -> binding keys, three Success hooks + AutoApprove) and this root
-		// injects it. P7Deps.Retrieval wiring is also Task 51; neither is invented
-		// here. Until then a passed case run does not notify knowledge.
-	})
-	executionCanceller.runner = executionRunner
 	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
 		Intents:  executionRepo.Intents,
 		Cases:    executionCases,
@@ -1175,6 +1246,46 @@ func main() {
 		log.Fatalf("eztest: wire P7 runtime: %v", err)
 	}
 
+	// P8 knowledge success hook: the adapter maps a passed case run's page/API
+	// IDs to the version's binding keys through the version read model, then
+	// sediments page_locator/api_auth/login_recipe drafts (auto-approved with
+	// audit) through the real knowledge service. The binding resolver is a
+	// composition-root adapter so the knowledge bridge never imports version.
+	p7rt.KnowledgeAdapter.SetVersionBindings(p7VersionCaseBindings{versions: versionSvc})
+
+	// The case runner is constructed after the P7 runtime so the knowledge
+	// success hook is non-nil (the hook is best effort at the Finish boundary:
+	// a failure is logged and never blocks or changes the case_run verdict).
+	executionRunner := executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
+		Intents:       executionRepo.Intents,
+		CaseRuns:      executionRepo.CaseRuns,
+		SUTContexts:   executionSUTContextRepo,
+		Results:       executionRepo.Results,
+		Evidence:      executionRepo.Evidence,
+		Humans:        executionRepo.Humans,
+		Cases:         executionCases,
+		Bindings:      executionVersionAdapter,
+		APIs:          executionVersionAdapter,
+		Browser:       executionadapters.NewBrowserAdapterWithRouter(executorRouter),
+		Credentials:   executionCredentials,
+		Content:       executionContent,
+		HTTPClient:    executionHTTPClient,
+		Database:      executionDatabase,
+		Coverage:      executionCoverage,
+		Gaps:          executionGaps,
+		TeamRoom:      executionTeamRoom,
+		Human:         executionHumans,
+		Visual:        p5.VisualPort,
+		Settings:      settingsSvc,
+		Clock:         clk,
+		IDs:           ids,
+		Events:        eventSvc,
+		Audit:         auditSvc,
+		InstanceID:    instanceID,
+		KnowledgeHook: p7rt.KnowledgeAdapter,
+	})
+	executionCanceller.runner = executionRunner
+
 	// P8 in-flight counters: HTTP requests and agent runs. The orchestration
 	// heartbeat copies them into api_instance for drain/rolling-upgrade
 	// observation; they never participate in scheduling.
@@ -1210,7 +1321,10 @@ func main() {
 			Design:      designadapter.New(designGraph),
 			Execution:   executionRunner,
 			P5:          p5Tools,
-			P7:          tools.P7Deps{Knowledge: p7rt.KnowledgeAdapter},
+			P7: tools.P7Deps{
+				Knowledge: p7rt.KnowledgeAdapter,
+				Retrieval: p7rt.KnowledgeAdapter,
+			},
 		},
 		TaskProvider:         executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
 		RunCanceller:         executionRunner,

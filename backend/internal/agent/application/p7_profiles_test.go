@@ -41,8 +41,8 @@ func TestEnsureProfilesSeedsP7ToolAdditions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	if len(seeded) != 14 {
-		t.Fatalf("seeded profiles = %d, want 14", len(seeded))
+	if len(seeded) != 15 {
+		t.Fatalf("seeded profiles = %d, want 15 (14 frozen P1-P4 + the P7 knowledge_curator profile)", len(seeded))
 	}
 
 	for key, additions := range p7ExpectedProfileTools {

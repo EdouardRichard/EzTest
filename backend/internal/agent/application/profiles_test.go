@@ -203,7 +203,8 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles()) + len(agentapp.P3Profiles()) + len(agentapp.P4Profiles())
+	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles()) + len(agentapp.P3Profiles()) +
+		len(agentapp.P4Profiles()) + len(agentapp.P7Profiles())
 	if len(first) != wantTotal {
 		t.Fatalf("seeded = %d, want %d", len(first), wantTotal)
 	}
