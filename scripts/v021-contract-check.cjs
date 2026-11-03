@@ -385,8 +385,10 @@ const oneOfBranch = (block, marker) => {
   const anchor = block.indexOf(marker)
   if (anchor < 0) return ""
   const start = block.lastIndexOf("\n        - type: object", anchor)
+  // Fail loudly instead of silently reading the previous branch's required list.
+  if (start < 0) return ""
   const end = block.indexOf("\n        - type: object", anchor + marker.length)
-  return block.slice(start < 0 ? 0 : start + 1, end < 0 ? block.length : end)
+  return block.slice(start + 1, end < 0 ? block.length : end)
 }
 const jobCardBranch = oneOfBranch(messagePartBlock, "enum: [job_card]")
 check(/code:/.test(jobCardBranch), "openapi job_card part carries optional code")
