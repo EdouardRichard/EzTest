@@ -320,7 +320,7 @@ func TestScanCreatesCriticAndDataPlanOnlyForDrafts(t *testing.T) {
 	if len(requirementTasks) != 1 || requirementTasks[0].DedupeKey != "design:3007:3008" {
 		t.Fatalf("requirement tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
 	}
-	if requirementTasks[0].Payload["reason"] != "requirement_changed" {
+	if requirementTasks[0].Payload["reason"] != "coverage_repair" {
 		t.Fatalf("redesign payload = %v", requirementTasks[0].Payload)
 	}
 
@@ -366,6 +366,95 @@ func TestRequestGapEnsuresScopeAndTask(t *testing.T) {
 	}
 	if len(enqueuer.byType("design.gap")) != 1 {
 		t.Fatalf("gap task duplicated")
+	}
+}
+
+// TestDesignConvergesAfterCoverage pins Task 70's generation-gap repair: a
+// design.requirement task can finish "done" without producing any usable case
+// (a failed case.graph_propose, a stale graph hash, a model that stops). The
+// static dedupe key used to make that empty job block every later attempt, so
+// the design pass never reached complete coverage and the version never left
+// designing. The reconciler must request one bounded fresh authoring generation
+// while coverage is missing, and still only converge once every activated
+// requirement really has coverage.
+func TestDesignConvergesAfterCoverage(t *testing.T) {
+	planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
+	repo.hasConversation = true
+	repo.latestConversation = 9001
+	roundID := int64(8001)
+	repo.rounds = []design.Round{{
+		ID: roundID, VersionID: 1001, ConversationID: 9001,
+		Activation: design.ActivationAutoNew, Status: design.RoundStatusActive,
+		RequirementIDs: []int64{3001, 3005}, RequirementVersionIDs: []int64{3002, 3006},
+	}}
+	repo.activeScopes = []design.Scope{
+		{ID: 6001, VersionID: 1001, RequirementID: 3001, ActivatedByRoundID: &roundID, Status: design.ScopeStatusActive},
+		{ID: 6002, VersionID: 1001, RequirementID: 3005, ActivatedByRoundID: &roundID, Status: design.ScopeStatusActive},
+	}
+	repo.coverage = []design.RequirementCoverage{
+		{Requirement: plannerRequirement(3001, 3002), ScenarioCount: 1, DraftCount: 1},
+		{Requirement: plannerRequirement(3005, 3006)},
+	}
+	// The uncovered requirement's original authoring task already finished
+	// without writing a scenario (the observed S3 gap).
+	enqueuer.seedDone(TaskInput{
+		VersionID: 1001, Team: TeamDesign, Type: TaskTypeDesignRequirement,
+		DedupeKey: "design:3005:3006",
+		Payload: map[string]any{
+			"requirement_id": "3005", "requirement_version_id": "3006",
+			"reason": "requirement_confirmed", "conversation_id": "9001", "round_id": "8001",
+		},
+	})
+	converger := &fakeDesignConverger{}
+	planner.SetDesignConverger(converger)
+	ctx := context.Background()
+
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile with an empty authoring task: %v", err)
+	}
+	if len(converger.versionIDs) != 0 {
+		t.Fatalf("uncovered requirement converged the version: %v", converger.versionIDs)
+	}
+	repairTasks := enqueuer.byType(TaskTypeDesignRequirement)
+	if len(repairTasks) != 2 {
+		t.Fatalf("requirement tasks = %v, want the done task plus one repair generation",
+			sortedTaskDedupeKeys(repairTasks))
+	}
+	repair := repairTasks[1]
+	if repair.DedupeKey != "design:3005:3006:repair:1" {
+		t.Fatalf("repair dedupe = %q, want design:3005:3006:repair:1 (the done static key must not block)", repair.DedupeKey)
+	}
+	if taskPayloadString(repair, "reason") != "coverage_repair" {
+		t.Fatalf("repair payload = %v", repair.Payload)
+	}
+	if taskPayloadString(repair, "requirement_version_id") != "3006" {
+		t.Fatalf("repair payload = %v", repair.Payload)
+	}
+
+	// A repeated pass while the repair generation is open must not stampede it.
+	taskCount := len(enqueuer.tasks)
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if len(enqueuer.tasks) != taskCount {
+		t.Fatalf("open repair generation was duplicated: %v", sortedTaskDedupeKeys(enqueuer.tasks))
+	}
+	if len(converger.versionIDs) != 0 {
+		t.Fatalf("still-uncovered requirement converged the version: %v", converger.versionIDs)
+	}
+
+	// Once the repair generation writes real coverage, the next pass converges.
+	repo.coverage[1] = design.RequirementCoverage{
+		Requirement: plannerRequirement(3005, 3006), ScenarioCount: 1, DraftCount: 1,
+	}
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile after coverage: %v", err)
+	}
+	if len(converger.versionIDs) != 1 || converger.versionIDs[0] != 1001 {
+		t.Fatalf("converged versions = %v, want [1001] once coverage is complete", converger.versionIDs)
+	}
+	if len(enqueuer.byType(TaskTypeDesignRequirement)) != 2 {
+		t.Fatalf("covered requirement still requested repair: %v", sortedTaskDedupeKeys(enqueuer.tasks))
 	}
 }
 

@@ -110,7 +110,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 			if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending", latestConversation, round.ID); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", latestConversation, round.ID); err != nil {
+			if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 				return err
 			}
 			if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation); err != nil {
@@ -149,7 +149,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 		if err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", latestConversation, round.ID); err != nil {
+		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 			return err
 		}
 		if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation); err != nil {

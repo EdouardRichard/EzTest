@@ -9,9 +9,25 @@ import (
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 )
 
-// fakeEnqueuer dedupes tasks by dedupe key like the work queue does.
+// fakeCoverageRepairLimit mirrors the production adapter's bounded repair
+// generations per requirement version (the original authoring task plus two
+// coverage repairs).
+const fakeCoverageRepairLimit = 3
+
+// fakeEnqueuer dedupes tasks by dedupe key like the work queue does. statuses
+// models the work-item lifecycle so the coverage-repair check can tell an
+// in-flight task from a terminal one; a task created through Ensure is open.
 type fakeEnqueuer struct {
-	tasks []TaskInput
+	tasks          []TaskInput
+	statuses       map[string]string
+	repairRequests []coverageRepairRequest
+}
+
+// coverageRepairRequest records one EnsureCoverageRepair call so a test can
+// pin which requirement version asked for a fresh generation.
+type coverageRepairRequest struct {
+	baseKey              string
+	requirementVersionID int64
 }
 
 func (f *fakeEnqueuer) Ensure(_ context.Context, in TaskInput) (bool, error) {
@@ -21,7 +37,59 @@ func (f *fakeEnqueuer) Ensure(_ context.Context, in TaskInput) (bool, error) {
 		}
 	}
 	f.tasks = append(f.tasks, in)
+	if f.statuses == nil {
+		f.statuses = map[string]string{}
+	}
+	f.statuses[in.DedupeKey] = "open"
 	return true, nil
+}
+
+// seedDone stores an already completed authoring task that produced no usable
+// coverage (the Task 70 stall: a done design.requirement item blocks the static
+// dedupe key forever).
+func (f *fakeEnqueuer) seedDone(in TaskInput) {
+	if f.statuses == nil {
+		f.statuses = map[string]string{}
+	}
+	f.tasks = append(f.tasks, in)
+	f.statuses[in.DedupeKey] = "done"
+}
+
+// EnsureCoverageRepair models the production adapter: it requests a fresh
+// dedupe key while the previous generation is terminal, refuses to stampede an
+// in-flight generation and stops after the bounded generation budget.
+func (f *fakeEnqueuer) EnsureCoverageRepair(ctx context.Context, in TaskInput, requirementVersionID int64) (bool, error) {
+	if f.statuses == nil {
+		f.statuses = map[string]string{}
+	}
+	f.repairRequests = append(f.repairRequests, coverageRepairRequest{
+		baseKey: in.DedupeKey, requirementVersionID: requirementVersionID,
+	})
+	generation := 0
+	for _, task := range f.tasks {
+		if task.Type != TaskTypeDesignRequirement {
+			continue
+		}
+		if taskPayloadString(task, "requirement_version_id") != fmt.Sprint(requirementVersionID) {
+			continue
+		}
+		switch f.statuses[task.DedupeKey] {
+		case "open", "claimed", "running", "waiting_human":
+			return false, nil
+		case "failed":
+			// A failed item below its attempt cap is retried by the queue; a
+			// fresh generation would duplicate the in-flight retry.
+			return false, nil
+		}
+		generation++
+	}
+	if generation >= fakeCoverageRepairLimit {
+		return false, nil
+	}
+	if generation > 0 {
+		in.DedupeKey = fmt.Sprintf("%s:repair:%d", in.DedupeKey, generation)
+	}
+	return f.Ensure(ctx, in)
 }
 
 func (f *fakeEnqueuer) byType(taskType string) []TaskInput {

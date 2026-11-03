@@ -214,6 +214,12 @@ func (e versionTaskEnqueuer) Ensure(ctx context.Context, in versionapp.TaskInput
 	return err
 }
 
+// maxDesignRequirementGenerations bounds the case-authoring generations of one
+// requirement version: the original task plus two coverage repairs. A model that
+// keeps producing no usable case must not loop forever; the version then stays
+// designing and the acceptance reports the generation gap (Task 70).
+const maxDesignRequirementGenerations = 3
+
 // designTaskEnqueuer adapts the design planner's work-queue port to the agent
 // task board. Composition-root only.
 type designTaskEnqueuer struct {
@@ -233,6 +239,76 @@ func (e designTaskEnqueuer) Ensure(ctx context.Context, in designapp.TaskInput) 
 		Payload:   in.Payload,
 	})
 	return created, err
+}
+
+// EnsureCoverageRepair applies one fresh authoring generation for a requirement
+// version whose coverage is still missing. It looks at the version's existing
+// design.requirement work items so a terminal "done but empty" generation (S3
+// emitted no usable case and the static dedupe key blocked every retry) is
+// repaired, while an in-flight or retry-backed generation is left alone and the
+// bounded generation budget is respected.
+func (e designTaskEnqueuer) EnsureCoverageRepair(ctx context.Context, in designapp.TaskInput, requirementVersionID int64) (bool, error) {
+	if e.queue == nil {
+		return false, nil
+	}
+	items, err := e.queue.ListByVersion(ctx, in.VersionID, agentapp.MaxListLimit)
+	if err != nil {
+		return false, err
+	}
+	key := coverageRepairDedupeKey(items, in.DedupeKey, requirementVersionID)
+	if key == "" {
+		return false, nil
+	}
+	in.DedupeKey = key
+	_, created, err := e.queue.Ensure(ctx, agent.NewWorkItem{
+		VersionID: in.VersionID,
+		Team:      in.Team,
+		Type:      in.Type,
+		Priority:  in.Priority,
+		DedupeKey: in.DedupeKey,
+		Payload:   in.Payload,
+	})
+	return created, err
+}
+
+// coverageRepairDedupeKey derives the dedupe key of the next design.requirement
+// generation for one requirement version, or "" when a generation must not be
+// requested: a previous generation is still in flight, a retryable failure is
+// queued for a retry, or the bounded generation budget is exhausted. The first
+// generation keeps the base key; later generations append ":repair:<n>", so the
+// static key of a terminal item can never block the repair.
+func coverageRepairDedupeKey(items []agent.WorkItem, baseKey string, requirementVersionID int64) string {
+	if requirementVersionID <= 0 {
+		return ""
+	}
+	generation := 0
+	for _, item := range items {
+		if agentapp.WorkTypeForItem(item) != designapp.TaskTypeDesignRequirement {
+			continue
+		}
+		payload, err := agentapp.ParseWorkItemPayload(item.Payload)
+		if err != nil || payload.RequirementVersionID != requirementVersionID {
+			continue
+		}
+		switch item.Status {
+		case agent.WorkItemOpen, agent.WorkItemClaimed, agent.WorkItemRunning, agent.WorkItemWaitingHuman:
+			return ""
+		case agent.WorkItemFailed:
+			// A failed item below its attempt cap is retried by the queue; a new
+			// generation would duplicate that retry.
+			if item.Attempts < item.MaxAttempts {
+				return ""
+			}
+		}
+		generation++
+	}
+	if generation >= maxDesignRequirementGenerations {
+		return ""
+	}
+	if generation == 0 {
+		return baseKey
+	}
+	return fmt.Sprintf("%s:repair:%d", baseKey, generation)
 }
 
 // designConversationCreator creates the auto-design conversation through the

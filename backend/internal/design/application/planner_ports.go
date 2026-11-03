@@ -34,6 +34,13 @@ type TaskInput struct {
 // (version_id, type, dedupe_key); callers treat enqueue as best effort.
 type TaskEnqueuer interface {
 	Ensure(ctx context.Context, in TaskInput) (bool, error)
+	// EnsureCoverageRepair ensures one fresh design.requirement generation for a
+	// requirement version that is still uncovered. in.DedupeKey is the base key
+	// of the first generation; the adapter derives a new generation key while
+	// the previous generation is terminal, never duplicates an in-flight
+	// generation, and enforces the bounded repair budget so a persistently
+	// failing model cannot stampede the queue (Task 70).
+	EnsureCoverageRepair(ctx context.Context, in TaskInput, requirementVersionID int64) (bool, error)
 }
 
 // ConversationCreator creates the auto-design conversation. main adapts it to

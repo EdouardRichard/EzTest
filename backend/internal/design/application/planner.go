@@ -115,7 +115,7 @@ func (p *Planner) StartRound(ctx context.Context, versionID, conversationID, act
 		if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", conversationID, round.ID); err != nil {
+		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
 		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
@@ -224,7 +224,7 @@ func (p *Planner) StartStageRound(ctx context.Context, versionID int64, requeste
 		if err := p.ensureRequirementTasks(ctx, versionID, pending, "requirement_confirmed", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", conversationID, round.ID); err != nil {
+		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
 		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
@@ -539,6 +539,44 @@ func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, r
 			DedupeKey: fmt.Sprintf("design:%d:%d", requirement.ID, requirement.CurrentVersionID),
 			Payload:   payload,
 		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureCoverageRepairTasks re-triggers the case-author work for requirements
+// that are still uncovered (or stale) after their previous design.requirement
+// task finished. The port derives a fresh generation key from the base key, so a
+// terminal "done but produced no cases" item no longer blocks the next attempt;
+// the adapter still refuses to duplicate an in-flight generation and bounds the
+// number of repair generations (Task 70).
+func (p *Planner) ensureCoverageRepairTasks(ctx context.Context, versionID int64, requirements []design.RequirementRef, conversationID, roundID int64) error {
+	if p.enqueuer == nil {
+		return nil
+	}
+	for _, requirement := range requirements {
+		if requirement.CurrentVersionID <= 0 {
+			continue
+		}
+		payload := map[string]any{
+			"requirement_id":         platformid.Format(requirement.ID),
+			"requirement_version_id": platformid.Format(requirement.CurrentVersionID),
+			"reason":                 "coverage_repair",
+		}
+		if conversationID > 0 {
+			payload["conversation_id"] = platformid.Format(conversationID)
+		}
+		if roundID > 0 {
+			payload["round_id"] = platformid.Format(roundID)
+		}
+		if _, err := p.enqueuer.EnsureCoverageRepair(ctx, TaskInput{
+			VersionID: versionID,
+			Team:      TeamDesign,
+			Type:      TaskTypeDesignRequirement,
+			DedupeKey: fmt.Sprintf("design:%d:%d", requirement.ID, requirement.CurrentVersionID),
+			Payload:   payload,
+		}, requirement.CurrentVersionID); err != nil {
 			return err
 		}
 	}
