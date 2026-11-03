@@ -3,7 +3,9 @@ package versionapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -616,6 +618,60 @@ func TestVersionWorkItemsRead(t *testing.T) {
 		if len(workItems.getScopes) != 0 {
 			t.Fatalf("work-item read for an invalid id")
 		}
+	})
+}
+
+func TestVersionReadServiceErrors(t *testing.T) {
+	boom := errors.New("boom")
+	paths := []string{
+		"/api/versions/7/facts",
+		"/api/versions/7/plan-items",
+		"/api/versions/7/work-items",
+		"/api/versions/7/work-items/401",
+	}
+	assertInternal := func(t *testing.T, path string, recorder *httptest.ResponseRecorder) {
+		t.Helper()
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf("GET %s status = %d, want 500: %s", path, recorder.Code, recorder.Body.String())
+		}
+		if errorBody(t, recorder)["code"] != "internal" {
+			t.Fatalf("GET %s error = %#v, want internal", path, errorBody(t, recorder))
+		}
+		if payload := decodeBody(t, recorder); payload["data"] != nil {
+			t.Fatalf("GET %s leaked data on error: %#v", path, payload["data"])
+		}
+	}
+
+	t.Run("version existence probe error fails every route closed", func(t *testing.T) {
+		for _, path := range paths {
+			mux, versions, _ := newVersionReadServer(t)
+			versions.existsErr = boom
+			assertInternal(t, path, call(t, mux, http.MethodGet, path, "", nil))
+		}
+	})
+
+	t.Run("fact read error is a 500", func(t *testing.T) {
+		mux, versions, _ := newVersionReadServer(t)
+		versions.factsErr = boom
+		assertInternal(t, "/api/versions/7/facts", call(t, mux, http.MethodGet, "/api/versions/7/facts", "", nil))
+	})
+
+	t.Run("plan-item read error is a 500", func(t *testing.T) {
+		mux, versions, _ := newVersionReadServer(t)
+		versions.planErr = boom
+		assertInternal(t, "/api/versions/7/plan-items", call(t, mux, http.MethodGet, "/api/versions/7/plan-items", "", nil))
+	})
+
+	t.Run("work-item list error is a 500", func(t *testing.T) {
+		mux, _, workItems := newVersionReadServer(t)
+		workItems.listErr = boom
+		assertInternal(t, "/api/versions/7/work-items", call(t, mux, http.MethodGet, "/api/versions/7/work-items", "", nil))
+	})
+
+	t.Run("work-item get error is a 500", func(t *testing.T) {
+		mux, _, workItems := newVersionReadServer(t)
+		workItems.getErr = boom
+		assertInternal(t, "/api/versions/7/work-items/401", call(t, mux, http.MethodGet, "/api/versions/7/work-items/401", "", nil))
 	})
 }
 

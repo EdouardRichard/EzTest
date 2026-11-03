@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -91,8 +92,7 @@ func (h *VersionReadHandler) Facts(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	limit := pagination.Limit(query.Get("limit"), pagination.DefaultLimit, pagination.MaxLimit)
-	before, err := parseReadCursor(query.Get("cursor"))
+	before, limit, err := parseReadPage(query)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -114,11 +114,7 @@ func (h *VersionReadHandler) Facts(w http.ResponseWriter, r *http.Request) {
 	for _, view := range views {
 		items = append(items, toFactReadDTO(view))
 	}
-	nextCursor := ""
-	if hasMore && len(views) > 0 {
-		nextCursor = formatDecimal(views[len(views)-1].ID)
-	}
-	httpx.List(w, http.StatusOK, items, nextCursor, hasMore)
+	httpx.List(w, http.StatusOK, items, nextReadCursor(hasMore, lastReadID(views, factReadViewID)), hasMore)
 }
 
 // PlanItems GET /api/versions/{id}/plan-items?status=&cursor=&limit=. Each item
@@ -130,8 +126,7 @@ func (h *VersionReadHandler) PlanItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
-	limit := pagination.Limit(query.Get("limit"), pagination.DefaultLimit, pagination.MaxLimit)
-	before, err := parseReadCursor(query.Get("cursor"))
+	before, limit, err := parseReadPage(query)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -152,11 +147,7 @@ func (h *VersionReadHandler) PlanItems(w http.ResponseWriter, r *http.Request) {
 	for _, view := range views {
 		items = append(items, toPlanItemReadDTO(view))
 	}
-	nextCursor := ""
-	if hasMore && len(views) > 0 {
-		nextCursor = formatDecimal(views[len(views)-1].ID)
-	}
-	httpx.List(w, http.StatusOK, items, nextCursor, hasMore)
+	httpx.List(w, http.StatusOK, items, nextReadCursor(hasMore, lastReadID(views, planItemReadViewID)), hasMore)
 }
 
 // ListWorkItems GET /api/versions/{id}/work-items?kind=&state=&created_by=&cursor=&limit=.
@@ -173,8 +164,7 @@ func (h *VersionReadHandler) ListWorkItems(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	query := r.URL.Query()
-	limit := pagination.Limit(query.Get("limit"), pagination.DefaultLimit, pagination.MaxLimit)
-	before, err := parseReadCursor(query.Get("cursor"))
+	before, limit, err := parseReadPage(query)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -203,11 +193,7 @@ func (h *VersionReadHandler) ListWorkItems(w http.ResponseWriter, r *http.Reques
 	for _, view := range views {
 		items = append(items, toWorkItemReadDTO(view))
 	}
-	nextCursor := ""
-	if hasMore && len(views) > 0 {
-		nextCursor = formatDecimal(views[len(views)-1].ID)
-	}
-	httpx.List(w, http.StatusOK, items, nextCursor, hasMore)
+	httpx.List(w, http.StatusOK, items, nextReadCursor(hasMore, lastReadID(views, workItemReadViewID)), hasMore)
 }
 
 // GetWorkItem GET /api/versions/{id}/work-items/{workItemId}. A work item of
@@ -291,6 +277,39 @@ func parseReadCursor(raw string) (*int64, error) {
 	}
 	return &value, nil
 }
+
+// parseReadPage parses the frozen Limit/Cursor pair shared by the three list
+// routes, so the bounds and their typed 400 live in one place.
+func parseReadPage(query url.Values) (*int64, int, error) {
+	before, err := parseReadCursor(query.Get("cursor"))
+	if err != nil {
+		return nil, 0, err
+	}
+	return before, pagination.Limit(query.Get("limit"), pagination.DefaultLimit, pagination.MaxLimit), nil
+}
+
+// nextReadCursor renders the frozen next_cursor: the id of the previous page's
+// last entity when has_more is set, empty otherwise.
+func nextReadCursor(hasMore bool, lastID int64) string {
+	if !hasMore || lastID == 0 {
+		return ""
+	}
+	return formatDecimal(lastID)
+}
+
+// lastReadID returns the id of a page's last entity, 0 for an empty page.
+func lastReadID[T any](views []T, id func(T) int64) int64 {
+	if len(views) == 0 {
+		return 0
+	}
+	return id(views[len(views)-1])
+}
+
+func factReadViewID(view versionapp.FactReadView) int64 { return view.ID }
+
+func planItemReadViewID(view versionapp.PlanItemReadView) int64 { return view.ID }
+
+func workItemReadViewID(view agentapp.WorkItemReadView) int64 { return view.ID }
 
 // ---------- DTOs ----------
 

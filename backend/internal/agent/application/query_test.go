@@ -397,3 +397,38 @@ func TestVersionWorkItemsRead(t *testing.T) {
 		}
 	})
 }
+
+// TestVersionWorkItemsDeadProjection pins the projection the state=failed SQL
+// hint has to match: a stored dead row is reported as failed (the frozen enum
+// has no dead), a stored failed row carrying the Task 46 cancel marker is
+// reported as cancelled, and a dead row that still carries the marker stays
+// failed because the marker only reclassifies failed rows.
+func TestVersionWorkItemsDeadProjection(t *testing.T) {
+	cancelledReason := agentapp.JobCanceledReason
+	rows := []agent.WorkItem{
+		{ID: 451, VersionID: 7, Kind: agent.WorkItemKindExecuteBatch, Status: agent.WorkItemFailed},
+		{ID: 452, VersionID: 7, Kind: agent.WorkItemKindExecuteBatch, Status: agent.WorkItemDead},
+		{ID: 453, VersionID: 7, Kind: agent.WorkItemKindExecuteBatch, Status: agent.WorkItemFailed, LastError: &cancelledReason},
+		{ID: 454, VersionID: 7, Kind: agent.WorkItemKindExecuteBatch, Status: agent.WorkItemDead, LastError: &cancelledReason},
+	}
+	service := agentapp.NewQueryService(&fakeP6RetryReader{workItemRows: rows})
+
+	views, _, err := service.WorkItems(context.Background(), agentapp.WorkItemFilter{VersionID: 7})
+	if err != nil {
+		t.Fatalf("WorkItems: %v", err)
+	}
+	want := map[int64]string{
+		451: string(agent.WorkItemFailed),
+		452: string(agent.WorkItemFailed),
+		453: agentapp.JobStateCancelled,
+		454: string(agent.WorkItemFailed),
+	}
+	if len(views) != len(want) {
+		t.Fatalf("views = %d, want %d", len(views), len(want))
+	}
+	for _, view := range views {
+		if view.State != want[view.ID] {
+			t.Fatalf("view %d state = %q, want %q", view.ID, view.State, want[view.ID])
+		}
+	}
+}

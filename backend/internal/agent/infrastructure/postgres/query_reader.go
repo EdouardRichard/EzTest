@@ -98,8 +98,10 @@ func (r *QueryReader) ListDeadWorkItems(ctx context.Context, limit int) ([]agent
 // pre-0.2.1 claim path and are not part of the frozen WorkItemView enum. A
 // canceled row is stored failed with the cancel marker; the cancelled/failed
 // state filters translate that marker so the API state and the stored status
-// never disagree. The reader fetches limit+1 rows so the application can report
-// has_more without a COUNT query.
+// never disagree. The marker only reclassifies failed rows: every dead row
+// projects as failed (the contract enum has no dead), so the failed filter must
+// include dead regardless of its last_error. The reader fetches limit+1 rows so
+// the application can report has_more without a COUNT query.
 func (r *QueryReader) ListWorkItems(ctx context.Context, query agentapp.WorkItemQuery) ([]agent.WorkItem, bool, error) {
 	if query.VersionID <= 0 {
 		return nil, false, fmt.Errorf("list work items: version id must be positive")
@@ -116,7 +118,10 @@ func (r *QueryReader) ListWorkItems(ctx context.Context, query agentapp.WorkItem
 		  AND (
 		        $3 = ''
 		     OR ($3 = 'cancelled' AND status = 'failed' AND last_error IS NOT DISTINCT FROM $6)
-		     OR ($3 = 'failed' AND status = 'failed' AND last_error IS DISTINCT FROM $6)
+		     OR ($3 = 'failed' AND (
+		             status = 'dead'
+		          OR (status = 'failed' AND last_error IS DISTINCT FROM $6)
+		        ))
 		     OR ($3 NOT IN ('cancelled', 'failed') AND status = $3)
 		  )
 		  AND ($4 = '' OR created_by = $4)
