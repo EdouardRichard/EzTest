@@ -138,6 +138,9 @@ func (r *fakeJobControlRepo) RetryJob(_ context.Context, versionID, id int64, no
 	item.ClaimedBy = nil
 	item.LeaseUntil = nil
 	item.LastError = nil
+	// A user-initiated retry grants a fresh attempt budget: attempts goes back
+	// to 0 while max_attempts is preserved. This mirrors the PostgreSQL adapter.
+	item.Attempts = 0
 	item.AvailableAt = now
 	item.UpdatedAt = now
 	r.items[id] = item
@@ -344,8 +347,8 @@ func TestJobCancelPendingRunning(t *testing.T) {
 			}
 
 			events := fixture.publishedEvents()
-			if len(events) != 1 {
-				t.Fatalf("events = %d, want 1: %#v", len(events), events)
+			if len(events) != 2 {
+				t.Fatalf("events = %d, want 2 (job.canceled + exactly one job.finished): %#v", len(events), events)
 			}
 			event := events[0]
 			if event.Type != "job.canceled" || event.Channel != "version:10" {
@@ -360,6 +363,47 @@ func TestJobCancelPendingRunning(t *testing.T) {
 			}
 			if event.ActorID == nil || *event.ActorID != 71 {
 				t.Fatalf("event actor = %v, want 71", event.ActorID)
+			}
+
+			// Task 46 fix round 1: the contract terminal event is
+			// job.finished{status:"cancelled"}, emitted once after the
+			// actor-facing job.canceled event.
+			finished := events[1]
+			if finished.Type != eventingapp.EventJobFinished || finished.Channel != "version:10" {
+				t.Fatalf("terminal event = %#v, want job.finished on version:10", finished)
+			}
+			if finished.Scope["version_id"] != "10" || finished.Scope["job_id"] != "501" {
+				t.Fatalf("terminal scope = %#v", finished.Scope)
+			}
+			wantFinished := map[string]any{
+				"job_id":     "501",
+				"kind":       before.Kind,
+				"status":     eventingapp.JobStatusCancelled,
+				"result_ref": "",
+			}
+			for field, want := range wantFinished {
+				if got := finished.Payload[field]; got != want {
+					t.Fatalf("terminal payload[%q] = %#v, want %#v (payload %#v)",
+						field, got, want, finished.Payload)
+				}
+			}
+			if _, present := finished.Payload["error"]; present {
+				t.Fatalf("cancel terminal event carries an error: %#v", finished.Payload)
+			}
+
+			// Exactly once: a repeated cancel is rejected and must not emit a
+			// second terminal event.
+			if _, err := fixture.service.Cancel(context.Background(), 71, before.VersionID, before.ID); err == nil {
+				t.Fatal("second Cancel succeeded, want a state conflict")
+			}
+			finishedCount := 0
+			for _, published := range fixture.publishedEvents() {
+				if published.Type == eventingapp.EventJobFinished {
+					finishedCount++
+				}
+			}
+			if finishedCount != 1 {
+				t.Fatalf("job.finished count after repeated cancel = %d, want exactly 1", finishedCount)
 			}
 		})
 	}
@@ -413,8 +457,8 @@ func TestJobRetryFailedOnly(t *testing.T) {
 		if view.JobID != before.ID || view.VersionID != before.VersionID || view.Kind != before.Kind {
 			t.Fatalf("view = %#v", view)
 		}
-		if view.Attempts != before.Attempts || view.MaxAttempts != before.MaxAttempts {
-			t.Fatalf("view attempts = %d/%d, want %d/%d", view.Attempts, view.MaxAttempts, before.Attempts, before.MaxAttempts)
+		if view.Attempts != 0 || view.MaxAttempts != before.MaxAttempts {
+			t.Fatalf("view attempts = %d/%d, want a fresh budget 0/%d", view.Attempts, view.MaxAttempts, before.MaxAttempts)
 		}
 		if !view.UpdatedAt.Equal(jobTestNow) {
 			t.Fatalf("view updated_at = %s, want %s", view.UpdatedAt, jobTestNow)
@@ -433,8 +477,14 @@ func TestJobRetryFailedOnly(t *testing.T) {
 		if !stored.AvailableAt.Equal(jobTestNow) || !stored.UpdatedAt.Equal(jobTestNow) {
 			t.Fatalf("stored timestamps = available %s updated %s, want %s", stored.AvailableAt, stored.UpdatedAt, jobTestNow)
 		}
-		if stored.Attempts != before.Attempts {
-			t.Fatalf("stored attempts = %d, want remaining budget %d (retry must not reset attempts)", stored.Attempts, before.Attempts)
+		// Task 46 fix round 1: a user-initiated retry resets attempts to 0 (a
+		// fresh budget) while keeping max_attempts. The automatic dispatcher
+		// retry consumes attempts; this explicit user action takes precedence.
+		if stored.Attempts != 0 {
+			t.Fatalf("stored attempts = %d, want 0 (user retry resets to a fresh budget)", stored.Attempts)
+		}
+		if stored.MaxAttempts != before.MaxAttempts {
+			t.Fatalf("stored max_attempts = %d, want %d preserved", stored.MaxAttempts, before.MaxAttempts)
 		}
 
 		// No automatic model switch: the retry only touches lifecycle columns,

@@ -152,9 +152,11 @@ func (r *WorkItemRepository) CancelJob(
 }
 
 // RetryJob atomically re-opens one failed work item below its attempt cap:
-// status open, lease cleared, last_error cleared, available_at=now. The
-// attempt count is preserved (a manual retry consumes the remaining budget),
-// and nothing else about the job changes (no automatic model switch).
+// status open, lease cleared, last_error cleared, available_at=now and attempts
+// reset to 0. The reset grants the user-initiated retry a fresh attempt budget;
+// max_attempts is preserved, and the dispatcher retry path (ClaimWorkItem)
+// consumes that new budget from 0. Nothing else about the job changes (no
+// automatic model switch).
 //
 // A missing/foreign row is agent.ErrNotFound; a non-failed row or an exhausted
 // budget is agent.ErrConflict.
@@ -200,6 +202,7 @@ func (r *WorkItemRepository) RetryJob(
 	updated, err := scanWorkItem(tx.QueryRow(ctx, `
 		UPDATE work_item
 		SET status = 'open',
+		    attempts = 0,
 		    claimed_by = NULL,
 		    lease_until = NULL,
 		    last_error = NULL,

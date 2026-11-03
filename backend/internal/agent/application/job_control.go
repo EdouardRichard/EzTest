@@ -8,16 +8,21 @@ package agentapp
 //     schema has no 'cancelled' status, so a canceled job is persisted as
 //     failed with the attempt budget exhausted (the same terminal shape
 //     ClaimWorkItem already uses at the attempt cap) and LastError set to
-//     JobCanceledReason. The API projection reports state=cancelled.
+//     JobCanceledReason. The API projection reports state=cancelled, and the
+//     service publishes the contract terminal event job.finished{status:
+//     cancelled} exactly once after the actor-facing job.canceled event.
 //   - Retry: failed jobs below max_attempts only. The row returns to open with
-//     available_at=now and the lease cleared. The attempt count is deliberately
-//     NOT reset: the retry consumes the remaining budget, so a job can never be
-//     retried forever. The model/inputs/budget are never touched (no automatic
+//     available_at=now and the lease cleared, and attempts is reset to 0: a
+//     user-initiated retry grants a fresh attempt budget while keeping
+//     max_attempts. This takes precedence over the automatic dispatcher retry
+//     (ClaimWorkItem), which consumes attempts; the explicit user action starts
+//     a new budget. The model/inputs/budget are never touched (no automatic
 //     model switch).
 //
-// Every accepted action records one audit entry and publishes one
-// version-channel event (job.canceled / job.requeued). Both are best effort:
-// a failed audit or publish never rolls back the lifecycle write.
+// Every accepted action records one audit entry and publishes its
+// version-channel event (job.canceled / job.requeued, plus the terminal
+// job.finished for a cancel). They are best effort: a failed audit or publish
+// never rolls back the lifecycle write.
 //
 // Ownership is version-scoped: a caller that addresses a job through a version
 // gets not_found for a row owned by another version, and the service re-checks
@@ -74,11 +79,15 @@ type JobControlRepository interface {
 	// status failed, lease cleared, lease_epoch incremented (fencing the old
 	// owner), attempts set to max_attempts, available_at/updated_at set to now,
 	// last_error set to reason, and the active attempt closed. leaseEpoch is
-	// the epoch read by GetJob.
+	// the epoch read by GetJob. The exhausted attempts value is the
+	// no-migration marker of a canceled row: retry-rate and todo queries must
+	// exclude it (see the PostgreSQL QueryReader's cancel-marker predicate).
 	CancelJob(ctx context.Context, versionID, id, leaseEpoch int64, reason string, now time.Time) (agent.WorkItem, error)
 	// RetryJob atomically re-opens a failed item below max_attempts:
 	// status open, lease cleared, last_error cleared, available_at and
-	// updated_at set to now. The attempt count is preserved.
+	// updated_at set to now, and attempts reset to 0 (a user-initiated retry
+	// grants a fresh budget). max_attempts and the contract inputs are
+	// preserved.
 	RetryJob(ctx context.Context, versionID, id int64, now time.Time) (agent.WorkItem, error)
 }
 
@@ -148,6 +157,10 @@ func (s *JobControl) Cancel(ctx context.Context, actorID, versionID, jobID int64
 	}
 	s.record(ctx, ActionJobCanceled, actorID, item, updated)
 	s.publish(ctx, EventJobCanceled, actorID, updated, JobStateCancelled)
+	// The terminal contract event follows the actor-facing cancel event. The
+	// stored status is failed (no cancelled value in the frozen schema), so the
+	// projected cancelled state is passed explicitly.
+	s.publishFinished(ctx, updated)
 	return jobControlView(updated), nil
 }
 
@@ -317,5 +330,24 @@ func (s *JobControl) publish(ctx context.Context, eventType string, actorID int6
 		},
 		ActorID:   actor,
 		RequestID: requestid.From(ctx),
+	})
+}
+
+// publishFinished emits the one-time contract terminal event of a cancel
+// (job.finished{status:"cancelled"}, events.md §18.1/§18.2 #4). It goes through
+// eventingapp.PublishJobFinished — the single place that enforces the
+// job.finished payload shape (job_id/kind/status/result_ref) — so the UI's
+// terminal state comes from the same producer task as a normally finished job.
+// A canceled row is stored failed for the no-migration compromise, so the raw
+// column value must never be used here. Best effort like every job event: a
+// failed publish never rolls back the cancel.
+func (s *JobControl) publishFinished(ctx context.Context, item agent.WorkItem) {
+	if s == nil || s.events == nil || item.VersionID <= 0 || item.ID <= 0 {
+		return
+	}
+	_ = eventingapp.PublishJobFinished(ctx, s.events, item.VersionID, eventingapp.JobFinished{
+		JobID:  item.ID,
+		Kind:   item.Kind,
+		Status: eventingapp.JobStatusCancelled,
 	})
 }
