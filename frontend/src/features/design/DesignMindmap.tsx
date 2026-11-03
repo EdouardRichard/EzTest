@@ -44,6 +44,23 @@ const NODE_TYPES = {
 /** Throttle window for search-driven fitView calls (spec §9.3). */
 const FIT_VIEW_THROTTLE_MS = 250
 
+/**
+ * Minimum zoom for automatic fits. A design graph stacks every case in one
+ * column (~150px per row), so a 10-case graph is ~2,500px tall while the
+ * inline canvas is only a few hundred pixels high. Fitting it to the default
+ * 0.2 min zoom renders 60px-wide cards and leaves most of them outside the
+ * canvas, which reads as an empty mindmap. Automatic fits therefore stop at a
+ * readable zoom; the explicit 适应 control still offers the whole-graph fit.
+ */
+const READABLE_FIT_MIN_ZOOM = 0.6
+
+/**
+ * Mount viewport. The inline canvas is scrollable/pannable, so starting at a
+ * readable zoom over the graph origin is more useful than a microscopic
+ * whole-graph fit; users can press 适应 for the overview.
+ */
+const READABLE_DEFAULT_VIEWPORT = { x: 16, y: 16, zoom: 0.8 } as const
+
 /** Case-status card tint; the arbitrary variant reaches the card inside the node. */
 const STATUS_NODE_CLASS: Record<Exclude<CaseVersionStatus, "superseded">, string> = {
   draft: "case-status-draft [&>div]:border-info/60 [&>div]:bg-info/5",
@@ -190,7 +207,11 @@ function MindmapCanvas({
     const first = requestAnimationFrame(() => {
       second = requestAnimationFrame(() => {
         second = null
-        void fitViewRef.current({ padding: 0.2, duration: 250 })
+        void fitViewRef.current({
+          padding: 0.2,
+          minZoom: READABLE_FIT_MIN_ZOOM,
+          duration: 250,
+        })
       })
     })
     return () => {
@@ -205,6 +226,7 @@ function MindmapCanvas({
       void fitViewRef.current({
         nodes: ids.map((id) => ({ id })),
         padding: 0.2,
+        minZoom: READABLE_FIT_MIN_ZOOM,
         duration: 250,
       })
     }
@@ -428,8 +450,7 @@ function MindmapCanvas({
               nodes={nodes}
               edges={edges}
               nodeTypes={NODE_TYPES}
-              fitView
-              fitViewOptions={{ padding: 0.2 }}
+              defaultViewport={READABLE_DEFAULT_VIEWPORT}
               minZoom={0.2}
               nodesDraggable={false}
               nodesConnectable={false}

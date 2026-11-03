@@ -91,6 +91,7 @@ async function renderWorkspace() {
   await screen.findByTestId("design-mindmap")
   return {
     root: screen.getByTestId("design-tab"),
+    scroll: screen.getByTestId("design-layers-scroll"),
     layers: screen.getByTestId("design-layers"),
     chat: screen.getByTestId("design-layer-chat"),
     mindmap: screen.getByTestId("design-layer-mindmap"),
@@ -130,7 +131,10 @@ describe("DesignTab three-layer layout", () => {
     mockWorkspace()
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
 
   it("stacks chat, mindmap and detail in DOM order", async () => {
     const { layers } = await renderWorkspace()
@@ -210,20 +214,60 @@ describe("DesignTab three-layer layout", () => {
   })
 
   it("caps the workspace to the viewport and scrolls inside each layer", async () => {
-    const { root, layers, chat, mindmap, detail } = await renderWorkspace()
+    const { root, scroll, chat, mindmap, detail } = await renderWorkspace()
 
     await waitFor(() => expect(root.style.height).toMatch(/^\d+px$/))
     const available = window.innerHeight - root.getBoundingClientRect().top - PAGE_BOTTOM_INSET
     expect(root.style.height).toBe(`${available}px`)
     expect(root).toHaveClass("overflow-hidden")
     expect(root.className).not.toMatch(/(?:^|\s)space-y-/)
-    expect(layers).toHaveClass("flex-1")
-    expect(layers).toHaveClass("min-h-0")
+    expect(scroll).toHaveClass("flex-1")
+    expect(scroll).toHaveClass("min-h-0")
+    expect(scroll).toHaveClass("overflow-y-auto")
 
     for (const layer of [chat, mindmap, detail]) {
       expect(layer).toHaveClass("overflow-auto")
       expect(layer).toHaveClass("min-h-0")
     }
+  })
+
+  it("keeps the three panes usable and scrolls the stacked workspace on a short viewport", async () => {
+    const { scroll, layers, chat, mindmap, detail } = await renderWorkspace()
+
+    // A 1422x904 viewport leaves ~450px for the layers: split 35/40/25 that is
+    // a 32px message list and a ~54px graph canvas. The track grows to a
+    // usable minimum and the scroll container above it moves between panes.
+    expect(layers.style.height).toBe("max(100%, 1000px)")
+    expect(scroll).toHaveClass("overflow-y-auto")
+    expect(scroll.contains(layers)).toBe(true)
+
+    expect(parseFloat(chat.style.flexBasis)).toBe(35)
+    expect(parseFloat(mindmap.style.flexBasis)).toBe(40)
+    expect(parseFloat(detail.style.flexBasis)).toBe(25)
+  })
+
+  it("uses the whole enlarged focus body instead of the inline minimum", async () => {
+    const { layers } = await renderWorkspace()
+
+    fireEvent.click(screen.getByTestId("design-mindmap-expand"))
+
+    // The focus dialog already provides enough height for the 65/35 split; a
+    // fixed 1000px track would leave it scrolled inside the dialog.
+    expect(layers.style.height).toBe("100%")
+  })
+
+  it("starts with the chat collapsed on a short viewport so the mindmap is visible", async () => {
+    // A 560px viewport leaves ~510px below the version header: expanded, that
+    // is the same blank 30px thread the user reported.
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(560)
+
+    const { chat, mindmap } = await renderWorkspace()
+
+    await waitFor(() => expect(chat).toHaveAttribute("data-collapsed", "true"))
+    expect(chat.style.flexBasis).toBe("auto")
+    // The input bar stays available; expanding it is one click away.
+    expect(screen.getByTestId("composer-textarea")).toBeInTheDocument()
+    expect(mindmap.style.flexGrow).toBe("1")
   })
 
   it("keeps the mobile DOM order unchanged", async () => {
