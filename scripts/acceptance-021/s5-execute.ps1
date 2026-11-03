@@ -45,7 +45,10 @@ param(
     [string] $VersionId = "",
     [string] $StatePath = "",
     [int] $ExecutionTimeoutSeconds = 240,
-    [int] $PauseProbeSeconds = 25
+    [int] $PauseProbeSeconds = 25,
+    # Task 111: the runner passes the resolved small-input P0 IDs so S5 proves
+    # the confirmed selection really includes every expected requirement.
+    [string] $ExpectedFrIds = ""
 )
 
 Set-StrictMode -Version 3.0
@@ -70,6 +73,7 @@ $state = Read-AcceptanceState -Path $statePath
 $exitCode = 2
 $versionId = $VersionId
 if ([string]::IsNullOrWhiteSpace($versionId) -and $state.ContainsKey("version_id")) { $versionId = [string]$state["version_id"] }
+$expectedSutIds = @(Get-AcceptanceExpectedSutIds -ExpectedFrIds $ExpectedFrIds -State $state)
 
 function Write-S5Evidence {
     param([string] $Name, $Value, [string] $Kind = "api", [string] $Note = "")
@@ -105,6 +109,7 @@ try {
             # ------------------------------------------------------------------
             # Confirmed cases and the starting execution state.
             # ------------------------------------------------------------------
+            $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
             $graph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
             $cards = @(Get-AcceptanceCaseCards -Graph $graph)
             $confirmedCards = @($cards | Where-Object { $_.status -eq "confirmed" })
@@ -126,11 +131,23 @@ try {
                 confirmed_case_ids = @($confirmedCards | ForEach-Object { $_.case_id })
                 confirmed_case_versions = $confirmedCaseVersions
             }) -Note "confirmed selection entering S5")
+            # Task 111: a confirmed selection that only contains FR-011 cases
+            # would execute 1/3 of the small-input requirements (retry-9) and
+            # report execution coverage of 1/3. Fail loudly instead of executing
+            # a partial sample that the report then has to caveat.
+            if ($expectedSutIds.Count -gt 0) {
+                $confirmedCoverage = Get-AcceptanceP0CaseCoverage -ExpectedFrIds $expectedSutIds -Requirements $requirements -CaseCards $confirmedCards
+                [void](Write-S5Evidence -Name "confirmed-requirement-coverage.json" -Value $confirmedCoverage -Kind "coverage" -Note "confirmed selection -> P0 requirement coverage")
+                Add-AcceptanceCheck -Scenario $scenario -Name "confirmed selection covers the small-input requirements" `
+                    -Passed ($confirmedCoverage.Passed) -Severity assertion -Detail $confirmedCoverage.Detail
+                if (-not $confirmedCoverage.Passed) {
+                    $scenario.ErrorMessage = "S5 failed: the confirmed selection is missing $(@($confirmedCoverage.Missing) -join ','); those requirements would never be executed"
+                }
+            }
 
             # The completion worker may have closed every requirement after an
             # earlier execution. Retest needs an open requirement, so reopen the
             # closed requirements through the user API before driving a new wave.
-            $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
             $closedRequirements = @($requirements | Where-Object { [string](Get-JsonProp -Object $_ -Name 'status' -Default '') -eq 'closed' })
             $reopenRecords = @()
             foreach ($requirement in ($closedRequirements | Select-Object -First 6)) {

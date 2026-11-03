@@ -18,8 +18,8 @@ external prerequisite.
 | Database | PostgreSQL 17, **not bundled** (external) |
 
 EzTest 0.2 keeps runtime configuration in the database **settings center**
-(admin UI). The API only reads four startup environment variables; see
-section 4.
+(admin UI). The API reads four runtime environment variables; a fresh database
+additionally needs the first-start administrator credential. See section 4.
 
 ## Package layout
 
@@ -98,8 +98,9 @@ cd eztest-__VERSION__-windows-x64
 # 3. Start the API, executor, web UI and PDF renderer (waits for health):
 .\start-eztest.ps1
 
-# 4. Open http://localhost:6868 and sign in as admin / admin123.
-#    Change that password immediately in the UI (the seed is fixed).
+# 4. Open http://localhost:6868 and sign in as admin with the
+#    EZTEST_INITIAL_ADMIN_PASSWORD value from .env.
+#    Change that password immediately in the UI.
 
 # Optional: verify the whole stack (9 checks):
 .\smoke-test.ps1
@@ -123,8 +124,9 @@ bash init-config.sh --database-url "postgres://eztest:<db-password>@localhost:54
 # 4. Start the API, executor, web UI and PDF renderer (waits for health):
 bash start-eztest.sh
 
-# 5. Open http://localhost:6868 and sign in as admin / admin123, then change
-#    the password in the UI.
+# 5. Open http://localhost:6868, sign in as admin with the
+#    EZTEST_INITIAL_ADMIN_PASSWORD value from .env, then change the password
+#    in the UI.
 
 # Optional: verify the whole stack (9 checks):
 bash smoke-test.sh
@@ -147,16 +149,17 @@ script restores them for the bundled binaries and the Chromium executables).
 
 | Command | What it does |
 |---|---|
-| `init-config` | Creates `.env` (renders the package-root paths and the database URL). `-Force`/`--force` regenerates and backs up the old file. |
+| `init-config` | Creates `.env` (renders the package-root paths, the database URL and a random first-start administrator password). `-Force`/`--force` regenerates and backs up the old file. |
 | `start-eztest` | Preflights PostgreSQL/ports, creates `.data/`, starts API -> executor -> web -> renderer, waits for health, writes `run/*.pid` and `logs/*.log`. |
 | `status-eztest` | Prints processes, the five health probes and PostgreSQL reachability. Exits 0 only when healthy. |
 | `stop-eztest` | Stops web -> renderer -> executor (whole process tree/group, Chromium included) -> API. Leaves PostgreSQL and `.data/` untouched. |
 | `smoke-test` | Runs the 9 checks listed in section 9 against the running stack. |
 
-The administrator is the fixed first-start seed `admin` / `admin123`. It is
-created once on the first API start; change the password in the admin UI
-immediately and keep the admin email/credentials private. The scripts never
-print token values.
+The administrator `admin` is seeded once on the first API start with the
+`EZTEST_INITIAL_ADMIN_PASSWORD` value that `init-config` generated into `.env`;
+there is no built-in default. Change the password in the admin UI immediately
+after the first login and keep the credentials private. The scripts never print
+token or password values.
 
 ## 4. Configuration (`.env`)
 
@@ -165,8 +168,9 @@ placeholders with this package's absolute path and stores the database URL.
 
 **EzTest 0.2 has two configuration layers:**
 
-1. **The four API startup variables** (this is the complete list the Go API
-   reads; everything else in the environment is ignored by the API):
+1. **The four API runtime variables** (this is the complete list the Go API
+   reads for runtime configuration; everything else in the environment is
+   ignored by the API), plus one first-start credential:
 
    | Key | Meaning |
    |---|---|
@@ -174,6 +178,7 @@ placeholders with this package's absolute path and stores the database URL.
    | `EZTEST_API_PORT` | API HTTP port (default `13333`). |
    | `EZTEST_WEB_PORT` | Web UI port (default `6868`); the API derives its CORS origins from it. |
    | `EZTEST_EXECUTOR_PORT` | Executor port (default `13336`); the API seeds its executor URL from it on the first start. |
+   | `EZTEST_INITIAL_ADMIN_PASSWORD` | **Required while the user table is empty.** First-start administrator password (at least 8 characters); `init-config` generates a random value. No built-in default: startup fails if it is missing. |
 
 2. **The database settings center** (admin UI): storage/content paths,
    retention, LLM provider, agent budgets, executor/renderer URLs and tokens,
@@ -191,7 +196,7 @@ Other `.env` keys used by the package scripts:
 | `EZTEST_EXECUTOR_MAX_CONTEXTS` | Concurrent browser contexts (default 8; each busy context needs ~0.5-1 GB RAM). |
 | `EZTEST_EXEC_ALLOWED_HOSTS` | Executor-wide WebSocket allow list; add remote test-target hosts explicitly. |
 | `EZTEST_VISUAL_BASELINE_MAX_BYTES` | Visual baseline request cap. |
-| `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD` | Only used by `smoke-test` to log in. The API ignores them: the seed is `admin` / `admin123`. Update the password here after changing it in the UI. |
+| `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD` | Only used by `smoke-test` to log in. `init-config` sets both to the generated first-start password; update `EZTEST_ADMIN_PASSWORD` here after changing it in the UI. |
 | `PORT` / `HOSTNAME` | Web server port/bind (default `6868` / `127.0.0.1`); keep `PORT` equal to `EZTEST_WEB_PORT`. |
 | `PLAYWRIGHT_BROWSERS_PATH` | Rewritten by `init-config` to this package's `playwright-browsers/` (read by the executor and the renderer). |
 
@@ -286,7 +291,8 @@ sha256sum -c SHA256SUMS.txt
 3. `GET /api/health` returns 200, `db: ok` and the version from `VERSION`.
 4. PDF renderer `GET /healthz` returns 200 with `status: ok` and a browser
    version (proves the bundled Chromium launches for report rendering).
-5. Admin login with the `.env` seed (`admin`/`admin123`) returns 200 and
+5. Admin login with the `.env` smoke-test credential
+   (`EZTEST_ADMIN_PASSWORD`, generated by `init-config`) returns 200 and
    `GET /api/auth/me` returns the admin user.
 6. Executor `GET /healthz` returns 200 with `status: ok` and a `browserVersion`.
 7. Executor round-trip on the bundled web UI: create context, `goto
@@ -300,8 +306,9 @@ sha256sum -c SHA256SUMS.txt
 
 - Never expose `13333/13336/13337` publicly; the executor and renderer are
   loopback-only by default and authenticated by shared Bearer tokens.
-- The administrator seed `admin/admin123` is public knowledge: change the
-  password immediately after the first login.
+- The administrator password is generated into the owner-only `.env` by
+  `init-config` (key `EZTEST_INITIAL_ADMIN_PASSWORD`): change it immediately
+  after the first login and never share or commit `.env`.
 - The packages do not provide TLS, a reverse proxy, multi-tenancy or public
   object URLs. Put a TLS-terminating proxy in front of the web port if the UI
   is reachable beyond localhost, and keep PostgreSQL on a private interface.

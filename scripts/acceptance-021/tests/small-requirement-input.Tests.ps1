@@ -358,13 +358,28 @@ function Invoke-RunAllPreflight {
     )
     $output = @()
     $exit = 1
+    # Task 113: the runner now requires explicit acceptance credentials. These
+    # tests exercise the requirement-source preflight only, so supply throwaway
+    # test values without touching the stack and restore the caller's env.
+    $credentialNames = @("EZTEST_ADMIN_PASSWORD", "SUT_PASSWORD")
+    $savedCredentials = @{}
+    foreach ($name in $credentialNames) {
+        $savedCredentials[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        [Environment]::SetEnvironmentVariable($name, "preflight-test-credential", "Process")
+    }
     try {
-        $output = @(& powershell.exe @($baseArguments + @($Arguments)) 2>&1)
-        $exit = [int]$LASTEXITCODE
+        try {
+            $output = @(& powershell.exe @($baseArguments + @($Arguments)) 2>&1)
+            $exit = [int]$LASTEXITCODE
+        } finally {
+            $summary = $null
+            if (Test-Path -LiteralPath $summaryPath) {
+                try { $summary = Get-Content -LiteralPath $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $summary = $null }
+            }
+        }
     } finally {
-        $summary = $null
-        if (Test-Path -LiteralPath $summaryPath) {
-            try { $summary = Get-Content -LiteralPath $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { $summary = $null }
+        foreach ($name in $credentialNames) {
+            [Environment]::SetEnvironmentVariable($name, $savedCredentials[$name], "Process")
         }
     }
     return [pscustomobject]@{

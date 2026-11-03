@@ -20,6 +20,11 @@ import (
 
 const testRequestID = "req_0123456789abcdef"
 
+// testAdminPassword is the explicit test-only administrator password. The
+// product no longer ships a default, so tests configure it through
+// EZTEST_INITIAL_ADMIN_PASSWORD (or the fake repository directly).
+const testAdminPassword = "test-admin-password-113"
+
 var testNow = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
 type fixedClock struct{ at time.Time }
@@ -217,7 +222,7 @@ func (e *testEnv) seedAdmin(t *testing.T) identity.User {
 		ID:           e.ids.Next(),
 		Username:     identityapp.SeedAdminUsername,
 		DisplayName:  identityapp.SeedAdminDisplayName,
-		PasswordHash: "hash:" + identityapp.SeedAdminPassword,
+		PasswordHash: "hash:" + testAdminPassword,
 		Role:         identity.RoleAdmin,
 		Status:       identity.StatusActive,
 		CreatedAt:    testNow,
@@ -280,6 +285,7 @@ func eventWithAction(t *testing.T, audit *fakeAudit, action string) auditapp.Eve
 
 func TestEnsureSeedAdminCreatesAdminOnlyOnce(t *testing.T) {
 	env := newTestEnv(t)
+	t.Setenv("EZTEST_INITIAL_ADMIN_PASSWORD", testAdminPassword)
 	ctx := context.Background()
 
 	created, err := env.svc.EnsureSeedAdmin(ctx)
@@ -299,7 +305,7 @@ func TestEnsureSeedAdminCreatesAdminOnlyOnce(t *testing.T) {
 	if admin.Username != "admin" || admin.DisplayName != "管理员" || admin.Role != identity.RoleAdmin || admin.Status != identity.StatusActive {
 		t.Fatalf("admin = %#v", admin)
 	}
-	if admin.PasswordHash != "hash:admin123" {
+	if admin.PasswordHash != "hash:"+testAdminPassword {
 		t.Fatalf("password hash = %q", admin.PasswordHash)
 	}
 	if !admin.CreatedAt.Equal(testNow) || !admin.UpdatedAt.Equal(testNow) {
@@ -318,9 +324,73 @@ func TestEnsureSeedAdminCreatesAdminOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestEnsureSeedAdminRequiresInitialPasswordEnv(t *testing.T) {
+	env := newTestEnv(t)
+	t.Setenv("EZTEST_INITIAL_ADMIN_PASSWORD", "")
+	t.Setenv("EZTEST_ADMIN_PASSWORD", "")
+
+	created, err := env.svc.EnsureSeedAdmin(context.Background())
+	if err == nil {
+		t.Fatal("EnsureSeedAdmin succeeded without EZTEST_INITIAL_ADMIN_PASSWORD")
+	}
+	if !strings.Contains(err.Error(), "EZTEST_INITIAL_ADMIN_PASSWORD") {
+		t.Fatalf("error = %v, want it to name EZTEST_INITIAL_ADMIN_PASSWORD", err)
+	}
+	if created {
+		t.Fatal("EnsureSeedAdmin reported creation without a password")
+	}
+	if len(env.repo.users) != 0 {
+		t.Fatalf("users = %d, want 0", len(env.repo.users))
+	}
+}
+
+func TestEnsureSeedAdminUsesExplicitEnvPassword(t *testing.T) {
+	env := newTestEnv(t)
+	t.Setenv("EZTEST_INITIAL_ADMIN_PASSWORD", testAdminPassword)
+
+	created, err := env.svc.EnsureSeedAdmin(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureSeedAdmin: %v", err)
+	}
+	if !created {
+		t.Fatal("EnsureSeedAdmin did not report creation")
+	}
+	var admin identity.User
+	for _, user := range env.repo.users {
+		admin = user
+	}
+	if admin.PasswordHash != "hash:"+testAdminPassword {
+		t.Fatalf("password hash = %q, want the explicit env password", admin.PasswordHash)
+	}
+	if _, err := env.svc.Login(context.Background(), "admin", testAdminPassword, testRequestID, "", ""); err != nil {
+		t.Fatalf("login with the explicit env password: %v", err)
+	}
+}
+
+func TestEnsureSeedAdminHasNoLegacyPasswordFallback(t *testing.T) {
+	env := newTestEnv(t)
+	t.Setenv("EZTEST_INITIAL_ADMIN_PASSWORD", "")
+	t.Setenv("EZTEST_ADMIN_PASSWORD", "legacy-admin-password")
+
+	created, err := env.svc.EnsureSeedAdmin(context.Background())
+	if err == nil {
+		t.Fatal("EnsureSeedAdmin fell back to EZTEST_ADMIN_PASSWORD")
+	}
+	if !strings.Contains(err.Error(), "EZTEST_INITIAL_ADMIN_PASSWORD") {
+		t.Fatalf("error = %v, want it to name EZTEST_INITIAL_ADMIN_PASSWORD", err)
+	}
+	if created {
+		t.Fatal("EnsureSeedAdmin reported creation through a legacy fallback")
+	}
+	if len(env.repo.users) != 0 {
+		t.Fatalf("users = %d, want 0", len(env.repo.users))
+	}
+}
+
 func TestEnsureSeedAdminDoesNotOverwriteExistingUsers(t *testing.T) {
 	env := newTestEnv(t)
 	existing := env.seedUser(t, "qa01", "qa-password")
+	t.Setenv("EZTEST_INITIAL_ADMIN_PASSWORD", "")
 
 	created, err := env.svc.EnsureSeedAdmin(context.Background())
 	if err != nil {
@@ -342,7 +412,7 @@ func TestLoginReturnsOpaqueTokenAndAudits(t *testing.T) {
 	admin := env.seedAdmin(t)
 	ctx := context.Background()
 
-	session, err := env.svc.Login(ctx, "admin", "admin123", testRequestID, "192.0.2.5", "unit-test-agent")
+	session, err := env.svc.Login(ctx, "admin", testAdminPassword, testRequestID, "192.0.2.5", "unit-test-agent")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -456,7 +526,7 @@ func TestLoginFailuresAreRejectedAndAudited(t *testing.T) {
 func TestAuthenticateValidToken(t *testing.T) {
 	env := newTestEnv(t)
 	env.seedAdmin(t)
-	session, err := env.svc.Login(context.Background(), "admin", "admin123", testRequestID, "", "")
+	session, err := env.svc.Login(context.Background(), "admin", testAdminPassword, testRequestID, "", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -482,7 +552,7 @@ func TestAuthenticateRejectsInvalidTokens(t *testing.T) {
 		{
 			name: "expired token",
 			prepare: func(t *testing.T, env *testEnv) string {
-				session, err := env.svc.Login(context.Background(), "admin", "admin123", testRequestID, "", "")
+				session, err := env.svc.Login(context.Background(), "admin", testAdminPassword, testRequestID, "", "")
 				if err != nil {
 					t.Fatalf("Login: %v", err)
 				}
@@ -495,7 +565,7 @@ func TestAuthenticateRejectsInvalidTokens(t *testing.T) {
 		{
 			name: "disabled user",
 			prepare: func(t *testing.T, env *testEnv) string {
-				session, err := env.svc.Login(context.Background(), "admin", "admin123", testRequestID, "", "")
+				session, err := env.svc.Login(context.Background(), "admin", testAdminPassword, testRequestID, "", "")
 				if err != nil {
 					t.Fatalf("Login: %v", err)
 				}
@@ -520,7 +590,7 @@ func TestAuthenticateRejectsInvalidTokens(t *testing.T) {
 func TestLogoutDeletesCurrentTokenAndAudits(t *testing.T) {
 	env := newTestEnv(t)
 	admin := env.seedAdmin(t)
-	session, err := env.svc.Login(context.Background(), "admin", "admin123", testRequestID, "", "")
+	session, err := env.svc.Login(context.Background(), "admin", testAdminPassword, testRequestID, "", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -568,13 +638,13 @@ func TestChangePasswordUpdatesHashAndAudits(t *testing.T) {
 	env := newTestEnv(t)
 	admin := env.seedAdmin(t)
 
-	if err := env.svc.ChangePassword(context.Background(), admin.ID, "admin123", "new-password-1"); err != nil {
+	if err := env.svc.ChangePassword(context.Background(), admin.ID, testAdminPassword, "new-password-1"); err != nil {
 		t.Fatalf("ChangePassword: %v", err)
 	}
 	if got := env.repo.users[admin.ID].PasswordHash; got != "hash:new-password-1" {
 		t.Fatalf("password hash = %q", got)
 	}
-	if _, err := env.svc.Login(context.Background(), "admin", "admin123", testRequestID, "", ""); err == nil {
+	if _, err := env.svc.Login(context.Background(), "admin", testAdminPassword, testRequestID, "", ""); err == nil {
 		t.Fatal("old password still logs in")
 	}
 	if _, err := env.svc.Login(context.Background(), "admin", "new-password-1", testRequestID, "", ""); err != nil {
@@ -595,13 +665,13 @@ func TestPasswordLengthBounds(t *testing.T) {
 	ctx := context.Background()
 
 	short := strings.Repeat("a", identityapp.MinPasswordLength-1)
-	assertAPIError(t, env.svc.ChangePassword(ctx, admin.ID, "admin123", short), 400, "invalid_argument")
+	assertAPIError(t, env.svc.ChangePassword(ctx, admin.ID, testAdminPassword, short), 400, "invalid_argument")
 
 	long := strings.Repeat("a", identityapp.MaxPasswordLength+1)
-	assertAPIError(t, env.svc.ChangePassword(ctx, admin.ID, "admin123", long), 400, "invalid_argument")
+	assertAPIError(t, env.svc.ChangePassword(ctx, admin.ID, testAdminPassword, long), 400, "invalid_argument")
 
 	minimum := strings.Repeat("a", identityapp.MinPasswordLength)
-	if err := env.svc.ChangePassword(ctx, admin.ID, "admin123", minimum); err != nil {
+	if err := env.svc.ChangePassword(ctx, admin.ID, testAdminPassword, minimum); err != nil {
 		t.Fatalf("minimum password rejected: %v", err)
 	}
 	maximum := strings.Repeat("b", identityapp.MaxPasswordLength)
@@ -886,7 +956,7 @@ func TestAuditEventsNeverCarrySecrets(t *testing.T) {
 	admin := env.seedAdmin(t)
 	ctx := context.Background()
 
-	session, err := env.svc.Login(ctx, "admin", "admin123", testRequestID, "", "")
+	session, err := env.svc.Login(ctx, "admin", testAdminPassword, testRequestID, "", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -900,14 +970,14 @@ func TestAuditEventsNeverCarrySecrets(t *testing.T) {
 	if err := env.svc.ResetPassword(ctx, admin.ID, user.ID, "reset-password"); err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
-	if err := env.svc.ChangePassword(ctx, admin.ID, "admin123", "changed-password"); err != nil {
+	if err := env.svc.ChangePassword(ctx, admin.ID, testAdminPassword, "changed-password"); err != nil {
 		t.Fatalf("ChangePassword: %v", err)
 	}
 	if err := env.svc.Logout(ctx, session.Token); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
 
-	secrets := []string{"admin123", "qa-password", "reset-password", "changed-password", session.Token}
+	secrets := []string{testAdminPassword, "qa-password", "reset-password", "changed-password", session.Token}
 	for _, event := range env.audit.events {
 		for key := range event.Metadata {
 			lower := strings.ToLower(key)

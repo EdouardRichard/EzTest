@@ -81,6 +81,174 @@ function Get-AcceptanceCaseCards {
     return $cards
 }
 
+# ---------------------------------------------------------------------------
+# Design coverage / case selection gates (Task 111)
+# ---------------------------------------------------------------------------
+
+function Get-AcceptanceP0CaseCoverage {
+    <#
+        Deterministic small-input P0 design gate. It maps every design-graph
+        case card back to its requirement and that requirement to its FR/NFR ID
+        (the same title/description marker join the matrix uses), then requires
+        at least one case for every expected P0 ID. The gate fails closed when
+        the expected set is empty and names every missing ID, so a partially
+        generated design (the retry-9 1/3 snapshot) can never be recorded as a
+        pass.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $ExpectedFrIds = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $Requirements = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $CaseCards = @()
+    )
+    $requirementSutById = @{}
+    foreach ($requirement in @($Requirements)) {
+        $requirementId = [string](Get-JsonProp -Object $requirement -Name "id" -Default "")
+        if ($requirementId -eq "") { continue }
+        $requirementSutById[$requirementId] = [string](Get-RequirementSutId -Requirement $requirement)
+    }
+    $caseCountBySutId = @{}
+    $caseIdsBySutId = @{}
+    foreach ($card in @($CaseCards)) {
+        $requirementId = [string](Get-JsonProp -Object $card -Name "requirement_id" -Default "")
+        if (-not $requirementSutById.ContainsKey($requirementId)) { continue }
+        $sutId = [string]$requirementSutById[$requirementId]
+        if ($sutId -eq "") { continue }
+        if (-not $caseCountBySutId.ContainsKey($sutId)) {
+            $caseCountBySutId[$sutId] = 0
+            $caseIdsBySutId[$sutId] = @()
+        }
+        $caseCountBySutId[$sutId] = [int]$caseCountBySutId[$sutId] + 1
+        $caseIdsBySutId[$sutId] = @($caseIdsBySutId[$sutId]) + @([string](Get-JsonProp -Object $card -Name "case_id" -Default ""))
+    }
+    $expected = @($ExpectedFrIds | ForEach-Object { [string]$_ } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+    $covered = @($expected | Where-Object { $caseCountBySutId.ContainsKey($_) -and [int]($caseCountBySutId[$_]) -ge 1 })
+    $missing = @($expected | Where-Object { -not ($caseCountBySutId.ContainsKey($_) -and [int]($caseCountBySutId[$_]) -ge 1) })
+    $passed = ($expected.Count -gt 0 -and $missing.Count -eq 0)
+    $detail = if ($expected.Count -eq 0) {
+        "no expected P0 requirement set; the design coverage gate fails closed"
+    } else {
+        "p0_with_cases=$($covered.Count)/$($expected.Count) covered=$(($covered -join ',')) missing=$(($missing -join ','))"
+    }
+    return [pscustomobject]@{
+        Passed           = $passed
+        Expected         = @($expected)
+        Covered          = @($covered)
+        Missing          = @($missing)
+        CaseCountBySutId = $caseCountBySutId
+        CaseIdsBySutId   = $caseIdsBySutId
+        Detail           = $detail
+    }
+}
+
+function Get-AcceptanceExpectedSutIds {
+    <#
+        Resolves the expected small-input P0 set for S4/S5. An explicit
+        -ExpectedFrIds (passed by run-all) wins; a targeted standalone rerun
+        falls back to the small-input profile S2 stored in state.json, so FR-025
+        is still required even when only s4-confirm.ps1 / s5-execute.ps1 is
+        re-run. Legacy full-document runs return an empty set.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $ExpectedFrIds = "",
+        [Parameter(Mandatory = $false)] $State = $null
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedFrIds)) {
+        return @($ExpectedFrIds.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+    }
+    if ($null -eq $State) { return @() }
+    if ($State -is [System.Collections.IDictionary]) {
+        if (-not $State.Contains("requirement_input_mode")) { return @() }
+        if ([string]$State["requirement_input_mode"] -ne "small-input") { return @() }
+        if (-not $State.Contains("requirement_expected_fr_ids")) { return @() }
+        return @(@($State["requirement_expected_fr_ids"]) | ForEach-Object { [string]$_ } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+    }
+    $mode = [string](Get-JsonProp -Object $State -Name "requirement_input_mode" -Default "")
+    if ($mode -ne "small-input") { return @() }
+    $ids = @(Get-JsonProp -Object $State -Name "requirement_expected_fr_ids" -Default @())
+    return @($ids | ForEach-Object { [string]$_ } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+}
+
+function Get-AcceptanceCaseCandidateSample {
+    <#
+        Bounded draft-case scan for the S4 case gate. Retry-9 scanned only the
+        first six draft cards (all FR-011/FR-014), so the FR-025 cases could
+        never become eligible. This helper takes a bounded sample per
+        requirement, in graph order, so every requirement's cases are reachable
+        without issuing one detail call per case on a large version.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $Cards = @(),
+        [int] $PerRequirement = 2,
+        [int] $MaxCandidates = 40
+    )
+    if ($PerRequirement -lt 1) { $PerRequirement = 1 }
+    if ($MaxCandidates -lt 1) { $MaxCandidates = 1 }
+    $seenByRequirement = @{}
+    $sampled = @()
+    foreach ($card in @($Cards)) {
+        if ($sampled.Count -ge $MaxCandidates) { break }
+        $requirementId = [string](Get-JsonProp -Object $card -Name "requirement_id" -Default "")
+        $seen = 0
+        if ($seenByRequirement.ContainsKey($requirementId)) { $seen = [int]$seenByRequirement[$requirementId] }
+        if ($seen -ge $PerRequirement) { continue }
+        $seenByRequirement[$requirementId] = $seen + 1
+        $sampled += $card
+    }
+    return @($sampled)
+}
+
+function Select-AcceptanceCoverageCases {
+    <#
+        Deterministic S4 selection: one candidate per required P0 requirement
+        first (input order), then one per remaining distinct requirement up to
+        MaxSelected. Candidate order is the graph order, so the selection is
+        reproducible. Missing required requirements are returned explicitly and
+        the S4 caller turns them into a hard assertion; the helper never pads a
+        missing requirement with another one.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $Candidates = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $SutIds = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $RequiredSutIds = @(),
+        [int] $MaxSelected = 4
+    )
+    $candidates_ = @($Candidates)
+    $sutIds_ = @($SutIds)
+    $required = @($RequiredSutIds | ForEach-Object { [string]$_ } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+    $selectedIndices = New-Object System.Collections.Generic.List[int]
+    $selectedSutIds = New-Object System.Collections.Generic.List[string]
+    $missingRequired = @()
+    foreach ($requiredSutId in $required) {
+        $found = $false
+        for ($index = 0; $index -lt $candidates_.Count; $index++) {
+            if ($selectedIndices.Contains($index)) { continue }
+            $candidateSutId = ""
+            if ($index -lt $sutIds_.Count) { $candidateSutId = [string]$sutIds_[$index] }
+            if ($candidateSutId -eq $requiredSutId) {
+                $selectedIndices.Add($index)
+                $selectedSutIds.Add($candidateSutId)
+                $found = $true
+                break
+            }
+        }
+        if (-not $found) { $missingRequired += $requiredSutId }
+    }
+    if ($MaxSelected -lt 1) { $MaxSelected = 1 }
+    for ($index = 0; $index -lt $candidates_.Count -and $selectedIndices.Count -lt $MaxSelected; $index++) {
+        if ($selectedIndices.Contains($index)) { continue }
+        $candidateSutId = ""
+        if ($index -lt $sutIds_.Count) { $candidateSutId = [string]$sutIds_[$index] }
+        if ($candidateSutId -eq "" -or $selectedSutIds.Contains($candidateSutId)) { continue }
+        $selectedIndices.Add($index)
+        $selectedSutIds.Add($candidateSutId)
+    }
+    return [pscustomobject]@{
+        SelectedIndices        = @($selectedIndices)
+        SelectedSutIds         = @($selectedSutIds)
+        MissingRequiredSutIds  = @($missingRequired)
+    }
+}
+
 function Get-AcceptanceDesignConversation {
     param(
         [Parameter(Mandatory = $true)] $Context,

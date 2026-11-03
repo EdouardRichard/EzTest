@@ -20,6 +20,9 @@ import (
 
 var handlerNow = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
+// handlerTestPassword is a test-only credential; it is never a product seed.
+const handlerTestPassword = "handler-test-password"
+
 type fakeService struct {
 	loginSession identityapp.Session
 	loginErr     error
@@ -182,7 +185,7 @@ func assertNoCredentials(t *testing.T, rec *httptest.ResponseRecorder) {
 
 func TestLoginReturnsTokenAndUserWithoutCredentials(t *testing.T) {
 	handler, svc := newTestHandler()
-	request := postJSON(t, "/api/auth/login", `{"username":" admin ","password":"admin123"}`)
+	request := postJSON(t, "/api/auth/login", `{"username":" admin ","password":"`+handlerTestPassword+`"}`)
 	request.Header.Set("User-Agent", "handler-test")
 	request.RemoteAddr = "192.0.2.7:54321"
 	request = request.WithContext(requestid.With(request.Context(), "req_login_123"))
@@ -212,7 +215,7 @@ func TestLoginReturnsTokenAndUserWithoutCredentials(t *testing.T) {
 	}
 	assertNoCredentials(t, rec)
 
-	wantArgs := []string{"admin", "admin123", "req_login_123", "192.0.2.7", "handler-test"}
+	wantArgs := []string{"admin", handlerTestPassword, "req_login_123", "192.0.2.7", "handler-test"}
 	if len(svc.loginArgs) != len(wantArgs) {
 		t.Fatalf("login args = %#v", svc.loginArgs)
 	}
@@ -329,14 +332,14 @@ func TestLogoutRevokesBearerToken(t *testing.T) {
 
 func TestChangePasswordUsesAuthenticatedActor(t *testing.T) {
 	handler, svc := newTestHandler()
-	request := withActor(postJSON(t, "/api/auth/password", `{"old_password":"admin123","new_password":"new-password-1"}`), 42, "admin")
+	request := withActor(postJSON(t, "/api/auth/password", `{"old_password":"`+handlerTestPassword+`","new_password":"new-password-1"}`), 42, "admin")
 	rec := httptest.NewRecorder()
 
 	handler.ChangePassword(rec, request)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	want := []string{"42", "admin123", "new-password-1"}
+	want := []string{"42", handlerTestPassword, "new-password-1"}
 	for i := range want {
 		if svc.changeArgs[i] != want[i] {
 			t.Fatalf("change args = %#v", svc.changeArgs)
@@ -623,7 +626,7 @@ func TestRegisterMountsRoutesBehindMiddleware(t *testing.T) {
 		return response.StatusCode
 	}
 
-	if status := send(http.MethodPost, "/api/auth/login", "", `{"username":"admin","password":"admin123"}`); status != http.StatusOK {
+	if status := send(http.MethodPost, "/api/auth/login", "", `{"username":"admin","password":"`+handlerTestPassword+`"}`); status != http.StatusOK {
 		t.Fatalf("login status = %d", status)
 	}
 	if status := send(http.MethodGet, "/api/auth/me", "Bearer user", ""); status != http.StatusOK {
@@ -651,7 +654,7 @@ func TestDTONeverExposesPasswordHash(t *testing.T) {
 	svc.loginSession.User.PasswordHash = "super-secret-hash"
 
 	rec := httptest.NewRecorder()
-	handler.Login(rec, postJSON(t, "/api/auth/login", `{"username":"admin","password":"admin123"}`))
+	handler.Login(rec, postJSON(t, "/api/auth/login", `{"username":"admin","password":"`+handlerTestPassword+`"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("login status = %d: %s", rec.Code, rec.Body.String())
 	}

@@ -254,17 +254,25 @@ function New-AcceptanceContext {
     if ([string]::IsNullOrWhiteSpace($AdminUsername)) {
         $AdminUsername = Get-AcceptanceSetting -Context ([pscustomobject]@{ DotEnv = $dotEnv }) -Name "EZTEST_ADMIN_USERNAME" -Default "admin"
     }
-    $passwordCandidates = @()
-    if (-not [string]::IsNullOrWhiteSpace($AdminPassword)) {
-        $passwordCandidates += $AdminPassword
-    } else {
-        $fromEnv = Get-AcceptanceSetting -Context ([pscustomobject]@{ DotEnv = $dotEnv }) -Name "EZTEST_ADMIN_PASSWORD" -Default ""
-        if (-not [string]::IsNullOrWhiteSpace($fromEnv)) { $passwordCandidates += $fromEnv }
-        $passwordCandidates += "admin123"
-        $passwordCandidates += "[REDACTED]"
+    # Credentials are required: acceptance never retries a built-in default.
+    # An explicit -AdminPassword / -SutPassword is still accepted, otherwise the
+    # process environment or the repository .env must provide the value.
+    $missingCredentials = @()
+    $adminPassword = $AdminPassword
+    if ([string]::IsNullOrWhiteSpace($adminPassword)) {
+        $adminPassword = Get-AcceptanceSetting -Context ([pscustomobject]@{ DotEnv = $dotEnv }) -Name "EZTEST_ADMIN_PASSWORD" -Default ""
+        if ([string]::IsNullOrWhiteSpace($adminPassword)) { $missingCredentials += "EZTEST_ADMIN_PASSWORD" }
     }
-    if ([string]::IsNullOrWhiteSpace($SutPassword)) {
-        $SutPassword = Get-AcceptanceSetting -Context ([pscustomobject]@{ DotEnv = $dotEnv }) -Name "SUT_PASSWORD" -Default "[REDACTED]"
+    $sutPassword = $SutPassword
+    if ([string]::IsNullOrWhiteSpace($sutPassword)) {
+        $sutPassword = Get-AcceptanceSetting -Context ([pscustomobject]@{ DotEnv = $dotEnv }) -Name "SUT_PASSWORD" -Default ""
+        if ([string]::IsNullOrWhiteSpace($sutPassword)) { $missingCredentials += "SUT_PASSWORD" }
+    }
+    if ($missingCredentials.Count -gt 0) {
+        $message = ("Missing acceptance credential(s): {0}. Set them in the process environment or in {1}; " +
+            "acceptance never falls back to a built-in password.") -f `
+            ($missingCredentials -join ", "), (Join-Path $RepoRoot ".env")
+        throw $message
     }
 
     $context = @{
@@ -276,8 +284,8 @@ function New-AcceptanceContext {
         SutWebBaseUrl    = $SutWebBaseUrl.TrimEnd('/')
         SutApiBaseUrl    = $SutApiBaseUrl.TrimEnd('/')
         AdminUsername    = $AdminUsername
-        PasswordCandidates = $passwordCandidates
-        SutPassword      = $SutPassword
+        AdminPassword    = $adminPassword
+        SutPassword      = $sutPassword
         DotEnv           = $dotEnv
         DatabaseName     = Get-DatabaseName -DatabaseUrl (Get-AcceptanceSetting -Context ([pscustomobject]@{ DotEnv = $dotEnv }) -Name "EZTEST_DATABASE_URL" -Default "")
         RepoHead         = Get-RepoHead -Context ([pscustomobject]@{ RepoRoot = $RepoRoot })
@@ -291,8 +299,7 @@ function New-AcceptanceContext {
     New-Item -ItemType Directory -Force -Path $context.EvidenceRoot | Out-Null
 
     $script:RedactionSecrets = @()
-    foreach ($candidate in $passwordCandidates) { if ($candidate) { $script:RedactionSecrets += $candidate } }
-    if ($SutPassword) { $script:RedactionSecrets += $SutPassword }
+    foreach ($secret in @($adminPassword, $sutPassword)) { if ($secret) { $script:RedactionSecrets += $secret } }
     foreach ($keyName in @("llm_api_key", "llm_key")) {
         if ($dotEnv.ContainsKey($keyName) -and $dotEnv[$keyName]) { $script:RedactionSecrets += [string]$dotEnv[$keyName] }
     }
@@ -632,31 +639,28 @@ function Connect-EzTest {
         [Parameter(Mandatory = $false)] [string] $Password = ""
     )
     if ([string]::IsNullOrWhiteSpace($Username)) { $Username = $Context.AdminUsername }
-    $candidates = if (-not [string]::IsNullOrWhiteSpace($Password)) { @($Password) } else { @($Context.PasswordCandidates) }
-    $lastError = ""
-    foreach ($candidate in $candidates) {
-        try {
-            $response = Invoke-Api -Context $Context -Method "POST" -Path "/api/auth/login" `
-                -Body @{ username = $Username; password = $candidate } -TimeoutSeconds 20
-        } catch {
-            $lastError = "login request failed: $($_.Exception.Message)"
-            continue
-        }
-        if ($response.Status -eq 200) {
-            $token = [string](Get-JsonProp -Object $response.Data -Name "token" -Default "")
-            if ([string]::IsNullOrWhiteSpace($token)) {
-                $lastError = "login succeeded but returned no token"
-                continue
-            }
-            $Context.Token = $token
-            $Context.User = Get-JsonProp -Object $response.Data -Name "user" -Default $null
-            $script:RedactionSecrets += $token
-            return [pscustomobject]@{ Ok = $true; Token = $token; User = $Context.User; Status = $response.Status }
-        }
-        $code = Get-JsonProp -Object $response.Error -Name "code" -Default ""
-        $lastError = "HTTP $($response.Status) $code"
+    if ([string]::IsNullOrWhiteSpace($Password)) { $Password = $Context.AdminPassword }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        return [pscustomobject]@{ Ok = $false; Token = ""; User = $null; Status = 0; Error = "EZTEST_ADMIN_PASSWORD is not configured" }
     }
-    return [pscustomobject]@{ Ok = $false; Token = ""; User = $null; Status = 0; Error = $lastError }
+    try {
+        $response = Invoke-Api -Context $Context -Method "POST" -Path "/api/auth/login" `
+            -Body @{ username = $Username; password = $Password } -TimeoutSeconds 20
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Token = ""; User = $null; Status = 0; Error = "login request failed: $($_.Exception.Message)" }
+    }
+    if ($response.Status -eq 200) {
+        $token = [string](Get-JsonProp -Object $response.Data -Name "token" -Default "")
+        if ([string]::IsNullOrWhiteSpace($token)) {
+            return [pscustomobject]@{ Ok = $false; Token = ""; User = $null; Status = $response.Status; Error = "login succeeded but returned no token" }
+        }
+        $Context.Token = $token
+        $Context.User = Get-JsonProp -Object $response.Data -Name "user" -Default $null
+        $script:RedactionSecrets += $token
+        return [pscustomobject]@{ Ok = $true; Token = $token; User = $Context.User; Status = $response.Status }
+    }
+    $code = Get-JsonProp -Object $response.Error -Name "code" -Default ""
+    return [pscustomobject]@{ Ok = $false; Token = ""; User = $null; Status = $response.Status; Error = "HTTP $($response.Status) $code" }
 }
 
 function Connect-SutAccount {
@@ -666,6 +670,9 @@ function Connect-SutAccount {
         [Parameter(Mandatory = $false)] [string] $Password = ""
     )
     if ([string]::IsNullOrWhiteSpace($Password)) { $Password = $Context.SutPassword }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        return [pscustomobject]@{ Ok = $false; Account = $Account; Status = 0; Token = ""; User = $null; Error = "SUT_PASSWORD is not configured" }
+    }
     try {
         $response = Invoke-Api -Context $Context -Method "POST" -Path "/api/v1/auth/login" `
             -BaseUrl $Context.SutApiBaseUrl -Body @{ account = $Account; password = $Password } -TimeoutSeconds 20

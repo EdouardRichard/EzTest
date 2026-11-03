@@ -83,7 +83,10 @@
 .NOTES
     Credentials supplied here (-AdminPassword / -SutPassword) are handed to the
     child scenarios through process environment variables, not command-line
-    arguments, and are never written to the summary or the report.
+    arguments, and are never written to the summary or the report. When they are
+    omitted, EZTEST_ADMIN_PASSWORD and SUT_PASSWORD must be set in the process
+    environment or the repository .env; the runner fails closed and never falls
+    back to a built-in password.
 #>
 [CmdletBinding()]
 param(
@@ -382,10 +385,15 @@ if ([string]::IsNullOrWhiteSpace($EvidenceRoot)) {
     $EvidenceRoot = "docs/version-V0.2.1/acceptance/evidence/final"
 }
 
-$context = Initialize-AcceptanceContext -ApiBaseUrl $ApiBaseUrl -WebBaseUrl $WebBaseUrl `
-    -ExecutorUrl $ExecutorUrl -SutWebBaseUrl $SutWebBaseUrl -SutApiBaseUrl $SutApiBaseUrl `
-    -AdminUsername $AdminUsername -AdminPassword $AdminPassword -SutPassword $SutPassword `
-    -EvidenceRoot $EvidenceRoot
+try {
+    $context = Initialize-AcceptanceContext -ApiBaseUrl $ApiBaseUrl -WebBaseUrl $WebBaseUrl `
+        -ExecutorUrl $ExecutorUrl -SutWebBaseUrl $SutWebBaseUrl -SutApiBaseUrl $SutApiBaseUrl `
+        -AdminUsername $AdminUsername -AdminPassword $AdminPassword -SutPassword $SutPassword `
+        -EvidenceRoot $EvidenceRoot
+} catch {
+    Write-Host ("[BLOCKED] preflight: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    exit 2
+}
 
 if ([string]::IsNullOrWhiteSpace($SummaryPath)) {
     $SummaryPath = Join-Path $context.EvidenceRoot "summary.json"
@@ -616,6 +624,12 @@ foreach ($scenario in $script:ScenarioCatalog) {
         } else {
             $childArgs += @("-FullSutDoc", "-FullSutDocPath", $requirementProfile.Path)
         }
+    }
+    # Task 111: S4 selects and S5 executes the confirmed cases. In small-input
+    # mode both need the explicit P0 set so FR-025 cannot be left unselected
+    # (retry-9 selected two FR-011 cases and S6 reported 1/3 coverage).
+    if (@("s4", "s5") -contains $scenario.Id -and $null -ne $requirementProfile -and $requirementProfile.Mode -eq "small-input" -and @($requirementProfile.ExpectedFrIds).Count -gt 0) {
+        $childArgs += @("-ExpectedFrIds", (@($requirementProfile.ExpectedFrIds) -join ","))
     }
 
     Write-Host ""

@@ -8,11 +8,13 @@
 # EZTEST_DATABASE_URL). Secret values are never printed.
 #
 # EzTest 0.2 keeps runtime configuration in the database settings center; the
-# API only reads the four startup variables EZTEST_DATABASE_URL, EZTEST_API_PORT,
-# EZTEST_WEB_PORT and EZTEST_EXECUTOR_PORT. The first API start seeds the fixed
-# administrator admin / admin123 (change it in the UI after the first login).
-# The executor and PDF-renderer tokens in .env must match the packaged
-# settings-center defaults; if you change one, change the settings center too.
+# API reads the four runtime variables EZTEST_DATABASE_URL, EZTEST_API_PORT,
+# EZTEST_WEB_PORT and EZTEST_EXECUTOR_PORT. A fresh database additionally
+# requires EZTEST_INITIAL_ADMIN_PASSWORD; this script generates a random value
+# into .env and seeds the administrator admin with it on the first start
+# (change it in the UI after the first login). The executor and PDF-renderer
+# tokens in .env must match the packaged settings-center defaults; if you change
+# one, change the settings center too.
 #
 # Re-running with --force backs up the current .env to .env.bak and renders it
 # again from the template.
@@ -144,12 +146,17 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 # --- Rendered values --------------------------------------------------------
-# 0.2 seeds a fixed administrator (admin / admin123) on the first API start, so
-# the template values are rendered as that seed: the API ignores the admin
-# variables, smoke-test.sh uses them to log in. The executor/renderer tokens are
-# the packaged settings-center defaults; change both sides if you change them.
+# A fresh 0.2 database requires EZTEST_INITIAL_ADMIN_PASSWORD; generate it here
+# and mirror it into EZTEST_ADMIN_PASSWORD so smoke-test.sh can log in. The value
+# is only written to the owner-only .env and is never printed. The
+# executor/renderer tokens are the packaged settings-center defaults; change both
+# sides if you change them.
 ADMIN_USERNAME="admin"
-ADMIN_PASSWORD="admin123"
+ADMIN_PASSWORD="$(od -An -N24 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+if [ "${#ADMIN_PASSWORD}" -lt 16 ]; then
+    fail "Could not generate a random administrator password; check that /dev/urandom and od are available."
+fi
+INITIAL_ADMIN_PASSWORD="$ADMIN_PASSWORD"
 EXECUTOR_TOKEN="eztest-dev-executor-token"
 RENDER_TOKEN="eztest-dev-render-token"
 
@@ -162,6 +169,7 @@ while IFS= read -r LINE || [ -n "$LINE" ]; do
     case "$RENDERED" in
         EZTEST_DATABASE_URL=*) RENDERED="EZTEST_DATABASE_URL=$DB_URL" ;;
         EZTEST_ADMIN_USERNAME=*) RENDERED="EZTEST_ADMIN_USERNAME=$ADMIN_USERNAME" ;;
+        EZTEST_INITIAL_ADMIN_PASSWORD=*) RENDERED="EZTEST_INITIAL_ADMIN_PASSWORD=$INITIAL_ADMIN_PASSWORD" ;;
         EZTEST_ADMIN_PASSWORD=*) RENDERED="EZTEST_ADMIN_PASSWORD=$ADMIN_PASSWORD" ;;
         EZTEST_EXECUTOR_TOKEN=*) RENDERED="EZTEST_EXECUTOR_TOKEN=$EXECUTOR_TOKEN" ;;
         EZTEST_RENDER_TOKEN=*) RENDERED="EZTEST_RENDER_TOKEN=$RENDER_TOKEN" ;;
@@ -189,9 +197,10 @@ if [ "$DB_FROM_TEMPLATE" -eq 1 ]; then
 else
     printf '  database     : %s (credentials are in .env, not shown)\n' "$(db_hostport "$DB_URL")"
 fi
-printf '  admin user   : admin / admin123 (fixed first-start seed; smoke-test.sh uses it)\n'
-printf '                 Change the password in the UI after the first login and update\n'
-printf '                 EZTEST_ADMIN_PASSWORD in .env afterwards.\n'
+printf '  admin user   : admin (first-start password generated in .env as EZTEST_INITIAL_ADMIN_PASSWORD)\n'
+printf '                 smoke-test.sh logs in with EZTEST_ADMIN_PASSWORD, set to the same value.\n'
+printf '                 Change the password in the UI after the first login and update both\n'
+printf '                 values in .env afterwards.\n'
 printf '  tokens       : executor/renderer use the packaged settings-center defaults;\n'
 printf '                 if you change a token here, change the settings center value too.\n'
 printf '\nNext steps:\n'
@@ -201,6 +210,6 @@ if [ "$DB_FROM_TEMPLATE" -eq 1 ]; then
 else
     printf '  1. Run: bash start-eztest.sh\n'
 fi
-printf '  2. Open http://localhost:6868, sign in as admin/admin123 and change the password.\n'
+printf '  2. Open http://localhost:6868, sign in as admin with EZTEST_INITIAL_ADMIN_PASSWORD from .env, then change the password.\n'
 printf '  3. Optional: bash smoke-test.sh to verify the whole stack.\n'
 exit 0

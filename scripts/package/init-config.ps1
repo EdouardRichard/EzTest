@@ -10,12 +10,13 @@
     EZTEST_DATABASE_URL). Secret values are never printed.
 
     EzTest 0.2 keeps runtime configuration in the database settings center; the
-    API only reads the four startup variables EZTEST_DATABASE_URL,
-    EZTEST_API_PORT, EZTEST_WEB_PORT and EZTEST_EXECUTOR_PORT. The first API
-    start seeds the fixed administrator `admin` / `admin123` (change it in the UI
-    after the first login). The executor and PDF-renderer tokens in `.env` must
-    match the packaged settings-center defaults; if you change one, change the
-    same value in the settings center.
+    API reads the four runtime variables EZTEST_DATABASE_URL, EZTEST_API_PORT,
+    EZTEST_WEB_PORT and EZTEST_EXECUTOR_PORT. A fresh database additionally
+    requires EZTEST_INITIAL_ADMIN_PASSWORD; this script generates a random value
+    into `.env` and seeds the administrator `admin` with it on the first start
+    (change it in the UI after the first login). The executor and PDF-renderer
+    tokens in `.env` must match the packaged settings-center defaults; if you
+    change one, change the same value in the settings center.
 
     Re-running with -Force backs up the current `.env` to `.env.bak` and renders
     it again from the template.
@@ -111,6 +112,20 @@ function Get-DatabaseHostPort {
     return [pscustomobject]@{ Host = $rest; Port = 5432 }
 }
 
+function New-RandomAdminPassword {
+    # 24 random bytes -> 32 base64url characters, well above the 8-character
+    # minimum. The value only ever lands in the owner-only .env; it is never
+    # printed and never committed.
+    $bytes = New-Object byte[] 24
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
+    return ([Convert]::ToBase64String($bytes) -replace '\+', '-' -replace '/', '_' -replace '=', '')
+}
+
 # ---------------------------------------------------------------------------
 # Resolve the database URL: parameter > environment > existing .env > template.
 # ---------------------------------------------------------------------------
@@ -137,13 +152,14 @@ if (Test-Path -LiteralPath $envPath -PathType Leaf) {
 # ---------------------------------------------------------------------------
 # Rendered values.
 #
-# 0.2 seeds a fixed administrator (admin / admin123) on the first API start, so
-# the template values are rendered as that seed: the API ignores the admin
-# variables, smoke-test.* uses them to log in. The executor/renderer tokens are
-# the packaged settings-center defaults; change both sides if you change them.
+# A fresh 0.2 database requires EZTEST_INITIAL_ADMIN_PASSWORD; init-config
+# generates it and mirrors it into EZTEST_ADMIN_PASSWORD so smoke-test.* can log
+# in. Neither value is printed. The executor/renderer tokens are the packaged
+# settings-center defaults; change both sides if you change them.
 # ---------------------------------------------------------------------------
 $adminUsername = "admin"
-$adminPassword = "admin123"
+$initialAdminPassword = New-RandomAdminPassword
+$adminPassword = $initialAdminPassword
 $executorToken = "eztest-dev-executor-token"
 $renderToken = "eztest-dev-render-token"
 
@@ -159,6 +175,8 @@ foreach ($line in $lines) {
         $rendered = "EZTEST_DATABASE_URL=" + $dbUrl
     } elseif ($rendered -match '^EZTEST_ADMIN_USERNAME=') {
         $rendered = "EZTEST_ADMIN_USERNAME=" + $adminUsername
+    } elseif ($rendered -match '^EZTEST_INITIAL_ADMIN_PASSWORD=') {
+        $rendered = "EZTEST_INITIAL_ADMIN_PASSWORD=" + $initialAdminPassword
     } elseif ($rendered -match '^EZTEST_ADMIN_PASSWORD=') {
         $rendered = "EZTEST_ADMIN_PASSWORD=" + $adminPassword
     } elseif ($rendered -match '^EZTEST_EXECUTOR_TOKEN=') {
@@ -205,9 +223,10 @@ if ($dbFromTemplate) {
     $endpoint = Get-DatabaseHostPort -Url $dbUrl
     Write-Host "  database     : $($endpoint.Host):$($endpoint.Port) (credentials are in .env, not shown)"
 }
-Write-Host "  admin user   : admin / admin123 (fixed first-start seed; smoke-test.* uses it)"
-Write-Host "                 Change the password in the UI after the first login and update"
-Write-Host "                 EZTEST_ADMIN_PASSWORD in .env afterwards."
+Write-Host "  admin user   : admin (first-start password generated in .env as EZTEST_INITIAL_ADMIN_PASSWORD)"
+Write-Host "                 smoke-test.* logs in with EZTEST_ADMIN_PASSWORD, set to the same value."
+Write-Host "                 Change the password in the UI after the first login and update both"
+Write-Host "                 values in .env afterwards."
 Write-Host "  tokens       : executor/renderer use the packaged settings-center defaults;"
 Write-Host "                 if you change a token here, change the settings center value too."
 Write-Host ""
@@ -218,6 +237,6 @@ if ($dbFromTemplate) {
 } else {
     Write-Host "  1. Run .\start-eztest.ps1 (or: bash start-eztest.sh on Linux)."
 }
-Write-Host "  2. Open http://localhost:6868, sign in as admin/admin123 and change the password."
+Write-Host "  2. Open http://localhost:6868, sign in as admin with EZTEST_INITIAL_ADMIN_PASSWORD from .env, then change the password."
 Write-Host "  3. Optional: .\smoke-test.ps1 to verify the whole stack."
 exit 0

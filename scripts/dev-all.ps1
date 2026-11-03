@@ -784,7 +784,7 @@ try {
     Write-Host ("  API        {0}   (/healthz, /api/health, /api/openapi.yaml; version {1})" -f $apiBaseUrl, $apiHealth.version)
     Write-Host ("  executor   {0}   (internal only; browser {1})" -f $executorBaseUrl, $executorHealth.browserVersion)
     Write-Host ("  postgres   {0}:{1}" -f $databaseEndpoint.Host, $databaseEndpoint.Port)
-    Write-Host ("  sign in    {0}   (password: EZTEST_ADMIN_PASSWORD in .env)" -f (Get-EnvValue -Name "EZTEST_ADMIN_USERNAME" -Default "admin"))
+    Write-Host ("  sign in    {0}   (password: EZTEST_INITIAL_ADMIN_PASSWORD from .env on the first start)" -f (Get-EnvValue -Name "EZTEST_ADMIN_USERNAME" -Default "admin"))
     if ($tokenFallback) {
         Write-Host "  note       EZTEST_EXECUTOR_TOKEN is not set in .env; a dev placeholder is used for both the API and the executor." -ForegroundColor Yellow
         Write-Host "             Add EZTEST_EXECUTOR_TOKEN to .env to make this permanent across manual restarts." -ForegroundColor Yellow

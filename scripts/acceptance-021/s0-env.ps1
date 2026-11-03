@@ -111,7 +111,7 @@ try {
             -Detail "user=$([string](Get-JsonProp -Object $login.User -Name "username" -Default "?")) role=$([string](Get-JsonProp -Object $login.User -Name "role" -Default "?"))"
     } else {
         Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $false -Severity blocker `
-            -Detail "credentials rejected ($($login.Error)); set EZTEST_ADMIN_USERNAME/EZTEST_ADMIN_PASSWORD for a non-default admin"
+            -Detail "credentials rejected ($($login.Error)); set EZTEST_ADMIN_PASSWORD and SUT_PASSWORD in the environment or .env (no built-in fallback)"
     }
 
     # ------------------------------------------------------------------

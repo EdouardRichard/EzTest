@@ -45,7 +45,10 @@ param(
     [string] $StatePath = "",
     [int] $DesignReplyTimeoutSeconds = 240,
     [int] $IntentTimeoutSeconds = 90,
-    [int] $CaseReviewTimeoutSeconds = 120
+    [int] $CaseReviewTimeoutSeconds = 120,
+    # Task 111: the runner passes the resolved small-input P0 IDs so the
+    # selection can require one eligible case per requirement (FR-025 included).
+    [string] $ExpectedFrIds = ""
 )
 
 Set-StrictMode -Version 3.0
@@ -72,6 +75,7 @@ if ([string]::IsNullOrWhiteSpace($versionId) -and $state.ContainsKey("version_id
 $selectedCases = @()
 $selectedCaseVersions = @()
 $confirmedCaseIds = @()
+$expectedSutIds = @(Get-AcceptanceExpectedSutIds -ExpectedFrIds $ExpectedFrIds -State $state)
 
 function Write-S4Evidence {
     param([string] $Name, $Value, [string] $Kind = "api", [string] $Note = "")
@@ -113,6 +117,12 @@ try {
             # Requirements and stage.
             # ------------------------------------------------------------------
             $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+            $requirementSutById = @{}
+            foreach ($requirement in @($requirements)) {
+                $requirementId = [string](Get-JsonProp -Object $requirement -Name "id" -Default "")
+                if ($requirementId -eq "") { continue }
+                $requirementSutById[$requirementId] = [string](Get-RequirementSutId -Requirement $requirement)
+            }
             # The design generation (S3) owns designing -> case_review. Wait for
             # the product to reach the case hard gate's only source stage; the
             # script never writes the stage itself.
@@ -283,14 +293,22 @@ try {
             $cards = @(Get-AcceptanceCaseCards -Graph $graph)
             $draftCards = @($cards | Where-Object { $_.status -eq "draft" })
             $candidateDetails = @()
-            foreach ($card in ($draftCards | Select-Object -First 6)) {
+            # Task 111: retry-9 scanned only the first six draft cards (three
+            # FR-011 + three FR-014), so FR-025 could never enter the eligible
+            # pool. Sample every requirement's draft cases (bounded) instead.
+            $candidateCards = @(Get-AcceptanceCaseCandidateSample -Cards $draftCards -PerRequirement 2 -MaxCandidates 40)
+            foreach ($card in $candidateCards) {
                 try {
                     $detail = Get-AcceptanceCaseDetail -Context $context -VersionId $versionId -CaseId $card.case_id
                     $selected = Get-JsonProp -Object $detail -Name "selected" -Default $null
+                    $requirementId = [string](Get-JsonProp -Object $card -Name "requirement_id" -Default "")
+                    $sutId = ""
+                    if ($requirementSutById.ContainsKey($requirementId)) { $sutId = [string]$requirementSutById[$requirementId] }
                     $candidateDetails += [pscustomobject]@{
                         card       = $card
                         detail     = $detail
                         selected   = $selected
+                        sut_id     = $sutId
                         case_version_id = [string](Get-JsonProp -Object $selected -Name 'case_version_id' -Default $card.case_version_id)
                         steps      = @(Get-JsonProp -Object $selected -Name 'steps' -Default @())
                         assertions = @(Get-JsonProp -Object $selected -Name 'assertions' -Default @())
@@ -300,34 +318,62 @@ try {
                     Write-AcceptanceLog -Scenario $scenario -Level warn -Message "case detail $($card.case_id) failed: $($_.Exception.Message)"
                 }
             }
-            $eligible = @($candidateDetails | Where-Object { $_.assertions.Count -ge 1 })
+            $eligible = @($candidateDetails | Where-Object { $_.assertions.Count -ge 1 -and $_.steps.Count -ge 1 })
+            if ($eligible.Count -eq 0) { $eligible = @($candidateDetails | Where-Object { $_.assertions.Count -ge 1 }) }
             if ($eligible.Count -eq 0) { $eligible = $candidateDetails }
-            # A partial selection is only honest when at least two eligible draft
-            # cases exist: select a strict subset and leave the rest draft. A
-            # version with a single eligible case exercises the gate's complete
-            # ("all selected") path instead, recorded as such, never as partial.
-            $partialSelection = $eligible.Count -ge 2
-            $selectCount = 0
-            if ($eligible.Count -ge 2) { $selectCount = [Math]::Min(2, $eligible.Count - 1) }
-            elseif ($eligible.Count -eq 1) { $selectCount = 1 }
-            $selectedDetails = @($eligible | Select-Object -First $selectCount)
+            # Select one executable representative per required P0 requirement
+            # (small-input mode), then one per remaining requirement up to the
+            # bound. The strict subset keeps the partial-gate variant honest.
+            $eligibleSutIds = @($eligible | ForEach-Object { [string]$_.sut_id })
+            if ($expectedSutIds.Count -gt 0) {
+                # Small-input mode: one executable representative per expected
+                # P0 requirement, so FR-014/FR-025 are really selected.
+                $maxSelected = [Math]::Max(4, $expectedSutIds.Count)
+                $selection = Select-AcceptanceCoverageCases -Candidates $eligible -SutIds $eligibleSutIds -RequiredSutIds $expectedSutIds -MaxSelected $maxSelected
+            } else {
+                # Legacy full-document mode keeps its historical two-case sample.
+                $legacyCount = if ($eligible.Count -ge 2) { [Math]::Min(2, $eligible.Count - 1) } elseif ($eligible.Count -eq 1) { 1 } else { 0 }
+                $legacyIndices = @()
+                if ($legacyCount -gt 0) { $legacyIndices = @(0..($legacyCount - 1)) }
+                $legacySutIds = @($legacyIndices | ForEach-Object { [string]$eligibleSutIds[$_] })
+                $selection = [pscustomobject]@{
+                    SelectedIndices       = @($legacyIndices)
+                    SelectedSutIds        = @($legacySutIds)
+                    MissingRequiredSutIds = @()
+                }
+            }
+            $selectedDetails = @()
+            foreach ($index in @($selection.SelectedIndices)) { $selectedDetails += $eligible[$index] }
             $selectedCases = @($selectedDetails | ForEach-Object { $_.card.case_id })
             $selectedCaseVersions = @($selectedDetails | ForEach-Object { $_.case_version_id })
             $unselectedDraft = @($draftCards | Where-Object { $selectedCases -notcontains $_.case_id })
+            $partialSelection = ($selectedCases.Count -ge 1 -and $unselectedDraft.Count -ge 1)
             [void](Write-S4Evidence -Name "case-selection.json" -Value ([pscustomobject]@{
                 draft_total = $draftCards.Count
                 eligible = $eligible.Count
                 partial = $partialSelection
+                expected_sut_ids = @($expectedSutIds)
+                selected_sut_ids = @($selection.SelectedSutIds)
+                missing_required_sut_ids = @($selection.MissingRequiredSutIds)
                 selected_case_ids = $selectedCases
                 selected_case_versions = $selectedCaseVersions
                 unselected_draft = @($unselectedDraft | ForEach-Object { $_.case_id })
-            }) -Note "case gate selection (strict subset when at least two eligible draft cases exist)")
+            }) -Note "case gate selection (strict subset with one eligible case per required P0 requirement)")
+            if ($expectedSutIds.Count -gt 0) {
+                $missingRequired = @($selection.MissingRequiredSutIds)
+                Add-AcceptanceCheck -Scenario $scenario -Name "selected cases cover the expected small-input requirements" `
+                    -Passed ($selectedCases.Count -ge 1 -and $missingRequired.Count -eq 0) -Severity assertion `
+                    -Detail ("expected=$($expectedSutIds -join ',') selected=$(@($selection.SelectedSutIds) -join ',') missing=$($missingRequired -join ',')")
+                if ($missingRequired.Count -gt 0) {
+                    $scenario.ErrorMessage = "S4 failed: the case selection does not cover $(@($missingRequired) -join ','); the case hard gate would never execute it"
+                }
+            }
             if ($partialSelection) {
                 Add-AcceptanceCheck -Scenario $scenario -Name "partial selection leaves at least one draft case" -Passed ($selectedCases.Count -ge 1 -and $unselectedDraft.Count -ge 1) -Severity assertion `
                     -Detail "selected=$($selectedCases.Count) unselectedDraft=$($unselectedDraft.Count) draftTotal=$($draftCards.Count)"
             } elseif ($selectedCases.Count -ge 1) {
                 Add-AcceptanceCheck -Scenario $scenario -Name "complete selection confirms every draft case" -Passed ($unselectedDraft.Count -eq 0) -Severity warning `
-                    -Detail "only one eligible draft case exists; the gate confirms it completely (the partial variant cannot be exercised on this version)"
+                    -Detail "all eligible draft cases are selected; the partial variant cannot be exercised on this version"
             } else {
                 Add-AcceptanceCheck -Scenario $scenario -Name "eligible draft case available for the case hard gate" -Passed $false -Severity assertion `
                     -Detail "draftCards=$($draftCards.Count) eligible=0"

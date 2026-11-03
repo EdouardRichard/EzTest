@@ -70,10 +70,15 @@ type testAPI struct {
 	issueSvc  *deliveryapp.IssueService
 }
 
+// testSeedAdminPassword is the explicit test-only administrator password set
+// through EZTEST_INITIAL_ADMIN_PASSWORD. The product has no built-in default.
+const testSeedAdminPassword = "test-seed-admin-password-113"
+
 func newTestAPI(t *testing.T) *testAPI {
 	t.Helper()
 	pool := testutil.NewDB(t)
 	ctx := context.Background()
+	t.Setenv(identityapp.SeedAdminPasswordEnv, testSeedAdminPassword)
 
 	settingsRepo := settingspg.New(pool)
 	defs := settingsapp.Definitions("http://127.0.0.1:13336")
@@ -303,7 +308,7 @@ func (a *testAPI) listData(body map[string]any) []any {
 func TestP0EndToEndFlow(t *testing.T) {
 	api := newTestAPI(t)
 
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 	me := api.data(api.do(http.MethodGet, "/api/auth/me", nil, http.StatusOK))
 	if me["username"] != "admin" || me["role"] != "admin" {
 		t.Fatalf("me = %#v", me)
@@ -384,7 +389,7 @@ func TestP0EndToEndFlow(t *testing.T) {
 	api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusForbidden)
 
 	// Content upload/download over multipart.
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 	var buffer bytes.Buffer
 	writer := multipart.NewWriter(&buffer)
 	part, err := writer.CreateFormFile("file", "hello.txt")
@@ -451,7 +456,7 @@ func TestP0EndToEndFlow(t *testing.T) {
 
 func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
 	api := newTestAPI(t)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 
 	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P2 Design SUT", "intro": "p2"}, http.StatusCreated))
 	sutID := sut["id"].(string)
@@ -502,7 +507,7 @@ func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
 
 	api.token = ""
 	api.do(http.MethodGet, "/api/versions/"+versionID+"/design/graph", nil, http.StatusUnauthorized)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 }
 
 // TestP3ExecutionRoutes pins the P3 routing/auth/empty-state contract (spec
@@ -515,7 +520,7 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	// Unauthenticated execution routes are 401.
 	api.do(http.MethodGet, "/api/versions/1/execution/overview", nil, http.StatusUnauthorized)
 
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P3 Execution SUT", "intro": "p3"}, http.StatusCreated))
 	sutID := sut["id"].(string)
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
@@ -614,7 +619,7 @@ func TestP3ExecutionRoutes(t *testing.T) {
 // and the wave is cancelled.
 func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 	api := newTestAPI(t)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 
 	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P3 Happy SUT", "intro": "p3"}, http.StatusCreated))
 	sutID := sut["id"].(string)

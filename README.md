@@ -275,12 +275,13 @@ bash stop-eztest.sh
 bash smoke-test.sh
 ```
 
-`init-config` creates the package `.env` (database URL, ports and the executor/renderer tokens), then
-`start-eztest` brings the stack up and prints the URLs. Open <http://localhost:6868> and sign in — the
-first boot seeds the administrator account `admin` / `admin123`; **change that password immediately** in
-the UI (Settings → account). HTML and PDF report rendering work out of the box: the bundled renderer
-starts with the stack. See [deploy/README.md](deploy/README.md) for the Docker deployment and
-multi-replica notes.
+`init-config` creates the package `.env` (database URL, ports, the executor/renderer tokens and a randomly
+generated first-start administrator password), then `start-eztest` brings the stack up and prints the URLs.
+Open <http://localhost:6868> and sign in as `admin` with the value of
+`EZTEST_INITIAL_ADMIN_PASSWORD` in the package `.env` (the file is owner-only and the scripts never print
+the secret); **change that password immediately** in the UI (Settings → account). HTML and PDF report
+rendering work out of the box: the bundled renderer starts with the stack. See
+[deploy/README.md](deploy/README.md) for the Docker deployment and multi-replica notes.
 
 ### Option B — Docker Compose
 
@@ -293,7 +294,7 @@ checked out at the build-context root. The Compose file delivers six services: t
 PostgreSQL 17, the Playwright executor and the PDF renderer.
 
 ```bash
-cp .env.example .env      # set POSTGRES_* and the secrets required by deploy/docker-compose.yml
+cp .env.example .env      # set POSTGRES_*, EZTEST_INITIAL_ADMIN_PASSWORD and the tokens required by deploy/docker-compose.yml
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 docker compose --env-file .env -f deploy/docker-compose.yml ps
 ```
@@ -307,11 +308,13 @@ Requirements: Go **1.24.6** (as declared in `backend/go.mod`), Node.js **22+** w
 PostgreSQL **17**, and a Chromium-based browser for the executor.
 
 ```bash
-# 0) The API process reads exactly four startup variables.
+# 0) The API process reads four runtime variables; a fresh database also needs the
+#    first-start administrator credential (there is no built-in default).
 export EZTEST_DATABASE_URL="postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 export EZTEST_API_PORT=13333
 export EZTEST_WEB_PORT=6868
 export EZTEST_EXECUTOR_PORT=13336
+export EZTEST_INITIAL_ADMIN_PASSWORD="<strong-first-start-password>"
 
 # 1) API — applies embedded migrations and seeds the administrator on first start
 cd backend && go run ./cmd/eztest
@@ -342,7 +345,7 @@ cd renderer && node --test   # renderer node:test suite
 
 After signing in as the administrator:
 
-1. **Change the seeded password** (`admin` / `admin123` on a fresh database).
+1. **Change the seeded password** (the `EZTEST_INITIAL_ADMIN_PASSWORD` value supplied on the first start).
 2. **Settings → LLM configuration:** add an OpenAI-compatible provider (base URL, API key, model),
    refresh the model catalog and run the connectivity test. Credentials are masked in the UI.
 3. **Resources:** register the systems under test, their environments, pages and HTTP APIs, optional
@@ -478,11 +481,13 @@ stateDiagram-v2
 
 ### 5. Configuration and operations
 
-- The API process reads exactly **four startup environment variables**: `EZTEST_DATABASE_URL`,
-  `EZTEST_API_PORT`, `EZTEST_WEB_PORT` and `EZTEST_EXECUTOR_PORT`. Everything else — paths, LLM
-  credentials, executor/renderer URLs and tokens, limits, retention, rate limiting, report templates —
-  lives in the database settings center and is managed from **Settings** in the UI (85 settings keys,
-  audited, secrets masked).
+- The API process reads exactly **four runtime environment variables**: `EZTEST_DATABASE_URL`,
+  `EZTEST_API_PORT`, `EZTEST_WEB_PORT` and `EZTEST_EXECUTOR_PORT`. A fresh database additionally needs
+  `EZTEST_INITIAL_ADMIN_PASSWORD` for the first-start administrator seed; it is required only while the
+  user table is empty and there is no built-in default. Everything else — paths, LLM credentials,
+  executor/renderer URLs and tokens, limits, retention, rate limiting, report templates — lives in the
+  database settings center and is managed from **Settings** in the UI (85 settings keys, audited,
+  secrets masked).
 - Migrations are append-only, embedded in the binary, applied at startup under an advisory lock and
   checksummed; rollback is a restore from backup, not a down migration.
 - API replicas are multi-replica safe: leases and leader advisory locks live in PostgreSQL, readiness
@@ -507,7 +512,7 @@ deploy/                  Docker Compose stack (two API replicas, web, PostgreSQL
 scripts/                 Development, test, acceptance and release tooling
 eval/                    Evaluation fixtures and metrics used by the quality center
 assets/screenshots/      README screenshots
-.env.example             Annotated template with the four startup variables
+.env.example             Annotated template with the four runtime variables and the first-start admin credential
 LICENSE                  Apache License 2.0
 ```
 

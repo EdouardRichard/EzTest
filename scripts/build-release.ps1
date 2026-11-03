@@ -1565,7 +1565,7 @@ function Get-RepositorySecretValues {
         Write-Warn "No repository .env found; the package secret-leak scan only checks for generic secret shapes."
         return $values
     }
-    $secretKeys = @("EZTEST_DATABASE_URL", "EZTEST_TEST_DATABASE_URL", "EZTEST_SECRET_KEYS", "EZTEST_ADMIN_PASSWORD", "EZTEST_EXECUTOR_TOKEN", "POSTGRES_PASSWORD", "llm_key")
+    $secretKeys = @("EZTEST_DATABASE_URL", "EZTEST_TEST_DATABASE_URL", "EZTEST_SECRET_KEYS", "EZTEST_INITIAL_ADMIN_PASSWORD", "EZTEST_ADMIN_PASSWORD", "EZTEST_EXECUTOR_TOKEN", "POSTGRES_PASSWORD", "llm_key")
     foreach ($line in [System.IO.File]::ReadAllLines($envPath, [System.Text.Encoding]::UTF8)) {
         $trimmed = $line.Trim()
         if ($trimmed.Length -eq 0 -or $trimmed.StartsWith("#")) { continue }
@@ -1638,7 +1638,8 @@ function Test-PackageTree {
             "EZTEST_EXEC_ALLOWED_HOSTS=",
             "EZTEST_VISUAL_BASELINE_MAX_BYTES=",
             "EZTEST_ADMIN_USERNAME=admin",
-            "EZTEST_ADMIN_PASSWORD=admin123",
+            "EZTEST_INITIAL_ADMIN_PASSWORD=",
+            "EZTEST_ADMIN_PASSWORD=",
             "PLAYWRIGHT_BROWSERS_PATH=__PACKAGE_ROOT__/playwright-browsers",
             "NODE_ENV=production",
             "PORT=6868",

@@ -134,6 +134,10 @@ if (-not [string]::IsNullOrWhiteSpace($RequirementInput) -or $FullSutDoc) {
     }
 }
 $isSmallInput = ($null -ne $requirementProfile -and $requirementProfile.Mode -eq "small-input")
+# Task 111: the small-input mode owns an explicit P0 set. S3 waits for and
+# hard-gates on one executable case per ID; it never reports a partial snapshot
+# (retry-9: FR-011 only, 1/3) as a pass.
+$expectedP0FrIds = if ($isSmallInput) { @($requirementProfile.ExpectedFrIds) } else { @() }
 # Fix round 1: every clarification fallback text is mode-aware. Small-input mode
 # references only the explicit input count/FR IDs; the legacy modes keep their
 # historical generic wording.
@@ -960,19 +964,41 @@ try {
                     -Detail ("conversation=$designConversationId; no design conversation was created by the script")
                 Save-S3State -Values @{ design_conversation_id = $designConversationId }
 
-                $caseWait = Wait-Until -TimeoutSeconds $CaseTimeoutSeconds -IntervalSeconds 5 -Description "design cases" -Condition {
+                # Task 111: in small-input mode the criterion is not "any case
+                # node". Retry-9 exited as soon as FR-011 produced three cases
+                # (14:43:31), six seconds before the FR-014/FR-025 authoring
+                # turns committed (14:43:39), and recorded 1/3 as a warning.
+                # Wait for the deterministic P0 coverage gate (bounded by the
+                # case timeout); a real gap still times out and is failed by the
+                # hard assertions below, never silently passed.
+                $caseWaitDescription = if ($isSmallInput) { "all small-input P0 design cases" } else { "design cases" }
+                $caseWait = Wait-Until -TimeoutSeconds $CaseTimeoutSeconds -IntervalSeconds 5 -Description $caseWaitDescription -Condition {
                     $graph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
                     $cards = @(Get-AcceptanceCaseCards -Graph $graph)
-                    if ($cards.Count -ge 1) { return [pscustomobject]@{ Graph = $graph; Cards = $cards } }
-                    return $null
+                    if ($cards.Count -lt 1) { return $null }
+                    if ($isSmallInput) {
+                        $coverage = Get-AcceptanceP0CaseCoverage -ExpectedFrIds $expectedP0FrIds -Requirements $requirements -CaseCards $cards
+                        if (-not $coverage.Passed) { return $null }
+                        return [pscustomobject]@{ Graph = $graph; Cards = $cards; Coverage = $coverage }
+                    }
+                    return [pscustomobject]@{ Graph = $graph; Cards = $cards; Coverage = $null }
                 }
                 $graph = $null
+                $p0CaseCoverage = $null
                 if ($caseWait.Ok -and $null -ne $caseWait.Value) {
                     $graph = $caseWait.Value.Graph
                     $caseCards = @($caseWait.Value.Cards)
+                    $p0CaseCoverage = $caseWait.Value.Coverage
                 } else {
                     $graph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
                     $caseCards = @(Get-AcceptanceCaseCards -Graph $graph)
+                }
+                if ($isSmallInput) {
+                    if ($null -eq $p0CaseCoverage) {
+                        $p0CaseCoverage = Get-AcceptanceP0CaseCoverage -ExpectedFrIds $expectedP0FrIds -Requirements $requirements -CaseCards $caseCards
+                    }
+                    Add-AcceptanceCheck -Scenario $scenario -Name "P0 case coverage wait completed" -Passed ($p0CaseCoverage.Passed) -Severity warning `
+                        -Detail ("waited up to ${CaseTimeoutSeconds}s wait_ok=$($caseWait.Ok); " + $p0CaseCoverage.Detail)
                 }
 
                 # Task 72 (optional): the automatic design fans out one case-author
@@ -980,7 +1006,7 @@ try {
                 # P0 baseline requirement has at least one case, so the matrix is
                 # generated from a meaningful P0 sample. This never invents cases:
                 # it only waits for real draft cases and reports a timeout honestly.
-                if ($WaitForP0CasesSeconds -gt 0 -and $p0Baseline.Count -gt 0) {
+                if (-not $isSmallInput -and $WaitForP0CasesSeconds -gt 0 -and $p0Baseline.Count -gt 0) {
                     $p0Wait = Wait-Until -TimeoutSeconds $WaitForP0CasesSeconds -IntervalSeconds 10 -Description "P0 case coverage" -Condition {
                         $currentGraph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
                         $currentCards = @(Get-AcceptanceCaseCards -Graph $currentGraph)
@@ -995,14 +1021,14 @@ try {
                     if ($p0Wait.Ok -and $null -ne $p0Wait.Value) {
                         $graph = $p0Wait.Value.Graph
                         $caseCards = @($p0Wait.Value.Cards)
-                        Add-AcceptanceCheck -Scenario $scenario -Name "P0 case coverage wait completed" -Passed $true -Severity warning `
+                        Add-AcceptanceCheck -Scenario $scenario -Name "legacy P0 case coverage wait completed" -Passed $true -Severity warning `
                             -Detail ("p0=$($p0Baseline.Count)/$($p0Baseline.Count) cases=$($caseCards.Count)")
                     } else {
                         $graph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
                         $caseCards = @(Get-AcceptanceCaseCards -Graph $graph)
                         $latestTrace = Get-CaseSutTraceability -Requirements $requirements -CaseCards $caseCards
                         $coveredP0 = @($p0Baseline | Where-Object { $latestTrace.CaseCountBySutId.ContainsKey([string]$_.id) })
-                        Add-AcceptanceCheck -Scenario $scenario -Name "P0 case coverage wait completed" -Passed $false -Severity warning `
+                        Add-AcceptanceCheck -Scenario $scenario -Name "legacy P0 case coverage wait completed" -Passed $false -Severity warning `
                             -Detail ("p0_with_cases=$($coveredP0.Count)/$($p0Baseline.Count) after ${WaitForP0CasesSeconds}s; matrix records the real remainder")
                     }
                 }
@@ -1027,6 +1053,18 @@ try {
                 $smallExpectedFrIds = if ($isSmallInput) { @($requirementProfile.ExpectedFrIds) } else { @() }
                 $smallCaseOutside = if ($isSmallInput) { @($caseSutIds | Where-Object { $smallExpectedFrIds -notcontains $_ }) } else { @() }
                 $smallFrWithCases = if ($isSmallInput) { @($smallExpectedFrIds | Where-Object { $caseSutIds -contains $_ }) } else { @() }
+                # Task 111: deterministic P0 gates. The small-input gate fails
+                # when any expected requirement has zero cases; the baseline P0
+                # gate is a hard assertion for the small input (all requirements
+                # are P0) and keeps the legacy warning elsewhere.
+                $p0ExpectedIds = @($p0Baseline | ForEach-Object { [string]$_.id })
+                $smallCoverage = if ($isSmallInput) {
+                    Get-AcceptanceP0CaseCoverage -ExpectedFrIds $smallExpectedFrIds -Requirements $requirements -CaseCards $caseCards
+                } else { $null }
+                $p0Coverage = if ($p0ExpectedIds.Count -gt 0) {
+                    Get-AcceptanceP0CaseCoverage -ExpectedFrIds $p0ExpectedIds -Requirements $requirements -CaseCards $caseCards
+                } else { $null }
+                $p0CoverageSeverity = if ($isSmallInput) { "assertion" } else { "warning" }
                 [void](Write-S3Evidence -Name "case-traceability.json" -Value ([pscustomobject]@{
                     generated_at             = (Get-Date).ToUniversalTime().ToString("o")
                     mode                     = $profileMode
@@ -1041,6 +1079,8 @@ try {
                     nfr_with_cases           = @($nfrWithCases | ForEach-Object { $_.id })
                     p0_with_cases            = @($p0WithCases | ForEach-Object { $_.id })
                     p0_total                 = $p0Baseline.Count
+                    p0_missing               = if ($null -ne $p0Coverage) { @($p0Coverage.Missing) } else { @() }
+                    small_coverage_passed    = if ($null -ne $smallCoverage) { $smallCoverage.Passed } else { $null }
                     v2_case_rows             = @($v2CaseRows)
                     rows                     = @($caseTrace.Rows)
                 }) -Kind "coverage" -Note "case -> requirement -> FR/NFR traceability")
@@ -1051,19 +1091,87 @@ try {
                     Add-AcceptanceCheck -Scenario $scenario -Name "design cases target only the small-input requirements" `
                         -Passed (@($caseCards).Count -ge 1 -and @($smallCaseOutside).Count -eq 0 -and @($smallFrWithCases).Count -ge 1) -Severity assertion `
                         -Detail ("expected=$($smallExpectedFrIds -join ',') with_cases=$($smallFrWithCases -join ',') outside=$($smallCaseOutside -join ',') cases=$(@($caseCards).Count)")
+                    # Task 111: retry-9 recorded 1/3 as a warning while S4/S5/S6
+                    # then over-claimed 11/11. In small-input mode every expected
+                    # P0 requirement must have a real case; a zero-case P0 fails
+                    # S3 and names the missing IDs.
                     Add-AcceptanceCheck -Scenario $scenario -Name "all small-input requirements have design cases" `
-                        -Passed (@($smallFrWithCases).Count -eq @($smallExpectedFrIds).Count) -Severity warning `
-                        -Detail ("with_cases=$(@($smallFrWithCases).Count)/$(@($smallExpectedFrIds).Count) covered=$($smallFrWithCases -join ','); the product may produce fewer cases and the matrix records the real remainder")
+                        -Passed ($smallCoverage.Passed) -Severity assertion `
+                        -Detail $smallCoverage.Detail
+                    if (-not $smallCoverage.Passed) {
+                        $scenario.ErrorMessage = "S3 failed: the small-input design gate is missing cases for $(@($smallCoverage.Missing) -join ','); a partial design snapshot is not a pass"
+                    }
                 }
                 Add-AcceptanceCheck -Scenario $scenario -Name "V2 延展·未实现 not designed as delivered cases" `
                     -Passed (@($v2CaseRows).Count -eq 0) -Severity assertion `
                     -Detail "v2_cases=$(@($v2CaseRows).Count)"
-                Add-AcceptanceCheck -Scenario $scenario -Name "P0 requirements have design cases" `
-                    -Passed ($p0WithCases.Count -ge 1) -Severity warning `
-                    -Detail ("p0_with_cases=$($p0WithCases.Count)/$($p0Baseline.Count) covered=$(@($p0WithCases | ForEach-Object { $_.id }) -join ',')")
+                if ($null -ne $p0Coverage) {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "P0 requirements have design cases" `
+                        -Passed ($p0Coverage.Passed) -Severity $p0CoverageSeverity `
+                        -Detail $p0Coverage.Detail
+                } else {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "P0 requirements have design cases" -Passed $false -Severity warning `
+                        -Detail "no P0 baseline entries are available; the P0 design gate cannot be evaluated"
+                }
                 Add-AcceptanceCheck -Scenario $scenario -Name "all V1 requirements have design cases" `
                     -Passed ($frWithCases.Count -eq $v1FrBaseline.Count -and $nfrWithCases.Count -eq $nfrBaseline.Count) -Severity warning `
                     -Detail ("fr_with_cases=$($frWithCases.Count)/$($v1FrBaseline.Count) nfr_with_cases=$($nfrWithCases.Count)/$($nfrBaseline.Count)")
+
+                # Task 111: having a case node is not enough; the P0 case S4/S5
+                # will select must be executable (steps + at least one assertion
+                # with a non-empty expected). Verify one representative per P0
+                # requirement and record it as evidence.
+                if ($isSmallInput) {
+                    $p0ExecutableRows = @()
+                    foreach ($expectedSutId in $smallExpectedFrIds) {
+                        $sutKey = [string]$expectedSutId
+                        $caseIds = @()
+                        if ($smallCoverage.CaseIdsBySutId.ContainsKey($sutKey)) {
+                            $caseIds = @($smallCoverage.CaseIdsBySutId[$sutKey])
+                        }
+                        $representativeCaseId = if ($caseIds.Count -gt 0) { [string]$caseIds[0] } else { "" }
+                        $row = [pscustomobject]@{
+                            sut_id        = [string]$expectedSutId
+                            case_id       = $representativeCaseId
+                            steps         = 0
+                            assertions    = 0
+                            with_expected = 0
+                            executable    = $false
+                            error         = ""
+                        }
+                        if ($representativeCaseId -eq "") {
+                            $row.error = "no design case"
+                        } else {
+                            try {
+                                $detail = Get-AcceptanceCaseDetail -Context $context -VersionId $versionId -CaseId $representativeCaseId
+                                $selected = Get-JsonProp -Object $detail -Name "selected" -Default $null
+                                $steps = @(Get-JsonProp -Object $selected -Name "steps" -Default @())
+                                $assertions = @(Get-JsonProp -Object $selected -Name "assertions" -Default @())
+                                $withExpected = @($assertions | Where-Object { -not [string]::IsNullOrWhiteSpace([string](Get-JsonProp -Object $_ -Name "expected" -Default "")) })
+                                $row.steps = $steps.Count
+                                $row.assertions = $assertions.Count
+                                $row.with_expected = $withExpected.Count
+                                $row.executable = ($steps.Count -ge 1 -and $withExpected.Count -ge 1)
+                                if (-not $row.executable) { $row.error = "not executable (steps=$($steps.Count) withExpected=$($withExpected.Count))" }
+                            } catch {
+                                $row.error = $_.Exception.Message
+                            }
+                        }
+                        $p0ExecutableRows += $row
+                    }
+                    $executableCount = @($p0ExecutableRows | Where-Object { $_.executable }).Count
+                    [void](Write-S3Evidence -Name "p0-case-executable.json" -Value ([pscustomobject]@{
+                        expected_fr_ids = @($smallExpectedFrIds)
+                        executable      = $executableCount
+                        rows            = @($p0ExecutableRows)
+                    }) -Kind "coverage" -Note "one executable case per small-input P0 requirement")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "each small-input P0 requirement has an executable case" `
+                        -Passed ($executableCount -eq $smallExpectedFrIds.Count) -Severity assertion `
+                        -Detail ("executable=$executableCount/$($smallExpectedFrIds.Count); " + ((@($p0ExecutableRows | Where-Object { -not $_.executable } | ForEach-Object { "$($_.sut_id):$($_.error)" }) -join ',')))
+                    if ($executableCount -ne $smallExpectedFrIds.Count) {
+                        $scenario.ErrorMessage = "S3 failed: not every small-input P0 requirement has an executable case (see p0-case-executable.json)"
+                    }
+                }
 
                 $overview = $null
                 try { $overview = Get-AcceptanceDesignOverview -Context $context -VersionId $versionId } catch { }
