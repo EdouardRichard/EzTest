@@ -355,6 +355,64 @@ func (r *RuntimeRepository) GetContextPacket(ctx context.Context, id int64) (age
 	return packet, nil
 }
 
+// LatestVersionContextPacket returns the newest context packet persisted for one
+// version, or agent.ErrNotFound. It is the read side of the 0.2.1 cache-first
+// context packet API: read-only and version-scoped. The version is already
+// denormalized on the row (context_packet.version_id), so no agent_run join is
+// needed; ordering by the snowflake ID is the persisted creation order.
+func (r *RuntimeRepository) LatestVersionContextPacket(ctx context.Context, versionID int64) (agent.ContextPacket, error) {
+	if versionID <= 0 {
+		return agent.ContextPacket{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	packet, err := scanPacket(r.pool.QueryRow(ctx, `
+		SELECT `+packetColumns+` FROM context_packet
+		WHERE version_id = $1
+		ORDER BY id DESC
+		LIMIT 1
+	`, versionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agent.ContextPacket{}, agent.ErrNotFound
+	}
+	if err != nil {
+		return agent.ContextPacket{}, wrapDB("latest context packet", err)
+	}
+	return packet, nil
+}
+
+// UpdateContextPacketCacheStats overwrites the provider-reported prompt cache
+// bookkeeping of one persisted packet (contracts §18.2.6). Only token_counts
+// changes; sections, hash and identity stay immutable. It returns
+// agent.ErrNotFound when the packet does not exist.
+func (r *RuntimeRepository) UpdateContextPacketCacheStats(ctx context.Context, id int64, cachedTokens int, cacheHit bool) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if cachedTokens < 0 {
+		return platform.Invalid("cached_tokens", "must not be negative")
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE context_packet
+		SET token_counts = jsonb_set(
+			jsonb_set(token_counts, '{cached_tokens}', to_jsonb($2::int), true),
+			'{cache_hit}', to_jsonb($3::int), true)
+		WHERE id = $1
+	`, id, cachedTokens, boolToInt(cacheHit))
+	if err != nil {
+		return wrapDB("update context packet cache stats", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrNotFound
+	}
+	return nil
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func scanProfile(row rowScanner) (agent.AgentProfile, error) {
 	var profile agent.AgentProfile
 	var toolsRaw, budgetsRaw []byte

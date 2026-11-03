@@ -97,6 +97,10 @@ type Deps struct {
 	// Jobs is the optional 0.2.1 job control surface (cancel/retry). Nil leaves
 	// both the direct and the version-scoped routes unmounted.
 	Jobs *agentapi.JobControlHandler
+	// ContextPackets is the optional 0.2.1 cache-first context_packet read port
+	// (Task 48). The route is always mounted behind the admin gate; a nil reader
+	// answers 503 instead of exposing a working endpoint or panicking.
+	ContextPackets agentapi.ContextPacketReader
 	// Load counts in-flight API requests for drain/rolling-upgrade observability
 	// (P8). Nil disables the counter.
 	Load *load.Counter
@@ -181,6 +185,7 @@ func New(deps Deps) http.Handler {
 	registerP6Routes(mux, authenticated, admin, deps.P6)
 	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
 	registerJobRoutes(mux, authenticated, deps.Jobs)
+	registerContextPacketRoutes(mux, admin, deps.ContextPackets)
 
 	var chain http.Handler = mux
 	if deps.Settings != nil {
@@ -267,6 +272,17 @@ func registerJobRoutes(mux *http.ServeMux, authenticated func(http.Handler) http
 		return
 	}
 	h.Register(mux, authenticated)
+}
+
+// registerContextPacketRoutes mounts the 0.2.1 cache-first context_packet read
+// API (Task 48). The packet contains the stable system-prompt prefix and the
+// replayed transcript, so the route is mounted behind the admin gate (Task 14's
+// handler is admin-only as well; spec R9). The handler is always constructed:
+// an unwired reader answers 503 instead of panicking, so a deployment whose
+// composition root has not supplied the version-latest reader never exposes a
+// broken 200.
+func registerContextPacketRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, reader agentapi.ContextPacketReader) {
+	agentapi.RegisterContextPacketRoutes(mux, admin, agentapi.NewContextPacketHandler(reader))
 }
 
 type identityAuthenticator struct {

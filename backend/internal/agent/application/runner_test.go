@@ -13,6 +13,7 @@ import (
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
@@ -41,6 +42,7 @@ type runnerFixture struct {
 	knowledge       *fakeKnowledgeReader
 	knowledgeUsage  *fakeKnowledgeUsageRecorder
 	knowledgeWriter *fakeKnowledgeWriter
+	briefing        *fakeBriefingSource
 	load            *load.Counter
 }
 
@@ -93,6 +95,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		knowledge:       &fakeKnowledgeReader{},
 		knowledgeUsage:  &fakeKnowledgeUsageRecorder{},
 		knowledgeWriter: &fakeKnowledgeWriter{},
+		briefing:        defaultAssemblyBriefing(),
 		load:            &load.Counter{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
@@ -111,6 +114,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		Content:        fixture.content,
 		Knowledge:      fixture.knowledge,
 		KnowledgeUsage: fixture.knowledgeUsage,
+		Briefing:       agentcontext.NewBriefingBuilder(fixture.briefing),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Load:           fixture.load,
 		TaskProvider:   taskProvider,
@@ -320,7 +324,12 @@ func TestRunnerScoutWritesTeamRoomFinding(t *testing.T) {
 	if len(fixture.chat.requests) == 0 || len(fixture.chat.requests[0].Messages) < 2 {
 		t.Fatalf("chat request missing user attachment context: %#v", fixture.chat.requests)
 	}
-	userContent := fixture.chat.requests[0].Messages[1].Content
+	messages := fixture.chat.requests[0].Messages
+	last := messages[len(messages)-1]
+	if last.Role != "user" {
+		t.Fatalf("last prompt message role = %q, want the current user turn", last.Role)
+	}
+	userContent := last.Content
 	if !strings.Contains(userContent, "请阅读附件《需求.md》") || !strings.Contains(userContent, "登录需求正文") {
 		t.Fatalf("scout user content = %q", userContent)
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -33,7 +34,6 @@ const (
 	finishTimeout             = 5 * time.Second
 	toolResultHeadRunes       = 2000
 	scoutAttachmentTextRunes  = 4000
-	contextSectionSystem      = "system"
 )
 
 // RunnerDeps wires the P1 agent run loop.
@@ -75,6 +75,10 @@ type RunnerDeps struct {
 	// KnowledgeUsage records knowledge_usage rows after the context packet is
 	// persisted. Nil disables usage accounting.
 	KnowledgeUsage KnowledgeUsageRecorder
+	// Briefing builds the derived version briefing appended to the cache-first
+	// context on every round (Task 48). Nil keeps the version pack facts only;
+	// the assembler prefix and transcript are still rendered.
+	Briefing *agentcontext.BriefingBuilder
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -113,6 +117,8 @@ type Runner struct {
 	load                 *load.Counter
 	instanceID           string
 	builder              *ContextBuilder
+	briefing             *agentcontext.BriefingBuilder
+	assembler            *agentcontext.Assembler
 }
 
 // NewRunner wires the agent runner.
@@ -146,6 +152,8 @@ func NewRunner(deps RunnerDeps) *Runner {
 		load:                 deps.Load,
 		instanceID:           deps.InstanceID,
 		builder:              NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
+		briefing:             deps.Briefing,
+		assembler:            agentcontext.NewAssembler(),
 	}
 }
 
@@ -357,15 +365,28 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 
 // runState carries one run's mutable state.
 type runState struct {
-	item        agent.WorkItem
-	payload     WorkItemPayload
-	profile     agent.AgentProfile
-	run         agent.AgentRun
-	input       ContextInput
-	packet      agent.ContextPacket
-	model       llmapp.ModelInfo
-	registry    *tools.Registry
-	definitions []llmapp.ToolDefinition
+	item    agent.WorkItem
+	payload WorkItemPayload
+	profile agent.AgentProfile
+	run     agent.AgentRun
+	input   ContextInput
+	packet  agent.ContextPacket
+	// contextPacket is the cache-first packet the current prompt was rendered
+	// from. It is persisted through EncodeContextPacket and its cache
+	// bookkeeping is overwritten by the provider usage (contract §18.2.6).
+	contextPacket agentcontext.ContextPacket
+	// cacheStatsApplied guards the at-most-one context.cache_stats event per
+	// run (contracts/events.md §18.2 #8).
+	cacheStatsApplied bool
+	// providerCacheTokens/providerCacheHit carry the provider-reported cache
+	// booking across a boundary rebuild so a compacted packet persisted after
+	// the first model turn keeps the authoritative statistics.
+	providerCacheTokens   int
+	providerCacheHit      bool
+	providerCacheReported bool
+	model                 llmapp.ModelInfo
+	registry              *tools.Registry
+	definitions           []llmapp.ToolDefinition
 	// roleTools is the intersection of the profile's allowed tools with the
 	// catalog role whitelist (R51); it is the surface exposed to the model.
 	roleTools tools.ToolSet
@@ -750,33 +771,51 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	state.roleTools, state.roleGuard, state.roleMapped = roleToolSurface(state.profile, r.audit)
 	state.definitions = state.roleTools.Definitions(state.registry)
 
-	packet, compactInfo, err := r.builder.Build(ctx, state.input)
+	// Knowledge is supplemental reference data: cap it at the injection budget
+	// before the assembler renders the pinned facts (contract §10.3).
+	knowledgeBudget := DefaultKnowledgeBudgetTokens
+	if r.builder != nil {
+		knowledgeBudget = r.builder.knowledgeBudgetTokens(ctx)
+	}
+	state.input.VersionPack.Knowledge = fitKnowledge(state.input.VersionPack.Knowledge, knowledgeBudget)
+
+	// Task 48 cache-first prompt: the assembler renders the byte-stable prefix
+	// and the append-only suffix once per run (and again only at a declared
+	// boundary rebuild). Compaction never happens on a normal round.
+	assembly, err := r.assembleContext(ctx, state, nil, agentcontext.InvalidationNone)
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	packet.RunID = state.run.ID
-	saved, err := r.repo.SaveContextPacket(ctx, packet)
+	state.contextPacket = assembly.Packet
+	state.budget = assembly.Budget
+	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	state.packet = saved
-	state.budget = compactInfo.Budget
 	state.run.ContextPacketID = &saved.ID
-	r.persistCompaction(ctx, state, compactInfo, "threshold")
+	// A boundary compaction persists its rolling summary and emits the
+	// compaction event; an append-only round writes neither.
+	if assembly.Compacted {
+		r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, true)
+	}
 	// knowledge_usage is written once per run from the persisted packet; a
 	// failure is logged and never fails the run (contracts §10.3).
 	r.recordKnowledgeUsage(ctx, state)
 
-	systemContent := sectionContent(saved, contextSectionSystem)
+	systemText := contextPacketPrefix(assembly.Packet)
+	if strings.TrimSpace(systemText) == "" {
+		systemText = systemContent(state.input)
+	}
 	userContent := r.userMessage(ctx, state, attachmentText)
 	state.userContent = userContent
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, userContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	state.messages = promptMessagesFor(state, saved, userContent)
+	state.messages = append(assembly.Messages, currentUserChatMessage(state, userContent))
 	return nil
 }
 
@@ -853,6 +892,9 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		}
 		state.turns++
 		mergeUsage(state.usage, response.Usage)
+		// Contract §18.2.6: the provider usage is authoritative for the prompt
+		// cache bookkeeping; the assembler's local estimate is overwritten.
+		r.applyProviderCacheStats(ctx, state, response.Usage)
 		// 0.2.1 job.progress: every completed model turn is a real step of the
 		// work item. It goes through the worker's per-job coalescer.
 		r.reportJobProgress(ctx, state)
@@ -1024,59 +1066,56 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 	return nil
 }
 
-// handleOverflow compacts the context and retries: half budget first, then the
-// minimal context. A third overflow is unrecoverable; context_overflow alone
-// never terminates the run.
+// handleOverflow compacts the context at a declared window_full boundary and
+// retries. The first two overflows retry with the compacted packet (summary +
+// the configured recent window); a third overflow is unrecoverable.
+// context_overflow alone never terminates the run.
 func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.overflowHits++
-	var budget int
-	switch state.overflowHits {
-	case 1:
-		budget = state.budget / 2
-	case 2:
-		budget = MinUsableBudget
-	default:
+	if state.overflowHits > 2 {
 		return &RunError{
 			Reason:    "context_overflow_unrecoverable",
 			Retryable: true,
 			Cause:     errors.New("model rejected the context window even after compaction"),
 		}
 	}
-	compacted, _ := Compact(state.input, budget)
-	packet, info, err := r.builder.Build(ctx, compacted)
+	previous := state.contextPacket
+	assembly, err := r.assembleContext(ctx, state, &previous, agentcontext.InvalidationWindowFull)
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	packet.RunID = state.run.ID
-	saved, err := r.repo.SaveContextPacket(ctx, packet)
+	state.contextPacket = assembly.Packet
+	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	state.packet = saved
-	state.input = compacted
 	state.run.ContextPacketID = &saved.ID
-	systemContent := sectionContent(saved, contextSectionSystem)
-	state.messages = promptMessagesFor(state, saved, state.userContent)
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-	}
-	summaryVersion := 0
-	if info.Compacted && strings.TrimSpace(info.Summary) != "" && state.payload.ConversationID > 0 && r.conversation != nil {
-		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID, state.payload.ConversationID, info.Summary, state.input.Conversation.PinnedFacts)
-		if err == nil {
-			summaryVersion = stored.Version
+	// A boundary rebuild persists a new packet row; carry the provider cache
+	// bookkeeping observed on an earlier turn so the latest row stays
+	// authoritative (the context.cache_stats event is still emitted once).
+	if state.providerCacheReported {
+		state.contextPacket.CachedTokens = state.providerCacheTokens
+		state.contextPacket.CacheHit = state.providerCacheHit
+		if state.packet.TokenCounts == nil {
+			state.packet.TokenCounts = map[string]int{}
+		}
+		state.packet.TokenCounts["cached_tokens"] = state.providerCacheTokens
+		state.packet.TokenCounts["cache_hit"] = boolInt(state.providerCacheHit)
+		if err := r.repo.UpdateContextPacketCacheStats(ctx, saved.ID,
+			state.providerCacheTokens, state.providerCacheHit); err != nil {
+			r.logContextWarning(ctx, "carry provider cache stats to the compacted packet failed", err)
 		}
 	}
-	payload := map[string]any{
-		"run_id":          idText(state.run.ID),
-		"summary_version": summaryVersion,
-		"token_before":    info.BeforeTokens,
-		"token_after":     info.AfterTokens,
+	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
+	systemText := contextPacketPrefix(assembly.Packet)
+	if strings.TrimSpace(systemText) == "" {
+		systemText = systemContent(state.input)
 	}
-	if state.payload.ConversationID > 0 {
-		payload["conversation_id"] = idText(state.payload.ConversationID)
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
+		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	r.publish(state, "context.compacted", payload)
+	r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, assembly.Compacted)
 	return nil
 }
 
@@ -1363,29 +1402,6 @@ func (r *Runner) persistAssistant(ctx context.Context, state *runState, response
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	return nil
-}
-
-func (r *Runner) persistCompaction(ctx context.Context, state *runState, info CompactInfo, reason string) {
-	if !info.Compacted || strings.TrimSpace(info.Summary) == "" {
-		return
-	}
-	summaryVersion := 0
-	if state.payload.ConversationID > 0 && r.conversation != nil {
-		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID, state.payload.ConversationID, info.Summary, state.input.Conversation.PinnedFacts)
-		if err == nil {
-			summaryVersion = stored.Version
-		}
-	}
-	payload := map[string]any{
-		"run_id":          idText(state.run.ID),
-		"summary_version": summaryVersion,
-		"token_before":    info.BeforeTokens,
-		"token_after":     info.AfterTokens,
-	}
-	if state.payload.ConversationID > 0 {
-		payload["conversation_id"] = idText(state.payload.ConversationID)
-	}
-	r.publish(state, "context.compacted", payload)
 }
 
 func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
@@ -2343,54 +2359,6 @@ func requirementCard(toolName string, payload any) (ConversationPart, bool) {
 		data["title"] = title
 	}
 	return ConversationPart{Type: "requirement_card", Data: data}, true
-}
-
-func sectionContent(packet agent.ContextPacket, name string) string {
-	for _, section := range packet.Sections {
-		if section.Name == name {
-			return section.Content
-		}
-	}
-	return ""
-}
-
-// promptMessages renders the persisted context packet into the actual model
-// prompt. The system section carries the profile/task instructions; every
-// non-system section (version pack, rolling summary/recent window, team room,
-// artifacts) is injected ahead of the current user message so context is not
-// merely persisted without ever reaching the model.
-func promptMessages(packet agent.ContextPacket, userContent string) []llmapp.ChatMessage {
-	system := sectionContent(packet, contextSectionSystem)
-	var builder strings.Builder
-	for _, section := range packet.Sections {
-		if section.Name == contextSectionSystem || strings.TrimSpace(section.Content) == "" {
-			continue
-		}
-		if builder.Len() > 0 {
-			builder.WriteString("\n\n")
-		}
-		fmt.Fprintf(&builder, "## %s\n%s", section.Name, section.Content)
-	}
-	if builder.Len() > 0 {
-		builder.WriteString("\n\n# 当前用户消息\n")
-	}
-	builder.WriteString(userContent)
-	return []llmapp.ChatMessage{
-		{Role: "system", Content: system},
-		{Role: "user", Content: builder.String()},
-	}
-}
-
-// promptMessagesFor renders the prompt and attaches the triggering message's
-// images to the current user turn, where vision models expect them.
-func promptMessagesFor(state *runState, packet agent.ContextPacket, userContent string) []llmapp.ChatMessage {
-	messages := promptMessages(packet, userContent)
-	if len(state.images) == 0 || len(messages) == 0 {
-		return messages
-	}
-	last := len(messages) - 1
-	messages[last].Images = append([]llmapp.ChatImage(nil), state.images...)
-	return messages
 }
 
 func mergeUsage(target map[string]int, addition map[string]int) {

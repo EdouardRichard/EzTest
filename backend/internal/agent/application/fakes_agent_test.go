@@ -30,6 +30,9 @@ type fakeRuntimeRepo struct {
 	messages  []agent.AgentMessage
 	packets   []agent.ContextPacket
 	packetIDs map[int64]agent.ContextPacket
+	// packetCacheUpdates counts the provider cache-stat overwrites persisted
+	// through UpdateContextPacketCacheStats.
+	packetCacheUpdates int
 }
 
 func newFakeRuntimeRepo() *fakeRuntimeRepo {
@@ -142,6 +145,37 @@ func (f *fakeRuntimeRepo) GetContextPacket(_ context.Context, id int64) (agent.C
 		return agent.ContextPacket{}, agent.ErrNotFound
 	}
 	return packet, nil
+}
+
+// UpdateContextPacketCacheStats mirrors the production token_counts rewrite:
+// only the provider cache bookkeeping changes, the packet content is immutable.
+func (f *fakeRuntimeRepo) UpdateContextPacketCacheStats(_ context.Context, id int64, cachedTokens int, cacheHit bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	packet, ok := f.packetIDs[id]
+	if !ok {
+		return agent.ErrNotFound
+	}
+	f.packetCacheUpdates++
+	if packet.TokenCounts == nil {
+		packet.TokenCounts = map[string]int{}
+	}
+	packet.TokenCounts["cached_tokens"] = cachedTokens
+	packet.TokenCounts["cache_hit"] = cacheHitInt(cacheHit)
+	f.packetIDs[id] = packet
+	for index := range f.packets {
+		if f.packets[index].ID == id {
+			f.packets[index] = packet
+		}
+	}
+	return nil
+}
+
+func cacheHitInt(cacheHit bool) int {
+	if cacheHit {
+		return 1
+	}
+	return 0
 }
 
 func (f *fakeRuntimeRepo) lastFinished(t interface{ Fatalf(string, ...any) }) agent.AgentRun {

@@ -135,4 +135,9 @@ type RuntimeRepository interface {
 	SaveContextPacket(ctx context.Context, packet ContextPacket) (ContextPacket, error)
 	// GetContextPacket loads one packet, or ErrNotFound.
 	GetContextPacket(ctx context.Context, id int64) (ContextPacket, error)
+	// UpdateContextPacketCacheStats overwrites the provider-reported prompt
+	// cache bookkeeping of a persisted packet (contracts §18.2.6). The packet
+	// content is immutable; only token_counts changes after the first model
+	// response. It returns ErrNotFound when the packet does not exist.
+	UpdateContextPacketCacheStats(ctx context.Context, id int64, cachedTokens int, cacheHit bool) error
 }
