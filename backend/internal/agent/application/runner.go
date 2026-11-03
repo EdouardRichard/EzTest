@@ -2235,6 +2235,21 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 // round (read + one propose per activated requirement) without being unbounded.
 const DesignRunMaxTokens = 200000
 
+// CaseExecutorRunMaxTokens is the case-scale token budget of a real case
+// execution (Task 89). Usage is cumulative across the turns of one run and every
+// turn re-sends the task pack plus the browser snapshot/ARIA tool results, so
+// the generic 20k chat budget was exhausted after four turns in the final small
+// S5 run (31,943 / 33,979 total tokens): the following settlement turn disabled
+// tools and execution.step_record/assertion_record could never write anything,
+// leaving both case runs with assertion_total=0. 200k matches the design case
+// scale and leaves headroom for the remaining steps, assertions and evidence
+// calls while remaining a bounded cap. The runner enforces it in code because
+// the stored profile row is seeded once and EnsureProfiles never overwrites an
+// existing row, so a stale chat-scale row must not pull the executor back to the
+// generic budget (same reasoning as the Task 79 design floor). A work item's
+// explicit 0.2.1 budget declaration still wins over the profile floor.
+const CaseExecutorRunMaxTokens = 200000
+
 // Design authoring envelope (Task 79). The stored profile budgets cannot be
 // trusted for design runs: profiles are seeded once and EnsureProfiles never
 // overwrites an existing row, so the live 0.2.1 database still carries the
@@ -2364,6 +2379,11 @@ func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile)
 		if minimum := DesignRunMinAuthorTurns * DesignAuthorTurnTokens; budget.MaxTokens < minimum {
 			budget.MaxTokens = minimum
 		}
+	} else if profile.Key == ProfileKeyCaseExecutor {
+		// Real execute.case runs must record steps/assertions before the token
+		// budget asks for settlement; the generic 20k chat default cannot cover
+		// the task pack plus browser results (Task 89).
+		budget.MaxTokens = CaseExecutorRunMaxTokens
 	}
 	trimmed := strings.TrimSpace(string(item.Budget))
 	if trimmed == "" || trimmed == "null" {
