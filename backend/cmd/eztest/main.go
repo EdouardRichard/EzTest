@@ -839,17 +839,6 @@ func main() {
 		requirementRepo, versionSvc, resourceSvc,
 		designStale, auditSvc, eventSvc, ids, clk)
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
-	// 0.2.1 job control (cancel/retry) is mounted by the HTTP layer only when
-	// server.Deps.Jobs is set. The repository is the postgres job-control
-	// adapter, audit and events are best-effort collaborators, and the service
-	// fails closed (503) rather than panicking if it were ever built without a
-	// repository.
-	jobControlHandler := agentapi.NewJobControlHandler(agentapp.NewJobControl(agentapp.JobControlDeps{
-		Jobs:   workItems,
-		Audit:  auditSvc,
-		Events: eventSvc,
-		Clock:  clk,
-	}))
 	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
 	workQueue.SetEvents(eventSvc)
 	teamRoom := agentapp.NewTeamRoom(agentpg.NewTeamRoomRepository(pool, ids), clk, ids, settingsSvc, eventSvc)
@@ -861,6 +850,19 @@ func main() {
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
 	conversationSvc.SetModelCatalog(conversationModelCatalog{svc: llmSvc})
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
+	// 0.2.1 job control (cancel/retry) is mounted by the HTTP layer only when
+	// server.Deps.Jobs is set. The repository is the postgres job-control
+	// adapter, audit and events are best-effort collaborators, and the service
+	// fails closed (503) rather than panicking if it were ever built without a
+	// repository. The version conversation service owns the persisted job card
+	// write-back (Task 63), so the handler is built after it.
+	jobControlHandler := agentapi.NewJobControlHandler(agentapp.NewJobControl(agentapp.JobControlDeps{
+		Jobs:     workItems,
+		Audit:    auditSvc,
+		Events:   eventSvc,
+		Clock:    clk,
+		JobCards: conversationSvc, // Task 63: persisted job card write-back
+	}))
 
 	// P3-T5 production version-briefing read path. The reader is a read-only,
 	// deterministic SQL source over the version/design/execution/knowledge
