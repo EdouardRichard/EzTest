@@ -26,6 +26,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
+	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
@@ -840,6 +841,17 @@ func main() {
 		requirementRepo, versionSvc, resourceSvc,
 		designStale, auditSvc, eventSvc, ids, clk)
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
+	// 0.2.1 job control (cancel/retry) is mounted by the HTTP layer only when
+	// server.Deps.Jobs is set. The repository is the postgres job-control
+	// adapter, audit and events are best-effort collaborators, and the service
+	// fails closed (503) rather than panicking if it were ever built without a
+	// repository.
+	jobControlHandler := agentapi.NewJobControlHandler(agentapp.NewJobControl(agentapp.JobControlDeps{
+		Jobs:   workItems,
+		Audit:  auditSvc,
+		Events: eventSvc,
+		Clock:  clk,
+	}))
 	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
 	workQueue.SetEvents(eventSvc)
 	teamRoom := agentapp.NewTeamRoom(agentpg.NewTeamRoomRepository(pool, ids), clk, ids, settingsSvc, eventSvc)
@@ -1470,6 +1482,7 @@ func main() {
 		Visual:        p5.Visual,
 		P6:            &p6Read.Handlers,
 		P7:            p7rt.p7ServerHandlers(),
+		Jobs:          jobControlHandler,
 		Load:          requestLoad,
 	})
 

@@ -33,7 +33,8 @@ import (
 )
 
 // jobControlSeed is one work_item fixture row. The zero MaxAttempts defaults to
-// 3 like the 0.2.1 contract default.
+// 3 like the 0.2.1 contract default. Legacy seeds omit the 0.2.1 kind so the
+// row looks like a pre-0.2.1 work item (empty kind).
 type jobControlSeed struct {
 	ID          int64
 	VersionID   int64
@@ -45,6 +46,7 @@ type jobControlSeed struct {
 	LastError   string
 	Payload     string
 	Claimed     bool // claimed_by/lease_until are set (claimed/running rows)
+	Legacy      bool // kind stays '' (pre-0.2.1 row, legacy claim path)
 	AvailableAt time.Time
 }
 
@@ -61,6 +63,10 @@ func seedJobControlItem(t *testing.T, pool *pgxpool.Pool, seed jobControlSeed) {
 	if availableAt.IsZero() {
 		availableAt = time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
 	}
+	kind := "execute.batch"
+	if seed.Legacy {
+		kind = ""
+	}
 	var lastError any
 	if seed.LastError != "" {
 		lastError = seed.LastError
@@ -74,12 +80,12 @@ func seedJobControlItem(t *testing.T, pool *pgxpool.Pool, seed jobControlSeed) {
 		INSERT INTO work_item (id, version_id, team, type, kind, goal, status, priority,
 			dedupe_key, payload, created_by, attempts, max_attempts, lease_epoch,
 			claimed_by, lease_until, last_error, available_at, created_at, updated_at)
-		VALUES ($1, $2, 'execution', 'job.control.test', 'execute.batch',
+		VALUES ($1, $2, 'execution', 'job.control.test', $14,
 		        'job control integration test', $3, $4, $5, $6::jsonb, 'state_machine',
 		        $7, $8, $9, $10, $11, $12, $13, $13, $13)
 	`, seed.ID, seed.VersionID, seed.Status, seed.Priority,
 		fmt.Sprintf("job-control-%d", seed.ID), payload, seed.Attempts, seed.MaxAttempts,
-		seed.LeaseEpoch, claimedBy, leaseUntil, lastError, availableAt); err != nil {
+		seed.LeaseEpoch, claimedBy, leaseUntil, lastError, availableAt, kind); err != nil {
 		t.Fatalf("seed work item %d: %v", seed.ID, err)
 	}
 }
@@ -341,6 +347,61 @@ func TestJobRetryControlSQL(t *testing.T) {
 
 	if _, err := repo.RetryJob(ctx, versionID, 999999, now); !errors.Is(err, agent.ErrNotFound) {
 		t.Fatalf("missing RetryJob error = %v, want agent.ErrNotFound", err)
+	}
+}
+
+// TestJobRetryRejectsLegacyKind pins the Task 60 legacy fence at the SQL layer:
+// a pre-0.2.1 work_item row (empty kind) is dispatched by the legacy Claim* path,
+// whose work_item_attempt number is the attempts budget counter. The 0.2.1 job
+// control adapter must not read, cancel or retry such a row by raw ID — both
+// scoped reads and both writes report agent.ErrNotFound and change nothing.
+func TestJobRetryRejectsLegacyKind(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
+	ctx := context.Background()
+	now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	const versionID = int64(7108)
+
+	seedJobControlItem(t, pool, jobControlSeed{
+		ID: 9501, VersionID: versionID, Status: "failed", Attempts: 1, MaxAttempts: 3,
+		LastError: "legacy boom", Legacy: true, AvailableAt: now.Add(-time.Hour),
+	})
+	seedJobControlItem(t, pool, jobControlSeed{
+		ID: 9502, VersionID: versionID, Status: "open", Attempts: 0, MaxAttempts: 3,
+		Legacy: true, AvailableAt: now.Add(-time.Minute),
+	})
+
+	for _, id := range []int64{9501, 9502} {
+		if _, err := repo.GetJob(ctx, versionID, id); !errors.Is(err, agent.ErrNotFound) {
+			t.Fatalf("GetJob(%d) error = %v, want agent.ErrNotFound (legacy kind fence)", id, err)
+		}
+		if _, err := repo.GetJob(ctx, 0, id); !errors.Is(err, agent.ErrNotFound) {
+			t.Fatalf("direct GetJob(%d) error = %v, want agent.ErrNotFound", id, err)
+		}
+	}
+
+	if _, err := repo.RetryJob(ctx, versionID, 9501, now); !errors.Is(err, agent.ErrNotFound) {
+		t.Fatalf("RetryJob(legacy failed) error = %v, want agent.ErrNotFound", err)
+	}
+	if _, err := repo.RetryJob(ctx, 0, 9501, now); !errors.Is(err, agent.ErrNotFound) {
+		t.Fatalf("direct RetryJob(legacy failed) error = %v, want agent.ErrNotFound", err)
+	}
+	if _, err := repo.CancelJob(ctx, versionID, 9502, 0, agentapp.JobCanceledReason, now); !errors.Is(err, agent.ErrNotFound) {
+		t.Fatalf("CancelJob(legacy open) error = %v, want agent.ErrNotFound", err)
+	}
+
+	// The fence must not mutate the legacy row: no status/attempt/last_error
+	// change, so the legacy claim path keeps its own budget-coupled numbering.
+	var status string
+	var attempts int
+	var lastError *string
+	if err := pool.QueryRow(ctx, `
+		SELECT status, attempts, last_error FROM work_item WHERE id = 9501
+	`).Scan(&status, &attempts, &lastError); err != nil {
+		t.Fatalf("read legacy row: %v", err)
+	}
+	if status != "failed" || attempts != 1 || lastError == nil || *lastError != "legacy boom" {
+		t.Fatalf("legacy row = %q/%d/%v, want untouched failed/1/legacy boom", status, attempts, lastError)
 	}
 }
 

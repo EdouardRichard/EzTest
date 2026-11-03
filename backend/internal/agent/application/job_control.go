@@ -33,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
@@ -148,6 +149,9 @@ func (s *JobControl) Cancel(ctx context.Context, actorID, versionID, jobID int64
 	if versionID > 0 && item.VersionID != versionID {
 		return JobView{}, platform.NotFound("job")
 	}
+	if !isControllableJob(item) {
+		return JobView{}, platform.NotFound("job")
+	}
 	if !cancellableJobStatus(item.Status) {
 		return JobView{}, platform.StateConflict(fmt.Sprintf(
 			"job %d cannot be canceled from status %s", jobID, item.Status,
@@ -188,6 +192,9 @@ func (s *JobControl) Retry(ctx context.Context, actorID, versionID, jobID int64)
 		return JobView{}, mapJobControlReadError(err)
 	}
 	if versionID > 0 && item.VersionID != versionID {
+		return JobView{}, platform.NotFound("job")
+	}
+	if !isControllableJob(item) {
 		return JobView{}, platform.NotFound("job")
 	}
 	if isCanceledJob(item) {
@@ -248,6 +255,18 @@ func cancellableJobStatus(status agent.WorkItemStatus) bool {
 	default:
 		return false
 	}
+}
+
+// isControllableJob fences the pre-0.2.1 work items out of the control API.
+// Rows created before the 0.2.1 contract have an empty kind (agent_0007_work_item021
+// adds the column with that default) and are still dispatched by the legacy
+// Claim/ClaimForTeams/ClaimForTypes path. That path derives the
+// work_item_attempt number from the attempts budget counter, unlike
+// ClaimWorkItem, which uses MAX(attempt)+1. A raw-ID retry of a legacy row would
+// re-open it under the 0.2.1 rules and let the two numbering schemes collide, so
+// the control API reports it as not found instead of touching it.
+func isControllableJob(item agent.WorkItem) bool {
+	return strings.TrimSpace(item.Kind) != ""
 }
 
 func isCanceledJob(item agent.WorkItem) bool {

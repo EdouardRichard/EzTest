@@ -614,6 +614,53 @@ func TestJobRetryFailedOnly(t *testing.T) {
 	}
 }
 
+// TestJobRetryRejectsLegacyKind pins the Task 60 legacy fence. Pre-0.2.1
+// work_item rows carry an empty kind (agent_0007_work_item021 defaults the column to
+// an empty string) and are dispatched by the legacy Claim/ClaimForTeams/
+// ClaimForTypes path, whose work_item_attempt numbering is coupled to the
+// attempts budget counter. Re-opening such a row through the 0.2.1 control API
+// would let the two attempt-numbering schemes collide, so both control actions
+// must answer a typed not-found and never reach the repository write path.
+func TestJobRetryRejectsLegacyKind(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		status   agent.WorkItemStatus
+		attempts int
+		call     func(*agentapp.JobControl, agent.WorkItem) error
+	}{
+		{"retry", agent.WorkItemFailed, 1, func(service *agentapp.JobControl, item agent.WorkItem) error {
+			_, err := service.Retry(context.Background(), 71, item.VersionID, item.ID)
+			return err
+		}},
+		{"cancel", agent.WorkItemOpen, 0, func(service *agentapp.JobControl, item agent.WorkItem) error {
+			_, err := service.Cancel(context.Background(), 71, item.VersionID, item.ID)
+			return err
+		}},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newJobControlFixture(t, jobTestNow)
+			legacy := jobControlItem(512, 10, testCase.status, testCase.attempts, 3)
+			legacy.Kind = "" // pre-0.2.1 row: no 0.2.1 job kind
+			legacy = fixture.repo.add(legacy)
+
+			assertAPIError(t, testCase.call(fixture.service, legacy), http.StatusNotFound, "not_found")
+
+			if fixture.repo.cancelCalls != 0 || fixture.repo.retryCalls != 0 {
+				t.Fatalf("legacy row reached the write path: cancel=%d retry=%d",
+					fixture.repo.cancelCalls, fixture.repo.retryCalls)
+			}
+			if len(fixture.auditEvents()) != 0 || len(fixture.publishedEvents()) != 0 {
+				t.Fatalf("rejected legacy job action wrote audit/events")
+			}
+			stored := fixture.repo.get(legacy.ID)
+			if stored.Status != testCase.status || stored.Attempts != testCase.attempts {
+				t.Fatalf("legacy row changed: %#v", stored)
+			}
+		})
+	}
+}
+
 // ---------- ownership / typed errors ----------
 
 func TestJobControlOwnership(t *testing.T) {

@@ -29,7 +29,10 @@ import (
 var _ agentapp.JobControlRepository = (*WorkItemRepository)(nil)
 
 // GetJob loads one work item, scoped to versionID when it is positive. A
-// missing or foreign row is agent.ErrNotFound.
+// missing or foreign row is agent.ErrNotFound. Pre-0.2.1 rows (empty kind) are
+// fenced out: they belong to the legacy claim path, whose attempt numbering is
+// coupled to the retry budget, so the 0.2.1 control API must not address them
+// by raw ID.
 func (r *WorkItemRepository) GetJob(ctx context.Context, versionID, id int64) (agent.WorkItem, error) {
 	if id <= 0 {
 		return agent.WorkItem{}, platform.Invalid("id", "must be a positive decimal ID")
@@ -37,7 +40,7 @@ func (r *WorkItemRepository) GetJob(ctx context.Context, versionID, id int64) (a
 	if versionID < 0 {
 		return agent.WorkItem{}, platform.Invalid("version_id", "must be a positive decimal ID")
 	}
-	query := `SELECT ` + workItemColumns + ` FROM work_item WHERE id = $1`
+	query := `SELECT ` + workItemColumns + ` FROM work_item WHERE id = $1 AND kind <> ''`
 	args := []any{id}
 	if versionID > 0 {
 		query += ` AND version_id = $2`
@@ -116,6 +119,7 @@ func (r *WorkItemRepository) CancelJob(
 		    updated_at = $4
 		WHERE id = $1
 		  AND lease_epoch = $2
+		  AND kind <> ''
 		  AND status IN ('open', 'claimed', 'running')`+versionFilter+`
 		RETURNING `+workItemColumns,
 		args...))
@@ -207,6 +211,7 @@ func (r *WorkItemRepository) RetryJob(
 		    updated_at = $2
 		WHERE id = $1
 		  AND status = 'failed'
+		  AND kind <> ''
 		  AND attempts < max_attempts`+versionFilter+`
 		RETURNING `+workItemColumns,
 		args...))
@@ -227,8 +232,10 @@ func (r *WorkItemRepository) RetryJob(
 
 // scopedJobSelect renders the row-lock read of one job. The caller appends the
 // lock clause (FOR UPDATE) so the same scope is used for both control actions.
+// The empty-kind predicate is the legacy fence shared with GetJob: a pre-0.2.1
+// row is not a controllable 0.2.1 job.
 func scopedJobSelect(lock string, versionID int64) string {
-	query := `SELECT ` + workItemColumns + ` FROM work_item WHERE id = $1`
+	query := `SELECT ` + workItemColumns + ` FROM work_item WHERE id = $1 AND kind <> ''`
 	if versionID > 0 {
 		query += ` AND version_id = $2`
 	}
