@@ -15,14 +15,17 @@ import (
 // Structured retrieval (spec §10.2): knowledge.search/knowledge.read.
 //
 // Candidate stage: the repository's pg_trgm top-K query
-// (knowledge_0003_trgm.sql: GIN trigram index on title/content plus a
+// (knowledge_0003_trgm.sql: GIN trigram index on title/content/tags plus a
 // similarity-ranked SQL top-K) feeds both the strict binding pass and the
 // generic fallback, so Chinese fuzzy recall no longer depends on the bounded
 // ts_rank window: an old item whose title only resembles the query still ranks
-// into the top-K. A repository without the optional TopKRetriever capability,
-// or a top-K pass that returns no candidates (no lexical overlap at all), falls
-// back to ListForInjection, which still applies the strict JSONB binding
-// containment and the stored tsvector ts_rank.
+// into the top-K. The candidate predicate is a SQL superset of the Go n-gram
+// scorer (trigram/word similarity, exact substring and tag matches), so a row
+// the scorer would accept is never filtered out by SQL only because another
+// row made the top-K non-empty. A repository without the optional
+// TopKRetriever capability, or a top-K pass that returns no candidates (no
+// lexical overlap at all), falls back to ListForInjection, which still applies
+// the strict JSONB binding containment and the stored tsvector ts_rank.
 //
 // Ranking stage: Retrieval then applies the pg_trgm-compatible character
 // (tri/bi)gram similarity in Go, which keeps the strict > partial > generic

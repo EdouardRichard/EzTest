@@ -316,28 +316,68 @@ func (r *Repository) ListForInjection(ctx context.Context, query knowledge.Injec
 	return items, nil
 }
 
-// pgTrgmSimilarityThreshold is the retrieval similarity floor passed to the
-// pg_trgm '%' operator (which reads pg_trgm.similarity_threshold). pg_trgm's
-// default (0.3) is tuned for latin words: Chinese text has no word separators,
-// so a short query against a longer sentence scores far below it (登陆 against
-// 登录页 scores 0.17). The lowered floor keeps the Chinese near-miss recall
-// spec §10.2 requires; the application still re-scores every candidate and
-// drops unrelated rows. It is applied inside the query transaction with
-// set_config(..., is_local = true) so it never leaks to the pooled connection.
-const pgTrgmSimilarityThreshold = "0.1"
+// pg_trgm retrieval floors. pg_trgm's defaults are latin-word tuned (0.3
+// whole-string similarity / 0.6 word similarity); Chinese text has no word
+// separators, so a short query against a longer field scores far below them.
+// The 2-rune near miss 登陆 vs 登录配方：管理员 is 0.0909 whole-string / 0.333
+// word similarity, and a 3-rune query matching inside a longer CJK word scores
+// 0.25 word similarity (登录页 inside 先打开登录页…). The floors are calibrated
+// just below those values so the GIN index admits them. SQL is only the
+// candidate stage: the application re-scores every candidate with the same
+// character n-grams and drops unrelated rows, and the caller bounds the
+// candidate count. Both settings are applied inside the query transaction with
+// set_config(..., is_local = true) so they never leak to the pooled connection.
+const (
+	pgTrgmSimilarityThreshold     = "0.08"
+	pgTrgmWordSimilarityThreshold = "0.2"
+)
+
+// likeContainsPatternEscaper makes a free-text query literal for the ILIKE
+// "contains" branches: the default backslash escape character is used, so a
+// query containing % or _ is not interpreted as a wildcard.
+var likeContainsPatternEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+func likeContainsPattern(text string) string {
+	return "%" + likeContainsPatternEscaper.Replace(text) + "%"
+}
+
+// topKCandidatePredicate is the SQL candidate superset of the Go scorer's
+// positive-match rule (a shared character trigram/bigram, an exact substring or
+// a tag match). The pg_trgm operators are GIN-indexable and read the
+// transaction-local floors above. The ILIKE branches cover a short query that
+// is an exact substring of a longer CJK word: pg_trgm pads the query with word
+// boundaries, so its trigrams cannot match the field's internal trigrams (登录
+// inside 先打开登录页… has whole-string and word similarity 0, while the Go
+// bigram scorer accepts it). $2 is the query text, $3 the escaped contains
+// pattern.
+const topKCandidatePredicate = `(
+			title OPERATOR(public.%) $2
+			OR $2 OPERATOR(public.<%) title
+			OR content OPERATOR(public.%) $2
+			OR $2 OPERATOR(public.<%) content
+			OR eztest_text_array_to_string(tags) OPERATOR(public.%) $2
+			OR $2 OPERATOR(public.<%) eztest_text_array_to_string(tags)
+			OR title ILIKE $3
+			OR content ILIKE $3
+			OR eztest_text_array_to_string(tags) ILIKE $3
+		)`
 
 // SearchTopK returns up to query.Limit approved candidates visible to the
 // requested system keys, ordered by pg_trgm similarity of the query against
 // the item title/content desc then id desc. It is the trigram retrieval stage
 // that replaces the bounded ts_rank candidate window: the GIN trigram index
 // finds rows sharing trigrams with the query, so an old item whose Chinese text
-// only matches fuzzily is still recalled. Bindings apply the same JSONB
-// containment filter as ListForInjection. An empty query delegates to the
-// id-desc injection window (structured browse has no similarity to rank by).
+// only matches fuzzily is still recalled. The candidate predicate covers
+// title, content and tags because the application's character n-gram scorer
+// scores all three; a tag-only match is therefore not dropped when another row
+// has a title/content hit. Bindings apply the same JSONB containment filter as
+// ListForInjection. An empty query delegates to the id-desc injection window
+// (structured browse has no similarity to rank by).
 //
-// The similarity threshold and the title/content OR predicate use the
-// public-installed pg_trgm objects (see knowledge_0003_trgm.sql); the query is
-// fully parameterized and the candidate count is bounded by the caller.
+// The predicate and thresholds use the public-installed pg_trgm objects and the
+// tag expression from the retrieval index (see knowledge_0003_trgm.sql); the
+// query is fully parameterized and the candidate count is bounded by the
+// caller.
 func (r *Repository) SearchTopK(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
@@ -357,11 +397,11 @@ func (r *Repository) SearchTopK(ctx context.Context, query knowledge.InjectionQu
 	// The % operator is the trigram-indexable operator; writing it as
 	// OPERATOR(public.%) keeps it resolvable when the session search_path does
 	// not include public (the integration harness narrows it to a test schema).
-	args := []any{keys, text}
+	args := []any{keys, text, likeContainsPattern(text)}
 	where := []string{
 		"status = 'approved'",
 		"(scope = 'global' OR (scope = 'system' AND system_key = ANY($1::text[])))",
-		"(title OPERATOR(public.%) $2 OR content OPERATOR(public.%) $2)",
+		topKCandidatePredicate,
 	}
 	if !query.Bindings.IsZero() {
 		bindings, err := encodeBindings(query.Bindings)
@@ -377,18 +417,18 @@ func (r *Repository) SearchTopK(ctx context.Context, query knowledge.InjectionQu
 		ORDER BY greatest(public.similarity(title, $2), public.similarity(content, $2)) DESC, id DESC
 		LIMIT $%d`, strings.Join(where, " AND "), len(args))
 
-	// set_config(..., is_local=true) makes the similarity floor transaction
-	// scoped; the % operator consults it while the query runs.
+	// set_config(..., is_local=true) makes both trigram floors transaction
+	// scoped; the GIN-indexable operators consult them while the query runs.
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin knowledge top-k: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var applied string
-	if err := tx.QueryRow(ctx,
-		`SELECT set_config('pg_trgm.similarity_threshold', $1, true)`,
-		pgTrgmSimilarityThreshold).Scan(&applied); err != nil {
-		return nil, fmt.Errorf("set knowledge trigram threshold: %w", err)
+	if _, err := tx.Exec(ctx, `
+		SELECT set_config('pg_trgm.similarity_threshold', $1, true),
+		       set_config('pg_trgm.word_similarity_threshold', $2, true)
+	`, pgTrgmSimilarityThreshold, pgTrgmWordSimilarityThreshold); err != nil {
+		return nil, fmt.Errorf("set knowledge trigram thresholds: %w", err)
 	}
 	rows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
