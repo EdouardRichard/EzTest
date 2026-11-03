@@ -61,9 +61,12 @@ param(
     [string] $VersionId = "",
     [string] $VersionTitle = "",
     [string] $StatePath = "",
+    [string] $RequirementDocumentPath = "D:\project\deliverables\墨栈博客系统需求文档（用户故事与BDD版）.md",
+    [string] $MatrixPath = "",
     [int] $ClarifyTimeoutSeconds = 180,
     [int] $DesignTimeoutSeconds = 300,
-    [int] $CaseTimeoutSeconds = 240
+    [int] $CaseTimeoutSeconds = 240,
+    [int] $WaitForP0CasesSeconds = 0
 )
 
 Set-StrictMode -Version 3.0
@@ -83,6 +86,12 @@ $context = Initialize-AcceptanceContext -ApiBaseUrl $ApiBaseUrl -WebBaseUrl $Web
     -EvidenceRoot $EvidenceRoot
 $scenario = New-AcceptanceScenario -Context $context -Name "s3" -Title "设计自动生成与脑图 (S3)"
 $statePath = Get-AcceptanceStatePath -Context $context -StatePath $StatePath
+if ([string]::IsNullOrWhiteSpace($MatrixPath)) {
+    $MatrixPath = Join-Path $repoRoot "docs/version-V0.2.1/acceptance/sut-requirements-matrix.md"
+} elseif (-not [System.IO.Path]::IsPathRooted($MatrixPath)) {
+    $MatrixPath = Join-Path $repoRoot $MatrixPath
+}
+$matrixPath = [System.IO.Path]::GetFullPath($MatrixPath)
 
 $runSuffix = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $version = $null
@@ -115,6 +124,176 @@ function Write-S3Evidence {
     Write-EvidenceJson -Path $path -Value $Value
     Add-AcceptanceArtifact -Scenario $scenario -Path $path -Kind $Kind -Note $Note
     return $path
+}
+
+function Get-CaseSutTraceability {
+    <#
+        Joins the design graph case cards to the version requirements and then
+        to the FR/NFR IDs. A case card carries requirement_id/title; the join is
+        by requirement ID, and the FR/NFR ID comes from the requirement title
+        (or its description fallback). No fuzzy title matching is used.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] $Requirements = @(),
+        [Parameter(Mandatory = $false)] $CaseCards = @()
+    )
+    $byRequirementId = @{}
+    foreach ($requirement in @($Requirements)) {
+        $byRequirementId[[string](Get-JsonProp -Object $requirement -Name "id" -Default "")] = $requirement
+    }
+    $rows = @()
+    $caseCountBySutId = @{}
+    $traceableCases = 0
+    $untraceableCases = @()
+    foreach ($card in @($CaseCards)) {
+        $requirementId = [string](Get-JsonProp -Object $card -Name "requirement_id" -Default "")
+        $requirement = $null
+        if ($byRequirementId.ContainsKey($requirementId)) { $requirement = $byRequirementId[$requirementId] }
+        $sutId = ""
+        $title = [string](Get-JsonProp -Object $card -Name "title" -Default "")
+        if ($null -ne $requirement) { $sutId = Get-RequirementSutId -Requirement $requirement }
+        if ($sutId -eq "") {
+            $untraceableCases += [pscustomobject]@{ case_id = [string](Get-JsonProp -Object $card -Name "case_id" -Default ""); title = $title; requirement_id = $requirementId }
+        } else {
+            $traceableCases++
+            if (-not $caseCountBySutId.ContainsKey($sutId)) { $caseCountBySutId[$sutId] = 0 }
+            $caseCountBySutId[$sutId] = $caseCountBySutId[$sutId] + 1
+        }
+        $rows += [pscustomobject]@{
+            sut_id            = $sutId
+            requirement_id    = $requirementId
+            requirement_title = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "title" -Default "") } else { [string](Get-JsonProp -Object $card -Name "requirement_title" -Default "") }
+            case_id           = [string](Get-JsonProp -Object $card -Name "case_id" -Default "")
+            case_title        = $title
+            status            = [string](Get-JsonProp -Object $card -Name "status" -Default "")
+            traceable         = ($sutId -ne "")
+        }
+    }
+    return [pscustomobject]@{
+        Rows            = @($rows)
+        CaseCountBySutId = $caseCountBySutId
+        TraceableCases  = $traceableCases
+        UntraceableCases = @($untraceableCases)
+    }
+}
+
+function New-SutRequirementsMatrix {
+    <#
+        Writes the Task 72 FR/NFR -> requirement -> case -> status matrix from
+        live API data. Rows without a requirement are reported as missing; V2
+        rows are reported as 延展·未实现（未交付） and are never counted as a
+        defect or as missing delivery.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $BaselineEntries,
+        [Parameter(Mandatory = $false)] $Requirements = @(),
+        [Parameter(Mandatory = $false)] $CaseCards = @(),
+        [Parameter(Mandatory = $true)] [string] $VersionId,
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $false)] [string] $DocumentPath = "",
+        [Parameter(Mandatory = $false)] [string] $Stage = "",
+        [Parameter(Mandatory = $false)] [string] $VersionTitle = ""
+    )
+    $requirementById = @{}
+    $requirementBySutId = @{}
+    foreach ($requirement in @($Requirements)) {
+        $requirementById[[string](Get-JsonProp -Object $requirement -Name "id" -Default "")] = $requirement
+        $sutId = Get-RequirementSutId -Requirement $requirement
+        if ($sutId -ne "" -and -not $requirementBySutId.ContainsKey($sutId)) { $requirementBySutId[$sutId] = $requirement }
+    }
+    $caseCountBySutId = @{}
+    $caseIdsBySutId = @{}
+    foreach ($card in @($CaseCards)) {
+        $requirementId = [string](Get-JsonProp -Object $card -Name "requirement_id" -Default "")
+        if (-not $requirementById.ContainsKey($requirementId)) { continue }
+        $sutId = Get-RequirementSutId -Requirement $requirementById[$requirementId]
+        if ($sutId -eq "") { continue }
+        if (-not $caseCountBySutId.ContainsKey($sutId)) { $caseCountBySutId[$sutId] = 0; $caseIdsBySutId[$sutId] = @() }
+        $caseCountBySutId[$sutId] = $caseCountBySutId[$sutId] + 1
+        $caseIdsBySutId[$sutId] += [string](Get-JsonProp -Object $card -Name "case_id" -Default "")
+    }
+
+    $v1Entries = @($BaselineEntries | Where-Object { [string]$_.version -eq "V1" })
+    $v2Entries = @($BaselineEntries | Where-Object { [string]$_.version -eq "V2" })
+    $v1Covered = 0
+    $p0Total = 0
+    $p0WithCases = 0
+    $casesTotal = @($CaseCards).Count
+    $lines = @()
+    $lines += "# SUT 需求追溯矩阵（FR/NFR → requirement → case → 状态）"
+    $lines += ""
+    $lines += "> 由真实运行数据生成，不是手工填写：需求来自 EzTest 版本 $VersionId 的 requirement API，用例来自 design graph。"
+    $lines += "> 生成时间：$((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))；版本标题：$VersionTitle；stage：$Stage。"
+    $lines += "> 需求文档：``$DocumentPath``（v3.0，V1 58 FR + 9 NFR，V2 32 延展·未实现）。"
+    $lines += ""
+    $lines += "## 1. 汇总"
+    $lines += ""
+    $lines += "| 指标 | 数值 |"
+    $lines += "|---|---|"
+    $lines += "| V1 需求总数（FR+NFR） | $($v1Entries.Count) |"
+    $lines += "| V1 需求已导入为 requirement | $(@($v1Entries | Where-Object { $requirementBySutId.ContainsKey([string]$_.id) }).Count) |"
+    $lines += "| V1 功能需求 FR-001~FR-058 | $(@($v1Entries | Where-Object { $_.id -like 'FR-0*' }).Count) |"
+    $lines += "| 非功能需求 NFR-001~NFR-009 | $(@($v1Entries | Where-Object { $_.id -like 'NFR-*' }).Count) |"
+    $lines += "| P0 需求（FR+NFR） | $($v1Entries | Where-Object { $_.priority -eq 'P0' } | Measure-Object | Select-Object -ExpandProperty Count) |"
+    $lines += "| 设计用例总数 | $casesTotal |"
+    $lines += "| 追溯不到 FR/NFR 的用例数 | $(@((Get-CaseSutTraceability -Requirements $Requirements -CaseCards $CaseCards).UntraceableCases).Count) |"
+    $lines += "| V2 延展·未实现 | $($v2Entries.Count)（未交付，不计为缺失或缺陷） |"
+    $lines += ""
+    $lines += "## 2. V1 需求追溯（FR/NFR）"
+    $lines += ""
+    $lines += "| 需求编号 | 优先级 | 标题 | requirement id | 需求状态 | 用例数 | 用例 ID | 追溯状态 |"
+    $lines += "|---|---|---|---|---|---|---|---|"
+    foreach ($entry in $v1Entries) {
+        $sutId = [string]$entry.id
+        $requirement = $null
+        if ($requirementBySutId.ContainsKey($sutId)) { $requirement = $requirementBySutId[$sutId] }
+        $requirementId = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "id" -Default "") } else { "" }
+        $requirementStatus = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "status" -Default "") } else { "缺失" }
+        $caseCount = 0
+        $caseText = "-"
+        if ($caseCountBySutId.ContainsKey($sutId)) { $caseCount = [int]$caseCountBySutId[$sutId]; $caseText = (@($caseIdsBySutId[$sutId]) -join ", ") }
+        $trace = if ($null -eq $requirement) { "需求未导入" } elseif ($caseCount -gt 0) { "需求→用例" } else { "仅需求（无用例）" }
+        if ($null -ne $requirement) { $v1Covered++ }
+        if ([string]$entry.priority -eq "P0") {
+            $p0Total++
+            if ($caseCount -gt 0) { $p0WithCases++ }
+        }
+        $lines += "| $sutId | $([string]$entry.priority) | $([string]$entry.title) | $requirementId | $requirementStatus | $caseCount | $caseText | $trace |"
+    }
+    $lines += ""
+    $lines += "## 3. V2 延展·未实现（未交付）"
+    $lines += ""
+    $lines += "| 需求编号 | 优先级 | 标题 | 交付状态 | 说明 |"
+    $lines += "|---|---|---|---|---|"
+    foreach ($entry in $v2Entries) {
+        $lines += "| $([string]$entry.id) | $([string]$entry.priority) | $([string]$entry.title) | 延展·未实现（未交付） | 当前系统不存在，不属于 V1 验收范围，不计为缺陷 |"
+    }
+    $lines += ""
+    $lines += "## 4. 覆盖结论"
+    $lines += ""
+    $frEntries = @($v1Entries | Where-Object { $_.id -like "FR-0*" })
+    $nfrEntries = @($v1Entries | Where-Object { $_.id -like "NFR-*" })
+    $frWithCases = @($frEntries | Where-Object { $caseCountBySutId.ContainsKey([string]$_.id) }).Count
+    $nfrWithCases = @($nfrEntries | Where-Object { $caseCountBySutId.ContainsKey([string]$_.id) }).Count
+    $lines += "- V1 需求导入：$v1Covered/$($v1Entries.Count)；P0 需求导入：$(@($v1Entries | Where-Object { $_.priority -eq 'P0' -and $requirementBySutId.ContainsKey([string]$_.id) }).Count)/$p0Total。"
+    $lines += "- 设计用例覆盖的 FR：$frWithCases/$($frEntries.Count)；NFR：$nfrWithCases/$($nfrEntries.Count)；P0：$p0WithCases/$p0Total。"
+    $lines += "- V2：$($v2Entries.Count) 条均为延展·未实现，未创建需求/用例，未计为缺陷。"
+    $lines += "- 用例覆盖是设计阶段的真实产出；若少于 100%，矩阵如实显示剩余项，不伪造用例。"
+    $lines += ""
+    $directory = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($directory)) { New-Item -ItemType Directory -Force -Path $directory | Out-Null }
+    [System.IO.File]::WriteAllText($Path, ($lines -join [Environment]::NewLine) + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    return [pscustomobject]@{
+        Path            = $Path
+        V1Total         = $v1Entries.Count
+        V1Covered       = $v1Covered
+        P0Total         = $p0Total
+        P0WithCases     = $p0WithCases
+        CasesTotal      = $casesTotal
+        FrWithCases     = $frWithCases
+        NfrWithCases    = $nfrWithCases
+        V2Total         = $v2Entries.Count
+    }
 }
 
 try {
@@ -174,6 +353,7 @@ try {
             # ------------------------------------------------------------------
             $conversationId = ""
             $requirements = @()
+            $requirementsAlreadyImported = $false
             if (-not $isReusedVersion) {
                 try {
                     $conversation = New-AcceptanceConversation -Context $context -VersionId $versionId -Kind "clarification" -Title "S3 需求澄清"
@@ -188,62 +368,141 @@ try {
                 $clarification = $existing | Where-Object { [string](Get-JsonProp -Object $_ -Name "kind" -Default "") -eq "clarification" } | Select-Object -First 1
                 if ($null -ne $clarification) { $conversationId = [string](Get-JsonProp -Object $clarification -Name "id" -Default "") }
                 Add-AcceptanceCheck -Scenario $scenario -Name "clarification conversation available" -Passed ($conversationId -ne "") -Severity warning -Detail "conversation=$conversationId"
+                $reusedRequirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+                if ($reusedRequirements.Count -gt 0) {
+                    $requirements = $reusedRequirements
+                    $requirementsAlreadyImported = $true
+                    Add-AcceptanceCheck -Scenario $scenario -Name "reused version already carries imported requirements" -Passed $true -Severity assertion `
+                        -Detail "requirements=$($requirements.Count); the S3 script does not post the legacy 4-requirement goal over an imported baseline"
+                }
             }
 
-            if ($conversationId -ne "") {
-                $goal = @"
+            if (-not $requirementsAlreadyImported) {
+                if ($conversationId -ne "") {
+                    $goal = @"
 【版本描述】墨栈博客：Vue 前端 + Go 后端博客系统，SUT 前端 $($context.SutWebBaseUrl)，后端 API $($context.SutApiBaseUrl)/api/v1，测试账号 admin/openClaw/Hermes。
 【版本目标】验收登录与会话、文章列表与详情、文章评论、后台管理四项主流程，并覆盖未登录/越权与文章状态边界。
 【本轮要求】请在澄清中直接整理并写入一份精简需求草案（4 条左右，覆盖上述主流程），不要反复提问；整理完停在需求确认门，等待用户确认，不要自动开始设计。
 "@
-                try {
-                    $message = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId -Text $goal
-                    Add-AcceptanceCheck -Scenario $scenario -Name "version description and goal accepted" -Passed ($null -ne $message) -Severity assertion `
-                        -Detail ("message=" + [string](Get-JsonProp -Object $message -Name "id" -Default ""))
-                } catch {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "version description and goal accepted" -Passed $false -Severity assertion -Detail $_.Exception.Message
+                    try {
+                        $message = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId -Text $goal
+                        Add-AcceptanceCheck -Scenario $scenario -Name "version description and goal accepted" -Passed ($null -ne $message) -Severity assertion `
+                            -Detail ("message=" + [string](Get-JsonProp -Object $message -Name "id" -Default ""))
+                    } catch {
+                        Add-AcceptanceCheck -Scenario $scenario -Name "version description and goal accepted" -Passed $false -Severity assertion -Detail $_.Exception.Message
+                    }
+                }
+
+                if ($conversationId -ne "") {
+                    $draftWait = Wait-Until -TimeoutSeconds $ClarifyTimeoutSeconds -IntervalSeconds 5 -Description "requirement drafts" -Condition {
+                        $current = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+                        $drafts = @($current | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -notin @("obsolete", "closed") })
+                        if ($drafts.Count -ge 2) { return $drafts }
+                        return $null
+                    }
+                    if (-not $draftWait.Ok) {
+                        # One follow-up nudge: the model sometimes asks questions
+                        # first instead of writing the draft.
+                        try {
+                            $nudge = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId `
+                                -Text "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），不需要继续提问；写完后停在需求确认门等待用户确认。"
+                            Write-AcceptanceLog -Scenario $scenario -Message ("posted requirement-draft nudge message=" + [string](Get-JsonProp -Object $nudge -Name 'id' -Default ''))
+                        } catch {
+                            Write-AcceptanceLog -Scenario $scenario -Level warn -Message "nudge failed: $($_.Exception.Message)"
+                        }
+                        $draftWait = Wait-Until -TimeoutSeconds ([Math]::Max(60, [int]($ClarifyTimeoutSeconds / 2))) -IntervalSeconds 5 -Description "requirement drafts after nudge" -Condition {
+                            $current = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+                            $drafts = @($current | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -notin @("obsolete", "closed") })
+                            if ($drafts.Count -ge 1) { return $drafts }
+                            return $null
+                        }
+                    }
+                    $requirements = @()
+                    if ($draftWait.Ok) { $requirements = @($draftWait.Value) }
+                    else { $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200) }
                 }
             }
 
-            if ($conversationId -ne "") {
-                $draftWait = Wait-Until -TimeoutSeconds $ClarifyTimeoutSeconds -IntervalSeconds 5 -Description "requirement drafts" -Condition {
-                    $current = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
-                    $drafts = @($current | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -notin @("obsolete", "closed") })
-                    if ($drafts.Count -ge 2) { return $drafts }
-                    return $null
-                }
-                if (-not $draftWait.Ok) {
-                    # One follow-up nudge: the model sometimes asks questions
-                    # first instead of writing the draft.
-                    try {
-                        $nudge = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId `
-                            -Text "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），不需要继续提问；写完后停在需求确认门等待用户确认。"
-                        Write-AcceptanceLog -Scenario $scenario -Message ("posted requirement-draft nudge message=" + [string](Get-JsonProp -Object $nudge -Name 'id' -Default ''))
-                    } catch {
-                        Write-AcceptanceLog -Scenario $scenario -Level warn -Message "nudge failed: $($_.Exception.Message)"
-                    }
-                    $draftWait = Wait-Until -TimeoutSeconds ([Math]::Max(60, [int]($ClarifyTimeoutSeconds / 2))) -IntervalSeconds 5 -Description "requirement drafts after nudge" -Condition {
-                        $current = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
-                        $drafts = @($current | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -notin @("obsolete", "closed") })
-                        if ($drafts.Count -ge 1) { return $drafts }
-                        return $null
-                    }
-                }
-                $requirements = @()
-                if ($draftWait.Ok) { $requirements = @($draftWait.Value) }
-                else { $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200) }
-                $requirementsBefore = @($requirements)
-                $requirementIds = @($requirements | ForEach-Object { [string](Get-JsonProp -Object $_ -Name "id" -Default "") } | Where-Object { $_ -ne "" })
-                [void](Write-S3Evidence -Name "requirements-before.json" -Value $requirements -Note "requirement drafts before confirmation")
-                Add-AcceptanceCheck -Scenario $scenario -Name "requirement drafts produced" -Passed ($requirementIds.Count -ge 1) -Severity assertion `
-                    -Detail ("requirements=$($requirementIds.Count) statuses=" + ((@($requirements | ForEach-Object { [string](Get-JsonProp -Object $_ -Name 'status' -Default '') }) -join ",")))
-                if ($requirementIds.Count -ge 2) {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "multiple requirements for design" -Passed $true -Severity warning -Detail "requirements=$($requirementIds.Count)"
-                } else {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "multiple requirements for design" -Passed $false -Severity warning -Detail "requirements=$($requirementIds.Count)"
-                }
-                Save-S3State -Values @{ clarification_conversation_id = $conversationId; requirement_ids = $requirementIds }
+            $requirementsBefore = @($requirements)
+            $requirementIds = @($requirements | ForEach-Object { [string](Get-JsonProp -Object $_ -Name "id" -Default "") } | Where-Object { $_ -ne "" })
+            [void](Write-S3Evidence -Name "requirements-before.json" -Value $requirements -Note "requirement drafts before confirmation")
+            Add-AcceptanceCheck -Scenario $scenario -Name "requirement drafts produced" -Passed ($requirementIds.Count -ge 1) -Severity assertion `
+                -Detail ("requirements=$($requirementIds.Count) statuses=" + ((@($requirements | ForEach-Object { [string](Get-JsonProp -Object $_ -Name 'status' -Default '') }) -join ",")))
+            if ($requirementIds.Count -ge 2) {
+                Add-AcceptanceCheck -Scenario $scenario -Name "multiple requirements for design" -Passed $true -Severity warning -Detail "requirements=$($requirementIds.Count)"
+            } else {
+                Add-AcceptanceCheck -Scenario $scenario -Name "multiple requirements for design" -Passed $false -Severity warning -Detail "requirements=$($requirementIds.Count)"
             }
+            Save-S3State -Values @{ clarification_conversation_id = $conversationId; requirement_ids = $requirementIds }
+
+            # ------------------------------------------------------------------
+            # Task 72: SUT requirement baseline and FR/NFR traceability at the
+            # design input. This reads the real requirement document (read-only)
+            # and joins it to the live requirement list; it never writes data.
+            # ------------------------------------------------------------------
+            $baselineEntries = @()
+            $baselineError = ""
+            try {
+                $baselineEntries = @(Read-SutRequirementDocument -Path $RequirementDocumentPath)
+            } catch {
+                $baselineError = $_.Exception.Message
+            }
+            $v1Baseline = @($baselineEntries | Where-Object { [string]$_.version -eq "V1" })
+            $v2Baseline = @($baselineEntries | Where-Object { [string]$_.version -eq "V2" })
+            $v1FrBaseline = @($v1Baseline | Where-Object { [string]$_.id -like "FR-0*" })
+            $nfrBaseline = @($v1Baseline | Where-Object { [string]$_.id -like "NFR-*" })
+            $p0Baseline = @($v1Baseline | Where-Object { [string]$_.priority -eq "P0" })
+            $coverageBefore = Get-SutRequirementCoverage -Entries $baselineEntries -Requirements $requirements -Version "V1"
+            $v2CoverageBefore = Get-SutRequirementCoverage -Entries $baselineEntries -Requirements $requirements -Version "V2"
+            $v2CreatedBefore = @($v2CoverageBefore.Rows | Where-Object { $_.covered })
+            $untraceableBefore = @($requirements | Where-Object { (Get-RequirementSutId -Requirement $_) -eq "" })
+            [void](Write-S3Evidence -Name "sut-baseline.json" -Value ([pscustomobject]@{
+                path        = $RequirementDocumentPath
+                parse_error = $baselineError
+                v1_total    = $v1Baseline.Count
+                v1_fr       = $v1FrBaseline.Count
+                nfr         = $nfrBaseline.Count
+                p0          = $p0Baseline.Count
+                v2          = $v2Baseline.Count
+                entries     = @($baselineEntries | Select-Object id, title, priority, version, version_label)
+            }) -Kind "baseline" -Note "SUT requirement document baseline used by S3")
+            [void](Write-S3Evidence -Name "sut-requirements-before.json" -Value ([pscustomobject]@{
+                generated_at = (Get-Date).ToUniversalTime().ToString("o")
+                summary      = [pscustomobject]@{
+                    v1_total   = $coverageBefore.Total
+                    v1_covered = $coverageBefore.Covered
+                    v1_missing = @($coverageBefore.Missing)
+                    p0_total   = $coverageBefore.P0Total
+                    p0_covered = $coverageBefore.P0Covered
+                    p0_missing = @($coverageBefore.P0Missing)
+                    v2_created = $v2CreatedBefore.Count
+                    untraceable = $untraceableBefore.Count
+                }
+                rows = @($coverageBefore.Rows)
+            }) -Kind "coverage" -Note "FR/NFR -> requirement coverage at the S3 design input")
+            [void](Write-S3Evidence -Name "v2-handling.json" -Value ([pscustomobject]@{
+                v2_total = $v2Baseline.Count
+                v2_created_as_requirements = $v2CreatedBefore.Count
+                v2_status = "延展·未实现（当前系统不存在，不要求交付，不算缺陷）"
+                rows = @($v2CoverageBefore.Rows)
+            }) -Kind "coverage" -Note "V2 延展·未实现 handling at S3")
+            Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement baseline available (V1 58 FR + 9 NFR + V2 32)" `
+                -Passed ($baselineError -eq "" -and $v1FrBaseline.Count -eq 58 -and $nfrBaseline.Count -eq 9 -and $v2Baseline.Count -eq 32) -Severity assertion `
+                -Detail ("error=$baselineError v1fr=$($v1FrBaseline.Count) nfr=$($nfrBaseline.Count) v2=$($v2Baseline.Count) p0=$($p0Baseline.Count)")
+            $frCoveredBefore = @($coverageBefore.Rows | Where-Object { $_.sut_id -like "FR-0*" -and $_.covered }).Count
+            $nfrCoveredBefore = @($coverageBefore.Rows | Where-Object { $_.sut_id -like "NFR-*" -and $_.covered }).Count
+            Add-AcceptanceCheck -Scenario $scenario -Name "design input is traceable to V1 FR/NFR (67/67)" `
+                -Passed ($frCoveredBefore -eq 58 -and $nfrCoveredBefore -eq 9) -Severity assertion `
+                -Detail "fr=$frCoveredBefore/58 nfr=$nfrCoveredBefore/9 missing=$(@($coverageBefore.Missing) -join ',')"
+            Add-AcceptanceCheck -Scenario $scenario -Name "design input covers all P0 requirements ($($p0Baseline.Count)/$($p0Baseline.Count))" `
+                -Passed ($coverageBefore.P0Covered -eq $coverageBefore.P0Total -and $coverageBefore.P0Total -gt 0) -Severity assertion `
+                -Detail "p0=$($coverageBefore.P0Covered)/$($coverageBefore.P0Total) missing=$(@($coverageBefore.P0Missing) -join ',')"
+            Add-AcceptanceCheck -Scenario $scenario -Name "V2 延展·未实现 not imported as design requirements" `
+                -Passed ($v2CreatedBefore.Count -eq 0) -Severity assertion `
+                -Detail "v2_created=$($v2CreatedBefore.Count)/$($v2Baseline.Count)"
+            Add-AcceptanceCheck -Scenario $scenario -Name "requirements are traceable to FR/NFR IDs" `
+                -Passed ($untraceableBefore.Count -eq 0) -Severity assertion `
+                -Detail "untraceable=$($untraceableBefore.Count)"
 
             if ($requirementIds.Count -eq 0) {
                 Add-AcceptanceCheck -Scenario $scenario -Name "requirements available for design" -Passed $false -Severity assertion `
@@ -405,6 +664,9 @@ try {
                 [void](Write-S3Evidence -Name "requirements-after.json" -Value $requirementsAfter -Note "requirements after confirmation")
                 Add-AcceptanceCheck -Scenario $scenario -Name "requirements leave draft after confirmation" -Passed ($requirementsAfter.Count -gt 0 -and @($statuses | Where-Object { $_ -eq "draft" }).Count -eq 0) -Severity assertion `
                     -Detail "statuses=$($statuses -join ",")"
+                # The matrix and case traceability must show the post-gate
+                # requirement status, not the pre-gate draft snapshot.
+                $requirements = @($requirementsAfter)
 
                 # ------------------------------------------------------------------
                 # The S3 criterion: a design conversation and case nodes appear
@@ -438,11 +700,80 @@ try {
                     $graph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
                     $caseCards = @(Get-AcceptanceCaseCards -Graph $graph)
                 }
+
+                # Task 72 (optional): the automatic design fans out one case-author
+                # task per confirmed requirement. When requested, wait until every
+                # P0 baseline requirement has at least one case, so the matrix is
+                # generated from a meaningful P0 sample. This never invents cases:
+                # it only waits for real draft cases and reports a timeout honestly.
+                if ($WaitForP0CasesSeconds -gt 0 -and $p0Baseline.Count -gt 0) {
+                    $p0Wait = Wait-Until -TimeoutSeconds $WaitForP0CasesSeconds -IntervalSeconds 10 -Description "P0 case coverage" -Condition {
+                        $currentGraph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
+                        $currentCards = @(Get-AcceptanceCaseCards -Graph $currentGraph)
+                        $currentTrace = Get-CaseSutTraceability -Requirements $requirements -CaseCards $currentCards
+                        $p0Ids = @($p0Baseline | ForEach-Object { [string]$_.id })
+                        $coveredP0 = @($p0Ids | Where-Object { $currentTrace.CaseCountBySutId.ContainsKey($_) })
+                        if ($coveredP0.Count -ge $p0Ids.Count) {
+                            return [pscustomobject]@{ Graph = $currentGraph; Cards = $currentCards }
+                        }
+                        return $null
+                    }
+                    if ($p0Wait.Ok -and $null -ne $p0Wait.Value) {
+                        $graph = $p0Wait.Value.Graph
+                        $caseCards = @($p0Wait.Value.Cards)
+                        Add-AcceptanceCheck -Scenario $scenario -Name "P0 case coverage wait completed" -Passed $true -Severity warning `
+                            -Detail ("p0=$($p0Baseline.Count)/$($p0Baseline.Count) cases=$($caseCards.Count)")
+                    } else {
+                        $graph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
+                        $caseCards = @(Get-AcceptanceCaseCards -Graph $graph)
+                        $latestTrace = Get-CaseSutTraceability -Requirements $requirements -CaseCards $caseCards
+                        $coveredP0 = @($p0Baseline | Where-Object { $latestTrace.CaseCountBySutId.ContainsKey([string]$_.id) })
+                        Add-AcceptanceCheck -Scenario $scenario -Name "P0 case coverage wait completed" -Passed $false -Severity warning `
+                            -Detail ("p0_with_cases=$($coveredP0.Count)/$($p0Baseline.Count) after ${WaitForP0CasesSeconds}s; matrix records the real remainder")
+                    }
+                }
                 $stats = Get-JsonProp -Object $graph -Name "stats" -Default $null
                 [void](Write-S3Evidence -Name "design-graph.json" -Value $graph -Note "design graph after automatic generation")
                 Add-AcceptanceCheck -Scenario $scenario -Name "case nodes appear in the design graph" -Passed ($caseCards.Count -ge 1) -Severity assertion `
                     -Detail ("cases=$($caseCards.Count) stats=" + $(if ($null -ne $stats) { $stats | ConvertTo-Json -Compress } else { "n/a" }))
                 Save-S3State -Values @{ case_ids = @($caseCards | ForEach-Object { $_.case_id }) }
+
+                # ------------------------------------------------------------------
+                # Task 72: case -> requirement -> FR/NFR traceability. Untraceable
+                # cases and any V2 case are hard failures; incomplete case coverage
+                # of the P0/FR baseline is reported as a warning with exact IDs.
+                # ------------------------------------------------------------------
+                $caseTrace = Get-CaseSutTraceability -Requirements $requirements -CaseCards $caseCards
+                $v2Ids = @($v2Baseline | ForEach-Object { [string]$_.id })
+                $v2CaseRows = @($caseTrace.Rows | Where-Object { $v2Ids -contains $_.sut_id })
+                $caseSutIds = @($caseTrace.CaseCountBySutId.Keys)
+                $p0WithCases = @($p0Baseline | Where-Object { $caseSutIds -contains [string]$_.id })
+                $frWithCases = @($v1FrBaseline | Where-Object { $caseSutIds -contains [string]$_.id })
+                $nfrWithCases = @($nfrBaseline | Where-Object { $caseSutIds -contains [string]$_.id })
+                [void](Write-S3Evidence -Name "case-traceability.json" -Value ([pscustomobject]@{
+                    generated_at       = (Get-Date).ToUniversalTime().ToString("o")
+                    cases_total        = @($caseCards).Count
+                    traceable_cases    = $caseTrace.TraceableCases
+                    untraceable_cases  = @($caseTrace.UntraceableCases)
+                    fr_with_cases      = @($frWithCases | ForEach-Object { $_.id })
+                    nfr_with_cases     = @($nfrWithCases | ForEach-Object { $_.id })
+                    p0_with_cases      = @($p0WithCases | ForEach-Object { $_.id })
+                    p0_total           = $p0Baseline.Count
+                    v2_case_rows       = @($v2CaseRows)
+                    rows               = @($caseTrace.Rows)
+                }) -Kind "coverage" -Note "case -> requirement -> FR/NFR traceability")
+                Add-AcceptanceCheck -Scenario $scenario -Name "design cases traceable to FR/NFR requirements" `
+                    -Passed ($caseTrace.TraceableCases -ge 1 -and @($caseTrace.UntraceableCases).Count -eq 0) -Severity assertion `
+                    -Detail ("cases=$(@($caseCards).Count) traceable=$($caseTrace.TraceableCases) untraceable=$(@($caseTrace.UntraceableCases).Count)")
+                Add-AcceptanceCheck -Scenario $scenario -Name "V2 延展·未实现 not designed as delivered cases" `
+                    -Passed (@($v2CaseRows).Count -eq 0) -Severity assertion `
+                    -Detail "v2_cases=$(@($v2CaseRows).Count)"
+                Add-AcceptanceCheck -Scenario $scenario -Name "P0 requirements have design cases" `
+                    -Passed ($p0WithCases.Count -ge 1) -Severity warning `
+                    -Detail ("p0_with_cases=$($p0WithCases.Count)/$($p0Baseline.Count) covered=$(@($p0WithCases | ForEach-Object { $_.id }) -join ',')")
+                Add-AcceptanceCheck -Scenario $scenario -Name "all V1 requirements have design cases" `
+                    -Passed ($frWithCases.Count -eq $v1FrBaseline.Count -and $nfrWithCases.Count -eq $nfrBaseline.Count) -Severity warning `
+                    -Detail ("fr_with_cases=$($frWithCases.Count)/$($v1FrBaseline.Count) nfr_with_cases=$($nfrWithCases.Count)/$($nfrBaseline.Count)")
 
                 $overview = $null
                 try { $overview = Get-AcceptanceDesignOverview -Context $context -VersionId $versionId } catch { }
@@ -510,6 +841,32 @@ try {
                 [void](Write-S3Evidence -Name "stage-at-end.json" -Value $stageAtEnd -Note "stage when S3 finished")
                 Add-AcceptanceCheck -Scenario $scenario -Name "design generation reached case_review" -Passed ($stageAtEndValue -eq "case_review") -Severity warning `
                     -Detail ("stage=$stageAtEndValue cases=$($caseCards.Count); case confirmation belongs to S4")
+
+                # ------------------------------------------------------------------
+                # Task 72 deliverable: the FR/NFR -> requirement -> case matrix.
+                # ------------------------------------------------------------------
+                $matrixResult = $null
+                try {
+                    $matrixResult = New-SutRequirementsMatrix -BaselineEntries $baselineEntries -Requirements $requirements `
+                        -CaseCards $caseCards -VersionId $versionId -Path $matrixPath -DocumentPath $RequirementDocumentPath `
+                        -Stage $stageAtEndValue -VersionTitle ([string](Get-JsonProp -Object $version -Name "title" -Default ""))
+                    Add-AcceptanceArtifact -Scenario $scenario -Path $matrixPath -Kind "matrix" -Note "FR/NFR -> requirement -> case -> status traceability matrix"
+                    Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement traceability matrix written" -Passed (Test-Path -LiteralPath $matrixPath) -Severity assertion `
+                        -Detail ("path=" + (Resolve-RepoRelativePath -Context $context -Path $matrixPath) + " v1=$($matrixResult.V1Covered)/$($matrixResult.V1Total) p0=$($matrixResult.P0WithCases)/$($matrixResult.P0Total) cases=$($matrixResult.CasesTotal)")
+                } catch {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement traceability matrix written" -Passed $false -Severity assertion -Detail $_.Exception.Message
+                }
+                [void](Write-S3Evidence -Name "sut-matrix-summary.json" -Value ([pscustomobject]@{
+                    matrix_path = if ($null -ne $matrixResult) { $matrixResult.Path } else { $matrixPath }
+                    summary     = $matrixResult
+                    coverage    = [pscustomobject]@{
+                        fr_with_cases = @($frWithCases | ForEach-Object { $_.id })
+                        nfr_with_cases = @($nfrWithCases | ForEach-Object { $_.id })
+                        p0_with_cases = @($p0WithCases | ForEach-Object { $_.id })
+                        v2_total = $v2Baseline.Count
+                        v2_cases = @($v2CaseRows).Count
+                    }
+                }) -Kind "summary" -Note "matrix generation summary")
 
                 # ------------------------------------------------------------------
                 # SSE: capture the persisted design/job events after the fact.

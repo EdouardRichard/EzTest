@@ -540,6 +540,91 @@ function Invoke-ApiOrFail {
     return $response
 }
 
+function New-AcceptanceContentUpload {
+    <#
+        Uploads one file through POST /api/content (multipart field "file") and
+        returns the public ContentObject (sha256/size/mime/url). The bearer token
+        never enters the response or evidence; the caller records only the object
+        metadata.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Context,
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $false)] [string] $Mime = "",
+        [Parameter(Mandatory = $false)] [int] $TimeoutSeconds = 120
+    )
+    if ([string]::IsNullOrWhiteSpace($Context.Token)) { throw "content upload requires a logged-in context" }
+    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($file.PSIsContainer) { throw "content upload path is a directory: $Path" }
+    if ([string]::IsNullOrWhiteSpace($Mime)) {
+        $Mime = switch ($file.Extension.ToLowerInvariant()) {
+            ".md" { "text/markdown" }
+            ".markdown" { "text/markdown" }
+            ".txt" { "text/plain" }
+            ".html" { "text/html" }
+            ".htm" { "text/html" }
+            default { "application/octet-stream" }
+        }
+    }
+    $stream = [System.IO.File]::OpenRead($file.FullName)
+    $fileContent = [System.Net.Http.StreamContent]::new($stream)
+    $multipart = [System.Net.Http.MultipartFormDataContent]::new()
+    $request = $null
+    $response = $null
+    $cts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds([Math]::Max(1, $TimeoutSeconds)))
+    try {
+        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($Mime)
+        $multipart.Add($fileContent, "file", $file.Name)
+        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $Context.ApiBaseUrl + "/api/content")
+        [void]$request.Headers.TryAddWithoutValidation("Accept", "application/json")
+        [void]$request.Headers.TryAddWithoutValidation("Authorization", "Bearer $($Context.Token)")
+        $request.Content = $multipart
+        $response = $Context.HttpClient.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseContentRead, $cts.Token).GetAwaiter().GetResult()
+        $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    } catch [System.OperationCanceledException] {
+        throw "content upload timed out after ${TimeoutSeconds}s: $Path"
+    } finally {
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $request) { $request.Dispose() }
+        $multipart.Dispose()
+        $cts.Dispose()
+    }
+    $parsed = $null
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        try { $parsed = $text | ConvertFrom-Json -ErrorAction Stop } catch { $parsed = $null }
+    }
+    $status = [int]$response.StatusCode
+    $data = Get-JsonProp -Object $parsed -Name "data" -Default $null
+    $errorInfo = Get-JsonProp -Object $parsed -Name "error" -Default $null
+    return [pscustomobject]@{
+        Status = $status
+        Ok     = ($status -ge 200 -and $status -lt 300)
+        Data   = $data
+        Error  = $errorInfo
+        Text   = $text
+        Path   = $file.FullName
+        Name   = $file.Name
+        Size   = $file.Length
+        Mime   = $Mime
+    }
+}
+
+function Get-AcceptanceFileSha256 {
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = $sha.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $sha.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Connect-EzTest {
     param(
         [Parameter(Mandatory = $true)] $Context,
@@ -585,11 +670,11 @@ function Connect-SutAccount {
         $response = Invoke-Api -Context $Context -Method "POST" -Path "/api/v1/auth/login" `
             -BaseUrl $Context.SutApiBaseUrl -Body @{ account = $Account; password = $Password } -TimeoutSeconds 20
     } catch {
-        return [pscustomobject]@{ Ok = $false; Account = $Account; Status = 0; Error = $_.Exception.Message }
+        return [pscustomobject]@{ Ok = $false; Account = $Account; Status = 0; Token = ""; User = $null; Error = $_.Exception.Message }
     }
     if ($response.Status -ne 200) {
         $sutError = Get-JsonProp -Object $response.Json -Name "message" -Default ""
-        return [pscustomobject]@{ Ok = $false; Account = $Account; Status = $response.Status; Error = $sutError }
+        return [pscustomobject]@{ Ok = $false; Account = $Account; Status = $response.Status; Token = ""; User = $null; Error = $sutError }
     }
     # The SUT wraps its payload in {code,message,data}; tolerate both shapes.
     $payload = if ($null -ne $response.Data) { $response.Data } else { $response.Json }
@@ -799,24 +884,52 @@ function New-AcceptanceConversation {
 }
 
 function New-AcceptanceUserMessage {
+    <#
+        Posts one user message. When -Attachment is supplied (a ContentObject or
+        any object with sha256/name/mime/size) the message carries a text part and
+        an attachment part, exactly like the UI's file upload flow. A 409
+        attachment_pending is retried because the server rejects a message that
+        references an attachment whose extraction has not finished yet.
+    #>
     param(
         $Context,
         [string] $VersionId,
         [string] $ConversationId,
         [string] $Text,
-        [string] $ClientMessageId = ""
+        [string] $ClientMessageId = "",
+        [Parameter(Mandatory = $false)] $Attachment = $null,
+        [Parameter(Mandatory = $false)] [int] $PendingRetrySeconds = 120
     )
     if ([string]::IsNullOrWhiteSpace($ClientMessageId)) {
         $ClientMessageId = "acc-" + [Guid]::NewGuid().ToString("N")
     }
+    $parts = @(@{ type = "text"; text = $Text })
+    if ($null -ne $Attachment) {
+        $parts += @{
+            type   = "attachment"
+            sha256 = [string](Get-JsonProp -Object $Attachment -Name "sha256" -Default "")
+            name   = [string](Get-JsonProp -Object $Attachment -Name "name" -Default "")
+            mime   = [string](Get-JsonProp -Object $Attachment -Name "mime" -Default "text/markdown")
+            size   = [long](Get-JsonProp -Object $Attachment -Name "size" -Default 0)
+        }
+    }
     $body = @{
         client_message_id = $ClientMessageId
-        parts             = @(@{ type = "text"; text = $Text })
+        parts             = $parts
     }
-    $response = Invoke-ApiOrFail -Context $Context -Method "POST" `
-        -Path "/api/versions/$VersionId/conversations/$ConversationId/messages" `
-        -Token $Context.Token -ExpectedStatus @(201) -Label "post user message" -Body $body
-    return $response.Data
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $PendingRetrySeconds))
+    while ($true) {
+        $response = Invoke-Api -Context $Context -Method "POST" `
+            -Path "/api/versions/$VersionId/conversations/$ConversationId/messages" `
+            -Token $Context.Token -Body $body
+        if ($response.Ok) { return $response.Data }
+        $code = [string](Get-JsonProp -Object $response.Error -Name "code" -Default "")
+        if ($code -ne "attachment_pending" -or (Get-Date) -ge $deadline) {
+            $message = [string](Get-JsonProp -Object $response.Error -Name "message" -Default $response.Text)
+            throw "post user message failed: HTTP $($response.Status) code=$code message=$message"
+        }
+        Start-Sleep -Seconds 2
+    }
 }
 
 function Get-AssistantText {
@@ -1351,4 +1464,161 @@ function Get-VersionFactKindCounts {
         if ($counts.Contains($kind)) { $counts[$kind] = $counts[$kind] + 1 } else { $counts[$kind] = 1 }
     }
     return [pscustomobject]@{ Total = $facts.Count; Counts = $counts; Facts = $facts }
+}
+
+# ---------------------------------------------------------------------------
+# SUT requirement document baseline (Task 72)
+# ---------------------------------------------------------------------------
+
+function Read-SutRequirementDocument {
+    <#
+        Parses the real SUT requirement Markdown baseline into its 99 requirement
+        entries: V1 FR-001..FR-058, NFR-001..NFR-009 and V2 FR-101..FR-132.
+        The parser reads the document as data (read-only); it never rewrites it.
+        Each entry carries the exact document text so callers can feed real
+        chunks to the clarification flow without inventing content.
+    #>
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "SUT requirement document not found: $Path" }
+    $fullPath = (Get-Item -LiteralPath $Path).FullName
+    $lines = [System.IO.File]::ReadAllLines($fullPath, [System.Text.Encoding]::UTF8)
+    $entries = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -notmatch '^####\s+((?:FR|NFR)-\d{3})\s+(.+?)\s*$') { continue }
+        $id = [string]$Matches[1]
+        $title = [string]$Matches[2]
+        $titleText = $title
+        $bodyEnd = $lines.Count
+        for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+            if ($lines[$j] -match '^#{1,4}\s') { $bodyEnd = $j; break }
+        }
+        $priority = ""
+        $status = ""
+        for ($j = $i + 1; $j -lt [Math]::Min($i + 15, $bodyEnd); $j++) {
+            if ($lines[$j] -match '^\*\*优先级\*\*[：:]\s*(P\d)') { $priority = [string]$Matches[1] }
+            if ($lines[$j] -match '^\*\*需求状态\*\*[：:]\s*(.+?)\s*$') { $status = [string]$Matches[1] }
+        }
+        $version = "V1"
+        if ($id -match '^FR-1\d{2}$') { $version = "V2" }
+        elseif ($status -match '延展' -or $titleText -match '延展·未实现') { $version = "V2" }
+        $bodyLines = @()
+        for ($j = $i; $j -lt $bodyEnd; $j++) { $bodyLines += $lines[$j] }
+        $text = ($bodyLines -join "`n").TrimEnd()
+        $entries += [pscustomobject]@{
+            id            = $id
+            title         = $titleText
+            priority      = $priority
+            version       = $version
+            version_label = if ($version -eq "V2") { "延展·未实现" } else { "V1" }
+            section       = ""
+            document_path = $fullPath
+            line_start    = $i + 1
+            line_end      = $bodyEnd
+            text          = $text
+            char_count    = $text.Length
+        }
+    }
+    return $entries
+}
+
+function New-SutRequirementChunks {
+    <#
+        Groups requirement entries into prompt-sized chunks. Chunk content is
+        copied verbatim from the document and bounded below the 20000-rune user
+        message limit. V2 entries are excluded from extraction by default.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Entries,
+        [Parameter(Mandatory = $false)] [string] $Version = "V1",
+        [Parameter(Mandatory = $false)] [int] $MaxChars = 15000
+    )
+    $selected = @($Entries | Where-Object { [string]$_.version -eq $Version })
+    $chunks = @()
+    $current = @()
+    $currentChars = 0
+    foreach ($entry in $selected) {
+        $size = [int]$entry.char_count
+        if ($current.Count -gt 0 -and ($currentChars + $size) -gt $MaxChars) {
+            $chunks += , @($current)
+            $current = @()
+            $currentChars = 0
+        }
+        $current += $entry
+        $currentChars += $size
+    }
+    if ($current.Count -gt 0) { $chunks += , @($current) }
+    return $chunks
+}
+
+function Get-RequirementSutId {
+    <#
+        Returns the FR/NFR ID a requirement is traceable to, or "" when it has
+        none. The title is the primary key (the extraction prompt requires the
+        title to start with the ID); descriptions are a fallback only for
+        requirements whose title lost the ID marker.
+    #>
+    param([Parameter(Mandatory = $false)] $Requirement)
+    $title = [string](Get-JsonProp -Object $Requirement -Name "title" -Default "")
+    if ($title -match '((?:FR|NFR)-\d{3})') { return [string]$Matches[1] }
+    $description = [string](Get-JsonProp -Object $Requirement -Name "description" -Default "")
+    if ($description -match '需求编号[：:]\s*((?:FR|NFR)-\d{3})') { return [string]$Matches[1] }
+    if ($description -match '((?:FR|NFR)-\d{3})') { return [string]$Matches[1] }
+    return ""
+}
+
+function Get-SutRequirementCoverage {
+    <#
+        Joins the parsed document baseline with the version's requirement list.
+        Returns per-entry rows and a summary. The join is by FR/NFR ID extracted
+        from the requirement title/description, never by fuzzy title matching.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Entries,
+        [Parameter(Mandatory = $false)] $Requirements = @(),
+        [Parameter(Mandatory = $false)] [string] $Version = "V1",
+        [Parameter(Mandatory = $false)] [string] $IdPattern = ""
+    )
+    $requirementList = @($Requirements)
+    $byId = @{}
+    $duplicates = @()
+    foreach ($requirement in $requirementList) {
+        $sutId = Get-RequirementSutId -Requirement $requirement
+        if ($sutId -eq "") { continue }
+        if ($byId.ContainsKey($sutId)) { $duplicates += $sutId } else { $byId[$sutId] = $requirement }
+    }
+    $rows = @()
+    foreach ($entry in @($Entries)) {
+        if (-not [string]::IsNullOrWhiteSpace($Version) -and [string]$entry.version -ne $Version) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($IdPattern) -and [string]$entry.id -notmatch $IdPattern) { continue }
+        $requirement = $null
+        if ($byId.ContainsKey([string]$entry.id)) { $requirement = $byId[[string]$entry.id] }
+        $rows += [pscustomobject]@{
+            sut_id              = [string]$entry.id
+            title               = [string]$entry.title
+            priority            = [string]$entry.priority
+            doc_version         = [string]$entry.version
+            version_label       = [string]$entry.version_label
+            requirement_id      = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "id" -Default "") } else { "" }
+            requirement_title   = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "title" -Default "") } else { "" }
+            requirement_status  = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "status" -Default "") } else { "" }
+            requirement_priority = if ($null -ne $requirement) { [string](Get-JsonProp -Object $requirement -Name "priority" -Default "") } else { "" }
+            covered             = ($null -ne $requirement)
+        }
+    }
+    $coveredRows = @($rows | Where-Object { $_.covered })
+    $p0Rows = @($rows | Where-Object { $_.priority -eq "P0" })
+    $p0Covered = @($p0Rows | Where-Object { $_.covered })
+    $missing = @($rows | Where-Object { -not $_.covered } | ForEach-Object { $_.sut_id })
+    return [pscustomobject]@{
+        Rows              = $rows
+        Total             = $rows.Count
+        Covered           = $coveredRows.Count
+        Missing           = $missing
+        P0Total           = $p0Rows.Count
+        P0Covered         = $p0Covered.Count
+        P0Missing         = @($p0Rows | Where-Object { -not $_.covered } | ForEach-Object { $_.sut_id })
+        DuplicateIds      = @($duplicates | Select-Object -Unique)
+        UntraceableCount  = @($requirementList | Where-Object { (Get-RequirementSutId -Requirement $_) -eq "" }).Count
+    }
 }

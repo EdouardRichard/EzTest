@@ -508,6 +508,15 @@ try {
                         -Passed ($foreignIntents.Count -eq 0) -Severity assertion `
                         -Detail "foreignVersions=$($foreignIntents -join ',')"
 
+                    # The wave is created asynchronously by the intent scan; wait
+                    # for it before asserting, so a fast executor cannot race the
+                    # assertion (the criterion is "wave exists", not "wave exists
+                    # in the same millisecond as the intents").
+                    [void](Wait-Until -TimeoutSeconds $IntentTimeoutSeconds -IntervalSeconds 2 -Description "execution wave for confirmed selection" -Condition {
+                        $currentWaves = @(Get-AcceptanceWaves -Context $context -VersionId $versionId)
+                        if ($currentWaves.Count -ge 1) { return $currentWaves }
+                        return $null
+                    })
                     $waves = @(Get-AcceptanceWaves -Context $context -VersionId $versionId)
                     [void](Write-S4Evidence -Name "waves.json" -Value $waves -Note "waves created by the confirmation chain")
                     Add-AcceptanceCheck -Scenario $scenario -Name "execution wave created for the confirmed selection" -Passed ($waves.Count -ge 1) -Severity assertion -Detail "waves=$($waves.Count)"

@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     S6 report, cancel and per-case evidence acceptance for EzTest 0.2.1.
@@ -10,9 +10,9 @@
          report);
       2. the executed version does get a published report revision with HTML,
          case rows, evidence and problems sections;
-      3. cancelling a wave stops new dispatch: the wave is cancelled, every
-         non-terminal case run becomes superseded and no case run starts after
-         the cancel;
+      3. cancelling a wave stops new dispatch: the wave is cancelled, its active
+         intents are cancelled, every non-terminal case run becomes superseded,
+         and no case run starts after the cancel;
       4. a case report Markdown file is written for every executed case run;
       5. failed cases are checked for a problem report; application failures
          must have a delivery issue, non-application failures are reported as a
@@ -271,6 +271,22 @@ try {
             }
             $confirmedCaseVersions = @($confirmedCaseVersions | Select-Object -Unique)
 
+            # S5's execution may have closed the requirements. A retest wave
+            # (needed for the cancel probe) requires an open requirement, so
+            # reopen them through the user API exactly as S5 does.
+            $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+            $closedRequirements = @($requirements | Where-Object { [string](Get-JsonProp -Object $_ -Name 'status' -Default '') -eq 'closed' })
+            $reopenRecords = @()
+            foreach ($requirement in ($closedRequirements | Select-Object -First 6)) {
+                $requirementId = [string](Get-JsonProp -Object $requirement -Name 'id' -Default '')
+                if (-not $requirementId) { continue }
+                $reopen = Invoke-AcceptanceRequirementReopen -Context $context -VersionId $versionId -RequirementId $requirementId -Reason "S6 acceptance cancel probe"
+                $reopenRecords += [pscustomobject]@{ requirement_id = $requirementId; http_status = $reopen.Status; ok = $reopen.Ok; error = $reopen.Error }
+            }
+            [void](Write-S6Evidence -Name "requirement-reopen.json" -Value $reopenRecords -Note "requirements reopened for the S6 cancel probe")
+            Add-AcceptanceCheck -Scenario $scenario -Name "requirements reopened for the cancel probe" -Passed (@($reopenRecords | Where-Object { $_.ok }).Count -eq $reopenRecords.Count) -Severity warning `
+                -Detail "reopened=$(@($reopenRecords | Where-Object { $_.ok }).Count)/$($reopenRecords.Count)"
+
             $wavesBefore = @(Get-AcceptanceWaves -Context $context -VersionId $versionId)
             $waveIdsBefore = @($wavesBefore | ForEach-Object { [string](Get-JsonProp -Object $_ -Name "id" -Default "") })
             $cancelRecord = [pscustomobject]@{
@@ -308,7 +324,24 @@ try {
                     if ($null -ne $newWave) { break }
                 }
                 if ($null -eq $newWave) {
-                    $cancelRecord = [pscustomobject]@{ attempt = $attempt; result = "no new active wave"; created_intents = $createdIntents }
+                    # Keep the full record shape: the no-wave path is reported
+                    # below as a failed assertion, not as an unexpected error.
+                    $cancelRecord = [pscustomobject]@{
+                        attempt              = $attempt
+                        result               = "no new active wave"
+                        wave_id              = ""
+                        created_intents      = $createdIntents
+                        pause_http           = 0
+                        pause_status         = ""
+                        cancel_http          = 0
+                        cancel_status        = ""
+                        wave_after           = $null
+                        runs_after           = @()
+                        active_runs_after    = 0
+                        started_after_cancel = @()
+                        intent_statuses      = @()
+                        cancelled_at         = ""
+                    }
                     continue
                 }
                 $newWaveId = [string](Get-JsonProp -Object $newWave -Name "id" -Default "")
@@ -357,9 +390,25 @@ try {
                 $superseded = @($cancelRecord.runs_after | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -in @("superseded", "cancelled", "passed", "failed", "blocked", "inconclusive", "skipped", "interrupted") })
                 Add-AcceptanceCheck -Scenario $scenario -Name "cancelled wave leaves only terminal case runs" -Passed ($superseded.Count -eq @($cancelRecord.runs_after).Count) -Severity assertion `
                     -Detail "runs=$(@($cancelRecord.runs_after).Count) terminal=$($superseded.Count)"
+                # QA-F2: cancel must propagate to the wave's intents even when a
+                # case_run already reached a terminal status before the cancel.
+                # Check the intents referenced by the cancelled wave's case runs:
+                # they must not stay open/claimed/running after the cancel.
+                $activeIntentStatuses = @("open", "claimed", "running")
+                $waveIntentIds = @($cancelRecord.runs_after | ForEach-Object { [string](Get-JsonProp -Object $_ -Name "intent_id" -Default "") } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+                $intentStatusById = @{}
+                foreach ($intent in $intentsAfter) {
+                    $intentStatusById[[string](Get-JsonProp -Object $intent -Name "id" -Default "")] = [string](Get-JsonProp -Object $intent -Name "status" -Default "")
+                }
+                $missingWaveIntents = @($waveIntentIds | Where-Object { -not $intentStatusById.ContainsKey($_) })
+                $waveIntentStatuses = @($waveIntentIds | ForEach-Object { if ($intentStatusById.ContainsKey($_)) { [string]$intentStatusById[$_] } })
+                $activeIntentsAfter = @($waveIntentStatuses | Where-Object { $activeIntentStatuses -contains [string]$_ })
+                Add-AcceptanceCheck -Scenario $scenario -Name "cancelled wave leaves no active intents" -Passed ($waveIntentIds.Count -gt 0 -and $missingWaveIntents.Count -eq 0 -and $activeIntentsAfter.Count -eq 0) -Severity assertion `
+                    -Detail "waveIntents=$($waveIntentIds.Count) missing=$($missingWaveIntents.Count) activeAfter=$($activeIntentsAfter.Count) statuses=$($waveIntentStatuses -join ',')"
             } else {
                 Add-AcceptanceCheck -Scenario $scenario -Name "cancel stops new dispatch" -Passed $false -Severity assertion -Detail "no wave could be cancelled"
                 Add-AcceptanceCheck -Scenario $scenario -Name "cancelled wave leaves only terminal case runs" -Passed $false -Severity assertion -Detail "no wave could be cancelled"
+                Add-AcceptanceCheck -Scenario $scenario -Name "cancelled wave leaves no active intents" -Passed $false -Severity assertion -Detail "no wave could be cancelled"
             }
 
             # Direct intent cancel (open intent) as a separate API assertion.
