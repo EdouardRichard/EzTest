@@ -123,8 +123,8 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
-	if len(applied) != 50 {
-		t.Fatalf("applied %d migrations, want 50: %v", len(applied), applied)
+	if len(applied) != 51 {
+		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {

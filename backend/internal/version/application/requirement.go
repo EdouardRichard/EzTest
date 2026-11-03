@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,25 @@ import (
 // newest page is read again when it has no duplicates. Accepted limitation until
 // dedupe paginates; the HTTP response correctly reports an empty page.
 const maxDedupeRequirements = 200
+
+// requirementSourceIDPattern matches the leading source identifier of a draft
+// title ("FR-011 账号密码登录", "NFR-001 …", "FR-011: …"). The identifier is the
+// deterministic source key: two curators extracting the same requirement from
+// the same input produce the same key even when the surrounding title wording
+// differs.
+var requirementSourceIDPattern = regexp.MustCompile(`^([A-Za-z]{2,8}-[0-9]{1,6})(?:\s|$|[:：])`)
+
+// requirementSourceKey derives the deterministic per-version requirement source
+// key. Titles without a leading FR/NFR-style identifier keep an empty key: those
+// rows are not auto-deduplicated (the explicit requirement.dedupe scan still
+// works on them) so user-authored arbitrary titles keep their current escaping.
+func requirementSourceKey(title string) string {
+	match := requirementSourceIDPattern.FindStringSubmatch(strings.TrimSpace(title))
+	if len(match) != 2 {
+		return ""
+	}
+	return "source:" + strings.ToUpper(match[1])
+}
 
 // RequirementService implements requirement draft lifecycle, immutable
 // revisions, single/batch confirmation, rollback and relations.
@@ -115,12 +135,16 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 		CurrentVersionID:    &revisionID,
 		Status:              version.RequirementDraft,
 		TargetVersionSUTIDs: append([]string{}, revision.TargetVersionSUTs...),
+		SourceKey:           requirementSourceKey(revision.Title),
 		CreatedBy:           optionalActor(actorID),
 		CreatedByRunID:      agentRunID(ctx),
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}
 	if err := s.repo.Create(ctx, requirement, revision); err != nil {
+		if errors.Is(err, version.ErrRequirementDuplicate) && requirement.SourceKey != "" {
+			return s.resolveDuplicateDraft(ctx, versionID, requirement.SourceKey, revision, actorID)
+		}
 		return RequirementDetail{}, mapRequirementRepositoryError(err)
 	}
 
@@ -146,6 +170,77 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 	s.markRunning(ctx, versionID)
 	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementCreated, "new requirement created")
 	return s.Get(ctx, versionID, requirementID)
+}
+
+// resolveDuplicateDraft turns a duplicate-source Create into an update/no-op on
+// the existing requirement instead of a second row. An empty-target create never
+// replaces populated targets; a richer target set enriches an empty draft. A
+// clarified/closed requirement is never rewritten by a draft_create (the
+// Curator must use requirement.reopen_propose).
+func (s *RequirementService) resolveDuplicateDraft(ctx context.Context, versionID int64, sourceKey string, incoming version.RequirementVersion, actorID int64) (RequirementDetail, error) {
+	existing, err := s.repo.GetBySourceKey(ctx, versionID, sourceKey)
+	if err != nil {
+		return RequirementDetail{}, mapRequirementRepositoryError(err)
+	}
+	current, ok := currentVersion(existing)
+	if !ok {
+		return RequirementDetail{}, platform.StateConflict("requirement has no current revision")
+	}
+	if existing.Requirement.Status != version.RequirementDraft ||
+		requirementTargetCount(incoming) <= requirementTargetCount(current) {
+		return s.detailFromAggregate(existing)
+	}
+
+	now := s.clock.Now()
+	revisionID := s.ids.Next()
+	revision := incoming
+	revision.ID = revisionID
+	revision.RequirementID = existing.Requirement.ID
+	revision.Revision = current.Revision + 1
+	revision.CreatedBy = optionalActor(actorID)
+	revision.CreatedByRunID = agentRunID(ctx)
+	revision.CreatedAt = now
+
+	requirement := existing.Requirement
+	requirement.Status = version.RequirementDraft
+	requirement.CurrentVersionID = &revisionID
+	requirement.TargetVersionSUTIDs = append([]string{}, revision.TargetVersionSUTs...)
+	requirement.UpdatedAt = now
+	if err := s.repo.AddRevision(ctx, requirement, revision); err != nil {
+		if errors.Is(err, version.ErrStateConflict) || errors.Is(err, version.ErrRequirementDuplicate) {
+			// A concurrent duplicate create won the enrichment; return the
+			// newest state instead of surfacing a duplicate/conflict.
+			latest, getErr := s.repo.Get(ctx, versionID, requirement.ID)
+			if getErr != nil {
+				return RequirementDetail{}, mapRequirementRepositoryError(getErr)
+			}
+			return s.detailFromAggregate(latest)
+		}
+		return RequirementDetail{}, mapRequirementRepositoryError(err)
+	}
+
+	requirementIDString := platformid.Format(requirement.ID)
+	revisionIDString := platformid.Format(revisionID)
+	s.publishEvent(ctx, versionID, "requirement.version_created", map[string]any{
+		"requirement_id":         requirementIDString,
+		"requirement_version_id": revisionIDString,
+		"revision":               revision.Revision,
+		"status":                 string(version.RequirementDraft),
+	}, map[string]any{"requirement_id": requirementIDString})
+	s.recordAudit(ctx, actorID, "requirement.updated", "requirement", requirementIDString, map[string]any{
+		"requirement_version_id": revisionIDString,
+		"revision":               revision.Revision,
+		"reason":                 "duplicate draft create enriched targets",
+		"source_key":             sourceKey,
+	})
+	s.markRunning(ctx, versionID)
+	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementReopened, "duplicate draft create enriched targets")
+	return s.Get(ctx, versionID, requirement.ID)
+}
+
+// requirementTargetCount counts bound target IDs on one revision.
+func requirementTargetCount(revision version.RequirementVersion) int {
+	return len(revision.TargetVersionSUTs) + len(revision.TargetPages) + len(revision.TargetAPIs)
 }
 
 // CountClarifiedRequirements reports whether the version has at least one
@@ -211,6 +306,7 @@ func (s *RequirementService) Update(ctx context.Context, versionID, requirementI
 	requirement.Status = version.RequirementDraft
 	requirement.CurrentVersionID = &revisionID
 	requirement.TargetVersionSUTIDs = append([]string{}, revision.TargetVersionSUTs...)
+	requirement.SourceKey = requirementSourceKey(revision.Title)
 	requirement.UpdatedAt = now
 	if err := s.repo.AddRevision(ctx, requirement, revision); err != nil {
 		return RequirementDetail{}, mapRequirementRepositoryError(err)
@@ -1169,6 +1265,8 @@ func mapRequirementRepositoryError(err error) error {
 		return platform.StateConflict("requirement is not in a mutable state")
 	case errors.Is(err, version.ErrRelationDuplicate):
 		return platform.Conflict("requirement relation already exists")
+	case errors.Is(err, version.ErrRequirementDuplicate):
+		return platform.Conflict("requirement already exists for this source")
 	default:
 		return err
 	}

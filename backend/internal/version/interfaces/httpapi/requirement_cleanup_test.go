@@ -77,6 +77,16 @@ func (r *cleanupRepo) Get(_ context.Context, versionID, requirementID int64) (ve
 	return aggregate, nil
 }
 
+func (r *cleanupRepo) GetBySourceKey(ctx context.Context, versionID int64, sourceKey string) (version.RequirementAggregate, error) {
+	for _, requirement := range r.requirements {
+		if requirement.VersionID == versionID && requirement.SourceKey == sourceKey &&
+			requirement.Status != version.RequirementObsolete {
+			return r.Get(ctx, versionID, requirement.ID)
+		}
+	}
+	return version.RequirementAggregate{}, version.ErrRequirementNotFound
+}
+
 func (r *cleanupRepo) GetMany(_ context.Context, versionID int64, ids []int64) ([]version.RequirementWithCurrent, error) {
 	items := make([]version.RequirementWithCurrent, 0, len(ids))
 	for _, id := range ids {

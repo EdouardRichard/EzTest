@@ -154,7 +154,7 @@ type requirementDraftCreate struct{ deps Deps }
 func (t *requirementDraftCreate) Name() string { return ToolRequirementDraftCreate }
 
 func (t *requirementDraftCreate) Description() string {
-	return "在当前版本创建一条 draft 需求（服务端生成不可变 revision 1）。不能确认、删除或修改已澄清需求。"
+	return "在当前版本创建一条 draft 需求（服务端生成不可变 revision 1）。同一版本同一来源编号（title 开头的 FR/NFR 等编号）已存在时返回已有 draft（仅在已有草稿缺 target 时补全），不会重复创建。不能确认、删除或修改已澄清需求。"
 }
 
 func (t *requirementDraftCreate) Parameters() json.RawMessage {

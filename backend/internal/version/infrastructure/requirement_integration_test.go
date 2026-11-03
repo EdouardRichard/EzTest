@@ -361,3 +361,86 @@ func TestRepositoryMarkRunningAndStats(t *testing.T) {
 		t.Fatalf("stored = %#v, %v", stored, err)
 	}
 }
+
+// TestRequirementRepositorySourceKeyIdempotency pins the Task 96 database
+// guarantee: one active requirement per (version_id, source_key) even when two
+// writers insert concurrently, while an explicitly deleted (obsolete) source
+// can be created again.
+func TestRequirementRepositorySourceKeyIdempotency(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.New(pool, ids)
+	requirementRepo := versionpg.NewRequirementRepository(pool)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 42)
+	if err := repo.Create(ctx, v, sampleBindings(ids, v.ID)); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+
+	first, firstRevision := sampleRequirement(ids, v.ID)
+	first.SourceKey = "source:FR-011"
+	firstRevision.Title = "FR-011 账号密码登录"
+	if err := requirementRepo.Create(ctx, first, firstRevision); err != nil {
+		t.Fatalf("Create first: %v", err)
+	}
+
+	duplicate, duplicateRevision := sampleRequirement(ids, v.ID)
+	duplicate.SourceKey = "source:FR-011"
+	duplicateRevision.Title = "FR-011 账号密码登录（重复）"
+	if err := requirementRepo.Create(ctx, duplicate, duplicateRevision); !errors.Is(err, version.ErrRequirementDuplicate) {
+		t.Fatalf("duplicate Create error = %v, want ErrRequirementDuplicate", err)
+	}
+
+	aggregate, err := requirementRepo.GetBySourceKey(ctx, v.ID, "source:FR-011")
+	if err != nil {
+		t.Fatalf("GetBySourceKey: %v", err)
+	}
+	if aggregate.Requirement.ID != first.ID {
+		t.Fatalf("GetBySourceKey id = %d, want the first requirement %d", aggregate.Requirement.ID, first.ID)
+	}
+
+	other, otherRevision := sampleRequirement(ids, v.ID)
+	other.SourceKey = "source:FR-014"
+	otherRevision.Title = "FR-014 页面访问控制与权限跳转"
+	if err := requirementRepo.Create(ctx, other, otherRevision); err != nil {
+		t.Fatalf("Create a different source: %v", err)
+	}
+
+	// Updating a draft into another source must be rejected by the same index.
+	collisionRevisionID := ids.Next()
+	collision := other
+	collision.SourceKey = "source:FR-011"
+	collision.CurrentVersionID = &collisionRevisionID
+	collisionRevision := otherRevision
+	collisionRevision.ID = collisionRevisionID
+	collisionRevision.RequirementID = other.ID
+	collisionRevision.Revision = 2
+	collisionRevision.Title = "FR-011 账号密码登录（改名）"
+	if err := requirementRepo.AddRevision(ctx, collision, collisionRevision); !errors.Is(err, version.ErrRequirementDuplicate) {
+		t.Fatalf("colliding AddRevision error = %v, want ErrRequirementDuplicate", err)
+	}
+
+	// The source leaves the partial index when the requirement is retired, so a
+	// fresh extraction can create the same FR again after an explicit delete.
+	if err := requirementRepo.SetStatus(ctx, v.ID, first.ID, version.RequirementObsolete, testTime.Add(time.Minute)); err != nil {
+		t.Fatalf("SetStatus obsolete: %v", err)
+	}
+	if _, err := requirementRepo.GetBySourceKey(ctx, v.ID, "source:FR-011"); !errors.Is(err, version.ErrRequirementNotFound) {
+		t.Fatalf("GetBySourceKey after obsolete error = %v, want ErrRequirementNotFound", err)
+	}
+	recreated, recreatedRevision := sampleRequirement(ids, v.ID)
+	recreated.SourceKey = "source:FR-011"
+	recreatedRevision.Title = "FR-011 账号密码登录"
+	if err := requirementRepo.Create(ctx, recreated, recreatedRevision); err != nil {
+		t.Fatalf("Create after obsolete: %v", err)
+	}
+
+	list, err := requirementRepo.List(ctx, v.ID, "", 10, nil)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("requirements = %d, want 3 (first obsolete + other + recreated)", len(list))
+	}
+}
