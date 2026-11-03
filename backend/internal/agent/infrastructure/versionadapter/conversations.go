@@ -216,6 +216,41 @@ func conversationPart(part version.MessagePart) agentapp.ConversationPart {
 			"requirement_id": platformid.Format(part.RequirementID),
 			"reason":         part.Reason,
 		}
+	case version.MessagePartThinking:
+		mapped.Data = map[string]any{"duration_ms": part.DurationMS}
+	case version.MessagePartToolCall:
+		mapped.Data = map[string]any{
+			"call_id":     part.CallID,
+			"name":        part.Name,
+			"status":      part.Status,
+			"arguments":   part.Arguments,
+			"result":      part.Result,
+			"duration_ms": part.DurationMS,
+			"error":       part.Error,
+		}
+	case version.MessagePartJobCard:
+		mapped.Data = map[string]any{
+			"job_id":     platformid.Format(part.JobID),
+			"kind":       part.JobKind,
+			"status":     part.Status,
+			"current":    part.Current,
+			"total":      part.Total,
+			"cancelable": part.Cancelable,
+		}
+	case version.MessagePartCaseCard:
+		mapped.Data = map[string]any{
+			"case_id":         platformid.Format(part.CaseID),
+			"case_version_id": platformid.Format(part.CaseVersionID),
+			"title":           part.Title,
+			"status":          part.Status,
+		}
+	case version.MessagePartError:
+		mapped.Data = map[string]any{
+			"code":      part.Code,
+			"message":   part.Message,
+			"retryable": part.Retryable,
+			"action":    part.Action,
+		}
 	}
 	return mapped
 }
@@ -273,8 +308,50 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 		return version.MessagePart{
 			Type: part.Type, RequirementID: requirementID, Reason: reason,
 		}, nil
+	case version.MessagePartThinking:
+		duration, _ := dataInt(part.Data, "duration_ms")
+		return version.MessagePart{Type: part.Type, Text: part.Text, DurationMS: duration}, nil
+	case version.MessagePartToolCall:
+		callID, _ := dataString(part.Data, "call_id")
+		name, _ := dataString(part.Data, "name")
+		status, _ := dataString(part.Data, "status")
+		arguments, _ := dataRaw(part.Data, "arguments")
+		result, _ := dataRaw(part.Data, "result")
+		duration, _ := dataInt(part.Data, "duration_ms")
+		errText, _ := dataString(part.Data, "error")
+		return version.MessagePart{
+			Type: part.Type, CallID: callID, Name: name, Status: status,
+			Arguments: arguments, Result: result, DurationMS: duration, Error: errText,
+		}, nil
+	case version.MessagePartJobCard:
+		jobID, _ := dataInt(part.Data, "job_id")
+		kind, _ := dataString(part.Data, "kind")
+		status, _ := dataString(part.Data, "status")
+		current, _ := dataInt(part.Data, "current")
+		total, _ := dataInt(part.Data, "total")
+		return version.MessagePart{
+			Type: part.Type, JobID: jobID, JobKind: kind, Status: status,
+			Current: int(current), Total: int(total), Cancelable: dataBoolPtr(part.Data, "cancelable"),
+		}, nil
+	case version.MessagePartCaseCard:
+		caseID, _ := dataInt(part.Data, "case_id")
+		caseVersionID, _ := dataInt(part.Data, "case_version_id")
+		title, _ := dataString(part.Data, "title")
+		status, _ := dataString(part.Data, "status")
+		return version.MessagePart{
+			Type: part.Type, CaseID: caseID, CaseVersionID: caseVersionID, Title: title, Status: status,
+		}, nil
+	case version.MessagePartError:
+		code, _ := dataString(part.Data, "code")
+		message, _ := dataString(part.Data, "message")
+		retryable, _ := dataBool(part.Data, "retryable")
+		action, _ := dataString(part.Data, "action")
+		return version.MessagePart{
+			Type: part.Type, Code: code, Message: message, Retryable: retryable, Action: action,
+		}, nil
 	default:
-		return version.MessagePart{}, platform.Invalid("type", "must be text, attachment, image, requirement_card or rollback_proposal")
+		return version.MessagePart{}, platform.Invalid("type",
+			"must be text, thinking, tool_call, job_card, attachment, image, requirement_card, case_card, error or rollback_proposal")
 	}
 }
 
@@ -312,4 +389,60 @@ func dataInt(data map[string]any, key string) (int64, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+// dataRaw reads an object-shaped JSON field carried either as a decoded map or
+// as raw JSON (the runner stores json.RawMessage for tool arguments/results).
+func dataRaw(data map[string]any, key string) (json.RawMessage, bool) {
+	if data == nil {
+		return nil, false
+	}
+	value, ok := data[key]
+	if !ok || value == nil {
+		return nil, false
+	}
+	switch typed := value.(type) {
+	case json.RawMessage:
+		if len(typed) == 0 {
+			return nil, false
+		}
+		return typed, true
+	case []byte:
+		if len(typed) == 0 {
+			return nil, false
+		}
+		return json.RawMessage(typed), true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil, false
+		}
+		return json.RawMessage(trimmed), true
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return nil, false
+		}
+		return json.RawMessage(encoded), true
+	}
+}
+
+func dataBool(data map[string]any, key string) (bool, bool) {
+	if data == nil {
+		return false, false
+	}
+	value, ok := data[key]
+	if !ok || value == nil {
+		return false, false
+	}
+	typed, ok := value.(bool)
+	return typed, ok
+}
+
+func dataBoolPtr(data map[string]any, key string) *bool {
+	value, ok := dataBool(data, key)
+	if !ok {
+		return nil
+	}
+	return &value
 }

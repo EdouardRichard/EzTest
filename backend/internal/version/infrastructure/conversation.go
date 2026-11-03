@@ -268,8 +268,11 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 	return nil, true, nil
 }
 
-// AppendAssistantMessage inserts one assistant message and bumps the
-// conversation timestamp.
+// AppendAssistantMessage inserts one assistant message together with its
+// append-only conversation_message_part rows (0.2.1 streaming parts) in one
+// transaction, then bumps the conversation timestamp. The (message_id, seq)
+// unique index makes a duplicate/restarted seq a transaction failure instead of
+// a silent overwrite: append-only parts are never rewritten.
 func (r *ConversationRepository) AppendAssistantMessage(ctx context.Context, conversationID int64, message version.Message) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -288,6 +291,22 @@ func (r *ConversationRepository) AppendAssistantMessage(ctx context.Context, con
 		message.ActorID, message.AgentRunID, message.ClientMessageID,
 		message.ReplyToMessageID, message.CreatedAt); err != nil {
 		return wrapConversationDB("insert assistant message", err)
+	}
+	for _, part := range message.StreamParts {
+		payload := part.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage(`{}`)
+		}
+		createdAt := part.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = message.CreatedAt
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO conversation_message_part (id, message_id, seq, part_type, payload, created_at)
+			VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+		`, r.ids.Next(), message.ID, part.Seq, part.Type, string(payload), createdAt); err != nil {
+			return wrapConversationDB("insert conversation message part", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, conversationID, message.CreatedAt); err != nil {
 		return wrapConversationDB("touch conversation", err)

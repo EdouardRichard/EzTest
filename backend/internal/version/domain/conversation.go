@@ -1,6 +1,7 @@
 package version
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,10 +30,15 @@ const (
 	MessageRoleAssistant = "assistant"
 
 	MessagePartText             = "text"
+	MessagePartThinking         = "thinking"
+	MessagePartToolCall         = "tool_call"
+	MessagePartJobCard          = "job_card"
 	MessagePartAttachment       = "attachment"
 	MessagePartImage            = "image"
 	MessagePartRequirementCard  = "requirement_card"
+	MessagePartCaseCard         = "case_card"
 	MessagePartRollbackProposal = "rollback_proposal"
+	MessagePartError            = "error"
 )
 
 // Conversation and message limits.
@@ -46,6 +52,17 @@ const (
 	SummaryTextMax        = 20000
 	MessagesDefaultLimit  = 100
 	MessagesMaxLimit      = 200
+
+	// Streamed part bounds (spec §9.1). The streaming table only stores these
+	// eight DB-checked types; rollback_proposal/image stay snapshot-only.
+	MaxMessageStreamParts  = 256
+	ToolCallIDMax          = 128
+	ToolCallNameMax        = 200
+	ToolCallErrorMax       = 2000
+	MessageErrorCodeMax    = 64
+	MessageErrorMessageMax = 2000
+	MessageErrorActionMax  = 500
+	CaseCardTitleMax       = 255
 )
 
 // Conversation domain errors.
@@ -58,11 +75,11 @@ var messageSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Conversation is one human/AI clarification thread.
 type Conversation struct {
-	ID            int64
-	VersionID     int64
-	Kind          string
-	Title         string
-	Status        string
+	ID        int64
+	VersionID int64
+	Kind      string
+	Title     string
+	Status    string
 	// ModelOverride is the 0.2.1 conversation-level model identifier
 	// (`llm_model.model`). Nil means "use the LLM config default_model_id";
 	// the runtime never switches models on its own (D24).
@@ -109,10 +126,18 @@ type Message struct {
 	// assistant messages without a run (contracts `actual_model`).
 	ActualModel string
 	CreatedAt   time.Time
+
+	// StreamParts is the append-only conversation_message_part aggregate written
+	// in the same transaction as an assistant message (0.2.1 streaming parts).
+	// Seq is 1-based and strictly increasing within the message; the repository
+	// enforces the (message_id, seq) uniqueness. It is not part of the message
+	// snapshot column.
+	StreamParts []ConversationMessagePart
 }
 
 // MessagePart is the discriminated union of message parts. The JSON shape is
-// fixed by the P1 OpenAPI MessagePart oneOf.
+// fixed by the P1 OpenAPI MessagePart oneOf (extended by 0.2.1 with the
+// thinking/tool_call/job_card/case_card/error branches).
 type MessagePart struct {
 	Type          string
 	Text          string
@@ -128,6 +153,28 @@ type MessagePart struct {
 	Status        string
 	Revision      int
 	Reason        string
+
+	// thinking
+	DurationMS int64
+	// tool_call
+	CallID    string
+	Arguments json.RawMessage
+	Result    json.RawMessage
+	Error     string
+	// job_card
+	JobID      int64
+	JobKind    string
+	Current    int
+	Total      int
+	Cancelable *bool
+	// case_card
+	CaseID        int64
+	CaseVersionID int64
+	// error
+	Code      string
+	Message   string
+	Retryable bool
+	Action    string
 }
 
 // MarshalJSON renders the exact OpenAPI part shape for the part type.
@@ -178,6 +225,63 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 			RequirementID: strconv.FormatInt(p.RequirementID, 10),
 			Reason:        p.Reason,
 		})
+	case MessagePartThinking:
+		return json.Marshal(struct {
+			Type       string `json:"type"`
+			Text       string `json:"text"`
+			DurationMS int64  `json:"duration_ms"`
+		}{Type: p.Type, Text: p.Text, DurationMS: p.DurationMS})
+	case MessagePartToolCall:
+		payload := struct {
+			Type       string          `json:"type"`
+			CallID     string          `json:"call_id"`
+			Name       string          `json:"name"`
+			Status     string          `json:"status"`
+			Arguments  json.RawMessage `json:"arguments,omitempty"`
+			Result     json.RawMessage `json:"result,omitempty"`
+			DurationMS int64           `json:"duration_ms"`
+			Error      string          `json:"error,omitempty"`
+		}{
+			Type: p.Type, CallID: p.CallID, Name: p.Name, Status: p.Status,
+			Arguments: p.Arguments, Result: p.Result, DurationMS: p.DurationMS, Error: p.Error,
+		}
+		return json.Marshal(payload)
+	case MessagePartJobCard:
+		payload := struct {
+			Type       string `json:"type"`
+			JobID      string `json:"job_id"`
+			Kind       string `json:"kind"`
+			Status     string `json:"status"`
+			Current    int    `json:"current"`
+			Total      int    `json:"total"`
+			Cancelable *bool  `json:"cancelable,omitempty"`
+		}{
+			Type: p.Type, JobID: strconv.FormatInt(p.JobID, 10), Kind: p.JobKind,
+			Status: p.Status, Current: p.Current, Total: p.Total, Cancelable: p.Cancelable,
+		}
+		return json.Marshal(payload)
+	case MessagePartCaseCard:
+		payload := struct {
+			Type          string `json:"type"`
+			CaseID        string `json:"case_id"`
+			CaseVersionID string `json:"case_version_id,omitempty"`
+			Title         string `json:"title"`
+			Status        string `json:"status"`
+		}{
+			Type: p.Type, CaseID: strconv.FormatInt(p.CaseID, 10), Title: p.Title, Status: p.Status,
+		}
+		if p.CaseVersionID > 0 {
+			payload.CaseVersionID = strconv.FormatInt(p.CaseVersionID, 10)
+		}
+		return json.Marshal(payload)
+	case MessagePartError:
+		return json.Marshal(struct {
+			Type      string `json:"type"`
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+			Action    string `json:"action,omitempty"`
+		}{Type: p.Type, Code: p.Code, Message: p.Message, Retryable: p.Retryable, Action: p.Action})
 	default:
 		return nil, fmt.Errorf("unsupported message part type %q", p.Type)
 	}
@@ -250,6 +354,82 @@ func (p *MessagePart) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		*p = MessagePart{Type: probe.Type, RequirementID: requirementID, Reason: payload.Reason}
+	case MessagePartThinking:
+		var payload struct {
+			Text       string `json:"text"`
+			DurationMS int64  `json:"duration_ms"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		*p = MessagePart{Type: probe.Type, Text: payload.Text, DurationMS: payload.DurationMS}
+	case MessagePartToolCall:
+		var payload struct {
+			CallID     string          `json:"call_id"`
+			Name       string          `json:"name"`
+			Status     string          `json:"status"`
+			Arguments  json.RawMessage `json:"arguments"`
+			Result     json.RawMessage `json:"result"`
+			DurationMS int64           `json:"duration_ms"`
+			Error      string          `json:"error"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		*p = MessagePart{
+			Type: probe.Type, CallID: payload.CallID, Name: payload.Name, Status: payload.Status,
+			Arguments: payload.Arguments, Result: payload.Result, DurationMS: payload.DurationMS, Error: payload.Error,
+		}
+	case MessagePartJobCard:
+		var payload struct {
+			JobID      json.RawMessage `json:"job_id"`
+			Kind       string          `json:"kind"`
+			Status     string          `json:"status"`
+			Current    int             `json:"current"`
+			Total      int             `json:"total"`
+			Cancelable *bool           `json:"cancelable"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		jobID, err := parseJSONID(payload.JobID)
+		if err != nil {
+			return err
+		}
+		*p = MessagePart{
+			Type: probe.Type, JobID: jobID, JobKind: payload.Kind, Status: payload.Status,
+			Current: payload.Current, Total: payload.Total, Cancelable: payload.Cancelable,
+		}
+	case MessagePartCaseCard:
+		var payload struct {
+			CaseID        json.RawMessage `json:"case_id"`
+			CaseVersionID json.RawMessage `json:"case_version_id"`
+			Title         string          `json:"title"`
+			Status        string          `json:"status"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		caseID, err := parseJSONID(payload.CaseID)
+		if err != nil {
+			return err
+		}
+		caseVersionID, err := parseJSONID(payload.CaseVersionID)
+		if err != nil {
+			return err
+		}
+		*p = MessagePart{Type: probe.Type, CaseID: caseID, CaseVersionID: caseVersionID, Title: payload.Title, Status: payload.Status}
+	case MessagePartError:
+		var payload struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+			Action    string `json:"action"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		*p = MessagePart{Type: probe.Type, Code: payload.Code, Message: payload.Message, Retryable: payload.Retryable, Action: payload.Action}
 	default:
 		return fmt.Errorf("unsupported message part type %q", probe.Type)
 	}
@@ -380,16 +560,97 @@ func ValidateUserMessageParts(parts []MessagePart) error {
 }
 
 // ValidateAssistantMessageParts validates one runtime-authored assistant
-// message (text, requirement card or rollback proposal).
+// message. It accepts the eight conversation_message_part contract types plus
+// the P1 rollback_proposal part (snapshot-only) and enforces each branch's
+// required payload fields and bounds (spec §9.1).
 func ValidateAssistantMessageParts(parts []MessagePart) error {
 	if len(parts) == 0 {
 		return platform.Invalid("parts", "must contain at least one part")
+	}
+	if len(parts) > MaxMessageStreamParts {
+		return platform.Invalid("parts", "must contain at most 256 parts")
 	}
 	for index, part := range parts {
 		field := func(name string) string { return fmt.Sprintf("parts[%d].%s", index, name) }
 		switch part.Type {
 		case MessagePartText:
 			if err := validation.String(field("text"), part.Text, 1, MessageTextMax); err != nil {
+				return err
+			}
+		case MessagePartThinking:
+			if err := validation.String(field("text"), part.Text, 1, MessageTextMax); err != nil {
+				return err
+			}
+			if part.DurationMS < 0 {
+				return platform.Invalid(field("duration_ms"), "must be a non-negative integer")
+			}
+		case MessagePartToolCall:
+			if err := validation.String(field("call_id"), part.CallID, 1, ToolCallIDMax); err != nil {
+				return err
+			}
+			if err := validation.String(field("name"), part.Name, 1, ToolCallNameMax); err != nil {
+				return err
+			}
+			switch part.Status {
+			case "running", "done", "failed":
+			default:
+				return platform.Invalid(field("status"), "must be one of running, done, failed")
+			}
+			if part.DurationMS < 0 {
+				return platform.Invalid(field("duration_ms"), "must be a non-negative integer")
+			}
+			if err := validateJSONObjectField(field("arguments"), part.Arguments, false); err != nil {
+				return err
+			}
+			if err := validateJSONObjectField(field("result"), part.Result, true); err != nil {
+				return err
+			}
+			if err := validation.String(field("error"), part.Error, 0, ToolCallErrorMax); err != nil {
+				return err
+			}
+		case MessagePartJobCard:
+			if part.JobID <= 0 {
+				return platform.Invalid(field("job_id"), "must be a positive decimal ID")
+			}
+			if !IsValidJobCardKind(part.JobKind) {
+				return platform.Invalid(field("kind"), "must be a job kind of the 0.2.1 contract")
+			}
+			cancelable, ok := jobCardStatusCancelable(part.Status)
+			if !ok {
+				return platform.Invalid(field("status"), "must be one of open, claimed, running, waiting_human, done, failed, cancelled")
+			}
+			if part.Current < 0 || part.Total < 0 {
+				return platform.Invalid(field("current"), "current/total must be non-negative integers")
+			}
+			if part.Total > 0 && part.Current > part.Total {
+				return platform.Invalid(field("current"), "must not exceed total")
+			}
+			if part.Cancelable != nil && *part.Cancelable && !cancelable {
+				return platform.Invalid(field("cancelable"), "must be false for a terminal job status")
+			}
+		case MessagePartCaseCard:
+			if part.CaseID <= 0 {
+				return platform.Invalid(field("case_id"), "must be a positive decimal ID")
+			}
+			if part.CaseVersionID < 0 {
+				return platform.Invalid(field("case_version_id"), "must be a positive decimal ID or null")
+			}
+			if err := validation.String(field("title"), part.Title, 1, CaseCardTitleMax); err != nil {
+				return err
+			}
+			switch part.Status {
+			case "draft", "confirmed", "stale", "superseded":
+			default:
+				return platform.Invalid(field("status"), "must be one of draft, confirmed, stale, superseded")
+			}
+		case MessagePartError:
+			if err := validation.String(field("code"), part.Code, 1, MessageErrorCodeMax); err != nil {
+				return err
+			}
+			if err := validation.String(field("message"), part.Message, 1, MessageErrorMessageMax); err != nil {
+				return err
+			}
+			if err := validation.String(field("action"), part.Action, 0, MessageErrorActionMax); err != nil {
 				return err
 			}
 		case MessagePartAttachment:
@@ -416,8 +677,79 @@ func ValidateAssistantMessageParts(parts []MessagePart) error {
 				return platform.Invalid(field("requirement_id"), "must be a positive decimal ID")
 			}
 		default:
-			return platform.Invalid(field("type"), "must be text, attachment, requirement_card or rollback_proposal")
+			return platform.Invalid(field("type"),
+				"must be text, thinking, tool_call, job_card, attachment, requirement_card, case_card, error or rollback_proposal")
 		}
+	}
+	return nil
+}
+
+// IsStreamingMessagePartType reports whether a part type has a
+// conversation_message_part row (the DB part_type CHECK enum). image and
+// rollback_proposal are snapshot-only message parts.
+func IsStreamingMessagePartType(partType string) bool {
+	switch partType {
+	case MessagePartText, MessagePartThinking, MessagePartToolCall, MessagePartJobCard,
+		MessagePartAttachment, MessagePartRequirementCard, MessagePartCaseCard, MessagePartError:
+		return true
+	default:
+		return false
+	}
+}
+
+// StreamingMessagePartTypes returns the conversation_message_part type enum in
+// contract order (openapi MessagePartView.part_type).
+func StreamingMessagePartTypes() []string {
+	return []string{
+		MessagePartText,
+		MessagePartThinking,
+		MessagePartToolCall,
+		MessagePartJobCard,
+		MessagePartAttachment,
+		MessagePartRequirementCard,
+		MessagePartCaseCard,
+		MessagePartError,
+	}
+}
+
+var jobCardKinds = map[string]struct{}{
+	"explore.login": {}, "explore.page": {}, "explore.api": {}, "explore.coverage": {},
+	"explore.gap": {}, "design.cases": {}, "review.cases": {}, "execute.batch": {},
+	"analyze.failure": {}, "report.version": {}, "knowledge.propose": {},
+}
+
+// IsValidJobCardKind reports whether kind is one of the frozen 0.2.1 job kinds.
+func IsValidJobCardKind(kind string) bool {
+	_, ok := jobCardKinds[kind]
+	return ok
+}
+
+// jobCardStatusCancelable validates the job_card status enum and reports
+// whether the derived UI may offer a cancel action for it.
+func jobCardStatusCancelable(status string) (bool, bool) {
+	switch status {
+	case "open", "claimed", "running", "waiting_human":
+		return true, true
+	case "done", "failed", "cancelled":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// validateJSONObjectField checks that an optional raw JSON field is a JSON
+// object. allowNull additionally accepts a literal null (tool_call.result).
+func validateJSONObjectField(field string, raw json.RawMessage, allowNull bool) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if allowNull && bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
+		return platform.Invalid(field, "must be a JSON object")
 	}
 	return nil
 }

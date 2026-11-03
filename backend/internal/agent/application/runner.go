@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Runner defaults. Profile budgets and the frozen P0 settings override them.
@@ -373,16 +375,21 @@ type runState struct {
 	// roleGuard audits and rejects a call outside the role whitelist. Nil for
 	// profiles not mapped to one of the seven roles (they keep their own frozen
 	// contract whitelist).
-	roleGuard        *RoleToolGuard
-	budget           int
-	resourceBudget   Budget
-	startedAt        time.Time
-	turns            int
-	usage            map[string]int
-	messages         []llmapp.ChatMessage
-	images           []llmapp.ChatImage
-	userContent      string
-	cards            []ConversationPart
+	roleGuard      *RoleToolGuard
+	budget         int
+	resourceBudget Budget
+	startedAt      time.Time
+	turns          int
+	usage          map[string]int
+	messages       []llmapp.ChatMessage
+	images         []llmapp.ChatImage
+	userContent    string
+	cards          []ConversationPart
+	// streamParts are the 0.2.1 UI streaming parts produced by this run
+	// (thinking/tool_call/error; job_card is appended when the final message is
+	// written). They are written with the assistant message as
+	// conversation_message_part rows and published on conversation.message.
+	streamParts      []ConversationPart
 	conversationKind string
 	team             agent.Team
 	overflowHits     int
@@ -774,6 +781,7 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			request.Tools = state.definitions
 		}
 
+		turnStarted := r.now()
 		response, err := r.chat.Chat(ctx, request)
 		if err != nil {
 			if llmapp.IsContextOverflow(err) {
@@ -790,6 +798,16 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			// run fails after the single upstream call and the user is asked to
 			// check the capability/protocol (spec §5.6).
 			return "", &RunError{Reason: "model_error", Retryable: !llmapp.IsProtocol(err), Cause: err}
+		}
+		// 0.2.1 thinking part: the provider's reasoning text is shown collapsed
+		// in the thread ("思考了 Ns"). The duration is the model turn; secrets
+		// are redacted and the text is bounded before it can reach the UI.
+		if reasoning := strings.TrimSpace(response.ReasoningContent); reasoning != "" {
+			state.appendStreamPart(ConversationPart{
+				Type: "thinking",
+				Text: redactPartText(reasoning, producedPartThinkingMax),
+				Data: map[string]any{"duration_ms": partDurationMS(turnStarted, r.now())},
+			})
 		}
 		state.turns++
 		mergeUsage(state.usage, response.Usage)
@@ -873,6 +891,7 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 
 	for _, call := range calls {
 		r.publishActivity(state, "tool", call.Name, "")
+		callStarted := r.now()
 		var payload any
 		var err error
 		switch {
@@ -932,6 +951,12 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 				content = string(spilled)
 			}
 		}
+
+		// 0.2.1 tool_call/error parts: the UI pairs streamed rows by call_id and
+		// shows the tool name/status/duration/result collapsed. Arguments and
+		// results are sanitized (credentials redacted, values bounded) before
+		// they can reach the conversation thread or its SSE event.
+		r.appendToolParts(state, call, content, err, partDurationMS(callStarted, r.now()))
 
 		parts := []agent.MessagePart{{Type: "text", Text: content}}
 		if contentRef != "" {
@@ -1033,7 +1058,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			ConversationID:   state.payload.ConversationID,
 			AgentRunID:       state.run.ID,
 			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+			Parts:            r.assistantConversationParts(state, finalText, nil),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
@@ -1049,7 +1074,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			ConversationID:   state.payload.ConversationID,
 			AgentRunID:       state.run.ID,
 			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+			Parts:            r.assistantConversationParts(state, finalText, nil),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
@@ -1064,7 +1089,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			VersionID:      state.item.VersionID,
 			ConversationID: state.payload.ConversationID,
 			AgentRunID:     state.run.ID,
-			Parts:          []ConversationPart{{Type: "text", Text: finalText}},
+			Parts:          r.assistantConversationParts(state, finalText, nil),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
@@ -1096,11 +1121,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		if finalText == "" && len(state.cards) == 0 {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("curator produced no message or requirement card")}
 		}
-		parts := make([]ConversationPart, 0, 1+len(state.cards))
-		if finalText != "" {
-			parts = append(parts, ConversationPart{Type: "text", Text: finalText})
-		}
-		parts = append(parts, state.cards...)
+		parts := r.assistantConversationParts(state, finalText, state.cards)
 		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
 			VersionID:        state.item.VersionID,
 			ConversationID:   state.payload.ConversationID,
@@ -1141,7 +1162,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 				ConversationID:   state.payload.ConversationID,
 				AgentRunID:       state.run.ID,
 				ReplyToMessageID: replyTarget(state.payload.MessageID),
-				Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+				Parts:            r.assistantConversationParts(state, finalText, nil),
 			}); err != nil {
 				return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 			}
@@ -2395,5 +2416,275 @@ func intValue(value any) int {
 		return int(parsed)
 	default:
 		return 0
+	}
+}
+
+// ---------- 0.2.1 message parts producer ----------
+
+// Produced part bounds. The version validator and the conversation_message_part
+// payload CHECK are the last line of defense; the runner bounds and sanitizes
+// before the part leaves the run so a tool result can never bloat a message or
+// persist credentials.
+const (
+	producedPartThinkingMax = 4000
+	producedPartJSONMax     = 4000
+	producedPartHeadMax     = 2000
+	producedPartStringMax   = 500
+	producedPartMaxDepth    = 8
+	maxProducedStreamParts  = 200
+)
+
+var (
+	// partSecretAssignmentPattern catches a credential written into free text
+	// ("password=hunter2", "token: abc"), keeping the field name for context.
+	partSecretAssignmentPattern = regexp.MustCompile(
+		`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|cookie|credential)s?\b\s*[:=]\s*(\S+)`)
+	// partBearerPattern catches a raw bearer credential under any key.
+	partBearerPattern = regexp.MustCompile(`(?i)\bbearer\s+([A-Za-z0-9._~+/=-]+)`)
+	// partJWTPattern catches a raw JWT.
+	partJWTPattern = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+)
+
+// appendStreamPart records one produced streaming part, bounded by the message
+// limit. A dropped part never fails the run: the model reply is the artifact,
+// the trace is supplementary.
+func (state *runState) appendStreamPart(part ConversationPart) {
+	if state == nil || len(state.streamParts) >= maxProducedStreamParts {
+		return
+	}
+	state.streamParts = append(state.streamParts, part)
+}
+
+// hasErrorPart dedupes repeated tool validation failures so a model retrying the
+// same bad call does not stack identical error cards in the thread.
+func (state *runState) hasErrorPart(code, message string) bool {
+	for _, part := range state.streamParts {
+		if part.Type != "error" {
+			continue
+		}
+		if stringValue(part.Data["code"]) == code && stringValue(part.Data["message"]) == message {
+			return true
+		}
+	}
+	return false
+}
+
+// appendToolParts emits the tool_call part plus, for a structured tool failure,
+// one error part with the user-visible code/message. Arguments and results are
+// sanitized first: credentials redacted, strings bounded, result object-shaped.
+func (r *Runner) appendToolParts(state *runState, call llmapp.ToolCall, content string, toolErr error, durationMS int64) {
+	callID := strings.TrimSpace(call.ID)
+	if callID == "" {
+		if r.ids == nil {
+			return
+		}
+		callID = "call_" + idText(r.ids.Next())
+	}
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return
+	}
+	status := "done"
+	errorText := ""
+	if toolErr != nil {
+		status = "failed"
+		errorText = redactPartText(toolErr.Error(), version.ToolCallErrorMax)
+	}
+	data := map[string]any{
+		"call_id":     truncateRunes(callID, version.ToolCallIDMax),
+		"name":        truncateRunes(name, version.ToolCallNameMax),
+		"status":      status,
+		"duration_ms": durationMS,
+	}
+	if arguments, ok := sanitizePartJSONObject(call.Arguments); ok {
+		data["arguments"] = arguments
+	}
+	if result, ok := sanitizePartResult(content); ok {
+		data["result"] = result
+	}
+	if errorText != "" {
+		data["error"] = errorText
+	}
+	state.appendStreamPart(ConversationPart{Type: "tool_call", Data: data})
+
+	var typed *tools.Error
+	if toolErr == nil || !errors.As(toolErr, &typed) {
+		return
+	}
+	code := truncateRunes(strings.TrimSpace(typed.Code), version.MessageErrorCodeMax)
+	message := redactPartText(typed.Message, version.MessageErrorMessageMax)
+	if code == "" || message == "" || state.hasErrorPart(code, message) {
+		return
+	}
+	state.appendStreamPart(ConversationPart{Type: "error", Data: map[string]any{
+		"code":      code,
+		"message":   message,
+		"retryable": false,
+	}})
+}
+
+// assistantConversationParts renders the parts of one final assistant message:
+// the produced trace parts (thinking/tool_call/error), the job_card of the work
+// item that wrote the message (when it maps to a contract job kind), the final
+// text and the profile-specific extra cards. Order is the render order.
+func (r *Runner) assistantConversationParts(state *runState, finalText string, extra []ConversationPart) []ConversationPart {
+	parts := make([]ConversationPart, 0, len(state.streamParts)+2+len(extra))
+	parts = append(parts, state.streamParts...)
+	if card, ok := jobCardConversationPart(state); ok {
+		parts = append(parts, card)
+	}
+	if finalText != "" {
+		parts = append(parts, ConversationPart{Type: "text", Text: finalText})
+	}
+	parts = append(parts, extra...)
+	return parts
+}
+
+// jobCardConversationPart projects the run's work item as a job_card part.
+// Chat-scale work items have no contract job kind, so they produce no card; a
+// background job (design.cases/execute.batch/...) shows up in the thread.
+func jobCardConversationPart(state *runState) (ConversationPart, bool) {
+	if state == nil || state.item.ID <= 0 {
+		return ConversationPart{}, false
+	}
+	kind := jobKind(state.item)
+	if !version.IsValidJobCardKind(kind) {
+		return ConversationPart{}, false
+	}
+	return ConversationPart{Type: "job_card", Data: map[string]any{
+		"job_id":     idText(state.item.ID),
+		"kind":       kind,
+		"status":     "running",
+		"current":    int64(state.turns),
+		"total":      int64(0),
+		"cancelable": true,
+	}}, true
+}
+
+// partDurationMS renders a non-negative elapsed duration for the UI.
+func partDurationMS(start, end time.Time) int64 {
+	if end.Before(start) {
+		return 0
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+// redactPartText removes credential-shaped values from free text and bounds it.
+func redactPartText(text string, max int) string {
+	redacted := partSecretAssignmentPattern.ReplaceAllString(text, "${1}=[redacted]")
+	redacted = partBearerPattern.ReplaceAllString(redacted, "Bearer [redacted]")
+	redacted = partJWTPattern.ReplaceAllString(redacted, "[redacted]")
+	if max > 0 {
+		redacted = truncateRunes(redacted, max)
+	}
+	return redacted
+}
+
+// sanitizePartJSONObject sanitizes a model-supplied JSON object (tool call
+// arguments). Malformed or non-object input is omitted instead of failing the
+// run; the model already sees the raw value through the tool channel.
+func sanitizePartJSONObject(raw string) (json.RawMessage, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return nil, false
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return marshalSanitizedPartJSON(redactPartValue(object, 0))
+}
+
+// sanitizePartResult sanitizes a tool result. The contract result is an object
+// or null, so a scalar tool result is wrapped under "value".
+func sanitizePartResult(content string) (json.RawMessage, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return marshalSanitizedPartJSON(map[string]any{"value": redactPartText(trimmed, producedPartStringMax)})
+	}
+	sanitized := redactPartValue(value, 0)
+	if _, ok := sanitized.(map[string]any); !ok {
+		sanitized = map[string]any{"value": sanitized}
+	}
+	return marshalSanitizedPartJSON(sanitized)
+}
+
+func marshalSanitizedPartJSON(value any) (json.RawMessage, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	if len(encoded) > producedPartJSONMax {
+		encoded, err = json.Marshal(map[string]any{
+			"truncated": true,
+			"head":      truncateRunes(string(encoded), producedPartHeadMax),
+		})
+		if err != nil {
+			return nil, false
+		}
+	}
+	return json.RawMessage(encoded), true
+}
+
+// redactPartValue walks a decoded JSON value: credential-keyed fields become
+// "[redacted]", every remaining string is credential-scanned and bounded, and
+// the walk is depth/size bounded so a hostile tool result cannot explode.
+func redactPartValue(value any, depth int) any {
+	if depth > producedPartMaxDepth {
+		return "[redacted]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if isCredentialKey(key) {
+				out[key] = "[redacted]"
+				continue
+			}
+			out[key] = redactPartValue(item, depth+1)
+		}
+		return out
+	case []any:
+		items := typed
+		if len(items) > 100 {
+			items = items[:100]
+		}
+		out := make([]any, 0, len(items))
+		for _, item := range items {
+			out = append(out, redactPartValue(item, depth+1))
+		}
+		return out
+	case string:
+		return redactPartText(typed, producedPartStringMax)
+	default:
+		return value
+	}
+}
+
+// isCredentialKey reports whether a JSON field name denotes a credential value
+// that must never reach conversation parts.
+func isCredentialKey(key string) bool {
+	normalized := strings.Map(func(r rune) rune {
+		if r == '_' || r == '-' || r == ' ' {
+			return -1
+		}
+		return r
+	}, strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
+	case "password", "passwd", "pwd", "secret", "token", "accesstoken", "refreshtoken",
+		"sessiontoken", "apikey", "apitoken", "authorization", "cookie", "cookies",
+		"credential", "credentials", "clientsecret", "secretkey", "privatekey",
+		"storagestate", "sessionid", "passphrase":
+		return true
+	default:
+		return false
 	}
 }

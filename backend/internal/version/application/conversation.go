@@ -2,7 +2,9 @@ package versionapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -371,11 +373,16 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 	}
 
 	now := s.clock.Now()
+	streamParts, err := assistantStreamParts(parts, now)
+	if err != nil {
+		return MessageView{}, err
+	}
 	message := version.Message{
 		ID:               s.ids.Next(),
 		ConversationID:   conversationID,
 		Role:             version.MessageRoleAssistant,
 		Parts:            append([]version.MessagePart{}, parts...),
+		StreamParts:      streamParts,
 		Refs:             []version.MessageRef{},
 		TokenUsage:       map[string]any{},
 		ReplyToMessageID: replyToMessageID,
@@ -451,8 +458,17 @@ func (s *ConversationService) publishMessageEvent(ctx context.Context, versionID
 		return
 	}
 	parts := make([]any, 0, len(message.Parts))
+	// Assistant streamed parts carry their 1-based conversation_message_part seq
+	// so the UI can dedupe repeated frames. The seq assignment mirrors
+	// assistantStreamParts; parts outside the streaming enum stay unsequenced.
+	seq := 0
 	for _, part := range message.Parts {
-		parts = append(parts, partPayload(part))
+		payload := partPayload(part)
+		if message.Role == version.MessageRoleAssistant && version.IsStreamingMessagePartType(part.Type) {
+			seq++
+			payload["seq"] = seq
+		}
+		parts = append(parts, payload)
 	}
 	refs := make([]map[string]any, 0, len(message.Refs))
 	for _, ref := range message.Refs {
@@ -478,30 +494,45 @@ func (s *ConversationService) publishMessageEvent(ctx context.Context, versionID
 	})
 }
 
-// partPayload renders the canonical part map without a JSON round trip.
+// assistantStreamParts turns an assistant message's parts into the append-only
+// conversation_message_part rows written in the same transaction as the
+// message head. Seq is 1-based and strictly increasing in part order; only the
+// eight DB-checked part types are streamed (rollback_proposal/image remain
+// snapshot-only).
+func assistantStreamParts(parts []version.MessagePart, now time.Time) ([]version.ConversationMessagePart, error) {
+	rows := make([]version.ConversationMessagePart, 0, len(parts))
+	seq := 0
+	for _, part := range parts {
+		if !version.IsStreamingMessagePartType(part.Type) {
+			continue
+		}
+		payload, err := json.Marshal(part)
+		if err != nil {
+			return nil, fmt.Errorf("encode message part %q: %w", part.Type, err)
+		}
+		seq++
+		rows = append(rows, version.ConversationMessagePart{
+			Seq:       seq,
+			Type:      part.Type,
+			Payload:   payload,
+			CreatedAt: now,
+		})
+	}
+	return rows, nil
+}
+
+// partPayload renders the canonical part map from the part's contract JSON
+// shape; unknown types fall back to just the type tag.
 func partPayload(part version.MessagePart) map[string]any {
-	payload := map[string]any{"type": part.Type}
-	switch part.Type {
-	case version.MessagePartText:
-		payload["text"] = part.Text
-	case version.MessagePartAttachment:
-		payload["sha256"] = part.SHA256
-		payload["name"] = part.Name
-		payload["mime"] = part.MIME
-		payload["size"] = part.Size
-	case version.MessagePartImage:
-		payload["mime"] = part.MIME
-		payload["data_ref"] = part.DataRef
-		payload["width"] = part.Width
-		payload["height"] = part.Height
-	case version.MessagePartRequirementCard:
-		payload["requirement_id"] = platformid.Format(part.RequirementID)
-		payload["title"] = part.Title
-		payload["status"] = part.Status
-		payload["revision"] = part.Revision
-	case version.MessagePartRollbackProposal:
-		payload["requirement_id"] = platformid.Format(part.RequirementID)
-		payload["reason"] = part.Reason
+	raw, err := json.Marshal(part)
+	if err != nil {
+		// MessagePart.MarshalJSON only fails for an unknown type, which the
+		// validators reject before a message is ever built.
+		return map[string]any{"type": part.Type}
+	}
+	payload := map[string]any{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return map[string]any{"type": part.Type}
 	}
 	return payload
 }

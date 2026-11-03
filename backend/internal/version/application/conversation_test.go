@@ -159,7 +159,27 @@ func (f *fakeConversationRepo) AppendAssistantMessage(_ context.Context, convers
 	if _, ok := f.conversations[conversationID]; !ok {
 		return version.ErrConversationNotFound
 	}
+	// Mirror the DB constraints the writer relies on: one part_type from the
+	// conversation_message_part enum and a unique (message_id, seq) per message,
+	// validated before anything is stored so a conflict leaves no head and no
+	// part row behind (transaction semantics).
+	seen := make(map[int]struct{}, len(message.StreamParts))
+	for _, part := range message.StreamParts {
+		if !version.IsStreamingMessagePartType(part.Type) {
+			return errors.New("fake: stream part type outside the conversation_message_part enum")
+		}
+		if part.Seq <= 0 {
+			return errors.New("fake: stream part seq must be positive")
+		}
+		if _, duplicate := seen[part.Seq]; duplicate {
+			return errors.New("fake: duplicate (message_id, seq)")
+		}
+		seen[part.Seq] = struct{}{}
+	}
 	f.messages[conversationID] = append(f.messages[conversationID], message)
+	if len(message.StreamParts) > 0 {
+		f.messageParts[message.ID] = append([]version.ConversationMessagePart(nil), message.StreamParts...)
+	}
 	conversation := f.conversations[conversationID]
 	conversation.MessageCount = len(f.messages[conversationID])
 	conversation.LastMessageAt = &message.CreatedAt

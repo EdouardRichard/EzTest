@@ -280,11 +280,13 @@ func TestRunnerCuratorToolCallWritesRequirementCard(t *testing.T) {
 		t.Fatalf("conversation messages = %d", len(fixture.conv.appended))
 	}
 	parts := fixture.conv.appended[0].Parts
-	if len(parts) != 2 || parts[0].Type != "text" || parts[1].Type != "requirement_card" {
+	text, hasText := partOfType(parts, "text")
+	card, hasCard := partOfType(parts, "requirement_card")
+	if !hasText || !hasCard || text.Text == "" {
 		t.Fatalf("parts = %#v", parts)
 	}
-	if parts[1].Data["requirement_id"] != "501" || parts[1].Data["revision"] != 1 {
-		t.Fatalf("card = %#v", parts[1].Data)
+	if card.Data["requirement_id"] != "501" || card.Data["revision"] != 1 {
+		t.Fatalf("card = %#v", card.Data)
 	}
 
 	toolMessages := 0
