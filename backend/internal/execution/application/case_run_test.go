@@ -46,8 +46,11 @@ type caseRunnerFixture struct {
 	events     *caseRunnerEvents
 	audit      *caseRunnerAudit
 	knowledge  *fakeCaseSuccessHook
-	runCtx     context.Context
-	runCancel  context.CancelFunc
+	// knowledgeFailure receives failed-case observations. It is a nil-safe
+	// optional hook like KnowledgeHook; the failure lifecycle wiring test uses it.
+	knowledgeFailure *fakeCaseFailureHook
+	runCtx           context.Context
+	runCancel        context.CancelFunc
 }
 
 func int64ptr(value int64) *int64 { return &value }
@@ -105,11 +108,12 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 			"execution.human_request_timeout_seconds": 600,
 			"execution.case_max_wait_seconds":         300,
 		}},
-		clock:     &caseRunnerClock{now: time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)},
-		ids:       &caseRunnerIDs{next: 5000},
-		events:    &caseRunnerEvents{},
-		audit:     &caseRunnerAudit{},
-		knowledge: &fakeCaseSuccessHook{},
+		clock:            &caseRunnerClock{now: time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)},
+		ids:              &caseRunnerIDs{next: 5000},
+		events:           &caseRunnerEvents{},
+		audit:            &caseRunnerAudit{},
+		knowledge:        &fakeCaseSuccessHook{},
+		knowledgeFailure: &fakeCaseFailureHook{},
 	}
 	fixture.runCtx, fixture.runCancel = context.WithCancel(context.Background())
 	t.Cleanup(fixture.runCancel)
@@ -123,30 +127,31 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 		Attempts: 1, OwnerInstance: "api-1",
 	}
 	fixture.runner = executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
-		Intents:       fixture.intents,
-		CaseRuns:      fixture.caseRuns,
-		SUTContexts:   fixture.sutContext,
-		Results:       fixture.results,
-		Evidence:      fixture.evidence,
-		Humans:        fixture.humans,
-		Cases:         fixture.cases,
-		Bindings:      fixture.bindings,
-		Browser:       fixture.browser,
-		Credentials:   fixture.creds,
-		Content:       fixture.content,
-		HTTPClient:    fixture.http,
-		Database:      fixture.db,
-		Gaps:          fixture.gaps,
-		Coverage:      fixture.coverage,
-		TeamRoom:      fixture.room,
-		Visual:        fixture.visual,
-		Settings:      fixture.settings,
-		Clock:         fixture.clock,
-		IDs:           fixture.ids,
-		Events:        fixture.events,
-		Audit:         fixture.audit,
-		KnowledgeHook: fixture.knowledge,
-		InstanceID:    "api-1",
+		Intents:              fixture.intents,
+		CaseRuns:             fixture.caseRuns,
+		SUTContexts:          fixture.sutContext,
+		Results:              fixture.results,
+		Evidence:             fixture.evidence,
+		Humans:               fixture.humans,
+		Cases:                fixture.cases,
+		Bindings:             fixture.bindings,
+		Browser:              fixture.browser,
+		Credentials:          fixture.creds,
+		Content:              fixture.content,
+		HTTPClient:           fixture.http,
+		Database:             fixture.db,
+		Gaps:                 fixture.gaps,
+		Coverage:             fixture.coverage,
+		TeamRoom:             fixture.room,
+		Visual:               fixture.visual,
+		Settings:             fixture.settings,
+		Clock:                fixture.clock,
+		IDs:                  fixture.ids,
+		Events:               fixture.events,
+		Audit:                fixture.audit,
+		KnowledgeHook:        fixture.knowledge,
+		KnowledgeFailureHook: fixture.knowledgeFailure,
+		InstanceID:           "api-1",
 	})
 	return fixture
 }

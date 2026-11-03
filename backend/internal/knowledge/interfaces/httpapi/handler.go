@@ -166,12 +166,19 @@ func (h *Handler) GetItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	// R91 read gate: the list/search projection hides secret-bearing rows, so a
+	// direct-ID detail must not become a secret oracle. The response is
+	// indistinguishable from a missing item.
+	if knowledgeapp.ItemHasSecrets(item) {
+		httpx.Error(w, r, platform.NotFound("knowledge_item"))
+		return
+	}
 	revisions, err := h.service.Revisions(r.Context(), id)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toItemDetailView(item, revisions))
+	httpx.JSON(w, http.StatusOK, toItemDetailView(item, visibleKnowledgeRevisions(revisions)))
 }
 
 // UpdateItem PATCH /api/knowledge/items/{knowledgeId} (author or admin). The
@@ -240,10 +247,25 @@ func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	views := make([]knowledgeRevisionView, 0, len(revisions))
-	for _, revision := range revisions {
+	for _, revision := range visibleKnowledgeRevisions(revisions) {
 		views = append(views, toRevisionView(revision))
 	}
 	httpx.List(w, http.StatusOK, views, "", false)
+}
+
+// visibleKnowledgeRevisions drops append-only rows whose title/tags/content
+// carry a credential. The current item body may be clean while an older
+// revision is not, so both the detail payload and the revisions endpoint filter
+// row by row (R91).
+func visibleKnowledgeRevisions(revisions []knowledge.Revision) []knowledge.Revision {
+	visible := make([]knowledge.Revision, 0, len(revisions))
+	for _, revision := range revisions {
+		if knowledgeapp.RevisionHasSecrets(revision) {
+			continue
+		}
+		visible = append(visible, revision)
+	}
+	return visible
 }
 
 /* --------------------------------- helpers -------------------------------- */

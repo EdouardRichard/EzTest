@@ -84,6 +84,30 @@ type CaseSuccessHook interface {
 	OnCaseRunPassed(ctx context.Context, fact CaseSuccessFact) error
 }
 
+// CaseFailureFact is the failed-case observation handed to the optional
+// knowledge failure hook (spec §10.1 失败复用 → suspect). It mirrors
+// CaseSuccessFact: identifiers (page/API/account-role back-references), the
+// version and the run identity plus the failure class, never knowledge content,
+// a case title or a credential.
+type CaseFailureFact struct {
+	VersionID     int64
+	CaseRunID     int64
+	CaseVersionID int64
+	FailureClass  execution.FailureClass
+	AccountRoles  []string
+	PageIDs       []int64
+	APIIDs        []int64
+}
+
+// CaseFailureHook is notified once when a case_run finishes failed. It exists so
+// the knowledge lifecycle can move the knowledge reused by the failed run to
+// suspect. Like CaseSuccessHook it is deliberately best effort: an error or a
+// panic is logged and never changes the persisted verdict. A nil hook disables
+// the notification.
+type CaseFailureHook interface {
+	OnCaseRunFailed(ctx context.Context, fact CaseFailureFact) error
+}
+
 // BrowserContextSpec is one lazily created executor browser context.
 type BrowserContextSpec struct {
 	Key          string
@@ -218,12 +242,15 @@ type CaseRunnerDeps struct {
 	// KnowledgeHook receives passed-case observations for knowledge
 	// sedimentation (spec §10.1). Optional and best effort.
 	KnowledgeHook CaseSuccessHook
-	Settings      SettingsReader
-	Clock         Clock
-	IDs           IDGenerator
-	Events        EventPublisher
-	Audit         AuditRecorder
-	InstanceID    string
+	// KnowledgeFailureHook receives failed-case observations so the knowledge
+	// reused by the failed run can be marked suspect. Optional and best effort.
+	KnowledgeFailureHook CaseFailureHook
+	Settings             SettingsReader
+	Clock                Clock
+	IDs                  IDGenerator
+	Events               EventPublisher
+	Audit                AuditRecorder
+	InstanceID           string
 	// LeaseTTL overrides the case_run lease. Values below 80s (the executor
 	// client bound is 75s) are raised to the minimum; zero selects the 90s
 	// default.
@@ -258,14 +285,16 @@ type CaseRunner struct {
 	human       HumanRequestService
 	visual      VisualAssertPort
 	knowledge   CaseSuccessHook
-	settings    SettingsReader
-	clock       Clock
-	ids         IDGenerator
-	events      EventPublisher
-	audit       AuditRecorder
-	instanceID  string
-	leaseTTL    time.Duration
-	heartbeat   time.Duration
+	// knowledgeFailure is the optional failed-case knowledge hook.
+	knowledgeFailure CaseFailureHook
+	settings         SettingsReader
+	clock            Clock
+	ids              IDGenerator
+	events           EventPublisher
+	audit            AuditRecorder
+	instanceID       string
+	leaseTTL         time.Duration
+	heartbeat        time.Duration
 
 	mu          sync.Mutex
 	activeRuns  map[int64]context.CancelFunc
@@ -321,18 +350,21 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		human:       deps.Human,
 		visual:      deps.Visual,
 		knowledge:   deps.KnowledgeHook,
-		settings:    deps.Settings,
-		clock:       deps.Clock,
-		ids:         deps.IDs,
-		events:      deps.Events,
-		audit:       deps.Audit,
-		instanceID:  deps.InstanceID,
-		leaseTTL:    lease,
-		heartbeat:   heartbeat,
-		activeRuns:  map[int64]context.CancelFunc{},
-		heartbeats:  map[int64]*leaseHeartbeat{},
-		waitTotals:  map[int64]time.Duration{},
-		waitStarted: map[int64]time.Time{},
+		// knowledgeFailure is optional: a nil field disables the failed-case
+		// notification.
+		knowledgeFailure: deps.KnowledgeFailureHook,
+		settings:         deps.Settings,
+		clock:            deps.Clock,
+		ids:              deps.IDs,
+		events:           deps.Events,
+		audit:            deps.Audit,
+		instanceID:       deps.InstanceID,
+		leaseTTL:         lease,
+		heartbeat:        heartbeat,
+		activeRuns:       map[int64]context.CancelFunc{},
+		heartbeats:       map[int64]*leaseHeartbeat{},
+		waitTotals:       map[int64]time.Duration{},
+		waitStarted:      map[int64]time.Time{},
 	}
 }
 
@@ -688,12 +720,13 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		"evidence_count":   summary.EvidenceCount,
 	})
 	s.forgetWaitTracking(caseRun.ID)
-	// Knowledge sedimentation is supplemental: a hook failure never changes the
-	// persisted verdict (spec §10.1, best effort). Only the owner that won the
-	// terminal CAS notifies; an idempotent Finish that read another owner's
-	// passed row must not sediment it a second time.
+	// Knowledge sedimentation/invalidation is supplemental: a hook failure never
+	// changes the persisted verdict (spec §10.1, best effort). Only the owner
+	// that won the terminal CAS notifies; an idempotent Finish that read another
+	// owner's row must not notify a second time.
 	if terminalWrote {
 		s.notifyCaseSuccess(ctx, scope.VersionID, finished, caseSnapshot, finished.Summary)
+		s.notifyCaseFailure(ctx, scope.VersionID, finished, caseSnapshot, finished.FailureClass)
 	}
 	return finished, nil
 }
@@ -783,7 +816,7 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
-	finished, _, err := s.writeTerminal(ctx, caseRun, status, class, summary)
+	finished, terminalWrote, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
 		return err
 	}
@@ -794,6 +827,11 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		"verdict_reason": summary.VerdictReason,
 	})
 	s.forgetWaitTracking(caseRun.ID)
+	// A failed finalization (agent-run failure or exhausted redispatch) notifies
+	// the optional knowledge failure hook exactly once, from the terminal owner.
+	if terminalWrote {
+		s.notifyCaseFailure(ctx, s.versionForCaseRun(caseRun), finished, caseSnapshot, finished.FailureClass)
+	}
 	return nil
 }
 
@@ -1246,6 +1284,26 @@ func (s *CaseRunner) notifyCaseSuccess(ctx context.Context, versionID int64, cas
 	}
 }
 
+// notifyCaseFailure invokes the optional knowledge failure hook for one failed
+// case_run. The hook never blocks or fails the executed case: an error is logged
+// and a panic is recovered (spec §10.1 best effort).
+func (s *CaseRunner) notifyCaseFailure(ctx context.Context, versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, class execution.FailureClass) {
+	if s.knowledgeFailure == nil || caseRun.Status != execution.CaseRunFailed || versionID <= 0 {
+		return
+	}
+	fact := caseFailureFact(versionID, caseRun, snapshot, class)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Default().ErrorContext(ctx, "knowledge failure hook panicked",
+				"case_run_id", caseRun.ID, "panic", recovered)
+		}
+	}()
+	if err := s.knowledgeFailure.OnCaseRunFailed(ctx, fact); err != nil {
+		slog.Default().WarnContext(ctx, "knowledge failure hook failed",
+			"case_run_id", caseRun.ID, "error", err)
+	}
+}
+
 // caseSuccessFact projects one passed case snapshot into the hook observation:
 // identifiers only, deduplicated and in case order.
 func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary) CaseSuccessFact {
@@ -1256,30 +1314,50 @@ func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execut
 		Title:         snapshot.Title,
 		EvidenceCount: summary.EvidenceCount,
 	}
-	roles := map[string]struct{}{}
-	pages := map[int64]struct{}{}
-	apis := map[int64]struct{}{}
+	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot)
+	return fact
+}
+
+// caseFailureFact projects one failed case snapshot into the failure hook
+// observation. It deliberately carries no title and no summary text.
+func caseFailureFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, class execution.FailureClass) CaseFailureFact {
+	fact := CaseFailureFact{
+		VersionID:     versionID,
+		CaseRunID:     caseRun.ID,
+		CaseVersionID: caseRun.CaseVersionID,
+		FailureClass:  class,
+	}
+	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot)
+	return fact
+}
+
+// caseObservationIDs extracts the deduplicated page/API/account-role
+// back-references of one case snapshot in case order.
+func caseObservationIDs(snapshot execution.CaseSnapshot) (roles []string, pages []int64, apis []int64) {
+	seenRoles := map[string]struct{}{}
+	seenPages := map[int64]struct{}{}
+	seenAPIs := map[int64]struct{}{}
 	for _, step := range snapshot.Steps {
 		if role := strings.TrimSpace(step.AccountRole); role != "" {
-			if _, seen := roles[role]; !seen {
-				roles[role] = struct{}{}
-				fact.AccountRoles = append(fact.AccountRoles, role)
+			if _, seen := seenRoles[role]; !seen {
+				seenRoles[role] = struct{}{}
+				roles = append(roles, role)
 			}
 		}
 		if step.TargetPageID != nil && *step.TargetPageID > 0 {
-			if _, seen := pages[*step.TargetPageID]; !seen {
-				pages[*step.TargetPageID] = struct{}{}
-				fact.PageIDs = append(fact.PageIDs, *step.TargetPageID)
+			if _, seen := seenPages[*step.TargetPageID]; !seen {
+				seenPages[*step.TargetPageID] = struct{}{}
+				pages = append(pages, *step.TargetPageID)
 			}
 		}
 		if step.TargetAPIID != nil && *step.TargetAPIID > 0 {
-			if _, seen := apis[*step.TargetAPIID]; !seen {
-				apis[*step.TargetAPIID] = struct{}{}
-				fact.APIIDs = append(fact.APIIDs, *step.TargetAPIID)
+			if _, seen := seenAPIs[*step.TargetAPIID]; !seen {
+				seenAPIs[*step.TargetAPIID] = struct{}{}
+				apis = append(apis, *step.TargetAPIID)
 			}
 		}
 	}
-	return fact
+	return roles, pages, apis
 }
 
 func (s *CaseRunner) resetWaitTracking(caseRunID int64, now time.Time) {

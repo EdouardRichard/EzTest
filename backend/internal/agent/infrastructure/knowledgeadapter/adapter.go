@@ -62,12 +62,24 @@ type KnowledgeRetrievalService interface {
 	Read(ctx context.Context, id int64) (knowledge.Item, error)
 }
 
+// KnowledgeLifecycleService is the verified-lifecycle surface (spec §10.1):
+// MarkVerified stamps last_verified_at after a successful reuse, MarkSuspect
+// reverts the knowledge reused by a failed run, and List finds the approved
+// knowledge bound to a page/API/account-role key. *knowledgeapp.Service
+// satisfies it.
+type KnowledgeLifecycleService interface {
+	List(ctx context.Context, filter knowledgeapp.ListFilter) (knowledgeapp.Page, error)
+	MarkVerified(ctx context.Context, id int64) (knowledge.Item, error)
+	MarkSuspect(ctx context.Context, id int64, reason string) (knowledge.Item, error)
+}
+
 // KnowledgeService is the knowledge application surface the adapter consumes.
 // *knowledgeapp.Service satisfies it.
 type KnowledgeService interface {
 	KnowledgeInjectionService
 	KnowledgeSuccessHookService
 	KnowledgeRetrievalService
+	KnowledgeLifecycleService
 }
 
 // VersionSystemReader resolves the SUT families bound to one version. The
@@ -142,6 +154,7 @@ var (
 	_ tools.KnowledgeProposePort      = (*Adapter)(nil)
 	_ tools.KnowledgeRetrievalPort    = (*Adapter)(nil)
 	_ executionapp.CaseSuccessHook    = (*Adapter)(nil)
+	_ executionapp.CaseFailureHook    = (*Adapter)(nil)
 	_ KnowledgeService                = (*knowledgeapp.Service)(nil)
 )
 
@@ -452,6 +465,182 @@ func (a *Adapter) OnCaseRunPassed(ctx context.Context, fact executionapp.CaseSuc
 			continue
 		}
 		errs = a.runSuccessHook(ctx, a.knowledge.OnLoginSuccess, loginFact, errs)
+	}
+	// A passed case verifies the knowledge it reused: the approved items bound
+	// to the same page/API/account-role keys are stamped with last_verified_at.
+	// Sedimentation above creates/approves the new items; this pass closes the
+	// loop for knowledge that already existed before the run (spec §10.1 复用成功).
+	if err := a.markReuse(ctx, index.reuseBindings(fact.PageIDs, fact.APIIDs, fact.AccountRoles), true, ""); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// OnCaseRunFailed marks the knowledge reused by a failed case run suspect (spec
+// §10.1 复用失败 → suspect): every approved item bound to the failed case's
+// page/API/account-role keys moves to suspect with the non-secret case-run
+// provenance as the review reason. It is the failure counterpart of
+// OnCaseRunPassed and follows the same best-effort contract: the case runner
+// logs the returned error and never changes the persisted verdict.
+func (a *Adapter) OnCaseRunFailed(ctx context.Context, fact executionapp.CaseFailureFact) error {
+	if fact.VersionID <= 0 {
+		return platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if a.knowledge == nil {
+		return errors.New("knowledgeadapter: knowledge service is not configured")
+	}
+	if a.bindings == nil {
+		return errors.New("knowledgeadapter: version binding reader is not configured")
+	}
+	bindings, err := a.bindings.VersionBindings(ctx, fact.VersionID)
+	if err != nil {
+		return fmt.Errorf("knowledgeadapter: resolve version bindings: %w", err)
+	}
+	index := newSuccessBindingIndex(bindings)
+	reuse := index.reuseBindings(fact.PageIDs, fact.APIIDs, fact.AccountRoles)
+	if len(reuse) == 0 {
+		return nil
+	}
+	return a.markReuse(ctx, reuse, false, failureReuseReason(fact))
+}
+
+// failureReuseReason is the stored review reason of a failed reuse. It carries
+// only the numeric case-run identity and the failure class enum, never a case
+// title, page content or credential.
+func failureReuseReason(fact executionapp.CaseFailureFact) string {
+	if fact.CaseRunID <= 0 {
+		return "case run failed"
+	}
+	if fact.FailureClass == "" {
+		return fmt.Sprintf("case_run %d failed", fact.CaseRunID)
+	}
+	return fmt.Sprintf("case_run %d failed (%s)", fact.CaseRunID, fact.FailureClass)
+}
+
+// reuseKind is one binding dimension of a case observation.
+type reuseKind int
+
+const (
+	reusePage reuseKind = iota
+	reuseAPI
+	reuseAccountRole
+)
+
+// reuseBinding is one page/API/role key of a case observation together with the
+// owning version-binding identifiers. The identifiers scope the invalidation so
+// a same-named key of another SUT/environment is not touched; role bindings are
+// scoped only when the role is unambiguous (the same rule the login recipe uses).
+type reuseBinding struct {
+	kind          reuseKind
+	key           string
+	systemID      int64
+	environmentID int64
+}
+
+// reuseBindings projects the bound page/API IDs and account roles of one case
+// observation onto knowledge binding keys. Unbound IDs are skipped here: the
+// success hook reports them separately, and the failure hook is a best-effort
+// no-op for a case that names no knowledge-addressable surface.
+func (i successBindingIndex) reuseBindings(pageIDs, apiIDs []int64, roles []string) []reuseBinding {
+	out := make([]reuseBinding, 0, len(pageIDs)+len(apiIDs)+len(roles))
+	for _, pageID := range uniqueIDs(pageIDs) {
+		binding, key, ok := i.page(pageID)
+		if !ok {
+			continue
+		}
+		out = append(out, reuseBinding{
+			kind:          reusePage,
+			key:           key,
+			systemID:      binding.SystemID,
+			environmentID: binding.EnvironmentID,
+		})
+	}
+	for _, apiID := range uniqueIDs(apiIDs) {
+		binding, key, ok := i.api(apiID)
+		if !ok {
+			continue
+		}
+		out = append(out, reuseBinding{
+			kind:          reuseAPI,
+			key:           key,
+			systemID:      binding.SystemID,
+			environmentID: binding.EnvironmentID,
+		})
+	}
+	for _, role := range uniqueTexts(roles) {
+		bindings, ok := i.roles[role]
+		if !ok || len(bindings) == 0 {
+			continue
+		}
+		reuse := reuseBinding{kind: reuseAccountRole, key: role}
+		if len(bindings) == 1 {
+			// An unambiguous role is scoped to its owning SUT/environment, the
+			// same attribution the login recipe gets.
+			reuse.systemID = bindings[0].SystemID
+			reuse.environmentID = bindings[0].EnvironmentID
+		}
+		out = append(out, reuse)
+	}
+	return out
+}
+
+// markReuse stamps (verified) or reverts (suspect) every approved knowledge item
+// bound to one of the reuse keys. The item list is the repository's strict
+// binding-containment query, so only knowledge genuinely bound to the exercised
+// surface is touched. Per-item and per-query failures are collected; the caller
+// treats the joined error as log-only.
+func (a *Adapter) markReuse(ctx context.Context, bindings []reuseBinding, verified bool, reason string) error {
+	if len(bindings) == 0 {
+		return nil
+	}
+	if a.knowledge == nil {
+		return errors.New("knowledgeadapter: knowledge service is not configured")
+	}
+	seen := make(map[int64]struct{}, len(bindings))
+	var errs []error
+	for _, binding := range bindings {
+		filter := knowledgeapp.ListFilter{
+			Status: knowledge.StatusApproved,
+			Limit:  knowledgeapp.MaxListLimit,
+		}
+		if binding.systemID > 0 {
+			systemID := binding.systemID
+			filter.Bindings.SystemID = &systemID
+		}
+		if binding.environmentID > 0 {
+			environmentID := binding.environmentID
+			filter.Bindings.EnvironmentID = &environmentID
+		}
+		switch binding.kind {
+		case reusePage:
+			key := binding.key
+			filter.Bindings.PageKey = &key
+		case reuseAPI:
+			key := binding.key
+			filter.Bindings.APIKey = &key
+		case reuseAccountRole:
+			role := binding.key
+			filter.Bindings.AccountRole = &role
+		}
+		page, err := a.knowledge.List(ctx, filter)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("knowledgeadapter: list knowledge for reuse: %w", err))
+			continue
+		}
+		for _, item := range page.Items {
+			if _, duplicate := seen[item.ID]; duplicate {
+				continue
+			}
+			seen[item.ID] = struct{}{}
+			if verified {
+				_, err = a.knowledge.MarkVerified(ctx, item.ID)
+			} else {
+				_, err = a.knowledge.MarkSuspect(ctx, item.ID, reason)
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("knowledgeadapter: mark knowledge %d: %w", item.ID, err))
+			}
+		}
 	}
 	return errors.Join(errs...)
 }

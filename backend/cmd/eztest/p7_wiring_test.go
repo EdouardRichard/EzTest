@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,9 +186,10 @@ func TestP7AdaptersFailClosedWithoutDatabase(t *testing.T) {
 }
 
 // TestP7VersionCaseBindingsProjectsSuccessBindingKeys pins the composition-root
-// projection consumed by the knowledge success hook: route templates with a URL
-// fallback, uppercase/default-GET API keys, per-binding role deduplication and
-// invalid resource IDs degrading to unset dimensions instead of zero IDs.
+// projection consumed by the knowledge success hook: route templates only (a
+// page without one is omitted, see TestBindingProjectionOmitsEmptyRouteTemplate),
+// uppercase/default-GET API keys, per-binding role deduplication and invalid
+// resource IDs degrading to unset dimensions instead of zero IDs.
 func TestP7VersionCaseBindingsProjectsSuccessBindingKeys(t *testing.T) {
 	family := "shop"
 	fullView := versionapp.VersionView{
@@ -220,7 +222,6 @@ func TestP7VersionCaseBindingsProjectsSuccessBindingKeys(t *testing.T) {
 		SystemKey:     "shop",
 		Pages: []knowledgeadapter.PageBinding{
 			{ID: 501, Key: "/login"},
-			{ID: 502, Key: "http://shop.test/cart"},
 		},
 		APIs: []knowledgeadapter.APIBinding{
 			{ID: 601, Key: "POST /api/login"},
@@ -253,7 +254,7 @@ func TestP7VersionCaseBindingsProjectsSuccessBindingKeys(t *testing.T) {
 		wantErr   bool
 	}{
 		{
-			name:      "projects route templates with URL fallback, API keys and deduplicated roles",
+			name:      "projects route templates (URL-only pages omitted), API keys and deduplicated roles",
 			source:    &p7FakeVersionCaseSource{view: fullView},
 			versionID: 10,
 			want:      wantFull,
@@ -298,6 +299,50 @@ func TestP7VersionCaseBindingsProjectsSuccessBindingKeys(t *testing.T) {
 				t.Fatalf("VersionBindings() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestBindingProjectionOmitsEmptyRouteTemplate pins R97: the knowledge page_key
+// is the route template, never the page URL. A page whose route template is
+// empty (or whitespace) is omitted from the success-hook binding projection, so
+// the success hook cannot sediment a URL-shaped page_key while the reader and
+// MarkBindingsStale expect a route template.
+func TestBindingProjectionOmitsEmptyRouteTemplate(t *testing.T) {
+	view := versionapp.VersionView{
+		Bindings: []versionapp.BindingView{{
+			SUT:         resourceapp.SUTView{ID: "7001"},
+			Environment: resourceapp.EnvironmentView{ID: "7101"},
+			Pages: []resourceapp.PageView{
+				{ID: "501", RouteTemplate: "/login", URL: "http://shop.test/login"},
+				{ID: "502", URL: "http://shop.test/cart"},
+				{ID: "503", RouteTemplate: "   ", URL: "http://shop.test/checkout"},
+				{ID: "504", RouteTemplate: "/products/:id", URL: "http://shop.test/products/42"},
+			},
+		}},
+	}
+	got, err := (p7VersionCaseBindings{versions: &p7FakeVersionCaseSource{view: view}}).
+		VersionBindings(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("VersionBindings: %v", err)
+	}
+	want := map[int64]string{
+		501: "/login",
+		504: "/products/:id",
+	}
+	if len(got) != 1 || len(got[0].Pages) != len(want) {
+		t.Fatalf("binding projection = %#v, want exactly the two template pages", got)
+	}
+	for _, page := range got[0].Pages {
+		key, ok := want[page.ID]
+		if !ok {
+			t.Fatalf("page %d was projected without a route template (key %q)", page.ID, page.Key)
+		}
+		if page.Key != key {
+			t.Fatalf("page %d key = %q, want the route template %q", page.ID, page.Key, key)
+		}
+		if strings.Contains(page.Key, "http://") || strings.Contains(page.Key, "https://") {
+			t.Fatalf("page %d key fell back to the page URL: %q", page.ID, page.Key)
+		}
 	}
 }
 

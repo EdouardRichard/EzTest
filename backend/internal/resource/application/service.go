@@ -6,6 +6,7 @@ package resourceapp
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -22,12 +23,13 @@ import (
 // Service is the resource-catalog application service. It implements
 // CatalogReader for the version context.
 type Service struct {
-	repo   resource.Repository
-	ids    platformid.Generator
-	clock  clock.Clock
-	usage  UsageChecker
-	audit  auditapp.Recorder
-	events eventingapp.Publisher
+	repo      resource.Repository
+	ids       platformid.Generator
+	clock     clock.Clock
+	usage     UsageChecker
+	audit     auditapp.Recorder
+	events    eventingapp.Publisher
+	knowledge KnowledgeInvalidator
 }
 
 // New wires a resource service. usage, audit and events may be nil in unit
@@ -48,6 +50,44 @@ func New(
 // assembly root wires the two contexts through this setter.
 func (s *Service) SetUsageChecker(usage UsageChecker) {
 	s.usage = usage
+}
+
+// SetKnowledgeInvalidator injects the knowledge lifecycle sink after
+// construction. The knowledge service is built later in the assembly root than
+// the resource catalog, so the cross-context port is attached through this
+// setter (nil disables invalidation).
+func (s *Service) SetKnowledgeInvalidator(invalidator KnowledgeInvalidator) {
+	s.knowledge = invalidator
+}
+
+// invalidateKnowledge forwards one genuinely changed binding signal to the
+// knowledge context. It is best effort: the resource write already committed, so
+// a knowledge failure or a partially failed CAS pass is logged and never
+// surfaced to the caller (spec §10.1 页面/路由/账号变更 → stale).
+func (s *Service) invalidateKnowledge(ctx context.Context, change KnowledgeBindingChange) {
+	if s.knowledge == nil {
+		return
+	}
+	result, err := s.knowledge.MarkBindingsStale(ctx, change)
+	if err != nil {
+		slog.Default().WarnContext(ctx, "knowledge binding invalidation failed",
+			"reason", change.Reason, "error", err)
+		return
+	}
+	fields := []any{
+		"reason", change.Reason,
+		"scanned", result.Scanned,
+		"matched", result.Matched,
+		"marked", result.Marked,
+		"failed", result.Failed,
+	}
+	if result.Failed > 0 {
+		slog.Default().WarnContext(ctx, "knowledge binding invalidation partially failed", fields...)
+		return
+	}
+	if result.Marked > 0 {
+		slog.Default().InfoContext(ctx, "knowledge binding invalidation marked stale", fields...)
+	}
 }
 
 // SUTInput is the editable payload for creating a SUT.
@@ -544,6 +584,7 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 	if err != nil {
 		return PageView{}, mapRepoError(err, "page", "")
 	}
+	previousRoute := strings.TrimSpace(page.RouteTemplate)
 	if patch.Name != nil {
 		page.Name = *patch.Name
 	}
@@ -583,6 +624,15 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 		"name":           updated.Name,
 		"route_template": updated.RouteTemplate,
 	})
+	// Only a genuinely changed route key invalidates knowledge. The page's
+	// owning system/environment IDs are not passed: they did not change, and
+	// naming them would mark every item bound to the whole SUT stale.
+	if currentRoute := strings.TrimSpace(updated.RouteTemplate); previousRoute != "" && previousRoute != currentRoute {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			PageKeys: []string{previousRoute},
+			Reason:   "page route changed",
+		})
+	}
 	return toPageView(updated), nil
 }
 
@@ -593,10 +643,20 @@ func (s *Service) DeletePage(ctx context.Context, id int64, actorID int64) error
 	}, "page"); err != nil {
 		return err
 	}
+	page, err := s.repo.GetPage(ctx, id)
+	if err != nil {
+		return mapRepoError(err, "page", "")
+	}
 	if err := s.repo.DeletePage(ctx, id); err != nil {
 		return mapRepoError(err, "page", "")
 	}
 	s.record(ctx, actorID, "resource.page.deleted", "page", platformid.Format(id), nil)
+	if route := strings.TrimSpace(page.RouteTemplate); route != "" {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			PageKeys: []string{route},
+			Reason:   "page deleted",
+		})
+	}
 	return nil
 }
 
@@ -1307,6 +1367,7 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 	if err != nil {
 		return AccountView{}, mapRepoError(err, "account", "")
 	}
+	previousRoles := append([]string(nil), account.Roles...)
 	if patch.Username != nil {
 		account.Username = *patch.Username
 	}
@@ -1335,6 +1396,16 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 		"environment_id": platformid.Format(updated.EnvironmentID),
 		"username":       updated.Username,
 	})
+	// Only roles removed by the edit invalidate knowledge: a login recipe is
+	// bound to the account_role, and a newly added role has no knowledge yet.
+	// The account's system/environment IDs did not change, so they are omitted
+	// to keep the invalidation scoped to the removed roles.
+	if removed := removedStrings(previousRoles, updated.Roles); len(removed) > 0 {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			AccountRoles: removed,
+			Reason:       "account roles changed",
+		})
+	}
 	return toAccountView(updated), nil
 }
 
@@ -1345,10 +1416,20 @@ func (s *Service) DeleteAccount(ctx context.Context, id int64, actorID int64) er
 	}, "account"); err != nil {
 		return err
 	}
+	account, err := s.repo.GetAccount(ctx, id)
+	if err != nil {
+		return mapRepoError(err, "account", "")
+	}
 	if err := s.repo.DeleteAccount(ctx, id); err != nil {
 		return mapRepoError(err, "account", "")
 	}
 	s.record(ctx, actorID, "resource.account.deleted", "account", platformid.Format(id), nil)
+	if roles := removedStrings(account.Roles, nil); len(roles) > 0 {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			AccountRoles: roles,
+			Reason:       "account deleted",
+		})
+	}
 	return nil
 }
 
@@ -1589,6 +1670,36 @@ func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (b
 		return platform.Conflict(kind + " is referenced by a version binding")
 	}
 	return nil
+}
+
+// removedStrings returns the trimmed values of before that are absent from
+// after, in their original order. It feeds the account-role invalidation: only
+// roles genuinely removed by an edit (or all roles of a deleted account) can
+// leave knowledge pointing at a surface that no longer exists.
+func removedStrings(before, after []string) []string {
+	kept := make(map[string]struct{}, len(after))
+	for _, value := range after {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			kept[trimmed] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(before))
+	seen := make(map[string]struct{}, len(before))
+	for _, value := range before {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, present := kept[trimmed]; present {
+			continue
+		}
+		if _, duplicate := seen[trimmed]; duplicate {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 // mapPageError maps page write failures. A normalized-URL collision is a

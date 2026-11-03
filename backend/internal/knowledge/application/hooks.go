@@ -394,6 +394,24 @@ func successFactHasSecrets(fact SuccessFact) bool {
 	return payloadHasSecrets(payload)
 }
 
+// ItemHasSecrets exposes the R91 stored-item secret predicate to the HTTP read
+// surfaces. The list/search projection already drops such rows in the
+// application service; the detail/revision handlers use this predicate so a
+// legacy secret-bearing row is hidden consistently instead of leaking through a
+// direct-ID read.
+func ItemHasSecrets(item knowledge.Item) bool { return itemHasSecrets(item) }
+
+// RevisionHasSecrets reports whether one append-only revision body carries a
+// credential. A revision has no typed bindings/system key, so the shared item
+// predicate is applied to its title/tags/content.
+func RevisionHasSecrets(revision knowledge.Revision) bool {
+	return itemHasSecrets(knowledge.Item{
+		Title:   revision.Title,
+		Content: revision.Content,
+		Tags:    revision.Tags,
+	})
+}
+
 // itemHasSecrets reports whether a stored item carries a credential value. It
 // inspects the title, tags, system key, every string binding and the content;
 // a non-JSON content is scanned as free text. The structured success content

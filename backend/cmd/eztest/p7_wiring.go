@@ -44,6 +44,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 	settingsapp "github.com/EdouardRichard/EzTest/backend/internal/settings/application"
 	settingsdomain "github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
@@ -522,6 +523,35 @@ func startP7Orchestration(ctx context.Context, deps p7OrchestrationDeps) (*p7Orc
 	}, nil
 }
 
+// p7ResourceKnowledgeInvalidator adapts the knowledge application's binding
+// invalidation to the resource context's neutral port. The resource service
+// reports a genuinely changed page route / removed account role; knowledge
+// decides which approved items become stale. The adapter only maps types, so
+// neither context imports the other.
+type p7ResourceKnowledgeInvalidator struct {
+	service *knowledgeapp.Service
+}
+
+// MarkBindingsStale implements resourceapp.KnowledgeInvalidator.
+func (i p7ResourceKnowledgeInvalidator) MarkBindingsStale(ctx context.Context, change resourceapp.KnowledgeBindingChange) (resourceapp.KnowledgeBindingInvalidation, error) {
+	if i.service == nil {
+		return resourceapp.KnowledgeBindingInvalidation{}, errors.New("knowledge invalidator: knowledge service is not configured")
+	}
+	result, err := i.service.MarkBindingsStale(ctx, knowledgeapp.BindingChange{
+		SystemIDs:      change.SystemIDs,
+		EnvironmentIDs: change.EnvironmentIDs,
+		PageKeys:       change.PageKeys,
+		AccountRoles:   change.AccountRoles,
+		Reason:         change.Reason,
+	})
+	return resourceapp.KnowledgeBindingInvalidation{
+		Scanned: result.Scanned,
+		Matched: result.Matched,
+		Marked:  result.Marked,
+		Failed:  result.Failed,
+	}, err
+}
+
 // p7RuntimeDeps are the already-constructed P0-P6 services the P7 composition
 // consumes.
 type p7RuntimeDeps struct {
@@ -550,12 +580,16 @@ type p7RuntimeDeps struct {
 type p7Runtime struct {
 	Knowledge        *knowledgeapi.Handler
 	KnowledgeAdapter *knowledgeadapter.Adapter
-	Orchestration    *orchestrationapi.Handler
-	GC               *storageapi.GCHandler
-	RenderEnsurer    *deliveryapp.RenderJobEnsurer
-	RenderWorker     *deliveryapp.RenderWorker
-	GCWorker         *storageapp.GCWorker
-	Listener         *eventingpg.Listener
+	// KnowledgeInvalidator is the resource context's page/account → knowledge
+	// stale sink. It is wired onto the resource service by main after this
+	// runtime is built.
+	KnowledgeInvalidator resourceapp.KnowledgeInvalidator
+	Orchestration        *orchestrationapi.Handler
+	GC                   *storageapi.GCHandler
+	RenderEnsurer        *deliveryapp.RenderJobEnsurer
+	RenderWorker         *deliveryapp.RenderWorker
+	GCWorker             *storageapp.GCWorker
+	Listener             *eventingpg.Listener
 
 	orchestrator *orchestrationapp.Service
 	leader       *orchestrationpg.Leader
@@ -662,16 +696,17 @@ func newP7Runtime(ctx context.Context, deps p7RuntimeDeps) (*p7Runtime, error) {
 	)
 
 	return &p7Runtime{
-		Knowledge:        knowledgeapi.New(knowledgeService),
-		KnowledgeAdapter: knowledgeAdapter,
-		Orchestration:    orchestrationapi.New(deps.Orchestrator),
-		GC:               storageapi.NewGC(gcService),
-		RenderEnsurer:    deliveryapp.NewRenderJobEnsurer(deps.ReportRepo, deps.Settings),
-		RenderWorker:     renderWorker,
-		GCWorker:         storageapp.NewGCWorker(gcService, deps.Settings, logger),
-		Listener:         listener,
-		orchestrator:     deps.Orchestrator,
-		leader:           deps.Leader,
+		Knowledge:            knowledgeapi.New(knowledgeService),
+		KnowledgeAdapter:     knowledgeAdapter,
+		KnowledgeInvalidator: p7ResourceKnowledgeInvalidator{service: knowledgeService},
+		Orchestration:        orchestrationapi.New(deps.Orchestrator),
+		GC:                   storageapi.NewGC(gcService),
+		RenderEnsurer:        deliveryapp.NewRenderJobEnsurer(deps.ReportRepo, deps.Settings),
+		RenderWorker:         renderWorker,
+		GCWorker:             storageapp.NewGCWorker(gcService, deps.Settings, logger),
+		Listener:             listener,
+		orchestrator:         deps.Orchestrator,
+		leader:               deps.Leader,
 	}, nil
 }
 

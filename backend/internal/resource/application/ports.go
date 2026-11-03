@@ -26,3 +26,34 @@ type UsageChecker interface {
 	AccountInUse(context.Context, int64) (bool, error)
 	RepositoryInUse(context.Context, int64) (bool, error)
 }
+
+// KnowledgeBindingChange is the resource context's neutral page/route/account
+// invalidation signal (spec §10.1): every non-empty dimension names a binding
+// value that genuinely changed. SystemIDs/EnvironmentIDs are reserved for a
+// future SUT/environment move; a page or account edit never passes them, so it
+// cannot invalidate the whole SUT's knowledge.
+type KnowledgeBindingChange struct {
+	SystemIDs      []int64
+	EnvironmentIDs []int64
+	PageKeys       []string
+	AccountRoles   []string
+	Reason         string
+}
+
+// KnowledgeBindingInvalidation mirrors the knowledge application's
+// BindingInvalidation counts so the resource context can log a pass without
+// importing the knowledge package.
+type KnowledgeBindingInvalidation struct {
+	Scanned int
+	Matched int
+	Marked  int
+	Failed  int
+}
+
+// KnowledgeInvalidator is the cross-context sink for a resource change that
+// invalidates knowledge. The assembly root adapts the knowledge application's
+// MarkBindingsStale onto it; implementation is best effort and must not fail the
+// resource write.
+type KnowledgeInvalidator interface {
+	MarkBindingsStale(ctx context.Context, change KnowledgeBindingChange) (KnowledgeBindingInvalidation, error)
+}

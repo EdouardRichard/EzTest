@@ -522,13 +522,11 @@ func (b p7VersionCaseBindings) VersionBindings(ctx context.Context, versionID in
 			binding.SystemKey = strings.TrimSpace(*item.SUT.Family)
 		}
 		for _, page := range item.Pages {
-			// The page binding key is the route template (spec §10.2); a page
-			// without a template falls back to its URL so the locator is still
-			// addressable.
+			// The page binding key is the route template only (spec §10.2,
+			// R97): the briefing reader and MarkBindingsStale name knowledge
+			// page keys as route templates, so a page without one is omitted
+			// instead of sedimenting a URL-shaped key that can never match.
 			key := strings.TrimSpace(page.RouteTemplate)
-			if key == "" {
-				key = strings.TrimSpace(page.URL)
-			}
 			id := parseCaseBindingID(page.ID)
 			if id <= 0 || key == "" {
 				continue
@@ -1270,6 +1268,10 @@ func main() {
 	// audit) through the real knowledge service. The binding resolver is a
 	// composition-root adapter so the knowledge bridge never imports version.
 	p7rt.KnowledgeAdapter.SetVersionBindings(p7VersionCaseBindings{versions: versionSvc})
+	// P8 knowledge lifecycle: a resource page-route / account-role change marks
+	// the approved knowledge bound to the old value stale. The resource context
+	// only emits the neutral change; the knowledge service owns the scan/write.
+	resourceSvc.SetKnowledgeInvalidator(p7rt.KnowledgeInvalidator)
 
 	// The case runner is constructed after the P7 runtime so the knowledge
 	// success hook is non-nil (the hook is best effort at the Finish boundary:
@@ -1301,6 +1303,9 @@ func main() {
 		Audit:         auditSvc,
 		InstanceID:    instanceID,
 		KnowledgeHook: p7rt.KnowledgeAdapter,
+		// The failure hook moves the knowledge reused by a failed case_run to
+		// suspect; the success hook stamps last_verified_at on a passed run.
+		KnowledgeFailureHook: p7rt.KnowledgeAdapter,
 	})
 	executionCanceller.runner = executionRunner
 
