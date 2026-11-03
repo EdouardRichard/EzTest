@@ -80,6 +80,24 @@ func (a *Adapter) ConversationKind(ctx context.Context, versionID, conversationI
 	return conversation.Kind, nil
 }
 
+// ModelOverride returns the conversation-level 0.2.1 model override stored on
+// the conversation ("" when unset). The runner reads it before model resolution
+// so the user's last model switch applies to the next run. Ownership is
+// enforced by the scoped Get.
+func (a *Adapter) ModelOverride(ctx context.Context, versionID, conversationID int64) (string, error) {
+	if a.conversations == nil {
+		return "", a.missing("conversations")
+	}
+	conversation, err := a.conversations.Get(ctx, versionID, conversationID)
+	if err != nil {
+		return "", err
+	}
+	if conversation.ModelOverride == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*conversation.ModelOverride), nil
+}
+
 // GetMessage returns one UI-thread message, scoped to its conversation/version.
 func (a *Adapter) GetMessage(ctx context.Context, versionID, conversationID, messageID int64) (agentapp.ConversationMessage, error) {
 	if a.conversations == nil {

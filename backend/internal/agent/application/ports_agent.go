@@ -64,6 +64,11 @@ type AssistantMessageInput struct {
 type ConversationPort interface {
 	Snapshot(ctx context.Context, versionID, conversationID int64, keepRecent int) (ConversationSnapshot, error)
 	ConversationKind(ctx context.Context, versionID, conversationID int64) (string, error)
+	// ModelOverride returns the conversation's stored 0.2.1 model_override
+	// identifier ("" when unset). The runner reads it before resolving the run
+	// model so a user-initiated conversation switch takes effect on the next
+	// run; the value is validated by model resolution, never by a fallback.
+	ModelOverride(ctx context.Context, versionID, conversationID int64) (string, error)
 	GetMessage(ctx context.Context, versionID, conversationID, messageID int64) (ConversationMessage, error)
 	AppendAssistantMessage(ctx context.Context, in AssistantMessageInput) (ConversationMessage, error)
 	// UpsertJobCard stores or refreshes the single job_card part of one

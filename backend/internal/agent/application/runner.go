@@ -478,10 +478,28 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if len(imageRefs) > 0 {
 		requirements = append(requirements, llmapp.ModelRequirements{Vision: true})
 	}
+	// Task 55: the conversation-level 0.2.1 model override (a user-initiated
+	// switch) takes precedence over the profile-bound model; an empty override
+	// keeps the profile binding, and an empty profile model stays the config
+	// default. The override is loaded before resolution and validated by the
+	// same ResolveModel capability gate; an override that no longer resolves
+	// fails the run and is never swapped for another model (D24).
+	modelOverride := ""
+	if payload.ConversationID > 0 && r.conversation != nil {
+		override, overrideErr := r.conversation.ModelOverride(ctx, item.VersionID, payload.ConversationID)
+		if overrideErr != nil {
+			return RunResult{}, &RunError{Reason: "tool_failure", Retryable: true, Cause: overrideErr}
+		}
+		modelOverride = strings.TrimSpace(override)
+	}
+	requestedModel := profileModel(profile)
+	if modelOverride != "" {
+		requestedModel = modelOverride
+	}
 	// Resolve the model before creating the run so agent_run records the model
 	// and config actually used (spec §7.3). Capability validation happens in
 	// ResolveModel against the role's tool needs.
-	modelInfo, err := r.chat.ResolveModel(ctx, 0, profileModel(profile), requirements...)
+	modelInfo, err := r.chat.ResolveModel(ctx, 0, requestedModel, requirements...)
 	if err != nil {
 		return RunResult{}, resolveRunError(err)
 	}

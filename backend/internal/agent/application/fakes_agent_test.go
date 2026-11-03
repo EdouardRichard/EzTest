@@ -249,14 +249,15 @@ type fakeJobCardRecord struct {
 }
 
 type fakeConversationPort struct {
-	kind        string
-	snapshot    agentapp.ConversationSnapshot
-	messages    map[int64]agentapp.ConversationMessage
-	appended    []agentapp.AssistantMessageInput
-	jobCards    []fakeJobCardRecord
-	summaries   []string
-	summaryVer  int
-	snapshotErr error
+	kind          string
+	modelOverride string
+	snapshot      agentapp.ConversationSnapshot
+	messages      map[int64]agentapp.ConversationMessage
+	appended      []agentapp.AssistantMessageInput
+	jobCards      []fakeJobCardRecord
+	summaries     []string
+	summaryVer    int
+	snapshotErr   error
 }
 
 func (f *fakeConversationPort) Snapshot(_ context.Context, versionID, conversationID int64, _ int) (agentapp.ConversationSnapshot, error) {
@@ -278,6 +279,13 @@ func (f *fakeConversationPort) ConversationKind(_ context.Context, _, _ int64) (
 		return "clarification", nil
 	}
 	return f.kind, nil
+}
+
+func (f *fakeConversationPort) ModelOverride(_ context.Context, _, _ int64) (string, error) {
+	if f.snapshotErr != nil {
+		return "", f.snapshotErr
+	}
+	return f.modelOverride, nil
 }
 
 func (f *fakeConversationPort) GetMessage(_ context.Context, versionID, conversationID, messageID int64) (agentapp.ConversationMessage, error) {
