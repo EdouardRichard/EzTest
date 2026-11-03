@@ -841,6 +841,129 @@ check(
 )
 
 // ---------------------------------------------------------------------------
+// Fix round 2: audit-before-event ordering, details.action scope, complete
+// user-message part list, image/jpg alias, contract-first qualification, and
+// exact frozen work_item kind catalogs (conversation job kinds never widen them).
+// ---------------------------------------------------------------------------
+const plain = (text) => text.replace(/[`*]/g, "")
+
+// job.canceled is audited before it is published (job_control.go records then
+// publishes); the event table must never claim the reverse.
+const cancelEventRow = eventsTable18
+  .split("\n")
+  .find((line) => /^\|\s*`job\.canceled`\s*\|/.test(line))
+check(Boolean(cancelEventRow), "events.md §18.1 has the job.canceled row")
+check(
+  Boolean(cancelEventRow) && !cancelEventRow.includes("先于同名审计"),
+  "events.md job.canceled row does not publish before its same-named audit",
+)
+check(
+  /先写同名审计[\s\S]{0,60}job\.finished/.test(cancelEventRow || ""),
+  "events.md job.canceled row documents audit first, then the event and job.finished",
+)
+check(
+  /先写审计再发布同名事件/.test(auditSection18),
+  "events.md §18.3 audit table documents audit-before-publish for job.canceled",
+)
+check(
+  /审计先于事件/.test(eventsSection),
+  "events.md §18.2 fixes the audit-before-event ordering for job control",
+)
+
+// details.action is guaranteed only for the classified upstream LLM failures;
+// config/capability/protocol-enum errors carry structured details but no action.
+const errorEnvelope = plain(schemaBlock("ErrorEnvelope"))
+check(
+  /llm_protocol_error[\s\S]{0,80}llm_auth_failed[\s\S]{0,80}invalid_model[\s\S]{0,80}details\.action/.test(
+    errorEnvelope,
+  ),
+  "openapi ErrorEnvelope guarantees details.action for llm_protocol_error/llm_auth_failed/invalid_model",
+)
+check(
+  /llm_config_invalid[\s\S]{0,200}不保证 details\.action/.test(errorEnvelope),
+  "openapi ErrorEnvelope scopes details.action away from llm_config_invalid/llm_capability_mismatch/invalid_protocol",
+)
+check(
+  !plain(openapi).includes("LLM 类错误均非重试（retryable=false）且 details.action"),
+  "openapi does not claim every LLM error carries details.action",
+)
+
+// User messages accept case_card (R95); the parts list must stay complete.
+const postMessageBlock = schemaBlock("PostMessageRequest")
+check(
+  postMessageBlock.includes("`case_card`") &&
+    /用户消息接受 `text`\/`attachment`\/`image`\/`case_card`/.test(postMessageBlock),
+  "openapi PostMessageRequest user part list includes case_card",
+)
+
+// image/jpg is accepted by IsSupportedImageMIME as a jpeg alias; it must stay in
+// the enum itself, not only in prose.
+check(
+  /enum: \[image\/png, image\/jpeg, image\/jpg, image\/webp\]/.test(imageBlock),
+  "openapi image part MIME enum includes the image/jpg alias",
+)
+
+// The admin context-packet read route is contract-first until Task 48 mounts it;
+// a missing packet is not_found with details.kind=context_packet (no own code).
+const contextPacketPlain = plain(contextPacketPath)
+check(
+  /404 not_found[\s\S]{0,80}details\.kind="context_packet"/.test(contextPacketPlain),
+  "openapi context packet 404 is not_found with details.kind=context_packet",
+)
+check(
+  /Task 48/.test(contextPacketPlain) && /未挂载/.test(contextPacketPlain),
+  "openapi context packet route notes it is not mounted until Task 48",
+)
+
+// The 19 documented operations are not all mounted: 4 reads are Task 62 and the
+// GET job is 0.3-reserved.
+check(
+  /Task 62[\s\S]{0,80}契约先行/.test(plain(openapi)) && /Task 48[\s\S]{0,80}挂载/.test(plain(openapi)),
+  "openapi qualifies the 19-operation list (Task 62 reads / Task 48 context packet)",
+)
+check(
+  /19 个 0\.2\.1 operation[\s\S]{0,400}Task 62/.test(readme) &&
+    readme.includes("0.3 预留") &&
+    readme.includes("Task 48"),
+  "contracts README qualifies the 19 operations (Task 62 reads / 0.3 GET job / Task 48 packet)",
+)
+
+// Cache-first context_packet persistence is pending Task 48; the runner still
+// stores the P1 builder packet. The body, not only the task label, must say so.
+check(
+  /当前 runner 仍保存 P1 `ContextBuilder`[\s\S]{0,80}尚未落库（Task 48）/.test(dbSection) &&
+    /cache-first 持久化待 Task 48/.test(dbSection),
+  "db-schema.md marks cache-first context_packet persistence pending Task 48",
+)
+
+// Frozen work_item kind catalogs stay exact: conversation work types are
+// conversation job_card kinds, not work_item.kind values or filter options.
+const workItemKindEnum = (() => {
+  const prop = propertyOf(workItemBlock, "kind")
+  const match = /enum: \[([^\]]+)\]/.exec(prop)
+  return match
+    ? match[1]
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : []
+})()
+check(
+  workItemKindEnum.length === frozenJobKinds.length &&
+    frozenJobKinds.every((kind) => workItemKindEnum.includes(kind)),
+  `openapi WorkItemView.kind stays exactly ${frozenJobKinds.length} frozen work_item kinds`,
+)
+for (const kind of conversationJobCardKinds) {
+  check(!workItemKindEnum.includes(kind), `openapi WorkItemView.kind excludes conversation work type ${kind}`)
+}
+check(
+  /enum: \[explore\.login, explore\.page, explore\.api, explore\.coverage, explore\.gap, design\.cases, review\.cases, execute\.batch, analyze\.failure, report\.version, knowledge\.propose\]/.test(
+    pathBlock("/api/versions/{id}/work-items"),
+  ),
+  "openapi work-items kind filter stays exactly the 11 frozen work_item kinds",
+)
+
+// ---------------------------------------------------------------------------
 // Result. Counts are derived from the parsed catalogs above, not hardcoded.
 // ---------------------------------------------------------------------------
 const summary = {
