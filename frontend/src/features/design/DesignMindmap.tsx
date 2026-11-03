@@ -88,6 +88,12 @@ export type DesignMindmapProps = {
   onBatchExecuteCases?: (caseIds: string[]) => void
   /** "交给 AI 修改": the checked case ids are handed to the design chat. */
   onRequestAiChange?: (caseIds: string[]) => void
+  /**
+   * Bumped when the canvas container is re-parented/resized (the focus dialog
+   * opens or closes). The view is re-fitted once the browser has committed the
+   * new size, never against the stale pre-change box.
+   */
+  fitViewToken?: number
 }
 
 function MindmapCanvas({
@@ -103,6 +109,7 @@ function MindmapCanvas({
   onBatchConfirmCases,
   onBatchExecuteCases,
   onRequestAiChange,
+  fitViewToken = 0,
 }: DesignMindmapProps) {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const [filters, setFilters] = useState<CaseFilterValues>(DEFAULT_CASE_FILTERS)
@@ -184,6 +191,27 @@ function MindmapCanvas({
   useEffect(() => {
     fitViewRef.current = fitView
   }, [fitView])
+
+  // The focus dialog re-parents the whole canvas region, so its size is only
+  // final after the browser has laid out the moved host. Fitting in the commit
+  // itself would measure the old inline box: wait two frames (React Flow's
+  // ResizeObserver updates the store after layout) before fitting the full graph.
+  const previousFitViewToken = useRef(fitViewToken)
+  useEffect(() => {
+    if (fitViewToken === previousFitViewToken.current) return undefined
+    previousFitViewToken.current = fitViewToken
+    let second: number | null = null
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => {
+        second = null
+        void fitViewRef.current({ padding: 0.2, duration: 250 })
+      })
+    })
+    return () => {
+      cancelAnimationFrame(first)
+      if (second !== null) cancelAnimationFrame(second)
+    }
+  }, [fitViewToken])
 
   const scheduleFitView = useCallback((nodeIds: string[]) => {
     const state = fitState.current

@@ -1,5 +1,6 @@
 "use client"
 
+import { Maximize2, Minimize2 } from "lucide-react"
 import { useRouter } from "next/navigation"
 import {
   type KeyboardEvent,
@@ -31,6 +32,7 @@ import {
 } from "./api"
 import { CaseDetailPanel } from "./CaseDetailPanel"
 import { DesignChat } from "./DesignChat"
+import { DESIGN_FOCUS_SPLITS, DesignFocusDialog } from "./DesignFocusDialog"
 import { DesignMindmap } from "./DesignMindmap"
 import { ExportCasesDialog } from "./ExportCasesDialog"
 import type { DesignExecutionResults } from "./layout"
@@ -136,6 +138,10 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [chatCollapsed, setChatCollapsed] = useState(false)
   const [activeDivider, setActiveDivider] = useState<DividerKind | null>(null)
   const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
+  /** Mindmap + detail enlarged in the floating focus dialog (spec §9.3). */
+  const [focusOpen, setFocusOpen] = useState(false)
+  /** Bumped on every focus toggle so the canvas re-fits after the size change. */
+  const [fitViewToken, setFitViewToken] = useState(0)
 
   // Each case card of the graph now carries its latest execution verdict
   // (spec §9.3); DesignMindmap consumes a case-id keyed map.
@@ -479,6 +485,19 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
 
   const toggleChatCollapsed = useCallback(() => setChatCollapsed((value) => !value), [])
 
+  // The focus toggle never re-creates the canvas: it only switches the split
+  // and lets `FloatingPanel` re-parent the existing host. The fit token defers
+  // the re-fit until the new size is committed (see DesignMindmap).
+  const toggleFocus = useCallback(() => {
+    setFocusOpen((open) => !open)
+    setFitViewToken((token) => token + 1)
+  }, [])
+
+  const closeFocus = useCallback(() => {
+    setFocusOpen(false)
+    setFitViewToken((token) => token + 1)
+  }, [])
+
   // The version page is not a flex column, so the workspace measures the space
   // left below its own top edge and caps itself to the viewport. That keeps the
   // document from growing: only the three layers (and their panels) scroll.
@@ -579,6 +598,24 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.mindmap}%` }
   const detailLayerStyle = { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.detail}%` }
 
+  // While the focus dialog is open the pair fills the floating body with the
+  // fixed spec split; the chat layer and both dividers leave so nothing can be
+  // dragged away from 65/35. Closing restores the inline styles untouched.
+  const focusMindmapStyle = {
+    flexGrow: 0,
+    flexShrink: 1,
+    flexBasis: `${DESIGN_FOCUS_SPLITS.mindmap}%`,
+  }
+  const focusDetailStyle = {
+    flexGrow: 0,
+    flexShrink: 1,
+    flexBasis: `${DESIGN_FOCUS_SPLITS.detail}%`,
+  }
+  const hiddenWhileFocused = focusOpen ? { display: "none" } : undefined
+  const effectiveChatStyle = focusOpen ? hiddenWhileFocused : chatLayerStyle
+  const effectiveMindmapStyle = focusOpen ? focusMindmapStyle : mindmapLayerStyle
+  const effectiveDetailStyle = focusOpen ? focusDetailStyle : detailLayerStyle
+
   return (
     <div
       ref={workspaceRef}
@@ -593,6 +630,23 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid="design-mindmap-expand"
+            aria-label={focusOpen ? "退出放大脑图与详情" : "放大脑图与详情"}
+            aria-expanded={focusOpen}
+            aria-haspopup="dialog"
+            onClick={toggleFocus}
+            className="gap-1"
+          >
+            {focusOpen ? (
+              <Minimize2 className="size-3.5" aria-hidden="true" />
+            ) : (
+              <Maximize2 className="size-3.5" aria-hidden="true" />
+            )}
+            <span className="hidden sm:inline">{focusOpen ? "退出放大" : "放大脑图"}</span>
+          </Button>
           <Button
             size="sm"
             variant="secondary"
@@ -638,144 +692,149 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
         />
       ) : null}
 
-      <div
-        ref={layersRef}
-        data-testid="design-layers"
-        className="flex min-h-0 flex-1 flex-col overflow-hidden"
-      >
+      <DesignFocusDialog open={focusOpen} onClose={closeFocus}>
         <div
-          data-testid="design-layer-chat"
-          data-collapsed={chatCollapsed ? "true" : "false"}
-          className="min-h-0 overflow-auto"
-          style={chatLayerStyle}
+          ref={layersRef}
+          data-testid="design-layers"
+          className="flex min-h-0 flex-1 flex-col overflow-hidden"
         >
-          <DesignChat
-            versionId={versionId}
-            conversations={conversations}
-            activeConversationId={activeConversationId}
-            onSelectConversation={selectConversation}
-            onCreateConversation={createConversation}
-            creatingConversation={creatingConversation}
-            liveMessages={liveMessages}
-            activity={activity}
-            sseStatus={sseStatus}
-            staleNotice={staleNotice}
-            draftText={chatDraft}
-            onDraftTextChange={setChatDraft}
-            refreshToken={teamRoomToken}
-            collapsed={chatCollapsed}
-            onToggleCollapsed={toggleChatCollapsed}
-            onConversationModelChanged={applyConversationModel}
-            caseReferences={chatCaseReferences}
-            onCaseReferencesChange={setChatCaseReferences}
-            onCaseSelect={selectCase}
-          />
-        </div>
-
-        <hr
-          data-testid="design-divider-chat"
-          // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
-          role="separator"
-          aria-orientation="horizontal"
-          aria-label="调整对话与脑图高度"
-          aria-valuemin={MIN_LAYER_PERCENT}
-          aria-valuemax={Math.round(chatPairTotal - MIN_LAYER_PERCENT)}
-          aria-valuenow={Math.round(layerSplits.chat)}
-          aria-disabled={chatCollapsed ? true : undefined}
-          tabIndex={chatCollapsed ? -1 : 0}
-          onPointerDown={(event) => handleDividerPointerDown("chat", event)}
-          onPointerMove={(event) => handleDividerPointerMove("chat", event)}
-          onPointerUp={() => handleDividerPointerUp("chat")}
-          onPointerCancel={() => handleDividerPointerUp("chat")}
-          onKeyDown={(event) => handleDividerKeyDown("chat", event)}
-          className={cn(
-            "group relative m-0 h-2 w-full shrink-0 touch-none select-none border-0 bg-transparent",
-            "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
-            "after:rounded-full after:bg-border after:transition-colors after:content-['']",
-            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            chatCollapsed
-              ? "cursor-not-allowed opacity-60"
-              : "cursor-row-resize hover:after:bg-primary/60",
-            activeDivider === "chat" && "after:bg-primary",
-          )}
-        />
-
-        <div
-          data-testid="design-layer-mindmap"
-          className="flex min-h-0 flex-col overflow-auto [&>section]:min-h-0 [&>section]:flex-1"
-          style={mindmapLayerStyle}
-        >
-          {graph.requirements.length === 0 ? (
-            <div className="surface-card flex h-full items-center justify-center p-6">
-              <EmptyState
-                title={EMPTY_REQUIREMENTS_COPY}
-                description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
-                action={
-                  <Button size="sm" disabled={creatingConversation} onClick={createConversation}>
-                    ＋ 新建对话
-                  </Button>
-                }
-                className="border-none bg-transparent"
-              />
-            </div>
-          ) : (
-            <DesignMindmap
-              graph={graph}
-              selectedCaseId={selectedCaseId}
-              confirmingKey={confirmingKey}
-              executionResults={executionResults}
-              batchBusy={batchBusy}
-              onSelectCase={selectCase}
-              onConfirmCase={confirmCase}
-              onConfirmScenario={confirmScenario}
-              onConfirmRequirement={confirmRequirement}
-              onBatchConfirmCases={batchConfirmCases}
-              onBatchExecuteCases={batchExecuteCases}
-              onRequestAiChange={requestAiChange}
+          <div
+            data-testid="design-layer-chat"
+            data-collapsed={chatCollapsed ? "true" : "false"}
+            className="min-h-0 overflow-auto"
+            style={effectiveChatStyle}
+          >
+            <DesignChat
+              versionId={versionId}
+              conversations={conversations}
+              activeConversationId={activeConversationId}
+              onSelectConversation={selectConversation}
+              onCreateConversation={createConversation}
+              creatingConversation={creatingConversation}
+              liveMessages={liveMessages}
+              activity={activity}
+              sseStatus={sseStatus}
+              staleNotice={staleNotice}
+              draftText={chatDraft}
+              onDraftTextChange={setChatDraft}
+              refreshToken={teamRoomToken}
+              collapsed={chatCollapsed}
+              onToggleCollapsed={toggleChatCollapsed}
+              onConversationModelChanged={applyConversationModel}
+              caseReferences={chatCaseReferences}
+              onCaseReferencesChange={setChatCaseReferences}
+              onCaseSelect={selectCase}
             />
-          )}
-        </div>
+          </div>
 
-        <hr
-          data-testid="design-divider-mindmap"
-          // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
-          role="separator"
-          aria-orientation="horizontal"
-          aria-label="调整脑图与详情高度"
-          aria-valuemin={MIN_LAYER_PERCENT}
-          aria-valuemax={Math.round(mindmapPairTotal - MIN_LAYER_PERCENT)}
-          aria-valuenow={Math.round(layerSplits.mindmap)}
-          tabIndex={0}
-          onPointerDown={(event) => handleDividerPointerDown("mindmap", event)}
-          onPointerMove={(event) => handleDividerPointerMove("mindmap", event)}
-          onPointerUp={() => handleDividerPointerUp("mindmap")}
-          onPointerCancel={() => handleDividerPointerUp("mindmap")}
-          onKeyDown={(event) => handleDividerKeyDown("mindmap", event)}
-          className={cn(
-            "group relative m-0 h-2 w-full shrink-0 cursor-row-resize touch-none select-none border-0 bg-transparent",
-            "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
-            "after:rounded-full after:bg-border after:transition-colors after:content-[''] hover:after:bg-primary/60",
-            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            activeDivider === "mindmap" && "after:bg-primary",
-          )}
-        />
-
-        <div
-          data-testid="design-layer-detail"
-          className="min-h-0 overflow-auto"
-          style={detailLayerStyle}
-        >
-          <CaseDetailPanel
-            versionId={versionId}
-            caseId={selectedCaseId}
-            refreshToken={detailToken}
-            confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
-            onConfirm={confirmCase}
-            onRequestChange={setChatDraft}
-            onRequestAiChange={requestAiChangeForCase}
+          <hr
+            data-testid="design-divider-chat"
+            // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="调整对话与脑图高度"
+            aria-valuemin={MIN_LAYER_PERCENT}
+            aria-valuemax={Math.round(chatPairTotal - MIN_LAYER_PERCENT)}
+            aria-valuenow={Math.round(layerSplits.chat)}
+            aria-disabled={chatCollapsed ? true : undefined}
+            tabIndex={chatCollapsed ? -1 : 0}
+            style={hiddenWhileFocused}
+            onPointerDown={(event) => handleDividerPointerDown("chat", event)}
+            onPointerMove={(event) => handleDividerPointerMove("chat", event)}
+            onPointerUp={() => handleDividerPointerUp("chat")}
+            onPointerCancel={() => handleDividerPointerUp("chat")}
+            onKeyDown={(event) => handleDividerKeyDown("chat", event)}
+            className={cn(
+              "group relative m-0 h-2 w-full shrink-0 touch-none select-none border-0 bg-transparent",
+              "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
+              "after:rounded-full after:bg-border after:transition-colors after:content-['']",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              chatCollapsed
+                ? "cursor-not-allowed opacity-60"
+                : "cursor-row-resize hover:after:bg-primary/60",
+              activeDivider === "chat" && "after:bg-primary",
+            )}
           />
+
+          <div
+            data-testid="design-layer-mindmap"
+            className="flex min-h-0 flex-col overflow-auto [&>section]:min-h-0 [&>section]:flex-1"
+            style={effectiveMindmapStyle}
+          >
+            {graph.requirements.length === 0 ? (
+              <div className="surface-card flex h-full items-center justify-center p-6">
+                <EmptyState
+                  title={EMPTY_REQUIREMENTS_COPY}
+                  description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
+                  action={
+                    <Button size="sm" disabled={creatingConversation} onClick={createConversation}>
+                      ＋ 新建对话
+                    </Button>
+                  }
+                  className="border-none bg-transparent"
+                />
+              </div>
+            ) : (
+              <DesignMindmap
+                graph={graph}
+                selectedCaseId={selectedCaseId}
+                confirmingKey={confirmingKey}
+                executionResults={executionResults}
+                batchBusy={batchBusy}
+                onSelectCase={selectCase}
+                onConfirmCase={confirmCase}
+                onConfirmScenario={confirmScenario}
+                onConfirmRequirement={confirmRequirement}
+                onBatchConfirmCases={batchConfirmCases}
+                onBatchExecuteCases={batchExecuteCases}
+                onRequestAiChange={requestAiChange}
+                fitViewToken={fitViewToken}
+              />
+            )}
+          </div>
+
+          <hr
+            data-testid="design-divider-mindmap"
+            // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="调整脑图与详情高度"
+            aria-valuemin={MIN_LAYER_PERCENT}
+            aria-valuemax={Math.round(mindmapPairTotal - MIN_LAYER_PERCENT)}
+            aria-valuenow={Math.round(layerSplits.mindmap)}
+            tabIndex={0}
+            style={hiddenWhileFocused}
+            onPointerDown={(event) => handleDividerPointerDown("mindmap", event)}
+            onPointerMove={(event) => handleDividerPointerMove("mindmap", event)}
+            onPointerUp={() => handleDividerPointerUp("mindmap")}
+            onPointerCancel={() => handleDividerPointerUp("mindmap")}
+            onKeyDown={(event) => handleDividerKeyDown("mindmap", event)}
+            className={cn(
+              "group relative m-0 h-2 w-full shrink-0 cursor-row-resize touch-none select-none border-0 bg-transparent",
+              "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
+              "after:rounded-full after:bg-border after:transition-colors after:content-[''] hover:after:bg-primary/60",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              activeDivider === "mindmap" && "after:bg-primary",
+            )}
+          />
+
+          <div
+            data-testid="design-layer-detail"
+            className="min-h-0 overflow-auto"
+            style={effectiveDetailStyle}
+          >
+            <CaseDetailPanel
+              versionId={versionId}
+              caseId={selectedCaseId}
+              refreshToken={detailToken}
+              confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
+              onConfirm={confirmCase}
+              onRequestChange={setChatDraft}
+              onRequestAiChange={requestAiChangeForCase}
+            />
+          </div>
         </div>
-      </div>
+      </DesignFocusDialog>
 
       <ExportCasesDialog
         versionId={versionId}
