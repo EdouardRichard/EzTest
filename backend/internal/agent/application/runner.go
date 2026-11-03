@@ -1067,8 +1067,11 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 }
 
 // handleOverflow compacts the context at a declared window_full boundary and
-// retries. The first two overflows retry with the compacted packet (summary +
-// the configured recent window); a third overflow is unrecoverable.
+// retries. The first retry folds the transcript down to the configured recent
+// window. Rebuilding from the same history with the same window cannot shrink
+// the prompt again, so the second (last) retry halves the window and folds
+// strictly more history; a configured window of 0 is already the minimum, so
+// only the pinned prefix/facts remain and a third overflow is unrecoverable.
 // context_overflow alone never terminates the run.
 func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.overflowHits++
@@ -1079,8 +1082,12 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 			Cause:     errors.New("model rejected the context window even after compaction"),
 		}
 	}
+	keepRecent := r.keepRecentMessages(ctx)
+	if state.overflowHits > 1 {
+		keepRecent = shrinkKeepRecentMessages(keepRecent)
+	}
 	previous := state.contextPacket
-	assembly, err := r.assembleContext(ctx, state, &previous, agentcontext.InvalidationWindowFull)
+	assembly, err := r.assembleContextWithKeepRecent(ctx, state, &previous, agentcontext.InvalidationWindowFull, keepRecent)
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
@@ -1117,6 +1124,17 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	}
 	r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, assembly.Compacted)
 	return nil
+}
+
+// shrinkKeepRecentMessages halves the recent window for the last overflow retry
+// so the second compaction folds strictly more history than the first. A window
+// of 0 or 1 shrinks to 0: every compactable segment is folded and only the
+// pinned prefix/facts and the rolling summary remain.
+func shrinkKeepRecentMessages(keepRecent int) int {
+	if keepRecent <= 1 {
+		return 0
+	}
+	return keepRecent / 2
 }
 
 // writeOutputs persists the profile-specific result: Host/Curator/Design Host/

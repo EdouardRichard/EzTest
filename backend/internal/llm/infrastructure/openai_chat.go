@@ -340,13 +340,67 @@ func parseChatCompletion(raw []byte, names *toolNameMapping) (llmapp.ChatRespons
 		})
 	}
 	if payload.Usage != nil {
-		response.Usage = map[string]int{
-			"prompt_tokens":     payload.Usage.PromptTokens,
-			"completion_tokens": payload.Usage.CompletionTokens,
-			"total_tokens":      payload.Usage.TotalTokens,
-		}
+		response.Usage = chatUsageMap(payload.Usage)
 	}
 	return response, nil
+}
+
+// chatUsageMap converts the chat-completions usage object into the normalized
+// key map the application consumes. The protocol-specific prompt-cache counters
+// are optional; a reported zero stays authoritative (a cache miss) while an
+// absent counter leaves the cache keys out of the map.
+func chatUsageMap(usage *chatCompletionUsage) map[string]int {
+	result := map[string]int{
+		"prompt_tokens":     usage.PromptTokens,
+		"completion_tokens": usage.CompletionTokens,
+		"total_tokens":      usage.TotalTokens,
+	}
+	if result["total_tokens"] == 0 {
+		// Some providers emit total_tokens=0 alongside a real component
+		// breakdown. Synthesize the total so the budget aggregation uses it
+		// instead of summing every usage key (which includes the prompt-cache
+		// bookkeeping that overlaps prompt_tokens).
+		result["total_tokens"] = usage.PromptTokens + usage.CompletionTokens
+	}
+	var cachedTokens *int
+	switch {
+	case usage.PromptTokensDetails != nil:
+		// OpenAI: usage.prompt_tokens_details.cached_tokens.
+		cachedTokens = &usage.PromptTokensDetails.CachedTokens
+	case usage.PromptCacheHitTokens != nil:
+		// DeepSeek: usage.prompt_cache_hit_tokens.
+		cachedTokens = usage.PromptCacheHitTokens
+	default:
+		// OpenAI-compatible gateways fronting Anthropic-style usage.
+		cachedTokens = usage.CacheReadInputTokens
+	}
+	setPromptCacheUsage(result, cachedTokens)
+	return result
+}
+
+// setPromptCacheUsage normalizes one reported prompt-cache read count into the
+// keys the application consumes (cached_tokens/cache_hit). A nil count means the
+// provider reported no cache statistics at all, so nothing is added and the
+// caller's local estimate stays authoritative. A reported zero is authoritative
+// too: it is a cache miss and overrides a local cache-hit estimate.
+func setPromptCacheUsage(usage map[string]int, cachedTokens *int) {
+	if cachedTokens == nil {
+		return
+	}
+	value := *cachedTokens
+	if value < 0 {
+		value = 0
+	}
+	usage["cached_tokens"] = value
+	usage["cache_hit"] = boolToInt(value > 0)
+}
+
+// boolToInt renders a boolean usage flag as the 0/1 int the usage map carries.
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // waitRetry sleeps with a deterministic exponential backoff bounded at 250ms.
@@ -530,11 +584,27 @@ type chatCompletionPayload struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage *chatCompletionUsage `json:"usage"`
+}
+
+// chatCompletionUsage is one OpenAI-compatible usage object. The prompt-cache
+// counters are optional and protocol-specific; pointers keep "reported zero"
+// distinct from "not reported".
+type chatCompletionUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails is the OpenAI nested prompt-cache detail.
+	PromptTokensDetails *chatPromptTokensDetails `json:"prompt_tokens_details"`
+	// PromptCacheHitTokens is the DeepSeek prompt-cache read counter.
+	PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
+	// CacheReadInputTokens is the Anthropic-style alias used by some gateways.
+	CacheReadInputTokens *int `json:"cache_read_input_tokens"`
+}
+
+// chatPromptTokensDetails is the OpenAI prompt_tokens_details object.
+type chatPromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 type chatErrorPayload struct {

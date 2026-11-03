@@ -608,3 +608,84 @@ func TestResponsesImagePayload(t *testing.T) {
 		t.Fatalf("text-only content = %#v, want the byte-compatible string form", plain["content"])
 	}
 }
+
+// TestResponsesNormalizesPromptCacheUsage pins the provider-usage normalization
+// (contract §18.2.6) of the Responses adapter: the nested
+// input_tokens_details.cached_tokens counter (and the flattened aliases used by
+// compatible gateways) reach the runner as cached_tokens/cache_hit, while a
+// provider that reports no cache statistics leaves the keys absent.
+func TestResponsesNormalizesPromptCacheUsage(t *testing.T) {
+	cases := []struct {
+		name       string
+		usage      string
+		wantCached int
+		wantCache  bool
+		wantHit    int
+	}{
+		{
+			name:       "input_tokens_details.cached_tokens",
+			usage:      `{"input_tokens":120,"output_tokens":7,"total_tokens":127,"input_tokens_details":{"cached_tokens":80}}`,
+			wantCached: 80, wantCache: true, wantHit: 1,
+		},
+		{
+			name:       "cache_read_input_tokens alias",
+			usage:      `{"input_tokens":120,"output_tokens":7,"total_tokens":127,"cache_read_input_tokens":48}`,
+			wantCached: 48, wantCache: true, wantHit: 1,
+		},
+		{
+			name:       "explicit zero cached tokens",
+			usage:      `{"input_tokens":120,"output_tokens":7,"total_tokens":127,"input_tokens_details":{"cached_tokens":0}}`,
+			wantCached: 0, wantCache: true, wantHit: 0,
+		},
+		{
+			name:      "no cache statistics",
+			usage:     `{"input_tokens":120,"output_tokens":7,"total_tokens":127}`,
+			wantCache: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{
+					"id":"resp_cache",
+					"object":"response",
+					"status":"completed",
+					"output":[{"type":"message","id":"msg_cache","role":"assistant","content":[
+						{"type":"output_text","text":"ok","annotations":[]}
+					]}],
+					"usage":`+tc.usage+`
+				}`)
+			}))
+			defer server.Close()
+
+			response, err := llminfra.NewClient().Chat(context.Background(), responsesConfig(server.URL+"/v1", 0), llmapp.ChatRequest{
+				Model:    "fake-llm",
+				Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if response.Usage["prompt_tokens"] != 120 ||
+				response.Usage["completion_tokens"] != 7 ||
+				response.Usage["total_tokens"] != 127 {
+				t.Fatalf("usage totals = %#v, want the provider totals preserved", response.Usage)
+			}
+			cached, hasCache := response.Usage["cached_tokens"]
+			if hasCache != tc.wantCache {
+				t.Fatalf("usage cached_tokens presence = %v (%#v), want %v", hasCache, response.Usage, tc.wantCache)
+			}
+			if hasCache {
+				if cached != tc.wantCached {
+					t.Fatalf("usage cached_tokens = %d, want %d", cached, tc.wantCached)
+				}
+				if hit := response.Usage["cache_hit"]; hit != tc.wantHit {
+					t.Fatalf("usage cache_hit = %d, want %d", hit, tc.wantHit)
+				}
+			} else if _, hasHit := response.Usage["cache_hit"]; hasHit {
+				t.Fatalf("usage fabricated cache_hit: %#v", response.Usage)
+			}
+		})
+	}
+}

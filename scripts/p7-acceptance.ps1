@@ -489,6 +489,16 @@ function Get-PacketHasText([int64]$PacketID, [string]$Needle) {
   return ($count -gt 0)
 }
 
+# Get-PacketSectionHasText checks one named context_packet section, not the whole
+# JSON document: Task 48 cache-first packets store the rendered knowledge block
+# inside the pinned `facts` segment (the P1 `knowledge` section no longer
+# exists), so the acceptance check must still prove the marker sits in a section
+# the model actually received.
+function Get-PacketSectionHasText([int64]$PacketID, [string]$SectionName, [string]$Needle) {
+  $count = [int](Get-Scalar ("SELECT count(*) FROM context_packet p, jsonb_array_elements(p.sections) s WHERE p.id = $PacketID AND s->>'name' = '" + (SqlText $SectionName) + "' AND COALESCE(s->>'content','') LIKE '%" + (SqlText $Needle) + "%';"))
+  return ($count -gt 0)
+}
+
 function Get-DeadRenderJobError {
   param([string]$ReportID, [int]$Revision)
   $dedupe = "report:${ReportID}:rev:$Revision"
@@ -925,8 +935,14 @@ function Scenario-S4($checks) {
   $packet1 = Wait-ContextPacket -VersionID $script:v1 -AfterID $run1.PacketBefore -Needle "[K-$kid]" -TimeoutSeconds 150
   Add-Check $checks ($null -ne $packet1) "context_packet carries [K-$kid]" ("run=" + $(if ($packet1) { $packet1.RunID } else { "none" }))
   if ($null -ne $packet1) {
-    $hasSection = Get-PacketHasText -PacketID ([int64]$packet1.PacketID) -Needle '"name": "knowledge"'
-    Add-Check $checks $hasSection "context_packet has knowledge section"
+    # Task 48 cache-first layout: the injected knowledge is rendered inside the
+    # pinned `facts` segment, not a dedicated P1 `knowledge` section. The check
+    # is stronger than a whole-document LIKE: both the [K-<id>] marker and the
+    # knowledge block heading must sit in that section.
+    $hasMarker = Get-PacketSectionHasText -PacketID ([int64]$packet1.PacketID) -SectionName "facts" -Needle "[K-$kid]"
+    Add-Check $checks $hasMarker "context_packet facts section carries [K-$kid]"
+    $hasHeading = Get-PacketSectionHasText -PacketID ([int64]$packet1.PacketID) -SectionName "facts" -Needle "知识:"
+    Add-Check $checks $hasHeading "context_packet facts section carries the knowledge block"
     $usage = Get-Scalar "SELECT count(*) FROM knowledge_usage WHERE knowledge_id = $kid AND agent_run_id = $($packet1.RunID);"
     Add-Check $checks ([int]$usage -ge 1) "knowledge_usage row for the run" "rows=$usage"
   } else {

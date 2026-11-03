@@ -549,4 +549,95 @@ func TestChatCompletionsImagePayload(t *testing.T) {
 	}
 }
 
+// TestOpenAIChatNormalizesPromptCacheUsage pins the provider-usage normalization
+// (contract §18.2.6): the nested/aliased prompt-cache counters of the supported
+// chat-completions providers are flattened into the keys the agent runner
+// consumes (cached_tokens/cache_hit) without disturbing the token totals or
+// inventing cache statistics a provider did not report.
+func TestOpenAIChatNormalizesPromptCacheUsage(t *testing.T) {
+	cases := []struct {
+		name       string
+		usage      string
+		wantCached int
+		wantCache  bool
+		wantHit    int
+	}{
+		{
+			name:       "openai prompt_tokens_details.cached_tokens",
+			usage:      `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":64}}`,
+			wantCached: 64, wantCache: true, wantHit: 1,
+		},
+		{
+			name:       "deepseek prompt_cache_hit_tokens",
+			usage:      `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_cache_hit_tokens":32}`,
+			wantCached: 32, wantCache: true, wantHit: 1,
+		},
+		{
+			name:       "cache_read_input_tokens alias",
+			usage:      `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"cache_read_input_tokens":48}`,
+			wantCached: 48, wantCache: true, wantHit: 1,
+		},
+		{
+			name:       "explicit zero cached tokens",
+			usage:      `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":0}}`,
+			wantCached: 0, wantCache: true, wantHit: 0,
+		},
+		{
+			// Some providers emit total_tokens=0 next to the component
+			// breakdown; the total must stay the sum of the components so the
+			// budget does not also add the overlapping cache counters.
+			name:       "zero total with cache statistics",
+			usage:      `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":64}}`,
+			wantCached: 64, wantCache: true, wantHit: 1,
+		},
+		{
+			name:      "no cache statistics",
+			usage:     `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}`,
+			wantCache: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{
+					"id":"chatcmpl-cache",
+					"object":"chat.completion",
+					"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+					"usage":`+tc.usage+`
+				}`)
+			}))
+			defer server.Close()
+
+			response, err := llminfra.NewClient().Chat(context.Background(), chatConfigFor(server.URL, 0), llmapp.ChatRequest{
+				Model:    "fake-llm",
+				Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if response.Usage["prompt_tokens"] != 100 ||
+				response.Usage["completion_tokens"] != 5 ||
+				response.Usage["total_tokens"] != 105 {
+				t.Fatalf("usage totals = %#v, want the provider totals preserved", response.Usage)
+			}
+			cached, hasCache := response.Usage["cached_tokens"]
+			if hasCache != tc.wantCache {
+				t.Fatalf("usage cached_tokens presence = %v (%#v), want %v", hasCache, response.Usage, tc.wantCache)
+			}
+			if hasCache {
+				if cached != tc.wantCached {
+					t.Fatalf("usage cached_tokens = %d, want %d", cached, tc.wantCached)
+				}
+				if hit := response.Usage["cache_hit"]; hit != tc.wantHit {
+					t.Fatalf("usage cache_hit = %d, want %d", hit, tc.wantHit)
+				}
+			} else if _, hasHit := response.Usage["cache_hit"]; hasHit {
+				t.Fatalf("usage fabricated cache_hit: %#v", response.Usage)
+			}
+		})
+	}
+}
+
 var _ llmapp.ChatClient = (*llminfra.Client)(nil)

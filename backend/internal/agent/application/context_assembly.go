@@ -36,6 +36,20 @@ func (r *Runner) assembleContext(
 	previous *agentcontext.ContextPacket,
 	invalidation agentcontext.Invalidation,
 ) (contextAssembly, error) {
+	return r.assembleContextWithKeepRecent(ctx, state, previous, invalidation, -1)
+}
+
+// assembleContextWithKeepRecent is assembleContext with an explicit compaction
+// recent window. keepRecent < 0 uses context.keep_recent_messages; a
+// non-negative value overrides it for this assembly only (the overflow rescue
+// path shrinks the window after the first retry).
+func (r *Runner) assembleContextWithKeepRecent(
+	ctx context.Context,
+	state *runState,
+	previous *agentcontext.ContextPacket,
+	invalidation agentcontext.Invalidation,
+	keepRecent int,
+) (contextAssembly, error) {
 	builder := r.builder
 	if builder == nil {
 		builder = NewContextBuilder(r.settings, NewLLMSummarizer(r.chat))
@@ -85,12 +99,15 @@ func (r *Runner) assembleContext(
 		}
 		result.Packet = rebuilt.Packet
 		result.BeforeTokens = contextPacketTokens(rebuilt.Packet)
-		compacted, compactErr := r.contextCompactor(ctx).Compact(ctx, result.Packet)
+		compactor := r.contextCompactor(ctx)
+		if keepRecent >= 0 {
+			compactor = r.contextCompactorWithKeepRecent(ctx, keepRecent)
+		}
+		compacted, compactErr := compactor.Compact(ctx, result.Packet)
 		if compactErr != nil {
 			return contextAssembly{}, compactErr
 		}
-		result.Compacted = contextPacketHasSummary(compacted) &&
-			len(compacted.Segments) != len(result.Packet.Segments)
+		result.Compacted = contextPacketFolded(result.Packet, compacted)
 		result.Packet = compacted
 		result.AfterTokens = contextPacketTokens(compacted)
 	}
@@ -233,6 +250,32 @@ func contextPacketHasSummary(packet agentcontext.ContextPacket) bool {
 	return false
 }
 
+// contextPacketFolded reports whether a boundary compaction actually folded
+// transcript segments. It compares the compactable segment counts instead of the
+// total segment count: appending the rolling summary in place of exactly one
+// folded segment leaves the total unchanged, so a count-only test misses a
+// foldCount==1 compaction and the summary would never be persisted.
+func contextPacketFolded(before, after agentcontext.ContextPacket) bool {
+	if !contextPacketHasSummary(after) {
+		return false
+	}
+	return contextPacketCompactableCount(before) > contextPacketCompactableCount(after)
+}
+
+// contextPacketCompactableCount counts the suffix segments a boundary compaction
+// may fold. Pinned prefix/briefing/facts segments and derived summaries are not
+// counted, so the result decreases exactly by the number of folded segments.
+func contextPacketCompactableCount(packet agentcontext.ContextPacket) int {
+	count := 0
+	for _, segment := range packet.Segments {
+		switch segment.Name {
+		case agentcontext.SegmentHistory, agentcontext.SegmentToolResult:
+			count++
+		}
+	}
+	return count
+}
+
 // packetSummary returns the rolling summary segment a compaction appended.
 func packetSummary(packet agentcontext.ContextPacket) string {
 	summary := ""
@@ -248,9 +291,18 @@ func packetSummary(packet agentcontext.ContextPacket) string {
 // (context.keep_recent_messages, default 12, zero folds everything compactable)
 // and the LLM summarizer with its deterministic fallback.
 func (r *Runner) contextCompactor(ctx context.Context) *agentcontext.Compactor {
+	return r.contextCompactorWithKeepRecent(ctx, -1)
+}
+
+// contextCompactorWithKeepRecent wires boundary compaction with an explicit
+// recent window. keepRecent < 0 resolves context.keep_recent_messages.
+func (r *Runner) contextCompactorWithKeepRecent(ctx context.Context, keepRecent int) *agentcontext.Compactor {
+	if keepRecent < 0 {
+		keepRecent = r.keepRecentMessages(ctx)
+	}
 	return agentcontext.NewCompactor(
 		NewLLMSummarizer(r.chat),
-		agentcontext.WithKeepRecent(r.keepRecentMessages(ctx)),
+		agentcontext.WithKeepRecent(keepRecent),
 		agentcontext.WithLogger(r.logger),
 	)
 }
@@ -314,9 +366,15 @@ func (r *Runner) logContextWarning(ctx context.Context, message string, err erro
 	logger.WarnContext(ctx, message, "error", err)
 }
 
-// providerCacheUsageKeys are the provider usage keys that carry prompt-cache
-// statistics. The LLM adapters flatten the protocol-specific nested usage
-// details into these keys; the runner only consumes the normalized map.
+// providerCacheUsageKeys are the usage keys that carry prompt-cache statistics.
+// The LLM adapters normalize the protocol-specific provider payloads (OpenAI
+// prompt_tokens_details.cached_tokens, Responses
+// input_tokens_details.cached_tokens, DeepSeek prompt_cache_hit_tokens and the
+// cache_read_input_tokens alias) into "cached_tokens"; the provider-native keys
+// are still accepted here so a caller that forwards the raw usage map (or an
+// adapter that reports the provider key directly) keeps working. The first
+// reported key wins and an explicit "cache_hit" (0/1) overrides the derived
+// cached_tokens > 0.
 var providerCacheUsageKeys = []string{
 	"cached_tokens",
 	"prompt_cache_hit_tokens",

@@ -482,8 +482,10 @@ func responsesFinishReason(payload responsesResponsePayload, hasToolCalls bool) 
 	}
 }
 
-// responsesUsage converts Responses token counts to the chat-completions keys
-// used by ChatResponse.Usage.
+// responsesUsageMap converts Responses token counts to the chat-completions keys
+// used by ChatResponse.Usage and normalizes the protocol-specific prompt-cache
+// counters (input_tokens_details.cached_tokens and the flattened aliases) into
+// the cached_tokens/cache_hit keys the application consumes.
 func responsesUsageMap(usage *responsesUsage) map[string]int {
 	result := map[string]int{
 		"prompt_tokens":     usage.InputTokens,
@@ -493,6 +495,18 @@ func responsesUsageMap(usage *responsesUsage) map[string]int {
 	if result["total_tokens"] == 0 {
 		result["total_tokens"] = usage.InputTokens + usage.OutputTokens
 	}
+	var cachedTokens *int
+	switch {
+	case usage.InputTokensDetails != nil:
+		// OpenAI: usage.input_tokens_details.cached_tokens.
+		cachedTokens = &usage.InputTokensDetails.CachedTokens
+	case usage.CacheReadInputTokens != nil:
+		// Anthropic-style alias used by some compatible gateways.
+		cachedTokens = usage.CacheReadInputTokens
+	default:
+		cachedTokens = usage.PromptCacheHitTokens
+	}
+	setPromptCacheUsage(result, cachedTokens)
 	return result
 }
 
@@ -790,6 +804,18 @@ type responsesUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
+	// InputTokensDetails is the OpenAI nested prompt-cache detail. Pointers keep
+	// "reported zero" distinct from "not reported".
+	InputTokensDetails *responsesInputTokensDetails `json:"input_tokens_details"`
+	// CacheReadInputTokens/PromptCacheHitTokens are flattened aliases used by
+	// compatible gateways.
+	CacheReadInputTokens *int `json:"cache_read_input_tokens"`
+	PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
+}
+
+// responsesInputTokensDetails is the Responses input_tokens_details object.
+type responsesInputTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 type responsesStreamEvent struct {
