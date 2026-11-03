@@ -339,6 +339,76 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 	}
 }
 
+// TestBriefingReaderSQLSourceStale pins the R87 source-staleness policy at the
+// production read boundary end to end: the SQL source selects the knowledge
+// status and computes whether the item's source version still exists, and the
+// briefing builder therefore suppresses a source-gone approved item instead of
+// relying on the SQL approved filter alone. An item without a source version and
+// an item whose source version still exists stay injectable.
+func TestBriefingReaderSQLSourceStale(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v\nSQL: %s", err, sql)
+		}
+	}
+	reader, err := NewBriefingReader(pool)
+	if err != nil {
+		t.Fatalf("NewBriefingReader: %v", err)
+	}
+
+	exec(`INSERT INTO version (id, title, status, created_by, stage)
+		VALUES (9005, '源失效版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO knowledge_item (id, scope, title, content, status, confidence, source_version_id)
+		VALUES (12001, 'global', '源版本存在知识', '应注入简报', 'approved', 0.90, 9005)`)
+	exec(`INSERT INTO knowledge_item (id, scope, title, content, status, confidence, source_version_id)
+		VALUES (12002, 'global', '源版本已删除知识', '不应注入简报', 'approved', 0.95, 999999)`)
+	exec(`INSERT INTO knowledge_item (id, scope, title, content, status, confidence)
+		VALUES (12003, 'global', '无源版本知识', '应注入简报', 'approved', 0.80)`)
+
+	// End to end: the production reader feeds the briefing builder, and the
+	// source-gone item must never reach the rendered prompt.
+	briefing, err := agentcontext.NewBriefingBuilder(reader).BuildBriefing(ctx, 9005)
+	if err != nil {
+		t.Fatalf("BuildBriefing: %v", err)
+	}
+	rendered := briefing.Render()
+	if strings.Contains(rendered, "源版本已删除知识") {
+		t.Fatalf("briefing rendered a source-gone approved item:\n%s", rendered)
+	}
+	for _, want := range []string{"源版本存在知识", "无源版本知识"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("briefing is missing injectable knowledge %q:\n%s", want, rendered)
+		}
+	}
+
+	// The read model must carry the state the builder filters on: the status is
+	// populated for every approved row and SourceStale marks exactly the item
+	// whose source version is gone (a nil source version is not stale).
+	source, err := reader.Load(ctx, 9005)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(source.Knowledge) != 3 {
+		t.Fatalf("knowledge = %#v, want all three approved candidates", source.Knowledge)
+	}
+	wantStale := map[int64]bool{12001: false, 12002: true, 12003: false}
+	for _, item := range source.Knowledge {
+		if item.Status != "approved" {
+			t.Fatalf("knowledge %d status = %q, want approved", item.ID, item.Status)
+		}
+		want, ok := wantStale[item.ID]
+		if !ok {
+			t.Fatalf("unexpected knowledge item %d: %#v", item.ID, item)
+		}
+		if item.SourceStale != want {
+			t.Fatalf("knowledge %d source_stale = %v, want %v", item.ID, item.SourceStale, want)
+		}
+	}
+}
+
 // briefingSeedSQL seeds every table the briefing reads plus unrelated credential
 // rows that must never be read.
 func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {

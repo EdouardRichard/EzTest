@@ -102,7 +102,7 @@ type KnowledgeSnapshot struct {
 	// Status is the knowledge review/verification state ("approved",
 	// "suspect", "stale", ...). The briefing only injects approved items; an
 	// empty value means the read port did not supply the state and the item is
-	// rendered (the production reader already filters approved rows in SQL).
+	// rendered. The production SQL reader supplies it together with SourceStale.
 	Status string
 	// SourceStale is the read-time marker of a knowledge item whose source
 	// version no longer exists. It is never injected.

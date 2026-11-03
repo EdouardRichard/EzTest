@@ -438,11 +438,23 @@ func loadBriefingKnowledge(ctx context.Context, tx pgx.Tx, versionID int64, sour
 	// top-K trade-off: a version with more than briefingKnowledgeCandidates
 	// higher-confidence items that are invisible to it could miss a visible
 	// lower-confidence item that would still make the rendered top-K.
+	//
+	// The status and the source-version existence are read with the item, not
+	// assumed: the agent's briefing builder re-applies the injection policy
+	// (approved only, never a source-gone item) and can only do so when the read
+	// model carries them. The existence probe is part of the same repeatable-read
+	// snapshot as the item read, and matches the Inject/Retrieve policy: a nil
+	// source version is not stale, and a source read error is fail-open (here it
+	// can only fail the whole briefing read, never silently mark an item stale).
 	rows, err := tx.Query(ctx, `
-		SELECT id, scope, COALESCE(system_key, ''), title, content, confidence, bindings
-		FROM knowledge_item
-		WHERE status = 'approved'
-		ORDER BY confidence DESC NULLS LAST, id DESC
+		SELECT ki.id, ki.scope, ki.status, COALESCE(ki.system_key, ''),
+			ki.title, ki.content, ki.confidence, ki.bindings,
+			(ki.source_version_id IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM version v WHERE v.id = ki.source_version_id
+			)) AS source_stale
+		FROM knowledge_item ki
+		WHERE ki.status = 'approved'
+		ORDER BY ki.confidence DESC NULLS LAST, ki.id DESC
 		LIMIT $1
 	`, briefingKnowledgeCandidates)
 	if err != nil {
@@ -456,7 +468,8 @@ func loadBriefingKnowledge(ctx context.Context, tx pgx.Tx, versionID int64, sour
 		var itemScope, systemKey string
 		var content string
 		var bindingsRaw []byte
-		if err := rows.Scan(&item.ID, &itemScope, &systemKey, &item.Title, &content, &item.Confidence, &bindingsRaw); err != nil {
+		if err := rows.Scan(&item.ID, &itemScope, &item.Status, &systemKey, &item.Title, &content,
+			&item.Confidence, &bindingsRaw, &item.SourceStale); err != nil {
 			return fmt.Errorf("scan briefing knowledge: %w", err)
 		}
 		var bindings knowledge.Bindings

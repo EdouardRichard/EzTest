@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -328,11 +329,17 @@ func TestRouteChangeMarksStale(t *testing.T) {
 			item.Status = knowledge.StatusStale
 			return item
 		}(),
+		// 107 is the same route on another SUT: the change names system 1, so an
+		// item explicitly bound to system 2 must not be invalidated by a
+		// same-named route. 108 is the same route on the changed system.
+		approvedBoundItem(107, knowledge.Bindings{SystemID: ptr[int64](2), PageKey: ptr("/login")}),
+		approvedBoundItem(108, knowledge.Bindings{SystemID: ptr[int64](1), PageKey: ptr("/login")}),
 	}
 	repo.failStatus[102] = true // one concurrent writer must not abort the pass
 	service := newLifecycleService(repo)
 
-	marked, err := service.MarkBindingsStale(context.Background(), knowledgeapp.BindingChange{
+	result, err := service.MarkBindingsStale(context.Background(), knowledgeapp.BindingChange{
+		SystemIDs:    []int64{1},
 		PageKeys:     []string{" /login "},
 		AccountRoles: []string{"admin"},
 		Reason:       " route template changed ",
@@ -340,11 +347,21 @@ func TestRouteChangeMarksStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarkBindingsStale: %v", err)
 	}
-	if marked != 1 {
-		t.Fatalf("marked = %d, want 1 (the failed CAS is best effort)", marked)
+	if result.Matched != 3 || result.Marked != 2 || result.Failed != 1 {
+		t.Fatalf("result = %+v, want 3 matched / 2 marked / 1 failed", result)
 	}
-	if len(repo.statusWrites) != 2 {
-		t.Fatalf("status writes = %d, want 2 (101 and 102)", len(repo.statusWrites))
+	if len(repo.statusWrites) != 3 {
+		t.Fatalf("status writes = %d, want 3 (101, 102, 108)", len(repo.statusWrites))
+	}
+	wrote := make(map[int64]bool, len(repo.statusWrites))
+	for _, write := range repo.statusWrites {
+		wrote[write.item.ID] = true
+	}
+	if wrote[107] {
+		t.Fatalf("item bound to another system was invalidated: %+v", repo.statusWrites)
+	}
+	if !wrote[108] {
+		t.Fatalf("item bound to the changed system's route was not invalidated: %+v", repo.statusWrites)
 	}
 	for _, write := range repo.statusWrites {
 		if write.from != knowledge.StatusApproved || write.item.Status != knowledge.StatusStale {
@@ -410,6 +427,148 @@ func TestRouteChangeMarksStale(t *testing.T) {
 	})
 }
 
+// pagedLifecycleRepo is lifecycleRepo with a repository-accurate List: id DESC,
+// status filter, exclusive BeforeID cursor and a hard limit. It lets the
+// invalidation paging contract be exercised without PostgreSQL.
+type pagedLifecycleRepo struct {
+	*lifecycleRepo
+	listCalls []knowledge.Filter
+}
+
+func newPagedLifecycleRepo() *pagedLifecycleRepo {
+	return &pagedLifecycleRepo{lifecycleRepo: newLifecycleRepo()}
+}
+
+func (r *pagedLifecycleRepo) List(_ context.Context, filter knowledge.Filter) ([]knowledge.Item, error) {
+	r.listCalls = append(r.listCalls, filter)
+	items := make([]knowledge.Item, 0, len(r.items))
+	for _, item := range r.items {
+		if filter.Status != "" && item.Status != filter.Status {
+			continue
+		}
+		if filter.BeforeID > 0 && item.ID >= filter.BeforeID {
+			continue
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(left, right int) bool { return items[left].ID > items[right].ID })
+	if filter.Limit > 0 && len(items) > filter.Limit {
+		items = items[:filter.Limit]
+	}
+	return items, r.listErr
+}
+
+// TestKnowledgeBindingInvalidationPagination pins that MarkBindingsStale walks
+// every approved page instead of only the newest one: an affected row older than
+// the first MaxListLimit window is still invalidated, while a matching row whose
+// CAS loses a race is reported as failed. A run whose matched rows all failed is
+// therefore distinguishable from a run with no matches.
+func TestKnowledgeBindingInvalidationPagination(t *testing.T) {
+	repo := newPagedLifecycleRepo()
+	for id := int64(1); id <= 130; id++ {
+		pageKey := "/login"
+		if id > 120 {
+			pageKey = "/checkout"
+		}
+		repo.items[id] = approvedBoundItem(id, knowledge.Bindings{PageKey: ptr(pageKey)})
+	}
+	repo.failStatus[5] = true // an older affected row loses the CAS race
+	service := newLifecycleService(repo)
+
+	result, err := service.MarkBindingsStale(context.Background(), knowledgeapp.BindingChange{
+		PageKeys: []string{"/login"},
+	})
+	if err != nil {
+		t.Fatalf("MarkBindingsStale: %v", err)
+	}
+	if result.Scanned != 130 || result.Matched != 120 || result.Marked != 119 || result.Failed != 1 {
+		t.Fatalf("result = %+v, want scanned=130 matched=120 marked=119 failed=1", result)
+	}
+
+	// 120 rows match; 119 move to stale and the failed CAS stays approved.
+	if stored := repo.items[4]; stored.Status != knowledge.StatusStale {
+		t.Fatalf("older bound item 4 = %+v, want stale", stored)
+	}
+	if stored := repo.items[5]; stored.Status != knowledge.StatusApproved {
+		t.Fatalf("failed-CAS item 5 = %+v, want approved (best effort)", stored)
+	}
+	if stored := repo.items[120]; stored.Status != knowledge.StatusStale {
+		t.Fatalf("last bound item 120 = %+v, want stale", stored)
+	}
+	if stored := repo.items[121]; stored.Status != knowledge.StatusApproved {
+		t.Fatalf("unbound item 121 = %+v, want approved", stored)
+	}
+	if len(repo.statusWrites) != 120 {
+		t.Fatalf("status writes = %d, want 120 matched rows", len(repo.statusWrites))
+	}
+
+	// The scan paginates by the id-desc cursor: page one is the newest 100 ids,
+	// the last id of that page is the exclusive cursor of page two.
+	if len(repo.listCalls) != 2 {
+		t.Fatalf("list calls = %d, want 2 pages", len(repo.listCalls))
+	}
+	if first := repo.listCalls[0]; first.Status != knowledge.StatusApproved ||
+		first.BeforeID != 0 || first.Limit != knowledgeapp.MaxListLimit {
+		t.Fatalf("first page filter = %+v", first)
+	}
+	if second := repo.listCalls[1]; second.BeforeID != 31 {
+		t.Fatalf("second page cursor = %d, want 31", second.BeforeID)
+	}
+
+	// An all-CAS-failure pass is distinguishable from a no-match pass: both move
+	// zero rows, but only the failure case reports matched/failed counts.
+	t.Run("an all-CAS-failure pass reports the failure count", func(t *testing.T) {
+		failed := newPagedLifecycleRepo()
+		failed.items[501] = approvedBoundItem(501, knowledge.Bindings{PageKey: ptr("/login")})
+		failed.failStatus[501] = true
+		failedService := newLifecycleService(failed)
+
+		allFailed, err := failedService.MarkBindingsStale(context.Background(),
+			knowledgeapp.BindingChange{PageKeys: []string{"/login"}})
+		if err != nil {
+			t.Fatalf("MarkBindingsStale: %v", err)
+		}
+		if allFailed.Marked != 0 || allFailed.Matched != 1 || allFailed.Failed != 1 ||
+			allFailed.Scanned != 1 {
+			t.Fatalf("all-failed result = %+v", allFailed)
+		}
+
+		noMatch, err := failedService.MarkBindingsStale(context.Background(),
+			knowledgeapp.BindingChange{PageKeys: []string{"/other"}})
+		if err != nil {
+			t.Fatalf("MarkBindingsStale (no match): %v", err)
+		}
+		if noMatch.Marked != 0 || noMatch.Matched != 0 || noMatch.Failed != 0 {
+			t.Fatalf("no-match result = %+v, want zero matched/failed", noMatch)
+		}
+	})
+}
+
+// TestKnowledgeBindingInvalidationReasonValidation pins that the stored
+// invalidation reason is validated with the same rule as UpdateStatus: an
+// overlong reason is a caller error (400 field=reason) and writes nothing.
+func TestKnowledgeBindingInvalidationReasonValidation(t *testing.T) {
+	repo := newLifecycleRepo()
+	repo.listItems = []knowledge.Item{
+		approvedBoundItem(109, knowledge.Bindings{PageKey: ptr("/login")}),
+	}
+	_, err := newLifecycleService(repo).MarkBindingsStale(context.Background(),
+		knowledgeapp.BindingChange{
+			PageKeys: []string{"/login"},
+			Reason:   strings.Repeat("x", knowledge.MaxReasonRunes+1),
+		})
+	if err == nil {
+		t.Fatal("an overlong reason must be rejected")
+	}
+	if apiErr := platform.AsError(err); apiErr == nil || apiErr.Status != 400 ||
+		apiErr.Details["field"] != "reason" {
+		t.Fatalf("error = %+v, want 400 field=reason", apiErr)
+	}
+	if len(repo.statusWrites) != 0 {
+		t.Fatalf("an invalid reason wrote %d statuses", len(repo.statusWrites))
+	}
+}
+
 // versionKeysRepo/repoCatalog are minimal read fakes for KnowledgeBindingKeys:
 // embedding the port interfaces keeps the unused methods out of the test.
 type versionKeysRepo struct {
@@ -436,7 +595,7 @@ func (c versionKeysCatalog) GetPage(_ context.Context, id int64) (resourceapp.Pa
 
 /* ------------------------------- HTTP secrets ----------------------------- */
 
-func assertSecretRejection(t *testing.T, recorder *httptest.ResponseRecorder, body map[string]any) {
+func assertSecretRejection(t *testing.T, recorder *httptest.ResponseRecorder, body map[string]any, secret string) {
 	t.Helper()
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%v, want 400", recorder.Code, body)
@@ -454,6 +613,11 @@ func assertSecretRejection(t *testing.T, recorder *httptest.ResponseRecorder, bo
 	if details["field"] != "secret" {
 		t.Fatalf("error details = %v, want field=secret", details)
 	}
+	// The rejection must never echo the credential back: the response is a
+	// generic field-level error, not a validation dump of the submitted body.
+	if secret != "" && strings.Contains(recorder.Body.String(), secret) {
+		t.Fatalf("rejection echoed the credential %q: %s", secret, recorder.Body.String())
+	}
 }
 
 // TestCreateApproveRejectSecrets pins the R91 write gate end to end over HTTP:
@@ -462,14 +626,19 @@ func assertSecretRejection(t *testing.T, recorder *httptest.ResponseRecorder, bo
 func TestCreateApproveRejectSecrets(t *testing.T) {
 	t.Run("create rejects a secret-bearing body without writing", func(t *testing.T) {
 		_, repo, mux := newHTTPHarness(t)
-		for name, payload := range map[string]string{
-			"assignment": `{"title":"登录配方","content":"password=hunter2"}`,
-			"jwt":        `{"title":"登录配方","content":"token: [REDACTED_TOKEN]"}`,
-			"tag":        `{"title":"登录配方","content":"打开 /login","tags":["Bearer abc123"]}`,
+		for _, testCase := range []struct {
+			name    string
+			payload string
+			secret  string
+		}{
+			{"assignment", `{"title":"登录配方","content":"password=hunter2"}`, "hunter2"},
+			{"jwt", `{"title":"登录配方","content":"token: [REDACTED_TOKEN]"}`,
+				"eyJhbGciOiJIUzI1NiJ9"},
+			{"tag", `{"title":"登录配方","content":"打开 /login","tags":["Bearer abc123"]}`, "abc123"},
 		} {
-			t.Run(name, func(t *testing.T) {
-				recorder, body := httpCall(t, mux, http.MethodPost, "/api/knowledge/items", payload)
-				assertSecretRejection(t, recorder, body)
+			t.Run(testCase.name, func(t *testing.T) {
+				recorder, body := httpCall(t, mux, http.MethodPost, "/api/knowledge/items", testCase.payload)
+				assertSecretRejection(t, recorder, body, testCase.secret)
 			})
 		}
 		if repo.insertCalls != 0 {
@@ -521,7 +690,7 @@ func TestCreateApproveRejectSecrets(t *testing.T) {
 
 		recorder, body = httpCall(t, mux, http.MethodPatch, "/api/knowledge/items/"+id,
 			`{"content":"password=hunter2"}`)
-		assertSecretRejection(t, recorder, body)
+		assertSecretRejection(t, recorder, body, "hunter2")
 		if repo.updateCalls != 0 {
 			t.Fatalf("a rejected update wrote the item: %d", repo.updateCalls)
 		}
@@ -540,7 +709,7 @@ func TestCreateApproveRejectSecrets(t *testing.T) {
 		repo.items[9101] = secret
 
 		recorder, body := httpCall(t, mux, http.MethodPost, "/api/knowledge/items/9101/approve", "")
-		assertSecretRejection(t, recorder, body)
+		assertSecretRejection(t, recorder, body, "hunter2")
 		if stored := repo.items[9101]; stored.Status != knowledge.StatusDraft {
 			t.Fatalf("secret-bearing draft was approved: %+v", stored)
 		}

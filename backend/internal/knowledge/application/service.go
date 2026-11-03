@@ -544,10 +544,33 @@ func (s *Service) UpdateStatus(ctx context.Context, id int64, status knowledge.S
 // change when the caller supplies no reason.
 const bindingChangeDefaultReason = "page/route/account binding changed"
 
+// bindingStalePageSize is the approved-row page size of the invalidation scan
+// (the frozen list maximum).
+const bindingStalePageSize = MaxListLimit
+
+// bindingStaleMaxPages bounds one invalidation pass so a corrupt/ignored cursor
+// can never make it unbounded: at most 1000 pages × 100 rows = 100k approved
+// rows per pass. The pass reports what it actually scanned and wrote.
+const bindingStaleMaxPages = 1000
+
+// BindingInvalidation is the outcome of one MarkBindingsStale pass. Scanned
+// counts the approved rows read, Matched the rows whose bindings named the
+// change, Marked the rows actually moved to stale, and Failed the matched rows
+// whose CAS write lost a race or failed. A run with Matched > 0 and Marked == 0
+// is an all-failed pass, distinguishable from a no-match pass; the caller
+// decides whether to log or retry it.
+type BindingInvalidation struct {
+	Scanned int
+	Matched int
+	Marked  int
+	Failed  int
+}
+
 // BindingChange is one page/route/account invalidation signal (spec §10.1): the
 // structured binding values that changed. Every non-empty dimension is matched
 // against the stored knowledge bindings; an item bound to any of them becomes
-// stale. SystemIDs/EnvironmentIDs scope a SUT/environment move.
+// stale, unless it names a different system/environment than the change (see
+// matchesBindingChange). SystemIDs/EnvironmentIDs scope a SUT/environment move.
 type BindingChange struct {
 	SystemIDs      []int64
 	EnvironmentIDs []int64
@@ -601,50 +624,76 @@ func (s *Service) MarkSuspect(ctx context.Context, id int64, reason string) (kno
 
 // MarkBindingsStale invalidates the approved knowledge verified against a
 // changed page route or account role (spec §10.1 "页面/路由/账号变更 → stale").
-// It scans one bounded approved window (MaxListLimit) and applies the same CAS
-// status write as UpdateStatus; a concurrent/lost write is skipped so one
-// racing item can never abort the invalidation pass. It returns the number of
-// items actually moved to stale. Knowledge.Read keeps stale items readable (the
-// diagnosis path); Inject and Retrieve stop injecting them.
-func (s *Service) MarkBindingsStale(ctx context.Context, change BindingChange) (int, error) {
+// It walks every approved page with the id-desc BeforeID cursor (not just the
+// newest MaxListLimit window) and applies the same CAS status write as
+// UpdateStatus. A per-item failure is counted and skipped so one racing item can
+// never abort the pass; the returned BindingInvalidation lets the caller tell a
+// no-match pass from an all-CAS-failure pass. Knowledge.Read keeps stale items
+// readable (the diagnosis path); Inject and Retrieve stop injecting them.
+func (s *Service) MarkBindingsStale(ctx context.Context, change BindingChange) (BindingInvalidation, error) {
 	if err := s.requireRepo(); err != nil {
-		return 0, err
+		return BindingInvalidation{}, err
 	}
 	change = normalizeBindingChange(change)
 	if len(change.SystemIDs) == 0 && len(change.EnvironmentIDs) == 0 &&
 		len(change.PageKeys) == 0 && len(change.AccountRoles) == 0 {
-		return 0, platform.Invalid("change", "must name at least one changed page key, account role, system or environment")
+		return BindingInvalidation{}, platform.Invalid("change", "must name at least one changed page key, account role, system or environment")
 	}
 	reason := strings.TrimSpace(change.Reason)
 	if reason == "" {
 		reason = bindingChangeDefaultReason
-	}
-	items, err := s.repo.List(ctx, knowledge.Filter{
-		Status: knowledge.StatusApproved,
-		Limit:  MaxListLimit,
-	})
-	if err != nil {
-		return 0, err
+	} else {
+		// Same validation as UpdateStatus: an overlong reason is a caller error,
+		// not a truncated write.
+		normalized, err := knowledge.ValidateReason(reason)
+		if err != nil {
+			return BindingInvalidation{}, err
+		}
+		reason = normalized
 	}
 
+	result := BindingInvalidation{}
 	now := s.now()
-	marked := 0
-	for _, item := range items {
-		if item.Status != knowledge.StatusApproved || !matchesBindingChange(item.Bindings, change) {
-			continue
+	cursor := int64(0)
+	for page := 0; page < bindingStaleMaxPages; page++ {
+		items, err := s.repo.List(ctx, knowledge.Filter{
+			Status:   knowledge.StatusApproved,
+			BeforeID: cursor,
+			Limit:    bindingStalePageSize,
+		})
+		if err != nil {
+			return result, err
 		}
-		stale := item
-		stale.Status = knowledge.StatusStale
-		stale.ReviewReason = &reason
-		stale.UpdatedAt = now
-		if err := s.repo.UpdateStatus(ctx, stale, knowledge.StatusApproved); err != nil {
-			// Best effort: a concurrent transition or a transient write failure
-			// must not stop the other invalidations.
-			continue
+		for _, item := range items {
+			result.Scanned++
+			if item.Status != knowledge.StatusApproved || !matchesBindingChange(item.Bindings, change) {
+				continue
+			}
+			result.Matched++
+			stale := item
+			stale.Status = knowledge.StatusStale
+			stale.ReviewReason = &reason
+			stale.UpdatedAt = now
+			if err := s.repo.UpdateStatus(ctx, stale, knowledge.StatusApproved); err != nil {
+				// Best effort: a concurrent transition or a transient write
+				// failure must not stop the other invalidations.
+				result.Failed++
+				continue
+			}
+			result.Marked++
 		}
-		marked++
+		if len(items) < bindingStalePageSize {
+			break
+		}
+		next := items[len(items)-1].ID
+		if next <= 0 || (cursor > 0 && next >= cursor) {
+			// A repository that ignores BeforeID/order cannot be paged safely;
+			// stop instead of rescanning the same rows.
+			break
+		}
+		cursor = next
 	}
-	return marked, nil
+	return result, nil
 }
 
 // Revisions returns the append-only content history of one item.
@@ -853,23 +902,11 @@ func (s *Service) decorateItemStale(ctx context.Context, item *knowledge.Item) {
 	*item = items[0]
 }
 
-// itemStale reports whether an item's source version no longer exists. A nil
-// source reader or a failing lookup means "not stale": staleness must never be
-// inferred from an unavailable dependency.
-func (s *Service) itemStale(ctx context.Context, item knowledge.Item) bool {
-	if s.sources == nil || item.SourceVersionID == nil {
-		return false
-	}
-	exists, err := s.sources.SourceVersionExists(ctx, *item.SourceVersionID)
-	if err != nil {
-		return false
-	}
-	return !exists
-}
-
 // sourceStaleCached is the shared source-staleness check of the injection and
-// retrieval paths (R87): it proves each distinct source version once per read
-// and applies the same fail-open error policy as itemStale.
+// retrieval paths (R87): it proves each distinct source version once per read.
+// A nil source reader or a failing lookup means "not stale": staleness must
+// never be inferred from an unavailable dependency (fail-open, matching the
+// read-time source_stale marker).
 func (s *Service) sourceStaleCached(ctx context.Context, item knowledge.Item, cache map[int64]bool) bool {
 	if s.sources == nil || item.SourceVersionID == nil {
 		return false
@@ -1067,7 +1104,24 @@ func normalizeTexts(values []string) []string {
 
 // matchesBindingChange reports whether an item's stored bindings name any of
 // the changed page/route/account/system/environment values.
+//
+// A change that names SUT/environment IDs is scoped to those identifiers: an
+// item explicitly bound to a different system or environment is never
+// invalidated by a same-named route or role from another SUT. An item that
+// leaves the dimension unset cannot be proven unrelated (the caller supplies no
+// page→system ownership), so another matching dimension still invalidates it.
+// This is deliberately conservative in the invalidation direction: a wrongly
+// stale item stops injecting (safe) while a wrongly approved one would keep
+// feeding a changed surface.
 func matchesBindingChange(bindings knowledge.Bindings, change BindingChange) bool {
+	if bindings.SystemID != nil && len(change.SystemIDs) > 0 &&
+		!containsID(change.SystemIDs, *bindings.SystemID) {
+		return false
+	}
+	if bindings.EnvironmentID != nil && len(change.EnvironmentIDs) > 0 &&
+		!containsID(change.EnvironmentIDs, *bindings.EnvironmentID) {
+		return false
+	}
 	if bindings.SystemID != nil && containsID(change.SystemIDs, *bindings.SystemID) {
 		return true
 	}
