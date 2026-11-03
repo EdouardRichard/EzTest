@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { expect, type Page, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 /**
  * P6 browser E2E against the real API/DB cloned from the P4 acceptance dataset.
  * No fake LLM or fake executor is used: every page reads the real read models,
@@ -10,15 +12,14 @@ import { expect, type Page, test } from "@playwright/test"
  *
  * The version id is discovered through the real API after an admin login instead
  * of hardcoding a dataset-specific snowflake; `EZTEST_E2E_P6_VERSION_ID` stays
- * available as an explicit override. The admin and normal-user credentials are
- * configurable too (defaults keep the documented acceptance accounts).
+ * available as an explicit override. The admin credentials come from the shared
+ * environment-only helper (no built-in password); the normal-user credentials
+ * stay configurable with defaults for the documented acceptance accounts.
  */
 const API_BASE_URL = (process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:13333").replace(
   /\/+$/,
   "",
 )
-const ADMIN_USERNAME = process.env.EZTEST_E2E_ADMIN_USERNAME?.trim() || "admin"
-const ADMIN_PASSWORD = process.env.EZTEST_E2E_ADMIN_PASSWORD?.trim() || "admin123"
 const USER_USERNAME = process.env.EZTEST_E2E_P6_USER_USERNAME?.trim() || "p6user"
 const USER_PASSWORD = process.env.EZTEST_E2E_P6_USER_PASSWORD?.trim() || "p6user12345"
 const SCREENSHOT_DIR =

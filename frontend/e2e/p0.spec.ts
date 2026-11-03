@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { expect, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 const API = process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:13333"
 const suffix = `${Date.now()}-${Math.floor(Math.random() * 1000)}`
 const sutName = `E2E 订单中心 ${suffix}`
@@ -42,8 +44,8 @@ async function api<T>(
 
 test.beforeAll(async ({ request }) => {
   const login = await api<{ data: { token: string } }>(request, "POST", "/api/auth/login", {
-    username: "admin",
-    password: "admin123",
+    username: ADMIN_USERNAME,
+    password: ADMIN_PASSWORD,
   })
   token = login.data.token
 
@@ -153,10 +155,12 @@ test("P0 admin journey: login, versions, detail, resources, settings", async ({ 
   page.on("pageerror", (error) => pageErrors.push(String(error)))
 
   await page.goto("/login")
-  await expect(page.getByText("首次启动默认 admin / admin123")).toBeVisible()
+  await expect(page.getByText("初始管理员密码")).toBeVisible()
+  await expect(page.getByText(/EZTEST_INITIAL_ADMIN_PASSWORD/)).toBeVisible()
+  await expect(page.getByText("admin123")).toHaveCount(0)
 
-  await page.fill("#username", "admin")
-  await page.fill("#password", "admin123")
+  await page.fill("#username", ADMIN_USERNAME)
+  await page.fill("#password", ADMIN_PASSWORD)
   await page.getByRole("button", { name: "登录" }).click()
   await page.waitForURL("**/versions")
 

@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { type APIRequestContext, expect, type Page, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 /**
  * P5 browser E2E (real API/DB/executor/fixture, real LLM + real Chrome).
  *
@@ -121,7 +123,11 @@ function screenshotPath(name: string): string {
   return path.join(SCREENSHOT_DIR, `p5-${String(screenshotIndex).padStart(2, "0")}-${name}.png`)
 }
 
-async function loginUI(page: Page, username = "admin", password = "admin123"): Promise<void> {
+async function loginUI(
+  page: Page,
+  username = ADMIN_USERNAME,
+  password = ADMIN_PASSWORD,
+): Promise<void> {
   await page.goto("/login")
   await page.fill("#username", username)
   await page.fill("#password", password)
@@ -202,7 +208,7 @@ test.beforeAll(async ({ request }) => {
   })) {
     if (value === "") throw new Error(`${name} is unset; run scripts/p5-e2e.ps1 (real stack)`)
   }
-  adminToken = await loginApi(request, "admin", "admin123")
+  adminToken = await loginApi(request, ADMIN_USERNAME, ADMIN_PASSWORD)
   userToken = await loginApi(request, "p5user", "p5-user-pass-123")
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true })
 })

@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { expect, type Locator, type Page, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 /**
  * P8 S12 browser E2E: the full journey key pages plus the global centres on the
  * real API/DB and the installed Chrome channel.
@@ -29,8 +31,6 @@ const API_BASE_URL = (process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.
   /\/+$/,
   "",
 )
-const ADMIN_USERNAME = process.env.EZTEST_E2E_ADMIN_USERNAME?.trim() || "admin"
-const ADMIN_PASSWORD = process.env.EZTEST_E2E_ADMIN_PASSWORD?.trim() || "admin123"
 const SCREENSHOT_DIR =
   process.env.EZTEST_E2E_P8_SCREENSHOT_DIR?.trim() ||
   path.resolve(process.cwd(), "..", ".tmp", "p8-e2e", "screenshots")
