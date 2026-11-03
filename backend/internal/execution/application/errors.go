@@ -8,10 +8,15 @@ import (
 )
 
 // ErrNoPersistedBatchSelection is the typed skip of the startup/leader repair
-// scan: the version has no persisted execute.batch selection (the stage-entry
-// work item was never enqueued, or an older row predates the contract). The
-// scan creates no initial intent instead of widening to every confirmed case;
-// R49 stage-entry recovery re-enqueues the scoped execute.batch job.
+// scan: no 0.2.1 execute.batch work item has been persisted for the version, so
+// there is no selection to refresh. The scan creates no initial intent instead
+// of widening to every confirmed case. An existing execute.batch row whose
+// inputs object omits case_ids is not this skip: it decodes as the contract's
+// empty selection ("all current confirmed cases"). A legacy 0.2.0 row (empty
+// kind, type only) carries no 0.2.1 selection, so it is this skip too. A lost
+// stage-entry job is only repaired by R49 when a persisted selection exists
+// (R49 re-enqueues that selection or skips); R49 scans running versions only, so
+// it never repairs or reopens a completed version either.
 var ErrNoPersistedBatchSelection = errors.New("execution: no persisted execute.batch selection")
 
 // mapExecutionError maps repository/domain sentinel errors onto the stable API

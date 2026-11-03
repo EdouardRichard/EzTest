@@ -758,6 +758,33 @@ func (f *fakeStageJobs) recorded() []versionapp.StageJob {
 	return append([]versionapp.StageJob(nil), f.jobs...)
 }
 
+// fakeStageSelection is the persisted execute.batch selection R49 must preserve
+// when it re-enqueues a lost job. found=false models a version whose
+// execute.batch work item was never persisted, so no selection exists.
+type fakeStageSelection struct {
+	mu      sync.Mutex
+	caseIDs []int64
+	found   bool
+	err     error
+	calls   []int64
+}
+
+func (f *fakeStageSelection) ExecuteBatchSelection(_ context.Context, versionID int64) ([]int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, versionID)
+	if f.err != nil {
+		return nil, false, f.err
+	}
+	return append([]int64(nil), f.caseIDs...), f.found, nil
+}
+
+func (f *fakeStageSelection) queried() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.calls...)
+}
+
 func (e *fakeEnsurer) itemsOfType(versionID int64, workType string) []agent.WorkItem {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -855,14 +882,17 @@ func TestGateClosedPassRearms(t *testing.T) {
 // test for resume/reject visits). The catalog mapping mirrors the stage machine.
 func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 	cases := []struct {
-		name     string
-		stage    version.Stage
-		reason   string
-		wantKind string
+		name        string
+		stage       version.Stage
+		reason      string
+		wantKind    string
+		wantCaseIDs []int64
+		selection   *fakeStageSelection
 	}{
-		{"designing gate confirmed", version.StageDesigning, "requirement_confirmed", versionapp.StageJobDesignCases},
-		{"executing gate confirmed", version.StageExecuting, "cases_confirmed", versionapp.StageJobExecuteBatch},
-		{"reporting wave terminal", version.StageReporting, "wave_terminal", versionapp.StageJobReportVersion},
+		{"designing gate confirmed", version.StageDesigning, "requirement_confirmed", versionapp.StageJobDesignCases, nil, nil},
+		{"executing gate confirmed", version.StageExecuting, "cases_confirmed", versionapp.StageJobExecuteBatch,
+			[]int64{7, 8}, &fakeStageSelection{caseIDs: []int64{7, 8}, found: true}},
+		{"reporting wave terminal", version.StageReporting, "wave_terminal", versionapp.StageJobReportVersion, nil, nil},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -875,10 +905,11 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 				Stages: &fakeStageReader{states: map[int64]version.StageState{
 					10: {VersionID: 10, Stage: testCase.stage},
 				}},
-				StageJobs:        jobs,
-				StageJobPresence: queue,
-				StageTransitions: &fakeStageTransitions{reasons: map[int64]string{10: testCase.reason}},
-				Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+				StageJobs:         jobs,
+				StageJobPresence:  queue,
+				StageJobSelection: testCase.selection,
+				StageTransitions:  &fakeStageTransitions{reasons: map[int64]string{10: testCase.reason}},
+				Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
 			for pass := 0; pass < 2; pass++ {
 				if err := reconciler.Reconcile(context.Background()); err != nil {
@@ -891,6 +922,9 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 			}
 			if recorded[0].VersionID != 10 || recorded[0].Kind != testCase.wantKind {
 				t.Fatalf("re-enqueued job = %#v, want version 10 %s", recorded[0], testCase.wantKind)
+			}
+			if !slices.Equal(recorded[0].CaseIDs, testCase.wantCaseIDs) {
+				t.Fatalf("re-enqueued case_ids = %v, want %v", recorded[0].CaseIDs, testCase.wantCaseIDs)
 			}
 			if items := queue.itemsOfType(10, testCase.wantKind); len(items) != 1 {
 				t.Fatalf("%s items = %#v, want one", testCase.wantKind, items)
@@ -974,6 +1008,105 @@ func TestReconcilerRepairsMissingStageJob(t *testing.T) {
 			t.Fatalf("stage jobs = %#v, want none for a stage without an entry job", recorded)
 		}
 	})
+}
+
+// TestReconcileRepairsExecuteBatchWithPersistedSelection pins R49 selection
+// preservation: a lost execute.batch stage-entry job must be re-enqueued with
+// the case_ids already persisted for the version. Re-enqueueing the canonical
+// empty StageJob would dispatch a fresh {} "all cases" work item, become the
+// newest execute.batch row, and let the startup/leader repair scan widen a
+// partial D23 selection to every confirmed case.
+func TestReconcileRepairsExecuteBatchWithPersistedSelection(t *testing.T) {
+	enteredAt := time.Now().Add(-time.Minute)
+	queue := &fakeEnsurer{}
+	selection := &fakeStageSelection{caseIDs: []int64{501, 502}, found: true}
+	jobs := &fakeStageJobs{queue: queue}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions:        &fakeProjector{},
+		Queue:           queue,
+		RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+		Stages: &fakeStageReader{states: map[int64]version.StageState{
+			10: {VersionID: 10, Stage: version.StageExecuting, StageEnteredAt: enteredAt},
+		}},
+		StageJobs:         jobs,
+		StageJobPresence:  queue,
+		StageJobSelection: selection,
+		StageTransitions:  &fakeStageTransitions{reasons: map[int64]string{10: "cases_confirmed"}},
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for pass := 0; pass < 2; pass++ {
+		if err := reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile pass %d: %v", pass, err)
+		}
+	}
+	recorded := jobs.recorded()
+	if len(recorded) != 1 {
+		t.Fatalf("stage jobs = %#v, want exactly one execute.batch re-enqueue", recorded)
+	}
+	if recorded[0].Kind != versionapp.StageJobExecuteBatch {
+		t.Fatalf("re-enqueued kind = %q, want %q", recorded[0].Kind, versionapp.StageJobExecuteBatch)
+	}
+	if !slices.Equal(recorded[0].CaseIDs, []int64{501, 502}) {
+		t.Fatalf("re-enqueued case_ids = %v, want the persisted selection [501 502]", recorded[0].CaseIDs)
+	}
+	if queried := selection.queried(); len(queried) != 1 || queried[0] != 10 {
+		t.Fatalf("execute.batch selection queries = %v, want [10]", queried)
+	}
+}
+
+// TestReconcileSkipsExecuteBatchWithoutPersistedSelection pins the R49 typed
+// skip: with no persisted execute.batch selection there is no safe batch scope,
+// so recovery must not enqueue the canonical empty job. Doing so would create a
+// fresh {} "all cases" row and the startup/leader repair scan would widen the
+// batch to every current confirmed case. A degraded assembly without the
+// selection reader follows the same skip, a selection read error fails the rule
+// without enqueueing anything, and R49 still repairs the other stage-entry
+// kinds.
+func TestReconcileSkipsExecuteBatchWithoutPersistedSelection(t *testing.T) {
+	cases := []struct {
+		name      string
+		selection agentapp.StageJobSelectionReader
+		wantErr   bool
+	}{
+		{"no persisted execute.batch row", &fakeStageSelection{found: false}, false},
+		{"no selection reader", nil, false},
+		{"selection read error", &fakeStageSelection{err: errors.New("selection store unavailable")}, true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			enteredAt := time.Now().Add(-time.Minute)
+			queue := &fakeEnsurer{}
+			jobs := &fakeStageJobs{queue: queue}
+			reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+				Versions:        &fakeProjector{},
+				Queue:           queue,
+				RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+				Stages: &fakeStageReader{states: map[int64]version.StageState{
+					10: {VersionID: 10, Stage: version.StageExecuting, StageEnteredAt: enteredAt},
+				}},
+				StageJobs:         jobs,
+				StageJobPresence:  queue,
+				StageJobSelection: testCase.selection,
+				StageTransitions:  &fakeStageTransitions{reasons: map[int64]string{10: "cases_confirmed"}},
+				Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			for pass := 0; pass < 2; pass++ {
+				err := reconciler.Reconcile(context.Background())
+				if testCase.wantErr && err == nil {
+					t.Fatalf("Reconcile pass %d swallowed the selection read error", pass)
+				}
+				if !testCase.wantErr && err != nil {
+					t.Fatalf("Reconcile pass %d: %v", pass, err)
+				}
+			}
+			if recorded := jobs.recorded(); len(recorded) != 0 {
+				t.Fatalf("stage jobs = %#v, want none without a usable persisted selection", recorded)
+			}
+			if items := queue.itemsOfType(10, versionapp.StageJobExecuteBatch); len(items) != 0 {
+				t.Fatalf("execute.batch items = %#v, want none without a usable persisted selection", items)
+			}
+		})
+	}
 }
 
 // TestReconcileIgnoresPreStageJobs pins the R49 creation floor: a job of the
@@ -1172,6 +1305,7 @@ func TestReconcileDoesNotRepairNoJobReEntries(t *testing.T) {
 
 var _ agentapp.VersionStageReader = (*fakeStageReader)(nil)
 var _ agentapp.StageTransitionReader = (*fakeStageTransitions)(nil)
+var _ agentapp.StageJobSelectionReader = (*fakeStageSelection)(nil)
 var _ versionapp.StageJobEnqueuer = (*fakeStageJobs)(nil)
 
 var _ agentapp.VersionProjector = (*fakeProjector)(nil)

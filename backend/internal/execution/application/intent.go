@@ -58,8 +58,12 @@ func NewIntentService(deps IntentServiceDeps) *IntentService {
 
 // Initial execution intents only belong to the executing stage (Task 78): a
 // case version that was merely confirmed at the case hard gate is not yet
-// executable, and confirming it must never auto-create a wave. A completed
-// version keeps the P3 §5.9 reopen-on-environment-change semantics.
+// executable, and confirming it must never auto-create a wave. A version whose
+// stage projection is completed keeps the P3 §5.9 reopen semantics: creating an
+// intent while its status is still completed reopens it. Only the
+// startup/leader scan's version list (the newest versions regardless of status,
+// so completed ones can be included) reaches that branch; R49 scans running
+// versions only and never repairs or reopens a completed version.
 const (
 	intentExecutableStage = "executing"
 	intentCompletedStage  = "completed"
@@ -71,18 +75,27 @@ const (
 // previously confirmed but unselected cases must not silently enter a wave. ids
 // are unique on (case_version, fingerprint, baseline, purpose=initial), so a
 // repeated scan, confirmation or API restart never duplicates an intent
-// (P3-D-08). A completed version is reopened first (P3 §5.9), again within the
-// persisted selection.
+// (P3-D-08). For a version whose stage projection is completed, the scan
+// refreshes only the persisted selection and, while its status is still
+// completed, reopens the version when it creates the first new initial intent
+// (P3 §5.9).
 //
 // The scan is stage-gated: before the case hard gate (case_review and earlier)
 // a confirmed case is not executable yet, so the scan returns without creating
-// intents and no wave can be planned. When the version has no persisted
-// execute.batch selection (the stage-entry job was never enqueued, e.g. the
-// dispatch crashed before the work item was written), the scan returns
-// ErrNoPersistedBatchSelection and creates nothing: R49 stage-entry recovery
-// re-enqueues the scoped execute.batch job, which performs the explicit
-// selection refresh instead. An empty persisted selection keeps its contract
-// meaning ("all current confirmed cases").
+// intents and no wave can be planned.
+//
+// The selection has exactly one durable source: the case_ids frozen on the
+// execute.batch work item. When no execute.batch work item exists, the scan
+// returns ErrNoPersistedBatchSelection and creates nothing. It never falls back
+// to every confirmed case, and R49 cannot silently recreate the scope: R49
+// re-enqueues a lost execute.batch job only with the persisted selection (which
+// reuses the original idempotency key), and with none it skips as well. A
+// version whose selection was lost therefore stays a typed skip until an
+// explicit execute.batch job exists. An existing row whose inputs object omits
+// case_ids is not this skip: it is the contract's "all current confirmed cases"
+// selection. With multiple execute.batch rows (multi-batch/reopen), the newest
+// persisted selection is the scope, which is the previous batch when a later
+// enqueue never persisted.
 func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int64) (int, error) {
 	return s.ensureInitialIntents(ctx, versionID, nil, false, true)
 }
@@ -118,7 +131,9 @@ func normalizeIntentCaseSelection(caseIDs []int64) (map[int64]struct{}, error) {
 // persistedBatchSelection reads the execute.batch case_ids frozen on the
 // stage-entry work item. A nil reader (degraded assembly) is the same typed skip
 // as a missing row: the repair scan must never widen to every confirmed case.
-// A repository failure is real and is surfaced instead of silently skipping.
+// An existing row without a case_ids field is the contract-empty selection
+// ("all current confirmed cases"), not a skip. A repository failure is real and
+// is surfaced instead of silently skipping.
 func (s *IntentService) persistedBatchSelection(ctx context.Context, versionID int64) ([]int64, bool, error) {
 	if s.batches == nil {
 		return nil, false, nil
@@ -162,8 +177,9 @@ func (s *IntentService) ensureInitialIntents(
 			return 0, err
 		}
 		if !found {
-			// Typed skip: never fall back to every confirmed case. The R49
-			// stage-entry recovery re-enqueues the scoped execute.batch job.
+			// Typed skip: never fall back to every confirmed case. R49 also
+			// skips this repair (it re-enqueues only a persisted selection),
+			// so no other path can recreate an unscoped batch.
 			return 0, fmt.Errorf("%w: version %d", ErrNoPersistedBatchSelection, versionID)
 		}
 		if selection, err = normalizeIntentCaseSelection(persisted); err != nil {

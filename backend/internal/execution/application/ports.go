@@ -28,7 +28,9 @@ type SettingsReader interface {
 // the composition-root adapter projects the newest execute.batch item. found
 // distinguishes "no persisted selection" (typed repair skip) from an explicit
 // empty selection, which keeps the contract's "all current confirmed cases"
-// meaning.
+// meaning. The agent reconciler's R49 recovery reads the same projection so a
+// lost execute.batch job is re-enqueued with the persisted selection, never
+// with a bare {} "all cases" target.
 type BatchSelectionReader interface {
 	ExecuteBatchSelection(ctx context.Context, versionID int64) (caseIDs []int64, found bool, err error)
 }

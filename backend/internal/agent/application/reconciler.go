@@ -48,6 +48,22 @@ type StageJobPresence interface {
 	HasWorkItemKindSince(ctx context.Context, versionID int64, kind string, since time.Time) (bool, error)
 }
 
+// StageJobSelectionReader reads the case selection persisted on the newest
+// execute.batch work item of a version (the same projection the execution
+// repair scan uses). R49 re-enqueues a lost execute.batch job with this
+// selection so the dispatch reuses the original idempotency key instead of
+// creating a fresh {} "all cases" row that would widen the repair scan.
+// *agentpg.WorkItemRepository satisfies it. found=false, a nil reader and a
+// read error all mean "no scope to recover": R49 must skip the execute.batch
+// repair rather than enqueue an unscoped job. Nil disables only the
+// execute.batch repair; design.cases and report.version recover unchanged.
+// With multiple execute.batch rows (multi-batch/reopen) the newest persisted
+// selection is the source; when a later enqueue never persisted that is the
+// previous batch's scope, never "all cases".
+type StageJobSelectionReader interface {
+	ExecuteBatchSelection(ctx context.Context, versionID int64) (caseIDs []int64, found bool, err error)
+}
+
 // StageTransitionReader answers R49's "why was the current stage visit
 // entered?" question from the version's persisted stage transition record. It
 // is read-only: the reason decides whether the visit owns a stage-entry job at
@@ -112,6 +128,10 @@ type ReconcilerDeps struct {
 	// is queried by kind and created_at floor, never by a bounded page.
 	// *agentpg.WorkItemRepository satisfies it; nil disables the rule.
 	StageJobPresence StageJobPresence
+	// StageJobSelection preserves the persisted execute.batch case selection
+	// through R49 recovery (D23). *agentpg.WorkItemRepository satisfies it;
+	// nil degrades to the execute.batch typed skip.
+	StageJobSelection StageJobSelectionReader
 	// StageTransitions tells R49 whether the current stage visit was created by
 	// a transition that owns the stage-entry job. eventingpg.StageTransitionReader
 	// satisfies it; nil disables the rule.
@@ -147,6 +167,7 @@ type Reconciler struct {
 	stageJobs        versionapp.StageJobEnqueuer
 	stageJobLookup   StageJobPresence
 	stageTransitions StageTransitionReader
+	stageJobBatches  StageJobSelectionReader
 	events           eventingapp.Publisher
 	clock            clock.Clock
 	logger           *slog.Logger
@@ -189,6 +210,7 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		stageJobs:        deps.StageJobs,
 		stageJobLookup:   deps.StageJobPresence,
 		stageTransitions: deps.StageTransitions,
+		stageJobBatches:  deps.StageJobSelection,
 		events:           deps.Events,
 		clock:            deps.Clock,
 		logger:           logger,
@@ -361,6 +383,20 @@ func (r *Reconciler) runPass(ctx context.Context, shouldRun func() bool) bool {
 // kind+floor alone would dispatch the empty-target job and insert a duplicate
 // work item next to the earlier partial selection. The persisted transition
 // reason is therefore checked before the presence query.
+//
+// The rule scans running versions only (ListRunningVersions excludes completed
+// versions), so it never repairs or reopens a completed version. The execution
+// repair scan's completed-stage branch is reached by the startup/leader full
+// scan, not by R49.
+//
+// execute.batch is the one kind whose re-enqueue must preserve a persisted
+// selection: a bare StageJob{VersionID, Kind} renders as {} ("all cases") and
+// the new row would become the newest execute.batch item, so the execution
+// repair scan would widen a partial D23 batch to every confirmed case. R49
+// therefore re-enqueues the case_ids already persisted for the version, which
+// reuses the original idempotency key; when no selection was ever persisted
+// there is no safe scope and the repair is skipped (the execution repair scan
+// keeps its typed skip as well).
 func (r *Reconciler) reconcileStageJobs(ctx context.Context) error {
 	if r.stageJobs == nil || r.stages == nil || r.runningVersions == nil ||
 		r.stageJobLookup == nil || r.stageTransitions == nil {
@@ -409,14 +445,43 @@ func (r *Reconciler) reconcileStageJobs(ctx context.Context) error {
 		if !missing {
 			continue
 		}
-		if err := r.stageJobs.EnqueueStageJob(ctx, versionapp.StageJob{
-			VersionID: versionID,
-			Kind:      kind,
-		}); err != nil {
+		job := versionapp.StageJob{VersionID: versionID, Kind: kind}
+		if kind == versionapp.StageJobExecuteBatch {
+			caseIDs, recoverable, err := r.executeBatchRecoverySelection(ctx, versionID)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if !recoverable {
+				// Typed skip: enqueueing the canonical empty job would replace
+				// the unknown batch scope with "all current confirmed cases".
+				r.logger.Warn("agent reconciler: execute.batch stage-entry job is missing and no persisted selection exists; not re-enqueueing",
+					"version_id", versionID)
+				continue
+			}
+			job.CaseIDs = caseIDs
+		}
+		if err := r.stageJobs.EnqueueStageJob(ctx, job); err != nil {
 			errs = append(errs, fmt.Errorf("re-enqueue %s for version %d: %w", kind, versionID, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// executeBatchRecoverySelection reads the persisted execute.batch selection R49
+// must put back on a lost job. recoverable=false means the version has no
+// persisted execute.batch selection (or the assembly has no selection reader):
+// there is no safe scope, so the caller skips the repair instead of dispatching
+// an empty "all cases" job.
+func (r *Reconciler) executeBatchRecoverySelection(ctx context.Context, versionID int64) ([]int64, bool, error) {
+	if r.stageJobBatches == nil {
+		return nil, false, nil
+	}
+	caseIDs, found, err := r.stageJobBatches.ExecuteBatchSelection(ctx, versionID)
+	if err != nil {
+		return nil, false, fmt.Errorf("read persisted execute.batch selection for version %d: %w", versionID, err)
+	}
+	return caseIDs, found, nil
 }
 
 // stageEntryJobKind maps the stage to the entry job the stage machine owns

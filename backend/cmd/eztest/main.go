@@ -740,13 +740,19 @@ func parseCaseBindingID(value string) int64 {
 // create initial intents, so a case confirmation at the case gate can never
 // auto-create a wave. Since Task 82 it is also selection-scoped (D23): the scan
 // refreshes only the case_ids frozen on the persisted execute.batch stage-entry
-// job, and a version without that persisted selection is a typed skip (the R49
-// stage-entry recovery re-enqueues the scoped job). A positive scanInterval
-// restores the old periodic full scan as a compatibility switch until P10
-// acceptance. The scan is idempotent (P3 §5.1). Errors are logged and retried;
-// the loop exits with the process context. The whole tick is leader-gated
-// (P7 §4.5: scheduler+recovery run on the leader only; in-flight work stays
-// protected by leases).
+// job. A version with no execute.batch work item is a typed skip: R49 can only
+// re-enqueue the job when a persisted selection exists (it re-enqueues with that
+// selection, reusing the original idempotency key); with none it also skips, so
+// nothing ever falls back to every confirmed case. The scan lists the newest
+// versions regardless of status, including completed ones, so its P3 §5.9
+// completed-stage branch reopens a completed version only within the persisted
+// selection (R49 itself scans running versions only and never reopens one). A
+// positive scanInterval restores the old periodic full scan as a compatibility
+// switch until P10 acceptance.
+// The scan is idempotent (P3 §5.1). Errors are logged and retried; the loop
+// exits with the process context. The whole tick is leader-gated (P7 §4.5:
+// scheduler+recovery run on the leader only; in-flight work stays protected by
+// leases).
 func runExecutionScheduler(
 	ctx context.Context,
 	gate orchestrationapp.LeaderGate,
@@ -767,8 +773,9 @@ func runExecutionScheduler(
 		if _, err := intents.EnsureInitialIntents(ctx, versionID); err != nil && !errors.Is(err, context.Canceled) {
 			if errors.Is(err, executionapp.ErrNoPersistedBatchSelection) {
 				// Typed skip: no persisted execute.batch selection means there is
-				// no safe scope. R49 stage-entry recovery re-enqueues the scoped
-				// job; the scan must not fall back to every confirmed case.
+				// no safe scope. R49 recovery also skips in this case (it only
+				// re-enqueues a job with the persisted selection), so the scan
+				// must not fall back to every confirmed case.
 				log.Printf("eztest: execution intent repair scan: version %d: skipped: %v", versionID, err)
 				return
 			}
@@ -1584,10 +1591,14 @@ func main() {
 		// query uses kind + stage-entered floor, not a newest-page scan, and the
 		// transition reason proves the visit was created by a transition that
 		// owns the entry job (a resume/reject re-entry must not be repaired).
-		Stages:           versionRepo,
-		StageJobs:        dispatcher,
-		StageJobPresence: workItems,
-		StageTransitions: eventingpg.NewStageTransitionReader(pool),
+		// StageJobSelection preserves the persisted execute.batch case_ids on a
+		// lost execute.batch job; with no persisted selection R49 skips that
+		// kind rather than dispatching an empty "all cases" job.
+		Stages:            versionRepo,
+		StageJobs:         dispatcher,
+		StageJobPresence:  workItems,
+		StageJobSelection: workItems,
+		StageTransitions:  eventingpg.NewStageTransitionReader(pool),
 		// The event-driven loop is the default; the env switch restores the old
 		// periodic scan until P10 acceptance.
 		PollInterval: reconcilerPollInterval(),
