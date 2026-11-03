@@ -56,6 +56,8 @@ type StaticAPIOptions struct {
 
 // StaticAPI is one statically extracted endpoint. Declared sources feed the
 // declared side of the coverage merge; api-client sources feed the used side.
+// Per-source dedupe keeps one entry per method/path, but Files records every
+// call site that produced it; File/Line identify the primary (first) site.
 type StaticAPI struct {
 	Method       string
 	PathTemplate string
@@ -63,6 +65,7 @@ type StaticAPI struct {
 	Source       string
 	File         string
 	Line         int
+	Files        []string
 	Name         string
 	Auth         string
 }
@@ -81,9 +84,9 @@ type StaticAPIExtraction struct {
 // entry point used by the explorer; the per-source parsers stay unexported so
 // there is exactly one normalization/deduplication path.
 func ExtractStaticAPIs(files []SourceFile, opts StaticAPIOptions) StaticAPIExtraction {
-	maxFiles := positiveOrDefault(opts.MaxFiles, DefaultStaticMaxFiles)
-	maxBytes := positiveOrDefault(opts.MaxFileBytes, DefaultStaticMaxFileBytes)
-	maxAPIs := positiveOrDefault(opts.MaxAPIs, DefaultStaticMaxAPIs)
+	maxFiles := boundedLimit(opts.MaxFiles, DefaultStaticMaxFiles)
+	maxBytes := boundedLimit(opts.MaxFileBytes, DefaultStaticMaxFileBytes)
+	maxAPIs := boundedLimit(opts.MaxAPIs, DefaultStaticMaxAPIs)
 
 	ordered := append([]SourceFile(nil), files...)
 	sort.SliceStable(ordered, func(i, j int) bool {
@@ -887,10 +890,14 @@ func mergeStaticAPI(destination map[string]StaticAPI, api StaticAPI) {
 	existing, ok := destination[key]
 	if !ok {
 		api.Params = uniqueSortedStrings(api.Params)
+		api.Files = uniqueSortedStrings(append(api.Files, api.File))
 		destination[key] = api
 		return
 	}
 	existing.Params = uniqueSortedStrings(append(existing.Params, api.Params...))
+	// Dedupe is per source+endpoint, not per file: every call site is kept so
+	// provenance does not silently lose the later files.
+	existing.Files = uniqueSortedStrings(append(append(existing.Files, api.Files...), api.File))
 	if existing.Auth == "" {
 		existing.Auth = api.Auth
 	}
@@ -947,11 +954,14 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func positiveOrDefault(value, fallback int) int {
-	if value > 0 {
-		return value
+// boundedLimit resolves one configured extraction limit against its hard
+// default: a non-positive value uses the default and a larger value is clamped
+// down to it, so settings can only lower a bound, never raise it.
+func boundedLimit(value, hardLimit int) int {
+	if value <= 0 || value > hardLimit {
+		return hardLimit
 	}
-	return fallback
+	return value
 }
 
 func leadingSpaces(line string) int {

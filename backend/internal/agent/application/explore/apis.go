@@ -50,7 +50,9 @@ type SourceProvider interface {
 }
 
 // APIDiscoveryConfig binds one static scan to a version SUT environment and its
-// bounds. MaxFiles/MaxFileBytes may only lower the extractor defaults.
+// bounds. MaxFiles/MaxFileBytes/MaxAPIs may only lower the hard extractor
+// defaults: a non-positive value uses the default and a larger value is clamped
+// down to it.
 type APIDiscoveryConfig struct {
 	VersionSUTID  int64
 	EnvironmentID int64
@@ -182,7 +184,12 @@ func (d *APIDiscovery) Run(ctx context.Context, versionID int64) (APIDiscoveryRe
 		return candidates[i].PathTemplate < candidates[j].PathTemplate
 	})
 
-	maxAPIs := positiveInt(d.cfg.MaxAPIs, DefaultMaxAPIs)
+	// The configured cap may only lower the hard default, matching the static
+	// extractor's hard bounds.
+	maxAPIs := d.cfg.MaxAPIs
+	if maxAPIs <= 0 || maxAPIs > DefaultMaxAPIs {
+		maxAPIs = DefaultMaxAPIs
+	}
 	if len(candidates) > maxAPIs {
 		candidates = candidates[:maxAPIs]
 		result.Truncated = true
@@ -230,9 +237,7 @@ func newAPIAggregate(method, pathTemplate string) *apiAggregate {
 
 func (a *apiAggregate) addDeclared(api codeintelapp.StaticAPI) {
 	a.declaredSources[api.Source] = true
-	if file := strings.TrimSpace(api.File); file != "" {
-		a.declaredFiles[file] = true
-	}
+	a.addFiles(a.declaredFiles, api)
 	a.addParams(api.Params)
 	if a.auth == "" {
 		a.auth = strings.TrimSpace(api.Auth)
@@ -241,12 +246,24 @@ func (a *apiAggregate) addDeclared(api codeintelapp.StaticAPI) {
 
 func (a *apiAggregate) addUsed(api codeintelapp.StaticAPI) {
 	a.usedSources[api.Source] = true
-	if file := strings.TrimSpace(api.File); file != "" {
-		a.usedFiles[file] = true
-	}
+	a.addFiles(a.usedFiles, api)
 	a.addParams(api.Params)
 	if a.auth == "" {
 		a.auth = strings.TrimSpace(api.Auth)
+	}
+}
+
+// addFiles records every file of a per-source deduplicated endpoint, falling
+// back to the primary File for callers that build a StaticAPI directly.
+func (a *apiAggregate) addFiles(target map[string]bool, api codeintelapp.StaticAPI) {
+	files := api.Files
+	if len(files) == 0 {
+		files = []string{api.File}
+	}
+	for _, file := range files {
+		if trimmed := strings.TrimSpace(file); trimmed != "" {
+			target[trimmed] = true
+		}
 	}
 }
 

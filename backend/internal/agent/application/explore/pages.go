@@ -39,6 +39,9 @@ const (
 // PageDiscoveryConfig binds one crawl to a version SUT environment and a start
 // location. StartURL is the normal crawl seed; an existing executor PageID or a
 // captured StorageStateRef can be used for an already-authenticated session.
+// PageID is caller-owned: discovery navigates it but never closes it. Without
+// PageID the first open creates the crawl page, which discovery closes best
+// effort when the executor implements PageCloser.
 // Credentials never enter this config or the produced facts.
 type PageDiscoveryConfig struct {
 	VersionSUTID       int64
@@ -56,9 +59,14 @@ type PageDiscoveryConfig struct {
 
 // PageDiscoveryDeps are the narrow ports consumed by the crawl. Facts may be
 // nil: the result is still useful to a caller that persists it elsewhere.
+// PageCloser is optional: when nil, an Executor that implements PageCloser is
+// used automatically so the crawl can release the page it opened. A closer
+// that never sees the page (no dependency and no capability) leaves it open and
+// the result reports its id for the caller to release.
 type PageDiscoveryDeps struct {
-	Executor Executor
-	Facts    FactRecorder
+	Executor   Executor
+	Facts      FactRecorder
+	PageCloser PageCloser
 }
 
 // PageElement is one interactive DOM element of a discovered page. Values are
@@ -93,9 +101,15 @@ type DiscoveredPage struct {
 	Children      []string      `json:"children"`
 }
 
-// PageDiscoveryResult is the deterministic output of one crawl.
+// PageDiscoveryResult is the deterministic output of one crawl. PageID is the
+// executor page the crawl drove that is still open for the caller to use:
+// a caller-supplied page id is echoed back (caller-owned, never closed by
+// discovery), and a page discovery opened itself appears here only when the
+// executor has no PageCloser. A created page that discovery could close is not
+// reported, so PageID never names a closed page.
 type PageDiscoveryResult struct {
 	VersionID      int64            `json:"version_id"`
+	PageID         string           `json:"page_id,omitempty"`
 	Pages          []DiscoveredPage `json:"pages"`
 	RouteTemplates []string         `json:"route_templates"`
 	Truncated      bool             `json:"truncated"`
@@ -108,11 +122,17 @@ type PageDiscovery struct {
 	cfg   PageDiscoveryConfig
 	exec  Executor
 	facts FactRecorder
+	pages PageCloser
 }
 
-// NewPageDiscovery wires one crawl.
+// NewPageDiscovery wires one crawl. The page closer defaults to the executor
+// when it implements the optional capability, mirroring LoginFlow.
 func NewPageDiscovery(cfg PageDiscoveryConfig, deps PageDiscoveryDeps) *PageDiscovery {
-	return &PageDiscovery{cfg: cfg, exec: deps.Executor, facts: deps.Facts}
+	pages := deps.PageCloser
+	if pages == nil {
+		pages, _ = deps.Executor.(PageCloser)
+	}
+	return &PageDiscovery{cfg: cfg, exec: deps.Executor, facts: deps.Facts, pages: pages}
 }
 
 type pageTarget struct {
@@ -138,8 +158,8 @@ type pageCrawlItem struct {
 // crawl seed; only configuration errors, a broken seed or a canceled context
 // fail the run. Facts are written after the crawl, so a failed run never leaves
 // partial page facts.
-func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (PageDiscoveryResult, error) {
-	result := PageDiscoveryResult{VersionID: versionID, Pages: []DiscoveredPage{}, RouteTemplates: []string{}}
+func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (result PageDiscoveryResult, err error) {
+	result = PageDiscoveryResult{VersionID: versionID, Pages: []DiscoveredPage{}, RouteTemplates: []string{}}
 	if d == nil || d.exec == nil {
 		return result, errors.New("page discovery has no executor")
 	}
@@ -156,6 +176,26 @@ func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (PageDiscovery
 	cfg.MaxLinksPerPage = positiveInt(cfg.MaxLinksPerPage, DefaultMaxLinksPerPage)
 	cfg.MaxElementsPerPage = positiveInt(cfg.MaxElementsPerPage, DefaultMaxElementsPerPage)
 
+	// Page ownership: a caller-supplied page belongs to the caller and is never
+	// closed here. A page this crawl opened is released best effort once the
+	// crawl is over (including early error exits), so repeated StartURL runs
+	// cannot creep toward the executor's fixed 8-page cap. When no closer is
+	// available the created page id is reported instead, so the caller can
+	// release it.
+	callerPageID := strings.TrimSpace(cfg.PageID)
+	result.PageID = callerPageID
+	createdPageID := ""
+	defer func() {
+		if createdPageID == "" {
+			return
+		}
+		if d.pages != nil {
+			d.closePageBestEffort(ctx, createdPageID)
+			return
+		}
+		result.PageID = createdPageID
+	}()
+
 	queue, allowedHosts, err := d.seedQueue(ctx, cfg)
 	if err != nil {
 		return result, err
@@ -171,9 +211,8 @@ func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (PageDiscovery
 	}
 
 	// The executor caps a runtime at 8 open pages, so the crawl navigates one
-	// dedicated page instead of opening a page per URL. A caller-supplied page
-	// belongs to the caller and is never closed here.
-	activePageID := strings.TrimSpace(cfg.PageID)
+	// dedicated page instead of opening a page per URL.
+	activePageID := callerPageID
 	pages := make([]DiscoveredPage, 0, cfg.MaxPages)
 	for len(queue) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -186,6 +225,7 @@ func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (PageDiscovery
 		item := queue[0]
 		queue = queue[1:]
 		item.pageID = activePageID
+		creatingPage := activePageID == ""
 
 		snapshot, openErr := d.openPage(ctx, cfg, item, allowedHosts)
 		if openErr != nil {
@@ -196,6 +236,9 @@ func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (PageDiscovery
 			continue
 		}
 		if pageID := strings.TrimSpace(snapshot.PageID); pageID != "" {
+			if creatingPage && createdPageID == "" {
+				createdPageID = pageID
+			}
 			activePageID = pageID
 		}
 		finalTarget, targetErr := pageTargetFromSnapshot(snapshot, item.target)
@@ -456,6 +499,22 @@ func (d *PageDiscovery) snapshotPage(ctx context.Context, pageID string) (discov
 	return decodeDiscoverySnapshot(result)
 }
 
+// closePageBestEffort releases exactly one page this crawl created. Cleanup is
+// best effort: close failures are ignored because the discovery result is
+// already complete, and a canceled run still detaches the cleanup context so it
+// has a chance to release the page instead of leaking it. It never closes
+// unpaginated (that would abort concurrent pages on the shared executor).
+func (d *PageDiscovery) closePageBestEffort(ctx context.Context, pageID string) {
+	if d == nil || d.pages == nil {
+		return
+	}
+	pageID = strings.TrimSpace(pageID)
+	if pageID == "" {
+		return
+	}
+	_ = d.pages.ClosePage(context.WithoutCancel(ctx), pageID)
+}
+
 // pageTargetFromSnapshot follows an executor redirect: the final DOM URL wins
 // over the requested URL when it is a usable http(s) page. Query keys from both
 // locations are merged so the normalized page does not lose a parameter name.
@@ -504,7 +563,9 @@ var (
 // analyzePageURL canonicalizes one absolute page URL and derives its route
 // template. Query values are always dropped; only non-sensitive parameter
 // names are kept. A hash-router path is preserved as part of the template
-// (`/app#/reports/{id}`), while a plain anchor (`#section`) is ignored.
+// (`/app#/reports/{id}`), while any other fragment (a plain anchor `#section`
+// or an application callback such as `#access_token=...`) is dropped from the
+// URL and the template.
 func analyzePageURL(raw string) (pageTarget, error) {
 	raw = strings.TrimSpace(raw)
 	parsed, err := url.Parse(raw)
@@ -522,9 +583,16 @@ func analyzePageURL(raw string) (pageTarget, error) {
 	}
 
 	queryKeys := queryKeyNames(parsed.RawQuery)
+	// Only a hash-router route (`#/reports/42` or the legacy `#!/reports/42`)
+	// is part of the page identity. Any other fragment is an anchor or an
+	// application callback (for example `#access_token=...` after an OAuth
+	// redirect): it is dropped from the URL entirely so a credential-bearing
+	// fragment can never reach the result, a fact payload/source ref or an
+	// element href.
+	hashbang := strings.HasPrefix(parsed.Fragment, "!")
 	hashPath := ""
 	fragment := parsed.Fragment
-	if strings.HasPrefix(fragment, "!") {
+	if hashbang {
 		fragment = strings.TrimPrefix(fragment, "!")
 	}
 	if strings.HasPrefix(fragment, "/") {
@@ -564,11 +632,16 @@ func analyzePageURL(raw string) (pageTarget, error) {
 	if err != nil {
 		return pageTarget{}, fmt.Errorf("parse normalized page URL: %w", err)
 	}
-	fragment = normalized.Fragment
-	if cut := strings.IndexByte(fragment, '?'); cut >= 0 {
-		fragment = fragment[:cut]
+	// NormalizePageURL keeps the fragment verbatim; only the sanitized router
+	// fragment is allowed to survive (with its hashbang marker when present).
+	// Every other fragment is dropped, including any query it carries.
+	normalized.Fragment = ""
+	if hashPath != "" {
+		normalized.Fragment = hashPath
+		if hashbang {
+			normalized.Fragment = "!" + hashPath
+		}
 	}
-	normalized.Fragment = fragment
 	normalizedURL = normalized.String()
 
 	scheme := strings.ToLower(normalized.Scheme)

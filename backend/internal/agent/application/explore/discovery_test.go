@@ -3,6 +3,7 @@ package explore_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -318,6 +319,455 @@ func TestPageDiscoveryReusesOneExecutorPage(t *testing.T) {
 	if _, present := opens[1].args["storage_state_ref"]; present {
 		t.Fatalf("storage_state_ref is only valid on a new page, args = %+v", opens[1].args)
 	}
+}
+
+// TestPageDiscoveryDropsNonRouterFragments covers a redirected OAuth callback
+// whose fragment carries a credential (`#access_token=...`): a non-router
+// fragment is not part of the page identity and must never reach the result
+// URL, the page facts or an element href. A hash-router fragment (`#/home`)
+// remains part of the URL because SPA routes live there.
+func TestPageDiscoveryDropsNonRouterFragments(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", discoveryPageSnapshot("page_1",
+		"http://sut.test/auth/callback?code=SECRET-CODE#access_token=SECRET-ACCESS", "Callback", []any{
+			discoveryLinkElement(0, "#plain", "Section", "#section"),
+			discoveryLinkElement(1, "#cred", "Credential", "/auth/callback#access_token=SECRET-LINK"),
+			discoveryLinkElement(2, "#router", "App", "/app#/home"),
+			discoveryLinkElement(3, "#query", "Orders", "/orders/42?tab=items#access_token=SECRET-QFRAG"),
+		}))
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/app#/home", "App", nil))
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/orders/42?tab=items", "Order", nil))
+
+	facts := &fakeFacts{}
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{
+			VersionSUTID:       7,
+			EnvironmentID:      8,
+			StartURL:           "http://sut.test/login",
+			MaxPages:           10,
+			MaxDepth:           2,
+			MaxLinksPerPage:    20,
+			MaxElementsPerPage: 20,
+		},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: facts},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if len(result.Pages) != 3 {
+		t.Fatalf("pages = %d (%+v), want callback + app + orders", len(result.Pages), result.Pages)
+	}
+	callback := result.Pages[0]
+	if callback.PageKey != "http://sut.test/auth/callback" {
+		t.Fatalf("callback PageKey = %q, want the fragment-free redirect target", callback.PageKey)
+	}
+	if callback.URL != "http://sut.test/auth/callback" {
+		t.Fatalf("callback URL = %q, want the credential-bearing fragment dropped", callback.URL)
+	}
+	if callback.RouteTemplate != "/auth/callback" {
+		t.Fatalf("callback route = %q, want /auth/callback", callback.RouteTemplate)
+	}
+	if len(callback.QueryKeys) != 1 || callback.QueryKeys[0] != "code" {
+		t.Fatalf("callback query keys = %v, want [code] (values dropped, key kept)", callback.QueryKeys)
+	}
+	if got := result.Pages[1].URL; got != "http://sut.test/app#/home" {
+		t.Fatalf("router page URL = %q, want the hash route preserved", got)
+	}
+	if got := result.Pages[2].URL; got != "http://sut.test/orders/42" {
+		t.Fatalf("orders URL = %q, want query and fragment dropped", got)
+	}
+
+	wantHrefs := map[string]string{
+		"#plain":  "http://sut.test/auth/callback",
+		"#cred":   "http://sut.test/auth/callback",
+		"#router": "http://sut.test/app#/home",
+		"#query":  "http://sut.test/orders/42",
+	}
+	for _, el := range callback.Elements {
+		want, ok := wantHrefs[el.Selector]
+		if !ok {
+			continue
+		}
+		if el.Href != want {
+			t.Fatalf("element %s href = %q, want %q", el.Selector, el.Href, want)
+		}
+		delete(wantHrefs, el.Selector)
+	}
+	if len(wantHrefs) != 0 {
+		t.Fatalf("missing fixture elements: %v (elements %+v)", wantHrefs, callback.Elements)
+	}
+
+	encodedResult, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	encodedFacts, err := json.Marshal(facts.recorded())
+	if err != nil {
+		t.Fatalf("marshal facts: %v", err)
+	}
+	for name, encoded := range map[string]string{"result": string(encodedResult), "facts": string(encodedFacts)} {
+		for _, secret := range []string{"SECRET-ACCESS", "SECRET-LINK", "SECRET-QFRAG", "SECRET-CODE", "access_token", "#section"} {
+			if strings.Contains(encoded, secret) {
+				t.Fatalf("%s leaked %q: %s", name, secret, encoded)
+			}
+		}
+	}
+	recorded := facts.recorded()
+	if len(recorded) != 3 {
+		t.Fatalf("page facts = %d, want 3", len(recorded))
+	}
+	if recorded[0].SourceRef != "http://sut.test/auth/callback" {
+		t.Fatalf("callback fact source ref = %q, want the sanitized URL", recorded[0].SourceRef)
+	}
+	if url, _ := recorded[0].Payload["url"].(string); url != "http://sut.test/auth/callback" {
+		t.Fatalf("callback fact url = %q, want the sanitized URL", url)
+	}
+	if url, _ := recorded[2].Payload["url"].(string); url != "http://sut.test/orders/42" {
+		t.Fatalf("orders fact url = %q, want query/fragment dropped", url)
+	}
+}
+
+// TestPageDiscoveryClosesCreatedPage covers the executor's 8-page cap: a crawl
+// seeded only by StartURL opens one page and must release it itself before Run
+// returns, because the caller never receives that page id. A failed close is
+// best effort and must not fail the discovery.
+func TestPageDiscoveryClosesCreatedPage(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", []any{
+		discoveryLinkElement(0, "#next", "Next", "/next"),
+	}))
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/next", "Next", nil))
+
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{
+			VersionSUTID:    7,
+			EnvironmentID:   8,
+			StartURL:        "http://sut.test/home",
+			StorageStateRef: "ss_discovery",
+			MaxPages:        5,
+			MaxDepth:        2,
+		},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: &fakeFacts{}},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if len(result.Pages) != 2 {
+		t.Fatalf("pages = %+v, want 2", result.Pages)
+	}
+	closed := exec.closedPageIDs()
+	if len(closed) != 1 || closed[0] != "page_1" {
+		t.Fatalf("closed pages = %v, want the crawl-created page_1", closed)
+	}
+	if exec.pageIsOpen("page_1") {
+		t.Fatalf("page_1 is still open; the crawl must close the page it created")
+	}
+	if result.PageID != "" {
+		t.Fatalf("result.PageID = %q, want empty: discovery closed the page it created", result.PageID)
+	}
+}
+
+// TestPageDiscoveryKeepsCallerPageOpen covers the other ownership side: a
+// caller-supplied PageID belongs to the caller, so discovery navigates it and
+// never closes it. The result reports the open page back to the caller.
+func TestPageDiscoveryKeepsCallerPageOpen(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.registerPage("page_caller")
+	exec.queue("explore.open", discoveryPageSnapshot("page_caller", "http://sut.test/home", "Home", nil))
+
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{
+			VersionSUTID:  7,
+			EnvironmentID: 8,
+			StartURL:      "http://sut.test/home",
+			PageID:        "page_caller",
+			MaxPages:      5,
+			MaxDepth:      2,
+		},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: &fakeFacts{}},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if len(result.Pages) != 1 {
+		t.Fatalf("pages = %+v, want 1", result.Pages)
+	}
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 1 || opens[0].args["page_id"] != "page_caller" {
+		t.Fatalf("opens = %+v, want one navigation of the caller page", opens)
+	}
+	if closed := exec.closedPageIDs(); len(closed) != 0 {
+		t.Fatalf("closed pages = %v, want none: the caller owns page_caller", closed)
+	}
+	if !exec.pageIsOpen("page_caller") {
+		t.Fatalf("the caller page must stay open after discovery")
+	}
+	if result.PageID != "page_caller" {
+		t.Fatalf("result.PageID = %q, want the caller-owned page id", result.PageID)
+	}
+}
+
+// TestPageDiscoverySeedURLs covers multi-seed crawls: StartURL stays first,
+// extra seeds are deduplicated by page identity, sorted deterministically and
+// an invalid extra seed does not abort a crawl that has a start URL.
+func TestPageDiscoverySeedURLs(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", nil))
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/orders/42", "Order 42", nil))
+
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{
+			VersionSUTID:  7,
+			EnvironmentID: 8,
+			StartURL:      "http://sut.test/home",
+			SeedURLs: []string{
+				"http://sut.test/orders/1",
+				"http://sut.test/home",
+				"http://sut.test/orders/2",
+				"not-a-url",
+			},
+			AllowedHosts: []string{"sut.test"},
+			MaxPages:     10,
+			MaxDepth:     1,
+		},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: &fakeFacts{}},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if len(result.Pages) != 2 {
+		t.Fatalf("pages = %+v, want the StartURL and one deduplicated seed", result.Pages)
+	}
+	if result.Pages[0].PageKey != "http://sut.test/home" || result.Pages[0].Depth != 0 || result.Pages[0].ParentKey != "" {
+		t.Fatalf("first page = %+v, want the StartURL root", result.Pages[0])
+	}
+	if result.Pages[1].PageKey != "http://sut.test/orders/{id}" || result.Pages[1].Depth != 0 || result.Pages[1].ParentKey != "" {
+		t.Fatalf("second page = %+v, want the deduplicated seed root", result.Pages[1])
+	}
+	if opens := exec.callsOf("explore.open"); len(opens) != 2 {
+		t.Fatalf("open calls = %d, want one per distinct seed", len(opens))
+	}
+}
+
+// TestPageDiscoverySeedsFromPageID covers a caller that only has an open page:
+// discovery snapshots it once to learn the current URL, then navigates the same
+// caller-owned page and never closes it.
+func TestPageDiscoverySeedsFromPageID(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.registerPage("page_caller")
+	exec.queue("explore.snapshot", discoveryPageSnapshot("page_caller", "http://sut.test/dashboard", "Dashboard", nil))
+	exec.queue("explore.open", discoveryPageSnapshot("page_caller", "http://sut.test/dashboard", "Dashboard", nil))
+
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{VersionSUTID: 7, EnvironmentID: 8, PageID: "page_caller", MaxPages: 5},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: &fakeFacts{}},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	snapshots := exec.callsOf("explore.snapshot")
+	if len(snapshots) != 1 || snapshots[0].args["page_id"] != "page_caller" {
+		t.Fatalf("snapshot calls = %+v, want one seed snapshot of the caller page", snapshots)
+	}
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 1 || opens[0].args["page_id"] != "page_caller" {
+		t.Fatalf("open calls = %+v, want the caller page navigated", opens)
+	}
+	if len(result.Pages) != 1 || result.Pages[0].URL != "http://sut.test/dashboard" {
+		t.Fatalf("pages = %+v, want the page-id seed URL", result.Pages)
+	}
+	if len(exec.closedPageIDs()) != 0 || !exec.pageIsOpen("page_caller") {
+		t.Fatalf("closed pages = %v, want the caller page untouched", exec.closedPageIDs())
+	}
+	if result.PageID != "page_caller" {
+		t.Fatalf("result.PageID = %q, want the caller page", result.PageID)
+	}
+}
+
+// TestPageDiscoveryRespectsMaxDepth covers the depth cap: a page at MaxDepth is
+// inventoried but its links are not followed.
+func TestPageDiscoveryRespectsMaxDepth(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", []any{
+		discoveryLinkElement(0, "#level1", "Level 1", "/level1"),
+	}))
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/level1", "Level 1", []any{
+		discoveryLinkElement(0, "#level2", "Level 2", "/level2"),
+	}))
+
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{
+			VersionSUTID:    7,
+			EnvironmentID:   8,
+			StartURL:        "http://sut.test/home",
+			MaxPages:        10,
+			MaxDepth:        1,
+			MaxLinksPerPage: 10,
+		},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: &fakeFacts{}},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if len(result.Pages) != 2 {
+		t.Fatalf("pages = %+v, want the seed and one level", result.Pages)
+	}
+	level1 := result.Pages[1]
+	if level1.Depth != 1 || len(level1.Children) != 0 {
+		t.Fatalf("level1 page = %+v, want depth 1 without followed children", level1)
+	}
+	if opens := exec.callsOf("explore.open"); len(opens) != 2 {
+		t.Fatalf("open calls = %d, want /level2 never opened at MaxDepth", len(opens))
+	}
+}
+
+// TestPageDiscoveryCaps covers the per-page link/element caps: both stop at the
+// configured bound, set Truncated, and never silently overrun.
+func TestPageDiscoveryCaps(t *testing.T) {
+	exec := newFakeExecutor()
+	root := discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", []any{
+		discoveryLinkElement(0, "#a", "A", "/a"),
+		discoveryLinkElement(1, "#b", "B", "/b"),
+		discoveryLinkElement(2, "#c", "C", "/c"),
+	})
+	exec.queue("explore.open", root)
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/a", "A", nil))
+
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{
+			VersionSUTID:       7,
+			EnvironmentID:      8,
+			StartURL:           "http://sut.test/home",
+			MaxPages:           10,
+			MaxDepth:           2,
+			MaxLinksPerPage:    1,
+			MaxElementsPerPage: 2,
+		},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: &fakeFacts{}},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatalf("truncated = false, want true at the element/link caps")
+	}
+	if len(result.Pages[0].Elements) != 2 {
+		t.Fatalf("root elements = %d, want the MaxElementsPerPage cap", len(result.Pages[0].Elements))
+	}
+	if len(result.Pages[0].Children) != 1 {
+		t.Fatalf("root children = %v, want the MaxLinksPerPage cap", result.Pages[0].Children)
+	}
+	if len(result.Pages) != 2 {
+		t.Fatalf("pages = %+v, want the seed and one followed link", result.Pages)
+	}
+}
+
+// TestPageDiscoveryClipsElementText locks the inventory bounds: a chatty DOM
+// node cannot push an unbounded name/text into facts.
+func TestPageDiscoveryClipsElementText(t *testing.T) {
+	exec := newFakeExecutor()
+	longName := strings.Repeat("N", 300)
+	longText := strings.Repeat("T", 300)
+	node := element(0, "button", "#long", "button", longName, "")
+	node["text"] = longText
+	exec.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", []any{node}))
+
+	facts := &fakeFacts{}
+	discovery := exploreapp.NewPageDiscovery(
+		exploreapp.PageDiscoveryConfig{VersionSUTID: 7, EnvironmentID: 8, StartURL: "http://sut.test/home", MaxPages: 2},
+		exploreapp.PageDiscoveryDeps{Executor: exec, Facts: facts},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("PageDiscovery.Run: %v", err)
+	}
+	if len(result.Pages) != 1 || len(result.Pages[0].Elements) != 1 {
+		t.Fatalf("pages = %+v, want one page with one element", result.Pages)
+	}
+	long := result.Pages[0].Elements[0]
+	if len([]rune(long.Name)) != 200 || len([]rune(long.Text)) != 200 {
+		t.Fatalf("element name/text = %d/%d runes, want the 200-rune clip", len([]rune(long.Name)), len([]rune(long.Text)))
+	}
+	recorded := facts.recorded()
+	if len(recorded) != 1 {
+		t.Fatalf("facts = %d, want 1", len(recorded))
+	}
+	payloadElements, _ := recorded[0].Payload["elements"].([]any)
+	if len(payloadElements) != 1 {
+		t.Fatalf("fact elements = %+v, want 1", recorded[0].Payload["elements"])
+	}
+	payload, _ := payloadElements[0].(map[string]any)
+	name, _ := payload["name"].(string)
+	text, _ := payload["text"].(string)
+	if len([]rune(name)) != 200 || len([]rune(text)) != 200 {
+		t.Fatalf("fact element name/text = %d/%d runes, want the 200-rune clip", len([]rune(name)), len([]rune(text)))
+	}
+}
+
+// executorWithoutPageCloser models an Executor that predates the optional
+// per-page cleanup capability.
+type executorWithoutPageCloser struct {
+	inner exploreapp.Executor
+}
+
+func (e executorWithoutPageCloser) Action(ctx context.Context, action string, args map[string]any) (map[string]any, error) {
+	return e.inner.Action(ctx, action, args)
+}
+
+// TestPageDiscoveryReportsUnclosedCreatedPage covers the degraded assembly: an
+// executor without PageCloser cannot be closed by discovery, so the created page
+// id is reported for the caller to release instead of being silently leaked.
+func TestPageDiscoveryReportsUnclosedCreatedPage(t *testing.T) {
+	t.Run("no closer reports the created page", func(t *testing.T) {
+		fake := newFakeExecutor()
+		fake.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", nil))
+		discovery := exploreapp.NewPageDiscovery(
+			exploreapp.PageDiscoveryConfig{VersionSUTID: 7, EnvironmentID: 8, StartURL: "http://sut.test/home", MaxPages: 2},
+			exploreapp.PageDiscoveryDeps{Executor: executorWithoutPageCloser{inner: fake}, Facts: &fakeFacts{}},
+		)
+		result, err := discovery.Run(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("PageDiscovery.Run: %v", err)
+		}
+		if fake.closeCount() != 0 {
+			t.Fatalf("close calls = %d, want none without a closer", fake.closeCount())
+		}
+		if result.PageID != "page_1" || !fake.pageIsOpen("page_1") {
+			t.Fatalf("result.PageID = %q (open=%v), want the created page reported for caller cleanup",
+				result.PageID, fake.pageIsOpen("page_1"))
+		}
+	})
+
+	t.Run("explicit closer is used and a close failure stays best effort", func(t *testing.T) {
+		fake := newFakeExecutor()
+		fake.closeErr = fmt.Errorf("executor close failed")
+		fake.queue("explore.open", discoveryPageSnapshot("page_1", "http://sut.test/home", "Home", nil))
+		discovery := exploreapp.NewPageDiscovery(
+			exploreapp.PageDiscoveryConfig{VersionSUTID: 7, EnvironmentID: 8, StartURL: "http://sut.test/home", MaxPages: 2},
+			exploreapp.PageDiscoveryDeps{
+				Executor:   executorWithoutPageCloser{inner: fake},
+				Facts:      &fakeFacts{},
+				PageCloser: fake,
+			},
+		)
+		result, err := discovery.Run(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("PageDiscovery.Run must not fail when best-effort cleanup fails: %v", err)
+		}
+		if fake.closeCount() != 1 || fake.closedPageIDs()[0] != "page_1" {
+			t.Fatalf("closed pages = %v, want the explicit closer to release page_1", fake.closedPageIDs())
+		}
+		if result.PageID != "" {
+			t.Fatalf("result.PageID = %q, want empty after a close attempt", result.PageID)
+		}
+	})
 }
 
 /* --------------------------- static API fixtures -------------------------- */
@@ -723,4 +1173,152 @@ func TestAPIThreeStateMerge(t *testing.T) {
 	if len(boundedFacts.recorded()) != 3 {
 		t.Fatalf("bounded facts = %d, want 3", len(boundedFacts.recorded()))
 	}
+}
+
+// TestAPIDiscoveryKeepsAllCallSites covers provenance of a per-source dedupe:
+// the same endpoint declared (Gin) or observed (api-client) in two files is one
+// candidate, but both call-site files stay in the result/facts instead of the
+// first one silently winning.
+func TestAPIDiscoveryKeepsAllCallSites(t *testing.T) {
+	sources := discoverySourceProvider(t, []codeintelapp.SourceFile{
+		{
+			Path: "backend/internal/server/routes_a.go",
+			Content: `package server
+
+func registerA(r router) {
+	r.GET("/api/health", health)
+}
+`,
+		},
+		{
+			Path: "backend/internal/server/routes_b.go",
+			Content: `package server
+
+func registerB(r router) {
+	r.GET("/api/health", health)
+}
+`,
+		},
+		{
+			Path: "web/src/api/client.ts",
+			Content: `export const api = axios.create({ baseURL: '/api' })
+
+export function listOrders() {
+  return api.get('/orders')
+}
+`,
+		},
+		{
+			Path: "web/src/pages/orders.ts",
+			Content: `export function loadOrders() {
+  return api.get('/api/orders')
+}
+`,
+		},
+	})
+	facts := &fakeFacts{}
+	discovery := exploreapp.NewAPIDiscovery(
+		exploreapp.APIDiscoveryConfig{EnvironmentID: 8, MaxAPIs: 100},
+		exploreapp.APIDiscoveryDeps{Sources: sources, Facts: facts},
+	)
+	result, err := discovery.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("APIDiscovery.Run: %v", err)
+	}
+	if len(result.APIs) != 2 {
+		t.Fatalf("APIs = %+v, want the deduped orders + health endpoints", result.APIs)
+	}
+	orders, ok := findAPI(result.APIs, "GET /api/orders")
+	if !ok {
+		t.Fatal("missing GET /api/orders")
+	}
+	if got := strings.Join(orders.UsedFiles, ","); got != "web/src/api/client.ts,web/src/pages/orders.ts" {
+		t.Fatalf("orders used files = %v, want every api-client call site", orders.UsedFiles)
+	}
+	health, ok := findAPI(result.APIs, "GET /api/health")
+	if !ok {
+		t.Fatal("missing GET /api/health")
+	}
+	if got := strings.Join(health.DeclaredFiles, ","); got != "backend/internal/server/routes_a.go,backend/internal/server/routes_b.go" {
+		t.Fatalf("health declared files = %v, want every route-registration site", health.DeclaredFiles)
+	}
+	encodedFacts, err := json.Marshal(facts.recorded())
+	if err != nil {
+		t.Fatalf("marshal facts: %v", err)
+	}
+	for _, file := range []string{"web/src/pages/orders.ts", "backend/internal/server/routes_b.go"} {
+		if !strings.Contains(string(encodedFacts), file) {
+			t.Fatalf("facts are missing call-site file %q: %s", file, encodedFacts)
+		}
+	}
+}
+
+func TestAPIDiscoveryHardBounds(t *testing.T) {
+	t.Run("files are clamped to the hard default", func(t *testing.T) {
+		extra := 20
+		files := make([]codeintelapp.SourceFile, 0, codeintelapp.DefaultStaticMaxFiles+extra)
+		for index := 0; index < codeintelapp.DefaultStaticMaxFiles+extra; index++ {
+			files = append(files, codeintelapp.SourceFile{
+				Path:    fmt.Sprintf("backend/internal/generated/file_%03d.go", index),
+				Content: "package generated\n",
+			})
+		}
+		discovery := exploreapp.NewAPIDiscovery(
+			exploreapp.APIDiscoveryConfig{EnvironmentID: 8, MaxFiles: 10000},
+			exploreapp.APIDiscoveryDeps{Sources: discoverySourceProvider(t, files)},
+		)
+		result, err := discovery.Run(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("APIDiscovery.Run: %v", err)
+		}
+		if result.FilesScanned != codeintelapp.DefaultStaticMaxFiles {
+			t.Fatalf("files scanned = %d, want the hard default %d", result.FilesScanned, codeintelapp.DefaultStaticMaxFiles)
+		}
+		if !result.Truncated {
+			t.Fatalf("truncated = false, want true when files exceed the hard default")
+		}
+	})
+
+	t.Run("file bytes are clamped to the hard default", func(t *testing.T) {
+		content := "package generated\n" + strings.Repeat("// padding\n", (codeintelapp.DefaultStaticMaxFileBytes/11)+2)
+		discovery := exploreapp.NewAPIDiscovery(
+			exploreapp.APIDiscoveryConfig{EnvironmentID: 8, MaxFileBytes: codeintelapp.DefaultStaticMaxFileBytes + 1000},
+			exploreapp.APIDiscoveryDeps{Sources: discoverySourceProvider(t, []codeintelapp.SourceFile{
+				{Path: "backend/internal/generated/huge.go", Content: content},
+			})},
+		)
+		result, err := discovery.Run(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("APIDiscovery.Run: %v", err)
+		}
+		if result.FilesScanned != 1 || result.FilesSkipped != 1 {
+			t.Fatalf("files scanned/skipped = %d/%d, want 1/1: an oversized file must stay over the hard byte cap",
+				result.FilesScanned, result.FilesSkipped)
+		}
+	})
+
+	t.Run("api count is clamped to the hard default", func(t *testing.T) {
+		var content strings.Builder
+		content.WriteString("package server\n\nfunc register(r router) {\n")
+		for index := 0; index < exploreapp.DefaultMaxAPIs+50; index++ {
+			fmt.Fprintf(&content, "\tr.GET(\"/api/generated/item%d\", handler)\n", index)
+		}
+		content.WriteString("}\n")
+		discovery := exploreapp.NewAPIDiscovery(
+			exploreapp.APIDiscoveryConfig{EnvironmentID: 8, MaxAPIs: 10000},
+			exploreapp.APIDiscoveryDeps{Sources: discoverySourceProvider(t, []codeintelapp.SourceFile{
+				{Path: "backend/internal/server/generated_routes.go", Content: content.String()},
+			})},
+		)
+		result, err := discovery.Run(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("APIDiscovery.Run: %v", err)
+		}
+		if len(result.APIs) != exploreapp.DefaultMaxAPIs {
+			t.Fatalf("apis = %d, want the hard default %d", len(result.APIs), exploreapp.DefaultMaxAPIs)
+		}
+		if !result.Truncated {
+			t.Fatalf("truncated = false, want true when endpoints exceed the hard default")
+		}
+	})
 }
