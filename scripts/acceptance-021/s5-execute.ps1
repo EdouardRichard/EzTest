@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     S5 real-execution acceptance for EzTest 0.2.1.
@@ -16,7 +16,11 @@
       4. executor_lost = 0 across case runs, work items and attempts;
       5. a running wave can be paused and resumed through the API;
       6. every executed case has a per-case verdict projected into the design
-         graph.
+         graph;
+      7. the execution really produced per-case step results, assertion results
+         and captured evidence. A wave where every selected case failed as
+         automation/agent_failure with zero recorded steps, assertions and
+         evidence is a control-plane-only run and FAILS S5 (Task 73/QA-F1).
 
     A failing case is a valid S5 result (the acceptance checks the execution
     path, not the SUT's functional quality); a missing execution record is not.
@@ -54,6 +58,7 @@ if ([string]::IsNullOrWhiteSpace($EvidenceRoot)) {
 
 . (Join-Path $PSScriptRoot "lib.ps1")
 . (Join-Path $PSScriptRoot "lib-s3-s6.ps1")
+. (Join-Path $PSScriptRoot "lib-s5-evidence.ps1")
 
 $context = Initialize-AcceptanceContext -ApiBaseUrl $ApiBaseUrl -WebBaseUrl $WebBaseUrl `
     -ExecutorUrl $ExecutorUrl -SutWebBaseUrl $SutWebBaseUrl -SutApiBaseUrl $SutApiBaseUrl `
@@ -271,6 +276,43 @@ try {
             }
             [void](Write-S5Evidence -Name "case-runs.json" -Value $runSummaries -Note "case runs across waves")
             [void](Write-S5Evidence -Name "case-run-details.json" -Value $runDetails -Note "case run details (steps/assertions/evidence)")
+
+            # Task 73 / QA-F1: the old gate accepted a wave where every selected
+            # case ended as automation/agent_failure with zero recorded
+            # steps/assertions/evidence (control plane only). PASS now requires
+            # at least one case run that really recorded steps, assertions and
+            # evidence; an all-silent-agent-failure wave FAILS.
+            $recordedByRun = @{}
+            foreach ($entry in $runDetails) {
+                $recordedRunId = [string]$entry.summary.id
+                $detail = $entry.detail
+                $recordedSteps = 0
+                $recordedAssertions = 0
+                $recordedEvidence = 0
+                if ($null -ne $detail) {
+                    $recordedSteps = @($detail.steps).Count
+                    $recordedAssertions = @($detail.assertions).Count
+                    $recordedEvidence = @($detail.evidence).Count
+                }
+                $recordedByRun[$recordedRunId] = @{
+                    steps      = $recordedSteps
+                    assertions = $recordedAssertions
+                    evidence   = $recordedEvidence
+                }
+            }
+            $evidenceGate = Get-S5ExecutionEvidenceGate -Runs $runSummaries -Recorded $recordedByRun
+            [void](Write-S5Evidence -Name "execution-evidence-gate.json" -Value $evidenceGate -Note "real-execution steps/assertions/evidence gate (Task 73)")
+            Add-AcceptanceCheck -Scenario $scenario -Name "executed cases recorded step results" -Passed ($evidenceGate.runs_with_steps -ge 1) -Severity assertion `
+                -Detail "runsWithSteps=$($evidenceGate.runs_with_steps)/$($evidenceGate.terminal_runs)"
+            Add-AcceptanceCheck -Scenario $scenario -Name "executed cases recorded assertion results" -Passed ($evidenceGate.runs_with_assertions -ge 1) -Severity assertion `
+                -Detail "runsWithAssertions=$($evidenceGate.runs_with_assertions)/$($evidenceGate.terminal_runs)"
+            Add-AcceptanceCheck -Scenario $scenario -Name "executed cases captured evidence" -Passed ($evidenceGate.runs_with_evidence -ge 1) -Severity assertion `
+                -Detail "runsWithEvidence=$($evidenceGate.runs_with_evidence)/$($evidenceGate.terminal_runs)"
+            Add-AcceptanceCheck -Scenario $scenario -Name "real execution produced steps, assertions and evidence" -Passed ($evidenceGate.runs_with_steps_assertions_evidence -ge 1) -Severity assertion `
+                -Detail "runsWithAll=$($evidenceGate.runs_with_steps_assertions_evidence) reason=$($evidenceGate.reason)"
+            Add-AcceptanceCheck -Scenario $scenario -Name "selected cases are not all silent agent failures" -Passed (-not $evidenceGate.all_agent_failure_zero_evidence) -Severity assertion `
+                -Detail "agentFailureZeroEvidence=$($evidenceGate.agent_failure_zero_evidence_runs)/$($evidenceGate.terminal_runs)"
+
             $terminalRuns = @($runSummaries | Where-Object { $terminalRunStatuses -contains $_.status })
             Add-AcceptanceCheck -Scenario $scenario -Name "case runs visible" -Passed ($runSummaries.Count -ge 1) -Severity assertion -Detail "caseRuns=$($runSummaries.Count)"
             Add-AcceptanceCheck -Scenario $scenario -Name "at least one case reached a terminal verdict" -Passed ($terminalRuns.Count -ge 1) -Severity assertion `
@@ -368,6 +410,7 @@ try {
             elseif ($lostTotal -gt 0) { $scenario.ErrorMessage = "S5 failed: executor_lost=$lostTotal" }
             elseif (-not $pauseExercised) { $scenario.ErrorMessage = "S5 failed: pause/resume could not be exercised" }
             elseif ($missingVerdict.Count -gt 0) { $scenario.ErrorMessage = "S5 failed: missing per-case verdict for $($missingVerdict -join ',')" }
+            elseif (-not $evidenceGate.passed) { $scenario.ErrorMessage = "S5 failed: real execution evidence gate - $($evidenceGate.reason)" }
         }
     }
 } catch {

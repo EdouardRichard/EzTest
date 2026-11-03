@@ -84,7 +84,7 @@ func (s *CaseRunner) Browser(ctx context.Context, scope tools.Scope, action stri
 		}
 		return nil, &tools.Error{Code: result.Error.Code, Message: result.Error.Message}
 	}
-	evidenceIDs, err := s.storeBrowserEvidence(ctx, caseRun, versionSUTID, action, result)
+	evidenceIDs, err := s.storeBrowserEvidence(ctx, caseRun, versionSUTID, action, result, scope.AgentRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +251,7 @@ func browserActionArgs(action string, in browserToolArgs) (json.RawMessage, erro
 	return json.Marshal(args)
 }
 
-func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution.CaseRun, versionSUTID int64, action string, result BrowserActionResult) ([]string, error) {
+func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution.CaseRun, versionSUTID int64, action string, result BrowserActionResult, agentRunID int64) ([]string, error) {
 	ids := make([]string, 0, 1)
 	versionRef := versionSUTID
 	for _, artifact := range result.Artifacts {
@@ -268,15 +268,7 @@ func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution
 		if err != nil {
 			return nil, errors.New("executor artifact is not valid base64")
 		}
-		evidence, addErr := s.AddEvidence(ctx, tools.Scope{
-			VersionID:     s.versionForCaseRun(caseRun),
-			WaveID:        caseRun.WaveID,
-			CaseRunID:     caseRun.ID,
-			IntentID:      caseRun.IntentID,
-			CaseVersionID: caseRun.CaseVersionID,
-			DispatchEpoch: caseRun.DispatchEpoch,
-			DispatchToken: caseRun.DispatchToken,
-		}, EvidenceInput{
+		evidence, addErr := s.addEvidenceForRun(ctx, caseRun, agentRunID, EvidenceInput{
 			Kind: kind, Data: data, Filename: artifact.Filename, VersionSUTID: &versionRef, Auto: true,
 		})
 		if addErr != nil {
@@ -296,15 +288,7 @@ func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution
 		if len(data) == 0 {
 			data = json.RawMessage(`[]`)
 		}
-		evidence, err := s.AddEvidence(ctx, tools.Scope{
-			VersionID:     s.versionForCaseRun(caseRun),
-			WaveID:        caseRun.WaveID,
-			CaseRunID:     caseRun.ID,
-			IntentID:      caseRun.IntentID,
-			CaseVersionID: caseRun.CaseVersionID,
-			DispatchEpoch: caseRun.DispatchEpoch,
-			DispatchToken: caseRun.DispatchToken,
-		}, EvidenceInput{
+		evidence, err := s.addEvidenceForRun(ctx, caseRun, agentRunID, EvidenceInput{
 			Kind: kind, Data: data, VersionSUTID: &versionRef, Auto: true,
 		})
 		if err != nil {

@@ -45,16 +45,22 @@ type EvidenceInput struct {
 	Auto         bool
 }
 
-// AddEvidence stores immutable evidence: it re-computes SHA-256/size from the
-// bytes, enforces the per-case_run cap, uploads to the content ledger, writes
-// the evidence row and its references. Oversized bytes are rejected with
-// evidence_too_large; evidence beyond the cap is dropped without failing the
-// case.
+// AddEvidence stores one evidence item produced by an execution tool. It
+// validates that the calling scope still owns a running case_run.
 func (s *CaseRunner) AddEvidence(ctx context.Context, scope tools.Scope, in EvidenceInput) (execution.Evidence, error) {
 	caseRun, err := s.requireRunningScope(ctx, scope)
 	if err != nil {
 		return execution.Evidence{}, err
 	}
+	return s.addEvidenceForRun(ctx, caseRun, scope.AgentRunID, in)
+}
+
+// addEvidenceForRun stores immutable evidence for one case_run without
+// re-validating the caller's run scope. It exists for server-owned captures that
+// happen around the terminal write (the P3 §6.4 automatic terminal screenshot
+// and the run-failure text evidence), when the run may already be paused or
+// terminal in the database.
+func (s *CaseRunner) addEvidenceForRun(ctx context.Context, caseRun execution.CaseRun, agentRunID int64, in EvidenceInput) (execution.Evidence, error) {
 	if !in.Kind.Valid() {
 		return execution.Evidence{}, platform.Invalid("kind", "unsupported evidence kind")
 	}
@@ -110,7 +116,7 @@ func (s *CaseRunner) AddEvidence(ctx context.Context, scope tools.Scope, in Evid
 		SizeBytes:      int64(len(in.Data)),
 		MIME:           truncateRunes(mime, execution.EvidenceMIMEMax),
 		Filename:       filename,
-		CreatedByRunID: optionalID(scope.AgentRunID),
+		CreatedByRunID: optionalID(agentRunID),
 		CreatedAt:      s.now(),
 	}
 	if err := s.evidence.Insert(ctx, evidence); err != nil {

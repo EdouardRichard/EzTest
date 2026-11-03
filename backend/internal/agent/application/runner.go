@@ -894,8 +894,16 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		}
 		executionTask, taskErr := r.taskProvider.ExecutionTask(ctx, state.item)
 		if taskErr != nil {
+			// A deterministic case-scope rejection (unresolvable step target,
+			// stale/superseded case, missing SUT binding) is a blocked case, not
+			// an automation failure: the execution context persists blocked with
+			// the concrete reason. Transient provider failures stay tool errors.
+			reason := "tool_failure"
+			if isCaseBlockedTaskError(taskErr) {
+				reason = "case_blocked"
+			}
 			return &RunError{
-				Reason:    "tool_failure",
+				Reason:    reason,
 				Retryable: executionTaskErrorRetryable(taskErr),
 				Cause:     taskErr,
 			}
@@ -1819,6 +1827,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 				"等待/时间窗口用 execution.wait，不要用重复 snapshot 空转",
 				"密码只经 account.credentials 读取，不得写入证据/日志/回复",
 				"登录失败/2FA 用 human.request 请求人工接管",
+				"失败/阻塞/不确定的断言要留下证据（截图、console/network 或 execution.evidence）",
 				"无法继续时用 execution.case_finish(blocked) 说明原因",
 			},
 			AcceptanceCriteria: []string{
@@ -2591,6 +2600,26 @@ func executionTaskErrorRetryable(err error) bool {
 		return apiErr.Retryable || apiErr.Status >= 500
 	}
 	return true
+}
+
+// isCaseBlockedTaskError reports whether an execution task-provider rejection is
+// a deterministic case-scope blocker rather than a transient infrastructure
+// error. The P3 execution context classifies a blocked run as
+// blocked/failure_class=blocked and persists the reason as evidence; treating
+// the same rejection as a tool_failure produced the silent zero-result
+// agent_failure rows in QA-F1.
+func isCaseBlockedTaskError(err error) bool {
+	if IsLeaseLost(err) {
+		return false
+	}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Status {
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+			return true
+		}
+	}
+	return false
 }
 
 // requirementCard turns a successful draft tool result into a UI card part.

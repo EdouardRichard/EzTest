@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,14 @@ const (
 	evidenceMaxPerCaseRun    = execution.EvidenceMaxPerCaseRun
 	maxSUTFilenameLength     = 255
 	executorContextKeyFormat = "run:%d:vs:%d:role:%s"
+	// terminalScreenshotTimeout bounds the P3 §6.4 automatic screenshot of a
+	// failed/blocked/inconclusive run. It is independent from the (possibly
+	// canceled) run context: the capture is best-effort and must never extend a
+	// terminal write.
+	terminalScreenshotTimeout = 8 * time.Second
+	// runFailureEvidenceFilename names the text evidence carrying the concrete
+	// error of a run that recorded no step/assertion result.
+	runFailureEvidenceFilename = "agent-failure.txt"
 )
 
 // SUTBindingResolver resolves the task-context bindings of a version (base URL,
@@ -456,7 +465,7 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 	if err != nil {
 		return execution.TaskSnapshot{}, mapExecutionError(err, "version")
 	}
-	suts, err := executionSUTBindings(caseSnapshot, bindings)
+	suts, err := executionSUTBindings(&caseSnapshot, bindings)
 	if err != nil {
 		return execution.TaskSnapshot{}, err
 	}
@@ -561,7 +570,10 @@ func (s *CaseRunner) StepRecord(ctx context.Context, scope tools.Scope, in tools
 	}
 	target := caseStep.TargetVersionSUTID
 	if in.VersionSUTID != nil {
-		if *in.VersionSUTID != caseStep.TargetVersionSUTID {
+		// An unresolved case target (a snapshot read before the default
+		// inheritance was applied) accepts the model's resolved target instead
+		// of rejecting the recording call.
+		if caseStep.TargetVersionSUTID > 0 && *in.VersionSUTID != caseStep.TargetVersionSUTID {
 			return nil, platform.Invalid("version_sut_id", "does not match the case step target")
 		}
 		target = *in.VersionSUTID
@@ -627,7 +639,7 @@ func (s *CaseRunner) AssertionRecord(ctx context.Context, scope tools.Scope, in 
 	}
 	target := assertion.TargetVersionSUTID
 	if in.VersionSUTID != nil {
-		if *in.VersionSUTID != assertion.TargetVersionSUTID {
+		if assertion.TargetVersionSUTID > 0 && *in.VersionSUTID != assertion.TargetVersionSUTID {
 			return nil, platform.Invalid("version_sut_id", "does not match the case assertion target")
 		}
 		target = *in.VersionSUTID
@@ -702,6 +714,10 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		return execution.CaseRun{}, platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	// P3 §6.4 automatic evidence: a failed/blocked/inconclusive run with a live
+	// browser context captures one screenshot before the terminal write so the
+	// failure is triageable instead of a zero-evidence row (QA-F1).
+	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
@@ -784,20 +800,24 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 		if class == execution.FailureClassBlocked {
 			candidate.Verdict = execution.CaseRunBlocked
 		}
-		if err := s.finalizeWithCandidate(ctx, caseRun, candidate); err != nil {
+		// A run that dies before recording any step/assertion result must not
+		// look like a silent zero-row failure: persist the concrete error as
+		// text evidence so the reason is visible in the report/UI.
+		s.recordRunFailureEvidence(ctx, caseRun, runErr)
+		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr); err != nil {
 			return err
 		}
 		return nil
 	}
 	// The agent loop succeeded but never finished the case (for example the turn
 	// budget was exhausted): aggregate whatever was recorded.
-	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}); err != nil {
+	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate) error {
+func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
 		return err
@@ -818,6 +838,12 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		return platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	if failure != nil {
+		// Persist the concrete failure reason (delivery reports and attribution
+		// read summary.last_error): a failed/blocked run must explain itself.
+		summary.LastError = truncateRunes(failure.Error(), 2000)
+	}
+	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
@@ -1002,6 +1028,11 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 	var runErr *agentapp.RunError
 	if errors.As(err, &runErr) {
 		switch runErr.Reason {
+		case "case_blocked":
+			// The execution task provider rejected the case scope before the
+			// agent loop (unresolvable step target, stale case, missing binding):
+			// this is a blocked case, not an automation failure.
+			return execution.FailureClassBlocked, false
 		case "budget", "model_error", "ai_unavailable", "invalid_payload", "profile_not_found":
 			return execution.FailureClassModel, runErr.Retryable
 		case "tool_failure":
@@ -1102,11 +1133,30 @@ func mapCaseReadError(err error) error {
 }
 
 // executionSUTBindings resolves the SUTs referenced by the case snapshot and
-// validates every step/assertion target against the version bindings.
-func executionSUTBindings(snapshot execution.CaseSnapshot, bindings []execution.SUTBinding) ([]execution.SUTBinding, error) {
+// validates every step/assertion target against the version bindings. P2 allows
+// a step target to be empty (inherit case_version.default_version_sut_id); a
+// case with no default target inherits the version's sole binding. The resolved
+// targets are written back to the snapshot so the task context, the SUT context
+// rows and the recorded results all carry the same version_sut_id.
+//
+// account_role is deliberately not validated against the bound test accounts:
+// the design contract allows any role label (for example "anonymous" for a
+// logged-out step), an unbound role simply runs an unauthenticated browser
+// context, and account.credentials returns a typed business error if the model
+// asks for credentials that do not exist. Rejecting the role here killed the
+// whole run before any step/assertion/evidence could be recorded (QA-F1).
+func executionSUTBindings(snapshot *execution.CaseSnapshot, bindings []execution.SUTBinding) ([]execution.SUTBinding, error) {
+	if snapshot == nil {
+		return nil, platform.StateConflict("the case snapshot is missing")
+	}
 	byID := make(map[int64]execution.SUTBinding, len(bindings))
 	for _, binding := range bindings {
 		byID[binding.VersionSUTID] = binding
+	}
+	fallback := snapshot.DefaultVersionSUTID
+	if fallback <= 0 && len(bindings) == 1 {
+		fallback = bindings[0].VersionSUTID
+		snapshot.DefaultVersionSUTID = fallback
 	}
 	used := make([]int64, 0, len(bindings))
 	seen := map[int64]struct{}{}
@@ -1123,15 +1173,42 @@ func executionSUTBindings(snapshot execution.CaseSnapshot, bindings []execution.
 	for _, id := range snapshot.VersionSUTIDs {
 		add(id)
 	}
-	for _, step := range snapshot.Steps {
-		add(step.TargetVersionSUTID)
+	add(fallback)
+	for i := range snapshot.Steps {
+		step := &snapshot.Steps[i]
+		target := step.TargetVersionSUTID
+		if target <= 0 {
+			target = fallback
+			step.TargetVersionSUTID = target
+		}
+		if target <= 0 {
+			return nil, platform.StateConflict(fmt.Sprintf(
+				"step %d has no target version_sut: set case_step.target_version_sut_id or case_version.default_version_sut_id", step.Seq))
+		}
+		if _, ok := byID[target]; !ok {
+			return nil, platform.StateConflict(fmt.Sprintf("step %d targets unbound version_sut %s", step.Seq, platformid.Format(target)))
+		}
+		add(target)
 	}
-	for _, assertion := range snapshot.Assertions {
-		add(assertion.TargetVersionSUTID)
+	for i := range snapshot.Assertions {
+		assertion := &snapshot.Assertions[i]
+		target := assertion.TargetVersionSUTID
+		if target <= 0 {
+			target = fallback
+			assertion.TargetVersionSUTID = target
+		}
+		if target <= 0 {
+			// The assertion carries only informational target metadata; the
+			// step target still routes the browser/API action.
+			continue
+		}
+		if _, ok := byID[target]; !ok {
+			return nil, platform.StateConflict(fmt.Sprintf(
+				"assertion %d.%d targets unbound version_sut %s", assertion.StepSeq, assertion.AssertionSeq, platformid.Format(target)))
+		}
+		add(target)
 	}
-	if snapshot.DefaultVersionSUTID > 0 {
-		add(snapshot.DefaultVersionSUTID)
-	}
+	snapshot.VersionSUTIDs = sortedSUTIDs(used)
 	resolved := make([]execution.SUTBinding, 0, len(used))
 	for _, id := range used {
 		binding, ok := byID[id]
@@ -1140,16 +1217,14 @@ func executionSUTBindings(snapshot execution.CaseSnapshot, bindings []execution.
 		}
 		resolved = append(resolved, binding)
 	}
-	for _, step := range snapshot.Steps {
-		binding, ok := byID[step.TargetVersionSUTID]
-		if !ok {
-			return nil, platform.StateConflict(fmt.Sprintf("step %d targets unbound version_sut %s", step.Seq, platformid.Format(step.TargetVersionSUTID)))
-		}
-		if step.AccountRole != "" && len(binding.AccountRoles) > 0 && !containsString(binding.AccountRoles, step.AccountRole) {
-			return nil, platform.StateConflict(fmt.Sprintf("step %d account role %q is not bound to version_sut %s", step.Seq, step.AccountRole, platformid.Format(step.TargetVersionSUTID)))
-		}
-	}
 	return resolved, nil
+}
+
+// sortedSUTIDs deduplicates and sorts one resolved SUT id set.
+func sortedSUTIDs(ids []int64) []int64 {
+	out := append([]int64(nil), ids...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, epoch int64) error {
@@ -1239,6 +1314,77 @@ func (s *CaseRunner) humanResponse(ctx context.Context, caseRun execution.CaseRu
 		}
 	}
 	return strings.Join(parts, "；"), nil
+}
+
+// recordRunFailureEvidence persists the concrete error of a run that never
+// recorded a step or assertion result as immutable text evidence (QA-F1): a
+// failed/blocked case_run must explain itself instead of showing zero rows and
+// zero evidence. Best effort: the terminal verdict never depends on it.
+func (s *CaseRunner) recordRunFailureEvidence(ctx context.Context, caseRun execution.CaseRun, runErr error) {
+	if runErr == nil || s.evidence == nil || s.content == nil || s.results == nil {
+		return
+	}
+	steps, err := s.results.ListSteps(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	assertions, err := s.results.ListAssertions(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	if len(steps) > 0 || len(assertions) > 0 {
+		return
+	}
+	if count, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr != nil || count > 0 {
+		return
+	}
+	message := fmt.Sprintf("agent run ended before recording any step/assertion result: %s",
+		truncateRunes(runErr.Error(), 1800))
+	_, _ = s.addEvidenceForRun(ctx, caseRun, 0, EvidenceInput{
+		Kind:     execution.EvidenceText,
+		Data:     []byte(message),
+		Filename: runFailureEvidenceFilename,
+	})
+}
+
+// captureTerminalEvidence implements the P3 §6.4 automatic capture: when a
+// case_run reaches failed/blocked/inconclusive and one of its browser contexts
+// is still active, take one screenshot and store it as evidence. The capture is
+// best effort and bounded; a missing/dead context never changes the verdict.
+func (s *CaseRunner) captureTerminalEvidence(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus) {
+	if s.browser == nil || s.evidence == nil || s.content == nil || s.sutContexts == nil {
+		return
+	}
+	switch status {
+	case execution.CaseRunFailed, execution.CaseRunBlocked, execution.CaseRunInconclusive:
+	default:
+		return
+	}
+	rows, err := s.sutContexts.ListByCaseRun(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	var target *execution.CaseRunSUTContext
+	for i := range rows {
+		if rows[i].Status == execution.SUTContextActive && rows[i].BrowserContextID != "" {
+			target = &rows[i]
+			break
+		}
+	}
+	if target == nil {
+		return
+	}
+	actionCtx, cancel := context.WithTimeout(context.Background(), terminalScreenshotTimeout)
+	defer cancel()
+	executorID := int64(0)
+	if target.ExecutorID != nil {
+		executorID = *target.ExecutorID
+	}
+	result, actionErr := s.browser.Action(actionCtx, executorID, target.BrowserContextID, "screenshot", json.RawMessage(`{}`))
+	if actionErr != nil || result.Error != nil {
+		return
+	}
+	_, _ = s.storeBrowserEvidence(actionCtx, caseRun, target.VersionSUTID, "screenshot", result, 0)
 }
 
 func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {

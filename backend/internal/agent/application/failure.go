@@ -39,6 +39,9 @@ const (
 	FailureActionRequeue          = "按新的 lease epoch 重排"
 	FailureActionCompactContext   = "压缩上下文或重建运行"
 	FailureActionRetryOrEscalate  = "重试；持续失败时查看错误详情"
+	// FailureActionFixCaseBinding is the actionable next step of a blocked
+	// execution case: the case step target or account binding cannot be executed.
+	FailureActionFixCaseBinding = "检查用例步骤目标/账号绑定后重试"
 )
 
 // Failure is the classified outcome of a failed agent run.
@@ -86,6 +89,11 @@ func Classify(err error) Failure {
 			return Failure{Kind: FailureKindInterrupted, Retryable: runErr.Retryable, UserVisible: false, Action: FailureActionRequeue}
 		case "context_overflow_unrecoverable":
 			return Failure{Kind: FailureKindContextOverflowUnrecoverable, Retryable: false, UserVisible: true, Action: FailureActionCompactContext}
+		case "case_blocked":
+			// The case could not start (step target/scope/binding rejected by
+			// the execution context). Retrying the same case cannot succeed;
+			// the operator must fix the case binding.
+			return Failure{Kind: FailureKindToolFailure, Retryable: false, UserVisible: true, Action: FailureActionFixCaseBinding}
 		case "tool_failure":
 			var apiErr *platform.Error
 			if errors.As(err, &apiErr) && apiErr.Code == "executor_unavailable" {
