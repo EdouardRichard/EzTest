@@ -385,4 +385,210 @@ func TestProposeMapsRepositoryNotFound(t *testing.T) {
 	}
 }
 
+// fakeCaseRunStatuses emulates the execution read model consumed by the design
+// graph: it returns the newest run per queried case version and records every
+// call so the test can prove the lookup is batched (no N+1 per case).
+type fakeCaseRunStatuses struct {
+	runs  map[int64][]fakeCaseRun
+	calls []fakeCaseRunCall
+	err   error
+}
+
+type fakeCaseRun struct {
+	ID     int64
+	Status string
+}
+
+type fakeCaseRunCall struct {
+	versionID      int64
+	caseVersionIDs []int64
+}
+
+func (f *fakeCaseRunStatuses) LatestCaseRunStatuses(_ context.Context, versionID int64, caseVersionIDs []int64) (map[int64]string, error) {
+	f.calls = append(f.calls, fakeCaseRunCall{
+		versionID:      versionID,
+		caseVersionIDs: append([]int64(nil), caseVersionIDs...),
+	})
+	if f.err != nil {
+		return nil, f.err
+	}
+	latest := make(map[int64]string, len(caseVersionIDs))
+	for _, caseVersionID := range caseVersionIDs {
+		var newest fakeCaseRun
+		found := false
+		for _, run := range f.runs[caseVersionID] {
+			if !found || run.ID > newest.ID {
+				newest = run
+				found = true
+			}
+		}
+		if found {
+			latest[caseVersionID] = newest.Status
+		}
+	}
+	return latest, nil
+}
+
+// seedVerdictCases prepares one scenario with four current case versions:
+// multiple runs, one blocked run, one skipped run and one never-executed case.
+func seedVerdictCases(repo *fakeRepo) {
+	repo.scenarios = []design.Scenario{{
+		ID: 5001, VersionID: 1001, RequirementID: 3001, RequirementVersionID: 3002,
+		Name: "正常登录",
+	}}
+	seed := []struct {
+		caseID        int64
+		caseVersionID int64
+		title         string
+		status        string
+	}{
+		{caseID: 7001, caseVersionID: 7002, title: "登录成功", status: design.CaseStatusDraft},
+		{caseID: 7003, caseVersionID: 7004, title: "登录失败", status: design.CaseStatusConfirmed},
+		{caseID: 7005, caseVersionID: 7006, title: "被跳过的用例", status: design.CaseStatusConfirmed},
+		{caseID: 7009, caseVersionID: 7010, title: "未执行用例", status: design.CaseStatusStale},
+	}
+	for _, item := range seed {
+		current := design.CaseVersion{
+			ID: item.caseVersionID, CaseID: item.caseID, Revision: 1,
+			Title: item.title, Status: item.status,
+			ContentHash: fmt.Sprintf("hash-%d", item.caseVersionID),
+		}
+		repo.cases[item.caseID] = &fakeCase{
+			entity: design.CaseEntity{
+				ID: item.caseID, ScenarioID: 5001,
+				CurrentVersionID: int64Ptr(item.caseVersionID), Status: item.status,
+			},
+			current: &current,
+		}
+	}
+}
+
+func newVerdictGraphFixture(t *testing.T, reader CaseRunStatusReader) *GraphService {
+	t.Helper()
+	service, repo, _, _ := newGraphFixture(t)
+	seedVerdictCases(repo)
+	if reader != nil {
+		service.SetCaseRunStatusReader(reader)
+	}
+	return service
+}
+
+func verdictsByCaseID(view GraphView) map[int64]string {
+	verdicts := make(map[int64]string)
+	for _, requirement := range view.Requirements {
+		for _, scenario := range requirement.Scenarios {
+			for _, card := range scenario.Cases {
+				verdicts[card.CaseID] = card.ExecutionVerdict
+			}
+		}
+	}
+	return verdicts
+}
+
+func TestDesignGraphCarriesLatestVerdict(t *testing.T) {
+	t.Run("latest run wins over an older run", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{runs: map[int64][]fakeCaseRun{
+			// The higher-ID run is the latest; its verdict must win.
+			7002: {{ID: 1, Status: "passed"}, {ID: 3, Status: "failed"}},
+			7004: {{ID: 2, Status: "blocked"}},
+		}}
+		service := newVerdictGraphFixture(t, runs)
+
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		verdicts := verdictsByCaseID(view)
+		if verdicts[7001] != string(design.CaseRunVerdictFailed) {
+			t.Fatalf("case 7001 verdict = %q, want failed (latest run)", verdicts[7001])
+		}
+		if verdicts[7003] != string(design.CaseRunVerdictBlocked) {
+			t.Fatalf("case 7003 verdict = %q, want blocked", verdicts[7003])
+		}
+	})
+
+	t.Run("no execution yields inconclusive", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, &fakeCaseRunStatuses{})
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		verdicts := verdictsByCaseID(view)
+		if len(verdicts) != 4 {
+			t.Fatalf("case verdicts = %+v", verdicts)
+		}
+		for caseID, verdict := range verdicts {
+			if verdict != string(design.CaseRunVerdictInconclusive) {
+				t.Fatalf("case %d verdict = %q, want inconclusive", caseID, verdict)
+			}
+		}
+	})
+
+	t.Run("process states and skipped runs are not verdicts", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{runs: map[int64][]fakeCaseRun{
+			7006: {{ID: 4, Status: "skipped"}},
+		}}
+		service := newVerdictGraphFixture(t, runs)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		if verdicts := verdictsByCaseID(view); verdicts[7005] != string(design.CaseRunVerdictInconclusive) {
+			t.Fatalf("skipped run verdict = %q, want inconclusive", verdicts[7005])
+		}
+	})
+
+	t.Run("one batched lookup over the graph's current case versions", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{runs: map[int64][]fakeCaseRun{
+			// A deleted/other-version case version must never be queried.
+			9999: {{ID: 5, Status: "passed"}},
+		}}
+		service := newVerdictGraphFixture(t, runs)
+		if _, err := service.ReadGraph(context.Background(), 1001); err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		if len(runs.calls) != 1 {
+			t.Fatalf("verdict lookups = %d, want 1 batch", len(runs.calls))
+		}
+		call := runs.calls[0]
+		if call.versionID != 1001 {
+			t.Fatalf("lookup version = %d, want 1001", call.versionID)
+		}
+		want := []int64{7002, 7004, 7006, 7010}
+		if len(call.caseVersionIDs) != len(want) {
+			t.Fatalf("lookup case versions = %v, want %v", call.caseVersionIDs, want)
+		}
+		for index, caseVersionID := range want {
+			if call.caseVersionIDs[index] != caseVersionID {
+				t.Fatalf("lookup case versions = %v, want %v", call.caseVersionIDs, want)
+			}
+		}
+	})
+
+	t.Run("reader failure keeps the graph readable", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{err: errors.New("execution read unavailable")}
+		service := newVerdictGraphFixture(t, runs)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph must not fail on an execution projection error: %v", err)
+		}
+		for caseID, verdict := range verdictsByCaseID(view) {
+			if verdict != string(design.CaseRunVerdictInconclusive) {
+				t.Fatalf("case %d verdict = %q, want inconclusive", caseID, verdict)
+			}
+		}
+	})
+
+	t.Run("an unwired reader still reports inconclusive", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, nil)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		if verdicts := verdictsByCaseID(view); verdicts[7001] != string(design.CaseRunVerdictInconclusive) {
+			t.Fatalf("unwired verdict = %q, want inconclusive", verdicts[7001])
+		}
+	})
+}
+
 var _ = time.Now

@@ -6,6 +6,7 @@ import {
   type PointerEvent,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react"
@@ -30,6 +31,7 @@ import { CaseDetailPanel } from "./CaseDetailPanel"
 import { DesignChat } from "./DesignChat"
 import { DesignMindmap } from "./DesignMindmap"
 import { ExportCasesDialog } from "./ExportCasesDialog"
+import type { DesignExecutionResults } from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
 import type { CaseConfirmationScope, DesignGraph, DesignOverview } from "./types"
 
@@ -129,6 +131,22 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [chatCollapsed, setChatCollapsed] = useState(false)
   const [activeDivider, setActiveDivider] = useState<DividerKind | null>(null)
   const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
+
+  // Each case card of the graph now carries its latest execution verdict
+  // (spec §9.3); DesignMindmap consumes a case-id keyed map.
+  const executionResults = useMemo<DesignExecutionResults>(() => {
+    const results: DesignExecutionResults = {}
+    for (const requirement of graph?.requirements ?? []) {
+      for (const scenario of requirement.scenarios) {
+        for (const designCase of scenario.cases) {
+          if (designCase.execution_verdict !== undefined) {
+            results[designCase.case_id] = designCase.execution_verdict
+          }
+        }
+      }
+    }
+    return results
+  }, [graph])
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const workspaceRef = useRef<HTMLDivElement>(null)
@@ -238,6 +256,10 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     },
     onDesignRoundChanged: () => {
       void refreshOverview()
+    },
+    onCaseRunChanged: (event) => {
+      // A finished execution changes the case's latest verdict on the mindmap.
+      if (event.type === "case_run.finished") scheduleGraphRefresh()
     },
   })
 
@@ -609,6 +631,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
               graph={graph}
               selectedCaseId={selectedCaseId}
               confirmingKey={confirmingKey}
+              executionResults={executionResults}
               onSelectCase={selectCase}
               onConfirmCase={confirmCase}
               onConfirmScenario={confirmScenario}

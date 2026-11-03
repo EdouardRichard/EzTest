@@ -169,6 +169,7 @@ func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 					CaseID: 7001, CurrentVersionID: 7002, Revision: 1, Title: "登录成功",
 					Priority: "P1", Status: "draft", DefaultVersionSUTID: int64Ptr(9001),
 					VersionSUTIDs: []int64{9001}, StepCount: 2, AssertionCount: 1,
+					ExecutionVerdict: "failed",
 				}},
 			}},
 		}},
@@ -195,6 +196,9 @@ func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 	card := scenario["cases"].([]any)[0].(map[string]any)
 	if card["case_id"] != "7001" || card["current_version_id"] != "7002" || card["default_version_sut_id"] != "9001" {
 		t.Fatalf("case card = %v", card)
+	}
+	if card["execution_verdict"] != "failed" {
+		t.Fatalf("case execution_verdict = %v", card["execution_verdict"])
 	}
 }
 

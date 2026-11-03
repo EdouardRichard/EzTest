@@ -65,7 +65,10 @@ type caseCardDTO struct {
 	APIIDs              []string `json:"api_ids"`
 	StepCount           int      `json:"step_count"`
 	AssertionCount      int      `json:"assertion_count"`
-	CreatedAt           string   `json:"created_at"`
+	// ExecutionVerdict is additive: the latest execution result of the case
+	// (passed/failed/blocked/inconclusive), inconclusive when never executed.
+	ExecutionVerdict string `json:"execution_verdict"`
+	CreatedAt        string `json:"created_at"`
 }
 
 func toGraphDTO(view designapp.GraphView) graphViewDTO {
@@ -119,6 +122,7 @@ func toGraphDTO(view designapp.GraphView) graphViewDTO {
 					APIIDs:              formatIDs(card.APIIDs),
 					StepCount:           card.StepCount,
 					AssertionCount:      card.AssertionCount,
+					ExecutionVerdict:    card.ExecutionVerdict,
 					CreatedAt:           formatTime(card.CreatedAt),
 				})
 			}

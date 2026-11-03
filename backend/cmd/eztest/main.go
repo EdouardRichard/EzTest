@@ -332,6 +332,29 @@ func (a designTeamRoomAdapter) Post(ctx context.Context, post designapp.TeamPost
 	return err
 }
 
+// designCaseRunStatuses adapts the execution case_run read model onto the
+// design graph's latest-verdict port (spec §9.3). The composition root is the
+// only place that knows both contexts: design reads execution through this
+// port, never through the execution tables (spec §2.1).
+type designCaseRunStatuses struct {
+	runs *executionpg.CaseRunRepository
+}
+
+func (a designCaseRunStatuses) LatestCaseRunStatuses(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]string, error) {
+	if a.runs == nil {
+		return nil, errors.New("design case run status reader is not configured")
+	}
+	latest, err := a.runs.LatestByCaseVersions(ctx, versionID, caseVersionIDs)
+	if err != nil {
+		return nil, err
+	}
+	statuses := make(map[int64]string, len(latest))
+	for caseVersionID, run := range latest {
+		statuses[caseVersionID] = string(run.Status)
+	}
+	return statuses, nil
+}
+
 // caseRunCanceller breaks the construction cycle between the execution
 // CaseRunner (which needs the human service to open takeovers) and the human /
 // pause services (which cancel in-flight case executor runs). The runner pointer
@@ -759,6 +782,9 @@ func main() {
 
 	// P3 execution context: repositories, cross-context adapters and services.
 	executionRepo := executionpg.NewRepository(pool, ids)
+	// P7 design graph result colouring (spec §9.3): each case card carries the
+	// latest case_run verdict of its current version.
+	designGraph.SetCaseRunStatusReader(designCaseRunStatuses{runs: executionRepo.CaseRuns})
 	executionSUTContextRepo := executionSUTContexts{repo: executionRepo.SUTContexts}
 	executionVersionAdapter := executionadapters.NewVersionAdapter(versionSvc)
 	executionCases := executionadapters.NewDesignCaseReader(designGraph)

@@ -7,6 +7,8 @@
  * `{data, next_cursor, has_more}` and detail endpoints use `{data: ...}`.
  */
 
+import type { CaseRunVerdict } from "@/features/execution/types"
+
 /** Per-requirement projection shown on the requirement node (spec §4.6). */
 export type DesignStatus = "pending" | "in_design" | "draft" | "confirmed" | "stale"
 
@@ -39,6 +41,12 @@ export type DesignCaseSummary = {
   api_ids: string[]
   step_count: number
   assertion_count: number
+  /**
+   * Latest execution verdict of this current case version (spec §9.3);
+   * `inconclusive` when the case has never been executed. Additive to the
+   * frozen P2 graph contract, so older fixtures may omit it.
+   */
+  execution_verdict?: CaseRunVerdict
   created_at: string
 }
 

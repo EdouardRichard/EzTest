@@ -20,6 +20,14 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
+// CaseRunStatusReader is the execution read port consumed by the design graph
+// to project each case's latest execution verdict. The implementation must
+// return the newest case_run per case version id in one batched lookup; design
+// never reads the execution tables directly (spec §2.1).
+type CaseRunStatusReader interface {
+	LatestCaseRunStatuses(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]string, error)
+}
+
 // GraphService serves graph/case reads, the case.graph_propose write path, user
 // confirmations, review/data-plan submissions.
 type GraphService struct {
@@ -30,6 +38,7 @@ type GraphService struct {
 	events   eventingapp.Publisher
 	teamRoom TeamRoom
 	reopener VersionReopener
+	caseRuns CaseRunStatusReader
 }
 
 // NewGraphService wires the graph service. audit, events and teamRoom are
@@ -68,6 +77,43 @@ func (s *GraphService) reopenCompleted(ctx context.Context, versionID int64, rea
 	_ = s.reopener.ReopenIfCompleted(ctx, versionID, "case_confirmed", reason)
 }
 
+// SetCaseRunStatusReader attaches the execution verdict projection used by
+// ReadGraph (spec §9.3). It returns the service for fluent wiring.
+func (s *GraphService) SetCaseRunStatusReader(reader CaseRunStatusReader) *GraphService {
+	if s != nil {
+		s.caseRuns = reader
+	}
+	return s
+}
+
+// latestCaseRunStatuses loads the newest case_run status per current case
+// version in one batched read. The execution projection is best effort: the
+// design graph is still served when the execution read fails and every case
+// then falls back to inconclusive.
+func (s *GraphService) latestCaseRunStatuses(ctx context.Context, versionID int64, requirements []design.RequirementGraph) map[int64]string {
+	if s == nil || s.caseRuns == nil {
+		return nil
+	}
+	caseVersionIDs := make([]int64, 0)
+	for _, requirement := range requirements {
+		for _, scenario := range requirement.Scenarios {
+			for _, item := range scenario.Cases {
+				if item.Current.ID > 0 {
+					caseVersionIDs = append(caseVersionIDs, item.Current.ID)
+				}
+			}
+		}
+	}
+	if len(caseVersionIDs) == 0 {
+		return nil
+	}
+	statuses, err := s.caseRuns.LatestCaseRunStatuses(ctx, versionID, caseVersionIDs)
+	if err != nil {
+		return nil
+	}
+	return statuses
+}
+
 // ReadGraph returns the full version design graph snapshot.
 func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphView, error) {
 	if err := requirePositiveID("version_id", versionID); err != nil {
@@ -81,6 +127,7 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 	if err != nil {
 		return GraphView{}, err
 	}
+	caseRunStatuses := s.latestCaseRunStatuses(ctx, versionID, data.Requirements)
 	view := GraphView{
 		VersionID:                 data.VersionID,
 		GeneratedAt:               s.clock.Now().UTC(),
@@ -114,6 +161,10 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 				Cases:                make([]CaseCardView, 0, len(scenario.Cases)),
 			}
 			for _, item := range scenario.Cases {
+				verdict := design.CaseRunVerdictInconclusive
+				if status, ok := caseRunStatuses[item.Current.ID]; ok {
+					verdict = design.CaseRunVerdictFromStatus(status)
+				}
 				scenarioView.Cases = append(scenarioView.Cases, CaseCardView{
 					CaseID:              item.Case.ID,
 					CurrentVersionID:    derefInt64(item.Case.CurrentVersionID),
@@ -127,6 +178,7 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 					APIIDs:              item.Current.APIIDs,
 					StepCount:           item.StepCount,
 					AssertionCount:      item.AssertionCount,
+					ExecutionVerdict:    string(verdict),
 					CreatedAt:           utcNow(item.Current.CreatedAt),
 				})
 			}

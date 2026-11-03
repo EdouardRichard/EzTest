@@ -56,7 +56,10 @@ type CaseCardView struct {
 	APIIDs              []int64
 	StepCount           int
 	AssertionCount      int
-	CreatedAt           time.Time
+	// ExecutionVerdict is the latest execution result of the current case
+	// version (spec §9.3); a case without an execution is inconclusive.
+	ExecutionVerdict string
+	CreatedAt        time.Time
 }
 
 // GraphView is the full version design graph snapshot.
