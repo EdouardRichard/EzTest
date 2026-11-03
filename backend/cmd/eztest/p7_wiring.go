@@ -212,9 +212,10 @@ func (r p7SourceVersions) SourceVersionExists(ctx context.Context, versionID int
 }
 
 // p7VersionSystems resolves the SUT families bound to a version so system-scope
-// knowledge can match them. The version/resource read models do not expose
-// sut.family yet (resource migration #38 adds the column), so the adapter joins
-// version_sut to sut in one read-only query.
+// knowledge can match them. The version read model exposes the family on each
+// binding (VersionView.Bindings[].SUT.Family); this adapter answers the same
+// projection with one read-only version_sut/sut query so the P7 runtime keeps
+// its narrow pool-based dependency surface.
 type p7VersionSystems struct {
 	pool *pgxpool.Pool
 }

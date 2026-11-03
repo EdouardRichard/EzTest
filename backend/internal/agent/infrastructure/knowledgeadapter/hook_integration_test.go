@@ -609,6 +609,56 @@ func TestCaseSuccessHookAmbiguousRoleStaysGlobal(t *testing.T) {
 	}
 }
 
+// TestCaseSuccessHookUnboundRoleContinues proves a passed case whose account
+// role is exposed by no version SUT is reported as unmapped while the page/API
+// facts still sediment: the hook never invents a login recipe for an unknown
+// role.
+func TestCaseSuccessHookUnboundRoleContinues(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryKnowledgeRepository()
+	service := knowledgeapp.NewService(
+		repo, nil, nil, nil, nil, nil,
+		fixedKnowledgeClock{}, &sequenceKnowledgeIDs{next: 7400},
+	)
+	adapter := New(service, nil)
+	adapter.SetVersionBindings(&fakeVersionBindingReader{bindings: []VersionBinding{{
+		SystemID:      7001,
+		EnvironmentID: 7101,
+		SystemKey:     "shop",
+		Pages:         []PageBinding{{ID: 501, Key: "/login"}},
+		APIs:          []APIBinding{{ID: 601, Key: "POST /api/login"}},
+		AccountRoles:  []string{"admin"},
+	}}})
+
+	fact := caseSuccessFactFixture()
+	fact.AccountRoles = []string{"ghost"}
+	err := adapter.OnCaseRunPassed(ctx, fact)
+	if err == nil {
+		t.Fatal("an account role exposed by no version SUT must be reported")
+	}
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("hook error = %v, want the unmapped role named", err)
+	}
+
+	byKind := make(map[knowledgeapp.Kind]knowledge.Item)
+	for _, item := range repo.allItems() {
+		kind, ok := knowledgeapp.KindOf(item)
+		if !ok {
+			t.Fatalf("item %d has no kind", item.ID)
+		}
+		byKind[kind] = item
+	}
+	if _, ok := byKind[knowledgeapp.KindPageLocator]; !ok {
+		t.Fatal("the bound page must still sediment a page_locator")
+	}
+	if _, ok := byKind[knowledgeapp.KindAPIAuth]; !ok {
+		t.Fatal("the bound API must still sediment an api_auth")
+	}
+	if _, ok := byKind[knowledgeapp.KindLoginRecipe]; ok {
+		t.Fatal("an unknown account role must not sediment a login_recipe")
+	}
+}
+
 // TestCaseSuccessHookUnconfiguredFailsClosed proves a missing wiring is an
 // internal error, never a silent no-op or a panic.
 func TestCaseSuccessHookUnconfiguredFailsClosed(t *testing.T) {

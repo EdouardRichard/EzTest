@@ -56,8 +56,12 @@ func TestAgentCenterReaderCatalogAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListCatalogProfiles: %v", err)
 	}
-	if len(profiles) != 14 {
-		t.Fatalf("catalog profiles = %d, want 14", len(profiles))
+	// ListCatalogProfiles is the raw profile read model: it returns every seeded
+	// profile (15, including the P7 knowledge_curator background profile). The
+	// service-level Catalog intentionally keeps the frozen 14-profile team map
+	// (agent_center_test.go).
+	if want := len(agentapp.ProfileSeeds()); len(profiles) != want {
+		t.Fatalf("catalog profiles = %d, want %d (every seeded profile)", len(profiles), want)
 	}
 	if profiles[0].Profile.Key != agentapp.ProfileKeyCaseExecutor && profiles[0].Profile.Key != agentapp.ProfileKeyCaseAuthor {
 		// The query orders by key; only assert the row shape.

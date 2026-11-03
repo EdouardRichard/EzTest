@@ -88,8 +88,10 @@ func TestLatestPromptVersionsAfterBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LatestPromptVersions: %v", err)
 	}
-	if len(versions) != 14 {
-		t.Fatalf("versions = %d, want 14", len(versions))
+	// EnsurePromptRevisions backfills one v1 revision per seeded profile,
+	// including the P7 knowledge_curator background profile.
+	if want := len(agentapp.ProfileSeeds()); len(versions) != want {
+		t.Fatalf("versions = %d, want %d (one v1 revision per seeded profile)", len(versions), want)
 	}
 	for key, info := range versions {
 		if info.Version != 1 {

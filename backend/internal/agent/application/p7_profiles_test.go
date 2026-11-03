@@ -81,6 +81,24 @@ func TestEnsureProfilesSeedsP7ToolAdditions(t *testing.T) {
 	}
 }
 
+func TestEnsureProfilesSeedsKnowledgeCuratorProfile(t *testing.T) {
+	seeded, err := agentapp.EnsureProfiles(context.Background(), newFakeRuntimeRepo())
+	if err != nil {
+		t.Fatalf("EnsureProfiles: %v", err)
+	}
+	profile, ok := profileByKey(seeded, agentapp.ProfileKeyKnowledgeCurator)
+	if !ok {
+		t.Fatalf("seeded profiles are missing %s", agentapp.ProfileKeyKnowledgeCurator)
+	}
+	if !profile.Enabled {
+		t.Fatal("knowledge_curator seed is disabled")
+	}
+	want := []string{tools.ToolKnowledgeSearch, tools.ToolKnowledgeRead, tools.ToolKnowledgePropose}
+	if strings.Join(profile.AllowedTools, ",") != strings.Join(want, ",") {
+		t.Fatalf("knowledge_curator tools = %v, want %v", profile.AllowedTools, want)
+	}
+}
+
 func TestApplyP7ProfileToolsIsASetUnion(t *testing.T) {
 	// The merge must not duplicate a tool an earlier seed (or an administrator
 	// edit) already whitelisted.

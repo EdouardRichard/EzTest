@@ -12,9 +12,11 @@
 //	tools.Deps{P7: tools.P7Deps{Knowledge: knowledgeAdapter, Retrieval: knowledgeAdapter}}
 //
 // versionSystemReader resolves the SUT families bound to a version. The
-// version/resource read models do not expose sut.family yet, so the assembly
-// root implements VersionSystemReader over the version bindings (a nil reader
-// only disables system-scoped knowledge; global knowledge still injects).
+// version read model exposes the family on each binding
+// (VersionView.Bindings[].SUT.Family); the assembly root also answers this port
+// with a narrow read-only version_sut/sut query, so the agent packages never
+// read version tables (a nil reader only disables system-scoped knowledge;
+// global knowledge still injects).
 //
 // VersionBindingReader resolves the page/API/account binding keys of one
 // version for the success hook (page/API IDs -> page_key/api_key and the
@@ -70,9 +72,10 @@ type KnowledgeService interface {
 
 // VersionSystemReader resolves the SUT families bound to one version. The
 // knowledge system scope matches scope=system items against those family keys
-// (spec §4.3 / contracts/agent-profiles-tools.md §10.3). The version/resource
-// read models do not expose sut.family yet, so cmd/eztest implements this port
-// over the version bindings (Task 19).
+// (spec §4.3 / contracts/agent-profiles-tools.md §10.3). The version read model
+// exposes the family on each binding (VersionView.Bindings[].SUT.Family);
+// cmd/eztest answers the same projection with its narrow read-only
+// version_sut/sut query.
 type VersionSystemReader interface {
 	VersionSystemKeys(ctx context.Context, versionID int64) ([]string, error)
 }

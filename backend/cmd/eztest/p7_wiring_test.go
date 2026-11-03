@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/knowledgeadapter"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	orchestrationapp "github.com/EdouardRichard/EzTest/backend/internal/orchestration/application"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	settingsdomain "github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 // p7FakeLeaderGate is the leader signal double of the gating tests.
@@ -58,6 +62,22 @@ type p7FakeExecutorLister struct {
 
 func (f p7FakeExecutorLister) List(context.Context) ([]execution.ExecutorInstance, error) {
 	return f.rows, f.err
+}
+
+// p7FakeVersionCaseSource is the version read-model double of the knowledge
+// success-hook binding adapter.
+type p7FakeVersionCaseSource struct {
+	view versionapp.VersionView
+	err  error
+	ids  []int64
+}
+
+func (f *p7FakeVersionCaseSource) Get(_ context.Context, id int64) (versionapp.VersionView, error) {
+	f.ids = append(f.ids, id)
+	if f.err != nil {
+		return versionapp.VersionView{}, f.err
+	}
+	return f.view, nil
 }
 
 func TestP7LeaderGating(t *testing.T) {
@@ -161,6 +181,123 @@ func TestP7AdaptersFailClosedWithoutDatabase(t *testing.T) {
 	}
 	if _, err := lookup.ExportArtifactExists(ctx, 1); err == nil {
 		t.Fatal("owner lookup accepted a nil pool (export artifact)")
+	}
+}
+
+// TestP7VersionCaseBindingsProjectsSuccessBindingKeys pins the composition-root
+// projection consumed by the knowledge success hook: route templates with a URL
+// fallback, uppercase/default-GET API keys, per-binding role deduplication and
+// invalid resource IDs degrading to unset dimensions instead of zero IDs.
+func TestP7VersionCaseBindingsProjectsSuccessBindingKeys(t *testing.T) {
+	family := "shop"
+	fullView := versionapp.VersionView{
+		Bindings: []versionapp.BindingView{{
+			SUT:         resourceapp.SUTView{ID: "7001", Family: &family},
+			Environment: resourceapp.EnvironmentView{ID: "7101"},
+			Pages: []resourceapp.PageView{
+				{ID: "501", RouteTemplate: "/login", URL: "http://shop.test/login"},
+				{ID: "502", URL: "http://shop.test/cart"},
+				{ID: "503"},
+				{ID: "not-an-id", RouteTemplate: "/ignored"},
+			},
+			APIs: []resourceapp.APIView{
+				{ID: "601", Method: "post", PathTemplate: "/api/login"},
+				{ID: "602", PathTemplate: "/api/items"},
+				{ID: "603", Method: "GET", PathTemplate: " /api/orders "},
+				{ID: "604", Method: "GET"},
+				{ID: "not-an-id", Method: "GET", PathTemplate: "/ignored"},
+			},
+			Accounts: []resourceapp.AccountView{
+				{Roles: []string{"admin", " admin "}},
+				{Roles: []string{"user", "admin"}},
+				{Roles: []string{"", "  "}},
+			},
+		}},
+	}
+	wantFull := []knowledgeadapter.VersionBinding{{
+		SystemID:      7001,
+		EnvironmentID: 7101,
+		SystemKey:     "shop",
+		Pages: []knowledgeadapter.PageBinding{
+			{ID: 501, Key: "/login"},
+			{ID: 502, Key: "http://shop.test/cart"},
+		},
+		APIs: []knowledgeadapter.APIBinding{
+			{ID: 601, Key: "POST /api/login"},
+			{ID: 602, Key: "GET /api/items"},
+			{ID: 603, Key: "GET /api/orders"},
+		},
+		AccountRoles: []string{"admin", "user"},
+	}}
+
+	blankFamily := "   "
+	degradedView := versionapp.VersionView{
+		Bindings: []versionapp.BindingView{{
+			SUT:         resourceapp.SUTView{ID: "not-an-id", Family: &blankFamily},
+			Environment: resourceapp.EnvironmentView{ID: "-5"},
+			Pages:       []resourceapp.PageView{{ID: "bad", RouteTemplate: "/ignored"}},
+			APIs:        []resourceapp.APIView{{ID: "bad", Method: "GET", PathTemplate: "/ignored"}},
+			Accounts:    []resourceapp.AccountView{{Roles: []string{"admin"}}},
+		}},
+	}
+	wantDegraded := []knowledgeadapter.VersionBinding{{
+		AccountRoles: []string{"admin"},
+	}}
+
+	sourceErr := errors.New("version read failed")
+	tests := []struct {
+		name      string
+		source    versionCaseBindingSource
+		versionID int64
+		want      []knowledgeadapter.VersionBinding
+		wantErr   bool
+	}{
+		{
+			name:      "projects route templates with URL fallback, API keys and deduplicated roles",
+			source:    &p7FakeVersionCaseSource{view: fullView},
+			versionID: 10,
+			want:      wantFull,
+		},
+		{
+			name:      "invalid resource IDs degrade to unset dimensions",
+			source:    &p7FakeVersionCaseSource{view: degradedView},
+			versionID: 10,
+			want:      wantDegraded,
+		},
+		{
+			name:      "a version without bindings yields an empty projection",
+			source:    &p7FakeVersionCaseSource{},
+			versionID: 10,
+			want:      []knowledgeadapter.VersionBinding{},
+		},
+		{name: "rejects a missing version source", source: nil, versionID: 10, wantErr: true},
+		{name: "rejects a non-positive version ID", source: &p7FakeVersionCaseSource{}, versionID: 0, wantErr: true},
+		{name: "propagates the version read error", source: &p7FakeVersionCaseSource{err: sourceErr}, versionID: 10, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := (p7VersionCaseBindings{versions: tt.source}).VersionBindings(context.Background(), tt.versionID)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("VersionBindings() error = nil, want an error")
+				}
+				if got != nil {
+					t.Fatalf("VersionBindings() = %#v on error, want nil", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VersionBindings() error = %v", err)
+			}
+			if fake, ok := tt.source.(*p7FakeVersionCaseSource); ok {
+				if len(fake.ids) != 1 || fake.ids[0] != tt.versionID {
+					t.Fatalf("source queried version IDs = %v, want [%d]", fake.ids, tt.versionID)
+				}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("VersionBindings() = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 
