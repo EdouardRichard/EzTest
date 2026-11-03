@@ -23,18 +23,38 @@ import (
 // (result.json finding O13, tools/out-exec-detail.json).
 var observedCaseExecutorRunUsage = Usage{Tokens: 409842, Turns: 28}
 
-// TestCaseExecutorBudgetAllowsExecution pins Task 89, its Task 97 raise and its
-// Task 103 raise: execute.case runs through the case_executor profile, which
-// must get an explicit case-scale token floor instead of the generic 20k chat
-// budget. The floor is enforced by the runner, not read from the stored profile
-// row: profiles are seeded once and EnsureProfiles never overwrites an existing
-// row, so a stale chat-scale row must not push the executor back to 20k (the
-// same reasoning as the Task 79 design floor). O13 showed that the 400k floor is
-// still not enough for a complete 5-step/3-assertion case (409,842 tokens used
-// after 28 turns, only 2/5 steps, 0/3 assertions): the raised bound must keep
-// that observed usage inside the run while remaining a bounded cap. The raise is
-// case-executor-only, and a work item's more specific 0.2.1 budget declaration
-// still wins over the profile floor.
+// observedFR011CaseExecutorRunUsage is the cumulative usage of the real 4-step /
+// 5-assertion case AC-FR-011-01 登录成功（正向） of the PO final E2E
+// (2026-11-03, case run 376026576434761738, wave 376026576434761728). Its
+// summary is the failure Task 109 removes:
+//
+//	"token budget: used 813006 of 800000 tokens after 44 turns; the case
+//	 recorded 3 of 4 steps before the run ended"
+//
+// with assertion_total=1, verdict_reason=incomplete, terminal_cause=token_budget
+// and next_action=rerun: the 800k cap raised by Task 103 still turned the next
+// turn into the tool-less settlement turn during the last step, so the remaining
+// assertions were never recorded. 44 turns is still below the 60-turn case
+// envelope, so only the token budget ended the run. Evidence:
+// docs/version-V0.2.1/acceptance/evidence/user-trials-team/product-owner/e2e/
+// (tools/out-exec-detail.json).
+var observedFR011CaseExecutorRunUsage = Usage{Tokens: 813006, Turns: 44}
+
+// TestCaseExecutorBudgetAllowsExecution pins Task 89, its Task 97 raise, its
+// Task 103 raise and its Task 109 raise: execute.case runs through the
+// case_executor profile, which must get an explicit case-scale token floor
+// instead of the generic 20k chat budget. The floor is enforced by the runner,
+// not read from the stored profile row: profiles are seeded once and
+// EnsureProfiles never overwrites an existing row, so a stale chat-scale row
+// must not push the executor back to 20k (the same reasoning as the Task 79
+// design floor). O13 showed that the 400k floor was not enough for a complete
+// 5-step/3-assertion case (409,842 tokens used after 28 turns, only 2/5 steps,
+// 0/3 assertions); FR-011-01 then showed that the 800k floor raised by Task 103
+// was still not enough for a complete 4-step/5-assertion case (813,006 tokens
+// used after 44 turns, only 3/4 steps, 1/5 assertions). The raised bound must
+// keep both observed usages inside the run while remaining a bounded cap. The
+// raise is case-executor-only, and a work item's more specific 0.2.1 budget
+// declaration still wins over the profile floor.
 func TestCaseExecutorBudgetAllowsExecution(t *testing.T) {
 	runner := &Runner{}
 	item := agent.WorkItem{VersionID: 1, Type: WorkTypeExecuteCase}
@@ -69,7 +89,34 @@ func TestCaseExecutorBudgetAllowsExecution(t *testing.T) {
 			cause, BudgetCauseTokens)
 	}
 
-	const wantCap = 800000
+	// The FR-011-01 observation must continue too: 44 turns is inside the
+	// 59-turn fuse and below the 60-turn loop cap, so the 800k token cap was the
+	// only resource that ended the run (terminal_cause=token_budget). 813,006
+	// tokens must not settle: the next tool turn is the one that executes the
+	// remaining step and records the remaining assertions.
+	if got := liveBudget.Decide(observedFR011CaseExecutorRunUsage); got != BudgetContinue {
+		t.Fatalf("case_executor budget decision at the observed FR-011-01 usage = %q, want %q",
+			got, BudgetContinue)
+	}
+	if cause := liveBudget.ExceededBy(observedFR011CaseExecutorRunUsage); cause != "" {
+		t.Fatalf("case_executor cause at the observed FR-011-01 usage = %q, want none", cause)
+	}
+
+	// Reproduction of the FR-011-01 failure: the same usage under the 800k
+	// envelope raised by Task 103 settles on the token cause, exactly the
+	// recorded terminal_cause=token_budget (44 turns, 3 of 4 steps, 1 of 5
+	// assertions).
+	previousCap := Budget{MaxTokens: 800000, RunSeconds: 780, MaxTurnsFuse: 59}
+	if got := previousCap.Decide(observedFR011CaseExecutorRunUsage); got != BudgetSettle {
+		t.Fatalf("800k budget decision at the observed FR-011-01 usage = %q, want %q",
+			got, BudgetSettle)
+	}
+	if cause := previousCap.ExceededBy(observedFR011CaseExecutorRunUsage); cause != BudgetCauseTokens {
+		t.Fatalf("800k cause at the observed FR-011-01 usage = %q, want %q",
+			cause, BudgetCauseTokens)
+	}
+
+	const wantCap = 1200000
 	if liveBudget.MaxTokens != wantCap {
 		t.Fatalf("live case_executor token budget = %d, want the raised execution cap %d",
 			liveBudget.MaxTokens, wantCap)
@@ -89,15 +136,19 @@ func TestCaseExecutorBudgetAllowsExecution(t *testing.T) {
 		t.Fatalf("case_executor token budget = %d, want above the observed O13 usage %d",
 			liveBudget.MaxTokens, observedCaseExecutorRunUsage.Tokens)
 	}
+	if liveBudget.MaxTokens <= observedFR011CaseExecutorRunUsage.Tokens {
+		t.Fatalf("case_executor token budget = %d, want above the observed FR-011-01 usage %d",
+			liveBudget.MaxTokens, observedFR011CaseExecutorRunUsage.Tokens)
+	}
 
-	// The raise is a bounded cap, not an unbounded budget: 800k still settles.
-	if got := liveBudget.Decide(Usage{Tokens: wantCap - 1, Turns: observedCaseExecutorRunUsage.Turns}); got != BudgetContinue {
+	// The raise is a bounded cap, not an unbounded budget: 1.2M still settles.
+	if got := liveBudget.Decide(Usage{Tokens: wantCap - 1, Turns: observedFR011CaseExecutorRunUsage.Turns}); got != BudgetContinue {
 		t.Fatalf("case_executor budget decision one token below the cap = %q, want %q", got, BudgetContinue)
 	}
-	if got := liveBudget.Decide(Usage{Tokens: wantCap, Turns: observedCaseExecutorRunUsage.Turns}); got != BudgetSettle {
+	if got := liveBudget.Decide(Usage{Tokens: wantCap, Turns: observedFR011CaseExecutorRunUsage.Turns}); got != BudgetSettle {
 		t.Fatalf("case_executor budget decision at the cap = %q, want %q", got, BudgetSettle)
 	}
-	if cause := liveBudget.ExceededBy(Usage{Tokens: wantCap, Turns: observedCaseExecutorRunUsage.Turns}); cause != BudgetCauseTokens {
+	if cause := liveBudget.ExceededBy(Usage{Tokens: wantCap, Turns: observedFR011CaseExecutorRunUsage.Turns}); cause != BudgetCauseTokens {
 		t.Fatalf("case_executor cause at the cap = %q, want %q", cause, BudgetCauseTokens)
 	}
 
@@ -132,10 +183,10 @@ func TestCaseExecutorBudgetAllowsExecution(t *testing.T) {
 	if overridden.MaxTokens != 50000 || overridden.RunSeconds != 120 || overridden.MaxTurnsFuse != 5 {
 		t.Fatalf("declared execute.case budget = %#v, want max_tokens/run_seconds/max_turns_fuse 50000/120/5", overridden)
 	}
-	// The declared 50k cap, not the 800k floor, bounds the run: the O13 usage is
-	// over the declaration and must settle on the token cause.
-	if cause := overridden.ExceededBy(Usage{Tokens: observedCaseExecutorRunUsage.Tokens, Turns: 4}); cause != BudgetCauseTokens {
-		t.Fatalf("declared execute.case cause at the observed O13 usage = %q, want %q (the item declaration must still win)",
+	// The declared 50k cap, not the 1.2M floor, bounds the run: the observed
+	// FR-011-01 usage is over the declaration and must settle on the token cause.
+	if cause := overridden.ExceededBy(Usage{Tokens: observedFR011CaseExecutorRunUsage.Tokens, Turns: 4}); cause != BudgetCauseTokens {
+		t.Fatalf("declared execute.case cause at the observed FR-011-01 usage = %q, want %q (the item declaration must still win)",
 			cause, BudgetCauseTokens)
 	}
 }

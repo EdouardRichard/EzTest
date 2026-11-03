@@ -2351,23 +2351,29 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 const DesignRunMaxTokens = 200000
 
 // CaseExecutorRunMaxTokens is the case-scale token budget of a real case
-// execution (Task 89, raised by Tasks 97 and 103). Usage is cumulative across
-// the turns of one run and every turn re-sends the task pack plus the browser
-// snapshot/ARIA tool results, so the generic 20k chat budget was exhausted after
-// four turns in the final small S5 run (31,943 / 33,979 total tokens): the
-// following settlement turn disabled tools and execution.step_record/
-// assertion_record could never write anything, leaving both case runs with
-// assertion_total=0. The first 200k raise was still not enough for a real
-// 4-step case: S5 retry-6 (case run 375990017199177730) used 216,814 tokens
-// after 15 turns and stopped during step 2 of 4 with no assertion recorded. 400k
-// covers the remaining steps, assertions and evidence calls while remaining a
-// bounded cap (above the observed failure point, not an unbounded budget). 400k
-// was still too small for the complete 5-step/3-assertion case of the O13 PO
-// retry: AC-FR-025-01 used 409,842 tokens after 28 turns and had recorded only 2
-// of 5 steps and 0 of 3 assertions when the token settlement turned the run
-// inconclusive/token_budget. 800k keeps that observed usage inside the run (28
-// turns is still well below the 60-turn case envelope) and covers the remaining
-// steps, assertions and evidence calls while remaining a bounded cap.
+// execution (Task 89, raised by Tasks 97, 103 and 109). Usage is cumulative
+// across the turns of one run and every turn re-sends the task pack plus the
+// browser snapshot/ARIA tool results, so the generic 20k chat budget was
+// exhausted after four turns in the final small S5 run (31,943 / 33,979 total
+// tokens): the following settlement turn disabled tools and
+// execution.step_record/assertion_record could never write anything, leaving
+// both case runs with assertion_total=0. The first 200k raise was still not
+// enough for a real 4-step case: S5 retry-6 (case run 375990017199177730) used
+// 216,814 tokens after 15 turns and stopped during step 2 of 4 with no
+// assertion recorded. 400k covers the remaining steps, assertions and evidence
+// calls while remaining a bounded cap (above the observed failure point, not an
+// unbounded budget). 400k was still too small for the complete 5-step/
+// 3-assertion case of the O13 PO retry: AC-FR-025-01 used 409,842 tokens after
+// 28 turns and had recorded only 2 of 5 steps and 0 of 3 assertions when the
+// token settlement turned the run inconclusive/token_budget. 800k kept that
+// observed usage inside the run (28 turns is still well below the 60-turn case
+// envelope), but it was still too small for the complete 4-step/5-assertion case
+// of the PO final E2E: AC-FR-011-01 used 813,006 tokens after 44 turns and had
+// recorded only 3 of 4 steps and 1 of 5 assertions when the token settlement
+// turned the run inconclusive/token_budget. 1.2M keeps that observed usage
+// inside the run (44 turns is still below the 60-turn envelope) and covers the
+// remaining step, assertions and evidence calls while remaining a bounded cap
+// (above the observed failure point, not an unbounded budget).
 // Task 98 additionally bounds the per-turn replay: older browser read results are
 // pruned from the prompt transcript and the budget settlement turn can still
 // record the assertions of already executed steps. The runner enforces the cap in
@@ -2376,7 +2382,7 @@ const DesignRunMaxTokens = 200000
 // executor back to the generic budget (same reasoning as the Task 79 design
 // floor). A work item's explicit 0.2.1 budget declaration still wins over the
 // profile floor.
-const CaseExecutorRunMaxTokens = 800000
+const CaseExecutorRunMaxTokens = 1200000
 
 // Design authoring envelope (Task 79). The stored profile budgets cannot be
 // trusted for design runs: profiles are seeded once and EnsureProfiles never
