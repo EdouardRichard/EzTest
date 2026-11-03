@@ -237,11 +237,23 @@ func (f *scriptedChat) request(index int) llmapp.ChatRequest {
 	return f.requests[index]
 }
 
+// fakeJobCardRecord is one job_card message the runner projected into a
+// conversation. The fake mirrors the version writer's one-card-per-job upsert:
+// a repeated projection updates Data/History instead of appending a record.
+type fakeJobCardRecord struct {
+	VersionID      int64
+	ConversationID int64
+	MessageID      int64
+	Data           map[string]any
+	History        []map[string]any
+}
+
 type fakeConversationPort struct {
 	kind        string
 	snapshot    agentapp.ConversationSnapshot
 	messages    map[int64]agentapp.ConversationMessage
 	appended    []agentapp.AssistantMessageInput
+	jobCards    []fakeJobCardRecord
 	summaries   []string
 	summaryVer  int
 	snapshotErr error
@@ -294,6 +306,52 @@ func (f *fakeConversationPort) UpdateSummary(_ context.Context, _, _ int64, summ
 	f.summaries = append(f.summaries, summary)
 	f.summaryVer++
 	return agentapp.ConversationSummary{Version: f.summaryVer, Summary: summary}, nil
+}
+
+// UpsertJobCard mirrors the version writer's one-card-per-job contract: the
+// first projection for a (conversation, job) appends the card message, later
+// projections rewrite that same record and keep the update history.
+func (f *fakeConversationPort) UpsertJobCard(_ context.Context, versionID, conversationID int64, part agentapp.ConversationPart) (agentapp.ConversationMessage, error) {
+	jobID, _ := part.Data["job_id"].(string)
+	for index := range f.jobCards {
+		record := &f.jobCards[index]
+		existingJobID, _ := record.Data["job_id"].(string)
+		if record.VersionID != versionID || record.ConversationID != conversationID || existingJobID != jobID {
+			continue
+		}
+		record.Data = copyPartData(part.Data)
+		record.History = append(record.History, copyPartData(part.Data))
+		return agentapp.ConversationMessage{
+			ID:             record.MessageID,
+			VersionID:      versionID,
+			ConversationID: conversationID,
+			Role:           "assistant",
+			Parts:          []agentapp.ConversationPart{part},
+		}, nil
+	}
+	record := fakeJobCardRecord{
+		VersionID:      versionID,
+		ConversationID: conversationID,
+		MessageID:      int64(9200 + len(f.jobCards)),
+		Data:           copyPartData(part.Data),
+	}
+	record.History = append(record.History, copyPartData(part.Data))
+	f.jobCards = append(f.jobCards, record)
+	return agentapp.ConversationMessage{
+		ID:             record.MessageID,
+		VersionID:      versionID,
+		ConversationID: conversationID,
+		Role:           "assistant",
+		Parts:          []agentapp.ConversationPart{part},
+	}, nil
+}
+
+func copyPartData(data map[string]any) map[string]any {
+	copied := make(map[string]any, len(data))
+	for key, value := range data {
+		copied[key] = value
+	}
+	return copied
 }
 
 type fakeVersionReader struct {

@@ -386,9 +386,10 @@ type runState struct {
 	userContent    string
 	cards          []ConversationPart
 	// streamParts are the 0.2.1 UI streaming parts produced by this run
-	// (thinking/tool_call/error; job_card is appended when the final message is
-	// written). They are written with the assistant message as
-	// conversation_message_part rows and published on conversation.message.
+	// (thinking/tool_call/error). They are written with the final assistant
+	// message as conversation_message_part rows and published on
+	// conversation.message. The job's own card is a separate assistant message
+	// owned by projectJobCard.
 	streamParts      []ConversationPart
 	conversationKind string
 	team             agent.Team
@@ -396,9 +397,32 @@ type runState struct {
 	softNoted        bool
 }
 
-// Run executes one work item. On failure the agent_run row is already marked
-// failed/interrupted and the returned error carries the retry classification.
+// Run executes one work item and projects the job into its conversation as one
+// job_card: the start snapshot before the run begins, one progress snapshot per
+// completed turn and the terminal run outcome. The projection is best effort
+// and never changes the run verdict or the persisted work-item state.
 func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error) {
+	payload, payloadErr := ParseWorkItemPayload(item.Payload)
+	if payloadErr == nil {
+		r.projectJobCard(ctx, item, payload, "running", 0)
+	}
+	result, err := r.run(ctx, item)
+	if payloadErr == nil {
+		if status, ok := jobCardTerminalStatus(item, err); ok {
+			// The run context may already be cancelled; the terminal card is a
+			// short independent write like the other post-run write-backs.
+			finishCtx, cancel := context.WithTimeout(context.Background(), jobCardWriteTimeout)
+			r.projectJobCard(finishCtx, item, payload, status, result.Turns)
+			cancel()
+		}
+	}
+	return result, err
+}
+
+// run is Run without the conversation job-card projection. On failure the
+// agent_run row is already marked failed/interrupted and the returned error
+// carries the retry classification.
+func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error) {
 	if r.load != nil {
 		r.load.Inc()
 		defer r.load.Dec()
@@ -1723,15 +1747,17 @@ func (r *Runner) publish(state *runState, eventType string, payload map[string]a
 	})
 }
 
-// reportJobProgress advances the job card's step counter with the completed
-// model turns of this run. The emitter is the worker's per-job coalescer
-// carried on the run context; without one (P1-P8 call paths and runner unit
-// tests) this is a no-op. total stays 0 ("unknown") so the UI never derives a
-// fabricated percentage (contracts/events.md §18.2 #4).
+// reportJobProgress advances the job card with the completed model turns of
+// this run: the conversation snapshot is rewritten through the conversation
+// port (one card per job) and, when the worker attached its per-job coalescer,
+// the same counter is published as a coalesced job.progress event. total stays
+// 0 ("unknown") so the UI never derives a fabricated percentage
+// (contracts/events.md §18.2 #4).
 func (r *Runner) reportJobProgress(ctx context.Context, state *runState) {
 	if state == nil {
 		return
 	}
+	r.projectJobCard(ctx, state.item, state.payload, "running", state.turns)
 	emitter := jobEventsFromContext(ctx)
 	if emitter == nil {
 		return
@@ -2524,15 +2550,13 @@ func (r *Runner) appendToolParts(state *runState, call llmapp.ToolCall, content 
 }
 
 // assistantConversationParts renders the parts of one final assistant message:
-// the produced trace parts (thinking/tool_call/error), the job_card of the work
-// item that wrote the message (when it maps to a contract job kind), the final
-// text and the profile-specific extra cards. Order is the render order.
+// the produced trace parts (thinking/tool_call/error), the final text and the
+// profile-specific extra cards. Order is the render order. The background job's
+// own card is not part of this message: it lives in the dedicated card message
+// written by projectJobCard, so one job never renders two job_cards.
 func (r *Runner) assistantConversationParts(state *runState, finalText string, extra []ConversationPart) []ConversationPart {
-	parts := make([]ConversationPart, 0, len(state.streamParts)+2+len(extra))
+	parts := make([]ConversationPart, 0, len(state.streamParts)+1+len(extra))
 	parts = append(parts, state.streamParts...)
-	if card, ok := jobCardConversationPart(state); ok {
-		parts = append(parts, card)
-	}
 	if finalText != "" {
 		parts = append(parts, ConversationPart{Type: "text", Text: finalText})
 	}
@@ -2540,25 +2564,90 @@ func (r *Runner) assistantConversationParts(state *runState, finalText string, e
 	return parts
 }
 
-// jobCardConversationPart projects the run's work item as a job_card part.
-// Chat-scale work items have no contract job kind, so they produce no card; a
-// background job (design.cases/execute.batch/...) shows up in the thread.
-func jobCardConversationPart(state *runState) (ConversationPart, bool) {
-	if state == nil || state.item.ID <= 0 {
-		return ConversationPart{}, false
+// jobCardWriteTimeout bounds the terminal card write-back, which runs after the
+// run context may already be cancelled.
+const jobCardWriteTimeout = 5 * time.Second
+
+// projectJobCard writes the single job_card part of a background job into its
+// conversation. It is a no-op when the job does not map to a card kind or the
+// work item carries no conversation. The version context owns idempotency: a
+// repeated start/progress/terminal projection rewrites the same card message
+// instead of appending a second one. The write is best effort: a card failure
+// is logged and never changes the run verdict.
+func (r *Runner) projectJobCard(ctx context.Context, item agent.WorkItem, payload WorkItemPayload, status string, current int) {
+	if r == nil || r.conversation == nil || item.ID <= 0 || payload.ConversationID <= 0 {
+		return
 	}
-	kind := jobKind(state.item)
-	if !version.IsValidJobCardKind(kind) {
-		return ConversationPart{}, false
+	kind, ok := jobKindForCard(item)
+	if !ok {
+		return
 	}
-	return ConversationPart{Type: "job_card", Data: map[string]any{
-		"job_id":     idText(state.item.ID),
+	if current < 0 {
+		current = 0
+	}
+	card := ConversationPart{Type: version.MessagePartJobCard, Data: map[string]any{
+		"job_id":     idText(item.ID),
 		"kind":       kind,
-		"status":     "running",
-		"current":    int64(state.turns),
+		"status":     status,
+		"current":    int64(current),
 		"total":      int64(0),
-		"cancelable": true,
-	}}, true
+		"cancelable": jobCardCancelable(status),
+	}}
+	if _, err := r.conversation.UpsertJobCard(ctx, item.VersionID, payload.ConversationID, card); err != nil {
+		if r.logger != nil {
+			r.logger.Warn("agent runner: project job card failed",
+				"work_item_id", item.ID, "conversation_id", payload.ConversationID,
+				"status", status, "error", err)
+		}
+	}
+}
+
+// jobKindForCard resolves the conversation job-card kind of a work item: the
+// frozen 0.2.1 contract kind when the row carries one, otherwise the
+// conversation-writing work type (chat.turn/requirement.curate/design.round).
+// Anything else has no card.
+func jobKindForCard(item agent.WorkItem) (string, bool) {
+	kind := jobKind(item)
+	if version.IsValidJobCardKind(kind) || version.IsConversationJobCardKind(kind) {
+		return kind, true
+	}
+	return "", false
+}
+
+// jobCardCancelable mirrors the card contract: an in-flight job may be
+// cancelled; a terminal card must not offer it.
+func jobCardCancelable(status string) bool {
+	switch status {
+	case "open", "claimed", "running", "waiting_human":
+		return true
+	default:
+		return false
+	}
+}
+
+// jobCardTerminalStatus maps a finished run to the stored card status. A
+// retryable failure below the attempt cap returns the job to queued (the worker
+// reopens the item); a fenced or aborted run owns no terminal card and keeps
+// the previous projection (the new owner or the job-control cancel path owns
+// it). done and failed are terminal.
+func jobCardTerminalStatus(item agent.WorkItem, err error) (string, bool) {
+	if err == nil {
+		return "done", true
+	}
+	if IsLeaseLost(err) {
+		return "", false
+	}
+	var runErr *RunError
+	if errors.As(err, &runErr) {
+		switch runErr.Reason {
+		case "lease_lost", "aborted", "interrupted":
+			return "", false
+		}
+	}
+	if IsRetryable(err) && item.Attempts < item.MaxAttempts {
+		return "open", true
+	}
+	return "failed", true
 }
 
 // partDurationMS renders a non-negative elapsed duration for the UI.

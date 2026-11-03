@@ -66,6 +66,11 @@ type ConversationPort interface {
 	ConversationKind(ctx context.Context, versionID, conversationID int64) (string, error)
 	GetMessage(ctx context.Context, versionID, conversationID, messageID int64) (ConversationMessage, error)
 	AppendAssistantMessage(ctx context.Context, in AssistantMessageInput) (ConversationMessage, error)
+	// UpsertJobCard stores or refreshes the single job_card part of one
+	// background job in the conversation. The first projection appends the card
+	// message; later start/progress/terminal projections rewrite that same card
+	// (one card per job). The part must be a job_card ConversationPart.
+	UpsertJobCard(ctx context.Context, versionID, conversationID int64, part ConversationPart) (ConversationMessage, error)
 	UpdateSummary(ctx context.Context, versionID, conversationID int64, summary string, pinnedFacts []string) (ConversationSummary, error)
 }
 

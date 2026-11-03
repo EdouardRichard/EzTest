@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
@@ -37,7 +38,9 @@ func (a DispatchActor) Valid() bool { return agent.ValidWorkItemCreatedBy(string
 
 // DispatchRequest is one four-way work_item creation request (D21). The actor
 // is the creator, never the executor; the version stage owns which kinds may be
-// created when.
+// created when. ConversationID is the optional conversation association of a
+// background job requested for a thread (the runner projects the job_card into
+// it); 0 means the job is not tied to a conversation.
 type DispatchRequest struct {
 	VersionID      int64
 	Kind           string
@@ -49,6 +52,7 @@ type DispatchRequest struct {
 	DependsOn      []int64
 	Actor          DispatchActor
 	IdempotencyKey string
+	ConversationID int64
 }
 
 // VersionStageReader reads the deterministic stage projection the dispatcher
@@ -139,12 +143,21 @@ func (d *Dispatcher) RequestJob(ctx context.Context, versionID int64, kind strin
 	if len(bytes.TrimSpace(inputs)) == 0 {
 		inputs = nil
 	}
+	// The request may name the conversation it belongs to (D25: the job does
+	// not read the thread; the association only targets the job_card). The
+	// value rides in the frozen work_item payload column so the runner can
+	// project the card without a 0.2.1 migration.
+	conversationID, err := conversationAssociation(inputs)
+	if err != nil {
+		return agent.WorkItem{}, err
+	}
 	return d.Dispatch(ctx, DispatchRequest{
 		VersionID:      versionID,
 		Kind:           kind,
 		Inputs:         inputs,
 		Actor:          DispatchActorAssistant,
 		IdempotencyKey: stageJobKey(versionID, kind, inputs),
+		ConversationID: conversationID,
 	})
 }
 
@@ -181,7 +194,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (agent.W
 	if d.workItems == nil {
 		return agent.WorkItem{}, errors.New("dispatcher: work item repository is not configured")
 	}
-	item, err := d.workItems.CreateWorkItem(ctx, agent.CreateWorkItemParams{
+	params := agent.CreateWorkItemParams{
 		VersionID:      req.VersionID,
 		Kind:           req.Kind,
 		Goal:           req.Goal,
@@ -192,7 +205,18 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (agent.W
 		DependsOn:      req.DependsOn,
 		CreatedBy:      string(req.Actor),
 		IdempotencyKey: req.IdempotencyKey,
-	})
+	}
+	if req.ConversationID > 0 {
+		// The conversation association targets the job_card projection. It
+		// lives in the frozen payload column (no 0.2.1 conversation_id column)
+		// and never alters the job's inputs.
+		payload, err := conversationJobPayload(params.Payload, req.ConversationID)
+		if err != nil {
+			return agent.WorkItem{}, err
+		}
+		params.Payload = payload
+	}
+	item, err := d.workItems.CreateWorkItem(ctx, params)
 	if err != nil {
 		return agent.WorkItem{}, fmt.Errorf("dispatch %s: %w", req.Kind, err)
 	}
@@ -383,4 +407,66 @@ func targetHash(inputs json.RawMessage) string {
 	}
 	sum := sha256.Sum256(canonical)
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// conversationAssociation reads the optional conversation_id from a job.start
+// payload. Both the canonical decimal string and a JSON number are accepted; a
+// malformed value is a typed validation error rather than a silently dropped
+// association (the job would otherwise never show its card).
+func conversationAssociation(raw json.RawMessage) (int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return 0, nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
+		return 0, nil
+	}
+	value, ok := object["conversation_id"]
+	if !ok {
+		return 0, nil
+	}
+	text := strings.TrimSpace(string(value))
+	if text == "" || text == "null" {
+		return 0, nil
+	}
+	if strings.HasPrefix(text, `"`) {
+		var decoded string
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return 0, platform.Invalid("conversation_id", "must be a positive decimal ID")
+		}
+		text = strings.TrimSpace(decoded)
+		if text == "" {
+			return 0, nil
+		}
+	}
+	conversationID, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || conversationID <= 0 {
+		return 0, platform.Invalid("conversation_id", "must be a positive decimal ID")
+	}
+	return conversationID, nil
+}
+
+// conversationJobPayload carries the job's conversation association in the
+// frozen legacy payload column. work_item has no conversation_id column and
+// 0.2.1 adds no migration, so the association is stored as the canonical
+// decimal string key the agent runner already reads (ParseWorkItemPayload).
+// Any existing payload object is preserved key by key.
+func conversationJobPayload(existing json.RawMessage, conversationID int64) (json.RawMessage, error) {
+	object := map[string]json.RawMessage{}
+	if trimmed := bytes.TrimSpace(existing); len(trimmed) > 0 {
+		if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
+			return nil, platform.Invalid("payload", "must be a JSON object")
+		}
+	}
+	encodedID, err := json.Marshal(strconv.FormatInt(conversationID, 10))
+	if err != nil {
+		return nil, fmt.Errorf("encode conversation_id: %w", err)
+	}
+	object["conversation_id"] = encodedID
+	payload, err := json.Marshal(object)
+	if err != nil {
+		return nil, fmt.Errorf("encode work item payload: %w", err)
+	}
+	return payload, nil
 }

@@ -40,6 +40,13 @@ func (a *Adapter) Snapshot(ctx context.Context, versionID, conversationID int64,
 	}
 	portMessages := make([]agentapp.ConversationMessage, 0, len(messages))
 	for _, message := range messages {
+		// A job card is a UI artifact of a background job, not a conversation
+		// turn: the card message carries no text, so injecting it would add an
+		// empty assistant turn to the Host/curator prompt (D25 keeps background
+		// work out of the conversation context).
+		if isJobCardOnlyMessage(message) {
+			continue
+		}
 		portMessages = append(portMessages, conversationMessage(message, versionID))
 	}
 	summaryText := summary.Summary
@@ -121,6 +128,30 @@ func (a *Adapter) AppendAssistantMessage(ctx context.Context, in agentapp.Assist
 	return message, nil
 }
 
+// UpsertJobCard stores or refreshes the single job_card part of one background
+// job in the conversation thread. The version context owns validation and the
+// one-card-per-job idempotency; the adapter only maps the runtime part shape.
+func (a *Adapter) UpsertJobCard(ctx context.Context, versionID, conversationID int64, part agentapp.ConversationPart) (agentapp.ConversationMessage, error) {
+	if a.conversations == nil {
+		return agentapp.ConversationMessage{}, a.missing("conversations")
+	}
+	if versionID <= 0 || conversationID <= 0 {
+		return agentapp.ConversationMessage{}, platform.Invalid("conversation_id", "must be positive decimal IDs")
+	}
+	mapped, err := versionPart(part)
+	if err != nil {
+		return agentapp.ConversationMessage{}, err
+	}
+	if mapped.Type != version.MessagePartJobCard {
+		return agentapp.ConversationMessage{}, platform.Invalid("type", "must be job_card")
+	}
+	view, _, err := a.conversations.UpsertJobCard(ctx, versionID, conversationID, mapped)
+	if err != nil {
+		return agentapp.ConversationMessage{}, err
+	}
+	return conversationMessage(view, versionID), nil
+}
+
 // UpdateSummary writes a new conversation summary revision and returns the
 // stored version.
 func (a *Adapter) UpdateSummary(ctx context.Context, versionID, conversationID int64, summary string, pinnedFacts []string) (agentapp.ConversationSummary, error) {
@@ -164,6 +195,17 @@ func (a *Adapter) allMessages(ctx context.Context, versionID, conversationID int
 		after = views[len(views)-1].ID
 	}
 	return all, nil
+}
+
+// isJobCardOnlyMessage reports whether a UI message exists only to carry a
+// background job card. Those messages are UI artifacts, not conversation turns:
+// the adapter keeps them out of the LLM history (an empty assistant turn would
+// otherwise pollute the Host/curator prompt).
+func isJobCardOnlyMessage(message versionapp.MessageView) bool {
+	if message.Role != version.MessageRoleAssistant || len(message.Parts) != 1 {
+		return false
+	}
+	return message.Parts[0].Type == version.MessagePartJobCard
 }
 
 func conversationMessage(view versionapp.MessageView, versionID int64) agentapp.ConversationMessage {

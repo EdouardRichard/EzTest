@@ -97,3 +97,48 @@ func TestConversationPortMapsStreamedParts(t *testing.T) {
 		t.Fatalf("mapped parts rejected by the version validator: %v", err)
 	}
 }
+
+// TestConversationPortUpsertsJobCard pins the adapter mapping of the mutable
+// job_card snapshot: the runtime part fields (decimal job id, kind, status,
+// counters, cancelable) reach the version writer's upsert, and the stored
+// message is returned as the port's conversation message.
+func TestConversationPortUpsertsJobCard(t *testing.T) {
+	ctx := context.Background()
+	var got version.MessagePart
+	fake := &fakeConversations{
+		upsertJobCardFn: func(_ context.Context, versionID, conversationID int64, card version.MessagePart) (versionapp.MessageView, bool, error) {
+			got = card
+			return versionapp.MessageView{
+				ID: 30, ConversationID: conversationID, Role: "assistant",
+				Parts: []version.MessagePart{card}, CreatedAt: testTime,
+			}, true, nil
+		},
+	}
+	adapter := versionadapter.New(nil, fake, nil, nil, nil)
+
+	message, err := adapter.UpsertJobCard(ctx, 10, 20, agentapp.ConversationPart{
+		Type: "job_card",
+		Data: map[string]any{
+			"job_id":     "501",
+			"kind":       "requirement.curate",
+			"status":     "running",
+			"current":    int64(2),
+			"total":      int64(0),
+			"cancelable": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpsertJobCard: %v", err)
+	}
+	if message.ID != 30 || message.ConversationID != 20 || message.Role != "assistant" {
+		t.Fatalf("message = %#v", message)
+	}
+	if got.Type != "job_card" || got.JobID != 501 || got.JobKind != "requirement.curate" ||
+		got.Status != "running" || got.Current != 2 || got.Total != 0 ||
+		got.Cancelable == nil || !*got.Cancelable {
+		t.Fatalf("mapped job card = %#v", got)
+	}
+	if err := version.ValidateJobCardMessage(got); err != nil {
+		t.Fatalf("mapped job card rejected by the version validator: %v", err)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -190,6 +191,90 @@ func (f *fakeConversationRepo) AppendAssistantMessage(_ context.Context, convers
 
 func (f *fakeConversationRepo) Summary(_ context.Context, conversationID int64) (*version.ConversationSummary, error) {
 	return f.latestSummary(conversationID), nil
+}
+
+// FindJobCardMessage mirrors the version writer's one-card-per-job lookup: the
+// newest assistant message whose parts carry a job_card for jobID.
+func (f *fakeConversationRepo) FindJobCardMessage(_ context.Context, versionID, conversationID, jobID int64) (*version.Message, error) {
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return nil, version.ErrMessageNotFound
+	}
+	messages := f.messages[conversationID]
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		if message.Role != version.MessageRoleAssistant {
+			continue
+		}
+		for _, part := range message.Parts {
+			if part.Type == version.MessagePartJobCard && part.JobID == jobID {
+				copied := message
+				copied.Parts = append([]version.MessagePart(nil), message.Parts...)
+				return &copied, nil
+			}
+		}
+	}
+	return nil, version.ErrMessageNotFound
+}
+
+// UpdateJobCardMessage mirrors the writer's in-place card rewrite: the message
+// snapshot part and its conversation_message_part payload change, while the
+// message/row identity (id, seq, created_at) stays untouched.
+func (f *fakeConversationRepo) UpdateJobCardMessage(_ context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return version.ErrMessageNotFound
+	}
+	for index := range f.messages[conversationID] {
+		message := &f.messages[conversationID][index]
+		if message.ID != messageID || message.Role != version.MessageRoleAssistant {
+			continue
+		}
+		replaced := false
+		for partIndex := range message.Parts {
+			if message.Parts[partIndex].Type == version.MessagePartJobCard && message.Parts[partIndex].JobID == jobID {
+				message.Parts[partIndex] = part
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			return version.ErrMessageNotFound
+		}
+		rows := f.messageParts[messageID]
+		for rowIndex := range rows {
+			if rows[rowIndex].Type != version.MessagePartJobCard {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(rows[rowIndex].Payload, &payload); err != nil {
+				return err
+			}
+			var rowJobID int64
+			switch typed := payload["job_id"].(type) {
+			case string:
+				parsed, err := strconv.ParseInt(typed, 10, 64)
+				if err != nil {
+					return err
+				}
+				rowJobID = parsed
+			case float64:
+				rowJobID = int64(typed)
+			}
+			if rowJobID != jobID {
+				continue
+			}
+			encoded, err := json.Marshal(part)
+			if err != nil {
+				return err
+			}
+			rows[rowIndex].Payload = encoded
+			f.messageParts[messageID] = rows
+			return nil
+		}
+		return nil
+	}
+	return version.ErrMessageNotFound
 }
 
 func (f *fakeConversationRepo) ListReconcilable(_ context.Context, limit int) ([]version.ReconcilerConversation, error) {

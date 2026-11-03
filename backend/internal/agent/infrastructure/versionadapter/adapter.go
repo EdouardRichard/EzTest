@@ -44,6 +44,9 @@ type ConversationService interface {
 	Messages(ctx context.Context, versionID, conversationID int64, after int64, limit int) ([]versionapp.MessageView, bool, error)
 	Summary(ctx context.Context, conversationID int64) (versionapp.SummaryView, error)
 	AppendAssistantMessageWithReply(ctx context.Context, conversationID int64, parts []version.MessagePart, runID int64, replyToMessageID *int64) (versionapp.MessageView, error)
+	// UpsertJobCard appends or rewrites the single job_card part of one
+	// background job in the conversation (one card per job).
+	UpsertJobCard(ctx context.Context, versionID, conversationID int64, card version.MessagePart) (versionapp.MessageView, bool, error)
 	UpdateSummary(ctx context.Context, conversationID int64, summary string, pinned []string) error
 	// ListReconcilable feeds the P1 reconciler (conversation opening/reply/curate).
 	ListReconcilable(ctx context.Context, limit int) ([]versionapp.ReconcilerConversation, error)

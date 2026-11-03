@@ -49,6 +49,11 @@ func (r *fakeWorkItemContractRepo) CreateWorkItem(_ context.Context, in agent.Cr
 		}
 	}
 	r.nextID++
+	payload := in.Payload
+	if len(payload) == 0 {
+		// The PostgreSQL writer defaults the frozen payload column to {}.
+		payload = json.RawMessage(`{}`)
+	}
 	item := agent.WorkItem{
 		ID:        r.nextID,
 		VersionID: in.VersionID,
@@ -58,6 +63,7 @@ func (r *fakeWorkItemContractRepo) CreateWorkItem(_ context.Context, in agent.Cr
 		Inputs:    in.Inputs,
 		Expected:  in.Expected,
 		Budget:    in.Budget,
+		Payload:   payload,
 		Status:    agent.WorkItemOpen,
 		DependsOn: in.DependsOn,
 		CreatedBy: in.CreatedBy,
@@ -419,6 +425,56 @@ func TestDispatchRequestJobWhitelist(t *testing.T) {
 		} else {
 			requirePlatformStatus(t, err, http.StatusForbidden)
 		}
+	}
+}
+
+// TestDispatchAssociatesJobCardConversation pins the job/card conversation
+// association: a requested job that names a conversation carries it in the
+// frozen work_item payload column (no 0.2.1 migration), which the runner reads
+// to project the job_card into that thread. The job inputs stay untouched and a
+// malformed conversation id is rejected instead of silently dropping the card.
+func TestDispatchAssociatesJobCardConversation(t *testing.T) {
+	ctx := context.Background()
+	dispatcher, repo, _, _ := newTestDispatcher(version.StageDesigning)
+
+	payload := json.RawMessage(`{"requirement_ids":[11],"conversation_id":"20"}`)
+	item, err := dispatcher.RequestJob(ctx, 7, agent.WorkItemKindDesignCases, payload)
+	if err != nil {
+		t.Fatalf("assistant design.cases request: %v", err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(item.Payload, &stored); err != nil {
+		t.Fatalf("decode work item payload %s: %v", item.Payload, err)
+	}
+	if stored["conversation_id"] != "20" {
+		t.Fatalf("work item payload conversation_id = %#v, want 20 (payload %s)", stored["conversation_id"], item.Payload)
+	}
+	if string(item.Inputs) != string(payload) {
+		t.Fatalf("inputs = %s, want the untouched job payload %s", item.Inputs, payload)
+	}
+	if got := repo.count(); got != 1 {
+		t.Fatalf("stored work items = %d, want 1", got)
+	}
+
+	// A request without a conversation association writes the empty payload.
+	plain, err := dispatcher.RequestJob(ctx, 7, agent.WorkItemKindDesignCases,
+		json.RawMessage(`{"requirement_ids":[12]}`))
+	if err != nil {
+		t.Fatalf("assistant request without a conversation: %v", err)
+	}
+	var plainPayload map[string]any
+	if err := json.Unmarshal(plain.Payload, &plainPayload); err != nil {
+		t.Fatalf("decode plain payload %s: %v", plain.Payload, err)
+	}
+	if _, ok := plainPayload["conversation_id"]; ok {
+		t.Fatalf("plain work item payload = %s, want no conversation association", plain.Payload)
+	}
+
+	// A malformed conversation id is a validation error, never a silently
+	// dropped association.
+	if _, err := dispatcher.RequestJob(ctx, 7, agent.WorkItemKindDesignCases,
+		json.RawMessage(`{"requirement_ids":[13],"conversation_id":"not-a-number"}`)); err == nil {
+		t.Fatal("request with a malformed conversation_id was accepted")
 	}
 }
 

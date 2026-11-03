@@ -478,6 +478,15 @@ type ConversationRepository interface {
 	// ascending by seq. The message must belong to the conversation and the
 	// conversation to the version; otherwise it returns ErrMessageNotFound.
 	MessageParts(ctx context.Context, versionID, conversationID, messageID int64) ([]ConversationMessagePart, error)
+	// FindJobCardMessage returns the assistant message carrying jobID's
+	// job_card part in one version-scoped conversation, or ErrMessageNotFound.
+	// It is the idempotency lookup behind the one-card-per-job contract.
+	FindJobCardMessage(ctx context.Context, versionID, conversationID, jobID int64) (*Message, error)
+	// UpdateJobCardMessage rewrites the stored snapshot part of jobID and its
+	// conversation_message_part payload inside messageID without appending a
+	// new message or part row. ErrMessageNotFound when the scoped message or
+	// its card is absent.
+	UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part MessagePart) error
 	// PostUserMessage inserts the message and bumps the conversation
 	// timestamp. When the client_message_id uniqueness constraint fires it
 	// returns the already-stored message instead of an error.
@@ -524,9 +533,12 @@ func ValidateClientMessageID(raw string) error {
 	return nil
 }
 
-// ValidateUserMessageParts validates one user message: text, attachment and
-// image parts only, at most ten attachments/images, and text within the
-// contract bounds.
+// ValidateUserMessageParts validates one user message: text, attachment, image
+// and case_card parts only, at most ten attachments/images, and text within the
+// contract bounds. A user case_card is a reference to an existing case (the
+// "hand to AI" action), not a secret or an uploaded artifact, so it follows the
+// same payload rules as the assistant case_card branch; the runtime-only
+// requirement_card/rollback_proposal parts stay rejected.
 func ValidateUserMessageParts(parts []MessagePart) error {
 	if len(parts) == 0 {
 		return platform.Invalid("parts", "must contain at least one part")
@@ -549,8 +561,12 @@ func ValidateUserMessageParts(parts []MessagePart) error {
 				return err
 			}
 			attachments++
+		case MessagePartCaseCard:
+			if err := validateCaseCardPart(part, field); err != nil {
+				return err
+			}
 		default:
-			return platform.Invalid(field("type"), "must be text, attachment or image")
+			return platform.Invalid(field("type"), "must be text, attachment, image or case_card")
 		}
 	}
 	if attachments > MaxMessageAttachments {
@@ -609,39 +625,15 @@ func ValidateAssistantMessageParts(parts []MessagePart) error {
 				return err
 			}
 		case MessagePartJobCard:
-			if part.JobID <= 0 {
-				return platform.Invalid(field("job_id"), "must be a positive decimal ID")
-			}
 			if !IsValidJobCardKind(part.JobKind) {
 				return platform.Invalid(field("kind"), "must be a job kind of the 0.2.1 contract")
 			}
-			cancelable, ok := jobCardStatusCancelable(part.Status)
-			if !ok {
-				return platform.Invalid(field("status"), "must be one of open, claimed, running, waiting_human, done, failed, cancelled")
-			}
-			if part.Current < 0 || part.Total < 0 {
-				return platform.Invalid(field("current"), "current/total must be non-negative integers")
-			}
-			if part.Total > 0 && part.Current > part.Total {
-				return platform.Invalid(field("current"), "must not exceed total")
-			}
-			if part.Cancelable != nil && *part.Cancelable && !cancelable {
-				return platform.Invalid(field("cancelable"), "must be false for a terminal job status")
-			}
-		case MessagePartCaseCard:
-			if part.CaseID <= 0 {
-				return platform.Invalid(field("case_id"), "must be a positive decimal ID")
-			}
-			if part.CaseVersionID < 0 {
-				return platform.Invalid(field("case_version_id"), "must be a positive decimal ID or null")
-			}
-			if err := validation.String(field("title"), part.Title, 1, CaseCardTitleMax); err != nil {
+			if err := validateJobCardPayload(part, field); err != nil {
 				return err
 			}
-			switch part.Status {
-			case "draft", "confirmed", "stale", "superseded":
-			default:
-				return platform.Invalid(field("status"), "must be one of draft, confirmed, stale, superseded")
+		case MessagePartCaseCard:
+			if err := validateCaseCardPart(part, field); err != nil {
+				return err
 			}
 		case MessagePartError:
 			if err := validation.String(field("code"), part.Code, 1, MessageErrorCodeMax); err != nil {
@@ -724,6 +716,63 @@ func IsValidJobCardKind(kind string) bool {
 	return ok
 }
 
+// conversationJobCardKinds are the P1/P2 conversation-writing work types that
+// run as background jobs for one conversation and therefore appear in the
+// thread as job cards. They are work item types, not frozen 0.2.1 contract job
+// kinds, so they stay out of IsValidJobCardKind: the contract enum sync for
+// them is owned by the contract task (Task 50).
+var conversationJobCardKinds = map[string]struct{}{
+	"chat.turn": {}, "requirement.curate": {}, "design.round": {},
+}
+
+// IsConversationJobCardKind reports whether kind is a conversation-writing work
+// type projected as a background job card (chat.turn/requirement.curate/
+// design.round).
+func IsConversationJobCardKind(kind string) bool {
+	_, ok := conversationJobCardKinds[kind]
+	return ok
+}
+
+// ValidateJobCardMessage validates the single mutable job_card part stored for
+// one background job in a conversation. It accepts the contract job kinds plus
+// the conversation work types above; every other field follows the MessagePart
+// job_card contract. Generic assistant parts stay restricted to the contract
+// kinds through ValidateAssistantMessageParts.
+func ValidateJobCardMessage(part MessagePart) error {
+	if part.Type != MessagePartJobCard {
+		return platform.Invalid("type", "must be job_card")
+	}
+	field := func(name string) string { return "parts[0]." + name }
+	kind := strings.TrimSpace(part.JobKind)
+	if !IsValidJobCardKind(kind) && !IsConversationJobCardKind(kind) {
+		return platform.Invalid(field("kind"), "must be a contract job kind or a conversation work type")
+	}
+	return validateJobCardPayload(part, field)
+}
+
+// validateJobCardPayload validates the job_card fields shared by the generic
+// assistant-part validator and the conversation card snapshot. The caller owns
+// the accepted kind set.
+func validateJobCardPayload(part MessagePart, field func(string) string) error {
+	if part.JobID <= 0 {
+		return platform.Invalid(field("job_id"), "must be a positive decimal ID")
+	}
+	cancelable, ok := jobCardStatusCancelable(part.Status)
+	if !ok {
+		return platform.Invalid(field("status"), "must be one of open, claimed, running, waiting_human, done, failed, cancelled")
+	}
+	if part.Current < 0 || part.Total < 0 {
+		return platform.Invalid(field("current"), "current/total must be non-negative integers")
+	}
+	if part.Total > 0 && part.Current > part.Total {
+		return platform.Invalid(field("current"), "must not exceed total")
+	}
+	if part.Cancelable != nil && *part.Cancelable && !cancelable {
+		return platform.Invalid(field("cancelable"), "must be false for a terminal job status")
+	}
+	return nil
+}
+
 // jobCardStatusCancelable validates the job_card status enum and reports
 // whether the derived UI may offer a cancel action for it.
 func jobCardStatusCancelable(status string) (bool, bool) {
@@ -750,6 +799,27 @@ func validateJSONObjectField(field string, raw json.RawMessage, allowNull bool) 
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
 		return platform.Invalid(field, "must be a JSON object")
+	}
+	return nil
+}
+
+// validateCaseCardPart validates the case_card payload shared by the user and
+// assistant part validators: a positive case ID, an optional positive case
+// version ID, a bounded title and the conversation case status enum.
+func validateCaseCardPart(part MessagePart, field func(string) string) error {
+	if part.CaseID <= 0 {
+		return platform.Invalid(field("case_id"), "must be a positive decimal ID")
+	}
+	if part.CaseVersionID < 0 {
+		return platform.Invalid(field("case_version_id"), "must be a positive decimal ID or null")
+	}
+	if err := validation.String(field("title"), part.Title, 1, CaseCardTitleMax); err != nil {
+		return err
+	}
+	switch part.Status {
+	case "draft", "confirmed", "stale", "superseded":
+	default:
+		return platform.Invalid(field("status"), "must be one of draft, confirmed, stale, superseded")
 	}
 	return nil
 }

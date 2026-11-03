@@ -94,9 +94,10 @@ func TestRunnerAppendsThinkingToolParts(t *testing.T) {
 }
 
 // TestRunnerAppendsJobCardPart pins the job_card producer for a background job
-// that writes into the conversation: job_id is the work item id, kind is the
-// contract job kind, progress starts at the completed turns and total=0 means
-// unknown (no fabricated percentage).
+// that writes into the conversation: the card is its own assistant message in
+// the thread (job_id = work item id, kind is the contract job kind), advanced by
+// the run and finalized at the terminal done snapshot — total=0 means unknown
+// (no fabricated percentage). The final assistant reply carries no second card.
 func TestRunnerAppendsJobCardPart(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.conv.kind = "design"
@@ -109,11 +110,10 @@ func TestRunnerAppendsJobCardPart(t *testing.T) {
 	if _, err := mustRun(t, fixture, item); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	parts := assistantParts(t, fixture)
-	card, ok := partOfType(parts, "job_card")
-	if !ok {
-		t.Fatalf("job card part missing: %v", partTypes(parts))
+	if len(fixture.conv.jobCards) != 1 {
+		t.Fatalf("job cards = %#v, want exactly one card for the job", fixture.conv.jobCards)
 	}
+	card := fixture.conv.jobCards[0]
 	jobID := strconv.FormatInt(item.ID, 10)
 	if card.Data["job_id"] != jobID {
 		t.Fatalf("job_id = %#v, want %s", card.Data["job_id"], jobID)
@@ -121,8 +121,8 @@ func TestRunnerAppendsJobCardPart(t *testing.T) {
 	if card.Data["kind"] != "design.cases" {
 		t.Fatalf("kind = %#v", card.Data["kind"])
 	}
-	if card.Data["status"] != "running" {
-		t.Fatalf("status = %#v, want running while the run is still in flight", card.Data["status"])
+	if card.Data["status"] != "done" {
+		t.Fatalf("status = %#v, want the terminal done snapshot", card.Data["status"])
 	}
 	if current, ok := card.Data["current"].(int64); !ok || current != 1 {
 		t.Fatalf("current = %#v, want the completed turn count", card.Data["current"])
@@ -130,8 +130,12 @@ func TestRunnerAppendsJobCardPart(t *testing.T) {
 	if total, ok := card.Data["total"].(int64); !ok || total != 0 {
 		t.Fatalf("total = %#v, want 0 (unknown)", card.Data["total"])
 	}
-	if cancelable, ok := card.Data["cancelable"].(bool); !ok || !cancelable {
-		t.Fatalf("cancelable = %#v, want true for a running job", card.Data["cancelable"])
+	if cancelable, ok := card.Data["cancelable"].(bool); !ok || cancelable {
+		t.Fatalf("cancelable = %#v, want false for a terminal job", card.Data["cancelable"])
+	}
+	parts := assistantParts(t, fixture)
+	if _, ok := partOfType(parts, "job_card"); ok {
+		t.Fatalf("job card duplicated in the final assistant message: %v", partTypes(parts))
 	}
 }
 

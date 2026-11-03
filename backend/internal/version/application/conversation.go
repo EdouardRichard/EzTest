@@ -400,6 +400,73 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 	return toMessageView(message), nil
 }
 
+// UpsertJobCard stores or refreshes the single job_card part of one background
+// job in a conversation. The first snapshot appends one assistant message whose
+// only part is the card (with its conversation_message_part row); every later
+// start/progress/terminal snapshot rewrites that same message and row in place,
+// so a job never owns two cards. The returned bool reports whether the card
+// message was created.
+func (s *ConversationService) UpsertJobCard(ctx context.Context, versionID, conversationID int64, card version.MessagePart) (MessageView, bool, error) {
+	if err := validateConversationIDs(versionID, conversationID); err != nil {
+		return MessageView{}, false, err
+	}
+	if err := version.ValidateJobCardMessage(card); err != nil {
+		return MessageView{}, false, err
+	}
+	// Ownership is version-scoped: a conversation of another version is a 404,
+	// never a cross-version card write.
+	if _, _, err := s.repo.Get(ctx, versionID, conversationID); err != nil {
+		return MessageView{}, false, mapConversationRepositoryError(err)
+	}
+
+	existing, err := s.repo.FindJobCardMessage(ctx, versionID, conversationID, card.JobID)
+	switch {
+	case err == nil && existing != nil:
+		if err := s.repo.UpdateJobCardMessage(ctx, versionID, conversationID, existing.ID, card.JobID, card); err != nil {
+			return MessageView{}, false, mapConversationRepositoryError(err)
+		}
+		existing.Parts = replaceJobCardPart(existing.Parts, card)
+		s.publishMessageEvent(ctx, versionID, *existing)
+		return toMessageView(*existing), false, nil
+	case err != nil && !errors.Is(err, version.ErrMessageNotFound):
+		return MessageView{}, false, mapConversationRepositoryError(err)
+	}
+
+	now := s.clock.Now()
+	message := version.Message{
+		ID:             s.ids.Next(),
+		ConversationID: conversationID,
+		Role:           version.MessageRoleAssistant,
+		Parts:          []version.MessagePart{card},
+		Refs:           []version.MessageRef{},
+		TokenUsage:     map[string]any{},
+		CreatedAt:      now,
+	}
+	streamParts, err := assistantStreamParts(message.Parts, now)
+	if err != nil {
+		return MessageView{}, false, err
+	}
+	message.StreamParts = streamParts
+	if err := s.repo.AppendAssistantMessage(ctx, conversationID, message); err != nil {
+		return MessageView{}, false, mapConversationRepositoryError(err)
+	}
+	s.publishMessageEvent(ctx, versionID, message)
+	return toMessageView(message), true, nil
+}
+
+// replaceJobCardPart returns a copy of parts with jobID's card replaced by the
+// new snapshot. The card is the only mutable part of the conversation.
+func replaceJobCardPart(parts []version.MessagePart, card version.MessagePart) []version.MessagePart {
+	updated := append([]version.MessagePart(nil), parts...)
+	for index := range updated {
+		if updated[index].Type == version.MessagePartJobCard && updated[index].JobID == card.JobID {
+			updated[index] = card
+			return updated
+		}
+	}
+	return append(updated, card)
+}
+
 // ---------- tasks and events ----------
 
 func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID int64, kind string, conversationID, messageID int64) {

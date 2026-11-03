@@ -48,12 +48,13 @@ func (f *fakeRequirements) CreateRelation(ctx context.Context, versionID int64, 
 }
 
 type fakeConversations struct {
-	getFn       func(ctx context.Context, versionID, conversationID int64) (versionapp.ConversationView, error)
-	messagesFn  func(ctx context.Context, versionID, conversationID int64, after int64, limit int) ([]versionapp.MessageView, bool, error)
-	summaryFn   func(ctx context.Context, conversationID int64) (versionapp.SummaryView, error)
-	appendFn    func(ctx context.Context, conversationID int64, parts []version.MessagePart, runID int64, replyTo *int64) (versionapp.MessageView, error)
-	updateFn    func(ctx context.Context, conversationID int64, summary string, pinned []string) error
-	reconcileFn func(ctx context.Context, limit int) ([]versionapp.ReconcilerConversation, error)
+	getFn           func(ctx context.Context, versionID, conversationID int64) (versionapp.ConversationView, error)
+	messagesFn      func(ctx context.Context, versionID, conversationID int64, after int64, limit int) ([]versionapp.MessageView, bool, error)
+	summaryFn       func(ctx context.Context, conversationID int64) (versionapp.SummaryView, error)
+	appendFn        func(ctx context.Context, conversationID int64, parts []version.MessagePart, runID int64, replyTo *int64) (versionapp.MessageView, error)
+	upsertJobCardFn func(ctx context.Context, versionID, conversationID int64, card version.MessagePart) (versionapp.MessageView, bool, error)
+	updateFn        func(ctx context.Context, conversationID int64, summary string, pinned []string) error
+	reconcileFn     func(ctx context.Context, limit int) ([]versionapp.ReconcilerConversation, error)
 }
 
 func (f *fakeConversations) Get(ctx context.Context, versionID, conversationID int64) (versionapp.ConversationView, error) {
@@ -70,6 +71,13 @@ func (f *fakeConversations) Summary(ctx context.Context, conversationID int64) (
 
 func (f *fakeConversations) AppendAssistantMessageWithReply(ctx context.Context, conversationID int64, parts []version.MessagePart, runID int64, replyTo *int64) (versionapp.MessageView, error) {
 	return f.appendFn(ctx, conversationID, parts, runID, replyTo)
+}
+
+func (f *fakeConversations) UpsertJobCard(ctx context.Context, versionID, conversationID int64, card version.MessagePart) (versionapp.MessageView, bool, error) {
+	if f.upsertJobCardFn == nil {
+		return versionapp.MessageView{}, false, nil
+	}
+	return f.upsertJobCardFn(ctx, versionID, conversationID, card)
 }
 
 func (f *fakeConversations) UpdateSummary(ctx context.Context, conversationID int64, summary string, pinned []string) error {
@@ -238,6 +246,14 @@ func TestConversationPortSnapshotAndMapping(t *testing.T) {
 				{Type: "requirement_card", RequirementID: 501, Title: "Login", Status: "draft", Revision: 1},
 			},
 		},
+		{
+			// A background job card is a UI artifact, not an LLM conversation
+			// turn; the snapshot must skip the otherwise-empty assistant turn.
+			ID: 3, ConversationID: 20, Role: "assistant", CreatedAt: testTime,
+			Parts: []version.MessagePart{
+				{Type: "job_card", JobID: 701, JobKind: "requirement.curate", Status: "running"},
+			},
+		},
 	}
 	fake := &fakeConversations{
 		getFn: func(_ context.Context, versionID, conversationID int64) (versionapp.ConversationView, error) {
@@ -290,6 +306,11 @@ func TestConversationPortSnapshotAndMapping(t *testing.T) {
 	full, err := adapter.Snapshot(ctx, 10, 20, 0)
 	if err != nil || len(full.Messages) != 2 {
 		t.Fatalf("full snapshot = %#v, %v", full, err)
+	}
+	for _, message := range full.Messages {
+		if message.ID == 3 {
+			t.Fatalf("job-card-only message leaked into the LLM snapshot: %#v", full.Messages)
+		}
 	}
 }
 

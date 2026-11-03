@@ -217,6 +217,101 @@ func (r *ConversationRepository) MessageParts(ctx context.Context, versionID, co
 	return parts, nil
 }
 
+// FindJobCardMessage returns the assistant message carrying jobID's job_card
+// part in one version-scoped conversation. It is the idempotency lookup behind
+// the one-card-per-job contract: a repeated start/update rewrites this message
+// instead of appending a second card.
+func (r *ConversationRepository) FindJobCardMessage(ctx context.Context, versionID, conversationID, jobID int64) (*version.Message, error) {
+	message, err := scanMessage(r.pool.QueryRow(ctx, `
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		JOIN conversation c ON c.id = m.conversation_id
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE c.version_id = $1 AND m.conversation_id = $2 AND m.role = 'assistant'
+		  AND EXISTS (
+			SELECT 1
+			FROM jsonb_array_elements(m.parts) AS part
+			WHERE part->>'type' = 'job_card' AND part->>'job_id' = $3
+		  )
+		ORDER BY m.id DESC
+		LIMIT 1
+	`, versionID, conversationID, platformid.Format(jobID)))
+	if err != nil {
+		return nil, wrapMessageDB("find job card message", err)
+	}
+	return &message, nil
+}
+
+// UpdateJobCardMessage rewrites the stored snapshot part of jobID and its
+// conversation_message_part payload inside messageID. The card is the one
+// mutable part of the conversation: no new message or part row is appended and
+// the append-only seq/created_at stay untouched.
+func (r *ConversationRepository) UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("update job card message: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var raw []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT m.parts
+		FROM conversation_message m
+		JOIN conversation c ON c.id = m.conversation_id
+		WHERE m.id = $1 AND m.conversation_id = $2 AND c.version_id = $3
+		  AND m.role = 'assistant'
+		FOR UPDATE
+	`, messageID, conversationID, versionID).Scan(&raw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return version.ErrMessageNotFound
+		}
+		return fmt.Errorf("update job card message: lock message: %w", err)
+	}
+	var parts []version.MessagePart
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &parts); err != nil {
+			return fmt.Errorf("update job card message: decode parts: %w", err)
+		}
+	}
+	replaced := false
+	for index := range parts {
+		if parts[index].Type == version.MessagePartJobCard && parts[index].JobID == jobID {
+			parts[index] = part
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		return version.ErrMessageNotFound
+	}
+	encodedParts, err := json.Marshal(parts)
+	if err != nil {
+		return fmt.Errorf("update job card message: encode parts: %w", err)
+	}
+	encodedPart, err := json.Marshal(part)
+	if err != nil {
+		return fmt.Errorf("update job card message: encode card: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message SET parts = $2::jsonb WHERE id = $1
+	`, messageID, string(encodedParts)); err != nil {
+		return wrapConversationDB("update job card message snapshot", err)
+	}
+	// A missing streaming row is tolerated: the message snapshot is the primary
+	// read path and an existing card may predate its conversation_message_part.
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message_part
+		SET payload = $3::jsonb
+		WHERE message_id = $1 AND part_type = 'job_card' AND payload->>'job_id' = $2
+	`, messageID, platformid.Format(jobID), string(encodedPart)); err != nil {
+		return fmt.Errorf("update job card message: update part row: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("update job card message: commit: %w", err)
+	}
+	return nil
+}
+
 // PostUserMessage inserts the user message and bumps the conversation
 // timestamp. A client_message_id conflict returns the existing message with
 // created=false.
