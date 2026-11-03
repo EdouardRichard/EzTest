@@ -1053,7 +1053,7 @@ try {
     Step "assert the P5 settings catalog (69 keys, codeintel.*/visual.* present)"
     $settingsResponse = Invoke-Api -Method "GET" -Path "/api/admin/settings" -Token $script:token
     Assert-Status $settingsResponse @(401) "GET /api/admin/settings without token is 401"
-    $script:token = Login-As -Username "admin" -Password "admin123"
+    $script:token = Login-As -Username "admin" -Password "[REDACTED]"
     $settingsResponse = Invoke-Api -Method "GET" -Path "/api/admin/settings" -Token $script:token
     Assert-Status $settingsResponse @(200) "GET /api/admin/settings"
     $settings = Get-Array $settingsResponse.Json.data
@@ -1147,7 +1147,7 @@ try {
     Stop-Api
     Start-Executor
     $health = Start-Api
-    $script:token = Login-As -Username "admin" -Password "admin123"
+    $script:token = Login-As -Username "admin" -Password "[REDACTED]"
     Assert-Status (Invoke-Api -Method "GET" -Path "/api/health" -Token $null) @(200) "GET /api/health"
     [void](Wait-For -TimeoutSeconds 90 -Description "executor registered active" -Condition {
         $response = Invoke-Api -Method "GET" -Path "/api/admin/executors" -Token $script:token

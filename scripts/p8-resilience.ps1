@@ -330,7 +330,7 @@ function Prepare-P8ContentRoot {
 
 function Login-P8Admin {
     $context = Get-P8Context
-    $login = Invoke-P8Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "admin123" } -Token "" -TimeoutSec 30
+    $login = Invoke-P8Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "[REDACTED]" } -Token "" -TimeoutSec 30
     if ($login.Status -ne 200 -or $null -eq $login.Json -or $null -eq $login.Json.data -or [string]::IsNullOrWhiteSpace([string]$login.Json.data.token)) {
         throw "admin login failed: status=$($login.Status) $($login.Text)"
     }

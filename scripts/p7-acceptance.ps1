@@ -387,7 +387,7 @@ function Restart-ApiA {
 }
 
 function Login-Admin {
-  $login = Invoke-ApiOnPort -Port $script:currentApiPort -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "admin123" } -Token "" -TimeoutSec 30
+  $login = Invoke-ApiOnPort -Port $script:currentApiPort -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "[REDACTED]" } -Token "" -TimeoutSec 30
   if ($login.Status -ne 200 -or $null -eq $login.Json -or $null -eq $login.Json.data) {
     return ""
   }

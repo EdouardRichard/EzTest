@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     P2 API acceptance runner (no browser) for EzTest 0.2.
@@ -8,7 +8,7 @@
       * database   : eztest_v02_e2e (dropped and recreated on every run)
       * fake LLM   : scripts/fake-llm.cjs on 127.0.0.1:13334
       * API        : freshly built .tmp/p2/eztest.exe on 127.0.0.1:14333
-    Then exercises the P2 design API journey against admin/admin123:
+    Then exercises the P2 design API journey against admin/[REDACTED]:
       LLM config -> SUT/env/page/API -> version -> clarified requirements ->
       design conversation -> planner/author draft graph -> case/scenario/
       requirement confirmations -> design chat modification -> stale/redesign ->
@@ -580,12 +580,12 @@ try {
     Start-Api
     StepPassed "start API on port $ApiPort"
 
-    Step "login as admin/admin123"
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "admin123" } -Token $null
+    Step "login as admin/[REDACTED]"
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "[REDACTED]" } -Token $null
     Assert-Status $login @(200) "POST /api/auth/login"
     $token = [string]$login.Json.data.token
     if ([string]::IsNullOrWhiteSpace($token)) { throw "login response has no token" }
-    StepPassed "login as admin/admin123"
+    StepPassed "login as admin/[REDACTED]"
 
     Step "create admin LLM config pointing at the fake LLM and refresh models"
     $config = Invoke-Api -Method "POST" -Path "/api/admin/llm/configs" -Token $token -Body @{

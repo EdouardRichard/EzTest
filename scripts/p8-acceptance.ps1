@@ -505,7 +505,7 @@ function Initialize-P8Environment {
     Start-P8Api -Port $ApiPort -DatabaseUrl $databaseUrl -ExecutorPort $ExecutorAPort -BinaryPath $binary | Out-Null
     $context.BaseUrl = "http://127.0.0.1:$ApiPort"
     $context.ApiPort = $ApiPort
-    $login = Invoke-P8Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "admin123" } -Token "" -TimeoutSec 30
+    $login = Invoke-P8Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "[REDACTED]" } -Token "" -TimeoutSec 30
     if ($login.Status -ne 200 -or $null -eq $login.Json.data.token) {
         throw "admin login failed: $($login.Status) $($login.Text)"
     }

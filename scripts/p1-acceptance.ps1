@@ -8,7 +8,7 @@
       * database   : eztest_v02_e2e (dropped and recreated on every run)
       * fake LLM   : scripts/fake-llm.cjs on 127.0.0.1:13334
       * API        : freshly built .tmp/p1/eztest.exe on 127.0.0.1:14333
-    Then exercises the P1 API journey against admin/admin123:
+    Then exercises the P1 API journey against admin/[REDACTED]:
       LLM config -> fake model catalog -> SUT/env/page/API -> version ->
       clarification conversation -> user message + MD attachment -> AI draft ->
       single confirm -> batch confirm -> rollback -> team room read ->
@@ -525,12 +525,12 @@ try {
     StepPassed "start API on port $ApiPort"
 
     # ------------------------------------------------------------- identity --
-    Step "login as admin/admin123"
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "admin123" } -Token $null
+    Step "login as admin/[REDACTED]"
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "[REDACTED]" } -Token $null
     Assert-Status $login @(200) "POST /api/auth/login"
     $token = [string]$login.Json.data.token
     if ([string]::IsNullOrWhiteSpace($token)) { throw "login response has no token" }
-    StepPassed "login as admin/admin123"
+    StepPassed "login as admin/[REDACTED]"
 
     # ------------------------------------------------------------------ LLM --
     Step "create admin LLM config pointing at the fake LLM and refresh models"
