@@ -9,16 +9,22 @@
       1. the confirmed requirements cover the design scope (up to five);
       2. a design-conversation modification produces a new immutable case
          version instead of overwriting the old one (versioned edit);
-      3. a selected subset of cases is confirmed through the real confirmation
-         API and only the selected cases become confirmed (partial confirm);
-      4. every selected case carries a success criterion (assertion expected);
-      5. the confirmed selection automatically enqueues execution intents for
-         exactly those cases (partial execution), without extra user guidance.
+      3. the version reached case_review and the wrong gate (POST
+         /stage/confirm-requirements) is rejected there with the typed 409
+         invalid_stage_for_gate without moving the stage;
+      4. a selected subset of draft cases is confirmed through the real 0.2.1
+         case hard gate POST /stage/confirm-cases: exactly the selected cases
+         become confirmed, each selected case is completely confirmed, and the
+         unselected cases remain draft;
+      5. the case hard gate advances case_review -> executing and enqueues
+         execute.batch for exactly the selected case ids, and the confirmed
+         selection automatically enqueues execution intents for exactly those
+         cases (partial execution), without extra user guidance.
 
-    The 0.2.1 case hard gate is attempted first. When the version is not at
-    case_review (the current product never leaves created) the exact 409 is
-    recorded and the available design-confirmation path is used so the rest of
-    the S4/S5 chain can be exercised. No DB write and no fake stage transition.
+    There is deliberately no 0.2 fallback: when the version is not at
+    case_review, the script records the typed 409 invalid_stage_for_gate and
+    fails. It never falls back to POST /design/confirmations and never writes a
+    stage or confirmation through SQL.
 
 .NOTES
     Exit codes: 0 = passed, 1 = failed acceptance assertion, 2 = blocked
@@ -38,7 +44,8 @@ param(
     [string] $VersionId = "",
     [string] $StatePath = "",
     [int] $DesignReplyTimeoutSeconds = 240,
-    [int] $IntentTimeoutSeconds = 90
+    [int] $IntentTimeoutSeconds = 90,
+    [int] $CaseReviewTimeoutSeconds = 120
 )
 
 Set-StrictMode -Version 3.0
@@ -106,11 +113,22 @@ try {
             # Requirements and stage.
             # ------------------------------------------------------------------
             $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+            # The design generation (S3) owns designing -> case_review. Wait for
+            # the product to reach the case hard gate's only source stage; the
+            # script never writes the stage itself.
+            $stageWait = Wait-Until -TimeoutSeconds $CaseReviewTimeoutSeconds -IntervalSeconds 3 -Description "case_review stage" -Condition {
+                try { $current = Get-VersionStage -Context $context -VersionId $versionId } catch { return $null }
+                if ([string](Get-JsonProp -Object $current -Name "stage" -Default "") -eq "case_review") { return $current }
+                return $null
+            }
             $stage = $null
-            try { $stage = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+            if ($stageWait.Ok) { $stage = $stageWait.Value }
+            else { try { $stage = Get-VersionStage -Context $context -VersionId $versionId } catch { } }
             $stageValue = [string](Get-JsonProp -Object $stage -Name "stage" -Default "")
             [void](Write-S4Evidence -Name "requirements.json" -Value $requirements -Note "requirements at S4")
             [void](Write-S4Evidence -Name "stage.json" -Value $stage -Note "stage at S4")
+            Add-AcceptanceCheck -Scenario $scenario -Name "version reached case_review for the case hard gate" -Passed ($stageValue -eq "case_review") -Severity assertion `
+                -Detail ("stage=$stageValue; expected case_review (design generation completion owns designing -> case_review; no fallback is used)")
             $confirmedStatuses = @("clarified", "confirmed", "closed")
             $nonDraft = @($requirements | Where-Object { $confirmedStatuses -contains [string](Get-JsonProp -Object $_ -Name "status" -Default "") })
             Add-AcceptanceCheck -Scenario $scenario -Name "requirements confirmed before design" -Passed ($requirements.Count -gt 0 -and $nonDraft.Count -eq $requirements.Count) -Severity assertion `
@@ -251,9 +269,14 @@ try {
             }
             $eligible = @($candidateDetails | Where-Object { $_.assertions.Count -ge 1 })
             if ($eligible.Count -eq 0) { $eligible = $candidateDetails }
+            # A partial selection is only honest when at least two eligible draft
+            # cases exist: select a strict subset and leave the rest draft. A
+            # version with a single eligible case exercises the gate's complete
+            # ("all selected") path instead, recorded as such, never as partial.
+            $partialSelection = $eligible.Count -ge 2
             $selectCount = 0
-            if ($eligible.Count -eq 1) { $selectCount = 1 }
-            elseif ($eligible.Count -gt 1) { $selectCount = [Math]::Min(2, $eligible.Count - 1) }
+            if ($eligible.Count -ge 2) { $selectCount = [Math]::Min(2, $eligible.Count - 1) }
+            elseif ($eligible.Count -eq 1) { $selectCount = 1 }
             $selectedDetails = @($eligible | Select-Object -First $selectCount)
             $selectedCases = @($selectedDetails | ForEach-Object { $_.card.case_id })
             $selectedCaseVersions = @($selectedDetails | ForEach-Object { $_.case_version_id })
@@ -261,12 +284,21 @@ try {
             [void](Write-S4Evidence -Name "case-selection.json" -Value ([pscustomobject]@{
                 draft_total = $draftCards.Count
                 eligible = $eligible.Count
+                partial = $partialSelection
                 selected_case_ids = $selectedCases
                 selected_case_versions = $selectedCaseVersions
                 unselected_draft = @($unselectedDraft | ForEach-Object { $_.case_id })
-            }) -Note "partial confirmation selection")
-            Add-AcceptanceCheck -Scenario $scenario -Name "partial selection leaves at least one draft case" -Passed ($selectedCases.Count -ge 1 -and $unselectedDraft.Count -ge 1) -Severity assertion `
-                -Detail "selected=$($selectedCases.Count) unselectedDraft=$($unselectedDraft.Count)"
+            }) -Note "case gate selection (strict subset when at least two eligible draft cases exist)")
+            if ($partialSelection) {
+                Add-AcceptanceCheck -Scenario $scenario -Name "partial selection leaves at least one draft case" -Passed ($selectedCases.Count -ge 1 -and $unselectedDraft.Count -ge 1) -Severity assertion `
+                    -Detail "selected=$($selectedCases.Count) unselectedDraft=$($unselectedDraft.Count) draftTotal=$($draftCards.Count)"
+            } elseif ($selectedCases.Count -ge 1) {
+                Add-AcceptanceCheck -Scenario $scenario -Name "complete selection confirms every draft case" -Passed ($unselectedDraft.Count -eq 0) -Severity warning `
+                    -Detail "only one eligible draft case exists; the gate confirms it completely (the partial variant cannot be exercised on this version)"
+            } else {
+                Add-AcceptanceCheck -Scenario $scenario -Name "eligible draft case available for the case hard gate" -Passed $false -Severity assertion `
+                    -Detail "draftCards=$($draftCards.Count) eligible=0"
+            }
             foreach ($item in $selectedDetails) {
                 $successCriteria = @($item.assertions | Where-Object { -not [string]::IsNullOrWhiteSpace([string](Get-JsonProp -Object $_ -Name 'expected' -Default '')) })
                 Add-AcceptanceCheck -Scenario $scenario -Name "selected case has a success criterion" -Passed ($successCriteria.Count -ge 1) -Severity assertion `
@@ -284,131 +316,238 @@ try {
                 -Detail "stepRoles=$($stepRoles -join ",")"
 
             $stageGateAttempt = $null
-            if ($selectedCases.Count -gt 0) {
+            $gateAdvanced = $false
+            $stageAfterGateValue = $stageValue
+            $intentsBefore = @()
+            $intentsBeforeIds = @()
+            $intents = @()
+            $waves = @()
+            $intentTargetVersions = @($selectedCaseVersions | Select-Object -Unique)
+            $confirmedCaseIds = @()
+
+            # ------------------------------------------------------------------
+            # Negative gate assertion: the requirement gate may only run at
+            # requirement_review. Calling it here must return the typed 409
+            # invalid_stage_for_gate and must not move the stage.
+            # ------------------------------------------------------------------
+            if ($stageValue -ne "requirement_review") {
+                $wrongGate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-requirements" `
+                    -Token $context.Token -Body @{ requirement_ids = @() }
+                $wrongGateCode = [string](Get-JsonProp -Object $wrongGate.Error -Name "code" -Default "")
+                $stageAfterWrongGate = $null
+                try { $stageAfterWrongGate = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+                $stageAfterWrongGateValue = [string](Get-JsonProp -Object $stageAfterWrongGate -Name "stage" -Default "")
+                [void](Write-S4Evidence -Name "wrong-gate-requirement.json" -Value ([pscustomobject]@{
+                    http_status  = $wrongGate.Status
+                    ok           = $wrongGate.Ok
+                    error_code   = $wrongGateCode
+                    error        = $wrongGate.Error
+                    stage_before = $stageValue
+                    stage_after  = $stageAfterWrongGateValue
+                }) -Note "requirement hard gate called after the requirement gate (must be rejected)")
+                Add-AcceptanceCheck -Scenario $scenario -Name "invalid_stage_for_gate rejected the requirement gate at $stageValue" `
+                    -Passed ($wrongGate.Status -eq 409 -and $wrongGateCode -eq "invalid_stage_for_gate" -and $stageAfterWrongGateValue -eq $stageValue) `
+                    -Severity assertion `
+                    -Detail ("HTTP $($wrongGate.Status) code=$wrongGateCode stage=$stageValue->$stageAfterWrongGateValue")
+            } else {
+                Add-AcceptanceCheck -Scenario $scenario -Name "version passed the requirement hard gate before S4" -Passed $false -Severity assertion `
+                    -Detail "stage=requirement_review; S4 requires the version to be past the requirement gate (case_review)"
+            }
+
+            if ($selectedCases.Count -eq 0) {
+                Add-AcceptanceCheck -Scenario $scenario -Name "eligible case selected for the case hard gate" -Passed $false -Severity assertion `
+                    -Detail "no eligible draft case was available; the case hard gate cannot be exercised honestly"
+                $scenario.ErrorMessage = "S4 failed: no eligible draft case available for the case hard gate"
+            } elseif ($stageValue -ne "case_review") {
+                # Record the typed rejection with the exact source stage. The
+                # script never falls back to POST /design/confirmations.
                 $gate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-cases" `
                     -Token $context.Token -Body @{ case_ids = $selectedCases }
-                $gateCode = Get-JsonProp -Object $gate.Error -Name "code" -Default ""
-                $stageGateAttempt = [pscustomobject]@{ http_status = $gate.Status; ok = $gate.Ok; error_code = [string]$gateCode; stage = $stageValue; error = $gate.Error }
-                [void](Write-S4Evidence -Name "case-gate.json" -Value $stageGateAttempt -Note "0.2.1 case hard-gate attempt")
-                if ($gate.Ok) {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 case hard gate confirmed the selection" -Passed $true -Severity assertion `
-                        -Detail "HTTP 200 stage_after=$([string](Get-JsonProp -Object $gate.Data -Name 'stage' -Default ''))"
-                } else {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 case hard gate reachable" -Passed $false -Severity warning `
-                        -Detail ("stage=$stageValue HTTP $($gate.Status) code=$gateCode; using the available design confirmation path")
+                $gateCode = [string](Get-JsonProp -Object $gate.Error -Name "code" -Default "")
+                $stageAfterGate = $null
+                try { $stageAfterGate = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+                $stageAfterGateValue = [string](Get-JsonProp -Object $stageAfterGate -Name "stage" -Default "")
+                $stageGateAttempt = [pscustomobject]@{
+                    http_status  = $gate.Status
+                    ok           = $gate.Ok
+                    error_code   = $gateCode
+                    error        = $gate.Error
+                    stage_before = $stageValue
+                    stage_after  = $stageAfterGateValue
                 }
-
+                [void](Write-S4Evidence -Name "case-gate.json" -Value $stageGateAttempt -Note "0.2.1 case hard-gate attempt at the wrong source stage")
+                Add-AcceptanceCheck -Scenario $scenario -Name "invalid_stage_for_gate rejected the case gate at $stageValue" `
+                    -Passed ($gate.Status -eq 409 -and $gateCode -eq "invalid_stage_for_gate" -and $stageAfterGateValue -eq $stageValue) `
+                    -Severity assertion `
+                    -Detail ("HTTP $($gate.Status) code=$gateCode stage=$stageValue->$stageAfterGateValue; the case gate requires case_review")
+                $scenario.ErrorMessage = "S4 failed: case gate requires case_review but stage=$stageValue (HTTP $($gate.Status) $gateCode); no fallback is used"
+            } else {
                 $intentsBefore = @(Get-AcceptanceExecutionIntents -Context $context -VersionId $versionId)
                 $intentsBeforeIds = @(Get-JsonIdSet -Items $intentsBefore)
-                $confirmResults = @()
-                $confirmedVersions = @()
-                foreach ($item in $selectedDetails) {
-                    $confirm = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/design/confirmations" `
-                        -Token $context.Token -Body @{ scope = "case"; target_id = $item.card.case_id; batch_id = ("s4-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)) }
-                    $confirmed = @(Get-JsonProp -Object $confirm.Data -Name "confirmed" -Default @())
-                    foreach ($confirmedItem in $confirmed) {
-                        $confirmedVersionId = [string](Get-JsonProp -Object $confirmedItem -Name "case_version_id" -Default "")
-                        if ($confirmedVersionId) { $confirmedVersions += $confirmedVersionId }
+
+                # Positive gate assertion: the real 0.2.1 case hard gate confirms
+                # exactly the selected subset and advances case_review ->
+                # executing. It is the only confirmation path used by S4.
+                $gate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-cases" `
+                    -Token $context.Token -Body @{ case_ids = $selectedCases }
+                $gateCode = [string](Get-JsonProp -Object $gate.Error -Name "code" -Default "")
+                $gateStage = [string](Get-JsonProp -Object $gate.Data -Name "stage" -Default "")
+                $stageAfterGate = $null
+                try { $stageAfterGate = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+                $stageAfterGateValue = [string](Get-JsonProp -Object $stageAfterGate -Name "stage" -Default "")
+                $stageGateAttempt = [pscustomobject]@{
+                    http_status  = $gate.Status
+                    ok           = $gate.Ok
+                    response     = $gate.Data
+                    error_code   = $gateCode
+                    error        = $gate.Error
+                    stage_before = $stageValue
+                    stage_after  = $stageAfterGateValue
+                    case_ids     = $selectedCases
+                }
+                [void](Write-S4Evidence -Name "case-gate.json" -Value $stageGateAttempt -Note "0.2.1 case hard gate (partial selection)")
+                [void](Write-S4Evidence -Name "stage-after-case-gate.json" -Value $stageAfterGate -Note "stage after the case hard gate")
+                $gateAdvanced = $gate.Ok -and $gateStage -eq "executing" -and $stageAfterGateValue -eq "executing"
+                Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 case hard gate advanced case_review to executing" `
+                    -Passed $gateAdvanced -Severity assertion `
+                    -Detail ("HTTP $($gate.Status) code=$gateCode responseStage=$gateStage readbackStage=$stageAfterGateValue selected=$($selectedCases.Count)")
+
+                if (-not $gateAdvanced) {
+                    $scenario.ErrorMessage = "S4 failed: the 0.2.1 case hard gate did not advance the version (HTTP $($gate.Status) $gateCode); no fallback is used"
+                } else {
+                    # Read the graph back: the selected cases must be completely
+                    # confirmed and the unselected cases must remain draft.
+                    $confirmWait = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -Description "graph confirmed selection" -Condition {
+                        $currentGraph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
+                        $currentCards = @(Get-AcceptanceCaseCards -Graph $currentGraph)
+                        $confirmedNow = @($currentCards | Where-Object { $selectedCases -contains $_.case_id -and $_.status -eq "confirmed" })
+                        if ($confirmedNow.Count -ge $selectedCases.Count) { return [pscustomobject]@{ Graph = $currentGraph; Cards = $currentCards } }
+                        return $null
                     }
-                    $confirmResults += [pscustomobject]@{
-                        case_id = $item.card.case_id
-                        http_status = $confirm.Status
-                        confirmed = $confirmed
-                        skipped = @(Get-JsonProp -Object $confirm.Data -Name "skipped" -Default @())
-                        error = $confirm.Error
+                    if ($confirmWait.Ok -and $null -ne $confirmWait.Value) { $graph = $confirmWait.Value.Graph; $cards = @($confirmWait.Value.Cards) }
+                    $graphConfirmed = @($cards | Where-Object { $_.status -eq "confirmed" } | ForEach-Object { $_.case_id })
+                    $remainingDraft = @($cards | Where-Object { $_.status -eq "draft" } | ForEach-Object { $_.case_id })
+                    $selectedStillDraft = @($selectedCases | Where-Object { $remainingDraft -contains $_ })
+                    $selectedNotConfirmed = @($selectedCases | Where-Object { $graphConfirmed -notcontains $_ })
+                    $graphSelectedVersions = @($cards | Where-Object { $selectedCases -contains $_.case_id } | ForEach-Object { $_.case_version_id } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+                    if ($graphSelectedVersions.Count -ge $selectedCases.Count) { $intentTargetVersions = $graphSelectedVersions }
+                    [void](Write-S4Evidence -Name "graph-after-confirm.json" -Value $graph -Note "graph after the partial case hard gate")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "selected cases are completely confirmed in the graph" `
+                        -Passed ($selectedStillDraft.Count -eq 0 -and $selectedNotConfirmed.Count -eq 0) -Severity assertion `
+                        -Detail "selected=$($selectedCases.Count) confirmedInGraph=$(@($selectedCases | Where-Object { $graphConfirmed -contains $_ }).Count) stillDraft=$($selectedStillDraft.Count)"
+                    Add-AcceptanceCheck -Scenario $scenario -Name "unselected cases stay draft after the partial hard gate" `
+                        -Passed ($unselectedDraft.Count -eq 0 -or @($unselectedDraft | Where-Object { $remainingDraft -contains $_.case_id }).Count -eq $unselectedDraft.Count) -Severity assertion `
+                        -Detail "unselectedDraft=$($unselectedDraft.Count) remainingDraft=$($remainingDraft.Count)"
+                    $confirmedCaseIds = @($graphConfirmed)
+
+                    # The gate must have dispatched execute.batch for exactly the
+                    # selected case ids (read-only DB projection).
+                    $executeBatchDb = Invoke-AcceptanceDbQuery -Context $context -VersionId ([long]$versionId) `
+                        -Sql "SELECT id, team, type, kind, status, created_by, inputs::text FROM work_item WHERE version_id = $versionId AND kind = 'execute.batch' ORDER BY id DESC"
+                    $executeBatchRows = @($executeBatchDb.Rows)
+                    $executeBatchCovers = $false
+                    $executeBatchForeign = @()
+                    $executeBatchIds = @()
+                    foreach ($row in $executeBatchRows) {
+                        $columns = @(Get-AcceptanceSplitRow -Line ([string]$row))
+                        if ($columns.Count -lt 1) { continue }
+                        $rawInputs = [string]$columns[$columns.Count - 1]
+                        try { $parsedInputs = $rawInputs | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                        $ids = @(Get-JsonProp -Object $parsedInputs -Name "case_ids" -Default @())
+                        $idsAsStrings = @($ids | ForEach-Object { [string]$_ })
+                        $missing = @($selectedCases | Where-Object { $idsAsStrings -notcontains $_ })
+                        if ($missing.Count -eq 0 -and $idsAsStrings.Count -ge $selectedCases.Count) {
+                            $executeBatchCovers = $true
+                            $executeBatchIds = $idsAsStrings
+                            $executeBatchForeign = @($idsAsStrings | Where-Object { $selectedCases -notcontains $_ })
+                            break
+                        }
                     }
-                    Add-AcceptanceCheck -Scenario $scenario -Name "case confirmed through the user API ($($item.card.case_id))" -Passed ($confirm.Ok -and $confirmed.Count -ge 1) -Severity assertion `
-                        -Detail "HTTP $($confirm.Status) confirmed=$($confirmed.Count)"
-                }
-                [void](Write-S4Evidence -Name "case-confirmations.json" -Value $confirmResults -Note "partial case confirmations")
-                $intentTargetVersions = @($confirmedVersions | Select-Object -Unique)
-                if ($intentTargetVersions.Count -eq 0) { $intentTargetVersions = @($selectedCaseVersions) }
+                    [void](Write-S4Evidence -Name "execute-batch-job-db.json" -Value ([pscustomobject]@{
+                        database = $executeBatchDb.Database
+                        ok       = $executeBatchDb.Ok
+                        error    = $executeBatchDb.Error
+                        rows     = $executeBatchRows
+                        selected_case_ids = $selectedCases
+                        matched_case_ids  = $executeBatchIds
+                        foreign_case_ids  = $executeBatchForeign
+                    }) -Kind "db" -Note "execute.batch stage-entry work item (read-only DB projection)")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "case hard gate enqueued execute.batch for the selected cases" `
+                        -Passed ($executeBatchDb.Ok -and $executeBatchRows.Count -ge 1 -and $executeBatchCovers) -Severity assertion `
+                        -Detail ("database=$($executeBatchDb.Database) rows=$($executeBatchRows.Count) selected=$($selectedCases.Count) matchedIds=$($executeBatchIds -join ',')")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "case hard gate did not enqueue unselected cases" `
+                        -Passed ($executeBatchForeign.Count -eq 0) -Severity assertion `
+                        -Detail "foreignCaseIds=$($executeBatchForeign -join ',')"
 
-                $confirmWait = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -Description "graph confirmed selection" -Condition {
-                    $currentGraph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
-                    $currentCards = @(Get-AcceptanceCaseCards -Graph $currentGraph)
-                    $confirmedNow = @($currentCards | Where-Object { $_.status -eq "confirmed" })
-                    if ($confirmedNow.Count -ge $selectedCases.Count) { return [pscustomobject]@{ Graph = $currentGraph; Cards = $currentCards } }
-                    return $null
-                }
-                if ($confirmWait.Ok -and $null -ne $confirmWait.Value) { $graph = $confirmWait.Value.Graph; $cards = @($confirmWait.Value.Cards) }
-                $graphConfirmed = @($cards | Where-Object { $_.status -eq "confirmed" } | ForEach-Object { $_.case_id })
-                $remainingDraft = @($cards | Where-Object { $_.status -eq "draft" } | ForEach-Object { $_.case_id })
-                $selectedStillDraft = @($selectedCases | Where-Object { $remainingDraft -contains $_ })
-                [void](Write-S4Evidence -Name "graph-after-confirm.json" -Value $graph -Note "graph after partial confirmation")
-                Add-AcceptanceCheck -Scenario $scenario -Name "selected cases are confirmed in the graph" -Passed ($selectedStillDraft.Count -eq 0) -Severity assertion `
-                    -Detail "selected=$($selectedCases.Count) confirmedInGraph=$(@($selectedCases | Where-Object { $graphConfirmed -contains $_ }).Count)"
-                Add-AcceptanceCheck -Scenario $scenario -Name "unselected cases stay draft after partial confirmation" -Passed ($unselectedDraft.Count -eq 0 -or @($unselectedDraft | Where-Object { $remainingDraft -contains $_.case_id }).Count -eq $unselectedDraft.Count) -Severity assertion `
-                    -Detail "unselectedDraft=$($unselectedDraft.Count) remainingDraft=$($remainingDraft.Count)"
-                $confirmedCaseIds = @($graphConfirmed)
-
-                # ------------------------------------------------------------------
-                # Confirm -> automatic execution intents for the selection only.
-                # ------------------------------------------------------------------
-                $intentWait = Wait-Until -TimeoutSeconds $IntentTimeoutSeconds -IntervalSeconds 3 -Description "execution intents for selection" -Condition {
-                    $current = @(Get-AcceptanceExecutionIntents -Context $context -VersionId $versionId)
-                    $covered = @($current | Where-Object { $intentTargetVersions -contains [string](Get-JsonProp -Object $_ -Name 'case_version_id' -Default '') })
-                    if ($covered.Count -ge $selectedCases.Count) { return $current }
-                    return $null
-                }
-                $intents = @(Get-AcceptanceExecutionIntents -Context $context -VersionId $versionId)
-                $newIntents = @($intents | Where-Object { $intentsBeforeIds -notcontains [string](Get-JsonProp -Object $_ -Name 'id' -Default '') })
-                $coveredIntents = @($intents | Where-Object { $intentTargetVersions -contains [string](Get-JsonProp -Object $_ -Name 'case_version_id' -Default '') })
-                $intentVersions = @($newIntents | ForEach-Object { [string](Get-JsonProp -Object $_ -Name 'case_version_id' -Default '') } | Select-Object -Unique)
-                $foreignIntents = @($intentVersions | Where-Object { $intentTargetVersions -notcontains $_ })
-                [void](Write-S4Evidence -Name "execution-intents.json" -Value ([pscustomobject]@{
-                    before = $intentsBefore
-                    after = $intents
-                    new = $newIntents
-                    selected_case_versions = $intentTargetVersions
-                    covered = $coveredIntents
-                    foreign_versions = $foreignIntents
-                }) -Note "intents auto-enqueued by the confirmation")
-                Add-AcceptanceCheck -Scenario $scenario -Name "confirmed selection is automatically enqueued for execution" -Passed ($coveredIntents.Count -ge $selectedCases.Count) -Severity assertion `
-                    -Detail "selected=$($selectedCases.Count) coveredIntents=$($coveredIntents.Count) newIntents=$($newIntents.Count)"
-                Add-AcceptanceCheck -Scenario $scenario -Name "partial confirmation enqueues only the selected cases" -Passed ($foreignIntents.Count -eq 0) -Severity assertion `
-                    -Detail "foreignVersions=$($foreignIntents -join ',')"
-
-                $waves = @(Get-AcceptanceWaves -Context $context -VersionId $versionId)
-                [void](Write-S4Evidence -Name "waves.json" -Value $waves -Note "waves created by the confirmation chain")
-                Add-AcceptanceCheck -Scenario $scenario -Name "execution wave created for the confirmed selection" -Passed ($waves.Count -ge 1) -Severity assertion -Detail "waves=$($waves.Count)"
-
-                $cursorBefore = 0
-                try { $cursorBefore = Get-EventCursor -Context $context -Channel "version:$versionId" } catch { }
-                $sseRecords = @()
-                try {
-                    $sse = Wait-SseEvent -Context $context -Channel "version:$versionId" -After $cursorBefore -TimeoutSeconds 15 -MaxEvents 200
-                    foreach ($eventObject in @($sse.Events)) {
-                        $sseRecords += [pscustomobject]@{ id = [string]$eventObject.Id; event = [string]$eventObject.Event; type = [string](Get-JsonProp -Object $eventObject.Data -Name 'type' -Default '') }
+                    # ------------------------------------------------------------------
+                    # Confirm -> automatic execution intents for the selection only.
+                    # ------------------------------------------------------------------
+                    $intentWait = Wait-Until -TimeoutSeconds $IntentTimeoutSeconds -IntervalSeconds 3 -Description "execution intents for selection" -Condition {
+                        $current = @(Get-AcceptanceExecutionIntents -Context $context -VersionId $versionId)
+                        $covered = @($current | Where-Object { $intentTargetVersions -contains [string](Get-JsonProp -Object $_ -Name 'case_version_id' -Default '') })
+                        if ($covered.Count -ge $selectedCases.Count) { return $current }
+                        return $null
                     }
-                } catch { }
-                [void](Write-S4Evidence -Name "sse-events.json" -Value $sseRecords -Kind "sse" -Note "confirmation/execution SSE events")
-                $confirmationEvents = @($sseRecords | Where-Object { $_.event -like '*confirm*' -or $_.event -like 'execution.*' -or $_.event -eq 'job.finished' })
-                Add-AcceptanceCheck -Scenario $scenario -Name "confirmation/execution SSE events recorded" -Passed ($confirmationEvents.Count -ge 1) -Severity warning `
-                    -Detail "events=$($confirmationEvents.Count)"
+                    $intents = @(Get-AcceptanceExecutionIntents -Context $context -VersionId $versionId)
+                    $newIntents = @($intents | Where-Object { $intentsBeforeIds -notcontains [string](Get-JsonProp -Object $_ -Name 'id' -Default '') })
+                    $coveredIntents = @($intents | Where-Object { $intentTargetVersions -contains [string](Get-JsonProp -Object $_ -Name 'case_version_id' -Default '') })
+                    $intentVersions = @($newIntents | ForEach-Object { [string](Get-JsonProp -Object $_ -Name 'case_version_id' -Default '') } | Select-Object -Unique)
+                    $foreignIntents = @($intentVersions | Where-Object { $intentTargetVersions -notcontains $_ })
+                    [void](Write-S4Evidence -Name "execution-intents.json" -Value ([pscustomobject]@{
+                        before = $intentsBefore
+                        after = $intents
+                        new = $newIntents
+                        selected_case_versions = $intentTargetVersions
+                        covered = $coveredIntents
+                        foreign_versions = $foreignIntents
+                    }) -Note "intents auto-enqueued by the case hard gate")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "confirmed selection is automatically enqueued for execution" `
+                        -Passed ($coveredIntents.Count -ge $selectedCases.Count) -Severity assertion `
+                        -Detail "selected=$($selectedCases.Count) coveredIntents=$($coveredIntents.Count) newIntents=$($newIntents.Count)"
+                    Add-AcceptanceCheck -Scenario $scenario -Name "partial confirmation enqueues only the selected cases" `
+                        -Passed ($foreignIntents.Count -eq 0) -Severity assertion `
+                        -Detail "foreignVersions=$($foreignIntents -join ',')"
 
-                try {
-                    $shot = Save-AcceptanceScreenshot -Context $context -Scenario $scenario -Route "/versions/${versionId}?tab=design" -FileName "s4-case-confirmation.png" `
-                        -WaitForSelector '[data-testid="version-header"]' -Note "design graph after partial case confirmation"
-                    Add-AcceptanceCheck -Scenario $scenario -Name "case confirmation screenshot" -Passed $true -Severity warning -Detail (Resolve-RepoRelativePath -Context $context -Path $shot.Path)
-                } catch {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "case confirmation screenshot" -Passed $false -Severity warning -Detail $_.Exception.Message
+                    $waves = @(Get-AcceptanceWaves -Context $context -VersionId $versionId)
+                    [void](Write-S4Evidence -Name "waves.json" -Value $waves -Note "waves created by the confirmation chain")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "execution wave created for the confirmed selection" -Passed ($waves.Count -ge 1) -Severity assertion -Detail "waves=$($waves.Count)"
+
+                    $cursorBefore = 0
+                    try { $cursorBefore = Get-EventCursor -Context $context -Channel "version:$versionId" } catch { }
+                    $sseRecords = @()
+                    try {
+                        $sse = Wait-SseEvent -Context $context -Channel "version:$versionId" -After $cursorBefore -TimeoutSeconds 15 -MaxEvents 200
+                        foreach ($eventObject in @($sse.Events)) {
+                            $sseRecords += [pscustomobject]@{ id = [string]$eventObject.Id; event = [string]$eventObject.Event; type = [string](Get-JsonProp -Object $eventObject.Data -Name 'type' -Default '') }
+                        }
+                    } catch { }
+                    [void](Write-S4Evidence -Name "sse-events.json" -Value $sseRecords -Kind "sse" -Note "confirmation/execution SSE events")
+                    $confirmationEvents = @($sseRecords | Where-Object { $_.event -like '*confirm*' -or $_.event -like 'execution.*' -or $_.event -eq 'job.finished' })
+                    Add-AcceptanceCheck -Scenario $scenario -Name "confirmation/execution SSE events recorded" -Passed ($confirmationEvents.Count -ge 1) -Severity warning `
+                        -Detail "events=$($confirmationEvents.Count)"
+
+                    try {
+                        $shot = Save-AcceptanceScreenshot -Context $context -Scenario $scenario -Route "/versions/${versionId}?tab=design" -FileName "s4-case-confirmation.png" `
+                            -WaitForSelector '[data-testid="version-header"]' -Note "design graph after the partial case hard gate"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "case confirmation screenshot" -Passed $true -Severity warning -Detail (Resolve-RepoRelativePath -Context $context -Path $shot.Path)
+                    } catch {
+                        Add-AcceptanceCheck -Scenario $scenario -Name "case confirmation screenshot" -Passed $false -Severity warning -Detail $_.Exception.Message
+                    }
                 }
-
-                $allConfirmed = @($graphConfirmed | Select-Object -Unique)
-                [void](Update-AcceptanceState -Context $context -Path $statePath -Values @{
-                    version_id           = $versionId
-                    selected_case_ids    = $selectedCases
-                    selected_case_versions = $intentTargetVersions
-                    confirmed_case_ids   = $allConfirmed
-                    execution_intent_ids = @(Get-JsonIdSet -Items $intents)
-                    wave_ids             = @(Get-JsonIdSet -Items $waves)
-                    stage_at_s4_end      = $stageValue
-                    case_gate_error      = [string](Get-JsonProp -Object $stageGateAttempt -Name 'error_code' -Default '')
-                })
-            } else {
-                Add-AcceptanceCheck -Scenario $scenario -Name "partial case confirmation" -Passed $false -Severity assertion -Detail "no eligible case to confirm"
             }
+
+            [void](Update-AcceptanceState -Context $context -Path $statePath -Values @{
+                version_id             = $versionId
+                selected_case_ids      = $selectedCases
+                unselected_case_ids    = @($unselectedDraft | ForEach-Object { $_.case_id })
+                selected_case_versions = $intentTargetVersions
+                confirmed_case_ids     = @($confirmedCaseIds)
+                execution_intent_ids   = @(Get-JsonIdSet -Items $intents)
+                wave_ids               = @(Get-JsonIdSet -Items $waves)
+                stage_at_s4_end        = $stageAfterGateValue
+                case_gate_advanced     = $gateAdvanced
+                case_gate_error        = [string](Get-JsonProp -Object $stageGateAttempt -Name 'error_code' -Default '')
+            })
         }
     }
 } catch {

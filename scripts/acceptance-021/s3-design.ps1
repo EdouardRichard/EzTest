@@ -4,25 +4,31 @@
     S3 design acceptance for EzTest 0.2.1.
 
 .DESCRIPTION
-    Drives a real-LLM version from requirements to design and asserts the S3
-    criteria:
+    Drives a fresh real-LLM version from requirements to design and asserts the
+    S3 criteria:
 
-      1. requirements get confirmed by the real user API;
-      2. a design conversation appears automatically after confirmation (the
-         script never creates a design conversation or clicks "new chat");
-      3. job progress is visible in that conversation as job_card parts and
+      1. clarification converges at the requirement gate and the real user hard
+         gate POST /stage/confirm-requirements confirms the drafts and advances
+         requirement_review -> designing;
+      2. the wrong gate (POST /stage/confirm-cases) is rejected with the typed
+         409 invalid_stage_for_gate at requirement_review and moves nothing;
+      3. a design conversation appears automatically after that gate (the script
+         never creates a design conversation, never PATCHes the legacy
+         auto_design_new_requirements toggle and never POSTs a legacy
+         requirement confirmation as a fallback);
+      4. job progress is visible in that conversation as job_card parts and
          design work items;
-      4. case nodes appear in the design graph/mindmap;
-      5. a case detail exposes executable steps, assertions (success criteria)
-         and evidence sources;
-      6. a confirmed case is projected back into the graph as confirmed.
+      5. the hard gate enqueued a design.cases stage-entry work item, and case
+         nodes appear in the design graph/mindmap automatically (cases > 0);
+      6. a case detail exposes executable steps, assertions (success criteria)
+         and evidence sources.
 
-    The 0.2.1 requirement hard gate is attempted first. On the current product
-    it answers 409 invalid_stage_for_gate because the version never leaves the
-    created stage; that is recorded as a warning together with the exact error,
-    and the available 0.2 requirement-confirmation path is used so the design
-    evidence can still be produced. The script never writes the DB or fakes a
-    stage transition.
+    There is deliberately no downgrade path: when the version is not at the
+    hard-gate source stage, the script records the typed 409 and fails instead
+    of switching to the 0.2 requirement-confirmation API. The script writes no
+    application data through SQL (the only DB use is the read-only stage-entry
+    work-item projection). Case confirmation belongs to S4, which calls the
+    case hard gate.
 
 .PARAMETER VersionId
     Reuse an existing version instead of creating one.
@@ -88,6 +94,8 @@ $requirementIds = @()
 $caseCards = @()
 $designConversation = $null
 $stageGateError = ""
+$requirementGatePassed = $false
+$stageAtEndValue = ""
 
 function Save-S3State {
     param([hashtable] $Values)
@@ -243,62 +251,147 @@ try {
                 $scenario.ErrorMessage = "S3 failed: no requirement draft was produced; design cannot be exercised"
             } else {
                 # ------------------------------------------------------------------
-                # Enable the version-level auto design setting before confirming,
-                # then attempt the 0.2.1 requirement hard gate.
+                # The 0.2.1 hard gates. The version must sit at requirement_review
+                # before the user confirmation can advance it. There is no
+                # legacy requirement-confirmation / auto-design fallback.
                 # ------------------------------------------------------------------
-                $autoDesign = Invoke-Api -Context $context -Method "PATCH" -Path "/api/versions/$versionId" -Token $context.Token `
-                    -Body @{ auto_design_new_requirements = $true }
-                Add-AcceptanceCheck -Scenario $scenario -Name "auto design enabled" -Passed ($autoDesign.Ok -and [bool](Get-JsonProp -Object $autoDesign.Data -Name "auto_design_new_requirements" -Default $false)) `
-                    -Severity assertion -Detail "HTTP $($autoDesign.Status)"
+                $autoDesignView = $null
+                try { $autoDesignView = Get-Version -Context $context -VersionId $versionId } catch { }
+                $autoDesignEnabled = [bool](Get-JsonProp -Object $autoDesignView -Name "auto_design_new_requirements" -Default $false)
+                Add-AcceptanceCheck -Scenario $scenario -Name "legacy auto-design toggle is not enabled" -Passed ($null -ne $autoDesignView -and -not $autoDesignEnabled) -Severity assertion `
+                    -Detail "auto_design_new_requirements=$autoDesignEnabled; the script never PATCHes the legacy toggle"
 
+                # Clarification convergence is owned by the product: the runner
+                # advances clarifying -> requirement_review when the
+                # clarification host's turn explicitly asks the user to confirm
+                # the drafts. The script only asks for that declaration; it
+                # never writes the stage.
+                $stageWait = Wait-Until -TimeoutSeconds ([Math]::Min(60, $ClarifyTimeoutSeconds)) -IntervalSeconds 3 -Description "requirement_review stage" -Condition {
+                    try { $current = Get-VersionStage -Context $context -VersionId $versionId } catch { return $null }
+                    if ([string](Get-JsonProp -Object $current -Name "stage" -Default "") -eq "requirement_review") { return $current }
+                    return $null
+                }
+                if (-not $stageWait.Ok -and $conversationId -ne "") {
+                    try {
+                        $convergeNudge = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $conversationId `
+                            -Text "请现在把需求草案写入需求列表（4 条左右，覆盖登录、文章、评论、后台管理），并在回复末尾明确给出『需求确认请求』；随后停在需求确认门等待用户确认，不要开始设计。"
+                        Write-AcceptanceLog -Scenario $scenario -Message ("posted requirement-confirmation nudge message=" + [string](Get-JsonProp -Object $convergeNudge -Name 'id' -Default ''))
+                    } catch {
+                        Write-AcceptanceLog -Scenario $scenario -Level warn -Message "confirmation nudge failed: $($_.Exception.Message)"
+                    }
+                    $stageWait = Wait-Until -TimeoutSeconds ([Math]::Max(90, [int]($ClarifyTimeoutSeconds / 2))) -IntervalSeconds 3 -Description "requirement_review stage after nudge" -Condition {
+                        try { $current = Get-VersionStage -Context $context -VersionId $versionId } catch { return $null }
+                        if ([string](Get-JsonProp -Object $current -Name "stage" -Default "") -eq "requirement_review") { return $current }
+                        return $null
+                    }
+                }
                 $stageBefore = $null
-                try { $stageBefore = Get-VersionStage -Context $context -VersionId $versionId } catch { }
-                [void](Write-S3Evidence -Name "stage-before.json" -Value $stageBefore -Note "stage before requirement gate")
+                if ($stageWait.Ok) { $stageBefore = $stageWait.Value }
+                else { try { $stageBefore = Get-VersionStage -Context $context -VersionId $versionId } catch { } }
+                [void](Write-S3Evidence -Name "stage-before.json" -Value $stageBefore -Note "stage at the requirement hard gate")
                 $stageValue = [string](Get-JsonProp -Object $stageBefore -Name "stage" -Default "")
+                Add-AcceptanceCheck -Scenario $scenario -Name "clarification converged at the requirement gate" -Passed ($stageValue -eq "requirement_review") -Severity assertion `
+                    -Detail ("stage=$stageValue; expected requirement_review (the product owns the clarifying->requirement_review edge; the script only asks for the confirmation request)")
 
-                $gate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-requirements" `
-                    -Token $context.Token -Body @{ requirement_ids = $requirementIds }
-                $gateError = Get-JsonProp -Object $gate.Error -Name "code" -Default ""
-                $gateDetail = [pscustomobject]@{
-                    http_status = $gate.Status
-                    ok          = $gate.Ok
-                    error_code  = [string]$gateError
-                    error       = $gate.Error
-                    stage       = $stageValue
-                }
-                [void](Write-S3Evidence -Name "requirement-gate.json" -Value $gateDetail -Note "0.2.1 requirement hard-gate attempt")
-                if ($gate.Ok) {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 requirement hard gate advanced the stage" -Passed $true -Severity assertion `
-                        -Detail ("HTTP 200 stage_after=" + [string](Get-JsonProp -Object $gate.Data -Name 'stage' -Default ''))
+                $requirementsAtGate = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+                $draftAtGate = @($requirementsAtGate | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -eq "draft" })
+                $gateRequirementIds = @($draftAtGate | ForEach-Object { [string](Get-JsonProp -Object $_ -Name "id" -Default "") } | Where-Object { $_ -ne "" })
+                Add-AcceptanceCheck -Scenario $scenario -Name "requirements are draft at the hard gate" -Passed ($stageValue -eq "requirement_review" -and $gateRequirementIds.Count -ge 1) -Severity assertion `
+                    -Detail ("requirements=$($requirementsAtGate.Count) draft=$($draftAtGate.Count)")
+
+                if ($stageValue -eq "requirement_review" -and $gateRequirementIds.Count -ge 1) {
+                    # Negative assertion: the case gate must be rejected at the
+                    # requirement gate because its only source stage is
+                    # case_review. The rejection must not move the stage.
+                    $wrongGate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-cases" `
+                        -Token $context.Token -Body @{ case_ids = @() }
+                    $wrongGateCode = [string](Get-JsonProp -Object $wrongGate.Error -Name "code" -Default "")
+                    $stageAfterWrongGate = $null
+                    try { $stageAfterWrongGate = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+                    $stageAfterWrongGateValue = [string](Get-JsonProp -Object $stageAfterWrongGate -Name "stage" -Default "")
+                    [void](Write-S3Evidence -Name "wrong-gate-case-at-requirement-review.json" -Value ([pscustomobject]@{
+                        http_status = $wrongGate.Status
+                        ok          = $wrongGate.Ok
+                        error_code  = $wrongGateCode
+                        error       = $wrongGate.Error
+                        stage_before = $stageValue
+                        stage_after  = $stageAfterWrongGateValue
+                    }) -Note "case hard gate called at requirement_review (must be rejected)")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "invalid_stage_for_gate rejected the case gate at requirement_review" `
+                        -Passed ($wrongGate.Status -eq 409 -and $wrongGateCode -eq "invalid_stage_for_gate" -and $stageAfterWrongGateValue -eq "requirement_review") `
+                        -Severity assertion `
+                        -Detail ("HTTP $($wrongGate.Status) code=$wrongGateCode stage=$stageValue->$stageAfterWrongGateValue")
+
+                    $conversationsBeforeGate = @(Get-VersionConversations -Context $context -VersionId $versionId -Limit 100)
+                    $designBeforeGate = @($conversationsBeforeGate | Where-Object { [string](Get-JsonProp -Object $_ -Name "kind" -Default "") -eq "design" })
+                    Add-AcceptanceCheck -Scenario $scenario -Name "no design conversation before the requirement hard gate" -Passed ($designBeforeGate.Count -eq 0) -Severity warning `
+                        -Detail "designConversationsBeforeGate=$($designBeforeGate.Count)"
+
+                    # Positive assertion: the real 0.2.1 requirement gate
+                    # confirms the drafts and advances to designing.
+                    $gate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-requirements" `
+                        -Token $context.Token -Body @{ requirement_ids = $gateRequirementIds }
+                    $gateCode = [string](Get-JsonProp -Object $gate.Error -Name "code" -Default "")
+                    $gateStage = [string](Get-JsonProp -Object $gate.Data -Name "stage" -Default "")
+                    $stageAfterGate = $null
+                    try { $stageAfterGate = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+                    $stageAfterGateValue = [string](Get-JsonProp -Object $stageAfterGate -Name "stage" -Default "")
+                    [void](Write-S3Evidence -Name "requirement-gate.json" -Value ([pscustomobject]@{
+                        http_status  = $gate.Status
+                        ok           = $gate.Ok
+                        response     = $gate.Data
+                        error_code   = $gateCode
+                        error        = $gate.Error
+                        stage_before = $stageValue
+                        stage_after  = $stageAfterGateValue
+                    }) -Note "0.2.1 requirement hard gate")
+                    [void](Write-S3Evidence -Name "stage-after-gate.json" -Value $stageAfterGate -Note "stage after the requirement hard gate")
+                    $requirementGatePassed = $gate.Ok -and $gateStage -eq "designing" -and $stageAfterGateValue -eq "designing"
+                    Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 requirement hard gate advanced requirement_review to designing" `
+                        -Passed $requirementGatePassed -Severity assertion `
+                        -Detail ("HTTP $($gate.Status) code=$gateCode responseStage=$gateStage readbackStage=$stageAfterGateValue")
+                    if (-not $requirementGatePassed) {
+                        $stageGateError = "HTTP $($gate.Status) $gateCode"
+                        $scenario.ErrorMessage = "S3 failed: the 0.2.1 requirement hard gate did not advance the version (HTTP $($gate.Status) $gateCode); no fallback is used"
+                    }
+
+                    # The stage machine must have dispatched the design.cases
+                    # stage-entry work item for the confirmed scope.
+                    $designCasesDb = Invoke-AcceptanceDbQuery -Context $context -VersionId ([long]$versionId) `
+                        -Sql "SELECT id, team, type, kind, status, attempts, max_attempts, created_by, inputs::text FROM work_item WHERE version_id = $versionId AND kind = 'design.cases' ORDER BY id"
+                    $designCasesRows = @($designCasesDb.Rows)
+                    [void](Write-S3Evidence -Name "design-cases-job-db.json" -Value ([pscustomobject]@{
+                        database = $designCasesDb.Database
+                        ok       = $designCasesDb.Ok
+                        error    = $designCasesDb.Error
+                        rows     = $designCasesRows
+                    }) -Kind "db" -Note "design.cases stage-entry work item (read-only DB projection)")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "requirement hard gate enqueued the design.cases stage-entry job" `
+                        -Passed ($designCasesDb.Ok -and $designCasesRows.Count -ge 1) -Severity assertion `
+                        -Detail ("database=$($designCasesDb.Database) rows=$($designCasesRows.Count) error=$($designCasesDb.Error)")
                 } else {
-                    $stageGateError = "HTTP $($gate.Status) $gateError"
-                    Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 requirement hard gate reachable" -Passed $false -Severity warning `
-                        -Detail ("stage=$stageValue HTTP $($gate.Status) code=$gateError message=" + [string](Get-JsonProp -Object $gate.Error -Name 'message' -Default '') + "; using the available 0.2 requirement-confirmation path")
-                }
-
-                # The available user confirmation path. If the stage gate
-                # already confirmed the rows we skip the duplicate call.
-                if (-not $gate.Ok) {
-                    $batch = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/requirements/confirmations" `
+                    # The version never reached its hard-gate source stage. The
+                    # gate is still called once to record the exact typed
+                    # rejection, and the scenario fails: it never falls back to
+                    # the legacy 0.2 requirement-confirmation API.
+                    $gate = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/stage/confirm-requirements" `
                         -Token $context.Token -Body @{ requirement_ids = $requirementIds }
-                    $confirmedIds = @()
-                    foreach ($item in @(Get-JsonProp -Object $batch.Data -Name "confirmed" -Default @())) {
-                        $confirmedIds += [string]$item
-                    }
-                    $skippedIds = @(Get-JsonProp -Object $batch.Data -Name "skipped" -Default @())
-                    $processedCount = $confirmedIds.Count + $skippedIds.Count
-                    $batchDetail = [pscustomobject]@{
-                        http_status   = $batch.Status
-                        ok            = $batch.Ok
-                        confirmed     = $confirmedIds
-                        skipped       = $skippedIds
-                        error         = $batch.Error
-                    }
-                    [void](Write-S3Evidence -Name "requirement-confirmations.json" -Value $batchDetail -Note "0.2 requirement confirmation response")
-                    Add-AcceptanceCheck -Scenario $scenario -Name "requirements confirmed by the user API" -Passed ($batch.Ok -and $processedCount -ge $requirementIds.Count) -Severity assertion `
-                        -Detail ("HTTP $($batch.Status) confirmed=$($confirmedIds.Count) skipped=$($skippedIds.Count) selected=$($requirementIds.Count)")
+                    $gateCode = [string](Get-JsonProp -Object $gate.Error -Name "code" -Default "")
+                    [void](Write-S3Evidence -Name "requirement-gate.json" -Value ([pscustomobject]@{
+                        http_status  = $gate.Status
+                        ok           = $gate.Ok
+                        response     = $gate.Data
+                        error_code   = $gateCode
+                        error        = $gate.Error
+                        stage_before = $stageValue
+                    }) -Note "requirement hard gate attempted at the wrong stage")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "0.2.1 requirement hard gate reachable" -Passed $false -Severity assertion `
+                        -Detail ("stage=$stageValue HTTP $($gate.Status) code=$gateCode; the version must reach requirement_review before the gate; no fallback is used")
+                    $stageGateError = "HTTP $($gate.Status) $gateCode"
+                    $scenario.ErrorMessage = "S3 failed: version stage=$stageValue, requirement gate requires requirement_review (HTTP $($gate.Status) $gateCode); no fallback is used"
                 }
 
+                if ($requirementGatePassed) {
                 # Requirements must leave draft before design can start.
                 $clarifiedWait = Wait-Until -TimeoutSeconds 90 -IntervalSeconds 3 -Description "requirements non-draft" -Condition {
                     $current = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
@@ -315,13 +408,10 @@ try {
 
                 # ------------------------------------------------------------------
                 # The S3 criterion: a design conversation and case nodes appear
-                # without the user creating a design chat.
+                # without the user creating a design chat. The design work is
+                # driven by the design.cases stage-entry job the hard gate
+                # dispatched above; the script only reads.
                 # ------------------------------------------------------------------
-                $conversationsBefore = @(Get-VersionConversations -Context $context -VersionId $versionId -Limit 100)
-                $designBefore = @($conversationsBefore | Where-Object { [string](Get-JsonProp -Object $_ -Name "kind" -Default "") -eq "design" })
-                Add-AcceptanceCheck -Scenario $scenario -Name "no design conversation before confirmation" -Passed ($designBefore.Count -eq 0) -Severity warning `
-                    -Detail "designConversationsBefore=$($designBefore.Count)"
-
                 $designWait = Wait-Until -TimeoutSeconds $DesignTimeoutSeconds -IntervalSeconds 5 -Description "auto design conversation" -Condition {
                     $conversation = Get-AcceptanceDesignConversation -Context $context -VersionId $versionId
                     if ($null -ne $conversation) { return $conversation }
@@ -410,42 +500,16 @@ try {
                 }
 
                 # ------------------------------------------------------------------
-                # "Confirmed cases appear": confirm one generated case through the
-                # real design confirmation API and read it back from the graph.
+                # S3 ends when automatic generation is complete. Case confirmation
+                # (case_review -> executing) is the S4 case hard gate; S3 never
+                # calls the legacy POST /design/confirmations endpoint.
                 # ------------------------------------------------------------------
-                $confirmTarget = $caseCards | Where-Object { $_.status -eq "draft" } | Select-Object -First 1
-                $confirmedCaseIds = @($caseCards | Where-Object { $_.status -eq "confirmed" } | ForEach-Object { $_.case_id })
-                if ($null -eq $confirmTarget -and $confirmedCaseIds.Count -gt 0) {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "generated case can be confirmed" -Passed $true -Severity warning `
-                        -Detail "the version was reused and already has $($confirmedCaseIds.Count) confirmed case(s); no draft case was available"
-                    [void](Write-S3Evidence -Name "design-graph-after-confirm.json" -Value $graph -Note "graph of the reused version with confirmed cases")
-                    Add-AcceptanceCheck -Scenario $scenario -Name "confirmed case appears in the graph" -Passed $true -Severity assertion `
-                        -Detail "confirmedCases=$($confirmedCaseIds.Count)"
-                } elseif ($null -ne $confirmTarget) {
-                    $confirm = Invoke-Api -Context $context -Method "POST" -Path "/api/versions/$versionId/design/confirmations" `
-                        -Token $context.Token -Body @{ scope = "case"; target_id = $confirmTarget.case_id; batch_id = ("s3-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)) }
-                    $confirmed = @(Get-JsonProp -Object $confirm.Data -Name "confirmed" -Default @())
-                    [void](Write-S3Evidence -Name "case-confirmation.json" -Value ([pscustomobject]@{ http_status = $confirm.Status; ok = $confirm.Ok; response = $confirm.Data; error = $confirm.Error }) -Note "single case confirmation")
-                    Add-AcceptanceCheck -Scenario $scenario -Name "generated case can be confirmed" -Passed ($confirm.Ok -and $confirmed.Count -ge 1) -Severity assertion `
-                        -Detail ("HTTP $($confirm.Status) confirmed=$($confirmed.Count) case=$($confirmTarget.case_id)")
-                    $confirmWait = Wait-Until -TimeoutSeconds 60 -IntervalSeconds 3 -Description "confirmed case in graph" -Condition {
-                        $currentGraph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
-                        $currentCards = @(Get-AcceptanceCaseCards -Graph $currentGraph)
-                        $target = $currentCards | Where-Object { $_.case_id -eq $confirmTarget.case_id } | Select-Object -First 1
-                        if ($null -ne $target -and $target.status -eq "confirmed") { return [pscustomobject]@{ Graph = $currentGraph; Cards = $currentCards } }
-                        return $null
-                    }
-                    if ($confirmWait.Ok -and $null -ne $confirmWait.Value) {
-                        $graph = $confirmWait.Value.Graph
-                        $caseCards = @($confirmWait.Value.Cards)
-                    }
-                    $confirmedCaseIds = @($caseCards | Where-Object { $_.status -eq "confirmed" } | ForEach-Object { $_.case_id })
-                    [void](Write-S3Evidence -Name "design-graph-after-confirm.json" -Value $graph -Note "graph after confirming one case")
-                    Add-AcceptanceCheck -Scenario $scenario -Name "confirmed case appears in the graph" -Passed ($confirmedCaseIds.Count -ge 1) -Severity assertion `
-                        -Detail "confirmedCases=$($confirmedCaseIds.Count)"
-                } else {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "confirmed case appears in the graph" -Passed $false -Severity assertion -Detail "no case was available to confirm"
-                }
+                $stageAtEnd = $null
+                try { $stageAtEnd = Get-VersionStage -Context $context -VersionId $versionId } catch { }
+                $stageAtEndValue = [string](Get-JsonProp -Object $stageAtEnd -Name "stage" -Default "")
+                [void](Write-S3Evidence -Name "stage-at-end.json" -Value $stageAtEnd -Note "stage when S3 finished")
+                Add-AcceptanceCheck -Scenario $scenario -Name "design generation reached case_review" -Passed ($stageAtEndValue -eq "case_review") -Severity warning `
+                    -Detail ("stage=$stageAtEndValue cases=$($caseCards.Count); case confirmation belongs to S4")
 
                 # ------------------------------------------------------------------
                 # SSE: capture the persisted design/job events after the fact.
@@ -485,18 +549,16 @@ try {
                 }
 
                 Save-S3State -Values @{
-                    requirement_ids      = $requirementIds
-                    case_ids             = @($caseCards | ForEach-Object { $_.case_id })
-                    confirmed_case_ids   = $confirmedCaseIds
+                    requirement_ids        = $requirementIds
+                    case_ids               = @($caseCards | ForEach-Object { $_.case_id })
                     design_conversation_id = $designConversationId
-                    stage_at_s3_end      = $stageValue
-                    stage_gate_error     = $stageGateError
+                    stage_at_s3_end        = $stageAtEndValue
+                    stage_gate_error       = $stageGateError
                 }
 
                 if ($caseCards.Count -eq 0 -or $designConversationId -eq "") {
-                    $scenario.ErrorMessage = "S3 failed: designConversation=$designConversationId cases=$($caseCards.Count)"
-                } elseif ($confirmedCaseIds.Count -eq 0) {
-                    $scenario.ErrorMessage = "S3 failed: no confirmed case appeared in the graph"
+                    $scenario.ErrorMessage = "S3 failed: designConversation=$designConversationId cases=$($caseCards.Count) stage=$stageAtEndValue"
+                }
                 }
             }
         }
