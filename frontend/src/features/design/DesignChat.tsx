@@ -76,7 +76,18 @@ export function DesignChat({
   onConversationModelChanged,
 }: DesignChatProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
-  const { messages, loading, error, reload, send, sendError } = useConversation({
+  const {
+    messages,
+    loading,
+    error,
+    reload,
+    send,
+    sendError,
+    hasMore,
+    loadingMore,
+    loadMore,
+    loadMoreError,
+  } = useConversation({
     versionId,
     conversationId: activeConversationId,
     liveMessages,
@@ -252,6 +263,19 @@ export function DesignChat({
                 messages={messages}
                 activity={activity}
                 onRequirementSelect={() => {}}
+                hasMore={hasMore}
+                loadingMore={loadingMore}
+                loadMoreError={loadMoreError}
+                onLoadMore={() => {
+                  void loadMore()
+                }}
+                onRetryLoadMore={() => {
+                  void loadMore()
+                }}
+                // Same recovery as the clarification chat: refetching the
+                // snapshot retries a failed/retryable error part. The action
+                // button only renders because this handler is supplied.
+                onErrorAction={() => reload()}
               />
               <Composer
                 onSend={handleSend}

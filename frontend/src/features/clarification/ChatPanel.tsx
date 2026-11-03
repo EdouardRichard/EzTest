@@ -58,7 +58,18 @@ export function ChatPanel({
   onConversationModelChanged,
 }: ChatPanelProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
-  const { messages, loading, error, reload, send, sendError } = useConversation({
+  const {
+    messages,
+    loading,
+    error,
+    reload,
+    send,
+    sendError,
+    hasMore,
+    loadingMore,
+    loadMore,
+    loadMoreError,
+  } = useConversation({
     versionId,
     conversationId,
     liveMessages,
@@ -175,6 +186,21 @@ export function ChatPanel({
             activity={activity}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            loadMoreError={loadMoreError}
+            onLoadMore={() => {
+              void loadMore()
+            }}
+            onRetryLoadMore={() => {
+              void loadMore()
+            }}
+            // Chat has no dedicated turn-retry endpoint: the page-level
+            // recovery for a failed/retryable error part is refetching the
+            // conversation snapshot (`reload`). Passing the handler is what
+            // lets ErrorPart render its action; without it the button is
+            // intentionally hidden instead of being a dead control.
+            onErrorAction={() => reload()}
           />
           <Composer onSend={send} error={sendError ?? undefined} />
         </>
