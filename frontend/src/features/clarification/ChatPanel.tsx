@@ -97,7 +97,10 @@ export function ChatPanel({
         data-floating={expanded ? "true" : "false"}
         className={cn(
           "surface-card flex flex-col overflow-hidden",
-          expanded ? "h-full min-h-0" : "min-h-[520px] lg:max-h-[calc(100vh-260px)]",
+          // Closed: `flex-1` fills the FloatingPanel host, which is `h-full` of
+          // the grid item, so the card still stretches to the workspace row
+          // (up to the viewport cap) as it did before the wrapper existed.
+          expanded ? "h-full min-h-0" : "flex-1 min-h-[520px] lg:max-h-[calc(100vh-260px)]",
         )}
       >
         <header className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3">

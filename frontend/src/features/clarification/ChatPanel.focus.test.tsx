@@ -132,6 +132,30 @@ describe("ChatPanel floating expansion", () => {
     expect(screen.getByTestId("chat-panel-expand")).toHaveAttribute("aria-expanded", "false")
   })
 
+  it("fills the grid row it occupies while closed", async () => {
+    const view = renderPanel()
+    await screen.findByText(ASSISTANT_TEXT)
+
+    const panel = screen.getByTestId("chat-panel")
+    const inlineSlot = view.container.querySelector<HTMLElement>("[data-floating-panel-inline]")
+    const host = view.container.querySelector<HTMLElement>("[data-floating-panel-host]")
+    expect(inlineSlot).not.toBeNull()
+    expect(host).not.toBeNull()
+    if (inlineSlot === null || host === null) return
+
+    // `RequirementsTab` places this wrapper in the workspace grid and the
+    // primitive's host is `h-full`. jsdom has no layout engine, so the closed
+    // card's fill behaviour is pinned structurally: without the flex fill the
+    // card stops at its 520px min-height and ends above the row bottom whenever
+    // the right sidebar column is taller.
+    expect(panel).toHaveAttribute("data-floating", "false")
+    expect(panel).toHaveClass("flex-1")
+    // The fill class must not replace the closed-state size contract.
+    expect(panel).toHaveClass("min-h-[520px]", "lg:max-h-[calc(100vh-260px)]")
+    expect(inlineSlot).toContainElement(host)
+    expect(host).toHaveClass("h-full", "min-h-0", "flex-col")
+  })
+
   it("closes from the backdrop and toggles closed from the expand control", async () => {
     renderPanel()
     await screen.findByText(ASSISTANT_TEXT)
