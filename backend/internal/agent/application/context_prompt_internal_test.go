@@ -43,10 +43,10 @@ func TestMinimalSystemContentRendersPromptAfterTaskBlock(t *testing.T) {
 		CaseRunID: 3001, CaseTitle: "登录流程", Priority: "P1",
 	}
 	in.Profile.Key = ProfileKeyCaseExecutor
-	in.Profile.SystemPrompt = "[profile:case_executor] 用例 {{.CaseTitle}}/{{.Priority}}"
+	in.Profile.SystemPrompt = "[profile:case_executor] 版本 {{.VersionTitle}}（{{.VersionStatus}}）"
 
 	system := minimalSystemContent(in)
-	if !strings.Contains(system, "用例 登录流程/P1") {
+	if !strings.Contains(system, "版本 订单系统 Q4（running）") {
 		t.Fatalf("minimal prompt not rendered: %s", system)
 	}
 	taskIndex := strings.Index(system, "# 任务")

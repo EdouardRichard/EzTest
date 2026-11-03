@@ -10,13 +10,13 @@ import (
 
 func promptCatalog() []agent.PromptVariable {
 	return []agent.PromptVariable{
-		{Name: "Now", Description: "当前时间", Example: "2026-11-01T12:00:00Z", Source: "runtime"},
-		{Name: "VersionTitle", Description: "版本标题", Example: "订单系统 Q4", Source: "runtime"},
+		{Name: "Now", Description: "当前时间", Example: "2026-11-01T12:00:00Z", Source: "runtime", Stability: agent.PromptVariableStabilityRun},
+		{Name: "VersionTitle", Description: "版本标题", Example: "订单系统 Q4", Source: "runtime", Stability: agent.PromptVariableStabilityStable},
 	}
 }
 
 func validPrompt() string {
-	return "[profile:clarification_host]\n当前时间 {{.Now}}，版本 {{.VersionTitle}}。"
+	return "[profile:clarification_host]\n版本 {{.VersionTitle}}。"
 }
 
 func TestValidatePromptAcceptsCatalogVariables(t *testing.T) {
@@ -26,6 +26,49 @@ func TestValidatePromptAcceptsCatalogVariables(t *testing.T) {
 	// A prompt without template actions stays valid.
 	if err := agent.ValidatePrompt("clarification_host", "[profile:clarification_host] 你是澄清 Host。", promptCatalog()); err != nil {
 		t.Fatalf("plain prompt: %v", err)
+	}
+}
+
+// TestValidatePromptRejectsRunVariable pins that the admin-save validator
+// refuses per-run variables in the system prompt, because that body is the
+// cache-stable prefix. The error is typed (reason/variables) and actionable.
+func TestValidatePromptRejectsRunVariable(t *testing.T) {
+	err := agent.ValidatePrompt("clarification_host",
+		"[profile:clarification_host] 当前时间 {{.Now}}", promptCatalog())
+	if err == nil {
+		t.Fatal("per-run variable accepted in the system prompt")
+	}
+	apiErr := platform.AsError(err)
+	if apiErr.Status != 400 || apiErr.Details["field"] != "system_prompt" {
+		t.Fatalf("err = %#v", apiErr)
+	}
+	if apiErr.Details["reason"] != "unstable_variable" {
+		t.Fatalf("reason = %#v", apiErr.Details["reason"])
+	}
+	variables, ok := apiErr.Details["variables"].([]string)
+	if !ok || len(variables) != 1 || variables[0] != "Now" {
+		t.Fatalf("details variables = %#v", apiErr.Details["variables"])
+	}
+	if !strings.Contains(apiErr.Message, ".Now") {
+		t.Fatalf("message not actionable: %q", apiErr.Message)
+	}
+}
+
+func TestValidatePromptRejectsRunVariableInControlFlow(t *testing.T) {
+	err := agent.ValidatePrompt("clarification_host",
+		"[profile:clarification_host]{{if .Now}}有时间{{end}}", promptCatalog())
+	if err == nil || platform.AsError(err).Details["reason"] != "unstable_variable" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestValidatePromptTemplateRemainsCatalogOnly keeps the generic template
+// validator usable for non-system bodies; the system-prompt guard lives in
+// ValidatePrompt/ValidateSystemPromptTemplate.
+func TestValidatePromptTemplateRemainsCatalogOnly(t *testing.T) {
+	tmpl := "[profile:clarification_host] 当前时间 {{.Now}}"
+	if err := agent.ValidatePromptTemplate(tmpl, promptCatalog()); err != nil {
+		t.Fatalf("generic template validator rejected a catalog variable: %v", err)
 	}
 }
 
