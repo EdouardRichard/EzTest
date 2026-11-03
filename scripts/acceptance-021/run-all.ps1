@@ -36,6 +36,29 @@
         2 = blocked (environment prerequisite, missing/ambiguous harness
             script, or the runner itself failed)
 
+.PARAMETER RequirementInput
+    Task 88 small requirement input (small-a.md / small-b.feature /
+    small-b.txt / small-c.docx). Exactly one requirement source is required:
+    either this parameter or -FullSutDoc. Supplying neither is a preflight
+    error (exit 2); the runner never falls back to the full SUT document.
+
+.PARAMETER ExpectedRequirements
+    Expected requirement count for the supplied input (e.g. 3). When omitted it
+    is derived from the input's FR/NFR ID set; when supplied it must match it,
+    otherwise the preflight fails instead of importing a different document.
+
+.PARAMETER ExpectedFrIds
+    Optional comma-separated expected FR/NFR ID set. When omitted it is derived
+    from the input; when supplied it must match the input exactly.
+
+.PARAMETER FullSutDoc
+    Explicit legacy mode: import the full SUT requirement document. Requires
+    -FullSutDocPath (or the scenario scripts' legacy default path) and cannot be
+    combined with -RequirementInput.
+
+.PARAMETER FullSutDocPath
+    Path of the explicit legacy full SUT requirement document.
+
 .PARAMETER KeepGoing
     Run every available scenario instead of stopping at the first non-passing
     one. The exit code is still non-zero if anything did not pass.
@@ -74,6 +97,14 @@ param(
     [string] $SummaryPath = "",
     [string] $ReportPath = "",
     [string] $ScenarioDirectory = "",
+    # Task 88 (P10-T13): the final E2E must import one explicit small requirement
+    # input, not the full 67-requirement SUT document. Supplying neither the
+    # small input nor -FullSutDoc is a preflight error (no silent 67 fallback).
+    [string] $RequirementInput = "",
+    [int] $ExpectedRequirements = 0,
+    [string] $ExpectedFrIds = "",
+    [switch] $FullSutDoc,
+    [string] $FullSutDocPath = "",
     [switch] $KeepGoing
 )
 
@@ -393,13 +424,18 @@ foreach ($pair in @(
         @{ Name = "-EvidenceRoot"; Value = $context.EvidenceRoot },
         @{ Name = "-ScenarioDirectory"; Value = $ScenarioDirectory },
         @{ Name = "-SummaryPath"; Value = $SummaryPath },
-        @{ Name = "-ReportPath"; Value = $ReportPath }
+        @{ Name = "-ReportPath"; Value = $ReportPath },
+        @{ Name = "-RequirementInput"; Value = $RequirementInput },
+        @{ Name = "-ExpectedRequirements"; Value = $(if ($ExpectedRequirements -gt 0) { [string]$ExpectedRequirements } else { "" }) },
+        @{ Name = "-ExpectedFrIds"; Value = $ExpectedFrIds },
+        @{ Name = "-FullSutDocPath"; Value = $FullSutDocPath }
     )) {
     if (-not [string]::IsNullOrWhiteSpace([string]$pair.Value)) {
         $commandParts += $pair.Name
         $commandParts += ([string]$pair.Value)
     }
 }
+if ($FullSutDoc) { $commandParts += "-FullSutDoc" }
 if ($KeepGoing) { $commandParts += "-KeepGoing" }
 $commandText = $commandParts -join " "
 if (-not [string]::IsNullOrWhiteSpace($AdminPassword) -or -not [string]::IsNullOrWhiteSpace($SutPassword)) {
@@ -478,6 +514,55 @@ $stopMessage = ""
 $runError = ""
 $exitCode = 0
 
+# ---------------------------------------------------------------------------
+# Requirement-source preflight (Task 88)
+#
+# The final E2E imports one explicit small requirement input. Supplying neither
+# -RequirementInput nor -FullSutDoc is an explicit preflight failure; it must
+# never fall back to the full 67-requirement SUT document. The resolved profile
+# is handed to S1/S2/S3 and recorded in the summary/report.
+# ---------------------------------------------------------------------------
+
+$requirementProfile = $null
+$preflightError = ""
+try {
+    $requirementProfile = Resolve-AcceptanceRequirementProfile -RequirementInput $RequirementInput `
+        -ExpectedRequirements $ExpectedRequirements -ExpectedFrIds $ExpectedFrIds `
+        -FullSutDoc:$FullSutDoc -FullSutDocPath $FullSutDocPath -RepoRoot $context.RepoRoot
+} catch {
+    $preflightError = $_.Exception.Message
+}
+$requirementProfileSummary = $null
+if ($null -ne $requirementProfile) {
+    $requirementProfileSummary = [pscustomobject]@{
+        mode                  = $requirementProfile.Mode
+        input                 = (Resolve-RepoRelativePath -Context $context -Path $requirementProfile.Path)
+        input_name            = $requirementProfile.Name
+        format                = $requirementProfile.Format
+        sha256                = $requirementProfile.Sha256
+        expected_requirements = $requirementProfile.ExpectedRequirements
+        expected_fr_ids       = @($requirementProfile.ExpectedFrIds)
+        full_sut_doc_opt_in   = [bool]$FullSutDoc
+    }
+}
+if ($preflightError -ne "") {
+    $runError = $preflightError
+    $stopReason = "preflight"
+    $stopScenario = "preflight"
+    $stopMessage = $preflightError
+    Write-RunLog -Path $logPath -Text "preflight failed: $preflightError"
+    Write-Host ("[BLOCKED] preflight: {0}" -f $preflightError) -ForegroundColor Yellow
+}
+
+if ($preflightError -eq "") {
+# A new run must not inherit an S2/S3 version hand-off from an earlier run.
+# Clearing state.json keeps the small-input S2 -> S3 chain honest (S3 refuses to
+# design a version that this run's S2 did not import).
+$runStatePath = Join-Path $context.EvidenceRoot "state.json"
+if (Test-Path -LiteralPath $runStatePath) {
+    Remove-Item -LiteralPath $runStatePath -Force
+    Write-RunLog -Path $logPath -Text "cleared stale scenario state: $runStatePath"
+}
 foreach ($scenario in $script:ScenarioCatalog) {
     $r = $resultById[$scenario.Id]
     $inv = $inventory[$scenario.Id]
@@ -520,6 +605,16 @@ foreach ($scenario in $script:ScenarioCatalog) {
     }
     $childArgs += "-EvidenceRoot"
     $childArgs += $context.EvidenceRoot
+    if (@("s1", "s2", "s3") -contains $scenario.Id -and $null -ne $requirementProfile) {
+        if ($requirementProfile.Mode -eq "small-input") {
+            $childArgs += @("-RequirementInput", $requirementProfile.Path, "-ExpectedRequirements", [string]$requirementProfile.ExpectedRequirements)
+            if (@($requirementProfile.ExpectedFrIds).Count -gt 0) {
+                $childArgs += @("-ExpectedFrIds", (@($requirementProfile.ExpectedFrIds) -join ","))
+            }
+        } else {
+            $childArgs += @("-FullSutDoc", "-FullSutDocPath", $requirementProfile.Path)
+        }
+    }
 
     Write-Host ""
     Write-Host ("=== [{0}] {1} ({2}) ===" -f $scenario.Id, $scenario.Title, $r.Script) -ForegroundColor Cyan
@@ -628,11 +723,14 @@ foreach ($scenario in $script:ScenarioCatalog) {
         break
     }
 }
+}
 
 # Mark everything that was not reached. It is never counted as a pass.
 foreach ($r in $results) {
     if ($r.Status -eq "not_run") {
-        if (-not [string]::IsNullOrWhiteSpace($stopScenario)) {
+        if ($stopReason -eq "preflight") {
+            $r.Blocker = "not run: requirement-source preflight failed: $preflightError"
+        } elseif (-not [string]::IsNullOrWhiteSpace($stopScenario)) {
             $r.Blocker = "not run: acceptance run stopped at $stopScenario ($stopReason)"
         } else {
             $r.Blocker = "not run"
@@ -726,8 +824,12 @@ $missingPatterns = @($inventoryList | Where-Object { $_.status -eq "missing" } |
 $notes = @(
     "A scenario is PASS only when its exit code is 0 AND result.json status is 'passed'; NOT RUN/MISSING are never passes.",
     "Scenario evidence directories are overwritten by each run; summary.json is authoritative for this run.",
-    "Credentials are passed to children through the process environment and are not recorded."
+    "Credentials are passed to children through the process environment and are not recorded.",
+    "Requirement source is explicit: -RequirementInput (small input) or -FullSutDoc (legacy); no silent full-document fallback."
 )
+if ($null -ne $requirementProfile) {
+    $notes += "Requirement profile: mode=$($requirementProfile.Mode) input=$($requirementProfile.Name) sha256=$($requirementProfile.Sha256) expected=$($requirementProfile.ExpectedRequirements) ids=$(@($requirementProfile.ExpectedFrIds) -join ',')."
+}
 if ($missingPatterns.Count -gt 0) {
     $notes += "Scenario scripts missing at run time: $($missingPatterns -join ', ')."
 }
@@ -751,6 +853,14 @@ $summary = [pscustomobject][ordered]@{
         scenario = $stopScenario
         message  = $stopMessage
     }
+    preflight      = [pscustomobject]@{
+        ok                    = [string]::IsNullOrWhiteSpace($preflightError)
+        error                 = $preflightError
+        requirement_input     = $RequirementInput
+        expected_requirements = $ExpectedRequirements
+        full_sut_doc          = [bool]$FullSutDoc
+    }
+    requirement_profile = $requirementProfileSummary
     command        = $commandText
     repo           = [pscustomobject]@{
         root   = $context.RepoRoot
@@ -870,6 +980,26 @@ function Write-AcceptanceReport {
     $lines.Add('```powershell')
     $lines.Add($Summary.command)
     $lines.Add('```')
+    $lines.Add("")
+    $lines.Add("## Requirement input (Task 88)")
+    $lines.Add("")
+    if ($null -eq $Summary.requirement_profile) {
+        $lines.Add(("**Preflight failed:** {0}" -f (Format-MarkdownCell $Summary.preflight.error)))
+        $lines.Add("")
+        $lines.Add("The run stopped before any scenario because no explicit requirement input was resolved. Pass ``-RequirementInput <small-a.md|small-b.feature|small-b.txt|small-c.docx> -ExpectedRequirements 3`` or the legacy ``-FullSutDoc -FullSutDocPath <doc>``.")
+    } else {
+        $profile = $Summary.requirement_profile
+        $lines.Add("| Field | Value |")
+        $lines.Add("|---|---|")
+        $lines.Add(("| Mode | {0} |" -f (Format-MarkdownCell $profile.mode)))
+        $lines.Add(("| Input | ``{0}`` |" -f (Format-MarkdownCell $profile.input)))
+        $lines.Add(("| Format | {0} |" -f (Format-MarkdownCell $profile.format)))
+        $lines.Add(("| SHA-256 | ``{0}`` |" -f (Format-MarkdownCell $profile.sha256)))
+        $lines.Add(("| Expected requirements | {0} |" -f $profile.expected_requirements))
+        $lines.Add(("| Expected FR/NFR IDs | {0} |" -f (Format-MarkdownCell (@($profile.expected_fr_ids) -join ", "))))
+        $lines.Add(("| Full SUT doc opt-in | {0} |" -f $(if ($profile.full_sut_doc_opt_in) { "yes" } else { "no" })))
+        $lines.Add(("| Preflight | {0} |" -f $(if ($Summary.preflight.ok) { "PASS" } else { "FAIL: " + (Format-MarkdownCell $Summary.preflight.error) })))
+    }
     $lines.Add("")
     $lines.Add("## Scenario results")
     $lines.Add("")
@@ -992,11 +1122,13 @@ function Write-AcceptanceReport {
     $lines.Add("")
     $lines.Add(("- Every scenario script present (``s0-*.ps1`` ... ``s10-*.ps1``). Missing at this run: {0}." -f $(if ($missing.Count -eq 0) { "none" } else { ($missing | ForEach-Object { "``" + $_.pattern + "``" }) -join ", " })))
     $lines.Add("- The EzTest API, web, executor, real LLM and SUT reachable as asserted by S0.")
+    $lines.Add("- One explicit requirement source: ``-RequirementInput`` (small input, expected count validated) or ``-FullSutDoc -FullSutDocPath`` (legacy full document). There is no silent full-document fallback.")
     $lines.Add("- Any product/runtime blockers reported above fixed and verified by rerunning the affected scenario.")
     $lines.Add("- Rerun the entrypoint; acceptance is complete only when this report shows **status PASSED**, every scenario PASS, and the summary ``assertions.all_scenarios_passed`` is true.")
     $lines.Add("")
     $lines.Add('```powershell')
-    $lines.Add("powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\acceptance-021\run-all.ps1")
+    $lines.Add("powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\acceptance-021\run-all.ps1 ``")
+    $lines.Add("  -RequirementInput docs\version-V0.2.1\acceptance\inputs\small-a.md -ExpectedRequirements 3")
     $lines.Add('```')
     $lines.Add("")
     $lines.Add("_Generated by run-all.ps1. Rerun to refresh; do not edit by hand._")

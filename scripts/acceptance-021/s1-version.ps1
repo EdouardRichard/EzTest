@@ -19,6 +19,12 @@
     APIs > 0 and expose route locators; a 0-page version fails loudly instead of
     passing on discovery facts alone. The script creates/approves no resource.
 
+    Task 88 (P10-T13): when the runner supplies -RequirementInput (or the
+    explicit legacy -FullSutDoc), S1 resolves and records the requirement input
+    profile (path/sha256/expected count/FR IDs) as requirement-input.json. S1
+    does not create requirements; S2 imports them into a version created after
+    discovery and S3 designs that same version.
+
     All observations and the full facts snapshot are written under
     docs/version-V0.2.1/acceptance/evidence/s0-s2/s1/.
 
@@ -45,7 +51,17 @@ param(
     [string] $SutPassword = "",
     [string] $EvidenceRoot = "",
     [int] $FactTimeoutSeconds = 120,
-    [int] $ResourceTimeoutSeconds = 120
+    [int] $ResourceTimeoutSeconds = 120,
+    # Task 88 (P10-T13): record which requirement source the downstream S2/S3
+    # flow will use. S1 never creates requirements itself; it only resolves the
+    # explicit small input (or the explicit legacy full document) so the evidence
+    # for the final run names the input file, its sha256, expected count and FR IDs.
+    [string] $RequirementInput = "",
+    [int] $ExpectedRequirements = 0,
+    [string] $ExpectedFrIds = "",
+    [switch] $FullSutDoc,
+    [string] $FullSutDocPath = "",
+    [string] $RequirementDocumentPath = "D:\project\deliverables\墨栈博客系统需求文档（用户故事与BDD版）.md"
 )
 
 Set-StrictMode -Version 3.0
@@ -58,6 +74,19 @@ $context = Initialize-AcceptanceContext -ApiBaseUrl $ApiBaseUrl -WebBaseUrl $Web
     -AdminUsername $AdminUsername -AdminPassword $AdminPassword -SutPassword $SutPassword `
     -EvidenceRoot $EvidenceRoot
 $scenario = New-AcceptanceScenario -Context $context -Name "s1" -Title "建版本与发现子循环 (S1)"
+
+$requirementProfile = $null
+$requirementInputError = ""
+if (-not [string]::IsNullOrWhiteSpace($RequirementInput) -or $FullSutDoc) {
+    try {
+        $requirementProfile = Resolve-AcceptanceRequirementProfile -RequirementInput $RequirementInput `
+            -ExpectedRequirements $ExpectedRequirements -ExpectedFrIds $ExpectedFrIds `
+            -FullSutDoc:$FullSutDoc -FullSutDocPath $FullSutDocPath `
+            -LegacyDocumentPath $RequirementDocumentPath -RepoRoot $context.RepoRoot
+    } catch {
+        $requirementInputError = $_.Exception.Message
+    }
+}
 
 $runSuffix = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $version = $null
@@ -75,6 +104,31 @@ $exitCode = 2
 
 try {
     Write-AcceptanceLog -Scenario $scenario -Message "S1 create-version acceptance; fact timeout=${FactTimeoutSeconds}s"
+
+    if ($null -ne $requirementProfile) {
+        $requirementInputPath = Join-Path $scenario.Directory "requirement-input.json"
+        Write-EvidenceJson -Path $requirementInputPath -Value ([pscustomobject]@{
+            mode                   = $requirementProfile.Mode
+            input_path             = $requirementProfile.Path
+            input_name             = $requirementProfile.Name
+            format                 = $requirementProfile.Format
+            sha256                 = $requirementProfile.Sha256
+            size                   = $requirementProfile.Size
+            expected_requirements  = $requirementProfile.ExpectedRequirements
+            expected_fr_ids        = @($requirementProfile.ExpectedFrIds)
+            v1_fr                  = $requirementProfile.V1FrCount
+            nfr                    = $requirementProfile.NfrCount
+            v2                     = $requirementProfile.V2Count
+            full_sut_doc_opt_in    = [bool]$FullSutDoc
+            note                   = "S1 records the requirement source for the final run; S2 imports it and S3 designs against the same version."
+        })
+        Add-AcceptanceArtifact -Scenario $scenario -Path $requirementInputPath -Kind "input" -Note "requirement input profile (path/sha/expected count/FR IDs)"
+        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input profile resolved for the final run" -Passed $true -Severity assertion `
+            -Detail ("mode=$($requirementProfile.Mode) input=$($requirementProfile.Path) sha256=$($requirementProfile.Sha256) expected=$($requirementProfile.ExpectedRequirements) ids=$(@($requirementProfile.ExpectedFrIds) -join ',')")
+    } elseif ($requirementInputError -ne "") {
+        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input profile resolved for the final run" -Passed $false -Severity blocker -Detail $requirementInputError
+        $scenario.ErrorMessage = "S1 blocked: $requirementInputError"
+    }
 
     # ------------------------------------------------------------------
     # Login (blocked when the stack is not ready)

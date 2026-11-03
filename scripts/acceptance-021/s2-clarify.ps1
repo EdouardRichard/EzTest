@@ -1,23 +1,28 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    S2 clarification acceptance for EzTest 0.2.1 (Task 72 SUT requirement import).
+    S2 clarification acceptance for EzTest 0.2.1 (Task 88 small-input profile,
+    with the Task 72 full-document traceability kept as an explicit opt-in).
 
 .DESCRIPTION
     Drives a real-LLM clarification conversation for a freshly created 墨栈博客
-    version, imports the real SUT requirement document as an attachment, and
-    asserts the S2 criteria plus the Task 72 traceability criteria:
+    version, imports exactly one explicit requirement source as an attachment,
+    and asserts the S2 criteria plus the traceability criteria:
 
-      1. the requirement document is uploaded through POST /api/content and
-         attached to the clarification message (sha256/size verified); the
-         server extracts the text (requirement_attachment.extraction_status =
-         done) instead of the script only passing a path;
-      2. the clarification flow extracts V1 FR-001..FR-058 + NFR-001..NFR-009 as
-         draft requirements whose titles are traceable to the FR/NFR IDs, via
-         bounded, real document-text batches; V2 FR-101..FR-132 are recognized
-         as 延展·未实现 and are not created as requirements or defects;
-      3. all 29 P0 requirements are present; requirements stay draft at the
-         version-level requirement confirmation gate;
+      1. the requirement input is uploaded through POST /api/content and attached
+         to the clarification message (sha256/size verified); the server extracts
+         the text (requirement_attachment.extraction_status = done) instead of
+         the script only passing a path;
+      2. every requirement in the resolved input is created as a draft whose
+         title is traceable to its FR/NFR ID, via bounded, real input-text
+         batches. In the recommended small-input mode the input is one of
+         small-a.md / small-b.feature / small-b.txt / small-c.docx and the
+         expected count/FR ID set comes from that file only; the legacy
+         -FullSutDoc mode keeps the previous full-document behavior. V2
+         requirements are never created from the input;
+      3. the requirement count equals the expected count, the imported FR ID set
+         equals the input set, there are no duplicates/untraceable rows, and all
+         requirements stay draft at the requirement_review gate;
       4. every requirement gets at most six clarification questions (aggregate
          budget = 6 * current requirement count), no normalized duplicate
          questions, and the version stops at requirement_review without
@@ -28,6 +33,8 @@
     parse state and the per-conversation agent-run usage. If a batch of the
     model only ingests a subset, the evidence records exactly which FR/NFR IDs
     are missing and the assertion fails instead of claiming full coverage.
+    S2 records the imported version/expected/actual set in the shared state so
+    S3 designs the same version instead of creating an unrelated requirement set.
 
 .NOTES
     Exit codes: 0 = passed, 1 = failed acceptance assertion, 2 = blocked
@@ -47,14 +54,20 @@ param(
     [int] $MaxTurns = 4,
     [int] $ReplyTimeoutSeconds = 180,
     [int] $QuestionBudgetPerRequirement = 6,
-    # Product clarification budget per version (spec §5.5/§15). The S2 harness
-    # feeds the 67-requirement document through separate batch-extraction
-    # conversations; those are harness sessions, not user clarification turns, so
-    # the budget is asserted on the primary+convergence conversations only and
-    # the extraction-session exception is recorded in questions.json/result
-    # warnings (never hidden and never claimed as an unqualified version-wide
-    # threshold).
+    # Product clarification budget per version (spec §5.5/§15). S2 harness
+    # extraction conversations are not user clarification turns, so the budget is
+    # asserted on the primary+convergence conversations only and the
+    # extraction-session exception is recorded in questions.json/result warnings.
     [int] $UserClarificationQuestionBudget = 30,
+    # Task 88 (P10-T13): one explicit requirement source. The final E2E passes
+    # -RequirementInput <small-a.md|small-b.feature|small-b.txt|small-c.docx>
+    # (and usually -ExpectedRequirements 3). -FullSutDoc keeps the legacy full
+    # SUT document import as an explicit opt-in; there is no implicit 67 fallback.
+    [string] $RequirementInput = "",
+    [int] $ExpectedRequirements = 0,
+    [string] $ExpectedFrIds = "",
+    [switch] $FullSutDoc,
+    [string] $FullSutDocPath = "",
     [string] $RequirementDocumentPath = "D:\project\deliverables\墨栈博客系统需求文档（用户故事与BDD版）.md",
     [int] $ImportMaxEntriesPerBatch = 8,
     [int] $ImportMaxCharsPerBatch = 9000,
@@ -179,20 +192,33 @@ function New-SutBatchPrompt {
         [Parameter(Mandatory = $true)] [string] $DocumentName,
         [Parameter(Mandatory = $true)] [int] $Index,
         [Parameter(Mandatory = $true)] [int] $Total,
-        [Parameter(Mandatory = $true)] $Entries
+        [Parameter(Mandatory = $true)] $Entries,
+        [Parameter(Mandatory = $false)] [string[]] $ExpectedIds = @(),
+        [Parameter(Mandatory = $false)] [switch] $SmallInput,
+        [Parameter(Mandatory = $false)] [int] $V2Count = 0
     )
     $entryList = @($Entries)
-    $ids = @($entryList | ForEach-Object { [string]$_.id })
+    $ids = if (@($ExpectedIds).Count -gt 0) { @($ExpectedIds) } else { @($entryList | ForEach-Object { [string]$_.id }) }
     $raw = ($entryList | ForEach-Object { [string]$_.text }) -join "`n`n"
+    $scopeRule = if ($SmallInput) {
+        "5. 本次只允许创建下面列出的编号；输入不含 V2 延展需求，不要创建任何未列出的编号。"
+    } else {
+        "5. 不要创建 V2 延展·未实现需求（输入中 $V2Count 条，不属于本次交付，也不算缺陷）。"
+    }
+    $intro = if ($SmallInput) {
+        "【小规模需求抽取批 $Index/$Total】文档《$DocumentName》已作为附件导入主澄清会话并完成解析；下面是该小输入文档的真实原文片段（不是完整 SUT 需求文档）。"
+    } else {
+        "【SUT 需求抽取批 $Index/$Total】文档《$DocumentName》已作为附件导入主澄清会话并完成解析；下面是同一文档的真实原文片段。"
+    }
     return @"
-【SUT 需求抽取批 $Index/$Total】文档《$DocumentName》已作为附件导入主澄清会话并完成解析；下面是同一文档的真实原文片段。
+$intro
 请立即把下列编号逐条创建为 draft 需求，不要提问、不要确认、不要调用 attachment.*/sut.* 工具，也不要先读取需求列表。
 规则：
 1. 每个编号调用一次 requirement.draft_create，不得遗漏、不得重复、不得创建未列出的编号。
 2. title 必须以编号开头，格式「<编号> <原文标题>」。
 3. description 用 2-5 句概括该条「需求描述」；acceptance_criteria 保留 Given/When/Then 验收场景（至少一个场景）。
 4. priority 必须与原文一致（P0/P1/P2/P3）。
-5. 不要创建 FR-101~FR-132：它们是 V2 延展·未实现，不属于本次交付，也不算缺陷。
+$scopeRule
 本次编号（共 $($ids.Count) 条）：$($ids -join '、')
 --- 文档原文开始 ---
 $raw
@@ -234,6 +260,21 @@ $primaryRecords = @()
 $convergenceRecords = @()
 $batchQuestionRecords = @()
 
+# Task 88: resolve exactly one requirement source before any network call. A
+# missing source or a count mismatch blocks S2 instead of importing the full
+# SUT document by default.
+$requirementProfile = $null
+$inputProfileError = ""
+try {
+    $requirementProfile = Resolve-AcceptanceRequirementProfile -RequirementInput $RequirementInput `
+        -ExpectedRequirements $ExpectedRequirements -ExpectedFrIds $ExpectedFrIds `
+        -FullSutDoc:$FullSutDoc -FullSutDocPath $FullSutDocPath `
+        -LegacyDocumentPath $RequirementDocumentPath -RepoRoot $context.RepoRoot
+} catch {
+    $inputProfileError = $_.Exception.Message
+}
+$isSmallInput = ($null -ne $requirementProfile -and $requirementProfile.Mode -eq "small-input")
+
 function Write-S2Evidence {
     param([string] $Name, $Value, [string] $Kind = "api", [string] $Note = "")
     $path = Join-Path $scenario.Directory $Name
@@ -243,14 +284,23 @@ function Write-S2Evidence {
 }
 
 try {
-    Write-AcceptanceLog -Scenario $scenario -Message "S2 SUT requirement import; doc=$RequirementDocumentPath batchEntries=$ImportMaxEntriesPerBatch batchChars=$ImportMaxCharsPerBatch batchTimeout=${ImportBatchTimeoutSeconds}s"
+    $inputModeLabel = if ($null -ne $requirementProfile) { $requirementProfile.Mode } else { "unresolved" }
+    $inputPathLabel = if ($null -ne $requirementProfile) { $requirementProfile.Path } else { $RequirementInput }
+    Write-AcceptanceLog -Scenario $scenario -Message "S2 requirement import; mode=$inputModeLabel input=$inputPathLabel expected=$ExpectedRequirements batchEntries=$ImportMaxEntriesPerBatch batchChars=$ImportMaxCharsPerBatch batchTimeout=${ImportBatchTimeoutSeconds}s"
 
-    $login = Connect-EzTest -Context $context
-    Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $login.Ok -Severity blocker `
-        -Detail ($(if ($login.Ok) { "user=$([string](Get-JsonProp -Object $login.User -Name "username" -Default "?"))" } else { $login.Error }))
-    if (-not $login.Ok) {
-        $scenario.ErrorMessage = "S2 blocked: EzTest admin login failed"
+    if ($inputProfileError -ne "") {
+        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input profile resolved" -Passed $false -Severity blocker -Detail $inputProfileError
+        $scenario.ErrorMessage = "S2 blocked: $inputProfileError"
     } else {
+        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input profile resolved" -Passed $true -Severity blocker `
+            -Detail ("mode=$($requirementProfile.Mode) path=$($requirementProfile.Path) sha256=$($requirementProfile.Sha256) expected=$($requirementProfile.ExpectedRequirements) ids=$(@($requirementProfile.ExpectedFrIds) -join ',')")
+
+        $login = Connect-EzTest -Context $context
+        Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $login.Ok -Severity blocker `
+            -Detail ($(if ($login.Ok) { "user=$([string](Get-JsonProp -Object $login.User -Name "username" -Default "?"))" } else { $login.Error }))
+        if (-not $login.Ok) {
+            $scenario.ErrorMessage = "S2 blocked: EzTest admin login failed"
+        } else {
         $bindingResult = $null
         try {
             $bindingResult = Resolve-AcceptanceSutBinding -Context $context
@@ -276,45 +326,72 @@ try {
 
             if ($versionId -ne "") {
                 # ------------------------------------------------------------------
-                # Read the real requirement baseline (read-only).
+                # Requirement baseline: the resolved profile is the only source.
+                # Small input -> only its 3 requirements; -FullSutDoc -> the
+                # explicitly requested legacy full document. No implicit 67.
                 # ------------------------------------------------------------------
                 $baselineError = ""
-                try {
-                    $baselineEntries = @(Read-SutRequirementDocument -Path $RequirementDocumentPath)
-                } catch {
-                    $baselineError = $_.Exception.Message
-                }
+                $baselineEntries = @($requirementProfile.Entries)
                 $v1Entries = @($baselineEntries | Where-Object { [string]$_.version -eq "V1" })
                 $v2Entries = @($baselineEntries | Where-Object { [string]$_.version -eq "V2" })
                 $v1Fr = @($v1Entries | Where-Object { [string]$_.id -like "FR-0*" })
                 $nfr = @($v1Entries | Where-Object { [string]$_.id -like "NFR-*" })
                 $p0Entries = @($v1Entries | Where-Object { [string]$_.priority -eq "P0" })
-                $documentPathFull = if (Test-Path -LiteralPath $RequirementDocumentPath) { (Get-Item -LiteralPath $RequirementDocumentPath).FullName } else { $RequirementDocumentPath }
+                $documentPathFull = $requirementProfile.Path
                 Write-S2Evidence -Name "document-baseline.json" -Value ([pscustomobject]@{
-                    path              = $documentPathFull
-                    parsed_at         = (Get-Date).ToUniversalTime().ToString("o")
-                    parse_error       = $baselineError
-                    total             = $baselineEntries.Count
-                    v1_total          = $v1Entries.Count
-                    v1_fr             = $v1Fr.Count
-                    nfr               = $nfr.Count
-                    v2                = $v2Entries.Count
-                    p0                = $p0Entries.Count
-                    entries           = @($baselineEntries | Select-Object id, title, priority, version, version_label, line_start, line_end, char_count)
-                    v2_ids            = @($v2Entries | ForEach-Object { $_.id })
-                    p0_ids            = @($p0Entries | ForEach-Object { $_.id })
-                }) -Kind "baseline" -Note "parsed SUT requirement document baseline"
-                Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement document parsed (V1 58 FR + 9 NFR + V2 32)" `
-                    -Passed ($baselineError -eq "" -and $v1Fr.Count -eq 58 -and $nfr.Count -eq 9 -and $v2Entries.Count -eq 32) -Severity assertion `
-                    -Detail ("error=$baselineError v1fr=$($v1Fr.Count) nfr=$($nfr.Count) v2=$($v2Entries.Count) p0=$($p0Entries.Count) total=$($baselineEntries.Count)")
-                if ($baselineError -ne "") {
-                    $scenario.ErrorMessage = "S2 blocked: SUT requirement document could not be parsed: $baselineError"
+                    path                   = $documentPathFull
+                    mode                   = $requirementProfile.Mode
+                    format                 = $requirementProfile.Format
+                    sha256                 = $requirementProfile.Sha256
+                    expected_requirements  = $requirementProfile.ExpectedRequirements
+                    expected_fr_ids        = @($requirementProfile.ExpectedFrIds)
+                    parsed_at              = (Get-Date).ToUniversalTime().ToString("o")
+                    parse_error            = $baselineError
+                    total                  = $baselineEntries.Count
+                    v1_total               = $v1Entries.Count
+                    v1_fr                  = $v1Fr.Count
+                    nfr                    = $nfr.Count
+                    v2                     = $v2Entries.Count
+                    p0                     = $p0Entries.Count
+                    entries                = @($baselineEntries | Select-Object id, title, priority, version, version_label, line_start, line_end, char_count)
+                    v2_ids                 = @($v2Entries | ForEach-Object { $_.id })
+                    p0_ids                 = @($p0Entries | ForEach-Object { $_.id })
+                }) -Kind "baseline" -Note "resolved requirement input baseline (small input or explicit full document)"
+                Write-S2Evidence -Name "requirement-input.json" -Value ([pscustomobject]@{
+                    mode                   = $requirementProfile.Mode
+                    input_path             = $documentPathFull
+                    input_name             = $requirementProfile.Name
+                    format                 = $requirementProfile.Format
+                    size                   = $requirementProfile.Size
+                    sha256                 = $requirementProfile.Sha256
+                    expected_requirements  = $requirementProfile.ExpectedRequirements
+                    expected_fr_ids        = @($requirementProfile.ExpectedFrIds)
+                    baseline_requirements  = $baselineEntries.Count
+                    baseline_fr_ids        = @($v1Entries | ForEach-Object { [string]$_.id })
+                    v1_fr                  = $v1Fr.Count
+                    nfr                    = $nfr.Count
+                    v2                     = $v2Entries.Count
+                    p0                     = $p0Entries.Count
+                    full_sut_doc_opt_in    = [bool]$FullSutDoc
+                }) -Kind "input" -Note "requirement input profile used by S2 (path/sha/count/FR IDs)"
+                if ($isSmallInput) {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "small requirement input parsed (expected $($requirementProfile.ExpectedRequirements) requirements)" `
+                        -Passed ($baselineEntries.Count -eq $requirementProfile.ExpectedRequirements -and $v1Entries.Count -eq $requirementProfile.ExpectedRequirements) -Severity assertion `
+                        -Detail ("input=$($requirementProfile.Name) expected=$($requirementProfile.ExpectedRequirements) parsed=$($baselineEntries.Count) ids=$(@($requirementProfile.ExpectedFrIds) -join ',')")
+                } else {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "full SUT requirement document parsed (V1 $($v1Entries.Count) requirements: $($v1Fr.Count) FR + $($nfr.Count) NFR; V2 $($v2Entries.Count))" `
+                        -Passed ($baselineEntries.Count -gt 0 -and $v1Entries.Count -gt 0 -and $v1Fr.Count -gt 0) -Severity assertion `
+                        -Detail ("mode=$($requirementProfile.Mode) v1=$($v1Entries.Count) fr=$($v1Fr.Count) nfr=$($nfr.Count) v2=$($v2Entries.Count) p0=$($p0Entries.Count) total=$($baselineEntries.Count)")
+                }
+                if ($baselineEntries.Count -eq 0) {
+                    $scenario.ErrorMessage = "S2 blocked: requirement input produced no baseline entries: $documentPathFull"
                 }
 
-                if ($baselineError -eq "") {
+                if ($baselineEntries.Count -gt 0) {
                     $primaryConversation = $null
                     try {
-                        $primaryConversation = New-AcceptanceConversation -Context $context -VersionId $versionId -Kind "clarification" -Title "S2 SUT 需求澄清（附件导入）"
+                        $primaryTitle = if ($isSmallInput) { "S2 小输入需求澄清（附件导入）" } else { "S2 SUT 需求澄清（附件导入）" }
+                        $primaryConversation = New-AcceptanceConversation -Context $context -VersionId $versionId -Kind "clarification" -Title $primaryTitle
                         $primaryConversationId = [string](Get-JsonProp -Object $primaryConversation -Name "id" -Default "")
                         Add-AcceptanceCheck -Scenario $scenario -Name "clarification conversation created" -Passed ($primaryConversationId -ne "") -Severity blocker -Detail "conversation=$primaryConversationId"
                     } catch {
@@ -329,40 +406,51 @@ try {
                     $attachmentObject = $null
                     $documentSha = ""
                     try {
-                        $documentSha = Get-AcceptanceFileSha256 -Path $RequirementDocumentPath
-                        $upload = New-AcceptanceContentUpload -Context $context -Path $RequirementDocumentPath
+                        $documentSha = Get-AcceptanceFileSha256 -Path $documentPathFull
+                        $upload = New-AcceptanceContentUpload -Context $context -Path $documentPathFull
                         $attachmentObject = $upload.Data
                         $uploadSha = [string](Get-JsonProp -Object $attachmentObject -Name "sha256" -Default "")
                         $uploadSize = [long](Get-JsonProp -Object $attachmentObject -Name "size" -Default 0)
+                        $uploadMime = [string](Get-JsonProp -Object $attachmentObject -Name "mime" -Default "")
+                        $attachmentMime = if ($requirementProfile.Extension -eq ".feature") { "text/plain" } else { $uploadMime }
                         Write-S2Evidence -Name "attachment-upload.json" -Value ([pscustomobject]@{
-                            source_path = $documentPathFull
-                            name        = $upload.Name
-                            http_status = $upload.Status
-                            ok          = $upload.Ok
-                            sha256      = $uploadSha
-                            local_sha256 = $documentSha
-                            size        = $uploadSize
-                            mime        = [string](Get-JsonProp -Object $attachmentObject -Name "mime" -Default "")
-                        }) -Kind "api" -Note "POST /api/content upload of the SUT requirement document"
-                        Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement document uploaded to content ledger" -Passed ($upload.Ok -and $uploadSha -ne "") -Severity blocker `
-                            -Detail ("HTTP $($upload.Status) sha=$uploadSha size=$uploadSize")
-                        Add-AcceptanceCheck -Scenario $scenario -Name "uploaded content sha256 matches the local document" -Passed ($uploadSha -ne "" -and $uploadSha -eq $documentSha) -Severity assertion `
+                            source_path            = $documentPathFull
+                            mode                   = $requirementProfile.Mode
+                            name                   = $upload.Name
+                            http_status            = $upload.Status
+                            ok                     = $upload.Ok
+                            sha256                 = $uploadSha
+                            local_sha256           = $documentSha
+                            size                   = $uploadSize
+                            server_mime            = $uploadMime
+                            message_attachment_mime = $attachmentMime
+                            expected_requirements  = $requirementProfile.ExpectedRequirements
+                            expected_fr_ids        = @($requirementProfile.ExpectedFrIds)
+                        }) -Kind "api" -Note "POST /api/content upload of the resolved requirement input"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input uploaded to content ledger" -Passed ($upload.Ok -and $uploadSha -ne "") -Severity blocker `
+                            -Detail ("HTTP $($upload.Status) sha=$uploadSha size=$uploadSize mime=$uploadMime")
+                        Add-AcceptanceCheck -Scenario $scenario -Name "uploaded content sha256 matches the local requirement input" -Passed ($uploadSha -ne "" -and $uploadSha -eq $documentSha) -Severity assertion `
                             -Detail "upload=$uploadSha local=$documentSha"
                     } catch {
-                        Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement document uploaded to content ledger" -Passed $false -Severity blocker -Detail $_.Exception.Message
-                        $scenario.ErrorMessage = "S2 blocked: document upload failed: $($_.Exception.Message)"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input uploaded to content ledger" -Passed $false -Severity blocker -Detail $_.Exception.Message
+                        $scenario.ErrorMessage = "S2 blocked: requirement input upload failed: $($_.Exception.Message)"
                     }
 
                     if ($null -ne $attachmentObject -and $primaryConversationId -ne "") {
+                        $baselineText = if ($isSmallInput) {
+                            "【验收基线】附件《$($upload.Name)》是本次验收的小规模需求输入（$($requirementProfile.Format)），恰好包含 $($requirementProfile.ExpectedRequirements) 条需求：$(@($requirementProfile.ExpectedFrIds) -join '、')。它不是完整需求文档，不包含 V2 延展需求。"
+                        } else {
+                            "【验收基线】附件《$($upload.Name)》是本次显式选择的全量需求文档：V1 共 $($v1Entries.Count) 条（$($v1Fr.Count) 条 FR + $($nfr.Count) 条 NFR），V2 $($v2Entries.Count) 条为延展·未实现（不创建需求、不判定为缺陷）。"
+                        }
                         $initialText = @"
 【版本描述】墨栈博客：Vue 前端 + Go 后端博客系统，SUT 前端 $($context.SutWebBaseUrl)，后端 API $($context.SutApiBaseUrl)/api/v1。
-【验收基线】附件《$($upload.Name)》是本次验收的真实需求文档（v3.0）：V1 功能需求 FR-001~FR-058、非功能需求 NFR-001~NFR-009；V2 FR-101~FR-132 为延展·未实现（当前系统不存在），不创建需求、不判定为缺陷。
+$baselineText
 【本轮要求】请确认附件已解析（只读取前 500 字符即可，不要通读全文），用一句话给出摘要，并最多提出 3 个关于抽取口径的澄清问题（可给默认假设）。本轮不要创建需求，等待用户确认口径后分批提交原文抽取。
 "@
                         $attachment = [pscustomobject]@{
                             sha256 = [string](Get-JsonProp -Object $attachmentObject -Name "sha256" -Default "")
                             name   = [string]$upload.Name
-                            mime   = [string](Get-JsonProp -Object $attachmentObject -Name "mime" -Default "text/plain")
+                            mime   = $attachmentMime
                             size   = [long](Get-JsonProp -Object $attachmentObject -Name "size" -Default 0)
                         }
                         $initialMessage = $null
@@ -397,7 +485,10 @@ try {
                                 $extractedSha = [string]$attachmentProjection.Content.sha256
                                 $extractedPath = [string]$attachmentProjection.Content.relative_path
                             }
-                            $markers = [pscustomobject]@{ FR001 = $false; FR058 = $false; NFR009 = $false; V2 = $false }
+                            $markerIds = @($requirementProfile.ExpectedFrIds)
+                            $v2Required = @($v2Entries | ForEach-Object { [string]$_.id })
+                            $extractedText = ""
+                            $extractedIds = @()
                             $fileLength = 0
                             if ($extractedPath -ne "") {
                                 # content_object.relative_path is relative to the
@@ -414,26 +505,44 @@ try {
                                 if ($null -ne $candidate) {
                                     $extractedText = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
                                     $fileLength = $extractedText.Length
-                                    $markers = [pscustomobject]@{
-                                        FR001  = $extractedText.Contains("FR-001")
-                                        FR058  = $extractedText.Contains("FR-058")
-                                        NFR009 = $extractedText.Contains("NFR-009")
-                                        V2     = $extractedText.Contains("FR-132")
-                                    }
+                                    $extractedIds = @(Get-AcceptanceFrIdsFromText -Text $extractedText -Format "text")
                                 }
                             }
+                            $missingMarkers = @($markerIds | Where-Object { $extractedIds -notcontains $_ })
+                            $unexpectedIds = if ($isSmallInput) {
+                                @($extractedIds | Where-Object { $markerIds -notcontains $_ })
+                            } else { @() }
+                            $v2Missing = @($v2Required | Where-Object { $extractedIds -notcontains $_ })
+                            $markers = [pscustomobject]@{
+                                mode                 = $requirementProfile.Mode
+                                expected_count       = $markerIds.Count
+                                expected_ids         = @($markerIds)
+                                extracted_count      = $extractedIds.Count
+                                extracted_ids        = @($extractedIds)
+                                missing_ids          = @($missingMarkers)
+                                unexpected_ids       = @($unexpectedIds)
+                                v2_required          = @($v2Required)
+                                v2_missing           = @($v2Missing)
+                            }
+                            $extractedMinBytes = if ($isSmallInput) { 1 } else { 100000 }
                             Write-S2Evidence -Name "attachment-extracted-check.json" -Value ([pscustomobject]@{
-                                attachment          = $attachmentRow
-                                content             = $attachmentProjection.Content
+                                attachment            = $attachmentRow
+                                content               = $attachmentProjection.Content
                                 extracted_file_length = $fileLength
-                                markers             = $markers
+                                markers               = $markers
                             }) -Kind "db" -Note "extracted attachment text content check"
                             Add-AcceptanceCheck -Scenario $scenario -Name "attachment extraction completed (status=done)" `
-                                -Passed ($parseDone -and $extractedSize -ge 100000) -Severity assertion `
-                                -Detail ("status=$(if ($null -ne $attachmentRow) { $attachmentRow.extraction_status } else { 'missing' }) extracted_bytes=$extractedSize message_link=$(if ($null -ne $attachmentRow) { $attachmentRow.conversation_message_id } else { 0 })")
-                            Add-AcceptanceCheck -Scenario $scenario -Name "extracted document contains FR/NFR and V2 markers" `
-                                -Passed ($markers.FR001 -and $markers.FR058 -and $markers.NFR009 -and $markers.V2) -Severity assertion `
-                                -Detail ("file_length=$fileLength FR001=$($markers.FR001) FR058=$($markers.FR058) NFR009=$($markers.NFR009) V2=$($markers.V2)")
+                                -Passed ($parseDone -and $extractedSize -ge $extractedMinBytes) -Severity assertion `
+                                -Detail ("status=$(if ($null -ne $attachmentRow) { $attachmentRow.extraction_status } else { 'missing' }) extracted_bytes=$extractedSize message_link=$(if ($null -ne $attachmentRow) { $attachmentRow.conversation_message_id } else { 0 }) mode=$($requirementProfile.Mode)")
+                            $markerPassed = ($markerIds.Count -gt 0 -and $missingMarkers.Count -eq 0)
+                            if ($isSmallInput) {
+                                $markerPassed = $markerPassed -and $unexpectedIds.Count -eq 0
+                            } else {
+                                $markerPassed = $markerPassed -and ($v2Required.Count -eq 0 -or $v2Missing.Count -eq 0)
+                            }
+                            Add-AcceptanceCheck -Scenario $scenario -Name "extracted requirement input contains exactly the expected FR/NFR IDs" `
+                                -Passed $markerPassed -Severity assertion `
+                                -Detail ("expected=$($markerIds.Count) extracted=$($extractedIds.Count) missing=$(@($missingMarkers) -join ',') unexpected=$(@($unexpectedIds) -join ',') v2_missing=$(@($v2Missing) -join ',') file_length=$fileLength")
                         }
 
                         # ------------------------------------------------------------------
@@ -448,7 +557,11 @@ try {
                                 $record = @(Get-ConversationAssistantRecords -Context $context -VersionId $versionId -ConversationId $primaryConversationId | Where-Object { $_.message_id -eq [string](Get-JsonProp -Object $firstReply.Value -Name "id" -Default "") })
                                 $primaryRecords += $record
                             }
-                            $answerText = "抽取口径默认假设：范围=V1 FR-001~FR-058 功能需求 + NFR-001~NFR-009 非功能需求，共 67 条；V2 FR-101~FR-132 为延展·未实现，只记录为未交付，不创建需求、不算缺陷。每条需求一个 requirement，title 以编号开头（如「FR-001 首页内容聚合浏览」），description 概括需求描述，acceptance_criteria 保留 Given/When/Then，priority 按原文。无需再提问；我现在分批提交原文，由需求 Curator 直接创建 draft，全部保持 draft 等待确认。"
+                            $answerText = if ($isSmallInput) {
+                                "抽取口径默认假设：本次只处理小规模需求输入中的 $($requirementProfile.ExpectedRequirements) 条需求（$(@($requirementProfile.ExpectedFrIds) -join '、')），没有其它编号，也没有 V2 延展需求。每条需求一个 requirement，title 以编号开头，description 概括需求描述，acceptance_criteria 保留 Given/When/Then，priority 按原文。无需再提问；我现在分批提交原文，由需求 Curator 直接创建 draft，全部保持 draft 等待确认。"
+                            } else {
+                                "抽取口径默认假设：范围=V1 $($v1Entries.Count) 条需求（$($v1Fr.Count) 条 FR + $($nfr.Count) 条 NFR）；V2 $($v2Entries.Count) 条为延展·未实现，只记录为未交付，不创建需求、不算缺陷。每条需求一个 requirement，title 以编号开头，description 概括需求描述，acceptance_criteria 保留 Given/When/Then，priority 按原文。无需再提问；我现在分批提交原文，由需求 Curator 直接创建 draft，全部保持 draft 等待确认。"
+                            }
                             $answerMessage = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $primaryConversationId -Text $answerText
                             $answerMessageId = [string](Get-JsonProp -Object $answerMessage -Name "id" -Default "")
                             $secondReply = Wait-NewAssistantText -Context $context -VersionId $versionId -ConversationId $primaryConversationId `
@@ -468,10 +581,11 @@ try {
                         # Group directly by entry count AND character budget so no
                         # tiny remainder batch is produced.
                         # ------------------------------------------------------------------
+                        $extractionEntries = @($requirementProfile.ExtractionEntries)
                         $batches = @()
                         $currentBatch = @()
                         $currentChars = 0
-                        foreach ($entry in $v1Entries) {
+                        foreach ($entry in $extractionEntries) {
                             $entryChars = [int]$entry.char_count
                             if ($currentBatch.Count -gt 0 -and
                                 (($currentBatch.Count -ge $ImportMaxEntriesPerBatch) -or
@@ -492,7 +606,17 @@ try {
                         $consecutiveEmpty = 0
                         for ($batchIndex = 0; $batchIndex -lt $batches.Count; $batchIndex++) {
                             $entries = @($batches[$batchIndex])
-                            $expectedIds = @($entries | ForEach-Object { [string]$_.id })
+                            $expectedIds = @()
+                            foreach ($entry in $entries) {
+                                $property = $entry.PSObject.Properties["expected_ids"]
+                                if ($null -ne $property -and @($property.Value).Count -gt 0) {
+                                    $expectedIds += @($property.Value)
+                                } elseif ([string]$entry.id -ne "") {
+                                    $expectedIds += [string]$entry.id
+                                }
+                            }
+                            $expectedIds = @($expectedIds | Where-Object { $_ -ne "" } | Select-Object -Unique)
+                            if ($expectedIds.Count -eq 0) { $expectedIds = @($requirementProfile.ExpectedFrIds) }
                             $batchNumber = $batchIndex + 1
                             $batchStarted = Get-Date
                             $batchConversation = $null
@@ -501,7 +625,8 @@ try {
                             $batchQuestions = @()
                             $batchError = ""
                             try {
-                                $batchConversation = New-AcceptanceConversation -Context $context -VersionId $versionId -Kind "clarification" -Title "S2 SUT 需求抽取批 $batchNumber/$($batches.Count)"
+                                $batchTitle = if ($isSmallInput) { "S2 小输入需求抽取批 $batchNumber/$($batches.Count)" } else { "S2 SUT 需求抽取批 $batchNumber/$($batches.Count)" }
+                                $batchConversation = New-AcceptanceConversation -Context $context -VersionId $versionId -Kind "clarification" -Title $batchTitle
                                 $batchConversationId = [string](Get-JsonProp -Object $batchConversation -Name "id" -Default "")
                             } catch {
                                 $batchError = $_.Exception.Message
@@ -511,7 +636,8 @@ try {
                             $missing = @($expectedIds)
                             $foundIds = @()
                             if ($batchConversationId -ne "") {
-                                $prompt = New-SutBatchPrompt -DocumentName $upload.Name -Index $batchNumber -Total $batches.Count -Entries $entries
+                                $prompt = New-SutBatchPrompt -DocumentName $upload.Name -Index $batchNumber -Total $batches.Count -Entries $entries `
+                                    -ExpectedIds $expectedIds -SmallInput:$isSmallInput -V2Count $v2Entries.Count
                                 try {
                                     $batchMessage = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $batchConversationId -Text $prompt
                                     $batchMessageId = [string](Get-JsonProp -Object $batchMessage -Name "id" -Default "")
@@ -583,10 +709,13 @@ try {
                             }
                         }
                         Write-S2Evidence -Name "import-batches.json" -Value ([pscustomobject]@{
-                            document = $documentPathFull
-                            batches  = @($batchResults)
-                            batch_questions = @($batchQuestionRecords)
-                        }) -Kind "api" -Note "SUT requirement extraction batches (real document slices)"
+                            document               = $documentPathFull
+                            mode                   = $requirementProfile.Mode
+                            expected_requirements  = $requirementProfile.ExpectedRequirements
+                            expected_fr_ids        = @($requirementProfile.ExpectedFrIds)
+                            batches                = @($batchResults)
+                            batch_questions        = @($batchQuestionRecords)
+                        }) -Kind "api" -Note "requirement input extraction batches (real input slices; small input or explicit full document)"
                         Write-S2Evidence -Name "batch-questions.json" -Value @($batchQuestionRecords) -Kind "api" -Note "questions asked by the batch extraction conversations (not the user clarification scope)"
                         Add-AcceptanceCheck -Scenario $scenario -Name "document extraction batches executed" -Passed ($batchResults.Count -ge 1) -Severity assertion `
                             -Detail "batches=$($batchResults.Count) entries=$((($batchResults | ForEach-Object { $_.expected.Count }) | Measure-Object -Sum).Sum) found=$((($batchResults | ForEach-Object { $_.found.Count }) | Measure-Object -Sum).Sum)"
@@ -616,7 +745,11 @@ try {
                         }
                         $stageValue = ""
                         if ($convergenceConversationId -ne "") {
-                            $convergenceText = "V1 功能需求 FR-001~FR-058 与非功能需求 NFR-001~NFR-009（共 67 条）已全部抽取到需求列表并保持 draft；V2 FR-101~FR-132 为延展·未实现，不创建需求、不算缺陷。请现在在回复末尾明确给出「需求确认请求」，停在需求确认门等待用户确认；不要开始设计、不要创建用例、不要再提问。"
+                            $convergenceText = if ($isSmallInput) {
+                                "小规模需求输入中的 $($requirementProfile.ExpectedRequirements) 条需求（$(@($requirementProfile.ExpectedFrIds) -join '、')）已全部抽取到需求列表并保持 draft；没有 V2 延展需求。请现在在回复末尾明确给出「需求确认请求」，停在需求确认门等待用户确认；不要开始设计、不要创建用例、不要再提问。"
+                            } else {
+                                "V1 $($v1Entries.Count) 条需求（$($v1Fr.Count) 条 FR + $($nfr.Count) 条 NFR）已全部抽取到需求列表并保持 draft；V2 $($v2Entries.Count) 条为延展·未实现，不创建需求、不算缺陷。请现在在回复末尾明确给出「需求确认请求」，停在需求确认门等待用户确认；不要开始设计、不要创建用例、不要再提问。"
+                            }
                             try {
                                 $convergenceMessage = New-AcceptanceUserMessage -Context $context -VersionId $versionId -ConversationId $convergenceConversationId -Text $convergenceText
                                 $convergenceMessageId = [string](Get-JsonProp -Object $convergenceMessage -Name "id" -Default "")
@@ -662,6 +795,13 @@ try {
                         $v2Created = @($v2Coverage.Rows | Where-Object { $_.covered })
                         $untraceableRequirements = @($requirements | Where-Object { (Get-RequirementSutId -Requirement $_) -eq "" })
                         $duplicates = @($coverage.DuplicateIds)
+                        $nfrTotal = @($coverage.Rows | Where-Object { $_.sut_id -like "NFR-*" }).Count
+                        $nfrCovered = @($coverage.Rows | Where-Object { $_.sut_id -like "NFR-*" -and $_.covered }).Count
+                        $setCheck = $null
+                        if ($isSmallInput) {
+                            $setCheck = Compare-AcceptanceRequirementSet -ExpectedFrIds (@($requirementProfile.ExpectedFrIds) -join ",") `
+                                -ExpectedRequirements $requirementProfile.ExpectedRequirements -Requirements $requirements
+                        }
                         $stageValue = [string](Get-JsonProp -Object $stage -Name "stage" -Default "")
                         $requirementCount = $requirements.Count
                         $draftRequirements = @($requirements | Where-Object { [string](Get-JsonProp -Object $_ -Name "status" -Default "") -eq "draft" })
@@ -680,10 +820,23 @@ try {
                         })
                         $designConversations = @($conversations | Where-Object { [string](Get-JsonProp -Object $_ -Name "kind" -Default "") -eq "design" })
 
+                        $actualRequirementFrIds = if ($null -ne $setCheck) {
+                            @($setCheck.ActualFrIds)
+                        } else {
+                            @($requirements | ForEach-Object { Get-RequirementSutId -Requirement $_ } | Where-Object { $_ -ne "" } | Sort-Object -Unique)
+                        }
                         Write-S2Evidence -Name "requirements.json" -Value $requirements -Note "requirement drafts at the gate"
                         Write-S2Evidence -Name "requirements-coverage.json" -Value ([pscustomobject]@{
-                            generated_at = (Get-Date).ToUniversalTime().ToString("o")
-                            summary      = [pscustomobject]@{
+                            generated_at          = (Get-Date).ToUniversalTime().ToString("o")
+                            mode                  = $requirementProfile.Mode
+                            input_path            = $documentPathFull
+                            input_sha256          = $requirementProfile.Sha256
+                            expected_requirements = $requirementProfile.ExpectedRequirements
+                            expected_fr_ids       = @($requirementProfile.ExpectedFrIds)
+                            actual_requirements   = $requirementCount
+                            actual_fr_ids         = @($actualRequirementFrIds)
+                            set_check             = $setCheck
+                            summary               = [pscustomobject]@{
                                 v1_total        = $coverage.Total
                                 v1_covered      = $coverage.Covered
                                 v1_missing      = @($coverage.Missing)
@@ -696,7 +849,7 @@ try {
                                 v2_total        = $v2Coverage.Total
                             }
                             rows         = @($coverage.Rows)
-                        }) -Kind "coverage" -Note "FR/NFR -> requirement traceability at the S2 gate"
+                        }) -Kind "coverage" -Note "requirement input -> requirement traceability at the S2 gate"
                         Write-S2Evidence -Name "v2-handling.json" -Value ([pscustomobject]@{
                             v2_total = $v2Coverage.Total
                             v2_created_as_requirements = $v2Created.Count
@@ -754,7 +907,13 @@ try {
                             batch_questions_unique = $batchUnique
                             all_conversations_total = $questionSummary.all_total
                             all_conversations_unique = $allConversationsUnique
-                            extraction_session_exception = "S2 batch extraction conversations are acceptance-harness sessions that feed the 67-requirement document; they are not user clarification turns, so the user clarification budget is not claimed for them. The product version-wide budget remains 6/requirement + $UserClarificationQuestionBudget/version on the clarification conversations."
+                            requirement_input_mode = $requirementProfile.Mode
+                            requirement_input_path = $documentPathFull
+                            expected_requirements  = $requirementProfile.ExpectedRequirements
+                            expected_fr_ids        = @($requirementProfile.ExpectedFrIds)
+                            actual_requirements    = $requirementCount
+                            actual_fr_ids          = @($actualRequirementFrIds)
+                            extraction_session_exception = "S2 batch extraction conversations are acceptance-harness sessions that feed the resolved requirement input ($($requirementProfile.Mode), $($requirementProfile.ExpectedRequirements) expected requirements); they are not user clarification turns, so the user clarification budget is not claimed for them. The product version-wide budget remains 6/requirement + $UserClarificationQuestionBudget/version on the clarification conversations."
                         }) -Kind "api" -Note "question budget, duplicates and extraction-session exception"
 
                         $confirmationAsked = $false
@@ -780,13 +939,35 @@ try {
 
                         Add-AcceptanceCheck -Scenario $scenario -Name "requirement drafts produced" -Passed ($requirements.Count -gt 0) -Severity assertion `
                             -Detail "requirements=$($requirements.Count) drafts=$($draftRequirements.Count)"
-                        Add-AcceptanceCheck -Scenario $scenario -Name "V1 FR requirements ingested (58/58)" -Passed ($frCovered -eq 58 -and $frTotal -eq 58) -Severity assertion `
+                        if ($isSmallInput) {
+                            Add-AcceptanceCheck -Scenario $scenario -Name "requirement count matches the small input ($($setCheck.ExpectedCount)/$($setCheck.ExpectedCount))" `
+                                -Passed ([bool]$setCheck.CountPassed) -Severity assertion -Detail $setCheck.Detail
+                            Add-AcceptanceCheck -Scenario $scenario -Name "imported FR IDs match the small input exactly" `
+                                -Passed (@($setCheck.MissingFrIds).Count -eq 0 -and @($setCheck.ExtraFrIds).Count -eq 0 -and @($setCheck.DuplicateIds).Count -eq 0 -and @($setCheck.UntraceableRequirementIds).Count -eq 0) `
+                                -Severity assertion -Detail $setCheck.Detail
+                            Add-AcceptanceCheck -Scenario $scenario -Name "no full-document requirement set imported" `
+                                -Passed ([bool]$setCheck.Passed -and -not [bool]$FullSutDoc) -Severity assertion `
+                                -Detail ("mode=$($requirementProfile.Mode) input=$($requirementProfile.Name) expected=$($requirementProfile.ExpectedRequirements) actual=$($requirementCount) full_sut_doc_opt_in=$([bool]$FullSutDoc)")
+                            Add-AcceptanceCheck -Scenario $scenario -Name "requirement source is the explicit small input file" `
+                                -Passed ($requirementProfile.Mode -eq "small-input" -and $requirementProfile.Path -eq $documentPathFull) -Severity assertion `
+                                -Detail ("input=$documentPathFull sha256=$($requirementProfile.Sha256)")
+                        }
+                        Add-AcceptanceCheck -Scenario $scenario -Name "V1 FR requirements ingested ($frCovered/$frTotal)" -Passed ($frTotal -gt 0 -and $frCovered -eq $frTotal) -Severity assertion `
                             -Detail "covered=$frCovered/$frTotal missing=$(@($coverage.Missing | Where-Object { $_ -like 'FR-0*' }) -join ',')"
-                        $nfrCovered = @($coverage.Rows | Where-Object { $_.sut_id -like "NFR-*" -and $_.covered }).Count
-                        Add-AcceptanceCheck -Scenario $scenario -Name "NFR requirements ingested (9/9)" -Passed ($nfrCovered -eq 9) -Severity assertion `
-                            -Detail "nfr_covered=$nfrCovered/9 missing=$(@($coverage.Rows | Where-Object { $_.sut_id -like 'NFR-*' -and -not $_.covered } | ForEach-Object { $_.sut_id }) -join ',')"
-                        Add-AcceptanceCheck -Scenario $scenario -Name "P0 requirements covered ($($coverage.P0Total)/$($coverage.P0Total))" -Passed ($coverage.P0Covered -eq $coverage.P0Total -and $coverage.P0Total -gt 0) -Severity assertion `
-                            -Detail "p0_covered=$($coverage.P0Covered)/$($coverage.P0Total) missing=$(@($coverage.P0Missing) -join ',')"
+                        if ($nfrTotal -gt 0) {
+                            Add-AcceptanceCheck -Scenario $scenario -Name "NFR requirements ingested ($nfrCovered/$nfrTotal)" -Passed ($nfrCovered -eq $nfrTotal) -Severity assertion `
+                                -Detail "nfr_covered=$nfrCovered/$nfrTotal missing=$(@($coverage.Rows | Where-Object { $_.sut_id -like 'NFR-*' -and -not $_.covered } | ForEach-Object { $_.sut_id }) -join ',')"
+                        } else {
+                            Add-AcceptanceCheck -Scenario $scenario -Name "NFR requirements are not part of this requirement input" -Passed $true -Severity warning `
+                                -Detail "nfr_total=0 mode=$($requirementProfile.Mode); no NFR row exists in the resolved input"
+                        }
+                        if ($coverage.P0Total -gt 0) {
+                            Add-AcceptanceCheck -Scenario $scenario -Name "P0 requirements covered ($($coverage.P0Covered)/$($coverage.P0Total))" -Passed ($coverage.P0Covered -eq $coverage.P0Total) -Severity assertion `
+                                -Detail "p0_covered=$($coverage.P0Covered)/$($coverage.P0Total) missing=$(@($coverage.P0Missing) -join ',')"
+                        } else {
+                            Add-AcceptanceCheck -Scenario $scenario -Name "P0 priority is not declared in this requirement input" -Passed $true -Severity warning `
+                                -Detail "p0_total=0 mode=$($requirementProfile.Mode); coverage is asserted by exact FR ID set instead"
+                        }
                         Add-AcceptanceCheck -Scenario $scenario -Name "requirements traceable to FR/NFR IDs" -Passed ($untraceableRequirements.Count -eq 0) -Severity assertion `
                             -Detail "untraceable=$($untraceableRequirements.Count) titles=$(@($untraceableRequirements | ForEach-Object { [string](Get-JsonProp -Object $_ -Name 'title' -Default '') }) -join ' | ')"
                         Add-AcceptanceCheck -Scenario $scenario -Name "no duplicate FR/NFR requirements" -Passed ($duplicates.Count -eq 0) -Severity assertion `
@@ -832,6 +1013,14 @@ try {
                             version_id              = $versionId
                             primary_conversation_id = $primaryConversationId
                             convergence_conversation_id = $convergenceConversationId
+                            requirement_mode        = $requirementProfile.Mode
+                            input_path              = $documentPathFull
+                            input_sha256            = $requirementProfile.Sha256
+                            expected_requirements   = $requirementProfile.ExpectedRequirements
+                            expected_fr_ids         = @($requirementProfile.ExpectedFrIds)
+                            actual_requirements     = $requirementCount
+                            actual_fr_ids           = @($actualRequirementFrIds)
+                            set_check               = $setCheck
                             requirements            = $requirementCount
                             fr_covered              = $frCovered
                             fr_total                = $frTotal
@@ -839,6 +1028,7 @@ try {
                             v1_total                = $coverage.Total
                             v1_covered              = $coverage.Covered
                             nfr_covered             = $nfrCovered
+                            nfr_total               = $nfrTotal
                             p0_covered              = $coverage.P0Covered
                             p0_total                = $coverage.P0Total
                             p0_missing              = @($coverage.P0Missing)
@@ -850,21 +1040,58 @@ try {
                             cases                   = $caseTotal
                             batch_count             = $batchResults.Count
                         }
-                        Write-S2Evidence -Name "sut-requirements-summary.json" -Value $coverageSummary -Kind "summary" -Note "S2 SUT requirement import summary"
+                        Write-S2Evidence -Name "sut-requirements-summary.json" -Value $coverageSummary -Kind "summary" -Note "S2 requirement input import summary"
 
-                        if ($stageValue -ne "requirement_review" -or $requirements.Count -eq 0 -or $frCovered -ne 58 -or $nfrCovered -ne 9 -or $coverage.P0Covered -ne $coverage.P0Total -or $v2Created.Count -gt 0 -or $untraceableRequirements.Count -gt 0 -or $duplicates.Count -gt 0 -or $duplicatesQuestions.Count -gt 0 -or $uniqueNormalized -gt $budget -or $uniqueNormalized -gt $UserClarificationQuestionBudget) {
-                            $scenario.ErrorMessage = "S2 failed: stage=$stageValue requirements=$requirementCount fr=$frCovered/58 nfr=$nfrCovered/9 p0=$($coverage.P0Covered)/$($coverage.P0Total) v2_created=$($v2Created.Count) untraceable=$($untraceableRequirements.Count) duplicates=$($duplicates.Count) userClarificationQuestions=$($uniqueNormalized)/$budget (user budget $UserClarificationQuestionBudget) batchQuestions=$($batchAllQuestions.Count)"
+                        $p0Passed = if ($coverage.P0Total -gt 0) { $coverage.P0Covered -eq $coverage.P0Total } else { $true }
+                        $smallSetOk = if ($isSmallInput) { [bool]$setCheck.Passed } else { $true }
+                        $s2Ok = ($stageValue -eq "requirement_review" -and
+                            $requirements.Count -gt 0 -and
+                            $frTotal -gt 0 -and $frCovered -eq $frTotal -and
+                            $nfrCovered -eq $nfrTotal -and
+                            $p0Passed -and
+                            $v2Created.Count -eq 0 -and
+                            $untraceableRequirements.Count -eq 0 -and
+                            $duplicates.Count -eq 0 -and
+                            $duplicatesQuestions.Count -eq 0 -and
+                            $uniqueNormalized -le $budget -and
+                            $uniqueNormalized -le $UserClarificationQuestionBudget -and
+                            $smallSetOk)
+                        if (-not $s2Ok) {
+                            $setDetail = if ($null -ne $setCheck) { $setCheck.Detail } else { "n/a" }
+                            $scenario.ErrorMessage = "S2 failed: mode=$($requirementProfile.Mode) stage=$stageValue requirements=$requirementCount expected=$($requirementProfile.ExpectedRequirements) fr=$frCovered/$frTotal nfr=$nfrCovered/$nfrTotal p0=$($coverage.P0Covered)/$($coverage.P0Total) v2_created=$($v2Created.Count) untraceable=$($untraceableRequirements.Count) duplicates=$($duplicates.Count) userClarificationQuestions=$($uniqueNormalized)/$budget (user budget $UserClarificationQuestionBudget) batchQuestions=$($batchAllQuestions.Count) set=$setDetail"
+                        }
+                        if ($null -ne $requirementProfile -and $versionId -ne "") {
+                            $stateValues = @{
+                                requirement_input_mode   = $requirementProfile.Mode
+                                requirement_input_path   = $requirementProfile.Path
+                                requirement_input_sha256 = $requirementProfile.Sha256
+                                requirement_expected_requirements = $requirementProfile.ExpectedRequirements
+                                requirement_expected_fr_ids       = @($requirementProfile.ExpectedFrIds)
+                                requirement_actual_requirements   = $requirementCount
+                                requirement_actual_fr_ids         = @($actualRequirementFrIds)
+                                requirement_s2_passed             = [bool]$s2Ok
+                                requirement_s2_evidence           = (Resolve-RepoRelativePath -Context $context -Path $scenario.Directory)
+                            }
+                            if ($isSmallInput) {
+                                $stateValues["small_input_version_id"] = $versionId
+                                $stateValues["small_input_s2_passed"] = [bool]$s2Ok
+                            } else {
+                                $stateValues["full_sut_doc_version_id"] = $versionId
+                                $stateValues["full_sut_doc_s2_passed"] = [bool]$s2Ok
+                            }
+                            [void](Update-AcceptanceState -Context $context -Path (Get-AcceptanceStatePath -Context $context) -Values $stateValues)
                         }
                     }
                 }
             }
         }
     }
+    }
 } catch {
     $scenario.ErrorMessage = $_.Exception.Message
     Add-AcceptanceCheck -Scenario $scenario -Name "S2 unexpected error" -Passed $false -Severity blocker -Detail ($_.Exception.Message + " | " + $_.ScriptStackTrace)
 } finally {
-    $exitCode = Complete-AcceptanceScenario -Scenario $scenario -Message "S2 SUT requirement import, FR/NFR coverage and requirement gate"
+    $exitCode = Complete-AcceptanceScenario -Scenario $scenario -Message "S2 requirement input import, count/FR mapping and requirement gate"
 }
 
 exit $exitCode

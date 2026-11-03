@@ -23,6 +23,16 @@
       6. a case detail exposes executable steps, assertions (success criteria)
          and evidence sources.
 
+    Task 88 (P10-T13) adds the small-input design profile: when
+    -RequirementInput is supplied, S3 reuses the version S2 imported
+    (small_input_version_id in the shared state) and asserts that its live
+    requirement count and FR ID set are exactly the supplied input. Small-input
+    mode never creates an unrelated version or posts the old generic
+    4-requirement goal. -FullSutDoc keeps the explicit legacy full-document
+    traceability mode. Case traceability must stay inside the selected FR set.
+    The Task 79 full requirement matrix is not overwritten by the small-input
+    profile (default small matrix: docs/version-V0.2.1/acceptance/small-input-matrix.md).
+
     Task 86 (P10-T11) adds the design-input resource gate: the version the
     design runs on must bind the pages/APIs P9 discovery proposed (pages > 0,
     APIs > 0, at least one page route_template locator). A version created
@@ -71,6 +81,15 @@ param(
     [string] $VersionId = "",
     [string] $VersionTitle = "",
     [string] $StatePath = "",
+    # Task 88 (P10-T13): in small-input mode S3 reuses the version S2 imported
+    # (small_input_version_id in the shared state) and asserts that the design
+    # input is exactly the supplied small requirement set. -FullSutDoc keeps the
+    # explicit legacy full-document traceability mode.
+    [string] $RequirementInput = "",
+    [int] $ExpectedRequirements = 0,
+    [string] $ExpectedFrIds = "",
+    [switch] $FullSutDoc,
+    [string] $FullSutDocPath = "",
     [string] $RequirementDocumentPath = "D:\project\deliverables\墨栈博客系统需求文档（用户故事与BDD版）.md",
     [string] $MatrixPath = "",
     [int] $ClarifyTimeoutSeconds = 180,
@@ -95,9 +114,31 @@ $context = Initialize-AcceptanceContext -ApiBaseUrl $ApiBaseUrl -WebBaseUrl $Web
     -AdminUsername $AdminUsername -AdminPassword $AdminPassword -SutPassword $SutPassword `
     -EvidenceRoot $EvidenceRoot
 $scenario = New-AcceptanceScenario -Context $context -Name "s3" -Title "设计自动生成与脑图 (S3)"
+
+# Task 88: resolve the explicit requirement source (small input or legacy full
+# document). In small-input mode S3 must reuse the version S2 imported instead
+# of creating a new version with an unrelated 4-requirement goal.
+$requirementProfile = $null
+$requirementInputError = ""
+if (-not [string]::IsNullOrWhiteSpace($RequirementInput) -or $FullSutDoc) {
+    try {
+        $requirementProfile = Resolve-AcceptanceRequirementProfile -RequirementInput $RequirementInput `
+            -ExpectedRequirements $ExpectedRequirements -ExpectedFrIds $ExpectedFrIds `
+            -FullSutDoc:$FullSutDoc -FullSutDocPath $FullSutDocPath `
+            -LegacyDocumentPath $RequirementDocumentPath -RepoRoot $context.RepoRoot
+    } catch {
+        $requirementInputError = $_.Exception.Message
+    }
+}
+$isSmallInput = ($null -ne $requirementProfile -and $requirementProfile.Mode -eq "small-input")
+
 $statePath = Get-AcceptanceStatePath -Context $context -StatePath $StatePath
 if ([string]::IsNullOrWhiteSpace($MatrixPath)) {
-    $MatrixPath = Join-Path $repoRoot "docs/version-V0.2.1/acceptance/sut-requirements-matrix.md"
+    if ($isSmallInput) {
+        $MatrixPath = Join-Path $repoRoot "docs/version-V0.2.1/acceptance/small-input-matrix.md"
+    } else {
+        $MatrixPath = Join-Path $repoRoot "docs/version-V0.2.1/acceptance/sut-requirements-matrix.md"
+    }
 } elseif (-not [System.IO.Path]::IsPathRooted($MatrixPath)) {
     $MatrixPath = Join-Path $repoRoot $MatrixPath
 }
@@ -106,6 +147,30 @@ $matrixPath = [System.IO.Path]::GetFullPath($MatrixPath)
 $runSuffix = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $version = $null
 $versionId = ([string]$VersionId).Trim()
+if ($null -ne $requirementProfile -and [string]::IsNullOrWhiteSpace($versionId)) {
+    $requirementState = Read-AcceptanceState -Path $statePath
+    if ($isSmallInput) {
+        if ($requirementState.ContainsKey("small_input_version_id") -and -not [string]::IsNullOrWhiteSpace([string]$requirementState["small_input_version_id"])) {
+            $versionId = [string]$requirementState["small_input_version_id"]
+            $s2Passed = $requirementState.ContainsKey("small_input_s2_passed") -and [bool]$requirementState["small_input_s2_passed"]
+            if (-not $s2Passed) {
+                $requirementInputError = "S3 blocked: S2 did not record a passing small-input import for version $versionId ($statePath); rerun S2 after fixing it"
+            }
+        } else {
+            $requirementInputError = "S3 blocked: no small-input version in $statePath; run S2 with the same -RequirementInput/-EvidenceRoot first (S3 never creates an unrelated version in small-input mode)"
+        }
+    } else {
+        if ($requirementState.ContainsKey("full_sut_doc_version_id") -and -not [string]::IsNullOrWhiteSpace([string]$requirementState["full_sut_doc_version_id"])) {
+            $versionId = [string]$requirementState["full_sut_doc_version_id"]
+            $s2Passed = $requirementState.ContainsKey("full_sut_doc_s2_passed") -and [bool]$requirementState["full_sut_doc_s2_passed"]
+            if (-not $s2Passed) {
+                $requirementInputError = "S3 blocked: S2 did not record a passing full-document import for version $versionId ($statePath); rerun S2 after fixing it"
+            }
+        } else {
+            $requirementInputError = "S3 blocked: no full-document version in $statePath; run S2 with the same -FullSutDoc/-EvidenceRoot first"
+        }
+    }
+}
 $isReusedVersion = -not [string]::IsNullOrWhiteSpace($versionId)
 $exitCode = 2
 $requirementsBefore = @()
@@ -117,6 +182,7 @@ $requirementGatePassed = $false
 $stageAtEndValue = ""
 $designResourceCounts = $null
 $designResourceCheck = $null
+$smallSetCheck = $null
 
 function Save-S3State {
     param([hashtable] $Values)
@@ -236,7 +302,9 @@ function New-SutRequirementsMatrix {
     $lines += ""
     $lines += "> 由真实运行数据生成，不是手工填写：需求来自 EzTest 版本 $VersionId 的 requirement API，用例来自 design graph。"
     $lines += "> 生成时间：$((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))；版本标题：$VersionTitle；stage：$Stage。"
-    $lines += "> 需求文档：``$DocumentPath``（v3.0，V1 58 FR + 9 NFR，V2 32 延展·未实现）。"
+    $v1FrCount = @($v1Entries | Where-Object { $_.id -like 'FR-0*' }).Count
+    $nfrCount = @($v1Entries | Where-Object { $_.id -like 'NFR-*' }).Count
+    $lines += "> 需求输入：``$DocumentPath``（V1 $($v1Entries.Count) 条：$v1FrCount FR + $nfrCount NFR；V2 $($v2Entries.Count) 条延展·未实现）。"
     $lines += ""
     $lines += "## 1. 汇总"
     $lines += ""
@@ -244,8 +312,8 @@ function New-SutRequirementsMatrix {
     $lines += "|---|---|"
     $lines += "| V1 需求总数（FR+NFR） | $($v1Entries.Count) |"
     $lines += "| V1 需求已导入为 requirement | $(@($v1Entries | Where-Object { $requirementBySutId.ContainsKey([string]$_.id) }).Count) |"
-    $lines += "| V1 功能需求 FR-001~FR-058 | $(@($v1Entries | Where-Object { $_.id -like 'FR-0*' }).Count) |"
-    $lines += "| 非功能需求 NFR-001~NFR-009 | $(@($v1Entries | Where-Object { $_.id -like 'NFR-*' }).Count) |"
+    $lines += "| V1 功能需求（FR-*） | $v1FrCount |"
+    $lines += "| 非功能需求（NFR-*） | $nfrCount |"
     $lines += "| P0 需求（FR+NFR） | $($v1Entries | Where-Object { $_.priority -eq 'P0' } | Measure-Object | Select-Object -ExpandProperty Count) |"
     $lines += "| 设计用例总数 | $casesTotal |"
     $lines += "| 追溯不到 FR/NFR 的用例数 | $(@((Get-CaseSutTraceability -Requirements $Requirements -CaseCards $CaseCards).UntraceableCases).Count) |"
@@ -309,19 +377,43 @@ function New-SutRequirementsMatrix {
 }
 
 try {
-    Write-AcceptanceLog -Scenario $scenario -Message "S3 design acceptance; clarifyTimeout=${ClarifyTimeoutSeconds}s designTimeout=${DesignTimeoutSeconds}s"
-
-    $login = Connect-EzTest -Context $context
-    Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $login.Ok -Severity blocker `
-        -Detail ($(if ($login.Ok) { "user=" + [string](Get-JsonProp -Object $login.User -Name 'username' -Default '?') } else { $login.Error }))
-    if (-not $login.Ok) {
-        $scenario.ErrorMessage = "S3 blocked: EzTest admin login failed"
+    if ($requirementInputError -ne "") {
+        Add-AcceptanceCheck -Scenario $scenario -Name "requirement input / S2 version resolved" -Passed $false -Severity blocker -Detail $requirementInputError
+        $scenario.ErrorMessage = "S3 blocked: $requirementInputError"
     } else {
+        $profileDetail = if ($null -ne $requirementProfile) {
+            "mode=$($requirementProfile.Mode) input=$($requirementProfile.Path) sha256=$($requirementProfile.Sha256) expected=$($requirementProfile.ExpectedRequirements) ids=$(@($requirementProfile.ExpectedFrIds) -join ',') version=$versionId reused=$isReusedVersion"
+        } else {
+            "no requirement input profile: live requirements only (legacy standalone S3)"
+        }
+        Write-AcceptanceLog -Scenario $scenario -Message ("S3 design acceptance; $profileDetail clarifyTimeout=${ClarifyTimeoutSeconds}s designTimeout=${DesignTimeoutSeconds}s")
+        if ($null -ne $requirementProfile) {
+            Add-AcceptanceCheck -Scenario $scenario -Name "requirement input profile resolved for design" -Passed $true -Severity assertion -Detail $profileDetail
+            Write-S3Evidence -Name "requirement-input.json" -Value ([pscustomobject]@{
+                mode                  = $requirementProfile.Mode
+                input_path            = $requirementProfile.Path
+                input_name            = $requirementProfile.Name
+                format                = $requirementProfile.Format
+                sha256                = $requirementProfile.Sha256
+                expected_requirements = $requirementProfile.ExpectedRequirements
+                expected_fr_ids       = @($requirementProfile.ExpectedFrIds)
+                version_id            = $versionId
+                reused_version        = $isReusedVersion
+            }) -Kind "input" -Note "requirement input used by S3 (small input or explicit full document)"
+        }
+
+        $login = Connect-EzTest -Context $context
+        Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $login.Ok -Severity blocker `
+            -Detail ($(if ($login.Ok) { "user=" + [string](Get-JsonProp -Object $login.User -Name 'username' -Default '?') } else { $login.Error }))
+        if (-not $login.Ok) {
+            $scenario.ErrorMessage = "S3 blocked: EzTest admin login failed"
+        } else {
         # ------------------------------------------------------------------
         # Resolve or create the version.
         # ------------------------------------------------------------------
         if ($isReusedVersion) {
-            $versionId = $VersionId.Trim()
+            # $versionId comes from -VersionId or from S2's small_input_version_id;
+            # never fall back to a new generic version in small-input mode.
             try {
                 $version = Get-Version -Context $context -VersionId $versionId
                 Add-AcceptanceCheck -Scenario $scenario -Name "version resolved" -Passed ($null -ne $version) -Severity blocker `
@@ -421,6 +513,25 @@ try {
                     $requirementsAlreadyImported = $true
                     Add-AcceptanceCheck -Scenario $scenario -Name "reused version already carries imported requirements" -Passed $true -Severity assertion `
                         -Detail "requirements=$($requirements.Count); the S3 script does not post the legacy 4-requirement goal over an imported baseline"
+                    if ($isSmallInput) {
+                        $smallSetCheck = Compare-AcceptanceRequirementSet -ExpectedFrIds (@($requirementProfile.ExpectedFrIds) -join ",") `
+                            -ExpectedRequirements $requirementProfile.ExpectedRequirements -Requirements $requirements
+                        Add-AcceptanceCheck -Scenario $scenario -Name "design input count matches the small input ($($smallSetCheck.ExpectedCount)/$($smallSetCheck.ExpectedCount))" `
+                            -Passed ([bool]$smallSetCheck.CountPassed) -Severity assertion -Detail $smallSetCheck.Detail
+                        Add-AcceptanceCheck -Scenario $scenario -Name "design input FR IDs match the small input exactly" `
+                            -Passed (@($smallSetCheck.MissingFrIds).Count -eq 0 -and @($smallSetCheck.ExtraFrIds).Count -eq 0 -and @($smallSetCheck.DuplicateIds).Count -eq 0 -and @($smallSetCheck.UntraceableRequirementIds).Count -eq 0) `
+                            -Severity assertion -Detail $smallSetCheck.Detail
+                        Add-AcceptanceCheck -Scenario $scenario -Name "design input contains no requirements outside the small input" `
+                            -Passed (@($smallSetCheck.ExtraFrIds).Count -eq 0 -and [bool]$smallSetCheck.CountPassed) -Severity assertion -Detail $smallSetCheck.Detail
+                        if (-not $smallSetCheck.Passed) {
+                            $scenario.ErrorMessage = "S3 failed: the reused S2 version does not carry exactly the small-input requirement set ($($smallSetCheck.Detail))"
+                        }
+                    }
+                } elseif ($isSmallInput) {
+                    $requirementsAlreadyImported = $true
+                    Add-AcceptanceCheck -Scenario $scenario -Name "design input version carries the small-input requirements" -Passed $false -Severity blocker `
+                        -Detail "version=$versionId has no requirements; run S2 with the same -RequirementInput/-EvidenceRoot first"
+                    $scenario.ErrorMessage = "S3 failed: small-input version $versionId has no requirements; no fallback generic requirement goal is posted"
                 }
             }
 
@@ -483,38 +594,104 @@ try {
             Save-S3State -Values @{ clarification_conversation_id = $conversationId; requirement_ids = $requirementIds }
 
             # ------------------------------------------------------------------
-            # Task 72: SUT requirement baseline and FR/NFR traceability at the
-            # design input. This reads the real requirement document (read-only)
-            # and joins it to the live requirement list; it never writes data.
+            # Requirement baseline for the design input. Small-input mode uses
+            # the live S2 version requirements only (already checked against the
+            # supplied input); the legacy mode uses the explicitly requested full
+            # document. Neither mode silently reads the default full document.
             # ------------------------------------------------------------------
             $baselineEntries = @()
             $baselineError = ""
-            try {
-                $baselineEntries = @(Read-SutRequirementDocument -Path $RequirementDocumentPath)
-            } catch {
-                $baselineError = $_.Exception.Message
+            $baselineSource = "none"
+            if ($isSmallInput) {
+                $baselineSource = "small-input"
+                $baselineEntries = @($requirements | ForEach-Object {
+                    $sutId = Get-RequirementSutId -Requirement $_
+                    if ($sutId -ne "") {
+                        [pscustomobject]@{
+                            id            = $sutId
+                            title         = [string](Get-JsonProp -Object $_ -Name "title" -Default "")
+                            priority      = [string](Get-JsonProp -Object $_ -Name "priority" -Default "")
+                            version       = "V1"
+                            version_label = "V1"
+                            section       = ""
+                            document_path = $requirementProfile.Path
+                            line_start    = 0
+                            line_end      = 0
+                            text          = ""
+                            char_count    = 0
+                        }
+                    }
+                })
+            } elseif ($null -ne $requirementProfile) {
+                $baselineSource = "full-sut-doc"
+                $baselineEntries = @($requirementProfile.Entries)
+            }
+            if ($isSmallInput -and $null -eq $smallSetCheck) {
+                $smallSetCheck = Compare-AcceptanceRequirementSet -ExpectedFrIds (@($requirementProfile.ExpectedFrIds) -join ",") `
+                    -ExpectedRequirements $requirementProfile.ExpectedRequirements -Requirements $requirements
             }
             $v1Baseline = @($baselineEntries | Where-Object { [string]$_.version -eq "V1" })
             $v2Baseline = @($baselineEntries | Where-Object { [string]$_.version -eq "V2" })
             $v1FrBaseline = @($v1Baseline | Where-Object { [string]$_.id -like "FR-0*" })
             $nfrBaseline = @($v1Baseline | Where-Object { [string]$_.id -like "NFR-*" })
             $p0Baseline = @($v1Baseline | Where-Object { [string]$_.priority -eq "P0" })
+            $frTotalBefore = @($baselineEntries | Where-Object { [string]$_.id -like "FR-0*" }).Count
+            $nfrTotalBefore = @($baselineEntries | Where-Object { [string]$_.id -like "NFR-*" }).Count
             $coverageBefore = Get-SutRequirementCoverage -Entries $baselineEntries -Requirements $requirements -Version "V1"
             $v2CoverageBefore = Get-SutRequirementCoverage -Entries $baselineEntries -Requirements $requirements -Version "V2"
             $v2CreatedBefore = @($v2CoverageBefore.Rows | Where-Object { $_.covered })
             $untraceableBefore = @($requirements | Where-Object { (Get-RequirementSutId -Requirement $_) -eq "" })
+            $frCoveredBefore = @($coverageBefore.Rows | Where-Object { $_.sut_id -like "FR-0*" -and $_.covered }).Count
+            $nfrCoveredBefore = @($coverageBefore.Rows | Where-Object { $_.sut_id -like "NFR-*" -and $_.covered }).Count
+            $profileMode = "none"
+            $profileExpectedCount = 0
+            $profileExpectedIds = @()
+            $inputPathForEvidence = "(none: live requirements only)"
+            $inputShaForEvidence = ""
+            if ($null -ne $requirementProfile) {
+                $profileMode = $requirementProfile.Mode
+                $profileExpectedCount = $requirementProfile.ExpectedRequirements
+                $profileExpectedIds = @($requirementProfile.ExpectedFrIds)
+                $inputPathForEvidence = $requirementProfile.Path
+                $inputShaForEvidence = $requirementProfile.Sha256
+            }
             [void](Write-S3Evidence -Name "sut-baseline.json" -Value ([pscustomobject]@{
-                path        = $RequirementDocumentPath
-                parse_error = $baselineError
-                v1_total    = $v1Baseline.Count
-                v1_fr       = $v1FrBaseline.Count
-                nfr         = $nfrBaseline.Count
-                p0          = $p0Baseline.Count
-                v2          = $v2Baseline.Count
-                entries     = @($baselineEntries | Select-Object id, title, priority, version, version_label)
-            }) -Kind "baseline" -Note "SUT requirement document baseline used by S3")
+                path                   = $inputPathForEvidence
+                mode                   = $profileMode
+                source                 = $baselineSource
+                sha256                 = $inputShaForEvidence
+                expected_requirements  = $profileExpectedCount
+                expected_fr_ids        = @($profileExpectedIds)
+                actual_requirements    = @($requirements).Count
+                parse_error            = $baselineError
+                v1_total               = $v1Baseline.Count
+                v1_fr                  = $v1FrBaseline.Count
+                nfr                    = $nfrBaseline.Count
+                p0                     = $p0Baseline.Count
+                v2                     = $v2Baseline.Count
+                entries                = @($baselineEntries | Select-Object id, title, priority, version, version_label)
+            }) -Kind "baseline" -Note "requirement baseline used by S3 (small input or explicit full document)")
+            [void](Write-S3Evidence -Name "design-input-requirements.json" -Value ([pscustomobject]@{
+                mode                   = $profileMode
+                source                 = $baselineSource
+                input_path             = $inputPathForEvidence
+                input_sha256           = $inputShaForEvidence
+                version_id             = $versionId
+                expected_requirements  = $profileExpectedCount
+                expected_fr_ids        = @($profileExpectedIds)
+                actual_requirements    = @($requirements).Count
+                actual_fr_ids          = @($requirements | ForEach-Object { Get-RequirementSutId -Requirement $_ } | Where-Object { $_ -ne "" } | Sort-Object -Unique)
+                set_check              = $smallSetCheck
+                v1_total               = $v1Baseline.Count
+                v1_fr                  = $v1FrBaseline.Count
+                nfr                    = $nfrBaseline.Count
+                p0                     = $p0Baseline.Count
+                v2                     = $v2Baseline.Count
+            }) -Kind "input" -Note "S3 design input requirement traceability (input file/sha, expected vs actual count and FR IDs)")
             [void](Write-S3Evidence -Name "sut-requirements-before.json" -Value ([pscustomobject]@{
                 generated_at = (Get-Date).ToUniversalTime().ToString("o")
+                mode         = $profileMode
+                input_path   = $inputPathForEvidence
                 summary      = [pscustomobject]@{
                     v1_total   = $coverageBefore.Total
                     v1_covered = $coverageBefore.Covered
@@ -526,27 +703,45 @@ try {
                     untraceable = $untraceableBefore.Count
                 }
                 rows = @($coverageBefore.Rows)
-            }) -Kind "coverage" -Note "FR/NFR -> requirement coverage at the S3 design input")
+            }) -Kind "coverage" -Note "requirement input -> requirement coverage at the S3 design input")
             [void](Write-S3Evidence -Name "v2-handling.json" -Value ([pscustomobject]@{
                 v2_total = $v2Baseline.Count
                 v2_created_as_requirements = $v2CreatedBefore.Count
                 v2_status = "延展·未实现（当前系统不存在，不要求交付，不算缺陷）"
                 rows = @($v2CoverageBefore.Rows)
             }) -Kind "coverage" -Note "V2 延展·未实现 handling at S3")
-            Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement baseline available (V1 58 FR + 9 NFR + V2 32)" `
-                -Passed ($baselineError -eq "" -and $v1FrBaseline.Count -eq 58 -and $nfrBaseline.Count -eq 9 -and $v2Baseline.Count -eq 32) -Severity assertion `
-                -Detail ("error=$baselineError v1fr=$($v1FrBaseline.Count) nfr=$($nfrBaseline.Count) v2=$($v2Baseline.Count) p0=$($p0Baseline.Count)")
-            $frCoveredBefore = @($coverageBefore.Rows | Where-Object { $_.sut_id -like "FR-0*" -and $_.covered }).Count
-            $nfrCoveredBefore = @($coverageBefore.Rows | Where-Object { $_.sut_id -like "NFR-*" -and $_.covered }).Count
-            Add-AcceptanceCheck -Scenario $scenario -Name "design input is traceable to V1 FR/NFR (67/67)" `
-                -Passed ($frCoveredBefore -eq 58 -and $nfrCoveredBefore -eq 9) -Severity assertion `
-                -Detail "fr=$frCoveredBefore/58 nfr=$nfrCoveredBefore/9 missing=$(@($coverageBefore.Missing) -join ',')"
-            Add-AcceptanceCheck -Scenario $scenario -Name "design input covers all P0 requirements ($($p0Baseline.Count)/$($p0Baseline.Count))" `
-                -Passed ($coverageBefore.P0Covered -eq $coverageBefore.P0Total -and $coverageBefore.P0Total -gt 0) -Severity assertion `
-                -Detail "p0=$($coverageBefore.P0Covered)/$($coverageBefore.P0Total) missing=$(@($coverageBefore.P0Missing) -join ',')"
-            Add-AcceptanceCheck -Scenario $scenario -Name "V2 延展·未实现 not imported as design requirements" `
-                -Passed ($v2CreatedBefore.Count -eq 0) -Severity assertion `
-                -Detail "v2_created=$($v2CreatedBefore.Count)/$($v2Baseline.Count)"
+            if ($isSmallInput) {
+                Add-AcceptanceCheck -Scenario $scenario -Name "design input is traceable to the small-input FR IDs ($frCoveredBefore/$frTotalBefore)" `
+                    -Passed ($frTotalBefore -gt 0 -and $frCoveredBefore -eq $frTotalBefore -and $nfrCoveredBefore -eq $nfrTotalBefore) -Severity assertion `
+                    -Detail "input=$($requirementProfile.Name) fr=$frCoveredBefore/$frTotalBefore nfr=$nfrCoveredBefore/$nfrTotalBefore missing=$(@($coverageBefore.Missing) -join ',')"
+                Add-AcceptanceCheck -Scenario $scenario -Name "design input has no full-document requirements" `
+                    -Passed ($v2Baseline.Count -eq 0 -and $baselineEntries.Count -eq $requirements.Count) -Severity assertion `
+                    -Detail "mode=$($requirementProfile.Mode) baseline=$($baselineEntries.Count) live=$($requirements.Count) v2=$($v2Baseline.Count)"
+                if ($p0Baseline.Count -gt 0) {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "small-input P0 design requirements covered ($($coverageBefore.P0Covered)/$($coverageBefore.P0Total))" `
+                        -Passed ($coverageBefore.P0Covered -eq $coverageBefore.P0Total) -Severity assertion `
+                        -Detail "p0=$($coverageBefore.P0Covered)/$($coverageBefore.P0Total) missing=$(@($coverageBefore.P0Missing) -join ',')"
+                } else {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "P0 priority is not declared by the small-input requirements" -Passed $true -Severity warning `
+                        -Detail "p0_total=0 mode=$($requirementProfile.Mode); the exact FR ID set is the hard check"
+                }
+            } elseif ($null -ne $requirementProfile) {
+                Add-AcceptanceCheck -Scenario $scenario -Name "full SUT requirement baseline available (V1 $($v1Baseline.Count): $($v1FrBaseline.Count) FR + $($nfrBaseline.Count) NFR; V2 $($v2Baseline.Count))" `
+                    -Passed ($baselineError -eq "" -and $v1Baseline.Count -gt 0 -and $v1FrBaseline.Count -gt 0) -Severity assertion `
+                    -Detail ("mode=$($requirementProfile.Mode) v1=$($v1Baseline.Count) v1fr=$($v1FrBaseline.Count) nfr=$($nfrBaseline.Count) v2=$($v2Baseline.Count) p0=$($p0Baseline.Count)")
+                Add-AcceptanceCheck -Scenario $scenario -Name "design input is traceable to V1 FR/NFR ($frCoveredBefore/$frTotalBefore; NFR $nfrCoveredBefore/$nfrTotalBefore)" `
+                    -Passed ($frCoveredBefore -eq $frTotalBefore -and $nfrCoveredBefore -eq $nfrTotalBefore) -Severity assertion `
+                    -Detail "fr=$frCoveredBefore/$frTotalBefore nfr=$nfrCoveredBefore/$nfrTotalBefore missing=$(@($coverageBefore.Missing) -join ',')"
+                Add-AcceptanceCheck -Scenario $scenario -Name "design input covers all P0 requirements ($($p0Baseline.Count)/$($p0Baseline.Count))" `
+                    -Passed ($coverageBefore.P0Covered -eq $coverageBefore.P0Total -and $coverageBefore.P0Total -gt 0) -Severity assertion `
+                    -Detail "p0=$($coverageBefore.P0Covered)/$($coverageBefore.P0Total) missing=$(@($coverageBefore.P0Missing) -join ',')"
+                Add-AcceptanceCheck -Scenario $scenario -Name "V2 延展·未实现 not imported as design requirements" `
+                    -Passed ($v2CreatedBefore.Count -eq 0) -Severity assertion `
+                    -Detail "v2_created=$($v2CreatedBefore.Count)/$($v2Baseline.Count)"
+            } else {
+                Add-AcceptanceCheck -Scenario $scenario -Name "full-document traceability is not asserted without an explicit requirement input" -Passed $true -Severity warning `
+                    -Detail "no -RequirementInput / -FullSutDoc was supplied; S3 used only the live version requirements"
+            }
             Add-AcceptanceCheck -Scenario $scenario -Name "requirements are traceable to FR/NFR IDs" `
                 -Passed ($untraceableBefore.Count -eq 0) -Severity assertion `
                 -Detail "untraceable=$($untraceableBefore.Count)"
@@ -797,21 +992,37 @@ try {
                 $p0WithCases = @($p0Baseline | Where-Object { $caseSutIds -contains [string]$_.id })
                 $frWithCases = @($v1FrBaseline | Where-Object { $caseSutIds -contains [string]$_.id })
                 $nfrWithCases = @($nfrBaseline | Where-Object { $caseSutIds -contains [string]$_.id })
+                $smallExpectedFrIds = if ($isSmallInput) { @($requirementProfile.ExpectedFrIds) } else { @() }
+                $smallCaseOutside = if ($isSmallInput) { @($caseSutIds | Where-Object { $smallExpectedFrIds -notcontains $_ }) } else { @() }
+                $smallFrWithCases = if ($isSmallInput) { @($smallExpectedFrIds | Where-Object { $caseSutIds -contains $_ }) } else { @() }
                 [void](Write-S3Evidence -Name "case-traceability.json" -Value ([pscustomobject]@{
-                    generated_at       = (Get-Date).ToUniversalTime().ToString("o")
-                    cases_total        = @($caseCards).Count
-                    traceable_cases    = $caseTrace.TraceableCases
-                    untraceable_cases  = @($caseTrace.UntraceableCases)
-                    fr_with_cases      = @($frWithCases | ForEach-Object { $_.id })
-                    nfr_with_cases     = @($nfrWithCases | ForEach-Object { $_.id })
-                    p0_with_cases      = @($p0WithCases | ForEach-Object { $_.id })
-                    p0_total           = $p0Baseline.Count
-                    v2_case_rows       = @($v2CaseRows)
-                    rows               = @($caseTrace.Rows)
+                    generated_at             = (Get-Date).ToUniversalTime().ToString("o")
+                    mode                     = $profileMode
+                    input_path               = $inputPathForEvidence
+                    expected_fr_ids          = @($smallExpectedFrIds)
+                    cases_total              = @($caseCards).Count
+                    traceable_cases          = $caseTrace.TraceableCases
+                    untraceable_cases        = @($caseTrace.UntraceableCases)
+                    cases_outside_small_input = @($smallCaseOutside)
+                    expected_fr_with_cases   = @($smallFrWithCases)
+                    fr_with_cases            = @($frWithCases | ForEach-Object { $_.id })
+                    nfr_with_cases           = @($nfrWithCases | ForEach-Object { $_.id })
+                    p0_with_cases            = @($p0WithCases | ForEach-Object { $_.id })
+                    p0_total                 = $p0Baseline.Count
+                    v2_case_rows             = @($v2CaseRows)
+                    rows                     = @($caseTrace.Rows)
                 }) -Kind "coverage" -Note "case -> requirement -> FR/NFR traceability")
                 Add-AcceptanceCheck -Scenario $scenario -Name "design cases traceable to FR/NFR requirements" `
                     -Passed ($caseTrace.TraceableCases -ge 1 -and @($caseTrace.UntraceableCases).Count -eq 0) -Severity assertion `
                     -Detail ("cases=$(@($caseCards).Count) traceable=$($caseTrace.TraceableCases) untraceable=$(@($caseTrace.UntraceableCases).Count)")
+                if ($isSmallInput) {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "design cases target only the small-input requirements" `
+                        -Passed (@($caseCards).Count -ge 1 -and @($smallCaseOutside).Count -eq 0 -and @($smallFrWithCases).Count -ge 1) -Severity assertion `
+                        -Detail ("expected=$($smallExpectedFrIds -join ',') with_cases=$($smallFrWithCases -join ',') outside=$($smallCaseOutside -join ',') cases=$(@($caseCards).Count)")
+                    Add-AcceptanceCheck -Scenario $scenario -Name "all small-input requirements have design cases" `
+                        -Passed (@($smallFrWithCases).Count -eq @($smallExpectedFrIds).Count) -Severity warning `
+                        -Detail ("with_cases=$(@($smallFrWithCases).Count)/$(@($smallExpectedFrIds).Count) covered=$($smallFrWithCases -join ','); the product may produce fewer cases and the matrix records the real remainder")
+                }
                 Add-AcceptanceCheck -Scenario $scenario -Name "V2 延展·未实现 not designed as delivered cases" `
                     -Passed (@($v2CaseRows).Count -eq 0) -Severity assertion `
                     -Detail "v2_cases=$(@($v2CaseRows).Count)"
@@ -893,18 +1104,24 @@ try {
                 # Task 72 deliverable: the FR/NFR -> requirement -> case matrix.
                 # ------------------------------------------------------------------
                 $matrixResult = $null
-                try {
-                    $matrixResult = New-SutRequirementsMatrix -BaselineEntries $baselineEntries -Requirements $requirements `
-                        -CaseCards $caseCards -VersionId $versionId -Path $matrixPath -DocumentPath $RequirementDocumentPath `
-                        -Stage $stageAtEndValue -VersionTitle ([string](Get-JsonProp -Object $version -Name "title" -Default ""))
-                    Add-AcceptanceArtifact -Scenario $scenario -Path $matrixPath -Kind "matrix" -Note "FR/NFR -> requirement -> case -> status traceability matrix"
-                    Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement traceability matrix written" -Passed (Test-Path -LiteralPath $matrixPath) -Severity assertion `
-                        -Detail ("path=" + (Resolve-RepoRelativePath -Context $context -Path $matrixPath) + " v1=$($matrixResult.V1Covered)/$($matrixResult.V1Total) p0=$($matrixResult.P0WithCases)/$($matrixResult.P0Total) cases=$($matrixResult.CasesTotal)")
-                } catch {
-                    Add-AcceptanceCheck -Scenario $scenario -Name "SUT requirement traceability matrix written" -Passed $false -Severity assertion -Detail $_.Exception.Message
+                if ($baselineEntries.Count -gt 0) {
+                    try {
+                        $matrixResult = New-SutRequirementsMatrix -BaselineEntries $baselineEntries -Requirements $requirements `
+                            -CaseCards $caseCards -VersionId $versionId -Path $matrixPath -DocumentPath $inputPathForEvidence `
+                            -Stage $stageAtEndValue -VersionTitle ([string](Get-JsonProp -Object $version -Name "title" -Default ""))
+                        Add-AcceptanceArtifact -Scenario $scenario -Path $matrixPath -Kind "matrix" -Note "requirement input -> requirement -> case -> status traceability matrix"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "requirement traceability matrix written" -Passed (Test-Path -LiteralPath $matrixPath) -Severity assertion `
+                            -Detail ("path=" + (Resolve-RepoRelativePath -Context $context -Path $matrixPath) + " v1=$($matrixResult.V1Covered)/$($matrixResult.V1Total) p0=$($matrixResult.P0WithCases)/$($matrixResult.P0Total) cases=$($matrixResult.CasesTotal)")
+                    } catch {
+                        Add-AcceptanceCheck -Scenario $scenario -Name "requirement traceability matrix written" -Passed $false -Severity assertion -Detail $_.Exception.Message
+                    }
+                } else {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "requirement traceability matrix written" -Passed $true -Severity warning `
+                        -Detail "no explicit requirement input profile; the matrix was not rewritten (existing full-document matrix preserved)"
                 }
+                $matrixPathForSummary = if ($null -ne $matrixResult) { $matrixResult.Path } else { "" }
                 [void](Write-S3Evidence -Name "sut-matrix-summary.json" -Value ([pscustomobject]@{
-                    matrix_path = if ($null -ne $matrixResult) { $matrixResult.Path } else { $matrixPath }
+                    matrix_path = $matrixPathForSummary
                     summary     = $matrixResult
                     coverage    = [pscustomobject]@{
                         fr_with_cases = @($frWithCases | ForEach-Object { $_.id })
@@ -966,6 +1183,7 @@ try {
                 }
             }
         }
+    }
     }
 } catch {
     $scenario.ErrorMessage = $_.Exception.Message

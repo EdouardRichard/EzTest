@@ -1964,3 +1964,427 @@ function Get-SutRequirementCoverage {
         UntraceableCount  = @($requirementList | Where-Object { (Get-RequirementSutId -Requirement $_) -eq "" }).Count
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 88 (P10-T13): small requirement input profile
+#
+# The final S0-S10 run must import only the explicitly supplied requirement
+# input (small-a.md / small-b.feature / small-b.txt / small-c.docx), not the
+# full 67-requirement SUT document. These helpers are pure/read-only: they never
+# write application data, never start a stack and never call the SUT.
+# ---------------------------------------------------------------------------
+
+function Resolve-AcceptanceRequirementPath {
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $Path = "",
+        [Parameter(Mandatory = $false)] [string] $RepoRoot = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
+    if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
+        return [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $Path))
+    }
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
+function ConvertTo-AcceptanceFrIdList {
+    <#
+        Normalizes an FR/NFR ID list passed as an array or as a comma/semicolon/
+        whitespace separated string. Unknown tokens are kept so a caller can
+        report them instead of silently dropping the input.
+    #>
+    param([Parameter(Mandatory = $false)] [AllowNull()] $Value)
+    $ids = @()
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        foreach ($part in ([string]$item -split '[,;\s]+')) {
+            $id = $part.Trim().ToUpperInvariant()
+            if ($id -ne "") { $ids += $id }
+        }
+    }
+    return @($ids | Select-Object -Unique | Sort-Object)
+}
+
+function Get-AcceptanceDocxText {
+    <#
+        Extracts the visible text of word/document.xml with the same rule shape
+        as the backend OOXML parser (w:t text, w:tab -> tab, w:br -> newline,
+        w:p end -> newline). This is only used to derive the expected FR ID set
+        and to hand the real text to the extraction flow; it never replaces the
+        product attachment parser, which remains the source of the imported text.
+    #>
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    $zip = $null
+    $stream = $null
+    $reader = $null
+    try {
+        if (-not ("System.IO.Compression.ZipFile" -as [type])) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        }
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        $entry = $zip.GetEntry("word/document.xml")
+        if ($null -eq $entry) { throw "DOCX requirement input has no word/document.xml: $Path" }
+        $stream = $entry.Open()
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
+        $xml = $reader.ReadToEnd()
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $zip) { $zip.Dispose() }
+    }
+    $text = [regex]::Replace($xml, '(?i)<w:tab\s*/>', "`t")
+    $text = [regex]::Replace($text, '(?i)<w:br\s*/>', "`n")
+    $text = [regex]::Replace($text, '(?i)</w:p>', "`n")
+    $text = [regex]::Replace($text, '<[^>]+>', '')
+    $text = [System.Net.WebUtility]::HtmlDecode($text)
+    return $text
+}
+
+function Get-AcceptanceRequirementInputFormat {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $Text = ""
+    )
+    $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    switch ($extension) {
+        ".docx" { return "docx" }
+        ".feature" { return "gherkin" }
+        ".md" { return "markdown" }
+        ".markdown" { return "markdown" }
+    }
+    if ($extension -eq ".txt" -and ($Text -match '(?im)^\s*(Feature|Rule):' -or $Text -match '(?im)^\s*@\S*FR-\d{3}')) {
+        return "gherkin"
+    }
+    return "text"
+}
+
+function Get-AcceptanceFrIdsFromText {
+    <#
+        Extracts the unique requirement IDs declared by the input. Formats use
+        their natural declaration first (Markdown heading, Gherkin Rule/tag) and
+        fall back to all FR/NFR tokens, so a plain DOCX/text export still yields
+        a verifiable ID set. AC tags contain the same FR ID and are de-duplicated.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $Text,
+        [Parameter(Mandatory = $false)] [string] $Format = "text"
+    )
+    $ids = @()
+    if ($Format -eq "markdown") {
+        foreach ($match in [regex]::Matches($Text, '(?im)^#{1,6}\s*((?:FR|NFR)-\d{3})\b')) {
+            $ids += ([string]$match.Groups[1].Value).ToUpperInvariant()
+        }
+    } elseif ($Format -eq "gherkin") {
+        foreach ($match in [regex]::Matches($Text, '(?im)^\s*Rule:\s*((?:FR|NFR)-\d{3})\b')) {
+            $ids += ([string]$match.Groups[1].Value).ToUpperInvariant()
+        }
+        if ($ids.Count -eq 0) {
+            foreach ($match in [regex]::Matches($Text, '(?im)^\s*@((?:FR|NFR)-\d{3})\b')) {
+                $ids += ([string]$match.Groups[1].Value).ToUpperInvariant()
+            }
+        }
+    }
+    if ($ids.Count -eq 0) {
+        foreach ($match in [regex]::Matches($Text, '(?i)\b(?:FR|NFR)-\d{3}\b')) {
+            $ids += ([string]$match.Value).ToUpperInvariant()
+        }
+    }
+    return @($ids | Select-Object -Unique | Sort-Object)
+}
+
+function New-AcceptanceRequirementInputEntries {
+    <#
+        Builds per-requirement extraction entries from the small input text. The
+        text slices stay verbatim; titles/priorities are only used for evidence
+        and the matrix, never to invent requirements.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $Text,
+        [Parameter(Mandatory = $true)] [string] $Format,
+        [Parameter(Mandatory = $true)] [string[]] $Ids,
+        [Parameter(Mandatory = $false)] [string] $DocumentPath = ""
+    )
+    $found = @()
+    if ($Format -eq "markdown") {
+        $found = @([regex]::Matches($Text, '(?m)^#{1,6}\s*((?:FR|NFR)-\d{3})\b[ \t]*(.*)$'))
+    } elseif ($Format -eq "gherkin") {
+        $found = @([regex]::Matches($Text, '(?im)^[ \t]*Rule:\s*((?:FR|NFR)-\d{3})\b[ \t]*(.*)$'))
+        if ($found.Count -eq 0) {
+            $found = @([regex]::Matches($Text, '(?im)^[ \t]*@((?:FR|NFR)-\d{3})\b[ \t]*(.*)$'))
+        }
+    } else {
+        $seen = @{}
+        foreach ($match in [regex]::Matches($Text, '(?i)\b(?:FR|NFR)-\d{3}\b')) {
+            $id = ([string]$match.Value).ToUpperInvariant()
+            if (-not $seen.ContainsKey($id)) {
+                $seen[$id] = $true
+                $found += $match
+            }
+        }
+    }
+
+    $foundById = @{}
+    foreach ($match in $found) {
+        $id = if ($match.Groups.Count -gt 1) { ([string]$match.Groups[1].Value).ToUpperInvariant() } else { ([string]$match.Value).ToUpperInvariant() }
+        if (-not $foundById.ContainsKey($id)) { $foundById[$id] = $match }
+    }
+
+    $orderedIds = @()
+    foreach ($match in $found) {
+        $id = if ($match.Groups.Count -gt 1) { ([string]$match.Groups[1].Value).ToUpperInvariant() } else { ([string]$match.Value).ToUpperInvariant() }
+        if (($Ids -contains $id) -and -not ($orderedIds -contains $id)) { $orderedIds += $id }
+    }
+    foreach ($id in $Ids) { if (-not ($orderedIds -contains $id)) { $orderedIds += $id } }
+
+    $entries = @()
+    foreach ($id in $orderedIds) {
+        $match = $null
+        if ($foundById.ContainsKey($id)) { $match = $foundById[$id] }
+        $start = if ($null -ne $match) { [int]$match.Index } else { 0 }
+        $end = $Text.Length
+        if ($null -ne $match) {
+            foreach ($candidate in $found) {
+                if ([int]$candidate.Index -gt $start) { $end = [int]$candidate.Index; break }
+            }
+        }
+        if ($end -le $start) { $end = $Text.Length }
+        $slice = $Text.Substring($start, [Math]::Min($Text.Length - $start, $end - $start)).Trim()
+        $title = $id
+        if ($Format -eq "docx" -or $Format -eq "text") {
+            # Flat Office/text extraction has no reliable per-requirement heading;
+            # the live requirement title comes from the product extraction.
+            $title = $id
+        } elseif ($null -ne $match -and $match.Groups.Count -gt 2) {
+            $candidateTitle = ([string]$match.Groups[2].Value).Trim()
+            if ($candidateTitle -ne "") { $title = $candidateTitle }
+        } elseif ($null -ne $match) {
+            $lineEnd = $Text.IndexOf("`n", $start)
+            if ($lineEnd -lt 0) { $lineEnd = $Text.Length }
+            $line = $Text.Substring($start, $lineEnd - $start)
+            $candidateTitle = ($line -replace ('(?i)^\s*\b' + [regex]::Escape($id) + '\b[ \t:：-]*'), '').Trim()
+            if ($candidateTitle -ne "") { $title = $candidateTitle }
+        }
+        if ($title.Length -gt 120) { $title = $title.Substring(0, 120) }
+        $priority = ""
+        $priorityMatch = [regex]::Match($slice, '(?im)\*\*优先级\*\*[：:]\s*(P\d)')
+        if ($priorityMatch.Success) {
+            $priority = [string]$priorityMatch.Groups[1].Value
+        } else {
+            $priorityMatch = [regex]::Match($slice, '(?im)^\s*(?:优先级|priority)[:：]?\s*(P\d)')
+            if ($priorityMatch.Success) { $priority = [string]$priorityMatch.Groups[1].Value }
+        }
+        $version = "V1"
+        if ($id -match '^FR-1\d{2}$') { $version = "V2" }
+        $entries += [pscustomobject]@{
+            id            = $id
+            title         = $title
+            priority      = $priority
+            version       = $version
+            version_label = if ($version -eq "V2") { "延展·未实现" } else { "V1" }
+            section       = ""
+            document_path = $DocumentPath
+            line_start    = 0
+            line_end      = 0
+            text          = $slice
+            char_count    = $slice.Length
+        }
+    }
+    return $entries
+}
+
+function Resolve-AcceptanceRequirementProfile {
+    <#
+        Resolves exactly one requirement source for the acceptance flow:
+
+          -RequirementInput <path>  small/parameterized input: expected count and
+                                    FR IDs come from that file only;
+          -FullSutDoc              explicit legacy full 67-requirement document.
+
+        Supplying neither is an error. There is deliberately no implicit fallback
+        to the full SUT document.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $RequirementInput = "",
+        [Parameter(Mandatory = $false)] [int] $ExpectedRequirements = 0,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $ExpectedFrIds = "",
+        [Parameter(Mandatory = $false)] [switch] $FullSutDoc,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $FullSutDocPath = "",
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $LegacyDocumentPath = "",
+        [Parameter(Mandatory = $false)] [string] $RepoRoot = ""
+    )
+    $hasSmallInput = -not [string]::IsNullOrWhiteSpace($RequirementInput)
+    if ($hasSmallInput -and $FullSutDoc) {
+        throw "RequirementInput and FullSutDoc are mutually exclusive; pass exactly one requirement source"
+    }
+    if (-not $hasSmallInput -and -not $FullSutDoc) {
+        throw "no requirement input: pass -RequirementInput <small-a.md|small-b.feature|small-b.txt|small-c.docx> or -FullSutDoc for the legacy full SUT document; refusing to default to the full 67-requirement document"
+    }
+    $requestedIds = @(ConvertTo-AcceptanceFrIdList -Value $ExpectedFrIds)
+
+    if ($FullSutDoc) {
+        $pathValue = if (-not [string]::IsNullOrWhiteSpace($FullSutDocPath)) { $FullSutDocPath } else { $LegacyDocumentPath }
+        if ([string]::IsNullOrWhiteSpace($pathValue)) {
+            throw "FullSutDoc requires the full document path (-FullSutDocPath) or the legacy -RequirementDocumentPath value"
+        }
+        $fullPath = Resolve-AcceptanceRequirementPath -Path $pathValue -RepoRoot $RepoRoot
+        if (-not (Test-Path -LiteralPath $fullPath)) { throw "full SUT requirement document not found: $fullPath" }
+        $entries = @(Read-SutRequirementDocument -Path $fullPath)
+        if ($entries.Count -eq 0) { throw "full SUT requirement document contains no requirement headings: $fullPath" }
+        $v1Entries = @($entries | Where-Object { [string]$_.version -eq "V1" })
+        $v2Entries = @($entries | Where-Object { [string]$_.version -eq "V2" })
+        $v1Fr = @($v1Entries | Where-Object { [string]$_.id -like "FR-0*" })
+        $nfr = @($v1Entries | Where-Object { [string]$_.id -like "NFR-*" })
+        $expectedCount = $v1Entries.Count
+        $expectedIds = @($v1Entries | ForEach-Object { [string]$_.id } | Sort-Object -Unique)
+        if ($ExpectedRequirements -gt 0 -and $ExpectedRequirements -ne $expectedCount) {
+            throw "full SUT document '$([System.IO.Path]::GetFileName($fullPath))' has $expectedCount V1 requirements but ExpectedRequirements=$ExpectedRequirements"
+        }
+        if ($requestedIds.Count -gt 0) {
+            $missingRequested = @($requestedIds | Where-Object { $expectedIds -notcontains $_ })
+            $missingActual = @($expectedIds | Where-Object { $requestedIds -notcontains $_ })
+            if ($missingRequested.Count -gt 0 -or $missingActual.Count -gt 0) {
+                throw "ExpectedFrIds does not match the full SUT document V1 IDs; not-in-document=$($missingRequested -join ',') not-requested=$($missingActual -join ',')"
+            }
+        }
+        return [pscustomobject]@{
+            Ok                   = $true
+            Mode                 = "full-sut-doc"
+            Path                 = $fullPath
+            Name                 = [System.IO.Path]::GetFileName($fullPath)
+            Extension            = [System.IO.Path]::GetExtension($fullPath).ToLowerInvariant()
+            Format               = "markdown"
+            Size                 = (Get-Item -LiteralPath $fullPath).Length
+            Sha256              = Get-AcceptanceFileSha256 -Path $fullPath
+            Text                 = ""
+            TextLength           = 0
+            Entries              = @($entries)
+            ExtractionEntries    = @($v1Entries)
+            ExpectedRequirements = $expectedCount
+            ExpectedFrIds        = @($expectedIds)
+            V1Total              = $v1Entries.Count
+            V1FrCount            = $v1Fr.Count
+            NfrCount             = $nfr.Count
+            V2Count              = $v2Entries.Count
+            V2FrIds              = @($v2Entries | Where-Object { [string]$_.id -like "FR-1*" } | ForEach-Object { [string]$_.id })
+        }
+    }
+
+    $fullPath = Resolve-AcceptanceRequirementPath -Path $RequirementInput -RepoRoot $RepoRoot
+    if (-not (Test-Path -LiteralPath $fullPath)) { throw "requirement input not found: $fullPath" }
+    $file = Get-Item -LiteralPath $fullPath
+    if ($file.PSIsContainer) { throw "requirement input is a directory, not a file: $fullPath" }
+    $extension = [System.IO.Path]::GetExtension($fullPath).ToLowerInvariant()
+    $text = if ($extension -eq ".docx") { Get-AcceptanceDocxText -Path $fullPath } else { [System.IO.File]::ReadAllText($fullPath, [System.Text.Encoding]::UTF8) }
+    $format = Get-AcceptanceRequirementInputFormat -Path $fullPath -Text $text
+    $ids = @(Get-AcceptanceFrIdsFromText -Text $text -Format $format)
+    if ($ids.Count -eq 0) { throw "requirement input '$($file.Name)' contains no FR/NFR IDs; refusing to guess the expected requirement set" }
+    $expectedCount = if ($ExpectedRequirements -gt 0) { $ExpectedRequirements } else { $ids.Count }
+    if ($ExpectedRequirements -gt 0 -and $ids.Count -ne $ExpectedRequirements) {
+        throw "requirement input '$($file.Name)' contains $($ids.Count) FR/NFR IDs ($($ids -join ',')) but ExpectedRequirements=$ExpectedRequirements; refusing to silently import the full SUT document"
+    }
+    if ($requestedIds.Count -gt 0) {
+        $missingRequested = @($requestedIds | Where-Object { $ids -notcontains $_ })
+        $missingActual = @($ids | Where-Object { $requestedIds -notcontains $_ })
+        if ($missingRequested.Count -gt 0 -or $missingActual.Count -gt 0) {
+            throw "ExpectedFrIds does not match requirement input '$($file.Name)'; input=$($ids -join ',') requested=$($requestedIds -join ',')"
+        }
+    }
+    $entries = @(New-AcceptanceRequirementInputEntries -Text $text -Format $format -Ids $ids -DocumentPath $fullPath)
+    # Markdown/Gherkin have real per-FR sections; flat DOCX/text is sent as one
+    # verbatim extraction block with the expected ID list so the curator sees the
+    # whole small input instead of a misleading fragment cut at the first ID.
+    $extractionEntries = if ($format -eq "docx" -or $format -eq "text") {
+        @([pscustomobject]@{
+            id            = "requirement-input"
+            expected_ids  = @($ids)
+            title         = "parsed requirement input text"
+            priority      = ""
+            version       = "V1"
+            version_label = "V1"
+            section       = ""
+            document_path = $fullPath
+            line_start    = 0
+            line_end      = 0
+            text          = $text.Trim()
+            char_count    = $text.Trim().Length
+        })
+    } else {
+        @($entries)
+    }
+    $v1FrCount = @($ids | Where-Object { $_ -like "FR-0*" }).Count
+    $nfrCount = @($ids | Where-Object { $_ -like "NFR-*" }).Count
+    $v2Ids = @($ids | Where-Object { $_ -match '^FR-1\d{2}$' })
+    return [pscustomobject]@{
+        Ok                   = $true
+        Mode                 = "small-input"
+        Path                 = $fullPath
+        Name                 = $file.Name
+        Extension            = $extension
+        Format               = $format
+        Size                 = $file.Length
+        Sha256              = Get-AcceptanceFileSha256 -Path $fullPath
+        Text                 = $text
+        TextLength           = $text.Length
+        Entries              = @($entries)
+        ExtractionEntries    = @($extractionEntries)
+        ExpectedRequirements = $expectedCount
+        ExpectedFrIds        = @($ids)
+        V1Total              = $ids.Count - $v2Ids.Count
+        V1FrCount            = $v1FrCount
+        NfrCount             = $nfrCount
+        V2Count              = $v2Ids.Count
+        V2FrIds              = @($v2Ids)
+    }
+}
+
+function Compare-AcceptanceRequirementSet {
+    <#
+        Compares the live version requirement list with the expected small-input
+        set: total count, exact FR/NFR ID mapping, duplicates and untraceable
+        rows. A case-insensitive/order-insensitive ID comparison is intentional;
+        the requirement count itself is exact.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [string] $ExpectedFrIds = "",
+        [Parameter(Mandatory = $false)] [int] $ExpectedRequirements = 0,
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $Requirements = @()
+    )
+    $expected = @(ConvertTo-AcceptanceFrIdList -Value $ExpectedFrIds)
+    $expectedCount = if ($ExpectedRequirements -gt 0) { $ExpectedRequirements } else { $expected.Count }
+    $requirementList = @($Requirements)
+    $actualIds = @()
+    $untraceable = @()
+    $duplicates = @()
+    $seen = @{}
+    foreach ($requirement in $requirementList) {
+        $sutId = Get-RequirementSutId -Requirement $requirement
+        if ($sutId -eq "") {
+            $untraceable += [pscustomobject]@{
+                requirement_id = [string](Get-JsonProp -Object $requirement -Name "id" -Default "")
+                title          = [string](Get-JsonProp -Object $requirement -Name "title" -Default "")
+            }
+            continue
+        }
+        if ($seen.ContainsKey($sutId)) { $duplicates += $sutId } else { $seen[$sutId] = $true; $actualIds += $sutId }
+    }
+    $actualSorted = @($actualIds | Sort-Object -Unique)
+    $missing = @($expected | Where-Object { $actualSorted -notcontains $_ })
+    $extra = @($actualSorted | Where-Object { $expected -notcontains $_ })
+    $duplicateIds = @($duplicates | Sort-Object -Unique)
+    $countPassed = ($requirementList.Count -eq $expectedCount)
+    $passed = ($expectedCount -gt 0 -and $countPassed -and $missing.Count -eq 0 -and $extra.Count -eq 0 -and $duplicateIds.Count -eq 0 -and $untraceable.Count -eq 0)
+    $detail = "expected=$expectedCount actual=$($requirementList.Count) missing=$(if ($missing.Count -gt 0) { $missing -join ',' } else { 'none' }) extra=$(if ($extra.Count -gt 0) { $extra -join ',' } else { 'none' }) duplicates=$(if ($duplicateIds.Count -gt 0) { $duplicateIds -join ',' } else { 'none' }) untraceable=$($untraceable.Count)"
+    return [pscustomobject]@{
+        Passed                     = $passed
+        ExpectedCount              = $expectedCount
+        ActualCount                = $requirementList.Count
+        ExpectedFrIds              = @($expected)
+        ActualFrIds                = @($actualSorted)
+        MissingFrIds               = @($missing)
+        ExtraFrIds                 = @($extra)
+        DuplicateIds               = @($duplicateIds)
+        UntraceableRequirementIds  = @($untraceable)
+        CountPassed                = $countPassed
+        Detail                     = $detail
+    }
+}
