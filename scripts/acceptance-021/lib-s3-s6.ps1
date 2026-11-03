@@ -446,3 +446,43 @@ function Get-AcceptanceSplitRow {
     if ($null -eq $Line) { return @() }
     return @($Line.Split("`t"))
 }
+
+# ---------------------------------------------------------------------------
+# Clarification question budget
+# ---------------------------------------------------------------------------
+
+# Get-AcceptanceQuestionBudgetSummary computes the question metrics for the S2
+# clarification budget. UserQuestions are the primary+convergence clarification
+# turns; BatchQuestions are the S2 harness batch-extraction sessions that feed
+# the document slices. The two scopes are normalized and deduplicated separately,
+# and together for an honest full-volume observation. The product budget applies
+# to the user clarification scope only; the extraction-session exception is a
+# harness artifact and is recorded, never silently folded into a version-wide
+# claim.
+function Get-AcceptanceQuestionBudgetSummary {
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $UserQuestions = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $BatchQuestions = @()
+    )
+    $userNormalized = @()
+    foreach ($question in @($UserQuestions)) { $userNormalized += (Get-NormalizedQuestion -Question $question) }
+    $batchNormalized = @()
+    foreach ($question in @($BatchQuestions)) { $batchNormalized += (Get-NormalizedQuestion -Question $question) }
+    $userUnique = @(Select-NormalizedUnique -Items $userNormalized)
+    $batchUnique = @(Select-NormalizedUnique -Items $batchNormalized)
+    $allUnique = @(Select-NormalizedUnique -Items (@($userNormalized) + @($batchNormalized)))
+    $duplicates = @()
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($item in $userNormalized) {
+        if (-not $seen.Add($item)) { $duplicates += $item }
+    }
+    return [pscustomobject]@{
+        user_total      = @($UserQuestions).Count
+        user_unique     = $userUnique.Count
+        user_duplicates = @($duplicates)
+        batch_total     = @($BatchQuestions).Count
+        batch_unique    = $batchUnique.Count
+        all_total       = @($UserQuestions).Count + @($BatchQuestions).Count
+        all_unique      = $allUnique.Count
+    }
+}

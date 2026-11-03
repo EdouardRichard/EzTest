@@ -675,37 +675,39 @@ func (a *fakeAnalyzer) AnalyzeWave(_ context.Context, waveID int64) error {
 
 // buildTask6Fixture wires the Task 6 services with in-memory fakes.
 type task6Fixture struct {
-	intents   *fakeIntentStore
-	waves     *fakeWaveStore
-	runs      *fakeCaseRunStore
-	cases     *fakeCaseReader
-	versions  *fakeVersionReader
-	registry  *fakeExecutorRegistry
-	quota     *fakeQuotaReader
-	queue     *fakeWorkQueue
-	analysis  *fakeAnalyzer
-	events    *corePublisher
-	clock     *coreClock
-	ids       *coreIDs
-	intent    *IntentService
-	scheduler *Scheduler
+	intents    *fakeIntentStore
+	waves      *fakeWaveStore
+	runs       *fakeCaseRunStore
+	cases      *fakeCaseReader
+	versions   *fakeVersionReader
+	selections *fakeBatchSelectionReader
+	registry   *fakeExecutorRegistry
+	quota      *fakeQuotaReader
+	queue      *fakeWorkQueue
+	analysis   *fakeAnalyzer
+	events     *corePublisher
+	clock      *coreClock
+	ids        *coreIDs
+	intent     *IntentService
+	scheduler  *Scheduler
 }
 
 func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 	now := time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)
 	f := &task6Fixture{
-		intents:  newFakeIntentStore(),
-		waves:    newFakeWaveStore(),
-		runs:     newFakeCaseRunStore(),
-		cases:    &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}},
-		versions: &fakeVersionReader{bindings: map[int64]VersionBinding{}},
-		registry: &fakeExecutorRegistry{},
-		quota:    &fakeQuotaReader{},
-		queue:    &fakeWorkQueue{},
-		analysis: &fakeAnalyzer{},
-		events:   &corePublisher{},
-		clock:    &coreClock{now: now},
-		ids:      &coreIDs{next: 1000},
+		intents:    newFakeIntentStore(),
+		waves:      newFakeWaveStore(),
+		runs:       newFakeCaseRunStore(),
+		cases:      &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}},
+		versions:   &fakeVersionReader{bindings: map[int64]VersionBinding{}},
+		selections: &fakeBatchSelectionReader{found: true},
+		registry:   &fakeExecutorRegistry{},
+		quota:      &fakeQuotaReader{},
+		queue:      &fakeWorkQueue{},
+		analysis:   &fakeAnalyzer{},
+		events:     &corePublisher{},
+		clock:      &coreClock{now: now},
+		ids:        &coreIDs{next: 1000},
 	}
 	f.waves.runsStore = f.runs
 	f.waves.claim = func(intents []execution.ExecutionIntent) {
@@ -714,12 +716,13 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		}
 	}
 	f.intent = NewIntentService(IntentServiceDeps{
-		Intents:  f.intents,
-		Cases:    f.cases,
-		Versions: f.versions,
-		IDs:      f.ids,
-		Clock:    f.clock,
-		Events:   f.events,
+		Intents:         f.intents,
+		Cases:           f.cases,
+		Versions:        f.versions,
+		BatchSelections: f.selections,
+		IDs:             f.ids,
+		Clock:           f.clock,
+		Events:          f.events,
 	})
 	f.scheduler = NewScheduler(SchedulerDeps{
 		Intents:     f.intents,

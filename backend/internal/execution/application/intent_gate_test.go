@@ -74,6 +74,22 @@ func TestSingleConfirmDoesNotAutoRunWave(t *testing.T) {
 	}
 }
 
+// TestSelectedCaseNotExecutableCarriesNextAction pins the typed guidance of the
+// D23 selection guard: a stale/unconfirmed selected case must tell the caller
+// how to recover instead of only failing with a bare 409 conflict.
+func TestSelectedCaseNotExecutableCarriesNextAction(t *testing.T) {
+	f := newTask6Fixture(t)
+	ctx := context.Background()
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	f.versions.bindings[100] = task6Binding(100, "running", 5001)
+
+	_, err := f.intent.EnsureInitialIntentsForCases(ctx, 100, []int64{999999})
+	apiErr := requireAPIError(t, err, "selected_case_not_executable")
+	if next, _ := apiErr.Details["next_action"].(string); next == "" {
+		t.Fatalf("selected_case_not_executable details = %#v, want next_action guidance", apiErr.Details)
+	}
+}
+
 // TestBatchExecuteSelectedOnly pins the D23 selected-only contract end to end:
 // the execute.batch scope must not widen to every confirmed case of the version.
 func TestBatchExecuteSelectedOnly(t *testing.T) {

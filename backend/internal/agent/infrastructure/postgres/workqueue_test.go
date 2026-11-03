@@ -410,3 +410,61 @@ func TestLeaseEpochFencing(t *testing.T) {
 		t.Fatalf("stale CompleteWorkItem after done = %v, want ErrLeaseLost", err)
 	}
 }
+
+// TestExecuteBatchSelectionReadsNewestPersistedJob pins the D23 repair-scan
+// projection: the newest execute.batch work item's case_ids, kind-scoped, with
+// found=false for a version that never enqueued the stage-entry job. An empty
+// inputs object keeps the contract's "all current confirmed cases" meaning, and
+// a malformed case_ids value is a loud data error instead of a silent empty
+// selection (which would widen the batch).
+func TestExecuteBatchSelectionReadsNewestPersistedJob(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
+	ctx := context.Background()
+
+	if caseIDs, found, err := repo.ExecuteBatchSelection(ctx, 9001); err != nil || found || len(caseIDs) != 0 {
+		t.Fatalf("empty version selection = %v found=%v err=%v, want no selection", caseIDs, found, err)
+	}
+
+	createContractWorkItem(t, repo, agent.CreateWorkItemParams{
+		VersionID: 9001, Kind: agent.WorkItemKindDesignCases,
+		Inputs:         json.RawMessage(`{"case_ids":[999]}`),
+		IdempotencyKey: "9001:design.cases:1",
+	})
+	createContractWorkItem(t, repo, agent.CreateWorkItemParams{
+		VersionID: 9001, Kind: agent.WorkItemKindExecuteBatch,
+		Inputs:         json.RawMessage(`{"case_ids":[11,12]}`),
+		IdempotencyKey: "9001:execute.batch:first",
+	})
+	createContractWorkItem(t, repo, agent.CreateWorkItemParams{
+		VersionID: 9001, Kind: agent.WorkItemKindExecuteBatch,
+		Inputs:         json.RawMessage(`{"case_ids":[13]}`),
+		IdempotencyKey: "9001:execute.batch:second",
+	})
+	caseIDs, found, err := repo.ExecuteBatchSelection(ctx, 9001)
+	if err != nil || !found {
+		t.Fatalf("ExecuteBatchSelection = found=%v err=%v, want the persisted selection", found, err)
+	}
+	if !slices.Equal(caseIDs, []int64{13}) {
+		t.Fatalf("ExecuteBatchSelection = %v, want the newest job selection [13]", caseIDs)
+	}
+
+	createContractWorkItem(t, repo, agent.CreateWorkItemParams{
+		VersionID: 9002, Kind: agent.WorkItemKindExecuteBatch,
+		Inputs:         json.RawMessage(`{}`),
+		IdempotencyKey: "9002:execute.batch:all",
+	})
+	caseIDs, found, err = repo.ExecuteBatchSelection(ctx, 9002)
+	if err != nil || !found || len(caseIDs) != 0 {
+		t.Fatalf("all-cases selection = %v found=%v err=%v, want found with no narrowed ids", caseIDs, found, err)
+	}
+
+	createContractWorkItem(t, repo, agent.CreateWorkItemParams{
+		VersionID: 9003, Kind: agent.WorkItemKindExecuteBatch,
+		Inputs:         json.RawMessage(`{"case_ids":"oops"}`),
+		IdempotencyKey: "9003:execute.batch:bad",
+	})
+	if caseIDs, found, err := repo.ExecuteBatchSelection(ctx, 9003); err == nil || found || len(caseIDs) != 0 {
+		t.Fatalf("malformed selection = %v found=%v err=%v, want a loud parse error", caseIDs, found, err)
+	}
+}

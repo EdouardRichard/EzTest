@@ -411,8 +411,10 @@ export function DesignTab({
     [versionId, refreshGraph, refreshOverview, canReviewCases, stage, onStageChanged],
   )
 
-  // The batch bar hands exactly the checked ids to the 0.2.1 stage gate; the
-  // "all confirmed" rule for execution is enforced by the mindmap.
+  // The batch bar hands exactly the checked ids to the 0.2.1 stage gate. The
+  // backend refreshes intents only for that selection (D23), so unselected
+  // confirmed cases never enter a wave; confirm and execute stay scoped to the
+  // checked cases.
   const batchConfirmCases = useCallback(
     (caseIds: string[]) => {
       void batchCaseGate(caseIds, "confirm")

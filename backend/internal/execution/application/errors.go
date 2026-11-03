@@ -7,6 +7,13 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
+// ErrNoPersistedBatchSelection is the typed skip of the startup/leader repair
+// scan: the version has no persisted execute.batch selection (the stage-entry
+// work item was never enqueued, or an older row predates the contract). The
+// scan creates no initial intent instead of widening to every confirmed case;
+// R49 stage-entry recovery re-enqueues the scoped execute.batch job.
+var ErrNoPersistedBatchSelection = errors.New("execution: no persisted execute.batch selection")
+
 // mapExecutionError maps repository/domain sentinel errors onto the stable API
 // error envelope. Already-mapped platform errors pass through.
 func mapExecutionError(err error, kind string) error {

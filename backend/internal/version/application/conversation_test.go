@@ -563,6 +563,9 @@ func TestDesignRequiresClarified(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || apiErr.Code != "design_requirements_missing" {
 		t.Fatalf("design create err = %v, want 409 design_requirements_missing", err)
 	}
+	if next, _ := apiErr.Details["next_action"].(string); next == "" {
+		t.Fatalf("design_requirements_missing details = %#v, want next_action guidance", apiErr.Details)
+	}
 	if counter.calls != 1 || counter.versionID != env.versionID {
 		t.Fatalf("counter calls = %d version = %d", counter.calls, counter.versionID)
 	}

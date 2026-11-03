@@ -215,6 +215,46 @@ func TestCaseConfirmationRequiresCaseReview(t *testing.T) {
 	}
 }
 
+// TestConfirmationStageGuidanceCoversEveryScope pins the Task 82 guidance fix:
+// the confirmation endpoint serves case, scenario and requirement scopes, so
+// its wrong-stage 409 must echo the requested scope and carry scope-appropriate
+// next-action guidance instead of a case-only message.
+func TestConfirmationStageGuidanceCoversEveryScope(t *testing.T) {
+	for _, scope := range []string{"case", "scenario", "requirement"} {
+		t.Run(scope, func(t *testing.T) {
+			handler, graph, _ := newTestHandler()
+			handler.SetStageReader(fixedDesignStageReader{stage: version.StageDesigning})
+			mux := testMux(handler)
+
+			response := httptest.NewRecorder()
+			body := `{"scope":"` + scope + `","target_id":"7001"}`
+			mux.ServeHTTP(response, authedRequest(http.MethodPost,
+				"/api/versions/1001/design/confirmations", strings.NewReader(body)))
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409, body = %s", response.Code, response.Body.String())
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			errorData, _ := payload["error"].(map[string]any)
+			if errorData["code"] != "invalid_stage_for_action" {
+				t.Fatalf("error = %#v, want invalid_stage_for_action", errorData)
+			}
+			details, _ := errorData["details"].(map[string]any)
+			if details["scope"] != scope {
+				t.Fatalf("details.scope = %#v, want %q", details["scope"], scope)
+			}
+			if next, _ := details["next_action"].(string); next == "" {
+				t.Fatalf("next_action = %#v, want actionable guidance", details["next_action"])
+			}
+			if graph.lastVersionID != 0 {
+				t.Fatalf("wrong-stage confirmation reached the graph service: %+v", graph)
+			}
+		})
+	}
+}
+
 func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 	handler, graph, _ := newTestHandler()
 	generatedAt := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)

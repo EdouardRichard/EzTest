@@ -98,10 +98,11 @@ func queryOptionalID(r *http.Request, field, name string) (*int64, error) {
 	return &value, nil
 }
 
-// requireCaseReview rejects design actions that are only meaningful at the case
-// hard gate. A version still clarifying/designing must not silently freeze case
-// versions; the typed 409 carries the next action so the UI can guide the user.
-func (h *Handler) requireCaseReview(ctx context.Context, versionID int64) error {
+// requireCaseReview rejects design confirmations that are only meaningful at
+// the case hard gate. A version still clarifying/designing must not silently
+// freeze case versions; the typed 409 carries the requested scope and a
+// scope-appropriate next action so the UI can guide the user.
+func (h *Handler) requireCaseReview(ctx context.Context, versionID int64, scope string) error {
 	if h.stages == nil {
 		return nil
 	}
@@ -115,12 +116,27 @@ func (h *Handler) requireCaseReview(ctx context.Context, versionID int64) error 
 	return &platform.Error{
 		Status:  http.StatusConflict,
 		Code:    "invalid_stage_for_action",
-		Message: "case confirmation requires stage case_review, but the version is at " + string(stage.Stage),
+		Message: scope + " confirmation requires stage case_review, but the version is at " + string(stage.Stage),
 		Details: map[string]any{
 			"action":         "confirm_cases",
+			"scope":          scope,
 			"required_stage": "case_review",
 			"current_stage":  string(stage.Stage),
-			"next_action":    "confirm the requirements and wait for design generation to reach the case gate",
+			"next_action":    confirmationScopeNextAction(scope),
 		},
+	}
+}
+
+// confirmationScopeNextAction tailors the guidance to the confirmation unit:
+// a case confirmation names one case, while a scenario/requirement batch
+// confirms every draft case below it.
+func confirmationScopeNextAction(scope string) string {
+	switch scope {
+	case "scenario":
+		return "confirm the requirements and wait for design generation to reach the case gate, then confirm the scenario's draft cases"
+	case "requirement":
+		return "confirm the requirements and wait for design generation to reach the case gate, then confirm the requirement's draft cases"
+	default:
+		return "confirm the requirements and wait for design generation to reach the case gate, then confirm this case"
 	}
 }

@@ -3,6 +3,8 @@ package main
 // Tests for the leader-gated execution intent scan. The scan is only a startup/
 // compatibility repair path since Task 78: initial intents are created by the
 // explicit execute.batch stage job at executing, never by a case confirmation.
+// Since Task 82 the scan is selection-scoped; this file pins the wake/interval
+// scheduling, while the scoping itself is tested in the execution application.
 
 import (
 	"context"
@@ -34,6 +36,7 @@ func (f *fakeIntentEnsurer) count(versionID int64) int {
 	return f.calls[versionID]
 }
 
+// fakeVersionSummaryLister is the full-scan version projection.
 type fakeVersionSummaryLister struct {
 	mu   sync.Mutex
 	list []versionapp.VersionSummary
@@ -46,11 +49,13 @@ func (f *fakeVersionSummaryLister) List(_ context.Context, _ int, _ *int64) ([]v
 	return append([]versionapp.VersionSummary(nil), f.list...), false, f.err
 }
 
-// TestIntentScanIsEventDriven pins the default: a case-confirmed wake scans the
-// event's version without any periodic tick.
-func TestIntentScanIsEventDriven(t *testing.T) {
+// TestIntentScanDoesNotWakePerVersion pins the Task 82 wake contract: the
+// per-version case-confirmed wake was removed with Task 78 (confirmations must
+// not create intents), so the only repair trigger is one leader-gated full scan.
+// A startup scan still runs once for the listed versions.
+func TestIntentScanDoesNotWakePerVersion(t *testing.T) {
 	intents := &fakeIntentEnsurer{}
-	versions := &fakeVersionSummaryLister{}
+	versions := &fakeVersionSummaryLister{list: []versionapp.VersionSummary{{ID: 42}, {ID: 99}}}
 	wake := newExecutionIntentWake()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,12 +65,9 @@ func TestIntentScanIsEventDriven(t *testing.T) {
 		close(done)
 	}()
 
-	wake.Notify(42)
-	waitUntil(t, 2*time.Second, func() bool { return intents.count(42) >= 1 },
-		"case-confirmed wake did not scan the event's version")
-	if count := intents.count(99); count != 0 {
-		t.Fatalf("unrelated version 99 scanned %d times", count)
-	}
+	// The startup request is a single full scan, not a per-version wake.
+	waitUntil(t, 2*time.Second, func() bool { return intents.count(42) >= 1 && intents.count(99) >= 1 },
+		"the startup repair scan did not cover every listed version")
 
 	cancel()
 	select {

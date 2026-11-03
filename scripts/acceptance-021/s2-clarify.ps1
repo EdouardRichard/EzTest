@@ -47,7 +47,14 @@ param(
     [int] $MaxTurns = 4,
     [int] $ReplyTimeoutSeconds = 180,
     [int] $QuestionBudgetPerRequirement = 6,
-    [int] $VersionWideQuestionBudget = 30,
+    # Product clarification budget per version (spec §5.5/§15). The S2 harness
+    # feeds the 67-requirement document through separate batch-extraction
+    # conversations; those are harness sessions, not user clarification turns, so
+    # the budget is asserted on the primary+convergence conversations only and
+    # the extraction-session exception is recorded in questions.json/result
+    # warnings (never hidden and never claimed as an unqualified version-wide
+    # threshold).
+    [int] $UserClarificationQuestionBudget = 30,
     [string] $RequirementDocumentPath = "D:\project\deliverables\墨栈博客系统需求文档（用户故事与BDD版）.md",
     [int] $ImportMaxEntriesPerBatch = 8,
     [int] $ImportMaxCharsPerBatch = 9000,
@@ -720,26 +727,35 @@ try {
                             $turnQuestionCounts += [pscustomobject]@{ message_id = $record.message_id; questions = $turnQuestions.Count }
                             $allQuestions += $turnQuestions
                         }
-                        $normalized = @()
-                        foreach ($question in $allQuestions) { $normalized += (Get-NormalizedQuestion -Question $question) }
-                        $uniqueNormalized = @(Select-NormalizedUnique -Items $normalized)
-                        $duplicatesQuestions = @()
-                        $seen = [System.Collections.Generic.HashSet[string]]::new()
-                        foreach ($item in $normalized) {
-                            if (-not $seen.Add($item)) { $duplicatesQuestions += $item }
-                        }
+                        # The batch extraction conversations are harness sessions
+                        # that feed the document slices; they are not product
+                        # clarification turns. Measure them separately so the
+                        # report states the full volume honestly without applying
+                        # the user clarification budget to them.
+                        $batchAllQuestions = @()
+                        foreach ($record in $batchQuestionRecords) { $batchAllQuestions += @($record.questions) }
+                        $questionSummary = Get-AcceptanceQuestionBudgetSummary -UserQuestions $allQuestions -BatchQuestions $batchAllQuestions
+                        $uniqueNormalized = [int]$questionSummary.user_unique
+                        $duplicatesQuestions = @($questionSummary.user_duplicates)
+                        $batchUnique = [int]$questionSummary.batch_unique
+                        $allConversationsUnique = [int]$questionSummary.all_unique
                         $budget = $QuestionBudgetPerRequirement * [Math]::Max(1, $requirementCount)
                         Write-S2Evidence -Name "questions.json" -Value ([pscustomobject]@{
-                            scope               = "primary clarification conversation + convergence conversation"
-                            total               = $allQuestions.Count
-                            unique              = $uniqueNormalized.Count
+                            scope               = "user clarification conversations (primary + convergence); S2 harness extraction batches measured separately"
+                            total               = $questionSummary.user_total
+                            unique              = $uniqueNormalized
                             duplicates          = $duplicatesQuestions
                             per_turn            = $turnQuestionCounts
                             requirement_count   = $requirementCount
                             budget              = $budget
-                            version_wide_budget = $VersionWideQuestionBudget
+                            user_clarification_budget = $UserClarificationQuestionBudget
                             batch_conversation_questions = @($batchQuestionRecords | ForEach-Object { [pscustomobject]@{ batch = $_.batch; count = @($_.questions).Count } })
-                        }) -Kind "api" -Note "question budget and duplicates"
+                            batch_questions_total = $questionSummary.batch_total
+                            batch_questions_unique = $batchUnique
+                            all_conversations_total = $questionSummary.all_total
+                            all_conversations_unique = $allConversationsUnique
+                            extraction_session_exception = "S2 batch extraction conversations are acceptance-harness sessions that feed the 67-requirement document; they are not user clarification turns, so the user clarification budget is not claimed for them. The product version-wide budget remains 6/requirement + $UserClarificationQuestionBudget/version on the clarification conversations."
+                        }) -Kind "api" -Note "question budget, duplicates and extraction-session exception"
 
                         $confirmationAsked = $false
                         foreach ($record in $scopedRecords) {
@@ -749,12 +765,14 @@ try {
                             [int]$batchResults.Count + 1
                         Add-AcceptanceCheck -Scenario $scenario -Name "multi-turn clarification exercised" -Passed ($userTurnCount -ge 2) -Severity assertion -Detail "userTurns=$userTurnCount batches=$($batchResults.Count)"
 
-                        Add-AcceptanceCheck -Scenario $scenario -Name "clarification questions asked" -Passed ($uniqueNormalized.Count -gt 0) -Severity assertion `
-                            -Detail "uniqueQuestions=$($uniqueNormalized.Count) total=$($allQuestions.Count) turns=$($scopedRecords.Count)"
-                        Add-AcceptanceCheck -Scenario $scenario -Name "question budget per requirement (<= $QuestionBudgetPerRequirement)" -Passed ($uniqueNormalized.Count -le $budget) -Severity assertion `
-                            -Detail "uniqueQuestions=$($uniqueNormalized.Count) requirements=$requirementCount budget=$budget"
-                        Add-AcceptanceCheck -Scenario $scenario -Name "version-wide question budget (<= $VersionWideQuestionBudget)" -Passed ($uniqueNormalized.Count -le $VersionWideQuestionBudget) -Severity assertion `
-                            -Detail "uniqueQuestions=$($uniqueNormalized.Count) versionBudget=$VersionWideQuestionBudget scope=primary+convergence"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "clarification questions asked" -Passed ($uniqueNormalized -gt 0) -Severity assertion `
+                            -Detail "uniqueQuestions=$($uniqueNormalized) total=$($allQuestions.Count) turns=$($scopedRecords.Count)"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "user clarification question budget per requirement (<= $QuestionBudgetPerRequirement)" -Passed ($uniqueNormalized -le $budget) -Severity assertion `
+                            -Detail "uniqueQuestions=$($uniqueNormalized) requirements=$requirementCount budget=$budget scope=primary+convergence"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "user clarification question budget (<= $UserClarificationQuestionBudget)" -Passed ($uniqueNormalized -le $UserClarificationQuestionBudget) -Severity assertion `
+                            -Detail "uniqueQuestions=$($uniqueNormalized) userBudget=$UserClarificationQuestionBudget scope=primary+convergence (extraction batches excluded by design; see extraction-session observation)"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "extraction-session question volume recorded (observation only; not the user clarification budget)" -Passed $true -Severity warning `
+                            -Detail "observation only: batchSessions=$($batchQuestionRecords.Count) batchQuestions=$($batchAllQuestions.Count) batchUnique=$($batchUnique) allConversationsUnique=$($allConversationsUnique); exception: the batch conversations are S2 harness extraction sessions, not product clarification turns, so the user clarification budget is not applied to them"
                         Add-AcceptanceCheck -Scenario $scenario -Name "no duplicate clarification questions" -Passed ($duplicatesQuestions.Count -eq 0) -Severity assertion `
                             -Detail ("duplicates=" + $(if ($duplicatesQuestions.Count -gt 0) { ($duplicatesQuestions -join " | ") } else { "none" }))
                         Add-AcceptanceCheck -Scenario $scenario -Name "at most 3 questions per assistant turn" -Passed (-not (@($turnQuestionCounts | Where-Object { $_.questions -gt 3 }).Count -gt 0)) -Severity warning `
@@ -834,8 +852,8 @@ try {
                         }
                         Write-S2Evidence -Name "sut-requirements-summary.json" -Value $coverageSummary -Kind "summary" -Note "S2 SUT requirement import summary"
 
-                        if ($stageValue -ne "requirement_review" -or $requirements.Count -eq 0 -or $frCovered -ne 58 -or $nfrCovered -ne 9 -or $coverage.P0Covered -ne $coverage.P0Total -or $v2Created.Count -gt 0 -or $untraceableRequirements.Count -gt 0 -or $duplicates.Count -gt 0 -or $duplicatesQuestions.Count -gt 0 -or $uniqueNormalized.Count -gt $budget -or $uniqueNormalized.Count -gt $VersionWideQuestionBudget) {
-                            $scenario.ErrorMessage = "S2 failed: stage=$stageValue requirements=$requirementCount fr=$frCovered/58 nfr=$nfrCovered/9 p0=$($coverage.P0Covered)/$($coverage.P0Total) v2_created=$($v2Created.Count) untraceable=$($untraceableRequirements.Count) duplicates=$($duplicates.Count) questions=$($uniqueNormalized.Count)/$budget (version-wide $VersionWideQuestionBudget)"
+                        if ($stageValue -ne "requirement_review" -or $requirements.Count -eq 0 -or $frCovered -ne 58 -or $nfrCovered -ne 9 -or $coverage.P0Covered -ne $coverage.P0Total -or $v2Created.Count -gt 0 -or $untraceableRequirements.Count -gt 0 -or $duplicates.Count -gt 0 -or $duplicatesQuestions.Count -gt 0 -or $uniqueNormalized -gt $budget -or $uniqueNormalized -gt $UserClarificationQuestionBudget) {
+                            $scenario.ErrorMessage = "S2 failed: stage=$stageValue requirements=$requirementCount fr=$frCovered/58 nfr=$nfrCovered/9 p0=$($coverage.P0Covered)/$($coverage.P0Total) v2_created=$($v2Created.Count) untraceable=$($untraceableRequirements.Count) duplicates=$($duplicates.Count) userClarificationQuestions=$($uniqueNormalized)/$budget (user budget $UserClarificationQuestionBudget) batchQuestions=$($batchAllQuestions.Count)"
                         }
                     }
                 }

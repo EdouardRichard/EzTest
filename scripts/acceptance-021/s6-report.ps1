@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     S6 report, cancel and per-case evidence acceptance for EzTest 0.2.1.

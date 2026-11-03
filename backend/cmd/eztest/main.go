@@ -738,11 +738,15 @@ func parseCaseBindingID(value string) int64 {
 // runExecutionScheduler drives the event-driven intent scan, wave planner and
 // recovery sweep. The scan is stage-gated (Task 78): only versions at executing
 // create initial intents, so a case confirmation at the case gate can never
-// auto-create a wave. A positive scanInterval restores the old periodic full
-// scan as a compatibility switch until P10 acceptance. The scan is idempotent
-// (P3 §5.1). Errors are logged and retried; the loop exits with the process
-// context. The whole tick is leader-gated (P7 §4.5: scheduler+recovery run on
-// the leader only; in-flight work stays protected by leases).
+// auto-create a wave. Since Task 82 it is also selection-scoped (D23): the scan
+// refreshes only the case_ids frozen on the persisted execute.batch stage-entry
+// job, and a version without that persisted selection is a typed skip (the R49
+// stage-entry recovery re-enqueues the scoped job). A positive scanInterval
+// restores the old periodic full scan as a compatibility switch until P10
+// acceptance. The scan is idempotent (P3 §5.1). Errors are logged and retried;
+// the loop exits with the process context. The whole tick is leader-gated
+// (P7 §4.5: scheduler+recovery run on the leader only; in-flight work stays
+// protected by leases).
 func runExecutionScheduler(
 	ctx context.Context,
 	gate orchestrationapp.LeaderGate,
@@ -761,6 +765,13 @@ func runExecutionScheduler(
 			return
 		}
 		if _, err := intents.EnsureInitialIntents(ctx, versionID); err != nil && !errors.Is(err, context.Canceled) {
+			if errors.Is(err, executionapp.ErrNoPersistedBatchSelection) {
+				// Typed skip: no persisted execute.batch selection means there is
+				// no safe scope. R49 stage-entry recovery re-enqueues the scoped
+				// job; the scan must not fall back to every confirmed case.
+				log.Printf("eztest: execution intent repair scan: version %d: skipped: %v", versionID, err)
+				return
+			}
 			log.Printf("eztest: execution intent scan: version %d: %v", versionID, err)
 		}
 	}
@@ -779,20 +790,16 @@ func runExecutionScheduler(
 			ensureIntents(summary.ID)
 		}
 	}
-	// flushIntents only consumes the pending wake while this replica is the
-	// leader, so a follower keeps the request armed until it acquires
-	// leadership (the 1s tick retries the flush).
+	// flushIntents only consumes the pending full-scan request while this
+	// replica is the leader, so a follower keeps the request armed until it
+	// acquires leadership (the 1s tick retries the flush).
 	flushIntents := func() {
 		if wake == nil {
 			return
 		}
 		p7RunGated(gate, func() {
-			versionIDs, scanAll := wake.take()
-			if scanAll {
+			if wake.takeScanAll() {
 				scanIntents()
-			}
-			for _, versionID := range versionIDs {
-				ensureIntents(versionID)
 			}
 		})
 	}
@@ -1146,10 +1153,15 @@ func main() {
 		Intents:  executionRepo.Intents,
 		Cases:    executionCases,
 		Versions: executionVersionAdapter,
-		IDs:      ids,
-		Clock:    clk,
-		Events:   eventSvc,
-		Audit:    auditSvc,
+		// The startup/leader repair scan may only refresh the case_ids frozen on
+		// the newest execute.batch work item (D23); the work-item repository is
+		// the persistence of that selection. A missing item is a typed repair
+		// skip, never an unscoped scan over every confirmed case.
+		BatchSelections: workItems,
+		IDs:             ids,
+		Clock:           clk,
+		Events:          eventSvc,
+		Audit:           auditSvc,
 	})
 	executionAnalysis := executionapp.NewAnalysisService(executionapp.AnalysisServiceDeps{
 		Waves:        executionRepo.Waves,

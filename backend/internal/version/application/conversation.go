@@ -104,8 +104,12 @@ func (s *ConversationService) CreateWithModel(ctx context.Context, versionID int
 			return ConversationView{}, err
 		}
 		if count == 0 {
-			return ConversationView{}, platform.NewError(http.StatusConflict, "design_requirements_missing",
+			apiErr := platform.NewError(http.StatusConflict, "design_requirements_missing",
 				"design requires at least one clarified requirement; confirm a requirement before starting the design conversation")
+			apiErr.Details = map[string]any{
+				"next_action": "confirm at least one requirement at the requirement gate, then start the design conversation",
+			}
+			return ConversationView{}, apiErr
 		}
 	}
 	title = strings.TrimSpace(title)

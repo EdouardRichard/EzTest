@@ -1,11 +1,14 @@
 package main
 
-// Event-driven execution intent scan (P2-T5 fix round; revised by Task 78).
+// Event-driven execution intent scan (P2-T5 fix round; revised by Task 78 and
+// Task 82).
 //
 // Execution intents are only refreshed by the explicit execute.batch stage job
 // at executing. The wake remains for the leader/startup repair scan; case
 // confirmations no longer wake it, because a case confirmed before the case hard
-// gate must not auto-create an intent or wave.
+// gate must not auto-create an intent or wave. The repair scan itself is
+// selection-scoped (D23): it reads the case_ids persisted on the execute.batch
+// stage-entry work item and treats a missing selection as a typed skip.
 
 import (
 	"context"
@@ -18,7 +21,8 @@ import (
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
-// intentEnsurer is the execution intent scan surface (*executionapp.IntentService).
+// intentEnsurer is the execution intent repair-scan surface
+// (*executionapp.IntentService).
 type intentEnsurer interface {
 	EnsureInitialIntents(ctx context.Context, versionID int64) (int, error)
 }
@@ -29,38 +33,24 @@ type versionSummaryLister interface {
 	List(ctx context.Context, limit int, beforeID *int64) ([]versionapp.VersionSummary, bool, error)
 }
 
-// executionIntentWake coalesces case-confirmed events into pending version IDs.
-// The observer only records the affected version; the leader-gated scheduler
-// loop performs the database work, so a slow scan never blocks the publishing
-// request. scanAll is the startup/leader fallback: it stays set until a leader
-// actually executes the full scan.
+// executionIntentWake holds the one leader/startup repair request. It is a
+// coalescing flag rather than a per-version queue: a single full scan covers
+// every version, and the leader-gated scheduler performs the database work so a
+// slow scan never blocks an event observer. scanAll stays set until a leader
+// actually executes the scan.
 type executionIntentWake struct {
 	mu      sync.Mutex
-	pending map[int64]struct{}
 	scanAll bool
 	signal  chan struct{}
 }
 
 func newExecutionIntentWake() *executionIntentWake {
 	return &executionIntentWake{
-		pending: make(map[int64]struct{}),
-		signal:  make(chan struct{}, 1),
+		signal: make(chan struct{}, 1),
 	}
 }
 
-// Notify records one version whose case confirmation may need an intent scan.
-// An unknown/zero version is ignored: the full scan covers it.
-func (w *executionIntentWake) Notify(versionID int64) {
-	if w == nil || versionID <= 0 {
-		return
-	}
-	w.mu.Lock()
-	w.pending[versionID] = struct{}{}
-	w.mu.Unlock()
-	w.wake()
-}
-
-// NotifyScanAll asks for one full intent scan (startup and post-failover). The
+// NotifyScanAll asks for one full repair scan (startup and post-failover). The
 // request survives follower ticks until a leader executes it.
 func (w *executionIntentWake) NotifyScanAll() {
 	if w == nil {
@@ -72,19 +62,14 @@ func (w *executionIntentWake) NotifyScanAll() {
 	w.wake()
 }
 
-// take drains the pending wake state. It must only be called while the caller
-// holds leadership, otherwise the requests would be lost.
-func (w *executionIntentWake) take() ([]int64, bool) {
+// takeScanAll drains the pending full-scan request. It must only be called
+// while the caller holds leadership, otherwise the request would be lost.
+func (w *executionIntentWake) takeScanAll() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	ids := make([]int64, 0, len(w.pending))
-	for versionID := range w.pending {
-		ids = append(ids, versionID)
-	}
-	w.pending = make(map[int64]struct{})
 	scanAll := w.scanAll
 	w.scanAll = false
-	return ids, scanAll
+	return scanAll
 }
 
 // events exposes the coalescing signal; a nil wake yields a nil channel so the

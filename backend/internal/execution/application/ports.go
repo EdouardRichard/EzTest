@@ -23,6 +23,16 @@ type SettingsReader interface {
 	Bool(ctx context.Context, key string) (bool, error)
 }
 
+// BatchSelectionReader reads the case selection frozen by the execute.batch
+// stage-entry job (D23). The 0.2.1 job persists its case_ids on the work item;
+// the composition-root adapter projects the newest execute.batch item. found
+// distinguishes "no persisted selection" (typed repair skip) from an explicit
+// empty selection, which keeps the contract's "all current confirmed cases"
+// meaning.
+type BatchSelectionReader interface {
+	ExecuteBatchSelection(ctx context.Context, versionID int64) (caseIDs []int64, found bool, err error)
+}
+
 // IntentRepository persists execution_intent rows.
 type IntentRepository interface {
 	Create(ctx context.Context, intent execution.ExecutionIntent) error
