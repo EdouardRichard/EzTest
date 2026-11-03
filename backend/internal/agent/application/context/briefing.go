@@ -585,8 +585,26 @@ func executionBody(in ExecutionSnapshot) string {
 	return body
 }
 
+// knowledgeApprovedStatus is the only knowledge status eligible for injection
+// (spec §10.1). A snapshot without a status is treated as approved for
+// compatibility with read ports that only return injectable rows.
+const knowledgeApprovedStatus = "approved"
+
+// knowledgeBody renders the injectable knowledge top-K. Items that are not
+// approved or whose source version is gone (SourceStale) are never injected;
+// the version briefing is read-only diagnosis input, not a revocation bypass.
 func knowledgeBody(items []KnowledgeSnapshot) string {
-	ranked := append([]KnowledgeSnapshot(nil), items...)
+	injectable := make([]KnowledgeSnapshot, 0, len(items))
+	for _, item := range items {
+		if item.SourceStale {
+			continue
+		}
+		if item.Status != "" && item.Status != knowledgeApprovedStatus {
+			continue
+		}
+		injectable = append(injectable, item)
+	}
+	ranked := injectable
 	sort.Slice(ranked, func(left, right int) bool {
 		if compared := compareConfidence(ranked[left].Confidence, ranked[right].Confidence); compared != 0 {
 			return compared < 0

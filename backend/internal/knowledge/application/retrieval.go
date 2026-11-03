@@ -100,6 +100,11 @@ type RetrievalPage struct {
 // second, unfiltered pass and only admits items that do not *conflict* with any
 // queried dimension. Strict hits always outrank fallback hits. The containment
 // primitive itself is untouched.
+//
+// Source-stale policy (R87): an item whose bound source version no longer
+// exists is filtered out, exactly like Inject. A failing source read is treated
+// as "not stale" (the same fail-open policy as the read-time source_stale
+// marker), so a broken version lookup can never silently hide knowledge.
 func (s *Service) Retrieve(ctx context.Context, query Query) (RetrievalPage, error) {
 	if err := s.requireRepo(); err != nil {
 		return RetrievalPage{}, err
@@ -179,12 +184,18 @@ func (s *Service) Retrieve(ctx context.Context, query Query) (RetrievalPage, err
 	}
 	scored := make([]scoredRetrieval, 0, len(strictCandidates)+len(genericCandidates))
 	seen := make(map[int64]struct{}, len(strictCandidates)+len(genericCandidates))
+	// One source-existence probe per distinct source version, shared by the
+	// strict and generic passes (the same cache policy as the read marker).
+	sourceCache := make(map[int64]bool)
 	add := func(items []knowledge.Item) {
 		for _, item := range items {
 			if _, duplicate := seen[item.ID]; duplicate {
 				continue
 			}
 			if !searchableItem(item, systemKeys) {
+				continue
+			}
+			if s.sourceStaleCached(ctx, item, sourceCache) {
 				continue
 			}
 			matched, total, conflict := bindingMatch(item.Bindings, bindings)

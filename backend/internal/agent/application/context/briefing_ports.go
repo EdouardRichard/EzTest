@@ -99,6 +99,14 @@ type KnowledgeSnapshot struct {
 	Title      string
 	Summary    string
 	Confidence *float64
+	// Status is the knowledge review/verification state ("approved",
+	// "suspect", "stale", ...). The briefing only injects approved items; an
+	// empty value means the read port did not supply the state and the item is
+	// rendered (the production reader already filters approved rows in SQL).
+	Status string
+	// SourceStale is the read-time marker of a knowledge item whose source
+	// version no longer exists. It is never injected.
+	SourceStale bool
 }
 
 // OpenQuestionsSnapshot is the unresolved question and human-request set.
