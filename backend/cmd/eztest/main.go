@@ -944,6 +944,8 @@ func main() {
 		Events:        eventSvc,
 		Accounts:      resourceSvc,
 		Versions:      versionSvc,
+		Requirements:  requirementSvc,
+		Design:        designGraph,
 		ExecutorURL:   executorURL,
 		ExecutorToken: executorToken,
 		Now:           clk.Now,
@@ -952,6 +954,10 @@ func main() {
 		log.Fatalf("eztest: wire P9 explore runtime: %v", err)
 	}
 	p9ExploreRuntime = p9rt
+	// The case author reads the exploration facts (page/API/gap/login) through
+	// its design graph read: the design graph holds the same process-wide fact
+	// store the explore runtime writes (Task 37).
+	designGraph.SetDiscoveryFacts(p9FactRecords{facts: p9rt.Facts})
 	executorRegistry := executionapp.NewRegistry(executionapp.RegistryDeps{
 		Repo:     executionRepo.Executors,
 		Probe:    executionadapters.NewExecutorProbe(executorClient),
@@ -1405,6 +1411,13 @@ func main() {
 		if event.Type == designCaseConfirmedEvent {
 			intentWake.Notify(versionID)
 		}
+		// P9 explore analysis (Task 37): every version-scoped event schedules a
+		// coalesced, leader-gated gap/coverage refresh. The analysis performs
+		// its page probes through the shared explore runtime (Login first,
+		// serialized, page-scoped close).
+		if versionID > 0 && p9rt != nil && p9rt.Analysis != nil {
+			p9rt.Analysis.Notify(versionID)
+		}
 		return nil
 	}
 	eventSvc.Observe(wake)
@@ -1426,6 +1439,17 @@ func main() {
 	go func() {
 		defer background.Done()
 		runExecutorPoller(ctx, p7OrchestrationRuntime.Leader, executorRegistry, settingsSvc)
+	}()
+	// P9 explore analysis consumer (Task 37, R93): the leader-gated refresh loop
+	// that drives GapAnalysis/Coverage/CaseAugment over the shared explore
+	// runtime. Only the leader probes/writes, and a per-version debounce keeps
+	// an event storm to one refresh per interval.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		p9rt.Analysis.Run(ctx, func() bool {
+			return p7OrchestrationRuntime.Leader != nil && p7OrchestrationRuntime.Leader.IsLeader()
+		})
 	}()
 
 	// P7 background loops: leader election, SSE listener, instance maintenance,

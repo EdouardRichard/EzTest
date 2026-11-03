@@ -31,14 +31,15 @@ type CaseRunStatusReader interface {
 // GraphService serves graph/case reads, the case.graph_propose write path, user
 // confirmations, review/data-plan submissions.
 type GraphService struct {
-	repo     design.Repository
-	ids      platformid.Generator
-	clock    clock.Clock
-	audit    auditapp.Recorder
-	events   eventingapp.Publisher
-	teamRoom TeamRoom
-	reopener VersionReopener
-	caseRuns CaseRunStatusReader
+	repo      design.Repository
+	ids       platformid.Generator
+	clock     clock.Clock
+	audit     auditapp.Recorder
+	events    eventingapp.Publisher
+	teamRoom  TeamRoom
+	reopener  VersionReopener
+	caseRuns  CaseRunStatusReader
+	discovery DiscoveryFactsReader
 }
 
 // NewGraphService wires the graph service. audit, events and teamRoom are

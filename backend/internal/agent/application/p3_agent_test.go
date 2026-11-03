@@ -166,6 +166,14 @@ func TestP3ProfilesToolsAndBudgets(t *testing.T) {
 			t.Fatalf("failure_analyst is missing tool %q", required)
 		}
 	}
+	// Task 37 (P9 capability #7): the failure analyst must consume the
+	// deterministic attribution and hand off a problem draft / retry-vs-human
+	// decision instead of inventing its own classification.
+	for _, required := range []string{"归因", "重试", "人工", "问题单草稿"} {
+		if !strings.Contains(failure.SystemPrompt, required) {
+			t.Fatalf("failure_analyst prompt is missing the %q handoff contract", required)
+		}
+	}
 
 	coverage, ok := profileByKey(profiles, agentapp.ProfileKeyCoverageAnalyst)
 	if !ok {
