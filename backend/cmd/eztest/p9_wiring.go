@@ -53,6 +53,11 @@ const (
 	p9AnalysisMaxProbes       = 3
 	p9AnalysisMaxDiscovered   = 20
 	p9AnalysisWakeBuffer      = 64
+	// A discovery login can hit a transient executor condition (page cap reached
+	// by a concurrent execution run, executor still starting). Retry the
+	// retry_login outcomes a few times before giving up for this debounce window.
+	p9LoginRetryAttempts     = 3
+	p9LoginRetryDefaultDelay = 1 * time.Second
 )
 
 // p9RequirementReader is the version requirement read surface the analysis
@@ -207,6 +212,9 @@ type p9Analysis struct {
 	debounce *p9AnalysisDebounce
 	wake     chan int64
 	logf     func(format string, args ...any)
+	// loginRetryDelay is the pause between retry_login discovery attempts. It
+	// is a field so the retry test does not sleep.
+	loginRetryDelay time.Duration
 }
 
 // newP9Analysis wires the analysis services over the explore runtime. Coverage
@@ -247,6 +255,8 @@ func newP9Analysis(deps p9AnalysisDeps) (*p9Analysis, error) {
 		debounce: newP9AnalysisDebounce(p9AnalysisMinInterval, now),
 		wake:     make(chan int64, p9AnalysisWakeBuffer),
 		logf:     log.Printf,
+
+		loginRetryDelay: p9LoginRetryDefaultDelay,
 	}, nil
 }
 
@@ -420,23 +430,54 @@ func (r p9SessionRuntime) OpenWithSession(ctx context.Context, cfg exploreapp.Lo
 	return r.runtime.OpenWithSession(ctx, cfg, url)
 }
 
-// loginForDiscovery logs in once for the discovery pre-pass. A blocked or failed
+// loginForDiscovery logs in once for the discovery pre-pass, retrying the
+// transient retry_login outcomes a bounded number of times. A blocked or failed
 // login is reported in the result and skips discovery, but never fails the
 // static analysis. ok is false when there is no runtime to log in with.
 func (a *p9Analysis) loginForDiscovery(ctx context.Context, versionID int64, binding p9LoginBinding) (exploreapp.SessionFact, bool) {
 	if a.deps.Runtime == nil {
 		return exploreapp.SessionFact{}, false
 	}
-	fact, err := a.deps.Runtime.Login(ctx, exploreapp.LoginFlowConfig{
-		VersionID:     versionID,
-		VersionSUTID:  binding.versionSUTID,
-		EnvironmentID: binding.environmentID,
-		Role:          binding.role,
-		LoginURL:      binding.loginURL,
-	})
-	if err != nil {
-		a.logf("eztest: P9 explore analysis version=%d login for discovery failed: %v", versionID, err)
-		return exploreapp.SessionFact{}, false
+	logf := a.logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	delay := a.loginRetryDelay
+	if delay < 0 {
+		delay = 0
+	}
+	var fact exploreapp.SessionFact
+	for attempt := 1; attempt <= p9LoginRetryAttempts; attempt++ {
+		var err error
+		fact, err = a.deps.Runtime.Login(ctx, exploreapp.LoginFlowConfig{
+			VersionID:     versionID,
+			VersionSUTID:  binding.versionSUTID,
+			EnvironmentID: binding.environmentID,
+			Role:          binding.role,
+			LoginURL:      binding.loginURL,
+		})
+		if err != nil {
+			logf("eztest: P9 explore analysis version=%d login for discovery failed: %v", versionID, err)
+			return exploreapp.SessionFact{}, false
+		}
+		if fact.Status == exploreapp.SessionActive || fact.Action != exploreapp.ActionRetryLogin {
+			break
+		}
+		if attempt < p9LoginRetryAttempts {
+			logf("eztest: P9 explore analysis version=%d login for discovery transient (attempt %d/%d): reason=%s action=%s",
+				versionID, attempt, p9LoginRetryAttempts, fact.Reason, fact.Action)
+			if delay > 0 {
+				select {
+				case <-ctx.Done():
+					return fact, true
+				case <-time.After(delay):
+				}
+			}
+		}
+	}
+	if fact.Status != exploreapp.SessionActive {
+		logf("eztest: P9 explore analysis version=%d login for discovery blocked: reason=%s action=%s",
+			versionID, fact.Reason, fact.Action)
 	}
 	return fact, true
 }
@@ -525,6 +566,9 @@ type p9LoginBinding struct {
 	environmentID int64
 	role          string
 	loginURL      string
+	// environmentBaseURL is the bound environment base URL. It is the login and
+	// crawl seed fallback when the version binds no page resources.
+	environmentBaseURL string
 	// pageURLs are the absolute bound page URLs the discovery crawl can seed.
 	pageURLs []string
 }
@@ -542,12 +586,22 @@ func (a *p9Analysis) loginBinding(ctx context.Context, versionID int64) p9LoginB
 			continue
 		}
 		role := p9FirstAccountRole(binding.Accounts)
+		environmentBaseURL := strings.TrimSpace(binding.Environment.BaseURL)
+		loginURL := p9LoginPageURL(binding.Pages)
+		// A version may bind no page resources (the S1 acceptance binds only the
+		// SUT/environment/accounts/repository). The environment base URL is the
+		// only navigable location then: it seeds the fresh login (which can open
+		// a modal login trigger) and the page crawl.
+		if loginURL == "" {
+			loginURL = environmentBaseURL
+		}
 		return p9LoginBinding{
-			versionSUTID:  binding.ID,
-			environmentID: parseCaseBindingID(binding.Environment.ID),
-			role:          role,
-			loginURL:      p9LoginPageURL(binding.Pages),
-			pageURLs:      p9PageURLs(binding.Pages),
+			versionSUTID:       binding.ID,
+			environmentID:      parseCaseBindingID(binding.Environment.ID),
+			environmentBaseURL: environmentBaseURL,
+			role:               role,
+			loginURL:           loginURL,
+			pageURLs:           p9PageURLs(binding.Pages),
 		}
 	}
 	return p9LoginBinding{}

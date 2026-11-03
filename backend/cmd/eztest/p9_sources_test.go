@@ -7,6 +7,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -108,5 +110,72 @@ func TestP9SourceProvider(t *testing.T) {
 	}
 	if _, err := newP9SourceProviderWithGit(nil, nil).SourceFiles(context.Background(), 1001); err == nil {
 		t.Fatal("SourceFiles must fail closed without a version reader")
+	}
+}
+
+// TestP9SourceProviderFallsBackToWorkingTreeWithoutGit covers a bound SUT
+// source directory that is not a git repository (the 墨栈博客 acceptance SUT).
+// The git reader fails, so the provider must read the bounded working tree
+// instead of silently returning no files and therefore no API facts.
+func TestP9SourceProviderFallsBackToWorkingTreeWithoutGit(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("blog-backend/internal/server/routes.go", "package server\n\nfunc Register(r *gin.Engine) {\n\tr.GET(\"/api/v1/posts\", listPosts)\n}\n")
+	write("blog-backend/vendor/ignored.go", "package ignored\n")
+	write("blog-backend/node_modules/ignored.go", "package ignored\n")
+	write("blog-frontend/src/api/client.ts", "export const list = () => request('/api/v1/posts')\n")
+	write("blog-backend/readme.md", "# docs\n")
+	write("blog-backend/huge.go", strings.Repeat("x", int(codeintelapp.DefaultStaticMaxFileBytes)+1))
+	write("blog-backend/binary.go", "package bin\x00\x01\x02\n")
+
+	git := &fakeP9SourceGit{
+		listErr: map[string]error{root: errors.New("git: not a repository")},
+	}
+	view := versionapp.VersionView{
+		ID: 1002,
+		Bindings: []versionapp.BindingView{{ID: 79, Repository: &resourceapp.CodeRepositoryView{
+			ID: "1301", Name: "墨栈博客", Path: root, Branch: "master",
+			Include: []string{"**/*.go"}, Exclude: []string{"**/vendor/**", "**/node_modules/**"},
+		}}},
+	}
+	provider := newP9SourceProviderWithGit(git, &fakeP9Versions{view: view})
+	files, err := provider.SourceFiles(context.Background(), 1002)
+	if err != nil {
+		t.Fatalf("SourceFiles: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "blog-backend/internal/server/routes.go" {
+		t.Fatalf("working-tree files = %+v, want only the route source", files)
+	}
+	if !strings.Contains(files[0].Content, "r.GET") {
+		t.Fatalf("content = %q", files[0].Content)
+	}
+
+	// Without an include filter the same fallback also returns frontend source
+	// and skips binary/large/vendor files.
+	view.Bindings[0].Repository.Include = nil
+	view.Bindings[0].Repository.Exclude = nil
+	files, err = provider.SourceFiles(context.Background(), 1002)
+	if err != nil {
+		t.Fatalf("SourceFiles without filters: %v", err)
+	}
+	paths := map[string]bool{}
+	for _, file := range files {
+		paths[file.Path] = true
+	}
+	if !paths["blog-backend/internal/server/routes.go"] || !paths["blog-frontend/src/api/client.ts"] || !paths["blog-backend/readme.md"] {
+		t.Fatalf("unfiltered working-tree files = %v", paths)
+	}
+	for _, skipped := range []string{"blog-backend/vendor/ignored.go", "blog-backend/node_modules/ignored.go", "blog-backend/huge.go", "blog-backend/binary.go"} {
+		if paths[skipped] {
+			t.Fatalf("fallback read %q (must stay bounded)", skipped)
+		}
 	}
 }

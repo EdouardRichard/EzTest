@@ -43,6 +43,7 @@ type runnerFixture struct {
 	knowledgeUsage  *fakeKnowledgeUsageRecorder
 	knowledgeWriter *fakeKnowledgeWriter
 	briefing        *fakeBriefingSource
+	clarification   *fakeClarificationConverger
 	load            *load.Counter
 }
 
@@ -96,6 +97,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		knowledgeUsage:  &fakeKnowledgeUsageRecorder{},
 		knowledgeWriter: &fakeKnowledgeWriter{},
 		briefing:        defaultAssemblyBriefing(),
+		clarification:   &fakeClarificationConverger{},
 		load:            &load.Counter{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
@@ -115,6 +117,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		Knowledge:      fixture.knowledge,
 		KnowledgeUsage: fixture.knowledgeUsage,
 		Briefing:       agentcontext.NewBriefingBuilder(fixture.briefing),
+		Clarification:  fixture.clarification,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Load:           fixture.load,
 		TaskProvider:   taskProvider,
@@ -1029,5 +1032,62 @@ func TestRunnerTracksLoadDuringRun(t *testing.T) {
 	}
 	if got := fixture.load.Value(); got != 0 {
 		t.Fatalf("load after run = %d, want 0", got)
+	}
+}
+
+// fakeClarificationConverger records the production convergence calls the
+// clarification host turn makes.
+type fakeClarificationConverger struct {
+	calls []int64
+	err   error
+}
+
+func (f *fakeClarificationConverger) Converge(_ context.Context, versionID int64) error {
+	f.calls = append(f.calls, versionID)
+	return f.err
+}
+
+var _ agentapp.ClarificationConverger = (*fakeClarificationConverger)(nil)
+
+// TestRunnerHostConvergesClarificationAtRequirementConfirmation proves the
+// production clarifying→requirement_review caller: an assistant turn that
+// explicitly requests requirement confirmation converges the version, after the
+// message is persisted.
+func TestRunnerHostConvergesClarificationAtRequirementConfirmation(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{
+		Content: "## 需求确认请求\n\n1. 是否确认以上 4 条草案按当前内容定稿？\n2. 是否保留已提议的需求关系？",
+	}}
+
+	item := hostItem()
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(fixture.conv.appended) != 1 {
+		t.Fatalf("assistant messages = %d, want 1", len(fixture.conv.appended))
+	}
+	if len(fixture.clarification.calls) != 1 || fixture.clarification.calls[0] != item.VersionID {
+		t.Fatalf("convergence calls = %v, want [%d]", fixture.clarification.calls, item.VersionID)
+	}
+}
+
+// TestRunnerHostDoesNotConvergeOnClarifyingQuestion keeps the edge precise: a
+// turn that still asks clarification questions must not advance the stage, even
+// when it mentions the requirement confirmation gate.
+func TestRunnerHostDoesNotConvergeOnClarifyingQuestion(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{
+		Content: "先问三个最影响拆分的问题：\n1. 角色有哪些？\n2. 文章状态有几种？\n3. 评论是否需要登录？\n最后我会把结论整理成需求草案，停在需求确认门等你确认。",
+	}}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fixture.clarification.calls) != 0 {
+		t.Fatalf("a clarifying question converged the version: %v", fixture.clarification.calls)
 	}
 }

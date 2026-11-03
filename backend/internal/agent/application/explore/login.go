@@ -404,6 +404,19 @@ func NewLoginFlow(cfg LoginFlowConfig, deps LoginFlowDeps) *LoginFlow {
 
 /* ------------------------------- detection -------------------------------- */
 
+// Login-trigger fallback bounds. A modal SPA renders the form asynchronously
+// after the trigger click, so detection polls a small, fixed number of
+// snapshots instead of trusting the first one.
+const (
+	loginTriggerSnapshots = 5
+	loginTriggerPollDelay = 200 * time.Millisecond
+	// The SUT login request is asynchronous: the submit click returns before the
+	// modal closes. Poll a bounded number of post-submit snapshots so a slow
+	// login is not reported as login_rejected.
+	loginVerifyAttempts = 10
+	loginVerifyDelay    = 300 * time.Millisecond
+)
+
 var (
 	usernameHints = regexp.MustCompile(`(?i)user|login|email|account|phone|账号|用户名|邮箱|手机号`)
 	submitHints   = regexp.MustCompile(`(?i)\blog\s*-?\s*in\b|\bsign\s*-?\s*in\b|submit|登录|登陆|提交`)
@@ -417,8 +430,10 @@ var (
 )
 
 // Detect reads the current page snapshot, finds the username/password/submit
-// selectors and remembers the form for Execute. A page without a password field
-// returns a *BlockedError with a recovery action.
+// selectors and remembers the form for Execute. When the page has no visible
+// form (SPA login modals), it clicks one visible login trigger and re-reads the
+// page. A page without a password field after that returns a *BlockedError with
+// a recovery action.
 func (f *LoginFlow) Detect(ctx context.Context, page Page) (LoginForm, error) {
 	if f.exec == nil {
 		return LoginForm{}, errors.New("login flow has no executor")
@@ -440,7 +455,10 @@ func (f *LoginFlow) Detect(ctx context.Context, page Page) (LoginForm, error) {
 	if page.URL == "" {
 		page.URL = snapshot.URL
 	}
-	form, blocked := detectLoginForm(snapshot, page)
+	form, blocked, detectErr := f.detectFormWithTrigger(ctx, page, snapshot)
+	if detectErr != nil {
+		return LoginForm{}, detectErr
+	}
 	if blocked != nil {
 		return LoginForm{}, blocked
 	}
@@ -449,13 +467,145 @@ func (f *LoginFlow) Detect(ctx context.Context, page Page) (LoginForm, error) {
 	return form, nil
 }
 
+// detectFormWithTrigger detects a login form from one snapshot and, when the
+// form is behind a login trigger (button/link/modal opener), clicks that
+// trigger once and waits a bounded number of snapshots for the form to render.
+// A blocked outcome is returned as *BlockedError; only executor/transport
+// failures are Go errors.
+func (f *LoginFlow) detectFormWithTrigger(ctx context.Context, page Page, snapshot pageSnapshot) (LoginForm, *BlockedError, error) {
+	form, blocked := detectLoginForm(snapshot, page)
+	if blocked == nil {
+		return form, nil, nil
+	}
+	if blocked.Reason != "login_form_not_found" {
+		return LoginForm{}, blocked, nil
+	}
+	trigger, ok := loginTriggerSelector(snapshot.DOM.Elements)
+	if !ok {
+		return LoginForm{}, blocked, nil
+	}
+	if _, err := f.exec.Action(ctx, actionClick, map[string]any{
+		"page_id": page.ID, "selector": trigger,
+	}); err != nil {
+		if isExecutorActionFailure(err) {
+			return LoginForm{}, &BlockedError{
+				Reason: "login_trigger_failed", Action: ActionManualLogin, PageID: page.ID,
+			}, nil
+		}
+		return LoginForm{}, nil, fmt.Errorf("open login form: %w", err)
+	}
+	pageID := page.ID
+	for attempt := 0; attempt < loginTriggerSnapshots; attempt++ {
+		if attempt > 0 {
+			time.Sleep(loginTriggerPollDelay)
+		}
+		result, err := f.exec.Action(ctx, actionSnapshot, map[string]any{"page_id": pageID})
+		if err != nil {
+			return LoginForm{}, nil, fmt.Errorf("snapshot login form: %w", err)
+		}
+		opened, err := decodePageSnapshot(result)
+		if err != nil {
+			return LoginForm{}, nil, err
+		}
+		if strings.TrimSpace(opened.PageID) != "" {
+			pageID = opened.PageID
+		}
+		formURL := strings.TrimSpace(opened.URL)
+		if formURL == "" {
+			formURL = strings.TrimSpace(page.URL)
+		}
+		form, blocked = detectLoginForm(opened, Page{ID: pageID, URL: formURL})
+		if blocked == nil {
+			return form, nil, nil
+		}
+		if blocked.Reason != "login_form_not_found" {
+			return LoginForm{}, blocked, nil
+		}
+	}
+	return LoginForm{}, &BlockedError{
+		Reason: "login_form_not_found", Action: ActionManualLogin, PageID: pageID,
+	}, nil
+}
+
+// loginTriggerSelector finds one visible, actionable login trigger (a header
+// "登录"/"Sign in" button or link) in a pre-form page inventory. Submitting a
+// hidden/absent form is not a trigger: only a rendered control that names a
+// login action qualifies.
+func loginTriggerSelector(elements []Element) (string, bool) {
+	for _, element := range elements {
+		if element.Disabled || !elementVisible(element) || strings.TrimSpace(element.Selector) == "" {
+			continue
+		}
+		tag := strings.ToLower(strings.TrimSpace(element.Tag))
+		role := strings.ToLower(strings.TrimSpace(element.Role))
+		if tag != "button" && tag != "a" && role != "button" && role != "link" {
+			continue
+		}
+		if loginHints.MatchString(element.Name + " " + element.Text) {
+			return element.Selector, true
+		}
+	}
+	return "", false
+}
+
+// awaitLoginOutcome polls the submitted page until the login form disappears or
+// a credential error is rendered. The SUT's login request is asynchronous, so
+// the first post-submit snapshot can still show the modal; a bounded delay keeps
+// a slow success from being reported as login_rejected without waiting forever.
+func (f *LoginFlow) awaitLoginOutcome(ctx context.Context, pageID string, snapshot pageSnapshot) (pageSnapshot, error) {
+	for attempt := 1; attempt <= loginVerifyAttempts; attempt++ {
+		if !loginStillVisible(snapshot) || loginCredentialError(snapshot) {
+			return snapshot, nil
+		}
+		if attempt == loginVerifyAttempts {
+			return snapshot, nil
+		}
+		select {
+		case <-ctx.Done():
+			return snapshot, ctx.Err()
+		case <-time.After(loginVerifyDelay):
+		}
+		result, err := f.exec.Action(ctx, actionSnapshot, map[string]any{
+			"page_id": pageID, "include_storage_state": true,
+		})
+		if err != nil {
+			return pageSnapshot{}, err
+		}
+		next, err := decodePageSnapshot(result)
+		if err != nil {
+			return pageSnapshot{}, err
+		}
+		if next.PageID != "" {
+			pageID = next.PageID
+		}
+		snapshot = next
+	}
+	return snapshot, nil
+}
+
+func loginCredentialError(snapshot pageSnapshot) bool {
+	return credentialErr.MatchString(snapshot.DOM.ARIA) || credentialErr.MatchString(errorText(snapshot.DOM.Elements))
+}
+
+func isExecutorActionFailure(err error) bool {
+	var actionErr *ExecutorActionError
+	return errors.As(err, &actionErr)
+}
+
 // Execute logs in with account and returns the resulting session fact. A cached
 // storage state is re-seeded on a fresh executor page and reused without any
 // credential read or form interaction; an unknown ref (executor restart) is a
 // cache miss that invalidates the entry and falls back to a fresh login. A
 // rejected login produces a blocked fact with a recovery action and a nil
 // error; only infrastructure failures return an error.
+// Execute runs a login/reuse attempt and closes the page it opened itself (a
+// caller page passed to Detect stays open). OpenWithSession uses the internal
+// keepPage variant so the freshly authenticated page can serve its target.
 func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, error) {
+	return f.execute(ctx, account, false)
+}
+
+func (f *LoginFlow) execute(ctx context.Context, account Account, keepPage bool) (SessionFact, error) {
 	if f == nil || f.exec == nil {
 		return SessionFact{}, errors.New("login flow has no executor")
 	}
@@ -521,12 +671,34 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return f.blocked(account, role, "account_secret_unavailable", ActionConfigureAccount), nil
 	}
 
+	ownedPageID := ""
+	keepOwnedPage := false
 	if form == nil {
 		opened, openErr := f.openPage(ctx, strings.TrimSpace(f.cfg.LoginURL), "")
 		if openErr != nil {
 			return f.blocked(account, role, "login_page_unavailable", executorFailureAction(openErr)), nil
 		}
-		detected, blocked := detectLoginForm(opened, Page{ID: opened.PageID, URL: opened.URL})
+		// This page was opened by the flow, not by the caller. Release it on
+		// every exit path once the session state is captured, except when
+		// OpenWithSession keeps it to navigate to its target. Without this every
+		// fresh login leaks one page until the executor's explore-page cap is
+		// exhausted. A page the caller passed to Detect is never closed here.
+		ownedPageID = strings.TrimSpace(opened.PageID)
+		if ownedPageID != "" && f.pages != nil {
+			defer func() {
+				if keepOwnedPage {
+					return
+				}
+				_ = f.pages.ClosePage(context.WithoutCancel(ctx), ownedPageID)
+			}()
+		}
+		// A landing page may present a login trigger (button/link) instead of
+		// the form itself; detection clicks it once and waits for the form.
+		loginPage := Page{ID: opened.PageID, URL: opened.URL}
+		detected, blocked, detectErr := f.detectFormWithTrigger(ctx, loginPage, opened)
+		if detectErr != nil {
+			return SessionFact{}, detectErr
+		}
 		if blocked != nil {
 			return f.blocked(account, role, blocked.Reason, blocked.Action), nil
 		}
@@ -560,7 +732,9 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return f.blocked(account, role, "login_submit_failed", executorFailureAction(err)), nil
 	}
 
-	// 5. Verify and capture the session in one snapshot.
+	// 5. Verify and capture the session. The submit click returns before the
+	// asynchronous login request settles, so poll until the form disappears (or
+	// a credential error renders) instead of trusting the first snapshot.
 	result, err := f.exec.Action(ctx, actionSnapshot, map[string]any{
 		"page_id": pageID, "include_storage_state": true,
 	})
@@ -570,6 +744,13 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 	snapshot, err := decodePageSnapshot(result)
 	if err != nil {
 		return SessionFact{}, err
+	}
+	if snapshot.PageID != "" {
+		pageID = snapshot.PageID
+	}
+	snapshot, err = f.awaitLoginOutcome(ctx, pageID, snapshot)
+	if err != nil {
+		return f.blocked(account, role, "login_verification_failed", executorFailureAction(err)), nil
 	}
 	if loginStillVisible(snapshot) {
 		f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
@@ -609,6 +790,10 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 	fact.Recipe = recipe
 	if err := f.record(ctx, &fact); err != nil {
 		return SessionFact{}, err
+	}
+	if keepPage {
+		// OpenWithSession still needs this page to serve its target URL.
+		keepOwnedPage = true
 	}
 	return fact, nil
 }
@@ -682,7 +867,7 @@ func (f *LoginFlow) OpenWithSession(ctx context.Context, account Account, url st
 
 	// 2. Cache miss: log in again. A blocked login is returned to the caller as
 	// a business outcome (nil error) and no page is produced.
-	fact, err := f.Execute(ctx, account)
+	fact, err := f.execute(ctx, account, true)
 	if err != nil {
 		return Page{}, SessionFact{}, err
 	}

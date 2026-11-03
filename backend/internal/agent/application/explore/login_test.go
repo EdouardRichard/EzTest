@@ -297,6 +297,26 @@ func targetPageSnapshot(pageID, url, route string) map[string]any {
 	}
 }
 
+// loginTriggerSnapshot is an unauthenticated landing page whose login form is
+// opened by a header button (a modal SPA): no password field yet.
+func loginTriggerSnapshot() map[string]any {
+	return map[string]any{
+		"page_id": "page_1",
+		"url":     "http://127.0.0.1:13335/",
+		"route":   "/",
+		"dom_snapshot": map[string]any{
+			"url":   "http://127.0.0.1:13335/",
+			"title": "EzTest Blog",
+			"aria":  "banner:\n  button \"Login\"\nmain:\n  textbox \"Search\"",
+			"route": "/",
+			"elements": []any{
+				element(0, "button", "#open-login", "button", "Login", ""),
+				element(1, "input", "#search", "textbox", "Search", "text"),
+			},
+		},
+	}
+}
+
 // loginSnapshotWithHiddenDuplicate keeps a stale, display:none copy of the form
 // in the DOM ahead of the visible one. Detection must use the visible form.
 func loginSnapshotWithHiddenDuplicate() map[string]any {
@@ -494,6 +514,73 @@ func TestLoginFlowDetectAndExecute(t *testing.T) {
 	}
 	if fact.Payload["storage_state_ref"] != "ss_abc123" {
 		t.Fatalf("fact payload storage_state_ref = %v", fact.Payload["storage_state_ref"])
+	}
+}
+
+func TestLoginFlowDetectOpensLoginTrigger(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginTriggerSnapshot())
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loginSnapshot())
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{}, resourceapp.NewSessionStore(time.Hour), facts)
+
+	form := detect(t, flow)
+	if form.PasswordSelector != "#password" || form.UsernameSelector != "#username" || form.SubmitSelector != "#submit" {
+		t.Fatalf("form selectors = %+v", form)
+	}
+	clicks := exec.callsOf("explore.click")
+	if len(clicks) != 1 || clicks[0].args["selector"] != "#open-login" {
+		t.Fatalf("login trigger click calls = %+v, want #open-login", clicks)
+	}
+}
+
+func TestLoginFlowExecuteOpensLoginTrigger(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", loginTriggerSnapshot())
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, accounts, resourceapp.NewSessionStore(time.Hour), facts)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive || session.StorageStateRef != "ss_abc123" {
+		t.Fatalf("session = %+v", session)
+	}
+	if len(facts.recorded()) != 1 {
+		t.Fatalf("recorded facts = %d, want the login_session fact", len(facts.recorded()))
+	}
+	clicks := exec.callsOf("explore.click")
+	if len(clicks) != 2 || clicks[0].args["selector"] != "#open-login" || clicks[1].args["selector"] != "#submit" {
+		t.Fatalf("click sequence = %+v, want trigger then submit", clicks)
+	}
+}
+
+func TestLoginFlowBlockedWhenNoFormAndNoTrigger(t *testing.T) {
+	exec := newFakeExecutor()
+	empty := loginTriggerSnapshot()
+	empty["dom_snapshot"].(map[string]any)["elements"] = []any{
+		element(0, "input", "#search", "textbox", "Search", "text"),
+	}
+	exec.queue("explore.snapshot", empty)
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{}, resourceapp.NewSessionStore(time.Hour), facts)
+
+	_, err := flow.Detect(context.Background(), exploreapp.Page{ID: "page_1", URL: "http://127.0.0.1:13335/"})
+	var blocked *exploreapp.BlockedError
+	if !errors.As(err, &blocked) || blocked.Reason != "login_form_not_found" || blocked.Action != exploreapp.ActionManualLogin {
+		t.Fatalf("Detect error = %v, want login_form_not_found/manual_login", err)
+	}
+	if len(exec.callsOf("explore.click")) != 0 {
+		t.Fatalf("no trigger must not click: %+v", exec.recorded())
 	}
 }
 
@@ -787,6 +874,89 @@ func TestLoginNonRetryableExecutorErrorBlocksManualLogin(t *testing.T) {
 	}
 	if len(facts.recorded()) != 0 {
 		t.Fatalf("blocked login must not record a fact")
+	}
+}
+
+// TestLoginFlowExecuteClosesThePageItOpened proves a fresh login does not leak
+// the executor page: repeated analysis logins would otherwise exhaust the
+// executor's fixed explore-page cap and block every later discovery.
+func TestLoginFlowExecuteClosesThePageItOpened(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"},
+		resourceapp.NewSessionStore(time.Hour), &fakeFacts{})
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil || session.Status != exploreapp.SessionActive {
+		t.Fatalf("Execute = %+v, %v", session, err)
+	}
+	if exec.closeCount() != 1 {
+		t.Fatalf("close calls = %d, want the login page closed once", exec.closeCount())
+	}
+	if closed := exec.closedPageIDs(); closed[0] != "page_1" {
+		t.Fatalf("closed pages = %v, want the page the flow opened", closed)
+	}
+}
+
+// TestLoginFlowDetectExecuteKeepsCallerPage: a caller that detected a form on
+// its own page owns that page; Execute must not close it.
+func TestLoginFlowDetectExecuteKeepsCallerPage(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"},
+		resourceapp.NewSessionStore(time.Hour), &fakeFacts{})
+
+	if form := detect(t, flow); form.PasswordSelector != "#password" {
+		t.Fatalf("form = %+v", form)
+	}
+	if _, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if exec.closeCount() != 0 {
+		t.Fatalf("Execute closed the caller-owned page: %v", exec.closedPageIDs())
+	}
+}
+
+// TestLoginFlowWaitsForAsyncLoginCompletion covers an SPA whose login request
+// completes after the submit click returns: the first post-submit snapshot still
+// shows the modal, so the flow must poll until the form disappears instead of
+// reporting a false login_rejected.
+func TestLoginFlowWaitsForAsyncLoginCompletion(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loginSnapshot()) // login still in flight
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, accounts, resourceapp.NewSessionStore(time.Hour), facts)
+
+	if form := detect(t, flow); form.PasswordSelector != "#password" {
+		t.Fatalf("form = %+v", form)
+	}
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive || session.StorageStateRef != "ss_abc123" {
+		t.Fatalf("session = %+v, want active after the async completion", session)
+	}
+	if len(facts.recorded()) != 1 {
+		t.Fatalf("facts = %d, want the login_session fact", len(facts.recorded()))
+	}
+	snapshots := exec.callsOf("explore.snapshot")
+	if len(snapshots) != 3 {
+		t.Fatalf("snapshots = %d, want detect + pending + completed", len(snapshots))
 	}
 }
 

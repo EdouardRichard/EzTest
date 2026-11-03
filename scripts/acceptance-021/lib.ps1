@@ -975,6 +975,17 @@ function Resolve-AcceptanceSutBinding {
                 }
             $account = $response.Data
             $created += ("account:" + [string]$requested.username)
+        } else {
+            # Acceptance accounts are reused across runs. A stale secret from an
+            # older run would make the production UI login fail even though S0's
+            # direct SUT API login still passes, so keep the EzTest-side secret
+            # aligned with the configured acceptance password.
+            $accountId = [string](Get-JsonProp -Object $account -Name "id" -Default "")
+            if ($accountId -ne "" -and -not [string]::IsNullOrWhiteSpace($Context.SutPassword)) {
+                [void](Invoke-ApiOrFail -Context $Context -Method "PATCH" -Path "/api/resources/accounts/$accountId" `
+                    -Token $Context.Token -Label "sync SUT account $($requested.username) password" `
+                    -Body @{ password = $Context.SutPassword })
+            }
         }
         $accounts += $account
     }

@@ -166,6 +166,37 @@ func (m *StageMachine) Transition(ctx context.Context, versionID int64, to versi
 	return err
 }
 
+// StartClarification applies the automatic created→clarifying edge (spec §5.3:
+// created starts the discovery sub-loop and exits automatically). It is
+// idempotent: a version that already left created is left untouched, so every
+// duplicate version.created event is harmless.
+func (m *StageMachine) StartClarification(ctx context.Context, versionID int64) error {
+	current, err := m.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageCreated {
+		return nil
+	}
+	return m.Transition(ctx, versionID, version.StageClarifying, "discovery_started")
+}
+
+// ConvergeClarification applies the clarifying→requirement_review edge after
+// the clarification round converged. It is the production caller the S2
+// requirement gate depends on; like StartClarification it only acts on its
+// source stage, so a repeated confirmation request is a no-op and can never
+// move a version that is already at or past the requirement gate.
+func (m *StageMachine) ConvergeClarification(ctx context.Context, versionID int64) error {
+	current, err := m.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageClarifying {
+		return nil
+	}
+	return m.Transition(ctx, versionID, version.StageRequirementReview, "clarification_converged")
+}
+
 // Suspend enters blocked or paused and records the current workflow stage in
 // version.suspended_from together with the user-visible blocker reason.
 func (m *StageMachine) Suspend(ctx context.Context, versionID int64, to version.Stage, reason string) error {

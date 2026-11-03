@@ -167,6 +167,40 @@ test("explore element inventory reports element visibility", async () => {
   assert.equal(items.get("#hidden-display")?.visible, false)
 })
 
+test("explore element selectors keep deep ancestors so the element resolves", async () => {
+  const opened = await openPage("/deep-login")
+  const elements = opened.dom_snapshot.elements
+  const username = elements.find((element) => element.type === "text")
+  const password = elements.find((element) => element.type === "password")
+  assert.ok(username, JSON.stringify(elements))
+  assert.ok(password, JSON.stringify(elements))
+  assert.match(password.selector, /^body > /)
+
+  // A selector that dropped an ancestor would time out here instead of filling
+  // the real login modal element.
+  const filledUser = await act("explore.fill", {
+    page_id: opened.page_id,
+    selector: username.selector,
+    value: "admin",
+    timeout_ms: 1000,
+  })
+  assert.equal(filledUser.json.ok, true, filledUser.text)
+  const filledPassword = await act("explore.fill", {
+    page_id: opened.page_id,
+    selector: password.selector,
+    value: "secret-pw",
+    timeout_ms: 1000,
+  })
+  assert.equal(filledPassword.json.ok, true, filledPassword.text)
+
+  // Release the page so the suite stays inside the 8-page runtime cap.
+  const closed = await request(`/v1/explore?page_id=${encodeURIComponent(opened.page_id)}`, {
+    method: "DELETE",
+  })
+  assert.equal(closed.status, 200, closed.text)
+  assert.equal(closed.json.result.closed, true)
+})
+
 test("unknown explore actions are rejected with 400 invalid_arguments", async () => {
   for (const action of ["explore.bash", "explore.teleport", "bash", "shell", "explore.exec"]) {
     const response = await act(action, { page_id: "page_1", command: "whoami" })

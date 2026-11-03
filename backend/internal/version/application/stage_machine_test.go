@@ -620,3 +620,68 @@ func TestStageGateConfirmationFailure(t *testing.T) {
 		requireNoGateSideEffects(t, env, version.StageCaseReview)
 	})
 }
+
+// TestStageMachineStartClarification is the created→clarifying automatic edge
+// (spec §5.3: created exits automatically when the discovery sub-loop starts).
+// It is idempotent and never moves a version that already advanced.
+func TestStageMachineStartClarification(t *testing.T) {
+	env := newStageEnv(t, version.StageState{Stage: version.StageCreated, StageEnteredAt: testTime})
+	if err := env.machine.StartClarification(requestContext(), 101); err != nil {
+		t.Fatalf("StartClarification: %v", err)
+	}
+	if env.repo.state.Stage != version.StageClarifying {
+		t.Fatalf("stage = %q, want clarifying", env.repo.state.Stage)
+	}
+	if len(env.repo.applied) != 1 || len(env.publisher.events) == 0 {
+		t.Fatalf("applied=%d events=%d, want one transition and its event", len(env.repo.applied), len(env.publisher.events))
+	}
+
+	// A repeated event must not write the stage again.
+	if err := env.machine.StartClarification(requestContext(), 101); err != nil {
+		t.Fatalf("second StartClarification: %v", err)
+	}
+	if len(env.repo.applied) != 1 {
+		t.Fatalf("idempotent start wrote %d transitions, want 1", len(env.repo.applied))
+	}
+
+	// A version already past clarifying must never be moved back.
+	advanced := newStageEnv(t, version.StageState{Stage: version.StageRequirementReview, StageEnteredAt: testTime})
+	if err := advanced.machine.StartClarification(requestContext(), 101); err != nil {
+		t.Fatalf("StartClarification at requirement_review: %v", err)
+	}
+	if len(advanced.repo.applied) != 0 {
+		t.Fatalf("advanced version was moved: %#v", advanced.repo.applied)
+	}
+}
+
+// TestStageMachineConvergeClarification is the clarifying→requirement_review
+// convergence edge: only a clarifying version converges, and re-entry is a
+// no-op so the acceptance can observe a stable requirement gate.
+func TestStageMachineConvergeClarification(t *testing.T) {
+	env := newStageEnv(t, version.StageState{Stage: version.StageClarifying, StageEnteredAt: testTime})
+	if err := env.machine.ConvergeClarification(requestContext(), 101); err != nil {
+		t.Fatalf("ConvergeClarification: %v", err)
+	}
+	if env.repo.state.Stage != version.StageRequirementReview {
+		t.Fatalf("stage = %q, want requirement_review", env.repo.state.Stage)
+	}
+	events := stageEvents(env.publisher)
+	if len(events) == 0 || events[0]["payload"].(map[string]any)["reason"] != "clarification_converged" {
+		t.Fatalf("stage event = %#v, want reason clarification_converged", events)
+	}
+
+	if err := env.machine.ConvergeClarification(requestContext(), 101); err != nil {
+		t.Fatalf("second ConvergeClarification: %v", err)
+	}
+	if len(env.repo.applied) != 1 {
+		t.Fatalf("idempotent convergence wrote %d transitions, want 1", len(env.repo.applied))
+	}
+
+	created := newStageEnv(t, version.StageState{Stage: version.StageCreated, StageEnteredAt: testTime})
+	if err := created.machine.ConvergeClarification(requestContext(), 101); err != nil {
+		t.Fatalf("ConvergeClarification at created: %v", err)
+	}
+	if len(created.repo.applied) != 0 {
+		t.Fatalf("created version converged without starting clarification: %#v", created.repo.applied)
+	}
+}

@@ -17,6 +17,8 @@ import (
 
 	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
@@ -261,6 +263,100 @@ func TestAnalysisWiresDiscovery(t *testing.T) {
 		if id == "" {
 			t.Fatalf("empty page id closed: %v", closed)
 		}
+	}
+}
+
+// TestAnalysisDiscoveryUsesEnvironmentBaseURLWithoutBoundPages is the S1
+// production path: a version binds only the SUT/environment/accounts/repository,
+// so the analysis must seed login and the page crawl from the environment base
+// URL instead of writing no facts at all.
+func TestAnalysisDiscoveryUsesEnvironmentBaseURLWithoutBoundPages(t *testing.T) {
+	log := &p9EventLog{}
+	executor := &fakeP9DiscoveryExecutor{log: log}
+	runtime := &fakeP9Runtime{log: log}
+	facts := &fakeP9Facts{byKind: map[string][]versiondomain.Fact{}}
+	view := versionapp.VersionView{
+		ID: 1001,
+		Bindings: []versionapp.BindingView{{
+			ID:          77,
+			Environment: resourceapp.EnvironmentView{ID: "8", Name: "staging", BaseURL: "http://sut.test/app"},
+			Accounts:    []resourceapp.AccountView{{ID: "9", Roles: []string{"admin"}}},
+		}},
+	}
+	analysis, err := newP9Analysis(p9AnalysisDeps{
+		Runtime:      runtime,
+		Executor:     executor,
+		Sources:      p9DiscoverySources(),
+		Pages:        &fakeP9Closer{},
+		Facts:        facts,
+		Recorder:     facts,
+		Requirements: &fakeP9Requirements{},
+		Cases:        &fakeP9Cases{},
+		Roles:        &fakeP9Roles{roles: []string{"admin"}},
+		Versions:     &fakeP9Versions{view: view},
+	})
+	if err != nil {
+		t.Fatalf("newP9Analysis: %v", err)
+	}
+	result, err := analysis.Refresh(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if result.LoginStatus != exploreapp.SessionActive {
+		t.Fatalf("login status = %q, want active", result.LoginStatus)
+	}
+	opened := executor.openedURLs()
+	if len(opened) == 0 || opened[0] != "http://sut.test/app" {
+		t.Fatalf("crawl seeds = %v, want the environment base URL first", opened)
+	}
+	if result.DiscoveredPages == 0 || result.DiscoveredAPIs == 0 {
+		t.Fatalf("discovery result = pages %d apis %d", result.DiscoveredPages, result.DiscoveredAPIs)
+	}
+	kinds := map[string]int{}
+	for _, fact := range facts.written {
+		kinds[fact.Kind]++
+	}
+	if kinds[exploreapp.KindPage] == 0 || kinds[exploreapp.KindAPI] == 0 {
+		t.Fatalf("recorded fact kinds = %v, want page and api facts", kinds)
+	}
+}
+
+// TestAnalysisRetriesTransientLogin covers a transient executor/page-cap
+// failure during discovery login: the analysis retries the retry_login outcome
+// instead of leaving the version without facts until the 10-minute debounce.
+func TestAnalysisRetriesTransientLogin(t *testing.T) {
+	executor := &fakeP9DiscoveryExecutor{}
+	blocked := exploreapp.SessionFact{
+		Status: exploreapp.SessionBlocked, Reason: "login_page_unavailable",
+		Action: exploreapp.ActionRetryLogin,
+	}
+	runtime := &fakeP9Runtime{loginQueue: []exploreapp.SessionFact{blocked, blocked}}
+	facts := &fakeP9Facts{byKind: map[string][]versiondomain.Fact{}}
+	analysis, err := newP9Analysis(p9AnalysisDeps{
+		Runtime:      runtime,
+		Executor:     executor,
+		Sources:      p9DiscoverySources(),
+		Pages:        &fakeP9Closer{},
+		Facts:        facts,
+		Recorder:     facts,
+		Requirements: &fakeP9Requirements{},
+		Cases:        &fakeP9Cases{},
+		Roles:        &fakeP9Roles{roles: []string{"admin"}},
+		Versions:     &fakeP9Versions{view: p9TestVersionView()},
+	})
+	if err != nil {
+		t.Fatalf("newP9Analysis: %v", err)
+	}
+	analysis.loginRetryDelay = 0
+	result, err := analysis.Refresh(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if runtime.loginCount() != 3 {
+		t.Fatalf("login calls = %d, want 2 retries + the active attempt", runtime.loginCount())
+	}
+	if result.LoginStatus != exploreapp.SessionActive || result.DiscoveredPages == 0 || result.DiscoveredAPIs == 0 {
+		t.Fatalf("result after retry = %+v", result)
 	}
 }
 

@@ -10,6 +10,10 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
 	"strings"
 
 	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
@@ -81,12 +85,20 @@ func (p *p9SourceProvider) SourceFiles(ctx context.Context, versionID int64) ([]
 		if commit == "" {
 			commit = strings.TrimSpace(repository.Branch)
 		}
+		remaining := codeintelapp.DefaultStaticMaxFiles - len(files)
 		if commit == "" {
+			// A source directory without git metadata still has readable code:
+			// scan the bounded working tree instead of silently writing no API
+			// facts.
+			files = append(files, p.workingTreeFiles(repoPath, repository.Include, repository.Exclude, remaining)...)
 			continue
 		}
-		remaining := codeintelapp.DefaultStaticMaxFiles - len(files)
 		tree, treeErr := p.git.ListTree(ctx, repoPath, commit, repository.Include, repository.Exclude, remaining)
 		if treeErr != nil {
+			// Many acceptance/SUT source directories are plain deployment
+			// checkouts without a .git directory. The git reader is the pinned
+			// path; the bounded working-tree read is the read-only fallback.
+			files = append(files, p.workingTreeFiles(repoPath, repository.Include, repository.Exclude, remaining)...)
 			continue
 		}
 		for _, entry := range tree.Entries {
@@ -107,6 +119,120 @@ func (p *p9SourceProvider) SourceFiles(ctx context.Context, versionID int64) ([]
 		}
 	}
 	return files, nil
+}
+
+// p9WorkingTreeSkipDirs are dependency/build/output directories whose files are
+// never SUT business source. Hidden directories (including .git and vendored
+// toolchains) are skipped by the leading-dot rule.
+var p9WorkingTreeSkipDirs = map[string]bool{
+	"node_modules": true, "vendor": true, "dist": true, "build": true,
+	"bin": true, "target": true, "coverage": true, "uploads": true,
+}
+
+// workingTreeFiles reads the bounded text files of a non-git source directory.
+// It applies the configured include/exclude globs, skips dependency/build
+// directories, symlinks, oversized files and binary content, and never leaves
+// the repository root. The static API extractor consumes the result; no file is
+// executed and no path is persisted.
+func (p *p9SourceProvider) workingTreeFiles(repoPath string, include, exclude []string, maxFiles int) []codeintelapp.SourceFile {
+	if maxFiles <= 0 {
+		return nil
+	}
+	root, err := filepath.Abs(strings.TrimSpace(repoPath))
+	if err != nil {
+		return nil
+	}
+	files := make([]codeintelapp.SourceFile, 0)
+	_ = filepath.WalkDir(root, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if len(files) >= maxFiles {
+			return fs.SkipAll
+		}
+		if entry.IsDir() {
+			if current == root {
+				return nil
+			}
+			name := strings.ToLower(entry.Name())
+			if strings.HasPrefix(name, ".") || p9WorkingTreeSkipDirs[name] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		relative, err := filepath.Rel(root, current)
+		if err != nil {
+			return nil
+		}
+		relative = filepath.ToSlash(relative)
+		if len(include) > 0 && !p9AnyGlob(include, relative) {
+			return nil
+		}
+		if p9AnyGlob(exclude, relative) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || info.Size() > int64(codeintelapp.DefaultStaticMaxFileBytes) {
+			return nil
+		}
+		content, err := os.ReadFile(current)
+		if err != nil || p9LooksBinary(content) {
+			return nil
+		}
+		files = append(files, codeintelapp.SourceFile{Path: relative, Content: string(content)})
+		return nil
+	})
+	return files
+}
+
+func p9LooksBinary(content []byte) bool {
+	window := content
+	if len(window) > 8192 {
+		window = window[:8192]
+	}
+	for _, value := range window {
+		if value == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func p9AnyGlob(patterns []string, filePath string) bool {
+	for _, pattern := range patterns {
+		if p9GlobMatch(pattern, filePath) {
+			return true
+		}
+	}
+	return false
+}
+
+// p9GlobMatch matches the resource include/exclude glob style. A leading "**/"
+// matches at any depth, a trailing "/**" matches the whole subtree, and plain
+// patterns are matched against the full relative path or any path suffix.
+func p9GlobMatch(pattern, filePath string) bool {
+	pattern = strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(pattern), "\\", "/"), "**/")
+	filePath = strings.ReplaceAll(filePath, "\\", "/")
+	if pattern == "" {
+		return false
+	}
+	if strings.HasSuffix(pattern, "/**") {
+		prefix := strings.TrimSuffix(pattern, "/**")
+		return filePath == prefix || strings.HasPrefix(filePath, prefix+"/")
+	}
+	if matched, _ := path.Match(pattern, filePath); matched {
+		return true
+	}
+	parts := strings.Split(filePath, "/")
+	for index := 1; index < len(parts); index++ {
+		if matched, _ := path.Match(pattern, strings.Join(parts[index:], "/")); matched {
+			return true
+		}
+	}
+	return false
 }
 
 var _ exploreapp.SourceProvider = (*p9SourceProvider)(nil)

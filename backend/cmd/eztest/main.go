@@ -166,6 +166,32 @@ func reconcilerEventVersionID(event eventingdomain.Event) int64 {
 	return 0
 }
 
+// clarificationStarter is the stage-machine edge the composition root drives
+// from version.created: the automatic created→clarifying transition (spec
+// §5.3). It stays a narrow interface so the event wiring is testable without a
+// database.
+type clarificationStarter interface {
+	StartClarification(ctx context.Context, versionID int64) error
+}
+
+// advanceCreatedVersionToClarifying applies the automatic created→clarifying
+// edge when a version is created. Delivery/DB failures are logged and never
+// abort the event observer: the stage row is the source of truth and a later
+// analysis/reconciler pass can retry. The transition is idempotent, so the event
+// being published on two channels is harmless.
+func advanceCreatedVersionToClarifying(ctx context.Context, starter clarificationStarter, event eventingdomain.Event) {
+	if starter == nil || event.Type != "version.created" {
+		return
+	}
+	versionID := reconcilerEventVersionID(event)
+	if versionID <= 0 {
+		return
+	}
+	if err := starter.StartClarification(ctx, versionID); err != nil {
+		log.Printf("eztest: start clarification version=%d failed: %v", versionID, err)
+	}
+}
+
 // versionTaskEnqueuer adapts the version context's local TaskEnqueuer port to
 // the agent work queue. The composition root is the only place that knows both
 // bounded contexts, so the adapter stays in cmd/eztest.
@@ -1334,6 +1360,10 @@ func main() {
 		TeamRoom:     teamRoom,
 		Content:      ports,
 		Briefing:     briefingBuilder,
+		// A clarification host turn that explicitly requests requirement
+		// confirmation converges the version to requirement_review (S2). The
+		// adapter refuses an empty draft list, so the gate is never opened empty.
+		Clarification: stageClarificationConverger{machine: stageMachine, requirements: requirementSvc},
 		// P7 knowledge injection + usage accounting (S6 report §5).
 		Knowledge:      p7rt.KnowledgeAdapter,
 		KnowledgeUsage: p7rt.KnowledgeAdapter,
@@ -1413,6 +1443,10 @@ func main() {
 	wake := func(_ context.Context, event eventingdomain.Event) error {
 		versionID := reconcilerEventVersionID(event)
 		reconciler.Notify(event.Type, versionID)
+		// created→clarifying is automatic when a version exists (spec §5.3):
+		// the discovery sub-loop starts and the version leaves the created
+		// stage before the create response is returned.
+		advanceCreatedVersionToClarifying(ctx, stageMachine, event)
 		if event.Type == designCaseConfirmedEvent {
 			intentWake.Notify(versionID)
 		}

@@ -79,6 +79,10 @@ type RunnerDeps struct {
 	// context on every round (Task 48). Nil keeps the version pack facts only;
 	// the assembler prefix and transcript are still rendered.
 	Briefing *agentcontext.BriefingBuilder
+	// Clarification applies the clarifying→requirement_review edge when a
+	// clarification host turn explicitly requests requirement confirmation. Nil
+	// keeps the stage unchanged (deployments without the version stage machine).
+	Clarification ClarificationConverger
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -119,6 +123,7 @@ type Runner struct {
 	builder              *ContextBuilder
 	briefing             *agentcontext.BriefingBuilder
 	assembler            *agentcontext.Assembler
+	clarification        ClarificationConverger
 }
 
 // NewRunner wires the agent runner.
@@ -154,6 +159,7 @@ func NewRunner(deps RunnerDeps) *Runner {
 		builder:              NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 		briefing:             deps.Briefing,
 		assembler:            agentcontext.NewAssembler(),
+		clarification:        deps.Clarification,
 	}
 }
 
@@ -1161,6 +1167,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
+		r.convergeClarification(ctx, state, finalText)
 	case ProfileKeyDesignHost:
 		if finalText == "" {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design host produced an empty final message")}
@@ -1268,6 +1275,24 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		}
 	}
 	return nil
+}
+
+// convergeClarification applies the clarifying→requirement_review edge when the
+// host's persisted turn explicitly requests requirement confirmation. Stage
+// failures are log-only: the assistant message is the source artifact and a
+// later confirmation turn retries the convergence instead of failing the chat
+// turn (which would re-run the model).
+func (r *Runner) convergeClarification(ctx context.Context, state *runState, finalText string) {
+	if r.clarification == nil || state == nil || state.item.VersionID <= 0 {
+		return
+	}
+	if !requestsRequirementConfirmation(finalText) {
+		return
+	}
+	if err := r.clarification.Converge(ctx, state.item.VersionID); err != nil && r.logger != nil {
+		r.logger.Warn("clarification convergence failed",
+			"version_id", state.item.VersionID, "error", err)
+	}
 }
 
 // postDesignUpdate writes one design team-room update attributed to the run and

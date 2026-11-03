@@ -511,7 +511,11 @@ async function readElements(page, selector = null) {
         const parts = []
         let current = node
         let depth = 0
-        while (current && current.nodeType === 1 && current !== document.body && depth < 4) {
+        // The whole ancestor chain up to body is required: truncating it makes
+        // the selector resolve against a different subtree (a login modal
+        // nested in an app shell would drop the shell and never match). The
+        // bound only guards against a pathological cyclic/hostile DOM.
+        while (current && current.nodeType === 1 && current !== document.body && depth < 32) {
           const currentTag = current.tagName.toLowerCase()
           const parent = current.parentElement
           if (!parent) {

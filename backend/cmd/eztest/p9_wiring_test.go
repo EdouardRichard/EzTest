@@ -29,6 +29,9 @@ type fakeP9Runtime struct {
 	openErr   error
 	active    int
 	maxActive int
+	// loginQueue scripts the next Login outcomes (used by the transient-retry
+	// test). An empty queue returns active.
+	loginQueue []exploreapp.SessionFact
 	// log is the optional shared log the discovery test uses to prove the
 	// cross-component ordering (login before discovery/probes).
 	log *p9EventLog
@@ -40,6 +43,14 @@ func (f *fakeP9Runtime) Login(_ context.Context, cfg exploreapp.LoginFlowConfig)
 	f.events = append(f.events, "login")
 	if f.log != nil {
 		f.log.add("login")
+	}
+	if len(f.loginQueue) > 0 {
+		fact := f.loginQueue[0]
+		f.loginQueue = f.loginQueue[1:]
+		if fact.AccountRole == "" {
+			fact.AccountRole = cfg.Role
+		}
+		return fact, nil
 	}
 	if f.blocked {
 		return exploreapp.SessionFact{Status: exploreapp.SessionBlocked, Reason: "invalid_credentials", AccountRole: cfg.Role}, nil
@@ -438,6 +449,39 @@ func TestP9LoginPageURL(t *testing.T) {
 	}
 	if got := p9LoginPageURL(nil); got != "" {
 		t.Fatalf("empty pages = %q", got)
+	}
+}
+
+// TestP9LoginBindingFallsBackToEnvironmentBaseURL covers a version with no
+// bound pages: the environment base URL is the only navigable location, so it
+// seeds both the fresh login and the page crawl. A bound page still wins.
+func TestP9LoginBindingFallsBackToEnvironmentBaseURL(t *testing.T) {
+	versions := &fakeP9Versions{view: versionapp.VersionView{
+		ID: 1001,
+		Bindings: []versionapp.BindingView{{
+			ID:          77,
+			Environment: resourceapp.EnvironmentView{ID: "8", BaseURL: "http://sut.test/app"},
+			Accounts:    []resourceapp.AccountView{{ID: "9", Roles: []string{"admin"}}},
+		}},
+	}}
+	analysis := &p9Analysis{deps: p9AnalysisDeps{Versions: versions}}
+	binding := analysis.loginBinding(context.Background(), 1001)
+	if binding.loginURL != "http://sut.test/app" {
+		t.Fatalf("login url = %q, want the environment base URL", binding.loginURL)
+	}
+	start, seeds, ok := p9DiscoverySeeds(binding)
+	if !ok || start != "http://sut.test/app" || len(seeds) != 0 {
+		t.Fatalf("discovery seeds = start %q seeds %v ok %v", start, seeds, ok)
+	}
+
+	versions.view.Bindings[0].Pages = []resourceapp.PageView{
+		{ID: "501", URL: "http://sut.test/home", RouteTemplate: "/home"},
+		{ID: "502", URL: "http://sut.test/login", RouteTemplate: "/login"},
+	}
+	binding = analysis.loginBinding(context.Background(), 1001)
+	start, seeds, ok = p9DiscoverySeeds(binding)
+	if !ok || start != "http://sut.test/home" || len(seeds) != 1 || seeds[0] != "http://sut.test/login" {
+		t.Fatalf("bound page seeds = start %q seeds %v ok %v", start, seeds, ok)
 	}
 }
 
