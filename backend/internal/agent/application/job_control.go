@@ -96,13 +96,17 @@ type JobControlRepository interface {
 }
 
 // JobCardUpdater is the narrow persisted-conversation-card surface of the job
-// control API (Task 63). It rewrites the one job_card message of a canceled job
-// to the terminal cancelled snapshot, in place. The version context owns the
-// lookup, the one-card-per-job rule and the SSE republication; the agent side
-// only names the job. A job without a card (legacy or non-conversation job) is
-// a no-op. *versionapp.ConversationService satisfies it.
+// control API (Task 63). CancelJobCard rewrites the one job_card message of a
+// canceled job to the terminal cancelled snapshot; ReopenJobCard returns a
+// retried job's card to the non-terminal open snapshot (the explicit bypass of
+// the sticky cancelled card, so the new attempt can reuse it). The version
+// context owns the lookup, the one-card-per-job rule and the SSE republication;
+// the agent side only names the job. A job without a card (legacy or
+// non-conversation job) is a no-op. *versionapp.ConversationService satisfies
+// it.
 type JobCardUpdater interface {
 	CancelJobCard(ctx context.Context, versionID, conversationID, jobID int64) error
+	ReopenJobCard(ctx context.Context, versionID, conversationID, jobID int64) error
 }
 
 // JobControlDeps wires the job control service. Jobs is required; Audit,
@@ -241,6 +245,13 @@ func (s *JobControl) Retry(ctx context.Context, actorID, versionID, jobID int64)
 	}
 	s.record(ctx, ActionJobRequeued, actorID, item, updated)
 	s.publish(ctx, EventJobRequeued, actorID, updated, string(agent.WorkItemOpen))
+	// Task 63 fix round 2: the retried job starts a new attempt, so a card left
+	// cancelled (by a cancel racing the retry, or by an earlier projection) must
+	// be reopened to the non-terminal open snapshot. Otherwise the sticky
+	// cancelled card would ignore every projection of the new attempt. Best
+	// effort like every card write-back: a failed reopen never rolls back the
+	// committed retry.
+	s.reopenJobCard(ctx, updated)
 	return jobControlView(updated), nil
 }
 
@@ -405,18 +416,18 @@ func (s *JobControl) publishFinished(ctx context.Context, item agent.WorkItem) {
 }
 
 // jobCardUpdateTimeout bounds the best-effort persisted-card write-back. The
-// cancel itself is already committed and published; a stuck card store must not
-// hold the HTTP response open indefinitely.
+// cancel/retry itself is already committed and published; a stuck card store
+// must not hold the HTTP response open indefinitely.
 const jobCardUpdateTimeout = 5 * time.Second
 
-// cancelJobCard asks the version context to rewrite the conversation card of a
-// canceled job to the terminal cancelled snapshot. The conversation association
-// is the only card linkage (Task 61 stores it in the frozen work_item payload
-// column), so a job without one never had a card and is a no-op — that covers
-// both legacy rows and non-conversation jobs. The error is deliberately dropped:
-// the committed work item and its events are the truth, never the card.
-func (s *JobControl) cancelJobCard(ctx context.Context, item agent.WorkItem) {
-	if s == nil || s.jobCards == nil || item.VersionID <= 0 || item.ID <= 0 {
+// updateJobCard runs one best-effort card write-back for item's conversation.
+// The conversation association is the only card linkage (Task 61 stores it in
+// the frozen work_item payload column), so a job without one never had a card
+// and is a no-op — that covers both legacy rows and non-conversation jobs. The
+// error of the write is deliberately dropped: the committed work item and its
+// events are the truth, never the card.
+func (s *JobControl) updateJobCard(ctx context.Context, item agent.WorkItem, write func(context.Context, int64, int64, int64) error) {
+	if s == nil || s.jobCards == nil || item.VersionID <= 0 || item.ID <= 0 || write == nil {
 		return
 	}
 	payload, err := ParseWorkItemPayload(item.Payload)
@@ -425,5 +436,25 @@ func (s *JobControl) cancelJobCard(ctx context.Context, item agent.WorkItem) {
 	}
 	cardCtx, cancel := context.WithTimeout(ctx, jobCardUpdateTimeout)
 	defer cancel()
-	_ = s.jobCards.CancelJobCard(cardCtx, item.VersionID, payload.ConversationID, item.ID)
+	_ = write(cardCtx, item.VersionID, payload.ConversationID, item.ID)
+}
+
+// cancelJobCard asks the version context to rewrite the conversation card of a
+// canceled job to the terminal cancelled snapshot.
+func (s *JobControl) cancelJobCard(ctx context.Context, item agent.WorkItem) {
+	if s == nil || s.jobCards == nil {
+		return
+	}
+	s.updateJobCard(ctx, item, s.jobCards.CancelJobCard)
+}
+
+// reopenJobCard asks the version context to return a retried job's card to the
+// non-terminal open snapshot — the explicit bypass of the sticky cancelled card,
+// so the new attempt can update the same card again. Best effort like the cancel
+// write-back: a failed reopen never rolls back the retry.
+func (s *JobControl) reopenJobCard(ctx context.Context, item agent.WorkItem) {
+	if s == nil || s.jobCards == nil {
+		return
+	}
+	s.updateJobCard(ctx, item, s.jobCards.ReopenJobCard)
 }

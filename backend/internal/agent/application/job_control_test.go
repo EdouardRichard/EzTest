@@ -24,25 +24,35 @@ import (
 // ---------- Task 63: persisted job card updater ----------
 
 // jobCardUpdateCall is one best-effort conversation-card write-back requested by
-// a cancel.
+// a cancel or a retry.
 type jobCardUpdateCall struct {
 	VersionID      int64
 	ConversationID int64
 	JobID          int64
 }
 
-// fakeJobCardUpdater records the cancel card write-back. Its error models the
-// card store being unavailable: the cancel must still succeed.
+// fakeJobCardUpdater records the cancel/retry card write-backs. Its error models
+// the card store being unavailable: the job lifecycle action must still succeed.
 type fakeJobCardUpdater struct {
-	mu    sync.Mutex
-	calls []jobCardUpdateCall
-	err   error
+	mu          sync.Mutex
+	cancelCalls []jobCardUpdateCall
+	reopenCalls []jobCardUpdateCall
+	err         error
 }
 
 func (u *fakeJobCardUpdater) CancelJobCard(_ context.Context, versionID, conversationID, jobID int64) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.calls = append(u.calls, jobCardUpdateCall{
+	u.cancelCalls = append(u.cancelCalls, jobCardUpdateCall{
+		VersionID: versionID, ConversationID: conversationID, JobID: jobID,
+	})
+	return u.err
+}
+
+func (u *fakeJobCardUpdater) ReopenJobCard(_ context.Context, versionID, conversationID, jobID int64) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.reopenCalls = append(u.reopenCalls, jobCardUpdateCall{
 		VersionID: versionID, ConversationID: conversationID, JobID: jobID,
 	})
 	return u.err
@@ -51,8 +61,16 @@ func (u *fakeJobCardUpdater) CancelJobCard(_ context.Context, versionID, convers
 func (u *fakeJobCardUpdater) recorded() []jobCardUpdateCall {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	calls := make([]jobCardUpdateCall, len(u.calls))
-	copy(calls, u.calls)
+	calls := make([]jobCardUpdateCall, len(u.cancelCalls))
+	copy(calls, u.cancelCalls)
+	return calls
+}
+
+func (u *fakeJobCardUpdater) reopened() []jobCardUpdateCall {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	calls := make([]jobCardUpdateCall, len(u.reopenCalls))
+	copy(calls, u.reopenCalls)
 	return calls
 }
 
@@ -922,4 +940,94 @@ func TestJobCardCancelUpdaterLegacyNoop(t *testing.T) {
 	if stored := fixture.repo.get(legacy.ID); stored.Status != agent.WorkItemRunning {
 		t.Fatalf("legacy row changed: %#v", stored)
 	}
+}
+
+// TestJobCardRetryReopenWiring pins the retry-side card wiring: after a
+// successful retry reset the job control service best-effort reopens the
+// persisted card of the retried job (same version/conversation/job), so a card
+// that a cancel/race had left cancelled can be reused by the new attempt. Retry
+// semantics are unchanged: one job.requeued event, no terminal event, and a card
+// failure never rolls back the re-opened row. A canceled row is still rejected
+// by Task 46 and never reopens anything.
+func TestJobCardRetryReopenWiring(t *testing.T) {
+	t.Run("reopens the retried job's card", func(t *testing.T) {
+		fixture := newJobControlFixture(t, jobTestNow)
+		item := jobControlItem(530, 10, agent.WorkItemFailed, 1, 3)
+		item.Payload = json.RawMessage(`{"conversation_id":"77","model":"deepseek-chat"}`)
+		before := fixture.repo.add(item)
+
+		view, err := fixture.service.Retry(context.Background(), 71, before.VersionID, before.ID)
+		if err != nil {
+			t.Fatalf("Retry: %v", err)
+		}
+		if view.State != string(agent.WorkItemOpen) {
+			t.Fatalf("view state = %q, want open", view.State)
+		}
+
+		calls := fixture.jobCards.reopened()
+		if len(calls) != 1 {
+			t.Fatalf("reopen calls = %d, want 1: %#v", len(calls), calls)
+		}
+		want := jobCardUpdateCall{VersionID: before.VersionID, ConversationID: 77, JobID: before.ID}
+		if calls[0] != want {
+			t.Fatalf("reopen call = %#v, want %#v", calls[0], want)
+		}
+		if cancelCalls := fixture.jobCards.recorded(); len(cancelCalls) != 0 {
+			t.Fatalf("cancel card calls = %#v, want none on a retry", cancelCalls)
+		}
+
+		// Retry semantics are untouched: one requeue event, no terminal event.
+		events := fixture.publishedEvents()
+		if len(events) != 1 || events[0].Type != "job.requeued" {
+			t.Fatalf("events = %#v, want exactly one job.requeued", events)
+		}
+		if stored := fixture.repo.get(before.ID); stored.Status != agent.WorkItemOpen || stored.Attempts != 0 {
+			t.Fatalf("stored retried row = %#v", stored)
+		}
+	})
+
+	t.Run("a card failure does not roll back the retry", func(t *testing.T) {
+		fixture := newJobControlFixture(t, jobTestNow)
+		fixture.jobCards.err = errors.New("conversation card store unavailable")
+		item := jobControlItem(531, 10, agent.WorkItemFailed, 1, 3)
+		item.Payload = json.RawMessage(`{"conversation_id":"78"}`)
+		before := fixture.repo.add(item)
+
+		if _, err := fixture.service.Retry(context.Background(), 71, before.VersionID, before.ID); err != nil {
+			t.Fatalf("Retry with a failing card update: %v", err)
+		}
+		if calls := fixture.jobCards.reopened(); len(calls) != 1 {
+			t.Fatalf("reopen calls = %d, want the one attempted best-effort write", len(calls))
+		}
+		if stored := fixture.repo.get(before.ID); stored.Status != agent.WorkItemOpen {
+			t.Fatalf("stored status = %q, want the re-opened row", stored.Status)
+		}
+	})
+
+	t.Run("no conversation association is a no-op", func(t *testing.T) {
+		fixture := newJobControlFixture(t, jobTestNow)
+		item := jobControlItem(532, 10, agent.WorkItemFailed, 1, 3)
+		before := fixture.repo.add(item)
+
+		if _, err := fixture.service.Retry(context.Background(), 71, before.VersionID, before.ID); err != nil {
+			t.Fatalf("Retry: %v", err)
+		}
+		if calls := fixture.jobCards.reopened(); len(calls) != 0 {
+			t.Fatalf("reopen calls = %#v, want none without a conversation association", calls)
+		}
+	})
+
+	t.Run("a canceled job is rejected without reopening its card", func(t *testing.T) {
+		fixture := newJobControlFixture(t, jobTestNow)
+		item := jobControlItem(533, 10, agent.WorkItemFailed, 1, 3)
+		item.LastError = jobStringPtr(agentapp.JobCanceledReason)
+		item.Payload = json.RawMessage(`{"conversation_id":"79"}`)
+		before := fixture.repo.add(item)
+
+		_, err := fixture.service.Retry(context.Background(), 71, before.VersionID, before.ID)
+		assertAPIError(t, err, http.StatusConflict, "state_conflict")
+		if calls := fixture.jobCards.reopened(); len(calls) != 0 {
+			t.Fatalf("reopen calls = %#v, want none for a canceled row", calls)
+		}
+	})
 }

@@ -69,6 +69,11 @@ const (
 var (
 	ErrConversationNotFound = errors.New("conversation not found")
 	ErrMessageNotFound      = errors.New("message not found")
+	// ErrJobCardCancelled reports that a job-card rewrite was rejected because
+	// the stored card is already cancelled: a late runner projection must never
+	// overwrite the terminal cancel snapshot. Callers treat it as an ignored,
+	// best-effort write-back.
+	ErrJobCardCancelled = errors.New("job card is cancelled")
 )
 
 var messageSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -485,8 +490,16 @@ type ConversationRepository interface {
 	// UpdateJobCardMessage rewrites the stored snapshot part of jobID and its
 	// conversation_message_part payload inside messageID without appending a
 	// new message or part row. ErrMessageNotFound when the scoped message or
-	// its card is absent.
+	// its card is absent. A stored cancelled card is sticky: a rewrite whose
+	// part is not cancelled is rejected with ErrJobCardCancelled and nothing is
+	// written (a late runner projection must not overwrite a cancel). The check
+	// runs under the row lock, so it cannot lose a race with the cancel write.
 	UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part MessagePart) error
+	// ReopenJobCardMessage rewrites the stored card of a retried job even when
+	// it is currently cancelled — the explicit retry reopen, and the only write
+	// the sticky cancelled rule above lets replace a cancelled card. ErrMessageNotFound
+	// when the scoped message or its card is absent.
+	ReopenJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part MessagePart) error
 	// PostUserMessage inserts the message and bumps the conversation
 	// timestamp. When the client_message_id uniqueness constraint fires it
 	// returns the already-stored message instead of an error.
@@ -731,6 +744,21 @@ var conversationJobCardKinds = map[string]struct{}{
 func IsConversationJobCardKind(kind string) bool {
 	_, ok := conversationJobCardKinds[kind]
 	return ok
+}
+
+// JobCardStatusCancelled is the terminal cancelled status of a job_card part
+// (contract §9.1).
+const JobCardStatusCancelled = "cancelled"
+
+// JobCardRewriteAllowed reports whether a stored job-card snapshot may be
+// replaced by a part with nextStatus. A cancelled card is terminal and sticky:
+// a late runner projection (running/open/done/failed) must never overwrite it,
+// while the repeated cancel snapshot is allowed. The repository re-checks this
+// rule under its row lock so a concurrent late write cannot win;
+// ReopenJobCardMessage is the one explicit bypass used by a user-initiated
+// retry.
+func JobCardRewriteAllowed(storedStatus, nextStatus string) bool {
+	return storedStatus != JobCardStatusCancelled || nextStatus == JobCardStatusCancelled
 }
 
 // ValidateJobCardMessage validates the single mutable job_card part stored for

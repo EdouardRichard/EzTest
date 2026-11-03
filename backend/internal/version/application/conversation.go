@@ -422,7 +422,24 @@ func (s *ConversationService) UpsertJobCard(ctx context.Context, versionID, conv
 	existing, err := s.repo.FindJobCardMessage(ctx, versionID, conversationID, card.JobID)
 	switch {
 	case err == nil && existing != nil:
+		// A cancelled card is terminal and sticky. The worker notices a cancel
+		// only on its next heartbeat, so an in-flight turn may still project
+		// running/progress or its terminal done after the cancel already
+		// rewrote the card: ignore that late snapshot (no write, no republish)
+		// and keep the stored cancelled card. The repository re-checks the
+		// stored status under its row lock, so a cancel committing between this
+		// lookup and the rewrite cannot lose the race either.
+		if stored, ok := findJobCardPart(existing.Parts, card.JobID); ok &&
+			!version.JobCardRewriteAllowed(stored.Status, card.Status) {
+			return toMessageView(*existing), false, nil
+		}
 		if err := s.repo.UpdateJobCardMessage(ctx, versionID, conversationID, existing.ID, card.JobID, card); err != nil {
+			if errors.Is(err, version.ErrJobCardCancelled) {
+				// The concurrent cancel won the row-lock re-check after this
+				// lookup. Its cancelled card is the truth; the late running/
+				// done projection has nothing left to write back.
+				return MessageView{}, false, nil
+			}
 			return MessageView{}, false, mapConversationRepositoryError(err)
 		}
 		existing.Parts = replaceJobCardPart(existing.Parts, card)
@@ -528,6 +545,51 @@ func findJobCardPart(parts []version.MessagePart, jobID int64) (version.MessageP
 		}
 	}
 	return version.MessagePart{}, false
+}
+
+// ReopenJobCard rewrites the persisted card of a retried job from the terminal
+// cancelled snapshot back to the non-terminal open snapshot, in place (Task 63
+// fix round 2). It is the explicit bypass of the sticky cancelled card: a
+// retried job starts a new attempt, and the runner's next start/progress
+// projection must be able to update this same card again. kind/current/total are
+// preserved; only status and cancelable become open. A job without a card is a
+// silent no-op. The caller treats the operation as best effort: the retry state
+// is already committed, so an error must never roll it back.
+func (s *ConversationService) ReopenJobCard(ctx context.Context, versionID, conversationID, jobID int64) error {
+	if err := validateConversationIDs(versionID, conversationID); err != nil {
+		return err
+	}
+	if jobID <= 0 {
+		return platform.Invalid("job_id", "must be a positive decimal ID")
+	}
+	existing, err := s.repo.FindJobCardMessage(ctx, versionID, conversationID, jobID)
+	if err != nil {
+		if errors.Is(err, version.ErrMessageNotFound) {
+			return nil
+		}
+		return mapConversationRepositoryError(err)
+	}
+	if existing == nil {
+		return nil
+	}
+	card, ok := findJobCardPart(existing.Parts, jobID)
+	if !ok {
+		return nil
+	}
+	card.Status = eventingapp.JobStatusOpen
+	cancelable := true
+	card.Cancelable = &cancelable
+	if err := s.repo.ReopenJobCardMessage(ctx, versionID, conversationID, existing.ID, jobID, card); err != nil {
+		if errors.Is(err, version.ErrMessageNotFound) {
+			// The card disappeared between the lookup and the rewrite; there is
+			// nothing left to reopen and the retry already stands.
+			return nil
+		}
+		return mapConversationRepositoryError(err)
+	}
+	existing.Parts = replaceJobCardPart(existing.Parts, card)
+	s.publishMessageEvent(ctx, versionID, *existing)
+	return nil
 }
 
 // ---------- tasks and events ----------

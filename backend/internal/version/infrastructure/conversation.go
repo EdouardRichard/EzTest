@@ -246,7 +246,24 @@ func (r *ConversationRepository) FindJobCardMessage(ctx context.Context, version
 // conversation_message_part payload inside messageID. The card is the one
 // mutable part of the conversation: no new message or part row is appended and
 // the append-only seq/created_at stay untouched.
+//
+// A cancelled card is terminal and sticky: a rewrite that would replace it with
+// a running/open/done/failed snapshot is rejected with version.ErrJobCardCancelled
+// and nothing is written. The stored status is re-read under FOR UPDATE, so a
+// late runner projection cannot overwrite a cancel that committed after the
+// caller's lookup. ReopenJobCardMessage is the explicit retry bypass.
 func (r *ConversationRepository) UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return r.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, false)
+}
+
+// ReopenJobCardMessage rewrites the stored job card even when it is currently
+// cancelled: the explicit user-retry reopen, so the new attempt can reuse the
+// same card.
+func (r *ConversationRepository) ReopenJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return r.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, true)
+}
+
+func (r *ConversationRepository) updateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart, allowCancelled bool) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("update job card message: begin: %w", err)
@@ -273,17 +290,23 @@ func (r *ConversationRepository) UpdateJobCardMessage(ctx context.Context, versi
 			return fmt.Errorf("update job card message: decode parts: %w", err)
 		}
 	}
-	replaced := false
+	replaced := -1
 	for index := range parts {
 		if parts[index].Type == version.MessagePartJobCard && parts[index].JobID == jobID {
-			parts[index] = part
-			replaced = true
+			// Re-check the sticky cancelled snapshot under the row lock. The
+			// cancel's own cancelled rewrite stays allowed (idempotent), and
+			// the explicit retry reopen bypasses the rule.
+			if !allowCancelled && !version.JobCardRewriteAllowed(parts[index].Status, part.Status) {
+				return version.ErrJobCardCancelled
+			}
+			replaced = index
 			break
 		}
 	}
-	if !replaced {
+	if replaced < 0 {
 		return version.ErrMessageNotFound
 	}
+	parts[replaced] = part
 	encodedParts, err := json.Marshal(parts)
 	if err != nil {
 		return fmt.Errorf("update job card message: encode parts: %w", err)

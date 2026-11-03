@@ -27,6 +27,14 @@ type fakeConversationRepo struct {
 	forceExisting       *version.Message
 	reconcilable        []version.ReconcilerConversation
 	lastReconcilerLimit int
+	// jobCardUpdateErr models a concurrent writer winning between the card
+	// lookup and the row-locked rewrite: the PostgreSQL update re-checks the
+	// stored status under FOR UPDATE and the fake returns this error instead of
+	// writing.
+	jobCardUpdateErr error
+	// jobCardFindOverride makes the next FindJobCardMessage return a stale
+	// snapshot, modelling a cancel that commits right after the lookup.
+	jobCardFindOverride *version.Message
 }
 
 func newFakeConversationRepo() *fakeConversationRepo {
@@ -196,6 +204,12 @@ func (f *fakeConversationRepo) Summary(_ context.Context, conversationID int64) 
 // FindJobCardMessage mirrors the version writer's one-card-per-job lookup: the
 // newest assistant message whose parts carry a job_card for jobID.
 func (f *fakeConversationRepo) FindJobCardMessage(_ context.Context, versionID, conversationID, jobID int64) (*version.Message, error) {
+	if f.jobCardFindOverride != nil {
+		stale := *f.jobCardFindOverride
+		stale.Parts = append([]version.MessagePart(nil), f.jobCardFindOverride.Parts...)
+		f.jobCardFindOverride = nil
+		return &stale, nil
+	}
 	conversation, ok := f.conversations[conversationID]
 	if !ok || conversation.VersionID != versionID {
 		return nil, version.ErrMessageNotFound
@@ -219,8 +233,22 @@ func (f *fakeConversationRepo) FindJobCardMessage(_ context.Context, versionID, 
 
 // UpdateJobCardMessage mirrors the writer's in-place card rewrite: the message
 // snapshot part and its conversation_message_part payload change, while the
-// message/row identity (id, seq, created_at) stays untouched.
-func (f *fakeConversationRepo) UpdateJobCardMessage(_ context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+// message/row identity (id, seq, created_at) stays untouched. A cancelled card
+// is sticky, like the PostgreSQL row-locked update.
+func (f *fakeConversationRepo) UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return f.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, false)
+}
+
+// ReopenJobCardMessage is the explicit retry reopen: the one rewrite allowed to
+// replace a cancelled card.
+func (f *fakeConversationRepo) ReopenJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return f.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, true)
+}
+
+func (f *fakeConversationRepo) updateJobCardMessage(_ context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart, allowCancelled bool) error {
+	if f.jobCardUpdateErr != nil {
+		return f.jobCardUpdateErr
+	}
 	conversation, ok := f.conversations[conversationID]
 	if !ok || conversation.VersionID != versionID {
 		return version.ErrMessageNotFound
@@ -233,6 +261,9 @@ func (f *fakeConversationRepo) UpdateJobCardMessage(_ context.Context, versionID
 		replaced := false
 		for partIndex := range message.Parts {
 			if message.Parts[partIndex].Type == version.MessagePartJobCard && message.Parts[partIndex].JobID == jobID {
+				if !allowCancelled && !version.JobCardRewriteAllowed(message.Parts[partIndex].Status, part.Status) {
+					return version.ErrJobCardCancelled
+				}
 				message.Parts[partIndex] = part
 				replaced = true
 				break

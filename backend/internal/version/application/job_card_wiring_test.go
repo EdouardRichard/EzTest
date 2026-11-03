@@ -342,3 +342,251 @@ func TestCancelLegacyNoCard(t *testing.T) {
 		t.Fatalf("events = %d, want no republish for a legacy thread", got-eventsBefore)
 	}
 }
+
+// newCancelledJobCard projects jobID's running card at the given progress and
+// cancels it, returning the stored card message and the event count after the
+// cancel — the baseline a late worker projection must not change.
+func newCancelledJobCard(t *testing.T, env *conversationEnv, conversationID, jobID int64, current int) (versionapp.MessageView, int) {
+	t.Helper()
+	cancelable := true
+	start := version.MessagePart{
+		Type: "job_card", JobID: jobID, JobKind: "requirement.curate",
+		Status: "running", Current: current, Total: 5, Cancelable: &cancelable,
+	}
+	cardMessage, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversationID, start)
+	if err != nil {
+		t.Fatalf("UpsertJobCard(start): %v", err)
+	}
+	if !created {
+		t.Fatal("fixture did not create the job card message")
+	}
+	if err := env.svc.CancelJobCard(requestContext(), env.versionID, conversationID, jobID); err != nil {
+		t.Fatalf("CancelJobCard: %v", err)
+	}
+	return cardMessage, len(env.events.events)
+}
+
+// assertCancelledJobCardStored pins the sticky terminal snapshot: one card
+// message, status cancelled, cancelable false, kind/current/total unchanged,
+// and the streaming row carrying the same snapshot.
+func assertCancelledJobCardStored(t *testing.T, env *conversationEnv, conversationID, messageID, jobID int64, current int) {
+	t.Helper()
+	messages := env.repo.messages[conversationID]
+	if len(messages) != 1 {
+		t.Fatalf("conversation messages = %d, want the one card", len(messages))
+	}
+	stored := messages[0]
+	if stored.ID != messageID || len(stored.Parts) != 1 {
+		t.Fatalf("stored card message = %#v, want the original card %d", stored, messageID)
+	}
+	card := stored.Parts[0]
+	if card.Type != version.MessagePartJobCard || card.JobID != jobID || card.Status != "cancelled" {
+		t.Fatalf("stored card = %#v, want the cancelled card of job %d", card, jobID)
+	}
+	if card.Cancelable == nil || *card.Cancelable {
+		t.Fatalf("stored card cancelable = %v, want false", card.Cancelable)
+	}
+	if card.JobKind != "requirement.curate" || card.Current != current || card.Total != 5 {
+		t.Fatalf("stored card = %#v, want the pre-cancel snapshot", card)
+	}
+	rows, err := env.svc.MessageParts(requestContext(), env.versionID, conversationID, messageID)
+	if err != nil {
+		t.Fatalf("MessageParts: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Seq != 1 || rows[0].Type != version.MessagePartJobCard {
+		t.Fatalf("card stream rows = %#v, want the original one seq=1 row", rows)
+	}
+	payload := decodedStreamParts(t, rows)[0]
+	if payload["status"] != "cancelled" || payload["cancelable"] != false ||
+		payload["current"] != float64(current) {
+		t.Fatalf("card row payload = %#v, want the cancelled snapshot", payload)
+	}
+}
+
+// TestLateRunningAfterCancelNoop pins the cancel card's stickiness against the
+// worker's ~10s heartbeat delay: the in-flight turn may still report progress
+// after the cancel committed, and that late running projection must be ignored
+// instead of overwriting the persisted cancelled card. No new message and no
+// conversation.message republish either.
+func TestLateRunningAfterCancelNoop(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation := newChatConversation(t, env)
+	cardMessage, eventsAfterCancel := newCancelledJobCard(t, env, conversation.ID, 701, 2)
+
+	late := version.MessagePart{
+		Type: "job_card", JobID: 701, JobKind: "requirement.curate",
+		Status: "running", Current: 4, Total: 5, Cancelable: boolPtr(true),
+	}
+	view, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversation.ID, late)
+	if err != nil {
+		t.Fatalf("late running UpsertJobCard: %v", err)
+	}
+	if created {
+		t.Fatal("late running projection appended a second card")
+	}
+	if view.ID != cardMessage.ID || len(view.Parts) != 1 || view.Parts[0].Status != "cancelled" {
+		t.Fatalf("late running projection result = %#v, want the stored cancelled card %d", view, cardMessage.ID)
+	}
+	assertCancelledJobCardStored(t, env, conversation.ID, cardMessage.ID, 701, 2)
+
+	if got := len(env.events.events); got != eventsAfterCancel {
+		t.Fatalf("events after late running projection = %d, want the pre-projection %d (no republish)",
+			got, eventsAfterCancel)
+	}
+}
+
+// TestLateDoneAfterCancelNoop pins the same stickiness for the runner's late
+// terminal outcome and its retryable failure reopen: once the persisted card is
+// cancelled, done/failed/open projections are ignored. It also models the row
+// lock race: a cancel committing after this projection's lookup is a silent
+// no-op, not an error that would surface out of the best-effort write-back.
+func TestLateDoneAfterCancelNoop(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		status     string
+		cancelable *bool
+	}{
+		{"done", "done", nil},
+		{"failed", "failed", nil},
+		{"open", "open", boolPtr(true)},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			env := newConversationEnv(t)
+			conversation := newChatConversation(t, env)
+			cardMessage, eventsAfterCancel := newCancelledJobCard(t, env, conversation.ID, 702, 1)
+
+			late := version.MessagePart{
+				Type: "job_card", JobID: 702, JobKind: "requirement.curate",
+				Status: testCase.status, Current: 3, Total: 5, Cancelable: testCase.cancelable,
+			}
+			view, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversation.ID, late)
+			if err != nil {
+				t.Fatalf("late %s UpsertJobCard: %v", testCase.status, err)
+			}
+			if created || view.ID != cardMessage.ID {
+				t.Fatalf("late %s projection = (%d, created=%v), want the stored card %d",
+					testCase.status, view.ID, created, cardMessage.ID)
+			}
+			assertCancelledJobCardStored(t, env, conversation.ID, cardMessage.ID, 702, 1)
+			if got := len(env.events.events); got != eventsAfterCancel {
+				t.Fatalf("events after late %s projection = %d, want %d (no republish)",
+					testCase.status, got, eventsAfterCancel)
+			}
+		})
+	}
+
+	t.Run("a lost row-lock race is a silent no-op", func(t *testing.T) {
+		env := newConversationEnv(t)
+		conversation := newChatConversation(t, env)
+		cardMessage, eventsAfterCancel := newCancelledJobCard(t, env, conversation.ID, 705, 0)
+		// The cancel commits after this projection's card lookup: the
+		// repository's FOR UPDATE re-check sees the cancelled card and rejects
+		// the rewrite. The app must treat that as an ignored write-back.
+		env.repo.jobCardFindOverride = &version.Message{
+			ID: cardMessage.ID, ConversationID: conversation.ID, Role: version.MessageRoleAssistant,
+			Parts: []version.MessagePart{{
+				Type: "job_card", JobID: 705, JobKind: "requirement.curate",
+				Status: "running", Current: 0, Total: 5, Cancelable: boolPtr(true),
+			}},
+		}
+		env.repo.jobCardUpdateErr = version.ErrJobCardCancelled
+
+		late := version.MessagePart{
+			Type: "job_card", JobID: 705, JobKind: "requirement.curate",
+			Status: "done", Current: 2, Total: 5,
+		}
+		view, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversation.ID, late)
+		if err != nil {
+			t.Fatalf("late projection surfaced the concurrent cancel: %v", err)
+		}
+		if created || view.ID != 0 {
+			t.Fatalf("late projection after a lost race = (%d, created=%v), want no write",
+				view.ID, created)
+		}
+		assertCancelledJobCardStored(t, env, conversation.ID, cardMessage.ID, 705, 0)
+		if got := len(env.events.events); got != eventsAfterCancel {
+			t.Fatalf("events after lost-race projection = %d, want %d", got, eventsAfterCancel)
+		}
+	})
+}
+
+// TestRetryReopensCancelledCard pins the explicit retry reopen: the one write
+// allowed to replace a cancelled card. The same message is reused (never a
+// second card), the card returns to the non-terminal open snapshot, and the new
+// attempt's running projection is accepted again.
+func TestRetryReopensCancelledCard(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation := newChatConversation(t, env)
+	cardMessage, _ := newCancelledJobCard(t, env, conversation.ID, 703, 3)
+
+	if err := env.svc.ReopenJobCard(requestContext(), env.versionID, conversation.ID, 703); err != nil {
+		t.Fatalf("ReopenJobCard: %v", err)
+	}
+
+	messages := env.repo.messages[conversation.ID]
+	if len(messages) != 1 || messages[0].ID != cardMessage.ID {
+		t.Fatalf("messages after reopen = %#v, want the original card %d", messages, cardMessage.ID)
+	}
+	card := messages[0].Parts[0]
+	if card.Status != "open" {
+		t.Fatalf("reopened card status = %q, want open", card.Status)
+	}
+	if card.Cancelable == nil || !*card.Cancelable {
+		t.Fatalf("reopened card cancelable = %v, want true", card.Cancelable)
+	}
+	if card.JobKind != "requirement.curate" || card.Current != 3 || card.Total != 5 {
+		t.Fatalf("reopen rewrote the card beyond the status/cancelable fields: %#v", card)
+	}
+	rows, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, cardMessage.ID)
+	if err != nil {
+		t.Fatalf("MessageParts: %v", err)
+	}
+	payload := decodedStreamParts(t, rows)[0]
+	if payload["status"] != "open" || payload["cancelable"] != true {
+		t.Fatalf("reopened card row payload = %#v, want the open snapshot", payload)
+	}
+	event := eventParts(t, lastConversationMessageEvent(t, env, cardMessage.ID))
+	if event[0]["status"] != "open" || event[0]["job_id"] != "703" {
+		t.Fatalf("republished reopen event = %#v, want open job 703", event[0])
+	}
+
+	// The sticky guard is lifted for the new attempt: the runner's start
+	// projection rewrites the same card to running.
+	next := version.MessagePart{
+		Type: "job_card", JobID: 703, JobKind: "requirement.curate",
+		Status: "running", Current: 0, Total: 5, Cancelable: boolPtr(true),
+	}
+	view, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversation.ID, next)
+	if err != nil {
+		t.Fatalf("UpsertJobCard after reopen: %v", err)
+	}
+	if created || view.ID != cardMessage.ID || view.Parts[0].Status != "running" {
+		t.Fatalf("post-reopen projection = (%#v, created=%v), want the same card running", view, created)
+	}
+	if got := env.repo.messages[conversation.ID][0].Parts[0].Status; got != "running" {
+		t.Fatalf("card status after the new attempt started = %q, want running", got)
+	}
+	if got := len(env.repo.messages[conversation.ID]); got != 1 {
+		t.Fatalf("conversation messages = %d, want the one reused card", got)
+	}
+}
+
+// TestJobCardReopenMissingNoop pins the no-card retry path: a job that never
+// projected a card (legacy thread / non-conversation job) has nothing to
+// reopen, so the best-effort call is a silent no-op.
+func TestJobCardReopenMissingNoop(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation := newChatConversation(t, env)
+	eventsBefore := len(env.events.events)
+
+	if err := env.svc.ReopenJobCard(requestContext(), env.versionID, conversation.ID, 704); err != nil {
+		t.Fatalf("ReopenJobCard without a card: %v", err)
+	}
+	if got := len(env.repo.messages[conversation.ID]); got != 0 {
+		t.Fatalf("messages = %d, want no card appended", got)
+	}
+	if got := len(env.events.events); got != eventsBefore {
+		t.Fatalf("events = %d, want no republish for a missing card", got-eventsBefore)
+	}
+}
