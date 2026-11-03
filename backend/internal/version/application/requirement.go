@@ -19,7 +19,12 @@ import (
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// maxDedupeRequirements bounds one duplicate-draft scan.
+// maxDedupeRequirements bounds one duplicate-draft scan. Dedupe reads a single
+// page of up to this many drafts (newest IDs first) and only collapses
+// duplicates inside that page. A version with more drafts may keep duplicates in
+// the unread older tail, and re-running is not guaranteed to advance: the same
+// newest page is read again when it has no duplicates. Accepted limitation until
+// dedupe paginates; the HTTP response correctly reports an empty page.
 const maxDedupeRequirements = 200
 
 // RequirementService implements requirement draft lifecycle, immutable

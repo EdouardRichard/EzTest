@@ -1162,6 +1162,52 @@ var _ = errors.Is
 var _ = platform.Invalid
 var _ = time.Time{}
 
+// countingRequirementRepo counts List calls without changing behavior, so the
+// dedupe page contract can be pinned.
+type countingRequirementRepo struct {
+	*fakeRequirementRepo
+	listCalls   int
+	listLimits  []int
+	listCursors []*int64
+}
+
+func (r *countingRequirementRepo) List(_ context.Context, versionID int64, status version.RequirementStatus, limit int, beforeID *int64) ([]version.RequirementListItem, error) {
+	r.listCalls++
+	r.listLimits = append(r.listLimits, limit)
+	r.listCursors = append(r.listCursors, beforeID)
+	return r.fakeRequirementRepo.List(context.Background(), versionID, status, limit, beforeID)
+}
+
+// TestRequirementDedupeScansOneCappedPage documents the accepted dedupe limit:
+// one page of at most 200 drafts, no pagination. Duplicates outside the newest
+// page are not found in that call, so re-running is not guaranteed to advance
+// for versions larger than the cap.
+func TestRequirementDedupeScansOneCappedPage(t *testing.T) {
+	env := newRequirementEnv(t)
+	repo := &countingRequirementRepo{fakeRequirementRepo: env.repo}
+	service := versionapp.NewRequirementService(
+		repo, env.versionEnv.svc, env.versionEnv.catalog, env.hook,
+		env.audit, env.events, &seqIDs{}, fixedClock{at: testTime},
+	)
+
+	result, err := service.Dedupe(requestContext(), env.versionID, 42)
+	if err != nil {
+		t.Fatalf("Dedupe: %v", err)
+	}
+	if len(result.KeptIDs) != 0 || len(result.ObsoleteIDs) != 0 {
+		t.Fatalf("empty dedupe = %#v, want no ids", result)
+	}
+	if repo.listCalls != 1 {
+		t.Fatalf("dedupe List calls = %d, want one capped page", repo.listCalls)
+	}
+	if len(repo.listLimits) != 1 || repo.listLimits[0] != 200 {
+		t.Fatalf("dedupe list limits = %v, want [200]", repo.listLimits)
+	}
+	if repo.listCursors[0] != nil {
+		t.Fatalf("dedupe reused a cursor: %v", *repo.listCursors[0])
+	}
+}
+
 // containsID reports whether ids holds target.
 func containsID(ids []int64, target int64) bool {
 	for _, id := range ids {

@@ -191,6 +191,101 @@ describe("RequirementsTab draft cleanup", () => {
     expect(screen.getByTestId("bulk-confirm-bar")).toHaveTextContent("已选 1 条")
   })
 
+  it("reports a partial per-id delete failure with the successes and the first error", async () => {
+    api.deleteRequirement.mockImplementation((_versionId: string, requirementId: string) => {
+      if (requirementId === "6004") {
+        return Promise.reject(
+          new ApiError({
+            status: 409,
+            code: "state_conflict",
+            message: "requirement is not in a mutable state",
+          }),
+        )
+      }
+      return Promise.resolve({ ...requirementDetailFixture, id: requirementId, status: "obsolete" })
+    })
+    api.listRequirements
+      .mockResolvedValueOnce(draftList())
+      .mockResolvedValue([duplicateDraft, requirementSecondFixture])
+    render(<RequirementsTab versionId="2001" />)
+
+    await selectDraft("退款到账时效")
+    await selectDraft("退款到账时效（重复）")
+    fireEvent.click(screen.getByTestId("cleanup-delete"))
+    fireEvent.click(screen.getByTestId("cleanup-confirm"))
+
+    await waitFor(() => expect(api.deleteRequirement).toHaveBeenCalledTimes(2))
+    expect(await screen.findByTestId("cleanup-notice")).toHaveTextContent(
+      "已删除 1 条草案（标记为 obsolete）",
+    )
+    expect(await screen.findByText("requirement is not in a mutable state")).toBeInTheDocument()
+    expect(api.listRequirements).toHaveBeenCalledTimes(2)
+    // The failed draft stays selected so the user can retry it.
+    expect(screen.getByRole("checkbox", { name: "选择退款到账时效（重复）" })).toBeChecked()
+  })
+
+  it("deletes only draft selections when a confirmed requirement is also selected", async () => {
+    api.listRequirements
+      .mockResolvedValueOnce(draftList())
+      .mockResolvedValue([duplicateDraft, requirementSecondFixture])
+    render(<RequirementsTab versionId="2001" />)
+
+    await selectDraft("退款到账时效")
+    await selectDraft("大额订单人工审核")
+
+    expect(screen.getByTestId("requirement-cleanup-bar")).toHaveTextContent("已选 1 条草案")
+    // One draft cannot be merged, even though two requirements are selected.
+    expect(screen.getByTestId("cleanup-merge")).toBeDisabled()
+
+    fireEvent.click(screen.getByTestId("cleanup-delete"))
+    fireEvent.click(screen.getByTestId("cleanup-confirm"))
+
+    await waitFor(() => expect(api.deleteRequirement).toHaveBeenCalledWith("2001", "6001"))
+    expect(api.deleteRequirement).not.toHaveBeenCalledWith("2001", "6002")
+    expect(await screen.findByTestId("cleanup-notice")).toHaveTextContent("已删除 1 条草案")
+    expect(screen.getByRole("checkbox", { name: "选择大额订单人工审核" })).toBeChecked()
+  })
+
+  it("surfaces a refresh failure instead of claiming the successful delete worked", async () => {
+    api.listRequirements
+      .mockResolvedValueOnce(draftList())
+      .mockRejectedValueOnce(new Error("list refresh failed"))
+    render(<RequirementsTab versionId="2001" />)
+
+    await selectDraft("退款到账时效")
+    fireEvent.click(screen.getByTestId("cleanup-delete"))
+    fireEvent.click(screen.getByTestId("cleanup-confirm"))
+
+    await waitFor(() => expect(api.deleteRequirement).toHaveBeenCalledWith("2001", "6001"))
+    expect(await screen.findByText("list refresh failed")).toBeInTheDocument()
+    expect(screen.queryByTestId("cleanup-notice")).not.toBeInTheDocument()
+    expect(api.listRequirements).toHaveBeenCalledTimes(2)
+  })
+
+  it("keeps the selection and shows a typed 409 when a merge replay is rejected", async () => {
+    api.mergeRequirements.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "state_conflict",
+        message: "only draft requirements can be merged into another requirement",
+      }),
+    )
+    render(<RequirementsTab versionId="2001" />)
+
+    await selectDraft("退款到账时效")
+    await selectDraft("退款到账时效（重复）")
+    fireEvent.click(screen.getByTestId("cleanup-merge"))
+    fireEvent.change(screen.getByTestId("cleanup-merge-target"), { target: { value: "6001" } })
+    fireEvent.click(screen.getByTestId("cleanup-confirm"))
+
+    expect(
+      await screen.findByText(/only draft requirements can be merged into another requirement/),
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId("cleanup-notice")).not.toBeInTheDocument()
+    expect(screen.getByRole("checkbox", { name: "选择退款到账时效" })).toBeChecked()
+    expect(screen.getByRole("checkbox", { name: "选择退款到账时效（重复）" })).toBeChecked()
+  })
+
   it("hides dedupe when the version has fewer than two drafts", async () => {
     api.listRequirements.mockResolvedValue([requirementFixture, requirementSecondFixture])
     render(<RequirementsTab versionId="2001" />)

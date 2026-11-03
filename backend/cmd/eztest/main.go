@@ -998,9 +998,12 @@ func main() {
 
 	// P1 control plane and clarification services.
 	requirementRepo := versionpg.NewRequirementRepository(pool)
-	requirementSvc := versionapp.NewRequirementService(
+	requirementSvc, err := newRequirementService(
 		requirementRepo, versionSvc, resourceSvc,
 		designStale, auditSvc, eventSvc, ids, clk)
+	if err != nil {
+		log.Fatalf("eztest: wire requirement service: %v", err)
+	}
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
 	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
 	workQueue.SetEvents(eventSvc)

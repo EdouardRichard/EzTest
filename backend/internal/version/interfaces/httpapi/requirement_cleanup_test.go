@@ -232,6 +232,16 @@ func (a *cleanupAudit) find(action string) (auditapp.Event, bool) {
 	return auditapp.Event{}, false
 }
 
+func (a *cleanupAudit) count(action string) int {
+	count := 0
+	for _, event := range a.events {
+		if event.Action == action {
+			count++
+		}
+	}
+	return count
+}
+
 type cleanupEvents struct{ events []eventingapp.Event }
 
 func (p *cleanupEvents) Publish(_ context.Context, event eventingapp.Event) error {
@@ -245,6 +255,16 @@ func (p *cleanupEvents) types() []string {
 		types = append(types, event.Type)
 	}
 	return types
+}
+
+func (p *cleanupEvents) count(eventType string) int {
+	count := 0
+	for _, event := range p.events {
+		if event.Type == eventType {
+			count++
+		}
+	}
+	return count
 }
 
 // ---------- HTTP fixture ----------
@@ -283,6 +303,12 @@ func newCleanupRoutes(t *testing.T) *cleanupRoutes {
 
 // seed inserts one requirement with a current revision and distinct revision ID.
 func (f *cleanupRoutes) seed(id int64, status version.RequirementStatus, title, description, acceptance string) version.Requirement {
+	return f.seedInVersion(cleanupVersionID, id, status, title, description, acceptance)
+}
+
+// seedInVersion inserts a requirement belonging to another version, so
+// cross-version (foreign) access can be asserted through the real handlers.
+func (f *cleanupRoutes) seedInVersion(versionID, id int64, status version.RequirementStatus, title, description, acceptance string) version.Requirement {
 	revisionID := id + 100
 	revision := version.RequirementVersion{
 		ID: revisionID, RequirementID: id, Revision: 1,
@@ -292,7 +318,7 @@ func (f *cleanupRoutes) seed(id int64, status version.RequirementStatus, title, 
 		ContentHash: strings.Repeat("a", 64), CreatedAt: testTime,
 	}
 	requirement := version.Requirement{
-		ID: id, VersionID: cleanupVersionID, CurrentVersionID: &revisionID, Status: status,
+		ID: id, VersionID: versionID, CurrentVersionID: &revisionID, Status: status,
 		CreatedAt: testTime, UpdatedAt: testTime,
 	}
 	f.repo.seed(requirement, revision)
@@ -380,12 +406,41 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 		if types := routes.events.types(); !hasString(types, "requirement.obsoleted") {
 			t.Fatalf("events = %v, want requirement.obsoleted", types)
 		}
+		// One delete writes exactly one deleted audit + one obsoleted audit and
+		// one requirement.obsoleted event. The obsolete projection must not add
+		// a second set of rows of its own.
+		if got := routes.audit.count("requirement.deleted"); got != 1 {
+			t.Fatalf("requirement.deleted audits = %d, want 1 (%v)", got, routes.audit.actions())
+		}
+		if got := routes.audit.count("requirement.obsoleted"); got != 1 {
+			t.Fatalf("requirement.obsoleted audits = %d, want 1 (%v)", got, routes.audit.actions())
+		}
+		if got := routes.events.count("requirement.obsoleted"); got != 1 {
+			t.Fatalf("requirement.obsoleted events = %d, want 1 (%v)", got, routes.events.types())
+		}
+		auditTotal := len(routes.audit.events)
+		eventTotal := len(routes.events.events)
 
-		// A repeated delete of the already-obsolete draft is idempotent.
+		// A repeated delete of the already-obsolete draft is idempotent and
+		// publishes/audits nothing new: the replay must not duplicate
+		// requirement.deleted or requirement.obsoleted.
 		again := call(t, routes.mux, http.MethodDelete,
 			"/api/versions/101/requirements/9001", "", actor())
 		if again.Code != http.StatusOK || dataBody(t, again)["status"] != "obsolete" {
 			t.Fatalf("repeat delete = %d %s", again.Code, again.Body.String())
+		}
+		if len(routes.audit.events) != auditTotal || len(routes.events.events) != eventTotal {
+			t.Fatalf("replay wrote audit/events: audits=%v events=%v",
+				routes.audit.actions(), routes.events.types())
+		}
+		if got := routes.audit.count("requirement.deleted"); got != 1 {
+			t.Fatalf("replay requirement.deleted audits = %d, want 1", got)
+		}
+		if got := routes.audit.count("requirement.obsoleted"); got != 1 {
+			t.Fatalf("replay requirement.obsoleted audits = %d, want 1", got)
+		}
+		if got := routes.events.count("requirement.obsoleted"); got != 1 {
+			t.Fatalf("replay requirement.obsoleted events = %d, want 1", got)
 		}
 	})
 
@@ -459,8 +514,17 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 		if types := routes.events.types(); !hasString(types, "requirement.deduped") {
 			t.Fatalf("events = %v, want requirement.deduped", types)
 		}
+		if got := routes.audit.count("requirement.deduped"); got != 1 {
+			t.Fatalf("requirement.deduped audits = %d, want 1 (%v)", got, routes.audit.actions())
+		}
+		if got := routes.events.count("requirement.deduped"); got != 1 {
+			t.Fatalf("requirement.deduped events = %d, want 1 (%v)", got, routes.events.types())
+		}
+		auditTotal := len(routes.audit.events)
+		eventTotal := len(routes.events.events)
 
-		// Repeating dedupe is idempotent: no duplicate drafts remain.
+		// Repeating dedupe is idempotent: no duplicate drafts remain. The no-op
+		// must not emit a second requirement.deduped audit/event.
 		again := call(t, routes.mux, http.MethodPost,
 			"/api/versions/101/requirements/dedupe", "", actor())
 		if again.Code != http.StatusOK {
@@ -468,6 +532,16 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 		}
 		if obsoleteAgain := stringList(t, dataBody(t, again)["obsolete_ids"]); len(obsoleteAgain) != 0 {
 			t.Fatalf("repeat dedupe obsolete ids = %v, want empty", obsoleteAgain)
+		}
+		if len(routes.audit.events) != auditTotal || len(routes.events.events) != eventTotal {
+			t.Fatalf("no-op dedupe wrote audit/events: audits=%v events=%v",
+				routes.audit.actions(), routes.events.types())
+		}
+		if got := routes.audit.count("requirement.deduped"); got != 1 {
+			t.Fatalf("no-op dedupe requirement.deduped audits = %d, want 1", got)
+		}
+		if got := routes.events.count("requirement.deduped"); got != 1 {
+			t.Fatalf("no-op dedupe requirement.deduped events = %d, want 1", got)
 		}
 
 		missingVersion := call(t, routes.mux, http.MethodPost,
@@ -477,6 +551,31 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 		unauthenticated := call(t, routes.mux, http.MethodPost,
 			"/api/versions/101/requirements/dedupe", "", nil)
 		requireError(t, unauthenticated, http.StatusUnauthorized, "unauthenticated")
+	})
+
+	t.Run("dedupe with nothing to collapse is silent", func(t *testing.T) {
+		routes := newCleanupRoutes(t)
+		routes.seed(9151, version.RequirementDraft, "Coupon checkout", "coupon desc", "coupon acceptance")
+		routes.seed(9152, version.RequirementDraft, "Refund timing", "refund desc", "refund acceptance")
+
+		recorder := call(t, routes.mux, http.MethodPost,
+			"/api/versions/101/requirements/dedupe", "", actor())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("dedupe status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		data := dataBody(t, recorder)
+		if len(stringList(t, data["obsolete_ids"])) != 0 {
+			t.Fatalf("obsolete ids = %v, want empty", data["obsolete_ids"])
+		}
+		if len(stringList(t, data["kept_ids"])) != 2 {
+			t.Fatalf("kept ids = %v, want both unique drafts", data["kept_ids"])
+		}
+		if got := routes.audit.count("requirement.deduped"); got != 0 {
+			t.Fatalf("no-op dedupe audits = %v, want none", routes.audit.actions())
+		}
+		if got := routes.events.count("requirement.deduped"); got != 0 {
+			t.Fatalf("no-op dedupe events = %v, want none", routes.events.types())
+		}
 	})
 
 	t.Run("merge folds draft sources into the target and records the relation", func(t *testing.T) {
@@ -556,6 +655,100 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("closed requirements are rejected with a typed 409", func(t *testing.T) {
+		routes := newCleanupRoutes(t)
+		routes.seed(9351, version.RequirementClosed, "Closed target", "desc", "acceptance")
+		routes.seed(9352, version.RequirementDraft, "Draft source", "desc", "acceptance")
+		routes.seed(9353, version.RequirementDraft, "Draft target", "desc", "acceptance")
+		routes.seed(9354, version.RequirementClosed, "Closed source", "desc", "acceptance")
+
+		deleted := call(t, routes.mux, http.MethodDelete,
+			"/api/versions/101/requirements/9351", "", actor())
+		requireError(t, deleted, http.StatusConflict, "state_conflict")
+		if stored := statusOf(t, routes.repo, 9351); stored != version.RequirementClosed {
+			t.Fatalf("closed requirement changed to %q", stored)
+		}
+		if _, ok := routes.audit.find("requirement.deleted"); ok {
+			t.Fatal("rejected closed delete must not be audited as deleted")
+		}
+
+		closedTarget := call(t, routes.mux, http.MethodPost,
+			"/api/versions/101/requirements/merge",
+			`{"target_requirement_id":"9351","source_requirement_ids":["9352"]}`, actor())
+		requireError(t, closedTarget, http.StatusConflict, "state_conflict")
+		if stored := statusOf(t, routes.repo, 9351); stored != version.RequirementClosed {
+			t.Fatalf("closed merge target changed to %q", stored)
+		}
+		if stored := statusOf(t, routes.repo, 9352); stored != version.RequirementDraft {
+			t.Fatalf("draft source changed after rejected closed-target merge: %q", stored)
+		}
+
+		closedSource := call(t, routes.mux, http.MethodPost,
+			"/api/versions/101/requirements/merge",
+			`{"target_requirement_id":"9353","source_requirement_ids":["9354"]}`, actor())
+		requireError(t, closedSource, http.StatusConflict, "state_conflict")
+		if stored := statusOf(t, routes.repo, 9354); stored != version.RequirementClosed {
+			t.Fatalf("closed merge source changed to %q", stored)
+		}
+		if len(routes.repo.relations) != 0 {
+			t.Fatalf("rejected closed merges wrote relations: %#v", routes.repo.relations)
+		}
+		if got := routes.audit.count("requirement.merged"); got != 0 {
+			t.Fatalf("rejected closed merges audited as merged: %v", routes.audit.actions())
+		}
+		if got := routes.events.count("requirement.merged"); got != 0 {
+			t.Fatalf("rejected closed merges published merged: %v", routes.events.types())
+		}
+	})
+
+	t.Run("merge resolves target and sources inside the version", func(t *testing.T) {
+		routes := newCleanupRoutes(t)
+		routes.seed(9601, version.RequirementDraft, "Target", "target desc", "target acceptance")
+		routes.seed(9602, version.RequirementDraft, "Source", "source desc", "source acceptance")
+		// Same IDs exist, but under a foreign version: the version-scoped reads
+		// must report 404 instead of reaching them.
+		routes.seedInVersion(102, 9603, version.RequirementDraft, "Foreign target", "foreign desc", "foreign acceptance")
+		routes.seedInVersion(102, 9604, version.RequirementDraft, "Foreign source", "foreign desc", "foreign acceptance")
+
+		cases := []struct {
+			name string
+			body string
+		}{
+			{"missing target", `{"target_requirement_id":"9999","source_requirement_ids":["9602"]}`},
+			{"foreign target", `{"target_requirement_id":"9603","source_requirement_ids":["9602"]}`},
+			{"missing source", `{"target_requirement_id":"9601","source_requirement_ids":["9999"]}`},
+			{"foreign source", `{"target_requirement_id":"9601","source_requirement_ids":["9604"]}`},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				recorder := call(t, routes.mux, http.MethodPost,
+					"/api/versions/101/requirements/merge", tc.body, actor())
+				requireError(t, recorder, http.StatusNotFound, "not_found")
+			})
+		}
+		if stored := statusOf(t, routes.repo, 9601); stored != version.RequirementDraft {
+			t.Fatalf("target status changed to %q", stored)
+		}
+		if stored := statusOf(t, routes.repo, 9602); stored != version.RequirementDraft {
+			t.Fatalf("source status changed to %q", stored)
+		}
+		if stored := statusOf(t, routes.repo, 9603); stored != version.RequirementDraft {
+			t.Fatalf("foreign target status changed to %q", stored)
+		}
+		if stored := statusOf(t, routes.repo, 9604); stored != version.RequirementDraft {
+			t.Fatalf("foreign source status changed to %q", stored)
+		}
+		if len(routes.repo.relations) != 0 {
+			t.Fatalf("rejected cross-version merges wrote relations: %#v", routes.repo.relations)
+		}
+		if got := routes.audit.count("requirement.merged"); got != 0 {
+			t.Fatalf("rejected merges audited as merged: %v", routes.audit.actions())
+		}
+		if got := routes.events.count("requirement.merged"); got != 0 {
+			t.Fatalf("rejected merges published merged: %v", routes.events.types())
+		}
+	})
+
 	t.Run("merge validates the request with typed errors", func(t *testing.T) {
 		routes := newCleanupRoutes(t)
 		routes.seed(9401, version.RequirementDraft, "Target", "desc", "acceptance")
@@ -567,6 +760,7 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 			field string
 		}{
 			{"missing target", `{"source_requirement_ids":["9402"]}`, "target_requirement_id"},
+			{"bad target id", `{"target_requirement_id":"nope","source_requirement_ids":["9402"]}`, "target_requirement_id"},
 			{"empty sources", `{"target_requirement_id":"9401","source_requirement_ids":[]}`, "source_requirement_ids"},
 			{"self merge", `{"target_requirement_id":"9401","source_requirement_ids":["9401"]}`, "source_requirement_ids"},
 			{"bad source id", `{"target_requirement_id":"9401","source_requirement_ids":["nope"]}`, "source_requirement_ids[0]"},
@@ -591,11 +785,20 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 
 	t.Run("cleanup rejects malformed version and requirement ids", func(t *testing.T) {
 		routes := newCleanupRoutes(t)
-		recorder := call(t, routes.mux, http.MethodDelete,
-			"/api/versions/nope/requirements/1", "", actor())
-		requireError(t, recorder, http.StatusBadRequest, "invalid_argument")
-		if details, _ := errorBody(t, recorder)["details"].(map[string]any); details["field"] != "id" {
-			t.Fatalf("version id error details = %#v", details)
+
+		requireField := func(t *testing.T, method, path, body, field string) {
+			t.Helper()
+			recorder := call(t, routes.mux, method, path, body, actor())
+			requireError(t, recorder, http.StatusBadRequest, "invalid_argument")
+			if details, _ := errorBody(t, recorder)["details"].(map[string]any); details["field"] != field {
+				t.Fatalf("error details = %#v, want field %q (body = %s)", details, field, recorder.Body.String())
+			}
 		}
+
+		requireField(t, http.MethodDelete, "/api/versions/nope/requirements/1", "", "id")
+		requireField(t, http.MethodDelete, "/api/versions/101/requirements/nope", "", "rid")
+		requireField(t, http.MethodPost, "/api/versions/nope/requirements/merge",
+			`{"target_requirement_id":"1","source_requirement_ids":["2"]}`, "id")
+		requireField(t, http.MethodPost, "/api/versions/nope/requirements/dedupe", "", "id")
 	})
 }
