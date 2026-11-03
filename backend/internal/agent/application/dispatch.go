@@ -68,6 +68,17 @@ type VersionReportEnsurer interface {
 	EnsureVersionReport(ctx context.Context, versionID int64) (delivery.Report, error)
 }
 
+// DesignConversationEnsurer resolves (creating when absent) the version's design
+// conversation before the design.cases stage-entry item is dispatched. The
+// conversation id is stored in the frozen work_item payload column so the job
+// card and the job-control cancel/retry write-back can find the thread; the
+// design runner then opens the round in that same conversation. Nil keeps the
+// previous behavior (the runner creates the conversation while consuming the
+// job, without a persisted association). *designapp.Planner satisfies it.
+type DesignConversationEnsurer interface {
+	EnsureDesignConversation(ctx context.Context, versionID int64) (int64, error)
+}
+
 // DispatcherDeps wires the four-way dispatcher.
 type DispatcherDeps struct {
 	// WorkItems is the additive 0.2.1 contract repository (Task 6).
@@ -78,6 +89,9 @@ type DispatcherDeps struct {
 	Stages VersionStageReader
 	// Reports enforces the §5.3 report gate behind report.version (R43).
 	Reports VersionReportEnsurer
+	// DesignConversations associates the deterministic design.cases stage-entry
+	// job with the design conversation it belongs to (Task 69). Optional.
+	DesignConversations DesignConversationEnsurer
 }
 
 // Dispatcher is the only writer of the 0.2.1 work_item contract. It enforces
@@ -86,15 +100,21 @@ type DispatcherDeps struct {
 // WorkItemContractRepository.CreateWorkItem, whose unique constraint makes a
 // repeated dispatch return the existing row instead of creating a duplicate.
 type Dispatcher struct {
-	workItems agent.WorkItemContractRepository
-	stages    VersionStageReader
-	reports   VersionReportEnsurer
+	workItems     agent.WorkItemContractRepository
+	stages        VersionStageReader
+	reports       VersionReportEnsurer
+	conversations DesignConversationEnsurer
 }
 
 // NewDispatcher wires the dispatcher. A nil WorkItems keeps the dispatcher
 // constructible for degraded assemblies; Dispatch then fails explicitly.
 func NewDispatcher(deps DispatcherDeps) *Dispatcher {
-	return &Dispatcher{workItems: deps.WorkItems, stages: deps.Stages, reports: deps.Reports}
+	return &Dispatcher{
+		workItems:     deps.WorkItems,
+		stages:        deps.Stages,
+		reports:       deps.Reports,
+		conversations: deps.DesignConversations,
+	}
 }
 
 // EnqueueStageJob adapts the dispatcher to the Task 4 narrow StageJobEnqueuer
@@ -347,6 +367,18 @@ func (d *Dispatcher) enqueueStageWorkItem(ctx context.Context, job versionapp.St
 	if kind == agent.WorkItemKindDesignCases {
 		goal = "generate case drafts for the confirmed requirements"
 	}
+	// The design.cases job card lives in the design conversation. Ensure the
+	// conversation now, before the row exists, and persist the association in
+	// the frozen payload column: the runner projects the card there and the
+	// job-control cancel/retry write-back can find the thread from the stored
+	// row. A degraded assembly without the ensurer keeps the old behavior.
+	conversationID := int64(0)
+	if kind == agent.WorkItemKindDesignCases && d.conversations != nil {
+		conversationID, err = d.conversations.EnsureDesignConversation(ctx, job.VersionID)
+		if err != nil {
+			return fmt.Errorf("ensure design conversation for version %d: %w", job.VersionID, err)
+		}
+	}
 	_, err = d.Dispatch(ctx, DispatchRequest{
 		VersionID:      job.VersionID,
 		Kind:           kind,
@@ -354,6 +386,7 @@ func (d *Dispatcher) enqueueStageWorkItem(ctx context.Context, job versionapp.St
 		Inputs:         inputs,
 		Actor:          DispatchActorStateMachine,
 		IdempotencyKey: stageJobKey(job.VersionID, kind, inputs),
+		ConversationID: conversationID,
 	})
 	return err
 }

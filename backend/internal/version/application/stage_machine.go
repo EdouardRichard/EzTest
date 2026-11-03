@@ -197,6 +197,23 @@ func (m *StageMachine) ConvergeClarification(ctx context.Context, versionID int6
 	return m.Transition(ctx, versionID, version.StageRequirementReview, "clarification_converged")
 }
 
+// ConvergeDesign applies the designing→case_review edge once the design pass
+// generated usable cases for the version's activated requirements (Task 69). It
+// is called by the design reconciler; like ConvergeClarification it only acts
+// on its source stage, so a repeated completion is a no-op and can never move a
+// version that already reached the case hard gate or beyond. case_review has no
+// stage-entry job, so the transition enqueues nothing.
+func (m *StageMachine) ConvergeDesign(ctx context.Context, versionID int64) error {
+	current, err := m.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageDesigning {
+		return nil
+	}
+	return m.Transition(ctx, versionID, version.StageCaseReview, "design_converged")
+}
+
 // Suspend enters blocked or paused and records the current workflow stage in
 // version.suspended_from together with the user-visible blocker reason.
 func (m *StageMachine) Suspend(ctx context.Context, versionID int64, to version.Stage, reason string) error {

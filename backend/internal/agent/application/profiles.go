@@ -143,18 +143,22 @@ const designHostPrompt = `你是 EzTest 的设计 Host（用例脑图助手）�
 回答使用简洁中文，聚焦用例覆盖与可执行性。
 [profile:design_host]`
 
-const designPlannerPrompt = `你是 EzTest 的设计 Planner（设计轮次规划者）。
+const designPlannerPrompt = `你是 EzTest 的设计 Planner（设计轮次执行者）。
 角色边界：
-- 只输出本轮设计范围说明：待设计需求、已激活范围、预计场景/用例数；不写库、不调用写工具。
-- 不确认、不删除、不关闭任何对象；确认只能由用户完成。
-- 范围以服务端 Planner 扫描结果为准，不编造未激活需求。
-用简洁中文说明本轮范围与下一步。
+- 读取一次脑图后立即用 case.graph_propose 提交本轮场景与用例 draft；不要询问用户、不要等待用户选择。
+- 只提交 draft/候选：不能确认、删除、关闭用例或需求；确认只属于用户。
+- 场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建。
+- 先做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实；来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id。
+- 用例必须包含可执行步骤、断言、来源与目标 version_sut；页面/接口发现事实可作为 knowledge/page/api 来源。
+- 范围以服务端 Planner 扫描结果为准，不编造未激活需求；不编造需求未表达的内容。
+提交后用简洁中文说明新增/更新的场景与用例数量。
 [profile:design_planner]`
 
 const caseAuthorPrompt = `你是 EzTest 的用例 Author（场景/用例作者）。
 角色边界：
 - 只能通过 case.graph_propose 提交场景与用例 draft；不能确认、删除、关闭用例或需求。
 - 先在 design.graph_read 读取当前脑图，避免重复创建；同一需求版本内修改已有用例时传既有 ID/自然键。
+- 场景名用需求标题原文、用例标题用对应验收要点原文，降低与同轮设计重复的概率；同一自然键已存在时更新而不是重复创建。
 - 用例必须包含可执行步骤、断言、来源与目标 version_sut；跨系统步骤分别指定目标。
 - 不编造需求未表达的内容；拿不准时写入 draft 并在团队频道说明假设。
 完成后在团队频道说明新增/修改的场景与用例。
@@ -197,6 +201,7 @@ var designPlannerTools = []string{
 	tools.ToolContextTeamRoomRead,
 	tools.ToolRequirementRead,
 	tools.ToolDesignGraphRead,
+	tools.ToolCaseGraphPropose,
 }
 
 var caseAuthorTools = []string{
@@ -239,8 +244,11 @@ func P2Profiles() []agent.AgentProfile {
 			Name:         "设计 Planner",
 			SystemPrompt: designPlannerPrompt,
 			AllowedTools: append([]string(nil), designPlannerTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 6, SoftSeconds: 180, HardSeconds: 300},
-			Enabled:      true,
+			// The round now proposes the case draft itself (Task 69): one graph
+			// read plus one graph_propose per activated requirement needs more
+			// turns/seconds than the frozen scope-narration budget.
+			Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+			Enabled: true,
 		},
 		{
 			Key:          ProfileKeyCaseAuthor,

@@ -1743,12 +1743,31 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			Scope:              ingestScope,
 		}
 	case WorkTypeDesignRound:
+		roundRequirementIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_ids")
+		roundRequirementVersionIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_version_ids")
+		roundScope := append([]string(nil), scope...)
+		if len(roundRequirementIDs) > 0 {
+			roundScope = append(roundScope, "requirement_ids="+joinIDText(roundRequirementIDs))
+		}
+		if len(roundRequirementVersionIDs) > 0 {
+			roundScope = append(roundScope, "requirement_version_ids="+joinIDText(roundRequirementVersionIDs))
+		}
 		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               "根据服务端扫描出的本轮设计范围，向用户说明待设计需求与预计场景/用例数量。",
-			Constraints:        []string{"只输出范围说明", "不写库、不调用写工具", "不确认、不删除"},
-			AcceptanceCriteria: []string{"说明本轮作用域与下一步", "不编造未激活需求"},
-			Scope:              scope,
+			Type: state.item.Type,
+			Goal: "读取一次设计脑图后，立即用 case.graph_propose 为本轮范围内每条已确认需求提交场景与用例草案；不要询问用户、不要等待用户选择。",
+			Constraints: []string{
+				"只提交 draft/候选，不能确认、删除、关闭用例或需求",
+				"只做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
+				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id",
+				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建",
+				"用例必须包含可执行步骤、断言、来源与目标 version_sut；页面/接口发现事实可作为 knowledge/page/api 来源；不编造需求未表达的内容",
+			},
+			AcceptanceCriteria: []string{
+				"对本轮每条已确认需求至少提交一次 case.graph_propose，并返回 case_ids/case_version_ids",
+				"提交后简要说明新增/更新的场景与用例数量",
+				"不向用户提问、不等待用户选择",
+			},
+			Scope: roundScope,
 		}
 	case WorkTypeDesignRequirement, WorkTypeDesignGap:
 		goal := "为指定需求版本设计场景与用例草案：先读取脑图，再用 case.graph_propose 提交 1 个场景与至少 1 条可执行用例。"
@@ -1764,6 +1783,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 				"同一需求版本内更新已有用例时传既有 ID/自然键",
 				"只做一次 design.graph_read 获取 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
 				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id；页面/接口发现事实可作为 knowledge/page/api 来源",
+				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与同轮设计重复的概率；同一自然键已存在时更新而不是重复创建",
 			},
 			AcceptanceCriteria: []string{
 				"design.graph_read 后再提交",
@@ -1866,7 +1886,11 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 		}
 		return "请基于最近对话继续澄清需求。"
 	case WorkTypeDesignRound:
-		return "请根据本轮设计范围，向用户简要说明待设计需求与预计生成的场景/用例数量。"
+		if requirementIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_ids"); len(requirementIDs) > 0 {
+			return fmt.Sprintf("本轮设计范围已确定（%d 条已确认需求，requirement_ids=%s）。请只读取一次 design.graph_read 获取 requirement_version_id 与发现事实，然后立即用 case.graph_propose 为每条需求提交场景与用例 draft；不要询问用户、不要等待用户选择，提交后简要说明结果。",
+				len(requirementIDs), joinIDText(requirementIDs))
+		}
+		return "本轮设计范围已确定。请只读取一次 design.graph_read 获取 requirement_version_id 与发现事实，然后立即用 case.graph_propose 为每条已确认需求提交场景与用例 draft；不要询问用户、不要等待用户选择，提交后简要说明结果。"
 	case WorkTypeDesignRequirement:
 		return fmt.Sprintf("请为需求 %s（需求版本 %s）设计场景与用例草案。",
 			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
@@ -2648,6 +2672,16 @@ func replyTarget(messageID int64) *int64 {
 }
 
 func idText(value int64) string { return strconv.FormatInt(value, 10) }
+
+// joinIDText renders a decimal ID list for the task context scope. It is used by
+// the design round scope (Task 69); the ids remain identifiers only.
+func joinIDText(ids []int64) string {
+	formatted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		formatted = append(formatted, idText(id))
+	}
+	return strings.Join(formatted, ",")
+}
 
 func stringValue(value any) string {
 	text, _ := value.(string)

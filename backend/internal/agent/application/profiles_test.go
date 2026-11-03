@@ -87,11 +87,11 @@ func TestP2ProfileSeeds(t *testing.T) {
 		agentapp.ProfileKeyDesignPlanner: {
 			tools: []string{
 				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolContextTeamRoomRead,
-				tools.ToolRequirementRead, tools.ToolDesignGraphRead,
+				tools.ToolRequirementRead, tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 6, SoftSeconds: 180, HardSeconds: 300},
+			budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
 			marker:  "[profile:design_planner]",
-			mustSay: []string{"范围"},
+			mustSay: []string{"范围", "case.graph_propose", "不要询问用户", "draft", "不能确认"},
 		},
 		agentapp.ProfileKeyCaseAuthor: {
 			tools: []string{

@@ -63,6 +63,14 @@ type Staler interface {
 	MarkRequirementChanged(ctx context.Context, versionID, requirementID int64, reason string, revision int) ([]string, error)
 }
 
+// DesignConverger applies the designing -> case_review edge once the version's
+// activated requirements have usable case coverage (Task 69). main adapts it to
+// versionapp.StageMachine.ConvergeDesign; nil disables the edge for degraded
+// assemblies.
+type DesignConverger interface {
+	ConvergeDesign(ctx context.Context, versionID int64) error
+}
+
 // GapInput requests design work for an execution gap or an uncovered
 // requirement version (spec §7.5).
 type GapInput struct {

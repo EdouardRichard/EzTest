@@ -26,6 +26,7 @@ type Planner struct {
 	conversations ConversationCreator
 	versions      VersionStarter
 	staler        Staler
+	converger     DesignConverger
 }
 
 // NewPlanner wires the design planner. Sinks and collaborators may be nil in
@@ -48,6 +49,31 @@ func NewPlanner(
 		repo: repo, ids: ids, clock: clk, events: events, enqueuer: enqueuer,
 		teamRoom: teamRoom, conversations: conversations, versions: versions, staler: staler,
 	}
+}
+
+// SetDesignConverger wires the designing -> case_review convergence port. It is
+// a setter because the composition root builds the version stage machine after
+// the design planner; nil disables the edge for degraded assemblies.
+func (p *Planner) SetDesignConverger(converger DesignConverger) *Planner {
+	if p != nil {
+		p.converger = converger
+	}
+	return p
+}
+
+// EnsureDesignConversation resolves (creating when absent) the version's design
+// conversation. The dispatcher calls it before creating the design.cases
+// stage-entry job, so the persisted work-item payload carries the conversation
+// association the job card and cancel/retry write-back need. It is idempotent.
+func (p *Planner) EnsureDesignConversation(ctx context.Context, versionID int64) (int64, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return 0, err
+	}
+	conversationID, err := p.ensureDesignConversation(ctx, versionID)
+	if err != nil {
+		return 0, mapDesignError(err, "version")
+	}
+	return conversationID, nil
 }
 
 // StartRound creates (or repairs) the manual design round of one conversation.
@@ -92,7 +118,7 @@ func (p *Planner) StartRound(ctx context.Context, versionID, conversationID, act
 		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round.ID, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
@@ -201,7 +227,7 @@ func (p *Planner) StartStageRound(ctx context.Context, versionID int64, requeste
 		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round.ID, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
@@ -519,20 +545,29 @@ func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, r
 	return nil
 }
 
-// ensureRoundTask enqueues the design.round task of one conversation.
-func (p *Planner) ensureRoundTask(ctx context.Context, versionID, roundID, conversationID int64) error {
+// ensureRoundTask enqueues the design.round task of one conversation. The
+// payload carries the round's activated requirement/version ids (Task 69), so
+// the round turn can propose cases for the whole scope without re-deriving it.
+func (p *Planner) ensureRoundTask(ctx context.Context, versionID int64, round design.Round, conversationID int64) error {
 	if p.enqueuer == nil {
 		return nil
+	}
+	payload := map[string]any{
+		"conversation_id": platformid.Format(conversationID),
+		"round_id":        platformid.Format(round.ID),
+	}
+	if ids := formatIDList(round.RequirementIDs); len(ids) > 0 {
+		payload["requirement_ids"] = ids
+	}
+	if ids := formatIDList(round.RequirementVersionIDs); len(ids) > 0 {
+		payload["requirement_version_ids"] = ids
 	}
 	_, err := p.enqueuer.Ensure(ctx, TaskInput{
 		VersionID: versionID,
 		Team:      TeamDesign,
 		Type:      TaskTypeDesignRound,
 		DedupeKey: fmt.Sprintf("round:%d", conversationID),
-		Payload: map[string]any{
-			"conversation_id": platformid.Format(conversationID),
-			"round_id":        platformid.Format(roundID),
-		},
+		Payload:   payload,
 	})
 	return err
 }

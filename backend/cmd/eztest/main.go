@@ -1203,6 +1203,11 @@ func main() {
 		WorkItems: workItems,
 		Stages:    versionRepo,
 		Reports:   reportSvc,
+		// Task 69: the design.cases stage-entry job is associated with the design
+		// conversation at dispatch time, so the persisted payload lets the job
+		// card / cancel write-back find the thread (the dispatcher creates the
+		// conversation when the version has none).
+		DesignConversations: designPlanner,
 	})
 	// Deterministic stage machine (0.2.1 §5.3/§5.5). Both hard gates confirm
 	// their selected entities before advancing; after the stage write commits
@@ -1212,6 +1217,11 @@ func main() {
 		versionapp.WithRequirementGateConfirmer(versionapp.NewRequirementGateConfirmer(requirementSvc)),
 		versionapp.WithCaseGateConfirmer(designCaseGateConfirmer{svc: designGraph}),
 	)
+	// Task 69: the design reconciler is the production caller of the
+	// designing→case_review edge. It checks the design coverage on every event
+	// pass; the stage machine only transitions a version that is still designing,
+	// so the call is idempotent and case_review has no stage-entry job.
+	designPlanner.SetDesignConverger(stageMachine)
 
 	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
 		Requirements: requirementRepo,
@@ -1501,9 +1511,15 @@ func main() {
 		// P9 explore analysis (Task 37): every version-scoped event schedules a
 		// coalesced, leader-gated gap/coverage refresh. The analysis performs
 		// its page probes through the shared explore runtime (Login first,
-		// serialized, page-scoped close).
+		// serialized, page-scoped close). Requirement events carry the changed
+		// input: they bypass the 10-minute per-version interval so the analysis
+		// actually sees the requirements created/confirmed after version.created
+		// (Task 69). The channel#seq identity suppresses the duplicate delivery
+		// of the same event from the local observer and the cross-instance
+		// listener.
 		if versionID > 0 && p9rt != nil && p9rt.Analysis != nil {
-			p9rt.Analysis.Notify(versionID)
+			eventKey := event.Channel + "#" + strconv.FormatInt(event.Seq, 10)
+			p9rt.Analysis.NotifyEvent(versionID, event.Type, eventKey)
 		}
 		return nil
 	}

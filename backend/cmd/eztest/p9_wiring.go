@@ -58,7 +58,12 @@ const (
 	p9AnalysisMaxRequirements = 50
 	p9AnalysisMaxProbes       = 3
 	p9AnalysisMaxDiscovered   = 20
-	p9AnalysisWakeBuffer      = 64
+	// p9AnalysisEventMemory bounds the recently observed change-event identities.
+	// The event observer is registered on both the local publish path and the
+	// cross-instance listener, so the same persisted event can be delivered
+	// twice; remembering its channel#seq prevents a duplicate delivery from
+	// triggering a second full refresh.
+	p9AnalysisEventMemory = 256
 	// A discovery login can hit a transient executor condition (page cap reached
 	// by a concurrent execution run, executor still starting). Retry the
 	// retry_login outcomes a few times before giving up for this debounce window.
@@ -224,8 +229,20 @@ type p9Analysis struct {
 
 	deps     p9AnalysisDeps
 	debounce *p9AnalysisDebounce
-	wake     chan int64
-	logf     func(format string, args ...any)
+	nowFn    func() time.Time
+	// pending holds at most one hint per version: a burst coalesces into one
+	// refresh request instead of filling (or overflowing) a channel. wake is a
+	// one-slot signal that the pending set changed.
+	pendingMu sync.Mutex
+	pending   map[int64]p9AnalysisHint
+	// seenEvents remembers the recently observed changed-event identities so the
+	// duplicate delivery from the cross-instance listener is dropped instead of
+	// triggering a second refresh. Its size is bounded by p9AnalysisEventMemory.
+	seenMu    sync.Mutex
+	seen      map[string]struct{}
+	seenOrder []string
+	wake      chan struct{}
+	logf      func(format string, args ...any)
 	// loginRetryDelay is the pause between retry_login discovery attempts. It
 	// is a field so the retry test does not sleep.
 	loginRetryDelay time.Duration
@@ -234,6 +251,16 @@ type p9Analysis struct {
 	// The mutex guards the attach against the running analysis loop.
 	recipeMu     sync.RWMutex
 	loginRecipes p9LoginRecipeWriter
+}
+
+// p9AnalysisHint is one coalesced refresh request. changed marks an event that
+// modified the analysis input (a requirement was created/updated/confirmed); at
+// is the event observation time, used to decide whether a refresh that started
+// later already saw the change.
+type p9AnalysisHint struct {
+	versionID int64
+	changed   bool
+	at        time.Time
 }
 
 // SetLoginRecipeWriter attaches the knowledge sedimentation port. It is a late
@@ -305,7 +332,10 @@ func newP9Analysis(deps p9AnalysisDeps) (*p9Analysis, error) {
 		}),
 		deps:     deps,
 		debounce: newP9AnalysisDebounce(p9AnalysisMinInterval, now),
-		wake:     make(chan int64, p9AnalysisWakeBuffer),
+		nowFn:    now,
+		pending:  map[int64]p9AnalysisHint{},
+		seen:     map[string]struct{}{},
+		wake:     make(chan struct{}, 1),
 		logf:     log.Printf,
 
 		loginRetryDelay: p9LoginRetryDefaultDelay,
@@ -326,22 +356,151 @@ type p9AnalysisResult struct {
 	DiscoveredAPIs  int
 }
 
-// Notify coalesces one version refresh request. A full buffer drops the hint
-// instead of blocking the event publish path; the next event retries.
+// currentTime returns the analysis clock, defaulting to the wall clock when a
+// test or degraded assembly did not inject one.
+func (a *p9Analysis) currentTime() time.Time {
+	if a == nil || a.nowFn == nil {
+		return time.Now()
+	}
+	return a.nowFn()
+}
+
+// Notify coalesces one regular version refresh request. The pending set keeps at
+// most one hint per version and a full pending set coalesces instead of
+// dropping: a new event only replaces the queued hint, and the one-slot wake
+// signal is never lost while a hint exists.
 func (a *p9Analysis) Notify(versionID int64) {
 	if a == nil || versionID <= 0 {
 		return
 	}
+	a.notify(p9AnalysisHint{versionID: versionID, at: a.currentTime()})
+}
+
+// NotifyEvent routes one published event to the analysis. Requirement events
+// changed the analysis input, so they bypass the regular 10-minute per-version
+// interval; the refresh coalesces normally (a refresh that starts after the
+// change already covers it). Other events keep the regular cadence. eventKey is
+// the persistent identity (channel#seq) used to drop the duplicate delivery of
+// the same event; an empty key skips deduplication.
+func (a *p9Analysis) NotifyEvent(versionID int64, eventType, eventKey string) {
+	if a == nil || versionID <= 0 {
+		return
+	}
+	changed := p9AnalysisInputChanged(eventType)
+	if changed && a.alreadySeenEvent(eventKey) {
+		return
+	}
+	a.notify(p9AnalysisHint{
+		versionID: versionID,
+		changed:   changed,
+		at:        a.currentTime(),
+	})
+}
+
+// alreadySeenEvent records one changed-event identity and reports whether it
+// was already observed. The ring keeps at most p9AnalysisEventMemory identities,
+// so a long-lived process cannot grow the set without bound.
+func (a *p9Analysis) alreadySeenEvent(eventKey string) bool {
+	if eventKey == "" {
+		return false
+	}
+	a.seenMu.Lock()
+	defer a.seenMu.Unlock()
+	if a.seen == nil {
+		a.seen = map[string]struct{}{}
+	}
+	if _, ok := a.seen[eventKey]; ok {
+		return true
+	}
+	a.seen[eventKey] = struct{}{}
+	a.seenOrder = append(a.seenOrder, eventKey)
+	if len(a.seenOrder) > p9AnalysisEventMemory {
+		oldest := a.seenOrder[0]
+		a.seenOrder = a.seenOrder[1:]
+		delete(a.seen, oldest)
+	}
+	return false
+}
+
+// p9AnalysisInputChanged reports whether an event changed the data the analysis
+// reads (requirements created/updated/confirmed/rolled back). Such events must
+// not be swallowed by the regular refresh interval.
+func p9AnalysisInputChanged(eventType string) bool {
+	return strings.HasPrefix(strings.TrimSpace(eventType), "requirement.")
+}
+
+// notify merges one hint into the per-version pending set. The event time is the
+// later of the two (a refresh must not be considered covered by a change that
+// happened after it started) and the changed flag is sticky.
+func (a *p9Analysis) notify(hint p9AnalysisHint) {
+	a.pendingMu.Lock()
+	if existing, ok := a.pending[hint.versionID]; ok {
+		if existing.at.After(hint.at) {
+			hint.at = existing.at
+		}
+		hint.changed = hint.changed || existing.changed
+	}
+	a.pending[hint.versionID] = hint
+	a.pendingMu.Unlock()
 	select {
-	case a.wake <- versionID:
+	case a.wake <- struct{}{}:
 	default:
 	}
 }
 
+// takePending drains the coalesced hints in deterministic version order.
+func (a *p9Analysis) takePending() []p9AnalysisHint {
+	if a == nil {
+		return nil
+	}
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	if len(a.pending) == 0 {
+		return nil
+	}
+	hints := make([]p9AnalysisHint, 0, len(a.pending))
+	for _, hint := range a.pending {
+		hints = append(hints, hint)
+	}
+	// The pending set is bounded by the number of versions seen since the last
+	// drain, so this allocation is bounded too.
+	a.pending = make(map[int64]p9AnalysisHint, len(hints))
+	sort.Slice(hints, func(i, j int) bool { return hints[i].versionID < hints[j].versionID })
+	return hints
+}
+
 // Run consumes refresh hints until the process context ends. It is leader-gated
-// so only one replica performs the probe/write, and the per-version debounce
-// keeps an event storm to one refresh per interval.
+// so only one replica performs the probe/write. Regular hints are coalesced to
+// one refresh per version per interval; an input-changing requirement event
+// bypasses that interval, so a version created before its requirements existed
+// is refreshed again when the requirements are actually created/curated and
+// confirmed.
 func (a *p9Analysis) Run(ctx context.Context, shouldRun func() bool) {
+	if a == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.wake:
+			for _, hint := range a.takePending() {
+				if shouldRun != nil && !shouldRun() {
+					// Only the leader probes/writes. The next event (or the next
+					// leader's event stream) retries; a non-leader must not build
+					// up an unbounded backlog.
+					continue
+				}
+				// runHint logs its own outcome; the loop keeps consuming hints.
+				_, _ = a.runHint(ctx, hint)
+			}
+		}
+	}
+}
+
+// logLine writes one analysis diagnostic, defaulting to the process logger for
+// a bare struct literal (tests and degraded assemblies).
+func (a *p9Analysis) logLine(format string, args ...any) {
 	if a == nil {
 		return
 	}
@@ -349,29 +508,38 @@ func (a *p9Analysis) Run(ctx context.Context, shouldRun func() bool) {
 	if logf == nil {
 		logf = log.Printf
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case versionID := <-a.wake:
-			if shouldRun != nil && !shouldRun() {
-				continue
-			}
-			if !a.debounce.due(versionID) {
-				continue
-			}
-			result, err := a.Refresh(ctx, versionID)
-			if err != nil {
-				if !errors.Is(err, context.Canceled) {
-					logf("eztest: P9 explore analysis version=%d failed: %v", versionID, err)
-				}
-				continue
-			}
-			logf("eztest: P9 explore analysis version=%d requirements=%d cases=%d pages=%d apis=%d roles=%d gaps=%d drafts=%d login=%s",
-				versionID, result.Requirements, result.Cases, result.Pages, result.APIs,
-				result.Roles, result.Gaps, result.Drafts, result.LoginStatus)
-		}
+	logf(format, args...)
+}
+
+// runHint applies the debounce policy and performs one refresh. It reports
+// whether a refresh actually ran; the bool is what the trigger regression test
+// asserts (no refresh was dropped, no storm ran twice for the same input).
+func (a *p9Analysis) runHint(ctx context.Context, hint p9AnalysisHint) (bool, error) {
+	if a == nil || hint.versionID <= 0 {
+		return false, nil
 	}
+	startedAt := a.currentTime()
+	if hint.changed {
+		if !a.debounce.dueChanged(hint.versionID, hint.at) {
+			return false, nil
+		}
+	} else if !a.debounce.due(hint.versionID) {
+		return false, nil
+	}
+	result, err := a.Refresh(ctx, hint.versionID)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			a.logLine("eztest: P9 explore analysis version=%d failed: %v", hint.versionID, err)
+		}
+		return true, err
+	}
+	// Only a successful refresh marks the change covered: a failed pass did not
+	// observe the requirements, so a later hint must retry.
+	a.debounce.completedAt(hint.versionID, startedAt)
+	a.logLine("eztest: P9 explore analysis version=%d requirements=%d cases=%d pages=%d apis=%d roles=%d gaps=%d drafts=%d login=%s",
+		hint.versionID, result.Requirements, result.Cases, result.Pages, result.APIs,
+		result.Roles, result.Gaps, result.Drafts, result.LoginStatus)
+	return true, nil
 }
 
 // Refresh runs one deterministic analysis pass for a version: first the
@@ -760,12 +928,19 @@ func p9LoginPageURL(pages []resourceapp.PageView) string {
 
 /* --------------------------- debounce ---------------------------- */
 
-// p9AnalysisDebounce coalesces refresh hints per version. A version is due when
-// it was never refreshed or the minimum interval elapsed.
+// p9AnalysisDebounce coalesces refresh hints per version. Regular hints keep a
+// minimum interval per version. Input-changing hints bypass that interval but are
+// covered by a successful refresh that started after the change: a burst of
+// requirement events therefore causes at most one extra pass, while a
+// confirmation after the last pass always triggers a new one.
 type p9AnalysisDebounce struct {
 	minInterval time.Duration
 	now         func() time.Time
-	seen        map[int64]time.Time
+	// attempted is the last refresh start per version (regular rate limit).
+	attempted map[int64]time.Time
+	// completed is the start time of the last successful refresh. A changed hint
+	// whose event time is at or before it was already observed by that pass.
+	completed map[int64]time.Time
 }
 
 func newP9AnalysisDebounce(minInterval time.Duration, now func() time.Time) *p9AnalysisDebounce {
@@ -775,21 +950,55 @@ func newP9AnalysisDebounce(minInterval time.Duration, now func() time.Time) *p9A
 	if now == nil {
 		now = time.Now
 	}
-	return &p9AnalysisDebounce{minInterval: minInterval, now: now, seen: map[int64]time.Time{}}
+	return &p9AnalysisDebounce{
+		minInterval: minInterval,
+		now:         now,
+		attempted:   map[int64]time.Time{},
+		completed:   map[int64]time.Time{},
+	}
 }
 
-// due reports whether the version may refresh now, and records the attempt so
-// concurrent hints within the interval are dropped.
+// due reports whether the version may refresh now for a regular hint, and
+// records the attempt so concurrent hints within the interval are dropped.
 func (d *p9AnalysisDebounce) due(versionID int64) bool {
 	if d == nil || versionID <= 0 {
 		return false
 	}
 	now := d.now()
-	if last, ok := d.seen[versionID]; ok && now.Sub(last) < d.minInterval {
+	if last, ok := d.attempted[versionID]; ok && now.Sub(last) < d.minInterval {
 		return false
 	}
-	d.seen[versionID] = now
+	d.attempted[versionID] = now
 	return true
+}
+
+// dueChanged reports whether a changed-input hint needs a refresh. A hint is
+// covered when a successful refresh started at or after the event; otherwise it
+// bypasses the regular interval and refreshes now.
+func (d *p9AnalysisDebounce) dueChanged(versionID int64, at time.Time) bool {
+	if d == nil || versionID <= 0 {
+		return false
+	}
+	now := d.now()
+	if at.IsZero() {
+		at = now
+	}
+	if completed, ok := d.completed[versionID]; ok && !at.After(completed) {
+		return false
+	}
+	d.attempted[versionID] = now
+	return true
+}
+
+// completedAt records the start time of a successful refresh so later changed
+// hints that were already observed by it coalesce instead of re-running.
+func (d *p9AnalysisDebounce) completedAt(versionID int64, startedAt time.Time) {
+	if d == nil || versionID <= 0 || startedAt.IsZero() {
+		return
+	}
+	if last, ok := d.completed[versionID]; !ok || startedAt.After(last) {
+		d.completed[versionID] = startedAt
+	}
 }
 
 /* ------------------------- design fact records --------------------------- */

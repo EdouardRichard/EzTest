@@ -685,3 +685,51 @@ func TestStageMachineConvergeClarification(t *testing.T) {
 		t.Fatalf("created version converged without starting clarification: %#v", created.repo.applied)
 	}
 }
+
+// TestDesigningToCaseReviewTransition pins Task 69's design completion edge:
+// once the design pass generated cases for the scoped requirements, the stage
+// machine moves designing -> case_review. The convergence is idempotent, never
+// enqueues a case_review stage job (case_review has no entry job) and never
+// moves a version at another stage.
+func TestDesigningToCaseReviewTransition(t *testing.T) {
+	env := newStageEnv(t, version.StageState{Stage: version.StageDesigning, StageEnteredAt: testTime})
+	if err := env.machine.ConvergeDesign(requestContext(), 101); err != nil {
+		t.Fatalf("ConvergeDesign: %v", err)
+	}
+	if env.repo.state.Stage != version.StageCaseReview {
+		t.Fatalf("stage = %q, want case_review", env.repo.state.Stage)
+	}
+	if len(env.repo.applied) != 1 || env.repo.applied[0].Stage != version.StageCaseReview {
+		t.Fatalf("applied = %#v, want one case_review transition", env.repo.applied)
+	}
+	if len(env.jobs.jobs) != 0 {
+		t.Fatalf("case_review enqueued a stage job: %#v", env.jobs.jobs)
+	}
+	payload := findStageEvent(t, env.publisher, "version:101")
+	if payload["from"] != "designing" || payload["to"] != "case_review" || payload["reason"] != "design_converged" {
+		t.Fatalf("stage event payload = %#v", payload)
+	}
+
+	// A repeated design completion is a no-op.
+	if err := env.machine.ConvergeDesign(requestContext(), 101); err != nil {
+		t.Fatalf("second ConvergeDesign: %v", err)
+	}
+	if len(env.repo.applied) != 1 {
+		t.Fatalf("idempotent convergence wrote %d transitions, want 1", len(env.repo.applied))
+	}
+
+	// Another stage must never converge to case_review.
+	for _, stage := range []version.Stage{
+		version.StageCreated, version.StageClarifying, version.StageRequirementReview,
+		version.StageCaseReview, version.StageExecuting,
+	} {
+		other := newStageEnv(t, version.StageState{Stage: stage, StageEnteredAt: testTime})
+		if err := other.machine.ConvergeDesign(requestContext(), 102); err != nil {
+			t.Fatalf("ConvergeDesign at %s: %v", stage, err)
+		}
+		if other.repo.state.Stage != stage || len(other.repo.applied) != 0 || len(other.publisher.events) != 0 {
+			t.Fatalf("ConvergeDesign moved %s: state=%s applied=%d events=%d",
+				stage, other.repo.state.Stage, len(other.repo.applied), len(other.publisher.events))
+		}
+	}
+}

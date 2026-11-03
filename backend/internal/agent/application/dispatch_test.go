@@ -181,6 +181,19 @@ func (f *fakeVersionReportEnsurer) EnsureVersionReport(_ context.Context, versio
 	return f.report, f.err
 }
 
+// fakeDesignConversationEnsurer records the design conversation ensure the
+// dispatcher performs before creating a design.cases stage-entry item.
+type fakeDesignConversationEnsurer struct {
+	calls []int64
+	id    int64
+	err   error
+}
+
+func (f *fakeDesignConversationEnsurer) EnsureDesignConversation(_ context.Context, versionID int64) (int64, error) {
+	f.calls = append(f.calls, versionID)
+	return f.id, f.err
+}
+
 type fakeDispatchRequirementGate struct {
 	calls int
 }
@@ -499,6 +512,93 @@ func TestDispatchAssociatesJobCardConversation(t *testing.T) {
 	if _, err := dispatcher.RequestJob(ctx, 7, agent.WorkItemKindDesignCases,
 		json.RawMessage(`{"requirement_ids":[13],"conversation_id":"not-a-number"}`)); err == nil {
 		t.Fatal("request with a malformed conversation_id was accepted")
+	}
+}
+
+// TestDesignCasesPayloadHasConversationID pins Task 69: the design.cases
+// stage-entry item is dispatched only after the design conversation exists, and
+// its frozen payload column carries the conversation association so the job
+// card / cancel write-back can find the thread. An absent ensurer degrades to
+// the previous behavior (no association), and an ensure failure never stores an
+// orphan item.
+func TestDesignCasesPayloadHasConversationID(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeWorkItemContractRepo()
+	conversations := &fakeDesignConversationEnsurer{id: 9001}
+	dispatcher := agentapp.NewDispatcher(agentapp.DispatcherDeps{
+		WorkItems:           repo,
+		Stages:              newDispatchStageRepo(version.StageDesigning),
+		DesignConversations: conversations,
+	})
+	job := versionapp.StageJob{
+		VersionID:      7,
+		Kind:           versionapp.StageJobDesignCases,
+		RequirementIDs: []int64{3, 4},
+	}
+	if err := dispatcher.EnqueueStageJob(ctx, job); err != nil {
+		t.Fatalf("EnqueueStageJob: %v", err)
+	}
+	if len(conversations.calls) != 1 || conversations.calls[0] != 7 {
+		t.Fatalf("conversation ensure calls = %v, want [7]", conversations.calls)
+	}
+	items := repo.itemsOfKind(agent.WorkItemKindDesignCases)
+	if len(items) != 1 {
+		t.Fatalf("design.cases items = %d, want 1", len(items))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(items[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload %s: %v", items[0].Payload, err)
+	}
+	if payload["conversation_id"] != "9001" {
+		t.Fatalf("design.cases payload conversation_id = %#v, want \"9001\" (payload %s)",
+			payload["conversation_id"], items[0].Payload)
+	}
+	if !strings.Contains(string(items[0].Inputs), "3") {
+		t.Fatalf("design.cases inputs = %s, want the requirement scope", items[0].Inputs)
+	}
+
+	// A stage re-entry is idempotent and keeps the same association.
+	if err := dispatcher.EnqueueStageJob(ctx, job); err != nil {
+		t.Fatalf("repeated EnqueueStageJob: %v", err)
+	}
+	if got := len(repo.itemsOfKind(agent.WorkItemKindDesignCases)); got != 1 {
+		t.Fatalf("design.cases items after re-entry = %d, want 1", got)
+	}
+
+	// Degraded assembly (no ensurer): the job is still created without an
+	// association, exactly like before this change.
+	plainRepo := newFakeWorkItemContractRepo()
+	plain := agentapp.NewDispatcher(agentapp.DispatcherDeps{
+		WorkItems: plainRepo,
+		Stages:    newDispatchStageRepo(version.StageDesigning),
+	})
+	if err := plain.EnqueueStageJob(ctx, job); err != nil {
+		t.Fatalf("EnqueueStageJob without an ensurer: %v", err)
+	}
+	plainItems := plainRepo.itemsOfKind(agent.WorkItemKindDesignCases)
+	if len(plainItems) != 1 {
+		t.Fatalf("degraded design.cases items = %d, want 1", len(plainItems))
+	}
+	var plainPayload map[string]any
+	if err := json.Unmarshal(plainItems[0].Payload, &plainPayload); err != nil {
+		t.Fatalf("decode degraded payload %s: %v", plainItems[0].Payload, err)
+	}
+	if _, ok := plainPayload["conversation_id"]; ok {
+		t.Fatalf("degraded payload must have no conversation association: %s", plainItems[0].Payload)
+	}
+
+	// An ensure failure is a dispatch failure: no orphan item is stored.
+	failingRepo := newFakeWorkItemContractRepo()
+	failing := agentapp.NewDispatcher(agentapp.DispatcherDeps{
+		WorkItems:           failingRepo,
+		Stages:              newDispatchStageRepo(version.StageDesigning),
+		DesignConversations: &fakeDesignConversationEnsurer{err: errors.New("conversation create failed")},
+	})
+	if err := failing.EnqueueStageJob(ctx, job); err == nil {
+		t.Fatal("EnqueueStageJob swallowed the conversation ensure failure")
+	}
+	if got := failingRepo.count(); got != 0 {
+		t.Fatalf("failed ensure stored %d design.cases item(s)", got)
 	}
 }
 

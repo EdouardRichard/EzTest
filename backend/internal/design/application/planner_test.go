@@ -2,7 +2,9 @@ package designapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
@@ -225,6 +227,21 @@ func TestStartStageRoundEnsuresConversationAndTasks(t *testing.T) {
 	}
 	if tasks := enqueuer.byType("design.round"); len(tasks) != 1 {
 		t.Fatalf("round tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+	} else {
+		// Task 69: the round task carries the activated scope so the round turn
+		// can propose cases for every confirmed requirement.
+		requirementIDs := taskPayloadString(tasks[0], "requirement_ids")
+		requirementVersionIDs := taskPayloadString(tasks[0], "requirement_version_ids")
+		for _, want := range []string{"3001", "3005"} {
+			if !strings.Contains(requirementIDs, want) {
+				t.Fatalf("round task requirement_ids = %q, want %s", requirementIDs, want)
+			}
+		}
+		for _, want := range []string{"3002", "3006"} {
+			if !strings.Contains(requirementVersionIDs, want) {
+				t.Fatalf("round task requirement_version_ids = %q, want %s", requirementVersionIDs, want)
+			}
+		}
 	}
 	if len(versions.calls) != 1 || versions.calls[0] != 1001 {
 		t.Fatalf("version starter calls = %v", versions.calls)
@@ -372,5 +389,75 @@ func TestReconcileIdempotent(t *testing.T) {
 	}
 	if len(enqueuer.tasks) != taskCount {
 		t.Fatalf("reconcile duplicated tasks: %v", sortedTaskDedupeKeys(enqueuer.tasks))
+	}
+}
+
+// TestDesigningToCaseReviewTransitionByDesignReconciler pins Task 69's
+// production caller of the designing -> case_review edge: the design reconciler
+// converges the version once every activated requirement has usable case
+// coverage, and leaves it designing while any requirement is uncovered, stale or
+// has no scenarios.
+func TestDesigningToCaseReviewTransitionByDesignReconciler(t *testing.T) {
+	planner, repo, _, _, _, _, _ := newPlannerFixture()
+	repo.hasConversation = true
+	repo.latestConversation = 9001
+	roundID := int64(8001)
+	repo.rounds = []design.Round{{
+		ID: roundID, VersionID: 1001, ConversationID: 9001,
+		Activation: design.ActivationAutoNew, Status: design.RoundStatusActive,
+		RequirementIDs: []int64{3001, 3005}, RequirementVersionIDs: []int64{3002, 3006},
+	}}
+	repo.activeScopes = []design.Scope{
+		{ID: 6001, VersionID: 1001, RequirementID: 3001, ActivatedByRoundID: &roundID, Status: design.ScopeStatusActive},
+		{ID: 6002, VersionID: 1001, RequirementID: 3005, ActivatedByRoundID: &roundID, Status: design.ScopeStatusActive},
+	}
+	repo.coverage = []design.RequirementCoverage{
+		{Requirement: plannerRequirement(3001, 3002), ScenarioCount: 1, DraftCount: 1},
+		{Requirement: plannerRequirement(3005, 3006), ScenarioCount: 1, DraftCount: 1},
+	}
+	converger := &fakeDesignConverger{}
+	planner.SetDesignConverger(converger)
+	ctx := context.Background()
+
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(converger.versionIDs) != 1 || converger.versionIDs[0] != 1001 {
+		t.Fatalf("converged versions = %v, want [1001]", converger.versionIDs)
+	}
+
+	// A requirement without cases keeps the version designing.
+	repo.coverage[1] = design.RequirementCoverage{Requirement: plannerRequirement(3005, 3006)}
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile with an uncovered requirement: %v", err)
+	}
+	if len(converger.versionIDs) != 1 {
+		t.Fatalf("uncovered requirement converged the version: %v", converger.versionIDs)
+	}
+
+	// A stale current case is not usable coverage either.
+	repo.coverage[1] = design.RequirementCoverage{
+		Requirement: plannerRequirement(3005, 3006), ScenarioCount: 1, StaleCount: 1,
+	}
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile with a stale case: %v", err)
+	}
+	if len(converger.versionIDs) != 1 {
+		t.Fatalf("stale case converged the version: %v", converger.versionIDs)
+	}
+
+	// A convergence failure is reported by the reconciler (the next pass
+	// retries; the stage is still the source of truth).
+	repo.coverage[1] = design.RequirementCoverage{Requirement: plannerRequirement(3005, 3006), ScenarioCount: 1, DraftCount: 1}
+	converger.err = errors.New("stage write failed")
+	if err := planner.Reconcile(ctx); err == nil {
+		t.Fatal("Reconcile swallowed the convergence failure")
+	}
+	converger.err = nil
+
+	// A degraded assembly without a converger still reconciles.
+	planner.SetDesignConverger(nil)
+	if err := planner.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile without a converger: %v", err)
 	}
 }

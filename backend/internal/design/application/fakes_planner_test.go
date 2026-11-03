@@ -80,6 +80,18 @@ func (f *fakeStaler) MarkRequirementChanged(_ context.Context, versionID, requir
 	return []string{fmt.Sprintf("%d", requirementID)}, nil
 }
 
+// fakeDesignConverger records the designing -> case_review convergence calls the
+// design reconciler makes once every activated requirement has usable coverage.
+type fakeDesignConverger struct {
+	versionIDs []int64
+	err        error
+}
+
+func (f *fakeDesignConverger) ConvergeDesign(_ context.Context, versionID int64) error {
+	f.versionIDs = append(f.versionIDs, versionID)
+	return f.err
+}
+
 func newPlannerFixture() (*Planner, *fakeRepo, *fakeEnqueuer, *fakeTeamRoom, *fakeConversationCreator, *fakeVersionStarter, *fakeStaler) {
 	repo := newFakeRepo()
 	repo.versionStatus = "initial"

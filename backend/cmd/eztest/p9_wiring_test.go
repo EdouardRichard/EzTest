@@ -8,6 +8,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -334,6 +336,121 @@ func TestExploreRuntimeConsumed(t *testing.T) {
 	// process-wide explore wiring.
 	if _, err := newP9Analysis(p9AnalysisDeps{Facts: facts, Recorder: facts, Requirements: requirements}); err == nil {
 		t.Fatal("newP9Analysis must reject a nil runtime")
+	}
+}
+
+// TestRequirementChangeTriggersAnalysis pins Task 69's P9 trigger fix. The
+// version.created refresh runs while the version has no requirements yet; a
+// later requirement create/update/confirm event changes the analysis input and
+// must re-run the analysis inside the 10-minute version window instead of being
+// swallowed by the debounce. Hints observed before a refresh starts coalesce
+// into it (one refresh sees the whole confirmation burst), and a later
+// confirmation always starts another refresh.
+func TestRequirementChangeTriggersAnalysis(t *testing.T) {
+	now := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
+	requirements := &fakeP9Requirements{}
+	facts := &fakeP9Facts{byKind: map[string][]versiondomain.Fact{}}
+	analysis, err := newP9Analysis(p9AnalysisDeps{
+		Runtime:      &fakeP9Runtime{},
+		Facts:        facts,
+		Recorder:     facts,
+		Requirements: requirements,
+		Cases:        &fakeP9Cases{},
+		Roles:        &fakeP9Roles{},
+		Versions:     &fakeP9Versions{view: versionapp.VersionView{}},
+		Now:          func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("newP9Analysis: %v", err)
+	}
+	var logs []string
+	analysis.logf = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+	ctx := context.Background()
+
+	// version.created: the analysis runs before the requirements exist.
+	ran, err := analysis.runHint(ctx, p9AnalysisHint{versionID: 1001, at: now})
+	if err != nil || !ran {
+		t.Fatalf("version.created refresh = ran %v err %v", ran, err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "requirements=0") {
+		t.Fatalf("first analysis log = %v, want requirements=0", logs)
+	}
+
+	// An unrelated event inside the window keeps the regular debounce.
+	now = now.Add(time.Minute)
+	if ran, _ = analysis.runHint(ctx, p9AnalysisHint{versionID: 1001, at: now}); ran {
+		t.Fatal("a regular event inside the 10-minute window re-ran the analysis")
+	}
+
+	// Requirement events carry changed input: the analysis must re-run now and
+	// must see the four requirements.
+	requirements.snapshots = []exploreapp.RequirementSnapshot{
+		{ID: 101, VersionID: 10010, Title: "登录", Status: "clarified"},
+		{ID: 102, VersionID: 10020, Title: "列表", Status: "clarified"},
+		{ID: 103, VersionID: 10030, Title: "评论", Status: "clarified"},
+		{ID: 104, VersionID: 10040, Title: "后台", Status: "clarified"},
+	}
+	before := requirements.calls
+	ran, err = analysis.runHint(ctx, p9AnalysisHint{versionID: 1001, changed: true, at: now})
+	if err != nil || !ran {
+		t.Fatalf("requirement change refresh = ran %v err %v", ran, err)
+	}
+	if requirements.calls <= before {
+		t.Fatal("the requirement change refresh did not read the requirements")
+	}
+	if len(logs) != 2 || !strings.Contains(logs[1], "requirements=4") {
+		t.Fatalf("requirement change log = %v, want requirements=4", logs)
+	}
+
+	// A burst hint recorded before that refresh started is covered by it: the
+	// burst coalesces into one refresh instead of a second run.
+	if ran, _ = analysis.runHint(ctx, p9AnalysisHint{versionID: 1001, changed: true, at: now.Add(-time.Second)}); ran {
+		t.Fatal("a change already covered by the last refresh re-ran the analysis")
+	}
+
+	// A later confirmation is new input and must not be swallowed.
+	now = now.Add(2 * time.Minute)
+	if ran, _ = analysis.runHint(ctx, p9AnalysisHint{versionID: 1001, changed: true, at: now}); !ran {
+		t.Fatal("a confirmation after the last refresh was swallowed")
+	}
+
+	// The classification covers create/update/confirm and leaves unrelated
+	// events on the regular interval.
+	for _, eventType := range []string{
+		"requirement.created", "requirement.version_created", "requirement.clarified",
+		"requirement.rolled_back",
+	} {
+		if !p9AnalysisInputChanged(eventType) {
+			t.Fatalf("event %q must be treated as changed analysis input", eventType)
+		}
+	}
+	for _, eventType := range []string{"version.created", "conversation.message_created", "case_version.created"} {
+		if p9AnalysisInputChanged(eventType) {
+			t.Fatalf("event %q must keep the regular debounce", eventType)
+		}
+	}
+
+	// Notifications coalesce per version in the wake queue: a regular hint and a
+	// changed hint for the same version are one changed refresh, never a drop.
+	analysis.Notify(1001)
+	analysis.NotifyEvent(1001, "requirement.clarified", "version:1001#7")
+	pending := analysis.takePending()
+	if len(pending) != 1 || !pending[0].changed || pending[0].versionID != 1001 {
+		t.Fatalf("coalesced pending hints = %#v, want one changed hint for 1001", pending)
+	}
+
+	// The same persisted event is delivered by the local observer and by the
+	// cross-instance listener. The second delivery must not queue a second
+	// refresh, while a new event identity must.
+	analysis.NotifyEvent(1001, "requirement.clarified", "version:1001#7")
+	if pending := analysis.takePending(); len(pending) != 0 {
+		t.Fatalf("duplicate event delivery queued a refresh: %#v", pending)
+	}
+	analysis.NotifyEvent(1001, "requirement.clarified", "version:1001#8")
+	if pending := analysis.takePending(); len(pending) != 1 || !pending[0].changed {
+		t.Fatalf("a new event identity was dropped: %#v", pending)
 	}
 }
 

@@ -906,6 +906,63 @@ func stringValueForTest(value any) string {
 	return text
 }
 
+// TestDesignRoundProposesCases pins Task 69: the design.round opening turn must
+// propose case drafts through case.graph_propose (one graph read, then propose)
+// instead of asking the user to pick a requirement, and its prompt must carry
+// the round's scoped requirement ids so the model proposes the right scope.
+func TestDesignRoundProposesCases(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.design.readResult = map[string]any{
+		"requirements": []any{
+			map[string]any{"requirement_id": "501", "requirement_version_id": "700"},
+			map[string]any{"requirement_id": "502", "requirement_version_id": "800"},
+		},
+		"discovery_facts": []any{map[string]any{
+			"kind": "page", "key": "page:env:1:/login", "summary": "/login · 登录",
+		}},
+	}
+	fixture.design.proposeResult = map[string]any{"case_version_ids": []string{"7001"}}
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignGraphRead, `{}`),
+		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
+		{Content: "已为本轮需求提交 1 个场景与 1 条用例草案。"},
+	}
+	item := fakeWorkItem(agentapp.WorkTypeDesignRound, agentapp.WorkItemPayload{
+		ConversationID: 20,
+		RoundID:        9001,
+	})
+	item.Payload = json.RawMessage(`{
+		"conversation_id":"20",
+		"round_id":"9001",
+		"requirement_ids":["501","502"],
+		"requirement_version_ids":["700","800"]
+	}`)
+
+	if _, err := mustRun(t, fixture, item); err != nil {
+		t.Fatalf("design.round run: %v", err)
+	}
+	if fixture.design.proposeCalls != 1 {
+		t.Fatalf("design.round proposals = %d, want the round to propose cases itself", fixture.design.proposeCalls)
+	}
+	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
+		t.Fatalf("design.round proposal = %#v", fixture.design.proposeInput)
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	for _, want := range []string{
+		"case.graph_propose", "不要询问用户", "requirement_ids=501,502",
+		"requirement_version_ids=700,800",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("design.round prompt missing %q: %s", want, prompt)
+		}
+	}
+	for _, avoid := range []string{"只输出范围说明", "不写库、不调用写工具"} {
+		if strings.Contains(prompt, avoid) {
+			t.Fatalf("design.round prompt still tells the model not to write (%q): %s", avoid, prompt)
+		}
+	}
+}
+
 func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.conv.kind = "design"
