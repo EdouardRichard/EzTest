@@ -356,17 +356,16 @@ func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool,
 		w.logger.Error("agent worker: fail write-back failed", "work_item_id", item.ID, "error", err)
 		return
 	}
-	// The repository decides dead vs retryable open; the event must reflect the
-	// persisted outcome, so read the row back after the write.
+	// The repository decides dead vs retryable-open from the claimed row with
+	// `retryable AND attempts < max_attempts` (the Fail SQL predicate). Deriving
+	// the same predicate from the claimed item gives the persisted outcome
+	// without a read-back: ListByVersion returns only the newest page, so a
+	// version holding more work items than that page would hide this one and
+	// lose the terminal event.
+	terminal := isTerminalFailure(item, retryable)
 	eventType := "work_item.failed"
-	terminal := false
-	if items, err := w.queue.ListByVersion(ctx, item.VersionID, 100); err == nil {
-		for _, current := range items {
-			if current.ID == item.ID && current.Status == agent.WorkItemDead {
-				eventType = "work_item.dead"
-				terminal = true
-			}
-		}
+	if terminal {
+		eventType = "work_item.dead"
 	}
 	attempt := item.Attempts
 	if attempt < 1 {
@@ -383,17 +382,26 @@ func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool,
 		"error":        errorText,
 	})
 	// The job projection follows the persisted work-item outcome: a dead item
-	// (attempts exhausted) is terminal failed, while a retryable failed item
-	// stays on the version stream so a later attempt can reopen it.
+	// (non-retryable or attempts exhausted) is terminal failed, while a
+	// retryable item below its cap returns to open and will be re-claimed.
 	if terminal {
 		w.jobFinished(item, result, eventingapp.JobStatusFailed, cause)
 		return
 	}
 	w.jobProgress(item, eventingapp.JobProgress{
-		Status:  eventingapp.JobStatusFailed,
+		Status:  eventingapp.JobStatusOpen,
 		Total:   0,
 		Message: errorText,
 	})
+}
+
+// isTerminalFailure mirrors the work_item repository's Fail predicate over the
+// claimed row: a retryable failure below max_attempts reopens the item; every
+// other failure is dead. The claimed item carries the post-claim attempts value
+// the SQL reads, and max_attempts is NOT NULL (default 3) on stored rows, so the
+// predicate needs no defaulting here.
+func isTerminalFailure(item agent.WorkItem, retryable bool) bool {
+	return !retryable || item.Attempts >= item.MaxAttempts
 }
 
 // draining reports the injected P7 drain signal (false when unwired).
@@ -493,9 +501,9 @@ func (w *Worker) publish(item agent.WorkItem, eventType string, payload map[stri
 // The first update for a job anchors a coalescing window (250-500ms); every
 // update inside the window replaces the pending snapshot, and the window close
 // publishes the latest snapshot once. current never moves backwards for the
-// same job and a known total is never downgraded to "unknown" (0), so a late
-// start or status event cannot make the card regress. Progress after the
-// terminal event is dropped.
+// same job, and total is a running maximum (an unknown 0 or a smaller
+// re-estimate never replaces a known total), so a late start or status event
+// cannot make the card regress. Progress after the terminal event is dropped.
 type JobProgressEmitter struct {
 	publisher eventingapp.Publisher
 	logger    *slog.Logger
@@ -557,13 +565,14 @@ func (e *JobProgressEmitter) Progress(versionID int64, progress eventingapp.JobP
 	}
 	// Monotonic snapshot: a status-only update (current 0) or a retried run
 	// (turn counter reset) must not pull the visible progress backwards, and a
-	// total learned once stays known.
+	// known total is a running maximum: a later smaller positive total (a
+	// re-estimate) or an unknown (0) total never shrinks the denominator.
 	if progress.Current < state.current {
 		progress.Current = state.current
 	}
 	state.current = progress.Current
 	switch {
-	case progress.Total > 0:
+	case progress.Total > state.total:
 		state.total = progress.Total
 	case state.total > 0:
 		progress.Total = state.total
