@@ -78,11 +78,23 @@ type CaseAugmentConfig struct {
 }
 
 // CaseAugmentDeps are the narrow ports of the augmentation. Writer may be nil:
-// the drafts are then returned to a caller that persists them.
+// the drafts are then returned to a caller that persists them. Requirements may
+// be nil: the eligibility filter is then skipped and the writer stays the
+// authority on which drafts it accepts (failures are isolated per draft).
 type CaseAugmentDeps struct {
-	Facts  FactReader
-	Cases  CaseSource
-	Writer DraftCaseWriter
+	Facts        FactReader
+	Cases        CaseSource
+	Writer       DraftCaseWriter
+	Requirements RequirementSource
+}
+
+// CaseDraftFailure is one writer failure isolated to its draft. One rejected
+// draft must never abort the remaining drafts of the batch: the run continues
+// and the caller reports the partial result.
+type CaseDraftFailure struct {
+	RequirementID int64
+	Dimension     GapDimension
+	Reason        string
 }
 
 // CaseAugmentResult is the deterministic output of one run.
@@ -92,6 +104,13 @@ type CaseAugmentResult struct {
 	Created    []CaseDraftResult
 	Duplicates int
 	Truncated  bool
+	// Skipped counts requirement-gap drafts that were not eligible for the
+	// design writer (not clarified, stale version, or no longer current). They
+	// are skipped before the writer is called, so they cannot abort the batch.
+	Skipped int
+	// Failed holds the per-draft writer failures that were isolated. A non-empty
+	// list is a partial success: the drafts in Created were persisted.
+	Failed []CaseDraftFailure
 }
 
 // CaseAugment produces deduplicated case drafts from the current gap facts.
@@ -105,11 +124,17 @@ func NewCaseAugment(cfg CaseAugmentConfig, deps CaseAugmentDeps) *CaseAugment {
 	return &CaseAugment{cfg: cfg, deps: deps}
 }
 
-// Run reads the gap facts, skips drafts that already exist (by deterministic
-// title) and writes the remainder as draft cases when a writer is configured.
-// It never confirms, modifies a requirement or executes a case.
+// Run reads the gap facts, skips drafts whose requirement is no longer current
+// or clarified, skips drafts that already exist (by deterministic title) and
+// writes the remainder as draft cases when a writer is configured. It never
+// confirms, modifies a requirement or executes a case.
 func (a *CaseAugment) Run(ctx context.Context, versionID int64) (CaseAugmentResult, error) {
-	result := CaseAugmentResult{VersionID: versionID, Drafts: []CaseDraft{}, Created: []CaseDraftResult{}}
+	result := CaseAugmentResult{
+		VersionID: versionID,
+		Drafts:    []CaseDraft{},
+		Created:   []CaseDraftResult{},
+		Failed:    []CaseDraftFailure{},
+	}
 	if a == nil || a.deps.Facts == nil {
 		return result, errors.New("case augmentation has no fact reader")
 	}
@@ -126,6 +151,16 @@ func (a *CaseAugment) Run(ctx context.Context, versionID int64) (CaseAugmentResu
 	}
 	sort.SliceStable(gapFacts, func(i, j int) bool { return gapFacts[i].ID < gapFacts[j].ID })
 
+	// The design writer only accepts a draft whose requirement is still current
+	// and clarified. A gap recorded for a requirement that has since been
+	// reviewed, closed, re-versioned or deleted is skipped here instead of
+	// being sent to a writer that must reject it, so one stale requirement can
+	// never abort the remaining drafts.
+	eligible, err := a.eligibleRequirements(ctx, versionID)
+	if err != nil {
+		return result, err
+	}
+
 	existing, err := a.existingTitles(ctx, versionID)
 	if err != nil {
 		return result, err
@@ -140,6 +175,10 @@ func (a *CaseAugment) Run(ctx context.Context, versionID int64) (CaseAugmentResu
 		if !ok {
 			// A version-level dependency gap (requirement_id=0) is not a
 			// requirement gap: it must not silently become a case.
+			continue
+		}
+		if !draftEligible(draft, eligible) {
+			result.Skipped++
 			continue
 		}
 		// Existing cases are deduped by their deterministic title; produced
@@ -166,14 +205,67 @@ func (a *CaseAugment) Run(ctx context.Context, versionID int64) (CaseAugmentResu
 		}
 		stored, writeErr := a.deps.Writer.CreateDraftCase(ctx, versionID, draft)
 		if writeErr != nil {
-			return result, fmt.Errorf("create augmented case draft: %w", writeErr)
+			// Ineligibility (a requirement that is no longer clarified or whose
+			// version went stale) is a per-draft condition, not a batch failure:
+			// isolate it and keep writing the other drafts.
+			result.Failed = append(result.Failed, CaseDraftFailure{
+				RequirementID: draft.RequirementID,
+				Dimension:     draft.Dimension,
+				Reason:        clipString(writeErr.Error(), 300),
+			})
+			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(stored.Status), coverageCaseDraft) {
+			// A non-draft writer result is a contract violation, not an
+			// eligibility problem: stop before more unsafe writes happen.
 			return result, fmt.Errorf("case augment: writer returned status %q; only draft cases are allowed", stored.Status)
 		}
 		result.Created = append(result.Created, stored)
 	}
 	return result, nil
+}
+
+// eligibleRequirements reads the current requirement source once per run. A nil
+// source disables the filter (the writer stays the authority and its per-draft
+// failures are isolated); a nil map returned here also disables it. A read
+// error fails closed: without the current requirement state the run cannot tell
+// an eligible draft from a stale one.
+func (a *CaseAugment) eligibleRequirements(ctx context.Context, versionID int64) (map[int64]RequirementSnapshot, error) {
+	if a.deps.Requirements == nil {
+		return nil, nil
+	}
+	requirements, err := a.deps.Requirements.Requirements(ctx, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("read case augmentation requirements: %w", err)
+	}
+	current := make(map[int64]RequirementSnapshot, len(requirements))
+	for _, requirement := range requirements {
+		if requirement.ID > 0 {
+			current[requirement.ID] = requirement
+		}
+	}
+	return current, nil
+}
+
+// draftEligible applies the design writer's admission rules before the writer
+// is called: the requirement must still exist in the current source, it must be
+// clarified, and when the gap fact recorded a requirement version that version
+// must still be current. A nil map disables the filter.
+func draftEligible(draft CaseDraft, requirements map[int64]RequirementSnapshot) bool {
+	if requirements == nil {
+		return true
+	}
+	requirement, ok := requirements[draft.RequirementID]
+	if !ok {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(requirement.Status), "clarified") {
+		return false
+	}
+	if draft.RequirementVersionID > 0 && requirement.VersionID > 0 && draft.RequirementVersionID != requirement.VersionID {
+		return false
+	}
+	return true
 }
 
 func (a *CaseAugment) existingTitles(ctx context.Context, versionID int64) (map[string]bool, error) {

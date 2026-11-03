@@ -261,6 +261,12 @@ func loginFact(id int64, role string) version.Fact {
 	}
 }
 
+func versionedGapFact(id, requirementID, requirementVersionID int64, requirementTitle string, dimension exploreapp.GapDimension, reason string) version.Fact {
+	fact := gapFact(id, requirementID, requirementTitle, dimension, reason)
+	fact.Payload["requirement_version_id"] = requirementVersionID
+	return fact
+}
+
 func gapFact(id int64, requirementID int64, requirementTitle string, dimension exploreapp.GapDimension, reason string) version.Fact {
 	return version.Fact{
 		ID:   id,
@@ -631,6 +637,73 @@ func TestCaseAugmentDedup(t *testing.T) {
 	}
 	if len(limited.Drafts) != 1 || !limited.Truncated {
 		t.Fatalf("bounded result = %+v", limited)
+	}
+}
+
+// TestCaseAugmentSkipsIneligible proves the design writer is never asked to
+// persist a draft it must reject: a requirement that is no longer clarified, a
+// stale requirement version and a requirement that disappeared from the current
+// requirement source are skipped, while an eligible draft (even after them)
+// still gets written. One ineligible requirement must not abort the batch.
+func TestCaseAugmentSkipsIneligible(t *testing.T) {
+	reader := newFactReader(
+		versionedGapFact(31, 402, 9002, "待评审", exploreapp.GapDimensionAcceptance, "缺少验收标准"),
+		versionedGapFact(32, 403, 9999, "登录", exploreapp.GapDimensionAcceptance, "缺少验收标准"),
+		versionedGapFact(33, 404, 9004, "已关闭", exploreapp.GapDimensionAcceptance, "缺少验收标准"),
+		versionedGapFact(34, 401, 9001, "下单", exploreapp.GapDimensionAcceptance, "缺少验收标准"),
+	)
+	source := &fakeRequirementSource{requirements: []exploreapp.RequirementSnapshot{
+		{ID: 401, VersionID: 9001, Title: "下单", Status: "clarified"},
+		{ID: 402, VersionID: 9002, Title: "待评审", Status: "in_review"},
+		{ID: 403, VersionID: 9003, Title: "登录", Status: "clarified"},
+	}}
+	writer := &fakeDraftWriter{}
+	augment := exploreapp.NewCaseAugment(exploreapp.CaseAugmentConfig{}, exploreapp.CaseAugmentDeps{
+		Facts:        reader,
+		Cases:        &fakeCaseSource{},
+		Writer:       writer,
+		Requirements: source,
+	})
+
+	result, err := augment.Run(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("a skipped requirement must not abort the batch: %v", err)
+	}
+	if result.Skipped != 3 {
+		t.Fatalf("skipped = %d, want 3 (non-clarified, stale version, deleted requirement)", result.Skipped)
+	}
+	if len(result.Drafts) != 1 || result.Drafts[0].RequirementID != 401 {
+		t.Fatalf("drafts = %+v, want only the eligible requirement 401", result.Drafts)
+	}
+	if len(result.Created) != 1 {
+		t.Fatalf("created = %+v, want the eligible draft", result.Created)
+	}
+	if attempts := writer.created(); len(attempts) != 1 || attempts[0].RequirementID != 401 {
+		t.Fatalf("writer attempts = %+v, want only the eligible requirement", attempts)
+	}
+	if source.calls != 1 || source.versionID != 1001 {
+		t.Fatalf("requirement source calls = %d version = %d", source.calls, source.versionID)
+	}
+
+	// Without a requirement source the filter is unavailable, but a writer
+	// failure is still isolated per draft instead of aborting the batch.
+	failingWriter := &fakeDraftWriter{err: errors.New("requirement must be clarified before it can be designed")}
+	unguarded := exploreapp.NewCaseAugment(exploreapp.CaseAugmentConfig{}, exploreapp.CaseAugmentDeps{
+		Facts:  reader,
+		Cases:  &fakeCaseSource{},
+		Writer: failingWriter,
+	})
+	partial, err := unguarded.Run(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("per-draft writer failures must not abort the batch: %v", err)
+	}
+	if len(partial.Created) != 0 || len(partial.Failed) != 4 {
+		t.Fatalf("partial result = created %d failed %d", len(partial.Created), len(partial.Failed))
+	}
+	for _, failure := range partial.Failed {
+		if failure.RequirementID == 0 || failure.Dimension != exploreapp.GapDimensionAcceptance || failure.Reason == "" {
+			t.Fatalf("failure = %+v", failure)
+		}
 	}
 }
 

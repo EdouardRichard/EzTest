@@ -238,9 +238,10 @@ func newP9Analysis(deps p9AnalysisDeps) (*p9Analysis, error) {
 			Roles:        deps.Roles,
 		}),
 		Augment: exploreapp.NewCaseAugment(exploreapp.CaseAugmentConfig{}, exploreapp.CaseAugmentDeps{
-			Facts:  deps.Facts,
-			Cases:  deps.Cases,
-			Writer: deps.DraftWriter,
+			Facts:        deps.Facts,
+			Cases:        deps.Cases,
+			Writer:       deps.DraftWriter,
+			Requirements: deps.Requirements,
 		}),
 		deps:     deps,
 		debounce: newP9AnalysisDebounce(p9AnalysisMinInterval, now),
@@ -373,16 +374,29 @@ func (a *p9Analysis) Refresh(ctx context.Context, versionID int64) (p9AnalysisRe
 	result.APIs = matrix.Totals.APIs
 	result.Roles = matrix.Totals.Roles
 
-	augmented, err := a.Augment.Run(ctx, versionID)
-	if err != nil {
-		return result, err
-	}
+	// Case augmentation is the last pass and its drafts are a best-effort
+	// enhancement: a single ineligible requirement or a writer contract error
+	// must never discard the gaps/coverage already computed (or abort the
+	// refresh loop). Per-draft writer failures are isolated inside CaseAugment
+	// and reported here; a hard error leaves the partial result in place.
+	augmented, augmentErr := a.Augment.Run(ctx, versionID)
 	if a.deps.DraftWriter != nil {
 		// Report the drafts that actually reached the design store, not the
-		// candidates that were only computed.
+		// candidates that were only computed. This stays accurate when a hard
+		// augmentation error interrupts the run after some drafts were written.
 		result.Drafts = len(augmented.Created)
-	} else {
+	} else if augmentErr == nil {
 		result.Drafts = len(augmented.Drafts)
+	}
+	logf := a.logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	if augmentErr != nil {
+		logf("eztest: P9 explore analysis version=%d case augmentation failed: %v", versionID, augmentErr)
+	} else if len(augmented.Failed) > 0 {
+		logf("eztest: P9 explore analysis version=%d case augmentation partial: created=%d failed=%d skipped=%d",
+			versionID, len(augmented.Created), len(augmented.Failed), augmented.Skipped)
 	}
 	return result, nil
 }
