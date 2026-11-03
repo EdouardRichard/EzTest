@@ -2645,9 +2645,12 @@ func jobCardCancelable(status string) bool {
 
 // jobCardTerminalStatus maps a finished run to the stored card status. A
 // retryable failure below the attempt cap returns the job to queued (the worker
-// reopens the item); a fenced or aborted run owns no terminal card and keeps
-// the previous projection (the new owner or the job-control cancel path owns
-// it). done and failed are terminal.
+// reopens the item), matching the worker's Fail predicate; at the cap it is
+// terminal failed. A hard-timeout run is interrupted+retryable, so it follows
+// the same reopen/terminal mapping instead of leaving a stale running card. A
+// fenced or aborted run owns no terminal card and keeps the previous projection
+// (the new owner or the job-control cancel path owns it). done and failed are
+// terminal.
 func jobCardTerminalStatus(item agent.WorkItem, err error) (string, bool) {
 	if err == nil {
 		return "done", true
@@ -2658,7 +2661,7 @@ func jobCardTerminalStatus(item agent.WorkItem, err error) (string, bool) {
 	var runErr *RunError
 	if errors.As(err, &runErr) {
 		switch runErr.Reason {
-		case "lease_lost", "aborted", "interrupted":
+		case "lease_lost", "aborted":
 			return "", false
 		}
 	}

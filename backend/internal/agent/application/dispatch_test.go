@@ -456,6 +456,22 @@ func TestDispatchAssociatesJobCardConversation(t *testing.T) {
 		t.Fatalf("stored work items = %d, want 1", got)
 	}
 
+	// The canonical form is the decimal string, but a JSON number is accepted too
+	// and normalized to the same stored string the runner reads.
+	numeric, err := dispatcher.RequestJob(ctx, 7, agent.WorkItemKindDesignCases,
+		json.RawMessage(`{"requirement_ids":[14],"conversation_id":21}`))
+	if err != nil {
+		t.Fatalf("assistant request with a numeric conversation id: %v", err)
+	}
+	var numericPayload map[string]any
+	if err := json.Unmarshal(numeric.Payload, &numericPayload); err != nil {
+		t.Fatalf("decode numeric payload %s: %v", numeric.Payload, err)
+	}
+	if numericPayload["conversation_id"] != "21" {
+		t.Fatalf("numeric work item payload conversation_id = %#v, want \"21\" (payload %s)",
+			numericPayload["conversation_id"], numeric.Payload)
+	}
+
 	// A request without a conversation association writes the empty payload.
 	plain, err := dispatcher.RequestJob(ctx, 7, agent.WorkItemKindDesignCases,
 		json.RawMessage(`{"requirement_ids":[12]}`))

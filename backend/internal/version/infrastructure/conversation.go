@@ -260,7 +260,7 @@ func (r *ConversationRepository) UpdateJobCardMessage(ctx context.Context, versi
 		JOIN conversation c ON c.id = m.conversation_id
 		WHERE m.id = $1 AND m.conversation_id = $2 AND c.version_id = $3
 		  AND m.role = 'assistant'
-		FOR UPDATE
+		FOR UPDATE OF m
 	`, messageID, conversationID, versionID).Scan(&raw); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return version.ErrMessageNotFound

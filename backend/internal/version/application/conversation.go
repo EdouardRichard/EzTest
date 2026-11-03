@@ -455,16 +455,19 @@ func (s *ConversationService) UpsertJobCard(ctx context.Context, versionID, conv
 }
 
 // replaceJobCardPart returns a copy of parts with jobID's card replaced by the
-// new snapshot. The card is the only mutable part of the conversation.
+// new snapshot. The card is the only mutable part of the conversation and the
+// caller only reaches this after the repository found and updated that exact
+// message, so there is no append fallback: a missing part leaves the snapshot
+// unchanged.
 func replaceJobCardPart(parts []version.MessagePart, card version.MessagePart) []version.MessagePart {
 	updated := append([]version.MessagePart(nil), parts...)
 	for index := range updated {
 		if updated[index].Type == version.MessagePartJobCard && updated[index].JobID == card.JobID {
 			updated[index] = card
-			return updated
+			break
 		}
 	}
-	return append(updated, card)
+	return updated
 }
 
 // ---------- tasks and events ----------
