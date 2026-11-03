@@ -755,11 +755,13 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 // Finalize is called by the worker run sink after the agent loop ends.
 // dispatchEpoch is the case_run dispatch epoch carried by the work item: a late
 // Finalize from an older epoch has lost the run to a newer dispatch and must not
-// finalize it nor stop the new owner's heartbeat. A retryable run error before
-// the attempt budget leaves the case_run running for a redispatch; otherwise the
-// deterministic aggregation writes the terminal state. A lease-lost or paused
-// run is left to its new owner.
-func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int64, runErr error, attempt, maxAttempts int) error {
+// finalize it nor stop the new owner's heartbeat. result carries the run's turns,
+// usage and settlement cause so a budget-ended run is explained instead of being
+// aggregated as a silent inconclusive(incomplete) (QA Q2). A retryable run error
+// before the attempt budget leaves the case_run running for a redispatch;
+// otherwise the deterministic aggregation writes the terminal state. A
+// lease-lost or paused run is left to its new owner.
+func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int64, result agentapp.RunResult, runErr error, attempt, maxAttempts int) error {
 	if s.caseRuns == nil {
 		return errors.New("case runner is not configured")
 	}
@@ -804,20 +806,96 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 		// look like a silent zero-row failure: persist the concrete error as
 		// text evidence so the reason is visible in the report/UI.
 		s.recordRunFailureEvidence(ctx, caseRun, runErr)
-		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr); err != nil {
+		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr, nil); err != nil {
 			return err
 		}
 		return nil
 	}
-	// The agent loop succeeded but never finished the case (for example the turn
-	// budget was exhausted): aggregate whatever was recorded.
-	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil); err != nil {
+	// The agent loop succeeded but never finished the case (for example the
+	// budget was exhausted): aggregate whatever was recorded and explain the
+	// stop instead of writing a silent inconclusive(incomplete).
+	outcome := newIncompleteRunOutcome(result)
+	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil, &outcome); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error) error {
+// incompleteRunOutcome is the typed explanation of an agent run that ended
+// without execution.case_finish. The deterministic verdict stays inconclusive;
+// these fields make the stop explainable and hand it to a human (rerun).
+type incompleteRunOutcome struct {
+	Cause      string
+	Detail     string
+	NextAction string
+}
+
+// newIncompleteRunOutcome derives the cause from the finished run result. A run
+// whose settlement was caused by a budget reports that budget; a run that
+// simply stopped without the completion tool reports agent_stopped. The cause is
+// never inferred from the model's prose.
+func newIncompleteRunOutcome(result agentapp.RunResult) incompleteRunOutcome {
+	cause := strings.TrimSpace(result.SettlementCause)
+	if cause == "" {
+		return incompleteRunOutcome{
+			Cause:      execution.TerminalCauseAgentStopped,
+			Detail:     fmt.Sprintf("the agent run ended without calling execution.case_finish after %d turns", result.Turns),
+			NextAction: execution.NextActionRerun,
+		}
+	}
+	cause = incompleteCauseCode(cause)
+	detail := strings.TrimSpace(result.SettlementDetail)
+	if detail == "" {
+		detail = incompleteCauseFallbackDetail(cause, result)
+	}
+	return incompleteRunOutcome{Cause: cause, Detail: detail, NextAction: execution.NextActionRerun}
+}
+
+// incompleteCauseCode maps the runner's stable budget cause onto the case_run
+// summary vocabulary. Unknown (future) causes are preserved verbatim.
+func incompleteCauseCode(cause string) string {
+	switch cause {
+	case agentapp.BudgetCauseTokens:
+		return execution.TerminalCauseTokenBudget
+	case agentapp.BudgetCauseTime:
+		return execution.TerminalCauseTimeBudget
+	case agentapp.BudgetCauseTurns:
+		return execution.TerminalCauseTurnBudget
+	default:
+		return cause
+	}
+}
+
+func incompleteCauseFallbackDetail(cause string, result agentapp.RunResult) string {
+	switch cause {
+	case execution.TerminalCauseTokenBudget:
+		return fmt.Sprintf("token budget: the run ended in its settlement turn after %d turns (%d tokens)",
+			result.Turns, runResultTokens(result.Usage))
+	case execution.TerminalCauseTimeBudget:
+		return fmt.Sprintf("time budget: the run ended in its settlement turn after %d turns", result.Turns)
+	case execution.TerminalCauseTurnBudget:
+		return fmt.Sprintf("turn budget: the run reached its turn fuse after %d turns", result.Turns)
+	default:
+		return fmt.Sprintf("the agent run ended before completing the case after %d turns", result.Turns)
+	}
+}
+
+// runResultTokens is the token count shown in the incomplete explanation. The
+// provider's total wins; older providers report prompt+completion components.
+func runResultTokens(usage map[string]int) int {
+	if total := usage["total_tokens"]; total > 0 {
+		return total
+	}
+	total := 0
+	for _, key := range []string{"prompt_tokens", "completion_tokens"} {
+		if value := usage[key]; value > 0 {
+			total += value
+		}
+	}
+	return total
+}
+
+func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
 		return err
@@ -843,6 +921,17 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		// read summary.last_error): a failed/blocked run must explain itself.
 		summary.LastError = truncateRunes(failure.Error(), 2000)
 	}
+	// An incomplete verdict explains why the run stopped and offers the human
+	// next step. The verdict itself is untouched: a 1/4-step run stays
+	// inconclusive, never a pass.
+	explained := incomplete != nil && status == execution.CaseRunInconclusive &&
+		summary.VerdictReason == execution.VerdictReasonIncomplete
+	if explained {
+		summary.TerminalCause = incomplete.Cause
+		summary.NextAction = incomplete.NextAction
+		summary.LastError = truncateRunes(fmt.Sprintf("%s; the case recorded %d of %d steps before the run ended",
+			incomplete.Detail, len(steps), len(caseSnapshot.Steps)), 2000)
+	}
 	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
@@ -856,14 +945,43 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		"status":         string(status),
 		"failure_class":  string(class),
 		"verdict_reason": summary.VerdictReason,
+		"terminal_cause": summary.TerminalCause,
+		"next_action":    summary.NextAction,
 	})
 	s.forgetWaitTracking(caseRun.ID)
 	// A failed finalization (agent-run failure or exhausted redispatch) notifies
 	// the optional knowledge failure hook exactly once, from the terminal owner.
 	if terminalWrote {
 		s.notifyCaseFailure(ctx, s.versionForCaseRun(caseRun), finished, caseSnapshot, finished.FailureClass)
+		if explained {
+			s.postIncompleteHandoff(ctx, caseRun, finished)
+		}
 	}
 	return nil
+}
+
+// postIncompleteHandoff records the human handoff of a terminal incomplete run
+// in the execution team room. A budget-ended case run cannot create a
+// human_request (the run is already terminal and the P3 human flow is limited to
+// login takeover), so the durable handoff is a typed team-room post carrying the
+// cause, the explanation and the suggested next action. Best effort: the verdict
+// and its summary fields never depend on it.
+func (s *CaseRunner) postIncompleteHandoff(ctx context.Context, caseRun execution.CaseRun, finished execution.CaseRun) {
+	if s.teamRoom == nil {
+		return
+	}
+	content := fmt.Sprintf("case run %s is inconclusive (%s); %s; next action: %s",
+		platformid.Format(caseRun.ID),
+		finished.Summary.TerminalCause,
+		finished.Summary.LastError,
+		finished.Summary.NextAction)
+	_ = s.teamRoom.Post(ctx, TeamPost{
+		VersionID: s.versionForCaseRun(caseRun),
+		Team:      "execution",
+		Kind:      "handoff",
+		Content:   truncateRunes(content, 2000),
+		Refs:      []TeamPostRef{{Kind: "case_run", ID: platformid.Format(caseRun.ID)}},
+	})
 }
 
 // RenewLease extends the case_run lease during a long agent run.

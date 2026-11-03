@@ -677,8 +677,9 @@ func (s *CaseRunner) CoverageRead(ctx context.Context, scope tools.Scope) (any, 
 }
 
 // FailureSubmit validates and persists one failure analysis candidate. Only
-// failed(application) is a P4 issue candidate; the analyst may refine but never
-// upgrade a non-application class into application.
+// failed(application) is a P4 issue candidate; the analyst may refine but may
+// upgrade a non-application class into application only when the stored step
+// observation is a requirement deviation (QA Q1).
 func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in tools.FailureSubmitInput) (any, error) {
 	if scope.WaveID <= 0 {
 		return nil, platform.Invalid("scope", "failure_submit requires the injected wave scope")
@@ -696,10 +697,40 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 	}
 	class := execution.FailureClass(in.FailureClass)
 	if class == execution.FailureClassApplication && caseRun.FailureClass != execution.FailureClassApplication {
-		return nil, platform.Invalid("failure_class", "a non-application failure cannot be upgraded to application")
+		// QA Q1: a stored observed requirement deviation is evidence the
+		// deterministic fallback may have missed; allow application only for
+		// that evidence.
+		steps, err := s.results.ListSteps(ctx, caseRun.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step_result")
+		}
+		hasDeviation := false
+		for _, step := range steps {
+			if execution.FailedStepShowsRequirementDeviation(step) {
+				hasDeviation = true
+				break
+			}
+		}
+		if !hasDeviation {
+			return nil, platform.Invalid("failure_class", "a non-application failure cannot be upgraded to application without observed requirement deviation evidence")
+		}
 	}
 	if !class.Valid() || class == "" {
 		return nil, platform.Invalid("failure_class", "unsupported failure class")
+	}
+	if class == execution.FailureClassAutomation && caseRun.FailureClass == execution.FailureClassApplication {
+		// QA Q1: a real requirement deviation recorded on a failed step is
+		// product evidence; the analyst must not be able to dismiss it as a
+		// script/automation problem and suppress the issue candidate.
+		steps, err := s.results.ListSteps(ctx, caseRun.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step_result")
+		}
+		for _, step := range steps {
+			if execution.FailedStepShowsRequirementDeviation(step) {
+				return nil, platform.StateConflict("an observed requirement deviation cannot be reclassified as automation")
+			}
+		}
 	}
 	updated := caseRun
 	updated.FailureClass = class

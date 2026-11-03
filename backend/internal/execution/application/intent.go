@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -221,6 +222,15 @@ func (s *IntentService) ensureInitialIntents(
 		}
 		cases = filtered
 	}
+	// Task 95 (PO O8): refuse an incomplete case version before any intent
+	// exists. A version without a step or an assertion can only aggregate to
+	// inconclusive(incomplete/no_assertions), so dispatching it would present a
+	// design defect as an inconclusive execution result. Validate the filtered
+	// batch before the first insert so a blocked batch creates no sibling
+	// intent behind the failed execute.batch job.
+	if err := ensureExecutableCaseCompleteness(cases); err != nil {
+		return 0, err
+	}
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
 		return 0, err
@@ -299,6 +309,12 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 	snapshot, err := s.cases.GetCaseVersion(ctx, versionID, caseVersionID)
 	if err != nil {
 		return execution.ExecutionIntent{}, mapExecutionError(err, "case version")
+	}
+	// Task 95 (PO O8): the retest/manual entry point bypasses the initial batch
+	// scan, so it must enforce the same executable-content gate. A 0-assertion
+	// version may never be queued just because the caller asked for a retest.
+	if err := ensureExecutableCaseCompleteness([]execution.CaseSnapshot{snapshot}); err != nil {
+		return execution.ExecutionIntent{}, err
 	}
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
@@ -460,6 +476,47 @@ func actorPtr(actorID int64) *int64 {
 		return nil
 	}
 	return &actorID
+}
+
+// ensureExecutableCaseCompleteness refuses a batch containing a case version
+// without executable content: at least one step and one assertion are required.
+// The check runs on the already-filtered selection, so a complete sibling is
+// never enqueued when an incomplete version blocks the batch.
+func ensureExecutableCaseCompleteness(cases []execution.CaseSnapshot) error {
+	for _, snapshot := range cases {
+		steps, assertions := len(snapshot.Steps), len(snapshot.Assertions)
+		if steps > 0 && assertions > 0 {
+			continue
+		}
+		missing := make([]string, 0, 2)
+		if steps == 0 {
+			missing = append(missing, "steps")
+		}
+		if assertions == 0 {
+			missing = append(missing, "assertions")
+		}
+		title := strings.TrimSpace(snapshot.Title)
+		if title == "" {
+			title = "untitled case"
+		}
+		return &platform.Error{
+			Status: http.StatusConflict,
+			Code:   "incomplete_case_version",
+			Message: fmt.Sprintf(
+				"case %q version %d is incomplete (%d step(s), %d assertion(s)); at least 1 step and 1 assertion are required before execution. Repair the case version in design (restore the designed steps/assertions), re-confirm it at the case gate, then execute the batch again.",
+				title, snapshot.CaseVersionID, steps, assertions,
+			),
+			Details: map[string]any{
+				"case_id":         platformid.Format(snapshot.CaseID),
+				"case_version_id": platformid.Format(snapshot.CaseVersionID),
+				"step_count":      steps,
+				"assertion_count": assertions,
+				"missing":         missing,
+				"next_action":     "repair the case version in design (restore the designed steps/assertions), re-confirm it at the case gate, then execute the batch again",
+			},
+		}
+	}
+	return nil
 }
 
 // invalidStageForExecution is the typed 409 returned when the explicit

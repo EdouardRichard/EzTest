@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -140,7 +141,7 @@ func TestCaseRunFailureNotifiesKnowledgeFailureHook(t *testing.T) {
 	t.Run("an agent-run failure finalized to the failed verdict notifies", func(t *testing.T) {
 		fixture := newCaseRunnerFixture(t)
 		prepareCaseRun(t, fixture)
-		if err := fixture.runner.Finalize(context.Background(), 3001, 3,
+		if err := fixture.runner.Finalize(context.Background(), 3001, 3, agentapp.RunResult{},
 			errors.New("agent loop exploded"), 3, 3); err != nil {
 			t.Fatalf("Finalize: %v", err)
 		}

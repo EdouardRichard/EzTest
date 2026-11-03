@@ -121,6 +121,22 @@ func (c FailureClass) Valid() bool {
 // Only failed(application) qualifies (P3-D-12).
 func (c FailureClass) IsIssueCandidate() bool { return c == FailureClassApplication }
 
+// Terminal causes written to case_run.summary.terminal_cause when the agent run
+// ended without executing all steps. They are stable codes (the UI localizes
+// them) and always name a concrete resource/provider/agent stop, never a generic
+// "unknown".
+const (
+	TerminalCauseTurnBudget   = "turn_budget"
+	TerminalCauseTokenBudget  = "token_budget"
+	TerminalCauseTimeBudget   = "time_budget"
+	TerminalCauseAgentStopped = "agent_stopped"
+)
+
+// NextAction is the stable suggested human next step of an incomplete run. P3
+// only supports rerunning the case (a retest intent with a fresh execution
+// budget); the system never auto-retries a terminal inconclusive run.
+const NextActionRerun = "rerun"
+
 // CaseRunSummary is the case_run.summary JSONB projection.
 type CaseRunSummary struct {
 	VerdictReason      string `json:"verdict_reason,omitempty"`
@@ -135,6 +151,10 @@ type CaseRunSummary struct {
 	VisualInconclusive int    `json:"visual_inconclusive"`
 	HumanRequestID     int64  `json:"human_request_id,omitempty"`
 	LastError          string `json:"last_error,omitempty"`
+	// TerminalCause/NextAction explain a terminal incomplete run: which budget
+	// (or agent stop) ended it and what the human should do next (QA Q2).
+	TerminalCause string `json:"terminal_cause,omitempty"`
+	NextAction    string `json:"next_action,omitempty"`
 }
 
 // EvidenceCountValue returns the evidence count as an int.

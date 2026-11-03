@@ -189,6 +189,15 @@ export type CaseRunSummary = {
   visual_passed?: number
   visual_failed?: number
   visual_inconclusive?: number
+  /**
+   * QA Q2: a terminal incomplete run explains itself. `terminal_cause` names the
+   * budget/agent stop, `last_error` carries the observable usage/limit and the
+   * recorded vs total steps, and `next_action` is the stable human next step
+   * (`rerun`). All three are absent on clean verdicts.
+   */
+  terminal_cause?: string
+  last_error?: string
+  next_action?: string
 }
 
 /** `CaseRunView` (spec §9.3). */

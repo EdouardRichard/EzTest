@@ -96,7 +96,7 @@ func TestFinalizePersistsBlockedReasonAndEvidence(t *testing.T) {
 		Retryable: false,
 		Cause:     platform.StateConflict("step 1 has no resolvable target version_sut"),
 	}
-	if err := fixture.runner.Finalize(context.Background(), 3001, 3, runErr, 1, 3); err != nil {
+	if err := fixture.runner.Finalize(context.Background(), 3001, 3, agentapp.RunResult{}, runErr, 1, 3); err != nil {
 		t.Fatalf("Finalize: %v", err)
 	}
 	stored := fixture.caseRuns.get(t, 3001)

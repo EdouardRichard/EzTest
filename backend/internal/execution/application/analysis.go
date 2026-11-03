@@ -240,9 +240,16 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 	}
 	if failedStep != nil {
 		class := execution.FailureClassAutomation
+		// A failed step that recorded an observed product behavior (and no
+		// automation/tool error) is a requirement deviation, not an automation
+		// failure (QA Q1). The deterministic fallback must not downgrade it;
+		// an environment/model/timeout/unknown class is a separate agent-level
+		// failure and is preserved.
 		switch run.FailureClass {
-		case "", execution.FailureClassApplication, execution.FailureClassBlocked, execution.FailureClassExecutorLost:
-			// keep automation
+		case "", execution.FailureClassAutomation, execution.FailureClassApplication:
+			if execution.FailedStepShowsRequirementDeviation(*failedStep) {
+				class = execution.FailureClassApplication
+			}
 		default:
 			if run.FailureClass.Valid() {
 				class = run.FailureClass
@@ -272,7 +279,8 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 }
 
 // emitFailureCandidate publishes the application failure candidate event and
-// team-room post. Only failed(application) with assertion evidence is emitted.
+// team-room post. Only failed(application) with failed assertion evidence or an
+// observed requirement deviation on a failed step is emitted.
 func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave execution.RunWave, run execution.CaseRun) error {
 	steps, _ := s.results.ListSteps(ctx, run.ID)
 	assertions, _ := s.results.ListAssertions(ctx, run.ID)
@@ -283,10 +291,29 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 			break
 		}
 	}
-	if failedAssertion == nil {
+	var failedStep *execution.StepResult
+	for index := range steps {
+		if execution.FailedStepShowsRequirementDeviation(steps[index]) {
+			failedStep = &steps[index]
+			break
+		}
+	}
+	if failedAssertion == nil && failedStep == nil {
 		return nil
 	}
-	hint := analysisCandidateHint(wave.VersionID, run.CaseVersionID, failedAssertion.StepSeq, failedAssertion.AssertionSeq, run.FailureClass)
+	category := "ui"
+	stepSeq, assertionSeq := 0, 0
+	detail := ""
+	switch {
+	case failedAssertion != nil:
+		category = failureCategory(failedAssertion.Kind)
+		stepSeq, assertionSeq = failedAssertion.StepSeq, failedAssertion.AssertionSeq
+		detail = fmt.Sprintf("%s assertion %d.%d", failedAssertion.Kind, failedAssertion.StepSeq, failedAssertion.AssertionSeq)
+	case failedStep != nil:
+		stepSeq = failedStep.Seq
+		detail = fmt.Sprintf("step %d observed requirement deviation", failedStep.Seq)
+	}
+	hint := analysisCandidateHint(wave.VersionID, run.CaseVersionID, stepSeq, assertionSeq, run.FailureClass)
 	s.mu.Lock()
 	if _, seen := s.candidates[hint]; seen {
 		s.mu.Unlock()
@@ -296,7 +323,6 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 	s.mu.Unlock()
 
 	priority := s.casePriority(ctx, wave.VersionID, run.CaseVersionID)
-	category := failureCategory(failedAssertion.Kind)
 	severity := failureSeverity(priority)
 	payload := map[string]any{
 		"wave_id":       platformid.Format(wave.ID),
@@ -315,20 +341,20 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 		VersionID: wave.VersionID,
 		Team:      TeamExecution,
 		Kind:      "finding",
-		Content: fmt.Sprintf("failed(application) candidate: case_run %s failed %s assertion %d.%d",
-			platformid.Format(run.ID), failedAssertion.Kind, failedAssertion.StepSeq, failedAssertion.AssertionSeq),
+		Content: fmt.Sprintf("failed(application) candidate: case_run %s failed %s",
+			platformid.Format(run.ID), detail),
 		Refs: []TeamPostRef{
 			{Kind: "case_run", ID: platformid.Format(run.ID)},
 			{Kind: "wave", ID: platformid.Format(wave.ID)},
 		},
 	})
-	_ = steps
 	return nil
 }
 
 // FailureSubmit is the analysis.failure_submit entry point (ExecutionPort). It
-// may only keep or downgrade an application classification; escalating a
-// non-application failure is rejected.
+// may keep or downgrade an application classification, and may escalate a
+// non-application failure only when the stored step observation is a
+// requirement deviation.
 func (s *AnalysisService) FailureSubmit(ctx context.Context, scope tools.Scope, in tools.FailureSubmitInput) (any, error) {
 	return s.SubmitFailure(ctx, scope, in)
 }
@@ -354,7 +380,37 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 		return nil, platform.Invalid("failure_class", "must be one of application, environment, session, model, automation, timeout, executor_lost, blocked, unknown")
 	}
 	if run.FailureClass != execution.FailureClassApplication && requested == execution.FailureClassApplication {
-		return nil, platform.StateConflict("a non-application failure cannot be escalated to application")
+		// QA Q1: a stored observed requirement deviation is evidence the
+		// deterministic fallback may have missed (for example a run classified
+		// by an older deployment); only that evidence allows application.
+		steps, err := s.results.ListSteps(ctx, run.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step result")
+		}
+		hasDeviation := false
+		for _, step := range steps {
+			if execution.FailedStepShowsRequirementDeviation(step) {
+				hasDeviation = true
+				break
+			}
+		}
+		if !hasDeviation {
+			return nil, platform.StateConflict("a non-application failure cannot be escalated to application without observed requirement deviation evidence")
+		}
+	}
+	if requested == execution.FailureClassAutomation && run.FailureClass == execution.FailureClassApplication {
+		// QA Q1: a real requirement deviation recorded on a failed step is
+		// product evidence; the analyst must not be able to dismiss it as a
+		// script/automation problem and suppress the issue candidate.
+		steps, err := s.results.ListSteps(ctx, run.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step result")
+		}
+		for _, step := range steps {
+			if execution.FailedStepShowsRequirementDeviation(step) {
+				return nil, platform.StateConflict("an observed requirement deviation cannot be reclassified as automation")
+			}
+		}
 	}
 	if !failureRelevant(run.Status) {
 		return nil, platform.StateConflict("only failed, blocked or inconclusive case runs can be refined")
@@ -372,7 +428,22 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 			}
 		}
 		if !hasEvidence {
-			return nil, platform.StateConflict("failed(application) requires assertion evidence")
+			// QA Q1: a failed step whose observation contradicts the
+			// requirement is application evidence even without a failed
+			// assertion record.
+			steps, err := s.results.ListSteps(ctx, run.ID)
+			if err != nil {
+				return nil, mapExecutionError(err, "step result")
+			}
+			for _, step := range steps {
+				if execution.FailedStepShowsRequirementDeviation(step) {
+					hasEvidence = true
+					break
+				}
+			}
+		}
+		if !hasEvidence {
+			return nil, platform.StateConflict("failed(application) requires failed assertion or observed requirement deviation evidence")
 		}
 	}
 	run.FailureClass = requested

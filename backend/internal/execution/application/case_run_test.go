@@ -1310,7 +1310,7 @@ func TestFinalizeMapsExecutorUnavailableToExecutorLost(t *testing.T) {
 	executorUnavailable := platform.NewError(503, "executor_unavailable", "executor is offline")
 	executorUnavailable.Retryable = true
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: executorUnavailable}
-	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, runErr, 1, 1); err != nil {
+	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 1, 1); err != nil {
 		t.Fatalf("Finalize: %v", err)
 	}
 	stored := fixture.caseRuns.get(t, 3001)
@@ -1342,7 +1342,7 @@ func TestStaleFinalizeDoesNotStopSupersedingHeartbeat(t *testing.T) {
 		t.Fatalf("Prepare superseding dispatch: %v", err)
 	}
 
-	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, nil, 1, 3); err != nil {
+	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, nil, 1, 3); err != nil {
 		t.Fatalf("stale Finalize: %v", err)
 	}
 	stored := fixture.caseRuns.get(t, 3001)

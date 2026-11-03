@@ -95,6 +95,10 @@ func failureSignalReason(run execution.CaseRun, steps []execution.StepResult, as
 	}
 	for _, step := range steps {
 		if step.Status == execution.StepFailed || step.Status == execution.StepBlocked {
+			// QA Q1: the failed step observation is the evidence the analyst
+			// must see (the SUT text that contradicts the requirement); the
+			// error is only the tool/automation cause when one exists.
+			appendPart(execution.StepObservedSummary(step))
 			appendPart(step.Error)
 		}
 	}

@@ -19,6 +19,16 @@ const (
 	DefaultBudgetMaxTurnsFuse = 24
 )
 
+// Stable settlement causes written to agent_run.terminal_reason and handed to
+// the execution context. They name the budget that actually ended the run, so a
+// tool-less settlement turn is never mistaken for a time/turn cap (QA Q2: the
+// settlement prompt accused the clock while the token budget was the trigger).
+const (
+	BudgetCauseTokens = "token_budget"
+	BudgetCauseTime   = "time_budget"
+	BudgetCauseTurns  = "turn_budget"
+)
+
 // BudgetDecision is what the agent loop should do after one turn.
 type BudgetDecision string
 
@@ -70,17 +80,24 @@ func (b Budget) Decide(usage Usage) BudgetDecision {
 
 // exceeded reports whether any normalized budget is reached.
 func (b Budget) exceeded(usage Usage) bool {
+	return b.ExceededBy(usage) != ""
+}
+
+// ExceededBy reports the first normalized budget the usage has reached, in a
+// stable precedence (tokens, wall clock, turns). An empty string means every
+// budget still has headroom. The value is a stable cause code, not display text.
+func (b Budget) ExceededBy(usage Usage) string {
 	budget := b.normalized()
-	if usage.Tokens >= budget.MaxTokens {
-		return true
+	switch {
+	case usage.Tokens >= budget.MaxTokens:
+		return BudgetCauseTokens
+	case usage.Seconds >= budget.RunSeconds:
+		return BudgetCauseTime
+	case usage.Turns >= budget.MaxTurnsFuse:
+		return BudgetCauseTurns
+	default:
+		return ""
 	}
-	if usage.Seconds >= budget.RunSeconds {
-		return true
-	}
-	if usage.Turns >= budget.MaxTurnsFuse {
-		return true
-	}
-	return false
 }
 
 // normalized applies the contract defaults to unset fields.

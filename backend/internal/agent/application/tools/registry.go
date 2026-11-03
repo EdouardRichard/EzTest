@@ -358,10 +358,14 @@ type SUTSummary struct {
 // ResourcePage is one page or API bound to a version SUT.
 type ResourcePage struct {
 	VersionSUTID int64
-	Kind         string
-	Name         string
-	Path         string
-	Method       string
+	// ID is the bound page/API catalog ID as a decimal string. requirement
+	// target_pages/target_apis only accept these IDs; paths are rejected by the
+	// version context, so the model must receive them from sut.page_list.
+	ID     string
+	Kind   string
+	Name   string
+	Path   string
+	Method string
 }
 
 // ResourcePort is the resource/version context read surface for SUT data.

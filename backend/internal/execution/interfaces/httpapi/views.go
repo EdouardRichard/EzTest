@@ -110,6 +110,11 @@ type CaseRunSummaryView struct {
 	VisualFailed       int     `json:"visual_failed"`
 	VisualInconclusive int     `json:"visual_inconclusive"`
 	HumanRequestID     *string `json:"human_request_id"`
+	// LastError/TerminalCause/NextAction explain an incomplete run: the concrete
+	// stop cause, the observable detail and the suggested human next step (QA Q2).
+	LastError     string `json:"last_error"`
+	TerminalCause string `json:"terminal_cause"`
+	NextAction    string `json:"next_action"`
 }
 
 // CaseRunView is the case_run projection (spec §9.3).
@@ -287,6 +292,9 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 			VisualFailed:       run.Summary.VisualFailed,
 			VisualInconclusive: run.Summary.VisualInconclusive,
 			HumanRequestID:     optionalIDString(run.Summary.HumanRequestID),
+			LastError:          run.Summary.LastError,
+			TerminalCause:      run.Summary.TerminalCause,
+			NextAction:         run.Summary.NextAction,
 		},
 		StartedAt:     formatOptionalTime(run.StartedAt),
 		FinishedAt:    formatOptionalTime(run.FinishedAt),

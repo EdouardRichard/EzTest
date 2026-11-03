@@ -185,6 +185,14 @@ type RunResult struct {
 	Turns          int
 	Usage          map[string]int
 	TerminalReason string
+	// SettlementCause is the stable budget cause (turn_budget/time_budget/
+	// token_budget) when the run's last turn was the tool-less settlement turn.
+	// It stays empty when the model finished on its own. The execution context
+	// uses it to explain an incomplete case run instead of silently aggregating.
+	SettlementCause string
+	// SettlementDetail is one bounded, secret-free sentence with the observed
+	// usage and the limit that triggered the settlement.
+	SettlementDetail string
 }
 
 // RunError classifies a run failure for the worker retry policy.
@@ -482,6 +490,11 @@ type runState struct {
 	team             agent.Team
 	overflowHits     int
 	softNoted        bool
+	// settlementCause/settlementDetail describe the budget that opened the
+	// tool-less settlement turn. They survive into RunResult and, for a settled
+	// done run, into agent_run.terminal_reason so a 1/4-step stop is explainable.
+	settlementCause  string
+	settlementDetail string
 }
 
 // Run executes one work item and projects the job into its conversation as one
@@ -1092,17 +1105,22 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		// here. A hit budget asks for one settlement turn (partial artifacts +
 		// summary) instead of a hard stop; a settlement turn that is still over
 		// budget is exhausted.
-		decision := state.resourceBudget.Decide(Usage{
+		usage := Usage{
 			Tokens:   usageTokens(state.usage),
 			Seconds:  r.elapsedSeconds(state),
 			Turns:    state.turns,
 			Settling: state.softNoted,
-		})
+		}
+		decision := state.resourceBudget.Decide(usage)
 		if decision == BudgetExhaust {
+			detail := state.settlementDetail
+			if detail == "" {
+				detail = budgetSettlementDetail(state.resourceBudget.ExceededBy(usage), state.resourceBudget, usage)
+			}
 			return "", &RunError{
 				Reason:    "budget",
 				Retryable: false,
-				Cause:     errors.New("agent run exhausted its budget during the settlement turn"),
+				Cause:     fmt.Errorf("agent run exhausted its budget during the settlement turn (%s)", detail),
 			}
 		}
 		soft := decision == BudgetSettle
@@ -1114,9 +1132,11 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		if soft {
 			if !state.softNoted {
 				state.softNoted = true
+				state.settlementCause = state.resourceBudget.ExceededBy(usage)
+				state.settlementDetail = budgetSettlementDetail(state.settlementCause, state.resourceBudget, usage)
 				request.Messages = append(request.Messages, llmapp.ChatMessage{
 					Role:    "system",
-					Content: "运行时间即将用尽，请不要再调用工具，直接给出最终回复。",
+					Content: settlementInstruction(state.settlementCause),
 				})
 			}
 		} else {
@@ -1195,7 +1215,43 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 	return "", &RunError{
 		Reason:    "budget",
 		Retryable: false,
-		Cause:     fmt.Errorf("agent run reached the max turn budget (%d)", maxTurns),
+		Cause:     fmt.Errorf("agent run reached the max turn budget (%d turns)", maxTurns),
+	}
+}
+
+// settlementInstruction is the system message of the tool-less wrap-up turn. It
+// must name the budget that actually triggered the settlement: the pre-QA-Q2
+// fixed text always blamed the clock, so a token/turn-budget stop produced a
+// model summary that pointed at the wrong cause.
+func settlementInstruction(cause string) string {
+	switch cause {
+	case BudgetCauseTokens:
+		return "本次运行的 token 预算即将用尽，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	case BudgetCauseTurns:
+		return "本次运行的轮次预算即将用尽，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	case BudgetCauseTime:
+		return "运行时间即将用尽，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	default:
+		return "本次运行即将结束，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	}
+}
+
+// budgetSettlementDetail renders the observable usage and limit of one
+// settlement cause. It carries counts only (no prompts, tool results or
+// credentials) and is persisted on the case_run summary.
+func budgetSettlementDetail(cause string, budget Budget, usage Usage) string {
+	normalized := budget.normalized()
+	switch cause {
+	case BudgetCauseTokens:
+		return fmt.Sprintf("token budget: used %d of %d tokens after %d turns",
+			usage.Tokens, normalized.MaxTokens, usage.Turns)
+	case BudgetCauseTime:
+		return fmt.Sprintf("time budget: elapsed %ds of %ds after %d turns",
+			usage.Seconds, normalized.RunSeconds, usage.Turns)
+	case BudgetCauseTurns:
+		return fmt.Sprintf("turn budget: reached the turn fuse after %d turns", usage.Turns)
+	default:
+		return fmt.Sprintf("resource budget: the run entered its settlement turn after %d turns", usage.Turns)
 	}
 }
 
@@ -1616,6 +1672,12 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 	state.run.Status = status
 	state.run.Turns = state.turns
 	state.run.Usage = state.usage
+	// A done run that needed the settlement turn explains itself: the concrete
+	// budget cause becomes its terminal_reason so the Agent Center does not show
+	// an empty reason for a run that stopped at 1/4 steps (QA Q2).
+	if reason == "" && status == agent.AgentRunDone && state.settlementCause != "" {
+		reason = state.settlementCause
+	}
 	// Tokens mirrors the aggregated usage into the 0.2.1 token-accounting column;
 	// cache stays a persisted (possibly empty) object until a provider reports
 	// prompt-cache statistics (spec §7.5).
@@ -1633,11 +1695,13 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 	defer cancel()
 	if err := r.repo.FinishRun(finishCtx, state.run); err != nil {
 		result := RunResult{
-			AgentRunID:     state.run.ID,
-			Status:         status,
-			Turns:          state.turns,
-			Usage:          state.usage,
-			TerminalReason: reason,
+			AgentRunID:       state.run.ID,
+			Status:           status,
+			Turns:            state.turns,
+			Usage:            state.usage,
+			TerminalReason:   reason,
+			SettlementCause:  state.settlementCause,
+			SettlementDetail: state.settlementDetail,
 		}
 		if errors.Is(err, agent.ErrLeaseLost) {
 			return result, &RunError{
@@ -1667,16 +1731,22 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 			payload["failure_action"] = failure.Action
 			payload["failure_user_visible"] = failure.UserVisible
 		}
+	} else if reason != "" {
+		// A settled done run still carries its concrete terminal reason so live
+		// consumers can explain it without waiting for the next list request.
+		payload["terminal_reason"] = reason
 	}
 	r.publish(state, eventType, payload)
 	r.recordAudit(state, status, reason)
 
 	return RunResult{
-		AgentRunID:     state.run.ID,
-		Status:         status,
-		Turns:          state.turns,
-		Usage:          state.usage,
-		TerminalReason: reason,
+		AgentRunID:       state.run.ID,
+		Status:           status,
+		Turns:            state.turns,
+		Usage:            state.usage,
+		TerminalReason:   reason,
+		SettlementCause:  state.settlementCause,
+		SettlementDetail: state.settlementDetail,
 	}, nil
 }
 

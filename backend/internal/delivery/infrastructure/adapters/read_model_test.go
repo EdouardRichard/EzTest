@@ -501,6 +501,120 @@ func TestReportDataReaderWaveSnapshotIsScoped(t *testing.T) {
 	}
 }
 
+// TestWaveReportCoverageReflectsCases reproduces QA Q3: the wave report used to
+// carry the zero-value coverage (0/0/0/0) even though the version had
+// requirements and executable cases. Coverage is a version-level projection, so
+// every wave report of the version must expose it (spec §6.1) regardless of
+// which cases the wave itself ran; zeros stay reserved for a version that
+// genuinely has no requirements/cases.
+func TestWaveReportCoverageReflectsCases(t *testing.T) {
+	deps, _ := newReadModelFixture()
+	reader := NewReportDataReader(deps)
+	version, err := reader.VersionSnapshot(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("VersionSnapshot: %v", err)
+	}
+	if version.Coverage.RequirementsTotal != 1 || version.Coverage.CaseVersionsTotal != 2 {
+		t.Fatalf("version coverage = %+v, want 1 requirement and 2 case versions", version.Coverage)
+	}
+	for _, waveID := range []int64{11, 12} {
+		snapshot, err := reader.WaveSnapshot(context.Background(), 7, waveID)
+		if err != nil {
+			t.Fatalf("WaveSnapshot(%d): %v", waveID, err)
+		}
+		coverage := snapshot.Coverage
+		if coverage.RequirementsTotal == 0 || coverage.CaseVersionsTotal == 0 {
+			t.Fatalf("wave %d coverage = %+v, want non-zero denominators (QA Q3)", waveID, coverage)
+		}
+		if coverage.RequirementsTotal != version.Coverage.RequirementsTotal ||
+			coverage.RequirementsCovered != version.Coverage.RequirementsCovered ||
+			coverage.CaseVersionsTotal != version.Coverage.CaseVersionsTotal ||
+			coverage.CaseVersionsCovered != version.Coverage.CaseVersionsCovered {
+			t.Fatalf("wave %d coverage = %+v, want the version projection %+v", waveID, coverage, version.Coverage)
+		}
+	}
+
+	// 0/0 is only correct when the version really has no requirements/cases.
+	empty, _ := newReadModelFixture()
+	empty.Requirements = &fakeRequirements{}
+	empty.Design = &fakeDesign{}
+	emptySnapshot, err := NewReportDataReader(empty).WaveSnapshot(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("empty WaveSnapshot: %v", err)
+	}
+	if coverage := emptySnapshot.Coverage; coverage.RequirementsTotal != 0 ||
+		coverage.RequirementsCovered != 0 || coverage.CaseVersionsTotal != 0 ||
+		coverage.CaseVersionsCovered != 0 || len(coverage.Gaps) != 0 {
+		t.Fatalf("empty version coverage = %+v, want 0/0 without gaps", coverage)
+	}
+}
+
+// TestWaveReportCoverageShowsGaps pins that a wave report lists the execution
+// coverage gaps of the version instead of the misleading "无覆盖缺口" empty
+// state, and that the reason matches the execution.coverage_gap analysis
+// (failed run vs. never run).
+func TestWaveReportCoverageShowsGaps(t *testing.T) {
+	t.Run("failed run is a gap", func(t *testing.T) {
+		deps, _ := newReadModelFixture()
+		snapshot, err := NewReportDataReader(deps).WaveSnapshot(context.Background(), 7, 11)
+		if err != nil {
+			t.Fatalf("WaveSnapshot: %v", err)
+		}
+		if len(snapshot.Coverage.Gaps) != 1 {
+			t.Fatalf("gaps = %+v, want the failed case 3001", snapshot.Coverage.Gaps)
+		}
+		gap := snapshot.Coverage.Gaps[0]
+		if gap.RequirementID != 101 || gap.CaseVersionID != 3001 || gap.Reason != "execution_failed_coverage" {
+			t.Fatalf("gap = %+v, want requirement 101 / case 3001 / execution_failed_coverage", gap)
+		}
+		if snapshot.Coverage.CaseVersionsCovered != 1 || snapshot.Coverage.RequirementsCovered != 1 {
+			t.Fatalf("coverage = %+v, want the passing case to count", snapshot.Coverage)
+		}
+	})
+
+	t.Run("never-run case is a gap", func(t *testing.T) {
+		deps, _ := newReadModelFixture()
+		runs := deps.CaseRuns.(*fakeCaseRuns)
+		runs.runs = runs.runs[1:] // keep only the passed 3002 run
+		snapshot, err := NewReportDataReader(deps).WaveSnapshot(context.Background(), 7, 11)
+		if err != nil {
+			t.Fatalf("WaveSnapshot: %v", err)
+		}
+		if len(snapshot.Coverage.Gaps) != 1 {
+			t.Fatalf("gaps = %+v, want the never-run case 3001", snapshot.Coverage.Gaps)
+		}
+		gap := snapshot.Coverage.Gaps[0]
+		if gap.CaseVersionID != 3001 || gap.Reason != "execution_not_run" {
+			t.Fatalf("gap = %+v, want case 3001 / execution_not_run", gap)
+		}
+		if snapshot.Coverage.CaseVersionsCovered != 1 || snapshot.Coverage.RequirementsCovered != 1 {
+			t.Fatalf("coverage = %+v, want the passing case to count", snapshot.Coverage)
+		}
+	})
+
+	t.Run("no passing case leaves the requirement uncovered", func(t *testing.T) {
+		deps, _ := newReadModelFixture()
+		runs := deps.CaseRuns.(*fakeCaseRuns)
+		for index := range runs.runs {
+			if runs.runs[index].CaseVersionID == 3002 {
+				runs.runs[index].Status = execution.CaseRunInconclusive
+			}
+		}
+		// Wave 12 has no executable case run of its own: the version projection
+		// must still list both uncovered cases.
+		snapshot, err := NewReportDataReader(deps).WaveSnapshot(context.Background(), 7, 12)
+		if err != nil {
+			t.Fatalf("WaveSnapshot: %v", err)
+		}
+		if len(snapshot.Coverage.Gaps) != 2 {
+			t.Fatalf("gaps = %+v, want both executable cases", snapshot.Coverage.Gaps)
+		}
+		if snapshot.Coverage.CaseVersionsCovered != 0 || snapshot.Coverage.RequirementsCovered != 0 {
+			t.Fatalf("coverage = %+v, want zero covered with no passing case", snapshot.Coverage)
+		}
+	})
+}
+
 func TestReportDataReaderCapsIssueList(t *testing.T) {
 	deps, issues := newReadModelFixture()
 	rows := make([]delivery.Issue, 0, delivery.MaxReportIssues+1)

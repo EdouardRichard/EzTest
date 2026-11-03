@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
@@ -164,6 +165,9 @@ type assembledRun struct {
 	// hasFailedAssertion reports whether the run carries a failed assertion
 	// result (the P3 precondition for an issue candidate / failure detail).
 	hasFailedAssertion bool
+	// hasRequirementDeviation reports whether a failed step recorded an
+	// observed product behavior instead of a tool/automation error (QA Q1).
+	hasRequirementDeviation bool
 }
 
 // caseRunsOfVersion returns every case_run of a version ordered by ID, reached
@@ -313,6 +317,14 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		}
 	}
 	result.hasFailedAssertion = firstFailed != nil
+	var deviationStep *execution.StepResult
+	for index := range steps {
+		if execution.FailedStepShowsRequirementDeviation(steps[index]) {
+			deviationStep = &steps[index]
+			break
+		}
+	}
+	result.hasRequirementDeviation = deviationStep != nil
 
 	evidenceRows := make([]execution.Evidence, 0)
 	if m.deps.Evidence != nil {
@@ -371,8 +383,25 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 			}
 		}
 	}
+	if firstFailed == nil && deviationStep != nil {
+		// QA Q1: a failed step with an observed product behavior is itself the
+		// requirement-deviation evidence, so the issue candidate must carry the
+		// step ref, a category/severity and the observed summary even when the
+		// case executor never recorded a failed assertion.
+		category = "ui"
+		severity = failureSeverity(info.priority)
+		failedStepSeq = deviationStep.Seq
+		failedStepResultID = deviationStep.ID
+		if deviationStep.TargetVersionSUTID != nil && *deviationStep.TargetVersionSUTID > 0 {
+			versionSUTID = int64Ptr(*deviationStep.TargetVersionSUTID)
+		}
+	}
 	if versionSUTID == nil && len(runVersionSUTIDs) > 0 {
 		versionSUTID = int64Ptr(runVersionSUTIDs[0])
+	}
+	failureSummary := run.Summary.LastError
+	if strings.TrimSpace(failureSummary) == "" && deviationStep != nil {
+		failureSummary = execution.StepObservedSummary(*deviationStep)
 	}
 
 	evidenceIDs := make([]int64, 0, len(evidenceRows))
@@ -403,7 +432,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		RequirementID: info.requirementID, CaseTitle: info.title,
 		VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
-		Summary:         run.Summary.LastError,
+		Summary:         failureSummary,
 		StepCount:       stepCount,
 		StepFailedCount: stepFailedCount,
 		AssertionCount:  assertionCount, AssertionFailedCount: assertionFailedCount,
@@ -417,7 +446,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		ID: run.ID, VersionID: versionID, WaveID: run.WaveID, CaseVersionID: run.CaseVersionID,
 		CaseTitle: info.title, VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
-		Summary:         run.Summary.LastError,
+		Summary:         failureSummary,
 		StepCount:       stepCount,
 		StepFailedCount: stepFailedCount,
 		AssertionCount:  assertionCount, AssertionFailedCount: assertionFailedCount,
@@ -451,8 +480,10 @@ func (r *ExecutionReader) ListFailedApplicationCaseRuns(ctx context.Context, ver
 			return nil, err
 		}
 		// P3 emits an issue candidate only for a failed(application) run with
-		// failed assertion evidence; a claim without evidence is inconclusive.
-		if !assembled.hasFailedAssertion {
+		// failed assertion evidence, or (QA Q1) with a failed step whose
+		// observed behavior contradicts the requirement; a claim without
+		// evidence stays inconclusive.
+		if !assembled.hasFailedAssertion && !assembled.hasRequirementDeviation {
 			continue
 		}
 		snapshots = append(snapshots, assembled.app)
@@ -509,8 +540,11 @@ func (r *ExecutionReader) VersionSnapshot(ctx context.Context, versionID int64) 
 	return r.model.appVersionSnapshot(model, view), nil
 }
 
-// waveModel assembles the report-style model of one wave (header, runs, issues
-// and version SUTs). It is shared by the app and report projections.
+// waveModel assembles the report-style model of one wave (header, runs, issues,
+// version SUTs and the version coverage projection). It is shared by the app and
+// report projections. Requirements/cases are version-level, so a wave report
+// carries the same coverage projection as the version report instead of the
+// zero value (QA Q3: coverage 0/0/0/0 with "无覆盖缺口" while gaps existed).
 func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (delivery.ReportSnapshot, error) {
 	if versionID <= 0 || waveID <= 0 {
 		return delivery.ReportSnapshot{}, platform.Invalid("wave_id", "must be a positive decimal ID")
@@ -543,6 +577,14 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
+	requirementViews, err := m.requirementViews(ctx, versionID)
+	if err != nil {
+		return delivery.ReportSnapshot{}, err
+	}
+	coverage, err := m.coverage(ctx, versionID, requirementViews)
+	if err != nil {
+		return delivery.ReportSnapshot{}, err
+	}
 	return delivery.CapReportSnapshot(delivery.ReportSnapshot{
 		Kind:        delivery.ReportKindWave,
 		VersionID:   versionID,
@@ -551,6 +593,7 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 		CaseRuns:    modelRuns,
 		Issues:      issueSnapshots,
 		VersionSUTs: versionSUTs,
+		Coverage:    coverage,
 	}), nil
 }
 
@@ -629,18 +672,18 @@ func (m *readModel) buildRuns(ctx context.Context, versionID int64, runs []execu
 	return modelRuns, appRuns, evidenceRows, nil
 }
 
-// requirementSnapshots pages the version requirements and joins the newest
-// closure round. It also returns the requirement views for coverage.
-func (m *readModel) requirementSnapshots(ctx context.Context, versionID int64) ([]delivery.RequirementSnapshot, []versionapp.RequirementView, error) {
+// requirementViews drains the version requirement pages ordered by ID. Both the
+// version report snapshots and the coverage projection share it.
+func (m *readModel) requirementViews(ctx context.Context, versionID int64) ([]versionapp.RequirementView, error) {
 	if m.deps.Requirements == nil {
-		return nil, nil, platform.NewError(500, "internal", "delivery adapter has no requirement reader")
+		return nil, platform.NewError(500, "internal", "delivery adapter has no requirement reader")
 	}
 	views := make([]versionapp.RequirementView, 0)
 	var before *int64
 	for {
 		page, hasMore, err := m.deps.Requirements.List(ctx, versionID, "", pageSize, before)
 		if err != nil {
-			return nil, nil, fmt.Errorf("list requirements: %w", err)
+			return nil, fmt.Errorf("list requirements: %w", err)
 		}
 		views = append(views, page...)
 		if !hasMore || len(page) == 0 {
@@ -653,6 +696,16 @@ func (m *readModel) requirementSnapshots(ctx context.Context, versionID int64) (
 		before = &last
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].ID < views[j].ID })
+	return views, nil
+}
+
+// requirementSnapshots joins the newest closure round of every requirement. It
+// also returns the requirement views for coverage.
+func (m *readModel) requirementSnapshots(ctx context.Context, versionID int64) ([]delivery.RequirementSnapshot, []versionapp.RequirementView, error) {
+	views, err := m.requirementViews(ctx, versionID)
+	if err != nil {
+		return nil, nil, err
+	}
 	snapshots := make([]delivery.RequirementSnapshot, 0, len(views))
 	for _, view := range views {
 		snapshot := delivery.RequirementSnapshot{

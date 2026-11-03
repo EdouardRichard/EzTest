@@ -2,6 +2,7 @@ package designapp
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -278,19 +279,51 @@ func (f *fakeRepo) InsertDataPlanRevision(_ context.Context, versionID, baseCase
 	return copied, nil
 }
 
-// seedFakeCase inserts a case with a deterministic version history. The last
-// version is the current one.
-func seedFakeCase(t *testing.T, repo *fakeRepo, caseID, scenarioID int64, title string, statuses ...string) {
+// fakeCaseVersionSpec is one seeded case version: its step/assertion content
+// and its status. Task 95 needs histories where the current revision lost the
+// assertions an earlier revision carried (the PO O8 1-step/0-assertion version).
+type fakeCaseVersionSpec struct {
+	steps      int
+	assertions int
+	status     string
+}
+
+// fakeCaseVersion builds one immutable fake case version with deterministic
+// child rows.
+func fakeCaseVersion(caseID int64, revision int, title string, steps, assertions int, status string) design.CaseVersion {
+	version := design.CaseVersion{
+		ID: caseID*10 + int64(revision), CaseID: caseID, Revision: revision,
+		Title: title, Status: status,
+		ContentHash:   fmt.Sprintf("hash-%s-%d", title, revision),
+		VersionSUTIDs: []int64{9001}, DefaultVersionSUTID: int64Ptr(9001),
+		StepCount: steps, AssertionCount: assertions,
+	}
+	for seq := 1; seq <= steps; seq++ {
+		version.Steps = append(version.Steps, design.CaseStep{
+			Seq: seq, Action: fmt.Sprintf("step %d", seq), Expected: "ok",
+		})
+	}
+	for seq := 1; seq <= assertions; seq++ {
+		stepSeq := 1
+		if steps > 0 {
+			stepSeq = (seq-1)%steps + 1
+		}
+		version.Assertions = append(version.Assertions, design.CaseAssertion{
+			StepSeq: stepSeq, AssertionSeq: seq, Kind: "ui", Target: "page", Expected: "ok",
+		})
+	}
+	return version
+}
+
+// seedFakeCaseVersions inserts a case with an explicit per-revision content
+// history. The last revision is the current one.
+func seedFakeCaseVersions(t *testing.T, repo *fakeRepo, caseID, scenarioID int64, title string, specs ...fakeCaseVersionSpec) {
 	t.Helper()
 	item := &fakeCase{}
-	for index, status := range statuses {
-		version := design.CaseVersion{
-			ID: caseID*10 + int64(index+1), CaseID: caseID, Revision: index + 1,
-			Title: title, Status: status, ContentHash: "hash-" + title,
-			VersionSUTIDs: []int64{9001}, DefaultVersionSUTID: int64Ptr(9001),
-			Steps: []design.CaseStep{{Seq: 1, Action: "step"}},
-		}
-		item.versions = append(item.versions, version)
+	for index, spec := range specs {
+		item.versions = append(item.versions, fakeCaseVersion(
+			caseID, index+1, title, spec.steps, spec.assertions, spec.status,
+		))
 	}
 	if len(item.versions) > 0 {
 		current := item.versions[len(item.versions)-1]
@@ -303,4 +336,36 @@ func seedFakeCase(t *testing.T, repo *fakeRepo, caseID, scenarioID int64, title 
 		item.entity = design.CaseEntity{ID: caseID, ScenarioID: scenarioID, Status: design.CaseStatusDraft}
 	}
 	repo.cases[caseID] = item
+}
+
+// appendFakeCaseVersion appends the next revision of an existing fake case and
+// makes it current. It models the design repair after an incomplete version was
+// refused: the repaired revision restores the designed steps/assertions.
+func appendFakeCaseVersion(t *testing.T, repo *fakeRepo, caseID int64, steps, assertions int, status string) design.CaseVersion {
+	t.Helper()
+	item, ok := repo.cases[caseID]
+	if !ok || item.current == nil {
+		t.Fatalf("appendFakeCaseVersion: case %d has no current version", caseID)
+	}
+	revision := len(item.versions) + 1
+	version := fakeCaseVersion(caseID, revision, item.current.Title, steps, assertions, status)
+	item.versions = append(item.versions, version)
+	item.current = &version
+	versionID := version.ID
+	item.entity.CurrentVersionID = &versionID
+	item.entity.Status = status
+	return version
+}
+
+// seedFakeCase inserts a case with a deterministic version history. The last
+// version is the current one. Every seeded version carries one step and one
+// assertion so it satisfies the Task 95 confirmation completeness gate; tests
+// that need the O8 incomplete shape use seedFakeCaseVersions.
+func seedFakeCase(t *testing.T, repo *fakeRepo, caseID, scenarioID int64, title string, statuses ...string) {
+	t.Helper()
+	specs := make([]fakeCaseVersionSpec, 0, len(statuses))
+	for _, status := range statuses {
+		specs = append(specs, fakeCaseVersionSpec{steps: 1, assertions: 1, status: status})
+	}
+	seedFakeCaseVersions(t, repo, caseID, scenarioID, title, specs...)
 }

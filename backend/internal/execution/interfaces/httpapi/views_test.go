@@ -31,6 +31,32 @@ func TestEvidenceKindsIncludeVisualKinds(t *testing.T) {
 	}
 }
 
+// TestCaseRunSummaryViewCarriesIncompleteCause pins the QA Q2 UI contract: an
+// incomplete case run exposes the concrete terminal cause, the human-readable
+// explanation and the stable next action so the execution UI can render an
+// actionable row instead of a bare "incomplete".
+func TestCaseRunSummaryViewCarriesIncompleteCause(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunInconclusive,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: "incomplete",
+			TerminalCause: execution.TerminalCauseTokenBudget,
+			LastError:     "token budget: used 222159 of 200000 tokens after 15 turns; the case recorded 1 of 4 steps before the run ended",
+			NextAction:    execution.NextActionRerun,
+		},
+	}, caseMeta{}, nil, 0)
+	if view.Summary.TerminalCause != execution.TerminalCauseTokenBudget {
+		t.Fatalf("terminal cause = %q", view.Summary.TerminalCause)
+	}
+	if view.Summary.LastError == "" {
+		t.Fatal("last error was dropped from the case-run summary view")
+	}
+	if view.Summary.NextAction != execution.NextActionRerun {
+		t.Fatalf("next action = %q", view.Summary.NextAction)
+	}
+}
+
 // TestCaseRunSummaryViewCarriesVisualCounts pins the P5 summary fields
 // (spec §4.2): visual_passed/failed/inconclusive are exposed and visual_skipped
 // stays in the payload for compatibility but is 0 on the P5 path.

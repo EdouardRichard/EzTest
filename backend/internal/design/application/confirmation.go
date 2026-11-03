@@ -87,14 +87,33 @@ func (s *GraphService) ConfirmCasesByIDs(ctx context.Context, versionID int64, c
 	// Validate the whole selection before changing anything, so a foreign or
 	// missing ID can never leave an earlier case of the same selection
 	// confirmed while the gate reports failure.
+	targets := make([]design.ConfirmationTarget, 0, len(ids))
 	for _, caseID := range ids {
-		if _, err := s.repo.ResolveConfirmationTarget(ctx, versionID, design.ConfirmScopeCase, caseID); err != nil {
+		target, err := s.repo.ResolveConfirmationTarget(ctx, versionID, design.ConfirmScopeCase, caseID)
+		if err != nil {
 			return mapDesignError(err, "case")
 		}
+		targets = append(targets, target)
 	}
-	for _, caseID := range ids {
+	// Task 95: an incomplete draft version (the PO O8 1-step/0-assertion
+	// version) must block the whole selected batch before any sibling is frozen.
+	// Confirming a complete sibling first and then failing on the incomplete one
+	// would leave a partially confirmed selection behind a failed gate.
+	for _, target := range targets {
+		data, err := s.repo.ReadCase(ctx, versionID, target.CaseID, nil)
+		if err != nil {
+			return mapDesignError(err, "case")
+		}
+		if data.Selected.Status != design.CaseStatusDraft {
+			continue
+		}
+		if err := validateConfirmableCaseVersion(design.CaseWithCurrent{Case: data.Case, Current: &data.Selected}); err != nil {
+			return err
+		}
+	}
+	for _, target := range targets {
 		if _, err := s.Confirm(ctx, versionID, ConfirmInput{
-			Scope: design.ConfirmScopeCase, TargetID: caseID,
+			Scope: design.ConfirmScopeCase, TargetID: target.CaseID,
 		}, actorID); err != nil {
 			return err
 		}
@@ -290,6 +309,15 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 			}
 			return platform.StateConflict("no draft case version is available for this confirmation scope")
 		}
+		// Task 95: a bulk confirmation is atomic and may only freeze complete
+		// versions. Validate every candidate before the first write so a
+		// version that lost its designed steps/assertions cannot be confirmed
+		// alongside its complete siblings.
+		for _, item := range toConfirm {
+			if err := validateConfirmableCaseVersion(item); err != nil {
+				return err
+			}
+		}
 
 		affected := make([]string, 0, len(toConfirm))
 		for _, item := range toConfirm {
@@ -389,4 +417,58 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 	}
 	s.reopenCompleted(ctx, versionID, "case confirmed")
 	return result, nil
+}
+
+// validateConfirmableCaseVersion enforces the Task 95 finalize rule: a case
+// version may only enter the confirmed set when it carries at least one step
+// and one assertion. The PO O8 AC-FR-011-01 version (1 step, 0 assertions) was
+// confirmed and then executed into inconclusive(incomplete); confirmation must
+// instead return a typed repair request.
+func validateConfirmableCaseVersion(item design.CaseWithCurrent) error {
+	if item.Current == nil {
+		return nil
+	}
+	if design.CaseVersionComplete(*item.Current) {
+		return nil
+	}
+	return incompleteCaseVersionError(item)
+}
+
+// incompleteCaseVersionError is the typed 409 block/repair response for an
+// incomplete case version. The message carries the counts and the repair action
+// because the design UI renders the API message; Details are for API consumers.
+func incompleteCaseVersionError(item design.CaseWithCurrent) *platform.Error {
+	version := design.CaseVersion{}
+	if item.Current != nil {
+		version = *item.Current
+	}
+	steps, assertions := design.CaseVersionContentCounts(version)
+	missing := make([]string, 0, 2)
+	if steps < design.MinimumCaseVersionSteps {
+		missing = append(missing, "steps")
+	}
+	if assertions < design.MinimumCaseVersionAssertions {
+		missing = append(missing, "assertions")
+	}
+	title := strings.TrimSpace(version.Title)
+	if title == "" {
+		title = "untitled case"
+	}
+	return &platform.Error{
+		Status: http.StatusConflict,
+		Code:   "incomplete_case_version",
+		Message: fmt.Sprintf(
+			"case %q version %d is incomplete (%d step(s), %d assertion(s)); a confirmable case needs at least %d step and %d assertion. Repair the case in design (restore the designed steps/assertions) and confirm it again.",
+			title, version.ID, steps, assertions,
+			design.MinimumCaseVersionSteps, design.MinimumCaseVersionAssertions,
+		),
+		Details: map[string]any{
+			"case_id":         platformid.Format(item.Case.ID),
+			"case_version_id": platformid.Format(version.ID),
+			"step_count":      steps,
+			"assertion_count": assertions,
+			"missing":         missing,
+			"next_action":     "repair the case version in design (restore the designed steps/assertions), then confirm the repaired version again",
+		},
+	}
 }

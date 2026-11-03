@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -30,7 +31,7 @@ type requirementRead struct{ deps Deps }
 func (t *requirementRead) Name() string { return ToolRequirementRead }
 
 func (t *requirementRead) Description() string {
-	return "读取当前版本的需求列表；传入 requirement_id 时返回该需求详情（跨版本返回 not_found）。"
+	return "读取当前版本的需求列表；传入 requirement_id 时返回该需求详情（跨版本返回 not_found）。返回是读取时刻的快照：并行写入（如需求 Curator 在同一轮创建 draft）可能尚未出现，需要确认最新状态时请重读，不要据一次空结果断言草案未创建。"
 }
 
 func (t *requirementRead) Parameters() json.RawMessage {
@@ -130,19 +131,19 @@ func draftProperties() map[string]any {
 		"target_version_suts": map[string]any{
 			"type":        "array",
 			"maxItems":    maxRequirementTargets,
-			"description": "目标 version_sut ID（十进制字符串），必须属于当前版本。",
+			"description": "目标 version_sut ID（十进制字符串，取 sut.list 返回的 version_sut_id），必须属于当前版本。",
 			"items":       map[string]any{"type": "string"},
 		},
 		"target_pages": map[string]any{
 			"type":        "array",
 			"maxItems":    maxRequirementTargets,
-			"description": "目标页面标识，必须属于当前版本绑定。",
+			"description": "目标页面 ID（十进制字符串，取 sut.page_list 中 kind=page 条目的 id）；不能填 path、URL 或页面名称，且必须属于当前版本绑定。",
 			"items":       map[string]any{"type": "string"},
 		},
 		"target_apis": map[string]any{
 			"type":        "array",
 			"maxItems":    maxRequirementTargets,
-			"description": "目标 API 标识，必须属于当前版本绑定。",
+			"description": "目标 API ID（十进制字符串，取 sut.page_list 中 kind=api 条目的 id）；不能填方法+路径或接口名称，且必须属于当前版本绑定。",
 			"items":       map[string]any{"type": "string"},
 		},
 	}
@@ -395,13 +396,13 @@ func buildDraft(fields draftFields) (RequirementDraft, *Error) {
 	if !contains(requirementPriorities, priority) {
 		return RequirementDraft{}, Invalid("priority", "must be one of P0, P1, P2, P3")
 	}
-	if err := validateStringList("target_version_suts", fields.TargetVersionSUTs, maxRequirementTargets); err != nil {
+	if err := validateTargetIDList("target_version_suts", fields.TargetVersionSUTs, maxRequirementTargets); err != nil {
 		return RequirementDraft{}, err
 	}
-	if err := validateStringList("target_pages", fields.TargetPages, maxRequirementTargets); err != nil {
+	if err := validateTargetIDList("target_pages", fields.TargetPages, maxRequirementTargets); err != nil {
 		return RequirementDraft{}, err
 	}
-	if err := validateStringList("target_apis", fields.TargetAPIs, maxRequirementTargets); err != nil {
+	if err := validateTargetIDList("target_apis", fields.TargetAPIs, maxRequirementTargets); err != nil {
 		return RequirementDraft{}, err
 	}
 
@@ -419,6 +420,23 @@ func buildDraft(fields draftFields) (RequirementDraft, *Error) {
 		TargetPages:        normalizedList(fields.TargetPages),
 		TargetAPIs:         normalizedList(fields.TargetAPIs),
 	}, nil
+}
+
+// validateTargetIDList keeps the version context's numeric-ID contract at the
+// tool boundary: implementation targets are catalog IDs exposed by sut.list /
+// sut.page_list ("id"), never paths, URLs or names. Membership in the version
+// binding stays the version service's validation.
+func validateTargetIDList(field string, values []string, max int) *Error {
+	if err := validateStringList(field, values, max); err != nil {
+		return err
+	}
+	for _, value := range values {
+		parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || parsed <= 0 {
+			return Invalid(field, "must contain positive decimal IDs (use the id values returned by sut.list/sut.page_list)")
+		}
+	}
+	return nil
 }
 
 // normalizeConstraints accepts an absent/null value or a JSON object; arrays

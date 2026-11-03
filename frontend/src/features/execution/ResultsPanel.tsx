@@ -15,6 +15,7 @@ import {
   CASE_RUN_STATUS_TONE,
   CASE_RUN_TERMINAL_STATUSES,
   failureClassLabel,
+  terminalCauseLabel,
 } from "./labels"
 import type { CaseRun, CaseRunDetail } from "./types"
 
@@ -158,6 +159,15 @@ export function ResultsPanel({
                       {caseRun.failure_class !== "" ? (
                         <span className="text-[11px] text-destructive">
                           {failureClassLabel(caseRun.failure_class)}
+                        </span>
+                      ) : null}
+                      {caseRun.status === "inconclusive" &&
+                      terminalCauseLabel(caseRun.summary.terminal_cause) !== null ? (
+                        <span
+                          data-testid={`case-run-cause-${caseRun.id}`}
+                          className="text-[11px] text-warning"
+                        >
+                          原因 {terminalCauseLabel(caseRun.summary.terminal_cause)}
                         </span>
                       ) : null}
                       <span className="ml-auto text-[10px] text-muted-foreground">

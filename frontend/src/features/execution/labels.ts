@@ -158,6 +158,33 @@ export const ASSERTION_KIND_LABEL: Record<AssertionKind, string> = {
   visual: "视觉",
 }
 
+/**
+ * Stable `case_run.summary.terminal_cause` codes (QA Q2). They name why a
+ * terminal incomplete run stopped; unknown future codes fall back to the raw
+ * value so this map never hides a cause.
+ */
+export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
+  turn_budget: "轮次预算用尽",
+  token_budget: "Token 预算用尽",
+  time_budget: "运行时间用尽",
+  agent_stopped: "Agent 提前结束（未提交结论）",
+}
+
+export function terminalCauseLabel(value: string | undefined): string | null {
+  if (value === undefined || value === "") return null
+  return CASE_RUN_TERMINAL_CAUSE_LABEL[value] ?? value
+}
+
+/** Stable `case_run.summary.next_action` codes; the only P3 action is a rerun. */
+export const CASE_RUN_NEXT_ACTION_LABEL: Record<string, string> = {
+  rerun: "重跑用例（新的执行会使用新的预算从头开始）",
+}
+
+export function nextActionLabel(value: string | undefined): string | null {
+  if (value === undefined || value === "") return null
+  return CASE_RUN_NEXT_ACTION_LABEL[value] ?? value
+}
+
 export const EXECUTOR_STATUS_LABEL: Record<ExecutorStatus, string> = {
   active: "在线",
   draining: "排空中",
