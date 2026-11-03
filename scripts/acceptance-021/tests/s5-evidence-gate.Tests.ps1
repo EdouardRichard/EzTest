@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # Focused tests for the S5 real-execution evidence gate (Task 73 / QA-F1).
 # The gate is a pure helper so it can be tested without a live stack:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-021/tests/s5-evidence-gate.Tests.ps1

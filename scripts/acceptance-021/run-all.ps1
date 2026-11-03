@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Final unattended acceptance entrypoint for EzTest 0.2.1 (S0-S10).

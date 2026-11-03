@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Pure real-execution evidence gate for the S5 acceptance scenario (Task 73).
