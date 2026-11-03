@@ -437,6 +437,18 @@ func TestPlannerQueriesAndCaseCounts(t *testing.T) {
 	if len(clarified) != 1 || clarified[0].CurrentVersionID != testReqVersion {
 		t.Fatalf("clarified = %+v", clarified)
 	}
+	// Task 79: the planner derives the authoring claim priority from the
+	// requirement priority, so the clarified projection must carry it.
+	if clarified[0].Priority != "P2" {
+		t.Fatalf("clarified priority = %q, want P2", clarified[0].Priority)
+	}
+	requirementContext, err := repo.RequirementContext(ctx, testVersionID, testReqID)
+	if err != nil {
+		t.Fatalf("RequirementContext: %v", err)
+	}
+	if requirementContext.Priority != "P2" {
+		t.Fatalf("requirement context priority = %q, want P2", requirementContext.Priority)
+	}
 
 	generator, _ := id.NewSnowflake(1)
 	now := time.Now().UTC()
@@ -501,6 +513,9 @@ func TestPlannerQueriesAndCaseCounts(t *testing.T) {
 	if len(coverage) != 1 || coverage[0].ScenarioCount != 1 || coverage[0].DraftCount != 1 ||
 		coverage[0].ConfirmedCount != 1 || coverage[0].StaleCount != 1 {
 		t.Fatalf("coverage = %+v", coverage)
+	}
+	if coverage[0].Requirement.Priority != "P2" {
+		t.Fatalf("coverage priority = %q, want P2", coverage[0].Requirement.Priority)
 	}
 }
 

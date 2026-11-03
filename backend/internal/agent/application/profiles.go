@@ -263,8 +263,11 @@ func P2Profiles() []agent.AgentProfile {
 			Name:         "用例 Author",
 			SystemPrompt: caseAuthorPrompt,
 			AllowedTools: append([]string(nil), caseAuthorTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 300, HardSeconds: 600},
-			Enabled:      true,
+			// Task 79: the per-requirement author needs the read, propose and
+			// summary turns; one 67-requirement round runs the author once per
+			// requirement, so the seed matches the design team envelope.
+			Budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
+			Enabled: true,
 		},
 		{
 			Key:          ProfileKeyDesignCritic,

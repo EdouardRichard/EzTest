@@ -15,7 +15,7 @@ import (
 )
 
 // TestContractClaimForTeamsSelectsStageEntryItems pins Task 65's SQL claim
-// path: a dispatcher-created stage-entry row (kind <> '') carries the product
+// path: a dispatcher-created stage-entry row (kind <> ”) carries the product
 // team as its frozen claim default and is leased by ClaimWorkItemForTeams for
 // that team only. The legacy ClaimForTeams path still ignores kind rows, and a
 // foreign team cannot take the item.
@@ -100,6 +100,36 @@ func ensureTeamItem(t *testing.T, repo *agentpg.WorkItemRepository, versionID in
 		t.Fatalf("Ensure(%s/%s) did not create", team, dedupe)
 	}
 	return item
+}
+
+// TestDesignAuthorClaimHonorsRequirementPriority pins Task 79's claim ordering:
+// the design planner stamps a design.requirement item with the requirement
+// priority, and the queue must lease the P0 item before a lower-priority item
+// that was enqueued first. Without this ordering a 67-requirement round would
+// drain in import order and starve P0 behind P1/P2.
+func TestDesignAuthorClaimHonorsRequirementPriority(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
+	ctx := context.Background()
+
+	low := ensureTeamItem(t, repo, 31, agent.TeamDesign, "design.requirement", "design:2:2", 1)
+	high := ensureTeamItem(t, repo, 31, agent.TeamDesign, "design.requirement", "design:1:1", 3)
+	designTeam := []agent.Team{agent.TeamDesign}
+
+	first, ok, err := repo.ClaimForTeams(ctx, "worker", designTeam, 2*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("first claim = %#v, %v, %v", first, ok, err)
+	}
+	if first.ID != high.ID || first.Priority != 3 {
+		t.Fatalf("first claim = %#v, want the higher-priority P0 item %d", first, high.ID)
+	}
+	second, ok, err := repo.ClaimForTeams(ctx, "worker", designTeam, 2*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("second claim = %#v, %v, %v", second, ok, err)
+	}
+	if second.ID != low.ID {
+		t.Fatalf("second claim = %#v, want the lower-priority item %d", second, low.ID)
+	}
 }
 
 func TestWorkItemClaimForTeamsOnlyRequestedTeam(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
@@ -13,6 +14,57 @@ import (
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
+
+// maxDesignRoundRequirements bounds the design.round authoring scope: one model
+// run reads the graph once and submits at most ten cases per proposal, so a
+// round that carries all 67 V1 requirement ids can never produce them. The
+// round run therefore proposes for the highest-priority prefix only; the
+// per-requirement design.requirement authors cover the rest of the scope.
+const maxDesignRoundRequirements = 3
+
+// Design authoring work-item priorities: P0 requirements are claimed before P1,
+// P2 and P3 so a 67-requirement authoring wave cannot starve the critical
+// scope behind FIFO requirement-import order (Task 79). The work queue claims
+// by priority DESC then id ASC.
+const (
+	designPriorityP3 = 0
+	designPriorityP2 = 1
+	designPriorityP1 = 2
+	designPriorityP0 = 3
+)
+
+// designRequirementPriority maps a requirement priority to the claim priority
+// of its authoring tasks. Unknown/empty priorities keep the default P3 level.
+func designRequirementPriority(priority string) int {
+	switch strings.ToUpper(strings.TrimSpace(priority)) {
+	case "P0":
+		return designPriorityP0
+	case "P1":
+		return designPriorityP1
+	case "P2":
+		return designPriorityP2
+	default:
+		return designPriorityP3
+	}
+}
+
+// roundTaskScope returns the bounded, highest-priority prefix of one round
+// scope for the design.round authoring payload. The full scope stays on the
+// design_round row; only the single model run is narrowed.
+func roundTaskScope(scope []design.RequirementRef) ([]int64, []int64) {
+	ordered := append([]design.RequirementRef(nil), scope...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, right := designRequirementPriority(ordered[i].Priority), designRequirementPriority(ordered[j].Priority)
+		if left != right {
+			return left > right
+		}
+		return ordered[i].ID < ordered[j].ID
+	})
+	if len(ordered) > maxDesignRoundRequirements {
+		ordered = ordered[:maxDesignRoundRequirements]
+	}
+	return requirementIDs(ordered), requirementVersionIDs(ordered)
+}
 
 // Planner deterministically activates design scopes, ensures design tasks and
 // serves the version design metrics. It never writes case content.
@@ -118,7 +170,7 @@ func (p *Planner) StartRound(ctx context.Context, versionID, conversationID, act
 		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID, scope); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
@@ -227,7 +279,7 @@ func (p *Planner) StartStageRound(ctx context.Context, versionID int64, requeste
 		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID, scope); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
@@ -389,6 +441,7 @@ func (p *Planner) RequestGap(ctx context.Context, in GapInput) error {
 				Type:      TaskTypeDesignGap,
 				DedupeKey: fmt.Sprintf("gap:%d:%d", in.RequirementID, dedupeSuffix),
 				Payload:   payload,
+				Priority:  designRequirementPriority(requirement.Priority),
 			}); err != nil {
 				return err
 			}
@@ -538,6 +591,7 @@ func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, r
 			Type:      TaskTypeDesignRequirement,
 			DedupeKey: fmt.Sprintf("design:%d:%d", requirement.ID, requirement.CurrentVersionID),
 			Payload:   payload,
+			Priority:  designRequirementPriority(requirement.Priority),
 		}); err != nil {
 			return err
 		}
@@ -576,6 +630,7 @@ func (p *Planner) ensureCoverageRepairTasks(ctx context.Context, versionID int64
 			Type:      TaskTypeDesignRequirement,
 			DedupeKey: fmt.Sprintf("design:%d:%d", requirement.ID, requirement.CurrentVersionID),
 			Payload:   payload,
+			Priority:  designRequirementPriority(requirement.Priority),
 		}, requirement.CurrentVersionID); err != nil {
 			return err
 		}
@@ -585,8 +640,11 @@ func (p *Planner) ensureCoverageRepairTasks(ctx context.Context, versionID int64
 
 // ensureRoundTask enqueues the design.round task of one conversation. The
 // payload carries the round's activated requirement/version ids (Task 69), so
-// the round turn can propose cases for the whole scope without re-deriving it.
-func (p *Planner) ensureRoundTask(ctx context.Context, versionID int64, round design.Round, conversationID int64) error {
+// the round turn can propose cases for the scope without re-deriving it. The
+// scope is bounded to the highest-priority prefix (Task 79): one model run
+// cannot read and propose 67 requirements, and the per-requirement authors own
+// the rest of the round.
+func (p *Planner) ensureRoundTask(ctx context.Context, versionID int64, round design.Round, conversationID int64, scope []design.RequirementRef) error {
 	if p.enqueuer == nil {
 		return nil
 	}
@@ -594,10 +652,23 @@ func (p *Planner) ensureRoundTask(ctx context.Context, versionID int64, round de
 		"conversation_id": platformid.Format(conversationID),
 		"round_id":        platformid.Format(round.ID),
 	}
-	if ids := formatIDList(round.RequirementIDs); len(ids) > 0 {
+	scopeIDs, scopeVersionIDs := roundTaskScope(scope)
+	if len(scopeIDs) == 0 && len(round.RequirementIDs) > 0 {
+		// Repair path with no refs in hand: keep the round order but still cap
+		// the single run's scope.
+		scopeIDs = round.RequirementIDs
+		scopeVersionIDs = round.RequirementVersionIDs
+		if len(scopeIDs) > maxDesignRoundRequirements {
+			scopeIDs = scopeIDs[:maxDesignRoundRequirements]
+		}
+		if len(scopeVersionIDs) > maxDesignRoundRequirements {
+			scopeVersionIDs = scopeVersionIDs[:maxDesignRoundRequirements]
+		}
+	}
+	if ids := formatIDList(scopeIDs); len(ids) > 0 {
 		payload["requirement_ids"] = ids
 	}
-	if ids := formatIDList(round.RequirementVersionIDs); len(ids) > 0 {
+	if ids := formatIDList(scopeVersionIDs); len(ids) > 0 {
 		payload["requirement_version_ids"] = ids
 	}
 	_, err := p.enqueuer.Ensure(ctx, TaskInput{
@@ -628,6 +699,7 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 			"requirement_id":         platformid.Format(item.Requirement.ID),
 			"requirement_version_id": platformid.Format(item.Requirement.CurrentVersionID),
 		}
+		priority := designRequirementPriority(item.Requirement.Priority)
 		if item.DraftCount > 0 || item.ConfirmedCount > 0 {
 			if _, err := p.enqueuer.Ensure(ctx, TaskInput{
 				VersionID: versionID,
@@ -635,6 +707,7 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 				Type:      TaskTypeDesignCritic,
 				DedupeKey: fmt.Sprintf("critic:%d:%d", item.Requirement.ID, item.Requirement.CurrentVersionID),
 				Payload:   payload,
+				Priority:  priority,
 			}); err != nil {
 				return err
 			}
@@ -646,6 +719,7 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 				Type:      TaskTypeDesignDataPlan,
 				DedupeKey: fmt.Sprintf("dataplan:%d:%d", item.Requirement.ID, item.Requirement.CurrentVersionID),
 				Payload:   payload,
+				Priority:  priority,
 			}); err != nil {
 				return err
 			}

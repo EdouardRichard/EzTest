@@ -944,12 +944,17 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
 		messages := conversationMessages(snapshot.Messages)
+		designConversation := strings.EqualFold(strings.TrimSpace(state.conversationKind), "design")
 		if isDesignAuthoringWorkType(state.item.Type) {
 			// Task 79: a background design author works from the work-item scope,
 			// requirement.read and design.graph_read. Replaying the shared design
 			// thread would replay every previous author's UI projection and grow
 			// the prompt with the round; keep only the human instructions.
 			messages = designAuthoringHistory(messages)
+		} else if designConversation {
+			// The design Host chat still needs its own recent turns, but not the
+			// whole background-author transcript that S3 appends to the thread.
+			messages = designHostHistory(messages)
 		}
 		state.input.Conversation = ConversationContext{
 			Summary:        snapshot.Summary,
@@ -958,7 +963,8 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		}
 	}
 	state.input.TeamRoom = r.teamRoomContext(ctx, state.item.VersionID, state.team)
-	if isDesignAuthoringWorkType(state.item.Type) {
+	if isDesignAuthoringWorkType(state.item.Type) ||
+		strings.EqualFold(strings.TrimSpace(state.conversationKind), "design") {
 		// The team room is where every author projects its own result: replaying
 		// the full post bodies turns the shared room into a second unbounded
 		// prompt. Keep the digest and only the newest, clipped posts.

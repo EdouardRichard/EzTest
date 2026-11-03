@@ -72,7 +72,7 @@ func (q *fakeWorkerQueue) ClaimForTeams(_ context.Context, _ string, teams []age
 
 // ClaimContract serves the 0.2.1 contract rows (kind != ""). The production
 // worker must use this claim path for them: ClaimForTeams only ever selects
-// legacy kind='' rows.
+// legacy kind=” rows.
 func (q *fakeWorkerQueue) ClaimContract(_ context.Context, _ string, teams []agent.Team) (*agent.WorkItem, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -324,7 +324,7 @@ func TestWorkerDrainGateStopsNewClaims(t *testing.T) {
 // design.cases item (created through the dispatcher defaults) is claimed by the
 // agent worker through the contract claim, dispatched to the runner and
 // completed. Before the fix the item carried Team=ops/Type=kind and the legacy
-// team claim skipped it forever (kind <> '' rows are not claimable there).
+// team claim skipped it forever (kind <> ” rows are not claimable there).
 func TestStageEntryWorkItemClaimed(t *testing.T) {
 	params := agent.CreateWorkItemParams{
 		VersionID:      7,
@@ -562,6 +562,61 @@ func TestWorkerRespectsConcurrencyLimit(t *testing.T) {
 	defer executor.mu.Unlock()
 	if executor.maxActive != 2 {
 		t.Fatalf("max active runs = %d, want 2", executor.maxActive)
+	}
+}
+
+// TestDesignAuthorQueueDrainsWithinConcurrency pins the queue-scaling half of
+// Task 79: a 67-requirement design round enqueues one authoring item per
+// requirement, and the worker must drain all of them while never running more
+// than agent.max_concurrent_runs at once. Combined with the bounded repair
+// generations in the design planner, the queue is finite and drains instead of
+// flooding the shared stack.
+func TestDesignAuthorQueueDrainsWithinConcurrency(t *testing.T) {
+	const (
+		authorCount = 67
+		limit       = 4
+	)
+	items := make([]agent.WorkItem, 0, authorCount)
+	for index := 0; index < authorCount; index++ {
+		item := fakeWorkItem(agentapp.WorkTypeDesignRequirement, agentapp.WorkItemPayload{
+			ConversationID: 20, RequirementID: int64(5000 + index), RequirementVersionID: int64(7000 + index),
+		})
+		item.ID = int64(2000 + index)
+		items = append(items, item)
+	}
+	queue := newFakeWorkerQueue(items...)
+	executor := &fakeRunExecutor{
+		result:  agentapp.RunResult{Status: agent.AgentRunDone},
+		release: make(chan struct{}),
+	}
+	worker := newTestWorker(queue, executor, &fakeSettings{},
+		agentapp.WithWorkerPollInterval(2*time.Millisecond),
+		agentapp.WithWorkerConcurrency(limit))
+
+	cancel, done := runWorker(t, worker)
+	waitUntil(t, 3*time.Second, func() bool {
+		executor.mu.Lock()
+		defer executor.mu.Unlock()
+		return executor.active == limit
+	}, "the design author concurrency limit")
+	time.Sleep(30 * time.Millisecond)
+	if claims, _, _ := queue.counts(); claims > limit {
+		t.Fatalf("claimed %d design authors, want the concurrency bound %d", claims, limit)
+	}
+	close(executor.release)
+	waitUntil(t, 5*time.Second, func() bool {
+		_, completes, _ := queue.counts()
+		return completes == authorCount
+	}, "all 67 design author items to drain")
+	stopWorker(t, cancel, done)
+
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.maxActive > limit {
+		t.Fatalf("max concurrent design authors = %d, want <= %d", executor.maxActive, limit)
+	}
+	if len(executor.calls) != authorCount {
+		t.Fatalf("executed design authors = %d, want %d", len(executor.calls), authorCount)
 	}
 }
 

@@ -9,12 +9,16 @@ import (
 // RequirementRef is the read-only design projection of a version-context
 // requirement joined with its current immutable revision.
 type RequirementRef struct {
-	ID                  int64
-	VersionID           int64
-	CurrentVersionID    int64
-	Revision            int
-	Title               string
-	Status              string
+	ID               int64
+	VersionID        int64
+	CurrentVersionID int64
+	Revision         int
+	Title            string
+	Status           string
+	// Priority is the current requirement version priority (P0-P3). Task 79:
+	// the design planner derives the work-item claim priority from it so the
+	// 67-requirement authoring wave cannot starve P0 behind P1/P2 FIFO order.
+	Priority            string
 	TargetVersionSUTIDs []int64
 }
 

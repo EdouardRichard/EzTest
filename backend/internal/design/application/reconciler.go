@@ -113,7 +113,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 			if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 				return err
 			}
-			if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation); err != nil {
+			if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation, scope); err != nil {
 				return err
 			}
 			p.markRunning(ctx, versionID)
@@ -152,7 +152,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation, requirementRefsUnion(activated, redesign)); err != nil {
 			return err
 		}
 		return p.ensureCriticAndDataPlanTasks(ctx, versionID)
@@ -227,7 +227,7 @@ func (p *Planner) autoStartIfEnabled(ctx context.Context, versionID int64) error
 		if err := p.ensureRequirementTasks(ctx, versionID, pending, "auto_new", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID, pending); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {

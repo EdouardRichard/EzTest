@@ -98,7 +98,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolRequirementRead,
 				tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose, tools.ToolSUTList, tools.ToolSUTPageList,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 300, HardSeconds: 600},
+			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:case_author]",
 			mustSay: []string{"draft", "不能确认"},
 		},
