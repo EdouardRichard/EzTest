@@ -99,13 +99,15 @@ func assertJobControlError(t *testing.T, recorder *httptest.ResponseRecorder, st
 
 func TestJobControlHandler(t *testing.T) {
 	author := &platform.Actor{ID: 71, Role: "author"}
+	// Task 46 fix round 2: a canceled 1/3 job reports the truthful pre-cancel
+	// attempt position (1), not the attempts=max_attempts storage marker.
 	cancelled := agentapp.JobView{
 		JobID: 501, VersionID: 10, Kind: "execute.batch",
-		State: agentapp.JobStateCancelled, Attempts: 3, MaxAttempts: 3, UpdatedAt: handlerTime,
+		State: agentapp.JobStateCancelled, Attempts: 1, MaxAttempts: 3, UpdatedAt: handlerTime,
 	}
 	requeued := cancelled
 	requeued.State = "open"
-	requeued.Attempts = 2
+	requeued.Attempts = 0
 
 	t.Run("canonical cancel route returns the job view", func(t *testing.T) {
 		stub := &stubJobControlService{view: cancelled}
@@ -123,7 +125,7 @@ func TestJobControlHandler(t *testing.T) {
 			"version_id":   "10",
 			"kind":         "execute.batch",
 			"state":        "cancelled",
-			"attempts":     float64(3),
+			"attempts":     float64(1),
 			"max_attempts": float64(3),
 			"updated_at":   "2026-10-31T12:00:00Z",
 		}

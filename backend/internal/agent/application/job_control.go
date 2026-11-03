@@ -8,7 +8,8 @@ package agentapp
 //     schema has no 'cancelled' status, so a canceled job is persisted as
 //     failed with the attempt budget exhausted (the same terminal shape
 //     ClaimWorkItem already uses at the attempt cap) and LastError set to
-//     JobCanceledReason. The API projection reports state=cancelled, and the
+//     JobCanceledReason. The API projection reports state=cancelled and the
+//     truthful pre-cancel attempts (not the exhausted storage marker), and the
 //     service publishes the contract terminal event job.finished{status:
 //     cancelled} exactly once after the actor-facing job.canceled event.
 //   - Retry: failed jobs below max_attempts only. The row returns to open with
@@ -82,6 +83,8 @@ type JobControlRepository interface {
 	// the epoch read by GetJob. The exhausted attempts value is the
 	// no-migration marker of a canceled row: retry-rate and todo queries must
 	// exclude it (see the PostgreSQL QueryReader's cancel-marker predicate).
+	// The returned row therefore carries that marker; the service projects
+	// the truthful pre-cancel Attempts value itself.
 	CancelJob(ctx context.Context, versionID, id, leaseEpoch int64, reason string, now time.Time) (agent.WorkItem, error)
 	// RetryJob atomically re-opens a failed item below max_attempts:
 	// status open, lease cleared, last_error cleared, available_at and
@@ -161,7 +164,15 @@ func (s *JobControl) Cancel(ctx context.Context, actorID, versionID, jobID int64
 	// stored status is failed (no cancelled value in the frozen schema), so the
 	// projected cancelled state is passed explicitly.
 	s.publishFinished(ctx, updated)
-	return jobControlView(updated), nil
+	// The no-migration persistence compromise stores the canceled row at
+	// attempts=max_attempts so the dispatcher can never claim it again. That
+	// terminal marker is storage bookkeeping, not the job's attempt position:
+	// report the truthful pre-cancel attempts captured by the read above. The
+	// lease-epoch fence in CancelJob guarantees the row did not move since
+	// then.
+	view := jobControlView(updated)
+	view.Attempts = item.Attempts
+	return view, nil
 }
 
 // Retry re-opens one failed job below its attempt cap.

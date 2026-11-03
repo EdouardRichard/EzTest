@@ -97,9 +97,6 @@ func (r *WorkItemRepository) CancelJob(
 	if current.LeaseEpoch != leaseEpoch || !jobStatusCancelable(current.Status) {
 		return agent.WorkItem{}, agent.ErrConflict
 	}
-	// The attempt row to close is the one the claims recorded before this
-	// update exhausts the budget.
-	activeAttempt := current.Attempts
 
 	args := []any{id, leaseEpoch, reason, now}
 	versionFilter := ""
@@ -131,18 +128,18 @@ func (r *WorkItemRepository) CancelJob(
 		return agent.WorkItem{}, wrapDB("cancel job: update", err)
 	}
 
-	if activeAttempt > 0 {
-		if _, err := tx.Exec(ctx, `
-			UPDATE work_item_attempt
-			SET status = 'failed',
-			    error = $2,
-			    finished_at = $3
-			WHERE work_item_id = $1
-			  AND attempt = $4
-			  AND status IN ('claimed', 'running')
-		`, id, reason, now, activeAttempt); err != nil {
-			return agent.WorkItem{}, wrapDB("cancel job: close attempt", err)
-		}
+	// The active attempt is the open log row, not attempt = the attempts
+	// budget counter: a manual retry resets that counter while the attempt log
+	// keeps counting (see ClaimWorkItem). At most one row is open per item.
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'failed',
+		    error = $2,
+		    finished_at = $3
+		WHERE work_item_id = $1
+		  AND status IN ('claimed', 'running')
+	`, id, reason, now); err != nil {
+		return agent.WorkItem{}, wrapDB("cancel job: close attempt", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

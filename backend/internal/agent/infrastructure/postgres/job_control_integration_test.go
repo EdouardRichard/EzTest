@@ -86,12 +86,29 @@ func seedJobControlItem(t *testing.T, pool *pgxpool.Pool, seed jobControlSeed) {
 
 func seedJobControlAttempt(t *testing.T, pool *pgxpool.Pool, itemID int64, attempt int, status string) {
 	t.Helper()
+	// Failed/done/dead/recovered attempts are historical: they are already
+	// closed. claimed/running are the active attempt of a leased row.
 	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
-		VALUES ($1, $2, $3, $4, now())
+		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at, finished_at)
+		VALUES ($1, $2, $3, $4, now(),
+		        CASE WHEN $4 IN ('done', 'failed', 'dead', 'recovered') THEN now() ELSE NULL END)
 	`, itemID*100+int64(attempt), itemID, attempt, status); err != nil {
 		t.Fatalf("seed work item attempt %d/%d: %v", itemID, attempt, err)
 	}
+}
+
+// readJobControlAttempt returns the status/error of one attempt log row and
+// whether it is closed (finished_at set).
+func readJobControlAttempt(t *testing.T, pool *pgxpool.Pool, itemID int64, attempt int) (status, errorText string, finished bool) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(), `
+		SELECT status, COALESCE(error, ''), finished_at IS NOT NULL
+		FROM work_item_attempt
+		WHERE work_item_id = $1 AND attempt = $2
+	`, itemID, attempt).Scan(&status, &errorText, &finished); err != nil {
+		t.Fatalf("read attempt %d of work item %d: %v", attempt, itemID, err)
+	}
+	return status, errorText, finished
 }
 
 func TestJobCancelControlSQL(t *testing.T) {
@@ -325,6 +342,127 @@ func TestJobRetryControlSQL(t *testing.T) {
 	if _, err := repo.RetryJob(ctx, versionID, 999999, now); !errors.Is(err, agent.ErrNotFound) {
 		t.Fatalf("missing RetryJob error = %v, want agent.ErrNotFound", err)
 	}
+}
+
+// TestJobRetryClaimAfterHistoricalAttempts pins the Task 46 fix round 2
+// regression: RetryJob resets work_item.attempts to 0 (a fresh budget), while
+// the attempt log is append-only. When ClaimWorkItem still derived the log
+// number from attempts it re-used attempt 1 for an item that already had
+// attempts 1..2, so UNIQUE (work_item_id, attempt) rejected the INSERT (23505),
+// the claim rolled back and the still-open item blocked the dispatcher loop.
+// The log number is now MAX(attempt)+1 inside the claim transaction; attempts
+// stays the budget counter and the write-backs close the current open row.
+func TestJobRetryClaimAfterHistoricalAttempts(t *testing.T) {
+	t.Run("historical attempts survive a manual retry", func(t *testing.T) {
+		pool := testutil.NewDB(t)
+		repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
+		ctx := context.Background()
+		now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		const versionID = int64(7106)
+
+		seedJobControlItem(t, pool, jobControlSeed{
+			ID: 9401, VersionID: versionID, Status: "failed", Attempts: 2, MaxAttempts: 3,
+			LastError: "assertion failed", AvailableAt: now.Add(-time.Hour),
+		})
+		seedJobControlAttempt(t, pool, 9401, 1, "failed")
+		seedJobControlAttempt(t, pool, 9401, 2, "failed")
+
+		retried, err := repo.RetryJob(ctx, versionID, 9401, now)
+		if err != nil {
+			t.Fatalf("RetryJob: %v", err)
+		}
+		if retried.Status != agent.WorkItemOpen || retried.Attempts != 0 {
+			t.Fatalf("retried = %#v, want open with a fresh budget", retried)
+		}
+
+		// RED before fix round 2: this claim reused attempt 1 and failed with a
+		// duplicate-key error (SQLSTATE 23505).
+		claimed, err := repo.ClaimWorkItem(ctx, "worker-history", now)
+		if err != nil {
+			t.Fatalf("ClaimWorkItem after a manual retry: %v", err)
+		}
+		if claimed == nil || claimed.ID != 9401 {
+			t.Fatalf("claimed = %#v, want work item 9401", claimed)
+		}
+		if claimed.Attempts != 1 {
+			t.Fatalf("claimed attempts = %d, want the fresh-budget 1", claimed.Attempts)
+		}
+		if status, errorText, finished := readJobControlAttempt(t, pool, 9401, 3); status != "claimed" || errorText != "" || finished {
+			t.Fatalf("attempt 3 = %q/%q/finished=%v, want a new open claimed row", status, errorText, finished)
+		}
+		for _, attempt := range []int{1, 2} {
+			if status, _, finished := readJobControlAttempt(t, pool, 9401, attempt); status != "failed" || !finished {
+				t.Fatalf("historical attempt %d = %q/finished=%v, want failed", attempt, status, finished)
+			}
+		}
+
+		// The write-backs must close the current log row, not the row numbered
+		// like the budget counter (attempt 1 already failed).
+		if err := repo.MarkRunning(ctx, 9401, claimed.LeaseEpoch); err != nil {
+			t.Fatalf("MarkRunning: %v", err)
+		}
+		if status, _, _ := readJobControlAttempt(t, pool, 9401, 3); status != "running" {
+			t.Fatalf("attempt 3 status after MarkRunning = %q, want running", status)
+		}
+		if err := repo.FailWorkItem(ctx, 9401, claimed.LeaseEpoch, "assertion failed again"); err != nil {
+			t.Fatalf("FailWorkItem: %v", err)
+		}
+		if status, errorText, finished := readJobControlAttempt(t, pool, 9401, 3); status != "failed" || errorText != "assertion failed again" || !finished {
+			t.Fatalf("attempt 3 after FailWorkItem = %q/%q/finished=%v", status, errorText, finished)
+		}
+
+		// The next automatic retry keeps the log monotonic (4) while the budget
+		// moves 1 -> 2.
+		reclaimed, err := repo.ClaimWorkItem(ctx, "worker-history-2", now)
+		if err != nil {
+			t.Fatalf("ClaimWorkItem again: %v", err)
+		}
+		if reclaimed == nil || reclaimed.ID != 9401 || reclaimed.Attempts != 2 {
+			t.Fatalf("reclaimed = %#v, want work item 9401 with attempts 2", reclaimed)
+		}
+		if status, _, finished := readJobControlAttempt(t, pool, 9401, 4); status != "claimed" || finished {
+			t.Fatalf("attempt 4 = %q/finished=%v, want a new open claimed row", status, finished)
+		}
+
+		// Cancel closes the current log row too (attempt 4, not attempt 2).
+		beforeCancel, err := repo.GetJob(ctx, versionID, 9401)
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		if _, err := repo.CancelJob(ctx, versionID, 9401, beforeCancel.LeaseEpoch, agentapp.JobCanceledReason, now); err != nil {
+			t.Fatalf("CancelJob: %v", err)
+		}
+		if status, errorText, finished := readJobControlAttempt(t, pool, 9401, 4); status != "failed" || errorText != agentapp.JobCanceledReason || !finished {
+			t.Fatalf("attempt 4 after CancelJob = %q/%q/finished=%v", status, errorText, finished)
+		}
+	})
+
+	t.Run("no history starts at the first attempt", func(t *testing.T) {
+		pool := testutil.NewDB(t)
+		repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
+		ctx := context.Background()
+		now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		const versionID = int64(7107)
+
+		seedJobControlItem(t, pool, jobControlSeed{
+			ID: 9402, VersionID: versionID, Status: "failed", Attempts: 1, MaxAttempts: 3,
+			LastError: "assertion failed", AvailableAt: now.Add(-time.Hour),
+		})
+
+		if _, err := repo.RetryJob(ctx, versionID, 9402, now); err != nil {
+			t.Fatalf("RetryJob: %v", err)
+		}
+		claimed, err := repo.ClaimWorkItem(ctx, "worker-no-history", now)
+		if err != nil {
+			t.Fatalf("ClaimWorkItem after a manual retry: %v", err)
+		}
+		if claimed == nil || claimed.ID != 9402 || claimed.Attempts != 1 {
+			t.Fatalf("claimed = %#v, want work item 9402 with attempts 1", claimed)
+		}
+		if status, _, finished := readJobControlAttempt(t, pool, 9402, 1); status != "claimed" || finished {
+			t.Fatalf("attempt 1 = %q/finished=%v, want a new open claimed row", status, finished)
+		}
+	})
 }
 
 func TestJobCancelMarkerExcludedFromRetryMetric(t *testing.T) {

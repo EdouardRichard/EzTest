@@ -266,15 +266,20 @@ func (f *jobControlFixture) publishedEvents() []eventingapp.Event {
 // ---------- cancel ----------
 
 func TestJobCancelPendingRunning(t *testing.T) {
-	for _, status := range []agent.WorkItemStatus{
-		agent.WorkItemOpen,
-		agent.WorkItemClaimed,
-		agent.WorkItemRunning,
+	for _, testCase := range []struct {
+		status   agent.WorkItemStatus
+		attempts int
+	}{
+		// The pre-cancel budget position varies so the projection cannot be
+		// confused with the stored terminal attempts=max_attempts marker.
+		{agent.WorkItemOpen, 0},
+		{agent.WorkItemClaimed, 1},
+		{agent.WorkItemRunning, 2},
 	} {
-		status := status
+		status := testCase.status
 		t.Run(string(status), func(t *testing.T) {
 			fixture := newJobControlFixture(t, jobTestNow)
-			before := fixture.repo.add(jobControlItem(501, 10, status, 1, 3))
+			before := fixture.repo.add(jobControlItem(501, 10, status, testCase.attempts, 3))
 
 			view, err := fixture.service.Cancel(context.Background(), 71, before.VersionID, before.ID)
 			if err != nil {
@@ -287,8 +292,13 @@ func TestJobCancelPendingRunning(t *testing.T) {
 			if view.JobID != before.ID || view.VersionID != before.VersionID || view.Kind != before.Kind {
 				t.Fatalf("view = %#v, want job %d version %d kind %s", view, before.ID, before.VersionID, before.Kind)
 			}
-			if view.Attempts != before.MaxAttempts || view.MaxAttempts != before.MaxAttempts {
-				t.Fatalf("view attempts = %d/%d, want %d/%d", view.Attempts, view.MaxAttempts, before.MaxAttempts, before.MaxAttempts)
+			// Task 46 fix round 2: the frozen-schema compromise persists
+			// attempts=max_attempts (so the dispatcher cannot claim the row),
+			// but the API must report the truthful pre-cancel attempt
+			// position, not that storage marker.
+			if view.Attempts != before.Attempts || view.MaxAttempts != before.MaxAttempts {
+				t.Fatalf("view attempts = %d/%d, want the pre-cancel %d/%d",
+					view.Attempts, view.MaxAttempts, before.Attempts, before.MaxAttempts)
 			}
 			if !view.UpdatedAt.Equal(jobTestNow) {
 				t.Fatalf("view updated_at = %s, want %s", view.UpdatedAt, jobTestNow)

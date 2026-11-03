@@ -342,6 +342,13 @@ func (r *WorkItemRepository) CreateWorkItem(ctx context.Context, in agent.Create
 // mean no dependencies. The claim increments lease_epoch and attempts, which
 // fences every older owner out of later writes.
 //
+// attempts is the retry-budget counter; the attempt log number is independent
+// of it: it is COALESCE(MAX(attempt), 0) + 1 of the item's attempt history,
+// computed under the claim's row lock. A user-initiated RetryJob resets attempts
+// to 0 (a fresh budget) without deleting the append-only attempt log, so
+// deriving the log number from attempts would reuse attempt 1 and hit
+// UNIQUE (work_item_id, attempt). The unique index stays the backstop.
+//
 // R41: an expired lease at the attempt cap is settled as failed inside the
 // claim transaction (0.2.1 has no dead state), so a crashed run can never be
 // taken over beyond max_attempts.
@@ -444,19 +451,32 @@ func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, no
 		return nil, wrapDB("claim 0.2.1 work item", err)
 	}
 
+	// The log number is MAX(attempt)+1, not the just-incremented budget
+	// counter: a manual RetryJob reset attempts to 0 while the append-only
+	// history keeps growing. The FOR UPDATE lock taken above makes this read
+	// stable; UNIQUE (work_item_id, attempt) remains the backstop.
+	var attemptNumber int
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(attempt), 0) + 1
+		FROM work_item_attempt
+		WHERE work_item_id = $1
+	`, item.ID).Scan(&attemptNumber); err != nil {
+		return nil, wrapDB("select next 0.2.1 work item attempt number", err)
+	}
+
 	// Taking over an expired lease abandons the previous attempt. Retries of a
 	// failed item leave the already-closed attempt untouched.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
 		SET status = 'recovered', error = COALESCE(error, 'lease expired'), finished_at = $3
 		WHERE work_item_id = $1 AND attempt < $2 AND status IN ('claimed', 'running')
-	`, item.ID, item.Attempts, now); err != nil {
+	`, item.ID, attemptNumber, now); err != nil {
 		return nil, wrapDB("recover abandoned 0.2.1 work item attempts", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
 		VALUES ($1, $2, $3, 'claimed', $4)
-	`, r.ids.Next(), item.ID, item.Attempts, now); err != nil {
+	`, r.ids.Next(), item.ID, attemptNumber, now); err != nil {
 		return nil, wrapDB("insert 0.2.1 work item attempt", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -520,11 +540,14 @@ func (r *WorkItemRepository) CompleteWorkItem(ctx context.Context, id, epoch int
 	if tag.RowsAffected() == 0 {
 		return agent.ErrLeaseLost
 	}
+	// The active attempt row is the open one, not attempt = the attempts
+	// budget counter: a manual retry (RetryJob) resets attempts while the
+	// append-only log keeps counting (see ClaimWorkItem). A claim leaves at
+	// most one open attempt row, so the status identifies it.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
 		SET status = 'done', finished_at = now()
 		WHERE work_item_id = $1
-		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
 		  AND status IN ('claimed', 'running')
 	`, id); err != nil {
 		return wrapDB("complete 0.2.1 work item attempt", err)
@@ -565,7 +588,6 @@ func (r *WorkItemRepository) FailWorkItem(ctx context.Context, id, epoch int64, 
 		UPDATE work_item_attempt
 		SET status = 'failed', error = COALESCE(NULLIF($2, ''), error), finished_at = now()
 		WHERE work_item_id = $1
-		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
 		  AND status IN ('claimed', 'running')
 	`, id, reason); err != nil {
 		return wrapDB("fail 0.2.1 work item attempt", err)
@@ -616,7 +638,6 @@ func (r *WorkItemRepository) MarkRunning(ctx context.Context, id, epoch int64) e
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt SET status = 'running'
 		WHERE work_item_id = $1
-		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
 		  AND status = 'claimed'
 	`, id); err != nil {
 		return wrapDB("mark work item attempt running", err)
@@ -666,7 +687,6 @@ func (r *WorkItemRepository) Complete(ctx context.Context, id, epoch int64) erro
 		UPDATE work_item_attempt
 		SET status = 'done', finished_at = now()
 		WHERE work_item_id = $1
-		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
 		  AND status IN ('claimed', 'running')
 	`, id); err != nil {
 		return wrapDB("complete work item attempt", err)
@@ -699,7 +719,6 @@ func (r *WorkItemRepository) MarkWaitingHuman(ctx context.Context, id, epoch int
 		UPDATE work_item_attempt
 		SET status = 'done', finished_at = now()
 		WHERE work_item_id = $1
-		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
 		  AND status IN ('claimed', 'running')
 	`, id); err != nil {
 		return wrapDB("mark work item attempt waiting_human", err)
@@ -732,7 +751,6 @@ func (r *WorkItemRepository) Finish(ctx context.Context, id int64, reason string
 		UPDATE work_item_attempt
 		SET status = 'done', finished_at = now()
 		WHERE work_item_id = $1
-		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
 		  AND status IN ('claimed', 'running')
 	`, id); err != nil {
 		return wrapDB("finish work item attempt", err)
