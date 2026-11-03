@@ -241,6 +241,19 @@ func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Unavailable("knowledge service is not configured"))
 		return
 	}
+	// R91 review read gate: the history route must not become a side channel for
+	// an item whose detail 404s. A secret-bearing stored item is hidden before
+	// its revisions are read; a clean item with a secret-bearing historical row
+	// keeps its 200 and has that row dropped below.
+	item, err := h.service.Get(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if knowledgeapp.ItemHasSecrets(item) {
+		httpx.Error(w, r, platform.NotFound("knowledge_item"))
+		return
+	}
 	revisions, err := h.service.Revisions(r.Context(), id)
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -295,6 +308,22 @@ func (h *Handler) review(w http.ResponseWriter, r *http.Request, action string) 
 	if h.service == nil {
 		httpx.Error(w, r, platform.Unavailable("knowledge service is not configured"))
 		return
+	}
+	// R91 review read gate: reject/revoke render the stored item through the
+	// review view, so a legacy secret-bearing item must be hidden exactly like a
+	// missing one (404) before any status write. Approve keeps its dedicated
+	// secret-specific 400 in the service so reviewers learn the body must be
+	// rewritten before approval.
+	if action != "approve" {
+		stored, err := h.service.Get(r.Context(), id)
+		if err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+		if knowledgeapp.ItemHasSecrets(stored) {
+			httpx.Error(w, r, platform.NotFound("knowledge_item"))
+			return
+		}
 	}
 	var item knowledge.Item
 	switch action {
