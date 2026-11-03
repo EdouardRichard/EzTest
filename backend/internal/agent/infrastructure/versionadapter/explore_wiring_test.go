@@ -367,27 +367,27 @@ func TestExploreWiringResolveAccountNotFound(t *testing.T) {
 	}
 }
 
-// TestExploreWiringResolveAccountConflict reports a state conflict when two
-// different accounts are bound for the requested role.
-func TestExploreWiringResolveAccountConflict(t *testing.T) {
+// TestExploreWiringResolveAccountMultipleRoleDeterministic verifies that two
+// different accounts bound for the requested role resolve deterministically to
+// the lowest account ID instead of failing with a state conflict (Task 90).
+func TestExploreWiringResolveAccountMultipleRoleDeterministic(t *testing.T) {
 	fixture := newWiringFixture(t)
 	fixture.versions.view = versionapp.VersionView{
 		ID: 10,
 		Bindings: []versionapp.BindingView{{
 			ID: 7,
 			Accounts: []resourceapp.AccountView{
-				{ID: "81", Roles: []string{"admin"}},
 				{ID: "82", Roles: []string{"admin"}},
+				{ID: "81", Roles: []string{"admin"}},
 			},
 		}},
 	}
-	_, err := fixture.wiring.ResolveAccount(context.Background(), 10, 7, "admin")
-	var platformErr *platform.Error
-	if !errors.As(err, &platformErr) {
-		t.Fatalf("ResolveAccount error = %T, want *platform.Error", err)
+	account, err := fixture.wiring.ResolveAccount(context.Background(), 10, 7, "admin")
+	if err != nil {
+		t.Fatalf("ResolveAccount: %v (two bound accounts sharing a role must resolve deterministically)", err)
 	}
-	if platformErr.Code != "state_conflict" {
-		t.Fatalf("error code = %q, want state_conflict", platformErr.Code)
+	if account.ID != 81 || account.Role != "admin" {
+		t.Fatalf("account = %+v, want ID 81 role admin", account)
 	}
 }
 

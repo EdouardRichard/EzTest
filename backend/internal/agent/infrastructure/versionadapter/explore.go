@@ -12,6 +12,7 @@ package versionadapter
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -137,17 +138,27 @@ func (w *ExploreWiring) ResolveAccount(ctx context.Context, versionID, versionSU
 			}
 		}
 	}
-	switch len(matched) {
-	case 0:
+	if len(matched) == 0 {
 		return exploreapp.Account{}, platform.NotFound("test_account")
-	case 1:
-	default:
-		return exploreapp.Account{}, platform.StateConflict("multiple test accounts share the requested role")
 	}
-	accountID := ""
+	// Deterministic account selection (Task 90): several SUT test accounts may
+	// share a role (e.g. author). Selecting the lowest account ID keeps repeated
+	// logins/case runs on the same account instead of failing with a
+	// state_conflict; all candidates are bound to the version SUT, so no auth
+	// boundary is bypassed.
+	candidates := make([]string, 0, len(matched))
 	for id := range matched {
-		accountID = id
+		candidates = append(candidates, id)
 	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, leftErr := strconv.ParseInt(strings.TrimSpace(candidates[i]), 10, 64)
+		right, rightErr := strconv.ParseInt(strings.TrimSpace(candidates[j]), 10, 64)
+		if leftErr != nil || rightErr != nil {
+			return candidates[i] < candidates[j]
+		}
+		return left < right
+	})
+	accountID := candidates[0]
 	id, err := strconv.ParseInt(strings.TrimSpace(accountID), 10, 64)
 	if err != nil || id <= 0 {
 		return exploreapp.Account{}, platform.NewError(500, "internal", "test account has an invalid ID")

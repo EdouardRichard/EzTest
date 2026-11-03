@@ -186,14 +186,18 @@ func TestCredentialsRoleResolution(t *testing.T) {
 	}
 }
 
-func TestCredentialsRejectDuplicateRole(t *testing.T) {
+func TestCredentialsResolveDuplicateRoleDeterministic(t *testing.T) {
 	view := versionViewFixture()
 	view.Bindings[0].Accounts = append(view.Bindings[0].Accounts,
 		resourceapp.AccountView{ID: "93", Username: "carol", Roles: []string{"admin"}})
 	adapter := NewCredentialAdapter(&fakeVersionService{view: view},
 		&fakeAccountSecrets{username: "u", password: "p"}, &fakeDatabaseSecrets{})
-	if _, err := adapter.Account(context.Background(), 10, 7, "admin"); err == nil {
-		t.Fatalf("expected a state_conflict for a duplicate role")
+	credential, err := adapter.Account(context.Background(), 10, 7, "admin")
+	if err != nil {
+		t.Fatalf("duplicate role must resolve deterministically: %v", err)
+	}
+	if credential.AccountID != 91 {
+		t.Fatalf("account ID = %d, want the lowest bound admin account 91", credential.AccountID)
 	}
 }
 
