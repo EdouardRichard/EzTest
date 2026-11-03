@@ -476,6 +476,11 @@ func (s *RequirementService) Dedupe(ctx context.Context, versionID int64, actorI
 	if versionID <= 0 {
 		return RequirementDedupeResult{}, platform.Invalid("id", "must be a positive decimal ID")
 	}
+	if s.versions != nil {
+		if _, err := s.versions.Get(ctx, versionID); err != nil {
+			return RequirementDedupeResult{}, err
+		}
+	}
 	items, err := s.repo.List(ctx, versionID, version.RequirementDraft, maxDedupeRequirements, nil)
 	if err != nil {
 		return RequirementDedupeResult{}, mapRequirementRepositoryError(err)
@@ -561,6 +566,8 @@ func (s *RequirementService) Delete(ctx context.Context, versionID, requirementI
 }
 
 // Merge folds duplicate draft requirements into one canonical target. The
+// target must still be a draft: absorbing duplicates rewrites the target and
+// un-confirms it, so a clarified requirement must be rolled back first. The
 // target's content absorbs the sources' description/acceptance text (deduped by
 // text and priority), sources are retired as obsolete and a relation records the
 // merge. The target gets a new draft revision only when its content actually
@@ -568,6 +575,9 @@ func (s *RequirementService) Delete(ctx context.Context, versionID, requirementI
 func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int64, sourceIDs []int64, actorID int64) (RequirementMergeResult, error) {
 	if err := validateIDs(versionID, targetID); err != nil {
 		return RequirementMergeResult{}, err
+	}
+	if len(sourceIDs) == 0 {
+		return RequirementMergeResult{}, platform.Invalid("source_requirement_ids", "must contain at least one source requirement")
 	}
 	sources, err := dedupeRequirementIDs(sourceIDs)
 	if err != nil {
@@ -588,8 +598,8 @@ func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int6
 		return RequirementMergeResult{}, mapRequirementRepositoryError(err)
 	}
 	target := targetAggregate.Requirement
-	if target.Status != version.RequirementDraft && target.Status != version.RequirementClarified {
-		return RequirementMergeResult{}, platform.StateConflict("only a draft or clarified requirement can be a merge target")
+	if target.Status != version.RequirementDraft {
+		return RequirementMergeResult{}, platform.StateConflict("only a draft requirement can be a merge target; roll back a clarified requirement first")
 	}
 	targetCurrent, ok := currentVersion(targetAggregate)
 	if !ok {

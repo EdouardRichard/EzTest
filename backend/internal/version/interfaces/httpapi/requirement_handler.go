@@ -24,6 +24,12 @@ type RequirementService interface {
 	BatchConfirm(ctx context.Context, versionID int64, requirementIDs []int64, actorID int64) (versionapp.BatchConfirmResult, error)
 	Rollback(ctx context.Context, versionID, requirementID int64, reason string, proposalMessageID *int64, actorID int64) (versionapp.RequirementDetail, error)
 	ListRelations(ctx context.Context, versionID, requirementID int64) ([]versionapp.RelationView, error)
+	// Draft-only duplicate cleanup. Confirmed (clarified/closed) requirements
+	// are never deleted, merged or deduped; the service returns a typed
+	// state_conflict instead.
+	Dedupe(ctx context.Context, versionID int64, actorID int64) (versionapp.RequirementDedupeResult, error)
+	Delete(ctx context.Context, versionID, requirementID int64, reason string, actorID int64) (versionapp.RequirementDetail, error)
+	Merge(ctx context.Context, versionID, targetID int64, sourceIDs []int64, actorID int64) (versionapp.RequirementMergeResult, error)
 }
 
 // RequirementReopener is the closure application surface for the manual
@@ -284,6 +290,87 @@ func (h *RequirementHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toRequirementDetailDTO(detail))
+}
+
+// Dedupe POST /api/versions/{id}/requirements/dedupe. It collapses duplicate
+// draft requirements of one version (keep the lowest ID per group) and retires
+// the rest as obsolete. Confirmed requirements are never touched; the response
+// is empty (kept/obsolete lists) when there is nothing to collapse.
+func (h *RequirementHandler) Dedupe(w http.ResponseWriter, r *http.Request) {
+	actorID, ok := requireActor(w, r)
+	if !ok {
+		return
+	}
+	versionID, err := validation.NonEmptyID("id", r.PathValue("id"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	result, err := h.svc.Dedupe(r.Context(), versionID, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toRequirementDedupeDTO(result))
+}
+
+// Delete DELETE /api/versions/{id}/requirements/{rid}. Only a draft (or an
+// already-obsolete row, which is an idempotent replay) can be retired;
+// clarified/closed requirements are rejected with a typed 409. The optional
+// body carries a reason for the audit entry.
+func (h *RequirementHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	actorID, ok := requireActor(w, r)
+	if !ok {
+		return
+	}
+	versionID, requirementID, err := requirementPathIDs(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request deleteRequirementRequest
+	if err := decodeOptionalBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	detail, err := h.svc.Delete(r.Context(), versionID, requirementID, request.Reason, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toRequirementDetailDTO(detail))
+}
+
+// Merge POST /api/versions/{id}/requirements/merge. Draft sources are folded
+// into the canonical draft target (content/targets union, highest priority);
+// the sources become obsolete and a relation records the merge. Confirmed
+// requirements cannot be targets or sources (typed 409).
+func (h *RequirementHandler) Merge(w http.ResponseWriter, r *http.Request) {
+	actorID, ok := requireActor(w, r)
+	if !ok {
+		return
+	}
+	versionID, err := validation.NonEmptyID("id", r.PathValue("id"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request mergeRequirementsRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	targetID, sourceIDs, err := request.ids()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	result, err := h.svc.Merge(r.Context(), versionID, targetID, sourceIDs, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toRequirementMergeDTO(result))
 }
 
 // Reopen POST /api/versions/{versionId}/requirements/{requirementId}/reopen.

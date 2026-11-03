@@ -21,6 +21,8 @@ type stubRequirementService struct {
 	confirm   versionapp.ConfirmResult
 	batch     versionapp.BatchConfirmResult
 	relations []versionapp.RelationView
+	dedupe    versionapp.RequirementDedupeResult
+	merge     versionapp.RequirementMergeResult
 	err       error
 
 	lastVersionID int64
@@ -131,6 +133,40 @@ func (s *stubRequirementService) ListRelations(_ context.Context, versionID, req
 		return nil, s.err
 	}
 	return s.relations, nil
+}
+
+func (s *stubRequirementService) Dedupe(_ context.Context, versionID int64, actorID int64) (versionapp.RequirementDedupeResult, error) {
+	s.calls = append(s.calls, "dedupe")
+	s.lastVersionID = versionID
+	s.lastActor = actorID
+	if s.err != nil {
+		return versionapp.RequirementDedupeResult{}, s.err
+	}
+	return s.dedupe, nil
+}
+
+func (s *stubRequirementService) Delete(_ context.Context, versionID, requirementID int64, reason string, actorID int64) (versionapp.RequirementDetail, error) {
+	s.calls = append(s.calls, "delete")
+	s.lastVersionID = versionID
+	s.lastRequestID = requirementID
+	s.lastReason = reason
+	s.lastActor = actorID
+	if s.err != nil {
+		return versionapp.RequirementDetail{}, s.err
+	}
+	return s.detail, nil
+}
+
+func (s *stubRequirementService) Merge(_ context.Context, versionID, targetID int64, sourceIDs []int64, actorID int64) (versionapp.RequirementMergeResult, error) {
+	s.calls = append(s.calls, "merge")
+	s.lastVersionID = versionID
+	s.lastRequestID = targetID
+	s.lastBatchIDs = sourceIDs
+	s.lastActor = actorID
+	if s.err != nil {
+		return versionapp.RequirementMergeResult{}, s.err
+	}
+	return s.merge, nil
 }
 
 var _ versionapi.RequirementService = (*stubRequirementService)(nil)

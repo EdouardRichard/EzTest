@@ -265,6 +265,21 @@ export type BatchConfirmResult = {
   skipped: string[]
 }
 
+/**
+ * `RequirementDedupeResult` — duplicate draft collapse. Confirmed requirements
+ * are never touched, so both lists only ever contain draft IDs.
+ */
+export type RequirementDedupeResult = {
+  kept_ids: string[]
+  obsolete_ids: string[]
+}
+
+/** `RequirementMergeResult` — the canonical target plus the retired sources. */
+export type RequirementMergeResult = {
+  requirement: RequirementDetail
+  merged_ids: string[]
+}
+
 export type RollbackRequest = {
   reason?: string
   proposal_message_id?: string

@@ -7,6 +7,8 @@ import {
   confirmRequirements,
   createConversation,
   createRequirement,
+  dedupeRequirements,
+  deleteRequirement,
   getConversation,
   getRequirement,
   getTeamRoom,
@@ -14,6 +16,7 @@ import {
   listMessages,
   listRequirementRelations,
   listRequirements,
+  mergeRequirements,
   postMessage,
   rollbackRequirement,
   updateRequirement,
@@ -251,6 +254,69 @@ describe("clarification api", () => {
     expect(url).toBe("http://localhost:13333/api/versions/2001/requirements/confirmations")
     expect(init?.method).toBe("POST")
     expect(readBody(init)).toEqual({ requirement_ids: ["6001", "6002"] })
+  })
+
+  it("deletes one draft requirement without deleting its history", async () => {
+    const obsolete = { ...requirementDetailFixture, status: "obsolete" as const }
+    fetchMock.mockResolvedValue(jsonResponse({ data: obsolete }))
+
+    await expect(deleteRequirement("2001", "6001")).resolves.toEqual(obsolete)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/requirements/6001")
+    expect(init?.method).toBe("DELETE")
+    expect(init?.body).toBeUndefined()
+  })
+
+  it("dedupes draft requirements through the cleanup endpoint", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: { kept_ids: ["6001"], obsolete_ids: ["6004"] } }),
+    )
+
+    await expect(dedupeRequirements("2001")).resolves.toEqual({
+      kept_ids: ["6001"],
+      obsolete_ids: ["6004"],
+    })
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/requirements/dedupe")
+    expect(init?.method).toBe("POST")
+    expect(init?.body).toBeUndefined()
+  })
+
+  it("merges draft sources into a canonical target", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: { requirement: { ...requirementDetailFixture, revision: 2 }, merged_ids: ["6004"] },
+      }),
+    )
+
+    const result = await mergeRequirements("2001", "6001", ["6004"])
+    expect(result.merged_ids).toEqual(["6004"])
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/requirements/merge")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({
+      target_requirement_id: "6001",
+      source_requirement_ids: ["6004"],
+    })
+  })
+
+  it("surfaces a typed cleanup conflict instead of a false success", async () => {
+    fetchMock.mockResolvedValue(
+      errorResponse(
+        409,
+        "state_conflict",
+        "only a draft requirement can be deleted; roll back a clarified requirement first",
+      ),
+    )
+
+    await expect(deleteRequirement("2001", "6002")).rejects.toMatchObject({
+      code: "state_conflict",
+      status: 409,
+      message: "only a draft requirement can be deleted; roll back a clarified requirement first",
+    })
   })
 
   it("rolls a clarified requirement back to a new draft", async () => {

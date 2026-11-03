@@ -15,13 +15,17 @@ import {
   confirmRequirements,
   confirmStageRequirements,
   createConversation,
+  dedupeRequirements,
+  deleteRequirement,
   getRequirement,
   listConversations,
   listRequirements,
+  mergeRequirements,
 } from "./api"
 import { BulkConfirmBar } from "./BulkConfirmBar"
 import { ChatPanel } from "./ChatPanel"
 import { DesignCTA } from "./DesignCTA"
+import { RequirementCleanupBar } from "./RequirementCleanupBar"
 import { RequirementEditor } from "./RequirementEditor"
 import { RequirementSidebar } from "./RequirementSidebar"
 import { TeamRoomPanel } from "./TeamRoomPanel"
@@ -103,6 +107,9 @@ export function RequirementsTab({
   const [bulkConfirming, setBulkConfirming] = useState(false)
   const [bulkNotice, setBulkNotice] = useState<string | null>(null)
   const [bulkError, setBulkError] = useState<unknown>(null)
+  const [cleanupBusy, setCleanupBusy] = useState(false)
+  const [cleanupNotice, setCleanupNotice] = useState<string | null>(null)
+  const [cleanupError, setCleanupError] = useState<unknown>(null)
   const [startingDesign, setStartingDesign] = useState(false)
   const [designError, setDesignError] = useState<unknown>(null)
 
@@ -223,6 +230,19 @@ export function RequirementsTab({
     return { suts: toOptions(suts), pages: toOptions(pages), apis: toOptions(apis) }
   }, [version])
 
+  // Draft cleanup only ever sees draft selections; confirmed requirements keep
+  // their own (confirm/rollback) paths and the server rejects them as 409 too.
+  const draftRequirements = useMemo(
+    () => requirements.filter((requirement) => requirement.status === "draft"),
+    [requirements],
+  )
+  const selectedDrafts = useMemo(() => {
+    const byId = new Map(draftRequirements.map((requirement) => [requirement.id, requirement]))
+    return selectedIds
+      .filter((id) => byId.has(id))
+      .map((id) => ({ id, title: byId.get(id)?.title ?? id }))
+  }, [draftRequirements, selectedIds])
+
   const clarifiedCount = requirements.filter(
     (requirement) => requirement.status === "clarified",
   ).length
@@ -292,6 +312,109 @@ export function RequirementsTab({
       setBulkError(cause)
     } finally {
       setBulkConfirming(false)
+    }
+  }
+
+  /**
+   * Draft cleanup (Task 83). Every action goes through the HTTP cleanup routes,
+   * reports only what the server actually retired, and refreshes the list so a
+   * rejected/partial request can never leave a stale "success" behind.
+   */
+  async function deleteSelectedDrafts(requirementIds: string[]): Promise<void> {
+    if (requirementIds.length === 0) return
+    setCleanupBusy(true)
+    setCleanupError(null)
+    setCleanupNotice(null)
+    const deleted: string[] = []
+    let failure: unknown = null
+    try {
+      const results = await Promise.allSettled(
+        requirementIds.map((requirementId) => deleteRequirement(versionId, requirementId)),
+      )
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          deleted.push(requirementIds[index])
+        } else if (failure === null) {
+          failure = result.reason
+        }
+      })
+      if (deleted.length > 0) {
+        setSelectedIds((current) => current.filter((id) => !deleted.includes(id)))
+      }
+      await Promise.all([loadRequirements(), loadVersion()])
+      if (deleted.length > 0) {
+        setCleanupNotice(`已删除 ${deleted.length} 条草案（标记为 obsolete）`)
+      }
+      if (failure !== null) {
+        setCleanupError(failure)
+      }
+      if (selectedRequirementId !== null && deleted.includes(selectedRequirementId)) {
+        setSelectedRequirementId(null)
+        setDetail(null)
+        router.replace(buildWorkspaceUrl(versionId, activeConversationId, null))
+      }
+    } catch (cause) {
+      setCleanupError(failure ?? cause)
+    } finally {
+      setCleanupBusy(false)
+    }
+  }
+
+  async function mergeSelectedDrafts(
+    targetRequirementId: string,
+    sourceRequirementIds: string[],
+  ): Promise<void> {
+    if (sourceRequirementIds.length === 0) return
+    setCleanupBusy(true)
+    setCleanupError(null)
+    setCleanupNotice(null)
+    try {
+      const result = await mergeRequirements(versionId, targetRequirementId, sourceRequirementIds)
+      const retired = new Set(result.merged_ids)
+      setSelectedIds((current) => current.filter((id) => !retired.has(id)))
+      await Promise.all([loadRequirements(), loadVersion()])
+      if (selectedRequirementId !== null && retired.has(selectedRequirementId)) {
+        setSelectedRequirementId(targetRequirementId)
+        setDetailToken((token) => token + 1)
+        router.replace(buildWorkspaceUrl(versionId, activeConversationId, targetRequirementId))
+      } else if (selectedRequirementId === targetRequirementId) {
+        setDetailToken((token) => token + 1)
+      }
+      setCleanupNotice(
+        `已将 ${result.merged_ids.length} 条草案合并到「${result.requirement.title}」`,
+      )
+    } catch (cause) {
+      setCleanupError(cause)
+    } finally {
+      setCleanupBusy(false)
+    }
+  }
+
+  async function dedupeDrafts(): Promise<void> {
+    setCleanupBusy(true)
+    setCleanupError(null)
+    setCleanupNotice(null)
+    try {
+      const result = await dedupeRequirements(versionId)
+      const retired = new Set(result.obsolete_ids)
+      if (retired.size > 0) {
+        setSelectedIds((current) => current.filter((id) => !retired.has(id)))
+        if (selectedRequirementId !== null && retired.has(selectedRequirementId)) {
+          setSelectedRequirementId(null)
+          setDetail(null)
+          router.replace(buildWorkspaceUrl(versionId, activeConversationId, null))
+        }
+      }
+      await Promise.all([loadRequirements(), loadVersion()])
+      setCleanupNotice(
+        result.obsolete_ids.length === 0
+          ? "未发现重复草案"
+          : `已去重 ${result.obsolete_ids.length} 条重复草案，保留 ${result.kept_ids.length} 条`,
+      )
+    } catch (cause) {
+      setCleanupError(cause)
+    } finally {
+      setCleanupBusy(false)
     }
   }
 
@@ -429,14 +552,32 @@ export function RequirementsTab({
             activeRequirementId={selectedRequirementId}
             onSelectRequirement={selectRequirement}
             bulk={
-              <BulkConfirmBar
-                selectedCount={selectedIds.length}
-                confirming={bulkConfirming}
-                error={bulkError}
-                onConfirm={() => {
-                  void bulkConfirm()
-                }}
-              />
+              <>
+                <BulkConfirmBar
+                  selectedCount={selectedIds.length}
+                  confirming={bulkConfirming}
+                  error={bulkError}
+                  onConfirm={() => {
+                    void bulkConfirm()
+                  }}
+                />
+                <RequirementCleanupBar
+                  draftCount={draftRequirements.length}
+                  selectedDrafts={selectedDrafts}
+                  busy={cleanupBusy}
+                  notice={cleanupNotice}
+                  error={cleanupError}
+                  onDelete={(requirementIds) => {
+                    void deleteSelectedDrafts(requirementIds)
+                  }}
+                  onMerge={(targetRequirementId, sourceRequirementIds) => {
+                    void mergeSelectedDrafts(targetRequirementId, sourceRequirementIds)
+                  }}
+                  onDedupe={() => {
+                    void dedupeDrafts()
+                  }}
+                />
+              </>
             }
             editor={
               detail !== null ? (

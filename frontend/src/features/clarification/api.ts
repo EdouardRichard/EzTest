@@ -2,6 +2,7 @@ import type { StageView } from "@/features/design/types"
 import {
   type ApiDownload,
   type ApiPage,
+  apiDelete,
   apiDownload,
   apiGet,
   apiGetPage,
@@ -21,7 +22,9 @@ import type {
   PostMessageRequest,
   Requirement,
   RequirementCreateRequest,
+  RequirementDedupeResult,
   RequirementDetail,
+  RequirementMergeResult,
   RequirementRelation,
   RequirementStatus,
   RequirementUpdateRequest,
@@ -170,6 +173,42 @@ export function confirmRequirements(
 ): Promise<BatchConfirmResult> {
   return apiPost<BatchConfirmResult>(`${versionPath(versionId)}/requirements/confirmations`, {
     requirement_ids: requirementIds,
+  })
+}
+
+/**
+ * Retires one draft requirement (obsolete, history kept). The server rejects
+ * clarified/closed requirements with a typed 409, so confirmed requirements can
+ * never be deleted through this path.
+ */
+export function deleteRequirement(
+  versionId: string,
+  requirementId: string,
+): Promise<RequirementDetail> {
+  return apiDelete<RequirementDetail>(requirementPath(versionId, requirementId))
+}
+
+/**
+ * Collapses duplicate draft requirements of a version. The server keeps the
+ * lowest ID per duplicate group and retires the rest; confirmed requirements are
+ * never touched.
+ */
+export function dedupeRequirements(versionId: string): Promise<RequirementDedupeResult> {
+  return apiPost<RequirementDedupeResult>(`${versionPath(versionId)}/requirements/dedupe`)
+}
+
+/**
+ * Folds the selected draft sources into the canonical draft target. The target
+ * must still be a draft; clarified/closed targets or sources are a typed 409.
+ */
+export function mergeRequirements(
+  versionId: string,
+  targetRequirementId: string,
+  sourceRequirementIds: string[],
+): Promise<RequirementMergeResult> {
+  return apiPost<RequirementMergeResult>(`${versionPath(versionId)}/requirements/merge`, {
+    target_requirement_id: targetRequirementId,
+    source_requirement_ids: sourceRequirementIds,
   })
 }
 
