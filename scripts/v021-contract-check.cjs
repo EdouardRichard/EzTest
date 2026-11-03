@@ -295,6 +295,15 @@ const propertyOf = (block, name) => {
   const end = rest.search(/\n        [a-z][a-z0-9_]*:\n/)
   return end < 0 ? rest : rest.slice(0, end)
 }
+const enumOf = (block, name) => {
+  const match = /enum: \[([^\]]+)\]/.exec(propertyOf(block, name))
+  return match
+    ? match[1]
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : []
+}
 
 const workItemBlock = schemaBlock("WorkItemView")
 const workItemRequired = requiredOf(workItemBlock)
@@ -386,6 +395,14 @@ const jobViewRequired = requiredOf(jobViewBlock)
 check(jobViewRequired.includes("attempts") && jobViewRequired.includes("max_attempts"), "JobView requires attempts/max_attempts")
 check(!jobViewRequired.includes("current") && !jobViewRequired.includes("total"), "JobView does not require 0.3-only progress fields")
 check(/取消前的真实/.test(propertyOf(jobViewBlock, "attempts")), "JobView.attempts documents the pre-cancel projection")
+// JobView.kind is the same frozen 11-kind work_item catalog; a silent widening
+// (e.g. accepting conversation job_card kinds) must fail here.
+const jobViewKindEnum = enumOf(jobViewBlock, "kind")
+check(
+  jobViewKindEnum.length === frozenJobKinds.length &&
+    frozenJobKinds.every((kind) => jobViewKindEnum.includes(kind)),
+  `openapi JobView.kind stays exactly ${frozenJobKinds.length} frozen work_item kinds`,
+)
 
 const llmConfigBlock = schemaBlock("LLMConfig")
 check(
@@ -887,6 +904,24 @@ check(
   !plain(openapi).includes("LLM 类错误均非重试（retryable=false）且 details.action"),
   "openapi does not claim every LLM error carries details.action",
 )
+// The 0.2.1 overview paragraph (:218-219) must scope details.action exactly
+// like ErrorEnvelope: only the classified three guarantee it. Without this the
+// overview can contradict the envelope while the old exact-phrase fence passes.
+const openapiOverview = plain(section(openapi, "错误码（HTTP 状态）：", "\nx-frozen:"))
+check(
+  /llm_protocol_error\/llm_auth_failed\/invalid_model[\s\S]{0,80}details\.action/.test(openapiOverview),
+  "openapi overview guarantees details.action only for llm_protocol_error/llm_auth_failed/invalid_model",
+)
+check(
+  /llm_config_invalid\/llm_capability_mismatch\/invalid_protocol[\s\S]{0,160}不保证\s*details\.action/.test(
+    openapiOverview,
+  ),
+  "openapi overview scopes details.action away from llm_config_invalid/llm_capability_mismatch/invalid_protocol",
+)
+check(
+  !plain(openapi).includes("LLM 类错误均非重试"),
+  "openapi overview does not restore the universal LLM-error / details.action claim",
+)
 
 // User messages accept case_card (R95); the parts list must stay complete.
 const postMessageBlock = schemaBlock("PostMessageRequest")
@@ -938,16 +973,7 @@ check(
 
 // Frozen work_item kind catalogs stay exact: conversation work types are
 // conversation job_card kinds, not work_item.kind values or filter options.
-const workItemKindEnum = (() => {
-  const prop = propertyOf(workItemBlock, "kind")
-  const match = /enum: \[([^\]]+)\]/.exec(prop)
-  return match
-    ? match[1]
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean)
-    : []
-})()
+const workItemKindEnum = enumOf(workItemBlock, "kind")
 check(
   workItemKindEnum.length === frozenJobKinds.length &&
     frozenJobKinds.every((kind) => workItemKindEnum.includes(kind)),
