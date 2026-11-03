@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
-import { LoadingCard } from "@/components/ui/Spinner"
+import { LoadingCard, Spinner } from "@/components/ui/Spinner"
 import { Composer } from "@/features/clarification/Composer"
 import { SSE_STATUS_LABEL } from "@/features/clarification/labels"
 import { MessageList } from "@/features/clarification/MessageList"
@@ -79,6 +79,7 @@ export function DesignChat({
   const {
     messages,
     loading,
+    refreshing,
     error,
     reload,
     send,
@@ -258,6 +259,15 @@ export function DesignChat({
             </div>
           ) : (
             <>
+              {refreshing ? (
+                <div
+                  data-testid="thread-refreshing"
+                  className="flex items-center gap-1.5 border-b border-border px-3 py-1"
+                >
+                  <Spinner size="sm" label="正在刷新设计对话" />
+                  <span className="text-[11px] text-muted-foreground">正在刷新对话…</span>
+                </div>
+              ) : null}
               <MessageList
                 versionId={versionId}
                 messages={messages}

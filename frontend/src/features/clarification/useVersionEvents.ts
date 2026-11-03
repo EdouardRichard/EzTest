@@ -7,7 +7,12 @@ import { getToken } from "@/lib/auth-storage"
 import { connectSSE, type SSEStatus } from "@/lib/sse-client"
 
 import type { ConversationMessage, VersionEvent } from "./types"
-import { mergePartsBySeq, publishJobEvent, publishStreamReset } from "./useConversation"
+import {
+  type JobEventType,
+  mergePartsBySeq,
+  publishJobEvent,
+  publishStreamReset,
+} from "./useConversation"
 
 export type VersionEventHandlers = {
   /** `conversation.message` payload (the full message object, spec §9). */
@@ -101,7 +106,11 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           break
         case "job.progress":
         case "job.finished":
-          publishJobEvent(versionId, payload)
+        case "job.canceled":
+        case "job.requeued":
+          // Cancel/requeue share the job card projection with progress so a
+          // card rendered from a message snapshot is updated in place.
+          publishJobEvent(versionId, payload, event.type as JobEventType)
           break
         case "conversation.created":
         case "conversation.summary_updated":

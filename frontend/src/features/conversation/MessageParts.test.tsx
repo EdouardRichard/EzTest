@@ -137,6 +137,12 @@ function JobStreamHarness({ part }: { part: JobCardPart }) {
   )
 }
 
+function emitJobEvent(type: string, payload: Record<string, unknown>): void {
+  act(() => {
+    connectOptions.onEvent({ event: "message", data: eventFrame(type, payload) })
+  })
+}
+
 function PaginationHarness({ liveMessages = [] }: { liveMessages?: ConversationMessage[] }) {
   const { messages, hasMore, loadingMore, loadMore } = useConversation({
     versionId: "2001",
@@ -311,6 +317,161 @@ describe("job card part", () => {
 
     expect(screen.getByText("已取消")).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+  })
+})
+
+describe("JobEventConsumer", () => {
+  it("applies job.canceled and the cancelled terminal event to a rendered card", async () => {
+    render(<JobStreamHarness part={{ ...runningJob, job_id: "601" }} />)
+    expect(screen.getByRole("button", { name: "取消作业" })).toBeInTheDocument()
+
+    emitJobEvent("job.canceled", { job_id: "601", kind: "design.cases", status: "cancelled" })
+
+    expect(await screen.findByText("已取消")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+
+    // Task 46 emits job.finished{status:"cancelled"} right after job.canceled.
+    emitJobEvent("job.finished", {
+      job_id: "601",
+      kind: "design.cases",
+      status: "cancelled",
+      result_ref: "",
+    })
+
+    expect(screen.getByText("已取消")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+  })
+
+  it("applies job.requeued and accepts the new owner's progress and terminal", async () => {
+    render(
+      <JobStreamHarness part={{ ...runningJob, job_id: "602", status: "failed", current: 12 }} />,
+    )
+    expect(screen.getByRole("button", { name: "重试作业" })).toBeInTheDocument()
+
+    emitJobEvent("job.requeued", { job_id: "602", kind: "design.cases", status: "open" })
+
+    expect(await screen.findByText("排队中")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "重试作业" })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "取消作业" })).toBeInTheDocument()
+
+    emitJobEvent("job.progress", {
+      job_id: "602",
+      kind: "design.cases",
+      status: "running",
+      current: 1,
+      total: 10,
+    })
+    expect(await screen.findByText("1/10")).toBeInTheDocument()
+
+    emitJobEvent("job.finished", {
+      job_id: "602",
+      kind: "design.cases",
+      status: "done",
+      result_ref: "agent_run:9",
+    })
+    expect(await screen.findByText("完成")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+  })
+
+  it("revives a cancelled card when job.requeued arrives", async () => {
+    render(<JobStreamHarness part={{ ...runningJob, job_id: "603" }} />)
+
+    emitJobEvent("job.canceled", { job_id: "603", kind: "design.cases", status: "cancelled" })
+    expect(await screen.findByText("已取消")).toBeInTheDocument()
+
+    emitJobEvent("job.requeued", { job_id: "603", kind: "design.cases", status: "open" })
+
+    expect(await screen.findByText("排队中")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "取消作业" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "重试作业" })).not.toBeInTheDocument()
+  })
+
+  it("keeps a cancelled card terminal against a stale old-owner update", async () => {
+    render(<JobStreamHarness part={{ ...runningJob, job_id: "604" }} />)
+
+    emitJobEvent("job.canceled", { job_id: "604", kind: "design.cases", status: "cancelled" })
+    expect(await screen.findByText("已取消")).toBeInTheDocument()
+
+    // A coalesced in-flight progress from the fenced owner can arrive later.
+    emitJobEvent("job.progress", {
+      job_id: "604",
+      kind: "design.cases",
+      status: "running",
+      current: 20,
+      total: 27,
+    })
+    emitJobEvent("job.progress", {
+      job_id: "604",
+      kind: "design.cases",
+      status: "failed",
+      current: 21,
+      total: 27,
+    })
+    emitJobEvent("job.finished", {
+      job_id: "604",
+      kind: "design.cases",
+      status: "failed",
+      result_ref: "",
+      error: "lease lost",
+    })
+
+    expect(screen.getByText("已取消")).toBeInTheDocument()
+    expect(screen.queryByText("运行中")).not.toBeInTheDocument()
+    expect(screen.queryByText("失败")).not.toBeInTheDocument()
+    // Stale progress counters are discarded too.
+    expect(screen.getByText("12/27")).toBeInTheDocument()
+    expect(screen.queryByText("21/27")).not.toBeInTheDocument()
+  })
+
+  it("keeps a done card terminal against a stale running progress", async () => {
+    render(<JobStreamHarness part={{ ...runningJob, job_id: "605" }} />)
+
+    emitJobEvent("job.finished", {
+      job_id: "605",
+      kind: "design.cases",
+      status: "done",
+      result_ref: "agent_run:10",
+    })
+    expect(await screen.findByText("完成")).toBeInTheDocument()
+
+    emitJobEvent("job.progress", {
+      job_id: "605",
+      kind: "design.cases",
+      status: "running",
+      current: 9,
+      total: 27,
+    })
+
+    expect(screen.getByText("完成")).toBeInTheDocument()
+    expect(screen.queryByText("运行中")).not.toBeInTheDocument()
+    expect(screen.queryByText("9/27")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+  })
+
+  it("keeps a failed card terminal against a stale running progress", async () => {
+    render(<JobStreamHarness part={{ ...runningJob, job_id: "606" }} />)
+
+    emitJobEvent("job.finished", {
+      job_id: "606",
+      kind: "design.cases",
+      status: "failed",
+      result_ref: "",
+      error: "agent failed",
+    })
+    expect(await screen.findByText("失败")).toBeInTheDocument()
+
+    emitJobEvent("job.progress", {
+      job_id: "606",
+      kind: "design.cases",
+      status: "running",
+      current: 9,
+      total: 27,
+    })
+
+    expect(screen.getByText("失败")).toBeInTheDocument()
+    expect(screen.queryByText("运行中")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "重试作业" })).toBeInTheDocument()
   })
 })
 

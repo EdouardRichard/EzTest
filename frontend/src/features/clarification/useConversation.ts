@@ -89,18 +89,28 @@ export function publishStreamReset(versionId: string, data: unknown): void {
 
 /* ------------------------------ job progress ------------------------------- */
 
-/** The live slice of a job card that `job.progress` / `job.finished` mutate. */
+/** The live slice of a job card that version-channel job events mutate. */
 export type JobCardUpdate = {
   status?: JobStatus
   current?: number
   total?: number
 }
 
+/** Version-channel event types that mutate the rendered job card. */
+export type JobEventType = "job.progress" | "job.finished" | "job.canceled" | "job.requeued"
+
 const JOB_STATUSES: ReadonlySet<string> = new Set<JobStatus>([
   "open",
   "claimed",
   "running",
   "waiting_human",
+  "done",
+  "failed",
+  "cancelled",
+])
+
+/** `done/failed/cancelled` are terminal: a card never regresses out of them. */
+const TERMINAL_JOB_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
   "done",
   "failed",
   "cancelled",
@@ -121,10 +131,44 @@ const jobUpdates = new Map<string, JobCardUpdate>()
 const jobUpdateListeners = new Set<() => void>()
 
 /**
- * Parses one validated `job.progress`/`job.finished` payload and merges it into
- * the live job card projection. Malformed payloads are ignored.
+ * Sticky-terminal merge for one job event.
+ *
+ * A terminal card (`done/failed/cancelled`) accepts only an idempotent terminal
+ * repeat or an explicit revival: `job.requeued`, or an `open` status (which the
+ * worker also emits after an automatic retry). Everything else is a stale
+ * in-flight update from the fenced old owner — a coalesced `running` snapshot,
+ * or a `failed` progress event that lost the race to a cancel/done — and is
+ * dropped with its counters so the card cannot roll back. After a revival the
+ * next owner's `running`/`finished` events apply normally.
  */
-export function publishJobEvent(versionId: string, payload: Record<string, unknown>): void {
+function mergeJobUpdate(
+  current: JobCardUpdate | undefined,
+  update: JobCardUpdate,
+  eventType: JobEventType,
+): JobCardUpdate | null {
+  const currentStatus = current?.status
+  if (currentStatus !== undefined && TERMINAL_JOB_STATUSES.has(currentStatus)) {
+    const revivedByControlEvent =
+      eventType === "job.requeued" &&
+      update.status !== undefined &&
+      !TERMINAL_JOB_STATUSES.has(update.status)
+    const revivedByOpenStatus = update.status === "open"
+    const idempotentTerminal = update.status !== undefined && update.status === currentStatus
+    if (!revivedByControlEvent && !revivedByOpenStatus && !idempotentTerminal) return null
+  }
+  return { ...(current ?? {}), ...update }
+}
+
+/**
+ * Parses one validated job event payload and merges it into the live job card
+ * projection. `job.canceled`/`job.requeued` share the same merge path as
+ * `job.progress`/`job.finished`; malformed payloads are ignored.
+ */
+export function publishJobEvent(
+  versionId: string,
+  payload: Record<string, unknown>,
+  eventType: JobEventType,
+): void {
   const rawId = payload.job_id
   const jobId =
     typeof rawId === "string"
@@ -149,13 +193,16 @@ export function publishJobEvent(versionId: string, payload: Record<string, unkno
   if (Object.keys(update).length === 0) return
 
   const key = jobKey(versionId, jobId)
-  jobUpdates.set(key, { ...(jobUpdates.get(key) ?? {}), ...update })
+  const next = mergeJobUpdate(jobUpdates.get(key), update, eventType)
+  if (next === null) return
+  jobUpdates.set(key, next)
   for (const listener of jobUpdateListeners) listener()
 }
 
 /**
  * Subscribes one rendered job card to the streamed job updates of its version.
- * Returns `null` until a `job.progress`/`job.finished` event for that job lands.
+ * Returns `null` until a job event (progress/finished/canceled/requeued) for
+ * that job lands.
  */
 export function useJobCardUpdate(versionId: string, jobId: string): JobCardUpdate | null {
   const subscribe = useCallback((listener: () => void): (() => void) => {
@@ -231,7 +278,10 @@ export type UseConversationOptions = {
 
 export type UseConversationResult = {
   messages: ConversationMessage[]
+  /** True while the first snapshot of the current conversation is loading. */
   loading: boolean
+  /** True while an already loaded snapshot is being refetched (thread stays). */
+  refreshing: boolean
   error: unknown
   sending: boolean
   sendError: unknown
@@ -259,6 +309,7 @@ export function useConversation({
 }: UseConversationOptions): UseConversationResult {
   const [messages, setMessages] = useState<ConversationMessage[]>([])
   const [loading, setLoading] = useState(conversationId !== null)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<unknown>(null)
   const [hasMore, setHasMore] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
@@ -274,6 +325,9 @@ export function useConversation({
   // Bumped by every snapshot fetch and by unmount/switch, so a late `loadMore`
   // response can be recognized as stale and ignored.
   const generationRef = useRef(0)
+  // Identity (`versionId:conversationId`) whose snapshot is currently rendered.
+  // A fetch for this identity is a refresh of a loaded thread, not a new load.
+  const loadedIdentityRef = useRef("")
   const identity = conversationId === null ? "" : `${versionId}:${conversationId}`
   const identityRef = useRef(identity)
   identityRef.current = identity
@@ -290,8 +344,10 @@ export function useConversation({
     historyCursorRef.current = ""
 
     if (conversationId === null) {
+      loadedIdentityRef.current = ""
       setMessages([])
       setLoading(false)
+      setRefreshing(false)
       setError(null)
       setHasMore(false)
       setLoadingMore(false)
@@ -302,7 +358,17 @@ export function useConversation({
       }
     }
 
-    setLoading(true)
+    const fetchIdentity = `${versionId}:${conversationId}`
+    // Refetching the already rendered conversation keeps the thread and the
+    // Composer (with its unsent draft) mounted: only the initial load of a
+    // conversation replaces the panel with the loading card.
+    const isRefresh = loadedIdentityRef.current === fetchIdentity
+    if (isRefresh) {
+      setRefreshing(true)
+    } else {
+      setLoading(true)
+      setRefreshing(false)
+    }
     setError(null)
     setHasMore(false)
     setLoadingMore(false)
@@ -315,11 +381,14 @@ export function useConversation({
         setMessages(sorted)
         historyCursorRef.current = page.nextCursor || newestMessageId(sorted)
         setHasMore(page.hasMore)
+        loadedIdentityRef.current = fetchIdentity
+        setRefreshing(false)
         setLoading(false)
       },
       (cause: unknown) => {
         if (!isCurrent()) return
         setError(cause)
+        setRefreshing(false)
         setLoading(false)
       },
     )
@@ -411,6 +480,7 @@ export function useConversation({
   return {
     messages,
     loading,
+    refreshing,
     error,
     sending,
     sendError,

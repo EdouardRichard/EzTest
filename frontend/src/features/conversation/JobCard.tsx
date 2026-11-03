@@ -5,7 +5,7 @@ import { useEffect, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
-import { apiPost } from "@/lib/api-client"
+import { ApiError, apiPost } from "@/lib/api-client"
 
 import type { JobCardPart, JobKind, JobStatus } from "./types"
 
@@ -52,12 +52,10 @@ const KIND_LABEL: Partial<Record<JobKind, string>> = {
   "knowledge.propose": "沉淀知识",
 }
 
-const CANCELLABLE: ReadonlySet<JobStatus> = new Set<JobStatus>([
-  "open",
-  "claimed",
-  "running",
-  "waiting_human",
-])
+// The job control API cancels only open/claimed/running jobs. `waiting_human`
+// is intentionally excluded: the API rejects it with a 409, so the card must
+// not offer a button that is guaranteed to fail.
+const CANCELLABLE: ReadonlySet<JobStatus> = new Set<JobStatus>(["open", "claimed", "running"])
 
 type JobViewResponse = {
   state?: JobStatus
@@ -67,6 +65,26 @@ type JobViewResponse = {
 
 function jobActionPath(versionId: string, jobId: string, action: "cancel" | "retry"): string {
   return `/api/versions/${encodeURIComponent(versionId)}/jobs/${encodeURIComponent(jobId)}/${action}`
+}
+
+/**
+ * User-facing text for a rejected cancel/retry. The card cannot know the job's
+ * attempt budget (`job_card` carries no attempts/max_attempts), so a retry on a
+ * failed-but-exhausted job is only guaranteed to be discovered from the typed
+ * 409; translating that status keeps the error actionable instead of showing
+ * the raw API sentence.
+ */
+function jobActionError(cause: unknown, action: "cancel" | "retry"): string {
+  if (cause instanceof ApiError) {
+    if (cause.status === 409) {
+      return action === "cancel"
+        ? "作业状态已变化，无法取消；请刷新后重试。"
+        : "该作业当前不可重试（可能已取消或尝试次数已用尽）；请刷新后重试。"
+    }
+    if (cause.status === 404) return "作业不存在或已失效；请刷新后重试。"
+    return cause.message
+  }
+  return "作业操作失败，请重试。"
 }
 
 function mergeJobView(part: JobCardPart, view: JobViewResponse): JobCardPart {
@@ -80,9 +98,12 @@ function mergeJobView(part: JobCardPart, view: JobViewResponse): JobCardPart {
 
 /**
  * One job progress card (spec §9.1). It shows current/total (never a fabricated
- * percentage when `total = 0`), keeps the cancel action while the job is
- * active, and the retry action once it failed. The actions call the 0.2.1
- * `/jobs/{id}/cancel|retry` endpoints unless a parent supplies an override.
+ * percentage when `total = 0`), offers cancel only for the states the job
+ * control API accepts (open/claimed/running — `waiting_human` is rejected), and
+ * retry only once the job failed (a cancelled job is never retryable). The
+ * actions call the 0.2.1 `/jobs/{id}/cancel|retry` endpoints unless a parent
+ * supplies an override; a typed 409 is surfaced as an actionable message
+ * because the card itself carries no attempt budget.
  */
 export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
   // Only the local result of cancel/retry lives here; the streamed snapshot is
@@ -129,7 +150,7 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
       const view = await apiPost<JobViewResponse>(jobActionPath(versionId, job.job_id, "retry"))
       setActionResult((current) => mergeJobView(current ?? part, view))
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : "作业操作失败，请重试。")
+      setActionError(jobActionError(cause, action))
     } finally {
       setPending(null)
     }

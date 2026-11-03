@@ -181,4 +181,52 @@ describe("ChatPanelPaginationWiring", () => {
     expect(api.listMessages).toHaveBeenLastCalledWith("2001", "4001")
     expect(screen.getByTestId("composer-textarea")).toBeInTheDocument()
   })
+
+  it("keeps the thread and composer draft mounted while an error action refreshes the snapshot", async () => {
+    const retryableError: ErrorPart = {
+      type: "error",
+      code: "model_error",
+      message: "模型调用失败，请重试。",
+      retryable: true,
+    }
+    let resolveRefresh: (page: ApiPage<ConversationMessage>) => void = () => {}
+    const pendingRefresh = new Promise<ApiPage<ConversationMessage>>((resolve) => {
+      resolveRefresh = resolve
+    })
+    api.listMessages
+      .mockResolvedValueOnce(
+        pageOf([assistantMessage("5001", "第一页消息"), errorMessage("5002", retryableError)]),
+      )
+      .mockReturnValueOnce(pendingRefresh)
+
+    renderPanel()
+
+    expect(await screen.findByText("模型调用失败，请重试。")).toBeInTheDocument()
+    fireEvent.change(screen.getByTestId("composer-textarea"), {
+      target: { value: "错误动作刷新时要保留的草稿" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "重试" }))
+
+    // Fetching the next snapshot is a refresh of an already loaded thread, not
+    // a new load: the thread and the Composer (whose draft lives in component
+    // state) stay mounted behind a subtle indicator instead of LoadingCard.
+    expect(screen.getByTestId("composer-textarea")).toHaveValue("错误动作刷新时要保留的草稿")
+    expect(screen.getByTestId("message-list")).toBeInTheDocument()
+    expect(screen.getByText("模型调用失败，请重试。")).toBeInTheDocument()
+    expect(screen.queryByText("正在加载对话…")).not.toBeInTheDocument()
+    expect(await screen.findByTestId("thread-refreshing")).toBeInTheDocument()
+
+    await act(async () => {
+      resolveRefresh(
+        pageOf([assistantMessage("5001", "第一页消息"), assistantMessage("5009", "重试后的回复")]),
+      )
+      await pendingRefresh
+    })
+
+    expect(await screen.findByText("重试后的回复")).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByTestId("thread-refreshing")).not.toBeInTheDocument())
+    expect(screen.getByTestId("composer-textarea")).toHaveValue("错误动作刷新时要保留的草稿")
+    expect(api.listMessages).toHaveBeenCalledTimes(2)
+    expect(api.listMessages).toHaveBeenLastCalledWith("2001", "4001")
+  })
 })
