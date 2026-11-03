@@ -5,6 +5,7 @@ import { useEffect, useState } from "react"
 import { Alert } from "@/components/ui/Alert"
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
+import { Dialog } from "@/components/ui/Dialog"
 import { InlineError } from "@/components/ui/ErrorState"
 import { Field } from "@/components/ui/Field"
 import { Input } from "@/components/ui/Input"
@@ -12,7 +13,7 @@ import { Select } from "@/components/ui/Select"
 import { Textarea } from "@/components/ui/Textarea"
 import { AnchorPanel } from "@/features/anchors/AnchorPanel"
 
-import { confirmRequirement, updateRequirement } from "./api"
+import { confirmRequirement, reopenRequirement, updateRequirement } from "./api"
 import { REQUIREMENT_STATUS_LABEL, REQUIREMENT_STATUS_TONE } from "./labels"
 import type { RequirementDetail, RequirementPriority, TargetOptions } from "./types"
 
@@ -79,6 +80,10 @@ export function RequirementEditor({
   const [error, setError] = useState<unknown>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [reopenOpen, setReopenOpen] = useState(false)
+  const [reopenReason, setReopenReason] = useState("")
+  const [reopening, setReopening] = useState(false)
+  const [reopenError, setReopenError] = useState<unknown>(null)
 
   useEffect(() => {
     setTitle(current.title)
@@ -94,6 +99,28 @@ export function RequirementEditor({
   }, [current])
 
   const clarified = requirement.status === "clarified"
+  const closed = requirement.status === "closed"
+  const obsolete = requirement.status === "obsolete"
+  const readOnly = closed || obsolete
+  const reopenSubmitDisabled = reopening || reopenReason.trim().length === 0
+
+  async function reopen(): Promise<void> {
+    const reason = reopenReason.trim()
+    if (reason.length === 0) return
+    setReopenError(null)
+    setReopening(true)
+    try {
+      const updated = await reopenRequirement(versionId, requirement.id, { reason })
+      onUpdated(updated)
+      setNotice("已重新打开为草案")
+      setReopenOpen(false)
+      setReopenReason("")
+    } catch (cause) {
+      setReopenError(cause)
+    } finally {
+      setReopening(false)
+    }
+  }
 
   async function save(): Promise<void> {
     const nextErrors = validate({ title, description, acceptance })
@@ -156,6 +183,14 @@ export function RequirementEditor({
         </div>
       ) : null}
 
+      {closed ? (
+        <div data-testid="editor-closed-hint" className="mt-2">
+          <Alert tone="warning">
+            该需求已闭环；重新打开后会回到草案，需重新确认后才会再次进入设计与执行。
+          </Alert>
+        </div>
+      ) : null}
+
       <div className="mt-2.5 space-y-2.5">
         <Field id="clarification-editor-title" label="标题" required error={errors.title}>
           <Input
@@ -164,6 +199,7 @@ export function RequirementEditor({
             value={title}
             maxLength={TITLE_LIMIT}
             aria-invalid={errors.title !== undefined}
+            disabled={readOnly || saving}
             onChange={(event) => setTitle(event.target.value)}
           />
         </Field>
@@ -180,6 +216,7 @@ export function RequirementEditor({
             rows={3}
             value={description}
             aria-invalid={errors.description !== undefined}
+            disabled={readOnly || saving}
             onChange={(event) => setDescription(event.target.value)}
             className="min-h-20 text-xs"
           />
@@ -197,6 +234,7 @@ export function RequirementEditor({
             rows={3}
             value={acceptance}
             aria-invalid={errors.acceptance !== undefined}
+            disabled={readOnly || saving}
             onChange={(event) => setAcceptance(event.target.value)}
             className="min-h-20 text-xs"
           />
@@ -207,6 +245,7 @@ export function RequirementEditor({
             id="clarification-editor-priority"
             data-testid="editor-priority"
             value={priority}
+            disabled={readOnly || saving}
             onChange={(event) => setPriority(event.target.value as RequirementPriority)}
           >
             {PRIORITIES.map((value) => (
@@ -224,6 +263,7 @@ export function RequirementEditor({
             idPrefix="sut"
             options={targetOptions.suts}
             values={suts}
+            disabled={readOnly || saving}
             onToggle={(id) => setSuts((currentValues) => toggleValue(currentValues, id))}
           />
           <TargetGroup
@@ -231,6 +271,7 @@ export function RequirementEditor({
             idPrefix="page"
             options={targetOptions.pages}
             values={pages}
+            disabled={readOnly || saving}
             onToggle={(id) => setPages((currentValues) => toggleValue(currentValues, id))}
           />
           <TargetGroup
@@ -238,34 +279,52 @@ export function RequirementEditor({
             idPrefix="api"
             options={targetOptions.apis}
             values={apis}
+            disabled={readOnly || saving}
             onToggle={(id) => setApis((currentValues) => toggleValue(currentValues, id))}
           />
         </fieldset>
       </div>
 
       <div className="mt-3 flex items-center gap-2">
-        <Button
-          size="sm"
-          variant="secondary"
-          data-testid="editor-save"
-          disabled={saving}
-          onClick={() => {
-            void save()
-          }}
-        >
-          {saving ? "保存中…" : "保存"}
-        </Button>
-        {clarified ? null : (
-          <Button
-            size="sm"
-            data-testid="editor-confirm"
-            disabled={saving}
-            onClick={() => {
-              void confirm()
-            }}
-          >
-            确认已澄清
-          </Button>
+        {readOnly ? (
+          closed ? (
+            <Button
+              size="sm"
+              data-testid="editor-reopen"
+              onClick={() => {
+                setReopenError(null)
+                setReopenOpen(true)
+              }}
+            >
+              重新打开需求
+            </Button>
+          ) : null
+        ) : (
+          <>
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="editor-save"
+              disabled={saving}
+              onClick={() => {
+                void save()
+              }}
+            >
+              {saving ? "保存中…" : "保存"}
+            </Button>
+            {clarified ? null : (
+              <Button
+                size="sm"
+                data-testid="editor-confirm"
+                disabled={saving}
+                onClick={() => {
+                  void confirm()
+                }}
+              >
+                确认已澄清
+              </Button>
+            )}
+          </>
         )}
         {notice !== null ? (
           <p role="status" className="ml-auto text-[11px] text-success">
@@ -279,6 +338,55 @@ export function RequirementEditor({
           <InlineError error={error} />
         </div>
       ) : null}
+
+      <Dialog
+        open={reopenOpen}
+        onClose={() => {
+          if (!reopening) setReopenOpen(false)
+        }}
+        title="重新打开需求"
+        description="需求从已闭环回到草案；当前版本与确认历史保留，重开原因会写入审计。重新打开后需再次确认。"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={reopening}
+              onClick={() => setReopenOpen(false)}
+            >
+              取消
+            </Button>
+            <Button
+              size="sm"
+              disabled={reopenSubmitDisabled}
+              onClick={() => {
+                void reopen()
+              }}
+            >
+              {reopening ? "提交中…" : "重新打开需求"}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <Field
+            id="requirement-reopen-reason"
+            label="重开原因"
+            required
+            hint="必填（1–2000 字）；会写入审计与 requirement.reopened 事件。"
+          >
+            <Textarea
+              id="requirement-reopen-reason"
+              value={reopenReason}
+              maxLength={2000}
+              disabled={reopening}
+              placeholder="例如：缺陷修复后需要重新执行验收"
+              onChange={(event) => setReopenReason(event.target.value)}
+            />
+          </Field>
+          {reopenError !== null ? <InlineError error={reopenError} /> : null}
+        </div>
+      </Dialog>
 
       <div className="mt-3 border-t border-border pt-3">
         <AnchorPanel
@@ -297,12 +405,14 @@ function TargetGroup({
   idPrefix,
   options,
   values,
+  disabled = false,
   onToggle,
 }: {
   title: string
   idPrefix: string
   options: TargetOptions["suts"]
   values: string[]
+  disabled?: boolean
   onToggle: (id: string) => void
 }) {
   if (options.length === 0) return null
@@ -322,6 +432,7 @@ function TargetGroup({
               data-testid={`editor-target-${idPrefix}-${option.id}`}
               type="checkbox"
               checked={values.includes(option.id)}
+              disabled={disabled}
               onChange={() => onToggle(option.id)}
               className="size-3.5 accent-primary"
             />

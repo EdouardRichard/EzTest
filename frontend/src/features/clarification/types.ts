@@ -285,6 +285,15 @@ export type RollbackRequest = {
   proposal_message_id?: string
 }
 
+/**
+ * `POST /api/versions/{id}/requirements/{rid}/reopen` payload. Only a closed
+ * requirement can be reopened (closed -> draft); the reason is mandatory and is
+ * written to the audit trail and the requirement.reopened event.
+ */
+export type ReopenRequirementRequest = {
+  reason: string
+}
+
 export type TeamRoomDigest = {
   summary: string
   pinned_post_ids: string[]

@@ -734,20 +734,25 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 	}
 	updated := caseRun
 	updated.FailureClass = class
-	if in.Summary != "" {
-		updated.Summary.LastError = truncateRunes(in.Summary, 2000)
+	summary := execution.SanitizeFailureSummary(in.Summary)
+	if summary != "" {
+		updated.Summary.LastError = truncateRunes(summary, 2000)
 	}
 	if _, err := s.caseRuns.Update(ctx, updated); err != nil {
 		return nil, mapExecutionError(err, "case_run")
 	}
 	dedupe := in.DedupeHint
+	steps, _ := s.results.ListSteps(ctx, caseRun.ID)
+	assertions, _ := s.results.ListAssertions(ctx, caseRun.ID)
 	if dedupe == "" {
 		// Align with the deterministic §8.1 fallback so P4 sees one stable
 		// dedupe hint for both paths.
-		steps, _ := s.results.ListSteps(ctx, caseRun.ID)
-		assertions, _ := s.results.ListAssertions(ctx, caseRun.ID)
 		dedupe = failureDedupeHint(scope.VersionID, caseRun, class, steps, assertions)
 	}
+	// Task 112: never echo the analyst's suggested category/severity. They are a
+	// second source that can disagree with the P4 issue record (and the summary);
+	// emit the canonical derivation instead.
+	category, severity := s.caseIssueAttribution(ctx, scope.VersionID, caseRun, steps, assertions)
 	eventScope := map[string]any{
 		"wave_id":     platformid.Format(caseRun.WaveID),
 		"case_run_id": platformid.Format(caseRun.ID),
@@ -756,9 +761,9 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 		"case_run_id":     platformid.Format(caseRun.ID),
 		"case_version_id": platformid.Format(caseRun.CaseVersionID),
 		"failure_class":   string(class),
-		"category":        in.Category,
-		"severity":        in.Severity,
-		"summary":         truncateRunes(in.Summary, 2000),
+		"category":        category,
+		"severity":        severity,
+		"summary":         truncateRunes(summary, 2000),
 		"dedupe_hint":     dedupe,
 		"issue_candidate": class.IsIssueCandidate(),
 	}, nil)
@@ -767,13 +772,15 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 			VersionID: s.versionForCaseRun(caseRun),
 			Team:      "execution",
 			Kind:      "finding",
-			Content:   truncateRunes(in.Summary, 2000),
+			Content:   truncateRunes(summary, 2000),
 			Refs:      []TeamPostRef{{Kind: "case_run", ID: platformid.Format(caseRun.ID)}},
 		})
 	}
 	return map[string]any{
 		"case_run_id":   platformid.Format(caseRun.ID),
 		"failure_class": string(class),
+		"category":      category,
+		"severity":      severity,
 		"dedupe_hint":   dedupe,
 	}, nil
 }

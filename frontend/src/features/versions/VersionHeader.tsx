@@ -181,7 +181,7 @@ export function VersionHeader({
           if (!submitting) setReopenOpen(false)
         }}
         title="重新打开版本"
-        description="版本将从已完成回到运行中，清空收尾信息并把最新版本报告置为过期。"
+        description="版本将从已完成回到运行中，清空收尾信息并把最新版本报告置为过期。已闭环需求不会自动重新打开；如需重跑已闭环需求，请在「需求与澄清」页重新打开该需求。"
         footer={
           <>
             <Button

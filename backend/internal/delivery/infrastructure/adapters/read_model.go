@@ -382,18 +382,39 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 	var failedExpected, failedActual, failedReason string
 	var versionSUTID *int64
 	if firstFailed != nil {
-		category = failureCategory(firstFailed.Kind)
-		severity = failureSeverity(info.priority)
-		failedStepSeq = firstFailed.StepSeq
 		failedAssertionSeq = firstFailed.AssertionSeq
-		failedExpected = firstFailed.Expected
-		failedActual = firstFailed.Actual
-		failedReason = firstFailed.Reason
 		for _, assertion := range failedAssertions {
 			if assertion.ID > 0 {
 				failedAssertionIDs = append(failedAssertionIDs, assertion.ID)
 			}
 		}
+	}
+	// Task 112: the missing required control/feature recorded before the first
+	// failed assertion is the root cause of the run (FR-106-02 step 1), while the
+	// later failed assertion is a consequence. Anchor the issue on it so the
+	// title/category/expected/observed describe what is actually missing, even
+	// when the first failed assertion is an api assertion on a later step.
+	missingFeatureAnchor := execution.MissingFeatureAnchor(steps, failedAssertionStep(firstFailed))
+	switch {
+	case missingFeatureAnchor != nil:
+		category = "ui"
+		severity = execution.IssueSeverity(info.priority)
+		failedStepSeq = missingFeatureAnchor.Seq
+		failedStepResultID = missingFeatureAnchor.ID
+		if expectation, ok := info.stepExpected[missingFeatureAnchor.Seq]; ok {
+			failedExpected = expectation
+		}
+		failedActual = execution.StepObservedSummary(*missingFeatureAnchor)
+		if missingFeatureAnchor.TargetVersionSUTID != nil && *missingFeatureAnchor.TargetVersionSUTID > 0 {
+			versionSUTID = int64Ptr(*missingFeatureAnchor.TargetVersionSUTID)
+		}
+	case firstFailed != nil:
+		category = failureCategory(firstFailed.Kind)
+		severity = execution.IssueSeverity(info.priority)
+		failedStepSeq = firstFailed.StepSeq
+		failedExpected = firstFailed.Expected
+		failedActual = firstFailed.Actual
+		failedReason = firstFailed.Reason
 		if firstFailed.TargetVersionSUTID != nil && *firstFailed.TargetVersionSUTID > 0 {
 			versionSUTID = int64Ptr(*firstFailed.TargetVersionSUTID)
 		}
@@ -403,8 +424,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 				break
 			}
 		}
-	}
-	if firstFailed == nil && deviationStep != nil {
+	case deviationStep != nil:
 		// QA Q1: a failed step with an observed product behavior is itself the
 		// requirement-deviation evidence, so the issue candidate must carry the
 		// step ref, a category/severity and the observed summary even when the
@@ -413,7 +433,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		// control/feature (FR-106-02) and carries the recorded case step
 		// expectation next to the observation.
 		category = "ui"
-		severity = failureSeverity(info.priority)
+		severity = execution.IssueSeverity(info.priority)
 		failedStepSeq = deviationStep.Seq
 		failedStepResultID = deviationStep.ID
 		if expectation, ok := info.stepExpected[deviationStep.Seq]; ok {
@@ -427,9 +447,12 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 	if versionSUTID == nil && len(runVersionSUTIDs) > 0 {
 		versionSUTID = int64Ptr(runVersionSUTIDs[0])
 	}
-	failureSummary := run.Summary.LastError
+	// Task 112: the issue summary is narrative evidence, never a second severity
+	// source. Drop a contradictory "severity upgraded to major" claim; if the
+	// whole summary was such a claim, fall back to the recorded observation.
+	failureSummary := execution.SanitizeFailureSummary(run.Summary.LastError)
 	if strings.TrimSpace(failureSummary) == "" && deviationStep != nil {
-		failureSummary = execution.StepObservedSummary(*deviationStep)
+		failureSummary = execution.SanitizeFailureSummary(execution.StepObservedSummary(*deviationStep))
 	}
 
 	evidenceIDs := make([]int64, 0, len(evidenceRows))
@@ -1039,16 +1062,13 @@ func failureCategory(assertionKind string) string {
 	}
 }
 
-// failureSeverity mirrors the P3-D-12 deterministic severity derivation.
-func failureSeverity(priority string) string {
-	switch priority {
-	case "P0", "P1":
-		return "major"
-	case "P2":
-		return "minor"
-	default:
-		return "trivial"
+// failedAssertionStep returns the step sequence of a failed assertion, or 0 when
+// the run has no failed assertion.
+func failedAssertionStep(assertion *execution.AssertionResult) int {
+	if assertion == nil {
+		return 0
 	}
+	return assertion.StepSeq
 }
 
 // mapExecutionError maps execution not-found onto the delivery 404.

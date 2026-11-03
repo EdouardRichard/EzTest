@@ -20,6 +20,7 @@ import type {
   ConversationSummary,
   CreateConversationRequest,
   PostMessageRequest,
+  ReopenRequirementRequest,
   Requirement,
   RequirementCreateRequest,
   RequirementDedupeResult,
@@ -237,6 +238,19 @@ export function rollbackRequirement(
     `${requirementPath(versionId, requirementId)}/rollback`,
     payload,
   )
+}
+
+/**
+ * Reopens a closed requirement (closed -> draft) with a mandatory reason. This
+ * is the explicit recovery path behind a closed-requirement retry 409; it does
+ * not confirm or move the version stage.
+ */
+export function reopenRequirement(
+  versionId: string,
+  requirementId: string,
+  payload: ReopenRequirementRequest,
+): Promise<RequirementDetail> {
+  return apiPost<RequirementDetail>(`${requirementPath(versionId, requirementId)}/reopen`, payload)
 }
 
 export async function listRequirementRelations(

@@ -350,7 +350,17 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 			return execution.ExecutionIntent{}, platform.StateConflict("an active intent already exists for this case, environment and purpose")
 		}
 		if errors.Is(err, execution.ErrRequirementClosed) {
-			return execution.ExecutionIntent{}, platform.StateConflict("the requirement is closed; reopen it before creating an execution intent")
+			// Task 112: actionable 409 for the retry UI. The requirement is
+			// closed; reopening it (and re-confirming after a retest) is a normal
+			// user action, so the error names the requirement and the next step
+			// instead of only a free-text message.
+			conflict := platform.StateConflict("the requirement is closed; reopen it before creating an execution intent")
+			conflict.Details = map[string]any{
+				"reason":         "requirement_closed",
+				"requirement_id": platformid.Format(snapshot.RequirementID),
+				"next_action":    "在「需求与澄清」页重新打开该需求，然后重试执行",
+			}
+			return execution.ExecutionIntent{}, conflict
 		}
 		return execution.ExecutionIntent{}, mapExecutionError(err, "intent")
 	}

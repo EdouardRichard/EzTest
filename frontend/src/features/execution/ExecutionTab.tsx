@@ -494,6 +494,11 @@ export function ExecutionTab({
               onRerunComplete={() => {
                 void refresh()
               }}
+              onOpenRequirement={(requirementId) => {
+                router.push(
+                  `/versions/${encodeURIComponent(versionId)}?tab=requirements&requirement=${encodeURIComponent(requirementId)}`,
+                )
+              }}
               detail={detail}
               detailLoading={detailLoading}
               detailError={detailError}

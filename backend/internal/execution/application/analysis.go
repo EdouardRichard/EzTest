@@ -398,6 +398,15 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 			detail = fmt.Sprintf("step %d observed requirement deviation", evidenceStep.Seq)
 		}
 	}
+	// Task 112: a missing required control/feature recorded on an earlier step is
+	// the root cause, even when later steps also failed assertions. Anchor the
+	// candidate on that step so its category/step agree with the P4 issue.
+	anchor := execution.MissingFeatureAnchor(steps, firstFailedStepSeq(failedAssertion))
+	if anchor != nil {
+		category = "ui"
+		stepSeq, assertionSeq = anchor.Seq, 0
+		detail = fmt.Sprintf("step %d observed the required control/feature missing", anchor.Seq)
+	}
 	hint := analysisCandidateHint(wave.VersionID, run.CaseVersionID, stepSeq, assertionSeq, run.FailureClass)
 	s.mu.Lock()
 	if _, seen := s.candidates[hint]; seen {
@@ -408,7 +417,7 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 	s.mu.Unlock()
 
 	priority := s.casePriority(ctx, wave.VersionID, run.CaseVersionID)
-	severity := failureSeverity(priority)
+	severity := execution.IssueSeverity(priority)
 	payload := map[string]any{
 		"wave_id":       platformid.Format(wave.ID),
 		"case_run_id":   platformid.Format(run.ID),
@@ -535,7 +544,7 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 		}
 	}
 	run.FailureClass = requested
-	if summary := strings.TrimSpace(in.Summary); summary != "" {
+	if summary := execution.SanitizeFailureSummary(in.Summary); summary != "" {
 		if len(summary) > 2000 {
 			summary = summary[:2000]
 		}
@@ -608,15 +617,14 @@ func failureCategory(assertionKind string) string {
 	}
 }
 
-func failureSeverity(priority string) string {
-	switch priority {
-	case "P0", "P1":
-		return "major"
-	case "P2":
-		return "minor"
-	default:
-		return "trivial"
+// firstFailedStepSeq returns the step sequence of the first failed assertion, or
+// 0 when the run has no failed assertion. It bounds the missing-feature anchor:
+// an observation on a later step is a consequence, not the root cause.
+func firstFailedStepSeq(assertion *execution.AssertionResult) int {
+	if assertion == nil {
+		return 0
 	}
+	return assertion.StepSeq
 }
 
 func (s *AnalysisService) post(ctx context.Context, post TeamPost) {

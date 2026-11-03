@@ -289,6 +289,7 @@ func (r *RequirementRepository) Confirm(ctx context.Context, requirement version
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO requirement_confirmation (`+requirementConfirmationColumns+`)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+		ON CONFLICT (requirement_version_id) DO NOTHING
 	`, confirmation.ID, confirmation.RequirementVersionID, confirmation.Scope, confirmation.BatchID,
 		confirmation.ActorID, confirmation.ConfirmedAt, encodeStringSlice(confirmation.AffectedRequirementIDs)); err != nil {
 		if isUniqueViolation(err) {
@@ -337,6 +338,7 @@ func (r *RequirementRepository) BatchConfirm(ctx context.Context, requirements [
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO requirement_confirmation (`+requirementConfirmationColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+			ON CONFLICT (requirement_version_id) DO NOTHING
 		`, confirmation.ID, confirmation.RequirementVersionID, confirmation.Scope, confirmation.BatchID,
 			confirmation.ActorID, confirmation.ConfirmedAt,
 			encodeStringSlice(confirmation.AffectedRequirementIDs)); err != nil {

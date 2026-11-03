@@ -129,6 +129,7 @@ describe("VersionHeader", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "重新打开" }))
     const dialog = await screen.findByRole("dialog", { name: "重新打开版本" })
+    expect(dialog).toHaveTextContent("已闭环需求不会自动重新打开")
     const submit = within(dialog).getByRole("button", { name: "重新打开" })
     expect(submit).toBeDisabled()
 

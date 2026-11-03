@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
 // Failure classifications (spec §11 capability #7).
@@ -35,17 +37,20 @@ const (
 )
 
 // FailureSignal is the deterministic input of one attribution: the failed run,
-// its candidate category/reason and the retry budget.
+// its candidate category/reason, the case priority and the retry budget.
 type FailureSignal struct {
 	CaseRunID     int64
 	CaseVersionID int64
 	CaseTitle     string
 	FailureClass  string
 	Category      string
-	Reason        string
-	EvidenceIDs   []int64
-	Attempts      int
-	MaxAttempts   int
+	// Priority is the P2 case priority. Application problem drafts derive their
+	// severity from it (the same single source as the delivery issue record).
+	Priority    string
+	Reason      string
+	EvidenceIDs []int64
+	Attempts    int
+	MaxAttempts int
 }
 
 // ProblemDraft is the problem-report draft of an application failure. It is a
@@ -111,7 +116,7 @@ func (f *FailureAttribution) Classify(ctx context.Context, versionID int64, sign
 	if category == "" {
 		category = defaultFailureCategory(classification)
 	}
-	severity := failureSeverity(classification, category)
+	severity := failureSeverity(classification, signal.Priority)
 	attempts := signal.Attempts
 	if attempts < 0 {
 		attempts = 0
@@ -196,19 +201,21 @@ func defaultFailureCategory(classification string) string {
 	}
 }
 
-func failureSeverity(classification, category string) string {
+func failureSeverity(classification, priority string) string {
+	if classification == FailureClassificationApplication {
+		// Task 112: an application problem draft has one severity source — the
+		// case priority (P0/P1 major, P2 minor, P3 trivial). The assertion kind
+		// (api/db) must not inflate a P2 finding to major; otherwise the analyst
+		// sees a "severity upgrade" that the P4 issue record (minor) contradicts.
+		return execution.IssueSeverity(priority)
+	}
 	switch classification {
 	case FailureClassificationAutomation, FailureClassificationData:
 		return "minor"
 	case FailureClassificationEnvironment:
 		return "major"
 	}
-	switch category {
-	case "db", "api", "data":
-		return "major"
-	default:
-		return "minor"
-	}
+	return "minor"
 }
 
 func attributionReason(classification string, retryable bool) string {

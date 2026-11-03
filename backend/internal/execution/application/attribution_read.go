@@ -27,12 +27,14 @@ func (s *CaseRunner) resultFailureAttribution(ctx context.Context, versionID int
 	if s == nil || s.attribution == nil || !failureRelevant(run.Status) {
 		return nil
 	}
+	caseSnapshot := s.failureSignalCase(ctx, versionID, run.CaseVersionID)
 	signal := exploreapp.FailureSignal{
 		CaseRunID:     run.ID,
 		CaseVersionID: run.CaseVersionID,
-		CaseTitle:     s.failureSignalCaseTitle(ctx, versionID, run.CaseVersionID),
+		CaseTitle:     caseSnapshot.Title,
 		FailureClass:  string(run.FailureClass),
 		Category:      failureAttributionCategory(assertions),
+		Priority:      caseSnapshot.Priority,
 		Reason:        failureSignalReason(run, steps, assertions),
 		EvidenceIDs:   s.failureSignalEvidenceIDs(ctx, run.ID),
 		Attempts:      run.Attempts,
@@ -45,15 +47,19 @@ func (s *CaseRunner) resultFailureAttribution(ctx context.Context, versionID int
 	return failureAttributionValue(result)
 }
 
-func (s *CaseRunner) failureSignalCaseTitle(ctx context.Context, versionID, caseVersionID int64) string {
-	if s.cases == nil {
-		return ""
+// failureSignalCase loads the case projection the attribution needs: the title
+// for the problem draft and the priority that is the single source of the
+// application severity. A read failure degrades to an empty projection; the
+// attribution still classifies from the recorded failure evidence.
+func (s *CaseRunner) failureSignalCase(ctx context.Context, versionID, caseVersionID int64) execution.CaseSnapshot {
+	if s == nil || s.cases == nil {
+		return execution.CaseSnapshot{}
 	}
 	snapshot, err := s.cases.GetCaseVersion(ctx, versionID, caseVersionID)
 	if err != nil {
-		return ""
+		return execution.CaseSnapshot{}
 	}
-	return snapshot.Title
+	return snapshot
 }
 
 func (s *CaseRunner) failureSignalEvidenceIDs(ctx context.Context, caseRunID int64) []int64 {

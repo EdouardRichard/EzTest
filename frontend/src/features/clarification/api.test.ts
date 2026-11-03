@@ -18,6 +18,7 @@ import {
   listRequirements,
   mergeRequirements,
   postMessage,
+  reopenRequirement,
   rollbackRequirement,
   updateRequirement,
   uploadContent,
@@ -333,6 +334,20 @@ describe("clarification api", () => {
       reason: "时效定义变更",
       proposal_message_id: "5001",
     })
+  })
+
+  it("reopens a closed requirement with a required reason", async () => {
+    const reopened = { ...requirementDetailFixture, status: "draft" as const }
+    fetchMock.mockResolvedValue(jsonResponse({ data: reopened }))
+
+    await expect(reopenRequirement("2001", "6001", { reason: "缺陷修复后重测" })).resolves.toEqual(
+      reopened,
+    )
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/requirements/6001/reopen")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({ reason: "缺陷修复后重测" })
   })
 
   it("lists requirement relations through the relations endpoint", async () => {

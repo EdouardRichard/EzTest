@@ -444,3 +444,73 @@ func TestRequirementRepositorySourceKeyIdempotency(t *testing.T) {
 		t.Fatalf("requirements = %d, want 3 (first obsolete + other + recreated)", len(list))
 	}
 }
+
+// Task 112: a closed requirement is reopened to draft without changing its
+// current revision, so its confirmation row still exists. Re-confirming that
+// same revision after the reopen (the explicit UX recovery path) must succeed
+// and stay idempotent instead of surfacing "requirement is not in a mutable
+// state" from the confirmation unique constraint.
+func TestRequirementRepositoryReconfirmAfterReopen(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewRequirementRepository(pool)
+	versionRepo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 42)
+	if err := versionRepo.Create(ctx, v, sampleBindings(ids, v.ID)); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	requirement, revision := sampleRequirement(ids, v.ID)
+	if err := repo.Create(ctx, requirement, revision); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	confirmTime := testTime.Add(time.Hour)
+	clarified := requirement
+	clarified.Status = version.RequirementClarified
+	clarified.UpdatedAt = confirmTime
+	confirmation := version.Confirmation{
+		ID: ids.Next(), RequirementVersionID: revision.ID,
+		Scope: version.ConfirmationScopeRequirement, ActorID: 42,
+		ConfirmedAt: confirmTime, AffectedRequirementIDs: []string{},
+	}
+	if err := repo.Confirm(ctx, clarified, confirmation); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	// ClosureService.Reopen: closed → draft, current revision unchanged.
+	reopenTime := confirmTime.Add(time.Hour)
+	if err := repo.SetStatus(ctx, v.ID, requirement.ID, version.RequirementDraft, reopenTime); err != nil {
+		t.Fatalf("SetStatus draft: %v", err)
+	}
+	reopenedAggregate, err := repo.Get(ctx, v.ID, requirement.ID)
+	if err != nil {
+		t.Fatalf("Get after reopen: %v", err)
+	}
+	if reopenedAggregate.Requirement.Status != version.RequirementDraft || len(reopenedAggregate.Confirmations) != 1 {
+		t.Fatalf("reopened aggregate = %#v", reopenedAggregate)
+	}
+
+	reconfirmTime := reopenTime.Add(time.Hour)
+	reconfirmed := reopenedAggregate.Requirement
+	reconfirmed.Status = version.RequirementClarified
+	reconfirmed.UpdatedAt = reconfirmTime
+	if err := repo.Confirm(ctx, reconfirmed, version.Confirmation{
+		ID: ids.Next(), RequirementVersionID: revision.ID,
+		Scope: version.ConfirmationScopeRequirement, ActorID: 43,
+		ConfirmedAt: reconfirmTime, AffectedRequirementIDs: []string{},
+	}); err != nil {
+		t.Fatalf("re-confirm after reopen: %v", err)
+	}
+	aggregate, err := repo.Get(ctx, v.ID, requirement.ID)
+	if err != nil {
+		t.Fatalf("Get after re-confirm: %v", err)
+	}
+	if aggregate.Requirement.Status != version.RequirementClarified {
+		t.Fatalf("status after re-confirm = %q, want clarified", aggregate.Requirement.Status)
+	}
+	if len(aggregate.Confirmations) != 1 {
+		t.Fatalf("confirmations after re-confirm = %d, want the original single row", len(aggregate.Confirmations))
+	}
+}
