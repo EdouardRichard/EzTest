@@ -450,8 +450,19 @@ func TestExploreWiringLoginFlow(t *testing.T) {
 	if opens[0].auth != "Bearer wiring-token" {
 		t.Fatalf("executor authorization = %q", opens[0].auth)
 	}
-	if fixture.server.closes != 0 {
-		t.Fatalf("a fresh login page must not be closed, close calls = %d", fixture.server.closes)
+	// A fresh login opens its own page and must release it once the session is
+	// captured: every analysis login would otherwise leak one page until the
+	// executor's 8-page cap blocks discovery (Task 64). The close is page-scoped
+	// to the page this flow opened (never close-all), so pages owned by
+	// concurrent discovery/exploration runs on the shared executor stay open.
+	if fixture.server.closes != 1 {
+		t.Fatalf("a fresh login must close the page it opened exactly once, close calls = %d", fixture.server.closes)
+	}
+	if fixture.server.closeAll != 0 {
+		t.Fatalf("a fresh login must not close every page, close-all calls = %d", fixture.server.closeAll)
+	}
+	if closed := fixture.server.closedPageIDs; len(closed) != 1 || closed[0] != "page_1" {
+		t.Fatalf("closed page ids = %v, want only the login page this flow opened (page_1)", closed)
 	}
 }
 
