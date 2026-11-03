@@ -943,13 +943,27 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		if err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
+		messages := conversationMessages(snapshot.Messages)
+		if isDesignAuthoringWorkType(state.item.Type) {
+			// Task 79: a background design author works from the work-item scope,
+			// requirement.read and design.graph_read. Replaying the shared design
+			// thread would replay every previous author's UI projection and grow
+			// the prompt with the round; keep only the human instructions.
+			messages = designAuthoringHistory(messages)
+		}
 		state.input.Conversation = ConversationContext{
 			Summary:        snapshot.Summary,
 			PinnedFacts:    snapshot.PinnedFacts,
-			RecentMessages: conversationMessages(snapshot.Messages),
+			RecentMessages: messages,
 		}
 	}
 	state.input.TeamRoom = r.teamRoomContext(ctx, state.item.VersionID, state.team)
+	if isDesignAuthoringWorkType(state.item.Type) {
+		// The team room is where every author projects its own result: replaying
+		// the full post bodies turns the shared room into a second unbounded
+		// prompt. Keep the digest and only the newest, clipped posts.
+		state.input.TeamRoom = boundDesignAuthoringTeamRoom(state.input.TeamRoom)
+	}
 
 	// P3 execution tasks are loaded from the execution context (CaseRunner),
 	// which also validates the case_run/intent and claims the dispatch lease.
@@ -1019,6 +1033,12 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	}
 	state.input.VersionPack.Knowledge = fitKnowledge(state.input.VersionPack.Knowledge, knowledgeBudget)
 
+	// The current user turn is rendered before the assembly: the window_full
+	// threshold accounts for it (Task 80 moved the per-work-item task context
+	// into this turn, outside the assembler packet), and it is the exact text
+	// handleOverflow re-appends after a boundary rebuild.
+	state.userContent = r.userMessage(ctx, state, attachmentText)
+
 	// Task 48 cache-first prompt: the assembler renders the byte-stable prefix
 	// and the append-only suffix once per run (and again only at a declared
 	// boundary rebuild). Compaction never happens on a normal round.
@@ -1043,19 +1063,14 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	// failure is logged and never fails the run (contracts §10.3).
 	r.recordKnowledgeUsage(ctx, state)
 
-	systemText := contextPacketPrefix(assembly.Packet)
-	if strings.TrimSpace(systemText) == "" {
-		systemText = systemContent(state.input)
-	}
-	userContent := r.userMessage(ctx, state, attachmentText)
-	state.userContent = userContent
+	systemText := systemMessageText(assembly.Packet, state.input)
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, userContent, nil, nil); err != nil {
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, state.userContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	state.messages = append(assembly.Messages, currentUserChatMessage(state, userContent))
+	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
 	return nil
 }
 
@@ -1355,10 +1370,7 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 		}
 	}
 	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
-	systemText := contextPacketPrefix(assembly.Packet)
-	if strings.TrimSpace(systemText) == "" {
-		systemText = systemContent(state.input)
-	}
+	systemText := systemMessageText(assembly.Packet, state.input)
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
@@ -2217,15 +2229,40 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 // round (read + one propose per activated requirement) without being unbounded.
 const DesignRunMaxTokens = 200000
 
+// Design authoring envelope (Task 79). The stored profile budgets cannot be
+// trusted for design runs: profiles are seeded once and EnsureProfiles never
+// overwrites an existing row, so the live 0.2.1 database still carries the
+// chat-scale design budgets (case_author 8/300/600, design_planner 12/300/600)
+// even after the seeds were raised. The runner therefore enforces the design
+// authoring floor in code, like the token budget: a focused case-author run
+// needs the read turn, the propose turn and the summary turn, and must not be
+// cut off by the generic chat-scale soft timeout.
+const (
+	DesignRunMaxTurns       = 16
+	DesignRunMinSeconds     = 600
+	DesignRunMinHardSeconds = 900
+	DesignRunMinAuthorTurns = 3
+	// DesignAuthorTurnTokens is the conservative per-turn token envelope of one
+	// focused case-author run after the Task 79 context scoping: profile prompt,
+	// version briefing/facts, one design.graph_read and the bounded
+	// human-history/team-room tail.
+	DesignAuthorTurnTokens = 32000
+)
+
 func (r *Runner) maxTurns(profile agent.AgentProfile) int {
 	limit := profile.Budgets.MaxTurns
 	setting := r.intSetting("agent.max_turns", defaultMaxTurns)
-	// P3 execution profiles and the design team carry their own case-scale
-	// budgets; the generic agent.max_turns (12) is a chat-scale guard and must
-	// not truncate a design round or an execution run.
-	if isP3Profile(profile.Key) || isDesignProfile(profile.Key) {
+	// P3 execution profiles carry their own case-scale turn budget; the design
+	// team gets the authoring floor so a stored chat-scale profile value cannot
+	// truncate a 67-requirement round. The generic agent.max_turns (12) is a
+	// chat-scale guard and must not clamp either team.
+	if isP3Profile(profile.Key) {
 		if limit <= 0 {
 			limit = setting
+		}
+	} else if isDesignProfile(profile.Key) {
+		if limit < DesignRunMaxTurns {
+			limit = DesignRunMaxTurns
 		}
 	} else {
 		switch {
@@ -2287,6 +2324,9 @@ func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 	if seconds < 1 {
 		seconds = defaultSoftSeconds
 	}
+	if isDesignProfile(profile.Key) && seconds < DesignRunMinSeconds {
+		seconds = DesignRunMinSeconds
+	}
 	return seconds
 }
 
@@ -2305,6 +2345,11 @@ func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile)
 	}
 	if isDesignProfile(profile.Key) {
 		budget.MaxTokens = DesignRunMaxTokens
+		// At least the read/propose/summary turns of one focused author run must
+		// fit inside the design token budget.
+		if minimum := DesignRunMinAuthorTurns * DesignAuthorTurnTokens; budget.MaxTokens < minimum {
+			budget.MaxTokens = minimum
+		}
 	}
 	trimmed := strings.TrimSpace(string(item.Budget))
 	if trimmed == "" || trimmed == "null" {
@@ -2395,6 +2440,9 @@ func (r *Runner) hardSeconds(profile agent.AgentProfile) int {
 	hard := profile.Budgets.HardSeconds
 	if hard <= 0 {
 		hard = r.intSetting("agent.run_hard_timeout_seconds", defaultHardSeconds)
+	}
+	if isDesignProfile(profile.Key) && hard < DesignRunMinHardSeconds {
+		hard = DesignRunMinHardSeconds
 	}
 	soft := r.softSeconds(profile)
 	if hard < soft {

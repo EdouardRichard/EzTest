@@ -705,3 +705,166 @@ func TestTaskContextInUserSuffix(t *testing.T) {
 		}
 	})
 }
+
+// TestTaskContextSurvivesWindowFull pins the Task 80 overflow survival
+// invariant: the current user turn (task block + trigger) is stored once in
+// state.userContent and handleOverflow re-appends that same turn after the
+// compaction rebuild. A retry prompt that lost the task block, or re-rendered a
+// different one, would leave the model without its goal/constraints/scope — and
+// a retry that re-added the block while the fallback system text also carried
+// it would send the block twice.
+func TestTaskContextSurvivesWindowFull(t *testing.T) {
+	t.Run("design task", func(t *testing.T) {
+		fixture := newBriefingRunnerFixture(t)
+		fixture.settings.ints["context.keep_recent_messages"] = 1
+		fixture.conv.snapshot.Summary = ""
+		fixture.conv.snapshot.PinnedFacts = nil
+		fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+			{ID: 701, Role: "user", Text: "消息一：需求背景"},
+			{ID: 702, Role: "assistant", Text: "消息二：澄清回复"},
+			{ID: 703, Role: "user", Text: "消息三：最新回复"},
+		}
+		fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
+		fixture.chat.responses = []llmapp.ChatResponse{
+			{Content: "不应被采用的回复"},
+			{Content: "窗口压缩摘要"},
+			{Content: "恢复后的回复"},
+		}
+
+		if _, err := mustRun(t, fixture, designRequirementWorkItem(1001, 501, 700)); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if len(fixture.repo.packets) != 2 {
+			t.Fatalf("persisted packets = %d, want prepare + window_full rebuild", len(fixture.repo.packets))
+		}
+		compacted := decodeStoredPacket(t, fixture.repo.packets[1])
+		if compacted.InvalidationReason != string(agentcontext.InvalidationWindowFull) {
+			t.Fatalf("invalidation reason = %q, want window_full", compacted.InvalidationReason)
+		}
+		if len(fixture.chat.requests) != 3 {
+			t.Fatalf("chat requests = %d, want overflow, summary, retry", len(fixture.chat.requests))
+		}
+		retry := fixture.chat.request(2)
+		last := retry.Messages[len(retry.Messages)-1]
+		if last.Role != "user" {
+			t.Fatalf("retry last message role = %q, want the re-appended user turn", last.Role)
+		}
+		for _, want := range []string{
+			"# 任务", "目标: ", "约束:", "验收:", "作用域:",
+			"work_item_id=1001", "requirement_id=501",
+			"请为需求 501（需求版本 700）设计场景与用例草案。",
+		} {
+			if !strings.Contains(last.Content, want) {
+				t.Fatalf("window_full retry lost task material %q:\n%s", want, last.Content)
+			}
+		}
+		if got := strings.Count(requestPrompt(retry), "# 任务"); got != 1 {
+			t.Fatalf("task block occurrences in the window_full retry = %d, want exactly 1:\n%s",
+				got, requestPrompt(retry))
+		}
+	})
+
+	t.Run("execution task", func(t *testing.T) {
+		provider := &fakeTaskProvider{task: executionTaskFixture()}
+		fixture := newRunnerFixtureWithTaskProvider(t, provider)
+		fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
+		fixture.chat.responses = []llmapp.ChatResponse{{Content: "恢复后的回复"}}
+
+		if _, err := mustRun(t, fixture, p3CaseItem()); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if len(fixture.repo.packets) != 2 {
+			t.Fatalf("persisted packets = %d, want prepare + window_full rebuild", len(fixture.repo.packets))
+		}
+		compacted := decodeStoredPacket(t, fixture.repo.packets[1])
+		if compacted.InvalidationReason != string(agentcontext.InvalidationWindowFull) {
+			t.Fatalf("invalidation reason = %q, want window_full", compacted.InvalidationReason)
+		}
+		if len(fixture.chat.requests) != 2 {
+			t.Fatalf("chat requests = %d, want overflow, retry", len(fixture.chat.requests))
+		}
+		retry := fixture.chat.request(1)
+		last := retry.Messages[len(retry.Messages)-1]
+		if last.Role != "user" {
+			t.Fatalf("retry last message role = %q, want the re-appended user turn", last.Role)
+		}
+		for _, want := range []string{
+			"# 任务", "# 执行任务", "目标: ", "约束:", "验收:", "作用域:",
+			"case_run_id=3001", "登录流程", "打开登录页", "Login 按钮可见",
+			"请逐步执行用例并记录结果",
+		} {
+			if !strings.Contains(last.Content, want) {
+				t.Fatalf("window_full retry lost execution material %q:\n%s", want, last.Content)
+			}
+		}
+		if got := strings.Count(requestPrompt(retry), "# 任务"); got != 1 {
+			t.Fatalf("task block occurrences in the window_full retry = %d, want exactly 1:\n%s",
+				got, requestPrompt(retry))
+		}
+	})
+}
+
+// TestTaskContextCountsTowardWindowBudget pins the Task 80 budget accounting:
+// the per-work-item task block moved out of the assembler-counted System
+// segment into the pending user turn that the runner appends after assembly.
+// The window_full threshold must count that turn; otherwise a run whose packet
+// fits the threshold but whose user turn pushes the prompt over the window
+// would never trigger the proactive boundary. The probe run measures the real
+// packet and user-turn token estimates, then the second fixture sets a
+// threshold that only the packet + user-turn sum exceeds.
+func TestTaskContextCountsTowardWindowBudget(t *testing.T) {
+	item := designRequirementWorkItem(1001, 501, 700)
+
+	probe := newBriefingRunnerFixture(t)
+	probe.chat.responses = []llmapp.ChatResponse{{Content: "已提交"}}
+	if _, err := mustRun(t, probe, item); err != nil {
+		t.Fatalf("probe run: %v", err)
+	}
+	if len(probe.repo.packets) != 1 {
+		t.Fatalf("probe persisted packets = %d, want one uncompacted packet", len(probe.repo.packets))
+	}
+	probePacket := decodeStoredPacket(t, probe.repo.packets[0])
+	packetTokens := 0
+	for _, segment := range probePacket.Segments {
+		packetTokens += segment.Tokens
+	}
+	probeRequest := probe.chat.request(0)
+	userContent := probeRequest.Messages[len(probeRequest.Messages)-1].Content
+	if !strings.Contains(userContent, "# 任务") {
+		t.Fatalf("probe last message is not the task-bearing user turn:\n%s", userContent)
+	}
+	userTokens := agentapp.EstimateTokens(userContent)
+	if packetTokens <= 0 || userTokens <= tokenOverheadProbe {
+		t.Fatalf("unexpected probe estimates: packet=%d user=%d", packetTokens, userTokens)
+	}
+
+	// Budget resolution for the fixture model: window 64000 - output reserve
+	// 8000 - tool reserve 2048. A threshold just below (packet+user)/budget
+	// triggers only when the user turn is counted, and the packet alone stays
+	// below it.
+	const budget = 64000 - 8000 - 2048
+	threshold := float64(packetTokens+userTokens-1) / float64(budget)
+	fixture := newBriefingRunnerFixture(t)
+	fixture.settings.floats = map[string]float64{"context.compact_threshold": threshold}
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "已提交"}}
+	if _, err := mustRun(t, fixture, item); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fixture.repo.packets) != 1 {
+		t.Fatalf("persisted packets = %d, want the proactively compacted prepare packet", len(fixture.repo.packets))
+	}
+	packet := decodeStoredPacket(t, fixture.repo.packets[0])
+	if packet.InvalidationReason != string(agentcontext.InvalidationWindowFull) {
+		t.Fatalf("invalidation reason = %q, want a proactive window_full boundary (packet %d + user %d > threshold %v×%d)",
+			packet.InvalidationReason, packetTokens, userTokens, threshold, budget)
+	}
+	// The block is still in the user turn; budget accounting must not move it.
+	last := fixture.chat.request(0).Messages[len(fixture.chat.request(0).Messages)-1]
+	if !strings.Contains(last.Content, "# 任务") || !strings.Contains(last.Content, "work_item_id=1001") {
+		t.Fatalf("task block lost from the budgeted user turn:\n%s", last.Content)
+	}
+}
+
+// tokenOverheadProbe is agentapp.EstimateTokens("") — the fixed estimator
+// overhead, used to prove the probe measured real user-turn content.
+const tokenOverheadProbe = 16

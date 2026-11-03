@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
@@ -153,5 +154,63 @@ func TestSystemContentKeepsPlainPromptUnchanged(t *testing.T) {
 	system := systemContent(in)
 	if !strings.HasPrefix(system, "[profile:clarification_host] 你是澄清 Host。") {
 		t.Fatalf("plain prompt changed: %s", system)
+	}
+}
+
+// TestTaskContextNotDuplicatedOnEmptyPrefix pins the defensive system-message
+// fallback of the cache-first runner. When an assembled packet carries no
+// prefix, the runner falls back to the stable system content only: the
+// per-work-item task block already lives in the user turn, so a fallback that
+// rendered the legacy systemContent (prompt + task context) would send the
+// block twice, and an oversized block duplicated in the prompt/transcript can
+// push a run over the window.
+func TestTaskContextNotDuplicatedOnEmptyPrefix(t *testing.T) {
+	in := internalPromptInput()
+	in.Task.Constraints = []string{"work_item_id=1001 不能替用户确认需求"}
+	in.Task.AcceptanceCriteria = []string{"给出可执行的下一步"}
+	in.Task.Scope = []string{"work_item_id=1001", "requirement_id=501"}
+	in.Execution = &ExecutionTask{
+		CaseRunID: 3001, CaseVersionID: 41, CaseTitle: "登录流程", Priority: "P1",
+		Steps: []ExecutionStep{{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"}},
+	}
+	const base = "请继续执行当前任务。"
+
+	system := systemMessageText(agentcontext.ContextPacket{}, in)
+	if !strings.Contains(system, "[profile:clarification_host] 版本 订单系统 Q4") {
+		t.Fatalf("empty-prefix fallback lost the stable prompt:\n%s", system)
+	}
+	for _, leaked := range []string{
+		"# 任务", "# 执行任务", "work_item_id=1001", "requirement_id=501",
+		"不能替用户确认需求", "登录流程", "打开登录页",
+	} {
+		if strings.Contains(system, leaked) {
+			t.Fatalf("empty-prefix fallback re-added per-work-item %q:\n%s", leaked, system)
+		}
+	}
+
+	user := taskContextMessage(base, in)
+	combined := system + "\n\n" + user
+	if got := strings.Count(combined, "# 任务"); got != 1 {
+		t.Fatalf("task block occurrences = %d, want exactly 1:\n%s", got, combined)
+	}
+	if got := strings.Count(combined, "# 执行任务"); got != 1 {
+		t.Fatalf("execution block occurrences = %d, want exactly 1:\n%s", got, combined)
+	}
+	for _, want := range []string{
+		"目标: 回答用户问题", "约束:", "不能替用户确认需求", "验收:",
+		"作用域:", "work_item_id=1001", "requirement_id=501",
+		"登录流程", "打开登录页", base,
+	} {
+		if !strings.Contains(user, want) {
+			t.Fatalf("user turn misses task material %q:\n%s", want, user)
+		}
+	}
+
+	// A non-empty prefix is used verbatim; the fallback never applies.
+	packet := agentcontext.ContextPacket{Segments: []agentcontext.Segment{{
+		Name: agentcontext.SegmentPrefix, Role: "system", Content: "[stable-prefix]", Prefix: true,
+	}}}
+	if got := systemMessageText(packet, in); got != "[stable-prefix]" {
+		t.Fatalf("systemMessageText(packet) = %q, want the persisted prefix", got)
 	}
 }

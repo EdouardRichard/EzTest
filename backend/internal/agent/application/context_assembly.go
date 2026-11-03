@@ -88,8 +88,15 @@ func (r *Runner) assembleContextWithKeepRecent(
 		AfterTokens:  contextPacketTokens(built.Packet),
 	}
 
+	// The runner appends the current user turn after the assembled packet, so
+	// the packet token count alone understates the model prompt. Task 80 moved
+	// the per-work-item task context into that turn: count it in the window
+	// decision, or a prompt pushed over the window by its task context would
+	// never trigger the proactive boundary. The packet bookkeeping stays
+	// packet-only; this is the same conservative estimate used for the budget.
+	userTokens := EstimateTokens(state.userContent)
 	if invalidation == agentcontext.InvalidationNone &&
-		float64(result.BeforeTokens) > threshold*float64(budget) {
+		float64(result.BeforeTokens+userTokens) > threshold*float64(budget) {
 		// The window is nearly full: this round is a declared boundary.
 		invalidation = agentcontext.InvalidationWindowFull
 	}
@@ -234,6 +241,18 @@ func contextPacketPrefix(packet agentcontext.ContextPacket) string {
 		}
 	}
 	return ""
+}
+
+// systemMessageText is the system message of one assembled round: the persisted
+// stable prefix, or the stable system content when the packet carries no prefix
+// (defensive fallback). Task 80: the per-work-item task context lives in the
+// user turn, so the fallback must not render the legacy systemContent (prompt +
+// task context) or the block would be sent twice.
+func systemMessageText(packet agentcontext.ContextPacket, in ContextInput) string {
+	if text := strings.TrimSpace(contextPacketPrefix(packet)); text != "" {
+		return text
+	}
+	return stableSystemContent(in)
 }
 
 // contextPacketTokens is the conservative local estimate of one packet.
