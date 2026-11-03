@@ -83,7 +83,7 @@ const frozenJobKinds = [
 const conversationJobCardKinds = ["chat.turn", "requirement.curate", "design.round"]
 
 // ---------------------------------------------------------------------------
-// events.md §18: ten 0.2.1 event types and their required payload fields.
+// events.md §18: thirteen 0.2.1 event types and their required payload fields.
 // ---------------------------------------------------------------------------
 const eventsSection = section(events, "## 18. 0.2.1", "\n## 19.")
 check(eventsSection.length > 0, "events.md has a §18 0.2.1 increment section")
@@ -92,6 +92,9 @@ const eventPayloads = {
   "version.stage_changed": ["from", "to", "reason", "stage_entered_at"],
   "plan.item_changed": ["plan_item_id", "phase", "status", "order"],
   "fact.recorded": ["fact_id", "kind", "key", "confidence", "source", "content_hash", "conflict"],
+  "requirement.deduped": ["kept_ids", "obsolete_ids"],
+  "requirement.merged": ["requirement_id", "source_requirement_ids"],
+  "requirement.obsoleted": ["requirement_id", "status", "reason"],
   "job.progress": ["job_id", "kind", "current", "total", "status"],
   "job.finished": ["job_id", "kind", "status", "result_ref"],
   "job.canceled": ["job_id", "kind", "status"],
@@ -160,7 +163,7 @@ check(
   /case_run_id[\s\S]{0,120}reason[\s\S]{0,120}(?:不重复|去重)/.test(eventsSection),
   "events.md documents case_run.blocked dedupe (same case_run+reason not repeated)",
 )
-check(eventsSection.includes("128") && eventsSection.includes("15"), "events.md 0.2.1 counts are 128 events / 15 audit actions")
+check(eventsSection.includes("131") && eventsSection.includes("19"), "events.md 0.2.1 counts are 131 events / 19 audit actions")
 check(/version:\{id\}[\s\S]{0,80}system/.test(eventsSection), "events.md documents 0.2.1 SSE channel scopes")
 for (const kind of conversationJobCardKinds) {
   check(
@@ -171,7 +174,15 @@ for (const kind of conversationJobCardKinds) {
 
 const auditSection18 = section(eventsSection, "### 18.3", "")
 check(auditSection18.length > 0, "events.md §18.3 lists the 0.2.1 audit actions")
-for (const action of ["knowledge.auto_approved", "job.canceled", "job.requeued"]) {
+for (const action of [
+  "knowledge.auto_approved",
+  "job.canceled",
+  "job.requeued",
+  "requirement.deleted",
+  "requirement.deduped",
+  "requirement.merged",
+  "requirement.obsoleted",
+]) {
   check(auditSection18.includes("`" + action + "`"), `events.md audit catalog contains ${action}`)
 }
 
@@ -237,6 +248,9 @@ const apiChecks = [
   ["/api/versions/{versionId}/jobs/{jobId}/retry", "post", "作业重试版本级别名"],
   ["/api/versions/{id}/context-packets/latest", "get", "最新上下文包（admin-only）"],
   ["/api/admin/llm/configs/{id}/models/{modelId}", "patch", "模型能力 PATCH"],
+  ["/api/versions/{id}/requirements/dedupe", "post", "需求草案去重"],
+  ["/api/versions/{id}/requirements/merge", "post", "需求草案合并"],
+  ["/api/versions/{id}/requirements/{rid}", "delete", "需求草案删除"],
 ]
 for (const [route, method, label] of apiChecks) {
   check(Boolean(openapiPaths.get(route)?.has(method)), `openapi ${method.toUpperCase()} ${route} (${label})`)
@@ -267,6 +281,10 @@ const schemaChecks = [
   "ContextPacketSegment",
   "UpdateLLMModelRequest",
   "UpdateLLMConfigRequest",
+  "RequirementDedupeResult",
+  "RequirementMergeRequest",
+  "RequirementMergeResult",
+  "RequirementDeleteRequest",
 ]
 for (const schema of schemaChecks) {
   check(new RegExp("^    " + schema + ":", "m").test(openapi), `openapi schema ${schema}`)
@@ -357,6 +375,33 @@ check(!/sha256:/.test(imageBlock), "openapi image part does not use the attachme
 check(
   /enum: \[job_card\][\s\S]{0,900}cancelable/.test(messagePartBlock),
   "openapi job_card part carries optional cancelable",
+)
+// Task 75: a terminal failed job card also carries the typed failure code and
+// the user-facing reason; both stay optional (not in the branch's required list).
+const jobCardBranch = (() => {
+  const start = messagePartBlock.indexOf("enum: [job_card]")
+  if (start < 0) return ""
+  const rest = messagePartBlock.slice(start)
+  const end = rest.indexOf("\n        - type: object")
+  return end < 0 ? rest : rest.slice(0, end)
+})()
+check(/code:/.test(jobCardBranch), "openapi job_card part carries optional code")
+check(/reason:/.test(jobCardBranch), "openapi job_card part carries optional reason")
+check(
+  /code:[\s\S]{0,160}maxLength:\s*64/.test(jobCardBranch),
+  "openapi job_card.code is bounded by MessageErrorCodeMax (64)",
+)
+check(
+  /reason:[\s\S]{0,160}maxLength:\s*2000/.test(jobCardBranch),
+  "openapi job_card.reason is bounded by MessageErrorMessageMax (2000)",
+)
+check(
+  /终态 failed/.test(jobCardBranch),
+  "openapi job_card.code/reason are documented as terminal-failed fields",
+)
+check(
+  !/required: \[[^\]]*\b(?:code|reason)\b/.test(jobCardBranch),
+  "openapi job_card.code/reason stay optional (absent from required)",
 )
 // job_card.kind accepts the 11 frozen job kinds and the three conversation work
 // types; every kind stays exact (no invented values, no dropped kind).
@@ -494,6 +539,9 @@ for (const operationId of [
   "retryVersionJob",
   "getLatestContextPacket",
   "updateLLMModel",
+  "dedupeRequirements",
+  "mergeRequirements",
+  "deleteRequirement",
 ]) {
   check(
     operationIds.filter((candidate) => candidate === operationId).length === 1,
@@ -577,6 +625,63 @@ check(/admin/i.test(contextPacketPath) && /403/.test(contextPacketPath), "openap
 const llmModelPatch = pathBlock("/api/admin/llm/configs/{id}/models/{modelId}")
 check(llmModelPatch.includes("patch:"), "openapi LLM model path has PATCH")
 check(llmModelPatch.includes("UpdateLLMModelRequest"), "openapi LLM model PATCH uses UpdateLLMModelRequest")
+
+// Task 83: draft-only requirement cleanup (dedupe/delete/merge) is mounted and
+// contractual. Routes stay additive on top of the frozen P1 requirement paths.
+const dedupePath = pathBlock("/api/versions/{id}/requirements/dedupe")
+const mergePath = pathBlock("/api/versions/{id}/requirements/merge")
+const requirementDetailPath = pathBlock("/api/versions/{id}/requirements/{rid}")
+check(dedupePath.includes("operationId: dedupeRequirements"), "openapi dedupe route operationId")
+check(dedupePath.includes("RequirementDedupeResult"), "openapi dedupe route returns RequirementDedupeResult")
+check(/draft/.test(dedupePath), "openapi dedupe route documents draft-only scanning")
+check(/404/.test(dedupePath), "openapi dedupe route documents unknown-version 404")
+check(mergePath.includes("operationId: mergeRequirements"), "openapi merge route operationId")
+check(
+  mergePath.includes("RequirementMergeRequest") && mergePath.includes("RequirementMergeResult"),
+  "openapi merge route uses RequirementMergeRequest/RequirementMergeResult",
+)
+check(/409[\s\S]{0,200}state_conflict/.test(mergePath), "openapi merge route documents confirmed 409 state_conflict")
+check(
+  /invalid_argument[\s\S]{0,200}source_requirement_ids/.test(mergePath),
+  "openapi merge route documents the source_requirement_ids 400 field",
+)
+check(requirementDetailPath.includes("operationId: deleteRequirement"), "openapi delete route operationId")
+check(
+  requirementDetailPath.includes("RequirementDeleteRequest"),
+  "openapi delete route accepts the optional RequirementDeleteRequest body",
+)
+check(
+  /status=obsolete/.test(requirementDetailPath) && /409[\s\S]{0,160}state_conflict/.test(requirementDetailPath),
+  "openapi delete route returns obsolete detail and documents confirmed 409 state_conflict",
+)
+
+const dedupeResult = schemaBlock("RequirementDedupeResult")
+check(
+  requiredOf(dedupeResult).includes("kept_ids") && requiredOf(dedupeResult).includes("obsolete_ids"),
+  "openapi RequirementDedupeResult requires kept_ids/obsolete_ids",
+)
+const mergeRequest = schemaBlock("RequirementMergeRequest")
+const mergeRequestRequired = requiredOf(mergeRequest)
+check(
+  mergeRequestRequired.includes("target_requirement_id") &&
+    mergeRequestRequired.includes("source_requirement_ids"),
+  "openapi RequirementMergeRequest requires target/source IDs",
+)
+check(
+  /source_requirement_ids:[\s\S]{0,120}minItems:\s*1/.test(mergeRequest) &&
+    /source_requirement_ids:[\s\S]{0,160}maxItems:\s*200/.test(mergeRequest),
+  "openapi RequirementMergeRequest bounds the source list (1..200)",
+)
+const mergeResult = schemaBlock("RequirementMergeResult")
+check(
+  requiredOf(mergeResult).includes("requirement") && requiredOf(mergeResult).includes("merged_ids"),
+  "openapi RequirementMergeResult requires requirement/merged_ids",
+)
+const deleteRequest = schemaBlock("RequirementDeleteRequest")
+check(
+  /reason:[\s\S]{0,120}maxLength:\s*2000/.test(deleteRequest),
+  "openapi RequirementDeleteRequest reason is bounded at 2000",
+)
 
 for (const needle of [
   ["openai_chat_completions", "canonical Chat Completions protocol"],
@@ -846,10 +951,10 @@ check(
 // contracts/README.md: 0.2.1 status line, without rewriting the P8 totals.
 // ---------------------------------------------------------------------------
 check(/0\.2\.1 契约状态/.test(readme), "contracts README has a 0.2.1 status line")
-for (const needle of ["179 paths", "219 operations", "277 schemas", "128 events", "draft: 0.2.1"]) {
+for (const needle of ["181 paths", "222 operations", "281 schemas", "131 events", "draft: 0.2.1"]) {
   check(readme.includes(needle), `contracts README 0.2.1 status contains ${needle}`)
 }
-check(/19 个 0\.2\.1 operation/.test(readme), "contracts README documents the 19 0.2.1 operations")
+check(/22 个 0\.2\.1 operation/.test(readme), "contracts README documents the 22 0.2.1 operations")
 check(
   readme.includes(`${openapiPaths.size} paths`) &&
     readme.includes(`${openapiOperationCount} operations`) &&
@@ -950,17 +1055,17 @@ check(
   "openapi context packet route notes it is not mounted until Task 48",
 )
 
-// The 19 documented operations are not all mounted: 4 reads are Task 62 and the
+// The 22 documented operations are not all mounted: 4 reads are Task 62 and the
 // GET job is 0.3-reserved.
 check(
   /Task 62[\s\S]{0,80}契约先行/.test(plain(openapi)) && /Task 48[\s\S]{0,80}挂载/.test(plain(openapi)),
-  "openapi qualifies the 19-operation list (Task 62 reads / Task 48 context packet)",
+  "openapi qualifies the 22-operation list (Task 62 reads / Task 48 context packet)",
 )
 check(
-  /19 个 0\.2\.1 operation[\s\S]{0,400}Task 62/.test(readme) &&
+  /22 个 0\.2\.1 operation[\s\S]{0,800}Task 62/.test(readme) &&
     readme.includes("0.3 预留") &&
     readme.includes("Task 48"),
-  "contracts README qualifies the 19 operations (Task 62 reads / 0.3 GET job / Task 48 packet)",
+  "contracts README qualifies the 22 operations (Task 62 reads / 0.3 GET job / Task 48 packet)",
 )
 
 // Cache-first context_packet persistence is pending Task 48; the runner still
@@ -1001,8 +1106,8 @@ const summary = {
   roles: declaredRoles.size,
   createdBy: declaredCreators.size,
 }
-check(summary.events === 10, `summary event count = 10 (got ${summary.events})`)
-check(summary.operations === 19, `summary operation count = 19 (got ${summary.operations})`)
+check(summary.events === 13, `summary event count = 13 (got ${summary.events})`)
+check(summary.operations === 22, `summary operation count = 22 (got ${summary.operations})`)
 check(summary.newTables === 3, `summary new table count = 3 (got ${summary.newTables})`)
 check(summary.alteredTables === 9, `summary altered table count = 9 (got ${summary.alteredTables})`)
 check(summary.kinds === 11, `summary work_item kind count = 11 (got ${summary.kinds})`)
