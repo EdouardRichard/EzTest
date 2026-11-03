@@ -39,15 +39,15 @@ describe("ChangePasswordDialog", () => {
     fireEvent.click(await screen.findByRole("button", { name: "保存新密码" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("请填写完整的密码信息")
 
-    await fill("admin123", "short", "short")
+    await fill("test-old-pass", "short", "short")
     fireEvent.click(screen.getByRole("button", { name: "保存新密码" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("新密码至少 8 个字符")
 
-    await fill("admin123", "newpass123", "different123")
+    await fill("test-old-pass", "newpass123", "different123")
     fireEvent.click(screen.getByRole("button", { name: "保存新密码" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("两次输入的新密码不一致")
 
-    await fill("admin123", "admin123", "admin123")
+    await fill("test-old-pass", "test-old-pass", "test-old-pass")
     fireEvent.click(screen.getByRole("button", { name: "保存新密码" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("新密码不能与旧密码相同")
 
@@ -56,11 +56,13 @@ describe("ChangePasswordDialog", () => {
 
   it("submits the old and new password and confirms success", async () => {
     render(<ChangePasswordDialog open onClose={onClose} />)
-    await fill("admin123", "newpass123", "newpass123")
+    await fill("test-old-pass", "newpass123", "newpass123")
 
     fireEvent.click(screen.getByRole("button", { name: "保存新密码" }))
 
-    await waitFor(() => expect(auth.changePassword).toHaveBeenCalledWith("admin123", "newpass123"))
+    await waitFor(() =>
+      expect(auth.changePassword).toHaveBeenCalledWith("test-old-pass", "newpass123"),
+    )
     expect(await screen.findByRole("status")).toHaveTextContent("密码已修改")
   })
 
