@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     S2 clarification acceptance for EzTest 0.2.1 (Task 88 small-input profile,
@@ -509,9 +509,10 @@ $baselineText
                                 }
                             }
                             $missingMarkers = @($markerIds | Where-Object { $extractedIds -notcontains $_ })
-                            $unexpectedIds = if ($isSmallInput) {
-                                @($extractedIds | Where-Object { $markerIds -notcontains $_ })
-                            } else { @() }
+                            $unexpectedIds = @()
+                            if ($isSmallInput) {
+                                $unexpectedIds = @($extractedIds | Where-Object { $markerIds -notcontains $_ })
+                            }
                             $v2Missing = @($v2Required | Where-Object { $extractedIds -notcontains $_ })
                             $markers = [pscustomobject]@{
                                 mode                 = $requirementProfile.Mode
@@ -536,7 +537,7 @@ $baselineText
                                 -Detail ("status=$(if ($null -ne $attachmentRow) { $attachmentRow.extraction_status } else { 'missing' }) extracted_bytes=$extractedSize message_link=$(if ($null -ne $attachmentRow) { $attachmentRow.conversation_message_id } else { 0 }) mode=$($requirementProfile.Mode)")
                             $markerPassed = ($markerIds.Count -gt 0 -and $missingMarkers.Count -eq 0)
                             if ($isSmallInput) {
-                                $markerPassed = $markerPassed -and $unexpectedIds.Count -eq 0
+                                $markerPassed = $markerPassed -and @($unexpectedIds).Count -eq 0
                             } else {
                                 $markerPassed = $markerPassed -and ($v2Required.Count -eq 0 -or $v2Missing.Count -eq 0)
                             }
