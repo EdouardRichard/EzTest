@@ -15,10 +15,12 @@ import (
 )
 
 // TestContractClaimForTeamsSelectsStageEntryItems pins Task 65's SQL claim
-// path: a dispatcher-created stage-entry row (kind <> ”) carries the product
-// team as its frozen claim default and is leased by ClaimWorkItemForTeams for
-// that team only. The legacy ClaimForTeams path still ignores kind rows, and a
-// foreign team cannot take the item.
+// path: a dispatcher-created stage-entry row (non-empty kind) carries the
+// product team as its frozen claim default and is leased by
+// ClaimWorkItemForTeams for that team only. The legacy ClaimForTeams path still
+// ignores kind rows, and a foreign team cannot take the item:
+//
+//	kind <> ''
 func TestContractClaimForTeamsSelectsStageEntryItems(t *testing.T) {
 	pool := testutil.NewDB(t)
 	repo := agentpg.NewWorkItemRepository(pool, newIDs(t))

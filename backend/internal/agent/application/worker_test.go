@@ -72,7 +72,9 @@ func (q *fakeWorkerQueue) ClaimForTeams(_ context.Context, _ string, teams []age
 
 // ClaimContract serves the 0.2.1 contract rows (kind != ""). The production
 // worker must use this claim path for them: ClaimForTeams only ever selects
-// legacy kind=” rows.
+// legacy rows where
+//
+//	kind=''
 func (q *fakeWorkerQueue) ClaimContract(_ context.Context, _ string, teams []agent.Team) (*agent.WorkItem, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -324,7 +326,11 @@ func TestWorkerDrainGateStopsNewClaims(t *testing.T) {
 // design.cases item (created through the dispatcher defaults) is claimed by the
 // agent worker through the contract claim, dispatched to the runner and
 // completed. Before the fix the item carried Team=ops/Type=kind and the legacy
-// team claim skipped it forever (kind <> ” rows are not claimable there).
+// team claim skipped it forever: rows with
+//
+//	kind <> ''
+//
+// are not claimable there.
 func TestStageEntryWorkItemClaimed(t *testing.T) {
 	params := agent.CreateWorkItemParams{
 		VersionID:      7,

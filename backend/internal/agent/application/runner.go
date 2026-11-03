@@ -2243,6 +2243,14 @@ const DesignRunMaxTokens = 200000
 // authoring floor in code, like the token budget: a focused case-author run
 // needs the read turn, the propose turn and the summary turn, and must not be
 // cut off by the generic chat-scale soft timeout.
+//
+// The envelope is profile-scoped, so it deliberately covers every design
+// profile. design_critic and data_planner remain seeded at the lighter
+// 4/120/300 (that seed is the admin-visible default), but they share the 200k
+// design token budget and can still face a full design.graph_read + submit
+// turn, so their runtime envelope is expanded to 16/600/900 as well. This is a
+// documented expansion, pinned by TestDesignBudgetExpandsCriticAndDataPlanner,
+// not an accidental override.
 const (
 	DesignRunMaxTurns       = 16
 	DesignRunMinSeconds     = 600

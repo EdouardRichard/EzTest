@@ -98,3 +98,45 @@ func TestDesignBudgetAllowsAllCaseAuthors(t *testing.T) {
 		t.Fatalf("declared item budget = %#v, want max_tokens/run_seconds/max_turns_fuse 50000/120/5", budget)
 	}
 }
+
+// TestDesignBudgetExpandsCriticAndDataPlanner makes the design floor's profile
+// scope explicit (Task 79 fix round). P2Profiles seeds design_critic and
+// data_planner at the lighter 4/120/300, but every design profile shares the
+// 200k design token budget and can face a full design.graph_read + submit turn.
+// The runner deliberately raises their runtime envelope to 16/600/900; the
+// seeded row remains the admin-visible default. Pinning the expansion here means
+// it is a documented envelope, not a silent override.
+func TestDesignBudgetExpandsCriticAndDataPlanner(t *testing.T) {
+	runner := &Runner{}
+	checks := []struct {
+		key      string
+		workType string
+	}{
+		{ProfileKeyDesignCritic, WorkTypeDesignCritic},
+		{ProfileKeyDataPlanner, WorkTypeDesignDataPlan},
+	}
+	for _, check := range checks {
+		profile := agent.AgentProfile{
+			Key:     check.key,
+			Budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
+		}
+		if got := runner.maxTurns(profile); got != DesignRunMaxTurns {
+			t.Fatalf("%s max turns = %d, want the expanded design floor %d", check.key, got, DesignRunMaxTurns)
+		}
+		if got := runner.softSeconds(profile); got != DesignRunMinSeconds {
+			t.Fatalf("%s soft seconds = %d, want the expanded design floor %d", check.key, got, DesignRunMinSeconds)
+		}
+		if got := runner.hardSeconds(profile); got != DesignRunMinHardSeconds {
+			t.Fatalf("%s hard seconds = %d, want the expanded design floor %d", check.key, got, DesignRunMinHardSeconds)
+		}
+		budget := runner.resourceBudget(agent.WorkItem{VersionID: 1, Type: check.workType}, profile)
+		if budget.MaxTokens != DesignRunMaxTokens {
+			t.Fatalf("%s/%s token budget = %d, want the design budget %d",
+				check.key, check.workType, budget.MaxTokens, DesignRunMaxTokens)
+		}
+		if budget.RunSeconds != DesignRunMinSeconds || budget.MaxTurnsFuse != DesignRunMaxTurns-1 {
+			t.Fatalf("%s/%s budget = %#v, want run_seconds %d and turn fuse %d",
+				check.key, check.workType, budget, DesignRunMinSeconds, DesignRunMaxTurns-1)
+		}
+	}
+}
