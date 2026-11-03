@@ -19,7 +19,7 @@ func (r *Repository) ReadCaseVersionsByIDs(ctx context.Context, versionID int64,
 		return summaries, nil
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT cv.id, cv.revision, cv.status, cv.title, cv.created_at, cc.confirmed_at
+		SELECT cv.id, cv.case_id, cv.revision, cv.status, cv.title, cv.created_at, cc.confirmed_at
 		FROM case_version cv
 		JOIN case_entity ce ON ce.id = cv.case_id
 		JOIN case_scenario s ON s.id = ce.scenario_id
@@ -34,7 +34,7 @@ func (r *Repository) ReadCaseVersionsByIDs(ctx context.Context, versionID int64,
 	for rows.Next() {
 		var summary design.CaseVersionSummary
 		if err := rows.Scan(
-			&summary.ID, &summary.Revision, &summary.Status, &summary.Title,
+			&summary.ID, &summary.CaseID, &summary.Revision, &summary.Status, &summary.Title,
 			&summary.CreatedAt, &summary.ConfirmedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan historical case version: %w", err)

@@ -51,8 +51,8 @@ func TestReadCaseVersionsByIDsReadsHistoricalRows(t *testing.T) {
 	repo := &fakeHistoryRepo{
 		versionID: 1001,
 		rows: map[int64]design.CaseVersionSummary{
-			5103: {ID: 5103, Revision: 2, Title: "Superseded checkout", Status: "superseded"},
-			5101: {ID: 5101, Revision: 1, Title: "Checkout", Status: "confirmed"},
+			5103: {ID: 5103, CaseID: 4103, Revision: 2, Title: "Superseded checkout", Status: "superseded"},
+			5101: {ID: 5101, CaseID: 4101, Revision: 1, Title: "Checkout", Status: "confirmed"},
 		},
 	}
 	service := newHistoryService(repo)
@@ -73,10 +73,11 @@ func TestReadCaseVersionsByIDsReadsHistoricalRows(t *testing.T) {
 	if len(views) != 2 {
 		t.Fatalf("views = %+v, want 2 rows (missing ids skipped)", views)
 	}
-	if views[0].ID != 5103 || views[0].Revision != 2 || views[0].Title != "Superseded checkout" || views[0].Status != "superseded" {
+	if views[0].ID != 5103 || views[0].CaseID != 4103 || views[0].Revision != 2 ||
+		views[0].Title != "Superseded checkout" || views[0].Status != "superseded" {
 		t.Errorf("superseded view = %+v", views[0])
 	}
-	if views[1].ID != 5101 || views[1].Status != "confirmed" || views[1].Title == "" {
+	if views[1].ID != 5101 || views[1].CaseID != 4101 || views[1].Status != "confirmed" || views[1].Title == "" {
 		t.Errorf("confirmed view = %+v", views[1])
 	}
 }

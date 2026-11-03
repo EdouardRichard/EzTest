@@ -113,6 +113,25 @@ describe("ResultsPanel", () => {
     expect(row("case-run-row-9301")).toHaveTextContent("通过")
   })
 
+  it("names why a superseded run was retired", () => {
+    const superseded: CaseRun = {
+      ...passedCaseRunFixture,
+      id: "9306",
+      title: "被取代的用例",
+      status: "superseded",
+      failure_class: "",
+      summary: {
+        ...passedCaseRunFixture.summary,
+        verdict_reason: "case_version_superseded",
+        terminal_cause: "case_version_superseded",
+      },
+    }
+    renderPanel({ caseRuns: [superseded] })
+
+    const reason = within(row("case-run-row-9306")).getByTestId("case-run-cause-9306")
+    expect(reason).toHaveTextContent("用例版本已被新版本取代")
+  })
+
   it("expands the selected case run into steps, assertions and evidence", () => {
     const onSelect = vi.fn()
     renderPanel({ selectedCaseRunId: "9302", detail: caseRunDetailFixture, onSelect })

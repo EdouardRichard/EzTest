@@ -615,6 +615,98 @@ func TestWaveReportCoverageShowsGaps(t *testing.T) {
 	})
 }
 
+// TestCoverageMatchesCaseResults pins that the coverage projection is derived
+// from the deterministic case results a report renders: the per-requirement
+// projection reconciles with the aggregate counts, the gap reasons and the
+// latest case_run status of every executable case version. The report narrative
+// guard consumes these facts, so they must stay authoritative (PO E2E Report B
+// claimed "no valid execution" for requirements whose cases passed).
+func TestCoverageMatchesCaseResults(t *testing.T) {
+	deps, _ := newReadModelFixture()
+	reader := NewReportDataReader(deps)
+	snapshot, err := reader.VersionSnapshot(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("VersionSnapshot: %v", err)
+	}
+	coverage := snapshot.Coverage
+	if coverage.RequirementsTotal != 1 || coverage.RequirementsCovered != 1 ||
+		coverage.CaseVersionsTotal != 2 || coverage.CaseVersionsCovered != 1 {
+		t.Fatalf("coverage = %+v, want the fixture's 1 requirement / 2 case versions / 1 covered", coverage)
+	}
+
+	// The latest run of 3002 passed (covered); the latest run of 3001 failed
+	// (a coverage gap). Neither 3001 nor 3002 has a "not run" gap.
+	latest := map[int64]string{}
+	order := map[int64]int64{}
+	for _, run := range snapshot.CaseRuns {
+		if run.CaseVersionID != 3001 && run.CaseVersionID != 3002 {
+			continue
+		}
+		if run.ID >= order[run.CaseVersionID] {
+			order[run.CaseVersionID] = run.ID
+			latest[run.CaseVersionID] = run.Status
+		}
+	}
+	if latest[3001] != "failed" || latest[3002] != "passed" {
+		t.Fatalf("latest executable run statuses = %+v, want 3001 failed / 3002 passed", latest)
+	}
+
+	want := delivery.RequirementCoverageSnapshot{
+		RequirementID:              101,
+		CaseVersionsTotal:          2,
+		CaseVersionsCovered:        1,
+		CaseVersionsFailedCoverage: 1,
+	}
+	if len(coverage.ByRequirement) != 1 || coverage.ByRequirement[0] != want {
+		t.Fatalf("per-requirement coverage = %+v, want %+v", coverage.ByRequirement, want)
+	}
+	row := coverage.ByRequirement[0]
+	if row.CaseVersionsCovered+row.CaseVersionsNotRun+row.CaseVersionsFailedCoverage != row.CaseVersionsTotal {
+		t.Fatalf("per-requirement coverage does not add up: %+v", row)
+	}
+
+	// The per-requirement rows reconcile with the aggregate projection and with
+	// the gap list the report renders.
+	var totals, covered, notRun, failedCoverage delivery.RequirementCoverageSnapshot
+	for _, row := range coverage.ByRequirement {
+		totals.CaseVersionsTotal += row.CaseVersionsTotal
+		covered.CaseVersionsCovered += row.CaseVersionsCovered
+		notRun.CaseVersionsNotRun += row.CaseVersionsNotRun
+		failedCoverage.CaseVersionsFailedCoverage += row.CaseVersionsFailedCoverage
+	}
+	gapNotRun, gapFailedCoverage := 0, 0
+	for _, gap := range coverage.Gaps {
+		switch gap.Reason {
+		case "execution_not_run":
+			gapNotRun++
+		case "execution_failed_coverage":
+			gapFailedCoverage++
+		default:
+			t.Fatalf("unexpected coverage gap reason %q", gap.Reason)
+		}
+	}
+	if totals.CaseVersionsTotal != coverage.CaseVersionsTotal ||
+		covered.CaseVersionsCovered != coverage.CaseVersionsCovered ||
+		notRun.CaseVersionsNotRun != gapNotRun ||
+		failedCoverage.CaseVersionsFailedCoverage != gapFailedCoverage {
+		t.Fatalf("coverage does not reconcile: totals=%+v gaps not_run=%d failed_coverage=%d aggregate=%+v",
+			totals, gapNotRun, gapFailedCoverage, coverage)
+	}
+	if gapNotRun+gapFailedCoverage != coverage.CaseVersionsTotal-coverage.CaseVersionsCovered {
+		t.Fatalf("coverage gaps = %d, want the %d uncovered case versions",
+			gapNotRun+gapFailedCoverage, coverage.CaseVersionsTotal-coverage.CaseVersionsCovered)
+	}
+
+	// A wave report exposes the same version-level projection (QA Q3).
+	wave, err := reader.WaveSnapshot(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("WaveSnapshot: %v", err)
+	}
+	if len(wave.Coverage.ByRequirement) != 1 || wave.Coverage.ByRequirement[0] != want {
+		t.Fatalf("wave per-requirement coverage = %+v, want %+v", wave.Coverage.ByRequirement, want)
+	}
+}
+
 func TestReportDataReaderCapsIssueList(t *testing.T) {
 	deps, issues := newReadModelFixture()
 	rows := make([]delivery.Issue, 0, delivery.MaxReportIssues+1)

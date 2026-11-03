@@ -29,6 +29,7 @@ type Recovery struct {
 	workQueue   WorkQueue
 	canceller   RunCanceller
 	executor    ExecutorControl
+	replanner   SupersededIntentReplanner
 	clock       Clock
 	events      EventPublisher
 	audit       AuditRecorder
@@ -53,6 +54,9 @@ type RecoveryDeps struct {
 	Audit       AuditRecorder
 	MaxAttempts int
 	ContextTTL  time.Duration
+	// Replanner is the Task 106 stale-intent re-plan (implemented by
+	// *IntentService). nil keeps the P3-only retire behavior.
+	Replanner SupersededIntentReplanner
 }
 
 // NewRecovery builds the recovery sweep.
@@ -76,6 +80,7 @@ func NewRecovery(deps RecoveryDeps) *Recovery {
 		workQueue:   deps.WorkQueue,
 		canceller:   deps.Canceller,
 		executor:    deps.Executor,
+		replanner:   deps.Replanner,
 		clock:       deps.Clock,
 		events:      deps.Events,
 		audit:       deps.Audit,
@@ -230,7 +235,10 @@ func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) erro
 }
 
 // recoverStale supersedes active intents whose case version left the
-// current+confirmed set (P3 §4.9).
+// current+confirmed set (P3 §4.9). Task 106: when the same logical case is
+// current+confirmed again as a new revision, its initial intent is enqueued so
+// a selected case is re-planned instead of silently dropped. A real case read
+// failure (not "no longer executable") is surfaced and never retires an intent.
 func (s *Recovery) recoverStale(ctx context.Context) error {
 	if s.cases == nil {
 		return nil
@@ -242,30 +250,25 @@ func (s *Recovery) recoverStale(ctx context.Context) error {
 	for _, intent := range intents {
 		if _, err := s.cases.GetCaseVersion(ctx, intent.VersionID, intent.CaseVersionID); err == nil {
 			continue
+		} else if !caseVersionNotExecutable(err) {
+			return mapExecutionError(err, "case version")
 		}
-		if changed, err := s.intents.Transition(ctx, intent.ID,
-			activeIntentStatuses, execution.IntentSuperseded); err != nil {
-			return mapExecutionError(err, "intent")
-		} else if changed {
-			s.supersedeIntentRuns(ctx, intent)
-			publishEvent(ctx, s.events, EventIntentSuperseded, intent.VersionID,
-				map[string]any{
-					"intent_id":       platformid.Format(intent.ID),
-					"case_version_id": platformid.Format(intent.CaseVersionID),
-				},
-				map[string]any{
-					"intent_id":       platformid.Format(intent.ID),
-					"case_version_id": platformid.Format(intent.CaseVersionID),
-					"reason":          "not_current_confirmed",
-				}, nil)
-			s.record(ctx, "execution.intent_superseded", execution.CaseRun{}, 0, map[string]any{"intent_id": platformid.Format(intent.ID)})
+		result, err := retireStaleIntent(ctx, s.intents, s.events, s.replanner, intent)
+		if err != nil {
+			return err
+		}
+		if result.Superseded {
+			s.supersedeIntentRuns(ctx, intent, result)
+			s.record(ctx, "execution.intent_superseded", execution.CaseRun{}, 0,
+				map[string]any{"intent_id": platformid.Format(intent.ID), "replanned": result.Replanned})
 		}
 	}
 	return nil
 }
 
-// supersedeIntentRuns retires the non-terminal case_runs of a superseded intent.
-func (s *Recovery) supersedeIntentRuns(ctx context.Context, intent execution.ExecutionIntent) {
+// supersedeIntentRuns retires the non-terminal case_runs of a superseded intent
+// and persists the supersede surface (reason/replacement) on each run.
+func (s *Recovery) supersedeIntentRuns(ctx context.Context, intent execution.ExecutionIntent, result SupersedeResult) {
 	wave, err := s.waves.GetActive(ctx, intent.VersionID)
 	if err != nil || wave == nil {
 		return
@@ -282,16 +285,8 @@ func (s *Recovery) supersedeIntentRuns(ctx context.Context, intent execution.Exe
 			s.canceller.CancelRun(run.ID)
 		}
 		s.closeRunContexts(ctx, run.ID)
-		_, _ = s.caseRuns.Transition(ctx, run.ID,
-			[]execution.CaseRunStatus{execution.CaseRunPending, execution.CaseRunRunning, execution.CaseRunPaused, execution.CaseRunInterrupted},
-			execution.CaseRunSuperseded, 0, "")
-		publishEvent(ctx, s.events, EventCaseRunFinished, intent.VersionID,
-			map[string]any{"wave_id": platformid.Format(wave.ID), "case_run_id": platformid.Format(run.ID)},
-			map[string]any{
-				"wave_id":     platformid.Format(wave.ID),
-				"case_run_id": platformid.Format(run.ID),
-				"status":      string(execution.CaseRunSuperseded),
-			}, nil)
+		_, _ = retireSupersededRun(ctx, s.caseRuns, s.events, wave.VersionID, run,
+			result.ReplacementCaseVersionID, result.Replanned)
 	}
 }
 

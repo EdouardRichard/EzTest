@@ -90,8 +90,10 @@ func (s *Scheduler) planVersion(ctx context.Context, versionID int64) error {
 // whose case version is still current+confirmed. A selected case that left the
 // executable set is superseded here, before any case_run is inserted (P3 §4.9
 // retires the intent; no run ever exists for it, so no attempts=0 terminal
-// placeholder is manufactured). A case read failure that is not "not found" is
-// surfaced instead of silently dropping a selected case.
+// placeholder is manufactured). Task 106 also auto-queues the same logical
+// case's replacement confirmed revision, and the superseded event carries the
+// reason/replacement so a selected case is never silently dropped. A case read
+// failure that is not "not found" is surfaced instead of retiring the intent.
 func (s *Scheduler) dispatchableIntents(ctx context.Context, versionID int64, open []execution.ExecutionIntent) ([]execution.ExecutionIntent, error) {
 	dispatchable := make([]execution.ExecutionIntent, 0, len(open))
 	for _, intent := range open {
@@ -99,27 +101,27 @@ func (s *Scheduler) dispatchableIntents(ctx context.Context, versionID int64, op
 			if !caseVersionNotExecutable(err) {
 				return nil, mapExecutionError(err, "case version")
 			}
-			changed, err := s.intents.Transition(ctx, intent.ID, activeIntentStatuses, execution.IntentSuperseded)
+			result, err := s.supersedeStaleIntent(ctx, intent)
 			if err != nil {
-				return nil, mapExecutionError(err, "intent")
+				return nil, err
 			}
-			if changed {
-				publishEvent(ctx, s.events, EventIntentSuperseded, versionID,
-					map[string]any{
-						"intent_id":       platformid.Format(intent.ID),
-						"case_version_id": platformid.Format(intent.CaseVersionID),
-					},
-					map[string]any{
-						"intent_id":       platformid.Format(intent.ID),
-						"case_version_id": platformid.Format(intent.CaseVersionID),
-						"reason":          "not_current_confirmed",
-					}, nil)
+			if result.ReplannedIntent != nil {
+				// Task 106: the same logical case was re-confirmed as a new
+				// revision; queue it in this wave instead of silently dropping
+				// the selected case.
+				dispatchable = append(dispatchable, *result.ReplannedIntent)
 			}
 			continue
 		}
 		dispatchable = append(dispatchable, intent)
 	}
 	return dispatchable, nil
+}
+
+// supersedeStaleIntent retires one no-longer-executable intent through the
+// injected re-planner (Task 106), falling back to the plain P3 §4.9 retire.
+func (s *Scheduler) supersedeStaleIntent(ctx context.Context, intent execution.ExecutionIntent) (SupersedeResult, error) {
+	return retireStaleIntent(ctx, s.intents, s.events, s.replanner, intent)
 }
 
 // caseVersionNotExecutable reports whether a case read error means "not a

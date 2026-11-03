@@ -530,8 +530,10 @@ func (s *fakeCaseRunStore) LatestByCaseVersions(_ context.Context, _ int64, case
 // ---- cross-context and infrastructure ports ----
 
 type fakeCaseReader struct {
-	mu    sync.Mutex
-	cases map[int64]execution.CaseSnapshot
+	mu           sync.Mutex
+	cases        map[int64]execution.CaseSnapshot
+	replacements map[int64]int64
+	labels       map[int64]CaseVersionLabel
 }
 
 func (r *fakeCaseReader) GetCaseVersion(_ context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, error) {
@@ -553,6 +555,35 @@ func (r *fakeCaseReader) ListExecutable(_ context.Context, versionID int64) ([]e
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].CaseVersionID < items[j].CaseVersionID })
 	return items, nil
+}
+
+// ResolveReplacement mirrors the design read used by the P3 re-plan: it maps a
+// historical case version to its replacement's snapshot when the fixture
+// declares one.
+func (r *fakeCaseReader) ResolveReplacement(_ context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	replacementID, ok := r.replacements[caseVersionID]
+	if !ok || replacementID <= 0 {
+		return execution.CaseSnapshot{}, false, nil
+	}
+	replacement, ok := r.cases[replacementID]
+	if !ok {
+		return execution.CaseSnapshot{}, false, nil
+	}
+	return replacement, true, nil
+}
+
+// CaseVersionLabel mirrors the design historical read used by the terminal-run
+// projection.
+func (r *fakeCaseReader) CaseVersionLabel(_ context.Context, versionID, caseVersionID int64) (CaseVersionLabel, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	label, ok := r.labels[caseVersionID]
+	if !ok {
+		return CaseVersionLabel{}, execution.ErrNotFound
+	}
+	return label, nil
 }
 
 type fakeVersionReader struct {
@@ -698,7 +729,7 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		intents:    newFakeIntentStore(),
 		waves:      newFakeWaveStore(),
 		runs:       newFakeCaseRunStore(),
-		cases:      &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}},
+		cases:      &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}, replacements: map[int64]int64{}, labels: map[int64]CaseVersionLabel{}},
 		versions:   &fakeVersionReader{bindings: map[int64]VersionBinding{}},
 		selections: &fakeBatchSelectionReader{found: true},
 		registry:   &fakeExecutorRegistry{},
@@ -735,6 +766,7 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		Quota:       domainQuota(3, 2, 1),
 		QuotaReader: f.quota,
 		Analyzer:    f.analysis,
+		Replanner:   f.intent,
 		IDs:         f.ids,
 		Clock:       f.clock,
 		Events:      f.events,

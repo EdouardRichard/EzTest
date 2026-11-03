@@ -1,10 +1,90 @@
 package httpapi
 
 import (
+	"context"
 	"testing"
 
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
+
+// historicalCaseReader serves the executable read as empty and resolves one
+// superseded case version through the historical label read.
+type historicalCaseReader struct {
+	label executionapp.CaseVersionLabel
+	err   error
+}
+
+func (historicalCaseReader) GetCaseVersion(context.Context, int64, int64) (execution.CaseSnapshot, error) {
+	return execution.CaseSnapshot{}, execution.ErrNotFound
+}
+
+func (historicalCaseReader) ListExecutable(context.Context, int64) ([]execution.CaseSnapshot, error) {
+	return nil, nil
+}
+
+func (historicalCaseReader) ResolveReplacement(context.Context, int64, int64) (execution.CaseSnapshot, bool, error) {
+	return execution.CaseSnapshot{}, false, nil
+}
+
+func (r historicalCaseReader) CaseVersionLabel(context.Context, int64, int64) (executionapp.CaseVersionLabel, error) {
+	if r.err != nil {
+		return executionapp.CaseVersionLabel{}, r.err
+	}
+	return r.label, nil
+}
+
+// TestCaseVersionProjectionResolvesSupersededRun pins the PO E2E F11 fix: a
+// case_run whose confirmed version was superseded no longer renders with an
+// empty case_id/title; the historical label read supplies the logical case and
+// title the row lost when the version left the executable set.
+func TestCaseVersionProjectionResolvesSupersededRun(t *testing.T) {
+	handler := New(Deps{Cases: historicalCaseReader{label: executionapp.CaseVersionLabel{
+		CaseID: 9001, CaseVersionID: 44, Title: "被取代的登录用例", Revision: 2, Status: "superseded",
+	}}})
+	snapshot, meta := handler.caseVersionProjection(context.Background(), 2001, 44)
+	if snapshot != nil {
+		t.Fatalf("snapshot = %+v, want nil for a superseded version", snapshot)
+	}
+	if meta.CaseID != "9001" || meta.Title != "被取代的登录用例" {
+		t.Fatalf("scene = %+v, want the historical case id/title", meta)
+	}
+}
+
+// TestCaseVersionProjectionKeepsExecutableReadFirst pins that the fallback never
+// overrides the current+confirmed snapshot used for execution.
+func TestCaseVersionProjectionKeepsExecutableReadFirst(t *testing.T) {
+	handler := New(Deps{Cases: executableCaseReader{snapshot: execution.CaseSnapshot{
+		CaseID: 9002, CaseVersionID: 45, Title: "当前用例",
+	}}})
+	snapshot, meta := handler.caseVersionProjection(context.Background(), 2001, 45)
+	if snapshot == nil || snapshot.CaseVersionID != 45 {
+		t.Fatalf("snapshot = %+v, want the executable read", snapshot)
+	}
+	if meta.CaseID != "9002" || meta.Title != "当前用例" {
+		t.Fatalf("meta = %+v", meta)
+	}
+}
+
+type executableCaseReader struct {
+	snapshot execution.CaseSnapshot
+}
+
+func (r executableCaseReader) GetCaseVersion(context.Context, int64, int64) (execution.CaseSnapshot, error) {
+	return r.snapshot, nil
+}
+
+func (executableCaseReader) ListExecutable(context.Context, int64) ([]execution.CaseSnapshot, error) {
+	return nil, nil
+}
+
+func (executableCaseReader) ResolveReplacement(context.Context, int64, int64) (execution.CaseSnapshot, bool, error) {
+	return execution.CaseSnapshot{}, false, nil
+}
+
+func (executableCaseReader) CaseVersionLabel(context.Context, int64, int64) (executionapp.CaseVersionLabel, error) {
+	return executionapp.CaseVersionLabel{}, execution.ErrNotFound
+}
 
 // TestEvidenceKindsIncludeVisualKinds pins the EvidenceView.kind API enum
 // (spec §4.2): the eight P3 kinds stay valid and the two P5 visual evidence

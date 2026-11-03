@@ -161,14 +161,15 @@ export function ResultsPanel({
                           {failureClassLabel(caseRun.failure_class)}
                         </span>
                       ) : null}
-                      {caseRun.status === "inconclusive" &&
-                      terminalCauseLabel(caseRun.summary.terminal_cause) !== null ? (
-                        <span
-                          data-testid={`case-run-cause-${caseRun.id}`}
-                          className="text-[11px] text-warning"
-                        >
-                          原因 {terminalCauseLabel(caseRun.summary.terminal_cause)}
-                        </span>
+                      {caseRun.status === "inconclusive" || caseRun.status === "superseded" ? (
+                        terminalCauseLabel(caseRun.summary.terminal_cause) !== null ? (
+                          <span
+                            data-testid={`case-run-cause-${caseRun.id}`}
+                            className="text-[11px] text-warning"
+                          >
+                            原因 {terminalCauseLabel(caseRun.summary.terminal_cause)}
+                          </span>
+                        ) : null
                       ) : null}
                       <span className="ml-auto text-[10px] text-muted-foreground">
                         {selected ? "收起" : "展开"}

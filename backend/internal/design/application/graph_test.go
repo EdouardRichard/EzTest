@@ -274,8 +274,15 @@ func TestCasesHaveExpected(t *testing.T) {
 	}
 }
 
-func TestProposeUpdatesConfirmedCaseAsNewDraft(t *testing.T) {
-	service, repo, _, _ := newGraphFixture(t)
+// TestConfirmedCaseVersionIsFrozen pins the Task 106 / PO E2E F4 rule: once a
+// case version is confirmed it is frozen. The design AI kept revising the same
+// logical cases after confirmation (v1..v5); each revision silently replaced
+// the confirmed current version with a draft, so 6 of the 12 batch-A cases were
+// superseded at dispatch and never ran. A changed proposal against a confirmed
+// current version must be a typed conflict that names the explicit redesign
+// path instead of inserting a silent replacement draft.
+func TestConfirmedCaseVersionIsFrozen(t *testing.T) {
+	service, repo, publisher, audit := newGraphFixture(t)
 	first, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
 	if err != nil {
 		t.Fatalf("first Propose: %v", err)
@@ -289,28 +296,48 @@ func TestProposeUpdatesConfirmedCaseAsNewDraft(t *testing.T) {
 			item.versions[index].Status = design.CaseStatusConfirmed
 		}
 	}
+	eventCount := len(publisher.events)
+	auditCount := len(audit.events)
 
 	updated := validProposeInput()
 	updated.Cases[0].Steps[0].Expected = "显示登录表单"
-	second, err := service.Propose(context.Background(), 1001, updated, 1, 1)
-	if err != nil {
-		t.Fatalf("second Propose: %v", err)
+	_, err = service.Propose(context.Background(), 1001, updated, 1, 1)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "confirmed_case_version_frozen" {
+		t.Fatalf("changed proposal against a confirmed version = %v, want confirmed_case_version_frozen", err)
 	}
-	if second.CaseVersionIDs[0] == first.CaseVersionIDs[0] {
-		t.Fatal("new draft revision reused the confirmed version id")
+	if apiErr.Status != 409 {
+		t.Fatalf("status = %d, want 409", apiErr.Status)
 	}
-	if repo.cases[first.CaseIDs[0]].entity.Status != design.CaseStatusDraft {
-		t.Fatalf("entity status = %q, want draft", repo.cases[first.CaseIDs[0]].entity.Status)
+	if apiErr.Details["case_id"] == "" || apiErr.Details["case_version_id"] == "" || apiErr.Details["next_action"] == "" {
+		t.Fatalf("error details = %#v, want case/version/next_action", apiErr.Details)
 	}
+
 	history := repo.versions(first.CaseIDs[0])
-	if len(history) != 2 {
-		t.Fatalf("history = %d versions", len(history))
+	if len(history) != 1 || history[0].ID != first.CaseVersionIDs[0] ||
+		history[0].Status != design.CaseStatusConfirmed {
+		t.Fatalf("confirmed history changed: %+v", history)
 	}
-	if history[0].Status != design.CaseStatusConfirmed {
-		t.Fatalf("old version status = %q, want confirmed", history[0].Status)
+	entity := repo.cases[first.CaseIDs[0]]
+	if entity.entity.Status != design.CaseStatusConfirmed || entity.current == nil ||
+		entity.current.ID != first.CaseVersionIDs[0] || entity.current.Revision != 1 {
+		t.Fatalf("confirmed current version replaced: entity=%q current=%+v", entity.entity.Status, entity.current)
 	}
-	if history[1].Status != design.CaseStatusDraft || history[1].Revision != 2 {
-		t.Fatalf("new version = %+v", history[1])
+	if len(publisher.events) != eventCount || len(audit.events) != auditCount {
+		t.Fatalf("frozen rejection published %v / audited %v", publisher.types()[eventCount:], audit.events[auditCount:])
+	}
+
+	// An identical proposal stays an idempotent no-op: it never inserts a new
+	// version and never fails the design AI's repeated graph pass.
+	same, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
+	if err != nil {
+		t.Fatalf("identical proposal against a confirmed version: %v", err)
+	}
+	if same.CaseVersionIDs[0] != first.CaseVersionIDs[0] {
+		t.Fatalf("identical proposal moved the confirmed current version: %+v", same)
+	}
+	if got := len(repo.versions(first.CaseIDs[0])); got != 1 {
+		t.Fatalf("history versions = %d, want 1", got)
 	}
 }
 

@@ -100,7 +100,7 @@ type reportDataReadTool struct{ svc *ReportService }
 func (t *reportDataReadTool) Name() string { return agenttools.ToolReportDataRead }
 
 func (t *reportDataReadTool) Description() string {
-	return "Read the deterministic summary of the current report task: IDs, section/status counts, coverage counts and truncation markers. Never returns titles, narrative text, evidence bytes/hashes, credentials or filesystem paths. Read-only."
+	return "Read the deterministic summary of the current report task: IDs, section/status counts, per-case result counters (status/steps/assertions/evidence), coverage counts including per-requirement coverage and gap reasons, and truncation markers. Never returns titles, narrative text, evidence bytes/hashes, credentials or filesystem paths. Read-only."
 }
 
 func (t *reportDataReadTool) Parameters() json.RawMessage { return reportToolSchema(nil) }
@@ -124,9 +124,18 @@ func (t *reportDataReadTool) Execute(ctx context.Context, scope agenttools.Scope
 	return reportSnapshotSummary(report, revision.Revision, snapshot), nil
 }
 
+// Report summary projection caps. The report writer only needs enough rows to
+// quote the deterministic facts; the full lists stay in the rendered report.
+const (
+	reportSummaryMaxCaseResults  = 60
+	reportSummaryMaxRequirements = 60
+)
+
 // reportSnapshotSummary renders the counts/IDs-only projection of one report
 // snapshot. Titles, summaries, narrative and evidence metadata deliberately do
-// not cross the tool boundary.
+// not cross the tool boundary. Case results are reduced to status/counters and
+// the coverage block carries the per-requirement facts so the narrative must
+// quote deterministic numbers instead of inventing them (PO E2E Report B).
 func reportSnapshotSummary(report delivery.Report, revision int32, snapshot delivery.ReportSnapshot) map[string]any {
 	requirementStatus := make(map[string]int)
 	for _, requirement := range snapshot.Requirements {
@@ -139,12 +148,28 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 	caseRunStatus := make(map[string]int)
 	caseRunFailureClass := make(map[string]int)
 	evidenceCount := 0
-	for _, run := range snapshot.CaseRuns {
+	caseResults := make([]map[string]any, 0, min(len(snapshot.CaseRuns), reportSummaryMaxCaseResults))
+	for index, run := range snapshot.CaseRuns {
 		caseRunStatus[run.Status]++
 		if run.FailureClass != "" {
 			caseRunFailureClass[run.FailureClass]++
 		}
 		evidenceCount += len(run.Evidence)
+		if index >= reportSummaryMaxCaseResults {
+			continue
+		}
+		result := map[string]any{
+			"case_version_id":        platformid.Format(run.CaseVersionID),
+			"requirement_id":         platformid.Format(run.RequirementID),
+			"status":                 run.Status,
+			"failure_class":          run.FailureClass,
+			"step_count":             run.StepCount,
+			"step_failed_count":      run.StepFailedCount,
+			"assertion_count":        run.AssertionCount,
+			"assertion_failed_count": run.AssertionFailedCount,
+			"evidence_count":         len(run.Evidence),
+		}
+		caseResults = append(caseResults, result)
 	}
 	issueStatus := make(map[string]int)
 	issueSeverity := make(map[string]int)
@@ -155,11 +180,26 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 		issueCategory[issue.Category]++
 	}
 	gaps := make([]map[string]any, 0, len(snapshot.Coverage.Gaps))
+	gapsByReason := make(map[string]int)
 	for _, gap := range snapshot.Coverage.Gaps {
+		gapsByReason[gap.Reason]++
 		gaps = append(gaps, map[string]any{
 			"requirement_id":  platformid.Format(gap.RequirementID),
 			"case_version_id": platformid.Format(gap.CaseVersionID),
 			"reason":          gap.Reason,
+		})
+	}
+	byRequirement := make([]map[string]any, 0, min(len(snapshot.Coverage.ByRequirement), reportSummaryMaxRequirements))
+	for index, row := range snapshot.Coverage.ByRequirement {
+		if index >= reportSummaryMaxRequirements {
+			break
+		}
+		byRequirement = append(byRequirement, map[string]any{
+			"requirement_id":                platformid.Format(row.RequirementID),
+			"case_versions_total":           row.CaseVersionsTotal,
+			"case_versions_covered":         row.CaseVersionsCovered,
+			"case_versions_not_run":         row.CaseVersionsNotRun,
+			"case_versions_failed_coverage": row.CaseVersionsFailedCoverage,
 		})
 	}
 	versionSUTIDs := make([]string, 0, len(snapshot.VersionSUTs))
@@ -204,6 +244,7 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"by_status":        caseRunStatus,
 			"by_failure_class": caseRunFailureClass,
 		},
+		"case_results": caseResults,
 		"issues": map[string]any{
 			"total":       len(snapshot.Issues),
 			"by_status":   issueStatus,
@@ -216,6 +257,8 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"case_versions_total":   snapshot.Coverage.CaseVersionsTotal,
 			"case_versions_covered": snapshot.Coverage.CaseVersionsCovered,
 			"gaps":                  gaps,
+			"gaps_by_reason":        gapsByReason,
+			"by_requirement":        byRequirement,
 		},
 		"version_sut_ids":    versionSUTIDs,
 		"evidence":           map[string]any{"count": evidenceCount},
@@ -294,6 +337,18 @@ func (t *reportNarrativeProposeTool) Execute(ctx context.Context, scope agenttoo
 			return nil, agenttools.Invalid("highlights", fmt.Sprintf("items must be at most %d characters", reportNarrativeHighlightMax))
 		}
 		highlights = append(highlights, highlight)
+	}
+	// Deterministic results are authoritative: reject a narrative that
+	// contradicts the snapshot so the writer can regenerate from
+	// report.data_read instead of publishing a false result story. Publish
+	// re-checks and falls back to deterministic text as the last line of defense.
+	snapshot, err := t.svc.snapshotFor(ctx, report)
+	if err != nil {
+		return nil, mapReportToolInternal(err)
+	}
+	if err := validateReportNarrative(snapshot, summary); err != nil {
+		return nil, agenttools.Invalid("summary_markdown",
+			err.Error()+"; 请逐字引用 report.data_read 的 coverage（含 by_requirement、gaps_by_reason）与 case_results 后重写")
 	}
 	stageReportNarrative(ReportNarrativeDraft{
 		ReportID:        report.ID,

@@ -293,6 +293,44 @@ func (r *DesignCaseReader) ListExecutable(ctx context.Context, versionID int64) 
 	return snapshots, nil
 }
 
+// ResolveReplacement resolves the same logical case's current+confirmed version
+// through the design historical read (Task 106). It is the execution re-plan
+// input: a stale intent's confirmed version was replaced by a re-confirmed
+// revision, so the selected case can be queued again instead of silently
+// dropped.
+func (r *DesignCaseReader) ResolveReplacement(ctx context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, bool, error) {
+	view, found, err := r.graph.ReplacementCaseVersion(ctx, versionID, caseVersionID)
+	if err != nil {
+		return execution.CaseSnapshot{}, false, err
+	}
+	if !found {
+		return execution.CaseSnapshot{}, false, nil
+	}
+	return mapExecutableCase(view), true, nil
+}
+
+// CaseVersionLabel resolves the display labels of any case version of the
+// version, including superseded/stale history (Task 106 / PO E2E F11). It is
+// the fallback for terminal case_runs whose version left the executable set, so
+// the UI/report row keeps its case id and title.
+func (r *DesignCaseReader) CaseVersionLabel(ctx context.Context, versionID, caseVersionID int64) (executionapp.CaseVersionLabel, error) {
+	views, err := r.graph.ReadCaseVersionsByIDs(ctx, versionID, []int64{caseVersionID})
+	if err != nil {
+		return executionapp.CaseVersionLabel{}, err
+	}
+	if len(views) == 0 {
+		return executionapp.CaseVersionLabel{}, execution.ErrNotFound
+	}
+	view := views[0]
+	return executionapp.CaseVersionLabel{
+		CaseID:        view.CaseID,
+		CaseVersionID: view.ID,
+		Title:         view.Title,
+		Revision:      int(view.Revision),
+		Status:        view.Status,
+	}, nil
+}
+
 // mapExecutableCase maps a design executable case to the execution snapshot and
 // resolves the P2 target inheritance: case_step/case_assertion
 // target_version_sut_id is nullable and empty inherits

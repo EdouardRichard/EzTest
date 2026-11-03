@@ -1215,6 +1215,7 @@ func main() {
 		Quota:       execution.QuotaFromSettings(3, 2, 1),
 		QuotaReader: executionQuotaReader{caseRuns: executionRepo.CaseRuns, intents: executionRepo.Intents},
 		Analyzer:    executionAnalysis,
+		Replanner:   executionIntents,
 		IDs:         ids,
 		Clock:       clk,
 		Events:      eventSvc,
@@ -1240,6 +1241,7 @@ func main() {
 		Audit:       auditSvc,
 		MaxAttempts: execution.DefaultMaxDispatchAttempts,
 		ContextTTL:  300 * time.Second,
+		Replanner:   executionIntents,
 	})
 	executionHandler := executionhttp.New(executionhttp.Deps{
 		Intents:       executionRepo.Intents,

@@ -222,13 +222,8 @@ func (h *Handler) ListIntents(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]IntentView, 0, len(intents))
 	for _, intent := range intents {
-		snapshot := h.caseSnapshot(ctx, versionID, intent.CaseVersionID)
-		caseID, title := "", ""
-		if snapshot != nil {
-			caseID = platformid.Format(snapshot.CaseID)
-			title = snapshot.Title
-		}
-		items = append(items, toIntentView(intent, caseID, title))
+		_, meta := h.caseVersionProjection(ctx, versionID, intent.CaseVersionID)
+		items = append(items, toIntentView(intent, meta.CaseID, meta.Title))
 	}
 	httpx.List(w, http.StatusOK, items, nextCursor(hasMore, len(items), lastIntentID(intents)), hasMore)
 }
@@ -279,13 +274,8 @@ func (h *Handler) CreateIntent(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	snapshot := h.caseSnapshot(ctx, versionID, intent.CaseVersionID)
-	caseID, title := "", ""
-	if snapshot != nil {
-		caseID = platformid.Format(snapshot.CaseID)
-		title = snapshot.Title
-	}
-	httpx.JSON(w, http.StatusCreated, toIntentView(intent, caseID, title))
+	_, meta := h.caseVersionProjection(ctx, versionID, intent.CaseVersionID)
+	httpx.JSON(w, http.StatusCreated, toIntentView(intent, meta.CaseID, meta.Title))
 }
 
 // CancelIntent POST /api/versions/{id}/execution/intents/{intentId}/cancel.
@@ -341,13 +331,8 @@ func (h *Handler) CancelIntent(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, mapRepoError(err, "intent"))
 		return
 	}
-	snapshot := h.caseSnapshot(ctx, versionID, intent.CaseVersionID)
-	caseID, title := "", ""
-	if snapshot != nil {
-		caseID = platformid.Format(snapshot.CaseID)
-		title = snapshot.Title
-	}
-	httpx.JSON(w, http.StatusOK, toIntentView(intent, caseID, title))
+	_, meta := h.caseVersionProjection(ctx, versionID, intent.CaseVersionID)
+	httpx.JSON(w, http.StatusOK, toIntentView(intent, meta.CaseID, meta.Title))
 }
 
 /* ----------------------------------- waves --------------------------------- */
@@ -1098,14 +1083,38 @@ func (h *Handler) caseSnapshot(ctx context.Context, versionID, caseVersionID int
 	return &snapshot
 }
 
-// caseRunView projects one case_run with its current+confirmed case metadata
-// (the intent carries the version_sut set).
-func (h *Handler) caseRunView(ctx context.Context, versionID int64, run execution.CaseRun) (CaseRunView, error) {
+// caseVersionProjection resolves one case version for display. The executable
+// read wins for current+confirmed versions; terminal/process rows whose version
+// left the executable set (superseded/stale) fall back to the design historical
+// label read, so the API/UI/report row keeps its case id and title instead of
+// rendering anonymously (PO E2E F11).
+func (h *Handler) caseVersionProjection(ctx context.Context, versionID, caseVersionID int64) (*execution.CaseSnapshot, caseMeta) {
+	if snapshot := h.caseSnapshot(ctx, versionID, caseVersionID); snapshot != nil {
+		return snapshot, caseMeta{
+			CaseID: platformid.Format(snapshot.CaseID),
+			Title:  snapshot.Title,
+		}
+	}
 	meta := caseMeta{}
+	if h.deps.Cases == nil {
+		return nil, meta
+	}
+	if label, err := h.deps.Cases.CaseVersionLabel(ctx, versionID, caseVersionID); err == nil {
+		if label.CaseID > 0 {
+			meta.CaseID = platformid.Format(label.CaseID)
+		}
+		meta.Title = label.Title
+	}
+	return nil, meta
+}
+
+// caseRunView projects one case_run with its display case metadata: the
+// executable read for current versions and the historical label read for
+// superseded/stale process rows (the intent carries the version_sut set).
+func (h *Handler) caseRunView(ctx context.Context, versionID int64, run execution.CaseRun) (CaseRunView, error) {
+	snapshot, meta := h.caseVersionProjection(ctx, versionID, run.CaseVersionID)
 	var versionSUTIDs []int64
-	if snapshot := h.caseSnapshot(ctx, versionID, run.CaseVersionID); snapshot != nil {
-		meta.CaseID = platformid.Format(snapshot.CaseID)
-		meta.Title = snapshot.Title
+	if snapshot != nil {
 		versionSUTIDs = snapshot.VersionSUTIDs
 	}
 	intent, err := h.deps.Intents.Get(ctx, run.IntentID)
@@ -1138,11 +1147,9 @@ func (h *Handler) caseRunViews(ctx context.Context, versionID int64, runs []exec
 			}
 			intents[run.IntentID] = intent
 		}
-		meta := caseMeta{}
+		snapshot, meta := h.caseVersionProjection(ctx, versionID, run.CaseVersionID)
 		var versionSUTIDs []int64
-		if snapshot := h.caseSnapshot(ctx, versionID, run.CaseVersionID); snapshot != nil {
-			meta.CaseID = platformid.Format(snapshot.CaseID)
-			meta.Title = snapshot.Title
+		if snapshot != nil {
 			versionSUTIDs = snapshot.VersionSUTIDs
 		}
 		if intent != nil && len(versionSUTIDs) == 0 {

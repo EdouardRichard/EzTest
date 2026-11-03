@@ -285,7 +285,7 @@ func (s *IntentService) ensureInitialIntents(
 			return created, mapExecutionError(err, "intent")
 		}
 		created++
-		s.publishCreated(ctx, intent, 0)
+		s.publishCreated(ctx, intent, 0, 0)
 	}
 	return created, nil
 }
@@ -354,7 +354,7 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 		}
 		return execution.ExecutionIntent{}, mapExecutionError(err, "intent")
 	}
-	s.publishCreated(ctx, intent, actorID)
+	s.publishCreated(ctx, intent, actorID, 0)
 	return intent, nil
 }
 
@@ -424,20 +424,25 @@ func (s *IntentService) createIntent(ctx context.Context, intent execution.Execu
 	return platform.StateConflict("the version is being closed; retry creating the execution intent")
 }
 
-func (s *IntentService) publishCreated(ctx context.Context, intent execution.ExecutionIntent, actorID int64) {
+func (s *IntentService) publishCreated(ctx context.Context, intent execution.ExecutionIntent, actorID int64, replannedFromCaseVersionID int64) {
 	versionRef := platformid.Format(intent.VersionID)
+	payload := map[string]any{
+		"intent_id":       platformid.Format(intent.ID),
+		"case_version_id": platformid.Format(intent.CaseVersionID),
+		"purpose":         string(intent.Purpose),
+		"version_sut_ids": idsToStrings(intent.VersionSUTIDs),
+		"version_id":      versionRef,
+	}
+	if replannedFromCaseVersionID > 0 {
+		payload["replanned_from_case_version_id"] = platformid.Format(replannedFromCaseVersionID)
+		payload["reason"] = SupersedeReasonCaseVersion
+	}
 	publishEvent(ctx, s.events, EventIntentCreated, intent.VersionID,
 		map[string]any{
 			"intent_id":       platformid.Format(intent.ID),
 			"case_version_id": platformid.Format(intent.CaseVersionID),
 		},
-		map[string]any{
-			"intent_id":       platformid.Format(intent.ID),
-			"case_version_id": platformid.Format(intent.CaseVersionID),
-			"purpose":         string(intent.Purpose),
-			"version_sut_ids": idsToStrings(intent.VersionSUTIDs),
-			"version_id":      versionRef,
-		},
+		payload,
 		actorPtr(actorID))
 	s.recordAudit(ctx, "execution.intent_created", intent, actorID)
 }

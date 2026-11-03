@@ -223,13 +223,17 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 		}
 	}
 
-	if blockedStep != nil || run.Status == execution.CaseRunBlocked {
-		if status, class, overridden := execution.ApplyVisualOutcome(execution.CaseRunBlocked, execution.FailureClassBlocked, summary, assertions); status != execution.CaseRunBlocked {
-			return status, class, overridden
-		}
-		summary.VerdictReason = execution.VerdictReasonBlocked
-		return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
-	}
+	// Recorded application evidence is authoritative over a blocked state (Task
+	// 107, PO trap E2E FR-113): the run observed a missing like control/count,
+	// missing like fields and a 404 like endpoint, recorded one failed ui
+	// assertion and 14 evidence rows, yet a later blocked step used to rewrite
+	// the whole run to blocked and drop the issue candidate. A blocked later
+	// step only says the remaining steps could not run; it does not erase the
+	// product deviation already observed. The failed assertion keeps the
+	// Aggregate precedence (assertions are authoritative); the observed
+	// requirement deviation deliberately outranks blocked here because the
+	// analysis fallback is the deterministic source of truth for the report and
+	// P4 issue projection, and there the recorded product deviation must win.
 	if failedAssertion != nil {
 		class := execution.FailureClassApplication
 		if run.FailureClass == execution.FailureClassAutomation {
@@ -238,28 +242,26 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 		summary.VerdictReason = execution.VerdictReasonAssertionFailed
 		return execution.CaseRunFailed, class, summary
 	}
+	if failedStep != nil && execution.FailedStepShowsRequirementDeviation(*failedStep) {
+		// A blocked run whose step already recorded an observed product
+		// deviation is an application failure; the blocked steps only explain
+		// why the remaining steps could not run. Normalize the class for the
+		// shared failed-step mapping, which treats blocked as a non-application
+		// agent class.
+		if run.FailureClass == execution.FailureClassBlocked {
+			run.FailureClass = execution.FailureClassApplication
+		}
+		return failedStepResult(run, *failedStep, summary, assertions)
+	}
+	if blockedStep != nil || run.Status == execution.CaseRunBlocked {
+		if status, class, overridden := execution.ApplyVisualOutcome(execution.CaseRunBlocked, execution.FailureClassBlocked, summary, assertions); status != execution.CaseRunBlocked {
+			return status, class, overridden
+		}
+		summary.VerdictReason = execution.VerdictReasonBlocked
+		return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
+	}
 	if failedStep != nil {
-		class := execution.FailureClassAutomation
-		// A failed step that recorded an observed product behavior (and no
-		// automation/tool error) is a requirement deviation, not an automation
-		// failure (QA Q1). The deterministic fallback must not downgrade it;
-		// an environment/model/timeout/unknown class is a separate agent-level
-		// failure and is preserved.
-		switch run.FailureClass {
-		case "", execution.FailureClassAutomation, execution.FailureClassApplication:
-			if execution.FailedStepShowsRequirementDeviation(*failedStep) {
-				class = execution.FailureClassApplication
-			}
-		default:
-			if run.FailureClass.Valid() {
-				class = run.FailureClass
-			}
-		}
-		if status, overriddenClass, overridden := execution.ApplyVisualOutcome(execution.CaseRunFailed, class, summary, assertions); status != execution.CaseRunFailed {
-			return status, overriddenClass, overridden
-		}
-		summary.VerdictReason = execution.VerdictReasonStepFailed
-		return execution.CaseRunFailed, class, summary
+		return failedStepResult(run, *failedStep, summary, assertions)
 	}
 	if run.Status == execution.CaseRunInconclusive || run.Status == execution.CaseRunFailed {
 		// No failing result: a claimed application failure has no evidence and
@@ -276,6 +278,30 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 	}
 	summary.VerdictReason = execution.VerdictReasonIncomplete
 	return execution.CaseRunInconclusive, "", summary
+}
+
+// failedStepResult maps one failed step onto the deterministic verdict. A
+// failed step that recorded an observed product behavior (and no
+// automation/tool error) is a requirement deviation, not an automation failure
+// (QA Q1). An environment/model/timeout/unknown class is a separate agent-level
+// failure and is preserved.
+func failedStepResult(run execution.CaseRun, step execution.StepResult, summary execution.CaseRunSummary, assertions []execution.AssertionResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
+	class := execution.FailureClassAutomation
+	switch run.FailureClass {
+	case "", execution.FailureClassAutomation, execution.FailureClassApplication:
+		if execution.FailedStepShowsRequirementDeviation(step) {
+			class = execution.FailureClassApplication
+		}
+	default:
+		if run.FailureClass.Valid() {
+			class = run.FailureClass
+		}
+	}
+	if status, overriddenClass, overridden := execution.ApplyVisualOutcome(execution.CaseRunFailed, class, summary, assertions); status != execution.CaseRunFailed {
+		return status, overriddenClass, overridden
+	}
+	summary.VerdictReason = execution.VerdictReasonStepFailed
+	return execution.CaseRunFailed, class, summary
 }
 
 // emitFailureCandidate publishes the application failure candidate event and

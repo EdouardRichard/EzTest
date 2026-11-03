@@ -168,6 +168,9 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   token_budget: "Token 预算用尽",
   time_budget: "运行时间用尽",
   agent_stopped: "Agent 提前结束（未提交结论）",
+  // P7 Task 106: the confirmed case version was superseded before the run
+  // started. The replacement (when present) is auto-requeued.
+  case_version_superseded: "用例版本已被新版本取代",
 }
 
 export function terminalCauseLabel(value: string | undefined): string | null {

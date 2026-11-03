@@ -516,6 +516,14 @@ func (f *fakeExecutionCaseReader) ListExecutable(context.Context, int64) ([]exec
 	return nil, nil
 }
 
+func (f *fakeExecutionCaseReader) ResolveReplacement(context.Context, int64, int64) (execution.CaseSnapshot, bool, error) {
+	return execution.CaseSnapshot{}, false, nil
+}
+
+func (f *fakeExecutionCaseReader) CaseVersionLabel(context.Context, int64, int64) (executionapp.CaseVersionLabel, error) {
+	return executionapp.CaseVersionLabel{}, execution.ErrNotFound
+}
+
 type fakeBindingResolver struct {
 	bindings []execution.SUTBinding
 	err      error

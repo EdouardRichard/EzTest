@@ -206,10 +206,14 @@ type SUTCountsSnapshot struct {
 // CaseRunSnapshot is one case_run projection of a report with its failure
 // position, step/assertion counters and evidence metadata (spec §6.1).
 type CaseRunSnapshot struct {
-	ID                   int64
-	VersionID            int64
-	WaveID               int64
-	CaseVersionID        int64
+	ID            int64
+	VersionID     int64
+	WaveID        int64
+	CaseVersionID int64
+	// RequirementID is the design requirement the case version belongs to. It
+	// connects a case result with the per-requirement coverage projection and
+	// is derived metadata: it is not part of the canonical fingerprint payload.
+	RequirementID        int64
 	CaseTitle            string
 	VersionSUTID         *int64
 	VersionSUTIDs        []int64
@@ -279,6 +283,26 @@ type CoverageSnapshot struct {
 	CaseVersionsTotal   int
 	CaseVersionsCovered int
 	Gaps                []CoverageGapSnapshot
+	// ByRequirement is the per-requirement projection of the same executable
+	// case versions and latest runs (see RequirementCoverageSnapshot). It is
+	// derived metadata: the canonical fingerprint already covers the case
+	// versions, their latest runs and the gaps, so this field is deliberately
+	// absent from the fingerprint payload. Report narrative validation uses it
+	// to prove statements such as "no valid execution" wrong; the report writer
+	// tool exposes its counts so the model quotes instead of inventing them.
+	ByRequirement []RequirementCoverageSnapshot
+}
+
+// RequirementCoverageSnapshot is the deterministic coverage of one requirement,
+// derived strictly from its executable case versions and their latest case_run
+// statuses. CaseVersionsTotal always equals the sum of the three outcome
+// counters.
+type RequirementCoverageSnapshot struct {
+	RequirementID              int64
+	CaseVersionsTotal          int
+	CaseVersionsCovered        int
+	CaseVersionsNotRun         int
+	CaseVersionsFailedCoverage int
 }
 
 // CoverageGapSnapshot is one uncovered case version.

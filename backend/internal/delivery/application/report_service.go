@@ -405,6 +405,12 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 	snapshot.ReportRevision = revision
 	snapshot.InputFingerprint = fingerprint
 
+	// Deterministic case/assertion/coverage results are authoritative. A
+	// model-proposed narrative that contradicts them is replaced by the
+	// server-generated deterministic summary, so this revision can never render
+	// a "no valid execution" story while its results table shows passed runs.
+	narrative = reportNarrativeForSnapshot(snapshot, narrative)
+
 	html, err := s.renderer.Render(ctx, snapshot, narrative, s.sections)
 	if err != nil {
 		err = fmt.Errorf("render report %d revision %d: %w", reportID, revision, err)

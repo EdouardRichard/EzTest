@@ -48,6 +48,7 @@ type Scheduler struct {
 	quota       execution.Quota
 	quotaReader QuotaReader
 	analyzer    WaveAnalyzer
+	replanner   SupersededIntentReplanner
 	ids         IDGenerator
 	clock       Clock
 	events      EventPublisher
@@ -80,6 +81,9 @@ type SchedulerDeps struct {
 	Events      EventPublisher
 	Instance    string
 	LeaseTTL    time.Duration
+	// Replanner is the Task 106 stale-intent re-plan (implemented by
+	// *IntentService). nil keeps the P3-only retire behavior.
+	Replanner SupersededIntentReplanner
 }
 
 // NewScheduler builds the scheduler.
@@ -106,6 +110,7 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		quota:       quota,
 		quotaReader: deps.QuotaReader,
 		analyzer:    deps.Analyzer,
+		replanner:   deps.Replanner,
 		ids:         deps.IDs,
 		clock:       deps.Clock,
 		events:      deps.Events,
@@ -245,34 +250,22 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		}
 		snapshot, err := s.cases.GetCaseVersion(ctx, wave.VersionID, run.CaseVersionID)
 		if err != nil {
+			if !caseVersionNotExecutable(err) {
+				return mapExecutionError(err, "case version")
+			}
 			// The case left the current+confirmed set between planning and
 			// dispatch: retire the run and intent, never execute stale cases.
-			if _, transitionErr := s.caseRuns.Transition(ctx, run.ID,
-				[]execution.CaseRunStatus{execution.CaseRunPending}, execution.CaseRunSuperseded, 0, ""); transitionErr != nil {
-				return mapExecutionError(transitionErr, "case run")
+			// Task 106 also re-queues the same logical case's replacement
+			// confirmed revision and persists the supersede reason on the run so
+			// the drop is visible in the wave/UI/report.
+			result, err := s.supersedeStaleIntent(ctx, intent)
+			if err != nil {
+				return err
 			}
-			publishEvent(ctx, s.events, EventCaseRunFinished, wave.VersionID,
-				map[string]any{"case_run_id": platformid.Format(run.ID), "intent_id": platformid.Format(intent.ID)},
-				map[string]any{
-					"case_run_id": platformid.Format(run.ID),
-					"wave_id":     platformid.Format(wave.ID),
-					"status":      string(execution.CaseRunSuperseded),
-					"reason":      "not_current_confirmed",
-				}, nil)
-			if _, transitionErr := s.intents.Transition(ctx, intent.ID,
-				activeIntentStatuses, execution.IntentSuperseded); transitionErr != nil {
-				return mapExecutionError(transitionErr, "intent")
+			if _, err := retireSupersededRun(ctx, s.caseRuns, s.events, wave.VersionID, run,
+				result.ReplacementCaseVersionID, result.Replanned); err != nil {
+				return err
 			}
-			publishEvent(ctx, s.events, EventIntentSuperseded, wave.VersionID,
-				map[string]any{
-					"intent_id":       platformid.Format(intent.ID),
-					"case_version_id": platformid.Format(intent.CaseVersionID),
-				},
-				map[string]any{
-					"intent_id":       platformid.Format(intent.ID),
-					"case_version_id": platformid.Format(intent.CaseVersionID),
-					"reason":          "not_current_confirmed",
-				}, nil)
 			continue
 		}
 		sutIDs := intent.VersionSUTIDs

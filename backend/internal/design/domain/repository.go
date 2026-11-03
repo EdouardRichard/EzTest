@@ -44,7 +44,11 @@ type CaseWithCurrent struct {
 
 // CaseVersionSummary is one row of the case version history.
 type CaseVersionSummary struct {
-	ID          int64
+	ID int64
+	// CaseID is the logical case that owns the version. It lets the execution
+	// re-plan path resolve the same case's current+confirmed replacement even
+	// when the historical version is superseded/stale (Task 106).
+	CaseID      int64
 	Revision    int
 	Status      string
 	Title       string

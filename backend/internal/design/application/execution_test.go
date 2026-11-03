@@ -105,3 +105,46 @@ func TestListExecutableRejectsInvalidVersion(t *testing.T) {
 		t.Fatal("missing version id must be rejected")
 	}
 }
+
+// TestReplacementCaseVersionResolvesSameLogicalCase pins the Task 106 re-plan
+// read: execution holds an intent for a confirmed case version that a later
+// design/requirement change invalidated. The replacement is the current
+// confirmed version of the same logical case, not an unrelated case version.
+func TestReplacementCaseVersionResolvesSameLogicalCase(t *testing.T) {
+	repo := newFakeRepo()
+	repo.caseVersionSummaries = []design.CaseVersionSummary{
+		{ID: 7004, CaseID: 7001, Revision: 1, Status: design.CaseStatusStale, Title: "旧版本"},
+	}
+	replacement := executableCaseFixture()
+	replacement.Version.ID = 7010
+	replacement.Version.Revision = 2
+	otherCase := executableCaseFixture()
+	otherCase.CaseID = 7003
+	otherCase.Version.ID = 7011
+	otherCase.Version.CaseID = 7003
+	repo.executableList = []design.ExecutableCase{otherCase, replacement}
+	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), nil, nil, &fakeTeamRoom{})
+
+	view, found, err := service.ReplacementCaseVersion(context.Background(), 1001, 7004)
+	if err != nil {
+		t.Fatalf("ReplacementCaseVersion: %v", err)
+	}
+	if !found || view.CaseVersionID != 7010 || view.CaseID != 7001 || view.Title == "" {
+		t.Fatalf("replacement = %+v found=%v, want case 7001 version 7010", view, found)
+	}
+	if len(view.Steps) != 1 || len(view.Assertions) != 2 {
+		t.Fatalf("replacement content = %d steps / %d assertions", len(view.Steps), len(view.Assertions))
+	}
+
+	// A version that is still current (or unknown) has no replacement: the
+	// caller must surface the supersede instead of inventing one.
+	if _, found, err := service.ReplacementCaseVersion(context.Background(), 1001, 7010); err != nil || found {
+		t.Fatalf("current version replacement = found=%v err=%v, want none", found, err)
+	}
+	if _, found, err := service.ReplacementCaseVersion(context.Background(), 1001, 999999); err != nil || found {
+		t.Fatalf("unknown version replacement = found=%v err=%v, want none", found, err)
+	}
+	if _, _, err := service.ReplacementCaseVersion(context.Background(), 0, 7004); err == nil {
+		t.Fatal("missing version id must be rejected")
+	}
+}

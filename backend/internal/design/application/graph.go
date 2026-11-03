@@ -7,6 +7,7 @@ package designapp
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -442,6 +443,14 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 					result.CaseVersionIDs = append(result.CaseVersionIDs, existing.Current.ID)
 					continue
 				}
+				// Task 106: a confirmed current version is the immutable unit
+				// frozen by the case gate and the execute.batch selection. A
+				// changed proposal must never silently replace it with a new
+				// draft: that is exactly the PO E2E v1..v5 churn that turned
+				// 6/12 confirmed batch-A cases into unexecuted superseded runs.
+				if existing.Current.Status == design.CaseStatusConfirmed {
+					return confirmedCaseVersionFrozenError(existing)
+				}
 				if _, err := tx.InsertCaseVersion(ctx, next); err != nil {
 					return err
 				}
@@ -511,6 +520,36 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 		s.recordAudit(ctx, in.RequirementID, result.CaseIDs, created, actorID)
 	}
 	return result, nil
+}
+
+// confirmedCaseVersionFrozenError is the typed 409 returned when a changed
+// proposal addresses a confirmed current case version (Task 106). The message
+// names the explicit redesign path because the freeze is deliberate: the
+// confirmed version is what the case gate froze and what an execute.batch
+// selection/wave executes, so a background design revision may not replace it.
+func confirmedCaseVersionFrozenError(item design.CaseWithCurrent) *platform.Error {
+	version := design.CaseVersion{}
+	if item.Current != nil {
+		version = *item.Current
+	}
+	title := strings.TrimSpace(version.Title)
+	if title == "" {
+		title = "untitled case"
+	}
+	return &platform.Error{
+		Status: http.StatusConflict,
+		Code:   "confirmed_case_version_frozen",
+		Message: fmt.Sprintf(
+			"case %q version %d is confirmed and frozen; a design change cannot silently replace a confirmed current version. Revise the requirement (which marks confirmed cases stale and reopens design) or reject the case gate to redesign it explicitly.",
+			title, version.ID,
+		),
+		Details: map[string]any{
+			"case_id":         platformid.Format(item.Case.ID),
+			"case_version_id": platformid.Format(version.ID),
+			"revision":        version.Revision,
+			"next_action":     "revise the requirement or explicitly reject the case gate before redesigning this case",
+		},
+	}
 }
 
 // buildCaseVersion maps one proposal case onto a CaseVersion. When current is
@@ -873,6 +912,41 @@ func (s *GraphService) ListExecutable(ctx context.Context, versionID int64) ([]E
 		views = append(views, executableCaseView(item))
 	}
 	return views, nil
+}
+
+// ReplacementCaseVersion returns the current+confirmed case version of the same
+// logical case that replaces historicalCaseVersionID, when one exists. It is
+// the design read behind the execution P3 §4.9 re-plan (Task 106): when an
+// intent's confirmed case version is no longer current+confirmed, execution
+// asks whether the case was re-confirmed as a new revision and, if so, queues
+// that revision instead of silently dropping the selected case. A missing,
+// foreign or still-current historical version reports found=false.
+func (s *GraphService) ReplacementCaseVersion(ctx context.Context, versionID, historicalCaseVersionID int64) (ExecutableCaseView, bool, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return ExecutableCaseView{}, false, err
+	}
+	if err := requirePositiveID("case_version_id", historicalCaseVersionID); err != nil {
+		return ExecutableCaseView{}, false, err
+	}
+	history, err := s.repo.ReadCaseVersionsByIDs(ctx, versionID, []int64{historicalCaseVersionID})
+	if err != nil {
+		return ExecutableCaseView{}, false, mapDesignError(err, "case version")
+	}
+	if len(history) == 0 || history[0].CaseID <= 0 {
+		return ExecutableCaseView{}, false, nil
+	}
+	caseID := history[0].CaseID
+	executables, err := s.repo.ListExecutableCases(ctx, versionID)
+	if err != nil {
+		return ExecutableCaseView{}, false, mapDesignError(err, "case version")
+	}
+	for _, item := range executables {
+		if item.CaseID != caseID || item.Version.ID == historicalCaseVersionID {
+			continue
+		}
+		return executableCaseView(item), true, nil
+	}
+	return ExecutableCaseView{}, false, nil
 }
 
 func executableCaseView(data design.ExecutableCase) ExecutableCaseView {

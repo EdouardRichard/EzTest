@@ -161,6 +161,38 @@ type SUTContextRepository interface {
 type CaseReader interface {
 	GetCaseVersion(ctx context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, error)
 	ListExecutable(ctx context.Context, versionID int64) ([]execution.CaseSnapshot, error)
+	// ResolveReplacement returns the current+confirmed case version of the same
+	// logical case that replaced a historical case version, when one exists
+	// (Task 106). execution never reads the design tables directly; the design
+	// adapter resolves the historical case_id and re-reads its executable
+	// current version. found=false means the case has no executable replacement
+	// yet (it still needs re-design/re-confirmation), not a read failure.
+	ResolveReplacement(ctx context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, bool, error)
+	// CaseVersionLabel resolves the display labels of any case version of the
+	// version, including superseded/stale/draft history. It is the projection
+	// fallback for terminal case_runs whose version is no longer
+	// current+confirmed, so a superseded row keeps its case id/title instead of
+	// rendering anonymously (PO E2E F11).
+	CaseVersionLabel(ctx context.Context, versionID, caseVersionID int64) (CaseVersionLabel, error)
+}
+
+// CaseVersionLabel is the historical case-version display projection used by
+// the execution read models.
+type CaseVersionLabel struct {
+	CaseID        int64
+	CaseVersionID int64
+	Title         string
+	Revision      int
+	Status        string
+}
+
+// SupersededIntentReplanner retires an active intent whose case version left
+// the current+confirmed executable set and auto-enqueues the same logical
+// case's replacement confirmed revision when it exists (Task 106). It is
+// implemented by *IntentService; degraded assemblies may leave it nil and the
+// scheduler/recovery then only retire the intent (with the visible event).
+type SupersededIntentReplanner interface {
+	SupersedeAndReplan(ctx context.Context, intent execution.ExecutionIntent) (SupersedeResult, error)
 }
 
 // VersionReader is the read/write port into the version context.

@@ -444,7 +444,8 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 	}
 	result.model = delivery.CaseRunSnapshot{
 		ID: run.ID, VersionID: versionID, WaveID: run.WaveID, CaseVersionID: run.CaseVersionID,
-		CaseTitle: info.title, VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
+		RequirementID: info.requirementID,
+		CaseTitle:     info.title, VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
 		Summary:         failureSummary,
 		StepCount:       stepCount,
@@ -790,7 +791,47 @@ func (m *readModel) coverage(ctx context.Context, versionID int64, requirements 
 			Reason:        reason,
 		})
 	}
+	coverage.ByRequirement = requirementCoverageRows(requirements, cases, latest)
 	return coverage, nil
+}
+
+// requirementCoverageRows derives the per-requirement coverage projection from
+// the same executable case versions and latest runs as the aggregate coverage.
+// Rows are emitted for every version requirement (including requirements with no
+// executable case version) in ascending requirement ID order, so the report
+// writer and the narrative guard see the same deterministic facts.
+func requirementCoverageRows(requirements []versionapp.RequirementView, cases []designapp.ExecutableCaseView, latest map[int64]execution.CaseRun) []delivery.RequirementCoverageSnapshot {
+	byID := make(map[int64]*delivery.RequirementCoverageSnapshot, len(requirements)+1)
+	row := func(requirementID int64) *delivery.RequirementCoverageSnapshot {
+		if existing, ok := byID[requirementID]; ok {
+			return existing
+		}
+		created := &delivery.RequirementCoverageSnapshot{RequirementID: requirementID}
+		byID[requirementID] = created
+		return created
+	}
+	for _, requirement := range requirements {
+		row(requirement.ID)
+	}
+	for _, item := range cases {
+		entry := row(item.RequirementID)
+		entry.CaseVersionsTotal++
+		run, ok := latest[item.CaseVersionID]
+		switch {
+		case ok && run.Status == execution.CaseRunPassed:
+			entry.CaseVersionsCovered++
+		case ok:
+			entry.CaseVersionsFailedCoverage++
+		default:
+			entry.CaseVersionsNotRun++
+		}
+	}
+	rows := make([]delivery.RequirementCoverageSnapshot, 0, len(byID))
+	for _, entry := range byID {
+		rows = append(rows, *entry)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].RequirementID < rows[j].RequirementID })
+	return rows
 }
 
 // versionSUTs maps the version bindings onto report labels.
