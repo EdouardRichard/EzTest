@@ -406,6 +406,90 @@ func TestCancelWaveAndIntent(t *testing.T) {
 	}
 }
 
+// TestCancelWaveCancelsActiveIntents pins QA-F2: cancelling a wave must cancel
+// its active intents even when their case_runs already reached a terminal
+// status (the cancel path used to skip them and leave the intents running).
+func TestCancelWaveCancelsActiveIntents(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	// QA-F2 shape: the wave's case runs may already be terminal while their
+	// intents are still running. Cancel must still settle those intents.
+	f.seedIntent(1, 300)
+	f.seedIntent(2, 301)
+	f.seedRun(500, 1, execution.CaseRunRunning)
+	f.seedRun(501, 2, execution.CaseRunFailed)
+	// An intent that already reached a terminal state must not be rewritten.
+	if err := f.intents.Create(ctx, execution.ExecutionIntent{
+		ID: 3, VersionID: 100, CaseVersionID: 302, VersionSUTIDs: []int64{5001},
+		EnvironmentFingerprint: testFingerprintForTask9, Purpose: execution.PurposeInitial,
+		Status: execution.IntentDone,
+	}); err != nil {
+		t.Fatalf("seed terminal intent: %v", err)
+	}
+	f.seedRun(502, 3, execution.CaseRunPassed)
+
+	wave, err := f.pause.CancelWave(ctx, 100, 50, 42)
+	if err != nil {
+		t.Fatalf("CancelWave: %v", err)
+	}
+	if wave.Status != execution.WaveCancelled {
+		t.Fatalf("wave = %s, want cancelled", wave.Status)
+	}
+	for _, id := range []int64{1, 2} {
+		stored, err := f.intents.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("get intent %d: %v", id, err)
+		}
+		if stored.Status != execution.IntentCancelled {
+			t.Fatalf("intent %d = %s, want cancelled", id, stored.Status)
+		}
+	}
+	if stored, _ := f.intents.Get(ctx, 3); stored.Status != execution.IntentDone {
+		t.Fatalf("terminal intent = %s, want done (unchanged)", stored.Status)
+	}
+	if run, _ := f.runs.Get(ctx, 500); run.Status != execution.CaseRunSuperseded {
+		t.Fatalf("running case run = %s, want superseded", run.Status)
+	}
+	if run, _ := f.runs.Get(ctx, 501); run.Status != execution.CaseRunFailed {
+		t.Fatalf("terminal case run = %s, want failed (unchanged)", run.Status)
+	}
+	if activeWave, err := f.waves.GetActive(ctx, 100); err != nil || activeWave != nil {
+		t.Fatalf("active wave = %+v err=%v, want nil", activeWave, err)
+	}
+	// active_wave=null must mean no residual active intent (QA-F2 contract).
+	activeIntents, err := f.intents.ListActive(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(activeIntents) != 0 {
+		t.Fatalf("active intents after cancel = %+v, want none", activeIntents)
+	}
+	if got := f.events.count(EventIntentCancelled); got != 2 {
+		t.Fatalf("intent_cancelled events = %d, want 2", got)
+	}
+
+	// Repeat cancel is idempotent: same state, no duplicate events.
+	again, err := f.pause.CancelWave(ctx, 100, 50, 42)
+	if err != nil {
+		t.Fatalf("second CancelWave: %v", err)
+	}
+	if again.Status != execution.WaveCancelled {
+		t.Fatalf("second cancel wave = %s, want cancelled", again.Status)
+	}
+	if got := f.events.count(EventIntentCancelled); got != 2 {
+		t.Fatalf("repeat cancel emitted intent_cancelled events = %d, want 2", got)
+	}
+	if got := f.events.count(EventWaveFinished); got != 1 {
+		t.Fatalf("wave_finished events = %d, want 1", got)
+	}
+	for _, id := range []int64{1, 2} {
+		if stored, _ := f.intents.Get(ctx, id); stored.Status != execution.IntentCancelled {
+			t.Fatalf("intent %d after repeat cancel = %s, want cancelled", id, stored.Status)
+		}
+	}
+}
+
 func TestCancelIntentSupersedesRuns(t *testing.T) {
 	ctx := context.Background()
 	f := newTask9Fixture()
