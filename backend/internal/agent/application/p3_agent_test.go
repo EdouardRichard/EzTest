@@ -423,6 +423,8 @@ func (f *fakeRunnerCanceller) ClearRun(caseRunID int64) {
 // fakeExecutionPort records the P3 execution tool calls made by the runner.
 type fakeExecutionPort struct {
 	stepCalls    int
+	assertCalls  int
+	finishCalls  int
 	lastScope    tools.Scope
 	stepInput    tools.StepRecordInput
 	assertInput  tools.AssertionRecordInput
@@ -431,8 +433,11 @@ type fakeExecutionPort struct {
 	humanInput   tools.HumanRequestInput
 	credInput    tools.AccountCredentialsInput
 	browserCalls []string
-	stepResult   any
-	stepErr      error
+	// browserResults are the per-call browser results; a call index past the
+	// slice falls back to the small {"ok":true} result.
+	browserResults []any
+	stepResult     any
+	stepErr        error
 }
 
 func (f *fakeExecutionPort) StepRecord(_ context.Context, scope tools.Scope, in tools.StepRecordInput) (any, error) {
@@ -443,6 +448,7 @@ func (f *fakeExecutionPort) StepRecord(_ context.Context, scope tools.Scope, in 
 }
 
 func (f *fakeExecutionPort) AssertionRecord(_ context.Context, scope tools.Scope, in tools.AssertionRecordInput) (any, error) {
+	f.assertCalls++
 	f.lastScope = scope
 	f.assertInput = in
 	return map[string]any{"ok": true}, nil
@@ -453,6 +459,7 @@ func (f *fakeExecutionPort) EvidenceText(_ context.Context, _ tools.Scope, _ too
 }
 
 func (f *fakeExecutionPort) CaseFinish(_ context.Context, scope tools.Scope, in tools.CaseFinishInput) (any, error) {
+	f.finishCalls++
 	f.lastScope = scope
 	f.finishInput = in
 	return map[string]any{"ok": true}, nil
@@ -473,6 +480,9 @@ func (f *fakeExecutionPort) HumanRequest(_ context.Context, scope tools.Scope, i
 func (f *fakeExecutionPort) Browser(_ context.Context, scope tools.Scope, action string, _ json.RawMessage) (any, error) {
 	f.lastScope = scope
 	f.browserCalls = append(f.browserCalls, action)
+	if index := len(f.browserCalls) - 1; index < len(f.browserResults) {
+		return f.browserResults[index], nil
+	}
 	return map[string]any{"ok": true}, nil
 }
 

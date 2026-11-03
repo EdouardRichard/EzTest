@@ -495,6 +495,12 @@ type runState struct {
 	// done run, into agent_run.terminal_reason so a 1/4-step stop is explainable.
 	settlementCause  string
 	settlementDetail string
+	// recordedSteps/recordedAssertions are the successful execution recording
+	// calls of this run (Task 98). The case executor's settlement turn uses them
+	// to name the assertions of already executed steps that still need a real
+	// result.
+	recordedSteps      map[int]string
+	recordedAssertions map[[2]int]struct{}
 }
 
 // Run executes one work item and projects the job into its conversation as one
@@ -1124,19 +1130,35 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			}
 		}
 		soft := decision == BudgetSettle
+		// Task 98: every turn re-sends the whole transcript, and a browser read
+		// result can be a 12KB ARIA tree. The prompt transcript keeps only the
+		// newest page reads; the persisted transcript stays complete.
+		r.pruneCaseExecutorBrowserReads(state)
 		request := llmapp.ChatRequest{
 			Model:           state.model.Model,
 			Messages:        append([]llmapp.ChatMessage(nil), state.messages...),
 			MaxOutputTokens: state.model.MaxOutput,
 		}
+		var settlementTools []llmapp.ToolDefinition
 		if soft {
 			if !state.softNoted {
 				state.softNoted = true
 				state.settlementCause = state.resourceBudget.ExceededBy(usage)
 				state.settlementDetail = budgetSettlementDetail(state.settlementCause, state.resourceBudget, usage)
+				// Task 98: the case executor keeps a recording-only settlement
+				// surface so the assertions of already executed steps are really
+				// written before the run ends. Every other profile keeps the
+				// frozen tool-less settlement turn.
+				settlementTools = caseExecutorSettlementDefinitions(state)
+				instruction := settlementInstruction(state.settlementCause)
+				if len(settlementTools) > 0 {
+					request.Tools = settlementTools
+					instruction = caseExecutorSettlementInstruction(
+						state.settlementCause, pendingCaseExecutorAssertions(state))
+				}
 				request.Messages = append(request.Messages, llmapp.ChatMessage{
 					Role:    "system",
-					Content: settlementInstruction(state.settlementCause),
+					Content: instruction,
 				})
 			}
 		} else {
@@ -1195,6 +1217,17 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			return strings.TrimSpace(response.Content), nil
 		}
 		if soft {
+			if len(settlementTools) > 0 {
+				// Task 98: the recording-only settlement turn. The recording
+				// calls reach the execution context (a new browser/network
+				// action is answered with a tool error by executeTools), then
+				// the run ends with the model's wrap-up text instead of spending
+				// another over-budget model turn.
+				if err := r.executeTools(ctx, state, response.ToolCalls); err != nil {
+					return "", err
+				}
+				return strings.TrimSpace(response.Content), nil
+			}
 			// Tools are disabled during settlement; a tool-call-only reply means
 			// the model ignored the wrap-up instruction. This is a budget
 			// exhaustion (the settlement turn is consumed without an answer),
@@ -1296,6 +1329,13 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 		var payload any
 		var err error
 		switch {
+		case settlementRecordingActive(state) && !isCaseExecutorSettlementTool(call.Name):
+			// Task 98: the case executor's settlement turn may only record
+			// results it already produced. A new browser/network/database
+			// action is rejected before it can touch the SUT; so is
+			// execution.case_finish, whose deterministic replacement (Finalize)
+			// must write the verdict with the budget cause/handoff.
+			err = caseExecutorSettlementRejection(call.Name)
 		case !profileAllowsTool(state.profile, call.Name):
 			err = tools.Invalid("tool", "tool is not allowed for this profile: "+call.Name)
 		case state.roleGuard != nil:
@@ -1311,6 +1351,11 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			err = tools.Forbidden(state.roleTools.Role(), call.Name)
 		default:
 			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+		}
+		if err == nil {
+			// Task 98: successful execution recording calls are remembered so a
+			// budget settlement turn can name the assertions still missing.
+			state.trackCaseExecutorRecording(call)
 		}
 		content := ""
 		contentRef := ""
@@ -2316,12 +2361,15 @@ const DesignRunMaxTokens = 200000
 // 4-step case: S5 retry-6 (case run 375990017199177730) used 216,814 tokens
 // after 15 turns and stopped during step 2 of 4 with no assertion recorded. 400k
 // covers the remaining steps, assertions and evidence calls while remaining a
-// bounded cap (above the observed failure point, not an unbounded budget). The
-// runner enforces it in code because the stored profile row is seeded once and
-// EnsureProfiles never overwrites an existing row, so a stale chat-scale row
-// must not pull the executor back to the generic budget (same reasoning as the
-// Task 79 design floor). A work item's explicit 0.2.1 budget declaration still
-// wins over the profile floor.
+// bounded cap (above the observed failure point, not an unbounded budget).
+// Task 98 additionally bounds the per-turn replay: older browser read results are
+// pruned from the prompt transcript and the budget settlement turn can still
+// record the assertions of already executed steps. The runner enforces the cap in
+// code because the stored profile row is seeded once and EnsureProfiles never
+// overwrites an existing row, so a stale chat-scale row must not pull the
+// executor back to the generic budget (same reasoning as the Task 79 design
+// floor). A work item's explicit 0.2.1 budget declaration still wins over the
+// profile floor.
 const CaseExecutorRunMaxTokens = 400000
 
 // Design authoring envelope (Task 79). The stored profile budgets cannot be

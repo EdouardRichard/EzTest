@@ -163,3 +163,58 @@ func TestCaseIncompleteWithoutSettlementReportsAgentStopped(t *testing.T) {
 		t.Fatalf("last error = %q, want the step progress", stored.Summary.LastError)
 	}
 }
+
+// TestCaseBudgetExitKeepsRecordedAssertions pins the execution-side half of Task
+// 98: a budget-ended run retains the step/assertion results recorded before the
+// budget hit. The terminal verdict stays inconclusive(incomplete) with the
+// budget cause and rerun handoff (Task 92), so a real assertion result reaches
+// the S5 evidence gate without the verdict pretending the case passed.
+func TestCaseBudgetExitKeepsRecordedAssertions(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	prepareOneOfFourSteps(t, fixture)
+
+	result := agentapp.RunResult{
+		Status:           "done",
+		Turns:            23,
+		Usage:            map[string]int{"total_tokens": 406167},
+		SettlementCause:  agentapp.BudgetCauseTokens,
+		SettlementDetail: "token budget: used 406167 of 400000 tokens after 23 turns",
+		TerminalReason:   agentapp.BudgetCauseTokens,
+	}
+	if err := fixture.runner.Finalize(context.Background(), 3001, 3, result, nil, 1, 3); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Status != execution.CaseRunInconclusive ||
+		stored.Summary.VerdictReason != execution.VerdictReasonIncomplete {
+		t.Fatalf("stored = %s/%s, want inconclusive(incomplete); a budget exit must never become a pass",
+			stored.Status, stored.Summary.VerdictReason)
+	}
+	if stored.Summary.TerminalCause != execution.TerminalCauseTokenBudget {
+		t.Fatalf("terminal cause = %q, want %q", stored.Summary.TerminalCause, execution.TerminalCauseTokenBudget)
+	}
+	if stored.Summary.NextAction != execution.NextActionRerun {
+		t.Fatalf("next action = %q, want %q", stored.Summary.NextAction, execution.NextActionRerun)
+	}
+
+	steps, err := fixture.results.ListSteps(context.Background(), 3001)
+	if err != nil {
+		t.Fatalf("ListSteps: %v", err)
+	}
+	if len(steps) != 1 || steps[0].Seq != 1 || steps[0].Status != execution.StepPassed {
+		t.Fatalf("recorded steps = %#v, want the executed step 1 kept", steps)
+	}
+	assertions, err := fixture.results.ListAssertions(context.Background(), 3001)
+	if err != nil {
+		t.Fatalf("ListAssertions: %v", err)
+	}
+	if len(assertions) != 1 {
+		t.Fatalf("recorded assertions = %d, want the executed assertion kept across the budget exit", len(assertions))
+	}
+	kept := assertions[0]
+	if kept.StepSeq != 1 || kept.AssertionSeq != 1 || kept.Verdict != execution.AssertionPassed ||
+		kept.Actual != "弹窗可见" {
+		t.Fatalf("recorded assertion = %#v, want the real executed result", kept)
+	}
+}

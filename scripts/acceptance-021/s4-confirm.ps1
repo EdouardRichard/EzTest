@@ -183,6 +183,19 @@ try {
             }
 
             if ($designConversationId -ne "" -and $modifyCaseId -ne "") {
+                # The modification is applied asynchronously by a design chat
+                # turn. Reading a revision increase alone is not enough: the
+                # automatic design team is still winding down and its own late
+                # revisions (or the modification turn itself) may land AFTER the
+                # case hard gate, de-confirming a case the gate just confirmed.
+                # That is retry-7's empty/superseded second case_run. Capture
+                # the turn state before sending so the gate can wait until the
+                # modification's own chat.turn is done.
+                $messageIdsBeforeModify = @()
+                try {
+                    $messagesBeforeModify = @(Get-AcceptanceMessages -Context $context -VersionId $versionId -ConversationId $designConversationId -Limit 200)
+                    $messageIdsBeforeModify = @($messagesBeforeModify | ForEach-Object { [string](Get-JsonProp -Object $_ -Name "id" -Default "") })
+                } catch { }
                 $modifyText = @"
 请只修改现有用例（case_id=$modifyCaseId，标题「$($modifyTarget.title)」），不要新建用例、不要确认：
 1. 保留原有步骤与断言；
@@ -199,18 +212,27 @@ try {
                 } catch {
                     Add-AcceptanceCheck -Scenario $scenario -Name "design modification message accepted" -Passed $false -Severity assertion -Detail $_.Exception.Message
                 }
-                $modifyWait = Wait-Until -TimeoutSeconds $DesignReplyTimeoutSeconds -IntervalSeconds 10 -Description "versioned case modification" -Condition {
+                $modifyWait = Wait-Until -TimeoutSeconds $DesignReplyTimeoutSeconds -IntervalSeconds 5 -Description "versioned case modification" -Condition {
                     $currentDetail = Get-AcceptanceCaseDetail -Context $context -VersionId $versionId -CaseId $modifyCaseId
                     $revisions = @(Get-JsonProp -Object $currentDetail -Name "versions" -Default @()).Count
+                    $currentMessages = @()
+                    try { $currentMessages = @(Get-AcceptanceMessages -Context $context -VersionId $versionId -ConversationId $designConversationId -Limit 200) } catch { }
+                    $newTurnCards = @(Get-AcceptanceJobCards -Messages $currentMessages | Where-Object {
+                        $_.kind -eq "chat.turn" -and $_.status -eq "done" -and ($messageIdsBeforeModify -notcontains $_.message_id)
+                    })
                     $currentGraph = Get-AcceptanceDesignGraph -Context $context -VersionId $versionId
                     $currentCards = @(Get-AcceptanceCaseCards -Graph $currentGraph)
-                    if ($revisions -gt $beforeRevisionCount -or $currentCards.Count -gt $beforeCaseCount) {
-                        return [pscustomobject]@{ Detail = $currentDetail; Revisions = $revisions; Cards = $currentCards; Graph = $currentGraph }
+                    if ($revisions -gt $beforeRevisionCount -and $newTurnCards.Count -ge 1) {
+                        return [pscustomobject]@{ Detail = $currentDetail; Revisions = $revisions; Cards = $currentCards; Graph = $currentGraph; TurnCards = $newTurnCards }
                     }
                     return $null
                 }
                 $modifyResult = $null
-                if ($modifyWait.Ok -and $null -ne $modifyWait.Value) { $modifyResult = $modifyWait.Value }
+                $modifyTurnCards = @()
+                if ($modifyWait.Ok -and $null -ne $modifyWait.Value) {
+                    $modifyResult = $modifyWait.Value
+                    $modifyTurnCards = @($modifyResult.TurnCards)
+                }
                 $afterDetail = $null
                 try { $afterDetail = Get-AcceptanceCaseDetail -Context $context -VersionId $versionId -CaseId $modifyCaseId } catch { }
                 $afterRevisionCount = 0
@@ -227,12 +249,23 @@ try {
                     message_id = [string](Get-JsonProp -Object $modifyMessage -Name 'id' -Default '')
                     before_revisions = $beforeRevisionCount
                     after_revisions = $afterRevisionCount
+                    modification_turn_finished = ($modifyTurnCards.Count -ge 1)
+                    modification_turn_jobs = @($modifyTurnCards | ForEach-Object { $_.job_id })
                     graph_propose_calls = $graphProposeCalls
                     last_assistant_text = $lastAssistantText
                     new_versions = if ($null -ne $afterDetail) { Get-JsonProp -Object $afterDetail -Name "versions" -Default @() } else { @() }
                 }) -Note "design-conversation modification result")
                 Add-AcceptanceCheck -Scenario $scenario -Name "conversation modification creates a new case version" -Passed ($afterRevisionCount -gt $beforeRevisionCount) -Severity assertion `
                     -Detail "before=$beforeRevisionCount after=$afterRevisionCount case=$modifyCaseId"
+                # The case hard gate must not race the modification turn: a
+                # revision that lands after the gate de-confirms the selected
+                # case and manufactures the retry-7 attempts=0 superseded run.
+                Add-AcceptanceCheck -Scenario $scenario -Name "design modification turn finished before the case gate" `
+                    -Passed ($modifyTurnCards.Count -ge 1) -Severity assertion `
+                    -Detail ("doneChatTurns=$($modifyTurnCards.Count) jobs=$((($modifyTurnCards | ForEach-Object { $_.job_id }) -join ',')) afterRevisions=$afterRevisionCount")
+                if ($modifyTurnCards.Count -lt 1) {
+                    $scenario.ErrorMessage = "S4 failed: the design modification chat turn did not finish before the case gate; the graph may still change after confirmation"
+                }
                 Add-AcceptanceCheck -Scenario $scenario -Name "modification used case.graph_propose" -Passed ($graphProposeCalls.Count -ge 1) -Severity warning `
                     -Detail "calls=$($graphProposeCalls.Count)"
                 if ($afterRevisionCount -le $beforeRevisionCount) {
