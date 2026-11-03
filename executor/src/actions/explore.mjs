@@ -1329,6 +1329,33 @@ export class ExploreRuntime {
   }
 
   /**
+   * Closes one explore page without touching the other pages. If an action is
+   * currently running on that page its controller is aborted and the page is
+   * dropped, so the browser-side operation cannot keep using it; actions on
+   * other pages (and queued actions) are left alone. An unknown or already
+   * closed page is an idempotent no-op.
+   */
+  async closePage(pageId) {
+    if (typeof pageId !== "string" || pageId.length === 0) {
+      throw invalidArguments("page_id must be a non-empty string")
+    }
+    const current = this.#current
+    if (current && current.entry?.pageId === pageId) {
+      if (!current.controller.signal.aborted) {
+        current.controller.abort()
+      }
+      await this.#discardOperation(current)
+      return { closed: true, page_id: pageId }
+    }
+    const entry = this.#pages.get(pageId)
+    if (!entry || entry.closed) {
+      return { closed: false, page_id: pageId }
+    }
+    await this.#dropPage(entry)
+    return { closed: true, page_id: pageId }
+  }
+
+  /**
    * Closes every explore page without shutting the runtime down, so a new
    * explore.open can be used again. In-flight actions and page creations are
    * canceled first.

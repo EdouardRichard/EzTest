@@ -25,7 +25,8 @@ import (
 // producing a login flow that panics or silently skips fact recording.
 type ExploreWiringDeps struct {
 	// Executor is the HTTP explore-action client; it must also implement
-	// explore.PageCloser so the throwaway reuse-verification page is closed.
+	// explore.PageCloser so the throwaway reuse-verification page is closed by
+	// page id (never by closing every page of the shared executor runtime).
 	Executor exploreapp.Executor
 	// Accounts is the real resource account-secret store (passwords are read
 	// only by LoginFlow and never enter a fact or knowledge payload).
@@ -68,7 +69,7 @@ func NewExploreWiring(deps ExploreWiringDeps) (*ExploreWiring, error) {
 		return nil, errors.New("versionadapter: explore wiring requires a version binding reader")
 	}
 	if _, ok := deps.Executor.(exploreapp.PageCloser); !ok {
-		return nil, errors.New("versionadapter: explore wiring executor must implement page cleanup (ClosePages)")
+		return nil, errors.New("versionadapter: explore wiring executor must implement per-page cleanup (ClosePage)")
 	}
 	now := deps.Now
 	if now == nil {
@@ -117,29 +118,35 @@ func (w *ExploreWiring) ResolveAccount(ctx context.Context, versionID, versionSU
 	if err != nil {
 		return exploreapp.Account{}, err
 	}
-	accountID := ""
-	matches := 0
+	// Dedupe by account: one account may be listed with the same role more than
+	// once (duplicate role entries or a repeated account row) without becoming a
+	// state conflict. Only two *different* accounts sharing the role conflict.
+	matched := make(map[string]struct{})
 	for _, binding := range view.Bindings {
 		if binding.ID != versionSUTID {
 			continue
 		}
 		for _, account := range binding.Accounts {
+			accountID := strings.TrimSpace(account.ID)
 			for _, accountRole := range account.Roles {
 				if strings.TrimSpace(accountRole) != role {
 					continue
 				}
-				accountID = account.ID
-				matches++
+				matched[accountID] = struct{}{}
 				break
 			}
 		}
 	}
-	switch matches {
+	switch len(matched) {
 	case 0:
 		return exploreapp.Account{}, platform.NotFound("test_account")
 	case 1:
 	default:
 		return exploreapp.Account{}, platform.StateConflict("multiple test accounts share the requested role")
+	}
+	accountID := ""
+	for id := range matched {
+		accountID = id
 	}
 	id, err := strconv.ParseInt(strings.TrimSpace(accountID), 10, 64)
 	if err != nil || id <= 0 {

@@ -17,7 +17,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -31,10 +33,11 @@ import (
 // pages are not execution contexts.
 const ExploreActionsPath = "/v1/explore/actions"
 
-// ExplorePagesPath is the executor route that closes every explore page
-// (DELETE /v1/explore, executor protocol §13). The login flow uses it to drop
-// the throwaway page opened to verify a cached storage ref, so repeated reuse
-// cannot exhaust the executor's 8-page cap.
+// ExplorePagesPath is the executor explore page route. DELETE /v1/explore
+// closes every explore page; the optional page_id query parameter scopes it to
+// one page (executor protocol §13). The login flow uses the per-page form to
+// drop only the throwaway page opened to verify a cached storage ref, so
+// repeated reuse cannot exhaust the executor's 8-page cap.
 const ExplorePagesPath = "/v1/explore"
 
 // defaultExecutorTimeout mirrors the executor client bound: the executor caps a
@@ -161,14 +164,17 @@ type Executor interface {
 	Action(ctx context.Context, action string, args map[string]any) (map[string]any, error)
 }
 
-// PageCloser is the optional executor capability that closes every explore page
-// the executor runtime owns. *HTTPExecutor implements it with DELETE
-// /v1/explore. It is detected from LoginFlowDeps.Executor, so an Executor that
-// predates the page-cleanup requirement still satisfies the action interface
-// (it simply skips cleanup, and the next open can hit the page cap). A close
-// failure never invalidates a verified session: the page is throwaway cleanup.
+// PageCloser is the optional executor capability that closes exactly one
+// explore page the executor runtime owns. *HTTPExecutor implements it with
+// DELETE /v1/explore?page_id=<id>. It is detected from LoginFlowDeps.Executor,
+// so an Executor that predates the per-page close still satisfies the action
+// interface (it simply skips cleanup, and the next open can hit the page cap).
+//
+// There is deliberately no close-all fallback: the executor runtime is shared
+// with concurrent discovery/exploration runs, so closing every page to clean up
+// one throwaway verification page would abort unrelated pages and actions.
 type PageCloser interface {
-	ClosePages(ctx context.Context) error
+	ClosePage(ctx context.Context, pageID string) error
 }
 
 // ExecutorActionError is a typed executor explore action failure (page not
@@ -258,14 +264,21 @@ func (e *HTTPExecutor) Action(ctx context.Context, action string, args map[strin
 	return envelope.Result, nil
 }
 
-// ClosePages closes every explore page owned by the executor runtime through
-// DELETE /v1/explore (executor protocol §13). Explore pages are addressed by
-// page id and the closed six-action set has no per-page close, so this is the
-// only cleanup route: the login flow uses it for the throwaway page opened to
-// verify a cached ref. The bearer token is only sent in the Authorization
+// ClosePage closes exactly one explore page owned by the executor runtime
+// through DELETE /v1/explore?page_id=<id> (executor protocol §13). The caller
+// gets the page id from the corresponding explore.open result. Other explore
+// pages and in-flight actions are left untouched, unlike the unpaginated route
+// that closes every page. An unknown/already-closed page is an idempotent
+// success at the protocol level (closed:false), so a transport failure is the
+// only error returned. The bearer token is only sent in the Authorization
 // header and redirects are not followed, as for Action.
-func (e *HTTPExecutor) ClosePages(ctx context.Context) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, e.endpoint+ExplorePagesPath, nil)
+func (e *HTTPExecutor) ClosePage(ctx context.Context, pageID string) error {
+	pageID = strings.TrimSpace(pageID)
+	if pageID == "" {
+		return errors.New("executor explore close requires a page id")
+	}
+	endpoint := e.endpoint + ExplorePagesPath + "?page_id=" + url.QueryEscape(pageID)
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("build executor explore close request: %w", err)
 	}
@@ -339,25 +352,28 @@ type LoginFlowConfig struct {
 }
 
 // LoginFlowDeps are the narrow ports consumed by the flow. Facts may be nil (a
-// degraded assembly still logs in); Sessions must be set.
+// degraded assembly still logs in); Sessions must be set. Logger receives
+// best-effort cleanup failures and defaults to slog.Default().
 type LoginFlowDeps struct {
 	Executor Executor
 	Accounts AccountStore
 	Sessions SessionStore
 	Facts    FactRecorder
 	Now      func() time.Time
+	Logger   *slog.Logger
 }
 
 // LoginFlow is one stateful autonomous login attempt. Detect records the
 // detected form, Execute logs in (or reuses a session) and produces the fact.
 type LoginFlow struct {
-	cfg   LoginFlowConfig
-	exec  Executor
-	accts AccountStore
-	sess  SessionStore
-	facts FactRecorder
-	pages PageCloser
-	now   func() time.Time
+	cfg    LoginFlowConfig
+	exec   Executor
+	accts  AccountStore
+	sess   SessionStore
+	facts  FactRecorder
+	pages  PageCloser
+	now    func() time.Time
+	logger *slog.Logger
 
 	form *LoginForm
 	page Page
@@ -369,15 +385,20 @@ func NewLoginFlow(cfg LoginFlowConfig, deps LoginFlowDeps) *LoginFlow {
 	if now == nil {
 		now = time.Now
 	}
+	logger := deps.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	pages, _ := deps.Executor.(PageCloser)
 	return &LoginFlow{
-		cfg:   cfg,
-		exec:  deps.Executor,
-		accts: deps.Accounts,
-		sess:  deps.Sessions,
-		facts: deps.Facts,
-		pages: pages,
-		now:   now,
+		cfg:    cfg,
+		exec:   deps.Executor,
+		accts:  deps.Accounts,
+		sess:   deps.Sessions,
+		facts:  deps.Facts,
+		pages:  pages,
+		now:    now,
+		logger: logger,
 	}
 }
 
@@ -470,11 +491,14 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		}
 		if verifyURL == "" {
 			f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
-		} else if _, openErr := f.openPage(ctx, verifyURL, session.StorageStateRef); openErr == nil {
+		} else if snapshot, openErr := f.openPage(ctx, verifyURL, session.StorageStateRef); openErr == nil {
 			// The verification page is throwaway: the caller never receives it
 			// and leaving it registered would count against the executor's
-			// 8-page cap. Cleanup is best effort and must not fail the reuse.
-			f.closeVerificationPages(ctx)
+			// 8-page cap. Close only the page the flow just opened (its id comes
+			// from the executor result), never the whole runtime: concurrent
+			// discovery/exploration pages may be in flight on the shared
+			// executor. Cleanup is best effort and must not fail the reuse.
+			f.closeVerificationPage(ctx, snapshot.PageID)
 			return f.reuse(ctx, account, role, session)
 		} else if !isUnknownStorageStateRef(openErr) {
 			return f.blocked(account, role, "login_page_unavailable", executorFailureAction(openErr)), nil
@@ -602,8 +626,9 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 //   - An unknown storage_state_ref (executor restart) invalidates the entry and
 //     falls back to a fresh login through the account store.
 //   - After a fresh login the already-authenticated page navigates to url, so
-//     the caller does not pay a second page. If navigation fails, a new page is
-//     seeded with the freshly captured ref.
+//     the caller does not pay a second page. If navigation fails, that page is
+//     closed before a new page is seeded with the freshly captured ref (a
+//     silent second page would leak the first one against the page cap).
 //
 // A successfully opened page is returned to the caller and stays open. Only
 // the throwaway verification page inside Execute is closed.
@@ -666,12 +691,18 @@ func (f *LoginFlow) OpenWithSession(ctx context.Context, account Account, url st
 	}
 
 	// 3. The login page is already authenticated: navigate it to the requested
-	// URL instead of consuming a second page. A navigation failure falls back to
-	// a new page seeded with the freshly captured ref.
+	// URL instead of consuming a second page. A navigation failure closes the
+	// authenticated page before a fallback page is opened, so the fixed-capacity
+	// executor runtime does not leak the failed page.
 	if pageID := strings.TrimSpace(fact.Form.PageID); pageID != "" {
-		if snapshot, navErr := f.navigatePage(ctx, pageID, url); navErr == nil {
+		snapshot, navErr := f.navigatePage(ctx, pageID, url)
+		if navErr == nil {
 			return pageFromSnapshot(snapshot, url), fact, nil
 		}
+		// The authenticated login page cannot serve the target URL: close it
+		// before opening a fallback page so the fixed-capacity runtime does not
+		// leak the failed page.
+		f.closePageBestEffort(ctx, pageID, "navigation_fallback")
 	}
 	snapshot, openErr := f.openPage(ctx, url, fact.StorageStateRef)
 	if openErr != nil {
@@ -1036,16 +1067,31 @@ func (f *LoginFlow) blocked(account Account, role, reason, action string) Sessio
 	return fact
 }
 
-// closeVerificationPages drops the throwaway page opened to re-seed a cached
-// storage state. The caller never receives it, and leaving it registered would
-// count against the executor's 8-page cap. Cleanup is best effort: a failed
-// close must not turn a verified session into an error (the executor may also
-// omit the close capability entirely).
-func (f *LoginFlow) closeVerificationPages(ctx context.Context) {
+// closeVerificationPage drops only the throwaway page opened to re-seed a
+// cached storage state. The caller never receives it, and leaving it registered
+// would count against the executor's 8-page cap. Cleanup is best effort: a
+// failed close is logged and must not turn a verified session into an error.
+// It never falls back to closing every page, which would abort concurrent
+// exploration on the shared executor runtime.
+func (f *LoginFlow) closeVerificationPage(ctx context.Context, pageID string) {
+	f.closePageBestEffort(ctx, pageID, "verification")
+}
+
+// closePageBestEffort closes exactly one explore page and logs a failure. An
+// empty page id is a no-op: there is nothing to target, and closing every page
+// would drop pages owned by other runs.
+func (f *LoginFlow) closePageBestEffort(ctx context.Context, pageID, purpose string) {
 	if f.pages == nil {
 		return
 	}
-	_ = f.pages.ClosePages(ctx)
+	pageID = strings.TrimSpace(pageID)
+	if pageID == "" {
+		return
+	}
+	if err := f.pages.ClosePage(ctx, pageID); err != nil {
+		f.logger.Warn("explore login: close explore page failed",
+			"purpose", purpose, "page_id", pageID, "error", err)
+	}
 }
 
 // reuse records the cached session as an active, reused fact. It neither drives

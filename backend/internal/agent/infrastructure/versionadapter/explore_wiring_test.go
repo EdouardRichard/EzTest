@@ -3,6 +3,7 @@ package versionadapter_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -85,12 +87,15 @@ type exploreServerCall struct {
 
 // wiringExecutorServer is the fake executor HTTP endpoint: it scripts replies per
 // explore action and records every request, so the wiring test asserts the real
-// HTTP client path plus the action sequence.
+// HTTP client path plus the action sequence. Close requests are split by scope:
+// a page_id query closes one page, no query keeps the close-all meaning.
 type wiringExecutorServer struct {
-	mu      sync.Mutex
-	replies map[string][]scriptedReply
-	calls   []exploreServerCall
-	closes  int
+	mu            sync.Mutex
+	replies       map[string][]scriptedReply
+	calls         []exploreServerCall
+	closes        int
+	closeAll      int
+	closedPageIDs []string
 }
 
 func newWiringExecutorServer() *wiringExecutorServer {
@@ -116,6 +121,11 @@ func (s *wiringExecutorServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if r.Method == http.MethodDelete && r.URL.Path == exploreapp.ExplorePagesPath {
 		s.mu.Lock()
 		s.closes++
+		if pageID := r.URL.Query().Get("page_id"); pageID != "" {
+			s.closedPageIDs = append(s.closedPageIDs, pageID)
+		} else {
+			s.closeAll++
+		}
 		s.calls = append(s.calls, exploreServerCall{method: r.Method, path: r.URL.Path, auth: r.Header.Get("authorization")})
 		s.mu.Unlock()
 		_, _ = io.WriteString(w, `{"ok":true,"result":{"closed":true}}`)
@@ -318,6 +328,69 @@ func TestExploreWiringRequiresPageCloser(t *testing.T) {
 	}
 }
 
+// TestExploreWiringResolveAccountDedupesRoleEntries covers a binding where the
+// same account is listed more than once (duplicate role entries or a repeated
+// account row). Resolution must dedupe by account, not count entries.
+func TestExploreWiringResolveAccountDedupesRoleEntries(t *testing.T) {
+	fixture := newWiringFixture(t)
+	fixture.versions.view = versionapp.VersionView{
+		ID: 10,
+		Bindings: []versionapp.BindingView{{
+			ID: 7,
+			Accounts: []resourceapp.AccountView{
+				{ID: "81", Roles: []string{"admin", "admin"}},
+				{ID: "81", Roles: []string{"admin"}},
+				{ID: "82", Roles: []string{"viewer"}},
+			},
+		}},
+	}
+	account, err := fixture.wiring.ResolveAccount(context.Background(), 10, 7, "admin")
+	if err != nil {
+		t.Fatalf("ResolveAccount: %v (duplicate entries for the same account must not conflict)", err)
+	}
+	if account.ID != 81 || account.Role != "admin" {
+		t.Fatalf("account = %+v, want account 81 with role admin", account)
+	}
+}
+
+// TestExploreWiringResolveAccountNotFound fails closed when no account is bound
+// for the requested role.
+func TestExploreWiringResolveAccountNotFound(t *testing.T) {
+	fixture := newWiringFixture(t)
+	_, err := fixture.wiring.ResolveAccount(context.Background(), 10, 7, "qa")
+	var platformErr *platform.Error
+	if !errors.As(err, &platformErr) {
+		t.Fatalf("ResolveAccount error = %T, want *platform.Error", err)
+	}
+	if platformErr.Code != "not_found" {
+		t.Fatalf("error code = %q, want not_found", platformErr.Code)
+	}
+}
+
+// TestExploreWiringResolveAccountConflict reports a state conflict when two
+// different accounts are bound for the requested role.
+func TestExploreWiringResolveAccountConflict(t *testing.T) {
+	fixture := newWiringFixture(t)
+	fixture.versions.view = versionapp.VersionView{
+		ID: 10,
+		Bindings: []versionapp.BindingView{{
+			ID: 7,
+			Accounts: []resourceapp.AccountView{
+				{ID: "81", Roles: []string{"admin"}},
+				{ID: "82", Roles: []string{"admin"}},
+			},
+		}},
+	}
+	_, err := fixture.wiring.ResolveAccount(context.Background(), 10, 7, "admin")
+	var platformErr *platform.Error
+	if !errors.As(err, &platformErr) {
+		t.Fatalf("ResolveAccount error = %T, want *platform.Error", err)
+	}
+	if platformErr.Code != "state_conflict" {
+		t.Fatalf("error code = %q, want state_conflict", platformErr.Code)
+	}
+}
+
 // TestExploreWiringLoginFlow wires the real account store, session store, fact
 // recorder and HTTP executor: a fresh login resolves the bound account, fills
 // and submits through the executor, records one login fact and caches the state.
@@ -383,8 +456,9 @@ func TestExploreWiringLoginFlow(t *testing.T) {
 }
 
 // TestExploreWiringClosesPages proves the throwaway page opened to verify a
-// cached storage ref is closed through DELETE /v1/explore, so repeated reuse
-// cannot exhaust the executor's 8-page cap.
+// cached storage ref is closed through DELETE /v1/explore?page_id=<id>, so
+// repeated reuse cannot exhaust the executor's 8-page cap and concurrent pages
+// on the shared executor runtime are left open.
 func TestExploreWiringClosesPages(t *testing.T) {
 	fixture := newWiringFixture(t)
 	seedWiringSession(t, fixture.sessions, "ss_reused", "http://127.0.0.1:13335/login")
@@ -402,6 +476,12 @@ func TestExploreWiringClosesPages(t *testing.T) {
 	}
 	if fixture.server.closes != 1 {
 		t.Fatalf("reuse verification page close calls = %d, want 1", fixture.server.closes)
+	}
+	if fixture.server.closeAll != 0 {
+		t.Fatalf("reuse must not close every page, close-all calls = %d", fixture.server.closeAll)
+	}
+	if closed := fixture.server.closedPageIDs; len(closed) != 1 || closed[0] != "page_verify" {
+		t.Fatalf("closed page ids = %v, want only the opened verification page page_verify", closed)
 	}
 	if len(fixture.server.callsOf("explore.fill")) != 0 {
 		t.Fatalf("reuse must not drive the login form, calls = %+v", fixture.server.callsOf("explore.fill"))

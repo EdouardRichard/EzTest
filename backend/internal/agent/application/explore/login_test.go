@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,25 +32,41 @@ type fakeReply struct {
 }
 
 // fakeExecutor scripts explore action responses (one queue per action) and
-// records every call, so the tests assert on the real interaction sequence.
+// records every call, so the tests assert on the real interaction sequence. It
+// also keeps a page registry: ClosePage drops exactly one page, so a page the
+// caller still needs must survive a verification-page cleanup (the old
+// close-everything route would drop it).
 type fakeExecutor struct {
 	mu       sync.Mutex
 	queues   map[string][]fakeReply
 	calls    []executorCall
-	closed   int
+	events   []string
+	pages    map[string]bool
+	closed   []string
 	closeErr error
 }
 
 func newFakeExecutor() *fakeExecutor {
-	return &fakeExecutor{queues: map[string][]fakeReply{}}
+	return &fakeExecutor{queues: map[string][]fakeReply{}, pages: map[string]bool{}}
 }
 
-// ClosePages implements the optional explore.PageCloser capability: the login
-// flow closes the throwaway reuse-verification page after a successful check.
-func (f *fakeExecutor) ClosePages(_ context.Context) error {
+// registerPage marks a page as owned by the fake executor runtime (for example
+// a page a concurrent discovery run opened on the shared executor).
+func (f *fakeExecutor) registerPage(pageID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.closed++
+	f.pages[pageID] = true
+}
+
+// ClosePage implements the optional explore.PageCloser capability: the login
+// flow closes only the throwaway reuse-verification page, leaving concurrently
+// opened pages alone.
+func (f *fakeExecutor) ClosePage(_ context.Context, pageID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = append(f.closed, pageID)
+	f.events = append(f.events, "close:"+pageID)
+	f.pages[pageID] = false
 	if f.closeErr != nil {
 		return f.closeErr
 	}
@@ -59,7 +76,42 @@ func (f *fakeExecutor) ClosePages(_ context.Context) error {
 func (f *fakeExecutor) closeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.closed
+	return len(f.closed)
+}
+
+func (f *fakeExecutor) closedPageIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.closed...)
+}
+
+func (f *fakeExecutor) pageIsOpen(pageID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pages[pageID]
+}
+
+// eventIndex returns the position of the nth (1-based) event with name, or -1.
+func (f *fakeExecutor) eventIndex(name string, nth int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := 0
+	for index, event := range f.events {
+		if event != name {
+			continue
+		}
+		seen++
+		if seen == nth {
+			return index
+		}
+	}
+	return -1
+}
+
+func (f *fakeExecutor) eventLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.events...)
 }
 
 func (f *fakeExecutor) queue(action string, results ...map[string]any) {
@@ -80,12 +132,18 @@ func (f *fakeExecutor) Action(_ context.Context, action string, args map[string]
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, executorCall{action: action, args: args})
+	f.events = append(f.events, "action:"+action)
 	queue := f.queues[action]
 	if len(queue) == 0 {
 		return nil, errors.New("fake executor: unexpected action " + action)
 	}
 	reply := queue[0]
 	f.queues[action] = queue[1:]
+	if reply.err == nil && action == "explore.open" {
+		if pageID, ok := reply.result["page_id"].(string); ok && pageID != "" {
+			f.pages[pageID] = true
+		}
+	}
 	return reply.result, reply.err
 }
 
@@ -488,8 +546,114 @@ func TestLoginFlowReusesStorageStateWithoutLoggingIn(t *testing.T) {
 	if len(facts.recorded()) != 1 {
 		t.Fatalf("reuse must still record a login_session fact, got %d", len(facts.recorded()))
 	}
+	if closed := exec.closedPageIDs(); len(closed) != 1 || closed[0] != "page_1" {
+		t.Fatalf("only the throwaway reuse-verification page must be closed, closed = %v", closed)
+	}
 	if exec.closeCount() != 1 {
-		t.Fatalf("the throwaway reuse-verification page must be closed once, close calls = %d", exec.closeCount())
+		t.Fatalf("reuse must close exactly the opened verification page, close calls = %d", exec.closeCount())
+	}
+	if exec.pageIsOpen("page_1") {
+		t.Fatal("the reuse-verification page must be closed")
+	}
+}
+
+// TestLoginReuseClosesOnlyVerificationPage is the regression guard for the
+// shared executor runtime: a concurrent discovery/exploration page must survive
+// the verification reopen's cleanup. Closing every page would abort that run.
+func TestLoginReuseClosesOnlyVerificationPage(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.registerPage("page_concurrent")
+	exec.queue("explore.open", loggedInSnapshot())
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
+		VersionID:       10,
+		VersionSUTID:    7,
+		EnvironmentID:   8,
+		AccountRole:     "admin",
+		StorageStateRef: "ss_reused",
+		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"t"}],"origins":[]}`),
+		LoginURL:        "http://127.0.0.1:13335/login",
+		Route:           "/login",
+		VerifiedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, accounts, sessions, facts)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !session.Reused || session.Status != exploreapp.SessionActive {
+		t.Fatalf("session = %+v, want an active reused session", session)
+	}
+	if exec.closeCount() != 1 {
+		t.Fatalf("reuse must close exactly the opened verification page, close calls = %d", exec.closeCount())
+	}
+	if closed := exec.closedPageIDs(); len(closed) != 1 || closed[0] != "page_1" {
+		t.Fatalf("closed pages = %v, want only the opened verification page page_1", closed)
+	}
+	if exec.pageIsOpen("page_1") {
+		t.Fatal("the opened verification page must be closed")
+	}
+	if !exec.pageIsOpen("page_concurrent") {
+		t.Fatal("a concurrent page on the shared executor must survive verification cleanup")
+	}
+}
+
+// TestLoginReuseCloseFailureStillActive proves a failed verification-page close
+// is best effort: the verified session is still an active reuse outcome.
+func TestLoginReuseCloseFailureStillActive(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.closeErr = errors.New("executor close failed")
+	exec.queue("explore.open", loggedInSnapshot())
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
+		VersionID:       10,
+		VersionSUTID:    7,
+		EnvironmentID:   8,
+		AccountRole:     "admin",
+		StorageStateRef: "ss_reused",
+		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"t"}],"origins":[]}`),
+		LoginURL:        "http://127.0.0.1:13335/login",
+		Route:           "/login",
+		VerifiedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	var logs strings.Builder
+	flow := exploreapp.NewLoginFlow(
+		exploreapp.LoginFlowConfig{
+			VersionID:     10,
+			VersionSUTID:  7,
+			EnvironmentID: 8,
+			Role:          "admin",
+			LoginURL:      "http://127.0.0.1:13335/login",
+		},
+		exploreapp.LoginFlowDeps{
+			Executor: exec,
+			Accounts: &fakeAccounts{},
+			Sessions: sessions,
+			Facts:    &fakeFacts{},
+			Logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+		},
+	)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("a failed cleanup must not fail the reuse: %v", err)
+	}
+	if !session.Reused || session.Status != exploreapp.SessionActive {
+		t.Fatalf("session = %+v, want an active reused session despite the close failure", session)
+	}
+	if closed := exec.closedPageIDs(); len(closed) != 1 || closed[0] != "page_1" {
+		t.Fatalf("close attempts = %v, want the verification page", closed)
+	}
+	// The failed cleanup is observable instead of silently swallowed.
+	if output := logs.String(); !strings.Contains(output, "page_1") || !strings.Contains(output, "verification") {
+		t.Fatalf("close failure must be logged with its page id and purpose, logs = %q", output)
 	}
 }
 
@@ -1050,24 +1214,74 @@ func TestLoginOpenWithSessionUnknownRefFallsBack(t *testing.T) {
 	}
 }
 
-func TestLoginHTTPExecutorDeletesExplorePages(t *testing.T) {
+// TestLoginOpenWithSessionNavigationFallbackClosesLoginPage covers the direct-ref
+// caller after a fresh login whose authenticated page cannot navigate to the
+// target URL. The flow must close that login page before opening a second page;
+// otherwise the fixed-capacity executor runtime leaks one page per fallback.
+func TestLoginOpenWithSessionNavigationFallbackClosesLoginPage(t *testing.T) {
+	const targetURL = "http://127.0.0.1:13335/orders"
+	exec := newFakeExecutor()
+	// No cached session: OpenWithSession falls back to a fresh login.
+	exec.queue("explore.open", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	exec.queueError("explore.open", &exploreapp.ExecutorActionError{
+		Code:    "timeout",
+		Message: "navigation to the target URL timed out",
+	})
+	exec.queue("explore.open", targetPageSnapshot("page_2", targetURL, "/orders"))
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"}, sessions, facts)
+
+	page, fact, err := flow.OpenWithSession(context.Background(), exploreapp.Account{ID: 81, Role: "admin"}, targetURL)
+	if err != nil {
+		t.Fatalf("OpenWithSession: %v", err)
+	}
+	if fact.Status != exploreapp.SessionActive {
+		t.Fatalf("fact = %+v, want an active login", fact)
+	}
+	if page.ID != "page_2" || page.URL != targetURL {
+		t.Fatalf("page = %+v, want the fallback page serving the target URL", page)
+	}
+	if exec.closeCount() != 1 {
+		t.Fatalf("the fallback must close only the authenticated login page, close calls = %d", exec.closeCount())
+	}
+	if closed := exec.closedPageIDs(); len(closed) != 1 || closed[0] != "page_1" {
+		t.Fatalf("closed pages = %v, want the authenticated login page page_1", closed)
+	}
+	navOpen := exec.eventIndex("action:explore.open", 2)
+	closeEvent := exec.eventIndex("close:page_1", 1)
+	fallbackOpen := exec.eventIndex("action:explore.open", 3)
+	if navOpen < 0 || closeEvent < 0 || fallbackOpen < 0 {
+		t.Fatalf("missing expected events: %v", exec.eventLog())
+	}
+	if !(navOpen < closeEvent && closeEvent < fallbackOpen) {
+		t.Fatalf("the login page must be closed before the fallback open: %v", exec.eventLog())
+	}
+}
+func TestLoginHTTPExecutorClosesExplorePage(t *testing.T) {
 	var (
 		gotMethod string
 		gotPath   string
+		gotPageID string
 		gotAuth   string
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
+		gotPageID = r.URL.Query().Get("page_id")
 		gotAuth = r.Header.Get("authorization")
 		w.Header().Set("content-type", "application/json")
-		_, _ = io.WriteString(w, `{"ok":true,"result":{"closed":true}}`)
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"closed":true,"page_id":"page_7"}}`)
 	}))
 	defer server.Close()
 
 	exec := exploreapp.NewHTTPExecutor(server.URL, "executor-token", time.Second)
-	if err := exec.ClosePages(context.Background()); err != nil {
-		t.Fatalf("ClosePages: %v", err)
+	if err := exec.ClosePage(context.Background(), "page_7"); err != nil {
+		t.Fatalf("ClosePage: %v", err)
 	}
 	if gotMethod != http.MethodDelete {
 		t.Fatalf("close method = %q, want DELETE", gotMethod)
@@ -1075,8 +1289,15 @@ func TestLoginHTTPExecutorDeletesExplorePages(t *testing.T) {
 	if gotPath != exploreapp.ExplorePagesPath {
 		t.Fatalf("close path = %q, want %q", gotPath, exploreapp.ExplorePagesPath)
 	}
+	if gotPageID != "page_7" {
+		t.Fatalf("close page_id = %q, want page_7", gotPageID)
+	}
 	if gotAuth != "Bearer executor-token" {
 		t.Fatalf("authorization = %q", gotAuth)
+	}
+	// A missing page id must never degrade into the close-all route.
+	if err := exec.ClosePage(context.Background(), "  "); err == nil {
+		t.Fatal("ClosePage without a page id must fail instead of closing every page")
 	}
 }
 

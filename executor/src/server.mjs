@@ -195,8 +195,11 @@ export function createExecutorServer({
   async function handle(req, res) {
     const startedAt = Date.now()
     let pathname = "/"
+    let searchParams = null
     try {
-      pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname
+      const parsed = new URL(req.url ?? "/", "http://127.0.0.1")
+      pathname = parsed.pathname
+      searchParams = parsed.searchParams
     } catch {
       // Keep the default path; the request will 404 below.
     }
@@ -249,7 +252,12 @@ export function createExecutorServer({
       if (req.method !== "DELETE") {
         return sendError(res, 405, "invalid_request", "method not allowed")
       }
-      const result = await exploreRuntime.closePages()
+      // Optional page_id scopes the cleanup to one page (P9 login reuse closes
+      // only its throwaway verification page, leaving concurrent exploration
+      // pages/actions alone). Without it the route keeps its close-all meaning.
+      const pageId = searchParams?.get("page_id") ?? null
+      const result =
+        pageId === null ? await exploreRuntime.closePages() : await exploreRuntime.closePage(pageId)
       return sendJson(res, 200, { ok: true, result })
     }
 

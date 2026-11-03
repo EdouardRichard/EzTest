@@ -6,7 +6,8 @@ package main
 // once here: one HTTP explore-action executor, one bounded version-scoped
 // session cache and one version fact service, so every explore caller shares
 // the same cache-miss policy (unknown storage_state_ref -> fresh login) and the
-// same executor-page cleanup (DELETE /v1/explore).
+// same executor-page cleanup (DELETE /v1/explore?page_id=<id>, scoped to the
+// throwaway verification page so concurrent explore pages stay open).
 //
 // The CaseSuccessHook is intentionally not wired here: the knowledge adapter
 // does not implement executionapp.CaseSuccessHook yet, and inventing one is not

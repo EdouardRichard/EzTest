@@ -264,6 +264,82 @@ test("the explore action family is closed and has no shell path", async () => {
   )
 })
 
+test("DELETE /v1/explore?page_id closes only the requested page", async () => {
+  const first = await openPage("/home")
+  const second = await openPage("/home")
+  assert.notEqual(first.page_id, second.page_id)
+
+  const closed = await request(`/v1/explore?page_id=${encodeURIComponent(first.page_id)}`, {
+    method: "DELETE",
+  })
+  assert.equal(closed.status, 200, closed.text)
+  assert.equal(closed.json.ok, true, closed.text)
+  assert.equal(closed.json.result.closed, true)
+  assert.equal(closed.json.result.page_id, first.page_id)
+
+  const gone = await act("explore.snapshot", { page_id: first.page_id })
+  assert.equal(gone.json.ok, false, gone.text)
+  assert.equal(gone.json.error.code, "page_not_found")
+
+  // The concurrent page and its isolated session are untouched.
+  const alive = await act("explore.snapshot", { page_id: second.page_id })
+  assert.equal(alive.status, 200, alive.text)
+  assert.equal(alive.json.ok, true, alive.text)
+  assert.equal(alive.json.result.page_id, second.page_id)
+
+  // Closing an already-closed page is an idempotent no-op.
+  const again = await request(`/v1/explore?page_id=${encodeURIComponent(first.page_id)}`, {
+    method: "DELETE",
+  })
+  assert.equal(again.status, 200, again.text)
+  assert.deepEqual(again.json, {
+    ok: true,
+    result: { closed: false, page_id: first.page_id },
+  })
+})
+
+test("DELETE /v1/explore rejects an empty page_id without closing pages", async () => {
+  const opened = await openPage("/home")
+  const response = await request("/v1/explore?page_id=", { method: "DELETE" })
+  assert.equal(response.status, 400, response.text)
+  assert.equal(response.json.ok, false)
+  assert.equal(response.json.error.code, "invalid_arguments")
+  const alive = await act("explore.snapshot", { page_id: opened.page_id })
+  assert.equal(alive.json.ok, true, alive.text)
+})
+
+test("closing a page by page_id aborts only its in-flight action", async () => {
+  const target = await openPage("/home")
+  const survivor = await openPage("/home")
+
+  const pending = act("explore.open", {
+    page_id: target.page_id,
+    url: `${pageServer.url}/slow`,
+    timeout_ms: 5000,
+  })
+  await delay(300)
+  const closed = await request(`/v1/explore?page_id=${encodeURIComponent(target.page_id)}`, {
+    method: "DELETE",
+  })
+  assert.equal(closed.status, 200, closed.text)
+  assert.equal(closed.json.result.closed, true)
+
+  const outcome = await pending
+  assert.equal(outcome.status, 200, outcome.text)
+  assert.equal(outcome.json.ok, false, outcome.text)
+  assert.equal(outcome.json.error.code, "canceled")
+
+  const alive = await act("explore.snapshot", { page_id: survivor.page_id })
+  assert.equal(alive.json.ok, true, alive.text)
+  assert.equal(alive.json.result.page_id, survivor.page_id)
+
+  // No page_id keeps the original close-everything behavior.
+  const all = await request("/v1/explore", { method: "DELETE" })
+  assert.equal(all.json.ok, true, all.text)
+  assert.equal(all.json.result.closed, true)
+  assert.equal(explore.size, 0)
+})
+
 test("explore.cancel aborts an in-flight action", async () => {
   const pending = act("explore.open", {
     url: `${pageServer.url}/slow`,
