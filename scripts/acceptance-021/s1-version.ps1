@@ -4,21 +4,30 @@
     S1 create-version acceptance for EzTest 0.2.1.
 
 .DESCRIPTION
-    Creates a version with the full 墨栈博客 binding (SUT + local environment +
-    the three SUT accounts + the SUT code repository), posts the version
-    description/goal as the first clarification message, and then asserts that
-    the discovery sub-loop produced the three required version facts:
-    `login_session`, `page` and `api`.
+    Creates a discovery version with the full 墨栈博客 binding (SUT + local
+    environment + the three SUT accounts + the SUT code repository), posts the
+    version description/goal as the first clarification message, and then
+    asserts that the discovery sub-loop produced the three required version
+    facts: `login_session`, `page` and `api`.
 
-    The version is intentionally *not* pre-populated with pages or APIs: the
-    acceptance expects the product to discover them. A missing fact is a real
-    failure, not a skip.
+    The discovery version is intentionally created BEFORE discovery and without
+    pages/APIs, exactly like the pre-Task-86 flow: a version binding is an
+    immutable snapshot, so that version can never gain the discovered pages.
+    After the facts appear, the script waits for P9 to propose the discovered
+    pages/APIs as resource rows of the bound environment and creates a WORKING
+    version from those real IDs. The working version must bind pages > 0 and
+    APIs > 0 and expose route locators; a 0-page version fails loudly instead of
+    passing on discovery facts alone. The script creates/approves no resource.
 
     All observations and the full facts snapshot are written under
     docs/version-V0.2.1/acceptance/evidence/s0-s2/s1/.
 
 .PARAMETER FactTimeoutSeconds
     How long to wait for the discovery facts. Defaults to 120 seconds.
+
+.PARAMETER ResourceTimeoutSeconds
+    How long to wait, after the facts, for P9 to propose the discovered pages
+    and APIs into the bound environment. Defaults to 120 seconds.
 
 .NOTES
     Exit codes: 0 = passed, 1 = failed acceptance assertion, 2 = blocked
@@ -35,7 +44,8 @@ param(
     [string] $AdminPassword = "",
     [string] $SutPassword = "",
     [string] $EvidenceRoot = "",
-    [int] $FactTimeoutSeconds = 120
+    [int] $FactTimeoutSeconds = 120,
+    [int] $ResourceTimeoutSeconds = 120
 )
 
 Set-StrictMode -Version 3.0
@@ -53,6 +63,14 @@ $runSuffix = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $version = $null
 $conversation = $null
 $bindingResult = $null
+$boundSutId = ""
+$boundEnvironmentId = ""
+$resourceWait = $null
+$bindableResources = $null
+$workingVersion = $null
+$workingVersionId = ""
+$workingResourceCounts = $null
+$workingResourceCheck = $null
 $exitCode = 2
 
 try {
@@ -72,7 +90,12 @@ try {
         # ------------------------------------------------------------------
         $bindingResult = $null
         try {
-            $bindingResult = Resolve-AcceptanceSutBinding -Context $context
+            # Task 86: the discovery version is created BEFORE discovery and
+            # deliberately binds no pages/APIs (the pre-fix order). Its immutable
+            # binding is the evidence that facts alone never reach a version.
+            $bindingResult = Resolve-AcceptanceSutBinding -Context $context -WithoutEnvironmentResources
+            $boundSutId = [string](Get-JsonProp -Object $bindingResult.Sut -Name "id" -Default "")
+            $boundEnvironmentId = [string](Get-JsonProp -Object $bindingResult.Environment -Name "id" -Default "")
             Write-EvidenceJson -Path (Join-Path $scenario.Directory "sut-binding.json") -Value ([pscustomobject]@{
                 sut = $bindingResult.Sut
                 environment = $bindingResult.Environment
@@ -101,8 +124,10 @@ try {
             # ------------------------------------------------------------------
             # Create the version and verify the binding round-trips
             # ------------------------------------------------------------------
-            $title = "墨栈博客 0.2.1 验收 · S1 建版本 · $runSuffix"
+            $title = "墨栈博客 0.2.1 验收 · S1 发现版本 · $runSuffix"
             try {
+                # Discovery runs on this version; its bound pages/APIs are 0 by
+                # design. The working version is created after discovery below.
                 $version = New-AcceptanceVersion -Context $context -Title $title -Binding $bindingResult.Binding
                 Write-EvidenceJson -Path (Join-Path $scenario.Directory "version.json") -Value $version
                 Add-AcceptanceArtifact -Scenario $scenario -Path (Join-Path $scenario.Directory "version.json") -Kind "api" -Note "created version"
@@ -211,6 +236,95 @@ try {
                     -Detail ("api=$apiFacts; all kinds: $kindDetail")
 
                 # ------------------------------------------------------------------
+                # Task 86 (P10-T11): discovery -> version binding order.
+                #
+                # P9 discovery records page/api version facts AND (since Task 76)
+                # proposes the same pages/APIs as sut_page/sut_api rows of the
+                # version's bound environment. A fact is not a bindable resource
+                # and a version binding is immutable, so the discovery version
+                # above can never gain those pages. Wait for the proposals, then
+                # create the working version from the real resource IDs. The
+                # script only reads the catalog: nothing is created or approved.
+                # ------------------------------------------------------------------
+                $resourceWait = Wait-AcceptanceEnvironmentResources -Context $context -EnvironmentId $boundEnvironmentId `
+                    -RequireApis -TimeoutSeconds $ResourceTimeoutSeconds
+                $discoveredResources = $resourceWait.Resources
+                $bindableResources = $resourceWait.Bindable
+                Write-EvidenceJson -Path (Join-Path $scenario.Directory "discovered-resources.json") -Value ([pscustomobject]@{
+                    discovery_version_id = $versionId
+                    sut_id               = $boundSutId
+                    environment_id       = $boundEnvironmentId
+                    wait_ok              = $resourceWait.Ok
+                    timed_out            = $resourceWait.TimedOut
+                    timeout_seconds      = $ResourceTimeoutSeconds
+                    page_count           = $bindableResources.PageCount
+                    api_count            = $bindableResources.ApiCount
+                    bindable_statuses    = @($bindableResources.Statuses)
+                    pages                = @($bindableResources.Pages | ForEach-Object {
+                        [pscustomobject]@{
+                            id             = [string](Get-JsonProp -Object $_ -Name "id" -Default "")
+                            name           = [string](Get-JsonProp -Object $_ -Name "name" -Default "")
+                            url            = [string](Get-JsonProp -Object $_ -Name "url" -Default "")
+                            route_template = [string](Get-JsonProp -Object $_ -Name "route_template" -Default "")
+                            status         = [string](Get-JsonProp -Object $_ -Name "status" -Default "")
+                            source         = [string](Get-JsonProp -Object $_ -Name "source" -Default "")
+                        }
+                    })
+                    apis                 = @($bindableResources.APIs | ForEach-Object {
+                        [pscustomobject]@{
+                            id            = [string](Get-JsonProp -Object $_ -Name "id" -Default "")
+                            name          = [string](Get-JsonProp -Object $_ -Name "name" -Default "")
+                            method        = [string](Get-JsonProp -Object $_ -Name "method" -Default "")
+                            path_template = [string](Get-JsonProp -Object $_ -Name "path_template" -Default "")
+                            status        = [string](Get-JsonProp -Object $_ -Name "status" -Default "")
+                            source        = [string](Get-JsonProp -Object $_ -Name "source" -Default "")
+                        }
+                    })
+                    skipped_pages        = $bindableResources.SkippedPageCount
+                    skipped_apis         = $bindableResources.SkippedApiCount
+                    error                = $discoveredResources.Error
+                })
+                Add-AcceptanceArtifact -Scenario $scenario -Path (Join-Path $scenario.Directory "discovered-resources.json") -Kind "api" -Note "P9-discovered bindable page/API resources of the bound environment"
+
+                if ($resourceWait.Ok) {
+                    try {
+                        $workingBinding = New-AcceptanceBindingWithResources -Binding $bindingResult.Binding -Resources $bindableResources
+                        $workingVersion = New-AcceptanceVersion -Context $context -Title ("墨栈博客 0.2.1 验收 · S1 工作版本 · " + $runSuffix) -Binding $workingBinding
+                        $workingVersionId = [string](Get-JsonProp -Object $workingVersion -Name "id" -Default "")
+                        Write-EvidenceJson -Path (Join-Path $scenario.Directory "working-version.json") -Value $workingVersion
+                        Add-AcceptanceArtifact -Scenario $scenario -Path (Join-Path $scenario.Directory "working-version.json") -Kind "api" -Note "version created after discovery with bound page/API resources"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "working version created after discovery" -Passed ($workingVersionId -ne "") -Severity assertion `
+                            -Detail ("discovery_version=$versionId working_version=$workingVersionId binding_pages=$($bindableResources.PageCount) binding_apis=$($bindableResources.ApiCount)")
+                    } catch {
+                        Add-AcceptanceCheck -Scenario $scenario -Name "working version created after discovery" -Passed $false -Severity assertion -Detail $_.Exception.Message
+                    }
+                } else {
+                    Add-AcceptanceCheck -Scenario $scenario -Name "discovery proposed bindable page/API resources into the bound environment" -Passed $false -Severity assertion `
+                        -Detail ("after ${ResourceTimeoutSeconds}s pages=$($bindableResources.PageCount) apis=$($bindableResources.ApiCount) environment=$boundEnvironmentId error=$($discoveredResources.Error); discovery facts are not bindable resources")
+                }
+
+                $workingResourceCounts = Get-AcceptanceVersionResourceCounts -Version $workingVersion
+                Write-EvidenceJson -Path (Join-Path $scenario.Directory "working-version-resources.json") -Value ([pscustomobject]@{
+                    working_version_id = $workingVersionId
+                    counts             = [pscustomobject]@{
+                        bindings       = $workingResourceCounts.Bindings
+                        pages          = $workingResourceCounts.PageCount
+                        apis           = $workingResourceCounts.ApiCount
+                        route_locators = $workingResourceCounts.RoutePageCount
+                        page_urls      = $workingResourceCounts.UrlPageCount
+                    }
+                    pages              = @($workingResourceCounts.Pages)
+                    apis               = @($workingResourceCounts.APIs)
+                })
+                Add-AcceptanceArtifact -Scenario $scenario -Path (Join-Path $scenario.Directory "working-version-resources.json") -Kind "binding" -Note "working version bound pages/APIs (design locators / execution page URLs)"
+
+                $workingResourceCheck = Get-AcceptanceVersionResourceCheck -Counts $workingResourceCounts -RequireApis -RequireLocators -RequirePageUrls
+                Add-AcceptanceCheck -Scenario $scenario -Name "version_pages > 0" -Passed $workingResourceCheck.PagePassed -Severity assertion -Detail $workingResourceCheck.PageDetail
+                Add-AcceptanceCheck -Scenario $scenario -Name "version_apis > 0" -Passed $workingResourceCheck.ApiPassed -Severity assertion -Detail $workingResourceCheck.ApiDetail
+                Add-AcceptanceCheck -Scenario $scenario -Name "bound pages provide route locators for design/execution" -Passed $workingResourceCheck.LocatorPassed -Severity assertion -Detail $workingResourceCheck.LocatorDetail
+                Add-AcceptanceCheck -Scenario $scenario -Name "bound pages provide SUT page URLs for execution" -Passed $workingResourceCheck.UrlPassed -Severity assertion -Detail $workingResourceCheck.UrlDetail
+
+                # ------------------------------------------------------------------
                 # Supporting evidence: stage, work items, messages, screenshots
                 # ------------------------------------------------------------------
                 try {
@@ -257,9 +371,20 @@ try {
                 } catch {
                     Add-AcceptanceCheck -Scenario $scenario -Name "exploration chain screenshot" -Passed $false -Severity warning -Detail $_.Exception.Message
                 }
+                if ($workingVersionId -ne "") {
+                    try {
+                        $workingShot = Save-AcceptanceScreenshot -Context $context -Scenario $scenario -Route "/versions/$workingVersionId" -FileName "s1-working-version-overview.png" `
+                            -WaitForSelector '[data-testid="version-header"]' -Note "working version created after discovery (bound pages/APIs)"
+                        Add-AcceptanceCheck -Scenario $scenario -Name "working version overview screenshot" -Passed $true -Severity warning -Detail (Resolve-RepoRelativePath -Context $context -Path $workingShot.Path)
+                    } catch {
+                        Add-AcceptanceCheck -Scenario $scenario -Name "working version overview screenshot" -Passed $false -Severity warning -Detail $_.Exception.Message
+                    }
+                }
 
                 if ($loginFacts -eq 0 -or $pageFacts -eq 0 -or $apiFacts -eq 0) {
                     $scenario.ErrorMessage = "S1 failed: discovery facts missing after ${FactTimeoutSeconds}s (login_session=$loginFacts page=$pageFacts api=$apiFacts)"
+                } elseif ($null -eq $workingVersion -or $null -eq $workingResourceCheck -or -not $workingResourceCheck.Passed) {
+                    $scenario.ErrorMessage = "S1 failed: the working version does not bind the discovered resources (version_pages=$($workingResourceCounts.PageCount) version_apis=$($workingResourceCounts.ApiCount) route_locators=$($workingResourceCounts.RoutePageCount)); discovery facts alone are not a bindable version"
                 }
             }
         }

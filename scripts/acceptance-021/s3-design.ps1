@@ -23,6 +23,16 @@
       6. a case detail exposes executable steps, assertions (success criteria)
          and evidence sources.
 
+    Task 86 (P10-T11) adds the design-input resource gate: the version the
+    design runs on must bind the pages/APIs P9 discovery proposed (pages > 0,
+    APIs > 0, at least one page route_template locator). A version created
+    before discovery carries an immutable empty binding, so it fails loudly
+    instead of producing an empty VersionPack. Run S1 discovery first so the
+    environment catalog has discovered resources when this version is created;
+    a reused version created before the fix must be recreated (fresh S2/S3
+    rerun on a version created after discovery). This script never creates,
+    approves or fakes a resource.
+
     There is deliberately no downgrade path: when the version is not at the
     hard-gate source stage, the script records the typed 409 and fails instead
     of switching to the 0.2 requirement-confirmation API. The script writes no
@@ -105,6 +115,8 @@ $designConversation = $null
 $stageGateError = ""
 $requirementGatePassed = $false
 $stageAtEndValue = ""
+$designResourceCounts = $null
+$designResourceCheck = $null
 
 function Save-S3State {
     param([hashtable] $Values)
@@ -342,10 +354,45 @@ try {
             }
         }
 
+        $designResourceCounts = $null
+        $designResourceCheck = $null
         if ($null -ne $version -and $versionId -ne "") {
             Save-S3State -Values @{ version_id = $versionId }
             Write-S3Evidence -Name "version.json" -Value $version -Note "version used by S3"
 
+            # ------------------------------------------------------------------
+            # Task 86 (P10-T11): the design input must be a version that binds
+            # the pages/APIs P9 discovery proposed. A version created before
+            # discovery (e.g. the Task 72 S2 version) has an immutable empty
+            # binding and can never gain pages; fail loudly here instead of
+            # burning a design run on an empty VersionPack.
+            # ------------------------------------------------------------------
+            $designResourceCounts = Get-AcceptanceVersionResourceCounts -Version $version
+            $designResourceCheck = Get-AcceptanceVersionResourceCheck -Counts $designResourceCounts -RequireApis -RequireLocators -RequirePageUrls
+            [void](Write-S3Evidence -Name "design-input-resources.json" -Value ([pscustomobject]@{
+                version_id = $versionId
+                reused     = $isReusedVersion
+                counts     = [pscustomobject]@{
+                    bindings       = $designResourceCounts.Bindings
+                    pages          = $designResourceCounts.PageCount
+                    apis           = $designResourceCounts.ApiCount
+                    route_locators = $designResourceCounts.RoutePageCount
+                    page_urls      = $designResourceCounts.UrlPageCount
+                }
+                pages      = @($designResourceCounts.Pages)
+                apis       = @($designResourceCounts.APIs)
+                check      = $designResourceCheck
+            }) -Kind "binding" -Note "pages/APIs bound to the design version (VersionPack locator source)")
+            Add-AcceptanceCheck -Scenario $scenario -Name "version_pages > 0" -Passed $designResourceCheck.PagePassed -Severity assertion -Detail $designResourceCheck.PageDetail
+            Add-AcceptanceCheck -Scenario $scenario -Name "version_apis > 0" -Passed $designResourceCheck.ApiPassed -Severity assertion -Detail $designResourceCheck.ApiDetail
+            Add-AcceptanceCheck -Scenario $scenario -Name "bound pages provide route locators for design" -Passed $designResourceCheck.LocatorPassed -Severity assertion -Detail $designResourceCheck.LocatorDetail
+            Add-AcceptanceCheck -Scenario $scenario -Name "bound pages provide SUT page URLs for execution" -Passed $designResourceCheck.UrlPassed -Severity assertion -Detail $designResourceCheck.UrlDetail
+            if (-not $designResourceCheck.Passed) {
+                $scenario.ErrorMessage = "S3 failed: version $versionId does not bind usable discovery resources (version_pages=$($designResourceCounts.PageCount) version_apis=$($designResourceCounts.ApiCount) route_locators=$($designResourceCounts.RoutePageCount)); version bindings are immutable, so run fresh S1 discovery first and use a version created after it (fresh S2/S3 rerun)"
+            }
+        }
+
+        if ($null -ne $designResourceCheck -and $designResourceCheck.Passed) {
             # ------------------------------------------------------------------
             # Clarification: create the conversation and request a compact
             # requirement draft. The design conversation must NOT be created by

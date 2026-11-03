@@ -1029,7 +1029,8 @@ function Resolve-AcceptanceSutBinding {
         [Parameter(Mandatory = $true)] $Context,
         [Parameter(Mandatory = $false)] [string] $SutName = "墨栈博客",
         [Parameter(Mandatory = $false)] [string] $EnvironmentName = "local",
-        [Parameter(Mandatory = $false)] [string] $CodeRepoPath = "D:\project"
+        [Parameter(Mandatory = $false)] [string] $CodeRepoPath = "D:\project",
+        [Parameter(Mandatory = $false)] [switch] $WithoutEnvironmentResources
     )
     $created = @()
     $suts = @(Get-AllSuts -Context $Context)
@@ -1130,15 +1131,30 @@ function Resolve-AcceptanceSutBinding {
         $role = if ($roles.Count -gt 0) { [string]$roles[0] } else { [string]$requestedAccounts[$index].roles[0] }
         $accountInputs += @{ account_id = $accountId; role = $role }
     }
-    $binding = @{
-        sut_id             = $sutId
-        environment_id     = $environmentId
-        code_repository_id = $repositoryId
-        page_ids           = @()
-        api_ids            = @()
-        database_ids       = @()
-        accounts           = $accountInputs
+
+    # Task 86: a version binding is an immutable snapshot, so a version created
+    # after P9 discovery must select the pages/APIs discovery proposed into this
+    # environment. Reading the catalog never creates or approves a resource.
+    # The S1 discovery version opts out on purpose: it is created before
+    # discovery, exactly like the pre-fix flow, while the working version below
+    # is created afterwards from the discovered rows.
+    $environmentResources = $null
+    $bindableResources = $null
+    if (-not $WithoutEnvironmentResources) {
+        $environmentResources = Get-AcceptanceEnvironmentResources -Context $Context -EnvironmentId $environmentId
+        if (-not $environmentResources.Ok) {
+            throw "environment resources could not be read for environment ${environmentId}: $($environmentResources.Error)"
+        }
+        $bindableResources = Get-AcceptanceBindableResources -Pages $environmentResources.Pages -APIs $environmentResources.APIs
     }
+    $pageIds = @()
+    $apiIds = @()
+    if ($null -ne $bindableResources) {
+        $pageIds = @($bindableResources.PageIds)
+        $apiIds = @($bindableResources.ApiIds)
+    }
+    $binding = New-AcceptanceBindingPayload -SutId $sutId -EnvironmentId $environmentId `
+        -CodeRepositoryId $repositoryId -Accounts $accountInputs -PageIds $pageIds -ApiIds $apiIds
     return [pscustomobject]@{
         Sut             = $sut
         Environment     = $environment
@@ -1147,6 +1163,332 @@ function Resolve-AcceptanceSutBinding {
         Binding         = $binding
         Created         = @($created)
         EnvironmentCount = $environments.Count
+        Resources       = $environmentResources
+        BindableResources = $bindableResources
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Discovery resources -> version binding (Task 86)
+# ---------------------------------------------------------------------------
+#
+# P9 discovery records page/api version facts AND (since Task 76) proposes the
+# same pages/APIs as sut_page/sut_api rows of the version's bound environment.
+# A fact is not bindable and a version binding is immutable, so the acceptance
+# flow must read the environment catalog after discovery and create the working
+# version from those IDs. Everything below is read-only: no resource is created,
+# approved or faked by the acceptance scripts.
+
+function Get-AcceptanceEnvironmentResources {
+    <#
+        Reads the page/API resource catalog of one environment. Proposed and
+        approved rows are returned as-is; the caller decides what is bindable.
+        A transport/HTTP failure is reported in Ok/Error instead of throwing so a
+        wait loop can record the final failure state honestly.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Context,
+        [Parameter(Mandatory = $true)] [string] $EnvironmentId
+    )
+    if ([string]::IsNullOrWhiteSpace($EnvironmentId)) {
+        throw "environment id is required to read discovered page/API resources"
+    }
+    $errors = @()
+    $pageResponse = $null
+    $apiResponse = $null
+    try {
+        $pageResponse = Invoke-Api -Context $Context -Method "GET" -Path "/api/resources/environments/$EnvironmentId/pages" -Token $Context.Token -TimeoutSeconds 30
+    } catch {
+        $errors += "pages: $($_.Exception.Message)"
+    }
+    try {
+        $apiResponse = Invoke-Api -Context $Context -Method "GET" -Path "/api/resources/environments/$EnvironmentId/apis" -Token $Context.Token -TimeoutSeconds 30
+    } catch {
+        $errors += "apis: $($_.Exception.Message)"
+    }
+    $pages = @()
+    if ($null -ne $pageResponse) {
+        if ($pageResponse.Ok) { $pages = @($pageResponse.Data) }
+        else { $errors += "pages: HTTP $($pageResponse.Status)" }
+    }
+    $apis = @()
+    if ($null -ne $apiResponse) {
+        if ($apiResponse.Ok) { $apis = @($apiResponse.Data) }
+        else { $errors += "apis: HTTP $($apiResponse.Status)" }
+    }
+    return [pscustomobject]@{
+        EnvironmentId = $EnvironmentId
+        Pages         = @($pages)
+        APIs          = @($apis)
+        PageCount     = @($pages).Count
+        ApiCount      = @($apis).Count
+        Ok            = (@($errors).Count -eq 0)
+        Error         = (@($errors) -join "; ")
+    }
+}
+
+function Get-AcceptanceBindableResources {
+    <#
+        Filters environment catalog rows down to the rows a version may bind:
+        proposed and approved by default. Rejected/status-less rows are skipped,
+        duplicate IDs are removed and the catalog order is preserved. This is
+        the pure half of the discovery hand-off, tested without a live stack.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $Pages = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $APIs = @(),
+        [Parameter(Mandatory = $false)] [string[]] $Statuses = @("proposed", "approved")
+    )
+    $allowed = @()
+    foreach ($status in @($Statuses)) {
+        $normalized = ([string]$status).Trim().ToLowerInvariant()
+        if ($normalized -ne "" -and $allowed -notcontains $normalized) { $allowed += $normalized }
+    }
+    $bindablePages = @()
+    $pageIds = @()
+    $skippedPages = 0
+    foreach ($page in @($Pages)) {
+        $id = [string](Get-JsonProp -Object $page -Name "id" -Default "")
+        $status = ([string](Get-JsonProp -Object $page -Name "status" -Default "")).Trim().ToLowerInvariant()
+        if ($id -eq "" -or $allowed -notcontains $status -or @($pageIds) -contains $id) {
+            $skippedPages++
+            continue
+        }
+        $pageIds += $id
+        $bindablePages += $page
+    }
+    $bindableApis = @()
+    $apiIds = @()
+    $skippedApis = 0
+    foreach ($api in @($APIs)) {
+        $id = [string](Get-JsonProp -Object $api -Name "id" -Default "")
+        $status = ([string](Get-JsonProp -Object $api -Name "status" -Default "")).Trim().ToLowerInvariant()
+        if ($id -eq "" -or $allowed -notcontains $status -or @($apiIds) -contains $id) {
+            $skippedApis++
+            continue
+        }
+        $apiIds += $id
+        $bindableApis += $api
+    }
+    return [pscustomobject]@{
+        Pages           = @($bindablePages)
+        APIs            = @($bindableApis)
+        PageIds         = @($pageIds)
+        ApiIds          = @($apiIds)
+        PageCount       = @($bindablePages).Count
+        ApiCount        = @($bindableApis).Count
+        SkippedPageCount = $skippedPages
+        SkippedApiCount = $skippedApis
+        Statuses        = @($allowed)
+    }
+}
+
+function New-AcceptanceBindingPayload {
+    <#
+        Builds the POST /api/versions binding payload from the resolved SUT /
+        environment / repository / accounts plus the discovered page/API IDs.
+        Keeping this pure makes the S1 working-version binding testable without
+        a stack.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $SutId,
+        [Parameter(Mandatory = $true)] [string] $EnvironmentId,
+        [Parameter(Mandatory = $false)] [string] $CodeRepositoryId = "",
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] $Accounts = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $PageIds = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $ApiIds = @(),
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $DatabaseIds = @()
+    )
+    return @{
+        sut_id             = $SutId
+        environment_id     = $EnvironmentId
+        code_repository_id = $CodeRepositoryId
+        page_ids           = @($PageIds)
+        api_ids            = @($ApiIds)
+        database_ids       = @($DatabaseIds)
+        accounts           = @($Accounts)
+    }
+}
+
+function New-AcceptanceBindingWithResources {
+    <#
+        Returns a copy of a resolved binding with page_ids/api_ids replaced by
+        the discovered resource IDs. The source binding is not mutated, so the
+        pre-discovery version keeps its immutable empty scope for evidence.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Binding,
+        [Parameter(Mandatory = $true)] $Resources
+    )
+    $copy = @{}
+    if ($Binding -is [System.Collections.IDictionary]) {
+        foreach ($key in $Binding.Keys) { $copy[[string]$key] = $Binding[$key] }
+    } else {
+        foreach ($property in $Binding.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+    }
+    $copy["page_ids"] = @(Get-JsonProp -Object $Resources -Name "PageIds" -Default @())
+    $copy["api_ids"] = @(Get-JsonProp -Object $Resources -Name "ApiIds" -Default @())
+    return $copy
+}
+
+function Get-AcceptanceVersionResourceCounts {
+    <#
+        Reads the bound pages/APIs of a version read model. This is the data the
+        design VersionPack renders (page name + route template locators) and the
+        execution binding turns into navigable SUT page URLs. Discovery version
+        facts are deliberately NOT consulted: a fact is not a bound resource.
+    #>
+    param([Parameter(Mandatory = $false)] $Version = $null)
+    $bindings = @()
+    if ($null -ne $Version) {
+        $bindings = @(Get-JsonProp -Object $Version -Name "bindings" -Default @())
+    }
+    $pages = @()
+    $apis = @()
+    $pageIds = @()
+    $apiIds = @()
+    foreach ($binding in $bindings) {
+        foreach ($page in @(Get-JsonProp -Object $binding -Name "pages" -Default @())) {
+            $id = [string](Get-JsonProp -Object $page -Name "id" -Default "")
+            if ($id -ne "" -and @($pageIds) -contains $id) { continue }
+            if ($id -ne "") { $pageIds += $id }
+            $pages += [pscustomobject]@{
+                id             = $id
+                name           = [string](Get-JsonProp -Object $page -Name "name" -Default "")
+                url            = [string](Get-JsonProp -Object $page -Name "url" -Default "")
+                route_template = [string](Get-JsonProp -Object $page -Name "route_template" -Default "")
+                status         = [string](Get-JsonProp -Object $page -Name "status" -Default "")
+                source         = [string](Get-JsonProp -Object $page -Name "source" -Default "")
+            }
+        }
+        foreach ($api in @(Get-JsonProp -Object $binding -Name "apis" -Default @())) {
+            $id = [string](Get-JsonProp -Object $api -Name "id" -Default "")
+            if ($id -ne "" -and @($apiIds) -contains $id) { continue }
+            if ($id -ne "") { $apiIds += $id }
+            $apis += [pscustomobject]@{
+                id            = $id
+                name          = [string](Get-JsonProp -Object $api -Name "name" -Default "")
+                method        = [string](Get-JsonProp -Object $api -Name "method" -Default "")
+                path_template = [string](Get-JsonProp -Object $api -Name "path_template" -Default "")
+                status        = [string](Get-JsonProp -Object $api -Name "status" -Default "")
+                source        = [string](Get-JsonProp -Object $api -Name "source" -Default "")
+            }
+        }
+    }
+    $routePages = @($pages | Where-Object { $_.route_template.Trim() -ne "" })
+    $urlPages = @($pages | Where-Object { $_.url.Trim() -ne "" })
+    $endpointApis = @($apis | Where-Object { $_.path_template.Trim() -ne "" })
+    return [pscustomobject]@{
+        Bindings        = @($bindings).Count
+        PageCount       = @($pages).Count
+        ApiCount        = @($apis).Count
+        RoutePageCount  = @($routePages).Count
+        UrlPageCount    = @($urlPages).Count
+        EndpointApiCount = @($endpointApis).Count
+        PageIds         = @($pageIds)
+        ApiIds          = @($apiIds)
+        Pages           = @($pages)
+        APIs            = @($apis)
+    }
+}
+
+function Get-AcceptanceVersionResourceCheck {
+    <#
+        Hard acceptance gate for Task 86: a version must bind >0 pages, >0 APIs
+        when the environment is expected to have them, and at least one route
+        template (the locator VersionPack renders) when design is the consumer.
+        Returns separate flags so S1/S3 can record one explicit check per
+        criterion and fail loudly instead of passing on 0 bound resources.
+    #>
+    param(
+        [Parameter(Mandatory = $false)] $Counts = $null,
+        [switch] $RequireApis,
+        [switch] $RequireLocators,
+        [switch] $RequirePageUrls
+    )
+    $pages = 0
+    $apis = 0
+    $routes = 0
+    $urls = 0
+    if ($null -ne $Counts) {
+        $pages = [int](Get-JsonProp -Object $Counts -Name "PageCount" -Default 0)
+        $apis = [int](Get-JsonProp -Object $Counts -Name "ApiCount" -Default 0)
+        $routes = [int](Get-JsonProp -Object $Counts -Name "RoutePageCount" -Default 0)
+        $urls = [int](Get-JsonProp -Object $Counts -Name "UrlPageCount" -Default 0)
+    }
+    $pagePassed = ($pages -gt 0)
+    $apiPassed = (-not $RequireApis) -or ($apis -gt 0)
+    $locatorPassed = (-not $RequireLocators) -or ($routes -gt 0)
+    $urlPassed = (-not $RequirePageUrls) -or ($urls -gt 0)
+    $passed = ($pagePassed -and $apiPassed -and $locatorPassed -and $urlPassed)
+    $reasons = @()
+    if (-not $pagePassed) {
+        $reasons += "version binds 0 pages; discovery facts are not bindable resources and a pre-discovery version can never gain a page (immutable binding)"
+    }
+    if (-not $apiPassed) {
+        $reasons += "version binds 0 APIs"
+    }
+    if (-not $locatorPassed) {
+        $reasons += "no bound page has a route_template locator for design/execution"
+    }
+    if (-not $urlPassed) {
+        $reasons += "no bound page has a SUT url for execution navigation"
+    }
+    return [pscustomobject]@{
+        Passed        = $passed
+        PagePassed    = $pagePassed
+        ApiPassed     = $apiPassed
+        LocatorPassed = $locatorPassed
+        UrlPassed     = $urlPassed
+        PageDetail    = "pages=$pages routes=$routes urls=$urls"
+        ApiDetail     = "apis=$apis"
+        LocatorDetail = "routes=$routes pages=$pages"
+        UrlDetail     = "urls=$urls pages=$pages"
+        Detail        = if ($passed) { "pages=$pages apis=$apis routes=$routes urls=$urls" } else { "pages=$pages apis=$apis routes=$routes urls=$urls; " + ($reasons -join "; ") }
+    }
+}
+
+function Wait-AcceptanceEnvironmentResources {
+    <#
+        Waits for P9 discovery to propose page/API resources into the bound
+        environment. Discovery records its facts first and proposes the catalog
+        rows in the same run, so S1 must wait separately after the fact check.
+        Returns the last snapshot on timeout (Ok/HasResources=false) so evidence
+        records what was actually there.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Context,
+        [Parameter(Mandatory = $true)] [string] $EnvironmentId,
+        [Parameter(Mandatory = $false)] [switch] $RequireApis,
+        [Parameter(Mandatory = $false)] [int] $TimeoutSeconds = 120,
+        [Parameter(Mandatory = $false)] [int] $IntervalSeconds = 3
+    )
+    $requireApis = [bool]$RequireApis
+    $watcher = Wait-Until -TimeoutSeconds $TimeoutSeconds -IntervalSeconds $IntervalSeconds -Description "discovery-proposed environment resources" -Condition {
+        $snapshot = Get-AcceptanceEnvironmentResources -Context $Context -EnvironmentId $EnvironmentId
+        $bindable = Get-AcceptanceBindableResources -Pages $snapshot.Pages -APIs $snapshot.APIs
+        if ($bindable.PageCount -gt 0 -and ((-not $requireApis) -or $bindable.ApiCount -gt 0)) {
+            return [pscustomobject]@{ Resources = $snapshot; Bindable = $bindable }
+        }
+        return $null
+    }
+    if ($watcher.Ok -and $null -ne $watcher.Value) {
+        $value = $watcher.Value
+        if ($value -is [System.Array]) { $value = @($value)[0] }
+        return [pscustomobject]@{
+            Ok        = $true
+            TimedOut  = $false
+            Resources = $value.Resources
+            Bindable  = $value.Bindable
+        }
+    }
+    $snapshot = Get-AcceptanceEnvironmentResources -Context $Context -EnvironmentId $EnvironmentId
+    $bindable = Get-AcceptanceBindableResources -Pages $snapshot.Pages -APIs $snapshot.APIs
+    return [pscustomobject]@{
+        Ok        = $false
+        TimedOut  = $true
+        Resources = $snapshot
+        Bindable  = $bindable
     }
 }
 
