@@ -63,6 +63,25 @@ const tasks = read("task-types.md")
 const executor = read("executor-protocol.md")
 const readme = read("README.md")
 
+// 0.2.1 job kinds. The 11 frozen contract work_item kinds are the closed
+// catalog; the three conversation work types are P1/P2 legacies that Task 61
+// projects as conversation job_card parts. They are not work_item.kind values
+// and must not widen the 11-kind catalog.
+const frozenJobKinds = [
+  "explore.login",
+  "explore.page",
+  "explore.api",
+  "explore.coverage",
+  "explore.gap",
+  "design.cases",
+  "review.cases",
+  "execute.batch",
+  "analyze.failure",
+  "report.version",
+  "knowledge.propose",
+]
+const conversationJobCardKinds = ["chat.turn", "requirement.curate", "design.round"]
+
 // ---------------------------------------------------------------------------
 // events.md §18: ten 0.2.1 event types and their required payload fields.
 // ---------------------------------------------------------------------------
@@ -143,6 +162,12 @@ check(
 )
 check(eventsSection.includes("128") && eventsSection.includes("15"), "events.md 0.2.1 counts are 128 events / 15 audit actions")
 check(/version:\{id\}[\s\S]{0,80}system/.test(eventsSection), "events.md documents 0.2.1 SSE channel scopes")
+for (const kind of conversationJobCardKinds) {
+  check(
+    eventsSection.includes("`" + kind + "`"),
+    `events.md §18 documents conversation job event kind ${kind}`,
+  )
+}
 
 const auditSection18 = section(eventsSection, "### 18.3", "")
 check(auditSection18.length > 0, "events.md §18.3 lists the 0.2.1 audit actions")
@@ -323,6 +348,37 @@ check(!/sha256:/.test(imageBlock), "openapi image part does not use the attachme
 check(
   /enum: \[job_card\][\s\S]{0,900}cancelable/.test(messagePartBlock),
   "openapi job_card part carries optional cancelable",
+)
+// job_card.kind accepts the 11 frozen job kinds and the three conversation work
+// types; every kind stays exact (no invented values, no dropped kind).
+const jobCardKindEnum = (() => {
+  const start = messagePartBlock.indexOf("enum: [job_card]")
+  if (start < 0) return []
+  const rest = messagePartBlock.slice(start)
+  const end = rest.indexOf("\n        - type: object")
+  const branch = end < 0 ? rest : rest.slice(0, end)
+  const kindAt = branch.indexOf("kind:")
+  if (kindAt < 0) return []
+  const match = /enum: \[([^\]]+)\]/.exec(branch.slice(kindAt))
+  return match
+    ? match[1]
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : []
+})()
+for (const kind of frozenJobKinds) {
+  check(jobCardKindEnum.includes(kind), `openapi MessagePart.job_card.kind keeps frozen job kind ${kind}`)
+}
+for (const kind of conversationJobCardKinds) {
+  check(
+    jobCardKindEnum.includes(kind),
+    `openapi MessagePart.job_card.kind accepts conversation work type ${kind}`,
+  )
+}
+check(
+  jobCardKindEnum.length === frozenJobKinds.length + conversationJobCardKinds.length,
+  `openapi MessagePart.job_card.kind lists exactly ${frozenJobKinds.length + conversationJobCardKinds.length} kinds (got ${jobCardKindEnum.length})`,
 )
 
 const jobViewBlock = schemaBlock("JobView")
@@ -655,6 +711,12 @@ check(
   "db-schema.md §18 documents the admin-only context_packet read semantics",
 )
 check(dbSection.includes("cancelable"), "db-schema.md §18 documents job_card.cancelable")
+for (const kind of conversationJobCardKinds) {
+  check(
+    dbSection.includes("`" + kind + "`"),
+    `db-schema.md §18 documents job_card kind ${kind}`,
+  )
+}
 
 // ---------------------------------------------------------------------------
 // task-types.md §9: 11 work_item kinds, 7 roles, four-way creation, created_by.
@@ -662,19 +724,7 @@ check(dbSection.includes("cancelable"), "db-schema.md §18 documents job_card.ca
 const tasksSection = section(tasks, "## 9. 0.2.1", "\n## 10.")
 check(tasksSection.length > 0, "task-types.md has a §9 0.2.1 increment section")
 
-const workItemKinds = [
-  "explore.login",
-  "explore.page",
-  "explore.api",
-  "explore.coverage",
-  "explore.gap",
-  "design.cases",
-  "review.cases",
-  "execute.batch",
-  "analyze.failure",
-  "report.version",
-  "knowledge.propose",
-]
+const workItemKinds = frozenJobKinds
 for (const kind of workItemKinds) {
   check(tasksSection.includes("`" + kind + "`"), `task-types.md §9 work_item kind ${kind}`)
 }
