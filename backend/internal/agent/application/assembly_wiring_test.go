@@ -518,3 +518,190 @@ func TestRunnerSecondOverflowFoldsMoreHistory(t *testing.T) {
 			len(fixture.chat.request(4).Messages), len(fixture.chat.request(2).Messages))
 	}
 }
+
+// designRequirementWorkItem returns a design.requirement work item with the
+// given per-work-item identity (work_item_id plus requirement ids). The
+// cache-prefix tests run two of them against the same profile, version and
+// stage — the shape of the 174 design work items that share one version.
+func designRequirementWorkItem(workItemID, requirementID, requirementVersionID int64) agent.WorkItem {
+	item := fakeWorkItem(agentapp.WorkTypeDesignRequirement, agentapp.WorkItemPayload{
+		ConversationID: 20, RequirementID: requirementID,
+		RequirementVersionID: requirementVersionID, Trigger: "manual",
+	})
+	item.ID = workItemID
+	return item
+}
+
+// TestPrefixStableAcrossWorkItems pins the Task 80 KV-cache invariant: the
+// stable prefix is a function of the profile, the version invariants and the
+// stage only. Two different work items of the same profile/version/stage must
+// render a byte-identical prefix (and the same PrefixHash) even though their
+// task context — work_item_id, requirement ids, goal, constraints, acceptance
+// and scope — differs. That per-work-item material must still reach the model
+// through the append-only user suffix.
+func TestPrefixStableAcrossWorkItems(t *testing.T) {
+	fixture := newBriefingRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{Content: "已为需求 501 提交场景与用例草案。"},
+		{Content: "已为需求 502 提交场景与用例草案。"},
+	}
+	firstItem := designRequirementWorkItem(1001, 501, 700)
+	secondItem := designRequirementWorkItem(1002, 502, 701)
+	if _, err := mustRun(t, fixture, firstItem); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if _, err := mustRun(t, fixture, secondItem); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if len(fixture.chat.requests) != 2 {
+		t.Fatalf("chat requests = %d, want one per run", len(fixture.chat.requests))
+	}
+
+	firstPrefix := fixture.chat.request(0).Messages[0]
+	secondPrefix := fixture.chat.request(1).Messages[0]
+	if firstPrefix.Role != "system" || secondPrefix.Role != "system" {
+		t.Fatalf("first prompt message roles = %q/%q, want system", firstPrefix.Role, secondPrefix.Role)
+	}
+	if firstPrefix.Content != secondPrefix.Content {
+		t.Fatalf("stable prefix changed across work items:\n%s\n---\n%s",
+			firstPrefix.Content, secondPrefix.Content)
+	}
+	for _, unstable := range []string{
+		"# 任务", "work_item_id=", "requirement_ids=",
+		"requirement_id=501", "requirement_id=502",
+	} {
+		if strings.Contains(firstPrefix.Content, unstable) {
+			t.Fatalf("per-work-item data %q leaked into the stable prefix:\n%s",
+				unstable, firstPrefix.Content)
+		}
+	}
+	for _, stable := range []string{
+		"[profile:case_author]", "版本目标: 订单系统", "阶段: clarifying",
+	} {
+		if !strings.Contains(firstPrefix.Content, stable) {
+			t.Fatalf("stable prefix is missing %q:\n%s", stable, firstPrefix.Content)
+		}
+	}
+
+	if len(fixture.repo.packets) != 2 {
+		t.Fatalf("persisted packets = %d, want one per run", len(fixture.repo.packets))
+	}
+	firstPacket := decodeStoredPacket(t, fixture.repo.packets[0])
+	secondPacket := decodeStoredPacket(t, fixture.repo.packets[1])
+	if firstPacket.PrefixHash != secondPacket.PrefixHash {
+		t.Fatalf("PrefixHash changed across work items: %s != %s",
+			firstPacket.PrefixHash, secondPacket.PrefixHash)
+	}
+	if firstPacket.Segments[0].Content != secondPacket.Segments[0].Content {
+		t.Fatalf("persisted stable prefixes disagree across work items")
+	}
+
+	// The task context still reaches the model: the last user turn differs per
+	// work item and carries its own scope/ids, so only the suffix changed.
+	firstUser := fixture.chat.request(0).Messages[len(fixture.chat.request(0).Messages)-1]
+	secondUser := fixture.chat.request(1).Messages[len(fixture.chat.request(1).Messages)-1]
+	if firstUser.Role != "user" || secondUser.Role != "user" {
+		t.Fatalf("last prompt message roles = %q/%q, want the current user turn",
+			firstUser.Role, secondUser.Role)
+	}
+	if !strings.Contains(firstUser.Content, "work_item_id=1001") ||
+		!strings.Contains(secondUser.Content, "work_item_id=1002") {
+		t.Fatalf("per-work-item task context was lost from the user suffix:\n%s\n---\n%s",
+			firstUser.Content, secondUser.Content)
+	}
+	if !strings.Contains(firstUser.Content, "requirement_id=501") ||
+		!strings.Contains(secondUser.Content, "requirement_id=502") {
+		t.Fatalf("requirement scope was lost from the user suffix:\n%s\n---\n%s",
+			firstUser.Content, secondUser.Content)
+	}
+}
+
+// TestTaskContextInUserSuffix pins the other half of Task 80: moving the task
+// context out of the stable prefix must not lose it. The task goal,
+// constraints, acceptance criteria and scope — and the P3 execution snapshot —
+// must still reach the model through a user-role suffix message, while the
+// system prefix keeps only the stable profile/version/stage material.
+func TestTaskContextInUserSuffix(t *testing.T) {
+	t.Run("design task", func(t *testing.T) {
+		fixture := newBriefingRunnerFixture(t)
+		fixture.chat.responses = []llmapp.ChatResponse{{Content: "已提交"}}
+		if _, err := mustRun(t, fixture, designRequirementWorkItem(1001, 501, 700)); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		request := fixture.chat.request(0)
+		if len(request.Messages) < 2 {
+			t.Fatalf("prompt = %#v", request.Messages)
+		}
+		prefix := request.Messages[0]
+		for _, leaked := range []string{
+			"# 任务", "# 执行任务", "work_item_id=1001", "requirement_id=501", "作用域:",
+		} {
+			if strings.Contains(prefix.Content, leaked) {
+				t.Fatalf("per-work-item data %q leaked into the stable prefix:\n%s",
+					leaked, prefix.Content)
+			}
+		}
+
+		userContent := ""
+		for _, message := range request.Messages[1:] {
+			if message.Role == "user" && strings.Contains(message.Content, "# 任务") {
+				userContent = message.Content
+			}
+		}
+		if userContent == "" {
+			t.Fatalf("task context block is missing from the user suffix: %#v", request.Messages)
+		}
+		for _, want := range []string{
+			"类型: design.requirement",
+			"目标: ", "约束:", "验收:", "作用域:",
+			"work_item_id=1001", "requirement_id=501",
+			"请为需求 501（需求版本 700）设计场景与用例草案。",
+		} {
+			if !strings.Contains(userContent, want) {
+				t.Fatalf("user suffix misses task material %q:\n%s", want, userContent)
+			}
+		}
+
+		packet := decodeStoredPacket(t, fixture.repo.packets[0])
+		if strings.Contains(packet.Segments[0].Content, "# 任务") {
+			t.Fatalf("persisted stable prefix carries the task block:\n%s", packet.Segments[0].Content)
+		}
+	})
+
+	t.Run("execution task", func(t *testing.T) {
+		provider := &fakeTaskProvider{task: executionTaskFixture()}
+		fixture := newRunnerFixtureWithTaskProvider(t, provider)
+		fixture.chat.responses = []llmapp.ChatResponse{{Content: "用例执行完成"}}
+		if _, err := mustRun(t, fixture, p3CaseItem()); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		request := fixture.chat.request(0)
+		prefix := request.Messages[0]
+		for _, leaked := range []string{
+			"# 任务", "# 执行任务", "case_run_id=3001", "case_version_id=41", "步骤:",
+		} {
+			if strings.Contains(prefix.Content, leaked) {
+				t.Fatalf("per-work-item data %q leaked into the stable prefix:\n%s",
+					leaked, prefix.Content)
+			}
+		}
+
+		userContent := ""
+		for _, message := range request.Messages[1:] {
+			if message.Role == "user" && strings.Contains(message.Content, "# 执行任务") {
+				userContent = message.Content
+			}
+		}
+		if userContent == "" {
+			t.Fatalf("execution task block is missing from the user suffix: %#v", request.Messages)
+		}
+		for _, want := range []string{
+			"# 任务", "# 执行任务", "登录流程",
+			"打开登录页", "Login 按钮可见", "请逐步执行用例并记录结果",
+		} {
+			if !strings.Contains(userContent, want) {
+				t.Fatalf("user suffix misses execution task material %q:\n%s", want, userContent)
+			}
+		}
+	})
+}

@@ -1948,7 +1948,18 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 	}
 }
 
+// userMessage is the current user turn of the run: the per-work-item task
+// context followed by the profile's triggering user content. Task 80: the task
+// context is per-work-item data, so it belongs to the append-only user suffix,
+// not the cache-stable system prefix; rendering it here keeps goal, constraints,
+// acceptance and scope in front of the model without breaking the shared prefix.
 func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentText string) string {
+	return taskContextMessage(r.baseUserMessage(ctx, state, attachmentText), state.input)
+}
+
+// baseUserMessage renders the triggering user content without the per-work-item
+// task context block.
+func (r *Runner) baseUserMessage(ctx context.Context, state *runState, attachmentText string) string {
 	switch state.item.Type {
 	case WorkTypeAttachmentIngest:
 		return attachmentText

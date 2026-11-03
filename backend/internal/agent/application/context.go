@@ -90,9 +90,11 @@ type ContextInput struct {
 	Conversation ConversationContext
 	TeamRoom     TeamRoomContext
 	Artifacts    []ArtifactRef
-	// Execution is the P3 case-executor task snapshot. It is part of the system
-	// section because its steps/assertions/prior results are pinned facts that
-	// compaction must never drop.
+	// Execution is the P3 case-executor task snapshot. Its steps/assertions/
+	// prior results are pinned facts that compaction must never drop, but they
+	// are per-work-item data: the cache-first path renders them in the user
+	// suffix (never in the stable prefix), and the legacy system section keeps
+	// them for the non-cache layout.
 	Execution *ExecutionTask
 	// P4Task is the registered P4 domain task payload (JSON-ready) rendered by
 	// context.task_pack. Nil for P1/P2/P3 runs and for P4 types no domain claims.
@@ -332,16 +334,62 @@ func renderSections(in ContextInput) []Section {
 	return sections
 }
 
+// systemContent renders the legacy one-system-section layout: the stable
+// profile prompt followed by the per-work-item task context. The cache-first
+// assembler path does not use it for the stable prefix (Task 80): it renders
+// stableSystemContent as the prefix and sends taskContextBlock through the
+// append-only user suffix, so the prefix is byte-stable across work items.
 func systemContent(in ContextInput) string {
-	parts := make([]string, 0, 3)
-	if prompt := renderedSystemPrompt(in); prompt != "" {
-		parts = append(parts, prompt)
+	parts := make([]string, 0, 2)
+	if stable := stableSystemContent(in); stable != "" {
+		parts = append(parts, stable)
 	}
-	parts = append(parts, taskBlock(in.Task))
+	if task := taskContextBlock(in); task != "" {
+		parts = append(parts, task)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// stableSystemContent is the work-item-independent system content: the rendered
+// profile prompt (role/rules/tool contract). It is the only system text allowed
+// in the cache-first stable prefix; goal, constraints, acceptance, scope,
+// work-item/requirement/case ids and the execution snapshot are per-work-item
+// data and belong to taskContextBlock.
+func stableSystemContent(in ContextInput) string {
+	return renderedSystemPrompt(in)
+}
+
+// taskContextBlock renders the per-work-item task context: the task goal,
+// constraints, acceptance criteria and scope plus the P3 execution snapshot.
+// It must never enter the stable prefix (every work item would get a unique
+// provider prefix); the cache-first path carries it in the user suffix and the
+// legacy system section keeps it for the non-cache layout.
+func taskContextBlock(in ContextInput) string {
+	parts := make([]string, 0, 2)
+	if block := taskBlock(in.Task); block != "" {
+		parts = append(parts, block)
+	}
 	if in.Execution != nil {
 		parts = append(parts, executionBlock(*in.Execution))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// taskContextMessage composes the current user turn with the per-work-item task
+// context block. The block stays ahead of the triggering user content, mirroring
+// the pre-Task-80 system ordering, while living entirely in the append-only
+// suffix.
+func taskContextMessage(content string, in ContextInput) string {
+	block := taskContextBlock(in)
+	content = strings.TrimSpace(content)
+	switch {
+	case block == "":
+		return content
+	case content == "":
+		return block
+	default:
+		return block + "\n\n" + content
+	}
 }
 
 // minimalSystemContent keeps the task block (goal/constraints first) ahead of
@@ -349,12 +397,11 @@ func systemContent(in ContextInput) string {
 // profile prompt is rendered through the same variable catalog as the normal
 // path.
 func minimalSystemContent(in ContextInput) string {
-	parts := make([]string, 0, 3)
-	parts = append(parts, taskBlock(in.Task))
-	if in.Execution != nil {
-		parts = append(parts, executionBlock(*in.Execution))
+	parts := make([]string, 0, 2)
+	if task := taskContextBlock(in); task != "" {
+		parts = append(parts, task)
 	}
-	if prompt := renderedSystemPrompt(in); prompt != "" {
+	if prompt := stableSystemContent(in); prompt != "" {
 		parts = append(parts, prompt)
 	}
 	return strings.Join(parts, "\n\n")

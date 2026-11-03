@@ -61,8 +61,14 @@ func (r *Runner) assembleContextWithKeepRecent(
 	budget, threshold, _ := builder.resolveBudget(ctx, state.input)
 
 	briefing, stage := r.versionBriefing(ctx, state)
+	// Task 80: the stable prefix is a function of the profile prompt, the
+	// version invariants and the stage only. The per-work-item task context
+	// (goal/constraints/acceptance/scope, work-item/requirement/case ids and the
+	// P3 execution snapshot) is sent through the user suffix by userMessage, so
+	// every work item of the same profile/stage/version shares one cached
+	// provider prefix.
 	request := agentcontext.AssemblyRequest{
-		System:       systemContent(state.input),
+		System:       stableSystemContent(state.input),
 		Invariants:   versionInvariantLines(state.input.VersionPack),
 		Stage:        stage,
 		Invalidation: invalidation,

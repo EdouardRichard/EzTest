@@ -60,6 +60,61 @@ func TestMinimalSystemContentRendersPromptAfterTaskBlock(t *testing.T) {
 	}
 }
 
+// TestStableSystemContentExcludesTaskContext pins the Task 80 split: the part
+// of the system content that feeds the cache-stable prefix is the rendered
+// profile prompt only. The per-work-item task block and the P3 execution block
+// must never leak into it, or every work item gets a unique provider prefix.
+func TestStableSystemContentExcludesTaskContext(t *testing.T) {
+	in := internalPromptInput()
+	in.Task.Constraints = []string{"work_item_id=1001 不能替用户确认需求"}
+	in.Task.Scope = []string{"work_item_id=1001", "requirement_id=501"}
+	in.Execution = &ExecutionTask{
+		CaseRunID: 3001, CaseVersionID: 41, CaseTitle: "登录流程", Priority: "P1",
+		Steps: []ExecutionStep{{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"}},
+	}
+
+	stable := stableSystemContent(in)
+	if !strings.Contains(stable, "[profile:clarification_host] 版本 订单系统 Q4") {
+		t.Fatalf("stable system content lost the rendered profile prompt: %s", stable)
+	}
+	for _, leaked := range []string{
+		"# 任务", "# 执行任务", "work_item_id=1001", "requirement_id=501",
+		"不能替用户确认需求", "登录流程", "打开登录页",
+	} {
+		if strings.Contains(stable, leaked) {
+			t.Fatalf("per-work-item %q leaked into the stable system content:\n%s", leaked, stable)
+		}
+	}
+}
+
+// TestTaskContextBlockKeepsTaskAndExecution pins that the extracted task
+// context still carries goal, constraints, acceptance, scope and the P3
+// execution snapshot, and that the legacy context path (renderSections/minimal
+// fallback) keeps rendering both blocks in the system section.
+func TestTaskContextBlockKeepsTaskAndExecution(t *testing.T) {
+	in := internalPromptInput()
+	in.Execution = &ExecutionTask{
+		CaseRunID: 3001, CaseVersionID: 41, CaseTitle: "登录流程", Priority: "P1",
+		Steps: []ExecutionStep{{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"}},
+	}
+
+	block := taskContextBlock(in)
+	for _, want := range []string{
+		"# 任务", "类型: chat.turn", "目标: 回答用户问题",
+		"约束:", "不能替用户确认需求", "# 执行任务", "登录流程", "打开登录页",
+	} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("task context block misses %q:\n%s", want, block)
+		}
+	}
+
+	legacy := systemContent(in)
+	if !strings.Contains(legacy, "[profile:clarification_host] 版本 订单系统 Q4") ||
+		!strings.Contains(legacy, block) {
+		t.Fatalf("legacy system content lost the prompt or the task context:\n%s", legacy)
+	}
+}
+
 func TestSystemContentFallsBackToSeedOnRenderFailure(t *testing.T) {
 	in := internalPromptInput()
 	in.Profile.SystemPrompt = "[profile:clarification_host] {{.Bogus}}"
