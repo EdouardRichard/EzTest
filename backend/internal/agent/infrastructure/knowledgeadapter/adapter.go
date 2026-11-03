@@ -27,6 +27,7 @@ package knowledgeadapter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -662,6 +663,170 @@ func (a *Adapter) runSuccessHook(
 	// and is a no-op for an already-approved item.
 	a.knowledge.AutoApprove(ctx, item)
 	return errs
+}
+
+/* -------------------------- login sedimentation --------------------------- */
+
+// LoginRecipeFact is one real, successful login observed by the P9 explore
+// login flow (the Task 64 login path), projected onto the knowledge success-hook
+// inputs. Every field is an identifier or a credential-free recipe: the account
+// password and the captured storage state never enter this type.
+type LoginRecipeFact struct {
+	// VersionID is the source version the login ran for (provenance).
+	VersionID int64
+	// VersionSUTID is the version SUT binding the account was resolved from.
+	VersionSUTID int64
+	// SystemID/EnvironmentID/SystemKey identify the bound SUT and environment.
+	SystemID      int64
+	EnvironmentID int64
+	SystemKey     string
+	// AccountRole is the role of the account that logged in.
+	AccountRole string
+	// PageKey is the bound login page knowledge key (route template); empty
+	// when the login page is not a bound page resource.
+	PageKey string
+	// Recipe is the credential-free login "how to" (mode/URL/route/selectors/
+	// steps) captured by the explore login flow.
+	Recipe map[string]any
+	// SourceFactID is the login_session version fact the flow recorded.
+	SourceFactID int64
+}
+
+// loginRecipeTag is the canonical tag of a login_recipe item. Kind.tag is
+// application-private, so the adapter repeats the frozen "kind:<kind>" marker.
+const loginRecipeTag = "kind:" + string(knowledgeapp.KindLoginRecipe)
+
+// SedimentLoginRecipe creates one approved login_recipe knowledge item for a real
+// login success, bound to the SUT/environment/login page/account role that the
+// login ran against and carrying the recorded login_session fact as source
+// provenance (spec §10.1). The credential-free recipe is the knowledge: the
+// service rejects a fact carrying a credential or secret.
+//
+// The hook is idempotent on the recipe key (SUT + environment + account role +
+// recipe): a repeated exploration login that observes the same recipe reuses the
+// stored item instead of cloning it, while a changed recipe (new login URL/route/
+// selectors) sediments its own item. It is best effort at the caller boundary:
+// the P9 analysis logs a returned error and never fails an otherwise successful
+// login because sedimentation failed.
+func (a *Adapter) SedimentLoginRecipe(ctx context.Context, fact LoginRecipeFact) (knowledge.Item, error) {
+	if fact.VersionID <= 0 {
+		return knowledge.Item{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if fact.VersionSUTID <= 0 {
+		return knowledge.Item{}, platform.Invalid("version_sut_id", "must be a positive decimal ID")
+	}
+	if fact.SystemID <= 0 {
+		return knowledge.Item{}, platform.Invalid("system_id", "must be a positive decimal ID")
+	}
+	role := strings.TrimSpace(fact.AccountRole)
+	if role == "" {
+		return knowledge.Item{}, platform.Invalid("account_role", "is required for a login recipe")
+	}
+	if len(fact.Recipe) == 0 {
+		return knowledge.Item{}, platform.Invalid("recipe", "is required for a login recipe")
+	}
+	if a.knowledge == nil {
+		return knowledge.Item{}, errors.New("knowledgeadapter: knowledge service is not configured")
+	}
+
+	systemID := fact.SystemID
+	successFact := knowledgeapp.SuccessFact{
+		VersionID:   fact.VersionID,
+		SystemKey:   strings.TrimSpace(fact.SystemKey),
+		SystemID:    &systemID,
+		AccountRole: role,
+		PageKey:     strings.TrimSpace(fact.PageKey),
+		Recipe:      fact.Recipe,
+	}
+	if fact.EnvironmentID > 0 {
+		environmentID := fact.EnvironmentID
+		successFact.EnvironmentID = &environmentID
+	}
+	if fact.SourceFactID > 0 {
+		sourceFactID := fact.SourceFactID
+		successFact.SourceFactID = &sourceFactID
+	}
+
+	if existing, ok, err := a.findLoginRecipe(ctx, successFact); err != nil {
+		return knowledge.Item{}, err
+	} else if ok {
+		return existing, nil
+	}
+	item, err := a.knowledge.OnLoginSuccess(ctx, successFact)
+	if err != nil {
+		return knowledge.Item{}, err
+	}
+	// The service auto-approves low-risk kinds inside the success hook; the
+	// explicit call keeps the documented pipeline and is a no-op here.
+	a.knowledge.AutoApprove(ctx, item)
+	return item, nil
+}
+
+// findLoginRecipe returns the already-approved login_recipe item for the same
+// key (SUT/environment/account role + identical recipe), if one exists.
+func (a *Adapter) findLoginRecipe(ctx context.Context, fact knowledgeapp.SuccessFact) (knowledge.Item, bool, error) {
+	filter := knowledgeapp.ListFilter{
+		Status: knowledge.StatusApproved,
+		Tag:    loginRecipeTag,
+		Limit:  knowledgeapp.MaxListLimit,
+	}
+	role := strings.TrimSpace(fact.AccountRole)
+	if role != "" {
+		filter.Bindings.AccountRole = &role
+	}
+	if fact.SystemID != nil {
+		systemID := *fact.SystemID
+		filter.Bindings.SystemID = &systemID
+	}
+	if fact.EnvironmentID != nil {
+		environmentID := *fact.EnvironmentID
+		filter.Bindings.EnvironmentID = &environmentID
+	}
+	page, err := a.knowledge.List(ctx, filter)
+	if err != nil {
+		return knowledge.Item{}, false, fmt.Errorf("knowledgeadapter: list login recipes: %w", err)
+	}
+	for _, item := range page.Items {
+		if loginRecipeMatches(item, fact.Recipe) {
+			return item, true, nil
+		}
+	}
+	return knowledge.Item{}, false, nil
+}
+
+// loginRecipeMatches compares the structured recipe stored in one item with the
+// observation. The comparison is JSON-canonical so map order cannot make the
+// same recipe look different.
+func loginRecipeMatches(item knowledge.Item, recipe map[string]any) bool {
+	var content struct {
+		Recipe map[string]any `json:"recipe"`
+	}
+	if err := json.Unmarshal([]byte(item.Content), &content); err != nil {
+		return false
+	}
+	canonical := canonicalRecipeJSON(content.Recipe)
+	return canonical != "" && canonical == canonicalRecipeJSON(recipe)
+}
+
+// canonicalRecipeJSON renders a recipe with sorted object keys and normalized
+// JSON number types, so re-reading the stored content compares equal.
+func canonicalRecipeJSON(recipe map[string]any) string {
+	if len(recipe) == 0 {
+		return ""
+	}
+	encoded, err := json.Marshal(recipe)
+	if err != nil {
+		return ""
+	}
+	var decoded any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return ""
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		return ""
+	}
+	return string(canonical)
 }
 
 // successBindingIndex is the ID -> binding-key index of one version.

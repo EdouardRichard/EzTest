@@ -646,6 +646,13 @@ func newP7Runtime(ctx context.Context, deps p7RuntimeDeps) (*p7Runtime, error) {
 		deps.IDs,
 	)
 	knowledgeAdapter := knowledgeadapter.New(knowledgeService, p7VersionSystems{pool: deps.Pool})
+	// Task 67 (P8-T9): the P9 explore analysis performs the pre-discovery login;
+	// that real login success sediments the approved login_recipe knowledge item
+	// through this adapter. The P9 runtime is built earlier in main (its version
+	// facts feed the design graph), so the knowledge port is late-attached here
+	// instead of rebuilding the runtime. nil-safe for a boot without P9 or for
+	// tests that build P7 in isolation.
+	p9AttachLoginRecipeWriter(p9ExploreRuntime, knowledgeAdapter)
 
 	// Storage GC: repository, owner lookup, filesystem ledger adapter, service
 	// and the leader-gated periodic worker.

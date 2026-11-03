@@ -17,10 +17,13 @@ package main
 // triggered with a per-version minimum interval, so the wiring is live in
 // production without a background write storm.
 //
-// The CaseSuccessHook is intentionally not wired here: the knowledge adapter
-// does not implement executionapp.CaseSuccessHook yet, and inventing one is not
-// this task's scope. Task 51 owns that adapter + the KnowledgeHook injection;
-// P7Deps.Retrieval is Task 51 as well.
+// The P9 pre-discovery login is also the production login-success observation
+// that sediments the approved login_recipe knowledge item (Task 67): the
+// knowledge adapter is attached to the analysis after the P7 composition builds
+// it (this runtime is constructed before the P7 knowledge adapter, so the
+// attachment is a late binding and no knowledge adapter is rebuilt here). The
+// case-run success hook stays wired by the execution runner at the assembly
+// root, not by this file.
 
 import (
 	"context"
@@ -29,12 +32,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/knowledgeadapter"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	knowledge "github.com/EdouardRichard/EzTest/backend/internal/knowledge/domain"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
@@ -199,6 +205,14 @@ type p9AnalysisDeps struct {
 	Now         func() time.Time
 }
 
+// p9LoginRecipeWriter sediments one approved login_recipe knowledge item from a
+// real login success (Task 67). *knowledgeadapter.Adapter implements it; the P9
+// analysis depends on this narrow port so a test can observe the trigger and a
+// degraded boot can run without the knowledge context.
+type p9LoginRecipeWriter interface {
+	SedimentLoginRecipe(ctx context.Context, fact knowledgeadapter.LoginRecipeFact) (knowledge.Item, error)
+}
+
 // p9Analysis is the deterministic exploration analysis bundle plus the
 // leader-gated, event-driven refresh loop that consumes the explore runtime.
 // Failure attribution is not part of this bundle: execution.result_read invokes
@@ -215,6 +229,44 @@ type p9Analysis struct {
 	// loginRetryDelay is the pause between retry_login discovery attempts. It
 	// is a field so the retry test does not sleep.
 	loginRetryDelay time.Duration
+	// loginRecipes is the late-attached knowledge sedimentation port (Task 67):
+	// the P7 knowledge adapter does not exist when this analysis is constructed.
+	// The mutex guards the attach against the running analysis loop.
+	recipeMu     sync.RWMutex
+	loginRecipes p9LoginRecipeWriter
+}
+
+// SetLoginRecipeWriter attaches the knowledge sedimentation port. It is a late
+// binding because the P9 runtime is built before the P7 knowledge adapter in the
+// assembly root; nil is a valid "knowledge context not wired" state.
+func (a *p9Analysis) SetLoginRecipeWriter(writer p9LoginRecipeWriter) {
+	if a == nil {
+		return
+	}
+	a.recipeMu.Lock()
+	a.loginRecipes = writer
+	a.recipeMu.Unlock()
+}
+
+func (a *p9Analysis) loginRecipeWriter() p9LoginRecipeWriter {
+	if a == nil {
+		return nil
+	}
+	a.recipeMu.RLock()
+	defer a.recipeMu.RUnlock()
+	return a.loginRecipes
+}
+
+// p9AttachLoginRecipeWriter completes the Task 67 wiring once the P7 knowledge
+// adapter exists. The P9 runtime is constructed before the P7 runtime (its
+// version facts feed the design graph), so the attachment is a late binding
+// performed by the P7 composition. A nil runtime is a no-op, keeping unit tests
+// and a degraded boot safe.
+func p9AttachLoginRecipeWriter(runtime *p9Runtime, writer p9LoginRecipeWriter) {
+	if runtime == nil || runtime.Analysis == nil {
+		return
+	}
+	runtime.Analysis.SetLoginRecipeWriter(writer)
 }
 
 // newP9Analysis wires the analysis services over the explore runtime. Coverage
@@ -349,9 +401,12 @@ func (a *p9Analysis) Refresh(ctx context.Context, versionID int64) (p9AnalysisRe
 	if login.role != "" && login.versionSUTID > 0 {
 		// Discovery must run with an authenticated session: log in once here,
 		// record page/API facts, then hand the same session to the gap probes so
-		// they do not log in a second time.
+		// they do not log in a second time. The successful login is also the
+		// real observation that sediments the approved login_recipe knowledge
+		// item; sedimentation is best effort and can never fail the login.
 		if fact, ok := a.loginForDiscovery(ctx, versionID, login); ok {
 			if fact.Status == exploreapp.SessionActive {
+				a.sedimentLoginRecipe(ctx, versionID, login, fact)
 				a.discover(ctx, versionID, login, fact, &result)
 				runtime = p9SessionRuntime{runtime: runtime, fact: fact}
 			}
@@ -482,6 +537,46 @@ func (a *p9Analysis) loginForDiscovery(ctx context.Context, versionID int64, bin
 	return fact, true
 }
 
+// sedimentLoginRecipe hands one real login success to the knowledge adapter so
+// it sediments the approved login_recipe bound to the version SUT/environment/
+// login page/account role. The recorded login_session fact is the source
+// provenance and the recipe is credential-free by construction (the login flow
+// never puts a credential in SessionFact). The call is best effort: a nil
+// writer, a sedimentation error or even a panic is logged and the login result,
+// discovery and analysis outcome stay untouched.
+func (a *p9Analysis) sedimentLoginRecipe(ctx context.Context, versionID int64, binding p9LoginBinding, session exploreapp.SessionFact) {
+	if a == nil || session.Status != exploreapp.SessionActive || len(session.Recipe) == 0 {
+		return
+	}
+	writer := a.loginRecipeWriter()
+	if writer == nil {
+		return
+	}
+	logf := a.logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logf("eztest: P9 explore analysis version=%d login recipe sedimentation panicked: %v", versionID, recovered)
+		}
+	}()
+	fact := knowledgeadapter.LoginRecipeFact{
+		VersionID:     versionID,
+		VersionSUTID:  p9FirstPositive(session.VersionSUTID, binding.versionSUTID),
+		SystemID:      binding.systemID,
+		EnvironmentID: p9FirstPositive(session.EnvironmentID, binding.environmentID),
+		SystemKey:     binding.systemKey,
+		AccountRole:   p9FirstNonEmpty(session.AccountRole, binding.role),
+		PageKey:       binding.loginPageKey,
+		Recipe:        session.Recipe,
+		SourceFactID:  session.FactID,
+	}
+	if _, err := writer.SedimentLoginRecipe(ctx, fact); err != nil {
+		logf("eztest: P9 explore analysis version=%d login recipe sedimentation failed: %v", versionID, err)
+	}
+}
+
 // discover runs the bounded discovery pre-pass and records page/API facts. The
 // crawl is DOM-based (no browser network capture), uses the session captured by
 // Login, and closes exactly the page it created through the shared page-scoped
@@ -566,6 +661,14 @@ type p9LoginBinding struct {
 	environmentID int64
 	role          string
 	loginURL      string
+	// systemID/systemKey are the bound SUT identity the login recipe knowledge
+	// item is scoped and bound to.
+	systemID  int64
+	systemKey string
+	// loginPageKey is the route template of the bound login page (the knowledge
+	// page key). It is empty when the login URL falls back to the environment
+	// base URL, which is not a page resource.
+	loginPageKey string
 	// environmentBaseURL is the bound environment base URL. It is the login and
 	// crawl seed fallback when the version binds no page resources.
 	environmentBaseURL string
@@ -587,20 +690,28 @@ func (a *p9Analysis) loginBinding(ctx context.Context, versionID int64) p9LoginB
 		}
 		role := p9FirstAccountRole(binding.Accounts)
 		environmentBaseURL := strings.TrimSpace(binding.Environment.BaseURL)
-		loginURL := p9LoginPageURL(binding.Pages)
+		loginURL, loginPageKey := p9LoginPage(binding.Pages)
 		// A version may bind no page resources (the S1 acceptance binds only the
 		// SUT/environment/accounts/repository). The environment base URL is the
 		// only navigable location then: it seeds the fresh login (which can open
 		// a modal login trigger) and the page crawl.
 		if loginURL == "" {
 			loginURL = environmentBaseURL
+			loginPageKey = ""
+		}
+		systemKey := ""
+		if binding.SUT.Family != nil {
+			systemKey = strings.TrimSpace(*binding.SUT.Family)
 		}
 		return p9LoginBinding{
 			versionSUTID:       binding.ID,
+			systemID:           parseCaseBindingID(binding.SUT.ID),
+			systemKey:          systemKey,
 			environmentID:      parseCaseBindingID(binding.Environment.ID),
-			environmentBaseURL: environmentBaseURL,
 			role:               role,
 			loginURL:           loginURL,
+			loginPageKey:       loginPageKey,
+			environmentBaseURL: environmentBaseURL,
 			pageURLs:           p9PageURLs(binding.Pages),
 		}
 	}
@@ -618,25 +729,33 @@ func p9PageURLs(pages []resourceapp.PageView) []string {
 	return urls
 }
 
-// p9LoginPageURL prefers a bound page whose URL/route looks like a login page
-// (so a fresh login can find a form), falling back to the first bound page for
-// the reuse-verification open.
-func p9LoginPageURL(pages []resourceapp.PageView) string {
-	fallback := ""
+// p9LoginPage prefers a bound page whose URL/route looks like a login page (so
+// a fresh login can find a form), falling back to the first bound page for the
+// reuse-verification open. It returns the page URL and the page's knowledge key
+// (route template), which is empty for a page without one.
+func p9LoginPage(pages []resourceapp.PageView) (string, string) {
+	fallbackURL, fallbackKey := "", ""
 	for _, page := range pages {
 		url := p9FirstNonEmpty(page.URL, page.RouteTemplate)
 		if url == "" {
 			continue
 		}
-		if fallback == "" {
-			fallback = url
+		key := strings.TrimSpace(page.RouteTemplate)
+		if fallbackURL == "" {
+			fallbackURL, fallbackKey = url, key
 		}
 		lowered := strings.ToLower(page.URL + " " + page.RouteTemplate)
 		if strings.Contains(lowered, "login") || strings.Contains(lowered, "signin") || strings.Contains(lowered, "sign-in") {
-			return url
+			return url, key
 		}
 	}
-	return fallback
+	return fallbackURL, fallbackKey
+}
+
+// p9LoginPageURL is the URL-only projection of p9LoginPage.
+func p9LoginPageURL(pages []resourceapp.PageView) string {
+	url, _ := p9LoginPage(pages)
+	return url
 }
 
 /* --------------------------- debounce ---------------------------- */
@@ -901,6 +1020,7 @@ var _ designapp.DiscoveryFactsReader = p9FactRecords{}
 var _ exploreapp.RequirementSource = (*p9RequirementSource)(nil)
 var _ exploreapp.CaseSource = (*p9CaseSource)(nil)
 var _ exploreapp.RoleSource = (*p9RoleSource)(nil)
+var _ p9LoginRecipeWriter = (*knowledgeadapter.Adapter)(nil)
 
 // p9FirstNonEmpty returns the first non-blank trimmed value.
 func p9FirstNonEmpty(values ...string) string {
@@ -910,4 +1030,14 @@ func p9FirstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// p9FirstPositive returns the first positive value, or zero when none is set.
+func p9FirstPositive(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
