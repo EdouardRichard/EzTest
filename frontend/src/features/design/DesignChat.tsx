@@ -87,6 +87,9 @@ export function DesignChat({
 }: DesignChatProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  // Composer-owned draft state exposed upward: non-vision models are disabled
+  // while the draft carries an image (0.2.1 vision gating).
+  const [draftHasImages, setDraftHasImages] = useState(false)
   const {
     messages,
     loading,
@@ -154,6 +157,7 @@ export function DesignChat({
                     versionId={versionId}
                     conversationId={activeConversationId}
                     modelOverride={active?.model_override ?? null}
+                    draftHasImages={draftHasImages}
                     onModelChanged={onConversationModelChanged}
                   />
                 )}
@@ -262,6 +266,7 @@ export function DesignChat({
               onTextChange={onDraftTextChange}
               caseReferences={caseReferences}
               onCaseReferencesChange={onCaseReferencesChange}
+              onDraftHasImagesChange={setDraftHasImages}
             />
           )
         ) : (
@@ -339,6 +344,7 @@ export function DesignChat({
                   onTextChange={onDraftTextChange}
                   caseReferences={caseReferences}
                   onCaseReferencesChange={onCaseReferencesChange}
+                  onDraftHasImagesChange={setDraftHasImages}
                 />
               </>
             )}

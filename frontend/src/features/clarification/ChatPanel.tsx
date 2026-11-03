@@ -60,6 +60,9 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  // Composer-owned draft state exposed upward: non-vision models are disabled
+  // while the draft carries an image (0.2.1 vision gating).
+  const [draftHasImages, setDraftHasImages] = useState(false)
   const {
     messages,
     loading,
@@ -111,6 +114,7 @@ export function ChatPanel({
                 versionId={versionId}
                 conversationId={conversationId}
                 modelOverride={active?.model_override ?? null}
+                draftHasImages={draftHasImages}
                 onModelChanged={onConversationModelChanged}
               />
             )}
@@ -242,7 +246,11 @@ export function ChatPanel({
               // intentionally hidden instead of being a dead control.
               onErrorAction={() => reload()}
             />
-            <Composer onSend={send} error={sendError ?? undefined} />
+            <Composer
+              onSend={send}
+              error={sendError ?? undefined}
+              onDraftHasImagesChange={setDraftHasImages}
+            />
           </>
         )}
       </section>

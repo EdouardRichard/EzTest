@@ -1,6 +1,13 @@
 "use client"
 
-import { type ClipboardEvent, type DragEvent, type KeyboardEvent, useRef, useState } from "react"
+import {
+  type ClipboardEvent,
+  type DragEvent,
+  type KeyboardEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
@@ -23,6 +30,16 @@ export type ComposerProps = {
   /** Case references ("交给 AI 修改") carried by the next user message. */
   caseReferences?: CaseCardPart[]
   onCaseReferencesChange?: (references: CaseCardPart[]) => void
+  /**
+   * True while the draft holds an image attachment (0.2.1 vision gating). The
+   * page passes it to `ModelSelector` so non-vision models are disabled.
+   */
+  onDraftHasImagesChange?: (hasImages: boolean) => void
+}
+
+/** Image detection for the draft; the mime comes from `POST /api/content`. */
+function hasImageAttachment(items: readonly UploadedAttachment[]): boolean {
+  return items.some((item) => item.mime.trim().toLowerCase().startsWith("image/"))
 }
 
 /**
@@ -41,6 +58,7 @@ export function Composer({
   onTextChange,
   caseReferences = [],
   onCaseReferencesChange,
+  onDraftHasImagesChange,
 }: ComposerProps) {
   const [internalValue, setInternalValue] = useState("")
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([])
@@ -58,6 +76,20 @@ export function Composer({
   // 409. Keep the draft/attachments and offer an explicit retry instead of
   // silently re-submitting or dropping the message.
   const attachmentPending = error instanceof ApiError && error.code === "attachment_pending"
+  const draftHasImages = hasImageAttachment(attachments)
+
+  // Publish the image-draft signal that gates non-vision models (0.2.1). The
+  // attachment list is owned here (Task 25 FloatingPanel / Task 28 chips stay
+  // untouched), so the page only needs the boolean.
+  useEffect(() => {
+    onDraftHasImagesChange?.(draftHasImages)
+  }, [draftHasImages, onDraftHasImagesChange])
+  // The next composer (conversation switch, collapse/expand, send that clears
+  // the draft) starts empty; never leak a stale `true` into it.
+  useEffect(() => {
+    if (onDraftHasImagesChange === undefined) return
+    return () => onDraftHasImagesChange(false)
+  }, [onDraftHasImagesChange])
 
   function updateValue(next: string): void {
     if (text === undefined) setInternalValue(next)
