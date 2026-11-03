@@ -104,6 +104,29 @@ export type DesignOverview = {
   active_round: DesignRound | null
 }
 
+/* ----------------------------------- stage ---------------------------------- */
+
+/** 0.2.1 version stage-machine projection (spec §5.3). */
+export type VersionStage =
+  | "created"
+  | "clarifying"
+  | "requirement_review"
+  | "designing"
+  | "case_review"
+  | "executing"
+  | "reporting"
+  | "completed"
+  | "blocked"
+  | "paused"
+
+/** `GET/POST /api/versions/{id}/stage` response payload. */
+export type StageView = {
+  version_id: string
+  stage: VersionStage
+  stage_entered_at: string
+  blocker: string | null
+}
+
 /* --------------------------------- case detail ------------------------------ */
 
 export type DesignCaseVersionSummary = {

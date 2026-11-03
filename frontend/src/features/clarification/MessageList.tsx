@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { Spinner } from "@/components/ui/Spinner"
+import { CaseCard } from "@/features/conversation/CaseCard"
 import { ErrorPart as ErrorPartView } from "@/features/conversation/ErrorPart"
 import { JobCard } from "@/features/conversation/JobCard"
 import { ThinkingBlock } from "@/features/conversation/ThinkingBlock"
@@ -32,6 +33,8 @@ export type MessageListProps = {
   activity: string | null
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+  /** Opens a `case_card` reference; the design workspace selects the case. */
+  onCaseSelect?: (caseId: string) => void
   /** History pagination: true while the messages endpoint has a newer page. */
   hasMore?: boolean
   loadingMore?: boolean
@@ -124,6 +127,7 @@ function MessagePartView({
   part,
   onRequirementSelect,
   onRequirementChanged,
+  onCaseSelect,
   onErrorAction,
 }: {
   versionId: string
@@ -131,6 +135,7 @@ function MessagePartView({
   part: RenderablePart
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+  onCaseSelect?: (caseId: string) => void
   onErrorAction?: (part: ErrorPayload) => void
 }) {
   switch (part.type) {
@@ -168,9 +173,7 @@ function MessagePartView({
     case "error":
       return <ErrorPartView part={part} onAction={onErrorAction} />
     case "case_card":
-      // Case cards are wired by the design conversation task; the thread
-      // intentionally ignores them until then instead of rendering a bare ID.
-      return null
+      return <CaseCard part={part} onOpen={onCaseSelect} versionId={versionId} />
   }
 }
 
@@ -204,12 +207,14 @@ function MessageBubble({
   message,
   onRequirementSelect,
   onRequirementChanged,
+  onCaseSelect,
   onErrorAction,
 }: {
   versionId: string
   message: ConversationMessage
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+  onCaseSelect?: (caseId: string) => void
   onErrorAction?: (part: ErrorPayload) => void
 }) {
   const isUser = message.role === "user"
@@ -242,6 +247,7 @@ function MessageBubble({
             part={part}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}
+            onCaseSelect={onCaseSelect}
             onErrorAction={onErrorAction}
           />
         ))}
@@ -271,6 +277,7 @@ export function MessageList({
   activity,
   onRequirementSelect,
   onRequirementChanged,
+  onCaseSelect,
   hasMore = false,
   loadingMore = false,
   loadMoreError,
@@ -298,6 +305,7 @@ export function MessageList({
           message={message}
           onRequirementSelect={onRequirementSelect}
           onRequirementChanged={onRequirementChanged}
+          onCaseSelect={onCaseSelect}
           onErrorAction={onErrorAction}
         />
       ))}

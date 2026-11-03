@@ -77,6 +77,14 @@ describe("CaseDetailPanel", () => {
     expect(props.onRequestChange).toHaveBeenCalledWith("请修改：退款 T+1 到账")
   })
 
+  it("hands the case to the AI modification action with its reference", async () => {
+    const props = renderPanel({ onRequestAiChange: vi.fn() })
+
+    fireEvent.click(await screen.findByTestId("btn-ai-modify-detail-7001"))
+
+    expect(props.onRequestAiChange).toHaveBeenCalledWith("7001")
+  })
+
   it("loads a historical version when the history entry is clicked", async () => {
     renderPanel()
 

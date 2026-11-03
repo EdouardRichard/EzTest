@@ -30,7 +30,8 @@ import {
 import type { DesignNodeActions } from "./nodeActions"
 import { RequirementNode } from "./RequirementNode"
 import { ScenarioNode } from "./ScenarioNode"
-import type { CaseVersionStatus, DesignGraph } from "./types"
+import type { CaseVersionStatus, DesignCaseSummary, DesignGraph } from "./types"
+import { useSelection } from "./useSelection"
 
 import "@xyflow/react/dist/style.css"
 
@@ -75,10 +76,18 @@ export type DesignMindmapProps = {
   confirmingKey?: string | null
   /** Latest terminal execution verdict per case id; absent means "not executed". */
   executionResults?: DesignExecutionResults
+  /** True while a batch confirm/execute request is in flight. */
+  batchBusy?: boolean
   onSelectCase: (caseId: string) => void
   onConfirmCase: (caseId: string) => void
   onConfirmScenario: (scenarioId: string) => void
   onConfirmRequirement: (requirementId: string) => void
+  /** Batch confirm: exactly the checked case ids (spec §9.3). */
+  onBatchConfirmCases?: (caseIds: string[]) => void
+  /** Batch execute: only offered when every checked case is confirmed. */
+  onBatchExecuteCases?: (caseIds: string[]) => void
+  /** "交给 AI 修改": the checked case ids are handed to the design chat. */
+  onRequestAiChange?: (caseIds: string[]) => void
 }
 
 function MindmapCanvas({
@@ -86,14 +95,42 @@ function MindmapCanvas({
   selectedCaseId = null,
   confirmingKey = null,
   executionResults = EMPTY_RESULTS,
+  batchBusy = false,
   onSelectCase,
   onConfirmCase,
   onConfirmScenario,
   onConfirmRequirement,
+  onBatchConfirmCases,
+  onBatchExecuteCases,
+  onRequestAiChange,
 }: DesignMindmapProps) {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const [filters, setFilters] = useState<CaseFilterValues>(DEFAULT_CASE_FILTERS)
   const hasExecutionResults = Object.keys(executionResults).length > 0
+  const selection = useSelection()
+
+  // The batch bar operates on the cases the user actually checked: the graph
+  // lookup only resolves titles/statuses, it never widens the selection.
+  const caseById = useMemo(() => {
+    const index = new Map<string, DesignCaseSummary>()
+    for (const requirement of graph.requirements) {
+      for (const scenario of requirement.scenarios) {
+        for (const designCase of scenario.cases) index.set(designCase.case_id, designCase)
+      }
+    }
+    return index
+  }, [graph.requirements])
+  const selectedCases = useMemo(
+    () =>
+      selection.selectedIds
+        .map((caseId) => caseById.get(caseId))
+        .filter((designCase): designCase is DesignCaseSummary => designCase !== undefined),
+    [selection.selectedIds, caseById],
+  )
+  const allSelectedConfirmed =
+    selectedCases.length > 0 &&
+    selectedCases.length === selection.selectedIds.length &&
+    selectedCases.every((designCase) => designCase.status === "confirmed")
 
   // A result filter without execution data would hide every case behind the
   // no-match overlay, so it only becomes active once a caller passes verdicts.
@@ -110,9 +147,17 @@ function MindmapCanvas({
       onConfirmCase,
       onConfirmScenario,
       onConfirmRequirement,
+      onToggleCaseSelected: selection.toggle,
       confirmingKey,
     }),
-    [onSelectCase, onConfirmCase, onConfirmScenario, onConfirmRequirement, confirmingKey],
+    [
+      onSelectCase,
+      onConfirmCase,
+      onConfirmScenario,
+      onConfirmRequirement,
+      selection.toggle,
+      confirmingKey,
+    ],
   )
 
   // The layout is cached by `version_id:graph_hash`, so a snapshot refresh that
@@ -229,16 +274,18 @@ function MindmapCanvas({
     () =>
       filteredLayout.nodes.map((node) => {
         const selected = node.id === `case-${selectedCaseId}`
+        const batchSelected =
+          node.data.kind === "case" && selection.selectedIds.includes(node.data.case.case_id)
         return {
           id: node.id,
           type: node.type,
           position: node.position,
           className: classesFor(node),
           selected,
-          data: { ...node.data, actions, selected },
+          data: { ...node.data, actions, selected, batchSelected },
         }
       }),
-    [filteredLayout, actions, selectedCaseId, classesFor],
+    [filteredLayout, actions, selectedCaseId, selection.selectedIds, classesFor],
   )
 
   const edges = useMemo<Edge[]>(
@@ -259,6 +306,61 @@ function MindmapCanvas({
         resultFilterEnabled={hasExecutionResults}
         onChange={handleFilterChange}
       />
+
+      {layout.nodes.length === 0 ? null : (
+        <div
+          data-testid="case-batch-bar"
+          role="toolbar"
+          aria-label="用例批量操作"
+          className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5"
+        >
+          <span data-testid="case-selection-count" className="text-[11px] text-muted-foreground">
+            已选 {selection.selectedIds.length} 条
+          </span>
+          {onBatchConfirmCases === undefined ? null : (
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="case-batch-confirm"
+              disabled={selection.selectedIds.length === 0 || batchBusy}
+              onClick={() => onBatchConfirmCases(selection.selectedIds)}
+            >
+              批量确认
+            </Button>
+          )}
+          {onRequestAiChange === undefined ? null : (
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="case-batch-ai-modify"
+              disabled={selection.selectedIds.length === 0 || batchBusy}
+              onClick={() => onRequestAiChange(selection.selectedIds)}
+            >
+              交给 AI 修改
+            </Button>
+          )}
+          {onBatchExecuteCases === undefined ? null : (
+            <Button
+              size="sm"
+              data-testid="case-batch-execute"
+              disabled={!allSelectedConfirmed || batchBusy}
+              title="仅当所选用例全部为 confirmed 时才能批量执行"
+              onClick={() => onBatchExecuteCases(selection.selectedIds)}
+            >
+              批量执行
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="ghost"
+            data-testid="case-batch-clear"
+            disabled={selection.selectedIds.length === 0}
+            onClick={selection.clear}
+          >
+            清除选择
+          </Button>
+        </div>
+      )}
 
       <div className="relative min-h-0 flex-1">
         <div className="absolute right-3 top-3 z-10 flex items-center gap-1">

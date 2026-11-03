@@ -19,9 +19,11 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import type { ConversationModel } from "@/features/conversation/api"
+import type { CaseCardPart } from "@/features/conversation/types"
 import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
+  confirmStageCases,
   createDesignConversation,
   getDesignGraph,
   getDesignOverview,
@@ -33,7 +35,7 @@ import { DesignMindmap } from "./DesignMindmap"
 import { ExportCasesDialog } from "./ExportCasesDialog"
 import type { DesignExecutionResults } from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
-import type { CaseConfirmationScope, DesignGraph, DesignOverview } from "./types"
+import type { CaseConfirmationScope, DesignCaseSummary, DesignGraph, DesignOverview } from "./types"
 
 export type DesignTabProps = {
   versionId: string
@@ -122,6 +124,9 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [staleNotice, setStaleNotice] = useState<string | null>(null)
   const [detailToken, setDetailToken] = useState(0)
   const [chatDraft, setChatDraft] = useState("")
+  const [batchBusy, setBatchBusy] = useState(false)
+  /** Cases checked in the mindmap and handed to the design chat ("交给 AI 修改"). */
+  const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
   const [activity, setActivity] = useState<string | null>(null)
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
@@ -314,6 +319,90 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const createConversation = useCallback(() => {
     void handleNewConversation()
   }, [handleNewConversation])
+
+  const batchCaseGate = useCallback(
+    async (caseIds: string[], mode: "confirm" | "execute"): Promise<void> => {
+      if (caseIds.length === 0) return
+      setBatchBusy(true)
+      setConfirmError(null)
+      setConfirmNotice(null)
+      try {
+        await confirmStageCases(versionId, caseIds)
+        setConfirmNotice(
+          mode === "execute"
+            ? `已提交 ${caseIds.length} 条用例执行`
+            : `已确认 ${caseIds.length} 条用例`,
+        )
+        await refreshGraph()
+        await refreshOverview()
+        setDetailToken((token) => token + 1)
+      } catch (cause) {
+        setConfirmError(cause)
+      } finally {
+        setBatchBusy(false)
+      }
+    },
+    [versionId, refreshGraph, refreshOverview],
+  )
+
+  // The batch bar hands exactly the checked ids to the 0.2.1 stage gate; the
+  // "all confirmed" rule for execution is enforced by the mindmap.
+  const batchConfirmCases = useCallback(
+    (caseIds: string[]) => {
+      void batchCaseGate(caseIds, "confirm")
+    },
+    [batchCaseGate],
+  )
+
+  const batchExecuteCases = useCallback(
+    (caseIds: string[]) => {
+      void batchCaseGate(caseIds, "execute")
+    },
+    [batchCaseGate],
+  )
+
+  /**
+   * "交给 AI 修改": resolve the checked case ids against the graph and put
+   * `case_card` reference parts into the design composer. Sending stays the
+   * user's action so the modification instruction can be edited first.
+   */
+  const requestAiChange = useCallback(
+    (caseIds: string[]) => {
+      if (graph === null) return
+      const byId = new Map<string, DesignCaseSummary>()
+      for (const requirement of graph.requirements) {
+        for (const scenario of requirement.scenarios) {
+          for (const designCase of scenario.cases) byId.set(designCase.case_id, designCase)
+        }
+      }
+      const references: CaseCardPart[] = []
+      for (const caseId of caseIds) {
+        const designCase = byId.get(caseId)
+        if (designCase === undefined) continue
+        references.push({
+          type: "case_card",
+          case_id: designCase.case_id,
+          case_version_id: designCase.current_version_id,
+          title: designCase.title,
+          status: designCase.status,
+        })
+      }
+      if (references.length === 0) return
+      setChatCaseReferences(references)
+      setChatDraft(
+        `请修改以下 ${references.length} 条用例：\n${references
+          .map((reference) => `- ${reference.title}（#${reference.case_id}）`)
+          .join("\n")}`,
+      )
+      if (activeConversationId === null) void handleNewConversation()
+    },
+    [graph, activeConversationId, handleNewConversation],
+  )
+
+  const requestAiChangeForCase = useCallback(
+    (caseId: string) => requestAiChange([caseId]),
+    [requestAiChange],
+  )
 
   const handleConfirm = useCallback(
     async (scope: CaseConfirmationScope, targetId: string): Promise<void> => {
@@ -577,6 +666,9 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
             collapsed={chatCollapsed}
             onToggleCollapsed={toggleChatCollapsed}
             onConversationModelChanged={applyConversationModel}
+            caseReferences={chatCaseReferences}
+            onCaseReferencesChange={setChatCaseReferences}
+            onCaseSelect={selectCase}
           />
         </div>
 
@@ -632,10 +724,14 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
               selectedCaseId={selectedCaseId}
               confirmingKey={confirmingKey}
               executionResults={executionResults}
+              batchBusy={batchBusy}
               onSelectCase={selectCase}
               onConfirmCase={confirmCase}
               onConfirmScenario={confirmScenario}
               onConfirmRequirement={confirmRequirement}
+              onBatchConfirmCases={batchConfirmCases}
+              onBatchExecuteCases={batchExecuteCases}
+              onRequestAiChange={requestAiChange}
             />
           )}
         </div>
@@ -676,6 +772,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
             confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
             onConfirm={confirmCase}
             onRequestChange={setChatDraft}
+            onRequestAiChange={requestAiChangeForCase}
           />
         </div>
       </div>

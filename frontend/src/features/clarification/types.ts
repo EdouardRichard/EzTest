@@ -7,6 +7,11 @@
  * `{data: ...}`.
  */
 
+import type {
+  CaseCardPart,
+  MessagePart as ConversationMessagePart,
+} from "@/features/conversation/types"
+
 export type RequirementStatus = "draft" | "clarified" | "closed" | "obsolete"
 
 export type RequirementPriority = "P0" | "P1" | "P2" | "P3"
@@ -127,14 +132,19 @@ export type MessagePart =
   | RequirementCardPart
   | RollbackProposalPart
 
-/** The parts a client may send in a message (P1). */
-export type NewMessagePart = TextPart | AttachmentPart
+/**
+ * The parts a client may send in a message. P1 allowed text/attachment; 0.2.1
+ * adds `case_card` reference parts so "交给 AI 修改" can carry the checked
+ * cases into the conversation (spec §9.3).
+ */
+export type NewMessagePart = TextPart | AttachmentPart | CaseCardPart
 
 export type ConversationMessage = {
   id: string
   conversation_id: string
   role: MessageRole
-  parts: MessagePart[]
+  /** 0.2.1 threads can carry every part kind, not only the P1 union. */
+  parts: (MessagePart | ConversationMessagePart)[]
   refs: MessageRef[]
   /** 0.2.1 assistant model that actually generated the message; null for user messages. */
   actual_model?: string | null

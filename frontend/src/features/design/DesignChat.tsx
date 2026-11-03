@@ -20,6 +20,7 @@ import type {
 import { useConversation } from "@/features/clarification/useConversation"
 import type { ConversationModel } from "@/features/conversation/api"
 import { ModelSelector } from "@/features/conversation/ModelSelector"
+import type { CaseCardPart } from "@/features/conversation/types"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -49,6 +50,11 @@ export type DesignChatProps = {
   onToggleCollapsed?: () => void
   /** Fired after a successful conversation model PATCH. */
   onConversationModelChanged?: (conversation: ConversationModel) => void
+  /** Case reference cards carried by the next design message (spec §9.3). */
+  caseReferences?: CaseCardPart[]
+  onCaseReferencesChange?: (references: CaseCardPart[]) => void
+  /** Opens a case referenced from a `case_card` part in the thread. */
+  onCaseSelect?: (caseId: string) => void
 }
 
 /**
@@ -74,6 +80,9 @@ export function DesignChat({
   collapsed = false,
   onToggleCollapsed,
   onConversationModelChanged,
+  caseReferences,
+  onCaseReferencesChange,
+  onCaseSelect,
 }: DesignChatProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
   const {
@@ -219,6 +228,8 @@ export function DesignChat({
             placeholder="描述设计修改，或上传参考文档…"
             text={draftText}
             onTextChange={onDraftTextChange}
+            caseReferences={caseReferences}
+            onCaseReferencesChange={onCaseReferencesChange}
           />
         )
       ) : (
@@ -273,6 +284,7 @@ export function DesignChat({
                 messages={messages}
                 activity={activity}
                 onRequirementSelect={() => {}}
+                onCaseSelect={onCaseSelect}
                 hasMore={hasMore}
                 loadingMore={loadingMore}
                 loadMoreError={loadMoreError}
@@ -293,6 +305,8 @@ export function DesignChat({
                 placeholder="描述设计修改，或上传参考文档…"
                 text={draftText}
                 onTextChange={onDraftTextChange}
+                caseReferences={caseReferences}
+                onCaseReferencesChange={onCaseReferencesChange}
               />
             </>
           )}

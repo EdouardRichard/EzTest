@@ -5,6 +5,7 @@ import { type ClipboardEvent, type DragEvent, type KeyboardEvent, useRef, useSta
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { InlineError } from "@/components/ui/ErrorState"
+import type { CaseCardPart } from "@/features/conversation/types"
 import { ApiError } from "@/lib/api-client"
 
 import { AttachmentUploader, type AttachmentUploaderHandle } from "./AttachmentUploader"
@@ -19,6 +20,9 @@ export type ComposerProps = {
   /** External draft (e.g. the P2 "请求修改" action); controlled when defined. */
   text?: string
   onTextChange?: (value: string) => void
+  /** Case references ("交给 AI 修改") carried by the next user message. */
+  caseReferences?: CaseCardPart[]
+  onCaseReferencesChange?: (references: CaseCardPart[]) => void
 }
 
 /**
@@ -35,6 +39,8 @@ export function Composer({
   placeholder = "描述需求，或粘贴 / 拖拽上传 doc / pdf / md / ppt…",
   text,
   onTextChange,
+  caseReferences = [],
+  onCaseReferencesChange,
 }: ComposerProps) {
   const [internalValue, setInternalValue] = useState("")
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([])
@@ -43,7 +49,7 @@ export function Composer({
   const uploaderRef = useRef<AttachmentUploaderHandle>(null)
 
   const value = text ?? internalValue
-  const hasContent = value.trim().length > 0 || attachments.length > 0
+  const hasContent = value.trim().length > 0 || attachments.length > 0 || caseReferences.length > 0
   // A pending attachment upload/parse must finish before the message can be
   // submitted (spec §8.5); the server repeats this with a typed 409
   // attachment_pending when a referenced attachment is still parsing.
@@ -72,6 +78,15 @@ export function Composer({
         size: attachment.size,
       })
     }
+    for (const reference of caseReferences) {
+      parts.push({
+        type: "case_card",
+        case_id: reference.case_id,
+        case_version_id: reference.case_version_id ?? null,
+        title: reference.title,
+        status: reference.status,
+      })
+    }
 
     setSending(true)
     try {
@@ -79,6 +94,7 @@ export function Composer({
       if (sent) {
         updateValue("")
         setAttachments([])
+        onCaseReferencesChange?.([])
       }
     } catch {
       // The parent surfaces send errors through `error`; keep the draft.
@@ -121,6 +137,34 @@ export function Composer({
           "focus-within:border-primary/60 focus-within:ring-1 focus-within:ring-ring",
         )}
       >
+        {caseReferences.length === 0 ? null : (
+          <div data-testid="composer-case-references" className="mb-1.5 flex flex-wrap gap-1">
+            {caseReferences.map((reference) => (
+              <span
+                key={reference.case_id}
+                data-testid={`composer-case-ref-${reference.case_id}`}
+                className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-2 py-0.5 text-[10px] text-foreground"
+              >
+                用例 {reference.title}
+                {onCaseReferencesChange === undefined ? null : (
+                  <button
+                    type="button"
+                    data-testid={`composer-case-ref-remove-${reference.case_id}`}
+                    aria-label={`移除用例引用 ${reference.title}`}
+                    onClick={() =>
+                      onCaseReferencesChange(
+                        caseReferences.filter((item) => item.case_id !== reference.case_id),
+                      )
+                    }
+                    className="rounded-full px-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    ×
+                  </button>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
         <textarea
           data-testid="composer-textarea"
           aria-label="需求澄清消息"

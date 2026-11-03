@@ -178,6 +178,8 @@ export type CaseDetailPanelProps = {
   onConfirm: (caseId: string) => void
   /** Fills the design chat input with a modification request (never sends). */
   onRequestChange: (title: string) => void
+  /** Hands this case to the design chat as a `case_card` reference (never sends). */
+  onRequestAiChange?: (caseId: string) => void
   confirming?: boolean
 }
 
@@ -188,6 +190,7 @@ function CaseDetailBody({
   onSelectVersion,
   onConfirm,
   onRequestChange,
+  onRequestAiChange,
   confirming,
 }: {
   versionId: string
@@ -196,6 +199,7 @@ function CaseDetailBody({
   onSelectVersion: (caseVersionId: string) => void
   onConfirm: (caseId: string) => void
   onRequestChange: (title: string) => void
+  onRequestAiChange?: (caseId: string) => void
   confirming: boolean
 }) {
   const selected = detail.selected
@@ -228,6 +232,16 @@ function CaseDetailBody({
         >
           请求修改
         </Button>
+        {onRequestAiChange === undefined ? null : (
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid={`btn-ai-modify-detail-${detail.case_id}`}
+            onClick={() => onRequestAiChange(detail.case_id)}
+          >
+            交给 AI 修改
+          </Button>
+        )}
         {canConfirm ? (
           <Button
             size="sm"
@@ -411,6 +425,7 @@ export function CaseDetailPanel({
   refreshToken = 0,
   onConfirm,
   onRequestChange,
+  onRequestAiChange,
   confirming = false,
 }: CaseDetailPanelProps) {
   const [detail, setDetail] = useState<DesignCaseDetail | null>(null)
@@ -477,6 +492,7 @@ export function CaseDetailPanel({
           onSelectVersion={setSelectedVersionId}
           onConfirm={onConfirm}
           onRequestChange={onRequestChange}
+          onRequestAiChange={onRequestAiChange}
           confirming={confirming}
         />
       )}

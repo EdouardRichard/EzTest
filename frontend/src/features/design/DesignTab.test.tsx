@@ -11,6 +11,7 @@ const api = vi.hoisted(() => ({
   createDesignConversation: vi.fn(),
   getDesignCase: vi.fn(),
   confirmCases: vi.fn(),
+  confirmStageCases: vi.fn(),
   createExport: vi.fn(),
   downloadExport: vi.fn(),
   listExports: vi.fn(),
@@ -121,6 +122,12 @@ function mockWorkspace(graph: DesignGraph = designGraphFixture) {
     confirmed: [{ case_id: "7001", case_version_id: "7002" }],
     skipped: [],
     confirmed_at: TIMESTAMP,
+  })
+  api.confirmStageCases.mockResolvedValue({
+    version_id: "2001",
+    stage: "executing",
+    stage_entered_at: TIMESTAMP,
+    blocker: null,
   })
 }
 
@@ -342,5 +349,94 @@ describe("DesignTab", () => {
 
     expect(screen.getByTestId("composer-textarea")).toHaveValue("请修改：退款 T+1 到账")
     expect(clarificationApi.postMessage).not.toHaveBeenCalled()
+  })
+
+  it("batch confirms exactly the checked cases through the stage gate", async () => {
+    render(<DesignTab versionId="2001" />)
+
+    await screen.findByTestId("case-checkbox-7001")
+    fireEvent.click(screen.getByTestId("case-checkbox-7001"))
+    fireEvent.click(screen.getByTestId("case-checkbox-7003"))
+    fireEvent.click(screen.getByTestId("case-batch-confirm"))
+
+    await waitFor(() =>
+      expect(api.confirmStageCases).toHaveBeenCalledWith("2001", ["7001", "7003"]),
+    )
+    expect(api.confirmStageCases).toHaveBeenCalledTimes(1)
+    expect(await screen.findByTestId("design-confirm-notice")).toHaveTextContent("已确认 2 条用例")
+  })
+
+  it("batch executes only the confirmed cases in the selection", async () => {
+    render(<DesignTab versionId="2001" />)
+
+    await screen.findByTestId("case-checkbox-7003")
+    fireEvent.click(screen.getByTestId("case-checkbox-7003"))
+    expect(screen.getByTestId("case-batch-execute")).toBeEnabled()
+    fireEvent.click(screen.getByTestId("case-batch-execute"))
+
+    await waitFor(() => expect(api.confirmStageCases).toHaveBeenCalledWith("2001", ["7003"]))
+    expect(await screen.findByTestId("design-confirm-notice")).toHaveTextContent(
+      "已提交 1 条用例执行",
+    )
+  })
+
+  it("hands checked cases to AI modification as case reference cards", async () => {
+    clarificationApi.postMessage.mockResolvedValue({
+      id: "5001",
+      conversation_id: "4009",
+      role: "user",
+      parts: [
+        { type: "text", text: "请修改以下 1 条用例：" },
+        {
+          type: "case_card",
+          case_id: "7001",
+          case_version_id: "7002",
+          title: "退款 T+1 到账",
+          status: "draft",
+        },
+      ],
+      refs: [],
+      created_at: TIMESTAMP,
+    })
+    render(<DesignTab versionId="2001" />)
+
+    await screen.findByTestId("case-checkbox-7001")
+    fireEvent.click(screen.getByTestId("case-checkbox-7001"))
+    fireEvent.click(screen.getByTestId("case-batch-ai-modify"))
+
+    expect(screen.getByTestId("composer-case-ref-7001")).toHaveTextContent("退款 T+1 到账")
+    expect(screen.getByTestId("composer-textarea")).toHaveValue(
+      "请修改以下 1 条用例：\n- 退款 T+1 到账（#7001）",
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }))
+
+    await waitFor(() => expect(clarificationApi.postMessage).toHaveBeenCalledTimes(1))
+    const payload = clarificationApi.postMessage.mock.calls[0]?.[2] as {
+      parts: Array<Record<string, unknown>>
+    }
+    expect(payload.parts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "case_card",
+          case_id: "7001",
+          case_version_id: "7002",
+          title: "退款 T+1 到账",
+          status: "draft",
+        }),
+      ]),
+    )
+    expect(await screen.findByTestId("message-case-card-7001")).toBeInTheDocument()
+  })
+
+  it("hands the detail case to AI modification as a reference card", async () => {
+    render(<DesignTab versionId="2001" initialCaseId="7001" />)
+
+    fireEvent.click(await screen.findByTestId("btn-ai-modify-detail-7001"))
+
+    expect(screen.getByTestId("composer-case-ref-7001")).toBeInTheDocument()
+    expect(screen.getByTestId("composer-textarea")).toHaveValue(
+      "请修改以下 1 条用例：\n- 退款 T+1 到账（#7001）",
+    )
   })
 })
