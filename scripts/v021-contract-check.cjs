@@ -1147,6 +1147,145 @@ check(
 )
 
 // ---------------------------------------------------------------------------
+// Task 85 (Release-T1): docs/openapi/api.yaml is the public release artifact.
+// It is a whole port of the frozen 0.2.1 contract, never a partial splice of
+// the 0.2.0-p8 snapshot: identity flips to 0.2.1 while the P0-P8 history
+// paragraphs stay, and every path/operation/schema equals the frozen file.
+// ---------------------------------------------------------------------------
+const releaseFile = path.join(root, "docs", "openapi", "api.yaml")
+check(fs.existsSync(releaseFile), "docs/openapi/api.yaml exists")
+const release = fs.existsSync(releaseFile)
+  ? fs.readFileSync(releaseFile, "utf8").replace(/\r\n/g, "\n")
+  : ""
+const releaseReadmeFile = path.join(root, "docs", "openapi", "README.md")
+check(fs.existsSync(releaseReadmeFile), "docs/openapi/README.md documents the 0.2.1 release artifact")
+const releaseReadme = fs.existsSync(releaseReadmeFile)
+  ? fs.readFileSync(releaseReadmeFile, "utf8").replace(/\r\n/g, "\n")
+  : ""
+
+check(/^  version: 0\.2\.1$/m.test(release), "release openapi info.version is 0.2.1")
+check(/^x-frozen: 0\.2\.1$/m.test(release), "release openapi x-frozen is 0.2.1")
+check(
+  /^  title: EzTest 0\.2\.1 API 契约（.*P8 冻结.*0\.2\.1 发布.*）$/m.test(release),
+  "release openapi title names the 0.2.1 release and preserves the P8 freeze",
+)
+check(!/0\.2\.1 增量（draft/.test(release), "release openapi no longer ships the 0.2.1 draft marker")
+check(/### 0\.2\.1 增量（release: 0\.2\.1/.test(release), "release openapi marks the 0.2.1 section as release")
+check(/Task 85/.test(release), "release openapi records the Task 85 whole-port provenance")
+// P0-P8 history must survive the identity flip (no history rewrite).
+for (const heading of [
+  "## P1 增量（frozen，2026-10-31）",
+  "### P2 增量（frozen，2026-10-31）",
+  "### P3 增量（frozen，2026-11-01）",
+  "### P4 增量（frozen，2026-11-01）",
+  "### P5 增量（frozen，2026-11-01）",
+  "### P6 增量（frozen，2026-11-01）",
+  "### P7 增量（frozen，2026-11-01）",
+  "### P8 增量（frozen，2026-11-02）",
+]) {
+  check(release.includes(heading), `release openapi preserves P8 history heading ${heading}`)
+}
+check(
+  /P8 快照历史计数仍为 162 paths \/ 200 operations \/ 264 schemas/.test(release),
+  "release openapi keeps the P8 snapshot counts as history (162/200/264)",
+)
+
+const releasePaths = parsePaths(release)
+const releaseOperationCount = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
+const releaseSchemaCount = countSchemas(release)
+const componentSchemaNames = (text) => {
+  const names = new Set()
+  let inComponents = false
+  let inSchemas = false
+  for (const line of text.split("\n")) {
+    if (line === "components:") {
+      inComponents = true
+      continue
+    }
+    if (inComponents && /^  [a-zA-Z]+:/.test(line)) {
+      inSchemas = line === "  schemas:"
+      continue
+    }
+    if (!inSchemas) continue
+    const match = /^    ([A-Za-z][A-Za-z0-9_]*):$/.exec(line)
+    if (match) names.add(match[1])
+  }
+  return names
+}
+const releaseSchemaNames = componentSchemaNames(release)
+const frozenSchemaNames = componentSchemaNames(openapi)
+
+check(
+  releasePaths.size === 181 && releaseOperationCount === 222 && releaseSchemaCount === 281,
+  `release openapi carries the 0.2.1 totals 181/222/281 (got ${releasePaths.size}/${releaseOperationCount}/${releaseSchemaCount})`,
+)
+for (const [route, method, label] of apiChecks) {
+  check(Boolean(releasePaths.get(route)?.has(method)), `release openapi ${method.toUpperCase()} ${route} (${label})`)
+}
+for (const schema of schemaChecks) {
+  check(releaseSchemaNames.has(schema), `release openapi schema ${schema}`)
+}
+// Release paths/operations/schemas must equal the frozen 0.2.1 contract exactly:
+// no missing route and no release-only invention.
+const samePathMap =
+  releasePaths.size === openapiPaths.size &&
+  [...openapiPaths].every(([route, methods]) => {
+    const releaseMethods = releasePaths.get(route)
+    return (
+      Boolean(releaseMethods) &&
+      releaseMethods.size === methods.size &&
+      [...methods].every((method) => releaseMethods.has(method))
+    )
+  })
+check(
+  samePathMap,
+  `release openapi paths/operations exactly match the frozen contract (${openapiPaths.size} paths / ${openapiOperationCount} operations)`,
+)
+const sameSchemaSet =
+  releaseSchemaNames.size === frozenSchemaNames.size &&
+  [...frozenSchemaNames].every((schema) => releaseSchemaNames.has(schema))
+check(
+  sameSchemaSet,
+  `release openapi schemas exactly match the frozen contract (${openapiSchemaCount} schemas)`,
+)
+// Whole-port proof, not a partial splice: every section after identity is
+// byte-identical to the frozen contract (servers/security/tags/paths/components).
+const releaseBody = release.slice(release.indexOf("\nservers:"))
+const frozenBody = openapi.slice(openapi.indexOf("\nservers:"))
+check(
+  releaseBody.length > 0 && releaseBody === frozenBody,
+  "release openapi body (servers/security/tags/paths/components) is a whole port of the frozen contract",
+)
+
+for (const [needle, label] of [
+  ["enum: [job_card]", "job_card message part"],
+  ["终态 `failed` 的卡片另带可选 `code`", "job_card code/reason documentation"],
+  ["RequirementDedupeResult", "requirement dedupe DTO"],
+  ["RequirementMergeRequest", "requirement merge request DTO"],
+  ["RequirementDeleteRequest", "requirement delete request DTO"],
+  ["/api/versions/{id}/requirements/dedupe", "dedupe operation"],
+]) {
+  check(release.includes(needle), `release openapi contains ${label}`)
+}
+
+check(/0\.2\.1/.test(releaseReadme), "release README names 0.2.1")
+for (const needle of ["181 paths", "222 operations", "281 schemas", "131 events"]) {
+  check(releaseReadme.includes(needle), `release README status contains ${needle}`)
+}
+check(/Task 85/.test(releaseReadme), "release README records Task 85")
+check(/整体 port|whole[- ]port/.test(releaseReadme), "release README documents the whole-port policy")
+check(/不.*局部|not.*partial|局部拼接/.test(releaseReadme), "release README forbids partial splicing")
+check(
+  /docs\/version-V0\.2\/contracts\/openapi\.yaml/.test(releaseReadme),
+  "release README names the frozen 0.2.1 source",
+)
+check(/P8/.test(releaseReadme), "release README preserves the P8 history identity")
+check(
+  /node scripts\/v021-contract-check\.cjs/.test(releaseReadme),
+  "release README documents the release gate command",
+)
+
+// ---------------------------------------------------------------------------
 // Result. Counts are derived from the parsed catalogs above, not hardcoded.
 // ---------------------------------------------------------------------------
 const summary = {
@@ -1157,6 +1296,9 @@ const summary = {
   kinds: declaredKinds.size,
   roles: declaredRoles.size,
   createdBy: declaredCreators.size,
+  releasePaths: releasePaths.size,
+  releaseOperations: releaseOperationCount,
+  releaseSchemas: releaseSchemaCount,
 }
 check(summary.events === 13, `summary event count = 13 (got ${summary.events})`)
 check(summary.operations === 22, `summary operation count = 22 (got ${summary.operations})`)
@@ -1165,6 +1307,10 @@ check(summary.alteredTables === 9, `summary altered table count = 9 (got ${summa
 check(summary.kinds === 11, `summary work_item kind count = 11 (got ${summary.kinds})`)
 check(summary.roles === 7, `summary role count = 7 (got ${summary.roles})`)
 check(summary.createdBy === 4, `summary created_by count = 4 (got ${summary.createdBy})`)
+check(
+  summary.releasePaths === 181 && summary.releaseOperations === 222 && summary.releaseSchemas === 281,
+  `summary release openapi counts = 181/222/281 (got ${summary.releasePaths}/${summary.releaseOperations}/${summary.releaseSchemas})`,
+)
 
 if (failures > 0) {
   console.error(`0.2.1 contract check FAILED (${failures} missing needle(s))`)
@@ -1173,6 +1319,7 @@ if (failures > 0) {
 console.log(
   `0.2.1 contract check OK: ${summary.events} events / ${summary.operations} operations / ` +
     `${openapiPaths.size} paths / ${openapiOperationCount} openapi operations / ${openapiSchemaCount} schemas / ` +
+    `release openapi ${summary.releasePaths} paths / ${summary.releaseOperations} operations / ${summary.releaseSchemas} schemas / ` +
     `${summary.newTables} new tables / ${summary.alteredTables} altered tables / ` +
     `${summary.kinds} work_item kinds / ${summary.roles} roles / created_by ${summary.createdBy} values`,
 )
