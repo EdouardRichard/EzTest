@@ -49,3 +49,4 @@ knowledge_0002_binding021.sql
 resource_0003_page_url.sql
 version_0008_suspended_from.sql
 llm_0003_protocol021.sql
+knowledge_0003_trgm.sql

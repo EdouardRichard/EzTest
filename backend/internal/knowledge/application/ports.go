@@ -47,6 +47,20 @@ const (
 // Repository is the item persistence port (owned by the domain).
 type Repository = knowledge.Repository
 
+// TopKRetriever is the optional repository capability behind knowledge.search
+// (spec §10.2). A repository that implements it provides a trigram-similarity
+// top-K candidate stage for a text query; Retrieve then falls back to the
+// ListForInjection ts_rank window when the top-K stage returns no candidates.
+// It is optional so a repository without pg_trgm support (or the in-memory test
+// doubles) keeps working with the documented window semantics. Inject never
+// uses it.
+type TopKRetriever interface {
+	// SearchTopK returns up to query.Limit approved candidates visible to the
+	// requested system keys and bindings, ranked by text similarity desc then
+	// id desc. An empty query may return the id-desc recent window.
+	SearchTopK(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error)
+}
+
 // UsageRepository appends knowledge_usage rows. Insert must be best-effort
 // from the caller's point of view; the caller ignores the returned error.
 type UsageRepository interface {

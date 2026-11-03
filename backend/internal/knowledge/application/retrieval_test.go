@@ -527,6 +527,119 @@ func TestKnowledgeChineseTrigram(t *testing.T) {
 	}
 }
 
+// topKRetrievalRepo adds the optional trigram top-K capability on top of the
+// ts_rank injection window fake, so Retrieve's preference and fallback can be
+// pinned without a database.
+type topKRetrievalRepo struct {
+	*retrievalRepo
+	topKItems []knowledge.Item
+	topKQuery knowledge.InjectionQuery
+	topKCalls int
+	topKErr   error
+}
+
+func (r *topKRetrievalRepo) SearchTopK(_ context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error) {
+	r.topKCalls++
+	r.topKQuery = query
+	if r.topKErr != nil {
+		return nil, r.topKErr
+	}
+	return append([]knowledge.Item(nil), r.topKItems...), nil
+}
+
+// TestKnowledgeSearchTrgmTopK pins the repository-stage contract of spec §10.2:
+// when the repository offers the trigram top-K stage, Retrieve must use it for
+// a text query instead of the bounded ts_rank window; an empty trigram result
+// falls back to that window so short/lexically disjoint queries still recall.
+func TestKnowledgeSearchTrgmTopK(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("trigram top-K candidates replace the ts_rank window", func(t *testing.T) {
+		target := retrievalItem(1201, knowledge.StatusApproved, knowledge.ScopeGlobal, "",
+			knowledge.Bindings{}, "登录页元素", "登录页元素定位。", "kind:page_locator")
+		windowItem := retrievalItem(1202, knowledge.StatusApproved, knowledge.ScopeGlobal, "",
+			knowledge.Bindings{}, "登录说明", "登录步骤说明。", "kind:login_recipe")
+		repo := &topKRetrievalRepo{
+			retrievalRepo: newRetrievalRepo(nil, []knowledge.Item{windowItem}),
+			topKItems:     []knowledge.Item{target},
+		}
+		service := newRetrievalService(repo)
+
+		page, err := service.Retrieve(ctx, knowledgeapp.Query{VersionID: 12, Text: "登陆", Limit: 10})
+		if err != nil {
+			t.Fatalf("Retrieve: %v", err)
+		}
+		if repo.topKCalls != 1 {
+			t.Fatalf("top-K calls = %d, want 1", repo.topKCalls)
+		}
+		if len(repo.calls) != 0 {
+			t.Fatalf("injection-window calls = %d, want 0 when the top-K stage has candidates", len(repo.calls))
+		}
+		if repo.topKQuery.Query != "登陆" || repo.topKQuery.Limit != 200 {
+			t.Fatalf("top-K query = %#v, want the text and the bounded candidate limit", repo.topKQuery)
+		}
+		if !containsID(page, 1201) || containsID(page, 1202) {
+			t.Fatalf("hits = %v, want only the top-K candidate 1201", hitIDs(page))
+		}
+	})
+
+	t.Run("empty top-K falls back to the ts_rank window", func(t *testing.T) {
+		windowItem := retrievalItem(1211, knowledge.StatusApproved, knowledge.ScopeGlobal, "",
+			knowledge.Bindings{}, "登录说明", "登录步骤说明。", "kind:login_recipe")
+		repo := &topKRetrievalRepo{
+			retrievalRepo: newRetrievalRepo(nil, []knowledge.Item{windowItem}),
+		}
+		service := newRetrievalService(repo)
+
+		page, err := service.Retrieve(ctx, knowledgeapp.Query{VersionID: 13, Text: "登录", Limit: 10})
+		if err != nil {
+			t.Fatalf("Retrieve: %v", err)
+		}
+		if repo.topKCalls != 1 || len(repo.calls) != 1 {
+			t.Fatalf("top-K/injection calls = %d/%d, want 1/1 fallback", repo.topKCalls, len(repo.calls))
+		}
+		if !containsID(page, 1211) {
+			t.Fatalf("hits = %v, want the injection-window fallback 1211", hitIDs(page))
+		}
+	})
+
+	t.Run("structured browse skips the trigram stage", func(t *testing.T) {
+		item := retrievalItem(1221, knowledge.StatusApproved, knowledge.ScopeGlobal, "",
+			knowledge.Bindings{PageKey: ptr("/login")}, "登录页元素", "登录页元素定位。", "kind:page_locator")
+		repo := &topKRetrievalRepo{
+			retrievalRepo: newRetrievalRepo(nil, []knowledge.Item{item}),
+		}
+		service := newRetrievalService(repo)
+
+		page, err := service.Retrieve(ctx, knowledgeapp.Query{
+			VersionID: 14,
+			PageKey:   ptr("/login"),
+			Limit:     10,
+		})
+		if err != nil {
+			t.Fatalf("Retrieve: %v", err)
+		}
+		if repo.topKCalls != 0 {
+			t.Fatalf("top-K calls = %d, want 0 for a structured-only query", repo.topKCalls)
+		}
+		if !containsID(page, 1221) {
+			t.Fatalf("hits = %v, want the structured window item 1221", hitIDs(page))
+		}
+	})
+
+	t.Run("a failing top-K stage is not hidden", func(t *testing.T) {
+		repo := &topKRetrievalRepo{
+			retrievalRepo: newRetrievalRepo(nil, nil),
+			topKErr:       errors.New("trigram unavailable"),
+		}
+		service := newRetrievalService(repo)
+
+		if _, err := service.Retrieve(ctx, knowledgeapp.Query{VersionID: 15, Text: "登录"}); err == nil {
+			t.Fatal("Retrieve error = nil, want the top-K failure propagated")
+		}
+	})
+}
+
 // TestKnowledgeReadFullContent proves knowledge.read returns the full item body
 // while knowledge.search only exposes the bounded snippet.
 func TestKnowledgeReadFullContent(t *testing.T) {

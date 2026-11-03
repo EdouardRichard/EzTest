@@ -316,6 +316,103 @@ func (r *Repository) ListForInjection(ctx context.Context, query knowledge.Injec
 	return items, nil
 }
 
+// pgTrgmSimilarityThreshold is the retrieval similarity floor passed to the
+// pg_trgm '%' operator (which reads pg_trgm.similarity_threshold). pg_trgm's
+// default (0.3) is tuned for latin words: Chinese text has no word separators,
+// so a short query against a longer sentence scores far below it (登陆 against
+// 登录页 scores 0.17). The lowered floor keeps the Chinese near-miss recall
+// spec §10.2 requires; the application still re-scores every candidate and
+// drops unrelated rows. It is applied inside the query transaction with
+// set_config(..., is_local = true) so it never leaks to the pooled connection.
+const pgTrgmSimilarityThreshold = "0.1"
+
+// SearchTopK returns up to query.Limit approved candidates visible to the
+// requested system keys, ordered by pg_trgm similarity of the query against
+// the item title/content desc then id desc. It is the trigram retrieval stage
+// that replaces the bounded ts_rank candidate window: the GIN trigram index
+// finds rows sharing trigrams with the query, so an old item whose Chinese text
+// only matches fuzzily is still recalled. Bindings apply the same JSONB
+// containment filter as ListForInjection. An empty query delegates to the
+// id-desc injection window (structured browse has no similarity to rank by).
+//
+// The similarity threshold and the title/content OR predicate use the
+// public-installed pg_trgm objects (see knowledge_0003_trgm.sql); the query is
+// fully parameterized and the candidate count is bounded by the caller.
+func (r *Repository) SearchTopK(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error) {
+	if err := r.ready(); err != nil {
+		return nil, err
+	}
+	text := strings.TrimSpace(query.Query)
+	if text == "" {
+		return r.ListForInjection(ctx, query)
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	keys := query.SystemKeys
+	if keys == nil {
+		keys = []string{}
+	}
+	// The % operator is the trigram-indexable operator; writing it as
+	// OPERATOR(public.%) keeps it resolvable when the session search_path does
+	// not include public (the integration harness narrows it to a test schema).
+	args := []any{keys, text}
+	where := []string{
+		"status = 'approved'",
+		"(scope = 'global' OR (scope = 'system' AND system_key = ANY($1::text[])))",
+		"(title OPERATOR(public.%) $2 OR content OPERATOR(public.%) $2)",
+	}
+	if !query.Bindings.IsZero() {
+		bindings, err := encodeBindings(query.Bindings)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, bindings)
+		where = append(where, fmt.Sprintf("bindings @> $%d::jsonb", len(args)))
+	}
+	args = append(args, limit)
+	sql := fmt.Sprintf(`SELECT `+itemColumns+` FROM knowledge_item
+		WHERE %s
+		ORDER BY greatest(public.similarity(title, $2), public.similarity(content, $2)) DESC, id DESC
+		LIMIT $%d`, strings.Join(where, " AND "), len(args))
+
+	// set_config(..., is_local=true) makes the similarity floor transaction
+	// scoped; the % operator consults it while the query runs.
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin knowledge top-k: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var applied string
+	if err := tx.QueryRow(ctx,
+		`SELECT set_config('pg_trgm.similarity_threshold', $1, true)`,
+		pgTrgmSimilarityThreshold).Scan(&applied); err != nil {
+		return nil, fmt.Errorf("set knowledge trigram threshold: %w", err)
+	}
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search knowledge top-k: %w", err)
+	}
+	items := make([]knowledge.Item, 0, limit)
+	for rows.Next() {
+		item, err := scanItem(rows)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan knowledge top-k item: %w", err)
+		}
+		items = append(items, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate knowledge top-k items: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit knowledge top-k: %w", err)
+	}
+	return items, nil
+}
+
 // UsageRepository appends knowledge_usage rows. It is a separate type because
 // the item repository already exposes Insert for item+revision transactions;
 // both are wired into the application service as distinct ports.

@@ -14,17 +14,21 @@ import (
 
 // Structured retrieval (spec §10.2): knowledge.search/knowledge.read.
 //
-// The 0.2.1 knowledge migration adds the structured bindings but no pg_trgm
-// extension or trigram index (the base migration only adds columns), and this
-// task is not allowed to add migrations. The repository therefore keeps the
-// existing relevance support as the candidate stage: ListForInjection already
-// returns only approved rows visible to the version's SUT families, applies the
-// strict JSONB binding containment and orders by the stored tsvector ts_rank.
-// Retrieval then applies the pg_trgm-compatible character-trigram similarity in
-// Go, which gives Chinese queries the fuzzy recall the 'simple' full-text
-// configuration cannot provide, and ranks the bounded candidate window
-// deterministically. The binding filter primitive itself is never weakened: the
-// strict pass uses the repository's containment query unchanged.
+// Candidate stage: the repository's pg_trgm top-K query
+// (knowledge_0003_trgm.sql: GIN trigram index on title/content plus a
+// similarity-ranked SQL top-K) feeds both the strict binding pass and the
+// generic fallback, so Chinese fuzzy recall no longer depends on the bounded
+// ts_rank window: an old item whose title only resembles the query still ranks
+// into the top-K. A repository without the optional TopKRetriever capability,
+// or a top-K pass that returns no candidates (no lexical overlap at all), falls
+// back to ListForInjection, which still applies the strict JSONB binding
+// containment and the stored tsvector ts_rank.
+//
+// Ranking stage: Retrieval then applies the pg_trgm-compatible character
+// (tri/bi)gram similarity in Go, which keeps the strict > partial > generic
+// ordering and the deterministic score/id tie-break independent of the
+// adapter's own ordering. The binding filter primitive itself is never
+// weakened: the strict pass uses the repository's containment query unchanged.
 const (
 	// DefaultRetrievalLimit is the knowledge.search page size when the caller
 	// omits limit (the injection default of five is too small for a tool page).
@@ -36,9 +40,10 @@ const (
 	// uses a similarly small query budget).
 	MaxRetrievalTextRunes = 512
 
-	// retrievalCandidateLimit is the number of approved rows the repository
-	// stage may return per pass. Strict and generic passes are merged before
-	// pagination; the cap keeps one search bounded even when the store grows.
+	// retrievalCandidateLimit is the minimum number of approved rows requested
+	// from the repository top-K stage per pass (and from the ts_rank fallback
+	// window). Strict and generic passes are merged before pagination; the cap
+	// keeps one search bounded even when the store grows.
 	retrievalCandidateLimit = 200
 	// retrievalCandidateCap bounds the widened window used by deep pages.
 	retrievalCandidateCap = 500
@@ -157,7 +162,7 @@ func (s *Service) Retrieve(ctx context.Context, query Query) (RetrievalPage, err
 
 	strictCandidates := make([]knowledge.Item, 0)
 	if !bindings.IsZero() {
-		strictCandidates, err = s.repo.ListForInjection(ctx, knowledge.InjectionQuery{
+		strictCandidates, err = s.retrievalCandidates(ctx, knowledge.InjectionQuery{
 			SystemKeys: systemKeys,
 			Query:      text,
 			Bindings:   bindings,
@@ -167,7 +172,7 @@ func (s *Service) Retrieve(ctx context.Context, query Query) (RetrievalPage, err
 			return RetrievalPage{}, err
 		}
 	}
-	genericCandidates, err := s.repo.ListForInjection(ctx, knowledge.InjectionQuery{
+	genericCandidates, err := s.retrievalCandidates(ctx, knowledge.InjectionQuery{
 		SystemKeys: systemKeys,
 		Query:      text,
 		Limit:      candidateLimit,
@@ -260,6 +265,25 @@ func (s *Service) Retrieve(ctx context.Context, query Query) (RetrievalPage, err
 		Limit:   limit,
 		HasMore: end < len(scored),
 	}, nil
+}
+
+// retrievalCandidates runs one candidate pass of Retrieve. The repository's
+// trigram top-K stage is preferred for a text query; the ts_rank injection
+// window is the Go-side fallback when the repository does not expose the
+// capability or the trigram query matches nothing (for example a query with no
+// shared character n-gram). A top-K error is returned rather than hidden: a
+// broken retrieval SQL must not silently degrade to the narrower window.
+func (s *Service) retrievalCandidates(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error) {
+	if topK, ok := s.repo.(TopKRetriever); ok && strings.TrimSpace(query.Query) != "" {
+		items, err := topK.SearchTopK(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		if len(items) > 0 {
+			return items, nil
+		}
+	}
+	return s.repo.ListForInjection(ctx, query)
 }
 
 // Read returns one knowledge item for knowledge.read. It is deliberately read
