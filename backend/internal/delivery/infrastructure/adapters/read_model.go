@@ -155,6 +155,24 @@ type caseInfo struct {
 	title                string
 	priority             string
 	versionSUTIDs        []int64
+	// stepExpected carries the recorded case step expectations so an issue
+	// raised from a step observation (no failed assertion) can still show what
+	// the product was required to do.
+	stepExpected map[int]string
+}
+
+// stepExpectations maps the recorded case step expectations by step seq.
+func stepExpectations(steps []designapp.ExecutableStepView) map[int]string {
+	expected := make(map[int]string, len(steps))
+	for _, step := range steps {
+		if step.Seq <= 0 {
+			continue
+		}
+		if value := strings.TrimSpace(step.Expected); value != "" {
+			expected[step.Seq] = value
+		}
+	}
+	return expected
 }
 
 // assembledRun carries one case_run in both the application and the report
@@ -165,8 +183,10 @@ type assembledRun struct {
 	// hasFailedAssertion reports whether the run carries a failed assertion
 	// result (the P3 precondition for an issue candidate / failure detail).
 	hasFailedAssertion bool
-	// hasRequirementDeviation reports whether a failed step recorded an
-	// observed product behavior instead of a tool/automation error (QA Q1).
+	// hasRequirementDeviation reports whether a step recorded application
+	// evidence without a failed assertion: a failed step with an observed
+	// product behavior (QA Q1) or a failed/blocked step observing a missing
+	// required control/feature (Task 110).
 	hasRequirementDeviation bool
 }
 
@@ -232,6 +252,7 @@ func (m *readModel) caseIndex(ctx context.Context, versionID int64, runs []execu
 			title:                view.Title,
 			priority:             view.Priority,
 			versionSUTIDs:        append([]int64(nil), view.VersionSUTIDs...),
+			stepExpected:         stepExpectations(view.Steps),
 		}
 	}
 	missing := make([]int64, 0)
@@ -319,7 +340,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 	result.hasFailedAssertion = firstFailed != nil
 	var deviationStep *execution.StepResult
 	for index := range steps {
-		if execution.FailedStepShowsRequirementDeviation(steps[index]) {
+		if execution.StepShowsApplicationDeviation(steps[index]) {
 			deviationStep = &steps[index]
 			break
 		}
@@ -387,11 +408,18 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		// QA Q1: a failed step with an observed product behavior is itself the
 		// requirement-deviation evidence, so the issue candidate must carry the
 		// step ref, a category/severity and the observed summary even when the
-		// case executor never recorded a failed assertion.
+		// case executor never recorded a failed assertion. Task 110 extends the
+		// same projection to a blocked step observing a missing required
+		// control/feature (FR-106-02) and carries the recorded case step
+		// expectation next to the observation.
 		category = "ui"
 		severity = failureSeverity(info.priority)
 		failedStepSeq = deviationStep.Seq
 		failedStepResultID = deviationStep.ID
+		if expectation, ok := info.stepExpected[deviationStep.Seq]; ok {
+			failedExpected = expectation
+		}
+		failedActual = execution.StepObservedSummary(*deviationStep)
 		if deviationStep.TargetVersionSUTID != nil && *deviationStep.TargetVersionSUTID > 0 {
 			versionSUTID = int64Ptr(*deviationStep.TargetVersionSUTID)
 		}

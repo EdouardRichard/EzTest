@@ -706,7 +706,7 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 		}
 		hasDeviation := false
 		for _, step := range steps {
-			if execution.FailedStepShowsRequirementDeviation(step) {
+			if execution.StepShowsApplicationDeviation(step) {
 				hasDeviation = true
 				break
 			}
@@ -727,7 +727,7 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 			return nil, mapExecutionError(err, "step_result")
 		}
 		for _, step := range steps {
-			if execution.FailedStepShowsRequirementDeviation(step) {
+			if execution.StepShowsApplicationDeviation(step) {
 				return nil, platform.StateConflict("an observed requirement deviation cannot be reclassified as automation")
 			}
 		}

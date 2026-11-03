@@ -101,10 +101,32 @@ func (s *AnalysisService) AnalyzeWave(ctx context.Context, waveID int64) error {
 			return err
 		}
 	}
+	// The executor snapshots run_wave.counts before it triggers this analysis,
+	// so a run reclassified from blocked to failed(application) would keep
+	// counting as blocked in the report headline. Refresh the snapshot from the
+	// final case_run states (the same recomputation pause/cancel use).
+	if err := s.refreshWaveCounts(ctx, wave); err != nil {
+		return err
+	}
 	if err := s.analyzeCoverage(ctx, wave, runs); err != nil {
 		return err
 	}
 	return s.EnsureTasks(ctx, waveID)
+}
+
+// refreshWaveCounts recomputes and persists the wave counts snapshot after the
+// deterministic classification changed case_run states.
+func (s *AnalysisService) refreshWaveCounts(ctx context.Context, wave execution.RunWave) error {
+	counts, err := s.waves.Counts(ctx, wave.ID)
+	if err != nil {
+		return mapExecutionError(err, "wave")
+	}
+	wave.Counts = counts
+	wave.UpdatedAt = s.now()
+	if _, err := s.waves.Update(ctx, wave); err != nil {
+		return mapExecutionError(err, "wave")
+	}
+	return nil
 }
 
 // EnsureTasks ensures the analyze.failure/analyze.coverage work items of a
@@ -242,16 +264,19 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 		summary.VerdictReason = execution.VerdictReasonAssertionFailed
 		return execution.CaseRunFailed, class, summary
 	}
-	if failedStep != nil && execution.FailedStepShowsRequirementDeviation(*failedStep) {
-		// A blocked run whose step already recorded an observed product
-		// deviation is an application failure; the blocked steps only explain
-		// why the remaining steps could not run. Normalize the class for the
-		// shared failed-step mapping, which treats blocked as a non-application
-		// agent class.
-		if run.FailureClass == execution.FailureClassBlocked {
-			run.FailureClass = execution.FailureClassApplication
-		}
-		return failedStepResult(run, *failedStep, summary, assertions)
+	// Recorded application evidence is authoritative over a blocked state.
+	// Task 107 (PO trap E2E FR-113) covers the failed assertion and the failed
+	// step that observed a product deviation; Task 110 (PO trap E2E FR-106-02)
+	// covers the observed missing UI/API control itself: the editor had no
+	// publish-time/schedule control, so the remaining steps could not run and
+	// no assertion was ever executed. The observation sits on the failed step
+	// that tried to set the time (with its explanatory error) or on a blocked
+	// step that could not even start; both name the absent product capability
+	// and are application evidence. A run whose blocked steps only record their
+	// downstream consequences (no control/feature) carries no such observation
+	// and still falls through to blocked.
+	if evidenceStep := firstApplicationDeviationStep(steps); evidenceStep != nil {
+		return applicationDeviationResult(run, summary, assertions)
 	}
 	if blockedStep != nil || run.Status == execution.CaseRunBlocked {
 		if status, class, overridden := execution.ApplyVisualOutcome(execution.CaseRunBlocked, execution.FailureClassBlocked, summary, assertions); status != execution.CaseRunBlocked {
@@ -280,6 +305,41 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 	return execution.CaseRunInconclusive, "", summary
 }
 
+// firstApplicationDeviationStep returns the first step whose recorded
+// observation is application evidence: a failed step with an observed
+// requirement deviation (QA Q1) or a failed/blocked step that observed a
+// required control/feature as absent (Task 110).
+func firstApplicationDeviationStep(steps []execution.StepResult) *execution.StepResult {
+	for index := range steps {
+		if execution.StepShowsApplicationDeviation(steps[index]) {
+			return &steps[index]
+		}
+	}
+	return nil
+}
+
+// applicationDeviationResult maps recorded application evidence onto the
+// deterministic verdict. A blocked run is normalized to application because the
+// blocked steps only explain why the remaining steps could not run; an explicit
+// environment/model/timeout/session class is preserved because it describes a
+// separate infrastructure failure.
+func applicationDeviationResult(run execution.CaseRun, summary execution.CaseRunSummary, assertions []execution.AssertionResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
+	class := execution.FailureClassApplication
+	switch run.FailureClass {
+	case "", execution.FailureClassApplication, execution.FailureClassAutomation, execution.FailureClassBlocked:
+		// Recorded product evidence wins over blocked/automation.
+	default:
+		if run.FailureClass.Valid() {
+			class = run.FailureClass
+		}
+	}
+	if status, overriddenClass, overridden := execution.ApplyVisualOutcome(execution.CaseRunFailed, class, summary, assertions); status != execution.CaseRunFailed {
+		return status, overriddenClass, overridden
+	}
+	summary.VerdictReason = execution.VerdictReasonStepFailed
+	return execution.CaseRunFailed, class, summary
+}
+
 // failedStepResult maps one failed step onto the deterministic verdict. A
 // failed step that recorded an observed product behavior (and no
 // automation/tool error) is a requirement deviation, not an automation failure
@@ -305,8 +365,9 @@ func failedStepResult(run execution.CaseRun, step execution.StepResult, summary 
 }
 
 // emitFailureCandidate publishes the application failure candidate event and
-// team-room post. Only failed(application) with failed assertion evidence or an
-// observed requirement deviation on a failed step is emitted.
+// team-room post. Only failed(application) with failed assertion evidence, an
+// observed requirement deviation on a failed step, or an observed missing
+// control/feature on a failed/blocked step is emitted.
 func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave execution.RunWave, run execution.CaseRun) error {
 	steps, _ := s.results.ListSteps(ctx, run.ID)
 	assertions, _ := s.results.ListAssertions(ctx, run.ID)
@@ -317,14 +378,8 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 			break
 		}
 	}
-	var failedStep *execution.StepResult
-	for index := range steps {
-		if execution.FailedStepShowsRequirementDeviation(steps[index]) {
-			failedStep = &steps[index]
-			break
-		}
-	}
-	if failedAssertion == nil && failedStep == nil {
+	evidenceStep := firstApplicationDeviationStep(steps)
+	if failedAssertion == nil && evidenceStep == nil {
 		return nil
 	}
 	category := "ui"
@@ -335,9 +390,13 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 		category = failureCategory(failedAssertion.Kind)
 		stepSeq, assertionSeq = failedAssertion.StepSeq, failedAssertion.AssertionSeq
 		detail = fmt.Sprintf("%s assertion %d.%d", failedAssertion.Kind, failedAssertion.StepSeq, failedAssertion.AssertionSeq)
-	case failedStep != nil:
-		stepSeq = failedStep.Seq
-		detail = fmt.Sprintf("step %d observed requirement deviation", failedStep.Seq)
+	case evidenceStep != nil:
+		stepSeq = evidenceStep.Seq
+		if execution.StepObservesMissingFeature(*evidenceStep) {
+			detail = fmt.Sprintf("step %d observed the required control/feature missing", evidenceStep.Seq)
+		} else {
+			detail = fmt.Sprintf("step %d observed requirement deviation", evidenceStep.Seq)
+		}
 	}
 	hint := analysisCandidateHint(wave.VersionID, run.CaseVersionID, stepSeq, assertionSeq, run.FailureClass)
 	s.mu.Lock()
@@ -408,14 +467,16 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 	if run.FailureClass != execution.FailureClassApplication && requested == execution.FailureClassApplication {
 		// QA Q1: a stored observed requirement deviation is evidence the
 		// deterministic fallback may have missed (for example a run classified
-		// by an older deployment); only that evidence allows application.
+		// by an older deployment); only that evidence allows application. The
+		// same applies to a blocked step observing a missing required control
+		// (Task 110, FR-106-02).
 		steps, err := s.results.ListSteps(ctx, run.ID)
 		if err != nil {
 			return nil, mapExecutionError(err, "step result")
 		}
 		hasDeviation := false
 		for _, step := range steps {
-			if execution.FailedStepShowsRequirementDeviation(step) {
+			if execution.StepShowsApplicationDeviation(step) {
 				hasDeviation = true
 				break
 			}
@@ -433,7 +494,7 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 			return nil, mapExecutionError(err, "step result")
 		}
 		for _, step := range steps {
-			if execution.FailedStepShowsRequirementDeviation(step) {
+			if execution.StepShowsApplicationDeviation(step) {
 				return nil, platform.StateConflict("an observed requirement deviation cannot be reclassified as automation")
 			}
 		}
@@ -456,13 +517,14 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 		if !hasEvidence {
 			// QA Q1: a failed step whose observation contradicts the
 			// requirement is application evidence even without a failed
-			// assertion record.
+			// assertion record; so is a blocked step observing a missing
+			// required control/feature (Task 110).
 			steps, err := s.results.ListSteps(ctx, run.ID)
 			if err != nil {
 				return nil, mapExecutionError(err, "step result")
 			}
 			for _, step := range steps {
-				if execution.FailedStepShowsRequirementDeviation(step) {
+				if execution.StepShowsApplicationDeviation(step) {
 					hasEvidence = true
 					break
 				}
