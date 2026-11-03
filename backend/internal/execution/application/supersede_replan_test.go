@@ -140,6 +140,11 @@ func TestSupersedeIsSurfaced(t *testing.T) {
 	if retired.Summary.VerdictReason != SupersedeReasonCaseVersion || retired.Summary.TerminalCause != SupersedeReasonCaseVersion {
 		t.Fatalf("retired run surface = %+v, want %q in verdict_reason/terminal_cause", retired.Summary, SupersedeReasonCaseVersion)
 	}
+	// QA Q2: the superseded row also needs a next action. This replacement was
+	// auto-requeued, so the row must say no manual rerun is required.
+	if retired.Summary.NextAction != execution.NextActionReplanned {
+		t.Fatalf("retired next_action = %q, want %q", retired.Summary.NextAction, execution.NextActionReplanned)
+	}
 	payload := findEventPayload(t, f, EventCaseRunFinished, "case_run_id", platformid.Format(pendingRun.ID))
 	if payload["status"] != string(execution.CaseRunSuperseded) ||
 		payload["reason"] != SupersedeReasonCaseVersion ||

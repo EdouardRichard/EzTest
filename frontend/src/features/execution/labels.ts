@@ -160,8 +160,9 @@ export const ASSERTION_KIND_LABEL: Record<AssertionKind, string> = {
 
 /**
  * Stable `case_run.summary.terminal_cause` codes (QA Q2). They name why a
- * terminal incomplete run stopped; unknown future codes fall back to the raw
- * value so this map never hides a cause.
+ * terminal run stopped: a specific settlement budget/agent stop, or a cause
+ * derived from the persisted verdict/failure class. Unknown future codes fall
+ * back to the raw value so this map never hides a cause.
  */
 export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   turn_budget: "轮次预算用尽",
@@ -171,6 +172,27 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   // P7 Task 106: the confirmed case version was superseded before the run
   // started. The replacement (when present) is auto-requeued.
   case_version_superseded: "用例版本已被新版本取代",
+  // QA Q2: causes derived from the persisted verdict/failure class.
+  blocked: "被阻塞（需人工处理）",
+  missing_account: "缺少测试账号",
+  missing_environment: "缺少测试环境",
+  incomplete: "运行未完成（缺少步骤/断言结果）",
+  assertion_failed: "断言失败（应用缺陷）",
+  step_failed: "步骤失败（应用缺陷）",
+  empty_case: "用例没有步骤",
+  no_assertions: "用例没有断言",
+  visual_assertion_not_run: "视觉断言未执行",
+  missing_visual_baseline: "缺少视觉基线",
+  visual_environment_mismatch: "视觉环境不一致",
+  human_timeout: "等待人工处理超时",
+  application: "应用缺陷",
+  environment: "环境异常",
+  session: "会话/登录异常",
+  model: "模型异常",
+  automation: "自动化异常",
+  timeout: "执行超时",
+  executor_lost: "执行器失联",
+  agent_failure: "Agent 运行失败",
 }
 
 export function terminalCauseLabel(value: string | undefined): string | null {
@@ -178,9 +200,15 @@ export function terminalCauseLabel(value: string | undefined): string | null {
   return CASE_RUN_TERMINAL_CAUSE_LABEL[value] ?? value
 }
 
-/** Stable `case_run.summary.next_action` codes; the only P3 action is a rerun. */
+/** Stable `case_run.summary.next_action` codes and their human affordance. */
 export const CASE_RUN_NEXT_ACTION_LABEL: Record<string, string> = {
   rerun: "重跑用例（新的执行会使用新的预算从头开始）",
+  resolve_blocker: "先解决阻塞条件（账号/环境/数据），再重跑用例",
+  review_failure: "查看失败详情并确认问题（必要时修复后重跑）",
+  repair_visual_baseline: "补齐视觉基线后重跑用例",
+  repair_case_version: "修复用例的步骤/断言后重新确认并执行",
+  reconfirm_case_version: "重新确认被取代的用例版本",
+  case_version_superseded_replanned: "替代用例已自动重排，无需人工重跑",
 }
 
 export function nextActionLabel(value: string | undefined): string | null {

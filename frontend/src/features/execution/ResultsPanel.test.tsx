@@ -12,6 +12,7 @@ vi.mock("./api", () => api)
 
 import { ResultsPanel } from "./ResultsPanel"
 import {
+  blockedCaseRunFixture,
   caseRunDetailFixture,
   caseRunsFixture,
   intentFixture,
@@ -31,6 +32,7 @@ type PanelOverrides = {
   onResume?: (caseRun: CaseRun) => void
   onRerunComplete?: () => void
   onRetryDetail?: () => void
+  onOpenRequirement?: (requirementId: string) => void
 }
 
 function renderPanel(overrides: PanelOverrides = {}) {
@@ -39,6 +41,7 @@ function renderPanel(overrides: PanelOverrides = {}) {
   const onResume = overrides.onResume ?? vi.fn()
   const onRerunComplete = overrides.onRerunComplete ?? vi.fn()
   const onRetryDetail = overrides.onRetryDetail ?? vi.fn()
+  const onOpenRequirement = overrides.onOpenRequirement ?? vi.fn()
   render(
     <ResultsPanel
       versionId="2001"
@@ -48,13 +51,14 @@ function renderPanel(overrides: PanelOverrides = {}) {
       onPause={onPause}
       onResume={onResume}
       onRerunComplete={onRerunComplete}
+      onOpenRequirement={onOpenRequirement}
       detail={overrides.detail ?? null}
       detailLoading={overrides.detailLoading ?? false}
       detailError={overrides.detailError ?? null}
       onRetryDetail={onRetryDetail}
     />,
   )
-  return { onSelect, onPause, onResume, onRerunComplete, onRetryDetail }
+  return { onSelect, onPause, onResume, onRerunComplete, onRetryDetail, onOpenRequirement }
 }
 
 function row(testId: string): HTMLElement {
@@ -132,6 +136,23 @@ describe("ResultsPanel", () => {
     expect(reason).toHaveTextContent("用例版本已被新版本取代")
   })
 
+  it("surfaces cause and usage on a blocked result row", () => {
+    const blocked: CaseRun = {
+      ...blockedCaseRunFixture,
+      summary: {
+        ...blockedCaseRunFixture.summary,
+        terminal_cause: "blocked",
+        next_action: "resolve_blocker",
+        usage: { turns: 12, total_tokens: 180000, prompt_tokens: 160000, completion_tokens: 20000 },
+      },
+    }
+    renderPanel({ caseRuns: [blocked] })
+
+    const blockedRow = row("case-run-row-9303")
+    expect(within(blockedRow).getByTestId("case-run-cause-9303")).toHaveTextContent("阻塞")
+    expect(within(blockedRow).getByText("180000 tokens")).toBeInTheDocument()
+  })
+
   it("expands the selected case run into steps, assertions and evidence", () => {
     const onSelect = vi.fn()
     renderPanel({ selectedCaseRunId: "9302", detail: caseRunDetailFixture, onSelect })
@@ -172,6 +193,27 @@ describe("ResultsPanel", () => {
       })
     })
     expect(onRerunComplete).toHaveBeenCalledTimes(1)
+  })
+
+  it("turns a closed-requirement retry 409 into a reopen entry", async () => {
+    api.createIntent.mockRejectedValueOnce(
+      new ApiError({
+        status: 409,
+        code: "state_conflict",
+        message: "the requirement is closed; reopen it before creating an execution intent",
+        requestId: "req_closed",
+        details: { reason: "requirement_closed", requirement_id: "6001" },
+      }),
+    )
+    const { onOpenRequirement } = renderPanel()
+
+    const failed = row("case-run-row-9302")
+    fireEvent.click(within(failed).getByRole("button", { name: "重跑" }))
+    fireEvent.click(within(failed).getByRole("button", { name: "确认重跑" }))
+
+    expect(await screen.findByText(/该用例所属需求已闭环/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "前往重新打开需求" }))
+    expect(onOpenRequirement).toHaveBeenCalledWith("6001")
   })
 
   it("shows retryable detail errors and pause/resume actions", () => {

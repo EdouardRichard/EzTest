@@ -87,6 +87,15 @@ func TestCaseIncompleteCarriesActionableCause(t *testing.T) {
 	if !strings.Contains(stored.Summary.LastError, "1 of 4") {
 		t.Fatalf("last error = %q, want the recorded/total step progress", stored.Summary.LastError)
 	}
+	// QA Q2: the observed usage used to be visible only in Agent Center. The
+	// terminal summary persists it so the execution page can show the same
+	// numbers as the explanation/limit.
+	if stored.Summary.Usage == nil {
+		t.Fatal("summary usage is nil, want the observed agent-run usage")
+	}
+	if stored.Summary.Usage.Turns != 15 || stored.Summary.Usage.TotalTokens != 222159 {
+		t.Fatalf("summary usage = %+v, want 15 turns / 222159 tokens", stored.Summary.Usage)
+	}
 }
 
 // TestCaseIncompleteOffersHandoff pins QA Q2's second half: the terminal

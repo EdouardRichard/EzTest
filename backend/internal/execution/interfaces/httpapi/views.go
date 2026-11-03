@@ -97,6 +97,16 @@ type IntentView struct {
 	CreatedAt     string   `json:"created_at"`
 }
 
+// CaseRunUsageView is the observed agent-run usage of a terminal case run.
+// Providers report prompt/completion or input/output keys; the domain already
+// normalized the total at settlement.
+type CaseRunUsageView struct {
+	Turns            int `json:"turns"`
+	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
 // CaseRunSummaryView is the stable subset of case_run.summary.
 type CaseRunSummaryView struct {
 	VerdictReason      string  `json:"verdict_reason"`
@@ -115,6 +125,9 @@ type CaseRunSummaryView struct {
 	LastError     string `json:"last_error"`
 	TerminalCause string `json:"terminal_cause"`
 	NextAction    string `json:"next_action"`
+	// Usage is the observed agent-run usage persisted at terminal settlement
+	// (QA Q2: it used to be visible only in Agent Center).
+	Usage *CaseRunUsageView `json:"usage"`
 }
 
 // CaseRunView is the case_run projection (spec §9.3).
@@ -270,6 +283,16 @@ func toIntentView(intent execution.ExecutionIntent, caseID, title string) Intent
 }
 
 func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, evidenceCount int) CaseRunView {
+	terminalCause, nextAction := execution.TerminalExplanation(run.Status, run.FailureClass, run.Summary)
+	var usage *CaseRunUsageView
+	if run.Summary.Usage != nil {
+		usage = &CaseRunUsageView{
+			Turns:            run.Summary.Usage.Turns,
+			TotalTokens:      run.Summary.Usage.TotalTokens,
+			PromptTokens:     run.Summary.Usage.PromptTokens,
+			CompletionTokens: run.Summary.Usage.CompletionTokens,
+		}
+	}
 	return CaseRunView{
 		ID:            platformid.Format(run.ID),
 		WaveID:        platformid.Format(run.WaveID),
@@ -293,8 +316,9 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 			VisualInconclusive: run.Summary.VisualInconclusive,
 			HumanRequestID:     optionalIDString(run.Summary.HumanRequestID),
 			LastError:          run.Summary.LastError,
-			TerminalCause:      run.Summary.TerminalCause,
-			NextAction:         run.Summary.NextAction,
+			TerminalCause:      terminalCause,
+			NextAction:         nextAction,
+			Usage:              usage,
 		},
 		StartedAt:     formatOptionalTime(run.StartedAt),
 		FinishedAt:    formatOptionalTime(run.FinishedAt),

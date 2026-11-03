@@ -220,9 +220,14 @@ func retireSupersededRun(
 	replacementCaseVersionID int64,
 	replanned bool,
 ) (bool, error) {
+	nextAction := SupersedeNextActionReconfirm
+	if replanned {
+		nextAction = SupersedeNextActionReplanned
+	}
 	mutated, err := runs.UpdateCAS(ctx, run.ID, 0, "", func(current *execution.CaseRun) error {
 		current.Summary.VerdictReason = SupersedeReasonCaseVersion
 		current.Summary.TerminalCause = SupersedeReasonCaseVersion
+		current.Summary.NextAction = nextAction
 		if current.Summary.LastError == "" {
 			current.Summary.LastError = "the confirmed case version was superseded before the run started"
 		}
@@ -245,10 +250,6 @@ func retireSupersededRun(
 	}
 	if !changed {
 		return false, nil
-	}
-	nextAction := SupersedeNextActionReconfirm
-	if replanned {
-		nextAction = SupersedeNextActionReplanned
 	}
 	publishEvent(ctx, events, EventCaseRunFinished, versionID,
 		map[string]any{

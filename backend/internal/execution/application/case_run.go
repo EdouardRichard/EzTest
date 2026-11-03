@@ -724,6 +724,10 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if caseRun.Summary.HumanRequestID > 0 {
 		summary.HumanRequestID = caseRun.Summary.HumanRequestID
 	}
+	// Every terminal non-clean run explains itself: an explicit settlement cause
+	// wins, a legacy/other terminal outcome derives one from the persisted
+	// verdict/class (QA Q2). The deterministic verdict itself is untouched.
+	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, class, summary)
 	finished, terminalWrote, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
 		return execution.CaseRun{}, err
@@ -734,6 +738,8 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		"status":           string(status),
 		"failure_class":    string(class),
 		"verdict_reason":   summary.VerdictReason,
+		"terminal_cause":   summary.TerminalCause,
+		"next_action":      summary.NextAction,
 		"assertion_total":  summary.AssertionTotal,
 		"assertion_failed": summary.AssertionFailed,
 		"step_total":       summary.StepTotal,
@@ -748,6 +754,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if terminalWrote {
 		s.notifyCaseSuccess(ctx, scope.VersionID, finished, caseSnapshot, finished.Summary)
 		s.notifyCaseFailure(ctx, scope.VersionID, finished, caseSnapshot, finished.FailureClass)
+		s.postTerminalHandoff(ctx, caseRun, finished)
 	}
 	return finished, nil
 }
@@ -781,9 +788,19 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 	// The agent loop is over and this dispatch still owns the case_run: no
 	// further renewal is needed.
 	s.stopLeaseHeartbeat(caseRunID, caseRun.DispatchEpoch)
-	if caseRun.Status.Finished() || caseRun.Status == execution.CaseRunPaused {
+	if caseRun.Status.Finished() {
+		// The verdict was already written while the agent run was still active
+		// (execution.case_finish). The run result now carries the observed usage;
+		// attach it to the terminal summary without touching the verdict (QA Q2).
+		if caseRun.Status.Terminal() {
+			s.attachRunUsage(ctx, caseRun.ID, result)
+		}
 		return nil
 	}
+	if caseRun.Status == execution.CaseRunPaused {
+		return nil
+	}
+	usage := execution.NewCaseRunUsage(result.Turns, result.Usage)
 	if runErr != nil {
 		class, retryable := classifyFinalRunError(ctx, runErr)
 		if retryable && maxAttempts > 0 && attempt < maxAttempts {
@@ -806,7 +823,7 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 		// look like a silent zero-row failure: persist the concrete error as
 		// text evidence so the reason is visible in the report/UI.
 		s.recordRunFailureEvidence(ctx, caseRun, runErr)
-		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr, nil); err != nil {
+		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr, nil, usage); err != nil {
 			return err
 		}
 		return nil
@@ -815,7 +832,7 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 	// budget was exhausted): aggregate whatever was recorded and explain the
 	// stop instead of writing a silent inconclusive(incomplete).
 	outcome := newIncompleteRunOutcome(result)
-	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil, &outcome); err != nil {
+	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil, &outcome, usage); err != nil {
 		return err
 	}
 	return nil
@@ -895,7 +912,7 @@ func runResultTokens(usage map[string]int) int {
 	return total
 }
 
-func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome) error {
+func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome, usage *execution.CaseRunUsage) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
 		return err
@@ -932,6 +949,13 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		summary.LastError = truncateRunes(fmt.Sprintf("%s; the case recorded %d of %d steps before the run ended",
 			incomplete.Detail, len(steps), len(caseSnapshot.Steps)), 2000)
 	}
+	// All other terminal outcomes (blocked, failed, non-budget inconclusive) also
+	// carry a stable cause and next action derived from the persisted terminal
+	// data, so no terminal row is left unexplained (QA Q2).
+	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, class, summary)
+	if usage != nil {
+		summary.Usage = usage
+	}
 	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
@@ -953,24 +977,25 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	// the optional knowledge failure hook exactly once, from the terminal owner.
 	if terminalWrote {
 		s.notifyCaseFailure(ctx, s.versionForCaseRun(caseRun), finished, caseSnapshot, finished.FailureClass)
-		if explained {
-			s.postIncompleteHandoff(ctx, caseRun, finished)
-		}
+		s.postTerminalHandoff(ctx, caseRun, finished)
 	}
 	return nil
 }
 
-// postIncompleteHandoff records the human handoff of a terminal incomplete run
-// in the execution team room. A budget-ended case run cannot create a
-// human_request (the run is already terminal and the P3 human flow is limited to
-// login takeover), so the durable handoff is a typed team-room post carrying the
-// cause, the explanation and the suggested next action. Best effort: the verdict
-// and its summary fields never depend on it.
-func (s *CaseRunner) postIncompleteHandoff(ctx context.Context, caseRun execution.CaseRun, finished execution.CaseRun) {
+// postTerminalHandoff records the human handoff of a terminal run whose cause
+// has no automatic recovery path in the execution team room. A terminal case run
+// cannot create a human_request (the run is already terminal and the P3 human
+// flow is limited to login takeover), so the durable handoff is a typed
+// team-room post carrying the cause, the explanation and the suggested next
+// action. Best effort: the verdict and its summary fields never depend on it.
+func (s *CaseRunner) postTerminalHandoff(ctx context.Context, caseRun execution.CaseRun, finished execution.CaseRun) {
 	if s.teamRoom == nil {
 		return
 	}
-	content := fmt.Sprintf("case run %s is inconclusive (%s); %s; next action: %s",
+	if !execution.TerminalCauseNeedsHuman(finished.Summary.TerminalCause) {
+		return
+	}
+	content := fmt.Sprintf("case run %s needs a human (%s); %s; next action: %s",
 		platformid.Format(caseRun.ID),
 		finished.Summary.TerminalCause,
 		finished.Summary.LastError,
@@ -982,6 +1007,24 @@ func (s *CaseRunner) postIncompleteHandoff(ctx context.Context, caseRun executio
 		Content:   truncateRunes(content, 2000),
 		Refs:      []TeamPostRef{{Kind: "case_run", ID: platformid.Format(caseRun.ID)}},
 	})
+}
+
+// attachRunUsage persists the observed usage of a run that ended after its
+// terminal verdict was already written (the execution.case_finish path). It is a
+// best-effort enrichment: the status, verdict reason and explanation are
+// untouched, and a row that already carries usage is never overwritten.
+func (s *CaseRunner) attachRunUsage(ctx context.Context, caseRunID int64, result agentapp.RunResult) {
+	usage := execution.NewCaseRunUsage(result.Turns, result.Usage)
+	if usage == nil {
+		return
+	}
+	current, err := s.caseRuns.Get(ctx, caseRunID)
+	if err != nil || !current.Status.Terminal() || current.Summary.Usage != nil {
+		return
+	}
+	current.Summary.Usage = usage
+	current.UpdatedAt = s.now()
+	_, _ = s.caseRuns.Update(ctx, current)
 }
 
 // RenewLease extends the case_run lease during a long agent run.

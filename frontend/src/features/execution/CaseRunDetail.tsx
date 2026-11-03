@@ -167,9 +167,15 @@ export function CaseRunDetailView({
     (item) => item.step_seq === null || item.step_seq === undefined,
   )
   const terminalCause = terminalCauseLabel(run.summary.terminal_cause)
-  const incomplete = run.status === "inconclusive"
-  const nextAction = incomplete ? nextActionLabel(run.summary.next_action) : null
-  const incompleteDetail = incomplete ? (run.summary.last_error?.trim() ?? "") : ""
+  const nextAction = nextActionLabel(run.summary.next_action)
+  const usage = run.summary.usage
+  // The persisted explanation belongs to every terminal cause (budget/agent
+  // stop, blocked, failure-derived); the inconclusive fallback keeps older rows
+  // that only carried last_error visible.
+  const terminalDetail =
+    terminalCause !== null || run.status === "inconclusive"
+      ? (run.summary.last_error?.trim() ?? "")
+      : ""
 
   return (
     <div data-testid="case-run-detail" className="space-y-2">
@@ -191,12 +197,12 @@ export function CaseRunDetailView({
         ) : null}
       </div>
 
-      {incompleteDetail.length > 0 ? (
+      {terminalDetail.length > 0 ? (
         <p
           data-testid="case-run-incomplete-detail"
           className="rounded-md border border-warning/30 bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-foreground"
         >
-          {incompleteDetail}
+          {terminalDetail}
         </p>
       ) : null}
 
@@ -207,6 +213,17 @@ export function CaseRunDetailView({
         >
           <span className="font-medium text-foreground">下一步：</span>
           {nextAction}
+        </p>
+      ) : null}
+
+      {usage !== undefined && usage.total_tokens > 0 ? (
+        <p
+          data-testid="case-run-usage"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          <span className="font-medium text-foreground">用量：</span>
+          {usage.total_tokens} tokens
+          {usage.turns > 0 ? ` · ${usage.turns} 轮` : ""}
         </p>
       ) : null}
 

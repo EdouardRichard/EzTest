@@ -137,6 +137,140 @@ func TestCaseRunSummaryViewCarriesIncompleteCause(t *testing.T) {
 	}
 }
 
+// TestCaseRunSummaryViewExplainsEveryTerminalRun reproduces QA Q2's Medium
+// residual: the persisted rows carried last_error/verdict_reason but their
+// terminal_cause/next_action were empty, so the execution page could not explain
+// a blocked/failed/inconclusive run. The projection must derive one stable cause
+// and one human next action from the persisted terminal data, while an explicit
+// settlement cause (budget/agent stop) always wins and a clean verdict stays
+// silent.
+func TestCaseRunSummaryViewExplainsEveryTerminalRun(t *testing.T) {
+	cases := []struct {
+		name      string
+		run       execution.CaseRun
+		wantCause string
+		wantNext  string
+	}{
+		{
+			name: "blocked missing account",
+			run: execution.CaseRun{
+				Status: execution.CaseRunBlocked, FailureClass: execution.FailureClassBlocked,
+				Summary: execution.CaseRunSummary{
+					VerdictReason: "missing_account",
+					LastError:     "the admin account is not configured",
+				},
+			},
+			wantCause: "missing_account",
+			wantNext:  execution.NextActionResolveBlocker,
+		},
+		{
+			name: "blocked application evidence",
+			run: execution.CaseRun{
+				Status: execution.CaseRunBlocked, FailureClass: execution.FailureClassApplication,
+				Summary: execution.CaseRunSummary{
+					VerdictReason: execution.VerdictReasonAssertionFailed,
+					LastError:     "the login failure message contradicts the requirement",
+				},
+			},
+			wantCause: execution.VerdictReasonAssertionFailed,
+			wantNext:  execution.NextActionReviewFailure,
+		},
+		{
+			name: "incomplete without settlement cause",
+			run: execution.CaseRun{
+				Status:  execution.CaseRunInconclusive,
+				Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonIncomplete},
+			},
+			wantCause: execution.VerdictReasonIncomplete,
+			wantNext:  execution.NextActionRerun,
+		},
+		{
+			name: "visual assertion not run",
+			run: execution.CaseRun{
+				Status:  execution.CaseRunInconclusive,
+				Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonVisualAssertionNotRun},
+			},
+			wantCause: execution.VerdictReasonVisualAssertionNotRun,
+			wantNext:  execution.NextActionRepairVisual,
+		},
+		{
+			name: "failed environment",
+			run: execution.CaseRun{
+				Status: execution.CaseRunFailed, FailureClass: execution.FailureClassEnvironment,
+				Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonAgentFailure},
+			},
+			wantCause: string(execution.FailureClassEnvironment),
+			wantNext:  execution.NextActionRerun,
+		},
+		{
+			name: "superseded",
+			run: execution.CaseRun{
+				Status:  execution.CaseRunSuperseded,
+				Summary: execution.CaseRunSummary{VerdictReason: "case_version_superseded"},
+			},
+			wantCause: "case_version_superseded",
+			wantNext:  execution.NextActionReconfirm,
+		},
+		{
+			name: "explicit settlement cause wins",
+			run: execution.CaseRun{
+				Status:  execution.CaseRunInconclusive,
+				Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonIncomplete, TerminalCause: execution.TerminalCauseTokenBudget},
+			},
+			wantCause: execution.TerminalCauseTokenBudget,
+			wantNext:  execution.NextActionRerun,
+		},
+		{
+			name: "passed verdict stays silent",
+			run: execution.CaseRun{
+				Status:  execution.CaseRunPassed,
+				Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonPassed},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.run.ID, tc.run.WaveID, tc.run.IntentID, tc.run.CaseVersionID = 3001, 2001, 1001, 41
+			view := toCaseRunView(tc.run, caseMeta{}, nil, 0)
+			if view.Summary.TerminalCause != tc.wantCause {
+				t.Fatalf("terminal cause = %q, want %q (last_error %q)",
+					view.Summary.TerminalCause, tc.wantCause, view.Summary.LastError)
+			}
+			if view.Summary.NextAction != tc.wantNext {
+				t.Fatalf("next action = %q, want %q", view.Summary.NextAction, tc.wantNext)
+			}
+		})
+	}
+}
+
+// TestCaseRunSummaryViewCarriesUsage pins the QA Q2 usage gap: the observed
+// agent-run usage persisted on the terminal summary is exposed by the case-run
+// projection so the execution page does not depend on Agent Center for it.
+func TestCaseRunSummaryViewCarriesUsage(t *testing.T) {
+	usage := execution.CaseRunUsage{Turns: 15, TotalTokens: 222159, PromptTokens: 200000, CompletionTokens: 22159}
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status:  execution.CaseRunInconclusive,
+		Summary: execution.CaseRunSummary{VerdictReason: "incomplete", Usage: &usage},
+	}, caseMeta{}, nil, 0)
+	if view.Summary.Usage == nil {
+		t.Fatal("summary usage is nil, want the persisted usage")
+	}
+	if view.Summary.Usage.Turns != 15 || view.Summary.Usage.TotalTokens != 222159 ||
+		view.Summary.Usage.PromptTokens != 200000 || view.Summary.Usage.CompletionTokens != 22159 {
+		t.Fatalf("summary usage view = %+v", view.Summary.Usage)
+	}
+
+	without := toCaseRunView(execution.CaseRun{
+		ID: 3002, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status:  execution.CaseRunPassed,
+		Summary: execution.CaseRunSummary{VerdictReason: "passed"},
+	}, caseMeta{}, nil, 0)
+	if without.Summary.Usage != nil {
+		t.Fatalf("usage view = %+v, want nil when the row has no persisted usage", without.Summary.Usage)
+	}
+}
+
 // TestCaseRunSummaryViewCarriesVisualCounts pins the P5 summary fields
 // (spec §4.2): visual_passed/failed/inconclusive are exposed and visual_skipped
 // stays in the payload for compatibility but is 0 on the P5 path.

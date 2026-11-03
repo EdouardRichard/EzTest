@@ -175,6 +175,14 @@ export type RunWave = {
 
 /* --------------------------------- case run -------------------------------- */
 
+/** Observed agent-run usage persisted on a terminal case run (QA Q2). */
+export type CaseRunUsage = {
+  turns: number
+  total_tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+}
+
 /** `case_run.summary` fields the UI reads; unknown keys are ignored. */
 export type CaseRunSummary = {
   verdict_reason?: string
@@ -190,14 +198,16 @@ export type CaseRunSummary = {
   visual_failed?: number
   visual_inconclusive?: number
   /**
-   * QA Q2: a terminal incomplete run explains itself. `terminal_cause` names the
-   * budget/agent stop, `last_error` carries the observable usage/limit and the
-   * recorded vs total steps, and `next_action` is the stable human next step
-   * (`rerun`). All three are absent on clean verdicts.
+   * QA Q2: a terminal run explains itself. `terminal_cause` names the concrete
+   * stop (budget, agent stop, blocked, assertion failure, ...), `last_error`
+   * carries the observable detail and `next_action` is the stable human next
+   * step. All three are absent on a clean verdict.
    */
   terminal_cause?: string
   last_error?: string
   next_action?: string
+  /** Observed agent-run usage; absent on rows settled before usage persisted. */
+  usage?: CaseRunUsage
 }
 
 /** `CaseRunView` (spec §9.3). */

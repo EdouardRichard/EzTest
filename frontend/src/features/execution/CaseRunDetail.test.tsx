@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { CaseRunDetailView } from "./CaseRunDetail"
-import { caseRunDetailFixture } from "./test-fixtures"
+import { blockedCaseRunFixture, caseRunDetailFixture } from "./test-fixtures"
 import type { CaseRunDetail } from "./types"
 
 function incompleteDetail(overrides: Partial<CaseRunDetail["case_run"]> = {}): CaseRunDetail {
@@ -27,6 +27,32 @@ function incompleteDetail(overrides: Partial<CaseRunDetail["case_run"]> = {}): C
         evidence_count: 2,
       },
       ...overrides,
+    },
+  }
+}
+
+function blockedDetail(): CaseRunDetail {
+  const base = caseRunDetailFixture
+  return {
+    ...base,
+    case_run: {
+      ...base.case_run,
+      id: blockedCaseRunFixture.id,
+      status: "blocked",
+      failure_class: "blocked",
+      summary: {
+        ...blockedCaseRunFixture.summary,
+        verdict_reason: "missing_account",
+        terminal_cause: "blocked",
+        next_action: "resolve_blocker",
+        last_error: "the admin account is not configured",
+        usage: {
+          turns: 12,
+          total_tokens: 180000,
+          prompt_tokens: 160000,
+          completion_tokens: 20000,
+        },
+      },
     },
   }
 }
@@ -79,5 +105,27 @@ describe("CaseRunDetail incomplete cause", () => {
     expect(screen.queryByTestId("case-run-terminal-cause")).not.toBeInTheDocument()
     expect(screen.queryByTestId("case-run-incomplete-detail")).not.toBeInTheDocument()
     expect(screen.queryByTestId("case-run-next-action")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
+  })
+
+  it("explains a blocked run with its cause, usage and next action", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={blockedDetail()}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent("阻塞")
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent(
+      "the admin account is not configured",
+    )
+    expect(screen.getByTestId("case-run-next-action")).toHaveTextContent("先解决阻塞条件")
+    const usage = screen.getByTestId("case-run-usage")
+    expect(usage).toHaveTextContent("180000")
+    expect(usage).toHaveTextContent("12 轮")
   })
 })
