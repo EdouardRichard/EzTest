@@ -48,12 +48,34 @@ function restoreScrollOffsets(offsets: readonly ScrollOffset[]): void {
   }
 }
 
+// Hidden nodes still match the selector but cannot take focus (and asking them
+// to focus would leave the trap stuck on the current element), so boundary
+// discovery walks up to the dialog and drops display:none / hidden subtrees.
+function isTabbable(element: HTMLElement, scope: HTMLElement): boolean {
+  let node: HTMLElement | null = element
+  while (node !== null) {
+    if (node.hidden) return false
+    const style = window.getComputedStyle(node)
+    if (style.display === "none") return false
+    if (style.visibility === "hidden" || style.visibility === "collapse") return false
+    if (node === scope) break
+    node = node.parentElement
+  }
+  return true
+}
+
+function focusablesIn(dialog: HTMLElement): HTMLElement[] {
+  return Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter((element) =>
+    isTabbable(element, dialog),
+  )
+}
+
 function firstFocusableIn(dialog: HTMLElement): HTMLElement | null {
-  return dialog.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)
+  return focusablesIn(dialog)[0] ?? null
 }
 
 function lastFocusableIn(dialog: HTMLElement): HTMLElement | null {
-  const focusables = dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
+  const focusables = focusablesIn(dialog)
   return focusables.length === 0 ? null : focusables[focusables.length - 1]
 }
 
@@ -98,6 +120,7 @@ export function FloatingPanel({
   const hostRef = useRef<HTMLDivElement>(null)
   const slotRef = useRef<HTMLDivElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
+  const preOpenFocusRef = useRef<HTMLElement | null>(null)
   const [mounted, setMounted] = useState(false)
   const [contentHost, setContentHost] = useState<HTMLDivElement | null>(null)
 
@@ -126,6 +149,12 @@ export function FloatingPanel({
     if (host === null || slot === null || inline === null) return undefined
 
     const openingOffsets = scrollOffsetsWithin(host)
+    // Reparenting blurs a focused descendant (the trigger may live inside the
+    // content, e.g. the expand button), so remember it before the move; the
+    // focus effect runs after this and would only see `body`.
+    if (document.activeElement instanceof HTMLElement) {
+      preOpenFocusRef.current = document.activeElement
+    }
     slot.appendChild(host)
     restoreScrollOffsets(openingOffsets)
 
@@ -142,7 +171,8 @@ export function FloatingPanel({
     if (dialog === null) return undefined
 
     const restoreFocus =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
+      preOpenFocusRef.current ??
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null)
     const previousOverflow = document.body.style.overflow
     const previousPaddingRight = document.body.style.paddingRight
     // Compensate for the scrollbar the lock removes, so the page does not jump.
@@ -162,7 +192,7 @@ export function FloatingPanel({
       const active = document.activeElement
       const activeInside = active instanceof Node && dialog.contains(active)
       if (event.shiftKey) {
-        if (!activeInside || active === first) {
+        if (!activeInside || active === first || active === dialog) {
           event.preventDefault()
           last.focus()
         }

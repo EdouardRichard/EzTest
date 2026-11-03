@@ -70,6 +70,49 @@ function FocusHarness() {
   )
 }
 
+function HiddenFocusHarness() {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <button type="button" data-testid="open-hidden-focus-panel" onClick={() => setOpen(true)}>
+        打开隐藏焦点浮层
+      </button>
+      <FloatingPanel
+        open={open}
+        onClose={() => setOpen(false)}
+        title="隐藏焦点浮层"
+        testIdPrefix="hidden-focus-panel"
+      >
+        <button type="button">第一个可见按钮</button>
+        <button type="button">最后一个可见按钮</button>
+        <button type="button" hidden data-testid="hidden-attr-button">
+          隐藏属性按钮
+        </button>
+        <button type="button" style={{ display: "none" }} data-testid="display-none-button">
+          不显示按钮
+        </button>
+      </FloatingPanel>
+    </>
+  )
+}
+
+function InternalTriggerHarness() {
+  const [open, setOpen] = useState(false)
+  return (
+    <FloatingPanel
+      open={open}
+      onClose={() => setOpen(false)}
+      title="内部触发浮层"
+      testIdPrefix="internal-trigger-panel"
+    >
+      <button type="button" data-testid="internal-trigger" onClick={() => setOpen(true)}>
+        展开内部浮层
+      </button>
+      <button type="button">内部内容按钮</button>
+    </FloatingPanel>
+  )
+}
+
 describe("FloatingPanel", () => {
   it("keeps children inline while closed and portals a labelled 90vw × 90vh dialog while open", () => {
     const { container, rerender } = render(<PanelHarness open={false} />)
@@ -151,6 +194,45 @@ describe("FloatingPanel", () => {
     expect(onClose).toHaveBeenCalledTimes(3)
   })
 
+  it("wraps the first Shift+Tab after opening from the dialog itself to the last tabbable element", () => {
+    render(<FocusHarness />)
+    const trigger = screen.getByTestId("open-focus-panel")
+    trigger.focus()
+    fireEvent.click(trigger)
+
+    const dialog = screen.getByRole("dialog", { name: "焦点浮层" })
+    expect(dialog).toHaveFocus()
+
+    const last = screen.getByRole("button", { name: "最后一个内容按钮" })
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true })
+    expect(last).toHaveFocus()
+    expect(dialog.contains(last)).toBe(true)
+  })
+
+  it("skips hidden and display:none elements when finding the last tabbable element", () => {
+    render(<HiddenFocusHarness />)
+    fireEvent.click(screen.getByTestId("open-hidden-focus-panel"))
+
+    const dialog = screen.getByRole("dialog", { name: "隐藏焦点浮层" })
+    const close = screen.getByTestId("hidden-focus-panel-close")
+    const lastVisible = screen.getByRole("button", { name: "最后一个可见按钮" })
+    const hidden = screen.getByTestId("hidden-attr-button")
+    const displayNone = screen.getByTestId("display-none-button")
+
+    // Shift+Tab from the first tabbable (close) must wrap to the last *visible*
+    // element, not to a trailing hidden/display:none button that cannot take focus.
+    close.focus()
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true })
+    expect(lastVisible).toHaveFocus()
+    expect(hidden).not.toHaveFocus()
+    expect(displayNone).not.toHaveFocus()
+
+    // Tab from the last visible element must also wrap to the first.
+    lastVisible.focus()
+    fireEvent.keyDown(dialog, { key: "Tab" })
+    expect(close).toHaveFocus()
+  })
+
   it("traps Tab inside the dialog and restores focus to the trigger on close", () => {
     render(<FocusHarness />)
     const trigger = screen.getByTestId("open-focus-panel")
@@ -173,6 +255,22 @@ describe("FloatingPanel", () => {
 
     fireEvent.keyDown(window, { key: "Escape" })
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+  })
+
+  it("restores focus to a trigger inside the panel content when it closes", () => {
+    render(<InternalTriggerHarness />)
+    const trigger = screen.getByTestId("internal-trigger")
+    trigger.focus()
+    fireEvent.click(trigger)
+
+    const dialog = screen.getByRole("dialog", { name: "内部触发浮层" })
+    expect(dialog).toHaveFocus()
+
+    fireEvent.keyDown(window, { key: "Escape" })
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    // Moving the content host into the dialog blurs a focused descendant, so
+    // the restore target must be captured before the move, not after it.
     expect(trigger).toHaveFocus()
   })
 
