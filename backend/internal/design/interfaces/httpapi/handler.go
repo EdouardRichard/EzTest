@@ -14,6 +14,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 const maxRequestBody = 1 << 20
@@ -38,11 +39,25 @@ type ExportService interface {
 type Handler struct {
 	graph   GraphService
 	exports ExportService
+	stages  StageReader
+}
+
+// StageReader is the deterministic version-stage projection used to keep the
+// single-case confirmation at the case gate only (Task 78).
+// *versionapp.StageMachine satisfies it.
+type StageReader interface {
+	Stage(ctx context.Context, versionID int64) (versionapp.StageView, error)
 }
 
 // New builds the design handler.
 func New(graph GraphService, exports ExportService) *Handler {
 	return &Handler{graph: graph, exports: exports}
+}
+
+// SetStageReader wires the stage projection. Without it the handler keeps the
+// P2 behavior (no stage gate); production always sets it.
+func (h *Handler) SetStageReader(reader StageReader) {
+	h.stages = reader
 }
 
 var (
@@ -81,4 +96,31 @@ func queryOptionalID(r *http.Request, field, name string) (*int64, error) {
 		return nil, err
 	}
 	return &value, nil
+}
+
+// requireCaseReview rejects design actions that are only meaningful at the case
+// hard gate. A version still clarifying/designing must not silently freeze case
+// versions; the typed 409 carries the next action so the UI can guide the user.
+func (h *Handler) requireCaseReview(ctx context.Context, versionID int64) error {
+	if h.stages == nil {
+		return nil
+	}
+	stage, err := h.stages.Stage(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if string(stage.Stage) == "case_review" {
+		return nil
+	}
+	return &platform.Error{
+		Status:  http.StatusConflict,
+		Code:    "invalid_stage_for_action",
+		Message: "case confirmation requires stage case_review, but the version is at " + string(stage.Stage),
+		Details: map[string]any{
+			"action":         "confirm_cases",
+			"required_stage": "case_review",
+			"current_stage":  string(stage.Stage),
+			"next_action":    "confirm the requirements and wait for design generation to reach the case gate",
+		},
+	}
 }

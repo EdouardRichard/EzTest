@@ -74,6 +74,35 @@ func TestConfirmRequirementsEmptyMeansAll(t *testing.T) {
 // TestConfirmRequirementsEmptyNoDrafts pins the empty-gate edge: with no
 // eligible draft requirement the gate answers a typed 409
 // (no_requirements_to_confirm) and writes no stage, job, event or audit.
+// TestRequirementGateAcceptsAlreadyConfirmedSelection pins the UI "开始设计"
+// path after Task 78: requirements may be confirmed first through the plain
+// confirmation API (which only converges to requirement_review); the explicit
+// requirement gate must still accept those already-clarified IDs and advance to
+// designing. Skipping already-confirmed requirements is not a failure.
+func TestRequirementGateAcceptsAlreadyConfirmedSelection(t *testing.T) {
+	requirements := newRequirementEnv(t)
+	created := createRequirement(t, requirements, "checkout applies coupons")
+	env := newRequirementGateEnv(t, requirements)
+	ctx := stageUserContext(42)
+
+	if _, err := requirements.svc.Confirm(ctx, requirements.versionID, created.ID, 42); err != nil {
+		t.Fatalf("Confirm requirement: %v", err)
+	}
+	view, err := env.machine.OnRequirementConfirmed(ctx, requirements.versionID, []int64{created.ID})
+	if err != nil {
+		t.Fatalf("OnRequirementConfirmed(already clarified): %v", err)
+	}
+	if view.Stage != version.StageDesigning || env.repo.state.Stage != version.StageDesigning {
+		t.Fatalf("stage = %q, want designing", env.repo.state.Stage)
+	}
+	if len(env.jobs.jobs) != 1 || env.jobs.jobs[0].Kind != versionapp.StageJobDesignCases {
+		t.Fatalf("jobs = %#v, want one design.cases", env.jobs.jobs)
+	}
+	if got := env.jobs.jobs[0].RequirementIDs; len(got) != 1 || got[0] != created.ID {
+		t.Fatalf("job requirement ids = %#v, want the selected clarified requirement", got)
+	}
+}
+
 func TestConfirmRequirementsEmptyNoDrafts(t *testing.T) {
 	requirements := newRequirementEnv(t)
 	env := newRequirementGateEnv(t, requirements)

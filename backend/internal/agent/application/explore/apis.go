@@ -62,10 +62,13 @@ type APIDiscoveryConfig struct {
 }
 
 // APIDiscoveryDeps are the narrow ports consumed by the static scan. Facts may
-// be nil: the merged result is still returned.
+// be nil: the merged result is still returned. Resources is optional: when set,
+// every discovered endpoint is also proposed into the resource catalog so a
+// version can bind it (task 76); nil keeps discovery fact-only.
 type APIDiscoveryDeps struct {
-	Sources SourceProvider
-	Facts   FactRecorder
+	Sources   SourceProvider
+	Facts     FactRecorder
+	Resources ResourceProposalWriter
 }
 
 // APICandidate is one merged endpoint with its three-state classification and
@@ -94,18 +97,25 @@ type APIDiscoveryResult struct {
 	FilesSkipped   int            `json:"files_skipped"`
 	Truncated      bool           `json:"truncated"`
 	FactIDs        []int64        `json:"fact_ids"`
+	// ProposedResources counts endpoints written to the resource catalog as
+	// proposed rows; ResourceErrors counts write failures. A write failure is
+	// best effort and never discards the facts or the scan result.
+	ProposedResources int    `json:"proposed_resources"`
+	ResourceErrors    int    `json:"resource_errors"`
+	ResourceError     string `json:"resource_error,omitempty"`
 }
 
 // APIDiscovery is one bounded code-first API scan.
 type APIDiscovery struct {
-	cfg     APIDiscoveryConfig
-	sources SourceProvider
-	facts   FactRecorder
+	cfg       APIDiscoveryConfig
+	sources   SourceProvider
+	facts     FactRecorder
+	resources ResourceProposalWriter
 }
 
 // NewAPIDiscovery wires one static API scan.
 func NewAPIDiscovery(cfg APIDiscoveryConfig, deps APIDiscoveryDeps) *APIDiscovery {
-	return &APIDiscovery{cfg: cfg, sources: deps.Sources, facts: deps.Facts}
+	return &APIDiscovery{cfg: cfg, sources: deps.Sources, facts: deps.Facts, resources: deps.Resources}
 }
 
 type apiAggregate struct {
@@ -206,19 +216,28 @@ func (d *APIDiscovery) Run(ctx context.Context, versionID int64) (APIDiscoveryRe
 		}
 	}
 
-	if d.facts == nil {
-		return result, nil
+	if d.facts != nil {
+		for _, candidate := range candidates {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			fact := apiFact(versionID, d.cfg, candidate)
+			stored, _, recordErr := d.facts.Record(ctx, fact)
+			if recordErr != nil {
+				return result, fmt.Errorf("record %s fact: %w", KindAPI, recordErr)
+			}
+			result.FactIDs = append(result.FactIDs, stored.ID)
+		}
 	}
-	for _, candidate := range candidates {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		fact := apiFact(versionID, d.cfg, candidate)
-		stored, _, recordErr := d.facts.Record(ctx, fact)
-		if recordErr != nil {
-			return result, fmt.Errorf("record %s fact: %w", KindAPI, recordErr)
-		}
-		result.FactIDs = append(result.FactIDs, stored.ID)
+	// Discovery evidence becomes a bindable resource: propose every discovered
+	// endpoint into the catalog of the environment the version binds. This is
+	// the missing step between "API discovered" and "version has APIs".
+	proposed, failures, firstError, proposeErr := proposeAPIResources(ctx, d.resources, d.cfg.EnvironmentID, result.APIs)
+	result.ProposedResources = proposed
+	result.ResourceErrors = failures
+	result.ResourceError = firstError
+	if proposeErr != nil {
+		return result, proposeErr
 	}
 	return result, nil
 }

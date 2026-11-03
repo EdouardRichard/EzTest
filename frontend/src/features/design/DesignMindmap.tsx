@@ -30,7 +30,7 @@ import {
 import type { DesignNodeActions } from "./nodeActions"
 import { RequirementNode } from "./RequirementNode"
 import { ScenarioNode } from "./ScenarioNode"
-import type { CaseVersionStatus, DesignCaseSummary, DesignGraph } from "./types"
+import type { CaseVersionStatus, DesignGraph } from "./types"
 import { useSelection } from "./useSelection"
 
 import "@xyflow/react/dist/style.css"
@@ -78,13 +78,19 @@ export type DesignMindmapProps = {
   executionResults?: DesignExecutionResults
   /** True while a batch confirm/execute request is in flight. */
   batchBusy?: boolean
+  /**
+   * Case confirmation/execution are only available at the case hard gate
+   * (stage case_review). Defaults to true so isolated canvas tests keep the
+   * legacy behavior; the design tab passes the real stage gate.
+   */
+  caseReviewEnabled?: boolean
   onSelectCase: (caseId: string) => void
   onConfirmCase: (caseId: string) => void
   onConfirmScenario: (scenarioId: string) => void
   onConfirmRequirement: (requirementId: string) => void
   /** Batch confirm: exactly the checked case ids (spec §9.3). */
   onBatchConfirmCases?: (caseIds: string[]) => void
-  /** Batch execute: only offered when every checked case is confirmed. */
+  /** Batch execute: confirms and executes exactly the checked case ids. */
   onBatchExecuteCases?: (caseIds: string[]) => void
   /** "交给 AI 修改": the checked case ids are handed to the design chat. */
   onRequestAiChange?: (caseIds: string[]) => void
@@ -102,6 +108,7 @@ function MindmapCanvas({
   confirmingKey = null,
   executionResults = EMPTY_RESULTS,
   batchBusy = false,
+  caseReviewEnabled = true,
   onSelectCase,
   onConfirmCase,
   onConfirmScenario,
@@ -115,29 +122,6 @@ function MindmapCanvas({
   const [filters, setFilters] = useState<CaseFilterValues>(DEFAULT_CASE_FILTERS)
   const hasExecutionResults = Object.keys(executionResults).length > 0
   const selection = useSelection()
-
-  // The batch bar operates on the cases the user actually checked: the graph
-  // lookup only resolves titles/statuses, it never widens the selection.
-  const caseById = useMemo(() => {
-    const index = new Map<string, DesignCaseSummary>()
-    for (const requirement of graph.requirements) {
-      for (const scenario of requirement.scenarios) {
-        for (const designCase of scenario.cases) index.set(designCase.case_id, designCase)
-      }
-    }
-    return index
-  }, [graph.requirements])
-  const selectedCases = useMemo(
-    () =>
-      selection.selectedIds
-        .map((caseId) => caseById.get(caseId))
-        .filter((designCase): designCase is DesignCaseSummary => designCase !== undefined),
-    [selection.selectedIds, caseById],
-  )
-  const allSelectedConfirmed =
-    selectedCases.length > 0 &&
-    selectedCases.length === selection.selectedIds.length &&
-    selectedCases.every((designCase) => designCase.status === "confirmed")
 
   // A result filter without execution data would hide every case behind the
   // no-match overlay, so it only becomes active once a caller passes verdicts.
@@ -156,6 +140,7 @@ function MindmapCanvas({
       onConfirmRequirement,
       onToggleCaseSelected: selection.toggle,
       confirmingKey,
+      caseReviewEnabled,
     }),
     [
       onSelectCase,
@@ -164,6 +149,7 @@ function MindmapCanvas({
       onConfirmRequirement,
       selection.toggle,
       confirmingKey,
+      caseReviewEnabled,
     ],
   )
 
@@ -345,12 +331,13 @@ function MindmapCanvas({
           <span data-testid="case-selection-count" className="text-[11px] text-muted-foreground">
             已选 {selection.selectedIds.length} 条
           </span>
-          {onBatchConfirmCases === undefined ? null : (
+          {onBatchConfirmCases === undefined || !caseReviewEnabled ? null : (
             <Button
               size="sm"
               variant="secondary"
               data-testid="case-batch-confirm"
               disabled={selection.selectedIds.length === 0 || batchBusy}
+              title="仅确认所选 draft 用例，不创建执行波次"
               onClick={() => onBatchConfirmCases(selection.selectedIds)}
             >
               批量确认
@@ -367,12 +354,12 @@ function MindmapCanvas({
               交给 AI 修改
             </Button>
           )}
-          {onBatchExecuteCases === undefined ? null : (
+          {onBatchExecuteCases === undefined || !caseReviewEnabled ? null : (
             <Button
               size="sm"
               data-testid="case-batch-execute"
-              disabled={!allSelectedConfirmed || batchBusy}
-              title="仅当所选用例全部为 confirmed 时才能批量执行"
+              disabled={selection.selectedIds.length === 0 || batchBusy}
+              title="确认并通过用例门，仅执行选中用例（不执行未选中的已确认用例）"
               onClick={() => onBatchExecuteCases(selection.selectedIds)}
             >
               批量执行

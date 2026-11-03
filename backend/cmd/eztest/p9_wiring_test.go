@@ -235,6 +235,7 @@ func p9GapFact(id int64) versiondomain.Fact {
 			"dimension":         "acceptance",
 			"requirement_id":    int64(101),
 			"requirement_title": "下单",
+			"target":            "/checkout",
 			"reason":            "缺少验收标准",
 			"question":          "请补充验收标准",
 		},

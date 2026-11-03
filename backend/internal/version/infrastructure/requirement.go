@@ -346,6 +346,22 @@ func (r *RequirementRepository) CreateRelation(ctx context.Context, relation ver
 	return nil
 }
 
+// SetStatus projects a lifecycle status change that adds no revision (Task 77
+// duplicate-draft deletion and merge retirement).
+func (r *RequirementRepository) SetStatus(ctx context.Context, versionID, requirementID int64, status version.RequirementStatus, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE requirement SET status = $3, updated_at = $4
+		WHERE version_id = $1 AND id = $2
+	`, versionID, requirementID, string(status), updatedAt)
+	if err != nil {
+		return wrapDB("set requirement status", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.ErrRequirementNotFound
+	}
+	return nil
+}
+
 // ListRelations returns every relation touching one requirement.
 func (r *RequirementRepository) ListRelations(ctx context.Context, versionID, requirementID int64) ([]version.Relation, error) {
 	rows, err := r.pool.Query(ctx, `

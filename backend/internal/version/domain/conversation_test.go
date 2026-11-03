@@ -61,6 +61,55 @@ func TestMessagePartJSONShapes(t *testing.T) {
 	}
 }
 
+// TestJobCardFailureReasonJSONShape covers Task 75: a terminal failed job card
+// persists the typed failure code and the user-facing reason, and both survive
+// the JSON round trip so the stored part, its streaming row and the SSE frame
+// all carry the explanation instead of only "failed".
+func TestJobCardFailureReasonJSONShape(t *testing.T) {
+	part := version.MessagePart{
+		Type: "job_card", JobID: 9001, JobKind: "chat.turn", Status: "failed",
+		Code:   "llm_capability_mismatch",
+		Reason: `llm model "text-only" does not support images; choose a model with vision`,
+	}
+	raw, err := json.Marshal(part)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload["code"] != "llm_capability_mismatch" {
+		t.Fatalf("code = %#v, want the typed failure code (%s)", payload["code"], raw)
+	}
+	if reason, _ := payload["reason"].(string); !strings.Contains(reason, "does not support images") {
+		t.Fatalf("reason = %#v, want the failure message (%s)", payload["reason"], raw)
+	}
+	var roundTripped version.MessagePart
+	if err := json.Unmarshal(raw, &roundTripped); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if roundTripped.Code != part.Code || roundTripped.Reason != part.Reason {
+		t.Fatalf("round trip = %#v, want the failure code/reason", roundTripped)
+	}
+	if err := version.ValidateJobCardMessage(part); err != nil {
+		t.Fatalf("failed card with a reason rejected: %v", err)
+	}
+	// A running/done card without a failure reason keeps the optional fields
+	// empty and stays valid.
+	ok := version.MessagePart{Type: "job_card", JobID: 9001, JobKind: "chat.turn", Status: "running"}
+	raw, err = json.Marshal(ok)
+	if err != nil {
+		t.Fatalf("marshal without reason: %v", err)
+	}
+	if strings.Contains(string(raw), `"reason"`) || strings.Contains(string(raw), `"code"`) {
+		t.Fatalf("a card without a failure exposes empty failure fields: %s", raw)
+	}
+	if err := version.ValidateJobCardMessage(ok); err != nil {
+		t.Fatalf("card without a reason rejected: %v", err)
+	}
+}
+
 func TestValidateUserMessageParts(t *testing.T) {
 	valid := []version.MessagePart{
 		{Type: "text", Text: "Find the coupon rules"},

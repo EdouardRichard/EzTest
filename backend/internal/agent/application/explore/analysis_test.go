@@ -276,6 +276,7 @@ func gapFact(id int64, requirementID int64, requirementTitle string, dimension e
 			"dimension":         string(dimension),
 			"requirement_id":    requirementID,
 			"requirement_title": requirementTitle,
+			"target":            "/checkout",
 			"reason":            reason,
 			"question":          "请补充" + dimension.Label(),
 			"target_pages":      []any{},
@@ -283,6 +284,14 @@ func gapFact(id int64, requirementID int64, requirementTitle string, dimension e
 			"source":            "requirement",
 		},
 	}
+}
+
+// gapFactWithoutTarget is a requirement-completeness gap with no discovered
+// page/API to verify. Such a gap is clarification work, never a case draft.
+func gapFactWithoutTarget(id int64, requirementID int64, requirementTitle string, dimension exploreapp.GapDimension, reason string) version.Fact {
+	fact := gapFact(id, requirementID, requirementTitle, dimension, reason)
+	delete(fact.Payload, "target")
+	return fact
 }
 
 func richRequirement() exploreapp.RequirementSnapshot {
@@ -707,8 +716,50 @@ func TestCaseAugmentSkipsIneligible(t *testing.T) {
 	}
 }
 
-/* --------------------------- failure attribution ------------------------- */
+// TestCaseAugmentSkipsStubGaps pins Task 77: requirement-completeness gaps with
+// no concrete discovered target must never become placeholder "[补用例]" cases.
+// The PO trial left such stubs in the graph where they could not be deleted or
+// merged; a gap is clarification work until it points at a real page/API.
+func TestCaseAugmentSkipsStubGaps(t *testing.T) {
+	reader := newFactReader(
+		gapFactWithoutTarget(41, 401, "下单", exploreapp.GapDimensionDependency, "requirement declares no dependent page or API"),
+		gapFactWithoutTarget(42, 402, "退款", exploreapp.GapDimensionException, "requirement does not state the exception concern"),
+	)
+	writer := &fakeDraftWriter{}
+	augment := exploreapp.NewCaseAugment(exploreapp.CaseAugmentConfig{}, exploreapp.CaseAugmentDeps{
+		Facts:  reader,
+		Cases:  &fakeCaseSource{},
+		Writer: writer,
+	})
+	result, err := augment.Run(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("CaseAugment.Run: %v", err)
+	}
+	if len(result.Drafts) != 0 || len(result.Created) != 0 {
+		t.Fatalf("target-less gaps produced stub drafts: %+v", result)
+	}
+	if attempts := writer.created(); len(attempts) != 0 {
+		t.Fatalf("target-less gaps reached the design writer: %+v", attempts)
+	}
+	if result.Ungrounded != 2 {
+		t.Fatalf("ungrounded skipped = %d, want 2", result.Ungrounded)
+	}
 
+	// A gap grounded on a concrete page/API still produces a draft.
+	grounded := newFactReader(gapFact(43, 403, "登录", exploreapp.GapDimensionDependency, "dependent page is not verified"))
+	result, err = exploreapp.NewCaseAugment(exploreapp.CaseAugmentConfig{}, exploreapp.CaseAugmentDeps{
+		Facts: grounded,
+		Cases: &fakeCaseSource{},
+	}).Run(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("grounded CaseAugment.Run: %v", err)
+	}
+	if len(result.Drafts) != 1 {
+		t.Fatalf("grounded drafts = %d, want 1", len(result.Drafts))
+	}
+}
+
+/* --------------------------- failure attribution ------------------------- */
 func TestFailureAttribution(t *testing.T) {
 	attribution := exploreapp.NewFailureAttribution()
 

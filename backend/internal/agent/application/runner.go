@@ -516,7 +516,7 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		return r.runExecuteBatch(ctx, item, payload)
 	}
 	if payloadErr == nil {
-		r.projectJobCard(ctx, item, payload, "running", 0)
+		r.projectJobCard(ctx, item, payload, "running", 0, jobCardFailure{})
 	}
 	result, err := r.run(ctx, item)
 	if payloadErr == nil {
@@ -524,7 +524,11 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 			// The run context may already be cancelled; the terminal card is a
 			// short independent write like the other post-run write-backs.
 			finishCtx, cancel := context.WithTimeout(context.Background(), jobCardWriteTimeout)
-			r.projectJobCard(finishCtx, item, payload, status, result.Turns)
+			failure := jobCardFailure{}
+			if status == "failed" {
+				failure = jobCardFailureDetails(err)
+			}
+			r.projectJobCard(finishCtx, item, payload, status, result.Turns, failure)
 			cancel()
 		}
 	}
@@ -557,7 +561,7 @@ func (r *Runner) runDesignCases(ctx context.Context, item agent.WorkItem, payloa
 		// write like the other post-run projections.
 		payload.ConversationID = conversationID
 		finishCtx, cancel := context.WithTimeout(context.Background(), jobCardWriteTimeout)
-		r.projectJobCard(finishCtx, item, payload, "done", 0)
+		r.projectJobCard(finishCtx, item, payload, "done", 0, jobCardFailure{})
 		cancel()
 	}
 	return RunResult{Status: agent.AgentRunDone}, nil
@@ -656,6 +660,7 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	// bytes are loaded and before the run row is created.
 	imageRefs, err := r.triggerImageRefs(ctx, item, payload)
 	if err != nil {
+		r.recordPreDispatchFailure(ctx, item, profile, payload, err)
 		return RunResult{}, err
 	}
 	requirements := modelRequirements(profile)
@@ -672,7 +677,9 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if payload.ConversationID > 0 && r.conversation != nil {
 		override, overrideErr := r.conversation.ModelOverride(ctx, item.VersionID, payload.ConversationID)
 		if overrideErr != nil {
-			return RunResult{}, &RunError{Reason: "tool_failure", Retryable: true, Cause: overrideErr}
+			runErr := &RunError{Reason: "tool_failure", Retryable: true, Cause: overrideErr}
+			r.recordPreDispatchFailure(ctx, item, profile, payload, runErr)
+			return RunResult{}, runErr
 		}
 		modelOverride = strings.TrimSpace(override)
 	}
@@ -685,7 +692,9 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	// ResolveModel against the role's tool needs.
 	modelInfo, err := r.chat.ResolveModel(ctx, 0, requestedModel, requirements...)
 	if err != nil {
-		return RunResult{}, resolveRunError(err)
+		runErr := resolveRunError(err)
+		r.recordPreDispatchFailure(ctx, item, profile, payload, runErr)
+		return RunResult{}, runErr
 	}
 
 	run, err := r.createRun(ctx, item, profile, payload, modelInfo)
@@ -821,6 +830,21 @@ func (r *Runner) finalizeRequirement(ctx context.Context, state *runState) error
 }
 
 func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, model llmapp.ModelInfo) (agent.AgentRun, error) {
+	run, err := r.buildRun(item, profile, payload, model)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
+	stored, err := r.repo.CreateRun(ctx, run)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
+	return stored, nil
+}
+
+// buildRun builds the immutable part of one agent_run attempt. The caller owns
+// the status: a dispatch-ready run is running, a pre-dispatch failure is
+// recorded with its terminal snapshot.
+func (r *Runner) buildRun(item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, model llmapp.ModelInfo) (agent.AgentRun, error) {
 	if r.ids == nil {
 		return agent.AgentRun{}, errors.New("agent runner has no ID generator")
 	}
@@ -843,11 +867,56 @@ func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile age
 		conversationID := payload.ConversationID
 		run.ConversationID = &conversationID
 	}
-	stored, err := r.repo.CreateRun(ctx, run)
-	if err != nil {
-		return agent.AgentRun{}, err
+	return run, nil
+}
+
+// recordPreDispatchFailure persists one failed agent_run for a conversation
+// attempt that stopped before createRun (trigger-message/image read, model
+// override read, or model capability resolution). The Agent center runs list is
+// backed by agent_run rows; without this snapshot a conversation job that fails
+// at zero steps is invisible there even though the thread shows a failed card
+// (Task 75 / admin B1). The insert is best effort and never changes the run
+// verdict.
+func (r *Runner) recordPreDispatchFailure(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, cause error) {
+	if r == nil || r.repo == nil || payload.ConversationID <= 0 {
+		return
 	}
-	return stored, nil
+	run, err := r.buildRun(item, profile, payload, llmapp.ModelInfo{})
+	if err != nil {
+		return
+	}
+	run.Status = agent.AgentRunFailed
+	reason := runTerminalReason(cause)
+	run.TerminalReason = &reason
+	finishedAt := r.now()
+	run.FinishedAt = &finishedAt
+	if _, err := r.repo.CreateRun(ctx, run); err != nil && r.logger != nil {
+		r.logger.Warn("agent runner: record pre-dispatch failed run failed",
+			"work_item_id", item.ID, "conversation_id", payload.ConversationID, "error", err)
+	}
+}
+
+// runTerminalReason is the stable terminal_reason of a pre-dispatch failure: the
+// classified RunError reason normally, and the typed platform error code when
+// the run stopped at model resolution (resolveRunError keeps the generic
+// ai_unavailable reason). Never empty.
+func runTerminalReason(err error) string {
+	var runErr *RunError
+	if errors.As(err, &runErr) {
+		if reason := strings.TrimSpace(runErr.Reason); reason != "" && reason != "ai_unavailable" {
+			return reason
+		}
+	}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		if code := strings.TrimSpace(apiErr.Code); code != "" {
+			return code
+		}
+	}
+	if runErr != nil && strings.TrimSpace(runErr.Reason) != "" {
+		return strings.TrimSpace(runErr.Reason)
+	}
+	return "model_error"
 }
 
 // prepare loads the version/conversation context, resolves the model, persists
@@ -1719,10 +1788,15 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 	case WorkTypeChatTurn:
 		if state.conversationKind == "design" {
 			return TaskContext{
-				Type:               state.item.Type,
-				Goal:               "作为设计 Host 与用户对话，读取脑图并按用户要求提交/修改场景与用例 draft。",
-				Constraints:        []string{"AI 只能提交 draft/候选，不能确认、删除或关闭用例", "确认只属于用户", "不编造需求未表达的内容"},
-				AcceptanceCriteria: []string{"引用用户最新消息", "修改脑图前先 design.graph_read", "用 case.graph_propose 提交草案并说明变化"},
+				Type: state.item.Type,
+				Goal: "作为设计 Host 与用户对话，读取脑图并按用户要求提交/修改场景与用例 draft。",
+				Constraints: []string{
+					"AI 只能提交 draft/候选，不能确认、删除或关闭用例", "确认只属于用户", "不编造需求未表达的内容",
+					"收到修改请求时先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改；不要只回复修改计划、不要等待用户二次授权",
+					"每条步骤与断言的 expected 必须是非空的可观察结果；修改时补齐空 expected",
+					"页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时只用 requirement/knowledge 来源，不要编造 ref_id",
+				},
+				AcceptanceCriteria: []string{"引用用户最新消息", "修改脑图前先 design.graph_read", "同一轮内用 case.graph_propose 提交草案或修改并说明变化"},
 				Scope:              scope,
 			}
 		}
@@ -1767,8 +1841,9 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 				"只提交 draft/候选，不能确认、删除、关闭用例或需求",
 				"只做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
 				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id",
+				"页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时只用 requirement/knowledge 来源，不要编造 ref_id",
 				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建",
-				"用例必须包含可执行步骤、断言、来源与目标 version_sut；页面/接口发现事实可作为 knowledge/page/api 来源；不编造需求未表达的内容",
+				"用例必须包含可执行步骤、断言、来源与目标 version_sut；每条步骤与断言的 expected 必须是非空的可观察结果；不编造需求未表达的内容",
 			},
 			AcceptanceCriteria: []string{
 				"对本轮每条已确认需求至少提交一次 case.graph_propose，并返回 case_ids/case_version_ids",
@@ -1787,10 +1862,10 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			Goal: goal,
 			Constraints: []string{
 				"只提交 draft/候选，不能确认、删除或关闭用例",
-				"用例必须包含步骤、断言、来源与目标 version_sut",
+				"用例必须包含步骤、断言、来源与目标 version_sut；每条步骤与断言的 expected 必须是非空的可观察结果",
 				"同一需求版本内更新已有用例时传既有 ID/自然键",
 				"只做一次 design.graph_read 获取 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
-				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id；页面/接口发现事实可作为 knowledge/page/api 来源",
+				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id；页面/API 来源只能引用版本已绑定的 page/api ID，未绑定时不要编造",
 				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与同轮设计重复的概率；同一自然键已存在时更新而不是重复创建",
 			},
 			AcceptanceCriteria: []string{
@@ -1891,7 +1966,7 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 			return "这是澄清会话的开场。请向用户提一个简短的开场问题，引导其描述需求。"
 		}
 		if state.conversationKind == "design" {
-			return "请根据最近的设计对话继续完善用例脑图；需要修改时先 design.graph_read 再 case.graph_propose。"
+			return "请根据最近的设计对话继续完善用例脑图。需要修改现有用例时：先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改（保留未变更内容、补齐所有 expected），不要只回复修改计划、不要等待二次授权。"
 		}
 		return "请基于最近对话继续澄清需求。"
 	case WorkTypeDesignRound:
@@ -2063,7 +2138,7 @@ func (r *Runner) reportJobProgress(ctx context.Context, state *runState) {
 	if state == nil {
 		return
 	}
-	r.projectJobCard(ctx, state.item, state.payload, "running", state.turns)
+	r.projectJobCard(ctx, state.item, state.payload, "running", state.turns, jobCardFailure{})
 	emitter := jobEventsFromContext(ctx)
 	if emitter == nil {
 		return
@@ -2123,13 +2198,21 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 	})
 }
 
+// DesignRunMaxTokens is the case-scale token budget of the design team. Usage is
+// cumulative across the turns of one run and every turn re-sends the design
+// thread plus the graph read, so the generic 20k chat budget was exhausted after
+// the read in the final S4 run: the following settlement turn disabled tools and
+// case.graph_propose could never write the modification. 200k covers a full
+// round (read + one propose per activated requirement) without being unbounded.
+const DesignRunMaxTokens = 200000
+
 func (r *Runner) maxTurns(profile agent.AgentProfile) int {
 	limit := profile.Budgets.MaxTurns
 	setting := r.intSetting("agent.max_turns", defaultMaxTurns)
-	// P3 execution profiles carry their own case-scale budget (P3 spec §7.2:
-	// case_executor 60 turns); the generic agent.max_turns (12) is a chat-scale
-	// guard and must not truncate an execution run.
-	if isP3Profile(profile.Key) {
+	// P3 execution profiles and the design team carry their own case-scale
+	// budgets; the generic agent.max_turns (12) is a chat-scale guard and must
+	// not truncate a design round or an execution run.
+	if isP3Profile(profile.Key) || isDesignProfile(profile.Key) {
 		if limit <= 0 {
 			limit = setting
 		}
@@ -2153,6 +2236,19 @@ func (r *Runner) maxTurns(profile agent.AgentProfile) int {
 func isP3Profile(key string) bool {
 	switch key {
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
+		return true
+	default:
+		return false
+	}
+}
+
+// isDesignProfile reports whether the profile belongs to the design team. Design
+// runs read the whole graph, write case drafts and run in one lasting round, so
+// they use the design-scale token budget and are not clamped by agent.max_turns.
+func isDesignProfile(key string) bool {
+	switch key {
+	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
+		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
 		return true
 	default:
 		return false
@@ -2195,6 +2291,9 @@ func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile)
 		// loop cap the loop exits before Decide can observe the fuse, so the
 		// budget policy would never get to ask for a wrap-up turn.
 		MaxTurnsFuse: r.turnFuse(profile),
+	}
+	if isDesignProfile(profile.Key) {
+		budget.MaxTokens = DesignRunMaxTokens
 	}
 	trimmed := strings.TrimSpace(string(item.Budget))
 	if trimmed == "" || trimmed == "null" {
@@ -2856,13 +2955,51 @@ func (r *Runner) assistantConversationParts(state *runState, finalText string, e
 // run context may already be cancelled.
 const jobCardWriteTimeout = 5 * time.Second
 
+// jobCardFailure is the typed explanation persisted on a terminal failed card
+// (Task 75). Code is the stable error code and Reason the user-facing message;
+// the zero value means "no failure to explain".
+type jobCardFailure struct {
+	Code   string
+	Reason string
+}
+
+// jobCardFailureDetails extracts the failure explanation of a finished run. A
+// typed platform error (for example llm_capability_mismatch) supplies the stable
+// code and the actionable message; otherwise the RunError classification and
+// then the error text are used. Secrets are redacted and both fields are bounded
+// by the MessagePart contract before they reach the conversation store.
+func jobCardFailureDetails(err error) jobCardFailure {
+	if err == nil {
+		return jobCardFailure{}
+	}
+	failure := jobCardFailure{}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		failure.Code = apiErr.Code
+		failure.Reason = apiErr.Message
+	}
+	if failure.Code == "" {
+		var runErr *RunError
+		if errors.As(err, &runErr) {
+			failure.Code = runErr.Reason
+		}
+	}
+	if strings.TrimSpace(failure.Reason) == "" {
+		failure.Reason = err.Error()
+	}
+	failure.Code = truncateRunes(strings.TrimSpace(failure.Code), version.MessageErrorCodeMax)
+	failure.Reason = redactPartText(strings.TrimSpace(failure.Reason), version.MessageErrorMessageMax)
+	return failure
+}
+
 // projectJobCard writes the single job_card part of a background job into its
 // conversation. It is a no-op when the job does not map to a card kind or the
 // work item carries no conversation. The version context owns idempotency: a
 // repeated start/progress/terminal projection rewrites the same card message
 // instead of appending a second one. The write is best effort: a card failure
-// is logged and never changes the run verdict.
-func (r *Runner) projectJobCard(ctx context.Context, item agent.WorkItem, payload WorkItemPayload, status string, current int) {
+// is logged and never changes the run verdict. A terminal failed card also
+// carries the typed failure code/reason so the thread explains the job.
+func (r *Runner) projectJobCard(ctx context.Context, item agent.WorkItem, payload WorkItemPayload, status string, current int, failure jobCardFailure) {
 	if r == nil || r.conversation == nil || item.ID <= 0 || payload.ConversationID <= 0 {
 		return
 	}
@@ -2873,14 +3010,23 @@ func (r *Runner) projectJobCard(ctx context.Context, item agent.WorkItem, payloa
 	if current < 0 {
 		current = 0
 	}
-	card := ConversationPart{Type: version.MessagePartJobCard, Data: map[string]any{
+	data := map[string]any{
 		"job_id":     idText(item.ID),
 		"kind":       kind,
 		"status":     status,
 		"current":    int64(current),
 		"total":      int64(0),
 		"cancelable": jobCardCancelable(status),
-	}}
+	}
+	if status == "failed" {
+		if failure.Code != "" {
+			data["code"] = failure.Code
+		}
+		if failure.Reason != "" {
+			data["reason"] = failure.Reason
+		}
+	}
+	card := ConversationPart{Type: version.MessagePartJobCard, Data: data}
 	if _, err := r.conversation.UpsertJobCard(ctx, item.VersionID, payload.ConversationID, card); err != nil {
 		if r.logger != nil {
 			r.logger.Warn("agent runner: project job card failed",

@@ -69,6 +69,23 @@ describe("JobCardActionRules", () => {
     expect(screen.queryByRole("button", { name: "重试作业" })).not.toBeInTheDocument()
   })
 
+  it("shows the persisted failure reason and typed code instead of only 失败", () => {
+    render(
+      <JobCard
+        versionId="2001"
+        part={{
+          ...jobWith("failed"),
+          code: "llm_capability_mismatch",
+          reason: `llm model "text-only" does not support images; choose a model with vision`,
+        }}
+      />,
+    )
+
+    const reason = screen.getByTestId("job-card-reason")
+    expect(reason).toHaveTextContent(/不支持图片|does not support images/)
+    expect(reason).toHaveTextContent("llm_capability_mismatch")
+  })
+
   it("shows a clear message when retry is rejected because the job is not retryable", async () => {
     apiClient.apiPost.mockRejectedValueOnce(
       new ApiError({

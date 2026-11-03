@@ -133,6 +133,37 @@ func Register(r *gin.Engine) {
 	}}}
 }
 
+// fakeP9ResourceProposals records the pages/APIs discovery hands to the
+// resource catalog (task 76). The production writer is p9ResourceProposals over
+// *resourceapp.Service; this fake pins that the analysis wires its writer down
+// into both discovery capabilities.
+type fakeP9ResourceProposals struct {
+	mu    sync.Mutex
+	pages []exploreapp.PageResourceProposal
+	apis  []exploreapp.APIResourceProposal
+}
+
+func (f *fakeP9ResourceProposals) ProposePageResource(_ context.Context, page exploreapp.PageResourceProposal) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pages = append(f.pages, page)
+	return true, nil
+}
+
+func (f *fakeP9ResourceProposals) ProposeAPIResource(_ context.Context, api exploreapp.APIResourceProposal) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.apis = append(f.apis, api)
+	return true, nil
+}
+
+func (f *fakeP9ResourceProposals) proposed() ([]exploreapp.PageResourceProposal, []exploreapp.APIResourceProposal) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]exploreapp.PageResourceProposal(nil), f.pages...),
+		append([]exploreapp.APIResourceProposal(nil), f.apis...)
+}
+
 func p9DiscoveryRequirement() exploreapp.RequirementSnapshot {
 	return exploreapp.RequirementSnapshot{
 		ID: 101, VersionID: 10010, Title: "下单", Status: "clarified",
@@ -165,6 +196,7 @@ func TestAnalysisWiresDiscovery(t *testing.T) {
 	closer := &fakeP9Closer{}
 	facts := &fakeP9Facts{byKind: map[string][]versiondomain.Fact{}}
 	versions := &fakeP9Versions{view: p9TestVersionView()}
+	resources := &fakeP9ResourceProposals{}
 	analysis, err := newP9Analysis(p9AnalysisDeps{
 		Runtime:      runtime,
 		Executor:     executor,
@@ -172,6 +204,7 @@ func TestAnalysisWiresDiscovery(t *testing.T) {
 		Pages:        closer,
 		Facts:        facts,
 		Recorder:     facts,
+		Resources:    resources,
 		Requirements: &fakeP9Requirements{snapshots: []exploreapp.RequirementSnapshot{p9DiscoveryRequirement()}},
 		Cases:        &fakeP9Cases{},
 		Roles:        &fakeP9Roles{roles: []string{"admin"}},
@@ -203,6 +236,37 @@ func TestAnalysisWiresDiscovery(t *testing.T) {
 	}
 	if result.Pages == 0 || result.APIs == 0 {
 		t.Fatalf("coverage did not consume discovery facts: %+v", result)
+	}
+
+	// Task 76: the same discovery pass must also write the discovered rows into
+	// the bound environment's resource catalog, otherwise the version wizard
+	// still shows "该环境暂无页面/API" even though the facts exist.
+	proposedPages, proposedAPIs := resources.proposed()
+	if result.ProposedPages != result.DiscoveredPages || result.ProposedAPIs != result.DiscoveredAPIs {
+		t.Fatalf("proposed pages/apis = %d/%d, discovered = %d/%d",
+			result.ProposedPages, result.ProposedAPIs, result.DiscoveredPages, result.DiscoveredAPIs)
+	}
+	if len(proposedPages) == 0 || len(proposedPages) != result.DiscoveredPages {
+		t.Fatalf("resource page proposals = %d, want %d", len(proposedPages), result.DiscoveredPages)
+	}
+	for index, page := range proposedPages {
+		if page.EnvironmentID != 8 {
+			t.Fatalf("page proposal[%d] environment = %d, want the bound environment 8", index, page.EnvironmentID)
+		}
+		if page.URL == "" || page.RouteTemplate == "" || page.Name == "" || page.PageType != "page" {
+			t.Fatalf("page proposal[%d] is incomplete: %+v", index, page)
+		}
+	}
+	if len(proposedAPIs) == 0 || len(proposedAPIs) != result.DiscoveredAPIs {
+		t.Fatalf("resource api proposals = %d, want %d", len(proposedAPIs), result.DiscoveredAPIs)
+	}
+	for index, api := range proposedAPIs {
+		if api.EnvironmentID != 8 {
+			t.Fatalf("api proposal[%d] environment = %d, want the bound environment 8", index, api.EnvironmentID)
+		}
+		if api.Method == "" || api.PathTemplate == "" || api.Name == "" {
+			t.Fatalf("api proposal[%d] is incomplete: %+v", index, api)
+		}
 	}
 	// The requirement depends on the crawled page and the statically discovered
 	// API; because both facts now exist, the dependency gap is gone.

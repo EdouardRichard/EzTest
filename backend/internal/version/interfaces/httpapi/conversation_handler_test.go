@@ -198,6 +198,58 @@ func TestCreateConversationReturnsDetailShape(t *testing.T) {
 	}
 }
 
+// fixedConversationStageReader is the deterministic stage projection stub for
+// the design-action gate.
+type fixedConversationStageReader struct {
+	stage version.Stage
+	err   error
+}
+
+func (r fixedConversationStageReader) Stage(_ context.Context, versionID int64) (versionapp.StageView, error) {
+	if r.err != nil {
+		return versionapp.StageView{}, r.err
+	}
+	return versionapp.StageView{VersionID: versionID, Stage: r.stage}, nil
+}
+
+// TestDesignConversationRequiresDesignStage pins the Task 78 guard: a design
+// conversation (the entry point for case generation) must not be silently
+// created while the version is still clarifying/requirement_review. The typed
+// 409 carries guidance instead of the raw stage error.
+func TestDesignConversationRequiresDesignStage(t *testing.T) {
+	stub := &stubConversationService{conversation: sampleConversationView()}
+	handler := versionapi.NewConversationHandler(stub)
+	handler.SetStageReader(fixedConversationStageReader{stage: version.StageClarifying})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/versions/{id}/conversations", handler.Create)
+
+	recorder := call(t, mux, http.MethodPost, "/api/versions/101/conversations", `{"kind":"design"}`, actor())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("design conversation at clarifying status = %d, want 409, body = %s",
+			recorder.Code, recorder.Body.String())
+	}
+	body := errorBody(t, recorder)
+	if body["code"] != "invalid_stage_for_action" {
+		t.Fatalf("error code = %#v, want invalid_stage_for_action", body["code"])
+	}
+	if stub.lastKind != "" {
+		t.Fatalf("design conversation was created anyway: kind=%q", stub.lastKind)
+	}
+
+	// Clarification conversations stay available at every stage.
+	clarification := call(t, mux, http.MethodPost, "/api/versions/101/conversations", `{"kind":"clarification"}`, actor())
+	if clarification.Code != http.StatusCreated {
+		t.Fatalf("clarification conversation status = %d, body = %s", clarification.Code, clarification.Body.String())
+	}
+
+	// The design entry opens once the requirement gate reached designing.
+	handler.SetStageReader(fixedConversationStageReader{stage: version.StageDesigning})
+	created := call(t, mux, http.MethodPost, "/api/versions/101/conversations", `{"kind":"design"}`, actor())
+	if created.Code != http.StatusCreated {
+		t.Fatalf("design conversation at designing status = %d, body = %s", created.Code, created.Body.String())
+	}
+}
+
 func TestConversationListAndGetParseQuery(t *testing.T) {
 	handler, stub := newConversationServer(t)
 	stub.list = []versionapp.ConversationView{sampleConversationView()}

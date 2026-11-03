@@ -35,6 +35,12 @@ export type ComposerProps = {
    * page passes it to `ModelSelector` so non-vision models are disabled.
    */
   onDraftHasImagesChange?: (hasImages: boolean) => void
+  /**
+   * Why the current draft cannot be sent (an image on a non-vision model,
+   * Task 75). When set, Send is disabled and the reason is shown; the draft is
+   * kept so the user can switch model or remove the image and retry.
+   */
+  sendBlockedReason?: string
 }
 
 /** Image detection for the draft; the mime comes from `POST /api/content`. */
@@ -59,6 +65,7 @@ export function Composer({
   caseReferences = [],
   onCaseReferencesChange,
   onDraftHasImagesChange,
+  sendBlockedReason,
 }: ComposerProps) {
   const [internalValue, setInternalValue] = useState("")
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([])
@@ -72,6 +79,9 @@ export function Composer({
   // submitted (spec §8.5); the server repeats this with a typed 409
   // attachment_pending when a referenced attachment is still parsing.
   const blocked = disabled || sending || uploading
+  // The page-level vision gate (Task 75): an image draft on a non-vision model
+  // never reaches POST 201. The draft and attachments stay editable/removable.
+  const sendBlocked = sendBlockedReason !== undefined
   // The server rejects a send whose attachment is still parsing with a typed
   // 409. Keep the draft/attachments and offer an explicit retry instead of
   // silently re-submitting or dropping the message.
@@ -97,7 +107,7 @@ export function Composer({
   }
 
   async function submit(): Promise<void> {
-    if (blocked || !hasContent) return
+    if (blocked || sendBlocked || !hasContent) return
     const parts: NewMessagePart[] = []
     const draft = value.trim()
     if (draft.length > 0) parts.push({ type: "text", text: draft })
@@ -230,11 +240,20 @@ export function Composer({
             onClick={() => {
               void submit()
             }}
-            disabled={blocked || !hasContent}
+            disabled={blocked || sendBlocked || !hasContent}
           >
             {sending ? "发送中…" : uploading ? "解析中…" : "发送"}
           </Button>
         </div>
+        {sendBlocked && sendBlockedReason !== undefined ? (
+          <p
+            data-testid="composer-send-blocked"
+            role="status"
+            className="mt-1.5 text-[11px] text-warning"
+          >
+            {sendBlockedReason}
+          </p>
+        ) : null}
       </div>
       {error !== undefined ? (
         <div className="flex flex-wrap items-center gap-2 pt-1.5">
@@ -243,7 +262,7 @@ export function Composer({
             <Button
               variant="secondary"
               size="sm"
-              disabled={blocked || !hasContent}
+              disabled={blocked || sendBlocked || !hasContent}
               onClick={() => {
                 void submit()
               }}

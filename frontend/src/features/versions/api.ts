@@ -1,3 +1,4 @@
+import type { StageView } from "@/features/design/types"
 import { apiGet, apiGetPage, apiPatch, apiPost } from "@/lib/api-client"
 
 import type {
@@ -18,6 +19,11 @@ export async function listVersions(): Promise<VersionSummary[]> {
 /** One nested version with all SUT bindings and resource summaries. */
 export function getVersion(id: string): Promise<Version> {
   return apiGet<Version>(`/api/versions/${encodeURIComponent(id)}`)
+}
+
+/** Deterministic stage-machine projection (spec §5.3); drives the stage badge and gates. */
+export function getVersionStage(id: string): Promise<StageView> {
+  return apiGet<StageView>(`/api/versions/${encodeURIComponent(id)}/stage`)
 }
 
 /** Creates a version with the exact contract payload built by the wizard. */

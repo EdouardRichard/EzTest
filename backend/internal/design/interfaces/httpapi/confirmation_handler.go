@@ -20,6 +20,10 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	if err := h.requireCaseReview(r.Context(), versionID); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
 	var request confirmRequest
 	if err := decodeBody(w, r, &request); err != nil {
 		httpx.Error(w, r, err)

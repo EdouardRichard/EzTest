@@ -497,7 +497,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(stepField+".action", step.Action, 1, StepActionMax); err != nil {
 			return err
 		}
-		if err := validation.String(stepField+".expected", step.Expected, 0, CaseDescriptionMax); err != nil {
+		if err := validation.String(stepField+".expected", step.Expected, 1, CaseDescriptionMax); err != nil {
 			return err
 		}
 		if err := validation.String(stepField+".account_role", step.AccountRole, 0, AccountRoleMax); err != nil {
@@ -532,7 +532,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(assertionField+".target", assertion.Target, 1, AssertionTargetMax); err != nil {
 			return err
 		}
-		if err := validation.String(assertionField+".expected", assertion.Expected, 0, AssertionExpectMax); err != nil {
+		if err := validation.String(assertionField+".expected", assertion.Expected, 1, AssertionExpectMax); err != nil {
 			return err
 		}
 		targetSUT, err := assertionTargetSUT(assertionField, assertion, caseSUTs, ctx, stepSUTs[assertion.StepSeq])

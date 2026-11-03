@@ -17,15 +17,22 @@ type ErrorDescription = {
   requestId?: string
   code?: string
   retryable?: boolean
+  /** Typed API `details.next_action` (e.g. stage-gate guidance). */
+  nextAction?: string
 }
 
 function describeError(error: unknown): ErrorDescription {
   if (error instanceof ApiError) {
+    const nextAction =
+      typeof error.details.next_action === "string" && error.details.next_action.length > 0
+        ? error.details.next_action
+        : undefined
     return {
       message: error.message,
       requestId: error.requestId,
       code: error.code,
       retryable: error.retryable,
+      nextAction,
     }
   }
   if (error instanceof Error) return { message: error.message }
@@ -46,6 +53,9 @@ export function ErrorState({ error, title = "加载失败", onRetry, className }
     >
       <p className="text-sm font-semibold text-destructive">{title}</p>
       <p className="text-xs text-foreground">{description.message}</p>
+      {description.nextAction ? (
+        <p className="text-[11px] text-muted-foreground">下一步：{description.nextAction}</p>
+      ) : null}
       <p className="text-[11px] text-muted-foreground">
         {description.code ? <span className="mr-2">{description.code}</span> : null}
         {description.requestId ? <span>请求 ID：{description.requestId}</span> : null}
@@ -70,6 +80,9 @@ export function InlineError({ error, children }: InlineErrorProps) {
   return (
     <p role="alert" className="text-xs text-destructive">
       {description.message}
+      {description.nextAction ? (
+        <span className="ml-2 text-muted-foreground">下一步：{description.nextAction}</span>
+      ) : null}
       {description.requestId ? (
         <span className="ml-2 text-muted-foreground">({description.requestId})</span>
       ) : null}

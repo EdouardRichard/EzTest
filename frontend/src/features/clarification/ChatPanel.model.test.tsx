@@ -171,6 +171,31 @@ describe("ChatPanel vision gating", () => {
     expect(select).toHaveValue("text-only")
   })
 
+  it("blocks send when the image draft is pinned to a non-vision model", async () => {
+    renderChatPanel({
+      conversations: [{ ...conversationFixture, model_override: "text-only" }],
+    })
+
+    const textarea = await screen.findByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请看这张截图" } })
+    const send = screen.getByRole("button", { name: "发送" })
+    expect(send).not.toBeDisabled()
+
+    await uploadDraftImage()
+
+    // The advisory warning is not enough (admin B1): the send itself must be
+    // blocked, with the reason, so no 201 ghost message and no doomed job.
+    await waitFor(() => expect(send).toBeDisabled())
+    expect(screen.getByTestId("composer-send-blocked")).toHaveTextContent(/不支持图片/)
+    fireEvent.click(send)
+    expect(clarificationApi.postMessage).not.toHaveBeenCalled()
+
+    // Removing the image unblocks the same draft.
+    fireEvent.click(screen.getByRole("button", { name: `移除附件 ${IMAGE_NAME}` }))
+    await waitFor(() => expect(send).not.toBeDisabled())
+    expect(screen.queryByTestId("composer-send-blocked")).not.toBeInTheDocument()
+  })
+
   it("does not gate on a text attachment", async () => {
     clarificationApi.uploadContent.mockResolvedValue({
       ...IMAGE_CONTENT,
@@ -214,5 +239,27 @@ describe("DesignChat vision gating", () => {
     fireEvent.click(screen.getByRole("button", { name: `移除附件 ${IMAGE_NAME}` }))
 
     await waitFor(() => expect(textOnlyOption).not.toBeDisabled())
+  })
+
+  it("blocks send for a collapsed image draft pinned to a non-vision model", async () => {
+    // The collapsed design chat hides the model selector; the send gate must
+    // still be enforced from the persisted conversation model.
+    renderDesignChat({
+      collapsed: true,
+      conversations: [{ ...designConversation, model_override: "text-only" }],
+    })
+    expect(screen.queryByTestId("model-selector")).not.toBeInTheDocument()
+
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请看这张设计截图" } })
+    const send = screen.getByRole("button", { name: "发送" })
+    expect(send).not.toBeDisabled()
+
+    await uploadDraftImage()
+
+    await waitFor(() => expect(send).toBeDisabled())
+    expect(screen.getByTestId("composer-send-blocked")).toBeInTheDocument()
+    fireEvent.click(send)
+    expect(clarificationApi.postMessage).not.toHaveBeenCalled()
   })
 })

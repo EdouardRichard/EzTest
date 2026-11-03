@@ -768,7 +768,7 @@ func task6Snapshot(caseVersionID int64, suts ...int64) execution.CaseSnapshot {
 }
 
 func task6Binding(versionID int64, status string, sutIDs ...int64) VersionBinding {
-	binding := VersionBinding{VersionID: versionID, Status: status}
+	binding := VersionBinding{VersionID: versionID, Status: status, Stage: intentExecutableStage}
 	for index, sutID := range sutIDs {
 		binding.SUTs = append(binding.SUTs, VersionSUTBinding{
 			VersionSUTID: sutID, SUTID: sutID + 100, EnvironmentID: sutID + 200,

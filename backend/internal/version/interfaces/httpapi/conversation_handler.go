@@ -28,6 +28,20 @@ type ConversationService interface {
 type ConversationHandler struct {
 	svc    ConversationService
 	design versionapp.DesignStarter
+	stage  ConversationStageReader
+}
+
+// ConversationStageReader is the deterministic stage projection used to keep
+// design actions off a clarifying version (Task 78). *versionapp.StageMachine
+// satisfies it.
+type ConversationStageReader interface {
+	Stage(ctx context.Context, versionID int64) (versionapp.StageView, error)
+}
+
+// SetStageReader wires the stage projection. Without it the handler keeps the
+// P1-only behavior (no stage gate); production always sets it.
+func (h *ConversationHandler) SetStageReader(reader ConversationStageReader) {
+	h.stage = reader
 }
 
 // NewConversationHandler builds the conversation handler. design may be
@@ -89,6 +103,32 @@ func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := decodeBody(w, r, &request); err != nil {
 		httpx.Error(w, r, err)
 		return
+	}
+	// A design action on a clarifying (or otherwise pre-design) version must not
+	// be silently accepted: it would generate cases the stage machine has not
+	// gated yet (Task 78). Requirement confirmation advances the version to
+	// requirement_review, and the explicit requirement gate starts designing.
+	kind := strings.TrimSpace(request.Kind)
+	if kind == string(version.ConversationDesign) && h.stage != nil {
+		stage, err := h.stage.Stage(r.Context(), versionID)
+		if err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+		if !designConversationStageAllowed(stage.Stage) {
+			httpx.Error(w, r, &platform.Error{
+				Status:  http.StatusConflict,
+				Code:    "invalid_stage_for_action",
+				Message: "creating a design conversation requires the designing stage, but the version is at " + string(stage.Stage),
+				Details: map[string]any{
+					"action":         "create_design_conversation",
+					"required_stage": "designing",
+					"current_stage":  string(stage.Stage),
+					"next_action":    "confirm the requirements and apply the requirement gate (start design) first",
+				},
+			})
+			return
+		}
 	}
 	view, err := h.svc.CreateWithModel(r.Context(), versionID, request.Kind, request.Title, request.ModelOverride, actorID)
 	if err != nil {
@@ -221,4 +261,16 @@ func conversationPathIDs(r *http.Request) (int64, int64, error) {
 		return 0, 0, err
 	}
 	return versionID, conversationID, nil
+}
+
+// designConversationStageAllowed reports whether a design conversation may be
+// created at stage. Designing is the product entry; case_review and the later
+// workflow stages keep redesign/modification available.
+func designConversationStageAllowed(stage version.Stage) bool {
+	switch stage {
+	case version.StageDesigning, version.StageCaseReview, version.StageExecuting, version.StageReporting:
+		return true
+	default:
+		return false
+	}
 }

@@ -4,7 +4,7 @@ import { ArrowLeft, Database, FileCode2, Server } from "lucide-react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
-
+import { Alert } from "@/components/ui/Alert"
 import { Badge } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
@@ -18,11 +18,12 @@ import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
 import { DesignTab } from "@/features/design/DesignTab"
+import type { StageView } from "@/features/design/types"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
 import { TodoDrawer } from "@/features/shell/TodoDrawer"
 import { formatDateTime } from "@/lib/format"
 
-import { getVersion } from "./api"
+import { getVersion, getVersionStage } from "./api"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
 import type { Version, VersionBinding, VersionTab } from "./types"
 import { VersionHeader } from "./VersionHeader"
@@ -142,6 +143,18 @@ function VersionOverview({ version }: { version: Version }) {
         />
       </dl>
 
+      {totals.pages === 0 ? (
+        <Alert tone="warning" title="该版本未绑定页面">
+          未绑定页面时，AI 设计拿不到页面清单与 locator，执行也无法导航 SUT。请先在「资源」
+          创建页面/API（或等待探索发现后刷新创建向导），再新建版本并勾选页面/API。
+          <div className="mt-1">
+            <Link href="/resources?tab=pages" className="font-medium underline underline-offset-2">
+              前往资源页创建或确认发现的页面 →
+            </Link>
+          </div>
+        </Alert>
+      ) : null}
+
       <section aria-label="绑定概览" className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-semibold text-foreground">SUT 绑定概览</h2>
@@ -191,6 +204,7 @@ export function VersionDetailPage({
   const router = useRouter()
   const searchParams = useSearchParams()
   const [version, setVersion] = useState<Version | null>(null)
+  const [stage, setStage] = useState<StageView | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [activeTab, setActiveTab] = useState<VersionTab>(() => parseVersionTab(initialTab))
@@ -230,6 +244,19 @@ export function VersionDetailPage({
     }
   }, [versionId])
 
+  /**
+   * Deterministic stage projection refresh (Task 78). It is independent of the
+   * version projection: a stage event may arrive before the version row, and a
+   * failed read clears the badge instead of showing a stale fake stage.
+   */
+  const refreshStage = useCallback(async () => {
+    try {
+      setStage(await getVersionStage(versionId))
+    } catch {
+      setStage(null)
+    }
+  }, [versionId])
+
   // Tab counts come from the real list projections; a failed/missing query
   // leaves the count absent instead of rendering a misleading zero (spec §9.1).
   const refreshCounts = useCallback(async () => {
@@ -251,6 +278,10 @@ export function VersionDetailPage({
   useEffect(() => {
     void load()
   }, [load])
+
+  useEffect(() => {
+    void refreshStage()
+  }, [refreshStage])
 
   useEffect(() => {
     setActiveTab(parseVersionTab(initialTab))
@@ -288,6 +319,11 @@ export function VersionDetailPage({
   const refreshVersionAndCounts = useCallback(() => scheduleRefresh(true), [scheduleRefresh])
   const refreshCountsOnly = useCallback(() => scheduleRefresh(false), [scheduleRefresh])
 
+  const refreshVersionAndStage = useCallback(() => {
+    refreshVersionAndCounts()
+    void refreshStage()
+  }, [refreshVersionAndCounts, refreshStage])
+
   const refreshSnapshotNow = useCallback(() => {
     if (refreshTimer.current !== null) {
       clearTimeout(refreshTimer.current)
@@ -307,11 +343,14 @@ export function VersionDetailPage({
   // One page-level subscription keeps the header projection and the tab counts
   // live while the mounted tab owns its own workspace subscription.
   useVersionEvents(versionId, {
-    onVersionChanged: refreshVersionAndCounts,
-    onRequirementChanged: refreshVersionAndCounts,
+    onVersionChanged: refreshVersionAndStage,
+    onRequirementChanged: refreshVersionAndStage,
     onIssueChanged: refreshCountsOnly,
     onReportChanged: refreshCountsOnly,
-    onStreamReset: refreshSnapshotNow,
+    onStreamReset: () => {
+      refreshSnapshotNow()
+      void refreshStage()
+    },
   })
 
   const tabItems = useMemo(
@@ -413,6 +452,7 @@ export function VersionDetailPage({
 
       <VersionHeader
         version={version}
+        stage={stage}
         onOpenTodo={() => setTodoOpen(true)}
         onReopened={(next) => setVersion(next)}
       />
@@ -429,12 +469,20 @@ export function VersionDetailPage({
       ) : activeTab === "requirements" ? (
         <RequirementsTab
           versionId={versionId}
+          stage={stage?.stage ?? null}
+          onStageChanged={() => {
+            void refreshStage()
+          }}
           initialConversationId={initialConversationId}
           initialRequirementId={initialRequirementId}
         />
       ) : activeTab === "design" ? (
         <DesignTab
           versionId={versionId}
+          stage={stage?.stage ?? null}
+          onStageChanged={() => {
+            void refreshStage()
+          }}
           initialCaseId={designCaseId}
           initialConversationId={designConversationId}
         />

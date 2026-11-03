@@ -11,6 +11,7 @@ import { FloatingPanel } from "@/components/ui/FloatingPanel"
 import { LoadingCard, Spinner } from "@/components/ui/Spinner"
 import type { ConversationModel } from "@/features/conversation/api"
 import { ModelSelector } from "@/features/conversation/ModelSelector"
+import { useVisionGate, VISION_SEND_BLOCKED_MESSAGE } from "@/features/conversation/useVisionGate"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -82,6 +83,14 @@ export function ChatPanel({
   })
 
   const active = conversations.find((conversation) => conversation.id === conversationId)
+  // Task 75: an image draft pinned to a non-vision model blocks Send before it
+  // can create a 201 ghost message and a doomed chat.turn/requirement.curate
+  // job. The model selector keeps warning; the composer owns the action gate.
+  const visionGate = useVisionGate({
+    conversationId,
+    modelOverride: active?.model_override ?? null,
+    draftHasImages,
+  })
 
   return (
     <FloatingPanel
@@ -253,6 +262,7 @@ export function ChatPanel({
               onSend={send}
               error={sendError ?? undefined}
               onDraftHasImagesChange={setDraftHasImages}
+              sendBlockedReason={visionGate.blocked ? VISION_SEND_BLOCKED_MESSAGE : undefined}
             />
           </>
         )}

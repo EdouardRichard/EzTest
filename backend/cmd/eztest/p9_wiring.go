@@ -98,6 +98,9 @@ type p9RuntimeDeps struct {
 	ExecutorURL   string
 	ExecutorToken string
 	Now           func() time.Time
+	// Resources is the resource-catalog write surface discovery proposes
+	// pages/APIs into (task 76). Optional: nil keeps discovery fact-only.
+	Resources p9ResourceProposalService
 }
 
 // p9Runtime is the constructed explore runtime. Sessions is exposed so a
@@ -158,6 +161,13 @@ func newP9Runtime(deps p9RuntimeDeps) (*p9Runtime, error) {
 	if designer, ok := deps.Design.(p9AugmentedDraftDesigner); ok {
 		draftWriter = newP9DraftCaseWriter(designer, deps.Versions)
 	}
+	// Discovery → resource catalog: every discovered page/API is proposed into
+	// the bound environment, so the version wizard can list and bind it.
+	// Without a resource service the analysis stays fact-only (degraded boot).
+	var resourceWriter exploreapp.ResourceProposalWriter
+	if deps.Resources != nil {
+		resourceWriter = p9ResourceProposals{resources: deps.Resources}
+	}
 	analysis, err := newP9Analysis(p9AnalysisDeps{
 		Runtime:      wiring,
 		Executor:     executor,
@@ -165,6 +175,7 @@ func newP9Runtime(deps p9RuntimeDeps) (*p9Runtime, error) {
 		Pages:        executor,
 		Facts:        facts,
 		Recorder:     facts,
+		Resources:    resourceWriter,
 		Requirements: &p9RequirementSource{requirements: deps.Requirements, versions: deps.Versions},
 		Cases:        &p9CaseSource{graph: deps.Design, versions: deps.Versions},
 		Roles:        &p9RoleSource{versions: deps.Versions},
@@ -195,11 +206,15 @@ type p9AnalysisDeps struct {
 	// Executor/Sources are optional: without Executor the page crawl is skipped,
 	// without Sources the static API scan is skipped, and the analysis keeps its
 	// static/probe behavior.
-	Executor     exploreapp.Executor
-	Sources      exploreapp.SourceProvider
-	Pages        exploreapp.PageCloser
-	Facts        exploreapp.FactReader
-	Recorder     exploreapp.FactRecorder
+	Executor exploreapp.Executor
+	Sources  exploreapp.SourceProvider
+	Pages    exploreapp.PageCloser
+	Facts    exploreapp.FactReader
+	Recorder exploreapp.FactRecorder
+	// Resources proposes discovered pages/APIs into the resource catalog. It is
+	// optional: without it a version stays at "0 pages / 0 APIs" even after a
+	// successful discovery.
+	Resources    exploreapp.ResourceProposalWriter
 	Requirements exploreapp.RequirementSource
 	Cases        exploreapp.CaseSource
 	Roles        exploreapp.RoleSource
@@ -354,6 +369,11 @@ type p9AnalysisResult struct {
 	LoginStatus     string
 	DiscoveredPages int
 	DiscoveredAPIs  int
+	// ProposedPages/ProposedAPIs count the discovered rows written to the
+	// resource catalog as proposed (task 76). Discovery stays fact-only when no
+	// resource writer is wired.
+	ProposedPages int
+	ProposedAPIs  int
 }
 
 // currentTime returns the analysis clock, defaulting to the wall clock when a
@@ -764,12 +784,18 @@ func (a *p9Analysis) discover(ctx context.Context, versionID int64, binding p9Lo
 				Executor:   a.deps.Executor,
 				Facts:      a.deps.Recorder,
 				PageCloser: a.deps.Pages,
+				Resources:  a.deps.Resources,
 			})
 			pageResult, err := discovery.Run(ctx, versionID)
 			if err != nil {
 				a.logf("eztest: P9 explore analysis version=%d page discovery failed: %v", versionID, err)
 			} else {
 				result.DiscoveredPages = len(pageResult.Pages)
+				result.ProposedPages = pageResult.ProposedResources
+				if pageResult.ResourceErrors > 0 {
+					a.logf("eztest: P9 explore analysis version=%d page resource proposals partial: proposed=%d failed=%d error=%s",
+						versionID, pageResult.ProposedResources, pageResult.ResourceErrors, pageResult.ResourceError)
+				}
 				// A result page id only appears when discovery had no PageCloser;
 				// release it here so a degraded assembly cannot leak the page.
 				if pageID := strings.TrimSpace(pageResult.PageID); pageID != "" && a.deps.Pages != nil {
@@ -783,8 +809,9 @@ func (a *p9Analysis) discover(ctx context.Context, versionID int64, binding p9Lo
 			VersionSUTID:  binding.versionSUTID,
 			EnvironmentID: binding.environmentID,
 		}, exploreapp.APIDiscoveryDeps{
-			Sources: a.deps.Sources,
-			Facts:   a.deps.Recorder,
+			Sources:   a.deps.Sources,
+			Facts:     a.deps.Recorder,
+			Resources: a.deps.Resources,
 		})
 		apiResult, err := discovery.Run(ctx, versionID)
 		if err != nil {
@@ -792,6 +819,11 @@ func (a *p9Analysis) discover(ctx context.Context, versionID int64, binding p9Lo
 			return
 		}
 		result.DiscoveredAPIs = len(apiResult.APIs)
+		result.ProposedAPIs = apiResult.ProposedResources
+		if apiResult.ResourceErrors > 0 {
+			a.logf("eztest: P9 explore analysis version=%d api resource proposals partial: proposed=%d failed=%d error=%s",
+				versionID, apiResult.ProposedResources, apiResult.ResourceErrors, apiResult.ResourceError)
+		}
 	}
 }
 

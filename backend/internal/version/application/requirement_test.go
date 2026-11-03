@@ -195,6 +195,17 @@ func (f *fakeRequirementRepo) ListRelations(_ context.Context, versionID, requir
 	return relations, nil
 }
 
+func (f *fakeRequirementRepo) SetStatus(_ context.Context, versionID, requirementID int64, status version.RequirementStatus, updatedAt time.Time) error {
+	requirement, ok := f.requirements[requirementID]
+	if !ok || requirement.VersionID != versionID {
+		return version.ErrRequirementNotFound
+	}
+	requirement.Status = status
+	requirement.UpdatedAt = updatedAt
+	f.requirements[requirementID] = requirement
+	return nil
+}
+
 func (f *fakeRequirementRepo) currentVersion(requirement version.Requirement) (version.RequirementVersion, bool) {
 	if requirement.CurrentVersionID == nil {
 		return version.RequirementVersion{}, false
@@ -1008,7 +1019,155 @@ func TestRequirementGetDetailIncludesHistoryRelationsAndAttachments(t *testing.T
 	}
 }
 
+// requirementDraftWithContent builds one distinct draft; Dedupe groups by
+// normalized title or by identical description+acceptance text.
+func requirementDraftWithContent(env *requirementEnv, title, description, acceptance string) versionapp.RequirementDraft {
+	draft := validRequirementDraft(env)
+	draft.Title = title
+	draft.Description = description
+	draft.AcceptanceCriteria = acceptance
+	return draft
+}
+
+// TestRequirementDedup pins the product-owner "10 duplicate drafts with no
+// delete/merge" finding: duplicate drafts can be collapsed deterministically
+// (one survivor per duplicate group) and a draft can be deleted instead of
+// lingering forever.
+func TestRequirementDedup(t *testing.T) {
+	env := newRequirementEnv(t)
+
+	keepA, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Checkout supports coupons", "Users apply a coupon at checkout.", "A valid coupon reduces the total."), 42)
+	if err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	duplicateTitle, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "  Checkout supports coupons  ", "Refined description of the same requirement.", "The total is recalculated after the coupon."), 42)
+	if err != nil {
+		t.Fatalf("Create same-title duplicate: %v", err)
+	}
+	keepC, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Coupon checkout", "Coupon checkout description.", "Coupon checkout acceptance."), 42)
+	if err != nil {
+		t.Fatalf("Create C: %v", err)
+	}
+	duplicateContent, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Coupon checkout (refined)", "Coupon checkout description.", "Coupon checkout acceptance."), 42)
+	if err != nil {
+		t.Fatalf("Create same-content duplicate: %v", err)
+	}
+	unique, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Refund flow", "Refund flow description.", "Refund flow acceptance."), 42)
+	if err != nil {
+		t.Fatalf("Create unique: %v", err)
+	}
+
+	result, err := env.svc.Dedupe(requestContext(), env.versionID, 42)
+	if err != nil {
+		t.Fatalf("Dedupe: %v", err)
+	}
+	if !containsID(result.ObsoleteIDs, duplicateTitle.ID) || !containsID(result.ObsoleteIDs, duplicateContent.ID) {
+		t.Fatalf("obsolete ids = %v, want the title/content duplicates", result.ObsoleteIDs)
+	}
+	for _, kept := range []int64{keepA.ID, keepC.ID, unique.ID} {
+		if !containsID(result.KeptIDs, kept) {
+			t.Fatalf("kept ids = %v, want %d retained", result.KeptIDs, kept)
+		}
+	}
+	for _, obsolete := range []int64{duplicateTitle.ID, duplicateContent.ID} {
+		stored := env.repo.requirements[obsolete]
+		if stored.Status != version.RequirementObsolete {
+			t.Fatalf("requirement %d status = %q, want obsolete", obsolete, stored.Status)
+		}
+	}
+	for _, kept := range []int64{keepA.ID, keepC.ID, unique.ID} {
+		if stored := env.repo.requirements[kept]; stored.Status != version.RequirementDraft {
+			t.Fatalf("requirement %d status = %q, want draft", kept, stored.Status)
+		}
+	}
+	if len(env.repo.versions[keepA.ID]) != 1 {
+		t.Fatal("dedupe must not add a revision to the survivor")
+	}
+
+	t.Run("Delete", func(t *testing.T) {
+		deletable := createRequirement(t, env, "Delete me")
+		deleted, err := env.svc.Delete(requestContext(), env.versionID, deletable.ID, "duplicate scope", 42)
+		if err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if deleted.Status != string(version.RequirementObsolete) {
+			t.Fatalf("deleted status = %q", deleted.Status)
+		}
+		if stored := env.repo.requirements[deletable.ID]; stored.Status != version.RequirementObsolete {
+			t.Fatalf("stored status = %q", stored.Status)
+		}
+		if _, _, err := env.svc.List(requestContext(), env.versionID, string(version.RequirementDraft), 10, nil); err != nil {
+			t.Fatalf("List drafts: %v", err)
+		}
+		// Deleting an already obsolete draft is idempotent.
+		if again, err := env.svc.Delete(requestContext(), env.versionID, deletable.ID, "", 42); err != nil || again.Status != string(version.RequirementObsolete) {
+			t.Fatalf("second Delete = %#v, %v", again, err)
+		}
+
+		clarified := createRequirement(t, env, "Clarified delete")
+		if _, err := env.svc.Confirm(requestContext(), env.versionID, clarified.ID, 42); err != nil {
+			t.Fatalf("Confirm: %v", err)
+		}
+		if _, err := env.svc.Delete(requestContext(), env.versionID, clarified.ID, "", 42); err == nil {
+			t.Fatal("deleting a clarified requirement must be rejected")
+		} else if apiError(t, err).Code != "state_conflict" {
+			t.Fatalf("code = %q", apiError(t, err).Code)
+		}
+		if stored := env.repo.requirements[clarified.ID]; stored.Status != version.RequirementClarified {
+			t.Fatalf("clarified requirement changed after a rejected delete: %q", stored.Status)
+		}
+	})
+
+	t.Run("Merge", func(t *testing.T) {
+		target, err := env.svc.Create(requestContext(), env.versionID,
+			requirementDraftWithContent(env, "Author can publish", "Author publishes an article.", "The article is publicly visible."), 42)
+		if err != nil {
+			t.Fatalf("Create target: %v", err)
+		}
+		source, err := env.svc.Create(requestContext(), env.versionID,
+			requirementDraftWithContent(env, "Author can publish articles", "Author publishes an article.", "The public list shows it."), 42)
+		if err != nil {
+			t.Fatalf("Create source: %v", err)
+		}
+		merged, err := env.svc.Merge(requestContext(), env.versionID, target.ID, []int64{source.ID}, 42)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		if merged.Requirement.ID != target.ID || !containsID(merged.MergedIDs, source.ID) {
+			t.Fatalf("merge result = %#v", merged)
+		}
+		if merged.Requirement.Revision != 2 {
+			t.Fatalf("target revision = %d, want 2 with the merged acceptance text", merged.Requirement.Revision)
+		}
+		if !strings.Contains(merged.Requirement.CurrentVersion.AcceptanceCriteria, "publicly visible") ||
+			!strings.Contains(merged.Requirement.CurrentVersion.AcceptanceCriteria, "public list shows it") {
+			t.Fatalf("merged acceptance = %q", merged.Requirement.CurrentVersion.AcceptanceCriteria)
+		}
+		if stored := env.repo.requirements[source.ID]; stored.Status != version.RequirementObsolete {
+			t.Fatalf("source status = %q, want obsolete", stored.Status)
+		}
+		if _, err := env.svc.Merge(requestContext(), env.versionID, target.ID, []int64{source.ID}, 42); err == nil {
+			t.Fatal("merging an obsolete source must be rejected")
+		}
+	})
+}
+
 // keep imports used while iterating
 var _ = errors.Is
 var _ = platform.Invalid
 var _ = time.Time{}
+
+// containsID reports whether ids holds target.
+func containsID(ids []int64, target int64) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}

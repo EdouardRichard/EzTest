@@ -138,6 +138,9 @@ const designHostPrompt = `你是 EzTest 的设计 Host（用例脑图助手）�
 角色边界：
 - 只解释、提问与修改脑图；不确认用例、不删除、不关闭版本或需求。
 - AI 只能提交 draft/候选：场景与用例草案通过 case.graph_propose 写入，等待用户在脑图中确认。
+- 收到修改请求时：先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改；不要只回复修改计划、不要等待用户二次授权。
+- 每条步骤与断言的 expected 必须写成可观察结果，不得留空；修改时保留未变更内容并补齐空 expected。
+- 场景名用需求标题原文、用例标题用对应验收要点原文；页面/API 来源只能引用版本已绑定的 page/api ID，未绑定时只用 requirement/knowledge 来源，不要编造 page/api 来源或 ref_id。
 - 不声称已完成确认；用户要求确认时提示其使用脑图节点上的确认按钮。
 - 设计对话支持附件；可读取附件文本作为设计依据。
 回答使用简洁中文，聚焦用例覆盖与可执行性。
@@ -149,6 +152,8 @@ const designPlannerPrompt = `你是 EzTest 的设计 Planner（设计轮次执�
 - 只提交 draft/候选：不能确认、删除、关闭用例或需求；确认只属于用户。
 - 场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建。
 - 先做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实；来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id。
+- 每条步骤与断言都必须有可观察的 expected，不得留空。
+- 页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时不要填 page/api 来源，改用 requirement/knowledge 来源，不要编造 ref_id。
 - 用例必须包含可执行步骤、断言、来源与目标 version_sut；页面/接口发现事实可作为 knowledge/page/api 来源。
 - 范围以服务端 Planner 扫描结果为准，不编造未激活需求；不编造需求未表达的内容。
 提交后用简洁中文说明新增/更新的场景与用例数量。
@@ -236,8 +241,11 @@ func P2Profiles() []agent.AgentProfile {
 			Name:         "设计 Host",
 			SystemPrompt: designHostPrompt,
 			AllowedTools: append([]string(nil), designHostTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
-			Enabled:      true,
+			// The Host edits existing cases through a full case.graph_read +
+			// case.graph_propose round trip inside one thread; the chat-scale
+			// budget settled before the write in the final S4 run.
+			Budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
+			Enabled: true,
 		},
 		{
 			Key:          ProfileKeyDesignPlanner,
@@ -247,7 +255,7 @@ func P2Profiles() []agent.AgentProfile {
 			// The round now proposes the case draft itself (Task 69): one graph
 			// read plus one graph_propose per activated requirement needs more
 			// turns/seconds than the frozen scope-narration budget.
-			Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+			Budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			Enabled: true,
 		},
 		{

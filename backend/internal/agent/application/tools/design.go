@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
@@ -31,6 +33,12 @@ const (
 	maxCaseAssertions    = 50
 	maxCaseSources       = 20
 )
+
+// maxGraphConvergeRetries bounds the server-side re-read/retry loop. A stale
+// base_graph_hash is a concurrency condition the tool can repair deterministically
+// by reading the current hash; spending the model's remaining budget on another
+// read+propose turn is what made the S4 modification fail.
+const maxGraphConvergeRetries = 2
 
 var graphHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -154,6 +162,10 @@ type graphProposalPayload struct {
 	BaseGraphHash        *string           `json:"base_graph_hash"`
 	Scenarios            []scenarioPayload `json:"scenarios"`
 	Cases                []casePayload     `json:"cases"`
+	// Sources is the proposal-level default provenance. The schema accepts it
+	// because models legitimately attach the requirement/knowledge sources once
+	// for the whole batch; each case inherits it unless it declares its own.
+	Sources []sourcePayload `json:"sources"`
 }
 
 type scenarioPayload struct {
@@ -295,7 +307,7 @@ type caseGraphPropose struct{ deps Deps }
 func (t *caseGraphPropose) Name() string { return ToolCaseGraphPropose }
 
 func (t *caseGraphPropose) Description() string {
-	return "提交场景/用例草案（case.graph_propose）。只能创建或更新 draft；不能确认、删除或用例状态变更。scenarios[].id/cases[].id 更新已有节点时传入，新建时省略。sources.kind=requirement 时 ref_id 必须是 requirement_version_id（当前需求版本 ID），不是 requirement_id。"
+	return "提交场景/用例草案（case.graph_propose）。只能创建或更新 draft；不能确认、删除或用例状态变更。scenarios[].id/cases[].id 更新已有节点时传入，新建时省略。sources 放在每个 case 内；也可在顶层传一份作为所有用例的默认来源。sources.kind=requirement 时 ref_id 必须是 requirement_version_id（当前需求版本 ID），不是 requirement_id。每条步骤与断言都必须有非空的 expected（可观察的成功判据）。"
 }
 
 func (t *caseGraphPropose) Parameters() json.RawMessage {
@@ -314,11 +326,71 @@ func (t *caseGraphPropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 	if err != nil {
 		return nil, err
 	}
-	result, portErr := t.deps.Design.ProposeGraph(ctx, scope.VersionID, proposal, 0, scope.AgentRunID)
+	var (
+		result  any
+		portErr error
+	)
+	for attempt := 0; attempt <= maxGraphConvergeRetries; attempt++ {
+		result, portErr = t.deps.Design.ProposeGraph(ctx, scope.VersionID, proposal, 0, scope.AgentRunID)
+		if portErr == nil || attempt == maxGraphConvergeRetries || !isGraphChangedConflict(portErr) {
+			break
+		}
+		// Re-read the graph and retry with the fresh hash inside the same tool
+		// call, instead of returning a conflict the model must fix by spending
+		// another turn (the final S4 modification ran out of budget there).
+		freshHash, readErr := t.readGraphHash(ctx, scope.VersionID, proposal.RequirementID)
+		if readErr != nil || freshHash == "" || freshHash == proposal.BaseGraphHash {
+			break
+		}
+		proposal.BaseGraphHash = freshHash
+	}
 	if portErr != nil {
 		return nil, mapPortError(portErr)
 	}
 	return result, nil
+}
+
+// readGraphHash reads the current design graph and returns its hash.
+func (t *caseGraphPropose) readGraphHash(ctx context.Context, versionID, requirementID int64) (string, error) {
+	result, err := t.deps.Design.ReadGraph(ctx, versionID, requirementID, 0)
+	if err != nil {
+		return "", err
+	}
+	return graphHashFromRead(result), nil
+}
+
+// graphHashFromRead extracts the graph hash from the design adapter payload.
+func graphHashFromRead(result any) string {
+	if object, ok := result.(map[string]any); ok {
+		hash, _ := object["graph_hash"].(string)
+		return strings.TrimSpace(hash)
+	}
+	if result == nil {
+		return ""
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	var payload struct {
+		GraphHash string `json:"graph_hash"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.GraphHash)
+}
+
+// isGraphChangedConflict reports the optimistic-lock conflict the tool can
+// repair by re-reading; other state conflicts (stale requirement version,
+// requirement not clarified) need a different action.
+func isGraphChangedConflict(err error) bool {
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Status == 409 && apiErr.Code == "state_conflict" &&
+			strings.Contains(apiErr.Message, "design graph changed")
+	}
+	return false
 }
 
 type designReviewSubmit struct{ deps Deps }
@@ -543,6 +615,10 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 	if len(payload.Cases) > maxProposalCases {
 		return GraphProposal{}, Invalid("cases", fmt.Sprintf("must contain at most %d cases per proposal", maxProposalCases))
 	}
+	topLevelSources, sourceErr := parseSources("sources", payload.Sources, requirementID, requirementVersionID)
+	if sourceErr != nil {
+		return GraphProposal{}, sourceErr
+	}
 	caseRefs := make(map[string]struct{}, len(payload.Cases))
 	for index, item := range payload.Cases {
 		field := func(name string) string { return fmt.Sprintf("cases[%d].%s", index, name) }
@@ -628,7 +704,7 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 				return GraphProposal{}, err
 			}
 			expected := stringValueOr(step.Expected, "")
-			if err := validateText(stepField("expected"), expected, 0, 20000); err != nil {
+			if err := validateText(stepField("expected"), expected, 1, 20000); err != nil {
 				return GraphProposal{}, err
 			}
 			targetSUT, err := parseOptionalID(stepField("target_version_sut_id"), step.TargetVersionSUTID)
@@ -685,7 +761,7 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 				return GraphProposal{}, err
 			}
 			expected := stringValueOr(assertion.Expected, "")
-			if err := validateText(assertionField("expected"), expected, 0, 2000); err != nil {
+			if err := validateText(assertionField("expected"), expected, 1, 2000); err != nil {
 				return GraphProposal{}, err
 			}
 			targetSUT, err := parseOptionalID(assertionField("target_version_sut_id"), assertion.TargetVersionSUTID)
@@ -715,40 +791,12 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 		if len(item.Sources) > maxCaseSources {
 			return GraphProposal{}, Invalid(field("sources"), fmt.Sprintf("must contain at most %d sources", maxCaseSources))
 		}
-		sources := make([]SourceProposal, 0, len(item.Sources))
-		for sourceIndex, source := range item.Sources {
-			sourceField := func(name string) string {
-				return fmt.Sprintf("cases[%d].sources[%d].%s", index, sourceIndex, name)
-			}
-			switch source.Kind {
-			case "requirement", "code", "page", "api", "knowledge":
-			default:
-				return GraphProposal{}, Invalid(sourceField("kind"), "must be one of requirement, code, page, api, knowledge")
-			}
-			if err := validateText(sourceField("ref_id"), source.RefID, 1, 200); err != nil {
-				return GraphProposal{}, err
-			}
-			// A requirement source is an immutable provenance reference, so it
-			// must be the requirement version. A model that cites the
-			// requirement id it was scoped with is unambiguous: resolve exactly
-			// that reference to the proposal's current requirement version.
-			// Any other ID is left untouched and validated by the design
-			// context.
-			refID := source.RefID
-			if source.Kind == "requirement" && refID == fmt.Sprintf("%d", requirementID) {
-				refID = fmt.Sprintf("%d", requirementVersionID)
-			}
-			path := stringValueOr(source.Path, "")
-			if err := validateText(sourceField("path"), path, 0, 1000); err != nil {
-				return GraphProposal{}, err
-			}
-			if source.Line != nil && *source.Line < 0 {
-				return GraphProposal{}, Invalid(sourceField("line"), "must be zero or positive")
-			}
-			sources = append(sources, SourceProposal{
-				Kind: source.Kind, RefID: refID, Path: path, Line: source.Line,
-				SHA: stringValueOr(source.SHA, ""),
-			})
+		caseSources, sourceErr := parseSources(field("sources"), item.Sources, requirementID, requirementVersionID)
+		if sourceErr != nil {
+			return GraphProposal{}, sourceErr
+		}
+		if len(caseSources) == 0 && len(topLevelSources) > 0 {
+			caseSources = append([]SourceProposal(nil), topLevelSources...)
 		}
 
 		proposal.Cases = append(proposal.Cases, CaseProposal{
@@ -756,10 +804,50 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 			Description: description, Preconditions: preconditions, TestData: testData,
 			Priority: priority, DefaultVersionSUTID: defaultSUT,
 			VersionSUTIDs: versionSUTs, PageIDs: pageIDs, APIIDs: apiIDs,
-			Steps: steps, Assertions: assertions, Sources: sources,
+			Steps: steps, Assertions: assertions, Sources: caseSources,
 		})
 	}
 	return proposal, nil
+}
+
+// parseSources validates one provenance list (case-level or proposal-level) and
+// resolves an unambiguous requirement-id citation to the requirement version.
+func parseSources(fieldPrefix string, raw []sourcePayload, requirementID, requirementVersionID int64) ([]SourceProposal, *Error) {
+	sources := make([]SourceProposal, 0, len(raw))
+	for sourceIndex, source := range raw {
+		sourceField := func(name string) string {
+			return fmt.Sprintf("%s[%d].%s", fieldPrefix, sourceIndex, name)
+		}
+		switch source.Kind {
+		case "requirement", "code", "page", "api", "knowledge":
+		default:
+			return nil, Invalid(sourceField("kind"), "must be one of requirement, code, page, api, knowledge")
+		}
+		if err := validateText(sourceField("ref_id"), source.RefID, 1, 200); err != nil {
+			return nil, err
+		}
+		// A requirement source is an immutable provenance reference, so it
+		// must be the requirement version. A model that cites the requirement
+		// id it was scoped with is unambiguous: resolve exactly that reference
+		// to the proposal's current requirement version. Any other ID is left
+		// untouched and validated by the design context.
+		refID := source.RefID
+		if source.Kind == "requirement" && refID == fmt.Sprintf("%d", requirementID) {
+			refID = fmt.Sprintf("%d", requirementVersionID)
+		}
+		path := stringValueOr(source.Path, "")
+		if err := validateText(sourceField("path"), path, 0, 1000); err != nil {
+			return nil, err
+		}
+		if source.Line != nil && *source.Line < 0 {
+			return nil, Invalid(sourceField("line"), "must be zero or positive")
+		}
+		sources = append(sources, SourceProposal{
+			Kind: source.Kind, RefID: refID, Path: path, Line: source.Line,
+			SHA: stringValueOr(source.SHA, ""),
+		})
+	}
+	return sources, nil
 }
 
 func parseRequiredID(field, raw string) (int64, *Error) {
@@ -837,22 +925,22 @@ func graphProposeSchema() json.RawMessage {
 	stepSchema := schemaObject(map[string]any{
 		"seq":                   map[string]any{"type": "integer", "minimum": 1},
 		"action":                map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
-		"expected":              map[string]any{"type": "string", "maxLength": 20000},
+		"expected":              map[string]any{"type": "string", "minLength": 1, "maxLength": 20000, "description": "observable success outcome; required and must not be empty"},
 		"target_version_sut_id": idStringSchema(),
 		"target_page_id":        idStringSchema(),
 		"target_api_id":         idStringSchema(),
 		"account_role":          map[string]any{"type": "string", "maxLength": 200},
 		"data":                  map[string]any{"type": "object", "additionalProperties": true},
-	}, "seq", "action")
+	}, "seq", "action", "expected")
 	assertionSchema := schemaObject(map[string]any{
 		"step_seq":              map[string]any{"type": "integer", "minimum": 1},
 		"kind":                  map[string]any{"type": "string", "enum": []any{"ui", "api", "db", "text", "visual"}},
 		"target":                map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
-		"expected":              map[string]any{"type": "string", "maxLength": 2000},
+		"expected":              map[string]any{"type": "string", "minLength": 1, "maxLength": 2000, "description": "observable success criterion; required and must not be empty"},
 		"target_version_sut_id": idStringSchema(),
 		"target_api_id":         idStringSchema(),
 		"database_id":           idStringSchema(),
-	}, "step_seq", "kind", "target")
+	}, "step_seq", "kind", "target", "expected")
 	sourceSchema := schemaObject(map[string]any{
 		"kind":   map[string]any{"type": "string", "enum": []any{"requirement", "code", "page", "api", "knowledge"}},
 		"ref_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 200, "description": "requirement sources reference the current requirement_version_id; page/api sources reference the version page/api id"},
@@ -893,5 +981,6 @@ func graphProposeSchema() json.RawMessage {
 		"base_graph_hash":        map[string]any{"type": "string", "pattern": `^[0-9a-f]{64}$`},
 		"scenarios":              map[string]any{"type": "array", "minItems": 1, "maxItems": maxProposalScenarios, "items": scenarioSchema},
 		"cases":                  map[string]any{"type": "array", "minItems": 1, "maxItems": maxProposalCases, "items": caseSchema},
+		"sources":                map[string]any{"type": "array", "maxItems": maxCaseSources, "items": sourceSchema, "description": "default provenance for every case that does not declare its own sources"},
 	}, "requirement_id", "requirement_version_id", "scenarios", "cases")
 }

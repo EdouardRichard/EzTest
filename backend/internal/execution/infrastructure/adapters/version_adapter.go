@@ -34,6 +34,12 @@ type VersionReopener interface {
 	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
 }
 
+// VersionStageReader is the deterministic stage-machine projection consumed by
+// the execution intent gate (Task 78). *versionapp.StageMachine satisfies it.
+type VersionStageReader interface {
+	Stage(ctx context.Context, versionID int64) (versionapp.StageView, error)
+}
+
 // versionReopenTriggerExecutionIntent is the stable P4 reopen trigger owned by
 // the execution intent path (spec §7.5).
 const versionReopenTriggerExecutionIntent = "execution_intent"
@@ -43,6 +49,7 @@ const versionReopenTriggerExecutionIntent = "execution_intent"
 type VersionAdapter struct {
 	versions VersionService
 	reopener VersionReopener
+	stages   VersionStageReader
 }
 
 // NewVersionAdapter wires the version adapter. SetVersionReopener must be called
@@ -54,6 +61,14 @@ func NewVersionAdapter(versions VersionService) *VersionAdapter {
 // SetVersionReopener wires the P4 reopen service (wiring-time only).
 func (a *VersionAdapter) SetVersionReopener(reopener VersionReopener) {
 	a.reopener = reopener
+}
+
+// SetStageReader wires the deterministic version-stage projection. The
+// execution intent gate refuses to create initial intents unless the version is
+// executing, so production must set it; a nil reader leaves the stage empty,
+// which fails closed (never auto-executes).
+func (a *VersionAdapter) SetStageReader(reader VersionStageReader) {
+	a.stages = reader
 }
 
 var (
@@ -72,6 +87,13 @@ func (a *VersionAdapter) Get(ctx context.Context, id int64) (executionapp.Versio
 		VersionID: view.ID,
 		Status:    view.Status,
 		SUTs:      make([]executionapp.VersionSUTBinding, 0, len(view.Bindings)),
+	}
+	if a.stages != nil {
+		stage, stageErr := a.stages.Stage(ctx, id)
+		if stageErr != nil {
+			return executionapp.VersionBinding{}, stageErr
+		}
+		binding.Stage = string(stage.Stage)
 	}
 	for _, item := range view.Bindings {
 		sutBinding, mapErr := mapVersionBinding(item)

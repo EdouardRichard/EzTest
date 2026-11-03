@@ -178,6 +178,11 @@ type RequirementRepository interface {
 	BatchConfirm(ctx context.Context, requirements []Requirement, confirmations []Confirmation) error
 	CreateRelation(ctx context.Context, relation Relation) error
 	ListRelations(ctx context.Context, versionID, requirementID int64) ([]Relation, error)
+	// SetStatus projects a lifecycle status change that does not add a revision
+	// (duplicate-draft deletion / merge retirement). Implementations must not
+	// rewrite content and must report ErrRequirementNotFound for a foreign or
+	// missing requirement.
+	SetStatus(ctx context.Context, versionID, requirementID int64, status RequirementStatus, updatedAt time.Time) error
 }
 
 // CanTransitionRequirement reports whether the requirement state machine allows

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -16,6 +17,12 @@ import (
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
+// CodeLLMCapabilityMismatch is the stable, non-retryable code returned when the
+// effective conversation model cannot serve a draft (an image without vision,
+// Task 75). It mirrors the LLM application's code; the version context must not
+// import the LLM context (Agent.md §6.9.7).
+const CodeLLMCapabilityMismatch = "llm_capability_mismatch"
+
 // ConversationService implements clarification conversations, message
 // posting and the thread summary. Task enqueue and attachment registration are
 // best-effort side effects; the reconciler is the fallback.
@@ -25,6 +32,7 @@ type ConversationService struct {
 	attachments MessageAttachmentRegistrar
 	versions    VersionReader
 	models      ConversationModelCatalog
+	clarified   ClarifiedRequirementCounter
 	ids         platformid.Generator
 	clock       clock.Clock
 	events      eventingapp.Publisher
@@ -54,6 +62,13 @@ func (s *ConversationService) SetModelCatalog(catalog ConversationModelCatalog) 
 	s.models = catalog
 }
 
+// SetClarifiedRequirementCounter wires the clarified-requirement gate of design
+// conversations. A nil counter keeps conversation creation working in degraded
+// assemblies and unit tests.
+func (s *ConversationService) SetClarifiedRequirementCounter(counter ClarifiedRequirementCounter) {
+	s.clarified = counter
+}
+
 // Create creates a clarification or design conversation and ensures the
 // opening chat task. Creating an empty conversation does not project the
 // version to running.
@@ -78,6 +93,20 @@ func (s *ConversationService) CreateWithModel(ctx context.Context, versionID int
 	}
 	if err := version.ValidateConversationKind(kind); err != nil {
 		return ConversationView{}, err
+	}
+	// A design conversation is only meaningful when at least one requirement is
+	// clarified. The empty-state warning was not enough: the "new conversation"
+	// action still created a round, queued AI work and burned a model run before
+	// the agent refused. Fail with a typed conflict instead (Task 77).
+	if kind == version.ConversationDesign && s.clarified != nil {
+		count, err := s.clarified.CountClarifiedRequirements(ctx, versionID)
+		if err != nil {
+			return ConversationView{}, err
+		}
+		if count == 0 {
+			return ConversationView{}, platform.NewError(http.StatusConflict, "design_requirements_missing",
+				"design requires at least one clarified requirement; confirm a requirement before starting the design conversation")
+		}
 	}
 	title = strings.TrimSpace(title)
 	if title == "" {
@@ -307,6 +336,18 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		}
 		parts = prepared
 		attachmentIDs = ids
+	}
+
+	// Task 75 / admin B1: an image draft pinned to a model without vision is
+	// rejected with a typed 400 before the message row and the reply/curate jobs
+	// exist. Dispatch would fail these jobs at zero steps, and the accept-then-
+	// fail behavior is exactly the opaque 201 ghost send observed in the trial.
+	// The gate runs after attachment preparation because the uploader submits an
+	// image as an attachment that the registrar converts into an image part.
+	if containsImageMessagePart(parts) {
+		if err := s.validateConversationImageModel(ctx, conversation.ModelOverride); err != nil {
+			return MessageView{}, err
+		}
 	}
 
 	now := s.clock.Now()
@@ -786,15 +827,66 @@ func (s *ConversationService) resolveModelOverride(ctx context.Context, modelOve
 	if s.models == nil {
 		return nil, nil, platform.Unavailable("llm model catalog is not configured")
 	}
-	name, err := s.models.ResolveConversationModel(ctx, trimmed)
+	model, err := s.models.ResolveConversationModel(ctx, trimmed)
 	if err != nil {
 		return nil, nil, err
 	}
-	name = strings.TrimSpace(name)
+	name := strings.TrimSpace(model.Model)
 	if name == "" {
 		return nil, nil, platform.Invalid("model_override", "must name a model of the default llm configuration")
 	}
 	return &name, &name, nil
+}
+
+// validateConversationImageModel enforces the Task 75 capability gate: an image
+// draft may only be stored and queued when the conversation's effective model
+// accepts images. The typed 400 names the model and the missing capability so
+// the UI can tell the user to switch models or remove the image; it never
+// switches the model automatically (D24).
+func (s *ConversationService) validateConversationImageModel(ctx context.Context, modelOverride *string) error {
+	if s.models == nil {
+		// Fail closed: without a catalog the runtime cannot verify vision, and
+		// accepting the draft would recreate the opaque zero-step failure.
+		return platform.Unavailable("llm model catalog is not configured")
+	}
+	requested := ""
+	if modelOverride != nil {
+		requested = strings.TrimSpace(*modelOverride)
+	}
+	model, err := s.models.ResolveConversationModel(ctx, requested)
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(model.Model)
+	if name == "" {
+		return platform.Invalid("model_override", "must name a model of the default llm configuration")
+	}
+	if model.SupportsVision {
+		return nil
+	}
+	return &platform.Error{
+		Status: http.StatusBadRequest,
+		Code:   CodeLLMCapabilityMismatch,
+		Message: fmt.Sprintf(
+			"llm model %q does not support images; choose a model with vision or remove the image before sending",
+			name),
+		Details: map[string]any{
+			"field":                "model_override",
+			"model":                name,
+			"missing_capabilities": []string{"vision"},
+		},
+	}
+}
+
+// containsImageMessagePart reports whether a validated user draft carries an
+// image part (either sent directly or converted from an uploaded attachment).
+func containsImageMessagePart(parts []version.MessagePart) bool {
+	for _, part := range parts {
+		if part.Type == version.MessagePartImage {
+			return true
+		}
+	}
+	return false
 }
 
 // effectiveModel resolves the model a conversation currently uses, best effort:
@@ -808,11 +900,11 @@ func (s *ConversationService) effectiveModel(ctx context.Context, override *stri
 	if override != nil {
 		requested = strings.TrimSpace(*override)
 	}
-	name, err := s.models.ResolveConversationModel(ctx, requested)
+	model, err := s.models.ResolveConversationModel(ctx, requested)
 	if err != nil {
 		return nil
 	}
-	name = strings.TrimSpace(name)
+	name := strings.TrimSpace(model.Model)
 	if name == "" {
 		return nil
 	}

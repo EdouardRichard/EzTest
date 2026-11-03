@@ -37,6 +37,48 @@ func lastConversationMessageEvent(t *testing.T, env *conversationEnv, messageID 
 	return latest
 }
 
+// TestJobCardFailureReasonPersisted covers Task 75: a failed job card's typed
+// failure code and user-facing reason are part of the immutable single-card
+// snapshot, the append-only streaming row and the SSE frame, so a reloaded
+// thread can explain the failure instead of showing only 失败/重试作业.
+func TestJobCardFailureReasonPersisted(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation := newChatConversation(t, env)
+	failed := version.MessagePart{
+		Type: "job_card", JobID: 801, JobKind: "chat.turn", Status: "failed",
+		Code:   "llm_capability_mismatch",
+		Reason: `llm model "text-only" does not support images; choose a model with vision`,
+	}
+
+	view, created, err := env.svc.UpsertJobCard(requestContext(), env.versionID, conversation.ID, failed)
+	if err != nil {
+		t.Fatalf("UpsertJobCard(failed): %v", err)
+	}
+	if !created {
+		t.Fatal("failed job card did not create its message")
+	}
+	card := view.Parts[0]
+	if card.Code != failed.Code || card.Reason != failed.Reason || card.Status != "failed" {
+		t.Fatalf("stored failed card = %#v, want the typed code/reason", card)
+	}
+
+	rows, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, view.ID)
+	if err != nil {
+		t.Fatalf("MessageParts: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("stream rows = %#v, want one job_card row", rows)
+	}
+	payload := decodedStreamParts(t, rows)[0]
+	if payload["code"] != failed.Code || payload["reason"] != failed.Reason {
+		t.Fatalf("stream row payload = %#v, want the typed failure code/reason", payload)
+	}
+	eventPart := eventParts(t, lastConversationMessageEvent(t, env, view.ID))[0]
+	if eventPart["code"] != failed.Code || eventPart["reason"] != failed.Reason {
+		t.Fatalf("republished card event = %#v, want the typed failure code/reason", eventPart)
+	}
+}
+
 // TestPartsJobCardUpsert pins the single-card contract of the conversation job
 // card writer: the first snapshot appends one assistant message carrying only
 // the job_card part (with its streaming row); every later progress/terminal

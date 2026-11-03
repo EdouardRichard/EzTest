@@ -41,10 +41,30 @@ type MessageAttachmentRegistrar interface {
 	LinkFromMessage(ctx context.Context, versionID, messageID int64, attachmentIDs []int64) error
 }
 
+// ClarifiedRequirementCounter exposes the clarified-requirement count used by
+// the design-conversation gate. RequirementService implements it; a nil counter
+// disables the gate for degraded assemblies and unit tests.
+type ClarifiedRequirementCounter interface {
+	CountClarifiedRequirements(ctx context.Context, versionID int64) (int, error)
+}
+
+// ConversationModel is the effective model of one conversation and the
+// capabilities the version context needs before dispatching a draft. The
+// version context never imports the LLM context (Agent.md §6.9.7), so the
+// composition root's adapter maps the LLM catalog row into this narrow shape.
+type ConversationModel struct {
+	// Model is the catalog name persisted in conversation.model_override and
+	// shown in effective_model.
+	Model string
+	// SupportsVision reports whether the model accepts image parts. An image
+	// draft must not be stored/queued for a model without it (Task 75).
+	SupportsVision bool
+}
+
 // ConversationModelCatalog resolves a conversation-level model override against
 // the default LLM configuration's selectable catalog. An empty override resolves
 // the configuration's explicit default_model_id (models[0] is never used,
 // D24). The LLM application service backs it in production.
 type ConversationModelCatalog interface {
-	ResolveConversationModel(ctx context.Context, modelOverride string) (string, error)
+	ResolveConversationModel(ctx context.Context, modelOverride string) (ConversationModel, error)
 }

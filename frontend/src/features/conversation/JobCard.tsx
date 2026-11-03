@@ -50,6 +50,9 @@ const KIND_LABEL: Partial<Record<JobKind, string>> = {
   "analyze.failure": "失败分析",
   "report.version": "生成报告",
   "knowledge.propose": "沉淀知识",
+  "chat.turn": "对话回复",
+  "requirement.curate": "需求整理",
+  "design.round": "设计轮次",
 }
 
 // The job control API cancels only open/claimed/running jobs. `waiting_human`
@@ -192,6 +195,20 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
       ) : (
         <p className="mt-1 text-[10px] text-muted-foreground">已处理 {current} 步</p>
       )}
+
+      {job.status === "failed" && typeof job.reason === "string" && job.reason.trim() !== "" ? (
+        <p
+          data-testid="job-card-reason"
+          role="status"
+          className="mt-1 text-[10px] text-destructive"
+        >
+          <span className="font-medium">失败原因：</span>
+          {job.reason}
+          {job.code !== undefined && job.code !== "" ? (
+            <span className="ml-1 text-muted-foreground">（{job.code}）</span>
+          ) : null}
+        </p>
+      ) : null}
 
       {CANCELLABLE.has(job.status) || job.status === "failed" ? (
         <div className="mt-1.5 flex items-center gap-1.5">

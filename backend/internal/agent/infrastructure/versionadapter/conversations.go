@@ -296,6 +296,8 @@ func conversationPart(part version.MessagePart) agentapp.ConversationPart {
 			"current":    part.Current,
 			"total":      part.Total,
 			"cancelable": part.Cancelable,
+			"code":       part.Code,
+			"reason":     part.Reason,
 		}
 	case version.MessagePartCaseCard:
 		mapped.Data = map[string]any{
@@ -389,9 +391,12 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 		status, _ := dataString(part.Data, "status")
 		current, _ := dataInt(part.Data, "current")
 		total, _ := dataInt(part.Data, "total")
+		failureCode, _ := dataString(part.Data, "code")
+		failureReason, _ := dataString(part.Data, "reason")
 		return version.MessagePart{
 			Type: part.Type, JobID: jobID, JobKind: kind, Status: status,
 			Current: int(current), Total: int(total), Cancelable: dataBoolPtr(part.Data, "cancelable"),
+			Code: failureCode, Reason: failureReason,
 		}, nil
 	case version.MessagePartCaseCard:
 		caseID, _ := dataInt(part.Data, "case_id")

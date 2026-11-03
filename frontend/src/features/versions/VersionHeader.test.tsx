@@ -61,6 +61,22 @@ describe("VersionHeader", () => {
 
   afterEach(cleanup)
 
+  it("renders the deterministic stage badge", () => {
+    render(
+      <VersionHeader
+        version={runningVersion}
+        stage={{
+          version_id: "2001",
+          stage: "case_review",
+          stage_entered_at: "2026-11-01T06:00:00Z",
+          blocker: null,
+        }}
+      />,
+    )
+
+    expect(screen.getByTestId("version-stage")).toHaveTextContent("阶段 · 用例待确认")
+  })
+
   it("renders the status badge, SUT chips, chain link, todo count and pending-design entry", async () => {
     render(<VersionHeader version={runningVersion} onOpenTodo={vi.fn()} onReopened={vi.fn()} />)
 

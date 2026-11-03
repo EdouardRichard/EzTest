@@ -26,13 +26,15 @@ func (f *fakeStageRoundStarter) StartStageRound(_ context.Context, versionID int
 type fakeBatchIntentEnsurer struct {
 	calls     int
 	versionID int64
+	caseIDs   []int64
 	created   int
 	err       error
 }
 
-func (f *fakeBatchIntentEnsurer) EnsureInitialIntents(_ context.Context, versionID int64) (int, error) {
+func (f *fakeBatchIntentEnsurer) EnsureInitialIntentsForCases(_ context.Context, versionID int64, caseIDs []int64) (int, error) {
 	f.calls++
 	f.versionID = versionID
+	f.caseIDs = append([]int64(nil), caseIDs...)
 	return f.created, f.err
 }
 
@@ -69,6 +71,9 @@ func TestStageEntryWiringAdapters(t *testing.T) {
 	}
 	if intents.calls != 1 || intents.versionID != 75 {
 		t.Fatalf("batch adapter delegation = %d version=%d", intents.calls, intents.versionID)
+	}
+	if len(intents.caseIDs) != 1 || intents.caseIDs[0] != 7001 {
+		t.Fatalf("batch adapter case ids = %v, want the execute.batch selection", intents.caseIDs)
 	}
 	intents.err = errors.New("intent scan down")
 	if err := batch.StartBatch(context.Background(), 75, nil); err == nil {

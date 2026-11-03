@@ -1,3 +1,4 @@
+import type { StageView } from "@/features/design/types"
 import {
   type ApiDownload,
   type ApiPage,
@@ -168,6 +169,21 @@ export function confirmRequirements(
   requirementIds: string[],
 ): Promise<BatchConfirmResult> {
   return apiPost<BatchConfirmResult>(`${versionPath(versionId)}/requirements/confirmations`, {
+    requirement_ids: requirementIds,
+  })
+}
+
+/**
+ * Applies the 0.2.1 requirement hard gate for the selected clarified
+ * requirements (`POST /stage/confirm-requirements`, spec §5.5): the version
+ * advances requirement_review -> designing and a design.cases entry job is
+ * enqueued. This is the "开始设计" action, not a plain confirmation.
+ */
+export function confirmStageRequirements(
+  versionId: string,
+  requirementIds: string[],
+): Promise<StageView> {
+  return apiPost<StageView>(`${versionPath(versionId)}/stage/confirm-requirements`, {
     requirement_ids: requirementIds,
   })
 }

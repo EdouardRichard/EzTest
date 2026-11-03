@@ -80,18 +80,18 @@ func TestP2ProfileSeeds(t *testing.T) {
 				tools.ToolCaseGraphPropose, tools.ToolAttachmentList, tools.ToolAttachmentReadText,
 				tools.ToolSUTList, tools.ToolSUTPageList,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_host]",
-			mustSay: []string{"不确认", "draft"},
+			mustSay: []string{"不确认", "draft", "同一轮内立即", "expected"},
 		},
 		agentapp.ProfileKeyDesignPlanner: {
 			tools: []string{
 				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolContextTeamRoomRead,
 				tools.ToolRequirementRead, tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_planner]",
-			mustSay: []string{"范围", "case.graph_propose", "不要询问用户", "draft", "不能确认"},
+			mustSay: []string{"范围", "case.graph_propose", "不要询问用户", "draft", "不能确认", "expected"},
 		},
 		agentapp.ProfileKeyCaseAuthor: {
 			tools: []string{

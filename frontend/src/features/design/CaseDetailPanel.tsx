@@ -181,6 +181,11 @@ export type CaseDetailPanelProps = {
   /** Hands this case to the design chat as a `case_card` reference (never sends). */
   onRequestAiChange?: (caseId: string) => void
   confirming?: boolean
+  /**
+   * Whether the version is at the case hard gate. Defaults to true for direct
+   * panel tests; the design tab passes the real stage gate.
+   */
+  canConfirm?: boolean
 }
 
 function CaseDetailBody({
@@ -192,6 +197,7 @@ function CaseDetailBody({
   onRequestChange,
   onRequestAiChange,
   confirming,
+  canConfirm: stageCanConfirm = true,
 }: {
   versionId: string
   detail: DesignCaseDetail
@@ -201,9 +207,10 @@ function CaseDetailBody({
   onRequestChange: (title: string) => void
   onRequestAiChange?: (caseId: string) => void
   confirming: boolean
+  canConfirm?: boolean
 }) {
   const selected = detail.selected
-  const canConfirm = detail.confirmable && selected.status === "draft"
+  const canConfirm = stageCanConfirm && detail.confirmable && selected.status === "draft"
   const previousVersion = [...detail.versions]
     .filter((version) => version.revision < selected.revision)
     .sort((left, right) => right.revision - left.revision)[0]
@@ -427,6 +434,7 @@ export function CaseDetailPanel({
   onRequestChange,
   onRequestAiChange,
   confirming = false,
+  canConfirm = true,
 }: CaseDetailPanelProps) {
   const [detail, setDetail] = useState<DesignCaseDetail | null>(null)
   const [selectedVersionId, setSelectedVersionId] = useState<string | undefined>(undefined)
@@ -494,6 +502,7 @@ export function CaseDetailPanel({
           onRequestChange={onRequestChange}
           onRequestAiChange={onRequestAiChange}
           confirming={confirming}
+          canConfirm={canConfirm}
         />
       )}
     </section>

@@ -10,6 +10,7 @@ import {
   type PublicModel,
   updateConversationModel,
 } from "./api"
+import { selectConversationModel } from "./modelSelection"
 
 export type ModelSelectorProps = {
   versionId: string
@@ -31,33 +32,6 @@ export type ModelSelectorProps = {
 function errorMessage(cause: unknown): string {
   if (cause instanceof Error && cause.message.length > 0) return cause.message
   return "模型切换失败，请重试"
-}
-
-type InitialSelection = {
-  value: string
-  /** Stored override the catalog no longer offers as a selectable model. */
-  unavailable: string | null
-}
-
-/**
- * Resolves the initial selection: the conversation override when it still names
- * a selectable model, otherwise the LLM configuration's explicit
- * `default_model_id`. It must never fall back to `models[0]` (D24). An override
- * that is no longer selectable stays visible and disabled instead of silently
- * reverting to the default: the conversation is still pinned to it, so the user
- * has to pick a new model deliberately.
- */
-function initialSelection(
-  models: PublicModel[],
-  override: string | null | undefined,
-): InitialSelection {
-  const value = override?.trim() ?? ""
-  if (value !== "") {
-    const match = models.find((model) => model.model === value && !model.deprecated)
-    if (match !== undefined) return { value: match.model, unavailable: null }
-    return { value, unavailable: value }
-  }
-  return { value: models.find((model) => model.default)?.model ?? "", unavailable: null }
 }
 
 function optionLabel(model: PublicModel): string {
@@ -106,7 +80,7 @@ export function ModelSelector({
     void listPublicModels().then(
       (items) => {
         if (cancelled) return
-        const selection = initialSelection(items, modelOverride)
+        const selection = selectConversationModel(items, modelOverride)
         setModels(items)
         setSelected(selection.value)
         setUnavailable(selection.unavailable)

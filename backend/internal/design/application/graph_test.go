@@ -178,6 +178,102 @@ func TestProposeUpdatesNaturalKeyInsteadOfDuplicating(t *testing.T) {
 	}
 }
 
+// TestCaseModificationCreatesVersion pins the S4 failure: a design
+// conversation modification of an existing case must persist a new immutable
+// case version (revision 2) instead of leaving "before=2 after=2". The proposal
+// addresses the case by its explicit id, exactly like the Host's modification
+// payload.
+func TestCaseModificationCreatesVersion(t *testing.T) {
+	service, repo, _, _ := newGraphFixture(t)
+	first, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
+	if err != nil {
+		t.Fatalf("initial Propose: %v", err)
+	}
+	caseID := first.CaseIDs[0]
+	initialVersionID := first.CaseVersionIDs[0]
+
+	modified := validProposeInput()
+	modified.Cases[0].ID = int64Ptr(caseID)
+	modified.Cases[0].Steps[0].Action = "打开墨栈博客首页"
+	modified.Cases[0].Steps[0].Expected = "首页加载成功"
+	modified.Cases[0].Steps[0].TargetVersionSUTID = int64Ptr(9001)
+	second, err := service.Propose(context.Background(), 1001, modified, 1, 1)
+	if err != nil {
+		t.Fatalf("modification Propose: %v", err)
+	}
+	if len(second.CaseIDs) != 1 || second.CaseIDs[0] != caseID {
+		t.Fatalf("modification changed the logical case id: %+v", second)
+	}
+	if second.CaseVersionIDs[0] == initialVersionID {
+		t.Fatalf("modification reused the old case version %d", initialVersionID)
+	}
+	current := repo.cases[caseID].current
+	if current == nil || current.Revision != 2 {
+		t.Fatalf("current version = %+v, want revision 2", current)
+	}
+	if current.Steps[0].Action != "打开墨栈博客首页" || current.Steps[0].Expected != "首页加载成功" {
+		t.Fatalf("modified step = %+v", current.Steps[0])
+	}
+	if current.Steps[0].TargetVersionSUTID == nil || *current.Steps[0].TargetVersionSUTID != 9001 {
+		t.Fatalf("modified step target = %+v", current.Steps[0].TargetVersionSUTID)
+	}
+	history := repo.versions(caseID)
+	if len(history) != 2 || history[0].Revision != 1 || history[1].Revision != 2 {
+		t.Fatalf("case history = %+v, want revisions 1 then 2", history)
+	}
+}
+
+// TestCasesHaveExpected pins the S4 "withExpected=0" failure: generated and
+// modified cases must carry an observable expected outcome on every step and
+// assertion; an empty expected is rejected instead of being persisted.
+func TestCasesHaveExpected(t *testing.T) {
+	service, _, _, _ := newGraphFixture(t)
+	invalid := []struct {
+		name   string
+		mutate func(*ProposeInput)
+		field  string
+	}{
+		{
+			name:   "empty assertion expected",
+			mutate: func(in *ProposeInput) { in.Cases[0].Assertions[0].Expected = "" },
+			field:  "cases[0].assertions[0].expected",
+		},
+		{
+			name:   "blank assertion expected",
+			mutate: func(in *ProposeInput) { in.Cases[0].Assertions[1].Expected = "   " },
+			field:  "cases[0].assertions[1].expected",
+		},
+		{
+			name:   "empty step expected",
+			mutate: func(in *ProposeInput) { in.Cases[0].Steps[0].Expected = "" },
+			field:  "cases[0].steps[0].expected",
+		},
+	}
+	for _, testCase := range invalid {
+		t.Run(testCase.name, func(t *testing.T) {
+			in := validProposeInput()
+			testCase.mutate(&in)
+			_, err := service.Propose(context.Background(), 1001, in, 1, 1)
+			var apiErr *platform.Error
+			if !errors.As(err, &apiErr) || apiErr.Code != "invalid_argument" {
+				t.Fatalf("err = %v, want invalid_argument", err)
+			}
+			if apiErr.Details["field"] != testCase.field {
+				t.Fatalf("field = %#v, want %q", apiErr.Details["field"], testCase.field)
+			}
+		})
+	}
+
+	// The well-formed proposal still persists with its expected outcomes.
+	result, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
+	if err != nil {
+		t.Fatalf("valid Propose: %v", err)
+	}
+	if len(result.CaseVersionIDs) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestProposeUpdatesConfirmedCaseAsNewDraft(t *testing.T) {
 	service, repo, _, _ := newGraphFixture(t)
 	first, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)

@@ -446,3 +446,41 @@ func TestVersionAdapterReopenRequiresP4ReopenService(t *testing.T) {
 		t.Fatal("Reopen without the P4 reopen service must fail")
 	}
 }
+
+// fakeVersionStageReader records the stage projection lookup used by the
+// execution intent gate.
+type fakeVersionStageReader struct {
+	stage versionapp.StageView
+	err   error
+	calls []int64
+}
+
+func (r *fakeVersionStageReader) Stage(_ context.Context, versionID int64) (versionapp.StageView, error) {
+	r.calls = append(r.calls, versionID)
+	return r.stage, r.err
+}
+
+// TestVersionAdapterProjectsStage pins the Task 78 seam: the execution
+// VersionBinding must carry the deterministic version stage so the intent scan
+// can refuse to turn a case-gate confirmation into an execution wave.
+func TestVersionAdapterProjectsStage(t *testing.T) {
+	adapter := NewVersionAdapter(&fakeVersionService{view: versionViewFixture()})
+	stages := &fakeVersionStageReader{stage: versionapp.StageView{VersionID: 10, Stage: "case_review"}}
+	adapter.SetStageReader(stages)
+
+	binding, err := adapter.Get(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if binding.Stage != "case_review" {
+		t.Fatalf("binding stage = %q, want case_review", binding.Stage)
+	}
+	if len(stages.calls) != 1 || stages.calls[0] != 10 {
+		t.Fatalf("stage calls = %v", stages.calls)
+	}
+
+	stages.err = platform.NotFound("version")
+	if _, err := adapter.Get(context.Background(), 10); err == nil {
+		t.Fatal("Get must propagate the stage read failure")
+	}
+}

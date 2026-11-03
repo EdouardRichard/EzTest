@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
@@ -116,7 +117,10 @@ func (r *RuntimeRepository) ListProfiles(ctx context.Context) ([]agent.AgentProf
 	return profiles, nil
 }
 
-// CreateRun inserts a running agent_run row.
+// CreateRun inserts one agent_run row with the run's status. A dispatch-ready
+// attempt is created running, while an attempt that failed before dispatch is
+// recorded with its terminal snapshot in the same insert (Task 75), so the
+// Agent center can list it without a transient running row.
 func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (agent.AgentRun, error) {
 	if err := run.Validate(); err != nil {
 		return agent.AgentRun{}, err
@@ -159,16 +163,21 @@ func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (
 		value := run.FallbackFrom
 		fallbackFrom = &value
 	}
+	var terminalReason *string
+	if run.TerminalReason != nil && strings.TrimSpace(*run.TerminalReason) != "" {
+		value := strings.TrimSpace(*run.TerminalReason)
+		terminalReason = &value
+	}
 
 	stored, err := scanRun(r.pool.QueryRow(ctx, `
 		INSERT INTO agent_run (id, profile_key, work_item_id, conversation_id, status,
 			terminal_reason, turns, usage, owner_instance, lease_epoch, context_packet_id,
 			started_at, finished_at, model, config_id, fallback_from, tokens, cache)
-		VALUES ($1, $2, $3, $4, 'running', NULL, 0, $5::jsonb, $6, $7, NULL, $8, NULL, $9, $10, $11, $12::jsonb, $13::jsonb)
+		VALUES ($1, $2, $3, $4, $5, $6, 0, $7::jsonb, $8, $9, NULL, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb)
 		RETURNING `+runColumns,
-		run.ID, run.ProfileKey, run.WorkItemID, run.ConversationID, encodedUsage,
-		run.OwnerInstance, run.LeaseEpoch, startedAt, run.Model, configID, fallbackFrom,
-		encodedTokens, encodedCache))
+		run.ID, run.ProfileKey, run.WorkItemID, run.ConversationID, string(run.Status),
+		terminalReason, encodedUsage, run.OwnerInstance, run.LeaseEpoch, startedAt,
+		run.FinishedAt, run.Model, configID, fallbackFrom, encodedTokens, encodedCache))
 	if err != nil {
 		return agent.AgentRun{}, wrapDB("create agent run", err)
 	}

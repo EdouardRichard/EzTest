@@ -108,6 +108,11 @@ type CaseAugmentResult struct {
 	// design writer (not clarified, stale version, or no longer current). They
 	// are skipped before the writer is called, so they cannot abort the batch.
 	Skipped int
+	// Ungrounded counts requirement gaps that have no concrete discovered
+	// target (page/API/URL). Those are requirement-completeness or discovery
+	// gaps that need clarification; turning them into templated "[补用例]"
+	// drafts only pollutes the graph with placeholder cases (Task 77).
+	Ungrounded int
 	// Failed holds the per-draft writer failures that were isolated. A non-empty
 	// list is a partial success: the drafts in Created were persisted.
 	Failed []CaseDraftFailure
@@ -175,6 +180,14 @@ func (a *CaseAugment) Run(ctx context.Context, versionID int64) (CaseAugmentResu
 		if !ok {
 			// A version-level dependency gap (requirement_id=0) is not a
 			// requirement gap: it must not silently become a case.
+			continue
+		}
+		// A gap without a concrete target has nothing executable to verify:
+		// it is a completeness/clarification gap, not a case. Persisting a
+		// templated placeholder here is how the "[补用例] ... · 依赖" stubs
+		// entered the graph with no delete/merge path (Task 77).
+		if strings.TrimSpace(factString(fact, "target")) == "" {
+			result.Ungrounded++
 			continue
 		}
 		if !draftEligible(draft, eligible) {

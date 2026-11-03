@@ -21,6 +21,12 @@ import type { ConversationMessage, ConversationSummary } from "@/features/clarif
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import type { ConversationModel } from "@/features/conversation/api"
 import type { CaseCardPart } from "@/features/conversation/types"
+import {
+  caseGateGuidance,
+  caseReviewStage,
+  designActionsAllowed,
+  designStageGuidance,
+} from "@/features/versions/stage"
 import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
@@ -37,10 +43,24 @@ import { DesignMindmap } from "./DesignMindmap"
 import { ExportCasesDialog } from "./ExportCasesDialog"
 import type { DesignExecutionResults } from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
-import type { CaseConfirmationScope, DesignCaseSummary, DesignGraph, DesignOverview } from "./types"
+import type {
+  CaseConfirmationScope,
+  DesignCaseSummary,
+  DesignGraph,
+  DesignOverview,
+  VersionStage,
+} from "./types"
 
 export type DesignTabProps = {
   versionId: string
+  /**
+   * Deterministic version stage. `undefined`/`null` (tab rendered outside the
+   * version page, or before the projection loads) keeps the legacy permissive
+   * UI; the backend stage guards remain authoritative.
+   */
+  stage?: VersionStage | null
+  /** Refresh the page-level stage projection after a gate transition. */
+  onStageChanged?: () => void
   /** Deep link `?case=` forwarded by the version page. */
   initialCaseId?: string
   /** Deep link `?conversation=` forwarded by the version page. */
@@ -105,7 +125,13 @@ function resizeLayerSplits(current: LayerSplits, divider: DividerKind, delta: nu
  * drives debounced snapshot refreshes; node positions stay local (`layout.ts`)
  * and are never persisted.
  */
-export function DesignTab({ versionId, initialCaseId, initialConversationId }: DesignTabProps) {
+export function DesignTab({
+  versionId,
+  stage,
+  onStageChanged,
+  initialCaseId,
+  initialConversationId,
+}: DesignTabProps) {
   const router = useRouter()
 
   const [graph, setGraph] = useState<DesignGraph | null>(null)
@@ -142,6 +168,12 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [focusOpen, setFocusOpen] = useState(false)
   /** Bumped on every focus toggle so the canvas re-fits after the size change. */
   const [fitViewToken, setFitViewToken] = useState(0)
+
+  // Stage-gated affordances (Task 78). Unknown projections stay permissive so a
+  // direct tab embed/test keeps working; the backend rejects wrong-stage calls.
+  const stageKnown = stage !== undefined && stage !== null
+  const designAllowed = designActionsAllowed(stage)
+  const canReviewCases = caseReviewStage(stage)
 
   // Each case card of the graph now carries its latest execution verdict
   // (spec §9.3); DesignMindmap consumes a case-id keyed map.
@@ -323,22 +355,50 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   }, [versionId, updateUrl])
 
   const createConversation = useCallback(() => {
+    if (!designAllowed) {
+      setCreateError(new Error(designStageGuidance(stage)))
+      return
+    }
     void handleNewConversation()
-  }, [handleNewConversation])
+  }, [designAllowed, handleNewConversation, stage])
 
   const batchCaseGate = useCallback(
     async (caseIds: string[], mode: "confirm" | "execute"): Promise<void> => {
       if (caseIds.length === 0) return
+      if (!canReviewCases) {
+        setConfirmError(new Error(caseGateGuidance(stage)))
+        return
+      }
       setBatchBusy(true)
       setConfirmError(null)
       setConfirmNotice(null)
       try {
-        await confirmStageCases(versionId, caseIds)
-        setConfirmNotice(
-          mode === "execute"
-            ? `已提交 ${caseIds.length} 条用例执行`
-            : `已确认 ${caseIds.length} 条用例`,
-        )
+        if (mode === "execute") {
+          // Explicit batch execute: the case hard gate confirms the selected
+          // cases and creates the execute.batch job for exactly this selection.
+          await confirmStageCases(versionId, caseIds)
+          setConfirmNotice(`已提交 ${caseIds.length} 条用例执行`)
+          onStageChanged?.()
+        } else {
+          // Batch confirm only freezes the selected case versions. It must not
+          // advance the case hard gate, so no wave is created until the user
+          // explicitly executes the selection (Task 78 / QA-F2).
+          let confirmed = 0
+          let skipped = 0
+          for (const caseId of caseIds) {
+            const result = await confirmCases(versionId, {
+              scope: "case",
+              target_id: caseId,
+            })
+            confirmed += result.confirmed.length
+            skipped += result.skipped.length
+          }
+          setConfirmNotice(
+            skipped > 0
+              ? `已确认 ${confirmed} 条用例（未执行），跳过 ${skipped} 条已确认用例`
+              : `已确认 ${confirmed} 条用例（未执行）`,
+          )
+        }
         await refreshGraph()
         await refreshOverview()
         setDetailToken((token) => token + 1)
@@ -348,7 +408,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
         setBatchBusy(false)
       }
     },
-    [versionId, refreshGraph, refreshOverview],
+    [versionId, refreshGraph, refreshOverview, canReviewCases, stage, onStageChanged],
   )
 
   // The batch bar hands exactly the checked ids to the 0.2.1 stage gate; the
@@ -412,6 +472,10 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
 
   const handleConfirm = useCallback(
     async (scope: CaseConfirmationScope, targetId: string): Promise<void> => {
+      if (!canReviewCases) {
+        setConfirmError(new Error(caseGateGuidance(stage)))
+        return
+      }
       setConfirmingKey(`${scope}:${targetId}`)
       setConfirmError(null)
       setConfirmNotice(null)
@@ -428,7 +492,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
         setConfirmingKey(null)
       }
     },
-    [versionId, refreshGraph],
+    [versionId, refreshGraph, canReviewCases, stage],
   )
 
   // Stable wrappers for DesignMindmap's memoized node data: React Flow must not
@@ -663,13 +727,33 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           <Button
             size="sm"
             data-testid="design-new-conversation"
-            disabled={creatingConversation}
+            disabled={creatingConversation || !designAllowed}
+            title={designAllowed ? undefined : designStageGuidance(stage)}
             onClick={createConversation}
           >
             {creatingConversation ? "创建中…" : "＋ 新建对话"}
           </Button>
         </div>
       </header>
+
+      {stageKnown && !designAllowed ? (
+        <p
+          data-testid="design-stage-notice"
+          role="status"
+          className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-[11px] text-warning"
+        >
+          {designStageGuidance(stage)}
+        </p>
+      ) : null}
+      {stageKnown && !canReviewCases ? (
+        <p
+          data-testid="case-gate-notice"
+          role="status"
+          className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground"
+        >
+          {caseGateGuidance(stage)}
+        </p>
+      ) : null}
 
       {createError !== null ? <InlineError error={createError} /> : null}
       {confirmError !== null ? <InlineError error={confirmError} /> : null}
@@ -688,7 +772,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           versionId={versionId}
           pendingCount={graph.pending_design_count}
           hasConversation={false}
-          onCreateConversation={createConversation}
+          onCreateConversation={designAllowed ? createConversation : undefined}
         />
       ) : null}
 
@@ -781,6 +865,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
                 confirmingKey={confirmingKey}
                 executionResults={executionResults}
                 batchBusy={batchBusy}
+                caseReviewEnabled={canReviewCases}
                 onSelectCase={selectCase}
                 onConfirmCase={confirmCase}
                 onConfirmScenario={confirmScenario}
@@ -828,6 +913,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
               caseId={selectedCaseId}
               refreshToken={detailToken}
               confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
+              canConfirm={canReviewCases}
               onConfirm={confirmCase}
               onRequestChange={setChatDraft}
               onRequestAiChange={requestAiChangeForCase}

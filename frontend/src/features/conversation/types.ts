@@ -85,6 +85,10 @@ export type JobKind =
   | "analyze.failure"
   | "report.version"
   | "knowledge.propose"
+  // Conversation-writing background jobs are projected as job cards too.
+  | "chat.turn"
+  | "requirement.curate"
+  | "design.round"
 
 /** Progress card; `total = 0` means unknown, so no percentage may be derived. */
 export type JobCardPart = {
@@ -95,6 +99,12 @@ export type JobCardPart = {
   status: JobStatus
   current?: number
   total?: number
+  /**
+   * Typed failure code and user-facing reason persisted on a terminal failed
+   * card (0.2.1 Task 75). Absent on healthy/retrying snapshots.
+   */
+  code?: string
+  reason?: string
 }
 
 export type AttachmentPart = {

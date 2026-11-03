@@ -86,7 +86,7 @@ export function CaseCard({ data }: NodeProps) {
       <p className="mt-1 text-[10px] text-muted-foreground">
         v{designCase.revision} · 步骤 {designCase.step_count} · 断言 {designCase.assertion_count}
       </p>
-      {designCase.status === "draft" ? (
+      {designCase.status === "draft" && node.actions.caseReviewEnabled !== false ? (
         <Button
           size="sm"
           variant="secondary"

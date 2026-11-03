@@ -1,13 +1,11 @@
 package main
 
-// Event-driven execution intent scan (P2-T5 fix round).
+// Event-driven execution intent scan (P2-T5 fix round; revised by Task 78).
 //
-// Before this file the execution scheduler polled EnsureInitialIntents every
-// five 1s ticks, because confirmed cases can appear without an execution event.
-// Case confirmation does publish design.case_confirmed, so the scan is now
-// woken by that event through the same eventing observer seam as the
-// reconciler. EZTEST_INTENT_SCAN_INTERVAL remains the compatibility poll until
-// P10 acceptance.
+// Execution intents are only refreshed by the explicit execute.batch stage job
+// at executing. The wake remains for the leader/startup repair scan; case
+// confirmations no longer wake it, because a case confirmed before the case hard
+// gate must not auto-create an intent or wave.
 
 import (
 	"context"
@@ -19,10 +17,6 @@ import (
 
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
-
-// designCaseConfirmedEvent is the design event that can make new case versions
-// executable. It is the event-driven replacement for the old 5s intent scan.
-const designCaseConfirmedEvent = "design.case_confirmed"
 
 // intentEnsurer is the execution intent scan surface (*executionapp.IntentService).
 type intentEnsurer interface {

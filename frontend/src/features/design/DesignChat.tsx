@@ -22,6 +22,7 @@ import { useConversation } from "@/features/clarification/useConversation"
 import type { ConversationModel } from "@/features/conversation/api"
 import { ModelSelector } from "@/features/conversation/ModelSelector"
 import type { CaseCardPart } from "@/features/conversation/types"
+import { useVisionGate, VISION_SEND_BLOCKED_MESSAGE } from "@/features/conversation/useVisionGate"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -108,6 +109,15 @@ export function DesignChat({
     liveMessages,
   })
   const active = conversations.find((conversation) => conversation.id === activeConversationId)
+  // Task 75: the vision send gate derives from the persisted conversation model
+  // rather than the picker's visibility, so the collapsed chat (which hides the
+  // selector) still blocks an image draft on a non-vision model.
+  const visionGate = useVisionGate({
+    conversationId: activeConversationId,
+    modelOverride: active?.model_override ?? null,
+    draftHasImages,
+  })
+  const sendBlockedReason = visionGate.blocked ? VISION_SEND_BLOCKED_MESSAGE : undefined
   // While the floating panel is open the chat always shows the full thread;
   // the collapse prop only describes the inline three-layer layout.
   const compact = collapsed && !expanded
@@ -267,6 +277,7 @@ export function DesignChat({
               caseReferences={caseReferences}
               onCaseReferencesChange={onCaseReferencesChange}
               onDraftHasImagesChange={setDraftHasImages}
+              sendBlockedReason={sendBlockedReason}
             />
           )
         ) : (
@@ -345,6 +356,7 @@ export function DesignChat({
                   caseReferences={caseReferences}
                   onCaseReferencesChange={onCaseReferencesChange}
                   onDraftHasImagesChange={setDraftHasImages}
+                  sendBlockedReason={sendBlockedReason}
                 />
               </>
             )}

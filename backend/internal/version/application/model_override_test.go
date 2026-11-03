@@ -15,25 +15,31 @@ import (
 type fakeConversationModelCatalog struct {
 	defaultModel string
 	selectable   map[string]string
-	err          error
-	calls        []string
+	// visionless marks selectable models whose supports_vision capability is
+	// false; the vision send gate reads it through the same catalog resolution.
+	visionless map[string]bool
+	err        error
+	calls      []string
 }
 
-func (f *fakeConversationModelCatalog) ResolveConversationModel(_ context.Context, modelOverride string) (string, error) {
+func (f *fakeConversationModelCatalog) ResolveConversationModel(_ context.Context, modelOverride string) (versionapp.ConversationModel, error) {
 	f.calls = append(f.calls, modelOverride)
 	if f.err != nil {
-		return "", f.err
+		return versionapp.ConversationModel{}, f.err
+	}
+	model := func(name string) versionapp.ConversationModel {
+		return versionapp.ConversationModel{Model: name, SupportsVision: !f.visionless[name]}
 	}
 	if modelOverride == "" {
 		if f.defaultModel == "" {
-			return "", platform.Invalid("model_override", "no default model is configured")
+			return versionapp.ConversationModel{}, platform.Invalid("model_override", "no default model is configured")
 		}
-		return f.defaultModel, nil
+		return model(f.defaultModel), nil
 	}
 	if name, ok := f.selectable[modelOverride]; ok {
-		return name, nil
+		return model(name), nil
 	}
-	return "", platform.Invalid("model_override", "must name a model of the default llm configuration")
+	return versionapp.ConversationModel{}, platform.Invalid("model_override", "must name a model of the default llm configuration")
 }
 
 func TestCreateConversationWithModelOverride(t *testing.T) {

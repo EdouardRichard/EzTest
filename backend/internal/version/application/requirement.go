@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -17,6 +18,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
+
+// maxDedupeRequirements bounds one duplicate-draft scan.
+const maxDedupeRequirements = 200
 
 // RequirementService implements requirement draft lifecycle, immutable
 // revisions, single/batch confirmation, rollback and relations.
@@ -137,6 +141,23 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 	s.markRunning(ctx, versionID)
 	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementCreated, "new requirement created")
 	return s.Get(ctx, versionID, requirementID)
+}
+
+// CountClarifiedRequirements reports whether the version has at least one
+// clarified requirement. It is the design-conversation gate: a design round
+// without clarified requirements has nothing to design.
+func (s *RequirementService) CountClarifiedRequirements(ctx context.Context, versionID int64) (int, error) {
+	if versionID <= 0 {
+		return 0, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	items, _, err := s.List(ctx, versionID, string(version.RequirementClarified), 1, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(items) > 0 {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // Update always creates a new immutable revision (revision+1). Editing a
@@ -444,6 +465,317 @@ func (s *RequirementService) BatchConfirm(ctx context.Context, versionID int64, 
 		skipped = []int64{}
 	}
 	return BatchConfirmResult{BatchID: batchID, Confirmed: confirmed, Skipped: skipped}, nil
+}
+
+// Dedupe collapses duplicate draft requirements of one version. Two drafts are
+// duplicates when their normalized titles match, or when both their normalized
+// description and acceptance text match (a refined title is still the same
+// requirement). The lowest id of each group survives; the rest become obsolete
+// without adding a revision. Clarified requirements are never touched.
+func (s *RequirementService) Dedupe(ctx context.Context, versionID int64, actorID int64) (RequirementDedupeResult, error) {
+	if versionID <= 0 {
+		return RequirementDedupeResult{}, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	items, err := s.repo.List(ctx, versionID, version.RequirementDraft, maxDedupeRequirements, nil)
+	if err != nil {
+		return RequirementDedupeResult{}, mapRequirementRepositoryError(err)
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].Requirement.ID < items[j].Requirement.ID })
+	result := RequirementDedupeResult{KeptIDs: []int64{}, ObsoleteIDs: []int64{}}
+	byTitle := make(map[string]int64, len(items))
+	byContent := make(map[string]int64, len(items))
+	now := s.clock.Now()
+	for _, item := range items {
+		requirementID := item.Requirement.ID
+		titleKey := normalizeRequirementText(item.Current.Title)
+		contentKey := normalizeRequirementText(item.Current.Description) + "|" + normalizeRequirementText(item.Current.AcceptanceCriteria)
+		hasContentKey := strings.TrimSpace(item.Current.Description) != "" || strings.TrimSpace(item.Current.AcceptanceCriteria) != ""
+		if survivor, duplicate := byTitle[titleKey]; duplicate {
+			if err := s.obsoleteRequirement(ctx, versionID, requirementID, "duplicate_title", actorID, now); err != nil {
+				return RequirementDedupeResult{}, err
+			}
+			byContent[contentKey] = survivor
+			result.ObsoleteIDs = append(result.ObsoleteIDs, requirementID)
+			continue
+		}
+		if hasContentKey {
+			if survivor, duplicate := byContent[contentKey]; duplicate {
+				if err := s.obsoleteRequirement(ctx, versionID, requirementID, "duplicate_content", actorID, now); err != nil {
+					return RequirementDedupeResult{}, err
+				}
+				byTitle[titleKey] = survivor
+				result.ObsoleteIDs = append(result.ObsoleteIDs, requirementID)
+				continue
+			}
+		}
+		byTitle[titleKey] = requirementID
+		if hasContentKey {
+			byContent[contentKey] = requirementID
+		}
+		result.KeptIDs = append(result.KeptIDs, requirementID)
+	}
+	if len(result.ObsoleteIDs) > 0 {
+		s.publishEvent(ctx, versionID, "requirement.deduped", map[string]any{
+			"kept_ids":     formatStageIDs(result.KeptIDs),
+			"obsolete_ids": formatStageIDs(result.ObsoleteIDs),
+		}, map[string]any{})
+		s.recordAudit(ctx, actorID, "requirement.deduped", "version", platformid.Format(versionID), map[string]any{
+			"kept_ids":     formatStageIDs(result.KeptIDs),
+			"obsolete_ids": formatStageIDs(result.ObsoleteIDs),
+		})
+	}
+	return result, nil
+}
+
+// Delete retires a duplicate draft requirement. Only a draft can be deleted: a
+// clarified requirement must be rolled back first, and closed/obsolete rows stay
+// untouched (idempotent repeat on obsolete). It never adds a revision.
+func (s *RequirementService) Delete(ctx context.Context, versionID, requirementID int64, reason string, actorID int64) (RequirementDetail, error) {
+	if err := validateIDs(versionID, requirementID); err != nil {
+		return RequirementDetail{}, err
+	}
+	reason = strings.TrimSpace(reason)
+	if err := validationStringMax("reason", reason, version.RequirementReasonMax); err != nil {
+		return RequirementDetail{}, err
+	}
+	aggregate, err := s.repo.Get(ctx, versionID, requirementID)
+	if err != nil {
+		return RequirementDetail{}, mapRequirementRepositoryError(err)
+	}
+	requirement := aggregate.Requirement
+	switch requirement.Status {
+	case version.RequirementObsolete:
+		// Idempotent delete: the requirement is already retired.
+		return s.Get(ctx, versionID, requirementID)
+	case version.RequirementDraft:
+	default:
+		return RequirementDetail{}, platform.StateConflict("only a draft requirement can be deleted; roll back a clarified requirement first")
+	}
+	if err := s.obsoleteRequirement(ctx, versionID, requirementID, reason, actorID, s.clock.Now()); err != nil {
+		return RequirementDetail{}, err
+	}
+	s.recordAudit(ctx, actorID, "requirement.deleted", "requirement", platformid.Format(requirementID), map[string]any{
+		"reason": reason,
+	})
+	return s.Get(ctx, versionID, requirementID)
+}
+
+// Merge folds duplicate draft requirements into one canonical target. The
+// target's content absorbs the sources' description/acceptance text (deduped by
+// text and priority), sources are retired as obsolete and a relation records the
+// merge. The target gets a new draft revision only when its content actually
+// changed; a target that already contains the sources just retires them.
+func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int64, sourceIDs []int64, actorID int64) (RequirementMergeResult, error) {
+	if err := validateIDs(versionID, targetID); err != nil {
+		return RequirementMergeResult{}, err
+	}
+	sources, err := dedupeRequirementIDs(sourceIDs)
+	if err != nil {
+		return RequirementMergeResult{}, err
+	}
+	kept := make([]int64, 0, len(sources))
+	for _, sourceID := range sources {
+		if sourceID == targetID {
+			return RequirementMergeResult{}, platform.Invalid("source_requirement_ids", "must not contain the target requirement")
+		}
+		kept = append(kept, sourceID)
+	}
+	if len(kept) == 0 {
+		return RequirementMergeResult{}, platform.Invalid("source_requirement_ids", "must contain at least one source requirement")
+	}
+	targetAggregate, err := s.repo.Get(ctx, versionID, targetID)
+	if err != nil {
+		return RequirementMergeResult{}, mapRequirementRepositoryError(err)
+	}
+	target := targetAggregate.Requirement
+	if target.Status != version.RequirementDraft && target.Status != version.RequirementClarified {
+		return RequirementMergeResult{}, platform.StateConflict("only a draft or clarified requirement can be a merge target")
+	}
+	targetCurrent, ok := currentVersion(targetAggregate)
+	if !ok {
+		return RequirementMergeResult{}, platform.StateConflict("merge target has no current revision")
+	}
+
+	merged := targetCurrent
+	for _, sourceID := range kept {
+		sourceAggregate, err := s.repo.Get(ctx, versionID, sourceID)
+		if err != nil {
+			return RequirementMergeResult{}, mapRequirementRepositoryError(err)
+		}
+		source := sourceAggregate.Requirement
+		if source.Status != version.RequirementDraft {
+			return RequirementMergeResult{}, platform.StateConflict("only draft requirements can be merged into another requirement")
+		}
+		sourceCurrent, ok := currentVersion(sourceAggregate)
+		if !ok {
+			return RequirementMergeResult{}, platform.StateConflict("merge source has no current revision")
+		}
+		merged.Description = appendUniqueText(merged.Description, sourceCurrent.Description)
+		merged.AcceptanceCriteria = appendUniqueText(merged.AcceptanceCriteria, sourceCurrent.AcceptanceCriteria)
+		merged.TargetVersionSUTs = appendUniqueStrings(merged.TargetVersionSUTs, sourceCurrent.TargetVersionSUTs)
+		merged.TargetPages = appendUniqueStrings(merged.TargetPages, sourceCurrent.TargetPages)
+		merged.TargetAPIs = appendUniqueStrings(merged.TargetAPIs, sourceCurrent.TargetAPIs)
+		if priorityRank(sourceCurrent.Priority) < priorityRank(merged.Priority) {
+			merged.Priority = sourceCurrent.Priority
+		}
+	}
+	now := s.clock.Now()
+	revision, err := normalizeDraft(RequirementDraft{
+		Title:              merged.Title,
+		Description:        merged.Description,
+		AcceptanceCriteria: merged.AcceptanceCriteria,
+		Priority:           merged.Priority,
+		Constraints:        merged.Constraints,
+		TargetVersionSUTs:  merged.TargetVersionSUTs,
+		TargetPages:        merged.TargetPages,
+		TargetAPIs:         merged.TargetAPIs,
+	})
+	if err != nil {
+		return RequirementMergeResult{}, err
+	}
+	if revision.ContentHash != targetCurrent.ContentHash {
+		revision.ID = s.ids.Next()
+		revision.RequirementID = targetID
+		revision.Revision = targetCurrent.Revision + 1
+		revision.CreatedBy = optionalActor(actorID)
+		revision.CreatedByRunID = agentRunID(ctx)
+		revision.CreatedAt = now
+		target.Status = version.RequirementDraft
+		target.CurrentVersionID = &revision.ID
+		target.TargetVersionSUTIDs = append([]string{}, revision.TargetVersionSUTs...)
+		target.UpdatedAt = now
+		if err := s.repo.AddRevision(ctx, target, revision); err != nil {
+			return RequirementMergeResult{}, mapRequirementRepositoryError(err)
+		}
+		staleHook := s.stale
+		if staleHook == nil {
+			staleHook = NoopCaseStaleHook{}
+		}
+		affected, err := staleHook.MarkRequirementChanged(ctx, versionID, targetID, "merged duplicate requirement", revision.Revision)
+		if err != nil {
+			return RequirementMergeResult{}, err
+		}
+		if affected == nil {
+			affected = []string{}
+		}
+		s.publishEvent(ctx, versionID, "requirement.version_created", map[string]any{
+			"requirement_id":            platformid.Format(targetID),
+			"requirement_version_id":    platformid.Format(revision.ID),
+			"revision":                  revision.Revision,
+			"status":                    string(version.RequirementDraft),
+			"affected_case_version_ids": affected,
+		}, map[string]any{"requirement_id": platformid.Format(targetID)})
+		s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementReopened, "requirement merged")
+	}
+
+	for _, sourceID := range kept {
+		if err := s.obsoleteRequirement(ctx, versionID, sourceID, "merged_into:"+platformid.Format(targetID), actorID, now); err != nil {
+			return RequirementMergeResult{}, err
+		}
+		sourceRevisionID := int64(0)
+		if sourceAggregate, err := s.repo.Get(ctx, versionID, sourceID); err == nil {
+			if current, ok := currentVersion(sourceAggregate); ok {
+				sourceRevisionID = current.ID
+			}
+		}
+		relation := version.Relation{
+			ID:                s.ids.Next(),
+			VersionID:         versionID,
+			FromRequirementID: targetID,
+			ToRequirementID:   sourceID,
+			Kind:              version.RelationOverlaps,
+			Description:       "merged duplicate into " + platformid.Format(targetID),
+			CreatedBy:         optionalActor(actorID),
+			CreatedAt:         now,
+		}
+		if sourceRevisionID > 0 {
+			relation.SourceRevisionID = &sourceRevisionID
+		}
+		if err := s.repo.CreateRelation(ctx, relation); err != nil && !errors.Is(err, version.ErrRelationDuplicate) {
+			return RequirementMergeResult{}, mapRequirementRepositoryError(err)
+		}
+	}
+	s.publishEvent(ctx, versionID, "requirement.merged", map[string]any{
+		"requirement_id":         platformid.Format(targetID),
+		"source_requirement_ids": formatStageIDs(kept),
+	}, map[string]any{"requirement_id": platformid.Format(targetID)})
+	s.recordAudit(ctx, actorID, "requirement.merged", "requirement", platformid.Format(targetID), map[string]any{
+		"source_requirement_ids": formatStageIDs(kept),
+	})
+	detail, err := s.Get(ctx, versionID, targetID)
+	if err != nil {
+		return RequirementMergeResult{}, err
+	}
+	return RequirementMergeResult{Requirement: detail, MergedIDs: kept}, nil
+}
+
+// obsoleteRequirement retires one requirement without adding a revision and
+// publishes/audits the change.
+func (s *RequirementService) obsoleteRequirement(ctx context.Context, versionID, requirementID int64, reason string, actorID int64, now time.Time) error {
+	if err := s.repo.SetStatus(ctx, versionID, requirementID, version.RequirementObsolete, now); err != nil {
+		return mapRequirementRepositoryError(err)
+	}
+	requirementIDString := platformid.Format(requirementID)
+	s.publishEvent(ctx, versionID, "requirement.obsoleted", map[string]any{
+		"requirement_id": requirementIDString,
+		"status":         string(version.RequirementObsolete),
+		"reason":         reason,
+	}, map[string]any{"requirement_id": requirementIDString})
+	s.recordAudit(ctx, actorID, "requirement.obsoleted", "requirement", requirementIDString, map[string]any{
+		"reason": reason,
+	})
+	return nil
+}
+
+// normalizeRequirementText lowercases and collapses whitespace so a duplicated
+// draft with cosmetic differences still matches.
+func normalizeRequirementText(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
+}
+
+// appendUniqueText appends extra unless it is empty or already contained.
+func appendUniqueText(base, extra string) string {
+	extra = strings.TrimSpace(extra)
+	if extra == "" {
+		return base
+	}
+	if strings.Contains(base, extra) {
+		return base
+	}
+	if strings.TrimSpace(base) == "" {
+		return extra
+	}
+	return strings.TrimRight(base, "\n") + "\n\n" + extra
+}
+
+// appendUniqueStrings unions target sets preserving order.
+func appendUniqueStrings(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	merged := make([]string, 0, len(base)+len(extra))
+	for _, value := range append(append([]string{}, base...), extra...) {
+		if _, duplicate := seen[value]; duplicate || strings.TrimSpace(value) == "" {
+			continue
+		}
+		seen[value] = struct{}{}
+		merged = append(merged, value)
+	}
+	return merged
+}
+
+// priorityRank orders priorities with P0 highest.
+func priorityRank(priority string) int {
+	switch priority {
+	case "P0":
+		return 0
+	case "P1":
+		return 1
+	case "P2":
+		return 2
+	case "P3":
+		return 3
+	default:
+		return 4
+	}
 }
 
 // Rollback copies the confirmed revision into a new draft revision, calls the

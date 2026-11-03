@@ -637,9 +637,47 @@ func mapStageRepositoryError(err error) error {
 // stage other than its single source stage. Reusing the plain transition
 // validator is not enough: the graph has legitimate back edges (for example
 // case_review -> designing), so a gate must pin its source explicitly to avoid
-// walking the version backwards.
+// walking the version backwards. The details carry the required/current stage
+// and a next action so the API and UI can guide the user instead of only
+// showing the raw error (Task 78).
 func invalidStageForGate(gate string, want, current version.Stage) error {
-	return platform.NewError(http.StatusConflict, "invalid_stage_for_gate", fmt.Sprintf(
-		"%s gate requires stage %s, but the version is at %s", gate, want, current,
-	))
+	return &platform.Error{
+		Status: http.StatusConflict,
+		Code:   "invalid_stage_for_gate",
+		Message: fmt.Sprintf(
+			"%s gate requires stage %s, but the version is at %s", gate, want, current,
+		),
+		Details: map[string]any{
+			"gate":           gate,
+			"required_stage": string(want),
+			"current_stage":  string(current),
+			"next_action":    gateNextAction(gate, want, current),
+		},
+	}
+}
+
+// gateNextAction turns a wrong-stage gate attempt into the user's next step.
+// Both gates are reached through the deterministic workflow, so the guidance is
+// expressed in product terms rather than internal stage names only.
+func gateNextAction(gate string, want, current version.Stage) string {
+	if gate == stageGateRequirement {
+		switch current {
+		case version.StageCreated, version.StageClarifying:
+			return "finish clarification and confirm the requirement drafts, then retry the requirement gate"
+		case version.StageDesigning, version.StageCaseReview, version.StageExecuting, version.StageReporting:
+			return "the requirement gate is already past; continue with the current stage"
+		}
+		return fmt.Sprintf("reach stage %s before confirming requirements", want)
+	}
+	switch current {
+	case version.StageCreated, version.StageClarifying, version.StageRequirementReview:
+		return "confirm the requirements and start design; confirm the selected cases at the case gate and execute them again"
+	case version.StageDesigning:
+		return "wait for design generation to reach the case gate, then confirm and execute the selected cases"
+	case version.StageCaseReview:
+		return "retry the case gate"
+	case version.StageExecuting, version.StageReporting:
+		return "a batch is already executing; wait for it to finish or cancel it before confirming another batch"
+	}
+	return fmt.Sprintf("reach stage %s before confirming cases", want)
 }

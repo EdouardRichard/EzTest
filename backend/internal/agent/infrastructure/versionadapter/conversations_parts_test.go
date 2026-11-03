@@ -121,10 +121,12 @@ func TestConversationPortUpsertsJobCard(t *testing.T) {
 		Data: map[string]any{
 			"job_id":     "501",
 			"kind":       "requirement.curate",
-			"status":     "running",
+			"status":     "failed",
 			"current":    int64(2),
 			"total":      int64(0),
-			"cancelable": true,
+			"cancelable": false,
+			"code":       "llm_capability_mismatch",
+			"reason":     `llm model "text-only" does not support images; choose a model with vision`,
 		},
 	})
 	if err != nil {
@@ -134,9 +136,15 @@ func TestConversationPortUpsertsJobCard(t *testing.T) {
 		t.Fatalf("message = %#v", message)
 	}
 	if got.Type != "job_card" || got.JobID != 501 || got.JobKind != "requirement.curate" ||
-		got.Status != "running" || got.Current != 2 || got.Total != 0 ||
-		got.Cancelable == nil || !*got.Cancelable {
+		got.Status != "failed" || got.Current != 2 || got.Total != 0 ||
+		got.Cancelable == nil || *got.Cancelable {
 		t.Fatalf("mapped job card = %#v", got)
+	}
+	// Task 75: the typed failure code and reason reach the version writer so the
+	// stored card (and the reloaded thread) explains the failure.
+	if got.Code != "llm_capability_mismatch" ||
+		got.Reason != `llm model "text-only" does not support images; choose a model with vision` {
+		t.Fatalf("mapped job card failure = %q/%q, want the typed code/reason", got.Code, got.Reason)
 	}
 	if err := version.ValidateJobCardMessage(got); err != nil {
 		t.Fatalf("mapped job card rejected by the version validator: %v", err)

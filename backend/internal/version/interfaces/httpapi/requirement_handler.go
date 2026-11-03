@@ -38,8 +38,24 @@ type RequirementClosureReader interface {
 	LatestClosure(ctx context.Context, requirementID int64) (versionapp.RequirementClosureView, bool, error)
 }
 
+// RequirementStageConverger applies the clarifying -> requirement_review edge
+// after a user confirms requirement drafts through the real API (Task 78). The
+// deterministic stage machine implements it; a nil converger keeps the handler
+// usable in P1-only assemblies, while production always wires it.
+type RequirementStageConverger interface {
+	ConvergeClarification(ctx context.Context, versionID int64) error
+}
+
 // RequirementHandlerOption configures the optional P4 requirement dependencies.
 type RequirementHandlerOption func(*RequirementHandler)
+
+// WithRequirementStageConverger wires the clarifying -> requirement_review edge
+// so a confirmed requirement advances the version even when the user confirms
+// it through POST /requirements/confirmations instead of the clarification
+// host. It is idempotent and a no-op outside clarifying.
+func WithRequirementStageConverger(converger RequirementStageConverger) RequirementHandlerOption {
+	return func(h *RequirementHandler) { h.stage = converger }
+}
 
 // WithRequirementReopener wires the closure service behind
 // POST /api/versions/{versionId}/requirements/{requirementId}/reopen.
@@ -58,6 +74,7 @@ type RequirementHandler struct {
 	svc      RequirementService
 	reopen   RequirementReopener
 	closures RequirementClosureReader
+	stage    RequirementStageConverger
 }
 
 // NewRequirementHandler builds the requirement handler. The P4 services are
@@ -196,6 +213,10 @@ func (h *RequirementHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	if err := h.convergeStage(r.Context(), versionID); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
 	httpx.JSON(w, http.StatusOK, toConfirmRequirementDTO(result))
 }
 
@@ -222,6 +243,10 @@ func (h *RequirementHandler) BatchConfirm(w http.ResponseWriter, r *http.Request
 	}
 	result, err := h.svc.BatchConfirm(r.Context(), versionID, ids, actorID)
 	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if err := h.convergeStage(r.Context(), versionID); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
@@ -350,6 +375,18 @@ func requirementPathIDs(r *http.Request) (int64, int64, error) {
 		return 0, 0, err
 	}
 	return versionID, requirementID, nil
+}
+
+// convergeStage moves a clarifying version to requirement_review after a user
+// requirement confirmation. It is a no-op outside clarifying, so repeated
+// confirmations, the requirement hard gate and already-designing versions are
+// unaffected. A stage failure is surfaced: the confirmation rows are committed
+// and retrying the same confirmation converges the stage.
+func (h *RequirementHandler) convergeStage(ctx context.Context, versionID int64) error {
+	if h.stage == nil {
+		return nil
+	}
+	return h.stage.ConvergeClarification(ctx, versionID)
 }
 
 // withClosure projects the newest closure round onto one requirement view. The

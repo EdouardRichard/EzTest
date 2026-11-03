@@ -1,9 +1,8 @@
 package main
 
-// Tests for the event-driven execution intent scan. The pre-0.2.1 scheduler
-// polled the intent scan every five 1s ticks; it is now woken by the
-// design.case_confirmed event, with EZTEST_INTENT_SCAN_INTERVAL kept as a
-// compatibility poll until P10 acceptance.
+// Tests for the leader-gated execution intent scan. The scan is only a startup/
+// compatibility repair path since Task 78: initial intents are created by the
+// explicit execute.batch stage job at executing, never by a case confirmation.
 
 import (
 	"context"

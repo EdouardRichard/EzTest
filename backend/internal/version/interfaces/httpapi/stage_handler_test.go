@@ -394,6 +394,65 @@ func TestStageConfirmCasesAcceptsPartialSelection(t *testing.T) {
 	}
 }
 
+// TestBatchGateRequiresCaseReview pins the QA-F1 fix: the case hard gate (the
+// batch execute/confirm gate) is only available at case_review. A version that
+// never advanced past clarifying must get a typed 409 with stage guidance, not
+// a silent success, and it must not confirm cases, move the stage or enqueue a
+// batch. The same request at case_review advances and carries the selected case
+// IDs into the execute.batch job.
+func TestBatchGateRequiresCaseReview(t *testing.T) {
+	mux, repo, jobs, audit, confirmer := newStageTestServerWithConfirmer(t, version.StageClarifying, &handlerGateConfirmer{})
+	recorder := call(t, mux, http.MethodPost, "/api/versions/101/stage/confirm-cases",
+		`{"case_ids":["501","502"]}`, actor())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", recorder.Code, recorder.Body.String())
+	}
+	body := errorBody(t, recorder)
+	if code := body["code"]; code != "invalid_stage_for_gate" {
+		t.Fatalf("error code = %#v, want invalid_stage_for_gate", code)
+	}
+	details, ok := body["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("details = %#v, want an object with stage guidance", body["details"])
+	}
+	if details["required_stage"] != "case_review" || details["current_stage"] != "clarifying" {
+		t.Fatalf("stage guidance = %#v", details)
+	}
+	if next, _ := details["next_action"].(string); next == "" {
+		t.Fatalf("next_action = %#v, want actionable guidance", details["next_action"])
+	}
+	if len(repo.applied) != 0 || repo.state.Stage != version.StageClarifying {
+		t.Fatalf("wrong-stage case gate moved the stage: %#v", repo.state)
+	}
+	if len(jobs.jobs) != 0 || len(audit.events) != 0 {
+		t.Fatalf("wrong-stage case gate wrote jobs=%#v audits=%#v", jobs.jobs, audit.events)
+	}
+	if len(confirmer.caseCalls) != 0 {
+		t.Fatalf("wrong-stage case gate confirmed cases: %#v", confirmer.caseCalls)
+	}
+
+	// At case_review the same batch gate is available and narrows execute.batch
+	// to exactly the selected cases.
+	mux, repo, jobs, _, confirmer = newStageTestServerWithConfirmer(t, version.StageCaseReview, &handlerGateConfirmer{})
+	recorder = call(t, mux, http.MethodPost, "/api/versions/101/stage/confirm-cases",
+		`{"case_ids":["501","502"]}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("case_review status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if repo.state.Stage != version.StageExecuting {
+		t.Fatalf("stage = %q, want executing", repo.state.Stage)
+	}
+	if len(confirmer.caseCalls) != 1 || len(confirmer.caseCalls[0]) != 2 {
+		t.Fatalf("case gate confirmer calls = %#v", confirmer.caseCalls)
+	}
+	if len(jobs.jobs) != 1 || jobs.jobs[0].Kind != versionapp.StageJobExecuteBatch {
+		t.Fatalf("jobs = %#v, want one execute.batch", jobs.jobs)
+	}
+	if got := jobs.jobs[0].CaseIDs; len(got) != 2 || got[0] != 501 || got[1] != 502 {
+		t.Fatalf("execute.batch case ids = %#v, want the selected cases only", got)
+	}
+}
+
 func TestStageRejectValidatesAndMovesBack(t *testing.T) {
 	mux, repo, _, audit := newStageTestServer(t, version.StageCaseReview)
 	recorder := call(t, mux, http.MethodPost, "/api/versions/101/stage/reject", `{"reason":"coverage gap"}`, actor())

@@ -7,11 +7,13 @@ import { cn } from "@/components/ui/cn"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import type { ConversationModel } from "@/features/conversation/api"
+import type { VersionStage } from "@/features/design/types"
 import { getVersion } from "@/features/versions/api"
 import type { Version } from "@/features/versions/types"
 
 import {
   confirmRequirements,
+  confirmStageRequirements,
   createConversation,
   getRequirement,
   listConversations,
@@ -36,6 +38,10 @@ import { useVersionEvents } from "./useVersionEvents"
 
 export type RequirementsTabProps = {
   versionId: string
+  /** Deterministic version stage; drives the "开始设计" requirement gate. */
+  stage?: VersionStage | null
+  /** Refresh the page-level stage projection after a hard-gate transition. */
+  onStageChanged?: () => void
   /** Deep link target from `?conversation=`; URL stays the source of truth. */
   initialConversationId?: string
   /** Deep link target from `?requirement=`; URL stays the source of truth. */
@@ -69,6 +75,8 @@ function activityText(payload: Record<string, unknown>): string | null {
  */
 export function RequirementsTab({
   versionId,
+  stage = null,
+  onStageChanged,
   initialConversationId,
   initialRequirementId,
 }: RequirementsTabProps) {
@@ -95,6 +103,8 @@ export function RequirementsTab({
   const [bulkConfirming, setBulkConfirming] = useState(false)
   const [bulkNotice, setBulkNotice] = useState<string | null>(null)
   const [bulkError, setBulkError] = useState<unknown>(null)
+  const [startingDesign, setStartingDesign] = useState(false)
+  const [designError, setDesignError] = useState<unknown>(null)
 
   const [creatingConversation, setCreatingConversation] = useState(false)
   const [createError, setCreateError] = useState<unknown>(null)
@@ -274,6 +284,7 @@ export function RequirementsTab({
       const selectedConfirmed = selectedIds.some((id) => result.confirmed.includes(id))
       setSelectedIds([])
       await Promise.all([loadRequirements(), loadVersion()])
+      onStageChanged?.()
       if (selectedConfirmed && selectedRequirementId !== null) {
         setDetailToken((token) => token + 1)
       }
@@ -284,10 +295,43 @@ export function RequirementsTab({
     }
   }
 
+  /**
+   * Applies the requirement hard gate for the clarified requirements and moves
+   * the viewer to the design workspace. This is what makes "开始设计" actually
+   * advance `requirement_review -> designing` (Task 78); the previous deep link
+   * left the version at the requirement gate while the design used to generate
+   * cases at the wrong stage.
+   */
+  async function startDesign(): Promise<void> {
+    const clarifiedIds = requirements
+      .filter((requirement) => requirement.status === "clarified")
+      .map((requirement) => requirement.id)
+    if (clarifiedIds.length === 0) return
+    setStartingDesign(true)
+    setDesignError(null)
+    try {
+      // Recovery path: if a requirement confirmation did not converge the
+      // version (older path, failed event), re-confirm the already-clarified
+      // selections first so the hard gate below always has its source stage.
+      if (stage === "clarifying" || stage === "created") {
+        await confirmRequirements(versionId, clarifiedIds)
+      }
+      await confirmStageRequirements(versionId, clarifiedIds)
+      await Promise.all([loadRequirements(), loadVersion()])
+      onStageChanged?.()
+      router.replace(`/versions/${encodeURIComponent(versionId)}?tab=design`)
+    } catch (cause) {
+      setDesignError(cause)
+    } finally {
+      setStartingDesign(false)
+    }
+  }
+
   function requirementUpdated(next: RequirementDetail): void {
     setDetail(next)
     void loadRequirements().catch(() => {})
     void loadVersion().catch(() => {})
+    onStageChanged?.()
   }
 
   /**
@@ -351,7 +395,17 @@ export function RequirementsTab({
         />
 
         <div className="flex min-w-0 flex-col gap-3">
-          <DesignCTA versionId={versionId} pendingCount={pendingDesignCount} />
+          <DesignCTA
+            versionId={versionId}
+            pendingCount={pendingDesignCount}
+            stage={stage}
+            starting={startingDesign}
+            onStartDesign={() => {
+              void startDesign()
+            }}
+          />
+
+          {designError !== null ? <InlineError error={designError} /> : null}
 
           {bulkNotice !== null ? (
             <p

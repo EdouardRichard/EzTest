@@ -68,6 +68,7 @@ func p9AugmentGapFact(id, requirementID int64, requirementTitle string) versiond
 			"dimension":         "acceptance",
 			"requirement_id":    requirementID,
 			"requirement_title": requirementTitle,
+			"target":            "/checkout",
 			"reason":            "缺少验收标准",
 			"question":          "请补充验收标准",
 		},

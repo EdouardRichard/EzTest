@@ -536,6 +536,57 @@ func TestCreateDesignConversationAllowsDesignAndEnqueuesDesignTeam(t *testing.T)
 	}
 }
 
+// fakeDesignRequirements counts the version's clarified requirements.
+type fakeDesignRequirements struct {
+	count     int
+	err       error
+	calls     int
+	versionID int64
+}
+
+func (f *fakeDesignRequirements) CountClarifiedRequirements(_ context.Context, versionID int64) (int, error) {
+	f.calls++
+	f.versionID = versionID
+	return f.count, f.err
+}
+
+// TestDesignRequiresClarified pins the product-owner gate finding: a design
+// conversation must not be created (burning AI work) when the version has no
+// clarified requirement; the failure is a typed conflict the UI can explain.
+func TestDesignRequiresClarified(t *testing.T) {
+	env := newConversationEnv(t)
+	counter := &fakeDesignRequirements{count: 0}
+	env.svc.SetClarifiedRequirementCounter(counter)
+
+	_, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || apiErr.Code != "design_requirements_missing" {
+		t.Fatalf("design create err = %v, want 409 design_requirements_missing", err)
+	}
+	if counter.calls != 1 || counter.versionID != env.versionID {
+		t.Fatalf("counter calls = %d version = %d", counter.calls, counter.versionID)
+	}
+	if len(env.repo.conversations) != 0 || len(env.queue.tasks) != 0 {
+		t.Fatalf("blocked design conversation created side effects: conversations=%d tasks=%d",
+			len(env.repo.conversations), len(env.queue.tasks))
+	}
+
+	// Clarification conversations are unaffected: requirements are clarified there.
+	if _, err := env.svc.Create(requestContext(), env.versionID, "clarification", "", 42); err != nil {
+		t.Fatalf("clarification create: %v", err)
+	}
+
+	// One clarified requirement unlocks the design conversation.
+	counter.count = 1
+	view, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42)
+	if err != nil {
+		t.Fatalf("design create with a clarified requirement: %v", err)
+	}
+	if view.Kind != version.ConversationDesign {
+		t.Fatalf("view = %#v", view)
+	}
+}
+
 func TestDesignConversationUserMessageSkipsCurateAndUsesDesignTeam(t *testing.T) {
 	env := newConversationEnv(t)
 	conversation, err := env.svc.Create(requestContext(), env.versionID, "design", "Design chat", 42)
@@ -999,6 +1050,7 @@ func TestListReconcilableClampsLimit(t *testing.T) {
 // is persisted as an `image` part, not an attachment part or extracted text.
 func TestPostUserMessageStoresImagePart(t *testing.T) {
 	env := newConversationEnv(t)
+	env.svc.SetModelCatalog(visionConversationCatalog())
 	conversation, err := env.svc.Create(requestContext(), env.versionID, "clarification", "Chat", 42)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -1062,6 +1114,7 @@ func newImageConversationEnv(t *testing.T) *imageConversationEnv {
 	repo := newFakeConversationRepo()
 	svc := versionapp.NewConversationService(
 		repo, &fakeQueue{}, attachEnv.svc, base.svc, fixedClock{at: testTime}, &seqIDs{}, &fakePublisher{})
+	svc.SetModelCatalog(visionConversationCatalog())
 	conversation, err := svc.Create(requestContext(), created.ID, "clarification", "Chat", 42)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

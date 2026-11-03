@@ -132,7 +132,9 @@ type RuntimeRepository interface {
 	GetProfile(ctx context.Context, key string) (AgentProfile, error)
 	// ListProfiles returns every profile ordered by key.
 	ListProfiles(ctx context.Context) ([]AgentProfile, error)
-	// CreateRun inserts a running agent_run row.
+	// CreateRun inserts one agent_run row with the status it carries: running
+	// for a dispatch-ready attempt, failed with a terminal_reason/finished_at
+	// for an attempt that stopped before dispatch.
 	CreateRun(ctx context.Context, run AgentRun) (AgentRun, error)
 	// FinishRun persists the terminal status/counters. It fences on
 	// (id, lease_epoch) and returns ErrLeaseLost when the run was taken over.

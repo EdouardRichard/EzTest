@@ -336,15 +336,18 @@ type conversationModelCatalog struct {
 	svc *llmapp.Service
 }
 
-func (c conversationModelCatalog) ResolveConversationModel(ctx context.Context, modelOverride string) (string, error) {
+func (c conversationModelCatalog) ResolveConversationModel(ctx context.Context, modelOverride string) (versionapp.ConversationModel, error) {
 	if c.svc == nil {
-		return "", errors.New("conversation model catalog has no llm service")
+		return versionapp.ConversationModel{}, errors.New("conversation model catalog has no llm service")
 	}
 	model, err := c.svc.ResolveSelectableModel(ctx, modelOverride)
 	if err != nil {
-		return "", err
+		return versionapp.ConversationModel{}, err
 	}
-	return model.Model, nil
+	return versionapp.ConversationModel{
+		Model:          model.Model,
+		SupportsVision: model.EffectiveCapabilities().SupportsVision,
+	}, nil
 }
 
 // designVersionStarter projects a version to running for design activation.
@@ -394,24 +397,26 @@ func (a designRoundStarterAdapter) StartDesignRound(ctx context.Context, version
 }
 
 // batchIntentEnsurer is the narrow execution-side surface consumed by the
-// execute.batch stage-entry job.
+// execute.batch stage-entry job. The scoped call keeps the batch to the selected
+// case IDs (D23) instead of every confirmed case of the version.
 type batchIntentEnsurer interface {
-	EnsureInitialIntents(ctx context.Context, versionID int64) (int, error)
+	EnsureInitialIntentsForCases(ctx context.Context, versionID int64, caseIDs []int64) (int, error)
 }
 
 // executionBatchStarterAdapter consumes the execute.batch stage-entry work item:
 // the deterministic scheduler owns execution, so the adapter only refreshes the
 // confirmed batch's execution intents (idempotent) and the scheduler dispatches
-// the per-case runs.
+// the per-case runs. The work item carries the selected case IDs, so the refresh
+// never widens the batch to unselected confirmed cases.
 type executionBatchStarterAdapter struct {
 	intents batchIntentEnsurer
 }
 
-func (a executionBatchStarterAdapter) StartBatch(ctx context.Context, versionID int64, _ []int64) error {
+func (a executionBatchStarterAdapter) StartBatch(ctx context.Context, versionID int64, caseIDs []int64) error {
 	if a.intents == nil {
 		return errors.New("execution batch starter has no intent service")
 	}
-	_, err := a.intents.EnsureInitialIntents(ctx, versionID)
+	_, err := a.intents.EnsureInitialIntentsForCases(ctx, versionID, caseIDs)
 	return err
 }
 
@@ -731,13 +736,13 @@ func parseCaseBindingID(value string) int64 {
 }
 
 // runExecutionScheduler drives the event-driven intent scan, wave planner and
-// recovery sweep. Case confirmations wake the intent scan through the eventing
-// observer seam (design.case_confirmed); a positive scanInterval additionally
-// runs the old periodic full scan as a compatibility switch until P10
-// acceptance. The scan is idempotent (P3 §5.1). Errors are logged and retried;
-// the loop exits with the process context. The whole tick is leader-gated
-// (P7 §4.5: scheduler+recovery run on the leader only; in-flight work stays
-// protected by leases).
+// recovery sweep. The scan is stage-gated (Task 78): only versions at executing
+// create initial intents, so a case confirmation at the case gate can never
+// auto-create a wave. A positive scanInterval restores the old periodic full
+// scan as a compatibility switch until P10 acceptance. The scan is idempotent
+// (P3 §5.1). Errors are logged and retried; the loop exits with the process
+// context. The whole tick is leader-gated (P7 §4.5: scheduler+recovery run on
+// the leader only; in-flight work stays protected by leases).
 func runExecutionScheduler(
 	ctx context.Context,
 	gate orchestrationapp.LeaderGate,
@@ -993,6 +998,10 @@ func main() {
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
 	conversationSvc.SetModelCatalog(conversationModelCatalog{svc: llmSvc})
+	// Task 77: a design conversation cannot be created before at least one
+	// requirement is clarified; the gate is typed and checked before any round
+	// or model run is started.
+	conversationSvc.SetClarifiedRequirementCounter(requirementSvc)
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
 	// 0.2.1 job control (cancel/retry) is mounted by the HTTP layer only when
 	// server.Deps.Jobs is set. The repository is the postgres job-control
@@ -1090,6 +1099,9 @@ func main() {
 		ExecutorURL:   executorURL,
 		ExecutorToken: executorToken,
 		Now:           clk.Now,
+		// Discovery proposes the pages/APIs it finds into this SUT environment's
+		// catalog, so a version can bind them (task 76).
+		Resources: resourceSvc,
 	})
 	if err != nil {
 		log.Fatalf("eztest: wire P9 explore runtime: %v", err)
@@ -1298,6 +1310,11 @@ func main() {
 	// pass; the stage machine only transitions a version that is still designing,
 	// so the call is idempotent and case_review has no stage-entry job.
 	designPlanner.SetDesignConverger(stageMachine)
+	// Task 78: the execution intent gate reads the deterministic stage through
+	// the same adapter, so a case confirmed at the case gate cannot auto-create
+	// an intent/wave. Wired here because the stage machine is assembled after
+	// the execution context.
+	executionVersionAdapter.SetStageReader(stageMachine)
 
 	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
 		Requirements: requirementRepo,
@@ -1570,9 +1587,9 @@ func main() {
 	// channel, so a slow observer never delays SSE delivery. Both delivery
 	// paths are wired: local publishes (this replica) and cross-instance events
 	// loaded by the P7 listener, so a worker on any replica wakes the leader.
-	// Case confirmation additionally wakes the execution intent scan; the
-	// observer only records the version and the leader-gated scheduler loop
-	// performs the database work.
+	// Execution intents are NOT refreshed from design.case_confirmed any more
+	// (Task 78): a confirmed case is not executable before the explicit case
+	// hard gate. The execute.batch stage-entry job owns the scoped refresh.
 	intentWake := newExecutionIntentWake()
 	wake := func(_ context.Context, event eventingdomain.Event) error {
 		versionID := reconcilerEventVersionID(event)
@@ -1581,9 +1598,6 @@ func main() {
 		// the discovery sub-loop starts and the version leaves the created
 		// stage before the create response is returned.
 		advanceCreatedVersionToClarifying(ctx, stageMachine, event)
-		if event.Type == designCaseConfirmedEvent {
-			intentWake.Notify(versionID)
-		}
 		// P9 explore analysis (Task 37): every version-scoped event schedules a
 		// coalesced, leader-gated gap/coverage refresh. The analysis performs
 		// its page probes through the shared explore runtime (Login first,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -49,12 +50,66 @@ func NewIntentService(deps IntentServiceDeps) *IntentService {
 	}
 }
 
+// Initial execution intents only belong to the executing stage (Task 78): a
+// case version that was merely confirmed at the case hard gate is not yet
+// executable, and confirming it must never auto-create a wave. A completed
+// version keeps the P3 §5.9 reopen-on-environment-change semantics.
+const (
+	intentExecutableStage = "executing"
+	intentCompletedStage  = "completed"
+)
+
 // EnsureInitialIntents creates the initial open intents of every
 // current+confirmed case version of a version. It is idempotent: repeated
 // scans, repeated confirmations and API restarts never create a duplicate
 // intent for the same (case_version, fingerprint, baseline, purpose=initial)
 // natural key (P3-D-08). A completed version is reopened first (P3 §5.9).
+//
+// The scan is stage-gated: before the case hard gate (case_review and earlier)
+// a confirmed case is not executable yet, so the scan returns without creating
+// intents and no wave can be planned. The explicit execute.batch stage job uses
+// EnsureInitialIntentsForCases at executing.
 func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int64) (int, error) {
+	return s.ensureInitialIntents(ctx, versionID, nil, false)
+}
+
+// EnsureInitialIntentsForCases is the explicit execute.batch refresh: it creates
+// initial intents only for the selected case IDs (D23) and requires the version
+// to be at executing. A selection naming a case that is not current+confirmed
+// is a typed 409: the caller must not silently run a different/larger batch.
+func (s *IntentService) EnsureInitialIntentsForCases(ctx context.Context, versionID int64, caseIDs []int64) (int, error) {
+	selection, err := normalizeIntentCaseSelection(caseIDs)
+	if err != nil {
+		return 0, err
+	}
+	return s.ensureInitialIntents(ctx, versionID, selection, true)
+}
+
+// normalizeIntentCaseSelection deduplicates the selected case IDs. A nil/empty
+// list keeps the D23 "all current draft cases" meaning and is passed through.
+func normalizeIntentCaseSelection(caseIDs []int64) (map[int64]struct{}, error) {
+	if len(caseIDs) == 0 {
+		return nil, nil
+	}
+	selection := make(map[int64]struct{}, len(caseIDs))
+	for _, caseID := range caseIDs {
+		if caseID <= 0 {
+			return nil, platform.Invalid("case_ids", "must contain positive decimal IDs")
+		}
+		selection[caseID] = struct{}{}
+	}
+	return selection, nil
+}
+
+// ensureInitialIntents is the shared scan. selection != nil narrows it to the
+// selected case IDs; explicit marks the execute.batch path, where a version at
+// the wrong stage must be a typed 409 instead of a silent no-op.
+func (s *IntentService) ensureInitialIntents(
+	ctx context.Context,
+	versionID int64,
+	selection map[int64]struct{},
+	explicit bool,
+) (int, error) {
 	if err := requirePositiveID("version_id", versionID); err != nil {
 		return 0, err
 	}
@@ -62,12 +117,40 @@ func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int6
 	if err != nil {
 		return 0, mapExecutionError(err, "version")
 	}
+	executableStage := binding.Stage == intentExecutableStage ||
+		(!explicit && binding.Stage == intentCompletedStage)
+	if !executableStage {
+		if explicit {
+			return 0, invalidStageForExecution(binding.Stage)
+		}
+		return 0, nil
+	}
 	cases, err := s.cases.ListExecutable(ctx, versionID)
 	if err != nil {
 		return 0, mapExecutionError(err, "version")
 	}
 	if len(cases) == 0 {
 		return 0, nil
+	}
+	if selection != nil {
+		available := make(map[int64]struct{}, len(cases))
+		for _, snapshot := range cases {
+			available[snapshot.CaseID] = struct{}{}
+		}
+		for caseID := range selection {
+			if _, ok := available[caseID]; !ok {
+				return 0, platform.NewError(http.StatusConflict, "selected_case_not_executable", fmt.Sprintf(
+					"selected case %d is not a current confirmed case of the version", caseID,
+				))
+			}
+		}
+		filtered := make([]execution.CaseSnapshot, 0, len(selection))
+		for _, snapshot := range cases {
+			if _, ok := selection[snapshot.CaseID]; ok {
+				filtered = append(filtered, snapshot)
+			}
+		}
+		cases = filtered
 	}
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
@@ -308,6 +391,22 @@ func actorPtr(actorID int64) *int64 {
 		return nil
 	}
 	return &actorID
+}
+
+// invalidStageForExecution is the typed 409 returned when the explicit
+// execute.batch refresh runs on a version that is not at executing. It carries
+// the next action so the caller can guide the user instead of failing silently.
+func invalidStageForExecution(current string) error {
+	return &platform.Error{
+		Status:  http.StatusConflict,
+		Code:    "invalid_stage_for_execution",
+		Message: fmt.Sprintf("batch execution requires stage executing, but the version is at %s", current),
+		Details: map[string]any{
+			"required_stage": "executing",
+			"current_stage":  current,
+			"next_action":    "confirm the selected cases at the case gate and execute the batch again",
+		},
+	}
 }
 
 // caseIntentVersionSUTIDs is the §5.1 intent SUT set: every step's resolved

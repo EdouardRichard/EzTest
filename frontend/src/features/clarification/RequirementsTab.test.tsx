@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
   updateRequirement: vi.fn(),
   confirmRequirement: vi.fn(),
   confirmRequirements: vi.fn(),
+  confirmStageRequirements: vi.fn(),
   rollbackRequirement: vi.fn(),
   listRequirementRelations: vi.fn(),
   getTeamRoom: vi.fn(),
@@ -203,16 +204,47 @@ describe("RequirementsTab shell", () => {
     expect(screen.queryByText("暂无澄清对话")).not.toBeInTheDocument()
   })
 
-  it("links the pending design CTA to the version design tab", async () => {
+  it("applies the requirement gate from the pending design CTA", async () => {
     api.listRequirements.mockResolvedValue([requirementSecondFixture])
+    api.confirmStageRequirements.mockResolvedValue({
+      version_id: "2001",
+      stage: "designing",
+      stage_entered_at: "2026-10-31T10:00:00Z",
+      blocker: null,
+    })
 
     render(<RequirementsTab versionId="2001" />)
 
     expect(await screen.findByTestId("design-cta")).toHaveTextContent("1 条需求待设计")
-    expect(screen.getByRole("link", { name: "开始设计" })).toHaveAttribute(
-      "href",
-      "/versions/2001?tab=design",
+    fireEvent.click(screen.getByRole("button", { name: "开始设计" }))
+
+    await waitFor(() => expect(api.confirmStageRequirements).toHaveBeenCalledWith("2001", ["6002"]))
+    await waitFor(() =>
+      expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=design"),
     )
+  })
+
+  it("recovers a stuck clarifying version before applying the requirement gate", async () => {
+    api.listRequirements.mockResolvedValue([requirementSecondFixture])
+    api.confirmRequirements.mockResolvedValue({
+      batch_id: "batch_1",
+      confirmed: [],
+      skipped: ["6002"],
+    })
+    api.confirmStageRequirements.mockResolvedValue({
+      version_id: "2001",
+      stage: "designing",
+      stage_entered_at: "2026-10-31T10:00:00Z",
+      blocker: null,
+    })
+
+    render(<RequirementsTab versionId="2001" stage="clarifying" />)
+
+    expect(await screen.findByTestId("design-cta")).toHaveTextContent("1 条需求待设计")
+    fireEvent.click(screen.getByRole("button", { name: "开始设计" }))
+
+    await waitFor(() => expect(api.confirmRequirements).toHaveBeenCalledWith("2001", ["6002"]))
+    await waitFor(() => expect(api.confirmStageRequirements).toHaveBeenCalledWith("2001", ["6002"]))
   })
 
   it("prefers the server pending_design_count projection over the local clarified count", async () => {

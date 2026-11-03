@@ -117,6 +117,7 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           break
         case "version.started":
         case "version.status_changed":
+        case "version.stage_changed":
         case "version.closed":
         case "version.reopened":
           handlersRef.current.onVersionChanged?.(event)

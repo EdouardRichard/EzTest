@@ -157,7 +157,9 @@ type MessagePart struct {
 	Title         string
 	Status        string
 	Revision      int
-	Reason        string
+	// Reason is the rollback_proposal explanation and, on a terminal failed
+	// job_card, the user-facing failure reason (Task 75).
+	Reason string
 
 	// thinking
 	DurationMS int64
@@ -175,7 +177,7 @@ type MessagePart struct {
 	// case_card
 	CaseID        int64
 	CaseVersionID int64
-	// error
+	// error; job_card reuses Code as the typed failure code (Task 75)
 	Code      string
 	Message   string
 	Retryable bool
@@ -260,9 +262,14 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 			Current    int    `json:"current"`
 			Total      int    `json:"total"`
 			Cancelable *bool  `json:"cancelable,omitempty"`
+			// Code/Reason explain a terminal failed job (Task 75); they are
+			// omitted on every other snapshot so a healthy card stays unchanged.
+			Code   string `json:"code,omitempty"`
+			Reason string `json:"reason,omitempty"`
 		}{
 			Type: p.Type, JobID: strconv.FormatInt(p.JobID, 10), Kind: p.JobKind,
 			Status: p.Status, Current: p.Current, Total: p.Total, Cancelable: p.Cancelable,
+			Code: p.Code, Reason: p.Reason,
 		}
 		return json.Marshal(payload)
 	case MessagePartCaseCard:
@@ -393,6 +400,8 @@ func (p *MessagePart) UnmarshalJSON(data []byte) error {
 			Current    int             `json:"current"`
 			Total      int             `json:"total"`
 			Cancelable *bool           `json:"cancelable"`
+			Code       string          `json:"code"`
+			Reason     string          `json:"reason"`
 		}
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return err
@@ -404,6 +413,7 @@ func (p *MessagePart) UnmarshalJSON(data []byte) error {
 		*p = MessagePart{
 			Type: probe.Type, JobID: jobID, JobKind: payload.Kind, Status: payload.Status,
 			Current: payload.Current, Total: payload.Total, Cancelable: payload.Cancelable,
+			Code: payload.Code, Reason: payload.Reason,
 		}
 	case MessagePartCaseCard:
 		var payload struct {
@@ -797,6 +807,19 @@ func validateJobCardPayload(part MessagePart, field func(string) string) error {
 	}
 	if part.Cancelable != nil && *part.Cancelable && !cancelable {
 		return platform.Invalid(field("cancelable"), "must be false for a terminal job status")
+	}
+	// Task 75: a terminal failed card may carry the typed failure code and the
+	// user-facing reason. They are optional so every earlier snapshot and every
+	// successful card keeps its previous shape.
+	if part.Code != "" {
+		if err := validation.String(field("code"), part.Code, 0, MessageErrorCodeMax); err != nil {
+			return err
+		}
+	}
+	if part.Reason != "" {
+		if err := validation.String(field("reason"), part.Reason, 0, MessageErrorMessageMax); err != nil {
+			return err
+		}
 	}
 	return nil
 }

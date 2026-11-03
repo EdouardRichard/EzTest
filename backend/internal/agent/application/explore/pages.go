@@ -62,11 +62,14 @@ type PageDiscoveryConfig struct {
 // PageCloser is optional: when nil, an Executor that implements PageCloser is
 // used automatically so the crawl can release the page it opened. A closer
 // that never sees the page (no dependency and no capability) leaves it open and
-// the result reports its id for the caller to release.
+// the result reports its id for the caller to release. Resources is optional:
+// when set, every discovered page is also proposed into the resource catalog so
+// a version can bind it (task 76); nil keeps discovery fact-only.
 type PageDiscoveryDeps struct {
 	Executor   Executor
 	Facts      FactRecorder
 	PageCloser PageCloser
+	Resources  ResourceProposalWriter
 }
 
 // PageElement is one interactive DOM element of a discovered page. Values are
@@ -115,14 +118,21 @@ type PageDiscoveryResult struct {
 	Truncated      bool             `json:"truncated"`
 	SkippedLinks   int              `json:"skipped_links"`
 	FactIDs        []int64          `json:"fact_ids"`
+	// ProposedResources counts pages written to the resource catalog as
+	// proposed rows; ResourceErrors counts write failures. A write failure is
+	// best effort and never discards the facts or the crawl result.
+	ProposedResources int    `json:"proposed_resources"`
+	ResourceErrors    int    `json:"resource_errors"`
+	ResourceError     string `json:"resource_error,omitempty"`
 }
 
 // PageDiscovery is one bounded runtime page crawl.
 type PageDiscovery struct {
-	cfg   PageDiscoveryConfig
-	exec  Executor
-	facts FactRecorder
-	pages PageCloser
+	cfg       PageDiscoveryConfig
+	exec      Executor
+	facts     FactRecorder
+	pages     PageCloser
+	resources ResourceProposalWriter
 }
 
 // NewPageDiscovery wires one crawl. The page closer defaults to the executor
@@ -132,7 +142,7 @@ func NewPageDiscovery(cfg PageDiscoveryConfig, deps PageDiscoveryDeps) *PageDisc
 	if pages == nil {
 		pages, _ = deps.Executor.(PageCloser)
 	}
-	return &PageDiscovery{cfg: cfg, exec: deps.Executor, facts: deps.Facts, pages: pages}
+	return &PageDiscovery{cfg: cfg, exec: deps.Executor, facts: deps.Facts, pages: pages, resources: deps.Resources}
 }
 
 type pageTarget struct {
@@ -343,6 +353,16 @@ func (d *PageDiscovery) Run(ctx context.Context, versionID int64) (result PageDi
 			}
 			result.FactIDs = append(result.FactIDs, stored.ID)
 		}
+	}
+	// Discovery evidence becomes a bindable resource: propose every crawled
+	// page into the catalog of the environment the version binds. This is the
+	// missing step between "page discovered" and "version has pages".
+	proposed, failures, firstError, proposeErr := proposePageResources(ctx, d.resources, cfg.EnvironmentID, result.Pages)
+	result.ProposedResources = proposed
+	result.ResourceErrors = failures
+	result.ResourceError = firstError
+	if proposeErr != nil {
+		return result, proposeErr
 	}
 	return result, nil
 }

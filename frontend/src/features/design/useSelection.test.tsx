@@ -114,20 +114,19 @@ describe("DesignMindmap multi-select batch actions", () => {
     expect(props.onBatchConfirmCases).not.toHaveBeenCalledWith(["7001", "7003", "7005", "7007"])
   })
 
-  it("disables batch execute unless every selected case is confirmed", async () => {
+  it("batch executes exactly the selection, including draft cases", async () => {
     const props = renderMindmap()
 
     await selectCases("7003", "7007")
     expect(screen.getByTestId("case-batch-execute")).toBeEnabled()
 
+    // Draft cases are allowed: the explicit case gate confirms the selection
+    // before it creates the execute.batch job (Task 78 / D23).
     await selectCases("7001")
-    expect(screen.getByTestId("case-batch-execute")).toBeDisabled()
+    expect(screen.getByTestId("case-batch-execute")).toBeEnabled()
     fireEvent.click(screen.getByTestId("case-batch-execute"))
-    expect(props.onBatchExecuteCases).not.toHaveBeenCalled()
-
-    await selectCases("7001")
-    fireEvent.click(screen.getByTestId("case-batch-execute"))
-    expect(props.onBatchExecuteCases).toHaveBeenCalledWith(["7003", "7007"])
+    expect(props.onBatchExecuteCases).toHaveBeenCalledWith(["7003", "7007", "7001"])
+    expect(props.onBatchExecuteCases).not.toHaveBeenCalledWith(["7003", "7007", "7001", "7005"])
   })
 
   it("hands the selected cases to the AI modification action", async () => {

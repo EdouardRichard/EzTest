@@ -10,6 +10,11 @@ export type DesignNodeActions = {
   onToggleCaseSelected: (caseId: string) => void
   /** `${scope}:${targetId}` while a confirmation request is in flight. */
   confirmingKey: string | null
+  /**
+   * Case confirmations are only available at the case hard gate (stage
+   * case_review). Defaults to true for isolated canvas tests.
+   */
+  caseReviewEnabled?: boolean
 }
 
 export const DESIGN_STATUS_LABEL: Record<DesignStatus, string> = {

@@ -351,7 +351,7 @@ describe("DesignTab", () => {
     expect(clarificationApi.postMessage).not.toHaveBeenCalled()
   })
 
-  it("batch confirms exactly the checked cases through the stage gate", async () => {
+  it("batch confirms selected cases without creating an execution wave", async () => {
     render(<DesignTab versionId="2001" />)
 
     await screen.findByTestId("case-checkbox-7001")
@@ -360,10 +360,31 @@ describe("DesignTab", () => {
     fireEvent.click(screen.getByTestId("case-batch-confirm"))
 
     await waitFor(() =>
-      expect(api.confirmStageCases).toHaveBeenCalledWith("2001", ["7001", "7003"]),
+      expect(api.confirmCases).toHaveBeenCalledWith("2001", {
+        scope: "case",
+        target_id: "7001",
+      }),
     )
-    expect(api.confirmStageCases).toHaveBeenCalledTimes(1)
-    expect(await screen.findByTestId("design-confirm-notice")).toHaveTextContent("已确认 2 条用例")
+    expect(api.confirmCases).toHaveBeenCalledWith("2001", {
+      scope: "case",
+      target_id: "7003",
+    })
+    expect(api.confirmStageCases).not.toHaveBeenCalled()
+    expect(await screen.findByTestId("design-confirm-notice")).toHaveTextContent(
+      "已确认 2 条用例（未执行）",
+    )
+  })
+
+  it("hides case confirm/execute actions outside the case gate", async () => {
+    render(<DesignTab versionId="2001" stage="designing" />)
+
+    await screen.findByTestId("design-mindmap")
+    expect(screen.getByTestId("case-gate-notice")).toHaveTextContent(
+      "用例确认与批量执行只在「用例待确认」阶段可用",
+    )
+    expect(screen.queryByTestId("case-batch-confirm")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("case-batch-execute")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("btn-confirm-case-7001")).not.toBeInTheDocument()
   })
 
   it("batch executes only the confirmed cases in the selection", async () => {

@@ -161,10 +161,17 @@ func New(deps Deps) http.Handler {
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
 	versionHandler := versionapi.New(deps.Versions, versionapi.WithVersionReopener(deps.VersionClose))
-	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements,
+	requirementOptions := []versionapi.RequirementHandlerOption{
 		versionapi.WithRequirementReopener(deps.Closure),
 		versionapi.WithRequirementClosures(deps.Closure),
-	)
+	}
+	// Task 78: confirming requirements through the real UI API must advance a
+	// clarifying version to requirement_review instead of leaving it stuck.
+	if deps.Stage != nil {
+		requirementOptions = append(requirementOptions,
+			versionapi.WithRequirementStageConverger(deps.Stage))
+	}
+	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements, requirementOptions...)
 	registerVersionRoutes(mux, authenticated, versionHandler)
 	registerRequirementRoutes(mux, authenticated, requirementHandler)
 	var stageHandler *versionapi.StageHandler
@@ -172,10 +179,18 @@ func New(deps Deps) http.Handler {
 		stageHandler = versionapi.NewStageHandler(deps.Stage)
 	}
 	registerStageRoutes(mux, authenticated, stageHandler)
-	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
+	conversationHandler := versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter)
+	if deps.Stage != nil {
+		conversationHandler.SetStageReader(deps.Stage)
+	}
+	registerConversationRoutes(mux, authenticated, conversationHandler)
 	versionapi.RegisterMessageParts(mux, authenticated, versionapi.NewMessagePartsHandler(deps.Conversations))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
-	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
+	designHandler := designapi.New(deps.DesignGraph, deps.DesignExports)
+	if deps.Stage != nil {
+		designHandler.SetStageReader(deps.Stage)
+	}
+	registerDesignRoutes(mux, authenticated, designHandler)
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
 	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
 	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
