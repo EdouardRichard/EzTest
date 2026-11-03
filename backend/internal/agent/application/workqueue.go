@@ -32,6 +32,7 @@ const (
 // backoff capped at MaxBackoff; exhausted or non-retryable failures go dead.
 type WorkQueue struct {
 	repo        agent.WorkItemRepository
+	contract    agent.WorkItemContractRepository
 	clock       clock.Clock
 	lease       time.Duration
 	maxAttempts int
@@ -40,6 +41,8 @@ type WorkQueue struct {
 
 // NewWorkQueue wires the work queue. Zero/invalid tuning values fall back to
 // the P1 defaults so the assembly root can pass settings-derived values later.
+// A repository that also implements the 0.2.1 contract surface enables the
+// contract claim; a legacy-only fake keeps compiling with that path disabled.
 func NewWorkQueue(repo agent.WorkItemRepository, clk clock.Clock, lease time.Duration, maxAttempts int) *WorkQueue {
 	if clk == nil {
 		clk = clock.System{}
@@ -50,7 +53,11 @@ func NewWorkQueue(repo agent.WorkItemRepository, clk clock.Clock, lease time.Dur
 	if maxAttempts < agent.MinMaxAttempts || maxAttempts > agent.MaxMaxAttempts {
 		maxAttempts = DefaultMaxAttempts
 	}
-	return &WorkQueue{repo: repo, clock: clk, lease: lease, maxAttempts: maxAttempts}
+	queue := &WorkQueue{repo: repo, clock: clk, lease: lease, maxAttempts: maxAttempts}
+	if contract, ok := repo.(agent.WorkItemContractRepository); ok {
+		queue.contract = contract
+	}
+	return queue
 }
 
 // SetEvents attaches the event publisher. Work item creation events are
@@ -145,6 +152,57 @@ func (q *WorkQueue) ClaimForTypes(ctx context.Context, claimant string, types []
 		lease = q.lease
 	}
 	return q.repo.ClaimForTypes(ctx, claimant, cleaned, lease)
+}
+
+// ClaimContract leases the next runnable 0.2.1 contract item (kind != "") whose
+// team is in teams. Legacy 0.2.0 rows (kind='') are never selected here; they
+// keep their frozen Claim/ClaimForTeams/ClaimForTypes paths. An empty team set
+// claims nothing, and an unknown team is a client error.
+func (q *WorkQueue) ClaimContract(ctx context.Context, claimant string, teams []agent.Team) (*agent.WorkItem, bool, error) {
+	claimant = strings.TrimSpace(claimant)
+	if claimant == "" {
+		return nil, false, platform.Invalid("claimant", "must not be empty")
+	}
+	if len(teams) == 0 {
+		return nil, false, nil
+	}
+	for _, team := range teams {
+		if !team.Valid() {
+			return nil, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
+		}
+	}
+	if q.contract == nil {
+		// A legacy-only repository has no 0.2.1 contract surface: leave the
+		// contract queue empty so the frozen 0.2.0 claim path keeps working.
+		return nil, false, nil
+	}
+	item, err := q.contract.ClaimWorkItemForTeams(ctx, claimant, teams, q.clock.Now())
+	if err != nil {
+		return nil, false, mapLeaseLost(err)
+	}
+	if item == nil {
+		return nil, false, nil
+	}
+	return item, true, nil
+}
+
+// FailContract records the failure of a claimed 0.2.1 item with the contract
+// retry policy: a retryable failure stays failed and ClaimWorkItem can retry it
+// below max_attempts; a non-retryable failure exhausts the attempt budget so the
+// item is never claimed again. The frozen schema has no 'dead' status in the
+// 0.2.1 contract, so the terminal marker is attempts=max_attempts.
+func (q *WorkQueue) FailContract(ctx context.Context, id, epoch int64, cause error, retryable bool) error {
+	if q.contract == nil {
+		return platform.Unavailable("0.2.1 work item repository is not configured")
+	}
+	message := ""
+	if cause != nil {
+		message = cause.Error()
+	}
+	if retryable {
+		return mapLeaseLost(q.contract.FailWorkItem(ctx, id, epoch, message))
+	}
+	return mapLeaseLost(q.contract.FailWorkItemTerminal(ctx, id, epoch, message))
 }
 
 // MarkRunning moves a freshly claimed item to running.

@@ -297,6 +297,48 @@ func (a designStarterAdapter) StartRound(ctx context.Context, versionID, convers
 	return err
 }
 
+// designStageRoundStarter is the narrow design-side surface consumed by the
+// design.cases stage-entry job (Task 65).
+type designStageRoundStarter interface {
+	StartStageRound(ctx context.Context, versionID int64, requirementIDs []int64) (int64, error)
+}
+
+// designRoundStarterAdapter consumes the design.cases stage-entry work item: it
+// opens/repairs the design round for the hard-gate-confirmed requirements and
+// returns the design conversation the job card is projected into.
+type designRoundStarterAdapter struct {
+	planner designStageRoundStarter
+}
+
+func (a designRoundStarterAdapter) StartDesignRound(ctx context.Context, versionID int64, requirementIDs []int64) (int64, error) {
+	if a.planner == nil {
+		return 0, errors.New("design round starter has no planner")
+	}
+	return a.planner.StartStageRound(ctx, versionID, requirementIDs)
+}
+
+// batchIntentEnsurer is the narrow execution-side surface consumed by the
+// execute.batch stage-entry job.
+type batchIntentEnsurer interface {
+	EnsureInitialIntents(ctx context.Context, versionID int64) (int, error)
+}
+
+// executionBatchStarterAdapter consumes the execute.batch stage-entry work item:
+// the deterministic scheduler owns execution, so the adapter only refreshes the
+// confirmed batch's execution intents (idempotent) and the scheduler dispatches
+// the per-case runs.
+type executionBatchStarterAdapter struct {
+	intents batchIntentEnsurer
+}
+
+func (a executionBatchStarterAdapter) StartBatch(ctx context.Context, versionID int64, _ []int64) error {
+	if a.intents == nil {
+		return errors.New("execution batch starter has no intent service")
+	}
+	_, err := a.intents.EnsureInitialIntents(ctx, versionID)
+	return err
+}
+
 // designMetricsAdapter maps designapp.CaseCounts to the version read model.
 type designMetricsAdapter struct {
 	planner *designapp.Planner
@@ -1364,6 +1406,12 @@ func main() {
 		// confirmation converges the version to requirement_review (S2). The
 		// adapter refuses an empty draft list, so the gate is never opened empty.
 		Clarification: stageClarificationConverger{machine: stageMachine, requirements: requirementSvc},
+		// Task 65: the deterministic consumers of the 0.2.1 stage-entry jobs.
+		// design.cases opens the design round for the hard-gate-confirmed
+		// requirements; execute.batch refreshes the confirmed batch's execution
+		// intents for the deterministic scheduler.
+		DesignRounds: designRoundStarterAdapter{planner: designPlanner},
+		Batches:      executionBatchStarterAdapter{intents: executionIntents},
 		// P7 knowledge injection + usage accounting (S6 report §5).
 		Knowledge:      p7rt.KnowledgeAdapter,
 		KnowledgeUsage: p7rt.KnowledgeAdapter,

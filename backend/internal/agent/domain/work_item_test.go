@@ -99,6 +99,64 @@ func TestValidateNewWorkItem(t *testing.T) {
 	}
 }
 
+// TestStageEntryWorkItemClaimDefaults pins the claimability defaults of the
+// 0.2.1 contract items (Task 65). A stage-entry or background kind must land in
+// a product team the agent worker claims, and the frozen type must carry the
+// kind so the runner can resolve its profile/port. Legacy 0.2.0 NewWorkItem
+// semantics (explicit team/type, ops default for unknown kinds) stay unchanged.
+func TestStageEntryWorkItemClaimDefaults(t *testing.T) {
+	cases := []struct {
+		kind string
+		team agent.Team
+	}{
+		{agent.WorkItemKindDesignCases, agent.TeamDesign},
+		{agent.WorkItemKindReviewCases, agent.TeamDesign},
+		{agent.WorkItemKindExecuteBatch, agent.TeamExecution},
+		{agent.WorkItemKindExploreLogin, agent.TeamClarification},
+		{agent.WorkItemKindExplorePage, agent.TeamClarification},
+		{agent.WorkItemKindExploreAPI, agent.TeamClarification},
+		{agent.WorkItemKindExploreCoverage, agent.TeamClarification},
+		{agent.WorkItemKindExploreGap, agent.TeamClarification},
+		{agent.WorkItemKindAnalyzeFailure, agent.TeamExecution},
+		{agent.WorkItemKindReportVersion, agent.TeamDelivery},
+		{agent.WorkItemKindKnowledgePropose, agent.TeamClarification},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.kind, func(t *testing.T) {
+			normalized := agent.CreateWorkItemParams{VersionID: 7, Kind: testCase.kind}.Normalize()
+			if normalized.Team != testCase.team {
+				t.Fatalf("team = %q, want %q", normalized.Team, testCase.team)
+			}
+			if normalized.Type != testCase.kind {
+				t.Fatalf("type = %q, want the kind %q", normalized.Type, testCase.kind)
+			}
+		})
+	}
+
+	// An explicit legacy team/type keeps winning: the dispatcher may still
+	// address a specific owner without losing the 0.2.0 column semantics.
+	explicit := agent.CreateWorkItemParams{
+		VersionID: 7,
+		Kind:      agent.WorkItemKindDesignCases,
+		Team:      agent.TeamSteward,
+		Type:      "design.round",
+	}.Normalize()
+	if explicit.Team != agent.TeamSteward || explicit.Type != "design.round" {
+		t.Fatalf("explicit overrides = %q/%q", explicit.Team, explicit.Type)
+	}
+
+	// Unknown/legacy kinds keep the 0.2.1 compatibility default (the worker
+	// never claims ops, so an unmapped kind stays inert instead of being
+	// stolen by the wrong executor).
+	unmapped := agent.CreateWorkItemParams{VersionID: 7, Kind: "legacy.unknown"}.Normalize()
+	if unmapped.Team != agent.TeamOps {
+		t.Fatalf("unmapped team = %q, want ops", unmapped.Team)
+	}
+	if unmapped.Type != "legacy.unknown" {
+		t.Fatalf("unmapped type = %q", unmapped.Type)
+	}
+}
+
 func TestWorkItemIsMutableSnapshot(t *testing.T) {
 	payload := json.RawMessage(`{"conversation_id":"9"}`)
 	item := agent.WorkItem{

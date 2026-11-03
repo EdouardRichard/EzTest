@@ -346,6 +346,31 @@ func (q *jobTestQueue) ClaimForTeams(context.Context, string, []agent.Team) (age
 	return q.item, true, nil
 }
 
+func (q *jobTestQueue) ClaimContract(context.Context, string, []agent.Team) (*agent.WorkItem, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.claimed {
+		return nil, false, nil
+	}
+	q.claimed = true
+	item := q.item
+	return &item, true, nil
+}
+
+func (q *jobTestQueue) FailContract(_ context.Context, _ int64, _ int64, _ error, retryable bool) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.failed++
+	// The 0.2.1 contract keeps failed rows retryable below the attempt cap; a
+	// non-retryable/exhausted failure stores the attempts=max marker instead of
+	// the removed dead state.
+	if !retryable || q.item.Attempts >= q.item.MaxAttempts {
+		q.item.Attempts = q.item.MaxAttempts
+	}
+	q.item.Status = agent.WorkItemFailed
+	return nil
+}
+
 func (q *jobTestQueue) MarkRunning(context.Context, int64, int64) error { return nil }
 
 func (q *jobTestQueue) Heartbeat(context.Context, int64, int64, time.Duration) error {

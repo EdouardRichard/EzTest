@@ -2,6 +2,7 @@ package agentapp
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
@@ -133,7 +134,10 @@ type ContentWriter interface {
 }
 
 // ProfileKeyForWorkType maps a work item type to its profile (P1 spec §4.2 /
-// P2 spec §5.1; the P3/P4 increments reuse the same switch).
+// P2 spec §5.1; the P3/P4 increments reuse the same switch). The 0.2.1
+// work-item kinds are accepted as well (Task 65): they are the authoritative
+// kind of a contract row, and the two stage-entry kinds additionally have a
+// deterministic runner path before this profile is resolved.
 func ProfileKeyForWorkType(workType string) (string, bool) {
 	switch workType {
 	case WorkTypeChatTurn:
@@ -144,13 +148,13 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyContextScout, true
 	case WorkTypeDesignRound:
 		return ProfileKeyDesignPlanner, true
-	case WorkTypeDesignRequirement, WorkTypeDesignGap:
+	case WorkTypeDesignRequirement, WorkTypeDesignGap, agent.WorkItemKindDesignCases:
 		return ProfileKeyCaseAuthor, true
-	case WorkTypeDesignCritic:
+	case WorkTypeDesignCritic, agent.WorkItemKindReviewCases:
 		return ProfileKeyDesignCritic, true
 	case WorkTypeDesignDataPlan:
 		return ProfileKeyDataPlanner, true
-	case WorkTypeExecuteCase:
+	case WorkTypeExecuteCase, agent.WorkItemKindExecuteBatch:
 		return ProfileKeyCaseExecutor, true
 	case WorkTypeAnalyzeFailure:
 		return ProfileKeyFailureAnalyst, true
@@ -162,8 +166,38 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyReportWriter, true
 	case WorkTypeRequirementClose, WorkTypeVersionClose:
 		return ProfileKeyVersionSteward, true
+	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage,
+		agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage,
+		agent.WorkItemKindExploreGap:
+		return ProfileKeyContextScout, true
+	case agent.WorkItemKindKnowledgePropose:
+		return ProfileKeyKnowledgeCurator, true
 	default:
 		return "", false
+	}
+}
+
+// WorkTypeForItem resolves the effective work type of a stored item. The 0.2.1
+// Kind column is authoritative when present (contract rows); legacy P1-P8 rows
+// carry no Kind and keep their frozen Type. The runner uses this everywhere it
+// previously switched on item.Type.
+func WorkTypeForItem(item agent.WorkItem) string {
+	if kind := strings.TrimSpace(item.Kind); kind != "" {
+		return kind
+	}
+	return strings.TrimSpace(item.Type)
+}
+
+// IsStageEntryWorkType reports whether the effective work type is consumed by
+// the runner's deterministic stage-entry path (design round / execution batch)
+// instead of an LLM profile run. Both are still 0.2.1 work items created by the
+// dispatcher; the path runs the real domain action and projects the job card.
+func IsStageEntryWorkType(workType string) bool {
+	switch workType {
+	case agent.WorkItemKindDesignCases, agent.WorkItemKindExecuteBatch:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -269,12 +303,34 @@ type RunExecutor interface {
 	Run(ctx context.Context, item agent.WorkItem) (RunResult, error)
 }
 
+// DesignRoundStarter is the deterministic consumer of the design.cases
+// stage-entry work item (Task 65). It opens/repairs the design round for the
+// requirements confirmed by the requirement hard gate and returns the design
+// conversation the job card is projected into. It never depends on the legacy
+// auto_design_new_requirements toggle: the stage transition already selected
+// the scope.
+type DesignRoundStarter interface {
+	StartDesignRound(ctx context.Context, versionID int64, requirementIDs []int64) (conversationID int64, err error)
+}
+
+// BatchStarter is the deterministic consumer of the execute.batch stage-entry
+// work item. It triggers the execution planner for the confirmed case batch
+// (the scheduler then dispatches the per-case execute.case runs); the agent
+// runner only owns the stage-entry job, never browser execution.
+type BatchStarter interface {
+	StartBatch(ctx context.Context, versionID int64, caseIDs []int64) error
+}
+
 // WorkerQueue is the work-queue surface used by the worker (satisfied by
 // *WorkQueue).
 type WorkerQueue interface {
 	Claim(ctx context.Context, claimant string) (agent.WorkItem, bool, error)
-	// ClaimForTeams leases the next available item whose team is in teams.
+	// ClaimForTeams leases the next available legacy (kind='') item whose team
+	// is in teams.
 	ClaimForTeams(ctx context.Context, claimant string, teams []agent.Team) (agent.WorkItem, bool, error)
+	// ClaimContract leases the next runnable 0.2.1 contract item (kind != '')
+	// whose team is in teams. A nil item with ok=false means nothing is ready.
+	ClaimContract(ctx context.Context, claimant string, teams []agent.Team) (*agent.WorkItem, bool, error)
 	MarkRunning(ctx context.Context, id, epoch int64) error
 	// Heartbeat renews the lease. The caller passes the lease it claimed with;
 	// zero keeps the queue default (the P1 worker always uses the default).
@@ -285,6 +341,9 @@ type WorkerQueue interface {
 	// Finish closes a waiting_human/pending work item without a failure.
 	Finish(ctx context.Context, id int64, reason string) error
 	Fail(ctx context.Context, id, epoch int64, cause error, retryable bool) error
+	// FailContract records a failure with the 0.2.1 retry policy (failed until
+	// attempts reach max_attempts; a non-retryable failure exhausts them).
+	FailContract(ctx context.Context, id, epoch int64, cause error, retryable bool) error
 	RecoverExpired(ctx context.Context) (int64, error)
 	ListByVersion(ctx context.Context, versionID int64, limit int) ([]agent.WorkItem, error)
 	Lease() time.Duration

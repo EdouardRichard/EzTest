@@ -69,10 +69,10 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 			if _, err := p.activateScopes(ctx, versionID, round.ID, pending); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending"); err != nil {
+			if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending", latestConversation, round.ID); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed"); err != nil {
+			if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", latestConversation, round.ID); err != nil {
 				return err
 			}
 			if err := p.ensureRoundTask(ctx, versionID, round.ID, latestConversation); err != nil {
@@ -98,7 +98,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 			if err := p.repo.UpdateRoundRequirements(ctx, round.ID, mergedIDs, mergedVersions); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, activated, "auto_new"); err != nil {
+			if err := p.ensureRequirementTasks(ctx, versionID, activated, "auto_new", latestConversation, round.ID); err != nil {
 				return err
 			}
 			p.publish(ctx, versionID, "design.scope_activated", map[string]any{
@@ -111,7 +111,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 		if err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed"); err != nil {
+		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed", latestConversation, round.ID); err != nil {
 			return err
 		}
 		if err := p.ensureRoundTask(ctx, versionID, round.ID, latestConversation); err != nil {
@@ -186,7 +186,7 @@ func (p *Planner) autoStartIfEnabled(ctx context.Context, versionID int64) error
 		if _, err := p.activateScopes(ctx, versionID, round.ID, pending); err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, pending, "auto_new"); err != nil {
+		if err := p.ensureRequirementTasks(ctx, versionID, pending, "auto_new", conversationID, round.ID); err != nil {
 			return err
 		}
 		if err := p.ensureRoundTask(ctx, versionID, round.ID, conversationID); err != nil {

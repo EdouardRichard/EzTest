@@ -117,6 +117,33 @@ func executeDesignTool(t *testing.T, registry *Registry, scope Scope, name, payl
 	return registry.Execute(context.Background(), scope, name, json.RawMessage(payload))
 }
 
+// TestGraphProposeNormalizesRequirementSourceRef pins the S3 failure fix: the
+// model may cite the requirement id it was scoped with as a requirement source
+// even though the immutable source must be the current requirement version.
+// The tool resolves exactly that unambiguous reference; a source pointing at
+// another requirement is never rewritten (the design context rejects it).
+func TestGraphProposeNormalizesRequirementSourceRef(t *testing.T) {
+	port := &fakeDesignPort{proposeResult: map[string]any{"case_version_ids": []string{"7001"}}}
+	registry := NewP2Registry(Deps{Design: port})
+	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
+
+	sameRequirement := strings.Replace(validGraphProposalJSON(), `"ref_id": "700"`, `"ref_id": "501"`, 1)
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, sameRequirement); err != nil {
+		t.Fatalf("propose with the requirement id as source: %v", err)
+	}
+	if got := port.proposeInput.Cases[0].Sources[0].RefID; got != "700" {
+		t.Fatalf("normalized requirement source = %q, want the requirement version 700", got)
+	}
+
+	foreignRequirement := strings.Replace(validGraphProposalJSON(), `"ref_id": "700"`, `"ref_id": "999"`, 1)
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, foreignRequirement); err != nil {
+		t.Fatalf("propose with a foreign requirement source: %v", err)
+	}
+	if got := port.proposeInput.Cases[0].Sources[0].RefID; got != "999" {
+		t.Fatalf("foreign requirement source = %q, want it passed through unchanged", got)
+	}
+}
+
 func TestDesignToolsRegisteredAndCaseConfirmAbsent(t *testing.T) {
 	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}})
 	for _, name := range []string{ToolDesignGraphRead, ToolCaseGraphPropose, ToolDesignReviewSubmit, ToolDesignDataPlanSubmit} {

@@ -353,6 +353,28 @@ func (r *WorkItemRepository) CreateWorkItem(ctx context.Context, in agent.Create
 // claim transaction (0.2.1 has no dead state), so a crashed run can never be
 // taken over beyond max_attempts.
 func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, now time.Time) (*agent.WorkItem, error) {
+	return r.claimWorkItem(ctx, owner, nil, now)
+}
+
+// ClaimWorkItemForTeams applies ClaimWorkItem to the listed teams only. An
+// empty team set claims nothing. The team set is validated by the application
+// facade (WorkQueue) before it reaches the repository.
+func (r *WorkItemRepository) ClaimWorkItemForTeams(ctx context.Context, owner string, teams []agent.Team, now time.Time) (*agent.WorkItem, error) {
+	if len(teams) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(teams))
+	for _, team := range teams {
+		names = append(names, string(team))
+	}
+	return r.claimWorkItem(ctx, owner, names, now)
+}
+
+// claimWorkItem is the shared 0.2.1 claim path. A nil teams slice claims from
+// every team; a non-empty slice adds a team filter to the candidate query. The
+// R41 expired-lease settlement stays global: it only closes rows that already
+// exhausted their attempt budget, which is correct for every owner.
+func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, teams []string, now time.Time) (*agent.WorkItem, error) {
 	owner = strings.TrimSpace(owner)
 	if owner == "" {
 		return nil, platform.Invalid("owner", "must not be empty")
@@ -405,6 +427,13 @@ func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, no
 		return nil, wrapDB("settle expired 0.2.1 work items", err)
 	}
 
+	teamFilter := ""
+	args := []any{now}
+	if len(teams) > 0 {
+		teamFilter = " AND w.team = ANY($2::text[])"
+		args = append(args, teams)
+	}
+
 	var id int64
 	err = tx.QueryRow(ctx, `
 		SELECT w.id FROM work_item w
@@ -421,11 +450,12 @@ func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, no
 		           SELECT 1 FROM unnest(w.depends_on) AS dependency(id)
 		           WHERE NOT EXISTS (
 		               SELECT 1 FROM work_item done
-		               WHERE done.id = dependency.id AND done.status = 'done')))
+		               WHERE done.id = dependency.id AND done.status = 'done')))`+
+		teamFilter+`
 		ORDER BY w.priority DESC, w.id ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`, now).Scan(&id)
+	`, args...).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("claim 0.2.1 work item: commit empty: %w", err)
@@ -591,6 +621,49 @@ func (r *WorkItemRepository) FailWorkItem(ctx context.Context, id, epoch int64, 
 		  AND status IN ('claimed', 'running')
 	`, id, reason); err != nil {
 		return wrapDB("fail 0.2.1 work item attempt", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// FailWorkItemTerminal records a non-retryable failure for a claimed/running
+// 0.2.1 item. The frozen schema has no dead status in the 0.2.1 contract, so the
+// row is stored failed with attempts set to max_attempts, which makes
+// ClaimWorkItem's "failed AND attempts < max_attempts" predicate false forever.
+// The append-only attempt log keeps the real attempt number and is closed.
+func (r *WorkItemRepository) FailWorkItemTerminal(ctx context.Context, id, epoch int64, reason string) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("fail 0.2.1 work item terminally: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE work_item
+		SET status = 'failed',
+		    attempts = max_attempts,
+		    last_error = $3,
+		    claimed_by = NULL,
+		    lease_until = NULL,
+		    available_at = now(),
+		    updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
+	`, id, epoch, reason)
+	if err != nil {
+		return wrapDB("fail 0.2.1 work item terminally", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrLeaseLost
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'failed', error = COALESCE(NULLIF($2, ''), error), finished_at = now()
+		WHERE work_item_id = $1
+		  AND status IN ('claimed', 'running')
+	`, id, reason); err != nil {
+		return wrapDB("fail 0.2.1 work item attempt terminally", err)
 	}
 	return tx.Commit(ctx)
 }

@@ -76,6 +76,32 @@ func ValidWorkItemKind(kind string) bool {
 	}
 }
 
+// ClaimDefaultsForKind returns the product team and frozen work type a 0.2.1
+// contract item of this kind must carry so the agent runtime can claim and
+// dispatch it (Task 65). The kinds whose executor is an agent run map to the
+// team that owns the producing role; a kind outside the frozen eleven (including
+// the legacy P1-P8 rows, which have no kind) reports false and keeps the
+// compatibility default.
+//
+// The team is the frozen work_item.team column, not the 0.2.1 job owner: the
+// agent worker claims by team, the codeintel worker claims TeamCode, and TeamOps
+// stays reserved for deterministic jobs such as report.render_pdf.
+func ClaimDefaultsForKind(kind string) (Team, string, bool) {
+	switch kind {
+	case WorkItemKindDesignCases, WorkItemKindReviewCases:
+		return TeamDesign, kind, true
+	case WorkItemKindExecuteBatch, WorkItemKindAnalyzeFailure:
+		return TeamExecution, kind, true
+	case WorkItemKindReportVersion:
+		return TeamDelivery, kind, true
+	case WorkItemKindExploreLogin, WorkItemKindExplorePage, WorkItemKindExploreAPI,
+		WorkItemKindExploreCoverage, WorkItemKindExploreGap, WorkItemKindKnowledgePropose:
+		return TeamClarification, kind, true
+	default:
+		return TeamOps, "", false
+	}
+}
+
 // The four allowed work_item.created_by values (D21, task-types.md §9.3). Only
 // the dispatch layer creates items; executors claim them.
 const (
@@ -227,7 +253,9 @@ func (in NewWorkItem) EncodePayload() (json.RawMessage, error) {
 }
 
 // CreateWorkItemParams is the 0.2.1 idempotent dispatch input. The repository
-// fills the frozen P1–P8 columns with compatibility defaults: Team=ops (the one
+// fills the frozen P1–P8 columns with compatibility defaults: a frozen kind maps
+// to the product team and work type that execute it (ClaimDefaultsForKind), so
+// the agent worker can claim the item; any other row keeps Team=ops (the one
 // team the legacy agent worker never claims), Type=Kind, an empty Payload and a
 // new unique dedupe key when IdempotencyKey is NULL.
 type CreateWorkItemParams struct {
@@ -260,6 +288,16 @@ func (in CreateWorkItemParams) Normalize() CreateWorkItemParams {
 	in.Type = strings.TrimSpace(in.Type)
 	if in.CreatedBy == "" {
 		in.CreatedBy = WorkItemCreatedByStateMachine
+	}
+	// A frozen 0.2.1 kind defaults to the team/type that really executes it. An
+	// explicit Team/Type (legacy compatibility or a controlled test) wins.
+	if team, workType, ok := ClaimDefaultsForKind(in.Kind); ok {
+		if in.Team == "" {
+			in.Team = team
+		}
+		if in.Type == "" {
+			in.Type = workType
+		}
 	}
 	if in.Team == "" {
 		in.Team = TeamOps

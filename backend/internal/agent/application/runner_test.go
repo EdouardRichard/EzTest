@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,8 @@ type runnerFixture struct {
 	knowledgeWriter *fakeKnowledgeWriter
 	briefing        *fakeBriefingSource
 	clarification   *fakeClarificationConverger
+	designRounds    *fakeDesignRoundStarter
+	batches         *fakeBatchStarter
 	load            *load.Counter
 }
 
@@ -98,6 +101,8 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		knowledgeWriter: &fakeKnowledgeWriter{},
 		briefing:        defaultAssemblyBriefing(),
 		clarification:   &fakeClarificationConverger{},
+		designRounds:    &fakeDesignRoundStarter{},
+		batches:         &fakeBatchStarter{},
 		load:            &load.Counter{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
@@ -118,6 +123,8 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		KnowledgeUsage: fixture.knowledgeUsage,
 		Briefing:       agentcontext.NewBriefingBuilder(fixture.briefing),
 		Clarification:  fixture.clarification,
+		DesignRounds:   fixture.designRounds,
+		Batches:        fixture.batches,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Load:           fixture.load,
 		TaskProvider:   taskProvider,
@@ -718,6 +725,185 @@ func TestRunnerDesignAuthorCallsGraphToolsWithScopeAndPostsTeamUpdate(t *testing
 	if len(fixture.team.contextTeams) == 0 || fixture.team.contextTeams[0] != string(agent.TeamDesign) {
 		t.Fatalf("team room context teams = %v", fixture.team.contextTeams)
 	}
+}
+
+// TestRunnerAcceptsConversationKinds pins Task 65's kind→profile mapping. The
+// 0.2.1 stage/conversation kinds must resolve to a profile (or the deterministic
+// stage-entry path) instead of returning invalid_work_type, while an unknown
+// type still fails closed. The 0.2.0 work types keep their frozen mapping.
+func TestRunnerAcceptsConversationKinds(t *testing.T) {
+	cases := []struct {
+		workType string
+		profile  string
+	}{
+		{agentapp.WorkTypeChatTurn, agentapp.ProfileKeyClarificationHost},
+		{agentapp.WorkTypeRequirementCurate, agentapp.ProfileKeyRequirementCurator},
+		{agentapp.WorkTypeAttachmentIngest, agentapp.ProfileKeyContextScout},
+		{agentapp.WorkTypeDesignRound, agentapp.ProfileKeyDesignPlanner},
+		{agentapp.WorkTypeDesignRequirement, agentapp.ProfileKeyCaseAuthor},
+		{agentapp.WorkTypeDesignGap, agentapp.ProfileKeyCaseAuthor},
+		{agentapp.WorkTypeDesignCritic, agentapp.ProfileKeyDesignCritic},
+		{agentapp.WorkTypeDesignDataPlan, agentapp.ProfileKeyDataPlanner},
+		{agentapp.WorkTypeExecuteCase, agentapp.ProfileKeyCaseExecutor},
+		{agentapp.WorkTypeAnalyzeFailure, agentapp.ProfileKeyFailureAnalyst},
+		{agentapp.WorkTypeAnalyzeCoverage, agentapp.ProfileKeyCoverageAnalyst},
+		{agentapp.WorkTypeIssueTriage, agentapp.ProfileKeyIssueTriager},
+		{agentapp.WorkTypeReportVersion, agentapp.ProfileKeyReportWriter},
+		{agentapp.WorkTypeRequirementClose, agentapp.ProfileKeyVersionSteward},
+		{agentapp.WorkTypeVersionClose, agentapp.ProfileKeyVersionSteward},
+		// 0.2.1 work-item kinds (contracts/task-types.md §9.1). The two
+		// stage-entry kinds also have a deterministic runner path; the mapping
+		// is still the profile that owns the produced artifact.
+		{agent.WorkItemKindDesignCases, agentapp.ProfileKeyCaseAuthor},
+		{agent.WorkItemKindReviewCases, agentapp.ProfileKeyDesignCritic},
+		{agent.WorkItemKindExecuteBatch, agentapp.ProfileKeyCaseExecutor},
+		{agent.WorkItemKindExploreLogin, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExplorePage, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExploreAPI, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExploreCoverage, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExploreGap, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindAnalyzeFailure, agentapp.ProfileKeyFailureAnalyst},
+		{agent.WorkItemKindReportVersion, agentapp.ProfileKeyReportWriter},
+		{agent.WorkItemKindKnowledgePropose, agentapp.ProfileKeyKnowledgeCurator},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.workType, func(t *testing.T) {
+			profile, ok := agentapp.ProfileKeyForWorkType(testCase.workType)
+			if !ok || profile != testCase.profile {
+				t.Fatalf("profile = %q (ok=%v), want %q", profile, ok, testCase.profile)
+			}
+		})
+	}
+
+	if _, ok := agentapp.ProfileKeyForWorkType("unknown.work"); ok {
+		t.Fatal("an unknown work type must stay unsupported")
+	}
+
+	// The 0.2.1 kind is authoritative over the frozen type column.
+	legacy := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20})
+	if got := agentapp.WorkTypeForItem(legacy); got != agentapp.WorkTypeChatTurn {
+		t.Fatalf("legacy work type = %q", got)
+	}
+	contractItem := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20})
+	contractItem.Kind = agent.WorkItemKindDesignCases
+	if got := agentapp.WorkTypeForItem(contractItem); got != agent.WorkItemKindDesignCases {
+		t.Fatalf("contract work type = %q, want the kind", got)
+	}
+
+	// A background explore kind must run through the explorer profile instead
+	// of being rejected as an unsupported work item.
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "已检查探索范围与页面可访问性。"}}
+	explore := fakeWorkItem(agent.WorkItemKindExplorePage, agentapp.WorkItemPayload{})
+	explore.Team = agent.TeamClarification
+	result, err := mustRun(t, fixture, explore)
+	if err != nil {
+		t.Fatalf("explore.page run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("explore.page result = %#v", result)
+	}
+	if finished := fixture.repo.lastFinished(t); finished.ProfileKey != agentapp.ProfileKeyContextScout {
+		t.Fatalf("explore.page profile = %q", finished.ProfileKey)
+	}
+}
+
+// TestDesignRoundProducesCases pins the Task 65 design chain end to end at the
+// runner boundary: the 0.2.1 design.cases stage job opens the design round (the
+// deterministic port is really called and its job card reaches the design
+// conversation), and the round's case-author task then submits real case drafts
+// through case.graph_propose with requirement-version evidence, so the design
+// conversation records the proposal call.
+func TestDesignRoundProducesCases(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.designRounds.conversationID = 20
+
+	stageItem := fakeWorkItem("", agentapp.WorkItemPayload{})
+	stageItem.Kind = agent.WorkItemKindDesignCases
+	stageItem.Type = agent.WorkItemKindDesignCases
+	stageItem.Team = agent.TeamDesign
+	stageItem.Inputs = json.RawMessage(`{"requirement_ids":["501","502"]}`)
+	stageItem.Payload = json.RawMessage(`{}`)
+
+	result, err := mustRun(t, fixture, stageItem)
+	if err != nil {
+		t.Fatalf("design.cases run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("design.cases result = %#v", result)
+	}
+	if fixture.designRounds.calls != 1 || fixture.designRounds.versionID != 10 {
+		t.Fatalf("design round starter calls = %d version=%d", fixture.designRounds.calls, fixture.designRounds.versionID)
+	}
+	if !slices.Equal(fixture.designRounds.requirementIDs, []int64{501, 502}) {
+		t.Fatalf("design round requirement ids = %v", fixture.designRounds.requirementIDs)
+	}
+	var card *fakeJobCardRecord
+	for index := range fixture.conv.jobCards {
+		if fixture.conv.jobCards[index].ConversationID == 20 {
+			card = &fixture.conv.jobCards[index]
+		}
+	}
+	if card == nil {
+		t.Fatal("design.cases job card was not projected into the design conversation")
+	}
+	if got := card.Data["kind"]; got != agent.WorkItemKindDesignCases {
+		t.Fatalf("job card kind = %v", got)
+	}
+	if got := card.Data["status"]; got != "done" {
+		t.Fatalf("job card status = %v, want the real terminal state done", got)
+	}
+
+	// The round's per-requirement case-author task produces case drafts through
+	// the existing proposal path.
+	fixture.design.readResult = map[string]any{
+		"requirements": []any{map[string]any{
+			"requirement_id": "501", "requirement_version_id": "700",
+		}},
+		"discovery_facts": []any{map[string]any{
+			"kind": "page", "key": "page:env:1:/login", "summary": "/login · 登录",
+		}},
+	}
+	fixture.design.proposeResult = map[string]any{"case_version_ids": []string{"7001"}}
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignGraphRead, `{"requirement_id":"501"}`),
+		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
+		{Content: "已为需求 501 生成 1 个场景与 1 条用例草案。"},
+	}
+	authorItem := fakeWorkItem(agentapp.WorkTypeDesignRequirement, agentapp.WorkItemPayload{
+		ConversationID: 20, RoundID: 9001, RequirementID: 501, RequirementVersionID: 700,
+	})
+	if _, err := mustRun(t, fixture, authorItem); err != nil {
+		t.Fatalf("case author run: %v", err)
+	}
+	if fixture.design.proposeCalls != 1 {
+		t.Fatalf("case proposals = %d, want the case author to produce cases", fixture.design.proposeCalls)
+	}
+	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
+		t.Fatalf("proposal = %#v", fixture.design.proposeInput)
+	}
+	proposalInConversation := false
+	for _, message := range fixture.conv.appended {
+		for _, part := range message.Parts {
+			if part.Type == "tool_call" && stringValueForTest(part.Data["name"]) == tools.ToolCaseGraphPropose {
+				proposalInConversation = true
+			}
+		}
+	}
+	if !proposalInConversation {
+		t.Fatal("the design conversation does not record the case-proposal tool call")
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("case author prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
+func stringValueForTest(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {

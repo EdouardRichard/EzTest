@@ -295,7 +295,7 @@ type caseGraphPropose struct{ deps Deps }
 func (t *caseGraphPropose) Name() string { return ToolCaseGraphPropose }
 
 func (t *caseGraphPropose) Description() string {
-	return "提交场景/用例草案（case.graph_propose）。只能创建或更新 draft；不能确认、删除或用例状态变更。scenarios[].id/cases[].id 更新已有节点时传入，新建时省略。"
+	return "提交场景/用例草案（case.graph_propose）。只能创建或更新 draft；不能确认、删除或用例状态变更。scenarios[].id/cases[].id 更新已有节点时传入，新建时省略。sources.kind=requirement 时 ref_id 必须是 requirement_version_id（当前需求版本 ID），不是 requirement_id。"
 }
 
 func (t *caseGraphPropose) Parameters() json.RawMessage {
@@ -728,6 +728,16 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 			if err := validateText(sourceField("ref_id"), source.RefID, 1, 200); err != nil {
 				return GraphProposal{}, err
 			}
+			// A requirement source is an immutable provenance reference, so it
+			// must be the requirement version. A model that cites the
+			// requirement id it was scoped with is unambiguous: resolve exactly
+			// that reference to the proposal's current requirement version.
+			// Any other ID is left untouched and validated by the design
+			// context.
+			refID := source.RefID
+			if source.Kind == "requirement" && refID == fmt.Sprintf("%d", requirementID) {
+				refID = fmt.Sprintf("%d", requirementVersionID)
+			}
 			path := stringValueOr(source.Path, "")
 			if err := validateText(sourceField("path"), path, 0, 1000); err != nil {
 				return GraphProposal{}, err
@@ -736,7 +746,7 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 				return GraphProposal{}, Invalid(sourceField("line"), "must be zero or positive")
 			}
 			sources = append(sources, SourceProposal{
-				Kind: source.Kind, RefID: source.RefID, Path: path, Line: source.Line,
+				Kind: source.Kind, RefID: refID, Path: path, Line: source.Line,
 				SHA: stringValueOr(source.SHA, ""),
 			})
 		}
@@ -845,7 +855,7 @@ func graphProposeSchema() json.RawMessage {
 	}, "step_seq", "kind", "target")
 	sourceSchema := schemaObject(map[string]any{
 		"kind":   map[string]any{"type": "string", "enum": []any{"requirement", "code", "page", "api", "knowledge"}},
-		"ref_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 200},
+		"ref_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 200, "description": "requirement sources reference the current requirement_version_id; page/api sources reference the version page/api id"},
 		"path":   map[string]any{"type": "string", "maxLength": 1000},
 		"line":   map[string]any{"type": "integer", "minimum": 0},
 		"sha":    map[string]any{"type": "string", "maxLength": 64},

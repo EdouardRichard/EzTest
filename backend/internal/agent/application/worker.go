@@ -230,7 +230,7 @@ func (w *Worker) claim(ctx context.Context, sem chan struct{}, inflight *sync.Wa
 		default:
 			return
 		}
-		item, ok, err := w.queue.ClaimForTeams(ctx, w.instanceID, agentProductTeams)
+		item, ok, err := w.claimNext(ctx)
 		if err != nil {
 			<-sem
 			if ctx.Err() == nil {
@@ -249,6 +249,22 @@ func (w *Worker) claim(ctx context.Context, sem chan struct{}, inflight *sync.Wa
 			w.execute(ctx, item)
 		}(item)
 	}
+}
+
+// claimNext leases one runnable item for this worker: 0.2.1 contract rows
+// (kind != "") through the contract claim, which preserves their dependency /
+// attempt / team semantics, then legacy P1-P8 rows through the frozen team
+// claim. Contract rows are tried first so a steady legacy stream cannot starve
+// stage-entry jobs.
+func (w *Worker) claimNext(ctx context.Context) (agent.WorkItem, bool, error) {
+	contract, ok, err := w.queue.ClaimContract(ctx, w.instanceID, agentProductTeams)
+	if err != nil {
+		return agent.WorkItem{}, false, err
+	}
+	if ok && contract != nil {
+		return *contract, true, nil
+	}
+	return w.queue.ClaimForTeams(ctx, w.instanceID, agentProductTeams)
 }
 
 func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
@@ -348,12 +364,21 @@ func (w *Worker) notifyRunFinished(item agent.WorkItem, result RunResult, runErr
 func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool, result RunResult) {
 	ctx, cancel := context.WithTimeout(context.Background(), workerWriteBackTimeout)
 	defer cancel()
-	if err := w.queue.Fail(ctx, item.ID, item.LeaseEpoch, cause, retryable); err != nil {
-		if IsLeaseLost(err) {
+	var failErr error
+	if strings.TrimSpace(item.Kind) != "" {
+		// 0.2.1 contract rows keep the contract retry policy: failed items are
+		// retried until the attempt cap, and a terminal marker is
+		// attempts=max_attempts instead of the removed dead state.
+		failErr = w.queue.FailContract(ctx, item.ID, item.LeaseEpoch, cause, retryable)
+	} else {
+		failErr = w.queue.Fail(ctx, item.ID, item.LeaseEpoch, cause, retryable)
+	}
+	if failErr != nil {
+		if IsLeaseLost(failErr) {
 			w.logger.Warn("agent worker: lease lost while failing", "work_item_id", item.ID)
 			return
 		}
-		w.logger.Error("agent worker: fail write-back failed", "work_item_id", item.ID, "error", err)
+		w.logger.Error("agent worker: fail write-back failed", "work_item_id", item.ID, "error", failErr)
 		return
 	}
 	// The repository decides dead vs retryable-open from the claimed row with

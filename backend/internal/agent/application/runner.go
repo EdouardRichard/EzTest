@@ -1,12 +1,14 @@
 package agentapp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -83,6 +85,15 @@ type RunnerDeps struct {
 	// clarification host turn explicitly requests requirement confirmation. Nil
 	// keeps the stage unchanged (deployments without the version stage machine).
 	Clarification ClarificationConverger
+	// DesignRounds consumes the design.cases stage-entry work item: it opens
+	// the design round for the hard-gate-confirmed requirements and returns the
+	// design conversation the job card is projected into (Task 65). Nil fails a
+	// design.cases item as a configuration error.
+	DesignRounds DesignRoundStarter
+	// Batches consumes the execute.batch stage-entry work item: it triggers the
+	// execution planner for the confirmed case batch. Nil fails an execute.batch
+	// item as a configuration error.
+	Batches BatchStarter
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -124,6 +135,8 @@ type Runner struct {
 	briefing             *agentcontext.BriefingBuilder
 	assembler            *agentcontext.Assembler
 	clarification        ClarificationConverger
+	designRounds         DesignRoundStarter
+	batches              BatchStarter
 }
 
 // NewRunner wires the agent runner.
@@ -160,6 +173,8 @@ func NewRunner(deps RunnerDeps) *Runner {
 		briefing:             deps.Briefing,
 		assembler:            agentcontext.NewAssembler(),
 		clarification:        deps.Clarification,
+		designRounds:         deps.DesignRounds,
+		batches:              deps.Batches,
 	}
 }
 
@@ -369,6 +384,51 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	return payload, nil
 }
 
+// ParseWorkItemIDList reads one JSON array of decimal IDs from a work item's
+// 0.2.1 inputs object (for example design.cases requirement_ids or execute.batch
+// case_ids). IDs may be decimal strings (canonical) or JSON numbers; duplicates
+// are removed and the input order is preserved. A missing/null field is nil.
+func ParseWorkItemIDList(raw json.RawMessage, field string) ([]int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("work item inputs must be a JSON object")
+	}
+	value, ok := object[field]
+	if !ok {
+		return nil, nil
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(value, &entries); err != nil {
+		return nil, fmt.Errorf("work item inputs %s must be an array of decimal IDs", field)
+	}
+	ids := make([]int64, 0, len(entries))
+	seen := make(map[int64]struct{}, len(entries))
+	for index, entry := range entries {
+		text := strings.TrimSpace(string(entry))
+		if strings.HasPrefix(text, `"`) {
+			var decoded string
+			if err := json.Unmarshal(entry, &decoded); err != nil {
+				return nil, fmt.Errorf("work item inputs %s[%d] must be a decimal ID", field, index)
+			}
+			text = strings.TrimSpace(decoded)
+		}
+		parsed, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("work item inputs %s[%d] must be a positive decimal ID", field, index)
+		}
+		if _, duplicate := seen[parsed]; duplicate {
+			continue
+		}
+		seen[parsed] = struct{}{}
+		ids = append(ids, parsed)
+	}
+	return ids, nil
+}
+
 // runState carries one run's mutable state.
 type runState struct {
 	item    agent.WorkItem
@@ -428,8 +488,33 @@ type runState struct {
 // job_card: the start snapshot before the run begins, one progress snapshot per
 // completed turn and the terminal run outcome. The projection is best effort
 // and never changes the run verdict or the persisted work-item state.
+//
+// The 0.2.1 stage-entry kinds (design.cases/execute.batch) take the
+// deterministic path instead of a model run: they consume the contract item by
+// running the domain action and project the truthful terminal state.
 func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error) {
 	payload, payloadErr := ParseWorkItemPayload(item.Payload)
+	workType := WorkTypeForItem(item)
+	// A dispatcher-created stage-entry row carries the same value in the frozen
+	// type column (Normalize defaults Type=Kind). A synthetic row that only
+	// overrides Kind keeps the normal profile path so the frozen 0.2.0
+	// type/card semantics are not hijacked by a bookkeeping label.
+	stageEntry := IsStageEntryWorkType(workType) &&
+		strings.TrimSpace(item.Kind) == workType &&
+		(strings.TrimSpace(item.Type) == "" || strings.TrimSpace(item.Type) == workType)
+	item.Type = workType
+	switch {
+	case stageEntry && workType == agent.WorkItemKindDesignCases:
+		if payloadErr != nil {
+			return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: payloadErr}
+		}
+		return r.runDesignCases(ctx, item, payload)
+	case stageEntry && workType == agent.WorkItemKindExecuteBatch:
+		if payloadErr != nil {
+			return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: payloadErr}
+		}
+		return r.runExecuteBatch(ctx, item, payload)
+	}
 	if payloadErr == nil {
 		r.projectJobCard(ctx, item, payload, "running", 0)
 	}
@@ -446,6 +531,76 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	return result, err
 }
 
+// runDesignCases consumes the design.cases stage-entry work item: it opens the
+// design round for the requirements confirmed by the hard gate and projects the
+// job card into the design conversation. The round's case-author tasks produce
+// the actual drafts through case.graph_propose; this job only owns the entry.
+func (r *Runner) runDesignCases(ctx context.Context, item agent.WorkItem, payload WorkItemPayload) (RunResult, error) {
+	if r.designRounds == nil {
+		return RunResult{}, &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no design round starter"),
+		}
+	}
+	requirementIDs, err := ParseWorkItemIDList(item.Inputs, "requirement_ids")
+	if err != nil {
+		return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: err}
+	}
+	conversationID, startErr := r.designRounds.StartDesignRound(ctx, item.VersionID, requirementIDs)
+	if startErr != nil {
+		return RunResult{}, stageEntryRunError(startErr)
+	}
+	if conversationID > 0 {
+		// The card lives in the design conversation the round just opened. The
+		// run context may already be cancelled, so use a short independent
+		// write like the other post-run projections.
+		payload.ConversationID = conversationID
+		finishCtx, cancel := context.WithTimeout(context.Background(), jobCardWriteTimeout)
+		r.projectJobCard(finishCtx, item, payload, "done", 0)
+		cancel()
+	}
+	return RunResult{Status: agent.AgentRunDone}, nil
+}
+
+// runExecuteBatch consumes the execute.batch stage-entry work item: the
+// deterministic execution planner owns the batch, so the agent runtime only
+// triggers it for the confirmed cases and completes the entry job.
+func (r *Runner) runExecuteBatch(ctx context.Context, item agent.WorkItem, payload WorkItemPayload) (RunResult, error) {
+	if r.batches == nil {
+		return RunResult{}, &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no execution batch starter"),
+		}
+	}
+	caseIDs, err := ParseWorkItemIDList(item.Inputs, "case_ids")
+	if err != nil {
+		return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: err}
+	}
+	if startErr := r.batches.StartBatch(ctx, item.VersionID, caseIDs); startErr != nil {
+		return RunResult{}, stageEntryRunError(startErr)
+	}
+	return RunResult{Status: agent.AgentRunDone}, nil
+}
+
+// stageEntryRunError classifies a deterministic stage-entry failure: a typed
+// 4xx (bad scope/ownership) cannot succeed on another attempt, transport and
+// server failures are retried through the normal work-item backoff.
+func stageEntryRunError(err error) *RunError {
+	retryable := true
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Status {
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+			retryable = false
+		default:
+			retryable = apiErr.Retryable || apiErr.Status >= http.StatusInternalServerError
+		}
+	}
+	return &RunError{Reason: "stage_entry_failed", Retryable: retryable, Cause: err}
+}
+
 // run is Run without the conversation job-card projection. On failure the
 // agent_run row is already marked failed/interrupted and the returned error
 // carries the retry classification.
@@ -454,6 +609,8 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		r.load.Inc()
 		defer r.load.Dec()
 	}
+	// The 0.2.1 Kind is authoritative when present; legacy rows keep Type.
+	item.Type = WorkTypeForItem(item)
 	profileKey, ok := ProfileKeyForWorkType(item.Type)
 	if !ok {
 		return RunResult{}, &RunError{
@@ -1206,6 +1363,23 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		if finalText == "" {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("case author produced no design update")}
 		}
+		// A case-author task enqueued by a design round carries the round's
+		// conversation/round association: persist the proposal trace and the
+		// summary there so the design thread shows the case.graph_propose call
+		// with its evidence (Task 65), alongside the team-room update. A task
+		// without the round association keeps the frozen P2 behavior (team room
+		// only) and never writes into a conversation.
+		if r.conversation != nil && state.payload.ConversationID > 0 && state.payload.RoundID > 0 {
+			if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
+				VersionID:        state.item.VersionID,
+				ConversationID:   state.payload.ConversationID,
+				AgentRunID:       state.run.ID,
+				ReplyToMessageID: replyTarget(state.payload.MessageID),
+				Parts:            r.assistantConversationParts(state, finalText, nil),
+			}); err != nil {
+				return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+			}
+		}
 		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
 			return err
 		}
@@ -1582,11 +1756,21 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			goal = "根据执行/设计缺口补充用例草案：先读取脑图，再用 case.graph_propose 新增或修改 draft 用例。"
 		}
 		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               goal,
-			Constraints:        []string{"只提交 draft/候选，不能确认、删除或关闭用例", "用例必须包含步骤、断言、来源与目标 version_sut", "同一需求版本内更新已有用例时传既有 ID/自然键"},
-			AcceptanceCriteria: []string{"design.graph_read 后再提交", "case.graph_propose 返回 case_version_ids", "向设计团队频道说明变化"},
-			Scope:              scope,
+			Type: state.item.Type,
+			Goal: goal,
+			Constraints: []string{
+				"只提交 draft/候选，不能确认、删除或关闭用例",
+				"用例必须包含步骤、断言、来源与目标 version_sut",
+				"同一需求版本内更新已有用例时传既有 ID/自然键",
+				"只做一次 design.graph_read 获取 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
+				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id；页面/接口发现事实可作为 knowledge/page/api 来源",
+			},
+			AcceptanceCriteria: []string{
+				"design.graph_read 后再提交",
+				"case.graph_propose 返回 case_version_ids 或 case_ids",
+				"向设计团队频道说明变化",
+			},
+			Scope: scope,
 		}
 	case WorkTypeDesignCritic:
 		return TaskContext{
@@ -1638,6 +1822,15 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			Goal:               "比对 current 需求、已确认用例与最近执行结果，找出执行覆盖缺口并用 analysis.coverage_submit 提交。",
 			Constraints:        []string{"只读覆盖与需求数据；不修改用例/需求、不创建问题", "缺口原因只取 execution_not_run 或 execution_failed_coverage"},
 			AcceptanceCriteria: []string{"每条缺口引用属于当前版本的 requirement 与 wave 内证据", "使用 analysis.coverage_submit"},
+			Scope:              scope,
+		}
+	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
+		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "执行当前 explore 任务：读取版本上下文与已有发现事实，用 explore.* 工具补齐可复现的页面/接口/登录事实并说明证据来源。",
+			Constraints:        []string{"只读 SUT 与版本事实，不生成/确认用例，不修改需求", "不编造事实；无法完成时说明明确原因", "记录证据引用，不写入凭据"},
+			AcceptanceCriteria: []string{"产生或补充可复现的发现事实", "说明证据来源与下一步"},
 			Scope:              scope,
 		}
 	default:
@@ -1697,6 +1890,9 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 		return fmt.Sprintf("请分析 wave %s 的失败结果并提交 failure 候选细化。", idText(state.payload.WaveID))
 	case WorkTypeAnalyzeCoverage:
 		return fmt.Sprintf("请分析 wave %s 的执行覆盖缺口并提交覆盖候选。", idText(state.payload.WaveID))
+	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
+		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
+		return "请执行当前 explore 任务，读取版本上下文与已有事实，补齐可复现的页面/接口/登录发现并说明证据来源。"
 	default:
 		return "请根据当前任务继续执行。"
 	}

@@ -78,6 +78,11 @@ type WorkItemContractRepository interface {
 	// increments lease_epoch, attempts and inserts a claimed attempt row. A nil
 	// item with a nil error means nothing is runnable.
 	ClaimWorkItem(ctx context.Context, owner string, now time.Time) (*WorkItem, error)
+	// ClaimWorkItemForTeams is ClaimWorkItem restricted to the given teams. The
+	// agent worker uses it so a 0.2.1 stage-entry item is only taken by the
+	// executor that owns its team. An empty team set claims nothing and returns
+	// (nil, nil); team validity is the caller's business (WorkQueue validates).
+	ClaimWorkItemForTeams(ctx context.Context, owner string, teams []Team, now time.Time) (*WorkItem, error)
 	// RenewLease extends the lease to the absolute until. A stale epoch is
 	// ErrLeaseLost.
 	RenewLease(ctx context.Context, id, epoch int64, until time.Time) error
@@ -86,6 +91,11 @@ type WorkItemContractRepository interface {
 	// FailWorkItem records a failure. Failed items remain retryable by
 	// ClaimWorkItem until attempts reach max_attempts.
 	FailWorkItem(ctx context.Context, id, epoch int64, reason string) error
+	// FailWorkItemTerminal records a failure that must never be retried: the
+	// row is stored failed with attempts=max_attempts (the frozen schema has no
+	// 'dead' status in 0.2.1), so ClaimWorkItem can never select it again while
+	// the job-control API still projects the truthful failed state.
+	FailWorkItemTerminal(ctx context.Context, id, epoch int64, reason string) error
 }
 
 // TeamRoomRepository persists team-room posts and bounded digest versions.

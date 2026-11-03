@@ -578,6 +578,37 @@ func (f *fakeDesignPort) SubmitDataPlan(_ context.Context, versionID, caseVersio
 	return f.dataPlanResult, f.dataPlanErr
 }
 
+// fakeDesignRoundStarter records the design.cases stage-entry port calls.
+type fakeDesignRoundStarter struct {
+	calls          int
+	versionID      int64
+	requirementIDs []int64
+	conversationID int64
+	err            error
+}
+
+func (f *fakeDesignRoundStarter) StartDesignRound(_ context.Context, versionID int64, requirementIDs []int64) (int64, error) {
+	f.calls++
+	f.versionID = versionID
+	f.requirementIDs = append([]int64(nil), requirementIDs...)
+	return f.conversationID, f.err
+}
+
+// fakeBatchStarter records the execute.batch stage-entry port calls.
+type fakeBatchStarter struct {
+	calls     int
+	versionID int64
+	caseIDs   []int64
+	err       error
+}
+
+func (f *fakeBatchStarter) StartBatch(_ context.Context, versionID int64, caseIDs []int64) error {
+	f.calls++
+	f.versionID = versionID
+	f.caseIDs = append([]int64(nil), caseIDs...)
+	return f.err
+}
+
 // fakeAttachmentPort implements tools.AttachmentPort.
 type fakeAttachmentPort struct {
 	attachments []tools.AttachmentMeta

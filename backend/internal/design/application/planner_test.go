@@ -2,6 +2,7 @@ package designapp
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
@@ -178,6 +179,72 @@ func TestAutoDesignOnlyWhenNoConversation(t *testing.T) {
 	}
 	if conversations.calls != 1 || len(repo.rounds) != 1 {
 		t.Fatalf("second scan duplicated auto conversation: calls=%d rounds=%d", conversations.calls, len(repo.rounds))
+	}
+}
+
+// TestStartStageRoundEnsuresConversationAndTasks pins Task 65's design.cases
+// consumer: the requirement hard gate confirms the scope, and the stage-entry
+// job must open the design round without depending on the legacy auto-design
+// toggle. It creates the design conversation when missing, scopes the confirmed
+// requirements, and enqueues the case-author tasks with the conversation
+// association so their proposal calls land in the design thread.
+func TestStartStageRoundEnsuresConversationAndTasks(t *testing.T) {
+	planner, repo, enqueuer, _, conversations, versions, _ := newPlannerFixture()
+	repo.clarified = []design.RequirementRef{
+		plannerRequirement(3001, 3002),
+		plannerRequirement(3005, 3006),
+	}
+
+	conversationID, err := planner.StartStageRound(context.Background(), 1001, []int64{3001, 3005})
+	if err != nil {
+		t.Fatalf("StartStageRound: %v", err)
+	}
+	if conversationID == 0 || conversations.calls != 1 || conversations.titles[0] == "" {
+		t.Fatalf("conversation = %d calls=%d titles=%v", conversationID, conversations.calls, conversations.titles)
+	}
+	if len(repo.rounds) != 1 || repo.rounds[0].ConversationID != conversationID {
+		t.Fatalf("rounds = %+v", repo.rounds)
+	}
+	if len(repo.rounds[0].RequirementIDs) != 2 {
+		t.Fatalf("round requirements = %v", repo.rounds[0].RequirementIDs)
+	}
+	if len(repo.activeScopes) != 2 {
+		t.Fatalf("active scopes = %d", len(repo.activeScopes))
+	}
+	requirementTasks := enqueuer.byType("design.requirement")
+	if len(requirementTasks) != 2 {
+		t.Fatalf("requirement tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+	}
+	for _, task := range requirementTasks {
+		if taskPayloadString(task, "conversation_id") != fmt.Sprint(conversationID) {
+			t.Fatalf("requirement task conversation association = %v", task.Payload)
+		}
+		if taskPayloadString(task, "round_id") != fmt.Sprint(repo.rounds[0].ID) {
+			t.Fatalf("requirement task round association = %v", task.Payload)
+		}
+	}
+	if tasks := enqueuer.byType("design.round"); len(tasks) != 1 {
+		t.Fatalf("round tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+	}
+	if len(versions.calls) != 1 || versions.calls[0] != 1001 {
+		t.Fatalf("version starter calls = %v", versions.calls)
+	}
+
+	// A repeated stage entry (R49 recovery or a replayed event) must reuse the
+	// same conversation/round and add no tasks.
+	taskCount := len(enqueuer.tasks)
+	again, err := planner.StartStageRound(context.Background(), 1001, []int64{3001, 3005})
+	if err != nil {
+		t.Fatalf("second StartStageRound: %v", err)
+	}
+	if again != conversationID {
+		t.Fatalf("conversation changed: %d vs %d", again, conversationID)
+	}
+	if conversations.calls != 1 || len(repo.rounds) != 1 {
+		t.Fatalf("repeat duplicated conversation/round: calls=%d rounds=%d", conversations.calls, len(repo.rounds))
+	}
+	if len(enqueuer.tasks) != taskCount {
+		t.Fatalf("repeat duplicated tasks: %v", sortedTaskDedupeKeys(enqueuer.tasks))
 	}
 }
 

@@ -83,6 +83,10 @@ func (r *fakeWorkItemContractRepo) ClaimWorkItem(context.Context, string, time.T
 	return nil, nil
 }
 
+func (r *fakeWorkItemContractRepo) ClaimWorkItemForTeams(context.Context, string, []agent.Team, time.Time) (*agent.WorkItem, error) {
+	return nil, nil
+}
+
 func (r *fakeWorkItemContractRepo) RenewLease(context.Context, int64, int64, time.Time) error {
 	return nil
 }
@@ -92,6 +96,10 @@ func (r *fakeWorkItemContractRepo) CompleteWorkItem(context.Context, int64, int6
 }
 
 func (r *fakeWorkItemContractRepo) FailWorkItem(context.Context, int64, int64, string) error {
+	return nil
+}
+
+func (r *fakeWorkItemContractRepo) FailWorkItemTerminal(context.Context, int64, int64, string) error {
 	return nil
 }
 
