@@ -378,13 +378,17 @@ check(
 )
 // Task 75: a terminal failed job card also carries the typed failure code and
 // the user-facing reason; both stay optional (not in the branch's required list).
-const jobCardBranch = (() => {
-  const start = messagePartBlock.indexOf("enum: [job_card]")
-  if (start < 0) return ""
-  const rest = messagePartBlock.slice(start)
-  const end = rest.indexOf("\n        - type: object")
-  return end < 0 ? rest : rest.slice(0, end)
-})()
+// Slice from the branch's `- type: object` line, not from its `enum:` marker:
+// `required:` precedes `type:` inside each oneOf branch, so an enum-anchored
+// slice hides the required list and makes the optionality assertion vacuous.
+const oneOfBranch = (block, marker) => {
+  const anchor = block.indexOf(marker)
+  if (anchor < 0) return ""
+  const start = block.lastIndexOf("\n        - type: object", anchor)
+  const end = block.indexOf("\n        - type: object", anchor + marker.length)
+  return block.slice(start < 0 ? 0 : start + 1, end < 0 ? block.length : end)
+}
+const jobCardBranch = oneOfBranch(messagePartBlock, "enum: [job_card]")
 check(/code:/.test(jobCardBranch), "openapi job_card part carries optional code")
 check(/reason:/.test(jobCardBranch), "openapi job_card part carries optional reason")
 check(
@@ -399,21 +403,47 @@ check(
   /终态 failed/.test(jobCardBranch),
   "openapi job_card.code/reason are documented as terminal-failed fields",
 )
+const jobCardRequiredFields = (branch) => {
+  const match = /^ {10}required: \[([^\]]*)\]$/m.exec(branch)
+  return match
+    ? match[1]
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : []
+}
+const jobCardOptionalityHolds = (branch) => {
+  const required = jobCardRequiredFields(branch)
+  return required.length > 0 && !required.includes("code") && !required.includes("reason")
+}
 check(
-  !/required: \[[^\]]*\b(?:code|reason)\b/.test(jobCardBranch),
+  jobCardOptionalityHolds(jobCardBranch),
   "openapi job_card.code/reason stay optional (absent from required)",
+)
+// Mutation probe: the optionality assertion is only meaningful if the slice
+// actually contains the job_card branch's required list. Inject code/reason
+// into that list in memory and prove the same predicate rejects it; if the
+// slice goes vacuous again (required list hidden), the injection matches
+// nothing and this probe fails instead of silently passing.
+const mutatedJobCardBranch = jobCardBranch.replace(
+  /^( {10})required: \[([^\]]*)\]$/m,
+  "$1required: [$2, code, reason]",
+)
+check(
+  mutatedJobCardBranch !== jobCardBranch,
+  "mutation probe: job_card branch slice exposes its required list",
+)
+check(
+  !jobCardOptionalityHolds(mutatedJobCardBranch),
+  "mutation probe: optionality check rejects required code/reason",
 )
 // job_card.kind accepts the 11 frozen job kinds and the three conversation work
 // types; every kind stays exact (no invented values, no dropped kind).
 const jobCardKindEnum = (() => {
-  const start = messagePartBlock.indexOf("enum: [job_card]")
-  if (start < 0) return []
-  const rest = messagePartBlock.slice(start)
-  const end = rest.indexOf("\n        - type: object")
-  const branch = end < 0 ? rest : rest.slice(0, end)
-  const kindAt = branch.indexOf("kind:")
+  if (!jobCardBranch) return []
+  const kindAt = jobCardBranch.indexOf("kind:")
   if (kindAt < 0) return []
-  const match = /enum: \[([^\]]+)\]/.exec(branch.slice(kindAt))
+  const match = /enum: \[([^\]]+)\]/.exec(jobCardBranch.slice(kindAt))
   return match
     ? match[1]
         .split(",")
@@ -659,6 +689,18 @@ const dedupeResult = schemaBlock("RequirementDedupeResult")
 check(
   requiredOf(dedupeResult).includes("kept_ids") && requiredOf(dedupeResult).includes("obsolete_ids"),
   "openapi RequirementDedupeResult requires kept_ids/obsolete_ids",
+)
+check(
+  !/没有重复时(?:两个数组均为空|返回空数组)/.test(openapi),
+  "openapi dedupe no longer claims a no-op returns two empty arrays",
+)
+check(
+  /kept_ids:[\s\S]{0,200}仍保留的全部 draft/.test(dedupeResult),
+  "openapi RequirementDedupeResult documents kept_ids as every surviving scanned draft",
+)
+check(
+  /obsolete_ids:[\s\S]{0,200}为空表示没有需求被退休/.test(dedupeResult),
+  "openapi RequirementDedupeResult documents empty obsolete_ids = nothing retired",
 )
 const mergeRequest = schemaBlock("RequirementMergeRequest")
 const mergeRequestRequired = requiredOf(mergeRequest)
@@ -1061,11 +1103,19 @@ check(
   /Task 62[\s\S]{0,80}契约先行/.test(plain(openapi)) && /Task 48[\s\S]{0,80}挂载/.test(plain(openapi)),
   "openapi qualifies the 22-operation list (Task 62 reads / Task 48 context packet)",
 )
+// The proximity bound stays at the original 400 characters (no relaxation):
+// the 0.2.1 cleanup-route names were inserted before "Task 62", yet the needle
+// is still within 400 characters, so a later edit that pushes the qualification
+// farther away must be reviewed instead of silently widening this gate.
 check(
-  /22 个 0\.2\.1 operation[\s\S]{0,800}Task 62/.test(readme) &&
+  /22 个 0\.2\.1 operation[\s\S]{0,400}Task 62/.test(readme) &&
     readme.includes("0.3 预留") &&
     readme.includes("Task 48"),
   "contracts README qualifies the 22 operations (Task 62 reads / 0.3 GET job / Task 48 packet)",
+)
+check(
+  /`docs\/openapi\/api\.yaml`[\s\S]{0,400}Task 85/.test(readme),
+  "contracts README defers the docs/openapi/api.yaml 0.2.1 port to Task 85",
 )
 
 // Cache-first context_packet persistence is pending Task 48; the runner still
