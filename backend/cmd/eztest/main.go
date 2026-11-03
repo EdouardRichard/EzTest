@@ -867,16 +867,13 @@ func main() {
 	// P3-T5 production version-briefing read path. The reader is a read-only,
 	// deterministic SQL source over the version/design/execution/knowledge
 	// tables. Reader and builder are constructed here at the assembly root (not
-	// a package singleton) so the future cache-first context assembler can take
-	// the builder as a dependency. That consumer is not wired yet (Task 13/14/33
-	// owns it), so the builder is held with a blank assignment instead of being
-	// added to the runner dependency set ahead of its consumer.
+	// a package singleton) and the builder is passed to the agent runner
+	// (Task 48), which feeds the cache-first context assembler's briefing.
 	briefingReader, err := versionadapter.NewBriefingReader(pool)
 	if err != nil {
 		log.Fatalf("eztest: wire version briefing reader: %v", err)
 	}
 	briefingBuilder := agentcontext.NewBriefingBuilder(briefingReader)
-	_ = briefingBuilder
 
 	// P2 design services and cross-context adapters.
 	designTeamRoom := designTeamRoomAdapter{room: teamRoom}
@@ -1336,6 +1333,7 @@ func main() {
 		Images:       ports,
 		TeamRoom:     teamRoom,
 		Content:      ports,
+		Briefing:     briefingBuilder,
 		// P7 knowledge injection + usage accounting (S6 report §5).
 		Knowledge:      p7rt.KnowledgeAdapter,
 		KnowledgeUsage: p7rt.KnowledgeAdapter,
@@ -1486,35 +1484,36 @@ func main() {
 	}()
 
 	handler := server.New(server.Deps{
-		Config:        cfg,
-		Pool:          pool,
-		Version:       version,
-		Settings:      settingsSvc,
-		Identity:      identitySvc,
-		Audit:         auditSvc,
-		Events:        eventSvc,
-		Storage:       storageSvc,
-		LLM:           llmSvc,
-		Resource:      resourceSvc,
-		Versions:      versionSvc,
-		Requirements:  requirementSvc,
-		Conversations: conversationSvc,
-		Stage:         stageMachine,
-		TeamRoom:      teamRoom,
-		DesignGraph:   designGraph,
-		DesignExports: designExports,
-		DesignStarter: designStarterAdapter{planner: designPlanner},
-		Execution:     executionHandler,
-		Delivery:      deliveryHandler,
-		Chain:         chainHandler,
-		Closure:       closureSvc,
-		VersionClose:  versionCloseSvc,
-		CodeIntel:     p5.CodeIntel,
-		Visual:        p5.Visual,
-		P6:            &p6Read.Handlers,
-		P7:            p7rt.p7ServerHandlers(),
-		Jobs:          jobControlHandler,
-		Load:          requestLoad,
+		Config:         cfg,
+		Pool:           pool,
+		Version:        version,
+		Settings:       settingsSvc,
+		Identity:       identitySvc,
+		Audit:          auditSvc,
+		Events:         eventSvc,
+		Storage:        storageSvc,
+		LLM:            llmSvc,
+		Resource:       resourceSvc,
+		Versions:       versionSvc,
+		Requirements:   requirementSvc,
+		Conversations:  conversationSvc,
+		Stage:          stageMachine,
+		TeamRoom:       teamRoom,
+		DesignGraph:    designGraph,
+		DesignExports:  designExports,
+		DesignStarter:  designStarterAdapter{planner: designPlanner},
+		Execution:      executionHandler,
+		Delivery:       deliveryHandler,
+		Chain:          chainHandler,
+		Closure:        closureSvc,
+		VersionClose:   versionCloseSvc,
+		CodeIntel:      p5.CodeIntel,
+		Visual:         p5.Visual,
+		P6:             &p6Read.Handlers,
+		P7:             p7rt.p7ServerHandlers(),
+		Jobs:           jobControlHandler,
+		Load:           requestLoad,
+		ContextPackets: versionadapter.NewContextPacketReader(runtimeRepo),
 	})
 
 	srv := &http.Server{
