@@ -15,19 +15,31 @@ const (
 	MaxReportCaseRuns = 2000
 )
 
-// Report-visible triage/coverage classifications (Task 118). The platform issue
-// triage is authoritative for the failure conclusion: a failed(application)
-// case_run whose issue triage is done with classification=flaky is automation
-// flakiness, not a product defect. The raw P3 failure_class stays available on
+// Report-visible triage/coverage classifications (Task 118, Task 122). The
+// platform issue triage is authoritative for the failure conclusion: a
+// failed(application) case_run whose issue triage is done with
+// classification=flaky is automation flakiness, and one classified
+// expected_failure (for example a run that stopped on a real token budget
+// before the step under observation) is an expected failure that must be rerun
+// rather than a product defect. The raw P3 failure_class stays available on
 // the snapshot; the report-visible value is derived through
 // CaseRunSnapshot.EffectiveFailureClass.
 const (
 	// TriageClassificationFlaky is the issue.triage classification that marks a
 	// failure as flaky/automation instead of a product defect.
 	TriageClassificationFlaky = "flaky"
+	// TriageClassificationExpectedFailure is the issue.triage classification
+	// that marks a failure as an expected/not-judged failure (budget or missing
+	// observation) instead of a product defect.
+	TriageClassificationExpectedFailure = "expected_failure"
 	// FailureClassAutomation is the report-visible failure class of a run whose
 	// issue triage is flaky.
 	FailureClassAutomation = "automation"
+	// FailureClassExpectedFailure is the report-visible failure class of a run
+	// whose issue triage is expected_failure. It is deliberately not
+	// "application" and not "automation": the run is neither a product defect
+	// nor flaky automation noise; it needs a rerun to produce a conclusion.
+	FailureClassExpectedFailure = "expected_failure"
 	// CoverageGapExecutionFlaky explains an uncovered case version whose latest
 	// run failed but the platform triage classified that failure as flaky. It
 	// is a flaky gap, not a product coverage failure.
@@ -259,14 +271,25 @@ type CaseRunSnapshot struct {
 }
 
 // EffectiveFailureClass is the failure class a report presents. It is the raw
-// execution class unless the platform triage finished with classification=flaky,
-// in which case the failure is automation flakiness and must not be presented
-// as an application/product defect (Task 118).
+// execution class unless the platform triage finished with classification=flaky
+// (automation flakiness) or classification=expected_failure (expected failure,
+// budget/no-judgment, needs a rerun). Neither triage classification is a
+// product/application defect (Task 118, Task 122).
 func (row CaseRunSnapshot) EffectiveFailureClass() string {
-	if row.TriageClassification == TriageClassificationFlaky {
+	switch row.TriageClassification {
+	case TriageClassificationFlaky:
 		return FailureClassAutomation
+	case TriageClassificationExpectedFailure:
+		return FailureClassExpectedFailure
 	}
 	return row.FailureClass
+}
+
+// ExpectedFailureTriage reports whether the latest finished issue triage
+// classified this run as expected_failure. The report summary counts it
+// separately from product defects.
+func (row CaseRunSnapshot) ExpectedFailureTriage() bool {
+	return row.TriageClassification == TriageClassificationExpectedFailure
 }
 
 // EvidenceSnapshot is one evidence metadata row of a report. Content bytes and
@@ -312,6 +335,22 @@ type IssueSnapshot struct {
 func (row IssueSnapshot) FlakyTriage() bool {
 	return row.TriageStatus == string(AnalysisStatusDone) &&
 		row.TriageClassification == TriageClassificationFlaky
+}
+
+// ExpectedFailureTriage reports whether the latest finished triage classified
+// this issue as expected_failure. Like FlakyTriage, only a done proposal is
+// authoritative; the stored issue row itself is never rewritten.
+func (row IssueSnapshot) ExpectedFailureTriage() bool {
+	return row.TriageStatus == string(AnalysisStatusDone) &&
+		row.TriageClassification == TriageClassificationExpectedFailure
+}
+
+// OpenProductIssue reports whether this issue is an open issue that the platform
+// triage did not classify as flaky or expected_failure, i.e. the issue counts as
+// an open product defect in the report summary (Task 122). The stored status is
+// never changed by a triage proposal; this is a report-visible projection.
+func (row IssueSnapshot) OpenProductIssue() bool {
+	return row.Status == IssueStatusOpen && !row.FlakyTriage() && !row.ExpectedFailureTriage()
 }
 
 // VersionSUTSnapshot is one version SUT binding used to label report rows

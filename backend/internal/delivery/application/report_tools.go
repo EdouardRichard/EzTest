@@ -100,7 +100,7 @@ type reportDataReadTool struct{ svc *ReportService }
 func (t *reportDataReadTool) Name() string { return agenttools.ToolReportDataRead }
 
 func (t *reportDataReadTool) Description() string {
-	return "Read the deterministic summary of the current report task: IDs, section/status counts, per-case result counters (status/steps/assertions/evidence), the triage-honoring and raw failure classification, issue triage counts, coverage counts including per-requirement coverage and gap reasons, and truncation markers. Never returns titles, narrative text, evidence bytes/hashes, credentials or filesystem paths. Read-only."
+	return "Read the deterministic summary of the current report task: IDs, section/status counts, per-case result counters (status/steps/assertions/evidence), the triage-honoring and raw failure classification, issue triage counts (including open product issues versus expected_failure/flaky), coverage counts including per-requirement coverage and gap reasons, and truncation markers. Never returns titles, narrative text, evidence bytes/hashes, credentials or filesystem paths. Read-only."
 }
 
 func (t *reportDataReadTool) Parameters() json.RawMessage { return reportToolSchema(nil) }
@@ -182,6 +182,8 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 	issueCategory := make(map[string]int)
 	issueTriage := make(map[string]int)
 	flakyIssues := 0
+	expectedFailureIssues := 0
+	openProductIssues := 0
 	for _, issue := range snapshot.Issues {
 		issueStatus[string(issue.Status)]++
 		issueSeverity[issue.Severity]++
@@ -191,6 +193,12 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 		}
 		if issue.FlakyTriage() {
 			flakyIssues++
+		}
+		if issue.ExpectedFailureTriage() {
+			expectedFailureIssues++
+		}
+		if issue.OpenProductIssue() {
+			openProductIssues++
 		}
 	}
 	gaps := make([]map[string]any, 0, len(snapshot.Coverage.Gaps))
@@ -262,12 +270,14 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 		},
 		"case_results": caseResults,
 		"issues": map[string]any{
-			"total":       len(snapshot.Issues),
-			"by_status":   issueStatus,
-			"by_severity": issueSeverity,
-			"by_category": issueCategory,
-			"by_triage":   issueTriage,
-			"flaky":       flakyIssues,
+			"total":            len(snapshot.Issues),
+			"by_status":        issueStatus,
+			"by_severity":      issueSeverity,
+			"by_category":      issueCategory,
+			"by_triage":        issueTriage,
+			"flaky":            flakyIssues,
+			"expected_failure": expectedFailureIssues,
+			"open_product":     openProductIssues,
 		},
 		"coverage": map[string]any{
 			"requirements_total":    snapshot.Coverage.RequirementsTotal,

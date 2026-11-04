@@ -321,12 +321,16 @@ func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts deli
 
 	// Issues are kept in ascending ID order while truncating (so "first N by
 	// id" is deterministic) and reversed only for display (spec §6.1). A
-	// flaky-triaged issue is displayed with the triage classification instead of
-	// its stored product category; the issue row itself is never rewritten.
+	// flaky- or expected_failure-triaged issue is displayed with the triage
+	// classification instead of its stored product category; the issue row
+	// itself is never rewritten (Task 118/122).
 	data.Issues = append([]delivery.IssueSnapshot(nil), snapshot.Issues...)
 	for index := range data.Issues {
-		if data.Issues[index].FlakyTriage() {
+		switch {
+		case data.Issues[index].FlakyTriage():
 			data.Issues[index].Category = delivery.TriageClassificationFlaky
+		case data.Issues[index].ExpectedFailureTriage():
+			data.Issues[index].Category = delivery.TriageClassificationExpectedFailure
 		}
 	}
 	sort.SliceStable(data.Issues, func(i, j int) bool { return data.Issues[i].ID < data.Issues[j].ID })

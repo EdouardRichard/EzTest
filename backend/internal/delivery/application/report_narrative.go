@@ -38,8 +38,9 @@ var ErrReportNarrativeContradictsResults = errors.New("delivery: report narrativ
 
 const (
 	// reportNarrativeFallbackNotice heads the server-generated replacement text
-	// so a reader can never mistake it for an AI analysis that was accepted.
-	reportNarrativeFallbackNotice = "（AI 候选叙述与确定性结果矛盾，已由服务端替换为确定性摘要；以下统计与用例结果来自报告快照。）"
+	// so a reader can never mistake it for an AI analysis that was accepted. It
+	// covers both a contradictory candidate and a missing one (Task 122).
+	reportNarrativeFallbackNotice = "（AI 候选叙述缺失或与确定性结果矛盾，已由服务端替换为确定性摘要；以下统计与用例结果来自报告快照。）"
 	// The deterministic fallback is bounded: reports may carry thousands of
 	// runs, but the narrative only needs enough rows to state the result story.
 	reportNarrativeMaxCaseRunLines     = 40
@@ -53,9 +54,32 @@ var (
 	reportFailedCoverageGapClaim   = regexp.MustCompile(`未有效覆盖\s*(\d+)\s*个用例版本[^\n。；]{0,24}execution_failed_coverage`)
 	reportFlakyCoverageGapClaim    = regexp.MustCompile(`未有效覆盖\s*(\d+)\s*个用例版本[^\n。；]{0,24}execution_flaky_coverage`)
 	reportFlakyTriageClaim         = regexp.MustCompile(`flaky\s*分诊\s*(\d+)\s*条`)
+	reportExpectedFailureClaim     = regexp.MustCompile(`expected_failure\s*分诊\s*(\d+)\s*条`)
 	reportRequirementCode          = regexp.MustCompile(`(?i)FR[\s_\-]*0*(\d+)`)
 	reportNarrativeSentenceSplit   = regexp.MustCompile(`[\n。！？]+`)
+	// reportAllFailuresProductDefectClaim matches a claim that literally every
+	// failed run is an application/product defect, e.g. the release report's
+	// "8 条失败全部为 failure_class=application ... 全部按缺陷结论呈现" (or the
+	// "失败 8 条全部..." / "全部 8 条失败..." word orders). The captured N is
+	// compared with the snapshot's failed-run count so a truthful subset
+	// ("其余 7 条失败全部...") is not over-blocked.
+	reportAllFailuresProductDefectClaim  = regexp.MustCompile(`(?i)(\d+)\s*条失败[^。；\n]{0,16}(?:全部|均|都)[^。；\n]{0,60}(?:application|产品缺陷|缺陷结论|产品行为|按缺陷|产品问题|应用缺陷)`)
+	reportAllFailuresProductDefectClaim2 = regexp.MustCompile(`(?i)失败\s*(\d+)\s*条[^。；\n]{0,16}(?:全部|均|都)[^。；\n]{0,60}(?:application|产品缺陷|缺陷结论|产品行为|按缺陷|产品问题|应用缺陷)`)
+	reportAllFailuresProductDefectClaim3 = regexp.MustCompile(`(?i)(?:全部|所有)\s*(\d+)\s*条失败[^。；\n]{0,60}(?:application|产品缺陷|缺陷结论|产品行为|按缺陷|产品问题|应用缺陷)`)
 )
+
+// reportAllFailuresProductDefectClaims are the accepted word orders of an
+// "all failed runs are product defects" claim.
+var reportAllFailuresProductDefectClaims = []*regexp.Regexp{
+	reportAllFailuresProductDefectClaim,
+	reportAllFailuresProductDefectClaim2,
+	reportAllFailuresProductDefectClaim3,
+}
+
+// reportAllFailuresPhrases are unscoped "all failures" forms that a product
+// defect conclusion attaches to; they are only rejected when expected_failure
+// runs exist and the sentence itself does not name the non-product triage.
+var reportAllFailuresPhrases = []string{"所有失败", "全部失败"}
 
 // reportProductDefectPhrases are the ways a narrative presents a failed run as
 // a product/application defect. They are only rejected when no real application
@@ -148,6 +172,26 @@ func validateReportNarrative(snapshot delivery.ReportSnapshot, narrative string)
 				ErrReportNarrativeContradictsResults, claimed, reportFlakyTriageCount(snapshot))
 		}
 	}
+	for _, match := range reportExpectedFailureClaim.FindAllStringSubmatch(narrative, -1) {
+		if claimed := reportAtoi(match[1]); claimed != reportExpectedFailureCount(snapshot) {
+			return fmt.Errorf("%w: expected_failure 分诊 %d 条，确定性 expected_failure 结果为 %d 条",
+				ErrReportNarrativeContradictsResults, claimed, reportExpectedFailureCount(snapshot))
+		}
+	}
+	// Task 122: a report with expected_failure-triaged runs must say so and may
+	// not present every failed run as an application/product defect. Truthful
+	// subset statements stay allowed; the publisher falls back to the
+	// deterministic summary when the candidate omits or over-claims.
+	if reportExpectedFailureCount(snapshot) > 0 {
+		if !strings.Contains(strings.ToLower(narrative), delivery.TriageClassificationExpectedFailure) {
+			return fmt.Errorf("%w: 存在 expected_failure 分诊的运行，叙述必须单独说明该失败为 expected_failure（非产品缺陷，需重跑）",
+				ErrReportNarrativeContradictsResults)
+		}
+		if reportClaimsAllFailuresProductDefect(snapshot, narrative) {
+			return fmt.Errorf("%w: 存在 expected_failure 分诊的运行，不得将全部失败表述为 application/产品缺陷结论",
+				ErrReportNarrativeContradictsResults)
+		}
+	}
 	for _, sentence := range reportNarrativeSentenceSplit.Split(narrative, -1) {
 		sentence = strings.TrimSpace(sentence)
 		if sentence == "" || !reportClaimsNoValidExecution(sentence) {
@@ -168,14 +212,15 @@ func validateReportNarrative(snapshot delivery.ReportSnapshot, narrative string)
 			}
 		}
 	}
-	// Task 118: the platform triage is authoritative. When every application
-	// failure of the report was triaged flaky, a product/application defect
-	// conclusion is false and must be rewritten (the publisher falls back to the
-	// deterministic summary). A real application failure keeps the defect path
-	// untouched.
-	if reportFlakyTriageCount(snapshot) > 0 && reportApplicationDefectCount(snapshot) == 0 &&
+	// Task 118/122: the platform triage is authoritative. When every
+	// application failure of the report was triaged flaky or expected_failure,
+	// a product/application defect conclusion is false and must be rewritten
+	// (the publisher falls back to the deterministic summary). A real
+	// application failure keeps the defect path untouched.
+	if (reportFlakyTriageCount(snapshot) > 0 || reportExpectedFailureCount(snapshot) > 0) &&
+		reportApplicationDefectCount(snapshot) == 0 &&
 		reportClaimsProductDefect(narrative) {
-		return fmt.Errorf("%w: 平台 triage 已将该失败分类为 flaky（自动化不稳定），不得按 application/产品缺陷结论呈现",
+		return fmt.Errorf("%w: 平台 triage 已将该失败分类为 flaky/expected_failure（非产品缺陷），不得按 application/产品缺陷结论呈现",
 			ErrReportNarrativeContradictsResults)
 	}
 	return nil
@@ -222,6 +267,58 @@ func reportFlakyTriageCount(snapshot delivery.ReportSnapshot) int {
 	return count
 }
 
+// reportExpectedFailureCount counts the report runs whose platform triage
+// finished with classification=expected_failure (budget/no-judgment). They are
+// counted separately from the product defects in the deterministic summary.
+func reportExpectedFailureCount(snapshot delivery.ReportSnapshot) int {
+	count := 0
+	for _, run := range snapshot.CaseRuns {
+		if run.ExpectedFailureTriage() {
+			count++
+		}
+	}
+	return count
+}
+
+// reportClaimsAllFailuresProductDefect reports whether the narrative claims that
+// every failed run is an application/product defect while the snapshot also
+// contains expected_failure-triaged runs. Only a literally matching total is
+// rejected, so a truthful "其余 7 条失败全部..." subset statement passes.
+func reportClaimsAllFailuresProductDefect(snapshot delivery.ReportSnapshot, narrative string) bool {
+	if reportExpectedFailureCount(snapshot) == 0 {
+		return false
+	}
+	totalFailed := 0
+	for _, run := range snapshot.CaseRuns {
+		if run.Status == "failed" {
+			totalFailed++
+		}
+	}
+	for _, sentence := range reportNarrativeSentenceSplit.Split(narrative, -1) {
+		sentence = strings.TrimSpace(sentence)
+		if sentence == "" {
+			continue
+		}
+		for _, claim := range reportAllFailuresProductDefectClaims {
+			for _, match := range claim.FindAllStringSubmatch(sentence, -1) {
+				if reportAtoi(match[1]) == totalFailed {
+					return true
+				}
+			}
+		}
+		lower := strings.ToLower(sentence)
+		if strings.Contains(lower, delivery.TriageClassificationExpectedFailure) {
+			continue
+		}
+		for _, phrase := range reportAllFailuresPhrases {
+			if strings.Contains(sentence, phrase) && reportClaimsProductDefect(sentence) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // reportApplicationDefectCount counts failed runs that remain an application
 // failure after honoring the triage. It is the authority that keeps real
 // application defects on the product-defect path.
@@ -236,8 +333,17 @@ func reportApplicationDefectCount(snapshot delivery.ReportSnapshot) int {
 }
 
 // reportNarrativeForSnapshot is the publish-time guard: a contradictory
-// candidate is replaced by deterministic text instead of being rendered.
+// candidate is replaced by deterministic text instead of being rendered. A
+// report with expected_failure-triaged runs always gets the deterministic
+// summary when the writer proposed nothing, so the top-level summary never
+// silently omits the non-product failure (Task 122).
 func reportNarrativeForSnapshot(snapshot delivery.ReportSnapshot, narrative string) string {
+	if strings.TrimSpace(narrative) == "" {
+		if reportExpectedFailureCount(snapshot) > 0 {
+			return deterministicReportNarrative(snapshot)
+		}
+		return narrative
+	}
 	if err := validateReportNarrative(snapshot, narrative); err != nil {
 		return deterministicReportNarrative(snapshot)
 	}
@@ -255,6 +361,7 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 	statusCounts := make(map[string]int, len(snapshot.CaseRuns))
 	other := 0
 	flakyRuns := 0
+	expectedFailureRuns := 0
 	applicationDefects := 0
 	for _, run := range snapshot.CaseRuns {
 		statusCounts[run.Status]++
@@ -266,6 +373,9 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 		if run.TriageClassification == delivery.TriageClassificationFlaky {
 			flakyRuns++
 		}
+		if run.TriageClassification == delivery.TriageClassificationExpectedFailure {
+			expectedFailureRuns++
+		}
 		if run.Status == "failed" && run.EffectiveFailureClass() == "application" {
 			applicationDefects++
 		}
@@ -273,13 +383,18 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 	fmt.Fprintf(&builder, "- 执行总数 %d：通过（passed）%d、失败（failed）%d、受阻（blocked）%d、不确定（inconclusive）%d、跳过（skipped）%d、其他 %d。\n",
 		len(snapshot.CaseRuns), statusCounts["passed"], statusCounts["failed"], statusCounts["blocked"],
 		statusCounts["inconclusive"], statusCounts["skipped"], other)
-	if flakyRuns > 0 {
-		if applicationDefects == 0 {
-			fmt.Fprintf(&builder, "- 失败分类：flaky 分诊 %d 条（自动化不稳定），不计入产品缺陷。\n", flakyRuns)
-		} else {
-			fmt.Fprintf(&builder, "- 失败分类：flaky 分诊 %d 条（自动化不稳定，不计入产品缺陷）；真实产品缺陷 %d 条。\n",
-				flakyRuns, applicationDefects)
+	if flakyRuns > 0 || expectedFailureRuns > 0 {
+		parts := make([]string, 0, 2)
+		if flakyRuns > 0 {
+			parts = append(parts, fmt.Sprintf("flaky 分诊 %d 条（自动化不稳定，不计入产品缺陷）", flakyRuns))
 		}
+		if expectedFailureRuns > 0 {
+			parts = append(parts, fmt.Sprintf("expected_failure 分诊 %d 条（运行预算/未取得观测，不计入产品缺陷，需重跑）", expectedFailureRuns))
+		}
+		if applicationDefects > 0 {
+			parts = append(parts, fmt.Sprintf("产品缺陷 %d 条", applicationDefects))
+		}
+		fmt.Fprintf(&builder, "- 失败分类：%s。\n", strings.Join(parts, "；"))
 	}
 
 	if len(snapshot.CaseRuns) > 0 {
@@ -289,9 +404,13 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 				fmt.Fprintf(&builder, "  - 其余 %d 条用例结果见报告结果表。\n", len(snapshot.CaseRuns)-index)
 				break
 			}
-			fmt.Fprintf(&builder, "  - %s：%s（步骤失败 %d/%d，断言失败 %d/%d，证据 %d）。\n",
+			fmt.Fprintf(&builder, "  - %s：%s（步骤失败 %d/%d，断言失败 %d/%d，证据 %d）。",
 				reportCaseRunLabel(run), run.Status, run.StepFailedCount, run.StepCount,
 				run.AssertionFailedCount, run.AssertionCount, len(run.Evidence))
+			if run.ExpectedFailureTriage() {
+				builder.WriteString("（expected_failure 分诊，不计入产品缺陷，需重跑）")
+			}
+			builder.WriteString("\n")
 		}
 	}
 
@@ -324,19 +443,44 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 	}
 
 	openIssues := 0
+	openProductIssues := 0
 	flakyIssues := 0
+	expectedFailureIssues := 0
 	for _, issue := range snapshot.Issues {
 		if issue.Status == delivery.IssueStatusOpen {
 			openIssues++
 		}
+		if issue.OpenProductIssue() {
+			openProductIssues++
+		}
 		if issue.FlakyTriage() {
 			flakyIssues++
 		}
+		if issue.ExpectedFailureTriage() {
+			expectedFailureIssues++
+		}
 	}
-	if flakyIssues > 0 {
-		fmt.Fprintf(&builder, "- 问题 %d 个（未关闭 %d；其中 flaky 分诊 %d 个，不计入产品缺陷）。\n",
-			len(snapshot.Issues), openIssues, flakyIssues)
-	} else {
+	switch {
+	case flakyIssues > 0 || expectedFailureIssues > 0:
+		parts := make([]string, 0, 2)
+		if flakyIssues > 0 {
+			parts = append(parts, fmt.Sprintf("flaky 分诊 %d 个", flakyIssues))
+		}
+		if expectedFailureIssues > 0 {
+			parts = append(parts, fmt.Sprintf("expected_failure 分诊 %d 个", expectedFailureIssues))
+		}
+		fmt.Fprintf(&builder, "- 问题 %d 个（未关闭 %d；其中 %s，不计入产品缺陷",
+			len(snapshot.Issues), openIssues, strings.Join(parts, "、"))
+		// Only name the product issues when real product defects exist; naming
+		// them in an expected_failure-only report would itself read as a
+		// product-defect conclusion (the guard rejects that).
+		if applicationDefects > 0 && openProductIssues > 0 {
+			fmt.Fprintf(&builder, "；未关闭产品问题 %d 个", openProductIssues)
+		} else if openProductIssues > 0 {
+			fmt.Fprintf(&builder, "；未关闭其他问题 %d 个", openProductIssues)
+		}
+		builder.WriteString("）。\n")
+	default:
 		fmt.Fprintf(&builder, "- 问题 %d 个（未关闭 %d）。\n", len(snapshot.Issues), openIssues)
 	}
 	if len(snapshot.TruncatedSections) > 0 {

@@ -636,11 +636,11 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	issueSnapshots, flakyRuns, err := m.issueSnapshots(ctx, versionID, &waveID, runIDSet(runs))
+	issueSnapshots, runTriage, err := m.issueSnapshots(ctx, versionID, &waveID, runIDSet(runs))
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	applyRunTriage(modelRuns, flakyRuns)
+	applyRunTriage(modelRuns, runTriage)
 	requirementViews, err := m.requirementViews(ctx, versionID)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
@@ -649,7 +649,7 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	coverage, err := m.coverage(ctx, versionID, requirementViews, versionRuns, flakyRuns)
+	coverage, err := m.coverage(ctx, versionID, requirementViews, versionRuns, flakyRunSet(runTriage))
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -699,12 +699,12 @@ func (m *readModel) versionModel(ctx context.Context, versionID int64) (delivery
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	issueSnapshots, flakyRuns, err := m.issueSnapshots(ctx, versionID, nil, nil)
+	issueSnapshots, runTriage, err := m.issueSnapshots(ctx, versionID, nil, nil)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	applyRunTriage(modelRuns, flakyRuns)
-	coverage, err := m.coverage(ctx, versionID, requirementViews, runs, flakyRuns)
+	applyRunTriage(modelRuns, runTriage)
+	coverage, err := m.coverage(ctx, versionID, requirementViews, runs, flakyRunSet(runTriage))
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -948,10 +948,11 @@ func (m *readModel) versionSUTs(ctx context.Context, versionID int64) ([]deliver
 // issueSnapshots drains the version issues and joins refs, the latest finished
 // issue.triage projection and the reverse merged_into projection. When
 // waveID/runIDs are set only issues referencing that wave or one of its runs
-// are returned. It also returns the case_run IDs whose triage is flaky: those
-// runs are automation flakiness, not product defects, for the whole version
-// projection (a wave report still uses the version-level coverage gaps).
-func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID *int64, runIDs map[int64]bool) ([]delivery.IssueSnapshot, map[int64]bool, error) {
+// are returned. It also returns the case_run IDs whose triage is flaky or
+// expected_failure: those runs are not product defects for the whole version
+// projection (a wave report still uses the version-level coverage gaps; only
+// flaky is excluded from the product coverage-failure count).
+func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID *int64, runIDs map[int64]bool) ([]delivery.IssueSnapshot, map[int64]string, error) {
 	if m.deps.Issues == nil {
 		return nil, nil, nil
 	}
@@ -975,7 +976,7 @@ func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID 
 	sort.Slice(issues, func(i, j int) bool { return issues[i].ID < issues[j].ID })
 	refsByIssue := make(map[int64][]delivery.IssueRef, len(issues))
 	mergedSources := make(map[int64][]int64)
-	flakyRuns := make(map[int64]bool)
+	runTriage := make(map[int64]string)
 	type triageProjection struct {
 		status         string
 		classification string
@@ -1005,14 +1006,31 @@ func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID 
 			classification: delivery.TriageOutputClassification(run),
 		}
 		triageByIssue[issue.ID] = projection
-		if projection.status != string(delivery.AnalysisStatusDone) ||
-			projection.classification != delivery.TriageClassificationFlaky {
+		if projection.status != string(delivery.AnalysisStatusDone) {
+			continue
+		}
+		classification := projection.classification
+		if classification != delivery.TriageClassificationFlaky &&
+			classification != delivery.TriageClassificationExpectedFailure {
 			continue
 		}
 		for _, ref := range refs {
-			if ref.Kind == delivery.IssueRefKindCaseRun && ref.RefID > 0 {
-				flakyRuns[ref.RefID] = true
+			if ref.Kind != delivery.IssueRefKindCaseRun || ref.RefID <= 0 {
+				continue
 			}
+			// A run referenced by more than one triaged issue (or by a flaky and
+			// an expected_failure issue) resolves deterministically: flaky
+			// (automation) wins because it also excludes the run from the
+			// product coverage-failure count; otherwise the first classification
+			// in issue-ID order is kept.
+			if existing, ok := runTriage[ref.RefID]; ok {
+				if existing != delivery.TriageClassificationFlaky &&
+					classification == delivery.TriageClassificationFlaky {
+					runTriage[ref.RefID] = classification
+				}
+				continue
+			}
+			runTriage[ref.RefID] = classification
 		}
 	}
 	snapshots := make([]delivery.IssueSnapshot, 0, len(issues))
@@ -1047,16 +1065,33 @@ func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID 
 			UpdatedAt:            issue.UpdatedAt,
 		})
 	}
-	return snapshots, flakyRuns, nil
+	return snapshots, runTriage, nil
+}
+
+// flakyRunSet selects the runs whose triage classification is flaky. Only those
+// are excluded from the product coverage-failure count; expected_failure stays a
+// genuine non-pass (no fake pass, Task 121/122).
+func flakyRunSet(runTriage map[int64]string) map[int64]bool {
+	if len(runTriage) == 0 {
+		return nil
+	}
+	flaky := make(map[int64]bool)
+	for runID, classification := range runTriage {
+		if classification == delivery.TriageClassificationFlaky {
+			flaky[runID] = true
+		}
+	}
+	return flaky
 }
 
 // applyRunTriage marks the report projection of every run referenced by a
-// flaky-triaged issue. The raw FailureClass stays untouched; readers use
-// CaseRunSnapshot.EffectiveFailureClass for the report-visible conclusion.
-func applyRunTriage(runs []delivery.CaseRunSnapshot, flakyRuns map[int64]bool) {
+// flaky- or expected_failure-triaged issue. The raw FailureClass stays
+// untouched; readers use CaseRunSnapshot.EffectiveFailureClass for the
+// report-visible conclusion.
+func applyRunTriage(runs []delivery.CaseRunSnapshot, runTriage map[int64]string) {
 	for index := range runs {
-		if flakyRuns[runs[index].ID] {
-			runs[index].TriageClassification = delivery.TriageClassificationFlaky
+		if classification, ok := runTriage[runs[index].ID]; ok {
+			runs[index].TriageClassification = classification
 		}
 	}
 }
