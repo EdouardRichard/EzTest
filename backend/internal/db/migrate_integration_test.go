@@ -1359,24 +1359,39 @@ func TestV022EEXSchema(t *testing.T) {
 	requireColumn(t, pool, "case_confirmation", "auto_confirmed_by")
 	requireUnique(t, pool, "uk_execution_discovery_observation")
 
-	// DB-17: one row per image extracted from a document attachment. Image
-	// statuses are independent from the attachment extraction status and
-	// (attachment_id, seq) is the natural key.
+	// DB-17: one row per image extracted from a document attachment. The
+	// attachment reference is a same-context FK that cascades on delete; every
+	// image must point at a content object and declare where it came from
+	// (E §2.3). Image statuses are independent from the attachment extraction
+	// status and (attachment_id, seq) is the natural key.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_attachment (id, version_id, content_ref_id, name, mime, size)
+		VALUES (9200, 920, 920, 'doc.pdf', 'application/pdf', 10)
+	`); err != nil {
+		t.Fatalf("insert requirement attachment: %v", err)
+	}
 	for _, column := range []string{
 		"id", "attachment_id", "seq", "content_ref_id", "mime", "width", "height",
 		"source_kind", "status", "caption", "error", "created_at", "updated_at",
 	} {
 		requireColumn(t, pool, "attachment_image", column)
 	}
+	requireColumnNotNull(t, pool, "attachment_image", "content_ref_id")
+	requireColumnNotNull(t, pool, "attachment_image", "source_kind")
+	requireCheckSet(t, pool, "chk_attachment_image_source_kind",
+		[]string{"embedded", "page_render", "standalone"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_attachment_image_status",
+		[]string{"extracted", "analyzing", "done", "failed", "skipped"}, []string{"bogus"})
 	requirePKConstraint(t, pool, "pk_attachment_image")
 	requireUnique(t, pool, "uk_attachment_image_attachment_seq")
 	requireIndex(t, pool, "idx_attachment_image_attachment_status")
 
-	// Image rows default to extracted, require seq > 0 and keep the
-	// (attachment_id, seq) identity unique.
+	// Image rows default to extracted, require seq > 0, declare a known
+	// source kind and keep the (attachment_id, seq) identity unique.
 	var imageStatus string
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO attachment_image (id, attachment_id, seq) VALUES (9201, 9200, 1)
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9201, 9200, 1, 920, 'embedded')
 		RETURNING status
 	`).Scan(&imageStatus); err != nil {
 		t.Fatalf("insert attachment image: %v", err)
@@ -1384,15 +1399,75 @@ func TestV022EEXSchema(t *testing.T) {
 	if imageStatus != "extracted" {
 		t.Errorf("attachment_image.status default = %q, want extracted", imageStatus)
 	}
+	for _, sourceKind := range []string{"page_render", "standalone"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET source_kind = $1 WHERE id = 9201
+		`, sourceKind); err != nil {
+			t.Errorf("attachment_image rejects source_kind %q: %v", sourceKind, err)
+		}
+	}
+	for _, sourceKind := range []string{"", "bogus"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET source_kind = $1 WHERE id = 9201
+		`, sourceKind); err == nil {
+			t.Errorf("attachment_image accepts source_kind %q", sourceKind)
+		}
+	}
+	for _, status := range []string{"analyzing", "done", "failed", "skipped"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET status = $1 WHERE id = 9201
+		`, status); err != nil {
+			t.Errorf("attachment_image rejects status %q: %v", status, err)
+		}
+	}
+	for _, status := range []string{"", "bogus"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET status = $1 WHERE id = 9201
+		`, status); err == nil {
+			t.Errorf("attachment_image accepts status %q", status)
+		}
+	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO attachment_image (id, attachment_id, seq) VALUES (9202, 9200, 1)
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id)
+		VALUES (9202, 9200, 2, 920)
+	`); err == nil {
+		t.Error("attachment_image accepts a missing source_kind")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9203, 9200, 3, NULL, 'embedded')
+	`); err == nil {
+		t.Error("attachment_image accepts a NULL content_ref_id")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9204, 999999, 4, 920, 'embedded')
+	`); err == nil {
+		t.Error("attachment_image accepts an unknown attachment_id")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9205, 9200, 1, 920, 'embedded')
 	`); err == nil {
 		t.Error("duplicate attachment_image (attachment_id, seq) accepted")
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO attachment_image (id, attachment_id, seq) VALUES (9203, 9200, 0)
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9206, 9200, 0, 920, 'embedded')
 	`); err == nil {
 		t.Error("attachment_image seq = 0 accepted")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM requirement_attachment WHERE id = 9200`); err != nil {
+		t.Fatalf("delete requirement attachment: %v", err)
+	}
+	var remainingImages int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM attachment_image WHERE attachment_id = 9200
+	`).Scan(&remainingImages); err != nil {
+		t.Fatalf("count attachment images after cascade: %v", err)
+	}
+	if remainingImages != 0 {
+		t.Errorf("attachment_image rows after attachment delete = %d, want 0 (ON DELETE CASCADE)", remainingImages)
 	}
 
 	// DB-16: the structured question state machine. The 0.21 open/resolved
@@ -1400,6 +1475,11 @@ func TestV022EEXSchema(t *testing.T) {
 	for _, column := range []string{"conversation_id", "message_id"} {
 		requireColumn(t, pool, "human_request", column)
 	}
+	requireCheckSet(t, pool, "chk_human_request_kind",
+		[]string{"clarification_question", "approval", "blocked_recovery", "login_takeover", "conflict", "other"},
+		[]string{"escalation"})
+	requireCheckSet(t, pool, "chk_human_request_status",
+		[]string{"pending", "answered", "expired", "cancelled"}, []string{"open", "resolved"})
 	requireIndex(t, pool, "idx_human_request_conversation")
 	var humanStatus string
 	if err := pool.QueryRow(ctx, `
@@ -1432,6 +1512,16 @@ func TestV022EEXSchema(t *testing.T) {
 	`); err == nil {
 		t.Error("human_request accepts unknown kind 'escalation'")
 	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'answered' WHERE id = 9301
+	`); err != nil {
+		t.Errorf("human_request rejects v0.22 status answered: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'bogus' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request accepts unknown status 'bogus'")
+	}
 
 	// DB-29: executions keep only normalized resource templates. The unique key
 	// is the observation identity; sensitive request payload columns must not
@@ -1452,6 +1542,15 @@ func TestV022EEXSchema(t *testing.T) {
 		requireNoColumn(t, pool, "execution_discovery_observation", column)
 	}
 	requirePKConstraint(t, pool, "pk_execution_discovery_observation")
+	// version_sut_id is part of the observation identity, so it must be
+	// non-null or NULLS DISTINCT would defeat the unique key.
+	requireColumnNotNull(t, pool, "execution_discovery_observation", "version_sut_id")
+	requireCheckSet(t, pool, "chk_execution_discovery_observation_kind",
+		[]string{"page", "api"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_execution_discovery_observation_decision",
+		[]string{"new", "proposed", "approved", "rejected", "out_of_scope"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_execution_discovery_observation_source_kind",
+		[]string{"execution", "p9"}, []string{"bogus"})
 	for _, index := range []string{
 		"idx_execution_discovery_observation_version_decision",
 		"idx_execution_discovery_observation_wave",
@@ -1472,12 +1571,17 @@ func TestV022EEXSchema(t *testing.T) {
 	if uniqueDef != wantUniqueDef {
 		t.Errorf("uk_execution_discovery_observation = %q, want %q", uniqueDef, wantUniqueDef)
 	}
-	if _, err := pool.Exec(ctx, `
+	var decision, sourceKind string
+	if err := pool.QueryRow(ctx, `
 		INSERT INTO execution_discovery_observation
 			(id, version_id, version_sut_id, kind, resource_template)
 		VALUES (9401, 9400, 9410, 'page', '/orders/42')
-	`); err != nil {
+		RETURNING decision, source_kind
+	`).Scan(&decision, &sourceKind); err != nil {
 		t.Fatalf("insert discovery observation: %v", err)
+	}
+	if decision != "new" || sourceKind != "execution" {
+		t.Errorf("observation defaults = (%q, %q), want (new, execution)", decision, sourceKind)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO execution_discovery_observation
@@ -1493,6 +1597,35 @@ func TestV022EEXSchema(t *testing.T) {
 	`); err != nil {
 		t.Errorf("distinct discovery observation kind rejected: %v", err)
 	}
+	for _, change := range []struct{ column, value string }{
+		{"decision", "proposed"},
+		{"source_kind", "p9"},
+	} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE execution_discovery_observation SET `+change.column+` = $1 WHERE id = 9401
+		`, change.value); err != nil {
+			t.Errorf("execution_discovery_observation rejects %s %q: %v", change.column, change.value, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE execution_discovery_observation SET `+change.column+` = 'bogus' WHERE id = 9401
+		`); err == nil {
+			t.Errorf("execution_discovery_observation accepts %s 'bogus'", change.column)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9404, 9400, 9410, 'bogus', '/orders/43')
+	`); err == nil {
+		t.Error("execution_discovery_observation accepts kind 'bogus'")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, kind, resource_template)
+		VALUES (9405, 9400, 'page', '/orders/44')
+	`); err == nil {
+		t.Error("execution_discovery_observation accepts a NULL version_sut_id")
+	}
 
 	// DB-30: discovery-delta case versions and the auto-confirmation audit.
 	for _, column := range []string{
@@ -1505,6 +1638,66 @@ func TestV022EEXSchema(t *testing.T) {
 		"auto_confirmed", "auto_confirmed_by", "trigger", "source_observation_id",
 	} {
 		requireColumn(t, pool, "case_confirmation", column)
+	}
+	requireColumnDefault(t, pool, "case_version", "trigger", "'normal'::text")
+	requireColumnDefault(t, pool, "case_confirmation", "trigger", "'manual'::text")
+	requireCheckSet(t, pool, "chk_case_version_trigger",
+		[]string{"normal", "discovery_delta"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_case_confirmation_trigger",
+		[]string{"manual", "discovery_delta"}, []string{"bogus"})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name)
+		VALUES (9500, 950, 950, 951, 'scenario')
+	`); err != nil {
+		t.Fatalf("insert case scenario: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_entity (id, scenario_id) VALUES (9501, 9500)
+	`); err != nil {
+		t.Fatalf("insert case entity: %v", err)
+	}
+	var caseVersionTrigger string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO case_version (id, case_id, revision, title, content_hash)
+		VALUES (9502, 9501, 1, 'case', repeat('a', 64))
+		RETURNING trigger
+	`).Scan(&caseVersionTrigger); err != nil {
+		t.Fatalf("insert case version: %v", err)
+	}
+	if caseVersionTrigger != "normal" {
+		t.Errorf("case_version.trigger default = %q, want normal", caseVersionTrigger)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_version SET trigger = 'discovery_delta' WHERE id = 9502
+	`); err != nil {
+		t.Errorf("case_version rejects trigger discovery_delta: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_version SET trigger = 'bogus' WHERE id = 9502
+	`); err == nil {
+		t.Error("case_version accepts trigger 'bogus'")
+	}
+	var confirmationTrigger string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO case_confirmation
+			(id, case_version_id, scope, target_scope_id, batch_id, confirmed_by)
+		VALUES (9503, 9502, 'case', 9502, 'batch-1', 950)
+		RETURNING trigger
+	`).Scan(&confirmationTrigger); err != nil {
+		t.Fatalf("insert case confirmation: %v", err)
+	}
+	if confirmationTrigger != "manual" {
+		t.Errorf("case_confirmation.trigger default = %q, want manual", confirmationTrigger)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_confirmation SET trigger = 'discovery_delta' WHERE id = 9503
+	`); err != nil {
+		t.Errorf("case_confirmation rejects trigger discovery_delta: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_confirmation SET trigger = 'bogus' WHERE id = 9503
+	`); err == nil {
+		t.Error("case_confirmation accepts trigger 'bogus'")
 	}
 }
 
@@ -1615,5 +1808,66 @@ func requirePKConstraint(t *testing.T, pool *pgxpool.Pool, constraint string) {
 	}
 	if !exists {
 		t.Errorf("missing primary-key constraint %s", constraint)
+	}
+}
+
+// requireColumnNotNull asserts information_schema reports the column as NOT
+// NULL, so a silently reintroduced NULL slips no further than this test.
+func requireColumnNotNull(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var nullable string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+	`, table, column).Scan(&nullable); err != nil {
+		t.Errorf("read %s.%s nullability: %v", table, column, err)
+		return
+	}
+	if nullable != "NO" {
+		t.Errorf("%s.%s is nullable, want NOT NULL", table, column)
+	}
+}
+
+// requireColumnDefault asserts the exact column default, pinning enum-like
+// defaults (normal/manual) against a silent drop.
+func requireColumnDefault(t *testing.T, pool *pgxpool.Pool, table, column, want string) {
+	t.Helper()
+	var got string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT column_default FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+	`, table, column).Scan(&got); err != nil {
+		t.Errorf("read %s.%s default: %v", table, column, err)
+		return
+	}
+	if got != want {
+		t.Errorf("%s.%s default = %q, want %q", table, column, got, want)
+	}
+}
+
+// requireCheckSet pins a named CHECK constraint's value set via
+// pg_get_constraintdef: every allowed value must still be listed and no
+// forbidden (legacy/draft) value may survive.
+func requireCheckSet(t *testing.T, pool *pgxpool.Pool, constraint string, allowed, forbidden []string) {
+	t.Helper()
+	var def string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conname = $1
+		  AND contype = 'c'
+		  AND connamespace = current_schema()::regnamespace
+	`, constraint).Scan(&def); err != nil {
+		t.Errorf("read check constraint %s: %v", constraint, err)
+		return
+	}
+	for _, value := range allowed {
+		if !strings.Contains(def, "'"+value+"'") {
+			t.Errorf("check constraint %s misses %q: %s", constraint, value, def)
+		}
+	}
+	for _, value := range forbidden {
+		if strings.Contains(def, "'"+value+"'") {
+			t.Errorf("check constraint %s still allows %q: %s", constraint, value, def)
+		}
 	}
 }

@@ -6,7 +6,9 @@
 -- api = path) plus a fingerprint; query values, headers, cookies, bodies and
 -- raw request/response payloads are deliberately never stored (N-16, R-EX-7).
 -- IDs are logical BIGINT references into the version/execution contexts
--- (Agent.md §6.9.7), so no cross-context foreign keys.
+-- (Agent.md §6.9.7), so no cross-context foreign keys. version_sut_id is part
+-- of the observation identity and therefore NOT NULL: with NULLS DISTINCT a
+-- nullable identity column would defeat dedupe (Lead ruling).
 -- See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-19/DB-29
 -- and §4.20/§4.31.
 
@@ -20,7 +22,7 @@ CREATE TABLE execution_discovery_observation (
     version_id          BIGINT NOT NULL,
     wave_id             BIGINT NULL,
     case_run_id         BIGINT NULL,
-    version_sut_id      BIGINT NULL,
+    version_sut_id      BIGINT NOT NULL,
     environment_id      BIGINT NULL,
     kind                TEXT NOT NULL
                         CONSTRAINT chk_execution_discovery_observation_kind

@@ -5,8 +5,10 @@
 -- status and extraction_report carries the found/parsed/skipped coverage plus
 -- skip reasons (spec DB-18, C-1, E §2.3).
 --
--- content_ref_id/attachment_id stay logical BIGINT references (content ledger /
--- version context, Agent.md §6.9.7), so no cross-context foreign keys.
+-- attachment_id is a same-context reference, so it carries a real FK and image
+-- rows cascade with their attachment; content_ref_id stays a logical BIGINT
+-- reference into the content ledger (Agent.md §6.9.7). Every image must point
+-- at a content object and declare how it was produced (E §2.3).
 -- See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-17/DB-18,
 -- §4.7 R-A7-3a and docs/version-V0.22/E-tools-attachments.md §2.3.
 
@@ -21,10 +23,11 @@ ALTER TABLE requirement_attachment DROP COLUMN parse_status;
 
 CREATE TABLE attachment_image (
     id              BIGINT NOT NULL,
-    attachment_id   BIGINT NOT NULL,
+    attachment_id   BIGINT NOT NULL
+                    REFERENCES requirement_attachment (id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL
                     CONSTRAINT chk_attachment_image_seq CHECK (seq > 0),
-    content_ref_id  BIGINT NULL,
+    content_ref_id  BIGINT NOT NULL,
     mime            TEXT NOT NULL DEFAULT '',
     width           INTEGER NULL
                     CONSTRAINT chk_attachment_image_width
@@ -32,7 +35,9 @@ CREATE TABLE attachment_image (
     height          INTEGER NULL
                     CONSTRAINT chk_attachment_image_height
                     CHECK (height IS NULL OR height > 0),
-    source_kind     TEXT NOT NULL DEFAULT '',
+    source_kind     TEXT NOT NULL
+                    CONSTRAINT chk_attachment_image_source_kind
+                    CHECK (source_kind IN ('embedded', 'page_render', 'standalone')),
     status          TEXT NOT NULL DEFAULT 'extracted'
                     CONSTRAINT chk_attachment_image_status
                     CHECK (status IN ('extracted', 'analyzing', 'done', 'failed', 'skipped')),
