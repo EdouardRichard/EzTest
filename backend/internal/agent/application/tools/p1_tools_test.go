@@ -447,7 +447,7 @@ func TestAttachmentReadTextPaging(t *testing.T) {
 		`{"attachment_id":""}`,
 		`{"attachment_id":"9001","offset":-1}`,
 		`{"attachment_id":"9001","max_chars":0}`,
-		`{"attachment_id":"9001","max_chars":20001}`,
+		`{"attachment_id":"9001","max_chars":-1}`,
 	}
 	for _, params := range invalid {
 		if _, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, params); err == nil {

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"unicode/utf8"
 )
 
 type attachmentList struct{ deps Deps }
@@ -62,7 +63,7 @@ type attachmentReadText struct{ deps Deps }
 func (t *attachmentReadText) Name() string { return ToolAttachmentReadText }
 
 func (t *attachmentReadText) Description() string {
-	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000）。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。"
+	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000，超出按 20000 截断）。响应返回 returned_chars 与 next_offset；必须按 next_offset 前进，禁止按请求的 max_chars 跳过内容。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。"
 }
 
 func (t *attachmentReadText) Parameters() json.RawMessage {
@@ -79,14 +80,13 @@ func (t *attachmentReadText) Parameters() json.RawMessage {
 		"max_chars": map[string]any{
 			"type":        "integer",
 			"minimum":     1,
-			"maximum":     20000,
-			"description": "本次最多返回的字符数，默认 8000。",
+			"description": "本次最多返回的字符数，默认 8000，超过 20000 按 20000 截断。",
 		},
 	}, "attachment_id")
 }
 
 func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.RawMessage) (any, error) {
-	params := attachmentReadTextParams{MaxChars: 8000}
+	params := attachmentReadTextParams{MaxChars: DefaultToolResultReadChars}
 	if err := decodeParams(raw, &params); err != nil {
 		return nil, err
 	}
@@ -97,8 +97,13 @@ func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.
 	if params.Offset < 0 {
 		return nil, Invalid("offset", "must not be negative")
 	}
-	if params.MaxChars <= 0 || params.MaxChars > 20000 {
-		return nil, Invalid("max_chars", "must be between 1 and 20000")
+	if params.MaxChars <= 0 {
+		return nil, Invalid("max_chars", "must be positive")
+	}
+	// R-A6-2 caps an oversized page instead of rejecting it: the model still
+	// advances by the actual returned count below.
+	if params.MaxChars > MaxToolResultReadChars {
+		params.MaxChars = MaxToolResultReadChars
 	}
 	if t.deps.Attachment == nil {
 		return nil, missingDep("attachment")
@@ -107,17 +112,24 @@ func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.
 	if err != nil {
 		return nil, mapPortError(err)
 	}
+	returned := utf8.RuneCountInString(page.Text)
+	nextOffset := page.Offset + returned
+	if page.TotalChars > 0 && nextOffset > page.TotalChars {
+		nextOffset = page.TotalChars
+	}
 	return map[string]any{
-		"attachment_id": idString(attachmentID),
-		"name":          page.Name,
-		"mime":          page.MIME,
-		"status":        page.Status,
-		"offset":        page.Offset,
-		"text":          page.Text,
-		"total_chars":   page.TotalChars,
-		"truncated":     page.Truncated,
-		"error":         page.Error,
-		"retryable":     page.Retryable,
+		"attachment_id":  idString(attachmentID),
+		"name":           page.Name,
+		"mime":           page.MIME,
+		"status":         page.Status,
+		"offset":         page.Offset,
+		"text":           page.Text,
+		"returned_chars": returned,
+		"next_offset":    nextOffset,
+		"total_chars":    page.TotalChars,
+		"truncated":      page.Truncated,
+		"error":          page.Error,
+		"retryable":      page.Retryable,
 	}, nil
 }
 

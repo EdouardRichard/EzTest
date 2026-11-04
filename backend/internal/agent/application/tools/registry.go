@@ -44,6 +44,10 @@ const (
 	ToolAttachmentImageRef         = "attachment.image_ref"
 	ToolSUTList                    = "sut.list"
 	ToolSUTPageList                = "sut.page_list"
+	// ToolToolResultRead is the v0.22 A-6 continuation tool (R-A6-1). It is
+	// registered by NewP7Registry only when the content-store port is wired;
+	// the frozen P1 registration order above is unchanged.
+	ToolToolResultRead = "tool_result.read"
 )
 
 // p1ToolNames is the frozen P1 registration order.
@@ -271,6 +275,11 @@ type Deps struct {
 	// root fills it per run (Task 36) and registers TaskCompleteTools through
 	// RegisterP4ToolGroup; a zero value leaves task.complete unregistered.
 	Completion CompletionDeps
+	// ToolResult is the additive v0.22 A-6 tool-result governance surface
+	// (R-A6-1..R-A6-5). The composition root fills it per run (Task 36); a nil
+	// Content leaves tool_result.read unregistered and a nil Settings falls
+	// back to the catalog default threshold.
+	ToolResult ToolResultDeps
 }
 
 // CompletionDeps is the per-run wiring of the task.complete tool: the
