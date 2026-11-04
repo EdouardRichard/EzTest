@@ -41,7 +41,9 @@ type TodoHit struct {
 }
 
 // HumanRequestRow is one open human_request row returned by the P6 read
-// source. Kind is the human_request kind (login_takeover/conflict/other).
+// source. The execution todo feed only contains pending login_takeover and
+// blocked_recovery rows: clarification_question/approval are version todos
+// (W2) and conflict/other are legacy, so none of them are execution todos.
 type HumanRequestRow struct {
 	ID           int64
 	Kind         string
@@ -74,8 +76,9 @@ type QueryReader interface {
 	// CountEvidenceCompleteness returns finished case_runs with at least one
 	// evidence row (num) over the same denominator as CountExecutionPass.
 	CountEvidenceCompleteness(ctx context.Context, versionID *int64) (num, denom int, err error)
-	// ListOpenHumanRequests returns open human requests. includeTakeover is
-	// false for non-admin viewers so login_takeover rows are never fetched.
+	// ListOpenHumanRequests returns pending execution-todo human requests:
+	// login_takeover and blocked_recovery only. includeTakeover is false for
+	// non-admin viewers so login_takeover rows are never fetched.
 	ListOpenHumanRequests(ctx context.Context, includeTakeover bool, limit int) ([]HumanRequestRow, error)
 	// ListDeadWorkItems returns dead work items. work_item is owned by the
 	// agent context, so the implementation must read it through the agent

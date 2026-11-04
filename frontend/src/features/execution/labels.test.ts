@@ -98,12 +98,16 @@ describe("wave labels", () => {
 })
 
 describe("human request labels", () => {
-  it("labels kinds, statuses and tones", () => {
+  it("labels every v0.22 kind, status and tone", () => {
     expect(HUMAN_REQUEST_KIND_LABEL).toEqual({
+      clarification_question: "澄清提问",
+      approval: "审批",
+      blocked_recovery: "阻塞恢复",
       login_takeover: "登录接管",
       conflict: "冲突处理",
       other: "其他",
     })
+    expect(Object.keys(HUMAN_REQUEST_KIND_LABEL)).toHaveLength(6)
     expect(HUMAN_REQUEST_STATUS_LABEL).toEqual({
       pending: "待处理",
       answered: "已处理",

@@ -1385,7 +1385,9 @@ try {
         if (-not $humanResolved) {
             $humanResponse = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=pending&limit=10" -Token $script:token
             if ($humanResponse.Status -eq 200) {
-                $openRequests = Get-Array $humanResponse.Json.data
+                # Only the login takeover gates execution: v0.22 clarification
+                # questions share this list and must not be resolved here.
+                $openRequests = @(Get-Array $humanResponse.Json.data | Where-Object { [string]$_.kind -eq "login_takeover" })
                 if ($openRequests.Count -gt 0) {
                     $human = $openRequests[0]
                     $s8 = Start-Scenario "S8 login takeover: 2FA human_request pending -> resolve 246810 -> resume -> pass"
@@ -1407,7 +1409,8 @@ try {
                     Assert-True ($null -eq $resolveResponse.Json.data.response.code) "resolve response must not echo the code"
                     $openAfterResolve = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=pending&limit=10" -Token $script:token
                     Assert-Status $openAfterResolve @(200) "GET pending human requests after resolve"
-                    Assert-Equal (Get-Array $openAfterResolve.Json.data).Count 0 "pending human requests after resolve"
+                    $pendingTakeoversAfterResolve = @(Get-Array $openAfterResolve.Json.data | Where-Object { [string]$_.kind -eq "login_takeover" })
+                    Assert-Equal $pendingTakeoversAfterResolve.Count 0 "pending human requests after resolve"
                     $humanResolved = $true
                     Pass-Scenario $s8
                     Start-Sleep -Milliseconds 500

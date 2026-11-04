@@ -101,7 +101,11 @@ export const PAUSE_MODE_LABEL: Record<PauseMode, string> = {
   immediate: "立即暂停",
 }
 
+/** All six v0.22 human_request kinds (spec R-W2-1 / DB-16). */
 export const HUMAN_REQUEST_KIND_LABEL: Record<HumanRequestKind, string> = {
+  clarification_question: "澄清提问",
+  approval: "审批",
+  blocked_recovery: "阻塞恢复",
   login_takeover: "登录接管",
   conflict: "冲突处理",
   other: "其他",

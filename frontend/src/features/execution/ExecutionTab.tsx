@@ -336,7 +336,13 @@ export function ExecutionTab({
   const pausedCaseRun =
     caseRuns.find((caseRun) => caseRun.id === selectedCaseRunId && caseRun.status === "paused") ??
     null
-  const openHumanRequests = humanRequests.filter((request) => request.status === "pending")
+  // Only login takeover pauses execution and gates the wave resume (server
+  // `GetOpenByCaseRun` is login_takeover-only). The other human_request kinds —
+  // clarification questions above all — are version todos and must never render
+  // as a takeover or block a resume (R-B3-4).
+  const openHumanRequests = humanRequests.filter(
+    (request) => request.status === "pending" && request.kind === "login_takeover",
+  )
 
   const sutOptions = Array.from(
     new Set([

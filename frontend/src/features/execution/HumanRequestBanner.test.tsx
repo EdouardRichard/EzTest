@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { HumanRequestBanner } from "./HumanRequestBanner"
-import { humanRequestFixture } from "./test-fixtures"
+import { clarificationQuestionFixture, humanRequestFixture } from "./test-fixtures"
 import type { HumanRequest, HumanRequestResponseInput } from "./types"
 
 const NOW = Date.parse("2026-10-31T12:00:00Z")
@@ -98,5 +98,21 @@ describe("HumanRequestBanner", () => {
 
     expect(await screen.findByText("验证码错误")).toBeInTheDocument()
     expect(screen.getAllByRole("alert").length).toBeGreaterThan(0)
+  })
+
+  it("ignores a pending clarification question: it is not a login takeover", () => {
+    render(<Harness initial={[clarificationQuestionFixture]} />)
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    expect(screen.queryByText(/请确认退款口径/)).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "完成" })).not.toBeInTheDocument()
+  })
+
+  it("renders the takeover when a clarification question is pending too", () => {
+    render(<Harness initial={[clarificationQuestionFixture, humanRequestFixture]} />)
+
+    expect(screen.getByText("登录接管")).toBeInTheDocument()
+    expect(screen.getByText(/支付网关需要 2FA 验证码/)).toBeInTheDocument()
+    expect(screen.queryByText(/请确认退款口径/)).not.toBeInTheDocument()
   })
 })

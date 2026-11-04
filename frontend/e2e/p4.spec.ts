@@ -162,14 +162,16 @@ async function getReportDetail(
   ).data
 }
 
-async function getOpenHumanRequests(request: APIRequestContext): Promise<HumanRequest[]> {
-  return (
+/** Pending login takeovers only; clarification questions share the same list. */
+async function getOpenLoginTakeoverRequests(request: APIRequestContext): Promise<HumanRequest[]> {
+  const requests = (
     await api<{ data: HumanRequest[] }>(
       request,
       "GET",
       `/api/versions/${versionID}/human-requests?status=pending&limit=10`,
     )
   ).data
+  return requests.filter((item) => item.kind === "login_takeover")
 }
 
 function screenshotPath(name: string): string {
@@ -310,8 +312,8 @@ test("phase A: running version tabs, issues, chain and report stale/regenerate",
   // ------------------------------------ resolve 2FA, wait for wave 1 terminal --
   const humanRequest = await waitFor(
     async () => {
-      const requests = await getOpenHumanRequests(request)
-      return requests.find((item) => item.kind === "login_takeover") ?? null
+      const requests = await getOpenLoginTakeoverRequests(request)
+      return requests[0] ?? null
     },
     120_000,
     "open login_takeover human request",
@@ -321,11 +323,11 @@ test("phase A: running version tabs, issues, chain and report stale/regenerate",
   })
   await waitFor(
     async () => {
-      const requests = await getOpenHumanRequests(request)
+      const requests = await getOpenLoginTakeoverRequests(request)
       return requests.length === 0 ? true : null
     },
     30_000,
-    "human request resolved",
+    "login_takeover human request resolved",
   )
   const wave1 = await waitFor(
     async () => {

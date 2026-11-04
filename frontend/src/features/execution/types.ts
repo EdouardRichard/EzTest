@@ -57,7 +57,18 @@ export type IntentStatus =
   | "cancelled"
   | "superseded"
 
-export type HumanRequestKind = "login_takeover" | "conflict" | "other"
+/**
+ * v0.22 human_request kinds (DB-16 / spec R-W2-1). Structured question kinds
+ * (`clarification_question`/`approval`/`blocked_recovery`) share the table with
+ * the P3 login takeover and are version todos, not execution blockers.
+ */
+export type HumanRequestKind =
+  | "clarification_question"
+  | "approval"
+  | "blocked_recovery"
+  | "login_takeover"
+  | "conflict"
+  | "other"
 
 /** v0.22 H1 human_request state machine (spec R-W2-1, DB-16). */
 export type HumanRequestStatus = "pending" | "answered" | "cancelled" | "expired"

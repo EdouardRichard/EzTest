@@ -1290,7 +1290,9 @@ try {
         if (-not $humanResolved) {
             $humanResponse = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=pending&limit=10" -Token $script:token
             if ($humanResponse.Status -eq 200) {
-                $openRequests = Get-Array $humanResponse.Json.data
+                # Only the login takeover gates execution: v0.22 clarification
+                # questions share this list and must not be resolved here.
+                $openRequests = @(Get-Array $humanResponse.Json.data | Where-Object { [string]$_.kind -eq "login_takeover" })
                 if ($openRequests.Count -gt 0) {
                     $human = $openRequests[0]
                     Write-Log ("      open human request id={0} kind={1} challenge={2} case_run={3}" -f $human.id, $human.kind, $human.payload.challenge_kind, $human.case_run_id)
@@ -1311,8 +1313,9 @@ try {
                     Assert-True ($null -eq $resolveResponse.Json.data.response.code) "resolve response must not echo the code"
                     $openAfterResolve = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=pending&limit=10" -Token $script:token
                     Assert-Status $openAfterResolve @(200) "GET pending human requests after resolve"
-                    Assert-Equal (Get-Array $openAfterResolve.Json.data).Count 0 "pending human requests after resolve"
-                    Note-Assertion "resolve 246810 -> status answered, code not echoed, pending list empty"
+                    $pendingTakeoversAfterResolve = @(Get-Array $openAfterResolve.Json.data | Where-Object { [string]$_.kind -eq "login_takeover" })
+                    Assert-Equal $pendingTakeoversAfterResolve.Count 0 "pending human requests after resolve"
+                    Note-Assertion "resolve 246810 -> status answered, code not echoed, pending login_takeover list empty"
                     $humanResolved = $true
                     Start-Sleep -Milliseconds 500
                 }

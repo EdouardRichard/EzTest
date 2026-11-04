@@ -746,6 +746,75 @@ func TestAnswerRevisionSurvivesReopenSkipCycle(t *testing.T) {
 	}
 }
 
+// TestLazyExpiryPreservesAnswerRevision is the regression for the lazy expiry
+// path overwriting the response with {}: Answer -> Reopen -> lazy expiry ->
+// Reopen -> Answer must still write revision 2. Otherwise the answer message
+// key question-answer:<id>:1 dedupes onto the stale message and the
+// conversation keeps the previous selection.
+func TestLazyExpiryPreservesAnswerRevision(t *testing.T) {
+	f := newQuestionFixture()
+	request := f.create(t, questionBatchOf(1))
+	if _, err := f.service.Answer(context.Background(), questionTestVersion, request.ID, questionTestActor,
+		[]execution.HumanQuestionAnswer{{QuestionID: "q1", Selected: []string{"a"}}}); err != nil {
+		t.Fatalf("first Answer: %v", err)
+	}
+	firstMessage, ok := f.messages.last()
+	if !ok || firstMessage.ClientMessageID != fmt.Sprintf("question-answer:%d:1", request.ID) {
+		t.Fatalf("first answer message = %+v, want revision 1 key", firstMessage)
+	}
+	if _, err := f.service.Reopen(context.Background(), questionTestVersion, request.ID,
+		QuestionOwner{AgentRunID: questionTestRun}); err != nil {
+		t.Fatalf("Reopen after answer: %v", err)
+	}
+
+	// Reopen extended the deadline; moving past it makes the next read lazily
+	// expire the question.
+	f.clock.now = f.clock.now.Add(25 * time.Hour)
+	expired, err := f.service.Get(context.Background(), questionTestVersion, request.ID)
+	if err != nil {
+		t.Fatalf("Get after deadline: %v", err)
+	}
+	if expired.Status != execution.HumanExpired {
+		t.Fatalf("status = %s, want expired", expired.Status)
+	}
+	persisted, err := f.humans.Get(context.Background(), request.ID)
+	if err != nil {
+		t.Fatalf("Get persisted: %v", err)
+	}
+	if got := answerRevision(persisted.Response); got != 1 {
+		t.Fatalf("persisted answer revision after lazy expiry = %d, want 1 preserved", got)
+	}
+
+	if _, err := f.service.Reopen(context.Background(), questionTestVersion, request.ID,
+		QuestionOwner{AgentRunID: questionTestRun}); err != nil {
+		t.Fatalf("Reopen after expiry: %v", err)
+	}
+	answered, err := f.service.Answer(context.Background(), questionTestVersion, request.ID, questionTestActor,
+		[]execution.HumanQuestionAnswer{{QuestionID: "q1", Selected: []string{"b"}}})
+	if err != nil {
+		t.Fatalf("second Answer: %v", err)
+	}
+	if got := answerRevision(answered.Response); got != 2 {
+		t.Fatalf("answer revision = %d, want 2 after lazy expiry", got)
+	}
+	if got := f.messages.countKind(QuestionMessageKindAnswer); got != 2 {
+		t.Fatalf("answer messages = %d, want 2 (the reopened answer must not dedupe)", got)
+	}
+	last, ok := f.messages.last()
+	if !ok || last.ClientMessageID != fmt.Sprintf("question-answer:%d:2", request.ID) {
+		t.Fatalf("second answer message = %+v, want revision 2 key", last)
+	}
+	answers, ok := last.Payload["answers"].([]any)
+	if !ok || len(answers) != 1 {
+		t.Fatalf("message answers = %#v", last.Payload["answers"])
+	}
+	item, _ := answers[0].(map[string]any)
+	selected, _ := item["selected"].([]any)
+	if len(selected) != 1 || selected[0] != "b" {
+		t.Fatalf("conversation answer payload = %#v, want the reopened selection b", last.Payload["answers"])
+	}
+}
+
 // TestQuestionInvalidAnswersRejected is the validation contract for the
 // answer endpoint: bad selections/text/ids and an empty answer list are 400s
 // and never write an answer message or change the pending row.

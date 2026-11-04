@@ -37,6 +37,7 @@ import { ExecutionTab } from "./ExecutionTab"
 import {
   caseRunDetailFixture,
   caseRunsFixture,
+  clarificationQuestionFixture,
   doneWaveFixture,
   emptyOverviewFixture,
   executionOverviewFixture,
@@ -248,6 +249,57 @@ describe("ExecutionTab", () => {
 
     expect(await screen.findByText(/支付网关需要 2FA 验证码/)).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "完成" })).toBeInTheDocument()
+  })
+
+  it("keeps clarification questions out of the login-takeover banner and resume gate", async () => {
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: pausedWaveFixture,
+    })
+    api.listWaves.mockResolvedValue([pausedWaveFixture, doneWaveFixture])
+    // Mixed pending rows: GET /human-requests returns every kind. The takeover
+    // deadline is far in the future so the 完成 action stays enabled.
+    api.listHumanRequests.mockResolvedValue([
+      clarificationQuestionFixture,
+      { ...humanRequestFixture, expires_at: "2099-01-01T00:00:00Z" },
+    ])
+
+    render(<ExecutionTab versionId="2001" />)
+
+    // Only the takeover is actionable here; the clarification question is a
+    // version todo and never renders as a takeover (R-B3-4).
+    expect(await screen.findByText(/支付网关需要 2FA 验证码/)).toBeInTheDocument()
+    expect(screen.queryByText(/请确认退款口径/)).not.toBeInTheDocument()
+
+    // A pending clarification question must not block the wave resume ...
+    fireEvent.click(screen.getAllByRole("button", { name: "恢复" })[0])
+    expect(api.resumeWave).not.toHaveBeenCalled()
+    // ... the pending takeover still does.
+    expect(await screen.findByText("请先处理待处理的人工请求，再恢复波次。")).toBeInTheDocument()
+
+    // 完成 resolves the takeover only; the question id never reaches the
+    // kind-blind P3 resolve route.
+    fireEvent.click(screen.getByRole("button", { name: "完成" }))
+    await waitFor(() => expect(api.resolveHumanRequest).toHaveBeenCalledTimes(1))
+    expect(api.resolveHumanRequest).toHaveBeenCalledWith("9501", {})
+  })
+
+  it("lets a wave resume when only a clarification question is pending", async () => {
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: pausedWaveFixture,
+    })
+    api.listWaves.mockResolvedValue([pausedWaveFixture, doneWaveFixture])
+    api.listHumanRequests.mockResolvedValue([clarificationQuestionFixture])
+
+    render(<ExecutionTab versionId="2001" />)
+
+    expect(await screen.findByText("执行已暂停")).toBeInTheDocument()
+    expect(screen.queryByTestId("human-request-banner")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getAllByRole("button", { name: "恢复" })[0])
+    await waitFor(() => expect(api.resumeWave).toHaveBeenCalledWith("2001", "9202"))
+    expect(screen.queryByText("请先处理待处理的人工请求，再恢复波次。")).not.toBeInTheDocument()
   })
 
   it("warns when the executor is offline", async () => {

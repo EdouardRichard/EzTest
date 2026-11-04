@@ -15,7 +15,7 @@ import { HUMAN_REQUEST_KIND_LABEL } from "./labels"
 import type { HumanRequest, HumanRequestResponseInput } from "./types"
 
 export type HumanRequestBannerProps = {
-  /** Open human requests for the version; only the oldest is actionable here. */
+  /** Pending login-takeover requests; only the oldest is actionable here. */
   requests: HumanRequest[]
   onResolve: (id: string, response: HumanRequestResponseInput) => Promise<void>
   onCancel: (id: string) => Promise<void>
@@ -28,6 +28,11 @@ export type HumanRequestBannerProps = {
  * pauses the wave and the user resolves the request here. The banner is
  * controlled by the parent list, so a successful resolve removes it as soon as
  * the execution snapshot refreshes.
+ *
+ * Only `login_takeover` rows are rendered: v0.22 structured questions share the
+ * human_request table but are version todos, and the code/2FA form (and the P3
+ * resolve route) must never be applied to them. `blocked_recovery` is a W2
+ * stage-level kind with no execution producer yet.
  */
 export function HumanRequestBanner({
   requests,
@@ -35,7 +40,9 @@ export function HumanRequestBanner({
   onCancel,
   now,
 }: HumanRequestBannerProps) {
-  const open = requests.filter((request) => request.status === "pending")
+  const open = requests.filter(
+    (request) => request.status === "pending" && request.kind === "login_takeover",
+  )
   const current = open[0]
   const [clock, setClock] = useState(() => now ?? Date.now())
   const [code, setCode] = useState("")

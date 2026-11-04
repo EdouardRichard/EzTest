@@ -340,6 +340,27 @@ export const answeredHumanRequestFixture: HumanRequest = {
   response: { note: "已输入验证码" },
 }
 
+/**
+ * A pending structured clarification question (v0.22 R-B3-1): it shares the
+ * human_request table but is a version todo, never an execution blocker.
+ */
+export const clarificationQuestionFixture: HumanRequest = {
+  id: "9503",
+  version_id: "2001",
+  case_run_id: null,
+  kind: "clarification_question",
+  status: "pending",
+  payload: {
+    reason: "请确认退款口径：T+1 还是 T+3？",
+    version_sut_id: null,
+    account_role: "",
+    page_url: "",
+    challenge_kind: "",
+  },
+  expires_at: "2026-10-31T12:30:00Z",
+  created_at: TIMESTAMP,
+}
+
 export const intentFixture: Intent = {
   id: "9101",
   version_id: "2001",

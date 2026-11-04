@@ -1093,7 +1093,11 @@ func (s *QuestionService) scoped(ctx context.Context, versionID, questionID int6
 }
 
 // expireIfOverdue lazily expires one pending question whose deadline passed and
-// emits question.expired exactly once (the guarded transition decides).
+// emits question.expired exactly once (the guarded transition decides). Like the
+// global sweep it preserves the stored response instead of overwriting it with
+// {}: answer_revision is the monotonic message-key history, so wiping it here
+// would make a later reopen reuse revision 1 and dedupe the next answer onto the
+// stale conversation message.
 func (s *QuestionService) expireIfOverdue(ctx context.Context, request execution.HumanRequest) (execution.HumanRequest, error) {
 	if request.Status != execution.HumanPending || request.ExpiresAt.IsZero() {
 		return request, nil
@@ -1102,7 +1106,7 @@ func (s *QuestionService) expireIfOverdue(ctx context.Context, request execution
 	if now.Before(request.ExpiresAt) {
 		return request, nil
 	}
-	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanExpired, nil, 0, now, nil)
+	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanExpired, request.Response, 0, now, nil)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "question")
 	}
