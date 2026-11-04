@@ -58,7 +58,9 @@ jobs:
       - name: Build release packages
         shell: pwsh
         run: |
-          ./scripts/build-release.ps1 -Version "${{ inputs.version }}" -SkipSmoke:${{ inputs.skip_smoke }}
+          $params = @{ Version = "${{ inputs.version }}" }
+          if ("${{ inputs.skip_smoke }}" -eq "true") { $params.SkipSmoke = $true }
+          ./scripts/build-release.ps1 @params
 
       - name: Show artifacts
         shell: pwsh
