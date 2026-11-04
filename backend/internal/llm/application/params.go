@@ -45,11 +45,20 @@ func EffectiveMaxOutput(model llm.Model) int64 {
 	return output
 }
 
-// MaxInput is the derived read-only input budget: effective context window
-// minus effective output limit (A §4.1). It is clamped at 0 so an inconsistent
-// upstream row (output larger than window) cannot render a negative budget.
+// MaxInput is the derived read-only input budget displayed by the admin and
+// public model views: effective context window minus the model's *raw*
+// max_output (0 falls back to 4096). The 16000 request-side cap of
+// EffectiveMaxOutput is deliberately not applied here — max_input must describe
+// the model's real window/output pair, so a stored 1M/393216 renders 606784 and
+// an equal window/output renders 0. It is clamped at 0 so an inconsistent
+// upstream row (output larger than window) cannot render a negative budget
+// (Lead ruling on A §4.1, fix round 1).
 func MaxInput(model llm.Model) int64 {
-	input := EffectiveContextWindow(model) - EffectiveMaxOutput(model)
+	output := int64(model.MaxOutput)
+	if output <= 0 {
+		output = DefaultChatMaxOutputTokens
+	}
+	input := EffectiveContextWindow(model) - output
 	if input < 0 {
 		return 0
 	}

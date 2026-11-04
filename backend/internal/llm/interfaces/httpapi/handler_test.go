@@ -652,6 +652,13 @@ func TestModelViewIncludesMaxInput(t *testing.T) {
 	model.MaxOutput = 8192
 	model.WindowSource = llm.SourceManual
 	model.OutputSource = llm.SourceCatalog
+	// The catalog snapshot is persistence metadata; setting it here proves the
+	// API layer strips it instead of leaking raw upstream values.
+	model.Capabilities = llm.Capabilities{
+		ContextWindow:        128000,
+		CatalogContextWindow: 1000000,
+		CatalogMaxOutput:     393216,
+	}
 	stub.models = []llm.Model{model}
 
 	assertView := func(t *testing.T, item map[string]any, context string) {
@@ -663,12 +670,21 @@ func TestModelViewIncludesMaxInput(t *testing.T) {
 			t.Fatalf("%s max_input = %#v, want 119808", context, item["max_input"])
 		}
 	}
+	assertNoSnapshotKeys := func(t *testing.T, recorder *httptest.ResponseRecorder, context string) {
+		t.Helper()
+		for _, key := range []string{"catalog_context_window", "catalog_max_output"} {
+			if strings.Contains(recorder.Body.String(), key) {
+				t.Fatalf("%s response leaked internal snapshot key %q: %s", context, key, recorder.Body.String())
+			}
+		}
+	}
 
 	admin := call(t, handler, http.MethodGet, "/api/admin/llm/models", "", adminActor())
 	if admin.Code != http.StatusOK {
 		t.Fatalf("admin status = %d, body = %s", admin.Code, admin.Body.String())
 	}
 	t.Logf("admin list response: %s", admin.Body.String())
+	assertNoSnapshotKeys(t, admin, "admin list")
 	adminItems := dataList(t, admin)
 	if len(adminItems) != 1 {
 		t.Fatalf("admin items = %#v", adminItems)
@@ -680,6 +696,7 @@ func TestModelViewIncludesMaxInput(t *testing.T) {
 		t.Fatalf("public status = %d, body = %s", public.Code, public.Body.String())
 	}
 	t.Logf("public list response: %s", public.Body.String())
+	assertNoSnapshotKeys(t, public, "public list")
 	publicItems := dataList(t, public)
 	if len(publicItems) != 1 {
 		t.Fatalf("public items = %#v", publicItems)
@@ -699,6 +716,7 @@ func TestModelViewIncludesMaxInput(t *testing.T) {
 		t.Fatalf("patch context_window = %#v", stub.lastPatch.ContextWindow)
 	}
 	t.Logf("patch response: %s", patch.Body.String())
+	assertNoSnapshotKeys(t, patch, "patch response")
 	assertView(t, dataBody(t, patch), "patch response")
 }
 
@@ -707,7 +725,15 @@ func TestModelViewIncludesMaxInput(t *testing.T) {
 // values, and missing models/actors/invalid IDs map to the typed errors.
 func TestResetModelParamsEndpoint(t *testing.T) {
 	handler, stub := newTestServer(t)
-	stub.model = sampleModel()
+	resetModel := sampleModel()
+	// The reset response is built from the restored snapshot; the internal
+	// catalog_* keys must still be stripped from its capabilities object.
+	resetModel.Capabilities = llm.Capabilities{
+		ContextWindow:        128000,
+		CatalogContextWindow: 128000,
+		CatalogMaxOutput:     16384,
+	}
+	stub.model = resetModel
 
 	recorder := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/201/reset-params", "", adminActor())
 	if recorder.Code != http.StatusOK {
@@ -720,12 +746,18 @@ func TestResetModelParamsEndpoint(t *testing.T) {
 		t.Fatalf("ids = %d/%d, want 101/201", stub.lastID, stub.lastModel)
 	}
 	t.Logf("reset response: %s", recorder.Body.String())
+	for _, key := range []string{"catalog_context_window", "catalog_max_output"} {
+		if strings.Contains(recorder.Body.String(), key) {
+			t.Fatalf("reset response leaked internal snapshot key %q: %s", key, recorder.Body.String())
+		}
+	}
 	data := dataBody(t, recorder)
 	if data["model"] != "gpt-4o" || data["window_source"] != llm.SourceCatalog {
 		t.Fatalf("reset data = %#v", data)
 	}
-	if data["max_input"] != float64(112000) {
-		t.Fatalf("reset max_input = %#v, want 112000 (128000-16000 capped output)", data["max_input"])
+	// Display max_input uses the raw output from the sample row (128000-16384).
+	if data["max_input"] != float64(111616) {
+		t.Fatalf("reset max_input = %#v, want 111616 (128000-16384 raw output)", data["max_input"])
 	}
 
 	invalid := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/not-an-id/reset-params", "", adminActor())
@@ -770,6 +802,10 @@ func TestLLMConfigSettingsAPI(t *testing.T) {
 			SupportsReasoning:   true,
 			SupportsPromptCache: true,
 			ContextWindow:       64000,
+			// Persistence-only snapshot: must never reach the admin config
+			// models array.
+			CatalogContextWindow: 1000000,
+			CatalogMaxOutput:     393216,
 		}
 		deprecated := sampleModel()
 		deprecated.ID = 202
@@ -815,6 +851,11 @@ func TestLLMConfigSettingsAPI(t *testing.T) {
 		}
 		if first["deprecated"] != false {
 			t.Fatalf("active model deprecated = %#v", first["deprecated"])
+		}
+		for _, key := range []string{"catalog_context_window", "catalog_max_output"} {
+			if strings.Contains(recorder.Body.String(), key) {
+				t.Fatalf("config models response leaked internal snapshot key %q: %s", key, recorder.Body.String())
+			}
 		}
 		second, _ := models[1].(map[string]any)
 		if second["deprecated"] != true {

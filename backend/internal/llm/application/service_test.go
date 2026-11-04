@@ -1023,6 +1023,47 @@ func TestPatchModelSetsManualSource(t *testing.T) {
 	}
 }
 
+// TestPatchOneSideKeepsOtherCatalogSource pins the one-sided patch success
+// path: changing only max_output marks that field manual and must leave the
+// catalog-sourced context_window (and its provenance) untouched.
+func TestPatchOneSideKeepsOtherCatalogSource(t *testing.T) {
+	svc, repo, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	repo.models[2] = llm.Model{
+		ID: 2, ConfigID: 1, Model: "gpt-4o", DisplayName: "gpt-4o",
+		ContextWindow: 128000, MaxOutput: 8192,
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceCatalog, OutputSource: llm.SourceCatalog,
+		Capabilities: llm.Capabilities{
+			ContextWindow:        128000,
+			CatalogContextWindow: 128000,
+			CatalogMaxOutput:     16384,
+		},
+	}
+
+	got, err := svc.UpdateModelParams(ctx, 1, 2, UpdateModelParams{MaxOutput: int64Ptr(4096)})
+	if err != nil {
+		t.Fatalf("UpdateModelParams: %v", err)
+	}
+	if got.WindowSource != llm.SourceCatalog || got.OutputSource != llm.SourceManual {
+		t.Fatalf("sources = %q/%q, want catalog/manual", got.WindowSource, got.OutputSource)
+	}
+	if got.ContextWindow != 128000 || got.MaxOutput != 4096 {
+		t.Fatalf("params = %d/%d, want 128000/4096", got.ContextWindow, got.MaxOutput)
+	}
+	if got.MaxInput != 123904 {
+		t.Fatalf("max_input = %d, want 123904 (128000-4096)", got.MaxInput)
+	}
+
+	stored := repo.models[2]
+	if stored.ContextWindow != 128000 || stored.MaxOutput != 4096 {
+		t.Fatalf("stored params = %d/%d, want 128000/4096", stored.ContextWindow, stored.MaxOutput)
+	}
+	if stored.WindowSource != llm.SourceCatalog || stored.OutputSource != llm.SourceManual {
+		t.Fatalf("stored sources = %q/%q, want catalog/manual", stored.WindowSource, stored.OutputSource)
+	}
+}
+
 // TestRefreshPreservesManual pins R-A1-3: an upstream refresh only fills fields
 // whose source is catalog (or whose stored value is 0) and never overwrites an
 // administrator's value. The upstream snapshot is still refreshed so
@@ -1091,6 +1132,10 @@ func TestRefreshPreservesManual(t *testing.T) {
 	if catalog.Capabilities.ContextWindow != 200000 {
 		t.Fatalf("catalog capabilities.context_window = %d", catalog.Capabilities.ContextWindow)
 	}
+	// Display max_input uses the raw upstream output: 200000 - 32000.
+	if catalog.MaxInput != 168000 {
+		t.Fatalf("catalog max_input = %d, want 168000 (200000-32000)", catalog.MaxInput)
+	}
 }
 
 // TestResetParams pins R-A1-4: reset restores the last upstream window/output
@@ -1128,8 +1173,8 @@ func TestResetParams(t *testing.T) {
 	if got.WindowSource != llm.SourceCatalog || got.OutputSource != llm.SourceCatalog {
 		t.Fatalf("reset sources = %q/%q, want catalog/catalog", got.WindowSource, got.OutputSource)
 	}
-	if got.MaxInput != 984000 {
-		t.Fatalf("max_input = %d, want 984000", got.MaxInput)
+	if got.MaxInput != 606784 {
+		t.Fatalf("max_input = %d, want 606784 (1000000-393216 raw output)", got.MaxInput)
 	}
 	stored := repo.models[2]
 	t.Logf("stored after reset: %+v", stored)
@@ -1200,13 +1245,13 @@ func TestPatchRejectsMaxOutputAboveWindow(t *testing.T) {
 		t.Fatalf("rejected patch was persisted: %+v", repo.models[2])
 	}
 
-	// Equal raw window/output is allowed; max_input uses the request-side
-	// output cap (O = min(128000, 16000)), so it is not the raw 0.
+	// Equal raw window/output is allowed; the derived max_input is the raw
+	// difference, so it is 0 rather than an artefact of the request-side cap.
 	equal, err := svc.UpdateModelParams(ctx, 1, 2, UpdateModelParams{MaxOutput: int64Ptr(128000)})
 	if err != nil {
 		t.Fatalf("equal window/output rejected: %v", err)
 	}
-	if equal.MaxInput != 112000 {
-		t.Fatalf("max_input = %d, want 112000", equal.MaxInput)
+	if equal.MaxInput != 0 {
+		t.Fatalf("max_input = %d, want 0 (128000-128000 raw output)", equal.MaxInput)
 	}
 }

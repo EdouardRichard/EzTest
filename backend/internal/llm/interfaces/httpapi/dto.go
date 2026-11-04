@@ -194,11 +194,24 @@ type publicModelDTO struct {
 	Deprecated    bool             `json:"deprecated"`
 }
 
+// apiCapabilities returns the capability set exposed over HTTP. The catalog_*
+// snapshot fields are internal persistence metadata: they share the same JSONB
+// object so refresh/reset can restore the last upstream values, and they must
+// not be tagged json:"-" on the domain type because that struct is also the
+// persistence wire format. Copying them out and zeroing them here keeps them
+// out of every model response while omitempty drops them from the JSON.
+func apiCapabilities(model llm.Model) llm.Capabilities {
+	capabilities := model.EffectiveCapabilities()
+	capabilities.CatalogContextWindow = 0
+	capabilities.CatalogMaxOutput = 0
+	return capabilities
+}
+
 // toPublicModelDTO maps one selectable model of an active configuration. Default
 // is true only for the configuration's explicit default_model_id; the picker
 // must never fall back to models[0] (D24).
 func toPublicModelDTO(model llm.Model, cfg llm.Config) publicModelDTO {
-	capabilities := model.EffectiveCapabilities()
+	capabilities := apiCapabilities(model)
 	return publicModelDTO{
 		ID:            strconv.FormatInt(model.ID, 10),
 		ConfigID:      strconv.FormatInt(model.ConfigID, 10),
@@ -227,7 +240,7 @@ func toModelDTO(model llm.Model) modelDTO {
 		MaxInput:       llmapp.MaxInput(model),
 		SupportsTools:  model.SupportsTools,
 		SupportsVision: model.SupportsVision,
-		Capabilities:   model.EffectiveCapabilities(),
+		Capabilities:   apiCapabilities(model),
 		Deprecated:     model.Deprecated,
 		Source:         model.Source,
 		WindowSource:   model.EffectiveWindowSource(),
