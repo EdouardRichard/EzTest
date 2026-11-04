@@ -14,7 +14,13 @@ type RequirementRef struct {
 	CurrentVersionID int64
 	Revision         int
 	Title            string
-	Status           string
+	// Description and AcceptanceCriteria are the current requirement version
+	// text. Task 120: design generation uses the requirement/AC text to decide
+	// whether a visual baseline comparison was explicitly requested, so an
+	// ordinary functional AC never auto-generates a kind=visual assertion.
+	Description        string
+	AcceptanceCriteria string
+	Status             string
 	// Priority is the current requirement version priority (P0-P3). Task 79:
 	// the design planner derives the work-item claim priority from it so the
 	// 67-requirement authoring wave cannot starve P0 behind P1/P2 FIFO order.

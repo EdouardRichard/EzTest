@@ -314,6 +314,12 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 		return ProposeResult{}, platform.StateConflict("the requirement version is stale; re-read the graph and retry")
 	}
 
+	// Task 120: ordinary functional ACs must generate non-visual assertions.
+	// Apply the default before validation and persistence so both the stored
+	// case version and its content hash reflect the assertion that will run;
+	// an explicit visual-baseline requirement keeps kind=visual untouched.
+	normalizeProposalAssertionKinds(&in, requirement)
+
 	graph, err := s.repo.ReadGraph(ctx, versionID)
 	if err != nil {
 		return ProposeResult{}, mapDesignError(err, "version")

@@ -665,6 +665,9 @@ func TestRunnerDesignHostUsesDesignProfileAndTeamRoom(t *testing.T) {
 	if !strings.Contains(prompt, "设计会话") || strings.Contains(prompt, "澄清会话的开场") {
 		t.Fatalf("design opening prompt = %q", prompt)
 	}
+	if !strings.Contains(prompt, "视觉基线") || !strings.Contains(prompt, "不要用 visual") {
+		t.Fatalf("design opening prompt must carry the non-visual assertion default: %q", prompt)
+	}
 	for _, definition := range fixture.chat.request(0).Tools {
 		if definition.Name == "case.confirm" {
 			t.Fatal("case.confirm must never be exposed to the model")
@@ -894,7 +897,7 @@ func TestDesignRoundProducesCases(t *testing.T) {
 		t.Fatal("the design conversation does not record the case-proposal tool call")
 	}
 	prompt := requestPrompt(fixture.chat.request(0))
-	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id"} {
+	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id", "视觉基线", "不要用 visual"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("case author prompt missing %q: %s", want, prompt)
 		}
@@ -950,7 +953,7 @@ func TestDesignRoundProposesCases(t *testing.T) {
 	prompt := requestPrompt(fixture.chat.request(0))
 	for _, want := range []string{
 		"case.graph_propose", "不要询问用户", "requirement_ids=501,502",
-		"requirement_version_ids=700,800",
+		"requirement_version_ids=700,800", "视觉基线", "不要用 visual",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("design.round prompt missing %q: %s", want, prompt)
@@ -981,7 +984,7 @@ func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {
 		t.Fatalf("post = %#v", post)
 	}
 	prompt := requestPrompt(fixture.chat.request(0))
-	for _, want := range []string{"design.round", "round_id=9001"} {
+	for _, want := range []string{"design.round", "round_id=9001", "视觉基线"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("planner prompt missing %q: %s", want, prompt)
 		}

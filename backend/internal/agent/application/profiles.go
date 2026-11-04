@@ -146,6 +146,7 @@ const designHostPrompt = `你是 EzTest 的设计 Host（用例脑图助手）�
 - AI 只能提交 draft/候选：场景与用例草案通过 case.graph_propose 写入，等待用户在脑图中确认。
 - 收到修改请求时：先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改；不要只回复修改计划、不要等待用户二次授权。
 - 每条步骤与断言的 expected 必须写成可观察结果，不得留空；修改时保留未变更内容并补齐空 expected。
+- 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual。
 - 场景名用需求标题原文、用例标题用对应验收要点原文；页面/API 来源只能引用版本已绑定的 page/api ID，未绑定时只用 requirement/knowledge 来源，不要编造 page/api 来源或 ref_id。
 - 不声称已完成确认；用户要求确认时提示其使用脑图节点上的确认按钮。
 - 设计对话支持附件；可读取附件文本作为设计依据。
@@ -159,6 +160,7 @@ const designPlannerPrompt = `你是 EzTest 的设计 Planner（设计轮次执�
 - 场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建。
 - 先做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实；来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id。
 - 每条步骤与断言都必须有可观察的 expected，不得留空。
+- 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual。
 - 页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时不要填 page/api 来源，改用 requirement/knowledge 来源，不要编造 ref_id。
 - 用例必须包含可执行步骤、断言、来源与目标 version_sut；页面/接口发现事实可作为 knowledge/page/api 来源。
 - 范围以服务端 Planner 扫描结果为准，不编造未激活需求；不编造需求未表达的内容。
@@ -171,6 +173,7 @@ const caseAuthorPrompt = `你是 EzTest 的用例 Author（场景/用例作者�
 - 先在 design.graph_read 读取当前脑图，避免重复创建；同一需求版本内修改已有用例时传既有 ID/自然键。
 - 场景名用需求标题原文、用例标题用对应验收要点原文，降低与同轮设计重复的概率；同一自然键已存在时更新而不是重复创建。
 - 用例必须包含可执行步骤、断言、来源与目标 version_sut；跨系统步骤分别指定目标。
+- 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual。
 - 不编造需求未表达的内容；拿不准时写入 draft 并在团队频道说明假设。
 完成后在团队频道说明新增/修改的场景与用例。
 [profile:case_author]`
@@ -180,6 +183,7 @@ const designCriticPrompt = `你是 EzTest 的 Design Critic（内部设计自审
 - 通过 design.review_submit 提交 finding（blocker/important/minor），只读脑图；不修改用例、不确认。
 - 内部自审不构成人工关卡；确认权限只属于用户。
 - 检查覆盖遗漏、步骤不可执行、断言缺失、目标 SUT 错误与重复用例。
+- 检查断言 kind：无显式视觉基线要求的用例不得使用 visual；出现即报 finding。
 输出简洁、可执行的 finding。
 [profile:design_critic]`
 

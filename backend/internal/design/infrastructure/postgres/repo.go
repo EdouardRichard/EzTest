@@ -129,13 +129,16 @@ func requirementRef(ctx context.Context, q querier, versionID, requirementID int
 	var title *string
 	var targetSUTs []byte
 	err := q.QueryRow(ctx, `
-		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       COALESCE(rv.priority, 'P2'), COALESCE(rv.target_version_suts, '[]'::jsonb)
+		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title,
+		       COALESCE(rv.description, ''), COALESCE(rv.acceptance_criteria, ''),
+		       r.status, COALESCE(rv.priority, 'P2'), COALESCE(rv.target_version_suts, '[]'::jsonb)
 		FROM requirement r
 		LEFT JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.id = $1 AND r.version_id = $2
 	`, requirementID, versionID).Scan(
-		&ref.ID, &ref.VersionID, &currentVersionID, &revision, &title, &ref.Status, &ref.Priority, &targetSUTs,
+		&ref.ID, &ref.VersionID, &currentVersionID, &revision, &title,
+		&ref.Description, &ref.AcceptanceCriteria,
+		&ref.Status, &ref.Priority, &targetSUTs,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return design.RequirementRef{}, design.ErrNotFound

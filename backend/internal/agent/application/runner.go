@@ -1927,6 +1927,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 					"AI 只能提交 draft/候选，不能确认、删除或关闭用例", "确认只属于用户", "不编造需求未表达的内容",
 					"收到修改请求时先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改；不要只回复修改计划、不要等待用户二次授权",
 					"每条步骤与断言的 expected 必须是非空的可观察结果；修改时补齐空 expected",
+					"断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual",
 					"页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时只用 requirement/knowledge 来源，不要编造 ref_id",
 				},
 				AcceptanceCriteria: []string{"引用用户最新消息", "修改脑图前先 design.graph_read", "同一轮内用 case.graph_propose 提交草案或修改并说明变化"},
@@ -1977,6 +1978,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 				"页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时只用 requirement/knowledge 来源，不要编造 ref_id",
 				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建",
 				"用例必须包含可执行步骤、断言、来源与目标 version_sut；每条步骤与断言的 expected 必须是非空的可观察结果；不编造需求未表达的内容",
+				"断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual",
 			},
 			AcceptanceCriteria: []string{
 				"对本轮每条已确认需求至少提交一次 case.graph_propose，并返回 case_ids/case_version_ids",
@@ -1996,6 +1998,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			Constraints: []string{
 				"只提交 draft/候选，不能确认、删除或关闭用例",
 				"用例必须包含步骤、断言、来源与目标 version_sut；每条步骤与断言的 expected 必须是非空的可观察结果",
+				"断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual",
 				"同一需求版本内更新已有用例时传既有 ID/自然键",
 				"只做一次 design.graph_read 获取 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
 				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id；页面/API 来源只能引用版本已绑定的 page/api ID，未绑定时不要编造",
@@ -2012,7 +2015,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 		return TaskContext{
 			Type:               state.item.Type,
 			Goal:               "内部自审当前需求的场景/用例草案，提交覆盖遗漏、不可执行步骤与断言缺失等 finding。",
-			Constraints:        []string{"只读脑图并使用 design.review_submit", "不修改用例、不确认", "内部自审不构成人工关卡"},
+			Constraints:        []string{"只读脑图并使用 design.review_submit", "不修改用例、不确认", "内部自审不构成人工关卡", "无显式视觉基线要求的用例不得使用 visual"},
 			AcceptanceCriteria: []string{"至少 1 条可执行 finding", "finding 带 severity 与 message"},
 			Scope:              scope,
 		}
