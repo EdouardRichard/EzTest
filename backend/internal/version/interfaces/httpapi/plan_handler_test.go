@@ -110,6 +110,24 @@ func TestPlanPatchHandlerUpdates(t *testing.T) {
 	}
 }
 
+// TestPlanPatchHandlerRequiresActor pins the package-standard actor guard: like
+// every sibling mutating handler, the plan write rejects an unauthenticated
+// request as 401 before parsing the path/body and before calling the service.
+func TestPlanPatchHandlerRequiresActor(t *testing.T) {
+	svc := &fakePlanUpdateService{item: storedPlanItem()}
+	recorder := call(t, newPlanUpdateTestServer(t, svc), http.MethodPatch,
+		"/api/versions/7/plan-items/9", `{"status":"done","revision":1}`, nil)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorBody(t, recorder)["code"]; code != "unauthenticated" {
+		t.Fatalf("code = %#v, want unauthenticated (body %s)", code, recorder.Body.String())
+	}
+	if svc.calls != 0 {
+		t.Fatalf("unauthenticated request reached the service: %+v", svc)
+	}
+}
+
 // TestPlanPatchHandlerOmittedFieldsKeepStoredValues pins the partial-write
 // semantics: absent optional fields reach the service as zero values (keep the
 // stored value) and an absent order stays a nil pointer.
@@ -149,6 +167,27 @@ func TestPlanPatchHandlerRevisionConflict(t *testing.T) {
 	if details["item_id"] != "9" || details["expected_revision"] != float64(2) ||
 		details["actual_revision"] != float64(5) {
 		t.Fatalf("details = %#v", details)
+	}
+}
+
+// TestPlanPatchHandlerConflictReportsUnknownActualRevision pins that the 409
+// details always carry actual_revision: when the store only reports the generic
+// conflict (Actual == 0 means unknown) the field is 0, never omitted.
+func TestPlanPatchHandlerConflictReportsUnknownActualRevision(t *testing.T) {
+	svc := &fakePlanUpdateService{err: &versionapp.ConflictError{
+		VersionID: 7, ItemID: 9, Expected: 2,
+	}}
+	recorder := planUpdateCall(t, svc, "/api/versions/7/plan-items/9", `{"status":"done","revision":2}`)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", recorder.Code, recorder.Body.String())
+	}
+	details, _ := errorBody(t, recorder)["details"].(map[string]any)
+	actual, present := details["actual_revision"]
+	if !present {
+		t.Fatalf("details = %#v, want actual_revision present", details)
+	}
+	if actual != float64(0) {
+		t.Fatalf("actual_revision = %#v, want 0 when the store did not report it", actual)
 	}
 }
 

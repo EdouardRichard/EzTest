@@ -30,8 +30,8 @@ type PlanService interface {
 var _ PlanService = (*versionapp.PlanService)(nil)
 
 // PlanHandler serves the plan-item write route. The server mounts it behind the
-// shared bearer-authentication middleware; the handler never parses credentials
-// itself.
+// shared bearer-authentication middleware; the handler enforces the authenticated
+// actor like the sibling mutating handlers and never parses credentials itself.
 type PlanHandler struct {
 	svc PlanService
 }
@@ -47,6 +47,9 @@ func NewPlanHandler(svc PlanService) *PlanHandler {
 // item including the new revision; a stale revision is a typed 409 conflict
 // carrying the expected and stored revisions.
 func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireActor(w, r); !ok {
+		return
+	}
 	versionID, err := validation.NonEmptyID("id", r.PathValue("id"))
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -95,14 +98,14 @@ func mapPlanWriteHTTPError(err error) error {
 		return err
 	}
 	apiErr := platform.Conflict(conflict.Error())
-	details := map[string]any{
+	apiErr.Details = map[string]any{
 		"item_id":           formatDecimal(conflict.ItemID),
 		"expected_revision": conflict.Expected,
+		// Actual == 0 means the store could not report the stored revision.
+		// The key is always present so clients can rely on the shape; 0 is
+		// not a valid revision (revisions start at 1).
+		"actual_revision": conflict.Actual,
 	}
-	if conflict.Actual > 0 {
-		details["actual_revision"] = conflict.Actual
-	}
-	apiErr.Details = details
 	return apiErr
 }
 
