@@ -218,6 +218,169 @@ func (r *AttachmentRepository) MarkDone(ctx context.Context, attachmentID int64,
 	return r.ensureAttachmentExists(ctx, attachmentID, "mark attachment done")
 }
 
+// SetExtractedContentRef stores the extracted-text reference without changing
+// the extraction status. It lets image analysis fail the attachment while the
+// text reference survives for a later successful reanalyze.
+func (r *AttachmentRepository) SetExtractedContentRef(ctx context.Context, attachmentID, contentRefID int64, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE requirement_attachment
+		SET extracted_content_ref_id = $2, updated_at = $3
+		WHERE id = $1
+	`, attachmentID, contentRefID, updatedAt)
+	if err != nil {
+		return fmt.Errorf("set attachment extracted content ref: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	return r.ensureAttachmentExists(ctx, attachmentID, "set attachment extracted content ref")
+}
+
+// CreateImage inserts one attachment_image row. The unique (attachment_id, seq)
+// makes a retried extraction idempotent: an existing row is left untouched, so
+// no duplicate rows or content references are created.
+func (r *AttachmentRepository) CreateImage(ctx context.Context, image version.AttachmentImageRecord) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO attachment_image (
+			id, attachment_id, seq, content_ref_id, mime, width, height, source_kind,
+			status, caption, error, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (attachment_id, seq) DO NOTHING
+	`, image.ID, image.AttachmentID, image.Seq, image.ContentRefID, image.MIME,
+		nullablePositiveInt(image.Width), nullablePositiveInt(image.Height), image.SourceKind,
+		image.Status, image.Caption, image.Error, image.CreatedAt, image.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("insert attachment image: %w", err)
+	}
+	return nil
+}
+
+// ListImages returns the image rows of one attachment ordered by seq.
+func (r *AttachmentRepository) ListImages(ctx context.Context, attachmentID int64) ([]version.AttachmentImageRecord, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+attachmentImageColumns+` FROM attachment_image
+		WHERE attachment_id = $1
+		ORDER BY seq
+	`, attachmentID)
+	if err != nil {
+		return nil, fmt.Errorf("list attachment images: %w", err)
+	}
+	defer rows.Close()
+	images := make([]version.AttachmentImageRecord, 0)
+	for rows.Next() {
+		image, err := scanAttachmentImage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan attachment image: %w", err)
+		}
+		images = append(images, image)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list attachment images: %w", err)
+	}
+	return images, nil
+}
+
+// MarkImageAnalyzing flips an extracted/skipped/failed row to analyzing and
+// reports whether this call changed it. A done/analyzing row is untouched.
+func (r *AttachmentRepository) MarkImageAnalyzing(ctx context.Context, imageID int64, updatedAt time.Time) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE attachment_image SET status = 'analyzing', updated_at = $2
+		WHERE id = $1 AND status IN ('extracted', 'skipped', 'failed')
+	`, imageID, updatedAt)
+	if err != nil {
+		return false, fmt.Errorf("mark attachment image analyzing: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	return false, r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image analyzing")
+}
+
+// MarkImageDone stores the caption and clears any previous analysis error.
+func (r *AttachmentRepository) MarkImageDone(ctx context.Context, imageID int64, caption string, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE attachment_image
+		SET status = 'done', caption = $2, error = '', updated_at = $3
+		WHERE id = $1
+	`, imageID, caption, updatedAt)
+	if err != nil {
+		return fmt.Errorf("mark attachment image done: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image done")
+}
+
+// MarkImageFailed stores the analysis failure reason.
+func (r *AttachmentRepository) MarkImageFailed(ctx context.Context, imageID int64, message string, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE attachment_image
+		SET status = 'failed', error = $2, updated_at = $3
+		WHERE id = $1
+	`, imageID, message, updatedAt)
+	if err != nil {
+		return fmt.Errorf("mark attachment image failed: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image failed")
+}
+
+// ResetImagesForReanalysis re-queues failed/skipped rows as extracted and
+// clears caption/error. The content reference is preserved, so reanalyze never
+// creates a duplicate content object.
+func (r *AttachmentRepository) ResetImagesForReanalysis(ctx context.Context, attachmentID int64, updatedAt time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE attachment_image
+		SET status = 'extracted', caption = '', error = '', updated_at = $2
+		WHERE attachment_id = $1 AND status IN ('failed', 'skipped')
+	`, attachmentID, updatedAt)
+	if err != nil {
+		return 0, fmt.Errorf("reset attachment images for reanalysis: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (r *AttachmentRepository) ensureAttachmentImageExists(ctx context.Context, imageID int64, op string) error {
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM attachment_image WHERE id = $1)`, imageID).Scan(&exists); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	if !exists {
+		return version.ErrAttachmentNotFound
+	}
+	return nil
+}
+
+func nullablePositiveInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+const attachmentImageColumns = `id, attachment_id, seq, content_ref_id, mime, width, height,
+	source_kind, status, caption, error, created_at, updated_at`
+
+func scanAttachmentImage(row rowScanner) (version.AttachmentImageRecord, error) {
+	var image version.AttachmentImageRecord
+	var width, height *int
+	if err := row.Scan(&image.ID, &image.AttachmentID, &image.Seq, &image.ContentRefID,
+		&image.MIME, &width, &height, &image.SourceKind, &image.Status,
+		&image.Caption, &image.Error, &image.CreatedAt, &image.UpdatedAt); err != nil {
+		return version.AttachmentImageRecord{}, err
+	}
+	if width != nil {
+		image.Width = *width
+	}
+	if height != nil {
+		image.Height = *height
+	}
+	return image, nil
+}
+
 // MarkFailed stores the stable error code/message. A done row is never
 // overwritten; repeated failures are idempotent.
 func (r *AttachmentRepository) MarkFailed(ctx context.Context, attachmentID int64, code, message string, updatedAt time.Time) error {

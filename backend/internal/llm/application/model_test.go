@@ -242,7 +242,7 @@ func TestConfigThinkingSettings(t *testing.T) {
 	}
 
 	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
-		Model: "thinking-model", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true,
+		Model: "thinking-model", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true, SupportsVision: true,
 	}, 1)
 	if err != nil {
 		t.Fatalf("AddModel: %v", err)

@@ -282,7 +282,7 @@ func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput
 			SupportsPromptCache: input.SupportsPromptCache,
 			ContextWindow:       input.ContextWindow,
 		},
-		Source:       llm.SourceManual,
+		Source: llm.SourceManual,
 		// A manually added model's numeric parameters are administrator input,
 		// so an upstream refresh that later reports the same name must keep
 		// them unless the value is still 0 (unknown).
@@ -623,9 +623,27 @@ func (s *Service) validateDefaultModel(ctx context.Context, cfg llm.Config) erro
 		if !model.Selectable() {
 			return platform.Invalid("default_model_id", "must reference an active model that is not deprecated")
 		}
+		// R-E2-2 (spec §4.25): document images are analyzed with the default
+		// model, so a model without supports_vision can never be the default.
+		// Without this gate the configuration would be persistable but every
+		// image-bearing attachment would fail only at analysis time.
+		if !model.EffectiveCapabilities().SupportsVision {
+			return invalidVisionDefaultModelError(model.Model)
+		}
 		return nil
 	}
 	return platform.Invalid("default_model_id", "must reference a model of this LLM configuration")
+}
+
+// invalidVisionDefaultModelError is the typed 400 for a non-vision default
+// model. The stable invalid_argument code and default_model_id field let the
+// admin UI map it back onto the field instead of showing a generic failure.
+func invalidVisionDefaultModelError(model string) error {
+	apiErr := platform.Invalid("default_model_id",
+		"must reference a model with supports_vision=true; document images and image drafts require vision analysis")
+	apiErr.Details["model"] = model
+	apiErr.Details["missing_capabilities"] = []string{"vision"}
+	return apiErr
 }
 
 // defaultModelRequiredError is the typed configuration error the admin UI maps

@@ -2,6 +2,8 @@ package versionapp_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,8 @@ import (
 
 type fakeAttachmentRepo struct {
 	attachments          map[int64]version.Attachment
+	images               map[int64]version.AttachmentImageRecord
+	imageStatusLog       []string
 	conversationMessages map[int64]int64 // message ID -> conversation ID
 	conversations        map[int64]int64 // conversation ID -> version ID
 	pendingForIngest     []version.PendingAttachment
@@ -30,7 +34,10 @@ type fakeAttachmentRepo struct {
 }
 
 func newFakeAttachmentRepo() *fakeAttachmentRepo {
-	return &fakeAttachmentRepo{attachments: map[int64]version.Attachment{}}
+	return &fakeAttachmentRepo{
+		attachments: map[int64]version.Attachment{},
+		images:      map[int64]version.AttachmentImageRecord{},
+	}
 }
 
 func (f *fakeAttachmentRepo) Create(_ context.Context, attachment version.Attachment) error {
@@ -222,7 +229,8 @@ func (f *fakeContentStore) Upload(_ context.Context, filename, mime string, r io
 	if err != nil {
 		return versionapp.ContentObject{}, err
 	}
-	sha := strings.Repeat("f", 64)
+	sum := sha256.Sum256(data)
+	sha := hex.EncodeToString(sum[:])
 	f.objects[sha] = versionapp.ContentObject{SHA256: sha, Size: int64(len(data)), MIME: mime}
 	f.data[sha] = data
 	f.uploads = append(f.uploads, filename+"|"+mime+"|"+string(data))
@@ -263,19 +271,25 @@ type attachmentEnv struct {
 	queue     *fakeQueue
 	extractor *fakeExtractor
 	events    *fakePublisher
+	vision    *fakeVisionCaptioner
+	facts     *fakeFactRecorder
 	versionID int64
 }
 
 func newAttachmentEnv(t *testing.T) *attachmentEnv {
 	t.Helper()
-	repo := newFakeAttachmentRepo()
-	store := newFakeContentStore()
-	queue := &fakeQueue{}
-	extractor := &fakeExtractor{text: "extracted text"}
-	events := &fakePublisher{}
-	svc := versionapp.NewAttachmentService(
-		repo, store, queue, extractor, attachments.NewImageProber(), events, &seqIDs{}, fixedClock{at: testTime})
-	return &attachmentEnv{svc: svc, repo: repo, store: store, queue: queue, extractor: extractor, events: events, versionID: 1}
+	env := &attachmentEnv{
+		repo: newFakeAttachmentRepo(), store: newFakeContentStore(), queue: &fakeQueue{},
+		extractor: &fakeExtractor{text: "extracted text"}, events: &fakePublisher{},
+		vision:    &fakeVisionCaptioner{available: true, caption: "登录界面截图：手机号与验证码输入框"},
+		facts:     &fakeFactRecorder{},
+		versionID: 1,
+	}
+	env.svc = versionapp.NewAttachmentService(
+		env.repo, env.store, env.queue, env.extractor, attachments.NewImageProber(), env.events, &seqIDs{}, fixedClock{at: testTime})
+	env.svc.SetVisionCaptioner(env.vision)
+	env.svc.SetFactRecorder(env.facts)
+	return env
 }
 
 func attachmentPart(sha, name, mime string, size int64) version.MessagePart {

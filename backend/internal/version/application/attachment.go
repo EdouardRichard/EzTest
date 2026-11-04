@@ -1,12 +1,14 @@
 package versionapp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -94,6 +96,92 @@ type DocumentExtractor interface {
 	Extract(ctx context.Context, name, mime string, r io.Reader) (ExtractionResult, error)
 }
 
+// ImageCaption is the vision-model result for one extracted image. Caption is
+// the only required part; Confidence and Model are optional provenance.
+type ImageCaption struct {
+	Caption    string
+	Confidence *float64
+	Model      string
+}
+
+// ErrVisionUnavailable reports that the vision analyzer could not resolve a
+// vision-capable default model (no default model or a model without
+// supports_vision). It is a typed configuration outcome, not a transient
+// upstream failure.
+var ErrVisionUnavailable = errors.New("no vision-capable model is configured")
+
+// VisionCaptioner is the version context's port for per-image analysis. The
+// production adapter lives in infrastructure and resolves the default LLM model
+// with a vision requirement, then sends the original bytes as llm.ChatImage;
+// the version application never imports the LLM context (Agent.md §6.2/§6.9.7).
+// Available reports whether a vision-capable default model exists; it is
+// checked before persistence so a no-vision deployment never pretends the
+// images were analyzed (R-E2-2).
+type VisionCaptioner interface {
+	Available(ctx context.Context) (bool, error)
+	Caption(ctx context.Context, mime string, data []byte) (ImageCaption, error)
+}
+
+// AttachmentFactRecorder is the append-only version_fact port used for
+// attachment_image_caption facts. *FactService implements it in production.
+type AttachmentFactRecorder interface {
+	Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error)
+}
+
+// AttachmentImageView is the API/agent-visible state of one extracted image.
+// SHA256 resolves the content-ledger reference so clients can preview the
+// original bytes through the content endpoint; the bytes themselves are never
+// returned in the JSON row.
+type AttachmentImageView struct {
+	ID           int64
+	AttachmentID int64
+	Seq          int
+	ContentRefID int64
+	SHA256       string
+	MIME         string
+	Width        int
+	Height       int
+	SourceKind   string
+	Status       string
+	Caption      string
+	Error        string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// VisionRequiredError is the typed 400 returned by the send path when a
+// document with embedded images is referenced but no vision-capable model is
+// configured. It unwraps both version.ErrVisionRequired (for errors.Is) and the
+// platform error (status/code/details for the HTTP envelope).
+type VisionRequiredError struct {
+	VersionID    int64
+	AttachmentID int64
+	api          *platform.Error
+}
+
+func (e *VisionRequiredError) Error() string { return e.api.Error() }
+
+// Unwrap exposes both the domain sentinel and the API error.
+func (e *VisionRequiredError) Unwrap() []error {
+	return []error{version.ErrVisionRequired, e.api}
+}
+
+func newVisionRequiredError(attachment version.Attachment, reason string) *VisionRequiredError {
+	message := "该文档包含图片，但当前没有可用的视觉模型；请先在 LLM 设置中配置支持视觉的默认模型，再发送或重试附件分析"
+	if strings.TrimSpace(reason) != "" {
+		message += "（" + reason + "）"
+	}
+	apiErr := platform.NewError(http.StatusBadRequest, version.AttachmentErrorVisionRequired, message)
+	apiErr.Details = map[string]any{
+		"version_id":    platformid.Format(attachment.VersionID),
+		"attachment_id": platformid.Format(attachment.ID),
+		"next_action":   "configure a vision-capable default model and reanalyze the attachment",
+	}
+	return &VisionRequiredError{
+		VersionID: attachment.VersionID, AttachmentID: attachment.ID, api: apiErr,
+	}
+}
+
 // AttachmentService registers message attachments against the content ledger
 // and extracts their text into a second content reference.
 type AttachmentService struct {
@@ -105,6 +193,8 @@ type AttachmentService struct {
 	events    eventingapp.Publisher
 	ids       platformid.Generator
 	clock     clock.Clock
+	vision    VisionCaptioner
+	facts     AttachmentFactRecorder
 }
 
 // NewAttachmentService wires the attachment use cases.
@@ -122,6 +212,20 @@ func NewAttachmentService(
 		repo: repo, storage: storage, queue: queue, extractor: extractor, images: images,
 		events: events, ids: ids, clock: clk,
 	}
+}
+
+// SetVisionCaptioner wires the per-image vision analyzer. A nil captioner is a
+// deployment without a vision model: documents with embedded images fail
+// explicitly with vision_required instead of silently skipping the images.
+func (s *AttachmentService) SetVisionCaptioner(vision VisionCaptioner) {
+	s.vision = vision
+}
+
+// SetFactRecorder wires the append-only fact store used for
+// attachment_image_caption facts. Recording a caption is part of analysis
+// success: a nil recorder fails the image explicitly.
+func (s *AttachmentService) SetFactRecorder(facts AttachmentFactRecorder) {
+	s.facts = facts
 }
 
 // RegisterFromMessage validates one message attachment part against the
@@ -297,6 +401,14 @@ func (s *AttachmentService) PrepareUserMessageParts(ctx context.Context, version
 			if isAttachmentPending(linked.ExtractionStatus) {
 				return nil, nil, attachmentPendingError(*linked)
 			}
+			// A document that already carries extracted images can only be sent
+			// when a vision model is available; otherwise the images could never
+			// be analyzed and the whole feature would be fake-available (R-E2-2).
+			if imagePart == nil {
+				if err := s.ensureVisionForImageBearingAttachment(ctx, *linked); err != nil {
+					return nil, nil, err
+				}
+			}
 			if imagePart != nil {
 				prepared = append(prepared, *imagePart)
 			} else {
@@ -314,6 +426,11 @@ func (s *AttachmentService) PrepareUserMessageParts(ctx context.Context, version
 		if draft != nil {
 			if isAttachmentPending(draft.ExtractionStatus) {
 				return nil, nil, attachmentPendingError(*draft)
+			}
+			if imagePart == nil {
+				if err := s.ensureVisionForImageBearingAttachment(ctx, *draft); err != nil {
+					return nil, nil, err
+				}
 			}
 			attachmentIDs = append(attachmentIDs, draft.ID)
 			if imagePart != nil {
@@ -526,6 +643,134 @@ func (s *AttachmentService) Get(ctx context.Context, versionID, attachmentID int
 	return toAttachmentView(attachment), nil
 }
 
+// ListImages returns the attachment_image rows of one attachment ordered by
+// seq. The status/caption/error fields are the per-image visibility required by
+// R-E3-2/R-E3-6; SHA256 lets clients preview the original bytes through the
+// content endpoint.
+func (s *AttachmentService) ListImages(ctx context.Context, attachmentID int64) ([]AttachmentImageView, error) {
+	if attachmentID <= 0 {
+		return nil, platform.Invalid("attachment_id", "must be a positive decimal ID")
+	}
+	if _, err := s.repo.Get(ctx, attachmentID); err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	return s.attachmentImageViews(ctx, attachmentID)
+}
+
+// Reanalyze re-runs vision analysis for the failed/skipped images of one
+// attachment. Rows are reset in place (no duplicate rows or content objects)
+// and the attachment returns to done only when every image succeeds. Without a
+// vision model the call is rejected with the same typed ErrVisionRequired as
+// the send path, so the UI can point at the missing configuration.
+func (s *AttachmentService) Reanalyze(ctx context.Context, attachmentID int64) ([]AttachmentImageView, error) {
+	if attachmentID <= 0 {
+		return nil, platform.Invalid("attachment_id", "must be a positive decimal ID")
+	}
+	attachment, err := s.repo.Get(ctx, attachmentID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	existing, err := s.repo.ListImages(ctx, attachmentID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	if len(existing) == 0 {
+		return []AttachmentImageView{}, nil
+	}
+	if available, reason := s.visionAvailability(ctx); !available {
+		s.publishVisionUnavailable(ctx, attachment)
+		return nil, newVisionRequiredError(attachment, reason)
+	}
+	reset, err := s.repo.ResetImagesForReanalysis(ctx, attachmentID, s.clock.Now())
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	if reset > 0 {
+		rows, err := s.repo.ListImages(ctx, attachmentID)
+		if err != nil {
+			return nil, mapAttachmentRepositoryError(err)
+		}
+		failures := 0
+		firstFailure := ""
+		for _, image := range rows {
+			if image.Status != version.AttachmentImageExtracted {
+				continue
+			}
+			if err := s.analyzeExtractedImage(ctx, attachment, image); err != nil {
+				failures++
+				if firstFailure == "" {
+					firstFailure = err.Error()
+				}
+			}
+		}
+		if failures > 0 {
+			message := fmt.Sprintf("image analysis failed for %d of %d image(s): %s",
+				failures, len(rows), firstFailure)
+			if _, err := s.failAttachment(ctx, attachment, version.AttachmentErrorVisionAnalysis, message, nil); err != nil {
+				return nil, err
+			}
+		} else {
+			textRefID := derefInt64(attachment.ExtractedContentRefID)
+			if textRefID <= 0 {
+				return nil, fmt.Errorf("attachment %d has no extracted text reference; re-upload the attachment", attachmentID)
+			}
+			if err := s.repo.MarkDone(ctx, attachmentID, textRefID, s.clock.Now()); err != nil {
+				return nil, mapAttachmentRepositoryError(err)
+			}
+		}
+	}
+	return s.attachmentImageViews(ctx, attachmentID)
+}
+
+// ensureVisionForImageBearingAttachment is the send-path hard gate for document
+// attachments: an attachment that already carries extracted images may only be
+// sent when a vision-capable model is configured (R-E2-2/R-E2-3). A document
+// without images is unaffected.
+func (s *AttachmentService) ensureVisionForImageBearingAttachment(ctx context.Context, attachment version.Attachment) error {
+	if version.DetectAttachmentKind(attachment.Name, attachment.MIME).IsImage() {
+		return nil
+	}
+	images, err := s.repo.ListImages(ctx, attachment.ID)
+	if err != nil {
+		return mapAttachmentRepositoryError(err)
+	}
+	if len(images) == 0 {
+		return nil
+	}
+	if available, reason := s.visionAvailability(ctx); !available {
+		s.publishVisionUnavailable(ctx, attachment)
+		return newVisionRequiredError(attachment, reason)
+	}
+	return nil
+}
+
+// attachmentImageViews joins the image rows with their content references so one
+// API/agent view carries the original object SHA-256 without opening the file.
+func (s *AttachmentService) attachmentImageViews(ctx context.Context, attachmentID int64) ([]AttachmentImageView, error) {
+	rows, err := s.repo.ListImages(ctx, attachmentID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	refs, err := s.storage.ListRefs(ctx, version.AttachmentOwnerKind, attachmentID)
+	if err != nil {
+		return nil, err
+	}
+	objectByRef := make(map[int64]string, len(refs))
+	for _, ref := range refs {
+		objectByRef[ref.ID] = ref.ObjectID
+	}
+	views := make([]AttachmentImageView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, AttachmentImageView{
+			ID: row.ID, AttachmentID: row.AttachmentID, Seq: row.Seq, ContentRefID: row.ContentRefID,
+			SHA256: objectByRef[row.ContentRefID], MIME: row.MIME, Width: row.Width, Height: row.Height,
+			SourceKind: row.SourceKind, Status: row.Status, Caption: row.Caption, Error: row.Error,
+			CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		})
+	}
+	return views, nil
+}
+
 // Attachment read limits for the agent tools (character based).
 const (
 	DefaultAttachmentReadChars = 4000
@@ -534,7 +779,9 @@ const (
 
 // AttachmentInfo is the agent-facing attachment view used by the ingest run.
 // It carries the extracted text and its total character count. The runtime
-// adapts this to its own AttachmentInfo port.
+// adapts this to its own AttachmentInfo port. Images exposes the extracted
+// image references plus captions so task packs can include refs/captions and
+// budget them; ImageTokens is len(Images)*AttachmentImageTokenBudget (R-E3-4).
 type AttachmentInfo struct {
 	ID                    int64
 	VersionID             int64
@@ -548,6 +795,23 @@ type AttachmentInfo struct {
 	ErrorText             string
 	Text                  string
 	TotalChars            int
+	Images                []AttachmentImageInfo
+	ImageTokens           int
+}
+
+// AttachmentImageInfo is the compact image reference/caption pair exposed to
+// the agent runtime (R-E3-4/R-E3-5). Bytes stay in the content ledger.
+type AttachmentImageInfo struct {
+	ID         int64
+	Seq        int
+	SHA256     string
+	MIME       string
+	Width      int
+	Height     int
+	SourceKind string
+	Status     string
+	Caption    string
+	Error      string
 }
 
 // AttachmentPendingCode is the stable error code of the typed 409 returned when
@@ -624,6 +888,18 @@ func (s *AttachmentService) GetAttachmentInfo(ctx context.Context, versionID, at
 		info.Text = text
 		info.TotalChars = len([]rune(text))
 	}
+	images, err := s.attachmentImageViews(ctx, attachment.ID)
+	if err != nil {
+		return AttachmentInfo{}, err
+	}
+	for _, image := range images {
+		info.Images = append(info.Images, AttachmentImageInfo{
+			ID: image.ID, Seq: image.Seq, SHA256: image.SHA256, MIME: image.MIME,
+			Width: image.Width, Height: image.Height, SourceKind: image.SourceKind,
+			Status: image.Status, Caption: image.Caption, Error: image.Error,
+		})
+	}
+	info.ImageTokens = len(info.Images) * version.AttachmentImageTokenBudget
 	return info, nil
 }
 
@@ -879,6 +1155,55 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	if err != nil {
 		return ExtractionResult{}, err
 	}
+	// Persist the text reference before image analysis so a failed analysis can
+	// fail the attachment without losing the extracted text; a later successful
+	// reanalyze then only has to finish the remaining images.
+	if err := s.repo.SetExtractedContentRef(ctx, attachmentID, textRef.ID, s.clock.Now()); err != nil {
+		return ExtractionResult{}, mapAttachmentRepositoryError(err)
+	}
+	attachment.ExtractedContentRefID = &textRef.ID
+
+	// Embedded images are persisted one row per image (content refs live in the
+	// content ledger, never in the DB) and then analyzed one by one (R-E2-1,
+	// R-E3-2). No vision model is an explicit whole-attachment failure, not a
+	// silent skip (R-E2-2/R-E3-3).
+	visionAvailable, visionReason := s.visionAvailability(ctx)
+	imageStatus := version.AttachmentImageExtracted
+	imageSkipReason := ""
+	if !visionAvailable {
+		imageStatus = version.AttachmentImageSkipped
+		imageSkipReason = visionUnavailableMessage(visionReason)
+	}
+	imageRows, err := s.persistExtractedImages(ctx, attachment, parsed.Images, imageStatus, imageSkipReason)
+	if err != nil {
+		return ExtractionResult{}, err
+	}
+	if len(imageRows) > 0 {
+		if !visionAvailable {
+			message := "attachment contains embedded images, but " + visionUnavailableMessage(visionReason)
+			s.publishVisionUnavailable(ctx, attachment)
+			return s.failAttachment(ctx, attachment, version.AttachmentErrorVisionRequired, message, parsed.Images)
+		}
+		failures := 0
+		firstFailure := ""
+		for _, image := range imageRows {
+			if image.Status != version.AttachmentImageExtracted {
+				continue
+			}
+			if err := s.analyzeExtractedImage(ctx, attachment, image); err != nil {
+				failures++
+				if firstFailure == "" {
+					firstFailure = err.Error()
+				}
+			}
+		}
+		if failures > 0 {
+			message := fmt.Sprintf("image analysis failed for %d of %d image(s): %s",
+				failures, len(imageRows), firstFailure)
+			return s.failAttachment(ctx, attachment, version.AttachmentErrorVisionAnalysis, message, parsed.Images)
+		}
+	}
+
 	now := s.clock.Now()
 	if err := s.repo.MarkDone(ctx, attachmentID, textRef.ID, now); err != nil {
 		return ExtractionResult{}, mapAttachmentRepositoryError(err)
@@ -894,6 +1219,7 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		"message_id":    messageIDString(attachment.ConversationMessageID),
 		"chars":         chars,
 		"coverage":      parsed.Coverage,
+		"images":        len(imageRows),
 	})
 	return ExtractionResult{
 		Attachment:            toAttachmentView(attachment),
@@ -917,6 +1243,14 @@ func (s *AttachmentService) failExtraction(ctx context.Context, attachment versi
 		// wraps this sentinel) instead of overwriting it.
 		message = extractErr.Error()
 	}
+	return s.failAttachment(ctx, attachment, code, message, nil)
+}
+
+// failAttachment marks one attachment failed with a stable code and reason,
+// publishes requirement.attachment_failed and returns the domain outcome (a
+// failure is not a retryable Go error). Image failures additionally carry the
+// parsed image references so callers still see what was extracted.
+func (s *AttachmentService) failAttachment(ctx context.Context, attachment version.Attachment, code, message string, parsedImages []ExtractionImage) (ExtractionResult, error) {
 	now := s.clock.Now()
 	if err := s.repo.MarkFailed(ctx, attachment.ID, code, message, now); err != nil {
 		return ExtractionResult{}, mapAttachmentRepositoryError(err)
@@ -931,7 +1265,239 @@ func (s *AttachmentService) failExtraction(ctx context.Context, attachment versi
 		"code":          code,
 		"message":       message,
 	})
-	return ExtractionResult{Attachment: toAttachmentView(attachment), ErrorCode: code}, nil
+	return ExtractionResult{
+		Attachment: toAttachmentView(attachment),
+		ErrorCode:  code,
+		Images:     parsedImages,
+	}, nil
+}
+
+// visionAvailability reports whether a vision-capable model is configured and,
+// when it is not, a human-readable reason. A nil captioner is a deployment
+// without the image-analysis feature: fail closed instead of degrading to a
+// silent skip (R-E2-2).
+func (s *AttachmentService) visionAvailability(ctx context.Context) (bool, string) {
+	if s.vision == nil {
+		return false, "vision image analysis is not configured"
+	}
+	available, err := s.vision.Available(ctx)
+	if err != nil {
+		return false, err.Error()
+	}
+	if !available {
+		return false, ""
+	}
+	return true, ""
+}
+
+func visionUnavailableMessage(reason string) string {
+	message := "no vision-capable model is configured; document images cannot be analyzed"
+	if trimmed := strings.TrimSpace(reason); trimmed != "" {
+		message += ": " + trimmed
+	}
+	return message
+}
+
+// publishVisionUnavailable emits model.vision.unavailable so the UI can tell
+// the user to configure a vision model instead of assuming the images were
+// understood. The payload names the attachment and the next action.
+func (s *AttachmentService) publishVisionUnavailable(ctx context.Context, attachment version.Attachment) {
+	s.publishAttachmentEvent(ctx, attachment.VersionID, "model.vision.unavailable", attachment, map[string]any{
+		"attachment_id": platformid.Format(attachment.ID),
+		"message":       visionUnavailableMessage(""),
+		"next_action":   "configure a vision-capable default model, then reanalyze the attachment",
+	})
+}
+
+// persistExtractedImages stores one attachment_image row per parsed image. The
+// bytes go through the content ledger under an attachment_image role; the row
+// only references them. Rows are created with the status chosen by the caller
+// (extracted when a vision model is available, skipped otherwise) and are
+// idempotent on (attachment_id, seq): an existing row is reused and no
+// duplicate content object/reference is created.
+func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachment version.Attachment, parsed []ExtractionImage, status, skipReason string) ([]version.AttachmentImageRecord, error) {
+	if len(parsed) == 0 {
+		return nil, nil
+	}
+	existing, err := s.repo.ListImages(ctx, attachment.ID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	bySeq := make(map[int]version.AttachmentImageRecord, len(existing))
+	for _, row := range existing {
+		bySeq[row.Seq] = row
+	}
+	sourceKind := version.AttachmentImageSourceEmbedded
+	if version.DetectAttachmentKind(attachment.Name, attachment.MIME).IsImage() {
+		sourceKind = version.AttachmentImageSourceStandalone
+	}
+	now := s.clock.Now()
+	rows := make([]version.AttachmentImageRecord, 0, len(parsed))
+	for _, image := range parsed {
+		if row, ok := bySeq[image.Seq]; ok {
+			rows = append(rows, row)
+			continue
+		}
+		name := image.Name
+		if strings.TrimSpace(name) == "" {
+			name = fmt.Sprintf("attachment-%d-image-%d", attachment.ID, image.Seq)
+		}
+		uploaded, err := s.storage.Upload(ctx, name, image.MIME, bytes.NewReader(image.Data), version.MaxAttachmentBytes, 0)
+		if err != nil {
+			return nil, err
+		}
+		ref, err := s.storage.AddRef(ctx, uploaded.SHA256, version.AttachmentOwnerKind, attachment.ID, version.AttachmentImageRole)
+		if err != nil {
+			return nil, err
+		}
+		row := version.AttachmentImageRecord{
+			ID: s.ids.Next(), AttachmentID: attachment.ID, Seq: image.Seq, ContentRefID: ref.ID,
+			MIME: image.MIME, Width: image.Width, Height: image.Height, SourceKind: sourceKind,
+			Status: status, Error: skipReason, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.repo.CreateImage(ctx, row); err != nil {
+			return nil, mapAttachmentRepositoryError(err)
+		}
+		s.publishImageEvent(ctx, attachment, row, "attachment.image.extracted", map[string]any{
+			"mime": image.MIME, "width": image.Width, "height": image.Height, "source_kind": sourceKind,
+		})
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// analyzeExtractedImage runs one image through the vision port. Success stores
+// the caption, appends the attachment_image_caption fact and emits
+// attachment.image.analyzed; any failure marks the image failed with the reason
+// and emits attachment.image.failed.
+func (s *AttachmentService) analyzeExtractedImage(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord) error {
+	now := s.clock.Now()
+	started, err := s.repo.MarkImageAnalyzing(ctx, image.ID, now)
+	if err != nil {
+		return mapAttachmentRepositoryError(err)
+	}
+	if !started {
+		return fmt.Errorf("attachment image %d is not in a re-analyzable state", image.ID)
+	}
+	if s.vision == nil {
+		return s.failAnalyzedImage(ctx, attachment, image, errors.New("vision image analysis is not configured"))
+	}
+	sha256, data, err := s.loadImageBytes(ctx, attachment.ID, image.ContentRefID)
+	if err != nil {
+		return s.failAnalyzedImage(ctx, attachment, image, err)
+	}
+	caption, err := s.vision.Caption(ctx, image.MIME, data)
+	if err != nil {
+		return s.failAnalyzedImage(ctx, attachment, image, err)
+	}
+	text := strings.TrimSpace(caption.Caption)
+	if text == "" {
+		return s.failAnalyzedImage(ctx, attachment, image, errors.New("vision model returned an empty caption"))
+	}
+	if err := s.repo.MarkImageDone(ctx, image.ID, text, now); err != nil {
+		return mapAttachmentRepositoryError(err)
+	}
+	image.Status = version.AttachmentImageDone
+	image.Caption = text
+	image.Error = ""
+	s.publishImageEvent(ctx, attachment, image, "attachment.image.analyzed", map[string]any{
+		"caption": text, "model": caption.Model,
+	})
+	if err := s.recordImageCaptionFact(ctx, attachment, image, caption, sha256); err != nil {
+		return s.failAnalyzedImage(ctx, attachment, image, fmt.Errorf("record caption fact: %w", err))
+	}
+	return nil
+}
+
+// failAnalyzedImage marks one image failed with the reason, publishes
+// attachment.image.failed and returns the reason as a Go error for the caller's
+// aggregate decision (the attachment itself is failed by Extract/Reanalyze).
+func (s *AttachmentService) failAnalyzedImage(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord, cause error) error {
+	message := "image analysis failed: " + cause.Error()
+	if err := s.repo.MarkImageFailed(ctx, image.ID, message, s.clock.Now()); err != nil {
+		return mapAttachmentRepositoryError(err)
+	}
+	image.Status = version.AttachmentImageFailed
+	image.Error = message
+	s.publishImageEvent(ctx, attachment, image, "attachment.image.failed", map[string]any{"error": message})
+	return errors.New(message)
+}
+
+// recordImageCaptionFact appends the version_fact(kind=attachment_image_caption)
+// for one analyzed image. A nil recorder is an explicit failure: a caption that
+// is not stored as a fact would be invisible to downstream context assembly.
+func (s *AttachmentService) recordImageCaptionFact(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord, caption ImageCaption, sha256 string) error {
+	if s.facts == nil {
+		return errors.New("attachment image fact recorder is not configured")
+	}
+	payload := map[string]any{
+		"attachment_id": platformid.Format(attachment.ID),
+		"image_id":      platformid.Format(image.ID),
+		"seq":           image.Seq,
+		"caption":       strings.TrimSpace(caption.Caption),
+		"mime":          image.MIME,
+		"width":         image.Width,
+		"height":        image.Height,
+		"source_kind":   image.SourceKind,
+	}
+	if caption.Model != "" {
+		payload["model"] = caption.Model
+	}
+	if caption.Confidence != nil {
+		payload["confidence"] = *caption.Confidence
+	}
+	fact := version.Fact{
+		VersionID:  attachment.VersionID,
+		Kind:       "attachment_image_caption",
+		Key:        fmt.Sprintf("attachment:%d:image:%d", attachment.ID, image.Seq),
+		Payload:    payload,
+		Confidence: caption.Confidence,
+		Source:     "attachment_vision",
+		SourceRef:  sha256,
+	}
+	_, _, err := s.facts.Record(ctx, fact)
+	return err
+}
+
+// loadImageBytes resolves one attachment_image content reference back to its
+// content object and returns the object's SHA-256 plus the original bytes.
+func (s *AttachmentService) loadImageBytes(ctx context.Context, attachmentID, contentRefID int64) (string, []byte, error) {
+	refs, err := s.storage.ListRefs(ctx, version.AttachmentOwnerKind, attachmentID)
+	if err != nil {
+		return "", nil, err
+	}
+	for _, ref := range refs {
+		if ref.ID != contentRefID {
+			continue
+		}
+		_, reader, err := s.storage.Open(ctx, ref.ObjectID)
+		if err != nil {
+			return "", nil, err
+		}
+		defer reader.Close()
+		data, err := io.ReadAll(io.LimitReader(reader, version.MaxAttachmentBytes+1))
+		if err != nil {
+			return "", nil, err
+		}
+		if int64(len(data)) > version.MaxAttachmentBytes {
+			return "", nil, version.ErrAttachmentTooLarge
+		}
+		return ref.ObjectID, data, nil
+	}
+	return "", nil, fmt.Errorf("attachment %d: image content reference %d is missing", attachmentID, contentRefID)
+}
+
+func (s *AttachmentService) publishImageEvent(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord, eventType string, extra map[string]any) {
+	payload := map[string]any{
+		"attachment_id": platformid.Format(attachment.ID),
+		"image_id":      platformid.Format(image.ID),
+		"seq":           image.Seq,
+		"status":        image.Status,
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	s.publishAttachmentEvent(ctx, attachment.VersionID, eventType, attachment, payload)
 }
 
 // originalObjectID resolves the attachment's content reference back to the

@@ -906,7 +906,7 @@ func TestConfigRequiresDefaultWhenModelsExist(t *testing.T) {
 		t.Fatalf("UpdateConfig without models: %v", err)
 	}
 
-	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true}, 1)
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true, SupportsVision: true}, 1)
 	if err != nil {
 		t.Fatalf("AddModel: %v", err)
 	}
@@ -971,6 +971,55 @@ func TestConfigRequiresDefaultWhenModelsExist(t *testing.T) {
 
 func formatID(value int64) string {
 	return strconv.FormatInt(value, 10)
+}
+
+// TestVisionModelCannotBeDefault covers R-E2-2 (spec §4.25): a model with
+// supports_vision=false can never be the default model, because document
+// images and standalone image drafts would then be accepted by the catalog and
+// fail only at dispatch. A vision-capable model is accepted.
+func TestVisionModelCannotBeDefault(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _, _, _ := newTestService(t)
+
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	textOnly, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "text-only", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel(text-only): %v", err)
+	}
+	visionModel, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "vision-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true, SupportsVision: true,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel(vision): %v", err)
+	}
+
+	rejected, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &textOnly.ID}, 1)
+	if err == nil {
+		t.Fatalf("non-vision default accepted: %#v", rejected)
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_argument" || apiErr.Retryable {
+		t.Fatalf("error = %#v, want non-retryable 400 invalid_argument", apiErr)
+	}
+	if field, _ := apiErr.Details["field"].(string); field != "default_model_id" {
+		t.Fatalf("details = %#v, want field=default_model_id", apiErr.Details)
+	}
+	if stored, getErr := repo.GetConfig(ctx, cfg.ID); getErr != nil || stored.DefaultModelID != 0 {
+		t.Fatalf("rejected default persisted: %#v, %v", stored, getErr)
+	}
+
+	updated, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &visionModel.ID}, 1)
+	if err != nil {
+		t.Fatalf("vision default rejected: %v", err)
+	}
+	if updated.DefaultModelID != visionModel.ID {
+		t.Fatalf("default_model_id = %d, want %d", updated.DefaultModelID, visionModel.ID)
+	}
 }
 
 func int64Ptr(value int64) *int64 { return &value }

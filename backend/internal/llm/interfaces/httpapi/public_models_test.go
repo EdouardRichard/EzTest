@@ -197,6 +197,44 @@ func TestPublicModelCatalogMatchesOverrideValidator(t *testing.T) {
 	}
 }
 
+// TestModelCatalogOnlyListsVisionModels covers R-E2-2 (spec §4.25): the
+// conversation model selector is backed by this catalog, so a model without
+// supports_vision=true must not be advertised at all. Keeping it out of the
+// list is what prevents the selector from offering a model that the image
+// send gate would reject.
+func TestModelCatalogOnlyListsVisionModels(t *testing.T) {
+	stub := &stubService{}
+	active := sampleConfig()
+	active.DefaultModelID = 201
+	stub.configs = []llm.Config{active}
+
+	vision := sampleModel()
+	textOnly := sampleModel()
+	textOnly.ID = 202
+	textOnly.Model = "text-only"
+	textOnly.DisplayName = "Text Only"
+	textOnly.SupportsVision = false
+	textOnly.Capabilities.SupportsVision = false
+	stub.models = []llm.Model{vision, textOnly}
+
+	handler := llmapi.New(stub)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/llm/models", handler.ListPublicModels)
+
+	recorder := call(t, mux, http.MethodGet, "/api/llm/models", "", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	items := dataList(t, recorder)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want only the vision-capable model", items)
+	}
+	item := items[0].(map[string]any)
+	if item["model"] != "gpt-4o" {
+		t.Fatalf("item = %#v", item)
+	}
+}
+
 // TestModelCatalogEmptyKeepsArrayShape pins the envelope: no selectable
 // model is an empty data array, never null.
 func TestModelCatalogEmptyKeepsArrayShape(t *testing.T) {

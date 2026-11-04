@@ -340,14 +340,16 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 //
 // The login-user model catalog backs the conversation model selector. Only
 // models of the unique active *default* LLM configuration that are themselves
-// enabled and not deprecated are returned (spec §7.3/§9.1); deprecated rows
-// stay in the admin catalog for display but can never be selected for a run.
-// Restricting the catalog to the default configuration is what keeps it
-// consistent with the conversation override resolver, which resolves only that
-// configuration: another active configuration's models would be advertised but
-// every PATCH naming them would be rejected. The response carries the 0.2.1
-// capability set and the config's default marker, and never any gateway
-// credential or base URL.
+// enabled, not deprecated and vision-capable are returned (spec
+// §7.3/§9.1/R-E2-2). Deprecated rows stay in the admin catalog for display but
+// can never be selected for a run; models without supports_vision are omitted
+// because a conversation chat is allowed to carry image drafts and document
+// images, which those models cannot serve. Restricting the catalog to the
+// default configuration is what keeps it consistent with the conversation
+// override resolver, which resolves only that configuration: another active
+// configuration's models would be advertised but every PATCH naming them would
+// be rejected. The response carries the 0.2.1 capability set and the config's
+// default marker, and never any gateway credential or base URL.
 func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
 	configs, err := h.svc.ListConfigs(r.Context())
 	if err != nil {
@@ -369,6 +371,9 @@ func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
 	items := make([]publicModelDTO, 0, len(models))
 	for _, model := range models {
 		if model.ConfigID != defaultConfig.ID || !model.Selectable() {
+			continue
+		}
+		if !model.EffectiveCapabilities().SupportsVision {
 			continue
 		}
 		items = append(items, toPublicModelDTO(model, defaultConfig))
