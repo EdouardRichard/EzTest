@@ -85,8 +85,15 @@ func (r *AttachmentRepository) ListByRequirement(ctx context.Context, versionID,
 	return attachments, nil
 }
 
-// ListByConversation returns the attachments linked to one conversation via
-// its messages, ordered by attachment ID.
+// ListByConversation returns the attachments visible to one conversation,
+// ordered by attachment ID: rows whose message belongs to the conversation,
+// plus pre-registered message attachments whose conversation_message_id is
+// still NULL. The second set is the attachment.ingest race window (R-E4-1): the
+// message post preflight stores the row and starts extraction before the
+// message insert, so attachment.list/read_text must already see it instead of
+// returning 0/not_found while the parse runs. Requirement attachments keep
+// their requirement scope (requirement_id/requirement_version_id) and are never
+// pulled into a conversation through this path.
 func (r *AttachmentRepository) ListByConversation(ctx context.Context, versionID, conversationID int64) ([]version.Attachment, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT a.id, a.version_id, a.requirement_id, a.requirement_version_id,
@@ -94,8 +101,14 @@ func (r *AttachmentRepository) ListByConversation(ctx context.Context, versionID
 			a.extraction_status, a.extracted_content_ref_id, a.extraction_error,
 			a.created_by, a.created_at, a.updated_at
 		FROM requirement_attachment a
-		JOIN conversation_message m ON m.id = a.conversation_message_id
-		WHERE a.version_id = $1 AND m.conversation_id = $2
+		LEFT JOIN conversation_message m ON m.id = a.conversation_message_id
+		WHERE a.version_id = $1
+		  AND (
+		        m.conversation_id = $2
+		        OR (a.conversation_message_id IS NULL
+		            AND a.requirement_id IS NULL
+		            AND a.requirement_version_id IS NULL)
+		      )
 		ORDER BY a.id
 	`, versionID, conversationID)
 	if err != nil {

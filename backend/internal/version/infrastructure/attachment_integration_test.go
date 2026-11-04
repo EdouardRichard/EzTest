@@ -187,3 +187,68 @@ func TestAttachmentRepositoryListsByRequirement(t *testing.T) {
 		t.Fatalf("cross-version = %#v, %v", crossVersion, err)
 	}
 }
+
+// TestAttachmentRepositoryConversationIncludesPreRegistered covers R-E4-1: a
+// message attachment pre-registered before its message insert (nil
+// conversation_message_id) must already be visible to ListByConversation while
+// ingest runs, without leaking requirement attachments or attachments of other
+// conversations into the result.
+func TestAttachmentRepositoryConversationIncludesPreRegistered(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewAttachmentRepository(pool)
+	ctx := context.Background()
+
+	versionID := ids.Next()
+	if _, err := pool.Exec(ctx, `INSERT INTO version (id, title, created_by) VALUES ($1, 'attachment race', 42)`, versionID); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	conversationID := ids.Next()
+	messageID := ids.Next()
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation (id, version_id, kind, title) VALUES ($1, $2, 'clarification', 'Chat')`, conversationID, versionID); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation_message (id, conversation_id, role) VALUES ($1, $2, 'user')`, messageID, conversationID); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	otherConversationID := ids.Next()
+	otherMessageID := ids.Next()
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation (id, version_id, kind, title) VALUES ($1, $2, 'clarification', 'Other')`, otherConversationID, versionID); err != nil {
+		t.Fatalf("insert other conversation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation_message (id, conversation_id, role) VALUES ($1, $2, 'user')`, otherMessageID, otherConversationID); err != nil {
+		t.Fatalf("insert other message: %v", err)
+	}
+
+	linked := sampleAttachment(ids, versionID)
+	linked.ConversationMessageID = &messageID
+	preRegistered := sampleAttachment(ids, versionID)
+	preRegistered.ConversationMessageID = nil
+	requirementID := int64(3001)
+	requirementAttachment := sampleAttachment(ids, versionID)
+	requirementAttachment.ConversationMessageID = nil
+	requirementAttachment.RequirementID = &requirementID
+	otherConversation := sampleAttachment(ids, versionID)
+	otherConversation.ConversationMessageID = &otherMessageID
+	for _, attachment := range []version.Attachment{linked, preRegistered, requirementAttachment, otherConversation} {
+		if err := repo.Create(ctx, attachment); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	attachments, err := repo.ListByConversation(ctx, versionID, conversationID)
+	if err != nil {
+		t.Fatalf("ListByConversation: %v", err)
+	}
+	if len(attachments) != 2 || attachments[0].ID != linked.ID || attachments[1].ID != preRegistered.ID {
+		t.Fatalf("attachments = %#v, want the linked and pre-registered rows", attachments)
+	}
+	if attachments[1].ConversationMessageID != nil {
+		t.Fatalf("pre-registered row was bound: %#v", attachments[1])
+	}
+
+	byRequirement, err := repo.ListByRequirement(ctx, versionID, requirementID)
+	if err != nil || len(byRequirement) != 1 || byRequirement[0].ID != requirementAttachment.ID {
+		t.Fatalf("requirement attachments = %#v, %v", byRequirement, err)
+	}
+}

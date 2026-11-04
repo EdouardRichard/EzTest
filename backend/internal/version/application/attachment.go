@@ -263,7 +263,11 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 
 // createAttachment inserts one requirement_attachment row and its content-ledger
 // reference. messageID is zero for a row pre-registered by the message post
-// preflight; LinkFromMessage binds it after the message insert wins.
+// preflight; LinkFromMessage binds it after the message insert wins. The row is
+// persisted before the ingest task is enqueued (R-E4-1) and the ingest task
+// resolves the attachment by attachment_id, never through the message join, so
+// the worker can run (and attachment.list/read_text can see the row) while the
+// message binding is still deferred.
 func (s *AttachmentService) createAttachment(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, name string, content ContentObject, actorID int64) (version.Attachment, error) {
 	now := s.clock.Now()
 	attachmentID := s.ids.Next()
@@ -525,13 +529,20 @@ func (s *AttachmentService) attachmentContent(ctx context.Context, part version.
 }
 
 // attachmentBySHA finds an attachment already linked to this conversation via
-// one of its messages whose original content matches sha256.
+// one of its messages whose original content matches sha256. ListByConversation
+// also returns pre-registered rows whose message binding is still deferred
+// (R-E4-1); those are not re-send candidates and are skipped here so they can
+// never be mistaken for an already-linked attachment. They are reused by
+// unlinkedAttachmentBySHA instead.
 func (s *AttachmentService) attachmentBySHA(ctx context.Context, versionID, conversationID int64, sha256 string) (*version.Attachment, error) {
 	attachments, err := s.repo.ListByConversation(ctx, versionID, conversationID)
 	if err != nil {
 		return nil, mapAttachmentRepositoryError(err)
 	}
 	for _, attachment := range attachments {
+		if attachment.ConversationMessageID == nil {
+			continue
+		}
 		objectID, err := s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID)
 		if err != nil {
 			return nil, err
@@ -903,8 +914,11 @@ func (s *AttachmentService) GetAttachmentInfo(ctx context.Context, versionID, at
 	return info, nil
 }
 
-// ListAttachments returns the attachments linked to one conversation, in
-// attachment-ID order.
+// ListAttachments returns the attachments visible to one conversation, in
+// attachment-ID order. That is every row linked to one of the conversation's
+// messages plus the message attachments pre-registered before their message
+// insert (conversation_message_id == 0): the attachment.ingest race window must
+// not make an uploaded attachment invisible to attachment.list (R-E4-1/R-E4-2).
 func (s *AttachmentService) ListAttachments(ctx context.Context, versionID, conversationID int64) ([]AttachmentMeta, error) {
 	if versionID <= 0 || conversationID <= 0 {
 		return nil, platform.Invalid("conversation_id", "must be positive decimal IDs")
@@ -1029,6 +1043,10 @@ func (s *AttachmentService) AttachmentImageRef(ctx context.Context, versionID, c
 	}, nil
 }
 
+// conversationAttachment resolves one attachment by its ID within the
+// conversation. The repository also returns pre-registered rows whose message
+// binding is still deferred, so attachment.read_text works by attachment_id
+// during the ingest race window instead of returning not_found (R-E4-1).
 func (s *AttachmentService) conversationAttachment(ctx context.Context, versionID, conversationID, attachmentID int64) (version.Attachment, error) {
 	if versionID <= 0 || conversationID <= 0 || attachmentID <= 0 {
 		return version.Attachment{}, platform.Invalid("attachment_id", "must be positive decimal IDs")
@@ -1551,6 +1569,12 @@ func (s *AttachmentService) readExtractedText(ctx context.Context, attachment ve
 	return "", version.ErrAttachmentNotFound
 }
 
+// enqueueIngest ensures the deterministic attachment.ingest task. The task is
+// keyed by attachment_id (never by the message join) and the row is already
+// persisted, so it may run before the message binding is known; message_id is
+// carried for observability and may be zero for a pre-registered row. Dedupe on
+// the attachment key keeps the enqueue idempotent when the retry path reuses
+// the same row.
 func (s *AttachmentService) enqueueIngest(ctx context.Context, versionID, conversationID, messageID, attachmentID int64) {
 	if s.queue == nil {
 		return

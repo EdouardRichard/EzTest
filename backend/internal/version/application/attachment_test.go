@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,10 +76,20 @@ func (f *fakeAttachmentRepo) ListByRequirement(_ context.Context, versionID, req
 	return items, nil
 }
 
+// ListByConversation mirrors the SQL: linked rows of the conversation plus
+// pre-registered message attachments whose message binding is still deferred.
+// Requirement attachments stay requirement-scoped and never appear here.
 func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, conversationID int64) ([]version.Attachment, error) {
 	items := make([]version.Attachment, 0)
 	for _, attachment := range f.attachments {
-		if attachment.VersionID != versionID || attachment.ConversationMessageID == nil {
+		if attachment.VersionID != versionID {
+			continue
+		}
+		if attachment.ConversationMessageID == nil {
+			if attachment.RequirementID != nil || attachment.RequirementVersionID != nil {
+				continue
+			}
+			items = append(items, attachment)
 			continue
 		}
 		if f.conversationMessages != nil {
@@ -934,5 +945,232 @@ func TestLegacyAttachmentSaveAsHint(t *testing.T) {
 	lastEvent := env.events.events[len(env.events.events)-1]
 	if lastEvent.Type != "requirement.attachment_failed" || !strings.Contains(lastEvent.Payload["message"].(string), "requirements.doc") {
 		t.Fatalf("event = %#v", lastEvent)
+	}
+}
+
+// ---------- upload-then-immediate-chat harness (R-E4-1/R-E4-2) ----------
+
+// uploadHarness reproduces the Composer path for "upload a document, then chat
+// immediately": the content object is already uploaded and the user message is
+// posted at once while extraction runs asynchronously. A brand-new document is
+// pre-registered by the message post preflight (its conversation_message_id is
+// still NULL) and the first post is gated with the retryable 409 while ingest
+// is pending. Everything the attachment.ingest run reads during that window
+// must still see the attachment instead of an empty conversation list or a
+// not_found.
+type uploadHarness struct {
+	t              *testing.T
+	env            *imageConversationEnv
+	conversationID int64
+	parts          []version.MessagePart
+	attachmentID   int64
+}
+
+func newAttachmentHarness(t *testing.T) *uploadHarness {
+	t.Helper()
+	env := newImageConversationEnv(t)
+	return &uploadHarness{t: t, env: env, conversationID: env.conversation.ID}
+}
+
+// Upload stores the document content and posts the user message. The message
+// post pre-registers the attachment row and enqueues ingest; while the parse is
+// pending the post is rejected with the typed 409, so the row stays unlinked
+// (message binding deferred) exactly like the live race.
+func (h *uploadHarness) Upload(name string) {
+	h.t.Helper()
+	data := []byte("# 需求\n登录、退款")
+	sha := strings.Repeat("7", 64)
+	h.env.attachments.store.put(sha, data, docxMIME)
+	h.parts = []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请读附件"},
+		attachmentPart(sha, name, docxMIME, int64(len(data))),
+	}
+	_, err := h.env.svc.PostUserMessage(
+		requestContext(), h.env.versionID, h.conversationID, h.parts, "upload-immediate-1", 42)
+	if err == nil {
+		h.t.Fatal("first post of a still-parsing attachment was accepted")
+	}
+	apiErr := apiError(h.t, err)
+	if apiErr.Code != versionapp.AttachmentPendingCode {
+		h.t.Fatalf("first post code = %q, want %q", apiErr.Code, versionapp.AttachmentPendingCode)
+	}
+	rawID, _ := apiErr.Details["attachment_id"].(string)
+	id, parseErr := strconv.ParseInt(rawID, 10, 64)
+	if parseErr != nil || id <= 0 {
+		h.t.Fatalf("attachment_id detail = %q", rawID)
+	}
+	h.attachmentID = id
+}
+
+// List is the attachment.list read of the conversation.
+func (h *uploadHarness) List() []versionapp.AttachmentMeta {
+	h.t.Helper()
+	metas, err := h.env.attachments.svc.ListAttachments(requestContext(), h.env.versionID, h.conversationID)
+	if err != nil {
+		h.t.Fatalf("ListAttachments: %v", err)
+	}
+	return metas
+}
+
+// ReadText is the attachment.read_text read by attachment ID.
+func (h *uploadHarness) ReadText() versionapp.AttachmentTextRead {
+	h.t.Helper()
+	read, err := h.env.attachments.svc.ReadAttachmentText(
+		requestContext(), h.env.versionID, h.conversationID, h.attachmentID, 0, 0)
+	if err != nil {
+		h.t.Fatalf("ReadAttachmentText: %v", err)
+	}
+	return read
+}
+
+// Ingest runs the attachment.ingest worker while the message binding may still
+// be deferred.
+func (h *uploadHarness) Ingest(text string) {
+	h.t.Helper()
+	h.env.attachments.extractor.text = text
+	if _, err := h.env.attachments.svc.Extract(requestContext(), h.attachmentID); err != nil {
+		h.t.Fatalf("Extract: %v", err)
+	}
+}
+
+// Retry posts the same user message again once ingest finished; this is the
+// client retry after the 409 and must bind the pre-registered row.
+func (h *uploadHarness) Retry(clientMessageID string) versionapp.MessageView {
+	h.t.Helper()
+	message, err := h.env.svc.PostUserMessage(
+		requestContext(), h.env.versionID, h.conversationID, h.parts, clientMessageID, 42)
+	if err != nil {
+		h.t.Fatalf("retry post: %v", err)
+	}
+	return message
+}
+
+// ingestTasks returns the attachment.ingest tasks queued for this attachment.
+func (h *uploadHarness) ingestTasks() []versionapp.TaskInput {
+	h.t.Helper()
+	tasks := make([]versionapp.TaskInput, 0, 1)
+	for _, task := range h.env.attachments.queue.tasks {
+		if task.Type == "attachment.ingest" && task.Payload["attachment_id"] == idString(h.attachmentID) {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+// TestUploadThenImmediateList covers R-E4-2: immediately after uploading a
+// document and attempting the first chat, attachment.list returns the
+// pre-registered attachment (not 0) and attachment.read_text returns the
+// structured "still parsing, retry" result (not not_found, and not a Go error).
+func TestUploadThenImmediateList(t *testing.T) {
+	h := newAttachmentHarness(t)
+	h.Upload("spec.docx")
+
+	listed := h.List()
+	if len(listed) != 1 {
+		t.Fatalf("list=%d, want 1", len(listed))
+	}
+	if listed[0].ID != h.attachmentID || listed[0].Name != "spec.docx" {
+		t.Fatalf("listed = %#v", listed[0])
+	}
+	if listed[0].ConversationMessageID != 0 {
+		t.Fatalf("pre-registered attachment was already bound: %#v", listed[0])
+	}
+	if listed[0].ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("status = %q, want pending", listed[0].ExtractionStatus)
+	}
+
+	read := h.ReadText()
+	if read.Status != version.AttachmentPending || !read.Retryable {
+		t.Fatalf("read_text = %#v, want a retryable pending result", read)
+	}
+	if read.AttachmentID != h.attachmentID || read.Name != "spec.docx" {
+		t.Fatalf("read metadata = %#v", read)
+	}
+	if !strings.Contains(read.Error, "解析中") {
+		t.Fatalf("read error = %q, want the parsing hint", read.Error)
+	}
+	t.Logf("attachment.list -> %+v", listed)
+	t.Logf("attachment.read_text -> %+v", read)
+}
+
+// TestIngestByAttachmentIDWhileBindingDeferred covers R-E4-1's second clause:
+// attachment.ingest resolves and extracts the row by attachment_id only, so it
+// completes even though the conversation message binding has not happened yet;
+// the extracted text is then readable through the conversation without a
+// not_found.
+func TestIngestByAttachmentIDWhileBindingDeferred(t *testing.T) {
+	h := newAttachmentHarness(t)
+	h.Upload("spec.docx")
+
+	h.Ingest("完整需求正文：登录、退款")
+	stored := h.env.attachments.repo.attachments[h.attachmentID]
+	if stored.ConversationMessageID != nil {
+		t.Fatalf("binding was not deferred: %#v", stored)
+	}
+	if stored.ExtractionStatus != version.AttachmentDone {
+		t.Fatalf("stored status = %q", stored.ExtractionStatus)
+	}
+
+	read := h.ReadText()
+	if read.Status != version.AttachmentDone || !strings.Contains(read.Text, "完整需求正文") {
+		t.Fatalf("read_text = %#v", read)
+	}
+	listed := h.List()
+	if len(listed) != 1 || listed[0].ExtractionStatus != version.AttachmentDone {
+		t.Fatalf("list = %#v", listed)
+	}
+}
+
+// TestRetryBindsOnceAndEnqueuesIngestOnce covers the ordering/idempotency half
+// of R-E4-1: the ingest task is enqueued exactly once per attachment, the
+// retry binds the pre-registered row to the inserted message (no duplicate
+// row), and a repeated post with the same client_message_id neither re-binds
+// nor re-enqueues.
+func TestRetryBindsOnceAndEnqueuesIngestOnce(t *testing.T) {
+	h := newAttachmentHarness(t)
+	h.Upload("spec.docx")
+	if tasks := h.ingestTasks(); len(tasks) != 1 {
+		t.Fatalf("ingest tasks after upload = %d, want 1", len(tasks))
+	}
+
+	h.Ingest("附件正文")
+	message := h.Retry("upload-immediate-2")
+	if message.ID <= 0 || len(h.env.repo.messages[h.conversationID]) != 1 {
+		t.Fatalf("retry message = %#v", message)
+	}
+	rows := h.env.attachments.repo.attachments
+	if len(rows) != 1 {
+		t.Fatalf("attachment rows = %d, want 1", len(rows))
+	}
+	bound := rows[h.attachmentID]
+	if bound.ConversationMessageID == nil || *bound.ConversationMessageID != message.ID {
+		t.Fatalf("bound = %#v (message %d)", bound, message.ID)
+	}
+	if tasks := h.ingestTasks(); len(tasks) != 1 {
+		t.Fatalf("ingest tasks after retry = %d, want 1", len(tasks))
+	}
+
+	read := h.ReadText()
+	if read.Status != version.AttachmentDone || read.Text != "附件正文" {
+		t.Fatalf("read after binding = %#v", read)
+	}
+	listed := h.List()
+	if len(listed) != 1 || listed[0].ConversationMessageID != message.ID {
+		t.Fatalf("list after binding = %#v", listed)
+	}
+
+	// The idempotent client retry returns the stored message without touching
+	// the binding or the ingest queue.
+	again := h.Retry("upload-immediate-2")
+	if again.ID != message.ID {
+		t.Fatalf("idempotent retry message = %d, want %d", again.ID, message.ID)
+	}
+	rows = h.env.attachments.repo.attachments
+	if len(rows) != 1 || rows[h.attachmentID].ConversationMessageID == nil ||
+		*rows[h.attachmentID].ConversationMessageID != message.ID {
+		t.Fatalf("rows after idempotent retry = %#v", rows)
+	}
+	if tasks := h.ingestTasks(); len(tasks) != 1 {
+		t.Fatalf("ingest tasks after idempotent retry = %d, want 1", len(tasks))
 	}
 }
