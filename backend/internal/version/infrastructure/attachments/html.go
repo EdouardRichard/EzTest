@@ -26,7 +26,9 @@ type htmlToken struct {
 
 // extractHTMLResult extracts visible HTML content: heading hierarchy, lists,
 // markdown tables and image alt/src references. Raw tags are never treated as
-// body text, and script/style/head content is excluded (R-A7-3).
+// body text, and script/style/head content is excluded (R-A7-3). HTML images
+// are external URL references, not embedded bytes: each is rendered once as a
+// marker inside its surrounding block and never as a separate image element.
 func extractHTMLResult(data []byte) (versionapp.ExtractionResult, error) {
 	document := strings.TrimPrefix(string(data), "\uFEFF")
 	tokens := tokenizeHTML(document)
@@ -181,15 +183,16 @@ func walkHTML(tokens []htmlToken, builder *resultBuilder) error {
 				} else {
 					marker += "]"
 				}
+				// HTML images are external references (the parser never fetches
+				// URLs), so the marker is the ONE representation: it stays in
+				// its surrounding paragraph/table cell and is deliberately not
+				// emitted as a separate "image" element. Emitting both would
+				// double count one visible item; Coverage.ImagesFound counts
+				// embedded image bytes (OOXML/PDF) only, never HTML refs.
 				if inTable && cellActive {
 					cell.WriteString(marker)
 				} else {
 					block.WriteString(marker)
-				}
-				if err := builder.element(versionapp.ExtractionElement{
-					Kind: "image", Text: marker, Source: src, HeadingPath: renderHeadingPath(headingStack),
-				}); err != nil {
-					return err
 				}
 			}
 		case htmlEndTagToken:

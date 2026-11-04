@@ -29,11 +29,15 @@ func TestWriteCoverageEvidence(t *testing.T) {
 	}{
 		{"docx", "requirements.docx", "", docxFullyFixture()},
 		{"docx-skipped-image", "requirements.docx", "", docxSkippedImageFixture()},
+		{"docx-duplicate-image", "requirements.docx", "", docxDuplicateImageFixture()},
 		{"pptx", "deck.pptx", "", pptxFullyFixture()},
 		{"xlsx", "matrix.xlsx", "", xlsxFullyFixture()},
+		{"xlsx-threaded-comment", "matrix.xlsx", "", xlsxThreadedCommentFixture()},
 		{"html", "requirements.html", "text/html", []byte(htmlFullyFixture)},
 		{"pdf", "report.pdf", "application/pdf", pdfFullyFixture()},
 		{"pdf-skipped-image", "report.pdf", "application/pdf", pdfSkippedImageFixture()},
+		{"pdf-image-only", "scan.pdf", "application/pdf", readPDFFixture(t, "image-only.pdf")},
+		{"pdf-mixed-scan-page", "mixed.pdf", "application/pdf", pdfMixedScanFixture()},
 	}
 	for _, tc := range cases {
 		result, err := extractResult(t, tc.file, tc.mime, tc.data)

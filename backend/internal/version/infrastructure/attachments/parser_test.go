@@ -584,6 +584,101 @@ func TestLimitFailsExplicitly(t *testing.T) {
 	}
 }
 
+// TestDOCXDuplicateImageExtractedOnce covers embedded-image dedupe: two
+// paragraphs referencing the same r:embed relationship describe one document
+// image, so it must be extracted exactly once.
+func TestDOCXDuplicateImageExtractedOnce(t *testing.T) {
+	result, err := extractResult(t, "duplicate.docx", "", docxDuplicateImageFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	for _, want := range []string{"第一处图片引用", "第二处图片引用"} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("missing %q in extracted text: %q", want, result.Text)
+		}
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("duplicate embedded image extracted %d times: %+v", len(result.Images), result.Images)
+	}
+	if result.Coverage.ImagesFound != 1 || result.Coverage.ImagesParsed != 1 {
+		t.Fatalf("image coverage = %+v", result.Coverage)
+	}
+	if coverage := result.Coverage; coverage.Found != coverage.Parsed+coverage.Skipped {
+		t.Fatalf("coverage = %+v", coverage)
+	}
+}
+
+// TestOOXMLImageRelationshipWithoutTargetReported covers R-A7-3a/3b for OOXML:
+// a dangling image relationship (no target) cannot be resolved and must be a
+// reasoned skip instead of a silent drop in DOCX and PPTX.
+func TestOOXMLImageRelationshipWithoutTargetReported(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		mime string
+		data []byte
+	}{
+		{"docx", "dangling.docx", "", docxDanglingImageFixture()},
+		{"pptx", "dangling.pptx", "", pptxDanglingImageFixture()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := extractResult(t, tc.file, tc.mime, tc.data)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if len(result.Images) != 0 {
+				t.Fatalf("unresolvable image extracted: %+v", result.Images)
+			}
+			reported := false
+			for _, skipped := range result.Skipped {
+				reason := strings.ToLower(skipped.Reason)
+				if skipped.Kind == "image" && strings.Contains(reason, "relationship") && strings.Contains(reason, "target") {
+					reported = true
+				}
+			}
+			if !reported {
+				t.Fatalf("dangling image relationship not reported: %+v", result.Skipped)
+			}
+			if result.Coverage.Skipped != 1 {
+				t.Fatalf("coverage = %+v", result.Coverage)
+			}
+			if coverage := result.Coverage; coverage.Found != coverage.Parsed+coverage.Skipped {
+				t.Fatalf("coverage = %+v", coverage)
+			}
+		})
+	}
+}
+
+// TestXLSXThreadedCommentReportedAsSkipped covers R-A7-3a: the legacy comment
+// parser still reads legacy comments, while a threaded comment (a different
+// XML part) must be reported as skipped with a reason, not silently dropped.
+func TestXLSXThreadedCommentReportedAsSkipped(t *testing.T) {
+	result, err := extractResult(t, "threaded.xlsx", "", xlsxThreadedCommentFixture())
+	if err != nil {
+		t.Fatalf("xlsx: %v", err)
+	}
+	if !strings.Contains(result.Text, "传统批注：需要补充边界条件") {
+		t.Fatalf("legacy comment lost: %q", result.Text)
+	}
+	if strings.Contains(result.Text, "线程批注：现代 Excel 讨论串") {
+		t.Fatalf("unparsed threaded comment leaked into text: %q", result.Text)
+	}
+	reported := false
+	for _, skipped := range result.Skipped {
+		if skipped.Kind == "comment" && strings.Contains(skipped.Source, "threadedComment1.xml") &&
+			strings.Contains(strings.ToLower(skipped.Reason), "threaded") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("threaded comment skip missing: %+v", result.Skipped)
+	}
+	if coverage := result.Coverage; coverage.Skipped != 1 || coverage.Found != coverage.Parsed+coverage.Skipped {
+		t.Fatalf("coverage = %+v", coverage)
+	}
+}
+
 // xlsxFixture builds a minimal spreadsheet with two worksheets: shared strings
 // (including a rich-text run), an inline string, numeric, boolean and formula
 // cells on the first sheet, and a numeric cell on the second. Worksheet files

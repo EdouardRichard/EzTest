@@ -674,9 +674,18 @@ func appendWordImages(builder *resultBuilder, archive *zip.Reader, refs []wordIm
 		}
 		target := relations[reference.ID]
 		if target == "" {
+			if err := builder.skip("image", reference.Part+"#"+reference.ID, "image relationship has no target"); err != nil {
+				return err
+			}
 			continue
 		}
 		mediaPath := resolvePartPath(path.Dir(reference.Part), target)
+		// The same media part may be referenced from several paragraphs,
+		// table cells or sections; it is one document image, so extract it
+		// once instead of duplicating the element and the image bytes.
+		if seen[mediaPath] {
+			continue
+		}
 		file, ok := findArchiveEntry(archive, mediaPath)
 		if !ok {
 			if err := builder.skip("image", mediaPath, "referenced image is missing from the package"); err != nil {
@@ -862,6 +871,9 @@ func extractPPTXResult(data []byte) (versionapp.ExtractionResult, error) {
 		for _, id := range part.ImageIDs {
 			target := relations[id]
 			if target == "" {
+				if err := builder.skip("image", slide.file.Name+"#"+id, "image relationship has no target"); err != nil {
+					return versionapp.ExtractionResult{}, err
+				}
 				continue
 			}
 			mediaPath := resolvePartPath(path.Dir(slide.file.Name), target)
@@ -903,6 +915,9 @@ func extractPPTXResult(data []byte) (versionapp.ExtractionResult, error) {
 			for _, id := range notes.ImageIDs {
 				target := notesRelations[id]
 				if target == "" {
+					if err := builder.skip("image", notesPath+"#"+id, "image relationship has no target"); err != nil {
+						return versionapp.ExtractionResult{}, err
+					}
 					continue
 				}
 				mediaPath := resolvePartPath(path.Dir(notesPath), target)
@@ -1165,34 +1180,49 @@ type sheetComment struct {
 	Text   string
 }
 
-// readSheetComments resolves the comments part related to one worksheet (if
-// any) and parses its comments.
-func readSheetComments(archive *zip.Reader, sheetFile string) ([]sheetComment, error) {
+// sheetCommentSkip records a comment part the XLSX parser found but cannot
+// parse (currently threaded comments), so it is reported with a reason instead
+// of silently disappearing from coverage (R-A7-3a).
+type sheetCommentSkip struct {
+	Source string
+	Reason string
+}
+
+// readSheetComments resolves the comment parts related to one worksheet (if
+// any). Legacy comments are parsed; threaded comments are a different XML part
+// that this parser does not decode, so they are returned as reasoned skips.
+func readSheetComments(archive *zip.Reader, sheetFile string) ([]sheetComment, []sheetCommentSkip, error) {
 	relations, err := readRelationships(archive, partRelsPath(sheetFile))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	comments := make([]sheetComment, 0)
+	skips := make([]sheetCommentSkip, 0)
 	for _, target := range sortedRelationshipTargets(relations) {
-		if !strings.Contains(strings.ToLower(target), "comments") {
+		lowered := strings.ToLower(target)
+		commentsPath := resolvePartPath(path.Dir(sheetFile), target)
+		if strings.Contains(lowered, "threadedcomment") {
+			skips = append(skips, sheetCommentSkip{Source: commentsPath, Reason: "threaded comments are not parsed"})
 			continue
 		}
-		commentsPath := resolvePartPath(path.Dir(sheetFile), target)
+		if !strings.Contains(lowered, "comments") {
+			continue
+		}
 		file, ok := findArchiveEntry(archive, commentsPath)
 		if !ok {
 			continue
 		}
 		raw, err := readZipEntry(file)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		parsed, err := parseComments(raw)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		comments = append(comments, parsed...)
 	}
-	return comments, nil
+	return comments, skips, nil
 }
 
 func parseComments(raw []byte) ([]sheetComment, error) {
@@ -1326,7 +1356,7 @@ func extractXLSXResult(data []byte) (versionapp.ExtractionResult, error) {
 				return versionapp.ExtractionResult{}, err
 			}
 		}
-		comments, err := readSheetComments(archive, sheet.File)
+		comments, commentSkips, err := readSheetComments(archive, sheet.File)
 		if err != nil {
 			return versionapp.ExtractionResult{}, err
 		}
@@ -1341,6 +1371,11 @@ func extractXLSXResult(data []byte) (versionapp.ExtractionResult, error) {
 				author = "unknown"
 			}
 			if err := builder.addText("[批注 " + comment.Ref + "] " + author + ": " + comment.Text + "\n"); err != nil {
+				return versionapp.ExtractionResult{}, err
+			}
+		}
+		for _, skip := range commentSkips {
+			if err := builder.skip("comment", skip.Source, skip.Reason); err != nil {
 				return versionapp.ExtractionResult{}, err
 			}
 		}

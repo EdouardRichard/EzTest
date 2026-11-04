@@ -25,18 +25,21 @@ import (
 // context built from the attachment text) can tell where one page ends.
 const PDFPageSeparator = "\n\n=== page break ===\n\n"
 
-// ErrPDFNoTextLayer reports a PDF without any extractable text layer, e.g. a
-// scanned or image-only document. Embedded images are extracted for PDFs that
-// do have a text layer, but a scanned PDF is rejected instead of yielding empty
-// text that looks like a successful extraction; no OCR or page rendering is
-// performed (spec N-7, R-A7-3).
+// ErrPDFNoTextLayer reports a PDF that yields neither an extractable text layer
+// nor a parseable embedded image, e.g. a scanned document whose page images use
+// an unsupported filter. A PDF without text but with parseable embedded images
+// returns those images instead (spec X-1); a page without text inside an
+// otherwise readable document becomes a reasoned skip. No OCR or page rendering
+// is performed (spec N-7, R-A7-3).
 var ErrPDFNoTextLayer = errors.New("pdf has no text layer")
 
 // extractPDFResult extracts positioned text from at most MaxPDFPages pages plus
 // every parseable embedded image XObject. Text runs are decoded through each
 // font's ToUnicode CMap, which covers the Type0/Identity-H CID fonts Chinese
 // documents use. Images whose filter/color space cannot be decoded are reported
-// as skipped with a reason; page rendering and OCR are never performed.
+// as skipped with a reason, as are pages without a text layer; page rendering
+// and OCR are never performed. An image-only PDF (no text but parseable images)
+// is a successful extraction whose text is empty (spec X-1).
 func extractPDFResult(data []byte) (result versionapp.ExtractionResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -60,6 +63,7 @@ func extractPDFResult(data []byte) (result versionapp.ExtractionResult, err erro
 		text   string
 	}
 	extracted := make([]pageText, 0, pages)
+	pageHasText := make([]bool, pages)
 	for pageNumber := 1; pageNumber <= pages; pageNumber++ {
 		page := reader.Page(pageNumber)
 		if page.V.IsNull() {
@@ -76,8 +80,16 @@ func extractPDFResult(data []byte) (result versionapp.ExtractionResult, err erro
 			continue
 		}
 		extracted = append(extracted, pageText{number: pageNumber, text: text})
+		pageHasText[pageNumber-1] = true
 	}
-	if len(extracted) == 0 {
+	// Embedded images are scanned even when no page has a text layer: an
+	// image-only PDF must still surface its images for the vision chain
+	// instead of being rejected as if it had no content (spec X-1).
+	images, skipped, scanErr := scanPDFImages(data)
+	if scanErr != nil {
+		return versionapp.ExtractionResult{}, scanErr
+	}
+	if len(extracted) == 0 && len(images) == 0 {
 		return versionapp.ExtractionResult{}, fmt.Errorf("%w: scanned or image-only PDFs are not supported", ErrPDFNoTextLayer)
 	}
 	builder := newResultBuilder()
@@ -96,9 +108,15 @@ func extractPDFResult(data []byte) (result versionapp.ExtractionResult, err erro
 			return versionapp.ExtractionResult{}, err
 		}
 	}
-	images, skipped, scanErr := scanPDFImages(data)
-	if scanErr != nil {
-		return versionapp.ExtractionResult{}, scanErr
+	// A page whose text layer is empty (a scanned page) must stay visible in
+	// the coverage report instead of silently disappearing (R-A7-3/3b).
+	for pageNumber := 1; pageNumber <= pages; pageNumber++ {
+		if pageHasText[pageNumber-1] {
+			continue
+		}
+		if err := builder.skip("page", fmt.Sprintf("pdf:page:%d", pageNumber), "page has no extractable text layer"); err != nil {
+			return versionapp.ExtractionResult{}, err
+		}
 	}
 	for _, image := range images {
 		if err := builder.image(image); err != nil {
@@ -160,6 +178,7 @@ func scanPDFImages(data []byte) ([]versionapp.ExtractionImage, []pdfSkip, error)
 	}
 	images := make([]versionapp.ExtractionImage, 0)
 	skipped := make([]pdfSkip, 0)
+	imageObjects := 0
 	for _, match := range matches {
 		number := string(data[match[2]:match[3]])
 		objectStart := match[1]
@@ -176,18 +195,24 @@ func scanPDFImages(data []byte) ([]versionapp.ExtractionImage, []pdfSkip, error)
 		if !pdfImageSubtype.Match(dict) {
 			continue
 		}
+		imageObjects++
+		if imageObjects > MaxPDFImageObjects {
+			return nil, nil, fmt.Errorf("%w: PDF has more than %d image objects", ErrTooLarge, MaxPDFImageObjects)
+		}
 		source := "pdf:object:" + number
 		object, err := parsePDFImageObject(number, dict, segment[streamIndex:])
 		if err != nil {
-			var tooLarge *limitError
-			if errors.As(err, &tooLarge) {
-				return nil, nil, fmt.Errorf("%w: %s", ErrTooLarge, tooLarge.reason)
-			}
 			skipped = append(skipped, pdfSkip{source: source, reason: err.Error()})
 			continue
 		}
 		image, err := decodePDFImageObject(object)
 		if err != nil {
+			// A decompressed-image limit hit is a hard failure: returning it
+			// as a skip would mark a partial extraction as done (R-A7-3a).
+			var tooLarge *limitError
+			if errors.As(err, &tooLarge) {
+				return nil, nil, fmt.Errorf("%w: %s", ErrTooLarge, tooLarge.reason)
+			}
 			skipped = append(skipped, pdfSkip{source: source, reason: err.Error()})
 			continue
 		}

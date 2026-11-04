@@ -470,6 +470,67 @@ func TestExtractReturnsCoverageAndImages(t *testing.T) {
 	}
 }
 
+// TestExtractImageOnlyDocumentReturnsImages covers spec X-1: a document with
+// no text layer but with embedded images (a scanned/image-only PDF) must not
+// be failed as "no text could be extracted". Its images are the extraction
+// output and flow to the vision chain; only a text-less document without any
+// image is a failure.
+func TestExtractImageOnlyDocumentReturnsImages(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.extractor.text = "" // the parser produced no text at all
+	view := registerAttachment(t, env, strings.Repeat("b", 64), "scan.pdf", "application/pdf", []byte("%PDF-1.7"))
+	env.extractor.result = versionapp.ExtractionResult{
+		Images: []versionapp.ExtractionImage{
+			{Seq: 1, Name: "pdf-image-6.png", Source: "pdf:object:6", MIME: "image/png", Width: 240, Height: 120, Data: []byte("png-bytes")},
+		},
+		Skipped: []versionapp.SkippedElement{
+			{Kind: "page", Source: "pdf:page:1", Reason: "page has no extractable text layer"},
+		},
+		Coverage: versionapp.ExtractionCoverage{
+			Found: 2, Parsed: 1, Skipped: 1, ImagesFound: 1, ImagesParsed: 1,
+			SkipReasons: []string{"page has no extractable text layer"},
+		},
+	}
+
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.Attachment.ExtractionStatus != version.AttachmentDone || result.ErrorCode != "" {
+		t.Fatalf("image-only document failed: %#v", result)
+	}
+	if len(result.Images) != 1 || string(result.Images[0].Data) != "png-bytes" || result.Images[0].MIME != "image/png" {
+		t.Fatalf("images = %+v", result.Images)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Source != "pdf:page:1" {
+		t.Fatalf("skips = %+v", result.Skipped)
+	}
+	stored := env.repo.attachments[view.ID]
+	if stored.ExtractionStatus != version.AttachmentDone || stored.ExtractionErrorCode != "" {
+		t.Fatalf("stored = %#v", stored)
+	}
+}
+
+// TestExtractEmptyTextWithoutImagesStillFails pins the other half of the X-1
+// contract: an empty extraction with no image at all remains a failure.
+func TestExtractEmptyTextWithoutImagesStillFails(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.extractor.text = ""
+	view := registerAttachment(t, env, strings.Repeat("c", 64), "empty.docx", "application/octet-stream", []byte("docx"))
+
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.ErrorCode != version.AttachmentErrorExtraction {
+		t.Fatalf("error code = %q, want %q", result.ErrorCode, version.AttachmentErrorExtraction)
+	}
+	stored := env.repo.attachments[view.ID]
+	if stored.ExtractionStatus != version.AttachmentFailed || !strings.Contains(stored.ExtractionErrorText, "no text") {
+		t.Fatalf("stored = %#v", stored)
+	}
+}
+
 func TestExtractIsIdempotentForCompletedAndFailedAttachments(t *testing.T) {
 	env := newAttachmentEnv(t)
 	view := registerAttachment(t, env, strings.Repeat("a", 64), "spec.md", "text/markdown", []byte("# Spec"))

@@ -8,6 +8,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // docxFixture builds a minimal OOXML wordprocessing document. Paragraphs are
@@ -403,6 +405,118 @@ func deflateBytes(data []byte) []byte {
 		panic(err)
 	}
 	return buffer.Bytes()
+}
+
+// docxDuplicateImageFixture references the same media part twice (two
+// paragraphs share one r:embed id). The image is one document element, so it
+// must be extracted exactly once.
+func docxDuplicateImageFixture() []byte {
+	document := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="` + wordNamespace + `" xmlns:r="` + officeRelNamespace + `" xmlns:a="` + drawingNamespace + `">
+<w:body>
+<w:p><w:r><w:t>第一处图片引用</w:t></w:r><w:r><w:drawing><a:blip r:embed="rId40"/></w:drawing></w:r></w:p>
+<w:p><w:r><w:t>第二处图片引用</w:t></w:r><w:r><w:drawing><a:blip r:embed="rId40"/></w:drawing></w:r></w:p>
+</w:body></w:document>`
+	return zipFixture(map[string]string{
+		"word/document.xml":     document,
+		"word/media/image1.png": string(fixturePNG(6, 4)),
+		"word/_rels/document.xml.rels": relationshipsXML(
+			`<Relationship Id="rId40" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>`),
+	})
+}
+
+// docxDanglingImageFixture references an image through a relationship whose
+// Target is empty, so the image cannot be resolved and must be reported as a
+// skip with a reason instead of being silently dropped.
+func docxDanglingImageFixture() []byte {
+	document := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="` + wordNamespace + `" xmlns:r="` + officeRelNamespace + `" xmlns:a="` + drawingNamespace + `">
+<w:body>
+<w:p><w:r><w:t>正文保留</w:t></w:r><w:r><w:drawing><a:blip r:embed="rId99"/></w:drawing></w:r></w:p>
+</w:body></w:document>`
+	return zipFixture(map[string]string{
+		"word/document.xml": document,
+		"word/_rels/document.xml.rels": relationshipsXML(
+			`<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target=""/>`),
+	})
+}
+
+// pptxDanglingImageFixture is the presentation equivalent: the slide points at
+// a relationship without a target, which must surface as a reasoned skip.
+func pptxDanglingImageFixture() []byte {
+	slide := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="` + presentationNS + `" xmlns:a="` + drawingNamespace + `" xmlns:r="` + officeRelNamespace + `"><p:cSld><p:spTree>
+<p:sp><p:txBody><a:p><a:r><a:t>幻灯片正文</a:t></a:r></a:p></p:txBody></p:sp>
+<p:pic><p:blipFill><a:blip r:embed="rId9"/></p:blipFill></p:pic>
+</p:spTree></p:cSld></p:sld>`
+	return zipFixture(map[string]string{
+		"ppt/slides/slide1.xml": slide,
+		"ppt/slides/_rels/slide1.xml.rels": relationshipsXML(
+			`<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target=""/>`),
+	})
+}
+
+// xlsxThreadedCommentFixture has both a legacy comment (parsed) and a threaded
+// comment (not parsed by the legacy comment parser). The threaded part must be
+// reported as a skip with a reason instead of vanishing silently.
+func xlsxThreadedCommentFixture() []byte {
+	const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="` + spreadsheetNamespace + `"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>线程批注表</t></is></c></row>
+</sheetData></worksheet>`
+	sheetRels := relationshipsXML(
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/>` +
+			`<Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/>`)
+	const comments = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<comments xmlns="` + spreadsheetNamespace + `"><authors><author>王五</author></authors><commentList>
+<comment ref="A1" authorId="0"><text><r><t>传统批注：需要补充边界条件</t></r></text></comment>
+</commentList></comments>`
+	const threaded = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+<threadedComment ref="A1" id="{11111111-1111-1111-1111-111111111111}" personId="{22222222-2222-2222-2222-222222222222}">
+<text>线程批注：现代 Excel 讨论串</text>
+</threadedComment></ThreadedComments>`
+	return zipFixture(map[string]string{
+		"xl/worksheets/sheet1.xml":                 sheet,
+		"xl/worksheets/_rels/sheet1.xml.rels":      sheetRels,
+		"xl/comments1.xml":                         comments,
+		"xl/threadedComments/threadedComment1.xml": threaded,
+	})
+}
+
+// pdfMixedScanFixture has a text page followed by a page without a text layer
+// (a scanned page), so the second page must be reported as skipped.
+func pdfMixedScanFixture() []byte {
+	return pdfFixture([]string{"Mixed PDF first page text", ""})
+}
+
+// pdfOversizedImageFixture embeds a FlateDecode image whose decoded payload is
+// larger than the decompressed-entry limit. The compressed object itself is
+// small, so this cannot be caught by the upload limit.
+func pdfOversizedImageFixture() []byte {
+	payload := make([]byte, int(version.MaxOOXMLBytes)+1)
+	return pdfWithImageObject("FlateDecode", deflateBytes(payload), "/ColorSpace /DeviceRGB")
+}
+
+// pdfManyImagesFixture embeds count image XObjects on one text page so the
+// MaxPDFImageObjects scan limit can be exercised.
+func pdfManyImagesFixture(count int) []byte {
+	content := "BT /F1 12 Tf 72 720 Td (many image objects) Tj ET"
+	objects := []string{
+		`<< /Type /Catalog /Pages 2 0 R >>`,
+		`<< /Type /Pages /Kids [3 0 R] /Count 1 >>`,
+		`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`,
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content),
+		fmt.Sprintf(`<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [%s] >>`, helveticaWidths()),
+	}
+	for index := 0; index < count; index++ {
+		stream := "JPX!"
+		objects = append(objects, fmt.Sprintf(`<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /JPXDecode /Length %d >>
+stream
+%s
+endstream`, len(stream), stream))
+	}
+	return assembledPDF(objects)
 }
 
 // helveticaWidths is a synthetic but usable /Widths table for codes 32..126.

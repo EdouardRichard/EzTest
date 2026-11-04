@@ -860,7 +860,10 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	if extractErr == nil && int64(len(text)) > version.MaxExtractedTextBytes {
 		extractErr = version.ErrAttachmentTooLarge
 	}
-	if extractErr == nil && strings.TrimSpace(text) == "" {
+	// Empty text is only a failure when the document yielded no images either.
+	// A scanned/image-only PDF legitimately has no text layer; its embedded
+	// images are the extraction output and feed the vision chain (spec X-1).
+	if extractErr == nil && strings.TrimSpace(text) == "" && len(parsed.Images) == 0 {
 		extractErr = fmt.Errorf("%w: no text could be extracted", version.ErrAttachmentCorrupt)
 	}
 	if extractErr != nil {

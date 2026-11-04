@@ -45,8 +45,35 @@ func TestHTMLFullyExtracts(t *testing.T) {
 	if !findElement(result.Elements, "list_item", "手机号") || !findElement(result.Elements, "table_row", "表格单元格") {
 		t.Fatalf("list/table elements missing: %+v", result.Elements)
 	}
-	if !findElement(result.Elements, "image", "/assets/login.png") {
-		t.Fatalf("image reference missing: %+v", result.Elements)
+	// An <img> is an external reference, not an embedded image: it is rendered
+	// once, as a marker inside its surrounding paragraph. It must not also be
+	// emitted as a separate "image" element (that would double count the same
+	// visible item). Coverage.ImagesFound counts embedded image bytes only, so
+	// HTML references never inflate it.
+	if strings.Count(result.Text, "登录流程图") != 1 || strings.Count(result.Text, "/assets/login.png") != 1 {
+		t.Fatalf("HTML image reference rendered more than once:\n%s", result.Text)
+	}
+	counts := map[string]int{}
+	for _, element := range result.Elements {
+		counts[element.Kind]++
+	}
+	wantCounts := map[string]int{"heading": 2, "paragraph": 2, "list_item": 2, "table_row": 2}
+	if len(result.Elements) != 8 {
+		t.Fatalf("HTML element count = %d, want 8: %+v", len(result.Elements), result.Elements)
+	}
+	for kind, want := range wantCounts {
+		if counts[kind] != want {
+			t.Fatalf("element kind %q count = %d, want %d: %+v", kind, counts[kind], want, result.Elements)
+		}
+	}
+	if counts["image"] != 0 {
+		t.Fatalf("HTML image double counted as a separate element: %+v", result.Elements)
+	}
+	if result.Coverage.ImagesFound != 0 || result.Coverage.ImagesParsed != 0 {
+		t.Fatalf("HTML image references counted as embedded images: %+v", result.Coverage)
+	}
+	if _, ok := result.Coverage.ElementCounts["image"]; ok {
+		t.Fatalf("HTML element counts include an image element: %+v", result.Coverage.ElementCounts)
 	}
 	if result.Coverage.Skipped != 0 || result.Coverage.Found != result.Coverage.Parsed {
 		t.Fatalf("coverage = %+v skipped=%+v", result.Coverage, result.Skipped)
