@@ -54,3 +54,7 @@ version_0009_requirement_source_key.sql
 llm_0004_v022_model_param_sources.sql
 agent_0008_v022_writer_runtime.sql
 version_0010_v022_binding_handoff.sql
+version_0011_v022_attachment_observation.sql
+execution_0006_v022_wave_observation.sql
+execution_0007_v022_human_request_question.sql
+design_0002_v022_case_auto_confirm.sql

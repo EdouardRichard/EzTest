@@ -87,9 +87,10 @@ func TestMigrations021Schema(t *testing.T) {
 		{"knowledge_item", "bindings", "jsonb", "jsonb", "NO", "NEVER", "'{}'::jsonb"},
 		{"knowledge_item", "last_verified_at", "timestamp with time zone", "timestamptz", "YES", "NEVER", ""},
 		{"knowledge_item", "status", "text", "text", "NO", "NEVER", "'draft'::text"},
-		// attachment: parser routing and structured parse errors.
+		// attachment: parser routing and structured parse errors. parse_status was
+		// dropped in v0.22 (DB-18); extraction_report replaces it and
+		// TestV022EEXSchema pins its absence.
 		{"requirement_attachment", "kind", "text", "text", "NO", "NEVER", "'document'::text"},
-		{"requirement_attachment", "parse_status", "text", "text", "NO", "NEVER", "'pending'::text"},
 		{"requirement_attachment", "parse_error", "text", "text", "YES", "NEVER", ""},
 		{"requirement_attachment", "page_refs", "jsonb", "jsonb", "NO", "NEVER", "'[]'::jsonb"},
 		// conversation: per-conversation model override (spec §12.2).
@@ -123,8 +124,8 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
-	if len(applied) != 54 {
-		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
+	if len(applied) != 58 {
+		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {

@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 54 {
-		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
+	if len(applied) != 58 {
+		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -47,9 +47,11 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"requirement", "requirement_version", "requirement_confirmation", "requirement_relation",
 		"requirement_extraction_run", "requirement_extraction_segment",
 		"conversation", "conversation_message", "conversation_summary", "requirement_attachment",
+		"attachment_image",
 		"case_scenario", "case_entity", "case_version", "case_step", "case_assertion",
 		"case_source", "case_confirmation", "design_round", "design_scope", "export_artifact",
 		"execution_intent", "run_wave", "case_run", "case_run_sut_context",
+		"execution_discovery_observation",
 		"step_result", "assertion_result", "evidence", "evidence_ref",
 		"executor_instance", "human_request",
 		"delivery_issue", "delivery_issue_ref", "delivery_issue_status_history",
@@ -181,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 54 {
-		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
+	if len(applied) != 58 {
+		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -322,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 54 {
-		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
+	if len(applied) != 58 {
+		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1069,8 +1071,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 54 {
-		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
+	if len(applied) != 58 {
+		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1335,6 +1337,177 @@ func TestV022CSchema(t *testing.T) {
 	}
 }
 
+// TestV022EEXSchema pins the E/EX v0.22 schema: document-image extraction rows
+// and the extraction coverage report, the frozen wave scope snapshot,
+// execution-time discovery observations, structured human questions and the
+// discovery-delta case auto-confirmation audit trail.
+// See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-16..DB-19,
+// DB-29, DB-30; docs/version-V0.22/E-tools-attachments.md §2.3;
+// docs/version-V0.22/B-clarification-messaging.md §6.1 and
+// docs/version-V0.22/A-model-token-budget.md §7.3.
+func TestV022EEXSchema(t *testing.T) {
+	pool := integrationDB(t)
+	ctx := context.Background()
+
+	requireTable(t, pool, "attachment_image")
+	requireTable(t, pool, "execution_discovery_observation")
+	requireColumn(t, pool, "requirement_attachment", "extraction_report")
+	requireNoColumn(t, pool, "requirement_attachment", "parse_status")
+	requireColumn(t, pool, "run_wave", "scope_snapshot")
+	requireColumn(t, pool, "human_request", "question")
+	requireColumn(t, pool, "case_version", "source_observation_id")
+	requireColumn(t, pool, "case_confirmation", "auto_confirmed_by")
+	requireUnique(t, pool, "uk_execution_discovery_observation")
+
+	// DB-17: one row per image extracted from a document attachment. Image
+	// statuses are independent from the attachment extraction status and
+	// (attachment_id, seq) is the natural key.
+	for _, column := range []string{
+		"id", "attachment_id", "seq", "content_ref_id", "mime", "width", "height",
+		"source_kind", "status", "caption", "error", "created_at", "updated_at",
+	} {
+		requireColumn(t, pool, "attachment_image", column)
+	}
+	requirePKConstraint(t, pool, "pk_attachment_image")
+	requireUnique(t, pool, "uk_attachment_image_attachment_seq")
+	requireIndex(t, pool, "idx_attachment_image_attachment_status")
+
+	// Image rows default to extracted, require seq > 0 and keep the
+	// (attachment_id, seq) identity unique.
+	var imageStatus string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq) VALUES (9201, 9200, 1)
+		RETURNING status
+	`).Scan(&imageStatus); err != nil {
+		t.Fatalf("insert attachment image: %v", err)
+	}
+	if imageStatus != "extracted" {
+		t.Errorf("attachment_image.status default = %q, want extracted", imageStatus)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq) VALUES (9202, 9200, 1)
+	`); err == nil {
+		t.Error("duplicate attachment_image (attachment_id, seq) accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq) VALUES (9203, 9200, 0)
+	`); err == nil {
+		t.Error("attachment_image seq = 0 accepted")
+	}
+
+	// DB-16: the structured question state machine. The 0.21 open/resolved
+	// statuses are gone and new rows default to pending.
+	for _, column := range []string{"conversation_id", "message_id"} {
+		requireColumn(t, pool, "human_request", column)
+	}
+	requireIndex(t, pool, "idx_human_request_conversation")
+	var humanStatus string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO human_request (id, version_id, kind, expires_at)
+		VALUES (9301, 9300, 'approval', now() + interval '1 hour')
+		RETURNING status
+	`).Scan(&humanStatus); err != nil {
+		t.Fatalf("insert human request: %v", err)
+	}
+	if humanStatus != "pending" {
+		t.Errorf("human_request.status default = %q, want pending", humanStatus)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'open' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request still accepts legacy status 'open'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'resolved' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request still accepts legacy status 'resolved'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET kind = 'clarification_question' WHERE id = 9301
+	`); err != nil {
+		t.Errorf("human_request rejects v0.22 kind clarification_question: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET kind = 'escalation' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request accepts unknown kind 'escalation'")
+	}
+
+	// DB-29: executions keep only normalized resource templates. The unique key
+	// is the observation identity; sensitive request payload columns must not
+	// exist (N-16/T8).
+	for _, column := range []string{
+		"id", "version_id", "wave_id", "case_run_id", "version_sut_id",
+		"environment_id", "kind", "method", "host", "resource_template",
+		"status_code", "mime", "source_kind", "fingerprint", "occurrences",
+		"first_seen_at", "last_seen_at", "decision", "resource_id", "fact_id",
+		"created_at", "updated_at",
+	} {
+		requireColumn(t, pool, "execution_discovery_observation", column)
+	}
+	for _, column := range []string{
+		"query", "query_values", "query_string", "headers", "header",
+		"cookie", "cookies", "body", "request_body", "response_body", "raw",
+	} {
+		requireNoColumn(t, pool, "execution_discovery_observation", column)
+	}
+	requirePKConstraint(t, pool, "pk_execution_discovery_observation")
+	for _, index := range []string{
+		"idx_execution_discovery_observation_version_decision",
+		"idx_execution_discovery_observation_wave",
+		"idx_execution_discovery_observation_resource",
+	} {
+		requireIndex(t, pool, index)
+	}
+	var uniqueDef string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid)
+		FROM pg_constraint
+		WHERE conname = 'uk_execution_discovery_observation'
+		  AND connamespace = current_schema()::regnamespace
+	`).Scan(&uniqueDef); err != nil {
+		t.Fatalf("read uk_execution_discovery_observation: %v", err)
+	}
+	wantUniqueDef := "UNIQUE (version_id, version_sut_id, kind, method, resource_template)"
+	if uniqueDef != wantUniqueDef {
+		t.Errorf("uk_execution_discovery_observation = %q, want %q", uniqueDef, wantUniqueDef)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9401, 9400, 9410, 'page', '/orders/42')
+	`); err != nil {
+		t.Fatalf("insert discovery observation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9402, 9400, 9410, 'page', '/orders/42')
+	`); err == nil {
+		t.Error("duplicate execution_discovery_observation identity accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9403, 9400, 9410, 'api', '/orders/42')
+	`); err != nil {
+		t.Errorf("distinct discovery observation kind rejected: %v", err)
+	}
+
+	// DB-30: discovery-delta case versions and the auto-confirmation audit.
+	for _, column := range []string{
+		"trigger", "source_observation_id", "auto_confirmed_by", "rollback_of",
+	} {
+		requireColumn(t, pool, "case_version", column)
+	}
+	requireIndex(t, pool, "idx_case_version_source_observation")
+	for _, column := range []string{
+		"auto_confirmed", "auto_confirmed_by", "trigger", "source_observation_id",
+	} {
+		requireColumn(t, pool, "case_confirmation", column)
+	}
+}
+
 // integrationDB returns a fresh, fully migrated test schema.
 func integrationDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
@@ -1400,6 +1573,27 @@ func requireIndex(t *testing.T, pool *pgxpool.Pool, index string) {
 	}
 	if !exists {
 		t.Errorf("missing index %s", index)
+	}
+}
+
+// requireUnique asserts a UNIQUE constraint (contype 'u') with exactly this
+// name exists in the test schema, pinning the D34 uk_<table>_<columns> naming.
+func requireUnique(t *testing.T, pool *pgxpool.Pool, constraint string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = $1
+			  AND contype = 'u'
+			  AND connamespace = current_schema()::regnamespace
+		)
+	`, constraint).Scan(&exists); err != nil {
+		t.Errorf("check unique constraint %s: %v", constraint, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing unique constraint %s", constraint)
 	}
 }
 
