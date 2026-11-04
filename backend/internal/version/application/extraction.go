@@ -808,3 +808,146 @@ func appendUniqueSegmentStrings(values []string, additions ...string) []string {
 	}
 	return values
 }
+
+// ---------- v0.22 A-7 reconciliation (R-A7-8, docs A §7.7) ----------
+
+// DefaultLowConfidenceThreshold is the UI "低置信待复核" cutoff: extracted
+// requirements below this confidence are counted in the report and need review.
+const DefaultLowConfidenceThreshold = 0.6
+
+// ReconciliationInput carries the extracted side of the reconciliation. The
+// declared side is parsed from the document text itself.
+type ReconciliationInput struct {
+	// ExtractedIDs are the external ids actually persisted for the run.
+	ExtractedIDs []string
+	// LowConfidence is the number of persisted requirements below
+	// DefaultLowConfidenceThreshold (supplied by the requirement query).
+	LowConfidence int
+	// SkippedImages is the parser coverage count of human-visible images that
+	// were not analyzed (A §7.9: v0.22 keeps the reference and marks skipped).
+	SkippedImages int
+}
+
+// ReconciliationReport is the R-A7-8 audit report. Expected/extracted are
+// persisted on requirement_extraction_run; MissingIDs/LowConfidence/
+// SkippedImages are exposed to the progress UI. CurrentIDs and PlannedIDs keep
+// the V1 current requirements separate from V2 planned ones (live documents mix
+// 58 current + 32 planned ids, so summing them would over-count).
+type ReconciliationReport struct {
+	Expected      int      `json:"expected"`
+	Extracted     int      `json:"extracted"`
+	Missing       int      `json:"missing"`
+	MissingIDs    []string `json:"missing_ids"`
+	LowConfidence int      `json:"low_confidence"`
+	SkippedImages int      `json:"skipped_images"`
+	CurrentIDs    []string `json:"current_ids"`
+	PlannedIDs    []string `json:"planned_ids"`
+}
+
+var (
+	// extractionFRIDPattern is the declared-requirement id syntax (R-A7-8).
+	extractionFRIDPattern = regexp.MustCompile(`FR-\d{3,}`)
+	// extractionFRHeadingPattern finds the heading sections that must be
+	// scanned a second time ("功能需求" / FR 清单).
+	extractionFRHeadingPattern = regexp.MustCompile(`(?i)功能需求|\bfr\b`)
+	// extractionPlannedHeadingPattern marks a V2 / planned region.
+	extractionPlannedHeadingPattern = regexp.MustCompile(`(?i)v2|规划|后续|未来|planned`)
+	// extractionCurrentHeadingPattern marks a V1 / current region.
+	extractionCurrentHeadingPattern = regexp.MustCompile(`(?i)v1|当前|本期|current`)
+)
+
+// ReconcileDocument counts the FR ids declared by a requirements document and
+// compares them with the ids the run actually extracted.
+//
+// The first pass applies FR-\d{3,} to the whole document (deduplicated in
+// appearance order). The heading second pass re-scans every Markdown heading
+// whose text contains "功能需求"/"FR" plus its following lines, so ids that only
+// occur in a functional-requirements section are never lost. Headings marking
+// V2/规划 split the declared ids into PlannedIDs; V1/当前 sections fill
+// CurrentIDs. The report never invents an id and never rewrites extracted ids:
+// missing_ids is the set difference, in document order.
+func ReconcileDocument(documentText string, input ReconciliationInput) ReconciliationReport {
+	report := ReconciliationReport{
+		LowConfidence: input.LowConfidence,
+		SkippedImages: input.SkippedImages,
+		MissingIDs:    []string{},
+		CurrentIDs:    []string{},
+		PlannedIDs:    []string{},
+	}
+	lines := strings.Split(strings.ReplaceAll(documentText, "\r\n", "\n"), "\n")
+	headings := make([]bool, len(lines))
+	headingTexts := make([]string, len(lines))
+	for index, line := range lines {
+		if heading, ok := markdownHeadingText(strings.TrimSpace(line)); ok {
+			headings[index] = true
+			headingTexts[index] = heading
+		}
+	}
+
+	declared := make([]string, 0)
+	seen := make(map[string]struct{})
+	planned := make(map[string]bool)
+	regionPlanned := false
+	add := func(id string) {
+		if _, duplicate := seen[id]; duplicate {
+			return
+		}
+		seen[id] = struct{}{}
+		declared = append(declared, id)
+		planned[id] = regionPlanned
+	}
+
+	// First pass: every declared id in document order, tagged with the V1/V2
+	// region of its first occurrence.
+	for index, line := range lines {
+		if headings[index] {
+			switch {
+			case extractionPlannedHeadingPattern.MatchString(headingTexts[index]):
+				regionPlanned = true
+			case extractionCurrentHeadingPattern.MatchString(headingTexts[index]):
+				regionPlanned = false
+			}
+		}
+		for _, id := range extractionFRIDPattern.FindAllString(line, -1) {
+			add(id)
+		}
+	}
+
+	// Second pass: functional-requirements / FR headings and their sections.
+	for index := 0; index < len(lines); index++ {
+		if !headings[index] || !extractionFRHeadingPattern.MatchString(headingTexts[index]) {
+			continue
+		}
+		for section := index; section < len(lines); section++ {
+			if section > index && headings[section] {
+				break
+			}
+			for _, id := range extractionFRIDPattern.FindAllString(lines[section], -1) {
+				add(id)
+			}
+		}
+	}
+
+	extracted := make(map[string]struct{}, len(input.ExtractedIDs))
+	for _, id := range input.ExtractedIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		extracted[trimmed] = struct{}{}
+	}
+	report.Expected = len(declared)
+	report.Extracted = len(extracted)
+	for _, id := range declared {
+		if planned[id] {
+			report.PlannedIDs = append(report.PlannedIDs, id)
+		} else {
+			report.CurrentIDs = append(report.CurrentIDs, id)
+		}
+		if _, ok := extracted[id]; !ok {
+			report.MissingIDs = append(report.MissingIDs, id)
+		}
+	}
+	report.Missing = len(report.MissingIDs)
+	return report
+}
