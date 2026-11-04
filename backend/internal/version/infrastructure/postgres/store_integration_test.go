@@ -185,7 +185,8 @@ func countFacts(t *testing.T, pool *pgxpool.Pool, versionID int64) int {
 
 // TestPlanRepositoryUpsertListAndDependencies pins the plan store contract:
 // create/update with a changed flag, (sort_order, id) listing, status filter,
-// dependency existence and append-style no-op updates.
+// dependency existence, append-style no-op updates and the revision column
+// seeded at 1 and bumped by plain updates.
 func TestPlanRepositoryUpsertListAndDependencies(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
@@ -204,6 +205,9 @@ func TestPlanRepositoryUpsertListAndDependencies(t *testing.T) {
 	if !changed || first.Status != version.PlanItemStatusPending {
 		t.Fatalf("created plan item = %#v changed=%v", first, changed)
 	}
+	if first.Revision != 1 {
+		t.Fatalf("created revision = %d, want 1", first.Revision)
+	}
 
 	if _, changed, err := repo.Upsert(ctx, first); err != nil || changed {
 		t.Fatalf("unchanged Upsert = changed %v, err %v; want no change", changed, err)
@@ -216,6 +220,9 @@ func TestPlanRepositoryUpsertListAndDependencies(t *testing.T) {
 	}
 	if !changed || updated.Status != "done" {
 		t.Fatalf("status update = %#v changed=%v", updated, changed)
+	}
+	if updated.Revision != 2 {
+		t.Fatalf("status update revision = %d, want 2 (plain Upsert bumps too)", updated.Revision)
 	}
 
 	dependent, changed, err := repo.Upsert(ctx, version.PlanItem{
@@ -235,6 +242,9 @@ func TestPlanRepositoryUpsertListAndDependencies(t *testing.T) {
 	}
 	if len(items) != 2 || items[0].ID != dependent.ID || items[1].ID != first.ID {
 		t.Fatalf("items = %#v, want (sort_order, id) order", items)
+	}
+	if items[0].Revision != 1 || items[1].Revision != 2 {
+		t.Fatalf("listed revisions = %d/%d, want 1/2", items[0].Revision, items[1].Revision)
 	}
 	done, err := repo.List(ctx, versionID, "done")
 	if err != nil {
@@ -268,5 +278,94 @@ func TestPlanRepositoryUpsertListAndDependencies(t *testing.T) {
 		Status: version.PlanItemStatusPending,
 	}); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("missing version = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPlanRepositoryUpdateOptimisticLock pins the SQL half of R-A8-2: Update
+// writes only when id/version_id match and the stored revision equals the
+// caller's expected revision, bumps revision by one on a real change, reports a
+// no-op patch as unchanged, and returns a typed conflict carrying the current
+// revision when the caller is stale.
+func TestPlanRepositoryUpdateOptimisticLock(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	repo := versionpg.NewPlanRepository(pool)
+	ctx := context.Background()
+
+	itemID := ids.Next()
+	created, changed, err := repo.Upsert(ctx, version.PlanItem{
+		ID: itemID, VersionID: versionID, Phase: "execute", Title: "run cases",
+		Status: version.PlanItemStatusPending, Order: 1,
+	})
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if !changed || created.Revision != 1 {
+		t.Fatalf("created = %+v changed=%v, want revision 1", created, changed)
+	}
+
+	order := 4
+	updated, changed, err := repo.Update(ctx, versionID, itemID, version.PlanPatch{
+		Status: "done", Decision: "ok", Order: &order,
+	}, 1)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !changed {
+		t.Fatal("Update reported no change for a real write")
+	}
+	if updated.Status != "done" || updated.Decision != "ok" || updated.Order != 4 || updated.Revision != 2 {
+		t.Fatalf("updated = %+v, want status=done decision=ok order=4 revision=2", updated)
+	}
+
+	// Empty patch fields keep the stored values and a no-op patch must not bump
+	// the revision again.
+	noop, changed, err := repo.Update(ctx, versionID, itemID, version.PlanPatch{Title: "", Status: ""}, 2)
+	if err != nil {
+		t.Fatalf("no-op Update: %v", err)
+	}
+	if changed {
+		t.Fatalf("no-op Update changed = true, want false: %+v", noop)
+	}
+	if noop.Status != "done" || noop.Decision != "ok" || noop.Title != "run cases" || noop.Revision != 2 {
+		t.Fatalf("no-op Update = %+v, want stored row with revision 2", noop)
+	}
+
+	// A stale expected revision is a typed conflict that reports the stored
+	// revision; nothing is written.
+	_, changed, err = repo.Update(ctx, versionID, itemID, version.PlanPatch{Status: "pending"}, 1)
+	if changed || !errors.Is(err, version.ErrPlanRevisionConflict) {
+		t.Fatalf("stale Update changed=%v err=%v, want ErrPlanRevisionConflict", changed, err)
+	}
+	var conflict *version.PlanRevisionConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("stale Update err = %v, want *version.PlanRevisionConflictError", err)
+	}
+	if conflict.ItemID != itemID || conflict.Expected != 1 || conflict.Actual != 2 {
+		t.Fatalf("conflict = %+v, want item=%d expected=1 actual=2", conflict, itemID)
+	}
+
+	// A missing item, or an item owned by another version, is a not-found even
+	// when the revision matches.
+	if _, _, err := repo.Update(ctx, versionID, ids.Next(), version.PlanPatch{Status: "done"}, 2); !errors.Is(err, version.ErrPlanNotFound) {
+		t.Fatalf("missing item Update = %v, want ErrPlanNotFound", err)
+	}
+	otherVersionID := ids.Next()
+	createVersion(t, pool, otherVersionID)
+	if _, _, err := repo.Update(ctx, otherVersionID, itemID, version.PlanPatch{Status: "done"}, 2); !errors.Is(err, version.ErrPlanNotFound) {
+		t.Fatalf("cross-version Update = %v, want ErrPlanNotFound", err)
+	}
+
+	// The stored row still carries the original values after the rejected
+	// writes.
+	items, err := repo.List(ctx, versionID, "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 1 || items[0].Status != "done" || items[0].Decision != "ok" ||
+		items[0].Order != 4 || items[0].Revision != 2 {
+		t.Fatalf("stored after rejected writes = %+v", items)
 	}
 }

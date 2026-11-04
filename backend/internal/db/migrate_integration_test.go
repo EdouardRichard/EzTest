@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 58 {
-		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
+	if len(applied) != 59 {
+		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -183,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 58 {
-		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
+	if len(applied) != 59 {
+		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -324,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 58 {
-		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
+	if len(applied) != 59 {
+		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1071,8 +1071,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 58 {
-		t.Fatalf("applied %d migrations, want 58: %v", len(applied), applied)
+	if len(applied) != 59 {
+		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1204,9 +1204,18 @@ func TestV022ABSchema(t *testing.T) {
 		{"requirement", "source_quote"},
 		{"requirement", "external_id"},
 		{"requirement", "confidence"},
+		// DB-20 / R-A8-2: optimistic-lock revision of the plan write path
+		// (Lead-approved additive column, version_0012).
+		{"version_plan_item", "revision"},
 	} {
 		requireColumn(t, pool, c.table, c.column)
 	}
+
+	// The plan revision backs the R-A8-2 optimistic lock: every stored row has
+	// one, and rows written without a revision (the pre-v0.22 write path)
+	// start at 1.
+	requireColumnNotNull(t, pool, "version_plan_item", "revision")
+	requireColumnDefault(t, pool, "version_plan_item", "revision", "1")
 
 	// D34 / Agent.md §6.9.5: the three new tables name their primary-key
 	// constraints pk_<table> instead of PostgreSQL's implicit <table>_pkey.
