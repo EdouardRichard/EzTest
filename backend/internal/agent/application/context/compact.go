@@ -190,6 +190,41 @@ func (c *Compactor) Compact(ctx context.Context, packet ContextPacket) (ContextP
 	return packet, nil
 }
 
+// CompactForDecision applies one policy-aware trigger decision to an assembled
+// packet (R-A5-2/R-A5-3). Unlike Compact it does not require the packet to
+// carry a prefix-cache Invalidation boundary: pressure and overflow compact the
+// append-only suffix while the stable prefix stays byte-identical, and
+// stage_boundary is handled the same way once the caller has rebuilt the prefix.
+// The decision's retain budget and trigger are recorded by the compaction
+// transaction; the token-based retain selection itself belongs to the summary
+// wiring task.
+//
+// The segment-window retention rule (CompactionKeepRecent / WithKeepRecent) is
+// unchanged, and a repeated call on the same packet is a no-op. A packet with
+// nothing compactable is returned unchanged.
+func (c *Compactor) CompactForDecision(ctx context.Context, packet ContextPacket, decision CompactionDecision) (ContextPacket, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return ContextPacket{}, err
+		}
+	}
+	if err := decision.Trigger.Validate(); err != nil {
+		return ContextPacket{}, err
+	}
+	var summarizer Summarizer
+	keepRecent := CompactionKeepRecent
+	if c != nil {
+		summarizer = c.summarizer
+		keepRecent = c.recentWindow()
+	}
+	compacted, summary := compactSegments(ctx, packet.Segments, summarizer, keepRecent, c)
+	if summary == nil {
+		return packet, nil
+	}
+	packet.Segments = compacted
+	return packet, nil
+}
+
 // compactableSegment reports whether a segment may be folded into the summary.
 // The stable prefix, the briefing and the rendered facts are pinned. Summary
 // segments are derived and are handled separately (superseded, never folded as
