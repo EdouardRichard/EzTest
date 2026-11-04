@@ -1,15 +1,76 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
+import type { QuestionBatch } from "./api"
 import { MessageList } from "./MessageList"
 import type { ConversationMessage, MessagePart } from "./types"
+import { mergeQuestionCards } from "./useConversation"
 
-const api = vi.hoisted(() => ({ downloadContent: vi.fn() }))
+const api = vi.hoisted(() => ({
+  downloadContent: vi.fn(),
+  answerQuestion: vi.fn(),
+  skipQuestion: vi.fn(),
+}))
 vi.mock("./api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./api")>()),
   downloadContent: api.downloadContent,
+  answerQuestion: api.answerQuestion,
+  skipQuestion: api.skipQuestion,
 }))
+
+function questionBatch(overrides: Partial<QuestionBatch> = {}): QuestionBatch {
+  return {
+    id: "101",
+    version_id: "2001",
+    conversation_id: "2",
+    message_id: "6001",
+    kind: "clarification_question",
+    status: "pending",
+    batch_id: "qb-1",
+    questions: [
+      {
+        id: "q1",
+        text: "退款到账时间按 T+1 还是 T+3 验收？",
+        options: [
+          { id: "a", label: "T+1" },
+          { id: "b", label: "T+3" },
+        ],
+        multiple: false,
+        allow_free_text: false,
+        required: true,
+        source_refs: ["requirement:FR-012"],
+      },
+    ],
+    expires_at: "2099-01-01T00:00:00Z",
+    answers: [],
+    answered_at: null,
+    answered_by: null,
+    skipped: false,
+    created_at: "2026-11-05T06:00:00Z",
+    ...overrides,
+  }
+}
+
+/** Wire shape written by the Task 23 question message payload. */
+function questionMessage(batch: QuestionBatch): ConversationMessage {
+  return {
+    id: batch.message_id ?? "6001",
+    conversation_id: "2",
+    role: "assistant",
+    parts: [
+      {
+        type: "question",
+        question_id: batch.id,
+        batch_id: batch.batch_id,
+        questions: batch.questions,
+        expires_at: batch.expires_at,
+      },
+    ],
+    refs: [],
+    created_at: "2026-11-05T06:00:00Z",
+  } as unknown as ConversationMessage
+}
 
 const SHA = "e".repeat(64)
 
@@ -27,6 +88,8 @@ function userMessage(parts: MessagePart[]): ConversationMessage {
 describe("MessageList", () => {
   beforeEach(() => {
     api.downloadContent.mockReset()
+    api.answerQuestion.mockReset()
+    api.skipQuestion.mockReset()
     vi.stubGlobal(
       "URL",
       Object.assign(URL, {
@@ -82,5 +145,93 @@ describe("MessageList", () => {
     )
 
     expect(await screen.findByText("图片加载失败")).toBeInTheDocument()
+  })
+
+  it("renders a question part as an interactive card in the thread", async () => {
+    const batch = questionBatch()
+    api.answerQuestion.mockResolvedValue({
+      ...batch,
+      status: "answered",
+      answers: [{ question_id: "q1", selected: ["a"], text: "" }],
+    })
+
+    render(
+      <MessageList
+        versionId="2001"
+        messages={[questionMessage(batch)]}
+        activity={null}
+        onRequirementSelect={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId("question-card")).toBeInTheDocument()
+    expect(screen.getByText("退款到账时间按 T+1 还是 T+3 验收？")).toBeInTheDocument()
+    expect(screen.getByTestId("pending-question-todo")).toHaveTextContent("1")
+
+    fireEvent.click(screen.getByLabelText("T+1"))
+    fireEvent.click(screen.getByRole("button", { name: "提交" }))
+
+    expect(await screen.findByText("已回答")).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.queryByTestId("pending-question-todo")).not.toBeInTheDocument(),
+    )
+    expect(api.answerQuestion).toHaveBeenCalledWith("2001", "101", [
+      { question_id: "q1", selected: ["a"], text: "" },
+    ])
+  })
+
+  it("keeps a persisted pending question after a reload from the question state", async () => {
+    const batch = questionBatch()
+    // Reload path: the thread snapshot has no question message yet, so the
+    // question API state is merged into the stream instead of local-only state.
+    const messages = mergeQuestionCards([], [batch])
+
+    render(
+      <MessageList
+        versionId="2001"
+        messages={messages}
+        activity={null}
+        onRequirementSelect={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId("question-card")).toBeInTheDocument()
+    expect(screen.getByText("退款到账时间按 T+1 还是 T+3 验收？")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "提交" })).toBeEnabled()
+    expect(screen.getByTestId("pending-question-todo")).toHaveTextContent("1")
+  })
+
+  it("reads a question card from a nested part payload", () => {
+    const batch = questionBatch({ id: "102", message_id: "6100", batch_id: "qb-2" })
+    const message = {
+      id: "6100",
+      conversation_id: "2",
+      role: "assistant",
+      parts: [
+        {
+          type: "question",
+          payload: {
+            question_id: "102",
+            batch_id: "qb-2",
+            questions: batch.questions,
+            expires_at: batch.expires_at,
+          },
+        },
+      ],
+      refs: [],
+      created_at: "2026-11-05T06:00:00Z",
+    } as unknown as ConversationMessage
+
+    render(
+      <MessageList
+        versionId="2001"
+        messages={[message]}
+        activity={null}
+        onRequirementSelect={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId("question-card")).toHaveAttribute("data-question-id", "102")
+    expect(screen.getByTestId("pending-question-todo")).toHaveTextContent("1")
   })
 })

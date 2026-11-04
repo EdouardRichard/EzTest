@@ -121,8 +121,125 @@ export function postMessage(
   )
 }
 
-/* -------------------------------- requirements ------------------------------ */
+/* ----------------------------- structured questions ------------------------ */
 
+/** `human_request.status` of a structured question (v0.22 R-B3-1). */
+export type QuestionStatus = "pending" | "answered" | "expired" | "cancelled"
+
+export type QuestionOption = {
+  id: string
+  label: string
+}
+
+/** One question inside a batch (`HumanQuestion.question` payload, R-B3-2). */
+export type QuestionItem = {
+  id: string
+  text: string
+  options: QuestionOption[]
+  multiple: boolean
+  allow_free_text: boolean
+  required: boolean
+  source_refs: string[]
+}
+
+/** One stored answer (`human_request.response.answers[]`). */
+export type QuestionAnswer = {
+  question_id: string
+  selected: string[]
+  text: string
+}
+
+/**
+ * One structured-question batch (`GET /api/versions/{id}/questions`
+ * QuestionView). The payload comes from `human_request`, lazily expired by the
+ * backend, so a pending card survives a reload without local-only state.
+ */
+export type QuestionBatch = {
+  id: string
+  version_id?: string
+  conversation_id?: string | null
+  message_id?: string | null
+  kind?: string
+  status: QuestionStatus
+  batch_id: string
+  questions: QuestionItem[]
+  expires_at: string
+  answers: QuestionAnswer[]
+  answered_by?: string | null
+  answered_at?: string | null
+  skipped?: boolean
+  created_at?: string
+}
+
+/** One answer typed in the card and sent with `onAnswer` for the echo. */
+export type QuestionAnswerInput = {
+  questionId: string
+  selected: string[]
+  text: string
+}
+
+/** A question card embedded in the conversation stream. */
+export type QuestionPart = {
+  type: "question"
+  question: QuestionBatch
+}
+
+/**
+ * The part payload the backend writes with `conversation_message(kind=question)`
+ * (`questionMessagePayload`): `{question_id, batch_id, questions, expires_at}`.
+ * Task 36/37 expose it through the conversation DTO; Task 24 renders it
+ * defensively from either this wire shape or an embedded `question` object.
+ */
+export type QuestionPartPayload = {
+  type: "question"
+  question?: QuestionBatch
+  question_id?: string
+  batch_id?: string
+  questions?: QuestionItem[]
+  expires_at?: string
+  status?: QuestionStatus
+  answers?: QuestionAnswer[]
+}
+
+/** Lists the version's structured questions (optionally one status). */
+export async function listQuestions(
+  versionId: string,
+  options: { status?: QuestionStatus; limit?: number } = {},
+): Promise<QuestionBatch[]> {
+  const page = await apiGetPage<QuestionBatch>(
+    `${versionPath(versionId)}/questions${query({
+      status: options.status,
+      limit: options.limit ?? 100,
+    })}`,
+  )
+  return page.items
+}
+
+/** Answers every question of one batch (`POST .../questions/{qid}/answer`). */
+export function answerQuestion(
+  versionId: string,
+  questionId: string,
+  answers: QuestionAnswer[],
+): Promise<QuestionBatch> {
+  return apiPost<QuestionBatch>(
+    `${versionPath(versionId)}/questions/${encodeURIComponent(questionId)}/answer`,
+    { answers },
+  )
+}
+
+/** Skips a pending batch (`POST .../questions/{qid}/skip` -> cancelled). */
+export function skipQuestion(
+  versionId: string,
+  questionId: string,
+  reason?: string,
+): Promise<QuestionBatch> {
+  return apiPost<QuestionBatch>(
+    `${versionPath(versionId)}/questions/${encodeURIComponent(questionId)}/skip`,
+    reason === undefined || reason === "" ? {} : { reason },
+  )
+}
+
+/* -------------------------------- requirements ------------------------------ */
 /** Lists requirements; the sidebar filters client-side, the API filter is optional. */
 export async function listRequirements(
   versionId: string,

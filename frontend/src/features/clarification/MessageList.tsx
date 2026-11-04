@@ -3,6 +3,7 @@
 import { Paperclip } from "lucide-react"
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 
+import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -19,12 +20,19 @@ import type {
 } from "@/features/conversation/types"
 import { formatDateTime } from "@/lib/format"
 
-import { downloadContent } from "./api"
+import { downloadContent, type QuestionBatch, type QuestionPart } from "./api"
+import { QuestionCard } from "./QuestionCard"
 import { RequirementCard } from "./RequirementCard"
 import { RichText } from "./RichText"
 import { RollbackCard } from "./RollbackCard"
 import type { ConversationMessage, ImagePart, MessagePart, RequirementDetail } from "./types"
-import { mergePartsBySeq, useJobCardUpdate } from "./useConversation"
+import {
+  mergePartsBySeq,
+  questionBatchFromMessage,
+  questionBatchFromPart,
+  questionBatchStatus,
+  useJobCardUpdate,
+} from "./useConversation"
 
 export type MessageListProps = {
   versionId: string
@@ -47,7 +55,14 @@ export type MessageListProps = {
 }
 
 /** The clarification thread can carry both the P1 and the 0.2.1 part unions. */
-type RenderablePart = MessagePart | ConversationMessagePart
+type RenderablePart = MessagePart | ConversationMessagePart | QuestionPart
+
+/** Task 36/37 exposes the message kind; the UI also handles it defensively. */
+type MessageWithKind = ConversationMessage & { kind?: string }
+
+function isAnswerMessage(message: ConversationMessage): boolean {
+  return (message as MessageWithKind).kind === "answer"
+}
 
 /** Distance from the bottom that still counts as "following the latest". */
 const BOTTOM_THRESHOLD_PX = 80
@@ -182,6 +197,8 @@ function MessagePartView({
   versionId,
   messageId,
   part,
+  questionOverrides,
+  onQuestionUpdated,
   onRequirementSelect,
   onRequirementChanged,
   onCaseSelect,
@@ -190,6 +207,8 @@ function MessagePartView({
   versionId: string
   messageId: string
   part: RenderablePart
+  questionOverrides: Record<string, QuestionBatch>
+  onQuestionUpdated: (question: QuestionBatch) => void
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
   onCaseSelect?: (caseId: string) => void
@@ -198,6 +217,17 @@ function MessagePartView({
   switch (part.type) {
     case "text":
       return <RichText>{part.text}</RichText>
+    case "question": {
+      const batch = questionBatchFromPart(part)
+      if (batch === null) return null
+      return (
+        <QuestionCard
+          versionId={versionId}
+          question={questionOverrides[batch.id] ?? batch}
+          onUpdated={onQuestionUpdated}
+        />
+      )
+    }
     case "image":
       return <MessageImage part={part} />
     case "attachment":
@@ -254,6 +284,10 @@ function partKey(part: RenderablePart): string {
       return `job:${part.job_id}`
     case "case_card":
       return `case:${part.case_id}`
+    case "question": {
+      const batch = questionBatchFromPart(part)
+      return `question:${batch?.id ?? "unknown"}`
+    }
     case "error":
       return `error:${part.code}:${part.message.slice(0, 32)}`
   }
@@ -262,6 +296,8 @@ function partKey(part: RenderablePart): string {
 function MessageBubble({
   versionId,
   message,
+  questionOverrides,
+  onQuestionUpdated,
   onRequirementSelect,
   onRequirementChanged,
   onCaseSelect,
@@ -269,11 +305,16 @@ function MessageBubble({
 }: {
   versionId: string
   message: ConversationMessage
+  questionOverrides: Record<string, QuestionBatch>
+  onQuestionUpdated: (question: QuestionBatch) => void
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
   onCaseSelect?: (caseId: string) => void
   onErrorAction?: (part: ErrorPayload) => void
 }) {
+  // The structured answer is already echoed by the question card; rendering the
+  // answer message too would duplicate it as an empty assistant bubble.
+  if (isAnswerMessage(message)) return null
   const isUser = message.role === "user"
   const seenKeys = new Map<string, number>()
   // Streamed rows are de-duplicated by seq before they reach the renderer; a
@@ -284,6 +325,10 @@ function MessageBubble({
     seenKeys.set(base, occurrence + 1)
     return { key: `${base}:${occurrence}`, part }
   })
+  // Defensive fallback: Task 36/37 may publish `kind=question` with a top-level
+  // payload instead of a question part. Never render the card twice.
+  const embeddedQuestion = questionBatchFromMessage(message)
+  const hasQuestionPart = parts.some(({ part }) => part.type === "question")
   return (
     <article
       data-testid={`message-${message.role}`}
@@ -302,12 +347,21 @@ function MessageBubble({
             versionId={versionId}
             messageId={message.id}
             part={part}
+            questionOverrides={questionOverrides}
+            onQuestionUpdated={onQuestionUpdated}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}
             onCaseSelect={onCaseSelect}
             onErrorAction={onErrorAction}
           />
         ))}
+        {embeddedQuestion !== null && !hasQuestionPart ? (
+          <QuestionCard
+            versionId={versionId}
+            question={questionOverrides[embeddedQuestion.id] ?? embeddedQuestion}
+            onUpdated={onQuestionUpdated}
+          />
+        ) : null}
       </div>
       <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
         {formatDateTime(message.created_at)}
@@ -365,6 +419,21 @@ export function MessageList({
 
   const conversationKey = messages[0]?.conversation_id ?? ""
   const oldestId = oldestMessageId(messages)
+
+  // The question card owns its local draft; this thread-level projection keeps
+  // the pending badge and the answered/skipped echo in sync after a transition.
+  const [questionOverrides, setQuestionOverrides] = useState<Record<string, QuestionBatch>>({})
+  const handleQuestionUpdated = useCallback((question: QuestionBatch) => {
+    setQuestionOverrides((previous) => ({ ...previous, [question.id]: question }))
+  }, [])
+  const pendingQuestionCount = useMemo(() => {
+    const byId = new Map<string, QuestionBatch>()
+    for (const message of messages) {
+      const batch = questionBatchFromMessage(message)
+      if (batch !== null) byId.set(batch.id, questionOverrides[batch.id] ?? batch)
+    }
+    return [...byId.values()].filter((batch) => questionBatchStatus(batch) === "pending").length
+  }, [messages, questionOverrides])
 
   const scrollToBottom = useCallback(() => {
     const element = containerRef.current
@@ -545,6 +614,17 @@ export function MessageList({
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
+      {pendingQuestionCount > 0 ? (
+        <div
+          data-testid="pending-question-todo"
+          role="status"
+          className="flex flex-wrap items-center gap-2 border-b border-border bg-warning/5 px-4 py-1.5 text-[11px]"
+        >
+          <Badge tone="warning">待回答问题</Badge>
+          <span className="font-semibold text-foreground">{pendingQuestionCount}</span>
+          <span className="text-muted-foreground">在提问卡中提交后自动清除</span>
+        </div>
+      ) : null}
       <div
         ref={containerRef}
         data-testid="message-list"
@@ -567,6 +647,8 @@ export function MessageList({
             key={message.id}
             versionId={versionId}
             message={message}
+            questionOverrides={questionOverrides}
+            onQuestionUpdated={handleQuestionUpdated}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}
             onCaseSelect={onCaseSelect}
