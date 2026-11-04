@@ -275,6 +275,81 @@ export function matchDesignNodes(layout: DesignLayout, query: string): DesignLay
   return layout.nodes.filter((node) => searchableText(node).toLowerCase().includes(needle))
 }
 
+/* ------------------------------ split preferences --------------------------- */
+
+/**
+ * Persisted split ratios (R-D2-2). Keys are versioned so the three-layer
+ * 35/40/25 draft from v0.2.1 can never be misread as the new 40/60 layout.
+ */
+export const DESIGN_SPLIT_STORAGE_KEYS = {
+  chat: "eztest.design.chat-split",
+  workbench: "eztest.design.workbench-split",
+} as const
+
+/** Approved defaults: chat 40% / workbench 60%, graph 65% / detail 35%. */
+export const DEFAULT_CHAT_SPLIT = 40
+export const DEFAULT_WORKBENCH_SPLIT = 65
+
+/** Clamps keep every pane usable and the divider within its own pair. */
+export const MIN_CHAT_SPLIT = 20
+export const MAX_CHAT_SPLIT = 80
+export const MIN_GRAPH_SPLIT = 25
+export const MAX_GRAPH_SPLIT = 85
+
+/** Keyboard divider step, matching the accessible splitter contract. */
+export const KEYBOARD_SPLIT_STEP = 5
+
+/** Round to two decimals so repeated drags do not accumulate float noise. */
+export function roundSplitPercent(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+export function clampSplitPercent(value: number, min: number, max: number): number {
+  return roundSplitPercent(Math.min(Math.max(value, min), max))
+}
+
+/**
+ * Reads a persisted top-pane percentage. Invalid, missing or out-of-range
+ * values fall back to the approved default; storage failures never break the
+ * workspace (private mode / disabled storage).
+ */
+export function readStoredSplit(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+  storage: Pick<Storage, "getItem"> | null = typeof window === "undefined"
+    ? null
+    : window.localStorage,
+): number {
+  if (storage === null) return fallback
+  try {
+    const raw = storage.getItem(key)
+    if (raw === null) return fallback
+    const parsed = Number.parseFloat(raw)
+    if (!Number.isFinite(parsed)) return fallback
+    return clampSplitPercent(parsed, min, max)
+  } catch {
+    return fallback
+  }
+}
+
+/** Persists the top-pane percentage; quota/privacy failures are non-fatal. */
+export function writeStoredSplit(
+  key: string,
+  value: number,
+  storage: Pick<Storage, "setItem"> | null = typeof window === "undefined"
+    ? null
+    : window.localStorage,
+): void {
+  if (storage === null) return
+  try {
+    storage.setItem(key, String(roundSplitPercent(value)))
+  } catch {
+    // The layout keeps working without persistence.
+  }
+}
+
 const LAYOUT_CACHE_LIMIT = 8
 
 /**

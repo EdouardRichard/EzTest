@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -26,12 +26,18 @@ const clarificationApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/clarification/api", () => clarificationApi)
 
+// The chat header mounts the login-user model selector.
+const conversationApi = vi.hoisted(() => ({
+  listPublicModels: vi.fn(),
+  updateConversationModel: vi.fn(),
+}))
+vi.mock("@/features/conversation/api", () => conversationApi)
+
 const versionsApi = vi.hoisted(() => ({ updateVersion: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
 
 vi.mock("@/features/clarification/useVersionEvents", () => ({
   useVersionEvents: () => "live",
-  subscribeStreamReset: () => () => {},
 }))
 
 const navigation = vi.hoisted(() => ({ replace: vi.fn(), push: vi.fn() }))
@@ -40,7 +46,7 @@ vi.mock("next/navigation", () => ({
   usePathname: () => "/versions/2001",
 }))
 
-// The three-layer contract is about the DesignTab shell. React Flow is
+// The split-layout contract is about the DesignTab shell. React Flow is
 // unrelated to it, so the canvas is replaced with a marker node.
 vi.mock("./DesignMindmap", async () => {
   const React = await import("react")
@@ -52,20 +58,16 @@ vi.mock("./DesignMindmap", async () => {
 import { versionFixture } from "@/features/versions/test-fixtures"
 
 import { DesignTab } from "./DesignTab"
-import { designGraphFixture, designOverviewFixture } from "./test-fixtures"
+import { designCaseDetailFixture, designGraphFixture, designOverviewFixture } from "./test-fixtures"
 
 const TIMESTAMP = "2026-10-31T12:00:00Z"
 
-/** `app-content` bottom padding; the layout reserves it so the page never scrolls. */
-const PAGE_BOTTOM_INSET = 48
-
-const LAYER_ORDER = [
-  "design-layer-chat",
-  "design-divider-chat",
-  "design-layer-mindmap",
-  "design-divider-mindmap",
-  "design-layer-detail",
-]
+/**
+ * Persisted split preferences (R-D2-2). Keys are literals here so the first red
+ * run fails on the missing layout instead of a missing module export.
+ */
+const CHAT_SPLIT_KEY = "eztest.design.chat-split"
+const WORKBENCH_SPLIT_KEY = "eztest.design.workbench-split"
 
 function mockWorkspace(): void {
   designApi.getDesignGraph.mockResolvedValue(designGraphFixture)
@@ -81,6 +83,8 @@ function mockWorkspace(): void {
       created_at: TIMESTAMP,
     },
   ])
+  designApi.getDesignCase.mockResolvedValue(designCaseDetailFixture)
+  conversationApi.listPublicModels.mockResolvedValue([])
   clarificationApi.listMessages.mockResolvedValue([])
   clarificationApi.getTeamRoom.mockResolvedValue({ team: "design", digest: null, posts: [] })
   versionsApi.updateVersion.mockResolvedValue(versionFixture)
@@ -90,19 +94,22 @@ async function renderWorkspace() {
   render(<DesignTab versionId="2001" />)
   await screen.findByTestId("design-mindmap")
   return {
-    root: screen.getByTestId("design-tab"),
-    scroll: screen.getByTestId("design-layers-scroll"),
-    layers: screen.getByTestId("design-layers"),
-    chat: screen.getByTestId("design-layer-chat"),
-    mindmap: screen.getByTestId("design-layer-mindmap"),
-    detail: screen.getByTestId("design-layer-detail"),
-    chatDivider: screen.getByTestId("design-divider-chat"),
-    mindmapDivider: screen.getByTestId("design-divider-mindmap"),
+    root: screen.getByTestId("design-scroll"),
+    header: screen.getByTestId("design-header"),
+    chat: screen.getByTestId("design-chat"),
+    graph: screen.getByTestId("design-graph"),
+    detail: screen.getByTestId("design-detail"),
+    mainSplit: screen.getByTestId("design-split-main"),
+    mainTop: screen.getByTestId("design-split-main-top"),
+    mainBottom: screen.getByTestId("design-split-main-bottom"),
+    mainDivider: screen.getByTestId("design-split-main-divider"),
+    workbenchSplit: screen.getByTestId("design-split-workbench"),
+    workbenchDivider: screen.getByTestId("design-split-workbench-divider"),
   }
 }
 
 /** jsdom has no layout engine; the drag maths only needs a definite height. */
-function mockLayerHeight(element: HTMLElement, height: number): void {
+function mockHeight(element: HTMLElement, height: number): void {
   vi.spyOn(element, "getBoundingClientRect").mockReturnValue({
     x: 0,
     y: 0,
@@ -122,165 +129,210 @@ function dragDivider(divider: HTMLElement, fromY: number, toY: number, pointerId
   fireEvent.pointerUp(divider, { pointerId, clientY: toY })
 }
 
-describe("DesignTab three-layer layout", () => {
+describe("DesignTab split layout (R-D2)", () => {
   beforeEach(() => {
     for (const fn of Object.values(designApi)) fn.mockReset()
     for (const fn of Object.values(clarificationApi)) fn.mockReset()
+    for (const fn of Object.values(conversationApi)) fn.mockReset()
     versionsApi.updateVersion.mockReset()
     navigation.replace.mockReset()
+    window.localStorage.clear()
     mockWorkspace()
   })
 
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    window.localStorage.clear()
   })
 
-  it("stacks chat, mindmap and detail in DOM order", async () => {
-    const { layers } = await renderWorkspace()
+  it("renders the design header with version, host, context, model and actions", async () => {
+    const { header } = await renderWorkspace()
 
-    expect(Array.from(layers.children).map((child) => child.getAttribute("data-testid"))).toEqual(
-      LAYER_ORDER,
-    )
+    expect(screen.getByTestId("design-header-version")).toHaveTextContent("2001")
+    expect(within(header).getByText("用例设计")).toBeInTheDocument()
+    expect(screen.getByTestId("design-header-host")).toHaveTextContent("Design Host")
+    expect(screen.getByTestId("design-header-context")).toHaveTextContent("上下文水位")
+    expect(screen.getByTestId("design-header-model")).toHaveTextContent("模型")
+    expect(screen.getByTestId("design-stats")).toHaveTextContent("需求 2 · 场景 2 · 用例 3")
+    expect(screen.getByTestId("export-cases")).toBeInTheDocument()
+    expect(screen.getByTestId("auto-design-switch")).toBeInTheDocument()
+    expect(screen.getByTestId("design-new-conversation")).toBeInTheDocument()
+    expect(screen.getByTestId("design-workbench-zoom")).toHaveAttribute("aria-expanded", "false")
   })
 
-  it("drags the dividers to rebalance the layer heights", async () => {
-    const { layers, chat, mindmap, detail, chatDivider, mindmapDivider } = await renderWorkspace()
-    mockLayerHeight(layers, 1000)
+  it("stacks the chat over the graph and detail without scrolling the page", async () => {
+    const { root, chat, graph, detail, mainSplit, workbenchSplit } = await renderWorkspace()
 
-    expect(chat.style.flexBasis).toBe("35%")
-    expect(mindmap.style.flexBasis).toBe("40%")
-    expect(detail.style.flexBasis).toBe("25%")
-
-    // Down 5% of the split area: the chat grows, the mindmap shrinks.
-    dragDivider(chatDivider, 100, 150)
-    expect(chat.style.flexBasis).toBe("40%")
-    expect(mindmap.style.flexBasis).toBe("35%")
-    expect(detail.style.flexBasis).toBe("25%")
-
-    // Down 10% of the split area: the mindmap grows, the detail shrinks.
-    dragDivider(mindmapDivider, 300, 400)
-    expect(mindmap.style.flexBasis).toBe("45%")
-    expect(detail.style.flexBasis).toBe("15%")
-  })
-
-  it("clamps a divider drag so every layer stays visible", async () => {
-    const { layers, chat, mindmap, chatDivider } = await renderWorkspace()
-    mockLayerHeight(layers, 1000)
-
-    dragDivider(chatDivider, 750, 0)
-
-    const chatPercent = Number.parseFloat(chat.style.flexBasis)
-    const mindmapPercent = Number.parseFloat(mindmap.style.flexBasis)
-    expect(chatPercent).toBeGreaterThanOrEqual(10)
-    expect(mindmapPercent).toBeGreaterThanOrEqual(10)
-    expect(chatPercent + mindmapPercent).toBe(75)
-  })
-
-  it("exposes horizontal separators that resize with the keyboard", async () => {
-    const { chat, mindmap, chatDivider } = await renderWorkspace()
-
-    expect(chatDivider).toHaveAttribute("role", "separator")
-    expect(chatDivider).toHaveAttribute("aria-orientation", "horizontal")
-
-    fireEvent.keyDown(chatDivider, { key: "ArrowDown" })
-    expect(chat.style.flexBasis).toBe("40%")
-    expect(mindmap.style.flexBasis).toBe("35%")
-  })
-
-  it("collapses the chat to an input bar and hands its space to the mindmap", async () => {
-    const { chat, mindmap, detail, chatDivider } = await renderWorkspace()
-    expect(await screen.findByTestId("composer-textarea")).toBeInTheDocument()
-    expect(screen.getByTestId("message-list")).toBeInTheDocument()
-
-    fireEvent.click(screen.getByTestId("design-chat-collapse-toggle"))
-
-    expect(chat).toHaveAttribute("data-collapsed", "true")
-    expect(chat.style.flexBasis).toBe("auto")
-    // A growing mindmap absorbs the space the fixed-size input bar releases.
-    expect(mindmap.style.flexGrow).toBe("1")
-    expect(mindmap.style.flexBasis).toBe("0%")
-    expect(detail.style.flexBasis).toBe("25%")
-    expect(chatDivider).toHaveAttribute("aria-disabled", "true")
-    expect(screen.getByTestId("composer-textarea")).toBeInTheDocument()
-    expect(screen.queryByTestId("message-list")).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByTestId("design-chat-collapse-toggle"))
-
-    expect(chat).toHaveAttribute("data-collapsed", "false")
-    expect(chat.style.flexBasis).toBe("35%")
-    expect(mindmap.style.flexGrow).toBe("0")
-    expect(mindmap.style.flexBasis).toBe("40%")
-  })
-
-  it("caps the workspace to the viewport and scrolls inside each layer", async () => {
-    const { root, scroll, chat, mindmap, detail } = await renderWorkspace()
-
+    // The outer shell is fixed to the viewport remainder and clips: only the
+    // panels inside scroll.
     await waitFor(() => expect(root.style.height).toMatch(/^\d+px$/))
-    const available = window.innerHeight - root.getBoundingClientRect().top - PAGE_BOTTOM_INSET
-    expect(root.style.height).toBe(`${available}px`)
-    expect(root).toHaveClass("overflow-hidden")
-    expect(root.className).not.toMatch(/(?:^|\s)space-y-/)
-    expect(scroll).toHaveClass("flex-1")
-    expect(scroll).toHaveClass("min-h-0")
-    expect(scroll).toHaveClass("overflow-y-auto")
+    expect(root).toHaveStyle({ overflow: "hidden" })
+    expect(root).toHaveClass("overflow-hidden", "min-h-0", "min-w-0")
 
-    for (const layer of [chat, mindmap, detail]) {
-      expect(layer).toHaveClass("overflow-auto")
-      expect(layer).toHaveClass("min-h-0")
-    }
+    // Chat above the workbench; inside it graph directly above detail.
+    expect(chat.compareDocumentPosition(graph) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(graph.compareDocumentPosition(detail) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(
+      mainSplit.compareDocumentPosition(workbenchSplit) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+
+    // Each panel owns its scroll: graph and detail auto, chat is clipped and
+    // scrolls internally (message list + composer).
+    expect(graph).toHaveStyle({ overflow: "auto" })
+    expect(detail).toHaveStyle({ overflow: "auto" })
+    expect(screen.getByTestId("design-chat-pane")).toHaveStyle({ overflow: "hidden" })
   })
 
-  it("keeps the three panes usable and scrolls the stacked workspace on a short viewport", async () => {
-    const { scroll, layers, chat, mindmap, detail } = await renderWorkspace()
+  it("defaults to a 40/60 chat split and a 65/35 graph/detail split", async () => {
+    const { mainTop, mainBottom, graph, detail } = await renderWorkspace()
 
-    // A 1422x904 viewport leaves ~450px for the layers: split 35/40/25 that is
-    // a 32px message list and a ~54px graph canvas. The track grows to a
-    // usable minimum and the scroll container above it moves between panes.
-    expect(layers.style.height).toBe("max(100%, 1000px)")
-    expect(scroll).toHaveClass("overflow-y-auto")
-    expect(scroll.contains(layers)).toBe(true)
-
-    expect(parseFloat(chat.style.flexBasis)).toBe(35)
-    expect(parseFloat(mindmap.style.flexBasis)).toBe(40)
-    expect(parseFloat(detail.style.flexBasis)).toBe(25)
+    expect(mainTop.style.flexBasis).toBe("40%")
+    expect(mainBottom.style.flexBasis).toBe("60%")
+    expect(graph.style.flexBasis).toBe("65%")
+    expect(detail.style.flexBasis).toBe("35%")
   })
 
-  it("uses the whole enlarged focus body instead of the inline minimum", async () => {
-    const { layers } = await renderWorkspace()
+  it("drags the chat/workbench divider and persists the ratio", async () => {
+    const { mainSplit, mainTop, mainBottom, mainDivider } = await renderWorkspace()
+    mockHeight(mainSplit, 1000)
 
-    fireEvent.click(screen.getByTestId("design-mindmap-expand"))
+    dragDivider(mainDivider, 400, 500)
 
-    // The focus dialog already provides enough height for the 65/35 split; a
-    // fixed 1000px track would leave it scrolled inside the dialog.
-    expect(layers.style.height).toBe("100%")
+    expect(mainTop.style.flexBasis).toBe("50%")
+    expect(mainBottom.style.flexBasis).toBe("50%")
+    expect(window.localStorage.getItem(CHAT_SPLIT_KEY)).toBe("50")
+
+    // The ratio survives a remount (refresh / navigation).
+    cleanup()
+    await renderWorkspace()
+    expect(screen.getByTestId("design-split-main-top").style.flexBasis).toBe("50%")
+    expect(screen.getByTestId("design-split-main-bottom").style.flexBasis).toBe("50%")
   })
 
-  it("starts with the chat collapsed on a short viewport so the mindmap is visible", async () => {
-    // A 560px viewport leaves ~510px below the version header: expanded, that
-    // is the same blank 30px thread the user reported.
+  it("drags the graph/detail divider and persists the ratio", async () => {
+    const { workbenchSplit, workbenchDivider, graph, detail } = await renderWorkspace()
+    mockHeight(workbenchSplit, 600)
+
+    dragDivider(workbenchDivider, 100, 160)
+
+    expect(graph.style.flexBasis).toBe("75%")
+    expect(detail.style.flexBasis).toBe("25%")
+    expect(window.localStorage.getItem(WORKBENCH_SPLIT_KEY)).toBe("75")
+
+    cleanup()
+    await renderWorkspace()
+    expect(screen.getByTestId("design-graph").style.flexBasis).toBe("75%")
+    expect(screen.getByTestId("design-detail").style.flexBasis).toBe("25%")
+  })
+
+  it("clamps both splits, resets on double-click and resizes from the keyboard", async () => {
+    const { mainSplit, mainTop, mainDivider, workbenchSplit, workbenchDivider, graph } =
+      await renderWorkspace()
+    mockHeight(mainSplit, 1000)
+    mockHeight(workbenchSplit, 1000)
+
+    // Overshoot both directions: the panes keep their minimum heights.
+    dragDivider(mainDivider, 500, 1500)
+    expect(Number.parseFloat(mainTop.style.flexBasis)).toBeLessThanOrEqual(80)
+    dragDivider(mainDivider, 500, -1500)
+    expect(Number.parseFloat(mainTop.style.flexBasis)).toBeGreaterThanOrEqual(20)
+
+    dragDivider(workbenchDivider, 500, 1500)
+    expect(Number.parseFloat(graph.style.flexBasis)).toBeLessThanOrEqual(85)
+    dragDivider(workbenchDivider, 500, -1500)
+    expect(Number.parseFloat(graph.style.flexBasis)).toBeGreaterThanOrEqual(25)
+
+    // Double-click restores the approved defaults (40/60, 65/35).
+    fireEvent.doubleClick(mainDivider)
+    expect(mainTop.style.flexBasis).toBe("40%")
+    fireEvent.doubleClick(workbenchDivider)
+    expect(graph.style.flexBasis).toBe("65%")
+
+    // Keyboard resize is the accessible equivalent of dragging.
+    fireEvent.keyDown(mainDivider, { key: "ArrowDown" })
+    expect(mainTop.style.flexBasis).toBe("45%")
+    fireEvent.keyDown(mainDivider, { key: "Home" })
+    expect(mainTop.style.flexBasis).toBe("40%")
+  })
+
+  it("opens the whole workbench as a 90vw×90vh dialog and closes with Escape", async () => {
+    const { chat, graph, detail } = await renderWorkspace()
+
+    fireEvent.click(screen.getByRole("button", { name: "放大工作区" }))
+
+    const dialog = await screen.findByRole("dialog", { name: "脑图与用例详情" })
+    expect(dialog).toHaveClass("w-[90vw]", "h-[90vh]")
+
+    // Graph above detail, same live components (not a second copy).
+    expect(within(dialog).getByTestId("design-graph")).toBe(graph)
+    expect(within(dialog).getByTestId("design-detail")).toBe(detail)
+    expect(graph.compareDocumentPosition(detail) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(dialog).queryByTestId("design-chat")).not.toBeInTheDocument()
+    expect(screen.getByTestId("design-chat")).toBe(chat)
+    expect(screen.getByRole("button", { name: "还原工作区" })).toBeInTheDocument()
+
+    fireEvent.keyDown(window, { key: "Escape" })
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(screen.getByTestId("design-graph")).toBe(graph)
+    expect(screen.getByRole("button", { name: "放大工作区" })).toBeInTheDocument()
+  })
+
+  it("closes the enlarged workbench with the restore button and the backdrop", async () => {
+    await renderWorkspace()
+
+    fireEvent.click(screen.getByRole("button", { name: "放大工作区" }))
+    await screen.findByRole("dialog", { name: "脑图与用例详情" })
+    fireEvent.click(screen.getByRole("button", { name: "还原工作区" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole("button", { name: "放大工作区" }))
+    await screen.findByRole("dialog", { name: "脑图与用例详情" })
+    fireEvent.click(screen.getByTestId("design-focus-backdrop"))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  })
+
+  it("collapses the chat to a title bar on a short viewport and keeps the workbench usable", async () => {
     vi.spyOn(window, "innerHeight", "get").mockReturnValue(560)
 
-    const { chat, mindmap } = await renderWorkspace()
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-mindmap")
 
-    await waitFor(() => expect(chat).toHaveAttribute("data-collapsed", "true"))
-    expect(chat.style.flexBasis).toBe("auto")
-    // The input bar stays available; expanding it is one click away.
-    expect(screen.getByTestId("composer-textarea")).toBeInTheDocument()
-    expect(mindmap.style.flexGrow).toBe("1")
+    const titleBar = await screen.findByTestId("design-chat-titlebar")
+    expect(within(titleBar).getByRole("heading", { name: "设计对话" })).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("message-list")).not.toBeInTheDocument()
+
+    // Graph + detail are prioritised and the collapsed top does not consume a
+    // percentage of the height.
+    expect(screen.getByTestId("design-graph")).toBeInTheDocument()
+    expect(screen.getByTestId("design-detail")).toBeInTheDocument()
+    expect(screen.getByTestId("design-split-main-top").style.flex).toBe("0 0 auto")
+    expect(screen.getByTestId("design-split-main-bottom").style.flex).toBe("1 1 0%")
+
+    // No horizontal overflow, no Tabs: the column stays min-w-0 all the way.
+    const root = screen.getByTestId("design-scroll")
+    expect(root).toHaveClass("overflow-hidden", "min-w-0")
+    expect(screen.getByTestId("design-split-main")).toHaveClass("min-w-0")
+    expect(screen.getByTestId("design-split-main-bottom")).toHaveClass("min-w-0")
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument()
+
+    // The title bar expands the chat again.
+    fireEvent.click(within(titleBar).getByTestId("design-chat-collapse-toggle"))
+    expect(await screen.findByTestId("design-chat")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
   })
 
-  it("keeps the mobile DOM order unchanged", async () => {
-    const { layers, chat, mindmap, detail } = await renderWorkspace()
+  it("collapses the chat when a resize enters the short-viewport band", async () => {
+    await renderWorkspace()
+    expect(screen.getByTestId("design-chat")).toBeInTheDocument()
 
-    // The same column is the mobile layout: no CSS reordering on small screens.
-    expect(layers).toHaveClass("flex-col")
-    expect(layers.className).not.toMatch(/(?:^|\s)flex-col-reverse(?:\s|$)/)
-    expect(layers.className).not.toMatch(/(?:^|\s)order-/)
-    expect(layers.className).not.toMatch(/:(?:flex-row|order-)/)
-    expect(layers.children).toHaveLength(5)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(560)
+    fireEvent(window, new Event("resize"))
 
-    expect(chat.compareDocumentPosition(mindmap) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(mindmap.compareDocumentPosition(detail) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(await screen.findByTestId("design-chat-titlebar")).toBeInTheDocument()
+    expect(screen.getByTestId("design-graph")).toBeInTheDocument()
+    expect(screen.getByTestId("design-detail")).toBeInTheDocument()
   })
 })

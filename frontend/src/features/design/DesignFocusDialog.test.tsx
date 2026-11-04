@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -43,7 +43,7 @@ vi.mock("next/navigation", () => ({
 }))
 
 // The version channel runs through the real `useVersionEvents` hook so a
-// re-subscription caused by the focus dialog would be observable here.
+// re-subscription caused by the zoom toggle would be observable here.
 const sse = vi.hoisted(() => ({ connectSSE: vi.fn(() => () => {}) }))
 vi.mock("@/lib/sse-client", () => ({ connectSSE: sse.connectSSE }))
 
@@ -104,12 +104,12 @@ async function renderWorkspace(): Promise<HTMLElement> {
   return screen.findByTestId("design-mindmap")
 }
 
-function openFocus(): HTMLElement {
-  fireEvent.click(screen.getByTestId("design-mindmap-expand"))
+function openWorkbenchZoom(): HTMLElement {
+  fireEvent.click(screen.getByTestId("design-workbench-zoom"))
   return screen.getByRole("dialog", { name: FOCUS_TITLE })
 }
 
-describe("DesignFocusDialog", () => {
+describe("Design workbench whole-block zoom (R-D2-3)", () => {
   beforeEach(() => {
     for (const fn of Object.values(designApi)) fn.mockReset()
     for (const fn of Object.values(clarificationApi)) fn.mockReset()
@@ -121,16 +121,21 @@ describe("DesignFocusDialog", () => {
     reactFlow.zoomOut.mockReset()
     sse.connectSSE.mockReset()
     sse.connectSSE.mockImplementation(() => () => {})
+    window.localStorage.clear()
     mockWorkspace()
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    window.localStorage.clear()
+  })
 
-  it("opens the 65/35 focus layout with the same canvas and syncs the selected case into the detail", async () => {
+  it("opens the graph above detail at 65/35 and syncs the selected case into the detail", async () => {
     const mindmap = await renderWorkspace()
     const detail = screen.getByTestId("case-detail")
+    const chat = screen.getByTestId("design-chat")
 
-    const dialog = openFocus()
+    const dialog = openWorkbenchZoom()
 
     // The very same nodes are moved into the dialog: not a second canvas or a
     // second detail panel (which would also duplicate their test ids).
@@ -139,12 +144,25 @@ describe("DesignFocusDialog", () => {
     expect(screen.getByTestId("design-mindmap")).toBe(mindmap)
     expect(screen.getByTestId("case-detail")).toBe(detail)
 
-    // Mindmap 65% + detail 35% (spec §9.3); the chat and both dividers leave.
-    expect(screen.getByTestId("design-layer-mindmap").style.flexBasis).toBe("65%")
-    expect(screen.getByTestId("design-layer-detail").style.flexBasis).toBe("35%")
-    expect(screen.getByTestId("design-layer-chat").style.display).toBe("none")
-    expect(screen.getByTestId("design-divider-chat").style.display).toBe("none")
-    expect(screen.getByTestId("design-divider-mindmap").style.display).toBe("none")
+    // The workbench keeps graph above detail, graph 65% / detail 35%.
+    const graphPane = screen.getByTestId("design-graph")
+    const detailPane = screen.getByTestId("design-detail")
+    expect(dialog).toContainElement(graphPane)
+    expect(dialog).toContainElement(detailPane)
+    expect(graphPane.style.flexBasis).toBe("65%")
+    expect(detailPane.style.flexBasis).toBe("35%")
+    expect(
+      graphPane.compareDocumentPosition(detailPane) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+
+    // The graph keeps its own zoom/fit controls inside the enlarged workbench.
+    expect(within(dialog).getByTestId("design-zoom-in")).toBeInTheDocument()
+    expect(within(dialog).getByTestId("design-zoom-out")).toBeInTheDocument()
+    expect(within(dialog).getByTestId("design-fit-view")).toBeInTheDocument()
+
+    // The chat stays inline: only the workbench is enlarged.
+    expect(dialog).not.toContainElement(chat)
+    expect(chat).toBeInTheDocument()
 
     // A case picked on the focused canvas drives the focused detail panel.
     fireEvent.click(screen.getByTestId("case-select-7001"))
@@ -156,7 +174,7 @@ describe("DesignFocusDialog", () => {
     expect(screen.getByTestId("case-card-7001")).toHaveAttribute("data-selected", "true")
   })
 
-  it("closes back to the prior inline layout, selection and scroll offsets", async () => {
+  it("closes back to the prior inline workbench, selection and scroll offsets", async () => {
     await renderWorkspace()
     fireEvent.click(screen.getByTestId("case-select-7001"))
     await waitFor(() =>
@@ -165,12 +183,10 @@ describe("DesignFocusDialog", () => {
     const detail = screen.getByTestId("case-detail")
     detail.scrollTop = 120
 
-    expect(screen.getByTestId("design-layer-mindmap").style.flexBasis).toBe("40%")
-    expect(screen.getByTestId("design-layer-detail").style.flexBasis).toBe("25%")
+    expect(screen.getByTestId("design-graph").style.flexBasis).toBe("65%")
+    expect(screen.getByTestId("design-detail").style.flexBasis).toBe("35%")
 
-    openFocus()
-    expect(screen.getByTestId("design-layer-mindmap").style.flexBasis).toBe("65%")
-
+    openWorkbenchZoom()
     fireEvent.click(screen.getByTestId("design-focus-close"))
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
@@ -178,27 +194,27 @@ describe("DesignFocusDialog", () => {
     expect(restored).toBe(detail)
     expect(restored.scrollTop).toBe(120)
     expect(restored).toHaveTextContent("退款 T+1 到账")
-    expect(screen.getByTestId("design-layer-mindmap").style.flexBasis).toBe("40%")
-    expect(screen.getByTestId("design-layer-detail").style.flexBasis).toBe("25%")
-    expect(screen.getByTestId("design-layer-chat").style.display).toBe("")
+    expect(screen.getByTestId("design-graph").style.flexBasis).toBe("65%")
+    expect(screen.getByTestId("design-detail").style.flexBasis).toBe("35%")
+    expect(screen.getByTestId("design-chat")).toBeInTheDocument()
     expect(screen.getByTestId("case-card-7001")).toHaveAttribute("data-selected", "true")
-    expect(screen.getByTestId("design-mindmap-expand")).toHaveAttribute("aria-expanded", "false")
+    expect(screen.getByTestId("design-workbench-zoom")).toHaveAttribute("aria-expanded", "false")
   })
 
-  it("moves the content instead of copying it, so no test id is duplicated", async () => {
+  it("moves the workbench content instead of copying it, so no test id is duplicated", async () => {
     await renderWorkspace()
     const inlineDuplicates = duplicateTestIds()
 
-    openFocus()
+    openWorkbenchZoom()
 
     expect(duplicateTestIds()).toEqual(inlineDuplicates)
     for (const testId of [
       "design-mindmap",
       "case-detail",
-      "design-layers",
-      "design-layer-mindmap",
-      "design-layer-detail",
-      "design-layer-chat",
+      "design-workbench",
+      "design-graph",
+      "design-detail",
+      "design-chat",
     ]) {
       expect(screen.getAllByTestId(testId)).toHaveLength(1)
     }
@@ -210,7 +226,7 @@ describe("DesignFocusDialog", () => {
     await renderWorkspace()
     expect(sse.connectSSE).toHaveBeenCalledTimes(1)
 
-    openFocus()
+    openWorkbenchZoom()
     expect(sse.connectSSE).toHaveBeenCalledTimes(1)
 
     fireEvent.click(screen.getByTestId("design-focus-close"))
@@ -218,7 +234,7 @@ describe("DesignFocusDialog", () => {
     expect(sse.connectSSE).toHaveBeenCalledTimes(1)
   })
 
-  it("re-fits the view only after the focus layout has settled", async () => {
+  it("re-fits the graph only after the enlarged layout has settled", async () => {
     await renderWorkspace()
     reactFlow.fitView.mockReset()
     const seenInsideDialog: boolean[] = []
@@ -226,7 +242,7 @@ describe("DesignFocusDialog", () => {
       seenInsideDialog.push(document.querySelector('[data-testid="design-focus-dialog"]') !== null)
     })
 
-    openFocus()
+    openWorkbenchZoom()
 
     // The size change is committed in a later frame: fitting against the very
     // tick that toggled the dialog would measure the stale inline canvas.
