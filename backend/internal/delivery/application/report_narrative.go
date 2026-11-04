@@ -51,9 +51,25 @@ var (
 	reportRequirementCoverageClaim = regexp.MustCompile(`需求覆盖\s*[:：]\s*(\d+)\s*/\s*(\d+)`)
 	reportNotRunGapClaim           = regexp.MustCompile(`未覆盖\s*(\d+)\s*个用例版本[^\n。；]{0,24}execution_not_run`)
 	reportFailedCoverageGapClaim   = regexp.MustCompile(`未有效覆盖\s*(\d+)\s*个用例版本[^\n。；]{0,24}execution_failed_coverage`)
+	reportFlakyCoverageGapClaim    = regexp.MustCompile(`未有效覆盖\s*(\d+)\s*个用例版本[^\n。；]{0,24}execution_flaky_coverage`)
+	reportFlakyTriageClaim         = regexp.MustCompile(`flaky\s*分诊\s*(\d+)\s*条`)
 	reportRequirementCode          = regexp.MustCompile(`(?i)FR[\s_\-]*0*(\d+)`)
 	reportNarrativeSentenceSplit   = regexp.MustCompile(`[\n。！？]+`)
 )
+
+// reportProductDefectPhrases are the ways a narrative presents a failed run as
+// a product/application defect. They are only rejected when no real application
+// failure remains after honoring the platform triage (Task 118); a truthfully
+// negated phrase ("不计入产品缺陷") stays allowed.
+var reportProductDefectPhrases = []string{
+	"application",
+	"产品缺陷",
+	"缺陷结论",
+	"按缺陷",
+	"产品行为",
+	"产品问题",
+	"缺陷已有",
+}
 
 // reportNoValidExecutionPhrases are the absolute/scoped ways a model dismisses
 // deterministic case results. Scoped occurrences are checked against the
@@ -78,7 +94,10 @@ var reportAbsoluteNoExecutionPhrases = []string{"没有任何用例版本", "所
 
 // reportNegationMarkers prevent instructions such as "不得表述为无有效执行"
 // from being mistaken for the claim itself.
-var reportNegationMarkers = []string{"不得", "不应", "不是", "并非", "而非", "避免", "不能", "不存在"}
+var reportNegationMarkers = []string{
+	"不得", "不应", "不是", "并非", "而非", "避免", "不能", "不存在",
+	"不计为", "不计入", "不属于", "无产品",
+}
 
 // validateReportNarrative returns ErrReportNarrativeContradictsResults when the
 // narrative states a deterministic fact (coverage count, gap count, executed
@@ -104,7 +123,7 @@ func validateReportNarrative(snapshot delivery.ReportSnapshot, narrative string)
 				snapshot.Coverage.RequirementsCovered, snapshot.Coverage.RequirementsTotal)
 		}
 	}
-	notRun, failedCoverage := reportCoverageGapCounts(snapshot.Coverage.Gaps)
+	notRun, failedCoverage, flakyCoverage := reportCoverageGapCounts(snapshot.Coverage.Gaps)
 	for _, match := range reportNotRunGapClaim.FindAllStringSubmatch(narrative, -1) {
 		if claimed := reportAtoi(match[1]); claimed != notRun {
 			return fmt.Errorf("%w: 未覆盖 %d 个用例版本（execution_not_run），确定性缺口为 %d 个",
@@ -115,6 +134,18 @@ func validateReportNarrative(snapshot delivery.ReportSnapshot, narrative string)
 		if claimed := reportAtoi(match[1]); claimed != failedCoverage {
 			return fmt.Errorf("%w: 未有效覆盖 %d 个用例版本（execution_failed_coverage），确定性缺口为 %d 个",
 				ErrReportNarrativeContradictsResults, claimed, failedCoverage)
+		}
+	}
+	for _, match := range reportFlakyCoverageGapClaim.FindAllStringSubmatch(narrative, -1) {
+		if claimed := reportAtoi(match[1]); claimed != flakyCoverage {
+			return fmt.Errorf("%w: 未有效覆盖 %d 个用例版本（execution_flaky_coverage），确定性缺口为 %d 个",
+				ErrReportNarrativeContradictsResults, claimed, flakyCoverage)
+		}
+	}
+	for _, match := range reportFlakyTriageClaim.FindAllStringSubmatch(narrative, -1) {
+		if claimed := reportAtoi(match[1]); claimed != reportFlakyTriageCount(snapshot) {
+			return fmt.Errorf("%w: flaky 分诊 %d 条，确定性 flaky 结果为 %d 条",
+				ErrReportNarrativeContradictsResults, claimed, reportFlakyTriageCount(snapshot))
 		}
 	}
 	for _, sentence := range reportNarrativeSentenceSplit.Split(narrative, -1) {
@@ -137,7 +168,71 @@ func validateReportNarrative(snapshot delivery.ReportSnapshot, narrative string)
 			}
 		}
 	}
+	// Task 118: the platform triage is authoritative. When every application
+	// failure of the report was triaged flaky, a product/application defect
+	// conclusion is false and must be rewritten (the publisher falls back to the
+	// deterministic summary). A real application failure keeps the defect path
+	// untouched.
+	if reportFlakyTriageCount(snapshot) > 0 && reportApplicationDefectCount(snapshot) == 0 &&
+		reportClaimsProductDefect(narrative) {
+		return fmt.Errorf("%w: 平台 triage 已将该失败分类为 flaky（自动化不稳定），不得按 application/产品缺陷结论呈现",
+			ErrReportNarrativeContradictsResults)
+	}
 	return nil
+}
+
+// reportClaimsProductDefect reports whether the narrative presents a product
+// defect without a negation marker right before the claim.
+func reportClaimsProductDefect(narrative string) bool {
+	for _, sentence := range reportNarrativeSentenceSplit.Split(narrative, -1) {
+		sentence = strings.TrimSpace(sentence)
+		if sentence == "" {
+			continue
+		}
+		lower := strings.ToLower(sentence)
+		for _, phrase := range reportProductDefectPhrases {
+			needle := strings.ToLower(phrase)
+			for offset := 0; offset < len(lower); {
+				index := strings.Index(lower[offset:], needle)
+				if index < 0 {
+					break
+				}
+				start := offset + index
+				// Use the original sentence for the negation window so case
+				// folding cannot shift the prefix the marker is looked up in.
+				if !reportPhraseNegated(sentence, start) {
+					return true
+				}
+				offset = start + len(needle)
+			}
+		}
+	}
+	return false
+}
+
+// reportFlakyTriageCount counts the report runs whose platform triage finished
+// with classification=flaky.
+func reportFlakyTriageCount(snapshot delivery.ReportSnapshot) int {
+	count := 0
+	for _, run := range snapshot.CaseRuns {
+		if run.TriageClassification == delivery.TriageClassificationFlaky {
+			count++
+		}
+	}
+	return count
+}
+
+// reportApplicationDefectCount counts failed runs that remain an application
+// failure after honoring the triage. It is the authority that keeps real
+// application defects on the product-defect path.
+func reportApplicationDefectCount(snapshot delivery.ReportSnapshot) int {
+	count := 0
+	for _, run := range snapshot.CaseRuns {
+		if run.Status == "failed" && run.EffectiveFailureClass() == "application" {
+			count++
+		}
+	}
+	return count
 }
 
 // reportNarrativeForSnapshot is the publish-time guard: a contradictory
@@ -159,6 +254,8 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 
 	statusCounts := make(map[string]int, len(snapshot.CaseRuns))
 	other := 0
+	flakyRuns := 0
+	applicationDefects := 0
 	for _, run := range snapshot.CaseRuns {
 		statusCounts[run.Status]++
 		switch run.Status {
@@ -166,10 +263,24 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 		default:
 			other++
 		}
+		if run.TriageClassification == delivery.TriageClassificationFlaky {
+			flakyRuns++
+		}
+		if run.Status == "failed" && run.EffectiveFailureClass() == "application" {
+			applicationDefects++
+		}
 	}
 	fmt.Fprintf(&builder, "- 执行总数 %d：通过（passed）%d、失败（failed）%d、受阻（blocked）%d、不确定（inconclusive）%d、跳过（skipped）%d、其他 %d。\n",
 		len(snapshot.CaseRuns), statusCounts["passed"], statusCounts["failed"], statusCounts["blocked"],
 		statusCounts["inconclusive"], statusCounts["skipped"], other)
+	if flakyRuns > 0 {
+		if applicationDefects == 0 {
+			fmt.Fprintf(&builder, "- 失败分类：flaky 分诊 %d 条（自动化不稳定），不计入产品缺陷。\n", flakyRuns)
+		} else {
+			fmt.Fprintf(&builder, "- 失败分类：flaky 分诊 %d 条（自动化不稳定，不计入产品缺陷）；真实产品缺陷 %d 条。\n",
+				flakyRuns, applicationDefects)
+		}
+	}
 
 	if len(snapshot.CaseRuns) > 0 {
 		builder.WriteString("- 用例结果：\n")
@@ -187,8 +298,13 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 	fmt.Fprintf(&builder, "- 用例版本覆盖：%d / %d；需求覆盖：%d / %d。\n",
 		snapshot.Coverage.CaseVersionsCovered, snapshot.Coverage.CaseVersionsTotal,
 		snapshot.Coverage.RequirementsCovered, snapshot.Coverage.RequirementsTotal)
-	notRun, failedCoverage := reportCoverageGapCounts(snapshot.Coverage.Gaps)
-	fmt.Fprintf(&builder, "- 覆盖缺口：execution_not_run %d 个；execution_failed_coverage %d 个。\n", notRun, failedCoverage)
+	notRun, failedCoverage, flakyCoverage := reportCoverageGapCounts(snapshot.Coverage.Gaps)
+	builder.WriteString("- 覆盖缺口：")
+	fmt.Fprintf(&builder, "execution_not_run %d 个；execution_failed_coverage %d 个", notRun, failedCoverage)
+	if flakyCoverage > 0 {
+		fmt.Fprintf(&builder, "；execution_flaky_coverage %d 个", flakyCoverage)
+	}
+	builder.WriteString("。\n")
 
 	if len(snapshot.Coverage.ByRequirement) > 0 {
 		builder.WriteString("- 需求覆盖：\n")
@@ -197,19 +313,32 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 				fmt.Fprintf(&builder, "  - 其余 %d 个需求见报告覆盖章节。\n", len(snapshot.Coverage.ByRequirement)-index)
 				break
 			}
-			fmt.Fprintf(&builder, "  - %s：覆盖 %d / %d（execution_not_run %d、execution_failed_coverage %d）。\n",
+			fmt.Fprintf(&builder, "  - %s：覆盖 %d / %d（execution_not_run %d、execution_failed_coverage %d",
 				reportRequirementLabel(snapshot, row.RequirementID), row.CaseVersionsCovered, row.CaseVersionsTotal,
 				row.CaseVersionsNotRun, row.CaseVersionsFailedCoverage)
+			if row.CaseVersionsFlakyCoverage > 0 {
+				fmt.Fprintf(&builder, "、execution_flaky_coverage %d", row.CaseVersionsFlakyCoverage)
+			}
+			builder.WriteString("）。\n")
 		}
 	}
 
 	openIssues := 0
+	flakyIssues := 0
 	for _, issue := range snapshot.Issues {
 		if issue.Status == delivery.IssueStatusOpen {
 			openIssues++
 		}
+		if issue.FlakyTriage() {
+			flakyIssues++
+		}
 	}
-	fmt.Fprintf(&builder, "- 问题 %d 个（未关闭 %d）。\n", len(snapshot.Issues), openIssues)
+	if flakyIssues > 0 {
+		fmt.Fprintf(&builder, "- 问题 %d 个（未关闭 %d；其中 flaky 分诊 %d 个，不计入产品缺陷）。\n",
+			len(snapshot.Issues), openIssues, flakyIssues)
+	} else {
+		fmt.Fprintf(&builder, "- 问题 %d 个（未关闭 %d）。\n", len(snapshot.Issues), openIssues)
+	}
 	if len(snapshot.TruncatedSections) > 0 {
 		fmt.Fprintf(&builder, "- 已截断章节：%s。\n", strings.Join(snapshot.TruncatedSections, "、"))
 	}
@@ -217,16 +346,18 @@ func deterministicReportNarrative(snapshot delivery.ReportSnapshot) string {
 }
 
 // reportCoverageGapCounts splits the deterministic gap list by reason.
-func reportCoverageGapCounts(gaps []delivery.CoverageGapSnapshot) (notRun, failedCoverage int) {
+func reportCoverageGapCounts(gaps []delivery.CoverageGapSnapshot) (notRun, failedCoverage, flakyCoverage int) {
 	for _, gap := range gaps {
 		switch gap.Reason {
 		case "execution_not_run":
 			notRun++
 		case "execution_failed_coverage":
 			failedCoverage++
+		case delivery.CoverageGapExecutionFlaky:
+			flakyCoverage++
 		}
 	}
-	return notRun, failedCoverage
+	return notRun, failedCoverage, flakyCoverage
 }
 
 // reportClaimsNoValidExecution reports whether the sentence contains a

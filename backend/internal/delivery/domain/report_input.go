@@ -232,12 +232,12 @@ type CaseRunSnapshot struct {
 	// RequirementID is the design requirement the case version belongs to. It
 	// connects a case result with the per-requirement coverage projection and
 	// is derived metadata: it is not part of the canonical fingerprint payload.
-	RequirementID        int64
-	CaseTitle            string
-	VersionSUTID         *int64
-	VersionSUTIDs        []int64
-	Status               string
-	FailureClass         string
+	RequirementID int64
+	CaseTitle     string
+	VersionSUTID  *int64
+	VersionSUTIDs []int64
+	Status        string
+	FailureClass  string
 	// TriageClassification is the latest finished platform triage
 	// classification of the issue that references this run (empty when none).
 	// A flaky classification overrides the report-visible classification; the

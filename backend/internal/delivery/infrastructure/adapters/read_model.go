@@ -96,6 +96,13 @@ type IssueReader interface {
 	ListRefs(ctx context.Context, issueID int64) ([]delivery.IssueRef, error)
 }
 
+// TriageReader reads the latest finished issue.triage analysis run. It is
+// optional: without it the report keeps the raw P3 failure classification
+// (older wirings and unit fixtures never silently downgrade a defect).
+type TriageReader interface {
+	LatestByIssue(ctx context.Context, issueID int64) (delivery.AnalysisRun, bool, error)
+}
+
 // Deps groups the application read surfaces of the delivery adapters.
 type Deps struct {
 	Versions     VersionReader
@@ -110,6 +117,7 @@ type Deps struct {
 	Intents      IntentReader
 	Humans       HumanReader
 	Issues       IssueReader
+	Triage       TriageReader
 }
 
 // pageSize is the shared page size of the application readers (all repositories
@@ -628,10 +636,11 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	issueSnapshots, err := m.issueSnapshots(ctx, versionID, &waveID, runIDSet(runs))
+	issueSnapshots, flakyRuns, err := m.issueSnapshots(ctx, versionID, &waveID, runIDSet(runs))
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
+	applyRunTriage(modelRuns, flakyRuns)
 	requirementViews, err := m.requirementViews(ctx, versionID)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
@@ -640,7 +649,7 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	coverage, err := m.coverage(ctx, versionID, requirementViews, versionRuns)
+	coverage, err := m.coverage(ctx, versionID, requirementViews, versionRuns, flakyRuns)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -690,11 +699,12 @@ func (m *readModel) versionModel(ctx context.Context, versionID int64) (delivery
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	coverage, err := m.coverage(ctx, versionID, requirementViews, runs)
+	issueSnapshots, flakyRuns, err := m.issueSnapshots(ctx, versionID, nil, nil)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	issueSnapshots, err := m.issueSnapshots(ctx, versionID, nil, nil)
+	applyRunTriage(modelRuns, flakyRuns)
+	coverage, err := m.coverage(ctx, versionID, requirementViews, runs, flakyRuns)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -819,8 +829,10 @@ func coverageLatestRuns(runs []execution.CaseRun) map[int64]execution.CaseRun {
 // confirmed case whose latest non-superseded run did not pass is a gap. The
 // projection is derived from the version's own case_run snapshot, not from a
 // separate newest-row query, so a cancelled wave that merely supersedes runs
-// cannot overwrite a result the report already counted.
-func (m *readModel) coverage(ctx context.Context, versionID int64, requirements []versionapp.RequirementView, runs []execution.CaseRun) (delivery.CoverageSnapshot, error) {
+// cannot overwrite a result the report already counted. A failed run whose
+// issue triage is flaky is a flaky gap (never a pass, but not a product
+// coverage failure).
+func (m *readModel) coverage(ctx context.Context, versionID int64, requirements []versionapp.RequirementView, runs []execution.CaseRun, flakyRuns map[int64]bool) (delivery.CoverageSnapshot, error) {
 	cases, err := m.deps.Design.ListExecutable(ctx, versionID)
 	if err != nil {
 		return delivery.CoverageSnapshot{}, fmt.Errorf("list executable cases: %w", err)
@@ -852,7 +864,10 @@ func (m *readModel) coverage(ctx context.Context, versionID int64, requirements 
 			continue
 		}
 		reason := "execution_not_run"
-		if ok {
+		switch {
+		case ok && flakyRuns[run.ID]:
+			reason = delivery.CoverageGapExecutionFlaky
+		case ok:
 			reason = "execution_failed_coverage"
 		}
 		coverage.Gaps = append(coverage.Gaps, delivery.CoverageGapSnapshot{
@@ -861,7 +876,7 @@ func (m *readModel) coverage(ctx context.Context, versionID int64, requirements 
 			Reason:        reason,
 		})
 	}
-	coverage.ByRequirement = requirementCoverageRows(requirements, cases, latest)
+	coverage.ByRequirement = requirementCoverageRows(requirements, cases, latest, flakyRuns)
 	return coverage, nil
 }
 
@@ -870,7 +885,7 @@ func (m *readModel) coverage(ctx context.Context, versionID int64, requirements 
 // Rows are emitted for every version requirement (including requirements with no
 // executable case version) in ascending requirement ID order, so the report
 // writer and the narrative guard see the same deterministic facts.
-func requirementCoverageRows(requirements []versionapp.RequirementView, cases []designapp.ExecutableCaseView, latest map[int64]execution.CaseRun) []delivery.RequirementCoverageSnapshot {
+func requirementCoverageRows(requirements []versionapp.RequirementView, cases []designapp.ExecutableCaseView, latest map[int64]execution.CaseRun, flakyRuns map[int64]bool) []delivery.RequirementCoverageSnapshot {
 	byID := make(map[int64]*delivery.RequirementCoverageSnapshot, len(requirements)+1)
 	row := func(requirementID int64) *delivery.RequirementCoverageSnapshot {
 		if existing, ok := byID[requirementID]; ok {
@@ -890,6 +905,8 @@ func requirementCoverageRows(requirements []versionapp.RequirementView, cases []
 		switch {
 		case ok && run.Status == execution.CaseRunPassed:
 			entry.CaseVersionsCovered++
+		case ok && flakyRuns[run.ID]:
+			entry.CaseVersionsFlakyCoverage++
 		case ok:
 			entry.CaseVersionsFailedCoverage++
 		default:
@@ -928,19 +945,22 @@ func (m *readModel) versionSUTs(ctx context.Context, versionID int64) ([]deliver
 	return out, nil
 }
 
-// issueSnapshots drains the version issues and joins refs plus the reverse
-// merged_into projection. When waveID/runIDs are set only issues referencing
-// that wave or one of its runs are returned.
-func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID *int64, runIDs map[int64]bool) ([]delivery.IssueSnapshot, error) {
+// issueSnapshots drains the version issues and joins refs, the latest finished
+// issue.triage projection and the reverse merged_into projection. When
+// waveID/runIDs are set only issues referencing that wave or one of its runs
+// are returned. It also returns the case_run IDs whose triage is flaky: those
+// runs are automation flakiness, not product defects, for the whole version
+// projection (a wave report still uses the version-level coverage gaps).
+func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID *int64, runIDs map[int64]bool) ([]delivery.IssueSnapshot, map[int64]bool, error) {
 	if m.deps.Issues == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	issues := make([]delivery.Issue, 0)
 	var before int64
 	for {
 		page, err := m.deps.Issues.List(ctx, versionID, deliveryapp.IssueFilter{Before: before, Limit: pageSize})
 		if err != nil {
-			return nil, fmt.Errorf("list issues: %w", err)
+			return nil, nil, fmt.Errorf("list issues: %w", err)
 		}
 		issues = append(issues, page...)
 		if len(page) < pageSize {
@@ -955,14 +975,44 @@ func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID 
 	sort.Slice(issues, func(i, j int) bool { return issues[i].ID < issues[j].ID })
 	refsByIssue := make(map[int64][]delivery.IssueRef, len(issues))
 	mergedSources := make(map[int64][]int64)
+	flakyRuns := make(map[int64]bool)
+	type triageProjection struct {
+		status         string
+		classification string
+	}
+	triageByIssue := make(map[int64]triageProjection, len(issues))
 	for _, issue := range issues {
 		refs, err := m.deps.Issues.ListRefs(ctx, issue.ID)
 		if err != nil {
-			return nil, fmt.Errorf("list issue refs %d: %w", issue.ID, err)
+			return nil, nil, fmt.Errorf("list issue refs %d: %w", issue.ID, err)
 		}
 		refsByIssue[issue.ID] = refs
 		if issue.MergedIntoID != nil && *issue.MergedIntoID > 0 {
 			mergedSources[*issue.MergedIntoID] = append(mergedSources[*issue.MergedIntoID], issue.ID)
+		}
+		if m.deps.Triage == nil {
+			continue
+		}
+		run, found, err := m.deps.Triage.LatestByIssue(ctx, issue.ID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load issue %d triage: %w", issue.ID, err)
+		}
+		if !found {
+			continue
+		}
+		projection := triageProjection{
+			status:         string(run.Status),
+			classification: delivery.TriageOutputClassification(run),
+		}
+		triageByIssue[issue.ID] = projection
+		if projection.status != string(delivery.AnalysisStatusDone) ||
+			projection.classification != delivery.TriageClassificationFlaky {
+			continue
+		}
+		for _, ref := range refs {
+			if ref.Kind == delivery.IssueRefKindCaseRun && ref.RefID > 0 {
+				flakyRuns[ref.RefID] = true
+			}
 		}
 	}
 	snapshots := make([]delivery.IssueSnapshot, 0, len(issues))
@@ -979,22 +1029,36 @@ func (m *readModel) issueSnapshots(ctx context.Context, versionID int64, waveID 
 				caseRunIDs = append(caseRunIDs, ref.RefID)
 			}
 		}
+		triage := triageByIssue[issue.ID]
 		snapshots = append(snapshots, delivery.IssueSnapshot{
-			ID:             issue.ID,
-			VersionID:      issue.VersionID,
-			Title:          issue.Title,
-			Status:         issue.Status,
-			Category:       issue.Category,
-			Severity:       issue.Severity,
-			Source:         issue.Source,
-			MergedIntoID:   issue.MergedIntoID,
-			SourceIssueIDs: mergedSources[issue.ID],
-			CaseRunIDs:     caseRunIDs,
-			CreatedAt:      issue.CreatedAt,
-			UpdatedAt:      issue.UpdatedAt,
+			ID:                   issue.ID,
+			VersionID:            issue.VersionID,
+			Title:                issue.Title,
+			Status:               issue.Status,
+			Category:             issue.Category,
+			Severity:             issue.Severity,
+			Source:               issue.Source,
+			MergedIntoID:         issue.MergedIntoID,
+			SourceIssueIDs:       mergedSources[issue.ID],
+			CaseRunIDs:           caseRunIDs,
+			TriageStatus:         triage.status,
+			TriageClassification: triage.classification,
+			CreatedAt:            issue.CreatedAt,
+			UpdatedAt:            issue.UpdatedAt,
 		})
 	}
-	return snapshots, nil
+	return snapshots, flakyRuns, nil
+}
+
+// applyRunTriage marks the report projection of every run referenced by a
+// flaky-triaged issue. The raw FailureClass stays untouched; readers use
+// CaseRunSnapshot.EffectiveFailureClass for the report-visible conclusion.
+func applyRunTriage(runs []delivery.CaseRunSnapshot, flakyRuns map[int64]bool) {
+	for index := range runs {
+		if flakyRuns[runs[index].ID] {
+			runs[index].TriageClassification = delivery.TriageClassificationFlaky
+		}
+	}
 }
 
 // issueMatchesWave reports whether the issue references the wave or one of its

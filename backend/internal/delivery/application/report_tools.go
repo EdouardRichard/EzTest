@@ -100,7 +100,7 @@ type reportDataReadTool struct{ svc *ReportService }
 func (t *reportDataReadTool) Name() string { return agenttools.ToolReportDataRead }
 
 func (t *reportDataReadTool) Description() string {
-	return "Read the deterministic summary of the current report task: IDs, section/status counts, per-case result counters (status/steps/assertions/evidence), coverage counts including per-requirement coverage and gap reasons, and truncation markers. Never returns titles, narrative text, evidence bytes/hashes, credentials or filesystem paths. Read-only."
+	return "Read the deterministic summary of the current report task: IDs, section/status counts, per-case result counters (status/steps/assertions/evidence), the triage-honoring and raw failure classification, issue triage counts, coverage counts including per-requirement coverage and gap reasons, and truncation markers. Never returns titles, narrative text, evidence bytes/hashes, credentials or filesystem paths. Read-only."
 }
 
 func (t *reportDataReadTool) Parameters() json.RawMessage { return reportToolSchema(nil) }
@@ -147,12 +147,16 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 	}
 	caseRunStatus := make(map[string]int)
 	caseRunFailureClass := make(map[string]int)
+	caseRunRawFailureClass := make(map[string]int)
 	evidenceCount := 0
 	caseResults := make([]map[string]any, 0, min(len(snapshot.CaseRuns), reportSummaryMaxCaseResults))
 	for index, run := range snapshot.CaseRuns {
 		caseRunStatus[run.Status]++
+		if effective := run.EffectiveFailureClass(); effective != "" {
+			caseRunFailureClass[effective]++
+		}
 		if run.FailureClass != "" {
-			caseRunFailureClass[run.FailureClass]++
+			caseRunRawFailureClass[run.FailureClass]++
 		}
 		evidenceCount += len(run.Evidence)
 		if index >= reportSummaryMaxCaseResults {
@@ -162,7 +166,9 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"case_version_id":        platformid.Format(run.CaseVersionID),
 			"requirement_id":         platformid.Format(run.RequirementID),
 			"status":                 run.Status,
-			"failure_class":          run.FailureClass,
+			"failure_class":          run.EffectiveFailureClass(),
+			"run_failure_class":      run.FailureClass,
+			"triage_classification":  run.TriageClassification,
 			"step_count":             run.StepCount,
 			"step_failed_count":      run.StepFailedCount,
 			"assertion_count":        run.AssertionCount,
@@ -174,10 +180,18 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 	issueStatus := make(map[string]int)
 	issueSeverity := make(map[string]int)
 	issueCategory := make(map[string]int)
+	issueTriage := make(map[string]int)
+	flakyIssues := 0
 	for _, issue := range snapshot.Issues {
 		issueStatus[string(issue.Status)]++
 		issueSeverity[issue.Severity]++
 		issueCategory[issue.Category]++
+		if issue.TriageClassification != "" {
+			issueTriage[issue.TriageClassification]++
+		}
+		if issue.FlakyTriage() {
+			flakyIssues++
+		}
 	}
 	gaps := make([]map[string]any, 0, len(snapshot.Coverage.Gaps))
 	gapsByReason := make(map[string]int)
@@ -200,6 +214,7 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"case_versions_covered":         row.CaseVersionsCovered,
 			"case_versions_not_run":         row.CaseVersionsNotRun,
 			"case_versions_failed_coverage": row.CaseVersionsFailedCoverage,
+			"case_versions_flaky_coverage":  row.CaseVersionsFlakyCoverage,
 		})
 	}
 	versionSUTIDs := make([]string, 0, len(snapshot.VersionSUTs))
@@ -240,9 +255,10 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"by_version_sut": byVersionSUT,
 		},
 		"case_runs": map[string]any{
-			"total":            len(snapshot.CaseRuns),
-			"by_status":        caseRunStatus,
-			"by_failure_class": caseRunFailureClass,
+			"total":                len(snapshot.CaseRuns),
+			"by_status":            caseRunStatus,
+			"by_failure_class":     caseRunFailureClass,
+			"by_run_failure_class": caseRunRawFailureClass,
 		},
 		"case_results": caseResults,
 		"issues": map[string]any{
@@ -250,6 +266,8 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"by_status":   issueStatus,
 			"by_severity": issueSeverity,
 			"by_category": issueCategory,
+			"by_triage":   issueTriage,
+			"flaky":       flakyIssues,
 		},
 		"coverage": map[string]any{
 			"requirements_total":    snapshot.Coverage.RequirementsTotal,

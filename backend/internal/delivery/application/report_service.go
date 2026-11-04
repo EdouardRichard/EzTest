@@ -249,6 +249,13 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 	if err != nil {
 		return err
 	}
+	// Mark every published report whose deterministic input changed as stale
+	// before the wave loop: a wave report published before an issue triage
+	// finished must be regenerated once the triage projection is part of the
+	// snapshot (Task 118), even when the version report is not due yet.
+	if _, err := s.MarkStaleIfChanged(ctx, versionID); err != nil {
+		return err
+	}
 	existing, err := s.repo.ListReports(ctx, versionID, ReportFilter{Limit: 100})
 	if err != nil {
 		return mapReportError(err)
@@ -264,8 +271,16 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 		if !terminalWaveStatus(wave.Status) {
 			continue
 		}
-		if report, ok := waveReports[wave.ID]; ok && reportHasPublishedRevision(report) {
-			continue
+		if report, ok := waveReports[wave.ID]; ok {
+			if report.Status == delivery.ReportStatusStale {
+				if _, err := s.Regenerate(ctx, versionID, report.ID); err != nil {
+					return err
+				}
+				continue
+			}
+			if reportHasPublishedRevision(report) {
+				continue
+			}
 		}
 		if _, err := s.EnsureWaveReport(ctx, versionID, wave.ID); err != nil {
 			return err
@@ -285,9 +300,6 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 	}
 	if !versionReportDue(snapshot) {
 		return nil
-	}
-	if _, err := s.MarkStaleIfChanged(ctx, versionID); err != nil {
-		return err
 	}
 	refreshKind := delivery.ReportKindVersion
 	refreshed, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &refreshKind, Limit: 1})

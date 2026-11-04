@@ -166,6 +166,7 @@ func newTestAPI(t *testing.T) *testAPI {
 		Waves: executionRepo.Waves, CaseRuns: executionRepo.CaseRuns, Results: executionRepo.Results,
 		Evidence: executionRepo.Evidence, SUTContexts: executionRepo.SUTContexts,
 		Intents: executionRepo.Intents, Humans: executionRepo.Humans, Issues: issueRepo,
+		Triage: analysisRepo,
 	}
 	deliveryEvents := deliveryadapters.NewEventPublisher(eventSvc)
 	deliveryAudit := deliveryadapters.NewAuditSink(auditSvc)
