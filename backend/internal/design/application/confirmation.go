@@ -107,7 +107,7 @@ func (s *GraphService) ConfirmCasesByIDs(ctx context.Context, versionID int64, c
 		if data.Selected.Status != design.CaseStatusDraft {
 			continue
 		}
-		if err := validateConfirmableCaseVersion(design.CaseWithCurrent{Case: data.Case, Current: &data.Selected}); err != nil {
+		if err := s.validateConfirmableCaseVersion(ctx, versionID, design.CaseWithCurrent{Case: data.Case, Current: &data.Selected}); err != nil {
 			return err
 		}
 	}
@@ -314,7 +314,7 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 		// version that lost its designed steps/assertions cannot be confirmed
 		// alongside its complete siblings.
 		for _, item := range toConfirm {
-			if err := validateConfirmableCaseVersion(item); err != nil {
+			if err := s.validateConfirmableCaseVersion(ctx, versionID, item); err != nil {
 				return err
 			}
 		}
@@ -419,19 +419,23 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 	return result, nil
 }
 
-// validateConfirmableCaseVersion enforces the Task 95 finalize rule: a case
-// version may only enter the confirmed set when it carries at least one step
-// and one assertion. The PO O8 AC-FR-011-01 version (1 step, 0 assertions) was
-// confirmed and then executed into inconclusive(incomplete); confirmation must
-// instead return a typed repair request.
-func validateConfirmableCaseVersion(item design.CaseWithCurrent) error {
+// validateConfirmableCaseVersion enforces the confirmed-version rules: a case
+// version may only enter the confirmed set when it is complete (Task 95 finalize
+// rule) and every kind=visual assertion resolves to an active visual_assertion
+// configuration (Task 115). The PO O8 AC-FR-011-01 version (1 step, 0
+// assertions) was confirmed and then executed into inconclusive(incomplete);
+// the retry11 FR-025 version carried a visual assertion without a
+// visual_assertion_id and executed into inconclusive(visual_assertion_not_run).
+// Confirmation must instead return a typed repair request before anything is
+// frozen.
+func (s *GraphService) validateConfirmableCaseVersion(ctx context.Context, versionID int64, item design.CaseWithCurrent) error {
 	if item.Current == nil {
 		return nil
 	}
-	if design.CaseVersionComplete(*item.Current) {
-		return nil
+	if !design.CaseVersionComplete(*item.Current) {
+		return incompleteCaseVersionError(item)
 	}
-	return incompleteCaseVersionError(item)
+	return s.validateVisualAssertionReferences(ctx, versionID, item)
 }
 
 // incompleteCaseVersionError is the typed 409 block/repair response for an

@@ -72,6 +72,8 @@ import (
 	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
+	visualapp "github.com/EdouardRichard/EzTest/backend/internal/visual/application"
+	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
 )
 
 var version = "0.2.1"
@@ -504,6 +506,37 @@ func (a designCaseRunStatuses) LatestCaseRunStatuses(ctx context.Context, versio
 		statuses[caseVersionID] = string(run.Status)
 	}
 	return statuses, nil
+}
+
+// designVisualAssertions adapts the visual context's assertion configuration
+// service onto the design graph's confirmation resolver port (Task 115). The
+// composition root is the only place that knows both contexts: design reads the
+// visual_assertion rows through this port, never through the visual tables
+// (spec §2.1).
+type designVisualAssertions struct {
+	configs *visualapp.ConfigService
+}
+
+func (a designVisualAssertions) ListActiveVisualAssertions(ctx context.Context, versionID, caseVersionID int64) ([]designapp.VisualAssertionRef, error) {
+	if a.configs == nil {
+		return nil, errors.New("design visual assertion resolver is not configured")
+	}
+	list, err := a.configs.List(ctx, versionID, &caseVersionID, nil)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]designapp.VisualAssertionRef, 0, len(list))
+	for _, config := range list {
+		if config.Status != visual.AssertionActive || config.ID <= 0 ||
+			config.CaseAssertionID <= 0 || config.CaseVersionID != caseVersionID {
+			continue
+		}
+		refs = append(refs, designapp.VisualAssertionRef{
+			ID:              config.ID,
+			CaseAssertionID: config.CaseAssertionID,
+		})
+	}
+	return refs, nil
 }
 
 // caseRunCanceller breaks the construction cycle between the execution
@@ -1095,6 +1128,11 @@ func main() {
 		// P7 §4.5: the codeintel worker stops claiming while this replica drains.
 		DrainGate: p7OrchestrationRuntime.Service.IsDraining,
 	})
+	// Task 115: confirmation must resolve every kind=visual assertion to an
+	// active visual_assertion configuration before freezing the case version,
+	// so execution can map it to execution.visual_assert instead of running
+	// into inconclusive(visual_assertion_not_run).
+	designGraph.SetVisualAssertionResolver(designVisualAssertions{configs: p5.VisualConfigs})
 
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)

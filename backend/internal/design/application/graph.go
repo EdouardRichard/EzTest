@@ -41,6 +41,10 @@ type GraphService struct {
 	reopener  VersionReopener
 	caseRuns  CaseRunStatusReader
 	discovery DiscoveryFactsReader
+	// visual resolves the active visual_assertion configurations of a case
+	// version so confirmation can require a resolvable visual_assertion_id
+	// before a kind=visual assertion reaches execution (Task 115).
+	visual VisualAssertionResolver
 }
 
 // NewGraphService wires the graph service. audit, events and teamRoom are
@@ -84,6 +88,16 @@ func (s *GraphService) reopenCompleted(ctx context.Context, versionID int64, rea
 func (s *GraphService) SetCaseRunStatusReader(reader CaseRunStatusReader) *GraphService {
 	if s != nil {
 		s.caseRuns = reader
+	}
+	return s
+}
+
+// SetVisualAssertionResolver attaches the visual context read port used by
+// confirmation to require a resolvable visual_assertion_id for every
+// kind=visual assertion (Task 115). It returns the service for fluent wiring.
+func (s *GraphService) SetVisualAssertionResolver(resolver VisualAssertionResolver) *GraphService {
+	if s != nil {
+		s.visual = resolver
 	}
 	return s
 }
@@ -873,6 +887,10 @@ type ExecutableStepView struct {
 // ExecutableAssertionView is one P3 case assertion projection. AssertionSeq is
 // derived server-side by ascending case_assertion ID (P3-D-06).
 type ExecutableAssertionView struct {
+	// CaseAssertionID is the design case_assertion.id. Execution uses it to
+	// join the visual assertion configuration to the exact design assertion
+	// (Task 115), not just to a derived position.
+	CaseAssertionID    int64
 	StepSeq            int
 	AssertionSeq       int
 	Kind               string
@@ -979,6 +997,7 @@ func executableCaseView(data design.ExecutableCase) ExecutableCaseView {
 	}
 	for _, assertion := range version.Assertions {
 		view.Assertions = append(view.Assertions, ExecutableAssertionView{
+			CaseAssertionID:    assertion.ID,
 			StepSeq:            assertion.StepSeq,
 			AssertionSeq:       assertion.AssertionSeq,
 			Kind:               assertion.Kind,

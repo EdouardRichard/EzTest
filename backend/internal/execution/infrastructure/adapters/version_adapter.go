@@ -388,6 +388,7 @@ func mapExecutableCase(view designapp.ExecutableCaseView) execution.CaseSnapshot
 			used = append(used, target)
 		}
 		snapshot.Assertions = append(snapshot.Assertions, execution.CaseAssertion{
+			CaseAssertionID:    assertion.CaseAssertionID,
 			StepSeq:            assertion.StepSeq,
 			AssertionSeq:       assertion.AssertionSeq,
 			Kind:               assertion.Kind,
