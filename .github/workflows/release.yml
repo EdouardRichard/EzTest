@@ -1,8 +1,8 @@
 name: Release packages
 
 # Manual-only: builds the two self-contained EzTest packages (Windows x64 +
-# Linux x64) and keeps them as workflow artifacts. Public release/archive is
-# intentionally not created here.
+# Linux x64), uploads each as its own artifact, and publishes both as assets
+# on the GitHub Release page.
 on:
   workflow_dispatch:
     inputs:
@@ -18,7 +18,7 @@ on:
         type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -68,12 +68,35 @@ jobs:
           Get-ChildItem .tmp/release | Select-Object Name, Length
           Get-Content .tmp/release/SHA256SUMS.txt
 
-      - name: Upload release packages
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: eztest-${{ inputs.version }}-packages
-          path: |
+          name: eztest-${{ inputs.version }}-windows-x64
+          path: .tmp/release/eztest-${{ inputs.version }}-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: eztest-${{ inputs.version }}-linux-x64
+          path: .tmp/release/eztest-${{ inputs.version }}-linux-x64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: eztest-${{ inputs.version }}-checksums
+          path: .tmp/release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: EzTest ${{ inputs.version }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
             .tmp/release/eztest-${{ inputs.version }}-windows-x64.zip
             .tmp/release/eztest-${{ inputs.version }}-linux-x64.tar.gz
             .tmp/release/SHA256SUMS.txt
-          if-no-files-found: error
