@@ -41,9 +41,9 @@ func TestTurnBudgetPrecedence(t *testing.T) {
 	if got := budget.ExceededBy(Usage{Turns: 59}); got != BudgetCauseTurns {
 		t.Fatalf("turn cause at the fuse = %q, want %q", got, BudgetCauseTurns)
 	}
-	// The observed QA runs stopped at 15/16 turns because of the token budget,
+	// With an unlimited token budget the token cap is not a cause at 15 turns.
 	// not a 16-turn cap: the same envelope reports the token cause there.
-	if got := budget.ExceededBy(Usage{Turns: 15, Tokens: CaseExecutorRunMaxTokens}); got != BudgetCauseTokens {
+	if got := budget.ExceededBy(Usage{Turns: 15, Tokens: 50_000_000}); got != "" {
 		t.Fatalf("cause at the token budget = %q, want %q", got, BudgetCauseTokens)
 	}
 }

@@ -8,7 +8,7 @@ import (
 )
 
 // observedCaseExecutorRunUsage is the cumulative usage of the real 5-step /
-// 3-assertion case AC-FR-025-01 (发布文章（正向）) of the PO user-trial retry
+// 3-assertion case AC-FR-025-01 (鍙戝竷鏂囩珷锛堟鍚戯級) of the PO user-trial retry
 // (2026-11-03, case run 376007071272796163). Its summary is the failure Task 103
 // removes:
 //
@@ -24,7 +24,7 @@ import (
 var observedCaseExecutorRunUsage = Usage{Tokens: 409842, Turns: 28}
 
 // observedFR011CaseExecutorRunUsage is the cumulative usage of the real 4-step /
-// 5-assertion case AC-FR-011-01 登录成功（正向） of the PO final E2E
+// 5-assertion case AC-FR-011-01 鐧诲綍鎴愬姛锛堟鍚戯級 of the PO final E2E
 // (2026-11-03, case run 376026576434761738, wave 376026576434761728). Its
 // summary is the failure Task 109 removes:
 //
@@ -116,39 +116,27 @@ func TestCaseExecutorBudgetAllowsExecution(t *testing.T) {
 			cause, BudgetCauseTokens)
 	}
 
-	const wantCap = 1200000
-	if liveBudget.MaxTokens != wantCap {
-		t.Fatalf("live case_executor token budget = %d, want the raised execution cap %d",
-			liveBudget.MaxTokens, wantCap)
+	// The case executor has no token ceiling: budget is cost observability, not
+	// a hard stop for a productive loop. Turn/time/tool-failure guards remain.
+	if CaseExecutorRunMaxTokens != 0 {
+		t.Fatalf("case_executor token cap = %d, want 0 (unlimited)", CaseExecutorRunMaxTokens)
+	}
+	if !liveBudget.UnlimitedTokens || liveBudget.MaxTokens != 0 {
+		t.Fatalf("live case_executor budget = {max=%d unlimited=%v}, want unlimited", liveBudget.MaxTokens, liveBudget.UnlimitedTokens)
 	}
 	if budget := runner.resourceBudget(item, agent.AgentProfile{
 		Key:     ProfileKeyCaseExecutor,
 		Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 300},
-	}); budget.MaxTokens != wantCap {
-		t.Fatalf("case_executor token budget from a stale profile = %d, want %d",
-			budget.MaxTokens, wantCap)
+	}); !budget.UnlimitedTokens || budget.MaxTokens != 0 {
+		t.Fatalf("case_executor budget from a stale profile = {max=%d unlimited=%v}, want unlimited", budget.MaxTokens, budget.UnlimitedTokens)
 	}
-	if liveBudget.MaxTokens <= DefaultBudgetMaxTokens {
-		t.Fatalf("case_executor token budget = %d, want above the generic chat budget %d",
-			liveBudget.MaxTokens, DefaultBudgetMaxTokens)
+	if got := liveBudget.Decide(Usage{Tokens: 1_268_436, Turns: 40}); got != BudgetContinue {
+		t.Fatalf("unlimited budget decision at the observed FR-113-03 usage = %q, want %q", got, BudgetContinue)
 	}
-	if liveBudget.MaxTokens <= observedCaseExecutorRunUsage.Tokens {
-		t.Fatalf("case_executor token budget = %d, want above the observed O13 usage %d",
-			liveBudget.MaxTokens, observedCaseExecutorRunUsage.Tokens)
+	if got := liveBudget.Decide(Usage{Tokens: 50_000_000, Turns: 59}); got != BudgetSettle {
+		t.Fatalf("unlimited budget decision at the turn fuse = %q, want %q", got, BudgetSettle)
 	}
-	if liveBudget.MaxTokens <= observedFR011CaseExecutorRunUsage.Tokens {
-		t.Fatalf("case_executor token budget = %d, want above the observed FR-011-01 usage %d",
-			liveBudget.MaxTokens, observedFR011CaseExecutorRunUsage.Tokens)
-	}
-
-	// The raise is a bounded cap, not an unbounded budget: 1.2M still settles.
-	if got := liveBudget.Decide(Usage{Tokens: wantCap - 1, Turns: observedFR011CaseExecutorRunUsage.Turns}); got != BudgetContinue {
-		t.Fatalf("case_executor budget decision one token below the cap = %q, want %q", got, BudgetContinue)
-	}
-	if got := liveBudget.Decide(Usage{Tokens: wantCap, Turns: observedFR011CaseExecutorRunUsage.Turns}); got != BudgetSettle {
-		t.Fatalf("case_executor budget decision at the cap = %q, want %q", got, BudgetSettle)
-	}
-	if cause := liveBudget.ExceededBy(Usage{Tokens: wantCap, Turns: observedFR011CaseExecutorRunUsage.Turns}); cause != BudgetCauseTokens {
+	if cause := liveBudget.ExceededBy(Usage{Tokens: 50_000_000, Turns: observedFR011CaseExecutorRunUsage.Turns}); cause != "" {
 		t.Fatalf("case_executor cause at the cap = %q, want %q", cause, BudgetCauseTokens)
 	}
 

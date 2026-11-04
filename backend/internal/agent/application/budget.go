@@ -8,6 +8,10 @@ package agentapp
 // caller can pass the zero Budget for a normal task.
 type Budget struct {
 	MaxTokens    int
+	// UnlimitedTokens removes the token ceiling (CaseExecutorRunMaxTokens=0).
+	// The turn fuse and wall-clock limit remain loop guards; an explicit
+	// per-item max_tokens still wins.
+	UnlimitedTokens bool
 	RunSeconds   int
 	MaxTurnsFuse int
 }
@@ -89,7 +93,7 @@ func (b Budget) exceeded(usage Usage) bool {
 func (b Budget) ExceededBy(usage Usage) string {
 	budget := b.normalized()
 	switch {
-	case usage.Tokens >= budget.MaxTokens:
+	case !budget.UnlimitedTokens && usage.Tokens >= budget.MaxTokens:
 		return BudgetCauseTokens
 	case usage.Seconds >= budget.RunSeconds:
 		return BudgetCauseTime
@@ -102,7 +106,7 @@ func (b Budget) ExceededBy(usage Usage) string {
 
 // normalized applies the contract defaults to unset fields.
 func (b Budget) normalized() Budget {
-	if b.MaxTokens <= 0 {
+	if !b.UnlimitedTokens && b.MaxTokens <= 0 {
 		b.MaxTokens = DefaultBudgetMaxTokens
 	}
 	if b.RunSeconds <= 0 {
