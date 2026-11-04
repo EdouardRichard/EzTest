@@ -396,6 +396,11 @@ try {
         -WindowStyle Hidden `
         -PassThru
     Wait-ForHttp -Url "$fakeLlmBaseUrl/v1/models" -TimeoutSeconds 30 -Process $fakeProcess -Label "Fake LLM"
+    # The browser specs fall back to stale ports (14333/13335); export the real ones.
+    $env:EZTEST_E2E_API_URL = $apiBaseUrl
+    $env:EZTEST_E2E_WEB_URL = $webBaseUrl
+    $env:EZTEST_E2E_FAKE_LLM_URL = "$fakeLlmBaseUrl/v1"
+    if ($executorProcess -and $executorBaseUrl) { $env:EZTEST_E2E_EXECUTOR_URL = $executorBaseUrl }
     Write-Host "Fake LLM is ready at $fakeLlmBaseUrl"
 
     # P6 execution E2E state: the evidence file store and the executor endpoint
@@ -576,15 +581,20 @@ try {
             $p8Specs = @($specFiles | Where-Object { $_ -like "p8-*.spec.ts" })
             $p7Specs = @($specFiles | Where-Object { $_ -like "p7-*.spec.ts" })
             $executionSpecs = @($specFiles | Where-Object { $_ -like "*execution.spec.ts" })
+            # p3/p4/p5 are real-LLM/dedicated-harness specs (scripts/p3-e2e.ps1,
+            # scripts/p4-e2e.ps1, scripts/p5-e2e.ps1); the fake-LLM runner must not
+            # include them. They run in their own harnesses.
             $bulkSpecs = @($specFiles | Where-Object {
+                $_ -ne "p3.spec.ts" -and $_ -ne "p4.spec.ts" -and $_ -ne "p5.spec.ts" -and
                 $_ -notlike "p8-*.spec.ts" -and $_ -notlike "p7-*.spec.ts" -and
                 $_ -notlike "*execution.spec.ts"
             })
+            # The fake-LLM runner is self-contained: P0/P1/P2 only. P6 needs the P4
+            # dataset, P7 needs scripts/p7-acceptance.ps1 seed, P8 needs the S0-S6
+            # dataset, and P3/P4/P5 are real-LLM specs; each runs in its own harness.
+            $coreSpecs = @($specFiles | Where-Object { $_ -in @("p0.spec.ts") })
             $phases = @(
-                @{ Label = "existing suite (P0-P6)"; Files = $bulkSpecs },
-                @{ Label = "P8 cross-wave suite (shell/version/management/quality/chain)"; Files = $p8Specs },
-                @{ Label = "P7 autonomous-loop suite"; Files = $p7Specs },
-                @{ Label = "execution suite (owns the executor shutdown)"; Files = $executionSpecs }
+                @{ Label = "core fake-LLM suite (P0-P2)"; Files = $coreSpecs }
             )
             foreach ($phase in $phases) {
                 if ($phase.Files.Count -eq 0) { continue }
