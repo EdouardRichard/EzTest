@@ -90,8 +90,8 @@ function Get-LatestPacket {
         Packet = $packet
         Text = (Get-PacketText -Packet $packet)
         PrefixHash = [string](Get-JsonProp -Object $packet -Name "prefix_hash" -Default "")
-        Id = [string](Get-JsonProp -Object  -Name "id" -Default "")
-        CreatedAt = [string](Get-JsonProp -Object  -Name "created_at" -Default "")
+        Id = [string](Get-JsonProp -Object $packet -Name "id" -Default "")
+        CreatedAt = [string](Get-JsonProp -Object $packet -Name "created_at" -Default "")
     }
 }
 
