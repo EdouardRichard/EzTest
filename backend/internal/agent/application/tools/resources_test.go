@@ -72,6 +72,34 @@ func TestSUTDatabaseListReturnsVersionDatabases(t *testing.T) {
 	}
 }
 
+// TestSUTDatabaseListRejectsMalformedVersionSUTID pins the fix: a malformed
+// optional filter is a model-fixable argument error, so it must be retryable
+// and carry the top-level field name (not only details.field), and it must not
+// reach the resource port.
+func TestSUTDatabaseListRejectsMalformedVersionSUTID(t *testing.T) {
+	for _, payload := range []string{`{"version_sut_id":"abc"}`, `{"version_sut_id":"  "}`} {
+		t.Run(payload, func(t *testing.T) {
+			port := &fakeDatabasePort{databases: []DatabaseSummary{{ID: "1501"}}}
+			registry := NewP7Registry(Deps{Resource: port})
+			_, err := registry.Execute(context.Background(), Scope{VersionID: 2001}, ToolSUTDatabaseList,
+				json.RawMessage(payload))
+			toolErr := asToolError(t, err)
+			if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+				t.Fatalf("malformed version_sut_id error = %+v, want retryable invalid_argument", toolErr)
+			}
+			if toolErr.Field != "version_sut_id" {
+				t.Fatalf("field = %q, want top-level version_sut_id", toolErr.Field)
+			}
+			if field, _ := toolErr.Details["field"].(string); field != "version_sut_id" {
+				t.Fatalf("details.field = %#v, want version_sut_id", toolErr.Details["field"])
+			}
+			if port.versionID != 0 {
+				t.Fatalf("malformed filter reached the resource port: versionID=%d", port.versionID)
+			}
+		})
+	}
+}
+
 // TestSUTDatabaseListRejectsUnknownParams keeps the read-only tool strict.
 func TestSUTDatabaseListRejectsUnknownParams(t *testing.T) {
 	registry := NewP7Registry(Deps{Resource: &fakeDatabasePort{}})

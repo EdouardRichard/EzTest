@@ -347,6 +347,7 @@ func (t *caseGraphPropose) Description() string {
 		"每条步骤与断言都必须有非空的 expected（可观察的成功判据）。" +
 		"未知字段（unknown fields）会被严格拒绝：不做别名映射；错误会给出最接近的合法字段名与合法字段清单。" +
 		"断言 kind=db 时必须传 database_id，且只能使用当前版本绑定环境中的数据库 id：先调用 sut.database_list（或读取 context.version_pack 的 databases 清单），禁止猜测或用库名/DSN 代替。" +
+		"ui 断言不接收 target_page_id：页面/接口目标写在对应的 steps[] 上（target_page_id/target_api_id），断言本身用 target/expected 描述检查点。" +
 		"proposal_id 用于幂等：同一次提交的重试请复用同一个 proposal_id，重复提交返回首次结果、不会重复创建 case revision。" +
 		"base_revision 用于乐观并发：从 design.graph_read 读取需求 revision 后传入；过期会返回不可重试的 state_conflict（带 base_revision/current_revision），需重读后再提交。" +
 		"枚举取值：priority=P0/P1/P2/P3；assertion.kind=ui/api/db/text/visual；sources.kind=requirement/code/page/api/knowledge。"
@@ -366,8 +367,8 @@ func (t *caseGraphPropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 	}
 	// The bound database inventory is only read when the proposal actually
 	// carries a db assertion; a db-less proposal never pays for the lookup.
-	allowedDatabaseIDs := t.allowedDatabaseIDs(ctx, scope, payload)
-	proposal, err := parseGraphProposal(payload, scope, allowedDatabaseIDs)
+	allowedDatabaseIDs, databaseInventoryKnown := t.allowedDatabaseIDs(ctx, scope, payload)
+	proposal, err := parseGraphProposal(payload, scope, allowedDatabaseIDs, databaseInventoryKnown)
 	if err != nil {
 		return nil, retryableGraphFieldError(err)
 	}
@@ -459,30 +460,32 @@ func (t *caseGraphPropose) rememberProposal(versionID, requirementID int64, prop
 }
 
 // allowedDatabaseIDs resolves the bound environment database inventory for the
-// db assertions of one payload. The read is best-effort: a missing lister or a
-// read failure leaves the list empty (the design context still validates the
-// database binding and the model still receives the hint), while an available
-// list turns a missing/unbound database_id into a precise allowed-values error.
-func (t *caseGraphPropose) allowedDatabaseIDs(ctx context.Context, scope Scope, payload graphProposalPayload) []string {
+// db assertions of one payload. known reports whether the inventory could be
+// read: a missing lister or a read failure returns known=false so the design
+// context remains the authority, while a successful read returns known=true even
+// when the list is empty. An empty known list means the environment binds no
+// databases, so any supplied database_id is unbound and must be rejected
+// locally as a retryable argument error instead of reaching the design domain.
+func (t *caseGraphPropose) allowedDatabaseIDs(ctx context.Context, scope Scope, payload graphProposalPayload) (ids []string, known bool) {
 	if !payloadHasDBAssertion(payload) {
-		return nil
+		return nil, false
 	}
 	lister, ok := t.deps.Resource.(DatabaseLister)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	items, err := lister.ListDatabases(ctx, scope.VersionID, 0)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	ids := make([]string, 0, len(items))
+	ids = make([]string, 0, len(items))
 	for _, item := range items {
 		if id := strings.TrimSpace(item.ID); id != "" {
 			ids = append(ids, id)
 		}
 	}
 	sort.Strings(ids)
-	return ids
+	return ids, true
 }
 
 func payloadHasDBAssertion(payload graphProposalPayload) bool {
@@ -751,7 +754,7 @@ func (t *designDataPlanSubmit) Execute(ctx context.Context, scope Scope, raw jso
 
 // --- validation helpers ----------------------------------------------------
 
-func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDatabaseIDs []string) (GraphProposal, *Error) {
+func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDatabaseIDs []string, databaseInventoryKnown bool) (GraphProposal, *Error) {
 	proposal := GraphProposal{}
 	requirementID, err := parseRequiredID("requirement_id", payload.RequirementID)
 	if err != nil {
@@ -777,8 +780,13 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 		}
 		proposal.BaseGraphHash = hash
 	}
-	if payload.ProposalID != nil && strings.TrimSpace(*payload.ProposalID) != "" {
+	if payload.ProposalID != nil {
 		proposalID := strings.TrimSpace(*payload.ProposalID)
+		if proposalID == "" {
+			return GraphProposal{}, InvalidWithAllowed("proposal_id",
+				"proposal_id must not be empty when supplied; omit it for a non-idempotent proposal",
+				nil, "omit proposal_id or pass a stable 1-128 character id and reuse it for retries; a blank id silently disables idempotent replay")
+		}
 		if !proposalIDPattern.MatchString(proposalID) {
 			return GraphProposal{}, InvalidWithAllowed("proposal_id",
 				"must be 1-128 characters of letters, digits, dot, underscore, colon or hyphen (no spaces)",
@@ -1028,7 +1036,7 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 						allowedDatabaseIDs,
 						"call sut.database_list first (or read context.version_pack databases); never guess a database_id or use a database name/DSN")
 				}
-				if len(allowedDatabaseIDs) > 0 && !containsString(allowedDatabaseIDs, idString(databaseID)) {
+				if databaseInventoryKnown && !containsString(allowedDatabaseIDs, idString(databaseID)) {
 					return GraphProposal{}, InvalidWithAllowed(assertionField("database_id"),
 						fmt.Sprintf("database_id %q is not bound to this version's environment", idString(databaseID)),
 						allowedDatabaseIDs,
@@ -1133,9 +1141,158 @@ func decodeGraphProposalParams(raw json.RawMessage, target *graphProposalPayload
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			return graphProposalTypeError(trimmed, typeErr)
+		}
 		return InvalidField("parameters", "invalid parameters: "+err.Error())
 	}
 	return nil
+}
+
+// graphProposalTypeError turns a wrong-typed JSON value into a retryable
+// field-level argument error (R-E1-3). The decoder's Field names the Go field
+// path without array indices, so the raw document is scanned once to recover the
+// exact JSON path (for example cases[0].steps[0].seq). The message names the
+// expected JSON type and the hint tells the model how to fix the value instead
+// of replaying the same arguments.
+func graphProposalTypeError(raw json.RawMessage, typeErr *json.UnmarshalTypeError) *Error {
+	path := strings.TrimSpace(typeErr.Field)
+	if resolved, ok := jsonPathAtOffset(raw, typeErr.Offset); ok && resolved != "" {
+		path = resolved
+	}
+	if path == "" {
+		path = "parameters"
+	}
+	expected := jsonValueKind(typeErr.Type)
+	message := fmt.Sprintf("%s must be a JSON %s", path, expected)
+	if typeErr.Value != "" {
+		message = fmt.Sprintf("%s must be a JSON %s (%s was provided)", path, expected, typeErr.Value)
+	}
+	hint := fmt.Sprintf("replace %s with a JSON %s; the tool schema documents what each field accepts", path, expected)
+	return InvalidWithAllowed(path, message, graphProposalAllowedValues(path), hint)
+}
+
+// jsonValueKind maps a Go type to the JSON value kind the model must send.
+func jsonValueKind(typ reflect.Type) string {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.String:
+		return "string"
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "integer"
+	case reflect.Float32, reflect.Float64:
+		return "number"
+	case reflect.Struct, reflect.Map:
+		return "object"
+	case reflect.Slice, reflect.Array:
+		return "array"
+	case reflect.Interface:
+		return "value"
+	default:
+		return typ.Kind().String()
+	}
+}
+
+// graphProposalAllowedValues attaches the legal enum values when a wrong-typed
+// value belongs to an enum field; other fields only get the expected type.
+func graphProposalAllowedValues(path string) []string {
+	switch {
+	case strings.HasSuffix(path, ".priority"):
+		return []string{"P0", "P1", "P2", "P3"}
+	case strings.HasSuffix(path, ".kind") && strings.Contains(path, ".assertions["):
+		return []string{"ui", "api", "db", "text", "visual"}
+	case strings.HasSuffix(path, ".kind") && strings.Contains(path, ".sources["):
+		return []string{"requirement", "code", "page", "api", "knowledge"}
+	default:
+		return nil
+	}
+}
+
+// jsonPathAtOffset resolves the JSON path of the value that ends at offset.
+// json.UnmarshalTypeError.Offset points just past the offending token, so one
+// token scan of the valid raw document recovers the path with array indices
+// (the decoder's Field string omits them).
+func jsonPathAtOffset(raw []byte, offset int64) (string, bool) {
+	if offset <= 0 {
+		return "", false
+	}
+	type frame struct {
+		path   string
+		object bool
+		key    string
+		index  int
+	}
+	var frames []frame
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	nextPath := func() string {
+		if len(frames) == 0 {
+			return ""
+		}
+		top := &frames[len(frames)-1]
+		if top.object {
+			return joinJSONPath(top.path, top.key)
+		}
+		return fmt.Sprintf("%s[%d]", top.path, top.index)
+	}
+	advance := func() {
+		if len(frames) == 0 {
+			return
+		}
+		top := &frames[len(frames)-1]
+		if top.object {
+			top.key = ""
+		} else {
+			top.index++
+		}
+	}
+	matched := ""
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		end := decoder.InputOffset()
+		switch value := token.(type) {
+		case json.Delim:
+			switch value {
+			case '{', '[':
+				containerPath := nextPath()
+				frames = append(frames, frame{path: containerPath, object: value == '{'})
+				if end == offset {
+					matched = containerPath
+				}
+			default:
+				if len(frames) > 0 {
+					frames = frames[:len(frames)-1]
+					advance()
+				}
+			}
+		case string:
+			if len(frames) > 0 && frames[len(frames)-1].object && frames[len(frames)-1].key == "" {
+				frames[len(frames)-1].key = value
+				continue
+			}
+			valuePath := nextPath()
+			if end == offset {
+				matched = valuePath
+			}
+			advance()
+		default:
+			valuePath := nextPath()
+			if end == offset {
+				matched = valuePath
+			}
+			advance()
+		}
+	}
+	return matched, matched != ""
 }
 
 // findUnknownJSONField walks the raw JSON alongside the target Go type and
@@ -1414,7 +1571,7 @@ func graphProposeSchema() json.RawMessage {
 		"additionalProperties": false,
 		"required":             []string{"step_seq", "kind", "target", "expected"},
 		"properties":           assertionProperties,
-		"description":          "断言对象。按 kind 分支（anyOf）：ui=target_page_id+步骤动作+expected；api=target_api_id/method+path+expected；db=database_id+查询/expected；text=可见文案；visual=基线/截图断言。",
+		"description":          "断言对象。按 kind 分支（anyOf）：ui=步骤的 steps[].target_page_id + 步骤动作 + 断言 target/expected（断言对象本身不接收 target_page_id）；api=target_api_id/method+path+expected；db=database_id+查询/expected；text=可见文案；visual=基线/截图断言。",
 		"anyOf": []any{
 			map[string]any{
 				"description": "ui 断言分支：页面元素/交互结果",

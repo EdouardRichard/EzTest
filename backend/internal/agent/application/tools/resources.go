@@ -156,7 +156,7 @@ func (t *sutDatabaseList) Execute(ctx context.Context, scope Scope, raw json.Raw
 	if rawID := params.VersionSUTID; rawID != "" {
 		parsed, toolErr := parsePositiveID("version_sut_id", rawID)
 		if toolErr != nil {
-			return nil, toolErr
+			return nil, retryableParamError(toolErr)
 		}
 		versionSUTID = parsed
 	}

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -752,6 +753,249 @@ func TestGraphProposeSchemaIsSelfDescribing(t *testing.T) {
 		if !strings.Contains(description, want) {
 			t.Fatalf("%s description lacks %q:\n%s", ToolCaseGraphPropose, want, description)
 		}
+	}
+}
+
+// TestGraphProposeAssertionDescriptionUsesStepTargetPageID pins the fix for the
+// ui assertion description: target_page_id belongs to the step (steps[]), not
+// to the assertion object. The assertion schema sets additionalProperties:false,
+// so advertising an assertion-level target_page_id told the model to send a
+// field the contract rejects.
+func TestGraphProposeAssertionDescriptionUsesStepTargetPageID(t *testing.T) {
+	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
+	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
+	if len(definitions) != 1 {
+		t.Fatalf("definitions = %d", len(definitions))
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(definitions[0].Parameters, &schema); err != nil {
+		t.Fatalf("schema is not JSON: %v", err)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	casesSchema, _ := properties["cases"].(map[string]any)
+	caseItems, _ := casesSchema["items"].(map[string]any)
+	caseProperties, _ := caseItems["properties"].(map[string]any)
+	assertionsSchema, _ := caseProperties["assertions"].(map[string]any)
+	assertionItems, _ := assertionsSchema["items"].(map[string]any)
+	assertionProperties, _ := assertionItems["properties"].(map[string]any)
+	if _, ok := assertionProperties["target_page_id"]; ok {
+		t.Fatalf("assertion schema advertises target_page_id, which is a step field: %#v", assertionProperties)
+	}
+	description := stringValueOf(assertionItems["description"])
+	if strings.Contains(description, "ui=target_page_id") {
+		t.Fatalf("assertion description advertises an assertion-level target_page_id: %q", description)
+	}
+	if !strings.Contains(description, "steps[].target_page_id") {
+		t.Fatalf("assertion description must point ui assertions at steps[].target_page_id: %q", description)
+	}
+	// No embedded example may model an assertion-level target_page_id either.
+	examples, _ := schema["examples"].([]any)
+	for exampleIndex, rawExample := range examples {
+		example, _ := rawExample.(map[string]any)
+		cases, _ := example["cases"].([]any)
+		for caseIndex, rawCase := range cases {
+			caseObject, _ := rawCase.(map[string]any)
+			assertions, _ := caseObject["assertions"].([]any)
+			for assertionIndex, rawAssertion := range assertions {
+				assertion, _ := rawAssertion.(map[string]any)
+				if _, ok := assertion["target_page_id"]; ok {
+					t.Fatalf("examples[%d].cases[%d].assertions[%d] carries an assertion-level target_page_id the schema rejects",
+						exampleIndex, caseIndex, assertionIndex)
+				}
+			}
+		}
+	}
+}
+
+// TestGraphProposeSchemaDBBranchRequiresDatabaseID pins the machine-checkable
+// half of the db branch contract: the anyOf branch for kind=db requires the
+// database_id property instead of only describing it.
+func TestGraphProposeSchemaDBBranchRequiresDatabaseID(t *testing.T) {
+	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
+	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
+	if len(definitions) != 1 {
+		t.Fatalf("definitions = %d", len(definitions))
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(definitions[0].Parameters, &schema); err != nil {
+		t.Fatalf("schema is not JSON: %v", err)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	casesSchema, _ := properties["cases"].(map[string]any)
+	caseItems, _ := casesSchema["items"].(map[string]any)
+	caseProperties, _ := caseItems["properties"].(map[string]any)
+	assertionsSchema, _ := caseProperties["assertions"].(map[string]any)
+	assertionItems, _ := assertionsSchema["items"].(map[string]any)
+
+	var dbBranch map[string]any
+	branches, _ := assertionItems["anyOf"].([]any)
+	for _, rawBranch := range branches {
+		branch, _ := rawBranch.(map[string]any)
+		branchProperties, _ := branch["properties"].(map[string]any)
+		if strings.Join(enumOf(t, branchProperties["kind"]), ",") == "db" {
+			dbBranch = branch
+			break
+		}
+	}
+	if dbBranch == nil {
+		t.Fatalf("assertion schema has no kind=db anyOf branch: %#v", assertionItems["anyOf"])
+	}
+	if _, ok := dbBranch["properties"].(map[string]any)["database_id"]; !ok {
+		t.Fatalf("db branch does not describe database_id: %#v", dbBranch)
+	}
+	required, _ := dbBranch["required"].([]any)
+	for _, rawRequired := range required {
+		if stringValueOf(rawRequired) == "database_id" {
+			return
+		}
+	}
+	t.Fatalf("db branch required = %#v, want database_id", dbBranch["required"])
+}
+
+// TestGraphProposeRejectsDatabaseIDWhenInventoryEmpty pins the fix for the
+// "empty list means unknown" hole: a successful sut.database_list that returns
+// zero databases still knows the bound set (empty), so any supplied
+// database_id must be rejected as a retryable argument error instead of
+// reaching the design context's non-retryable validation.
+func TestGraphProposeRejectsDatabaseIDWhenInventoryEmpty(t *testing.T) {
+	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+	resource := &fakeDatabaseResource{} // successful list, no bound databases
+	registry := NewP2Registry(Deps{Design: port, Resource: resource})
+	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
+
+	_, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "1501"))
+	toolErr := asToolError(t, err)
+	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+		t.Fatalf("empty-inventory database error = %+v, want retryable invalid_argument", toolErr)
+	}
+	if toolErr.Field != "cases[0].assertions[0].database_id" {
+		t.Fatalf("field = %q, want cases[0].assertions[0].database_id", toolErr.Field)
+	}
+	if len(toolErr.Allowed) != 0 {
+		t.Fatalf("allowed = %#v, want the empty bound inventory", toolErr.Allowed)
+	}
+	if !strings.Contains(toolErr.Hint, "sut.database_list") {
+		t.Fatalf("hint = %q, want it to point at sut.database_list", toolErr.Hint)
+	}
+	if port.proposeCalls != 0 {
+		t.Fatalf("unbound database reached the design port: %#v", port.proposeInput)
+	}
+}
+
+// TestGraphProposeDatabaseInventoryUnavailableDefersToDesign documents the
+// best-effort half of R-E1-2: when no database lister is wired (or the lookup
+// fails) the tool cannot know the bound inventory, so it passes the id through
+// and lets the design context's binding validation be the authority instead of
+// rejecting a possibly-valid id. Only a successful inventory read turns an
+// unbound database_id into a local retryable error.
+func TestGraphProposeDatabaseInventoryUnavailableDefersToDesign(t *testing.T) {
+	tests := []struct {
+		name string
+		deps Deps
+	}{
+		{"no lister", Deps{Design: &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}}},
+		{"lister failure", Deps{
+			Design:   &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}},
+			Resource: &fakeDatabaseResource{err: errors.New("resource unavailable")},
+		}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			port, _ := testCase.deps.Design.(*fakeDesignPort)
+			registry := NewP2Registry(testCase.deps)
+			if _, err := executeDesignTool(t, registry,
+				Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700},
+				ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "1501")); err != nil {
+				t.Fatalf("database inventory unavailable must defer to the design context: %v", err)
+			}
+			if port.proposeCalls != 1 {
+				t.Fatalf("propose calls = %d, want the id passed through to the design context", port.proposeCalls)
+			}
+			if got := port.proposeInput.Cases[0].Assertions[0].DatabaseID; got != 1501 {
+				t.Fatalf("database id = %d, want 1501 passed through", got)
+			}
+		})
+	}
+}
+
+// TestGraphProposeWrongTypedValuesCarryJSONFieldPath pins the fix for decoder
+// fallbacks: a wrong-typed value is a model-fixable argument error, so it must
+// name the JSON field path (with array indices where resolvable), stay
+// retryable and never reach the design port. Previously every decoder error
+// collapsed to field=parameters.
+func TestGraphProposeWrongTypedValuesCarryJSONFieldPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		field   string
+	}{
+		{
+			"base_revision string",
+			strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
+				`"requirement_version_id": "700", "base_revision": "3",`, 1),
+			"base_revision",
+		},
+		{
+			"proposal_id number",
+			strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
+				`"requirement_version_id": "700", "proposal_id": 123,`, 1),
+			"proposal_id",
+		},
+		{
+			"nested step seq string",
+			strings.Replace(validGraphProposalJSON(), `"seq": 1,`, `"seq": "1",`, 1),
+			"cases[0].steps[0].seq",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+			registry := NewP2Registry(Deps{Design: port})
+			_, err := executeDesignTool(t, registry,
+				Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700},
+				ToolCaseGraphPropose, testCase.payload)
+			toolErr := asToolError(t, err)
+			if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+				t.Fatalf("wrong-typed value error = %+v, want retryable invalid_argument", toolErr)
+			}
+			if toolErr.Field != testCase.field {
+				t.Fatalf("field = %q, want %q (message=%q)", toolErr.Field, testCase.field, toolErr.Message)
+			}
+			if strings.TrimSpace(toolErr.Hint) == "" {
+				t.Fatalf("hint is empty for a wrong-typed value: %+v", toolErr)
+			}
+			if port.proposeCalls != 0 {
+				t.Fatalf("wrong-typed payload reached the design port: %#v", port.proposeInput)
+			}
+		})
+	}
+}
+
+// TestGraphProposeRejectsBlankProposalID pins the fix for silently ignoring an
+// explicitly supplied empty/space proposal_id: the idempotency key must be
+// either absent or a valid stable id, never a blank value that silently
+// disables replay protection.
+func TestGraphProposeRejectsBlankProposalID(t *testing.T) {
+	for _, value := range []string{`""`, `"   "`} {
+		t.Run("value="+value, func(t *testing.T) {
+			port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+			registry := NewP2Registry(Deps{Design: port})
+			payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
+				`"requirement_version_id": "700", "proposal_id": `+value+`,`, 1)
+			_, err := executeDesignTool(t, registry,
+				Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700},
+				ToolCaseGraphPropose, payload)
+			toolErr := asToolError(t, err)
+			if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+				t.Fatalf("blank proposal_id error = %+v, want retryable invalid_argument", toolErr)
+			}
+			if toolErr.Field != "proposal_id" {
+				t.Fatalf("field = %q, want proposal_id", toolErr.Field)
+			}
+			if port.proposeCalls != 0 {
+				t.Fatalf("blank proposal_id proposal reached the design port")
+			}
+		})
 	}
 }
 
