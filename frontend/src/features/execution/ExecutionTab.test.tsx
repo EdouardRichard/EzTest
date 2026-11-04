@@ -409,17 +409,84 @@ describe("ExecutionTab", () => {
 
     // v0.22 audit §2.5-3: the backend projection stays all-zero while a wave is
     // running. The tab must fall back to the loaded case runs, not show 0/0.
+    // The toolbar owns the derived counters; the compact strip only adds the
+    // states the toolbar does not show.
     const counts = await screen.findByTestId("execution-counts")
-    expect(counts).toHaveTextContent("共 5 条")
-    expect(counts).toHaveTextContent("通过 2")
-    expect(counts).toHaveTextContent("失败 1")
-    expect(counts).toHaveTextContent("阻塞 1")
     expect(counts).toHaveTextContent("未定 0")
+    expect(counts).toHaveTextContent("证据 8")
+    expect(counts).not.toHaveTextContent("共 5 条")
+    expect(counts).not.toHaveTextContent("通过 2")
 
     const toolbar = screen.getByTestId("execution-toolbar")
     expect(toolbar).toHaveTextContent("共 5 条")
     expect(toolbar).toHaveTextContent("通过 2")
     expect(toolbar).toHaveTextContent("失败 1")
+  })
+
+  it("keeps the server evidence and by-SUT breakdown in the counts fallback", async () => {
+    const wave = staleWave({
+      counts: {
+        ...zeroWaveCounts(),
+        evidence: 7,
+        by_version_sut: {
+          "1099": { total: 0, passed: 0, failed: 0, blocked: 0, inconclusive: 0 },
+        },
+      },
+    })
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: wave,
+      counts: wave.counts,
+    })
+    api.listWaves.mockResolvedValue([wave])
+    api.listCaseRuns.mockResolvedValue(fiveCaseRuns())
+
+    render(<ExecutionTab versionId="2001" />)
+
+    // The loaded page may be paginated; its derived aggregate must not erase a
+    // server-provided evidence/by-SUT projection.
+    const counts = await screen.findByTestId("execution-counts")
+    expect(counts).toHaveTextContent("证据 7")
+
+    const toolbar = screen.getByTestId("execution-toolbar")
+    expect(toolbar).toHaveTextContent("通过 2")
+    expect(within(toolbar).getByRole("option", { name: "SUT 1099" })).toBeInTheDocument()
+  })
+
+  it("drops the previous wave's derived counts while the next wave loads", async () => {
+    const first = staleWave()
+    const second = staleWave({ id: "9199", status: "running" })
+    let resolveSecond: (caseRuns: CaseRun[]) => void = () => {}
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: first,
+      counts: zeroWaveCounts(),
+    })
+    api.listWaves.mockResolvedValue([first, second])
+    api.listCaseRuns.mockImplementation((_versionId: string, waveId: string) => {
+      if (waveId === "9201") return Promise.resolve(fiveCaseRuns())
+      return new Promise<CaseRun[]>((resolve) => {
+        resolveSecond = resolve
+      })
+    })
+
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByTestId("execution-counts")
+
+    fireEvent.click(screen.getByRole("button", { name: /#9199/ }))
+
+    // The fallback belongs to the loaded wave: while the next wave's case runs
+    // are in flight the previous wave's numbers must not linger, and the empty
+    // state must not flash before the fetch settles.
+    await waitFor(() => expect(screen.queryByTestId("execution-counts")).not.toBeInTheDocument())
+    expect(screen.queryByTestId("execution-counts-empty")).not.toBeInTheDocument()
+    expect(screen.getByTestId("execution-toolbar")).toHaveTextContent("共 0 条")
+
+    await act(async () => {
+      resolveSecond([])
+    })
+
+    expect(await screen.findByTestId("execution-counts-empty")).toBeInTheDocument()
   })
 
   it("keeps non-zero counts after the wave completes", async () => {
@@ -438,9 +505,13 @@ describe("ExecutionTab", () => {
     render(<ExecutionTab versionId="2001" />)
 
     const counts = await screen.findByTestId("execution-counts")
-    expect(counts).toHaveTextContent("通过 2")
-    expect(counts).toHaveTextContent("失败 1")
-    expect(counts).toHaveTextContent("共 5 条")
+    expect(counts).toHaveTextContent("未定 0")
+    expect(counts).toHaveTextContent("证据 8")
+
+    const toolbar = screen.getByTestId("execution-toolbar")
+    expect(toolbar).toHaveTextContent("通过 2")
+    expect(toolbar).toHaveTextContent("失败 1")
+    expect(toolbar).toHaveTextContent("共 5 条")
   })
 
   it("renders an explicit empty state instead of a fake pass for zero data", async () => {
@@ -474,6 +545,9 @@ describe("ExecutionTab", () => {
     expect(await screen.findByRole("dialog", { name: "证据 #9402" })).toBeInTheDocument()
     expect(api.getEvidence).toHaveBeenCalledWith("2001", "9402")
     expect(await screen.findByTestId("evidence-text")).toHaveTextContent("PASS login as admin")
+    // The deep link also focuses the case run that owns the evidence (9302)
+    // once the wave's case runs are loaded.
+    await waitFor(() => expect(api.getCaseRun).toHaveBeenCalledWith("2001", "9302"))
   })
 
   it("notices a missing evidence deep link without crashing", async () => {
@@ -518,7 +592,38 @@ describe("ExecutionTab", () => {
     expect(screen.queryByTestId("blocked-case-run-9303")).not.toBeInTheDocument()
   })
 
-  it("does not stack a case_run.blocked notice on a login takeover", async () => {
+  it("does not stack a case_run.blocked notice on a login takeover for its own case run", async () => {
+    api.listHumanRequests.mockResolvedValue([
+      { ...humanRequestFixture, expires_at: "2099-01-01T00:00:00Z" },
+    ])
+    // Keep the blocked snapshot row out of the loaded wave: only the per-run
+    // takeover guard may suppress the event, not the snapshot banner.
+    api.listCaseRuns.mockResolvedValue([
+      passedCaseRunFixture,
+      failedCaseRunFixture,
+      runningCaseRunFixture,
+    ])
+
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByTestId("human-request-banner")
+
+    await act(async () => {
+      events.handlers?.onCaseRunChanged?.({
+        type: "case_run.blocked",
+        payload: {
+          case_run_id: "9303",
+          reason: "no_executor",
+          action: "等待执行器注册后重试",
+        },
+      } as never)
+    })
+
+    // The takeover and the event share case run 9303: the takeover banner is
+    // the single actionable surface for it.
+    expect(screen.queryByTestId("case-run-blocked-event-notice")).not.toBeInTheDocument()
+  })
+
+  it("still shows a case_run.blocked notice for another case run during a takeover", async () => {
     api.listHumanRequests.mockResolvedValue([
       { ...humanRequestFixture, expires_at: "2099-01-01T00:00:00Z" },
     ])
@@ -537,7 +642,55 @@ describe("ExecutionTab", () => {
       } as never)
     })
 
-    expect(screen.queryByTestId("case-run-blocked-event-notice")).not.toBeInTheDocument()
+    // The pending takeover owns 9303 only; an unrelated run's dispatch-health
+    // warning must not be swallowed by the global takeover state.
+    const notice = await screen.findByTestId("case-run-blocked-event-notice")
+    expect(notice).toHaveTextContent("用例 #9399")
+    expect(notice).toHaveTextContent("没有可用的执行器")
+    expect(notice).toHaveTextContent("等待执行器注册后重试")
+  })
+
+  it("renders a generic reason when a blocked event carries no reason", async () => {
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByRole("heading", { name: "波次 #9201" })
+
+    await act(async () => {
+      events.handlers?.onCaseRunChanged?.({
+        type: "case_run.blocked",
+        payload: { case_run_id: "9399", reason: "", action: "" },
+      } as never)
+    })
+
+    const notice = await screen.findByTestId("case-run-blocked-event-notice")
+    expect(notice).toHaveTextContent("阻塞原因未知")
+  })
+
+  it("clears a stale blocked notice once its case run recovers", async () => {
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByRole("heading", { name: "波次 #9201" })
+
+    await act(async () => {
+      events.handlers?.onCaseRunChanged?.({
+        type: "case_run.blocked",
+        payload: { case_run_id: "9399", reason: "no_executor", action: "" },
+      } as never)
+    })
+    expect(await screen.findByTestId("case-run-blocked-event-notice")).toBeInTheDocument()
+
+    // The next snapshot shows the run started and passed; the dispatch warning
+    // is no longer current and must not linger.
+    api.listCaseRuns.mockResolvedValue([
+      ...caseRunsFixture,
+      { ...passedCaseRunFixture, id: "9399", title: "恢复后的用例" },
+    ])
+    await act(async () => {
+      events.handlers?.onWaveChanged?.({ type: "wave.resumed" } as never)
+    })
+
+    await waitFor(
+      () => expect(screen.queryByTestId("case-run-blocked-event-notice")).not.toBeInTheDocument(),
+      { timeout: 3000 },
+    )
   })
 
   it("consumes case_run.blocked events with reason and action", async () => {
@@ -577,6 +730,18 @@ describe("ExecutionTab", () => {
     render(<ExecutionTab versionId="2001" />)
 
     expect(await screen.findByTestId("execution-settings")).toHaveTextContent("不可用")
+    expect(await screen.findByRole("heading", { name: "波次 #9201" })).toBeInTheDocument()
+  })
+
+  it("treats a null quota projection as unavailable instead of crashing", async () => {
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      quotas: null,
+    } as unknown as ExecutionOverview)
+
+    render(<ExecutionTab versionId="2001" />)
+
+    expect(await screen.findByTestId("execution-settings")).toHaveTextContent("并发配额 不可用")
     expect(await screen.findByRole("heading", { name: "波次 #9201" })).toBeInTheDocument()
   })
 })

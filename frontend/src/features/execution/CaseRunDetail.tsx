@@ -13,7 +13,7 @@ import {
   ASSERTION_VERDICT_LABEL,
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
-  CASE_RUN_TERMINAL_STATUSES,
+  CASE_RUN_TELEMETRY_TERMINAL_STATUSES,
   EVIDENCE_KIND_LABEL,
   failureClassLabel,
   nextActionLabel,
@@ -245,7 +245,7 @@ export function CaseRunDetailView({
           {usage.total_tokens} tokens
           {usage.turns > 0 ? ` · ${usage.turns} 轮` : ""}
         </p>
-      ) : CASE_RUN_TERMINAL_STATUSES.includes(run.status) ? (
+      ) : CASE_RUN_TELEMETRY_TERMINAL_STATUSES.includes(run.status) ? (
         <p
           data-testid="case-run-telemetry-unavailable"
           className="text-[11px] leading-relaxed text-muted-foreground"

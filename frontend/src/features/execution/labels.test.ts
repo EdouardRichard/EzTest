@@ -5,6 +5,7 @@ import {
   ASSERTION_VERDICT_LABEL,
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
+  CASE_RUN_TELEMETRY_TERMINAL_STATUSES,
   CASE_RUN_TERMINAL_STATUSES,
   EVIDENCE_KIND_LABEL,
   EXECUTOR_STATUS_LABEL,
@@ -49,6 +50,17 @@ describe("case run labels", () => {
 
   it("marks the four verdicts as terminal and process states as not", () => {
     expect(CASE_RUN_TERMINAL_STATUSES).toEqual(["passed", "failed", "blocked", "inconclusive"])
+  })
+
+  it("treats skipped and superseded rows as telemetry-terminal too", () => {
+    expect(CASE_RUN_TELEMETRY_TERMINAL_STATUSES).toEqual([
+      "passed",
+      "failed",
+      "blocked",
+      "inconclusive",
+      "skipped",
+      "superseded",
+    ])
   })
 })
 

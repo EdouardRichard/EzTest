@@ -23,6 +23,17 @@ export const CASE_RUN_TERMINAL_STATUSES: CaseRunStatus[] = [
   "inconclusive",
 ]
 
+/**
+ * Statuses that have settled and own a persisted telemetry record: the four
+ * verdicts plus `skipped`/`superseded`, which end without running the case and
+ * can therefore carry `usage: null` (v0.22 audit §2.5-2).
+ */
+export const CASE_RUN_TELEMETRY_TERMINAL_STATUSES: CaseRunStatus[] = [
+  ...CASE_RUN_TERMINAL_STATUSES,
+  "skipped",
+  "superseded",
+]
+
 export const CASE_RUN_STATUS_LABEL: Record<CaseRunStatus, string> = {
   pending: "待执行",
   running: "执行中",

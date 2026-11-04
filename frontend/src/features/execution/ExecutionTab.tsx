@@ -39,6 +39,7 @@ import type {
   CaseRunDetail,
   Evidence,
   ExecutionOverview,
+  ExecutionQuotas,
   HumanRequest,
   HumanRequestResponseInput,
   RunWave,
@@ -167,7 +168,16 @@ function countsFromCaseRuns(caseRuns: CaseRun[]): WaveCounts {
 function effectiveWaveCounts(wave: RunWave, caseRuns: CaseRun[]): WaveCounts {
   const server = normalizeWaveCounts(wave.counts)
   if (!countsAreEmpty(server) || caseRuns.length === 0) return server
-  return countsFromCaseRuns(caseRuns)
+  const derived = countsFromCaseRuns(caseRuns)
+  const serverByVersionSut = server.by_version_sut ?? {}
+  return {
+    ...derived,
+    // The loaded page can be paginated, so its aggregate must not erase a
+    // server-provided evidence/by-SUT projection.
+    evidence: server.evidence > 0 ? server.evidence : derived.evidence,
+    by_version_sut:
+      Object.keys(serverByVersionSut).length > 0 ? serverByVersionSut : derived.by_version_sut,
+  }
 }
 
 function countsEqual(left: WaveCounts, right: WaveCounts): boolean {
@@ -186,8 +196,9 @@ function formatSettingSeconds(value: number | undefined): string {
 }
 
 function executionQuotaText(overview: ExecutionOverview | null): string {
-  const quotas = overview?.quotas
+  const quotas: ExecutionQuotas | null | undefined = overview?.quotas
   if (
+    quotas === null ||
     quotas === undefined ||
     typeof quotas.global !== "number" ||
     typeof quotas.per_sut !== "number" ||
@@ -219,6 +230,28 @@ function blockedRunNextAction(caseRun: CaseRun): string {
   return (
     nextActionLabel(caseRun.summary.next_action) ?? "先解决阻塞条件（账号/环境/数据），再重跑用例"
   )
+}
+
+type BlockedEvent = {
+  caseRunId: string
+  reason: string
+  action: string
+}
+
+/**
+ * A dispatch-health `case_run.blocked` notice is only current while the run is
+ * still waiting for an executor. Once a snapshot shows the run has started or
+ * settled, the warning is stale (the blocked-case banner takes over a blocked
+ * verdict); drop it instead of showing it forever.
+ */
+function reconcileBlockedEvent(
+  event: BlockedEvent | null,
+  nextCaseRuns: CaseRun[],
+): BlockedEvent | null {
+  if (event === null) return null
+  const run = nextCaseRuns.find((caseRun) => caseRun.id === event.caseRunId)
+  if (run === undefined) return event
+  return run.status === "pending" ? event : null
 }
 
 /**
@@ -265,12 +298,11 @@ export function ExecutionTab({
   const [evidenceNotice, setEvidenceNotice] = useState<string | null>(null)
   // `case_run.blocked` is a dispatch-health warning; snapshot-derived blocked
   // verdicts render through the blocked-case banner instead.
-  const [blockedEvent, setBlockedEvent] = useState<{
-    caseRunId: string
-    reason: string
-    action: string
-  } | null>(null)
+  const [blockedEvent, setBlockedEvent] = useState<BlockedEvent | null>(null)
   const [caseRunsLoading, setCaseRunsLoading] = useState(false)
+  // The wave the loaded `caseRuns` belong to: a fallback aggregate must never
+  // be derived from the previous wave's rows while a new wave is loading.
+  const [caseRunsWaveId, setCaseRunsWaveId] = useState<string | null>(null)
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const selectedWaveIdRef = useRef<string | null>(null)
@@ -285,8 +317,6 @@ export function ExecutionTab({
   const openHumanRequests = humanRequests.filter(
     (request) => request.status === "pending" && request.kind === "login_takeover",
   )
-  const openHumanRequestsRef = useRef(0)
-  openHumanRequestsRef.current = openHumanRequests.length
 
   // Deep link `?evidence=<id>`: resolve the metadata by id (the evidence may
   // belong to any case run of the version, not just the selected one) and open
@@ -351,6 +381,7 @@ export function ExecutionTab({
   useEffect(() => {
     if (selectedWaveId === null) {
       setCaseRuns([])
+      setCaseRunsWaveId(null)
       setSelectedCaseRunId(null)
       setDetail(null)
       setCaseRunsLoading(false)
@@ -362,6 +393,8 @@ export function ExecutionTab({
       .then((nextCaseRuns) => {
         if (cancelled) return
         setCaseRuns(nextCaseRuns)
+        setCaseRunsWaveId(selectedWaveId)
+        setBlockedEvent((current) => reconcileBlockedEvent(current, nextCaseRuns))
         setSelectedCaseRunId((current) => {
           if (
             initialCaseRunId !== undefined &&
@@ -431,7 +464,13 @@ export function ExecutionTab({
       const waveId = selectedWaveIdRef.current
       if (waveId !== null) {
         try {
-          setCaseRuns(await listCaseRuns(versionId, waveId))
+          const nextCaseRuns = await listCaseRuns(versionId, waveId)
+          // The user may have switched waves while the fetch was in flight.
+          if (selectedWaveIdRef.current === waveId) {
+            setCaseRuns(nextCaseRuns)
+            setCaseRunsWaveId(waveId)
+            setBlockedEvent((current) => reconcileBlockedEvent(current, nextCaseRuns))
+          }
         } catch {
           // Keep the last case-run snapshot; the next event retries.
         }
@@ -469,8 +508,9 @@ export function ExecutionTab({
    * `case_run.blocked` (v0.22 FE-8, audit §2.5-6): the scheduler could not
    * dispatch a pending run because no healthy executor is available. The event
    * carries the stable reason/action; it is surfaced once and then the snapshot
-   * is refetched. A pending login takeover already owns the human-facing
-   * banner, so the two surfaces never stack.
+   * is refetched. A pending login takeover only owns its own case run; the
+   * per-run `showBlockedEvent` guard keeps the two surfaces from stacking
+   * without swallowing unrelated runs' warnings.
    */
   const handleCaseRunChanged = useCallback(
     (event: VersionEvent) => {
@@ -479,9 +519,7 @@ export function ExecutionTab({
           typeof event.payload.case_run_id === "string" ? event.payload.case_run_id : ""
         const reason = typeof event.payload.reason === "string" ? event.payload.reason : ""
         const action = typeof event.payload.action === "string" ? event.payload.action : ""
-        if (openHumanRequestsRef.current === 0 && caseRunId.length > 0) {
-          setBlockedEvent({ caseRunId, reason, action })
-        }
+        if (caseRunId.length > 0) setBlockedEvent({ caseRunId, reason, action })
       }
       scheduleRefresh()
     },
@@ -574,10 +612,14 @@ export function ExecutionTab({
     (overview?.active_wave?.id === selectedWaveId ? overview.active_wave : null)
   // v0.22 audit §2.5-3: a running wave may project all-zero counts; show the
   // counts derived from the loaded case runs instead. The merge is display-only
-  // and never mutates the fetched snapshot.
-  const displayWave = effectiveWave(selectedWave, caseRuns)
+  // and never mutates the fetched snapshot. Only rows loaded for the selected
+  // wave may feed the fallback: after a wave switch the previous wave's rows
+  // must not keep its stale numbers (or fake an empty state) while the next
+  // list is in flight.
+  const loadedWaveCaseRuns = caseRunsWaveId === selectedWaveId ? caseRuns : []
+  const displayWave = effectiveWave(selectedWave, loadedWaveCaseRuns)
   const displayWaves = waves.map((wave) =>
-    wave.id === selectedWaveId ? (effectiveWave(wave, caseRuns) ?? wave) : wave,
+    wave.id === selectedWaveId ? (effectiveWave(wave, loadedWaveCaseRuns) ?? wave) : wave,
   )
   const countsFallbackActive =
     selectedWave !== null &&
@@ -586,8 +628,9 @@ export function ExecutionTab({
   const showCountsEmpty =
     selectedWave !== null &&
     displayWave !== null &&
+    caseRunsWaveId === selectedWaveId &&
     displayWave.counts.total === 0 &&
-    caseRuns.length === 0 &&
+    loadedWaveCaseRuns.length === 0 &&
     !caseRunsLoading
   const pausedWave = selectedWave !== null && selectedWave.status === "paused" ? selectedWave : null
   const pausedCaseRun =
@@ -717,7 +760,7 @@ export function ExecutionTab({
           className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-foreground"
         >
           用例 #{blockedEvent.caseRunId} 无法调度：
-          {BLOCKED_EVENT_REASON_LABEL[blockedEvent.reason] ?? blockedEvent.reason ?? "阻塞原因未知"}
+          {BLOCKED_EVENT_REASON_LABEL[blockedEvent.reason] || blockedEvent.reason || "阻塞原因未知"}
           {blockedEvent.action.length > 0 ? `；${blockedEvent.action}` : ""}
         </p>
       ) : null}
@@ -772,11 +815,13 @@ export function ExecutionTab({
               className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-muted-foreground"
             >
               <span className="font-medium text-foreground">实时统计</span>
-              <span>共 {displayWave.counts.total} 条</span>
-              <span>通过 {displayWave.counts.passed}</span>
-              <span>失败 {displayWave.counts.failed}</span>
-              <span>阻塞 {displayWave.counts.blocked}</span>
               <span>未定 {displayWave.counts.inconclusive}</span>
+              {displayWave.counts.skipped > 0 ? (
+                <span>已跳过 {displayWave.counts.skipped}</span>
+              ) : null}
+              {displayWave.counts.evidence > 0 ? (
+                <span>证据 {displayWave.counts.evidence}</span>
+              ) : null}
             </div>
           ) : null}
 

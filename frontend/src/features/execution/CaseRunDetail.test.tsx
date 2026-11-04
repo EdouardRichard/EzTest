@@ -138,6 +138,40 @@ describe("CaseRunDetail incomplete cause", () => {
     expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
   })
 
+  it("states that telemetry is unavailable on a superseded run", () => {
+    const detail: CaseRunDetail = {
+      ...caseRunDetailFixture,
+      case_run: {
+        ...caseRunDetailFixture.case_run,
+        status: "superseded",
+        failure_class: "",
+        summary: {
+          verdict_reason: "case_version_superseded",
+          terminal_cause: "case_version_superseded",
+          next_action: "reconfirm_case_version",
+          usage: null,
+        },
+      },
+    }
+
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={detail}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    // v0.22 audit §2.5-2: skipped/superseded rows settle without running and
+    // can carry `usage: null`; they are terminal and must state that the
+    // telemetry is unavailable instead of silently omitting the line.
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent("已取代")
+    expect(screen.getByTestId("case-run-telemetry-unavailable")).toHaveTextContent("遥测不可用")
+    expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
+  })
+
   it("explains a blocked run without a last_error using its verdict reason", () => {
     const detail: CaseRunDetail = {
       ...caseRunDetailFixture,
