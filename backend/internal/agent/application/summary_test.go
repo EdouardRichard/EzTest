@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -112,9 +113,15 @@ func testSummaryInput() agentapp.SummaryInput {
 		WorkItemID:     42,
 		RequirementIDs: []int64{501},
 		CaseIDs:        []int64{7001},
-		Messages: []agentapp.Message{
-			{ID: 1, Role: "user", Content: "请实现 /api/login；错误码 FR-001。"},
-			{ID: 2, Role: "assistant", Content: "已读取 src/auth/login.go，并运行 go test ./internal/auth。"},
+		Messages: []agentapp.SummaryReplayMessage{
+			{ID: 1, Role: "user", Content: "早前：请实现 /api/login，登录代码在 src/auth/login.go，先阅读并运行 go test ./internal/auth。"},
+			{
+				ID: 2, Role: "assistant", Content: "已读取 src/auth/login.go。",
+				ReasoningContent: "先阅读登录实现",
+				ToolCalls:        []llmapp.ToolCall{{ID: "call-1", Name: "file.read", Arguments: `{"path":"src/auth/login.go"}`}},
+			},
+			{ID: 3, Role: "tool", ToolCallID: "call-1", Content: "file.read 返回 package auth\nfunc Login(ctx context.Context) error\n运行 go test ./internal/auth 通过，耗时 0.42s"},
+			{ID: 4, Role: "user", Content: "请实现 /api/login；错误码 FR-001。"},
 		},
 		Plan: []agentcontext.PlanItemSnapshot{
 			{ID: 7, Title: "实现登录接口", Status: "in_progress", DependsOn: []string{"6"}},
@@ -123,7 +130,7 @@ func testSummaryInput() agentapp.SummaryInput {
 			{ID: 9, Kind: "decision", Key: "auth.method", Summary: "使用 JWT", Confidence: &confidence},
 		},
 		PinnedFacts:      []string{"JWT 有效期 15 分钟"},
-		CoveredMessageID: 2,
+		CoveredMessageID: 4,
 		Policy:           summaryPolicy(),
 	}
 }
@@ -174,8 +181,8 @@ func TestSummaryEmptySectionsUseNone(t *testing.T) {
 func TestSummaryMergesPriorSummaryAndPreservesIdentifiers(t *testing.T) {
 	in := testSummaryInput()
 	in.PriorSummary = "## 需求 / 用例 / 产物\n- FR-001 登录需求（已确认）\n\n## 关键上下文\n- 附件 attachment_id=9001 已解析"
-	in.Messages = append(in.Messages, agentapp.Message{
-		ID: 3, Role: "tool",
+	in.Messages = append(in.Messages, agentapp.SummaryReplayMessage{
+		ID: 5, Role: "tool",
 		Content: "error: timeout after 30s in Login(ctx)",
 	})
 	out := agentapp.BuildSummary(in)
@@ -299,7 +306,7 @@ func TestSummaryImagesNeverEnterSummary(t *testing.T) {
 // next summary only folds messages after the watermark, and a watermark never
 // moves backwards.
 func TestSummaryIncrementalWatermark(t *testing.T) {
-	messages := []agentapp.Message{
+	messages := []agentapp.SummaryReplayMessage{
 		{ID: 1, Role: "user", Content: "旧消息一"},
 		{ID: 5, Role: "assistant", Content: "旧消息五"},
 		{ID: 9, Role: "user", Content: "新消息九"},
@@ -386,7 +393,7 @@ func TestSummaryLedgerVersionIncrements(t *testing.T) {
 func TestSummaryPrefixReuseRequest(t *testing.T) {
 	in := testSummaryInput()
 	in.PreviousCoveredMessageID = 1
-	in.CoveredMessageID = 2
+	in.CoveredMessageID = 4
 	request := agentapp.BuildSummaryRequest(in)
 	if len(request.Messages) < 2 {
 		t.Fatalf("summary request messages = %#v", request.Messages)
@@ -415,7 +422,7 @@ func TestSummaryPrefixReuseRequest(t *testing.T) {
 		if strings.Contains(message.Content, "src/auth/login.go") {
 			replayed = true
 		}
-		if strings.Contains(message.Content, "请实现 /api/login") {
+		if strings.Contains(message.Content, "早前：请实现 /api/login") {
 			t.Fatalf("summary request replayed a message at/below the covered watermark:\n%s", message.Content)
 		}
 	}
@@ -613,5 +620,333 @@ func TestCompactionReinjectsIntoCompactedPacket(t *testing.T) {
 		if strings.Contains(facts, folded) {
 			t.Fatalf("folded history %q leaked into the reinjection:\n%s", folded, facts)
 		}
+	}
+}
+
+// TestSummaryExcludesPinnedTaskContextAndLatestUser pins R-A5-4: the summary is
+// derived from the folded transcript only. Pinned task context, pinned facts,
+// work item/requirement/case ids and the latest (trailing) user message must
+// never be rendered into the summary text, while still-true folded transcript
+// content survives.
+func TestSummaryExcludesPinnedTaskContextAndLatestUser(t *testing.T) {
+	in := testSummaryInput()
+	out := agentapp.BuildSummary(in)
+
+	forbidden := []string{
+		"task_type:",
+		"work_item:",
+		"pinned_fact:",
+		"requirement_id=501",
+		"case_id=7001",
+		"goal: 实现登录功能",
+		in.Task.Goal,
+		in.PinnedFacts[0],
+		"请实现 /api/login；错误码 FR-001。", // latest (trailing) user message
+	}
+	forbidden = append(forbidden, in.Task.Constraints...)
+	forbidden = append(forbidden, in.Task.AcceptanceCriteria...)
+	forbidden = append(forbidden, in.Task.Scope...)
+	for _, text := range forbidden {
+		if strings.Contains(out, text) {
+			t.Fatalf("summary re-introduced pinned R-A5-4 material %q:\n%s", text, out)
+		}
+	}
+
+	for _, want := range []string{
+		"早前：请实现 /api/login",
+		"src/auth/login.go",
+		"go test ./internal/auth",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary lost folded transcript content %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestSummaryWatermarkAppliesToDeterministicFallback pins the single watermark
+// contract (R-A5-12): the deterministic builder folds only messages after
+// PreviousCoveredMessageID, so an already-covered message is never re-summarized
+// on the fallback path.
+func TestSummaryWatermarkAppliesToDeterministicFallback(t *testing.T) {
+	in := testSummaryInput()
+	in.PreviousCoveredMessageID = 2
+	out := agentapp.BuildSummary(in)
+	for _, covered := range []string{"早前：请实现 /api/login", "src/auth/login.go"} {
+		if strings.Contains(out, covered) {
+			t.Fatalf("deterministic summary re-folded covered message material %q:\n%s", covered, out)
+		}
+	}
+	if !strings.Contains(out, "go test ./internal/auth") {
+		t.Fatalf("deterministic summary dropped the message after the watermark:\n%s", out)
+	}
+}
+
+// TestSummaryDropsPinnedAndStalePriorLines pins the prior-summary merge: lines
+// that re-introduce pinned R-A5-4 material are dropped, a fact whose kind/key is
+// no longer current is stale and dropped, a still-current fact line survives and
+// a plan item missing from the DB snapshot is dropped.
+func TestSummaryDropsPinnedAndStalePriorLines(t *testing.T) {
+	in := testSummaryInput()
+	in.PriorSummary = `## 关键概念与约束
+- goal: 实现登录功能
+- 约束: 不得修改已确认需求
+
+## 关键上下文
+- fact kind=decision key=auth.method confidence=0.90 (prior merge marker)
+- fact kind=decision key=auth.legacy confidence=0.90
+- pinned_fact: JWT 有效期 15 分钟
+- pinned_fact: 旧凭证 30 天
+- plan_item id=99 status=in_progress
+- 仍然有效的旧结论 attachment_id=9001`
+	out := agentapp.BuildSummary(in)
+
+	for _, stale := range []string{
+		"goal: 实现登录功能",
+		"不得修改已确认需求",
+		"pinned_fact:",
+		"旧凭证 30 天",
+		"auth.legacy",
+		"plan_item id=99",
+	} {
+		if strings.Contains(out, stale) {
+			t.Fatalf("summary kept stale/pinned prior line %q:\n%s", stale, out)
+		}
+	}
+	for _, want := range []string{
+		"(prior merge marker)",
+		"仍然有效的旧结论 attachment_id=9001",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary dropped still-current prior material %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestSummaryPreservesBareNumbers pins R-A5-7's exact-value rule for bare
+// numbers: HTTP statuses/counts from the folded range are preserved, while
+// numbers that are part of an id field are not duplicated as bare noise.
+func TestSummaryPreservesBareNumbers(t *testing.T) {
+	in := testSummaryInput()
+	in.Messages = append(in.Messages, agentapp.SummaryReplayMessage{
+		ID: 5, Role: "tool",
+		Content: "release check: HTTP 401 after 12 retries; attachment_id=9001",
+	})
+	out := agentapp.BuildSummary(in)
+	for _, want := range []string{"401", "12"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary lost bare number %q:\n%s", want, out)
+		}
+	}
+	if count := strings.Count(out, "9001"); count != 1 {
+		t.Fatalf("attachment id 9001 rendered %d times, want the id once and no bare duplicate:\n%s", count, out)
+	}
+}
+
+// TestSummaryCommitCapsPinnedFacts pins the R-A5-4 ≤20 cap on the persistence
+// hook: the commit carries only the newest MaxPinnedFacts facts.
+func TestSummaryCommitCapsPinnedFacts(t *testing.T) {
+	in := testSummaryInput()
+	in.PinnedFacts = make([]string, 0, 25)
+	for index := 0; index < 25; index++ {
+		in.PinnedFacts = append(in.PinnedFacts, fmt.Sprintf("钉住事实%02d", index))
+	}
+	commit := agentapp.BuildSummaryResult(in).Commit(in)
+	if len(commit.PinnedFacts) != agentapp.MaxPinnedFacts {
+		t.Fatalf("commit pinned facts = %d, want the R-A5-4 cap %d", len(commit.PinnedFacts), agentapp.MaxPinnedFacts)
+	}
+	if commit.PinnedFacts[0] != "钉住事实05" || commit.PinnedFacts[len(commit.PinnedFacts)-1] != "钉住事实24" {
+		t.Fatalf("commit kept the wrong pinned-fact window: %#v", commit.PinnedFacts)
+	}
+}
+
+// TestCompactionSummarizerFallbackPublishesTruncation pins the summary_truncated
+// flag/event on the deterministic fallback path too: a missing gateway must not
+// hide an over-budget summary.
+func TestCompactionSummarizerFallbackPublishesTruncation(t *testing.T) {
+	publisher := &fakeSummaryEventPublisher{}
+	in := testSummaryInput()
+	in.SummaryMax = 240
+	confidence := 0.5
+	for index := 0; index < 40; index++ {
+		in.Facts = append(in.Facts, agentcontext.FactSnapshot{
+			ID: int64(100 + index), Kind: "finding",
+			Key: fmt.Sprintf("key.%02d", index), Summary: strings.Repeat("细节", 20),
+			Confidence: &confidence,
+		})
+	}
+	result := agentapp.NewCompactionSummarizer(nil, agentapp.WithSummaryEventPublisher(publisher)).
+		Summarize(context.Background(), in)
+	if !result.UsedFallback || !result.Truncated {
+		t.Fatalf("fallback summary = %+v, want a truncated fallback", result)
+	}
+	if len(publisher.events) != 1 || publisher.events[0].Type != agentapp.EventSummaryTruncated {
+		t.Fatalf("fallback summary events = %#v, want one %s", publisher.events, agentapp.EventSummaryTruncated)
+	}
+}
+
+// TestCompactionReinjectionDoesNotDuplicatePinnedFacts pins R-A5-4/R-A5-9: the
+// pinned facts already live in the pinned facts segment, so appending the
+// post-compaction reinjection block must not render them a second time.
+func TestCompactionReinjectionDoesNotDuplicatePinnedFacts(t *testing.T) {
+	fixture := newBriefingRunnerFixture(t)
+	fixture.settings.ints["context.keep_recent_messages"] = 1
+	fixture.conv.snapshot.Summary = ""
+	fixture.conv.snapshot.PinnedFacts = []string{"JWT 有效期 15 分钟"}
+	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+		{ID: 701, Role: "user", Text: "消息一：折叠目标"},
+		{ID: 702, Role: "assistant", Text: "消息二：折叠回复"},
+		{ID: 703, Role: "user", Text: "消息三：最新回复"},
+	}
+	fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{Content: "不应被采用的回复"},
+		{Content: "压缩后的摘要"},
+		{Content: "恢复后的回复"},
+	}
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fixture.repo.packets) != 2 {
+		t.Fatalf("persisted packets = %d, want prepare + compacted", len(fixture.repo.packets))
+	}
+	compacted := decodeStoredPacket(t, fixture.repo.packets[1])
+	facts := strings.Join(segmentContents(compacted, agentcontext.SegmentFacts), "\n")
+	if count := strings.Count(facts, "JWT 有效期 15 分钟"); count != 1 {
+		t.Fatalf("pinned fact rendered %d times in the facts segment, want once:\n%s", count, facts)
+	}
+	if !strings.Contains(facts, "work_item: 1001") || !strings.Contains(facts, "acceptance") {
+		t.Fatalf("compacted pinned facts lost the reinjected task context:\n%s", facts)
+	}
+}
+
+// TestSummaryRequestReusesStablePrefixByteForByte pins R-A5-8's cache-alignment
+// byte rule: the system message of the summary request is the live stable prefix
+// unchanged, including any leading/trailing whitespace.
+func TestSummaryRequestReusesStablePrefixByteForByte(t *testing.T) {
+	in := testSummaryInput()
+	in.StablePrefix = "  [profile:clarification_host] 稳定前缀  \n\n# 版本不变量\n- 版本目标: 订单系统  \n"
+	request := agentapp.BuildSummaryRequest(in)
+	if request.Messages[0].Role != "system" || request.Messages[0].Content != in.StablePrefix {
+		t.Fatalf("summary request rewrote the stable prefix:\nwant %q\ngot  %q", in.StablePrefix, request.Messages[0].Content)
+	}
+}
+
+// TestSummaryRequestIsCacheAlignedPrefix pins R-A5-8's prefix-reuse contract:
+// the request replays the live prefix messages and the watermark-filtered folded
+// range verbatim, so its message sequence (before the compaction instruction) is
+// a prefix of the live provider transcript with no skipped middle messages.
+// Tool calls and reasoning content survive the replay.
+func TestSummaryRequestIsCacheAlignedPrefix(t *testing.T) {
+	live := []agentapp.SummaryReplayMessage{
+		{Role: "user", Content: "版本 briefing：登录需求"},
+		{Role: "user", Content: "版本 facts：订单系统"},
+		{Role: "user", Content: "已有摘要：早期上下文"},
+	}
+	folded := []agentapp.SummaryReplayMessage{
+		{ID: 11, Role: "user", Content: "请阅读登录实现"},
+		{
+			ID: 12, Role: "assistant", Content: "",
+			ReasoningContent: "先阅读登录实现",
+			ToolCalls:        []llmapp.ToolCall{{ID: "call-1", Name: "file.read", Arguments: `{"path":"src/auth/login.go"}`}},
+		},
+		{ID: 13, Role: "tool", ToolCallID: "call-1", Content: "package auth"},
+	}
+	in := testSummaryInput()
+	in.StablePrefix = "  [profile:clarification_host] 稳定前缀  \n"
+	in.LiveMessages = live
+	in.Messages = folded
+	in.PreviousCoveredMessageID = 0
+	in.CoveredMessageID = 13
+
+	request := agentapp.BuildSummaryRequest(in)
+	expected := make([]llmapp.ChatMessage, 0, 1+len(live)+len(folded))
+	expected = append(expected, llmapp.ChatMessage{Role: "system", Content: in.StablePrefix})
+	for _, message := range live {
+		expected = append(expected, summaryReplayChatMessage(message))
+	}
+	for _, message := range folded {
+		expected = append(expected, summaryReplayChatMessage(message))
+	}
+	if len(request.Messages) != len(expected)+1 {
+		t.Fatalf("summary request has %d messages, want the %d prefix messages plus the instruction",
+			len(request.Messages), len(expected))
+	}
+	for index, want := range expected {
+		if !reflect.DeepEqual(request.Messages[index], want) {
+			t.Fatalf("summary request message %d is not the live transcript message:\nwant %#v\ngot  %#v",
+				index, want, request.Messages[index])
+		}
+	}
+	last := request.Messages[len(request.Messages)-1]
+	if last.Role != "user" || !strings.Contains(last.Content, "压缩指令") {
+		t.Fatalf("last summary message is not the compaction instruction: %#v", last)
+	}
+
+	var toolCall, reasoning bool
+	for _, message := range request.Messages {
+		if len(message.ToolCalls) == 1 && message.ToolCalls[0].ID == "call-1" {
+			toolCall = true
+		}
+		if message.ReasoningContent == "先阅读登录实现" {
+			reasoning = true
+		}
+	}
+	if !toolCall || !reasoning {
+		t.Fatalf("summary replay lost tool calls/reasoning: toolCall=%v reasoning=%v", toolCall, reasoning)
+	}
+}
+
+// summaryReplayChatMessage mirrors the production replay conversion for the
+// expected-prefix assertion.
+func summaryReplayChatMessage(message agentapp.SummaryReplayMessage) llmapp.ChatMessage {
+	return llmapp.ChatMessage{
+		Role:             message.Role,
+		Content:          message.Content,
+		Images:           message.Images,
+		ToolCalls:        message.ToolCalls,
+		ToolCallID:       message.ToolCallID,
+		ReasoningContent: message.ReasoningContent,
+	}
+}
+
+// TestSummaryMessagesPreservesStructuredParts pins the transcript contract of
+// SummaryMessages: structured UI parts are rendered as bounded structured text
+// (never dropped) while image payload bytes are replaced by the attachment
+// marker.
+func TestSummaryMessagesPreservesStructuredParts(t *testing.T) {
+	messages := agentapp.SummaryMessages([]agentapp.ConversationMessage{{
+		ID:   1,
+		Role: "assistant",
+		Text: "已生成需求卡",
+		Parts: []agentapp.ConversationPart{
+			{Type: "requirement_card", Data: map[string]any{"requirement_id": "501", "title": "登录"}},
+			{Type: "image", Data: map[string]any{"attachment_id": 9001, "content": "SECRET_IMAGE_BYTES"}},
+		},
+	}})
+	if len(messages) != 1 {
+		t.Fatalf("summary messages = %#v", messages)
+	}
+	if !strings.Contains(messages[0].Content, "requirement_card") || !strings.Contains(messages[0].Content, "501") {
+		t.Fatalf("structured requirement_card part was dropped: %q", messages[0].Content)
+	}
+	if strings.Contains(messages[0].Content, "SECRET_IMAGE_BYTES") {
+		t.Fatalf("image payload leaked into the summary transcript: %q", messages[0].Content)
+	}
+}
+
+// TestSummaryImageTokensChargedInRequestEstimate pins R-A5-5's 1500-tokens-per-
+// image charge: the summary request estimate and the result bookkeeping both
+// account for skipped images.
+func TestSummaryImageTokensChargedInRequestEstimate(t *testing.T) {
+	in := testSummaryInput()
+	in.ImageCount = 2
+	if estimate := agentapp.EstimateSummaryRequestTokens(in); estimate < 2*agentapp.SummaryImageTokens {
+		t.Fatalf("summary request estimate = %d, want at least the %d image charge",
+			estimate, 2*agentapp.SummaryImageTokens)
+	}
+	result := agentapp.BuildSummaryResult(in)
+	if result.InputTokens < 2*agentapp.SummaryImageTokens {
+		t.Fatalf("summary result input tokens = %d, want the %d image charge",
+			result.InputTokens, 2*agentapp.SummaryImageTokens)
 	}
 }

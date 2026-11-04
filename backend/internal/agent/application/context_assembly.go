@@ -111,8 +111,10 @@ func (r *Runner) assembleContextWithKeepRecent(
 		// re-injected independently of the summary. The block lands in the
 		// pinned facts segment, ahead of the rolling summary and the retained
 		// recent turns, so compaction can never fold the goal, constraints,
-		// acceptance criteria, scope or ids into the summary.
-		if reinjection := assembleAfterCompaction(newCompactionState(state)); reinjection != "" {
+		// acceptance criteria, scope or ids into the summary. The pinned facts
+		// themselves are already rendered by contextFactBlocks, so the prompt
+		// variant omits them and each fact is carried exactly once.
+		if reinjection := assembleAfterCompactionForPrompt(newCompactionState(state)); reinjection != "" {
 			request.Facts = append(request.Facts, reinjection)
 		}
 		rebuilt, rebuildErr := assembler.Build(ctx, request)
@@ -530,22 +532,38 @@ func newCompactionState(state *runState) compactionState {
 // renders pinned material only, so the folded history can never leak back into
 // the prompt through this path.
 func assembleAfterCompaction(state compactionState) string {
+	return assembleCompactionBlock(state, true)
+}
+
+// assembleAfterCompactionForPrompt renders the reinjection block that the runner
+// appends to the pinned facts segment of the live prompt. That segment already
+// renders the pinned facts through contextFactBlocks (session memory), so this
+// variant omits them: the prompt carries every pinned fact exactly once
+// (R-A5-4/R-A5-9) while the standalone block still renders them for callers that
+// use it on its own.
+func assembleAfterCompactionForPrompt(state compactionState) string {
+	return assembleCompactionBlock(state, false)
+}
+
+func assembleCompactionBlock(state compactionState, includePinnedFacts bool) string {
 	lines := []string{"压缩后重注入（pinned task context，来自 state.input，不依赖摘要）"}
 	lines = append(lines, summaryTaskContextLines(
 		state.Input.Task, state.WorkItemID, state.RequirementIDs, state.CaseIDs, nil)...)
 
-	pinnedFacts := state.PinnedFacts
-	if pinnedFacts == nil {
-		pinnedFacts = state.Input.Conversation.PinnedFacts
-	}
-	pinnedFacts = capPinnedFacts(pinnedFacts)
-	lines = append(lines, fmt.Sprintf("pinned_facts (%d/%d):", len(pinnedFacts), MaxPinnedFacts))
-	if len(pinnedFacts) == 0 {
-		lines = append(lines, "- "+summaryNoneText)
-	}
-	for _, fact := range pinnedFacts {
-		if line := summaryOneLine(fact); line != "" {
-			lines = append(lines, "- "+line)
+	if includePinnedFacts {
+		pinnedFacts := state.PinnedFacts
+		if pinnedFacts == nil {
+			pinnedFacts = state.Input.Conversation.PinnedFacts
+		}
+		pinnedFacts = capPinnedFacts(pinnedFacts)
+		lines = append(lines, fmt.Sprintf("pinned_facts (%d/%d):", len(pinnedFacts), MaxPinnedFacts))
+		if len(pinnedFacts) == 0 {
+			lines = append(lines, "- "+summaryNoneText)
+		}
+		for _, fact := range pinnedFacts {
+			if line := summaryOneLine(fact); line != "" {
+				lines = append(lines, "- "+line)
+			}
 		}
 	}
 	if len(state.Plan) > 0 {

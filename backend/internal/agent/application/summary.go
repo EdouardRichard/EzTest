@@ -2,6 +2,7 @@ package agentapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -124,7 +125,9 @@ const (
 
 	// summaryNoneText is the R-A5-7 empty-section placeholder.
 	summaryNoneText = "(none)"
-	// SummaryImageTokens is the R-A5-5 token charge of one skipped image.
+	// SummaryImageTokens is the R-A5-5 token charge of one skipped image. It is
+	// wired into EstimateSummaryRequestTokens (and the result/commit bookkeeping)
+	// so the Task 36 budget accounting charges every skipped image exactly once.
 	SummaryImageTokens = 1500
 	// maxSummaryContextItems bounds the extracted exact identifiers of the
 	// key-context section so one noisy transcript cannot flood the summary.
@@ -133,6 +136,17 @@ const (
 	maxSummaryPlanItems = 10
 	// maxSummaryFactItems bounds one rendered fact group.
 	maxSummaryFactItems = 10
+	// maxSummaryGoalItems bounds the older-user request bullets of the goal
+	// section derived from the folded transcript.
+	maxSummaryGoalItems = 5
+	// maxSummaryConstraintItems bounds the derived constraint bullets.
+	maxSummaryConstraintItems = 10
+	// maxSummaryRequirementItems bounds the derived requirement/case/artifact
+	// bullets.
+	maxSummaryRequirementItems = 10
+	// maxSummaryBareNumbers bounds the bare-number extraction so a numeric
+	// transcript cannot flood the key-context section.
+	maxSummaryBareNumbers = 12
 )
 
 // summarySectionHeadings is the ordered R-A5-7 section list.
@@ -185,6 +199,22 @@ type SummarySection struct {
 	Body    string
 }
 
+// SummaryReplayMessage is one message replayed verbatim in the R-A5-8 summary
+// request. It preserves the provider-relevant fields of the live transcript
+// (tool calls, tool-call identity, reasoning content and images) that the
+// narrower context.Message cannot carry, so the summary call shares the longest
+// possible prefix with the conversation's next provider request. The summary
+// text itself is still derived from Content only.
+type SummaryReplayMessage struct {
+	ID               int64
+	Role             string
+	Content          string
+	Images           []llmapp.ChatImage
+	ToolCalls        []llmapp.ToolCall
+	ToolCallID       string
+	ReasoningContent string
+}
+
 // SummaryInput is the complete material of one compaction summary (R-A5-4,
 // R-A5-7, R-A5-8, R-A5-13). It carries the pinned task context and plan/fact
 // snapshots that are never folded, the transcript range to fold, the stable
@@ -212,9 +242,23 @@ type SummaryInput struct {
 	// summary call hits the provider prefix cache (R-A5-8).
 	StablePrefix string
 	Tools        []llmapp.ToolDefinition
-	// Messages is the summarised range, oldest first. Image content never
-	// reaches this slice: SummaryMessages replaces it with attachment markers.
-	Messages []Message
+	// LiveMessages are the current conversation's messages between the stable
+	// system prefix and the folded range: the rendered version briefing, the
+	// rendered version facts and the prior summary. BuildSummaryRequest replays
+	// them verbatim before the folded range so the request is a prefix of the
+	// live provider transcript (R-A5-8). The summary text never derives from
+	// them.
+	LiveMessages []SummaryReplayMessage
+	// Messages is the summarised range, oldest first. Callers may pass the
+	// unfiltered range: BuildSummaryResult and BuildSummaryRequest apply
+	// SelectSummaryMessages exactly once with PreviousCoveredMessageID, so an
+	// already-covered message is never folded twice (R-A5-12). Image content
+	// never reaches the summary text: SummaryMessages replaces it with
+	// attachment markers.
+	Messages []SummaryReplayMessage
+	// ImageCount is the number of images skipped by the folded range (R-A5-5).
+	// Each image is charged SummaryImageTokens in the request estimate.
+	ImageCount int
 
 	// Task is the pinned per-work-item task context (R-A5-4).
 	Task           TaskContext
@@ -262,6 +306,7 @@ type SummaryResult struct {
 	Text             string
 	Truncated        bool
 	Tokens           int
+	InputTokens      int
 	CachedTokens     int
 	CacheHit         bool
 	UsedFallback     bool
@@ -275,6 +320,13 @@ type SummaryResult struct {
 // 16-token overhead. It deliberately over-estimates (rounds the non-CJK part
 // up) so a truncated summary still fits the budget the provider sees.
 func EstimateSummaryTokens(text string) int {
+	return summaryTextTokens(text) + tokenOverhead
+}
+
+// summaryTextTokens is the overflow-free part of EstimateSummaryTokens; the
+// aggregate request estimate adds the per-prompt overhead once instead of once
+// per message.
+func summaryTextTokens(text string) int {
 	cjk, other := 0, 0
 	for _, r := range text {
 		if summaryCJK(r) {
@@ -283,7 +335,45 @@ func EstimateSummaryTokens(text string) int {
 		}
 		other++
 	}
-	return cjk + (other+3)/4 + tokenOverhead
+	return cjk + (other+3)/4
+}
+
+// EstimateSummaryRequestTokens is the R-A5-14/R-A5-5 conservative estimate of
+// one summary request input: the reused stable prefix, the live prefix
+// messages, the watermark-filtered folded range and the compaction instruction,
+// plus SummaryImageTokens for every skipped image. Task 36 charges this against
+// the compaction trigger budget.
+func EstimateSummaryRequestTokens(in SummaryInput) int {
+	in = selectSummaryInput(in)
+	return estimateSummaryRequestTokens(in)
+}
+
+// estimateSummaryRequestTokens is the already-selected form used by the builder
+// so the watermark is applied exactly once per summary transaction.
+func estimateSummaryRequestTokens(in SummaryInput) int {
+	total := summaryTextTokens(in.StablePrefix)
+	for _, message := range in.LiveMessages {
+		total += summaryReplayMessageTokens(message)
+	}
+	for _, message := range in.Messages {
+		total += summaryReplayMessageTokens(message)
+	}
+	total += summaryTextTokens(summaryCompactionInstruction(in))
+	if in.ImageCount > 0 {
+		total += in.ImageCount * SummaryImageTokens
+	}
+	return total + tokenOverhead
+}
+
+// summaryReplayMessageTokens estimates one replayed message: its text plus the
+// reasoning/tool-call payload it carries.
+func summaryReplayMessageTokens(message SummaryReplayMessage) int {
+	total := summaryTextTokens(message.Content)
+	total += summaryTextTokens(message.ReasoningContent)
+	for _, call := range message.ToolCalls {
+		total += summaryTextTokens(call.Name + call.Arguments)
+	}
+	return total
 }
 
 // summaryCJK reports whether a rune is rendered at roughly one token per rune
@@ -303,11 +393,21 @@ func summaryCJK(r rune) bool {
 	}
 }
 
+// selectSummaryInput applies the R-A5-12 watermark exactly once per public
+// summary entry point. Messages may therefore be passed unfiltered: the
+// deterministic builder and the request builder both fold only the messages the
+// previous summary revision did not cover.
+func selectSummaryInput(in SummaryInput) SummaryInput {
+	in.Messages = SelectSummaryMessages(in.Messages, in.PreviousCoveredMessageID)
+	return in
+}
+
 // BuildSummary renders the R-A5-7 nine-section summary text. It is deterministic
 // and never invents material: the plan/progress/next sections are rebuilt from
 // the DB snapshots, exact ids/paths/commands/errors/numbers/signatures are
 // preserved, a prior summary is merged without verbatim duplication and every
-// empty section renders (none).
+// empty section renders (none). Pinned R-A5-4 material (task context, pinned
+// facts, latest user message) is never rendered.
 func BuildSummary(in SummaryInput) string {
 	return BuildSummaryResult(in).Text
 }
@@ -315,12 +415,14 @@ func BuildSummary(in SummaryInput) string {
 // BuildSummaryResult is BuildSummary plus the truncation/token bookkeeping used
 // by the summary_truncated flag and event (R-A5-7).
 func BuildSummaryResult(in SummaryInput) SummaryResult {
+	in = selectSummaryInput(in)
 	sections := buildSummarySections(in)
 	text, truncated := renderSummaryWithinBudget(sections, in.summaryMax())
 	return SummaryResult{
 		Text:             text,
 		Truncated:        truncated,
 		Tokens:           EstimateSummaryTokens(text),
+		InputTokens:      estimateSummaryRequestTokens(in),
 		CoveredMessageID: in.CoveredMessageID,
 		CompactionID:     in.CompactionID,
 	}
@@ -366,7 +468,7 @@ func buildSummarySections(in SummaryInput) []SummarySection {
 				// current DB snapshot is the only truth for those sections.
 				continue
 			}
-			body := filterStalePriorSummaryLines(strings.TrimSpace(prior[index]), in.Plan)
+			body := filterStalePriorSummaryLines(strings.TrimSpace(prior[index]), in)
 			if body == "" {
 				continue
 			}
@@ -377,21 +479,28 @@ func buildSummarySections(in SummaryInput) []SummarySection {
 }
 
 // deriveSummarySections renders the deterministic sections from the input
-// material. No section invents content.
+// material. No section invents content. R-A5-4: the goal/concepts/requirements/
+// files/errors/context sections are derived from the folded transcript only
+// (older user messages and tool outputs). Pinned task context, pinned facts,
+// work item/requirement/case ids and the latest user message never enter the
+// summary; the todo/progress/next sections only reference the DB truth
+// snapshots (R-A5-13).
 func deriveSummarySections(in SummaryInput) []SummarySection {
 	sections := make([]SummarySection, len(summarySectionHeadings))
 	for index, heading := range summarySectionHeadings {
 		sections[index].Heading = heading
 	}
-	sections[0].Body = summaryGoalBody(in)
-	sections[1].Body = summaryConceptsBody(in)
-	sections[2].Body = summaryRequirementsBody(in)
-	sections[3].Body = summaryFilesBody(in)
-	sections[4].Body = summaryErrorsBody(in)
+	material := summaryMaterialMessages(in.Messages)
+	extracted := summaryExtract(material)
+	sections[0].Body = summaryGoalBody(material)
+	sections[1].Body = summaryConceptsBody(material)
+	sections[2].Body = summaryRequirementsBody(material, extracted)
+	sections[3].Body = summaryFilesBody(extracted)
+	sections[4].Body = summaryErrorsBody(extracted)
 	sections[5].Body = summaryTodoBody(in.Plan)
 	sections[6].Body = summaryProgressBody(in)
 	sections[7].Body = summaryNextBody(in.Plan)
-	sections[8].Body = summaryContextBody(in)
+	sections[8].Body = summaryContextBody(extracted)
 	return sections
 }
 
@@ -401,67 +510,101 @@ func summaryDBTruthSection(index int) bool {
 	return index >= 5 && index <= 7
 }
 
-func summaryGoalBody(in SummaryInput) string {
-	lines := make([]string, 0, 3)
-	if taskType := summaryOneLine(in.Task.Type); taskType != "" {
-		lines = append(lines, "task_type: "+taskType)
+// summaryMaterialMessages drops the pinned latest user message from the summary
+// material (R-A5-4). A trailing user message is the current/triggering turn: it
+// is retained verbatim by the live transcript and must never be folded into the
+// summary. Older user messages with a reply after them are folded transcript
+// material and stay.
+func summaryMaterialMessages(messages []SummaryReplayMessage) []SummaryReplayMessage {
+	if len(messages) == 0 {
+		return messages
 	}
-	if goal := summaryOneLine(in.Task.Goal); goal != "" {
-		lines = append(lines, "goal: "+goal)
+	if !strings.EqualFold(strings.TrimSpace(messages[len(messages)-1].Role), "user") {
+		return messages
 	}
-	if latest := summaryLatestUserIntent(in.Messages); latest != "" {
-		lines = append(lines, "latest_user: "+latest)
-	}
-	return strings.Join(lines, "\n")
+	return messages[:len(messages)-1]
 }
 
-// summaryLatestUserIntent returns the newest user message, collapsed to one line
-// and bounded so a huge instruction cannot dominate the summary.
-func summaryLatestUserIntent(messages []Message) string {
-	for index := len(messages) - 1; index >= 0; index-- {
-		if !strings.EqualFold(strings.TrimSpace(messages[index].Role), "user") {
+// summaryGoalBody lists the older user requests folded into the summary. It is
+// deliberately derived from the folded transcript, never from the pinned task
+// goal or the latest user message.
+func summaryGoalBody(messages []SummaryReplayMessage) string {
+	lines := make([]string, 0, maxSummaryGoalItems)
+	for _, message := range messages {
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
 			continue
 		}
-		if content := summaryOneLine(messages[index].Content); content != "" {
-			return truncateRunes(content, 200)
+		content := summaryOneLine(message.Content)
+		if content == "" {
+			continue
 		}
-	}
-	return ""
-}
-
-func summaryConceptsBody(in SummaryInput) string {
-	lines := make([]string, 0, len(in.Task.Constraints))
-	for _, constraint := range in.Task.Constraints {
-		if line := summaryOneLine(constraint); line != "" {
-			lines = append(lines, "- 约束: "+line)
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-func summaryRequirementsBody(in SummaryInput) string {
-	lines := make([]string, 0, len(in.RequirementIDs)+len(in.CaseIDs)+len(in.Task.AcceptanceCriteria)+len(in.Task.Scope))
-	for _, requirementID := range uniqueSummaryIDs(in.RequirementIDs) {
-		lines = append(lines, fmt.Sprintf("requirement_id=%d", requirementID))
-	}
-	for _, caseID := range uniqueSummaryIDs(in.CaseIDs) {
-		lines = append(lines, fmt.Sprintf("case_id=%d", caseID))
-	}
-	for _, criterion := range in.Task.AcceptanceCriteria {
-		if line := summaryOneLine(criterion); line != "" {
-			lines = append(lines, "acceptance: "+line)
-		}
-	}
-	for _, scope := range in.Task.Scope {
-		if line := summaryOneLine(scope); line != "" {
-			lines = append(lines, "scope: "+line)
+		lines = append(lines, "- 历史用户: "+truncateRunes(content, 200))
+		if len(lines) == maxSummaryGoalItems {
+			break
 		}
 	}
 	return summaryBullets(lines)
 }
 
-func summaryFilesBody(in SummaryInput) string {
-	extracted := summaryExtract(in.Messages)
+// summaryConstraintLinePattern recognizes explicit constraint/requirement
+// statements in the folded transcript.
+var summaryConstraintLinePattern = regexp.MustCompile(`(?i)(约束|限制|必须|不得|禁止|不能|只允许|要求|规则|constraint|must|shall|required)`)
+
+// summaryConceptsBody extracts constraint-like statements from the folded
+// transcript (older user messages and tool outputs). Pinned task constraints are
+// never read.
+func summaryConceptsBody(messages []SummaryReplayMessage) string {
+	lines := make([]string, 0, maxSummaryConstraintItems)
+	for _, message := range messages {
+		for _, rawLine := range strings.Split(message.Content, "\n") {
+			line := summaryOneLine(rawLine)
+			if line == "" || !summaryConstraintLinePattern.MatchString(line) {
+				continue
+			}
+			lines = append(lines, "- 约束: "+truncateRunes(line, 200))
+			if len(lines) == maxSummaryConstraintItems {
+				return summaryBullets(lines)
+			}
+		}
+	}
+	return summaryBullets(lines)
+}
+
+// summaryRequirementIDPattern recognizes requirement/case/artifact identifiers
+// in the folded transcript.
+var summaryRequirementIDPattern = regexp.MustCompile(`(?i)(?:requirement_id|case_id|fr|req|case)[-_=:]?\d+`)
+
+// summaryImageMarkerPattern recognizes the R-A5-5 image placeholder.
+var summaryImageMarkerPattern = regexp.MustCompile(`\[image skipped: attachment_id=[^\]]+\]`)
+
+// summaryRequirementsBody renders the requirements/cases/artifacts observed in
+// the folded transcript: requirement/case identifiers and image attachment
+// markers. Pinned requirement/case ids are never read.
+func summaryRequirementsBody(messages []SummaryReplayMessage, extracted summaryExtracted) string {
+	lines := make([]string, 0, maxSummaryRequirementItems)
+	for _, item := range extracted.ids {
+		if !summaryRequirementIDPattern.MatchString(item) {
+			continue
+		}
+		lines = append(lines, "- "+item)
+		if len(lines) == maxSummaryRequirementItems {
+			return summaryBullets(lines)
+		}
+	}
+	for _, message := range messages {
+		for _, marker := range summaryImageMarkerPattern.FindAllString(message.Content, -1) {
+			lines = append(lines, "- artifact: "+marker)
+			if len(lines) == maxSummaryRequirementItems {
+				return summaryBullets(lines)
+			}
+		}
+	}
+	return summaryBullets(lines)
+}
+
+// summaryFilesBody renders the paths/commands/signatures extracted from the
+// folded transcript.
+func summaryFilesBody(extracted summaryExtracted) string {
 	lines := make([]string, 0, len(extracted.paths)+len(extracted.commands)+len(extracted.signatures))
 	lines = append(lines, extracted.paths...)
 	lines = append(lines, extracted.commands...)
@@ -469,8 +612,10 @@ func summaryFilesBody(in SummaryInput) string {
 	return summaryBullets(lines)
 }
 
-func summaryErrorsBody(in SummaryInput) string {
-	return summaryBullets(summaryExtract(in.Messages).errors)
+// summaryErrorsBody renders the error strings extracted from the folded
+// transcript.
+func summaryErrorsBody(extracted summaryExtracted) string {
+	return summaryBullets(extracted.errors)
 }
 
 // summaryTodoBody renders the open plan items: every line carries the real plan
@@ -531,38 +676,22 @@ func summaryNextBody(plan []agentcontext.PlanItemSnapshot) string {
 	return summaryPlanItemLine(next)
 }
 
-// summaryContextBody renders the pinned facts plus the exact identifiers,
-// paths, commands, errors, numbers and signatures preserved from the folded
-// transcript.
-func summaryContextBody(in SummaryInput) string {
-	lines := make([]string, 0, maxSummaryContextItems+MaxPinnedFacts)
-	for _, fact := range capPinnedFacts(in.PinnedFacts) {
-		if line := summaryOneLine(fact); line != "" {
-			lines = append(lines, "- pinned_fact: "+line)
+// summaryContextBody renders the exact identifiers, paths, commands, errors,
+// numbers and signatures preserved from the folded transcript. Pinned facts and
+// the work item id never enter the summary (R-A5-4).
+func summaryContextBody(extracted summaryExtracted) string {
+	lines := make([]string, 0, maxSummaryContextItems)
+	add := func(prefix string, values []string) {
+		for _, item := range values {
+			if len(lines) >= maxSummaryContextItems {
+				return
+			}
+			lines = append(lines, "- "+prefix+item)
 		}
 	}
-	if in.WorkItemID > 0 {
-		lines = append(lines, fmt.Sprintf("- work_item: %d", in.WorkItemID))
-	}
-	extracted := summaryExtract(in.Messages)
-	for _, item := range extracted.ids {
-		if len(lines) >= maxSummaryContextItems+MaxPinnedFacts {
-			break
-		}
-		lines = append(lines, "- "+item)
-	}
-	for _, item := range extracted.errors {
-		if len(lines) >= maxSummaryContextItems+MaxPinnedFacts {
-			break
-		}
-		lines = append(lines, "- error: "+item)
-	}
-	for _, item := range extracted.numbers {
-		if len(lines) >= maxSummaryContextItems+MaxPinnedFacts {
-			break
-		}
-		lines = append(lines, "- "+item)
-	}
+	add("", extracted.ids)
+	add("error: ", extracted.errors)
+	add("", extracted.numbers)
 	return strings.Join(lines, "\n")
 }
 
@@ -653,12 +782,15 @@ var (
 	summaryErrorLinePattern = regexp.MustCompile(`(?i)(?:error|failed|panic|exception|失败|修复|错误[:：])`)
 	summaryNumberPattern    = regexp.MustCompile(`\b(?:v\d+(?:\.\d+)+|\d+(?:\.\d+)?\s?(?:ms|s|%|KB|MB|GB|tokens?|chars?|条|个|分钟|秒))`)
 	summarySignaturePattern = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\([^()\n]{0,80}\)`)
+	// summaryBareNumberPattern matches a bounded bare number (ids/counts/HTTP
+	// statuses) that the unit/version pattern above does not cover.
+	summaryBareNumberPattern = regexp.MustCompile(`\b\d{2,6}\b`)
 )
 
 // summaryExtract scans the folded transcript for the exact material the summary
 // must preserve: ids, file paths, commands, error strings, numbers/signatures.
 // Deduplication is order-preserving so the render is deterministic.
-func summaryExtract(messages []Message) summaryExtracted {
+func summaryExtract(messages []SummaryReplayMessage) summaryExtracted {
 	extracted := summaryExtracted{}
 	seen := map[string]map[string]struct{}{
 		"path":      {},
@@ -691,6 +823,9 @@ func summaryExtract(messages []Message) summaryExtracted {
 			case "error":
 				extracted.errors = append(extracted.errors, value)
 			case "number":
+				if len(extracted.numbers) >= maxSummaryBareNumbers {
+					continue
+				}
 				extracted.numbers = append(extracted.numbers, value)
 			case "signature":
 				extracted.signatures = append(extracted.signatures, value)
@@ -710,6 +845,7 @@ func summaryExtract(messages []Message) summaryExtracted {
 				return strings.TrimRight(value, "。，；;.,")
 			})
 			add("number", summaryNumberPattern.FindAllString(line, -1), nil)
+			add("number", summaryBareNumbers(line), nil)
 			add("signature", summarySignaturePattern.FindAllString(line, -1), nil)
 			if summaryErrorLinePattern.MatchString(line) {
 				add("error", []string{truncateRunes(line, 200)}, nil)
@@ -717,6 +853,79 @@ func summaryExtract(messages []Message) summaryExtracted {
 		}
 	}
 	return extracted
+}
+
+// summaryBareNumbers extracts bounded bare numbers (HTTP statuses, counts, ids)
+// with a noise guard: numbers embedded in paths, versions, hyphenated ids or
+// id fields are already preserved elsewhere and are not duplicated here.
+func summaryBareNumbers(line string) []string {
+	matches := summaryBareNumberPattern.FindAllStringIndex(line, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if !summaryBareNumberBoundary(line, match[0], match[1]) {
+			continue
+		}
+		if summaryIDFieldNumber(line, match[0]) {
+			continue
+		}
+		value := line[match[0]:match[1]]
+		if summaryYearNumber(value) {
+			continue
+		}
+		values = append(values, value)
+		if len(values) == maxSummaryBareNumbers {
+			break
+		}
+	}
+	return values
+}
+
+// summaryBareNumberBoundary rejects numbers that are part of a larger token
+// (path segment, version, hyphenated id, decimal or unit suffix).
+func summaryBareNumberBoundary(line string, start, end int) bool {
+	if start > 0 {
+		switch line[start-1] {
+		case '.', '/', '\\', '-', '_', ':', '=':
+			return false
+		}
+	}
+	if end < len(line) {
+		switch line[end] {
+		case '.', '/', '\\', '-', '_', ':', '%':
+			return false
+		}
+	}
+	return true
+}
+
+// summaryIDFieldNumber reports whether the number is the value of an id field
+// (for example attachment_id=9001): the id extractor already preserves that
+// field verbatim, so a bare duplicate would only add noise.
+func summaryIDFieldNumber(line string, start int) bool {
+	prefix := strings.TrimSpace(line[:start])
+	for _, separator := range []string{"=", ":", "："} {
+		if !strings.HasSuffix(prefix, separator) {
+			continue
+		}
+		field := strings.TrimSpace(strings.TrimSuffix(prefix, separator))
+		if index := strings.LastIndexAny(field, " \t"); index >= 0 {
+			field = field[index+1:]
+		}
+		return field == "id" || strings.HasSuffix(field, "_id")
+	}
+	return false
+}
+
+// summaryYearNumber filters 4-digit calendar years so timestamps do not flood
+// the bare-number list.
+func summaryYearNumber(value string) bool {
+	if len(value) != 4 {
+		return false
+	}
+	return strings.HasPrefix(value, "19") || strings.HasPrefix(value, "20")
 }
 
 // summaryBullets renders deduplicated bullet lines, preserving order.
@@ -749,25 +958,6 @@ func capPinnedFacts(facts []string) []string {
 	return facts[len(facts)-MaxPinnedFacts:]
 }
 
-func uniqueSummaryIDs(ids []int64) []int64 {
-	if len(ids) == 0 {
-		return nil
-	}
-	seen := make(map[int64]struct{}, len(ids))
-	out := make([]int64, 0, len(ids))
-	for _, id := range ids {
-		if id <= 0 {
-			continue
-		}
-		if _, duplicate := seen[id]; duplicate {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	return out
-}
-
 // summaryOneLine trims and collapses whitespace so a database value cannot break
 // the single-line summary layout.
 func summaryOneLine(text string) string {
@@ -797,21 +987,33 @@ func mergeSummaryBodies(bodies ...string) string {
 	return strings.Join(lines, "\n")
 }
 
-// filterStalePriorSummaryLines drops prior lines whose plan item is gone from
-// the current snapshot or whose status no longer matches the DB. Everything
-// else is kept so still-true prior facts survive the merge.
-func filterStalePriorSummaryLines(body string, plan []agentcontext.PlanItemSnapshot) string {
-	if body == "" || len(plan) == 0 {
+// filterStalePriorSummaryLines keeps only the prior lines that are still true
+// under the current DB snapshots and that do not re-introduce pinned R-A5-4
+// material. A prior plan line is dropped when its item is gone or its status
+// changed; a prior fact line is dropped when its kind/key is no longer current;
+// a pinned_fact line is always dropped because pinned facts never enter the
+// summary; any line echoing the pinned task context or the latest user message
+// is dropped.
+func filterStalePriorSummaryLines(body string, in SummaryInput) string {
+	if body == "" {
 		return body
 	}
-	statuses := make(map[int64]string, len(plan))
-	for _, item := range plan {
+	statuses := make(map[int64]string, len(in.Plan))
+	for _, item := range in.Plan {
 		statuses[item.ID] = summaryPlanStatus(item.Status)
 	}
+	facts := make(map[string]struct{}, len(in.Facts))
+	for _, fact := range in.Facts {
+		facts[summaryFactKey(fact.Kind, fact.Key)] = struct{}{}
+	}
+	needles := summaryPinnedNeedles(in)
 	lines := make([]string, 0)
 	for _, rawLine := range strings.Split(body, "\n") {
 		line := strings.TrimSpace(rawLine)
 		if line == "" {
+			continue
+		}
+		if summaryPriorPinnedFactPattern.MatchString(line) {
 			continue
 		}
 		if match := summaryPriorPlanPattern.FindStringSubmatch(line); match != nil {
@@ -827,12 +1029,80 @@ func filterStalePriorSummaryLines(body string, plan []agentcontext.PlanItemSnaps
 				continue
 			}
 		}
+		if len(facts) > 0 {
+			if match := summaryPriorFactPattern.FindStringSubmatch(line); match != nil {
+				if _, ok := facts[summaryFactKey(match[1], match[2])]; !ok {
+					continue
+				}
+			}
+		}
+		if summaryLineHasNeedle(line, needles) {
+			continue
+		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
 }
 
-var summaryPriorPlanPattern = regexp.MustCompile(`plan_item id=(\d+)(?:\s+status=([^\s]+))?`)
+// summaryFactKey normalizes the DB fact identity used to detect stale prior
+// fact lines.
+func summaryFactKey(kind, key string) string {
+	return strings.ToLower(summaryFactPart(kind)) + "\x00" + strings.TrimSpace(key)
+}
+
+// summaryPinnedNeedles is the R-A5-4 pinned material that must never reappear
+// through a prior summary: the task context values (goal/constraints/acceptance/
+// scope/type), the pinned facts and the latest user message. Short values are
+// skipped so a single character cannot filter unrelated lines.
+func summaryPinnedNeedles(in SummaryInput) []string {
+	values := make([]string, 0, 8+len(in.Task.Constraints)+len(in.Task.AcceptanceCriteria)+len(in.Task.Scope)+len(in.PinnedFacts))
+	values = append(values, in.Task.Type, in.Task.Goal)
+	values = append(values, in.Task.Constraints...)
+	values = append(values, in.Task.AcceptanceCriteria...)
+	values = append(values, in.Task.Scope...)
+	values = append(values, in.PinnedFacts...)
+	values = append(values, summaryLatestUserText(in.Messages))
+	needles := make([]string, 0, len(values))
+	for _, value := range values {
+		value = summaryOneLine(value)
+		if len([]rune(value)) < 6 {
+			continue
+		}
+		needles = append(needles, value)
+	}
+	return needles
+}
+
+// summaryLatestUserText returns the trailing user message (the R-A5-4 pinned
+// latest user message) when the folded range ends with one.
+func summaryLatestUserText(messages []SummaryReplayMessage) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	last := messages[len(messages)-1]
+	if !strings.EqualFold(strings.TrimSpace(last.Role), "user") {
+		return ""
+	}
+	return summaryOneLine(last.Content)
+}
+
+// summaryLineHasNeedle reports whether a whitespace-normalized line contains any
+// pinned needle.
+func summaryLineHasNeedle(line string, needles []string) bool {
+	line = summaryOneLine(line)
+	for _, needle := range needles {
+		if strings.Contains(line, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	summaryPriorPlanPattern       = regexp.MustCompile(`plan_item id=(\d+)(?:\s+status=([^\s]+))?`)
+	summaryPriorFactPattern       = regexp.MustCompile(`fact\s+kind=(\S+)\s+key=(\S+)`)
+	summaryPriorPinnedFactPattern = regexp.MustCompile(`(?i)pinned_fact\s*:`)
+)
 
 // parseSummarySections parses markdown summary text into the canonical section
 // bodies. ok is false when the text carries none of the nine headings; content
@@ -997,27 +1267,27 @@ const truncationEllipsis = "…"
 // last user message of the prefix-reusing summary request (R-A5-8).
 const summaryInstructionMarker = "压缩指令"
 
-// BuildSummaryRequest builds the R-A5-8 summary request: the current
-// conversation's stable prefix and tool definitions are reused byte for byte,
-// the summary range after the covered watermark is replayed verbatim and the
-// compaction instruction is the last user message.
+// BuildSummaryRequest builds the R-A5-8 summary request as a true prefix of the
+// live provider transcript: the current conversation's stable prefix is reused
+// byte for byte (never trimmed), then the live prefix messages (briefing/facts/
+// prior summary), then the watermark-filtered folded range, and finally the
+// compaction instruction as the last user message. Replaying the live messages
+// before the folded range is what lets the provider reuse the mid-transcript
+// prefix cache, not just the system prompt. Tool calls, tool-call identities,
+// reasoning content and images are preserved on replay.
 func BuildSummaryRequest(in SummaryInput) llmapp.ChatRequest {
-	system := strings.TrimSpace(in.StablePrefix)
+	in = selectSummaryInput(in)
+	system := in.StablePrefix
 	if system == "" {
 		system = summaryCompactionSystemPrompt
 	}
-	messages := make([]llmapp.ChatMessage, 0, len(in.Messages)+2)
+	messages := make([]llmapp.ChatMessage, 0, 1+len(in.LiveMessages)+len(in.Messages)+1)
 	messages = append(messages, llmapp.ChatMessage{Role: "system", Content: system})
-	for _, message := range SelectSummaryMessages(in.Messages, in.PreviousCoveredMessageID) {
-		content := strings.TrimSpace(message.Content)
-		if content == "" {
-			continue
-		}
-		messages = append(messages, llmapp.ChatMessage{
-			Role:       message.Role,
-			Content:    message.Content,
-			ToolCallID: message.ToolCallID,
-		})
+	for _, message := range in.LiveMessages {
+		messages = append(messages, summaryReplayChatMessage(message))
+	}
+	for _, message := range in.Messages {
+		messages = append(messages, summaryReplayChatMessage(message))
 	}
 	messages = append(messages, llmapp.ChatMessage{
 		Role:    "user",
@@ -1030,14 +1300,29 @@ func BuildSummaryRequest(in SummaryInput) llmapp.ChatRequest {
 	}
 }
 
+// summaryReplayChatMessage converts one replay message to the provider shape
+// without dropping any prefix-relevant field.
+func summaryReplayChatMessage(message SummaryReplayMessage) llmapp.ChatMessage {
+	return llmapp.ChatMessage{
+		Role:             message.Role,
+		Content:          message.Content,
+		Images:           append([]llmapp.ChatImage(nil), message.Images...),
+		ToolCalls:        append([]llmapp.ToolCall(nil), message.ToolCalls...),
+		ToolCallID:       message.ToolCallID,
+		ReasoningContent: message.ReasoningContent,
+	}
+}
+
 // SelectSummaryMessages returns the messages newer than the covered watermark
 // (R-A5-12). IDs are monotonic in a conversation, so a summary only folds the
-// messages the previous revision did not cover.
-func SelectSummaryMessages(messages []Message, coveredMessageID int64) []Message {
+// messages the previous revision did not cover. BuildSummaryResult and
+// BuildSummaryRequest both call it exactly once, so callers pass Messages
+// unfiltered and the watermark is applied on a single, shared boundary.
+func SelectSummaryMessages(messages []SummaryReplayMessage, coveredMessageID int64) []SummaryReplayMessage {
 	if coveredMessageID <= 0 {
 		return messages
 	}
-	selected := make([]Message, 0, len(messages))
+	selected := make([]SummaryReplayMessage, 0, len(messages))
 	for _, message := range messages {
 		if message.ID > coveredMessageID {
 			selected = append(selected, message)
@@ -1249,10 +1534,17 @@ func summaryScopedIDs(ids []int64, scope []string, field string) []int64 {
 }
 
 // SummaryMessages converts conversation-thread messages into the folded summary
-// range. Image parts are replaced by the R-A5-5 attachment marker and their
-// bytes/data_refs never enter the summary; only text parts are replayed.
-func SummaryMessages(messages []ConversationMessage) []Message {
-	converted := make([]Message, 0, len(messages))
+// range. The transcript contract is:
+//   - the message Text and every text part are replayed;
+//   - an image part is replaced by the R-A5-5 attachment marker and its bytes,
+//     data_refs and other payload fields never enter the summary;
+//   - any other structured part (requirement_card/rollback_proposal/...) is
+//     rendered as bounded "[type] {json}" text instead of being dropped;
+//   - the UI thread shape carries no tool-call identity, so ToolCallID is empty;
+//     callers with the live transcript pass SummaryReplayMessage values with the
+//     full tool-call/reasoning fields instead.
+func SummaryMessages(messages []ConversationMessage) []SummaryReplayMessage {
+	converted := make([]SummaryReplayMessage, 0, len(messages))
 	for _, message := range messages {
 		parts := make([]string, 0, len(message.Parts)+1)
 		if text := strings.TrimSpace(message.Text); text != "" {
@@ -1266,20 +1558,43 @@ func SummaryMessages(messages []ConversationMessage) []Message {
 				if text := strings.TrimSpace(part.Text); text != "" && text != strings.TrimSpace(message.Text) {
 					parts = append(parts, text)
 				}
+			default:
+				if structured := summaryStructuredPart(part); structured != "" {
+					parts = append(parts, structured)
+				}
 			}
 		}
 		content := strings.TrimSpace(strings.Join(parts, "\n"))
 		if content == "" {
 			continue
 		}
-		converted = append(converted, Message{
-			ID:         message.ID,
-			Role:       message.Role,
-			Content:    content,
-			ToolCallID: "",
+		converted = append(converted, SummaryReplayMessage{
+			ID:      message.ID,
+			Role:    message.Role,
+			Content: content,
 		})
 	}
 	return converted
+}
+
+// summaryStructuredPart renders one non-text/non-image conversation part as
+// bounded structured text. The payload is serialized deterministically (JSON
+// object keys are sorted) and capped so one card cannot dominate the summary.
+func summaryStructuredPart(part ConversationPart) string {
+	if strings.TrimSpace(part.Type) == "" {
+		return ""
+	}
+	payload := ""
+	if len(part.Data) > 0 {
+		encoded, err := json.Marshal(part.Data)
+		if err == nil {
+			payload = truncateRunes(string(encoded), 500)
+		}
+	}
+	if payload == "" {
+		return "[" + part.Type + "]"
+	}
+	return "[" + part.Type + "] " + payload
 }
 
 // conversationImageAttachmentID extracts the decimal attachment id of an image
@@ -1407,13 +1722,17 @@ func (s *CompactionSummarizer) Summarize(ctx context.Context, in SummaryInput) S
 }
 
 // fallback returns the deterministic nine-section summary and records why the
-// model path was skipped.
+// model path was skipped. A truncated fallback still publishes summary_truncated
+// (R-A5-7): the event must not depend on which path authored the summary.
 func (s *CompactionSummarizer) fallback(ctx context.Context, in SummaryInput, cause error) SummaryResult {
 	result := BuildSummaryResult(in)
 	result.UsedFallback = true
 	if cause != nil {
 		result.FallbackReason = cause.Error()
 		s.logWarn(ctx, "context compaction: summary generation failed; using deterministic summary", "error", cause)
+	}
+	if result.Truncated {
+		s.publishTruncated(ctx, in, result)
 	}
 	return result
 }
@@ -1430,6 +1749,8 @@ func (s *CompactionSummarizer) publishTruncated(ctx context.Context, in SummaryI
 		"trigger":            string(in.Trigger),
 		"summary_max":        in.summaryMax(),
 		"summary_tokens":     result.Tokens,
+		"input_tokens":       result.InputTokens,
+		"image_tokens":       in.ImageCount * SummaryImageTokens,
 		"covered_message_id": result.CoveredMessageID,
 	}
 	publishContext := context.Background()
@@ -1565,11 +1886,15 @@ func (l *SummaryLedger) currentTime() time.Time {
 	return l.now()
 }
 
-// Commit renders the persistence commit of one summary result.
+// Commit renders the persistence commit of one summary result. The pinned-facts
+// payload honors the R-A5-4 ≤20 cap (newest window), so a persistence adapter
+// never stores a different fact window than the prompt used.
 func (r SummaryResult) Commit(in SummaryInput) SummaryCommit {
 	meta := map[string]any{
 		"trigger":        string(in.Trigger),
 		"summary_tokens": r.Tokens,
+		"input_tokens":   r.InputTokens,
+		"image_tokens":   in.ImageCount * SummaryImageTokens,
 		"summary_max":    in.summaryMax(),
 		"truncated":      r.Truncated,
 		"cached_tokens":  r.CachedTokens,
@@ -1584,7 +1909,7 @@ func (r SummaryResult) Commit(in SummaryInput) SummaryCommit {
 		CompactionID:     r.CompactionID,
 		Trigger:          in.Trigger,
 		Summary:          r.Text,
-		PinnedFacts:      append([]string(nil), in.PinnedFacts...),
+		PinnedFacts:      append([]string(nil), capPinnedFacts(in.PinnedFacts)...),
 		CoveredMessageID: r.CoveredMessageID,
 		SummaryMeta:      meta,
 		TokenEstimate:    r.Tokens,

@@ -195,13 +195,15 @@ func (c *Compactor) Compact(ctx context.Context, packet ContextPacket) (ContextP
 // carry a prefix-cache Invalidation boundary: pressure and overflow compact the
 // append-only suffix while the stable prefix stays byte-identical, and
 // stage_boundary is handled the same way once the caller has rebuilt the prefix.
-// This method neither records nor applies the decision's retain budget; the
-// caller carries it into the compaction transaction, and the token-based retain
-// selection belongs to Task 13's summary wiring.
 //
-// The segment-window retention rule (CompactionKeepRecent / WithKeepRecent) is
-// unchanged, and a repeated call on the same packet is a no-op. A packet with
-// nothing compactable is returned unchanged.
+// R-A5-5 token retain: when the decision carries a positive Retain budget
+// (decision.Retain, or decision.Policy.Retain), retention is selected in whole
+// turns/tool pairs from the newest turn backwards until the retain budget is
+// reached; the last turn is always kept. context.keep_recent_messages
+// (WithKeepRecent) remains a secondary bound on the retained segment count, and
+// a zero retain budget falls back to the count-only rule. A repeated call on the
+// same packet is a no-op. A packet with nothing compactable is returned
+// unchanged.
 func (c *Compactor) CompactForDecision(ctx context.Context, packet ContextPacket, decision CompactionDecision) (ContextPacket, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -217,7 +219,11 @@ func (c *Compactor) CompactForDecision(ctx context.Context, packet ContextPacket
 		summarizer = c.summarizer
 		keepRecent = c.recentWindow()
 	}
-	compacted, summary := compactSegments(ctx, packet.Segments, summarizer, keepRecent, c)
+	retainTokens := decision.Retain
+	if retainTokens <= 0 {
+		retainTokens = decision.Policy.Retain
+	}
+	compacted, summary := compactSegmentsWithRetain(ctx, packet.Segments, summarizer, keepRecent, retainTokens, c)
 	if summary == nil {
 		return packet, nil
 	}
@@ -244,10 +250,19 @@ func compactableSegment(segment Segment) bool {
 
 // compactSegments returns the compacted segment list and the appended summary
 // segment, or (nil, nil) when the packet does not need compaction. keepRecent
-// bounds how many compactable segments stay verbatim (0 is allowed). It is a
-// pure function: the input slice is never mutated, so callers can keep the
-// original packet for audit.
+// bounds how many compactable segments stay verbatim (0 is allowed). It is the
+// count-only rule used by Compact; CompactForDecision adds the R-A5-5 token
+// retain budget through compactSegmentsWithRetain. It is a pure function: the
+// input slice is never mutated, so callers can keep the original packet for
+// audit.
 func compactSegments(ctx context.Context, segments []Segment, summarizer Summarizer, keepRecent int, compactor *Compactor) ([]Segment, *Segment) {
+	return compactSegmentsWithRetain(ctx, segments, summarizer, keepRecent, 0, compactor)
+}
+
+// compactSegmentsWithRetain is the single compaction layout implementation.
+// retainTokens > 0 selects the retained suffix in whole turns/tool pairs by the
+// R-A5-5 token budget; retainTokens <= 0 keeps the count-only rule.
+func compactSegmentsWithRetain(ctx context.Context, segments []Segment, summarizer Summarizer, keepRecent, retainTokens int, compactor *Compactor) ([]Segment, *Segment) {
 	compactable := make([]int, 0, len(segments))
 	priorSummaries := make([]Segment, 0, 1)
 	for index, segment := range segments {
@@ -258,16 +273,37 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 			compactable = append(compactable, index)
 		}
 	}
-	if len(compactable) <= keepRecent {
-		// The newest transcript already fits the verbatim window. This also
-		// makes a repeated Compact on the same boundary a no-op: compaction
-		// keeps exactly keepRecent compactable segments.
+	if len(compactable) == 0 {
 		return nil, nil
 	}
-	foldCount := len(compactable) - keepRecent
-	folded := make([]int, 0, foldCount)
-	for _, index := range compactable[:foldCount] {
-		folded = append(folded, index)
+
+	var folded []int
+	firstRetained := compactable[0]
+	if retainTokens > 0 {
+		units := compactionUnits(segments, compactable)
+		retainedFrom := retainedUnitStart(units, keepRecent, retainTokens)
+		if retainedFrom == 0 {
+			// Every whole turn fits the retain budget and the secondary segment
+			// bound: nothing to fold. This also keeps a repeated call on the
+			// same packet a no-op.
+			return nil, nil
+		}
+		for _, unit := range units[:retainedFrom] {
+			folded = append(folded, unit.indexes...)
+		}
+		firstRetained = units[retainedFrom].indexes[0]
+	} else {
+		if len(compactable) <= keepRecent {
+			// The newest transcript already fits the verbatim window. This also
+			// makes a repeated Compact on the same boundary a no-op: compaction
+			// keeps exactly keepRecent compactable segments.
+			return nil, nil
+		}
+		foldCount := len(compactable) - keepRecent
+		folded = append(folded, compactable[:foldCount]...)
+		if foldCount < len(compactable) {
+			firstRetained = compactable[foldCount]
+		}
 	}
 
 	// The new rolling summary covers the previously folded summaries plus the
@@ -324,10 +360,6 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 	// briefing, conversation summary, 近 N 条): it is a new segment appended to
 	// the packet before the retained recent messages, and it supersedes any
 	// previous summary without touching history or the pinned segments.
-	firstRetained := compactable[0]
-	if foldCount < len(compactable) {
-		firstRetained = compactable[foldCount]
-	}
 	inserted := false
 	for index, segment := range segments {
 		if index == firstRetained {
@@ -350,6 +382,86 @@ func compactSegments(ctx context.Context, segments []Segment, summarizer Summari
 		out = append(out, summarySegment)
 	}
 	return out, &summarySegment
+}
+
+// roleAssistant is the assistant transcript role. The context package already
+// declares roleSystem/roleUser/roleTool in prefix.go.
+const roleAssistant = "assistant"
+
+// compactionUnit is one indivisible compaction unit: a whole user turn (the user
+// message plus its assistant/tool replies) or one assistant tool-call turn with
+// all of its tool results. Folding and retaining happen per unit, so a tool call
+// and its results always stay on the same side of the summary boundary.
+type compactionUnit struct {
+	indexes []int
+	tokens  int
+}
+
+// compactionUnits partitions the compactable segments into whole turns/tool
+// pairs, preserving transcript order. A user message starts a new turn; a tool
+// result always stays with the preceding turn (its tool-call pair); a bare
+// assistant message after another assistant/tool message starts a new turn so
+// unrelated assistant turns are never merged into one unit.
+func compactionUnits(segments []Segment, compactable []int) []compactionUnit {
+	units := make([]compactionUnit, 0, len(compactable))
+	previous := ""
+	for _, index := range compactable {
+		segment := segments[index]
+		role := strings.ToLower(strings.TrimSpace(segment.Role))
+		startNew := len(units) == 0
+		if !startNew {
+			switch {
+			case role == roleUser:
+				startNew = true
+			case role == roleAssistant && previous != roleUser:
+				startNew = true
+			case role != roleUser && role != roleAssistant && role != roleTool && previous != roleUser:
+				startNew = true
+			}
+		}
+		if startNew {
+			units = append(units, compactionUnit{})
+		}
+		unit := &units[len(units)-1]
+		unit.indexes = append(unit.indexes, index)
+		unit.tokens += segmentTokens(segment)
+		previous = role
+	}
+	return units
+}
+
+// segmentTokens is the conservative local token estimate of one segment.
+func segmentTokens(segment Segment) int {
+	if segment.Tokens > 0 {
+		return segment.Tokens
+	}
+	return estimateBriefingTokens(segment.Content)
+}
+
+// retainedUnitStart returns the index of the first retained unit. Units are
+// selected newest-first in whole units: the last turn is always retained, then
+// further newer turns are added while both the R-A5-5 retain token budget and
+// the context.keep_recent_messages segment bound hold.
+func retainedUnitStart(units []compactionUnit, keepRecent, retainTokens int) int {
+	if len(units) == 0 {
+		return 0
+	}
+	keep, segmentsKept, tokensKept := 0, 0, 0
+	for index := len(units) - 1; index >= 0; index-- {
+		unit := units[index]
+		if keep > 0 {
+			if segmentsKept+len(unit.indexes) > keepRecent {
+				break
+			}
+			if tokensKept+unit.tokens > retainTokens {
+				break
+			}
+		}
+		keep++
+		segmentsKept += len(unit.indexes)
+		tokensKept += unit.tokens
+	}
+	return len(units) - keep
 }
 
 // deterministicCompactionSummary renders the fallback summary from the folded
