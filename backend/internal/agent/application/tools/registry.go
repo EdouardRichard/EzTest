@@ -266,6 +266,21 @@ type Deps struct {
 	// P7 is the additive P7 knowledge tool surface. It is nested so the frozen
 	// P1–P6 Deps fields stay unchanged; a zero value disables the P7 tools.
 	P7 P7Deps
+	// Completion is the additive v0.22 task.complete surface (spec R-A3). It is
+	// nested so the frozen P1–P7 Deps fields stay unchanged. The composition
+	// root fills it per run (Task 36) and registers TaskCompleteTools through
+	// RegisterP4ToolGroup; a zero value leaves task.complete unregistered.
+	Completion CompletionDeps
+}
+
+// CompletionDeps is the per-run wiring of the task.complete tool: the
+// server-side Validator selects the completion criterion by task type and the
+// CompletionWriter persists the verified completion. Both must be present for
+// the tool to be registered; a nil writer would let a forged declaration end
+// the run without the plan/fact write, so the tool is never half-wired.
+type CompletionDeps struct {
+	Validator Validator
+	Writer    CompletionWriter
 }
 
 // RequirementSummary is one requirement row shown to the model.
