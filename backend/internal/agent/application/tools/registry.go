@@ -108,12 +108,18 @@ type Tool interface {
 }
 
 // Error is a structured business failure returned to the model as
-// {"error":{"code","message","details"}}. Internal failures are plain errors
-// and fail the run.
+// {"error":{"code","retryable","message","details"}}. Internal failures are
+// plain errors and fail the run.
+//
+// Retryable reports whether the same call can plausibly succeed on a retry.
+// Field-level corrections (invalid_argument) are retryable because the model can
+// fix the arguments; stale-revision conflicts are not blindly retryable and must
+// re-read the current revision first. Internal failures never use this type.
 type Error struct {
-	Code    string
-	Message string
-	Details map[string]any
+	Code      string
+	Message   string
+	Retryable bool
+	Details   map[string]any
 }
 
 // Error implements error.
@@ -151,9 +157,10 @@ func (e *Error) Payload() map[string]any {
 	}
 	return map[string]any{
 		"error": map[string]any{
-			"code":    e.Code,
-			"message": e.Message,
-			"details": details,
+			"code":      e.Code,
+			"message":   e.Message,
+			"retryable": e.Retryable,
+			"details":   details,
 		},
 	}
 }
