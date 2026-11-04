@@ -101,6 +101,12 @@ type Scope struct {
 	CloseRound           int32
 	ReportRevisionID     int64
 	PredicateFingerprint string
+	// Extraction is the v0.22 A-7 deterministic extraction context of one
+	// requirement.extraction_emit call (spec R-A7-2/4/5). The extraction worker
+	// (Task 17/18) injects it out of band; it is never part of a tool schema.
+	// SegmentText is the exact chunk the model was shown and is the only
+	// accepted source of source_quote substrings.
+	Extraction ExtractionScope
 }
 
 // Tool is one scoped, schema-described agent tool.
@@ -124,10 +130,18 @@ type Error struct {
 	Message   string
 	Retryable bool
 	Details   map[string]any
+	// Cause is an optional sentinel wrapped by this tool error. It lets callers
+	// classify a failure with errors.Is while still receiving the typed
+	// invalid_argument shape (for example ErrSourceQuoteNotFound on
+	// requirement.extraction_emit). It is never rendered into Payload.
+	Cause error
 }
 
 // Error implements error.
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
+
+// Unwrap returns the optional classification sentinel.
+func (e *Error) Unwrap() error { return e.Cause }
 
 // NewError builds a structured tool error.
 func NewError(code, message string) *Error {
@@ -280,6 +294,34 @@ type Deps struct {
 	// Content leaves tool_result.read unregistered and a nil Settings falls
 	// back to the catalog default threshold.
 	ToolResult ToolResultDeps
+	// Extraction is the additive v0.22 A-7 deterministic requirement extraction
+	// surface (R-A7-4/R-A7-5). A nil Sink leaves requirement.extraction_emit
+	// unregistered; the extraction worker (Task 17/18) wires the requirement
+	// draft/upsert sink. It is nested so the frozen P1-P7 Deps fields stay
+	// unchanged.
+	Extraction ExtractionDeps
+}
+
+// ExtractionDeps is the per-run wiring of the v0.22 A-7 deterministic
+// requirement extraction tool. A nil Sink leaves requirement.extraction_emit
+// unregistered: the additive tool group is evaluated on every registry build
+// (P4 and later compose it), and the extraction worker (Task 17/18) supplies the
+// requirement draft/upsert sink. It is never half-wired.
+type ExtractionDeps struct {
+	Sink ExtractionSink
+}
+
+// registerExtractionToolGroup appends the extraction tool only when its sink is
+// wired. It uses the additive P4 tool-group mechanism from registry.go so the
+// frozen P1-P7 registration sets are not edited by this task; NewP4Registry and
+// every later composition (P5-P7, the runtime registry) evaluate it.
+func init() {
+	RegisterP4ToolGroup(func(deps Deps) []Tool {
+		if deps.Extraction.Sink == nil {
+			return nil
+		}
+		return []Tool{NewExtractionEmitTool(deps.Extraction.Sink)}
+	})
 }
 
 // CompletionDeps is the per-run wiring of the task.complete tool: the
