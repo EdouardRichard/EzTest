@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 53 {
-		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
+	if len(applied) != 54 {
+		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -39,6 +39,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"schema_migrations", "sut", "sut_api", "sut_environment", "sut_page",
 		"system_setting", "system_setting_revision", "target_database", "test_account",
 		"version", "version_sut", "version_sut_resource",
+		"sut_repository", "version_repository_override", "version_account",
+		"clarification_handoff",
 		"work_item", "work_item_attempt", "team_room_post", "team_room_digest",
 		"agent_profile", "agent_run", "agent_message", "context_packet",
 		"agent_activity",
@@ -179,8 +181,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 53 {
-		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
+	if len(applied) != 54 {
+		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -320,8 +322,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 53 {
-		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
+	if len(applied) != 54 {
+		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1067,8 +1069,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 53 {
-		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
+	if len(applied) != 54 {
+		t.Fatalf("applied %d migrations, want 54: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1250,6 +1252,81 @@ func TestV022ABSchema(t *testing.T) {
 	}
 }
 
+// TestV022CSchema pins the C-domain v0.22 schema: version description/goal, the
+// version_sut single-repository column removal and exclusion-document rename,
+// the SUT/version repository bindings, the global test-account pool with
+// per-version enablement, and the clarification handoff artifact.
+// See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-10..DB-15,
+// DB-22 and docs/version-V0.22/C-version-sut-resources.md §3.
+func TestV022CSchema(t *testing.T) {
+	pool := integrationDB(t)
+
+	// DB-10: version information and the blocked exit. version.blocker already
+	// exists as TEXT and stays unchanged (lead ruling C6); only presence is
+	// pinned here. DB-11: scope is renamed in place to scope_exclude.
+	for _, c := range []struct{ table, column string }{
+		{"version", "description"},
+		{"version", "goal"},
+		{"version", "blocker"},
+		{"version_sut", "scope_exclude"},
+	} {
+		requireColumn(t, pool, c.table, c.column)
+	}
+	// DB-11: the single-repository column moves to sut_repository.
+	requireNoColumn(t, pool, "version_sut", "code_repo_id")
+
+	for _, table := range []string{
+		"sut_repository",
+		"version_repository_override",
+		"version_account",
+		"clarification_handoff",
+	} {
+		requireTable(t, pool, table)
+	}
+
+	// D34 / Agent.md §6.9.5: the new tables name their primary-key constraints
+	// pk_<table> instead of PostgreSQL's implicit <table>_pkey.
+	for _, constraint := range []string{
+		"pk_sut_repository",
+		"pk_version_repository_override",
+		"pk_version_account",
+		"pk_clarification_handoff",
+	} {
+		requirePKConstraint(t, pool, constraint)
+	}
+
+	// DB-12..DB-14, DB-22 natural keys plus the lookup indexes on the logical
+	// repo/account references.
+	for _, index := range []string{
+		"uk_sut_repository_sut_repo",
+		"uk_version_repository_override_version_repo",
+		"uk_version_account_version_account",
+		"uk_clarification_handoff_version_revision",
+		"idx_sut_repository_repo",
+		"idx_version_account_account",
+	} {
+		requireIndex(t, pool, index)
+	}
+
+	// DB-15: test accounts are a global, case-insensitively unique pool. The old
+	// uniqueness was scoped to environment_id, which is gone.
+	requireNoColumn(t, pool, "test_account", "sut_id")
+	requireNoColumn(t, pool, "test_account", "environment_id")
+	var testAccountIndexDef string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = 'uk_test_account_username'
+	`).Scan(&testAccountIndexDef); err != nil {
+		t.Fatalf("read uk_test_account_username: %v", err)
+	}
+	if !strings.Contains(testAccountIndexDef, "lower(") || !strings.Contains(testAccountIndexDef, "username") {
+		t.Errorf("uk_test_account_username does not cover lower(username): %s", testAccountIndexDef)
+	}
+	if strings.Contains(testAccountIndexDef, "environment_id") {
+		t.Errorf("uk_test_account_username is still environment-scoped: %s", testAccountIndexDef)
+	}
+}
+
 // integrationDB returns a fresh, fully migrated test schema.
 func integrationDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
@@ -1286,6 +1363,23 @@ func requireColumn(t *testing.T, pool *pgxpool.Pool, table, column string) {
 	}
 	if !exists {
 		t.Errorf("missing column %s.%s", table, column)
+	}
+}
+
+func requireNoColumn(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+		)
+	`, table, column).Scan(&exists); err != nil {
+		t.Errorf("check column %s.%s: %v", table, column, err)
+		return
+	}
+	if exists {
+		t.Errorf("column %s.%s still exists", table, column)
 	}
 }
 
