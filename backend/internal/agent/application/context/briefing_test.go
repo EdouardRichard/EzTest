@@ -154,7 +154,8 @@ func TestBriefingDeterministic(t *testing.T) {
 		"- 缺少过期券的边界路径",
 		"草稿 2 / 已确认 3 / 失效 1",
 		"覆盖缺口（1）：",
-		"- [pending] 生成用例草稿（依赖：确认需求）",
+		"当前：[pending] 生成用例草稿（依赖：确认需求）",
+		"下一步：[in_progress] 评审用例草稿（依赖：生成用例草稿）",
 		"- [page] login：登录页可达（置信 0.90）",
 		"最近 wave：done（通过 8 / 失败 1 / 阻塞 0 / 跳过 2）",
 		"- 登录失败重试：先刷新再重试（置信 0.80）",
@@ -280,9 +281,10 @@ func TestBriefingEmptyVersion(t *testing.T) {
 	})
 }
 
-// TestBriefingBudget pins spec §6.2: the render stays inside the 2.5k token
-// envelope, over-budget sections are truncated per section, and the goal,
-// stage and open questions are never truncated.
+// TestBriefingBudget pins R-A8-5: the render stays inside the 3k token
+// envelope, over-budget sections are truncated per section at their own budget
+// (plan 600, findings 800), and the goal, stage and open questions are never
+// truncated.
 func TestBriefingBudget(t *testing.T) {
 	builder := agentcontext.NewBriefingBuilder(&fakeBriefingReader{source: oversizedSource()})
 	briefing, err := builder.BuildBriefing(context.Background(), 55)
@@ -318,8 +320,8 @@ func TestBriefingBudget(t *testing.T) {
 	}{
 		{"需求", 600},
 		{"用例", 300},
-		{"计划", 300},
-		{"发现", 500},
+		{"计划", 600},
+		{"发现", 800},
 		{"执行", 200},
 		{"知识", 200},
 	}
@@ -362,6 +364,202 @@ func TestBriefingBudget(t *testing.T) {
 	}
 }
 
+// budgetProbeSource pushes only the plan and findings groups over their section
+// caps. Every other group is empty, so the render stays inside the total
+// envelope and the rendered proportions pin the R-A8-5 section budgets.
+func budgetProbeSource() agentcontext.Source {
+	source := agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "预算探针", Stage: "executing"},
+	}
+	for index := 0; index < 6; index++ {
+		source.Plan = append(source.Plan, agentcontext.PlanItemSnapshot{
+			ID:     int64(index + 1),
+			Title:  fmt.Sprintf("%s%d", strings.Repeat("计划项", 80), index),
+			Status: "pending",
+		})
+	}
+	base := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	for index := 0; index < 8; index++ {
+		source.Findings = append(source.Findings, agentcontext.FactSnapshot{
+			ID:         int64(index + 1),
+			Kind:       "page",
+			Key:        fmt.Sprintf("probe-%d", index+1),
+			Summary:    strings.Repeat("事实摘要", 80),
+			Confidence: floatPtr(0.90 - float64(index)*0.05),
+			CreatedAt:  base.Add(time.Duration(index) * time.Minute),
+		})
+	}
+	return source
+}
+
+// TestBriefingSectionBudgets pins the R-A8-5 budget constants: the total
+// envelope is 3k tokens, the plan section keeps 600 tokens and the findings
+// section 800. Both probe sections are truncated right at their cap, so the
+// rendered token counts prove the values instead of only bounding them.
+func TestBriefingSectionBudgets(t *testing.T) {
+	if got := agentcontext.BriefingTokenBudget; got != 3000 {
+		t.Fatalf("BriefingTokenBudget = %d, want 3000 (R-A8-5)", got)
+	}
+	rendered := buildBriefing(t, budgetProbeSource(), 140).Render()
+	if got := briefingTokens(rendered); got > 3000 {
+		t.Fatalf("probe briefing uses %d tokens, want <= 3000", got)
+	}
+	plan := renderedSection(rendered, "计划")
+	if got := briefingTokens(plan); got < 590 || got > 600 {
+		t.Fatalf("plan section uses %d tokens, want the 600-token budget:\n%s", got, plan)
+	}
+	findings := renderedSection(rendered, "发现")
+	if got := briefingTokens(findings); got < 790 || got > 800 {
+		t.Fatalf("findings section uses %d tokens, want the 800-token budget:\n%s", got, findings)
+	}
+}
+
+// currentNextSource is the R-A8-5 current/next fixture: the first non-terminal
+// item is 生成用例草稿 (in_progress) and the following non-terminal item is
+// 补充边界用例 (pending); the terminal items in between must never be promoted.
+func currentNextSource() agentcontext.Source {
+	return agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "验证当前与下一步", Stage: "executing"},
+		Plan: []agentcontext.PlanItemSnapshot{
+			{ID: 1, Title: "完成需求梳理", Status: "done"},
+			{ID: 2, Title: "生成用例草稿", Status: "in_progress"},
+			{ID: 3, Title: "评审旧草稿", Status: "completed"},
+			{ID: 4, Title: "补充边界用例", Status: "pending"},
+			{ID: 5, Title: "执行回归测试", Status: "pending"},
+			{ID: 6, Title: "归档旧结果", Status: "skipped"},
+		},
+	}
+}
+
+// TestBriefingKeepsCurrentAndNextPlanItems pins R-A8-5: the current plan item
+// is the first non-terminal item in plan order, the next one is the following
+// non-terminal item, both carry an explicit label, and the 3k total envelope
+// still holds.
+func TestBriefingKeepsCurrentAndNextPlanItems(t *testing.T) {
+	text := buildBriefing(t, currentNextSource(), 120).Render()
+	for _, want := range []string{
+		"当前：[in_progress] 生成用例草稿",
+		"下一步：[pending] 补充边界用例",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rendered briefing is missing %q:\n%s", want, text)
+		}
+	}
+	if got := briefingTokens(text); got > 3000 {
+		t.Fatalf("briefing uses %d tokens, want <= 3000:\n%s", got, text)
+	}
+	for _, banned := range []string{"下一步：[done]", "下一步：[completed]", "下一步：[skipped]"} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("terminal item rendered as next (%q):\n%s", banned, text)
+		}
+	}
+
+	t.Run("single open item has no fabricated next", func(t *testing.T) {
+		source := agentcontext.Source{
+			Plan: []agentcontext.PlanItemSnapshot{
+				{ID: 1, Title: "唯一待办", Status: "todo"},
+				{ID: 2, Title: "已经完成", Status: "done"},
+			},
+		}
+		rendered := buildBriefing(t, source, 121).Render()
+		if !strings.Contains(rendered, "当前：[todo] 唯一待办") {
+			t.Fatalf("the single open item is not current:\n%s", rendered)
+		}
+		if strings.Contains(rendered, "下一步：") {
+			t.Fatalf("briefing fabricated a next item:\n%s", rendered)
+		}
+	})
+
+	t.Run("all terminal items have neither current nor next", func(t *testing.T) {
+		source := agentcontext.Source{
+			Plan: []agentcontext.PlanItemSnapshot{
+				{ID: 1, Title: "已完成一", Status: "done"},
+				{ID: 2, Title: "已取消二", Status: "cancelled"},
+			},
+		}
+		rendered := buildBriefing(t, source, 123).Render()
+		if strings.Contains(rendered, "当前：") || strings.Contains(rendered, "下一步：") {
+			t.Fatalf("fully terminal plan invented current/next:\n%s", rendered)
+		}
+		if !strings.Contains(rendered, "已完成一") {
+			t.Fatalf("terminal plan items were dropped:\n%s", rendered)
+		}
+	})
+
+	t.Run("current and next survive the total budget squeeze", func(t *testing.T) {
+		source := currentNextSource()
+		source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
+			Questions: []string{strings.Repeat("压缩压力", 1150)},
+		}
+		rendered := buildBriefing(t, source, 122).Render()
+		if got := briefingTokens(rendered); got > 3000 {
+			t.Fatalf("squeezed briefing uses %d tokens, want <= 3000", got)
+		}
+		for _, want := range []string{"当前：", "下一步：", "生成用例草稿", "补充边界用例"} {
+			if !strings.Contains(rendered, want) {
+				t.Fatalf("squeezed briefing dropped %q:\n%s", want, rendered)
+			}
+		}
+	})
+}
+
+// topFactsSource is the R-A8-5 top-3 fixture: eight findings with a descending
+// confidence spread, so the ranking is unambiguous.
+func topFactsSource() agentcontext.Source {
+	base := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	confidences := []float64{0.95, 0.90, 0.85, 0.60, 0.55, 0.50, 0.45, 0.40}
+	source := agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "验证发现排序", Stage: "executing"},
+	}
+	for index, confidence := range confidences {
+		source.Findings = append(source.Findings, agentcontext.FactSnapshot{
+			ID:         int64(index + 1),
+			Kind:       "page",
+			Key:        fmt.Sprintf("top-%d", index+1),
+			Summary:    strings.Repeat("事实摘要", 75),
+			Confidence: floatPtr(confidence),
+			CreatedAt:  base.Add(time.Duration(index) * time.Minute),
+		})
+	}
+	return source
+}
+
+// TestBriefingKeepsTop3Facts pins R-A8-5: the three highest-confidence facts
+// stay visible even when the findings section is truncated or the total budget
+// squeezes the section body down to its mandatory tail.
+func TestBriefingKeepsTop3Facts(t *testing.T) {
+	assertTop3 := func(t *testing.T, rendered string) {
+		t.Helper()
+		for _, key := range []string{"top-1", "top-2", "top-3"} {
+			if !strings.Contains(rendered, key) {
+				t.Fatalf("briefing dropped top-3 fact %q:\n%s", key, rendered)
+			}
+		}
+		first := strings.Index(rendered, "top-1")
+		second := strings.Index(rendered, "top-2")
+		third := strings.Index(rendered, "top-3")
+		if first > second || second > third {
+			t.Fatalf("facts are not ranked by confidence:\n%s", rendered)
+		}
+	}
+
+	t.Run("top-3 survive section truncation", func(t *testing.T) {
+		assertTop3(t, buildBriefing(t, topFactsSource(), 130).Render())
+	})
+
+	t.Run("top-3 survive the total budget squeeze", func(t *testing.T) {
+		source := topFactsSource()
+		source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
+			Questions: []string{strings.Repeat("压缩压力", 925)},
+		}
+		rendered := buildBriefing(t, source, 131).Render()
+		if got := briefingTokens(rendered); got > 3000 {
+			t.Fatalf("squeezed briefing uses %d tokens, want <= 3000", got)
+		}
+		assertTop3(t, rendered)
+	})
+}
+
 func oversizedSource() agentcontext.Source {
 	base := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
 	source := agentcontext.Source{
@@ -388,7 +586,7 @@ func oversizedSource() agentcontext.Source {
 		source.Cases.CoverageGaps = append(source.Cases.CoverageGaps, strings.Repeat("覆盖缺口", 6))
 		source.Plan = append(source.Plan, agentcontext.PlanItemSnapshot{
 			ID:        int64(index + 1),
-			Title:     strings.Repeat("计划项", 40),
+			Title:     strings.Repeat("计划项", 100),
 			Status:    "pending",
 			DependsOn: []string{"确认需求"},
 		})
@@ -396,7 +594,7 @@ func oversizedSource() agentcontext.Source {
 			ID:         int64(index + 1),
 			Kind:       "page",
 			Key:        fmt.Sprintf("key-%d", index),
-			Summary:    strings.Repeat("发现事实", 40),
+			Summary:    strings.Repeat("发现事实", 80),
 			Confidence: floatPtr(float64(index%10) / 10),
 			CreatedAt:  base.Add(time.Duration(index) * time.Minute),
 		})
@@ -421,8 +619,23 @@ func oversizedSource() agentcontext.Source {
 	return source
 }
 
+// boundarySource is the protected-budget boundary fixture: the six regular
+// groups are filled by oversizedSource, but the plan and findings groups are
+// deliberately empty so the fixture isolates the goal/stage and open-questions
+// protection. Its mandatory current/next and top-3 prefixes are exercised by
+// their own tests.
+func boundarySource() agentcontext.Source {
+	source := oversizedSource()
+	source.Plan = nil
+	source.Findings = nil
+	return source
+}
+
 // briefingTokens is the independent test-side token estimate from spec §6.3:
-// at least 0.6 tokens per rune (rounded up), the conservative coefficient.
+// at least 0.6 tokens per rune (rounded up), the conservative coefficient. It
+// mirrors the production estimateBriefingTokens helper exactly (ceil(0.6×runes)
+// is computed as (runes×3+4)/5 in integer arithmetic, so runes → tokens is the
+// documented conversion).
 func briefingTokens(text string) int {
 	return (utf8.RuneCountInString(text)*3 + 4) / 5
 }
@@ -452,8 +665,8 @@ func briefingSectionCaps() []briefingSectionCap {
 	return []briefingSectionCap{
 		{"需求", 600},
 		{"用例", 300},
-		{"计划", 300},
-		{"发现", 500},
+		{"计划", 600},
+		{"发现", 800},
 		{"执行", 200},
 		{"知识", 200},
 	}
@@ -480,7 +693,7 @@ func buildBriefing(t *testing.T, source agentcontext.Source, versionID int64) ag
 
 // protectedHeavySource is the total-budget fixture: the six regular groups are
 // pushed to their standalone caps (through oversizedSource), while the open
-// questions are large enough to break the 2.5k total on their own when combined
+// questions are large enough to break the 3k total on their own when combined
 // with those caps, but not large enough to exceed the envelope by themselves.
 func protectedHeavySource() agentcontext.Source {
 	source := oversizedSource()
@@ -498,13 +711,13 @@ func protectedHeavySource() agentcontext.Source {
 	return source
 }
 
-// TestBriefingTotalBudget pins the total envelope from spec §6.2. The
-// per-section caps alone (600+300+300+500+200+200 = 2100) plus a large
-// protected open-questions group can exceed 2500, so Render must squeeze the six
-// regular groups until the whole text fits, while never cutting the goal, stage
-// or open questions. If the protected content plus the fixed headings and the
-// one-rune marker each regular group needs already exceeds the envelope, the
-// render is returned unchanged: that is the documented, unavoidable exception.
+// TestBriefingTotalBudget pins the total envelope from R-A8-5. The per-section
+// caps alone (600+300+600+800+200+200 = 2700) plus a large protected
+// open-questions group can exceed 3000, so Render must squeeze the six regular
+// groups until the whole text fits, while never cutting the goal, stage or open
+// questions. If the protected content plus the fixed headings and the one-rune
+// marker each regular group needs already exceeds the envelope, the render is
+// returned unchanged: that is the documented, unavoidable exception.
 func TestBriefingTotalBudget(t *testing.T) {
 	t.Run("large open questions shrink the regular sections", func(t *testing.T) {
 		briefing := buildBriefing(t, protectedHeavySource(), 77)
@@ -600,11 +813,14 @@ func TestBriefingTotalBudget(t *testing.T) {
 // for every regular section marker, Render squeezes the regular groups and the
 // total stays inside the envelope; one rune more of protected content pushes
 // the protected content alone over the envelope, and Render returns the
-// per-section-truncated text unchanged.
+// per-section-truncated text unchanged. The fixture deliberately has no plan or
+// findings items: their mandatory current/next and top-3 prefixes are covered
+// by TestBriefingKeepsCurrentAndNextPlanItems and TestBriefingKeepsTop3Facts,
+// so this test isolates the goal/stage and open-questions protection.
 func TestBriefingProtectedBudgetBoundary(t *testing.T) {
 	build := func(openRunes int) agentcontext.Briefing {
 		t.Helper()
-		source := oversizedSource()
+		source := boundarySource()
 		source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
 			Questions: []string{strings.Repeat("边", openRunes)},
 		}

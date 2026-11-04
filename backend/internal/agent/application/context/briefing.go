@@ -17,20 +17,23 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// BriefingTokenBudget is the total render envelope from spec §6.2 (≤2.5k
+// BriefingTokenBudget is the total render envelope from spec R-A8-5 (≤3k
 // tokens). Render enforces it in two passes: it first cuts every regular group
 // to its own section budget, then, when the whole text is still over the
 // envelope, it squeezes the six regular groups deterministically until the
 // render fits. The goal/stage head and the open questions are protected and are
-// never truncated. The only render allowed to exceed the envelope is the
-// documented exception where the protected content (head and open questions)
-// plus the fixed headings and the one-rune truncation marker every regular group
-// needs already exceed it; that render is returned unchanged.
-const BriefingTokenBudget = 2500
+// never truncated. The mandatory prefixes of the plan and findings groups (the
+// current/next plan items and the top-3 facts, spec R-A8-5) are protected too:
+// a section budget may not cut them, and the total-budget pass reserves their
+// runes before sharing the rest. The only render allowed to exceed the envelope
+// is the documented exception where the protected content plus the fixed
+// headings and the one-rune truncation marker every regular group needs already
+// exceed it; that render is returned unchanged.
+const BriefingTokenBudget = 3000
 
 // briefingBudgetRunes is the largest rune count whose conservative estimate
 // still fits BriefingTokenBudget: the estimator is ceil(0.6×runes), so
-// ceil(0.6 × 2500×5/3) = 2500.
+// ceil(0.6 × 3000×5/3) = 3000.
 const briefingBudgetRunes = BriefingTokenBudget * 5 / 3
 
 // Stable section names. They are the machine identity of a briefing group and
@@ -46,20 +49,27 @@ const (
 )
 
 const (
-	// Per-section content budgets from spec §6.2. The goal/stage head and the
+	// Per-section content budgets from spec R-A8-5. The goal/stage head and the
 	// open-questions group are intentionally exempt: they are never truncated.
 	briefingRequirementsBudget = 600
 	briefingCasesBudget        = 300
-	briefingPlanBudget         = 300
-	briefingFindingsBudget     = 500
+	briefingPlanBudget         = 600
+	briefingFindingsBudget     = 800
 	briefingExecutionBudget    = 200
 	briefingKnowledgeBudget    = 200
 
-	// maxPlanItems is the plan cap from spec §6.2 (open items ≤5). The finding
-	// and knowledge caps are the top-K selection bounds.
-	maxPlanItems      = 5
-	maxFindingItems   = 5
-	maxKnowledgeItems = 5
+	// maxPlanItems is the plan cap from spec §6.2 (open items ≤5). The current
+	// and next items count toward it but are always rendered. maxFindingItems
+	// is the findings top-K bound; maxMandatoryFindings is the R-A8-5 top-3
+	// floor that no truncation may cut. maxKnowledgeItems is the knowledge
+	// top-K bound.
+	maxPlanItems         = 5
+	maxFindingItems      = 5
+	maxMandatoryFindings = 3
+	maxKnowledgeItems    = 5
+
+	planCurrentPrefix = "当前："
+	planNextPrefix    = "下一步："
 
 	noneText         = "无"
 	truncationMarker = "…"
@@ -100,6 +110,15 @@ type Briefing struct {
 	Execution     []Section
 	Knowledge     []Section
 	OpenQuestions []Section
+
+	// mandatoryPlan and mandatoryFindings are the protected prefixes of the
+	// plan and findings groups (spec R-A8-5): the current and next plan items
+	// and the top-3 facts. They are derived from the same source data as the
+	// section content, are always a prefix of it, and are never persisted.
+	// Render keeps them even when a section or the whole briefing is over
+	// budget. Both are empty for a zero Briefing and for groups without data.
+	mandatoryPlan     string
+	mandatoryFindings string
 }
 
 // BriefingBuilder builds version briefings from a Reader.
@@ -142,15 +161,17 @@ func newBriefing(source Source) Briefing {
 		stage += "（阻塞：" + blocker + "）"
 	}
 	return Briefing{
-		Goal:          oneLine(source.Version.Goal),
-		Stage:         stage,
-		Requirements:  briefingSection(SectionRequirements, sectionTitleRequirements, requirementsBody(source.Requirements)),
-		Cases:         briefingSection(SectionCases, sectionTitleCases, casesBody(source.Cases)),
-		Plan:          briefingSection(SectionPlan, sectionTitlePlan, planBody(source.Plan)),
-		Findings:      briefingSection(SectionFindings, sectionTitleFindings, findingsBody(source.Findings)),
-		Execution:     briefingSection(SectionExecution, sectionTitleExecution, executionBody(source.Execution)),
-		Knowledge:     briefingSection(SectionKnowledge, sectionTitleKnowledge, knowledgeBody(source.Knowledge)),
-		OpenQuestions: briefingSection(SectionOpenQuestions, sectionTitleOpenQuestions, openQuestionsBody(source.OpenQuestions)),
+		Goal:              oneLine(source.Version.Goal),
+		Stage:             stage,
+		Requirements:      briefingSection(SectionRequirements, sectionTitleRequirements, requirementsBody(source.Requirements)),
+		Cases:             briefingSection(SectionCases, sectionTitleCases, casesBody(source.Cases)),
+		Plan:              briefingSection(SectionPlan, sectionTitlePlan, planBody(source.Plan)),
+		Findings:          briefingSection(SectionFindings, sectionTitleFindings, findingsBody(source.Findings)),
+		Execution:         briefingSection(SectionExecution, sectionTitleExecution, executionBody(source.Execution)),
+		Knowledge:         briefingSection(SectionKnowledge, sectionTitleKnowledge, knowledgeBody(source.Knowledge)),
+		OpenQuestions:     briefingSection(SectionOpenQuestions, sectionTitleOpenQuestions, openQuestionsBody(source.OpenQuestions)),
+		mandatoryPlan:     planMandatoryBody(source.Plan),
+		mandatoryFindings: findingsMandatoryBody(source.Findings),
 	}
 }
 
@@ -165,24 +186,27 @@ func briefingSection(name, title, body string) []Section {
 
 // Render formats the briefing deterministically. The section order is fixed
 // (head, requirements, cases, plan, findings, execution, knowledge, open
-// questions). Over-budget regular sections are truncated independently; the
-// goal/stage head and the open questions are never truncated. When the
-// independently truncated text still exceeds BriefingTokenBudget, the six
-// regular groups are squeezed proportionally until the total fits. Only the
-// documented protected-content exception can leave the render above the
-// envelope.
+// questions). Over-budget regular sections are truncated independently but
+// never below their mandatory prefix; the goal/stage head and the open
+// questions are never truncated. When the independently truncated text still
+// exceeds BriefingTokenBudget, the optional tails of the six regular groups are
+// squeezed proportionally until the total fits, while the mandatory prefixes
+// stay. Only the documented protected-content exception can leave the render
+// above the envelope.
 func (b Briefing) Render() string {
 	groups := briefingGroups(b)
 	head := renderHead(b)
 
 	bodies := make([]string, len(groups))
+	protectedRunes := make([]int, len(groups))
 	for index, group := range groups {
 		body := renderSectionBody(group.sections)
 		if strings.TrimSpace(body) == "" {
 			body = noneText
 		}
+		protectedRunes[index] = protectedPrefixRunes(body, group.mandatory)
 		if group.budget > 0 {
-			body = truncateToBudget(body, group.budget)
+			body = truncateSectionBody(body, group.budget, protectedRunes[index])
 		}
 		bodies[index] = body
 	}
@@ -191,28 +215,171 @@ func (b Briefing) Render() string {
 	if estimateBriefingTokens(rendered) <= BriefingTokenBudget {
 		return rendered
 	}
+	return squeezeBriefing(head, groups, bodies, protectedRunes, rendered)
+}
 
-	// The last group (open questions) is protected; everything before it is a
-	// regular group that the total-budget pass may shrink.
+// squeezeBriefing is the total-budget pass. The last group (open questions) and
+// the mandatory prefixes are protected; everything else may shrink. It returns
+// the per-section-truncated render unchanged in the documented exception where
+// the protected content plus the fixed headings and one marker per regular
+// group already exceed the envelope.
+func squeezeBriefing(head string, groups []briefingGroup, bodies []string, protectedRunes []int, rendered string) string {
 	regularGroups := len(groups) - 1
 	regularRunes := 0
+	protectedTotal := 0
+	optionalGroups := 0
 	for index := 0; index < regularGroups; index++ {
-		regularRunes += utf8.RuneCountInString(bodies[index])
+		bodyRunes := utf8.RuneCountInString(bodies[index])
+		regularRunes += bodyRunes
+		protectedTotal += protectedRunes[index]
+		if bodyRunes > protectedRunes[index] {
+			optionalGroups++
+		}
 	}
 	fixedRunes := utf8.RuneCountInString(rendered) - regularRunes
-	if fixedRunes+regularGroups > briefingBudgetRunes {
-		// Documented exception: the protected content plus the fixed headings
-		// and the smallest possible body for every regular group already exceed
-		// the envelope. Nothing can be cut without touching protected content,
-		// so the per-section-truncated render is returned unchanged.
+	available := briefingBudgetRunes - fixedRunes - protectedTotal - optionalGroups
+	if available < 0 {
 		return rendered
 	}
-
-	allocations := regularSectionAllocations(groups[:regularGroups], briefingBudgetRunes-fixedRunes)
+	allocations := optionalSectionAllocations(groups[:regularGroups], bodies[:regularGroups], protectedRunes[:regularGroups], available)
 	for index := 0; index < regularGroups; index++ {
-		bodies[index] = truncateToRunes(bodies[index], allocations[index])
+		bodyRunes := utf8.RuneCountInString(bodies[index])
+		if bodyRunes <= protectedRunes[index] {
+			continue
+		}
+		bodies[index] = truncateToRunes(bodies[index], protectedRunes[index]+1+allocations[index])
 	}
 	return assembleBriefing(head, groups, bodies)
+}
+
+// protectedPrefixRunes returns the rune length of the protected prefix of one
+// group body. A mandatory prefix that is not a literal prefix of the body is
+// treated as absent, so a hand-built Briefing without derived mandatory
+// content renders exactly as before.
+func protectedPrefixRunes(body, mandatory string) int {
+	if mandatory == "" || !strings.HasPrefix(body, mandatory) {
+		return 0
+	}
+	return utf8.RuneCountInString(mandatory)
+}
+
+// truncateSectionBody cuts one group body to its section budget without ever
+// cutting its protected prefix. A group whose mandatory prefix alone exceeds
+// the budget keeps the whole prefix and adds the truncation marker only when
+// there is optional content to drop, so current/next and the top-3 facts stay
+// visible even when the section is over budget (spec R-A8-5).
+func truncateSectionBody(body string, budget, protectedRunes int) string {
+	limit := budget * 5 / 3
+	bodyRunes := utf8.RuneCountInString(body)
+	if bodyRunes <= limit {
+		return body
+	}
+	minimum := protectedRunes
+	if bodyRunes > protectedRunes {
+		minimum = protectedRunes + 1
+	}
+	if limit < minimum {
+		limit = minimum
+	}
+	return truncateToRunes(body, limit)
+}
+
+// optionalSectionAllocations distributes the rune allowance left after the
+// protected content over the optional tails of the regular groups. Each group
+// with an optional tail first reserves one rune for its truncation marker; the
+// rest is shared proportionally to the group's section budget, so a group with
+// a larger spec budget keeps a larger share, and a tail never exceeds the room
+// its own section budget leaves after the protected prefix. Integer arithmetic
+// and a fixed remainder order make the split deterministic.
+func optionalSectionAllocations(groups []briefingGroup, bodies []string, protectedRunes []int, availableRunes int) []int {
+	allocations := make([]int, len(groups))
+	if len(groups) == 0 {
+		return allocations
+	}
+	weights := make([]int, len(groups))
+	maxOptional := make([]int, len(groups))
+	weightTotal := 0
+	for index, group := range groups {
+		optional := utf8.RuneCountInString(bodies[index]) - protectedRunes[index]
+		if optional <= 0 {
+			continue
+		}
+		weight := group.budget * 5 / 3
+		if weight < 2 {
+			weight = 2
+		}
+		weights[index] = weight
+		weightTotal += weight
+		budgetRoom := weight - protectedRunes[index] - 1
+		if budgetRoom < 0 {
+			budgetRoom = 0
+		}
+		maxOptional[index] = optional - 1
+		if maxOptional[index] > budgetRoom {
+			maxOptional[index] = budgetRoom
+		}
+	}
+	if weightTotal == 0 {
+		return allocations
+	}
+	remaining := availableRunes
+	if remaining < 0 {
+		remaining = 0
+	}
+	assigned := 0
+	for index := range groups {
+		if weights[index] == 0 {
+			continue
+		}
+		share := remaining * weights[index] / weightTotal
+		if share > maxOptional[index] {
+			share = maxOptional[index]
+		}
+		allocations[index] = share
+		assigned += share
+	}
+	for assigned < remaining {
+		progressed := false
+		for index := range groups {
+			if assigned >= remaining {
+				break
+			}
+			if weights[index] == 0 || allocations[index] >= maxOptional[index] {
+				continue
+			}
+			allocations[index]++
+			assigned++
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
+	}
+	return allocations
+}
+
+// briefingGroup couples one rendered group with its content budget and its
+// mandatory prefix. A zero budget means the group is protected and never
+// truncated; an empty mandatory prefix means the group has no protected part.
+type briefingGroup struct {
+	title     string
+	sections  []Section
+	budget    int
+	mandatory string
+}
+
+// briefingGroups returns the groups in the fixed spec §6.2 order. It allocates a
+// fresh slice every render; the values themselves are immutable.
+func briefingGroups(b Briefing) []briefingGroup {
+	return []briefingGroup{
+		{title: sectionTitleRequirements, sections: b.Requirements, budget: briefingRequirementsBudget},
+		{title: sectionTitleCases, sections: b.Cases, budget: briefingCasesBudget},
+		{title: sectionTitlePlan, sections: b.Plan, budget: briefingPlanBudget, mandatory: b.mandatoryPlan},
+		{title: sectionTitleFindings, sections: b.Findings, budget: briefingFindingsBudget, mandatory: b.mandatoryFindings},
+		{title: sectionTitleExecution, sections: b.Execution, budget: briefingExecutionBudget},
+		{title: sectionTitleKnowledge, sections: b.Knowledge, budget: briefingKnowledgeBudget},
+		{title: sectionTitleOpenQuestions, sections: b.OpenQuestions},
+	}
 }
 
 // renderHead renders the always-present goal/stage head. It is never truncated.
@@ -242,72 +409,6 @@ func assembleBriefing(head string, groups []briefingGroup, bodies []string) stri
 	return out.String()
 }
 
-// regularSectionAllocations splits the rune allowance left after the protected
-// content over the regular groups. Each group first reserves one rune for its
-// truncation marker; the rest is shared proportionally to the group's own
-// section budget, so a group with a larger spec budget keeps a larger share.
-// Integer arithmetic and a fixed remainder order make the split deterministic,
-// and no group ever receives more than its own section budget allows.
-func regularSectionAllocations(groups []briefingGroup, availableRunes int) []int {
-	allocations := make([]int, len(groups))
-	if len(groups) == 0 {
-		return allocations
-	}
-	weights := make([]int, len(groups))
-	weightTotal := 0
-	for index, group := range groups {
-		weight := group.budget * 5 / 3
-		if weight < 1 {
-			weight = 1
-		}
-		weights[index] = weight
-		weightTotal += weight
-		allocations[index] = 1
-	}
-	remaining := availableRunes - len(groups)
-	if remaining < 0 {
-		remaining = 0
-	}
-	assigned := 0
-	for index := range groups {
-		share := remaining * weights[index] / weightTotal
-		allocations[index] += share
-		assigned += share
-	}
-	for index := 0; assigned < remaining; index = (index + 1) % len(groups) {
-		allocations[index]++
-		assigned++
-	}
-	for index := range groups {
-		if allocations[index] > weights[index] {
-			allocations[index] = weights[index]
-		}
-	}
-	return allocations
-}
-
-// briefingGroup couples one rendered group with its content budget. A zero
-// budget means the group is protected and never truncated.
-type briefingGroup struct {
-	title    string
-	sections []Section
-	budget   int
-}
-
-// briefingGroups returns the groups in the fixed spec §6.2 order. It allocates a
-// fresh slice every render; the values themselves are immutable.
-func briefingGroups(b Briefing) []briefingGroup {
-	return []briefingGroup{
-		{title: sectionTitleRequirements, sections: b.Requirements, budget: briefingRequirementsBudget},
-		{title: sectionTitleCases, sections: b.Cases, budget: briefingCasesBudget},
-		{title: sectionTitlePlan, sections: b.Plan, budget: briefingPlanBudget},
-		{title: sectionTitleFindings, sections: b.Findings, budget: briefingFindingsBudget},
-		{title: sectionTitleExecution, sections: b.Execution, budget: briefingExecutionBudget},
-		{title: sectionTitleKnowledge, sections: b.Knowledge, budget: briefingKnowledgeBudget},
-		{title: sectionTitleOpenQuestions, sections: b.OpenQuestions},
-	}
-}
-
 // renderSectionBody joins the non-empty sections of one group in slice order.
 // When a group has more than one non-empty section, its title prefixes the body
 // as a sub-heading; the single-section case (the normal briefing) stays clean.
@@ -332,15 +433,6 @@ func renderSectionBody(sections []Section) string {
 		parts = append(parts, content)
 	}
 	return strings.Join(parts, "\n\n")
-}
-
-// truncateToBudget cuts text down to the conservative token estimate of one
-// section budget. A non-positive budget means "do not truncate".
-func truncateToBudget(text string, budget int) string {
-	if budget <= 0 {
-		return text
-	}
-	return truncateToRunes(text, budget*5/3)
 }
 
 // truncateToRunes cuts text to at most maxRunes runes while staying UTF-8 safe,
@@ -454,38 +546,139 @@ func casesBody(in CasesSnapshot) string {
 	return strings.Join(parts, "\n")
 }
 
-func planBody(items []PlanItemSnapshot) string {
-	total := 0
+// planTerminalStatuses are the statuses that mean a plan item no longer needs
+// work (spec R-A8-5). Current and next are always chosen among the other items.
+var planTerminalStatuses = map[string]bool{
+	"done":      true,
+	"completed": true,
+	"skipped":   true,
+	"cancelled": true,
+	"canceled":  true,
+}
+
+// planItemView is one renderable plan item: its normalized status and its
+// already-rendered label.
+type planItemView struct {
+	status string
+	label  string
+}
+
+// planItemTerminal reports whether a plan status is terminal. An empty or
+// unknown status counts as open, so a malformed row still shows up as work.
+func planItemTerminal(status string) bool {
+	return planTerminalStatuses[strings.ToLower(oneLine(status))]
+}
+
+// planViews returns the renderable plan items in plan order. Items without a
+// title are dropped exactly as before: there is nothing to show for them.
+func planViews(items []PlanItemSnapshot) []planItemView {
+	views := make([]planItemView, 0, len(items))
 	for _, item := range items {
-		if oneLine(item.Title) != "" {
-			total++
-		}
-	}
-	if total == 0 {
-		return ""
-	}
-	lines := make([]string, 0, maxPlanItems)
-	for _, item := range items {
-		if len(lines) == maxPlanItems {
-			break
-		}
-		title := oneLine(item.Title)
-		if title == "" {
+		if oneLine(item.Title) == "" {
 			continue
 		}
-		line := "- "
-		if status := oneLine(item.Status); status != "" {
-			line += "[" + status + "] "
-		}
-		line += title
-		if dependencies := dependencyText(item.DependsOn); dependencies != "" {
-			line += "（依赖：" + dependencies + "）"
-		}
-		lines = append(lines, line)
+		views = append(views, planItemView{status: oneLine(item.Status), label: planItemLabel(item)})
 	}
-	if remaining := total - len(lines); remaining > 0 {
+	return views
+}
+
+// planItemLabel renders one plan item without its bullet: the status, the title
+// and the dependency reference.
+func planItemLabel(item PlanItemSnapshot) string {
+	label := ""
+	if status := oneLine(item.Status); status != "" {
+		label = "[" + status + "] "
+	}
+	label += oneLine(item.Title)
+	if dependencies := dependencyText(item.DependsOn); dependencies != "" {
+		label += "（依赖：" + dependencies + "）"
+	}
+	return label
+}
+
+// planCurrentAndNext returns the indexes of the current and next plan items
+// (spec R-A8-5): current is the first non-terminal item in plan order and next
+// is the following non-terminal item. Either index is -1 when it does not
+// exist; no item is fabricated.
+func planCurrentAndNext(views []planItemView) (current, next int) {
+	current, next = -1, -1
+	for index := range views {
+		if planItemTerminal(views[index].status) {
+			continue
+		}
+		if current < 0 {
+			current = index
+			continue
+		}
+		next = index
+		break
+	}
+	return current, next
+}
+
+// planMandatoryLines returns the always-visible plan prefix with explicit
+// labels and the indexes it covers.
+func planMandatoryLines(views []planItemView) (lines []string, current, next int) {
+	current, next = planCurrentAndNext(views)
+	if current >= 0 {
+		lines = append(lines, planCurrentPrefix+views[current].label)
+	}
+	if next >= 0 {
+		lines = append(lines, planNextPrefix+views[next].label)
+	}
+	return lines, current, next
+}
+
+// planBody renders the plan group plus its cap marker. The current and next
+// items come first with explicit labels and count toward maxPlanItems; the
+// remaining slots show the upcoming open items in plan order, then the finished
+// ones, so the model keeps seeing history when there is room.
+func planBody(items []PlanItemSnapshot) string {
+	views := planViews(items)
+	if len(views) == 0 {
+		return ""
+	}
+	mandatory, current, next := planMandatoryLines(views)
+	lines := append(make([]string, 0, maxPlanItems), mandatory...)
+	shown := make([]bool, len(views))
+	if current >= 0 {
+		shown[current] = true
+	}
+	if next >= 0 {
+		shown[next] = true
+	}
+	for _, terminal := range []bool{false, true} {
+		for index := range views {
+			if len(lines) == maxPlanItems {
+				break
+			}
+			if shown[index] || planItemTerminal(views[index].status) != terminal {
+				continue
+			}
+			lines = append(lines, "- "+views[index].label)
+			shown[index] = true
+		}
+	}
+	shownCount := 0
+	for _, visible := range shown {
+		if visible {
+			shownCount++
+		}
+	}
+	if remaining := len(views) - shownCount; remaining > 0 {
 		lines = append(lines, fmt.Sprintf("（另有 %d 项未列出）", remaining))
 	}
+	return strings.Join(lines, "\n")
+}
+
+// planMandatoryBody returns the protected plan prefix (spec R-A8-5): the
+// current item and the following non-terminal item, with explicit labels.
+func planMandatoryBody(items []PlanItemSnapshot) string {
+	views := planViews(items)
+	if len(views) == 0 {
+		return ""
+	}
+	lines, _, _ := planMandatoryLines(views)
 	return strings.Join(lines, "\n")
 }
 
@@ -499,14 +692,35 @@ func dependencyText(values []string) string {
 	return strings.Join(parts, "、")
 }
 
-func findingsBody(items []FactSnapshot) string {
+// rankedFacts returns a deterministic top-first copy of the findings, ordered
+// by factLess so the same source data always yields the same selection.
+func rankedFacts(items []FactSnapshot) []FactSnapshot {
 	ranked := append([]FactSnapshot(nil), items...)
 	sort.Slice(ranked, func(left, right int) bool {
 		return factLess(ranked[left], ranked[right])
 	})
+	return ranked
+}
+
+func findingsBody(items []FactSnapshot) string {
 	lines := make([]string, 0, maxFindingItems)
-	for _, fact := range ranked {
+	for _, fact := range rankedFacts(items) {
 		if len(lines) == maxFindingItems {
+			break
+		}
+		if line := factLine(fact); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// findingsMandatoryBody returns the protected findings prefix (spec R-A8-5):
+// the top-3 ranked facts. It is always a prefix of findingsBody.
+func findingsMandatoryBody(items []FactSnapshot) string {
+	lines := make([]string, 0, maxMandatoryFindings)
+	for _, fact := range rankedFacts(items) {
+		if len(lines) == maxMandatoryFindings {
 			break
 		}
 		if line := factLine(fact); line != "" {
