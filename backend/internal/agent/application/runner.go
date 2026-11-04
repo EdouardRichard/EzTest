@@ -2385,7 +2385,7 @@ const DesignRunMaxTokens = 200000
 // executor back to the generic budget (same reasoning as the Task 79 design
 // floor). A work item's explicit 0.2.1 budget declaration still wins over the
 // profile floor.
-const CaseExecutorRunMaxTokens = 1200000
+const CaseExecutorRunMaxTokens = 1500000
 
 // Design authoring envelope (Task 79). The stored profile budgets cannot be
 // trusted for design runs: profiles are seeded once and EnsureProfiles never

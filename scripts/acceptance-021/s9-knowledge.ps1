@@ -90,11 +90,13 @@ function Get-LatestPacket {
         Packet = $packet
         Text = (Get-PacketText -Packet $packet)
         PrefixHash = [string](Get-JsonProp -Object $packet -Name "prefix_hash" -Default "")
+        Id = [string](Get-JsonProp -Object  -Name "id" -Default "")
+        CreatedAt = [string](Get-JsonProp -Object  -Name "created_at" -Default "")
     }
 }
 
 try {
-    Write-AcceptanceLog -Scenario $scenario -Message "S9 knowledge acceptance; injectionTimeout=${InjectionTimeoutSeconds}s revokeTimeout=${RevokeTimeoutSeconds}s token=$token"
+    $injectedPacketId = ""`n    Write-AcceptanceLog -Scenario $scenario -Message "S9 knowledge acceptance; injectionTimeout=${InjectionTimeoutSeconds}s revokeTimeout=${RevokeTimeoutSeconds}s token=$token"
 
     $login = Connect-EzTest -Context $context
     Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $login.Ok -Severity blocker -Detail ($(if ($login.Ok) { "admin session established" } else { "admin credentials rejected" }))
@@ -230,7 +232,7 @@ try {
             $postRevokePacket = $null
             while ((Get-Date) -lt $deadline) {
                 $latest = Get-LatestPacket -Context $context -VersionId $versionId
-                if ($latest.HttpStatus -eq 200 -and $latest.PrefixHash -ne "" -and $latest.PrefixHash -ne $injectedPacketHash -and -not ($latest.Text -match [regex]::Escape($marker))) {
+                if ($latest.HttpStatus -eq 200 -and -not ($latest.Text -match [regex]::Escape($marker)) -and (($latest.Id -ne "" -and $latest.Id -ne $injectedPacketId) -or ($latest.CreatedAt -ne "" -and $latest.CreatedAt -gt $revokedAt))) {
                     $postRevokePacket = $latest
                     break
                 }
