@@ -245,7 +245,7 @@ describe("QuestionCard", () => {
     expect(await screen.findByText("已回答")).toBeInTheDocument()
   })
 
-  it("notifies the thread with the updated batch", async () => {
+  it("notifies the thread with the updated batch and its source signature", async () => {
     const updated = answeredBatch(["a"])
     api.answerQuestion.mockResolvedValue(updated)
     const onUpdated = vi.fn()
@@ -254,6 +254,168 @@ describe("QuestionCard", () => {
     fireEvent.click(screen.getByLabelText("T+1"))
     fireEvent.click(screen.getByRole("button", { name: "提交" }))
 
-    await waitFor(() => expect(onUpdated).toHaveBeenCalledWith(updated))
+    await waitFor(() => expect(onUpdated).toHaveBeenCalledWith(updated, expect.any(String)))
+  })
+
+  it("submits one answers[] payload with every question of a multi-question batch", async () => {
+    const batch = pendingBatch({
+      questions: [
+        {
+          id: "q1",
+          text: "退款到账时间按 T+1 还是 T+3 验收？",
+          options: [
+            { id: "a", label: "T+1" },
+            { id: "b", label: "T+3" },
+          ],
+          multiple: false,
+          allow_free_text: false,
+          required: true,
+          source_refs: [],
+        },
+        {
+          id: "q2",
+          text: "验收补充",
+          options: [],
+          multiple: false,
+          allow_free_text: true,
+          required: true,
+          source_refs: [],
+        },
+      ],
+    })
+    api.answerQuestion.mockResolvedValue({
+      ...batch,
+      status: "answered",
+      answers: [
+        { question_id: "q1", selected: ["b"], text: "" },
+        { question_id: "q2", selected: [], text: "需要补充" },
+      ],
+    })
+
+    render(<QuestionCard versionId="7" question={batch} />)
+    fireEvent.click(screen.getByLabelText("T+3"))
+    fireEvent.change(screen.getByLabelText(/验收补充 补充说明/), {
+      target: { value: "需要补充" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "提交" }))
+
+    await waitFor(() =>
+      expect(api.answerQuestion).toHaveBeenCalledWith("7", "101", [
+        { question_id: "q1", selected: ["b"], text: "" },
+        { question_id: "q2", selected: [], text: "需要补充" },
+      ]),
+    )
+    expect(await screen.findByText("已回答")).toBeInTheDocument()
+    expect(screen.getByTestId("question-answer-q1")).toHaveTextContent("T+3")
+    expect(screen.getByTestId("question-answer-q2")).toHaveTextContent("需要补充")
+  })
+
+  it("shows a skip error inline and keeps the card pending for a retry", async () => {
+    api.skipQuestion
+      .mockRejectedValueOnce(
+        new ApiError({ status: 409, code: "conflict", message: "问题已被回答", retryable: true }),
+      )
+      .mockResolvedValueOnce(pendingBatch({ status: "cancelled", skipped: true, answers: [] }))
+
+    render(<QuestionCard versionId="7" question={pendingBatch()} />)
+    fireEvent.click(screen.getByRole("button", { name: "跳过" }))
+
+    expect(await screen.findByText("问题已被回答")).toBeInTheDocument()
+    expect(screen.getByText("待回答")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "跳过" })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole("button", { name: "跳过" }))
+    await waitFor(() => expect(api.skipQuestion).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("已跳过")).toBeInTheDocument()
+    expect(screen.queryByText("问题已被回答")).not.toBeInTheDocument()
+  })
+
+  it("labels a required free-text field as 必填 instead of 选填", () => {
+    const batch = pendingBatch({
+      questions: [
+        {
+          id: "q1",
+          text: "补充验收标准",
+          options: [],
+          multiple: false,
+          allow_free_text: true,
+          required: true,
+          source_refs: [],
+        },
+      ],
+    })
+
+    render(<QuestionCard versionId="7" question={batch} />)
+
+    expect(screen.getByLabelText(/补充验收标准 补充说明/)).toHaveAttribute(
+      "placeholder",
+      "补充说明（必填）",
+    )
+  })
+
+  it("submits prefilled persisted answers of a pending batch instead of reporting them missing", async () => {
+    const batch = pendingBatch({
+      answers: [{ question_id: "q1", selected: ["a"], text: "" }],
+    })
+    api.answerQuestion.mockResolvedValue({
+      ...batch,
+      status: "answered",
+      answers: [{ question_id: "q1", selected: ["a"], text: "" }],
+    })
+
+    render(<QuestionCard versionId="7" question={batch} />)
+    expect(screen.getByLabelText("T+1")).toBeChecked()
+
+    fireEvent.click(screen.getByRole("button", { name: "提交" }))
+
+    await waitFor(() =>
+      expect(api.answerQuestion).toHaveBeenCalledWith("7", "101", [
+        { question_id: "q1", selected: ["a"], text: "" },
+      ]),
+    )
+    expect(await screen.findByText("已回答")).toBeInTheDocument()
+    expect(screen.queryByText("请选择")).not.toBeInTheDocument()
+  })
+
+  it("clears a field error when a newer authoritative batch arrives", async () => {
+    const batch = pendingBatch({
+      questions: [
+        {
+          id: "q1",
+          text: "补充验收标准",
+          options: [],
+          multiple: false,
+          allow_free_text: true,
+          required: true,
+          source_refs: [],
+        },
+      ],
+    })
+    const { rerender } = render(<QuestionCard versionId="7" question={batch} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "提交" }))
+    expect(await screen.findByText("请填写")).toBeInTheDocument()
+
+    const reopened = { ...batch, expires_at: "2099-06-01T00:00:00Z" }
+    rerender(<QuestionCard versionId="7" question={reopened} />)
+
+    await waitFor(() => expect(screen.queryByText("请填写")).not.toBeInTheDocument())
+  })
+
+  it("clears a submit error when a newer authoritative batch arrives", async () => {
+    api.answerQuestion.mockRejectedValueOnce(
+      new ApiError({ status: 503, code: "unavailable", message: "服务暂不可用", retryable: true }),
+    )
+    const batch = pendingBatch()
+    const { rerender } = render(<QuestionCard versionId="7" question={batch} />)
+
+    fireEvent.click(screen.getByLabelText("T+1"))
+    fireEvent.click(screen.getByRole("button", { name: "提交" }))
+    expect(await screen.findByText("服务暂不可用")).toBeInTheDocument()
+
+    const reopened = { ...batch, expires_at: "2099-06-01T00:00:00Z" }
+    rerender(<QuestionCard versionId="7" question={reopened} />)
+
+    await waitFor(() => expect(screen.queryByText("服务暂不可用")).not.toBeInTheDocument())
   })
 })

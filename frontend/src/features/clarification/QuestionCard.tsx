@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
@@ -16,7 +16,7 @@ import {
   type QuestionStatus,
   skipQuestion,
 } from "./api"
-import { questionBatchStatus } from "./useConversation"
+import { questionBatchSignature, questionBatchStatus } from "./useConversation"
 
 export type QuestionCardProps = {
   /** Version scope of the default answer/skip transport. */
@@ -32,22 +32,15 @@ export type QuestionCardProps = {
   /** Echo callback: one entry per question after a successful submit. */
   onAnswer?: (answer: QuestionAnswerInput) => void
   onSkip?: (questionId: string) => void
-  /** The updated batch after answer/skip; the thread refreshes its pending count. */
-  onUpdated?: (question: QuestionBatch) => void
+  /**
+   * The updated batch after answer/skip, plus the signature of the source batch
+   * it replaced; the thread keys its pending override by that signature so a
+   * newer authoritative batch (e.g. a Host reopen) supersedes the local echo.
+   */
+  onUpdated?: (question: QuestionBatch, sourceSignature: string) => void
 }
 
 type FieldErrors = Record<string, string>
-
-function questionSignature(question: QuestionBatch): string {
-  return JSON.stringify([
-    question.id,
-    question.status,
-    question.expires_at,
-    question.answers,
-    question.answered_at,
-    question.skipped,
-  ])
-}
 
 function toWireAnswer(answer: QuestionAnswerInput): QuestionAnswer {
   return { question_id: answer.questionId, selected: [...answer.selected], text: answer.text }
@@ -98,7 +91,16 @@ export function QuestionCard({
     question: QuestionBatch
   } | null>(null)
 
-  const signature = questionSignature(question)
+  const signature = questionBatchSignature(question)
+  const previousSignatureRef = useRef(signature)
+  // A newer authoritative batch starts a new interaction: field/submit errors
+  // from the previous snapshot must not leak into it (e.g. after a Host reopen).
+  useEffect(() => {
+    if (previousSignatureRef.current === signature) return
+    previousSignatureRef.current = signature
+    setFieldErrors({})
+    setSubmitError(null)
+  }, [signature])
   const current =
     localAnswer !== null && localAnswer.signature === signature ? localAnswer.question : question
   const status = questionBatchStatus(current)
@@ -127,6 +129,21 @@ export function QuestionCard({
     return current.answers.find((answer) => answer.question_id === item.id)?.text ?? ""
   }
 
+  /**
+   * The value the card would submit for one question: the local draft when the
+   * user touched it, otherwise the persisted answer of the batch. Validation and
+   * the submitted payload share this source, so a pending batch that already
+   * carries an answer (e.g. a reopened question with retained data) is neither
+   * reported missing nor submitted empty.
+   */
+  function answerFor(item: QuestionItem): QuestionAnswerInput {
+    return {
+      questionId: item.id,
+      selected: [...selectedFor(item)],
+      text: textFor(item).trim(),
+    }
+  }
+
   function chooseOption(item: QuestionItem, optionId: string): void {
     if (busy) return
     clearFieldError(item.id)
@@ -150,17 +167,16 @@ export function QuestionCard({
   function validate(): FieldErrors {
     const errors: FieldErrors = {}
     for (const item of current.questions) {
-      const selected = selections[item.id] ?? []
-      const text = (texts[item.id] ?? "").trim()
-      if (text.length > 0 && !item.allow_free_text) {
+      const draft = answerFor(item)
+      if (draft.text.length > 0 && !item.allow_free_text) {
         errors[item.id] = "该问题不支持补充说明"
         continue
       }
-      if (item.required && selected.length === 0 && text.length === 0) {
+      if (item.required && draft.selected.length === 0 && draft.text.length === 0) {
         errors[item.id] = item.options.length > 0 ? "请选择" : "请填写"
         continue
       }
-      if (!item.multiple && selected.length > 1) {
+      if (!item.multiple && draft.selected.length > 1) {
         errors[item.id] = "只能选择一项"
       }
     }
@@ -189,18 +205,14 @@ export function QuestionCard({
     setFieldErrors(errors)
     if (Object.keys(errors).length > 0) return
 
-    const answers: QuestionAnswerInput[] = current.questions.map((item) => ({
-      questionId: item.id,
-      selected: [...(selections[item.id] ?? [])],
-      text: (texts[item.id] ?? "").trim(),
-    }))
+    const answers: QuestionAnswerInput[] = current.questions.map(answerFor)
     setSubmitting(true)
     setSubmitError(null)
     try {
       const updated = await resolveAnswer(answers)
       setLocalAnswer({ signature, question: updated })
       for (const answer of answers) onAnswer?.(answer)
-      onUpdated?.(updated)
+      onUpdated?.(updated, signature)
     } catch (cause) {
       // Keep the draft selections: a retryable API error must not discard them.
       setSubmitError(cause)
@@ -217,7 +229,7 @@ export function QuestionCard({
       const updated = await resolveSkip()
       setLocalAnswer({ signature, question: updated })
       onSkip?.(current.id)
-      onUpdated?.(updated)
+      onUpdated?.(updated, signature)
     } catch (cause) {
       setSubmitError(cause)
     } finally {
@@ -285,7 +297,7 @@ export function QuestionCard({
               {item.allow_free_text ? (
                 <Input
                   aria-label={`${item.text} 补充说明`}
-                  placeholder="补充说明（选填）"
+                  placeholder={item.required ? "补充说明（必填）" : "补充说明（选填）"}
                   value={textFor(item)}
                   disabled={readOnly || submitting}
                   maxLength={2000}

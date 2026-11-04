@@ -421,6 +421,23 @@ export function questionBatchStatus(
   return "pending"
 }
 
+/**
+ * Stable signature of the server-visible batch state (status, deadline, answer
+ * echo). Local echoes and thread overrides are keyed by it: an unchanged parent
+ * snapshot keeps the local answer, while a newer authoritative batch (a Host
+ * reopen gets a new `expires_at` and cleared answers) supersedes it.
+ */
+export function questionBatchSignature(question: QuestionBatch): string {
+  return JSON.stringify([
+    question.id,
+    question.status,
+    question.expires_at,
+    question.answers,
+    question.answered_at,
+    question.skipped,
+  ])
+}
+
 function isQuestionPart(part: unknown): boolean {
   return (
     typeof part === "object" && part !== null && (part as { type?: unknown }).type === "question"
@@ -436,6 +453,12 @@ function isQuestionPart(part: unknown): boolean {
  * one `question` part into the message bound by `message_id` (or synthesizes the
  * card message when the thread page does not include it yet), which is what
  * makes a pending question survive a reload without local-only state.
+ *
+ * Only a *pending* batch is synthesized when its bound message is not in the
+ * loaded page. A terminal batch (answered/expired/cancelled) belongs to old
+ * history: synthesizing it would float an answered card above the loaded page
+ * (and of its not-yet-loaded history), so it is dropped until that message page
+ * is loaded and the card can be placed at its real position.
  */
 export function mergeQuestionCards(
   messages: readonly ConversationMessage[],
@@ -444,6 +467,7 @@ export function mergeQuestionCards(
   if (questions.length === 0) return messages as ConversationMessage[]
   const byId = new Map<string, ConversationMessage>()
   for (const message of messages) byId.set(message.id, message)
+  let changed = false
   for (const question of questions) {
     const messageID = question.message_id ?? ""
     const existing = messageID !== "" ? byId.get(messageID) : undefined
@@ -457,8 +481,10 @@ export function mergeQuestionCards(
         ...existing,
         parts: [...parts, part],
       } as unknown as ConversationMessage)
+      changed = true
       continue
     }
+    if (questionBatchStatus(question) !== "pending") continue
     const id = messageID !== "" ? messageID : `question-${question.id}`
     const synthesized = {
       id,
@@ -469,8 +495,9 @@ export function mergeQuestionCards(
       created_at: question.created_at ?? new Date().toISOString(),
     } as unknown as ConversationMessage
     byId.set(id, synthesized)
+    changed = true
   }
-  return sortMessages([...byId.values()])
+  return changed ? sortMessages([...byId.values()]) : (messages as ConversationMessage[])
 }
 
 function createClientMessageId(): string {

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError } from "@/lib/api-client"
-
+import type { QuestionBatch } from "./api"
 import {
+  answerQuestion,
   confirmRequirement,
   confirmRequirements,
   createConversation,
@@ -14,12 +15,14 @@ import {
   getTeamRoom,
   listConversations,
   listMessages,
+  listQuestions,
   listRequirementRelations,
   listRequirements,
   mergeRequirements,
   postMessage,
   reopenRequirement,
   rollbackRequirement,
+  skipQuestion,
   updateRequirement,
   uploadContent,
 } from "./api"
@@ -56,6 +59,39 @@ function readHeaders(init: RequestInit | undefined): Headers {
 function readBody(init: RequestInit | undefined): unknown {
   if (typeof init?.body !== "string") return undefined
   return JSON.parse(init.body) as unknown
+}
+
+function questionFixture(overrides: Partial<QuestionBatch> = {}): QuestionBatch {
+  return {
+    id: "101",
+    version_id: "2001",
+    conversation_id: "4001",
+    message_id: "5001",
+    kind: "clarification_question",
+    status: "pending",
+    batch_id: "qb-1",
+    questions: [
+      {
+        id: "q1",
+        text: "退款到账时间按 T+1 还是 T+3 验收？",
+        options: [
+          { id: "a", label: "T+1" },
+          { id: "b", label: "T+3" },
+        ],
+        multiple: false,
+        allow_free_text: true,
+        required: true,
+        source_refs: ["requirement:FR-012"],
+      },
+    ],
+    expires_at: "2099-01-01T00:00:00Z",
+    answers: [],
+    answered_by: null,
+    answered_at: null,
+    skipped: false,
+    created_at: "2026-11-05T06:00:00Z",
+    ...overrides,
+  }
 }
 
 const fetchMock = vi.fn<typeof fetch>()
@@ -145,6 +181,55 @@ describe("clarification api", () => {
       client_message_id: "client_1",
       parts: [{ type: "text", text: "退款 T+1 到账" }],
     })
+  })
+
+  it("lists structured questions with the status filter and paging envelope", async () => {
+    const question = questionFixture()
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: [question], next_cursor: "101", has_more: true }),
+    )
+
+    await expect(listQuestions("2001", { status: "pending", limit: 50 })).resolves.toEqual([
+      question,
+    ])
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/questions?status=pending&limit=50",
+    )
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("GET")
+  })
+
+  it("answers one question batch with the structured answers payload", async () => {
+    const answered = questionFixture({
+      status: "answered",
+      answers: [{ question_id: "q1", selected: ["a"], text: "T+1 更稳妥" }],
+    })
+    fetchMock.mockResolvedValue(jsonResponse({ data: answered }))
+
+    await expect(
+      answerQuestion("2001", "101", [{ question_id: "q1", selected: ["a"], text: "T+1 更稳妥" }]),
+    ).resolves.toEqual(answered)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/questions/101/answer")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({
+      answers: [{ question_id: "q1", selected: ["a"], text: "T+1 更稳妥" }],
+    })
+  })
+
+  it("skips one question batch with an empty or reasoned body", async () => {
+    const skipped = questionFixture({ status: "cancelled", skipped: true })
+    fetchMock.mockResolvedValue(jsonResponse({ data: skipped }))
+
+    await expect(skipQuestion("2001", "101")).resolves.toEqual(skipped)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/questions/101/skip")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({})
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: skipped }))
+    await skipQuestion("2001", "101", "重复提问")
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({ reason: "重复提问" })
   })
 
   it("lists requirements with an optional status filter", async () => {

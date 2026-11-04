@@ -30,6 +30,7 @@ import {
   mergePartsBySeq,
   questionBatchFromMessage,
   questionBatchFromPart,
+  questionBatchSignature,
   questionBatchStatus,
   useJobCardUpdate,
 } from "./useConversation"
@@ -193,11 +194,16 @@ function JobCardHost({ versionId, part }: { versionId: string; part: JobCardPart
   return <JobCard versionId={versionId} part={mergedPart} />
 }
 
+/** Local answer/skip transition keyed to the source batch it superseded. */
+type QuestionOverride = {
+  sourceSignature: string
+  batch: QuestionBatch
+}
+
 function MessagePartView({
   versionId,
   messageId,
   part,
-  questionOverrides,
   onQuestionUpdated,
   onRequirementSelect,
   onRequirementChanged,
@@ -207,8 +213,7 @@ function MessagePartView({
   versionId: string
   messageId: string
   part: RenderablePart
-  questionOverrides: Record<string, QuestionBatch>
-  onQuestionUpdated: (question: QuestionBatch) => void
+  onQuestionUpdated: (question: QuestionBatch, sourceSignature: string) => void
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
   onCaseSelect?: (caseId: string) => void
@@ -220,13 +225,10 @@ function MessagePartView({
     case "question": {
       const batch = questionBatchFromPart(part)
       if (batch === null) return null
-      return (
-        <QuestionCard
-          versionId={versionId}
-          question={questionOverrides[batch.id] ?? batch}
-          onUpdated={onQuestionUpdated}
-        />
-      )
+      // The card owns its local answer echo (`localAnswer`); the thread only
+      // keeps an override for the pending count, so a stale echo can never make
+      // a newer authoritative pending batch read-only.
+      return <QuestionCard versionId={versionId} question={batch} onUpdated={onQuestionUpdated} />
     }
     case "image":
       return <MessageImage part={part} />
@@ -296,7 +298,6 @@ function partKey(part: RenderablePart): string {
 function MessageBubble({
   versionId,
   message,
-  questionOverrides,
   onQuestionUpdated,
   onRequirementSelect,
   onRequirementChanged,
@@ -305,8 +306,7 @@ function MessageBubble({
 }: {
   versionId: string
   message: ConversationMessage
-  questionOverrides: Record<string, QuestionBatch>
-  onQuestionUpdated: (question: QuestionBatch) => void
+  onQuestionUpdated: (question: QuestionBatch, sourceSignature: string) => void
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
   onCaseSelect?: (caseId: string) => void
@@ -347,7 +347,6 @@ function MessageBubble({
             versionId={versionId}
             messageId={message.id}
             part={part}
-            questionOverrides={questionOverrides}
             onQuestionUpdated={onQuestionUpdated}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}
@@ -358,7 +357,7 @@ function MessageBubble({
         {embeddedQuestion !== null && !hasQuestionPart ? (
           <QuestionCard
             versionId={versionId}
-            question={questionOverrides[embeddedQuestion.id] ?? embeddedQuestion}
+            question={embeddedQuestion}
             onUpdated={onQuestionUpdated}
           />
         ) : null}
@@ -417,23 +416,42 @@ export function MessageList({
   const loadOlderRequestedRef = useRef(false)
   const oldestMessageIdRef = useRef("")
 
-  const conversationKey = messages[0]?.conversation_id ?? ""
-  const oldestId = oldestMessageId(messages)
+  // `kind=answer` rows are hidden from the stream (the question card already
+  // echoes the answer): they must not affect the unread counter, the scroll
+  // anchoring or the conversation-switch detection.
+  const visibleMessages = useMemo(
+    () => messages.filter((message) => !isAnswerMessage(message)),
+    [messages],
+  )
+  const conversationKey = visibleMessages[0]?.conversation_id ?? ""
+  const oldestId = oldestMessageId(visibleMessages)
 
-  // The question card owns its local draft; this thread-level projection keeps
-  // the pending badge and the answered/skipped echo in sync after a transition.
-  const [questionOverrides, setQuestionOverrides] = useState<Record<string, QuestionBatch>>({})
-  const handleQuestionUpdated = useCallback((question: QuestionBatch) => {
-    setQuestionOverrides((previous) => ({ ...previous, [question.id]: question }))
+  // The question card owns its local answer echo. This thread-level projection
+  // only keys a local answer/skip to the source batch signature so the pending
+  // badge clears immediately; a newer authoritative batch (different signature,
+  // e.g. after a Host reopen) discards the stale override instead of keeping the
+  // card read-only with a zero badge.
+  const [questionOverrides, setQuestionOverrides] = useState<Record<string, QuestionOverride>>({})
+  const handleQuestionUpdated = useCallback((question: QuestionBatch, sourceSignature: string) => {
+    setQuestionOverrides((previous) => ({
+      ...previous,
+      [question.id]: { sourceSignature, batch: question },
+    }))
   }, [])
   const pendingQuestionCount = useMemo(() => {
     const byId = new Map<string, QuestionBatch>()
-    for (const message of messages) {
+    for (const message of visibleMessages) {
       const batch = questionBatchFromMessage(message)
-      if (batch !== null) byId.set(batch.id, questionOverrides[batch.id] ?? batch)
+      if (batch === null) continue
+      const override = questionOverrides[batch.id]
+      const effective =
+        override !== undefined && override.sourceSignature === questionBatchSignature(batch)
+          ? override.batch
+          : batch
+      byId.set(batch.id, effective)
     }
     return [...byId.values()].filter((batch) => questionBatchStatus(batch) === "pending").length
-  }, [messages, questionOverrides])
+  }, [visibleMessages, questionOverrides])
 
   const scrollToBottom = useCallback(() => {
     const element = containerRef.current
@@ -491,9 +509,9 @@ export function MessageList({
     if (element === null) return
 
     const isConversationChange = conversationKeyRef.current !== conversationKey
-    const nextIds = new Set(messages.map((message) => message.id))
-    const nextNewestId = newestMessageId(messages)
-    const nextOldestId = oldestMessageId(messages)
+    const nextIds = new Set(visibleMessages.map((message) => message.id))
+    const nextNewestId = newestMessageId(visibleMessages)
+    const nextOldestId = oldestMessageId(visibleMessages)
 
     if (isConversationChange) {
       conversationKeyRef.current = conversationKey
@@ -522,7 +540,7 @@ export function MessageList({
       previousOldestIdRef.current !== "" &&
       nextOldestId !== previousOldestIdRef.current &&
       nextIds.has(previousOldestIdRef.current)
-    const appended = messages.filter(
+    const appended = visibleMessages.filter(
       (message) =>
         !previousIdsRef.current.has(message.id) &&
         isNewerMessageId(message.id, previousNewestIdRef.current),
@@ -546,11 +564,11 @@ export function MessageList({
 
     previousScrollHeightRef.current = nextHeight
     if (autoFollowRef.current) {
-      if (messages.length > 0) scheduleScrollToBottom()
+      if (visibleMessages.length > 0) scheduleScrollToBottom()
       return
     }
     if (appended.length > 0) setUnreadCount((count) => count + appended.length)
-  }, [conversationKey, messages, saveScrollPosition, scheduleScrollToBottom, scrollToBottom])
+  }, [conversationKey, visibleMessages, saveScrollPosition, scheduleScrollToBottom, scrollToBottom])
 
   // Activity text can change the thread height (the bubble appears/grows)
   // without changing the message list, so it gets its own merged follow-up.
@@ -634,7 +652,7 @@ export function MessageList({
         onScroll={handleScroll}
         className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4"
       >
-        {messages.length === 0 && activity === null ? (
+        {visibleMessages.length === 0 && activity === null ? (
           <EmptyState
             title="暂无消息"
             description="描述需求，AI 会先读取版本上下文，再产出需求草案。"
@@ -642,12 +660,11 @@ export function MessageList({
           />
         ) : null}
 
-        {messages.map((message) => (
+        {visibleMessages.map((message) => (
           <MessageBubble
             key={message.id}
             versionId={versionId}
             message={message}
-            questionOverrides={questionOverrides}
             onQuestionUpdated={handleQuestionUpdated}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}

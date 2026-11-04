@@ -163,6 +163,31 @@ describe("MessageList stick-to-bottom scrolling", () => {
     expect(list.scrollTop).toBe(listScrollHeight)
   })
 
+  it("does not count hidden kind=answer messages as unread or new rows", async () => {
+    const first = message("1", "第一条消息")
+    const { rerender } = render(listElement([first]))
+    const list = scrolledList()
+
+    list.scrollTop = 0
+    fireEvent.scroll(list)
+    expect(screen.getByRole("button", { name: "回到最新" })).toBeInTheDocument()
+
+    // The structured answer is echoed by the question card, so its message row
+    // is hidden. It must not inflate the unread counter or the scroll math.
+    const hiddenAnswer = {
+      ...message("2", ""),
+      kind: "answer",
+      parts: [],
+    } as unknown as ConversationMessage
+    rerender(listElement([first, hiddenAnswer]))
+    expect(screen.getByRole("button", { name: "回到最新" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /回到最新 \(/ })).not.toBeInTheDocument()
+    expect(screen.queryAllByTestId("message-user")).toHaveLength(1)
+
+    rerender(listElement([first, hiddenAnswer, message("3", "第三条消息")]))
+    expect(await screen.findByRole("button", { name: "回到最新 (1)" })).toBeInTheDocument()
+  })
+
   it("resumes auto-follow when the reader scrolls back to the bottom", async () => {
     const first = message("1", "第一条消息")
     const { rerender } = render(listElement([first]))

@@ -180,10 +180,10 @@ describe("MessageList", () => {
     ])
   })
 
-  it("keeps a persisted pending question after a reload from the question state", async () => {
+  it("renders a persisted pending question merged from the question state overlay", async () => {
     const batch = questionBatch()
-    // Reload path: the thread snapshot has no question message yet, so the
-    // question API state is merged into the stream instead of local-only state.
+    // Overlay branch for a pending batch whose bound message is not in this page
+    // (the hook-driven reload path is covered in useConversation.questions.test).
     const messages = mergeQuestionCards([], [batch])
 
     render(
@@ -197,6 +197,49 @@ describe("MessageList", () => {
 
     expect(screen.getByTestId("question-card")).toBeInTheDocument()
     expect(screen.getByText("退款到账时间按 T+1 还是 T+3 验收？")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "提交" })).toBeEnabled()
+    expect(screen.getByTestId("pending-question-todo")).toHaveTextContent("1")
+  })
+
+  it("lets a locally answered card become answerable again when a reopened batch arrives", async () => {
+    const batch = questionBatch()
+    api.answerQuestion.mockResolvedValue({
+      ...batch,
+      status: "answered",
+      answers: [{ question_id: "q1", selected: ["a"], text: "" }],
+      answered_by: "42",
+      answered_at: "2026-11-05T06:30:00Z",
+    })
+
+    const { rerender } = render(
+      <MessageList
+        versionId="2001"
+        messages={[questionMessage(batch)]}
+        activity={null}
+        onRequirementSelect={vi.fn()}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText("T+1"))
+    fireEvent.click(screen.getByRole("button", { name: "提交" }))
+    expect(await screen.findByText("已回答")).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.queryByTestId("pending-question-todo")).not.toBeInTheDocument(),
+    )
+
+    // The Host reopened the question: a newer authoritative pending batch (new
+    // deadline, cleared answers) replaces the local answer echo. The stale
+    // local override must be discarded, so the card is answerable and counted.
+    const reopened = questionBatch({ expires_at: "2099-06-01T00:00:00Z", answers: [] })
+    rerender(
+      <MessageList
+        versionId="2001"
+        messages={[questionMessage(reopened)]}
+        activity={null}
+        onRequirementSelect={vi.fn()}
+      />,
+    )
+
+    expect(await screen.findByText("待回答")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "提交" })).toBeEnabled()
     expect(screen.getByTestId("pending-question-todo")).toHaveTextContent("1")
   })
