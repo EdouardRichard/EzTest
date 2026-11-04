@@ -123,8 +123,10 @@ func NewCompactionPolicy(window, output int) CompactionPolicy {
 }
 
 // Validate enforces the spec's load-time contract retain < trigger < usable
-// (R-A5-1). The returned error is always a *CompactionPolicyError wrapping
-// ErrInvalidCompactionPolicy.
+// (R-A5-1), plus the explicit v0.22 guards that every budget is positive. The
+// summary_max > 0 guard is deliberately explicit: the formula always derives a
+// positive summary budget for a valid window, but a settings override must not
+// be able to disable the summary cap.
 func (p CompactionPolicy) Validate() error {
 	switch {
 	case p.Window <= 0:
@@ -134,6 +136,7 @@ func (p CompactionPolicy) Validate() error {
 	case p.Usable <= 0:
 		return invalidCompactionPolicy("usable", "must be positive")
 	case p.SummaryMax <= 0:
+		// Explicit v0.22 guard (see the Validate doc).
 		return invalidCompactionPolicy("summary_max", "must be positive")
 	case p.Retain < 0:
 		return invalidCompactionPolicy("retain", "must not be negative")
@@ -150,7 +153,7 @@ func (p CompactionPolicy) Validate() error {
 }
 
 // OverflowPolicy returns the forced-overflow variant of the policy: retain is
-// halved from 16% to the spec's 8% of usable (R-A5-2/R-A5-8). The receiver is
+// halved from 16% to 8% of usable (R-A5-2, R-A5-11 and A §6.8). The receiver is
 // not mutated.
 func (p CompactionPolicy) OverflowPolicy() CompactionPolicy {
 	overflow := p
@@ -348,20 +351,24 @@ const (
 
 // CompactionTransaction is one in-flight compaction of one conversation. ID
 // fences the state transitions: only the holder of the transaction may advance
-// or end it.
+// or end it. MaxRetries is the overflow retry budget carried from a
+// policy-aware decision (R-A5-2); it is zero for non-overflow transactions.
 type CompactionTransaction struct {
 	ID             string
 	ConversationID int64
 	Trigger        CompactionTrigger
 	Policy         CompactionPolicy
+	MaxRetries     int
 	State          CompactionTransactionState
 	StartedAt      time.Time
 	UpdatedAt      time.Time
 }
 
 // CompactionOutcome is what a successful compaction reports to the transaction
-// manager. The summary/covered-message identifiers are produced by the Task 13
-// persistence path and simply carried through the event here.
+// manager. RetainTokens may be zero or negative; Finish then publishes the
+// transaction policy's retain budget instead. The summary/covered-message
+// identifiers are produced by the Task 13 persistence path and simply carried
+// through the event here.
 type CompactionOutcome struct {
 	BeforeTokens     int
 	AfterTokens      int
@@ -375,7 +382,8 @@ var (
 	// ErrCompactionBusy reports that another live compaction transaction owns
 	// the conversation. The caller keeps the original context and continues.
 	ErrCompactionBusy = errors.New("agentcontext: compaction already in progress for this conversation")
-	// ErrCompactionNotStarted reports a transaction that is not the live holder.
+	// ErrCompactionNotStarted reports a transaction that cannot advance or end
+	// because it is not the live holder in the required phase.
 	ErrCompactionNotStarted = errors.New("agentcontext: compaction transaction is not active")
 	// ErrCompactionFailed is the sentinel wrapper of a failed (but recoverable)
 	// compaction.
@@ -416,12 +424,17 @@ func (e *CompactionFailure) Unwrap() []error {
 	return []error{ErrCompactionFailed, e.Cause}
 }
 
-// IsRecoverableCompactionError reports whether err is a compaction failure the
-// run may ignore (keeping the original context). Unrecoverable overflow and
-// invalid configuration are not recoverable.
+// IsRecoverableCompactionError reports whether err is a compaction stop the run
+// may ignore while keeping its original context (R-A5-10): a *CompactionFailure,
+// a busy conversation (ErrCompactionBusy) or the R-A5-11 thrashing stop
+// (ErrCompactionThrashing). Unrecoverable overflow, invalid configuration and a
+// canceled context are not recoverable compaction stops.
 func IsRecoverableCompactionError(err error) bool {
 	if err == nil || errors.Is(err, ErrContextOverflowUnrecoverable) {
 		return false
+	}
+	if errors.Is(err, ErrCompactionBusy) || errors.Is(err, ErrCompactionThrashing) {
+		return true
 	}
 	var failure *CompactionFailure
 	return errors.As(err, &failure)
@@ -511,10 +524,10 @@ func WithCompactionLogger(logger *slog.Logger) CompactionManagerOption {
 // context.compacted event port and the R-A5-11 thrashing guard.
 //
 // The manager is the deterministic, in-process reference implementation. Task
-// 36 wires it into the runner; a multi-instance deployment can back the same
-// contract with a conversation row lock/advisory lock behind an equivalent
-// port. The manager itself never touches the transcript: a failed or busy
-// compaction leaves the caller's original context untouched.
+// 36 wires it into the runner; the manager coordinates in-process callers only,
+// and R-A5-10's cross-process locking is left to that runner wiring. The
+// manager itself never touches the transcript: a failed or busy compaction
+// leaves the caller's original context untouched.
 type CompactionManager struct {
 	mu        sync.Mutex
 	now       func() time.Time
@@ -545,9 +558,42 @@ func NewCompactionManager(options ...CompactionManagerOption) *CompactionManager
 
 // Start atomically begins a transaction for one conversation. It first reclaims
 // stale started transactions (R-A5-10 TTL), then rejects a second live
-// transaction with ErrCompactionBusy. The policy is validated here, so an
-// invalid settings/configuration combination fails at load time.
+// transaction with ErrCompactionBusy. The trigger and policy are validated on
+// every Start, and an overflow trigger always runs with the halved 8% overflow
+// policy and the v0.22 retry budget.
 func (m *CompactionManager) Start(ctx context.Context, conversationID int64, trigger CompactionTrigger, policy CompactionPolicy) (CompactionTransaction, error) {
+	return m.startTransaction(ctx, conversationID, trigger, policy, defaultCompactionRetries(trigger))
+}
+
+// StartDecision begins a transaction from a policy-aware trigger decision. It is
+// the entry point for callers that already resolved a decision: an overflow
+// decision carries the halved 8% retain policy (R-A5-2/R-A5-11) and its retry
+// budget into the transaction, so the operation cannot accidentally run with
+// the normal 16% retain. A decision with an overflow trigger is normalized to
+// OverflowPolicy even when it was built from the normal policy.
+func (m *CompactionManager) StartDecision(ctx context.Context, conversationID int64, decision CompactionDecision) (CompactionTransaction, error) {
+	if err := decision.Trigger.Validate(); err != nil {
+		return CompactionTransaction{}, err
+	}
+	policy := decision.Policy
+	maxRetries := 0
+	if decision.Trigger == CompactionTriggerOverflow {
+		policy = policy.OverflowPolicy()
+		maxRetries = normalizeOverflowRetries(decision.MaxRetries)
+	}
+	return m.startTransaction(ctx, conversationID, decision.Trigger, policy, maxRetries)
+}
+
+// defaultCompactionRetries is the retry budget of a plain Start: R-A5-2 allows
+// one retry after an overflow, none for the proactive triggers.
+func defaultCompactionRetries(trigger CompactionTrigger) int {
+	if trigger == CompactionTriggerOverflow {
+		return DefaultCompactionOverflowRetries
+	}
+	return 0
+}
+
+func (m *CompactionManager) startTransaction(ctx context.Context, conversationID int64, trigger CompactionTrigger, policy CompactionPolicy, maxRetries int) (CompactionTransaction, error) {
 	if err := contextError(ctx); err != nil {
 		return CompactionTransaction{}, err
 	}
@@ -556,6 +602,9 @@ func (m *CompactionManager) Start(ctx context.Context, conversationID int64, tri
 	}
 	if err := trigger.Validate(); err != nil {
 		return CompactionTransaction{}, err
+	}
+	if trigger == CompactionTriggerOverflow {
+		policy = policy.OverflowPolicy()
 	}
 	if err := policy.Validate(); err != nil {
 		return CompactionTransaction{}, err
@@ -573,6 +622,7 @@ func (m *CompactionManager) Start(ctx context.Context, conversationID int64, tri
 		ConversationID: conversationID,
 		Trigger:        trigger,
 		Policy:         policy,
+		MaxRetries:     maxRetries,
 		State:          CompactionStateStarted,
 		StartedAt:      now,
 		UpdatedAt:      now,
@@ -606,12 +656,21 @@ func (m *CompactionManager) MarkSummary(ctx context.Context, transaction Compact
 	return active, nil
 }
 
-// Finish ends a successful transaction and publishes context.compacted. It
-// returns ErrCompactionThrashing when this compaction is the second consecutive
-// one that did not reduce the prompt size; the lock is still released and the
-// event still records the attempt.
+// Finish ends a successful transaction and publishes context.compacted. The
+// R-A5-10 state machine is start → summary → end, so a direct start → end is
+// rejected with ErrCompactionNotStarted and the live transaction is kept for the
+// summary path.
+//
+// Finish returns ErrCompactionThrashing when this compaction is the second
+// consecutive one that did not reduce the prompt size (R-A5-11). That stop is
+// best effort: IsRecoverableCompactionError reports true, the lock is released,
+// the event still records the attempt and the run keeps its original context.
+//
+// A canceled context aborts the Finish, releases the live transaction and emits
+// a failure event instead of leaking the per-conversation lock until the TTL.
 func (m *CompactionManager) Finish(ctx context.Context, transaction CompactionTransaction, outcome CompactionOutcome) (CompactionEvent, error) {
 	if err := contextError(ctx); err != nil {
+		m.abortFinish(ctx, transaction, err)
 		return CompactionEvent{}, err
 	}
 	now := m.currentTime()
@@ -621,6 +680,11 @@ func (m *CompactionManager) Finish(ctx context.Context, transaction CompactionTr
 		m.mu.Unlock()
 		return CompactionEvent{}, err
 	}
+	if active.State != CompactionStateSummary {
+		m.mu.Unlock()
+		return CompactionEvent{}, fmt.Errorf("%w: transaction %s is %s, want %s",
+			ErrCompactionNotStarted, active.ID, active.State, CompactionStateSummary)
+	}
 	active.State = CompactionStateEnded
 	active.UpdatedAt = now
 	delete(m.active, active.ConversationID)
@@ -628,7 +692,7 @@ func (m *CompactionManager) Finish(ctx context.Context, transaction CompactionTr
 		Trigger:          active.Trigger,
 		BeforeTokens:     outcome.BeforeTokens,
 		AfterTokens:      outcome.AfterTokens,
-		RetainTokens:     outcome.RetainTokens,
+		RetainTokens:     publishedRetainTokens(outcome.RetainTokens, active.Policy.Retain),
 		SummaryVersion:   outcome.SummaryVersion,
 		CoveredMessageID: outcome.CoveredMessageID,
 		CachedTokens:     outcome.CachedTokens,
@@ -644,10 +708,46 @@ func (m *CompactionManager) Finish(ctx context.Context, transaction CompactionTr
 	return event, nil
 }
 
+// abortFinish ends a transaction whose Finish was aborted (for example by a
+// canceled run context). It removes the live transaction so the conversation
+// lock cannot leak until the TTL (R-A5-10) and emits the failure event, treating
+// the abort as a failed compaction.
+func (m *CompactionManager) abortFinish(ctx context.Context, transaction CompactionTransaction, cause error) {
+	now := m.currentTime()
+	m.mu.Lock()
+	active, ok := m.active[transaction.ConversationID]
+	if !ok || active.ID != transaction.ID {
+		m.mu.Unlock()
+		return
+	}
+	active.State = CompactionStateFailed
+	active.UpdatedAt = now
+	delete(m.active, active.ConversationID)
+	event := CompactionEvent{
+		Trigger:      active.Trigger,
+		RetainTokens: active.Policy.Retain,
+		Duration:     nonNegativeDuration(now.Sub(active.StartedAt)),
+		Err:          errorText(cause),
+	}
+	m.mu.Unlock()
+	m.publish(ctx, event)
+}
+
+// publishedRetainTokens keeps the event retain_tokens meaningful: an operation
+// that does not report a positive budget falls back to the transaction policy's
+// retain (the normal 16% or the overflow 8%).
+func publishedRetainTokens(outcomeRetain, policyRetain int) int {
+	if outcomeRetain > 0 {
+		return outcomeRetain
+	}
+	return policyRetain
+}
+
 // Fail ends a transaction after an error, publishes the failure event and
 // releases the lock. Non-overflow failures are returned as the recoverable
-// *CompactionFailure; an unrecoverable overflow is returned unchanged so the
-// runner can terminate the run.
+// *CompactionFailure (IsRecoverableCompactionError reports true); an
+// unrecoverable overflow is returned unchanged so the runner can terminate the
+// run.
 func (m *CompactionManager) Fail(ctx context.Context, transaction CompactionTransaction, cause error) error {
 	now := m.currentTime()
 	m.mu.Lock()
@@ -679,21 +779,38 @@ func (m *CompactionManager) Fail(ctx context.Context, transaction CompactionTran
 
 // Run drives one full start → summary → end transaction around operation. A
 // failed operation releases the lock and returns a recoverable
-// *CompactionFailure; only unrecoverable overflow is returned as a terminal
-// error. A busy conversation is also recoverable: the run keeps its original
-// context.
+// *CompactionFailure. A busy conversation and the R-A5-11 thrashing stop are
+// recoverable too (IsRecoverableCompactionError reports true), so the run keeps
+// its original context and continues without compaction. Only unrecoverable
+// overflow is returned as a terminal error.
 func (m *CompactionManager) Run(ctx context.Context, conversationID int64, trigger CompactionTrigger, policy CompactionPolicy, operation CompactionOperation) (CompactionOutcome, error) {
-	transaction, err := m.Start(ctx, conversationID, trigger, policy)
+	return m.RunDecision(ctx, conversationID, CompactionDecision{
+		Trigger:    trigger,
+		Policy:     policy,
+		Retain:     policy.Retain,
+		MaxRetries: defaultCompactionRetries(trigger),
+	}, operation)
+}
+
+// RunDecision is the decision-aware form of Run: the transaction runs with the
+// decision's effective policy (an overflow decision carries the halved 8%
+// retain, R-A5-2/R-A5-11) and retry budget.
+func (m *CompactionManager) RunDecision(ctx context.Context, conversationID int64, decision CompactionDecision, operation CompactionOperation) (CompactionOutcome, error) {
+	transaction, err := m.StartDecision(ctx, conversationID, decision)
 	if err != nil {
 		if errors.Is(err, ErrCompactionBusy) {
 			return CompactionOutcome{}, &CompactionFailure{
-				Trigger:        trigger,
+				Trigger:        decision.Trigger,
 				ConversationID: conversationID,
 				Cause:          err,
 			}
 		}
 		return CompactionOutcome{}, err
 	}
+	return m.runTransaction(ctx, transaction, operation)
+}
+
+func (m *CompactionManager) runTransaction(ctx context.Context, transaction CompactionTransaction, operation CompactionOperation) (CompactionOutcome, error) {
 	summaryTransaction, err := m.MarkSummary(ctx, transaction)
 	if err != nil {
 		return CompactionOutcome{}, m.Fail(ctx, transaction, err)

@@ -3,6 +3,8 @@ package agentcontext_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"reflect"
 	"testing"
 	"time"
@@ -619,5 +621,302 @@ func TestUnrecoverableOverflowFailsCompaction(t *testing.T) {
 	}
 	if len(publisher.events) != 1 || publisher.events[0].Err == "" {
 		t.Fatalf("published failure events = %+v, want one event with an error", publisher.events)
+	}
+}
+
+/* ------------------- fix round 1: compaction stop contract ---------------- */
+
+// TestCompactionStopIsRecoverable pins the R-A5-10 contract: a best-effort
+// compaction stop must not fail the run. Thrashing (R-A5-11), a bare busy Start
+// and a busy Run are recoverable; unrecoverable overflow, configuration errors
+// and a canceled context are not.
+func TestCompactionStopIsRecoverable(t *testing.T) {
+	ctx := context.Background()
+	manager := agentcontext.NewCompactionManager(agentcontext.WithCompactionClock(newCompactionClock()))
+	policy := mustPolicy(t, 128000, 8000)
+
+	run := func(conversationID int64, before, after int) error {
+		_, err := manager.Run(ctx, conversationID, agentcontext.CompactionTriggerPressure, policy,
+			func(context.Context, agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
+				return agentcontext.CompactionOutcome{
+					BeforeTokens: before,
+					AfterTokens:  after,
+					RetainTokens: policy.Retain,
+				}, nil
+			})
+		return err
+	}
+	if err := run(71, 1000, 1000); err != nil {
+		t.Fatalf("first non-reducing compaction error = %v, want nil", err)
+	}
+	thrashing := run(71, 1000, 1000)
+	if !errors.Is(thrashing, agentcontext.ErrCompactionThrashing) {
+		t.Fatalf("second non-reducing compaction error = %v, want ErrCompactionThrashing", thrashing)
+	}
+	if !agentcontext.IsRecoverableCompactionError(thrashing) {
+		t.Fatalf("thrashing error = %v, want a best-effort recoverable stop", thrashing)
+	}
+	if errors.Is(thrashing, agentcontext.ErrContextOverflowUnrecoverable) {
+		t.Fatalf("thrashing error = %v, must not be classified as unrecoverable overflow", thrashing)
+	}
+
+	// A second Start sees the live transaction and returns a bare busy error
+	// outside Run; it belongs to the same recoverable stop class.
+	if _, err := manager.Start(ctx, 72, agentcontext.CompactionTriggerPressure, policy); err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	busyStart, err := manager.Start(ctx, 72, agentcontext.CompactionTriggerPressure, policy)
+	if !errors.Is(err, agentcontext.ErrCompactionBusy) {
+		t.Fatalf("second Start() error = %v, want ErrCompactionBusy", err)
+	}
+	if busyStart.ID != "" {
+		t.Fatalf("busy Start() returned transaction %+v, want the zero value", busyStart)
+	}
+	if !agentcontext.IsRecoverableCompactionError(err) {
+		t.Fatalf("bare busy Start() error = %v, want a best-effort recoverable stop", err)
+	}
+	if _, err := manager.Run(ctx, 72, agentcontext.CompactionTriggerPressure, policy,
+		func(context.Context, agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
+			t.Fatal("a busy conversation must not run the compaction operation")
+			return agentcontext.CompactionOutcome{}, nil
+		}); !errors.Is(err, agentcontext.ErrCompactionBusy) || !agentcontext.IsRecoverableCompactionError(err) {
+		t.Fatalf("busy Run() error = %v, want a recoverable ErrCompactionBusy", err)
+	}
+
+	// Unrecoverable overflow remains the only terminal compaction error.
+	overflow := &agentcontext.ContextOverflowError{
+		Policy:            policy,
+		PromptTokens:      150000,
+		LargestUnitTokens: 130000,
+		Suggestion:        "split the input or raise the model context window",
+	}
+	if _, err := manager.Run(ctx, 73, agentcontext.CompactionTriggerOverflow, policy,
+		func(context.Context, agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
+			return agentcontext.CompactionOutcome{}, overflow
+		}); !errors.Is(err, agentcontext.ErrContextOverflowUnrecoverable) ||
+		agentcontext.IsRecoverableCompactionError(err) {
+		t.Fatalf("unrecoverable overflow error = %v, want a terminal error", err)
+	}
+
+	// Configuration errors and a canceled context are not compaction stops.
+	invalid := policy
+	invalid.Retain = invalid.Trigger
+	if err := invalid.Validate(); err == nil || agentcontext.IsRecoverableCompactionError(err) {
+		t.Fatalf("invalid policy error = %v, want a terminal configuration error", err)
+	}
+	if agentcontext.IsRecoverableCompactionError(context.Canceled) {
+		t.Fatal("context.Canceled must not be a recoverable compaction stop")
+	}
+	if agentcontext.IsRecoverableCompactionError(nil) {
+		t.Fatal("nil must not be a recoverable compaction stop")
+	}
+}
+
+// TestFinishRequiresSummaryState pins the R-A5-10 state machine: a started
+// transaction cannot jump straight to end, the rejected transaction stays live
+// and the proper start → summary → end path still completes.
+func TestFinishRequiresSummaryState(t *testing.T) {
+	ctx := context.Background()
+	publisher := &fakeCompactionPublisher{}
+	manager := agentcontext.NewCompactionManager(
+		agentcontext.WithCompactionClock(newCompactionClock()),
+		agentcontext.WithCompactionPublisher(publisher),
+	)
+	policy := mustPolicy(t, 128000, 8000)
+	transaction, err := manager.Start(ctx, 51, agentcontext.CompactionTriggerPressure, policy)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	outcome := agentcontext.CompactionOutcome{
+		BeforeTokens: 1000,
+		AfterTokens:  500,
+		RetainTokens: policy.Retain,
+	}
+	if _, err := manager.Finish(ctx, transaction, outcome); !errors.Is(err, agentcontext.ErrCompactionNotStarted) {
+		t.Fatalf("Finish(started) error = %v, want ErrCompactionNotStarted", err)
+	}
+	if len(publisher.events) != 0 {
+		t.Fatalf("rejected Finish published events = %+v, want none", publisher.events)
+	}
+	if active, ok := manager.Active(ctx, 51); !ok || active.State != agentcontext.CompactionStateStarted {
+		t.Fatalf("active transaction = %+v, want the rejected start→end to stay live", active)
+	}
+	summary, err := manager.MarkSummary(ctx, transaction)
+	if err != nil {
+		t.Fatalf("MarkSummary() error = %v", err)
+	}
+	if _, err := manager.Finish(ctx, summary, outcome); err != nil {
+		t.Fatalf("Finish(summary) error = %v", err)
+	}
+	if active, ok := manager.Active(ctx, 51); ok {
+		t.Fatalf("finished transaction %+v is still active", active)
+	}
+}
+
+// TestFinishCanceledContextReleasesLock covers R-A5-10 recovery: a Finish
+// aborted by a canceled context is treated as a failed compaction and releases
+// the live transaction immediately instead of leaking it until the TTL.
+func TestFinishCanceledContextReleasesLock(t *testing.T) {
+	ctx := context.Background()
+	publisher := &fakeCompactionPublisher{}
+	manager := agentcontext.NewCompactionManager(
+		agentcontext.WithCompactionClock(newCompactionClock()),
+		agentcontext.WithCompactionPublisher(publisher),
+	)
+	policy := mustPolicy(t, 128000, 8000)
+	transaction, err := manager.Start(ctx, 52, agentcontext.CompactionTriggerPressure, policy)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	transaction, err = manager.MarkSummary(ctx, transaction)
+	if err != nil {
+		t.Fatalf("MarkSummary() error = %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := manager.Finish(canceled, transaction, agentcontext.CompactionOutcome{
+		BeforeTokens: 1000,
+		AfterTokens:  500,
+		RetainTokens: policy.Retain,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Finish(canceled) error = %v, want context.Canceled", err)
+	}
+	if active, ok := manager.Active(ctx, 52); ok {
+		t.Fatalf("canceled Finish leaked active transaction %+v until the TTL", active)
+	}
+	if _, err := manager.Start(ctx, 52, agentcontext.CompactionTriggerPressure, policy); err != nil {
+		t.Fatalf("Start() after canceled Finish error = %v, want the lock released", err)
+	}
+	if len(publisher.events) != 1 || publisher.events[0].Err == "" {
+		t.Fatalf("published failure events = %+v, want one failure event for the aborted Finish", publisher.events)
+	}
+	if publisher.events[0].RetainTokens != policy.Retain {
+		t.Fatalf("aborted Finish event retain = %d, want %d", publisher.events[0].RetainTokens, policy.Retain)
+	}
+}
+
+// TestFinishRetainFallback covers the context.compacted retain contract: when an
+// operation does not report a positive retain budget, the event publishes the
+// transaction policy's retain instead of a meaningless zero.
+func TestFinishRetainFallback(t *testing.T) {
+	ctx := context.Background()
+	publisher := &fakeCompactionPublisher{}
+	manager := agentcontext.NewCompactionManager(
+		agentcontext.WithCompactionClock(newCompactionClock()),
+		agentcontext.WithCompactionPublisher(publisher),
+	)
+	policy := mustPolicy(t, 128000, 8000)
+
+	transaction, err := manager.Start(ctx, 53, agentcontext.CompactionTriggerPressure, policy)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	transaction, err = manager.MarkSummary(ctx, transaction)
+	if err != nil {
+		t.Fatalf("MarkSummary() error = %v", err)
+	}
+	event, err := manager.Finish(ctx, transaction, agentcontext.CompactionOutcome{
+		BeforeTokens: 1000,
+		AfterTokens:  500,
+		RetainTokens: 0,
+	})
+	if err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
+	if event.RetainTokens != policy.Retain {
+		t.Fatalf("event retain = %d, want the policy retain %d", event.RetainTokens, policy.Retain)
+	}
+	if len(publisher.events) != 1 || publisher.events[0].RetainTokens != policy.Retain {
+		t.Fatalf("published events = %+v, want retain %d", publisher.events, policy.Retain)
+	}
+}
+
+// TestPublisherFailureDoesNotFailCompaction covers the event port contract:
+// publishing context.compacted is best effort, so a transport failure never
+// fails the compaction or the run.
+func TestPublisherFailureDoesNotFailCompaction(t *testing.T) {
+	ctx := context.Background()
+	publisher := &fakeCompactionPublisher{err: errors.New("event store unavailable")}
+	manager := agentcontext.NewCompactionManager(
+		agentcontext.WithCompactionClock(newCompactionClock()),
+		agentcontext.WithCompactionPublisher(publisher),
+		agentcontext.WithCompactionLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	policy := mustPolicy(t, 128000, 8000)
+	outcome, err := manager.Run(ctx, 81, agentcontext.CompactionTriggerPressure, policy,
+		func(context.Context, agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
+			return agentcontext.CompactionOutcome{
+				BeforeTokens: 1000,
+				AfterTokens:  500,
+				RetainTokens: policy.Retain,
+			}, nil
+		})
+	if err != nil {
+		t.Fatalf("Run() with a failing publisher error = %v, want nil", err)
+	}
+	if outcome.AfterTokens != 500 {
+		t.Fatalf("outcome = %+v, want the compaction outcome", outcome)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("published events = %d, want the single attempted event", len(publisher.events))
+	}
+}
+
+/* ----------------- fix round 1: overflow decision contract ---------------- */
+
+// TestOverflowDecisionUsesOverflowBudget covers R-A5-2/R-A5-11: the
+// decision-aware entry point runs the transaction with the halved 8% overflow
+// retain (9600 at 128K) and carries the overflow retry budget; the manager also
+// enforces the overflow policy when an overflow decision carries only the normal
+// policy.
+func TestOverflowDecisionUsesOverflowBudget(t *testing.T) {
+	ctx := context.Background()
+	manager := agentcontext.NewCompactionManager(agentcontext.WithCompactionClock(newCompactionClock()))
+	policy := mustPolicy(t, 128000, 8000)
+	decision := policy.OverflowDecision(-1)
+	if decision.Retain != 9600 {
+		t.Fatalf("overflow decision retain = %d, want 9600", decision.Retain)
+	}
+
+	var observed agentcontext.CompactionTransaction
+	outcome, err := manager.RunDecision(ctx, 61, decision,
+		func(_ context.Context, transaction agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
+			observed = transaction
+			return agentcontext.CompactionOutcome{
+				BeforeTokens: 118000,
+				AfterTokens:  40000,
+				RetainTokens: transaction.Policy.Retain,
+			}, nil
+		})
+	if err != nil {
+		t.Fatalf("RunDecision() error = %v", err)
+	}
+	if observed.Trigger != agentcontext.CompactionTriggerOverflow {
+		t.Fatalf("transaction trigger = %q, want overflow", observed.Trigger)
+	}
+	if observed.Policy != policy.OverflowPolicy() || observed.Policy.Retain != 9600 {
+		t.Fatalf("transaction policy = %+v, want the 8%% overflow policy", observed.Policy)
+	}
+	if observed.MaxRetries != 1 {
+		t.Fatalf("transaction retry budget = %d, want the v0.22 overflow default 1", observed.MaxRetries)
+	}
+	if outcome.RetainTokens != 9600 {
+		t.Fatalf("outcome retain = %d, want 9600", outcome.RetainTokens)
+	}
+
+	// An overflow trigger forces the 8% policy even when the decision only
+	// carries the normal policy.
+	transaction, err := manager.StartDecision(ctx, 62, agentcontext.CompactionDecision{
+		Trigger: agentcontext.CompactionTriggerOverflow,
+		Policy:  policy,
+	})
+	if err != nil {
+		t.Fatalf("StartDecision(overflow) error = %v", err)
+	}
+	if transaction.Policy != policy.OverflowPolicy() || transaction.Policy.Retain != 9600 {
+		t.Fatalf("normalized overflow policy = %+v, want the 8%% overflow policy", transaction.Policy)
+	}
+	if err := transaction.Policy.Validate(); err != nil {
+		t.Fatalf("normalized overflow policy is invalid: %v", err)
 	}
 }

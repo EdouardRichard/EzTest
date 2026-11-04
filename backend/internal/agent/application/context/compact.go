@@ -195,9 +195,9 @@ func (c *Compactor) Compact(ctx context.Context, packet ContextPacket) (ContextP
 // carry a prefix-cache Invalidation boundary: pressure and overflow compact the
 // append-only suffix while the stable prefix stays byte-identical, and
 // stage_boundary is handled the same way once the caller has rebuilt the prefix.
-// The decision's retain budget and trigger are recorded by the compaction
-// transaction; the token-based retain selection itself belongs to the summary
-// wiring task.
+// This method neither records nor applies the decision's retain budget; the
+// caller carries it into the compaction transaction, and the token-based retain
+// selection belongs to Task 13's summary wiring.
 //
 // The segment-window retention rule (CompactionKeepRecent / WithKeepRecent) is
 // unchanged, and a repeated call on the same packet is a no-op. A packet with
