@@ -220,8 +220,28 @@ func (f *fakeCaseRunRepo) ListRunningByExecutor(context.Context, int64) ([]execu
 	return nil, nil
 }
 
-func (f *fakeCaseRunRepo) LatestByCaseVersions(context.Context, int64, []int64) (map[int64]execution.CaseRun, error) {
-	return map[int64]execution.CaseRun{}, nil
+// LatestByCaseVersions mirrors the production "newest non-superseded run per
+// case version" projection (the coverage reader feeds on it).
+func (f *fakeCaseRunRepo) LatestByCaseVersions(_ context.Context, _ int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	wanted := make(map[int64]struct{}, len(caseVersionIDs))
+	for _, id := range caseVersionIDs {
+		wanted[id] = struct{}{}
+	}
+	latest := make(map[int64]execution.CaseRun, len(caseVersionIDs))
+	for _, row := range f.rows {
+		if row.Status == execution.CaseRunSuperseded {
+			continue
+		}
+		if _, ok := wanted[row.CaseVersionID]; !ok {
+			continue
+		}
+		if existing, ok := latest[row.CaseVersionID]; !ok || row.ID > existing.ID {
+			latest[row.CaseVersionID] = row
+		}
+	}
+	return latest, nil
 }
 
 func (f *fakeCaseRunRepo) get(t interface{ Fatalf(string, ...any) }, id int64) execution.CaseRun {
@@ -501,8 +521,9 @@ func (f *fakeHumanRepo) Expire(context.Context, time.Time) ([]execution.HumanReq
 // --- readers / ports -------------------------------------------------------
 
 type fakeExecutionCaseReader struct {
-	snapshot execution.CaseSnapshot
-	err      error
+	snapshot   execution.CaseSnapshot
+	executable []execution.CaseSnapshot
+	err        error
 }
 
 func (f *fakeExecutionCaseReader) GetCaseVersion(context.Context, int64, int64) (execution.CaseSnapshot, error) {
@@ -513,7 +534,7 @@ func (f *fakeExecutionCaseReader) GetCaseVersion(context.Context, int64, int64) 
 }
 
 func (f *fakeExecutionCaseReader) ListExecutable(context.Context, int64) ([]execution.CaseSnapshot, error) {
-	return nil, nil
+	return append([]execution.CaseSnapshot(nil), f.executable...), nil
 }
 
 func (f *fakeExecutionCaseReader) ResolveReplacement(context.Context, int64, int64) (execution.CaseSnapshot, bool, error) {

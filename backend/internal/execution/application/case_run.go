@@ -912,6 +912,43 @@ func runResultTokens(usage map[string]int) int {
 	return total
 }
 
+// visualSymptomReached reports whether the visual assertion that left an
+// inconclusive run without a usable result was actually reached before the run
+// ended: the case step holding it was recorded, or the visual assertion itself
+// has a result row. A run stopped by the budget before that step has no visual
+// observation at all, so visual_assertion_not_run is only the downstream
+// symptom of the stop (QA release T9); a reached step (or a recorded visual
+// result) is a real observation and keeps its own cause/next action.
+func visualSymptomReached(caseSnapshot execution.CaseSnapshot, steps []execution.StepResult, assertions []execution.AssertionResult) bool {
+	recordedSteps := make(map[int]struct{}, len(steps))
+	for _, step := range steps {
+		recordedSteps[step.Seq] = struct{}{}
+	}
+	visualResults := make(map[[2]int]execution.AssertionResult, len(assertions))
+	for _, result := range assertions {
+		if result.Kind == execution.AssertionKindVisual {
+			visualResults[[2]int{result.StepSeq, result.AssertionSeq}] = result
+		}
+	}
+	for _, visual := range caseSnapshot.Assertions {
+		if visual.Kind != execution.AssertionKindVisual {
+			continue
+		}
+		result, hasResult := visualResults[[2]int{visual.StepSeq, visual.AssertionSeq}]
+		if hasResult && result.Verdict != execution.AssertionSkipped && result.Verdict != execution.AssertionInconclusive {
+			continue // this visual assertion did not block the verdict
+		}
+		if hasResult {
+			return true
+		}
+		_, stepRecorded := recordedSteps[visual.StepSeq]
+		return stepRecorded
+	}
+	// Visual results outside the snapshot (a legacy snapshot read) mean the
+	// visual tool ran, so the symptom was observed.
+	return len(visualResults) > 0
+}
+
 func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome, usage *execution.CaseRunUsage) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
@@ -940,9 +977,17 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	}
 	// An incomplete verdict explains why the run stopped and offers the human
 	// next step. The verdict itself is untouched: a 1/4-step run stays
-	// inconclusive, never a pass.
+	// inconclusive, never a pass. The explicit settlement cause also wins over a
+	// downstream visual symptom: when a budget/turn stop happens before the
+	// visual step, the aggregate sees no visual result and reports
+	// visual_assertion_not_run even though the baseline/config may be healthy
+	// (QA release T9). That symptom is only trusted once the run actually
+	// reached the visual step; before that the budget/agent stop is the real
+	// cause and rerun is the human next step.
 	explained := incomplete != nil && status == execution.CaseRunInconclusive &&
-		summary.VerdictReason == execution.VerdictReasonIncomplete
+		(summary.VerdictReason == execution.VerdictReasonIncomplete ||
+			(summary.VerdictReason == execution.VerdictReasonVisualAssertionNotRun &&
+				!visualSymptomReached(caseSnapshot, steps, assertions)))
 	if explained {
 		summary.TerminalCause = incomplete.Cause
 		summary.NextAction = incomplete.NextAction
