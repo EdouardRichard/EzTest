@@ -17,7 +17,7 @@ import (
 
 // Version steward tool descriptions (contracts/agent-profiles-tools.md §7.3).
 const (
-	requirementGoalMetDescription  = "Submit a requirement closure proposal. The server recomputes the eight closure checks inside the transaction; on success it writes the closure round, marks the requirement closed and publishes requirement.closed. On failure it returns 409 with details.failed (check name -> count) and changes nothing."
+	requirementGoalMetDescription  = "Submit a requirement closure proposal. The server recomputes the nine closure checks inside the transaction; on success it writes the closure round, marks the requirement closed and publishes requirement.closed. On failure it returns 409 with details.failed (check name -> count) and changes nothing."
 	versionCloseReadDescription    = "Read the version close predicate as an eight-item snapshot (version_running, no_blocking_work_items, no_active_intents, no_open_human_requests, no_active_waves, no_inflight_case_runs, requirements_closed, version_report_published) with the failing check names. Read-only."
 	versionCloseProposeDescription = "Submit a version close proposal. The server re-evaluates the close predicate inside the version row-lock transaction; on success it moves running -> completed, writes closed_at/close_reason/close_run_id and publishes version.closed. On failure it returns 409 with details.failed and changes nothing."
 )
@@ -160,13 +160,14 @@ func (s *ClosureService) checkRequirementToolScope(ctx context.Context, scope to
 	return nil
 }
 
-// closureChecksPayload renders the eight requirement closure checks with their
+// closureChecksPayload renders the nine requirement closure checks with their
 // frozen JSON keys.
 func closureChecksPayload(checks version.ClosureChecks) map[string]bool {
 	return map[string]bool{
 		version.ClosureCheckRequirementState:   checks.RequirementState,
 		version.ClosureCheckHasConfirmedCase:   checks.HasConfirmedCase,
 		version.ClosureCheckCasesTerminal:      checks.CasesTerminal,
+		version.ClosureCheckCasesVerified:      checks.CasesVerified,
 		version.ClosureCheckFailedCaseHasIssue: checks.FailedCaseHasIssue,
 		version.ClosureCheckNoOpenWork:         checks.NoOpenWork,
 		version.ClosureCheckNoActiveIntent:     checks.NoActiveIntent,

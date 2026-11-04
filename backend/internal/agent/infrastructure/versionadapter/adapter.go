@@ -44,6 +44,9 @@ type ConversationService interface {
 	Messages(ctx context.Context, versionID, conversationID int64, after int64, limit int) ([]versionapp.MessageView, bool, error)
 	Summary(ctx context.Context, conversationID int64) (versionapp.SummaryView, error)
 	AppendAssistantMessageWithReply(ctx context.Context, conversationID int64, parts []version.MessagePart, runID int64, replyToMessageID *int64) (versionapp.MessageView, error)
+	// UpsertJobCard appends or rewrites the single job_card part of one
+	// background job in the conversation (one card per job).
+	UpsertJobCard(ctx context.Context, versionID, conversationID int64, card version.MessagePart) (versionapp.MessageView, bool, error)
 	UpdateSummary(ctx context.Context, conversationID int64, summary string, pinned []string) error
 	// ListReconcilable feeds the P1 reconciler (conversation opening/reply/curate).
 	ListReconcilable(ctx context.Context, limit int) ([]versionapp.ReconcilerConversation, error)
@@ -64,8 +67,11 @@ type AttachmentService interface {
 	Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
 	GetAttachmentInfo(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
 	ListAttachments(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
-	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error)
+	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
 	AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
+	// ReadImage resolves an image part data_ref (content SHA-256) into the
+	// original bytes plus the sniffed MIME for the vision model.
+	ReadImage(ctx context.Context, dataRef string) (mime string, data []byte, err error)
 	// ListPendingForIngest feeds the P1 reconciler (attachment.ingest).
 	ListPendingForIngest(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
 }
@@ -112,6 +118,7 @@ var (
 	_ agentapp.ConversationPort        = (*Adapter)(nil)
 	_ agentapp.VersionReader           = (*Adapter)(nil)
 	_ agentapp.AttachmentReader        = (*Adapter)(nil)
+	_ agentapp.ImageLoader             = (*Adapter)(nil)
 	_ agentapp.ContentWriter           = (*Adapter)(nil)
 	_ agentapp.ConversationReader      = (*Adapter)(nil)
 	_ agentapp.PendingAttachmentReader = (*Adapter)(nil)

@@ -111,10 +111,12 @@ func (f *fakeVersionCloseWorkItems) BlockingWorkItems(_ context.Context, _ int64
 }
 
 type fakeVersionCloseExecution struct {
-	intents  int
-	waves    int
-	inflight int
-	err      error
+	intents          int
+	waves            int
+	inflight         int
+	hasExecutionData bool
+	unconfirmedCases int
+	err              error
 }
 
 func (f *fakeVersionCloseExecution) CountActiveIntents(_ context.Context, _ int64) (int, error) {
@@ -136,6 +138,16 @@ func (f *fakeVersionCloseExecution) CountInflightCaseRuns(_ context.Context, _ i
 		return 0, f.err
 	}
 	return f.inflight, nil
+}
+
+func (f *fakeVersionCloseExecution) ExecutionCoverage(_ context.Context, _ int64) (versionapp.VersionExecutionCoverage, error) {
+	if f.err != nil {
+		return versionapp.VersionExecutionCoverage{}, f.err
+	}
+	return versionapp.VersionExecutionCoverage{
+		HasExecutionData: f.hasExecutionData,
+		UnconfirmedCases: f.unconfirmedCases,
+	}, nil
 }
 
 type fakeVersionCloseHumanRequests struct {
@@ -292,6 +304,7 @@ func configurePassingVersionClose(env *versionCloseEnv, versionID int64) {
 		{ID: 1002, VersionID: versionID, Status: version.RequirementObsolete},
 	}
 	env.reports.report = publishedVersionReportStatus()
+	env.execution.hasExecutionData = true
 }
 
 func versionCloseEventTypes(events []eventingapp.Event) []string {
@@ -487,6 +500,67 @@ func TestVersionCloseServiceReportMustBeCurrent(t *testing.T) {
 				t.Fatal("version completed with a non-current report")
 			}
 		})
+	}
+}
+
+// TestCompletionEventOnce pins completion side-effect idempotency: a close
+// writes exactly one event per channel and exactly one audit entry, and a
+// repeated completion callback is a conflict that writes nothing again.
+func TestCompletionEventOnce(t *testing.T) {
+	env := newVersionCloseEnv(t)
+	configurePassingVersionClose(env, 701)
+
+	if _, err := env.svc.Close(requestContext(), 701, 0, "delivery complete"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	types := versionCloseEventTypes(env.events.events)
+	if len(types) != 2 || types[0] != "version.closed" || types[1] != "version.closed" {
+		t.Fatalf("completion events = %#v, want one version.closed per channel", types)
+	}
+	if channels := versionCloseEventChannels(env.events.events); len(channels) != 2 ||
+		channels[0] != "version:701" || channels[1] != "system" {
+		t.Fatalf("completion event channels = %#v", channels)
+	}
+	if len(env.audit.events) != 1 || env.audit.events[0].Action != "version.closed" {
+		t.Fatalf("completion audit = %#v, want exactly one version.closed", env.audit.events)
+	}
+
+	// A stale/repeated completion callback must not emit a second event or
+	// audit entry (the version is already completed).
+	if _, err := env.svc.Close(requestContext(), 701, 0, "delivery complete"); err == nil {
+		t.Fatal("repeated completion callback succeeded")
+	}
+	if len(env.events.events) != 2 || len(env.audit.events) != 1 {
+		t.Fatalf("repeated completion wrote side effects: events=%#v audit=%#v",
+			env.events.events, env.audit.events)
+	}
+}
+
+// TestVersionCloseServiceBlocksOnUnexecutedCases pins the completion input
+// wiring: a version without execution data or with confirmed-but-unexecuted
+// cases cannot complete, and the frozen check names carry the failure counts.
+func TestVersionCloseServiceBlocksOnUnexecutedCases(t *testing.T) {
+	env := newVersionCloseEnv(t)
+	configurePassingVersionClose(env, 701)
+	env.execution.hasExecutionData = false
+	env.execution.unconfirmedCases = 2
+
+	_, err := env.svc.Close(requestContext(), 701, 0, "try")
+	var predicateErr *version.ErrVersionClosePredicateFailed
+	if !errors.As(err, &predicateErr) {
+		t.Fatalf("Close error = %v, want ErrVersionClosePredicateFailed", err)
+	}
+	if predicateErr.Failed[version.VersionCloseCheckNoInflightCaseRuns] != 2 {
+		t.Fatalf("failed = %#v, want no_inflight_case_runs=2", predicateErr.Failed)
+	}
+	if predicateErr.Failed[version.VersionCloseCheckVersionReportPublished] != 1 {
+		t.Fatalf("failed = %#v, want version_report_published=1", predicateErr.Failed)
+	}
+	if stored := env.versions.versions[701]; stored.Status != version.StatusRunning || stored.ClosedAt != nil {
+		t.Fatalf("version changed on predicate failure: %#v", stored)
+	}
+	if len(env.events.events) != 0 || len(env.audit.events) != 0 {
+		t.Fatalf("failed close wrote side effects: %#v/%#v", env.events.events, env.audit.events)
 	}
 }
 

@@ -10,14 +10,18 @@ import { Dialog } from "@/components/ui/Dialog"
 import { InlineError } from "@/components/ui/ErrorState"
 import { Field } from "@/components/ui/Field"
 import { Textarea } from "@/components/ui/Textarea"
+import type { StageView } from "@/features/design/types"
 import { listHumanRequests } from "@/features/execution/api"
 import { formatDateTime } from "@/lib/format"
 
 import { reopenVersion } from "./api"
+import { stageLabel } from "./stage"
 import type { Version, VersionStatus } from "./types"
 
 export type VersionHeaderProps = {
   version: Version
+  /** Deterministic stage projection; null while loading/unavailable. */
+  stage?: StageView | null
   /** Called with the server projection after a successful manual reopen. */
   onReopened?: (version: Version) => void
   /** Opens the shared topbar/page todo drawer. */
@@ -36,7 +40,12 @@ const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
  * `completed → running` reopen dialog (reason required). Reopening calls the
  * frozen version API and hands the refreshed projection back to the page.
  */
-export function VersionHeader({ version, onReopened, onOpenTodo }: VersionHeaderProps) {
+export function VersionHeader({
+  version,
+  stage = null,
+  onReopened,
+  onOpenTodo,
+}: VersionHeaderProps) {
   const [openTodoCount, setOpenTodoCount] = useState<number | null>(null)
   const [reopenOpen, setReopenOpen] = useState(false)
   const [reason, setReason] = useState("")
@@ -87,6 +96,14 @@ export function VersionHeader({ version, onReopened, onOpenTodo }: VersionHeader
       <div className="flex flex-wrap items-center gap-2">
         <h1 className="text-xl font-semibold text-foreground">{version.title}</h1>
         <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+        {stage !== null ? (
+          <span
+            data-testid="version-stage"
+            title={`阶段更新时间：${formatDateTime(stage.stage_entered_at)}`}
+          >
+            <Badge tone="info">阶段 · {stageLabel(stage.stage)}</Badge>
+          </span>
+        ) : null}
         {version.auto_design_new_requirements ? <Badge tone="info">新需求自动设计</Badge> : null}
       </div>
 
@@ -164,7 +181,7 @@ export function VersionHeader({ version, onReopened, onOpenTodo }: VersionHeader
           if (!submitting) setReopenOpen(false)
         }}
         title="重新打开版本"
-        description="版本将从已完成回到运行中，清空收尾信息并把最新版本报告置为过期。"
+        description="版本将从已完成回到运行中，清空收尾信息并把最新版本报告置为过期。已闭环需求不会自动重新打开；如需重跑已闭环需求，请在「需求与澄清」页重新打开该需求。"
         footer={
           <>
             <Button

@@ -5,11 +5,52 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
+// ProfileKeyKnowledgeCurator is the 0.2.1 profile that executes the
+// knowledge_curator role (spec §5.2, D19). The role catalog previously had no
+// dedicated profile, which left the structured retrieval tools registered but
+// unreachable by any model: the runner exposes profile.AllowedTools ∩ role
+// whitelist. Seeding the profile makes knowledge.search/knowledge.read
+// model-visible while the runtime RoleToolGuard keeps the surface closed.
+const ProfileKeyKnowledgeCurator = "knowledge_curator"
+
+// knowledgeCuratorProfilePrompt is the role boundary prompt plus the
+// [profile:<key>] marker used by the deterministic fake LLM and the prompt
+// revision seed (the [role:<key>] marker is kept for the role catalog).
+const knowledgeCuratorProfilePrompt = knowledgeCuratorRolePrompt + "\n[profile:knowledge_curator]"
+
+// knowledgeCuratorProfileTools is the knowledge_curator profile surface: the
+// structured retrieval tools (spec §10.2) plus the existing draft writer. Every
+// entry is also in the role's closed whitelist.
+var knowledgeCuratorProfileTools = []string{
+	tools.ToolKnowledgeSearch,
+	tools.ToolKnowledgeRead,
+	tools.ToolKnowledgePropose,
+}
+
+// P7Profiles returns the 0.2.1 profile seeds introduced by the knowledge
+// increment. They are appended by Profiles() after the frozen P1–P4 seeds; the
+// agent-center catalog keeps its frozen 14-profile team map and intentionally
+// does not list this background role profile, but the admin profile surface and
+// the startup seed do.
+func P7Profiles() []agent.AgentProfile {
+	return []agent.AgentProfile{
+		{
+			Key:          ProfileKeyKnowledgeCurator,
+			Name:         "知识维护员",
+			SystemPrompt: knowledgeCuratorProfilePrompt,
+			AllowedTools: append([]string(nil), knowledgeCuratorProfileTools...),
+			Budgets:      agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 180, HardSeconds: 300},
+			Enabled:      true,
+		},
+	}
+}
+
 // p7ProfileTools is the P7 allowed_tools increment per existing profile key
-// (contracts/agent-profiles-tools.md §10.1). P7 adds no profile; the increment
-// is merged into the startup seed as a union so P1–P6 tools keep their
-// positions and administrator edits are still never overwritten. Only the
-// Host/Scout/Planner/Author profiles may propose knowledge.
+// (contracts/agent-profiles-tools.md §10.1). P7 adds the draft writer to the
+// profiles that may propose knowledge; the knowledge_curator profile (above) is
+// a new seed rather than an increment. The increment is merged into the startup
+// seed as a union so P1–P6 tools keep their positions and administrator edits
+// are still never overwritten.
 var p7ProfileTools = map[string][]string{
 	ProfileKeyClarificationHost: {
 		tools.ToolKnowledgePropose,

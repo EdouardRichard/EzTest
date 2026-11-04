@@ -47,6 +47,20 @@ const (
 // Repository is the item persistence port (owned by the domain).
 type Repository = knowledge.Repository
 
+// TopKRetriever is the optional repository capability behind knowledge.search
+// (spec §10.2). A repository that implements it provides a trigram-similarity
+// top-K candidate stage for a text query; Retrieve then falls back to the
+// ListForInjection ts_rank window when the top-K stage returns no candidates.
+// It is optional so a repository without pg_trgm support (or the in-memory test
+// doubles) keeps working with the documented window semantics. Inject never
+// uses it.
+type TopKRetriever interface {
+	// SearchTopK returns up to query.Limit approved candidates visible to the
+	// requested system keys and bindings, ranked by text similarity desc then
+	// id desc. An empty query may return the id-desc recent window.
+	SearchTopK(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error)
+}
+
 // UsageRepository appends knowledge_usage rows. Insert must be best-effort
 // from the caller's point of view; the caller ignores the returned error.
 type UsageRepository interface {
@@ -85,13 +99,15 @@ type Clock = clock.Clock
 type IDGenerator = platformid.Generator
 
 // ListFilter narrows one knowledge page. Zero-value string fields mean no
-// filter; Limit is normalized by the service.
+// filter; Limit is normalized by the service. Bindings filters rows by
+// structured SUT bindings (system/environment/page/api/account role).
 type ListFilter struct {
 	Scope     knowledge.Scope
 	Status    knowledge.Status
 	SystemKey string
 	Tag       string
 	Query     string
+	Bindings  knowledge.Bindings
 	Cursor    int64
 	Limit     int
 }
@@ -105,13 +121,15 @@ type Page struct {
 }
 
 // CreateInput is one POST /api/knowledge/items request (or a knowledge.propose
-// tool call after conversion). AgentRunID is optional audit metadata.
+// tool call after conversion). AgentRunID is optional audit metadata. Bindings
+// are the structured SUT identifiers the item is bound to.
 type CreateInput struct {
 	Title                 string
 	Content               string
 	Scope                 knowledge.Scope
 	SystemKey             *string
 	Tags                  []string
+	Bindings              knowledge.Bindings
 	SourceVersionID       *int64
 	PromotedFromVersionID *int64
 	AgentRunID            *int64

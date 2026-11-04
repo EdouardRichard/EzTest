@@ -236,11 +236,21 @@ func (f *fakeRepo) GetPage(_ context.Context, id int64) (resource.Page, error) {
 	return resource.Page{}, resource.ErrNotFound
 }
 
+// pageURLKey mirrors the sut_page unique key: (environment_id, normalized_url).
+func pageURLKey(page resource.Page) string {
+	normalized, err := resource.NormalizePageURL(page.URL)
+	if err != nil {
+		return page.URL
+	}
+	return normalized
+}
+
 func (f *fakeRepo) CreatePage(_ context.Context, page resource.Page) (resource.Page, error) {
 	f.createPageCalls++
+	key := pageURLKey(page)
 	for _, item := range f.pages {
-		if item.EnvironmentID == page.EnvironmentID && item.RouteTemplate == page.RouteTemplate {
-			return resource.Page{}, resource.ErrDuplicate
+		if item.EnvironmentID == page.EnvironmentID && pageURLKey(item) == key {
+			return resource.Page{}, resource.ErrPageURLDuplicate
 		}
 	}
 	f.pages = append(f.pages, page)
@@ -252,9 +262,10 @@ func (f *fakeRepo) UpdatePage(_ context.Context, page resource.Page) (resource.P
 		if item.ID != page.ID {
 			continue
 		}
+		key := pageURLKey(page)
 		for _, other := range f.pages {
-			if other.ID != page.ID && other.EnvironmentID == page.EnvironmentID && other.RouteTemplate == page.RouteTemplate {
-				return resource.Page{}, resource.ErrDuplicate
+			if other.ID != page.ID && other.EnvironmentID == page.EnvironmentID && pageURLKey(other) == key {
+				return resource.Page{}, resource.ErrPageURLDuplicate
 			}
 		}
 		f.pages[i] = page
@@ -1041,7 +1052,10 @@ func TestCreatePageValidationAndDuplicate(t *testing.T) {
 		t.Fatalf("CreatePage: %v", err)
 	}
 	_, err = h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders dup", URL: "https://app.example.com/orders?x=1"}, 42)
-	assertAPIError(t, err, 409, "conflict")
+	apiErr = assertAPIError(t, err, 409, "page_url_exists")
+	if apiErr.Details["field"] != "url" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
 }
 
 func TestUpdatePageAppliesPatch(t *testing.T) {
@@ -1076,9 +1090,167 @@ func TestUpdatePageAppliesPatch(t *testing.T) {
 		t.Fatalf("CreatePage second: %v", err)
 	}
 	_ = second
+	// route_template is no longer unique: reusing one is accepted.
 	route = "/orders/list"
-	_, err = h.svc.UpdatePage(context.Background(), 1004, PagePatch{RouteTemplate: &route}, 42)
-	assertAPIError(t, err, 409, "conflict")
+	reused, err := h.svc.UpdatePage(context.Background(), 1004, PagePatch{RouteTemplate: &route}, 42)
+	if err != nil {
+		t.Fatalf("reusing a route_template must be accepted: %v", err)
+	}
+	if reused.RouteTemplate != "/orders/list" {
+		t.Fatalf("route = %q", reused.RouteTemplate)
+	}
+	// The normalized URL is the unique key now.
+	duplicateURL := "https://app.example.com/orders?dup=1"
+	_, err = h.svc.UpdatePage(context.Background(), 1004, PagePatch{URL: &duplicateURL}, 42)
+	apiErr := assertAPIError(t, err, 409, "page_url_exists")
+	if apiErr.Details["field"] != "url" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+}
+
+func TestPageSameTemplateDifferentUrlsAccepted(t *testing.T) {
+	h := newHarness()
+	newPageEnv(t, h)
+	ctx := context.Background()
+
+	first, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		Name: "Orders list", URL: "https://app.example.com/orders", RouteTemplate: "/shared",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreatePage first: %v", err)
+	}
+	second, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		Name: "Users list", URL: "https://app.example.com/users", RouteTemplate: "/shared",
+	}, 42)
+	if err != nil {
+		t.Fatalf("same route_template with a different URL must be accepted: %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("pages share id %q", first.ID)
+	}
+
+	// Omitted route templates derive from each URL and are likewise independent.
+	for _, tc := range []struct{ name, url, route string }{
+		{name: "Reports", url: "https://app.example.com/reports", route: "/reports"},
+		{name: "Settings", url: "https://app.example.com/settings", route: "/settings"},
+	} {
+		view, err := h.svc.CreatePage(ctx, 1002, PageInput{Name: tc.name, URL: tc.url}, 42)
+		if err != nil {
+			t.Fatalf("CreatePage(%s): %v", tc.url, err)
+		}
+		if view.RouteTemplate != tc.route {
+			t.Fatalf("route for %s = %q, want %q", tc.url, view.RouteTemplate, tc.route)
+		}
+	}
+	if len(h.repo.pages) != 4 {
+		t.Fatalf("stored pages = %d, want 4", len(h.repo.pages))
+	}
+
+	// Clearing route_template re-derives it from the page URL.
+	empty := ""
+	updated, err := h.svc.UpdatePage(ctx, 1004, PagePatch{RouteTemplate: &empty}, 42)
+	if err != nil {
+		t.Fatalf("empty route_template must derive from the URL: %v", err)
+	}
+	if updated.RouteTemplate != "/users" {
+		t.Fatalf("derived route = %q, want /users", updated.RouteTemplate)
+	}
+}
+
+func TestDuplicateNormalizedUrlFieldError(t *testing.T) {
+	h := newHarness()
+	newPageEnv(t, h)
+	ctx := context.Background()
+
+	if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		Name: "Orders", URL: "https://app.example.com/orders?state=open",
+	}, 42); err != nil {
+		t.Fatalf("CreatePage first: %v", err)
+	}
+
+	_, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		Name: "Orders duplicate",
+		URL:  "HTTPS://APP.EXAMPLE.COM:443/orders/?tab=all",
+	}, 42)
+	apiErr := assertAPIError(t, err, 409, "page_url_exists")
+	if apiErr.Details["field"] != "url" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+
+	users, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		Name: "Users", URL: "https://app.example.com/users",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreatePage users: %v", err)
+	}
+	usersID, err := strconv.ParseInt(users.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse users id %q: %v", users.ID, err)
+	}
+	duplicateURL := "https://app.example.com/orders?dup=1"
+	_, err = h.svc.UpdatePage(ctx, usersID, PagePatch{URL: &duplicateURL}, 42)
+	apiErr = assertAPIError(t, err, 409, "page_url_exists")
+	if apiErr.Details["field"] != "url" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+}
+
+func TestSpaHashAndQueryNormalization(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("query is dropped", func(t *testing.T) {
+		h := newHarness()
+		newPageEnv(t, h)
+		if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+			Name: "Orders", URL: "https://app.example.com/orders?state=open",
+		}, 42); err != nil {
+			t.Fatalf("CreatePage: %v", err)
+		}
+		_, err := h.svc.CreatePage(ctx, 1002, PageInput{
+			Name: "Orders other query", URL: "https://app.example.com/orders?state=closed",
+		}, 42)
+		apiErr := assertAPIError(t, err, 409, "page_url_exists")
+		if apiErr.Details["field"] != "url" {
+			t.Fatalf("details = %#v", apiErr.Details)
+		}
+	})
+
+	t.Run("hash is kept", func(t *testing.T) {
+		h := newHarness()
+		newPageEnv(t, h)
+		first, err := h.svc.CreatePage(ctx, 1002, PageInput{
+			Name: "Orders list", URL: "https://app.example.com/orders#/list",
+		}, 42)
+		if err != nil {
+			t.Fatalf("CreatePage first: %v", err)
+		}
+		second, err := h.svc.CreatePage(ctx, 1002, PageInput{
+			Name: "Orders detail", URL: "https://app.example.com/orders#/detail",
+		}, 42)
+		if err != nil {
+			t.Fatalf("different SPA hashes are different pages: %v", err)
+		}
+		if first.ID == second.ID || len(h.repo.pages) != 2 {
+			t.Fatalf("pages = %#v", h.repo.pages)
+		}
+	})
+
+	t.Run("same hash with different query is duplicate", func(t *testing.T) {
+		h := newHarness()
+		newPageEnv(t, h)
+		if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+			Name: "Orders list", URL: "https://app.example.com/orders?x=1#/list",
+		}, 42); err != nil {
+			t.Fatalf("CreatePage: %v", err)
+		}
+		_, err := h.svc.CreatePage(ctx, 1002, PageInput{
+			Name: "Orders list other query", URL: "https://app.example.com/orders?y=2#/list",
+		}, 42)
+		apiErr := assertAPIError(t, err, 409, "page_url_exists")
+		if apiErr.Details["field"] != "url" {
+			t.Fatalf("details = %#v", apiErr.Details)
+		}
+	})
 }
 
 func TestImportPagesSkipsDuplicates(t *testing.T) {

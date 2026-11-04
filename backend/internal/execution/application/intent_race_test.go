@@ -69,6 +69,17 @@ func TestCreateManualRejectsClosedRequirement(t *testing.T) {
 	if !strings.Contains(strings.ToLower(apiErr.Message), "requirement") {
 		t.Fatalf("message = %q, want a requirement hint", apiErr.Message)
 	}
+	// Task 112: the retry 409 must be actionable in the UI: which requirement is
+	// closed and what the user should do next (open it, then retry).
+	if apiErr.Details["reason"] != "requirement_closed" {
+		t.Fatalf("details.reason = %#v, want requirement_closed", apiErr.Details["reason"])
+	}
+	if apiErr.Details["requirement_id"] != "2300" {
+		t.Fatalf("details.requirement_id = %#v, want the closed requirement 2300", apiErr.Details["requirement_id"])
+	}
+	if next, _ := apiErr.Details["next_action"].(string); !strings.Contains(next, "需求") {
+		t.Fatalf("details.next_action = %#v, want reopen guidance", apiErr.Details["next_action"])
+	}
 	if f.intents.createC != 0 {
 		t.Fatalf("intents created = %d, want 0", f.intents.createC)
 	}

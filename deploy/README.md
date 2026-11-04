@@ -48,15 +48,19 @@ passes the repository `.env` to both API containers with `env_file`.
 | `POSTGRES_USER` | postgres + api URL | Defaults to `eztest`. |
 | `POSTGRES_PASSWORD` | postgres + api URL | **Required**, no default. |
 | `POSTGRES_DB` | postgres + api URL | Defaults to `eztest`. |
+| `EZTEST_INITIAL_ADMIN_PASSWORD` | api | **Required while the user table is empty.** Seeds the single administrator; no built-in default. |
 | `EZTEST_EXECUTOR_TOKEN` | api + executor | **Required**; shared Bearer token. |
 | `EZTEST_RENDER_TOKEN` | renderer (optional) | PDF renderer Bearer token. Defaults to the DB seed value `eztest-dev-render-token`; if set, also set the DB setting `report.render_token` to the same value. |
 | `NEXT_PUBLIC_API_BASE_URL` | web build | Build-time browser API origin, default `http://localhost:13333`. |
 | `EZTEST_API_URL` | executor (optional) | Leave unset for pull-only registration; see below. |
 
-The API process itself still reads only the four documented 0.2 startup
-variables: `EZTEST_DATABASE_URL`, `EZTEST_API_PORT`, `EZTEST_WEB_PORT`,
-`EZTEST_EXECUTOR_PORT`. Every other runtime knob lives in the database settings
-center (paths, renderer URL/token, instance heartbeat, snowflake node id, ...).
+The API process itself reads only the four documented 0.2 runtime variables
+(`EZTEST_DATABASE_URL`, `EZTEST_API_PORT`, `EZTEST_WEB_PORT`,
+`EZTEST_EXECUTOR_PORT`). A fresh database additionally needs
+`EZTEST_INITIAL_ADMIN_PASSWORD` (passed through `env_file`) to seed the first
+administrator; there is no built-in default. Every other runtime knob lives in
+the database settings center (paths, renderer URL/token, instance heartbeat,
+snowflake node id, ...).
 
 ### Renderer settings (required for PDFs)
 

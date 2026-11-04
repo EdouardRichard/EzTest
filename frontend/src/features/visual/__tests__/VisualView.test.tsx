@@ -166,7 +166,30 @@ describe("VisualView", () => {
     expect(screen.getByRole("button", { name: "批准基线" })).toBeInTheDocument()
   })
 
-  it("creates a retest intent from a case-run row", async () => {
+  it("reruns a passed case with purpose=manual because it has no failed result", async () => {
+    render(<VisualView versionId="2001" />)
+    await screen.findByText("退款 T+1 到账")
+
+    fireEvent.click(screen.getByRole("button", { name: "复测" }))
+
+    await waitFor(() =>
+      expect(executionApi.createIntent).toHaveBeenCalledWith("2001", {
+        case_version_id: "7002",
+        purpose: "manual",
+      }),
+    )
+    expect(await screen.findByRole("status")).toHaveTextContent("已创建手动执行意图")
+  })
+
+  it("keeps retest for a failed case-run row", async () => {
+    executionApi.listCaseRuns.mockResolvedValue([
+      {
+        ...passedCaseRunFixture,
+        id: "9302",
+        status: "failed",
+        failure_class: "application",
+      },
+    ])
     render(<VisualView versionId="2001" />)
     await screen.findByText("退款 T+1 到账")
 

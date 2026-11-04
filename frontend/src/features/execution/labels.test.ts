@@ -61,7 +61,7 @@ describe("failure class labels", () => {
       model: "模型异常",
       automation: "自动化异常",
       timeout: "超时",
-      executor_lost: "执行器丢失",
+      executor_lost: "执行器失联",
       blocked: "无法开始",
       unknown: "未知",
     })
@@ -71,7 +71,7 @@ describe("failure class labels", () => {
   it("renders a dash for the empty (no class) value", () => {
     expect(failureClassLabel("")).toBe("—")
     expect(failureClassLabel("application")).toBe("应用缺陷")
-    expect(failureClassLabel("executor_lost" as FailureClass)).toBe("执行器丢失")
+    expect(failureClassLabel("executor_lost" as FailureClass)).toBe("执行器失联")
   })
 })
 

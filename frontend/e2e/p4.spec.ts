@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { type APIRequestContext, expect, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 /**
  * P4 delivery-workspace browser E2E (real LLM; spec §12 S10 / scripts/p4-e2e.ps1).
  *
@@ -78,8 +80,8 @@ async function api<T>(
 
 async function login(request: APIRequestContext): Promise<string> {
   const response = await api<{ data: { token: string } }>(request, "POST", "/api/auth/login", {
-    username: "admin",
-    password: "admin123",
+    username: ADMIN_USERNAME,
+    password: ADMIN_PASSWORD,
   })
   return response.data.token
 }
@@ -184,8 +186,8 @@ async function expectNoHorizontalOverflow(page: import("@playwright/test").Page)
 
 async function loginUI(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/login")
-  await page.fill("#username", process.env.EZTEST_E2E_USERNAME?.trim() || "admin")
-  await page.fill("#password", process.env.EZTEST_E2E_PASSWORD?.trim() || "admin123")
+  await page.fill("#username", ADMIN_USERNAME)
+  await page.fill("#password", ADMIN_PASSWORD)
   await page.getByRole("button", { name: "登录" }).click()
   await page.waitForURL("**/versions")
 }

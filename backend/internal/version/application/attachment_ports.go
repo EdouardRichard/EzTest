@@ -35,3 +35,10 @@ type ContentStore interface {
 type TextExtractor interface {
 	Extract(ctx context.Context, name, mime string, r io.Reader) (string, error)
 }
+
+// ImageProber sniffs image bytes and returns the detected MIME plus the pixel
+// dimensions. It is implemented by the attachments infrastructure (PNG/JPEG/
+// WebP header probing); the application never decodes image pixels itself.
+type ImageProber interface {
+	Probe(ctx context.Context, declaredMIME string, data []byte) (mime string, width, height int, err error)
+}

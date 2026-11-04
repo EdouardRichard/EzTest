@@ -98,6 +98,24 @@ func TestRegistryRejectsUnknownParametersIncludingVersionID(t *testing.T) {
 	}
 }
 
+// TestRequirementDraftCreateDescriptionStatesSourceIdempotency keeps the
+// model-facing contract aligned with the server-side source-key uniqueness: the
+// same FR/NFR source in one version resolves to the existing draft instead of a
+// second one.
+func TestRequirementDraftCreateDescriptionStatesSourceIdempotency(t *testing.T) {
+	registry := NewP1Registry(Deps{})
+	tool, ok := registry.Get(ToolRequirementDraftCreate)
+	if !ok {
+		t.Fatalf("registry has no %s", ToolRequirementDraftCreate)
+	}
+	description := tool.Description()
+	for _, want := range []string{"同一版本", "来源编号", "不会重复"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("%s description lacks %q:\n%s", ToolRequirementDraftCreate, want, description)
+		}
+	}
+}
+
 func asToolError(t *testing.T, err error) *Error {
 	t.Helper()
 	if err == nil {

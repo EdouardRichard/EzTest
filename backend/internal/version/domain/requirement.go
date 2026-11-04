@@ -63,9 +63,10 @@ const (
 
 // Requirement domain errors.
 var (
-	ErrRequirementNotFound = errors.New("requirement not found")
-	ErrStateConflict       = errors.New("requirement state conflict")
-	ErrRelationDuplicate   = errors.New("requirement relation already exists")
+	ErrRequirementNotFound  = errors.New("requirement not found")
+	ErrStateConflict        = errors.New("requirement state conflict")
+	ErrRelationDuplicate    = errors.New("requirement relation already exists")
+	ErrRequirementDuplicate = errors.New("requirement source already exists")
 )
 
 // Requirement is the logical requirement object. Its content lives in an
@@ -77,6 +78,7 @@ type Requirement struct {
 	CurrentVersionID     *int64
 	Status               RequirementStatus
 	TargetVersionSUTIDs  []string
+	SourceKey            string
 	ClosedAt             *time.Time
 	ClosedByRunID        *int64
 	CreatedBy            *int64
@@ -171,6 +173,10 @@ type RequirementAggregate struct {
 type RequirementRepository interface {
 	Create(ctx context.Context, requirement Requirement, revision RequirementVersion) error
 	Get(ctx context.Context, versionID, requirementID int64) (RequirementAggregate, error)
+	// GetBySourceKey returns the single non-obsolete requirement carrying a
+	// deterministic source key in one version. Implementations must report
+	// ErrRequirementNotFound when no active requirement matches.
+	GetBySourceKey(ctx context.Context, versionID int64, sourceKey string) (RequirementAggregate, error)
 	GetMany(ctx context.Context, versionID int64, ids []int64) ([]RequirementWithCurrent, error)
 	List(ctx context.Context, versionID int64, status RequirementStatus, limit int, beforeID *int64) ([]RequirementListItem, error)
 	AddRevision(ctx context.Context, requirement Requirement, revision RequirementVersion) error
@@ -178,6 +184,11 @@ type RequirementRepository interface {
 	BatchConfirm(ctx context.Context, requirements []Requirement, confirmations []Confirmation) error
 	CreateRelation(ctx context.Context, relation Relation) error
 	ListRelations(ctx context.Context, versionID, requirementID int64) ([]Relation, error)
+	// SetStatus projects a lifecycle status change that does not add a revision
+	// (duplicate-draft deletion / merge retirement). Implementations must not
+	// rewrite content and must report ErrRequirementNotFound for a foreign or
+	// missing requirement.
+	SetStatus(ctx context.Context, versionID, requirementID int64, status RequirementStatus, updatedAt time.Time) error
 }
 
 // CanTransitionRequirement reports whether the requirement state machine allows

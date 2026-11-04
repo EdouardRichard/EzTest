@@ -155,7 +155,14 @@ function normalizeSessionStorage(input) {
   return result
 }
 
-function splitStorageState(input) {
+/**
+ * Normalizes a storageState-shaped input into the Playwright context option
+ * (`cookies` + `origins[].localStorage`) and the sessionStorage map a context
+ * must re-seed through an init script. Exported for the P9 explore runtime:
+ * session reuse must read and write exactly the same shape as execution
+ * contexts.
+ */
+export function splitStorageState(input) {
   if (input === undefined || input === null) {
     return { storageState: undefined, sessionStorage: {} }
   }
@@ -182,6 +189,57 @@ function splitStorageState(input) {
   }
   const hasState = Array.isArray(input.cookies) || Array.isArray(input.origins)
   return { storageState: hasState ? { cookies, origins } : undefined, sessionStorage }
+}
+
+function sessionStorageFromPage(page) {
+  return page.evaluate(() => {
+    const items = []
+    for (let index = 0; index < window.sessionStorage.length; index += 1) {
+      const name = window.sessionStorage.key(index)
+      if (name !== null) {
+        items.push({ name, value: window.sessionStorage.getItem(name) ?? "" })
+      }
+    }
+    return items
+  })
+}
+
+/**
+ * Captures one page's session in the same shape `createContext` accepts
+ * (`storage_state`), including the current origin's sessionStorage. Playwright's
+ * context.storageState() covers cookies and localStorage only, so the
+ * sessionStorage pass runs here and is merged into the matching origin entry.
+ *
+ * The returned object is sensitive: it carries the SUT's session cookies. The
+ * explore runtime only returns it on an explicit request and the backend must
+ * keep it out of prompts, facts and knowledge.
+ */
+export async function captureStorageState(page) {
+  const state = await page.context().storageState()
+  const origins = new Map()
+  for (const origin of state.origins ?? []) {
+    origins.set(origin.origin, {
+      origin: origin.origin,
+      localStorage: origin.localStorage ?? [],
+      sessionStorage: [],
+    })
+  }
+  let pageOrigin = null
+  try {
+    pageOrigin = new URL(page.url()).origin
+  } catch {
+    pageOrigin = null
+  }
+  if (pageOrigin) {
+    const record = origins.get(pageOrigin) ?? {
+      origin: pageOrigin,
+      localStorage: [],
+      sessionStorage: [],
+    }
+    record.sessionStorage = await sessionStorageFromPage(page).catch(() => [])
+    origins.set(pageOrigin, record)
+  }
+  return { cookies: state.cookies ?? [], origins: [...origins.values()] }
 }
 
 // Device scale factor bounds of design spec §9.3. Playwright fixes the DPR at

@@ -365,7 +365,7 @@ try {
     Add-Type -AssemblyName System.Net.Http | Out-Null
     $http = New-Object System.Net.Http.HttpClient
     $http.Timeout = [TimeSpan]::FromSeconds(600)
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "[REDACTED]" }
     Assert-Status $login @(200) "POST /api/auth/login (bootstrap)"
     $token = [string]$login.Json.data.token
     foreach ($setting in @(
@@ -416,7 +416,7 @@ try {
     if (Test-Port $ApiPort) { throw "API port $ApiPort is still in use after stopping the bootstrap API" }
     Log "start the acceptance API"
     Start-Api
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "[REDACTED]" }
     Assert-Status $login @(200) "POST /api/auth/login"
     $token = [string]$login.Json.data.token
     Wait-For -TimeoutSeconds 120 -Description "executor registered active" -Condition {

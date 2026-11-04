@@ -140,10 +140,11 @@ func TestProfilesMergesP4WithoutDuplicatingOrOverwriting(t *testing.T) {
 	base := append(agentapp.P1Profiles(), agentapp.P2Profiles()...)
 	base = append(base, agentapp.P3Profiles()...)
 	p4 := agentapp.P4Profiles()
+	p7 := agentapp.P7Profiles()
 	merged := agentapp.Profiles()
 
-	if len(merged) != len(base)+len(p4) {
-		t.Fatalf("merged profiles = %d, want %d", len(merged), len(base)+len(p4))
+	if len(merged) != len(base)+len(p4)+len(p7) {
+		t.Fatalf("merged profiles = %d, want %d", len(merged), len(base)+len(p4)+len(p7))
 	}
 	for i := range base {
 		if !reflect.DeepEqual(merged[i], base[i]) {
@@ -153,6 +154,12 @@ func TestProfilesMergesP4WithoutDuplicatingOrOverwriting(t *testing.T) {
 	for i := range p4 {
 		if !reflect.DeepEqual(merged[len(base)+i], p4[i]) {
 			t.Fatalf("Profiles() P4 profile at %d = %#v, want %#v", len(base)+i, merged[len(base)+i], p4[i])
+		}
+	}
+	for i := range p7 {
+		index := len(base) + len(p4) + i
+		if !reflect.DeepEqual(merged[index], p7[i]) {
+			t.Fatalf("Profiles() P7 profile at %d = %#v, want %#v", index, merged[index], p7[i])
 		}
 	}
 	seen := map[string]bool{}

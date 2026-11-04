@@ -80,27 +80,27 @@ func TestP2ProfileSeeds(t *testing.T) {
 				tools.ToolCaseGraphPropose, tools.ToolAttachmentList, tools.ToolAttachmentReadText,
 				tools.ToolSUTList, tools.ToolSUTPageList,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_host]",
-			mustSay: []string{"不确认", "draft"},
+			mustSay: []string{"不确认", "draft", "同一轮内立即", "expected", "视觉基线", "不要用 visual"},
 		},
 		agentapp.ProfileKeyDesignPlanner: {
 			tools: []string{
 				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolContextTeamRoomRead,
-				tools.ToolRequirementRead, tools.ToolDesignGraphRead,
+				tools.ToolRequirementRead, tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 6, SoftSeconds: 180, HardSeconds: 300},
+			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_planner]",
-			mustSay: []string{"范围"},
+			mustSay: []string{"范围", "case.graph_propose", "不要询问用户", "draft", "不能确认", "expected", "视觉基线", "不要用 visual"},
 		},
 		agentapp.ProfileKeyCaseAuthor: {
 			tools: []string{
 				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolRequirementRead,
 				tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose, tools.ToolSUTList, tools.ToolSUTPageList,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 300, HardSeconds: 600},
+			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:case_author]",
-			mustSay: []string{"draft", "不能确认"},
+			mustSay: []string{"draft", "不能确认", "视觉基线", "不要用 visual"},
 		},
 		agentapp.ProfileKeyDesignCritic: {
 			tools: []string{
@@ -108,7 +108,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
 			marker:  "[profile:design_critic]",
-			mustSay: []string{"内部", "不构成人工关卡"},
+			mustSay: []string{"内部", "不构成人工关卡", "视觉基线", "visual"},
 		},
 		agentapp.ProfileKeyDataPlanner: {
 			tools: []string{
@@ -203,7 +203,8 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles()) + len(agentapp.P3Profiles()) + len(agentapp.P4Profiles())
+	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles()) + len(agentapp.P3Profiles()) +
+		len(agentapp.P4Profiles()) + len(agentapp.P7Profiles())
 	if len(first) != wantTotal {
 		t.Fatalf("seeded = %d, want %d", len(first), wantTotal)
 	}

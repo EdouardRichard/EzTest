@@ -4,6 +4,8 @@ import { pathToFileURL } from "node:url"
 
 import { expect, type Locator, type Page, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 /**
  * P7 browser E2E against the real API/DB/Chrome, using the clone created by the
  * P7 API/DB acceptance run (`eztest_v02_p7`). No fake LLM and no fake executor:
@@ -19,8 +21,6 @@ import { expect, type Locator, type Page, test } from "@playwright/test"
  * preconditions the hardcoded ids used to pin (v2 appendix HTML + PDF, approved
  * knowledge items, a merged issue chain, recurrence_count >= 2).
  */
-const ADMIN_USER = process.env.EZTEST_E2E_ADMIN_USERNAME?.trim() || "admin"
-const ADMIN_PASSWORD = process.env.EZTEST_E2E_ADMIN_PASSWORD?.trim() || "admin123"
 const API_BASE_URL = (process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:13333").replace(
   /\/+$/,
   "",
@@ -100,7 +100,7 @@ async function apiLogin(): Promise<string> {
   const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASSWORD }),
+    body: JSON.stringify({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }),
   })
   if (!response.ok) {
     throw new Error(`P7 seed discovery: API login failed (HTTP ${response.status})`)
@@ -404,7 +404,7 @@ async function snapElement(locator: Locator, name: string): Promise<void> {
 
 async function loginUI(page: Page): Promise<void> {
   await page.goto("/login")
-  await page.getByLabel("用户名").fill(ADMIN_USER)
+  await page.getByLabel("用户名").fill(ADMIN_USERNAME)
   await page.getByLabel("密码").fill(ADMIN_PASSWORD)
   await page.getByRole("button", { name: "登录" }).click()
   await page.waitForURL((url) => !url.pathname.startsWith("/login"), { timeout: 30_000 })

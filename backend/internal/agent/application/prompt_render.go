@@ -9,12 +9,15 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// RenderPrompt renders a saved profile template with values generated from the
-// run's ContextInput. It fails (never half-renders) for unknown variables,
-// syntax errors or non-variable template actions; the runtime caller then
-// falls back to the built-in default body.
+// RenderPrompt renders a saved profile system prompt template with values
+// generated from the run's ContextInput. The system prompt is the cache-stable
+// provider prefix, so per-run variables (Now, TaskGoal, CaseTitle, execution
+// ids, ...) are rejected before rendering (Task 81). It fails (never
+// half-renders) for unknown variables, per-run variables, syntax errors or
+// non-variable template actions; the runtime caller then falls back to the
+// built-in default body.
 func RenderPrompt(profileKey, tmpl string, in ContextInput) (string, error) {
-	if err := agent.ValidatePromptTemplate(tmpl, PromptVariables(profileKey)); err != nil {
+	if err := agent.ValidateSystemPromptTemplate(tmpl, PromptVariables(profileKey)); err != nil {
 		return "", err
 	}
 	return renderPromptTemplate(profileKey, tmpl, promptValues(profileKey, in))
@@ -22,9 +25,10 @@ func RenderPrompt(profileKey, tmpl string, in ContextInput) (string, error) {
 
 // RenderPromptSample renders an admin preview with catalog example values and
 // the optional sample overrides. It validates the template against the same
-// variable catalog as a save; nothing is persisted.
+// system-prompt catalog and stability rules as a save, so an unsafe per-run
+// variable is rejected in the preview too; nothing is persisted.
 func RenderPromptSample(profileKey, tmpl string, sample map[string]string) (string, error) {
-	if err := agent.ValidatePromptTemplate(tmpl, PromptVariables(profileKey)); err != nil {
+	if err := agent.ValidateSystemPromptTemplate(tmpl, PromptVariables(profileKey)); err != nil {
 		return "", err
 	}
 	values := PromptSampleValues(profileKey)

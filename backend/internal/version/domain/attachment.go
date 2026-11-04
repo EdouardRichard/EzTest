@@ -3,6 +3,7 @@ package version
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path"
 	"strings"
 	"time"
@@ -19,6 +20,10 @@ const (
 	MaxOOXMLBytes          int64 = 20 << 20 // uncompressed OOXML XML cap
 	MaxPDFPages                  = 50
 	MaxAttachmentNameRunes       = 255
+	// Image parts are sent to vision models, so their pixel dimensions are
+	// bounded instead of downscaled by the server (spec §8.3).
+	MaxImageDimension = 16384
+	MaxImagePixels    = 40_000_000
 )
 
 // Attachment extraction statuses.
@@ -50,8 +55,10 @@ type AttachmentKind string
 const (
 	AttachmentMarkdown    AttachmentKind = "markdown"
 	AttachmentText        AttachmentKind = "text"
+	AttachmentHTML        AttachmentKind = "html"
 	AttachmentDOCX        AttachmentKind = "docx"
 	AttachmentPPTX        AttachmentKind = "pptx"
+	AttachmentXLSX        AttachmentKind = "xlsx"
 	AttachmentPDF         AttachmentKind = "pdf"
 	AttachmentImage       AttachmentKind = "image"
 	AttachmentUnsupported AttachmentKind = "unsupported"
@@ -63,7 +70,8 @@ func (k AttachmentKind) IsImage() bool { return k == AttachmentImage }
 // SupportsExtraction reports whether the parser can extract text for the kind.
 func (k AttachmentKind) SupportsExtraction() bool {
 	switch k {
-	case AttachmentMarkdown, AttachmentText, AttachmentDOCX, AttachmentPPTX, AttachmentPDF:
+	case AttachmentMarkdown, AttachmentText, AttachmentHTML, AttachmentDOCX,
+		AttachmentPPTX, AttachmentXLSX, AttachmentPDF:
 		return true
 	default:
 		return false
@@ -74,9 +82,17 @@ func (k AttachmentKind) SupportsExtraction() bool {
 // wrap these so the application can classify the extraction outcome.
 var (
 	ErrUnsupportedAttachmentFormat = errors.New("unsupported attachment format")
-	ErrAttachmentTooLarge          = errors.New("attachment exceeds the extraction limit")
-	ErrAttachmentCorrupt           = errors.New("attachment cannot be parsed")
-	ErrAttachmentNotFound          = errors.New("attachment not found")
+	// ErrUnsupportedLegacyAttachment is raised for the pre-OOXML .doc/.ppt
+	// binary formats. It wraps ErrUnsupportedAttachmentFormat so callers that
+	// only classify unsupported formats keep working, while callers can still
+	// surface the save-as hint to users.
+	ErrUnsupportedLegacyAttachment = fmt.Errorf(
+		"%w: legacy .doc/.ppt is not supported; save it as .docx/.pptx and upload again",
+		ErrUnsupportedAttachmentFormat,
+	)
+	ErrAttachmentTooLarge = errors.New("attachment exceeds the extraction limit")
+	ErrAttachmentCorrupt  = errors.New("attachment cannot be parsed")
+	ErrAttachmentNotFound = errors.New("attachment not found")
 )
 
 // Attachment is the runtime state of one message attachment. The binary lives
@@ -109,7 +125,15 @@ type AttachmentRepository interface {
 	GetInVersion(ctx context.Context, versionID, attachmentID int64) (Attachment, error)
 	ListByRequirement(ctx context.Context, versionID, requirementID int64) ([]Attachment, error)
 	ListByConversation(ctx context.Context, versionID, conversationID int64) ([]Attachment, error)
+	// ListUnlinkedByVersion returns attachment rows that were pre-registered
+	// before their message was inserted (nil conversation_message_id). The
+	// message post preflight reuses them on retry instead of inserting a
+	// duplicate row or re-running extraction.
+	ListUnlinkedByVersion(ctx context.Context, versionID int64) ([]Attachment, error)
 	ConversationExists(ctx context.Context, versionID, conversationID int64) (bool, error)
+	// LinkMessage binds a pre-registered attachment row to the message that was
+	// inserted after the extraction pending gate passed.
+	LinkMessage(ctx context.Context, attachmentID, messageID int64, updatedAt time.Time) error
 	MarkProcessing(ctx context.Context, attachmentID int64, updatedAt time.Time) (bool, error)
 	MarkDone(ctx context.Context, attachmentID int64, extractedContentRefID int64, updatedAt time.Time) error
 	MarkFailed(ctx context.Context, attachmentID int64, code, message string, updatedAt time.Time) error
@@ -140,7 +164,8 @@ func SanitizeAttachmentName(raw string) (string, error) {
 }
 
 // DetectAttachmentKind classifies an attachment by extension, falling back to
-// the MIME type. Legacy binary .doc/.ppt are deliberately unsupported.
+// the MIME type. Legacy binary .doc/.ppt are deliberately unsupported; see
+// IsLegacyOfficeFormat for the explicit rejection path.
 func DetectAttachmentKind(name, mime string) AttachmentKind {
 	name = strings.ToLower(strings.TrimSpace(name))
 	mime = strings.ToLower(strings.TrimSpace(mime))
@@ -149,10 +174,14 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 		return AttachmentMarkdown
 	case strings.HasSuffix(name, ".txt"):
 		return AttachmentText
+	case strings.HasSuffix(name, ".html"), strings.HasSuffix(name, ".htm"):
+		return AttachmentHTML
 	case strings.HasSuffix(name, ".docx"):
 		return AttachmentDOCX
 	case strings.HasSuffix(name, ".pptx"):
 		return AttachmentPPTX
+	case strings.HasSuffix(name, ".xlsx"):
+		return AttachmentXLSX
 	case strings.HasSuffix(name, ".pdf"):
 		return AttachmentPDF
 	case strings.HasSuffix(name, ".png"), strings.HasSuffix(name, ".jpg"), strings.HasSuffix(name, ".jpeg"),
@@ -166,15 +195,55 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 		return AttachmentImage
 	case mime == "text/plain", mime == "text/markdown":
 		return AttachmentText
+	case mime == "text/html":
+		return AttachmentHTML
 	case mime == "application/pdf":
 		return AttachmentPDF
 	case strings.Contains(mime, "wordprocessingml"):
 		return AttachmentDOCX
 	case strings.Contains(mime, "presentationml"):
 		return AttachmentPPTX
+	case strings.Contains(mime, "spreadsheetml"):
+		return AttachmentXLSX
 	default:
 		return AttachmentUnsupported
 	}
+}
+
+// IsLegacyOfficeFormat reports whether name is a pre-OOXML Word (.doc) or
+// PowerPoint (.ppt) file. They are rejected instead of parsed so the user is
+// told to save as .docx/.pptx. .xls is outside the supported matrix too, but
+// the spec only requires the .doc/.ppt save-as hint, so .xls keeps the generic
+// unsupported-format error.
+func IsLegacyOfficeFormat(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".ppt")
+}
+
+// IsSupportedImageMIME reports whether an image part can be sent to a vision
+// model (spec §8.1/§8.3: png/jpg/webp).
+func IsSupportedImageMIME(mime string) bool {
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "image/png", "image/jpeg", "image/jpg", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateImageDimensions enforces the vision image bounds. The server rejects
+// rather than silently downscales oversized images (spec §8.3).
+func ValidateImageDimensions(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return platform.Invalid("width", "image width and height must be positive")
+	}
+	if width > MaxImageDimension || height > MaxImageDimension {
+		return platform.Invalid("width", "image dimensions must not exceed 16384 pixels")
+	}
+	if int64(width)*int64(height) > MaxImagePixels {
+		return platform.Invalid("width", "image must not exceed 40 megapixels")
+	}
+	return nil
 }
 
 // PendingAttachment is the ingest reconciler row: a pending attachment plus the

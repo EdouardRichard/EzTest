@@ -1,16 +1,20 @@
 package agentapp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -20,6 +24,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Runner defaults. Profile budgets and the frozen P0 settings override them.
@@ -31,7 +36,6 @@ const (
 	finishTimeout             = 5 * time.Second
 	toolResultHeadRunes       = 2000
 	scoutAttachmentTextRunes  = 4000
-	contextSectionSystem      = "system"
 )
 
 // RunnerDeps wires the P1 agent run loop.
@@ -46,9 +50,13 @@ type RunnerDeps struct {
 	Conversation ConversationPort
 	Versions     VersionReader
 	Attachments  AttachmentReader
-	TeamRoom     TeamRoomPort
-	Content      ContentWriter
-	ToolDeps     tools.Deps
+	// Images resolves image part data_refs into model-ready bytes. It may be nil
+	// for deployments without vision; an image-bearing message then fails the
+	// run instead of silently dropping the image.
+	Images   ImageLoader
+	TeamRoom TeamRoomPort
+	Content  ContentWriter
+	ToolDeps tools.Deps
 	// TaskProvider loads the P3 execution task snapshot (execute.case runs).
 	// P1/P2 work items may leave it nil.
 	TaskProvider TaskContextProvider
@@ -69,6 +77,23 @@ type RunnerDeps struct {
 	// KnowledgeUsage records knowledge_usage rows after the context packet is
 	// persisted. Nil disables usage accounting.
 	KnowledgeUsage KnowledgeUsageRecorder
+	// Briefing builds the derived version briefing appended to the cache-first
+	// context on every round (Task 48). Nil keeps the version pack facts only;
+	// the assembler prefix and transcript are still rendered.
+	Briefing *agentcontext.BriefingBuilder
+	// Clarification applies the clarifying→requirement_review edge when a
+	// clarification host turn explicitly requests requirement confirmation. Nil
+	// keeps the stage unchanged (deployments without the version stage machine).
+	Clarification ClarificationConverger
+	// DesignRounds consumes the design.cases stage-entry work item: it opens
+	// the design round for the hard-gate-confirmed requirements and returns the
+	// design conversation the job card is projected into (Task 65). Nil fails a
+	// design.cases item as a configuration error.
+	DesignRounds DesignRoundStarter
+	// Batches consumes the execute.batch stage-entry work item: it triggers the
+	// execution planner for the confirmed case batch. Nil fails an execute.batch
+	// item as a configuration error.
+	Batches BatchStarter
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -93,6 +118,7 @@ type Runner struct {
 	conversation         ConversationPort
 	versions             VersionReader
 	attachments          AttachmentReader
+	images               ImageLoader
 	teamRoom             TeamRoomPort
 	content              ContentWriter
 	toolDeps             tools.Deps
@@ -106,6 +132,11 @@ type Runner struct {
 	load                 *load.Counter
 	instanceID           string
 	builder              *ContextBuilder
+	briefing             *agentcontext.BriefingBuilder
+	assembler            *agentcontext.Assembler
+	clarification        ClarificationConverger
+	designRounds         DesignRoundStarter
+	batches              BatchStarter
 }
 
 // NewRunner wires the agent runner.
@@ -125,6 +156,7 @@ func NewRunner(deps RunnerDeps) *Runner {
 		conversation:         deps.Conversation,
 		versions:             deps.Versions,
 		attachments:          deps.Attachments,
+		images:               deps.Images,
 		teamRoom:             deps.TeamRoom,
 		content:              deps.Content,
 		toolDeps:             deps.ToolDeps,
@@ -138,6 +170,11 @@ func NewRunner(deps RunnerDeps) *Runner {
 		load:                 deps.Load,
 		instanceID:           deps.InstanceID,
 		builder:              NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
+		briefing:             deps.Briefing,
+		assembler:            agentcontext.NewAssembler(),
+		clarification:        deps.Clarification,
+		designRounds:         deps.DesignRounds,
+		batches:              deps.Batches,
 	}
 }
 
@@ -148,6 +185,14 @@ type RunResult struct {
 	Turns          int
 	Usage          map[string]int
 	TerminalReason string
+	// SettlementCause is the stable budget cause (turn_budget/time_budget/
+	// token_budget) when the run's last turn was the tool-less settlement turn.
+	// It stays empty when the model finished on its own. The execution context
+	// uses it to explain an incomplete case run instead of silently aggregating.
+	SettlementCause string
+	// SettlementDetail is one bounded, secret-free sentence with the observed
+	// usage and the limit that triggered the settlement.
+	SettlementDetail string
 }
 
 // RunError classifies a run failure for the worker retry policy.
@@ -347,37 +392,248 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	return payload, nil
 }
 
+// ParseWorkItemIDList reads one JSON array of decimal IDs from a work item's
+// 0.2.1 inputs object (for example design.cases requirement_ids or execute.batch
+// case_ids). IDs may be decimal strings (canonical) or JSON numbers; duplicates
+// are removed and the input order is preserved. A missing/null field is nil.
+func ParseWorkItemIDList(raw json.RawMessage, field string) ([]int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("work item inputs must be a JSON object")
+	}
+	value, ok := object[field]
+	if !ok {
+		return nil, nil
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(value, &entries); err != nil {
+		return nil, fmt.Errorf("work item inputs %s must be an array of decimal IDs", field)
+	}
+	ids := make([]int64, 0, len(entries))
+	seen := make(map[int64]struct{}, len(entries))
+	for index, entry := range entries {
+		text := strings.TrimSpace(string(entry))
+		if strings.HasPrefix(text, `"`) {
+			var decoded string
+			if err := json.Unmarshal(entry, &decoded); err != nil {
+				return nil, fmt.Errorf("work item inputs %s[%d] must be a decimal ID", field, index)
+			}
+			text = strings.TrimSpace(decoded)
+		}
+		parsed, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("work item inputs %s[%d] must be a positive decimal ID", field, index)
+		}
+		if _, duplicate := seen[parsed]; duplicate {
+			continue
+		}
+		seen[parsed] = struct{}{}
+		ids = append(ids, parsed)
+	}
+	return ids, nil
+}
+
 // runState carries one run's mutable state.
 type runState struct {
-	item             agent.WorkItem
-	payload          WorkItemPayload
-	profile          agent.AgentProfile
-	run              agent.AgentRun
-	input            ContextInput
-	packet           agent.ContextPacket
-	model            llmapp.ModelInfo
-	registry         *tools.Registry
-	definitions      []llmapp.ToolDefinition
-	budget           int
-	softDeadline     time.Time
-	turns            int
-	usage            map[string]int
-	messages         []llmapp.ChatMessage
-	userContent      string
-	cards            []ConversationPart
+	item    agent.WorkItem
+	payload WorkItemPayload
+	profile agent.AgentProfile
+	run     agent.AgentRun
+	input   ContextInput
+	packet  agent.ContextPacket
+	// contextPacket is the cache-first packet the current prompt was rendered
+	// from. It is persisted through EncodeContextPacket and its cache
+	// bookkeeping is overwritten by the provider usage (contract §18.2.6).
+	contextPacket agentcontext.ContextPacket
+	// cacheStatsApplied guards the at-most-one context.cache_stats event per
+	// run (contracts/events.md §18.2 #8).
+	cacheStatsApplied bool
+	// providerCacheTokens/providerCacheHit carry the provider-reported cache
+	// booking across a boundary rebuild so a compacted packet persisted after
+	// the first model turn keeps the authoritative statistics.
+	providerCacheTokens   int
+	providerCacheHit      bool
+	providerCacheReported bool
+	model                 llmapp.ModelInfo
+	registry              *tools.Registry
+	definitions           []llmapp.ToolDefinition
+	// roleTools is the intersection of the profile's allowed tools with the
+	// catalog role whitelist (R51); it is the surface exposed to the model.
+	roleTools tools.ToolSet
+	// roleMapped reports whether the profile maps to one of the seven catalog
+	// roles. Unmapped profiles keep their own frozen contract whitelist.
+	roleMapped bool
+	// roleGuard audits and rejects a call outside the role whitelist. Nil for
+	// profiles not mapped to one of the seven roles (they keep their own frozen
+	// contract whitelist).
+	roleGuard      *RoleToolGuard
+	budget         int
+	resourceBudget Budget
+	startedAt      time.Time
+	turns          int
+	usage          map[string]int
+	messages       []llmapp.ChatMessage
+	images         []llmapp.ChatImage
+	userContent    string
+	cards          []ConversationPart
+	// streamParts are the 0.2.1 UI streaming parts produced by this run
+	// (thinking/tool_call/error). They are written with the final assistant
+	// message as conversation_message_part rows and published on
+	// conversation.message. The job's own card is a separate assistant message
+	// owned by projectJobCard.
+	streamParts      []ConversationPart
 	conversationKind string
 	team             agent.Team
 	overflowHits     int
 	softNoted        bool
+	// settlementCause/settlementDetail describe the budget that opened the
+	// tool-less settlement turn. They survive into RunResult and, for a settled
+	// done run, into agent_run.terminal_reason so a 1/4-step stop is explainable.
+	settlementCause  string
+	settlementDetail string
+	// recordedSteps/recordedAssertions are the successful execution recording
+	// calls of this run (Task 98). The case executor's settlement turn uses them
+	// to name the assertions of already executed steps that still need a real
+	// result.
+	recordedSteps      map[int]string
+	recordedAssertions map[[2]int]struct{}
 }
 
-// Run executes one work item. On failure the agent_run row is already marked
-// failed/interrupted and the returned error carries the retry classification.
+// Run executes one work item and projects the job into its conversation as one
+// job_card: the start snapshot before the run begins, one progress snapshot per
+// completed turn and the terminal run outcome. The projection is best effort
+// and never changes the run verdict or the persisted work-item state.
+//
+// The 0.2.1 stage-entry kinds (design.cases/execute.batch) take the
+// deterministic path instead of a model run: they consume the contract item by
+// running the domain action and project the truthful terminal state.
 func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error) {
+	payload, payloadErr := ParseWorkItemPayload(item.Payload)
+	workType := WorkTypeForItem(item)
+	// A dispatcher-created stage-entry row carries the same value in the frozen
+	// type column (Normalize defaults Type=Kind). A synthetic row that only
+	// overrides Kind keeps the normal profile path so the frozen 0.2.0
+	// type/card semantics are not hijacked by a bookkeeping label.
+	stageEntry := IsStageEntryWorkType(workType) &&
+		strings.TrimSpace(item.Kind) == workType &&
+		(strings.TrimSpace(item.Type) == "" || strings.TrimSpace(item.Type) == workType)
+	item.Type = workType
+	switch {
+	case stageEntry && workType == agent.WorkItemKindDesignCases:
+		if payloadErr != nil {
+			return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: payloadErr}
+		}
+		return r.runDesignCases(ctx, item, payload)
+	case stageEntry && workType == agent.WorkItemKindExecuteBatch:
+		if payloadErr != nil {
+			return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: payloadErr}
+		}
+		return r.runExecuteBatch(ctx, item, payload)
+	}
+	if payloadErr == nil {
+		r.projectJobCard(ctx, item, payload, "running", 0, jobCardFailure{})
+	}
+	result, err := r.run(ctx, item)
+	if payloadErr == nil {
+		if status, ok := jobCardTerminalStatus(item, err); ok {
+			// The run context may already be cancelled; the terminal card is a
+			// short independent write like the other post-run write-backs.
+			finishCtx, cancel := context.WithTimeout(context.Background(), jobCardWriteTimeout)
+			failure := jobCardFailure{}
+			if status == "failed" {
+				failure = jobCardFailureDetails(err)
+			}
+			r.projectJobCard(finishCtx, item, payload, status, result.Turns, failure)
+			cancel()
+		}
+	}
+	return result, err
+}
+
+// runDesignCases consumes the design.cases stage-entry work item: it opens the
+// design round for the requirements confirmed by the hard gate and projects the
+// job card into the design conversation. The round's case-author tasks produce
+// the actual drafts through case.graph_propose; this job only owns the entry.
+func (r *Runner) runDesignCases(ctx context.Context, item agent.WorkItem, payload WorkItemPayload) (RunResult, error) {
+	if r.designRounds == nil {
+		return RunResult{}, &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no design round starter"),
+		}
+	}
+	requirementIDs, err := ParseWorkItemIDList(item.Inputs, "requirement_ids")
+	if err != nil {
+		return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: err}
+	}
+	conversationID, startErr := r.designRounds.StartDesignRound(ctx, item.VersionID, requirementIDs)
+	if startErr != nil {
+		return RunResult{}, stageEntryRunError(startErr)
+	}
+	if conversationID > 0 {
+		// The card lives in the design conversation the round just opened. The
+		// run context may already be cancelled, so use a short independent
+		// write like the other post-run projections.
+		payload.ConversationID = conversationID
+		finishCtx, cancel := context.WithTimeout(context.Background(), jobCardWriteTimeout)
+		r.projectJobCard(finishCtx, item, payload, "done", 0, jobCardFailure{})
+		cancel()
+	}
+	return RunResult{Status: agent.AgentRunDone}, nil
+}
+
+// runExecuteBatch consumes the execute.batch stage-entry work item: the
+// deterministic execution planner owns the batch, so the agent runtime only
+// triggers it for the confirmed cases and completes the entry job.
+func (r *Runner) runExecuteBatch(ctx context.Context, item agent.WorkItem, payload WorkItemPayload) (RunResult, error) {
+	if r.batches == nil {
+		return RunResult{}, &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no execution batch starter"),
+		}
+	}
+	caseIDs, err := ParseWorkItemIDList(item.Inputs, "case_ids")
+	if err != nil {
+		return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: err}
+	}
+	if startErr := r.batches.StartBatch(ctx, item.VersionID, caseIDs); startErr != nil {
+		return RunResult{}, stageEntryRunError(startErr)
+	}
+	return RunResult{Status: agent.AgentRunDone}, nil
+}
+
+// stageEntryRunError classifies a deterministic stage-entry failure: a typed
+// 4xx (bad scope/ownership) cannot succeed on another attempt, transport and
+// server failures are retried through the normal work-item backoff.
+func stageEntryRunError(err error) *RunError {
+	retryable := true
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Status {
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+			retryable = false
+		default:
+			retryable = apiErr.Retryable || apiErr.Status >= http.StatusInternalServerError
+		}
+	}
+	return &RunError{Reason: "stage_entry_failed", Retryable: retryable, Cause: err}
+}
+
+// run is Run without the conversation job-card projection. On failure the
+// agent_run row is already marked failed/interrupted and the returned error
+// carries the retry classification.
+func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error) {
 	if r.load != nil {
 		r.load.Inc()
 		defer r.load.Dec()
 	}
+	// The 0.2.1 Kind is authoritative when present; legacy rows keep Type.
+	item.Type = WorkTypeForItem(item)
 	profileKey, ok := ProfileKeyForWorkType(item.Type)
 	if !ok {
 		return RunResult{}, &RunError{
@@ -417,7 +673,50 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		}
 	}
 
-	run, err := r.createRun(ctx, item, profile, payload)
+	// An image on the triggering message requires a vision-capable model
+	// (spec §7.3/§8.3). Detect image parts before resolving so the single gate
+	// is ResolveModel(..., Vision:true); the typed 400 happens before any image
+	// bytes are loaded and before the run row is created.
+	imageRefs, err := r.triggerImageRefs(ctx, item, payload)
+	if err != nil {
+		r.recordPreDispatchFailure(ctx, item, profile, payload, err)
+		return RunResult{}, err
+	}
+	requirements := modelRequirements(profile)
+	if len(imageRefs) > 0 {
+		requirements = append(requirements, llmapp.ModelRequirements{Vision: true})
+	}
+	// Task 55: the conversation-level 0.2.1 model override (a user-initiated
+	// switch) takes precedence over the profile-bound model; an empty override
+	// keeps the profile binding, and an empty profile model stays the config
+	// default. The override is loaded before resolution and validated by the
+	// same ResolveModel capability gate; an override that no longer resolves
+	// fails the run and is never swapped for another model (D24).
+	modelOverride := ""
+	if payload.ConversationID > 0 && r.conversation != nil {
+		override, overrideErr := r.conversation.ModelOverride(ctx, item.VersionID, payload.ConversationID)
+		if overrideErr != nil {
+			runErr := &RunError{Reason: "tool_failure", Retryable: true, Cause: overrideErr}
+			r.recordPreDispatchFailure(ctx, item, profile, payload, runErr)
+			return RunResult{}, runErr
+		}
+		modelOverride = strings.TrimSpace(override)
+	}
+	requestedModel := profileModel(profile)
+	if modelOverride != "" {
+		requestedModel = modelOverride
+	}
+	// Resolve the model before creating the run so agent_run records the model
+	// and config actually used (spec §7.3). Capability validation happens in
+	// ResolveModel against the role's tool needs.
+	modelInfo, err := r.chat.ResolveModel(ctx, 0, requestedModel, requirements...)
+	if err != nil {
+		runErr := resolveRunError(err)
+		r.recordPreDispatchFailure(ctx, item, profile, payload, runErr)
+		return RunResult{}, runErr
+	}
+
+	run, err := r.createRun(ctx, item, profile, payload, modelInfo)
 	if err != nil {
 		return RunResult{}, &RunError{Reason: "run_create_failed", Retryable: true, Cause: err}
 	}
@@ -426,9 +725,12 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		payload:          payload,
 		profile:          profile,
 		run:              run,
+		model:            modelInfo,
 		usage:            map[string]int{},
 		conversationKind: conversationKind,
 		team:             teamForProfile(profileKey),
+		resourceBudget:   r.resourceBudget(item, profile),
+		startedAt:        run.StartedAt,
 	}
 
 	hard := time.Duration(r.hardSeconds(profile)) * time.Second
@@ -440,6 +742,12 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		r.runCanceller.RegisterRun(state.payload.CaseRunID, cancel)
 		defer r.runCanceller.ClearRun(state.payload.CaseRunID)
 	}
+
+	images, err := r.loadTriggerImages(runCtx, imageRefs)
+	if err != nil {
+		return r.fail(runCtx, state, err)
+	}
+	state.images = images
 
 	if err := r.prepare(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
@@ -473,7 +781,7 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.finalizeRequirement(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
 	}
-	return r.finish(state, agent.AgentRunDone, "", false)
+	return r.finish(state, agent.AgentRunDone, "", false, Failure{})
 }
 
 // finalizeReport runs the report finalizer hook for report tasks. It is a
@@ -540,13 +848,33 @@ func (r *Runner) finalizeRequirement(ctx context.Context, state *runState) error
 	return nil
 }
 
-func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload) (agent.AgentRun, error) {
+func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, model llmapp.ModelInfo) (agent.AgentRun, error) {
+	run, err := r.buildRun(item, profile, payload, model)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
+	stored, err := r.repo.CreateRun(ctx, run)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
+	return stored, nil
+}
+
+// buildRun builds the immutable part of one agent_run attempt. The caller owns
+// the status: a dispatch-ready run is running, a pre-dispatch failure is
+// recorded with its terminal snapshot.
+func (r *Runner) buildRun(item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, model llmapp.ModelInfo) (agent.AgentRun, error) {
 	if r.ids == nil {
 		return agent.AgentRun{}, errors.New("agent runner has no ID generator")
 	}
 	run := agent.AgentRun{
 		ID:            r.ids.Next(),
 		ProfileKey:    profile.Key,
+		Model:         model.Model,
+		ConfigID:      model.ConfigID,
+		FallbackFrom:  model.FallbackFrom,
+		Tokens:        map[string]int{},
+		Cache:         map[string]int{},
 		WorkItemID:    &item.ID,
 		Status:        agent.AgentRunRunning,
 		OwnerInstance: r.instanceID,
@@ -558,11 +886,56 @@ func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile age
 		conversationID := payload.ConversationID
 		run.ConversationID = &conversationID
 	}
-	stored, err := r.repo.CreateRun(ctx, run)
-	if err != nil {
-		return agent.AgentRun{}, err
+	return run, nil
+}
+
+// recordPreDispatchFailure persists one failed agent_run for a conversation
+// attempt that stopped before createRun (trigger-message/image read, model
+// override read, or model capability resolution). The Agent center runs list is
+// backed by agent_run rows; without this snapshot a conversation job that fails
+// at zero steps is invisible there even though the thread shows a failed card
+// (Task 75 / admin B1). The insert is best effort and never changes the run
+// verdict.
+func (r *Runner) recordPreDispatchFailure(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, cause error) {
+	if r == nil || r.repo == nil || payload.ConversationID <= 0 {
+		return
 	}
-	return stored, nil
+	run, err := r.buildRun(item, profile, payload, llmapp.ModelInfo{})
+	if err != nil {
+		return
+	}
+	run.Status = agent.AgentRunFailed
+	reason := runTerminalReason(cause)
+	run.TerminalReason = &reason
+	finishedAt := r.now()
+	run.FinishedAt = &finishedAt
+	if _, err := r.repo.CreateRun(ctx, run); err != nil && r.logger != nil {
+		r.logger.Warn("agent runner: record pre-dispatch failed run failed",
+			"work_item_id", item.ID, "conversation_id", payload.ConversationID, "error", err)
+	}
+}
+
+// runTerminalReason is the stable terminal_reason of a pre-dispatch failure: the
+// classified RunError reason normally, and the typed platform error code when
+// the run stopped at model resolution (resolveRunError keeps the generic
+// ai_unavailable reason). Never empty.
+func runTerminalReason(err error) string {
+	var runErr *RunError
+	if errors.As(err, &runErr) {
+		if reason := strings.TrimSpace(runErr.Reason); reason != "" && reason != "ai_unavailable" {
+			return reason
+		}
+	}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		if code := strings.TrimSpace(apiErr.Code); code != "" {
+			return code
+		}
+	}
+	if runErr != nil && strings.TrimSpace(runErr.Reason) != "" {
+		return strings.TrimSpace(runErr.Reason)
+	}
+	return "model_error"
 }
 
 // prepare loads the version/conversation context, resolves the model, persists
@@ -589,13 +962,33 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		if err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
+		messages := conversationMessages(snapshot.Messages)
+		designConversation := strings.EqualFold(strings.TrimSpace(state.conversationKind), "design")
+		if isDesignAuthoringWorkType(state.item.Type) {
+			// Task 79: a background design author works from the work-item scope,
+			// requirement.read and design.graph_read. Replaying the shared design
+			// thread would replay every previous author's UI projection and grow
+			// the prompt with the round; keep only the human instructions.
+			messages = designAuthoringHistory(messages)
+		} else if designConversation {
+			// The design Host chat still needs its own recent turns, but not the
+			// whole background-author transcript that S3 appends to the thread.
+			messages = designHostHistory(messages)
+		}
 		state.input.Conversation = ConversationContext{
 			Summary:        snapshot.Summary,
 			PinnedFacts:    snapshot.PinnedFacts,
-			RecentMessages: conversationMessages(snapshot.Messages),
+			RecentMessages: messages,
 		}
 	}
 	state.input.TeamRoom = r.teamRoomContext(ctx, state.item.VersionID, state.team)
+	if isDesignAuthoringWorkType(state.item.Type) ||
+		strings.EqualFold(strings.TrimSpace(state.conversationKind), "design") {
+		// The team room is where every author projects its own result: replaying
+		// the full post bodies turns the shared room into a second unbounded
+		// prompt. Keep the digest and only the newest, clipped posts.
+		state.input.TeamRoom = boundDesignAuthoringTeamRoom(state.input.TeamRoom)
+	}
 
 	// P3 execution tasks are loaded from the execution context (CaseRunner),
 	// which also validates the case_run/intent and claims the dispatch lease.
@@ -609,8 +1002,16 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		}
 		executionTask, taskErr := r.taskProvider.ExecutionTask(ctx, state.item)
 		if taskErr != nil {
+			// A deterministic case-scope rejection (unresolvable step target,
+			// stale/superseded case, missing SUT binding) is a blocked case, not
+			// an automation failure: the execution context persists blocked with
+			// the concrete reason. Transient provider failures stay tool errors.
+			reason := "tool_failure"
+			if isCaseBlockedTaskError(taskErr) {
+				reason = "case_blocked"
+			}
 			return &RunError{
-				Reason:    "tool_failure",
+				Reason:    reason,
 				Retryable: executionTaskErrorRetryable(taskErr),
 				Cause:     taskErr,
 			}
@@ -618,12 +1019,9 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		state.input.Execution = &executionTask
 	}
 
-	modelInfo, err := r.chat.ResolveModel(ctx, profileModel(state.profile))
-	if err != nil {
-		return &RunError{Reason: "ai_unavailable", Retryable: true, Cause: err}
-	}
-	state.model = modelInfo
-	state.input.ModelBudget = ModelBudget{ContextWindow: modelInfo.ContextWindow, MaxOutput: modelInfo.MaxOutput}
+	// The model was resolved before the run row was created; the context packet
+	// only needs its budget metadata here.
+	state.input.ModelBudget = ModelBudget{ContextWindow: state.model.ContextWindow, MaxOutput: state.model.MaxOutput}
 	state.input.Profile = state.profile
 	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
@@ -647,38 +1045,57 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 
 	// P5/P7 compose the P1–P4 registry with the codeintel/visual/knowledge tool
 	// groups; the profile allowed_tools still select the surface each run may
-	// call.
+	// call, and R51 intersects that surface with the profile role's whitelist.
 	state.registry = tools.NewP7Registry(r.toolDepsForRun(state))
-	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
+	state.roleTools, state.roleGuard, state.roleMapped = roleToolSurface(state.profile, r.audit)
+	state.definitions = state.roleTools.Definitions(state.registry)
 
-	packet, compactInfo, err := r.builder.Build(ctx, state.input)
+	// Knowledge is supplemental reference data: cap it at the injection budget
+	// before the assembler renders the pinned facts (contract §10.3).
+	knowledgeBudget := DefaultKnowledgeBudgetTokens
+	if r.builder != nil {
+		knowledgeBudget = r.builder.knowledgeBudgetTokens(ctx)
+	}
+	state.input.VersionPack.Knowledge = fitKnowledge(state.input.VersionPack.Knowledge, knowledgeBudget)
+
+	// The current user turn is rendered before the assembly: the window_full
+	// threshold accounts for it (Task 80 moved the per-work-item task context
+	// into this turn, outside the assembler packet), and it is the exact text
+	// handleOverflow re-appends after a boundary rebuild.
+	state.userContent = r.userMessage(ctx, state, attachmentText)
+
+	// Task 48 cache-first prompt: the assembler renders the byte-stable prefix
+	// and the append-only suffix once per run (and again only at a declared
+	// boundary rebuild). Compaction never happens on a normal round.
+	assembly, err := r.assembleContext(ctx, state, nil, agentcontext.InvalidationNone)
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	packet.RunID = state.run.ID
-	saved, err := r.repo.SaveContextPacket(ctx, packet)
+	state.contextPacket = assembly.Packet
+	state.budget = assembly.Budget
+	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	state.packet = saved
-	state.budget = compactInfo.Budget
 	state.run.ContextPacketID = &saved.ID
-	state.softDeadline = r.now().Add(time.Duration(r.softSeconds(state.profile)) * time.Second)
-	r.persistCompaction(ctx, state, compactInfo, "threshold")
+	// A boundary compaction persists its rolling summary and emits the
+	// compaction event; an append-only round writes neither.
+	if assembly.Compacted {
+		r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, true)
+	}
 	// knowledge_usage is written once per run from the persisted packet; a
 	// failure is logged and never fails the run (contracts §10.3).
 	r.recordKnowledgeUsage(ctx, state)
 
-	systemContent := sectionContent(saved, contextSectionSystem)
-	userContent := r.userMessage(ctx, state, attachmentText)
-	state.userContent = userContent
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
+	systemText := systemMessageText(assembly.Packet, state.input)
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, userContent, nil, nil); err != nil {
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, state.userContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	state.messages = promptMessages(saved, userContent)
+	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
 	return nil
 }
 
@@ -689,24 +1106,66 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			return "", contextRunError(err)
 		}
 		r.publishActivity(state, "thinking", "", "")
-		soft := !r.now().Before(state.softDeadline)
+		// Task 9 budget seam (spec §5.7): completion is structural (a reply
+		// without tool calls ends the run), while tokens/time/turns are decided
+		// here. A hit budget asks for one settlement turn (partial artifacts +
+		// summary) instead of a hard stop; a settlement turn that is still over
+		// budget is exhausted.
+		usage := Usage{
+			Tokens:   usageTokens(state.usage),
+			Seconds:  r.elapsedSeconds(state),
+			Turns:    state.turns,
+			Settling: state.softNoted,
+		}
+		decision := state.resourceBudget.Decide(usage)
+		if decision == BudgetExhaust {
+			detail := state.settlementDetail
+			if detail == "" {
+				detail = budgetSettlementDetail(state.resourceBudget.ExceededBy(usage), state.resourceBudget, usage)
+			}
+			return "", &RunError{
+				Reason:    "budget",
+				Retryable: false,
+				Cause:     fmt.Errorf("agent run exhausted its budget during the settlement turn (%s)", detail),
+			}
+		}
+		soft := decision == BudgetSettle
+		// Task 98: every turn re-sends the whole transcript, and a browser read
+		// result can be a 12KB ARIA tree. The prompt transcript keeps only the
+		// newest page reads; the persisted transcript stays complete.
+		r.pruneCaseExecutorBrowserReads(state)
 		request := llmapp.ChatRequest{
 			Model:           state.model.Model,
 			Messages:        append([]llmapp.ChatMessage(nil), state.messages...),
 			MaxOutputTokens: state.model.MaxOutput,
 		}
+		var settlementTools []llmapp.ToolDefinition
 		if soft {
 			if !state.softNoted {
 				state.softNoted = true
+				state.settlementCause = state.resourceBudget.ExceededBy(usage)
+				state.settlementDetail = budgetSettlementDetail(state.settlementCause, state.resourceBudget, usage)
+				// Task 98: the case executor keeps a recording-only settlement
+				// surface so the assertions of already executed steps are really
+				// written before the run ends. Every other profile keeps the
+				// frozen tool-less settlement turn.
+				settlementTools = caseExecutorSettlementDefinitions(state)
+				instruction := settlementInstruction(state.settlementCause)
+				if len(settlementTools) > 0 {
+					request.Tools = settlementTools
+					instruction = caseExecutorSettlementInstruction(
+						state.settlementCause, pendingCaseExecutorAssertions(state))
+				}
 				request.Messages = append(request.Messages, llmapp.ChatMessage{
 					Role:    "system",
-					Content: "运行时间即将用尽，请不要再调用工具，直接给出最终回复。",
+					Content: instruction,
 				})
 			}
 		} else {
 			request.Tools = state.definitions
 		}
 
+		turnStarted := r.now()
 		response, err := r.chat.Chat(ctx, request)
 		if err != nil {
 			if llmapp.IsContextOverflow(err) {
@@ -718,30 +1177,69 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return "", contextRunError(ctxErr)
 			}
-			return "", &RunError{Reason: "model_error", Retryable: true, Cause: err}
+			// A protocol/capability rejection cannot succeed on a later work-item
+			// attempt: the model is never switched automatically (D24), so the
+			// run fails after the single upstream call and the user is asked to
+			// check the capability/protocol (spec §5.6).
+			return "", &RunError{Reason: "model_error", Retryable: !llmapp.IsProtocol(err), Cause: err}
+		}
+		// 0.2.1 thinking part: the provider's reasoning text is shown collapsed
+		// in the thread ("思考了 Ns"). The duration is the model turn; secrets
+		// are redacted and the text is bounded before it can reach the UI.
+		if reasoning := strings.TrimSpace(response.ReasoningContent); reasoning != "" {
+			state.appendStreamPart(ConversationPart{
+				Type: "thinking",
+				Text: redactPartText(reasoning, producedPartThinkingMax),
+				Data: map[string]any{"duration_ms": partDurationMS(turnStarted, r.now())},
+			})
 		}
 		state.turns++
 		mergeUsage(state.usage, response.Usage)
+		// Contract §18.2.6: the provider usage is authoritative for the prompt
+		// cache bookkeeping; the assembler's local estimate is overwritten.
+		r.applyProviderCacheStats(ctx, state, response.Usage)
+		// 0.2.1 job.progress: every completed model turn is a real step of the
+		// work item. It goes through the worker's per-job coalescer.
+		r.reportJobProgress(ctx, state)
 
 		if err := r.persistAssistant(ctx, state, response); err != nil {
 			return "", err
 		}
 		state.messages = append(state.messages, llmapp.ChatMessage{
-			Role:      "assistant",
-			Content:   response.Content,
-			ToolCalls: response.ToolCalls,
+			Role:             "assistant",
+			Content:          response.Content,
+			ToolCalls:        response.ToolCalls,
+			ReasoningContent: response.ReasoningContent,
+			ReasoningItems:   response.ReasoningItems,
 		})
 
 		if len(response.ToolCalls) == 0 {
 			return strings.TrimSpace(response.Content), nil
 		}
 		if soft {
-			// Tools are disabled at soft timeout; treat a tool-call-only reply as
-			// the model ignoring the wrap-up instruction.
+			if len(settlementTools) > 0 {
+				// Task 98: the recording-only settlement turn. The recording
+				// calls reach the execution context (a new browser/network
+				// action is answered with a tool error by executeTools), then
+				// the run ends with the model's wrap-up text instead of spending
+				// another over-budget model turn.
+				if err := r.executeTools(ctx, state, response.ToolCalls); err != nil {
+					return "", err
+				}
+				return strings.TrimSpace(response.Content), nil
+			}
+			// Tools are disabled during settlement; a tool-call-only reply means
+			// the model ignored the wrap-up instruction. This is a budget
+			// exhaustion (the settlement turn is consumed without an answer),
+			// not a transient model error: another attempt cannot succeed.
 			if text := strings.TrimSpace(response.Content); text != "" {
 				return text, nil
 			}
-			return "", &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("model requested tools after the soft timeout")}
+			return "", &RunError{
+				Reason:    "budget",
+				Retryable: false,
+				Cause:     errors.New("model requested tools during the settlement turn"),
+			}
 		}
 		if err := r.executeTools(ctx, state, response.ToolCalls); err != nil {
 			return "", err
@@ -750,7 +1248,43 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 	return "", &RunError{
 		Reason:    "budget",
 		Retryable: false,
-		Cause:     fmt.Errorf("agent run reached the max turn budget (%d)", maxTurns),
+		Cause:     fmt.Errorf("agent run reached the max turn budget (%d turns)", maxTurns),
+	}
+}
+
+// settlementInstruction is the system message of the tool-less wrap-up turn. It
+// must name the budget that actually triggered the settlement: the pre-QA-Q2
+// fixed text always blamed the clock, so a token/turn-budget stop produced a
+// model summary that pointed at the wrong cause.
+func settlementInstruction(cause string) string {
+	switch cause {
+	case BudgetCauseTokens:
+		return "本次运行的 token 预算即将用尽，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	case BudgetCauseTurns:
+		return "本次运行的轮次预算即将用尽，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	case BudgetCauseTime:
+		return "运行时间即将用尽，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	default:
+		return "本次运行即将结束，请不要再调用工具，直接给出最终回复，并如实说明已完成与未完成的步骤。"
+	}
+}
+
+// budgetSettlementDetail renders the observable usage and limit of one
+// settlement cause. It carries counts only (no prompts, tool results or
+// credentials) and is persisted on the case_run summary.
+func budgetSettlementDetail(cause string, budget Budget, usage Usage) string {
+	normalized := budget.normalized()
+	switch cause {
+	case BudgetCauseTokens:
+		return fmt.Sprintf("token budget: used %d of %d tokens after %d turns",
+			usage.Tokens, normalized.MaxTokens, usage.Turns)
+	case BudgetCauseTime:
+		return fmt.Sprintf("time budget: elapsed %ds of %ds after %d turns",
+			usage.Seconds, normalized.RunSeconds, usage.Turns)
+	case BudgetCauseTurns:
+		return fmt.Sprintf("turn budget: reached the turn fuse after %d turns", usage.Turns)
+	default:
+		return fmt.Sprintf("resource budget: the run entered its settlement turn after %d turns", usage.Turns)
 	}
 }
 
@@ -791,12 +1325,37 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 
 	for _, call := range calls {
 		r.publishActivity(state, "tool", call.Name, "")
+		callStarted := r.now()
 		var payload any
 		var err error
-		if !profileAllowsTool(state.profile, call.Name) {
+		switch {
+		case settlementRecordingActive(state) && !isCaseExecutorSettlementTool(call.Name):
+			// Task 98: the case executor's settlement turn may only record
+			// results it already produced. A new browser/network/database
+			// action is rejected before it can touch the SUT; so is
+			// execution.case_finish, whose deterministic replacement (Finalize)
+			// must write the verdict with the budget cause/handoff.
+			err = caseExecutorSettlementRejection(call.Name)
+		case !profileAllowsTool(state.profile, call.Name):
 			err = tools.Invalid("tool", "tool is not allowed for this profile: "+call.Name)
-		} else {
+		case state.roleGuard != nil:
+			// R51: the runner intersects the profile role's whitelist even when
+			// a stored profile was widened outside it. A denial is a typed
+			// forbidden error and an audit event, never a tool execution.
+			payload, err = state.roleGuard.Execute(ctx, state.registry, scope, call.Name, json.RawMessage(call.Arguments))
+		case !state.roleMapped:
+			// Unmapped profile: the profile whitelist was the only surface and
+			// it already passed the first case.
 			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+		case !state.roleTools.Allows(call.Name):
+			err = tools.Forbidden(state.roleTools.Role(), call.Name)
+		default:
+			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+		}
+		if err == nil {
+			// Task 98: successful execution recording calls are remembered so a
+			// budget settlement turn can name the assertions still missing.
+			state.trackCaseExecutorRecording(call)
 		}
 		content := ""
 		contentRef := ""
@@ -839,6 +1398,12 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			}
 		}
 
+		// 0.2.1 tool_call/error parts: the UI pairs streamed rows by call_id and
+		// shows the tool name/status/duration/result collapsed. Arguments and
+		// results are sanitized (credentials redacted, values bounded) before
+		// they can reach the conversation thread or its SSE event.
+		r.appendToolParts(state, call, content, err, partDurationMS(callStarted, r.now()))
+
 		parts := []agent.MessagePart{{Type: "text", Text: content}}
 		if contentRef != "" {
 			parts = append(parts, agent.MessagePart{Type: "content_ref", Text: contentRef})
@@ -863,60 +1428,72 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 	return nil
 }
 
-// handleOverflow compacts the context and retries: half budget first, then the
-// minimal context. A third overflow is unrecoverable; context_overflow alone
-// never terminates the run.
+// handleOverflow compacts the context at a declared window_full boundary and
+// retries. The first retry folds the transcript down to the configured recent
+// window. Rebuilding from the same history with the same window cannot shrink
+// the prompt again, so the second (last) retry halves the window and folds
+// strictly more history; a configured window of 0 is already the minimum, so
+// only the pinned prefix/facts remain and a third overflow is unrecoverable.
+// context_overflow alone never terminates the run.
 func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.overflowHits++
-	var budget int
-	switch state.overflowHits {
-	case 1:
-		budget = state.budget / 2
-	case 2:
-		budget = MinUsableBudget
-	default:
+	if state.overflowHits > 2 {
 		return &RunError{
 			Reason:    "context_overflow_unrecoverable",
 			Retryable: true,
 			Cause:     errors.New("model rejected the context window even after compaction"),
 		}
 	}
-	compacted, _ := Compact(state.input, budget)
-	packet, info, err := r.builder.Build(ctx, compacted)
+	keepRecent := r.keepRecentMessages(ctx)
+	if state.overflowHits > 1 {
+		keepRecent = shrinkKeepRecentMessages(keepRecent)
+	}
+	previous := state.contextPacket
+	assembly, err := r.assembleContextWithKeepRecent(ctx, state, &previous, agentcontext.InvalidationWindowFull, keepRecent)
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	packet.RunID = state.run.ID
-	saved, err := r.repo.SaveContextPacket(ctx, packet)
+	state.contextPacket = assembly.Packet
+	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	state.packet = saved
-	state.input = compacted
 	state.run.ContextPacketID = &saved.ID
-	systemContent := sectionContent(saved, contextSectionSystem)
-	state.messages = promptMessages(saved, state.userContent)
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-	}
-	summaryVersion := 0
-	if info.Compacted && strings.TrimSpace(info.Summary) != "" && state.payload.ConversationID > 0 && r.conversation != nil {
-		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID, state.payload.ConversationID, info.Summary, state.input.Conversation.PinnedFacts)
-		if err == nil {
-			summaryVersion = stored.Version
+	// A boundary rebuild persists a new packet row; carry the provider cache
+	// bookkeeping observed on an earlier turn so the latest row stays
+	// authoritative (the context.cache_stats event is still emitted once).
+	if state.providerCacheReported {
+		state.contextPacket.CachedTokens = state.providerCacheTokens
+		state.contextPacket.CacheHit = state.providerCacheHit
+		if state.packet.TokenCounts == nil {
+			state.packet.TokenCounts = map[string]int{}
+		}
+		state.packet.TokenCounts["cached_tokens"] = state.providerCacheTokens
+		state.packet.TokenCounts["cache_hit"] = boolInt(state.providerCacheHit)
+		if err := r.repo.UpdateContextPacketCacheStats(ctx, saved.ID,
+			state.providerCacheTokens, state.providerCacheHit); err != nil {
+			r.logContextWarning(ctx, "carry provider cache stats to the compacted packet failed", err)
 		}
 	}
-	payload := map[string]any{
-		"run_id":          idText(state.run.ID),
-		"summary_version": summaryVersion,
-		"token_before":    info.BeforeTokens,
-		"token_after":     info.AfterTokens,
+	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
+	systemText := systemMessageText(assembly.Packet, state.input)
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
+		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	if state.payload.ConversationID > 0 {
-		payload["conversation_id"] = idText(state.payload.ConversationID)
-	}
-	r.publish(state, "context.compacted", payload)
+	r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, assembly.Compacted)
 	return nil
+}
+
+// shrinkKeepRecentMessages halves the recent window for the last overflow retry
+// so the second compaction folds strictly more history than the first. A window
+// of 0 or 1 shrinks to 0: every compactable segment is folded and only the
+// pinned prefix/facts and the rolling summary remain.
+func shrinkKeepRecentMessages(keepRecent int) int {
+	if keepRecent <= 1 {
+		return 0
+	}
+	return keepRecent / 2
 }
 
 // writeOutputs persists the profile-specific result: Host/Curator/Design Host/
@@ -939,10 +1516,11 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			ConversationID:   state.payload.ConversationID,
 			AgentRunID:       state.run.ID,
 			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+			Parts:            r.assistantConversationParts(state, finalText, nil),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
+		r.convergeClarification(ctx, state, finalText)
 	case ProfileKeyDesignHost:
 		if finalText == "" {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design host produced an empty final message")}
@@ -955,7 +1533,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			ConversationID:   state.payload.ConversationID,
 			AgentRunID:       state.run.ID,
 			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+			Parts:            r.assistantConversationParts(state, finalText, nil),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
@@ -970,7 +1548,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			VersionID:      state.item.VersionID,
 			ConversationID: state.payload.ConversationID,
 			AgentRunID:     state.run.ID,
-			Parts:          []ConversationPart{{Type: "text", Text: finalText}},
+			Parts:          r.assistantConversationParts(state, finalText, nil),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
@@ -980,6 +1558,23 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 	case ProfileKeyCaseAuthor:
 		if finalText == "" {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("case author produced no design update")}
+		}
+		// A case-author task enqueued by a design round carries the round's
+		// conversation/round association: persist the proposal trace and the
+		// summary there so the design thread shows the case.graph_propose call
+		// with its evidence (Task 65), alongside the team-room update. A task
+		// without the round association keeps the frozen P2 behavior (team room
+		// only) and never writes into a conversation.
+		if r.conversation != nil && state.payload.ConversationID > 0 && state.payload.RoundID > 0 {
+			if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
+				VersionID:        state.item.VersionID,
+				ConversationID:   state.payload.ConversationID,
+				AgentRunID:       state.run.ID,
+				ReplyToMessageID: replyTarget(state.payload.MessageID),
+				Parts:            r.assistantConversationParts(state, finalText, nil),
+			}); err != nil {
+				return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+			}
 		}
 		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
 			return err
@@ -1002,11 +1597,7 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		if finalText == "" && len(state.cards) == 0 {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("curator produced no message or requirement card")}
 		}
-		parts := make([]ConversationPart, 0, 1+len(state.cards))
-		if finalText != "" {
-			parts = append(parts, ConversationPart{Type: "text", Text: finalText})
-		}
-		parts = append(parts, state.cards...)
+		parts := r.assistantConversationParts(state, finalText, state.cards)
 		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
 			VersionID:        state.item.VersionID,
 			ConversationID:   state.payload.ConversationID,
@@ -1047,13 +1638,31 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 				ConversationID:   state.payload.ConversationID,
 				AgentRunID:       state.run.ID,
 				ReplyToMessageID: replyTarget(state.payload.MessageID),
-				Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+				Parts:            r.assistantConversationParts(state, finalText, nil),
 			}); err != nil {
 				return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 			}
 		}
 	}
 	return nil
+}
+
+// convergeClarification applies the clarifying→requirement_review edge when the
+// host's persisted turn explicitly requests requirement confirmation. Stage
+// failures are log-only: the assistant message is the source artifact and a
+// later confirmation turn retries the convergence instead of failing the chat
+// turn (which would re-run the model).
+func (r *Runner) convergeClarification(ctx context.Context, state *runState, finalText string) {
+	if r.clarification == nil || state == nil || state.item.VersionID <= 0 {
+		return
+	}
+	if !requestsRequirementConfirmation(finalText) {
+		return
+	}
+	if err := r.clarification.Converge(ctx, state.item.VersionID); err != nil && r.logger != nil {
+		r.logger.Warn("clarification convergence failed",
+			"version_id", state.item.VersionID, "error", err)
+	}
 }
 
 // postDesignUpdate writes one design team-room update attributed to the run and
@@ -1087,22 +1696,40 @@ func (r *Runner) postDesignUpdate(ctx context.Context, state *runState, kind age
 
 func (r *Runner) fail(ctx context.Context, state *runState, err error) (RunResult, error) {
 	reason, retryable := classifyFailure(ctx, err)
+	// Task 9 seam: Classify is the contract-facing failure taxonomy (kind/
+	// retryable/user-visible/action). The run's own status stays driven by the
+	// RunError reason so lease/cancel semantics keep their existing behavior;
+	// the classification is attached to the failed event for the UI (spec §5.6).
+	failure := Classify(err)
 	status := agent.AgentRunFailed
 	if reason == "interrupted" || reason == "aborted" {
 		status = agent.AgentRunInterrupted
 	}
-	result, finishErr := r.finish(state, status, reason, retryable)
+	result, finishErr := r.finish(state, status, reason, retryable, failure)
 	if finishErr != nil {
 		return result, finishErr
 	}
 	return result, &RunError{Reason: reason, Retryable: retryable, Cause: err}
 }
 
-func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason string, retryable bool) (RunResult, error) {
+func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason string, retryable bool, failure Failure) (RunResult, error) {
 	finishedAt := r.now()
 	state.run.Status = status
 	state.run.Turns = state.turns
 	state.run.Usage = state.usage
+	// A done run that needed the settlement turn explains itself: the concrete
+	// budget cause becomes its terminal_reason so the Agent Center does not show
+	// an empty reason for a run that stopped at 1/4 steps (QA Q2).
+	if reason == "" && status == agent.AgentRunDone && state.settlementCause != "" {
+		reason = state.settlementCause
+	}
+	// Tokens mirrors the aggregated usage into the 0.2.1 token-accounting column;
+	// cache stays a persisted (possibly empty) object until a provider reports
+	// prompt-cache statistics (spec §7.5).
+	state.run.Tokens = copyUsage(state.usage)
+	if state.run.Cache == nil {
+		state.run.Cache = map[string]int{}
+	}
 	state.run.FinishedAt = &finishedAt
 	state.run.TerminalReason = nil
 	if reason != "" {
@@ -1113,11 +1740,13 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 	defer cancel()
 	if err := r.repo.FinishRun(finishCtx, state.run); err != nil {
 		result := RunResult{
-			AgentRunID:     state.run.ID,
-			Status:         status,
-			Turns:          state.turns,
-			Usage:          state.usage,
-			TerminalReason: reason,
+			AgentRunID:       state.run.ID,
+			Status:           status,
+			Turns:            state.turns,
+			Usage:            state.usage,
+			TerminalReason:   reason,
+			SettlementCause:  state.settlementCause,
+			SettlementDetail: state.settlementDetail,
 		}
 		if errors.Is(err, agent.ErrLeaseLost) {
 			return result, &RunError{
@@ -1142,16 +1771,27 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 			"terminal_reason": reason,
 			"retryable":       retryable,
 		}
+		if failure.Kind != "" {
+			payload["failure_kind"] = string(failure.Kind)
+			payload["failure_action"] = failure.Action
+			payload["failure_user_visible"] = failure.UserVisible
+		}
+	} else if reason != "" {
+		// A settled done run still carries its concrete terminal reason so live
+		// consumers can explain it without waiting for the next list request.
+		payload["terminal_reason"] = reason
 	}
 	r.publish(state, eventType, payload)
 	r.recordAudit(state, status, reason)
 
 	return RunResult{
-		AgentRunID:     state.run.ID,
-		Status:         status,
-		Turns:          state.turns,
-		Usage:          state.usage,
-		TerminalReason: reason,
+		AgentRunID:       state.run.ID,
+		Status:           status,
+		Turns:            state.turns,
+		Usage:            state.usage,
+		TerminalReason:   reason,
+		SettlementCause:  state.settlementCause,
+		SettlementDetail: state.settlementDetail,
 	}, nil
 }
 
@@ -1189,29 +1829,6 @@ func (r *Runner) persistAssistant(ctx context.Context, state *runState, response
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	return nil
-}
-
-func (r *Runner) persistCompaction(ctx context.Context, state *runState, info CompactInfo, reason string) {
-	if !info.Compacted || strings.TrimSpace(info.Summary) == "" {
-		return
-	}
-	summaryVersion := 0
-	if state.payload.ConversationID > 0 && r.conversation != nil {
-		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID, state.payload.ConversationID, info.Summary, state.input.Conversation.PinnedFacts)
-		if err == nil {
-			summaryVersion = stored.Version
-		}
-	}
-	payload := map[string]any{
-		"run_id":          idText(state.run.ID),
-		"summary_version": summaryVersion,
-		"token_before":    info.BeforeTokens,
-		"token_after":     info.AfterTokens,
-	}
-	if state.payload.ConversationID > 0 {
-		payload["conversation_id"] = idText(state.payload.ConversationID)
-	}
-	r.publish(state, "context.compacted", payload)
 }
 
 func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
@@ -1304,10 +1921,16 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 	case WorkTypeChatTurn:
 		if state.conversationKind == "design" {
 			return TaskContext{
-				Type:               state.item.Type,
-				Goal:               "作为设计 Host 与用户对话，读取脑图并按用户要求提交/修改场景与用例 draft。",
-				Constraints:        []string{"AI 只能提交 draft/候选，不能确认、删除或关闭用例", "确认只属于用户", "不编造需求未表达的内容"},
-				AcceptanceCriteria: []string{"引用用户最新消息", "修改脑图前先 design.graph_read", "用 case.graph_propose 提交草案并说明变化"},
+				Type: state.item.Type,
+				Goal: "作为设计 Host 与用户对话，读取脑图并按用户要求提交/修改场景与用例 draft。",
+				Constraints: []string{
+					"AI 只能提交 draft/候选，不能确认、删除或关闭用例", "确认只属于用户", "不编造需求未表达的内容",
+					"收到修改请求时先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改；不要只回复修改计划、不要等待用户二次授权",
+					"每条步骤与断言的 expected 必须是非空的可观察结果；修改时补齐空 expected",
+					"断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual",
+					"页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时只用 requirement/knowledge 来源，不要编造 ref_id",
+				},
+				AcceptanceCriteria: []string{"引用用户最新消息", "修改脑图前先 design.graph_read", "同一轮内用 case.graph_propose 提交草案或修改并说明变化"},
 				Scope:              scope,
 			}
 		}
@@ -1336,12 +1959,33 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			Scope:              ingestScope,
 		}
 	case WorkTypeDesignRound:
+		roundRequirementIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_ids")
+		roundRequirementVersionIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_version_ids")
+		roundScope := append([]string(nil), scope...)
+		if len(roundRequirementIDs) > 0 {
+			roundScope = append(roundScope, "requirement_ids="+joinIDText(roundRequirementIDs))
+		}
+		if len(roundRequirementVersionIDs) > 0 {
+			roundScope = append(roundScope, "requirement_version_ids="+joinIDText(roundRequirementVersionIDs))
+		}
 		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               "根据服务端扫描出的本轮设计范围，向用户说明待设计需求与预计场景/用例数量。",
-			Constraints:        []string{"只输出范围说明", "不写库、不调用写工具", "不确认、不删除"},
-			AcceptanceCriteria: []string{"说明本轮作用域与下一步", "不编造未激活需求"},
-			Scope:              scope,
+			Type: state.item.Type,
+			Goal: "读取一次设计脑图后，立即用 case.graph_propose 为本轮范围内每条已确认需求提交场景与用例草案；不要询问用户、不要等待用户选择。",
+			Constraints: []string{
+				"只提交 draft/候选，不能确认、删除、关闭用例或需求",
+				"只做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
+				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id",
+				"页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时只用 requirement/knowledge 来源，不要编造 ref_id",
+				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建",
+				"用例必须包含可执行步骤、断言、来源与目标 version_sut；每条步骤与断言的 expected 必须是非空的可观察结果；不编造需求未表达的内容",
+				"断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual",
+			},
+			AcceptanceCriteria: []string{
+				"对本轮每条已确认需求至少提交一次 case.graph_propose，并返回 case_ids/case_version_ids",
+				"提交后简要说明新增/更新的场景与用例数量",
+				"不向用户提问、不等待用户选择",
+			},
+			Scope: roundScope,
 		}
 	case WorkTypeDesignRequirement, WorkTypeDesignGap:
 		goal := "为指定需求版本设计场景与用例草案：先读取脑图，再用 case.graph_propose 提交 1 个场景与至少 1 条可执行用例。"
@@ -1349,17 +1993,29 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			goal = "根据执行/设计缺口补充用例草案：先读取脑图，再用 case.graph_propose 新增或修改 draft 用例。"
 		}
 		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               goal,
-			Constraints:        []string{"只提交 draft/候选，不能确认、删除或关闭用例", "用例必须包含步骤、断言、来源与目标 version_sut", "同一需求版本内更新已有用例时传既有 ID/自然键"},
-			AcceptanceCriteria: []string{"design.graph_read 后再提交", "case.graph_propose 返回 case_version_ids", "向设计团队频道说明变化"},
-			Scope:              scope,
+			Type: state.item.Type,
+			Goal: goal,
+			Constraints: []string{
+				"只提交 draft/候选，不能确认、删除或关闭用例",
+				"用例必须包含步骤、断言、来源与目标 version_sut；每条步骤与断言的 expected 必须是非空的可观察结果",
+				"断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual",
+				"同一需求版本内更新已有用例时传既有 ID/自然键",
+				"只做一次 design.graph_read 获取 requirement_version_id 与发现事实，随后立即用 case.graph_propose 提交，不要用重复只读调用耗尽预算",
+				"来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id；页面/API 来源只能引用版本已绑定的 page/api ID，未绑定时不要编造",
+				"场景名用需求标题原文、用例标题用对应验收要点原文，降低与同轮设计重复的概率；同一自然键已存在时更新而不是重复创建",
+			},
+			AcceptanceCriteria: []string{
+				"design.graph_read 后再提交",
+				"case.graph_propose 返回 case_version_ids 或 case_ids",
+				"向设计团队频道说明变化",
+			},
+			Scope: scope,
 		}
 	case WorkTypeDesignCritic:
 		return TaskContext{
 			Type:               state.item.Type,
 			Goal:               "内部自审当前需求的场景/用例草案，提交覆盖遗漏、不可执行步骤与断言缺失等 finding。",
-			Constraints:        []string{"只读脑图并使用 design.review_submit", "不修改用例、不确认", "内部自审不构成人工关卡"},
+			Constraints:        []string{"只读脑图并使用 design.review_submit", "不修改用例、不确认", "内部自审不构成人工关卡", "无显式视觉基线要求的用例不得使用 visual"},
 			AcceptanceCriteria: []string{"至少 1 条可执行 finding", "finding 带 severity 与 message"},
 			Scope:              scope,
 		}
@@ -1382,6 +2038,7 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 				"等待/时间窗口用 execution.wait，不要用重复 snapshot 空转",
 				"密码只经 account.credentials 读取，不得写入证据/日志/回复",
 				"登录失败/2FA 用 human.request 请求人工接管",
+				"失败/阻塞/不确定的断言要留下证据（截图、console/network 或 execution.evidence）",
 				"无法继续时用 execution.case_finish(blocked) 说明原因",
 			},
 			AcceptanceCriteria: []string{
@@ -1407,6 +2064,15 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			AcceptanceCriteria: []string{"每条缺口引用属于当前版本的 requirement 与 wave 内证据", "使用 analysis.coverage_submit"},
 			Scope:              scope,
 		}
+	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
+		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "执行当前 explore 任务：读取版本上下文与已有发现事实，用 explore.* 工具补齐可复现的页面/接口/登录事实并说明证据来源。",
+			Constraints:        []string{"只读 SUT 与版本事实，不生成/确认用例，不修改需求", "不编造事实；无法完成时说明明确原因", "记录证据引用，不写入凭据"},
+			AcceptanceCriteria: []string{"产生或补充可复现的发现事实", "说明证据来源与下一步"},
+			Scope:              scope,
+		}
 	default:
 		// P4 domains register their task-context providers from init hooks. When
 		// one claims the type, its JSON-ready payload is rendered by
@@ -1418,7 +2084,18 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 	}
 }
 
+// userMessage is the current user turn of the run: the per-work-item task
+// context followed by the profile's triggering user content. Task 80: the task
+// context is per-work-item data, so it belongs to the append-only user suffix,
+// not the cache-stable system prefix; rendering it here keeps goal, constraints,
+// acceptance and scope in front of the model without breaking the shared prefix.
 func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentText string) string {
+	return taskContextMessage(r.baseUserMessage(ctx, state, attachmentText), state.input)
+}
+
+// baseUserMessage renders the triggering user content without the per-work-item
+// task context block.
+func (r *Runner) baseUserMessage(ctx context.Context, state *runState, attachmentText string) string {
 	switch state.item.Type {
 	case WorkTypeAttachmentIngest:
 		return attachmentText
@@ -1436,11 +2113,15 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 			return "这是澄清会话的开场。请向用户提一个简短的开场问题，引导其描述需求。"
 		}
 		if state.conversationKind == "design" {
-			return "请根据最近的设计对话继续完善用例脑图；需要修改时先 design.graph_read 再 case.graph_propose。"
+			return "请根据最近的设计对话继续完善用例脑图。需要修改现有用例时：先 design.graph_read 读取目标用例一次，然后在同一轮内立即用 case.graph_propose 提交完整修改（保留未变更内容、补齐所有 expected），不要只回复修改计划、不要等待二次授权。"
 		}
 		return "请基于最近对话继续澄清需求。"
 	case WorkTypeDesignRound:
-		return "请根据本轮设计范围，向用户简要说明待设计需求与预计生成的场景/用例数量。"
+		if requirementIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_ids"); len(requirementIDs) > 0 {
+			return fmt.Sprintf("本轮设计范围已确定（%d 条已确认需求，requirement_ids=%s）。请只读取一次 design.graph_read 获取 requirement_version_id 与发现事实，然后立即用 case.graph_propose 为每条需求提交场景与用例 draft；不要询问用户、不要等待用户选择，提交后简要说明结果。",
+				len(requirementIDs), joinIDText(requirementIDs))
+		}
+		return "本轮设计范围已确定。请只读取一次 design.graph_read 获取 requirement_version_id 与发现事实，然后立即用 case.graph_propose 为每条已确认需求提交场景与用例 draft；不要询问用户、不要等待用户选择，提交后简要说明结果。"
 	case WorkTypeDesignRequirement:
 		return fmt.Sprintf("请为需求 %s（需求版本 %s）设计场景与用例草案。",
 			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
@@ -1464,9 +2145,104 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 		return fmt.Sprintf("请分析 wave %s 的失败结果并提交 failure 候选细化。", idText(state.payload.WaveID))
 	case WorkTypeAnalyzeCoverage:
 		return fmt.Sprintf("请分析 wave %s 的执行覆盖缺口并提交覆盖候选。", idText(state.payload.WaveID))
+	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
+		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
+		return "请执行当前 explore 任务，读取版本上下文与已有事实，补齐可复现的页面/接口/登录发现并说明证据来源。"
 	default:
 		return "请根据当前任务继续执行。"
 	}
+}
+
+// triggerImageRefs returns the content data_refs of the image parts on the
+// user message that triggered this run. Only chat.turn/requirement.curate read
+// the triggering message; background runs (execution, reports) never attach
+// conversation images. Refs are deduplicated and keep message order.
+func (r *Runner) triggerImageRefs(ctx context.Context, item agent.WorkItem, payload WorkItemPayload) ([]string, error) {
+	switch item.Type {
+	case WorkTypeChatTurn, WorkTypeRequirementCurate:
+	default:
+		return nil, nil
+	}
+	if payload.MessageID <= 0 || payload.ConversationID <= 0 || r.conversation == nil {
+		return nil, nil
+	}
+	message, err := r.conversation.GetMessage(ctx, item.VersionID, payload.ConversationID, payload.MessageID)
+	if err != nil {
+		return nil, &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	}
+	refs := make([]string, 0, len(message.Parts))
+	seen := make(map[string]struct{}, len(message.Parts))
+	for _, part := range message.Parts {
+		if part.Type != "image" {
+			continue
+		}
+		ref := imagePartDataRef(part)
+		if ref == "" {
+			continue
+		}
+		if _, duplicate := seen[ref]; duplicate {
+			continue
+		}
+		seen[ref] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// imagePartDataRef extracts the content data_ref of one image conversation
+// part. The version adapter maps the R5 image payload into Data.
+func imagePartDataRef(part ConversationPart) string {
+	if part.Data == nil {
+		return ""
+	}
+	value, ok := part.Data["data_ref"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+// loadTriggerImages resolves the triggering message's image refs into bytes for
+// the LLM request. A missing loader or an unreadable image fails the run: the
+// model must never silently miss an image the user sent.
+func (r *Runner) loadTriggerImages(ctx context.Context, refs []string) ([]llmapp.ChatImage, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	if r.images == nil {
+		return nil, &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no image loader"),
+		}
+	}
+	images := make([]llmapp.ChatImage, 0, len(refs))
+	for _, ref := range refs {
+		image, err := r.images.LoadImage(ctx, ref)
+		if err != nil {
+			return nil, &RunError{Reason: "tool_failure", Retryable: imageLoadErrorRetryable(err), Cause: err}
+		}
+		if len(image.Data) == 0 {
+			return nil, &RunError{
+				Reason:    "tool_failure",
+				Retryable: true,
+				Cause:     fmt.Errorf("image %s resolved to no bytes", ref),
+			}
+		}
+		images = append(images, llmapp.ChatImage{MIME: image.MIME, Data: image.Data})
+	}
+	return images, nil
+}
+
+// imageLoadErrorRetryable classifies an image resolution failure: a 4xx means
+// the stored reference is bad (non-retryable unless it says otherwise), while
+// transport/storage failures are retried.
+func imageLoadErrorRetryable(err error) bool {
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 {
+		return apiErr.Retryable
+	}
+	return true
 }
 
 func (r *Runner) teamRoomContext(ctx context.Context, versionID int64, team agent.Team) TeamRoomContext {
@@ -1496,6 +2272,30 @@ func (r *Runner) publish(state *runState, eventType string, payload map[string]a
 		Type:    eventType,
 		Scope:   scope,
 		Payload: payload,
+	})
+}
+
+// reportJobProgress advances the job card with the completed model turns of
+// this run: the conversation snapshot is rewritten through the conversation
+// port (one card per job) and, when the worker attached its per-job coalescer,
+// the same counter is published as a coalesced job.progress event. total stays
+// 0 ("unknown") so the UI never derives a fabricated percentage
+// (contracts/events.md §18.2 #4).
+func (r *Runner) reportJobProgress(ctx context.Context, state *runState) {
+	if state == nil {
+		return
+	}
+	r.projectJobCard(ctx, state.item, state.payload, "running", state.turns, jobCardFailure{})
+	emitter := jobEventsFromContext(ctx)
+	if emitter == nil {
+		return
+	}
+	emitter.Progress(state.item.VersionID, eventingapp.JobProgress{
+		JobID:   state.item.ID,
+		Kind:    jobKind(state.item),
+		Current: state.turns,
+		Total:   0,
+		Status:  eventingapp.JobStatusRunning,
 	})
 }
 
@@ -1545,15 +2345,90 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 	})
 }
 
+// DesignRunMaxTokens is the case-scale token budget of the design team. Usage is
+// cumulative across the turns of one run and every turn re-sends the design
+// thread plus the graph read, so the generic 20k chat budget was exhausted after
+// the read in the final S4 run: the following settlement turn disabled tools and
+// case.graph_propose could never write the modification. 200k covers a full
+// round (read + one propose per activated requirement) without being unbounded.
+const DesignRunMaxTokens = 200000
+
+// CaseExecutorRunMaxTokens is the case-scale token budget of a real case
+// execution (Task 89, raised by Tasks 97, 103 and 109). Usage is cumulative
+// across the turns of one run and every turn re-sends the task pack plus the
+// browser snapshot/ARIA tool results, so the generic 20k chat budget was
+// exhausted after four turns in the final small S5 run (31,943 / 33,979 total
+// tokens): the following settlement turn disabled tools and
+// execution.step_record/assertion_record could never write anything, leaving
+// both case runs with assertion_total=0. The first 200k raise was still not
+// enough for a real 4-step case: S5 retry-6 (case run 375990017199177730) used
+// 216,814 tokens after 15 turns and stopped during step 2 of 4 with no
+// assertion recorded. 400k covers the remaining steps, assertions and evidence
+// calls while remaining a bounded cap (above the observed failure point, not an
+// unbounded budget). 400k was still too small for the complete 5-step/
+// 3-assertion case of the O13 PO retry: AC-FR-025-01 used 409,842 tokens after
+// 28 turns and had recorded only 2 of 5 steps and 0 of 3 assertions when the
+// token settlement turned the run inconclusive/token_budget. 800k kept that
+// observed usage inside the run (28 turns is still well below the 60-turn case
+// envelope), but it was still too small for the complete 4-step/5-assertion case
+// of the PO final E2E: AC-FR-011-01 used 813,006 tokens after 44 turns and had
+// recorded only 3 of 4 steps and 1 of 5 assertions when the token settlement
+// turned the run inconclusive/token_budget. 1.2M keeps that observed usage
+// inside the run (44 turns is still below the 60-turn envelope) and covers the
+// remaining step, assertions and evidence calls while remaining a bounded cap
+// (above the observed failure point, not an unbounded budget).
+// Task 98 additionally bounds the per-turn replay: older browser read results are
+// pruned from the prompt transcript and the budget settlement turn can still
+// record the assertions of already executed steps. The runner enforces the cap in
+// code because the stored profile row is seeded once and EnsureProfiles never
+// overwrites an existing row, so a stale chat-scale row must not pull the
+// executor back to the generic budget (same reasoning as the Task 79 design
+// floor). A work item's explicit 0.2.1 budget declaration still wins over the
+// profile floor.
+const CaseExecutorRunMaxTokens = 0
+
+// Design authoring envelope (Task 79). The stored profile budgets cannot be
+// trusted for design runs: profiles are seeded once and EnsureProfiles never
+// overwrites an existing row, so the live 0.2.1 database still carries the
+// chat-scale design budgets (case_author 8/300/600, design_planner 12/300/600)
+// even after the seeds were raised. The runner therefore enforces the design
+// authoring floor in code, like the token budget: a focused case-author run
+// needs the read turn, the propose turn and the summary turn, and must not be
+// cut off by the generic chat-scale soft timeout.
+//
+// The envelope is profile-scoped, so it deliberately covers every design
+// profile. design_critic and data_planner remain seeded at the lighter
+// 4/120/300 (that seed is the admin-visible default), but they share the 200k
+// design token budget and can still face a full design.graph_read + submit
+// turn, so their runtime envelope is expanded to 16/600/900 as well. This is a
+// documented expansion, pinned by TestDesignBudgetExpandsCriticAndDataPlanner,
+// not an accidental override.
+const (
+	DesignRunMaxTurns       = 16
+	DesignRunMinSeconds     = 600
+	DesignRunMinHardSeconds = 900
+	DesignRunMinAuthorTurns = 3
+	// DesignAuthorTurnTokens is the conservative per-turn token envelope of one
+	// focused case-author run after the Task 79 context scoping: profile prompt,
+	// version briefing/facts, one design.graph_read and the bounded
+	// human-history/team-room tail.
+	DesignAuthorTurnTokens = 32000
+)
+
 func (r *Runner) maxTurns(profile agent.AgentProfile) int {
 	limit := profile.Budgets.MaxTurns
 	setting := r.intSetting("agent.max_turns", defaultMaxTurns)
-	// P3 execution profiles carry their own case-scale budget (P3 spec §7.2:
-	// case_executor 60 turns); the generic agent.max_turns (12) is a chat-scale
-	// guard and must not truncate an execution run.
+	// P3 execution profiles carry their own case-scale turn budget; the design
+	// team gets the authoring floor so a stored chat-scale profile value cannot
+	// truncate a 67-requirement round. The generic agent.max_turns (12) is a
+	// chat-scale guard and must not clamp either team.
 	if isP3Profile(profile.Key) {
 		if limit <= 0 {
 			limit = setting
+		}
+	} else if isDesignProfile(profile.Key) {
+		if limit < DesignRunMaxTurns {
+			limit = DesignRunMaxTurns
 		}
 	} else {
 		switch {
@@ -1581,6 +2456,32 @@ func isP3Profile(key string) bool {
 	}
 }
 
+// isDesignProfile reports whether the profile belongs to the design team. Design
+// runs read the whole graph, write case drafts and run in one lasting round, so
+// they use the design-scale token budget and are not clamped by agent.max_turns.
+func isDesignProfile(key string) bool {
+	switch key {
+	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
+		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
+		return true
+	default:
+		return false
+	}
+}
+
+// turnFuse is the turn-circuit-breaker value used by the default resource
+// budget. It is one below the loop cap so the final allowed turn is the
+// tool-less settlement turn: the loop can still execute it, Decide sees
+// Turns >= fuse and asks for settlement instead of the loop silently ending
+// with a hard budget error. A degenerate one-turn cap keeps fuse=1.
+func (r *Runner) turnFuse(profile agent.AgentProfile) int {
+	fuse := r.maxTurns(profile) - 1
+	if fuse < 1 {
+		fuse = 1
+	}
+	return fuse
+}
+
 func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 	seconds := profile.Budgets.SoftSeconds
 	if seconds <= 0 {
@@ -1589,13 +2490,132 @@ func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 	if seconds < 1 {
 		seconds = defaultSoftSeconds
 	}
+	if isDesignProfile(profile.Key) && seconds < DesignRunMinSeconds {
+		seconds = DesignRunMinSeconds
+	}
 	return seconds
+}
+
+// resourceBudget maps the work item's 0.2.1 budget (spec §5.4: max_tokens /
+// run_seconds / max_turns_fuse) onto the Task 9 Budget policy. Legacy P1-P8
+// items carry no Budget JSON and fall back to the frozen profile limits; the
+// token default is the contract default when neither source sets it.
+func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile) Budget {
+	budget := Budget{
+		MaxTokens:  DefaultBudgetMaxTokens,
+		RunSeconds: r.softSeconds(profile),
+		// Reserve the last loop turn for settlement. With the fuse equal to the
+		// loop cap the loop exits before Decide can observe the fuse, so the
+		// budget policy would never get to ask for a wrap-up turn.
+		MaxTurnsFuse: r.turnFuse(profile),
+	}
+	if isDesignProfile(profile.Key) {
+		budget.MaxTokens = DesignRunMaxTokens
+		// At least the read/propose/summary turns of one focused author run must
+		// fit inside the design token budget.
+		if minimum := DesignRunMinAuthorTurns * DesignAuthorTurnTokens; budget.MaxTokens < minimum {
+			budget.MaxTokens = minimum
+		}
+	} else if profile.Key == ProfileKeyCaseExecutor {
+		// Real execute.case runs must record steps/assertions before the token
+		// budget asks for settlement; the generic 20k chat default cannot cover
+		// the task pack plus browser results (Task 89).
+		budget.MaxTokens = CaseExecutorRunMaxTokens
+		budget.UnlimitedTokens = CaseExecutorRunMaxTokens <= 0
+	}
+	trimmed := strings.TrimSpace(string(item.Budget))
+	if trimmed == "" || trimmed == "null" {
+		return budget
+	}
+	var declared struct {
+		MaxTokens    int `json:"max_tokens"`
+		RunSeconds   int `json:"run_seconds"`
+		MaxTurnsFuse int `json:"max_turns_fuse"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &declared); err != nil {
+		return budget
+	}
+	if declared.MaxTokens > 0 {
+		budget.MaxTokens = declared.MaxTokens
+		budget.UnlimitedTokens = false
+	}
+	if declared.RunSeconds > 0 {
+		budget.RunSeconds = declared.RunSeconds
+	}
+	if declared.MaxTurnsFuse > 0 {
+		budget.MaxTurnsFuse = declared.MaxTurnsFuse
+	}
+	return budget
+}
+
+// elapsedSeconds is the wall-clock usage of the run at the decision point. The
+// manual test clock advances it, matching the pre-Task-9 soft-timeout seam.
+func (r *Runner) elapsedSeconds(state *runState) int {
+	if state == nil || state.startedAt.IsZero() {
+		return 0
+	}
+	seconds := int(r.now().Sub(state.startedAt).Seconds())
+	if seconds < 0 {
+		return 0
+	}
+	return seconds
+}
+
+// usageTokens returns the aggregated token usage the budget compares against.
+// Providers report total_tokens; a provider that only reports the components is
+// summed instead of treated as zero usage. A present-but-zero total_tokens is
+// treated as "not reported" because some providers emit it alongside a real
+// component breakdown.
+func usageTokens(usage map[string]int) int {
+	if total, ok := usage["total_tokens"]; ok && total > 0 {
+		return total
+	}
+	total := 0
+	for key, value := range usage {
+		if key == "total_tokens" || value <= 0 {
+			continue
+		}
+		total += value
+	}
+	return total
+}
+
+// roleToolSurface intersects the profile's allowed tools with the catalog role
+// whitelist (R51). A mapped profile executes through a RoleToolGuard, so a
+// denied call is a typed forbidden error plus an audit event. Profiles outside
+// the seven roles (case_executor, coverage_analyst, version_steward) are not
+// constrained by this catalog and keep their own frozen contract whitelist.
+func roleToolSurface(profile agent.AgentProfile, audit auditapp.Recorder) (tools.ToolSet, *RoleToolGuard, bool) {
+	spec, ok := RoleForProfile(profile.Key)
+	if !ok {
+		return tools.NewToolSet("", profile.AllowedTools), nil, false
+	}
+	roleSet, ok := RoleToolSet(spec.Key)
+	if !ok {
+		// Unknown role is a configuration error: fail closed by exposing
+		// nothing rather than granting the profile set.
+		return tools.NewToolSet("", nil), nil, true
+	}
+	names := make([]string, 0, len(profile.AllowedTools))
+	for _, name := range profile.AllowedTools {
+		if roleSet.Allows(name) {
+			names = append(names, name)
+		}
+	}
+	guard, err := NewRoleToolGuard(spec.Key, audit)
+	if err != nil {
+		return tools.NewToolSet(string(spec.Key), names), nil, true
+	}
+	return tools.NewToolSet(string(spec.Key), names), guard, true
 }
 
 func (r *Runner) hardSeconds(profile agent.AgentProfile) int {
 	hard := profile.Budgets.HardSeconds
 	if hard <= 0 {
 		hard = r.intSetting("agent.run_hard_timeout_seconds", defaultHardSeconds)
+	}
+	if isDesignProfile(profile.Key) && hard < DesignRunMinHardSeconds {
+		hard = DesignRunMinHardSeconds
 	}
 	soft := r.softSeconds(profile)
 	if hard < soft {
@@ -1632,6 +2652,30 @@ func profileModel(profile agent.AgentProfile) string {
 		return ""
 	}
 	return strings.TrimSpace(*profile.Model)
+}
+
+// modelRequirements derives the capabilities a profile's run needs before
+// dispatch. Profiles that may call tools need a tools-capable model; the
+// reasoning requirement is derived from the config's thinking mode by the
+// gateway itself. Vision is appended by Run when the triggering message has
+// image parts, so ResolveModel is the single vision gate.
+func modelRequirements(profile agent.AgentProfile) []llmapp.ModelRequirements {
+	if len(profile.AllowedTools) == 0 {
+		return nil
+	}
+	return []llmapp.ModelRequirements{{Tools: true}}
+}
+
+// resolveRunError classifies a model-resolution failure. Configuration and
+// capability errors are non-retryable (an operator must fix the config, D24);
+// an unavailable gateway stays retryable like before.
+func resolveRunError(err error) *RunError {
+	retryable := true
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		retryable = apiErr.Retryable
+	}
+	return &RunError{Reason: "ai_unavailable", Retryable: retryable, Cause: err}
 }
 
 func conversationMessages(messages []ConversationMessage) []Message {
@@ -1889,6 +2933,26 @@ func executionTaskErrorRetryable(err error) bool {
 	return true
 }
 
+// isCaseBlockedTaskError reports whether an execution task-provider rejection is
+// a deterministic case-scope blocker rather than a transient infrastructure
+// error. The P3 execution context classifies a blocked run as
+// blocked/failure_class=blocked and persists the reason as evidence; treating
+// the same rejection as a tool_failure produced the silent zero-result
+// agent_failure rows in QA-F1.
+func isCaseBlockedTaskError(err error) bool {
+	if IsLeaseLost(err) {
+		return false
+	}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Status {
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+			return true
+		}
+	}
+	return false
+}
+
 // requirementCard turns a successful draft tool result into a UI card part.
 func requirementCard(toolName string, payload any) (ConversationPart, bool) {
 	if toolName != tools.ToolRequirementDraftCreate && toolName != tools.ToolRequirementDraftUpdate {
@@ -1920,46 +2984,20 @@ func requirementCard(toolName string, payload any) (ConversationPart, bool) {
 	return ConversationPart{Type: "requirement_card", Data: data}, true
 }
 
-func sectionContent(packet agent.ContextPacket, name string) string {
-	for _, section := range packet.Sections {
-		if section.Name == name {
-			return section.Content
-		}
-	}
-	return ""
-}
-
-// promptMessages renders the persisted context packet into the actual model
-// prompt. The system section carries the profile/task instructions; every
-// non-system section (version pack, rolling summary/recent window, team room,
-// artifacts) is injected ahead of the current user message so context is not
-// merely persisted without ever reaching the model.
-func promptMessages(packet agent.ContextPacket, userContent string) []llmapp.ChatMessage {
-	system := sectionContent(packet, contextSectionSystem)
-	var builder strings.Builder
-	for _, section := range packet.Sections {
-		if section.Name == contextSectionSystem || strings.TrimSpace(section.Content) == "" {
-			continue
-		}
-		if builder.Len() > 0 {
-			builder.WriteString("\n\n")
-		}
-		fmt.Fprintf(&builder, "## %s\n%s", section.Name, section.Content)
-	}
-	if builder.Len() > 0 {
-		builder.WriteString("\n\n# 当前用户消息\n")
-	}
-	builder.WriteString(userContent)
-	return []llmapp.ChatMessage{
-		{Role: "system", Content: system},
-		{Role: "user", Content: builder.String()},
-	}
-}
-
 func mergeUsage(target map[string]int, addition map[string]int) {
 	for key, value := range addition {
 		target[key] += value
 	}
+}
+
+// copyUsage returns a non-nil copy so the persisted token snapshot cannot be
+// mutated by a later usage merge.
+func copyUsage(source map[string]int) map[string]int {
+	target := make(map[string]int, len(source))
+	for key, value := range source {
+		target[key] = value
+	}
+	return target
 }
 
 func contextRunError(err error) error {
@@ -1995,6 +3033,16 @@ func replyTarget(messageID int64) *int64 {
 
 func idText(value int64) string { return strconv.FormatInt(value, 10) }
 
+// joinIDText renders a decimal ID list for the task context scope. It is used by
+// the design round scope (Task 69); the ids remain identifiers only.
+func joinIDText(ids []int64) string {
+	formatted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		formatted = append(formatted, idText(id))
+	}
+	return strings.Join(formatted, ",")
+}
+
 func stringValue(value any) string {
 	text, _ := value.(string)
 	return text
@@ -2013,5 +3061,388 @@ func intValue(value any) int {
 		return int(parsed)
 	default:
 		return 0
+	}
+}
+
+// ---------- 0.2.1 message parts producer ----------
+
+// Produced part bounds. The version validator and the conversation_message_part
+// payload CHECK are the last line of defense; the runner bounds and sanitizes
+// before the part leaves the run so a tool result can never bloat a message or
+// persist credentials.
+const (
+	producedPartThinkingMax = 4000
+	producedPartJSONMax     = 4000
+	producedPartHeadMax     = 2000
+	producedPartStringMax   = 500
+	producedPartMaxDepth    = 8
+	maxProducedStreamParts  = 200
+)
+
+var (
+	// partSecretAssignmentPattern catches a credential written into free text
+	// ("password=hunter2", "token: abc"), keeping the field name for context.
+	partSecretAssignmentPattern = regexp.MustCompile(
+		`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|cookie|credential)s?\b\s*[:=]\s*(\S+)`)
+	// partBearerPattern catches a raw bearer credential under any key.
+	partBearerPattern = regexp.MustCompile(`(?i)\bbearer\s+([A-Za-z0-9._~+/=-]+)`)
+	// partJWTPattern catches a raw JWT.
+	partJWTPattern = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+)
+
+// appendStreamPart records one produced streaming part, bounded by the message
+// limit. A dropped part never fails the run: the model reply is the artifact,
+// the trace is supplementary.
+func (state *runState) appendStreamPart(part ConversationPart) {
+	if state == nil || len(state.streamParts) >= maxProducedStreamParts {
+		return
+	}
+	state.streamParts = append(state.streamParts, part)
+}
+
+// hasErrorPart dedupes repeated tool validation failures so a model retrying the
+// same bad call does not stack identical error cards in the thread.
+func (state *runState) hasErrorPart(code, message string) bool {
+	for _, part := range state.streamParts {
+		if part.Type != "error" {
+			continue
+		}
+		if stringValue(part.Data["code"]) == code && stringValue(part.Data["message"]) == message {
+			return true
+		}
+	}
+	return false
+}
+
+// appendToolParts emits the tool_call part plus, for a structured tool failure,
+// one error part with the user-visible code/message. Arguments and results are
+// sanitized first: credentials redacted, strings bounded, result object-shaped.
+func (r *Runner) appendToolParts(state *runState, call llmapp.ToolCall, content string, toolErr error, durationMS int64) {
+	callID := strings.TrimSpace(call.ID)
+	if callID == "" {
+		if r.ids == nil {
+			return
+		}
+		callID = "call_" + idText(r.ids.Next())
+	}
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return
+	}
+	status := "done"
+	errorText := ""
+	if toolErr != nil {
+		status = "failed"
+		errorText = redactPartText(toolErr.Error(), version.ToolCallErrorMax)
+	}
+	data := map[string]any{
+		"call_id":     truncateRunes(callID, version.ToolCallIDMax),
+		"name":        truncateRunes(name, version.ToolCallNameMax),
+		"status":      status,
+		"duration_ms": durationMS,
+	}
+	if arguments, ok := sanitizePartJSONObject(call.Arguments); ok {
+		data["arguments"] = arguments
+	}
+	if result, ok := sanitizePartResult(content); ok {
+		data["result"] = result
+	}
+	if errorText != "" {
+		data["error"] = errorText
+	}
+	state.appendStreamPart(ConversationPart{Type: "tool_call", Data: data})
+
+	var typed *tools.Error
+	if toolErr == nil || !errors.As(toolErr, &typed) {
+		return
+	}
+	code := truncateRunes(strings.TrimSpace(typed.Code), version.MessageErrorCodeMax)
+	message := redactPartText(typed.Message, version.MessageErrorMessageMax)
+	if code == "" || message == "" || state.hasErrorPart(code, message) {
+		return
+	}
+	state.appendStreamPart(ConversationPart{Type: "error", Data: map[string]any{
+		"code":      code,
+		"message":   message,
+		"retryable": false,
+	}})
+}
+
+// assistantConversationParts renders the parts of one final assistant message:
+// the produced trace parts (thinking/tool_call/error), the final text and the
+// profile-specific extra cards. Order is the render order. The background job's
+// own card is not part of this message: it lives in the dedicated card message
+// written by projectJobCard, so one job never renders two job_cards.
+func (r *Runner) assistantConversationParts(state *runState, finalText string, extra []ConversationPart) []ConversationPart {
+	parts := make([]ConversationPart, 0, len(state.streamParts)+1+len(extra))
+	parts = append(parts, state.streamParts...)
+	if finalText != "" {
+		parts = append(parts, ConversationPart{Type: "text", Text: finalText})
+	}
+	parts = append(parts, extra...)
+	return parts
+}
+
+// jobCardWriteTimeout bounds the terminal card write-back, which runs after the
+// run context may already be cancelled.
+const jobCardWriteTimeout = 5 * time.Second
+
+// jobCardFailure is the typed explanation persisted on a terminal failed card
+// (Task 75). Code is the stable error code and Reason the user-facing message;
+// the zero value means "no failure to explain".
+type jobCardFailure struct {
+	Code   string
+	Reason string
+}
+
+// jobCardFailureDetails extracts the failure explanation of a finished run. A
+// typed platform error (for example llm_capability_mismatch) supplies the stable
+// code and the actionable message; otherwise the RunError classification and
+// then the error text are used. Secrets are redacted and both fields are bounded
+// by the MessagePart contract before they reach the conversation store.
+func jobCardFailureDetails(err error) jobCardFailure {
+	if err == nil {
+		return jobCardFailure{}
+	}
+	failure := jobCardFailure{}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		failure.Code = apiErr.Code
+		failure.Reason = apiErr.Message
+	}
+	if failure.Code == "" {
+		var runErr *RunError
+		if errors.As(err, &runErr) {
+			failure.Code = runErr.Reason
+		}
+	}
+	if strings.TrimSpace(failure.Reason) == "" {
+		failure.Reason = err.Error()
+	}
+	failure.Code = truncateRunes(strings.TrimSpace(failure.Code), version.MessageErrorCodeMax)
+	failure.Reason = redactPartText(strings.TrimSpace(failure.Reason), version.MessageErrorMessageMax)
+	return failure
+}
+
+// projectJobCard writes the single job_card part of a background job into its
+// conversation. It is a no-op when the job does not map to a card kind or the
+// work item carries no conversation. The version context owns idempotency: a
+// repeated start/progress/terminal projection rewrites the same card message
+// instead of appending a second one. The write is best effort: a card failure
+// is logged and never changes the run verdict. A terminal failed card also
+// carries the typed failure code/reason so the thread explains the job.
+func (r *Runner) projectJobCard(ctx context.Context, item agent.WorkItem, payload WorkItemPayload, status string, current int, failure jobCardFailure) {
+	if r == nil || r.conversation == nil || item.ID <= 0 || payload.ConversationID <= 0 {
+		return
+	}
+	kind, ok := jobKindForCard(item)
+	if !ok {
+		return
+	}
+	if current < 0 {
+		current = 0
+	}
+	data := map[string]any{
+		"job_id":     idText(item.ID),
+		"kind":       kind,
+		"status":     status,
+		"current":    int64(current),
+		"total":      int64(0),
+		"cancelable": jobCardCancelable(status),
+	}
+	if status == "failed" {
+		if failure.Code != "" {
+			data["code"] = failure.Code
+		}
+		if failure.Reason != "" {
+			data["reason"] = failure.Reason
+		}
+	}
+	card := ConversationPart{Type: version.MessagePartJobCard, Data: data}
+	if _, err := r.conversation.UpsertJobCard(ctx, item.VersionID, payload.ConversationID, card); err != nil {
+		if r.logger != nil {
+			r.logger.Warn("agent runner: project job card failed",
+				"work_item_id", item.ID, "conversation_id", payload.ConversationID,
+				"status", status, "error", err)
+		}
+	}
+}
+
+// jobKindForCard resolves the conversation job-card kind of a work item: the
+// frozen 0.2.1 contract kind when the row carries one, otherwise the
+// conversation-writing work type (chat.turn/requirement.curate/design.round).
+// Anything else has no card.
+func jobKindForCard(item agent.WorkItem) (string, bool) {
+	kind := jobKind(item)
+	if version.IsValidJobCardKind(kind) || version.IsConversationJobCardKind(kind) {
+		return kind, true
+	}
+	return "", false
+}
+
+// jobCardCancelable mirrors the card contract: an in-flight job may be
+// cancelled; a terminal card must not offer it.
+func jobCardCancelable(status string) bool {
+	switch status {
+	case "open", "claimed", "running", "waiting_human":
+		return true
+	default:
+		return false
+	}
+}
+
+// jobCardTerminalStatus maps a finished run to the stored card status. A
+// retryable failure below the attempt cap returns the job to queued (the worker
+// reopens the item), matching the worker's Fail predicate; at the cap it is
+// terminal failed. A hard-timeout run is interrupted+retryable, so it follows
+// the same reopen/terminal mapping instead of leaving a stale running card. A
+// fenced or aborted run owns no terminal card and keeps the previous projection
+// (the new owner or the job-control cancel path owns it). done and failed are
+// terminal.
+func jobCardTerminalStatus(item agent.WorkItem, err error) (string, bool) {
+	if err == nil {
+		return "done", true
+	}
+	if IsLeaseLost(err) {
+		return "", false
+	}
+	var runErr *RunError
+	if errors.As(err, &runErr) {
+		switch runErr.Reason {
+		case "lease_lost", "aborted":
+			return "", false
+		}
+	}
+	if IsRetryable(err) && item.Attempts < item.MaxAttempts {
+		return "open", true
+	}
+	return "failed", true
+}
+
+// partDurationMS renders a non-negative elapsed duration for the UI.
+func partDurationMS(start, end time.Time) int64 {
+	if end.Before(start) {
+		return 0
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+// redactPartText removes credential-shaped values from free text and bounds it.
+func redactPartText(text string, max int) string {
+	redacted := partSecretAssignmentPattern.ReplaceAllString(text, "${1}=[redacted]")
+	redacted = partBearerPattern.ReplaceAllString(redacted, "Bearer [redacted]")
+	redacted = partJWTPattern.ReplaceAllString(redacted, "[redacted]")
+	if max > 0 {
+		redacted = truncateRunes(redacted, max)
+	}
+	return redacted
+}
+
+// sanitizePartJSONObject sanitizes a model-supplied JSON object (tool call
+// arguments). Malformed or non-object input is omitted instead of failing the
+// run; the model already sees the raw value through the tool channel.
+func sanitizePartJSONObject(raw string) (json.RawMessage, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return nil, false
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return marshalSanitizedPartJSON(redactPartValue(object, 0))
+}
+
+// sanitizePartResult sanitizes a tool result. The contract result is an object
+// or null, so a scalar tool result is wrapped under "value".
+func sanitizePartResult(content string) (json.RawMessage, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return marshalSanitizedPartJSON(map[string]any{"value": redactPartText(trimmed, producedPartStringMax)})
+	}
+	sanitized := redactPartValue(value, 0)
+	if _, ok := sanitized.(map[string]any); !ok {
+		sanitized = map[string]any{"value": sanitized}
+	}
+	return marshalSanitizedPartJSON(sanitized)
+}
+
+func marshalSanitizedPartJSON(value any) (json.RawMessage, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	if len(encoded) > producedPartJSONMax {
+		encoded, err = json.Marshal(map[string]any{
+			"truncated": true,
+			"head":      truncateRunes(string(encoded), producedPartHeadMax),
+		})
+		if err != nil {
+			return nil, false
+		}
+	}
+	return json.RawMessage(encoded), true
+}
+
+// redactPartValue walks a decoded JSON value: credential-keyed fields become
+// "[redacted]", every remaining string is credential-scanned and bounded, and
+// the walk is depth/size bounded so a hostile tool result cannot explode.
+func redactPartValue(value any, depth int) any {
+	if depth > producedPartMaxDepth {
+		return "[redacted]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if isCredentialKey(key) {
+				out[key] = "[redacted]"
+				continue
+			}
+			out[key] = redactPartValue(item, depth+1)
+		}
+		return out
+	case []any:
+		items := typed
+		if len(items) > 100 {
+			items = items[:100]
+		}
+		out := make([]any, 0, len(items))
+		for _, item := range items {
+			out = append(out, redactPartValue(item, depth+1))
+		}
+		return out
+	case string:
+		return redactPartText(typed, producedPartStringMax)
+	default:
+		return value
+	}
+}
+
+// isCredentialKey reports whether a JSON field name denotes a credential value
+// that must never reach conversation parts.
+func isCredentialKey(key string) bool {
+	normalized := strings.Map(func(r rune) rune {
+		if r == '_' || r == '-' || r == ' ' {
+			return -1
+		}
+		return r
+	}, strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
+	case "password", "passwd", "pwd", "secret", "token", "accesstoken", "refreshtoken",
+		"sessiontoken", "apikey", "apitoken", "authorization", "cookie", "cookies",
+		"credential", "credentials", "clientsecret", "secretkey", "privatekey",
+		"storagestate", "sessionid", "passphrase":
+		return true
+	default:
+		return false
 	}
 }

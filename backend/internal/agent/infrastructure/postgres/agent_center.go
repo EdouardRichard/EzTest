@@ -125,6 +125,8 @@ func (r *AgentCenterReader) ListRuns(ctx context.Context, query agentapp.RunQuer
 	rows, err := r.pool.Query(ctx, `
 		SELECT r.id, r.profile_key, r.work_item_id, w.type, w.version_id,
 		       r.conversation_id, r.status, r.terminal_reason, r.turns, r.usage,
+		       r.model, COALESCE(r.config_id, 0), COALESCE(r.fallback_from, ''),
+		       r.tokens, r.cache,
 		       r.started_at, r.finished_at
 		FROM agent_run r
 		LEFT JOIN work_item w ON w.id = r.work_item_id
@@ -143,10 +145,11 @@ func (r *AgentCenterReader) ListRuns(ctx context.Context, query agentapp.RunQuer
 	runs := make([]agentapp.RunRow, 0, query.Limit+1)
 	for rows.Next() {
 		var run agentapp.RunRow
-		var usageRaw []byte
+		var usageRaw, tokensRaw, cacheRaw []byte
 		if err := rows.Scan(
 			&run.ID, &run.ProfileKey, &run.WorkItemID, &run.WorkType, &run.VersionID,
 			&run.ConversationID, &run.Status, &run.TerminalReason, &run.Turns, &usageRaw,
+			&run.Model, &run.ConfigID, &run.FallbackFrom, &tokensRaw, &cacheRaw,
 			&run.StartedAt, &run.FinishedAt,
 		); err != nil {
 			return nil, false, fmt.Errorf("scan agent run: %w", err)
@@ -155,6 +158,18 @@ func (r *AgentCenterReader) ListRuns(ctx context.Context, query agentapp.RunQuer
 		if len(usageRaw) > 0 {
 			if err := json.Unmarshal(usageRaw, &run.Usage); err != nil {
 				return nil, false, fmt.Errorf("decode agent run usage: %w", err)
+			}
+		}
+		run.Tokens = map[string]int{}
+		if len(tokensRaw) > 0 {
+			if err := json.Unmarshal(tokensRaw, &run.Tokens); err != nil {
+				return nil, false, fmt.Errorf("decode agent run tokens: %w", err)
+			}
+		}
+		run.Cache = map[string]int{}
+		if len(cacheRaw) > 0 {
+			if err := json.Unmarshal(cacheRaw, &run.Cache); err != nil {
+				return nil, false, fmt.Errorf("decode agent run cache: %w", err)
 			}
 		}
 		runs = append(runs, run)

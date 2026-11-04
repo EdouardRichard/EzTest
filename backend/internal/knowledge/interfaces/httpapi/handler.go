@@ -1,6 +1,7 @@
 // Package httpapi exposes the P7 knowledge REST API (frozen contract):
 //
 //	GET   /api/knowledge/items                          login  list/search
+//	GET   /api/knowledge/search                         login  structured search
 //	POST  /api/knowledge/items                          login  create draft
 //	GET   /api/knowledge/items/{knowledgeId}            login  detail + revisions
 //	PATCH /api/knowledge/items/{knowledgeId}            login  edit draft/rejected
@@ -165,12 +166,19 @@ func (h *Handler) GetItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	// R91 read gate: the list/search projection hides secret-bearing rows, so a
+	// direct-ID detail must not become a secret oracle. The response is
+	// indistinguishable from a missing item.
+	if knowledgeapp.ItemHasSecrets(item) {
+		httpx.Error(w, r, platform.NotFound("knowledge_item"))
+		return
+	}
 	revisions, err := h.service.Revisions(r.Context(), id)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toItemDetailView(item, revisions))
+	httpx.JSON(w, http.StatusOK, toItemDetailView(item, visibleKnowledgeRevisions(revisions)))
 }
 
 // UpdateItem PATCH /api/knowledge/items/{knowledgeId} (author or admin). The
@@ -233,16 +241,44 @@ func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Unavailable("knowledge service is not configured"))
 		return
 	}
+	// R91 review read gate: the history route must not become a side channel for
+	// an item whose detail 404s. A secret-bearing stored item is hidden before
+	// its revisions are read; a clean item with a secret-bearing historical row
+	// keeps its 200 and has that row dropped below.
+	item, err := h.service.Get(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if knowledgeapp.ItemHasSecrets(item) {
+		httpx.Error(w, r, platform.NotFound("knowledge_item"))
+		return
+	}
 	revisions, err := h.service.Revisions(r.Context(), id)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
 	views := make([]knowledgeRevisionView, 0, len(revisions))
-	for _, revision := range revisions {
+	for _, revision := range visibleKnowledgeRevisions(revisions) {
 		views = append(views, toRevisionView(revision))
 	}
 	httpx.List(w, http.StatusOK, views, "", false)
+}
+
+// visibleKnowledgeRevisions drops append-only rows whose title/tags/content
+// carry a credential. The current item body may be clean while an older
+// revision is not, so both the detail payload and the revisions endpoint filter
+// row by row (R91).
+func visibleKnowledgeRevisions(revisions []knowledge.Revision) []knowledge.Revision {
+	visible := make([]knowledge.Revision, 0, len(revisions))
+	for _, revision := range revisions {
+		if knowledgeapp.RevisionHasSecrets(revision) {
+			continue
+		}
+		visible = append(visible, revision)
+	}
+	return visible
 }
 
 /* --------------------------------- helpers -------------------------------- */
@@ -272,6 +308,22 @@ func (h *Handler) review(w http.ResponseWriter, r *http.Request, action string) 
 	if h.service == nil {
 		httpx.Error(w, r, platform.Unavailable("knowledge service is not configured"))
 		return
+	}
+	// R91 review read gate: reject/revoke render the stored item through the
+	// review view, so a legacy secret-bearing item must be hidden exactly like a
+	// missing one (404) before any status write. Approve keeps its dedicated
+	// secret-specific 400 in the service so reviewers learn the body must be
+	// rewritten before approval.
+	if action != "approve" {
+		stored, err := h.service.Get(r.Context(), id)
+		if err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+		if knowledgeapp.ItemHasSecrets(stored) {
+			httpx.Error(w, r, platform.NotFound("knowledge_item"))
+			return
+		}
 	}
 	var item knowledge.Item
 	switch action {

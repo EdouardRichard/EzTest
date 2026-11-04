@@ -37,3 +37,9 @@ func (a *VersionCloseExecution) CountActiveWaves(ctx context.Context, versionID 
 func (a *VersionCloseExecution) CountInflightCaseRuns(ctx context.Context, versionID int64) (int, error) {
 	return a.readers.CountVersionInflightCaseRuns(ctx, versionID)
 }
+
+// ExecutionCoverage supplies the §5.3 execution-data and confirmed-case
+// terminal inputs of the version close predicate.
+func (a *VersionCloseExecution) ExecutionCoverage(ctx context.Context, versionID int64) (versionapp.VersionExecutionCoverage, error) {
+	return a.readers.ExecutionCoverage(ctx, versionID)
+}

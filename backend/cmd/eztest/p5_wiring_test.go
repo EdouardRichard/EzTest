@@ -23,10 +23,11 @@ import (
 const p5TestCommit = "0123456789abcdef0123456789abcdef01234567"
 
 // TestP5WiringAPIVersion pins the composition-root API version constant. The
-// value is what /api/health reports and what the frozen OpenAPI declares.
+// value is what /api/health reports; the frozen OpenAPI keeps its P8 identity
+// until 0.2.1 acceptance signs off (Task 68).
 func TestP5WiringAPIVersion(t *testing.T) {
-	if version != "0.2.0-p8" {
-		t.Fatalf("API version = %q, want 0.2.0-p8", version)
+	if version != "0.2.1" {
+		t.Fatalf("API version = %q, want 0.2.1", version)
 	}
 }
 

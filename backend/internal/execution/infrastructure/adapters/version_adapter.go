@@ -6,6 +6,7 @@ package adapters
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -33,6 +34,12 @@ type VersionReopener interface {
 	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
 }
 
+// VersionStageReader is the deterministic stage-machine projection consumed by
+// the execution intent gate (Task 78). *versionapp.StageMachine satisfies it.
+type VersionStageReader interface {
+	Stage(ctx context.Context, versionID int64) (versionapp.StageView, error)
+}
+
 // versionReopenTriggerExecutionIntent is the stable P4 reopen trigger owned by
 // the execution intent path (spec §7.5).
 const versionReopenTriggerExecutionIntent = "execution_intent"
@@ -42,6 +49,7 @@ const versionReopenTriggerExecutionIntent = "execution_intent"
 type VersionAdapter struct {
 	versions VersionService
 	reopener VersionReopener
+	stages   VersionStageReader
 }
 
 // NewVersionAdapter wires the version adapter. SetVersionReopener must be called
@@ -53,6 +61,14 @@ func NewVersionAdapter(versions VersionService) *VersionAdapter {
 // SetVersionReopener wires the P4 reopen service (wiring-time only).
 func (a *VersionAdapter) SetVersionReopener(reopener VersionReopener) {
 	a.reopener = reopener
+}
+
+// SetStageReader wires the deterministic version-stage projection. The
+// execution intent gate refuses to create initial intents unless the version is
+// executing, so production must set it; a nil reader leaves the stage empty,
+// which fails closed (never auto-executes).
+func (a *VersionAdapter) SetStageReader(reader VersionStageReader) {
+	a.stages = reader
 }
 
 var (
@@ -71,6 +87,13 @@ func (a *VersionAdapter) Get(ctx context.Context, id int64) (executionapp.Versio
 		VersionID: view.ID,
 		Status:    view.Status,
 		SUTs:      make([]executionapp.VersionSUTBinding, 0, len(view.Bindings)),
+	}
+	if a.stages != nil {
+		stage, stageErr := a.stages.Stage(ctx, id)
+		if stageErr != nil {
+			return executionapp.VersionBinding{}, stageErr
+		}
+		binding.Stage = string(stage.Stage)
 	}
 	for _, item := range view.Bindings {
 		sutBinding, mapErr := mapVersionBinding(item)
@@ -270,27 +293,86 @@ func (r *DesignCaseReader) ListExecutable(ctx context.Context, versionID int64) 
 	return snapshots, nil
 }
 
+// ResolveReplacement resolves the same logical case's current+confirmed version
+// through the design historical read (Task 106). It is the execution re-plan
+// input: a stale intent's confirmed version was replaced by a re-confirmed
+// revision, so the selected case can be queued again instead of silently
+// dropped.
+func (r *DesignCaseReader) ResolveReplacement(ctx context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, bool, error) {
+	view, found, err := r.graph.ReplacementCaseVersion(ctx, versionID, caseVersionID)
+	if err != nil {
+		return execution.CaseSnapshot{}, false, err
+	}
+	if !found {
+		return execution.CaseSnapshot{}, false, nil
+	}
+	return mapExecutableCase(view), true, nil
+}
+
+// CaseVersionLabel resolves the display labels of any case version of the
+// version, including superseded/stale history (Task 106 / PO E2E F11). It is
+// the fallback for terminal case_runs whose version left the executable set, so
+// the UI/report row keeps its case id and title.
+func (r *DesignCaseReader) CaseVersionLabel(ctx context.Context, versionID, caseVersionID int64) (executionapp.CaseVersionLabel, error) {
+	views, err := r.graph.ReadCaseVersionsByIDs(ctx, versionID, []int64{caseVersionID})
+	if err != nil {
+		return executionapp.CaseVersionLabel{}, err
+	}
+	if len(views) == 0 {
+		return executionapp.CaseVersionLabel{}, execution.ErrNotFound
+	}
+	view := views[0]
+	return executionapp.CaseVersionLabel{
+		CaseID:        view.CaseID,
+		CaseVersionID: view.ID,
+		Title:         view.Title,
+		Revision:      int(view.Revision),
+		Status:        view.Status,
+	}, nil
+}
+
+// mapExecutableCase maps a design executable case to the execution snapshot and
+// resolves the P2 target inheritance: case_step/case_assertion
+// target_version_sut_id is nullable and empty inherits
+// case_version.default_version_sut_id (P2 spec §case_step). A case without a
+// default target is unambiguous when the version has a single SUT, so that
+// binding is inherited too. QA-F1 died because the execution app received raw
+// target 0 and rejected the case before the agent could record anything.
 func mapExecutableCase(view designapp.ExecutableCaseView) execution.CaseSnapshot {
+	defaultSUT := view.DefaultVersionSUTID
+	if defaultSUT <= 0 && len(view.VersionSUTIDs) == 1 {
+		defaultSUT = view.VersionSUTIDs[0]
+	}
 	snapshot := execution.CaseSnapshot{
 		CaseID:               view.CaseID,
 		CaseVersionID:        view.CaseVersionID,
 		RequirementID:        view.RequirementID,
 		RequirementVersionID: view.RequirementVersionID,
-		DefaultVersionSUTID:  view.DefaultVersionSUTID,
+		DefaultVersionSUTID:  defaultSUT,
 		Title:                view.Title,
 		Description:          view.Description,
 		Preconditions:        view.Preconditions,
 		Priority:             view.Priority,
-		VersionSUTIDs:        append([]int64(nil), view.VersionSUTIDs...),
 		Steps:                make([]execution.CaseStep, 0, len(view.Steps)),
 		Assertions:           make([]execution.CaseAssertion, 0, len(view.Assertions)),
 	}
+	used := append([]int64(nil), view.VersionSUTIDs...)
+	if defaultSUT > 0 {
+		used = append(used, defaultSUT)
+	}
 	for _, step := range view.Steps {
+		target := step.TargetVersionSUTID
+		if target <= 0 {
+			target = defaultSUT
+		}
+		if target > 0 {
+			used = append(used, target)
+		}
 		snapshot.Steps = append(snapshot.Steps, execution.CaseStep{
 			Seq:                step.Seq,
 			Action:             step.Action,
 			Expected:           step.Expected,
-			TargetVersionSUTID: step.TargetVersionSUTID,
+			TargetVersionSUTID: target,
 			AccountRole:        step.AccountRole,
 			TargetPageID:       step.PageID,
 			TargetAPIID:        step.APIID,
@@ -298,14 +380,42 @@ func mapExecutableCase(view designapp.ExecutableCaseView) execution.CaseSnapshot
 		})
 	}
 	for _, assertion := range view.Assertions {
+		target := assertion.TargetVersionSUTID
+		if target <= 0 {
+			target = defaultSUT
+		}
+		if target > 0 {
+			used = append(used, target)
+		}
 		snapshot.Assertions = append(snapshot.Assertions, execution.CaseAssertion{
+			CaseAssertionID:    assertion.CaseAssertionID,
 			StepSeq:            assertion.StepSeq,
 			AssertionSeq:       assertion.AssertionSeq,
 			Kind:               assertion.Kind,
 			Expected:           assertion.Expected,
-			TargetVersionSUTID: assertion.TargetVersionSUTID,
+			TargetVersionSUTID: target,
 			TargetDatabaseID:   assertion.DatabaseID,
 		})
 	}
+	snapshot.VersionSUTIDs = normalizedCaseSUTIDs(used)
 	return snapshot
+}
+
+// normalizedCaseSUTIDs is the P3 §5.1 case SUT set: deduplicated and sorted so
+// one case version always fingerprints to the same intent.
+func normalizedCaseSUTIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	normalized := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i] < normalized[j] })
+	return normalized
 }

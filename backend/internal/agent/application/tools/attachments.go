@@ -62,7 +62,7 @@ type attachmentReadText struct{ deps Deps }
 func (t *attachmentReadText) Name() string { return ToolAttachmentReadText }
 
 func (t *attachmentReadText) Description() string {
-	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000）。"
+	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000）。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。"
 }
 
 func (t *attachmentReadText) Parameters() json.RawMessage {
@@ -111,10 +111,13 @@ func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.
 		"attachment_id": idString(attachmentID),
 		"name":          page.Name,
 		"mime":          page.MIME,
+		"status":        page.Status,
 		"offset":        page.Offset,
 		"text":          page.Text,
 		"total_chars":   page.TotalChars,
 		"truncated":     page.Truncated,
+		"error":         page.Error,
+		"retryable":     page.Retryable,
 	}, nil
 }
 

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -14,6 +14,7 @@ import type { RequirementDetail, TargetOptions } from "./types"
 const api = vi.hoisted(() => ({
   updateRequirement: vi.fn(),
   confirmRequirement: vi.fn(),
+  reopenRequirement: vi.fn(),
 }))
 vi.mock("./api", () => api)
 
@@ -59,6 +60,7 @@ describe("RequirementEditor", () => {
   beforeEach(() => {
     api.updateRequirement.mockReset()
     api.confirmRequirement.mockReset()
+    api.reopenRequirement.mockReset()
     api.updateRequirement.mockResolvedValue(updatedDetail)
     api.confirmRequirement.mockResolvedValue({
       confirmed: true,
@@ -149,6 +151,41 @@ describe("RequirementEditor", () => {
     )
     expect(screen.queryByTestId("editor-confirm")).not.toBeInTheDocument()
     expect(screen.getByTestId("editor-save")).toBeInTheDocument()
+  })
+
+  it("reopens a closed requirement with an explicit reason dialog", async () => {
+    const onUpdated = vi.fn()
+    const closedDetail: RequirementDetail = {
+      ...requirementDetailFixture,
+      status: "closed",
+    }
+    const reopened = { ...closedDetail, status: "draft" as const }
+    api.reopenRequirement.mockResolvedValue(reopened)
+    renderEditor({ requirement: closedDetail, onUpdated })
+
+    expect(screen.getByTestId("editor-closed-hint")).toHaveTextContent(
+      "该需求已闭环；重新打开后会回到草案",
+    )
+    expect(screen.queryByTestId("editor-confirm")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("editor-save")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("editor-reopen"))
+    const dialog = await screen.findByRole("dialog", { name: "重新打开需求" })
+    const submit = within(dialog).getByRole("button", { name: "重新打开需求" })
+    expect(submit).toBeDisabled()
+
+    fireEvent.change(within(dialog).getByLabelText("重开原因"), {
+      target: { value: "缺陷修复后重测" },
+    })
+    fireEvent.click(submit)
+
+    await waitFor(() =>
+      expect(api.reopenRequirement).toHaveBeenCalledWith("2001", "6001", {
+        reason: "缺陷修复后重测",
+      }),
+    )
+    expect(onUpdated).toHaveBeenCalledWith(reopened)
+    expect(await screen.findByRole("status")).toHaveTextContent("已重新打开为草案")
   })
 
   it("shows API validation errors inline", async () => {

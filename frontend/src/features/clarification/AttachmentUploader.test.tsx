@@ -117,4 +117,47 @@ describe("AttachmentUploader", () => {
     expect(onChange).toHaveBeenCalledWith([])
     expect(screen.queryByText("退款规则V2.pdf")).not.toBeInTheDocument()
   })
+
+  it("accepts xlsx and html files from the picker", () => {
+    render(<Harness />)
+
+    const accept = screen.getByTestId("attachment-input").getAttribute("accept") ?? ""
+    for (const extension of [".xlsx", ".html", ".htm"]) {
+      expect(accept).toContain(extension)
+    }
+  })
+
+  it("rejects legacy doc and ppt files with the save-as hint", async () => {
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["legacy"], "需求说明.doc")] },
+    })
+
+    expect(await screen.findByText(/另存为 \.docx\/\.pptx/)).toBeInTheDocument()
+    expect(api.uploadContent).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it("keeps an earlier upload failure when a later batch succeeds", async () => {
+    api.uploadContent
+      .mockRejectedValueOnce(
+        new ApiError({ status: 413, code: "payload_too_large", message: "附件超过 10 MiB" }),
+      )
+      .mockResolvedValueOnce(CONTENT)
+    render(<Harness />)
+
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["x"], "big.pdf")] },
+    })
+    expect(await screen.findByText(/附件超过 10 MiB/)).toBeInTheDocument()
+
+    fireEvent.change(screen.getByTestId("attachment-input"), {
+      target: { files: [new File(["ok"], "ok.txt", { type: "text/plain" })] },
+    })
+    await waitFor(() => expect(api.uploadContent).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("ok.txt")).toBeInTheDocument()
+    expect(screen.getByText(/附件超过 10 MiB/)).toBeInTheDocument()
+  })
 })

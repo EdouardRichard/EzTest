@@ -32,7 +32,9 @@ func (s *AnalysisService) autoGapDesign(ctx context.Context) bool {
 
 // analyzeCoverage computes the execution coverage gaps of one wave: for every
 // current clarified/closed requirement, a current+confirmed case version with
-// no passing latest case_run is a gap (P3 §8.1 step 3).
+// no passing latest non-superseded case_run is a gap (P3 §8.1 step 3). A
+// superseded run is a cancelled/replaced process row, never a result, so it
+// cannot erase the coverage of an earlier pass.
 func (s *AnalysisService) analyzeCoverage(ctx context.Context, wave execution.RunWave, _ []execution.CaseRun) error {
 	if s.requirements == nil || s.cases == nil {
 		return nil

@@ -34,6 +34,31 @@ type graphHashCase struct {
 	ContentHash      string `json:"content_hash"`
 }
 
+// CaseRunVerdict is the design projection of one case's latest execution
+// result (spec §9.3). The design context never imports the execution context:
+// it consumes the execution read port and maps the case_run status onto this
+// local four-state enum.
+type CaseRunVerdict string
+
+const (
+	CaseRunVerdictPassed       CaseRunVerdict = "passed"
+	CaseRunVerdictFailed       CaseRunVerdict = "failed"
+	CaseRunVerdictBlocked      CaseRunVerdict = "blocked"
+	CaseRunVerdictInconclusive CaseRunVerdict = "inconclusive"
+)
+
+// CaseRunVerdictFromStatus maps a case_run status onto the four-state design
+// verdict. Process states (pending/running/paused/skipped/interrupted/
+// superseded) and unknown values carry no verdict, so they are inconclusive.
+func CaseRunVerdictFromStatus(status string) CaseRunVerdict {
+	switch verdict := CaseRunVerdict(status); verdict {
+	case CaseRunVerdictPassed, CaseRunVerdictFailed, CaseRunVerdictBlocked, CaseRunVerdictInconclusive:
+		return verdict
+	default:
+		return CaseRunVerdictInconclusive
+	}
+}
+
 // ComputeGraphHash returns the stable sha256 of a design graph. Ordering from
 // the database is normalized so the same graph always hashes identically.
 func ComputeGraphHash(requirements []RequirementGraph) (string, error) {

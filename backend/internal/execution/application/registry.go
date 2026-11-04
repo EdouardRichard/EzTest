@@ -216,8 +216,10 @@ func (r *Registry) pollEndpoint(ctx context.Context, endpoint, token string, pro
 	instance.UpdatedAt = now
 	if health.Status != "" && health.Status != "ok" {
 		instance.LastError = truncateExecutorError(health.Error)
+		setExecutorDegraded(&instance, true)
 	} else {
 		instance.LastError = ""
+		setExecutorDegraded(&instance, false)
 	}
 	// A degraded executor still heartbeats and stays active (degraded is an
 	// alerting concern, not a P3 dispatch blocker, spec §6.2). Only an explicit
@@ -239,6 +241,9 @@ func (r *Registry) recordProbeFailure(ctx context.Context, endpoint string, prob
 		return getErr
 	}
 	existing.LastError = truncateExecutorError(probeErr.Error())
+	// An unreachable endpoint must not receive new work even before the offline
+	// window closes (the row is still active).
+	setExecutorDegraded(&existing, true)
 	existing.UpdatedAt = now
 	offlineAfter := r.offlineWindow(ctx)
 	if existing.LastHeartbeat == nil || now.Sub(*existing.LastHeartbeat) > offlineAfter {
@@ -265,11 +270,12 @@ func (r *Registry) Select(ctx context.Context) (*execution.ExecutorInstance, err
 		return nil, err
 	}
 	if len(extras) == 0 {
-		// P3 single-endpoint selection is intentionally unchanged.
+		// P3 single-endpoint selection is intentionally unchanged (except that a
+		// degraded health signal is never dispatchable).
 		sort.SliceStable(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 		for i := range rows {
 			row := rows[i]
-			if !row.Status.Dispatchable() {
+			if !row.Status.Dispatchable() || row.Degraded() {
 				continue
 			}
 			if endpoint != "" && normalizeExecutorEndpoint(row.Endpoint) != endpoint {
@@ -281,8 +287,9 @@ func (r *Registry) Select(ctx context.Context) (*execution.ExecutorInstance, err
 	}
 	candidates := make([]execution.ExecutorInstance, 0, len(rows))
 	for _, row := range rows {
-		// capacity=0 can never be selected; a full executor is not dispatchable.
-		if !row.Status.Dispatchable() || row.ActiveContexts >= row.Capacity {
+		// capacity=0 can never be selected; a full or degraded executor is not
+		// dispatchable.
+		if !row.Status.Dispatchable() || row.Degraded() || row.ActiveContexts >= row.Capacity {
 			continue
 		}
 		candidates = append(candidates, row)
@@ -453,6 +460,7 @@ func (r *Registry) RegisterPush(ctx context.Context, token string, in ExecutorRe
 	instance.LastHeartbeat = &now
 	instance.UpdatedAt = now
 	instance.LastError = ""
+	setExecutorDegraded(&instance, false)
 	if instance.Status != execution.ExecutorDraining {
 		instance.Status = execution.ExecutorActive
 	}
@@ -495,8 +503,10 @@ func (r *Registry) HeartbeatPush(ctx context.Context, in ExecutorHeartbeat) (exe
 	// dispatchable set. An active (or silent) heartbeat clears it.
 	if in.Status == "degraded" {
 		instance.LastError = "degraded"
+		setExecutorDegraded(&instance, true)
 	} else {
 		instance.LastError = ""
+		setExecutorDegraded(&instance, false)
 	}
 	instance.LastHeartbeat = &now
 	instance.UpdatedAt = now
@@ -617,4 +627,20 @@ func truncateExecutorError(message string) string {
 		return message
 	}
 	return message[:maxExecutorErrorLength]
+}
+
+// setExecutorDegraded maintains the explicit degraded health marker in the
+// persisted labels, independent of last_error text.
+func setExecutorDegraded(instance *execution.ExecutorInstance, degraded bool) {
+	if instance == nil {
+		return
+	}
+	if !degraded {
+		delete(instance.Labels, execution.ExecutorLabelDegraded)
+		return
+	}
+	if instance.Labels == nil {
+		instance.Labels = map[string]any{}
+	}
+	instance.Labels[execution.ExecutorLabelDegraded] = true
 }

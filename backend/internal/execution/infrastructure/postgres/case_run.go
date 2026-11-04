@@ -224,8 +224,10 @@ func (r *CaseRunRepository) ListRunningByExecutor(ctx context.Context, executorI
 	return collectCaseRuns(rows)
 }
 
-// LatestByCaseVersions returns the newest case_run per case_version of a
-// version (coverage analysis).
+// LatestByCaseVersions returns the newest non-superseded case_run per
+// case_version of a version (coverage analysis). A superseded run is a retired
+// process row, not a result: including it would let a cancelled wave erase the
+// coverage of an earlier passed run (QA release REL-Q2).
 func (r *CaseRunRepository) LatestByCaseVersions(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error) {
 	ctx = contextOrBackground(ctx)
 	result := map[int64]execution.CaseRun{}
@@ -237,6 +239,7 @@ func (r *CaseRunRepository) LatestByCaseVersions(ctx context.Context, versionID 
 		FROM case_run run
 		JOIN run_wave wave ON wave.id = run.wave_id
 		WHERE wave.version_id = $1 AND run.case_version_id = ANY($2::BIGINT[])
+		  AND run.status <> 'superseded'
 		ORDER BY run.case_version_id, run.id DESC
 	`, versionID, caseVersionIDs)
 	if err != nil {

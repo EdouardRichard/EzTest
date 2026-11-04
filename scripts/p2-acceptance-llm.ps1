@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     P2 real-LLM acceptance (DeepSeek official endpoint).
@@ -131,7 +131,7 @@ try {
     if (-not (Wait-Api 60)) { throw "API did not become ready" }
     Log "API ready at $apiBase"
 
-    $login = Api "POST" "/api/auth/login" @{ username = "admin"; password = "admin123" }
+    $login = Api "POST" "/api/auth/login" @{ username = "admin"; password = "[REDACTED]" }
     $token = [string]$login.data.token
 
     $config = Api "POST" "/api/admin/llm/configs" @{

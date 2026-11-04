@@ -338,6 +338,20 @@ func TestVersionCloseReaders(t *testing.T) {
 		t.Fatalf("inflight case runs = %d, want 1", inflight)
 	}
 
+	// Execution coverage: case 3001's latest run (5004) is still running, so it
+	// is the one confirmed case not yet executed; every other confirmed case has
+	// a terminal latest run.
+	coverage, err := adapters.ExecutionCoverage(ctx, 7)
+	if err != nil {
+		t.Fatalf("ExecutionCoverage: %v", err)
+	}
+	if !coverage.HasExecutionData {
+		t.Fatal("HasExecutionData = false, the version has case runs")
+	}
+	if coverage.UnconfirmedCases != 1 {
+		t.Fatalf("UnconfirmedCases = %d, want 1 (case 3001)", coverage.UnconfirmedCases)
+	}
+
 	openHumans, err := adapters.CountOpenHumanRequests(ctx, 7)
 	if err != nil {
 		t.Fatalf("CountOpenHumanRequests: %v", err)

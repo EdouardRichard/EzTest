@@ -1036,7 +1036,7 @@ type failureSubmitTool struct{ deps Deps }
 
 func (t *failureSubmitTool) Name() string { return ToolAnalysisFailureSubmit }
 func (t *failureSubmitTool) Description() string {
-	return "Submit a failure analysis candidate (refine only; never upgrade a non-application class to application; wave scope is validated by the server)."
+	return "Submit a failure analysis candidate (refine only; never upgrade a non-application class to application; wave scope is validated by the server). The server derives and returns the canonical category/severity from the case priority; the summary must describe evidence, not a different severity."
 }
 func (t *failureSubmitTool) Parameters() json.RawMessage {
 	return schemaObject(map[string]any{

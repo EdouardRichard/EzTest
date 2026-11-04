@@ -301,3 +301,273 @@ func normalizeTodoLimit(limit int) int {
 	}
 	return limit
 }
+
+/* ------------------- version-scoped facts / plan-item reads ------------------ */
+
+// Version read limits (0.2.1 contract: default 20, cap 100, matching the frozen
+// Cursor/Limit parameters).
+const (
+	defaultVersionReadLimit = 20
+	maxVersionReadLimit     = 100
+)
+
+// FactReadFilter is the user-supplied filter of the version fact list. Kind is
+// trimmed by the service; IncludeSuperseded widens the page to the append-only
+// history (default false = current facts only). BeforeID is the cursor.
+type FactReadFilter struct {
+	Kind              string
+	IncludeSuperseded bool
+	BeforeID          *int64
+	Limit             int
+}
+
+// FactReadQuery is the normalized form handed to the version read source.
+type FactReadQuery struct {
+	VersionID         int64
+	Kind              string
+	IncludeSuperseded bool
+	BeforeID          *int64
+	Limit             int
+}
+
+// FactReadRow is one version_fact row of a read page, including the append
+// timestamp the domain entity does not carry.
+type FactReadRow struct {
+	ID           int64
+	VersionID    int64
+	Kind         string
+	Key          string
+	Payload      map[string]any
+	Confidence   *float64
+	Source       string
+	SourceRef    string
+	EvidenceIDs  []int64
+	ContentHash  string
+	SupersededBy *int64
+	CreatedAt    time.Time
+}
+
+// FactReadView is the frozen FactView projection of one fact.
+type FactReadView struct {
+	ID           int64
+	VersionID    int64
+	Kind         string
+	Key          string
+	Payload      map[string]any
+	Confidence   *float64
+	Source       string
+	SourceRef    string
+	EvidenceIDs  []int64
+	ContentHash  string
+	SupersededBy *int64
+	CreatedAt    time.Time
+}
+
+// PlanItemReadFilter is the user-supplied filter of the plan-item list. Status
+// is trimmed by the service and empty means every status.
+type PlanItemReadFilter struct {
+	Status   string
+	BeforeID *int64
+	Limit    int
+}
+
+// PlanItemReadQuery is the normalized form handed to the version read source.
+type PlanItemReadQuery struct {
+	VersionID int64
+	Status    string
+	BeforeID  *int64
+	Limit     int
+}
+
+// PlanItemReadRow is one version_plan_item row of a read page.
+type PlanItemReadRow struct {
+	ID         int64
+	VersionID  int64
+	Phase      string
+	Title      string
+	Status     string
+	DependsOn  []int64
+	WorkItemID *int64
+	Decision   string
+	Order      int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// PlanItemReadView is the frozen PlanItemView projection of one plan item.
+type PlanItemReadView struct {
+	ID         int64
+	VersionID  int64
+	Phase      string
+	Title      string
+	Status     string
+	DependsOn  []int64
+	WorkItemID *int64
+	Decision   string
+	Order      int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// VersionReadReader is the version context's read-only source for facts, plan
+// items and the version existence probe. It is implemented outside the
+// application layer over the version context's own tables; it never writes and
+// every list method returns at most query.Limit+1 rows so the service can
+// report has_more without a COUNT query.
+type VersionReadReader interface {
+	// VersionExists reports whether the version row exists. A missing version
+	// makes the version-scoped read routes 404.
+	VersionExists(ctx context.Context, versionID int64) (bool, error)
+	// ListFacts returns one version's facts ordered by id DESC, optionally
+	// including superseded rows.
+	ListFacts(ctx context.Context, query FactReadQuery) ([]FactReadRow, bool, error)
+	// ListPlanItems returns one version's plan items ordered by id DESC,
+	// optionally filtered by status.
+	ListPlanItems(ctx context.Context, query PlanItemReadQuery) ([]PlanItemReadRow, bool, error)
+}
+
+// VersionReadService is the read-only application port behind
+// GET /api/versions/{id}/facts and /plan-items. It normalizes the cursor and
+// limit, validates the version scope and never mutates state.
+type VersionReadService struct {
+	reader VersionReadReader
+}
+
+// NewVersionReadService wires the version read model.
+func NewVersionReadService(reader VersionReadReader) *VersionReadService {
+	return &VersionReadService{reader: reader}
+}
+
+func (s *VersionReadService) requireReader() error {
+	if s == nil || s.reader == nil {
+		return platform.Unavailable("version read model is not configured")
+	}
+	return nil
+}
+
+// VersionExists reports whether the version exists. The version-scoped read
+// routes use it to turn a missing/foreign version into a 404 before any read.
+func (s *VersionReadService) VersionExists(ctx context.Context, versionID int64) (bool, error) {
+	if versionID <= 0 {
+		return false, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if err := s.requireReader(); err != nil {
+		return false, err
+	}
+	return s.reader.VersionExists(ctx, versionID)
+}
+
+// Facts returns one page of a version's facts, newest first. By default only
+// the current facts (superseded_by IS NULL) are returned; IncludeSuperseded
+// returns the whole append-only history.
+func (s *VersionReadService) Facts(ctx context.Context, versionID int64, filter FactReadFilter) ([]FactReadView, bool, error) {
+	if versionID <= 0 {
+		return nil, false, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if filter.BeforeID != nil && *filter.BeforeID <= 0 {
+		return nil, false, platform.Invalid("cursor", "must be a positive decimal ID")
+	}
+	if err := s.requireReader(); err != nil {
+		return nil, false, err
+	}
+	rows, hasMore, err := s.reader.ListFacts(ctx, FactReadQuery{
+		VersionID:         versionID,
+		Kind:              strings.TrimSpace(filter.Kind),
+		IncludeSuperseded: filter.IncludeSuperseded,
+		BeforeID:          filter.BeforeID,
+		Limit:             normalizeVersionReadLimit(filter.Limit),
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	views := make([]FactReadView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, FactReadView{
+			ID:           row.ID,
+			VersionID:    row.VersionID,
+			Kind:         row.Kind,
+			Key:          row.Key,
+			Payload:      factPayload(row.Payload),
+			Confidence:   row.Confidence,
+			Source:       row.Source,
+			SourceRef:    row.SourceRef,
+			EvidenceIDs:  factEvidenceIDs(row.EvidenceIDs),
+			ContentHash:  row.ContentHash,
+			SupersededBy: row.SupersededBy,
+			CreatedAt:    row.CreatedAt,
+		})
+	}
+	return views, hasMore, nil
+}
+
+// PlanItems returns one page of a version's plan items, newest first. A status
+// filter is trimmed and empty means every status; each view carries its
+// depends_on list and work item link.
+func (s *VersionReadService) PlanItems(ctx context.Context, versionID int64, filter PlanItemReadFilter) ([]PlanItemReadView, bool, error) {
+	if versionID <= 0 {
+		return nil, false, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if filter.BeforeID != nil && *filter.BeforeID <= 0 {
+		return nil, false, platform.Invalid("cursor", "must be a positive decimal ID")
+	}
+	if err := s.requireReader(); err != nil {
+		return nil, false, err
+	}
+	rows, hasMore, err := s.reader.ListPlanItems(ctx, PlanItemReadQuery{
+		VersionID: versionID,
+		Status:    strings.TrimSpace(filter.Status),
+		BeforeID:  filter.BeforeID,
+		Limit:     normalizeVersionReadLimit(filter.Limit),
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	views := make([]PlanItemReadView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, PlanItemReadView{
+			ID:         row.ID,
+			VersionID:  row.VersionID,
+			Phase:      row.Phase,
+			Title:      row.Title,
+			Status:     row.Status,
+			DependsOn:  planDependencyIDs(row.DependsOn),
+			WorkItemID: row.WorkItemID,
+			Decision:   row.Decision,
+			Order:      row.Order,
+			CreatedAt:  row.CreatedAt,
+			UpdatedAt:  row.UpdatedAt,
+		})
+	}
+	return views, hasMore, nil
+}
+
+func normalizeVersionReadLimit(limit int) int {
+	if limit <= 0 {
+		return defaultVersionReadLimit
+	}
+	if limit > maxVersionReadLimit {
+		return maxVersionReadLimit
+	}
+	return limit
+}
+
+func factPayload(payload map[string]any) map[string]any {
+	if payload == nil {
+		return map[string]any{}
+	}
+	return payload
+}
+
+func factEvidenceIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
+}
+
+func planDependencyIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
+}

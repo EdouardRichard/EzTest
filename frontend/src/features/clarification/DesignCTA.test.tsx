@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -28,5 +28,36 @@ describe("DesignCTA", () => {
 
     expect(fetchSpy).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
+  })
+
+  it("applies the requirement gate from the CTA at requirement_review", () => {
+    const onStartDesign = vi.fn()
+    render(
+      <DesignCTA
+        versionId="2001"
+        pendingCount={2}
+        stage="requirement_review"
+        onStartDesign={onStartDesign}
+      />,
+    )
+
+    expect(screen.queryByRole("link", { name: "开始设计" })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "开始设计" }))
+
+    expect(onStartDesign).toHaveBeenCalledTimes(1)
+  })
+
+  it("disables the gate action while it is submitting", () => {
+    render(
+      <DesignCTA
+        versionId="2001"
+        pendingCount={2}
+        stage="requirement_review"
+        starting
+        onStartDesign={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole("button", { name: "提交需求门…" })).toBeDisabled()
   })
 })

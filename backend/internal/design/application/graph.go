@@ -7,6 +7,7 @@ package designapp
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -20,16 +21,31 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
+// CaseRunStatusReader is the execution read port consumed by the design graph
+// to project each case's latest execution verdict. The implementation must
+// return the newest non-superseded case_run per case version id in one batched
+// lookup; a superseded process row is not a verdict. Design never reads the
+// execution tables directly (spec §2.1).
+type CaseRunStatusReader interface {
+	LatestCaseRunStatuses(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]string, error)
+}
+
 // GraphService serves graph/case reads, the case.graph_propose write path, user
 // confirmations, review/data-plan submissions.
 type GraphService struct {
-	repo     design.Repository
-	ids      platformid.Generator
-	clock    clock.Clock
-	audit    auditapp.Recorder
-	events   eventingapp.Publisher
-	teamRoom TeamRoom
-	reopener VersionReopener
+	repo      design.Repository
+	ids       platformid.Generator
+	clock     clock.Clock
+	audit     auditapp.Recorder
+	events    eventingapp.Publisher
+	teamRoom  TeamRoom
+	reopener  VersionReopener
+	caseRuns  CaseRunStatusReader
+	discovery DiscoveryFactsReader
+	// visual resolves the active visual_assertion configurations of a case
+	// version so confirmation can require a resolvable visual_assertion_id
+	// before a kind=visual assertion reaches execution (Task 115).
+	visual VisualAssertionResolver
 }
 
 // NewGraphService wires the graph service. audit, events and teamRoom are
@@ -68,6 +84,53 @@ func (s *GraphService) reopenCompleted(ctx context.Context, versionID int64, rea
 	_ = s.reopener.ReopenIfCompleted(ctx, versionID, "case_confirmed", reason)
 }
 
+// SetCaseRunStatusReader attaches the execution verdict projection used by
+// ReadGraph (spec §9.3). It returns the service for fluent wiring.
+func (s *GraphService) SetCaseRunStatusReader(reader CaseRunStatusReader) *GraphService {
+	if s != nil {
+		s.caseRuns = reader
+	}
+	return s
+}
+
+// SetVisualAssertionResolver attaches the visual context read port used by
+// confirmation to require a resolvable visual_assertion_id for every
+// kind=visual assertion (Task 115). It returns the service for fluent wiring.
+func (s *GraphService) SetVisualAssertionResolver(resolver VisualAssertionResolver) *GraphService {
+	if s != nil {
+		s.visual = resolver
+	}
+	return s
+}
+
+// latestCaseRunStatuses loads the newest case_run status per current case
+// version in one batched read. The execution projection is best effort: the
+// design graph is still served when the execution read fails and every case
+// then falls back to inconclusive.
+func (s *GraphService) latestCaseRunStatuses(ctx context.Context, versionID int64, requirements []design.RequirementGraph) map[int64]string {
+	if s == nil || s.caseRuns == nil {
+		return nil
+	}
+	caseVersionIDs := make([]int64, 0)
+	for _, requirement := range requirements {
+		for _, scenario := range requirement.Scenarios {
+			for _, item := range scenario.Cases {
+				if item.Current.ID > 0 {
+					caseVersionIDs = append(caseVersionIDs, item.Current.ID)
+				}
+			}
+		}
+	}
+	if len(caseVersionIDs) == 0 {
+		return nil
+	}
+	statuses, err := s.caseRuns.LatestCaseRunStatuses(ctx, versionID, caseVersionIDs)
+	if err != nil {
+		return nil
+	}
+	return statuses
+}
+
 // ReadGraph returns the full version design graph snapshot.
 func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphView, error) {
 	if err := requirePositiveID("version_id", versionID); err != nil {
@@ -81,6 +144,7 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 	if err != nil {
 		return GraphView{}, err
 	}
+	caseRunStatuses := s.latestCaseRunStatuses(ctx, versionID, data.Requirements)
 	view := GraphView{
 		VersionID:                 data.VersionID,
 		GeneratedAt:               s.clock.Now().UTC(),
@@ -114,6 +178,10 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 				Cases:                make([]CaseCardView, 0, len(scenario.Cases)),
 			}
 			for _, item := range scenario.Cases {
+				verdict := design.CaseRunVerdictInconclusive
+				if status, ok := caseRunStatuses[item.Current.ID]; ok {
+					verdict = design.CaseRunVerdictFromStatus(status)
+				}
 				scenarioView.Cases = append(scenarioView.Cases, CaseCardView{
 					CaseID:              item.Case.ID,
 					CurrentVersionID:    derefInt64(item.Case.CurrentVersionID),
@@ -127,6 +195,7 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 					APIIDs:              item.Current.APIIDs,
 					StepCount:           item.StepCount,
 					AssertionCount:      item.AssertionCount,
+					ExecutionVerdict:    string(verdict),
 					CreatedAt:           utcNow(item.Current.CreatedAt),
 				})
 			}
@@ -244,6 +313,12 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 	if requirement.CurrentVersionID == 0 || requirement.CurrentVersionID != in.RequirementVersionID {
 		return ProposeResult{}, platform.StateConflict("the requirement version is stale; re-read the graph and retry")
 	}
+
+	// Task 120: ordinary functional ACs must generate non-visual assertions.
+	// Apply the default before validation and persistence so both the stored
+	// case version and its content hash reflect the assertion that will run;
+	// an explicit visual-baseline requirement keeps kind=visual untouched.
+	normalizeProposalAssertionKinds(&in, requirement)
 
 	graph, err := s.repo.ReadGraph(ctx, versionID)
 	if err != nil {
@@ -389,6 +464,14 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 					result.CaseVersionIDs = append(result.CaseVersionIDs, existing.Current.ID)
 					continue
 				}
+				// Task 106: a confirmed current version is the immutable unit
+				// frozen by the case gate and the execute.batch selection. A
+				// changed proposal must never silently replace it with a new
+				// draft: that is exactly the PO E2E v1..v5 churn that turned
+				// 6/12 confirmed batch-A cases into unexecuted superseded runs.
+				if existing.Current.Status == design.CaseStatusConfirmed {
+					return confirmedCaseVersionFrozenError(existing)
+				}
 				if _, err := tx.InsertCaseVersion(ctx, next); err != nil {
 					return err
 				}
@@ -458,6 +541,36 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 		s.recordAudit(ctx, in.RequirementID, result.CaseIDs, created, actorID)
 	}
 	return result, nil
+}
+
+// confirmedCaseVersionFrozenError is the typed 409 returned when a changed
+// proposal addresses a confirmed current case version (Task 106). The message
+// names the explicit redesign path because the freeze is deliberate: the
+// confirmed version is what the case gate froze and what an execute.batch
+// selection/wave executes, so a background design revision may not replace it.
+func confirmedCaseVersionFrozenError(item design.CaseWithCurrent) *platform.Error {
+	version := design.CaseVersion{}
+	if item.Current != nil {
+		version = *item.Current
+	}
+	title := strings.TrimSpace(version.Title)
+	if title == "" {
+		title = "untitled case"
+	}
+	return &platform.Error{
+		Status: http.StatusConflict,
+		Code:   "confirmed_case_version_frozen",
+		Message: fmt.Sprintf(
+			"case %q version %d is confirmed and frozen; a design change cannot silently replace a confirmed current version. Revise the requirement (which marks confirmed cases stale and reopens design) or reject the case gate to redesign it explicitly.",
+			title, version.ID,
+		),
+		Details: map[string]any{
+			"case_id":         platformid.Format(item.Case.ID),
+			"case_version_id": platformid.Format(version.ID),
+			"revision":        version.Revision,
+			"next_action":     "revise the requirement or explicitly reject the case gate before redesigning this case",
+		},
+	}
 }
 
 // buildCaseVersion maps one proposal case onto a CaseVersion. When current is
@@ -781,6 +894,10 @@ type ExecutableStepView struct {
 // ExecutableAssertionView is one P3 case assertion projection. AssertionSeq is
 // derived server-side by ascending case_assertion ID (P3-D-06).
 type ExecutableAssertionView struct {
+	// CaseAssertionID is the design case_assertion.id. Execution uses it to
+	// join the visual assertion configuration to the exact design assertion
+	// (Task 115), not just to a derived position.
+	CaseAssertionID    int64
 	StepSeq            int
 	AssertionSeq       int
 	Kind               string
@@ -822,6 +939,41 @@ func (s *GraphService) ListExecutable(ctx context.Context, versionID int64) ([]E
 	return views, nil
 }
 
+// ReplacementCaseVersion returns the current+confirmed case version of the same
+// logical case that replaces historicalCaseVersionID, when one exists. It is
+// the design read behind the execution P3 §4.9 re-plan (Task 106): when an
+// intent's confirmed case version is no longer current+confirmed, execution
+// asks whether the case was re-confirmed as a new revision and, if so, queues
+// that revision instead of silently dropping the selected case. A missing,
+// foreign or still-current historical version reports found=false.
+func (s *GraphService) ReplacementCaseVersion(ctx context.Context, versionID, historicalCaseVersionID int64) (ExecutableCaseView, bool, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return ExecutableCaseView{}, false, err
+	}
+	if err := requirePositiveID("case_version_id", historicalCaseVersionID); err != nil {
+		return ExecutableCaseView{}, false, err
+	}
+	history, err := s.repo.ReadCaseVersionsByIDs(ctx, versionID, []int64{historicalCaseVersionID})
+	if err != nil {
+		return ExecutableCaseView{}, false, mapDesignError(err, "case version")
+	}
+	if len(history) == 0 || history[0].CaseID <= 0 {
+		return ExecutableCaseView{}, false, nil
+	}
+	caseID := history[0].CaseID
+	executables, err := s.repo.ListExecutableCases(ctx, versionID)
+	if err != nil {
+		return ExecutableCaseView{}, false, mapDesignError(err, "case version")
+	}
+	for _, item := range executables {
+		if item.CaseID != caseID || item.Version.ID == historicalCaseVersionID {
+			continue
+		}
+		return executableCaseView(item), true, nil
+	}
+	return ExecutableCaseView{}, false, nil
+}
+
 func executableCaseView(data design.ExecutableCase) ExecutableCaseView {
 	version := data.Version
 	view := ExecutableCaseView{
@@ -852,6 +1004,7 @@ func executableCaseView(data design.ExecutableCase) ExecutableCaseView {
 	}
 	for _, assertion := range version.Assertions {
 		view.Assertions = append(view.Assertions, ExecutableAssertionView{
+			CaseAssertionID:    assertion.ID,
 			StepSeq:            assertion.StepSeq,
 			AssertionSeq:       assertion.AssertionSeq,
 			Kind:               assertion.Kind,

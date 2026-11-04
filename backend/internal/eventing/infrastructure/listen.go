@@ -105,6 +105,18 @@ func (l *Listener) Ready() <-chan struct{} {
 	return l.ready
 }
 
+// Observe registers an additional post-delivery observer on this replica's
+// cross-instance listener (for example the event-driven reconciler wake). The
+// observer runs after the event has been broadcast to the local hub, so a slow
+// observer cannot delay SSE delivery, and its error is logged by the listener.
+// It is safe to call while Run is delivering events.
+func (l *Listener) Observe(observer eventingapp.EventObserver) {
+	if l == nil || l.dispatcher == nil || observer == nil {
+		return
+	}
+	l.dispatcher.Observe(observer)
+}
+
 // Run blocks until ctx is cancelled, reconnecting whenever the LISTEN session
 // fails. A nil configuration returns an error instead of spinning.
 func (l *Listener) Run(ctx context.Context) error {

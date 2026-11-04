@@ -87,7 +87,7 @@ func (r *Repository) ListCandidateVersionIDs(ctx context.Context, limit int) ([]
 func (r *Repository) ListClarifiedRequirements(ctx context.Context, versionID int64) ([]design.RequirementRef, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       COALESCE(rv.target_version_suts, '[]'::jsonb)
+		       rv.priority, COALESCE(rv.target_version_suts, '[]'::jsonb)
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.version_id = $1 AND r.status = 'clarified'
@@ -102,7 +102,7 @@ func (r *Repository) ListClarifiedRequirements(ctx context.Context, versionID in
 		var ref design.RequirementRef
 		var targetSUTs []byte
 		if err := rows.Scan(&ref.ID, &ref.VersionID, &ref.CurrentVersionID, &ref.Revision,
-			&ref.Title, &ref.Status, &targetSUTs); err != nil {
+			&ref.Title, &ref.Status, &ref.Priority, &targetSUTs); err != nil {
 			return nil, fmt.Errorf("scan clarified requirement: %w", err)
 		}
 		if ref.TargetVersionSUTIDs, err = decodeIDArray(targetSUTs); err != nil {
@@ -150,7 +150,7 @@ func (r *Repository) ListActiveScopes(ctx context.Context, versionID int64) ([]d
 func (r *Repository) ListRequirementCoverage(ctx context.Context, versionID int64) ([]design.RequirementCoverage, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       COALESCE(rv.target_version_suts, '[]'::jsonb),
+		       rv.priority, COALESCE(rv.target_version_suts, '[]'::jsonb),
 		       (SELECT count(*) FROM case_scenario s
 		        WHERE s.version_id = r.version_id AND s.requirement_id = r.id
 		          AND s.requirement_version_id = r.current_version_id),
@@ -190,7 +190,8 @@ func (r *Repository) ListRequirementCoverage(ctx context.Context, versionID int6
 		var targetSUTs []byte
 		if err := rows.Scan(&coverage.Requirement.ID, &coverage.Requirement.VersionID,
 			&coverage.Requirement.CurrentVersionID, &coverage.Requirement.Revision,
-			&coverage.Requirement.Title, &coverage.Requirement.Status, &targetSUTs,
+			&coverage.Requirement.Title, &coverage.Requirement.Status,
+			&coverage.Requirement.Priority, &targetSUTs,
 			&coverage.ScenarioCount, &coverage.DraftCount, &coverage.ConfirmedCount,
 			&coverage.StaleCount); err != nil {
 			return nil, fmt.Errorf("scan requirement coverage: %w", err)

@@ -3,17 +3,22 @@ package agentapp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 )
 
@@ -26,6 +31,7 @@ type runnerFixture struct {
 	conv            *fakeConversationPort
 	versions        *fakeVersionReader
 	attachments     *fakeAttachmentReader
+	images          *fakeImageLoader
 	team            *fakeTeamRoomPort
 	content         *fakeContentWriter
 	settings        *fakeSettings
@@ -37,6 +43,10 @@ type runnerFixture struct {
 	knowledge       *fakeKnowledgeReader
 	knowledgeUsage  *fakeKnowledgeUsageRecorder
 	knowledgeWriter *fakeKnowledgeWriter
+	briefing        *fakeBriefingSource
+	clarification   *fakeClarificationConverger
+	designRounds    *fakeDesignRoundStarter
+	batches         *fakeBatchStarter
 	load            *load.Counter
 }
 
@@ -70,6 +80,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		attachments: &fakeAttachmentReader{info: agentapp.AttachmentInfo{
 			Name: "需求.md", MIME: "text/markdown", Status: "done", Text: "登录需求正文", TotalChars: 6,
 		}},
+		images:  &fakeImageLoader{images: map[string]agentapp.ImageData{}},
 		team:    &fakeTeamRoomPort{},
 		content: &fakeContentWriter{},
 		settings: &fakeSettings{ints: map[string]int64{
@@ -88,6 +99,10 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		knowledge:       &fakeKnowledgeReader{},
 		knowledgeUsage:  &fakeKnowledgeUsageRecorder{},
 		knowledgeWriter: &fakeKnowledgeWriter{},
+		briefing:        defaultAssemblyBriefing(),
+		clarification:   &fakeClarificationConverger{},
+		designRounds:    &fakeDesignRoundStarter{},
+		batches:         &fakeBatchStarter{},
 		load:            &load.Counter{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
@@ -101,10 +116,15 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		Conversation:   fixture.conv,
 		Versions:       fixture.versions,
 		Attachments:    fixture.attachments,
+		Images:         fixture.images,
 		TeamRoom:       fixture.team,
 		Content:        fixture.content,
 		Knowledge:      fixture.knowledge,
 		KnowledgeUsage: fixture.knowledgeUsage,
+		Briefing:       agentcontext.NewBriefingBuilder(fixture.briefing),
+		Clarification:  fixture.clarification,
+		DesignRounds:   fixture.designRounds,
+		Batches:        fixture.batches,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Load:           fixture.load,
 		TaskProvider:   taskProvider,
@@ -274,11 +294,13 @@ func TestRunnerCuratorToolCallWritesRequirementCard(t *testing.T) {
 		t.Fatalf("conversation messages = %d", len(fixture.conv.appended))
 	}
 	parts := fixture.conv.appended[0].Parts
-	if len(parts) != 2 || parts[0].Type != "text" || parts[1].Type != "requirement_card" {
+	text, hasText := partOfType(parts, "text")
+	card, hasCard := partOfType(parts, "requirement_card")
+	if !hasText || !hasCard || text.Text == "" {
 		t.Fatalf("parts = %#v", parts)
 	}
-	if parts[1].Data["requirement_id"] != "501" || parts[1].Data["revision"] != 1 {
-		t.Fatalf("card = %#v", parts[1].Data)
+	if card.Data["requirement_id"] != "501" || card.Data["revision"] != 1 {
+		t.Fatalf("card = %#v", card.Data)
 	}
 
 	toolMessages := 0
@@ -312,7 +334,12 @@ func TestRunnerScoutWritesTeamRoomFinding(t *testing.T) {
 	if len(fixture.chat.requests) == 0 || len(fixture.chat.requests[0].Messages) < 2 {
 		t.Fatalf("chat request missing user attachment context: %#v", fixture.chat.requests)
 	}
-	userContent := fixture.chat.requests[0].Messages[1].Content
+	messages := fixture.chat.requests[0].Messages
+	last := messages[len(messages)-1]
+	if last.Role != "user" {
+		t.Fatalf("last prompt message role = %q, want the current user turn", last.Role)
+	}
+	userContent := last.Content
 	if !strings.Contains(userContent, "请阅读附件《需求.md》") || !strings.Contains(userContent, "登录需求正文") {
 		t.Fatalf("scout user content = %q", userContent)
 	}
@@ -355,6 +382,68 @@ func TestRunnerStopsAtMaxTurnsBudget(t *testing.T) {
 	}
 	if !containsEvent(fixture.events, "agent.run.failed") {
 		t.Fatalf("events = %v", eventTypes(fixture.events))
+	}
+	// The failed-run event carries the Task 9 failure taxonomy (spec §5.6), so
+	// the UI can show what happened/impact/next step without parsing the error.
+	var failedPayload map[string]any
+	for _, event := range fixture.events.events {
+		if event.Type == "agent.run.failed" {
+			failedPayload = event.Payload
+		}
+	}
+	if failedPayload["failure_kind"] != string(agentapp.FailureKindBudget) {
+		t.Fatalf("agent.run.failed payload = %#v, want failure_kind %q", failedPayload, agentapp.FailureKindBudget)
+	}
+}
+
+// TestRunnerSettlesOnTurnFuse pins that the default turn fuse leaves exactly
+// one loop turn for the tool-less settlement turn. Before the fix the fuse
+// equalled the loop cap, so Decide could never observe turns >= fuse and the
+// loop hard-failed without ever asking the model to wrap up.
+func TestRunnerSettlesOnTurnFuse(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.settings.ints["agent.max_turns"] = 2
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolContextVersionPack, `{}`),
+		{Content: "回合上限已到，以下为收尾回复。"},
+	}
+
+	result, err := mustRun(t, fixture, hostItem())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone || result.Turns != 2 {
+		t.Fatalf("result = %#v, want a settled done run at the fuse turn", result)
+	}
+	if count := len(fixture.chat.request(1).Tools); count != 0 {
+		t.Fatalf("fuse turn still exposes %d tools, want the settlement surface", count)
+	}
+}
+
+// TestRunnerSettlesWhenZeroTotalReportsComponents pins the usage aggregation:
+// providers that report total_tokens=0 plus a component breakdown must still
+// hit the token budget, otherwise the settlement turn never triggers.
+func TestRunnerSettlesWhenZeroTotalReportsComponents(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	item := hostItem()
+	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":12}`)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{
+			ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
+			Usage:     map[string]int{"total_tokens": 0, "prompt_tokens": 7, "completion_tokens": 7},
+		},
+		{Content: "预算已用尽，以下为收尾回复。"},
+	}
+
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %#v, want a settled done run", result)
+	}
+	if count := len(fixture.chat.request(1).Tools); count != 0 {
+		t.Fatalf("settlement turn still exposes %d tools; the component breakdown was ignored", count)
 	}
 }
 
@@ -576,6 +665,9 @@ func TestRunnerDesignHostUsesDesignProfileAndTeamRoom(t *testing.T) {
 	if !strings.Contains(prompt, "设计会话") || strings.Contains(prompt, "澄清会话的开场") {
 		t.Fatalf("design opening prompt = %q", prompt)
 	}
+	if !strings.Contains(prompt, "视觉基线") || !strings.Contains(prompt, "不要用 visual") {
+		t.Fatalf("design opening prompt must carry the non-visual assertion default: %q", prompt)
+	}
 	for _, definition := range fixture.chat.request(0).Tools {
 		if definition.Name == "case.confirm" {
 			t.Fatal("case.confirm must never be exposed to the model")
@@ -638,6 +730,242 @@ func TestRunnerDesignAuthorCallsGraphToolsWithScopeAndPostsTeamUpdate(t *testing
 	}
 }
 
+// TestRunnerAcceptsConversationKinds pins Task 65's kind→profile mapping. The
+// 0.2.1 stage/conversation kinds must resolve to a profile (or the deterministic
+// stage-entry path) instead of returning invalid_work_type, while an unknown
+// type still fails closed. The 0.2.0 work types keep their frozen mapping.
+func TestRunnerAcceptsConversationKinds(t *testing.T) {
+	cases := []struct {
+		workType string
+		profile  string
+	}{
+		{agentapp.WorkTypeChatTurn, agentapp.ProfileKeyClarificationHost},
+		{agentapp.WorkTypeRequirementCurate, agentapp.ProfileKeyRequirementCurator},
+		{agentapp.WorkTypeAttachmentIngest, agentapp.ProfileKeyContextScout},
+		{agentapp.WorkTypeDesignRound, agentapp.ProfileKeyDesignPlanner},
+		{agentapp.WorkTypeDesignRequirement, agentapp.ProfileKeyCaseAuthor},
+		{agentapp.WorkTypeDesignGap, agentapp.ProfileKeyCaseAuthor},
+		{agentapp.WorkTypeDesignCritic, agentapp.ProfileKeyDesignCritic},
+		{agentapp.WorkTypeDesignDataPlan, agentapp.ProfileKeyDataPlanner},
+		{agentapp.WorkTypeExecuteCase, agentapp.ProfileKeyCaseExecutor},
+		{agentapp.WorkTypeAnalyzeFailure, agentapp.ProfileKeyFailureAnalyst},
+		{agentapp.WorkTypeAnalyzeCoverage, agentapp.ProfileKeyCoverageAnalyst},
+		{agentapp.WorkTypeIssueTriage, agentapp.ProfileKeyIssueTriager},
+		{agentapp.WorkTypeReportVersion, agentapp.ProfileKeyReportWriter},
+		{agentapp.WorkTypeRequirementClose, agentapp.ProfileKeyVersionSteward},
+		{agentapp.WorkTypeVersionClose, agentapp.ProfileKeyVersionSteward},
+		// 0.2.1 work-item kinds (contracts/task-types.md §9.1). The two
+		// stage-entry kinds also have a deterministic runner path; the mapping
+		// is still the profile that owns the produced artifact.
+		{agent.WorkItemKindDesignCases, agentapp.ProfileKeyCaseAuthor},
+		{agent.WorkItemKindReviewCases, agentapp.ProfileKeyDesignCritic},
+		{agent.WorkItemKindExecuteBatch, agentapp.ProfileKeyCaseExecutor},
+		{agent.WorkItemKindExploreLogin, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExplorePage, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExploreAPI, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExploreCoverage, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindExploreGap, agentapp.ProfileKeyContextScout},
+		{agent.WorkItemKindAnalyzeFailure, agentapp.ProfileKeyFailureAnalyst},
+		{agent.WorkItemKindReportVersion, agentapp.ProfileKeyReportWriter},
+		{agent.WorkItemKindKnowledgePropose, agentapp.ProfileKeyKnowledgeCurator},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.workType, func(t *testing.T) {
+			profile, ok := agentapp.ProfileKeyForWorkType(testCase.workType)
+			if !ok || profile != testCase.profile {
+				t.Fatalf("profile = %q (ok=%v), want %q", profile, ok, testCase.profile)
+			}
+		})
+	}
+
+	if _, ok := agentapp.ProfileKeyForWorkType("unknown.work"); ok {
+		t.Fatal("an unknown work type must stay unsupported")
+	}
+
+	// The 0.2.1 kind is authoritative over the frozen type column.
+	legacy := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20})
+	if got := agentapp.WorkTypeForItem(legacy); got != agentapp.WorkTypeChatTurn {
+		t.Fatalf("legacy work type = %q", got)
+	}
+	contractItem := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20})
+	contractItem.Kind = agent.WorkItemKindDesignCases
+	if got := agentapp.WorkTypeForItem(contractItem); got != agent.WorkItemKindDesignCases {
+		t.Fatalf("contract work type = %q, want the kind", got)
+	}
+
+	// A background explore kind must run through the explorer profile instead
+	// of being rejected as an unsupported work item.
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "已检查探索范围与页面可访问性。"}}
+	explore := fakeWorkItem(agent.WorkItemKindExplorePage, agentapp.WorkItemPayload{})
+	explore.Team = agent.TeamClarification
+	result, err := mustRun(t, fixture, explore)
+	if err != nil {
+		t.Fatalf("explore.page run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("explore.page result = %#v", result)
+	}
+	if finished := fixture.repo.lastFinished(t); finished.ProfileKey != agentapp.ProfileKeyContextScout {
+		t.Fatalf("explore.page profile = %q", finished.ProfileKey)
+	}
+}
+
+// TestDesignRoundProducesCases pins the Task 65 design chain end to end at the
+// runner boundary: the 0.2.1 design.cases stage job opens the design round (the
+// deterministic port is really called and its job card reaches the design
+// conversation), and the round's case-author task then submits real case drafts
+// through case.graph_propose with requirement-version evidence, so the design
+// conversation records the proposal call.
+func TestDesignRoundProducesCases(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.designRounds.conversationID = 20
+
+	stageItem := fakeWorkItem("", agentapp.WorkItemPayload{})
+	stageItem.Kind = agent.WorkItemKindDesignCases
+	stageItem.Type = agent.WorkItemKindDesignCases
+	stageItem.Team = agent.TeamDesign
+	stageItem.Inputs = json.RawMessage(`{"requirement_ids":["501","502"]}`)
+	stageItem.Payload = json.RawMessage(`{}`)
+
+	result, err := mustRun(t, fixture, stageItem)
+	if err != nil {
+		t.Fatalf("design.cases run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("design.cases result = %#v", result)
+	}
+	if fixture.designRounds.calls != 1 || fixture.designRounds.versionID != 10 {
+		t.Fatalf("design round starter calls = %d version=%d", fixture.designRounds.calls, fixture.designRounds.versionID)
+	}
+	if !slices.Equal(fixture.designRounds.requirementIDs, []int64{501, 502}) {
+		t.Fatalf("design round requirement ids = %v", fixture.designRounds.requirementIDs)
+	}
+	var card *fakeJobCardRecord
+	for index := range fixture.conv.jobCards {
+		if fixture.conv.jobCards[index].ConversationID == 20 {
+			card = &fixture.conv.jobCards[index]
+		}
+	}
+	if card == nil {
+		t.Fatal("design.cases job card was not projected into the design conversation")
+	}
+	if got := card.Data["kind"]; got != agent.WorkItemKindDesignCases {
+		t.Fatalf("job card kind = %v", got)
+	}
+	if got := card.Data["status"]; got != "done" {
+		t.Fatalf("job card status = %v, want the real terminal state done", got)
+	}
+
+	// The round's per-requirement case-author task produces case drafts through
+	// the existing proposal path.
+	fixture.design.readResult = map[string]any{
+		"requirements": []any{map[string]any{
+			"requirement_id": "501", "requirement_version_id": "700",
+		}},
+		"discovery_facts": []any{map[string]any{
+			"kind": "page", "key": "page:env:1:/login", "summary": "/login · 登录",
+		}},
+	}
+	fixture.design.proposeResult = map[string]any{"case_version_ids": []string{"7001"}}
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignGraphRead, `{"requirement_id":"501"}`),
+		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
+		{Content: "已为需求 501 生成 1 个场景与 1 条用例草案。"},
+	}
+	authorItem := fakeWorkItem(agentapp.WorkTypeDesignRequirement, agentapp.WorkItemPayload{
+		ConversationID: 20, RoundID: 9001, RequirementID: 501, RequirementVersionID: 700,
+	})
+	if _, err := mustRun(t, fixture, authorItem); err != nil {
+		t.Fatalf("case author run: %v", err)
+	}
+	if fixture.design.proposeCalls != 1 {
+		t.Fatalf("case proposals = %d, want the case author to produce cases", fixture.design.proposeCalls)
+	}
+	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
+		t.Fatalf("proposal = %#v", fixture.design.proposeInput)
+	}
+	proposalInConversation := false
+	for _, message := range fixture.conv.appended {
+		for _, part := range message.Parts {
+			if part.Type == "tool_call" && stringValueForTest(part.Data["name"]) == tools.ToolCaseGraphPropose {
+				proposalInConversation = true
+			}
+		}
+	}
+	if !proposalInConversation {
+		t.Fatal("the design conversation does not record the case-proposal tool call")
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id", "视觉基线", "不要用 visual"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("case author prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
+func stringValueForTest(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+// TestDesignRoundProposesCases pins Task 69: the design.round opening turn must
+// propose case drafts through case.graph_propose (one graph read, then propose)
+// instead of asking the user to pick a requirement, and its prompt must carry
+// the round's scoped requirement ids so the model proposes the right scope.
+func TestDesignRoundProposesCases(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.design.readResult = map[string]any{
+		"requirements": []any{
+			map[string]any{"requirement_id": "501", "requirement_version_id": "700"},
+			map[string]any{"requirement_id": "502", "requirement_version_id": "800"},
+		},
+		"discovery_facts": []any{map[string]any{
+			"kind": "page", "key": "page:env:1:/login", "summary": "/login · 登录",
+		}},
+	}
+	fixture.design.proposeResult = map[string]any{"case_version_ids": []string{"7001"}}
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignGraphRead, `{}`),
+		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
+		{Content: "已为本轮需求提交 1 个场景与 1 条用例草案。"},
+	}
+	item := fakeWorkItem(agentapp.WorkTypeDesignRound, agentapp.WorkItemPayload{
+		ConversationID: 20,
+		RoundID:        9001,
+	})
+	item.Payload = json.RawMessage(`{
+		"conversation_id":"20",
+		"round_id":"9001",
+		"requirement_ids":["501","502"],
+		"requirement_version_ids":["700","800"]
+	}`)
+
+	if _, err := mustRun(t, fixture, item); err != nil {
+		t.Fatalf("design.round run: %v", err)
+	}
+	if fixture.design.proposeCalls != 1 {
+		t.Fatalf("design.round proposals = %d, want the round to propose cases itself", fixture.design.proposeCalls)
+	}
+	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
+		t.Fatalf("design.round proposal = %#v", fixture.design.proposeInput)
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	for _, want := range []string{
+		"case.graph_propose", "不要询问用户", "requirement_ids=501,502",
+		"requirement_version_ids=700,800", "视觉基线", "不要用 visual",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("design.round prompt missing %q: %s", want, prompt)
+		}
+	}
+	for _, avoid := range []string{"只输出范围说明", "不写库、不调用写工具"} {
+		if strings.Contains(prompt, avoid) {
+			t.Fatalf("design.round prompt still tells the model not to write (%q): %s", avoid, prompt)
+		}
+	}
+}
+
 func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.conv.kind = "design"
@@ -656,7 +984,7 @@ func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {
 		t.Fatalf("post = %#v", post)
 	}
 	prompt := requestPrompt(fixture.chat.request(0))
-	for _, want := range []string{"design.round", "round_id=9001"} {
+	for _, want := range []string{"design.round", "round_id=9001", "视觉基线"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("planner prompt missing %q: %s", want, prompt)
 		}
@@ -746,6 +1074,194 @@ func TestProfileKeyForWorkType(t *testing.T) {
 	}
 }
 
+// imageHostFixture seeds the triggering user message with one image part and a
+// resolvable image loader. The fake gateway enforces supports_vision like the
+// real catalog gate.
+func imageHostFixture(t *testing.T) (*runnerFixture, string) {
+	t.Helper()
+	fixture := newRunnerFixture(t)
+	sha := strings.Repeat("a", 64)
+	fixture.conv.messages[501] = agentapp.ConversationMessage{
+		ID: 501, Role: "user", Text: "这张截图说明了什么？",
+		Parts: []agentapp.ConversationPart{{
+			Type: "image",
+			Data: map[string]any{"mime": "image/png", "data_ref": sha, "width": 800, "height": 600},
+		}},
+	}
+	fixture.images.images[sha] = agentapp.ImageData{MIME: "image/png", Data: []byte("png-bytes")}
+	fixture.chat.supportsVision = true
+	return fixture, sha
+}
+
+// TestRunnerSendsImageContent covers the runner half of the vision path: image
+// parts on the triggering message are resolved through the ImageLoader port and
+// attached to the user LLM message, with Vision required from the model.
+func TestRunnerSendsImageContent(t *testing.T) {
+	fixture, sha := imageHostFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "截图里是登录页。"}}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fixture.images.refs) != 1 || fixture.images.refs[0] != sha {
+		t.Fatalf("loaded image refs = %#v, want %q", fixture.images.refs, sha)
+	}
+	if fixture.chat.requestCount() == 0 {
+		t.Fatal("no chat request recorded")
+	}
+	request := fixture.chat.request(0)
+	found := false
+	for _, message := range request.Messages {
+		if message.Role != "user" || len(message.Images) == 0 {
+			continue
+		}
+		found = true
+		if message.Images[0].MIME != "image/png" || string(message.Images[0].Data) != "png-bytes" {
+			t.Fatalf("image content = %#v", message.Images[0])
+		}
+	}
+	if !found {
+		t.Fatalf("no user message carried the image: %#v", request.Messages)
+	}
+	vision := false
+	for _, requirement := range fixture.chat.requirements {
+		if requirement.Vision {
+			vision = true
+		}
+	}
+	if !vision {
+		t.Fatalf("ResolveModel requirements = %#v, want Vision", fixture.chat.requirements)
+	}
+}
+
+// TestRunnerRejectsImageWithoutVision covers §7.3/§8.3: the single vision gate
+// is ResolveModel(..., Vision:true); a non-vision model fails with a typed 400
+// before the model is called or any image bytes are loaded.
+func TestRunnerRejectsImageWithoutVision(t *testing.T) {
+	fixture, _ := imageHostFixture(t)
+	fixture.chat.supportsVision = false
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "must not be called"}}
+
+	_, err := mustRun(t, fixture, hostItem())
+	if err == nil {
+		t.Fatal("image run accepted a model without supports_vision")
+	}
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want a typed platform error", err)
+	}
+	if apiErr.Status != http.StatusBadRequest || apiErr.Code != llmapp.CodeLLMCapabilityMismatch {
+		t.Fatalf("error = %#v, want 400 %s", apiErr, llmapp.CodeLLMCapabilityMismatch)
+	}
+	if !strings.Contains(strings.ToLower(apiErr.Message), "vision") {
+		t.Fatalf("message = %q, want an explicit vision capability error", apiErr.Message)
+	}
+	if fixture.chat.requestCount() != 0 {
+		t.Fatalf("chat was called on a rejected model: %#v", fixture.chat.requests)
+	}
+	if len(fixture.images.refs) != 0 {
+		t.Fatalf("image bytes loaded before the capability gate: %#v", fixture.images.refs)
+	}
+}
+
+// TestRunnerEnforcesRoleToolWhitelist pins R51: the runner intersects the tools
+// it exposes and executes with the profile role's RoleToolSet, even when an
+// already-stored profile was widened outside the role whitelist (the admin
+// validation is separate defense in depth). A role-denied call returns a typed
+// forbidden tool error, writes the role-denial audit and never reaches the tool
+// port.
+func TestRunnerEnforcesRoleToolWhitelist(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	// Simulate a stored profile widened before the Task 8 admin check existed.
+	profile := fixture.repo.profiles[agentapp.ProfileKeyClarificationHost]
+	profile.AllowedTools = append(append([]string(nil), profile.AllowedTools...), tools.ToolDesignReviewSubmit)
+	fixture.repo.profiles[agentapp.ProfileKeyClarificationHost] = profile
+
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignReviewSubmit, `{"summary":"x","findings":[]}`),
+		{Content: "该工具不属于当前角色，已跳过。"},
+	}
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The widened tool must not be exposed to the model.
+	for _, definition := range fixture.chat.request(0).Tools {
+		if definition.Name == tools.ToolDesignReviewSubmit {
+			t.Fatalf("role-denied tool was exposed: %s", definition.Name)
+		}
+	}
+	// The call is rejected with the typed forbidden payload before execution.
+	var toolContent string
+	for _, message := range fixture.chat.request(1).Messages {
+		if message.Role == "tool" {
+			toolContent = message.Content
+		}
+	}
+	var result struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(toolContent), &result); err != nil {
+		t.Fatalf("tool result is not JSON: %q", toolContent)
+	}
+	if result.Error.Code != tools.CodeForbidden {
+		t.Fatalf("tool error code = %q, want %q (payload %s)", result.Error.Code, tools.CodeForbidden, toolContent)
+	}
+	if result.Error.Details["role"] != string(agentapp.RoleAssistant) || result.Error.Details["tool"] != tools.ToolDesignReviewSubmit {
+		t.Fatalf("forbidden details = %#v", result.Error.Details)
+	}
+	if fixture.design.reviewCalls != 0 {
+		t.Fatalf("role-denied tool reached the design port: %d calls", fixture.design.reviewCalls)
+	}
+	fixture.audit.mu.Lock()
+	defer fixture.audit.mu.Unlock()
+	audited := false
+	for _, event := range fixture.audit.events {
+		if event.Action == agentapp.ActionRoleToolDenied && event.TargetID == tools.ToolDesignReviewSubmit {
+			audited = true
+			if event.Metadata["role"] != string(agentapp.RoleAssistant) {
+				t.Fatalf("audit metadata = %#v", event.Metadata)
+			}
+		}
+	}
+	if !audited {
+		t.Fatalf("no %s audit event: %#v", agentapp.ActionRoleToolDenied, fixture.audit.events)
+	}
+}
+
+// TestRunnerSettlesOnWorkItemTokenBudget pins the Task 9 Budget.Decide seam in
+// the real loop: the work item's token budget is hit after the first turn, so
+// the next request is a tool-less settlement turn and the run ends with the
+// model's final text instead of spending another tool turn.
+func TestRunnerSettlesOnWorkItemTokenBudget(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	item := hostItem()
+	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":12}`)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{
+			ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
+			Usage:     map[string]int{"total_tokens": 10},
+		},
+		{Content: "预算已用尽，以下为收尾回复。"},
+	}
+
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %#v, want a settled done run", result)
+	}
+	if fixture.chat.requestCount() != 2 {
+		t.Fatalf("chat calls = %d, want tool turn + settlement turn", fixture.chat.requestCount())
+	}
+	if tools := len(fixture.chat.request(1).Tools); tools != 0 {
+		t.Fatalf("settlement turn still exposes %d tools", tools)
+	}
+}
+
 func TestRunnerTracksLoadDuringRun(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.chat.responses = []llmapp.ChatResponse{{Content: "请补充登录方式与验收标准？"}}
@@ -762,5 +1278,62 @@ func TestRunnerTracksLoadDuringRun(t *testing.T) {
 	}
 	if got := fixture.load.Value(); got != 0 {
 		t.Fatalf("load after run = %d, want 0", got)
+	}
+}
+
+// fakeClarificationConverger records the production convergence calls the
+// clarification host turn makes.
+type fakeClarificationConverger struct {
+	calls []int64
+	err   error
+}
+
+func (f *fakeClarificationConverger) Converge(_ context.Context, versionID int64) error {
+	f.calls = append(f.calls, versionID)
+	return f.err
+}
+
+var _ agentapp.ClarificationConverger = (*fakeClarificationConverger)(nil)
+
+// TestRunnerHostConvergesClarificationAtRequirementConfirmation proves the
+// production clarifying→requirement_review caller: an assistant turn that
+// explicitly requests requirement confirmation converges the version, after the
+// message is persisted.
+func TestRunnerHostConvergesClarificationAtRequirementConfirmation(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{
+		Content: "## 需求确认请求\n\n1. 是否确认以上 4 条草案按当前内容定稿？\n2. 是否保留已提议的需求关系？",
+	}}
+
+	item := hostItem()
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(fixture.conv.appended) != 1 {
+		t.Fatalf("assistant messages = %d, want 1", len(fixture.conv.appended))
+	}
+	if len(fixture.clarification.calls) != 1 || fixture.clarification.calls[0] != item.VersionID {
+		t.Fatalf("convergence calls = %v, want [%d]", fixture.clarification.calls, item.VersionID)
+	}
+}
+
+// TestRunnerHostDoesNotConvergeOnClarifyingQuestion keeps the edge precise: a
+// turn that still asks clarification questions must not advance the stage, even
+// when it mentions the requirement confirmation gate.
+func TestRunnerHostDoesNotConvergeOnClarifyingQuestion(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{
+		Content: "先问三个最影响拆分的问题：\n1. 角色有哪些？\n2. 文章状态有几种？\n3. 评论是否需要登录？\n最后我会把结论整理成需求草案，停在需求确认门等你确认。",
+	}}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fixture.clarification.calls) != 0 {
+		t.Fatalf("a clarifying question converged the version: %v", fixture.clarification.calls)
 	}
 }

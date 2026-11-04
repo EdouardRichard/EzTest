@@ -308,6 +308,182 @@ func TestRepositoryListForInjection(t *testing.T) {
 	}
 }
 
+func TestRepositoryBindingsLifecycleAndInjection(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := knowledgepg.NewRepository(pool)
+	ctx := context.Background()
+
+	systemID, environmentID := int64(7001), int64(7101)
+	pageKey, apiKey, role := "/checkout", "POST /api/orders", "admin"
+	otherPage := "/login"
+	verifiedAt := time.Date(2026, 11, 1, 9, 30, 0, 0, time.UTC)
+
+	bound := itemFixture(1601, knowledge.ScopeGlobal, "", knowledge.StatusApproved,
+		"Checkout recipe", "submit the order", []string{"checkout"})
+	bound.Bindings = knowledge.Bindings{
+		SystemID: &systemID, EnvironmentID: &environmentID, PageKey: &pageKey,
+		APIKey: &apiKey, AccountRole: &role,
+	}
+	bound.LastVerifiedAt = &verifiedAt
+	mustInsert(t, repo, bound, 9601)
+
+	partial := itemFixture(1602, knowledge.ScopeGlobal, "", knowledge.StatusApproved,
+		"Login page", "login page locator", []string{"login"})
+	partial.Bindings = knowledge.Bindings{SystemID: &systemID, PageKey: &otherPage}
+	mustInsert(t, repo, partial, 9602)
+
+	plain := itemFixture(1603, knowledge.ScopeGlobal, "", knowledge.StatusApproved,
+		"Generic retry", "retry contract", nil)
+	mustInsert(t, repo, plain, 9603)
+
+	loaded, err := repo.Get(ctx, 1601)
+	if err != nil {
+		t.Fatalf("get bound item: %v", err)
+	}
+	if loaded.Bindings.SystemID == nil || *loaded.Bindings.SystemID != systemID ||
+		loaded.Bindings.EnvironmentID == nil || *loaded.Bindings.EnvironmentID != environmentID ||
+		loaded.Bindings.PageKey == nil || *loaded.Bindings.PageKey != pageKey ||
+		loaded.Bindings.APIKey == nil || *loaded.Bindings.APIKey != apiKey ||
+		loaded.Bindings.AccountRole == nil || *loaded.Bindings.AccountRole != role {
+		t.Fatalf("bindings = %+v", loaded.Bindings)
+	}
+	if loaded.LastVerifiedAt == nil || !loaded.LastVerifiedAt.Equal(verifiedAt) {
+		t.Fatalf("last verified = %v", loaded.LastVerifiedAt)
+	}
+	unbound, err := repo.Get(ctx, 1603)
+	if err != nil {
+		t.Fatalf("get plain item: %v", err)
+	}
+	if !unbound.Bindings.IsZero() || unbound.LastVerifiedAt != nil {
+		t.Fatalf("unbound item = %+v", unbound)
+	}
+
+	filterHits := []struct {
+		name   string
+		filter knowledge.Bindings
+		want   []int64
+	}{
+		{name: "page and role", filter: knowledge.Bindings{PageKey: &pageKey, AccountRole: &role}, want: []int64{1601}},
+		{name: "environment", filter: knowledge.Bindings{EnvironmentID: &environmentID}, want: []int64{1601}},
+		{name: "api", filter: knowledge.Bindings{APIKey: &apiKey}, want: []int64{1601}},
+		{name: "system", filter: knowledge.Bindings{SystemID: &systemID}, want: []int64{1602, 1601}},
+		{name: "unknown role", filter: knowledge.Bindings{AccountRole: ptr("author")}},
+	}
+	for _, test := range filterHits {
+		t.Run(test.name, func(t *testing.T) {
+			items, err := repo.List(ctx, knowledge.Filter{Bindings: test.filter, Limit: 10})
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			got := make([]int64, 0, len(items))
+			for _, item := range items {
+				got = append(got, item.ID)
+			}
+			if len(got) != len(test.want) {
+				t.Fatalf("hits = %v, want %v", got, test.want)
+			}
+			for index := range test.want {
+				if got[index] != test.want[index] {
+					t.Fatalf("hits = %v, want %v", got, test.want)
+				}
+			}
+		})
+	}
+
+	// The verification lifecycle persists suspect/stale reasons and keeps the
+	// last successful verification time.
+	item := loaded
+	item.Status = knowledge.StatusSuspect
+	item.ReviewReason = ptr("reuse failed")
+	item.UpdatedAt = verifiedAt.Add(time.Hour)
+	if err := repo.UpdateStatus(ctx, item, knowledge.StatusApproved); err != nil {
+		t.Fatalf("mark suspect: %v", err)
+	}
+	suspect, err := repo.Get(ctx, 1601)
+	if err != nil {
+		t.Fatalf("get suspect: %v", err)
+	}
+	if suspect.Status != knowledge.StatusSuspect || suspect.ReviewReason == nil ||
+		*suspect.ReviewReason != "reuse failed" ||
+		suspect.LastVerifiedAt == nil || !suspect.LastVerifiedAt.Equal(verifiedAt) {
+		t.Fatalf("suspect = %+v", suspect)
+	}
+	item = suspect
+	item.Status = knowledge.StatusStale
+	item.ReviewReason = ptr("route changed")
+	item.UpdatedAt = verifiedAt.Add(2 * time.Hour)
+	if err := repo.UpdateStatus(ctx, item, knowledge.StatusSuspect); err != nil {
+		t.Fatalf("mark stale: %v", err)
+	}
+	stale, err := repo.Get(ctx, 1601)
+	if err != nil {
+		t.Fatalf("get stale: %v", err)
+	}
+	if stale.Status != knowledge.StatusStale || stale.ReviewReason == nil ||
+		*stale.ReviewReason != "route changed" {
+		t.Fatalf("stale = %+v", stale)
+	}
+	item = stale
+	item.Status = knowledge.StatusApproved
+	item.ReviewReason = nil
+	item.UpdatedAt = verifiedAt.Add(3 * time.Hour)
+	if err := repo.UpdateStatus(ctx, item, knowledge.StatusStale); err != nil {
+		t.Fatalf("re-approve: %v", err)
+	}
+	reapproved, err := repo.Get(ctx, 1601)
+	if err != nil {
+		t.Fatalf("get re-approved: %v", err)
+	}
+	if reapproved.Status != knowledge.StatusApproved || reapproved.ReviewReason != nil {
+		t.Fatalf("re-approved = %+v", reapproved)
+	}
+
+	// Injection only returns approved rows and honors the binding filter.
+	mustInsert(t, repo, itemFixture(1610, knowledge.ScopeGlobal, "", knowledge.StatusApproved,
+		"Checkout generic", "checkout retry", []string{"checkout"}), 9610)
+	mustInsert(t, repo, itemFixture(1611, knowledge.ScopeGlobal, "", knowledge.StatusSuspect,
+		"Checkout suspect", "checkout retry", []string{"checkout"}), 9611)
+	mustInsert(t, repo, itemFixture(1612, knowledge.ScopeGlobal, "", knowledge.StatusStale,
+		"Checkout stale", "checkout retry", []string{"checkout"}), 9612)
+	mustInsert(t, repo, itemFixture(1613, knowledge.ScopeGlobal, "", knowledge.StatusRevoked,
+		"Checkout revoked", "checkout retry", []string{"checkout"}), 9613)
+
+	injected, err := repo.ListForInjection(ctx, knowledge.InjectionQuery{Query: "checkout", Limit: 10})
+	if err != nil {
+		t.Fatalf("injection query: %v", err)
+	}
+	seen := make(map[int64]bool, len(injected))
+	for _, item := range injected {
+		if item.Status != knowledge.StatusApproved {
+			t.Fatalf("injected non-approved item: %+v", item)
+		}
+		if item.ID >= 1611 && item.ID <= 1613 {
+			t.Fatalf("injected suspect/stale/revoked item: %+v", item)
+		}
+		seen[item.ID] = true
+	}
+	for _, id := range []int64{1601, 1602, 1603, 1610} {
+		if !seen[id] {
+			t.Fatalf("approved item %d missing from injection candidates: %+v", id, injected)
+		}
+	}
+	if len(injected) != 4 {
+		t.Fatalf("injected = %+v, want the 4 approved items", injected)
+	}
+
+	boundOnly, err := repo.ListForInjection(ctx, knowledge.InjectionQuery{
+		Query:    "checkout",
+		Bindings: knowledge.Bindings{PageKey: &pageKey},
+		Limit:    10,
+	})
+	if err != nil {
+		t.Fatalf("bound injection query: %v", err)
+	}
+	if len(boundOnly) != 1 || boundOnly[0].ID != 1601 {
+		t.Fatalf("bound injection = %+v", boundOnly)
+	}
+}
+
 func TestRepositoryUsageInsert(t *testing.T) {
 	pool := testutil.NewDB(t)
 	repo := knowledgepg.NewRepository(pool)

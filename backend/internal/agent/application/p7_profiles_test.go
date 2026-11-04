@@ -41,8 +41,8 @@ func TestEnsureProfilesSeedsP7ToolAdditions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	if len(seeded) != 14 {
-		t.Fatalf("seeded profiles = %d, want 14", len(seeded))
+	if len(seeded) != 15 {
+		t.Fatalf("seeded profiles = %d, want 15 (14 frozen P1-P4 + the P7 knowledge_curator profile)", len(seeded))
 	}
 
 	for key, additions := range p7ExpectedProfileTools {
@@ -78,6 +78,24 @@ func TestEnsureProfilesSeedsP7ToolAdditions(t *testing.T) {
 		if hasTool(profile, tools.ToolKnowledgePropose) {
 			t.Fatalf("%s must not expose %q: %v", key, tools.ToolKnowledgePropose, profile.AllowedTools)
 		}
+	}
+}
+
+func TestEnsureProfilesSeedsKnowledgeCuratorProfile(t *testing.T) {
+	seeded, err := agentapp.EnsureProfiles(context.Background(), newFakeRuntimeRepo())
+	if err != nil {
+		t.Fatalf("EnsureProfiles: %v", err)
+	}
+	profile, ok := profileByKey(seeded, agentapp.ProfileKeyKnowledgeCurator)
+	if !ok {
+		t.Fatalf("seeded profiles are missing %s", agentapp.ProfileKeyKnowledgeCurator)
+	}
+	if !profile.Enabled {
+		t.Fatal("knowledge_curator seed is disabled")
+	}
+	want := []string{tools.ToolKnowledgeSearch, tools.ToolKnowledgeRead, tools.ToolKnowledgePropose}
+	if strings.Join(profile.AllowedTools, ",") != strings.Join(want, ",") {
+		t.Fatalf("knowledge_curator tools = %v, want %v", profile.AllowedTools, want)
 	}
 }
 

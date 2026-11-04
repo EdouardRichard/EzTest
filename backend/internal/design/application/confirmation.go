@@ -2,6 +2,8 @@ package designapp
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -49,6 +51,144 @@ func countOrLen(count, length int) int {
 		return count
 	}
 	return length
+}
+
+// ConfirmCasesByIDs freezes explicit current-version cases selected by the
+// version case hard gate. An empty list confirms every confirmed-eligible
+// current case of the version (the POST /stage/confirm-cases "all" case); a
+// version with no eligible draft case is a typed 409 no_cases_to_confirm, since
+// spec §5.3 only enters executing when confirmed cases exist.
+//
+// It is deliberately layered on the single confirmation use case: stale,
+// foreign, already-confirmed and old-requirement-version cases get exactly the
+// same typed behavior as POST /design/confirmations, and the gate only advances
+// when every confirmation succeeded.
+func (s *GraphService) ConfirmCasesByIDs(ctx context.Context, versionID int64, caseIDs []int64) error {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return err
+	}
+	ids, err := normalizeCaseSelectionIDs(caseIDs)
+	if err != nil {
+		return err
+	}
+	actorID := confirmationActorID(ctx)
+	if len(ids) == 0 {
+		confirmed, err := s.confirmAllCases(ctx, versionID, actorID)
+		if err != nil {
+			return err
+		}
+		if confirmed == 0 {
+			return platform.NewError(http.StatusConflict, "no_cases_to_confirm",
+				"the version has no draft case to confirm")
+		}
+		return nil
+	}
+
+	// Validate the whole selection before changing anything, so a foreign or
+	// missing ID can never leave an earlier case of the same selection
+	// confirmed while the gate reports failure.
+	targets := make([]design.ConfirmationTarget, 0, len(ids))
+	for _, caseID := range ids {
+		target, err := s.repo.ResolveConfirmationTarget(ctx, versionID, design.ConfirmScopeCase, caseID)
+		if err != nil {
+			return mapDesignError(err, "case")
+		}
+		targets = append(targets, target)
+	}
+	// Task 95: an incomplete draft version (the PO O8 1-step/0-assertion
+	// version) must block the whole selected batch before any sibling is frozen.
+	// Confirming a complete sibling first and then failing on the incomplete one
+	// would leave a partially confirmed selection behind a failed gate.
+	for _, target := range targets {
+		data, err := s.repo.ReadCase(ctx, versionID, target.CaseID, nil)
+		if err != nil {
+			return mapDesignError(err, "case")
+		}
+		if data.Selected.Status != design.CaseStatusDraft {
+			continue
+		}
+		if err := s.validateConfirmableCaseVersion(ctx, versionID, design.CaseWithCurrent{Case: data.Case, Current: &data.Selected}); err != nil {
+			return err
+		}
+	}
+	for _, target := range targets {
+		if _, err := s.Confirm(ctx, versionID, ConfirmInput{
+			Scope: design.ConfirmScopeCase, TargetID: target.CaseID,
+		}, actorID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// confirmAllCases confirms every draft current case of the version by reusing
+// the requirement-scope confirmation, one clarified requirement at a time, and
+// reports how many case versions were frozen. A requirement without draft cases
+// is skipped: "all" means all eligible cases, not "fail when some requirement
+// has nothing to confirm". Zero confirmations means the version has no eligible
+// draft case, which the gate rejects instead of advancing to executing.
+func (s *GraphService) confirmAllCases(ctx context.Context, versionID int64, actorID int64) (int, error) {
+	graph, err := s.repo.ReadGraph(ctx, versionID)
+	if err != nil {
+		return 0, mapDesignError(err, "version")
+	}
+	confirmed := 0
+	for _, requirement := range graph.Requirements {
+		if !hasDraftCurrentCase(requirement) {
+			continue
+		}
+		result, err := s.Confirm(ctx, versionID, ConfirmInput{
+			Scope: design.ConfirmScopeRequirement, TargetID: requirement.Requirement.ID,
+		}, actorID)
+		if err != nil {
+			return 0, err
+		}
+		confirmed += len(result.Confirmed)
+	}
+	return confirmed, nil
+}
+
+// hasDraftCurrentCase reports whether a requirement graph node has at least one
+// draft case on a scenario of the requirement's current revision. Cases bound
+// to an older revision are excluded, matching ConfirmationTx.CasesByRequirement.
+func hasDraftCurrentCase(requirement design.RequirementGraph) bool {
+	for _, scenario := range requirement.Scenarios {
+		if scenario.Scenario.RequirementVersionID != requirement.Requirement.CurrentVersionID {
+			continue
+		}
+		for _, item := range scenario.Cases {
+			if item.Current.Status == design.CaseStatusDraft {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeCaseSelectionIDs(raw []int64) ([]int64, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	ids := make([]int64, 0, len(raw))
+	seen := make(map[int64]struct{}, len(raw))
+	for index, id := range raw {
+		if id <= 0 {
+			return nil, platform.Invalid(fmt.Sprintf("case_ids[%d]", index), "must be a positive decimal ID")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func confirmationActorID(ctx context.Context) int64 {
+	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
+		return actor.ID
+	}
+	return 0
 }
 
 // Confirm freezes the selected draft case versions in one transaction. The
@@ -169,6 +309,15 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 			}
 			return platform.StateConflict("no draft case version is available for this confirmation scope")
 		}
+		// Task 95: a bulk confirmation is atomic and may only freeze complete
+		// versions. Validate every candidate before the first write so a
+		// version that lost its designed steps/assertions cannot be confirmed
+		// alongside its complete siblings.
+		for _, item := range toConfirm {
+			if err := s.validateConfirmableCaseVersion(ctx, versionID, item); err != nil {
+				return err
+			}
+		}
 
 		affected := make([]string, 0, len(toConfirm))
 		for _, item := range toConfirm {
@@ -268,4 +417,62 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 	}
 	s.reopenCompleted(ctx, versionID, "case confirmed")
 	return result, nil
+}
+
+// validateConfirmableCaseVersion enforces the confirmed-version rules: a case
+// version may only enter the confirmed set when it is complete (Task 95 finalize
+// rule) and every kind=visual assertion resolves to an active visual_assertion
+// configuration (Task 115). The PO O8 AC-FR-011-01 version (1 step, 0
+// assertions) was confirmed and then executed into inconclusive(incomplete);
+// the retry11 FR-025 version carried a visual assertion without a
+// visual_assertion_id and executed into inconclusive(visual_assertion_not_run).
+// Confirmation must instead return a typed repair request before anything is
+// frozen.
+func (s *GraphService) validateConfirmableCaseVersion(ctx context.Context, versionID int64, item design.CaseWithCurrent) error {
+	if item.Current == nil {
+		return nil
+	}
+	if !design.CaseVersionComplete(*item.Current) {
+		return incompleteCaseVersionError(item)
+	}
+	return s.validateVisualAssertionReferences(ctx, versionID, item)
+}
+
+// incompleteCaseVersionError is the typed 409 block/repair response for an
+// incomplete case version. The message carries the counts and the repair action
+// because the design UI renders the API message; Details are for API consumers.
+func incompleteCaseVersionError(item design.CaseWithCurrent) *platform.Error {
+	version := design.CaseVersion{}
+	if item.Current != nil {
+		version = *item.Current
+	}
+	steps, assertions := design.CaseVersionContentCounts(version)
+	missing := make([]string, 0, 2)
+	if steps < design.MinimumCaseVersionSteps {
+		missing = append(missing, "steps")
+	}
+	if assertions < design.MinimumCaseVersionAssertions {
+		missing = append(missing, "assertions")
+	}
+	title := strings.TrimSpace(version.Title)
+	if title == "" {
+		title = "untitled case"
+	}
+	return &platform.Error{
+		Status: http.StatusConflict,
+		Code:   "incomplete_case_version",
+		Message: fmt.Sprintf(
+			"case %q version %d is incomplete (%d step(s), %d assertion(s)); a confirmable case needs at least %d step and %d assertion. Repair the case in design (restore the designed steps/assertions) and confirm it again.",
+			title, version.ID, steps, assertions,
+			design.MinimumCaseVersionSteps, design.MinimumCaseVersionAssertions,
+		),
+		Details: map[string]any{
+			"case_id":         platformid.Format(item.Case.ID),
+			"case_version_id": platformid.Format(version.ID),
+			"step_count":      steps,
+			"assertion_count": assertions,
+			"missing":         missing,
+			"next_action":     "repair the case version in design (restore the designed steps/assertions), then confirm the repaired version again",
+		},
+	}
 }

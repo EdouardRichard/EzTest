@@ -40,6 +40,9 @@ const COUNT_FIELDS: { key: keyof RunWave["counts"]; label: string }[] = [
   { key: "blocked", label: "阻塞" },
   { key: "paused", label: "暂停" },
   { key: "pending", label: "待执行" },
+  // A superseded case_run is a selected case that did not run: it must be
+  // visible in the wave header instead of being inferred from the result rows.
+  { key: "superseded", label: "已取代" },
 ]
 
 /**

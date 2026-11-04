@@ -161,7 +161,10 @@ func TestRepositoryUniquenessAndDefaultUnset(t *testing.T) {
 	_, err = e.svc.CreatePage(ctx, environmentID, resourceapp.PageInput{
 		Name: "duplicate", URL: "https://app.example.com/orders?x=1",
 	}, 42)
-	assertAPIErr(t, err, 409, "conflict")
+	apiErr := assertAPIErr(t, err, 409, "page_url_exists")
+	if apiErr.Details["field"] != "url" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
 
 	api, err := e.svc.CreateAPI(ctx, environmentID, resourceapp.APIInput{
 		Method: "GET", PathTemplate: "/api/orders", Name: "List orders",

@@ -278,6 +278,41 @@ func seedClosureRequirement(env *closureEnv, requirementID, versionID, currentVe
 	return requirement
 }
 
+// seedP0ClosureRequirement seeds a P0 requirement revision. REL-Q3 was
+// triggered by FR-025, a P0 requirement; the priority itself is not part of the
+// closure predicate (and therefore not part of ClosureInput), so the same gate
+// applies to every priority.
+func seedP0ClosureRequirement(env *closureEnv, requirementID, versionID, currentVersionID int64, status version.RequirementStatus) version.Requirement {
+	requirement := seedClosureRequirement(env, requirementID, versionID, currentVersionID, status)
+	env.requirements.mu.Lock()
+	revisions := env.requirements.versions[requirement.ID]
+	for index := range revisions {
+		revisions[index].Priority = "P0"
+	}
+	env.requirements.versions[requirement.ID] = revisions
+	env.requirements.mu.Unlock()
+	return requirement
+}
+
+// configureInconclusiveVisualClosure reproduces the REL-Q3 execution state: one
+// current+confirmed case whose latest run is a terminal but inconclusive
+// automation outcome (missing visual baseline), recorded coverage and only the
+// requirement's own close task open.
+func configureInconclusiveVisualClosure(env *closureEnv, requirementID int64) {
+	env.cases.byRequirement[requirementID] = []version.CaseVersionSnapshot{{
+		CaseVersionID: 1101, CaseID: 1100, RequirementID: requirementID,
+		RequirementVersionID: 1002, Title: "FR-025 publishes an article",
+	}}
+	env.runs.latest[requirementID] = map[int64]version.CaseRunSnapshot{
+		1101: {
+			CaseRunID: 1201, CaseVersionID: 1101,
+			Status: version.CaseRunInconclusive, FailureClass: "automation",
+		},
+	}
+	env.coverage.recorded[requirementID] = true
+	env.work.counts[requirementID] = versionapp.OpenWorkItemCounts{Total: 1, RequirementClose: 1}
+}
+
 // configurePassingClosure makes requirementID closable: one confirmed case with
 // a latest passed run, recorded coverage and only its own close task open.
 func configurePassingClosure(env *closureEnv, requirementID int64) {
@@ -687,6 +722,35 @@ func TestClosureServiceEnsureClosuresUsesNextCloseRound(t *testing.T) {
 	}
 	if len(env.tasks.calls) != 1 || env.tasks.calls[0].closeRound != 2 {
 		t.Fatalf("task ensures = %#v, want close round 2", env.tasks.calls)
+	}
+}
+
+// TestClosureServiceEnsureClosuresSkipsUnverifiedRequirement is the auto-close
+// half of REL-Q3: the reconciler used to ensure the requirement.close steward
+// task as soon as a terminal (but inconclusive) run existed, which let the
+// steward close FR-025 with no visual verification. The reconciler must not
+// create the close task while the case has no definitive verification outcome.
+func TestClosureServiceEnsureClosuresSkipsUnverifiedRequirement(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedP0ClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	env.cases.byRequirement[requirement.ID] = []version.CaseVersionSnapshot{{
+		CaseVersionID: 1101, CaseID: 1100, RequirementID: requirement.ID,
+		RequirementVersionID: 1002, Title: "FR-025 publishes an article",
+	}}
+	env.runs.latest[requirement.ID] = map[int64]version.CaseRunSnapshot{
+		1101: {
+			CaseRunID: 1201, CaseVersionID: 1101,
+			Status: version.CaseRunInconclusive, FailureClass: "automation",
+		},
+	}
+	env.coverage.recorded[requirement.ID] = true
+	env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 1, RequirementClose: 1}
+
+	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
+		t.Fatalf("EnsureClosures: %v", err)
+	}
+	if len(env.tasks.calls) != 0 {
+		t.Fatalf("task ensures = %#v, want no close task for an unverified requirement", env.tasks.calls)
 	}
 }
 

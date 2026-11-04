@@ -45,16 +45,18 @@ export function RequirementNode({ data }: NodeProps) {
       <p className="text-[11px] text-muted-foreground">
         SUT {requirement.target_version_sut_ids.length} 个目标
       </p>
-      <Button
-        size="sm"
-        variant="secondary"
-        className="mt-2 w-full"
-        data-testid={`btn-confirm-requirement-${requirement.requirement_id}`}
-        disabled={draftCount === 0 || confirming}
-        onClick={() => node.actions.onConfirmRequirement(requirement.requirement_id)}
-      >
-        {confirming ? "确认中…" : "确认全部"}
-      </Button>
+      {node.actions.caseReviewEnabled === false ? null : (
+        <Button
+          size="sm"
+          variant="secondary"
+          className="mt-2 w-full"
+          data-testid={`btn-confirm-requirement-${requirement.requirement_id}`}
+          disabled={draftCount === 0 || confirming}
+          onClick={() => node.actions.onConfirmRequirement(requirement.requirement_id)}
+        >
+          {confirming ? "确认中…" : "确认全部"}
+        </Button>
+      )}
     </div>
   )
 }

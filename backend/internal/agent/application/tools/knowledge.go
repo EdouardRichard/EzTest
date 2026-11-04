@@ -56,26 +56,35 @@ type KnowledgeProposePort interface {
 	ProposeKnowledge(ctx context.Context, versionID, agentRunID int64, in KnowledgeProposal) (KnowledgeProposalResult, error)
 }
 
-// P7Deps is the additive P7 service surface. It is nested inside Deps so the
-// frozen P1–P6 wiring keeps compiling untouched; a nil writer makes the P7
-// tool fail as an internal configuration error, never as a model-visible
-// business error.
+// P7Deps is the additive P7/P8 knowledge service surface. It is nested inside
+// Deps so the frozen P1–P6 wiring keeps compiling untouched; a nil writer makes
+// the P7 tool fail as an internal configuration error, never as a model-visible
+// business error. Retrieval is the P8 structured search/read surface.
 type P7Deps struct {
 	Knowledge KnowledgeProposePort
+	// Retrieval serves knowledge.search and knowledge.read. A nil value makes
+	// both tools fail closed as an internal configuration error.
+	Retrieval KnowledgeRetrievalPort
 }
 
-// P7ToolNames returns a copy of the frozen P7 tool names.
+// P7ToolNames returns a copy of the frozen P7 knowledge tool names plus the P8
+// structured retrieval tools.
 func P7ToolNames() []string {
-	return []string{ToolKnowledgePropose}
+	return []string{ToolKnowledgePropose, ToolKnowledgeSearch, ToolKnowledgeRead}
 }
 
-// NewP7Registry registers the frozen P1–P6 tool set plus the P7 knowledge tool.
-// Profiles still filter the registry by allowed_tools, so only the five P7
-// profiles can call knowledge.propose.
+// NewP7Registry registers the frozen P1–P6 tool set plus the P7 knowledge tool
+// and the P8 structured retrieval tools. Profiles still filter the registry by
+// allowed_tools (and the runtime RoleToolGuard by the role whitelist), so only
+// roles that explicitly list them can call knowledge.*.
 func NewP7Registry(deps Deps) *Registry {
 	base := NewP5Registry(deps)
-	all := make([]Tool, 0, len(base.byName)+1)
-	all = append(all, &knowledgePropose{deps: deps})
+	all := make([]Tool, 0, len(base.byName)+3)
+	all = append(all,
+		&knowledgePropose{deps: deps},
+		&knowledgeSearch{deps: deps},
+		&knowledgeRead{deps: deps},
+	)
 	for _, name := range base.Names() {
 		tool, _ := base.Get(name)
 		all = append(all, tool)

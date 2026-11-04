@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 
@@ -278,8 +279,10 @@ func (s *PauseService) ResumeCaseRun(ctx context.Context, versionID, caseRunID, 
 }
 
 // CancelWave cancels an active wave: non-terminal case_runs become superseded
-// and active intents are cancelled. Cancelled waves do not run failure analysis
-// (P3-D-26).
+// and every still-active intent of the wave is cancelled, even when its
+// case_run already reached a terminal status (QA-F2). Cancelled waves do not
+// run failure analysis (P3-D-26). Repeating the call converges the remaining
+// rows and returns the current value.
 func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorID int64) (execution.RunWave, error) {
 	if err := requirePositiveID("wave_id", waveID); err != nil {
 		return execution.RunWave{}, err
@@ -288,42 +291,16 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 	if err != nil {
 		return execution.RunWave{}, err
 	}
+	if wave.Status.Terminal() && wave.Status != execution.WaveCancelled {
+		return execution.RunWave{}, platform.StateConflict("the wave is already finished")
+	}
+	if err := s.cancelWaveRunsAndIntents(ctx, wave, actorID); err != nil {
+		return execution.RunWave{}, err
+	}
 	if wave.Status == execution.WaveCancelled {
 		return wave, nil
 	}
-	if wave.Status.Terminal() {
-		return execution.RunWave{}, platform.StateConflict("the wave is already finished")
-	}
 	now := s.now()
-	runs, err := s.caseRuns.ListAllByWave(ctx, wave.ID)
-	if err != nil {
-		return execution.RunWave{}, mapExecutionError(err, "case run")
-	}
-	for _, run := range runs {
-		if run.Status.Terminal() {
-			continue
-		}
-		if s.canceller != nil {
-			s.canceller.CancelRun(run.ID)
-		}
-		if changed, err := s.caseRuns.Transition(ctx, run.ID,
-			[]execution.CaseRunStatus{execution.CaseRunPending, execution.CaseRunRunning, execution.CaseRunPaused, execution.CaseRunInterrupted},
-			execution.CaseRunSuperseded, 0, ""); err != nil {
-			return execution.RunWave{}, mapExecutionError(err, "case run")
-		} else if changed {
-			s.cleanupContexts(ctx, run.ID)
-			publishEvent(ctx, s.events, EventCaseRunFinished, wave.VersionID,
-				map[string]any{"wave_id": platformid.Format(wave.ID), "case_run_id": platformid.Format(run.ID)},
-				map[string]any{
-					"wave_id":     platformid.Format(wave.ID),
-					"case_run_id": platformid.Format(run.ID),
-					"status":      string(execution.CaseRunSuperseded),
-				}, actorPtr(actorID))
-			if _, err := s.intents.Transition(ctx, run.IntentID, activeIntentStatuses, execution.IntentCancelled); err != nil {
-				return execution.RunWave{}, mapExecutionError(err, "intent")
-			}
-		}
-	}
 	changed, err := s.waves.Transition(ctx, wave.ID,
 		[]execution.WaveStatus{execution.WavePlanned, execution.WaveRunning, execution.WavePaused},
 		execution.WaveCancelled, execution.RunWave{FinishedAt: &now})
@@ -345,6 +322,67 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		actorPtr(actorID))
 	s.record(ctx, "execution.wave_cancelled", "execution_wave", wave.ID, actorID, nil)
 	return wave, nil
+}
+
+// cancelWaveRunsAndIntents propagates cancellation from a wave to its
+// case_runs and intents. Case_runs that are still non-terminal become
+// superseded; every still-active intent referenced by the wave's case_runs
+// becomes cancelled. Terminal rows are left untouched, so the step is
+// idempotent.
+func (s *PauseService) cancelWaveRunsAndIntents(ctx context.Context, wave execution.RunWave, actorID int64) error {
+	runs, err := s.caseRuns.ListAllByWave(ctx, wave.ID)
+	if err != nil {
+		return mapExecutionError(err, "case run")
+	}
+	intentIDs := make([]int64, 0, len(runs))
+	seen := make(map[int64]struct{}, len(runs))
+	for _, run := range runs {
+		if run.IntentID > 0 {
+			if _, ok := seen[run.IntentID]; !ok {
+				seen[run.IntentID] = struct{}{}
+				intentIDs = append(intentIDs, run.IntentID)
+			}
+		}
+		if run.Status.Terminal() {
+			continue
+		}
+		if s.canceller != nil {
+			s.canceller.CancelRun(run.ID)
+		}
+		changed, err := s.caseRuns.Transition(ctx, run.ID,
+			[]execution.CaseRunStatus{execution.CaseRunPending, execution.CaseRunRunning, execution.CaseRunPaused, execution.CaseRunInterrupted},
+			execution.CaseRunSuperseded, 0, "")
+		if err != nil {
+			return mapExecutionError(err, "case run")
+		}
+		if !changed {
+			continue
+		}
+		s.cleanupContexts(ctx, run.ID)
+		publishEvent(ctx, s.events, EventCaseRunFinished, wave.VersionID,
+			map[string]any{"wave_id": platformid.Format(wave.ID), "case_run_id": platformid.Format(run.ID)},
+			map[string]any{
+				"wave_id":     platformid.Format(wave.ID),
+				"case_run_id": platformid.Format(run.ID),
+				"status":      string(execution.CaseRunSuperseded),
+			}, actorPtr(actorID))
+	}
+	sort.Slice(intentIDs, func(i, j int) bool { return intentIDs[i] < intentIDs[j] })
+	for _, intentID := range intentIDs {
+		changed, err := s.intents.Transition(ctx, intentID, activeIntentStatuses, execution.IntentCancelled)
+		if err != nil {
+			return mapExecutionError(err, "intent")
+		}
+		if !changed {
+			continue
+		}
+		publishEvent(ctx, s.events, EventIntentCancelled, wave.VersionID,
+			map[string]any{"intent_id": platformid.Format(intentID)},
+			map[string]any{"intent_id": platformid.Format(intentID), "reason": "wave_cancelled"},
+			actorPtr(actorID))
+		s.record(ctx, "execution.intent_cancelled", "execution_intent", intentID, actorID, map[string]any{"reason": "wave_cancelled"})
+	}
+	return nil
 }
 
 // CancelIntent cancels one intent and supersedes its non-terminal case_runs.

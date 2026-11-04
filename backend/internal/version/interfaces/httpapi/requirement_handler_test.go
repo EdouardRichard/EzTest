@@ -21,6 +21,8 @@ type stubRequirementService struct {
 	confirm   versionapp.ConfirmResult
 	batch     versionapp.BatchConfirmResult
 	relations []versionapp.RelationView
+	dedupe    versionapp.RequirementDedupeResult
+	merge     versionapp.RequirementMergeResult
 	err       error
 
 	lastVersionID int64
@@ -133,6 +135,40 @@ func (s *stubRequirementService) ListRelations(_ context.Context, versionID, req
 	return s.relations, nil
 }
 
+func (s *stubRequirementService) Dedupe(_ context.Context, versionID int64, actorID int64) (versionapp.RequirementDedupeResult, error) {
+	s.calls = append(s.calls, "dedupe")
+	s.lastVersionID = versionID
+	s.lastActor = actorID
+	if s.err != nil {
+		return versionapp.RequirementDedupeResult{}, s.err
+	}
+	return s.dedupe, nil
+}
+
+func (s *stubRequirementService) Delete(_ context.Context, versionID, requirementID int64, reason string, actorID int64) (versionapp.RequirementDetail, error) {
+	s.calls = append(s.calls, "delete")
+	s.lastVersionID = versionID
+	s.lastRequestID = requirementID
+	s.lastReason = reason
+	s.lastActor = actorID
+	if s.err != nil {
+		return versionapp.RequirementDetail{}, s.err
+	}
+	return s.detail, nil
+}
+
+func (s *stubRequirementService) Merge(_ context.Context, versionID, targetID int64, sourceIDs []int64, actorID int64) (versionapp.RequirementMergeResult, error) {
+	s.calls = append(s.calls, "merge")
+	s.lastVersionID = versionID
+	s.lastRequestID = targetID
+	s.lastBatchIDs = sourceIDs
+	s.lastActor = actorID
+	if s.err != nil {
+		return versionapp.RequirementMergeResult{}, s.err
+	}
+	return s.merge, nil
+}
+
 var _ versionapi.RequirementService = (*stubRequirementService)(nil)
 
 func newRequirementServer(t *testing.T) (http.Handler, *stubRequirementService) {
@@ -156,6 +192,70 @@ func newRequirementServerWithClosures(t *testing.T) (http.Handler, *stubRequirem
 	mux.HandleFunc("POST /api/versions/{id}/requirements/{rid}/rollback", handler.Rollback)
 	mux.HandleFunc("GET /api/versions/{id}/requirements/{rid}/relations", handler.ListRelations)
 	return mux, stub, closures
+}
+
+// TestRequirementsConfirmedAdvanceStage pins the QA-F1 fix on the real user
+// confirmation API: confirming requirement drafts through
+// POST /requirements/confirmations must converge a clarifying version to
+// requirement_review, so a subsequent design/case action cannot keep operating
+// on a silently-stuck clarifying version. The edge is idempotent and a failed
+// confirmation never moves the stage.
+func TestRequirementsConfirmedAdvanceStage(t *testing.T) {
+	repo := &handlerStageRepo{
+		state: version.StageState{Stage: version.StageClarifying, StageEnteredAt: testTime},
+		found: true,
+	}
+	machine := versionapp.NewStageMachine(repo, &handlerStageJobs{}, nil, nil, handlerClock{at: testTime})
+	stub := &stubRequirementService{
+		confirm: versionapp.ConfirmResult{},
+		batch:   versionapp.BatchConfirmResult{Confirmed: []int64{6001}},
+	}
+	handler := versionapi.NewRequirementHandler(stub,
+		versionapi.WithRequirementStageConverger(machine))
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/versions/{id}/requirements/confirmations", handler.BatchConfirm)
+	mux.HandleFunc("POST /api/versions/{id}/requirements/{rid}/confirmations", handler.Confirm)
+
+	// Batch confirmation through the UI endpoint advances the stage.
+	recorder := call(t, mux, http.MethodPost, "/api/versions/2001/requirements/confirmations",
+		`{"requirement_ids":["6001"]}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("batch confirm status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if repo.state.Stage != version.StageRequirementReview {
+		t.Fatalf("stage after batch confirmation = %q, want requirement_review", repo.state.Stage)
+	}
+	if len(repo.applied) != 1 || repo.applied[0].Stage != version.StageRequirementReview {
+		t.Fatalf("applied transitions = %#v", repo.applied)
+	}
+
+	// Single confirmation is idempotent: the version is already at the gate.
+	recorder = call(t, mux, http.MethodPost, "/api/versions/2001/requirements/6001/confirmations", "", actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("single confirm status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if repo.state.Stage != version.StageRequirementReview || len(repo.applied) != 1 {
+		t.Fatalf("repeat confirmation changed the stage: %#v", repo.state)
+	}
+
+	// A failed confirmation must not converge anything.
+	failingRepo := &handlerStageRepo{
+		state: version.StageState{Stage: version.StageClarifying, StageEnteredAt: testTime},
+		found: true,
+	}
+	failingMachine := versionapp.NewStageMachine(failingRepo, &handlerStageJobs{}, nil, nil, handlerClock{at: testTime})
+	failingStub := &stubRequirementService{err: platform.StateConflict("requirement is already clarified")}
+	failingHandler := versionapi.NewRequirementHandler(failingStub,
+		versionapi.WithRequirementStageConverger(failingMachine))
+	failingMux := http.NewServeMux()
+	failingMux.HandleFunc("POST /api/versions/{id}/requirements/{rid}/confirmations", failingHandler.Confirm)
+	recorder = call(t, failingMux, http.MethodPost, "/api/versions/2001/requirements/6001/confirmations", "", actor())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("failing confirm status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if failingRepo.state.Stage != version.StageClarifying || len(failingRepo.applied) != 0 {
+		t.Fatalf("failed confirmation advanced the stage: %#v", failingRepo.state)
+	}
 }
 
 func sampleRequirementVersionView() versionapp.RequirementVersionView {

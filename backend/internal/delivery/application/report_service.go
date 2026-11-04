@@ -19,6 +19,40 @@ const (
 	reportEventStale     = "report.stale"
 )
 
+// Stable reasons carried by VersionReportNotDueError. They classify why the
+// §5.3 report gate is closed without exposing internal rows.
+const (
+	versionReportNotDueNoExecutionData  = "no_execution_data"
+	versionReportNotDueWaveNotTerminal  = "wave_not_terminal"
+	versionReportNotDueRequirementsOpen = "requirements_open"
+	versionReportNotDuePendingBlocker   = "pending_user_blocker"
+)
+
+// ErrVersionReportNotDue is the sentinel returned when a version report was
+// requested but the §5.3 report gate is closed: the version has no terminal
+// execution data yet, a wave is still in flight or a user-visible blocker is
+// pending. Callers may treat it as a no-op (the reconciler retries later).
+var ErrVersionReportNotDue = errors.New("version report is not due")
+
+// VersionReportNotDueError is the typed gate rejection. Reason is one of the
+// stable versionReportNotDue* values so a caller can log or surface why no
+// report was generated.
+type VersionReportNotDueError struct {
+	Reason string
+}
+
+// Error implements error.
+func (e *VersionReportNotDueError) Error() string {
+	reason := e.Reason
+	if reason == "" {
+		reason = "not_due"
+	}
+	return "version report is not due: " + reason
+}
+
+// Unwrap exposes ErrVersionReportNotDue to errors.Is.
+func (e *VersionReportNotDueError) Unwrap() error { return ErrVersionReportNotDue }
+
 // Report lifecycle constants. template_version falls back to "1" (the frozen
 // P4 built-in template) when the renderer does not report a version; renderers
 // implementing delivery.ReportTemplateVersioner supply the actual version.
@@ -138,12 +172,17 @@ func (s *ReportService) EnsureWaveReport(ctx context.Context, versionID, waveID 
 }
 
 // EnsureVersionReport makes sure one version report exists and has an
-// in-flight draft revision with a report.version work item. The reconciler
-// only calls it when the §7.4 conditions hold (all requirements closed or
-// obsolete, no active wave, latest report missing or stale).
+// in-flight draft revision with a report.version work item. The §5.3 report
+// gate is enforced here: a version without terminal execution data (or with a
+// pending user-visible blocker) returns *VersionReportNotDueError and creates
+// nothing, so an empty version never produces a report. The reconciler
+// additionally only calls it when the §7.4 conditions hold.
 func (s *ReportService) EnsureVersionReport(ctx context.Context, versionID int64) (delivery.Report, error) {
 	if versionID <= 0 {
 		return delivery.Report{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if err := s.requireVersionReportDue(ctx, versionID); err != nil {
+		return delivery.Report{}, err
 	}
 	kind := delivery.ReportKindVersion
 	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &kind, Limit: 100})
@@ -164,11 +203,41 @@ func (s *ReportService) EnsureVersionReport(ctx context.Context, versionID int64
 	return s.ensureGeneration(ctx, report)
 }
 
+// requireVersionReportDue applies the §5.3 report gate: execution data exists
+// (terminal waves with case runs), every requirement is closed/obsolete and no
+// pending user-visible blocker (active intent or open human request) is
+// outstanding. A gate rejection is *VersionReportNotDueError; a read failure
+// propagates untouched.
+func (s *ReportService) requireVersionReportDue(ctx context.Context, versionID int64) error {
+	if s.data == nil {
+		return reportServiceNotConfigured("report data reader")
+	}
+	snapshot, err := s.data.VersionSnapshot(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if reason := versionReportGateReason(snapshot); reason != "" {
+		return &VersionReportNotDueError{Reason: reason}
+	}
+	if trigger, ok := s.data.(ReportTriggerReader); ok {
+		ready, err := trigger.VersionReportReady(ctx, versionID)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return &VersionReportNotDueError{Reason: versionReportNotDuePendingBlocker}
+		}
+	}
+	return nil
+}
+
 // EnsureReports is the reconciler entry point (spec §4.4/§7.4): it creates the
-// missing terminal-wave reports and, when every requirement is closed or
-// obsolete and no wave is active, marks changed reports stale and ensures the
-// version report (regenerating it when stale). Active-intent checks are owned
-// by the reader/wiring layer; this method consumes the version snapshot.
+// missing terminal-wave reports and, when the §5.3 execution gate is open (all
+// requirements closed or obsolete, every wave terminal, at least one case_run)
+// and no pending user-visible blocker exists, marks changed reports stale and
+// ensures the version report (regenerating it when stale). Active-intent checks
+// are owned by the reader/wiring layer; this method consumes the version
+// snapshot.
 func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) error {
 	if versionID <= 0 {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
@@ -178,6 +247,13 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 	}
 	snapshot, err := s.data.VersionSnapshot(ctx, versionID)
 	if err != nil {
+		return err
+	}
+	// Mark every published report whose deterministic input changed as stale
+	// before the wave loop: a wave report published before an issue triage
+	// finished must be regenerated once the triage projection is part of the
+	// snapshot (Task 118), even when the version report is not due yet.
+	if _, err := s.MarkStaleIfChanged(ctx, versionID); err != nil {
 		return err
 	}
 	existing, err := s.repo.ListReports(ctx, versionID, ReportFilter{Limit: 100})
@@ -195,8 +271,16 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 		if !terminalWaveStatus(wave.Status) {
 			continue
 		}
-		if report, ok := waveReports[wave.ID]; ok && reportHasPublishedRevision(report) {
-			continue
+		if report, ok := waveReports[wave.ID]; ok {
+			if report.Status == delivery.ReportStatusStale {
+				if _, err := s.Regenerate(ctx, versionID, report.ID); err != nil {
+					return err
+				}
+				continue
+			}
+			if reportHasPublishedRevision(report) {
+				continue
+			}
 		}
 		if _, err := s.EnsureWaveReport(ctx, versionID, wave.ID); err != nil {
 			return err
@@ -217,9 +301,6 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 	if !versionReportDue(snapshot) {
 		return nil
 	}
-	if _, err := s.MarkStaleIfChanged(ctx, versionID); err != nil {
-		return err
-	}
 	refreshKind := delivery.ReportKindVersion
 	refreshed, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &refreshKind, Limit: 1})
 	if err != nil {
@@ -227,6 +308,9 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 	}
 	if len(refreshed) == 0 {
 		_, err := s.EnsureVersionReport(ctx, versionID)
+		if errors.Is(err, ErrVersionReportNotDue) {
+			return nil
+		}
 		return err
 	}
 	current := refreshed[0]
@@ -236,6 +320,9 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 		return err
 	case delivery.ReportStatusDraft:
 		_, err := s.EnsureVersionReport(ctx, versionID)
+		if errors.Is(err, ErrVersionReportNotDue) {
+			return nil
+		}
 		return err
 	default:
 		return nil
@@ -329,6 +416,12 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 	snapshot.ReportID = report.ID
 	snapshot.ReportRevision = revision
 	snapshot.InputFingerprint = fingerprint
+
+	// Deterministic case/assertion/coverage results are authoritative. A
+	// model-proposed narrative that contradicts them is replaced by the
+	// server-generated deterministic summary, so this revision can never render
+	// a "no valid execution" story while its results table shows passed runs.
+	narrative = reportNarrativeForSnapshot(snapshot, narrative)
 
 	html, err := s.renderer.Render(ctx, snapshot, narrative, s.sections)
 	if err != nil {
@@ -870,23 +963,37 @@ func terminalWaveStatus(status string) bool {
 	}
 }
 
-// versionReportDue applies the §7.4 version-report condition that is visible
-// from the version snapshot: every requirement is closed or obsolete and no
-// wave is active. The active-intent/human-request checks belong to the close
-// predicate and the reader/wiring layer.
+// versionReportDue reports whether the §5.3 report gate is open: the version
+// produced execution data. At least one wave must be terminal, every wave must
+// be terminal (done/failed/cancelled; an active or unknown wave means execution
+// is still in flight), at least one case_run must exist, and every requirement
+// must be closed or obsolete (spec §5.3/§7.4). An empty version never generates
+// a report: it has no terminal wave and no case run.
 func versionReportDue(snapshot delivery.ReportSnapshot) bool {
-	for _, requirement := range snapshot.Requirements {
-		if requirement.Status != "closed" && requirement.Status != "obsolete" {
-			return false
-		}
+	return versionReportGateReason(snapshot) == ""
+}
+
+// versionReportGateReason returns the stable reason the report gate is closed,
+// or "" when the version report is due. Requirements are checked last so the
+// failure reason points at the execution gap first.
+func versionReportGateReason(snapshot delivery.ReportSnapshot) string {
+	if len(snapshot.Waves) == 0 {
+		return versionReportNotDueNoExecutionData
 	}
 	for _, wave := range snapshot.Waves {
-		switch wave.Status {
-		case "planned", "running", "paused":
-			return false
+		if !terminalWaveStatus(wave.Status) {
+			return versionReportNotDueWaveNotTerminal
 		}
 	}
-	return true
+	if len(snapshot.CaseRuns) == 0 {
+		return versionReportNotDueNoExecutionData
+	}
+	for _, requirement := range snapshot.Requirements {
+		if requirement.Status != "closed" && requirement.Status != "obsolete" {
+			return versionReportNotDueRequirementsOpen
+		}
+	}
+	return ""
 }
 
 // reportHasPublishedRevision reports whether the report has a published

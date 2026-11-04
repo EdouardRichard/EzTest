@@ -10,11 +10,13 @@ import (
 
 // RemoteModel is one model reported by an OpenAI-compatible upstream.
 type RemoteModel struct {
-	ID             string
-	ContextWindow  int
-	MaxOutput      int
-	SupportsTools  bool
-	SupportsVision bool
+	ID                  string
+	ContextWindow       int
+	MaxOutput           int
+	SupportsTools       bool
+	SupportsVision      bool
+	SupportsReasoning   bool
+	SupportsPromptCache bool
 }
 
 // TestResult is the outcome of a connectivity test. Error is only set when the
@@ -51,14 +53,41 @@ type SettingsReader interface {
 // defaults) and update (nil fields keep the stored value; a non-nil empty
 // string clears api_key/headers).
 type ConfigInput struct {
-	Name           *string
-	Provider       *string
-	Protocol       *string
-	BaseURL        *string
-	APIKey         *string
-	Headers        *map[string]string
-	TimeoutSeconds *int
-	MaxRetries     *int
-	IsDefault      *bool
-	Status         *string
+	Name            *string
+	Provider        *string
+	Protocol        *string
+	BaseURL         *string
+	APIKey          *string
+	Headers         *map[string]string
+	TimeoutSeconds  *int
+	MaxRetries      *int
+	IsDefault       *bool
+	Status          *string
+	ThinkingType    *string
+	ReasoningEffort *string
+	DefaultModelID  *int64
+}
+
+// ModelInput is the manual-model create payload. The full 0.2.1 capability set
+// is accepted so an administrator can describe gateways whose /models response
+// does not report capabilities (spec §7.3).
+type ModelInput struct {
+	Model               string
+	ContextWindow       int
+	MaxOutput           int
+	SupportsTools       bool
+	SupportsVision      bool
+	SupportsReasoning   bool
+	SupportsPromptCache bool
+}
+
+// ModelPatch is a partial model update: nil fields keep the stored value. It
+// backs the capability editor and the deprecated flag; there is no rename.
+type ModelPatch struct {
+	ContextWindow       *int
+	SupportsTools       *bool
+	SupportsVision      *bool
+	SupportsReasoning   *bool
+	SupportsPromptCache *bool
+	Deprecated          *bool
 }

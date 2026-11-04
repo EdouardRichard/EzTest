@@ -28,8 +28,9 @@ type Leader struct {
 	retry  time.Duration
 	logger *slog.Logger
 
-	mu      sync.RWMutex
-	leading bool
+	mu         sync.RWMutex
+	leading    bool
+	onAcquired func()
 }
 
 // LeaderOption customizes the leader loop. Wiring only overrides the logger;
@@ -71,6 +72,34 @@ func (l *Leader) IsLeader() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.leading
+}
+
+// OnAcquired registers a callback invoked every time this replica acquires the
+// advisory lock, including an acquisition that happened before the callback was
+// registered. The callback must be fast and non-blocking (the reconciler wake
+// only signals a buffered channel); it runs on the leader-election goroutine.
+// It lets the composition root wake leader-gated schedulers on failover instead
+// of waiting for the next unrelated event.
+func (l *Leader) OnAcquired(callback func()) {
+	if l == nil || callback == nil {
+		return
+	}
+	l.mu.Lock()
+	alreadyLeading := l.leading
+	l.onAcquired = callback
+	l.mu.Unlock()
+	if alreadyLeading {
+		callback()
+	}
+}
+
+func (l *Leader) notifyAcquired() {
+	l.mu.RLock()
+	callback := l.onAcquired
+	l.mu.RUnlock()
+	if callback != nil {
+		callback()
+	}
 }
 
 // Run blocks until ctx is cancelled. It acquires the advisory lock when free,
@@ -123,6 +152,9 @@ func (l *Leader) hold(ctx context.Context) error {
 	}
 	leading = acquired
 	l.setLeading(leading)
+	if leading {
+		l.notifyAcquired()
+	}
 
 	ticker := time.NewTicker(l.retry)
 	defer ticker.Stop()
@@ -146,6 +178,7 @@ func (l *Leader) hold(ctx context.Context) error {
 			if acquired {
 				leading = true
 				l.setLeading(true)
+				l.notifyAcquired()
 			}
 		}
 	}

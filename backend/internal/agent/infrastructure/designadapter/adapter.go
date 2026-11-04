@@ -27,6 +27,10 @@ type GraphGateway interface {
 	Propose(ctx context.Context, versionID int64, in designapp.ProposeInput, actorID, runID int64) (designapp.ProposeResult, error)
 	SubmitReview(ctx context.Context, versionID, requirementID, runID int64, in designapp.ReviewInput) (designapp.ReviewResult, error)
 	SubmitDataPlan(ctx context.Context, versionID, caseVersionID, runID int64, in designapp.DataPlanInput) (designapp.DataPlanResult, error)
+	// CaseAuthorFacts returns the bounded, credential-free discovery facts the
+	// case author reads before proposing cases (Task 37). The read is best
+	// effort; an error yields an empty list on the rendered graph.
+	CaseAuthorFacts(ctx context.Context, versionID int64) ([]designapp.DiscoveryFact, error)
 }
 
 // Adapter implements tools.DesignPort on top of the design application
@@ -65,7 +69,13 @@ func (a *Adapter) ReadGraph(ctx context.Context, versionID, requirementID, caseI
 	if err != nil {
 		return nil, err
 	}
-	return graphPayload(graph, requirementID), nil
+	// The exploration facts are case-author evidence. A fact read failure must
+	// not fail the design graph read: the graph is still usable without them.
+	discovery := []designapp.DiscoveryFact{}
+	if facts, factsErr := a.graph.CaseAuthorFacts(ctx, versionID); factsErr == nil {
+		discovery = facts
+	}
+	return graphPayload(graph, requirementID, discovery), nil
 }
 
 // ProposeGraph maps the tool-validated proposal into the design application
@@ -210,7 +220,7 @@ func proposeInput(in tools.GraphProposal) designapp.ProposeInput {
 
 // ---------- design application -> tool result payloads ---------------------
 
-func graphPayload(view designapp.GraphView, requirementID int64) map[string]any {
+func graphPayload(view designapp.GraphView, requirementID int64, discovery []designapp.DiscoveryFact) map[string]any {
 	requirements := make([]any, 0, len(view.Requirements))
 	for _, requirement := range view.Requirements {
 		if requirementID > 0 && requirement.RequirementID != requirementID {
@@ -232,8 +242,28 @@ func graphPayload(view designapp.GraphView, requirementID int64) map[string]any 
 			"confirmed":    view.Stats.Confirmed,
 			"stale":        view.Stats.Stale,
 		},
-		"requirements": requirements,
+		"requirements":    requirements,
+		"discovery_facts": discoveryFactPayloads(discovery),
 	}
+}
+
+// discoveryFactPayloads renders the case-author discovery facts with decimal
+// string ids, mirroring the rest of the tool payload vocabulary.
+func discoveryFactPayloads(facts []designapp.DiscoveryFact) []any {
+	payloads := make([]any, 0, len(facts))
+	for _, fact := range facts {
+		payload := map[string]any{
+			"fact_id": formatID(fact.ID),
+			"kind":    fact.Kind,
+			"key":     fact.Key,
+			"summary": fact.Summary,
+		}
+		if fact.Confidence != nil {
+			payload["confidence"] = *fact.Confidence
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads
 }
 
 func requirementPayload(view designapp.RequirementGraphView) map[string]any {

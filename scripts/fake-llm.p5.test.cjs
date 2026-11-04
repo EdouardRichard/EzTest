@@ -8,9 +8,12 @@
 // system-prompt detection, per-run step counting, mode switch and the tool-call
 // payloads the backend agent runtime consumes.
 //
-// The system prompts are read from backend/internal/mindmap/domain/prompts.go
-// instead of being duplicated here: the detector must keep matching the real
-// Chinese role markers (task T7).
+// The system prompts are read from the current product role prompts instead of
+// being duplicated here: the detector must keep matching the real Chinese role
+// markers. The 0.2.1 tree removed backend/internal/mindmap/domain/prompts.go;
+// the current equivalents are the design profile prompts in
+// backend/internal/agent/application/profiles.go and the explorer role prompt in
+// backend/internal/agent/application/roles.go.
 //
 // Run:
 //   node scripts/fake-llm.p5.test.cjs
@@ -24,7 +27,8 @@ const { after, before, test } = require("node:test");
 
 const repoRoot = path.resolve(__dirname, "..");
 const fakeLlmScript = path.join(__dirname, "fake-llm.cjs");
-const promptsPath = path.join(repoRoot, "backend", "internal", "mindmap", "domain", "prompts.go");
+const promptsPath = path.join(repoRoot, "backend", "internal", "agent", "application", "profiles.go");
+const rolesPath = path.join(repoRoot, "backend", "internal", "agent", "application", "roles.go");
 const serverLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "eztest-fake-llm-p5-"));
 
 const MODEL = "deepseek-flash";
@@ -40,21 +44,22 @@ const NODE_CASE_ONE = "1838293000128";
 const NODE_CASE_TWO = "1838293000129";
 const FIXTURE_BASE = "http://127.0.0.1:13335";
 
+// The current product equivalents of the removed P5 mindmap role prompts.
+// Every constant below is a backtick Go constant in profiles.go/roles.go.
 const PROMPT_CONSTS = {
-  design: "DesignPrompt",
-  review: "ReviewPrompt",
-  data_plan: "DataPlanPrompt",
-  explore: "ExplorePrompt",
+  design: "caseAuthorPrompt",
+  review: "designCriticPrompt",
+  data_plan: "dataPlannerPrompt",
+  explore: "explorerRolePrompt",
 };
 
-// The exact Chinese role markers of spec §8.1/§10.6. They must stay substrings
-// of the real prompt constants below. The data-plan prompt landed with the
-// "数据/前置规划" spelling, so both variants are accepted.
+// The current role markers the P5 detector matches. They are the
+// [profile:<key>] / [role:<key>] markers carried by the current prompts above.
 const ROLE_MARKERS = {
-  design: ["EzTest 的测试设计 Agent"],
-  review: ["EzTest 的设计评审 Agent"],
-  data_plan: ["EzTest 的数据与前置规划 Agent", "EzTest 的数据/前置规划 Agent"],
-  explore: ["EzTest 的应用探索 Agent"],
+  design: ["[profile:case_author]"],
+  review: ["[profile:design_critic]"],
+  data_plan: ["[profile:data_planner]"],
+  explore: ["[role:explorer]"],
 };
 
 const TOOL_NAMES = {
@@ -75,16 +80,20 @@ function sleep(ms) {
 function readPromptsSource() {
   assert.ok(
     fs.existsSync(promptsPath),
-    "missing backend/internal/mindmap/domain/prompts.go; task T7 must land first",
+    "missing backend/internal/agent/application/profiles.go (current design prompts)",
   );
-  return fs.readFileSync(promptsPath, "utf8");
+  assert.ok(
+    fs.existsSync(rolesPath),
+    "missing backend/internal/agent/application/roles.go (current explorer role prompt)",
+  );
+  return [fs.readFileSync(promptsPath, "utf8"), fs.readFileSync(rolesPath, "utf8")].join("\n");
 }
 
 /** Extracts one prompt constant body from prompts.go. */
 function promptBody(name, source) {
   const pattern = new RegExp("const " + name + " = `([\\s\\S]*?)`");
   const match = pattern.exec(source);
-  assert.ok(match, "prompts.go has no " + name + " constant");
+  assert.ok(match, "the current role prompt source has no " + name + " constant");
   return match[1];
 }
 
@@ -611,7 +620,7 @@ after(() => {
 
 // --- prompt drift ----------------------------------------------------------
 
-test("prompts.go still contains the four role markers the detector matches", () => {
+test("the current role prompts still contain the four markers the detector matches", () => {
   for (const [kind, name] of Object.entries(PROMPT_CONSTS)) {
     const body = promptBody(name, promptsSource);
     const markers = ROLE_MARKERS[kind];

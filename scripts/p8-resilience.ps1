@@ -330,7 +330,7 @@ function Prepare-P8ContentRoot {
 
 function Login-P8Admin {
     $context = Get-P8Context
-    $login = Invoke-P8Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "admin123" } -Token "" -TimeoutSec 30
+    $login = Invoke-P8Api -Method "POST" -Path "/api/auth/login" -Body @{ username = "admin"; password = "[REDACTED]" } -Token "" -TimeoutSec 30
     if ($login.Status -ne 200 -or $null -eq $login.Json -or $null -eq $login.Json.data -or [string]::IsNullOrWhiteSpace([string]$login.Json.data.token)) {
         throw "admin login failed: status=$($login.Status) $($login.Text)"
     }
@@ -963,7 +963,10 @@ function Invoke-P8ScenarioS9 {
         $packetSummaryPresent = 0
         $packetSectionCount = 0
         if ($packetID -gt 0) {
-            $packetRow = Get-P8Scalar -Sql ("SELECT count(*) || '|' || COALESCE(MAX(CASE WHEN s->>'name' = 'conversation' AND EXISTS (SELECT 1 FROM conversation_summary cs WHERE cs.conversation_id = " + [int64]$conversationID + " AND length(cs.summary) > 0 AND position(left(cs.summary,16) in COALESCE(s->>'content','')) > 0) THEN 1 ELSE 0 END),0) FROM context_packet p LEFT JOIN LATERAL jsonb_array_elements(p.sections) s ON TRUE WHERE p.run_id = " + [int64]$runID + ";")
+            # Task 48 cache-first packets render session memory (rolling summary +
+            # pinned facts) inside the pinned `facts` segment; the P1
+            # `conversation` section no longer exists.
+            $packetRow = Get-P8Scalar -Sql ("SELECT count(*) || '|' || COALESCE(MAX(CASE WHEN s->>'name' = 'facts' AND EXISTS (SELECT 1 FROM conversation_summary cs WHERE cs.conversation_id = " + [int64]$conversationID + " AND length(cs.summary) > 0 AND position(left(cs.summary,16) in COALESCE(s->>'content','')) > 0) THEN 1 ELSE 0 END),0) FROM context_packet p LEFT JOIN LATERAL jsonb_array_elements(p.sections) s ON TRUE WHERE p.run_id = " + [int64]$runID + ";")
             $packetParts = @($packetRow.Split("|"))
             if ($packetParts.Count -ge 2) {
                 $packetSectionCount = [int]$packetParts[0]
@@ -971,10 +974,10 @@ function Invoke-P8ScenarioS9 {
             }
         }
         Write-P8Check $checks ($packetID -gt 0 -and $packetSectionCount -ge 1) "S9 latest run has a context packet" ("packet_id=$packetID sections=$packetSectionCount")
-        Write-P8Check $checks ($packetSummaryPresent -eq 1) "S9 context packet conversation section contains the rolling summary" ("packet_id=$packetID summary_prefix_present=$packetSummaryPresent")
+        Write-P8Check $checks ($packetSummaryPresent -eq 1) "S9 context packet facts section contains the rolling summary" ("packet_id=$packetID summary_prefix_present=$packetSummaryPresent")
         $pinnedPresent = 0
         if ($packetID -gt 0 -and $pinnedCount -gt 0) {
-            $pinnedPresent = [int](Get-P8Scalar -Sql ("SELECT CASE WHEN position('P8-S9-REGION' in (SELECT COALESCE(s->>'content','') FROM context_packet p, jsonb_array_elements(p.sections) s WHERE p.id = " + [int64]$packetID + " AND s->>'name' = 'conversation' LIMIT 1)) > 0 THEN 1 ELSE 0 END;"))
+            $pinnedPresent = [int](Get-P8Scalar -Sql ("SELECT CASE WHEN position('P8-S9-REGION' in (SELECT COALESCE(s->>'content','') FROM context_packet p, jsonb_array_elements(p.sections) s WHERE p.id = " + [int64]$packetID + " AND s->>'name' = 'facts' LIMIT 1)) > 0 THEN 1 ELSE 0 END;"))
         }
         Write-P8Check $checks ($pinnedCount -gt 0 -and $pinnedPresent -eq 1) "S9 context packet preserves pinned facts" ("pinned_facts=$pinnedCount present_in_packet=$pinnedPresent")
 

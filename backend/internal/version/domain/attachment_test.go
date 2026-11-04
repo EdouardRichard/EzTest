@@ -48,8 +48,14 @@ func TestDetectAttachmentKind(t *testing.T) {
 		{"notes.md", "text/markdown", version.AttachmentMarkdown},
 		{"notes.markdown", "text/markdown", version.AttachmentMarkdown},
 		{"notes.txt", "text/plain", version.AttachmentText},
+		{"page.html", "application/octet-stream", version.AttachmentHTML},
+		{"page.htm", "application/octet-stream", version.AttachmentHTML},
+		{"page", "text/html", version.AttachmentHTML},
 		{"requirements.docx", "application/octet-stream", version.AttachmentDOCX},
 		{"slides.pptx", "application/octet-stream", version.AttachmentPPTX},
+		{"matrix.xlsx", "application/octet-stream", version.AttachmentXLSX},
+		{"MATRIX.XLSX", "application/octet-stream", version.AttachmentXLSX},
+		{"spreadsheet", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", version.AttachmentXLSX},
 		{"report.pdf", "application/pdf", version.AttachmentPDF},
 		{"screenshot.png", "image/png", version.AttachmentImage},
 		{"photo.JPG", "image/jpeg", version.AttachmentImage},
@@ -71,8 +77,9 @@ func TestDetectAttachmentKind(t *testing.T) {
 
 func TestAttachmentKindSupportsExtraction(t *testing.T) {
 	for _, kind := range []version.AttachmentKind{
-		version.AttachmentMarkdown, version.AttachmentText, version.AttachmentDOCX,
-		version.AttachmentPPTX, version.AttachmentPDF,
+		version.AttachmentMarkdown, version.AttachmentText, version.AttachmentHTML,
+		version.AttachmentDOCX, version.AttachmentPPTX, version.AttachmentXLSX,
+		version.AttachmentPDF,
 	} {
 		if !kind.SupportsExtraction() {
 			t.Fatalf("%q should support extraction", kind)

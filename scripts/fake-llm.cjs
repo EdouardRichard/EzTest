@@ -1,17 +1,25 @@
 #!/usr/bin/env node
 "use strict";
 
-// Deterministic OpenAI-compatible fake LLM upstream for EzTest 0.2 P0 + P1 + P2.
+// Deterministic OpenAI-compatible fake LLM upstream for EzTest 0.2 P0 + P1 + P2,
+// plus the legacy P3-P7 scenario dispatchers used by the 0.2 regression suites.
 //
 // P0 only needs configuration / model catalog / connectivity tests and the
 // acceptance flow. P1 adds a deterministic agent mode used by the clarification
 // runtime; P2 adds the design team profiles. Without a profile marker the P0
-// behaviour is unchanged.
+// behaviour is unchanged. The legacy P3-P7 scenario dispatchers live in
+// scripts/fake-llm-legacy.cjs (ported from the pre-0.2.1 upstream) and are
+// called before the current profile dispatcher; see that module for the
+// scenario rules and the [profile:...] marker mapping.
 //
 // Endpoints:
 //   GET  /health               -> {"status":"ok","service":"fake-llm",...}
 //   GET  /v1/models            -> OpenAI-compatible model list
 //   POST /v1/chat/completions  -> non-stream JSON or stream=true SSE
+//   GET/POST /__p4-mode        -> legacy P4 scenario mode (ok|error|partial|impact-ai)
+//   GET/POST /__p5-mode        -> legacy P5 scenario mode (normal|invalid|degraded)
+//   GET/POST /__p6-mode        -> legacy P6 scenario mode (normal|fail|blocked|takeover|budget)
+//   GET/POST /__p7-mode        -> legacy P7 scenario mode (normal|noop|degraded|invalid)
 //
 // Determinism rules (same request body => byte-identical response):
 //   * completion id  = "chatcmpl-fake-" + sha256(raw body)[0:12]
@@ -36,6 +44,9 @@
 //       - data_planner -> design.graph_read, then design.data_plan_submit for
 //         the first draft case, then final text
 //       - no profile ever calls case.confirm (user/server-only)
+//   * legacy P3-P7 scenarios: see scripts/fake-llm-legacy.cjs. P4 file/impact
+//         requests are recorded compactly in .tmp/fake-llm-requests.jsonl
+//         (mode/path/commit only, never prompt content).
 //   * context overflow  = system marker "[fake:context_overflow]" or request
 //         header X-Fake-Context-Overflow: 1 returns HTTP 400 with
 //         code=context_length_exceeded once per distinct raw request body
@@ -46,11 +57,14 @@
 // legacy fallback. Host is always 127.0.0.1. The fake is not an EzTest
 // runtime env var and is never read by the API.
 //
-// This process never touches the network besides loopback and never writes
-// request logs.
+// This process never touches the network besides loopback; the only file write
+// is the compact legacy P4 request log described above.
 
 const crypto = require("node:crypto");
 const http = require("node:http");
+// Legacy P3-P7 scenario dispatchers kept for the regression suites committed in
+// the 0.2.0 tree (scripts/fake-llm.p4/p5/p6/p7.test.cjs). See the module banner.
+const legacyFake = require("./fake-llm-legacy.cjs");
 
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 13334;
@@ -753,6 +767,23 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
+  // The legacy P3-P7 scenario suites (and their P1/P3/P4 regression guards) are
+  // dispatched first: each detector only matches its own system-prompt marker,
+  // and the P1/P3 fallbacks are gated so an unmarked current P1/P2 request
+  // still reaches the current dispatcher below.
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  if (
+    await legacyFake.handleLegacyScenario({
+      body,
+      messages,
+      res,
+      stream: body.stream === true,
+      hasProfileMarker: profileOf(body) !== null,
+    })
+  ) {
+    return;
+  }
+
   const outcome = chatOutcome(body, rawBody);
   if (body.stream === true && outcome.kind === "text") {
     streamCompletion(res, body, rawBody, outcome.text);
@@ -787,6 +818,8 @@ async function handleRequest(req, res) {
     await handleChatCompletions(req, res);
     return;
   }
+  // Test-only legacy scenario controls (/__p4-mode ... /__p7-mode).
+  if (await legacyFake.handleLegacyControl(req, res, pathname)) return;
   sendError(res, 404, "not found", "not_found_error");
 }
 

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
+import type { VersionEvent } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { VisualView } from "@/features/visual/VisualView"
 
@@ -247,12 +248,29 @@ export function ExecutionTab({
     [],
   )
 
+  const handleExecutionChanged = useCallback(
+    (event: VersionEvent) => {
+      if (event.type === "execution.intent_superseded") {
+        // Task 106: a selected confirmed case version left the executable set.
+        // Re-planned replacements run automatically; without one the user must
+        // reconfirm. Either way the drop is stated, never silent.
+        if (event.payload.replanned === true) {
+          setNotice("有已确认用例版本被更新的已确认版本取代，已自动重新排入执行队列。")
+        } else if (event.payload.reason === "case_version_superseded") {
+          setNotice("有已确认用例版本在执行前失效且尚未重新确认，未执行；请重新确认用例后再执行。")
+        }
+      }
+      scheduleRefresh()
+    },
+    [scheduleRefresh],
+  )
+
   const sseStatus = useVersionEvents(versionId, {
     onWaveChanged: scheduleRefresh,
     onCaseRunChanged: scheduleRefresh,
     onEvidenceCreated: scheduleRefresh,
     onHumanRequestChanged: scheduleRefresh,
-    onExecutionChanged: scheduleRefresh,
+    onExecutionChanged: handleExecutionChanged,
   })
 
   const updateUrl = useCallback(
@@ -475,6 +493,11 @@ export function ExecutionTab({
               onResume={(caseRun) => handleResumeCaseRun(caseRun)}
               onRerunComplete={() => {
                 void refresh()
+              }}
+              onOpenRequirement={(requirementId) => {
+                router.push(
+                  `/versions/${encodeURIComponent(versionId)}?tab=requirements&requirement=${encodeURIComponent(requirementId)}`,
+                )
               }}
               detail={detail}
               detailLoading={detailLoading}

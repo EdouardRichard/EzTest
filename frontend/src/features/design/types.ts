@@ -7,6 +7,8 @@
  * `{data, next_cursor, has_more}` and detail endpoints use `{data: ...}`.
  */
 
+import type { CaseRunVerdict } from "@/features/execution/types"
+
 /** Per-requirement projection shown on the requirement node (spec §4.6). */
 export type DesignStatus = "pending" | "in_design" | "draft" | "confirmed" | "stale"
 
@@ -39,6 +41,12 @@ export type DesignCaseSummary = {
   api_ids: string[]
   step_count: number
   assertion_count: number
+  /**
+   * Latest execution verdict of this current case version (spec §9.3);
+   * `inconclusive` when the case has never been executed. Additive to the
+   * frozen P2 graph contract, so older fixtures may omit it.
+   */
+  execution_verdict?: CaseRunVerdict
   created_at: string
 }
 
@@ -94,6 +102,29 @@ export type DesignOverview = {
   auto_design_new_requirements: boolean
   round_count: number
   active_round: DesignRound | null
+}
+
+/* ----------------------------------- stage ---------------------------------- */
+
+/** 0.2.1 version stage-machine projection (spec §5.3). */
+export type VersionStage =
+  | "created"
+  | "clarifying"
+  | "requirement_review"
+  | "designing"
+  | "case_review"
+  | "executing"
+  | "reporting"
+  | "completed"
+  | "blocked"
+  | "paused"
+
+/** `GET/POST /api/versions/{id}/stage` response payload. */
+export type StageView = {
+  version_id: string
+  stage: VersionStage
+  stage_entered_at: string
+  blocker: string | null
 }
 
 /* --------------------------------- case detail ------------------------------ */

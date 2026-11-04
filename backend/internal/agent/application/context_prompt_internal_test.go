@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
@@ -43,10 +44,10 @@ func TestMinimalSystemContentRendersPromptAfterTaskBlock(t *testing.T) {
 		CaseRunID: 3001, CaseTitle: "登录流程", Priority: "P1",
 	}
 	in.Profile.Key = ProfileKeyCaseExecutor
-	in.Profile.SystemPrompt = "[profile:case_executor] 用例 {{.CaseTitle}}/{{.Priority}}"
+	in.Profile.SystemPrompt = "[profile:case_executor] 版本 {{.VersionTitle}}（{{.VersionStatus}}）"
 
 	system := minimalSystemContent(in)
-	if !strings.Contains(system, "用例 登录流程/P1") {
+	if !strings.Contains(system, "版本 订单系统 Q4（running）") {
 		t.Fatalf("minimal prompt not rendered: %s", system)
 	}
 	taskIndex := strings.Index(system, "# 任务")
@@ -57,6 +58,61 @@ func TestMinimalSystemContentRendersPromptAfterTaskBlock(t *testing.T) {
 	}
 	if !(taskIndex < executionIndex && executionIndex < promptIndex) {
 		t.Fatalf("minimal block order = %d/%d/%d: %s", taskIndex, executionIndex, promptIndex, system)
+	}
+}
+
+// TestStableSystemContentExcludesTaskContext pins the Task 80 split: the part
+// of the system content that feeds the cache-stable prefix is the rendered
+// profile prompt only. The per-work-item task block and the P3 execution block
+// must never leak into it, or every work item gets a unique provider prefix.
+func TestStableSystemContentExcludesTaskContext(t *testing.T) {
+	in := internalPromptInput()
+	in.Task.Constraints = []string{"work_item_id=1001 不能替用户确认需求"}
+	in.Task.Scope = []string{"work_item_id=1001", "requirement_id=501"}
+	in.Execution = &ExecutionTask{
+		CaseRunID: 3001, CaseVersionID: 41, CaseTitle: "登录流程", Priority: "P1",
+		Steps: []ExecutionStep{{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"}},
+	}
+
+	stable := stableSystemContent(in)
+	if !strings.Contains(stable, "[profile:clarification_host] 版本 订单系统 Q4") {
+		t.Fatalf("stable system content lost the rendered profile prompt: %s", stable)
+	}
+	for _, leaked := range []string{
+		"# 任务", "# 执行任务", "work_item_id=1001", "requirement_id=501",
+		"不能替用户确认需求", "登录流程", "打开登录页",
+	} {
+		if strings.Contains(stable, leaked) {
+			t.Fatalf("per-work-item %q leaked into the stable system content:\n%s", leaked, stable)
+		}
+	}
+}
+
+// TestTaskContextBlockKeepsTaskAndExecution pins that the extracted task
+// context still carries goal, constraints, acceptance, scope and the P3
+// execution snapshot, and that the legacy context path (renderSections/minimal
+// fallback) keeps rendering both blocks in the system section.
+func TestTaskContextBlockKeepsTaskAndExecution(t *testing.T) {
+	in := internalPromptInput()
+	in.Execution = &ExecutionTask{
+		CaseRunID: 3001, CaseVersionID: 41, CaseTitle: "登录流程", Priority: "P1",
+		Steps: []ExecutionStep{{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"}},
+	}
+
+	block := taskContextBlock(in)
+	for _, want := range []string{
+		"# 任务", "类型: chat.turn", "目标: 回答用户问题",
+		"约束:", "不能替用户确认需求", "# 执行任务", "登录流程", "打开登录页",
+	} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("task context block misses %q:\n%s", want, block)
+		}
+	}
+
+	legacy := systemContent(in)
+	if !strings.Contains(legacy, "[profile:clarification_host] 版本 订单系统 Q4") ||
+		!strings.Contains(legacy, block) {
+		t.Fatalf("legacy system content lost the prompt or the task context:\n%s", legacy)
 	}
 }
 
@@ -98,5 +154,63 @@ func TestSystemContentKeepsPlainPromptUnchanged(t *testing.T) {
 	system := systemContent(in)
 	if !strings.HasPrefix(system, "[profile:clarification_host] 你是澄清 Host。") {
 		t.Fatalf("plain prompt changed: %s", system)
+	}
+}
+
+// TestTaskContextNotDuplicatedOnEmptyPrefix pins the defensive system-message
+// fallback of the cache-first runner. When an assembled packet carries no
+// prefix, the runner falls back to the stable system content only: the
+// per-work-item task block already lives in the user turn, so a fallback that
+// rendered the legacy systemContent (prompt + task context) would send the
+// block twice, and an oversized block duplicated in the prompt/transcript can
+// push a run over the window.
+func TestTaskContextNotDuplicatedOnEmptyPrefix(t *testing.T) {
+	in := internalPromptInput()
+	in.Task.Constraints = []string{"work_item_id=1001 不能替用户确认需求"}
+	in.Task.AcceptanceCriteria = []string{"给出可执行的下一步"}
+	in.Task.Scope = []string{"work_item_id=1001", "requirement_id=501"}
+	in.Execution = &ExecutionTask{
+		CaseRunID: 3001, CaseVersionID: 41, CaseTitle: "登录流程", Priority: "P1",
+		Steps: []ExecutionStep{{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"}},
+	}
+	const base = "请继续执行当前任务。"
+
+	system := systemMessageText(agentcontext.ContextPacket{}, in)
+	if !strings.Contains(system, "[profile:clarification_host] 版本 订单系统 Q4") {
+		t.Fatalf("empty-prefix fallback lost the stable prompt:\n%s", system)
+	}
+	for _, leaked := range []string{
+		"# 任务", "# 执行任务", "work_item_id=1001", "requirement_id=501",
+		"不能替用户确认需求", "登录流程", "打开登录页",
+	} {
+		if strings.Contains(system, leaked) {
+			t.Fatalf("empty-prefix fallback re-added per-work-item %q:\n%s", leaked, system)
+		}
+	}
+
+	user := taskContextMessage(base, in)
+	combined := system + "\n\n" + user
+	if got := strings.Count(combined, "# 任务"); got != 1 {
+		t.Fatalf("task block occurrences = %d, want exactly 1:\n%s", got, combined)
+	}
+	if got := strings.Count(combined, "# 执行任务"); got != 1 {
+		t.Fatalf("execution block occurrences = %d, want exactly 1:\n%s", got, combined)
+	}
+	for _, want := range []string{
+		"目标: 回答用户问题", "约束:", "不能替用户确认需求", "验收:",
+		"作用域:", "work_item_id=1001", "requirement_id=501",
+		"登录流程", "打开登录页", base,
+	} {
+		if !strings.Contains(user, want) {
+			t.Fatalf("user turn misses task material %q:\n%s", want, user)
+		}
+	}
+
+	// A non-empty prefix is used verbatim; the fallback never applies.
+	packet := agentcontext.ContextPacket{Segments: []agentcontext.Segment{{
+		Name: agentcontext.SegmentPrefix, Role: "system", Content: "[stable-prefix]", Prefix: true,
+	}}}
+	if got := systemMessageText(packet, in); got != "[stable-prefix]" {
+		t.Fatalf("systemMessageText(packet) = %q, want the persisted prefix", got)
 	}
 }

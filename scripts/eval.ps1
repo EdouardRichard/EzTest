@@ -40,7 +40,7 @@
 .PARAMETER BearerToken
     Admin bearer token. Defaults to EZTEST_ADMIN_TOKEN; otherwise the script
     logs in with the admin username/password from .env (development seed
-    defaults admin/admin123 when absent).
+    defaults admin/[REDACTED] when absent).
 
 .PARAMETER RequestTimeoutSeconds
     Per-request HTTP timeout.
@@ -774,7 +774,7 @@ function Invoke-Preflight {
     Write-Info "llm model = $llmModel (real-LLM track; key/base URL never printed)"
 
     $adminUsername = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_USERNAME" -Default "admin"
-    $adminPassword = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_PASSWORD" -Default "admin123"
+    $adminPassword = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_PASSWORD" -Default "[REDACTED]"
     $adminToken = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_TOKEN" -Default ""
     if ([string]::IsNullOrWhiteSpace($adminToken) -and [string]::IsNullOrWhiteSpace($adminUsername)) {
         throw "admin credentials are missing for the evaluation run"

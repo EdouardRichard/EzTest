@@ -1,12 +1,21 @@
 "use client"
 
-import { type KeyboardEvent, useState } from "react"
+import {
+  type ClipboardEvent,
+  type DragEvent,
+  type KeyboardEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { InlineError } from "@/components/ui/ErrorState"
+import type { CaseCardPart } from "@/features/conversation/types"
+import { ApiError } from "@/lib/api-client"
 
-import { AttachmentUploader } from "./AttachmentUploader"
+import { AttachmentUploader, type AttachmentUploaderHandle } from "./AttachmentUploader"
 import type { NewMessagePart, UploadedAttachment } from "./types"
 
 export type ComposerProps = {
@@ -18,30 +27,79 @@ export type ComposerProps = {
   /** External draft (e.g. the P2 "请求修改" action); controlled when defined. */
   text?: string
   onTextChange?: (value: string) => void
+  /** Case references ("交给 AI 修改") carried by the next user message. */
+  caseReferences?: CaseCardPart[]
+  onCaseReferencesChange?: (references: CaseCardPart[]) => void
+  /**
+   * True while the draft holds an image attachment (0.2.1 vision gating). The
+   * page passes it to `ModelSelector` so non-vision models are disabled.
+   */
+  onDraftHasImagesChange?: (hasImages: boolean) => void
+  /**
+   * Why the current draft cannot be sent (an image on a non-vision model,
+   * Task 75). When set, Send is disabled and the reason is shown; the draft is
+   * kept so the user can switch model or remove the image and retry.
+   */
+  sendBlockedReason?: string
+}
+
+/** Image detection for the draft; the mime comes from `POST /api/content`. */
+function hasImageAttachment(items: readonly UploadedAttachment[]): boolean {
+  return items.some((item) => item.mime.trim().toLowerCase().startsWith("image/"))
 }
 
 /**
  * Chat composer: Enter sends, Shift+Enter inserts a newline, the send button is
  * disabled while a message/attachment is in flight, and the draft survives a
- * failed send. `text`/`onTextChange` make the draft controllable so other UI
- * (design case detail) can prefill it without sending.
+ * failed send. Files can be selected, pasted or dropped; all three paths use the
+ * same upload pipeline (spec §8.4). `text`/`onTextChange` make the draft
+ * controllable so other UI (design case detail) can prefill it without sending.
  */
 export function Composer({
   onSend,
   error,
   disabled = false,
-  placeholder = "描述需求，或上传 doc / pdf / md / ppt…",
+  placeholder = "描述需求，或粘贴 / 拖拽上传 doc / pdf / md / ppt…",
   text,
   onTextChange,
+  caseReferences = [],
+  onCaseReferencesChange,
+  onDraftHasImagesChange,
+  sendBlockedReason,
 }: ComposerProps) {
   const [internalValue, setInternalValue] = useState("")
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([])
   const [uploading, setUploading] = useState(false)
   const [sending, setSending] = useState(false)
+  const uploaderRef = useRef<AttachmentUploaderHandle>(null)
 
   const value = text ?? internalValue
-  const hasContent = value.trim().length > 0 || attachments.length > 0
+  const hasContent = value.trim().length > 0 || attachments.length > 0 || caseReferences.length > 0
+  // A pending attachment upload/parse must finish before the message can be
+  // submitted (spec §8.5); the server repeats this with a typed 409
+  // attachment_pending when a referenced attachment is still parsing.
   const blocked = disabled || sending || uploading
+  // The page-level vision gate (Task 75): an image draft on a non-vision model
+  // never reaches POST 201. The draft and attachments stay editable/removable.
+  const sendBlocked = sendBlockedReason !== undefined
+  // The server rejects a send whose attachment is still parsing with a typed
+  // 409. Keep the draft/attachments and offer an explicit retry instead of
+  // silently re-submitting or dropping the message.
+  const attachmentPending = error instanceof ApiError && error.code === "attachment_pending"
+  const draftHasImages = hasImageAttachment(attachments)
+
+  // Publish the image-draft signal that gates non-vision models (0.2.1). The
+  // attachment list is owned here (Task 25 FloatingPanel / Task 28 chips stay
+  // untouched), so the page only needs the boolean.
+  useEffect(() => {
+    onDraftHasImagesChange?.(draftHasImages)
+  }, [draftHasImages, onDraftHasImagesChange])
+  // The next composer (conversation switch, collapse/expand, send that clears
+  // the draft) starts empty; never leak a stale `true` into it.
+  useEffect(() => {
+    if (onDraftHasImagesChange === undefined) return
+    return () => onDraftHasImagesChange(false)
+  }, [onDraftHasImagesChange])
 
   function updateValue(next: string): void {
     if (text === undefined) setInternalValue(next)
@@ -49,7 +107,7 @@ export function Composer({
   }
 
   async function submit(): Promise<void> {
-    if (blocked || !hasContent) return
+    if (blocked || sendBlocked || !hasContent) return
     const parts: NewMessagePart[] = []
     const draft = value.trim()
     if (draft.length > 0) parts.push({ type: "text", text: draft })
@@ -62,6 +120,15 @@ export function Composer({
         size: attachment.size,
       })
     }
+    for (const reference of caseReferences) {
+      parts.push({
+        type: "case_card",
+        case_id: reference.case_id,
+        case_version_id: reference.case_version_id ?? null,
+        title: reference.title,
+        status: reference.status,
+      })
+    }
 
     setSending(true)
     try {
@@ -69,6 +136,7 @@ export function Composer({
       if (sent) {
         updateValue("")
         setAttachments([])
+        onCaseReferencesChange?.([])
       }
     } catch {
       // The parent surfaces send errors through `error`; keep the draft.
@@ -84,6 +152,25 @@ export function Composer({
     void submit()
   }
 
+  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>): void {
+    const files = event.clipboardData?.files
+    if (files === undefined || files.length === 0) return
+    event.preventDefault()
+    uploaderRef.current?.addFiles(files)
+  }
+
+  function handleDragOver(event: DragEvent<HTMLTextAreaElement>): void {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return
+    event.preventDefault()
+  }
+
+  function handleDrop(event: DragEvent<HTMLTextAreaElement>): void {
+    const files = event.dataTransfer?.files
+    if (files === undefined || files.length === 0) return
+    event.preventDefault()
+    uploaderRef.current?.addFiles(files)
+  }
+
   return (
     <div className="border-t border-border px-3 py-2.5">
       <div
@@ -92,6 +179,34 @@ export function Composer({
           "focus-within:border-primary/60 focus-within:ring-1 focus-within:ring-ring",
         )}
       >
+        {caseReferences.length === 0 ? null : (
+          <div data-testid="composer-case-references" className="mb-1.5 flex flex-wrap gap-1">
+            {caseReferences.map((reference) => (
+              <span
+                key={reference.case_id}
+                data-testid={`composer-case-ref-${reference.case_id}`}
+                className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-2 py-0.5 text-[10px] text-foreground"
+              >
+                用例 {reference.title}
+                {onCaseReferencesChange === undefined ? null : (
+                  <button
+                    type="button"
+                    data-testid={`composer-case-ref-remove-${reference.case_id}`}
+                    aria-label={`移除用例引用 ${reference.title}`}
+                    onClick={() =>
+                      onCaseReferencesChange(
+                        caseReferences.filter((item) => item.case_id !== reference.case_id),
+                      )
+                    }
+                    className="rounded-full px-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    ×
+                  </button>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
         <textarea
           data-testid="composer-textarea"
           aria-label="需求澄清消息"
@@ -101,6 +216,9 @@ export function Composer({
           placeholder={placeholder}
           onChange={(event) => updateValue(event.target.value)}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
           className={cn(
             "w-full resize-none bg-transparent text-sm text-foreground outline-none",
             "placeholder:text-muted-foreground disabled:cursor-not-allowed",
@@ -108,6 +226,7 @@ export function Composer({
         />
         <div className="mt-1 flex items-center gap-2">
           <AttachmentUploader
+            ref={uploaderRef}
             items={attachments}
             onChange={setAttachments}
             onUploadingChange={setUploading}
@@ -121,15 +240,36 @@ export function Composer({
             onClick={() => {
               void submit()
             }}
-            disabled={blocked || !hasContent}
+            disabled={blocked || sendBlocked || !hasContent}
           >
-            {sending ? "发送中…" : "发送"}
+            {sending ? "发送中…" : uploading ? "解析中…" : "发送"}
           </Button>
         </div>
+        {sendBlocked && sendBlockedReason !== undefined ? (
+          <p
+            data-testid="composer-send-blocked"
+            role="status"
+            className="mt-1.5 text-[11px] text-warning"
+          >
+            {sendBlockedReason}
+          </p>
+        ) : null}
       </div>
       {error !== undefined ? (
-        <div className="pt-1.5">
+        <div className="flex flex-wrap items-center gap-2 pt-1.5">
           <InlineError error={error} />
+          {attachmentPending ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={blocked || sendBlocked || !hasContent}
+              onClick={() => {
+                void submit()
+              }}
+            >
+              重试发送
+            </Button>
+          ) : null}
         </div>
       ) : null}
     </div>

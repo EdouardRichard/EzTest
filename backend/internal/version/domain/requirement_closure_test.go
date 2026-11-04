@@ -45,6 +45,7 @@ func allClosureChecks() version.ClosureChecks {
 		RequirementState:   true,
 		HasConfirmedCase:   true,
 		CasesTerminal:      true,
+		CasesVerified:      true,
 		FailedCaseHasIssue: true,
 		NoOpenWork:         true,
 		NoActiveIntent:     true,
@@ -109,7 +110,10 @@ func TestClosureEvaluationRequiresEveryCheck(t *testing.T) {
 			mutate: func(in *version.ClosureInput) {
 				in.CaseVersions = append(in.CaseVersions, other)
 			},
-			want: wantClosureChecks(func(c *version.ClosureChecks) { c.CasesTerminal = false }),
+			want: wantClosureChecks(func(c *version.ClosureChecks) {
+				c.CasesTerminal = false
+				c.CasesVerified = false
+			}),
 		},
 		{
 			name: "pending latest run is not terminal",
@@ -118,7 +122,10 @@ func TestClosureEvaluationRequiresEveryCheck(t *testing.T) {
 					CaseRunID: 1201, CaseVersionID: 1101, Status: version.CaseRunPending,
 				}
 			},
-			want: wantClosureChecks(func(c *version.ClosureChecks) { c.CasesTerminal = false }),
+			want: wantClosureChecks(func(c *version.ClosureChecks) {
+				c.CasesTerminal = false
+				c.CasesVerified = false
+			}),
 		},
 		{
 			name: "running latest run is not terminal",
@@ -127,7 +134,39 @@ func TestClosureEvaluationRequiresEveryCheck(t *testing.T) {
 					CaseRunID: 1201, CaseVersionID: 1101, Status: version.CaseRunRunning,
 				}
 			},
-			want: wantClosureChecks(func(c *version.ClosureChecks) { c.CasesTerminal = false }),
+			want: wantClosureChecks(func(c *version.ClosureChecks) {
+				c.CasesTerminal = false
+				c.CasesVerified = false
+			}),
+		},
+		{
+			name: "inconclusive latest run is terminal but not verified",
+			mutate: func(in *version.ClosureInput) {
+				in.LatestRuns[1101] = version.CaseRunSnapshot{
+					CaseRunID: 1201, CaseVersionID: 1101,
+					Status: version.CaseRunInconclusive, FailureClass: "automation",
+				}
+			},
+			want: wantClosureChecks(func(c *version.ClosureChecks) { c.CasesVerified = false }),
+		},
+		{
+			name: "blocked latest run is terminal but not verified",
+			mutate: func(in *version.ClosureInput) {
+				in.LatestRuns[1101] = version.CaseRunSnapshot{
+					CaseRunID: 1201, CaseVersionID: 1101,
+					Status: version.CaseRunBlocked, FailureClass: "blocked",
+				}
+			},
+			want: wantClosureChecks(func(c *version.ClosureChecks) { c.CasesVerified = false }),
+		},
+		{
+			name: "explicitly skipped latest run is verified",
+			mutate: func(in *version.ClosureInput) {
+				in.LatestRuns[1101] = version.CaseRunSnapshot{
+					CaseRunID: 1201, CaseVersionID: 1101, Status: version.CaseRunSkipped,
+				}
+			},
+			want: allClosureChecks(),
 		},
 		{
 			name: "failed application case requires an issue ref",
@@ -227,8 +266,18 @@ func TestClosureTerminalStatusMatrix(t *testing.T) {
 			if status == version.CaseRunFailed {
 				in.IssueRefs[1201] = true
 			}
-			if !version.EvaluateRequirementClosure(in).Passed() {
-				t.Fatalf("status %q should be terminal and closable", status)
+			checks := version.EvaluateRequirementClosure(in)
+			if !checks.CasesTerminal {
+				t.Fatalf("status %q should be terminal", status)
+			}
+			// Task 117: a terminal run is not automatically a verified one.
+			verified := status == version.CaseRunPassed || status == version.CaseRunFailed ||
+				status == version.CaseRunSkipped
+			if checks.CasesVerified != verified {
+				t.Fatalf("status %q verified = %v, want %v", status, checks.CasesVerified, verified)
+			}
+			if checks.Passed() != verified {
+				t.Fatalf("status %q closable = %v, want %v", status, checks.Passed(), verified)
 			}
 		})
 	}
@@ -238,8 +287,37 @@ func TestClosureTerminalStatusMatrix(t *testing.T) {
 			in.LatestRuns[1101] = version.CaseRunSnapshot{
 				CaseRunID: 1201, CaseVersionID: 1101, Status: status,
 			}
-			if version.EvaluateRequirementClosure(in).CasesTerminal {
+			checks := version.EvaluateRequirementClosure(in)
+			if checks.CasesTerminal {
 				t.Fatalf("status %q must not be terminal", status)
+			}
+			if checks.CasesVerified {
+				t.Fatalf("status %q must not be verified", status)
+			}
+		})
+	}
+}
+
+// TestInconclusiveVisualBlocksClose reproduces REL-Q3: FR-025's latest case
+// run was terminal but inconclusive because its visual assertion had no
+// approved baseline. An inconclusive run verified nothing, so it must not
+// satisfy the closure predicate; blocked runs are the same non-verification
+// class (the case is waiting on a human/environment instead of producing a
+// definitive result).
+func TestInconclusiveVisualBlocksClose(t *testing.T) {
+	for _, status := range []string{version.CaseRunInconclusive, version.CaseRunBlocked} {
+		t.Run(status, func(t *testing.T) {
+			in := passingClosureInput()
+			in.LatestRuns[1101] = version.CaseRunSnapshot{
+				CaseRunID: 1201, CaseVersionID: 1101,
+				Status: status, FailureClass: version.FailureClassApplication,
+			}
+			checks := version.EvaluateRequirementClosure(in)
+			if checks.Passed() {
+				t.Fatalf("%s latest run must not satisfy the closure predicate", status)
+			}
+			if counts := version.ClosureFailureCounts(in); counts["cases_verified"] != 1 {
+				t.Fatalf("%s failure counts = %#v, want cases_verified=1", status, counts)
 			}
 		})
 	}
@@ -250,7 +328,7 @@ func TestClosurePassedRequiresAllChecks(t *testing.T) {
 		t.Fatal("all-true checks must pass")
 	}
 	names := []string{
-		"requirement_state", "has_confirmed_case", "cases_terminal",
+		"requirement_state", "has_confirmed_case", "cases_terminal", "cases_verified",
 		"failed_case_has_issue", "no_open_work", "no_active_intent",
 		"no_inflight_case_run", "coverage_recorded",
 	}
@@ -263,6 +341,8 @@ func TestClosurePassedRequiresAllChecks(t *testing.T) {
 			checks.HasConfirmedCase = false
 		case "cases_terminal":
 			checks.CasesTerminal = false
+		case "cases_verified":
+			checks.CasesVerified = false
 		case "failed_case_has_issue":
 			checks.FailedCaseHasIssue = false
 		case "no_open_work":
@@ -306,6 +386,7 @@ func TestClosureFailureCounts(t *testing.T) {
 	want := map[string]int{
 		version.ClosureCheckRequirementState:   1,
 		version.ClosureCheckCasesTerminal:      1,
+		version.ClosureCheckCasesVerified:      1,
 		version.ClosureCheckFailedCaseHasIssue: 1,
 		version.ClosureCheckNoOpenWork:         2,
 		version.ClosureCheckNoActiveIntent:     1,
@@ -356,14 +437,14 @@ func TestClosureCheckResultJSONReservesWaived(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(decoded) != 9 {
+	if len(decoded) != 10 {
 		t.Fatalf("check result keys = %#v", decoded)
 	}
 	if waived, ok := decoded["waived"].(bool); !ok || waived {
 		t.Fatalf("waived = %#v, want false", decoded["waived"])
 	}
 	for _, name := range []string{
-		"requirement_state", "has_confirmed_case", "cases_terminal",
+		"requirement_state", "has_confirmed_case", "cases_terminal", "cases_verified",
 		"failed_case_has_issue", "no_open_work", "no_active_intent",
 		"no_inflight_case_run", "coverage_recorded",
 	} {

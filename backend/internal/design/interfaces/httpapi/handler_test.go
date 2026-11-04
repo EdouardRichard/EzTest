@@ -13,6 +13,8 @@ import (
 
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 func int64Ptr(value int64) *int64 { return &value }
@@ -153,6 +155,106 @@ func decodeEnvelope(t *testing.T, recorder *httptest.ResponseRecorder) map[strin
 	return envelope.Data
 }
 
+// fixedDesignStageReader is the deterministic stage projection stub for the
+// case-gate guard.
+type fixedDesignStageReader struct {
+	stage version.Stage
+	err   error
+}
+
+func (r fixedDesignStageReader) Stage(_ context.Context, versionID int64) (versionapp.StageView, error) {
+	if r.err != nil {
+		return versionapp.StageView{}, r.err
+	}
+	return versionapp.StageView{VersionID: versionID, Stage: r.stage}, nil
+}
+
+// TestCaseConfirmationRequiresCaseReview pins the Task 78 guard on the single
+// case confirmation path: the design API must not freeze cases while the
+// version is clarifying/designing, and the typed 409 must carry the stage and
+// next action. At case_review the same request reaches the graph service.
+func TestCaseConfirmationRequiresCaseReview(t *testing.T) {
+	handler, graph, _ := newTestHandler()
+	handler.SetStageReader(fixedDesignStageReader{stage: version.StageClarifying})
+	mux := testMux(handler)
+
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, authedRequest(http.MethodPost,
+		"/api/versions/1001/design/confirmations", strings.NewReader(`{"scope":"case","target_id":"7001"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	errorData, _ := payload["error"].(map[string]any)
+	if errorData["code"] != "invalid_stage_for_action" {
+		t.Fatalf("error = %#v, want invalid_stage_for_action", errorData)
+	}
+	details, _ := errorData["details"].(map[string]any)
+	if details["required_stage"] != "case_review" || details["current_stage"] != "clarifying" {
+		t.Fatalf("details = %#v", details)
+	}
+	if next, _ := details["next_action"].(string); next == "" {
+		t.Fatalf("next_action = %#v, want actionable guidance", details["next_action"])
+	}
+	if graph.lastVersionID != 0 {
+		t.Fatalf("wrong-stage confirmation reached the graph service: %+v", graph)
+	}
+
+	handler.SetStageReader(fixedDesignStageReader{stage: version.StageCaseReview})
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, authedRequest(http.MethodPost,
+		"/api/versions/1001/design/confirmations", strings.NewReader(`{"scope":"case","target_id":"7001"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("case_review status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if graph.lastVersionID != 1001 || graph.lastConfirmIn.TargetID != 7001 {
+		t.Fatalf("confirm input = %+v version=%d", graph.lastConfirmIn, graph.lastVersionID)
+	}
+}
+
+// TestConfirmationStageGuidanceCoversEveryScope pins the Task 82 guidance fix:
+// the confirmation endpoint serves case, scenario and requirement scopes, so
+// its wrong-stage 409 must echo the requested scope and carry scope-appropriate
+// next-action guidance instead of a case-only message.
+func TestConfirmationStageGuidanceCoversEveryScope(t *testing.T) {
+	for _, scope := range []string{"case", "scenario", "requirement"} {
+		t.Run(scope, func(t *testing.T) {
+			handler, graph, _ := newTestHandler()
+			handler.SetStageReader(fixedDesignStageReader{stage: version.StageDesigning})
+			mux := testMux(handler)
+
+			response := httptest.NewRecorder()
+			body := `{"scope":"` + scope + `","target_id":"7001"}`
+			mux.ServeHTTP(response, authedRequest(http.MethodPost,
+				"/api/versions/1001/design/confirmations", strings.NewReader(body)))
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409, body = %s", response.Code, response.Body.String())
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			errorData, _ := payload["error"].(map[string]any)
+			if errorData["code"] != "invalid_stage_for_action" {
+				t.Fatalf("error = %#v, want invalid_stage_for_action", errorData)
+			}
+			details, _ := errorData["details"].(map[string]any)
+			if details["scope"] != scope {
+				t.Fatalf("details.scope = %#v, want %q", details["scope"], scope)
+			}
+			if next, _ := details["next_action"].(string); next == "" {
+				t.Fatalf("next_action = %#v, want actionable guidance", details["next_action"])
+			}
+			if graph.lastVersionID != 0 {
+				t.Fatalf("wrong-stage confirmation reached the graph service: %+v", graph)
+			}
+		})
+	}
+}
+
 func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 	handler, graph, _ := newTestHandler()
 	generatedAt := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
@@ -169,6 +271,7 @@ func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 					CaseID: 7001, CurrentVersionID: 7002, Revision: 1, Title: "登录成功",
 					Priority: "P1", Status: "draft", DefaultVersionSUTID: int64Ptr(9001),
 					VersionSUTIDs: []int64{9001}, StepCount: 2, AssertionCount: 1,
+					ExecutionVerdict: "failed",
 				}},
 			}},
 		}},
@@ -195,6 +298,9 @@ func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 	card := scenario["cases"].([]any)[0].(map[string]any)
 	if card["case_id"] != "7001" || card["current_version_id"] != "7002" || card["default_version_sut_id"] != "9001" {
 		t.Fatalf("case card = %v", card)
+	}
+	if card["execution_verdict"] != "failed" {
+		t.Fatalf("case execution_verdict = %v", card["execution_verdict"])
 	}
 }
 

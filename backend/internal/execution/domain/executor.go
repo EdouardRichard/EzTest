@@ -28,6 +28,13 @@ func (s ExecutorStatus) Available() bool { return s == ExecutorActive || s == Ex
 // Dispatchable reports whether new case_runs may be dispatched to it.
 func (s ExecutorStatus) Dispatchable() bool { return s == ExecutorActive }
 
+// ExecutorLabelDegraded is the reserved executor_instance.labels marker the
+// registry sets when the executor health signal is degraded (or the endpoint
+// probe fails inside the offline window). It is a marker rather than a
+// last_error convention because a degraded health reply may carry no error text
+// at all; last_error stays diagnostic.
+const ExecutorLabelDegraded = "eztest.degraded"
+
 // ExecutorInstance is one registered Playwright executor instance. P3 keeps a
 // single endpoint; the table is the P7 multi-executor reservation.
 type ExecutorInstance struct {
@@ -44,6 +51,16 @@ type ExecutorInstance struct {
 	LastError      string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+// Degraded reports whether the last health signal marked this executor as
+// degraded. It is independent of LastError, which is free-form diagnostic text.
+func (e ExecutorInstance) Degraded() bool {
+	if e.Labels == nil {
+		return false
+	}
+	marker, ok := e.Labels[ExecutorLabelDegraded].(bool)
+	return ok && marker
 }
 
 // FreeContexts returns the remaining browser-context capacity.

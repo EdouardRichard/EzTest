@@ -6,6 +6,8 @@ package resourceapp
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -21,12 +23,13 @@ import (
 // Service is the resource-catalog application service. It implements
 // CatalogReader for the version context.
 type Service struct {
-	repo   resource.Repository
-	ids    platformid.Generator
-	clock  clock.Clock
-	usage  UsageChecker
-	audit  auditapp.Recorder
-	events eventingapp.Publisher
+	repo      resource.Repository
+	ids       platformid.Generator
+	clock     clock.Clock
+	usage     UsageChecker
+	audit     auditapp.Recorder
+	events    eventingapp.Publisher
+	knowledge KnowledgeInvalidator
 }
 
 // New wires a resource service. usage, audit and events may be nil in unit
@@ -47,6 +50,44 @@ func New(
 // assembly root wires the two contexts through this setter.
 func (s *Service) SetUsageChecker(usage UsageChecker) {
 	s.usage = usage
+}
+
+// SetKnowledgeInvalidator injects the knowledge lifecycle sink after
+// construction. The knowledge service is built later in the assembly root than
+// the resource catalog, so the cross-context port is attached through this
+// setter (nil disables invalidation).
+func (s *Service) SetKnowledgeInvalidator(invalidator KnowledgeInvalidator) {
+	s.knowledge = invalidator
+}
+
+// invalidateKnowledge forwards one genuinely changed binding signal to the
+// knowledge context. It is best effort: the resource write already committed, so
+// a knowledge failure or a partially failed CAS pass is logged and never
+// surfaced to the caller (spec §10.1 页面/路由/账号变更 → stale).
+func (s *Service) invalidateKnowledge(ctx context.Context, change KnowledgeBindingChange) {
+	if s.knowledge == nil {
+		return
+	}
+	result, err := s.knowledge.MarkBindingsStale(ctx, change)
+	if err != nil {
+		slog.Default().WarnContext(ctx, "knowledge binding invalidation failed",
+			"reason", change.Reason, "error", err)
+		return
+	}
+	fields := []any{
+		"reason", change.Reason,
+		"scanned", result.Scanned,
+		"matched", result.Matched,
+		"marked", result.Marked,
+		"failed", result.Failed,
+	}
+	if result.Failed > 0 {
+		slog.Default().WarnContext(ctx, "knowledge binding invalidation partially failed", fields...)
+		return
+	}
+	if result.Marked > 0 {
+		slog.Default().InfoContext(ctx, "knowledge binding invalidation marked stale", fields...)
+	}
 }
 
 // SUTInput is the editable payload for creating a SUT.
@@ -482,7 +523,7 @@ func (s *Service) CreatePage(ctx context.Context, environmentID int64, input Pag
 	}
 	created, err := s.insertPage(ctx, page, actorID)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	return toPageView(created), nil
 }
@@ -536,12 +577,14 @@ func (s *Service) insertPage(ctx context.Context, page resource.Page, actorID in
 	return created, nil
 }
 
-// UpdatePage applies a partial page update.
+// UpdatePage applies a partial page update. Clearing route_template re-derives
+// it from the (possibly patched) URL.
 func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, actorID int64) (PageView, error) {
 	page, err := s.repo.GetPage(ctx, id)
 	if err != nil {
 		return PageView{}, mapRepoError(err, "page", "")
 	}
+	previousRoute := strings.TrimSpace(page.RouteTemplate)
 	if patch.Name != nil {
 		page.Name = *patch.Name
 	}
@@ -560,13 +603,20 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 	if patch.Module != nil {
 		page.Module = *patch.Module
 	}
+	if strings.TrimSpace(page.RouteTemplate) == "" {
+		derived, deriveErr := resource.DeriveRouteTemplate(page.URL)
+		if deriveErr != nil {
+			return PageView{}, deriveErr
+		}
+		page.RouteTemplate = derived
+	}
 	page.UpdatedAt = s.clock.Now()
 	if err := page.Validate(); err != nil {
 		return PageView{}, err
 	}
 	updated, err := s.repo.UpdatePage(ctx, page)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	s.record(ctx, actorID, "resource.page.updated", "page", platformid.Format(updated.ID), map[string]any{
 		"sut_id":         platformid.Format(updated.SUTID),
@@ -574,6 +624,15 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 		"name":           updated.Name,
 		"route_template": updated.RouteTemplate,
 	})
+	// Only a genuinely changed route key invalidates knowledge. The page's
+	// owning system/environment IDs are not passed: they did not change, and
+	// naming them would mark every item bound to the whole SUT stale.
+	if currentRoute := strings.TrimSpace(updated.RouteTemplate); previousRoute != "" && previousRoute != currentRoute {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			PageKeys: []string{previousRoute},
+			Reason:   "page route changed",
+		})
+	}
 	return toPageView(updated), nil
 }
 
@@ -584,10 +643,20 @@ func (s *Service) DeletePage(ctx context.Context, id int64, actorID int64) error
 	}, "page"); err != nil {
 		return err
 	}
+	page, err := s.repo.GetPage(ctx, id)
+	if err != nil {
+		return mapRepoError(err, "page", "")
+	}
 	if err := s.repo.DeletePage(ctx, id); err != nil {
 		return mapRepoError(err, "page", "")
 	}
 	s.record(ctx, actorID, "resource.page.deleted", "page", platformid.Format(id), nil)
+	if route := strings.TrimSpace(page.RouteTemplate); route != "" {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			PageKeys: []string{route},
+			Reason:   "page deleted",
+		})
+	}
 	return nil
 }
 
@@ -616,8 +685,9 @@ func (s *Service) GetPage(ctx context.Context, id int64) (PageView, error) {
 	return toPageView(page), nil
 }
 
-// ImportPages validates the whole batch first, then inserts it. Duplicate
-// route templates are skipped; any invalid item rejects the batch with 400.
+// ImportPages validates the whole batch first, then inserts it. Pages whose
+// normalized URL already exists are skipped; any invalid item rejects the batch
+// with 400.
 func (s *Service) ImportPages(ctx context.Context, environmentID int64, inputs []PageInput, actorID int64) (ImportPagesResult, error) {
 	environment, err := s.repo.GetEnvironment(ctx, environmentID)
 	if err != nil {
@@ -883,13 +953,18 @@ func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInpu
 	if err := page.Validate(); err != nil {
 		return PageView{}, err
 	}
+	normalizedURL, err := resource.NormalizePageURL(page.URL)
+	if err != nil {
+		return PageView{}, err
+	}
 
 	existing, listErr := s.repo.ListPages(ctx, environment.ID)
 	if listErr != nil {
 		return PageView{}, listErr
 	}
 	for _, candidate := range existing {
-		if candidate.RouteTemplate != routeTemplate {
+		candidateURL, normalizeErr := resource.NormalizePageURL(candidate.URL)
+		if normalizeErr != nil || candidateURL != normalizedURL {
 			continue
 		}
 		if candidate.Status == resource.PageStatusProposed {
@@ -897,7 +972,7 @@ func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInpu
 			page.CreatedAt = candidate.CreatedAt
 			updated, updateErr := s.repo.UpdatePage(ctx, page)
 			if updateErr != nil {
-				return PageView{}, mapRepoError(updateErr, "page", "page route already exists in this environment")
+				return PageView{}, mapPageError(updateErr)
 			}
 			s.record(ctx, 0, "resource.page.proposed", "page", platformid.Format(updated.ID), map[string]any{
 				"sut_id":         platformid.Format(updated.SUTID),
@@ -913,7 +988,7 @@ func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInpu
 	page.ID = s.ids.Next()
 	created, createErr := s.repo.CreatePage(ctx, page)
 	if createErr != nil {
-		return PageView{}, mapRepoError(createErr, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(createErr)
 	}
 	s.record(ctx, 0, "resource.page.proposed", "page", platformid.Format(created.ID), map[string]any{
 		"sut_id":         platformid.Format(created.SUTID),
@@ -937,7 +1012,7 @@ func (s *Service) ConfirmPage(ctx context.Context, pageID, actorID int64) (PageV
 	page.UpdatedAt = s.clock.Now()
 	updated, err := s.repo.UpdatePage(ctx, page)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	s.record(ctx, actorID, "resource.page.confirmed", "page", platformid.Format(updated.ID), map[string]any{
 		"sut_id":         platformid.Format(updated.SUTID),
@@ -961,7 +1036,7 @@ func (s *Service) RejectPage(ctx context.Context, pageID, actorID int64) (PageVi
 	page.UpdatedAt = s.clock.Now()
 	updated, err := s.repo.UpdatePage(ctx, page)
 	if err != nil {
-		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+		return PageView{}, mapPageError(err)
 	}
 	s.record(ctx, actorID, "resource.page.rejected", "page", platformid.Format(updated.ID), map[string]any{
 		"sut_id":         platformid.Format(updated.SUTID),
@@ -1292,6 +1367,7 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 	if err != nil {
 		return AccountView{}, mapRepoError(err, "account", "")
 	}
+	previousRoles := append([]string(nil), account.Roles...)
 	if patch.Username != nil {
 		account.Username = *patch.Username
 	}
@@ -1320,6 +1396,16 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 		"environment_id": platformid.Format(updated.EnvironmentID),
 		"username":       updated.Username,
 	})
+	// Only roles removed by the edit invalidate knowledge: a login recipe is
+	// bound to the account_role, and a newly added role has no knowledge yet.
+	// The account's system/environment IDs did not change, so they are omitted
+	// to keep the invalidation scoped to the removed roles.
+	if removed := removedStrings(previousRoles, updated.Roles); len(removed) > 0 {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			AccountRoles: removed,
+			Reason:       "account roles changed",
+		})
+	}
 	return toAccountView(updated), nil
 }
 
@@ -1330,10 +1416,20 @@ func (s *Service) DeleteAccount(ctx context.Context, id int64, actorID int64) er
 	}, "account"); err != nil {
 		return err
 	}
+	account, err := s.repo.GetAccount(ctx, id)
+	if err != nil {
+		return mapRepoError(err, "account", "")
+	}
 	if err := s.repo.DeleteAccount(ctx, id); err != nil {
 		return mapRepoError(err, "account", "")
 	}
 	s.record(ctx, actorID, "resource.account.deleted", "account", platformid.Format(id), nil)
+	if roles := removedStrings(account.Roles, nil); len(roles) > 0 {
+		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
+			AccountRoles: roles,
+			Reason:       "account deleted",
+		})
+	}
 	return nil
 }
 
@@ -1574,6 +1670,48 @@ func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (b
 		return platform.Conflict(kind + " is referenced by a version binding")
 	}
 	return nil
+}
+
+// removedStrings returns the trimmed values of before that are absent from
+// after, in their original order. It feeds the account-role invalidation: only
+// roles genuinely removed by an edit (or all roles of a deleted account) can
+// leave knowledge pointing at a surface that no longer exists.
+func removedStrings(before, after []string) []string {
+	kept := make(map[string]struct{}, len(after))
+	for _, value := range after {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			kept[trimmed] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(before))
+	seen := make(map[string]struct{}, len(before))
+	for _, value := range before {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, present := kept[trimmed]; present {
+			continue
+		}
+		if _, duplicate := seen[trimmed]; duplicate {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+// mapPageError maps page write failures. A normalized-URL collision is a
+// field-level 409 so clients can highlight the URL input instead of showing a
+// generic "page route already exists" conflict.
+func mapPageError(err error) error {
+	if errors.Is(err, resource.ErrPageURLDuplicate) {
+		apiErr := platform.NewError(http.StatusConflict, "page_url_exists", "page url already exists in this environment")
+		apiErr.Details = map[string]any{"field": "url"}
+		return apiErr
+	}
+	return mapRepoError(err, "page", "page already exists in this environment")
 }
 
 func mapRepoError(err error, kind, conflictMessage string) error {

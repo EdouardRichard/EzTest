@@ -35,5 +35,9 @@ type Repository interface {
 	// every model of the config in ID order.
 	UpsertModels(ctx context.Context, configID int64, models []Model, at time.Time) ([]Model, error)
 	InsertModel(ctx context.Context, model Model) (Model, error)
+	// UpdateModel rewrites one existing row's capability set, deprecated flag
+	// and updated_at. It returns ErrModelNotFound when the (id, config_id) pair
+	// does not exist.
+	UpdateModel(ctx context.Context, model Model) (Model, error)
 	DeleteModel(ctx context.Context, id int64) error
 }

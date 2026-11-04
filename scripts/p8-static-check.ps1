@@ -7,9 +7,11 @@ P8 (EzTest 0.2) repository-local static gate.
 Database-free gate for acceptance scenario S13. It verifies the 0.2 delivery
 surface that can be checked without PostgreSQL, Docker, Chrome or an LLM:
 
-  - .env.example defines exactly the four documented EZTEST_* startup variables
+  - .env.example defines exactly the four documented EZTEST_* runtime variables
     (EZTEST_DATABASE_URL, EZTEST_API_PORT, EZTEST_WEB_PORT,
-    EZTEST_EXECUTOR_PORT) and .env is gitignored and untracked;
+    EZTEST_EXECUTOR_PORT) plus the first-start administrator credential
+    (EZTEST_INITIAL_ADMIN_PASSWORD, allowed to be empty in the template), and
+    .env is gitignored and untracked;
   - docs/version-V0.2/contracts/openapi.yaml is frozen as 0.2.0-p8 / P8 and the
     frozen P8 contract gate (scripts/p8-contract-check.cjs) passes;
   - the migration order (order.txt, 42 entries) and settings catalogue (85 keys)
@@ -79,8 +81,12 @@ $script:RequiredStartupKeys = @(
     'EZTEST_DATABASE_URL',
     'EZTEST_API_PORT',
     'EZTEST_WEB_PORT',
-    'EZTEST_EXECUTOR_PORT'
+    'EZTEST_EXECUTOR_PORT',
+    'EZTEST_INITIAL_ADMIN_PASSWORD'
 )
+# The template deliberately leaves the first-start password empty so copying
+# .env.example cannot silently produce a working default credential.
+$script:OptionalEmptyKeys = @('EZTEST_INITIAL_ADMIN_PASSWORD')
 
 $script:RequiredAcceptanceFiles = @(
     'acceptance.md',
@@ -175,7 +181,8 @@ function Check-EnvExample {
         if (-not $matchResult.Success) { continue }
         $key = $matchResult.Groups[1].Value
         if (-not $present.Contains($key)) { $present.Add($key) }
-        if ($matchResult.Groups[2].Value.Trim().Length -eq 0 -and -not $empty.Contains($key)) {
+        if ($matchResult.Groups[2].Value.Trim().Length -eq 0 -and -not $empty.Contains($key) -and
+            $script:OptionalEmptyKeys -notcontains $key) {
             $empty.Add($key)
         }
     }
@@ -197,10 +204,10 @@ function Check-EnvExample {
     if ($legacy.Count -gt 0) { $problems.Add('0.1-only ' + ($legacy -join ', ')) }
     if ($empty.Count -gt 0) { $problems.Add('empty value for ' + ($empty -join ', ')) }
     if ($problems.Count -gt 0) {
-        Write-Fail $name ('.env.example must define exactly the four documented EZTEST_* startup variables; ' + ($problems -join '; '))
+        Write-Fail $name ('.env.example must define exactly the four documented EZTEST_* runtime variables plus the first-start administrator credential; ' + ($problems -join '; '))
         return
     }
-    Write-Pass $name 'exactly the four documented EZTEST_* startup variables, no fifth'
+    Write-Pass $name 'the four documented EZTEST_* runtime variables plus the first-start administrator credential'
 }
 
 function Check-DotEnv {

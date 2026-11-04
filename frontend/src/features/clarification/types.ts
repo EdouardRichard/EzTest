@@ -7,6 +7,11 @@
  * `{data: ...}`.
  */
 
+import type {
+  CaseCardPart,
+  MessagePart as ConversationMessagePart,
+} from "@/features/conversation/types"
+
 export type RequirementStatus = "draft" | "clarified" | "closed" | "obsolete"
 
 export type RequirementPriority = "P0" | "P1" | "P2" | "P3"
@@ -66,6 +71,10 @@ export type ConversationSummary = {
   status: ConversationStatus
   message_count: number
   last_message_at: string | null
+  /** 0.2.1 conversation override; null follows the LLM config default model. */
+  model_override?: string | null
+  /** 0.2.1 model a new assistant turn would use (override or config default). */
+  effective_model?: string | null
   created_at: string
 }
 
@@ -93,6 +102,15 @@ export type AttachmentPart = {
   size: number
 }
 
+/** R5 image part: the uploaded content reference sent to a vision model. */
+export type ImagePart = {
+  type: "image"
+  mime: string
+  data_ref: string
+  width: number
+  height: number
+}
+
 export type RequirementCardPart = {
   type: "requirement_card"
   requirement_id: string
@@ -107,17 +125,29 @@ export type RollbackProposalPart = {
   reason: string
 }
 
-export type MessagePart = TextPart | AttachmentPart | RequirementCardPart | RollbackProposalPart
+export type MessagePart =
+  | TextPart
+  | AttachmentPart
+  | ImagePart
+  | RequirementCardPart
+  | RollbackProposalPart
 
-/** The parts a client may send in a message (P1). */
-export type NewMessagePart = TextPart | AttachmentPart
+/**
+ * The parts a client may send in a message. P1 allowed text/attachment; 0.2.1
+ * adds `case_card` reference parts so "交给 AI 修改" can carry the checked
+ * cases into the conversation (spec §9.3).
+ */
+export type NewMessagePart = TextPart | AttachmentPart | CaseCardPart
 
 export type ConversationMessage = {
   id: string
   conversation_id: string
   role: MessageRole
-  parts: MessagePart[]
+  /** 0.2.1 threads can carry every part kind, not only the P1 union. */
+  parts: (MessagePart | ConversationMessagePart)[]
   refs: MessageRef[]
+  /** 0.2.1 assistant model that actually generated the message; null for user messages. */
+  actual_model?: string | null
   created_at: string
 }
 
@@ -235,9 +265,33 @@ export type BatchConfirmResult = {
   skipped: string[]
 }
 
+/**
+ * `RequirementDedupeResult` — duplicate draft collapse. Confirmed requirements
+ * are never touched, so both lists only ever contain draft IDs.
+ */
+export type RequirementDedupeResult = {
+  kept_ids: string[]
+  obsolete_ids: string[]
+}
+
+/** `RequirementMergeResult` — the canonical target plus the retired sources. */
+export type RequirementMergeResult = {
+  requirement: RequirementDetail
+  merged_ids: string[]
+}
+
 export type RollbackRequest = {
   reason?: string
   proposal_message_id?: string
+}
+
+/**
+ * `POST /api/versions/{id}/requirements/{rid}/reopen` payload. Only a closed
+ * requirement can be reopened (closed -> draft); the reason is mandatory and is
+ * written to the audit trail and the requirement.reopened event.
+ */
+export type ReopenRequirementRequest = {
+  reason: string
 }
 
 export type TeamRoomDigest = {

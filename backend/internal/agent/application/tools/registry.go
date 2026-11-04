@@ -316,15 +316,20 @@ type AttachmentMeta struct {
 	Status         string
 }
 
-// AttachmentText is one page of extracted attachment text.
+// AttachmentText is one page of extracted attachment text plus the structured
+// parse status. A non-done status is data, never a tool error: the model is
+// told "解析中，可重试" or the concrete parse failure reason (§8.5).
 type AttachmentText struct {
 	AttachmentID int64
 	Name         string
 	MIME         string
+	Status       string
 	Offset       int
 	Text         string
 	TotalChars   int
 	Truncated    bool
+	Error        string
+	Retryable    bool
 }
 
 // AttachmentImage is image metadata; P1 performs no vision understanding.
@@ -353,10 +358,14 @@ type SUTSummary struct {
 // ResourcePage is one page or API bound to a version SUT.
 type ResourcePage struct {
 	VersionSUTID int64
-	Kind         string
-	Name         string
-	Path         string
-	Method       string
+	// ID is the bound page/API catalog ID as a decimal string. requirement
+	// target_pages/target_apis only accept these IDs; paths are rejected by the
+	// version context, so the model must receive them from sut.page_list.
+	ID     string
+	Kind   string
+	Name   string
+	Path   string
+	Method string
 }
 
 // ResourcePort is the resource/version context read surface for SUT data.

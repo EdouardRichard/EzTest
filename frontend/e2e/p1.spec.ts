@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { type APIRequestContext, expect, test } from "@playwright/test"
 
+import { ADMIN_PASSWORD, ADMIN_USERNAME } from "./credentials"
+
 const API = process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:14333"
 const FAKE_LLM = process.env.EZTEST_E2E_FAKE_LLM_URL?.trim() || "http://127.0.0.1:13335/v1"
 const suffix = `${Date.now()}-${Math.floor(Math.random() * 1000)}`
@@ -39,8 +41,8 @@ async function api<T>(
 
 test.beforeAll(async ({ request }) => {
   const login = await api<{ data: { token: string } }>(request, "POST", "/api/auth/login", {
-    username: "admin",
-    password: "admin123",
+    username: ADMIN_USERNAME,
+    password: ADMIN_PASSWORD,
   })
   token = login.data.token
 
@@ -138,8 +140,8 @@ test("P1 clarification workspace: conversation, AI draft, confirm, batch, team r
   page.on("pageerror", (error) => pageErrors.push(String(error)))
 
   await page.goto("/login")
-  await page.fill("#username", "admin")
-  await page.fill("#password", "admin123")
+  await page.fill("#username", ADMIN_USERNAME)
+  await page.fill("#password", ADMIN_PASSWORD)
   await page.getByRole("button", { name: "登录" }).click()
   await page.waitForURL("**/versions")
 

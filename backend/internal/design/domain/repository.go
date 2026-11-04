@@ -9,12 +9,22 @@ import (
 // RequirementRef is the read-only design projection of a version-context
 // requirement joined with its current immutable revision.
 type RequirementRef struct {
-	ID                  int64
-	VersionID           int64
-	CurrentVersionID    int64
-	Revision            int
-	Title               string
-	Status              string
+	ID               int64
+	VersionID        int64
+	CurrentVersionID int64
+	Revision         int
+	Title            string
+	// Description and AcceptanceCriteria are the current requirement version
+	// text. Task 120: design generation uses the requirement/AC text to decide
+	// whether a visual baseline comparison was explicitly requested, so an
+	// ordinary functional AC never auto-generates a kind=visual assertion.
+	Description        string
+	AcceptanceCriteria string
+	Status             string
+	// Priority is the current requirement version priority (P0-P3). Task 79:
+	// the design planner derives the work-item claim priority from it so the
+	// 67-requirement authoring wave cannot starve P0 behind P1/P2 FIFO order.
+	Priority            string
 	TargetVersionSUTIDs []int64
 }
 
@@ -40,7 +50,11 @@ type CaseWithCurrent struct {
 
 // CaseVersionSummary is one row of the case version history.
 type CaseVersionSummary struct {
-	ID          int64
+	ID int64
+	// CaseID is the logical case that owns the version. It lets the execution
+	// re-plan path resolve the same case's current+confirmed replacement even
+	// when the historical version is superseded/stale (Task 106).
+	CaseID      int64
 	Revision    int
 	Status      string
 	Title       string

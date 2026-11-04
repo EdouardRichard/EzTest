@@ -1,0 +1,54 @@
+{
+  "source": "docs/version-V0.2.1/acceptance/evidence/user-trials-team/qa/api/102-failed-case-run-detail.json",
+  "case_run": {
+    "id": 375971351774629889,
+    "case_version_id": 375970866653040640,
+    "title": "AC-FR-011-02 登录失败提示（负向）",
+    "status": "failed",
+    "failure_class": "automation",
+    "step_total": 2,
+    "step_failed": 1,
+    "assertion_total": 1,
+    "assertion_failed": 0,
+    "evidence_count": 8
+  },
+  "steps": [
+    {
+      "seq": 1,
+      "status": "passed",
+      "observed": {
+        "summary": "未登录首页打开登录弹窗，填入已存在作者账号 openClaw + 错误密码提交；POST /api/v1/auth/login 返回 401，登录弹窗仍保持打开，页面顶部仍显示「登录」按钮（未登录状态）。"
+      },
+      "error": ""
+    },
+    {
+      "seq": 2,
+      "status": "failed",
+      "observed": {
+        "summary": "弹窗内展示的提示文案为「登录已过期，请重新登录」，与需求要求的统一提示「账号或密码错误，请重试」不一致。"
+      },
+      "error": ""
+    }
+  ],
+  "assertions": [
+    {
+      "step_seq": 1,
+      "assertion_seq": 1,
+      "kind": "ui",
+      "verdict": "passed",
+      "expected": "错误密码提交后弹窗不关闭且页面不出现已登录状态",
+      "actual": "POST /api/v1/auth/login 返回 401；登录弹窗仍打开（含「关闭登录弹窗」按钮与登录表单）；页头仍为「登录」按钮，未出现已登录用户信息。",
+      "reason": ""
+    }
+  ],
+  "evidence": [
+    {"id": 375971568028749824, "kind": "screenshot"},
+    {"id": 375971535107657728, "kind": "network"},
+    {"id": 375971458754547712, "kind": "http"},
+    {"id": 375971433962016768, "kind": "http"},
+    {"id": 375971430405246976, "kind": "http"},
+    {"id": 375971420942897152, "kind": "console"},
+    {"id": 375971420879982592, "kind": "screenshot"},
+    {"id": 375971409970597888, "kind": "network"}
+  ]
+}

@@ -5,16 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/knowledgeadapter"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	orchestrationapp "github.com/EdouardRichard/EzTest/backend/internal/orchestration/application"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	settingsdomain "github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 // p7FakeLeaderGate is the leader signal double of the gating tests.
@@ -58,6 +63,22 @@ type p7FakeExecutorLister struct {
 
 func (f p7FakeExecutorLister) List(context.Context) ([]execution.ExecutorInstance, error) {
 	return f.rows, f.err
+}
+
+// p7FakeVersionCaseSource is the version read-model double of the knowledge
+// success-hook binding adapter.
+type p7FakeVersionCaseSource struct {
+	view versionapp.VersionView
+	err  error
+	ids  []int64
+}
+
+func (f *p7FakeVersionCaseSource) Get(_ context.Context, id int64) (versionapp.VersionView, error) {
+	f.ids = append(f.ids, id)
+	if f.err != nil {
+		return versionapp.VersionView{}, f.err
+	}
+	return f.view, nil
 }
 
 func TestP7LeaderGating(t *testing.T) {
@@ -161,6 +182,167 @@ func TestP7AdaptersFailClosedWithoutDatabase(t *testing.T) {
 	}
 	if _, err := lookup.ExportArtifactExists(ctx, 1); err == nil {
 		t.Fatal("owner lookup accepted a nil pool (export artifact)")
+	}
+}
+
+// TestP7VersionCaseBindingsProjectsSuccessBindingKeys pins the composition-root
+// projection consumed by the knowledge success hook: route templates only (a
+// page without one is omitted, see TestBindingProjectionOmitsEmptyRouteTemplate),
+// uppercase/default-GET API keys, per-binding role deduplication and invalid
+// resource IDs degrading to unset dimensions instead of zero IDs.
+func TestP7VersionCaseBindingsProjectsSuccessBindingKeys(t *testing.T) {
+	family := "shop"
+	fullView := versionapp.VersionView{
+		Bindings: []versionapp.BindingView{{
+			SUT:         resourceapp.SUTView{ID: "7001", Family: &family},
+			Environment: resourceapp.EnvironmentView{ID: "7101"},
+			Pages: []resourceapp.PageView{
+				{ID: "501", RouteTemplate: "/login", URL: "http://shop.test/login"},
+				{ID: "502", URL: "http://shop.test/cart"},
+				{ID: "503"},
+				{ID: "not-an-id", RouteTemplate: "/ignored"},
+			},
+			APIs: []resourceapp.APIView{
+				{ID: "601", Method: "post", PathTemplate: "/api/login"},
+				{ID: "602", PathTemplate: "/api/items"},
+				{ID: "603", Method: "GET", PathTemplate: " /api/orders "},
+				{ID: "604", Method: "GET"},
+				{ID: "not-an-id", Method: "GET", PathTemplate: "/ignored"},
+			},
+			Accounts: []resourceapp.AccountView{
+				{Roles: []string{"admin", " admin "}},
+				{Roles: []string{"user", "admin"}},
+				{Roles: []string{"", "  "}},
+			},
+		}},
+	}
+	wantFull := []knowledgeadapter.VersionBinding{{
+		SystemID:      7001,
+		EnvironmentID: 7101,
+		SystemKey:     "shop",
+		Pages: []knowledgeadapter.PageBinding{
+			{ID: 501, Key: "/login"},
+		},
+		APIs: []knowledgeadapter.APIBinding{
+			{ID: 601, Key: "POST /api/login"},
+			{ID: 602, Key: "GET /api/items"},
+			{ID: 603, Key: "GET /api/orders"},
+		},
+		AccountRoles: []string{"admin", "user"},
+	}}
+
+	blankFamily := "   "
+	degradedView := versionapp.VersionView{
+		Bindings: []versionapp.BindingView{{
+			SUT:         resourceapp.SUTView{ID: "not-an-id", Family: &blankFamily},
+			Environment: resourceapp.EnvironmentView{ID: "-5"},
+			Pages:       []resourceapp.PageView{{ID: "bad", RouteTemplate: "/ignored"}},
+			APIs:        []resourceapp.APIView{{ID: "bad", Method: "GET", PathTemplate: "/ignored"}},
+			Accounts:    []resourceapp.AccountView{{Roles: []string{"admin"}}},
+		}},
+	}
+	wantDegraded := []knowledgeadapter.VersionBinding{{
+		AccountRoles: []string{"admin"},
+	}}
+
+	sourceErr := errors.New("version read failed")
+	tests := []struct {
+		name      string
+		source    versionCaseBindingSource
+		versionID int64
+		want      []knowledgeadapter.VersionBinding
+		wantErr   bool
+	}{
+		{
+			name:      "projects route templates (URL-only pages omitted), API keys and deduplicated roles",
+			source:    &p7FakeVersionCaseSource{view: fullView},
+			versionID: 10,
+			want:      wantFull,
+		},
+		{
+			name:      "invalid resource IDs degrade to unset dimensions",
+			source:    &p7FakeVersionCaseSource{view: degradedView},
+			versionID: 10,
+			want:      wantDegraded,
+		},
+		{
+			name:      "a version without bindings yields an empty projection",
+			source:    &p7FakeVersionCaseSource{},
+			versionID: 10,
+			want:      []knowledgeadapter.VersionBinding{},
+		},
+		{name: "rejects a missing version source", source: nil, versionID: 10, wantErr: true},
+		{name: "rejects a non-positive version ID", source: &p7FakeVersionCaseSource{}, versionID: 0, wantErr: true},
+		{name: "propagates the version read error", source: &p7FakeVersionCaseSource{err: sourceErr}, versionID: 10, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := (p7VersionCaseBindings{versions: tt.source}).VersionBindings(context.Background(), tt.versionID)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("VersionBindings() error = nil, want an error")
+				}
+				if got != nil {
+					t.Fatalf("VersionBindings() = %#v on error, want nil", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VersionBindings() error = %v", err)
+			}
+			if fake, ok := tt.source.(*p7FakeVersionCaseSource); ok {
+				if len(fake.ids) != 1 || fake.ids[0] != tt.versionID {
+					t.Fatalf("source queried version IDs = %v, want [%d]", fake.ids, tt.versionID)
+				}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("VersionBindings() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBindingProjectionOmitsEmptyRouteTemplate pins R97: the knowledge page_key
+// is the route template, never the page URL. A page whose route template is
+// empty (or whitespace) is omitted from the success-hook binding projection, so
+// the success hook cannot sediment a URL-shaped page_key while the reader and
+// MarkBindingsStale expect a route template.
+func TestBindingProjectionOmitsEmptyRouteTemplate(t *testing.T) {
+	view := versionapp.VersionView{
+		Bindings: []versionapp.BindingView{{
+			SUT:         resourceapp.SUTView{ID: "7001"},
+			Environment: resourceapp.EnvironmentView{ID: "7101"},
+			Pages: []resourceapp.PageView{
+				{ID: "501", RouteTemplate: "/login", URL: "http://shop.test/login"},
+				{ID: "502", URL: "http://shop.test/cart"},
+				{ID: "503", RouteTemplate: "   ", URL: "http://shop.test/checkout"},
+				{ID: "504", RouteTemplate: "/products/:id", URL: "http://shop.test/products/42"},
+			},
+		}},
+	}
+	got, err := (p7VersionCaseBindings{versions: &p7FakeVersionCaseSource{view: view}}).
+		VersionBindings(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("VersionBindings: %v", err)
+	}
+	want := map[int64]string{
+		501: "/login",
+		504: "/products/:id",
+	}
+	if len(got) != 1 || len(got[0].Pages) != len(want) {
+		t.Fatalf("binding projection = %#v, want exactly the two template pages", got)
+	}
+	for _, page := range got[0].Pages {
+		key, ok := want[page.ID]
+		if !ok {
+			t.Fatalf("page %d was projected without a route template (key %q)", page.ID, page.Key)
+		}
+		if page.Key != key {
+			t.Fatalf("page %d key = %q, want the route template %q", page.ID, page.Key, key)
+		}
+		if strings.Contains(page.Key, "http://") || strings.Contains(page.Key, "https://") {
+			t.Fatalf("page %d key fell back to the page URL: %q", page.ID, page.Key)
+		}
 	}
 }
 

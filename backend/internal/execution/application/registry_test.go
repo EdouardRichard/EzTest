@@ -263,6 +263,56 @@ func TestRegistryPollDegradedStillHeartbeats(t *testing.T) {
 	}
 }
 
+// TestRegistryPollDegradedWithEmptyErrorStillDegraded pins the health marker:
+// a degraded /healthz reply is not required to carry error text, so degraded
+// detection cannot be keyed off a non-empty last_error.
+func TestRegistryPollDegradedWithEmptyErrorStillDegraded(t *testing.T) {
+	registry, repo, probe, _ := newRegistryFixture(t)
+	probe.health = executionapp.ExecutorHealth{
+		Status: "degraded", Version: "0.2.0-p3", Contexts: 0, MaxContexts: 8,
+	}
+	if err := registry.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	row := repo.only(t)
+	if row.Status != execution.ExecutorActive {
+		t.Fatalf("degraded executor should stay active for cleanup, got %q", row.Status)
+	}
+	if marker, _ := row.Labels["eztest.degraded"].(bool); !marker {
+		t.Fatalf("degraded health reply with empty error was not marked degraded: labels=%v last_error=%q",
+			row.Labels, row.LastError)
+	}
+	selected, err := registry.Select(context.Background())
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if selected != nil {
+		t.Fatalf("a degraded executor with an empty health error was selected: %+v", selected)
+	}
+}
+
+// TestRegistrySelectSkipsDegradedInMultiEndpoint proves multi-endpoint selection
+// never picks a degraded high-capacity row while a healthy endpoint exists.
+func TestRegistrySelectSkipsDegradedInMultiEndpoint(t *testing.T) {
+	primary := "http://127.0.0.1:13336"
+	extras := "http://127.0.0.1:13337"
+	registry, repo, _, _ := newMultiRegistryFixture(t, primary, extras, map[string]*fakeExecutorProbe{})
+	repo.rows = map[int64]execution.ExecutorInstance{
+		1: {
+			ID: 1, Endpoint: primary, Status: execution.ExecutorActive, Capacity: 32,
+			Labels: map[string]any{"eztest.degraded": true},
+		},
+		2: {ID: 2, Endpoint: "http://127.0.0.1:13337", Status: execution.ExecutorActive, Capacity: 8},
+	}
+	selected, err := registry.Select(context.Background())
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if selected == nil || selected.ID != 2 {
+		t.Fatalf("selected = %+v, want the healthy endpoint (id 2), never the degraded id 1", selected)
+	}
+}
+
 func TestRegistryPollKeepsDrainingAndMarksOffline(t *testing.T) {
 	registry, repo, probe, clock := newRegistryFixture(t)
 	if err := registry.PollOnce(context.Background()); err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 )
 
@@ -30,6 +31,12 @@ type LLMSummarizer struct {
 func NewLLMSummarizer(chat llmapp.ChatGateway) *LLMSummarizer {
 	return &LLMSummarizer{chat: chat}
 }
+
+// The context-package compaction port is narrow (no agentapp types), and
+// agentapp.Message is an alias of agentcontext.Message, so the LLM summarizer
+// satisfies it structurally. Boundary compaction can therefore inject this
+// type without agentcontext importing agentapp (which would cycle).
+var _ agentcontext.Summarizer = (*LLMSummarizer)(nil)
 
 // Summarize compresses the oldest messages into a rolling summary.
 func (s *LLMSummarizer) Summarize(ctx context.Context, messages []Message) (string, error) {

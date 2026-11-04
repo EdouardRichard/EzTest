@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -93,9 +94,10 @@ type EventObserver func(context.Context, eventing.Event) error
 type DispatcherOption func(*Dispatcher)
 
 // WithDispatcherObserver installs an observer invoked once per delivered event.
+// Additional observers may be added later through Dispatcher.Observe.
 func WithDispatcherObserver(observer EventObserver) DispatcherOption {
 	return func(d *Dispatcher) {
-		d.observer = observer
+		d.Observe(observer)
 	}
 }
 
@@ -104,10 +106,11 @@ func WithDispatcherObserver(observer EventObserver) DispatcherOption {
 // the event log (DB is the truth) and broadcast it. It performs no I/O other
 // than the repository load, so it is unit-testable without PostgreSQL.
 type Dispatcher struct {
-	events   EventReader
-	sink     LocalBroadcaster
-	observer EventObserver
-	recent   *recentEvents
+	events    EventReader
+	sink      LocalBroadcaster
+	mu        sync.RWMutex
+	observers []EventObserver
+	recent    *recentEvents
 }
 
 // NewDispatcher wires a dispatcher. A nil reader or sink makes Handle fail
@@ -118,6 +121,32 @@ func NewDispatcher(events EventReader, sink LocalBroadcaster, options ...Dispatc
 		option(dispatcher)
 	}
 	return dispatcher
+}
+
+// Observe registers an additional post-delivery observer. Observers run after
+// the event is broadcast to the local hub, are safe to register concurrently
+// with delivery and are best effort: a failure is returned to the caller but
+// never undoes the delivery or the persisted event.
+func (d *Dispatcher) Observe(observer EventObserver) {
+	if d == nil || observer == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.observers = append(d.observers, observer)
+}
+
+func (d *Dispatcher) notifyObservers(ctx context.Context, event eventing.Event) error {
+	d.mu.RLock()
+	observers := append([]EventObserver(nil), d.observers...)
+	d.mu.RUnlock()
+	var firstErr error
+	for _, observer := range observers {
+		if err := observer(ctx, event); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Handle processes one NOTIFY payload. Duplicate references are ignored;
@@ -140,12 +169,7 @@ func (d *Dispatcher) Handle(ctx context.Context, payload string) error {
 	}
 	d.sink.BroadcastLoaded(event)
 	d.recent.add(ref.Key())
-	if d.observer != nil {
-		if err := d.observer(ctx, event); err != nil {
-			return err
-		}
-	}
-	return nil
+	return d.notifyObservers(ctx, event)
 }
 
 // recentEvents is a bounded insertion-ordered set. When it overflows the

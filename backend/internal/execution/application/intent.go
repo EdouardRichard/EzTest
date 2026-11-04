@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -19,6 +21,7 @@ type IntentService struct {
 	intents  IntentRepository
 	cases    CaseReader
 	versions VersionReader
+	batches  BatchSelectionReader
 	ids      IDGenerator
 	clock    Clock
 	events   EventPublisher
@@ -30,10 +33,14 @@ type IntentServiceDeps struct {
 	Intents  IntentRepository
 	Cases    CaseReader
 	Versions VersionReader
-	IDs      IDGenerator
-	Clock    Clock
-	Events   EventPublisher
-	Audit    AuditRecorder
+	// BatchSelections projects the execute.batch selection persisted on the
+	// stage-entry work item. It scopes the startup/leader repair scan (D23); nil
+	// degrades to the typed skip, never to an unscoped scan.
+	BatchSelections BatchSelectionReader
+	IDs             IDGenerator
+	Clock           Clock
+	Events          EventPublisher
+	Audit           AuditRecorder
 }
 
 // NewIntentService builds the intent service.
@@ -42,6 +49,7 @@ func NewIntentService(deps IntentServiceDeps) *IntentService {
 		intents:  deps.Intents,
 		cases:    deps.Cases,
 		versions: deps.Versions,
+		batches:  deps.BatchSelections,
 		ids:      deps.IDs,
 		clock:    deps.Clock,
 		events:   deps.Events,
@@ -49,12 +57,106 @@ func NewIntentService(deps IntentServiceDeps) *IntentService {
 	}
 }
 
-// EnsureInitialIntents creates the initial open intents of every
-// current+confirmed case version of a version. It is idempotent: repeated
-// scans, repeated confirmations and API restarts never create a duplicate
-// intent for the same (case_version, fingerprint, baseline, purpose=initial)
-// natural key (P3-D-08). A completed version is reopened first (P3 §5.9).
+// Initial execution intents only belong to the executing stage (Task 78): a
+// case version that was merely confirmed at the case hard gate is not yet
+// executable, and confirming it must never auto-create a wave. A version whose
+// stage projection is completed keeps the P3 §5.9 reopen semantics: creating an
+// intent while its status is still completed reopens it. Only the
+// startup/leader scan's version list (the newest versions regardless of status,
+// so completed ones can be included) reaches that branch; R49 scans running
+// versions only and never repairs or reopens a completed version.
+const (
+	intentExecutableStage = "executing"
+	intentCompletedStage  = "completed"
+)
+
+// EnsureInitialIntents is the startup/leader repair scan (P3 §5.1/§5.7). It
+// refreshes initial intents only for the case selection frozen by the
+// execute.batch stage-entry job (D23): after a restart or a leader failover,
+// previously confirmed but unselected cases must not silently enter a wave. ids
+// are unique on (case_version, fingerprint, baseline, purpose=initial), so a
+// repeated scan, confirmation or API restart never duplicates an intent
+// (P3-D-08). For a version whose stage projection is completed, the scan
+// refreshes only the persisted selection and, while its status is still
+// completed, reopens the version when it creates the first new initial intent
+// (P3 §5.9).
+//
+// The scan is stage-gated: before the case hard gate (case_review and earlier)
+// a confirmed case is not executable yet, so the scan returns without creating
+// intents and no wave can be planned.
+//
+// The selection has exactly one durable source: the case_ids frozen on the
+// execute.batch work item. When no execute.batch work item exists, the scan
+// returns ErrNoPersistedBatchSelection and creates nothing. It never falls back
+// to every confirmed case, and R49 cannot silently recreate the scope: R49
+// re-enqueues a lost execute.batch job only with the persisted selection (which
+// reuses the original idempotency key), and with none it skips as well. A
+// version whose selection was lost therefore stays a typed skip until an
+// explicit execute.batch job exists. An existing row whose inputs object omits
+// case_ids is not this skip: it is the contract's "all current confirmed cases"
+// selection. With multiple execute.batch rows (multi-batch/reopen), the newest
+// persisted selection is the scope, which is the previous batch when a later
+// enqueue never persisted.
 func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int64) (int, error) {
+	return s.ensureInitialIntents(ctx, versionID, nil, false, true)
+}
+
+// EnsureInitialIntentsForCases is the explicit execute.batch refresh: it creates
+// initial intents only for the selected case IDs (D23) and requires the version
+// to be at executing. A selection naming a case that is not current+confirmed
+// is a typed 409: the caller must not silently run a different/larger batch.
+func (s *IntentService) EnsureInitialIntentsForCases(ctx context.Context, versionID int64, caseIDs []int64) (int, error) {
+	selection, err := normalizeIntentCaseSelection(caseIDs)
+	if err != nil {
+		return 0, err
+	}
+	return s.ensureInitialIntents(ctx, versionID, selection, true, false)
+}
+
+// normalizeIntentCaseSelection deduplicates the selected case IDs. A nil/empty
+// list keeps the D23 "all current draft cases" meaning and is passed through.
+func normalizeIntentCaseSelection(caseIDs []int64) (map[int64]struct{}, error) {
+	if len(caseIDs) == 0 {
+		return nil, nil
+	}
+	selection := make(map[int64]struct{}, len(caseIDs))
+	for _, caseID := range caseIDs {
+		if caseID <= 0 {
+			return nil, platform.Invalid("case_ids", "must contain positive decimal IDs")
+		}
+		selection[caseID] = struct{}{}
+	}
+	return selection, nil
+}
+
+// persistedBatchSelection reads the execute.batch case_ids frozen on the
+// stage-entry work item. A nil reader (degraded assembly) is the same typed skip
+// as a missing row: the repair scan must never widen to every confirmed case.
+// An existing row without a case_ids field is the contract-empty selection
+// ("all current confirmed cases"), not a skip. A repository failure is real and
+// is surfaced instead of silently skipping.
+func (s *IntentService) persistedBatchSelection(ctx context.Context, versionID int64) ([]int64, bool, error) {
+	if s.batches == nil {
+		return nil, false, nil
+	}
+	caseIDs, found, err := s.batches.ExecuteBatchSelection(ctx, versionID)
+	if err != nil {
+		return nil, false, mapExecutionError(err, "execute batch selection")
+	}
+	return caseIDs, found, nil
+}
+
+// ensureInitialIntents is the shared scan. selection != nil narrows it to the
+// selected case IDs; explicit marks the execute.batch path, where a version at
+// the wrong stage must be a typed 409 instead of a silent no-op; repair scopes
+// the startup/leader scan to the persisted execute.batch selection.
+func (s *IntentService) ensureInitialIntents(
+	ctx context.Context,
+	versionID int64,
+	selection map[int64]struct{},
+	explicit bool,
+	repair bool,
+) (int, error) {
 	if err := requirePositiveID("version_id", versionID); err != nil {
 		return 0, err
 	}
@@ -62,12 +164,72 @@ func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int6
 	if err != nil {
 		return 0, mapExecutionError(err, "version")
 	}
+	executableStage := binding.Stage == intentExecutableStage ||
+		(!explicit && binding.Stage == intentCompletedStage)
+	if !executableStage {
+		if explicit {
+			return 0, invalidStageForExecution(binding.Stage)
+		}
+		return 0, nil
+	}
+	if repair {
+		persisted, found, err := s.persistedBatchSelection(ctx, versionID)
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			// Typed skip: never fall back to every confirmed case. R49 also
+			// skips this repair (it re-enqueues only a persisted selection),
+			// so no other path can recreate an unscoped batch.
+			return 0, fmt.Errorf("%w: version %d", ErrNoPersistedBatchSelection, versionID)
+		}
+		if selection, err = normalizeIntentCaseSelection(persisted); err != nil {
+			return 0, err
+		}
+	}
 	cases, err := s.cases.ListExecutable(ctx, versionID)
 	if err != nil {
 		return 0, mapExecutionError(err, "version")
 	}
 	if len(cases) == 0 {
 		return 0, nil
+	}
+	if selection != nil {
+		available := make(map[int64]struct{}, len(cases))
+		for _, snapshot := range cases {
+			available[snapshot.CaseID] = struct{}{}
+		}
+		for caseID := range selection {
+			if _, ok := available[caseID]; !ok {
+				return 0, &platform.Error{
+					Status: http.StatusConflict,
+					Code:   "selected_case_not_executable",
+					Message: fmt.Sprintf(
+						"selected case %d is not a current confirmed case of the version", caseID,
+					),
+					Details: map[string]any{
+						"case_id":     platformid.Format(caseID),
+						"next_action": "refresh the design graph, confirm the case at the case gate, then execute the batch again",
+					},
+				}
+			}
+		}
+		filtered := make([]execution.CaseSnapshot, 0, len(selection))
+		for _, snapshot := range cases {
+			if _, ok := selection[snapshot.CaseID]; ok {
+				filtered = append(filtered, snapshot)
+			}
+		}
+		cases = filtered
+	}
+	// Task 95 (PO O8): refuse an incomplete case version before any intent
+	// exists. A version without a step or an assertion can only aggregate to
+	// inconclusive(incomplete/no_assertions), so dispatching it would present a
+	// design defect as an inconclusive execution result. Validate the filtered
+	// batch before the first insert so a blocked batch creates no sibling
+	// intent behind the failed execute.batch job.
+	if err := ensureExecutableCaseCompleteness(cases); err != nil {
+		return 0, err
 	}
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
@@ -123,7 +285,7 @@ func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int6
 			return created, mapExecutionError(err, "intent")
 		}
 		created++
-		s.publishCreated(ctx, intent, 0)
+		s.publishCreated(ctx, intent, 0, 0)
 	}
 	return created, nil
 }
@@ -147,6 +309,12 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 	snapshot, err := s.cases.GetCaseVersion(ctx, versionID, caseVersionID)
 	if err != nil {
 		return execution.ExecutionIntent{}, mapExecutionError(err, "case version")
+	}
+	// Task 95 (PO O8): the retest/manual entry point bypasses the initial batch
+	// scan, so it must enforce the same executable-content gate. A 0-assertion
+	// version may never be queued just because the caller asked for a retest.
+	if err := ensureExecutableCaseCompleteness([]execution.CaseSnapshot{snapshot}); err != nil {
+		return execution.ExecutionIntent{}, err
 	}
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
@@ -182,11 +350,21 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 			return execution.ExecutionIntent{}, platform.StateConflict("an active intent already exists for this case, environment and purpose")
 		}
 		if errors.Is(err, execution.ErrRequirementClosed) {
-			return execution.ExecutionIntent{}, platform.StateConflict("the requirement is closed; reopen it before creating an execution intent")
+			// Task 112: actionable 409 for the retry UI. The requirement is
+			// closed; reopening it (and re-confirming after a retest) is a normal
+			// user action, so the error names the requirement and the next step
+			// instead of only a free-text message.
+			conflict := platform.StateConflict("the requirement is closed; reopen it before creating an execution intent")
+			conflict.Details = map[string]any{
+				"reason":         "requirement_closed",
+				"requirement_id": platformid.Format(snapshot.RequirementID),
+				"next_action":    "在「需求与澄清」页重新打开该需求，然后重试执行",
+			}
+			return execution.ExecutionIntent{}, conflict
 		}
 		return execution.ExecutionIntent{}, mapExecutionError(err, "intent")
 	}
-	s.publishCreated(ctx, intent, actorID)
+	s.publishCreated(ctx, intent, actorID, 0)
 	return intent, nil
 }
 
@@ -256,20 +434,25 @@ func (s *IntentService) createIntent(ctx context.Context, intent execution.Execu
 	return platform.StateConflict("the version is being closed; retry creating the execution intent")
 }
 
-func (s *IntentService) publishCreated(ctx context.Context, intent execution.ExecutionIntent, actorID int64) {
+func (s *IntentService) publishCreated(ctx context.Context, intent execution.ExecutionIntent, actorID int64, replannedFromCaseVersionID int64) {
 	versionRef := platformid.Format(intent.VersionID)
+	payload := map[string]any{
+		"intent_id":       platformid.Format(intent.ID),
+		"case_version_id": platformid.Format(intent.CaseVersionID),
+		"purpose":         string(intent.Purpose),
+		"version_sut_ids": idsToStrings(intent.VersionSUTIDs),
+		"version_id":      versionRef,
+	}
+	if replannedFromCaseVersionID > 0 {
+		payload["replanned_from_case_version_id"] = platformid.Format(replannedFromCaseVersionID)
+		payload["reason"] = SupersedeReasonCaseVersion
+	}
 	publishEvent(ctx, s.events, EventIntentCreated, intent.VersionID,
 		map[string]any{
 			"intent_id":       platformid.Format(intent.ID),
 			"case_version_id": platformid.Format(intent.CaseVersionID),
 		},
-		map[string]any{
-			"intent_id":       platformid.Format(intent.ID),
-			"case_version_id": platformid.Format(intent.CaseVersionID),
-			"purpose":         string(intent.Purpose),
-			"version_sut_ids": idsToStrings(intent.VersionSUTIDs),
-			"version_id":      versionRef,
-		},
+		payload,
 		actorPtr(actorID))
 	s.recordAudit(ctx, "execution.intent_created", intent, actorID)
 }
@@ -310,6 +493,63 @@ func actorPtr(actorID int64) *int64 {
 	return &actorID
 }
 
+// ensureExecutableCaseCompleteness refuses a batch containing a case version
+// without executable content: at least one step and one assertion are required.
+// The check runs on the already-filtered selection, so a complete sibling is
+// never enqueued when an incomplete version blocks the batch.
+func ensureExecutableCaseCompleteness(cases []execution.CaseSnapshot) error {
+	for _, snapshot := range cases {
+		steps, assertions := len(snapshot.Steps), len(snapshot.Assertions)
+		if steps > 0 && assertions > 0 {
+			continue
+		}
+		missing := make([]string, 0, 2)
+		if steps == 0 {
+			missing = append(missing, "steps")
+		}
+		if assertions == 0 {
+			missing = append(missing, "assertions")
+		}
+		title := strings.TrimSpace(snapshot.Title)
+		if title == "" {
+			title = "untitled case"
+		}
+		return &platform.Error{
+			Status: http.StatusConflict,
+			Code:   "incomplete_case_version",
+			Message: fmt.Sprintf(
+				"case %q version %d is incomplete (%d step(s), %d assertion(s)); at least 1 step and 1 assertion are required before execution. Repair the case version in design (restore the designed steps/assertions), re-confirm it at the case gate, then execute the batch again.",
+				title, snapshot.CaseVersionID, steps, assertions,
+			),
+			Details: map[string]any{
+				"case_id":         platformid.Format(snapshot.CaseID),
+				"case_version_id": platformid.Format(snapshot.CaseVersionID),
+				"step_count":      steps,
+				"assertion_count": assertions,
+				"missing":         missing,
+				"next_action":     "repair the case version in design (restore the designed steps/assertions), re-confirm it at the case gate, then execute the batch again",
+			},
+		}
+	}
+	return nil
+}
+
+// invalidStageForExecution is the typed 409 returned when the explicit
+// execute.batch refresh runs on a version that is not at executing. It carries
+// the next action so the caller can guide the user instead of failing silently.
+func invalidStageForExecution(current string) error {
+	return &platform.Error{
+		Status:  http.StatusConflict,
+		Code:    "invalid_stage_for_execution",
+		Message: fmt.Sprintf("batch execution requires stage executing, but the version is at %s", current),
+		Details: map[string]any{
+			"required_stage": "executing",
+			"current_stage":  current,
+			"next_action":    "confirm the selected cases at the case gate and execute the batch again",
+		},
+	}
+}
+
 // caseIntentVersionSUTIDs is the §5.1 intent SUT set: every step's resolved
 // target plus the case default, deduplicated and sorted.
 func caseIntentVersionSUTIDs(snapshot execution.CaseSnapshot) []int64 {
@@ -327,5 +567,3 @@ func caseIntentVersionSUTIDs(snapshot execution.CaseSnapshot) []int64 {
 	}
 	return normalized
 }
-
-var _ = fmt.Sprintf

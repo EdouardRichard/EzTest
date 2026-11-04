@@ -1,17 +1,36 @@
 "use client"
 
+import { Maximize2, Minimize2 } from "lucide-react"
 import { useRouter } from "next/navigation"
-import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  type KeyboardEvent,
+  type PointerEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 
 import { Button } from "@/components/ui/Button"
+import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import type { ConversationModel } from "@/features/conversation/api"
+import type { CaseCardPart } from "@/features/conversation/types"
+import {
+  caseGateGuidance,
+  caseReviewStage,
+  designActionsAllowed,
+  designStageGuidance,
+} from "@/features/versions/stage"
 import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
+  confirmStageCases,
   createDesignConversation,
   getDesignGraph,
   getDesignOverview,
@@ -19,13 +38,29 @@ import {
 } from "./api"
 import { CaseDetailPanel } from "./CaseDetailPanel"
 import { DesignChat } from "./DesignChat"
+import { DESIGN_FOCUS_SPLITS, DesignFocusDialog } from "./DesignFocusDialog"
 import { DesignMindmap } from "./DesignMindmap"
 import { ExportCasesDialog } from "./ExportCasesDialog"
+import type { DesignExecutionResults } from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
-import type { CaseConfirmationScope, DesignGraph, DesignOverview } from "./types"
+import type {
+  CaseConfirmationScope,
+  DesignCaseSummary,
+  DesignGraph,
+  DesignOverview,
+  VersionStage,
+} from "./types"
 
 export type DesignTabProps = {
   versionId: string
+  /**
+   * Deterministic version stage. `undefined`/`null` (tab rendered outside the
+   * version page, or before the projection loads) keeps the legacy permissive
+   * UI; the backend stage guards remain authoritative.
+   */
+  stage?: VersionStage | null
+  /** Refresh the page-level stage projection after a gate transition. */
+  onStageChanged?: () => void
   /** Deep link `?case=` forwarded by the version page. */
   initialCaseId?: string
   /** Deep link `?conversation=` forwarded by the version page. */
@@ -42,13 +77,83 @@ function activityText(payload: Record<string, unknown>): string | null {
   return "AI 正在处理…"
 }
 
+/** The two draggable boundaries of the vertical three-layer workspace. */
+type DividerKind = "chat" | "mindmap"
+
+/** Chat / mindmap / detail share of the workspace height, in percent. */
+type LayerSplits = { chat: number; mindmap: number; detail: number }
+
+const DEFAULT_LAYER_SPLITS: LayerSplits = { chat: 35, mindmap: 40, detail: 25 }
+const MIN_LAYER_PERCENT = 10
+const KEYBOARD_RESIZE_STEP = 5
+/** `.app-content` bottom padding, reserved so the page itself never scrolls. */
+const PAGE_BOTTOM_INSET = 48
+const MIN_WORKSPACE_HEIGHT = 320
 /**
- * P2 design workspace: React Flow mindmap + design chat (top row) and the
- * full-width case detail (bottom row). The URL is the deep-link source of truth
- * and the `version:{id}` SSE channel drives debounced snapshot refreshes; node
- * positions stay local (`layout.ts`) and are never persisted.
+ * The version header/tabs leave a 1422x904 viewport with only ~450px for the
+ * three layers. At a 35/40/25 split that is a ~30px message list and a ~50px
+ * graph canvas: the design chat renders as a blank strip and the mindmap as a
+ * microscopic cluster. The layers therefore keep a usable stacked height and
+ * the dedicated scroll container moves between them; the page itself still
+ * never scrolls and each layer keeps its own internal scroll.
+ *
+ * 1000px yields a ~130px message thread, a ~280px graph canvas and a ~250px
+ * detail pane before scrolling, and leaves `收起` able to grow the mindmap to
+ * ~600px instead of stealing its height.
  */
-export function DesignTab({ versionId, initialCaseId, initialConversationId }: DesignTabProps) {
+const MIN_WORKSPACE_TRACK_HEIGHT = 1000
+const INLINE_TRACK_HEIGHT = `max(100%, ${MIN_WORKSPACE_TRACK_HEIGHT}px)`
+/**
+ * Below this design-tab height the expanded chat (35% of the stacked track)
+ * plus the mindmap's filter/batch chrome consume the whole first screen, so the
+ * graph is invisible until the user scrolls. The design chat starts collapsed
+ * to its composer bar so the mindmap is visible on load; 展开 restores the
+ * inline thread and 放大 gives it the full dialog.
+ */
+const SHORT_WORKSPACE_HEIGHT = 620
+
+function clampPercent(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
+
+function roundPercent(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+/**
+ * Move one divider by `delta` percent. A boundary always keeps the combined
+ * height of its two neighbouring layers constant (chat+mindmap / mindmap+detail),
+ * so dragging never changes the third layer.
+ */
+function resizeLayerSplits(current: LayerSplits, divider: DividerKind, delta: number): LayerSplits {
+  if (divider === "chat") {
+    const total = current.chat + current.mindmap
+    const chat = roundPercent(
+      clampPercent(current.chat + delta, MIN_LAYER_PERCENT, total - MIN_LAYER_PERCENT),
+    )
+    return { chat, mindmap: roundPercent(total - chat), detail: current.detail }
+  }
+  const total = current.mindmap + current.detail
+  const mindmap = roundPercent(
+    clampPercent(current.mindmap + delta, MIN_LAYER_PERCENT, total - MIN_LAYER_PERCENT),
+  )
+  return { chat: current.chat, mindmap, detail: roundPercent(total - mindmap) }
+}
+
+/**
+ * P2 design workspace: a full-height, vertically stacked three-layer layout
+ * (design chat / React Flow mindmap / case detail) with draggable separators.
+ * The URL is the deep-link source of truth and the `version:{id}` SSE channel
+ * drives debounced snapshot refreshes; node positions stay local (`layout.ts`)
+ * and are never persisted.
+ */
+export function DesignTab({
+  versionId,
+  stage,
+  onStageChanged,
+  initialCaseId,
+  initialConversationId,
+}: DesignTabProps) {
   const router = useRouter()
 
   const [graph, setGraph] = useState<DesignGraph | null>(null)
@@ -69,12 +174,55 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [staleNotice, setStaleNotice] = useState<string | null>(null)
   const [detailToken, setDetailToken] = useState(0)
   const [chatDraft, setChatDraft] = useState("")
+  const [batchBusy, setBatchBusy] = useState(false)
+  /** Cases checked in the mindmap and handed to the design chat ("交给 AI 修改"). */
+  const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
   const [activity, setActivity] = useState<string | null>(null)
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
 
+  const [layerSplits, setLayerSplits] = useState<LayerSplits>(DEFAULT_LAYER_SPLITS)
+  const [chatCollapsed, setChatCollapsed] = useState(false)
+  const [activeDivider, setActiveDivider] = useState<DividerKind | null>(null)
+  const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
+  /** Mindmap + detail enlarged in the floating focus dialog (spec §9.3). */
+  const [focusOpen, setFocusOpen] = useState(false)
+  /** Bumped on every focus toggle so the canvas re-fits after the size change. */
+  const [fitViewToken, setFitViewToken] = useState(0)
+
+  // Stage-gated affordances (Task 78). Unknown projections stay permissive so a
+  // direct tab embed/test keeps working; the backend rejects wrong-stage calls.
+  const stageKnown = stage !== undefined && stage !== null
+  const designAllowed = designActionsAllowed(stage)
+  const canReviewCases = caseReviewStage(stage)
+
+  // Each case card of the graph now carries its latest execution verdict
+  // (spec §9.3); DesignMindmap consumes a case-id keyed map.
+  const executionResults = useMemo<DesignExecutionResults>(() => {
+    const results: DesignExecutionResults = {}
+    for (const requirement of graph?.requirements ?? []) {
+      for (const scenario of requirement.scenarios) {
+        for (const designCase of scenario.cases) {
+          if (designCase.execution_verdict !== undefined) {
+            results[designCase.case_id] = designCase.execution_verdict
+          }
+        }
+      }
+    }
+    return results
+  }, [graph])
+
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const workspaceRef = useRef<HTMLDivElement>(null)
+  const layersRef = useRef<HTMLDivElement>(null)
+  /** Applies the short-viewport default at most once, never over a user toggle. */
+  const autoCollapseApplied = useRef(false)
+  const dividerDrag = useRef<{
+    divider: DividerKind
+    startY: number
+    startSplits: LayerSplits
+  } | null>(null)
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true)
@@ -176,6 +324,10 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     onDesignRoundChanged: () => {
       void refreshOverview()
     },
+    onCaseRunChanged: (event) => {
+      // A finished execution changes the case's latest verdict on the mindmap.
+      if (event.type === "case_run.finished") scheduleGraphRefresh()
+    },
   })
 
   const updateUrl = useCallback(
@@ -227,11 +379,129 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   }, [versionId, updateUrl])
 
   const createConversation = useCallback(() => {
+    if (!designAllowed) {
+      setCreateError(new Error(designStageGuidance(stage)))
+      return
+    }
     void handleNewConversation()
-  }, [handleNewConversation])
+  }, [designAllowed, handleNewConversation, stage])
+
+  const batchCaseGate = useCallback(
+    async (caseIds: string[], mode: "confirm" | "execute"): Promise<void> => {
+      if (caseIds.length === 0) return
+      if (!canReviewCases) {
+        setConfirmError(new Error(caseGateGuidance(stage)))
+        return
+      }
+      setBatchBusy(true)
+      setConfirmError(null)
+      setConfirmNotice(null)
+      try {
+        if (mode === "execute") {
+          // Explicit batch execute: the case hard gate confirms the selected
+          // cases and creates the execute.batch job for exactly this selection.
+          await confirmStageCases(versionId, caseIds)
+          setConfirmNotice(`已提交 ${caseIds.length} 条用例执行`)
+          onStageChanged?.()
+        } else {
+          // Batch confirm only freezes the selected case versions. It must not
+          // advance the case hard gate, so no wave is created until the user
+          // explicitly executes the selection (Task 78 / QA-F2).
+          let confirmed = 0
+          let skipped = 0
+          for (const caseId of caseIds) {
+            const result = await confirmCases(versionId, {
+              scope: "case",
+              target_id: caseId,
+            })
+            confirmed += result.confirmed.length
+            skipped += result.skipped.length
+          }
+          setConfirmNotice(
+            skipped > 0
+              ? `已确认 ${confirmed} 条用例（未执行），跳过 ${skipped} 条已确认用例`
+              : `已确认 ${confirmed} 条用例（未执行）`,
+          )
+        }
+        await refreshGraph()
+        await refreshOverview()
+        setDetailToken((token) => token + 1)
+      } catch (cause) {
+        setConfirmError(cause)
+      } finally {
+        setBatchBusy(false)
+      }
+    },
+    [versionId, refreshGraph, refreshOverview, canReviewCases, stage, onStageChanged],
+  )
+
+  // The batch bar hands exactly the checked ids to the 0.2.1 stage gate. The
+  // backend refreshes intents only for that selection (D23), so unselected
+  // confirmed cases never enter a wave; confirm and execute stay scoped to the
+  // checked cases.
+  const batchConfirmCases = useCallback(
+    (caseIds: string[]) => {
+      void batchCaseGate(caseIds, "confirm")
+    },
+    [batchCaseGate],
+  )
+
+  const batchExecuteCases = useCallback(
+    (caseIds: string[]) => {
+      void batchCaseGate(caseIds, "execute")
+    },
+    [batchCaseGate],
+  )
+
+  /**
+   * "交给 AI 修改": resolve the checked case ids against the graph and put
+   * `case_card` reference parts into the design composer. Sending stays the
+   * user's action so the modification instruction can be edited first.
+   */
+  const requestAiChange = useCallback(
+    (caseIds: string[]) => {
+      if (graph === null) return
+      const byId = new Map<string, DesignCaseSummary>()
+      for (const requirement of graph.requirements) {
+        for (const scenario of requirement.scenarios) {
+          for (const designCase of scenario.cases) byId.set(designCase.case_id, designCase)
+        }
+      }
+      const references: CaseCardPart[] = []
+      for (const caseId of caseIds) {
+        const designCase = byId.get(caseId)
+        if (designCase === undefined) continue
+        references.push({
+          type: "case_card",
+          case_id: designCase.case_id,
+          case_version_id: designCase.current_version_id,
+          title: designCase.title,
+          status: designCase.status,
+        })
+      }
+      if (references.length === 0) return
+      setChatCaseReferences(references)
+      setChatDraft(
+        `请修改以下 ${references.length} 条用例：\n${references
+          .map((reference) => `- ${reference.title}（#${reference.case_id}）`)
+          .join("\n")}`,
+      )
+      if (activeConversationId === null) void handleNewConversation()
+    },
+    [graph, activeConversationId, handleNewConversation],
+  )
+
+  const requestAiChangeForCase = useCallback(
+    (caseId: string) => requestAiChange([caseId]),
+    [requestAiChange],
+  )
 
   const handleConfirm = useCallback(
     async (scope: CaseConfirmationScope, targetId: string): Promise<void> => {
+      if (!canReviewCases) {
+        setConfirmError(new Error(caseGateGuidance(stage)))
+        return
+      }
       setConfirmingKey(`${scope}:${targetId}`)
       setConfirmError(null)
       setConfirmNotice(null)
@@ -248,7 +518,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
         setConfirmingKey(null)
       }
     },
-    [versionId, refreshGraph],
+    [versionId, refreshGraph, canReviewCases, stage],
   )
 
   // Stable wrappers for DesignMindmap's memoized node data: React Flow must not
@@ -284,6 +554,61 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     )
   }, [])
 
+  /**
+   * Keep the workspace conversation summaries in sync after the chat model
+   * selector persists an override: collapsing/expanding the chat remounts the
+   * keyed selector, which must reseed from the updated summary.
+   */
+  const applyConversationModel = useCallback((updated: ConversationModel) => {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === updated.id
+          ? {
+              ...conversation,
+              model_override: updated.model_override,
+              effective_model: updated.effective_model,
+            }
+          : conversation,
+      ),
+    )
+  }, [])
+
+  const toggleChatCollapsed = useCallback(() => setChatCollapsed((value) => !value), [])
+
+  // The focus toggle never re-creates the canvas: it only switches the split
+  // and lets `FloatingPanel` re-parent the existing host. The fit token defers
+  // the re-fit until the new size is committed (see DesignMindmap).
+  const toggleFocus = useCallback(() => {
+    setFocusOpen((open) => !open)
+    setFitViewToken((token) => token + 1)
+  }, [])
+
+  const closeFocus = useCallback(() => {
+    setFocusOpen(false)
+    setFitViewToken((token) => token + 1)
+  }, [])
+
+  // The version page is not a flex column, so the workspace measures the space
+  // left below its own top edge and caps itself to the viewport. That keeps the
+  // document from growing: only the three layers (and their panels) scroll.
+  useEffect(() => {
+    if (loading || graph === null) return undefined
+    const updateHeight = () => {
+      const workspace = workspaceRef.current
+      if (workspace === null) return
+      const top = workspace.getBoundingClientRect().top
+      const available = Math.max(MIN_WORKSPACE_HEIGHT, window.innerHeight - top - PAGE_BOTTOM_INSET)
+      setWorkspaceHeight(`${Math.round(available)}px`)
+      if (!autoCollapseApplied.current) {
+        autoCollapseApplied.current = true
+        if (available < SHORT_WORKSPACE_HEIGHT) setChatCollapsed(true)
+      }
+    }
+    updateHeight()
+    window.addEventListener("resize", updateHeight)
+    return () => window.removeEventListener("resize", updateHeight)
+  }, [loading, graph])
+
   if (loading) {
     return (
       <div data-testid="design-tab">
@@ -312,15 +637,110 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     ? `设计轮次 #${overview.active_round.round_no}`
     : "暂无设计轮次"
 
+  const chatPairTotal = layerSplits.chat + layerSplits.mindmap
+  const mindmapPairTotal = layerSplits.mindmap + layerSplits.detail
+
+  function dividerDisabled(divider: DividerKind): boolean {
+    return divider === "chat" && chatCollapsed
+  }
+
+  function handleDividerPointerDown(
+    divider: DividerKind,
+    event: PointerEvent<HTMLDivElement>,
+  ): void {
+    if (dividerDisabled(divider)) return
+    dividerDrag.current = { divider, startY: event.clientY, startSplits: layerSplits }
+    setActiveDivider(divider)
+    if (typeof event.currentTarget.setPointerCapture === "function") {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    }
+    event.preventDefault()
+  }
+
+  function handleDividerPointerMove(
+    divider: DividerKind,
+    event: PointerEvent<HTMLDivElement>,
+  ): void {
+    const drag = dividerDrag.current
+    if (drag === null || drag.divider !== divider) return
+    const height = layersRef.current?.getBoundingClientRect().height ?? 0
+    if (height <= 0) return
+    const delta = ((event.clientY - drag.startY) / height) * 100
+    setLayerSplits(resizeLayerSplits(drag.startSplits, divider, delta))
+  }
+
+  function handleDividerPointerUp(divider: DividerKind): void {
+    if (dividerDrag.current?.divider !== divider) return
+    dividerDrag.current = null
+    setActiveDivider(null)
+  }
+
+  function handleDividerKeyDown(divider: DividerKind, event: KeyboardEvent<HTMLDivElement>): void {
+    if (dividerDisabled(divider)) return
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return
+    event.preventDefault()
+    const delta = event.key === "ArrowDown" ? KEYBOARD_RESIZE_STEP : -KEYBOARD_RESIZE_STEP
+    setLayerSplits((current) => resizeLayerSplits(current, divider, delta))
+  }
+
+  const chatLayerStyle = chatCollapsed
+    ? { flexGrow: 0, flexShrink: 0, flexBasis: "auto" }
+    : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.chat}%` }
+  // Collapsed chat takes only its content height; the mindmap grows into the rest.
+  const mindmapLayerStyle = chatCollapsed
+    ? { flexGrow: 1, flexShrink: 1, flexBasis: "0%" }
+    : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.mindmap}%` }
+  const detailLayerStyle = { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.detail}%` }
+
+  // While the focus dialog is open the pair fills the floating body with the
+  // fixed spec split; the chat layer and both dividers leave so nothing can be
+  // dragged away from 65/35. Closing restores the inline styles untouched.
+  const focusMindmapStyle = {
+    flexGrow: 0,
+    flexShrink: 1,
+    flexBasis: `${DESIGN_FOCUS_SPLITS.mindmap}%`,
+  }
+  const focusDetailStyle = {
+    flexGrow: 0,
+    flexShrink: 1,
+    flexBasis: `${DESIGN_FOCUS_SPLITS.detail}%`,
+  }
+  const hiddenWhileFocused = focusOpen ? { display: "none" } : undefined
+  const effectiveChatStyle = focusOpen ? hiddenWhileFocused : chatLayerStyle
+  const effectiveMindmapStyle = focusOpen ? focusMindmapStyle : mindmapLayerStyle
+  const effectiveDetailStyle = focusOpen ? focusDetailStyle : detailLayerStyle
+
   return (
-    <div data-testid="design-tab" className="space-y-3">
-      <header className="flex flex-wrap items-center gap-2">
+    <div
+      ref={workspaceRef}
+      data-testid="design-tab"
+      className="flex min-h-0 flex-col gap-3 overflow-hidden"
+      style={{ height: workspaceHeight }}
+    >
+      <header className="flex shrink-0 flex-wrap items-center gap-2">
         <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
         <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
           需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
           {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid="design-mindmap-expand"
+            aria-label={focusOpen ? "退出放大脑图与详情" : "放大脑图与详情"}
+            aria-expanded={focusOpen}
+            aria-haspopup="dialog"
+            onClick={toggleFocus}
+            className="gap-1"
+          >
+            {focusOpen ? (
+              <Minimize2 className="size-3.5" aria-hidden="true" />
+            ) : (
+              <Maximize2 className="size-3.5" aria-hidden="true" />
+            )}
+            <span className="hidden sm:inline">{focusOpen ? "退出放大" : "放大脑图"}</span>
+          </Button>
           <Button
             size="sm"
             variant="secondary"
@@ -337,13 +757,33 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           <Button
             size="sm"
             data-testid="design-new-conversation"
-            disabled={creatingConversation}
+            disabled={creatingConversation || !designAllowed}
+            title={designAllowed ? undefined : designStageGuidance(stage)}
             onClick={createConversation}
           >
             {creatingConversation ? "创建中…" : "＋ 新建对话"}
           </Button>
         </div>
       </header>
+
+      {stageKnown && !designAllowed ? (
+        <p
+          data-testid="design-stage-notice"
+          role="status"
+          className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-[11px] text-warning"
+        >
+          {designStageGuidance(stage)}
+        </p>
+      ) : null}
+      {stageKnown && !canReviewCases ? (
+        <p
+          data-testid="case-gate-notice"
+          role="status"
+          className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground"
+        >
+          {caseGateGuidance(stage)}
+        </p>
+      ) : null}
 
       {createError !== null ? <InlineError error={createError} /> : null}
       {confirmError !== null ? <InlineError error={confirmError} /> : null}
@@ -362,65 +802,165 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           versionId={versionId}
           pendingCount={graph.pending_design_count}
           hasConversation={false}
-          onCreateConversation={createConversation}
+          onCreateConversation={designAllowed ? createConversation : undefined}
         />
       ) : null}
 
-      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_380px]">
-        <div className="min-w-0">
-          {graph.requirements.length === 0 ? (
-            <div className="surface-card flex min-h-[560px] items-center justify-center p-6">
-              <EmptyState
-                title={EMPTY_REQUIREMENTS_COPY}
-                description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
-                action={
-                  <Button size="sm" disabled={creatingConversation} onClick={createConversation}>
-                    ＋ 新建对话
-                  </Button>
-                }
-                className="border-none bg-transparent"
+      <DesignFocusDialog open={focusOpen} onClose={closeFocus}>
+        <div
+          data-testid="design-layers-scroll"
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+        >
+          <div
+            ref={layersRef}
+            data-testid="design-layers"
+            className="flex min-h-0 flex-col overflow-hidden"
+            style={{ height: focusOpen ? "100%" : INLINE_TRACK_HEIGHT }}
+          >
+            <div
+              data-testid="design-layer-chat"
+              data-collapsed={chatCollapsed ? "true" : "false"}
+              className="min-h-0 overflow-auto"
+              style={effectiveChatStyle}
+            >
+              <DesignChat
+                versionId={versionId}
+                conversations={conversations}
+                activeConversationId={activeConversationId}
+                onSelectConversation={selectConversation}
+                onCreateConversation={createConversation}
+                creatingConversation={creatingConversation}
+                liveMessages={liveMessages}
+                activity={activity}
+                sseStatus={sseStatus}
+                staleNotice={staleNotice}
+                draftText={chatDraft}
+                onDraftTextChange={setChatDraft}
+                refreshToken={teamRoomToken}
+                collapsed={chatCollapsed}
+                onToggleCollapsed={toggleChatCollapsed}
+                onConversationModelChanged={applyConversationModel}
+                caseReferences={chatCaseReferences}
+                onCaseReferencesChange={setChatCaseReferences}
+                onCaseSelect={selectCase}
               />
             </div>
-          ) : (
-            <DesignMindmap
-              graph={graph}
-              selectedCaseId={selectedCaseId}
-              confirmingKey={confirmingKey}
-              onSelectCase={selectCase}
-              onConfirmCase={confirmCase}
-              onConfirmScenario={confirmScenario}
-              onConfirmRequirement={confirmRequirement}
+
+            <hr
+              data-testid="design-divider-chat"
+              // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="调整对话与脑图高度"
+              aria-valuemin={MIN_LAYER_PERCENT}
+              aria-valuemax={Math.round(chatPairTotal - MIN_LAYER_PERCENT)}
+              aria-valuenow={Math.round(layerSplits.chat)}
+              aria-disabled={chatCollapsed ? true : undefined}
+              tabIndex={chatCollapsed ? -1 : 0}
+              style={hiddenWhileFocused}
+              onPointerDown={(event) => handleDividerPointerDown("chat", event)}
+              onPointerMove={(event) => handleDividerPointerMove("chat", event)}
+              onPointerUp={() => handleDividerPointerUp("chat")}
+              onPointerCancel={() => handleDividerPointerUp("chat")}
+              onKeyDown={(event) => handleDividerKeyDown("chat", event)}
+              className={cn(
+                "group relative m-0 h-2 w-full shrink-0 touch-none select-none border-0 bg-transparent",
+                "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
+                "after:rounded-full after:bg-border after:transition-colors after:content-['']",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                chatCollapsed
+                  ? "cursor-not-allowed opacity-60"
+                  : "cursor-row-resize hover:after:bg-primary/60",
+                activeDivider === "chat" && "after:bg-primary",
+              )}
             />
-          )}
-        </div>
 
-        <DesignChat
-          versionId={versionId}
-          conversations={conversations}
-          activeConversationId={activeConversationId}
-          onSelectConversation={selectConversation}
-          onCreateConversation={createConversation}
-          creatingConversation={creatingConversation}
-          liveMessages={liveMessages}
-          activity={activity}
-          sseStatus={sseStatus}
-          staleNotice={staleNotice}
-          draftText={chatDraft}
-          onDraftTextChange={setChatDraft}
-          refreshToken={teamRoomToken}
-        />
+            <div
+              data-testid="design-layer-mindmap"
+              className="flex min-h-0 flex-col overflow-auto [&>section]:min-h-0 [&>section]:flex-1"
+              style={effectiveMindmapStyle}
+            >
+              {graph.requirements.length === 0 ? (
+                <div className="surface-card flex h-full items-center justify-center p-6">
+                  <EmptyState
+                    title={EMPTY_REQUIREMENTS_COPY}
+                    description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
+                    action={
+                      <Button
+                        size="sm"
+                        disabled={creatingConversation}
+                        onClick={createConversation}
+                      >
+                        ＋ 新建对话
+                      </Button>
+                    }
+                    className="border-none bg-transparent"
+                  />
+                </div>
+              ) : (
+                <DesignMindmap
+                  graph={graph}
+                  selectedCaseId={selectedCaseId}
+                  confirmingKey={confirmingKey}
+                  executionResults={executionResults}
+                  batchBusy={batchBusy}
+                  caseReviewEnabled={canReviewCases}
+                  onSelectCase={selectCase}
+                  onConfirmCase={confirmCase}
+                  onConfirmScenario={confirmScenario}
+                  onConfirmRequirement={confirmRequirement}
+                  onBatchConfirmCases={batchConfirmCases}
+                  onBatchExecuteCases={batchExecuteCases}
+                  onRequestAiChange={requestAiChange}
+                  fitViewToken={fitViewToken}
+                />
+              )}
+            </div>
 
-        <div className="lg:col-span-2">
-          <CaseDetailPanel
-            versionId={versionId}
-            caseId={selectedCaseId}
-            refreshToken={detailToken}
-            confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
-            onConfirm={confirmCase}
-            onRequestChange={setChatDraft}
-          />
+            <hr
+              data-testid="design-divider-mindmap"
+              // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="调整脑图与详情高度"
+              aria-valuemin={MIN_LAYER_PERCENT}
+              aria-valuemax={Math.round(mindmapPairTotal - MIN_LAYER_PERCENT)}
+              aria-valuenow={Math.round(layerSplits.mindmap)}
+              tabIndex={0}
+              style={hiddenWhileFocused}
+              onPointerDown={(event) => handleDividerPointerDown("mindmap", event)}
+              onPointerMove={(event) => handleDividerPointerMove("mindmap", event)}
+              onPointerUp={() => handleDividerPointerUp("mindmap")}
+              onPointerCancel={() => handleDividerPointerUp("mindmap")}
+              onKeyDown={(event) => handleDividerKeyDown("mindmap", event)}
+              className={cn(
+                "group relative m-0 h-2 w-full shrink-0 cursor-row-resize touch-none select-none border-0 bg-transparent",
+                "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
+                "after:rounded-full after:bg-border after:transition-colors after:content-[''] hover:after:bg-primary/60",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                activeDivider === "mindmap" && "after:bg-primary",
+              )}
+            />
+
+            <div
+              data-testid="design-layer-detail"
+              className="min-h-0 overflow-auto"
+              style={effectiveDetailStyle}
+            >
+              <CaseDetailPanel
+                versionId={versionId}
+                caseId={selectedCaseId}
+                refreshToken={detailToken}
+                confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
+                canConfirm={canReviewCases}
+                onConfirm={confirmCase}
+                onRequestChange={setChatDraft}
+                onRequestAiChange={requestAiChangeForCase}
+              />
+            </div>
+          </div>
         </div>
-      </div>
+      </DesignFocusDialog>
 
       <ExportCasesDialog
         versionId={versionId}

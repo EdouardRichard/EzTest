@@ -15,7 +15,7 @@ import (
 
 const requirementColumns = `id, version_id, current_version_id, status, target_version_sut_ids,
 	closed_at, closed_by_run_id, created_by, created_by_run_id, source_conversation_id,
-	created_at, updated_at`
+	created_at, updated_at, source_key`
 
 const requirementVersionColumns = `id, requirement_id, revision, title, description,
 	acceptance_criteria, priority, constraints, target_version_suts, target_pages,
@@ -50,6 +50,9 @@ func (r *RequirementRepository) Create(ctx context.Context, requirement version.
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, insertRequirementSQL, requirementArgs(requirement)...); err != nil {
+		if isSourceKeyUniqueViolation(err) {
+			return version.ErrRequirementDuplicate
+		}
 		return wrapDB("insert requirement", err)
 	}
 	if _, err := tx.Exec(ctx, insertRequirementVersionSQL, requirementVersionArgs(revision)...); err != nil {
@@ -141,6 +144,22 @@ func (r *RequirementRepository) Get(ctx context.Context, versionID, requirementI
 	return aggregate, nil
 }
 
+// GetBySourceKey loads the active requirement carrying one deterministic source
+// key in a version. Obsolete rows leave the partial unique index and are not
+// matched: an explicitly deleted source can be created again.
+func (r *RequirementRepository) GetBySourceKey(ctx context.Context, versionID int64, sourceKey string) (version.RequirementAggregate, error) {
+	var requirementID int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT id FROM requirement
+		WHERE version_id = $1 AND source_key = $2 AND status <> 'obsolete'
+		LIMIT 1
+	`, versionID, sourceKey).Scan(&requirementID)
+	if err != nil {
+		return version.RequirementAggregate{}, wrapRequirementLookup("get requirement by source key", err)
+	}
+	return r.Get(ctx, versionID, requirementID)
+}
+
 // GetMany loads requirements with their current revision in the caller's ID
 // order. A missing ID is reported as ErrRequirementNotFound.
 func (r *RequirementRepository) GetMany(ctx context.Context, versionID int64, ids []int64) ([]version.RequirementWithCurrent, error) {
@@ -220,11 +239,16 @@ func (r *RequirementRepository) AddRevision(ctx context.Context, requirement ver
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE requirement
-		SET status = $3, current_version_id = $4, target_version_sut_ids = $5::jsonb, updated_at = $6
+		SET status = $3, current_version_id = $4, target_version_sut_ids = $5::jsonb, updated_at = $6,
+			source_key = $7
 		WHERE id = $1 AND version_id = $2
 	`, requirement.ID, requirement.VersionID, string(requirement.Status),
-		requirement.CurrentVersionID, encodeStringSlice(requirement.TargetVersionSUTIDs), requirement.UpdatedAt)
+		requirement.CurrentVersionID, encodeStringSlice(requirement.TargetVersionSUTIDs), requirement.UpdatedAt,
+		requirement.SourceKey)
 	if err != nil {
+		if isSourceKeyUniqueViolation(err) {
+			return version.ErrRequirementDuplicate
+		}
 		return wrapDB("update requirement", err)
 	}
 	if tag.RowsAffected() == 0 {
@@ -265,6 +289,7 @@ func (r *RequirementRepository) Confirm(ctx context.Context, requirement version
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO requirement_confirmation (`+requirementConfirmationColumns+`)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+		ON CONFLICT (requirement_version_id) DO NOTHING
 	`, confirmation.ID, confirmation.RequirementVersionID, confirmation.Scope, confirmation.BatchID,
 		confirmation.ActorID, confirmation.ConfirmedAt, encodeStringSlice(confirmation.AffectedRequirementIDs)); err != nil {
 		if isUniqueViolation(err) {
@@ -313,6 +338,7 @@ func (r *RequirementRepository) BatchConfirm(ctx context.Context, requirements [
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO requirement_confirmation (`+requirementConfirmationColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+			ON CONFLICT (requirement_version_id) DO NOTHING
 		`, confirmation.ID, confirmation.RequirementVersionID, confirmation.Scope, confirmation.BatchID,
 			confirmation.ActorID, confirmation.ConfirmedAt,
 			encodeStringSlice(confirmation.AffectedRequirementIDs)); err != nil {
@@ -342,6 +368,22 @@ func (r *RequirementRepository) CreateRelation(ctx context.Context, relation ver
 			return version.ErrRelationDuplicate
 		}
 		return wrapDB("insert requirement relation", err)
+	}
+	return nil
+}
+
+// SetStatus projects a lifecycle status change that adds no revision (Task 77
+// duplicate-draft deletion and merge retirement).
+func (r *RequirementRepository) SetStatus(ctx context.Context, versionID, requirementID int64, status version.RequirementStatus, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE requirement SET status = $3, updated_at = $4
+		WHERE version_id = $1 AND id = $2
+	`, versionID, requirementID, string(status), updatedAt)
+	if err != nil {
+		return wrapDB("set requirement status", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.ErrRequirementNotFound
 	}
 	return nil
 }
@@ -403,7 +445,7 @@ func (r *RequirementRepository) ListAttachments(ctx context.Context, versionID, 
 
 const insertRequirementSQL = `
 	INSERT INTO requirement (` + requirementColumns + `)
-	VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12)
+	VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13)
 `
 
 const insertRequirementVersionSQL = `
@@ -416,7 +458,7 @@ func requirementArgs(requirement version.Requirement) []any {
 		requirement.ID, requirement.VersionID, requirement.CurrentVersionID, string(requirement.Status),
 		encodeStringSlice(requirement.TargetVersionSUTIDs), requirement.ClosedAt, requirement.ClosedByRunID,
 		requirement.CreatedBy, requirement.CreatedByRunID, requirement.SourceConversationID,
-		requirement.CreatedAt, requirement.UpdatedAt,
+		requirement.CreatedAt, requirement.UpdatedAt, requirement.SourceKey,
 	}
 }
 
@@ -433,7 +475,7 @@ func requirementVersionArgs(revision version.RequirementVersion) []any {
 func prefixedRequirementColumns(alias string) string {
 	return `r.id, r.version_id, r.current_version_id, r.status, r.target_version_sut_ids,
 		r.closed_at, r.closed_by_run_id, r.created_by, r.created_by_run_id, r.source_conversation_id,
-		r.created_at, r.updated_at`
+		r.created_at, r.updated_at, r.source_key`
 }
 
 func prefixedVersionColumns(alias string) string {
@@ -456,7 +498,7 @@ func scanRequirement(row rowScanner) (version.Requirement, error) {
 	if err := row.Scan(&requirement.ID, &requirement.VersionID, &requirement.CurrentVersionID, &status,
 		&targetSUTs, &requirement.ClosedAt, &requirement.ClosedByRunID, &requirement.CreatedBy,
 		&requirement.CreatedByRunID, &requirement.SourceConversationID, &requirement.CreatedAt,
-		&requirement.UpdatedAt); err != nil {
+		&requirement.UpdatedAt, &requirement.SourceKey); err != nil {
 		return version.Requirement{}, err
 	}
 	requirement.Status = version.RequirementStatus(status)
@@ -513,7 +555,7 @@ func scanRequirementWithVersion(row rowScanner, extra ...any) (version.Requireme
 		&requirement.ID, &requirement.VersionID, &requirement.CurrentVersionID, &status,
 		&requirementTargetSUTs, &requirement.ClosedAt, &requirement.ClosedByRunID, &requirement.CreatedBy,
 		&requirement.CreatedByRunID, &requirement.SourceConversationID, &requirement.CreatedAt,
-		&requirement.UpdatedAt,
+		&requirement.UpdatedAt, &requirement.SourceKey,
 		&revision.ID, &revision.RequirementID, &revision.Revision, &revision.Title,
 		&revision.Description, &revision.AcceptanceCriteria, &revision.Priority, &constraints,
 		&versionTargetSUTs, &targetPages,
@@ -615,6 +657,14 @@ func wrapRequirementLookup(op string, err error) error {
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// isSourceKeyUniqueViolation distinguishes the deterministic (version,
+// source_key) uniqueness violation from the revision primary key conflict.
+func isSourceKeyUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		pgErr.ConstraintName == "uk_requirement_version_id_source_key"
 }
 
 var _ version.RequirementRepository = (*RequirementRepository)(nil)

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
@@ -518,6 +519,9 @@ func TestRuntimeProfilesRunsMessagesAndPackets(t *testing.T) {
 	run := agent.AgentRun{
 		ID:             ids.Next(),
 		ProfileKey:     "clarification_host",
+		Model:          "gpt-4o",
+		ConfigID:       77,
+		FallbackFrom:   "old-model",
 		WorkItemID:     ptr(int64(55)),
 		ConversationID: ptr(int64(66)),
 		Status:         agent.AgentRunRunning,
@@ -532,6 +536,19 @@ func TestRuntimeProfilesRunsMessagesAndPackets(t *testing.T) {
 	}
 	if createdRun.ID != run.ID || createdRun.Status != agent.AgentRunRunning {
 		t.Fatalf("created run = %#v", createdRun)
+	}
+	if createdRun.Model != "gpt-4o" || createdRun.ConfigID != 77 || createdRun.FallbackFrom != "old-model" {
+		t.Fatalf("created run model/config/fallback = %q/%d/%q", createdRun.Model, createdRun.ConfigID, createdRun.FallbackFrom)
+	}
+	var runModel, runFallback string
+	var runConfigID *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT model, config_id, fallback_from FROM agent_run WHERE id = $1`, run.ID,
+	).Scan(&runModel, &runConfigID, &runFallback); err != nil {
+		t.Fatalf("query run model: %v", err)
+	}
+	if runModel != "gpt-4o" || runConfigID == nil || *runConfigID != 77 || runFallback != "old-model" {
+		t.Fatalf("stored run model/config/fallback = %q/%v/%q", runModel, runConfigID, runFallback)
 	}
 
 	assistant := agent.AgentMessage{
@@ -625,6 +642,56 @@ func TestRuntimeProfilesRunsMessagesAndPackets(t *testing.T) {
 
 	if _, err := repo.GetContextPacket(ctx, savedPacket.ID+1); !errors.Is(err, agent.ErrNotFound) {
 		t.Fatalf("missing packet = %v, want ErrNotFound", err)
+	}
+}
+
+// TestRuntimeRepositoryRecordsPreDispatchFailedRun covers Task 75: a run that
+// fails before dispatch (model capability resolution) is persisted with its
+// failed status, terminal reason and finish time in one insert, so the Agent
+// center's agent_run-backed runs list can show the conversation job and why it
+// failed.
+func TestRuntimeRepositoryRecordsPreDispatchFailedRun(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewRuntimeRepository(pool, newIDs(t))
+	ctx := context.Background()
+	if _, err := agentapp.EnsureProfiles(ctx, repo); err != nil {
+		t.Fatalf("EnsureProfiles: %v", err)
+	}
+
+	reason := "llm_capability_mismatch"
+	finishedAt := testTime.Add(2 * time.Second)
+	run := agent.AgentRun{
+		ID:             newIDs(t).Next(),
+		ProfileKey:     agentapp.ProfileKeyClarificationHost,
+		WorkItemID:     ptr(int64(1001)),
+		ConversationID: ptr(int64(20)),
+		Status:         agent.AgentRunFailed,
+		TerminalReason: &reason,
+		OwnerInstance:  "instance-1",
+		LeaseEpoch:     3,
+		StartedAt:      testTime,
+		FinishedAt:     &finishedAt,
+		Usage:          map[string]int{},
+		Tokens:         map[string]int{},
+		Cache:          map[string]int{},
+	}
+	stored, err := repo.CreateRun(ctx, run)
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if stored.Status != agent.AgentRunFailed || stored.TerminalReason == nil ||
+		*stored.TerminalReason != reason || stored.FinishedAt == nil {
+		t.Fatalf("stored failed run = %#v, want failed/%s with a finish time", stored, reason)
+	}
+	var status, terminalReason string
+	var finished *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT status, COALESCE(terminal_reason, ''), finished_at FROM agent_run WHERE id = $1`,
+		run.ID).Scan(&status, &terminalReason, &finished); err != nil {
+		t.Fatalf("query failed run: %v", err)
+	}
+	if status != "failed" || terminalReason != reason || finished == nil {
+		t.Fatalf("stored row = %q/%q/%v, want failed/%s with finished_at", status, terminalReason, finished, reason)
 	}
 }
 

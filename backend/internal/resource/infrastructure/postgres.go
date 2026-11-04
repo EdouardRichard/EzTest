@@ -39,6 +39,11 @@ func wrapDB(op string, err error) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "23505": // unique_violation
+			// Page uniqueness is (environment_id, normalized_url); keep
+			// route_template collisions non-unique.
+			if pgErr.ConstraintName == "uk_sut_page_normalized_url" {
+				return resource.ErrPageURLDuplicate
+			}
 			return resource.ErrDuplicate
 		case "23503": // foreign_key_violation
 			return resource.ErrNotFound

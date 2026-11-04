@@ -20,6 +20,9 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	// Decode the scope before the stage gate so the typed 409 can name the
+	// requested confirmation scope (case/scenario/requirement) instead of a
+	// case-only message. Body/scope validation stays a 400.
 	var request confirmRequest
 	if err := decodeBody(w, r, &request); err != nil {
 		httpx.Error(w, r, err)
@@ -27,6 +30,10 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 	}
 	scope := request.Scope
 	if err := design.ValidateConfirmationScope(scope); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if err := h.requireCaseReview(r.Context(), versionID, scope); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}

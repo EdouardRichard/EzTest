@@ -55,7 +55,7 @@ type sutPageList struct{ deps Deps }
 func (t *sutPageList) Name() string { return ToolSUTPageList }
 
 func (t *sutPageList) Description() string {
-	return "列出当前版本绑定 SUT 的页面/API 清单（只读）；version_sut_id 省略时返回该版本全部。"
+	return "列出当前版本绑定 SUT 的页面/API 清单（只读），每条的 id 是该页面/API 的十进制 ID，供 requirement.draft_create 的 target_pages/target_apis 直接使用；version_sut_id 省略时返回该版本全部。"
 }
 
 func (t *sutPageList) Parameters() json.RawMessage {
@@ -91,6 +91,7 @@ func (t *sutPageList) Execute(ctx context.Context, scope Scope, raw json.RawMess
 	for _, item := range items {
 		pages = append(pages, map[string]any{
 			"version_sut_id": idString(item.VersionSUTID),
+			"id":             item.ID,
 			"kind":           item.Kind,
 			"name":           item.Name,
 			"path":           item.Path,

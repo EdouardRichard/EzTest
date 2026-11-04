@@ -177,9 +177,25 @@ func (f *fakeRepo) UpsertModels(_ context.Context, configID int64, models []llm.
 		existing.MaxOutput = incoming.MaxOutput
 		existing.SupportsTools = incoming.SupportsTools
 		existing.SupportsVision = incoming.SupportsVision
+		existing.Capabilities = incoming.Capabilities
+		existing.Deprecated = incoming.Deprecated
 		existing.Source = incoming.Source
 		existing.UpdatedAt = incoming.UpdatedAt
 		f.models[existingID] = existing
+	}
+	// Mirror the repository contract: catalog rows absent from the refresh are
+	// kept and marked deprecated instead of being deleted.
+	present := make(map[string]bool, len(models))
+	for _, incoming := range models {
+		present[incoming.Model] = true
+	}
+	for id, existing := range f.models {
+		if existing.ConfigID != configID || existing.Source != llm.SourceCatalog || present[existing.Model] {
+			continue
+		}
+		existing.Deprecated = true
+		existing.UpdatedAt = at
+		f.models[id] = existing
 	}
 	list := make([]llm.Model, 0)
 	for _, model := range f.models {
@@ -211,6 +227,17 @@ func (f *fakeRepo) DeleteModel(_ context.Context, id int64) error {
 	}
 	delete(f.models, id)
 	return nil
+}
+
+func (f *fakeRepo) UpdateModel(_ context.Context, model llm.Model) (llm.Model, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, ok := f.models[model.ID]
+	if !ok || existing.ConfigID != model.ConfigID {
+		return llm.Model{}, llm.ErrModelNotFound
+	}
+	f.models[model.ID] = model
+	return model, nil
 }
 
 type fakeClient struct {
@@ -717,7 +744,10 @@ func TestAddModelValidatesAndRejectsDuplicates(t *testing.T) {
 		t.Fatalf("CreateConfig: %v", err)
 	}
 
-	model, err := svc.AddModel(ctx, cfg.ID, "gpt-4o", 128000, 16384, true, false, 7)
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 16384,
+		SupportsTools: true, SupportsReasoning: true, SupportsPromptCache: true,
+	}, 7)
 	if err != nil {
 		t.Fatalf("AddModel: %v", err)
 	}
@@ -727,8 +757,12 @@ func TestAddModelValidatesAndRejectsDuplicates(t *testing.T) {
 	if model.Source != "manual" || model.Status != "active" || !model.SupportsTools || model.SupportsVision {
 		t.Fatalf("model flags = %#v", model)
 	}
+	if !model.Capabilities.SupportsReasoning || !model.Capabilities.SupportsPromptCache ||
+		model.Capabilities.ContextWindow != 128000 {
+		t.Fatalf("capabilities = %#v", model.Capabilities)
+	}
 
-	if _, err := svc.AddModel(ctx, cfg.ID, "gpt-4o", 1, 1, false, false, 7); err == nil {
+	if _, err := svc.AddModel(ctx, cfg.ID, ModelInput{Model: "gpt-4o", ContextWindow: 1, MaxOutput: 1}, 7); err == nil {
 		t.Fatal("duplicate model accepted")
 	} else if apiError(t, err).Status != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", apiError(t, err).Status)
@@ -750,7 +784,8 @@ func TestAddModelValidatesAndRejectsDuplicates(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := svc.AddModel(ctx, tc.configID, tc.model, tc.contextWindow, tc.maxOutput, false, false, 1); err == nil {
+			input := ModelInput{Model: tc.model, ContextWindow: tc.contextWindow, MaxOutput: tc.maxOutput}
+			if _, err := svc.AddModel(ctx, tc.configID, input, 1); err == nil {
 				t.Fatal("invalid model accepted")
 			} else if got := apiError(t, err).Status; got != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", got, tc.wantStatus)
@@ -772,11 +807,11 @@ func TestDeleteModelAndListModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateConfig: %v", err)
 	}
-	modelA, err := svc.AddModel(ctx, first.ID, "gpt-4o", 128000, 16384, true, true, 1)
+	modelA, err := svc.AddModel(ctx, first.ID, ModelInput{Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 16384, SupportsTools: true, SupportsVision: true}, 1)
 	if err != nil {
 		t.Fatalf("AddModel: %v", err)
 	}
-	if _, err := svc.AddModel(ctx, second.ID, "claude", 200000, 8192, false, true, 1); err != nil {
+	if _, err := svc.AddModel(ctx, second.ID, ModelInput{Model: "claude", ContextWindow: 200000, MaxOutput: 8192, SupportsVision: true}, 1); err != nil {
 		t.Fatalf("AddModel: %v", err)
 	}
 
@@ -848,6 +883,89 @@ func TestDefaultConfigStaysUnique(t *testing.T) {
 	}
 	if dflt != 1 {
 		t.Fatalf("default configs = %d, want 1", dflt)
+	}
+}
+
+// TestConfigRequiresDefaultWhenModelsExist pins the dispatch-ready invariant:
+// once a configuration owns a selectable model, create/update must name a
+// default_model_id, otherwise the config is persistable but the agent runtime
+// cannot resolve a model. A config without models may still be created before
+// its catalog is refreshed (Task 17 carve-out), and a catalog whose models are
+// all deprecated does not require a default either.
+func TestConfigRequiresDefaultWhenModelsExist(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _, _, _ := newTestService(t)
+
+	// Task 17 carve-out: a config with no models may be created (and updated)
+	// before its catalog is refreshed.
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig without models: %v", err)
+	}
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{Name: strPtr("Primary")}, 1); err != nil {
+		t.Fatalf("UpdateConfig without models: %v", err)
+	}
+
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true}, 1)
+	if err != nil {
+		t.Fatalf("AddModel: %v", err)
+	}
+
+	assertDefaultRequired := func(t *testing.T, err error) {
+		t.Helper()
+		apiErr := apiError(t, err)
+		if apiErr.Status != http.StatusBadRequest || apiErr.Code != CodeLLMConfigInvalid || apiErr.Retryable {
+			t.Fatalf("error = %#v, want non-retryable %s", apiErr, CodeLLMConfigInvalid)
+		}
+		if apiErr.Details["field"] != "default_model_id" {
+			t.Fatalf("error details = %#v, want field=default_model_id", apiErr.Details)
+		}
+	}
+
+	// With a selectable model but no default, a partial update must be rejected.
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{Name: strPtr("Renamed")}, 1); err == nil {
+		t.Fatal("UpdateConfig accepted a config with selectable models and no default")
+	} else {
+		assertDefaultRequired(t, err)
+	}
+	stored, err := repo.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	if stored.Name != "Primary" {
+		t.Fatalf("rejected update was persisted: name = %q", stored.Name)
+	}
+
+	// An explicit clear is the same violation.
+	zero := int64(0)
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &zero}, 1); err == nil {
+		t.Fatal("UpdateConfig accepted an explicit default_model_id clear")
+	} else {
+		assertDefaultRequired(t, err)
+	}
+
+	// Naming the model satisfies the rule.
+	updated, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{
+		Name:           strPtr("Renamed"),
+		DefaultModelID: &model.ID,
+	}, 1)
+	if err != nil {
+		t.Fatalf("UpdateConfig with default model: %v", err)
+	}
+	if updated.DefaultModelID != model.ID {
+		t.Fatalf("default_model_id = %d, want %d", updated.DefaultModelID, model.ID)
+	}
+
+	// A catalog whose models are all deprecated has nothing selectable, so the
+	// admin may clear the default until the catalog is refreshed.
+	model.Deprecated = true
+	repo.models[model.ID] = model
+	cleared, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &zero}, 1)
+	if err != nil {
+		t.Fatalf("UpdateConfig deprecated-only catalog: %v", err)
+	}
+	if cleared.DefaultModelID != 0 {
+		t.Fatalf("default_model_id = %d, want cleared", cleared.DefaultModelID)
 	}
 }
 

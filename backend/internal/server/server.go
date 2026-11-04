@@ -67,6 +67,9 @@ type Deps struct {
 	Versions      *versionapp.Service
 	Requirements  *versionapp.RequirementService
 	Conversations *versionapp.ConversationService
+	// Stage is the deterministic version stage machine (spec §5.3). It is
+	// optional; nil leaves the stage-machine routes unmounted.
+	Stage         *versionapp.StageMachine
 	TeamRoom      *agentapp.TeamRoom
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
@@ -91,6 +94,13 @@ type Deps struct {
 	// whenever the execution handler exists (the token middleware fails closed
 	// without a settings service).
 	P7 *P7Handlers
+	// Jobs is the optional 0.2.1 job control surface (cancel/retry). Nil leaves
+	// both the direct and the version-scoped routes unmounted.
+	Jobs *agentapi.JobControlHandler
+	// ContextPackets is the optional 0.2.1 cache-first context_packet read port
+	// (Task 48). The route is always mounted behind the admin gate; a nil reader
+	// answers 503 instead of exposing a working endpoint or panicking.
+	ContextPackets agentapi.ContextPacketReader
 	// Load counts in-flight API requests for drain/rolling-upgrade observability
 	// (P8). Nil disables the counter.
 	Load *load.Counter
@@ -115,6 +125,10 @@ type P6Handlers struct {
 	Global      *deliveryapi.GlobalHandler
 	AgentCenter *agentapi.AgentCenterHandler
 	Profiles    *agentapi.ProfileHandler
+	// VersionRead is the 0.2.1 version-scoped read surface (facts, plan items
+	// and work items). Nil leaves those routes unmounted so a P0-P5
+	// deployment keeps its route table.
+	VersionRead *versionapi.VersionReadHandler
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -142,20 +156,41 @@ func New(deps Deps) http.Handler {
 	identityapi.New(deps.Identity).Register(mux, authenticated, admin)
 	registerSettingsRoutes(mux, admin, settingsapi.New(deps.Settings))
 	registerAuditRoutes(mux, admin, auditapi.New(deps.Audit))
-	registerLLMRoutes(mux, admin, llmapi.New(deps.LLM))
+	registerLLMRoutes(mux, authenticated, admin, llmapi.New(deps.LLM))
 	registerContentRoutes(mux, authenticated, storageapi.New(deps.Storage))
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
 	versionHandler := versionapi.New(deps.Versions, versionapi.WithVersionReopener(deps.VersionClose))
-	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements,
+	requirementOptions := []versionapi.RequirementHandlerOption{
 		versionapi.WithRequirementReopener(deps.Closure),
 		versionapi.WithRequirementClosures(deps.Closure),
-	)
+	}
+	// Task 78: confirming requirements through the real UI API must advance a
+	// clarifying version to requirement_review instead of leaving it stuck.
+	if deps.Stage != nil {
+		requirementOptions = append(requirementOptions,
+			versionapi.WithRequirementStageConverger(deps.Stage))
+	}
+	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements, requirementOptions...)
 	registerVersionRoutes(mux, authenticated, versionHandler)
 	registerRequirementRoutes(mux, authenticated, requirementHandler)
-	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
+	var stageHandler *versionapi.StageHandler
+	if deps.Stage != nil {
+		stageHandler = versionapi.NewStageHandler(deps.Stage)
+	}
+	registerStageRoutes(mux, authenticated, stageHandler)
+	conversationHandler := versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter)
+	if deps.Stage != nil {
+		conversationHandler.SetStageReader(deps.Stage)
+	}
+	registerConversationRoutes(mux, authenticated, conversationHandler)
+	versionapi.RegisterMessageParts(mux, authenticated, versionapi.NewMessagePartsHandler(deps.Conversations))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
-	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
+	designHandler := designapi.New(deps.DesignGraph, deps.DesignExports)
+	if deps.Stage != nil {
+		designHandler.SetStageReader(deps.Stage)
+	}
+	registerDesignRoutes(mux, authenticated, designHandler)
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
 	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
 	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
@@ -164,6 +199,8 @@ func New(deps Deps) http.Handler {
 	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
 	registerP6Routes(mux, authenticated, admin, deps.P6)
 	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
+	registerJobRoutes(mux, authenticated, deps.Jobs)
+	registerContextPacketRoutes(mux, admin, deps.ContextPackets)
 
 	var chain http.Handler = mux
 	if deps.Settings != nil {
@@ -193,6 +230,9 @@ func registerP7Routes(
 	if h != nil {
 		if h.Knowledge != nil {
 			knowledgeapi.RegisterRoutes(mux, authenticated, admin, h.Knowledge)
+			// 0.2.1 structured search is a login-only read surface; it is
+			// mounted explicitly so it never inherits the admin middleware.
+			h.Knowledge.RegisterSearch(mux, authenticated)
 		}
 		if h.Orchestration != nil {
 			orchestrationapi.RegisterRoutes(mux, authenticated, admin, h.Orchestration)
@@ -234,6 +274,30 @@ func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler
 	if h.Profiles != nil {
 		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
 	}
+	if h.VersionRead != nil {
+		versionapi.RegisterVersionReadRoutes(mux, authenticated, h.VersionRead)
+	}
+}
+
+// registerJobRoutes mounts the optional 0.2.1 job control API (cancel/retry).
+// A nil handler keeps the route table of a deployment without job control
+// unchanged.
+func registerJobRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *agentapi.JobControlHandler) {
+	if h == nil {
+		return
+	}
+	h.Register(mux, authenticated)
+}
+
+// registerContextPacketRoutes mounts the 0.2.1 cache-first context_packet read
+// API (Task 48). The packet contains the stable system-prompt prefix and the
+// replayed transcript, so the route is mounted behind the admin gate (Task 14's
+// handler is admin-only as well; spec R9). The handler is always constructed:
+// an unwired reader answers 503 instead of panicking, so a deployment whose
+// composition root has not supplied the version-latest reader never exposes a
+// broken 200.
+func registerContextPacketRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, reader agentapi.ContextPacketReader) {
+	agentapi.RegisterContextPacketRoutes(mux, admin, agentapi.NewContextPacketHandler(reader))
 }
 
 type identityAuthenticator struct {
@@ -281,7 +345,10 @@ func registerAuditRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handl
 	mux.Handle("GET /api/admin/audit-logs", admin(http.HandlerFunc(h.List)))
 }
 
-func registerLLMRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler, h *llmapi.Handler) {
+func registerLLMRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *llmapi.Handler) {
+	// The public catalog backs the conversation model selector; it is readable
+	// by any logged-in user and never exposes credentials (spec §9.1).
+	mux.Handle("GET /api/llm/models", authenticated(http.HandlerFunc(h.ListPublicModels)))
 	mux.Handle("GET /api/admin/llm/configs", admin(http.HandlerFunc(h.ListConfigs)))
 	mux.Handle("POST /api/admin/llm/configs", admin(http.HandlerFunc(h.CreateConfig)))
 	mux.Handle("GET /api/admin/llm/configs/{id}", admin(http.HandlerFunc(h.GetConfig)))
@@ -290,6 +357,7 @@ func registerLLMRoutes(mux *http.ServeMux, admin func(http.Handler) http.Handler
 	mux.Handle("POST /api/admin/llm/configs/{id}/test", admin(http.HandlerFunc(h.TestConfig)))
 	mux.Handle("POST /api/admin/llm/configs/{id}/refresh-models", admin(http.HandlerFunc(h.RefreshModels)))
 	mux.Handle("POST /api/admin/llm/configs/{id}/models", admin(http.HandlerFunc(h.AddModel)))
+	mux.Handle("PATCH /api/admin/llm/configs/{id}/models/{modelId}", admin(http.HandlerFunc(h.UpdateModel)))
 	mux.Handle("DELETE /api/admin/llm/configs/{id}/models/{modelId}", admin(http.HandlerFunc(h.DeleteModel)))
 	mux.Handle("GET /api/admin/llm/models", admin(http.HandlerFunc(h.ListModels)))
 }
@@ -315,17 +383,35 @@ func registerRequirementRoutes(mux *http.ServeMux, authenticated func(http.Handl
 	mux.Handle("GET /api/versions/{id}/requirements", authenticated(http.HandlerFunc(h.List)))
 	mux.Handle("POST /api/versions/{id}/requirements", authenticated(http.HandlerFunc(h.Create)))
 	mux.Handle("POST /api/versions/{id}/requirements/confirmations", authenticated(http.HandlerFunc(h.BatchConfirm)))
+	mux.Handle("POST /api/versions/{id}/requirements/dedupe", authenticated(http.HandlerFunc(h.Dedupe)))
+	mux.Handle("POST /api/versions/{id}/requirements/merge", authenticated(http.HandlerFunc(h.Merge)))
 	mux.Handle("GET /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Get)))
 	mux.Handle("PATCH /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Update)))
+	mux.Handle("DELETE /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Delete)))
 	mux.Handle("POST /api/versions/{id}/requirements/{rid}/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
 	mux.Handle("POST /api/versions/{id}/requirements/{rid}/rollback", authenticated(http.HandlerFunc(h.Rollback)))
 	mux.Handle("GET /api/versions/{id}/requirements/{rid}/relations", authenticated(http.HandlerFunc(h.ListRelations)))
+}
+
+// registerStageRoutes mounts the deterministic version stage-machine API: the
+// stage read plus the two user-only hard gates and the gate reject. A nil
+// handler keeps the route table of a deployment without the stage machine
+// unchanged.
+func registerStageRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.StageHandler) {
+	if h == nil {
+		return
+	}
+	mux.Handle("GET /api/versions/{id}/stage", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("POST /api/versions/{id}/stage/confirm-requirements", authenticated(http.HandlerFunc(h.ConfirmRequirements)))
+	mux.Handle("POST /api/versions/{id}/stage/confirm-cases", authenticated(http.HandlerFunc(h.ConfirmCases)))
+	mux.Handle("POST /api/versions/{id}/stage/reject", authenticated(http.HandlerFunc(h.Reject)))
 }
 
 func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.ConversationHandler) {
 	mux.Handle("GET /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.List)))
 	mux.Handle("POST /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.Create)))
 	mux.Handle("GET /api/versions/{id}/conversations/{cid}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("PATCH /api/versions/{id}/conversations/{cid}", authenticated(http.HandlerFunc(h.UpdateModel)))
 	mux.Handle("GET /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.Messages)))
 	mux.Handle("POST /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.PostMessage)))
 }

@@ -15,6 +15,37 @@ const (
 	MaxReportCaseRuns = 2000
 )
 
+// Report-visible triage/coverage classifications (Task 118, Task 122). The
+// platform issue triage is authoritative for the failure conclusion: a
+// failed(application) case_run whose issue triage is done with
+// classification=flaky is automation flakiness, and one classified
+// expected_failure (for example a run that stopped on a real token budget
+// before the step under observation) is an expected failure that must be rerun
+// rather than a product defect. The raw P3 failure_class stays available on
+// the snapshot; the report-visible value is derived through
+// CaseRunSnapshot.EffectiveFailureClass.
+const (
+	// TriageClassificationFlaky is the issue.triage classification that marks a
+	// failure as flaky/automation instead of a product defect.
+	TriageClassificationFlaky = "flaky"
+	// TriageClassificationExpectedFailure is the issue.triage classification
+	// that marks a failure as an expected/not-judged failure (budget or missing
+	// observation) instead of a product defect.
+	TriageClassificationExpectedFailure = "expected_failure"
+	// FailureClassAutomation is the report-visible failure class of a run whose
+	// issue triage is flaky.
+	FailureClassAutomation = "automation"
+	// FailureClassExpectedFailure is the report-visible failure class of a run
+	// whose issue triage is expected_failure. It is deliberately not
+	// "application" and not "automation": the run is neither a product defect
+	// nor flaky automation noise; it needs a rerun to produce a conclusion.
+	FailureClassExpectedFailure = "expected_failure"
+	// CoverageGapExecutionFlaky explains an uncovered case version whose latest
+	// run failed but the platform triage classified that failure as flaky. It
+	// is a flaky gap, not a product coverage failure.
+	CoverageGapExecutionFlaky = "execution_flaky_coverage"
+)
+
 // Stable section names of ReportSnapshot.TruncatedSections.
 const (
 	ReportTruncationIssues   = "issues"
@@ -206,15 +237,24 @@ type SUTCountsSnapshot struct {
 // CaseRunSnapshot is one case_run projection of a report with its failure
 // position, step/assertion counters and evidence metadata (spec §6.1).
 type CaseRunSnapshot struct {
-	ID                   int64
-	VersionID            int64
-	WaveID               int64
-	CaseVersionID        int64
-	CaseTitle            string
-	VersionSUTID         *int64
-	VersionSUTIDs        []int64
-	Status               string
-	FailureClass         string
+	ID            int64
+	VersionID     int64
+	WaveID        int64
+	CaseVersionID int64
+	// RequirementID is the design requirement the case version belongs to. It
+	// connects a case result with the per-requirement coverage projection and
+	// is derived metadata: it is not part of the canonical fingerprint payload.
+	RequirementID int64
+	CaseTitle     string
+	VersionSUTID  *int64
+	VersionSUTIDs []int64
+	Status        string
+	FailureClass  string
+	// TriageClassification is the latest finished platform triage
+	// classification of the issue that references this run (empty when none).
+	// A flaky classification overrides the report-visible classification; the
+	// raw FailureClass remains the execution fact.
+	TriageClassification string
 	Summary              string
 	StepCount            int
 	StepFailedCount      int
@@ -228,6 +268,28 @@ type CaseRunSnapshot struct {
 	StartedAt            *time.Time
 	FinishedAt           *time.Time
 	CreatedAt            time.Time
+}
+
+// EffectiveFailureClass is the failure class a report presents. It is the raw
+// execution class unless the platform triage finished with classification=flaky
+// (automation flakiness) or classification=expected_failure (expected failure,
+// budget/no-judgment, needs a rerun). Neither triage classification is a
+// product/application defect (Task 118, Task 122).
+func (row CaseRunSnapshot) EffectiveFailureClass() string {
+	switch row.TriageClassification {
+	case TriageClassificationFlaky:
+		return FailureClassAutomation
+	case TriageClassificationExpectedFailure:
+		return FailureClassExpectedFailure
+	}
+	return row.FailureClass
+}
+
+// ExpectedFailureTriage reports whether the latest finished issue triage
+// classified this run as expected_failure. The report summary counts it
+// separately from product defects.
+func (row CaseRunSnapshot) ExpectedFailureTriage() bool {
+	return row.TriageClassification == TriageClassificationExpectedFailure
 }
 
 // EvidenceSnapshot is one evidence metadata row of a report. Content bytes and
@@ -257,8 +319,38 @@ type IssueSnapshot struct {
 	MergedIntoID   *int64
 	SourceIssueIDs []int64
 	CaseRunIDs     []int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// TriageStatus/TriageClassification are the latest finished issue.triage
+	// projection. They are display metadata (the issue row itself is never
+	// rewritten by a triage proposal) and let the report honor a flaky
+	// classification instead of presenting the issue as a product defect.
+	TriageStatus         string
+	TriageClassification string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+// FlakyTriage reports whether the latest finished triage classified this issue
+// as flaky. Only a done proposal is authoritative: a degraded/failed run or a
+// non-flaky classification never downgrades a real application defect.
+func (row IssueSnapshot) FlakyTriage() bool {
+	return row.TriageStatus == string(AnalysisStatusDone) &&
+		row.TriageClassification == TriageClassificationFlaky
+}
+
+// ExpectedFailureTriage reports whether the latest finished triage classified
+// this issue as expected_failure. Like FlakyTriage, only a done proposal is
+// authoritative; the stored issue row itself is never rewritten.
+func (row IssueSnapshot) ExpectedFailureTriage() bool {
+	return row.TriageStatus == string(AnalysisStatusDone) &&
+		row.TriageClassification == TriageClassificationExpectedFailure
+}
+
+// OpenProductIssue reports whether this issue is an open issue that the platform
+// triage did not classify as flaky or expected_failure, i.e. the issue counts as
+// an open product defect in the report summary (Task 122). The stored status is
+// never changed by a triage proposal; this is a report-visible projection.
+func (row IssueSnapshot) OpenProductIssue() bool {
+	return row.Status == IssueStatusOpen && !row.FlakyTriage() && !row.ExpectedFailureTriage()
 }
 
 // VersionSUTSnapshot is one version SUT binding used to label report rows
@@ -272,13 +364,38 @@ type VersionSUTSnapshot struct {
 }
 
 // CoverageSnapshot is the P3 execution coverage projection of a version
-// (spec §6.1).
+// (spec §6.1). It counts the newest non-superseded case_run of every executable
+// case version: a superseded process row is not a result.
 type CoverageSnapshot struct {
 	RequirementsTotal   int
 	RequirementsCovered int
 	CaseVersionsTotal   int
 	CaseVersionsCovered int
 	Gaps                []CoverageGapSnapshot
+	// ByRequirement is the per-requirement projection of the same executable
+	// case versions and latest runs (see RequirementCoverageSnapshot). It is
+	// derived metadata: the canonical fingerprint already covers the case
+	// versions, their latest runs and the gaps, so this field is deliberately
+	// absent from the fingerprint payload. Report narrative validation uses it
+	// to prove statements such as "no valid execution" wrong; the report writer
+	// tool exposes its counts so the model quotes instead of inventing them.
+	ByRequirement []RequirementCoverageSnapshot
+}
+
+// RequirementCoverageSnapshot is the deterministic coverage of one requirement,
+// derived strictly from its executable case versions and their latest case_run
+// statuses. CaseVersionsTotal always equals the sum of the four outcome
+// counters: covered, not run, product failed coverage and flaky coverage.
+type RequirementCoverageSnapshot struct {
+	RequirementID              int64
+	CaseVersionsTotal          int
+	CaseVersionsCovered        int
+	CaseVersionsNotRun         int
+	CaseVersionsFailedCoverage int
+	// CaseVersionsFlakyCoverage counts failed latest runs whose issue triage is
+	// flaky. They stay uncovered (a failure is never a pass) but are not a
+	// product coverage failure.
+	CaseVersionsFlakyCoverage int
 }
 
 // CoverageGapSnapshot is one uncovered case version.

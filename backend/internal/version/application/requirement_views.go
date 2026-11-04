@@ -136,6 +136,21 @@ type BatchConfirmResult struct {
 	Skipped   []int64
 }
 
+// RequirementDedupeResult is the duplicate-draft collapse response: one
+// survivor per group is kept and the remaining duplicates are retired
+// (obsolete).
+type RequirementDedupeResult struct {
+	KeptIDs     []int64
+	ObsoleteIDs []int64
+}
+
+// RequirementMergeResult is the duplicate-merge response: the canonical target
+// (with the merged content when it changed) and the retired sources.
+type RequirementMergeResult struct {
+	Requirement RequirementDetail
+	MergedIDs   []int64
+}
+
 // ---------- domain -> view conversions ----------
 
 func toRequirementVersionView(revision version.RequirementVersion) RequirementVersionView {

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"sort"
+	"sync"
 	"time"
 
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -17,6 +18,19 @@ const (
 	WorkTypeAnalyzeFailure  = "analyze.failure"
 	WorkTypeAnalyzeCoverage = "analyze.coverage"
 	TeamExecution           = "execution"
+)
+
+// EventCaseRunBlocked is the 0.2.1 dispatch-health event (spec §5.6): a pending
+// case_run could not be dispatched because no healthy executor is available.
+// It is emitted once per (case_run, reason) until the run is dispatched, so
+// "no executor" never looks like a silent pending row.
+const EventCaseRunBlocked = "case_run.blocked"
+
+// Reasons carried by EventCaseRunBlocked.
+const (
+	BlockedReasonNoExecutor          = "no_executor"
+	BlockedReasonExecutorDegraded    = "executor_degraded"
+	BlockedReasonExecutorUnavailable = "executor_unavailable"
 )
 
 // Scheduler is the deterministic execution planner/reconciler (ARCH §7.1,
@@ -34,15 +48,23 @@ type Scheduler struct {
 	quota       execution.Quota
 	quotaReader QuotaReader
 	analyzer    WaveAnalyzer
+	replanner   SupersededIntentReplanner
 	ids         IDGenerator
 	clock       Clock
 	events      EventPublisher
 	instance    string
 	leaseTTL    time.Duration
+	// blocked deduplicates EventCaseRunBlocked by case_run ID; it holds the
+	// last published reason. A successful dispatch clears the entry.
+	blockedMu sync.Mutex
+	blocked   map[int64]string
 }
 
 // SchedulerDeps wires the scheduler. quotaReader may be nil: the running set is
-// then read from CaseRunRepository.ListRunning. leaseTTL defaults to 30s.
+// then read from CaseRunRepository.ListRunning. LeaseTTL is the dispatch-time
+// case_run lease; it is clamped to at least DefaultCaseLease (the agent-side
+// lease), because the work item may wait in the queue before any agent claims
+// it.
 type SchedulerDeps struct {
 	Intents     IntentRepository
 	Waves       WaveRepository
@@ -59,6 +81,9 @@ type SchedulerDeps struct {
 	Events      EventPublisher
 	Instance    string
 	LeaseTTL    time.Duration
+	// Replanner is the Task 106 stale-intent re-plan (implemented by
+	// *IntentService). nil keeps the P3-only retire behavior.
+	Replanner SupersededIntentReplanner
 }
 
 // NewScheduler builds the scheduler.
@@ -68,8 +93,11 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		quota = execution.QuotaFromSettings(0, 0, 0)
 	}
 	lease := deps.LeaseTTL
-	if lease <= 0 {
-		lease = 30 * time.Second
+	if lease < DefaultCaseLease {
+		// The dispatch lease must outlive the agent lease: a queued work item
+		// can wait behind a busy worker, and Recovery interrupts a running
+		// case_run whose lease expired before the agent even claimed it.
+		lease = DefaultCaseLease
 	}
 	return &Scheduler{
 		intents:     deps.Intents,
@@ -82,11 +110,13 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		quota:       quota,
 		quotaReader: deps.QuotaReader,
 		analyzer:    deps.Analyzer,
+		replanner:   deps.Replanner,
 		ids:         deps.IDs,
 		clock:       deps.Clock,
 		events:      deps.Events,
 		instance:    deps.Instance,
 		leaseTTL:    lease,
+		blocked:     map[int64]string{},
 	}
 }
 
@@ -207,7 +237,11 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		if err != nil {
 			return mapExecutionError(err, "executor")
 		}
-		if executor == nil || !executor.Status.Dispatchable() {
+		if !dispatchableExecutor(executor) {
+			// Do not leave pending case_runs silent (spec §5.6): publish a
+			// visible blocked event per run and stop this tick. A later tick
+			// retries the dispatch once a healthy executor is registered.
+			s.publishBlockedPending(ctx, wave, pending[index:], blockedReason(executor))
 			return nil
 		}
 		intent, err := s.intents.Get(ctx, run.IntentID)
@@ -216,34 +250,22 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		}
 		snapshot, err := s.cases.GetCaseVersion(ctx, wave.VersionID, run.CaseVersionID)
 		if err != nil {
+			if !caseVersionNotExecutable(err) {
+				return mapExecutionError(err, "case version")
+			}
 			// The case left the current+confirmed set between planning and
 			// dispatch: retire the run and intent, never execute stale cases.
-			if _, transitionErr := s.caseRuns.Transition(ctx, run.ID,
-				[]execution.CaseRunStatus{execution.CaseRunPending}, execution.CaseRunSuperseded, 0, ""); transitionErr != nil {
-				return mapExecutionError(transitionErr, "case run")
+			// Task 106 also re-queues the same logical case's replacement
+			// confirmed revision and persists the supersede reason on the run so
+			// the drop is visible in the wave/UI/report.
+			result, err := s.supersedeStaleIntent(ctx, intent)
+			if err != nil {
+				return err
 			}
-			publishEvent(ctx, s.events, EventCaseRunFinished, wave.VersionID,
-				map[string]any{"case_run_id": platformid.Format(run.ID), "intent_id": platformid.Format(intent.ID)},
-				map[string]any{
-					"case_run_id": platformid.Format(run.ID),
-					"wave_id":     platformid.Format(wave.ID),
-					"status":      string(execution.CaseRunSuperseded),
-					"reason":      "not_current_confirmed",
-				}, nil)
-			if _, transitionErr := s.intents.Transition(ctx, intent.ID,
-				activeIntentStatuses, execution.IntentSuperseded); transitionErr != nil {
-				return mapExecutionError(transitionErr, "intent")
+			if _, err := retireSupersededRun(ctx, s.caseRuns, s.events, wave.VersionID, run,
+				result.ReplacementCaseVersionID, result.Replanned); err != nil {
+				return err
 			}
-			publishEvent(ctx, s.events, EventIntentSuperseded, wave.VersionID,
-				map[string]any{
-					"intent_id":       platformid.Format(intent.ID),
-					"case_version_id": platformid.Format(intent.CaseVersionID),
-				},
-				map[string]any{
-					"intent_id":       platformid.Format(intent.ID),
-					"case_version_id": platformid.Format(intent.CaseVersionID),
-					"reason":          "not_current_confirmed",
-				}, nil)
 			continue
 		}
 		sutIDs := intent.VersionSUTIDs
@@ -275,6 +297,7 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		if _, err := s.caseRuns.Update(ctx, run); err != nil {
 			return mapExecutionError(err, "case run")
 		}
+		s.clearBlocked(run.ID)
 		// Reserve the slots in the local usage snapshot so the next candidate
 		// of this tick sees the one-shot reservation.
 		usage = append(usage, candidate)
@@ -425,6 +448,81 @@ func isInfraFailure(class execution.FailureClass) bool {
 	default:
 		return false
 	}
+}
+
+// dispatchableExecutor reports whether a selected instance may start new
+// case_runs. A degraded executor keeps Status=active (it still heartbeat for
+// cleanup) but must not receive new work, and draining/offline rows are never
+// dispatchable.
+func dispatchableExecutor(executor *execution.ExecutorInstance) bool {
+	return executor != nil && executor.Status.Dispatchable() && !isDegradedExecutor(executor)
+}
+
+// isDegradedExecutor reads the explicit degraded health marker the registry
+// keeps on the row (executor health status, not last_error text: a degraded
+// /healthz reply is not required to carry an error message). A healthy poll or
+// heartbeat clears the marker again.
+func isDegradedExecutor(executor *execution.ExecutorInstance) bool {
+	return executor != nil && executor.Degraded()
+}
+
+// blockedReason maps the unavailable executor to the blocked-event reason.
+func blockedReason(executor *execution.ExecutorInstance) string {
+	switch {
+	case executor == nil:
+		return BlockedReasonNoExecutor
+	case !executor.Status.Dispatchable():
+		return BlockedReasonExecutorUnavailable
+	case isDegradedExecutor(executor):
+		return BlockedReasonExecutorDegraded
+	default:
+		return BlockedReasonExecutorUnavailable
+	}
+}
+
+// publishBlockedPending publishes one deduplicated blocked event per pending
+// case_run of the wave.
+func (s *Scheduler) publishBlockedPending(ctx context.Context, wave execution.RunWave, runs []execution.CaseRun, reason string) {
+	action := "等待执行器恢复后重试"
+	if reason == BlockedReasonNoExecutor {
+		action = "等待执行器注册后重试"
+	}
+	for _, run := range runs {
+		if !s.markBlocked(run.ID, reason) {
+			continue
+		}
+		publishEvent(ctx, s.events, EventCaseRunBlocked, wave.VersionID,
+			map[string]any{
+				"wave_id":     platformid.Format(wave.ID),
+				"case_run_id": platformid.Format(run.ID),
+				"intent_id":   platformid.Format(run.IntentID),
+			},
+			map[string]any{
+				"wave_id":     platformid.Format(wave.ID),
+				"case_run_id": platformid.Format(run.ID),
+				"intent_id":   platformid.Format(run.IntentID),
+				"reason":      reason,
+				"action":      action,
+			}, nil)
+	}
+}
+
+// markBlocked reports whether this (case_run, reason) pair must be published.
+func (s *Scheduler) markBlocked(caseRunID int64, reason string) bool {
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	if previous, ok := s.blocked[caseRunID]; ok && previous == reason {
+		return false
+	}
+	s.blocked[caseRunID] = reason
+	return true
+}
+
+// clearBlocked forgets the blocked state once the run is dispatched.
+func (s *Scheduler) clearBlocked(caseRunID int64) {
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	delete(s.blocked, caseRunID)
 }
 
 // requiredContextCount is the number of executor contexts a case needs: one per

@@ -1,4 +1,15 @@
-import { apiGet, apiGetPage, apiPatch, apiPost, apiUpload } from "@/lib/api-client"
+import type { StageView } from "@/features/design/types"
+import {
+  type ApiDownload,
+  type ApiPage,
+  apiDelete,
+  apiDownload,
+  apiGet,
+  apiGetPage,
+  apiPatch,
+  apiPost,
+  apiUpload,
+} from "@/lib/api-client"
 
 import type {
   BatchConfirmResult,
@@ -9,9 +20,12 @@ import type {
   ConversationSummary,
   CreateConversationRequest,
   PostMessageRequest,
+  ReopenRequirementRequest,
   Requirement,
   RequirementCreateRequest,
+  RequirementDedupeResult,
   RequirementDetail,
+  RequirementMergeResult,
   RequirementRelation,
   RequirementStatus,
   RequirementUpdateRequest,
@@ -72,19 +86,22 @@ export function getConversation(versionId: string, conversationId: string): Prom
   return apiGet<Conversation>(conversationPath(versionId, conversationId))
 }
 
-/** Loads the conversation thread in ascending id order. */
-export async function listMessages(
+/**
+ * Loads one page of the conversation thread in ascending id order and keeps the
+ * server pagination envelope (`next_cursor`/`has_more`). The history cursor must
+ * come from here, never from the last live/optimistic message in the thread.
+ */
+export function listMessages(
   versionId: string,
   conversationId: string,
   options: { after?: string; limit?: number } = {},
-): Promise<ConversationMessage[]> {
-  const page = await apiGetPage<ConversationMessage>(
+): Promise<ApiPage<ConversationMessage>> {
+  return apiGetPage<ConversationMessage>(
     `${conversationPath(versionId, conversationId)}/messages${query({
       after: options.after,
       limit: options.limit ?? 100,
     })}`,
   )
-  return page.items
 }
 
 /** Appends one user message (text and/or attachments). */
@@ -160,6 +177,57 @@ export function confirmRequirements(
   })
 }
 
+/**
+ * Retires one draft requirement (obsolete, history kept). The server rejects
+ * clarified/closed requirements with a typed 409, so confirmed requirements can
+ * never be deleted through this path.
+ */
+export function deleteRequirement(
+  versionId: string,
+  requirementId: string,
+): Promise<RequirementDetail> {
+  return apiDelete<RequirementDetail>(requirementPath(versionId, requirementId))
+}
+
+/**
+ * Collapses duplicate draft requirements of a version. The server keeps the
+ * lowest ID per duplicate group and retires the rest; confirmed requirements are
+ * never touched.
+ */
+export function dedupeRequirements(versionId: string): Promise<RequirementDedupeResult> {
+  return apiPost<RequirementDedupeResult>(`${versionPath(versionId)}/requirements/dedupe`)
+}
+
+/**
+ * Folds the selected draft sources into the canonical draft target. The target
+ * must still be a draft; clarified/closed targets or sources are a typed 409.
+ */
+export function mergeRequirements(
+  versionId: string,
+  targetRequirementId: string,
+  sourceRequirementIds: string[],
+): Promise<RequirementMergeResult> {
+  return apiPost<RequirementMergeResult>(`${versionPath(versionId)}/requirements/merge`, {
+    target_requirement_id: targetRequirementId,
+    source_requirement_ids: sourceRequirementIds,
+  })
+}
+
+/**
+ * Applies the 0.2.1 requirement hard gate for the selected clarified
+ * requirements (`POST /stage/confirm-requirements`, spec §5.5): the version
+ * advances requirement_review -> designing and a design.cases entry job is
+ * enqueued. This is the "开始设计" action, not a plain confirmation.
+ */
+export function confirmStageRequirements(
+  versionId: string,
+  requirementIds: string[],
+): Promise<StageView> {
+  return apiPost<StageView>(`${versionPath(versionId)}/stage/confirm-requirements`, {
+    requirement_ids: requirementIds,
+  })
+}
+
 /** Rolls a clarified requirement back to a new draft revision. */
 export function rollbackRequirement(
   versionId: string,
@@ -170,6 +238,19 @@ export function rollbackRequirement(
     `${requirementPath(versionId, requirementId)}/rollback`,
     payload,
   )
+}
+
+/**
+ * Reopens a closed requirement (closed -> draft) with a mandatory reason. This
+ * is the explicit recovery path behind a closed-requirement retry 409; it does
+ * not confirm or move the version stage.
+ */
+export function reopenRequirement(
+  versionId: string,
+  requirementId: string,
+  payload: ReopenRequirementRequest,
+): Promise<RequirementDetail> {
+  return apiPost<RequirementDetail>(`${requirementPath(versionId, requirementId)}/reopen`, payload)
 }
 
 export async function listRequirementRelations(
@@ -204,4 +285,13 @@ export function uploadContent(file: File): Promise<ContentObject> {
   const form = new FormData()
   form.append("file", file)
   return apiUpload<ContentObject>("/api/content", form)
+}
+
+/**
+ * Downloads an uploaded image through the authenticated content endpoint.
+ * `GET /api/content/{sha256}` requires the bearer token, so the UI loads image
+ * parts as an object URL instead of a bare `<img src>`.
+ */
+export function downloadContent(sha256: string): Promise<ApiDownload> {
+  return apiDownload(`/api/content/${encodeURIComponent(sha256)}`)
 }

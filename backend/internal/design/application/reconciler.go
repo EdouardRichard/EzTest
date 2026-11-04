@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
@@ -21,9 +22,46 @@ func (p *Planner) Reconcile(ctx context.Context) error {
 	for _, versionID := range versionIDs {
 		if err := p.ScanVersion(ctx, versionID); err != nil {
 			failures = append(failures, fmt.Errorf("scan design version %d: %w", versionID, err))
+			continue
+		}
+		// Design completion: once the scan observed usable coverage for every
+		// activated requirement, the version leaves designing for the case hard
+		// gate. The stage machine only acts at designing, so a repeat pass is a
+		// no-op.
+		if err := p.convergeCompleteDesign(ctx, versionID); err != nil {
+			failures = append(failures, fmt.Errorf("converge design version %d: %w", versionID, err))
 		}
 	}
 	return errors.Join(failures...)
+}
+
+// convergeCompleteDesign applies the designing -> case_review edge when every
+// activated, still-clarified requirement has usable case coverage (a scenario
+// and a current draft/confirmed case, no stale current case). Missing coverage
+// or an uncovered requirement leaves the version designing; the stage machine is
+// the final guard and only transitions a version that is still designing.
+func (p *Planner) convergeCompleteDesign(ctx context.Context, versionID int64) error {
+	if p == nil || p.converger == nil {
+		return nil
+	}
+	coverage, err := p.repo.ListRequirementCoverage(ctx, versionID)
+	if err != nil {
+		return mapDesignError(err, "version")
+	}
+	considered := 0
+	for _, item := range coverage {
+		if !strings.EqualFold(strings.TrimSpace(item.Requirement.Status), "clarified") {
+			continue
+		}
+		considered++
+		if NeedsRedesign(item) {
+			return nil
+		}
+	}
+	if considered == 0 {
+		return nil
+	}
+	return p.converger.ConvergeDesign(ctx, versionID)
 }
 
 // ScanVersion applies the deterministic design reconciler rules of spec §9.1:
@@ -69,13 +107,13 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 			if _, err := p.activateScopes(ctx, versionID, round.ID, pending); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending"); err != nil {
+			if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending", latestConversation, round.ID); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed"); err != nil {
+			if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 				return err
 			}
-			if err := p.ensureRoundTask(ctx, versionID, round.ID, latestConversation); err != nil {
+			if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation, scope); err != nil {
 				return err
 			}
 			p.markRunning(ctx, versionID)
@@ -98,7 +136,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 			if err := p.repo.UpdateRoundRequirements(ctx, round.ID, mergedIDs, mergedVersions); err != nil {
 				return err
 			}
-			if err := p.ensureRequirementTasks(ctx, versionID, activated, "auto_new"); err != nil {
+			if err := p.ensureRequirementTasks(ctx, versionID, activated, "auto_new", latestConversation, round.ID); err != nil {
 				return err
 			}
 			p.publish(ctx, versionID, "design.scope_activated", map[string]any{
@@ -111,10 +149,10 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 		if err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed"); err != nil {
+		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round.ID, latestConversation); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, *round, latestConversation, requirementRefsUnion(activated, redesign)); err != nil {
 			return err
 		}
 		return p.ensureCriticAndDataPlanTasks(ctx, versionID)
@@ -186,10 +224,10 @@ func (p *Planner) autoStartIfEnabled(ctx context.Context, versionID int64) error
 		if _, err := p.activateScopes(ctx, versionID, round.ID, pending); err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, pending, "auto_new"); err != nil {
+		if err := p.ensureRequirementTasks(ctx, versionID, pending, "auto_new", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round.ID, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID, pending); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {

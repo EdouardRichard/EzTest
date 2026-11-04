@@ -40,6 +40,22 @@ func sectionNames(packet agentapp.ContextPacket) []string {
 	return names
 }
 
+// packetContent joins the persisted context packet sections. The cache-first
+// packet stores the injected knowledge inside its pinned facts segment, so the
+// runner assertions search the persisted content instead of a P1 section name.
+func packetContent(packet agentapp.ContextPacket) string {
+	var builder strings.Builder
+	for _, section := range packet.Sections {
+		builder.WriteString(section.Content)
+		builder.WriteString("\n")
+	}
+	return builder.String()
+}
+
+func packetReferencesKnowledge(packet agentapp.ContextPacket) bool {
+	return strings.Contains(packetContent(packet), "[K-")
+}
+
 func TestContextBuildRendersKnowledgeSection(t *testing.T) {
 	in := sampleInput()
 	in.VersionPack.Knowledge = knowledgeRefs()
@@ -255,7 +271,7 @@ func TestRunnerInjectsKnowledgeAndRecordsUsageOnce(t *testing.T) {
 		t.Fatalf("context packets = %d", len(fixture.repo.packets))
 	}
 	packet := fixture.repo.packets[0]
-	if !strings.Contains(sectionByName(t, packet, "knowledge").Content, "[K-7001]") {
+	if !strings.Contains(packetContent(packet), "[K-7001]") {
 		t.Fatalf("persisted packet misses injected knowledge: %#v", packet.Sections)
 	}
 
@@ -287,8 +303,8 @@ func TestRunnerTreatsKnowledgeUsageFailureAsLogOnly(t *testing.T) {
 	if fixture.knowledgeUsage.calls != 1 {
 		t.Fatalf("knowledge usage calls = %d, want 1", fixture.knowledgeUsage.calls)
 	}
-	if !strings.Contains(sectionByName(t, fixture.repo.packets[0], "knowledge").Content, "[K-7001]") {
-		t.Fatal("knowledge section lost after a usage failure")
+	if !strings.Contains(packetContent(fixture.repo.packets[0]), "[K-7001]") {
+		t.Fatal("knowledge content lost after a usage failure")
 	}
 }
 
@@ -304,8 +320,8 @@ func TestRunnerContinuesWhenKnowledgeRetrievalFails(t *testing.T) {
 	if result.Status != agent.AgentRunDone {
 		t.Fatalf("result = %#v", result)
 	}
-	if _, ok := findSection(fixture.repo.packets[0], "knowledge"); ok {
-		t.Fatal("knowledge section rendered after a retrieval failure")
+	if packetReferencesKnowledge(fixture.repo.packets[0]) {
+		t.Fatal("knowledge content rendered after a retrieval failure")
 	}
 	if fixture.knowledgeUsage.calls != 0 {
 		t.Fatalf("usage recorded without injected refs: %d", fixture.knowledgeUsage.calls)

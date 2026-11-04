@@ -25,7 +25,8 @@ func passingVersionCloseInput() version.VersionCloseInput {
 			{ID: 1001, VersionID: 701, Status: version.RequirementClosed},
 			{ID: 1002, VersionID: 701, Status: version.RequirementObsolete},
 		},
-		Report: publishedVersionReport(),
+		Report:           publishedVersionReport(),
+		HasExecutionData: true,
 	}
 }
 
@@ -39,6 +40,7 @@ func allVersionCloseConditions() version.ClosePredicate {
 		NoInflightCaseRuns:     true,
 		RequirementsClosed:     true,
 		VersionReportPublished: true,
+		HasExecutionData:       true,
 	}
 }
 
@@ -167,6 +169,26 @@ func TestClosePredicateRequiresEveryCondition(t *testing.T) {
 			},
 			want: wantVersionClosePredicate(func(p *version.ClosePredicate) { p.VersionReportPublished = false }),
 		},
+		{
+			name: "no execution data blocks close",
+			mutate: func(in *version.VersionCloseInput) {
+				in.HasExecutionData = false
+			},
+			want: wantVersionClosePredicate(func(p *version.ClosePredicate) {
+				p.HasExecutionData = false
+				p.VersionReportPublished = false
+			}),
+		},
+		{
+			name: "unconfirmed cases block close",
+			mutate: func(in *version.VersionCloseInput) {
+				in.UnconfirmedCases = 2
+			},
+			want: wantVersionClosePredicate(func(p *version.ClosePredicate) {
+				p.UnconfirmedCases = 2
+				p.NoInflightCaseRuns = false
+			}),
+		},
 	}
 
 	for _, tc := range cases {
@@ -196,6 +218,8 @@ func TestClosePredicatePassedRequiresAll(t *testing.T) {
 		{"in-flight case runs", func(p *version.ClosePredicate) { p.NoInflightCaseRuns = false }},
 		{"requirements", func(p *version.ClosePredicate) { p.RequirementsClosed = false }},
 		{"version report", func(p *version.ClosePredicate) { p.VersionReportPublished = false }},
+		{"execution data", func(p *version.ClosePredicate) { p.HasExecutionData = false }},
+		{"unconfirmed cases", func(p *version.ClosePredicate) { p.UnconfirmedCases = 1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			predicate := allVersionCloseConditions()
@@ -245,6 +269,17 @@ func TestVersionCloseFailureCounts(t *testing.T) {
 			mutate: func(*version.VersionCloseInput) {},
 			want:   map[string]int{},
 		},
+		{
+			name: "missing execution data and unconfirmed cases fold into the frozen checks",
+			mutate: func(in *version.VersionCloseInput) {
+				in.HasExecutionData = false
+				in.UnconfirmedCases = 3
+			},
+			want: map[string]int{
+				version.VersionCloseCheckVersionReportPublished: 1,
+				version.VersionCloseCheckNoInflightCaseRuns:     3,
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -292,6 +327,8 @@ func TestVersionCloseFingerprintChangesWithPredicateInput(t *testing.T) {
 		{"open human requests", func(in *version.VersionCloseInput) { in.OpenHumanRequests = 1 }},
 		{"active waves", func(in *version.VersionCloseInput) { in.ActiveWaves = 1 }},
 		{"in-flight case runs", func(in *version.VersionCloseInput) { in.InflightCaseRuns = 1 }},
+		{"execution data", func(in *version.VersionCloseInput) { in.HasExecutionData = false }},
+		{"unconfirmed cases", func(in *version.VersionCloseInput) { in.UnconfirmedCases = 1 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -299,6 +336,58 @@ func TestVersionCloseFingerprintChangesWithPredicateInput(t *testing.T) {
 			tc.mutate(&input)
 			if got := version.VersionCloseFingerprint(input); got == fingerprint {
 				t.Fatalf("fingerprint did not change when %s changed", tc.name)
+			}
+		})
+	}
+}
+
+func TestCompletionPredicateBlocksOnOpenBlocker(t *testing.T) {
+	cases := []struct {
+		name      string
+		mutate    func(*version.VersionCloseInput)
+		wantCheck string
+		wantCount int
+	}{
+		{
+			name:      "open human request",
+			mutate:    func(in *version.VersionCloseInput) { in.OpenHumanRequests = 1 },
+			wantCheck: version.VersionCloseCheckNoOpenHumanRequests,
+			wantCount: 1,
+		},
+		{
+			name:      "open blocking work items",
+			mutate:    func(in *version.VersionCloseInput) { in.BlockingWorkItems = 2 },
+			wantCheck: version.VersionCloseCheckNoBlockingWorkItems,
+			wantCount: 2,
+		},
+		{
+			name:      "unconfirmed confirmed-case",
+			mutate:    func(in *version.VersionCloseInput) { in.UnconfirmedCases = 1 },
+			wantCheck: version.VersionCloseCheckNoInflightCaseRuns,
+			wantCount: 1,
+		},
+		{
+			name:      "missing execution data",
+			mutate:    func(in *version.VersionCloseInput) { in.HasExecutionData = false },
+			wantCheck: version.VersionCloseCheckVersionReportPublished,
+			wantCount: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := passingVersionCloseInput()
+			tc.mutate(&input)
+			predicate := version.EvaluateVersionClose(input)
+			if predicate.Passed() {
+				t.Fatalf("predicate passed with %s", tc.name)
+			}
+			if predicate.HasExecutionData != input.HasExecutionData ||
+				predicate.UnconfirmedCases != input.UnconfirmedCases {
+				t.Fatalf("predicate execution projection = %+v, want %+v", predicate, input)
+			}
+			failed := version.VersionCloseFailureCounts(input)
+			if failed[tc.wantCheck] != tc.wantCount {
+				t.Fatalf("failed[%q] = %d, want %d (%#v)", tc.wantCheck, failed[tc.wantCheck], tc.wantCount, failed)
 			}
 		})
 	}
