@@ -72,6 +72,16 @@ func Definitions(executorURL string) []settings.Definition {
 	minInjectionItems, maxInjectionItems := numberRange(0, 50)
 	minGCInterval, maxGCInterval := numberRange(5, 10080)
 	minGCBatch, maxGCBatch := numberRange(1, 5000)
+	minCompactionThreshold, maxCompactionThreshold := numberRange(0.5, 0.9)
+	minCompactionRetain, maxCompactionRetain := numberRange(0.05, 0.5)
+	minSummaryTokens, maxSummaryTokens := numberRange(256, 8192)
+	minOverflowRetries, maxOverflowRetries := numberRange(0, 5)
+	minVisionImages, maxVisionImages := numberRange(1, 500)
+	minImageBytes, maxImageBytes := numberRange(1024, 104857600)
+	minToolRetries, maxToolRetries := numberRange(0, 5)
+	minQuestionTimeout, maxQuestionTimeout := numberRange(60, 604800)
+	minGCRetentionDays, maxGCRetentionDays := numberRange(1, 3650)
+	minGCGraceDays, maxGCGraceDays := numberRange(0, 365)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
@@ -122,10 +132,22 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "llm.request_timeout_seconds", Category: "llm", Type: settings.TypeNumber, Default: num(60), Integer: true, Min: number(1, 0), Description: "Default LLM request timeout."},
 		{Key: "llm.max_retries", Category: "llm", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: number(0, 0), Description: "Default LLM retry count."},
 
-		{Key: "context.window_tokens", Category: "context", Type: settings.TypeNumber, Default: num(64000), Integer: true, Min: number(1024, 0), Description: "Model context window used by the context budgeter."},
+		{Key: "tool.retry_max", Category: "tool", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minToolRetries, Max: maxToolRetries, Description: "Automatic retries for retryable tool errors before the error card surfaces."},
+		{Key: "question.timeout_seconds", Category: "question", Type: settings.TypeNumber, Default: num(86400), Integer: true, Min: minQuestionTimeout, Max: maxQuestionTimeout, Description: "Human-request question expiry; questions never block execution (24h default, C-2)."},
+
+		{Key: "vision.required", Category: "vision", Type: settings.TypeBool, Default: boolean(true), Description: "Require a vision-capable model for image-bearing work; never silently degrade to text."},
+		{Key: "vision.max_images_per_attachment", Category: "vision", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minVisionImages, Max: maxVisionImages, Description: "Maximum images extracted from one attachment; excess images are reported as skipped."},
+		{Key: "vision.max_image_bytes", Category: "vision", Type: settings.TypeNumber, Default: num(10 * 1024 * 1024), Integer: true, Min: minImageBytes, Max: maxImageBytes, Description: "Maximum single image size in bytes accepted by the vision pipeline (10 MiB default)."},
+
+		{Key: "context.window_tokens", Category: "context", Type: settings.TypeNumber, Default: num(128000), Integer: true, Min: number(1024, 0), Description: "Model context window used by the context budgeter."},
 		{Key: "context.output_reserve_tokens", Category: "context", Type: settings.TypeNumber, Default: num(8000), Integer: true, Min: number(0, 0), Description: "Tokens reserved for the model response."},
 		{Key: "context.compact_threshold", Category: "context", Type: settings.TypeNumber, Default: num(0.7), Min: minThreshold, Max: maxThreshold, Description: "Usage ratio that triggers rolling summarization."},
 		{Key: "context.keep_recent_messages", Category: "context", Type: settings.TypeNumber, Default: num(12), Integer: true, Min: number(0, 0), Description: "Recent messages kept verbatim during compaction."},
+
+		{Key: "compaction.threshold_ratio", Category: "compaction", Type: settings.TypeNumber, Default: num(0.8), Min: minCompactionThreshold, Max: maxCompactionThreshold, Description: "Usable-context usage ratio that triggers automatic compaction (spec formula 0.80)."},
+		{Key: "compaction.retain_ratio", Category: "compaction", Type: settings.TypeNumber, Default: num(0.16), Min: minCompactionRetain, Max: maxCompactionRetain, Description: "Fraction of the usable context kept verbatim after compaction (spec formula 0.16)."},
+		{Key: "compaction.summary_max_tokens", Category: "compaction", Type: settings.TypeNumber, Default: num(8192), Integer: true, Min: minSummaryTokens, Max: maxSummaryTokens, Description: "Maximum output tokens for one compaction summary; the budget formula also caps it at 8192."},
+		{Key: "compaction.overflow_retries", Category: "compaction", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minOverflowRetries, Max: maxOverflowRetries, Description: "Forced-compaction retries after a provider context-overflow error."},
 
 		{Key: "team_room.digest_every_n_posts", Category: "team_room", Type: settings.TypeNumber, Default: num(20), Integer: true, Min: number(1, 0), Description: "Generate a team-room digest every N posts."},
 		{Key: "team_room.digest_interval_minutes", Category: "team_room", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: number(1, 0), Description: "Generate a team-room digest at least every N minutes."},
@@ -139,6 +161,11 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "retention.gc_interval_minutes", Category: "retention", Type: settings.TypeNumber, Default: num(1440), Integer: true, Min: minGCInterval, Max: maxGCInterval, Description: "Interval between leader-scheduled GC runs in minutes."},
 		{Key: "retention.gc_batch_size", Category: "retention", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minGCBatch, Max: maxGCBatch, Description: "Maximum candidate rows scanned by one GC pass."},
 		{Key: "retention.event_days", Category: "retention", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: minEventDays, Max: maxEventDays, Description: "Event-log retention in days; the leader-gated cleanup deletes older rows in batches."},
+
+		{Key: "gc.retention_days", Category: "gc", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minGCRetentionDays, Max: maxGCRetentionDays, Description: "Days a storage object is retained before GC may reclaim it."},
+		{Key: "gc.max_bytes", Category: "gc", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: number(0, 0), Description: "Maximum managed storage in bytes for GC; 0 means unlimited."},
+		{Key: "gc.dry_run", Category: "gc", Type: settings.TypeBool, Default: boolean(true), Description: "Run GC in dry-run mode (list candidates, delete nothing) by default."},
+		{Key: "gc.grace_days", Category: "gc", Type: settings.TypeNumber, Default: num(7), Integer: true, Min: minGCGraceDays, Max: maxGCGraceDays, Description: "Grace period in days between marking an object for deletion and reclaiming it."},
 
 		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("2"), Description: "Built-in report template version (\"1\" or \"2\")."},
 		{Key: "report.render_pdf", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Render PDF alongside the authoritative HTML report."},
