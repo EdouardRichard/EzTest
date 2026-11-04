@@ -2,6 +2,7 @@ package agentapp
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -106,6 +107,14 @@ func (r *Runner) assembleContextWithKeepRecent(
 		// summary of this round only.
 		request.Invalidation = invalidation
 		request.Previous = withConversationSummary(previous, state.input.Conversation.Summary)
+		// R-A5-9: the pinned task context is rebuilt from state.input and
+		// re-injected independently of the summary. The block lands in the
+		// pinned facts segment, ahead of the rolling summary and the retained
+		// recent turns, so compaction can never fold the goal, constraints,
+		// acceptance criteria, scope or ids into the summary.
+		if reinjection := assembleAfterCompaction(newCompactionState(state)); reinjection != "" {
+			request.Facts = append(request.Facts, reinjection)
+		}
 		rebuilt, rebuildErr := assembler.Build(ctx, request)
 		if rebuildErr != nil {
 			return contextAssembly{}, rebuildErr
@@ -477,4 +486,83 @@ func (r *Runner) applyProviderCacheStats(ctx context.Context, state *runState, u
 		payload["conversation_id"] = idText(state.payload.ConversationID)
 	}
 	r.publish(state, "context.cache_stats", payload)
+}
+
+// compactionState is the pinned material of one post-compaction rebuild
+// (R-A5-4/R-A5-9). It is derived from the run input, never from the rolling
+// summary or the folded transcript: Task is the per-work-item task context,
+// Plan/Facts are the DB truth snapshots and Briefing is the derived version
+// briefing. PinnedFacts defaults to Input.Conversation.PinnedFacts when nil.
+type compactionState struct {
+	Input          ContextInput
+	WorkItemID     int64
+	RequirementIDs []int64
+	CaseIDs        []int64
+	Plan           []agentcontext.PlanItemSnapshot
+	Facts          []agentcontext.FactSnapshot
+	Briefing       string
+	PinnedFacts    []string
+}
+
+// newCompactionState derives the reinjection input from the runner state. Task
+// 36 may fill Plan/Facts from the briefing source; the task context, work item
+// id and requirement/case ids are always rebuilt from state.input/payload.
+func newCompactionState(state *runState) compactionState {
+	if state == nil {
+		return compactionState{}
+	}
+	reinjection := compactionState{
+		Input:      state.input,
+		WorkItemID: state.item.ID,
+	}
+	if state.payload.RequirementID > 0 {
+		reinjection.RequirementIDs = []int64{state.payload.RequirementID}
+	}
+	if state.payload.CaseID > 0 {
+		reinjection.CaseIDs = []int64{state.payload.CaseID}
+	}
+	return reinjection
+}
+
+// assembleAfterCompaction renders the R-A5-6/R-A5-9 pinned suffix block that is
+// re-injected after a compaction: the task context rebuilt from state.input, the
+// pinned facts (≤20), the plan/fact snapshots and the derived briefing. It
+// renders pinned material only, so the folded history can never leak back into
+// the prompt through this path.
+func assembleAfterCompaction(state compactionState) string {
+	lines := []string{"压缩后重注入（pinned task context，来自 state.input，不依赖摘要）"}
+	lines = append(lines, summaryTaskContextLines(
+		state.Input.Task, state.WorkItemID, state.RequirementIDs, state.CaseIDs, nil)...)
+
+	pinnedFacts := state.PinnedFacts
+	if pinnedFacts == nil {
+		pinnedFacts = state.Input.Conversation.PinnedFacts
+	}
+	pinnedFacts = capPinnedFacts(pinnedFacts)
+	lines = append(lines, fmt.Sprintf("pinned_facts (%d/%d):", len(pinnedFacts), MaxPinnedFacts))
+	if len(pinnedFacts) == 0 {
+		lines = append(lines, "- "+summaryNoneText)
+	}
+	for _, fact := range pinnedFacts {
+		if line := summaryOneLine(fact); line != "" {
+			lines = append(lines, "- "+line)
+		}
+	}
+	if len(state.Plan) > 0 {
+		lines = append(lines, "plan:")
+		for _, item := range state.Plan {
+			lines = append(lines, summaryPlanItemLine(item))
+		}
+	}
+	if len(state.Facts) > 0 {
+		lines = append(lines, "facts:")
+		for _, fact := range state.Facts {
+			lines = append(lines, summaryFactLine(fact))
+		}
+	}
+	if briefing := strings.TrimSpace(state.Briefing); briefing != "" {
+		lines = append(lines, "briefing:")
+		lines = append(lines, briefing)
+	}
+	return strings.Join(lines, "\n")
 }

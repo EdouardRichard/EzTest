@@ -3,8 +3,20 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"unicode/utf8"
 )
+
+// ImageSkippedMarker renders the R-A5-5 placeholder a compaction summary uses
+// for an image that is not folded into the summary. The image bytes never enter
+// the summary; the attachment id is the lazy re-read handle. A missing
+// (zero/unknown) id is rendered as "unknown" instead of fabricating an id.
+func ImageSkippedMarker(attachmentID int64) string {
+	if attachmentID <= 0 {
+		return "[image skipped: attachment_id=unknown]"
+	}
+	return fmt.Sprintf("[image skipped: attachment_id=%d]", attachmentID)
+}
 
 type attachmentList struct{ deps Deps }
 
