@@ -3,11 +3,16 @@ package tools
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
@@ -42,14 +47,26 @@ const maxGraphConvergeRetries = 2
 
 var graphHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// proposalIDPattern keeps proposal_id stable and cheap to key an idempotency
+// cache on; it intentionally rejects whitespace and control characters.
+var proposalIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
 // GraphProposal is the parsed, tool-validated case.graph_propose payload. IDs
 // are parsed to int64 here; the design adapter maps this into its own input.
 type GraphProposal struct {
 	RequirementID        int64
 	RequirementVersionID int64
 	BaseGraphHash        string
-	Scenarios            []ScenarioProposal
-	Cases                []CaseProposal
+	// ProposalID/BaseRevision implement the v0.22 E-1 idempotency contract
+	// (R-E1-5) at the tool boundary. The design context keys idempotency on the
+	// natural case key; the tool additionally replays the same result for a
+	// repeated proposal_id and rejects a stale base_revision before writing.
+	ProposalID string
+	// BaseRevision is the requirement revision the proposal was composed
+	// against (1-based). Zero means "not supplied".
+	BaseRevision int
+	Scenarios    []ScenarioProposal
+	Cases        []CaseProposal
 }
 
 // ScenarioProposal is one scenario node in a graph proposal.
@@ -160,6 +177,8 @@ type graphProposalPayload struct {
 	RequirementID        string            `json:"requirement_id"`
 	RequirementVersionID string            `json:"requirement_version_id"`
 	BaseGraphHash        *string           `json:"base_graph_hash"`
+	ProposalID           *string           `json:"proposal_id"`
+	BaseRevision         *int              `json:"base_revision"`
 	Scenarios            []scenarioPayload `json:"scenarios"`
 	Cases                []casePayload     `json:"cases"`
 	// Sources is the proposal-level default provenance. The schema accepts it
@@ -302,12 +321,35 @@ func (t *designGraphRead) Execute(ctx context.Context, scope Scope, raw json.Raw
 	return result, nil
 }
 
-type caseGraphPropose struct{ deps Deps }
+// caseGraphProposalCacheEntry is one successful proposal result replayed for a
+// duplicate proposal_id within the same run-scoped registry. The digest makes a
+// proposal_id collision (same id, different payload) a visible conflict instead
+// of silently returning someone else's result.
+type caseGraphProposalCacheEntry struct {
+	digest string
+	result any
+}
+
+type caseGraphPropose struct {
+	deps Deps
+
+	mu        sync.Mutex
+	proposals map[string]caseGraphProposalCacheEntry
+}
 
 func (t *caseGraphPropose) Name() string { return ToolCaseGraphPropose }
 
 func (t *caseGraphPropose) Description() string {
-	return "提交场景/用例草案（case.graph_propose）。只能创建或更新 draft；不能确认、删除或用例状态变更。scenarios[].id/cases[].id 更新已有节点时传入，新建时省略。sources 放在每个 case 内；也可在顶层传一份作为所有用例的默认来源。sources.kind=requirement 时 ref_id 必须是 requirement_version_id（当前需求版本 ID），不是 requirement_id。每条步骤与断言都必须有非空的 expected（可观察的成功判据）。"
+	return "提交场景/用例草案（case.graph_propose）。只能创建或更新 draft；不能确认、删除或用例状态变更。" +
+		"合法顶层字段：requirement_id、requirement_version_id、base_graph_hash、proposal_id、base_revision、scenarios、cases、sources；每个字段的说明/取值见 Parameters schema。" +
+		"scenarios[].id/cases[].id 更新已有节点时传入，新建时省略。sources 放在每个 case 内；也可在顶层传一份作为所有用例的默认来源。" +
+		"sources.kind=requirement 时 ref_id 必须是 requirement_version_id（当前需求版本 ID），不是 requirement_id。" +
+		"每条步骤与断言都必须有非空的 expected（可观察的成功判据）。" +
+		"未知字段（unknown fields）会被严格拒绝：不做别名映射；错误会给出最接近的合法字段名与合法字段清单。" +
+		"断言 kind=db 时必须传 database_id，且只能使用当前版本绑定环境中的数据库 id：先调用 sut.database_list（或读取 context.version_pack 的 databases 清单），禁止猜测或用库名/DSN 代替。" +
+		"proposal_id 用于幂等：同一次提交的重试请复用同一个 proposal_id，重复提交返回首次结果、不会重复创建 case revision。" +
+		"base_revision 用于乐观并发：从 design.graph_read 读取需求 revision 后传入；过期会返回不可重试的 state_conflict（带 base_revision/current_revision），需重读后再提交。" +
+		"枚举取值：priority=P0/P1/P2/P3；assertion.kind=ui/api/db/text/visual；sources.kind=requirement/code/page/api/knowledge。"
 }
 
 func (t *caseGraphPropose) Parameters() json.RawMessage {
@@ -319,13 +361,33 @@ func (t *caseGraphPropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 		return nil, missingDep("design")
 	}
 	var payload graphProposalPayload
-	if err := decodeParams(raw, &payload); err != nil {
+	if err := decodeGraphProposalParams(raw, &payload); err != nil {
 		return nil, err
 	}
-	proposal, err := parseGraphProposal(payload, scope)
+	// The bound database inventory is only read when the proposal actually
+	// carries a db assertion; a db-less proposal never pays for the lookup.
+	allowedDatabaseIDs := t.allowedDatabaseIDs(ctx, scope, payload)
+	proposal, err := parseGraphProposal(payload, scope, allowedDatabaseIDs)
 	if err != nil {
+		return nil, retryableGraphFieldError(err)
+	}
+
+	// R-E1-5: a duplicate proposal_id must return the first result without
+	// re-proposing; it is checked before the revision guard so a legitimate
+	// retry still succeeds after the graph advanced.
+	digest := proposalDigest(raw)
+	if proposal.ProposalID != "" {
+		if result, found, cacheErr := t.cachedProposal(scope.VersionID, proposal.RequirementID, proposal.ProposalID, digest); cacheErr != nil {
+			return nil, cacheErr
+		} else if found {
+			return result, nil
+		}
+	}
+
+	if err := t.checkBaseRevision(ctx, scope, proposal); err != nil {
 		return nil, err
 	}
+
 	var (
 		result  any
 		portErr error
@@ -336,8 +398,8 @@ func (t *caseGraphPropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 			break
 		}
 		// Re-read the graph and retry with the fresh hash inside the same tool
-		// call, instead of returning a conflict the model must fix by spending
-		// another turn (the final S4 modification ran out of budget there).
+		// call, instead of returning a conflict the model must spend another
+		// turn on (the final S4 modification ran out of budget there).
 		freshHash, readErr := t.readGraphHash(ctx, scope.VersionID, proposal.RequirementID)
 		if readErr != nil || freshHash == "" || freshHash == proposal.BaseGraphHash {
 			break
@@ -347,7 +409,167 @@ func (t *caseGraphPropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 	if portErr != nil {
 		return nil, mapPortError(portErr)
 	}
+	if proposal.ProposalID != "" {
+		t.rememberProposal(scope.VersionID, proposal.RequirementID, proposal.ProposalID, digest, result)
+	}
 	return result, nil
+}
+
+// proposalDigest fingerprints the submitted payload bytes. Whitespace differences
+// are not normalized: a retry is expected to resend the same arguments.
+func proposalDigest(raw json.RawMessage) string {
+	sum := sha256.Sum256(bytes.TrimSpace(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func (t *caseGraphPropose) cacheKey(versionID, requirementID int64, proposalID string) string {
+	return fmt.Sprintf("%d:%d:%s", versionID, requirementID, proposalID)
+}
+
+func (t *caseGraphPropose) cachedProposal(versionID, requirementID int64, proposalID, digest string) (any, bool, *Error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry, found := t.proposals[t.cacheKey(versionID, requirementID, proposalID)]
+	if !found {
+		return nil, false, nil
+	}
+	if entry.digest != digest {
+		err := &Error{
+			Code:      CodeStateConflict,
+			Message:   fmt.Sprintf("proposal_id %q was already used for a different proposal payload; use a new proposal_id for a changed proposal", proposalID),
+			Retryable: false,
+			Field:     "proposal_id",
+			Hint:      "the duplicate was not applied; submit the changed proposal with a fresh proposal_id",
+			Details:   map[string]any{"proposal_id": proposalID},
+		}
+		return nil, false, err
+	}
+	return entry.result, true, nil
+}
+
+func (t *caseGraphPropose) rememberProposal(versionID, requirementID int64, proposalID, digest string, result any) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.proposals == nil {
+		t.proposals = make(map[string]caseGraphProposalCacheEntry)
+	}
+	t.proposals[t.cacheKey(versionID, requirementID, proposalID)] = caseGraphProposalCacheEntry{
+		digest: digest, result: result,
+	}
+}
+
+// allowedDatabaseIDs resolves the bound environment database inventory for the
+// db assertions of one payload. The read is best-effort: a missing lister or a
+// read failure leaves the list empty (the design context still validates the
+// database binding and the model still receives the hint), while an available
+// list turns a missing/unbound database_id into a precise allowed-values error.
+func (t *caseGraphPropose) allowedDatabaseIDs(ctx context.Context, scope Scope, payload graphProposalPayload) []string {
+	if !payloadHasDBAssertion(payload) {
+		return nil
+	}
+	lister, ok := t.deps.Resource.(DatabaseLister)
+	if !ok {
+		return nil
+	}
+	items, err := lister.ListDatabases(ctx, scope.VersionID, 0)
+	if err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if id := strings.TrimSpace(item.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func payloadHasDBAssertion(payload graphProposalPayload) bool {
+	for _, item := range payload.Cases {
+		for _, assertion := range item.Assertions {
+			if strings.TrimSpace(assertion.Kind) == "db" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkBaseRevision rejects a proposal composed against a stale requirement
+// revision (R-E1-5). It is a non-retryable conflict: blindly retrying the same
+// base_revision cannot succeed, the model must re-read the current revision.
+// When no revision information is returned the guard stays out of the way; the
+// design context's own stale-version check is the authority.
+func (t *caseGraphPropose) checkBaseRevision(ctx context.Context, scope Scope, proposal GraphProposal) *Error {
+	if proposal.BaseRevision <= 0 {
+		return nil
+	}
+	result, err := t.deps.Design.ReadGraph(ctx, scope.VersionID, proposal.RequirementID, 0)
+	if err != nil {
+		return nil
+	}
+	current, found := requirementRevisionFromRead(result, proposal.RequirementID)
+	if !found || current == proposal.BaseRevision {
+		return nil
+	}
+	return &Error{
+		Code:      CodeStateConflict,
+		Message:   fmt.Sprintf("base_revision %d is stale; the requirement is now revision %d", proposal.BaseRevision, current),
+		Retryable: false,
+		Field:     "base_revision",
+		Hint:      "re-read design.graph_read and resubmit with the current requirement revision",
+		Details: map[string]any{
+			"base_revision":    proposal.BaseRevision,
+			"current_revision": current,
+			"requirement_id":   idString(proposal.RequirementID),
+		},
+	}
+}
+
+// requirementRevisionFromRead extracts requirements[].revision for one
+// requirement from the design.graph_read payload.
+func requirementRevisionFromRead(result any, requirementID int64) (int, bool) {
+	if result == nil {
+		return 0, false
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return 0, false
+	}
+	var payload struct {
+		Requirements []struct {
+			RequirementID string `json:"requirement_id"`
+			Revision      int    `json:"revision"`
+		} `json:"requirements"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return 0, false
+	}
+	target := idString(requirementID)
+	for _, requirement := range payload.Requirements {
+		if requirement.RequirementID == target {
+			return requirement.Revision, true
+		}
+	}
+	return 0, false
+}
+
+// retryableGraphFieldError promotes every field-level graph validation failure
+// to the v0.22 E-1 retryable shape (R-E1-3) while preserving the original
+// message/field. Validation errors are always model-fixable arguments.
+func retryableGraphFieldError(err *Error) *Error {
+	if err == nil {
+		return nil
+	}
+	err.Retryable = true
+	if err.Field == "" {
+		if field, _ := err.Details["field"].(string); field != "" {
+			err.Field = field
+			err.Details["field"] = field
+		}
+	}
+	return err
 }
 
 // readGraphHash reads the current design graph and returns its hash.
@@ -529,7 +751,7 @@ func (t *designDataPlanSubmit) Execute(ctx context.Context, scope Scope, raw jso
 
 // --- validation helpers ----------------------------------------------------
 
-func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposal, *Error) {
+func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDatabaseIDs []string) (GraphProposal, *Error) {
 	proposal := GraphProposal{}
 	requirementID, err := parseRequiredID("requirement_id", payload.RequirementID)
 	if err != nil {
@@ -554,6 +776,21 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 			return GraphProposal{}, Invalid("base_graph_hash", "must be 64 lowercase hex characters")
 		}
 		proposal.BaseGraphHash = hash
+	}
+	if payload.ProposalID != nil && strings.TrimSpace(*payload.ProposalID) != "" {
+		proposalID := strings.TrimSpace(*payload.ProposalID)
+		if !proposalIDPattern.MatchString(proposalID) {
+			return GraphProposal{}, InvalidWithAllowed("proposal_id",
+				"must be 1-128 characters of letters, digits, dot, underscore, colon or hyphen (no spaces)",
+				nil, "reuse the same stable id for a retry of this proposal")
+		}
+		proposal.ProposalID = proposalID
+	}
+	if payload.BaseRevision != nil {
+		if *payload.BaseRevision < 1 {
+			return GraphProposal{}, InvalidField("base_revision", "must be a positive requirement revision (1-based)")
+		}
+		proposal.BaseRevision = *payload.BaseRevision
 	}
 
 	if len(payload.Scenarios) == 0 {
@@ -659,7 +896,9 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 		switch priority {
 		case "P0", "P1", "P2", "P3":
 		default:
-			return GraphProposal{}, Invalid(field("priority"), "must be one of P0, P1, P2, P3")
+			return GraphProposal{}, InvalidWithAllowed(field("priority"),
+				"must be one of P0, P1, P2, P3", []string{"P0", "P1", "P2", "P3"},
+				"use the exact enum value; case priority is P0/P1/P2/P3")
 		}
 		defaultSUT, err := parseRequiredID(field("default_version_sut_id"), stringValueOr(item.DefaultVersionSUTID, ""))
 		if err != nil {
@@ -755,7 +994,10 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 			switch assertion.Kind {
 			case "ui", "api", "db", "text", "visual":
 			default:
-				return GraphProposal{}, Invalid(assertionField("kind"), "must be one of ui, api, db, text, visual")
+				return GraphProposal{}, InvalidWithAllowed(assertionField("kind"),
+					fmt.Sprintf("%q is not a supported assertion kind", assertion.Kind),
+					[]string{"ui", "api", "db", "text", "visual"},
+					"use ui for page checks, api for endpoint checks, db for database checks, text for visible copy; visual requires an explicit baseline")
 			}
 			if err := validateText(assertionField("target"), assertion.Target, 1, 2000); err != nil {
 				return GraphProposal{}, err
@@ -779,8 +1021,19 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposa
 			if err != nil {
 				return GraphProposal{}, err
 			}
-			if assertion.Kind == "db" && databaseID <= 0 {
-				return GraphProposal{}, Invalid(assertionField("database_id"), "is required for db assertions")
+			if assertion.Kind == "db" {
+				if databaseID <= 0 {
+					return GraphProposal{}, InvalidWithAllowed(assertionField("database_id"),
+						"database_id is required for db assertions; call sut.database_list and reuse a bound database id",
+						allowedDatabaseIDs,
+						"call sut.database_list first (or read context.version_pack databases); never guess a database_id or use a database name/DSN")
+				}
+				if len(allowedDatabaseIDs) > 0 && !containsString(allowedDatabaseIDs, idString(databaseID)) {
+					return GraphProposal{}, InvalidWithAllowed(assertionField("database_id"),
+						fmt.Sprintf("database_id %q is not bound to this version's environment", idString(databaseID)),
+						allowedDatabaseIDs,
+						"choose one of the allowed database ids returned by sut.database_list; ids are not inferred from names")
+				}
 			}
 			assertions = append(assertions, AssertionProposal{
 				StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target, Expected: expected,
@@ -821,7 +1074,10 @@ func parseSources(fieldPrefix string, raw []sourcePayload, requirementID, requir
 		switch source.Kind {
 		case "requirement", "code", "page", "api", "knowledge":
 		default:
-			return nil, Invalid(sourceField("kind"), "must be one of requirement, code, page, api, knowledge")
+			return nil, InvalidWithAllowed(sourceField("kind"),
+				fmt.Sprintf("%q is not a supported source kind", source.Kind),
+				[]string{"requirement", "code", "page", "api", "knowledge"},
+				"requirement sources cite the current requirement_version_id; page/api sources cite bound catalog ids")
 		}
 		if err := validateText(sourceField("ref_id"), source.RefID, 1, 200); err != nil {
 			return nil, err
@@ -848,6 +1104,174 @@ func parseSources(fieldPrefix string, raw []sourcePayload, requirementID, requir
 		})
 	}
 	return sources, nil
+}
+
+// --- strict decode and unknown-field suggestions ---------------------------
+
+// decodeGraphProposalParams keeps R-E1-1's strict decoding (DisallowUnknownFields)
+// and adds R-E1-4's self-correction data: the exact JSON path of the unknown
+// field, the nearest legal field name at that nesting level, and the full legal
+// field list. Aliases are never mapped silently.
+func decodeGraphProposalParams(raw json.RawMessage, target *graphProposalPayload) *Error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		trimmed = []byte(`{}`)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &object); err != nil {
+		return InvalidField("parameters", "parameters must be a JSON object")
+	}
+	if path, unknown, allowed, found := findUnknownJSONField(trimmed, reflect.TypeOf(*target), ""); found {
+		suggestion := nearestJSONField(unknown, allowed)
+		message := fmt.Sprintf("unknown field %q; nearest legal field is %q; unknown fields are rejected and aliases are not accepted", unknown, suggestion)
+		err := InvalidWithAllowed(path, message, allowed,
+			"remove or rename the unknown field; the tool schema lists every legal field and design.graph_read shows the current graph shape")
+		err.Details["unknown"] = unknown
+		err.Details["suggestion"] = suggestion
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return InvalidField("parameters", "invalid parameters: "+err.Error())
+	}
+	return nil
+}
+
+// findUnknownJSONField walks the raw JSON alongside the target Go type and
+// returns the first unknown object key with its full path. Reaching a
+// json.RawMessage/interface field (test_data/data) stops the walk: those are
+// intentionally free-form objects.
+func findUnknownJSONField(raw json.RawMessage, typ reflect.Type, path string) (string, string, []string, bool) {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ == reflect.TypeOf(json.RawMessage{}) || typ.Kind() == reflect.Interface {
+		return "", "", nil, false
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil {
+			return "", "", nil, false
+		}
+		allowed, byName := jsonStructFields(typ)
+		keys := make([]string, 0, len(object))
+		for key := range object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			valueType, ok := byName[key]
+			if !ok {
+				return joinJSONPath(path, key), key, allowed, true
+			}
+			if foundPath, unknown, fields, found := findUnknownJSONField(object[key], valueType, joinJSONPath(path, key)); found {
+				return foundPath, unknown, fields, true
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		element := typ.Elem()
+		for element.Kind() == reflect.Pointer {
+			element = element.Elem()
+		}
+		if element.Kind() != reflect.Struct {
+			return "", "", nil, false
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return "", "", nil, false
+		}
+		for index, item := range items {
+			if foundPath, unknown, fields, found := findUnknownJSONField(item, element, fmt.Sprintf("%s[%d]", path, index)); found {
+				return foundPath, unknown, fields, true
+			}
+		}
+	}
+	return "", "", nil, false
+}
+
+// jsonStructFields returns the sorted JSON names of a struct plus their types.
+func jsonStructFields(typ reflect.Type) ([]string, map[string]reflect.Type) {
+	allowed := make([]string, 0, typ.NumField())
+	byName := make(map[string]reflect.Type, typ.NumField())
+	for index := 0; index < typ.NumField(); index++ {
+		field := typ.Field(index)
+		if field.PkgPath != "" {
+			continue
+		}
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		allowed = append(allowed, name)
+		byName[name] = field.Type
+	}
+	sort.Strings(allowed)
+	return allowed, byName
+}
+
+func joinJSONPath(path, name string) string {
+	if path == "" {
+		return name
+	}
+	return path + "." + name
+}
+
+// nearestJSONField picks the legal field with the smallest edit distance
+// (case-insensitive); ties resolve lexicographically for determinism.
+func nearestJSONField(unknown string, allowed []string) string {
+	lower := strings.ToLower(unknown)
+	best := ""
+	bestDistance := -1
+	for _, candidate := range allowed {
+		distance := levenshteinDistance(lower, strings.ToLower(candidate))
+		if bestDistance < 0 || distance < bestDistance || (distance == bestDistance && candidate < best) {
+			best, bestDistance = candidate, distance
+		}
+	}
+	return best
+}
+
+// levenshteinDistance is the classic two-row edit distance over runes.
+func levenshteinDistance(a, b string) int {
+	ar, br := []rune(a), []rune(b)
+	if len(ar) == 0 {
+		return len(br)
+	}
+	if len(br) == 0 {
+		return len(ar)
+	}
+	previous := make([]int, len(br)+1)
+	current := make([]int, len(br)+1)
+	for j := 0; j <= len(br); j++ {
+		previous[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		current[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			deletion := previous[j] + 1
+			insertion := current[j-1] + 1
+			substitution := previous[j-1] + cost
+			current[j] = minInt(deletion, minInt(insertion, substitution))
+		}
+		previous, current = current, previous
+	}
+	return previous[len(br)]
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func parseRequiredID(field, raw string) (int64, *Error) {
@@ -921,66 +1345,300 @@ func idArraySchema() map[string]any {
 	return map[string]any{"type": "array", "items": idStringSchema()}
 }
 
+// graphProposeSchema is the self-describing v0.22 E-1 contract (R-E1-1). Every
+// field documents its unit/values/when-required, enums are explicit, the
+// assertion branches are expressed with anyOf (db requires database_id), two
+// complete examples (including a db assertion) show the whole shape, and the
+// root description names the legal top-level fields and the strict
+// unknown-field policy. additionalProperties stays false at every level.
 func graphProposeSchema() json.RawMessage {
+	id := func(description string) map[string]any {
+		schema := idStringSchema()
+		schema["description"] = description
+		return schema
+	}
+	ids := func(description string) map[string]any {
+		schema := idArraySchema()
+		schema["description"] = description
+		return schema
+	}
 	stepSchema := schemaObject(map[string]any{
-		"seq":                   map[string]any{"type": "integer", "minimum": 1},
-		"action":                map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
-		"expected":              map[string]any{"type": "string", "minLength": 1, "maxLength": 20000, "description": "observable success outcome; required and must not be empty"},
-		"target_version_sut_id": idStringSchema(),
-		"target_page_id":        idStringSchema(),
-		"target_api_id":         idStringSchema(),
-		"account_role":          map[string]any{"type": "string", "maxLength": 200},
-		"data":                  map[string]any{"type": "object", "additionalProperties": true},
+		"seq": map[string]any{
+			"type": "integer", "minimum": 1,
+			"description": "步骤序号，从 1 开始且必须连续（1..N），断言 step_seq 引用它。",
+		},
+		"action": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 2000,
+			"description": "必填。本步骤的可执行动作（点击/输入/调用等），不得为空。",
+		},
+		"expected": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 20000,
+			"description": "必填。可观察的成功结果；不能为空或只写“成功”。",
+		},
+		"target_version_sut_id": id("可选。步骤目标 version_sut 的十进制 ID，必须属于 cases[].version_sut_ids；省略表示沿用用例默认 SUT。"),
+		"target_page_id":        id("可选。步骤目标页面的十进制 ID（来自 sut.page_list 的 kind=page 条目）；不是 path/URL。"),
+		"target_api_id":         id("可选。步骤目标 API 的十进制 ID（来自 sut.page_list 的 kind=api 条目）；不是 method+path。"),
+		"account_role": map[string]any{
+			"type": "string", "maxLength": 200,
+			"description": "可选。执行该步骤使用的账号角色（如 admin），对应绑定环境的测试账号角色。",
+		},
+		"data": map[string]any{
+			"type": "object", "additionalProperties": true,
+			"description": "可选。步骤输入数据（自由 JSON 对象），键值由用例自行约定。",
+		},
 	}, "seq", "action", "expected")
-	assertionSchema := schemaObject(map[string]any{
-		"step_seq":              map[string]any{"type": "integer", "minimum": 1},
-		"kind":                  map[string]any{"type": "string", "enum": []any{"ui", "api", "db", "text", "visual"}},
-		"target":                map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
-		"expected":              map[string]any{"type": "string", "minLength": 1, "maxLength": 2000, "description": "observable success criterion; required and must not be empty"},
-		"target_version_sut_id": idStringSchema(),
-		"target_api_id":         idStringSchema(),
-		"database_id":           idStringSchema(),
-	}, "step_seq", "kind", "target", "expected")
+	assertionProperties := map[string]any{
+		"step_seq": map[string]any{
+			"type": "integer", "minimum": 1,
+			"description": "必填。断言所属步骤的 seq（必须对应 cases[].steps[].seq 中已存在的步骤）。",
+		},
+		"kind": map[string]any{
+			"type":        "string",
+			"enum":        []any{"ui", "api", "db", "text", "visual"},
+			"description": "必填。断言类型枚举：ui=页面元素/交互；api=接口响应；db=数据库（必须同时给 database_id）；text=页面可见文案；visual=截图/视觉基线（仅需求明确要求时使用）。",
+		},
+		"target": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 2000,
+			"description": "必填。断言对象：ui 用元素/选择器描述，api 用 method+path，db 用表/查询，text/visual 用区域描述。",
+		},
+		"expected": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 2000,
+			"description": "必填。可观察的成功判据（期望值），不能为空。",
+		},
+		"target_version_sut_id": id("可选。断言目标 version_sut 的十进制 ID，必须属于 cases[].version_sut_ids。"),
+		"target_api_id":         id("可选。api 断言的目标 API 十进制 ID（来自 sut.page_list 的 kind=api 条目）。"),
+		"database_id":           id("kind=db 时必填。绑定环境目标数据库的十进制 ID：只能取 sut.database_list / context.version_pack.databases 返回的 id，禁止猜测或用库名/DSN 代替。"),
+	}
+	assertionSchema := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required":             []string{"step_seq", "kind", "target", "expected"},
+		"properties":           assertionProperties,
+		"description":          "断言对象。按 kind 分支（anyOf）：ui=target_page_id+步骤动作+expected；api=target_api_id/method+path+expected；db=database_id+查询/expected；text=可见文案；visual=基线/截图断言。",
+		"anyOf": []any{
+			map[string]any{
+				"description": "ui 断言分支：页面元素/交互结果",
+				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"ui"}}},
+			},
+			map[string]any{
+				"description": "api 断言分支：接口响应的 method/path/状态码或响应体",
+				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"api"}}},
+			},
+			map[string]any{
+				"description": "db 断言分支：必须提供绑定环境的 database_id（来自 sut.database_list）",
+				"properties": map[string]any{
+					"kind":        map[string]any{"enum": []any{"db"}},
+					"database_id": idStringSchema(),
+				},
+				"required": []string{"database_id"},
+			},
+			map[string]any{
+				"description": "text 断言分支：页面可见文案",
+				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"text"}}},
+			},
+			map[string]any{
+				"description": "visual 断言分支：仅在需求/验收标准显式要求视觉基线时使用",
+				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"visual"}}},
+			},
+		},
+	}
 	sourceSchema := schemaObject(map[string]any{
-		"kind":   map[string]any{"type": "string", "enum": []any{"requirement", "code", "page", "api", "knowledge"}},
-		"ref_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 200, "description": "requirement sources reference the current requirement_version_id; page/api sources reference the version page/api id"},
-		"path":   map[string]any{"type": "string", "maxLength": 1000},
-		"line":   map[string]any{"type": "integer", "minimum": 0},
-		"sha":    map[string]any{"type": "string", "maxLength": 64},
+		"kind": map[string]any{
+			"type": "string", "enum": []any{"requirement", "code", "page", "api", "knowledge"},
+			"description": "必填。来源类型枚举：requirement=需求版本；code=代码位置；page=已绑定页面；api=已绑定接口；knowledge=已批准知识。",
+		},
+		"ref_id": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 200,
+			"description": "必填。来源引用 ID：kind=requirement 时必须是当前 requirement_version_id（不是 requirement_id）；page/api 用绑定的 catalog ID；code 用文件路径/引用；knowledge 用知识 ID。",
+		},
+		"path": map[string]any{
+			"type": "string", "maxLength": 1000,
+			"description": "可选。来源文件路径或定位路径（code 来源常用）。",
+		},
+		"line": map[string]any{
+			"type": "integer", "minimum": 0,
+			"description": "可选。来源行号（0 或正整数）。",
+		},
+		"sha": map[string]any{
+			"type": "string", "maxLength": 64,
+			"description": "可选。来源内容/提交的 SHA 摘要。",
+		},
 	}, "kind", "ref_id")
 	caseSchema := schemaObject(map[string]any{
-		"ref":                    map[string]any{"type": "string", "minLength": 1, "maxLength": 64},
-		"id":                     idStringSchema(),
-		"scenario_ref":           map[string]any{"type": "string", "minLength": 1, "maxLength": 64},
-		"title":                  map[string]any{"type": "string", "minLength": 1, "maxLength": 200},
-		"description":            map[string]any{"type": "string", "maxLength": 20000},
-		"preconditions":          map[string]any{"type": "string", "maxLength": 20000},
-		"test_data":              map[string]any{"type": "object", "additionalProperties": true},
-		"priority":               map[string]any{"type": "string", "enum": []any{"P0", "P1", "P2", "P3"}},
-		"default_version_sut_id": idStringSchema(),
-		"version_sut_ids":        idArraySchema(),
-		"page_ids":               idArraySchema(),
-		"api_ids":                idArraySchema(),
-		"steps":                  map[string]any{"type": "array", "minItems": 1, "maxItems": maxCaseSteps, "items": stepSchema},
-		"assertions":             map[string]any{"type": "array", "maxItems": maxCaseAssertions, "items": assertionSchema},
-		"sources":                map[string]any{"type": "array", "maxItems": maxCaseSources, "items": sourceSchema},
+		"ref": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 64,
+			"description": "必填。本次 proposal 内的临时引用名，断言/scenario_ref 用它关联；不是数据库 ID。",
+		},
+		"id": id("可选。更新已有用例时传用例十进制 ID；新建时省略。"),
+		"scenario_ref": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 64,
+			"description": "必填。所属场景在本 proposal 内的 ref（必须在 scenarios 中存在）。",
+		},
+		"title": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 200,
+			"description": "必填。用例标题，建议使用对应验收要点原文。",
+		},
+		"description": map[string]any{
+			"type": "string", "maxLength": 20000,
+			"description": "可选。用例说明。",
+		},
+		"preconditions": map[string]any{
+			"type": "string", "maxLength": 20000,
+			"description": "可选。前置条件（账号、数据、环境状态）。",
+		},
+		"test_data": map[string]any{
+			"type": "object", "additionalProperties": true,
+			"description": "可选。测试数据（自由 JSON 对象）。",
+		},
+		"priority": map[string]any{
+			"type": "string", "enum": []any{"P0", "P1", "P2", "P3"},
+			"description": "可选，默认 P2。优先级枚举：P0 最高（核心阻断）→ P3 最低。只能取 P0/P1/P2/P3。",
+		},
+		"default_version_sut_id": id("必填。默认 version_sut 的十进制 ID，必须属于 cases[].version_sut_ids。"),
+		"version_sut_ids":        ids("必填。该用例可使用的 version_sut 十进制 ID 列表，至少一个。"),
+		"page_ids":               ids("可选。用例涉及的已绑定页面十进制 ID 列表（来自 sut.page_list 的 kind=page）。"),
+		"api_ids":                ids("可选。用例涉及的已绑定接口十进制 ID 列表（来自 sut.page_list 的 kind=api）。"),
+		"steps": map[string]any{
+			"type": "array", "minItems": 1, "maxItems": maxCaseSteps, "items": stepSchema,
+			"description": "必填。可执行步骤，seq 从 1 连续递增，至少一步。",
+		},
+		"assertions": map[string]any{
+			"type": "array", "maxItems": maxCaseAssertions, "items": assertionSchema,
+			"description": "可选。断言列表；kind=db 的项必须带 database_id。",
+		},
+		"sources": map[string]any{
+			"type": "array", "maxItems": maxCaseSources, "items": sourceSchema,
+			"description": "可选。该用例的来源；省略时继承顶层 sources。",
+		},
 	}, "ref", "scenario_ref", "title", "default_version_sut_id", "version_sut_ids", "steps")
 	scenarioSchema := schemaObject(map[string]any{
-		"ref":             map[string]any{"type": "string", "minLength": 1, "maxLength": 64},
-		"id":              idStringSchema(),
-		"name":            map[string]any{"type": "string", "minLength": 1, "maxLength": 200},
-		"description":     map[string]any{"type": "string", "maxLength": 20000},
-		"version_sut_ids": idArraySchema(),
-		"page_ids":        idArraySchema(),
-		"api_ids":         idArraySchema(),
-		"sort_order":      map[string]any{"type": "integer", "minimum": 0},
+		"ref": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 64,
+			"description": "必填。本次 proposal 内的场景引用名（唯一），cases[].scenario_ref 引用它。",
+		},
+		"id": id("可选。更新已有场景时传场景十进制 ID；新建时省略。"),
+		"name": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": 200,
+			"description": "必填。场景名，建议使用需求标题原文。",
+		},
+		"description": map[string]any{
+			"type": "string", "maxLength": 20000,
+			"description": "可选。场景说明。",
+		},
+		"version_sut_ids": ids("可选。场景使用的 version_sut 十进制 ID 列表。"),
+		"page_ids":        ids("可选。场景关联的已绑定页面十进制 ID 列表。"),
+		"api_ids":         ids("可选。场景关联的已绑定接口十进制 ID 列表。"),
+		"sort_order": map[string]any{
+			"type": "integer", "minimum": 0,
+			"description": "可选。场景排序（0 或正整数，越小越靠前）。",
+		},
 	}, "ref", "name")
-	return schemaObject(map[string]any{
-		"requirement_id":         idStringSchema(),
-		"requirement_version_id": idStringSchema(),
-		"base_graph_hash":        map[string]any{"type": "string", "pattern": `^[0-9a-f]{64}$`},
-		"scenarios":              map[string]any{"type": "array", "minItems": 1, "maxItems": maxProposalScenarios, "items": scenarioSchema},
-		"cases":                  map[string]any{"type": "array", "minItems": 1, "maxItems": maxProposalCases, "items": caseSchema},
-		"sources":                map[string]any{"type": "array", "maxItems": maxCaseSources, "items": sourceSchema, "description": "default provenance for every case that does not declare its own sources"},
-	}, "requirement_id", "requirement_version_id", "scenarios", "cases")
+	properties := map[string]any{
+		"requirement_id":         id("必填。需求十进制 ID，必须与本次 run 注入的需求作用域一致。"),
+		"requirement_version_id": id("必填。当前需求版本十进制 ID（不是 requirement_id），必须与注入的需求版本作用域一致；sources.kind=requirement 的 ref_id 用它。"),
+		"base_graph_hash": map[string]any{
+			"type": "string", "pattern": `^[0-9a-f]{64}$`,
+			"description": "可选。design.graph_read 返回的当前 graph_hash（64 位小写十六进制）；用于乐观锁，过期会触发服务端重读并重试。",
+		},
+		"proposal_id": map[string]any{
+			"type": "string", "pattern": `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`,
+			"description": "可选。幂等键：同一次提交的重试复用同一个 proposal_id；重复提交返回首次结果，不会重复创建 case revision。改内容时必须换新 id。",
+		},
+		"base_revision": map[string]any{
+			"type": "integer", "minimum": 1,
+			"description": "可选。提交所基于的需求 revision（1 开始，取自 design.graph_read 的 requirements[].revision）；与当前 revision 不一致时返回不可重试的 state_conflict。",
+		},
+		"scenarios": map[string]any{
+			"type": "array", "minItems": 1, "maxItems": maxProposalScenarios, "items": scenarioSchema,
+			"description": "必填。场景列表，1..3 个；新增/更新场景都在这里提交。",
+		},
+		"cases": map[string]any{
+			"type": "array", "minItems": 1, "maxItems": maxProposalCases, "items": caseSchema,
+			"description": "必填。用例列表，1..10 个；每个用例带完整步骤/断言/来源。",
+		},
+		"sources": map[string]any{
+			"type": "array", "maxItems": maxCaseSources, "items": sourceSchema,
+			"description": "可选。所有用例的默认来源；用例自带 sources 时以用例为准。",
+		},
+	}
+	document := map[string]any{
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": false,
+		"required":             []string{"requirement_id", "requirement_version_id", "scenarios", "cases"},
+		"description": "提交场景/用例 draft 的自描述 schema。合法顶层字段：requirement_id、requirement_version_id、base_graph_hash、proposal_id、base_revision、scenarios、cases、sources。" +
+			" unknown fields are strictly rejected（未知字段会被拒绝，不做别名映射），错误会指出最接近的合法字段；db 断言必须带 database_id（来自 sut.database_list / context.version_pack.databases）。",
+		"examples": graphProposeExamples(),
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return emptyObjectSchema
+	}
+	return raw
+}
+
+// graphProposeExamples returns two complete, copyable proposals: one ordinary
+// ui/api update and one db assertion keyed by the bound database id. They are
+// part of the model-visible contract (R-E1-1), not test fixtures.
+func graphProposeExamples() []any {
+	return []any{
+		map[string]any{
+			"requirement_id":         "501",
+			"requirement_version_id": "700",
+			"scenarios": []any{
+				map[string]any{
+					"ref": "s1", "name": "正常登录", "description": "手机号密码登录",
+					"version_sut_ids": []any{"9001"}, "page_ids": []any{"9101"}, "api_ids": []any{"9201"},
+				},
+			},
+			"cases": []any{
+				map[string]any{
+					"ref": "c1", "scenario_ref": "s1", "title": "账号密码登录成功", "priority": "P1",
+					"default_version_sut_id": "9001", "version_sut_ids": []any{"9001"},
+					"steps": []any{
+						map[string]any{"seq": 1, "action": "打开登录页", "expected": "显示登录表单",
+							"target_version_sut_id": "9001", "target_page_id": "9101"},
+						map[string]any{"seq": 2, "action": "提交有效账号密码", "expected": "跳转到首页",
+							"target_version_sut_id": "9001", "target_api_id": "9201"},
+					},
+					"assertions": []any{
+						map[string]any{"step_seq": 1, "kind": "ui", "target": "登录表单", "expected": "表单可见"},
+						map[string]any{"step_seq": 2, "kind": "api", "target": "POST /login", "expected": "HTTP 200"},
+					},
+					"sources": []any{
+						map[string]any{"kind": "requirement", "ref_id": "700"},
+					},
+				},
+			},
+		},
+		map[string]any{
+			"requirement_id":         "501",
+			"requirement_version_id": "700",
+			"proposal_id":            "login-db-check-1",
+			"base_revision":          3,
+			"scenarios": []any{
+				map[string]any{
+					"ref": "s1", "name": "正常登录", "version_sut_ids": []any{"9001"},
+				},
+			},
+			"cases": []any{
+				map[string]any{
+					"ref": "c1", "scenario_ref": "s1", "title": "登录成功后写入登录审计", "priority": "P1",
+					"default_version_sut_id": "9001", "version_sut_ids": []any{"9001"},
+					"steps": []any{
+						map[string]any{"seq": 1, "action": "提交有效账号密码", "expected": "登录成功",
+							"target_version_sut_id": "9001", "target_api_id": "9201"},
+					},
+					"assertions": []any{
+						map[string]any{"step_seq": 1, "kind": "db",
+							"target":   "select count(*) from login_audit where user_id = 42",
+							"expected": "count = 1", "database_id": "1501"},
+					},
+					"sources": []any{
+						map[string]any{"kind": "requirement", "ref_id": "700"},
+					},
+				},
+			},
+		},
+	}
 }

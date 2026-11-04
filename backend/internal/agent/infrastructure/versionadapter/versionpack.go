@@ -41,6 +41,10 @@ func (a *Adapter) VersionPack(ctx context.Context, versionID int64) (agentapp.Ve
 		for _, api := range binding.APIs {
 			pack.APIs = append(pack.APIs, fmt.Sprintf("%s %s", api.Method, api.PathTemplate))
 		}
+		// R-E1-2: db assertions may only use a database_id from the bound
+		// environment; the pack carries the inventory so the model can choose
+		// instead of guessing. Empty when the version binds no database.
+		pack.Databases = append(pack.Databases, databaseSummaries(binding)...)
 	}
 
 	requirements, err := a.listAllRequirements(ctx, versionID)

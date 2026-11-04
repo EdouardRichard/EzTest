@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	versionadapter "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
@@ -106,4 +107,55 @@ func TestVersionBindingHasResources(t *testing.T) {
 	if pages[0].Path != "/orders" || pages[1].Path != "/login" {
 		t.Fatalf("page routes = %q/%q, want /orders and /login", pages[0].Path, pages[1].Path)
 	}
+}
+
+// TestDatabaseListIncludesEnvironmentDatabases pins R-E1-2: the agent VersionPack
+// carries the bound environment's databases (id/name/kind/read_only) so both the
+// context prompt and the sut.database_list tool expose the same list without the
+// model guessing an id.
+func TestDatabaseListIncludesEnvironmentDatabases(t *testing.T) {
+	version := resourceBoundVersion()
+	versions := &fakeVersions{getFn: func(context.Context, int64) (versionapp.VersionView, error) {
+		return version, nil
+	}}
+	requirements := &fakeRequirements{
+		listFn: func(context.Context, int64, string, int, *int64) ([]versionapp.RequirementView, bool, error) {
+			return []versionapp.RequirementView{}, false, nil
+		},
+		getFn: func(context.Context, int64, int64) (versionapp.RequirementDetail, error) {
+			return versionapp.RequirementDetail{}, nil
+		},
+	}
+	adapter := versionadapter.New(requirements, nil, versions, nil, nil)
+
+	pack, err := adapter.VersionPack(context.Background(), 2001)
+	if err != nil {
+		t.Fatalf("VersionPack: %v", err)
+	}
+	if len(pack.Databases) == 0 {
+		t.Fatal("version pack carries no databases; the design model cannot choose a database_id")
+	}
+	database := pack.Databases[0]
+	if database.ID != "1501" || database.Name != "order_db" ||
+		database.Kind != "postgres" || !database.ReadOnly {
+		t.Fatalf("version pack database = %#v, want the bound order_db", database)
+	}
+
+	listed, err := adapter.ListDatabases(context.Background(), 2001, 0)
+	if err != nil {
+		t.Fatalf("ListDatabases: %v", err)
+	}
+	if len(listed) != 1 || listed[0] != database {
+		t.Fatalf("sut.database_list databases = %#v, want the same bound database", listed)
+	}
+
+	filtered, err := adapter.ListDatabases(context.Background(), 2001, 3001)
+	if err != nil || len(filtered) != 1 {
+		t.Fatalf("filtered ListDatabases = %#v err=%v", filtered, err)
+	}
+	if _, err := adapter.ListDatabases(context.Background(), 2001, 9999); err == nil {
+		t.Fatal("ListDatabases accepted an unbound version_sut_id")
+	}
+
+	var _ tools.DatabaseLister = adapter
 }

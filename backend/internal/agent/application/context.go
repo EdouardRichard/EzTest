@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
@@ -48,12 +49,16 @@ type TaskContext struct {
 
 // VersionPack is the version/task package rendered into the context.
 type VersionPack struct {
-	VersionID    int64
-	Title        string
-	Status       string
-	SUTs         []string
-	Pages        []string
-	APIs         []string
+	VersionID int64
+	Title     string
+	Status    string
+	SUTs      []string
+	Pages     []string
+	APIs      []string
+	// Databases is the v0.22 E-1 read-only target database inventory of the
+	// bound environments (R-E1-2). It carries the decimal database_id that db
+	// assertions must reuse; the model must never infer one from a name/kind.
+	Databases    []tools.DatabaseSummary
 	Requirements []string
 	Attachments  []string
 	// Knowledge is the approved knowledge injected for the run (P7). It is a
@@ -544,6 +549,7 @@ func executionBlock(task ExecutionTask) string {
 func versionPackContent(pack VersionPack) string {
 	if pack.VersionID == 0 && pack.Title == "" && pack.Status == "" &&
 		len(pack.SUTs) == 0 && len(pack.Pages) == 0 && len(pack.APIs) == 0 &&
+		len(pack.Databases) == 0 &&
 		len(pack.Requirements) == 0 && len(pack.Attachments) == 0 {
 		return ""
 	}
@@ -557,6 +563,15 @@ func versionPackContent(pack VersionPack) string {
 	}
 	if len(pack.APIs) > 0 {
 		fmt.Fprintf(&builder, "\nAPI(%d): %s", len(pack.APIs), strings.Join(pack.APIs, ", "))
+	}
+	if len(pack.Databases) > 0 {
+		// R-E1-2: db assertions must reuse a bound database_id; the list is the
+		// model's only legitimate source (no inference from names/DSNs).
+		fmt.Fprintf(&builder, "\n数据库(%d，database_id 供 db 断言使用):", len(pack.Databases))
+		for _, database := range pack.Databases {
+			fmt.Fprintf(&builder, "\n- id=%s name=%s kind=%s read_only=%t",
+				database.ID, database.Name, database.Kind, database.ReadOnly)
+		}
 	}
 	if len(pack.Requirements) > 0 {
 		builder.WriteString("\n需求:")

@@ -44,6 +44,11 @@ const (
 	ToolAttachmentImageRef         = "attachment.image_ref"
 	ToolSUTList                    = "sut.list"
 	ToolSUTPageList                = "sut.page_list"
+	// ToolSUTDatabaseList is the v0.22 E-1 read-only database inventory
+	// (R-E1-2). It is additive: the frozen P1 registration order above does not
+	// include it; resources.go registers it through RegisterP4ToolGroup when the
+	// resource port also implements the DatabaseLister surface.
+	ToolSUTDatabaseList = "sut.database_list"
 	// ToolToolResultRead is the v0.22 A-6 continuation tool (R-A6-1). It is
 	// registered by NewP7Registry only when the content-store port is wired;
 	// the frozen P1 registration order above is unchanged.
@@ -118,17 +123,23 @@ type Tool interface {
 }
 
 // Error is a structured business failure returned to the model as
-// {"error":{"code","retryable","message","details"}}. Internal failures are
-// plain errors and fail the run.
+// {"error":{"code","message","retryable","field","allowed","hint","details"}}.
+// Internal failures are plain errors and fail the run.
 //
 // Retryable reports whether the same call can plausibly succeed on a retry.
 // Field-level corrections (invalid_argument) are retryable because the model can
 // fix the arguments; stale-revision conflicts are not blindly retryable and must
-// re-read the current revision first. Internal failures never use this type.
+// re-read the current revision first. Field/Allowed/Hint carry the v0.22 E-1
+// self-description contract (spec R-E1-3): the exact JSON path, the legal enum
+// values and the next action the model should take. They are also mirrored into
+// Details for older consumers (the frontend cards read both shapes).
 type Error struct {
 	Code      string
 	Message   string
 	Retryable bool
+	Field     string
+	Allowed   []string
+	Hint      string
 	Details   map[string]any
 	// Cause is an optional sentinel wrapped by this tool error. It lets callers
 	// classify a failure with errors.Is while still receiving the typed
@@ -157,6 +168,25 @@ func Invalid(field, message string) *Error {
 	return err
 }
 
+// InvalidField builds a retryable field-level invalid_argument error (v0.22
+// R-E1-3). The model can fix the named argument and retry the same call.
+func InvalidField(field, message string) *Error {
+	err := Invalid(field, message)
+	err.Retryable = true
+	err.Field = field
+	return err
+}
+
+// InvalidWithAllowed builds a retryable field-level invalid_argument error that
+// also names the accepted values and the next action. Used by the self-describing
+// case.graph_propose contract for enums, database ids and unknown fields.
+func InvalidWithAllowed(field, message string, allowed []string, hint string) *Error {
+	err := InvalidField(field, message)
+	err.Allowed = append([]string(nil), allowed...)
+	err.Hint = hint
+	return err
+}
+
 // NotFound builds a not_found tool error for one entity kind.
 func NotFound(kind string) *Error {
 	return &Error{Code: CodeNotFound, Message: kind + " not found", Details: map[string]any{"kind": kind}}
@@ -167,20 +197,35 @@ func StateConflict(message string) *Error {
 	return &Error{Code: CodeStateConflict, Message: message}
 }
 
-// Payload renders the error in the shared tool result shape.
+// Payload renders the error in the shared tool result shape. The v0.22 E-1
+// contract exposes code/message/retryable/field/allowed/hint at the top level
+// and mirrors field/allowed/hint into details so both the new frontend cards and
+// older readers (which only look at details) see the same correction data.
 func (e *Error) Payload() map[string]any {
-	details := e.Details
-	if details == nil {
-		details = map[string]any{}
+	details := make(map[string]any, len(e.Details)+3)
+	for key, value := range e.Details {
+		details[key] = value
 	}
-	return map[string]any{
-		"error": map[string]any{
-			"code":      e.Code,
-			"message":   e.Message,
-			"retryable": e.Retryable,
-			"details":   details,
-		},
+	body := map[string]any{
+		"code":      e.Code,
+		"message":   e.Message,
+		"retryable": e.Retryable,
+		"details":   details,
 	}
+	if e.Field != "" {
+		details["field"] = e.Field
+		body["field"] = e.Field
+	}
+	if len(e.Allowed) > 0 {
+		allowed := append([]string(nil), e.Allowed...)
+		details["allowed"] = allowed
+		body["allowed"] = allowed
+	}
+	if e.Hint != "" {
+		details["hint"] = e.Hint
+		body["hint"] = e.Hint
+	}
+	return map[string]any{"error": body}
 }
 
 // Registry is the immutable set of registered tools.
