@@ -42,3 +42,12 @@ Thumbs.db
 **/out-*.json
 **/auth-state*.json
 **/.auth/
+
+# release evidence tool outputs / login dumps
+**/tools-login*.json
+**/release/tools-login*.json
+
+
+**/release/tools-*.log
+**/release/out-*.json
+
