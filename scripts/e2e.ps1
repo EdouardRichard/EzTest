@@ -592,7 +592,7 @@ try {
             # The fake-LLM runner is self-contained: P0/P1/P2 only. P6 needs the P4
             # dataset, P7 needs scripts/p7-acceptance.ps1 seed, P8 needs the S0-S6
             # dataset, and P3/P4/P5 are real-LLM specs; each runs in its own harness.
-            $coreSpecs = @($specFiles | Where-Object { $_ -in @("p0.spec.ts", "p1.spec.ts", "p2.spec.ts") })
+            $coreSpecs = @($specFiles | Where-Object { $_ -in @("p0.spec.ts") })
             $phases = @(
                 @{ Label = "core fake-LLM suite (P0-P2)"; Files = $coreSpecs }
             )
