@@ -35,6 +35,7 @@ const (
 	ClosureCheckNoActiveIntent     = "no_active_intent"
 	ClosureCheckNoInflightCaseRun  = "no_inflight_case_run"
 	ClosureCheckCoverageRecorded   = "coverage_recorded"
+	ClosureCheckCasesVerified      = "cases_verified"
 )
 
 // Closure evidence kinds persisted in requirement_closure.evidence_refs.
@@ -69,6 +70,7 @@ type ClosureChecks struct {
 	RequirementState   bool `json:"requirement_state"`
 	HasConfirmedCase   bool `json:"has_confirmed_case"`
 	CasesTerminal      bool `json:"cases_terminal"`
+	CasesVerified      bool `json:"cases_verified"`
 	FailedCaseHasIssue bool `json:"failed_case_has_issue"`
 	NoOpenWork         bool `json:"no_open_work"`
 	NoActiveIntent     bool `json:"no_active_intent"`
@@ -79,11 +81,11 @@ type ClosureChecks struct {
 // Passed reports whether every closure check is green.
 func (c ClosureChecks) Passed() bool {
 	return c.RequirementState && c.HasConfirmedCase && c.CasesTerminal &&
-		c.FailedCaseHasIssue && c.NoOpenWork && c.NoActiveIntent &&
-		c.NoInflightCaseRun && c.CoverageRecorded
+		c.CasesVerified && c.FailedCaseHasIssue && c.NoOpenWork &&
+		c.NoActiveIntent && c.NoInflightCaseRun && c.CoverageRecorded
 }
 
-// ClosureCheckResult is the persisted check_result snapshot: the eight checks
+// ClosureCheckResult is the persisted check_result snapshot: the nine checks
 // plus the reserved waived flag. P4 has no waiver path, so Waived is always
 // false; P6 owns the explicit human waiver.
 type ClosureCheckResult struct {
@@ -106,16 +108,20 @@ type ClosureInput struct {
 	CoverageComplete bool
 }
 
-// EvaluateRequirementClosure recomputes the eight closure checks. Missing
+// EvaluateRequirementClosure recomputes the nine closure checks. Missing
 // latest runs are non-terminal; missing issue refs only block failed
 // application runs. Open issue status is intentionally not modelled: any ref
-// satisfies the check.
+// satisfies the check. CasesVerified is the verification gate (Task 117): a
+// terminal run is not enough, the case must have produced a definitive outcome.
+// Passed, failed and explicitly skipped runs are definitive; inconclusive and
+// blocked runs verified nothing and keep the requirement open.
 func EvaluateRequirementClosure(in ClosureInput) ClosureChecks {
 	checks := ClosureChecks{
 		RequirementState: in.Requirement.CurrentVersionID != nil &&
 			(in.Requirement.Status == RequirementClarified || in.Requirement.Status == RequirementClosed),
 		HasConfirmedCase:   len(in.CaseVersions) > 0,
 		CasesTerminal:      true,
+		CasesVerified:      true,
 		FailedCaseHasIssue: true,
 		NoOpenWork:         in.OpenWorkItems <= 0,
 		NoActiveIntent:     in.ActiveIntents <= 0,
@@ -127,6 +133,9 @@ func EvaluateRequirementClosure(in ClosureInput) ClosureChecks {
 		if !ok || !terminalCaseRunStatus(run.Status) {
 			checks.CasesTerminal = false
 		}
+		if !ok || !verifiedCaseRunStatus(run.Status) {
+			checks.CasesVerified = false
+		}
 		if ok && run.Status == CaseRunFailed && run.FailureClass == FailureClassApplication &&
 			!in.IssueRefs[run.CaseRunID] {
 			checks.FailedCaseHasIssue = false
@@ -137,8 +146,8 @@ func EvaluateRequirementClosure(in ClosureInput) ClosureChecks {
 
 // ClosureFailureCounts returns the check-name to count map carried by
 // ErrClosePredicateFailed. Counts are the offending row counts (open work
-// items, active intents, non-terminal cases, missing issue refs); boolean-only
-// failures report 1 and a missing confirmed case reports 0.
+// items, active intents, non-terminal cases, unverified cases, missing issue
+// refs); boolean-only failures report 1 and a missing confirmed case reports 0.
 func ClosureFailureCounts(in ClosureInput) map[string]int {
 	failed := make(map[string]int)
 	if in.Requirement.CurrentVersionID == nil ||
@@ -149,11 +158,15 @@ func ClosureFailureCounts(in ClosureInput) map[string]int {
 		failed[ClosureCheckHasConfirmedCase] = 0
 	}
 	nonTerminal := 0
+	unverified := 0
 	missingIssue := 0
 	for _, caseVersion := range in.CaseVersions {
 		run, ok := in.LatestRuns[caseVersion.CaseVersionID]
 		if !ok || !terminalCaseRunStatus(run.Status) {
 			nonTerminal++
+		}
+		if !ok || !verifiedCaseRunStatus(run.Status) {
+			unverified++
 		}
 		if ok && run.Status == CaseRunFailed && run.FailureClass == FailureClassApplication &&
 			!in.IssueRefs[run.CaseRunID] {
@@ -162,6 +175,9 @@ func ClosureFailureCounts(in ClosureInput) map[string]int {
 	}
 	if nonTerminal > 0 {
 		failed[ClosureCheckCasesTerminal] = nonTerminal
+	}
+	if unverified > 0 {
+		failed[ClosureCheckCasesVerified] = unverified
 	}
 	if missingIssue > 0 {
 		failed[ClosureCheckFailedCaseHasIssue] = missingIssue
@@ -223,6 +239,21 @@ type RequirementClosure struct {
 func terminalCaseRunStatus(status string) bool {
 	switch status {
 	case CaseRunPassed, CaseRunFailed, CaseRunBlocked, CaseRunInconclusive, CaseRunSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+// verifiedCaseRunStatus reports whether a latest case_run carries a definitive
+// verification outcome. passed and failed are execution results, and skipped is
+// the explicit skip recorded by the operator (the waiver-equivalent P4 allows).
+// blocked and inconclusive are terminal but verified nothing: the case never
+// produced a pass/fail verdict, so a requirement carrying one must stay open
+// (Task 117 / REL-Q3).
+func verifiedCaseRunStatus(status string) bool {
+	switch status {
+	case CaseRunPassed, CaseRunFailed, CaseRunSkipped:
 		return true
 	default:
 		return false

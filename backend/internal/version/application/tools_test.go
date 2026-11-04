@@ -128,15 +128,90 @@ func TestP4ToolsRequirementGoalMetClosesScopedRequirement(t *testing.T) {
 		t.Fatalf("closed_at = %#v", payload["closed_at"])
 	}
 	checks, ok := payload["checks"].(map[string]bool)
-	if !ok || len(checks) != 8 {
-		t.Fatalf("checks = %#v, want the eight closure checks", payload["checks"])
+	if !ok || len(checks) != 9 {
+		t.Fatalf("checks = %#v, want the nine closure checks", payload["checks"])
 	}
-	if !checks["requirement_state"] || !checks["no_open_work"] {
+	if !checks["requirement_state"] || !checks["no_open_work"] || !checks["cases_verified"] {
 		t.Fatalf("checks = %#v", checks)
 	}
 	stored := env.requirements.requirements[requirement.ID]
 	if stored.Status != version.RequirementClosed || stored.ClosedByRunID == nil || *stored.ClosedByRunID != 9001 {
 		t.Fatalf("stored requirement = %#v, want closed by agent run 9001", stored)
+	}
+}
+
+// TestStewardDoesNotCloseUnverifiedP0 reproduces REL-Q3 at the steward boundary:
+// the version_steward's requirement.goal_met proposal for FR-025 must be
+// rejected with 409 while the requirement's only case run is the terminal but
+// inconclusive visual run. No closure round, event or closed status may be
+// written: a closed P0 without a visual pass misleads sign-off.
+func TestStewardDoesNotCloseUnverifiedP0(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedP0ClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configureInconclusiveVisualClosure(env, requirement.ID)
+
+	tool := p4Tool(t, versionapp.VersionTools(env.svc, nil), "requirement.goal_met")
+	_, err := tool.Execute(context.Background(), agenttools.Scope{
+		VersionID:            701,
+		RequirementID:        requirement.ID,
+		RequirementVersionID: 1002,
+		AgentRunID:           9001,
+	}, json.RawMessage(`{}`))
+	toolErr := toolError(t, err)
+	if toolErr.Code != agenttools.CodeStateConflict {
+		t.Fatalf("unverified close code = %q, want state_conflict", toolErr.Code)
+	}
+	failed, ok := toolErr.Details["failed"].(map[string]int)
+	if !ok {
+		t.Fatalf("unverified close details = %#v, want failed counts", toolErr.Details)
+	}
+	if failed["cases_verified"] != 1 {
+		t.Fatalf("failed = %#v, want cases_verified=1", failed)
+	}
+	stored := env.requirements.requirements[requirement.ID]
+	if stored.Status != version.RequirementClarified || stored.ClosedAt != nil || stored.ClosedByRunID != nil {
+		t.Fatalf("stored requirement = %#v, want an open clarified requirement", stored)
+	}
+	if len(env.closures.closures[requirement.ID]) != 0 {
+		t.Fatalf("closures = %#v, want none for an unverified requirement", env.closures.closures[requirement.ID])
+	}
+	if len(env.events.events) != 0 || len(env.audit.events) != 0 {
+		t.Fatalf("rejected close wrote side effects: %#v/%#v", env.events.events, env.audit.events)
+	}
+}
+
+// TestStewardClosesVerifiedP0 guards against weakening the gate: a P0
+// requirement whose latest run passed still closes, and the reported checks
+// show that verification passed instead of being bypassed.
+func TestStewardClosesVerifiedP0(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedP0ClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+
+	tool := p4Tool(t, versionapp.VersionTools(env.svc, nil), "requirement.goal_met")
+	out, err := tool.Execute(context.Background(), agenttools.Scope{
+		VersionID:            701,
+		RequirementID:        requirement.ID,
+		RequirementVersionID: 1002,
+		AgentRunID:           9001,
+	}, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("requirement.goal_met: %v", err)
+	}
+	payload, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("requirement.goal_met result = %#v, want a JSON-ready map", out)
+	}
+	checks, ok := payload["checks"].(map[string]bool)
+	if !ok {
+		t.Fatalf("checks = %#v", payload["checks"])
+	}
+	if !checks["cases_verified"] || !checks["cases_terminal"] {
+		t.Fatalf("checks = %#v, want a verified passing case", checks)
+	}
+	stored := env.requirements.requirements[requirement.ID]
+	if stored.Status != version.RequirementClosed || stored.ClosedByRunID == nil || *stored.ClosedByRunID != 9001 {
+		t.Fatalf("stored requirement = %#v, want closed by the steward run", stored)
 	}
 }
 

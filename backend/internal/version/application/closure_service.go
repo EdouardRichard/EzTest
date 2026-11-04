@@ -84,7 +84,7 @@ func NewClosureService(deps ClosureServiceDeps) *ClosureService {
 	}
 }
 
-// Close recomputes the eight closure checks server-side and, when they all
+// Close recomputes the nine closure checks server-side and, when they all
 // pass, inserts the next closure round, marks the requirement closed and
 // publishes requirement.closed. The predicate is re-run inside the repository
 // transaction while the requirement row is locked, so a concurrent
