@@ -78,18 +78,30 @@ func (f *fakeConversationRepo) AppendAssistantMessageAsWriter(_ context.Context,
 	if !ok {
 		return nil, false, version.ErrConversationNotFound
 	}
-	if conversation.ActiveTurnID != nil && conversation.ActiveAgent != nil &&
-		conversation.LeaseUntil != nil && !conversation.LeaseUntil.Before(now) {
+	live := conversation.ActiveTurnID != nil && conversation.ActiveAgent != nil &&
+		conversation.LeaseUntil != nil && !conversation.LeaseUntil.Before(now)
+	switch {
+	case live:
 		if *conversation.ActiveTurnID != turnID || *conversation.ActiveAgent != agent {
 			return nil, false, version.ErrConversationBusy
 		}
-	} else {
+	case conversation.ActiveTurnID != nil && conversation.LeaseUntil != nil && conversation.LeaseUntil.Before(now):
+		// Crash recovery: only an expired non-NULL lease is taken over.
 		conversation.ActiveTurnID = &turnID
 		activeAgent := agent
 		conversation.ActiveAgent = &activeAgent
 		conversation.LeaseUntil = &leaseUntil
 		f.conversations[conversationID] = conversation
+	default:
+		// Idle or lease-less: AppendAssistant must never become the writer
+		// without an explicit Acquire.
+		return nil, false, version.ErrNotConversationWriter
 	}
+	kind := version.NormalizeMessageKind(message.Kind)
+	if err := version.ValidateConversationMessageKind(kind); err != nil {
+		return nil, false, err
+	}
+	message.Kind = kind
 	if message.ClientMessageID != nil {
 		for _, existing := range f.messages[conversationID] {
 			if existing.ClientMessageID != nil && *existing.ClientMessageID == *message.ClientMessageID {
@@ -105,6 +117,35 @@ func (f *fakeConversationRepo) AppendAssistantMessageAsWriter(_ context.Context,
 	conversation.UpdatedAt = message.CreatedAt
 	f.conversations[conversationID] = conversation
 	return nil, true, nil
+}
+
+// AppendAssistantMessageAsBackground mirrors the PostgreSQL fenced background
+// write: it re-checks the stored lease under the (fake) row lock and rejects a
+// live writer without appending. The call count lets a test prove the rejection
+// point is this repository contract rather than a stale pre-read.
+func (f *fakeConversationRepo) AppendAssistantMessageAsBackground(_ context.Context, conversationID int64, message version.Message, now time.Time) error {
+	f.backgroundFenceCalls++
+	conversation, ok := f.conversations[conversationID]
+	if !ok {
+		return version.ErrConversationNotFound
+	}
+	if conversation.ActiveTurnID != nil && conversation.LeaseUntil != nil && !conversation.LeaseUntil.Before(now) {
+		return version.ErrNotConversationWriter
+	}
+	kind := version.NormalizeMessageKind(message.Kind)
+	if err := version.ValidateConversationMessageKind(kind); err != nil {
+		return err
+	}
+	message.Kind = kind
+	f.messages[conversationID] = append(f.messages[conversationID], message)
+	if len(message.StreamParts) > 0 {
+		f.messageParts[message.ID] = append([]version.ConversationMessagePart(nil), message.StreamParts...)
+	}
+	conversation.MessageCount = len(f.messages[conversationID])
+	conversation.LastMessageAt = &message.CreatedAt
+	conversation.UpdatedAt = message.CreatedAt
+	f.conversations[conversationID] = conversation
+	return nil
 }
 
 // ---------- mutable-clock conversation environment ----------
@@ -414,5 +455,84 @@ func TestReservedHostTurnClientIDRejected(t *testing.T) {
 	}
 	if len(env.repo.messages[conversation.ID]) != 0 {
 		t.Fatalf("reserved message stored: %#v", env.repo.messages[conversation.ID])
+	}
+}
+
+// TestBackgroundAppendFenceIsAtomicInRepository pins the fix for the legacy
+// background assistant-text path: its live-lease fence must be part of the
+// repository's locked write, not a pre-read. Here GetByID is forced stale (it
+// reports an idle conversation) while the stored conversation has a live Host
+// lease, which is exactly the window in which a Host acquires after the
+// application read. A pre-read-only fence lets the background text through; the
+// repository call must reject it and leave the conversation unchanged.
+func TestBackgroundAppendFenceIsAtomicInRepository(t *testing.T) {
+	env := newLeaseConversationEnv(t)
+	conversation := env.createConversation(t)
+	if _, err := env.svc.Acquire(requestContext(), conversation.ID, "clarification_host", 101); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	// The Host acquired after the application's conversation read: model the
+	// stale read explicitly.
+	env.repo.hideLeaseFromGet = true
+
+	_, err := env.svc.AppendAssistantMessage(requestContext(), conversation.ID, textParts("background"), 9001)
+	var notWriter *versionapp.NotWriterError
+	if !errors.As(err, &notWriter) {
+		t.Fatalf("background append err = %v, want *NotWriterError from the repository fence", err)
+	}
+	if apiErr := apiError(t, err); apiErr.Status != http.StatusForbidden || apiErr.Code != versionapp.CodeNotWriter {
+		t.Fatalf("background append = %#v, want 403 not_writer", apiErr)
+	}
+	if notWriter.Reason != versionapp.NotWriterReasonServerWriter {
+		t.Fatalf("reason = %q, want %q", notWriter.Reason, versionapp.NotWriterReasonServerWriter)
+	}
+	if env.repo.backgroundFenceCalls != 1 {
+		t.Fatalf("repository fence calls = %d, want 1 (the rejection must come from the write, not the pre-read)",
+			env.repo.backgroundFenceCalls)
+	}
+	if len(env.repo.messages[conversation.ID]) != 0 {
+		t.Fatalf("fenced background append stored a message: %#v", env.repo.messages[conversation.ID])
+	}
+	stored := env.repo.conversations[conversation.ID]
+	if stored.ActiveTurnID == nil || *stored.ActiveTurnID != 101 ||
+		stored.ActiveAgent == nil || *stored.ActiveAgent != "clarification_host" {
+		t.Fatalf("background append disturbed the Host lease: %#v", stored)
+	}
+}
+
+// TestAppendAssistantRequiresExplicitLeaseOnIdleConversation pins the fix:
+// AppendAssistant must not silently become the writer of an idle conversation.
+// An explicit Acquire is required; only an expired non-NULL lease may be taken
+// over implicitly (TestLeaseExpiryRecovers).
+func TestAppendAssistantRequiresExplicitLeaseOnIdleConversation(t *testing.T) {
+	env := newLeaseConversationEnv(t)
+	conversation := env.createConversation(t)
+	writer := versionapp.Writer{TurnID: 101, Agent: "clarification_host"}
+
+	_, err := env.svc.AppendAssistant(requestContext(), conversation.ID, writer, textParts("no lease"), 555, nil)
+	var notWriter *versionapp.NotWriterError
+	if !errors.As(err, &notWriter) {
+		t.Fatalf("idle append err = %v, want *NotWriterError", err)
+	}
+	if apiErr := apiError(t, err); apiErr.Status != http.StatusForbidden || apiErr.Code != versionapp.CodeNotWriter {
+		t.Fatalf("idle append = %#v, want 403 not_writer", apiErr)
+	}
+	if len(env.repo.messages[conversation.ID]) != 0 {
+		t.Fatalf("idle append stored a message: %#v", env.repo.messages[conversation.ID])
+	}
+	stored := env.repo.conversations[conversation.ID]
+	if stored.ActiveTurnID != nil || stored.ActiveAgent != nil || stored.LeaseUntil != nil {
+		t.Fatalf("idle append silently claimed the lease: %#v", stored)
+	}
+
+	// The explicit acquisition is the supported path.
+	if _, err := env.svc.Acquire(requestContext(), conversation.ID, writer.Agent, writer.TurnID); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := env.svc.AppendAssistant(requestContext(), conversation.ID, writer, textParts("leased"), 555, nil); err != nil {
+		t.Fatalf("append after Acquire: %v", err)
+	}
+	if len(env.repo.messages[conversation.ID]) != 1 {
+		t.Fatalf("messages = %#v", env.repo.messages[conversation.ID])
 	}
 }

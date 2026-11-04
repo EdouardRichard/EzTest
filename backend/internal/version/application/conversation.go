@@ -532,6 +532,13 @@ func (s *ConversationService) AppendAssistantMessage(ctx context.Context, conver
 
 // AppendAssistantMessageWithReply is AppendAssistantMessage plus the optional
 // UI reply target (the Host assistant answers a specific user message).
+//
+// A background/server writer has no conversation.append capability while a
+// Host turn owns the conversation (R-B2-4). This legacy path carries no writer
+// identity, so it writes through the repository's fenced background append:
+// the live-lease check and the insert are one locked transaction. The read
+// below is only for the version projection; it must not be used as the fence,
+// because a Host can acquire between that read and the write.
 func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Context, conversationID int64, parts []version.MessagePart, runID int64, replyToMessageID *int64) (MessageView, error) {
 	if conversationID <= 0 {
 		return MessageView{}, platform.Invalid("cid", "must be a positive decimal ID")
@@ -542,15 +549,6 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 	conversation, err := s.repo.GetByID(ctx, conversationID)
 	if err != nil {
 		return MessageView{}, mapConversationRepositoryError(err)
-	}
-	// A background/server writer has no conversation.append capability while a
-	// Host turn owns the conversation (R-B2-4). This legacy path carries no
-	// writer identity, so a live lease means it must not append assistant text;
-	// job cards use the repository-direct UpsertJobCard path instead, and the
-	// Host runtime writes through AppendAssistant (typed lease check).
-	if conversation.ActiveTurnID != nil && conversation.ActiveAgent != nil && *conversation.ActiveAgent != "" &&
-		conversation.LeaseUntil != nil && !conversation.LeaseUntil.Before(s.clock.Now()) {
-		return MessageView{}, newNotWriterError(conversationID, 0, "", NotWriterReasonServerWriter)
 	}
 	if err := version.ValidateAssistantMessageParts(parts); err != nil {
 		return MessageView{}, err
@@ -577,7 +575,10 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 		value := runID
 		message.AgentRunID = &value
 	}
-	if err := s.repo.AppendAssistantMessage(ctx, conversationID, message); err != nil {
+	if err := s.repo.AppendAssistantMessageAsBackground(ctx, conversationID, message, now); err != nil {
+		if errors.Is(err, version.ErrNotConversationWriter) {
+			return MessageView{}, newNotWriterError(conversationID, 0, "", NotWriterReasonServerWriter)
+		}
 		return MessageView{}, mapConversationRepositoryError(err)
 	}
 	s.publishMessageEvent(ctx, conversation.VersionID, message)

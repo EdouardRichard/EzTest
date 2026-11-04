@@ -35,6 +35,14 @@ type fakeConversationRepo struct {
 	// jobCardFindOverride makes the next FindJobCardMessage return a stale
 	// snapshot, modelling a cancel that commits right after the lookup.
 	jobCardFindOverride *version.Message
+	// hideLeaseFromGet makes GetByID return a snapshot without the lease,
+	// modelling a Host that acquires between the application's conversation read
+	// and the repository's fenced write.
+	hideLeaseFromGet bool
+	// backgroundFenceCalls counts writes that reached the atomic background
+	// fence, proving a rejection came from the repository write contract rather
+	// than from a stale application pre-read.
+	backgroundFenceCalls int
 }
 
 func newFakeConversationRepo() *fakeConversationRepo {
@@ -74,6 +82,11 @@ func (f *fakeConversationRepo) GetByID(_ context.Context, conversationID int64) 
 	conversation, ok := f.conversations[conversationID]
 	if !ok {
 		return version.Conversation{}, version.ErrConversationNotFound
+	}
+	if f.hideLeaseFromGet {
+		conversation.ActiveTurnID = nil
+		conversation.ActiveAgent = nil
+		conversation.LeaseUntil = nil
 	}
 	return conversation, nil
 }

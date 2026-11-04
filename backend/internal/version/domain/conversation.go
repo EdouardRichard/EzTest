@@ -558,6 +558,16 @@ type ConversationRepository interface {
 	// returns the already-stored message instead of an error.
 	PostUserMessage(ctx context.Context, conversationID int64, message Message) (*Message, bool, error)
 	AppendAssistantMessage(ctx context.Context, conversationID int64, message Message) error
+	// AppendAssistantMessageAsBackground inserts one server/background assistant
+	// message only while no live Host writer lease exists. The conversation row
+	// is locked FOR UPDATE, so the lease re-check and the insert are one
+	// serialized step: a Host that acquires between the caller's read and this
+	// write cannot be overtaken by background text. A live lease (any turn,
+	// including the caller's) is ErrNotConversationWriter — the background path
+	// never becomes a writer, never renews and never clears the lease. An idle
+	// conversation or an expired non-NULL lease stays writable; the stored lease
+	// fields are left untouched so the owning turn's lifecycle is unaffected.
+	AppendAssistantMessageAsBackground(ctx context.Context, conversationID int64, message Message, now time.Time) error
 	// AcquireWriter atomically claims the conversation's single-writer lease for
 	// (turnID, agent) until leaseUntil. It succeeds when the conversation is idle
 	// (no active turn), when the stored lease already expired at now, or when the
