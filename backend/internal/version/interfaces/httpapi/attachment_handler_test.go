@@ -121,6 +121,19 @@ func TestAttachmentReanalyzeHandler(t *testing.T) {
 	}
 }
 
+func TestAttachmentReanalyzeHandlerNotFound(t *testing.T) {
+	mux, stub := newAttachmentImageServer(t)
+	stub.rows = nil
+	stub.err = platform.NotFound("attachment")
+	recorder := call(t, mux, http.MethodPost, "/api/attachments/9999/reanalyze", "", &platform.Actor{ID: 42})
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.reanalyze != 1 {
+		t.Fatalf("service calls = %d, want the handler to surface the service error", stub.reanalyze)
+	}
+}
+
 func TestAttachmentReanalyzeHandlerRequiresAuth(t *testing.T) {
 	mux, stub := newAttachmentImageServer(t)
 	recorder := call(t, mux, http.MethodPost, "/api/attachments/8001/reanalyze", "", nil)

@@ -234,6 +234,14 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 			errors.New("llm provider returned an empty model catalog; existing models were left unchanged"),
 			cfg.APIKey, "failed to refresh llm models")
 	}
+	// R-E2-2: a catalog refresh must not make the default-model vision
+	// invariant reversible by silently downgrading the configured default
+	// model. Reject the refresh before the upsert so no capability change is
+	// persisted; the stored catalog (and the default's vision support) stays
+	// intact and the admin can choose another vision-capable default first.
+	if err := validateRefreshedDefaultModel(cfg, existing, models); err != nil {
+		return nil, err
+	}
 
 	upserted, err := s.repo.UpsertModels(ctx, id, models, now)
 	if err != nil {
@@ -377,6 +385,23 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 	}
 	target.Capabilities = capabilities
 	target.UpdatedAt = s.clock.Now()
+
+	// R-E2-2 irreversibility: gating only the default assignment would let a
+	// capability PATCH remove supports_vision from the model that is already
+	// the configured default. Reject that write (and any update that would
+	// leave the default non-vision) before it is persisted. A missing config is
+	// tolerated for repository fixtures: such a catalog has no default to
+	// protect, and the repository itself scopes the update by (id, config_id).
+	if !target.EffectiveCapabilities().SupportsVision {
+		cfg, configErr := s.repo.GetConfig(ctx, configID)
+		switch {
+		case configErr == nil && cfg.DefaultModelID == target.ID:
+			return llm.Model{}, invalidVisionDefaultModelError(
+				"supports_vision", target.Model, "default_model_vision_downgrade")
+		case configErr != nil && !errors.Is(configErr, llm.ErrConfigNotFound):
+			return llm.Model{}, mapRepositoryError(configErr)
+		}
+	}
 
 	stored, err := s.repo.UpdateModel(ctx, *target)
 	if err != nil {
@@ -628,21 +653,58 @@ func (s *Service) validateDefaultModel(ctx context.Context, cfg llm.Config) erro
 		// Without this gate the configuration would be persistable but every
 		// image-bearing attachment would fail only at analysis time.
 		if !model.EffectiveCapabilities().SupportsVision {
-			return invalidVisionDefaultModelError(model.Model)
+			return invalidVisionDefaultModelError("default_model_id", model.Model, "")
 		}
 		return nil
 	}
 	return platform.Invalid("default_model_id", "must reference a model of this LLM configuration")
 }
 
+// validateRefreshedDefaultModel enforces the default-model vision invariant
+// against the merged upstream catalog before a refresh is persisted (R-E2-2).
+// The configured default is identified by ID in the stored catalog and matched
+// to the refresh entry by model name (the upsert preserves the stored row ID).
+// A default model that disappeared from the upstream catalog is handled by the
+// repository's deprecation rule, not by this vision guard.
+func validateRefreshedDefaultModel(cfg llm.Config, existing, refreshed []llm.Model) error {
+	if cfg.DefaultModelID <= 0 {
+		return nil
+	}
+	defaultName := ""
+	for _, model := range existing {
+		if model.ID == cfg.DefaultModelID {
+			defaultName = model.Model
+			break
+		}
+	}
+	if defaultName == "" {
+		return nil
+	}
+	for _, model := range refreshed {
+		if model.Model != defaultName {
+			continue
+		}
+		if !model.EffectiveCapabilities().SupportsVision {
+			return invalidVisionDefaultModelError("default_model_id", model.Model, "upstream_catalog_lost_vision")
+		}
+		return nil
+	}
+	return nil
+}
+
 // invalidVisionDefaultModelError is the typed 400 for a non-vision default
-// model. The stable invalid_argument code and default_model_id field let the
-// admin UI map it back onto the field instead of showing a generic failure.
-func invalidVisionDefaultModelError(model string) error {
-	apiErr := platform.Invalid("default_model_id",
-		"must reference a model with supports_vision=true; document images and image drafts require vision analysis")
+// model. The stable invalid_argument code and the field let the admin UI map it
+// back onto the offending control instead of showing a generic failure. reason
+// is an optional stable explanation (for example that the upstream catalog lost
+// the capability) surfaced in the error details.
+func invalidVisionDefaultModelError(field, model, reason string) error {
+	apiErr := platform.Invalid(field,
+		"the default model must have supports_vision=true; document images and image drafts require vision analysis")
 	apiErr.Details["model"] = model
 	apiErr.Details["missing_capabilities"] = []string{"vision"}
+	if reason != "" {
+		apiErr.Details["reason"] = reason
+	}
 	return apiErr
 }
 

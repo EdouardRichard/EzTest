@@ -325,11 +325,13 @@ func (r *AttachmentRepository) MarkImageDone(ctx context.Context, imageID int64,
 	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image done")
 }
 
-// MarkImageFailed stores the analysis failure reason.
+// MarkImageFailed stores the analysis failure reason and clears any caption
+// written before the failure, so a failed row never exposes an analyzed caption
+// to API/event consumers.
 func (r *AttachmentRepository) MarkImageFailed(ctx context.Context, imageID int64, message string, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE attachment_image
-		SET status = 'failed', error = $2, updated_at = $3
+		SET status = 'failed', caption = '', error = $2, updated_at = $3
 		WHERE id = $1
 	`, imageID, message, updatedAt)
 	if err != nil {

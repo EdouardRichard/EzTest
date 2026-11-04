@@ -668,11 +668,14 @@ func (s *AttachmentService) ListImages(ctx context.Context, attachmentID int64) 
 	return s.attachmentImageViews(ctx, attachmentID)
 }
 
-// Reanalyze re-runs vision analysis for the failed/skipped images of one
-// attachment. Rows are reset in place (no duplicate rows or content objects)
-// and the attachment returns to done only when every image succeeds. Without a
-// vision model the call is rejected with the same typed ErrVisionRequired as
-// the send path, so the UI can point at the missing configuration.
+// Reanalyze re-runs vision analysis for every claimable image row of one
+// attachment. Failed/skipped rows are reset in place (no duplicate rows or
+// content objects) and rows already sitting in the extracted state are analyzed
+// too, so a crash between the reset and the vision calls is recoverable. The
+// attachment returns to done only when at least one row was analyzed and every
+// image succeeded. Without a vision model the call is rejected with the same
+// typed ErrVisionRequired as the send path, so the UI can point at the missing
+// configuration; a transient availability failure is a retryable error instead.
 func (s *AttachmentService) Reanalyze(ctx context.Context, attachmentID int64) ([]AttachmentImageView, error) {
 	if attachmentID <= 0 {
 		return nil, platform.Invalid("attachment_id", "must be a positive decimal ID")
@@ -688,46 +691,49 @@ func (s *AttachmentService) Reanalyze(ctx context.Context, attachmentID int64) (
 	if len(existing) == 0 {
 		return []AttachmentImageView{}, nil
 	}
-	if available, reason := s.visionAvailability(ctx); !available {
-		s.publishVisionUnavailable(ctx, attachment)
+	available, reason, err := s.visionStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !available {
+		s.publishVisionUnavailable(ctx, attachment, reason)
 		return nil, newVisionRequiredError(attachment, reason)
 	}
-	reset, err := s.repo.ResetImagesForReanalysis(ctx, attachmentID, s.clock.Now())
+	if _, err := s.repo.ResetImagesForReanalysis(ctx, attachmentID, s.clock.Now()); err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	rows, err := s.repo.ListImages(ctx, attachmentID)
 	if err != nil {
 		return nil, mapAttachmentRepositoryError(err)
 	}
-	if reset > 0 {
-		rows, err := s.repo.ListImages(ctx, attachmentID)
-		if err != nil {
+	failures := 0
+	analyzed := 0
+	firstFailure := ""
+	for _, image := range rows {
+		if image.Status != version.AttachmentImageExtracted {
+			continue
+		}
+		analyzed++
+		if err := s.analyzeExtractedImage(ctx, attachment, image); err != nil {
+			failures++
+			if firstFailure == "" {
+				firstFailure = err.Error()
+			}
+		}
+	}
+	if failures > 0 {
+		message := fmt.Sprintf("image analysis failed for %d of %d image(s): %s",
+			failures, len(rows), firstFailure)
+		if _, err := s.failAttachment(ctx, attachment, version.AttachmentErrorVisionAnalysis, message, nil); err != nil {
+			return nil, err
+		}
+	} else if analyzed > 0 {
+		textRefID := derefInt64(attachment.ExtractedContentRefID)
+		if textRefID <= 0 {
+			return nil, fmt.Errorf("attachment %d has no extracted text reference; re-upload the attachment", attachmentID)
+		}
+		if err := s.repo.MarkDone(ctx, attachmentID, textRefID, s.clock.Now()); err != nil {
 			return nil, mapAttachmentRepositoryError(err)
-		}
-		failures := 0
-		firstFailure := ""
-		for _, image := range rows {
-			if image.Status != version.AttachmentImageExtracted {
-				continue
-			}
-			if err := s.analyzeExtractedImage(ctx, attachment, image); err != nil {
-				failures++
-				if firstFailure == "" {
-					firstFailure = err.Error()
-				}
-			}
-		}
-		if failures > 0 {
-			message := fmt.Sprintf("image analysis failed for %d of %d image(s): %s",
-				failures, len(rows), firstFailure)
-			if _, err := s.failAttachment(ctx, attachment, version.AttachmentErrorVisionAnalysis, message, nil); err != nil {
-				return nil, err
-			}
-		} else {
-			textRefID := derefInt64(attachment.ExtractedContentRefID)
-			if textRefID <= 0 {
-				return nil, fmt.Errorf("attachment %d has no extracted text reference; re-upload the attachment", attachmentID)
-			}
-			if err := s.repo.MarkDone(ctx, attachmentID, textRefID, s.clock.Now()); err != nil {
-				return nil, mapAttachmentRepositoryError(err)
-			}
 		}
 	}
 	return s.attachmentImageViews(ctx, attachmentID)
@@ -748,8 +754,12 @@ func (s *AttachmentService) ensureVisionForImageBearingAttachment(ctx context.Co
 	if len(images) == 0 {
 		return nil
 	}
-	if available, reason := s.visionAvailability(ctx); !available {
-		s.publishVisionUnavailable(ctx, attachment)
+	available, reason, err := s.visionStatus(ctx)
+	if err != nil {
+		return err
+	}
+	if !available {
+		s.publishVisionUnavailable(ctx, attachment, reason)
 		return newVisionRequiredError(attachment, reason)
 	}
 	return nil
@@ -1108,6 +1118,16 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		return ExtractionResult{Attachment: toAttachmentView(attachment)}, nil
 	}
 
+	// Resolve vision availability before the row is claimed: a transient
+	// availability-check failure must remain retryable, so the attachment has to
+	// stay claimable (pending). The definitive no-vision answer is carried to
+	// the image-persistence step below and only affects documents that actually
+	// contain images.
+	visionAvailable, visionReason, err := s.visionStatus(ctx)
+	if err != nil {
+		return ExtractionResult{}, err
+	}
+
 	objectID, err := s.originalObjectID(ctx, attachmentID, attachment.ContentRefID)
 	if err != nil {
 		return ExtractionResult{}, err
@@ -1185,7 +1205,6 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	// content ledger, never in the DB) and then analyzed one by one (R-E2-1,
 	// R-E3-2). No vision model is an explicit whole-attachment failure, not a
 	// silent skip (R-E2-2/R-E3-3).
-	visionAvailable, visionReason := s.visionAvailability(ctx)
 	imageStatus := version.AttachmentImageExtracted
 	imageSkipReason := ""
 	if !visionAvailable {
@@ -1199,7 +1218,7 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	if len(imageRows) > 0 {
 		if !visionAvailable {
 			message := "attachment contains embedded images, but " + visionUnavailableMessage(visionReason)
-			s.publishVisionUnavailable(ctx, attachment)
+			s.publishVisionUnavailable(ctx, attachment, visionReason)
 			return s.failAttachment(ctx, attachment, version.AttachmentErrorVisionRequired, message, parsed.Images)
 		}
 		failures := 0
@@ -1290,22 +1309,24 @@ func (s *AttachmentService) failAttachment(ctx context.Context, attachment versi
 	}, nil
 }
 
-// visionAvailability reports whether a vision-capable model is configured and,
-// when it is not, a human-readable reason. A nil captioner is a deployment
-// without the image-analysis feature: fail closed instead of degrading to a
-// silent skip (R-E2-2).
-func (s *AttachmentService) visionAvailability(ctx context.Context) (bool, string) {
+// visionStatus reports whether a vision-capable model is configured and, when
+// it is not, a human-readable reason. A nil captioner is a deployment without
+// the image-analysis feature: fail closed instead of degrading to a silent skip
+// (R-E2-2). A transient availability-check failure is returned as err so every
+// caller treats it as a retryable failure; only a definitive "no vision model"
+// answer becomes the typed vision_required outcome.
+func (s *AttachmentService) visionStatus(ctx context.Context) (bool, string, error) {
 	if s.vision == nil {
-		return false, "vision image analysis is not configured"
+		return false, "vision image analysis is not configured", nil
 	}
 	available, err := s.vision.Available(ctx)
 	if err != nil {
-		return false, err.Error()
+		return false, "", fmt.Errorf("check vision model availability: %w", err)
 	}
 	if !available {
-		return false, ""
+		return false, "no vision-capable model is configured", nil
 	}
-	return true, ""
+	return true, "", nil
 }
 
 func visionUnavailableMessage(reason string) string {
@@ -1318,11 +1339,12 @@ func visionUnavailableMessage(reason string) string {
 
 // publishVisionUnavailable emits model.vision.unavailable so the UI can tell
 // the user to configure a vision model instead of assuming the images were
-// understood. The payload names the attachment and the next action.
-func (s *AttachmentService) publishVisionUnavailable(ctx context.Context, attachment version.Attachment) {
+// understood. The payload carries the concrete reason plus the next action.
+func (s *AttachmentService) publishVisionUnavailable(ctx context.Context, attachment version.Attachment, reason string) {
 	s.publishAttachmentEvent(ctx, attachment.VersionID, "model.vision.unavailable", attachment, map[string]any{
 		"attachment_id": platformid.Format(attachment.ID),
-		"message":       visionUnavailableMessage(""),
+		"reason":        reason,
+		"message":       visionUnavailableMessage(reason),
 		"next_action":   "configure a vision-capable default model, then reanalyze the attachment",
 	})
 }
@@ -1385,9 +1407,10 @@ func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachme
 }
 
 // analyzeExtractedImage runs one image through the vision port. Success stores
-// the caption, appends the attachment_image_caption fact and emits
-// attachment.image.analyzed; any failure marks the image failed with the reason
-// and emits attachment.image.failed.
+// the caption, appends the attachment_image_caption fact and only then emits
+// attachment.image.analyzed (a consumer must never observe an analyzed image
+// whose caption fact was not persisted); any failure marks the image failed
+// with the reason (clearing the caption) and emits attachment.image.failed.
 func (s *AttachmentService) analyzeExtractedImage(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord) error {
 	now := s.clock.Now()
 	started, err := s.repo.MarkImageAnalyzing(ctx, image.ID, now)
@@ -1418,12 +1441,12 @@ func (s *AttachmentService) analyzeExtractedImage(ctx context.Context, attachmen
 	image.Status = version.AttachmentImageDone
 	image.Caption = text
 	image.Error = ""
-	s.publishImageEvent(ctx, attachment, image, "attachment.image.analyzed", map[string]any{
-		"caption": text, "model": caption.Model,
-	})
 	if err := s.recordImageCaptionFact(ctx, attachment, image, caption, sha256); err != nil {
 		return s.failAnalyzedImage(ctx, attachment, image, fmt.Errorf("record caption fact: %w", err))
 	}
+	s.publishImageEvent(ctx, attachment, image, "attachment.image.analyzed", map[string]any{
+		"caption": text, "model": caption.Model,
+	})
 	return nil
 }
 

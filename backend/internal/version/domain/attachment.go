@@ -213,12 +213,16 @@ type AttachmentRepository interface {
 	// MarkImageAnalyzing flips an extracted/skipped/failed row to analyzing and
 	// reports whether this call changed it. done/analyzing rows are untouched.
 	MarkImageAnalyzing(ctx context.Context, imageID int64, updatedAt time.Time) (bool, error)
+	// MarkImageDone stores the caption and clears any previous error.
 	MarkImageDone(ctx context.Context, imageID int64, caption string, updatedAt time.Time) error
+	// MarkImageFailed stores the failure reason and clears any caption written
+	// before the failure, so a failed row never exposes a stale caption.
 	MarkImageFailed(ctx context.Context, imageID int64, message string, updatedAt time.Time) error
 	// ResetImagesForReanalysis re-queues failed/skipped image rows as extracted,
 	// clearing caption/error. The content reference is preserved, so a reanalyze
 	// never creates a duplicate content object. It returns how many rows were
-	// reset (0 makes the reanalyze an idempotent no-op).
+	// reset; rows already in the extracted state remain claimable, which is what
+	// lets a reanalyze recover from a crash after the reset.
 	ResetImagesForReanalysis(ctx context.Context, attachmentID int64, updatedAt time.Time) (int64, error)
 	// ListPendingForIngest returns the oldest pending attachments for the P1
 	// attachment.ingest reconciler.

@@ -94,6 +94,8 @@ func (f *fakeAttachmentRepo) MarkImageFailed(_ context.Context, imageID int64, m
 		return version.ErrAttachmentNotFound
 	}
 	image.Status = version.AttachmentImageFailed
+	// A failed row must never expose a previously stored analyzed caption.
+	image.Caption = ""
 	image.Error = message
 	image.UpdatedAt = updatedAt
 	f.images[imageID] = image
@@ -129,9 +131,12 @@ type fakeVisionCaptioner struct {
 	caption      string
 	confidence   *float64
 	err          error
-	calls        int
-	lastMIME     string
-	lastData     []byte
+	// callErrs fails selected Caption calls by 1-based call index, so a
+	// multi-image attachment can fail only one of its images.
+	callErrs []error
+	calls    int
+	lastMIME string
+	lastData []byte
 }
 
 func (f *fakeVisionCaptioner) Available(context.Context) (bool, error) {
@@ -144,6 +149,9 @@ func (f *fakeVisionCaptioner) Caption(_ context.Context, mime string, data []byt
 	f.lastData = append([]byte(nil), data...)
 	if f.err != nil {
 		return versionapp.ImageCaption{}, f.err
+	}
+	if f.calls <= len(f.callErrs) && f.callErrs[f.calls-1] != nil {
+		return versionapp.ImageCaption{}, f.callErrs[f.calls-1]
 	}
 	return versionapp.ImageCaption{Caption: f.caption, Confidence: f.confidence, Model: "fake-vision"}, nil
 }
