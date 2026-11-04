@@ -420,10 +420,12 @@ func TestRunnerSettlesOnTurnFuse(t *testing.T) {
 	}
 }
 
-// TestRunnerSettlesWhenZeroTotalReportsComponents pins the usage aggregation:
-// providers that report total_tokens=0 plus a component breakdown must still
-// hit the token budget, otherwise the settlement turn never triggers.
-func TestRunnerSettlesWhenZeroTotalReportsComponents(t *testing.T) {
+// TestRunnerTokenUsageIsTelemetryOnly pins R-A2-1 at the real loop: a provider
+// that reports total_tokens=0 plus a component breakdown is still recorded as
+// telemetry, but token usage (even over a legacy max_tokens) never opens the
+// settlement turn. The second model turn keeps its tools and the run ends only
+// when the model stops on its own.
+func TestRunnerTokenUsageIsTelemetryOnly(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	item := hostItem()
 	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":12}`)
@@ -432,7 +434,7 @@ func TestRunnerSettlesWhenZeroTotalReportsComponents(t *testing.T) {
 			ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
 			Usage:     map[string]int{"total_tokens": 0, "prompt_tokens": 7, "completion_tokens": 7},
 		},
-		{Content: "预算已用尽，以下为收尾回复。"},
+		{Content: "继续完成本轮，不受 token 用量影响。"},
 	}
 
 	result, err := mustRun(t, fixture, item)
@@ -440,10 +442,19 @@ func TestRunnerSettlesWhenZeroTotalReportsComponents(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if result.Status != agent.AgentRunDone {
-		t.Fatalf("result = %#v, want a settled done run", result)
+		t.Fatalf("result = %#v, want a done run", result)
 	}
-	if count := len(fixture.chat.request(1).Tools); count != 0 {
-		t.Fatalf("settlement turn still exposes %d tools; the component breakdown was ignored", count)
+	if result.SettlementCause != "" {
+		t.Fatalf("settlement cause = %q, want none (tokens are telemetry)", result.SettlementCause)
+	}
+	if result.Usage["prompt_tokens"] != 7 || result.Usage["completion_tokens"] != 7 {
+		t.Fatalf("token telemetry = %#v, want the component breakdown preserved", result.Usage)
+	}
+	if fixture.chat.requestCount() != 2 {
+		t.Fatalf("chat calls = %d, want 2", fixture.chat.requestCount())
+	}
+	if count := len(fixture.chat.request(1).Tools); count == 0 {
+		t.Fatal("the second turn lost its tools; token usage must not open settlement")
 	}
 }
 
@@ -1228,37 +1239,6 @@ func TestRunnerEnforcesRoleToolWhitelist(t *testing.T) {
 	}
 	if !audited {
 		t.Fatalf("no %s audit event: %#v", agentapp.ActionRoleToolDenied, fixture.audit.events)
-	}
-}
-
-// TestRunnerSettlesOnWorkItemTokenBudget pins the Task 9 Budget.Decide seam in
-// the real loop: the work item's token budget is hit after the first turn, so
-// the next request is a tool-less settlement turn and the run ends with the
-// model's final text instead of spending another tool turn.
-func TestRunnerSettlesOnWorkItemTokenBudget(t *testing.T) {
-	fixture := newRunnerFixture(t)
-	item := hostItem()
-	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":12}`)
-	fixture.chat.responses = []llmapp.ChatResponse{
-		{
-			ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
-			Usage:     map[string]int{"total_tokens": 10},
-		},
-		{Content: "预算已用尽，以下为收尾回复。"},
-	}
-
-	result, err := mustRun(t, fixture, item)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if result.Status != agent.AgentRunDone {
-		t.Fatalf("result = %#v, want a settled done run", result)
-	}
-	if fixture.chat.requestCount() != 2 {
-		t.Fatalf("chat calls = %d, want tool turn + settlement turn", fixture.chat.requestCount())
-	}
-	if tools := len(fixture.chat.request(1).Tools); tools != 0 {
-		t.Fatalf("settlement turn still exposes %d tools", tools)
 	}
 }
 

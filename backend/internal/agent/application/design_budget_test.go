@@ -6,12 +6,11 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
-// TestDesignRunBudgetAllowsPropose pins the S4 "runtime exhausted before
-// case.graph_propose" failure. A design conversation carries the whole thread
-// plus a full design-graph read; the generic chat-scale 20k-token budget can be
-// exhausted after the read, which forces the settlement turn and disables tools
-// exactly before the write. Design profiles therefore need a case-scale token
-// budget and must not be clamped by the generic agent.max_turns guard.
+// TestDesignRunBudgetAllowsPropose pins that the design team's v0.22 runtime
+// envelope no longer carries a token ceiling: the S4 "runtime exhausted before
+// case.graph_propose" failure is removed by making token usage telemetry only
+// (R-A2-1/R-A2-4). The design Host still gets its 16-turn / 600s soft guard and
+// must not be clamped by the chat-scale agent.max_turns setting.
 func TestDesignRunBudgetAllowsPropose(t *testing.T) {
 	runner := &Runner{}
 	designHost := agent.AgentProfile{
@@ -21,9 +20,9 @@ func TestDesignRunBudgetAllowsPropose(t *testing.T) {
 		},
 	}
 	budget := runner.resourceBudget(agent.WorkItem{VersionID: 1, Type: WorkTypeChatTurn}, designHost)
-	if budget.MaxTokens <= DefaultBudgetMaxTokens {
-		t.Fatalf("design token budget = %d, want a case-scale budget above the %d chat default",
-			budget.MaxTokens, DefaultBudgetMaxTokens)
+	if !budget.UnlimitedTokens || budget.MaxTokens != 0 {
+		t.Fatalf("design token budget = {max=%d unlimited=%v}, want unlimited telemetry",
+			budget.MaxTokens, budget.UnlimitedTokens)
 	}
 	if budget.RunSeconds != 600 {
 		t.Fatalf("design run seconds = %d, want the profile budget 600", budget.RunSeconds)
@@ -32,15 +31,17 @@ func TestDesignRunBudgetAllowsPropose(t *testing.T) {
 		t.Fatalf("design max turns = %d, want the profile budget 16 (the chat-scale agent.max_turns must not clamp it)", got)
 	}
 
-	// Clarification stays on the generic chat-scale budget.
+	// Clarification keeps the chat turn guard and its token budget is unlimited
+	// telemetry too.
 	clarification := agent.AgentProfile{
 		Key:     ProfileKeyClarificationHost,
-		Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+		Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 600, HardSeconds: 900},
 	}
 	if got := runner.maxTurns(clarification); got != defaultMaxTurns {
 		t.Fatalf("clarification max turns = %d, want the chat-scale %d", got, defaultMaxTurns)
 	}
-	if got := runner.resourceBudget(agent.WorkItem{VersionID: 1, Type: WorkTypeChatTurn}, clarification).MaxTokens; got != DefaultBudgetMaxTokens {
-		t.Fatalf("clarification token budget = %d, want %d", got, DefaultBudgetMaxTokens)
+	if got := runner.resourceBudget(agent.WorkItem{VersionID: 1, Type: WorkTypeChatTurn}, clarification); !got.UnlimitedTokens || got.MaxTokens != 0 {
+		t.Fatalf("clarification token budget = {max=%d unlimited=%v}, want unlimited telemetry",
+			got.MaxTokens, got.UnlimitedTokens)
 	}
 }

@@ -24,7 +24,7 @@ func TestP1ProfilesMatchContract(t *testing.T) {
 	if !strings.Contains(host.SystemPrompt, "[profile:clarification_host]") {
 		t.Fatalf("host prompt missing fake marker: %s", host.SystemPrompt)
 	}
-	if host.Budgets.MaxTurns != 12 || host.Budgets.SoftSeconds != 300 || host.Budgets.HardSeconds != 600 {
+	if host.Budgets.MaxTurns != 12 || host.Budgets.SoftSeconds != 600 || host.Budgets.HardSeconds != 900 {
 		t.Fatalf("host budgets = %#v", host.Budgets)
 	}
 	if len(host.AllowedTools) != 9 {
@@ -106,7 +106,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			tools: []string{
 				tools.ToolContextTaskPack, tools.ToolDesignGraphRead, tools.ToolDesignReviewSubmit,
 			},
-			budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
+			budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_critic]",
 			mustSay: []string{"内部", "不构成人工关卡", "视觉基线", "visual"},
 		},

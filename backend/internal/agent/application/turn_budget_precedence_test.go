@@ -29,8 +29,9 @@ func TestTurnBudgetPrecedence(t *testing.T) {
 	if budget.MaxTurnsFuse != 59 {
 		t.Fatalf("execute.case turn fuse = %d, want 59 (one below the 60-turn loop cap)", budget.MaxTurnsFuse)
 	}
-	if budget.MaxTokens != CaseExecutorRunMaxTokens {
-		t.Fatalf("execute.case token budget = %d, want %d", budget.MaxTokens, CaseExecutorRunMaxTokens)
+	if !budget.UnlimitedTokens || budget.MaxTokens != 0 {
+		t.Fatalf("execute.case token budget = {max=%d unlimited=%v}, want unlimited telemetry",
+			budget.MaxTokens, budget.UnlimitedTokens)
 	}
 	if budget.RunSeconds != 780 {
 		t.Fatalf("execute.case run seconds = %d, want the profile's 780", budget.RunSeconds)
@@ -41,10 +42,9 @@ func TestTurnBudgetPrecedence(t *testing.T) {
 	if got := budget.ExceededBy(Usage{Turns: 59}); got != BudgetCauseTurns {
 		t.Fatalf("turn cause at the fuse = %q, want %q", got, BudgetCauseTurns)
 	}
-	// With an unlimited token budget the token cap is not a cause at 15 turns.
-	// not a 16-turn cap: the same envelope reports the token cause there.
+	// Token usage is telemetry: 50M tokens at 15 turns is not a cause.
 	if got := budget.ExceededBy(Usage{Turns: 15, Tokens: 50_000_000}); got != "" {
-		t.Fatalf("cause at the token budget = %q, want %q", got, BudgetCauseTokens)
+		t.Fatalf("cause at 50M tokens = %q, want none", got)
 	}
 }
 

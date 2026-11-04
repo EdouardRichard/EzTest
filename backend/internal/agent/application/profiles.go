@@ -105,8 +105,9 @@ var contextScoutTools = []string{
 	tools.ToolContextTeamRoomRead,
 }
 
-// P1Profiles returns fresh seed definitions. Values match the frozen budgets in
-// the P1 profile contract; EnsureProfiles never overwrites admin edits.
+// P1Profiles returns fresh seed definitions. The clarification Host carries the
+// v0.22 R-A2-2 envelope (12 turns / 600s soft / 900s hard); EnsureProfiles never
+// overwrites admin edits.
 func P1Profiles() []agent.AgentProfile {
 	return []agent.AgentProfile{
 		{
@@ -114,8 +115,10 @@ func P1Profiles() []agent.AgentProfile {
 			Name:         "澄清 Host",
 			SystemPrompt: clarificationHostPrompt,
 			AllowedTools: append([]string(nil), clarificationHostTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
-			Enabled:      true,
+			// v0.22 R-A2-2: multi-turn clarification must not be cut off by the
+			// old 300s soft / 600s hard chat clock; tokens are telemetry only.
+			Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 600, HardSeconds: 900},
+			Enabled: true,
 		},
 		{
 			Key:          ProfileKeyRequirementCurator,
@@ -241,9 +244,10 @@ var dataPlannerTools = []string{
 	tools.ToolDesignDataPlanSubmit,
 }
 
-// P2Profiles returns fresh P2 seed definitions. Budgets and tool sets are
-// frozen by the P2 profile contract; EnsureProfiles never overwrites admin
-// edits.
+// P2Profiles returns fresh P2 seed definitions. Tool sets are frozen by the P2
+// profile contract; the design critic's wall clock follows the v0.22 R-A2-2
+// envelope (turns kept, soft 600s / hard 900s). EnsureProfiles never overwrites
+// admin edits.
 func P2Profiles() []agent.AgentProfile {
 	return []agent.AgentProfile{
 		{
@@ -284,8 +288,10 @@ func P2Profiles() []agent.AgentProfile {
 			Name:         "设计 Critic",
 			SystemPrompt: designCriticPrompt,
 			AllowedTools: append([]string(nil), designCriticTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
-			Enabled:      true,
+			// v0.22 R-A2-2: the critic keeps its 4-turn guard but shares the
+			// design team's 600s soft / 900s hard clock; tokens are telemetry.
+			Budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 600, HardSeconds: 900},
+			Enabled: true,
 		},
 		{
 			Key:          ProfileKeyDataPlanner,

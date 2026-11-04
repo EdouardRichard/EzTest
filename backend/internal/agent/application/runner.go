@@ -185,10 +185,12 @@ type RunResult struct {
 	Turns          int
 	Usage          map[string]int
 	TerminalReason string
-	// SettlementCause is the stable budget cause (turn_budget/time_budget/
-	// token_budget) when the run's last turn was the tool-less settlement turn.
-	// It stays empty when the model finished on its own. The execution context
-	// uses it to explain an incomplete case run instead of silently aggregating.
+	// SettlementCause is the stable budget cause (turn_budget/time_budget) when
+	// the run's last turn was the tool-less settlement turn. It stays empty when
+	// the model finished on its own. token_budget is only a legacy mapping and
+	// is never produced since v0.22 (tokens are telemetry). The execution
+	// context uses it to explain an incomplete case run instead of silently
+	// aggregating.
 	SettlementCause string
 	// SettlementDetail is one bounded, secret-free sentence with the observed
 	// usage and the limit that triggered the settlement.
@@ -1254,8 +1256,9 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 
 // settlementInstruction is the system message of the tool-less wrap-up turn. It
 // must name the budget that actually triggered the settlement: the pre-QA-Q2
-// fixed text always blamed the clock, so a token/turn-budget stop produced a
-// model summary that pointed at the wrong cause.
+// fixed text always blamed the clock, so a turn/time-budget stop produced a
+// model summary that pointed at the wrong cause. The token branch is retained
+// only as a legacy mapping; v0.22 tokens are telemetry and never settle.
 func settlementInstruction(cause string) string {
 	switch cause {
 	case BudgetCauseTokens:
@@ -2345,74 +2348,26 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 	})
 }
 
-// DesignRunMaxTokens is the case-scale token budget of the design team. Usage is
-// cumulative across the turns of one run and every turn re-sends the design
-// thread plus the graph read, so the generic 20k chat budget was exhausted after
-// the read in the final S4 run: the following settlement turn disabled tools and
-// case.graph_propose could never write the modification. 200k covers a full
-// round (read + one propose per activated requirement) without being unbounded.
-const DesignRunMaxTokens = 200000
-
-// CaseExecutorRunMaxTokens is the case-scale token budget of a real case
-// execution (Task 89, raised by Tasks 97, 103 and 109). Usage is cumulative
-// across the turns of one run and every turn re-sends the task pack plus the
-// browser snapshot/ARIA tool results, so the generic 20k chat budget was
-// exhausted after four turns in the final small S5 run (31,943 / 33,979 total
-// tokens): the following settlement turn disabled tools and
-// execution.step_record/assertion_record could never write anything, leaving
-// both case runs with assertion_total=0. The first 200k raise was still not
-// enough for a real 4-step case: S5 retry-6 (case run 375990017199177730) used
-// 216,814 tokens after 15 turns and stopped during step 2 of 4 with no
-// assertion recorded. 400k covers the remaining steps, assertions and evidence
-// calls while remaining a bounded cap (above the observed failure point, not an
-// unbounded budget). 400k was still too small for the complete 5-step/
-// 3-assertion case of the O13 PO retry: AC-FR-025-01 used 409,842 tokens after
-// 28 turns and had recorded only 2 of 5 steps and 0 of 3 assertions when the
-// token settlement turned the run inconclusive/token_budget. 800k kept that
-// observed usage inside the run (28 turns is still well below the 60-turn case
-// envelope), but it was still too small for the complete 4-step/5-assertion case
-// of the PO final E2E: AC-FR-011-01 used 813,006 tokens after 44 turns and had
-// recorded only 3 of 4 steps and 1 of 5 assertions when the token settlement
-// turned the run inconclusive/token_budget. 1.2M keeps that observed usage
-// inside the run (44 turns is still below the 60-turn envelope) and covers the
-// remaining step, assertions and evidence calls while remaining a bounded cap
-// (above the observed failure point, not an unbounded budget).
-// Task 98 additionally bounds the per-turn replay: older browser read results are
-// pruned from the prompt transcript and the budget settlement turn can still
-// record the assertions of already executed steps. The runner enforces the cap in
-// code because the stored profile row is seeded once and EnsureProfiles never
-// overwrites an existing row, so a stale chat-scale row must not pull the
-// executor back to the generic budget (same reasoning as the Task 79 design
-// floor). A work item's explicit 0.2.1 budget declaration still wins over the
-// profile floor.
-const CaseExecutorRunMaxTokens = 0
-
-// Design authoring envelope (Task 79). The stored profile budgets cannot be
-// trusted for design runs: profiles are seeded once and EnsureProfiles never
-// overwrites an existing row, so the live 0.2.1 database still carries the
-// chat-scale design budgets (case_author 8/300/600, design_planner 12/300/600)
-// even after the seeds were raised. The runner therefore enforces the design
-// authoring floor in code, like the token budget: a focused case-author run
-// needs the read turn, the propose turn and the summary turn, and must not be
-// cut off by the generic chat-scale soft timeout.
+// Design authoring envelope (Task 79, kept by v0.22). The stored profile
+// budgets cannot be trusted for design runs: profiles are seeded once and
+// EnsureProfiles never overwrites an existing row, so the live 0.2.1 database
+// still carries the chat-scale design budgets (case_author 8/300/600,
+// design_planner 12/300/600) even after the seeds were raised. The runner
+// therefore enforces the design authoring floor in code: a focused case-author
+// run needs the read turn, the propose turn and the summary turn, and must not
+// be cut off by the generic chat-scale soft timeout. Tokens are telemetry only
+// since v0.22, so the envelope consists of turns and wall-clock time only
+// (R-A2-1/R-A2-2).
 //
 // The envelope is profile-scoped, so it deliberately covers every design
-// profile. design_critic and data_planner remain seeded at the lighter
-// 4/120/300 (that seed is the admin-visible default), but they share the 200k
-// design token budget and can still face a full design.graph_read + submit
-// turn, so their runtime envelope is expanded to 16/600/900 as well. This is a
-// documented expansion, pinned by TestDesignBudgetExpandsCriticAndDataPlanner,
-// not an accidental override.
+// profile. design_critic and data_planner can face a full design.graph_read +
+// submit turn, so their runtime envelope is expanded to 16/600/900 as well.
+// This is a documented expansion, pinned by
+// TestDesignBudgetExpandsCriticAndDataPlanner, not an accidental override.
 const (
 	DesignRunMaxTurns       = 16
 	DesignRunMinSeconds     = 600
 	DesignRunMinHardSeconds = 900
-	DesignRunMinAuthorTurns = 3
-	// DesignAuthorTurnTokens is the conservative per-turn token envelope of one
-	// focused case-author run after the Task 79 context scoping: profile prompt,
-	// version briefing/facts, one design.graph_read and the bounded
-	// human-history/team-room tail.
-	DesignAuthorTurnTokens = 32000
 )
 
 func (r *Runner) maxTurns(profile agent.AgentProfile) int {
@@ -2497,31 +2452,20 @@ func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 }
 
 // resourceBudget maps the work item's 0.2.1 budget (spec §5.4: max_tokens /
-// run_seconds / max_turns_fuse) onto the Task 9 Budget policy. Legacy P1-P8
-// items carry no Budget JSON and fall back to the frozen profile limits; the
-// token default is the contract default when neither source sets it.
+// run_seconds / max_turns_fuse) onto the v0.22 Budget policy. Legacy P1-P8
+// items carry no Budget JSON and fall back to the frozen profile limits. Token
+// accounting is telemetry only (R-A2-1): every profile runs with the explicit
+// unlimited shape (MaxTokens=0 + UnlimitedTokens=true) and a declared legacy
+// max_tokens is recorded without ever terminating the run.
 func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile) Budget {
 	budget := Budget{
-		MaxTokens:  DefaultBudgetMaxTokens,
-		RunSeconds: r.softSeconds(profile),
+		MaxTokens:       0,
+		UnlimitedTokens: true,
+		RunSeconds:      r.softSeconds(profile),
 		// Reserve the last loop turn for settlement. With the fuse equal to the
 		// loop cap the loop exits before Decide can observe the fuse, so the
 		// budget policy would never get to ask for a wrap-up turn.
 		MaxTurnsFuse: r.turnFuse(profile),
-	}
-	if isDesignProfile(profile.Key) {
-		budget.MaxTokens = DesignRunMaxTokens
-		// At least the read/propose/summary turns of one focused author run must
-		// fit inside the design token budget.
-		if minimum := DesignRunMinAuthorTurns * DesignAuthorTurnTokens; budget.MaxTokens < minimum {
-			budget.MaxTokens = minimum
-		}
-	} else if profile.Key == ProfileKeyCaseExecutor {
-		// Real execute.case runs must record steps/assertions before the token
-		// budget asks for settlement; the generic 20k chat default cannot cover
-		// the task pack plus browser results (Task 89).
-		budget.MaxTokens = CaseExecutorRunMaxTokens
-		budget.UnlimitedTokens = CaseExecutorRunMaxTokens <= 0
 	}
 	trimmed := strings.TrimSpace(string(item.Budget))
 	if trimmed == "" || trimmed == "null" {
@@ -2536,6 +2480,7 @@ func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile)
 		return budget
 	}
 	if declared.MaxTokens > 0 {
+		// Kept as the future token-quota hook (R-A2-5); ExceededBy ignores it.
 		budget.MaxTokens = declared.MaxTokens
 		budget.UnlimitedTokens = false
 	}
