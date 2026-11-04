@@ -425,7 +425,20 @@ try {
             # Direct intent cancel (open intent) as a separate API assertion.
             $cancelIntentRecord = $null
             if ($confirmedCaseVersions.Count -ge 1) {
-                $manualIntent = New-AcceptanceManualIntent -Context $context -VersionId $versionId -CaseVersionId $confirmedCaseVersions[0] -Purpose "manual"
+                $manualIntent = $null
+                for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                    $manualIntent = New-AcceptanceManualIntent -Context $context -VersionId $versionId -CaseVersionId $confirmedCaseVersions[0] -Purpose "manual"
+                    if ($manualIntent.Ok) { break }
+                    if ($manualIntent.Status -ne 409) { break }
+                    # Async requirement.close may land after the snapshot/reopen.
+                    # Reopen every currently closed requirement and retry once.
+                    $lateReqs = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+                    foreach ($lr in @($lateReqs | Where-Object { [string](Get-JsonProp -Object $_ -Name 'status' -Default '') -eq 'closed' })) {
+                        $lrId = [string](Get-JsonProp -Object $lr -Name 'id' -Default '')
+                        if ($lrId) { [void](Invoke-AcceptanceRequirementReopen -Context $context -VersionId $versionId -RequirementId $lrId -Reason "S6 late close retry") }
+                    }
+                    Start-Sleep -Seconds 2
+                }
                 if ($manualIntent.Ok) {
                     $manualIntentId = [string](Get-JsonProp -Object $manualIntent.Data -Name "id" -Default "")
                     $intentCancel = Invoke-AcceptanceIntentCancel -Context $context -VersionId $versionId -IntentId $manualIntentId
