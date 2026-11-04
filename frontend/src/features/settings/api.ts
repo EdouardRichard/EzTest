@@ -121,8 +121,12 @@ export type LLMModel = {
   config_id: string
   model: string
   display_name: string
+  /** Raw tokens; the admin UI renders the value in K (1K = 1000 tokens). */
   context_window: number
+  /** Raw tokens; the admin UI renders the value in K (1K = 1000 tokens). */
   max_output: number
+  /** Derived read-only input budget in raw tokens (0.22 API, v0.22 A §4.1). */
+  max_input?: number
   supports_tools: boolean
   supports_vision: boolean
   /** 0.2.1 capability set; optional for older/partial payloads. */
@@ -130,6 +134,12 @@ export type LLMModel = {
   /** Deprecated catalog rows stay visible but are not selectable. */
   deprecated?: boolean
   source: LLMModelSource
+  /**
+   * Provenance of context_window / max_output: `manual` values survive a
+   * catalog refresh; only reset-params hands them back to `catalog` (A §4.2).
+   */
+  window_source?: LLMModelSource
+  output_source?: LLMModelSource
   status: LLMStatus
   created_at: string
   updated_at: string
@@ -176,9 +186,13 @@ export type AddLLMModelInput = {
   supports_prompt_cache?: boolean
 }
 
-/** Partial capability patch for an existing model (admin capability editor). */
+/**
+ * Partial per-model patch (admin model editor). Numeric fields are raw tokens:
+ * the UI converts its K inputs before calling this layer (A §4.3).
+ */
 export type UpdateLLMModelInput = {
   context_window?: number
+  max_output?: number
   supports_tools?: boolean
   supports_vision?: boolean
   supports_reasoning?: boolean
@@ -237,6 +251,16 @@ export function updateLLMModel(
 export function deleteLLMModel(configId: string, modelId: string): Promise<void> {
   return apiDelete<void>(
     `/api/admin/llm/configs/${encodeURIComponent(configId)}/models/${encodeURIComponent(modelId)}`,
+  )
+}
+
+/**
+ * Restores a model's window/output to the last catalog-refresh snapshot and
+ * flips both field sources back to `catalog` (R-A1-4).
+ */
+export function resetLLMModelParams(configId: string, modelId: string): Promise<LLMModel> {
+  return apiPost<LLMModel>(
+    `/api/admin/llm/configs/${encodeURIComponent(configId)}/models/${encodeURIComponent(modelId)}/reset-params`,
   )
 }
 

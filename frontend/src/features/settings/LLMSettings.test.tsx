@@ -105,6 +105,49 @@ const deprecatedModel: LLMModel = {
   deprecated: true,
 }
 
+/** Catalog-owned window/output, no manual override, 64K/4.096K. */
+const editableModel: LLMModel = {
+  ...model,
+  id: "8010",
+  model: "editable-model",
+  display_name: "editable-model",
+  context_window: 64000,
+  max_output: 4096,
+  max_input: 59904,
+  source: "catalog",
+  window_source: "catalog",
+  output_source: "catalog",
+}
+
+/** Manual window/output override with a real server-derived input budget. */
+const manualParamsModel: LLMModel = {
+  ...model,
+  id: "8011",
+  model: "manual-params",
+  display_name: "manual-params",
+  context_window: 128000,
+  max_output: 8192,
+  max_input: 119808,
+  window_source: "manual",
+  output_source: "manual",
+}
+
+/**
+ * Deliberately inconsistent with the raw pair (131072-8192=122880) so the test
+ * pins that the server-derived max_input is preferred over client derivation.
+ */
+const apiMaxInputModel: LLMModel = {
+  ...model,
+  id: "8012",
+  model: "api-max-input",
+  display_name: "api-max-input",
+  context_window: 131072,
+  max_output: 8192,
+  max_input: 119808,
+  window_source: "catalog",
+  output_source: "manual",
+}
+
 type RouteHandler = (url: URL, init: RequestInit) => Response | Promise<Response>
 
 function installFetch(handler: RouteHandler): void {
@@ -124,6 +167,17 @@ function readBody(init: RequestInit): unknown {
 
 function configCard(id = "7001"): HTMLElement {
   return screen.getByTestId(`llm-config-${id}`)
+}
+
+async function openModelDirectory(id = "7001"): Promise<void> {
+  fireEvent.click(within(configCard(id)).getByRole("button", { name: "管理模型" }))
+  await screen.findByRole("region", { name: "模型目录" })
+}
+
+async function openModelEditor(modelID = "8010"): Promise<HTMLElement> {
+  const row = await screen.findByTestId(`llm-model-${modelID}`)
+  fireEvent.click(within(row).getByRole("button", { name: "编辑" }))
+  return screen.getByRole("dialog")
 }
 
 async function openCreateDialog(): Promise<HTMLElement> {
@@ -329,7 +383,7 @@ describe("LLMSettings", () => {
     expect(within(dialog).queryByRole("option", { name: "OpenAI 兼容" })).toBeNull()
   })
 
-  it("edits thinking settings and shows the default model capabilities", async () => {
+  it("edits thinking settings and the default model", async () => {
     installFetch((url, init) => {
       if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
         return jsonResponse({ data: [canonicalConfig] })
@@ -362,11 +416,6 @@ describe("LLMSettings", () => {
     const defaultModel = within(dialog).getByLabelText("默认模型")
     expect(defaultModel).toHaveValue("8002")
     expect(within(dialog).getByRole("option", { name: /gpt-legacy/ })).toBeDisabled()
-    expect(within(dialog).getByLabelText("支持工具")).toBeChecked()
-    expect(within(dialog).getByLabelText("支持视觉")).not.toBeChecked()
-    expect(within(dialog).getByLabelText("支持推理")).toBeChecked()
-    expect(within(dialog).getByLabelText("提示缓存")).toBeChecked()
-    expect(within(dialog).getByText(/上下文窗口 128000/)).toBeVisible()
 
     fireEvent.change(thinking, { target: { value: "disabled" } })
     // disabled thinking cannot be combined with a non-none reasoning effort
@@ -377,9 +426,6 @@ describe("LLMSettings", () => {
     expect(effort).not.toBeDisabled()
     fireEvent.change(effort, { target: { value: "xhigh" } })
     fireEvent.change(defaultModel, { target: { value: "8004" } })
-    expect(within(dialog).getByLabelText("支持推理")).not.toBeChecked()
-    expect(within(dialog).getByLabelText("支持视觉")).toBeChecked()
-    expect(within(dialog).getByText(/上下文窗口 32000/)).toBeVisible()
 
     fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
@@ -397,26 +443,137 @@ describe("LLMSettings", () => {
     })
   })
 
-  it("edits a model capability and saves it through the model endpoint", async () => {
+  it("removes the model capability block from the provider config dialog", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [editableModel] })
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    fireEvent.click(within(configCard()).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+
+    expect(within(dialog).queryByText(/模型能力/)).toBeNull()
+    expect(within(dialog).queryByLabelText("支持推理")).toBeNull()
+    expect(within(dialog).queryByText(/上下文窗口 \d+/)).toBeNull()
+  })
+
+  it("edits capabilities in the model edit dialog without patching window sources", async () => {
     installFetch((url, init) => {
-      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
-        return jsonResponse({ data: [canonicalConfig] })
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [editableModel] })
+      if (url.pathname === "/api/admin/llm/configs/7001/models/8010" && method(init) === "PATCH") {
+        return jsonResponse({
+          data: { ...editableModel, supports_vision: true, supports_reasoning: true },
+        })
       }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+    const dialog = await openModelEditor()
+
+    fireEvent.click(within(dialog).getByLabelText("支持视觉"))
+    fireEvent.click(within(dialog).getByLabelText("支持推理"))
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const patch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7001/models/8010",
+    )
+    expect(readBody(patch?.[1] ?? {})).toEqual({
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: true,
+      supports_prompt_cache: false,
+      deprecated: false,
+    })
+  })
+
+  it("renders model parameters in K units", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
       if (url.pathname === "/api/admin/llm/models") {
-        return jsonResponse({ data: [reasoningModel, plainModel, deprecatedModel] })
+        return jsonResponse({ data: [manualParamsModel, editableModel] })
       }
-      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
-        return jsonResponse({ data: canonicalConfig })
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+
+    const manualRow = screen.getByTestId("llm-model-8011")
+    expect(manualRow).toHaveTextContent("上下文 128K")
+    expect(manualRow).toHaveTextContent("输出 8.192K")
+    expect(manualRow).toHaveTextContent("输入 119.808K")
+
+    const catalogRow = screen.getByTestId("llm-model-8010")
+    expect(catalogRow).toHaveTextContent("上下文 64K")
+    expect(catalogRow).toHaveTextContent("输出 4.096K")
+    expect(catalogRow).toHaveTextContent("输入 59.904K")
+  })
+
+  it("marks manual parameter sources and only enables reset for them", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [manualParamsModel, editableModel] })
       }
-      if (url.pathname === "/api/admin/llm/configs/7003/models/8002" && method(init) === "PATCH") {
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+
+    expect(within(screen.getByTestId("llm-model-8011")).getByText("[手工]")).toBeVisible()
+    expect(within(screen.getByTestId("llm-model-8010")).queryByText("[手工]")).toBeNull()
+
+    let dialog = await openModelEditor("8011")
+    expect(within(dialog).getByRole("button", { name: "恢复上游值" })).toBeEnabled()
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    dialog = await openModelEditor("8010")
+    expect(within(dialog).getByRole("button", { name: "恢复上游值" })).toBeDisabled()
+  })
+
+  it("displays the server-derived max input", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models")
+        return jsonResponse({ data: [apiMaxInputModel] })
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+
+    expect(screen.getByTestId("llm-model-8012")).toHaveTextContent("输入 119.808K")
+
+    const dialog = await openModelEditor("8012")
+    expect(within(dialog).getByLabelText("最大输入")).toHaveValue("119.808K")
+  })
+
+  it("patches the context window in raw tokens from a K input", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [editableModel] })
+      if (url.pathname === "/api/admin/llm/configs/7001/models/8010" && method(init) === "PATCH") {
         return jsonResponse({
           data: {
-            ...reasoningModel,
-            capabilities: {
-              ...reasoningModel.capabilities,
-              supports_reasoning: false,
-              supports_vision: true,
-            },
+            ...editableModel,
+            context_window: 128000,
+            max_input: 123904,
+            window_source: "manual",
           },
         })
       }
@@ -424,39 +581,140 @@ describe("LLMSettings", () => {
     })
 
     render(<LLMSettings />)
-    await screen.findByTestId("llm-config-7003")
-    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
-    const dialog = screen.getByRole("dialog")
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+    const dialog = await openModelEditor()
 
-    // The capability checkboxes edit the selected default model instead of
-    // being read-only: gateways that do not report capabilities can be fixed.
-    const reasoning = within(dialog).getByLabelText("支持推理")
-    expect(reasoning).toBeChecked()
-    fireEvent.click(reasoning)
-    expect(reasoning).not.toBeChecked()
-    fireEvent.click(within(dialog).getByLabelText("支持视觉"))
-
-    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    const input = within(dialog).getByLabelText("上下文窗口 (K)")
+    expect(input).toHaveValue(64)
+    fireEvent.change(input, { target: { value: "128" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
 
-    const modelPatch = fetchMock.mock.calls.find(
+    const patch = fetchMock.mock.calls.find(
       (call) =>
         method(call[1] ?? {}) === "PATCH" &&
-        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003/models/8002",
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7001/models/8010",
     )
-    expect(readBody(modelPatch?.[1] ?? {})).toEqual({
-      supports_tools: true,
-      supports_vision: true,
-      supports_reasoning: false,
-      supports_prompt_cache: true,
-      context_window: 128000,
+    expect(String(patch?.[1]?.body)).toContain('"context_window":128000')
+    expect(await screen.findByTestId("llm-model-8010")).toHaveTextContent("上下文 128K")
+  })
+
+  it("converts fractional K values to exact raw tokens", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [editableModel] })
+      if (url.pathname === "/api/admin/llm/configs/7001/models/8010" && method(init) === "PATCH") {
+        return jsonResponse({
+          data: { ...editableModel, max_output: 500, max_input: 63500, output_source: "manual" },
+        })
+      }
+      return jsonResponse({ data: [] })
     })
-    const configPatch = fetchMock.mock.calls.find(
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+    const dialog = await openModelEditor()
+
+    const output = within(dialog).getByLabelText("最大输出 (K)")
+    expect(output).toHaveValue(4.096)
+    fireEvent.change(output, { target: { value: "0.5" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const patch = fetchMock.mock.calls.find(
       (call) =>
         method(call[1] ?? {}) === "PATCH" &&
-        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003",
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7001/models/8010",
     )
-    expect(readBody(configPatch?.[1] ?? {})).toMatchObject({ default_model_id: "8002" })
+    expect(String(patch?.[1]?.body)).toContain('"max_output":500')
+  })
+
+  it("resets manual parameters through the reset-params endpoint", async () => {
+    const resetModel: LLMModel = {
+      ...manualParamsModel,
+      context_window: 64000,
+      max_output: 4096,
+      max_input: 59904,
+      window_source: "catalog",
+      output_source: "catalog",
+    }
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [manualParamsModel, editableModel] })
+      }
+      if (
+        url.pathname === "/api/admin/llm/configs/7001/models/8011/reset-params" &&
+        method(init) === "POST"
+      ) {
+        return jsonResponse({ data: resetModel })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+    const dialog = await openModelEditor("8011")
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "恢复上游值" }))
+    await waitFor(() => expect(within(dialog).getByLabelText("上下文窗口 (K)")).toHaveValue(64))
+
+    const reset = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "POST" &&
+        new URL(String(call[0])).pathname ===
+          "/api/admin/llm/configs/7001/models/8011/reset-params",
+    )
+    expect(reset).toBeDefined()
+    expect(screen.getByTestId("llm-model-8011")).toHaveTextContent("上下文 64K")
+    expect(within(dialog).getByRole("button", { name: "恢复上游值" })).toBeDisabled()
+  })
+
+  it("rejects max_output greater than context_window without patching", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [editableModel] })
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+    const dialog = await openModelEditor()
+
+    fireEvent.change(within(dialog).getByLabelText("最大输出 (K)"), {
+      target: { value: "128" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }))
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("最大输出不能大于上下文窗口")
+    expect(fetchMock.mock.calls.some((call) => method(call[1] ?? {}) === "PATCH")).toBe(false)
+  })
+
+  it("rejects negative or non-numeric K values without patching", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [editableModel] })
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+    const dialog = await openModelEditor()
+    const input = within(dialog).getByLabelText("上下文窗口 (K)")
+
+    fireEvent.change(input, { target: { value: "-1" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }))
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("上下文窗口必须是")
+
+    fireEvent.change(input, { target: { value: "abc" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }))
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("上下文窗口必须是")
+    expect(fetchMock.mock.calls.some((call) => method(call[1] ?? {}) === "PATCH")).toBe(false)
   })
 
   it("allows clearing the default model when no selectable model exists", async () => {

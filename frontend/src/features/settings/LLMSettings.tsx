@@ -28,7 +28,6 @@ import {
   type LLMConfig,
   type LLMConfigInput,
   type LLMModel,
-  type LLMModelCapabilities,
   type LLMProtocol,
   type LLMReasoningEffort,
   type LLMStatus,
@@ -37,8 +36,14 @@ import {
   refreshLLMModels,
   testLLMConfig,
   updateLLMConfig,
-  updateLLMModel,
 } from "./api"
+import {
+  formatTokensK,
+  formatTokensKWithAuto,
+  ModelEditDialog,
+  modelCapabilities,
+  modelMaxInput,
+} from "./ModelEditDialog"
 
 /** Canonical protocols offered to new/updated configurations. */
 const CANONICAL_PROTOCOLS: ReadonlyArray<{ value: LLMProtocol; label: string }> = [
@@ -75,34 +80,6 @@ const EFFORT_OPTIONS: ReadonlyArray<{ value: LLMReasoningEffort; label: string }
   { value: "xhigh", label: "xhigh（极高）" },
   { value: "max", label: "max（最高）" },
 ]
-
-type CapabilityFlag =
-  | "supports_tools"
-  | "supports_vision"
-  | "supports_reasoning"
-  | "supports_prompt_cache"
-
-const CAPABILITY_FIELDS: ReadonlyArray<{ key: CapabilityFlag; label: string; id: string }> = [
-  { key: "supports_tools", label: "支持工具", id: "llm-capability-tools" },
-  { key: "supports_vision", label: "支持视觉", id: "llm-capability-vision" },
-  { key: "supports_reasoning", label: "支持推理", id: "llm-capability-reasoning" },
-  { key: "supports_prompt_cache", label: "提示缓存", id: "llm-capability-prompt-cache" },
-]
-
-/**
- * Merges the 0.2.1 capability object with the legacy flat columns so a partial
- * payload (or an older API build) still renders sensible checkbox state.
- */
-function modelCapabilities(model: LLMModel | undefined): LLMModelCapabilities {
-  const capabilities = model?.capabilities
-  return {
-    supports_tools: capabilities?.supports_tools ?? model?.supports_tools ?? false,
-    supports_vision: capabilities?.supports_vision ?? model?.supports_vision ?? false,
-    supports_reasoning: capabilities?.supports_reasoning ?? false,
-    supports_prompt_cache: capabilities?.supports_prompt_cache ?? false,
-    context_window: capabilities?.context_window ?? model?.context_window ?? 0,
-  }
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -145,8 +122,7 @@ type ConfigFormDialogProps = {
   /** Catalog rows belonging to this config (empty while creating). */
   models: LLMModel[]
   onClose: () => void
-  /** updatedModels holds rows written through the model capability route. */
-  onSaved: (saved: LLMConfig, created: boolean, updatedModels: LLMModel[]) => void
+  onSaved: (saved: LLMConfig, created: boolean) => void
 }
 
 function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialogProps) {
@@ -167,9 +143,6 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
     initialThinkingType === "disabled" ? "none" : (config?.reasoning_effort ?? "none"),
   )
   const [defaultModelID, setDefaultModelID] = useState(config?.default_model_id ?? "")
-  // Capabilities staged for the selected model; flushed through the model
-  // update route when the config form is saved.
-  const [capabilityDrafts, setCapabilityDrafts] = useState<Record<string, LLMModelCapabilities>>({})
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
@@ -177,19 +150,6 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
     (model) => !model.deprecated && model.status !== "disabled",
   )
   const defaultModelRequired = selectableModels.length > 0
-  const selectedModel = models.find((model) => model.id === defaultModelID)
-  const selectedCapabilities = {
-    ...modelCapabilities(selectedModel),
-    ...(selectedModel === undefined ? {} : capabilityDrafts[selectedModel.id]),
-  }
-
-  function updateCapability(key: CapabilityFlag, checked: boolean): void {
-    if (selectedModel === undefined) return
-    setCapabilityDrafts((current) => ({
-      ...current,
-      [selectedModel.id]: { ...selectedCapabilities, [key]: checked },
-    }))
-  }
 
   function updateThinkingType(value: LLMThinkingType): void {
     setThinkingType(value)
@@ -284,23 +244,7 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
       const saved = created
         ? await createLLMConfig(parsed.input)
         : await updateLLMConfig(config.id, parsed.input)
-      const updatedModels: LLMModel[] = []
-      if (config !== null) {
-        // Flush every staged capability draft (a model stays dirty when the
-        // admin switches the default-model selection before saving).
-        for (const [modelID, draft] of Object.entries(capabilityDrafts)) {
-          updatedModels.push(
-            await updateLLMModel(config.id, modelID, {
-              supports_tools: draft.supports_tools,
-              supports_vision: draft.supports_vision,
-              supports_reasoning: draft.supports_reasoning,
-              supports_prompt_cache: draft.supports_prompt_cache,
-              context_window: draft.context_window,
-            }),
-          )
-        }
-      }
-      onSaved(saved, created, updatedModels)
+      onSaved(saved, created)
     } catch (caught) {
       setError(errorText(caught, "保存失败，请稍后重试"))
     } finally {
@@ -463,36 +407,6 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
             </Select>
           </Field>
         </div>
-
-        <fieldset className="rounded-md border border-border px-3 py-2">
-          <legend className="px-1 text-xs font-medium text-foreground">
-            模型能力（选中默认模型后可编辑）
-          </legend>
-          <div className="flex flex-wrap items-center gap-4 text-xs text-foreground">
-            {CAPABILITY_FIELDS.map((field) => (
-              <label key={field.key} htmlFor={field.id} className="flex items-center gap-2">
-                <input
-                  id={field.id}
-                  type="checkbox"
-                  checked={selectedCapabilities[field.key]}
-                  disabled={selectedModel === undefined}
-                  onChange={(event) => updateCapability(field.key, event.target.checked)}
-                />
-                {field.label}
-              </label>
-            ))}
-            <span className="text-muted-foreground">
-              上下文窗口 {selectedModel ? selectedCapabilities.context_window : "—"}
-            </span>
-          </div>
-          {selectedModel === undefined ? (
-            <p className="mt-1 text-xs text-muted-foreground">选择默认模型后显示其能力。</p>
-          ) : (
-            <p className="mt-1 text-xs text-muted-foreground">
-              勾选状态会随配置保存，通过模型更新接口写回；上游未上报能力时可在此修正。
-            </p>
-          )}
-        </fieldset>
 
         <Field
           id="llm-headers"
@@ -670,6 +584,7 @@ export function LLMSettings() {
   >(null)
   const [deleteTarget, setDeleteTarget] = useState<LLMConfig | null>(null)
   const [modelTarget, setModelTarget] = useState<LLMConfig | null>(null)
+  const [editTarget, setEditTarget] = useState<LLMModel | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<unknown>(null)
 
@@ -795,7 +710,7 @@ export function LLMSettings() {
     }
   }
 
-  function handleSaved(saved: LLMConfig, created: boolean, updatedModels: LLMModel[]): void {
+  function handleSaved(saved: LLMConfig, created: boolean): void {
     setConfigs((current) => {
       const next = current
         ? created
@@ -805,10 +720,6 @@ export function LLMSettings() {
       if (!saved.is_default) return next
       return next.map((item) => (item.id === saved.id ? item : { ...item, is_default: false }))
     })
-    if (updatedModels.length > 0) {
-      const byID = new Map(updatedModels.map((model) => [model.id, model]))
-      setModels((current) => current.map((item) => byID.get(item.id) ?? item))
-    }
     setFormState(null)
   }
 
@@ -816,6 +727,11 @@ export function LLMSettings() {
     setModels((current) => [...current, saved])
     setNotice(saved.config_id, `已添加模型 ${saved.model}`)
     setModelTarget(null)
+  }
+
+  function handleModelChanged(saved: LLMModel): void {
+    setModels((current) => current.map((item) => (item.id === saved.id ? saved : item)))
+    setNotice(saved.config_id, `已更新模型 ${saved.model}`)
   }
 
   if (loading && configs === null) return <LoadingCard label="正在加载 LLM 配置…" />
@@ -1015,6 +931,8 @@ export function LLMSettings() {
                     <ul className="mt-2 divide-y divide-border rounded-lg border border-border">
                       {configModels.map((model) => {
                         const capabilities = modelCapabilities(model)
+                        const manualParams =
+                          model.window_source === "manual" || model.output_source === "manual"
                         return (
                           <li
                             key={model.id}
@@ -1029,6 +947,7 @@ export function LLMSettings() {
                                 <Badge tone={model.source === "manual" ? "info" : "neutral"}>
                                   {model.source === "manual" ? "手工" : "目录"}
                                 </Badge>
+                                {manualParams ? <Badge tone="warning">[手工]</Badge> : null}
                                 {model.deprecated ? <Badge tone="danger">已下线</Badge> : null}
                                 {capabilities.supports_tools ? (
                                   <Badge tone="success">工具</Badge>
@@ -1044,17 +963,29 @@ export function LLMSettings() {
                                 ) : null}
                               </div>
                               <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                上下文 {capabilities.context_window} · 输出 {model.max_output}
+                                上下文 {formatTokensKWithAuto(model.context_window)} · 输出{" "}
+                                {formatTokensKWithAuto(model.max_output)} · 输入{" "}
+                                {formatTokensK(modelMaxInput(model))}K
                               </p>
                             </div>
-                            <Button
-                              variant="danger"
-                              size="sm"
-                              disabled={busy}
-                              onClick={() => void handleDeleteModel(config, model)}
-                            >
-                              删除模型
-                            </Button>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                disabled={busy}
+                                onClick={() => setEditTarget(model)}
+                              >
+                                编辑
+                              </Button>
+                              <Button
+                                variant="danger"
+                                size="sm"
+                                disabled={busy}
+                                onClick={() => void handleDeleteModel(config, model)}
+                              >
+                                删除模型
+                              </Button>
+                            </div>
                           </li>
                         )
                       })}
@@ -1086,6 +1017,15 @@ export function LLMSettings() {
           config={modelTarget}
           onClose={() => setModelTarget(null)}
           onSaved={handleModelSaved}
+        />
+      ) : null}
+
+      {editTarget ? (
+        <ModelEditDialog
+          key={editTarget.id}
+          model={editTarget}
+          onClose={() => setEditTarget(null)}
+          onModelChange={handleModelChanged}
         />
       ) : null}
 
