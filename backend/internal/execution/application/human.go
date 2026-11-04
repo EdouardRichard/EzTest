@@ -251,7 +251,7 @@ func (s *HumanService) Resolve(ctx context.Context, humanRequestID, actorID int6
 		return execution.HumanRequest{}, err
 	}
 	now := s.now()
-	changed, err := s.humans.Transition(ctx, humanRequestID, execution.HumanPending, execution.HumanAnswered, normalized, actorID, now)
+	changed, err := s.humans.Transition(ctx, humanRequestID, execution.HumanPending, execution.HumanAnswered, normalized, actorID, now, nil)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "human_request")
 	}
@@ -298,7 +298,7 @@ func (s *HumanService) Cancel(ctx context.Context, humanRequestID, actorID int64
 		return platform.StateConflict("the human request is not pending")
 	}
 	now := s.now()
-	changed, err := s.humans.Transition(ctx, humanRequestID, execution.HumanPending, execution.HumanCancelled, nil, actorID, now)
+	changed, err := s.humans.Transition(ctx, humanRequestID, execution.HumanPending, execution.HumanCancelled, nil, actorID, now, nil)
 	if err != nil {
 		return mapExecutionError(err, "human_request")
 	}
@@ -650,6 +650,9 @@ func (s *QuestionService) Create(ctx context.Context, in QuestionCreateInput) (e
 	if s.messages == nil {
 		return execution.HumanRequest{}, fmt.Errorf("question message writer is not configured")
 	}
+	if s.ids == nil {
+		return execution.HumanRequest{}, fmt.Errorf("question id generator is not configured")
+	}
 	if err := execution.ValidateHumanQuestions(in.Questions); err != nil {
 		return execution.HumanRequest{}, err
 	}
@@ -709,11 +712,15 @@ func (s *QuestionService) Create(ctx context.Context, in QuestionCreateInput) (e
 		// The pending row must not survive without its card; best-effort cancel
 		// keeps the state machine truthful if the conversation write failed.
 		_, _ = s.humans.Transition(ctx, requestID, execution.HumanPending, execution.HumanCancelled,
-			map[string]any{"cancelled_by": "system", "reason": "question_message_failed"}, 0, now)
+			map[string]any{"cancelled_by": "system", "reason": "question_message_failed"}, 0, now, nil)
 		return execution.HumanRequest{}, mapExecutionError(err, "conversation")
 	}
 	request.MessageID = &messageID
 	if err := s.humans.AttachMessage(ctx, requestID, messageID); err != nil {
+		// The card exists but the question row could not record it; do not leave
+		// a pending question that the UI can never render.
+		_, _ = s.humans.Transition(ctx, requestID, execution.HumanPending, execution.HumanCancelled,
+			map[string]any{"cancelled_by": "system", "reason": "question_message_attach_failed"}, 0, now, nil)
 		return execution.HumanRequest{}, mapExecutionError(err, "question")
 	}
 
@@ -821,7 +828,7 @@ func (s *QuestionService) Answer(ctx context.Context, versionID, questionID, act
 		execution.HumanResponseAnswerRevision:  revision,
 		execution.HumanResponseAnswerMessageID: platformid.Format(messageID),
 	}
-	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanAnswered, response, actorID, now)
+	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanAnswered, response, actorID, now, nil)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "question")
 	}
@@ -886,15 +893,15 @@ func (s *QuestionService) Skip(ctx context.Context, versionID, questionID, actor
 	if len(reason) > 500 {
 		return execution.HumanRequest{}, platform.Invalid("reason", "must be at most 500 characters")
 	}
-	response := map[string]any{
+	response := mergeQuestionResponse(questionResponseHistory(request.Response), map[string]any{
 		execution.HumanResponseSkipped:   true,
 		execution.HumanResponseSkippedBy: platformid.Format(actorID),
 		execution.HumanResponseSkippedAt: eventTime(now),
-	}
+	})
 	if reason != "" {
 		response[execution.HumanResponseReason] = reason
 	}
-	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanCancelled, response, actorID, now)
+	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanCancelled, response, actorID, now, nil)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "question")
 	}
@@ -935,11 +942,12 @@ func (s *QuestionService) Reopen(ctx context.Context, versionID, questionID int6
 		return execution.HumanRequest{}, platform.StateConflict("the question cannot be reopened")
 	}
 	now := s.now()
-	response := mergeQuestionResponse(request.Response, map[string]any{
+	deadline := now.Add(s.questionTimeout(ctx))
+	response := mergeQuestionResponse(questionResponseHistory(request.Response), map[string]any{
 		execution.HumanResponseReopenedBy: platformid.Format(owner.AgentRunID),
 		execution.HumanResponseReopenedAt: eventTime(now),
 	})
-	changed, err := s.humans.Transition(ctx, request.ID, request.Status, execution.HumanPending, response, 0, now)
+	changed, err := s.humans.Transition(ctx, request.ID, request.Status, execution.HumanPending, response, 0, now, &deadline)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "question")
 	}
@@ -948,6 +956,8 @@ func (s *QuestionService) Reopen(ctx context.Context, versionID, questionID int6
 	}
 	request.Status = execution.HumanPending
 	request.Response = response
+	request.ExpiresAt = deadline
+	request.Question.ExpiresAt = deadline
 	request.ResolvedBy = nil
 	request.ResolvedAt = nil
 	request.UpdatedAt = now
@@ -980,8 +990,11 @@ func (s *QuestionService) Cancel(ctx context.Context, versionID, questionID int6
 		return platform.StateConflict("the question is not pending")
 	}
 	now := s.now()
+	response := mergeQuestionResponse(questionResponseHistory(request.Response), map[string]any{
+		"cancelled_by": platformid.Format(owner.AgentRunID),
+	})
 	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanCancelled,
-		map[string]any{"cancelled_by": platformid.Format(owner.AgentRunID)}, 0, now)
+		response, 0, now, nil)
 	if err != nil {
 		return mapExecutionError(err, "question")
 	}
@@ -989,6 +1002,7 @@ func (s *QuestionService) Cancel(ctx context.Context, versionID, questionID int6
 		return platform.StateConflict("the question is not pending")
 	}
 	request.Status = execution.HumanCancelled
+	request.Response = response
 	request.UpdatedAt = now
 	s.record(ctx, "question.cancelled", request, 0)
 	return nil
@@ -1088,7 +1102,7 @@ func (s *QuestionService) expireIfOverdue(ctx context.Context, request execution
 	if now.Before(request.ExpiresAt) {
 		return request, nil
 	}
-	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanExpired, nil, 0, now)
+	changed, err := s.humans.Transition(ctx, request.ID, execution.HumanPending, execution.HumanExpired, nil, 0, now, nil)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "question")
 	}
@@ -1296,6 +1310,17 @@ func payloadInt64(payload map[string]any, key string) int64 {
 		return int64(value)
 	}
 	return 0
+}
+
+// questionResponseHistory keeps the monotonic answer revision across
+// skip/cancel/reopen. This is the message-key history: a later answer must not
+// reuse question-answer:<id>:<revision> and dedupe onto the stale message.
+func questionResponseHistory(response map[string]any) map[string]any {
+	history := map[string]any{}
+	if revision := answerRevision(response); revision > 0 {
+		history[execution.HumanResponseAnswerRevision] = revision
+	}
+	return history
 }
 
 // mergeQuestionResponse copies a stored response and applies the reopen markers.

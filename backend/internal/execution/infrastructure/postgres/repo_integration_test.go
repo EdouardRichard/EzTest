@@ -683,16 +683,57 @@ func TestExecutorAndHumanRequest(t *testing.T) {
 		t.Fatalf("CountByCaseRun = %d err=%v", count, err)
 	}
 	changed, err := repo.Humans.Transition(ctx, 10, execution.HumanPending, execution.HumanAnswered,
-		map[string]any{"code": "246810"}, 7, now)
+		map[string]any{"code": "246810"}, 7, now, nil)
 	if err != nil || !changed {
 		t.Fatalf("resolve human request: %v %v", changed, err)
 	}
-	if changed, err := repo.Humans.Transition(ctx, 10, execution.HumanPending, execution.HumanCancelled, nil, 7, now); err != nil || changed {
+	if changed, err := repo.Humans.Transition(ctx, 10, execution.HumanPending, execution.HumanCancelled, nil, 7, now, nil); err != nil || changed {
 		t.Fatalf("second transition = %v err=%v", changed, err)
 	}
 	resolved, err := repo.Humans.Get(ctx, 10)
 	if err != nil || resolved.Status != execution.HumanAnswered || resolved.Response["code"] != "246810" {
 		t.Fatalf("resolved human request = %+v err=%v", resolved, err)
+	}
+
+	// A reopened structured question must persist the extended deadline in both
+	// the column and the question payload (R-B3-4 lazy expiry).
+	questionDeadline := now.Add(2 * time.Hour)
+	question := execution.HumanRequest{
+		ID: 12, VersionID: 100, ConversationID: ptrInt64(600), Kind: execution.HumanClarificationQuestion,
+		Status: execution.HumanPending, ExpiresAt: now.Add(time.Hour),
+		Question: execution.HumanQuestionBatch{
+			Questions: []execution.HumanQuestion{{
+				ID: "q1", Text: "退款到账时间按 T+1 还是 T+3 验收？", Required: true,
+				Options: []execution.HumanQuestionOption{{ID: "a", Label: "T+1"}},
+			}},
+			BatchID:   "qb-12",
+			ExpiresAt: now.Add(time.Hour),
+		},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := repo.Humans.Create(ctx, question); err != nil {
+		t.Fatalf("create question: %v", err)
+	}
+	if changed, err := repo.Humans.Transition(ctx, 12, execution.HumanPending, execution.HumanAnswered,
+		map[string]any{"answer_revision": 1}, 7, now, nil); err != nil || !changed {
+		t.Fatalf("answer question = %v err=%v", changed, err)
+	}
+	if changed, err := repo.Humans.Transition(ctx, 12, execution.HumanAnswered, execution.HumanPending,
+		map[string]any{"answer_revision": 1}, 0, now, &questionDeadline); err != nil || !changed {
+		t.Fatalf("reopen question = %v err=%v", changed, err)
+	}
+	reopened, err := repo.Humans.Get(ctx, 12)
+	if err != nil {
+		t.Fatalf("get reopened question: %v", err)
+	}
+	if reopened.Status != execution.HumanPending || !timesWithinMicrosecond(reopened.ExpiresAt, questionDeadline) {
+		t.Fatalf("reopened = %+v, want pending with expires_at %v", reopened, questionDeadline)
+	}
+	if !timesWithinMicrosecond(reopened.Question.ExpiresAt, questionDeadline) {
+		t.Fatalf("reopened question.expires_at = %v, want %v", reopened.Question.ExpiresAt, questionDeadline)
+	}
+	if reopened.Question.BatchID != "qb-12" || len(reopened.Question.Questions) != 1 {
+		t.Fatalf("reopened question payload = %+v", reopened.Question)
 	}
 
 	expired := execution.HumanRequest{
@@ -711,10 +752,17 @@ func TestExecutorAndHumanRequest(t *testing.T) {
 		t.Fatalf("second Expire = %+v err=%v", rows, err)
 	}
 	page, hasMore, err := repo.Humans.ListByVersion(ctx, 100, "", 10, nil)
-	if err != nil || len(page) != 2 || hasMore {
+	if err != nil || len(page) != 3 || hasMore {
 		t.Fatalf("ListByVersion = %+v hasMore=%v err=%v", page, hasMore, err)
 	}
 }
 
 func ptrInt64(value int64) *int64 { return &value }
 func ptrInt(value int) *int       { return &value }
+
+// timesWithinMicrosecond compares a Go nanosecond deadline with the
+// microsecond precision PostgreSQL stores.
+func timesWithinMicrosecond(got, want time.Time) bool {
+	delta := got.Sub(want)
+	return delta >= -time.Microsecond && delta <= time.Microsecond
+}

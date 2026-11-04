@@ -204,6 +204,21 @@ func TestQuestionAskToolMapsPortErrors(t *testing.T) {
 	})
 }
 
+// TestQuestionAskToolDescriptionDoesNotPromiseSkipWakeUp pins the wake
+// contract: only an answer writes the kind=answer message that wakes the Host;
+// skipping cancels the question without an answer message.
+func TestQuestionAskToolDescriptionDoesNotPromiseSkipWakeUp(t *testing.T) {
+	description := NewQuestionAskTool(nil).Description()
+	for _, forbidden := range []string{"回答或跳过后会唤醒", "回答或跳过后唤醒"} {
+		if strings.Contains(description, forbidden) {
+			t.Fatalf("description promises a skip wake-up: %q", description)
+		}
+	}
+	if !strings.Contains(description, "回答后会唤醒") {
+		t.Fatalf("description must state that an answer wakes the conversation: %q", description)
+	}
+}
+
 // TestQuestionAskToolSchemaHidesScope pins the shared scope-hiding contract.
 func TestQuestionAskToolSchemaHidesScope(t *testing.T) {
 	tool := NewQuestionAskTool(nil)

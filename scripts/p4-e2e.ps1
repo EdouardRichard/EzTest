@@ -535,7 +535,7 @@ COMMIT;
         if ($null -eq $overview.Json.data.active_wave) { return $null }
         $issueCount = Invoke-PsqlScalar ("SELECT count(*) FROM delivery_issue WHERE version_id = $versionID;")
         if ([int]$issueCount -lt 1) { return $null }
-        $human = Invoke-Api -Method "GET" -Path "/api/versions/$versionID/human-requests?status=open&limit=10" -Token $token
+        $human = Invoke-Api -Method "GET" -Path "/api/versions/$versionID/human-requests?status=pending&limit=10" -Token $token
         if ($human.Status -ne 200) { return $null }
         $open = Get-Array $human.Json.data
         if ($open.Count -lt 1) { return $null }
@@ -613,7 +613,7 @@ COMMIT;
         Pop-Location
     }
     if ($codeB -ne 0) { throw "Playwright p4.spec.ts phase B failed (see e2e-playwright-phase-b.log)" }
-    Log "P4 browser E2E phase B PASS (completed, report, reopen, resolved todo)" "Green"
+    Log "P4 browser E2E phase B PASS (completed, report, reopen, answered todo)" "Green"
     $script:exitCode = 0
 } catch {
     Log "E2E FAIL: $($_.Exception.Message)" "Red"

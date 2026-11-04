@@ -99,7 +99,7 @@ func (t *QuestionAskTool) Name() string { return ToolQuestionAsk }
 
 // Description implements Tool.
 func (t *QuestionAskTool) Description() string {
-	return "向用户发起结构化提问（question.ask）：一次提交 1-5 个问题，每题可带选项/多选/必填/允许自由文本/来源引用；创建 pending 问题并渲染提问卡，返回问题 ID。用户回答或跳过后会唤醒当前对话；提问不会阻塞阶段推进。"
+	return "向用户发起结构化提问（question.ask）：一次提交 1-5 个问题，每题可带选项/多选/必填/允许自由文本/来源引用；创建 pending 问题并渲染提问卡，返回问题 ID。用户回答后会唤醒当前对话；跳过后问题置 cancelled、不写回答消息也不唤醒；提问不会阻塞阶段推进。"
 }
 
 // Parameters implements Tool. version_id/conversation_id/agent_run_id are

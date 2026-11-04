@@ -190,7 +190,7 @@ export function downloadEvidence(versionId: string, evidenceId: string): Promise
 
 /* -------------------------------- human work ------------------------------- */
 
-/** Lists open (or all) human requests paused for a user response. */
+/** Lists pending (or all) human requests paused for a user response. */
 export async function listHumanRequests(
   versionId: string,
   options: HumanRequestListOptions = {},

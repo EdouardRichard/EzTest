@@ -514,7 +514,7 @@ func (f *fakeHumanRepo) ListQuestions(context.Context, int64, string, int, *int6
 
 func (f *fakeHumanRepo) CountByCaseRun(context.Context, int64) (int, error) { return 0, nil }
 
-func (f *fakeHumanRepo) Transition(context.Context, int64, execution.HumanRequestStatus, execution.HumanRequestStatus, map[string]any, int64, time.Time) (bool, error) {
+func (f *fakeHumanRepo) Transition(context.Context, int64, execution.HumanRequestStatus, execution.HumanRequestStatus, map[string]any, int64, time.Time, *time.Time) (bool, error) {
 	return false, nil
 }
 

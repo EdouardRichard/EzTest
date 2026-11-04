@@ -217,21 +217,31 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 	p6SeedHumanRequest(t, pool, 6001, 1001, "login_takeover", "pending", "验证码超时", base.Add(3*time.Hour))
-	p6SeedHumanRequest(t, pool, 6002, 1001, "conflict", "pending", "账号冲突", base.Add(2*time.Hour))
-	p6SeedHumanRequest(t, pool, 6003, 1001, "other", "pending", "", base.Add(1*time.Hour))
-	p6SeedHumanRequest(t, pool, 6004, 1001, "conflict", "answered", "已解决", base.Add(4*time.Hour))
-	p6SeedHumanRequest(t, pool, 6011, 1002, "other", "pending", "人工确认", base)
+	p6SeedHumanRequest(t, pool, 6002, 1001, "blocked_recovery", "pending", "", base.Add(2*time.Hour))
+	p6SeedHumanRequest(t, pool, 6003, 1001, "clarification_question", "pending", "退款按 T+1 还是 T+3？", base.Add(5*time.Hour))
+	p6SeedHumanRequest(t, pool, 6004, 1001, "conflict", "pending", "账号冲突", base.Add(4*time.Hour))
+	p6SeedHumanRequest(t, pool, 6005, 1001, "other", "pending", "", base.Add(1*time.Hour))
+	p6SeedHumanRequest(t, pool, 6006, 1001, "login_takeover", "answered", "已处理", base.Add(6*time.Hour))
+	p6SeedHumanRequest(t, pool, 6011, 1002, "blocked_recovery", "pending", "恢复执行", base)
 
 	rows, err := reader.ListOpenHumanRequests(ctx, true, 10)
 	if err != nil {
 		t.Fatalf("ListOpenHumanRequests admin: %v", err)
 	}
-	if len(rows) != 4 {
-		t.Fatalf("rows = %d, want 4 open rows", len(rows))
+	// Execution todos are login_takeover/blocked_recovery only: structured
+	// clarification_question rows have their own version list, and the legacy
+	// conflict/other kinds are no longer execution todos.
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3 open execution todo rows: %#v", len(rows), rows)
 	}
-	if rows[0].ID != 6001 || rows[1].ID != 6002 || rows[2].ID != 6003 || rows[3].ID != 6011 {
-		t.Fatalf("ids = %d,%d,%d,%d, want takeover first then created_at DESC",
-			rows[0].ID, rows[1].ID, rows[2].ID, rows[3].ID)
+	if rows[0].ID != 6001 || rows[1].ID != 6002 || rows[2].ID != 6011 {
+		t.Fatalf("ids = %d,%d,%d, want takeover first then created_at DESC",
+			rows[0].ID, rows[1].ID, rows[2].ID)
+	}
+	for _, row := range rows {
+		if row.Kind != "login_takeover" && row.Kind != "blocked_recovery" {
+			t.Fatalf("execution todo leaked kind %q: %#v", row.Kind, row)
+		}
 	}
 	if rows[0].Kind != "login_takeover" || rows[0].Title != "验证码超时" || rows[0].VersionID != 1001 {
 		t.Fatalf("row = %#v", rows[0])
@@ -239,8 +249,11 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	if rows[0].ExpiresAt == nil || !rows[0].ExpiresAt.Equal(base.Add(3*time.Hour).Add(30*time.Minute)) {
 		t.Fatalf("expires_at = %v", rows[0].ExpiresAt)
 	}
-	if rows[2].Title != "人工请求" {
-		t.Fatalf("fallback title = %q, want 人工请求", rows[2].Title)
+	if rows[1].Kind != "blocked_recovery" || rows[1].Title != "阻塞恢复" {
+		t.Fatalf("blocked recovery row = %#v, want the kind fallback title", rows[1])
+	}
+	if rows[2].Title != "恢复执行" {
+		t.Fatalf("blocked recovery reason title = %q", rows[2].Title)
 	}
 	if rows[0].VersionTitle != "" {
 		t.Fatalf("version_title = %q, want empty (owned by the version context)", rows[0].VersionTitle)
@@ -250,20 +263,20 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOpenHumanRequests member: %v", err)
 	}
-	if len(memberRows) != 3 {
-		t.Fatalf("rows = %d, want 3 non-takeover rows", len(memberRows))
+	if len(memberRows) != 2 {
+		t.Fatalf("rows = %d, want 2 non-takeover execution todo rows", len(memberRows))
 	}
 	for _, row := range memberRows {
-		if row.Kind == "login_takeover" {
+		if row.Kind != "blocked_recovery" {
 			t.Fatalf("non-admin read leaked %#v", row)
 		}
 	}
 
-	limited, err := reader.ListOpenHumanRequests(ctx, true, 2)
+	limited, err := reader.ListOpenHumanRequests(ctx, true, 1)
 	if err != nil {
 		t.Fatalf("ListOpenHumanRequests limit: %v", err)
 	}
-	if len(limited) != 2 || limited[0].ID != 6001 || limited[1].ID != 6002 {
+	if len(limited) != 1 || limited[0].ID != 6001 {
 		t.Fatalf("limited rows = %#v", limited)
 	}
 }

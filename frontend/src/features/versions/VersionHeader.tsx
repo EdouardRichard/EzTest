@@ -54,10 +54,10 @@ export function VersionHeader({
 
   useEffect(() => {
     let cancelled = false
-    void listHumanRequests(version.id, { status: "open" })
+    void listHumanRequests(version.id, { status: "pending" })
       .then((requests) => {
         if (!cancelled) {
-          setOpenTodoCount(requests.filter((request) => request.status === "open").length)
+          setOpenTodoCount(requests.filter((request) => request.status === "pending").length)
         }
       })
       .catch(() => {

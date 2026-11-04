@@ -320,7 +320,7 @@ export const humanRequestFixture: HumanRequest = {
   version_id: "2001",
   case_run_id: "9303",
   kind: "login_takeover",
-  status: "open",
+  status: "pending",
   payload: {
     reason: "支付网关需要 2FA 验证码",
     version_sut_id: "1002",
@@ -332,10 +332,10 @@ export const humanRequestFixture: HumanRequest = {
   created_at: TIMESTAMP,
 }
 
-export const resolvedHumanRequestFixture: HumanRequest = {
+export const answeredHumanRequestFixture: HumanRequest = {
   ...humanRequestFixture,
   id: "9502",
-  status: "resolved",
+  status: "answered",
   resolved_at: LATER,
   response: { note: "已输入验证码" },
 }

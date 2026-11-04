@@ -197,6 +197,11 @@ func ValidateHumanQuestionBatch(batch HumanQuestionBatch) error {
 // only accepted when allow_free_text is set, and unknown/duplicate answer ids
 // are rejected.
 func ValidateHumanQuestionAnswers(batch HumanQuestionBatch, answers []HumanQuestionAnswer) error {
+	if len(answers) == 0 {
+		// An empty response is not a skip: skip is its own transition. Reject it
+		// so an accidental empty submit cannot silently cancel/answer anything.
+		return platform.Invalid("answers", "must contain at least one answer")
+	}
 	byID := make(map[string]HumanQuestion, len(batch.Questions))
 	for _, question := range batch.Questions {
 		byID[question.ID] = question

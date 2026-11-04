@@ -57,7 +57,7 @@ function mockWorkspace() {
   api.cancelWave.mockResolvedValue({ ...runningWaveFixture, status: "cancelled" })
   api.pauseCaseRun.mockResolvedValue({ ...caseRunsFixture[3], status: "paused" })
   api.resumeCaseRun.mockResolvedValue(caseRunsFixture[3])
-  api.resolveHumanRequest.mockResolvedValue({ ...humanRequestFixture, status: "resolved" })
+  api.resolveHumanRequest.mockResolvedValue({ ...humanRequestFixture, status: "answered" })
   api.cancelHumanRequest.mockResolvedValue({ ...humanRequestFixture, status: "cancelled" })
 }
 
@@ -88,7 +88,7 @@ describe("ExecutionTab", () => {
     expect(await screen.findByRole("heading", { name: "波次 #9201" })).toBeInTheDocument()
     expect(api.getOverview).toHaveBeenCalledWith("2001")
     expect(api.listWaves).toHaveBeenCalledWith("2001")
-    expect(api.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+    expect(api.listHumanRequests).toHaveBeenCalledWith("2001", { status: "pending" })
     await waitFor(() => {
       expect(api.listCaseRuns).toHaveBeenCalledWith("2001", "9201")
     })

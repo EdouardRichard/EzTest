@@ -59,7 +59,8 @@ export type IntentStatus =
 
 export type HumanRequestKind = "login_takeover" | "conflict" | "other"
 
-export type HumanRequestStatus = "open" | "resolved" | "cancelled" | "expired"
+/** v0.22 H1 human_request state machine (spec R-W2-1, DB-16). */
+export type HumanRequestStatus = "pending" | "answered" | "cancelled" | "expired"
 
 export type EvidenceKind =
   | "screenshot"

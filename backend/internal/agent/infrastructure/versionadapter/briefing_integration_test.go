@@ -385,7 +385,7 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 	// never truncated by the renderer.
 	longReason := strings.Repeat("验", 300)
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
-		VALUES (10012, 9004, 'other', jsonb_build_object('reason', $1::text), 'open', now())`, longReason)
+		VALUES (10012, 9004, 'other', jsonb_build_object('reason', $1::text), 'pending', now())`, longReason)
 	source = assertBlocker("cancelled", "")
 	if len(source.OpenQuestions.Questions) != 1 {
 		t.Fatalf("questions = %#v", source.OpenQuestions.Questions)

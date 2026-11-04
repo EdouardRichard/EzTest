@@ -105,13 +105,13 @@ describe("human request labels", () => {
       other: "其他",
     })
     expect(HUMAN_REQUEST_STATUS_LABEL).toEqual({
-      open: "待处理",
-      resolved: "已处理",
+      pending: "待处理",
+      answered: "已处理",
       cancelled: "已取消",
       expired: "已过期",
     })
-    expect(HUMAN_REQUEST_STATUS_TONE.open).toBe("warning")
-    expect(HUMAN_REQUEST_STATUS_TONE.resolved).toBe("success")
+    expect(HUMAN_REQUEST_STATUS_TONE.pending).toBe("warning")
+    expect(HUMAN_REQUEST_STATUS_TONE.answered).toBe("success")
   })
 })
 

@@ -152,7 +152,7 @@ func (s *fakeHumanStore) CountByCaseRun(_ context.Context, caseRunID int64) (int
 	return count, nil
 }
 
-func (s *fakeHumanStore) Transition(_ context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time) (bool, error) {
+func (s *fakeHumanStore) Transition(_ context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time, expiresAt *time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	request, ok := s.byID[id]
@@ -164,6 +164,10 @@ func (s *fakeHumanStore) Transition(_ context.Context, id int64, from, to execut
 	}
 	request.Status = to
 	request.Response = response
+	if expiresAt != nil {
+		request.ExpiresAt = *expiresAt
+		request.Question.ExpiresAt = *expiresAt
+	}
 	switch to {
 	case execution.HumanAnswered, execution.HumanCancelled:
 		request.ResolvedBy = actorPtr(actorID)

@@ -71,7 +71,7 @@ func (r *handlerQuestionRepo) ListOpen(context.Context) ([]execution.HumanReques
 
 func (r *handlerQuestionRepo) CountByCaseRun(context.Context, int64) (int, error) { return 0, nil }
 
-func (r *handlerQuestionRepo) Transition(_ context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time) (bool, error) {
+func (r *handlerQuestionRepo) Transition(_ context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time, expiresAt *time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	request, ok := r.byID[id]
@@ -83,6 +83,10 @@ func (r *handlerQuestionRepo) Transition(_ context.Context, id int64, from, to e
 	}
 	request.Status = to
 	request.Response = response
+	if expiresAt != nil {
+		request.ExpiresAt = *expiresAt
+		request.Question.ExpiresAt = *expiresAt
+	}
 	switch to {
 	case execution.HumanAnswered, execution.HumanCancelled:
 		request.ResolvedBy = &actorID
@@ -438,6 +442,45 @@ func TestQuestionHandlerSkipAndReopen(t *testing.T) {
 	}
 	if reopened.Status != "pending" {
 		t.Fatalf("reopened status = %s, want pending", reopened.Status)
+	}
+}
+
+// TestQuestionHandlerAnswerValidationRejects pins the HTTP 400 mapping of the
+// domain answer validation, including the empty answer list (skip is a distinct
+// transition, never an empty answer).
+func TestQuestionHandlerAnswerValidationRejects(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"unknown option id", `{"answers":[{"question_id":"q1","selected":["z"]}]}`},
+		{"empty answers", `{"answers":[]}`},
+		{"unknown question id", `{"answers":[{"question_id":"q1","selected":["a"]},{"question_id":"q9","selected":["a"]}]}`},
+		{"missing answers field", `{}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newHandlerQuestionFixture()
+			question := f.seed(t, 1)
+			request := questionActorRequest(http.MethodPost,
+				"/api/versions/100/questions/"+questionID(question.ID)+"/answer", test.body)
+			setQuestionPathValues(request, map[string]string{"id": "100", "qid": questionID(question.ID)})
+			recorder := httptest.NewRecorder()
+			f.handler.AnswerQuestion(recorder, request)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("answer status = %d body=%s, want 400", recorder.Code, recorder.Body.String())
+			}
+			if got := f.messages.countKind("answer"); got != 0 {
+				t.Fatalf("invalid answer wrote %d messages", got)
+			}
+			persisted, err := f.repo.Get(context.Background(), question.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if persisted.Status != execution.HumanPending {
+				t.Fatalf("status = %s, want pending", persisted.Status)
+			}
+		})
 	}
 }
 

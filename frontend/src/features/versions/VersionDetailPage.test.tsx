@@ -347,7 +347,7 @@ describe("VersionDetailPage", () => {
     fireEvent.click(screen.getByTestId("version-todo-entry"))
 
     expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()
-    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "pending" })
   })
 
   it("honours a deep-linked execution tab and mounts the execution workspace", async () => {

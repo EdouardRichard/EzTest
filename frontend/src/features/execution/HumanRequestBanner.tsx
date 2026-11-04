@@ -35,7 +35,7 @@ export function HumanRequestBanner({
   onCancel,
   now,
 }: HumanRequestBannerProps) {
-  const open = requests.filter((request) => request.status === "open")
+  const open = requests.filter((request) => request.status === "pending")
   const current = open[0]
   const [clock, setClock] = useState(() => now ?? Date.now())
   const [code, setCode] = useState("")

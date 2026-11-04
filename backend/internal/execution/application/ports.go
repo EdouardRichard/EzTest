@@ -142,8 +142,11 @@ type HumanRequestRepository interface {
 	ListQuestions(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error)
 	CountByCaseRun(ctx context.Context, caseRunID int64) (int, error)
 	// Transition applies a guarded status change with the optional response
-	// fields. It returns false,nil on a status mismatch.
-	Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time) (bool, error)
+	// fields. A non-nil expiresAt extends the deadline in the same statement
+	// (column and question payload); reopening uses it so lazy expiry cannot
+	// immediately re-expire the question. It returns false,nil on a status
+	// mismatch.
+	Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time, expiresAt *time.Time) (bool, error)
 	// AttachMessage records the conversation_message id that renders the
 	// question card.
 	AttachMessage(ctx context.Context, id, messageID int64) error

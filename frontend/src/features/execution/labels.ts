@@ -108,15 +108,15 @@ export const HUMAN_REQUEST_KIND_LABEL: Record<HumanRequestKind, string> = {
 }
 
 export const HUMAN_REQUEST_STATUS_LABEL: Record<HumanRequestStatus, string> = {
-  open: "待处理",
-  resolved: "已处理",
+  pending: "待处理",
+  answered: "已处理",
   cancelled: "已取消",
   expired: "已过期",
 }
 
 export const HUMAN_REQUEST_STATUS_TONE: Record<HumanRequestStatus, BadgeTone> = {
-  open: "warning",
-  resolved: "success",
+  pending: "warning",
+  answered: "success",
   cancelled: "neutral",
   expired: "neutral",
 }

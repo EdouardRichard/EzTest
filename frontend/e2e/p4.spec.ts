@@ -167,7 +167,7 @@ async function getOpenHumanRequests(request: APIRequestContext): Promise<HumanRe
     await api<{ data: HumanRequest[] }>(
       request,
       "GET",
-      `/api/versions/${versionID}/human-requests?status=open&limit=10`,
+      `/api/versions/${versionID}/human-requests?status=pending&limit=10`,
     )
   ).data
 }

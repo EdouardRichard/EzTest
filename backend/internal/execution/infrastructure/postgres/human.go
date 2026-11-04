@@ -151,8 +151,10 @@ func (r *HumanRequestRepository) CountByCaseRun(ctx context.Context, caseRunID i
 }
 
 // Transition applies a guarded human request status change. answered/cancelled
-// store the resolver; reopening to pending clears the resolver fields.
-func (r *HumanRequestRepository) Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time) (bool, error) {
+// store the resolver; reopening to pending clears the resolver fields. A
+// non-nil expiresAt extends the deadline (column and question payload) in the
+// same statement.
+func (r *HumanRequestRepository) Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time, expiresAt *time.Time) (bool, error) {
 	ctx = contextOrBackground(ctx)
 	encodedResponse, err := encodeJSONObject("response", response)
 	if err != nil {
@@ -166,13 +168,18 @@ func (r *HumanRequestRepository) Transition(ctx context.Context, id int64, from,
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE human_request SET status = $3, response = $4::jsonb,
+			expires_at = COALESCE($7::timestamptz, expires_at),
+			question = CASE
+				WHEN $7::timestamptz IS NULL THEN question
+				ELSE jsonb_set(question, '{expires_at}', to_jsonb($7::timestamptz))
+			END,
 			resolved_by = CASE WHEN $3 IN ('answered', 'cancelled') THEN $5
 				WHEN $3 = 'pending' THEN NULL ELSE resolved_by END,
 			resolved_at = CASE WHEN $3 IN ('answered', 'cancelled') THEN $6
 				WHEN $3 = 'pending' THEN NULL ELSE resolved_at END,
 			updated_at = now()
 		WHERE id = $1 AND status = $2
-	`, id, string(from), string(to), encodedResponse, resolvedBy, resolvedAt)
+	`, id, string(from), string(to), encodedResponse, resolvedBy, resolvedAt, expiresAt)
 	if err != nil {
 		return false, wrapDB("transition human request", err)
 	}

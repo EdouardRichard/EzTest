@@ -118,7 +118,7 @@ export function ExecutionTab({
       const [nextOverview, nextWaves, nextHumanRequests] = await Promise.all([
         getOverview(versionId),
         listWaves(versionId),
-        listHumanRequests(versionId, { status: "open" }),
+        listHumanRequests(versionId, { status: "pending" }),
       ])
       setOverview(nextOverview)
       setWaves(nextWaves)
@@ -205,7 +205,7 @@ export function ExecutionTab({
       const [nextOverview, nextWaves, nextHumanRequests] = await Promise.all([
         getOverview(versionId),
         listWaves(versionId),
-        listHumanRequests(versionId, { status: "open" }),
+        listHumanRequests(versionId, { status: "pending" }),
       ])
       setOverview(nextOverview)
       setWaves(nextWaves)
@@ -336,7 +336,7 @@ export function ExecutionTab({
   const pausedCaseRun =
     caseRuns.find((caseRun) => caseRun.id === selectedCaseRunId && caseRun.status === "paused") ??
     null
-  const openHumanRequests = humanRequests.filter((request) => request.status === "open")
+  const openHumanRequests = humanRequests.filter((request) => request.status === "pending")
 
   const sutOptions = Array.from(
     new Set([
