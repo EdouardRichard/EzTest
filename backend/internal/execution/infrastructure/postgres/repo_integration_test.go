@@ -402,6 +402,100 @@ func TestCaseRunListings(t *testing.T) {
 	}
 }
 
+// TestCoverageUsesLatestNonSupersededRun reproduces QA release REL-Q2 at the
+// repository projection that feeds execution coverage: a cancelled wave retires
+// its case_runs as superseded (release run IDs 376154856219480065..67). A
+// superseded row is a process state, not a result, so it must not shadow an
+// earlier passed run, hide an earlier failed run, or count as execution of a
+// case that never ran.
+func TestCoverageUsesLatestNonSupersededRun(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	ctx := context.Background()
+	const (
+		cancelledFingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		retestFingerprint    = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	)
+
+	// Case 300: a pass, then a newer superseded run: the pass survives.
+	// Case 301: a failure, then a newer superseded run: the failure survives.
+	// Case 302: only a superseded run: not executed at all.
+	// Case 303: a pass, a superseded run, then a newer genuine failure.
+	mustCreateIntent(t, repo, 1, 100, 300, testFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 2, 100, 301, testFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 3, 100, 303, testFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 4, 100, 300, cancelledFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 5, 100, 301, cancelledFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 6, 100, 302, cancelledFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 7, 100, 303, cancelledFingerprint, execution.PurposeInitial)
+	mustCreateIntent(t, repo, 8, 100, 303, retestFingerprint, execution.PurposeRetest)
+	mustCreateWave(t, repo, 50, 100)
+	// At most one active wave per version: settle each fixture wave before the
+	// next one is created.
+	markWave := func(id int64, status execution.WaveStatus) {
+		wave, err := repo.Waves.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("load wave %d: %v", id, err)
+		}
+		wave.Status = status
+		ok, err := repo.Waves.Update(ctx, wave)
+		if err != nil || !ok {
+			t.Fatalf("set wave %d %s: ok=%v err=%v", id, status, ok, err)
+		}
+	}
+	markWave(50, execution.WaveDone)
+	mustCreateWave(t, repo, 51, 100)
+	markWave(51, execution.WaveCancelled)
+	mustCreateWave(t, repo, 52, 100)
+	markWave(52, execution.WaveDone)
+	mustCreateCaseRun(t, repo, 500, 50, 1, 300)
+	mustCreateCaseRun(t, repo, 501, 50, 2, 301)
+	mustCreateCaseRun(t, repo, 502, 50, 3, 303)
+	mustCreateCaseRun(t, repo, 503, 51, 4, 300)
+	mustCreateCaseRun(t, repo, 504, 51, 5, 301)
+	mustCreateCaseRun(t, repo, 505, 51, 6, 302)
+	mustCreateCaseRun(t, repo, 506, 51, 7, 303)
+	mustCreateCaseRun(t, repo, 507, 52, 8, 303)
+	setStatus := func(id int64, status execution.CaseRunStatus) {
+		run, err := repo.CaseRuns.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("load case run %d: %v", id, err)
+		}
+		run.Status = status
+		ok, err := repo.CaseRuns.Update(ctx, run)
+		if err != nil || !ok {
+			t.Fatalf("set case run %d %s: ok=%v err=%v", id, status, ok, err)
+		}
+	}
+	setStatus(500, execution.CaseRunPassed)
+	setStatus(501, execution.CaseRunFailed)
+	setStatus(502, execution.CaseRunPassed)
+	setStatus(503, execution.CaseRunSuperseded)
+	setStatus(504, execution.CaseRunSuperseded)
+	setStatus(505, execution.CaseRunSuperseded)
+	setStatus(506, execution.CaseRunSuperseded)
+	setStatus(507, execution.CaseRunFailed)
+
+	latest, err := repo.CaseRuns.LatestByCaseVersions(ctx, 100, []int64{300, 301, 302, 303})
+	if err != nil {
+		t.Fatalf("LatestByCaseVersions: %v", err)
+	}
+	if len(latest) != 3 {
+		t.Fatalf("latest = %+v, want 3 case versions with a non-superseded run", latest)
+	}
+	if run, ok := latest[300]; !ok || run.ID != 500 || run.Status != execution.CaseRunPassed {
+		t.Fatalf("latest[300] = %+v ok=%v, want the earlier passed run 500", run, ok)
+	}
+	if run, ok := latest[301]; !ok || run.ID != 501 || run.Status != execution.CaseRunFailed {
+		t.Fatalf("latest[301] = %+v ok=%v, want the earlier failed run 501", run, ok)
+	}
+	if run, ok := latest[302]; ok {
+		t.Fatalf("latest[302] = %+v, want no result for a superseded-only case", run)
+	}
+	if run, ok := latest[303]; !ok || run.ID != 507 || run.Status != execution.CaseRunFailed {
+		t.Fatalf("latest[303] = %+v ok=%v, want the newest non-superseded run 507", run, ok)
+	}
+}
+
 func TestStepAssertionUpsert(t *testing.T) {
 	repo, _ := newTestRepository(t)
 	ctx := context.Background()

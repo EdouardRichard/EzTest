@@ -23,8 +23,9 @@ import (
 
 // CaseRunStatusReader is the execution read port consumed by the design graph
 // to project each case's latest execution verdict. The implementation must
-// return the newest case_run per case version id in one batched lookup; design
-// never reads the execution tables directly (spec §2.1).
+// return the newest non-superseded case_run per case version id in one batched
+// lookup; a superseded process row is not a verdict. Design never reads the
+// execution tables directly (spec §2.1).
 type CaseRunStatusReader interface {
 	LatestCaseRunStatuses(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]string, error)
 }

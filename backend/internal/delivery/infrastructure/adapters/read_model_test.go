@@ -154,7 +154,7 @@ func (f *fakeCaseRuns) LatestByCaseVersions(_ context.Context, _ int64, caseVers
 	}
 	out := make(map[int64]execution.CaseRun)
 	for _, run := range f.runs {
-		if !want[run.CaseVersionID] {
+		if !want[run.CaseVersionID] || run.Status == execution.CaseRunSuperseded {
 			continue
 		}
 		if existing, ok := out[run.CaseVersionID]; !ok || run.ID > existing.ID {

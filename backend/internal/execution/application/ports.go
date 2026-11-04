@@ -95,8 +95,9 @@ type CaseRunRepository interface {
 	// ClaimLease extends the run lease for the given dispatch epoch.
 	ClaimLease(ctx context.Context, id int64, epoch int64, until time.Time) (bool, error)
 	ListRunningByExecutor(ctx context.Context, executorID int64) ([]execution.CaseRun, error)
-	// LatestByCaseVersions returns the newest case_run per case_version_id of
-	// a version (coverage analysis).
+	// LatestByCaseVersions returns the newest non-superseded case_run per
+	// case_version_id of a version (coverage analysis). Superseded process
+	// rows carry no result and never shadow an earlier run.
 	LatestByCaseVersions(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error)
 }
 

@@ -58,6 +58,9 @@ type WaveReader interface {
 type CaseRunReader interface {
 	Get(ctx context.Context, id int64) (execution.CaseRun, error)
 	ListAllByWave(ctx context.Context, waveID int64) ([]execution.CaseRun, error)
+	// LatestByCaseVersions returns the newest non-superseded run per case
+	// version. The report coverage projection derives from the version run
+	// snapshot instead of relying on this lookup.
 	LatestByCaseVersions(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error)
 }
 
@@ -633,7 +636,11 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	coverage, err := m.coverage(ctx, versionID, requirementViews)
+	versionRuns, err := m.caseRunsOfVersion(ctx, versionID)
+	if err != nil {
+		return delivery.ReportSnapshot{}, err
+	}
+	coverage, err := m.coverage(ctx, versionID, requirementViews, versionRuns)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -683,7 +690,7 @@ func (m *readModel) versionModel(ctx context.Context, versionID int64) (delivery
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	coverage, err := m.coverage(ctx, versionID, requirementViews)
+	coverage, err := m.coverage(ctx, versionID, requirementViews, runs)
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -789,24 +796,36 @@ func (m *readModel) requirementSnapshots(ctx context.Context, versionID int64) (
 	return snapshots, views, nil
 }
 
+// coverageLatestRuns projects the newest non-superseded case_run per case
+// version. A superseded run is a cancelled/replaced process row, never an
+// execution result: treating it as the latest result erases the coverage of an
+// earlier passed run (Task 116 / QA release REL-Q2). A case version whose only
+// runs are superseded has no entry here and stays a "not run" gap.
+func coverageLatestRuns(runs []execution.CaseRun) map[int64]execution.CaseRun {
+	latest := make(map[int64]execution.CaseRun, len(runs))
+	for _, run := range runs {
+		if run.Status == execution.CaseRunSuperseded {
+			continue
+		}
+		if existing, ok := latest[run.CaseVersionID]; ok && existing.ID >= run.ID {
+			continue
+		}
+		latest[run.CaseVersionID] = run
+	}
+	return latest
+}
+
 // coverage computes the P3 execution coverage projection: every current+
-// confirmed case whose latest run did not pass is a gap.
-func (m *readModel) coverage(ctx context.Context, versionID int64, requirements []versionapp.RequirementView) (delivery.CoverageSnapshot, error) {
+// confirmed case whose latest non-superseded run did not pass is a gap. The
+// projection is derived from the version's own case_run snapshot, not from a
+// separate newest-row query, so a cancelled wave that merely supersedes runs
+// cannot overwrite a result the report already counted.
+func (m *readModel) coverage(ctx context.Context, versionID int64, requirements []versionapp.RequirementView, runs []execution.CaseRun) (delivery.CoverageSnapshot, error) {
 	cases, err := m.deps.Design.ListExecutable(ctx, versionID)
 	if err != nil {
 		return delivery.CoverageSnapshot{}, fmt.Errorf("list executable cases: %w", err)
 	}
-	caseVersionIDs := make([]int64, 0, len(cases))
-	for _, item := range cases {
-		caseVersionIDs = append(caseVersionIDs, item.CaseVersionID)
-	}
-	latest := map[int64]execution.CaseRun{}
-	if len(caseVersionIDs) > 0 {
-		latest, err = m.deps.CaseRuns.LatestByCaseVersions(ctx, versionID, caseVersionIDs)
-		if err != nil {
-			return delivery.CoverageSnapshot{}, fmt.Errorf("latest case runs: %w", err)
-		}
-	}
+	latest := coverageLatestRuns(runs)
 	coverage := delivery.CoverageSnapshot{
 		RequirementsTotal: len(requirements),
 		CaseVersionsTotal: len(cases),

@@ -15,6 +15,25 @@ const (
 	MaxReportCaseRuns = 2000
 )
 
+// Report-visible triage/coverage classifications (Task 118). The platform issue
+// triage is authoritative for the failure conclusion: a failed(application)
+// case_run whose issue triage is done with classification=flaky is automation
+// flakiness, not a product defect. The raw P3 failure_class stays available on
+// the snapshot; the report-visible value is derived through
+// CaseRunSnapshot.EffectiveFailureClass.
+const (
+	// TriageClassificationFlaky is the issue.triage classification that marks a
+	// failure as flaky/automation instead of a product defect.
+	TriageClassificationFlaky = "flaky"
+	// FailureClassAutomation is the report-visible failure class of a run whose
+	// issue triage is flaky.
+	FailureClassAutomation = "automation"
+	// CoverageGapExecutionFlaky explains an uncovered case version whose latest
+	// run failed but the platform triage classified that failure as flaky. It
+	// is a flaky gap, not a product coverage failure.
+	CoverageGapExecutionFlaky = "execution_flaky_coverage"
+)
+
 // Stable section names of ReportSnapshot.TruncatedSections.
 const (
 	ReportTruncationIssues   = "issues"
@@ -219,6 +238,11 @@ type CaseRunSnapshot struct {
 	VersionSUTIDs        []int64
 	Status               string
 	FailureClass         string
+	// TriageClassification is the latest finished platform triage
+	// classification of the issue that references this run (empty when none).
+	// A flaky classification overrides the report-visible classification; the
+	// raw FailureClass remains the execution fact.
+	TriageClassification string
 	Summary              string
 	StepCount            int
 	StepFailedCount      int
@@ -232,6 +256,17 @@ type CaseRunSnapshot struct {
 	StartedAt            *time.Time
 	FinishedAt           *time.Time
 	CreatedAt            time.Time
+}
+
+// EffectiveFailureClass is the failure class a report presents. It is the raw
+// execution class unless the platform triage finished with classification=flaky,
+// in which case the failure is automation flakiness and must not be presented
+// as an application/product defect (Task 118).
+func (row CaseRunSnapshot) EffectiveFailureClass() string {
+	if row.TriageClassification == TriageClassificationFlaky {
+		return FailureClassAutomation
+	}
+	return row.FailureClass
 }
 
 // EvidenceSnapshot is one evidence metadata row of a report. Content bytes and
@@ -261,8 +296,22 @@ type IssueSnapshot struct {
 	MergedIntoID   *int64
 	SourceIssueIDs []int64
 	CaseRunIDs     []int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// TriageStatus/TriageClassification are the latest finished issue.triage
+	// projection. They are display metadata (the issue row itself is never
+	// rewritten by a triage proposal) and let the report honor a flaky
+	// classification instead of presenting the issue as a product defect.
+	TriageStatus         string
+	TriageClassification string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+// FlakyTriage reports whether the latest finished triage classified this issue
+// as flaky. Only a done proposal is authoritative: a degraded/failed run or a
+// non-flaky classification never downgrades a real application defect.
+func (row IssueSnapshot) FlakyTriage() bool {
+	return row.TriageStatus == string(AnalysisStatusDone) &&
+		row.TriageClassification == TriageClassificationFlaky
 }
 
 // VersionSUTSnapshot is one version SUT binding used to label report rows
@@ -276,7 +325,8 @@ type VersionSUTSnapshot struct {
 }
 
 // CoverageSnapshot is the P3 execution coverage projection of a version
-// (spec §6.1).
+// (spec §6.1). It counts the newest non-superseded case_run of every executable
+// case version: a superseded process row is not a result.
 type CoverageSnapshot struct {
 	RequirementsTotal   int
 	RequirementsCovered int
@@ -295,14 +345,18 @@ type CoverageSnapshot struct {
 
 // RequirementCoverageSnapshot is the deterministic coverage of one requirement,
 // derived strictly from its executable case versions and their latest case_run
-// statuses. CaseVersionsTotal always equals the sum of the three outcome
-// counters.
+// statuses. CaseVersionsTotal always equals the sum of the four outcome
+// counters: covered, not run, product failed coverage and flaky coverage.
 type RequirementCoverageSnapshot struct {
 	RequirementID              int64
 	CaseVersionsTotal          int
 	CaseVersionsCovered        int
 	CaseVersionsNotRun         int
 	CaseVersionsFailedCoverage int
+	// CaseVersionsFlakyCoverage counts failed latest runs whose issue triage is
+	// flaky. They stay uncovered (a failure is never a pass) but are not a
+	// product coverage failure.
+	CaseVersionsFlakyCoverage int
 }
 
 // CoverageGapSnapshot is one uncovered case version.
