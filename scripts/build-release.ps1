@@ -81,7 +81,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "0.2.0-preview.1",
+    [string]$Version = "0.2.1",
     [string]$RepoRoot = "",
     [string]$OutDir = ".tmp/release",
     [string]$ApiBaseUrl = "http://localhost:13333",

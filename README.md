@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: v0.2.1" src="https://img.shields.io/badge/status-v0.2--preview-orange">
+  <img alt="Status: v0.2.1" src="https://img.shields.io/badge/status-v0.2.1-orange">
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Go 1.24" src="https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white">
   <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-black">
