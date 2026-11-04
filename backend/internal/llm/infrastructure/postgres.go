@@ -28,7 +28,7 @@ const configColumns = `id, name, provider, protocol, base_url, api_key, headers,
 
 const modelColumns = `id, config_id, model, display_name, context_window, max_output,
 	supports_tools, supports_vision, source, status, created_at, updated_at,
-	capabilities, deprecated`
+	capabilities, deprecated, window_source, output_source`
 
 // Repository stores llm_config and llm_model rows.
 type Repository struct {
@@ -207,7 +207,7 @@ func (r *Repository) UpsertModels(ctx context.Context, configID int64, models []
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO llm_model (`+modelColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16)
 			ON CONFLICT (config_id, model) DO UPDATE SET
 				display_name = EXCLUDED.display_name,
 				context_window = EXCLUDED.context_window,
@@ -218,10 +218,13 @@ func (r *Repository) UpsertModels(ctx context.Context, configID int64, models []
 				status = EXCLUDED.status,
 				capabilities = EXCLUDED.capabilities,
 				deprecated = EXCLUDED.deprecated,
+				window_source = EXCLUDED.window_source,
+				output_source = EXCLUDED.output_source,
 				updated_at = EXCLUDED.updated_at
 		`, model.ID, configID, model.Model, model.DisplayName, model.ContextWindow,
 			model.MaxOutput, model.SupportsTools, model.SupportsVision, model.Source,
-			model.Status, model.CreatedAt, model.UpdatedAt, encodedCapabilities, model.Deprecated); err != nil {
+			model.Status, model.CreatedAt, model.UpdatedAt, encodedCapabilities, model.Deprecated,
+			storedFieldSource(model.WindowSource), storedFieldSource(model.OutputSource)); err != nil {
 			return nil, mapModelError(err)
 		}
 	}
@@ -269,20 +272,22 @@ func (r *Repository) InsertModel(ctx context.Context, model llm.Model) (llm.Mode
 	}
 	_, err = r.pool.Exec(ctx, `
 		INSERT INTO llm_model (`+modelColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16)
 	`, model.ID, model.ConfigID, model.Model, model.DisplayName, model.ContextWindow,
 		model.MaxOutput, model.SupportsTools, model.SupportsVision, model.Source,
-		model.Status, model.CreatedAt, model.UpdatedAt, encodedCapabilities, model.Deprecated)
+		model.Status, model.CreatedAt, model.UpdatedAt, encodedCapabilities, model.Deprecated,
+		storedFieldSource(model.WindowSource), storedFieldSource(model.OutputSource))
 	if err != nil {
 		return llm.Model{}, mapModelError(err)
 	}
 	return model, nil
 }
 
-// UpdateModel rewrites one existing row's capability set and deprecated flag.
-// The (id, config_id) pair scopes the write so a model cannot be edited through
-// another configuration. Legacy tools/vision/context columns stay authoritative
-// for P0 readers and are rewritten together with the capability object.
+// UpdateModel rewrites one existing row's numeric parameters, capability set,
+// field provenance and deprecated flag. The (id, config_id) pair scopes the
+// write so a model cannot be edited through another configuration. Legacy
+// tools/vision/window/output columns stay authoritative for readers and are
+// rewritten together with the capability object.
 func (r *Repository) UpdateModel(ctx context.Context, model llm.Model) (llm.Model, error) {
 	encodedCapabilities, err := encodeCapabilities(model.EffectiveCapabilities())
 	if err != nil {
@@ -290,11 +295,13 @@ func (r *Repository) UpdateModel(ctx context.Context, model llm.Model) (llm.Mode
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE llm_model SET
-			context_window = $3, supports_tools = $4, supports_vision = $5,
-			capabilities = $6::jsonb, deprecated = $7, updated_at = $8
+			context_window = $3, max_output = $4, supports_tools = $5, supports_vision = $6,
+			window_source = $7, output_source = $8,
+			capabilities = $9::jsonb, deprecated = $10, updated_at = $11
 		WHERE id = $1 AND config_id = $2
-	`, model.ID, model.ConfigID, model.ContextWindow, model.SupportsTools,
-		model.SupportsVision, encodedCapabilities, model.Deprecated, model.UpdatedAt)
+	`, model.ID, model.ConfigID, model.ContextWindow, model.MaxOutput, model.SupportsTools,
+		model.SupportsVision, storedFieldSource(model.WindowSource), storedFieldSource(model.OutputSource),
+		encodedCapabilities, model.Deprecated, model.UpdatedAt)
 	if err != nil {
 		return llm.Model{}, mapModelError(err)
 	}
@@ -302,6 +309,16 @@ func (r *Repository) UpdateModel(ctx context.Context, model llm.Model) (llm.Mode
 		return llm.Model{}, llm.ErrModelNotFound
 	}
 	return model, nil
+}
+
+// storedFieldSource normalizes the field provenance before it hits the
+// llm_model.window_source/output_source CHECK constraints. Rows that never set
+// a source (fixtures, rows read before llm_0004 existed) are catalog values.
+func storedFieldSource(source string) string {
+	if source == llm.SourceManual {
+		return llm.SourceManual
+	}
+	return llm.SourceCatalog
 }
 
 // DeleteModel removes one catalog row.
@@ -354,7 +371,7 @@ func scanModel(row rowScanner) (llm.Model, error) {
 		&model.ID, &model.ConfigID, &model.Model, &model.DisplayName, &model.ContextWindow,
 		&model.MaxOutput, &model.SupportsTools, &model.SupportsVision, &model.Source,
 		&model.Status, &model.CreatedAt, &model.UpdatedAt,
-		&capabilitiesRaw, &model.Deprecated,
+		&capabilitiesRaw, &model.Deprecated, &model.WindowSource, &model.OutputSource,
 	); err != nil {
 		return llm.Model{}, err
 	}

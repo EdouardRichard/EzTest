@@ -126,6 +126,16 @@ func (s *stubService) DeleteModel(_ context.Context, modelID int64, actorID int6
 	return s.err
 }
 
+func (s *stubService) ResetModelParams(_ context.Context, configID, modelID int64) (llm.Model, error) {
+	s.calls = append(s.calls, "reset_model_params")
+	s.lastID = configID
+	s.lastModel = modelID
+	if s.err != nil {
+		return llm.Model{}, s.err
+	}
+	return s.model, nil
+}
+
 func (s *stubService) ListModels(context.Context) ([]llm.Model, error) {
 	s.calls = append(s.calls, "list_models")
 	return s.models, s.err
@@ -146,7 +156,9 @@ func newTestServer(t *testing.T) (http.Handler, *stubService) {
 	mux.HandleFunc("POST /api/admin/llm/configs/{id}/models", handler.AddModel)
 	mux.HandleFunc("PATCH /api/admin/llm/configs/{id}/models/{modelId}", handler.UpdateModel)
 	mux.HandleFunc("DELETE /api/admin/llm/configs/{id}/models/{modelId}", handler.DeleteModel)
+	mux.HandleFunc("POST /api/admin/llm/configs/{id}/models/{modelId}/reset-params", handler.ResetModelParams)
 	mux.HandleFunc("GET /api/admin/llm/models", handler.ListModels)
+	mux.HandleFunc("GET /api/llm/models", handler.ListPublicModels)
 	return mux, stub
 }
 
@@ -624,6 +636,112 @@ func TestListModelsReturnsAllModels(t *testing.T) {
 	first := items[0].(map[string]any)
 	if first["id"] != "201" || first["created_at"] != "2026-10-31T12:00:00Z" {
 		t.Fatalf("model = %#v", first)
+	}
+}
+
+// TestModelViewIncludesMaxInput pins R-A1-8: both model-list responses and the
+// PATCH response carry window_source, output_source and the derived max_input.
+func TestModelViewIncludesMaxInput(t *testing.T) {
+	handler, stub := newTestServer(t)
+	cfg := sampleConfig()
+	cfg.DefaultModelID = 201
+	stub.configs = []llm.Config{cfg}
+
+	model := sampleModel()
+	model.ContextWindow = 128000
+	model.MaxOutput = 8192
+	model.WindowSource = llm.SourceManual
+	model.OutputSource = llm.SourceCatalog
+	stub.models = []llm.Model{model}
+
+	assertView := func(t *testing.T, item map[string]any, context string) {
+		t.Helper()
+		if item["window_source"] != llm.SourceManual || item["output_source"] != llm.SourceCatalog {
+			t.Fatalf("%s sources = %#v/%#v", context, item["window_source"], item["output_source"])
+		}
+		if item["max_input"] != float64(119808) {
+			t.Fatalf("%s max_input = %#v, want 119808", context, item["max_input"])
+		}
+	}
+
+	admin := call(t, handler, http.MethodGet, "/api/admin/llm/models", "", adminActor())
+	if admin.Code != http.StatusOK {
+		t.Fatalf("admin status = %d, body = %s", admin.Code, admin.Body.String())
+	}
+	t.Logf("admin list response: %s", admin.Body.String())
+	adminItems := dataList(t, admin)
+	if len(adminItems) != 1 {
+		t.Fatalf("admin items = %#v", adminItems)
+	}
+	assertView(t, adminItems[0].(map[string]any), "admin list")
+
+	public := call(t, handler, http.MethodGet, "/api/llm/models", "", nil)
+	if public.Code != http.StatusOK {
+		t.Fatalf("public status = %d, body = %s", public.Code, public.Body.String())
+	}
+	t.Logf("public list response: %s", public.Body.String())
+	publicItems := dataList(t, public)
+	if len(publicItems) != 1 {
+		t.Fatalf("public items = %#v", publicItems)
+	}
+	assertView(t, publicItems[0].(map[string]any), "public list")
+
+	stub.model = model
+	patch := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101/models/201",
+		`{"context_window":128000,"max_output":8192}`, adminActor())
+	if patch.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", patch.Code, patch.Body.String())
+	}
+	if stub.lastPatch.MaxOutput == nil || *stub.lastPatch.MaxOutput != 8192 {
+		t.Fatalf("patch max_output = %#v", stub.lastPatch.MaxOutput)
+	}
+	if stub.lastPatch.ContextWindow == nil || *stub.lastPatch.ContextWindow != 128000 {
+		t.Fatalf("patch context_window = %#v", stub.lastPatch.ContextWindow)
+	}
+	t.Logf("patch response: %s", patch.Body.String())
+	assertView(t, dataBody(t, patch), "patch response")
+}
+
+// TestResetModelParamsEndpoint pins R-A1-4 at the HTTP boundary: an
+// administrator can reset one model's window/output to the stored upstream
+// values, and missing models/actors/invalid IDs map to the typed errors.
+func TestResetModelParamsEndpoint(t *testing.T) {
+	handler, stub := newTestServer(t)
+	stub.model = sampleModel()
+
+	recorder := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/201/reset-params", "", adminActor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(stub.calls) != 1 || stub.calls[0] != "reset_model_params" {
+		t.Fatalf("calls = %#v", stub.calls)
+	}
+	if stub.lastID != 101 || stub.lastModel != 201 {
+		t.Fatalf("ids = %d/%d, want 101/201", stub.lastID, stub.lastModel)
+	}
+	t.Logf("reset response: %s", recorder.Body.String())
+	data := dataBody(t, recorder)
+	if data["model"] != "gpt-4o" || data["window_source"] != llm.SourceCatalog {
+		t.Fatalf("reset data = %#v", data)
+	}
+	if data["max_input"] != float64(112000) {
+		t.Fatalf("reset max_input = %#v, want 112000 (128000-16000 capped output)", data["max_input"])
+	}
+
+	invalid := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/not-an-id/reset-params", "", adminActor())
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid id status = %d, body = %s", invalid.Code, invalid.Body.String())
+	}
+
+	unauthenticated := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/201/reset-params", "", nil)
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401", unauthenticated.Code)
+	}
+
+	stub.err = platform.NotFound("llm model")
+	missing := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/999/reset-params", "", adminActor())
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d, body = %s", missing.Code, missing.Body.String())
 	}
 }
 

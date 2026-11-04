@@ -972,3 +972,241 @@ func TestConfigRequiresDefaultWhenModelsExist(t *testing.T) {
 func formatID(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
+
+func int64Ptr(value int64) *int64 { return &value }
+
+// TestPatchModelSetsManualSource pins R-A1-2/R-A1-8: writing context_window or
+// max_output through the model-parameter patch stores the value, marks that
+// field's provenance as manual and derives max_input = W - O for the response.
+func TestPatchModelSetsManualSource(t *testing.T) {
+	svc, repo, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	repo.models[2] = llm.Model{
+		ID: 2, ConfigID: 1, Model: "gpt-4o", DisplayName: "gpt-4o",
+		ContextWindow: 64000, MaxOutput: 4096,
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceCatalog, OutputSource: llm.SourceCatalog,
+		Capabilities: llm.Capabilities{
+			ContextWindow:        64000,
+			CatalogContextWindow: 128000,
+			CatalogMaxOutput:     16384,
+		},
+	}
+
+	window, output := int64(128000), int64(8192)
+	got, err := svc.UpdateModelParams(ctx, 1, 2, UpdateModelParams{ContextWindow: &window, MaxOutput: &output})
+	if err != nil {
+		t.Fatalf("UpdateModelParams: %v", err)
+	}
+	if got.WindowSource != llm.SourceManual || got.OutputSource != llm.SourceManual {
+		t.Fatalf("sources = %q/%q, want manual/manual", got.WindowSource, got.OutputSource)
+	}
+	if got.MaxInput != 119808 {
+		t.Fatalf("max_input = %d, want 119808", got.MaxInput)
+	}
+
+	stored := repo.models[2]
+	t.Logf("stored after patch: %+v", stored)
+	if stored.ContextWindow != 128000 || stored.MaxOutput != 8192 {
+		t.Fatalf("stored window/output = %d/%d, want 128000/8192", stored.ContextWindow, stored.MaxOutput)
+	}
+	if stored.WindowSource != llm.SourceManual || stored.OutputSource != llm.SourceManual {
+		t.Fatalf("stored sources = %q/%q, want manual/manual", stored.WindowSource, stored.OutputSource)
+	}
+	// The legacy capabilities.context_window mirror stays in sync (A §4.2).
+	if stored.Capabilities.ContextWindow != 128000 {
+		t.Fatalf("capabilities.context_window = %d, want 128000", stored.Capabilities.ContextWindow)
+	}
+	// Patching does not discard the last upstream snapshot.
+	if stored.Capabilities.CatalogContextWindow != 128000 || stored.Capabilities.CatalogMaxOutput != 16384 {
+		t.Fatalf("upstream snapshot = %#v", stored.Capabilities)
+	}
+}
+
+// TestRefreshPreservesManual pins R-A1-3: an upstream refresh only fills fields
+// whose source is catalog (or whose stored value is 0) and never overwrites an
+// administrator's value. The upstream snapshot is still refreshed so
+// reset-params can restore the latest catalog value.
+func TestRefreshPreservesManual(t *testing.T) {
+	svc, repo, client, _, _ := newTestService(t)
+	ctx := context.Background()
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	repo.models[10] = llm.Model{
+		ID: 10, ConfigID: cfg.ID, Model: "manual-model", DisplayName: "manual-model",
+		ContextWindow: 128000, MaxOutput: 8192,
+		Source: llm.SourceManual, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceManual, OutputSource: llm.SourceManual,
+		Capabilities: llm.Capabilities{ContextWindow: 128000},
+	}
+	repo.models[11] = llm.Model{
+		ID: 11, ConfigID: cfg.ID, Model: "catalog-model", DisplayName: "catalog-model",
+		ContextWindow: 64000, MaxOutput: 4096,
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceCatalog, OutputSource: llm.SourceCatalog,
+		Capabilities: llm.Capabilities{ContextWindow: 64000},
+	}
+	client.models = []RemoteModel{
+		{ID: "manual-model", ContextWindow: 1000000, MaxOutput: 393216},
+		{ID: "catalog-model", ContextWindow: 200000, MaxOutput: 32000},
+	}
+
+	models, err := svc.RefreshModels(ctx, cfg.ID, 1)
+	if err != nil {
+		t.Fatalf("RefreshModels: %v", err)
+	}
+	byName := make(map[string]llm.Model, len(models))
+	for _, model := range models {
+		byName[model.Model] = model
+		t.Logf("refreshed model: %+v", model)
+	}
+
+	manual := byName["manual-model"]
+	if manual.ContextWindow != 128000 || manual.MaxOutput != 8192 {
+		t.Fatalf("manual params overwritten: %d/%d", manual.ContextWindow, manual.MaxOutput)
+	}
+	if manual.WindowSource != llm.SourceManual || manual.OutputSource != llm.SourceManual {
+		t.Fatalf("manual sources = %q/%q", manual.WindowSource, manual.OutputSource)
+	}
+	if manual.Capabilities.ContextWindow != 128000 {
+		t.Fatalf("manual capabilities.context_window = %d, want 128000", manual.Capabilities.ContextWindow)
+	}
+	if manual.Capabilities.CatalogContextWindow != 1000000 || manual.Capabilities.CatalogMaxOutput != 393216 {
+		t.Fatalf("upstream snapshot = %#v, want the remote 1M/393216", manual.Capabilities)
+	}
+	if manual.MaxInput != 119808 {
+		t.Fatalf("manual max_input = %d, want 119808", manual.MaxInput)
+	}
+
+	catalog := byName["catalog-model"]
+	if catalog.ContextWindow != 200000 || catalog.MaxOutput != 32000 {
+		t.Fatalf("catalog params not updated: %d/%d", catalog.ContextWindow, catalog.MaxOutput)
+	}
+	if catalog.WindowSource != llm.SourceCatalog || catalog.OutputSource != llm.SourceCatalog {
+		t.Fatalf("catalog sources = %q/%q", catalog.WindowSource, catalog.OutputSource)
+	}
+	if catalog.Capabilities.ContextWindow != 200000 {
+		t.Fatalf("catalog capabilities.context_window = %d", catalog.Capabilities.ContextWindow)
+	}
+}
+
+// TestResetParams pins R-A1-4: reset restores the last upstream window/output
+// snapshot and flips both field sources back to catalog; a model without a
+// snapshot resets to 0 (unknown/auto).
+func TestResetParams(t *testing.T) {
+	svc, repo, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	repo.models[2] = llm.Model{
+		ID: 2, ConfigID: 1, Model: "edited-model", DisplayName: "edited-model",
+		ContextWindow: 128000, MaxOutput: 8192,
+		Source: llm.SourceManual, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceManual, OutputSource: llm.SourceManual,
+		Capabilities: llm.Capabilities{
+			ContextWindow:        128000,
+			CatalogContextWindow: 1000000,
+			CatalogMaxOutput:     393216,
+		},
+	}
+	repo.models[3] = llm.Model{
+		ID: 3, ConfigID: 1, Model: "no-upstream-model", DisplayName: "no-upstream-model",
+		ContextWindow: 64000, MaxOutput: 4096,
+		Source: llm.SourceManual, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceManual, OutputSource: llm.SourceManual,
+		Capabilities: llm.Capabilities{ContextWindow: 64000},
+	}
+
+	got, err := svc.ResetModelParams(ctx, 1, 2)
+	if err != nil {
+		t.Fatalf("ResetModelParams: %v", err)
+	}
+	if got.ContextWindow != 1000000 || got.MaxOutput != 393216 {
+		t.Fatalf("reset params = %d/%d, want the 1M/393216 snapshot", got.ContextWindow, got.MaxOutput)
+	}
+	if got.WindowSource != llm.SourceCatalog || got.OutputSource != llm.SourceCatalog {
+		t.Fatalf("reset sources = %q/%q, want catalog/catalog", got.WindowSource, got.OutputSource)
+	}
+	if got.MaxInput != 984000 {
+		t.Fatalf("max_input = %d, want 984000", got.MaxInput)
+	}
+	stored := repo.models[2]
+	t.Logf("stored after reset: %+v", stored)
+	if stored.ContextWindow != 1000000 || stored.MaxOutput != 393216 ||
+		stored.WindowSource != llm.SourceCatalog || stored.OutputSource != llm.SourceCatalog {
+		t.Fatalf("stored after reset = %+v", stored)
+	}
+	if stored.Capabilities.ContextWindow != 1000000 {
+		t.Fatalf("capabilities.context_window = %d, want 1000000", stored.Capabilities.ContextWindow)
+	}
+
+	empty, err := svc.ResetModelParams(ctx, 1, 3)
+	if err != nil {
+		t.Fatalf("ResetModelParams without snapshot: %v", err)
+	}
+	if empty.ContextWindow != 0 || empty.MaxOutput != 0 {
+		t.Fatalf("reset without snapshot = %d/%d, want 0/0", empty.ContextWindow, empty.MaxOutput)
+	}
+	if empty.WindowSource != llm.SourceCatalog || empty.OutputSource != llm.SourceCatalog {
+		t.Fatalf("sources without snapshot = %q/%q", empty.WindowSource, empty.OutputSource)
+	}
+	if empty.MaxInput != 123904 {
+		t.Fatalf("max_input without snapshot = %d, want 123904 (128000-4096)", empty.MaxInput)
+	}
+
+	if _, err := svc.ResetModelParams(ctx, 1, 999); err == nil {
+		t.Fatal("reset of an unknown model succeeded")
+	} else if apiErr := apiError(t, err); apiErr.Status != http.StatusNotFound {
+		t.Fatalf("unknown model status = %d, want 404", apiErr.Status)
+	}
+}
+
+// TestPatchRejectsMaxOutputAboveWindow pins R-A1-6: max_output must stay within
+// the context window, including when only one side is patched and the other is
+// the stored value. Equal values are allowed (the UI warns instead).
+func TestPatchRejectsMaxOutputAboveWindow(t *testing.T) {
+	svc, repo, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	repo.models[2] = llm.Model{
+		ID: 2, ConfigID: 1, Model: "gpt-4o", DisplayName: "gpt-4o",
+		ContextWindow: 128000, MaxOutput: 8192,
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceCatalog, OutputSource: llm.SourceCatalog,
+		Capabilities: llm.Capabilities{ContextWindow: 128000},
+	}
+
+	assertInvalid := func(t *testing.T, params UpdateModelParams) {
+		t.Helper()
+		if _, err := svc.UpdateModelParams(ctx, 1, 2, params); err == nil {
+			t.Fatalf("params %#v accepted", params)
+		} else {
+			apiErr := apiError(t, err)
+			if apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_argument" {
+				t.Fatalf("error = %#v, want 400 invalid_argument", apiErr)
+			}
+		}
+	}
+
+	// max_output above the stored window.
+	assertInvalid(t, UpdateModelParams{MaxOutput: int64Ptr(128001)})
+	// A window lowered below the stored max_output is the same violation.
+	assertInvalid(t, UpdateModelParams{ContextWindow: int64Ptr(4096)})
+	// Out-of-range window is rejected even when max_output stays valid.
+	assertInvalid(t, UpdateModelParams{ContextWindow: int64Ptr(llm.MaxContextWindow + 1)})
+	assertInvalid(t, UpdateModelParams{MaxOutput: int64Ptr(-1)})
+
+	if repo.models[2].ContextWindow != 128000 || repo.models[2].MaxOutput != 8192 {
+		t.Fatalf("rejected patch was persisted: %+v", repo.models[2])
+	}
+
+	// Equal raw window/output is allowed; max_input uses the request-side
+	// output cap (O = min(128000, 16000)), so it is not the raw 0.
+	equal, err := svc.UpdateModelParams(ctx, 1, 2, UpdateModelParams{MaxOutput: int64Ptr(128000)})
+	if err != nil {
+		t.Fatalf("equal window/output rejected: %v", err)
+	}
+	if equal.MaxInput != 112000 {
+		t.Fatalf("max_input = %d, want 112000", equal.MaxInput)
+	}
+}

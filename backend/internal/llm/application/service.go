@@ -145,7 +145,12 @@ func (s *Service) TestConfig(ctx context.Context, id int64) (TestResult, error) 
 	return result, nil
 }
 
-// RefreshModels pulls the upstream model catalog and upserts it.
+// RefreshModels pulls the upstream model catalog and merges it into the stored
+// catalog. For an existing model only parameters whose field source is catalog
+// (or whose stored value is 0/unknown) are updated: an administrator's manual
+// window/output survives every refresh (A §4.4/R-A1-3). The latest upstream
+// values are still persisted inside capabilities so reset-params can restore
+// them. Capability booleans keep following the upstream as before.
 func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([]llm.Model, error) {
 	cfg, err := s.repo.GetConfig(ctx, id)
 	if err != nil {
@@ -155,6 +160,14 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 	if err != nil {
 		return nil, upstreamError(err, cfg.APIKey, "failed to refresh llm models")
 	}
+	existing, err := s.repo.ListModelsByConfig(ctx, id)
+	if err != nil {
+		return nil, mapRepositoryError(err)
+	}
+	byName := make(map[string]llm.Model, len(existing))
+	for _, model := range existing {
+		byName[model.Model] = model
+	}
 
 	now := s.clock.Now()
 	models := make([]llm.Model, 0, len(remote))
@@ -163,13 +176,34 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 		if name == "" {
 			continue
 		}
+		window := item.ContextWindow
+		output := item.MaxOutput
+		windowSource := llm.SourceCatalog
+		outputSource := llm.SourceCatalog
+		source := llm.SourceCatalog
+		if previous, ok := byName[name]; ok {
+			// Manual values are never overwritten. A 0 stored value means
+			// unknown/auto and may be filled from the upstream even when the
+			// source marker says manual.
+			windowSource = previous.EffectiveWindowSource()
+			outputSource = previous.EffectiveOutputSource()
+			if windowSource != llm.SourceCatalog && previous.ContextWindow != 0 {
+				window = previous.ContextWindow
+			}
+			if outputSource != llm.SourceCatalog && previous.MaxOutput != 0 {
+				output = previous.MaxOutput
+			}
+			if previous.Source != "" {
+				source = previous.Source
+			}
+		}
 		models = append(models, llm.Model{
 			ID:             s.ids.Next(),
 			ConfigID:       id,
 			Model:          name,
 			DisplayName:    name,
-			ContextWindow:  item.ContextWindow,
-			MaxOutput:      item.MaxOutput,
+			ContextWindow:  window,
+			MaxOutput:      output,
 			SupportsTools:  item.SupportsTools,
 			SupportsVision: item.SupportsVision,
 			Capabilities: llm.Capabilities{
@@ -177,12 +211,18 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 				SupportsVision:      item.SupportsVision,
 				SupportsReasoning:   item.SupportsReasoning,
 				SupportsPromptCache: item.SupportsPromptCache,
-				ContextWindow:       item.ContextWindow,
+				// Legacy mirror stays in sync with the effective column, while
+				// the catalog_* keys keep the raw upstream values for reset.
+				ContextWindow:        window,
+				CatalogContextWindow: item.ContextWindow,
+				CatalogMaxOutput:     item.MaxOutput,
 			},
-			Source:    llm.SourceCatalog,
-			Status:    llm.ModelStatusActive,
-			CreatedAt: now,
-			UpdatedAt: now,
+			Source:       source,
+			WindowSource: windowSource,
+			OutputSource: outputSource,
+			Status:       llm.ModelStatusActive,
+			CreatedAt:    now,
+			UpdatedAt:    now,
 		})
 	}
 
@@ -198,6 +238,9 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 	upserted, err := s.repo.UpsertModels(ctx, id, models, now)
 	if err != nil {
 		return nil, mapRepositoryError(err)
+	}
+	for i := range upserted {
+		upserted[i] = withModelView(upserted[i])
 	}
 	return upserted, nil
 }
@@ -218,6 +261,9 @@ func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput
 	if input.MaxOutput < 0 || input.MaxOutput > llm.MaxMaxOutput {
 		return llm.Model{}, platform.Invalid("max_output", "must be between 0 and "+strconv.Itoa(llm.MaxMaxOutput))
 	}
+	if err := validateParamPair(int64(input.ContextWindow), int64(input.MaxOutput)); err != nil {
+		return llm.Model{}, err
+	}
 
 	now := s.clock.Now()
 	row := llm.Model{
@@ -236,22 +282,29 @@ func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput
 			SupportsPromptCache: input.SupportsPromptCache,
 			ContextWindow:       input.ContextWindow,
 		},
-		Source:    llm.SourceManual,
-		Status:    llm.ModelStatusActive,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Source:       llm.SourceManual,
+		// A manually added model's numeric parameters are administrator input,
+		// so an upstream refresh that later reports the same name must keep
+		// them unless the value is still 0 (unknown).
+		WindowSource: llm.SourceManual,
+		OutputSource: llm.SourceManual,
+		Status:       llm.ModelStatusActive,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	stored, err := s.repo.InsertModel(ctx, row)
 	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
-	return stored, nil
+	return withModelView(stored), nil
 }
 
 // UpdateModel patches one model row scoped to its configuration. It backs the
 // admin capability editor so gateways whose /models response omits capabilities
-// can be corrected without deleting and re-adding the model. Unknown rows (and
-// rows owned by another configuration) are a typed 404.
+// can be corrected without deleting and re-adding the model, and it also
+// accepts the context_window/max_output parameters (whose field sources become
+// manual on write). Unknown rows (and rows owned by another configuration) are
+// a typed 404.
 func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patch ModelPatch, actorID int64) (llm.Model, error) {
 	models, err := s.repo.ListModelsByConfig(ctx, configID)
 	if err != nil {
@@ -268,12 +321,34 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 		return llm.Model{}, platform.NotFound("llm model")
 	}
 
+	window := int64(target.ContextWindow)
+	output := int64(target.MaxOutput)
 	if patch.ContextWindow != nil {
 		if *patch.ContextWindow < 0 || *patch.ContextWindow > llm.MaxContextWindow {
 			return llm.Model{}, platform.Invalid("context_window", "must be between 0 and "+strconv.Itoa(llm.MaxContextWindow))
 		}
-		target.ContextWindow = *patch.ContextWindow
-		target.Capabilities.ContextWindow = *patch.ContextWindow
+		window = int64(*patch.ContextWindow)
+	}
+	if patch.MaxOutput != nil {
+		if *patch.MaxOutput < 0 || *patch.MaxOutput > llm.MaxMaxOutput {
+			return llm.Model{}, platform.Invalid("max_output", "must be between 0 and "+strconv.Itoa(llm.MaxMaxOutput))
+		}
+		output = *patch.MaxOutput
+	}
+	// Validate only when a numeric parameter is being written: an unrelated
+	// capability edit must not fail because an older row is inconsistent.
+	if patch.ContextWindow != nil || patch.MaxOutput != nil {
+		if err := validateParamPair(window, output); err != nil {
+			return llm.Model{}, err
+		}
+	}
+	if patch.ContextWindow != nil {
+		target.ContextWindow = int(window)
+		target.WindowSource = llm.SourceManual
+	}
+	if patch.MaxOutput != nil {
+		target.MaxOutput = int(output)
+		target.OutputSource = llm.SourceManual
 	}
 	if patch.SupportsTools != nil {
 		target.SupportsTools = *patch.SupportsTools
@@ -298,7 +373,7 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 		capabilities.SupportsPromptCache = *patch.SupportsPromptCache
 	}
 	if patch.ContextWindow != nil {
-		capabilities.ContextWindow = *patch.ContextWindow
+		capabilities.ContextWindow = target.ContextWindow
 	}
 	target.Capabilities = capabilities
 	target.UpdatedAt = s.clock.Now()
@@ -307,7 +382,59 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
-	return stored, nil
+	return withModelView(stored), nil
+}
+
+// UpdateModelParams applies the per-model numeric-parameter edit from the model
+// catalog dialog (A §4.3). Supplied values are persisted and the matching field
+// source becomes manual; nil keeps the stored value. The service-level patch
+// above remains the transport for the capability editor.
+func (s *Service) UpdateModelParams(ctx context.Context, configID, modelID int64, params UpdateModelParams) (llm.Model, error) {
+	patch := ModelPatch{MaxOutput: params.MaxOutput}
+	if params.ContextWindow != nil {
+		if *params.ContextWindow < 0 || *params.ContextWindow > llm.MaxContextWindow {
+			return llm.Model{}, platform.Invalid("context_window", "must be between 0 and "+strconv.Itoa(llm.MaxContextWindow))
+		}
+		window := int(*params.ContextWindow)
+		patch.ContextWindow = &window
+	}
+	return s.UpdateModel(ctx, configID, modelID, patch, 0)
+}
+
+// ResetModelParams restores one model's window/output to the most recent
+// upstream values recorded during a catalog refresh and flips both field
+// sources back to catalog (A §4.3/R-A1-4). A model without an upstream snapshot
+// resets to 0 (unknown/auto).
+func (s *Service) ResetModelParams(ctx context.Context, configID, modelID int64) (llm.Model, error) {
+	models, err := s.repo.ListModelsByConfig(ctx, configID)
+	if err != nil {
+		return llm.Model{}, err
+	}
+	var target *llm.Model
+	for i := range models {
+		if models[i].ID == modelID {
+			target = &models[i]
+			break
+		}
+	}
+	if target == nil {
+		return llm.Model{}, platform.NotFound("llm model")
+	}
+
+	capabilities := target.EffectiveCapabilities()
+	target.ContextWindow = capabilities.CatalogContextWindow
+	target.MaxOutput = capabilities.CatalogMaxOutput
+	target.Capabilities = capabilities
+	target.Capabilities.ContextWindow = target.ContextWindow
+	target.WindowSource = llm.SourceCatalog
+	target.OutputSource = llm.SourceCatalog
+	target.UpdatedAt = s.clock.Now()
+
+	stored, err := s.repo.UpdateModel(ctx, *target)
+	if err != nil {
+		return llm.Model{}, mapRepositoryError(err)
+	}
+	return withModelView(stored), nil
 }
 
 // DeleteModel removes one catalog row.
@@ -318,11 +445,15 @@ func (s *Service) DeleteModel(ctx context.Context, modelID int64, actorID int64)
 	return nil
 }
 
-// ListModels returns the whole model catalog ordered by ID.
+// ListModels returns the whole model catalog ordered by ID. Every row carries
+// the derived max_input view value (A §4.3).
 func (s *Service) ListModels(ctx context.Context) ([]llm.Model, error) {
 	list, err := s.repo.ListModels(ctx)
 	if err != nil {
 		return nil, mapRepositoryError(err)
+	}
+	for i := range list {
+		list[i] = withModelView(list[i])
 	}
 	return list, nil
 }
@@ -565,6 +696,28 @@ func (s *Service) recordConfigChange(ctx context.Context, verb string, cfg llm.C
 			RequestID: requestID,
 		})
 	}
+}
+
+// validateParamPair enforces the cross-field rule from A §4.1/R-A1-6: when the
+// context window is known (>0), max_output must stay within it. Equal values are
+// allowed (the UI warns about a zero input budget instead). A window of 0 means
+// auto/unknown, so any non-negative max_output is acceptable.
+func validateParamPair(window, output int64) error {
+	if output < 0 {
+		return platform.Invalid("max_output", "must not be negative")
+	}
+	if window > 0 && output > window {
+		return platform.Invalid("max_output", fmt.Sprintf(
+			"must not exceed context_window (%d tokens)", window))
+	}
+	return nil
+}
+
+// withModelView fills the derived, read-only fields of a model before it is
+// returned to the HTTP layer. They are never persisted.
+func withModelView(model llm.Model) llm.Model {
+	model.MaxInput = MaxInput(model)
+	return model
 }
 
 // mapRepositoryError translates domain sentinels into the shared HTTP errors.

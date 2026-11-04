@@ -315,10 +315,9 @@ func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, erro
 
 	req.Model = chosen.Model
 	if req.MaxOutputTokens <= 0 {
-		req.MaxOutputTokens = chosen.MaxOutput
-		if req.MaxOutputTokens <= 0 {
-			req.MaxOutputTokens = DefaultChatMaxOutputTokens
-		}
+		// R-A1-5: the request-side output limit is O = min(max_output or 4096,
+		// 16000), so an upstream-reported 393K is never forwarded verbatim.
+		req.MaxOutputTokens = int(EffectiveMaxOutput(chosen))
 	}
 
 	response, err := s.chat.Chat(ctx, cfg, req)

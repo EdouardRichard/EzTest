@@ -162,11 +162,14 @@ type modelDTO struct {
 	DisplayName    string           `json:"display_name"`
 	ContextWindow  int              `json:"context_window"`
 	MaxOutput      int              `json:"max_output"`
+	MaxInput       int64            `json:"max_input"`
 	SupportsTools  bool             `json:"supports_tools"`
 	SupportsVision bool             `json:"supports_vision"`
 	Capabilities   llm.Capabilities `json:"capabilities"`
 	Deprecated     bool             `json:"deprecated"`
 	Source         string           `json:"source"`
+	WindowSource   string           `json:"window_source"`
+	OutputSource   string           `json:"output_source"`
 	Status         string           `json:"status"`
 	CreatedAt      string           `json:"created_at"`
 	UpdatedAt      string           `json:"updated_at"`
@@ -182,6 +185,10 @@ type publicModelDTO struct {
 	Model         string           `json:"model"`
 	DisplayName   string           `json:"display_name"`
 	ContextWindow int              `json:"context_window"`
+	MaxOutput     int              `json:"max_output"`
+	MaxInput      int64            `json:"max_input"`
+	WindowSource  string           `json:"window_source"`
+	OutputSource  string           `json:"output_source"`
 	Capabilities  llm.Capabilities `json:"capabilities"`
 	Default       bool             `json:"default"`
 	Deprecated    bool             `json:"deprecated"`
@@ -199,6 +206,10 @@ func toPublicModelDTO(model llm.Model, cfg llm.Config) publicModelDTO {
 		Model:         model.Model,
 		DisplayName:   model.DisplayName,
 		ContextWindow: capabilities.ContextWindow,
+		MaxOutput:     model.MaxOutput,
+		MaxInput:      llmapp.MaxInput(model),
+		WindowSource:  model.EffectiveWindowSource(),
+		OutputSource:  model.EffectiveOutputSource(),
 		Capabilities:  capabilities,
 		Default:       cfg.DefaultModelID == model.ID,
 		Deprecated:    model.Deprecated,
@@ -213,11 +224,14 @@ func toModelDTO(model llm.Model) modelDTO {
 		DisplayName:    model.DisplayName,
 		ContextWindow:  model.ContextWindow,
 		MaxOutput:      model.MaxOutput,
+		MaxInput:       llmapp.MaxInput(model),
 		SupportsTools:  model.SupportsTools,
 		SupportsVision: model.SupportsVision,
 		Capabilities:   model.EffectiveCapabilities(),
 		Deprecated:     model.Deprecated,
 		Source:         model.Source,
+		WindowSource:   model.EffectiveWindowSource(),
+		OutputSource:   model.EffectiveOutputSource(),
 		Status:         model.Status,
 		CreatedAt:      formatTime(model.CreatedAt),
 		UpdatedAt:      formatTime(model.UpdatedAt),
@@ -282,21 +296,24 @@ func (r addModelRequest) input() llmapp.ModelInput {
 	}
 }
 
-// updateModelRequest is the partial capability patch. Pointer fields keep
-// "omitted" distinct from an explicit false/zero so the admin editor can flip a
-// single checkbox without resetting the others.
+// updateModelRequest is the partial model patch. Pointer fields keep "omitted"
+// distinct from an explicit false/zero so the admin editor can flip a single
+// checkbox without resetting the others. context_window/max_output are the
+// per-model numeric parameters (raw tokens, A §4.3).
 type updateModelRequest struct {
-	ContextWindow       *int  `json:"context_window"`
-	SupportsTools       *bool `json:"supports_tools"`
-	SupportsVision      *bool `json:"supports_vision"`
-	SupportsReasoning   *bool `json:"supports_reasoning"`
-	SupportsPromptCache *bool `json:"supports_prompt_cache"`
-	Deprecated          *bool `json:"deprecated"`
+	ContextWindow       *int   `json:"context_window"`
+	MaxOutput           *int64 `json:"max_output"`
+	SupportsTools       *bool  `json:"supports_tools"`
+	SupportsVision      *bool  `json:"supports_vision"`
+	SupportsReasoning   *bool  `json:"supports_reasoning"`
+	SupportsPromptCache *bool  `json:"supports_prompt_cache"`
+	Deprecated          *bool  `json:"deprecated"`
 }
 
 func (r updateModelRequest) patch() llmapp.ModelPatch {
 	return llmapp.ModelPatch{
 		ContextWindow:       r.ContextWindow,
+		MaxOutput:           r.MaxOutput,
 		SupportsTools:       r.SupportsTools,
 		SupportsVision:      r.SupportsVision,
 		SupportsReasoning:   r.SupportsReasoning,
