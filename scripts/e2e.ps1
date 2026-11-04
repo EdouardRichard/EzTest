@@ -396,6 +396,11 @@ try {
         -WindowStyle Hidden `
         -PassThru
     Wait-ForHttp -Url "$fakeLlmBaseUrl/v1/models" -TimeoutSeconds 30 -Process $fakeProcess -Label "Fake LLM"
+    # The browser specs fall back to stale ports (14333/13335); export the real ones.
+    $env:EZTEST_E2E_API_URL = $apiBaseUrl
+    $env:EZTEST_E2E_WEB_URL = $webBaseUrl
+    $env:EZTEST_E2E_FAKE_LLM_URL = "$fakeLlmBaseUrl/v1"
+    if ($executorProcess -and $executorBaseUrl) { $env:EZTEST_E2E_EXECUTOR_URL = $executorBaseUrl }
     Write-Host "Fake LLM is ready at $fakeLlmBaseUrl"
 
     # P6 execution E2E state: the evidence file store and the executor endpoint
@@ -576,7 +581,11 @@ try {
             $p8Specs = @($specFiles | Where-Object { $_ -like "p8-*.spec.ts" })
             $p7Specs = @($specFiles | Where-Object { $_ -like "p7-*.spec.ts" })
             $executionSpecs = @($specFiles | Where-Object { $_ -like "*execution.spec.ts" })
+            # p3/p4/p5 are real-LLM/dedicated-harness specs (scripts/p3-e2e.ps1,
+            # scripts/p4-e2e.ps1, scripts/p5-e2e.ps1); the fake-LLM runner must not
+            # include them. They run in their own harnesses.
             $bulkSpecs = @($specFiles | Where-Object {
+                $_ -ne "p3.spec.ts" -and $_ -ne "p4.spec.ts" -and $_ -ne "p5.spec.ts" -and
                 $_ -notlike "p8-*.spec.ts" -and $_ -notlike "p7-*.spec.ts" -and
                 $_ -notlike "*execution.spec.ts"
             })
