@@ -54,8 +54,10 @@ var _ versionapp.ExtractionRepository = (*ExtractionRepository)(nil)
 // exactly one run stays active and every superseded run is archived. On the
 // replay path the stored segments are refreshed (a changed text_sha256 reopens
 // the segment) and totals/expected_count are recomputed so a done run never
-// keeps orphan pending segments. A replay of an already superseded sha returns
-// the currently active run instead of resurrecting the old cursor.
+// keeps orphan pending segments. A replay of a sha whose run is already terminal
+// returns the newer active run when one exists; when no run is active, the
+// replayed run is revived and becomes the live generation again (a newer settled
+// run does not fence it).
 func (r *ExtractionRepository) CreateRun(ctx context.Context, run versionapp.ExtractionRun, segments []versionapp.ExtractionSegment) (versionapp.ExtractionRun, error) {
 	if r.pool == nil {
 		return versionapp.ExtractionRun{}, errors.New("extraction repository: missing pool")
@@ -177,7 +179,8 @@ func archiveActiveRunsTx(ctx context.Context, tx pgx.Tx, versionID, attachmentID
 // refreshReplayedRunTx recomputes the replay segment totals and reopens a
 // terminal run that received pending segments (changed text or a new segment),
 // so a done run can never keep orphan pending segments. A paused run stays
-// paused; expected_count is refreshed when the replay supplied a document.
+// paused; a zero-segment run created done stays done (the failed branch requires
+// total > 0); expected_count is refreshed when the replay supplied a document.
 func refreshReplayedRunTx(ctx context.Context, tx pgx.Tx, runID int64, expected *int, now time.Time) error {
 	if _, err := tx.Exec(ctx, `
 		WITH agg AS (
@@ -200,7 +203,7 @@ func refreshReplayedRunTx(ctx context.Context, tx pgx.Tx, runID int64, expected 
 		        WHEN r.status = 'paused' THEN r.status
 		        WHEN agg.pending > 0 AND r.status IN ('done', 'failed') THEN 'pending'
 		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN 'done'
-		        WHEN agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0 THEN 'failed'
+		        WHEN agg.total > 0 AND agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0 THEN 'failed'
 		        ELSE r.status
 		    END,
 		    error = CASE
@@ -584,7 +587,9 @@ func (r *ExtractionRepository) markSegmentTerminal(ctx context.Context, runID in
 }
 
 // requireWritableExtractionRunTx locks the run and rejects transitions when it
-// is terminal or superseded by a newer run of the same attachment.
+// is terminal or superseded by a newer *active* run of the same attachment. A
+// newer run that already settled does not fence an older run revived by a replay
+// of its sha; only a newer pending/running/paused run is a live generation.
 func requireWritableExtractionRunTx(ctx context.Context, tx pgx.Tx, runID int64) error {
 	var versionID, attachmentID int64
 	var status string
@@ -607,6 +612,7 @@ func requireWritableExtractionRunTx(ctx context.Context, tx pgx.Tx, runID int64)
 		SELECT EXISTS (
 			SELECT 1 FROM requirement_extraction_run
 			WHERE version_id = $1 AND attachment_id = $2 AND id > $3
+			  AND status IN ('pending', 'running', 'paused')
 		)
 	`, versionID, attachmentID, runID).Scan(&superseded); err != nil {
 		return fmt.Errorf("check extraction run generation: %w", err)
@@ -664,7 +670,8 @@ func requireSegmentTransition(ctx context.Context, tx pgx.Tx, affected int64, ru
 
 // requireActiveExtractionRunTx fences requirement emits: the source run must
 // exist for the same version/attachment, be active (pending/running/paused) and
-// not be superseded by a newer run of the attachment.
+// not be superseded by a newer *active* run of the attachment. A newer settled
+// run does not fence a replay-revived generation (there is only one live writer).
 func requireActiveExtractionRunTx(ctx context.Context, tx pgx.Tx, source versionapp.ExtractionSource) error {
 	var versionID, attachmentID int64
 	var status string
@@ -690,6 +697,7 @@ func requireActiveExtractionRunTx(ctx context.Context, tx pgx.Tx, source version
 		SELECT EXISTS (
 			SELECT 1 FROM requirement_extraction_run
 			WHERE version_id = $1 AND attachment_id = $2 AND id > $3
+			  AND status IN ('pending', 'running', 'paused')
 		)
 	`, versionID, attachmentID, source.RunID).Scan(&superseded); err != nil {
 		return fmt.Errorf("check extraction run generation: %w", err)

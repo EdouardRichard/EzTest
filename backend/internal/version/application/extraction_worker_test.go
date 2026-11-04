@@ -124,8 +124,12 @@ type fakeRequirement struct {
 	Category    string
 	SourceQuote string
 	Confidence  float64
-	Constraints json.RawMessage
-	RunID       int64
+	// ConfidenceSet distinguishes the SQL NUMERIC value 0 from NULL: emitted
+	// requirements always carry a score, while requirement rows from other
+	// writers may have confidence IS NULL.
+	ConfidenceSet bool
+	Constraints   json.RawMessage
+	RunID         int64
 }
 
 type fakeExtractionRepo struct {
@@ -277,8 +281,10 @@ func (r *fakeExtractionRepo) upsertSegmentsLocked(runID int64, segments []versio
 	r.segments[runID] = stored
 }
 
-// reopenForWorkLocked moves a terminal run back to pending when a replay added
-// or reopened a segment, so a done run can never keep orphan pending segments.
+// reopenForWorkLocked moves a terminal run back to pending when a replay added a
+// pending segment, so a done run can never keep orphan pending segments. This
+// mirrors the SQL reopen predicate (agg.pending > 0): a running segment left by
+// an in-flight worker does not make a terminal run claimable again.
 func (r *fakeExtractionRepo) reopenForWorkLocked(run *versionapp.ExtractionRun) {
 	if run == nil || run.Status == versionapp.ExtractionRunPaused {
 		return
@@ -287,7 +293,7 @@ func (r *fakeExtractionRepo) reopenForWorkLocked(run *versionapp.ExtractionRun) 
 		return
 	}
 	for _, segment := range r.segments[run.ID] {
-		if segment.Status == versionapp.ExtractionSegmentPending || segment.Status == versionapp.ExtractionSegmentRunning {
+		if segment.Status == versionapp.ExtractionSegmentPending {
 			run.Status = versionapp.ExtractionRunPending
 			run.Error = ""
 			return
@@ -482,9 +488,10 @@ func (r *fakeExtractionRepo) findSegment(runID int64, seq int) (*versionapp.Extr
 	return nil, versionapp.ErrExtractionSegmentNotFound
 }
 
-// ensureRunWritableLocked fences segment transitions: only pending/running/
-// paused runs that were not superseded by a newer run of the same attachment
-// may transition a segment (a paused run still finishes its claimed batch).
+// ensureRunWritableLocked fences segment transitions and emits: only pending/
+// running/paused runs that were not superseded by a newer *active* run of the
+// same attachment may write (a paused run still finishes its claimed batch). A
+// newer terminal run does not fence an older run revived by a replay.
 func (r *fakeExtractionRepo) ensureRunWritableLocked(runID int64) error {
 	run, ok := r.runs[runID]
 	if !ok {
@@ -496,7 +503,11 @@ func (r *fakeExtractionRepo) ensureRunWritableLocked(runID int64) error {
 		return versionapp.ErrExtractionRunState
 	}
 	for _, other := range r.runs {
-		if other.VersionID == run.VersionID && other.AttachmentID == run.AttachmentID && other.ID > run.ID {
+		if other.VersionID != run.VersionID || other.AttachmentID != run.AttachmentID || other.ID <= run.ID {
+			continue
+		}
+		switch other.Status {
+		case versionapp.ExtractionRunPending, versionapp.ExtractionRunRunning, versionapp.ExtractionRunPaused:
 			return versionapp.ErrExtractionRunState
 		}
 	}
@@ -621,7 +632,7 @@ func (r *fakeExtractionRepo) recomputeRunLocked(runID int64, now time.Time) {
 		run.Error = ""
 		return
 	}
-	if pending == 0 && running == 0 && retryable == 0 {
+	if run.TotalSegments > 0 && pending == 0 && running == 0 && retryable == 0 {
 		run.Status = versionapp.ExtractionRunFailed
 		return
 	}
@@ -729,8 +740,9 @@ func (r *fakeExtractionRepo) SaveReconciliation(_ context.Context, runID int64, 
 	return nil
 }
 
-// CountLowConfidence derives the low-confidence count from the requirement rows
-// attributed to the run (fake equivalent of requirement.confidence < threshold).
+// CountLowConfidence derives the low-confidence count from the scored
+// requirement rows attributed to the run (fake equivalent of
+// requirement.confidence IS NOT NULL AND confidence < threshold).
 func (r *fakeExtractionRepo) CountLowConfidence(_ context.Context, runID int64, threshold float64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -739,7 +751,7 @@ func (r *fakeExtractionRepo) CountLowConfidence(_ context.Context, runID int64, 
 	}
 	count := 0
 	for _, requirement := range r.requirements {
-		if requirement.RunID == runID && requirement.Confidence < threshold {
+		if requirement.RunID == runID && requirement.ConfidenceSet && requirement.Confidence < threshold {
 			count++
 		}
 	}
@@ -779,23 +791,25 @@ func (r *fakeExtractionRepo) UpsertExtractedRequirements(_ context.Context, sour
 			existing.Category = requirement.Category
 			existing.SourceQuote = requirement.SourceQuote
 			existing.Confidence = requirement.Confidence
+			existing.ConfidenceSet = true
 			existing.Constraints = requirement.ConstraintsJSON
 			existing.RunID = source.RunID
 			counts.Updated++
 			continue
 		}
 		stored := &fakeRequirement{
-			VersionID:   source.VersionID,
-			ExternalID:  requirement.ExternalID,
-			Title:       requirement.Title,
-			Description: requirement.Description,
-			Criteria:    append([]string(nil), requirement.AcceptanceCriteria...),
-			Priority:    requirement.Priority,
-			Category:    requirement.Category,
-			SourceQuote: requirement.SourceQuote,
-			Confidence:  requirement.Confidence,
-			Constraints: requirement.ConstraintsJSON,
-			RunID:       source.RunID,
+			VersionID:     source.VersionID,
+			ExternalID:    requirement.ExternalID,
+			Title:         requirement.Title,
+			Description:   requirement.Description,
+			Criteria:      append([]string(nil), requirement.AcceptanceCriteria...),
+			Priority:      requirement.Priority,
+			Category:      requirement.Category,
+			SourceQuote:   requirement.SourceQuote,
+			Confidence:    requirement.Confidence,
+			ConfidenceSet: true,
+			Constraints:   requirement.ConstraintsJSON,
+			RunID:         source.RunID,
 		}
 		r.requirements[key] = stored
 		r.requirementOrder = append(r.requirementOrder, key)
@@ -849,6 +863,31 @@ func (r *fakeExtractionRepo) debugSetSegmentError(runID int64, seq int, message 
 		return
 	}
 	segment.Error = message
+}
+
+// debugSetRunStatus forces a run status to model a state the service cannot
+// produce directly (a done run that still has a running segment), so the fake
+// reopen predicate can be compared with the SQL one.
+func (r *fakeExtractionRepo) debugSetRunStatus(runID int64, status versionapp.ExtractionRunStatus) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if run, ok := r.runs[runID]; ok {
+		run.Status = status
+	}
+}
+
+// debugAddUnscoredRequirement stores a requirement with NULL confidence (the
+// fake models SQL NULL with ConfidenceSet=false).
+func (r *fakeExtractionRepo) debugAddUnscoredRequirement(versionID, runID int64, externalID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := fakeRequirementKey(versionID, externalID)
+	r.requirements[key] = &fakeRequirement{
+		VersionID:  versionID,
+		ExternalID: externalID,
+		RunID:      runID,
+	}
+	r.requirementOrder = append(r.requirementOrder, key)
 }
 
 // ---------- fixtures ----------
@@ -1691,6 +1730,98 @@ func TestStartArchivesSupersededRunsOnEveryPath(t *testing.T) {
 	}
 }
 
+// TestReplaySupersededShaAfterNewRunSettles pins the recoverable replay path: A
+// is archived when B starts; once B is terminal there is no active run, so
+// replaying A must revive A in a writable state (not a pending zombie fenced by
+// B's higher id) and ProcessRun must settle it without retry loops.
+func TestReplaySupersededShaAfterNewRunSettles(t *testing.T) {
+	env := newExtractionEnv(t)
+	ctx := context.Background()
+	a := env.start(t, 7, 3, testSHA("sha-a"), "", "A段一", "A段二")
+	b := env.start(t, 7, 3, testSHA("sha-b"), "", "B段一")
+
+	archived, err := env.repo.GetRun(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetRun archived A: %v", err)
+	}
+	if archived.Status != versionapp.ExtractionRunFailed {
+		t.Fatalf("A after B Start status=%s, want failed", archived.Status)
+	}
+	settledB, err := env.svc.ProcessRun(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("ProcessRun B: %v", err)
+	}
+	if settledB.Status != versionapp.ExtractionRunDone {
+		t.Fatalf("B did not settle: %+v", settledB)
+	}
+
+	replayed, err := env.svc.Start(ctx, versionapp.ExtractionStartInput{
+		VersionID: 7, AttachmentID: 3, InputSHA256: testSHA("sha-a"),
+		Segments: testExtractionSegments("A段一", "A段二"),
+	})
+	if err != nil {
+		t.Fatalf("replay A after B settled: %v", err)
+	}
+	if replayed.ID != a.ID {
+		t.Fatalf("replay A returned run %d, want %d", replayed.ID, a.ID)
+	}
+	if replayed.Status != versionapp.ExtractionRunPending || replayed.TotalSegments != 2 {
+		t.Fatalf("replayed A=%+v, want pending with 2 segments", replayed)
+	}
+
+	// A real processor emits while the run is active; the emit and the segment
+	// marks must both be accepted because there is no newer *active* run.
+	env.processor.process = func(segment versionapp.ExtractionSegment) (versionapp.ExtractionSegmentResult, error) {
+		_, emitErr := env.svc.EmitExtractedRequirements(ctx, versionapp.ExtractionSource{
+			VersionID: 7, AttachmentID: 3, RunID: segment.RunID, SegmentSeq: segment.Seq,
+		}, []versionapp.ExtractionRequirement{{
+			ExternalID: fmt.Sprintf("FR-%03d", segment.Seq), Title: "A需求", Confidence: 0.9,
+		}})
+		if emitErr != nil {
+			return versionapp.ExtractionSegmentResult{}, emitErr
+		}
+		return versionapp.ExtractionSegmentResult{ExtractedCount: 1}, nil
+	}
+	processed, err := env.svc.ProcessRun(ctx, replayed.ID)
+	if err != nil {
+		t.Fatalf("ProcessRun replayed A: %v", err)
+	}
+	if processed.Status != versionapp.ExtractionRunDone || processed.DoneSegments != 2 {
+		t.Fatalf("replayed A after ProcessRun=%+v, want done with 2 segments", processed)
+	}
+	if got := env.repo.RequirementCount(7); got != 2 {
+		t.Fatalf("replayed A emitted %d requirements, want 2", got)
+	}
+	segments, err := env.repo.ListSegments(ctx, replayed.ID)
+	if err != nil {
+		t.Fatalf("ListSegments replayed A: %v", err)
+	}
+	for _, segment := range segments {
+		if segment.Status == versionapp.ExtractionSegmentRunning ||
+			segment.Status == versionapp.ExtractionSegmentPending {
+			t.Fatalf("replayed A left segment %d %s", segment.Seq, segment.Status)
+		}
+	}
+
+	// The settled replay is idempotent: a second pass processes nothing and
+	// ProcessNext does not pick the run up forever.
+	calls := env.processor.CallCount()
+	again, err := env.svc.ProcessRun(ctx, replayed.ID)
+	if err != nil {
+		t.Fatalf("second ProcessRun replayed A: %v", err)
+	}
+	if again.Status != versionapp.ExtractionRunDone || env.processor.CallCount() != calls {
+		t.Fatalf("second ProcessRun=%+v calls=%d, want done without new calls", again, env.processor.CallCount())
+	}
+	next, err := env.svc.ProcessNext(ctx, 10)
+	if err != nil {
+		t.Fatalf("ProcessNext after replay settled: %v", err)
+	}
+	if next != 0 {
+		t.Fatalf("ProcessNext processed %d settled runs, want 0", next)
+	}
+}
+
 func mustListRuns(t *testing.T, repo *fakeExtractionRepo, versionID int64) []versionapp.ExtractionRun {
 	t.Helper()
 	runs, err := repo.ListRuns(context.Background(), versionID)
@@ -1772,6 +1903,37 @@ func TestReplayRefreshesSegmentsAndExpected(t *testing.T) {
 	}
 	if calls := env.processor.CallCount(); calls != before+1 {
 		t.Fatalf("replay processed %d segments, want only the changed one", calls-before)
+	}
+}
+
+// TestReplayDoesNotReviveDoneRunForRunningSegment pins fake/SQL parity for the
+// terminal-run reopen predicate: a replay reopens a done/failed run only when it
+// has a *pending* segment (SQL: agg.pending > 0). A running segment left by an
+// in-flight worker must not be converted into a claimable run by a replay.
+func TestReplayDoesNotReviveDoneRunForRunningSegment(t *testing.T) {
+	env := newExtractionEnv(t)
+	ctx := context.Background()
+	input := versionapp.ExtractionStartInput{
+		VersionID: 7, AttachmentID: 3, InputSHA256: testSHA("running-segment-parity"),
+		Segments: testExtractionSegments("唯一段落"),
+	}
+	run, err := env.svc.Start(ctx, input)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if claimed, err := env.repo.ClaimSegments(ctx, run.ID, 1, testTime); err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimSegments=%d err=%v", len(claimed), err)
+	}
+	// Model the SQL state directly: a done run whose only segment is running
+	// (the service itself never produces this state).
+	env.repo.debugSetRunStatus(run.ID, versionapp.ExtractionRunDone)
+
+	replayed, err := env.svc.Start(ctx, input)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if replayed.Status != versionapp.ExtractionRunDone {
+		t.Fatalf("replay revived a done run with only a running segment: %+v", replayed)
 	}
 }
 
@@ -1884,6 +2046,46 @@ func TestZeroSegmentRun(t *testing.T) {
 	}
 }
 
+// TestZeroSegmentReplayStaysDone pins the replay safety of an empty parse: a
+// zero-segment run is created done; replaying the same sha must keep it done
+// instead of falling through the "no retryable work" branch to failed.
+func TestZeroSegmentReplayStaysDone(t *testing.T) {
+	env := newExtractionEnv(t)
+	ctx := context.Background()
+	input := versionapp.ExtractionStartInput{
+		VersionID: 7, AttachmentID: 3, InputSHA256: testSHA("empty-replay"),
+		DocumentText: "# V1 当前需求\n\nFR-001 登录\nFR-002 退出\n",
+	}
+	first, err := env.svc.Start(ctx, input)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if first.Status != versionapp.ExtractionRunDone || first.TotalSegments != 0 {
+		t.Fatalf("zero-segment run=%+v, want done with 0 segments", first)
+	}
+
+	replayed, err := env.svc.Start(ctx, input)
+	if err != nil {
+		t.Fatalf("zero-segment replay: %v", err)
+	}
+	if replayed.ID != first.ID {
+		t.Fatalf("zero-segment replay created run %d, want %d", replayed.ID, first.ID)
+	}
+	if replayed.Status != versionapp.ExtractionRunDone || replayed.TotalSegments != 0 {
+		t.Fatalf("zero-segment replay=%+v, want the same run still done", replayed)
+	}
+	if replayed.ExpectedCount == nil || *replayed.ExpectedCount != 2 {
+		t.Fatalf("zero-segment replay expected_count=%v, want 2", replayed.ExpectedCount)
+	}
+	stored, err := env.svc.GetRun(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if stored.Status != versionapp.ExtractionRunDone || stored.Error != "" {
+		t.Fatalf("stored zero-segment run=%+v, want done without error", stored)
+	}
+}
+
 // TestLatestRunValidatesFields pins the API error field names (the attachment
 // parameter used to be reported for an invalid version id).
 func TestLatestRunValidatesFields(t *testing.T) {
@@ -1947,6 +2149,40 @@ func TestReconcileComputesLowConfidenceAndPersistsReport(t *testing.T) {
 	}
 	if len(stored.Report.PlannedIDs) != 2 || len(stored.Report.MissingIDs) != 0 {
 		t.Fatalf("persisted report ids=%+v", stored.Report)
+	}
+}
+
+// TestCountLowConfidenceIgnoresUnscored pins fake/SQL parity for NULL
+// confidence: SQL counts `confidence IS NOT NULL AND confidence < threshold`,
+// so an unscored requirement must not be reported as low confidence.
+func TestCountLowConfidenceIgnoresUnscored(t *testing.T) {
+	env := newExtractionEnv(t)
+	ctx := context.Background()
+	run := env.start(t, 7, 3, testSHA("confidence-null"), "", "需求段落")
+	source := versionapp.ExtractionSource{VersionID: 7, AttachmentID: 3, RunID: run.ID, SegmentSeq: 1}
+	if _, err := env.svc.EmitExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-001", Title: "低置信", Confidence: 0.4},
+		{ExternalID: "FR-002", Title: "高置信", Confidence: 0.9},
+	}); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	env.repo.debugAddUnscoredRequirement(7, run.ID, "FR-003")
+
+	low, err := env.repo.CountLowConfidence(ctx, run.ID, versionapp.DefaultLowConfidenceThreshold)
+	if err != nil {
+		t.Fatalf("CountLowConfidence: %v", err)
+	}
+	if low != 1 {
+		t.Fatalf("low confidence count=%d, want 1 (the unscored requirement is NULL, not low)", low)
+	}
+
+	document := "# V1 当前需求\n\nFR-001 低\nFR-002 高\nFR-003 未评分\n"
+	report, err := env.svc.Reconcile(ctx, run.ID, document, 0)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if report.LowConfidence != 1 {
+		t.Fatalf("reconciliation low_confidence=%d, want 1", report.LowConfidence)
 	}
 }
 

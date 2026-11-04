@@ -563,3 +563,174 @@ func TestExtractionConcurrentDifferentSHAIntegration(t *testing.T) {
 		t.Fatalf("replay created extra runs: total=%d", total)
 	}
 }
+
+// TestExtractionZeroSegmentReplayIntegration pins the empty-parse replay: a run
+// created done with zero segments must stay done when the same sha is replayed,
+// not fall through the "no retryable work" branch to failed.
+func TestExtractionZeroSegmentReplayIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	expected := 2
+	run := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("8", 64), Status: versionapp.ExtractionRunDone,
+		ExpectedCount: &expected, CreatedAt: now, UpdatedAt: now,
+	}
+	created, err := repo.CreateRun(ctx, run, nil)
+	if err != nil {
+		t.Fatalf("CreateRun zero segments: %v", err)
+	}
+	if created.Status != versionapp.ExtractionRunDone || created.TotalSegments != 0 {
+		t.Fatalf("zero-segment run=%+v, want done with 0 segments", created)
+	}
+
+	replay := run
+	replay.UpdatedAt = now.Add(time.Minute)
+	replayed, err := repo.CreateRun(ctx, replay, nil)
+	if err != nil {
+		t.Fatalf("CreateRun zero-segment replay: %v", err)
+	}
+	if replayed.ID != created.ID {
+		t.Fatalf("zero-segment replay created run %d, want %d", replayed.ID, created.ID)
+	}
+	if replayed.Status != versionapp.ExtractionRunDone || replayed.TotalSegments != 0 {
+		t.Fatalf("zero-segment replay=%+v, want the same run still done", replayed)
+	}
+	if replayed.ExpectedCount == nil || *replayed.ExpectedCount != 2 {
+		t.Fatalf("zero-segment replay expected_count=%v, want 2", replayed.ExpectedCount)
+	}
+	segments, err := repo.ListSegments(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("ListSegments zero run: %v", err)
+	}
+	if len(segments) != 0 {
+		t.Fatalf("zero-segment run has %d segments", len(segments))
+	}
+}
+
+// TestExtractionSupersededReplayAfterNewRunSettlesIntegration pins the replay
+// path once the changed-sha run is terminal: with no active newer run, replaying
+// the archived sha must revive it in a writable state. The revived run must be
+// able to claim, emit and mark its segments instead of being permanently fenced
+// by the newer (already settled) run's id.
+func TestExtractionSupersededReplayAfterNewRunSettlesIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	oldRun := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("6", 64), Status: versionapp.ExtractionRunPending,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	archived, err := repo.CreateRun(ctx, oldRun, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun A: %v", err)
+	}
+	newRun := oldRun
+	newRun.InputSHA256 = strings.Repeat("7", 64)
+	newRun.UpdatedAt = now.Add(time.Second)
+	settled, err := repo.CreateRun(ctx, newRun, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun B: %v", err)
+	}
+	storedOld, err := repo.GetRun(ctx, archived.ID)
+	if err != nil {
+		t.Fatalf("GetRun archived A: %v", err)
+	}
+	if storedOld.Status != versionapp.ExtractionRunFailed {
+		t.Fatalf("A after B Start status=%s, want failed", storedOld.Status)
+	}
+
+	// B terminates normally: claim both segments and mark them done.
+	if claimed, err := repo.ClaimSegments(ctx, settled.ID, 10, now); err != nil || len(claimed) != 2 {
+		t.Fatalf("claim B=%d err=%v", len(claimed), err)
+	}
+	if err := repo.MarkSegmentDone(ctx, settled.ID, 1, 1, now); err != nil {
+		t.Fatalf("MarkSegmentDone B1: %v", err)
+	}
+	if err := repo.MarkSegmentDone(ctx, settled.ID, 2, 1, now); err != nil {
+		t.Fatalf("MarkSegmentDone B2: %v", err)
+	}
+	storedB, err := repo.GetRun(ctx, settled.ID)
+	if err != nil {
+		t.Fatalf("GetRun B: %v", err)
+	}
+	if storedB.Status != versionapp.ExtractionRunDone {
+		t.Fatalf("B did not settle: %+v", storedB)
+	}
+
+	// Replay A now that B is terminal but still newer by id.
+	replay := oldRun
+	replay.UpdatedAt = now.Add(2 * time.Minute)
+	replayed, err := repo.CreateRun(ctx, replay, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun replay A: %v", err)
+	}
+	if replayed.ID != archived.ID {
+		t.Fatalf("replay A returned run %d, want %d", replayed.ID, archived.ID)
+	}
+	if replayed.Status != versionapp.ExtractionRunPending || replayed.TotalSegments != 2 {
+		t.Fatalf("replayed A=%+v, want pending with 2 segments", replayed)
+	}
+
+	// The revived run must be writable even though B has a higher id: claim,
+	// emit and mark must all succeed (B is terminal, not active).
+	claimed, err := repo.ClaimSegments(ctx, archived.ID, 10, replay.UpdatedAt)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim replayed A=%d err=%v", len(claimed), err)
+	}
+	source := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: archived.ID, SegmentSeq: 1,
+	}
+	if err := repo.MarkSegmentDone(ctx, archived.ID, 1, 1, replay.UpdatedAt); err != nil {
+		t.Fatalf("MarkSegmentDone replayed A1: %v", err)
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-009", Title: "重放需求", Confidence: 0.8},
+	}, replay.UpdatedAt); err != nil {
+		t.Fatalf("emit from revived run: %v", err)
+	}
+	if err := repo.MarkSegmentDone(ctx, archived.ID, 2, 1, replay.UpdatedAt); err != nil {
+		t.Fatalf("MarkSegmentDone replayed A2: %v", err)
+	}
+	final, err := repo.GetRun(ctx, archived.ID)
+	if err != nil {
+		t.Fatalf("GetRun replayed A: %v", err)
+	}
+	if final.Status != versionapp.ExtractionRunDone || final.DoneSegments != 2 || final.TotalSegments != 2 {
+		t.Fatalf("replayed A after marking=%+v, want done with 2 segments", final)
+	}
+	segments, err := repo.ListSegments(ctx, archived.ID)
+	if err != nil {
+		t.Fatalf("ListSegments replayed A: %v", err)
+	}
+	for _, segment := range segments {
+		if segment.Status != versionapp.ExtractionSegmentDone {
+			t.Fatalf("replayed A left segment %d %s", segment.Seq, segment.Status)
+		}
+	}
+	var active int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_extraction_run
+		WHERE version_id = $1 AND attachment_id = $2
+		  AND status IN ('pending', 'running', 'paused')
+	`, versionID, attachmentID).Scan(&active); err != nil {
+		t.Fatalf("count active runs: %v", err)
+	}
+	if active != 0 {
+		t.Fatalf("active runs=%d after the replay settled, want 0 (no zombie)", active)
+	}
+}
