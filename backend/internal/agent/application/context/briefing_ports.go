@@ -71,6 +71,10 @@ type PlanItemSnapshot struct {
 	Title     string
 	Status    string
 	DependsOn []string
+	// Revision is the optimistic-lock token the Host must present on the next
+	// plan.update write (R-A8-2). It starts at 1 and is bumped by every real
+	// write, so the Host can write without guessing and absorbing a conflict.
+	Revision int64
 }
 
 // FactSnapshot is one current finding of the version.

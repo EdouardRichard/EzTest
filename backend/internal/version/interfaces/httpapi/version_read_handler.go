@@ -335,6 +335,7 @@ type planItemReadDTO struct {
 	Title      string   `json:"title"`
 	Status     string   `json:"status"`
 	Order      int      `json:"order"`
+	Revision   int64    `json:"revision"`
 	DependsOn  []string `json:"depends_on"`
 	WorkItemID *string  `json:"work_item_id"`
 	Decision   string   `json:"decision"`
@@ -396,6 +397,7 @@ func toPlanItemReadDTO(view versionapp.PlanItemReadView) planItemReadDTO {
 		Title:      view.Title,
 		Status:     view.Status,
 		Order:      view.Order,
+		Revision:   view.Revision,
 		DependsOn:  decimalIDList(view.DependsOn),
 		WorkItemID: formatOptionalDecimal(view.WorkItemID),
 		Decision:   view.Decision,

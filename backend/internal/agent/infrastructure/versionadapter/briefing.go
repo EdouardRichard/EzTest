@@ -269,7 +269,7 @@ func loadBriefingCases(ctx context.Context, tx pgx.Tx, versionID int64, source *
 
 func loadBriefingPlan(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
 	rows, err := tx.Query(ctx, `
-		SELECT id, title, status, depends_on
+		SELECT id, title, status, depends_on, revision
 		FROM version_plan_item
 		WHERE version_id = $1
 		  AND status NOT IN ('done', 'completed', 'cancelled', 'skipped', 'failed', 'closed')
@@ -283,7 +283,7 @@ func loadBriefingPlan(ctx context.Context, tx pgx.Tx, versionID int64, source *a
 	for rows.Next() {
 		var item agentcontext.PlanItemSnapshot
 		var dependsOn []int64
-		if err := rows.Scan(&item.ID, &item.Title, &item.Status, &dependsOn); err != nil {
+		if err := rows.Scan(&item.ID, &item.Title, &item.Status, &dependsOn, &item.Revision); err != nil {
 			return fmt.Errorf("scan briefing plan item: %w", err)
 		}
 		item.DependsOn = make([]string, 0, len(dependsOn))

@@ -322,7 +322,7 @@ func (r *QueryReader) ListPlanItems(ctx context.Context, query versionapp.PlanIt
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, version_id, phase, title, status, depends_on, work_item_id,
-		       decision, sort_order, created_at, updated_at
+		       decision, sort_order, created_at, updated_at, revision
 		FROM version_plan_item
 		WHERE version_id = $1
 		  AND ($2 = '' OR status = $2)
@@ -340,7 +340,7 @@ func (r *QueryReader) ListPlanItems(ctx context.Context, query versionapp.PlanIt
 		var item versionapp.PlanItemReadRow
 		if err := rows.Scan(&item.ID, &item.VersionID, &item.Phase, &item.Title,
 			&item.Status, &item.DependsOn, &item.WorkItemID, &item.Decision,
-			&item.Order, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&item.Order, &item.CreatedAt, &item.UpdatedAt, &item.Revision); err != nil {
 			return nil, false, fmt.Errorf("scan plan item: %w", err)
 		}
 		if item.DependsOn == nil {

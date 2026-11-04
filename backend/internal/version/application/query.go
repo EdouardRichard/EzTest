@@ -392,6 +392,9 @@ type PlanItemReadRow struct {
 	Order      int
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+	// Revision is the optimistic-lock token of the plan write path (R-A8-2);
+	// reads expose it so a writer need not guess it.
+	Revision int64
 }
 
 // PlanItemReadView is the frozen PlanItemView projection of one plan item.
@@ -407,6 +410,9 @@ type PlanItemReadView struct {
 	Order      int
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+	// Revision is the optimistic-lock token the client must present on the
+	// next plan.item update.
+	Revision int64
 }
 
 // VersionReadReader is the version context's read-only source for facts, plan
@@ -536,6 +542,7 @@ func (s *VersionReadService) PlanItems(ctx context.Context, versionID int64, fil
 			Order:      row.Order,
 			CreatedAt:  row.CreatedAt,
 			UpdatedAt:  row.UpdatedAt,
+			Revision:   row.Revision,
 		})
 	}
 	return views, hasMore, nil

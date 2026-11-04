@@ -14,6 +14,7 @@ import (
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -76,6 +77,12 @@ func TestBriefingReaderSQL(t *testing.T) {
 	}
 	if !reflect.DeepEqual(source.Plan[1].DependsOn, []string{"准备"}) {
 		t.Fatalf("plan dependency = %#v", source.Plan[1].DependsOn)
+	}
+	// The optimistic-lock revision is read with the item: a value written
+	// explicitly must surface, and a fixture row written without one keeps the
+	// migration default 1. Without the read the Host would have to guess.
+	if source.Plan[0].Revision != 1 || source.Plan[1].Revision != 4 {
+		t.Fatalf("plan revisions = %d/%d, want 1/4", source.Plan[0].Revision, source.Plan[1].Revision)
 	}
 
 	// Facts: current rows only, ranked by confidence then recency (the same
@@ -148,6 +155,56 @@ func TestBriefingReaderSQL(t *testing.T) {
 	// A missing version is reported with the version not-found error.
 	if _, err := reader.Load(ctx, 999999); !errors.Is(err, versiondomain.ErrNotFound) {
 		t.Fatalf("missing version error = %v, want %v", err, versiondomain.ErrNotFound)
+	}
+}
+
+// TestLoadBriefingPlanSQLRevision pins the R-A8-2 optimistic-lock token at the
+// production plan read: loadBriefingPlan must SELECT the stored revision and
+// scan it into the snapshot, because the Host consumes it to guard plan.update
+// instead of guessing it and absorbing a conflict. The function is called
+// directly (not through Load) because the sibling knowledge read still binds
+// the 0.2.1 version_sut columns; that known H1 breakage is Task 29, not this
+// read. A row written without a revision keeps the migration default 1.
+func TestLoadBriefingPlanSQLRevision(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v\nSQL: %s", err, sql)
+		}
+	}
+	exec(`INSERT INTO version (id, title, status, created_by, stage)
+		VALUES (9006, '计划版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order, revision)
+		VALUES (9511, 9006, 'execute', '准备', 'pending', 0, 4)`)
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order)
+		VALUES (9512, 9006, 'execute', '执行', 'pending', 1)`)
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order, revision)
+		VALUES (9513, 9006, 'execute', '已完成', 'done', 2, 7)`)
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatalf("begin read transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var source agentcontext.Source
+	if err := loadBriefingPlan(ctx, tx, 9006, &source); err != nil {
+		t.Fatalf("loadBriefingPlan: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit read transaction: %v", err)
+	}
+	t.Logf("briefing plan snapshot: %+v", source.Plan)
+
+	if len(source.Plan) != 2 {
+		t.Fatalf("plan = %#v, want the two open items", source.Plan)
+	}
+	if source.Plan[0].ID != 9511 || source.Plan[0].Revision != 4 {
+		t.Fatalf("plan[0] = %#v, want id 9511 revision 4", source.Plan[0])
+	}
+	if source.Plan[1].ID != 9512 || source.Plan[1].Revision != 1 {
+		t.Fatalf("plan[1] = %#v, want id 9512 revision 1 (migration default)", source.Plan[1])
 	}
 }
 
@@ -491,9 +548,11 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 	}
 
 	// The dependent plan item sorts before its dependency; the reader must
-	// restore dependency-first order. A done item must be omitted.
-	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)
-		VALUES (9501, 9001, 'execute', '执行', 'pending', '{9502}'::bigint[], 0)`)
+	// restore dependency-first order. A done item must be omitted. 9501 carries
+	// an explicit revision while 9502 relies on the migration default (1), so
+	// the read mapping is pinned for both shapes.
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order, revision)
+		VALUES (9501, 9001, 'execute', '执行', 'pending', '{9502}'::bigint[], 0, 4)`)
 	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)
 		VALUES (9502, 9001, 'execute', '准备', 'pending', '{}'::bigint[], 1)`)
 	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)

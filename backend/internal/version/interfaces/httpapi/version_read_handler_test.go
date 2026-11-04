@@ -137,6 +137,7 @@ func samplePlanItemReadViews() []versionapp.PlanItemReadView {
 			DependsOn:  []int64{199},
 			WorkItemID: &workItemID,
 			Decision:   "keep",
+			Revision:   4,
 			CreatedAt:  testTime,
 			UpdatedAt:  testTime,
 		},
@@ -148,6 +149,7 @@ func samplePlanItemReadViews() []versionapp.PlanItemReadView {
 			Status:    "done",
 			Order:     2,
 			DependsOn: []int64{},
+			Revision:  1,
 			Decision:  "",
 			CreatedAt: testTime,
 			UpdatedAt: testTime,
@@ -386,7 +388,15 @@ func TestVersionPlanItemsRead(t *testing.T) {
 		if len(dependencies) != 1 || dependencies[0] != "199" {
 			t.Fatalf("depends_on = %#v", dependencies)
 		}
+		// The plan.update optimistic-lock token must be on the read DTO; the
+		// Host uses this value instead of guessing and absorbing a conflict.
+		if first["revision"] != float64(4) {
+			t.Fatalf("first revision = %#v, want 4", first["revision"])
+		}
 		second := items[1].(map[string]any)
+		if second["revision"] != float64(1) {
+			t.Fatalf("second revision = %#v, want 1", second["revision"])
+		}
 		if second["work_item_id"] != nil {
 			t.Fatalf("second work_item_id = %v, want null", second["work_item_id"])
 		}
