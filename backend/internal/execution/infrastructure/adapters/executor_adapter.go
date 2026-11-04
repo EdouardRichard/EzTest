@@ -16,6 +16,18 @@ func errNotConfigured(name string) error {
 	return fmt.Errorf("%s is not configured", name)
 }
 
+// Executor self-check sentinels (spec §11.1 item 6). The startup probe has to
+// distinguish a rejected bearer token from an unreachable executor so the UI
+// can show "authentication failed" instead of a generic "offline".
+var (
+	// ErrExecutorUnauthorized reports that the executor rejected the configured
+	// Bearer token (HTTP 401/403).
+	ErrExecutorUnauthorized = errors.New("executor rejected the bearer token")
+	// ErrExecutorOffline reports that the executor could not be reached or
+	// answered with an unexpected status.
+	ErrExecutorOffline = errors.New("executor is offline")
+)
+
 // BrowserAdapter adapts the executor protocol client to the execution browser
 // port. One client call maps one action; context lifecycle is owned by the
 // CaseRunner.

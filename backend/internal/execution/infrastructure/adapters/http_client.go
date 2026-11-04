@@ -3,8 +3,10 @@ package adapters
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,6 +17,12 @@ import (
 const (
 	httpToolTimeout      = 15 * time.Second
 	httpToolMaxBodyBytes = 1 << 20
+
+	// executorSelfCheckTimeout bounds the startup authentication probe. The
+	// executor answers GET /v1/contexts immediately, so startup must not wait
+	// for the regular action timeout when the executor is unreachable.
+	executorSelfCheckTimeout = 5 * time.Second
+	executorContextsPath     = "/v1/contexts"
 )
 
 // HTTPClientAdapter performs the target-SUT HTTP requests of http.request. It
@@ -68,4 +76,76 @@ func (a *HTTPClientAdapter) Do(ctx context.Context, request executionapp.HTTPReq
 		Body:       data,
 		DurationMS: time.Since(started).Milliseconds(),
 	}, nil
+}
+
+// ExecutorSelfCheck performs the startup authentication probe of the Playwright
+// executor. The executor's /healthz is unauthenticated and therefore cannot
+// prove that the configured bearer token is accepted: only a protected route
+// does. SelfCheck calls GET /v1/contexts with the token and reports the three
+// outcomes the acceptance criteria ask for (nil / unauthorized / offline).
+type ExecutorSelfCheck struct {
+	endpoint string
+	token    string
+	client   *http.Client
+}
+
+// NewExecutorSelfCheck wires the executor authentication self-check.
+func NewExecutorSelfCheck(endpoint, token string) *ExecutorSelfCheck {
+	return &ExecutorSelfCheck{
+		endpoint: strings.TrimRight(endpoint, "/"),
+		token:    token,
+		client: &http.Client{
+			Timeout: executorSelfCheckTimeout,
+			// Never replay the bearer token to a redirect target.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+}
+
+// SelfCheck calls GET /v1/contexts with the bearer token. A 200 is a success
+// (the body is irrelevant to the probe); 401/403 wrap ErrExecutorUnauthorized;
+// transport failures, timeouts and unexpected statuses wrap ErrExecutorOffline.
+func (c *ExecutorSelfCheck) SelfCheck(ctx context.Context) error {
+	if c == nil || c.client == nil {
+		return fmt.Errorf("%w: executor self-check is not configured", ErrExecutorOffline)
+	}
+	if c.endpoint == "" {
+		return fmt.Errorf("%w: executor endpoint is not configured", ErrExecutorOffline)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+executorContextsPath, nil)
+	if err != nil {
+		return fmt.Errorf("%w: executor endpoint is invalid", ErrExecutorOffline)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.token)
+	response, err := c.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrExecutorOffline, executorSelfCheckTransportError(err))
+	}
+	defer func() { _ = response.Body.Close() }()
+	// Drain a bounded prefix so the connection can be reused; the probe body
+	// carries no useful data.
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	switch response.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("%w: executor returned HTTP %d", ErrExecutorUnauthorized, response.StatusCode)
+	default:
+		// A reachable but unusable executor (5xx, redirect, ...) belongs to the
+		// offline bucket: it is not an authentication failure.
+		return fmt.Errorf("%w: executor returned HTTP %d", ErrExecutorOffline, response.StatusCode)
+	}
+}
+
+// executorSelfCheckTransportError keeps the useful part of a transport failure
+// without the request URL (which may embed credentials) or the Authorization
+// header.
+func executorSelfCheckTransportError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return "transport error"
 }
