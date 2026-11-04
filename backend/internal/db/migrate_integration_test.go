@@ -10,6 +10,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
@@ -20,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 53 {
+		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -40,7 +41,9 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"version", "version_sut", "version_sut_resource",
 		"work_item", "work_item_attempt", "team_room_post", "team_room_digest",
 		"agent_profile", "agent_run", "agent_message", "context_packet",
+		"agent_activity",
 		"requirement", "requirement_version", "requirement_confirmation", "requirement_relation",
+		"requirement_extraction_run", "requirement_extraction_segment",
 		"conversation", "conversation_message", "conversation_summary", "requirement_attachment",
 		"case_scenario", "case_entity", "case_version", "case_step", "case_assertion",
 		"case_source", "case_confirmation", "design_round", "design_scope", "export_artifact",
@@ -176,8 +179,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 53 {
+		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -317,8 +320,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 53 {
+		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1064,8 +1067,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 53 {
+		t.Fatalf("applied %d migrations, want 53: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1122,5 +1125,151 @@ func TestP8HardeningSchema(t *testing.T) {
 	}
 	if requests != 0 || work != 0 {
 		t.Fatalf("api_instance inflight defaults = %d/%d, want 0/0", requests, work)
+	}
+}
+
+// TestV022ABSchema pins the A/B core schema of v0.22: model parameter
+// provenance, the single-writer conversation lease, message kinds, summary
+// watermarks, run telemetry, the per-run activity trace and requirement
+// extraction run/segment bookkeeping.
+// See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-1..DB-9,
+// docs/version-V0.22/B-clarification-messaging.md §5.1 and
+// docs/version-V0.22/A-model-token-budget.md §4.2, §5.2, §6.4, §7.3.
+func TestV022ABSchema(t *testing.T) {
+	pool := integrationDB(t)
+
+	for _, table := range []string{
+		"agent_activity",
+		"requirement_extraction_run",
+		"requirement_extraction_segment",
+	} {
+		requireTable(t, pool, table)
+	}
+
+	for _, c := range []struct{ table, column string }{
+		// DB-1: catalog/manual provenance per model parameter.
+		{"llm_model", "window_source"},
+		{"llm_model", "output_source"},
+		// DB-2: single active turn and its lease.
+		{"conversation", "active_turn_id"},
+		{"conversation", "active_agent"},
+		{"conversation", "lease_until"},
+		// DB-3: message author and kind.
+		{"conversation_message", "author_agent"},
+		{"conversation_message", "kind"},
+		// DB-4: compaction watermark and metadata.
+		{"conversation_summary", "covered_message_id"},
+		{"conversation_summary", "compaction_id"},
+		{"conversation_summary", "summary_meta"},
+		// DB-5: run telemetry (model/config_id exist since 0.2.1).
+		{"agent_run", "cached_tokens"},
+		{"agent_run", "duration_ms"},
+		// DB-6: run activity trace.
+		{"agent_activity", "id"},
+		{"agent_activity", "run_id"},
+		{"agent_activity", "type"},
+		{"agent_activity", "title"},
+		{"agent_activity", "started_at"},
+		{"agent_activity", "ended_at"},
+		{"agent_activity", "payload"},
+		{"agent_activity", "error"},
+		// DB-7: requirement extraction runs.
+		{"requirement_extraction_run", "version_id"},
+		{"requirement_extraction_run", "attachment_id"},
+		{"requirement_extraction_run", "input_sha256"},
+		{"requirement_extraction_run", "status"},
+		{"requirement_extraction_run", "total_segments"},
+		{"requirement_extraction_run", "done_segments"},
+		{"requirement_extraction_run", "failed_segments"},
+		{"requirement_extraction_run", "expected_count"},
+		{"requirement_extraction_run", "extracted_count"},
+		{"requirement_extraction_run", "error"},
+		// DB-8: extraction segments / cursor.
+		{"requirement_extraction_segment", "run_id"},
+		{"requirement_extraction_segment", "seq"},
+		{"requirement_extraction_segment", "heading_path"},
+		{"requirement_extraction_segment", "char_start"},
+		{"requirement_extraction_segment", "char_end"},
+		{"requirement_extraction_segment", "text_sha256"},
+		{"requirement_extraction_segment", "status"},
+		{"requirement_extraction_segment", "attempts"},
+		{"requirement_extraction_segment", "extracted_count"},
+		{"requirement_extraction_segment", "renewed_at"},
+		// DB-9: requirement source and reconciliation.
+		{"requirement", "extraction_run_id"},
+		{"requirement", "source_quote"},
+		{"requirement", "external_id"},
+		{"requirement", "confidence"},
+	} {
+		requireColumn(t, pool, c.table, c.column)
+	}
+
+	requireIndex(t, pool, "uk_conversation_active_turn")
+
+	// The one-active-turn invariant is a partial UNIQUE index on
+	// conversation(id): rows with a NULL active_turn_id stay outside it.
+	var definition string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = 'uk_conversation_active_turn'
+	`).Scan(&definition); err != nil {
+		t.Fatalf("read uk_conversation_active_turn: %v", err)
+	}
+	if !strings.Contains(definition, "UNIQUE INDEX") {
+		t.Errorf("uk_conversation_active_turn is not unique: %s", definition)
+	}
+	if !strings.Contains(definition, "WHERE (active_turn_id IS NOT NULL)") {
+		t.Errorf("uk_conversation_active_turn is not partial: %s", definition)
+	}
+}
+
+// integrationDB returns a fresh, fully migrated test schema.
+func integrationDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := testutil.NewEmptyDB(t)
+	if _, err := db.Migrate(context.Background(), pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	return pool
+}
+
+func requireTable(t *testing.T, pool *pgxpool.Pool, table string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+		t.Errorf("check table %s: %v", table, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing table %s", table)
+	}
+}
+
+func requireColumn(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+		)
+	`, table, column).Scan(&exists); err != nil {
+		t.Errorf("check column %s.%s: %v", table, column, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing column %s.%s", table, column)
+	}
+}
+
+func requireIndex(t *testing.T, pool *pgxpool.Pool, index string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `SELECT to_regclass($1) IS NOT NULL`, index).Scan(&exists); err != nil {
+		t.Errorf("check index %s: %v", index, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing index %s", index)
 	}
 }

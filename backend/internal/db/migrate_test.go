@@ -10,8 +10,8 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orderedMigrations: %v", err)
 	}
-	if len(migrations) != 51 {
-		t.Fatalf("len = %d, want 51", len(migrations))
+	if len(migrations) != 53 {
+		t.Fatalf("len = %d, want 53", len(migrations))
 	}
 	for _, item := range migrations {
 		if !strings.HasSuffix(item.Name, ".sql") {
@@ -55,6 +55,8 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 		"llm_0003_protocol021.sql",
 		"knowledge_0003_trgm.sql",
 		"version_0009_requirement_source_key.sql",
+		"llm_0004_v022_model_param_sources.sql",
+		"agent_0008_v022_writer_runtime.sql",
 	}
 	tail := migrations[len(migrations)-len(wantTail):]
 	for i, want := range wantTail {
