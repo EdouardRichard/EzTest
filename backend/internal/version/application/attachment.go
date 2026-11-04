@@ -267,7 +267,9 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 // persisted before the ingest task is enqueued (R-E4-1) and the ingest task
 // resolves the attachment by attachment_id, never through the message join, so
 // the worker can run (and attachment.list/read_text can see the row) while the
-// message binding is still deferred.
+// message binding is still deferred. conversationID is stored on the row from
+// the start so the unbound draft is only visible/readable to its own
+// conversation instead of every conversation of the version.
 func (s *AttachmentService) createAttachment(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, name string, content ContentObject, actorID int64) (version.Attachment, error) {
 	now := s.clock.Now()
 	attachmentID := s.ids.Next()
@@ -304,10 +306,16 @@ func (s *AttachmentService) createAttachment(ctx context.Context, versionID, con
 		value := messageID
 		linkedMessageID = &value
 	}
+	var owningConversationID *int64
+	if conversationID > 0 {
+		value := conversationID
+		owningConversationID = &value
+	}
 	attachment := version.Attachment{
 		ID:                    attachmentID,
 		VersionID:             versionID,
 		ConversationMessageID: linkedMessageID,
+		ConversationID:        owningConversationID,
 		ContentRefID:          ref.ID,
 		Name:                  name,
 		MIME:                  part.MIME,
@@ -530,10 +538,10 @@ func (s *AttachmentService) attachmentContent(ctx context.Context, part version.
 
 // attachmentBySHA finds an attachment already linked to this conversation via
 // one of its messages whose original content matches sha256. ListByConversation
-// also returns pre-registered rows whose message binding is still deferred
-// (R-E4-1); those are not re-send candidates and are skipped here so they can
-// never be mistaken for an already-linked attachment. They are reused by
-// unlinkedAttachmentBySHA instead.
+// also returns this conversation's pre-registered rows whose message binding is
+// still deferred (R-E4-1); those are not re-send candidates and are skipped
+// here so they can never be mistaken for an already-linked attachment. They are
+// reused by unlinkedAttachmentBySHA instead.
 func (s *AttachmentService) attachmentBySHA(ctx context.Context, versionID, conversationID int64, sha256 string) (*version.Attachment, error) {
 	attachments, err := s.repo.ListByConversation(ctx, versionID, conversationID)
 	if err != nil {
@@ -926,9 +934,11 @@ func (s *AttachmentService) GetAttachmentInfo(ctx context.Context, versionID, at
 
 // ListAttachments returns the attachments visible to one conversation, in
 // attachment-ID order. That is every row linked to one of the conversation's
-// messages plus the message attachments pre-registered before their message
-// insert (conversation_message_id == 0): the attachment.ingest race window must
-// not make an uploaded attachment invisible to attachment.list (R-E4-1/R-E4-2).
+// messages plus the message attachments pre-registered for this conversation
+// before their message insert (conversation_message_id == 0, conversation_id
+// set): the attachment.ingest race window must not make an uploaded attachment
+// invisible to attachment.list (R-E4-1/R-E4-2). A draft pre-registered by
+// another conversation of the same version is not visible here.
 func (s *AttachmentService) ListAttachments(ctx context.Context, versionID, conversationID int64) ([]AttachmentMeta, error) {
 	if versionID <= 0 || conversationID <= 0 {
 		return nil, platform.Invalid("conversation_id", "must be positive decimal IDs")
@@ -1054,9 +1064,11 @@ func (s *AttachmentService) AttachmentImageRef(ctx context.Context, versionID, c
 }
 
 // conversationAttachment resolves one attachment by its ID within the
-// conversation. The repository also returns pre-registered rows whose message
-// binding is still deferred, so attachment.read_text works by attachment_id
-// during the ingest race window instead of returning not_found (R-E4-1).
+// conversation. The repository also returns rows pre-registered for this
+// conversation while their message binding is still deferred, so
+// attachment.read_text works by attachment_id during the ingest race window
+// instead of returning not_found (R-E4-1) — but a draft owned by another
+// conversation of the version stays not_found.
 func (s *AttachmentService) conversationAttachment(ctx context.Context, versionID, conversationID, attachmentID int64) (version.Attachment, error) {
 	if versionID <= 0 || conversationID <= 0 || attachmentID <= 0 {
 		return version.Attachment{}, platform.Invalid("attachment_id", "must be positive decimal IDs")

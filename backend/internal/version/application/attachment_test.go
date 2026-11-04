@@ -77,7 +77,9 @@ func (f *fakeAttachmentRepo) ListByRequirement(_ context.Context, versionID, req
 }
 
 // ListByConversation mirrors the SQL: linked rows of the conversation plus
-// pre-registered message attachments whose message binding is still deferred.
+// pre-registered message attachments owned by this conversation whose message
+// binding is still deferred. A draft with no conversation_id (legacy row) is
+// never returned; a draft of another conversation is not returned either.
 // Requirement attachments stay requirement-scoped and never appear here.
 func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, conversationID int64) ([]version.Attachment, error) {
 	items := make([]version.Attachment, 0)
@@ -87,6 +89,9 @@ func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, co
 		}
 		if attachment.ConversationMessageID == nil {
 			if attachment.RequirementID != nil || attachment.RequirementVersionID != nil {
+				continue
+			}
+			if attachment.ConversationID == nil || *attachment.ConversationID != conversationID {
 				continue
 			}
 			items = append(items, attachment)
@@ -123,6 +128,13 @@ func (f *fakeAttachmentRepo) LinkMessage(_ context.Context, attachmentID, messag
 		return nil
 	}
 	attachment.ConversationMessageID = &messageID
+	// Mirror the SQL backfill: a legacy unscoped draft gets the conversation of
+	// the message it is bound to.
+	if attachment.ConversationID == nil && f.conversationMessages != nil {
+		if conversationID, ok := f.conversationMessages[messageID]; ok {
+			attachment.ConversationID = &conversationID
+		}
+	}
 	attachment.UpdatedAt = updatedAt
 	f.attachments[attachmentID] = attachment
 	return nil
@@ -1091,6 +1103,60 @@ func TestUploadThenImmediateList(t *testing.T) {
 	}
 	t.Logf("attachment.list -> %+v", listed)
 	t.Logf("attachment.read_text -> %+v", read)
+}
+
+// TestPreRegisteredAttachmentNotVisibleToOtherConversation covers the Task 20
+// follow-up scope leak: a document pre-registered by a blocked post in
+// conversation A is unbound until the retry, but that must not make it visible
+// to another conversation of the same version. Conversation A keeps the R-E4-2
+// behavior (its own draft is listed); conversation B must neither list nor read
+// it. This is the regression test for the version-scoped unbound-row branch.
+func TestPreRegisteredAttachmentNotVisibleToOtherConversation(t *testing.T) {
+	env := newAttachmentEnv(t)
+	const conversationA, conversationB = int64(6001), int64(6002)
+	data := []byte("# 需求\n登录")
+	sha := strings.Repeat("9", 64)
+	env.store.put(sha, data, "text/markdown")
+	parts := []version.MessagePart{attachmentPart(sha, "spec.md", "text/markdown", int64(len(data)))}
+
+	_, _, err := env.svc.PrepareUserMessageParts(requestContext(), env.versionID, conversationA, parts, 42)
+	if err == nil {
+		t.Fatal("first post of a still-parsing attachment was accepted")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Code != versionapp.AttachmentPendingCode {
+		t.Fatalf("first post code = %q, want %q", apiErr.Code, versionapp.AttachmentPendingCode)
+	}
+	rawID, _ := apiErr.Details["attachment_id"].(string)
+	attachmentID, parseErr := strconv.ParseInt(rawID, 10, 64)
+	if parseErr != nil || attachmentID <= 0 {
+		t.Fatalf("attachment_id detail = %q", rawID)
+	}
+
+	// Conversation A still sees its own pre-registered draft (R-E4-2).
+	own, err := env.svc.ListAttachments(requestContext(), env.versionID, conversationA)
+	if err != nil {
+		t.Fatalf("ListAttachments(A): %v", err)
+	}
+	if len(own) != 1 || own[0].ID != attachmentID || own[0].ConversationMessageID != 0 {
+		t.Fatalf("conversation A list = %#v", own)
+	}
+
+	// Conversation B must never see conversation A's unbound draft.
+	other, err := env.svc.ListAttachments(requestContext(), env.versionID, conversationB)
+	if err != nil {
+		t.Fatalf("ListAttachments(B): %v", err)
+	}
+	if len(other) != 0 {
+		t.Fatalf("conversation B sees conversation A's pre-registered draft: %#v", other)
+	}
+
+	// read_text by attachment id in conversation B must not resolve it either.
+	if _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, conversationB, attachmentID, 0, 10); err == nil {
+		t.Fatal("conversation B read conversation A's pre-registered draft")
+	} else if readErr := apiError(t, err); readErr.Status != http.StatusNotFound {
+		t.Fatalf("read_text error = %#v, want 404 not_found", readErr)
+	}
 }
 
 // TestIngestByAttachmentIDWhileBindingDeferred covers R-E4-1's second clause:

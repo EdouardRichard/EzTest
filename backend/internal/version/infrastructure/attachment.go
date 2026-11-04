@@ -25,9 +25,10 @@ func NewAttachmentRepository(pool *pgxpool.Pool) *AttachmentRepository {
 func (r *AttachmentRepository) Create(ctx context.Context, attachment version.Attachment) error {
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO requirement_attachment (`+attachmentColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 	`, attachment.ID, attachment.VersionID, attachment.RequirementID, attachment.RequirementVersionID,
-		attachment.ConversationMessageID, attachment.ContentRefID, attachment.Name, attachment.MIME,
+		attachment.ConversationMessageID, attachment.ConversationID, attachment.ContentRefID,
+		attachment.Name, attachment.MIME,
 		attachment.Size, attachment.ExtractionStatus, attachment.ExtractedContentRefID,
 		encodeExtractionError(attachment.ExtractionErrorCode, attachment.ExtractionErrorText),
 		attachment.CreatedBy, attachment.CreatedAt, attachment.UpdatedAt)
@@ -87,17 +88,25 @@ func (r *AttachmentRepository) ListByRequirement(ctx context.Context, versionID,
 
 // ListByConversation returns the attachments visible to one conversation,
 // ordered by attachment ID: rows whose message belongs to the conversation,
-// plus pre-registered message attachments whose conversation_message_id is
-// still NULL. The second set is the attachment.ingest race window (R-E4-1): the
-// message post preflight stores the row and starts extraction before the
-// message insert, so attachment.list/read_text must already see it instead of
-// returning 0/not_found while the parse runs. Requirement attachments keep
-// their requirement scope (requirement_id/requirement_version_id) and are never
-// pulled into a conversation through this path.
+// plus pre-registered message attachments owned by this conversation whose
+// conversation_message_id is still NULL. The second set is the attachment.ingest
+// race window (R-E4-1): the message post preflight stores the row and starts
+// extraction before the message insert, so attachment.list/read_text must
+// already see it instead of returning 0/not_found while the parse runs.
+//
+// The draft branch is scoped by conversation_id, never by version alone: a
+// draft pre-registered by another conversation of the same version must not be
+// listed or readable here. Unbound rows with conversation_id IS NULL (legacy
+// rows) cannot be attributed to any conversation and are deliberately excluded;
+// the message post retry still reuses them through ListUnlinkedByVersion and
+// scopes them on LinkMessage. Requirement attachments keep their requirement
+// scope (requirement_id/requirement_version_id) and are never pulled into a
+// conversation through this path.
 func (r *AttachmentRepository) ListByConversation(ctx context.Context, versionID, conversationID int64) ([]version.Attachment, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT a.id, a.version_id, a.requirement_id, a.requirement_version_id,
-			a.conversation_message_id, a.content_ref_id, a.name, a.mime, a.size,
+			a.conversation_message_id, a.conversation_id, a.content_ref_id,
+			a.name, a.mime, a.size,
 			a.extraction_status, a.extracted_content_ref_id, a.extraction_error,
 			a.created_by, a.created_at, a.updated_at
 		FROM requirement_attachment a
@@ -106,6 +115,7 @@ func (r *AttachmentRepository) ListByConversation(ctx context.Context, versionID
 		  AND (
 		        m.conversation_id = $2
 		        OR (a.conversation_message_id IS NULL
+		            AND a.conversation_id = $2
 		            AND a.requirement_id IS NULL
 		            AND a.requirement_version_id IS NULL)
 		      )
@@ -130,8 +140,10 @@ func (r *AttachmentRepository) ListByConversation(ctx context.Context, versionID
 }
 
 // ListUnlinkedByVersion returns the attachment rows pre-registered before their
-// message insert. They have no conversation linkage yet and are reused by the
-// message post retry so extraction is not duplicated.
+// message insert. They are reused by the message post retry so extraction is not
+// duplicated. The lookup stays version-scoped on purpose (content-level reuse);
+// only the conversation read path (ListByConversation) is conversation-scoped,
+// so a reused draft is re-owned by the retry's conversation on LinkMessage.
 func (r *AttachmentRepository) ListUnlinkedByVersion(ctx context.Context, versionID int64) ([]version.Attachment, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+attachmentColumns+` FROM requirement_attachment
@@ -170,9 +182,14 @@ func (r *AttachmentRepository) ConversationExists(ctx context.Context, versionID
 
 // ListPendingForIngest returns the oldest pending attachments together with
 // their conversation/message linkage (zero when a message is not stored yet).
+// An unbound pre-registered row carries its owning conversation in
+// conversation_id, so the reconciler keeps the conversation scope even before
+// the message binding exists.
 func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit int) ([]version.PendingAttachment, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT a.id, a.version_id, COALESCE(m.conversation_id, 0), COALESCE(a.conversation_message_id, 0)
+		SELECT a.id, a.version_id,
+			COALESCE(m.conversation_id, a.conversation_id, 0),
+			COALESCE(a.conversation_message_id, 0)
 		FROM requirement_attachment a
 		LEFT JOIN conversation_message m ON m.id = a.conversation_message_id
 		WHERE a.extraction_status = 'pending'
@@ -413,13 +430,20 @@ func (r *AttachmentRepository) MarkFailed(ctx context.Context, attachmentID int6
 	return r.ensureAttachmentExists(ctx, attachmentID, "mark attachment failed")
 }
 
-// LinkMessage binds a pre-registered row to the inserted message. Linking the
-// same message twice is idempotent; a row already owned by another message is
-// left untouched.
+// LinkMessage binds a pre-registered row to the inserted message and derives
+// the conversation ownership from that message (the message is the source of
+// truth): a legacy unscoped draft is backfilled, and a reused draft can never
+// keep a stale conversation. Linking the same message twice is idempotent; a
+// row already owned by another message is left untouched.
 func (r *AttachmentRepository) LinkMessage(ctx context.Context, attachmentID, messageID int64, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE requirement_attachment
-		SET conversation_message_id = $2, updated_at = $3
+		SET conversation_message_id = $2,
+		    conversation_id = COALESCE(
+		        (SELECT conversation_id FROM conversation_message WHERE id = $2),
+		        conversation_id
+		    ),
+		    updated_at = $3
 		WHERE id = $1 AND (conversation_message_id IS NULL OR conversation_message_id = $2)
 	`, attachmentID, messageID, updatedAt)
 	if err != nil {
@@ -445,14 +469,16 @@ func (r *AttachmentRepository) ensureAttachmentExists(ctx context.Context, attac
 // attachmentColumns is shared by the requirement aggregate (attachment list)
 // and the attachment repository.
 const attachmentColumns = `id, version_id, requirement_id, requirement_version_id,
-	conversation_message_id, content_ref_id, name, mime, size, extraction_status,
-	extracted_content_ref_id, extraction_error, created_by, created_at, updated_at`
+	conversation_message_id, conversation_id, content_ref_id, name, mime, size,
+	extraction_status, extracted_content_ref_id, extraction_error, created_by,
+	created_at, updated_at`
 
 func scanAttachment(row rowScanner) (version.Attachment, error) {
 	var attachment version.Attachment
 	var extractionError *string
 	if err := row.Scan(&attachment.ID, &attachment.VersionID, &attachment.RequirementID,
-		&attachment.RequirementVersionID, &attachment.ConversationMessageID, &attachment.ContentRefID,
+		&attachment.RequirementVersionID, &attachment.ConversationMessageID,
+		&attachment.ConversationID, &attachment.ContentRefID,
 		&attachment.Name, &attachment.MIME, &attachment.Size, &attachment.ExtractionStatus,
 		&attachment.ExtractedContentRefID, &extractionError, &attachment.CreatedBy,
 		&attachment.CreatedAt, &attachment.UpdatedAt); err != nil {

@@ -5,10 +5,14 @@ package versionpg_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	platformclock "github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
 )
@@ -189,10 +193,10 @@ func TestAttachmentRepositoryListsByRequirement(t *testing.T) {
 }
 
 // TestAttachmentRepositoryConversationIncludesPreRegistered covers R-E4-1: a
-// message attachment pre-registered before its message insert (nil
-// conversation_message_id) must already be visible to ListByConversation while
-// ingest runs, without leaking requirement attachments or attachments of other
-// conversations into the result.
+// message attachment pre-registered for a conversation before its message
+// insert (nil conversation_message_id, conversation_id set) must already be
+// visible to ListByConversation while ingest runs, without leaking requirement
+// attachments or attachments of other conversations into the result.
 func TestAttachmentRepositoryConversationIncludesPreRegistered(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
@@ -222,14 +226,17 @@ func TestAttachmentRepositoryConversationIncludesPreRegistered(t *testing.T) {
 
 	linked := sampleAttachment(ids, versionID)
 	linked.ConversationMessageID = &messageID
+	linked.ConversationID = &conversationID
 	preRegistered := sampleAttachment(ids, versionID)
 	preRegistered.ConversationMessageID = nil
+	preRegistered.ConversationID = &conversationID
 	requirementID := int64(3001)
 	requirementAttachment := sampleAttachment(ids, versionID)
 	requirementAttachment.ConversationMessageID = nil
 	requirementAttachment.RequirementID = &requirementID
 	otherConversation := sampleAttachment(ids, versionID)
 	otherConversation.ConversationMessageID = &otherMessageID
+	otherConversation.ConversationID = &otherConversationID
 	for _, attachment := range []version.Attachment{linked, preRegistered, requirementAttachment, otherConversation} {
 		if err := repo.Create(ctx, attachment); err != nil {
 			t.Fatalf("Create: %v", err)
@@ -250,5 +257,155 @@ func TestAttachmentRepositoryConversationIncludesPreRegistered(t *testing.T) {
 	byRequirement, err := repo.ListByRequirement(ctx, versionID, requirementID)
 	if err != nil || len(byRequirement) != 1 || byRequirement[0].ID != requirementAttachment.ID {
 		t.Fatalf("requirement attachments = %#v, %v", byRequirement, err)
+	}
+}
+
+// TestAttachmentRepositoryConversationScopesPreRegisteredDrafts covers the
+// Task 20 follow-up scope leak: two conversations of the same version each
+// pre-register a message attachment (unbound draft), and neither conversation
+// may see or read the other's draft. Both attachment.list and
+// attachment.read_text resolve visibility through ListByConversation, so this
+// pins the repository contract directly and then exercises the read_text path
+// through the real application service.
+func TestAttachmentRepositoryConversationScopesPreRegisteredDrafts(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewAttachmentRepository(pool)
+	ctx := context.Background()
+
+	versionID := ids.Next()
+	if _, err := pool.Exec(ctx, `INSERT INTO version (id, title, created_by) VALUES ($1, 'attachment scope', 42)`, versionID); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	conversationA := ids.Next()
+	conversationB := ids.Next()
+	for _, conversation := range []struct {
+		id    int64
+		title string
+	}{{conversationA, "Chat A"}, {conversationB, "Chat B"}} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO conversation (id, version_id, kind, title)
+			VALUES ($1, $2, 'clarification', $3)
+		`, conversation.id, versionID, conversation.title); err != nil {
+			t.Fatalf("insert conversation %d: %v", conversation.id, err)
+		}
+	}
+	messageA := ids.Next()
+	messageB := ids.Next()
+	for _, message := range []struct {
+		id             int64
+		conversationID int64
+	}{{messageA, conversationA}, {messageB, conversationB}} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO conversation_message (id, conversation_id, role)
+			VALUES ($1, $2, 'user')
+		`, message.id, message.conversationID); err != nil {
+			t.Fatalf("insert message %d: %v", message.id, err)
+		}
+	}
+
+	// One bound row in A (the normal list path) plus one unbound draft in each
+	// conversation (the 409 pre-registration window).
+	linkedA := sampleAttachment(ids, versionID)
+	linkedA.ConversationMessageID = &messageA
+	linkedA.ConversationID = &conversationA
+	draftA := sampleAttachment(ids, versionID)
+	draftA.ConversationMessageID = nil
+	draftA.ConversationID = &conversationA
+	draftB := sampleAttachment(ids, versionID)
+	draftB.ConversationMessageID = nil
+	draftB.ConversationID = &conversationB
+	for _, attachment := range []version.Attachment{linkedA, draftA, draftB} {
+		if err := repo.Create(ctx, attachment); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	// The owning conversation round-trips through Create/scan.
+	stored, err := repo.Get(ctx, draftB.ID)
+	if err != nil {
+		t.Fatalf("Get draft B: %v", err)
+	}
+	if stored.ConversationID == nil || *stored.ConversationID != conversationB {
+		t.Fatalf("draft B conversation = %#v, want %d", stored.ConversationID, conversationB)
+	}
+
+	// Conversation A sees its linked row and its own draft, never B's draft.
+	listA, err := repo.ListByConversation(ctx, versionID, conversationA)
+	if err != nil {
+		t.Fatalf("ListByConversation(A): %v", err)
+	}
+	if len(listA) != 2 || listA[0].ID != linkedA.ID || listA[1].ID != draftA.ID {
+		t.Fatalf("conversation A list = %#v, want the linked row and its own draft", listA)
+	}
+	for _, attachment := range listA {
+		if attachment.ID == draftB.ID {
+			t.Fatalf("conversation A sees conversation B's draft: %#v", attachment)
+		}
+	}
+
+	listB, err := repo.ListByConversation(ctx, versionID, conversationB)
+	if err != nil {
+		t.Fatalf("ListByConversation(B): %v", err)
+	}
+	if len(listB) != 1 || listB[0].ID != draftB.ID {
+		t.Fatalf("conversation B list = %#v, want only its own draft", listB)
+	}
+
+	// attachment.read_text path: B must not resolve A's draft (404), while A
+	// still reads its own pending draft as the retryable R-E4-1 result.
+	svc := versionapp.NewAttachmentService(repo, nil, nil, nil, nil, nil, ids, platformclock.System{})
+	if _, err := svc.ReadAttachmentText(ctx, versionID, conversationB, draftA.ID, 0, 10); err == nil {
+		t.Fatal("conversation B read conversation A's pre-registered draft")
+	} else {
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
+			t.Fatalf("read_text in B error = %v, want 404 not_found", err)
+		}
+	}
+	read, err := svc.ReadAttachmentText(ctx, versionID, conversationA, draftA.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("read_text in A: %v", err)
+	}
+	if read.AttachmentID != draftA.ID || read.Status != version.AttachmentPending || !read.Retryable {
+		t.Fatalf("conversation A read_text = %#v, want its own retryable pending draft", read)
+	}
+
+	// Binding derives the ownership from the inserted message: a legacy unscoped
+	// draft is backfilled with the message's conversation, while an already
+	// scoped draft keeps the conversation it was pre-registered for.
+	legacy := sampleAttachment(ids, versionID)
+	legacy.ConversationMessageID = nil
+	legacy.ConversationID = nil
+	if err := repo.Create(ctx, legacy); err != nil {
+		t.Fatalf("Create legacy draft: %v", err)
+	}
+	if err := repo.LinkMessage(ctx, legacy.ID, messageA, testTime); err != nil {
+		t.Fatalf("LinkMessage legacy draft: %v", err)
+	}
+	boundLegacy, err := repo.Get(ctx, legacy.ID)
+	if err != nil {
+		t.Fatalf("Get bound legacy draft: %v", err)
+	}
+	if boundLegacy.ConversationMessageID == nil || *boundLegacy.ConversationMessageID != messageA ||
+		boundLegacy.ConversationID == nil || *boundLegacy.ConversationID != conversationA {
+		t.Fatalf("bound legacy draft = %#v, want message %d in conversation %d", boundLegacy, messageA, conversationA)
+	}
+	if err := repo.LinkMessage(ctx, draftB.ID, messageB, testTime); err != nil {
+		t.Fatalf("LinkMessage draft B: %v", err)
+	}
+	boundB, err := repo.Get(ctx, draftB.ID)
+	if err != nil {
+		t.Fatalf("Get bound draft B: %v", err)
+	}
+	if boundB.ConversationID == nil || *boundB.ConversationID != conversationB {
+		t.Fatalf("bound draft B conversation = %#v, want %d", boundB.ConversationID, conversationB)
+	}
+	listAAfterBind, err := repo.ListByConversation(ctx, versionID, conversationA)
+	if err != nil {
+		t.Fatalf("ListByConversation(A) after bind: %v", err)
+	}
+	if len(listAAfterBind) != 3 || listAAfterBind[2].ID != legacy.ID {
+		t.Fatalf("conversation A list after bind = %#v, want the backfilled legacy row", listAAfterBind)
 	}
 }

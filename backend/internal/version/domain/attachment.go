@@ -146,6 +146,12 @@ type Attachment struct {
 	RequirementID         *int64
 	RequirementVersionID  *int64
 	ConversationMessageID *int64
+	// ConversationID is the conversation that owns a message attachment. It is
+	// set from pre-registration onwards (before the message exists, R-E4-1) so
+	// an unbound draft is only visible/readable to its own conversation and
+	// never leaks into another conversation of the same version. It is nil for
+	// requirement-scoped rows and for legacy/unattributable drafts.
+	ConversationID        *int64
 	ContentRefID          int64
 	Name                  string
 	MIME                  string
@@ -186,6 +192,11 @@ type AttachmentRepository interface {
 	Get(ctx context.Context, attachmentID int64) (Attachment, error)
 	GetInVersion(ctx context.Context, versionID, attachmentID int64) (Attachment, error)
 	ListByRequirement(ctx context.Context, versionID, requirementID int64) ([]Attachment, error)
+	// ListByConversation returns rows bound to one of the conversation's
+	// messages plus unbound drafts pre-registered for this conversation
+	// (conversation_id matches). Drafts with no conversation_id (legacy rows)
+	// are never returned through a conversation; they remain reusable by
+	// ListUnlinkedByVersion on retry and get scoped when they are bound.
 	ListByConversation(ctx context.Context, versionID, conversationID int64) ([]Attachment, error)
 	// ListUnlinkedByVersion returns attachment rows that were pre-registered
 	// before their message was inserted (nil conversation_message_id). The

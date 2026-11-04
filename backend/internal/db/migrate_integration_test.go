@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 60 {
-		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
+	if len(applied) != 61 {
+		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -183,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 60 {
-		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
+	if len(applied) != 61 {
+		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -324,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 60 {
-		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
+	if len(applied) != 61 {
+		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1071,8 +1071,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 60 {
-		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
+	if len(applied) != 61 {
+		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1211,6 +1211,11 @@ func TestV022ABSchema(t *testing.T) {
 		// DB-20 / R-A8-2: optimistic-lock revision of the plan write path
 		// (Lead-approved additive column, version_0012).
 		{"version_plan_item", "revision"},
+		// Task 20 follow-up (version_0014): pre-registered message attachments
+		// carry their owning conversation, so an unbound draft stays scoped to
+		// that conversation and never leaks into another conversation of the
+		// same version. NULL stays valid for requirement-scoped and legacy rows.
+		{"requirement_attachment", "conversation_id"},
 	} {
 		requireColumn(t, pool, c.table, c.column)
 	}
@@ -1249,6 +1254,9 @@ func TestV022ABSchema(t *testing.T) {
 	}
 
 	requireIndex(t, pool, "uk_conversation_active_turn")
+	// Task 20 follow-up: the unbound-draft lookup by conversation before the
+	// message binding exists.
+	requireIndex(t, pool, "idx_requirement_attachment_conversation")
 
 	// The one-active-turn invariant is a partial UNIQUE index on
 	// conversation(id): rows with a NULL active_turn_id stay outside it.
