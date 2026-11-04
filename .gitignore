@@ -56,3 +56,5 @@ Thumbs.db
 **/e2e-final/tools-*.log
 **/qa/release/final/tools-*
 docs/
+!docs/openapi/
+!docs/openapi/**
