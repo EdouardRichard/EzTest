@@ -7,7 +7,11 @@ package executionapp
 // wave-terminal -> reporting -> report-published -> completed chain.
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -249,4 +253,141 @@ func TestSchedulerWaveTerminalCallbackAdvancesStage(t *testing.T) {
 		stages[0] != version.StageReporting || stages[1] != version.StageCompleted {
 		t.Fatalf("applied stages = %v, want [reporting completed]", stages)
 	}
+}
+
+// flakyWaveStageNotifier simulates a transient production callback failure: the
+// next failures N calls return an error, later calls succeed.
+type flakyWaveStageNotifier struct {
+	mu       sync.Mutex
+	calls    int
+	failures int
+}
+
+func (n *flakyWaveStageNotifier) OnWaveTerminal(_ context.Context, _ int64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.calls++
+	if n.failures > 0 {
+		n.failures--
+		return errors.New("transient stage callback failure")
+	}
+	return nil
+}
+
+func (n *flakyWaveStageNotifier) callCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.calls
+}
+
+// recordingStageReconciler records the StageService.Reconcile retries.
+type recordingStageReconciler struct {
+	mu       sync.Mutex
+	versions []int64
+	err      error
+}
+
+func (r *recordingStageReconciler) Reconcile(_ context.Context, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.versions = append(r.versions, versionID)
+	return r.err
+}
+
+func (r *recordingStageReconciler) calls() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.versions...)
+}
+
+// TestSchedulerRetriesFailedWaveTerminalCallback covers review fix 2: when the
+// wave-terminal stage callback fails transiently after the wave row is already
+// terminal, a later scheduler tick must re-drive the stage through
+// StageService.Reconcile instead of leaving the version in executing until a
+// manual advance. A still-failing reconcile stays pending; a success clears it.
+func TestSchedulerRetriesFailedWaveTerminalCallback(t *testing.T) {
+	f := newTask6Fixture(t)
+	ctx := context.Background()
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	f.versions.bindings[100] = task6Binding(100, "running", 5001)
+	if _, err := f.intent.EnsureInitialIntents(ctx, 100); err != nil {
+		t.Fatalf("EnsureInitialIntents: %v", err)
+	}
+	if err := f.scheduler.ReconcileVersion(ctx, 100); err != nil {
+		t.Fatalf("dispatch ReconcileVersion: %v", err)
+	}
+	wave, _ := f.waves.GetActive(ctx, 100)
+	if wave == nil {
+		t.Fatal("wave not created")
+	}
+	runs, _ := f.runs.ListAllByWave(ctx, wave.ID)
+	run, _ := f.runs.Get(ctx, runs[0].ID)
+	run.Status = execution.CaseRunPassed
+	run.FailureClass = ""
+	if ok, err := f.runs.Update(ctx, run); err != nil || !ok {
+		t.Fatalf("finish run: %v %v", ok, err)
+	}
+
+	notifier := &flakyWaveStageNotifier{failures: 1}
+	reconciler := &recordingStageReconciler{}
+	f.scheduler.stageNotifier = notifier
+	f.scheduler.stageReconciler = reconciler
+	logs := captureSchedulerSlog(t)
+
+	// The wave finalizes but the first callback fails: the tick stays green and
+	// the version is tracked for a later retry.
+	if err := f.scheduler.ReconcileVersion(ctx, 100); err != nil {
+		t.Fatalf("terminal ReconcileVersion: %v", err)
+	}
+	finished, err := f.waves.Get(ctx, wave.ID)
+	if err != nil || finished.Status != execution.WaveDone {
+		t.Fatalf("wave = %+v err=%v, want done", finished, err)
+	}
+	if notifier.callCount() != 1 {
+		t.Fatalf("stage callback attempts = %d, want 1", notifier.callCount())
+	}
+	if logged := logs.String(); !strings.Contains(logged, "wave-terminal stage callback failed") {
+		t.Fatalf("failed wave-terminal callback was not logged: %q", logged)
+	}
+	if calls := reconciler.calls(); len(calls) != 0 {
+		t.Fatalf("reconciler ran before a later tick: %v", calls)
+	}
+
+	// A later tick retries through StageService.Reconcile. The reconcile itself
+	// can still fail (report not ready); the retry stays pending.
+	reconciler.err = errors.New("report is not ready yet")
+	if err := f.scheduler.Reconcile(ctx); err != nil {
+		t.Fatalf("retry tick with failing reconcile: %v", err)
+	}
+	if calls := reconciler.calls(); len(calls) != 1 || calls[0] != 100 {
+		t.Fatalf("reconcile retries = %v, want [100]", calls)
+	}
+
+	// The next tick retries again and the success clears the pending entry.
+	reconciler.err = nil
+	if err := f.scheduler.Reconcile(ctx); err != nil {
+		t.Fatalf("successful retry tick: %v", err)
+	}
+	if calls := reconciler.calls(); len(calls) != 2 || calls[1] != 100 {
+		t.Fatalf("reconcile retries = %v, want [100 100]", calls)
+	}
+
+	// A cleared retry is never re-driven again.
+	if err := f.scheduler.Reconcile(ctx); err != nil {
+		t.Fatalf("post-success tick: %v", err)
+	}
+	if calls := reconciler.calls(); len(calls) != 2 {
+		t.Fatalf("reconciler ran after the retry was cleared: %v", calls)
+	}
+}
+
+// captureSchedulerSlog redirects the process logger for one test and restores it
+// on cleanup; the scheduler callback paths use slog.Default().
+func captureSchedulerSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buffer, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return buffer
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"time"
@@ -100,6 +101,13 @@ type ReportService struct {
 // re-publish so a lost stage advance can heal). Implementations must be
 // idempotent; the report publish is already committed, so the callback is best
 // effort.
+//
+// Report-kind contract (note for Task 36): Publish notifies for every report
+// kind, wave and version alike. The StageService.ReportPublished gate adapter
+// must therefore mean "the *version* report is published", never "some report is
+// published"; a wave-report publish arriving while the version is reporting must
+// not be treated as the completion evidence. The gate re-check makes that
+// explicit, and the deferred wording decision is tracked in task-25-report.md.
 type ReportPublishedStageNotifier interface {
 	OnReportPublished(ctx context.Context, versionID int64) error
 }
@@ -490,12 +498,17 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 // notifyReportPublished invokes the optional v0.22 production report.published
 // callback (Task 25, R-B4-3). The publish is already committed, so the callback
 // is best effort: a failed stage advance is retried by the stage reconciler/API
-// and never rolls the report back.
+// and never rolls the report back. The failure is logged instead of silently
+// discarded (Task 25 fix round 1).
 func (s *ReportService) notifyReportPublished(ctx context.Context, report delivery.Report) {
 	if s.stageNotifier == nil || report.VersionID <= 0 {
 		return
 	}
-	_ = s.stageNotifier.OnReportPublished(ctx, report.VersionID)
+	if err := s.stageNotifier.OnReportPublished(ctx, report.VersionID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"delivery: report-published stage callback failed; the stage reconciler will retry",
+			"report_id", report.ID, "version_id", report.VersionID, "kind", string(report.Kind), "error", err)
+	}
 }
 
 // bookPDF books the P7 PDF work for one published revision (spec §4.2). It is

@@ -3,6 +3,7 @@ package versionapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -259,8 +260,26 @@ type StageReports interface {
 	EnsureVersionReport(ctx context.Context, versionID int64) error
 }
 
+// ErrVersionAlreadyClosed is the typed already-closed signal of the
+// StageVersionCloser contract (Task 25 fix round 1). Closing means "ensure the
+// version is closed": an implementation that finds the version already
+// completed must return this sentinel (wrapped with %w is fine) instead of a
+// generic state conflict, so a retried reporting -> completed edge whose version
+// close already committed still advances the stage instead of stranding it in
+// reporting forever.
+var ErrVersionAlreadyClosed = errors.New("version is already closed")
+
 // StageVersionCloser closes the version on reporting -> completed (R-B4-3
 // "version.closed 有真实路径"). The composition root adapts VersionCloseService.
+//
+// Contract: CloseVersion must be an "ensure closed" operation. A successful
+// close (or an already completed version reported as ErrVersionAlreadyClosed)
+// is success for the stage gate; a rejected close predicate is still a gate
+// failure. The production adapter therefore maps the version close service's
+// state conflict for a completed row to ErrVersionAlreadyClosed. On success the
+// version row is closed before the stage write, so a lost stage compare-and-swap
+// is healed by retrying the callback: the retry sees the already-closed version
+// and only has to write the completed stage.
 type StageVersionCloser interface {
 	CloseVersion(ctx context.Context, versionID int64, reason string) error
 }

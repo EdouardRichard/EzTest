@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,11 @@ type PauseService struct {
 	clock     Clock
 	events    EventPublisher
 	audit     AuditRecorder
+	// stageNotifier is the v0.22 wave-terminal stage callback (Task 25 fix
+	// round 1). B §7.1 counts a cancelled wave as terminal, so CancelWave must
+	// notify the stage machine just like the scheduler's done/failed paths. nil
+	// keeps the pre-v0.22 behavior.
+	stageNotifier WaveTerminalStageNotifier
 }
 
 // PauseServiceDeps wires the pause/resume service. contexts/executor/canceller
@@ -39,21 +45,26 @@ type PauseServiceDeps struct {
 	Clock     Clock
 	Events    EventPublisher
 	Audit     AuditRecorder
+	// StageNotifier is the v0.22 wave-terminal stage callback (Task 25 fix
+	// round 1). nil keeps the pre-v0.22 behavior; Task 36 wires
+	// *versionapp.StageService here.
+	StageNotifier WaveTerminalStageNotifier
 }
 
 // NewPauseService builds the pause/resume service.
 func NewPauseService(deps PauseServiceDeps) *PauseService {
 	return &PauseService{
-		intents:   deps.Intents,
-		waves:     deps.Waves,
-		caseRuns:  deps.CaseRuns,
-		humans:    deps.Humans,
-		contexts:  deps.Contexts,
-		canceller: deps.Canceller,
-		executor:  deps.Executor,
-		clock:     deps.Clock,
-		events:    deps.Events,
-		audit:     deps.Audit,
+		intents:       deps.Intents,
+		waves:         deps.Waves,
+		caseRuns:      deps.CaseRuns,
+		humans:        deps.Humans,
+		contexts:      deps.Contexts,
+		canceller:     deps.Canceller,
+		executor:      deps.Executor,
+		clock:         deps.Clock,
+		events:        deps.Events,
+		audit:         deps.Audit,
+		stageNotifier: deps.StageNotifier,
 	}
 }
 
@@ -298,6 +309,9 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		return execution.RunWave{}, err
 	}
 	if wave.Status == execution.WaveCancelled {
+		// A repeated cancel is idempotent but re-notifies: the stage callback is
+		// best effort, so this heals a stage advance lost after the first call.
+		s.notifyStageWaveCancelled(ctx, wave)
 		return wave, nil
 	}
 	now := s.now()
@@ -321,7 +335,26 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		map[string]any{"wave_id": platformid.Format(wave.ID), "status": string(execution.WaveCancelled), "counts": wave.Counts},
 		actorPtr(actorID))
 	s.record(ctx, "execution.wave_cancelled", "execution_wave", wave.ID, actorID, nil)
+	// B §7.1 counts a cancelled wave as terminal: notify the v0.22 stage machine
+	// after the cancel committed so executing -> reporting is not stranded on a
+	// manual stage advance (Task 25 fix round 1).
+	s.notifyStageWaveCancelled(ctx, wave)
 	return wave, nil
+}
+
+// notifyStageWaveCancelled invokes the optional v0.22 wave-terminal stage
+// callback for a cancelled wave. It is best effort: the cancellation is the
+// source of truth, so a callback failure is logged and never fails or rolls back
+// the cancel; the stage reconciler retries the advance.
+func (s *PauseService) notifyStageWaveCancelled(ctx context.Context, wave execution.RunWave) {
+	if s.stageNotifier == nil || wave.ID <= 0 {
+		return
+	}
+	if err := s.stageNotifier.OnWaveTerminal(ctx, wave.ID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: cancelled-wave stage callback failed; the stage reconciler will retry",
+			"version_id", wave.VersionID, "wave_id", wave.ID, "error", err)
+	}
 }
 
 // cancelWaveRunsAndIntents propagates cancellation from a wave to its

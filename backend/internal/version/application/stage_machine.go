@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -108,10 +109,21 @@ type StageView struct {
 	Blocker        string
 }
 
-// StageMachine is the only writer of version.stage (spec §5.3). It validates
+// StageMachine is the atomic writer of version.stage (spec §5.3): it validates
 // domain transitions, records the suspension source, publishes
 // version.stage_changed after the write commits and asks the injected enqueuer
 // for the stage-entry job. LLM output never reaches this service.
+//
+// R-B4-1 single-writer invariant (Task 25 fix round 1): the v0.22 StageService
+// is the only application surface allowed to drive version.stage. The exported
+// convenience writers below (StartClarification, ConvergeClarification,
+// ConvergeDesign, OnRequirementConfirmed, OnCasesConfirmed, OnWaveTerminal,
+// Reject, ResumeTo, RecordGateDenied) are pre-v0.22 entry points kept only until
+// Task 36/37 route their call sites through StageService; they are deprecated
+// for all new code. StageService itself only uses the atomic core methods
+// (Stage, load, Transition, Suspend, Resume, resumeRecorded), so there is still
+// exactly one persisted compare-and-swap path. The exact legacy call sites are
+// listed in .superpowers/sdd/.../task-25-report.md ("Fix round 1").
 type StageMachine struct {
 	repo   version.StageRepository
 	jobs   StageJobEnqueuer
@@ -170,6 +182,9 @@ func (m *StageMachine) Transition(ctx context.Context, versionID int64, to versi
 // created starts the discovery sub-loop and exits automatically). It is
 // idempotent: a version that already left created is left untouched, so every
 // duplicate version.created event is harmless.
+//
+// Deprecated: pre-v0.22 stage writer. Route this call site through
+// StageService.Advance/Request in Task 36/37 (R-B4-1 single writer).
 func (m *StageMachine) StartClarification(ctx context.Context, versionID int64) error {
 	current, err := m.load(ctx, versionID)
 	if err != nil {
@@ -186,6 +201,9 @@ func (m *StageMachine) StartClarification(ctx context.Context, versionID int64) 
 // requirement gate depends on; like StartClarification it only acts on its
 // source stage, so a repeated confirmation request is a no-op and can never
 // move a version that is already at or past the requirement gate.
+//
+// Deprecated: pre-v0.22 stage writer. Route this call site through
+// StageService.Advance/Request in Task 36/37 (R-B4-1 single writer).
 func (m *StageMachine) ConvergeClarification(ctx context.Context, versionID int64) error {
 	current, err := m.load(ctx, versionID)
 	if err != nil {
@@ -203,6 +221,9 @@ func (m *StageMachine) ConvergeClarification(ctx context.Context, versionID int6
 // on its source stage, so a repeated completion is a no-op and can never move a
 // version that already reached the case hard gate or beyond. case_review has no
 // stage-entry job, so the transition enqueues nothing.
+//
+// Deprecated: pre-v0.22 stage writer. Route the design reconciler through
+// StageService.Advance/Request in Task 36/37 (R-B4-1 single writer).
 func (m *StageMachine) ConvergeDesign(ctx context.Context, versionID int64) error {
 	current, err := m.load(ctx, versionID)
 	if err != nil {
@@ -268,6 +289,9 @@ func (m *StageMachine) resumeRecorded(ctx context.Context, versionID int64, reas
 // ResumeTo resumes a suspended version to target. target must equal the stage
 // recorded in version.suspended_from; any other target is rejected so a resume
 // can never jump ahead past a hard gate.
+//
+// Deprecated: pre-v0.22 stage writer. The v0.22 surface resumes only the
+// recorded stage through StageService.Unblock/Resume (R-B4-1 single writer).
 func (m *StageMachine) ResumeTo(ctx context.Context, versionID int64, target version.Stage) error {
 	current, err := m.load(ctx, versionID)
 	if err != nil {
@@ -291,6 +315,10 @@ func (m *StageMachine) ResumeTo(ctx context.Context, versionID int64, target ver
 // typed 409 no_requirements_to_confirm. The version must be exactly at
 // requirement_review: the graph also has a legitimate case_review -> designing
 // reject edge, so the source stage must be pinned explicitly.
+//
+// Deprecated: pre-v0.22 stage writer. The v0.22 StageService confirms
+// requirements through the gate surface; route this call site through it in
+// Task 36/37 (R-B4-1 single writer).
 func (m *StageMachine) OnRequirementConfirmed(ctx context.Context, versionID int64, requirementIDs []int64) (StageView, error) {
 	ids, err := normalizeStageIDs("requirement_ids", requirementIDs)
 	if err != nil {
@@ -326,6 +354,10 @@ func (m *StageMachine) OnRequirementConfirmed(ctx context.Context, versionID int
 // non-empty caseIDs list confirms only those cases (D23); an empty list means
 // every confirmed-eligible case, and a version with no eligible draft case is a
 // typed 409 no_cases_to_confirm. The version must be exactly at case_review.
+//
+// Deprecated: pre-v0.22 stage writer. The v0.22 StageService confirms cases
+// through the gate surface; route this call site through it in Task 36/37
+// (R-B4-1 single writer).
 func (m *StageMachine) OnCasesConfirmed(ctx context.Context, versionID int64, caseIDs []int64) (StageView, error) {
 	ids, err := normalizeStageIDs("case_ids", caseIDs)
 	if err != nil {
@@ -358,6 +390,11 @@ func (m *StageMachine) OnCasesConfirmed(ctx context.Context, versionID int64, ca
 
 // OnWaveTerminal enters reporting after a terminal execution wave and
 // dispatches report.version.
+//
+// Deprecated: pre-v0.22 stage writer. The v0.22 production callback is
+// StageService.OnWaveTerminal(waveID), which resolves the wave, checks every
+// wave is terminal and runs the report gate (R-B4-3). Route this call site
+// through it in Task 36/37 (R-B4-1 single writer).
 func (m *StageMachine) OnWaveTerminal(ctx context.Context, versionID int64) (StageView, error) {
 	next, err := m.transition(ctx, versionID, version.StageReporting, "wave_terminal", &StageJob{
 		VersionID: versionID,
@@ -372,6 +409,10 @@ func (m *StageMachine) OnWaveTerminal(ctx context.Context, versionID int64) (Sta
 // Reject returns a hard gate one stage back: requirement_review -> clarifying
 // and case_review -> designing. target is the optional client-selected back
 // stage; it must equal the gate's previous stage.
+//
+// Deprecated: pre-v0.22 stage writer. The v0.22 surface does not reopen a hard
+// gate through Request; the gate reject entry point is Task 36/37's audited
+// route (R-B4-1 single writer).
 func (m *StageMachine) Reject(ctx context.Context, versionID int64, reason string, target *version.Stage) (StageView, error) {
 	reason = strings.TrimSpace(reason)
 	if err := validateStageText("reason", reason, stageRejectReasonMax); err != nil {
@@ -406,6 +447,9 @@ func (m *StageMachine) Reject(ctx context.Context, versionID int64, reason strin
 
 // RecordGateDenied records a forbidden hard-gate attempt (assistant/service
 // token). It never touches the stage row.
+//
+// Deprecated: pre-v0.22 stage surface. The v0.22 stage request routes record
+// gate denials through StageService (Task 36/37, R-B4-1).
 func (m *StageMachine) RecordGateDenied(ctx context.Context, versionID int64, gate string) {
 	metadata := map[string]any{"gate": gate}
 	if actor, ok := platform.ActorFrom(ctx); ok {
@@ -725,7 +769,12 @@ func gateNextAction(gate string, want, current version.Stage) string {
 //   - OnWaveTerminal(waveID): executing -> reporting after every wave is
 //     terminal and the version report has been ensured;
 //   - OnReportPublished(versionID): reporting -> completed after the version
-//     report is published, no blocking issue is open and the version row closed.
+//     report is published, no blocking issue is open and the version row closed
+//     (an already-closed version is success, see ErrVersionAlreadyClosed);
+//   - Reconcile(versionID): retry hook for a transiently failed production
+//     callback (executing with every wave terminal -> reporting; reporting with
+//     the report already published -> completed). Scheduler ticks and the Task
+//     36 reconciler call it; it is idempotent and a no-op outside those stages.
 //
 // It composes the existing *StageMachine atomic core rather than duplicating the
 // stage write: the StageMachine remains the only code that persists version.stage
@@ -786,6 +835,11 @@ func (s *StageService) Stage(ctx context.Context, versionID int64) (StageView, e
 // Request is idempotent: asking for the stage the version is already in is a
 // no-op. A gate rejection returns *StageGateError and writes nothing; a
 // non-graph transition returns *StageTransitionError.
+//
+// Request only advances the deterministic forward workflow. The graph's back
+// edges (gate rejects) and the completed -> clarifying reopen are deliberately
+// not reachable here: they need a dedicated user decision and audit entry point
+// (Task 36/37) instead of a generic stage request (review fix round 1).
 func (s *StageService) Request(ctx context.Context, versionID int64, to version.Stage) error {
 	if to == version.StageBlocked || to == version.StagePaused {
 		return newStageTransitionError(version.Stage(""), to,
@@ -804,6 +858,11 @@ func (s *StageService) Request(ctx context.Context, versionID int64, to version.
 	}
 	if !current.Stage.CanTransitionTo(to) {
 		return newStageTransitionError(current.Stage, to, "")
+	}
+	if next, ok := nextWorkflowStage(current.Stage); !ok || next != to {
+		return newStageTransitionError(current.Stage, to,
+			"gate reject and version reopen edges are not part of stage request; "+
+				"use the dedicated audited entry point")
 	}
 	if err := s.checkGate(ctx, current.VersionID, current.Stage, to); err != nil {
 		return err
@@ -898,6 +957,13 @@ func (s *StageService) Pause(ctx context.Context, versionID int64, reason string
 	if reason == "" {
 		reason = "user_paused"
 	}
+	// Validate the reason with the same limit the subsequent Suspend write
+	// enforces, and do it before touching the execution waves: a rejected stage
+	// write after the waves were already paused would strand the execution
+	// (review fix round 1).
+	if err := validateStageText("reason", reason, stageBlockerMax); err != nil {
+		return err
+	}
 	var actorID int64
 	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
 		actorID = actor.ID
@@ -914,9 +980,10 @@ func (s *StageService) Pause(ctx context.Context, versionID int64, reason string
 	return nil
 }
 
-// Resume leaves paused and continues the paused waves (best effort: the stage
-// resume is the truth and a wave resume failure is retried by the execution
-// reconciler).
+// Resume leaves paused and continues the paused waves. The stage resume is the
+// truth: the wave continuation is best effort because the execution reconciler
+// retries it, and a wave error must not make the caller believe the stage is
+// still paused while the row already left paused (review fix round 1 ordering).
 func (s *StageService) Resume(ctx context.Context, versionID int64) error {
 	current, err := s.machine.load(ctx, versionID)
 	if err != nil {
@@ -931,7 +998,9 @@ func (s *StageService) Resume(ctx context.Context, versionID int64) error {
 	}
 	if s.waveControl != nil {
 		if err := s.waveControl.ResumeVersionWaves(ctx, versionID); err != nil {
-			return err
+			slog.Default().WarnContext(ctx,
+				"version: paused waves were not resumed after the stage resume; the execution reconciler will retry",
+				"version_id", versionID, "error", err)
 		}
 	}
 	return nil
@@ -973,7 +1042,9 @@ func (s *StageService) OnWaveTerminal(ctx context.Context, waveID int64) error {
 
 // OnReportPublished is the production report.published callback (R-B4-3). It
 // completes a reporting version after the report is published, no blocking issue
-// remains open and the version row is closed. Duplicate deliveries are no-ops.
+// remains open and the version row is closed. Duplicate deliveries are no-ops,
+// and an already-closed version is gate success (the closer contract), so a
+// retry after a lost stage compare-and-swap still completes.
 func (s *StageService) OnReportPublished(ctx context.Context, versionID int64) error {
 	current, err := s.machine.load(ctx, versionID)
 	if err != nil {
@@ -983,6 +1054,63 @@ func (s *StageService) OnReportPublished(ctx context.Context, versionID int64) e
 		return nil
 	}
 	return s.Request(ctx, versionID, version.StageCompleted)
+}
+
+// Reconcile re-drives the production terminal callbacks for one version
+// (Task 25 fix round 1, review finding 2). The scheduler's wave-terminal and the
+// report-published callbacks are best effort, and the scheduler never finalizes
+// an already-terminal wave twice; without a retry hook a transient
+// EnsureVersionReport failure would leave the version in executing until a
+// manual stage advance.
+//
+// Reconcile is idempotent and safe to call on every tick:
+//
+//   - executing: no-op while any wave is active; when every wave is terminal it
+//     advances to reporting (which re-runs the report gate and retries the
+//     transient report failure);
+//   - reporting: no-op until the version report is published; then re-fires the
+//     completion (this also heals a report published while the stage was still
+//     executing, whose callback was a no-op);
+//   - anything else: no-op.
+//
+// A gate that is not ready yet (active wave, unpublished report) is reported as
+// nil; a transient port failure is returned as *StageGateError so the caller can
+// keep the version pending and retry on the next tick.
+func (s *StageService) Reconcile(ctx context.Context, versionID int64) error {
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	switch current.Stage {
+	case version.StageExecuting:
+		if s.gates.WavesTerminal == nil {
+			return newStageGateNotConfigured("wave")
+		}
+		terminal, err := s.gates.WavesTerminal(ctx, versionID)
+		if err != nil {
+			return newStageGateError("wave", "gate_check_failed",
+				"retry the wave terminal check", "reporting", err)
+		}
+		if !terminal {
+			return nil
+		}
+		return s.Request(ctx, versionID, version.StageReporting)
+	case version.StageReporting:
+		if s.gates.ReportPublished == nil {
+			return newStageGateNotConfigured("report")
+		}
+		published, err := s.gates.ReportPublished(ctx, versionID)
+		if err != nil {
+			return newStageGateError("report", "gate_check_failed",
+				"retry the report publication check", "completed", err)
+		}
+		if !published {
+			return nil
+		}
+		return s.OnReportPublished(ctx, versionID)
+	default:
+		return nil
+	}
 }
 
 // ---------- gate evaluation ----------
@@ -1200,6 +1328,13 @@ func (s *StageService) requireCompletable(ctx context.Context, versionID int64) 
 		return newStageGateNotConfigured("version_close")
 	}
 	if err := s.closer.CloseVersion(ctx, versionID, "stage_completed"); err != nil {
+		// The closer contract is "ensure closed": an already completed version
+		// (for example when a retry follows a lost stage CAS after the close
+		// committed) is success, not a gate failure. A rejected close predicate
+		// still fails the gate.
+		if errors.Is(err, ErrVersionAlreadyClosed) {
+			return nil
+		}
 		return newStageGateError("version_close", "version_close_failed",
 			"resolve the version close predicate", "completed", err)
 	}
@@ -1208,10 +1343,15 @@ func (s *StageService) requireCompletable(ctx context.Context, versionID int64) 
 
 // runPostTransition performs the best-effort hooks after the stage write: the
 // Task 27 handoff generation when design starts. Its own reconciler retries a
-// missed generation, so a failure never blocks the stage.
+// missed generation, so a failure never blocks the stage; the failure is logged
+// instead of being silently discarded (review fix round 1).
 func (s *StageService) runPostTransition(ctx context.Context, versionID int64, from, to version.Stage) {
 	if from == version.StageRequirementReview && to == version.StageDesigning && s.handoff != nil {
-		_, _ = s.handoff.Generate(ctx, versionID)
+		if _, err := s.handoff.Generate(ctx, versionID); err != nil {
+			slog.Default().WarnContext(ctx,
+				"version: design handoff generation failed after the stage transition; the handoff reconciler will retry",
+				"version_id", versionID, "error", err)
+		}
 	}
 }
 

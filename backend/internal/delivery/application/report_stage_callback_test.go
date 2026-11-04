@@ -6,7 +6,11 @@ package deliveryapp
 // version closes without a manual stage API call.
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -179,4 +183,51 @@ func TestReportPublishedCallbackCompletesStage(t *testing.T) {
 	if calls := closer.calls(); len(calls) != 1 {
 		t.Fatalf("version closed %d times, want once", len(calls))
 	}
+}
+
+// TestReportPublishStageCallbackFailureDoesNotRollBackPublish pins fix round 1's
+// best-effort contract: the publish is committed before the stage callback, so a
+// failing callback is logged and the published revision is still returned. The
+// StageService.Reconcile retry heals the missed stage advance.
+func TestReportPublishStageCallbackFailureDoesNotRollBackPublish(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, _ := fixture.seedWaveReport(7, 12)
+	notifier := &reportStageNotifier{err: errors.New("stage service unavailable")}
+	fixture.svc.WithReportPublishedNotifier(notifier)
+
+	// Capture the default logger to prove the silent callback failure is now
+	// logged (review finding 4: "add silent-callback logging").
+	logs := captureDefaultSlog(t)
+
+	published, err := fixture.svc.Publish(context.Background(), report.ID, 1, "叙述")
+	if err != nil {
+		t.Fatalf("Publish with failing stage callback: %v", err)
+	}
+	if published.Status != delivery.ReportStatusPublished {
+		t.Fatalf("revision status = %q, want published", published.Status)
+	}
+	if calls := notifier.calls(); len(calls) != 1 || calls[0] != 7 {
+		t.Fatalf("stage callback attempts = %v, want [7]", calls)
+	}
+	persisted := fixture.repoRevision(t, report.ID, 1)
+	if persisted.Status != delivery.ReportStatusPublished {
+		t.Fatalf("persisted revision status = %q, want published", persisted.Status)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "report-published stage callback failed") ||
+		!strings.Contains(logged, "stage service unavailable") {
+		t.Fatalf("failed stage callback was not logged: %q", logged)
+	}
+}
+
+// captureDefaultSlog redirects the process logger for one test and restores it
+// on cleanup. The callback paths use slog.Default(), matching the other
+// background callbacks in the execution/delivery services.
+func captureDefaultSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buffer, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return buffer
 }

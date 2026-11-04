@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -58,6 +59,13 @@ type Scheduler struct {
 	// (R-B4-3). It is optional so the pre-v0.22 scheduler assemblies keep
 	// working: nil means "do not drive the stage machine from execution".
 	stageNotifier WaveTerminalStageNotifier
+	// stageReconciler re-drives a version whose wave-terminal callback failed
+	// transiently on an earlier tick (Task 25 fix round 1). It is optional;
+	// *versionapp.StageService implements it. pendingStage holds the version IDs
+	// whose callback failed and which are retried until a reconcile succeeds.
+	stageReconciler StageReconciler
+	pendingStageMu  sync.Mutex
+	pendingStage    map[int64]struct{}
 	// blocked deduplicates EventCaseRunBlocked by case_run ID; it holds the
 	// last published reason. A successful dispatch clears the entry.
 	blockedMu sync.Mutex
@@ -68,9 +76,20 @@ type Scheduler struct {
 // invokes when a wave becomes terminal (done/failed/cancelled), so the version
 // stage machine can advance executing -> reporting without a manual API call
 // (spec §4.12 R-B4-3). Implementations must be idempotent and must not block the
-// wave finalization: the scheduler treats the callback as best effort.
+// wave finalization: the scheduler treats the callback as best effort, logs a
+// failure and retries it on a later tick through StageReconciler.
 type WaveTerminalStageNotifier interface {
 	OnWaveTerminal(ctx context.Context, waveID int64) error
+}
+
+// StageReconciler is the narrow retry port the scheduler uses when a
+// wave-terminal callback failed. *versionapp.StageService implements it: a
+// reconcile advances an executing version whose waves are all terminal to
+// reporting (and completes a reporting version whose report is published),
+// idempotently and without a wave ID. It is optional so assemblies without the
+// v0.22 stage wiring keep working.
+type StageReconciler interface {
+	Reconcile(ctx context.Context, versionID int64) error
 }
 
 // SchedulerDeps wires the scheduler. quotaReader may be nil: the running set is
@@ -100,6 +119,10 @@ type SchedulerDeps struct {
 	// StageNotifier is the v0.22 wave-terminal stage callback (Task 25). nil
 	// keeps the pre-v0.22 behavior; Task 36 wires *versionapp.StageService here.
 	StageNotifier WaveTerminalStageNotifier
+	// StageReconciler is the v0.22 retry sink for a failed wave-terminal stage
+	// callback (Task 25 fix round 1). nil disables retries; Task 36 wires
+	// *versionapp.StageService here too.
+	StageReconciler StageReconciler
 }
 
 // NewScheduler builds the scheduler.
@@ -116,24 +139,26 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		lease = DefaultCaseLease
 	}
 	return &Scheduler{
-		intents:       deps.Intents,
-		waves:         deps.Waves,
-		caseRuns:      deps.CaseRuns,
-		cases:         deps.Cases,
-		versions:      deps.Versions,
-		executors:     deps.Executors,
-		workQueue:     deps.WorkQueue,
-		quota:         quota,
-		quotaReader:   deps.QuotaReader,
-		analyzer:      deps.Analyzer,
-		replanner:     deps.Replanner,
-		ids:           deps.IDs,
-		clock:         deps.Clock,
-		events:        deps.Events,
-		instance:      deps.Instance,
-		leaseTTL:      lease,
-		stageNotifier: deps.StageNotifier,
-		blocked:       map[int64]string{},
+		intents:         deps.Intents,
+		waves:           deps.Waves,
+		caseRuns:        deps.CaseRuns,
+		cases:           deps.Cases,
+		versions:        deps.Versions,
+		executors:       deps.Executors,
+		workQueue:       deps.WorkQueue,
+		quota:           quota,
+		quotaReader:     deps.QuotaReader,
+		analyzer:        deps.Analyzer,
+		replanner:       deps.Replanner,
+		ids:             deps.IDs,
+		clock:           deps.Clock,
+		events:          deps.Events,
+		instance:        deps.Instance,
+		leaseTTL:        lease,
+		stageNotifier:   deps.StageNotifier,
+		stageReconciler: deps.StageReconciler,
+		pendingStage:    map[int64]struct{}{},
+		blocked:         map[int64]string{},
 	}
 }
 
@@ -165,7 +190,10 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	// A failed wave-terminal stage callback from an earlier tick is retried here:
+	// the version may have no open intent and no active wave any more, so it is
+	// not part of this tick's version set (Task 25 fix round 1).
+	return s.retryPendingStageNotifications(ctx)
 }
 
 // ReconcileVersion plans, dispatches and finalizes one version.
@@ -224,7 +252,7 @@ func (s *Scheduler) failEmptyWave(ctx context.Context, wave execution.RunWave) e
 		map[string]any{"wave_id": platformid.Format(wave.ID)},
 		map[string]any{"wave_id": platformid.Format(wave.ID), "status": string(execution.WaveFailed)},
 		nil)
-	s.notifyStageWaveTerminal(ctx, wave.ID)
+	s.notifyStageWaveTerminal(ctx, wave.VersionID, wave.ID)
 	return nil
 }
 
@@ -434,19 +462,79 @@ func (s *Scheduler) completeWave(ctx context.Context, wave execution.RunWave, ru
 	// The wave row is terminal now, so the version stage machine may advance
 	// executing -> reporting (R-B4-3). The callback runs after analysis so the
 	// version report snapshot includes the analyzed issues.
-	s.notifyStageWaveTerminal(ctx, wave.ID)
+	s.notifyStageWaveTerminal(ctx, wave.VersionID, wave.ID)
 	return nil
 }
 
 // notifyStageWaveTerminal invokes the optional v0.22 production callback after a
 // wave is terminal. It is best effort: the wave finalization is the source of
-// truth and a failed stage advance is retried by the stage reconciler/API, so a
-// callback failure never rolls the wave back or fails the scheduler tick.
-func (s *Scheduler) notifyStageWaveTerminal(ctx context.Context, waveID int64) {
+// truth and a failed stage advance is retried by StageReconciler on a later
+// scheduler tick, so a callback failure never rolls the wave back or fails the
+// scheduler tick. The failure is logged instead of silently swallowed (Task 25
+// fix round 1).
+func (s *Scheduler) notifyStageWaveTerminal(ctx context.Context, versionID, waveID int64) {
 	if s.stageNotifier == nil || waveID <= 0 {
 		return
 	}
-	_ = s.stageNotifier.OnWaveTerminal(ctx, waveID)
+	if err := s.stageNotifier.OnWaveTerminal(ctx, waveID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: wave-terminal stage callback failed; the version is retried on a later scheduler tick",
+			"version_id", versionID, "wave_id", waveID, "error", err)
+		s.markPendingStage(versionID)
+		return
+	}
+	s.clearPendingStage(versionID)
+}
+
+// retryPendingStageNotifications re-drives the stage machine for every version
+// whose wave-terminal callback failed on an earlier tick. A still-failing
+// reconcile keeps the version pending for the next tick; a success clears it.
+// Reconcile failures never fail the scheduler tick (best effort, one version
+// must not block the others).
+func (s *Scheduler) retryPendingStageNotifications(ctx context.Context) error {
+	versionIDs := s.pendingStageVersions()
+	if len(versionIDs) == 0 || s.stageReconciler == nil {
+		return nil
+	}
+	for _, versionID := range versionIDs {
+		if err := s.stageReconciler.Reconcile(ctx, versionID); err != nil {
+			slog.Default().WarnContext(ctx,
+				"execution: stage reconcile retry failed; keeping the version pending",
+				"version_id", versionID, "error", err)
+			continue
+		}
+		s.clearPendingStage(versionID)
+	}
+	return nil
+}
+
+func (s *Scheduler) markPendingStage(versionID int64) {
+	if versionID <= 0 {
+		return
+	}
+	s.pendingStageMu.Lock()
+	defer s.pendingStageMu.Unlock()
+	if s.pendingStage == nil {
+		s.pendingStage = map[int64]struct{}{}
+	}
+	s.pendingStage[versionID] = struct{}{}
+}
+
+func (s *Scheduler) clearPendingStage(versionID int64) {
+	s.pendingStageMu.Lock()
+	defer s.pendingStageMu.Unlock()
+	delete(s.pendingStage, versionID)
+}
+
+func (s *Scheduler) pendingStageVersions() []int64 {
+	s.pendingStageMu.Lock()
+	defer s.pendingStageMu.Unlock()
+	versionIDs := make([]int64, 0, len(s.pendingStage))
+	for versionID := range s.pendingStage {
+		versionIDs = append(versionIDs, versionID)
+	}
+	sort.Slice(versionIDs, func(i, j int) bool { return versionIDs[i] < versionIDs[j] })
+	return versionIDs
 }
 
 // completeIntent projects one finished case_run onto its intent (§4.1).

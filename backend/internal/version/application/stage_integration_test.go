@@ -11,9 +11,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
@@ -139,6 +142,7 @@ type fakeStageWaveControl struct {
 	paused       []int64
 	resumed      []int64
 	pauseReasons []string
+	resumeCalls  int
 	err          error
 }
 
@@ -152,6 +156,7 @@ func (f *fakeStageWaveControl) PauseVersionWaves(_ context.Context, versionID in
 }
 
 func (f *fakeStageWaveControl) ResumeVersionWaves(_ context.Context, versionID int64) error {
+	f.resumeCalls++
 	if f.err != nil {
 		return f.err
 	}
@@ -173,12 +178,25 @@ type fakeStageCloser struct {
 	versionIDs []int64
 	reasons    []string
 	err        error
+	// alreadyClosed makes the fake model the production "ensure closed"
+	// contract: the first close succeeds and every later close reports the
+	// typed already-closed signal instead of a generic state conflict.
+	alreadyClosed map[int64]bool
 }
 
 func (f *fakeStageCloser) CloseVersion(_ context.Context, versionID int64, reason string) error {
 	f.versionIDs = append(f.versionIDs, versionID)
 	f.reasons = append(f.reasons, reason)
-	return f.err
+	if f.err != nil {
+		return f.err
+	}
+	if f.alreadyClosed != nil {
+		if f.alreadyClosed[versionID] {
+			return fmt.Errorf("version %d is already completed: %w", versionID, versionapp.ErrVersionAlreadyClosed)
+		}
+		f.alreadyClosed[versionID] = true
+	}
+	return nil
 }
 
 type fakeStageHandoff struct {
@@ -299,6 +317,23 @@ func TestStageHappyPathToCompleted(t *testing.T) {
 	}
 	env.requireStage(t, version.StageReporting)
 
+	// Pin the stage-entry job kinds: the executing and reporting edges must keep
+	// enqueuing execute.batch and report.version exactly (spec §5.4, D21).
+	wantedJobs := []string{
+		versionapp.StageJobDesignCases,
+		versionapp.StageJobExecuteBatch,
+		versionapp.StageJobReportVersion,
+	}
+	if len(env.jobs.jobs) != len(wantedJobs) {
+		t.Fatalf("stage-entry jobs = %#v, want kinds %v", env.jobs.jobs, wantedJobs)
+	}
+	for index, kind := range wantedJobs {
+		if env.jobs.jobs[index].Kind != kind {
+			t.Fatalf("stage-entry job[%d] = %q, want %q (jobs=%#v)",
+				index, env.jobs.jobs[index].Kind, kind, env.jobs.jobs)
+		}
+	}
+
 	if err := env.svc.OnReportPublished(ctx, stageServiceVersionID); err != nil {
 		t.Fatalf("OnReportPublished: %v", err)
 	}
@@ -357,6 +392,11 @@ func TestStageGateRejections(t *testing.T) {
 		closeGate  func(*stageGateState)
 		wantReason string
 	}{
+		{
+			name: "environment not bound", from: version.StageCreated, to: version.StageClarifying,
+			closeGate:  func(g *stageGateState) { g.environmentBound = false },
+			wantReason: "environment_not_bound",
+		},
 		{
 			name: "missing requirement", from: version.StageClarifying, to: version.StageRequirementReview,
 			closeGate:  func(g *stageGateState) { g.requirementCount = 0 },
@@ -484,6 +524,22 @@ func TestBlockedRoundTrip(t *testing.T) {
 	if len(blockedEvents) != 1 || blockedEvents[0]["to"] != "blocked" ||
 		blockedEvents[0]["from"] != "designing" || blockedEvents[0]["reason"] != "blocked" {
 		t.Fatalf("block event = %#v", blockedEvents)
+	}
+	// The event payload carries the same structured JSON that is persisted in
+	// version.blocker, so consumers can render kind/reason/action/next.
+	payloadBlocker, ok := blockedEvents[0]["blocker"].(string)
+	if !ok {
+		t.Fatalf("block event has no blocker payload: %#v", blockedEvents[0])
+	}
+	if payloadBlocker != env.repo.state.Blocker {
+		t.Fatalf("event blocker = %q, want persisted %q", payloadBlocker, env.repo.state.Blocker)
+	}
+	var eventBlocker versionapp.Blocker
+	if err := json.Unmarshal([]byte(payloadBlocker), &eventBlocker); err != nil {
+		t.Fatalf("event blocker is not JSON: %q (%v)", payloadBlocker, err)
+	}
+	if eventBlocker != blocker {
+		t.Fatalf("event blocker = %+v, want %+v", eventBlocker, blocker)
 	}
 
 	// A blocker that is not cleared cannot be resumed.
@@ -804,4 +860,251 @@ func stageOrNil(stage *version.Stage) string {
 		return "<nil>"
 	}
 	return string(*stage)
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (review findings)
+// ---------------------------------------------------------------------------
+
+// TestOnReportPublishedSucceedsWhenVersionAlreadyClosed pins the closer contract
+// from review fix 1: CloseVersion means "ensure the version is closed", so an
+// already-completed version is gate success. Before the fix the production
+// VersionCloseService returned a generic 409 for a completed row, stranding the
+// stage in reporting forever.
+func TestOnReportPublishedSucceedsWhenVersionAlreadyClosed(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageReporting)
+	// Wrapped on purpose: implementations may wrap the sentinel with context.
+	env.closer.err = fmt.Errorf("version 101 already completed: %w", versionapp.ErrVersionAlreadyClosed)
+
+	if err := env.svc.OnReportPublished(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("OnReportPublished with an already-closed version: %v", err)
+	}
+	env.requireStage(t, version.StageCompleted)
+	if len(env.closer.versionIDs) != 1 || env.closer.versionIDs[0] != stageServiceVersionID {
+		t.Fatalf("closer calls = %#v, want one for %d", env.closer.versionIDs, stageServiceVersionID)
+	}
+}
+
+// TestOnReportPublishedRetriesAfterCloseWonButStageCASLost covers the second
+// half of fix 1: the version close commits, then the stage compare-and-swap loses
+// a race. The first callback reports the conflict; a retry must see the
+// already-closed version as success and finish the stage write.
+func TestOnReportPublishedRetriesAfterCloseWonButStageCASLost(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageReporting)
+	env.closer.alreadyClosed = map[int64]bool{}
+
+	env.repo.applyErr = version.ErrStageConflict
+	if err := env.svc.OnReportPublished(requestContext(), stageServiceVersionID); err == nil {
+		t.Fatal("stage CAS loss was not surfaced")
+	}
+	env.requireStage(t, version.StageReporting)
+	if len(env.closer.versionIDs) != 1 {
+		t.Fatalf("close calls after CAS loss = %#v, want one", env.closer.versionIDs)
+	}
+
+	// The version is closed now; the retry must treat that as success.
+	env.repo.applyErr = nil
+	if err := env.svc.OnReportPublished(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("retry after a successful close: %v", err)
+	}
+	env.requireStage(t, version.StageCompleted)
+	if len(env.closer.versionIDs) != 2 {
+		t.Fatalf("close calls after retry = %#v, want two", env.closer.versionIDs)
+	}
+}
+
+// TestStageReconcileRetriesTransientReportFailure covers review fix 2: a
+// transient EnsureVersionReport failure after the wave already finalized must be
+// retryable without a manual stage API call. Reconcile is the production
+// reconciler hook; the first pass fails the report gate, the second advances.
+func TestStageReconcileRetriesTransientReportFailure(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageExecuting)
+	env.reports.err = errors.New("report store unavailable")
+
+	err := env.svc.Reconcile(requestContext(), stageServiceVersionID)
+	var gateErr *versionapp.StageGateError
+	if !errors.As(err, &gateErr) || gateErr.Reason != "report_not_generated" {
+		t.Fatalf("first Reconcile error = %v, want report_not_generated gate", err)
+	}
+	env.requireStage(t, version.StageExecuting)
+	if len(env.repo.applied) != 0 {
+		t.Fatalf("failed reconcile wrote stage: %#v", env.repo.applied)
+	}
+
+	env.reports.err = nil
+	if err := env.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("retry Reconcile: %v", err)
+	}
+	env.requireStage(t, version.StageReporting)
+	if len(env.reports.versionIDs) != 2 {
+		t.Fatalf("report ensure calls = %#v, want two", env.reports.versionIDs)
+	}
+}
+
+// TestStageReconcileNoOpsWhenNotReady documents the reconciler contract: a
+// version with an active wave, or one outside executing/reporting, is a no-op.
+func TestStageReconcileNoOpsWhenNotReady(t *testing.T) {
+	active := newStageServiceEnv(t, version.StageExecuting)
+	active.gates.wavesTerminal = false
+	if err := active.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("Reconcile with active waves: %v", err)
+	}
+	active.requireStage(t, version.StageExecuting)
+	if len(active.reports.versionIDs) != 0 {
+		t.Fatalf("active-wave reconcile ensured a report: %#v", active.reports.versionIDs)
+	}
+
+	designing := newStageServiceEnv(t, version.StageDesigning)
+	if err := designing.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("Reconcile outside executing: %v", err)
+	}
+	designing.requireStage(t, version.StageDesigning)
+	if len(designing.repo.applied) != 0 {
+		t.Fatalf("reconcile moved a designing version: %#v", designing.repo.applied)
+	}
+}
+
+// TestStageReconcileCompletesReportingVersion heals the publish-raced-the-edge
+// case: the report is published but the publishing callback landed while the
+// version was still executing (a no-op), so no later publish event will arrive.
+func TestStageReconcileCompletesReportingVersion(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageReporting)
+	env.gates.reportPublished = true
+	if err := env.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("Reconcile reporting version: %v", err)
+	}
+	env.requireStage(t, version.StageCompleted)
+
+	unpublished := newStageServiceEnv(t, version.StageReporting)
+	unpublished.gates.reportPublished = false
+	if err := unpublished.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("Reconcile unpublished reporting version: %v", err)
+	}
+	unpublished.requireStage(t, version.StageReporting)
+	if len(unpublished.repo.applied) != 0 {
+		t.Fatalf("unpublished version advanced: %#v", unpublished.repo.applied)
+	}
+}
+
+// TestRequestRejectsBackAndReopenEdges pins the review fix that Request only
+// advances the deterministic forward workflow. Gate rejection back edges and
+// the completed-reopen edge need a dedicated, audited entry point (Task 36/37).
+func TestRequestRejectsBackAndReopenEdges(t *testing.T) {
+	testCases := []struct {
+		name     string
+		from, to version.Stage
+	}{
+		{name: "requirement gate reject", from: version.StageRequirementReview, to: version.StageClarifying},
+		{name: "case gate reject", from: version.StageCaseReview, to: version.StageDesigning},
+		{name: "partial execution back edge", from: version.StageExecuting, to: version.StageCaseReview},
+		{name: "completed reopen", from: version.StageCompleted, to: version.StageClarifying},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := newStageServiceEnv(t, testCase.from)
+			err := env.svc.Request(stageUserContext(42), stageServiceVersionID, testCase.to)
+			var transitionErr *versionapp.StageTransitionError
+			if !errors.As(err, &transitionErr) {
+				t.Fatalf("Request(%s -> %s) error = %v, want *StageTransitionError",
+					testCase.from, testCase.to, err)
+			}
+			if transitionErr.From != testCase.from || transitionErr.To != testCase.to {
+				t.Fatalf("transition error = %+v", transitionErr)
+			}
+			if len(env.repo.applied) != 0 || len(env.publisher.events) != 0 {
+				t.Fatalf("back/reopen edge wrote state: applied=%#v events=%d",
+					env.repo.applied, len(env.publisher.events))
+			}
+		})
+	}
+}
+
+// TestPauseRejectsInvalidReasonBeforePausingWaves pins the review fix that the
+// pause reason is validated before the execution side effect: an over-long
+// reason must not pause the waves and then fail the stage write.
+func TestPauseRejectsInvalidReasonBeforePausingWaves(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageExecuting)
+	err := env.svc.Pause(stageUserContext(42), stageServiceVersionID, strings.Repeat("x", 4001))
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != 400 || apiErr.Code != "invalid_argument" {
+		t.Fatalf("Pause error = %v, want a 400 invalid_argument", err)
+	}
+	if len(env.waveControl.paused) != 0 || env.waveControl.resumeCalls != 0 {
+		t.Fatalf("invalid pause touched the waves: paused=%#v resumed=%#v",
+			env.waveControl.paused, env.waveControl.resumeCalls)
+	}
+	if len(env.repo.applied) != 0 {
+		t.Fatalf("invalid pause wrote the stage: %#v", env.repo.applied)
+	}
+	env.requireStage(t, version.StageExecuting)
+}
+
+// TestResumeIsBestEffortWhenWaveResumeFails pins the resume ordering fix: the
+// stage resume is the truth. A wave-resume failure is reported to logs and
+// retried by the execution reconciler; it must not make the caller believe the
+// stage is still paused.
+func TestResumeIsBestEffortWhenWaveResumeFails(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageExecuting)
+	if err := env.svc.Pause(stageUserContext(42), stageServiceVersionID, "maintenance"); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	env.waveControl.err = errors.New("execution pause service unavailable")
+
+	if err := env.svc.Resume(stageUserContext(42), stageServiceVersionID); err != nil {
+		t.Fatalf("Resume with failing wave continuation: %v", err)
+	}
+	env.requireStage(t, version.StageExecuting)
+	if env.waveControl.resumeCalls != 1 {
+		t.Fatalf("wave resume attempts = %d, want 1", env.waveControl.resumeCalls)
+	}
+	if len(env.repo.applied) != 2 {
+		t.Fatalf("stage writes = %d, want pause + resume", len(env.repo.applied))
+	}
+}
+
+// TestStageTransitionErrorMapsToAPIError keeps the Task 37 HTTP wiring trivial:
+// invalid transitions map to 409 invalid_stage_transition with from/to/action.
+func TestStageTransitionErrorMapsToAPIError(t *testing.T) {
+	err := &versionapp.StageTransitionError{
+		From:   version.StageRequirementReview,
+		To:     version.StageClarifying,
+		Action: "use the gate reject entry point",
+	}
+	apiErr := err.APIError()
+	if apiErr.Status != 409 || apiErr.Code != "invalid_stage_transition" {
+		t.Fatalf("api error = %d/%s, want 409/invalid_stage_transition", apiErr.Status, apiErr.Code)
+	}
+	if apiErr.Details["from"] != "requirement_review" || apiErr.Details["to"] != "clarifying" {
+		t.Fatalf("api details = %#v", apiErr.Details)
+	}
+	if apiErr.Details["action"] != "use the gate reject entry point" {
+		t.Fatalf("api details action = %#v", apiErr.Details["action"])
+	}
+}
+
+// TestStageServiceUsesAtomicCoreCAS pins R-B4-1 at the write boundary: every
+// StageService edge must go through the same source-stage compare-and-swap as
+// the legacy machine, and a lost CAS is a typed 409 with no event/job leak.
+func TestStageServiceUsesAtomicCoreCAS(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageCreated)
+	if err := env.svc.Request(stageUserContext(42), stageServiceVersionID, version.StageClarifying); err != nil {
+		t.Fatalf("Request(clarifying): %v", err)
+	}
+	if len(env.repo.expectedStages) != 1 || env.repo.expectedStages[0] != version.StageCreated {
+		t.Fatalf("CAS source stages = %#v, want [created]", env.repo.expectedStages)
+	}
+	eventsAfterFirst := len(env.publisher.events)
+	jobsAfterFirst := len(env.jobs.jobs)
+
+	env.repo.applyErr = version.ErrStageConflict
+	err := env.svc.Request(stageUserContext(42), stageServiceVersionID, version.StageRequirementReview)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != 409 {
+		t.Fatalf("CAS conflict error = %v, want a 409 platform error", err)
+	}
+	env.requireStage(t, version.StageClarifying)
+	if len(env.publisher.events) != eventsAfterFirst || len(env.jobs.jobs) != jobsAfterFirst {
+		t.Fatalf("lost CAS leaked side effects: events=%d->%d jobs=%d->%d",
+			eventsAfterFirst, len(env.publisher.events), jobsAfterFirst, len(env.jobs.jobs))
+	}
 }
