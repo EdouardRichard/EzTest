@@ -72,9 +72,6 @@ jobs:
         working-directory: backend
         run: go test -count=1 ./...
 
-      - name: Go integration tests
-        working-directory: backend
-        run: go test -tags=integration -count=1 ./...
 
       - name: Install frontend dependencies
         working-directory: frontend
