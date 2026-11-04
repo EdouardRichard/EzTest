@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -54,9 +55,12 @@ func NewFactRepository(pool *pgxpool.Pool, ids platformid.Generator) *FactReposi
 
 // Record appends one fact. The unique (version_id, kind, key, content_hash)
 // index deduplicates an identical fact (the stored row is returned, conflict
-// false). A different hash under the same (version, kind, key) is appended as
-// a second current row and reported with conflict=true; the existing row is
-// left untouched for Arbitrate to resolve.
+// false). A different hash under the same (version, kind, key) is resolved by
+// versionapp.ResolveFactAppend inside the same transaction as the append: a
+// not-lower confidence sets the old row's superseded_by to the new fact, a
+// lower/unknown confidence stores the new row already superseded by the old
+// one, and two high-confidence contradictions stay current and report
+// conflict=true for the host to arbitrate.
 func (r *FactRepository) Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error) {
 	if fact.VersionID <= 0 {
 		return version.Fact{}, false, fmt.Errorf("record fact: version id must be positive")
@@ -95,26 +99,22 @@ func (r *FactRepository) Record(ctx context.Context, fact version.Fact) (version
 		return version.Fact{}, false, fmt.Errorf("record fact: lookup identical fact: %w", err)
 	}
 
-	var conflict bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM version_fact
-			WHERE version_id = $1 AND kind = $2 AND key = $3
-			  AND superseded_by IS NULL AND content_hash <> $4
-		)
-	`, fact.VersionID, fact.Kind, fact.Key, fact.ContentHash).Scan(&conflict); err != nil {
-		return version.Fact{}, false, fmt.Errorf("record fact: detect conflict: %w", err)
+	current, err := currentFactsForAppend(ctx, tx, fact.VersionID, fact.Kind, fact.Key, fact.ContentHash)
+	if err != nil {
+		return version.Fact{}, false, err
 	}
+	decision := versionapp.ResolveFactAppend(current, fact)
+	fact.SupersededBy = decision.SupersedeNewBy
 
 	stored, err := scanFact(tx.QueryRow(ctx, `
 		INSERT INTO version_fact (
 			id, version_id, kind, key, payload, confidence,
-			source, source_ref, evidence_refs, content_hash
+			source, source_ref, evidence_refs, content_hash, superseded_by
 		)
-		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11)
 		RETURNING `+factColumns+`
 	`, fact.ID, fact.VersionID, fact.Kind, fact.Key, payload, fact.Confidence,
-		fact.Source, fact.SourceRef, evidence, fact.ContentHash))
+		fact.Source, fact.SourceRef, evidence, fact.ContentHash, fact.SupersededBy))
 	if err != nil {
 		// A concurrent append of the same hash can still win outside this
 		// database's advisory lock (another primary); the unique index is the
@@ -136,10 +136,54 @@ func (r *FactRepository) Record(ctx context.Context, fact version.Fact) (version
 		}
 		return version.Fact{}, false, fmt.Errorf("record fact: insert: %w", err)
 	}
+	// R-B6-1: the supersede write is in the same transaction as the append, so
+	// no observer can ever see both rows current for a non-conflict append.
+	for _, oldID := range decision.SupersedeOldIDs {
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE version_fact SET superseded_by = $1
+			WHERE id = $2 AND superseded_by IS NULL
+		`, stored.ID, oldID)
+		if updateErr != nil {
+			return version.Fact{}, false, fmt.Errorf("record fact: supersede %d: %w", oldID, updateErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return version.Fact{}, false, fmt.Errorf("record fact: supersede %d: current row disappeared", oldID)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return version.Fact{}, false, fmt.Errorf("record fact: commit: %w", err)
 	}
-	return stored, conflict, nil
+	return stored, decision.Conflict, nil
+}
+
+// currentFactsForAppend locks and returns the current rows of the same
+// (version, kind, key) whose content hash differs from the new fact. The
+// version advisory lock plus FOR UPDATE make the append decision stable until
+// commit.
+func currentFactsForAppend(ctx context.Context, tx pgx.Tx, versionID int64, kind, key, contentHash string) ([]version.Fact, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT `+factColumns+` FROM version_fact
+		WHERE version_id = $1 AND kind = $2 AND key = $3
+		  AND superseded_by IS NULL AND content_hash <> $4
+		ORDER BY id
+		FOR UPDATE
+	`, versionID, kind, key, contentHash)
+	if err != nil {
+		return nil, fmt.Errorf("record fact: current facts: %w", err)
+	}
+	defer rows.Close()
+	items := make([]version.Fact, 0, 2)
+	for rows.Next() {
+		fact, err := scanFact(rows)
+		if err != nil {
+			return nil, fmt.Errorf("record fact: scan current fact: %w", err)
+		}
+		items = append(items, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("record fact: current facts: %w", err)
+	}
+	return items, nil
 }
 
 // Current returns the effective facts of one version (superseded_by IS NULL),
@@ -247,6 +291,92 @@ func (r *FactRepository) Arbitrate(ctx context.Context, keepID, dropID int64) er
 	}
 	return nil
 }
+
+// ArbitrateFact resolves one conflict group under the version advisory lock.
+// The pure selection lives in versionapp.ResolveFactArbitration; this adapter
+// loads every row of the key FOR UPDATE, lets it decide, and writes only
+// superseded_by. History is never deleted and a repeated no-op decision writes
+// nothing.
+func (r *FactRepository) ArbitrateFact(
+	ctx context.Context, versionID, factID int64, decision versionapp.FactArbitrationDecision,
+) (versionapp.FactArbitration, error) {
+	if versionID <= 0 || factID <= 0 {
+		return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: ids must be positive")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var targetVersion int64
+	var kind, key string
+	if err := tx.QueryRow(ctx, `
+		SELECT version_id, kind, key FROM version_fact WHERE id = $1
+	`, factID).Scan(&targetVersion, &kind, &key); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return versionapp.FactArbitration{}, version.ErrFactNotFound
+		}
+		return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: locate fact: %w", err)
+	}
+	if targetVersion != versionID {
+		return versionapp.FactArbitration{}, version.ErrFactNotFound
+	}
+	if err := lockVersionTx(ctx, tx, versionID, "arbitrate fact"); err != nil {
+		return versionapp.FactArbitration{}, err
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT `+factColumns+` FROM version_fact
+		WHERE version_id = $1 AND kind = $2 AND key = $3
+		ORDER BY id
+		FOR UPDATE
+	`, versionID, kind, key)
+	if err != nil {
+		return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: lock facts: %w", err)
+	}
+	facts := make([]version.Fact, 0, 2)
+	for rows.Next() {
+		fact, scanErr := scanFact(rows)
+		if scanErr != nil {
+			rows.Close()
+			return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: scan fact: %w", scanErr)
+		}
+		facts = append(facts, fact)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: lock facts: %w", err)
+	}
+
+	outcome, err := versionapp.ResolveFactArbitration(facts, factID, decision)
+	if err != nil {
+		return versionapp.FactArbitration{}, err
+	}
+	if !outcome.Changed {
+		return outcome, nil
+	}
+	for _, dropID := range outcome.DroppedIDs {
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE version_fact SET superseded_by = $1
+			WHERE id = $2 AND superseded_by IS NULL
+		`, outcome.KeepID, dropID)
+		if updateErr != nil {
+			return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: supersede %d: %w", dropID, updateErr)
+		}
+		if tag.RowsAffected() == 0 {
+			return versionapp.FactArbitration{}, version.ErrFactSuperseded
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return versionapp.FactArbitration{}, fmt.Errorf("arbitrate fact: commit: %w", err)
+	}
+	return outcome, nil
+}
+
+var _ interface {
+	ArbitrateFact(context.Context, int64, int64, versionapp.FactArbitrationDecision) (versionapp.FactArbitration, error)
+} = (*FactRepository)(nil)
 
 func encodeFactPayload(payload map[string]any) (string, error) {
 	if payload == nil {
