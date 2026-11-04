@@ -59,6 +59,7 @@ func passingChecks() version.ClosureChecks {
 		RequirementState:   true,
 		HasConfirmedCase:   true,
 		CasesTerminal:      true,
+		CasesVerified:      true,
 		FailedCaseHasIssue: true,
 		NoOpenWork:         true,
 		NoActiveIntent:     true,

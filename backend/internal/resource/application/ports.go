@@ -12,6 +12,11 @@ type CatalogReader interface {
 	GetDatabase(context.Context, int64) (DatabaseView, error)
 	GetAccount(context.Context, int64) (AccountView, error)
 	GetRepository(context.Context, int64) (CodeRepositoryView, error)
+	// ListSUTRepositories returns the SUT-level multi-repository associations
+	// (v0.22 R-C2). A version inherits the enabled rows.
+	ListSUTRepositories(context.Context, int64) ([]SUTRepositoryView, error)
+	// ListAllAccounts returns the global test-account pool (v0.22 DB-15).
+	ListAllAccounts(context.Context) ([]AccountView, error)
 }
 
 // UsageChecker answers whether a resource is still referenced by a version

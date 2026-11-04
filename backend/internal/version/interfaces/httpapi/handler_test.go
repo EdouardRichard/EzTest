@@ -202,21 +202,9 @@ func TestCreateVersionParsesPayloadAndReturnsNestedView(t *testing.T) {
 
 	body := `{
 		"title": "Orders Q4",
-		"bindings": [
-			{
-				"sut_id": "1001",
-				"environment_id": "1101",
-				"code_repository_id": "1201",
-				"page_ids": ["1301", "1302"],
-				"api_ids": ["1401"],
-				"database_ids": ["1501"],
-				"accounts": [{"account_id": "1601", "role": "order_admin"}, {"account_id": "1602"}]
-			},
-			{
-				"sut_id": "1002",
-				"environment_id": "1102"
-			}
-		]
+		"description": "Q4 flows",
+		"goal": "verify checkout",
+		"environment_id": "1101"
 	}`
 	recorder := call(t, handler, http.MethodPost, "/api/versions", body, actor())
 	if recorder.Code != http.StatusCreated {
@@ -226,34 +214,9 @@ func TestCreateVersionParsesPayloadAndReturnsNestedView(t *testing.T) {
 		t.Fatalf("actor = %d", stub.lastActor)
 	}
 	cmd := stub.lastCommand
-	if cmd.Title != "Orders Q4" || len(cmd.Bindings) != 2 {
+	if cmd.Title != "Orders Q4" || cmd.Description != "Q4 flows" || cmd.Goal != "verify checkout" ||
+		cmd.EnvironmentID != 1101 {
 		t.Fatalf("command = %#v", cmd)
-	}
-	first := cmd.Bindings[0]
-	if first.SUTID != 1001 || first.EnvironmentID != 1101 {
-		t.Fatalf("first binding = %#v", first)
-	}
-	if first.CodeRepositoryID == nil || *first.CodeRepositoryID != 1201 {
-		t.Fatalf("repository = %#v", first.CodeRepositoryID)
-	}
-	if len(first.PageIDs) != 2 || first.PageIDs[0] != 1301 || first.PageIDs[1] != 1302 {
-		t.Fatalf("page ids = %#v", first.PageIDs)
-	}
-	if len(first.APIIDs) != 1 || first.APIIDs[0] != 1401 {
-		t.Fatalf("api ids = %#v", first.APIIDs)
-	}
-	if len(first.DatabaseIDs) != 1 || first.DatabaseIDs[0] != 1501 {
-		t.Fatalf("database ids = %#v", first.DatabaseIDs)
-	}
-	if len(first.Accounts) != 2 || first.Accounts[0].AccountID != 1601 || first.Accounts[0].Role != "order_admin" {
-		t.Fatalf("accounts = %#v", first.Accounts)
-	}
-	if first.Accounts[1].Role != "" {
-		t.Fatalf("second account role = %q", first.Accounts[1].Role)
-	}
-	second := cmd.Bindings[1]
-	if second.SUTID != 1002 || second.EnvironmentID != 1102 || second.CodeRepositoryID != nil {
-		t.Fatalf("second binding = %#v", second)
 	}
 
 	data := dataBody(t, recorder)
@@ -292,21 +255,25 @@ func TestCreateVersionParsesPayloadAndReturnsNestedView(t *testing.T) {
 	if len(binding["databases"].([]any)) != 1 || len(binding["accounts"].([]any)) != 1 {
 		t.Fatalf("databases/accounts = %#v", binding)
 	}
+	if scopes, ok := binding["scope_exclude"].(map[string]any); !ok ||
+		len(scopes["pages"].([]any)) != 0 || len(scopes["apis"].([]any)) != 0 || len(scopes["databases"].([]any)) != 0 {
+		t.Fatalf("scope_exclude = %#v", binding["scope_exclude"])
+	}
 	if strings.Contains(recorder.Body.String(), `"password"`) {
 		t.Fatalf("response exposes a password field: %s", recorder.Body.String())
 	}
 }
 
-func TestCreateVersionAcceptsMissingRepository(t *testing.T) {
+func TestCreateVersionRequiresEnvironment(t *testing.T) {
 	handler, stub := newTestServer(t)
 	stub.view = sampleView()
-	body := `{"title":"T","bindings":[{"sut_id":"1001","environment_id":"1101","code_repository_id":"","page_ids":[],"api_ids":[],"database_ids":[],"accounts":[]}]}`
+	body := `{"title":"T"}`
 	recorder := call(t, handler, http.MethodPost, "/api/versions", body, actor())
-	if recorder.Code != http.StatusCreated {
+	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if stub.lastCommand.Bindings[0].CodeRepositoryID != nil {
-		t.Fatalf("empty repository id was not treated as unset")
+	if recorder := call(t, handler, http.MethodPost, "/api/versions", `{"title":"T","environment_id":"0"}`, actor()); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("zero environment status = %d", recorder.Code)
 	}
 }
 
@@ -344,13 +311,9 @@ func TestCreateVersionValidationErrors(t *testing.T) {
 			body  string
 			field string
 		}{
-			{`{"title":"T","bindings":[{"sut_id":"abc","environment_id":"1"}]}`, "bindings[0].sut_id"},
-			{`{"title":"T","bindings":[{"sut_id":"1","environment_id":"0"}]}`, "bindings[0].environment_id"},
-			{`{"title":"T","bindings":[{"sut_id":"1","environment_id":"1","page_ids":["nope"]}]}`, "bindings[0].page_ids[0]"},
-			{`{"title":"T","bindings":[{"sut_id":"1","environment_id":"1","api_ids":["nope"]}]}`, "bindings[0].api_ids[0]"},
-			{`{"title":"T","bindings":[{"sut_id":"1","environment_id":"1","database_ids":["nope"]}]}`, "bindings[0].database_ids[0]"},
-			{`{"title":"T","bindings":[{"sut_id":"1","environment_id":"1","accounts":[{"account_id":"nope"}]}]}`, "bindings[0].accounts[0].account_id"},
-			{`{"title":"T","bindings":[{"sut_id":"1","environment_id":"1","code_repository_id":"nope"}]}`, "bindings[0].code_repository_id"},
+			{`{"title":"T","environment_id":"abc"}`, "environment_id"},
+			{`{"title":"T","environment_id":"0"}`, "environment_id"},
+			{`{"title":"T"}`, "environment_id"},
 		}
 		for _, tc := range cases {
 			stub.calls = nil
@@ -367,7 +330,7 @@ func TestCreateVersionValidationErrors(t *testing.T) {
 		}
 	})
 	t.Run("missing actor", func(t *testing.T) {
-		recorder := call(t, handler, http.MethodPost, "/api/versions", `{"title":"T","bindings":[]}`, nil)
+		recorder := call(t, handler, http.MethodPost, "/api/versions", `{"title":"T","environment_id":"1101"}`, nil)
 		if recorder.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d", recorder.Code)
 		}
@@ -379,15 +342,14 @@ func TestCreateVersionSurfacesServiceValidationDetails(t *testing.T) {
 		name  string
 		field string
 	}{
-		{"cross sut page", "bindings[0].page_ids"},
-		{"duplicate sut", "bindings[1].sut_id"},
-		{"invalid repository", "bindings[0].code_repository_id"},
+		{"unknown environment", "environment_id"},
+		{"unknown sut", "environment_id"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			handler, stub := newTestServer(t)
 			stub.err = platform.Invalid(tc.field, "invalid binding")
-			recorder := call(t, handler, http.MethodPost, "/api/versions", `{"title":"T","bindings":[]}`, actor())
+			recorder := call(t, handler, http.MethodPost, "/api/versions", `{"title":"T","environment_id":"1101"}`, actor())
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 			}

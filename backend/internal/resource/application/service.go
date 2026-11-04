@@ -186,7 +186,9 @@ type DatabasePatch struct {
 	Status   *string
 }
 
-// AccountInput is the editable payload for creating a test account.
+// AccountInput is the editable payload for creating a test account. EnvironmentID
+// is retained for the legacy SUT-scoped HTTP route but is ignored: the v0.22
+// test-account pool is global (DB-15).
 type AccountInput struct {
 	EnvironmentID int64
 	Username      string
@@ -194,6 +196,13 @@ type AccountInput struct {
 	Roles         []string
 	Notes         string
 	Status        string
+}
+
+// SUTRepositoryInput is the payload for associating one global code repository
+// with a SUT (v0.22 API-17).
+type SUTRepositoryInput struct {
+	RepositoryID int64
+	Role         string
 }
 
 // AccountPatch is a partial test-account update; a nil Password keeps the
@@ -478,7 +487,7 @@ func (s *Service) environmentView(ctx context.Context, environment resource.Envi
 	if err != nil {
 		return EnvironmentView{}, err
 	}
-	accounts, err := s.repo.ListAccounts(ctx, environment.SUTID)
+	accounts, err := s.repo.ListAccounts(ctx)
 	if err != nil {
 		return EnvironmentView{}, err
 	}
@@ -1316,17 +1325,12 @@ func (s *Service) GetDatabase(ctx context.Context, id int64) (DatabaseView, erro
 	return toDatabaseView(database), nil
 }
 
-// CreateAccount stores a test account under a SUT environment.
+// CreateAccount stores a test account in the global pool. The legacy sutID
+// argument only scopes the HTTP route: the account row itself has no SUT or
+// environment ownership (v0.22 DB-15).
 func (s *Service) CreateAccount(ctx context.Context, sutID int64, input AccountInput, actorID int64) (AccountView, error) {
 	if _, err := s.repo.GetSUT(ctx, sutID); err != nil {
 		return AccountView{}, mapRepoError(err, "sut", "")
-	}
-	environment, err := s.repo.GetEnvironment(ctx, input.EnvironmentID)
-	if err != nil {
-		return AccountView{}, mapRepoError(err, "environment", "")
-	}
-	if environment.SUTID != sutID {
-		return AccountView{}, platform.Invalid("environment_id", "environment does not belong to the SUT")
 	}
 	roles := input.Roles
 	if roles == nil {
@@ -1334,15 +1338,13 @@ func (s *Service) CreateAccount(ctx context.Context, sutID int64, input AccountI
 	}
 	at := s.clock.Now()
 	account := resource.TestAccount{
-		SUTID:         sutID,
-		EnvironmentID: environment.ID,
-		Username:      input.Username,
-		Password:      input.Password,
-		Roles:         roles,
-		Notes:         input.Notes,
-		Status:        defaultStatus(input.Status),
-		CreatedAt:     at,
-		UpdatedAt:     at,
+		Username:  input.Username,
+		Password:  input.Password,
+		Roles:     roles,
+		Notes:     input.Notes,
+		Status:    defaultStatus(input.Status),
+		CreatedAt: at,
+		UpdatedAt: at,
 	}
 	if err := account.Validate(); err != nil {
 		return AccountView{}, err
@@ -1350,12 +1352,10 @@ func (s *Service) CreateAccount(ctx context.Context, sutID int64, input AccountI
 	account.ID = s.ids.Next()
 	created, err := s.repo.CreateAccount(ctx, account)
 	if err != nil {
-		return AccountView{}, mapRepoError(err, "account", "account username already exists in this environment")
+		return AccountView{}, mapRepoError(err, "account", "account username already exists")
 	}
 	s.record(ctx, actorID, "resource.account.created", "account", platformid.Format(created.ID), map[string]any{
-		"sut_id":         platformid.Format(created.SUTID),
-		"environment_id": platformid.Format(created.EnvironmentID),
-		"username":       created.Username,
+		"username": created.Username,
 	})
 	return toAccountView(created), nil
 }
@@ -1389,17 +1389,15 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 	}
 	updated, err := s.repo.UpdateAccount(ctx, account)
 	if err != nil {
-		return AccountView{}, mapRepoError(err, "account", "account username already exists in this environment")
+		return AccountView{}, mapRepoError(err, "account", "account username already exists")
 	}
 	s.record(ctx, actorID, "resource.account.updated", "account", platformid.Format(updated.ID), map[string]any{
-		"sut_id":         platformid.Format(updated.SUTID),
-		"environment_id": platformid.Format(updated.EnvironmentID),
-		"username":       updated.Username,
+		"username": updated.Username,
 	})
 	// Only roles removed by the edit invalidate knowledge: a login recipe is
 	// bound to the account_role, and a newly added role has no knowledge yet.
-	// The account's system/environment IDs did not change, so they are omitted
-	// to keep the invalidation scoped to the removed roles.
+	// The account is global and has no system/environment binding, so those
+	// dimensions are omitted to keep the invalidation scoped to the roles.
 	if removed := removedStrings(previousRoles, updated.Roles); len(removed) > 0 {
 		s.invalidateKnowledge(ctx, KnowledgeBindingChange{
 			AccountRoles: removed,
@@ -1433,12 +1431,18 @@ func (s *Service) DeleteAccount(ctx context.Context, id int64, actorID int64) er
 	return nil
 }
 
-// ListAccounts returns every test account of a SUT.
+// ListAccounts returns the global test-account pool. The sutID argument scopes
+// the legacy HTTP route only; the account pool is not SUT-owned (DB-15).
 func (s *Service) ListAccounts(ctx context.Context, sutID int64) ([]AccountView, error) {
 	if _, err := s.repo.GetSUT(ctx, sutID); err != nil {
 		return nil, mapRepoError(err, "sut", "")
 	}
-	accounts, err := s.repo.ListAccounts(ctx, sutID)
+	return s.ListAllAccounts(ctx)
+}
+
+// ListAllAccounts returns the global test-account pool ordered by ID.
+func (s *Service) ListAllAccounts(ctx context.Context) ([]AccountView, error) {
+	accounts, err := s.repo.ListAccounts(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1603,6 +1607,66 @@ func (s *Service) GetRepository(ctx context.Context, id int64) (CodeRepositoryVi
 		return CodeRepositoryView{}, mapRepoError(err, "code repository", "")
 	}
 	return toCodeRepositoryView(repository), nil
+}
+
+// ListSUTRepositories returns the SUT-level repositories in deterministic
+// repository-ID order (v0.22 R-C2/API-17).
+func (s *Service) ListSUTRepositories(ctx context.Context, sutID int64) ([]SUTRepositoryView, error) {
+	if _, err := s.repo.GetSUT(ctx, sutID); err != nil {
+		return nil, mapRepoError(err, "sut", "")
+	}
+	associations, err := s.repo.ListSUTRepositories(ctx, sutID)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]SUTRepositoryView, 0, len(associations))
+	for _, association := range associations {
+		repository, err := s.repo.GetRepository(ctx, association.RepoID)
+		if err != nil {
+			return nil, mapRepoError(err, "code repository", "")
+		}
+		views = append(views, toSUTRepositoryView(association, repository))
+	}
+	return views, nil
+}
+
+// AddSUTRepository associates one global code repository with a SUT. The
+// (sut_id, repo_id) natural key is unique; an unknown repository is a 404.
+func (s *Service) AddSUTRepository(ctx context.Context, sutID int64, input SUTRepositoryInput, actorID int64) (SUTRepositoryView, error) {
+	if _, err := s.repo.GetSUT(ctx, sutID); err != nil {
+		return SUTRepositoryView{}, mapRepoError(err, "sut", "")
+	}
+	if input.RepositoryID <= 0 {
+		return SUTRepositoryView{}, platform.Invalid("repository_id", "must be a positive decimal ID")
+	}
+	repository, err := s.repo.GetRepository(ctx, input.RepositoryID)
+	if err != nil {
+		return SUTRepositoryView{}, mapRepoError(err, "code repository", "")
+	}
+	at := s.clock.Now()
+	association := resource.SUTRepository{
+		ID:        s.ids.Next(),
+		SUTID:     sutID,
+		RepoID:    input.RepositoryID,
+		Role:      strings.TrimSpace(input.Role),
+		Enabled:   true,
+		CreatedAt: at,
+		UpdatedAt: at,
+	}
+	if err := association.Validate(); err != nil {
+		return SUTRepositoryView{}, err
+	}
+	created, err := s.repo.CreateSUTRepository(ctx, association)
+	if err != nil {
+		return SUTRepositoryView{}, mapRepoError(err, "sut repository", "repository is already associated with this sut")
+	}
+	s.record(ctx, actorID, "resource.sut_repository.created", "sut_repository",
+		platformid.Format(created.ID), map[string]any{
+			"sut_id":  platformid.Format(created.SUTID),
+			"repo_id": platformid.Format(created.RepoID),
+			"role":    created.Role,
+		})
+	return toSUTRepositoryView(created, repository), nil
 }
 
 // Catalog returns every SUT with its full nested resource tree, ordered by SUT
@@ -1799,9 +1863,7 @@ func toEnvironmentView(
 		}
 	}
 	for _, account := range accounts {
-		if account.EnvironmentID == environment.ID {
-			view.Accounts = append(view.Accounts, toAccountView(account))
-		}
+		view.Accounts = append(view.Accounts, toAccountView(account))
 	}
 	return view
 }
@@ -1863,16 +1925,26 @@ func toAccountView(account resource.TestAccount) AccountView {
 		roles = []string{}
 	}
 	return AccountView{
-		ID:            platformid.Format(account.ID),
-		SUTID:         platformid.Format(account.SUTID),
-		EnvironmentID: platformid.Format(account.EnvironmentID),
-		Username:      account.Username,
-		Roles:         roles,
-		Notes:         account.Notes,
-		Status:        account.Status,
-		PasswordSet:   account.Password != "",
-		CreatedAt:     account.CreatedAt,
-		UpdatedAt:     account.UpdatedAt,
+		ID:          platformid.Format(account.ID),
+		Username:    account.Username,
+		Roles:       roles,
+		Notes:       account.Notes,
+		Status:      account.Status,
+		PasswordSet: account.Password != "",
+		CreatedAt:   account.CreatedAt,
+		UpdatedAt:   account.UpdatedAt,
+	}
+}
+
+func toSUTRepositoryView(item resource.SUTRepository, repository resource.CodeRepository) SUTRepositoryView {
+	return SUTRepositoryView{
+		ID:         platformid.Format(item.ID),
+		SUTID:      platformid.Format(item.SUTID),
+		Repository: toCodeRepositoryView(repository),
+		Role:       item.Role,
+		Enabled:    item.Enabled,
+		CreatedAt:  item.CreatedAt,
+		UpdatedAt:  item.UpdatedAt,
 	}
 }
 

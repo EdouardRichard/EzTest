@@ -162,9 +162,9 @@ func TestBriefingReaderSQL(t *testing.T) {
 // production plan read: loadBriefingPlan must SELECT the stored revision and
 // scan it into the snapshot, because the Host consumes it to guard plan.update
 // instead of guessing it and absorbing a conflict. The function is called
-// directly (not through Load) because the sibling knowledge read still binds
-// the 0.2.1 version_sut columns; that known H1 breakage is Task 29, not this
-// read. A row written without a revision keeps the migration default 1.
+// directly so the test stays focused on the plan read (Task 29 updated the
+// sibling knowledge read to the v0.22 version_sut.scope_exclude shape). A row
+// written without a revision keeps the migration default 1.
 func TestLoadBriefingPlanSQLRevision(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ctx := context.Background()
@@ -488,16 +488,19 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 		VALUES (7201, 7001, 7101, 'Checkout', 'https://shop.test/checkout', '/checkout')`)
 	exec(`INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name)
 		VALUES (7301, 7001, 7101, 'POST', '/api/checkout', 'Checkout API')`)
-	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id, scope)
-		VALUES (7401, 9001, 7001, 7101, '{"pages":[7201],"apis":[7301]}'::jsonb)`)
-	exec(`INSERT INTO version_sut_resource (id, version_sut_id, kind, resource_id, role)
-		VALUES (7501, 7401, 'account', 7601, 'buyer')`)
+	// v0.22 binding shape: version_sut carries the environment exclusions
+	// (empty = whole environment) and accounts are the enabled rows of the
+	// global test-account pool.
+	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id)
+		VALUES (7401, 9001, 7001, 7101)`)
 
 	// Credentials in sibling resource tables must never reach the briefing.
 	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, password)
 		VALUES (7801, 7001, 7101, 'main', 'postgres://user:secret@db/test', 'user', 'db-password')`)
-	exec(`INSERT INTO test_account (id, sut_id, environment_id, username, password)
-		VALUES (7601, 7001, 7101, 'buyer', 'hunter2')`)
+	exec(`INSERT INTO test_account (id, username, password, roles)
+		VALUES (7601, 'buyer', 'hunter2', '["buyer"]'::jsonb)`)
+	exec(`INSERT INTO version_account (id, version_id, account_id, enabled)
+		VALUES (7501, 9001, 7601, true)`)
 
 	requirements := []struct {
 		id, currentID int64

@@ -78,6 +78,7 @@ type fakeRepo struct {
 	databases    []resource.TargetDatabase
 	accounts     []resource.TestAccount
 	repositories []resource.CodeRepository
+	sutRepos     []resource.SUTRepository
 
 	lastSUTLimit    int
 	lastSUTBefore   *int64
@@ -153,7 +154,7 @@ func (f *fakeRepo) deleteBySUT(id int64) {
 	f.pages = filterSlice(f.pages, func(item resource.Page) bool { return item.SUTID != id })
 	f.apis = filterSlice(f.apis, func(item resource.API) bool { return item.SUTID != id })
 	f.databases = filterSlice(f.databases, func(item resource.TargetDatabase) bool { return item.SUTID != id })
-	f.accounts = filterSlice(f.accounts, func(item resource.TestAccount) bool { return item.SUTID != id })
+	f.sutRepos = filterSlice(f.sutRepos, func(item resource.SUTRepository) bool { return item.SUTID != id })
 }
 
 func (f *fakeRepo) ListEnvironments(_ context.Context, sutID int64) ([]resource.Environment, error) {
@@ -209,7 +210,6 @@ func (f *fakeRepo) DeleteEnvironment(_ context.Context, id int64) error {
 			f.pages = filterSlice(f.pages, func(page resource.Page) bool { return page.EnvironmentID != id })
 			f.apis = filterSlice(f.apis, func(api resource.API) bool { return api.EnvironmentID != id })
 			f.databases = filterSlice(f.databases, func(db resource.TargetDatabase) bool { return db.EnvironmentID != id })
-			f.accounts = filterSlice(f.accounts, func(account resource.TestAccount) bool { return account.EnvironmentID != id })
 			return nil
 		}
 	}
@@ -397,13 +397,8 @@ func (f *fakeRepo) DeleteDatabase(_ context.Context, id int64) error {
 	return resource.ErrNotFound
 }
 
-func (f *fakeRepo) ListAccounts(_ context.Context, sutID int64) ([]resource.TestAccount, error) {
-	out := make([]resource.TestAccount, 0)
-	for _, item := range f.accounts {
-		if item.SUTID == sutID {
-			out = append(out, item)
-		}
-	}
+func (f *fakeRepo) ListAccounts(_ context.Context) ([]resource.TestAccount, error) {
+	out := append([]resource.TestAccount(nil), f.accounts...)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
@@ -419,7 +414,7 @@ func (f *fakeRepo) GetAccount(_ context.Context, id int64) (resource.TestAccount
 
 func (f *fakeRepo) CreateAccount(_ context.Context, account resource.TestAccount) (resource.TestAccount, error) {
 	for _, item := range f.accounts {
-		if item.EnvironmentID == account.EnvironmentID && strings.EqualFold(item.Username, account.Username) {
+		if strings.EqualFold(item.Username, account.Username) {
 			return resource.TestAccount{}, resource.ErrDuplicate
 		}
 	}
@@ -433,7 +428,7 @@ func (f *fakeRepo) UpdateAccount(_ context.Context, account resource.TestAccount
 			continue
 		}
 		for _, other := range f.accounts {
-			if other.ID != account.ID && other.EnvironmentID == account.EnvironmentID && strings.EqualFold(other.Username, account.Username) {
+			if other.ID != account.ID && strings.EqualFold(other.Username, account.Username) {
 				return resource.TestAccount{}, resource.ErrDuplicate
 			}
 		}
@@ -447,6 +442,42 @@ func (f *fakeRepo) DeleteAccount(_ context.Context, id int64) error {
 	for i, item := range f.accounts {
 		if item.ID == id {
 			f.accounts = append(f.accounts[:i], f.accounts[i+1:]...)
+			return nil
+		}
+	}
+	return resource.ErrNotFound
+}
+
+func (f *fakeRepo) ListSUTRepositories(_ context.Context, sutID int64) ([]resource.SUTRepository, error) {
+	out := make([]resource.SUTRepository, 0)
+	for _, item := range f.sutRepos {
+		if item.SUTID == sutID {
+			out = append(out, item)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RepoID != out[j].RepoID {
+			return out[i].RepoID < out[j].RepoID
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (f *fakeRepo) CreateSUTRepository(_ context.Context, repository resource.SUTRepository) (resource.SUTRepository, error) {
+	for _, item := range f.sutRepos {
+		if item.SUTID == repository.SUTID && item.RepoID == repository.RepoID {
+			return resource.SUTRepository{}, resource.ErrDuplicate
+		}
+	}
+	f.sutRepos = append(f.sutRepos, repository)
+	return repository, nil
+}
+
+func (f *fakeRepo) DeleteSUTRepository(_ context.Context, id int64) error {
+	for i, item := range f.sutRepos {
+		if item.ID == id {
+			f.sutRepos = append(f.sutRepos[:i], f.sutRepos[i+1:]...)
 			return nil
 		}
 	}
@@ -553,11 +584,7 @@ func (f *fakeRepo) graph(sut resource.SUT) resource.SUTGraph {
 			graph.Databases = append(graph.Databases, db)
 		}
 	}
-	for _, account := range f.accounts {
-		if account.SUTID == sut.ID {
-			graph.Accounts = append(graph.Accounts, account)
-		}
-	}
+	graph.Accounts = append(graph.Accounts, f.accounts...)
 	return graph
 }
 
@@ -1609,12 +1636,12 @@ func TestDatabaseDefaultsAndEnvironmentOwnership(t *testing.T) {
 	if apiErr.Details["field"] != "environment_id" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
-	_, err = h.svc.CreateAccount(context.Background(), 1001, AccountInput{
+	// Accounts are a global pool (DB-15): the legacy environmentID field is
+	// ignored and the account is created regardless of the SUT/environment pair.
+	if _, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
 		EnvironmentID: otherEnvID, Username: "cross-sut", Password: "x",
-	}, 42)
-	apiErr = assertAPIError(t, err, 400, "invalid_argument")
-	if apiErr.Details["field"] != "environment_id" {
-		t.Fatalf("details = %#v", apiErr.Details)
+	}, 42); err != nil {
+		t.Fatalf("global account creation rejected: %v", err)
 	}
 }
 

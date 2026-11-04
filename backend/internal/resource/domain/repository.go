@@ -55,11 +55,16 @@ type Repository interface {
 	UpdateDatabase(ctx context.Context, database TargetDatabase) (TargetDatabase, error)
 	DeleteDatabase(ctx context.Context, id int64) error
 
-	ListAccounts(ctx context.Context, sutID int64) ([]TestAccount, error)
+	ListAccounts(ctx context.Context) ([]TestAccount, error)
 	GetAccount(ctx context.Context, id int64) (TestAccount, error)
 	CreateAccount(ctx context.Context, account TestAccount) (TestAccount, error)
 	UpdateAccount(ctx context.Context, account TestAccount) (TestAccount, error)
 	DeleteAccount(ctx context.Context, id int64) error
+
+	// SUT repositories are the SUT-level multi-repository associations (DB-12).
+	ListSUTRepositories(ctx context.Context, sutID int64) ([]SUTRepository, error)
+	CreateSUTRepository(ctx context.Context, repository SUTRepository) (SUTRepository, error)
+	DeleteSUTRepository(ctx context.Context, id int64) error
 
 	ListRepositories(ctx context.Context, limit int, beforeID *int64) ([]CodeRepository, error)
 	GetRepository(ctx context.Context, id int64) (CodeRepository, error)

@@ -54,7 +54,7 @@ func (r *Repository) VersionContext(ctx context.Context, versionID int64) (desig
 	view.DBTOSUT = map[int64]int64{}
 
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, scope
+		SELECT id
 		FROM version_sut
 		WHERE version_id = $1 AND status = 'active'
 		ORDER BY id
@@ -65,26 +65,9 @@ func (r *Repository) VersionContext(ctx context.Context, versionID int64) (desig
 	versionSUTIDs := make([]int64, 0)
 	for rows.Next() {
 		var versionSUTID int64
-		var rawScope []byte
-		if err := rows.Scan(&versionSUTID, &rawScope); err != nil {
+		if err := rows.Scan(&versionSUTID); err != nil {
 			rows.Close()
 			return design.VersionContext{}, fmt.Errorf("scan version binding: %w", err)
-		}
-		var scope struct {
-			Pages []int64 `json:"pages"`
-			APIs  []int64 `json:"apis"`
-		}
-		if len(rawScope) > 0 {
-			if err := json.Unmarshal(rawScope, &scope); err != nil {
-				rows.Close()
-				return design.VersionContext{}, fmt.Errorf("decode version binding scope: %w", err)
-			}
-		}
-		for _, pageID := range scope.Pages {
-			view.PageToSUT[pageID] = versionSUTID
-		}
-		for _, apiID := range scope.APIs {
-			view.APIToSUT[apiID] = versionSUTID
 		}
 		versionSUTIDs = append(versionSUTIDs, versionSUTID)
 	}
@@ -94,26 +77,79 @@ func (r *Repository) VersionContext(ctx context.Context, versionID int64) (desig
 	}
 	view.AllowedVersionSUTs = versionSUTIDs
 
-	if len(versionSUTIDs) > 0 {
-		resourceRows, err := r.pool.Query(ctx, `
-			SELECT version_sut_id, resource_id
-			FROM version_sut_resource
-			WHERE version_sut_id = ANY($1) AND kind = 'database' AND selected = true
-		`, versionSUTIDs)
-		if err != nil {
-			return design.VersionContext{}, fmt.Errorf("read version databases: %w", err)
+	// v0.22 DB-11: the version range is the bound environment's approved pages
+	// and APIs minus the version_sut.scope_exclude IDs. Entities proposed by
+	// discovery are not part of the range until approved.
+	pageRows, err := r.pool.Query(ctx, `
+		SELECT vs.id, p.id
+		FROM version_sut vs
+		JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
+		WHERE vs.version_id = $1 AND vs.status = 'active' AND p.status = 'approved'
+		  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
+		ORDER BY p.id
+	`, versionID)
+	if err != nil {
+		return design.VersionContext{}, fmt.Errorf("read version pages: %w", err)
+	}
+	for pageRows.Next() {
+		var versionSUTID, pageID int64
+		if err := pageRows.Scan(&versionSUTID, &pageID); err != nil {
+			pageRows.Close()
+			return design.VersionContext{}, fmt.Errorf("scan version page: %w", err)
 		}
-		defer resourceRows.Close()
-		for resourceRows.Next() {
-			var versionSUTID, databaseID int64
-			if err := resourceRows.Scan(&versionSUTID, &databaseID); err != nil {
-				return design.VersionContext{}, fmt.Errorf("scan version database: %w", err)
-			}
-			view.DBTOSUT[databaseID] = versionSUTID
+		view.PageToSUT[pageID] = versionSUTID
+	}
+	pageRows.Close()
+	if err := pageRows.Err(); err != nil {
+		return design.VersionContext{}, fmt.Errorf("scan version pages: %w", err)
+	}
+
+	apiRows, err := r.pool.Query(ctx, `
+		SELECT vs.id, a.id
+		FROM version_sut vs
+		JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
+		WHERE vs.version_id = $1 AND vs.status = 'active' AND a.status = 'approved'
+		  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
+		ORDER BY a.id
+	`, versionID)
+	if err != nil {
+		return design.VersionContext{}, fmt.Errorf("read version APIs: %w", err)
+	}
+	for apiRows.Next() {
+		var versionSUTID, apiID int64
+		if err := apiRows.Scan(&versionSUTID, &apiID); err != nil {
+			apiRows.Close()
+			return design.VersionContext{}, fmt.Errorf("scan version API: %w", err)
 		}
-		if err := resourceRows.Err(); err != nil {
-			return design.VersionContext{}, fmt.Errorf("scan version databases: %w", err)
+		view.APIToSUT[apiID] = versionSUTID
+	}
+	apiRows.Close()
+	if err := apiRows.Err(); err != nil {
+		return design.VersionContext{}, fmt.Errorf("scan version APIs: %w", err)
+	}
+
+	databaseRows, err := r.pool.Query(ctx, `
+		SELECT vs.id, d.id
+		FROM version_sut vs
+		JOIN target_database d ON d.sut_id = vs.sut_id AND d.environment_id = vs.environment_id
+		WHERE vs.version_id = $1 AND vs.status = 'active' AND d.status = 'active'
+		  AND NOT (vs.scope_exclude -> 'databases' @> to_jsonb(d.id))
+		ORDER BY d.id
+	`, versionID)
+	if err != nil {
+		return design.VersionContext{}, fmt.Errorf("read version databases: %w", err)
+	}
+	for databaseRows.Next() {
+		var versionSUTID, databaseID int64
+		if err := databaseRows.Scan(&versionSUTID, &databaseID); err != nil {
+			databaseRows.Close()
+			return design.VersionContext{}, fmt.Errorf("scan version database: %w", err)
 		}
+		view.DBTOSUT[databaseID] = versionSUTID
+	}
+	databaseRows.Close()
+	if err := databaseRows.Err(); err != nil {
+		return design.VersionContext{}, fmt.Errorf("scan version databases: %w", err)
 	}
 	return view, nil
 }

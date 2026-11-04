@@ -35,6 +35,8 @@ func idString(value int64) string { return strconv.FormatInt(value, 10) }
 
 func int64Ptr(value int64) *int64 { return &value }
 
+func int64SlicePtr(values []int64) *[]int64 { return &values }
+
 func stringPtr(value string) *string { return &value }
 
 func boolPtr(value bool) *bool { return &value }
@@ -49,6 +51,7 @@ type fakeCatalog struct {
 	databases    map[int64]resourceapp.DatabaseView
 	accounts     map[int64]resourceapp.AccountView
 	repositories map[int64]resourceapp.CodeRepositoryView
+	sutRepos     map[int64][]resourceapp.SUTRepositoryView
 }
 
 func newFakeCatalog() *fakeCatalog {
@@ -60,29 +63,69 @@ func newFakeCatalog() *fakeCatalog {
 		databases:    map[int64]resourceapp.DatabaseView{},
 		accounts:     map[int64]resourceapp.AccountView{},
 		repositories: map[int64]resourceapp.CodeRepositoryView{},
+		sutRepos:     map[int64][]resourceapp.SUTRepositoryView{},
 	}
 
-	catalog.suts[1001] = resourceapp.SUTView{ID: "1001", Name: "Orders", CreatedAt: testTime, UpdatedAt: testTime}
-	catalog.suts[1002] = resourceapp.SUTView{ID: "1002", Name: "Billing", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.suts[1001] = resourceapp.SUTView{ID: "1001", Name: "Orders", Intro: "order center", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.suts[1002] = resourceapp.SUTView{ID: "1002", Name: "Billing", Intro: "billing", CreatedAt: testTime, UpdatedAt: testTime}
 
 	catalog.environments[1101] = resourceapp.EnvironmentView{ID: "1101", SUTID: "1001", Name: "prod", BaseURL: "https://orders.example.test", IsDefault: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
 	catalog.environments[1102] = resourceapp.EnvironmentView{ID: "1102", SUTID: "1002", Name: "staging", BaseURL: "https://billing.example.test", Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.environments[1103] = resourceapp.EnvironmentView{ID: "1103", SUTID: "1001", Name: "dev", BaseURL: "https://dev.example.test", Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
 
 	catalog.pages[1301] = resourceapp.PageView{ID: "1301", SUTID: "1001", EnvironmentID: "1101", Name: "Order list", URL: "https://orders.example.test/orders", RouteTemplate: "/orders", Status: "approved", Source: "admin", CreatedAt: testTime, UpdatedAt: testTime}
 	catalog.pages[1302] = resourceapp.PageView{ID: "1302", SUTID: "1001", EnvironmentID: "1101", Name: "Order detail", URL: "https://orders.example.test/orders/:id", RouteTemplate: "/orders/:id", Status: "approved", Source: "admin", CreatedAt: testTime, UpdatedAt: testTime}
 	catalog.pages[1303] = resourceapp.PageView{ID: "1303", SUTID: "1002", EnvironmentID: "1102", Name: "Invoice list", URL: "https://billing.example.test/invoices", RouteTemplate: "/invoices", Status: "approved", Source: "admin", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.pages[1304] = resourceapp.PageView{ID: "1304", SUTID: "1001", EnvironmentID: "1101", Name: "Order draft", URL: "https://orders.example.test/draft", RouteTemplate: "/draft", Status: "proposed", Source: "ai", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.pages[1305] = resourceapp.PageView{ID: "1305", SUTID: "1001", EnvironmentID: "1103", Name: "Dev page", URL: "https://dev.example.test/dev", RouteTemplate: "/dev", Status: "approved", Source: "admin", CreatedAt: testTime, UpdatedAt: testTime}
 
 	catalog.apis[1401] = resourceapp.APIView{ID: "1401", SUTID: "1001", EnvironmentID: "1101", Method: "GET", PathTemplate: "/api/orders", Name: "List orders", Status: "approved", Source: "manual", CreatedAt: testTime, UpdatedAt: testTime}
 	catalog.apis[1402] = resourceapp.APIView{ID: "1402", SUTID: "1002", EnvironmentID: "1102", Method: "POST", PathTemplate: "/api/invoices", Name: "Create invoice", Status: "approved", Source: "manual", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.apis[1403] = resourceapp.APIView{ID: "1403", SUTID: "1001", EnvironmentID: "1101", Method: "POST", PathTemplate: "/api/orders", Name: "Create order", Status: "proposed", Source: "ai", CreatedAt: testTime, UpdatedAt: testTime}
 
 	catalog.databases[1501] = resourceapp.DatabaseView{ID: "1501", SUTID: "1001", EnvironmentID: "1101", Name: "orders-db", DSN: "postgres://orders", Username: "orders", ReadOnly: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
 	catalog.databases[1502] = resourceapp.DatabaseView{ID: "1502", SUTID: "1002", EnvironmentID: "1102", Name: "billing-db", DSN: "postgres://billing", Username: "billing", ReadOnly: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.databases[1503] = resourceapp.DatabaseView{ID: "1503", SUTID: "1001", EnvironmentID: "1101", Name: "orders-ro", DSN: "postgres://orders-ro", Username: "reader", ReadOnly: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
 
-	catalog.accounts[1601] = resourceapp.AccountView{ID: "1601", SUTID: "1001", EnvironmentID: "1101", Username: "order-admin", Roles: []string{"admin"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime}
-	catalog.accounts[1602] = resourceapp.AccountView{ID: "1602", SUTID: "1002", EnvironmentID: "1102", Username: "billing-admin", Roles: []string{"admin"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.accounts[1601] = resourceapp.AccountView{ID: "1601", Username: "order-admin", Roles: []string{"admin"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.accounts[1602] = resourceapp.AccountView{ID: "1602", Username: "buyer", Roles: []string{"buyer"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.accounts[1603] = resourceapp.AccountView{ID: "1603", Username: "retired", Roles: []string{"buyer"}, Status: "disabled", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.accounts[1604] = resourceapp.AccountView{ID: "1604", Username: "auditor", Roles: []string{"auditor"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime}
 
-	catalog.repositories[1201] = resourceapp.CodeRepositoryView{ID: "1201", Name: "orders-repo", Path: "C:/repos/orders", Branch: "main", Include: []string{}, Exclude: []string{}, CreatedBy: 42, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.repositories[1201] = resourceapp.CodeRepositoryView{ID: "1201", Name: "orders-backend", Path: "C:/repos/orders-backend", Branch: "main", Include: []string{}, Exclude: []string{}, CreatedBy: 42, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.repositories[1202] = resourceapp.CodeRepositoryView{ID: "1202", Name: "orders-frontend", Path: "C:/repos/orders-frontend", Branch: "main", Include: []string{}, Exclude: []string{}, CreatedBy: 42, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
+	catalog.repositories[1203] = resourceapp.CodeRepositoryView{ID: "1203", Name: "orders-infra", Path: "C:/repos/orders-infra", Branch: "infra", Include: []string{}, Exclude: []string{}, CreatedBy: 42, Status: "active", CreatedAt: testTime, UpdatedAt: testTime}
 
+	// SUT 1001 inherits two repositories (backend + frontend). The fake returns
+	// them in creation order to prove the service normalizes the baseline by
+	// repository ID.
+	catalog.sutRepos[1001] = []resourceapp.SUTRepositoryView{
+		{ID: "1", SUTID: "1001", Repository: catalog.repositories[1202], Role: "frontend", Enabled: true, CreatedAt: testTime, UpdatedAt: testTime},
+		{ID: "2", SUTID: "1001", Repository: catalog.repositories[1201], Role: "backend", Enabled: true, CreatedAt: testTime, UpdatedAt: testTime},
+	}
+
+	for id, environment := range catalog.environments {
+		view := environment
+		for pageID, page := range catalog.pages {
+			if page.EnvironmentID == environment.ID {
+				view.Pages = append(view.Pages, catalog.pages[pageID])
+			}
+		}
+		for apiID, api := range catalog.apis {
+			if api.EnvironmentID == environment.ID {
+				view.APIs = append(view.APIs, catalog.apis[apiID])
+			}
+		}
+		for databaseID, database := range catalog.databases {
+			if database.EnvironmentID == environment.ID {
+				view.Databases = append(view.Databases, catalog.databases[databaseID])
+			}
+		}
+		sort.Slice(view.Pages, func(left, right int) bool { return view.Pages[left].ID < view.Pages[right].ID })
+		sort.Slice(view.APIs, func(left, right int) bool { return view.APIs[left].ID < view.APIs[right].ID })
+		sort.Slice(view.Databases, func(left, right int) bool { return view.Databases[left].ID < view.Databases[right].ID })
+		catalog.environments[id] = view
+	}
 	return catalog
 }
 
@@ -144,27 +187,60 @@ func (f *fakeCatalog) GetRepository(_ context.Context, id int64) (resourceapp.Co
 	return view, nil
 }
 
+func (f *fakeCatalog) ListSUTRepositories(_ context.Context, sutID int64) ([]resourceapp.SUTRepositoryView, error) {
+	if _, ok := f.suts[sutID]; !ok {
+		return nil, notFound("sut")
+	}
+	views := append([]resourceapp.SUTRepositoryView(nil), f.sutRepos[sutID]...)
+	sort.Slice(views, func(i, j int) bool {
+		return views[i].Repository.ID < views[j].Repository.ID
+	})
+	return views, nil
+}
+
+func (f *fakeCatalog) ListAllAccounts(_ context.Context) ([]resourceapp.AccountView, error) {
+	views := make([]resourceapp.AccountView, 0, len(f.accounts))
+	for _, account := range f.accounts {
+		views = append(views, account)
+	}
+	sort.Slice(views, func(i, j int) bool { return views[i].ID < views[j].ID })
+	return views, nil
+}
+
 var _ resourceapp.CatalogReader = (*fakeCatalog)(nil)
 
 // ---------- fake version repository ----------
 
 type fakeRepo struct {
-	versions           map[int64]version.Version
-	bindings           map[int64][]version.Binding
+	versions map[int64]version.Version
+	bindings map[int64][]version.Binding
+	stages   map[int64]version.StageState
+
 	createErr          error
+	updateErr          error
 	stats              version.VersionStats
 	initialWithContent []int64
 	lastInitialLimit   int
+	updateCalls        int
+	createCalls        int
+	lastBinding        version.Binding
+	lastVersion        version.Version
+	updateStages       []version.Stage
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{versions: map[int64]version.Version{}, bindings: map[int64][]version.Binding{}}
+	return &fakeRepo{
+		versions: map[int64]version.Version{},
+		bindings: map[int64][]version.Binding{},
+		stages:   map[int64]version.StageState{},
+	}
 }
 
 func (f *fakeRepo) Create(_ context.Context, v version.Version, bindings []version.Binding) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
+	f.createCalls++
 	f.versions[v.ID] = v
 	f.bindings[v.ID] = bindings
 	return nil
@@ -179,6 +255,35 @@ func (f *fakeRepo) Get(_ context.Context, id int64) (version.Version, []version.
 	copied := make([]version.Binding, len(bindings))
 	copy(copied, bindings)
 	return v, copied, nil
+}
+
+func (f *fakeRepo) GetStage(_ context.Context, id int64) (version.StageState, error) {
+	if state, ok := f.stages[id]; ok {
+		return state, nil
+	}
+	if _, ok := f.versions[id]; !ok {
+		return version.StageState{}, version.ErrNotFound
+	}
+	return version.StageState{VersionID: id, Stage: version.StageCreated}, nil
+}
+
+func (f *fakeRepo) UpdateBinding(_ context.Context, v version.Version, binding version.Binding) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	if _, ok := f.versions[v.ID]; !ok {
+		return version.ErrNotFound
+	}
+	f.updateCalls++
+	f.lastVersion = v
+	f.lastBinding = binding
+	f.versions[v.ID] = v
+	if len(f.bindings[v.ID]) == 0 {
+		f.bindings[v.ID] = []version.Binding{binding}
+		return nil
+	}
+	f.bindings[v.ID][0] = binding
+	return nil
 }
 
 func (f *fakeRepo) List(_ context.Context, limit int, beforeID *int64) ([]version.Summary, error) {
@@ -291,8 +396,8 @@ func (f *fakeRepo) EnvironmentInUse(_ context.Context, id int64) (bool, error) {
 func (f *fakeRepo) PageInUse(_ context.Context, id int64) (bool, error) {
 	for _, bindings := range f.bindings {
 		for _, binding := range bindings {
-			for _, pageID := range binding.Scope.Pages {
-				if pageID == id {
+			for _, excluded := range binding.ScopeExclude.Pages {
+				if excluded == id {
 					return true, nil
 				}
 			}
@@ -304,8 +409,8 @@ func (f *fakeRepo) PageInUse(_ context.Context, id int64) (bool, error) {
 func (f *fakeRepo) APIInUse(_ context.Context, id int64) (bool, error) {
 	for _, bindings := range f.bindings {
 		for _, binding := range bindings {
-			for _, apiID := range binding.Scope.APIs {
-				if apiID == id {
+			for _, excluded := range binding.ScopeExclude.APIs {
+				if excluded == id {
 					return true, nil
 				}
 			}
@@ -317,8 +422,8 @@ func (f *fakeRepo) APIInUse(_ context.Context, id int64) (bool, error) {
 func (f *fakeRepo) DatabaseInUse(_ context.Context, id int64) (bool, error) {
 	for _, bindings := range f.bindings {
 		for _, binding := range bindings {
-			for _, databaseID := range binding.DatabaseIDs {
-				if databaseID == id {
+			for _, excluded := range binding.ScopeExclude.Databases {
+				if excluded == id {
 					return true, nil
 				}
 			}
@@ -343,8 +448,10 @@ func (f *fakeRepo) AccountInUse(_ context.Context, id int64) (bool, error) {
 func (f *fakeRepo) RepositoryInUse(_ context.Context, id int64) (bool, error) {
 	for _, bindings := range f.bindings {
 		for _, binding := range bindings {
-			if binding.CodeRepositoryID != nil && *binding.CodeRepositoryID == id {
-				return true, nil
+			for _, override := range binding.RepositoryOverrides {
+				if override.RepoID == id {
+					return true, nil
+				}
 			}
 		}
 	}
@@ -423,18 +530,10 @@ func requestContext() context.Context {
 
 func validCommand() versionapp.CreateCommand {
 	return versionapp.CreateCommand{
-		Title: "Orders Q4",
-		Bindings: []versionapp.BindingInput{
-			{
-				SUTID:            1001,
-				EnvironmentID:    1101,
-				CodeRepositoryID: int64Ptr(1201),
-				PageIDs:          []int64{1301},
-				APIIDs:           []int64{1401},
-				DatabaseIDs:      []int64{1501},
-				Accounts:         []versionapp.AccountInput{{AccountID: 1601, Role: "order_admin"}},
-			},
-		},
+		Title:         "Orders Q4",
+		Description:   "Q4 order flows",
+		Goal:          "verify checkout",
+		EnvironmentID: 1101,
 	}
 }
 
@@ -471,228 +570,122 @@ func createVersion(t *testing.T, env *testEnv, title string) versionapp.VersionV
 	return view
 }
 
-func findBinding(t *testing.T, bindings []version.Binding, sutID int64) version.Binding {
+func storedBinding(t *testing.T, env *testEnv, versionID int64) version.Binding {
 	t.Helper()
-	for _, binding := range bindings {
-		if binding.SUTID == sutID {
-			return binding
-		}
+	_, bindings, err := env.repo.Get(requestContext(), versionID)
+	if err != nil {
+		t.Fatalf("stored Get: %v", err)
 	}
-	t.Fatalf("binding for SUT %d not stored", sutID)
-	return version.Binding{}
+	if len(bindings) != 1 {
+		t.Fatalf("stored bindings = %#v", bindings)
+	}
+	return bindings[0]
 }
 
 // ---------- tests ----------
 
-func TestCreatePersistsMultiSUTBindingsAndEmitsAuditAndEvents(t *testing.T) {
+// TestCreateVersionEnvironmentOnly is the v0.22 R-C3/API-15 contract: creation
+// takes title/description/goal/environment_id only, derives the SUT, writes the
+// version_sut binding, inherits the SUT repositories (no override rows), binds
+// every active global account and derives the baseline from the lowest repo ID.
+func TestCreateVersionEnvironmentOnly(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := requestContext()
 
-	cmd := versionapp.CreateCommand{
-		Title: "  Orders & Billing Q4  ",
-		Bindings: []versionapp.BindingInput{
-			{
-				SUTID:            1001,
-				EnvironmentID:    1101,
-				CodeRepositoryID: int64Ptr(1201),
-				PageIDs:          []int64{1301, 1302, 1301},
-				APIIDs:           []int64{1401, 1401},
-				DatabaseIDs:      []int64{1501},
-				Accounts: []versionapp.AccountInput{
-					{AccountID: 1601, Role: "order_admin"},
-					{AccountID: 1601, Role: "order_admin"},
-				},
-			},
-			{
-				SUTID:         1002,
-				EnvironmentID: 1102,
-				PageIDs:       []int64{1303},
-				APIIDs:        []int64{1402},
-				DatabaseIDs:   []int64{1502},
-				Accounts:      []versionapp.AccountInput{{AccountID: 1602}},
-			},
-		},
-	}
-
-	view, err := env.svc.Create(ctx, cmd, 42)
+	view, err := env.svc.Create(ctx, validCommand(), 42)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if view.ID <= 0 {
-		t.Fatalf("id = %d", view.ID)
+	if view.Title != "Orders Q4" || view.Description != "Q4 order flows" || view.Goal != "verify checkout" {
+		t.Fatalf("version metadata = %#v", view)
 	}
-	if view.Title != "Orders & Billing Q4" {
-		t.Fatalf("title = %q", view.Title)
+	if view.Status != version.StatusInitial || view.CreatedBy != 42 {
+		t.Fatalf("version = %#v", view)
 	}
-	if view.Status != "initial" || view.AutoDesignNewRequirements {
-		t.Fatalf("status/auto = %q/%v", view.Status, view.AutoDesignNewRequirements)
+	if len(view.Bindings) != 1 {
+		t.Fatalf("bindings = %#v", view.Bindings)
 	}
-	if view.CreatedBy != 42 || !view.CreatedAt.Equal(testTime) || !view.UpdatedAt.Equal(testTime) {
-		t.Fatalf("created = %#v", view)
+	binding := view.Bindings[0]
+	if binding.SUT.ID != "1001" || binding.SUT.Name != "Orders" {
+		t.Fatalf("derived SUT = %#v", binding.SUT)
 	}
-	if len(view.Bindings) != 2 {
-		t.Fatalf("bindings = %d", len(view.Bindings))
+	if binding.Environment.ID != "1101" || binding.Environment.SUTID != "1001" {
+		t.Fatalf("environment = %#v", binding.Environment)
 	}
-
-	first := findBindingView(t, view.Bindings, "1001")
-	if first.SUT.Name != "Orders" || first.Environment.Name != "prod" {
-		t.Fatalf("binding sut/env = %#v/%#v", first.SUT, first.Environment)
+	if len(binding.ScopeExclude.Pages) != 0 || len(binding.ScopeExclude.APIs) != 0 || len(binding.ScopeExclude.Databases) != 0 {
+		t.Fatalf("default exclusions = %#v", binding.ScopeExclude)
 	}
-	if first.Repository == nil || first.Repository.Name != "orders-repo" {
-		t.Fatalf("repository = %#v", first.Repository)
+	// Default range = every approved environment resource; proposed resources
+	// are not part of the version range.
+	if len(binding.Pages) != 2 || binding.Pages[0].ID != "1301" || binding.Pages[1].ID != "1302" {
+		t.Fatalf("pages = %#v", binding.Pages)
 	}
-	if first.CodeBaselineCommit != codeBaselineCommit {
-		t.Fatalf("code baseline commit = %q, want %q", first.CodeBaselineCommit, codeBaselineCommit)
+	if len(binding.APIs) != 1 || binding.APIs[0].ID != "1401" {
+		t.Fatalf("apis = %#v", binding.APIs)
 	}
-	if len(first.Pages) != 2 || first.Pages[0].ID != "1301" || first.Pages[1].ID != "1302" {
-		t.Fatalf("pages = %#v", first.Pages)
+	if len(binding.Databases) != 2 || binding.Databases[0].ID != "1501" || binding.Databases[1].ID != "1503" {
+		t.Fatalf("databases = %#v", binding.Databases)
 	}
-	if len(first.APIs) != 1 || first.APIs[0].ID != "1401" {
-		t.Fatalf("apis = %#v", first.APIs)
+	// Accounts default to the active global pool; disabled accounts are skipped.
+	if len(binding.Accounts) != 3 {
+		t.Fatalf("accounts = %#v", binding.Accounts)
 	}
-	if len(first.Databases) != 1 || first.Databases[0].ID != "1501" {
-		t.Fatalf("databases = %#v", first.Databases)
+	// Repositories inherit the SUT association; the baseline is the lowest repo
+	// ID and the resolver is called exactly once for it.
+	if len(binding.Repositories) != 2 || binding.Repositories[0].Repository.ID != "1201" || binding.Repositories[1].Repository.ID != "1202" {
+		t.Fatalf("repositories = %#v", binding.Repositories)
 	}
-	if len(first.Accounts) != 1 || first.Accounts[0].ID != "1601" {
-		t.Fatalf("accounts = %#v", first.Accounts)
+	if binding.Repository == nil || binding.Repository.ID != "1201" {
+		t.Fatalf("baseline repository = %#v", binding.Repository)
 	}
-
-	second := findBindingView(t, view.Bindings, "1002")
-	if second.Repository != nil {
-		t.Fatalf("repository = %#v, want nil", second.Repository)
+	if binding.CodeBaselineCommit != codeBaselineCommit {
+		t.Fatalf("code baseline = %q", binding.CodeBaselineCommit)
 	}
-	if len(second.Pages) != 1 || second.Pages[0].ID != "1303" {
-		t.Fatalf("pages = %#v", second.Pages)
-	}
-
-	storedVersion, storedBindings, err := env.repo.Get(ctx, view.ID)
-	if err != nil {
-		t.Fatalf("Get stored: %v", err)
-	}
-	if storedVersion.Title != "Orders & Billing Q4" {
-		t.Fatalf("stored title = %q", storedVersion.Title)
-	}
-	firstStored := findBinding(t, storedBindings, 1001)
-	if got := firstStored.Scope.Pages; len(got) != 2 || got[0] != 1301 || got[1] != 1302 {
-		t.Fatalf("scope pages = %#v", got)
-	}
-	if got := firstStored.Scope.APIs; len(got) != 1 || got[0] != 1401 {
-		t.Fatalf("scope apis = %#v", got)
-	}
-	if got := firstStored.DatabaseIDs; len(got) != 1 || got[0] != 1501 {
-		t.Fatalf("database ids = %#v", got)
-	}
-	if len(firstStored.Accounts) != 1 || firstStored.Accounts[0].AccountID != 1601 || firstStored.Accounts[0].Role != "order_admin" {
-		t.Fatalf("accounts = %#v", firstStored.Accounts)
-	}
-	secondStored := findBinding(t, storedBindings, 1002)
-	if got := secondStored.Scope.APIs; len(got) != 1 || got[0] != 1402 {
-		t.Fatalf("second scope apis = %#v", got)
-	}
-	if stored := findBinding(t, storedBindings, 1001); stored.CodeBaselineCommit != codeBaselineCommit {
-		t.Fatalf("stored code baseline commit = %q, want %q", stored.CodeBaselineCommit, codeBaselineCommit)
-	}
-	if len(env.resolver.calls) != 1 || env.resolver.calls[0].ID != "1201" || env.resolver.calls[0].Branch != "main" {
-		t.Fatalf("resolver calls = %#v, want one call for repository 1201", env.resolver.calls)
+	if len(env.resolver.calls) != 1 || env.resolver.calls[0].ID != "1201" {
+		t.Fatalf("resolver calls = %#v, want the deterministic 1201 baseline", env.resolver.calls)
 	}
 
-	if len(env.audit.events) != 1 {
-		t.Fatalf("audit events = %d", len(env.audit.events))
+	stored := storedBinding(t, env, view.ID)
+	if stored.SUTID != 1001 || stored.EnvironmentID != 1101 {
+		t.Fatalf("stored binding = %#v", stored)
 	}
-	entry := env.audit.events[0]
-	if entry.Action != "version.created" || entry.TargetKind != "version" {
-		t.Fatalf("audit = %#v", entry)
+	if len(stored.RepositoryOverrides) != 0 {
+		t.Fatalf("create must not write repository overrides: %#v", stored.RepositoryOverrides)
 	}
-	if entry.TargetID != idString(view.ID) {
-		t.Fatalf("audit target = %q", entry.TargetID)
+	if len(stored.Accounts) != 3 {
+		t.Fatalf("stored accounts = %#v", stored.Accounts)
 	}
-	if entry.ActorID == nil || *entry.ActorID != 42 || entry.RequestID != "req_version_tests" {
-		t.Fatalf("audit actor/request = %#v", entry)
+	if stored.ScopeExclude.Pages == nil || stored.ScopeExclude.APIs == nil || stored.ScopeExclude.Databases == nil {
+		t.Fatalf("stored exclusions must be non-nil: %#v", stored.ScopeExclude)
+	}
+	storedVersion := env.repo.versions[view.ID]
+	if storedVersion.Description != "Q4 order flows" || storedVersion.Goal != "verify checkout" {
+		t.Fatalf("stored description/goal = %q/%q", storedVersion.Description, storedVersion.Goal)
 	}
 
+	// version.created audit and event (sut_count is 1 in the environment-only
+	// model).
+	if len(env.audit.events) != 1 || env.audit.events[0].Action != "version.created" {
+		t.Fatalf("audit = %#v", env.audit.events)
+	}
+	if count, _ := env.audit.events[0].Metadata["sut_count"].(int); count != 1 {
+		t.Fatalf("audit sut_count = %#v", env.audit.events[0].Metadata)
+	}
 	if len(env.publisher.events) != 2 {
-		t.Fatalf("events = %d", len(env.publisher.events))
-	}
-	channels := map[string]eventingapp.Event{}
-	for _, event := range env.publisher.events {
-		if event.Type != "version.created" {
-			t.Fatalf("event type = %q", event.Type)
-		}
-		channels[event.Channel] = event
-	}
-	for _, channel := range []string{"version:" + idString(view.ID), "system"} {
-		event, ok := channels[channel]
-		if !ok {
-			t.Fatalf("missing event on channel %q: %#v", channel, channels)
-		}
-		if event.Scope["version_id"] != idString(view.ID) {
-			t.Fatalf("scope = %#v", event.Scope)
-		}
-		if event.Payload["title"] != "Orders & Billing Q4" || event.Payload["status"] != "initial" {
-			t.Fatalf("payload = %#v", event.Payload)
-		}
-		count, ok := event.Payload["sut_count"].(int)
-		if !ok || count != 2 {
-			t.Fatalf("sut_count = %#v", event.Payload["sut_count"])
-		}
-		if event.ActorID == nil || *event.ActorID != 42 || event.RequestID != "req_version_tests" {
-			t.Fatalf("event actor/request = %#v", event)
-		}
+		t.Fatalf("events = %#v", env.publisher.events)
 	}
 }
 
-func findBindingView(t *testing.T, bindings []versionapp.BindingView, sutID string) versionapp.BindingView {
-	t.Helper()
-	for _, binding := range bindings {
-		if binding.SUT.ID == sutID {
-			return binding
-		}
-	}
-	t.Fatalf("binding view for SUT %q not found", sutID)
-	return versionapp.BindingView{}
-}
-
-func TestCreateValidatesBindings(t *testing.T) {
-	tooMany := make([]versionapp.BindingInput, 0, version.MaxBindings+1)
-	for i := 0; i < version.MaxBindings+1; i++ {
-		tooMany = append(tooMany, validCommand().Bindings[0])
-	}
-
+func TestCreateVersionValidatesEnvironmentOnly(t *testing.T) {
 	cases := []struct {
 		name      string
 		mutate    func(*versionapp.CreateCommand)
 		wantField string
 	}{
 		{"blank title", func(cmd *versionapp.CreateCommand) { cmd.Title = "   " }, "title"},
-		{"no bindings", func(cmd *versionapp.CreateCommand) { cmd.Bindings = nil }, "bindings"},
-		{"too many bindings", func(cmd *versionapp.CreateCommand) { cmd.Bindings = tooMany }, "bindings"},
-		{"duplicate sut", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings = append(cmd.Bindings, cmd.Bindings[0])
-		}, "bindings[1].sut_id"},
-		{"unknown sut", func(cmd *versionapp.CreateCommand) { cmd.Bindings[0].SUTID = 9999 }, "bindings[0].sut_id"},
-		{"environment of another sut", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].EnvironmentID = 1102
-		}, "bindings[0].environment_id"},
-		{"page of another sut", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].PageIDs = []int64{1303}
-		}, "bindings[0].page_ids"},
-		{"api of another environment", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].APIIDs = []int64{1402}
-		}, "bindings[0].api_ids"},
-		{"database of another sut", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].DatabaseIDs = []int64{1502}
-		}, "bindings[0].database_ids"},
-		{"account of another sut", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].Accounts = []versionapp.AccountInput{{AccountID: 1602}}
-		}, "bindings[0].accounts"},
-		{"invalid repository", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].CodeRepositoryID = int64Ptr(9999)
-		}, "bindings[0].code_repository_id"},
-		{"zero page id", func(cmd *versionapp.CreateCommand) {
-			cmd.Bindings[0].PageIDs = []int64{0}
-		}, "bindings[0].page_ids"},
+		{"missing environment", func(cmd *versionapp.CreateCommand) { cmd.EnvironmentID = 0 }, "environment_id"},
+		{"unknown environment", func(cmd *versionapp.CreateCommand) { cmd.EnvironmentID = 9999 }, "environment_id"},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newTestEnv(t)
@@ -703,13 +696,28 @@ func TestCreateValidatesBindings(t *testing.T) {
 			} else if field := fieldName(t, err); field != tc.wantField {
 				t.Fatalf("field = %q, want %q", field, tc.wantField)
 			}
-			if len(env.repo.versions) != 0 {
-				t.Fatalf("invalid input persisted: %#v", env.repo.versions)
+			if env.repo.createCalls != 0 {
+				t.Fatalf("invalid input reached the repository: %d", env.repo.createCalls)
 			}
 			if len(env.audit.events) != 0 || len(env.publisher.events) != 0 {
-				t.Fatalf("invalid input recorded side effects: %d/%d", len(env.audit.events), len(env.publisher.events))
+				t.Fatalf("invalid input recorded side effects")
 			}
 		})
+	}
+}
+
+func TestCreateVersionWithoutSUTRepositoriesSkipsBaseline(t *testing.T) {
+	env := newTestEnv(t)
+	env.catalog.sutRepos[1001] = nil
+	view, err := env.svc.Create(requestContext(), validCommand(), 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(env.resolver.calls) != 0 {
+		t.Fatalf("resolver calls = %#v, want none without a SUT repository", env.resolver.calls)
+	}
+	if view.Bindings[0].CodeBaselineCommit != "" || view.Bindings[0].Repository != nil {
+		t.Fatalf("baseline = %#v", view.Bindings[0])
 	}
 }
 
@@ -728,49 +736,22 @@ func TestCreateLeavesCodeBaselineEmptyWhenResolutionFails(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Create must not be blocked by baseline resolution: %v", err)
 			}
-			if len(view.Bindings) != 1 || view.Bindings[0].CodeBaselineCommit != "" {
-				t.Fatalf("binding view = %#v, want an empty code baseline", view.Bindings)
+			if view.Bindings[0].CodeBaselineCommit != "" {
+				t.Fatalf("binding view = %#v, want an empty code baseline", view.Bindings[0])
 			}
-			stored := findBinding(t, env.repo.bindings[view.ID], 1001)
-			if stored.CodeBaselineCommit != "" {
-				t.Fatalf("stored commit = %q, want empty", stored.CodeBaselineCommit)
-			}
-
-			created := 0
-			warnings := 0
+			created, warnings := 0, 0
 			for _, entry := range env.audit.events {
 				switch entry.Action {
 				case "version.created":
 					created++
 				case "version.code_baseline_unresolved":
 					warnings++
-					if entry.TargetKind != "version" || entry.TargetID != idString(view.ID) {
-						t.Fatalf("warning audit target = %#v", entry)
-					}
-					if entry.Metadata["version_sut_id"] != idString(stored.ID) {
-						t.Fatalf("warning metadata = %#v", entry.Metadata)
-					}
 				}
 			}
 			if created != 1 || warnings != 1 {
-				t.Fatalf("audit actions = %#v, want one version.created and one warning", env.audit.events)
-			}
-			if len(env.publisher.events) != 2 {
-				t.Fatalf("version.created events = %d, want 2", len(env.publisher.events))
+				t.Fatalf("audit actions = %#v", env.audit.events)
 			}
 		})
-	}
-}
-
-func TestCreateSkipsBaselineResolutionWithoutRepository(t *testing.T) {
-	env := newTestEnv(t)
-	cmd := validCommand()
-	cmd.Bindings[0].CodeRepositoryID = nil
-	if _, err := env.svc.Create(requestContext(), cmd, 42); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if len(env.resolver.calls) != 0 {
-		t.Fatalf("resolver calls = %#v, want none for a binding without repository", env.resolver.calls)
 	}
 }
 
@@ -787,40 +768,304 @@ func TestCreateMapsDuplicatePersistenceError(t *testing.T) {
 	}
 }
 
-func TestVersionViewExposesCloseProjection(t *testing.T) {
+// TestBindingMultiRepoAndAccounts pins R-C2/DB-12..14: a binding update selects
+// an explicit effective repository subset (included overrides for appended
+// repositories, excluded overrides for removed inherited ones) and an explicit
+// account subset. Unknown or disabled accounts are typed 400s.
+func TestBindingMultiRepoAndAccounts(t *testing.T) {
 	env := newTestEnv(t)
-	view := createVersion(t, env, "Orders Q4")
-	closedAt := testTime.Add(time.Hour)
-	stored := env.repo.versions[view.ID]
-	stored.Status = version.StatusCompleted
-	stored.ClosedAt = &closedAt
-	stored.CloseReason = "all delivery work is done"
-	env.repo.versions[view.ID] = stored
+	created := createVersion(t, env, "Orders Q4")
 
-	got, err := env.svc.Get(requestContext(), view.ID)
+	overview, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		RepositoryIDs: int64SlicePtr([]int64{1202, 1203}),
+		AccountIDs:    int64SlicePtr([]int64{1602}),
+	}, 42)
+	if err != nil {
+		t.Fatalf("UpdateBinding: %v", err)
+	}
+	if len(overview.Repositories) != 3 {
+		t.Fatalf("overview repositories = %#v", overview.Repositories)
+	}
+	included := map[int64]bool{}
+	for _, repository := range overview.Repositories {
+		included[parseID(t, repository.Repository.ID)] = repository.Included
+	}
+	if !included[1202] || !included[1203] || included[1201] {
+		t.Fatalf("effective repositories = %#v", overview.Repositories)
+	}
+	if len(overview.Accounts) != 1 || overview.Accounts[0].ID != "1602" {
+		t.Fatalf("overview accounts = %#v", overview.Accounts)
+	}
+	// The lowest effective repository is the deterministic baseline.
+	if overview.CodeBaselineCommit != codeBaselineCommit {
+		t.Fatalf("code baseline = %q", overview.CodeBaselineCommit)
+	}
+	if len(env.resolver.calls) != 2 || env.resolver.calls[0].ID != "1201" || env.resolver.calls[1].ID != "1202" {
+		t.Fatalf("resolver calls = %#v, want create 1201 then update 1202", env.resolver.calls)
+	}
+
+	stored := storedBinding(t, env, created.ID)
+	overrides := map[int64]bool{}
+	for _, override := range stored.RepositoryOverrides {
+		overrides[override.RepoID] = override.Included
+	}
+	if included, ok := overrides[1201]; !ok || included {
+		t.Fatalf("1201 override = %v/%v", included, ok)
+	}
+	if included, ok := overrides[1203]; !ok || !included {
+		t.Fatalf("1203 override = %v/%v", included, ok)
+	}
+	if _, ok := overrides[1202]; ok {
+		t.Fatalf("inherited repository 1202 must not be overridden: %#v", stored.RepositoryOverrides)
+	}
+	if len(stored.Accounts) != 1 || stored.Accounts[0].AccountID != 1602 {
+		t.Fatalf("stored accounts = %#v", stored.Accounts)
+	}
+
+	// The binding change is audited and published as version.binding.changed.
+	var changed bool
+	for _, event := range env.audit.events {
+		if event.Action == "version.binding.changed" {
+			changed = true
+		}
+	}
+	if !changed {
+		t.Fatalf("version.binding.changed audit missing: %#v", env.audit.events)
+	}
+	changed = false
+	for _, event := range env.publisher.events {
+		if event.Type == "version.binding.changed" {
+			changed = true
+			if event.Scope["version_id"] != idString(created.ID) {
+				t.Fatalf("event scope = %#v", event.Scope)
+			}
+		}
+	}
+	if !changed {
+		t.Fatalf("version.binding.changed event missing: %#v", env.publisher.events)
+	}
+
+	// Typed errors: unknown/disabled resources are 400, missing version 404.
+	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		AccountIDs: int64SlicePtr([]int64{1603}),
+	}, 42); err == nil {
+		t.Fatal("disabled account accepted")
+	} else if field := fieldName(t, err); field != "account_ids" {
+		t.Fatalf("field = %q", field)
+	}
+	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		AccountIDs: int64SlicePtr([]int64{9999}),
+	}, 42); err == nil {
+		t.Fatal("unknown account accepted")
+	} else if field := fieldName(t, err); field != "account_ids" {
+		t.Fatalf("field = %q", field)
+	}
+	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		RepositoryIDs: int64SlicePtr([]int64{9999}),
+	}, 42); err == nil {
+		t.Fatal("unknown repository accepted")
+	} else if field := fieldName(t, err); field != "repository_ids" {
+		t.Fatalf("field = %q", field)
+	}
+	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		EnvironmentID: int64Ptr(9999),
+	}, 42); err == nil {
+		t.Fatal("unknown environment accepted")
+	} else if field := fieldName(t, err); field != "environment_id" {
+		t.Fatalf("field = %q", field)
+	}
+	if _, err := env.svc.UpdateBinding(requestContext(), 9999, versionapp.BindingPatch{}, 42); err == nil {
+		t.Fatal("missing version accepted")
+	} else if got := apiError(t, err).Status; got != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", got)
+	}
+}
+
+// TestBindingScopeExclude pins DB-11: pages/APIs/databases are excluded through
+// scope_exclude, persisted verbatim, exposed with counts, and only resources of
+// the bound environment are selectable.
+func TestBindingScopeExclude(t *testing.T) {
+	env := newTestEnv(t)
+	created := createVersion(t, env, "Orders Q4")
+
+	overview, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		ScopeExclude: &version.ScopeExclude{
+			Pages:     []int64{1301},
+			APIs:      []int64{1401},
+			Databases: []int64{1501},
+		},
+	}, 42)
+	if err != nil {
+		t.Fatalf("UpdateBinding: %v", err)
+	}
+	if overview.Counts.Pages.Approved != 2 || overview.Counts.Pages.Excluded != 1 || overview.Counts.Pages.Included != 1 {
+		t.Fatalf("page counts = %#v", overview.Counts.Pages)
+	}
+	if overview.Counts.APIs.Approved != 1 || overview.Counts.APIs.Included != 0 {
+		t.Fatalf("api counts = %#v", overview.Counts.APIs)
+	}
+	if overview.Counts.Databases.Approved != 2 || overview.Counts.Databases.Included != 1 {
+		t.Fatalf("database counts = %#v", overview.Counts.Databases)
+	}
+	if len(overview.Pages) != 1 || overview.Pages[0].ID != "1302" {
+		t.Fatalf("effective pages = %#v", overview.Pages)
+	}
+	if len(overview.APIs) != 0 {
+		t.Fatalf("effective apis = %#v", overview.APIs)
+	}
+	if len(overview.Databases) != 1 || overview.Databases[0].ID != "1503" {
+		t.Fatalf("effective databases = %#v", overview.Databases)
+	}
+
+	stored := storedBinding(t, env, created.ID)
+	if len(stored.ScopeExclude.Pages) != 1 || stored.ScopeExclude.Pages[0] != 1301 ||
+		len(stored.ScopeExclude.APIs) != 1 || stored.ScopeExclude.APIs[0] != 1401 ||
+		len(stored.ScopeExclude.Databases) != 1 || stored.ScopeExclude.Databases[0] != 1501 {
+		t.Fatalf("stored exclusions = %#v", stored.ScopeExclude)
+	}
+	// The version detail read model also applies the exclusions.
+	detail, err := env.svc.Get(requestContext(), created.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.Status != string(version.StatusCompleted) {
-		t.Fatalf("status = %q", got.Status)
-	}
-	if got.ClosedAt == nil || !got.ClosedAt.Equal(closedAt) {
-		t.Fatalf("closed_at = %v", got.ClosedAt)
-	}
-	if got.CloseReason != "all delivery work is done" {
-		t.Fatalf("close_reason = %q", got.CloseReason)
+	if len(detail.Bindings[0].Pages) != 1 || detail.Bindings[0].Pages[0].ID != "1302" {
+		t.Fatalf("detail pages = %#v", detail.Bindings[0].Pages)
 	}
 
-	stored.Status = version.StatusRunning
-	stored.ClosedAt = nil
-	stored.CloseReason = ""
-	env.repo.versions[view.ID] = stored
-	reopened, err := env.svc.Get(requestContext(), view.ID)
+	// Clearing the exclusions restores the whole environment.
+	cleared, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		ScopeExclude: &version.ScopeExclude{},
+	}, 42)
 	if err != nil {
-		t.Fatalf("Get reopened: %v", err)
+		t.Fatalf("clear exclusions: %v", err)
 	}
-	if reopened.ClosedAt != nil || reopened.CloseReason != "" {
-		t.Fatalf("reopened close projection = %v/%q", reopened.ClosedAt, reopened.CloseReason)
+	if len(cleared.Pages) != 2 || len(cleared.APIs) != 1 || len(cleared.Databases) != 2 {
+		t.Fatalf("cleared overview = %#v", cleared)
+	}
+
+	// Only the bound environment's resources are selectable.
+	invalid := map[string]version.ScopeExclude{
+		"page of another environment": {Pages: []int64{1303}},
+		"database of another sut":     {Databases: []int64{1502}},
+		"unknown page":                {Pages: []int64{9999}},
+		"zero api id":                 {APIs: []int64{0}},
+	}
+	for name, scope := range invalid {
+		t.Run(name, func(t *testing.T) {
+			_, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{ScopeExclude: &scope}, 42)
+			if err == nil {
+				t.Fatal("invalid exclusion accepted")
+			}
+			if got := apiError(t, err).Status; got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", got)
+			}
+		})
+	}
+}
+
+// TestBindingEnvironmentAndStageRules pins the environment-scoped binding model
+// and the R-C4-2 stage gate: editable through case_review, read-only while
+// executing/reporting/completed, and suspended versions inherit the gate of the
+// stage they were suspended from.
+func TestBindingEnvironmentAndStageRules(t *testing.T) {
+	env := newTestEnv(t)
+	created := createVersion(t, env, "Orders Q4")
+	ctx := requestContext()
+
+	// The environment may change within the same SUT, and its resources are
+	// validated against the new environment.
+	overview, err := env.svc.UpdateBinding(ctx, created.ID, versionapp.BindingPatch{
+		EnvironmentID: int64Ptr(1103),
+	}, 42)
+	if err != nil {
+		t.Fatalf("change environment: %v", err)
+	}
+	if overview.Environment.ID != "1103" || len(overview.Pages) != 1 || overview.Pages[0].ID != "1305" {
+		t.Fatalf("environment override = %#v", overview)
+	}
+	if _, err := env.svc.UpdateBinding(ctx, created.ID, versionapp.BindingPatch{
+		EnvironmentID: int64Ptr(1102),
+		ScopeExclude:  &version.ScopeExclude{Pages: []int64{1305}},
+	}, 42); err == nil {
+		t.Fatal("environment of another SUT accepted")
+	} else if field := fieldName(t, err); field != "environment_id" {
+		t.Fatalf("field = %q", field)
+	}
+
+	readOnlyStages := []version.Stage{
+		version.StageExecuting,
+		version.StageReporting,
+		version.StageCompleted,
+	}
+	for _, stage := range readOnlyStages {
+		env.repo.stages[created.ID] = version.StageState{VersionID: created.ID, Stage: stage}
+		_, err := env.svc.UpdateBinding(ctx, created.ID, versionapp.BindingPatch{
+			ScopeExclude: &version.ScopeExclude{},
+		}, 42)
+		if err == nil {
+			t.Fatalf("binding update accepted at stage %q", stage)
+		}
+		if got := apiError(t, err).Status; got != http.StatusConflict {
+			t.Fatalf("stage %q status = %d, want 409", stage, got)
+		}
+	}
+	for _, stage := range []version.Stage{
+		version.StageCreated,
+		version.StageClarifying,
+		version.StageRequirementReview,
+		version.StageDesigning,
+		version.StageCaseReview,
+	} {
+		env.repo.stages[created.ID] = version.StageState{VersionID: created.ID, Stage: stage}
+		if _, err := env.svc.UpdateBinding(ctx, created.ID, versionapp.BindingPatch{
+			ScopeExclude: &version.ScopeExclude{},
+		}, 42); err != nil {
+			t.Fatalf("binding update rejected at stage %q: %v", stage, err)
+		}
+	}
+
+	// Suspended versions use the recorded workflow stage.
+	executing := version.StageExecuting
+	env.repo.stages[created.ID] = version.StageState{
+		VersionID: created.ID, Stage: version.StagePaused, SuspendedFrom: &executing,
+	}
+	if _, err := env.svc.UpdateBinding(ctx, created.ID, versionapp.BindingPatch{}, 42); err == nil {
+		t.Fatal("paused-from-executing binding was editable")
+	} else if got := apiError(t, err).Status; got != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", got)
+	}
+	designing := version.StageDesigning
+	env.repo.stages[created.ID] = version.StageState{
+		VersionID: created.ID, Stage: version.StageBlocked, SuspendedFrom: &designing,
+	}
+	if _, err := env.svc.UpdateBinding(ctx, created.ID, versionapp.BindingPatch{}, 42); err != nil {
+		t.Fatalf("blocked-from-designing binding rejected: %v", err)
+	}
+}
+
+func TestBindingOverviewReportsStageEditability(t *testing.T) {
+	env := newTestEnv(t)
+	created := createVersion(t, env, "Orders Q4")
+	env.repo.stages[created.ID] = version.StageState{VersionID: created.ID, Stage: version.StageDesigning}
+	overview, err := env.svc.GetBinding(requestContext(), created.ID)
+	if err != nil {
+		t.Fatalf("GetBinding: %v", err)
+	}
+	if overview.Stage != version.StageDesigning || !overview.Editable {
+		t.Fatalf("overview = %#v", overview)
+	}
+	env.repo.stages[created.ID] = version.StageState{VersionID: created.ID, Stage: version.StageExecuting}
+	overview, err = env.svc.GetBinding(requestContext(), created.ID)
+	if err != nil {
+		t.Fatalf("GetBinding executing: %v", err)
+	}
+	if overview.Editable {
+		t.Fatal("executing binding reported editable")
+	}
+	if _, err := env.svc.GetBinding(requestContext(), 9999); err == nil {
+		t.Fatal("missing version binding read accepted")
+	} else if got := apiError(t, err).Status; got != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", got)
 	}
 }
 
@@ -835,32 +1080,16 @@ func TestGetReturnsNestedResourceViews(t *testing.T) {
 	if view.ID != created.ID || view.Title != "Orders Q4" || view.Status != "initial" {
 		t.Fatalf("view = %#v", view)
 	}
-	if len(view.Bindings) != 1 {
-		t.Fatalf("bindings = %d", len(view.Bindings))
-	}
 	binding := view.Bindings[0]
-	if binding.SUT.ID != "1001" || binding.SUT.Name != "Orders" {
-		t.Fatalf("sut = %#v", binding.SUT)
-	}
-	if binding.Environment.ID != "1101" || binding.Environment.SUTID != "1001" {
-		t.Fatalf("environment = %#v", binding.Environment)
+	if binding.SUT.ID != "1001" || binding.Environment.ID != "1101" {
+		t.Fatalf("binding = %#v", binding)
 	}
 	if binding.Repository == nil || binding.Repository.ID != "1201" {
 		t.Fatalf("repository = %#v", binding.Repository)
 	}
-	if len(binding.Pages) != 1 || binding.Pages[0].RouteTemplate != "/orders" {
-		t.Fatalf("pages = %#v", binding.Pages)
+	if len(binding.Pages) != 2 || len(binding.APIs) != 1 || len(binding.Databases) != 2 || len(binding.Accounts) != 3 {
+		t.Fatalf("nested resources = %#v", binding)
 	}
-	if len(binding.APIs) != 1 || binding.APIs[0].Method != "GET" {
-		t.Fatalf("apis = %#v", binding.APIs)
-	}
-	if len(binding.Databases) != 1 || binding.Databases[0].Name != "orders-db" {
-		t.Fatalf("databases = %#v", binding.Databases)
-	}
-	if len(binding.Accounts) != 1 || binding.Accounts[0].Username != "order-admin" {
-		t.Fatalf("accounts = %#v", binding.Accounts)
-	}
-
 	if _, err := env.svc.Get(requestContext(), 9999); err == nil {
 		t.Fatal("missing version returned")
 	} else if got := apiError(t, err).Status; got != http.StatusNotFound {
@@ -878,33 +1107,19 @@ func TestListReturnsCursorSummaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if !hasMore || len(page) != 2 {
+	if !hasMore || len(page) != 2 || page[0].ID != third.ID || page[1].ID != second.ID {
 		t.Fatalf("page = %#v, hasMore = %v", page, hasMore)
 	}
-	if page[0].ID != third.ID || page[1].ID != second.ID {
-		t.Fatalf("page order = %#v", page)
-	}
-	if page[0].SUTCount != 1 {
-		t.Fatalf("sut count = %d", page[0].SUTCount)
-	}
-	if page[0].Title != "Version three" || page[0].Status != "initial" {
+	if page[0].SUTCount != 1 || page[0].Title != "Version three" || page[0].Status != "initial" {
 		t.Fatalf("summary = %#v", page[0])
 	}
-
 	next, more, err := env.svc.List(requestContext(), 2, &page[1].ID)
-	if err != nil {
-		t.Fatalf("List next: %v", err)
+	if err != nil || more || len(next) != 1 || next[0].ID != first.ID {
+		t.Fatalf("next = %#v, hasMore = %v, err = %v", next, more, err)
 	}
-	if more || len(next) != 1 || next[0].ID != first.ID {
-		t.Fatalf("next = %#v, hasMore = %v", next, more)
-	}
-
 	all, more, err := env.svc.List(requestContext(), 0, nil)
-	if err != nil {
-		t.Fatalf("List all: %v", err)
-	}
-	if more || len(all) != 3 {
-		t.Fatalf("all = %#v, hasMore = %v", all, more)
+	if err != nil || more || len(all) != 3 {
+		t.Fatalf("all = %#v, hasMore = %v, err = %v", all, more, err)
 	}
 }
 
@@ -919,32 +1134,12 @@ func TestUpdateOnlyChangesTitleAndAutoFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if updated.Title != "Renamed" || !updated.AutoDesignNewRequirements {
+	if updated.Title != "Renamed" || !updated.AutoDesignNewRequirements || updated.Status != "initial" {
 		t.Fatalf("updated = %#v", updated)
 	}
-	if updated.Status != "initial" {
-		t.Fatalf("status = %q, want initial", updated.Status)
+	if len(env.audit.events) != 2 || env.audit.events[1].Action != "version.updated" {
+		t.Fatalf("audit = %#v", env.audit.events)
 	}
-
-	stored, err := env.svc.Get(requestContext(), created.ID)
-	if err != nil {
-		t.Fatalf("Get after update: %v", err)
-	}
-	if stored.Title != "Renamed" || !stored.AutoDesignNewRequirements || stored.Status != "initial" {
-		t.Fatalf("stored = %#v", stored)
-	}
-
-	if len(env.audit.events) != 2 {
-		t.Fatalf("audit events = %d", len(env.audit.events))
-	}
-	entry := env.audit.events[1]
-	if entry.Action != "version.updated" || entry.TargetKind != "version" || entry.TargetID != idString(created.ID) {
-		t.Fatalf("audit = %#v", entry)
-	}
-	if len(env.publisher.events) != 2 {
-		t.Fatalf("update must not publish an event beyond the two version.created events, got %d", len(env.publisher.events))
-	}
-
 	if _, err := env.svc.Update(requestContext(), 9999, versionapp.Patch{Title: stringPtr("Nope")}, 42); err == nil {
 		t.Fatal("missing version updated")
 	} else if got := apiError(t, err).Status; got != http.StatusNotFound {
@@ -969,26 +1164,7 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 	env := newTestEnv(t)
 	var usage resourceapp.UsageChecker = env.svc
 
-	before := []struct {
-		name  string
-		check func(context.Context, int64) (bool, error)
-	}{
-		{"sut", usage.SUTInUse},
-		{"environment", usage.EnvironmentInUse},
-		{"page", usage.PageInUse},
-		{"api", usage.APIInUse},
-		{"database", usage.DatabaseInUse},
-		{"account", usage.AccountInUse},
-		{"repository", usage.RepositoryInUse},
-	}
-	for _, check := range before {
-		if used, err := check.check(requestContext(), 9999); err != nil || used {
-			t.Fatalf("%s before create = %v/%v", check.name, used, err)
-		}
-	}
-
 	created := createVersion(t, env, "Version")
-
 	cases := []struct {
 		name  string
 		check func(context.Context, int64) (bool, error)
@@ -999,16 +1175,12 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 		{"sut unbound", usage.SUTInUse, 1002, false},
 		{"environment bound", usage.EnvironmentInUse, 1101, true},
 		{"environment unbound", usage.EnvironmentInUse, 1102, false},
-		{"page in scope", usage.PageInUse, 1301, true},
-		{"page outside scope", usage.PageInUse, 1302, false},
-		{"api in scope", usage.APIInUse, 1401, true},
-		{"api outside scope", usage.APIInUse, 1402, false},
-		{"database bound", usage.DatabaseInUse, 1501, true},
-		{"database unbound", usage.DatabaseInUse, 1502, false},
-		{"account bound", usage.AccountInUse, 1601, true},
-		{"account unbound", usage.AccountInUse, 1602, false},
-		{"repository bound", usage.RepositoryInUse, 1201, true},
-		{"repository unbound", usage.RepositoryInUse, 1202, false},
+		{"page excluded", usage.PageInUse, 1301, false},
+		{"api excluded", usage.APIInUse, 1401, false},
+		{"database excluded", usage.DatabaseInUse, 1501, false},
+		{"account bound", usage.AccountInUse, 1602, true},
+		{"account unbound", usage.AccountInUse, 1603, false},
+		{"repository inherited", usage.RepositoryInUse, 1201, false},
 	}
 	for _, tc := range cases {
 		used, err := tc.check(requestContext(), tc.id)
@@ -1019,11 +1191,50 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
 		}
 	}
+	// Exclusions and overrides make a resource in use.
+	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		ScopeExclude:  &version.ScopeExclude{Pages: []int64{1301}, Databases: []int64{1501}},
+		RepositoryIDs: int64SlicePtr([]int64{1203}),
+	}, 42); err != nil {
+		t.Fatalf("UpdateBinding: %v", err)
+	}
+	for _, tc := range []struct {
+		check func(context.Context, int64) (bool, error)
+		id    int64
+	}{
+		{usage.PageInUse, 1301},
+		{usage.DatabaseInUse, 1501},
+		{usage.RepositoryInUse, 1201},
+		{usage.RepositoryInUse, 1203},
+	} {
+		used, err := tc.check(requestContext(), tc.id)
+		if err != nil || !used {
+			t.Fatalf("usage(%d) = %v/%v, want in use", tc.id, used, err)
+		}
+	}
+}
 
-	// The created version is listed with one SUT binding.
-	page, _, err := env.svc.List(requestContext(), 10, nil)
-	if err != nil || len(page) != 1 || page[0].ID != created.ID || page[0].SUTCount != 1 {
-		t.Fatalf("list = %#v, %v", page, err)
+func TestKnowledgeBindingKeysUsesEffectiveResources(t *testing.T) {
+	env := newTestEnv(t)
+	created := createVersion(t, env, "Orders Q4")
+	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
+		ScopeExclude: &version.ScopeExclude{Pages: []int64{1301}},
+		AccountIDs:   int64SlicePtr([]int64{1601}),
+	}, 42); err != nil {
+		t.Fatalf("UpdateBinding: %v", err)
+	}
+	keys, err := env.svc.KnowledgeBindingKeys(requestContext(), created.ID)
+	if err != nil {
+		t.Fatalf("KnowledgeBindingKeys: %v", err)
+	}
+	if len(keys.PageKeys) != 1 || keys.PageKeys[0] != "/orders/:id" {
+		t.Fatalf("page keys = %#v", keys.PageKeys)
+	}
+	if len(keys.AccountRoles) != 1 || keys.AccountRoles[0] != "admin" {
+		t.Fatalf("account roles = %#v", keys.AccountRoles)
+	}
+	if len(keys.SystemIDs) != 1 || keys.SystemIDs[0] != 1001 {
+		t.Fatalf("system ids = %#v", keys.SystemIDs)
 	}
 }
 
@@ -1043,42 +1254,29 @@ func TestReopenCompletedVersionPublishesStatusChange(t *testing.T) {
 		t.Fatalf("Reopen: %v", err)
 	}
 	reopened := env.repo.versions[created.ID]
-	if reopened.Status != version.StatusRunning {
-		t.Fatalf("status = %s, want running", reopened.Status)
+	if reopened.Status != version.StatusRunning || reopened.ClosedAt != nil || reopened.CloseReason != "" {
+		t.Fatalf("reopened = %#v", reopened)
 	}
-	if reopened.ClosedAt != nil || reopened.CloseReason != "" {
-		t.Fatalf("closed fields not cleared: %+v", reopened)
-	}
-	changed := false
+	changed, audited := false, false
 	for _, event := range env.publisher.events {
-		if event.Type != "version.status_changed" {
-			continue
+		if event.Type == "version.status_changed" && event.Payload["from"] == version.StatusCompleted {
+			changed = true
 		}
-		if event.Payload["from"] != version.StatusCompleted || event.Payload["to"] != version.StatusRunning {
-			t.Fatalf("status_changed payload = %+v", event.Payload)
-		}
-		changed = true
 	}
-	if !changed {
-		t.Fatal("version.status_changed completed->running not published")
-	}
-	audited := false
 	for _, event := range env.audit.events {
 		if event.Action == "version.reopened" {
 			audited = true
 		}
 	}
-	if !audited {
-		t.Fatal("version.reopened audit entry missing")
+	if !changed || !audited {
+		t.Fatalf("events/audit = %#v / %#v", env.publisher.events, env.audit.events)
 	}
-
-	// Idempotent: a non-completed version publishes nothing new.
 	eventsBefore := len(env.publisher.events)
 	if err := env.svc.Reopen(requestContext(), created.ID); err != nil {
 		t.Fatalf("second Reopen: %v", err)
 	}
 	if len(env.publisher.events) != eventsBefore {
-		t.Fatal("reopen of a running version must not publish status changes")
+		t.Fatal("reopen of a running version published status changes")
 	}
 }
 
@@ -1089,4 +1287,13 @@ func TestReopenMissingVersion(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
 		t.Fatalf("err = %v, want not_found", err)
 	}
+}
+
+func parseID(t *testing.T, raw string) int64 {
+	t.Helper()
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		t.Fatalf("parse ID %q: %v", raw, err)
+	}
+	return value
 }

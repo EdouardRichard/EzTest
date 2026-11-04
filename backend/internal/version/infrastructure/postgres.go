@@ -16,18 +16,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const versionColumns = `id, title, status, auto_design_new_requirements, closed_at,
-	close_reason, close_run_id, created_by, created_at, updated_at`
+const versionColumns = `id, title, description, goal, status, auto_design_new_requirements,
+	closed_at, close_reason, close_run_id, created_by, created_at, updated_at`
 
-// Repository stores version, version_sut and version_sut_resource rows.
+// Repository stores versions, version_sut bindings, the version-level
+// repository overrides and the version account subset.
 type Repository struct {
 	pool *pgxpool.Pool
 	ids  platformid.Generator
 }
 
-// New wraps a pgx pool. The generator supplies primary keys for the internal
-// version_sut_resource join rows; business entity IDs are assigned by the
-// application service.
+// New wraps a pgx pool. The generator supplies primary keys for the binding
+// override/account rows; business entity IDs are assigned by the application
+// service.
 func New(pool *pgxpool.Pool, ids platformid.Generator) *Repository {
 	return &Repository{pool: pool, ids: ids}
 }
@@ -55,8 +56,9 @@ func wrapDB(op string, err error) error {
 	return fmt.Errorf("%s: %w", op, err)
 }
 
-// Create inserts the version, every binding and its database/account rows in
-// one transaction. A uniqueness failure rolls the whole aggregate back.
+// Create inserts the version, its environment-only binding, the initial
+// repository overrides and the version account subset in one transaction. A
+// uniqueness failure rolls the whole aggregate back.
 func (r *Repository) Create(ctx context.Context, v version.Version, bindings []version.Binding) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -66,39 +68,29 @@ func (r *Repository) Create(ctx context.Context, v version.Version, bindings []v
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO version (`+versionColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, v.ID, v.Title, v.Status, v.AutoDesignNewRequirements, v.ClosedAt,
-		v.CloseReason, v.CloseRunID, v.CreatedBy, v.CreatedAt, v.UpdatedAt); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`, v.ID, v.Title, v.Description, v.Goal, v.Status, v.AutoDesignNewRequirements,
+		v.ClosedAt, v.CloseReason, v.CloseRunID, v.CreatedBy, v.CreatedAt, v.UpdatedAt); err != nil {
 		return wrapDB("insert version", err)
 	}
 
 	for _, binding := range bindings {
-		scope, err := encodeScope(binding.Scope)
+		scopeExclude, err := encodeScopeExclude(binding.ScopeExclude)
 		if err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO version_sut (id, version_id, sut_id, environment_id, code_repo_id, code_baseline_commit, scope)
-			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+			INSERT INTO version_sut (id, version_id, sut_id, environment_id, code_baseline_commit, scope_exclude)
+			VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 		`, binding.ID, v.ID, binding.SUTID, binding.EnvironmentID,
-			binding.CodeRepositoryID, nullableCommit(binding.CodeBaselineCommit), scope); err != nil {
+			nullableCommit(binding.CodeBaselineCommit), scopeExclude); err != nil {
 			return wrapDB("insert version_sut", err)
 		}
-		for _, databaseID := range binding.DatabaseIDs {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO version_sut_resource (id, version_sut_id, kind, resource_id, role)
-				VALUES ($1, $2, 'database', $3, '')
-			`, r.ids.Next(), binding.ID, databaseID); err != nil {
-				return wrapDB("insert version_sut_resource database", err)
-			}
+		if err := insertBindingRepositories(ctx, tx, r.ids, v.ID, binding.RepositoryOverrides); err != nil {
+			return err
 		}
-		for _, account := range binding.Accounts {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO version_sut_resource (id, version_sut_id, kind, resource_id, role)
-				VALUES ($1, $2, 'account', $3, $4)
-			`, r.ids.Next(), binding.ID, account.AccountID, account.Role); err != nil {
-				return wrapDB("insert version_sut_resource account", err)
-			}
+		if err := insertBindingAccounts(ctx, tx, r.ids, v.ID, binding.Accounts); err != nil {
+			return err
 		}
 	}
 
@@ -108,7 +100,90 @@ func (r *Repository) Create(ctx context.Context, v version.Version, bindings []v
 	return nil
 }
 
-// Get loads one version and its bindings with the selected resources.
+// UpdateBinding rewrites the v0.22 binding projection of one existing version
+// in one transaction: version_sut (environment/scope_exclude/code baseline),
+// the version_repository_override rows and the version_account rows.
+func (r *Repository) UpdateBinding(ctx context.Context, v version.Version, binding version.Binding) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("update version binding: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	scopeExclude, err := encodeScopeExclude(binding.ScopeExclude)
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE version_sut
+		SET environment_id = $3, scope_exclude = $4::jsonb,
+			code_baseline_commit = $5, updated_at = $6
+		WHERE id = $1 AND version_id = $2
+	`, binding.ID, v.ID, binding.EnvironmentID, scopeExclude,
+		nullableCommit(binding.CodeBaselineCommit), v.UpdatedAt)
+	if err != nil {
+		return wrapDB("update version_sut", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.ErrNotFound
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM version_repository_override WHERE version_id = $1`, v.ID); err != nil {
+		return wrapDB("delete version repository overrides", err)
+	}
+	if err := insertBindingRepositories(ctx, tx, r.ids, v.ID, binding.RepositoryOverrides); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM version_account WHERE version_id = $1`, v.ID); err != nil {
+		return wrapDB("delete version accounts", err)
+	}
+	if err := insertBindingAccounts(ctx, tx, r.ids, v.ID, binding.Accounts); err != nil {
+		return err
+	}
+	tag, err = tx.Exec(ctx, `UPDATE version SET updated_at = $2 WHERE id = $1`, v.ID, v.UpdatedAt)
+	if err != nil {
+		return wrapDB("update version timestamp", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("update version binding: commit: %w", err)
+	}
+	return nil
+}
+
+func insertBindingRepositories(
+	ctx context.Context, tx pgx.Tx, ids platformid.Generator, versionID int64,
+	overrides []version.RepositoryOverride,
+) error {
+	for _, override := range overrides {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO version_repository_override (id, version_id, repo_id, included)
+			VALUES ($1, $2, $3, $4)
+		`, ids.Next(), versionID, override.RepoID, override.Included); err != nil {
+			return wrapDB("insert version repository override", err)
+		}
+	}
+	return nil
+}
+
+func insertBindingAccounts(
+	ctx context.Context, tx pgx.Tx, ids platformid.Generator, versionID int64,
+	accounts []version.AccountBinding,
+) error {
+	for _, account := range accounts {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO version_account (id, version_id, account_id, enabled)
+			VALUES ($1, $2, $3, true)
+		`, ids.Next(), versionID, account.AccountID); err != nil {
+			return wrapDB("insert version account", err)
+		}
+	}
+	return nil
+}
+
+// Get loads one version and its environment-only bindings with the version
+// repository overrides and account subset.
 func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []version.Binding, error) {
 	v, err := scanVersion(r.pool.QueryRow(ctx, `SELECT `+versionColumns+` FROM version WHERE id = $1`, id))
 	if err != nil {
@@ -116,8 +191,8 @@ func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []vers
 	}
 
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, version_id, sut_id, environment_id, code_repo_id,
-			COALESCE(code_baseline_commit, ''), scope
+		SELECT id, version_id, sut_id, environment_id,
+			COALESCE(code_baseline_commit, ''), scope_exclude
 		FROM version_sut WHERE version_id = $1 ORDER BY id
 	`, id)
 	if err != nil {
@@ -126,21 +201,23 @@ func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []vers
 	defer rows.Close()
 
 	bindings := make([]version.Binding, 0)
-	index := make(map[int64]int, 0)
 	for rows.Next() {
 		var binding version.Binding
 		var scopeRaw []byte
 		if err := rows.Scan(&binding.ID, &binding.VersionID, &binding.SUTID, &binding.EnvironmentID,
-			&binding.CodeRepositoryID, &binding.CodeBaselineCommit, &scopeRaw); err != nil {
+			&binding.CodeBaselineCommit, &scopeRaw); err != nil {
 			return version.Version{}, nil, fmt.Errorf("scan version binding: %w", err)
 		}
-		if err := json.Unmarshal(scopeRaw, &binding.Scope); err != nil {
-			return version.Version{}, nil, fmt.Errorf("decode version scope: %w", err)
+		if len(scopeRaw) > 0 {
+			if err := json.Unmarshal(scopeRaw, &binding.ScopeExclude); err != nil {
+				return version.Version{}, nil, fmt.Errorf("decode version scope_exclude: %w", err)
+			}
 		}
-		binding.Scope = version.NewScope(binding.Scope.Pages, binding.Scope.APIs)
-		binding.DatabaseIDs = []int64{}
+		binding.ScopeExclude = version.NewScopeExclude(
+			binding.ScopeExclude.Pages, binding.ScopeExclude.APIs, binding.ScopeExclude.Databases,
+		)
+		binding.RepositoryOverrides = []version.RepositoryOverride{}
 		binding.Accounts = []version.AccountBinding{}
-		index[binding.ID] = len(bindings)
 		bindings = append(bindings, binding)
 	}
 	if err := rows.Err(); err != nil {
@@ -150,42 +227,49 @@ func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []vers
 		return v, bindings, nil
 	}
 
-	bindingIDs := make([]int64, 0, len(bindings))
-	for _, binding := range bindings {
-		bindingIDs = append(bindingIDs, binding.ID)
-	}
-	resourceRows, err := r.pool.Query(ctx, `
-		SELECT version_sut_id, kind, resource_id, role
-		FROM version_sut_resource
-		WHERE version_sut_id = ANY($1::BIGINT[])
-		ORDER BY id
-	`, bindingIDs)
+	overrideRows, err := r.pool.Query(ctx, `
+		SELECT repo_id, included
+		FROM version_repository_override
+		WHERE version_id = $1
+		ORDER BY repo_id
+	`, id)
 	if err != nil {
-		return version.Version{}, nil, fmt.Errorf("get version binding resources: %w", err)
+		return version.Version{}, nil, fmt.Errorf("get version repository overrides: %w", err)
 	}
-	defer resourceRows.Close()
-	for resourceRows.Next() {
-		var bindingID, resourceID int64
-		var kind, role string
-		if err := resourceRows.Scan(&bindingID, &kind, &resourceID, &role); err != nil {
-			return version.Version{}, nil, fmt.Errorf("scan version binding resource: %w", err)
+	defer overrideRows.Close()
+	for overrideRows.Next() {
+		var repoID int64
+		var included bool
+		if err := overrideRows.Scan(&repoID, &included); err != nil {
+			return version.Version{}, nil, fmt.Errorf("scan version repository override: %w", err)
 		}
-		position, ok := index[bindingID]
-		if !ok {
-			continue
-		}
-		switch kind {
-		case "database":
-			bindings[position].DatabaseIDs = append(bindings[position].DatabaseIDs, resourceID)
-		case "account":
-			bindings[position].Accounts = append(bindings[position].Accounts, version.AccountBinding{
-				AccountID: resourceID,
-				Role:      role,
-			})
-		}
+		// The environment-only model has one binding per version.
+		bindings[0].RepositoryOverrides = append(bindings[0].RepositoryOverrides,
+			version.RepositoryOverride{RepoID: repoID, Included: included})
 	}
-	if err := resourceRows.Err(); err != nil {
-		return version.Version{}, nil, fmt.Errorf("get version binding resources: %w", err)
+	if err := overrideRows.Err(); err != nil {
+		return version.Version{}, nil, fmt.Errorf("get version repository overrides: %w", err)
+	}
+
+	accountRows, err := r.pool.Query(ctx, `
+		SELECT account_id
+		FROM version_account
+		WHERE version_id = $1 AND enabled
+		ORDER BY account_id
+	`, id)
+	if err != nil {
+		return version.Version{}, nil, fmt.Errorf("get version accounts: %w", err)
+	}
+	defer accountRows.Close()
+	for accountRows.Next() {
+		var accountID int64
+		if err := accountRows.Scan(&accountID); err != nil {
+			return version.Version{}, nil, fmt.Errorf("scan version account: %w", err)
+		}
+		bindings[0].Accounts = append(bindings[0].Accounts, version.AccountBinding{AccountID: accountID})
+	}
+	if err := accountRows.Err(); err != nil {
+		return version.Version{}, nil, fmt.Errorf("get version accounts: %w", err)
 	}
 	return v, bindings, nil
 }
@@ -225,9 +309,10 @@ func (r *Repository) List(ctx context.Context, limit int, beforeID *int64) ([]ve
 // are never touched by the P0 API.
 func (r *Repository) Update(ctx context.Context, v version.Version) (version.Version, error) {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE version SET title = $2, auto_design_new_requirements = $3, updated_at = $4
+		UPDATE version SET title = $2, description = $3, goal = $4,
+			auto_design_new_requirements = $5, updated_at = $6
 		WHERE id = $1
-	`, v.ID, v.Title, v.AutoDesignNewRequirements, v.UpdatedAt)
+	`, v.ID, v.Title, v.Description, v.Goal, v.AutoDesignNewRequirements, v.UpdatedAt)
 	if err != nil {
 		return version.Version{}, wrapDB("update version", err)
 	}
@@ -462,41 +547,44 @@ func (r *Repository) EnvironmentInUse(ctx context.Context, id int64) (bool, erro
 	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version_sut WHERE environment_id = $1)`, id)
 }
 
-// PageInUse reports whether any binding scope contains the page ID.
+// PageInUse reports whether any binding excludes the page.
 func (r *Repository) PageInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut WHERE scope -> 'pages' @> to_jsonb($1::BIGINT)
+			SELECT 1 FROM version_sut WHERE scope_exclude -> 'pages' @> to_jsonb($1::BIGINT)
 		)`, id)
 }
 
-// APIInUse reports whether any binding scope contains the API ID.
+// APIInUse reports whether any binding excludes the API.
 func (r *Repository) APIInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut WHERE scope -> 'apis' @> to_jsonb($1::BIGINT)
+			SELECT 1 FROM version_sut WHERE scope_exclude -> 'apis' @> to_jsonb($1::BIGINT)
 		)`, id)
 }
 
-// DatabaseInUse reports whether any binding references the target database.
+// DatabaseInUse reports whether any binding excludes the target database.
 func (r *Repository) DatabaseInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut_resource WHERE kind = 'database' AND resource_id = $1
+			SELECT 1 FROM version_sut WHERE scope_exclude -> 'databases' @> to_jsonb($1::BIGINT)
 		)`, id)
 }
 
-// AccountInUse reports whether any binding references the test account.
+// AccountInUse reports whether any version enables the test account.
 func (r *Repository) AccountInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut_resource WHERE kind = 'account' AND resource_id = $1
+			SELECT 1 FROM version_account WHERE account_id = $1
 		)`, id)
 }
 
-// RepositoryInUse reports whether any binding references the code repository.
+// RepositoryInUse reports whether any SUT association or version override
+// references the code repository.
 func (r *Repository) RepositoryInUse(ctx context.Context, id int64) (bool, error) {
-	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version_sut WHERE code_repo_id = $1)`, id)
+	return r.exists(ctx, `
+		SELECT EXISTS (SELECT 1 FROM sut_repository WHERE repo_id = $1)
+			OR EXISTS (SELECT 1 FROM version_repository_override WHERE repo_id = $1)`, id)
 }
 
 func (r *Repository) exists(ctx context.Context, query string, id int64) (bool, error) {
@@ -509,18 +597,19 @@ func (r *Repository) exists(ctx context.Context, query string, id int64) (bool, 
 
 func scanVersion(row rowScanner) (version.Version, error) {
 	var v version.Version
-	if err := row.Scan(&v.ID, &v.Title, &v.Status, &v.AutoDesignNewRequirements,
-		&v.ClosedAt, &v.CloseReason, &v.CloseRunID, &v.CreatedBy, &v.CreatedAt, &v.UpdatedAt); err != nil {
+	if err := row.Scan(&v.ID, &v.Title, &v.Description, &v.Goal, &v.Status,
+		&v.AutoDesignNewRequirements, &v.ClosedAt, &v.CloseReason, &v.CloseRunID,
+		&v.CreatedBy, &v.CreatedAt, &v.UpdatedAt); err != nil {
 		return version.Version{}, err
 	}
 	return v, nil
 }
 
-func encodeScope(scope version.Scope) (string, error) {
-	normalized := version.NewScope(scope.Pages, scope.APIs)
+func encodeScopeExclude(scope version.ScopeExclude) (string, error) {
+	normalized := version.NewScopeExclude(scope.Pages, scope.APIs, scope.Databases)
 	raw, err := json.Marshal(normalized)
 	if err != nil {
-		return "", fmt.Errorf("encode version scope: %w", err)
+		return "", fmt.Errorf("encode version scope_exclude: %w", err)
 	}
 	return string(raw), nil
 }

@@ -482,17 +482,16 @@ func scanDatabase(row rowScanner) (resource.TargetDatabase, error) {
 
 // ---------- Test account ----------
 
-const accountColumns = `id, sut_id, environment_id, username, password, roles,
+const accountColumns = `id, username, password, roles,
 	notes, status, created_at, updated_at`
 
-// ListAccounts returns every test account of a SUT in ID order.
-func (r *Repository) ListAccounts(ctx context.Context, sutID int64) ([]resource.TestAccount, error) {
+// ListAccounts returns the global test-account pool in ID order (v0.22 DB-15).
+func (r *Repository) ListAccounts(ctx context.Context) ([]resource.TestAccount, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+accountColumns+`
 		FROM test_account
-		WHERE sut_id = $1
 		ORDER BY id ASC
-	`, sutID)
+	`)
 	if err != nil {
 		return nil, wrapDB("list accounts", err)
 	}
@@ -529,11 +528,11 @@ func (r *Repository) CreateAccount(ctx context.Context, account resource.TestAcc
 		return resource.TestAccount{}, fmt.Errorf("encode account roles: %w", err)
 	}
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO test_account (id, sut_id, environment_id, username, password, roles,
+		INSERT INTO test_account (id, username, password, roles,
 			notes, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
 		RETURNING created_at, updated_at
-	`, account.ID, account.SUTID, account.EnvironmentID, account.Username,
+	`, account.ID, account.Username,
 		account.Password, roles, account.Notes, account.Status, account.CreatedAt, account.UpdatedAt)
 	if err := row.Scan(&account.CreatedAt, &account.UpdatedAt); err != nil {
 		return resource.TestAccount{}, wrapDB("create account", err)
@@ -573,7 +572,7 @@ func (r *Repository) DeleteAccount(ctx context.Context, id int64) error {
 func scanAccount(row rowScanner) (resource.TestAccount, error) {
 	var item resource.TestAccount
 	var roles []byte
-	if err := row.Scan(&item.ID, &item.SUTID, &item.EnvironmentID, &item.Username,
+	if err := row.Scan(&item.ID, &item.Username,
 		&item.Password, &roles, &item.Notes, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.TestAccount{}, err
@@ -705,6 +704,58 @@ func scanRepository(row rowScanner) (resource.CodeRepository, error) {
 	return item, nil
 }
 
+// ---------- SUT repositories ----------
+
+const sutRepositoryColumns = `id, sut_id, repo_id, role, enabled, created_at, updated_at`
+
+// ListSUTRepositories returns the SUT-level repository associations ordered by
+// repository ID so the version binding baseline is deterministic (v0.22 DB-12).
+func (r *Repository) ListSUTRepositories(ctx context.Context, sutID int64) ([]resource.SUTRepository, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+sutRepositoryColumns+`
+		FROM sut_repository
+		WHERE sut_id = $1
+		ORDER BY repo_id ASC, id ASC
+	`, sutID)
+	if err != nil {
+		return nil, wrapDB("list sut repositories", err)
+	}
+	defer rows.Close()
+
+	items := make([]resource.SUTRepository, 0)
+	for rows.Next() {
+		var item resource.SUTRepository
+		if err := rows.Scan(&item.ID, &item.SUTID, &item.RepoID, &item.Role, &item.Enabled,
+			&item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, wrapDB("scan sut repository", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("list sut repositories", err)
+	}
+	return items, nil
+}
+
+// CreateSUTRepository inserts one SUT-repository association.
+func (r *Repository) CreateSUTRepository(ctx context.Context, repository resource.SUTRepository) (resource.SUTRepository, error) {
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING created_at, updated_at
+	`, repository.ID, repository.SUTID, repository.RepoID, repository.Role,
+		repository.Enabled, repository.CreatedAt, repository.UpdatedAt)
+	if err := row.Scan(&repository.CreatedAt, &repository.UpdatedAt); err != nil {
+		return resource.SUTRepository{}, wrapDB("create sut repository", err)
+	}
+	return repository, nil
+}
+
+// DeleteSUTRepository removes one SUT-repository association.
+func (r *Repository) DeleteSUTRepository(ctx context.Context, id int64) error {
+	return r.exec(ctx, "delete sut repository", `DELETE FROM sut_repository WHERE id = $1`, id)
+}
+
 // ---------- Aggregates ----------
 
 // GetSUTGraph returns a SUT with every nested resource.
@@ -729,7 +780,7 @@ func (r *Repository) GetSUTGraph(ctx context.Context, sutID int64) (resource.SUT
 	if err != nil {
 		return resource.SUTGraph{}, err
 	}
-	accounts, err := r.ListAccounts(ctx, sutID)
+	accounts, err := r.ListAccounts(ctx)
 	if err != nil {
 		return resource.SUTGraph{}, err
 	}
@@ -802,8 +853,10 @@ func (r *Repository) ListCatalog(ctx context.Context) ([]resource.SUTGraph, erro
 		databasesBySUT[item.SUTID] = append(databasesBySUT[item.SUTID], item)
 	}
 	accountsBySUT := make(map[int64][]resource.TestAccount, len(suts))
-	for _, item := range accounts {
-		accountsBySUT[item.SUTID] = append(accountsBySUT[item.SUTID], item)
+	// The test-account pool is global (DB-15); every SUT detail exposes the same
+	// pool because accounts no longer have SUT ownership.
+	for _, sut := range suts {
+		accountsBySUT[sut.ID] = accounts
 	}
 
 	graphs := make([]resource.SUTGraph, 0, len(suts))

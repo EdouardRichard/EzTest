@@ -1,13 +1,13 @@
 package versionapi
 
 import (
-	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // ---------- response DTOs ----------
@@ -15,6 +15,8 @@ import (
 type versionDTO struct {
 	ID                        string               `json:"id"`
 	Title                     string               `json:"title"`
+	Description               string               `json:"description"`
+	Goal                      string               `json:"goal"`
 	Status                    string               `json:"status"`
 	AutoDesignNewRequirements bool                 `json:"auto_design_new_requirements"`
 	Bindings                  []bindingDTO         `json:"bindings"`
@@ -46,15 +48,31 @@ type requirementCountsDTO struct {
 }
 
 type bindingDTO struct {
-	ID                 string             `json:"id"`
-	CodeBaselineCommit *string            `json:"codeBaselineCommit,omitempty"`
-	SUT                sutDTO             `json:"sut"`
-	Environment        environmentDTO     `json:"environment"`
-	Repository         *codeRepositoryDTO `json:"repository"`
-	Pages              []pageDTO          `json:"pages"`
-	APIs               []apiDTO           `json:"apis"`
-	Databases          []databaseDTO      `json:"databases"`
-	Accounts           []accountDTO       `json:"accounts"`
+	ID                 string                 `json:"id"`
+	CodeBaselineCommit *string                `json:"codeBaselineCommit,omitempty"`
+	SUT                sutDTO                 `json:"sut"`
+	Environment        environmentDTO         `json:"environment"`
+	Repository         *codeRepositoryDTO     `json:"repository"`
+	Repositories       []bindingRepositoryDTO `json:"repositories"`
+	ScopeExclude       scopeExcludeDTO        `json:"scope_exclude"`
+	Pages              []pageDTO              `json:"pages"`
+	APIs               []apiDTO               `json:"apis"`
+	Databases          []databaseDTO          `json:"databases"`
+	Accounts           []accountDTO           `json:"accounts"`
+}
+
+// scopeExcludeDTO is the v0.22 environment-level exclusion document (DB-11).
+type scopeExcludeDTO struct {
+	Pages     []string `json:"pages"`
+	APIs      []string `json:"apis"`
+	Databases []string `json:"databases"`
+}
+
+// bindingRepositoryDTO is one effective repository of a version binding.
+type bindingRepositoryDTO struct {
+	Repository codeRepositoryDTO `json:"repository"`
+	Role       string            `json:"role"`
+	Source     string            `json:"source"`
 }
 
 type versionSummaryDTO struct {
@@ -169,6 +187,8 @@ func toVersionDTO(view versionapp.VersionView) versionDTO {
 	return versionDTO{
 		ID:                        strconv.FormatInt(view.ID, 10),
 		Title:                     view.Title,
+		Description:               view.Description,
+		Goal:                      view.Goal,
 		Status:                    view.Status,
 		AutoDesignNewRequirements: view.AutoDesignNewRequirements,
 		Bindings:                  bindings,
@@ -216,17 +236,43 @@ func toBindingDTO(view versionapp.BindingView) bindingDTO {
 		converted := toCodeRepositoryDTO(*view.Repository)
 		repository = &converted
 	}
+	repositories := make([]bindingRepositoryDTO, 0, len(view.Repositories))
+	for _, item := range view.Repositories {
+		repositories = append(repositories, bindingRepositoryDTO{
+			Repository: toCodeRepositoryDTO(item.Repository),
+			Role:       item.Role,
+			Source:     item.Source,
+		})
+	}
 	return bindingDTO{
 		ID:                 strconv.FormatInt(view.ID, 10),
 		CodeBaselineCommit: formatOptionalString(view.CodeBaselineCommit),
 		SUT:                toSUTDTO(view.SUT),
 		Environment:        toEnvironmentDTO(view.Environment),
 		Repository:         repository,
+		Repositories:       repositories,
+		ScopeExclude:       toScopeExcludeDTO(view.ScopeExclude),
 		Pages:              pages,
 		APIs:               apis,
 		Databases:          databases,
 		Accounts:           accounts,
 	}
+}
+
+func toScopeExcludeDTO(scope version.ScopeExclude) scopeExcludeDTO {
+	return scopeExcludeDTO{
+		Pages:     decimalIDs(scope.Pages),
+		APIs:      decimalIDs(scope.APIs),
+		Databases: decimalIDs(scope.Databases),
+	}
+}
+
+func decimalIDs(ids []int64) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, strconv.FormatInt(id, 10))
+	}
+	return out
 }
 
 func toVersionSummaryDTO(view versionapp.VersionSummary) versionSummaryDTO {
@@ -383,24 +429,14 @@ func toCodeRepositoryDTO(view resourceapp.CodeRepositoryView) codeRepositoryDTO 
 
 // ---------- request payloads ----------
 
+// createVersionRequest is the v0.22 API-15 environment-only version payload.
+// The SUT is derived from the environment; pages, APIs, databases, accounts and
+// repositories are no longer accepted at creation (R-C3-2).
 type createVersionRequest struct {
-	Title    string         `json:"title"`
-	Bindings []bindingInput `json:"bindings"`
-}
-
-type bindingInput struct {
-	SUTID            string         `json:"sut_id"`
-	EnvironmentID    string         `json:"environment_id"`
-	CodeRepositoryID *string        `json:"code_repository_id"`
-	PageIDs          []string       `json:"page_ids"`
-	APIIDs           []string       `json:"api_ids"`
-	DatabaseIDs      []string       `json:"database_ids"`
-	Accounts         []accountInput `json:"accounts"`
-}
-
-type accountInput struct {
-	AccountID string `json:"account_id"`
-	Role      string `json:"role"`
+	Title         string `json:"title"`
+	Description   string `json:"description"`
+	Goal          string `json:"goal"`
+	EnvironmentID string `json:"environment_id"`
 }
 
 type updateVersionRequest struct {
@@ -415,75 +451,16 @@ type reopenVersionRequest struct {
 }
 
 func (r createVersionRequest) command() (versionapp.CreateCommand, error) {
-	command := versionapp.CreateCommand{
-		Title:    r.Title,
-		Bindings: make([]versionapp.BindingInput, 0, len(r.Bindings)),
+	environmentID, err := validation.NonEmptyID("environment_id", r.EnvironmentID)
+	if err != nil {
+		return versionapp.CreateCommand{}, err
 	}
-	for index, binding := range r.Bindings {
-		field := func(name string) string { return fmt.Sprintf("bindings[%d].%s", index, name) }
-
-		sutID, err := validation.NonEmptyID(field("sut_id"), binding.SUTID)
-		if err != nil {
-			return versionapp.CreateCommand{}, err
-		}
-		environmentID, err := validation.NonEmptyID(field("environment_id"), binding.EnvironmentID)
-		if err != nil {
-			return versionapp.CreateCommand{}, err
-		}
-		var repositoryID *int64
-		if binding.CodeRepositoryID != nil && *binding.CodeRepositoryID != "" {
-			parsed, err := validation.NonEmptyID(field("code_repository_id"), *binding.CodeRepositoryID)
-			if err != nil {
-				return versionapp.CreateCommand{}, err
-			}
-			repositoryID = &parsed
-		}
-		pageIDs, err := parseIDs(binding.PageIDs, field("page_ids"))
-		if err != nil {
-			return versionapp.CreateCommand{}, err
-		}
-		apiIDs, err := parseIDs(binding.APIIDs, field("api_ids"))
-		if err != nil {
-			return versionapp.CreateCommand{}, err
-		}
-		databaseIDs, err := parseIDs(binding.DatabaseIDs, field("database_ids"))
-		if err != nil {
-			return versionapp.CreateCommand{}, err
-		}
-		accounts := make([]versionapp.AccountInput, 0, len(binding.Accounts))
-		for accountIndex, account := range binding.Accounts {
-			accountID, err := validation.NonEmptyID(
-				fmt.Sprintf("%s[%d].account_id", field("accounts"), accountIndex), account.AccountID,
-			)
-			if err != nil {
-				return versionapp.CreateCommand{}, err
-			}
-			accounts = append(accounts, versionapp.AccountInput{AccountID: accountID, Role: account.Role})
-		}
-
-		command.Bindings = append(command.Bindings, versionapp.BindingInput{
-			SUTID:            sutID,
-			EnvironmentID:    environmentID,
-			CodeRepositoryID: repositoryID,
-			PageIDs:          pageIDs,
-			APIIDs:           apiIDs,
-			DatabaseIDs:      databaseIDs,
-			Accounts:         accounts,
-		})
-	}
-	return command, nil
-}
-
-func parseIDs(raw []string, field string) ([]int64, error) {
-	ids := make([]int64, 0, len(raw))
-	for index, value := range raw {
-		id, err := validation.NonEmptyID(fmt.Sprintf("%s[%d]", field, index), value)
-		if err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, nil
+	return versionapp.CreateCommand{
+		Title:         r.Title,
+		Description:   r.Description,
+		Goal:          r.Goal,
+		EnvironmentID: environmentID,
+	}, nil
 }
 
 func formatTime(value time.Time) string {

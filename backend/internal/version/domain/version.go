@@ -1,6 +1,7 @@
 // Package version is the version/binding bounded context. A version pins a
-// testable snapshot of one or more SUTs: every binding selects an environment,
-// optional code repository, page/API scope, target databases and test accounts.
+// testable snapshot of one SUT environment: the SUT is derived from the selected
+// environment, page/API/database exclusions are recorded in version_sut and the
+// version inherits the SUT repositories and the global test-account pool.
 package version
 
 import (
@@ -18,17 +19,16 @@ const (
 	StatusCompleted = "completed"
 )
 
-// Binding cardinality and title limits.
-const (
-	MinBindings    = 1
-	MaxBindings    = 20
-	MaxTitleLength = 200
-)
+// MaxTitleLength caps the version title.
+const MaxTitleLength = 200
 
 // Version is one version workspace.
 type Version struct {
-	ID                        int64
-	Title                     string
+	ID    int64
+	Title string
+	// Description and Goal are the free-form version metadata of v0.22 R-C3-4.
+	Description               string
+	Goal                      string
 	Status                    string
 	AutoDesignNewRequirements bool
 	// Stage is the deterministic stage-machine state (spec §5.3). Only the

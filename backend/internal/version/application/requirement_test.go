@@ -518,7 +518,7 @@ func TestRequirementCreateValidatesContentAndTargets(t *testing.T) {
 		{"bad priority", func(d *versionapp.RequirementDraft) { d.Priority = "P9" }, "priority", 400},
 		{"bad constraints", func(d *versionapp.RequirementDraft) { d.Constraints = json.RawMessage(`[1]`) }, "constraints", 400},
 		{"unknown version sut", func(d *versionapp.RequirementDraft) { d.TargetVersionSUTs = []string{"9999"} }, "targets.version_suts", 400},
-		{"page outside version scope", func(d *versionapp.RequirementDraft) { d.TargetPages = []string{"1302"} }, "targets.pages", 400},
+		{"page outside version scope", func(d *versionapp.RequirementDraft) { d.TargetPages = []string{"1303"} }, "targets.pages", 400},
 		{"unknown api", func(d *versionapp.RequirementDraft) { d.TargetAPIs = []string{"9999"} }, "targets.apis", 400},
 		{"non decimal target", func(d *versionapp.RequirementDraft) { d.TargetPages = []string{"page-a"} }, "targets.pages", 400},
 	}

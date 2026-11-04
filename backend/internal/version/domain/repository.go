@@ -39,6 +39,12 @@ type Repository interface {
 	Get(ctx context.Context, id int64) (Version, []Binding, error)
 	List(ctx context.Context, limit int, beforeID *int64) ([]Summary, error)
 	Update(ctx context.Context, version Version) (Version, error)
+	// UpdateBinding rewrites the editable binding projection of one existing
+	// version: the environment and scope_exclude of version_sut, the
+	// version_repository_override rows and the version_account rows. It is one
+	// transaction and yields ErrNotFound when the version or its binding is
+	// missing.
+	UpdateBinding(ctx context.Context, version Version, binding Binding) error
 
 	// SetCodeBaselineCommit writes the resolved commit SHA of one version_sut
 	// binding (P5 §5.5). The first successful code index uses it to backfill a

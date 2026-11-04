@@ -15,6 +15,7 @@ func baselineBinding(commit string) version.Binding {
 		SUTID:              1001,
 		EnvironmentID:      1101,
 		CodeBaselineCommit: commit,
+		ScopeExclude:       version.NewScopeExclude(nil, nil, nil),
 	}
 }
 
@@ -47,5 +48,73 @@ func TestBindingValidateRejectsMalformedCommit(t *testing.T) {
 				t.Fatalf("field = %q, want code_baseline_commit", field)
 			}
 		})
+	}
+}
+
+func TestNewScopeExcludeNormalizesEmptyLists(t *testing.T) {
+	scope := version.NewScopeExclude(nil, nil, nil)
+	if scope.Pages == nil || scope.APIs == nil || scope.Databases == nil {
+		t.Fatalf("scope = %#v, want non-nil lists", scope)
+	}
+	if err := scope.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestScopeExcludeValidateRejectsNonPositiveIDs(t *testing.T) {
+	cases := map[string]version.ScopeExclude{
+		"pages":     version.NewScopeExclude([]int64{0}, nil, nil),
+		"apis":      version.NewScopeExclude(nil, []int64{-1}, nil),
+		"databases": version.NewScopeExclude(nil, nil, []int64{0}),
+	}
+	for name, scope := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := scope.Validate()
+			if err == nil {
+				t.Fatal("Validate accepted a non-positive ID")
+			}
+			var apiErr *platform.Error
+			if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+				t.Fatalf("err = %v, want a 400 platform error", err)
+			}
+		})
+	}
+}
+
+func TestBindingValidateRejectsInvalidOverrides(t *testing.T) {
+	binding := baselineBinding("")
+	binding.RepositoryOverrides = []version.RepositoryOverride{{RepoID: 0, Included: true}}
+	if err := binding.Validate(); err == nil {
+		t.Fatal("Validate accepted a zero repository override ID")
+	}
+	binding.RepositoryOverrides = nil
+	binding.Accounts = []version.AccountBinding{{AccountID: 0}}
+	if err := binding.Validate(); err == nil {
+		t.Fatal("Validate accepted a zero account ID")
+	}
+}
+
+func TestBindingEditableStageGate(t *testing.T) {
+	editable := []version.Stage{
+		version.StageCreated,
+		version.StageClarifying,
+		version.StageRequirementReview,
+		version.StageDesigning,
+		version.StageCaseReview,
+	}
+	for _, stage := range editable {
+		if !version.BindingEditable(stage) {
+			t.Fatalf("stage %q must allow binding edits", stage)
+		}
+	}
+	readOnly := []version.Stage{
+		version.StageExecuting,
+		version.StageReporting,
+		version.StageCompleted,
+	}
+	for _, stage := range readOnly {
+		if version.BindingEditable(stage) {
+			t.Fatalf("stage %q must be read-only", stage)
+		}
 	}
 }
