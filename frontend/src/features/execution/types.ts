@@ -164,8 +164,13 @@ export type ExecutionOverview = {
   case_run_counts: CaseRunCounts
   open_human_requests: number
   executor: ExecutorStatusView | null
-  quotas: ExecutionQuotas
-  human_request_timeout_seconds: number
+  /**
+   * The overview always carries the effective settings, but older/fake
+   * projections may omit them; the UI treats a missing block as unavailable
+   * rather than crashing (v0.22 audit §2.5-5, Task 37 wiring).
+   */
+  quotas?: ExecutionQuotas
+  human_request_timeout_seconds?: number
 }
 
 /* ----------------------------------- wave ---------------------------------- */
@@ -219,7 +224,7 @@ export type CaseRunSummary = {
   last_error?: string
   next_action?: string
   /** Observed agent-run usage; absent on rows settled before usage persisted. */
-  usage?: CaseRunUsage
+  usage?: CaseRunUsage | null
 }
 
 /** `CaseRunView` (spec §9.3). */

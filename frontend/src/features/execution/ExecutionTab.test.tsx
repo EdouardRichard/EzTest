@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -10,6 +10,8 @@ const api = vi.hoisted(() => ({
   getWave: vi.fn(),
   listCaseRuns: vi.fn(),
   getCaseRun: vi.fn(),
+  getEvidence: vi.fn(),
+  downloadEvidence: vi.fn(),
   listHumanRequests: vi.fn(),
   pauseWave: vi.fn(),
   resumeWave: vi.fn(),
@@ -35,23 +37,84 @@ vi.mock("@/features/clarification/useVersionEvents", () => ({
 
 import { ExecutionTab } from "./ExecutionTab"
 import {
+  blockedCaseRunFixture,
   caseRunDetailFixture,
   caseRunsFixture,
   clarificationQuestionFixture,
   doneWaveFixture,
   emptyOverviewFixture,
+  evidenceTextFixture,
   executionOverviewFixture,
+  failedCaseRunFixture,
   humanRequestFixture,
   offlineExecutorOverviewFixture,
+  passedCaseRunFixture,
   pausedWaveFixture,
+  runningCaseRunFixture,
   runningWaveFixture,
 } from "./test-fixtures"
+import type { CaseRun, ExecutionOverview, RunWave, WaveCounts } from "./types"
+
+function zeroWaveCounts(): WaveCounts {
+  return {
+    total: 0,
+    pending: 0,
+    running: 0,
+    paused: 0,
+    passed: 0,
+    failed: 0,
+    blocked: 0,
+    inconclusive: 0,
+    skipped: 0,
+    interrupted: 0,
+    superseded: 0,
+    evidence: 0,
+    by_version_sut: {},
+  }
+}
+
+/** A running wave whose persisted counts projection is still all zeros. */
+function staleWave(overrides: Partial<RunWave> = {}): RunWave {
+  return { ...runningWaveFixture, counts: zeroWaveCounts(), ...overrides }
+}
+
+/** Five real case runs: 2 passed / 1 failed / 1 blocked / 1 running. */
+function fiveCaseRuns(): CaseRun[] {
+  return [
+    passedCaseRunFixture,
+    {
+      ...passedCaseRunFixture,
+      id: "9311",
+      intent_id: "9111",
+      case_id: "7011",
+      case_version_id: "7012",
+      title: "退款金额四舍五入",
+    },
+    {
+      ...blockedCaseRunFixture,
+      summary: {
+        ...blockedCaseRunFixture.summary,
+        terminal_cause: "blocked",
+        last_error: "缺少管理员账号",
+        next_action: "resolve_blocker",
+      },
+    },
+    failedCaseRunFixture,
+    runningCaseRunFixture,
+  ]
+}
 
 function mockWorkspace() {
   api.getOverview.mockResolvedValue(executionOverviewFixture)
   api.listWaves.mockResolvedValue([runningWaveFixture, doneWaveFixture])
   api.listCaseRuns.mockResolvedValue(caseRunsFixture)
   api.getCaseRun.mockResolvedValue(caseRunDetailFixture)
+  api.getEvidence.mockResolvedValue(evidenceTextFixture)
+  api.downloadEvidence.mockResolvedValue({
+    blob: new Blob(["PASS login as admin"], { type: "text/plain" }),
+    filename: "console.log",
+    contentType: "text/plain",
+  })
   api.listHumanRequests.mockResolvedValue([])
   api.pauseWave.mockResolvedValue(pausedWaveFixture)
   api.resumeWave.mockResolvedValue(runningWaveFixture)
@@ -70,7 +133,10 @@ describe("ExecutionTab", () => {
     mockWorkspace()
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    window.history.replaceState({}, "", "/")
+  })
 
   it("shows a loading state while the execution snapshot loads", () => {
     const pending = new Promise<never>(() => {})
@@ -327,5 +393,190 @@ describe("ExecutionTab", () => {
       })
     })
     await waitFor(() => expect(api.getOverview).toHaveBeenCalledTimes(2))
+  })
+
+  it("shows non-zero running counts derived from real case-run fields", async () => {
+    const wave = staleWave()
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: wave,
+      counts: wave.counts,
+    })
+    api.listWaves.mockResolvedValue([wave, doneWaveFixture])
+    api.listCaseRuns.mockResolvedValue(fiveCaseRuns())
+
+    render(<ExecutionTab versionId="2001" />)
+
+    // v0.22 audit §2.5-3: the backend projection stays all-zero while a wave is
+    // running. The tab must fall back to the loaded case runs, not show 0/0.
+    const counts = await screen.findByTestId("execution-counts")
+    expect(counts).toHaveTextContent("共 5 条")
+    expect(counts).toHaveTextContent("通过 2")
+    expect(counts).toHaveTextContent("失败 1")
+    expect(counts).toHaveTextContent("阻塞 1")
+    expect(counts).toHaveTextContent("未定 0")
+
+    const toolbar = screen.getByTestId("execution-toolbar")
+    expect(toolbar).toHaveTextContent("共 5 条")
+    expect(toolbar).toHaveTextContent("通过 2")
+    expect(toolbar).toHaveTextContent("失败 1")
+  })
+
+  it("keeps non-zero counts after the wave completes", async () => {
+    const wave = staleWave({
+      status: "done",
+      finished_at: "2026-10-31T12:02:00Z",
+    })
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: null,
+      counts: zeroWaveCounts(),
+    })
+    api.listWaves.mockResolvedValue([wave])
+    api.listCaseRuns.mockResolvedValue(fiveCaseRuns())
+
+    render(<ExecutionTab versionId="2001" />)
+
+    const counts = await screen.findByTestId("execution-counts")
+    expect(counts).toHaveTextContent("通过 2")
+    expect(counts).toHaveTextContent("失败 1")
+    expect(counts).toHaveTextContent("共 5 条")
+  })
+
+  it("renders an explicit empty state instead of a fake pass for zero data", async () => {
+    const wave = staleWave()
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      active_wave: wave,
+      counts: wave.counts,
+    })
+    api.listWaves.mockResolvedValue([wave])
+    api.listCaseRuns.mockResolvedValue([])
+
+    render(<ExecutionTab versionId="2001" />)
+
+    const empty = await screen.findByTestId("execution-counts-empty")
+    expect(empty).toHaveTextContent("暂无执行数据")
+    expect(screen.queryByTestId("execution-counts")).not.toBeInTheDocument()
+  })
+
+  it("opens the evidence deep link from ?evidence=", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/versions/2001?tab=execution&wave=9201&case_run=9302&evidence=9402",
+    )
+
+    render(<ExecutionTab versionId="2001" />)
+
+    // The deep link opens the immutable evidence dialog directly, even before a
+    // user expands the owning case run.
+    expect(await screen.findByRole("dialog", { name: "证据 #9402" })).toBeInTheDocument()
+    expect(api.getEvidence).toHaveBeenCalledWith("2001", "9402")
+    expect(await screen.findByTestId("evidence-text")).toHaveTextContent("PASS login as admin")
+  })
+
+  it("notices a missing evidence deep link without crashing", async () => {
+    api.getEvidence.mockRejectedValue(
+      new ApiError({
+        status: 404,
+        code: "not_found",
+        message: "证据不存在",
+        requestId: "req_evidence",
+      }),
+    )
+
+    render(<ExecutionTab versionId="2001" initialEvidenceId="9999" />)
+
+    const notice = await screen.findByTestId("evidence-deep-link-notice")
+    expect(notice).toHaveTextContent("未找到证据 #9999")
+    // The workspace itself keeps rendering behind the non-fatal notice.
+    expect(await screen.findByRole("heading", { name: "波次 #9201" })).toBeInTheDocument()
+  })
+
+  it("shows a blocked case run with its blocker reason and next action", async () => {
+    api.listCaseRuns.mockResolvedValue(fiveCaseRuns())
+
+    render(<ExecutionTab versionId="2001" />)
+
+    const blocked = await screen.findByTestId("blocked-case-run-9303")
+    expect(blocked).toHaveTextContent("缺少管理员账号")
+    expect(blocked).toHaveTextContent("先解决阻塞条件")
+  })
+
+  it("keeps the login takeover as the single blocked surface for its case run", async () => {
+    // The blocked case 9303 already owns an open login-takeover request; the
+    // takeover banner is the actionable surface and the generic blocked banner
+    // must not stack on top of it.
+    api.listHumanRequests.mockResolvedValue([
+      { ...humanRequestFixture, expires_at: "2099-01-01T00:00:00Z" },
+    ])
+
+    render(<ExecutionTab versionId="2001" />)
+
+    expect(await screen.findByTestId("human-request-banner")).toBeInTheDocument()
+    expect(screen.queryByTestId("blocked-case-run-9303")).not.toBeInTheDocument()
+  })
+
+  it("does not stack a case_run.blocked notice on a login takeover", async () => {
+    api.listHumanRequests.mockResolvedValue([
+      { ...humanRequestFixture, expires_at: "2099-01-01T00:00:00Z" },
+    ])
+
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByTestId("human-request-banner")
+
+    await act(async () => {
+      events.handlers?.onCaseRunChanged?.({
+        type: "case_run.blocked",
+        payload: {
+          case_run_id: "9399",
+          reason: "no_executor",
+          action: "等待执行器注册后重试",
+        },
+      } as never)
+    })
+
+    expect(screen.queryByTestId("case-run-blocked-event-notice")).not.toBeInTheDocument()
+  })
+
+  it("consumes case_run.blocked events with reason and action", async () => {
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByRole("heading", { name: "波次 #9201" })
+
+    events.handlers?.onCaseRunChanged?.({
+      type: "case_run.blocked",
+      payload: {
+        case_run_id: "9399",
+        reason: "no_executor",
+        action: "等待执行器注册后重试",
+      },
+    } as never)
+
+    const notice = await screen.findByTestId("case-run-blocked-event-notice")
+    expect(notice).toHaveTextContent("没有可用的执行器")
+    expect(notice).toHaveTextContent("等待执行器注册后重试")
+  })
+
+  it("shows the execution TTL and quota settings without crashing", async () => {
+    render(<ExecutionTab versionId="2001" />)
+
+    const settings = await screen.findByTestId("execution-settings")
+    expect(settings).toHaveTextContent("人工请求 TTL 30 分钟")
+    expect(settings).toHaveTextContent("全局 3")
+    expect(settings).toHaveTextContent("每 SUT 2")
+    expect(settings).toHaveTextContent("用例超时")
+  })
+
+  it("renders when the execution settings are missing", async () => {
+    const overview: Record<string, unknown> = { ...executionOverviewFixture }
+    delete overview.human_request_timeout_seconds
+    delete overview.quotas
+    api.getOverview.mockResolvedValue(overview as unknown as ExecutionOverview)
+
+    render(<ExecutionTab versionId="2001" />)
+
+    expect(await screen.findByTestId("execution-settings")).toHaveTextContent("不可用")
+    expect(await screen.findByRole("heading", { name: "波次 #9201" })).toBeInTheDocument()
   })
 })

@@ -13,6 +13,7 @@ import {
   ASSERTION_VERDICT_LABEL,
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
+  CASE_RUN_TERMINAL_STATUSES,
   EVIDENCE_KIND_LABEL,
   failureClassLabel,
   nextActionLabel,
@@ -167,20 +168,40 @@ export function CaseRunDetailView({
     (item) => item.step_seq === null || item.step_seq === undefined,
   )
   const terminalCause = terminalCauseLabel(run.summary.terminal_cause)
-  const nextAction = nextActionLabel(run.summary.next_action)
-  const usage = run.summary.usage
+  const verdictReason =
+    typeof run.summary.verdict_reason === "string" ? run.summary.verdict_reason.trim() : ""
+  const lastError = typeof run.summary.last_error === "string" ? run.summary.last_error.trim() : ""
+  const nextAction =
+    nextActionLabel(run.summary.next_action) ??
+    (run.status === "blocked" ? "先解决阻塞条件（账号/环境/数据），再重跑用例" : null)
+  // `usage` is nullable on the wire (v0.22 audit §2.5-2): a terminal row settled
+  // before telemetry persisted answers `null`, not an object. Never read through
+  // it without checking; state "遥测不可用" instead of crashing the execution tab.
+  const usage = run.summary.usage ?? null
+  const hasUsage =
+    usage !== null && typeof usage.total_tokens === "number" && usage.total_tokens > 0
   // The persisted explanation belongs to every terminal cause (budget/agent
   // stop, blocked, failure-derived); the inconclusive fallback keeps older rows
-  // that only carried last_error visible.
+  // that only carried last_error visible. A blocked row without last_error falls
+  // back to its verdict reason so the blocker is never hidden.
   const terminalDetail =
-    terminalCause !== null || run.status === "inconclusive"
-      ? (run.summary.last_error?.trim() ?? "")
+    terminalCause !== null || run.status === "inconclusive" || run.status === "blocked"
+      ? lastError.length > 0
+        ? lastError
+        : run.status === "blocked"
+          ? (terminalCauseLabel(verdictReason) ?? verdictReason)
+          : ""
       : ""
 
   return (
     <div data-testid="case-run-detail" className="space-y-2">
       <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-        <Badge tone={CASE_RUN_STATUS_TONE[run.status]}>{CASE_RUN_STATUS_LABEL[run.status]}</Badge>
+        <span data-testid="case-run-status">
+          <Badge tone={CASE_RUN_STATUS_TONE[run.status]}>{CASE_RUN_STATUS_LABEL[run.status]}</Badge>
+        </span>
+        <span data-testid="case-run-duration" className="text-muted-foreground">
+          时长 {spanDuration(run.started_at, run.finished_at)}
+        </span>
         <span className="text-muted-foreground">尝试 {run.attempts} 次</span>
         {run.failure_class !== "" ? (
           <span className="text-muted-foreground">
@@ -191,9 +212,8 @@ export function CaseRunDetailView({
           <span data-testid="case-run-terminal-cause" className="font-medium text-warning">
             原因 {terminalCause}
           </span>
-        ) : typeof run.summary.verdict_reason === "string" &&
-          run.summary.verdict_reason.length > 0 ? (
-          <span className="text-muted-foreground">原因 {run.summary.verdict_reason}</span>
+        ) : verdictReason.length > 0 ? (
+          <span className="text-muted-foreground">原因 {verdictReason}</span>
         ) : null}
       </div>
 
@@ -216,7 +236,7 @@ export function CaseRunDetailView({
         </p>
       ) : null}
 
-      {usage !== undefined && usage.total_tokens > 0 ? (
+      {hasUsage && usage !== null ? (
         <p
           data-testid="case-run-usage"
           className="text-[11px] leading-relaxed text-muted-foreground"
@@ -224,6 +244,13 @@ export function CaseRunDetailView({
           <span className="font-medium text-foreground">用量：</span>
           {usage.total_tokens} tokens
           {usage.turns > 0 ? ` · ${usage.turns} 轮` : ""}
+        </p>
+      ) : CASE_RUN_TERMINAL_STATUSES.includes(run.status) ? (
+        <p
+          data-testid="case-run-telemetry-unavailable"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          遥测不可用
         </p>
       ) : null}
 
