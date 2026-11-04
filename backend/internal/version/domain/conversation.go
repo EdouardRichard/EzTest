@@ -24,6 +24,27 @@ const (
 	ConversationClosed        = "closed"
 )
 
+// Conversation message kinds (design DB-3, B §5.1/§5.2). The Host reply is
+// text; a structured question is question; the DB CHECK constraint is the final
+// guard, so the application validates before writing.
+const (
+	MessageKindText     = "text"
+	MessageKindQuestion = "question"
+	MessageKindAnswer   = "answer"
+	MessageKindSystem   = "system"
+	MessageKindArtifact = "artifact"
+)
+
+// ConversationWriterLeaseDuration is the single-writer lease of one
+// conversation (B §5.1): 90 seconds, renewed by the Host's heartbeat. A crashed
+// turn is recoverable once the lease expires.
+const ConversationWriterLeaseDuration = 90 * time.Second
+
+// hostTurnClientMessageIDPrefix is the reserved client_message_id namespace of
+// a Host turn's idempotency key. User-supplied client ids must not collide with
+// it, otherwise a retried turn could resolve a user message (or vice versa).
+const hostTurnClientMessageIDPrefix = "host-turn:"
+
 // Message roles and part types.
 const (
 	MessageRoleUser      = "user"
@@ -69,6 +90,14 @@ const (
 var (
 	ErrConversationNotFound = errors.New("conversation not found")
 	ErrMessageNotFound      = errors.New("message not found")
+	// ErrConversationBusy reports that another Host turn holds the conversation's
+	// single-writer lease (typed 409 conversation_busy at the API edge).
+	ErrConversationBusy = errors.New("conversation is being written by another turn")
+	// ErrNotConversationWriter reports that the caller does not own the active
+	// writer lease (typed 403 not_writer at the API edge). Background jobs have
+	// no conversation.append capability; only the lease owner may write Host
+	// replies (R-B2-3/R-B2-4).
+	ErrNotConversationWriter = errors.New("not the active writer of the conversation")
 	// ErrJobCardCancelled reports that a job-card rewrite was rejected because
 	// the stored card is already cancelled: a late runner projection must never
 	// overwrite the terminal cancel snapshot. Callers treat it as an ignored,
@@ -89,6 +118,13 @@ type Conversation struct {
 	// (`llm_model.model`). Nil means "use the LLM config default_model_id";
 	// the runtime never switches models on its own (D24).
 	ModelOverride *string
+	// ActiveTurnID/ActiveAgent/LeaseUntil are the single-writer lease of the
+	// conversation (B §5.1 DB-2): while ActiveTurnID is non-nil that Host turn is
+	// the only writer allowed to append assistant messages, and LeaseUntil gates
+	// recovery after a crash. All three are cleared together.
+	ActiveTurnID  *int64
+	ActiveAgent   *string
+	LeaseUntil    *time.Time
 	CreatedBy     *int64
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
@@ -126,6 +162,13 @@ type Message struct {
 	AgentRunID       *int64
 	ClientMessageID  *string
 	ReplyToMessageID *int64
+	// AuthorAgent is the agent profile key that authored an assistant message
+	// (DB conversation_message.author_agent, B §5.1). It is empty for user
+	// messages and for server-generated cards (job_card/requirement_card).
+	AuthorAgent string
+	// Kind is the conversation_message kind enum (text/question/answer/system/
+	// artifact, DB-3). Empty is normalized to text for legacy writers.
+	Kind string
 	// ActualModel is the model that actually generated an assistant message,
 	// read from the linked agent_run. Empty for user messages and for
 	// assistant messages without a run (contracts `actual_model`).
@@ -515,6 +558,27 @@ type ConversationRepository interface {
 	// returns the already-stored message instead of an error.
 	PostUserMessage(ctx context.Context, conversationID int64, message Message) (*Message, bool, error)
 	AppendAssistantMessage(ctx context.Context, conversationID int64, message Message) error
+	// AcquireWriter atomically claims the conversation's single-writer lease for
+	// (turnID, agent) until leaseUntil. It succeeds when the conversation is idle
+	// (no active turn), when the stored lease already expired at now, or when the
+	// same turn/agent re-acquires (idempotent retry). A different live turn is
+	// ErrConversationBusy; an unknown conversation is ErrConversationNotFound.
+	AcquireWriter(ctx context.Context, conversationID, turnID int64, agent string, now, leaseUntil time.Time) error
+	// RenewWriterLease extends the lease of the current owner (heartbeat). It
+	// fails with ErrNotConversationWriter when turnID/agent no longer own a
+	// non-expired lease, and ErrConversationNotFound for an unknown conversation.
+	RenewWriterLease(ctx context.Context, conversationID, turnID int64, agent string, now, leaseUntil time.Time) error
+	// ReleaseWriter clears the lease of the current owner (clean turn end). A
+	// foreign turn is ErrNotConversationWriter and an already-released lease is a
+	// no-op; an unknown conversation is ErrConversationNotFound.
+	ReleaseWriter(ctx context.Context, conversationID, turnID int64, agent string) error
+	// AppendAssistantMessageAsWriter inserts one assistant message only when
+	// (turnID, agent) owns the live lease. An idle conversation or an expired
+	// lease is taken over atomically inside the write transaction (crash
+	// recovery); a different live writer is ErrConversationBusy. A repeated
+	// client_message_id returns the stored message with created=false instead of
+	// appending a duplicate (turn-level idempotency).
+	AppendAssistantMessageAsWriter(ctx context.Context, conversationID int64, message Message, turnID int64, agent string, now, leaseUntil time.Time) (*Message, bool, error)
 	Summary(ctx context.Context, conversationID int64) (*ConversationSummary, error)
 	// SaveSummary inserts a new summary version computed by the adapter.
 	SaveSummary(ctx context.Context, summary ConversationSummary) (ConversationSummary, error)
@@ -548,10 +612,49 @@ func ValidateConversationTitle(title string) error {
 	return validation.String("title", title, 1, ConversationTitleMax)
 }
 
-// ValidateClientMessageID validates the optional idempotency key length.
+// ValidateConversationMessageKind validates the DB-3 conversation_message kind
+// enum. Empty is the legacy default: NormalizeMessageKind maps it to text before
+// a write, and callers validate the normalized value.
+func ValidateConversationMessageKind(kind string) error {
+	switch kind {
+	case MessageKindText, MessageKindQuestion, MessageKindAnswer, MessageKindSystem, MessageKindArtifact:
+		return nil
+	default:
+		return platform.Invalid("kind", "must be one of text, question, answer, system, artifact")
+	}
+}
+
+// NormalizeMessageKind maps the empty legacy value to text and leaves explicit
+// kinds untouched.
+func NormalizeMessageKind(kind string) string {
+	if kind == "" {
+		return MessageKindText
+	}
+	return kind
+}
+
+// HostTurnClientMessageID derives the reserved idempotency key of one Host
+// turn. Assistant message writes store it in conversation_message.
+// client_message_id, so a retried turn resolves the stored message instead of
+// appending a duplicate (B §5.1: client_message_id / turn_id).
+func HostTurnClientMessageID(turnID int64) string {
+	return hostTurnClientMessageIDPrefix + strconv.FormatInt(turnID, 10)
+}
+
+// IsReservedClientMessageID reports whether raw collides with the Host-turn
+// idempotency namespace. User client ids may not use it.
+func IsReservedClientMessageID(raw string) bool {
+	return strings.HasPrefix(raw, hostTurnClientMessageIDPrefix)
+}
+
+// ValidateClientMessageID validates the optional idempotency key length and
+// keeps the reserved Host-turn namespace out of user input.
 func ValidateClientMessageID(raw string) error {
 	if utf8.RuneCountInString(raw) > ClientMessageIDMax {
 		return platform.Invalid("client_message_id", "must be at most 64 characters")
+	}
+	if IsReservedClientMessageID(raw) {
+		return platform.Invalid("client_message_id", "must not use the reserved host-turn idempotency namespace")
 	}
 	return nil
 }

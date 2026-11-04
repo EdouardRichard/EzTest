@@ -23,6 +23,135 @@ import (
 // import the LLM context (Agent.md §6.9.7).
 const CodeLLMCapabilityMismatch = "llm_capability_mismatch"
 
+// Single-writer conversation error codes (design §4.10 R-B2-3/R-B2-4, B §5.1).
+// The HTTP edge maps them to 409/403; the application returns the typed
+// BusyError/NotWriterError so the mapping never has to parse strings.
+const (
+	CodeConversationBusy = "conversation_busy"
+	CodeNotWriter        = "not_writer"
+)
+
+// NotWriterError reasons.
+const (
+	// NotWriterReasonNoLease means the call did not carry a Host writer
+	// identity (a background job has no conversation.append capability).
+	NotWriterReasonNoLease = "no_writer_lease"
+	// NotWriterReasonLeaseLost means the caller's turn no longer owns a live
+	// lease (expired or taken over).
+	NotWriterReasonLeaseLost = "lease_lost"
+	// NotWriterReasonServerWriter means a non-Host server path tried to append
+	// assistant text while a Host turn owned the conversation.
+	NotWriterReasonServerWriter = "background_writer"
+)
+
+// Writer identifies the single active Host turn that owns a conversation's
+// writer lease. TurnID is the Host turn identifier; Agent is the author_agent
+// profile key (for example clarification_host/design_host).
+type Writer struct {
+	TurnID int64
+	Agent  string
+}
+
+// WriterLease is a granted single-writer lease.
+type WriterLease struct {
+	ConversationID int64
+	TurnID         int64
+	Agent          string
+	ExpiresAt      time.Time
+}
+
+// BusyError is the typed 409 conversation_busy failure: another live Host turn
+// holds the conversation's writer lease. It unwraps to
+// version.ErrConversationBusy and to the platform error carrying the HTTP
+// status/code/details.
+type BusyError struct {
+	ConversationID int64
+	ActiveTurnID   *int64
+	ActiveAgent    *string
+	LeaseUntil     *time.Time
+	api            *platform.Error
+}
+
+func (e *BusyError) Error() string {
+	return CodeConversationBusy + ": conversation is being written by another host turn"
+}
+
+// Unwrap exposes the domain sentinel and the API error to errors.Is/As.
+func (e *BusyError) Unwrap() []error {
+	errs := []error{version.ErrConversationBusy}
+	if e.api != nil {
+		errs = append(errs, e.api)
+	}
+	return errs
+}
+
+func newBusyError(conversation version.Conversation) *BusyError {
+	details := map[string]any{"conversation_id": platformid.Format(conversation.ID)}
+	if conversation.ActiveTurnID != nil {
+		details["active_turn_id"] = platformid.Format(*conversation.ActiveTurnID)
+	}
+	if conversation.ActiveAgent != nil && *conversation.ActiveAgent != "" {
+		details["active_agent"] = *conversation.ActiveAgent
+	}
+	if conversation.LeaseUntil != nil {
+		details["lease_until"] = conversation.LeaseUntil.UTC().Format(time.RFC3339)
+	}
+	apiErr := platform.NewError(http.StatusConflict, CodeConversationBusy,
+		"conversation is being written by another host turn")
+	apiErr.Details = details
+	return &BusyError{
+		ConversationID: conversation.ID,
+		ActiveTurnID:   conversation.ActiveTurnID,
+		ActiveAgent:    conversation.ActiveAgent,
+		LeaseUntil:     conversation.LeaseUntil,
+		api:            apiErr,
+	}
+}
+
+// NotWriterError is the typed 403 not_writer failure: the caller is not the
+// active writer of the conversation (no writer identity, a lost/expired lease,
+// or a background path while a Host owns the conversation). It unwraps to
+// version.ErrNotConversationWriter and to the platform error.
+type NotWriterError struct {
+	ConversationID int64
+	TurnID         int64
+	Agent          string
+	Reason         string
+	api            *platform.Error
+}
+
+func (e *NotWriterError) Error() string {
+	return CodeNotWriter + ": not the active writer of the conversation"
+}
+
+// Unwrap exposes the domain sentinel and the API error to errors.Is/As.
+func (e *NotWriterError) Unwrap() []error {
+	errs := []error{version.ErrNotConversationWriter}
+	if e.api != nil {
+		errs = append(errs, e.api)
+	}
+	return errs
+}
+
+func newNotWriterError(conversationID, turnID int64, agent, reason string) *NotWriterError {
+	details := map[string]any{
+		"conversation_id": platformid.Format(conversationID),
+		"reason":          reason,
+	}
+	if turnID > 0 {
+		details["turn_id"] = platformid.Format(turnID)
+	}
+	if agent != "" {
+		details["agent"] = agent
+	}
+	apiErr := platform.NewError(http.StatusForbidden, CodeNotWriter,
+		"not the active writer of the conversation")
+	apiErr.Details = details
+	return &NotWriterError{
+		ConversationID: conversationID, TurnID: turnID, Agent: agent, Reason: reason, api: apiErr,
+	}
+}
+
 // ConversationService implements clarification conversations, message
 // posting and the thread summary. Task enqueue and attachment registration are
 // best-effort side effects; the reconciler is the fallback.
@@ -363,6 +492,7 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		Refs:           []version.MessageRef{},
 		TokenUsage:     map[string]any{},
 		ActorID:        optionalActor(actorID),
+		Kind:           version.MessageKindText,
 		CreatedAt:      now,
 	}
 	if clientMessageID != "" {
@@ -413,6 +543,15 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 	if err != nil {
 		return MessageView{}, mapConversationRepositoryError(err)
 	}
+	// A background/server writer has no conversation.append capability while a
+	// Host turn owns the conversation (R-B2-4). This legacy path carries no
+	// writer identity, so a live lease means it must not append assistant text;
+	// job cards use the repository-direct UpsertJobCard path instead, and the
+	// Host runtime writes through AppendAssistant (typed lease check).
+	if conversation.ActiveTurnID != nil && conversation.ActiveAgent != nil && *conversation.ActiveAgent != "" &&
+		conversation.LeaseUntil != nil && !conversation.LeaseUntil.Before(s.clock.Now()) {
+		return MessageView{}, newNotWriterError(conversationID, 0, "", NotWriterReasonServerWriter)
+	}
 	if err := version.ValidateAssistantMessageParts(parts); err != nil {
 		return MessageView{}, err
 	}
@@ -431,6 +570,7 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 		Refs:             []version.MessageRef{},
 		TokenUsage:       map[string]any{},
 		ReplyToMessageID: replyToMessageID,
+		Kind:             version.MessageKindText,
 		CreatedAt:        now,
 	}
 	if runID > 0 {
@@ -443,6 +583,162 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 	s.publishMessageEvent(ctx, conversation.VersionID, message)
 	s.markRunning(ctx, conversation.VersionID)
 	return toMessageView(message), nil
+}
+
+// ---------- single-writer lease (design §4.10, B §5.1) ----------
+
+// Acquire claims the conversation's single-writer lease for one Host turn. A
+// second live turn is a typed 409 conversation_busy; re-acquiring as the same
+// turn/agent is an idempotent retry that renews the lease.
+func (s *ConversationService) Acquire(ctx context.Context, conversationID int64, agent string, turnID int64) (WriterLease, error) {
+	if conversationID <= 0 {
+		return WriterLease{}, platform.Invalid("cid", "must be a positive decimal ID")
+	}
+	agent = strings.TrimSpace(agent)
+	if turnID <= 0 {
+		return WriterLease{}, platform.Invalid("turn_id", "must be a positive decimal ID")
+	}
+	if agent == "" {
+		return WriterLease{}, platform.Invalid("agent", "must not be empty")
+	}
+	now := s.clock.Now()
+	leaseUntil := now.Add(version.ConversationWriterLeaseDuration)
+	if err := s.repo.AcquireWriter(ctx, conversationID, turnID, agent, now, leaseUntil); err != nil {
+		if errors.Is(err, version.ErrConversationBusy) {
+			return WriterLease{}, s.writerBusyError(ctx, conversationID)
+		}
+		return WriterLease{}, mapConversationRepositoryError(err)
+	}
+	return WriterLease{ConversationID: conversationID, TurnID: turnID, Agent: agent, ExpiresAt: leaseUntil}, nil
+}
+
+// RenewLease is the Host heartbeat: it extends the caller's lease by 90s from
+// the injected clock. A caller that no longer owns a live lease is a typed 403
+// not_writer (the turn has been fenced).
+func (s *ConversationService) RenewLease(ctx context.Context, conversationID int64, agent string, turnID int64) (WriterLease, error) {
+	if conversationID <= 0 {
+		return WriterLease{}, platform.Invalid("cid", "must be a positive decimal ID")
+	}
+	agent = strings.TrimSpace(agent)
+	if turnID <= 0 {
+		return WriterLease{}, platform.Invalid("turn_id", "must be a positive decimal ID")
+	}
+	if agent == "" {
+		return WriterLease{}, platform.Invalid("agent", "must not be empty")
+	}
+	now := s.clock.Now()
+	leaseUntil := now.Add(version.ConversationWriterLeaseDuration)
+	if err := s.repo.RenewWriterLease(ctx, conversationID, turnID, agent, now, leaseUntil); err != nil {
+		if errors.Is(err, version.ErrNotConversationWriter) {
+			return WriterLease{}, newNotWriterError(conversationID, turnID, agent, NotWriterReasonLeaseLost)
+		}
+		return WriterLease{}, mapConversationRepositoryError(err)
+	}
+	return WriterLease{ConversationID: conversationID, TurnID: turnID, Agent: agent, ExpiresAt: leaseUntil}, nil
+}
+
+// Release clears the lease at a clean turn end. It is idempotent for an
+// already-released conversation and never clears another turn's lease.
+func (s *ConversationService) Release(ctx context.Context, conversationID int64, agent string, turnID int64) error {
+	if conversationID <= 0 {
+		return platform.Invalid("cid", "must be a positive decimal ID")
+	}
+	agent = strings.TrimSpace(agent)
+	if turnID <= 0 {
+		return platform.Invalid("turn_id", "must be a positive decimal ID")
+	}
+	if agent == "" {
+		return platform.Invalid("agent", "must not be empty")
+	}
+	if err := s.repo.ReleaseWriter(ctx, conversationID, turnID, agent); err != nil {
+		if errors.Is(err, version.ErrNotConversationWriter) {
+			return newNotWriterError(conversationID, turnID, agent, NotWriterReasonLeaseLost)
+		}
+		return mapConversationRepositoryError(err)
+	}
+	return nil
+}
+
+// AppendAssistant is the only Host assistant-text write path (R-B2-3). The
+// write is accepted only when writer owns the live conversation lease; an idle
+// conversation or an expired lease is taken over atomically (crash recovery),
+// while a different live turn is a typed 409 conversation_busy. Appends are
+// idempotent per turn: a retried turn returns the stored message instead of
+// appending a duplicate.
+func (s *ConversationService) AppendAssistant(ctx context.Context, conversationID int64, writer Writer, parts []version.MessagePart, runID int64, replyToMessageID *int64) (MessageView, error) {
+	if conversationID <= 0 {
+		return MessageView{}, platform.Invalid("cid", "must be a positive decimal ID")
+	}
+	writer.Agent = strings.TrimSpace(writer.Agent)
+	if writer.TurnID <= 0 || writer.Agent == "" {
+		return MessageView{}, newNotWriterError(conversationID, writer.TurnID, writer.Agent, NotWriterReasonNoLease)
+	}
+	if replyToMessageID != nil && *replyToMessageID <= 0 {
+		return MessageView{}, platform.Invalid("reply_to_message_id", "must be a positive decimal ID")
+	}
+	conversation, err := s.repo.GetByID(ctx, conversationID)
+	if err != nil {
+		return MessageView{}, mapConversationRepositoryError(err)
+	}
+	if err := version.ValidateAssistantMessageParts(parts); err != nil {
+		return MessageView{}, err
+	}
+
+	now := s.clock.Now()
+	streamParts, err := assistantStreamParts(parts, now)
+	if err != nil {
+		return MessageView{}, err
+	}
+	message := version.Message{
+		ID:               s.ids.Next(),
+		ConversationID:   conversationID,
+		Role:             version.MessageRoleAssistant,
+		Parts:            append([]version.MessagePart{}, parts...),
+		StreamParts:      streamParts,
+		Refs:             []version.MessageRef{},
+		TokenUsage:       map[string]any{},
+		ReplyToMessageID: replyToMessageID,
+		AuthorAgent:      writer.Agent,
+		Kind:             version.MessageKindText,
+		CreatedAt:        now,
+	}
+	if runID > 0 {
+		value := runID
+		message.AgentRunID = &value
+	}
+	turnKey := version.HostTurnClientMessageID(writer.TurnID)
+	message.ClientMessageID = &turnKey
+
+	leaseUntil := now.Add(version.ConversationWriterLeaseDuration)
+	existing, created, err := s.repo.AppendAssistantMessageAsWriter(
+		ctx, conversationID, message, writer.TurnID, writer.Agent, now, leaseUntil)
+	if err != nil {
+		switch {
+		case errors.Is(err, version.ErrConversationBusy):
+			return MessageView{}, s.writerBusyError(ctx, conversationID)
+		case errors.Is(err, version.ErrNotConversationWriter):
+			return MessageView{}, newNotWriterError(conversationID, writer.TurnID, writer.Agent, NotWriterReasonLeaseLost)
+		default:
+			return MessageView{}, mapConversationRepositoryError(err)
+		}
+	}
+	if !created && existing != nil {
+		return toMessageView(*existing), nil
+	}
+	s.publishMessageEvent(ctx, conversation.VersionID, message)
+	s.markRunning(ctx, conversation.VersionID)
+	return toMessageView(message), nil
+}
+
+// writerBusyError builds the typed 409 from the stored lease holder. The extra
+// read is best effort: the busy classification itself already came from the
+// atomic SQL compare-and-set.
+func (s *ConversationService) writerBusyError(ctx context.Context, conversationID int64) *BusyError {
+	conversation, err := s.repo.GetByID(ctx, conversationID)
+	if err != nil {
+		return newBusyError(version.Conversation{ID: conversationID})
+	}
+	return newBusyError(conversation)
 }
 
 // UpsertJobCard stores or refreshes the single job_card part of one background
@@ -502,6 +798,7 @@ func (s *ConversationService) UpsertJobCard(ctx context.Context, versionID, conv
 		Parts:          []version.MessagePart{card},
 		Refs:           []version.MessageRef{},
 		TokenUsage:     map[string]any{},
+		Kind:           version.MessageKindArtifact,
 		CreatedAt:      now,
 	}
 	streamParts, err := assistantStreamParts(message.Parts, now)

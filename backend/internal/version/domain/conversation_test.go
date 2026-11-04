@@ -276,6 +276,48 @@ func TestValidateClientMessageID(t *testing.T) {
 	if err := version.ValidateClientMessageID(strings.Repeat("a", 65)); err == nil {
 		t.Fatal("oversized client_message_id accepted")
 	}
+	// The host-turn namespace is reserved for the assistant-turn idempotency
+	// key, so a user-supplied id may not collide with it.
+	if err := version.ValidateClientMessageID(version.HostTurnClientMessageID(42)); err == nil {
+		t.Fatal("reserved host-turn client_message_id accepted")
+	}
+}
+
+// TestHostTurnClientMessageID pins the reserved idempotency namespace derived
+// from a Host turn id (B §5.1: client_message_id / turn_id).
+func TestHostTurnClientMessageID(t *testing.T) {
+	if got := version.HostTurnClientMessageID(42); got != "host-turn:42" {
+		t.Fatalf("HostTurnClientMessageID = %q", got)
+	}
+	if !version.IsReservedClientMessageID("host-turn:42") {
+		t.Fatal("host turn id not recognized as reserved")
+	}
+	if version.IsReservedClientMessageID("client-42") || version.IsReservedClientMessageID("") {
+		t.Fatal("ordinary client id classified as reserved")
+	}
+}
+
+// TestConversationMessageKind pins the DB-3 kind enum (B §5.1/§5.2).
+func TestConversationMessageKind(t *testing.T) {
+	for _, kind := range []string{"text", "question", "answer", "system", "artifact"} {
+		if err := version.ValidateConversationMessageKind(kind); err != nil {
+			t.Fatalf("kind %q rejected: %v", kind, err)
+		}
+	}
+	for _, kind := range []string{"", "activity", "tool", "markdown"} {
+		if err := version.ValidateConversationMessageKind(kind); err == nil {
+			t.Fatalf("kind %q accepted", kind)
+		}
+	}
+	if got := version.NormalizeMessageKind(""); got != version.MessageKindText {
+		t.Fatalf("NormalizeMessageKind(empty) = %q, want text", got)
+	}
+	if got := version.NormalizeMessageKind(version.MessageKindArtifact); got != version.MessageKindArtifact {
+		t.Fatalf("NormalizeMessageKind(artifact) = %q", got)
+	}
+	if version.ConversationWriterLeaseDuration != 90*time.Second {
+		t.Fatalf("lease = %v, want the spec's 90s", version.ConversationWriterLeaseDuration)
+	}
 }
 
 func TestValidateConversationSummary(t *testing.T) {
