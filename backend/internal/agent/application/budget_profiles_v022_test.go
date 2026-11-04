@@ -35,8 +35,7 @@ func TestProfileBudgetsV022(t *testing.T) {
 		turns int
 	}{
 		{ProfileKeyDesignHost, 16},
-		{ProfileKeyDesignPlanner, 16},
-		{ProfileKeyCaseAuthor, 16},
+		{ProfileKeyDesignAuthor, 16},
 		{ProfileKeyDesignCritic, 4},
 	}
 	designProfiles := P2Profiles()

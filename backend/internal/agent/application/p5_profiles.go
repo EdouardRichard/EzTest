@@ -10,18 +10,7 @@ import (
 // increment is merged into the startup seed as a union so P1–P4 tools keep
 // their positions and administrator edits are still never overwritten.
 var p5ProfileTools = map[string][]string{
-	ProfileKeyContextScout: {
-		tools.ToolCodeTree,
-		tools.ToolCodeRead,
-		tools.ToolCodeSearch,
-		tools.ToolCodeFacts,
-		tools.ToolCodeRoutes,
-		tools.ToolCodeAPIs,
-		tools.ToolCodeDiff,
-		tools.ToolCodeImpact,
-		tools.ToolSUTPagePropose,
-	},
-	ProfileKeyCaseAuthor: {
+	ProfileKeyDesignAuthor: {
 		tools.ToolCodeFacts,
 		tools.ToolCodeRoutes,
 		tools.ToolCodeAPIs,
@@ -34,9 +23,6 @@ var p5ProfileTools = map[string][]string{
 		tools.ToolCodeFacts,
 		tools.ToolCodeAnchors,
 	},
-	ProfileKeyDesignPlanner: {
-		tools.ToolCodeImpact,
-	},
 	ProfileKeyDesignHost: {
 		tools.ToolCodeFacts,
 		tools.ToolCodeRoutes,
@@ -48,8 +34,8 @@ var p5ProfileTools = map[string][]string{
 }
 
 // P5ProfileTools returns a copy of the P5 per-profile tool increment. The
-// contract keeps sut.page_propose on context_scout only; case_author gets the
-// read-only code tools.
+// removed Scout/Planner entries are gone; the design author keeps the read-only
+// code tools it inherited from the old author seed.
 func P5ProfileTools() map[string][]string {
 	cloned := make(map[string][]string, len(p5ProfileTools))
 	for key, names := range p5ProfileTools {

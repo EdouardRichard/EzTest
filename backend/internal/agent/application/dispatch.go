@@ -299,7 +299,9 @@ func (d *Dispatcher) validateStage(ctx context.Context, req DispatchRequest) err
 	return nil
 }
 
-// actorMayCreate is the D21 four-way creator-kind matrix (task-types.md §9.3).
+// actorMayCreate is the D21 four-way creator-kind matrix (task-types.md §9.3),
+// converged by v0.22 D-B1/R-W1-5: the planner actor no longer creates any kind
+// because the five explore.* kinds were removed.
 func actorMayCreate(actor DispatchActor, kind string) bool {
 	switch actor {
 	case DispatchActorStateMachine:
@@ -308,8 +310,6 @@ func actorMayCreate(actor DispatchActor, kind string) bool {
 			agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion:
 			return true
 		}
-	case DispatchActorPlanner:
-		return isExploreKind(kind)
 	case DispatchActorAssistant:
 		switch kind {
 		case agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases:
@@ -323,17 +323,6 @@ func actorMayCreate(actor DispatchActor, kind string) bool {
 		}
 	}
 	return false
-}
-
-func isExploreKind(kind string) bool {
-	switch kind {
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage,
-		agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage,
-		agent.WorkItemKindExploreGap:
-		return true
-	default:
-		return false
-	}
 }
 
 // requiredStage maps the stage-entry kinds to the version stage that owns them

@@ -21,7 +21,7 @@ type fakeAgentCenterReader struct {
 	stats    map[string]agentapp.RunStats
 	statsErr error
 
-	runs       []agentapp.RunRow
+	runs        []agentapp.RunRow
 	runsHasMore bool
 	runsErr     error
 	lastQuery   agentapp.RunQuery
@@ -76,11 +76,10 @@ func (f *fakeLatestEvalReader) LatestEval(_ context.Context) (*agentapp.EvalSumm
 func agentCenterCatalogRows(t *testing.T) []agentapp.CatalogProfileRow {
 	t.Helper()
 	profiles := agentapp.Profiles()
-	// The frozen agent-center team map covers 14 profiles; the P7
-	// knowledge_curator background profile is seeded but intentionally outside
-	// that catalog, so the seed list is one larger than the catalog.
-	if len(profiles) != 15 {
-		t.Fatalf("seed profiles = %d, want 15", len(profiles))
+	// v0.22 D-B1: 11 seeds, all part of the two converged catalog teams
+	// (conversation Hosts/background jobs and execution/analysis profiles).
+	if len(profiles) != 11 {
+		t.Fatalf("seed profiles = %d, want 11", len(profiles))
 	}
 	rows := make([]agentapp.CatalogProfileRow, 0, len(profiles))
 	for _, profile := range profiles {
@@ -103,59 +102,60 @@ func mustCatalog(t *testing.T, service *agentapp.AgentCenterService) agentapp.Ca
 
 /* -------------------------------- catalog ------------------------------- */
 
-func TestAgentCenterCatalogGroupsFourteenProfiles(t *testing.T) {
+func TestAgentCenterCatalogGroupsConvergedTeams(t *testing.T) {
 	lastRun := time.Date(2026, 11, 1, 10, 30, 0, 0, time.UTC)
 	reader := &fakeAgentCenterReader{
 		catalogProfiles: agentCenterCatalogRows(t),
 		stats: map[string]agentapp.RunStats{
 			agentapp.ProfileKeyClarificationHost: {
-				RunCount:        5,
-				DoneCount:       2,
-				FailedCount:     1,
-				AbortedCount:    1,
+				RunCount:         5,
+				DoneCount:        2,
+				FailedCount:      1,
+				AbortedCount:     1,
 				InterruptedCount: 0,
-				LastRunAt:       &lastRun,
+				LastRunAt:        &lastRun,
 			},
 		},
 	}
 	service := agentapp.NewAgentCenterService(reader, nil, nil)
 
 	catalog := mustCatalog(t, service)
-	if len(catalog.Profiles) != 14 {
-		t.Fatalf("catalog profiles = %d, want 14", len(catalog.Profiles))
+	if len(catalog.Profiles) != 11 {
+		t.Fatalf("catalog profiles = %d, want 11", len(catalog.Profiles))
 	}
 
 	teams := make(map[string]agentapp.AgentTeam, len(catalog.Teams))
 	for _, team := range catalog.Teams {
 		teams[team.Team] = team
 	}
-	for _, want := range []string{"clarification", "design", "execution", "delivery", "steward", "code"} {
+	if len(catalog.Teams) != 2 {
+		t.Fatalf("catalog teams = %d, want 2: %#v", len(catalog.Teams), catalog.Teams)
+	}
+	for _, want := range []string{"conversation", "execution"} {
 		if _, ok := teams[want]; !ok {
 			t.Fatalf("team %q missing from %#v", want, catalog.Teams)
 		}
 	}
-	if len(teams["clarification"].ProfileKeys) != 3 {
-		t.Fatalf("clarification profiles = %v", teams["clarification"].ProfileKeys)
+	if got := strings.Join(teams["conversation"].ProfileKeys, ","); got !=
+		"clarification_host,design_host,design_author,design_critic" {
+		t.Fatalf("conversation profiles = %q, want 2 Hosts + 2 background jobs", got)
 	}
-	if len(teams["design"].ProfileKeys) != 5 {
-		t.Fatalf("design profiles = %v", teams["design"].ProfileKeys)
+	if len(teams["execution"].ProfileKeys) != 7 {
+		t.Fatalf("execution profiles = %v, want all execution/analysis seeds", teams["execution"].ProfileKeys)
 	}
-	if len(teams["execution"].ProfileKeys) != 3 {
-		t.Fatalf("execution profiles = %v", teams["execution"].ProfileKeys)
-	}
-	if len(teams["delivery"].ProfileKeys) != 2 {
-		t.Fatalf("delivery profiles = %v", teams["delivery"].ProfileKeys)
-	}
-	if len(teams["steward"].ProfileKeys) != 1 {
-		t.Fatalf("steward profiles = %v", teams["steward"].ProfileKeys)
-	}
-	if len(teams["code"].ProfileKeys) != 0 || teams["code"].Note == "" {
-		t.Fatalf("code team = %#v, want empty with note", teams["code"])
+	for _, removed := range []string{"requirement_curator", "context_scout", "design_planner", "data_planner", "case_author"} {
+		for _, team := range catalog.Teams {
+			for _, key := range team.ProfileKeys {
+				if key == removed {
+					t.Fatalf("removed profile %q still listed in team %q", removed, team.Team)
+				}
+			}
+		}
 	}
 	if catalog.Profiles[0].ProfileKey != agentapp.ProfileKeyClarificationHost {
 		t.Fatalf("first profile = %q", catalog.Profiles[0].ProfileKey)
 	}
-	if catalog.Profiles[0].Order != 1 || catalog.Profiles[0].Team != "clarification" {
+	if catalog.Profiles[0].Order != 1 || catalog.Profiles[0].Team != "conversation" {
 		t.Fatalf("first profile team/order = %#v", catalog.Profiles[0])
 	}
 	for i, profile := range catalog.Profiles {
@@ -186,9 +186,9 @@ func TestAgentCenterCatalogGroupsFourteenProfiles(t *testing.T) {
 	}
 
 	// A profile without runs reports zero stats, never a missing block.
-	curator := catalog.Profiles[1]
-	if curator.Stats.RunCount != 0 || curator.Stats.SuccessRate() != 0 {
-		t.Fatalf("empty stats = %#v", curator.Stats)
+	second := catalog.Profiles[1]
+	if second.Stats.RunCount != 0 || second.Stats.SuccessRate() != 0 {
+		t.Fatalf("empty stats = %#v", second.Stats)
 	}
 
 	// The catalog read model must never carry the prompt or transcript.

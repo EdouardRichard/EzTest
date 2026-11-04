@@ -8,26 +8,23 @@ import (
 )
 
 // TestClarificationPromptsTeachNumericResourceTargets pins the O5 model-facing
-// guidance: the Curator must copy the decimal IDs exposed by sut.list /
-// sut.page_list into requirement targets, and the Host must not read a
-// point-in-time requirement.read snapshot as "no drafts were created" while the
-// parallel Curator is writing.
+// guidance after the Curator removal: the clarification Host owns requirement
+// drafting and must copy the decimal IDs exposed by sut.list / sut.page_list
+// into requirement targets, and must not read a point-in-time requirement.read
+// snapshot as "no drafts were created".
 func TestClarificationPromptsTeachNumericResourceTargets(t *testing.T) {
-	var host, curator string
+	var host string
 	for _, profile := range agentapp.P1Profiles() {
-		switch profile.Key {
-		case agentapp.ProfileKeyClarificationHost:
+		if profile.Key == agentapp.ProfileKeyClarificationHost {
 			host = profile.SystemPrompt
-		case agentapp.ProfileKeyRequirementCurator:
-			curator = profile.SystemPrompt
 		}
 	}
-	if curator == "" || host == "" {
-		t.Fatalf("clarification profiles missing: host_present=%v curator_present=%v", host != "", curator != "")
+	if host == "" {
+		t.Fatal("clarification Host profile is missing")
 	}
 	for _, want := range []string{"sut.page_list", "sut.list", "十进制"} {
-		if !strings.Contains(curator, want) {
-			t.Fatalf("curator prompt lacks %q:\n%s", want, curator)
+		if !strings.Contains(host, want) {
+			t.Fatalf("host prompt lacks %q:\n%s", want, host)
 		}
 	}
 	for _, want := range []string{"requirement_card", "快照"} {
@@ -38,28 +35,21 @@ func TestClarificationPromptsTeachNumericResourceTargets(t *testing.T) {
 }
 
 // TestClarificationPromptsTeachSourceKeyIdempotency pins the duplicate-draft
-// guidance added with the server-side source key: the Host must not ask for a
-// second draft for an existing FR source, and the Curator must update the
-// existing draft instead of creating another one.
+// guidance added with the server-side source key: the Host must update the
+// existing FR draft instead of creating another one now that it owns drafting.
 func TestClarificationPromptsTeachSourceKeyIdempotency(t *testing.T) {
-	var host, curator string
+	var host string
 	for _, profile := range agentapp.P1Profiles() {
-		switch profile.Key {
-		case agentapp.ProfileKeyClarificationHost:
+		if profile.Key == agentapp.ProfileKeyClarificationHost {
 			host = profile.SystemPrompt
-		case agentapp.ProfileKeyRequirementCurator:
-			curator = profile.SystemPrompt
 		}
 	}
-	if curator == "" || host == "" {
-		t.Fatalf("clarification profiles missing: host_present=%v curator_present=%v", host != "", curator != "")
+	if host == "" {
+		t.Fatal("clarification Host profile is missing")
 	}
-	for _, want := range []string{"同一来源编号", "requirement.draft_update", "不要重复"} {
-		if !strings.Contains(curator, want) {
-			t.Fatalf("curator prompt lacks %q:\n%s", want, curator)
+	for _, want := range []string{"同一来源编号", "requirement.draft_update", "不要"} {
+		if !strings.Contains(host, want) {
+			t.Fatalf("host prompt lacks %q:\n%s", want, host)
 		}
-	}
-	if !strings.Contains(host, "同一来源编号") {
-		t.Fatalf("host prompt lacks source-key guidance:\n%s", host)
 	}
 }

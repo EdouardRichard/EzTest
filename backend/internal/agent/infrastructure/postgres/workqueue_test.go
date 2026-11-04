@@ -47,12 +47,12 @@ func TestWorkItemRoundTrip(t *testing.T) {
 
 	dependency := createContractWorkItem(t, repo, agent.CreateWorkItemParams{
 		VersionID:      42,
-		Kind:           agent.WorkItemKindExploreLogin,
-		Goal:           "复用已有登录会话",
+		Kind:           agent.WorkItemKindKnowledgePropose,
+		Goal:           "沉淀登录知识",
 		CreatedBy:      agent.WorkItemCreatedByPlanner,
-		IdempotencyKey: "42:explore.login:dep",
+		IdempotencyKey: "42:knowledge.propose:dep",
 	})
-	claimedDep, err := repo.ClaimWorkItem(ctx, "explorer-1", now)
+	claimedDep, err := repo.ClaimWorkItem(ctx, "worker-1", now)
 	if err != nil || claimedDep == nil || claimedDep.ID != dependency.ID {
 		t.Fatalf("claim dependency = %#v, %v", claimedDep, err)
 	}
@@ -154,10 +154,10 @@ func TestWorkItemIdempotency(t *testing.T) {
 
 	params := agent.CreateWorkItemParams{
 		VersionID:      7,
-		Kind:           agent.WorkItemKindExplorePage,
-		Goal:           "发现页面树",
+		Kind:           agent.WorkItemKindDesignCases,
+		Goal:           "生成设计用例",
 		CreatedBy:      agent.WorkItemCreatedByPlanner,
-		IdempotencyKey: "7:explore.page:target-hash",
+		IdempotencyKey: "7:design.cases:target-hash",
 	}
 	first := createContractWorkItem(t, repo, params)
 	second := createContractWorkItem(t, repo, params)
@@ -174,7 +174,7 @@ func TestWorkItemIdempotency(t *testing.T) {
 		t.Fatal("idempotency key was not scoped by version")
 	}
 	otherKind := params
-	otherKind.Kind = agent.WorkItemKindExploreAPI
+	otherKind.Kind = agent.WorkItemKindReviewCases
 	if item := createContractWorkItem(t, repo, otherKind); item.ID == first.ID {
 		t.Fatal("idempotency key was not scoped by kind")
 	}
@@ -182,8 +182,8 @@ func TestWorkItemIdempotency(t *testing.T) {
 	// A NULL key is exempt: each create inserts a new row.
 	withoutKey := agent.CreateWorkItemParams{
 		VersionID: 7,
-		Kind:      agent.WorkItemKindExploreCoverage,
-		Goal:      "覆盖矩阵",
+		Kind:      agent.WorkItemKindKnowledgePropose,
+		Goal:      "沉淀覆盖知识",
 		CreatedBy: agent.WorkItemCreatedByPlanner,
 	}
 	noKeyOne := createContractWorkItem(t, repo, withoutKey)
@@ -204,33 +204,33 @@ func TestDependsOnGating(t *testing.T) {
 
 	dependency := createContractWorkItem(t, repo, agent.CreateWorkItemParams{
 		VersionID:      9,
-		Kind:           agent.WorkItemKindExploreLogin,
-		Goal:           "登录",
+		Kind:           agent.WorkItemKindKnowledgePropose,
+		Goal:           "登录知识",
 		CreatedBy:      agent.WorkItemCreatedByPlanner,
-		IdempotencyKey: "9:explore.login:1",
+		IdempotencyKey: "9:knowledge.propose:1",
 	})
 	blocked := createContractWorkItem(t, repo, agent.CreateWorkItemParams{
 		VersionID:      9,
 		Kind:           agent.WorkItemKindDesignCases,
-		Goal:           "依赖登录配方",
+		Goal:           "依赖登录知识",
 		DependsOn:      []int64{dependency.ID},
 		CreatedBy:      agent.WorkItemCreatedByStateMachine,
 		IdempotencyKey: "9:design.cases:1",
 	})
 	readyNil := createContractWorkItem(t, repo, agent.CreateWorkItemParams{
 		VersionID:      9,
-		Kind:           agent.WorkItemKindExplorePage,
+		Kind:           agent.WorkItemKindReportVersion,
 		Goal:           "NULL 依赖",
 		CreatedBy:      agent.WorkItemCreatedByPlanner,
-		IdempotencyKey: "9:explore.page:null",
+		IdempotencyKey: "9:report.version:null",
 	})
 	readyEmpty := createContractWorkItem(t, repo, agent.CreateWorkItemParams{
 		VersionID:      9,
-		Kind:           agent.WorkItemKindExploreAPI,
+		Kind:           agent.WorkItemKindAnalyzeFailure,
 		Goal:           "空数组依赖",
 		DependsOn:      []int64{},
 		CreatedBy:      agent.WorkItemCreatedByPlanner,
-		IdempotencyKey: "9:explore.api:empty",
+		IdempotencyKey: "9:analyze.failure:empty",
 	})
 
 	// Only the dependency and the two no-dependency items are claimable. The

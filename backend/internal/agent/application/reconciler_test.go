@@ -392,7 +392,7 @@ func TestReconcilerEnsuresOpeningOnce(t *testing.T) {
 	assertEnsured(t, fixture.queue, agentapp.WorkTypeChatTurn+":opening:20")
 }
 
-func TestReconcilerEnsuresReplyAndCuratePerUserMessage(t *testing.T) {
+func TestReconcilerEnsuresReplyPerUserMessage(t *testing.T) {
 	fixture := newReconcilerFixture(t)
 	fixture.conversations.conversations = []agentapp.ReconcilerConversation{{
 		ID:        20,
@@ -401,7 +401,7 @@ func TestReconcilerEnsuresReplyAndCuratePerUserMessage(t *testing.T) {
 			{ID: 501, Role: "user"},
 			{ID: 502, Role: "assistant", AgentProfileKey: agentapp.ProfileKeyClarificationHost},
 			{ID: 503, Role: "user"},
-			{ID: 504, Role: "assistant", AgentProfileKey: agentapp.ProfileKeyRequirementCurator},
+			{ID: 504, Role: "assistant", AgentProfileKey: agentapp.ProfileKeyDesignAuthor},
 			{ID: 505, Role: "user"},
 		},
 	}}
@@ -409,10 +409,9 @@ func TestReconcilerEnsuresReplyAndCuratePerUserMessage(t *testing.T) {
 	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	assertEnsured(t, fixture.queue,
-		agentapp.WorkTypeChatTurn+":reply:505",
-		agentapp.WorkTypeRequirementCurate+":curate:505",
-	)
+	// v0.22 D-B1 removed the requirement.curate background job: only the Host
+	// reply is enqueued for the unanswered user message.
+	assertEnsured(t, fixture.queue, agentapp.WorkTypeChatTurn+":reply:505")
 }
 
 func TestReconcilerSkipsMessagesWithExistingTasks(t *testing.T) {
@@ -476,13 +475,13 @@ func TestReconcilerIsIdempotentAcrossRules(t *testing.T) {
 	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if calls := len(fixture.queue.ensured()); calls != 3 {
+	if calls := len(fixture.queue.ensured()); calls != 2 {
 		t.Fatalf("first reconcile ensured %d tasks: %v", calls, fixture.queue.ensured())
 	}
 	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
 		t.Fatalf("second Reconcile: %v", err)
 	}
-	if calls := len(fixture.queue.ensured()); calls != 3 {
+	if calls := len(fixture.queue.ensured()); calls != 2 {
 		t.Fatalf("second reconcile added tasks: %v", fixture.queue.ensured())
 	}
 }
@@ -537,17 +536,20 @@ func TestReconcilerDesignConversationsSkipCurateAndUseDesignTeam(t *testing.T) {
 	}
 	for _, key := range []string{
 		agentapp.WorkTypeChatTurn + ":reply:601",
-		agentapp.WorkTypeRequirementCurate + ":curate:601",
 		agentapp.WorkTypeChatTurn + ":opening:31",
 	} {
 		if _, ok := byKey[key]; !ok {
 			t.Fatalf("missing task %q: %v", key, byKey)
 		}
 	}
-	// The design conversation had a user message; it gets a reply Host task but
-	// no requirement.curate rule.
-	if _, ok := byKey[agentapp.WorkTypeRequirementCurate+":curate:501"]; ok {
-		t.Fatalf("design conversation created requirement.curate: %v", byKey)
+	// v0.22 D-B1 removed the requirement.curate job entirely.
+	for _, key := range []string{
+		agentapp.WorkTypeRequirementCurate + ":curate:501",
+		agentapp.WorkTypeRequirementCurate + ":curate:601",
+	} {
+		if _, ok := byKey[key]; ok {
+			t.Fatalf("reconciler created removed requirement.curate task %q: %v", key, byKey)
+		}
 	}
 	if byKey[agentapp.WorkTypeChatTurn+":reply:501"].Team != string(agent.TeamDesign) {
 		t.Fatalf("design reply team = %q", byKey[agentapp.WorkTypeChatTurn+":reply:501"].Team)

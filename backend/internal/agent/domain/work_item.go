@@ -48,13 +48,10 @@ func (s WorkItemStatus) Terminal() bool {
 
 // Work item kinds introduced by the 0.2.1 contract (spec §5.4,
 // task-types.md §9.1). The DB keeps them in work_item.kind; the frozen P1–P8
-// work_item.type column continues to carry the legacy task types.
+// work_item.type column continues to carry the legacy task types. v0.22 D-B1 /
+// R-W1-5 removed the five explore.* kinds: discovery is a deterministic
+// server-side pipeline, not an agent-facing work item.
 const (
-	WorkItemKindExploreLogin     = "explore.login"
-	WorkItemKindExplorePage      = "explore.page"
-	WorkItemKindExploreAPI       = "explore.api"
-	WorkItemKindExploreCoverage  = "explore.coverage"
-	WorkItemKindExploreGap       = "explore.gap"
 	WorkItemKindDesignCases      = "design.cases"
 	WorkItemKindReviewCases      = "review.cases"
 	WorkItemKindExecuteBatch     = "execute.batch"
@@ -63,12 +60,10 @@ const (
 	WorkItemKindKnowledgePropose = "knowledge.propose"
 )
 
-// ValidWorkItemKind reports whether kind is one of the eleven 0.2.1 kinds.
+// ValidWorkItemKind reports whether kind is one of the six 0.2.1 kinds.
 func ValidWorkItemKind(kind string) bool {
 	switch kind {
-	case WorkItemKindExploreLogin, WorkItemKindExplorePage, WorkItemKindExploreAPI,
-		WorkItemKindExploreCoverage, WorkItemKindExploreGap,
-		WorkItemKindDesignCases, WorkItemKindReviewCases, WorkItemKindExecuteBatch,
+	case WorkItemKindDesignCases, WorkItemKindReviewCases, WorkItemKindExecuteBatch,
 		WorkItemKindAnalyzeFailure, WorkItemKindReportVersion, WorkItemKindKnowledgePropose:
 		return true
 	default:
@@ -79,7 +74,7 @@ func ValidWorkItemKind(kind string) bool {
 // ClaimDefaultsForKind returns the product team and frozen work type a 0.2.1
 // contract item of this kind must carry so the agent runtime can claim and
 // dispatch it (Task 65). The kinds whose executor is an agent run map to the
-// team that owns the producing role; a kind outside the frozen eleven (including
+// team that owns the producing role; a kind outside the frozen six (including
 // the legacy P1-P8 rows, which have no kind) reports false and keeps the
 // compatibility default.
 //
@@ -94,8 +89,7 @@ func ClaimDefaultsForKind(kind string) (Team, string, bool) {
 		return TeamExecution, kind, true
 	case WorkItemKindReportVersion:
 		return TeamDelivery, kind, true
-	case WorkItemKindExploreLogin, WorkItemKindExplorePage, WorkItemKindExploreAPI,
-		WorkItemKindExploreCoverage, WorkItemKindExploreGap, WorkItemKindKnowledgePropose:
+	case WorkItemKindKnowledgePropose:
 		return TeamClarification, kind, true
 	default:
 		return TeamOps, "", false
@@ -319,7 +313,7 @@ func (in CreateWorkItemParams) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !ValidWorkItemKind(in.Kind) {
-		return platform.Invalid("kind", "must be one of explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose")
+		return platform.Invalid("kind", "must be one of design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose")
 	}
 	if utf8.RuneCountInString(in.Goal) > 500 {
 		return platform.Invalid("goal", "must be at most 500 characters")

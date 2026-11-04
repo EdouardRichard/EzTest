@@ -841,12 +841,12 @@ func StreamingMessagePartTypes() []string {
 }
 
 var jobCardKinds = map[string]struct{}{
-	"explore.login": {}, "explore.page": {}, "explore.api": {}, "explore.coverage": {},
-	"explore.gap": {}, "design.cases": {}, "review.cases": {}, "execute.batch": {},
+	"design.cases": {}, "review.cases": {}, "execute.batch": {},
 	"analyze.failure": {}, "report.version": {}, "knowledge.propose": {},
 }
 
 // IsValidJobCardKind reports whether kind is one of the frozen 0.2.1 job kinds.
+// The five explore.* kinds were removed by v0.22 D-B1/R-W1-5.
 func IsValidJobCardKind(kind string) bool {
 	_, ok := jobCardKinds[kind]
 	return ok

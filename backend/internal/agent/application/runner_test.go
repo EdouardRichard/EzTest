@@ -146,18 +146,6 @@ func hostItem() agent.WorkItem {
 	})
 }
 
-func curatorItem() agent.WorkItem {
-	return fakeWorkItem(agentapp.WorkTypeRequirementCurate, agentapp.WorkItemPayload{
-		ConversationID: 20, MessageID: 501,
-	})
-}
-
-func scoutItem() agent.WorkItem {
-	return fakeWorkItem(agentapp.WorkTypeAttachmentIngest, agentapp.WorkItemPayload{
-		ConversationID: 20, AttachmentID: 9001, MessageID: 501,
-	})
-}
-
 func mustRun(t *testing.T, fixture *runnerFixture, item agent.WorkItem) (agentapp.RunResult, error) {
 	t.Helper()
 	return fixture.runner.Run(context.Background(), item)
@@ -252,15 +240,15 @@ func TestRunnerHostWritesFinalConversationMessage(t *testing.T) {
 func TestRunnerRejectsToolsOutsideProfileAllowlist(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.chat.responses = []llmapp.ChatResponse{
-		toolCall(tools.ToolRequirementDraftCreate, `{"title":"越权","description":"x","acceptance_criteria":"x","priority":"P1"}`),
+		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
 		{Content: "工具被拒绝，继续澄清。"},
 	}
 
 	if _, err := mustRun(t, fixture, hostItem()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if fixture.requirement.createDraft.Title != "" {
-		t.Fatalf("disallowed tool executed: %#v", fixture.requirement.createDraft)
+	if fixture.design.proposeCalls != 0 {
+		t.Fatalf("disallowed tool executed: %#v", fixture.design.proposeInput)
 	}
 	var toolContent string
 	for _, message := range fixture.chat.requests[1].Messages {
@@ -273,14 +261,14 @@ func TestRunnerRejectsToolsOutsideProfileAllowlist(t *testing.T) {
 	}
 }
 
-func TestRunnerCuratorToolCallWritesRequirementCard(t *testing.T) {
+func TestRunnerHostToolCallWritesRequirementCard(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.chat.responses = []llmapp.ChatResponse{
 		toolCall(tools.ToolRequirementDraftCreate, `{"title":"登录功能","description":"支持手机号登录","acceptance_criteria":"可登录","priority":"P1"}`),
 		{Content: "已创建需求草案，请确认。"},
 	}
 
-	result, err := mustRun(t, fixture, curatorItem())
+	result, err := mustRun(t, fixture, hostItem())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -317,41 +305,33 @@ func TestRunnerCuratorToolCallWritesRequirementCard(t *testing.T) {
 	}
 }
 
-func TestRunnerScoutWritesTeamRoomFinding(t *testing.T) {
-	fixture := newRunnerFixture(t)
-	fixture.chat.responses = []llmapp.ChatResponse{{Content: "已读取附件：需求.md，共 6 字符。关键约束：手机号登录。"}}
-
-	result, err := mustRun(t, fixture, scoutItem())
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if result.Status != agent.AgentRunDone {
-		t.Fatalf("result = %#v", result)
-	}
-	if len(fixture.team.posts) != 1 {
-		t.Fatalf("team posts = %d", len(fixture.team.posts))
-	}
-	if len(fixture.chat.requests) == 0 || len(fixture.chat.requests[0].Messages) < 2 {
-		t.Fatalf("chat request missing user attachment context: %#v", fixture.chat.requests)
-	}
-	messages := fixture.chat.requests[0].Messages
-	last := messages[len(messages)-1]
-	if last.Role != "user" {
-		t.Fatalf("last prompt message role = %q, want the current user turn", last.Role)
-	}
-	userContent := last.Content
-	if !strings.Contains(userContent, "请阅读附件《需求.md》") || !strings.Contains(userContent, "登录需求正文") {
-		t.Fatalf("scout user content = %q", userContent)
-	}
-	post := fixture.team.posts[0]
-	if post.Team != agent.TeamClarification || post.Kind != agent.PostKindFinding {
-		t.Fatalf("post = %#v", post)
-	}
-	if len(post.Refs) != 1 || post.Refs[0].Kind != "attachment" || post.Refs[0].ID != "9001" {
-		t.Fatalf("refs = %#v", post.Refs)
-	}
-	if len(fixture.conv.appended) != 0 {
-		t.Fatalf("scout wrote a conversation message: %#v", fixture.conv.appended)
+// TestRunnerRejectsRemovedBackgroundWorkTypes pins the v0.22 D-B1/R-W1-5
+// removal: the Curator/Scout/Planner and explore.* background work types fail
+// closed instead of resolving a deleted profile, and no model/team-room write
+// happens.
+func TestRunnerRejectsRemovedBackgroundWorkTypes(t *testing.T) {
+	for _, workType := range []string{
+		agentapp.WorkTypeRequirementCurate,
+		agentapp.WorkTypeAttachmentIngest,
+		agentapp.WorkTypeDesignRound,
+		agentapp.WorkTypeDesignDataPlan,
+		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
+	} {
+		t.Run(workType, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			item := fakeWorkItem(workType, agentapp.WorkItemPayload{
+				ConversationID: 20, MessageID: 501, AttachmentID: 9001,
+			})
+			if _, err := mustRun(t, fixture, item); err == nil {
+				t.Fatalf("%s run succeeded, want invalid_work_type", workType)
+			}
+			if fixture.chat.requestCount() != 0 {
+				t.Fatalf("%s chat calls = %d, want 0", workType, fixture.chat.requestCount())
+			}
+			if len(fixture.team.posts) != 0 || len(fixture.conv.appended) != 0 {
+				t.Fatalf("%s wrote posts/messages: %d/%d", workType, len(fixture.team.posts), len(fixture.conv.appended))
+			}
+		})
 	}
 }
 
@@ -600,7 +580,7 @@ func TestRunnerRejectsModelSuppliedVersionID(t *testing.T) {
 		{Content: "参数有误，我会重试。"},
 	}
 
-	if _, err := mustRun(t, fixture, curatorItem()); err != nil {
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	var toolMessage *agent.AgentMessage
@@ -705,7 +685,7 @@ func TestRunnerDesignAuthorCallsGraphToolsWithScopeAndPostsTeamUpdate(t *testing
 	if result.Status != agent.AgentRunDone || result.Turns != 3 {
 		t.Fatalf("result = %#v", result)
 	}
-	if finished := fixture.repo.lastFinished(t); finished.ProfileKey != agentapp.ProfileKeyCaseAuthor {
+	if finished := fixture.repo.lastFinished(t); finished.ProfileKey != agentapp.ProfileKeyDesignAuthor {
 		t.Fatalf("profile = %q", finished.ProfileKey)
 	}
 	if fixture.design.readCalls != 1 || fixture.design.readVersionID != 10 || fixture.design.readRequirementID != 501 {
@@ -741,23 +721,20 @@ func TestRunnerDesignAuthorCallsGraphToolsWithScopeAndPostsTeamUpdate(t *testing
 	}
 }
 
-// TestRunnerAcceptsConversationKinds pins Task 65's kind→profile mapping. The
-// 0.2.1 stage/conversation kinds must resolve to a profile (or the deterministic
-// stage-entry path) instead of returning invalid_work_type, while an unknown
-// type still fails closed. The 0.2.0 work types keep their frozen mapping.
+// TestRunnerAcceptsConversationKinds pins Task 65's kind→profile mapping after
+// the v0.22 D-B1 convergence. The remaining 0.2.1 stage/conversation kinds must
+// resolve to a profile (or the deterministic stage-entry path) instead of
+// returning invalid_work_type, while the removed Planner/Curator/Scout work
+// types and explore kinds fail closed.
 func TestRunnerAcceptsConversationKinds(t *testing.T) {
 	cases := []struct {
 		workType string
 		profile  string
 	}{
 		{agentapp.WorkTypeChatTurn, agentapp.ProfileKeyClarificationHost},
-		{agentapp.WorkTypeRequirementCurate, agentapp.ProfileKeyRequirementCurator},
-		{agentapp.WorkTypeAttachmentIngest, agentapp.ProfileKeyContextScout},
-		{agentapp.WorkTypeDesignRound, agentapp.ProfileKeyDesignPlanner},
-		{agentapp.WorkTypeDesignRequirement, agentapp.ProfileKeyCaseAuthor},
-		{agentapp.WorkTypeDesignGap, agentapp.ProfileKeyCaseAuthor},
+		{agentapp.WorkTypeDesignRequirement, agentapp.ProfileKeyDesignAuthor},
+		{agentapp.WorkTypeDesignGap, agentapp.ProfileKeyDesignAuthor},
 		{agentapp.WorkTypeDesignCritic, agentapp.ProfileKeyDesignCritic},
-		{agentapp.WorkTypeDesignDataPlan, agentapp.ProfileKeyDataPlanner},
 		{agentapp.WorkTypeExecuteCase, agentapp.ProfileKeyCaseExecutor},
 		{agentapp.WorkTypeAnalyzeFailure, agentapp.ProfileKeyFailureAnalyst},
 		{agentapp.WorkTypeAnalyzeCoverage, agentapp.ProfileKeyCoverageAnalyst},
@@ -768,14 +745,9 @@ func TestRunnerAcceptsConversationKinds(t *testing.T) {
 		// 0.2.1 work-item kinds (contracts/task-types.md §9.1). The two
 		// stage-entry kinds also have a deterministic runner path; the mapping
 		// is still the profile that owns the produced artifact.
-		{agent.WorkItemKindDesignCases, agentapp.ProfileKeyCaseAuthor},
+		{agent.WorkItemKindDesignCases, agentapp.ProfileKeyDesignAuthor},
 		{agent.WorkItemKindReviewCases, agentapp.ProfileKeyDesignCritic},
 		{agent.WorkItemKindExecuteBatch, agentapp.ProfileKeyCaseExecutor},
-		{agent.WorkItemKindExploreLogin, agentapp.ProfileKeyContextScout},
-		{agent.WorkItemKindExplorePage, agentapp.ProfileKeyContextScout},
-		{agent.WorkItemKindExploreAPI, agentapp.ProfileKeyContextScout},
-		{agent.WorkItemKindExploreCoverage, agentapp.ProfileKeyContextScout},
-		{agent.WorkItemKindExploreGap, agentapp.ProfileKeyContextScout},
 		{agent.WorkItemKindAnalyzeFailure, agentapp.ProfileKeyFailureAnalyst},
 		{agent.WorkItemKindReportVersion, agentapp.ProfileKeyReportWriter},
 		{agent.WorkItemKindKnowledgePropose, agentapp.ProfileKeyKnowledgeCurator},
@@ -789,6 +761,17 @@ func TestRunnerAcceptsConversationKinds(t *testing.T) {
 		})
 	}
 
+	// Removed profiles/work types fail closed instead of resolving a deleted
+	// seed (v0.22 D-B1/R-W1-5).
+	for _, removed := range []string{
+		agentapp.WorkTypeRequirementCurate, agentapp.WorkTypeAttachmentIngest,
+		agentapp.WorkTypeDesignRound, agentapp.WorkTypeDesignDataPlan,
+		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
+	} {
+		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
+			t.Fatalf("removed work type %q still maps to a profile", removed)
+		}
+	}
 	if _, ok := agentapp.ProfileKeyForWorkType("unknown.work"); ok {
 		t.Fatal("an unknown work type must stay unsupported")
 	}
@@ -802,23 +785,6 @@ func TestRunnerAcceptsConversationKinds(t *testing.T) {
 	contractItem.Kind = agent.WorkItemKindDesignCases
 	if got := agentapp.WorkTypeForItem(contractItem); got != agent.WorkItemKindDesignCases {
 		t.Fatalf("contract work type = %q, want the kind", got)
-	}
-
-	// A background explore kind must run through the explorer profile instead
-	// of being rejected as an unsupported work item.
-	fixture := newRunnerFixture(t)
-	fixture.chat.responses = []llmapp.ChatResponse{{Content: "已检查探索范围与页面可访问性。"}}
-	explore := fakeWorkItem(agent.WorkItemKindExplorePage, agentapp.WorkItemPayload{})
-	explore.Team = agent.TeamClarification
-	result, err := mustRun(t, fixture, explore)
-	if err != nil {
-		t.Fatalf("explore.page run: %v", err)
-	}
-	if result.Status != agent.AgentRunDone {
-		t.Fatalf("explore.page result = %#v", result)
-	}
-	if finished := fixture.repo.lastFinished(t); finished.ProfileKey != agentapp.ProfileKeyContextScout {
-		t.Fatalf("explore.page profile = %q", finished.ProfileKey)
 	}
 }
 
@@ -920,89 +886,7 @@ func stringValueForTest(value any) string {
 	return text
 }
 
-// TestDesignRoundProposesCases pins Task 69: the design.round opening turn must
-// propose case drafts through case.graph_propose (one graph read, then propose)
-// instead of asking the user to pick a requirement, and its prompt must carry
-// the round's scoped requirement ids so the model proposes the right scope.
-func TestDesignRoundProposesCases(t *testing.T) {
-	fixture := newRunnerFixture(t)
-	fixture.design.readResult = map[string]any{
-		"requirements": []any{
-			map[string]any{"requirement_id": "501", "requirement_version_id": "700"},
-			map[string]any{"requirement_id": "502", "requirement_version_id": "800"},
-		},
-		"discovery_facts": []any{map[string]any{
-			"kind": "page", "key": "page:env:1:/login", "summary": "/login · 登录",
-		}},
-	}
-	fixture.design.proposeResult = map[string]any{"case_version_ids": []string{"7001"}}
-	fixture.chat.responses = []llmapp.ChatResponse{
-		toolCall(tools.ToolDesignGraphRead, `{}`),
-		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
-		{Content: "已为本轮需求提交 1 个场景与 1 条用例草案。"},
-	}
-	item := fakeWorkItem(agentapp.WorkTypeDesignRound, agentapp.WorkItemPayload{
-		ConversationID: 20,
-		RoundID:        9001,
-	})
-	item.Payload = json.RawMessage(`{
-		"conversation_id":"20",
-		"round_id":"9001",
-		"requirement_ids":["501","502"],
-		"requirement_version_ids":["700","800"]
-	}`)
-
-	if _, err := mustRun(t, fixture, item); err != nil {
-		t.Fatalf("design.round run: %v", err)
-	}
-	if fixture.design.proposeCalls != 1 {
-		t.Fatalf("design.round proposals = %d, want the round to propose cases itself", fixture.design.proposeCalls)
-	}
-	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
-		t.Fatalf("design.round proposal = %#v", fixture.design.proposeInput)
-	}
-	prompt := requestPrompt(fixture.chat.request(0))
-	for _, want := range []string{
-		"case.graph_propose", "不要询问用户", "requirement_ids=501,502",
-		"requirement_version_ids=700,800", "视觉基线", "不要用 visual",
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("design.round prompt missing %q: %s", want, prompt)
-		}
-	}
-	for _, avoid := range []string{"只输出范围说明", "不写库、不调用写工具"} {
-		if strings.Contains(prompt, avoid) {
-			t.Fatalf("design.round prompt still tells the model not to write (%q): %s", avoid, prompt)
-		}
-	}
-}
-
-func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {
-	fixture := newRunnerFixture(t)
-	fixture.conv.kind = "design"
-	fixture.chat.responses = []llmapp.ChatResponse{{Content: "本轮设计范围：1 个待设计需求，预计生成 1 个场景与 2 条用例。"}}
-	item := fakeWorkItem(agentapp.WorkTypeDesignRound, agentapp.WorkItemPayload{
-		ConversationID: 20, RoundID: 9001,
-	})
-
-	if _, err := mustRun(t, fixture, item); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if len(fixture.conv.appended) != 1 || len(fixture.team.posts) != 1 {
-		t.Fatalf("messages/posts = %d/%d", len(fixture.conv.appended), len(fixture.team.posts))
-	}
-	if post := fixture.team.posts[0]; post.Team != agent.TeamDesign || !strings.Contains(post.Content, "范围") {
-		t.Fatalf("post = %#v", post)
-	}
-	prompt := requestPrompt(fixture.chat.request(0))
-	for _, want := range []string{"design.round", "round_id=9001", "视觉基线"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("planner prompt missing %q: %s", want, prompt)
-		}
-	}
-}
-
-func TestRunnerDesignCriticAndDataPlannerSubmitViaScopedTools(t *testing.T) {
+func TestRunnerDesignCriticSubmitsViaScopedTools(t *testing.T) {
 	critic := newRunnerFixture(t)
 	critic.chat.responses = []llmapp.ChatResponse{
 		toolCall(tools.ToolDesignReviewSubmit, `{"summary":"整体可用","findings":[{"severity":"minor","message":"补充异常步骤断言"}]}`),
@@ -1022,28 +906,6 @@ func TestRunnerDesignCriticAndDataPlannerSubmitViaScopedTools(t *testing.T) {
 	}
 	if len(critic.design.reviewInput.Findings) != 1 || critic.design.reviewInput.Findings[0].Message == "" {
 		t.Fatalf("review input = %#v", critic.design.reviewInput)
-	}
-
-	dataPlanner := newRunnerFixture(t)
-	dataPlanner.design.readResult = map[string]any{
-		"cases": []any{map[string]any{"case_id": "7001", "current_version_id": "8001", "status": "draft"}},
-	}
-	dataPlanner.chat.responses = []llmapp.ChatResponse{
-		toolCall(tools.ToolDesignGraphRead, `{}`),
-		toolCall(tools.ToolDesignDataPlanSubmit, `{"case_version_id":"8001","preconditions":"已登录","test_data":{"account":"admin"}}`),
-		{Content: "已为用例补充前置条件与测试数据。"},
-	}
-	dataItem := fakeWorkItem(agentapp.WorkTypeDesignDataPlan, agentapp.WorkItemPayload{
-		ConversationID: 20, RequirementID: 501, RequirementVersionID: 700,
-	})
-	if _, err := mustRun(t, dataPlanner, dataItem); err != nil {
-		t.Fatalf("data planner run: %v", err)
-	}
-	if dataPlanner.design.dataPlanCalls != 1 || dataPlanner.design.dataPlanCaseVersionID != 8001 {
-		t.Fatalf("data plan call = %#v", dataPlanner.design)
-	}
-	if len(dataPlanner.team.posts) != 1 || dataPlanner.team.posts[0].Team != agent.TeamDesign {
-		t.Fatalf("data planner posts = %#v", dataPlanner.team.posts)
 	}
 }
 
@@ -1069,13 +931,20 @@ func TestWorkItemPayloadParsesDesignIDs(t *testing.T) {
 func TestProfileKeyForWorkType(t *testing.T) {
 	cases := map[string]string{
 		agentapp.WorkTypeChatTurn:          agentapp.ProfileKeyClarificationHost,
-		agentapp.WorkTypeRequirementCurate: agentapp.ProfileKeyRequirementCurator,
-		agentapp.WorkTypeAttachmentIngest:  agentapp.ProfileKeyContextScout,
+		agentapp.WorkTypeDesignRequirement: agentapp.ProfileKeyDesignAuthor,
+		agentapp.WorkTypeDesignGap:         agentapp.ProfileKeyDesignAuthor,
 	}
 	for workType, want := range cases {
 		got, ok := agentapp.ProfileKeyForWorkType(workType)
 		if !ok || got != want {
 			t.Fatalf("ProfileKeyForWorkType(%q) = %q/%v, want %q", workType, got, ok, want)
+		}
+	}
+	// The removed clarification Curator/Scout work types no longer map to a
+	// deleted profile.
+	for _, removed := range []string{agentapp.WorkTypeRequirementCurate, agentapp.WorkTypeAttachmentIngest} {
+		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
+			t.Fatalf("removed work type %q still maps to a profile", removed)
 		}
 	}
 	// P3/P4 mappings live in their phase contract tests; an unregistered later

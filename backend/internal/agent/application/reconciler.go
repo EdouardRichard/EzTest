@@ -636,8 +636,9 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 			}
 		}
 
-		// Rules 3 and 4: reply and curation per user message. Design
-		// conversations keep the reply Host but never run requirement.curate.
+		// Rule 3: reply per unanswered user message. v0.22 D-B1 removed the
+		// requirement.curate background job; requirement drafting is a Host tool
+		// now, so the reconciler no longer enqueues a curation task.
 		for index, message := range conversation.Messages {
 			if message.Role != "user" {
 				continue
@@ -654,23 +655,6 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 						errs = append(errs, err)
 					} else if created {
 						items = append(items, agent.WorkItem{VersionID: conversation.VersionID, Type: WorkTypeChatTurn, DedupeKey: dedupeKey, Status: agent.WorkItemOpen})
-					}
-				}
-			}
-			if design {
-				continue
-			}
-			if !hasCuratorAfter(conversation.Messages, index) {
-				dedupeKey := fmt.Sprintf("curate:%d", message.ID)
-				if !hasBlockingTask(items, WorkTypeRequirementCurate, dedupeKey) {
-					created, err := r.ensure(ctx, conversation.VersionID, team, WorkTypeRequirementCurate, dedupeKey, map[string]any{
-						"conversation_id": idText(conversation.ID),
-						"message_id":      idText(message.ID),
-					})
-					if err != nil {
-						errs = append(errs, err)
-					} else if created {
-						items = append(items, agent.WorkItem{VersionID: conversation.VersionID, Type: WorkTypeRequirementCurate, DedupeKey: dedupeKey, Status: agent.WorkItemOpen})
 					}
 				}
 			}
@@ -746,15 +730,6 @@ func hasBlockingTask(items []agent.WorkItem, workType, dedupeKey string) bool {
 func hasAssistantAfter(messages []ReconcilerMessage, index int) bool {
 	for i := index + 1; i < len(messages); i++ {
 		if messages[i].Role == "assistant" {
-			return true
-		}
-	}
-	return false
-}
-
-func hasCuratorAfter(messages []ReconcilerMessage, index int) bool {
-	for i := index + 1; i < len(messages); i++ {
-		if messages[i].Role == "assistant" && messages[i].AgentProfileKey == ProfileKeyRequirementCurator {
 			return true
 		}
 	}

@@ -9,14 +9,13 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 )
 
-// p7ExpectedProfileTools is the contract §10.1 P7 whitelist increment: the
-// knowledge tool is a union with the P1–P6 tools, not a replacement.
+// p7ExpectedProfileTools is the contract §10.1 P7 whitelist increment after the
+// v0.22 D-B1 convergence: the knowledge tool is a union with the remaining P1–P6
+// tools, not a replacement.
 var p7ExpectedProfileTools = map[string][]string{
 	agentapp.ProfileKeyClarificationHost: {tools.ToolKnowledgePropose},
-	agentapp.ProfileKeyContextScout:      {tools.ToolKnowledgePropose},
 	agentapp.ProfileKeyDesignHost:        {tools.ToolKnowledgePropose},
-	agentapp.ProfileKeyDesignPlanner:     {tools.ToolKnowledgePropose},
-	agentapp.ProfileKeyCaseAuthor:        {tools.ToolKnowledgePropose},
+	agentapp.ProfileKeyDesignAuthor:      {tools.ToolKnowledgePropose},
 }
 
 func TestP7ProfileToolAdditionsMatchContract(t *testing.T) {
@@ -41,8 +40,8 @@ func TestEnsureProfilesSeedsP7ToolAdditions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	if len(seeded) != 15 {
-		t.Fatalf("seeded profiles = %d, want 15 (14 frozen P1-P4 + the P7 knowledge_curator profile)", len(seeded))
+	if len(seeded) != 11 {
+		t.Fatalf("seeded profiles = %d, want 11 (1 clarification Host + 3 design profiles + 3 execution + 3 delivery/steward + 1 knowledge_curator)", len(seeded))
 	}
 
 	for key, additions := range p7ExpectedProfileTools {
@@ -60,9 +59,7 @@ func TestEnsureProfilesSeedsP7ToolAdditions(t *testing.T) {
 	// The knowledge tool is a proposal surface only: teams that execute,
 	// analyse or deliver must not expose it (contracts §10.1).
 	excluded := []string{
-		agentapp.ProfileKeyRequirementCurator,
 		agentapp.ProfileKeyDesignCritic,
-		agentapp.ProfileKeyDataPlanner,
 		agentapp.ProfileKeyCaseExecutor,
 		agentapp.ProfileKeyFailureAnalyst,
 		agentapp.ProfileKeyCoverageAnalyst,

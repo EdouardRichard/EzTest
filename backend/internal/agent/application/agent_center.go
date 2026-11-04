@@ -213,8 +213,10 @@ func (s *AgentCenterService) requireReader() error {
 	return nil
 }
 
-// Catalog returns the 14 fixed profiles grouped by team with their run stats
-// and current prompt version. It never reads or returns the prompt body.
+// Catalog returns the fixed profile catalog grouped by team with their run
+// stats and current prompt version. It never reads or returns the prompt body.
+// v0.22 D-B1/R-B1-4: the conversation team is exactly the two Hosts plus the
+// two design background jobs; execution/analysis profiles are a separate team.
 func (s *AgentCenterService) Catalog(ctx context.Context) (Catalog, error) {
 	if err := s.requireReader(); err != nil {
 		return Catalog{}, err
@@ -233,7 +235,8 @@ func (s *AgentCenterService) Catalog(ctx context.Context) (Catalog, error) {
 	for _, row := range rows {
 		team, order, ok := catalogTeamForProfile(row.Profile.Key)
 		if !ok {
-			// Only the 14 seeded profiles are part of the frozen team map.
+			// Only the profiles of the converged team map are part of the
+			// catalog.
 			continue
 		}
 		promptVersion := row.PromptVersion
@@ -417,43 +420,41 @@ type agentCenterTeamDefinition struct {
 	keys  []string
 }
 
-// agentCenterTeams is the frozen team map of the 14 profiles (spec §8.1). The
-// code team owns deterministic workers and deliberately has no profile.
+// agentCenterTeams is the converged v0.22 team map (R-B1-1..R-B1-4). The
+// conversation team holds the two Hosts (the only conversation writers) and the
+// two design background jobs (job cards only, no conversation entry); the
+// execution team holds the execution/analysis profiles. There is no code team
+// because deterministic workers have no agent profile.
 var agentCenterTeams = []agentCenterTeamDefinition{
 	{
-		team:  "clarification",
-		label: "澄清",
-		keys:  []string{ProfileKeyClarificationHost, ProfileKeyRequirementCurator, ProfileKeyContextScout},
-	},
-	{
-		team:  "design",
-		label: "设计",
-		keys:  []string{ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor, ProfileKeyDesignCritic, ProfileKeyDataPlanner},
+		team:  "conversation",
+		label: "对话 Host 与后台作业",
+		note:  "2 个 Host 是对话唯一写者；design_author/design_critic 是后台作业，只出作业卡，无对话入口。",
+		keys: []string{
+			ProfileKeyClarificationHost,
+			ProfileKeyDesignHost,
+			ProfileKeyDesignAuthor,
+			ProfileKeyDesignCritic,
+		},
 	},
 	{
 		team:  "execution",
-		label: "执行",
-		keys:  []string{ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst},
-	},
-	{
-		team:  "delivery",
-		label: "交付",
-		keys:  []string{ProfileKeyIssueTriager, ProfileKeyReportWriter},
-	},
-	{
-		team:  "steward",
-		label: "版本管家",
-		keys:  []string{ProfileKeyVersionSteward},
-	},
-	{
-		team:  "code",
-		label: "代码",
-		note:  "确定性 worker，无 agent profile",
+		label: "执行 / 分析",
+		note:  "执行与后台分析 profile，不是对话 Agent。",
+		keys: []string{
+			ProfileKeyCaseExecutor,
+			ProfileKeyFailureAnalyst,
+			ProfileKeyCoverageAnalyst,
+			ProfileKeyIssueTriager,
+			ProfileKeyReportWriter,
+			ProfileKeyVersionSteward,
+			ProfileKeyKnowledgeCurator,
+		},
 	},
 }
 
 // catalogTeamForProfile maps a seeded profile key to its team and 1-based catalog
-// order. Unknown keys are not part of the frozen catalog.
+// order. Unknown keys are not part of the converged catalog.
 func catalogTeamForProfile(profileKey string) (string, int, bool) {
 	order := 0
 	for _, definition := range agentCenterTeams {

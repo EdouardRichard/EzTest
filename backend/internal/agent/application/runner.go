@@ -1499,9 +1499,10 @@ func shrinkKeepRecentMessages(keepRecent int) int {
 	return keepRecent / 2
 }
 
-// writeOutputs persists the profile-specific result: Host/Curator/Design Host/
-// Design Planner conversation messages (Curator with requirement cards),
-// Scout/Case Author/Design Critic/Data Planner team-room updates.
+// writeOutputs persists the profile-specific result: the two conversation Hosts
+// write assistant messages (the clarification Host also carries requirement
+// cards), while Design Author/Critic write team-room updates and background jobs
+// never append assistant text.
 func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText string) error {
 	switch state.profile.Key {
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst,
@@ -1514,12 +1515,15 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		if finalText == "" {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("host produced an empty final message")}
 		}
+		// The clarification Host owns requirement drafting after the v0.22
+		// Curator removal, so requirement cards created by its tools ride on the
+		// same assistant message (as the old Curator run did).
 		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
 			VersionID:        state.item.VersionID,
 			ConversationID:   state.payload.ConversationID,
 			AgentRunID:       state.run.ID,
 			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            r.assistantConversationParts(state, finalText, nil),
+			Parts:            r.assistantConversationParts(state, finalText, state.cards),
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
@@ -1540,29 +1544,11 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
-	case ProfileKeyDesignPlanner:
+	case ProfileKeyDesignAuthor:
 		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design planner produced an empty scope message")}
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design author produced no design update")}
 		}
-		if state.payload.ConversationID <= 0 {
-			return &RunError{Reason: "invalid_payload", Retryable: false, Cause: errors.New("design planner run has no conversation")}
-		}
-		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-			VersionID:      state.item.VersionID,
-			ConversationID: state.payload.ConversationID,
-			AgentRunID:     state.run.ID,
-			Parts:          r.assistantConversationParts(state, finalText, nil),
-		}); err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-		}
-		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
-			return err
-		}
-	case ProfileKeyCaseAuthor:
-		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("case author produced no design update")}
-		}
-		// A case-author task enqueued by a design round carries the round's
+		// A design-author task enqueued by a design round carries the round's
 		// conversation/round association: persist the proposal trace and the
 		// summary there so the design thread shows the case.graph_propose call
 		// with its evidence (Task 65), alongside the team-room update. A task
@@ -1588,48 +1574,6 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		}
 		if err := r.postDesignUpdate(ctx, state, agent.PostKindFinding, finalText); err != nil {
 			return err
-		}
-	case ProfileKeyDataPlanner:
-		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("data planner produced no data update")}
-		}
-		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
-			return err
-		}
-	case ProfileKeyRequirementCurator:
-		if finalText == "" && len(state.cards) == 0 {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("curator produced no message or requirement card")}
-		}
-		parts := r.assistantConversationParts(state, finalText, state.cards)
-		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-			VersionID:        state.item.VersionID,
-			ConversationID:   state.payload.ConversationID,
-			AgentRunID:       state.run.ID,
-			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            parts,
-		}); err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-		}
-	case ProfileKeyContextScout:
-		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("scout produced an empty finding")}
-		}
-		if r.teamRoom == nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: errors.New("agent runner has no team room port")}
-		}
-		refs := []agent.PostRef{}
-		if state.payload.AttachmentID > 0 {
-			refs = append(refs, agent.PostRef{Kind: "attachment", ID: idText(state.payload.AttachmentID)})
-		}
-		if _, err := r.teamRoom.Post(ctx, agent.TeamRoomPost{
-			VersionID:  state.item.VersionID,
-			Team:       agent.TeamClarification,
-			Kind:       agent.PostKindFinding,
-			Content:    finalText,
-			Refs:       refs,
-			AgentRunID: &state.run.ID,
-		}); err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
 	default:
 		if finalText == "" {
@@ -2067,15 +2011,6 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			AcceptanceCriteria: []string{"每条缺口引用属于当前版本的 requirement 与 wave 内证据", "使用 analysis.coverage_submit"},
 			Scope:              scope,
 		}
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
-		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
-		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               "执行当前 explore 任务：读取版本上下文与已有发现事实，用 explore.* 工具补齐可复现的页面/接口/登录事实并说明证据来源。",
-			Constraints:        []string{"只读 SUT 与版本事实，不生成/确认用例，不修改需求", "不编造事实；无法完成时说明明确原因", "记录证据引用，不写入凭据"},
-			AcceptanceCriteria: []string{"产生或补充可复现的发现事实", "说明证据来源与下一步"},
-			Scope:              scope,
-		}
 	default:
 		// P4 domains register their task-context providers from init hooks. When
 		// one claims the type, its JSON-ready payload is rendered by
@@ -2148,9 +2083,6 @@ func (r *Runner) baseUserMessage(ctx context.Context, state *runState, attachmen
 		return fmt.Sprintf("请分析 wave %s 的失败结果并提交 failure 候选细化。", idText(state.payload.WaveID))
 	case WorkTypeAnalyzeCoverage:
 		return fmt.Sprintf("请分析 wave %s 的执行覆盖缺口并提交覆盖候选。", idText(state.payload.WaveID))
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
-		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
-		return "请执行当前 explore 任务，读取版本上下文与已有事实，补齐可复现的页面/接口/登录发现并说明证据来源。"
 	default:
 		return "请根据当前任务继续执行。"
 	}
@@ -2350,20 +2282,20 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 
 // Design authoring envelope (Task 79, kept by v0.22). The stored profile
 // budgets cannot be trusted for design runs: profiles are seeded once and
-// EnsureProfiles never overwrites an existing row, so the live 0.2.1 database
-// still carries the chat-scale design budgets (case_author 8/300/600,
+// EnsureProfiles never overwrites an existing row, so an older database can
+// still carry the chat-scale design budgets (design_author 8/300/600,
 // design_planner 12/300/600) even after the seeds were raised. The runner
-// therefore enforces the design authoring floor in code: a focused case-author
+// therefore enforces the design authoring floor in code: a focused design-author
 // run needs the read turn, the propose turn and the summary turn, and must not
 // be cut off by the generic chat-scale soft timeout. Tokens are telemetry only
 // since v0.22, so the envelope consists of turns and wall-clock time only
 // (R-A2-1/R-A2-2).
 //
 // The envelope is profile-scoped, so it deliberately covers every design
-// profile. design_critic and data_planner can face a full design.graph_read +
-// submit turn, so their runtime envelope is expanded to 16/600/900 as well.
-// This is a documented expansion, pinned by
-// TestDesignBudgetExpandsCriticAndDataPlanner, not an accidental override.
+// profile. design_critic can face a full design.graph_read + submit turn, so
+// its runtime envelope is expanded to 16/600/900 as well. This is a documented
+// expansion, pinned by TestDesignBudgetExpandsCritic, not an accidental
+// override.
 const (
 	DesignRunMaxTurns       = 16
 	DesignRunMinSeconds     = 600
@@ -2416,8 +2348,7 @@ func isP3Profile(key string) bool {
 // they use the design-scale token budget and are not clamped by agent.max_turns.
 func isDesignProfile(key string) bool {
 	switch key {
-	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
-		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
+	case ProfileKeyDesignHost, ProfileKeyDesignAuthor, ProfileKeyDesignCritic:
 		return true
 	default:
 		return false
@@ -2839,8 +2770,7 @@ func artifactRefs(state *runState) []ArtifactRef {
 // room, and every P1 profile keeps the clarification team room.
 func teamForProfile(profileKey string) agent.Team {
 	switch profileKey {
-	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
-		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
+	case ProfileKeyDesignHost, ProfileKeyDesignAuthor, ProfileKeyDesignCritic:
 		return agent.TeamDesign
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
 		return agent.TeamExecution

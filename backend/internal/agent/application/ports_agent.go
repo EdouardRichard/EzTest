@@ -138,22 +138,20 @@ type ContentWriter interface {
 // work-item kinds are accepted as well (Task 65): they are the authoritative
 // kind of a contract row, and the two stage-entry kinds additionally have a
 // deterministic runner path before this profile is resolved.
+//
+// v0.22 D-B1/R-W1-5 removed the requirement.curate, attachment.ingest,
+// design.round, design.data_plan and explore.* mappings together with their
+// profiles: those capabilities moved to the deterministic server pipeline or
+// Host tools, so an item of one of those legacy types fails closed here instead
+// of resolving a deleted profile.
 func ProfileKeyForWorkType(workType string) (string, bool) {
 	switch workType {
 	case WorkTypeChatTurn:
 		return ProfileKeyClarificationHost, true
-	case WorkTypeRequirementCurate:
-		return ProfileKeyRequirementCurator, true
-	case WorkTypeAttachmentIngest:
-		return ProfileKeyContextScout, true
-	case WorkTypeDesignRound:
-		return ProfileKeyDesignPlanner, true
 	case WorkTypeDesignRequirement, WorkTypeDesignGap, agent.WorkItemKindDesignCases:
-		return ProfileKeyCaseAuthor, true
+		return ProfileKeyDesignAuthor, true
 	case WorkTypeDesignCritic, agent.WorkItemKindReviewCases:
 		return ProfileKeyDesignCritic, true
-	case WorkTypeDesignDataPlan:
-		return ProfileKeyDataPlanner, true
 	case WorkTypeExecuteCase, agent.WorkItemKindExecuteBatch:
 		return ProfileKeyCaseExecutor, true
 	case WorkTypeAnalyzeFailure:
@@ -166,10 +164,6 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyReportWriter, true
 	case WorkTypeRequirementClose, WorkTypeVersionClose:
 		return ProfileKeyVersionSteward, true
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage,
-		agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage,
-		agent.WorkItemKindExploreGap:
-		return ProfileKeyContextScout, true
 	case agent.WorkItemKindKnowledgePropose:
 		return ProfileKeyKnowledgeCurator, true
 	default:

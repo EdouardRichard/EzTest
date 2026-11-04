@@ -576,7 +576,7 @@ func TestPrefixStableAcrossWorkItems(t *testing.T) {
 		}
 	}
 	for _, stable := range []string{
-		"[profile:case_author]", "版本目标: 订单系统", "阶段: clarifying",
+		"[profile:design_author]", "版本目标: 订单系统", "阶段: clarifying",
 	} {
 		if !strings.Contains(firstPrefix.Content, stable) {
 			t.Fatalf("stable prefix is missing %q:\n%s", stable, firstPrefix.Content)

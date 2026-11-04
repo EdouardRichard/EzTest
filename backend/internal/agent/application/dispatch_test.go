@@ -316,14 +316,10 @@ func TestDispatchRoleMatrix(t *testing.T) {
 	}{
 		{"assistant execute.batch", agentapp.DispatchActorAssistant, agent.WorkItemKindExecuteBatch, version.StageExecuting, true},
 		{"assistant report.version", agentapp.DispatchActorAssistant, agent.WorkItemKindReportVersion, version.StageReporting, true},
-		{"assistant explore.page", agentapp.DispatchActorAssistant, agent.WorkItemKindExplorePage, version.StageClarifying, true},
+		{"assistant explore.page", agentapp.DispatchActorAssistant, "explore.page", version.StageClarifying, true},
 		{"assistant design.cases", agentapp.DispatchActorAssistant, agent.WorkItemKindDesignCases, version.StageDesigning, false},
 		{"assistant review.cases", agentapp.DispatchActorAssistant, agent.WorkItemKindReviewCases, version.StageDesigning, false},
-		{"planner explore.login", agentapp.DispatchActorPlanner, agent.WorkItemKindExploreLogin, version.StageClarifying, false},
-		{"planner explore.page", agentapp.DispatchActorPlanner, agent.WorkItemKindExplorePage, version.StageClarifying, false},
-		{"planner explore.api", agentapp.DispatchActorPlanner, agent.WorkItemKindExploreAPI, version.StageClarifying, false},
-		{"planner explore.coverage", agentapp.DispatchActorPlanner, agent.WorkItemKindExploreCoverage, version.StageClarifying, false},
-		{"planner explore.gap", agentapp.DispatchActorPlanner, agent.WorkItemKindExploreGap, version.StageClarifying, false},
+		{"planner explore.page", agentapp.DispatchActorPlanner, "explore.page", version.StageClarifying, true},
 		{"planner design.cases", agentapp.DispatchActorPlanner, agent.WorkItemKindDesignCases, version.StageDesigning, true},
 		{"trigger report.version", agentapp.DispatchActorTrigger, agent.WorkItemKindReportVersion, version.StageReporting, false},
 		{"trigger analyze.failure", agentapp.DispatchActorTrigger, agent.WorkItemKindAnalyzeFailure, version.StageExecuting, false},
@@ -349,7 +345,7 @@ func TestDispatchRoleMatrix(t *testing.T) {
 					t.Fatalf("actor %s created forbidden kind %s", testCase.actor, testCase.kind)
 				}
 				wantStatus := http.StatusForbidden
-				if !testCase.actor.Valid() {
+				if !testCase.actor.Valid() || !agent.ValidWorkItemKind(testCase.kind) {
 					wantStatus = http.StatusBadRequest
 				}
 				requirePlatformStatus(t, err, wantStatus)
@@ -440,11 +436,19 @@ func TestDispatchRequestJobWhitelist(t *testing.T) {
 		t.Fatalf("stored work items = %d, want 1", got)
 	}
 
-	for _, kind := range []string{agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion, agent.WorkItemKindExplorePage} {
+	for _, kind := range []string{agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion} {
 		if _, err := dispatcher.RequestJob(ctx, 7, kind, nil); err == nil {
 			t.Fatalf("assistant request for %s was accepted", kind)
 		} else {
 			requirePlatformStatus(t, err, http.StatusForbidden)
+		}
+	}
+	// Removed explore kinds are invalid work item kinds now (400).
+	for _, kind := range []string{"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap"} {
+		if _, err := dispatcher.RequestJob(ctx, 7, kind, nil); err == nil {
+			t.Fatalf("assistant request for removed kind %s was accepted", kind)
+		} else {
+			requirePlatformStatus(t, err, http.StatusBadRequest)
 		}
 	}
 }

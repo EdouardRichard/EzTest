@@ -7,9 +7,9 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
-// TestDesignBudgetAllowsAllCaseAuthors pins the per-requirement case-author
-// runtime envelope. The live v0.2.1 database was seeded before the design budget
-// was raised (case_author 8/300/600, design_planner 12/300/600) and
+// TestDesignBudgetAllowsAllCaseAuthors pins the per-requirement design-author
+// runtime envelope. The live database may have been seeded before the design
+// budget was raised (design_author 8/300/600, design_planner 12/300/600) and
 // EnsureProfiles never overwrites an existing row, so the runner must enforce
 // the design-authoring floor in code: 16 turns, 600s soft / 900s hard. Token
 // usage is telemetry only (R-A2-1), so every design run is explicitly unlimited
@@ -19,19 +19,15 @@ func TestDesignBudgetAllowsAllCaseAuthors(t *testing.T) {
 	runner := &Runner{}
 	staleProfiles := []agent.AgentProfile{
 		{
-			Key:     ProfileKeyCaseAuthor,
+			Key:     ProfileKeyDesignAuthor,
 			Budgets: agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 300, HardSeconds: 600},
-		},
-		{
-			Key:     ProfileKeyDesignPlanner,
-			Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
 		},
 		{
 			Key:     ProfileKeyDesignHost,
 			Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
 		},
 	}
-	workTypes := []string{WorkTypeDesignRequirement, WorkTypeDesignGap, WorkTypeDesignRound}
+	workTypes := []string{WorkTypeDesignRequirement, WorkTypeDesignGap}
 	for _, profile := range staleProfiles {
 		if got := runner.maxTurns(profile); got < DesignRunMaxTurns {
 			t.Fatalf("%s max turns = %d, want at least the design floor %d", profile.Key, got, DesignRunMaxTurns)
@@ -94,21 +90,20 @@ func TestDesignBudgetAllowsAllCaseAuthors(t *testing.T) {
 	}
 }
 
-// TestDesignBudgetExpandsCriticAndDataPlanner makes the design floor's profile
-// scope explicit (Task 79 fix round). P2Profiles seeds design_critic and
-// data_planner at the lighter 4/120/300, but every design profile shares the
-// 200k design token budget and can face a full design.graph_read + submit turn.
-// The runner deliberately raises their runtime envelope to 16/600/900; the
-// seeded row remains the admin-visible default. Pinning the expansion here means
-// it is a documented envelope, not a silent override.
-func TestDesignBudgetExpandsCriticAndDataPlanner(t *testing.T) {
+// TestDesignBudgetExpandsCritic makes the design floor's profile scope explicit
+// (Task 79 fix round). P2Profiles seeds design_critic at the lighter 4/120/300
+// floor in older databases, but every design profile can face a full
+// design.graph_read + submit turn. The runner deliberately raises the runtime
+// envelope to 16/600/900; the seeded row remains the admin-visible default.
+// Pinning the expansion here means it is a documented envelope, not a silent
+// override.
+func TestDesignBudgetExpandsCritic(t *testing.T) {
 	runner := &Runner{}
 	checks := []struct {
 		key      string
 		workType string
 	}{
 		{ProfileKeyDesignCritic, WorkTypeDesignCritic},
-		{ProfileKeyDataPlanner, WorkTypeDesignDataPlan},
 	}
 	for _, check := range checks {
 		profile := agent.AgentProfile{

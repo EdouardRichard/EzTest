@@ -12,8 +12,8 @@ import (
 
 func TestP1ProfilesMatchContract(t *testing.T) {
 	profiles := agentapp.P1Profiles()
-	if len(profiles) != 3 {
-		t.Fatalf("profiles = %d, want 3", len(profiles))
+	if len(profiles) != 1 {
+		t.Fatalf("profiles = %d, want 1 (the clarification Host; Curator/Scout were removed)", len(profiles))
 	}
 	registry := tools.NewP1Registry(tools.Deps{})
 
@@ -27,24 +27,18 @@ func TestP1ProfilesMatchContract(t *testing.T) {
 	if host.Budgets.MaxTurns != 12 || host.Budgets.SoftSeconds != 600 || host.Budgets.HardSeconds != 900 {
 		t.Fatalf("host budgets = %#v", host.Budgets)
 	}
-	if len(host.AllowedTools) != 9 {
+	if len(host.AllowedTools) != 13 {
 		t.Fatalf("host tools = %v", host.AllowedTools)
 	}
-
-	curator := profiles[1]
-	if curator.Key != agentapp.ProfileKeyRequirementCurator || len(curator.AllowedTools) != 12 {
-		t.Fatalf("curator profile = %#v", curator)
-	}
-	if !strings.Contains(curator.SystemPrompt, "[profile:requirement_curator]") {
-		t.Fatalf("curator prompt missing fake marker")
-	}
-
-	scout := profiles[2]
-	if scout.Key != agentapp.ProfileKeyContextScout || len(scout.AllowedTools) != 6 {
-		t.Fatalf("scout profile = %#v", scout)
-	}
-	if !strings.Contains(scout.SystemPrompt, "[profile:context_scout]") {
-		t.Fatalf("scout prompt missing fake marker")
+	// The Host now owns requirement drafting directly; the removed Curator
+	// must not leave its tools unreachable.
+	for _, name := range []string{
+		tools.ToolRequirementDraftCreate, tools.ToolRequirementDraftUpdate,
+		tools.ToolRequirementRelationPropose, tools.ToolRequirementReopenPropose,
+	} {
+		if !containsString(host.AllowedTools, name) {
+			t.Fatalf("clarification_host is missing %q: %v", name, host.AllowedTools)
+		}
 	}
 
 	for _, profile := range profiles {
@@ -59,10 +53,19 @@ func TestP1ProfilesMatchContract(t *testing.T) {
 	}
 }
 
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestP2ProfileSeeds(t *testing.T) {
 	profiles := agentapp.P2Profiles()
-	if len(profiles) != 5 {
-		t.Fatalf("P2 profiles = %d, want 5", len(profiles))
+	if len(profiles) != 3 {
+		t.Fatalf("P2 profiles = %d, want 3 (design_host, design_author, design_critic)", len(profiles))
 	}
 	registry := tools.NewP2Registry(tools.Deps{})
 
@@ -84,23 +87,14 @@ func TestP2ProfileSeeds(t *testing.T) {
 			marker:  "[profile:design_host]",
 			mustSay: []string{"不确认", "draft", "同一轮内立即", "expected", "视觉基线", "不要用 visual"},
 		},
-		agentapp.ProfileKeyDesignPlanner: {
-			tools: []string{
-				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolContextTeamRoomRead,
-				tools.ToolRequirementRead, tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose,
-			},
-			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
-			marker:  "[profile:design_planner]",
-			mustSay: []string{"范围", "case.graph_propose", "不要询问用户", "draft", "不能确认", "expected", "视觉基线", "不要用 visual"},
-		},
-		agentapp.ProfileKeyCaseAuthor: {
+		agentapp.ProfileKeyDesignAuthor: {
 			tools: []string{
 				tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolRequirementRead,
 				tools.ToolDesignGraphRead, tools.ToolCaseGraphPropose, tools.ToolSUTList, tools.ToolSUTPageList,
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
-			marker:  "[profile:case_author]",
-			mustSay: []string{"draft", "不能确认", "视觉基线", "不要用 visual"},
+			marker:  "[profile:design_author]",
+			mustSay: []string{"后台作业", "draft", "不能确认", "视觉基线", "不要用 visual"},
 		},
 		agentapp.ProfileKeyDesignCritic: {
 			tools: []string{
@@ -108,15 +102,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_critic]",
-			mustSay: []string{"内部", "不构成人工关卡", "视觉基线", "visual"},
-		},
-		agentapp.ProfileKeyDataPlanner: {
-			tools: []string{
-				tools.ToolContextTaskPack, tools.ToolDesignGraphRead, tools.ToolDesignDataPlanSubmit,
-			},
-			budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
-			marker:  "[profile:data_planner]",
-			mustSay: []string{"draft"},
+			mustSay: []string{"后台作业", "内部", "不构成人工关卡", "视觉基线", "visual"},
 		},
 	}
 
@@ -158,6 +144,68 @@ func TestP2ProfileSeeds(t *testing.T) {
 	}
 }
 
+// TestProfileSeedsAfterTeamConvergence pins the v0.22 D-B1 profile catalog: the
+// clarification/design domain has exactly two Hosts (clarification_host,
+// design_host) plus the two background jobs (design_author, design_critic), the
+// removed Scout/Curator/Planner seeds are absent, and the execution/analysis
+// seeds (case_executor, analysts, version_steward, report_writer,
+// knowledge_curator) are untouched.
+func TestProfileSeedsAfterTeamConvergence(t *testing.T) {
+	for _, key := range []string{
+		agentapp.ProfileKeyClarificationHost,
+		agentapp.ProfileKeyDesignHost,
+		agentapp.ProfileKeyDesignAuthor,
+		agentapp.ProfileKeyDesignCritic,
+	} {
+		if _, ok := agentapp.Profile(key); !ok {
+			t.Fatalf("conversation/design profile %q is missing", key)
+		}
+	}
+
+	hostCount := 0
+	for _, profile := range append(agentapp.P1Profiles(), agentapp.P2Profiles()...) {
+		switch profile.Key {
+		case agentapp.ProfileKeyClarificationHost, agentapp.ProfileKeyDesignHost:
+			hostCount++
+		case agentapp.ProfileKeyDesignAuthor, agentapp.ProfileKeyDesignCritic:
+			// Background jobs: seeded for job runs, never a conversation Host.
+		default:
+			t.Fatalf("unexpected conversation/design profile %q", profile.Key)
+		}
+	}
+	if hostCount != 2 {
+		t.Fatalf("conversation Hosts = %d, want exactly 2", hostCount)
+	}
+
+	for _, removed := range []string{
+		"context_scout", "requirement_curator", "design_planner", "data_planner", "case_author",
+	} {
+		if _, ok := agentapp.Profile(removed); ok {
+			t.Fatalf("removed profile %q is still seeded", removed)
+		}
+	}
+	for _, profile := range agentapp.ProfileSeeds() {
+		if profile.Key == "context_scout" || profile.Key == "requirement_curator" ||
+			profile.Key == "design_planner" || profile.Key == "data_planner" ||
+			profile.Key == "case_author" {
+			t.Fatalf("removed profile %q survived the convergence", profile.Key)
+		}
+	}
+
+	for _, key := range []string{
+		agentapp.ProfileKeyCaseExecutor,
+		agentapp.ProfileKeyCoverageAnalyst,
+		agentapp.ProfileKeyVersionSteward,
+		agentapp.ProfileKeyFailureAnalyst,
+		agentapp.ProfileKeyReportWriter,
+		agentapp.ProfileKeyKnowledgeCurator,
+	} {
+		if _, ok := agentapp.Profile(key); !ok {
+			t.Fatalf("execution/analysis profile %q must be retained", key)
+		}
+	}
+}
+
 func TestProfileKeyForConversationKind(t *testing.T) {
 	cases := map[string]string{
 		"clarification": agentapp.ProfileKeyClarificationHost,
@@ -176,16 +224,25 @@ func TestProfileKeyForConversationKind(t *testing.T) {
 
 func TestProfileKeyForWorkTypeP2(t *testing.T) {
 	cases := map[string]string{
-		agentapp.WorkTypeDesignRound:       agentapp.ProfileKeyDesignPlanner,
-		agentapp.WorkTypeDesignRequirement: agentapp.ProfileKeyCaseAuthor,
-		agentapp.WorkTypeDesignGap:         agentapp.ProfileKeyCaseAuthor,
+		agentapp.WorkTypeDesignRequirement: agentapp.ProfileKeyDesignAuthor,
+		agentapp.WorkTypeDesignGap:         agentapp.ProfileKeyDesignAuthor,
 		agentapp.WorkTypeDesignCritic:      agentapp.ProfileKeyDesignCritic,
-		agentapp.WorkTypeDesignDataPlan:    agentapp.ProfileKeyDataPlanner,
+		agent.WorkItemKindDesignCases:      agentapp.ProfileKeyDesignAuthor,
+		agent.WorkItemKindReviewCases:      agentapp.ProfileKeyDesignCritic,
 	}
 	for workType, want := range cases {
 		got, ok := agentapp.ProfileKeyForWorkType(workType)
 		if !ok || got != want {
 			t.Fatalf("ProfileKeyForWorkType(%q) = %q/%v, want %q", workType, got, ok, want)
+		}
+	}
+	// The Planner/Curator/Scout work types were removed with their profiles.
+	for _, removed := range []string{
+		agentapp.WorkTypeDesignRound, agentapp.WorkTypeDesignDataPlan,
+		agentapp.WorkTypeRequirementCurate, agentapp.WorkTypeAttachmentIngest,
+	} {
+		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
+			t.Fatalf("removed work type %q still maps to a profile", removed)
 		}
 	}
 	for _, reserved := range []string{"report.render_pdf", "case.confirm"} {
