@@ -273,8 +273,19 @@ try {
 
             # S5's execution may have closed the requirements. A retest wave
             # (needed for the cancel probe) requires an open requirement, so
-            # reopen them through the user API exactly as S5 does.
-            $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+            # reopen them through the user API exactly as S5 does. The close is
+            # asynchronous (requirement.close work item), so wait for the
+            # requirement status set to stabilize before snapshotting.
+            $requirements = @()
+            $lastSignature = ""
+            $stable = 0
+            for ($i = 0; $i -lt 15; $i++) {
+                $requirements = @(Get-VersionRequirements -Context $context -VersionId $versionId -Limit 200)
+                $signature = (($requirements | ForEach-Object { [string](Get-JsonProp -Object $_ -Name 'id' -Default '') + ':' + [string](Get-JsonProp -Object $_ -Name 'status' -Default '') }) | Sort-Object) -join '|'
+                if ($signature -eq $lastSignature) { $stable++ } else { $stable = 0; $lastSignature = $signature }
+                if ($stable -ge 2) { break }
+                Start-Sleep -Seconds 2
+            }
             $closedRequirements = @($requirements | Where-Object { [string](Get-JsonProp -Object $_ -Name 'status' -Default '') -eq 'closed' })
             $reopenRecords = @()
             foreach ($requirement in ($closedRequirements | Select-Object -First 6)) {
