@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 59 {
-		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
+	if len(applied) != 60 {
+		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -183,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 59 {
-		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
+	if len(applied) != 60 {
+		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -324,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 59 {
-		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
+	if len(applied) != 60 {
+		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1071,8 +1071,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 59 {
-		t.Fatalf("applied %d migrations, want 59: %v", len(applied), applied)
+	if len(applied) != 60 {
+		t.Fatalf("applied %d migrations, want 60: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1188,6 +1188,10 @@ func TestV022ABSchema(t *testing.T) {
 		{"requirement_extraction_run", "expected_count"},
 		{"requirement_extraction_run", "extracted_count"},
 		{"requirement_extraction_run", "error"},
+		// R-A7-8 / Lead ruling C12 (version_0013): the full reconciliation
+		// report object persisted for the progress API (58/58 current plus the
+		// separate V2 planned partition).
+		{"requirement_extraction_run", "report"},
 		// DB-8: extraction segments / cursor.
 		{"requirement_extraction_segment", "run_id"},
 		{"requirement_extraction_segment", "seq"},
@@ -1216,6 +1220,23 @@ func TestV022ABSchema(t *testing.T) {
 	// start at 1.
 	requireColumnNotNull(t, pool, "version_plan_item", "revision")
 	requireColumnDefault(t, pool, "version_plan_item", "revision", "1")
+
+	// R-A7-8 / Lead ruling C12: report is a NOT NULL JSON object with an empty
+	// object default, so pre-v0.22 rows and a run that never reconciled read
+	// back as "no report yet" instead of NULL.
+	requireColumnNotNull(t, pool, "requirement_extraction_run", "report")
+	requireColumnDefault(t, pool, "requirement_extraction_run", "report", "'{}'::jsonb")
+	var reportCheck string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conname = 'chk_requirement_extraction_run_report'
+		  AND contype = 'c'
+		  AND connamespace = current_schema()::regnamespace
+	`).Scan(&reportCheck); err != nil {
+		t.Errorf("read chk_requirement_extraction_run_report: %v", err)
+	} else if !strings.Contains(reportCheck, "jsonb_typeof(report) = 'object'") {
+		t.Errorf("requirement_extraction_run.report CHECK is not an object check: %s", reportCheck)
+	}
 
 	// D34 / Agent.md §6.9.5: the three new tables name their primary-key
 	// constraints pk_<table> instead of PostgreSQL's implicit <table>_pkey.

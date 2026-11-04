@@ -13,19 +13,27 @@ package versionapp
 // Idempotency and recovery:
 //   - run key = (version_id, attachment_id, input_sha256); Start twice returns
 //     the same run and segments are inserted with INSERT ... ON CONFLICT
-//     (run_id, seq) DO NOTHING;
+//     (run_id, seq) DO NOTHING. Start locks (version_id, attachment_id), so one
+//     attachment always has a single active run: the new-run path archives every
+//     other active run and the replay path returns the active run when the
+//     requested sha was already superseded;
 //   - a changed document sha opens a new run and archives the previous
-//     pending/running/paused run as failed;
+//     pending/running/paused run as failed. Archived runs are fenced: segment
+//     transitions and requirement emits from a worker that was in flight when
+//     the archive happened are rejected;
 //   - segment claims increment attempts, failed segments are retried with
 //     attempts-based exponential backoff (SegmentRetryDelay) up to
 //     DefaultExtractionMaxAttempts, and a running lease older than
-//     DefaultExtractionLeaseTimeout returns to pending (error cleared);
+//     DefaultExtractionLeaseTimeout returns to pending (error cleared). A worker
+//     renews the leases of its outstanding claim batch (heartbeat) so a slow
+//     processor cannot let a second worker reclaim the same segments;
 //   - done/skipped segments are never claimed again, so replay is a no-op.
 //
 // The requirement sink upserts by (version_id, external_id) (source_key
 // "extraction:<external_id>") and updates instead of inserting a duplicate.
 // Counts (total/done/failed/extracted) are recomputed in the same transaction
-// as the segment transition.
+// as the segment transition; the full reconciliation report is persisted in
+// requirement_extraction_run.report.
 
 import (
 	"context"
@@ -81,6 +89,9 @@ const (
 	// DefaultExtractionRetryBaseDelay is the first retry backoff. Retry n
 	// waits base * 2^(n-1) (30s, 60s, ...), persisted in segment.renewed_at.
 	DefaultExtractionRetryBaseDelay = 30 * time.Second
+	// DefaultExtractionLeaseHeartbeat is how often a worker renews the leases
+	// of its outstanding claimed segments while processing a batch.
+	DefaultExtractionLeaseHeartbeat = DefaultExtractionLeaseTimeout / 3
 )
 
 // Extraction worker sentinel errors. Operations on paused/done/failed runs and
@@ -106,8 +117,11 @@ type ExtractionRun struct {
 	ExpectedCount  *int                `json:"expected_count,omitempty"`
 	ExtractedCount int                 `json:"extracted_count"`
 	Error          string              `json:"error,omitempty"`
-	CreatedAt      time.Time           `json:"created_at"`
-	UpdatedAt      time.Time           `json:"updated_at"`
+	// Report is the full R-A7-8 reconciliation report persisted in
+	// requirement_extraction_run.report. Nil until Reconcile has run once.
+	Report    *ReconciliationReport `json:"report,omitempty"`
+	CreatedAt time.Time             `json:"created_at"`
+	UpdatedAt time.Time             `json:"updated_at"`
 }
 
 // ExtractionSegment is one requirement_extraction_segment row. It never carries
@@ -195,8 +209,12 @@ type ExtractionRepository interface {
 	// ClaimSegments resets stale running leases, then claims pending (and due
 	// failed, attempts < DefaultExtractionMaxAttempts) segments
 	// FOR UPDATE SKIP LOCKED. Claim sets running, attempts+1, renewed_at=now
-	// and clears the error.
+	// and clears the error. It must return no segments when the run is no
+	// longer pending/running (pause/archive gate).
 	ClaimSegments(ctx context.Context, runID int64, limit int, now time.Time) ([]ExtractionSegment, error)
+	// RenewSegmentLeases extends the running lease of the given claimed
+	// segments (worker heartbeat). Terminal segments are not touched.
+	RenewSegmentLeases(ctx context.Context, runID int64, seqs []int, now time.Time) (int, error)
 	MarkSegmentDone(ctx context.Context, runID int64, seq, extractedCount int, now time.Time) error
 	MarkSegmentSkipped(ctx context.Context, runID int64, seq int, reason string, now time.Time) error
 	// MarkSegmentFailed records the failure and sets renewed_at to the
@@ -206,17 +224,23 @@ type ExtractionRepository interface {
 	// It reports false when the current status does not match.
 	TransitionRun(ctx context.Context, runID int64, from []ExtractionRunStatus, to ExtractionRunStatus, now time.Time) (bool, error)
 	// RetryFailedSegments resets failed segments to a fresh attempt budget.
+	// Superseded (archived) runs are rejected with ErrExtractionRunState.
 	RetryFailedSegments(ctx context.Context, runID int64, now time.Time) (int, error)
 	// RetrySegment resets one failed segment (and a failed run back to pending).
 	RetrySegment(ctx context.Context, runID int64, seq int, now time.Time) error
-	// SaveReconciliation persists the declared/extracted counts read by the UI.
-	SaveReconciliation(ctx context.Context, runID int64, expected, extracted int, now time.Time) error
+	// SaveReconciliation persists the full report plus the expected/extracted
+	// counts read by the UI.
+	SaveReconciliation(ctx context.Context, runID int64, report ReconciliationReport, now time.Time) error
+	// CountLowConfidence counts the requirements attributed to the run whose
+	// confidence is below threshold (NULL confidence is not counted).
+	CountLowConfidence(ctx context.Context, runID int64, threshold float64) (int, error)
 	// ListExtractedExternalIDs returns the external ids currently attributed to
 	// this run (requirement.extraction_run_id), used for missing_ids.
 	ListExtractedExternalIDs(ctx context.Context, versionID, runID int64) ([]string, error)
 	// UpsertExtractedRequirements updates by (version_id, external_id) and
-	// never inserts a second requirement for the same external id.
-	UpsertExtractedRequirements(ctx context.Context, source ExtractionSource, requirements []ExtractionRequirement) (ExtractionEmitCounts, error)
+	// never inserts a second requirement for the same external id. Superseded
+	// (archived) runs are rejected with ErrExtractionRunState.
+	UpsertExtractedRequirements(ctx context.Context, source ExtractionSource, requirements []ExtractionRequirement, now time.Time) (ExtractionEmitCounts, error)
 }
 
 // ExtractionService runs the deterministic extraction cursor and owns the
@@ -227,6 +251,7 @@ type ExtractionService struct {
 	events     eventingapp.Publisher
 	clock      clock.Clock
 	claimBatch int
+	heartbeat  time.Duration
 }
 
 // NewExtractionService wires the worker. events may be nil (best-effort
@@ -238,6 +263,7 @@ func NewExtractionService(repo ExtractionRepository, processor ExtractionSegment
 	return &ExtractionService{
 		repo: repo, processor: processor, events: events, clock: clk,
 		claimBatch: DefaultExtractionClaimBatch,
+		heartbeat:  DefaultExtractionLeaseHeartbeat,
 	}
 }
 
@@ -248,10 +274,17 @@ func (s *ExtractionService) SetClaimBatch(batch int) {
 	}
 }
 
+// SetLeaseHeartbeat overrides the outstanding-claim renewal interval. Zero
+// disables the background heartbeat (tests that do not exercise lease safety).
+func (s *ExtractionService) SetLeaseHeartbeat(interval time.Duration) {
+	s.heartbeat = interval
+}
+
 // Start opens (or replays) the extraction run of one attachment input. The same
 // (version_id, attachment_id, input_sha256) always returns the same run; a
-// changed sha creates a new run and archives the old one. Segments are inserted
-// once and duplicate (run_id, seq) rows are a no-op.
+// changed sha creates a new run and archives the old one. On replay, changed
+// (run_id, seq) segment text reopens that segment and totals/expected_count are
+// refreshed so a done run never keeps orphan pending segments.
 func (s *ExtractionService) Start(ctx context.Context, input ExtractionStartInput) (ExtractionRun, error) {
 	if s == nil || s.repo == nil {
 		return ExtractionRun{}, errors.New("extraction service has no repository")
@@ -347,6 +380,17 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 		if err := ctx.Err(); err != nil {
 			return run, err
 		}
+		// Re-read the run before every claim: Pause, archive (changed sha) or a
+		// terminal transition made while this worker was processing a previous
+		// batch must stop the loop instead of draining more segments.
+		current, err := s.repo.GetRun(ctx, runID)
+		if err != nil {
+			return run, err
+		}
+		run = current
+		if run.Status != ExtractionRunPending && run.Status != ExtractionRunRunning {
+			break
+		}
 		segments, err := s.repo.ClaimSegments(ctx, runID, s.claimBatch, s.clock.Now())
 		if err != nil {
 			return run, err
@@ -355,39 +399,22 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 			break
 		}
 		worked = true
-		for _, segment := range segments {
-			result, processErr := s.processor.ProcessSegment(ctx, run, segment)
-			now := s.clock.Now()
-			if processErr != nil {
-				if ctx.Err() != nil {
-					// The segment lease stays running and is reset by the
-					// next worker after DefaultExtractionLeaseTimeout.
-					return run, ctx.Err()
-				}
-				if markErr := s.repo.MarkSegmentFailed(ctx, runID, segment.Seq, processErr.Error(), now); markErr != nil {
-					return run, markErr
-				}
-				s.publish(ctx, run, "extraction.segment_failed", map[string]any{
-					"seq":       segment.Seq,
-					"attempts":  segment.Attempts,
-					"error":     processErr.Error(),
-					"retryable": segment.Attempts < DefaultExtractionMaxAttempts,
-				})
-				continue
+		if err := s.processClaimedBatch(ctx, &run, segments); err != nil {
+			if ctx.Err() != nil {
+				// The in-flight segment lease stays running and is reset by the
+				// next worker after DefaultExtractionLeaseTimeout.
+				return run, ctx.Err()
 			}
-			if result.Skipped {
-				if markErr := s.repo.MarkSegmentSkipped(ctx, runID, segment.Seq, result.SkipReason, now); markErr != nil {
-					return run, markErr
+			if errors.Is(err, ErrExtractionRunState) {
+				// The run was archived (or otherwise changed) while the batch
+				// was in flight. Stop cleanly and report the current cursor.
+				current, getErr := s.repo.GetRun(ctx, runID)
+				if getErr != nil {
+					return run, getErr
 				}
-				continue
+				return current, nil
 			}
-			if markErr := s.repo.MarkSegmentDone(ctx, runID, segment.Seq, result.ExtractedCount, now); markErr != nil {
-				return run, markErr
-			}
-			s.publish(ctx, run, "extraction.progress", map[string]any{
-				"seq":             segment.Seq,
-				"extracted_count": result.ExtractedCount,
-			})
+			return run, err
 		}
 	}
 
@@ -405,6 +432,94 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 		})
 	}
 	return final, nil
+}
+
+// processClaimedBatch executes one claim batch and keeps the batch leases alive
+// while it runs. The heartbeat matters when one batch takes longer than
+// DefaultExtractionLeaseTimeout: without it a second worker could reset the
+// unrenewed running segments and process them twice.
+func (s *ExtractionService) processClaimedBatch(ctx context.Context, run *ExtractionRun, segments []ExtractionSegment) error {
+	stop := s.startLeaseHeartbeat(ctx, run.ID, segments)
+	defer stop()
+	for index, segment := range segments {
+		// Renewing the outstanding tail before each segment is cheap and keeps
+		// the batch claim alive even if the background ticker is disabled.
+		s.renewSegmentLeases(ctx, run.ID, segments[index:])
+		result, processErr := s.processor.ProcessSegment(ctx, *run, segment)
+		now := s.clock.Now()
+		if processErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if markErr := s.repo.MarkSegmentFailed(ctx, run.ID, segment.Seq, processErr.Error(), now); markErr != nil {
+				return markErr
+			}
+			s.publish(ctx, *run, "extraction.segment_failed", map[string]any{
+				"seq":       segment.Seq,
+				"attempts":  segment.Attempts,
+				"error":     processErr.Error(),
+				"retryable": segment.Attempts < DefaultExtractionMaxAttempts,
+			})
+			continue
+		}
+		if result.Skipped {
+			if markErr := s.repo.MarkSegmentSkipped(ctx, run.ID, segment.Seq, result.SkipReason, now); markErr != nil {
+				return markErr
+			}
+			continue
+		}
+		if markErr := s.repo.MarkSegmentDone(ctx, run.ID, segment.Seq, result.ExtractedCount, now); markErr != nil {
+			return markErr
+		}
+		s.publish(ctx, *run, "extraction.progress", map[string]any{
+			"seq":             segment.Seq,
+			"extracted_count": result.ExtractedCount,
+		})
+	}
+	return nil
+}
+
+// startLeaseHeartbeat renews the leases of one outstanding claim batch until the
+// returned stop function is called. It is best-effort: a renewal failure never
+// fails extraction (the lease then recovers through the normal timeout path).
+func (s *ExtractionService) startLeaseHeartbeat(ctx context.Context, runID int64, segments []ExtractionSegment) func() {
+	if s.heartbeat <= 0 || len(segments) == 0 || s.repo == nil {
+		return func() {}
+	}
+	seqs := make([]int, 0, len(segments))
+	for _, segment := range segments {
+		seqs = append(seqs, segment.Seq)
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(s.heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				_, _ = s.repo.RenewSegmentLeases(heartbeatCtx, runID, seqs, s.clock.Now())
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func (s *ExtractionService) renewSegmentLeases(ctx context.Context, runID int64, segments []ExtractionSegment) {
+	if s.repo == nil || len(segments) == 0 {
+		return
+	}
+	seqs := make([]int, 0, len(segments))
+	for _, segment := range segments {
+		seqs = append(seqs, segment.Seq)
+	}
+	_, _ = s.repo.RenewSegmentLeases(ctx, runID, seqs, s.clock.Now())
 }
 
 // ProcessNext processes up to limit runs in ascending id order. Claims are
@@ -473,10 +588,13 @@ func (s *ExtractionService) Resume(ctx context.Context, runID int64) (Extraction
 }
 
 // RetryRun retries a failed run: failed segments get a fresh attempt budget and
-// the run returns to pending.
+// the run returns to pending. A superseded (archived) run cannot be retried.
 func (s *ExtractionService) RetryRun(ctx context.Context, runID int64) (ExtractionRun, error) {
 	run, err := s.mustGetRun(ctx, runID)
 	if err != nil {
+		return ExtractionRun{}, err
+	}
+	if err := s.ensureRunNotSuperseded(ctx, run); err != nil {
 		return ExtractionRun{}, err
 	}
 	if run.Status != ExtractionRunFailed {
@@ -499,7 +617,11 @@ func (s *ExtractionService) RetryRun(ctx context.Context, runID int64) (Extracti
 
 // RetrySegment retries one terminal failed segment (and a failed run).
 func (s *ExtractionService) RetrySegment(ctx context.Context, runID int64, seq int) (ExtractionRun, error) {
-	if _, err := s.mustGetRun(ctx, runID); err != nil {
+	run, err := s.mustGetRun(ctx, runID)
+	if err != nil {
+		return ExtractionRun{}, err
+	}
+	if err := s.ensureRunNotSuperseded(ctx, run); err != nil {
 		return ExtractionRun{}, err
 	}
 	if seq <= 0 {
@@ -521,8 +643,11 @@ func (s *ExtractionService) LatestRun(ctx context.Context, versionID, attachment
 	if s == nil || s.repo == nil {
 		return ExtractionRun{}, errors.New("extraction service has no repository")
 	}
-	if versionID <= 0 || attachmentID <= 0 {
-		return ExtractionRun{}, platform.Invalid("attachment_id", "must be positive decimal IDs")
+	if versionID <= 0 {
+		return ExtractionRun{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if attachmentID <= 0 {
+		return ExtractionRun{}, platform.Invalid("attachment_id", "must be a positive decimal ID")
 	}
 	return s.repo.GetLatestRun(ctx, versionID, attachmentID)
 }
@@ -538,11 +663,12 @@ func (s *ExtractionService) ListRuns(ctx context.Context, versionID int64) ([]Ex
 	return s.repo.ListRuns(ctx, versionID)
 }
 
-// Reconcile computes the R-A7-8 report and persists expected_count/
-// extracted_count on the run. lowConfidence and skippedImages are supplied by
-// the caller (requirement rows / parser coverage); the report itself is
-// returned to the progress UI.
-func (s *ExtractionService) Reconcile(ctx context.Context, runID int64, documentText string, lowConfidence, skippedImages int) (ReconciliationReport, error) {
+// Reconcile computes the R-A7-8 report and persists the full report plus
+// expected_count/extracted_count on the run. low_confidence is derived from the
+// run's requirement rows (requirement.confidence below
+// DefaultLowConfidenceThreshold) instead of trusting a caller; skippedImages is
+// accepted from the parser coverage and persisted in the report.
+func (s *ExtractionService) Reconcile(ctx context.Context, runID int64, documentText string, skippedImages int) (ReconciliationReport, error) {
 	run, err := s.mustGetRun(ctx, runID)
 	if err != nil {
 		return ReconciliationReport{}, err
@@ -551,12 +677,16 @@ func (s *ExtractionService) Reconcile(ctx context.Context, runID int64, document
 	if err != nil {
 		return ReconciliationReport{}, err
 	}
+	lowConfidence, err := s.repo.CountLowConfidence(ctx, run.ID, DefaultLowConfidenceThreshold)
+	if err != nil {
+		return ReconciliationReport{}, err
+	}
 	report := ReconcileDocument(documentText, ReconciliationInput{
 		ExtractedIDs:  extracted,
 		LowConfidence: lowConfidence,
 		SkippedImages: skippedImages,
 	})
-	if err := s.repo.SaveReconciliation(ctx, run.ID, report.Expected, report.Extracted, s.clock.Now()); err != nil {
+	if err := s.repo.SaveReconciliation(ctx, run.ID, report, s.clock.Now()); err != nil {
 		return ReconciliationReport{}, err
 	}
 	return report, nil
@@ -565,6 +695,11 @@ func (s *ExtractionService) Reconcile(ctx context.Context, runID int64, document
 // EmitExtractedRequirements implements tools.ExtractionSink: the model emits
 // one validated batch per segment, the sink upserts by (version_id,
 // external_id), sets run/source provenance and never inserts duplicates.
+//
+// Task 18 wiring: the actual database identity is requirement.source_key =
+// "extraction:<external_id>" (the partial unique index is (version_id,
+// source_key)); external_id is written alongside it for reconciliation. A
+// superseded/archived run is rejected with ErrExtractionRunState.
 func (s *ExtractionService) EmitExtractedRequirements(ctx context.Context, source ExtractionSource, requirements []ExtractionRequirement) (ExtractionEmitCounts, error) {
 	if s == nil || s.repo == nil {
 		return ExtractionEmitCounts{}, errors.New("extraction service has no repository")
@@ -583,7 +718,7 @@ func (s *ExtractionService) EmitExtractedRequirements(ctx context.Context, sourc
 	if len(requirements) == 0 {
 		return ExtractionEmitCounts{}, nil
 	}
-	return s.repo.UpsertExtractedRequirements(ctx, source, requirements)
+	return s.repo.UpsertExtractedRequirements(ctx, source, requirements, s.clock.Now())
 }
 
 var _ tools.ExtractionSink = (*ExtractionService)(nil)
@@ -614,6 +749,21 @@ func (s *ExtractionService) mustGetRun(ctx context.Context, runID int64) (Extrac
 		return ExtractionRun{}, ErrExtractionRunNotFound
 	}
 	return s.repo.GetRun(ctx, runID)
+}
+
+// ensureRunNotSuperseded rejects operations on a run that was archived because a
+// newer run of the same attachment took over (changed input_sha256). The repo
+// enforces the same fence transactionally; this check gives typed errors before
+// attempting a write.
+func (s *ExtractionService) ensureRunNotSuperseded(ctx context.Context, run ExtractionRun) error {
+	latest, err := s.repo.GetLatestRun(ctx, run.VersionID, run.AttachmentID)
+	if err != nil {
+		return err
+	}
+	if latest.ID != run.ID {
+		return ErrExtractionRunState
+	}
+	return nil
 }
 
 // publish emits one best-effort progress event. A nil publisher or a failing

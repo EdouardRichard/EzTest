@@ -885,11 +885,12 @@ type ReconciliationInput struct {
 	SkippedImages int
 }
 
-// ReconciliationReport is the R-A7-8 audit report. Expected/extracted are
-// persisted on requirement_extraction_run; MissingIDs/LowConfidence/
-// SkippedImages are exposed to the progress UI. CurrentIDs and PlannedIDs keep
-// the V1 current requirements separate from V2 planned ones (live documents mix
-// 58 current + 32 planned ids, so summing them would over-count).
+// ReconciliationReport is the R-A7-8 audit report. Expected/Extracted/Missing
+// and MissingIDs cover the V1 current requirements only. The V2 planned
+// requirements are a separate partition (PlannedCount/PlannedIDs) and are never
+// reported missing: the live document declares 58 current + 32 planned ids, so
+// summing them would over-count the A-9 58/58 target. The whole report is
+// persisted as requirement_extraction_run.report for the progress UI/API.
 type ReconciliationReport struct {
 	Expected      int      `json:"expected"`
 	Extracted     int      `json:"extracted"`
@@ -897,8 +898,11 @@ type ReconciliationReport struct {
 	MissingIDs    []string `json:"missing_ids"`
 	LowConfidence int      `json:"low_confidence"`
 	SkippedImages int      `json:"skipped_images"`
-	CurrentIDs    []string `json:"current_ids"`
+	PlannedCount  int      `json:"planned_count"`
 	PlannedIDs    []string `json:"planned_ids"`
+	// CurrentIDs is the declared V1 partition. It is kept in-process for
+	// diagnostics/tests and is not part of the persisted report contract.
+	CurrentIDs []string `json:"-"`
 }
 
 var (
@@ -921,7 +925,9 @@ var (
 // whose text contains "功能需求"/"FR" plus its following lines, so ids that only
 // occur in a functional-requirements section are never lost. Headings marking
 // V2/规划 split the declared ids into PlannedIDs; V1/当前 sections fill
-// CurrentIDs. The report never invents an id and never rewrites extracted ids:
+// CurrentIDs. Expected/Extracted/Missing and MissingIDs are computed over the
+// V1 current partition only; planned ids are counted separately and are never
+// missing. The report never invents an id and never rewrites extracted ids:
 // missing_ids is the set difference, in document order.
 func ReconcileDocument(documentText string, input ReconciliationInput) ReconciliationReport {
 	report := ReconciliationReport{
@@ -993,18 +999,20 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 		}
 		extracted[trimmed] = struct{}{}
 	}
-	report.Expected = len(declared)
-	report.Extracted = len(extracted)
 	for _, id := range declared {
 		if planned[id] {
 			report.PlannedIDs = append(report.PlannedIDs, id)
-		} else {
-			report.CurrentIDs = append(report.CurrentIDs, id)
+			continue
 		}
-		if _, ok := extracted[id]; !ok {
-			report.MissingIDs = append(report.MissingIDs, id)
+		report.CurrentIDs = append(report.CurrentIDs, id)
+		if _, ok := extracted[id]; ok {
+			report.Extracted++
+			continue
 		}
+		report.MissingIDs = append(report.MissingIDs, id)
 	}
+	report.Expected = len(report.CurrentIDs)
+	report.PlannedCount = len(report.PlannedIDs)
 	report.Missing = len(report.MissingIDs)
 	return report
 }

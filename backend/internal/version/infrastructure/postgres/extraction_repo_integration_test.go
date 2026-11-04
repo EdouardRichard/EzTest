@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,36 +117,9 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 		t.Fatalf("running segments reclaimed: %+v", none)
 	}
 
-	// Stale running lease returns to pending (error cleared) and is reclaimed.
-	if _, err := pool.Exec(ctx, `
-		UPDATE requirement_extraction_segment
-		SET renewed_at = $2, error = 'worker crashed'
-		WHERE run_id = $1 AND seq = 1
-	`, third.ID, now.Add(-6*time.Minute)); err != nil {
-		t.Fatalf("age lease: %v", err)
-	}
-	if err := repo.MarkSegmentDone(ctx, third.ID, 2, 0, now); err != nil {
-		t.Fatalf("MarkSegmentDone 2: %v", err)
-	}
-	reclaimed, err := repo.ClaimSegments(ctx, third.ID, 10, now)
-	if err != nil {
-		t.Fatalf("ClaimSegments after stale lease: %v", err)
-	}
-	if len(reclaimed) != 1 || reclaimed[0].Seq != 1 || reclaimed[0].Attempts != 2 || reclaimed[0].Error != "" {
-		t.Fatalf("reclaimed=%+v", reclaimed)
-	}
-	if err := repo.MarkSegmentDone(ctx, third.ID, 1, 1, now); err != nil {
-		t.Fatalf("MarkSegmentDone 1: %v", err)
-	}
-	stored, err := repo.GetRun(ctx, third.ID)
-	if err != nil {
-		t.Fatalf("GetRun done: %v", err)
-	}
-	if stored.Status != versionapp.ExtractionRunDone || stored.DoneSegments != 2 || stored.TotalSegments != 2 {
-		t.Fatalf("run after done=%+v", stored)
-	}
-
 	// Duplicate external_id updates the existing requirement, never inserts.
+	// Emits happen while the run is active: the sink is fenced against
+	// archived/done runs, so this block runs before the final segment mark.
 	source := versionapp.ExtractionSource{
 		VersionID: versionID, AttachmentID: attachmentID, RunID: third.ID, SegmentSeq: 1,
 	}
@@ -154,7 +128,7 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 		AcceptanceCriteria: []string{"验证码正确"}, Priority: "P0",
 		Category: "functional", SourceQuote: "FR-001 登录", Confidence: 0.9,
 	}
-	counts, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{requirement})
+	counts, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{requirement}, now)
 	if err != nil {
 		t.Fatalf("Upsert first: %v", err)
 	}
@@ -163,7 +137,7 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 	}
 	requirement.Title = "手机号登录"
 	requirement.Confidence = 0.7
-	counts, err = repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{requirement})
+	counts, err = repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{requirement}, now)
 	if err != nil {
 		t.Fatalf("Upsert duplicate: %v", err)
 	}
@@ -196,9 +170,50 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 		t.Fatalf("requirement title=%q run=%d quote=%q external=%q confidence=%v",
 			title, runID, sourceQuote, externalID, confidence)
 	}
+	// A second, low-confidence requirement for the derived count assertion.
+	if _, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-002", Title: "低置信", Confidence: 0.4},
+	}, now); err != nil {
+		t.Fatalf("Upsert low confidence: %v", err)
+	}
 
-	// Reconciliation counts persist on the run.
-	if err := repo.SaveReconciliation(ctx, third.ID, 58, 1, now); err != nil {
+	// Stale running lease returns to pending (error cleared) and is reclaimed.
+	if _, err := pool.Exec(ctx, `
+		UPDATE requirement_extraction_segment
+		SET renewed_at = $2, error = 'worker crashed'
+		WHERE run_id = $1 AND seq = 1
+	`, third.ID, now.Add(-6*time.Minute)); err != nil {
+		t.Fatalf("age lease: %v", err)
+	}
+	if err := repo.MarkSegmentDone(ctx, third.ID, 2, 0, now); err != nil {
+		t.Fatalf("MarkSegmentDone 2: %v", err)
+	}
+	reclaimed, err := repo.ClaimSegments(ctx, third.ID, 10, now)
+	if err != nil {
+		t.Fatalf("ClaimSegments after stale lease: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Seq != 1 || reclaimed[0].Attempts != 2 || reclaimed[0].Error != "" {
+		t.Fatalf("reclaimed=%+v", reclaimed)
+	}
+	if err := repo.MarkSegmentDone(ctx, third.ID, 1, 1, now); err != nil {
+		t.Fatalf("MarkSegmentDone 1: %v", err)
+	}
+	stored, err := repo.GetRun(ctx, third.ID)
+	if err != nil {
+		t.Fatalf("GetRun done: %v", err)
+	}
+	if stored.Status != versionapp.ExtractionRunDone || stored.DoneSegments != 2 || stored.TotalSegments != 2 {
+		t.Fatalf("run after done=%+v", stored)
+	}
+
+	// The full reconciliation report plus the UI counts persist on the run.
+	report := versionapp.ReconciliationReport{
+		Expected: 58, Extracted: 1, Missing: 57,
+		MissingIDs:    []string{"FR-002"},
+		LowConfidence: 1, SkippedImages: 3,
+		PlannedCount: 32, PlannedIDs: []string{"FR-059", "FR-060"},
+	}
+	if err := repo.SaveReconciliation(ctx, third.ID, report, now); err != nil {
 		t.Fatalf("SaveReconciliation: %v", err)
 	}
 	reconciled, err := repo.GetRun(ctx, third.ID)
@@ -208,9 +223,343 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 	if reconciled.ExpectedCount == nil || *reconciled.ExpectedCount != 58 || reconciled.ExtractedCount != 1 {
 		t.Fatalf("reconciled run=%+v", reconciled)
 	}
+	if reconciled.Report == nil || reconciled.Report.Expected != 58 ||
+		reconciled.Report.SkippedImages != 3 || reconciled.Report.PlannedCount != 32 ||
+		len(reconciled.Report.PlannedIDs) != 2 || len(reconciled.Report.MissingIDs) != 1 {
+		t.Fatalf("persisted report=%+v", reconciled.Report)
+	}
+	var storedPlanned string
+	if err := pool.QueryRow(ctx, `
+		SELECT report->>'planned_count' FROM requirement_extraction_run WHERE id = $1
+	`, third.ID).Scan(&storedPlanned); err != nil {
+		t.Fatalf("read report jsonb: %v", err)
+	}
+	if storedPlanned != "32" {
+		t.Fatalf("report->>'planned_count' = %q, want 32", storedPlanned)
+	}
+
+	// low_confidence is derived from requirement.confidence, not supplied.
+	low, err := repo.CountLowConfidence(ctx, third.ID, versionapp.DefaultLowConfidenceThreshold)
+	if err != nil {
+		t.Fatalf("CountLowConfidence: %v", err)
+	}
+	if low != 1 {
+		t.Fatalf("low confidence count = %d, want 1", low)
+	}
 
 	// Missing run is a typed not-found.
 	if _, err := repo.GetRun(ctx, ids.Next()); !errors.Is(err, versionapp.ErrExtractionRunNotFound) {
 		t.Fatalf("GetRun missing err=%v, want ErrExtractionRunNotFound", err)
+	}
+}
+
+// TestExtractionArchiveFencingIntegration pins the changed-sha fence in SQL: a
+// worker that claimed segments of the archived run cannot mark them terminal or
+// overwrite the new run's requirement provenance, so reconciliation never has
+// false missing ids because of a late old-worker emit.
+func TestExtractionArchiveFencingIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	oldRun := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("a", 64), Status: versionapp.ExtractionRunPending,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	archived, err := repo.CreateRun(ctx, oldRun, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun old: %v", err)
+	}
+	claimed, err := repo.ClaimSegments(ctx, archived.ID, 10, now)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim old segments=%d err=%v", len(claimed), err)
+	}
+	oldSource := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: archived.ID, SegmentSeq: 1,
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, oldSource, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-001", Title: "旧", Confidence: 0.9},
+	}, now); err != nil {
+		t.Fatalf("old emit before archive: %v", err)
+	}
+
+	// The document changed while the worker was in flight.
+	newRun := oldRun
+	newRun.InputSHA256 = strings.Repeat("b", 64)
+	newRun.UpdatedAt = now.Add(time.Second)
+	active, err := repo.CreateRun(ctx, newRun, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun new: %v", err)
+	}
+	storedOld, err := repo.GetRun(ctx, archived.ID)
+	if err != nil {
+		t.Fatalf("GetRun old: %v", err)
+	}
+	if storedOld.Status != versionapp.ExtractionRunFailed {
+		t.Fatalf("archived run status=%s, want failed", storedOld.Status)
+	}
+
+	// Fenced terminal marks and emits.
+	if err := repo.MarkSegmentDone(ctx, archived.ID, 1, 1, now); !errors.Is(err, versionapp.ErrExtractionRunState) {
+		t.Fatalf("MarkSegmentDone archived err=%v, want ErrExtractionRunState", err)
+	}
+	if err := repo.MarkSegmentFailed(ctx, archived.ID, 2, "late", now); !errors.Is(err, versionapp.ErrExtractionRunState) {
+		t.Fatalf("MarkSegmentFailed archived err=%v, want ErrExtractionRunState", err)
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, oldSource, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-001", Title: "旧覆盖", Confidence: 0.1},
+	}, now); !errors.Is(err, versionapp.ErrExtractionRunState) {
+		t.Fatalf("late archived emit err=%v, want ErrExtractionRunState", err)
+	}
+	if _, err := repo.RetryFailedSegments(ctx, archived.ID, now); !errors.Is(err, versionapp.ErrExtractionRunState) {
+		t.Fatalf("RetryFailedSegments archived err=%v, want ErrExtractionRunState", err)
+	}
+
+	// The new run owns the requirement provenance and reports no false missing id.
+	newSource := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: active.ID, SegmentSeq: 1,
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, newSource, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-001", Title: "新", Confidence: 0.9},
+	}, now); err != nil {
+		t.Fatalf("new emit: %v", err)
+	}
+	var requirementRunID int64
+	if err := pool.QueryRow(ctx, `
+		SELECT extraction_run_id FROM requirement
+		WHERE version_id = $1 AND external_id = 'FR-001'
+	`, versionID).Scan(&requirementRunID); err != nil {
+		t.Fatalf("read requirement provenance: %v", err)
+	}
+	if requirementRunID != active.ID {
+		t.Fatalf("requirement extraction_run_id=%d, want new run %d", requirementRunID, active.ID)
+	}
+	extracted, err := repo.ListExtractedExternalIDs(ctx, versionID, active.ID)
+	if err != nil {
+		t.Fatalf("ListExtractedExternalIDs: %v", err)
+	}
+	if len(extracted) != 1 || extracted[0] != "FR-001" {
+		t.Fatalf("new run extracted ids=%v, want [FR-001]", extracted)
+	}
+	oldExtracted, err := repo.ListExtractedExternalIDs(ctx, versionID, archived.ID)
+	if err != nil {
+		t.Fatalf("ListExtractedExternalIDs old: %v", err)
+	}
+	if len(oldExtracted) != 0 {
+		t.Fatalf("archived run still owns ids=%v", oldExtracted)
+	}
+}
+
+// TestExtractionReplayLeaseAndPauseIntegration pins the SQL half of replay and
+// lease safety: a changed text_sha256 reopens the segment and refreshes
+// expected_count/totals; heartbeat renewal keeps a claim alive past the lease;
+// a paused run is no longer claimable.
+func TestExtractionReplayLeaseAndPauseIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	sha := strings.Repeat("3", 64)
+	run := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID, InputSHA256: sha,
+		Status: versionapp.ExtractionRunPending, CreatedAt: now, UpdatedAt: now,
+	}
+	created, err := repo.CreateRun(ctx, run, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	claimed, err := repo.ClaimSegments(ctx, created.ID, 10, now)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim=%d err=%v", len(claimed), err)
+	}
+	if err := repo.MarkSegmentDone(ctx, created.ID, 1, 1, now); err != nil {
+		t.Fatalf("MarkSegmentDone 1: %v", err)
+	}
+	if err := repo.MarkSegmentDone(ctx, created.ID, 2, 1, now); err != nil {
+		t.Fatalf("MarkSegmentDone 2: %v", err)
+	}
+
+	// Replay the same sha with changed seq2 text and a fresh expected count.
+	expected := 58
+	replay := run
+	replay.ExpectedCount = &expected
+	replay.UpdatedAt = now.Add(time.Minute)
+	changedSegments := extractionSegments()
+	changedSegments[1].TextSHA256 = strings.Repeat("c", 64)
+	replayed, err := repo.CreateRun(ctx, replay, changedSegments)
+	if err != nil {
+		t.Fatalf("CreateRun replay: %v", err)
+	}
+	if replayed.ID != created.ID {
+		t.Fatalf("replay created run %d, want %d", replayed.ID, created.ID)
+	}
+	if replayed.Status != versionapp.ExtractionRunPending || replayed.TotalSegments != 2 {
+		t.Fatalf("replayed run=%+v", replayed)
+	}
+	if replayed.ExpectedCount == nil || *replayed.ExpectedCount != 58 {
+		t.Fatalf("replayed expected_count=%v, want 58", replayed.ExpectedCount)
+	}
+	segments, err := repo.ListSegments(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	if segments[0].Status != versionapp.ExtractionSegmentDone {
+		t.Fatalf("unchanged segment status=%s, want done", segments[0].Status)
+	}
+	if segments[1].Status != versionapp.ExtractionSegmentPending || segments[1].Attempts != 0 {
+		t.Fatalf("changed segment=%+v, want pending attempts=0", segments[1])
+	}
+
+	reclaimed, err := repo.ClaimSegments(ctx, created.ID, 10, replay.UpdatedAt)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].Seq != 2 {
+		t.Fatalf("replay claim=%+v err=%v", reclaimed, err)
+	}
+
+	// Heartbeat renewal keeps the claim alive past the five minute lease.
+	renewed, err := repo.RenewSegmentLeases(ctx, created.ID, []int{2}, replay.UpdatedAt.Add(4*time.Minute))
+	if err != nil || renewed != 1 {
+		t.Fatalf("RenewSegmentLeases=%d err=%v", renewed, err)
+	}
+	none, err := repo.ClaimSegments(ctx, created.ID, 10, replay.UpdatedAt.Add(6*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimSegments renewed: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("renewed claim was stolen: %+v", none)
+	}
+	stolen, err := repo.ClaimSegments(ctx, created.ID, 10, replay.UpdatedAt.Add(10*time.Minute))
+	if err != nil || len(stolen) != 1 || stolen[0].Attempts != 2 {
+		t.Fatalf("stale claim after lease=%+v err=%v", stolen, err)
+	}
+
+	// Pause gates further claims.
+	transitioned, err := repo.TransitionRun(ctx, created.ID,
+		[]versionapp.ExtractionRunStatus{versionapp.ExtractionRunRunning},
+		versionapp.ExtractionRunPaused, replay.UpdatedAt.Add(11*time.Minute))
+	if err != nil || !transitioned {
+		t.Fatalf("pause transition=%v err=%v", transitioned, err)
+	}
+	pausedClaims, err := repo.ClaimSegments(ctx, created.ID, 10, replay.UpdatedAt.Add(12*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimSegments paused: %v", err)
+	}
+	if len(pausedClaims) != 0 {
+		t.Fatalf("paused run still claimable: %+v", pausedClaims)
+	}
+}
+
+// TestExtractionConcurrentDifferentSHAIntegration pins the attachment-level
+// Start lock: concurrent CreateRun calls with different shas must leave exactly
+// one active run.
+func TestExtractionConcurrentDifferentSHAIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	type result struct {
+		run versionapp.ExtractionRun
+		sha string
+		err error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for _, sha := range []string{strings.Repeat("d", 64), strings.Repeat("e", 64)} {
+		wait.Add(1)
+		go func(sha string) {
+			defer wait.Done()
+			<-start
+			run, err := repo.CreateRun(ctx, versionapp.ExtractionRun{
+				VersionID: versionID, AttachmentID: attachmentID, InputSHA256: sha,
+				Status: versionapp.ExtractionRunPending, CreatedAt: now, UpdatedAt: now,
+			}, extractionSegments())
+			results <- result{run: run, sha: sha, err: err}
+		}(sha)
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	returned := make(map[int64]struct{}, 2)
+	var failedSHA string
+	var activeID int64
+	for item := range results {
+		if item.err != nil {
+			t.Fatalf("concurrent CreateRun: %v", item.err)
+		}
+		returned[item.run.ID] = struct{}{}
+		stored, err := repo.GetRun(ctx, item.run.ID)
+		if err != nil {
+			t.Fatalf("GetRun concurrent result: %v", err)
+		}
+		if stored.Status == versionapp.ExtractionRunFailed {
+			failedSHA = item.sha
+		} else {
+			activeID = stored.ID
+		}
+	}
+	if len(returned) != 2 {
+		t.Fatalf("returned run ids=%v, want two distinct runs", returned)
+	}
+	if failedSHA == "" || activeID == 0 {
+		t.Fatalf("concurrent runs did not archive one input: failed=%q active=%d", failedSHA, activeID)
+	}
+	var active int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_extraction_run
+		WHERE version_id = $1 AND attachment_id = $2 AND status IN ('pending', 'running', 'paused')
+	`, versionID, attachmentID).Scan(&active); err != nil {
+		t.Fatalf("count active runs: %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("active runs=%d, want 1", active)
+	}
+	var total int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_extraction_run
+		WHERE version_id = $1 AND attachment_id = $2
+	`, versionID, attachmentID).Scan(&total); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("runs=%d, want 2", total)
+	}
+
+	// Replaying the superseded sha returns the active run and does not archive
+	// it or create a third run.
+	replayed, err := repo.CreateRun(ctx, versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID, InputSHA256: failedSHA,
+		Status: versionapp.ExtractionRunPending, CreatedAt: now, UpdatedAt: now.Add(time.Minute),
+	}, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun superseded replay: %v", err)
+	}
+	if replayed.ID != activeID || replayed.Status == versionapp.ExtractionRunFailed {
+		t.Fatalf("superseded replay returned run=%+v, want active run %d", replayed, activeID)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_extraction_run
+		WHERE version_id = $1 AND attachment_id = $2
+	`, versionID, attachmentID).Scan(&total); err != nil {
+		t.Fatalf("count runs after replay: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("replay created extra runs: total=%d", total)
 	}
 }
