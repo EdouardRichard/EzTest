@@ -54,10 +54,23 @@ type Scheduler struct {
 	events      EventPublisher
 	instance    string
 	leaseTTL    time.Duration
+	// stageNotifier is the v0.22 production wave-terminal stage callback
+	// (R-B4-3). It is optional so the pre-v0.22 scheduler assemblies keep
+	// working: nil means "do not drive the stage machine from execution".
+	stageNotifier WaveTerminalStageNotifier
 	// blocked deduplicates EventCaseRunBlocked by case_run ID; it holds the
 	// last published reason. A successful dispatch clears the entry.
 	blockedMu sync.Mutex
 	blocked   map[int64]string
+}
+
+// WaveTerminalStageNotifier is the narrow production callback the scheduler
+// invokes when a wave becomes terminal (done/failed/cancelled), so the version
+// stage machine can advance executing -> reporting without a manual API call
+// (spec §4.12 R-B4-3). Implementations must be idempotent and must not block the
+// wave finalization: the scheduler treats the callback as best effort.
+type WaveTerminalStageNotifier interface {
+	OnWaveTerminal(ctx context.Context, waveID int64) error
 }
 
 // SchedulerDeps wires the scheduler. quotaReader may be nil: the running set is
@@ -84,6 +97,9 @@ type SchedulerDeps struct {
 	// Replanner is the Task 106 stale-intent re-plan (implemented by
 	// *IntentService). nil keeps the P3-only retire behavior.
 	Replanner SupersededIntentReplanner
+	// StageNotifier is the v0.22 wave-terminal stage callback (Task 25). nil
+	// keeps the pre-v0.22 behavior; Task 36 wires *versionapp.StageService here.
+	StageNotifier WaveTerminalStageNotifier
 }
 
 // NewScheduler builds the scheduler.
@@ -100,23 +116,24 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		lease = DefaultCaseLease
 	}
 	return &Scheduler{
-		intents:     deps.Intents,
-		waves:       deps.Waves,
-		caseRuns:    deps.CaseRuns,
-		cases:       deps.Cases,
-		versions:    deps.Versions,
-		executors:   deps.Executors,
-		workQueue:   deps.WorkQueue,
-		quota:       quota,
-		quotaReader: deps.QuotaReader,
-		analyzer:    deps.Analyzer,
-		replanner:   deps.Replanner,
-		ids:         deps.IDs,
-		clock:       deps.Clock,
-		events:      deps.Events,
-		instance:    deps.Instance,
-		leaseTTL:    lease,
-		blocked:     map[int64]string{},
+		intents:       deps.Intents,
+		waves:         deps.Waves,
+		caseRuns:      deps.CaseRuns,
+		cases:         deps.Cases,
+		versions:      deps.Versions,
+		executors:     deps.Executors,
+		workQueue:     deps.WorkQueue,
+		quota:         quota,
+		quotaReader:   deps.QuotaReader,
+		analyzer:      deps.Analyzer,
+		replanner:     deps.Replanner,
+		ids:           deps.IDs,
+		clock:         deps.Clock,
+		events:        deps.Events,
+		instance:      deps.Instance,
+		leaseTTL:      lease,
+		stageNotifier: deps.StageNotifier,
+		blocked:       map[int64]string{},
 	}
 }
 
@@ -207,6 +224,7 @@ func (s *Scheduler) failEmptyWave(ctx context.Context, wave execution.RunWave) e
 		map[string]any{"wave_id": platformid.Format(wave.ID)},
 		map[string]any{"wave_id": platformid.Format(wave.ID), "status": string(execution.WaveFailed)},
 		nil)
+	s.notifyStageWaveTerminal(ctx, wave.ID)
 	return nil
 }
 
@@ -413,7 +431,22 @@ func (s *Scheduler) completeWave(ctx context.Context, wave execution.RunWave, ru
 		// deduplicated by the work queue.
 		_ = s.analyzer.AnalyzeWave(ctx, wave.ID)
 	}
+	// The wave row is terminal now, so the version stage machine may advance
+	// executing -> reporting (R-B4-3). The callback runs after analysis so the
+	// version report snapshot includes the analyzed issues.
+	s.notifyStageWaveTerminal(ctx, wave.ID)
 	return nil
+}
+
+// notifyStageWaveTerminal invokes the optional v0.22 production callback after a
+// wave is terminal. It is best effort: the wave finalization is the source of
+// truth and a failed stage advance is retried by the stage reconciler/API, so a
+// callback failure never rolls the wave back or fails the scheduler tick.
+func (s *Scheduler) notifyStageWaveTerminal(ctx context.Context, waveID int64) {
+	if s.stageNotifier == nil || waveID <= 0 {
+		return
+	}
+	_ = s.stageNotifier.OnWaveTerminal(ctx, waveID)
 }
 
 // completeIntent projects one finished case_run onto its intent (§4.1).

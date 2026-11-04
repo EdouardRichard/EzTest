@@ -248,6 +248,13 @@ func (m *StageMachine) Suspend(ctx context.Context, versionID int64, to version.
 // Resume restores the stage recorded in version.suspended_from. A suspension
 // with no recorded stage (legacy or corrupted row) is not resumable.
 func (m *StageMachine) Resume(ctx context.Context, versionID int64) error {
+	return m.resumeRecorded(ctx, versionID, "resumed")
+}
+
+// resumeRecorded restores the stage recorded in version.suspended_from using
+// reason for the published event. The v0.22 StageService uses it so a blocked
+// round-trip is distinguishable from a paused resume.
+func (m *StageMachine) resumeRecorded(ctx context.Context, versionID int64, reason string) error {
 	current, err := m.load(ctx, versionID)
 	if err != nil {
 		return err
@@ -255,7 +262,7 @@ func (m *StageMachine) Resume(ctx context.Context, versionID int64) error {
 	if current.SuspendedFrom == nil {
 		return platform.StateConflict("version has no recorded suspended stage")
 	}
-	return m.resumeTo(ctx, current, *current.SuspendedFrom)
+	return m.resumeTo(ctx, current, *current.SuspendedFrom, reason)
 }
 
 // ResumeTo resumes a suspended version to target. target must equal the stage
@@ -274,7 +281,7 @@ func (m *StageMachine) ResumeTo(ctx context.Context, versionID int64, target ver
 			"resume target %s does not match the recorded suspended stage %s", target, *current.SuspendedFrom,
 		))
 	}
-	return m.resumeTo(ctx, current, target)
+	return m.resumeTo(ctx, current, target, "resumed")
 }
 
 // OnRequirementConfirmed applies the requirement hard gate
@@ -444,7 +451,7 @@ func (m *StageMachine) transitionFrom(ctx context.Context, current version.Stage
 	return next, nil
 }
 
-func (m *StageMachine) resumeTo(ctx context.Context, current version.StageState, target version.Stage) error {
+func (m *StageMachine) resumeTo(ctx context.Context, current version.StageState, target version.Stage, reason string) error {
 	if !current.Stage.CanResumeTo(target) {
 		return platform.StateConflict(fmt.Sprintf(
 			"cannot resume version from %s to %s", current.Stage, target,
@@ -455,7 +462,7 @@ func (m *StageMachine) resumeTo(ctx context.Context, current version.StageState,
 		Stage:          target,
 		StageEnteredAt: m.now(),
 	}
-	return m.apply(ctx, current, next, "resumed", "", nil)
+	return m.apply(ctx, current, next, reason, "", nil)
 }
 
 // apply writes the validated transition, then publishes the stage event and
@@ -495,6 +502,7 @@ func (m *StageMachine) publishStageChanged(ctx context.Context, from, to version
 		"from":             string(from.Stage),
 		"to":               string(to.Stage),
 		"reason":           reason,
+		"actor":            stageEventActor(ctx),
 		"stage_entered_at": to.StageEnteredAt.UTC().Format(time.RFC3339),
 	}
 	if blocker != "" {
@@ -502,16 +510,37 @@ func (m *StageMachine) publishStageChanged(ctx context.Context, from, to version
 	}
 	versionID := platformid.Format(to.VersionID)
 	scope := map[string]any{"version_id": versionID}
-	for _, channel := range []string{"version:" + versionID, "system"} {
-		_ = m.events.Publish(ctx, eventingapp.Event{
-			Channel:   channel,
-			Type:      "version.stage_changed",
-			Scope:     scope,
-			Payload:   payload,
-			ActorID:   actorIDFrom(ctx),
-			RequestID: requestid.From(ctx),
-		})
+	// version.stage_changed is the stable 0.21 event name still consumed by the
+	// eventing stage-transition reader and the current version page. v0.22
+	// R-B4-1 specifies version.stage.changed: publish that name in parallel until
+	// the Lead wiring (Task 37) migrates the consumers.
+	for _, eventType := range []string{"version.stage_changed", "version.stage.changed"} {
+		for _, channel := range []string{"version:" + versionID, "system"} {
+			_ = m.events.Publish(ctx, eventingapp.Event{
+				Channel:   channel,
+				Type:      eventType,
+				Scope:     scope,
+				Payload:   payload,
+				ActorID:   actorIDFrom(ctx),
+				RequestID: requestid.From(ctx),
+			})
+		}
 	}
+}
+
+// stageEventActor projects the authenticated caller into the stage event
+// payload (R-B4-1 from/to/reason/actor). A background callback has no actor and
+// is reported as system.
+func stageEventActor(ctx context.Context) string {
+	if actor, ok := platform.ActorFrom(ctx); ok {
+		if actor.Role != "" {
+			return actor.Role
+		}
+		if actor.ID > 0 {
+			return platformid.Format(actor.ID)
+		}
+	}
+	return "system"
 }
 
 func (m *StageMachine) recordDecision(
@@ -680,4 +709,552 @@ func gateNextAction(gate string, want, current version.Stage) string {
 		return "a batch is already executing; wait for it to finish or cancel it before confirming another batch"
 	}
 	return fmt.Sprintf("reach stage %s before confirming cases", want)
+}
+
+// ===========================================================================
+// v0.22 StageService (Task 25, R-B4-1..R-B4-6)
+// ===========================================================================
+
+// StageService is the orchestrated v0.22 stage machine: the single application
+// entry point Hosts and users may call (R-B4-1). It owns the forward workflow
+// edges, validates every HTTP-level gate from spec §4.12/B §7.1, publishes
+// version.stage.changed with from/to/reason/actor (the legacy
+// version.stage_changed name is still emitted), records structured blockers as
+// JSON in version.blocker and exposes the production callbacks:
+//
+//   - OnWaveTerminal(waveID): executing -> reporting after every wave is
+//     terminal and the version report has been ensured;
+//   - OnReportPublished(versionID): reporting -> completed after the version
+//     report is published, no blocking issue is open and the version row closed.
+//
+// It composes the existing *StageMachine atomic core rather than duplicating the
+// stage write: the StageMachine remains the only code that persists version.stage
+// and the repository's ApplyStage keeps its compare-and-swap guard.
+type StageService struct {
+	machine     *StageMachine
+	gates       StageGates
+	waves       StageWaveReader
+	waveControl StageWaveController
+	reports     StageReports
+	closer      StageVersionCloser
+	handoff     StageHandoffGenerator
+}
+
+// StageServiceDeps wires the v0.22 stage service. Repo is required. Events,
+// audit, jobs and clock are optional (the clock defaults to the system clock).
+// Gates, Waves, Reports and Closer are required by the edge that needs them: a
+// missing port fails closed with a typed gate_not_configured error instead of
+// silently skipping the gate. WaveControl is required for Pause (and optional
+// for Resume, which must not strand a version that has no running wave).
+type StageServiceDeps struct {
+	Repo        version.StageRepository
+	Jobs        StageJobEnqueuer
+	Audit       auditapp.Recorder
+	Events      eventingapp.Publisher
+	Clock       clock.Clock
+	Gates       StageGates
+	Waves       StageWaveReader
+	WaveControl StageWaveController
+	Reports     StageReports
+	Closer      StageVersionCloser
+	Handoff     StageHandoffGenerator
+}
+
+// NewStageService wires the v0.22 orchestrated stage machine.
+func NewStageService(deps StageServiceDeps) *StageService {
+	return &StageService{
+		machine:     NewStageMachine(deps.Repo, deps.Jobs, deps.Audit, deps.Events, deps.Clock),
+		gates:       deps.Gates,
+		waves:       deps.Waves,
+		waveControl: deps.WaveControl,
+		reports:     deps.Reports,
+		closer:      deps.Closer,
+		handoff:     deps.Handoff,
+	}
+}
+
+// Stage returns the current stage projection.
+func (s *StageService) Stage(ctx context.Context, versionID int64) (StageView, error) {
+	return s.machine.Stage(ctx, versionID)
+}
+
+// Request validates one requested stage and applies it. The target is carried
+// explicitly because the graph has legitimate back edges (gate rejects) and the
+// two suspension stages have their own entry points (Block/Pause): a Request for
+// blocked or paused is always rejected.
+//
+// Request is idempotent: asking for the stage the version is already in is a
+// no-op. A gate rejection returns *StageGateError and writes nothing; a
+// non-graph transition returns *StageTransitionError.
+func (s *StageService) Request(ctx context.Context, versionID int64, to version.Stage) error {
+	if to == version.StageBlocked || to == version.StagePaused {
+		return newStageTransitionError(version.Stage(""), to,
+			"use Block for blocked and Pause for paused; Request only advances workflow stages")
+	}
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage == to {
+		return nil
+	}
+	if current.Stage.IsSuspended() {
+		return newStageTransitionError(current.Stage, to,
+			"resume or unblock the version before requesting another stage")
+	}
+	if !current.Stage.CanTransitionTo(to) {
+		return newStageTransitionError(current.Stage, to, "")
+	}
+	if err := s.checkGate(ctx, current.VersionID, current.Stage, to); err != nil {
+		return err
+	}
+	if err := s.machine.Transition(ctx, current.VersionID, to, stageTransitionReason(current.Stage, to)); err != nil {
+		return err
+	}
+	s.runPostTransition(ctx, current.VersionID, current.Stage, to)
+	return nil
+}
+
+// Advance requests the next workflow stage of the deterministic graph.
+func (s *StageService) Advance(ctx context.Context, versionID int64) error {
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	next, ok := nextWorkflowStage(current.Stage)
+	if !ok {
+		return newStageTransitionError(current.Stage, version.Stage(""),
+			"the version has no automatic next stage")
+	}
+	return s.Request(ctx, versionID, next)
+}
+
+// Block enters blocked with a structured reason/action/next (R-B4-4). The JSON
+// encoding is stored in version.blocker (TEXT, ruling C6) and the previous
+// workflow stage is recorded in version.suspended_from.
+func (s *StageService) Block(ctx context.Context, versionID int64, blocker Blocker) error {
+	normalized, err := blocker.Normalize()
+	if err != nil {
+		return err
+	}
+	encoded, err := normalized.JSON()
+	if err != nil {
+		return err
+	}
+	if _, err := s.machine.load(ctx, versionID); err != nil {
+		return err
+	}
+	return s.machine.Suspend(ctx, versionID, version.StageBlocked, encoded)
+}
+
+// Unblock resumes a blocked version to its recorded stage. R-B4-4 requires the
+// reason to be cleared first: the BlockerCleared port must answer true; nil
+// fails closed. The blocker row is cleared by the repository write.
+func (s *StageService) Unblock(ctx context.Context, versionID int64) error {
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageBlocked {
+		return newStageTransitionError(current.Stage, version.Stage(""),
+			"only a blocked version can be unblocked")
+	}
+	if s.gates.BlockerCleared == nil {
+		return newStageGateNotConfigured("blocker")
+	}
+	blocker := ParseBlocker(current.Blocker)
+	cleared, err := s.gates.BlockerCleared(ctx, versionID, blocker)
+	if err != nil {
+		return newStageGateError("blocker", "gate_check_failed",
+			"retry the blocker clearance check", "unblock", err)
+	}
+	if !cleared {
+		return newStageGateError("blocker", "blocker_not_cleared",
+			blocker.Action, blocker.Next, nil)
+	}
+	return s.machine.resumeRecorded(ctx, versionID, "unblocked")
+}
+
+// Pause enters paused and asks the execution context to gracefully pause the
+// version's running waves (R-B4-5 minimal paused support). No complex
+// scheduling is attempted.
+func (s *StageService) Pause(ctx context.Context, versionID int64, reason string) error {
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage.IsSuspended() {
+		return newStageTransitionError(current.Stage, version.StagePaused,
+			"the version is already suspended")
+	}
+	if !current.Stage.CanTransitionTo(version.StagePaused) {
+		return newStageTransitionError(current.Stage, version.StagePaused,
+			"only a workflow version can be paused")
+	}
+	if s.waveControl == nil {
+		return newStageGateNotConfigured("wave_control")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "user_paused"
+	}
+	var actorID int64
+	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
+		actorID = actor.ID
+	}
+	if err := s.waveControl.PauseVersionWaves(ctx, versionID, reason, actorID); err != nil {
+		return err
+	}
+	if err := s.machine.Suspend(ctx, versionID, version.StagePaused, reason); err != nil {
+		// The waves are already pausing; continue them rather than leaving the
+		// execution stranded behind a failed stage write.
+		_ = s.waveControl.ResumeVersionWaves(ctx, versionID)
+		return err
+	}
+	return nil
+}
+
+// Resume leaves paused and continues the paused waves (best effort: the stage
+// resume is the truth and a wave resume failure is retried by the execution
+// reconciler).
+func (s *StageService) Resume(ctx context.Context, versionID int64) error {
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StagePaused {
+		return newStageTransitionError(current.Stage, version.Stage(""),
+			"only a paused version can be resumed; use Unblock for blocked")
+	}
+	if err := s.machine.Resume(ctx, versionID); err != nil {
+		return err
+	}
+	if s.waveControl != nil {
+		if err := s.waveControl.ResumeVersionWaves(ctx, versionID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OnWaveTerminal is the production wave-terminal callback (R-B4-3). The wave ID
+// is resolved to its version, the wave must be terminal, and every other wave of
+// the version must be terminal too before executing -> reporting advances.
+// Calls for versions that are not executing (or are suspended/completed) are
+// idempotent no-ops so duplicate or late events are harmless.
+func (s *StageService) OnWaveTerminal(ctx context.Context, waveID int64) error {
+	if waveID <= 0 {
+		return platform.Invalid("wave_id", "must be a positive decimal ID")
+	}
+	if s.waves == nil {
+		return newStageGateNotConfigured("wave")
+	}
+	wave, err := s.waves.GetWave(ctx, waveID)
+	if err != nil {
+		return err
+	}
+	if wave.VersionID <= 0 {
+		return newStageGateError("wave", "wave_not_scoped",
+			"link the wave to a version", "report", nil)
+	}
+	current, err := s.machine.load(ctx, wave.VersionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageExecuting {
+		return nil
+	}
+	if !wave.Terminal {
+		return newStageGateError("wave", "wave_not_terminal",
+			"wait for the wave to reach a terminal state", "reporting", nil)
+	}
+	return s.Request(ctx, wave.VersionID, version.StageReporting)
+}
+
+// OnReportPublished is the production report.published callback (R-B4-3). It
+// completes a reporting version after the report is published, no blocking issue
+// remains open and the version row is closed. Duplicate deliveries are no-ops.
+func (s *StageService) OnReportPublished(ctx context.Context, versionID int64) error {
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageReporting {
+		return nil
+	}
+	return s.Request(ctx, versionID, version.StageCompleted)
+}
+
+// ---------- gate evaluation ----------
+
+// checkGate dispatches the one gate that guards the requested edge (B §7.1).
+func (s *StageService) checkGate(ctx context.Context, versionID int64, from, to version.Stage) error {
+	switch {
+	case from == version.StageCreated && to == version.StageClarifying:
+		return s.requireEnvironmentBound(ctx, versionID)
+	case from == version.StageClarifying && to == version.StageRequirementReview:
+		return s.requireRequirements(ctx, versionID)
+	case from == version.StageRequirementReview && to == version.StageDesigning:
+		return s.requireConfirmedRequirements(ctx, versionID)
+	case from == version.StageDesigning && to == version.StageCaseReview:
+		return s.requireCaseDrafts(ctx, versionID)
+	case from == version.StageCaseReview && to == version.StageExecuting:
+		return s.requireExecutable(ctx, versionID)
+	case from == version.StageExecuting && to == version.StageReporting:
+		return s.requireReportReady(ctx, versionID)
+	case from == version.StageReporting && to == version.StageCompleted:
+		return s.requireCompletable(ctx, versionID)
+	default:
+		return nil
+	}
+}
+
+func (s *StageService) requireEnvironmentBound(ctx context.Context, versionID int64) error {
+	if s.gates.EnvironmentBound == nil {
+		return newStageGateNotConfigured("environment")
+	}
+	bound, err := s.gates.EnvironmentBound(ctx, versionID)
+	if err != nil {
+		return newStageGateError("environment", "gate_check_failed",
+			"retry the environment binding check", "clarifying", err)
+	}
+	if !bound {
+		return newStageGateError("environment", "environment_not_bound",
+			"bind a SUT environment to the version", "clarifying", nil)
+	}
+	return nil
+}
+
+// requireRequirements is C-2: only the requirement count opens the gate. No
+// pending question state participates, so a pending question never blocks the
+// stage (spec §4.11 R-B3-4, §4.12 R-B4-2).
+func (s *StageService) requireRequirements(ctx context.Context, versionID int64) error {
+	if s.gates.RequirementCount == nil {
+		return newStageGateNotConfigured("requirement")
+	}
+	count, err := s.gates.RequirementCount(ctx, versionID)
+	if err != nil {
+		return newStageGateError("requirement", "gate_check_failed",
+			"retry the requirement count check", "requirement_review", err)
+	}
+	if count < 1 {
+		return newStageGateError("requirement", "missing_requirement",
+			"add at least one requirement in the clarification conversation",
+			"requirement_review", nil)
+	}
+	return nil
+}
+
+func (s *StageService) requireConfirmedRequirements(ctx context.Context, versionID int64) error {
+	if s.gates.RequirementsConfirmed == nil {
+		return newStageGateNotConfigured("requirement_confirmation")
+	}
+	confirmed, err := s.gates.RequirementsConfirmed(ctx, versionID)
+	if err != nil {
+		return newStageGateError("requirement_confirmation", "gate_check_failed",
+			"retry the requirement confirmation check", "designing", err)
+	}
+	if !confirmed {
+		return newStageGateError("requirement_confirmation", "requirements_unconfirmed",
+			"confirm every current requirement before starting design",
+			"designing", nil)
+	}
+	if s.gates.OpenGaps == nil {
+		return newStageGateNotConfigured("requirement_gap")
+	}
+	gaps, err := s.gates.OpenGaps(ctx, versionID)
+	if err != nil {
+		return newStageGateError("requirement_gap", "gate_check_failed",
+			"retry the requirement gap check", "designing", err)
+	}
+	if gaps > 0 {
+		return newStageGateError("requirement_gap", "open_gap",
+			"resolve or explicitly accept every open requirement gap",
+			"designing", nil)
+	}
+	return nil
+}
+
+func (s *StageService) requireCaseDrafts(ctx context.Context, versionID int64) error {
+	if s.gates.ConfirmedCaseDrafts == nil {
+		return newStageGateNotConfigured("case_draft")
+	}
+	count, err := s.gates.ConfirmedCaseDrafts(ctx, versionID)
+	if err != nil {
+		return newStageGateError("case_draft", "gate_check_failed",
+			"retry the case draft check", "case_review", err)
+	}
+	if count < 1 {
+		return newStageGateError("case_draft", "no_confirmed_case_draft",
+			"generate at least one confirmed case draft in the design pass",
+			"case_review", nil)
+	}
+	if s.gates.CoverageComputed == nil {
+		return newStageGateNotConfigured("coverage")
+	}
+	computed, err := s.gates.CoverageComputed(ctx, versionID)
+	if err != nil {
+		return newStageGateError("coverage", "gate_check_failed",
+			"retry the coverage matrix check", "case_review", err)
+	}
+	if !computed {
+		return newStageGateError("coverage", "coverage_not_computed",
+			"compute the coverage matrix before reviewing cases",
+			"case_review", nil)
+	}
+	return nil
+}
+
+func (s *StageService) requireExecutable(ctx context.Context, versionID int64) error {
+	if s.gates.ConfirmedCases == nil {
+		return newStageGateNotConfigured("case_confirmation")
+	}
+	confirmed, err := s.gates.ConfirmedCases(ctx, versionID)
+	if err != nil {
+		return newStageGateError("case_confirmation", "gate_check_failed",
+			"retry the case confirmation check", "executing", err)
+	}
+	if confirmed < 1 {
+		return newStageGateError("case_confirmation", "cases_unconfirmed",
+			"confirm at least one case before execution", "executing", nil)
+	}
+	if s.gates.ExecutorOnline == nil {
+		return newStageGateNotConfigured("executor")
+	}
+	online, err := s.gates.ExecutorOnline(ctx)
+	if err != nil {
+		return newStageGateError("executor", "gate_check_failed",
+			"retry the executor health check", "executing", err)
+	}
+	if !online {
+		return newStageGateError("executor", "executor_offline",
+			"start the executor and wait for its heartbeat", "executing", nil)
+	}
+	if s.gates.AccountsValid == nil {
+		return newStageGateNotConfigured("account")
+	}
+	valid, err := s.gates.AccountsValid(ctx, versionID)
+	if err != nil {
+		return newStageGateError("account", "gate_check_failed",
+			"retry the account and target database check", "executing", err)
+	}
+	if !valid {
+		return newStageGateError("account", "account_invalid",
+			"fix the account or target database binding", "executing", nil)
+	}
+	return nil
+}
+
+func (s *StageService) requireReportReady(ctx context.Context, versionID int64) error {
+	if s.gates.WavesTerminal == nil {
+		return newStageGateNotConfigured("wave")
+	}
+	terminal, err := s.gates.WavesTerminal(ctx, versionID)
+	if err != nil {
+		return newStageGateError("wave", "gate_check_failed",
+			"retry the wave terminal check", "reporting", err)
+	}
+	if !terminal {
+		return newStageGateError("wave", "waves_active",
+			"wait for every execution wave to reach a terminal state",
+			"reporting", nil)
+	}
+	if s.reports == nil {
+		return newStageGateNotConfigured("report")
+	}
+	if err := s.reports.EnsureVersionReport(ctx, versionID); err != nil {
+		return newStageGateError("report", "report_not_generated",
+			"generate the version report", "reporting", err)
+	}
+	return nil
+}
+
+func (s *StageService) requireCompletable(ctx context.Context, versionID int64) error {
+	if s.gates.ReportPublished == nil {
+		return newStageGateNotConfigured("report")
+	}
+	published, err := s.gates.ReportPublished(ctx, versionID)
+	if err != nil {
+		return newStageGateError("report", "gate_check_failed",
+			"retry the report publication check", "completed", err)
+	}
+	if !published {
+		return newStageGateError("report", "report_not_published",
+			"publish the version report before completing the version",
+			"completed", nil)
+	}
+	if s.gates.OpenBlockingIssues == nil {
+		return newStageGateNotConfigured("issue")
+	}
+	open, err := s.gates.OpenBlockingIssues(ctx, versionID)
+	if err != nil {
+		return newStageGateError("issue", "gate_check_failed",
+			"retry the blocking issue check", "completed", err)
+	}
+	if open > 0 {
+		return newStageGateError("issue", "open_blocking_issue",
+			"close or dismiss every blocking issue before completing the version",
+			"completed", nil)
+	}
+	if s.closer == nil {
+		return newStageGateNotConfigured("version_close")
+	}
+	if err := s.closer.CloseVersion(ctx, versionID, "stage_completed"); err != nil {
+		return newStageGateError("version_close", "version_close_failed",
+			"resolve the version close predicate", "completed", err)
+	}
+	return nil
+}
+
+// runPostTransition performs the best-effort hooks after the stage write: the
+// Task 27 handoff generation when design starts. Its own reconciler retries a
+// missed generation, so a failure never blocks the stage.
+func (s *StageService) runPostTransition(ctx context.Context, versionID int64, from, to version.Stage) {
+	if from == version.StageRequirementReview && to == version.StageDesigning && s.handoff != nil {
+		_, _ = s.handoff.Generate(ctx, versionID)
+	}
+}
+
+// stageTransitionReason is the event reason of one forward edge.
+func stageTransitionReason(from, to version.Stage) string {
+	switch {
+	case from == version.StageCreated && to == version.StageClarifying:
+		return "environment_bound"
+	case from == version.StageClarifying && to == version.StageRequirementReview:
+		return "requirements_ready"
+	case from == version.StageRequirementReview && to == version.StageDesigning:
+		return "requirements_confirmed"
+	case from == version.StageDesigning && to == version.StageCaseReview:
+		return "cases_ready"
+	case from == version.StageCaseReview && to == version.StageExecuting:
+		return "cases_confirmed"
+	case from == version.StageExecuting && to == version.StageReporting:
+		return "wave_terminal"
+	case from == version.StageReporting && to == version.StageCompleted:
+		return "report_published"
+	default:
+		return "stage_requested"
+	}
+}
+
+// nextWorkflowStage is the automatic next stage used by Advance.
+func nextWorkflowStage(stage version.Stage) (version.Stage, bool) {
+	switch stage {
+	case version.StageCreated:
+		return version.StageClarifying, true
+	case version.StageClarifying:
+		return version.StageRequirementReview, true
+	case version.StageRequirementReview:
+		return version.StageDesigning, true
+	case version.StageDesigning:
+		return version.StageCaseReview, true
+	case version.StageCaseReview:
+		return version.StageExecuting, true
+	case version.StageExecuting:
+		return version.StageReporting, true
+	case version.StageReporting:
+		return version.StageCompleted, true
+	default:
+		return version.Stage(""), false
+	}
 }
