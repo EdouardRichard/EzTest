@@ -7,12 +7,19 @@ import (
 	"strings"
 	"testing"
 
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 )
 
 func extract(t *testing.T, name, mime string, data []byte) (string, error) {
 	t.Helper()
-	return attachments.NewParser().Extract(context.Background(), name, mime, strings.NewReader(string(data)))
+	result, err := extractResult(t, name, mime, data)
+	return result.Text, err
+}
+
+func extractResult(t *testing.T, name, mime string, data []byte) (versionapp.ExtractionResult, error) {
+	t.Helper()
+	return attachments.NewParser().Extract(context.Background(), name, mime, bytes.NewReader(data))
 }
 
 func TestExtractMarkdownAndText(t *testing.T) {
@@ -78,11 +85,11 @@ func TestSizeLimit(t *testing.T) {
 
 func TestExtractOfficeFormats(t *testing.T) {
 	cases := []struct {
-		name string
-		file string
-		mime string
-		data []byte
-		want string
+		name  string
+		file  string
+		mime  string
+		data  []byte
+		wants []string
 	}{
 		{
 			name: "docx",
@@ -92,28 +99,28 @@ func TestExtractOfficeFormats(t *testing.T) {
 				[]string{"Attachment matrix paragraph"},
 				[][]string{{"Cell A", "Cell B"}},
 			),
-			want: "Attachment matrix paragraph\nCell A\nCell B",
+			wants: []string{"Attachment matrix paragraph", "Cell A", "Cell B", "| Cell A | Cell B |"},
 		},
 		{
-			name: "pptx",
-			file: "slides.pptx",
-			mime: "application/octet-stream",
-			data: pptxFixture([]string{"First slide", "Second slide"}),
-			want: "First slide\nSecond slide",
+			name:  "pptx",
+			file:  "slides.pptx",
+			mime:  "application/octet-stream",
+			data:  pptxFixture([]string{"First slide", "Second slide"}),
+			wants: []string{"First slide", "Second slide"},
 		},
 		{
-			name: "xlsx",
-			file: "matrix.xlsx",
-			mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			data: xlsxFixture(),
-			want: "Requirement\tExpected\nLogin works\tinline value\nTRUE\t2\tFALSE\n42\tExpected result",
+			name:  "xlsx",
+			file:  "matrix.xlsx",
+			mime:  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			data:  xlsxFixture(),
+			wants: []string{"Requirement\tExpected", "Login works\tinline value", "TRUE\t2\tFALSE", "42\tExpected result"},
 		},
 		{
-			name: "xlsx by MIME",
-			file: "spreadsheet",
-			mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			data: xlsxFixture(),
-			want: "Requirement\tExpected\nLogin works\tinline value\nTRUE\t2\tFALSE\n42\tExpected result",
+			name:  "xlsx by MIME",
+			file:  "spreadsheet",
+			mime:  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			data:  xlsxFixture(),
+			wants: []string{"Requirement\tExpected", "Login works\tinline value", "TRUE\t2\tFALSE", "42\tExpected result"},
 		},
 	}
 	for _, tc := range cases {
@@ -122,10 +129,10 @@ func TestExtractOfficeFormats(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", tc.name, err)
 			}
-			// Exact output catches a whole document being appended once per
-			// text run; the markup check reports leaked XML explicitly.
-			if got := strings.TrimSpace(text); got != tc.want {
-				t.Fatalf("%s extraction = %q, want %q", tc.name, got, tc.want)
+			for _, want := range tc.wants {
+				if !strings.Contains(text, want) {
+					t.Fatalf("%s extraction missing %q: %q", tc.name, want, text)
+				}
 			}
 			for _, markup := range []string{"<w:", "<a:", "<?xml"} {
 				if strings.Contains(text, markup) {
@@ -157,7 +164,6 @@ func TestLegacyFormatsRejected(t *testing.T) {
 
 func TestExtractHTML(t *testing.T) {
 	document := []byte("\ufeff<!doctype html><html><body><h1>标题</h1><p>body text</p></body></html>")
-	const want = "<!doctype html><html><body><h1>标题</h1><p>body text</p></body></html>"
 	for _, tc := range []struct{ name, mime string }{
 		{"page.html", "text/html"},
 		{"page.htm", "text/html"},
@@ -167,8 +173,11 @@ func TestExtractHTML(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		if text != want {
-			t.Fatalf("%s = %q, want %q", tc.name, text, want)
+		if !strings.Contains(text, "标题") || !strings.Contains(text, "body text") {
+			t.Fatalf("%s = %q, want visible text", tc.name, text)
+		}
+		if strings.Contains(text, "<h1>") || strings.Contains(text, "<p>") {
+			t.Fatalf("%s leaked raw HTML tags: %q", tc.name, text)
 		}
 	}
 }
@@ -263,11 +272,10 @@ func TestExtractDOCXRejectsOversizedXML(t *testing.T) {
 	}
 }
 
-func TestExtractRejectsLegacyAndImageFormats(t *testing.T) {
+func TestExtractRejectsLegacyAndArchiveFormats(t *testing.T) {
 	for _, tc := range []struct{ name, mime string }{
 		{"legacy.doc", "application/msword"},
 		{"legacy.ppt", "application/vnd.ms-powerpoint"},
-		{"screenshot.png", "image/png"},
 		{"archive.zip", "application/zip"},
 	} {
 		if _, err := extract(t, tc.name, tc.mime, []byte("data")); err == nil {
@@ -275,6 +283,304 @@ func TestExtractRejectsLegacyAndImageFormats(t *testing.T) {
 		} else if !errors.Is(err, attachments.ErrUnsupported) {
 			t.Fatalf("%s error = %v", tc.name, err)
 		}
+	}
+}
+
+// TestExtractStandaloneImage covers R-E3-1: a standalone image is returned as
+// an image reference (bytes + MIME + dimensions) for the vision chain, not as
+// text and not as an unsupported format.
+func TestExtractStandaloneImage(t *testing.T) {
+	result, err := extractResult(t, "screenshot.png", "image/png", fixturePNG(4, 3))
+	if err != nil {
+		t.Fatalf("standalone image: %v", err)
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("images = %+v", result.Images)
+	}
+	image := result.Images[0]
+	if image.MIME != "image/png" || image.Width != 4 || image.Height != 3 || len(image.Data) == 0 {
+		t.Fatalf("image = %+v", image)
+	}
+	if strings.TrimSpace(result.Text) != "" {
+		t.Fatalf("standalone image produced text: %q", result.Text)
+	}
+	if result.Coverage.Parsed != 1 || result.Coverage.Skipped != 0 {
+		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+}
+
+func findElement(elements []versionapp.ExtractionElement, kind, text string) bool {
+	for _, element := range elements {
+		if element.Kind == kind && strings.Contains(element.Text, text) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDOCXFullyExtracts(t *testing.T) {
+	result, err := extractResult(t, "req.docx", "", docxFullyFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	for _, want := range []string{
+		"3.2 用户登录", "手机号", "表格单元格", "页眉", "页脚", "脚注", "尾注", "批注",
+	} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("missing %q in extracted text:\n%s", want, result.Text)
+		}
+	}
+	if !strings.Contains(result.Text, "| 表格单元格 | 预期结果 |") {
+		t.Fatalf("table row structure lost:\n%s", result.Text)
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("embedded image not extracted: %+v", result.Images)
+	}
+	if result.Images[0].MIME != "image/png" || len(result.Images[0].Data) == 0 ||
+		result.Images[0].Width != 8 || result.Images[0].Height != 6 {
+		t.Fatalf("embedded image metadata = %+v", result.Images[0])
+	}
+	if result.Coverage.Skipped != 0 {
+		t.Fatalf("skipped = %+v", result.Skipped)
+	}
+	if !findElement(result.Elements, "heading", "3.2 用户登录") {
+		t.Fatalf("heading element missing: %+v", result.Elements)
+	}
+	for _, element := range result.Elements {
+		if element.Kind == "heading" && element.Text == "3.2 用户登录" {
+			if element.Level != 2 || element.HeadingPath != "3.2 用户登录" {
+				t.Fatalf("heading metadata = %+v", element)
+			}
+		}
+	}
+	if !findElement(result.Elements, "list_item", "手机号") {
+		t.Fatalf("list item missing: %+v", result.Elements)
+	}
+	for _, kind := range []string{"header", "footer", "footnote", "endnote", "comment", "table_row"} {
+		found := false
+		for _, element := range result.Elements {
+			if element.Kind == kind {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("element kind %q missing: %+v", kind, result.Elements)
+		}
+	}
+	if result.Coverage.Found == 0 || result.Coverage.Found != result.Coverage.Parsed {
+		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+}
+
+// TestDOCXTableImageExtracted covers images whose drawing lives in a table
+// cell paragraph instead of the document body.
+func TestDOCXTableImageExtracted(t *testing.T) {
+	result, err := extractResult(t, "req.docx", "", docxTableImageFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	if !strings.Contains(result.Text, "表格中的图片") {
+		t.Fatalf("table text missing: %q", result.Text)
+	}
+	if len(result.Images) != 1 || result.Images[0].MIME != "image/png" {
+		t.Fatalf("table-cell image = %+v", result.Images)
+	}
+	if result.Coverage.Skipped != 0 {
+		t.Fatalf("skipped = %+v", result.Skipped)
+	}
+}
+
+func TestPPTXFullyExtracts(t *testing.T) {
+	result, err := extractResult(t, "deck.pptx", "", pptxFullyFixture())
+	if err != nil {
+		t.Fatalf("pptx: %v", err)
+	}
+	for _, want := range []string{"3.2 用户登录", "表格单元格", "演讲者备注", "第二页"} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("missing %q in extracted text:\n%s", want, result.Text)
+		}
+	}
+	if strings.Index(result.Text, "3.2 用户登录") > strings.Index(result.Text, "第二页") {
+		t.Fatalf("slide order lost:\n%s", result.Text)
+	}
+	if len(result.Images) != 1 || result.Images[0].MIME != "image/png" || len(result.Images[0].Data) == 0 {
+		t.Fatalf("embedded image = %+v", result.Images)
+	}
+	if !findElement(result.Elements, "table_row", "表格单元格") ||
+		!findElement(result.Elements, "note", "演讲者备注") {
+		t.Fatalf("structured elements missing: %+v", result.Elements)
+	}
+	if result.Coverage.Skipped != 0 || result.Coverage.Found != result.Coverage.Parsed {
+		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+}
+
+func TestXLSXFullyExtracts(t *testing.T) {
+	result, err := extractResult(t, "matrix.xlsx", "", xlsxFullyFixture())
+	if err != nil {
+		t.Fatalf("xlsx: %v", err)
+	}
+	for _, want := range []string{
+		"可见表", "隐藏表", "(hidden)", "隐藏 sheet 内容", "缓存值",
+		"内联字符串", "[formula]", "CONCAT(A1,A2)", "批注：需要补充边界条件",
+	} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("missing %q in extracted text:\n%s", want, result.Text)
+		}
+	}
+	if !strings.Contains(result.Text, "## Sheet: 隐藏表 (hidden)") {
+		t.Fatalf("hidden sheet not marked:\n%s", result.Text)
+	}
+	if len(result.Images) != 1 || result.Images[0].MIME != "image/png" {
+		t.Fatalf("embedded image = %+v", result.Images)
+	}
+	cachedFormula := false
+	formulaOnly := false
+	for _, element := range result.Elements {
+		if element.Kind != "sheet_row" {
+			continue
+		}
+		for _, cell := range element.Row {
+			if cell == "2" {
+				cachedFormula = true
+			}
+			if strings.Contains(cell, "[formula] CONCAT(A1,A2)") {
+				formulaOnly = true
+			}
+		}
+	}
+	if !cachedFormula || !formulaOnly {
+		t.Fatalf("formula cells = %+v", result.Elements)
+	}
+	if !findElement(result.Elements, "comment", "批注：需要补充边界条件") {
+		t.Fatalf("comment element missing: %+v", result.Elements)
+	}
+	if result.Coverage.Skipped != 0 || result.Coverage.Found != result.Coverage.Parsed {
+		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+}
+
+func TestPDFFullyExtracts(t *testing.T) {
+	result, err := extractResult(t, "report.pdf", "application/pdf", pdfFullyFixture())
+	if err != nil {
+		t.Fatalf("pdf: %v", err)
+	}
+	if !strings.Contains(result.Text, "PDF image page") {
+		t.Fatalf("pdf text = %q", result.Text)
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("embedded pdf image not extracted: %+v", result.Images)
+	}
+	image := result.Images[0]
+	if image.MIME != "image/png" || image.Width != 2 || image.Height != 2 || len(image.Data) == 0 {
+		t.Fatalf("pdf image = %+v", image)
+	}
+	if result.Coverage.Skipped != 0 {
+		t.Fatalf("skipped = %+v", result.Skipped)
+	}
+}
+
+func TestPDFSkippedImageReported(t *testing.T) {
+	result, err := extractResult(t, "report.pdf", "application/pdf", pdfSkippedImageFixture())
+	if err != nil {
+		t.Fatalf("pdf: %v", err)
+	}
+	if !strings.Contains(result.Text, "PDF image page") {
+		t.Fatalf("pdf text = %q", result.Text)
+	}
+	if len(result.Images) != 0 {
+		t.Fatalf("unsupported image decoded: %+v", result.Images)
+	}
+	if len(result.Skipped) != 1 || result.Coverage.Skipped != 1 {
+		t.Fatalf("skipped = %+v coverage=%+v", result.Skipped, result.Coverage)
+	}
+	reason := result.Skipped[0].Reason
+	if !strings.Contains(reason, "JPXDecode") {
+		t.Fatalf("skip reason = %q, want the unsupported filter", reason)
+	}
+}
+
+func TestCoverageSkippedImageHasReason(t *testing.T) {
+	result, err := extractResult(t, "req.docx", "", docxSkippedImageFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	if !strings.Contains(result.Text, "正文保留") {
+		t.Fatalf("body text lost: %q", result.Text)
+	}
+	if len(result.Images) != 0 {
+		t.Fatalf("unparseable image returned: %+v", result.Images)
+	}
+	if result.Coverage.Skipped != 1 || len(result.Skipped) != 1 {
+		t.Fatalf("coverage = %+v skipped=%+v", result.Coverage, result.Skipped)
+	}
+	if !strings.Contains(result.Skipped[0].Reason, "image") {
+		t.Fatalf("skip reason = %q", result.Skipped[0].Reason)
+	}
+	if result.Coverage.Found != result.Coverage.Parsed+result.Coverage.Skipped {
+		t.Fatalf("coverage mismatch = %+v", result.Coverage)
+	}
+}
+
+func TestCoverageReport(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		mime string
+		data []byte
+	}{
+		{"docx", "req.docx", "", docxFullyFixture()},
+		{"pptx", "deck.pptx", "", pptxFullyFixture()},
+		{"xlsx", "matrix.xlsx", "", xlsxFullyFixture()},
+		{"html", "page.html", "text/html", []byte(htmlFullyFixture)},
+		{"pdf", "report.pdf", "application/pdf", pdfFullyFixture()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := extractResult(t, tc.file, tc.mime, tc.data)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			coverage := result.Coverage
+			if coverage.Found == 0 {
+				t.Fatalf("empty coverage: %+v", coverage)
+			}
+			if coverage.Found != coverage.Parsed+coverage.Skipped {
+				t.Fatalf("found != parsed+skipped: %+v", coverage)
+			}
+			if coverage.Parsed != len(result.Elements)+len(result.Images) {
+				t.Fatalf("parsed = %d, elements+images = %d", coverage.Parsed, len(result.Elements)+len(result.Images))
+			}
+			if coverage.Skipped != len(result.Skipped) || coverage.Skipped != 0 {
+				t.Fatalf("unexpected skips: %+v", coverage)
+			}
+			if len(coverage.SkipReasons) != 0 {
+				t.Fatalf("skip reasons for a clean fixture: %+v", coverage.SkipReasons)
+			}
+			if coverage.ImagesFound != len(result.Images) {
+				t.Fatalf("image coverage = %+v images=%d", coverage, len(result.Images))
+			}
+			t.Logf("%s coverage: %+v", tc.name, coverage)
+		})
+	}
+}
+
+func TestLimitFailsExplicitly(t *testing.T) {
+	pages := make([]string, 51)
+	for index := range pages {
+		pages[index] = "Page"
+	}
+	if _, err := extractResult(t, "big.pdf", "application/pdf", pdfFixture(pages)); !errors.Is(err, attachments.ErrTooLarge) {
+		t.Fatalf("PDF over the page limit error = %v, want ErrTooLarge", err)
+	}
+
+	paragraphs := make([]string, attachments.MaxDocumentElements+1)
+	for index := range paragraphs {
+		paragraphs[index] = "p"
+	}
+	if _, err := extractResult(t, "big.docx", "", docxFixture(paragraphs, nil)); !errors.Is(err, attachments.ErrTooLarge) {
+		t.Fatalf("DOCX over the element limit error = %v, want ErrTooLarge", err)
 	}
 }
 

@@ -232,18 +232,26 @@ func (f *fakeContentStore) Upload(_ context.Context, filename, mime string, r io
 type fakeExtractor struct {
 	text     string
 	err      error
+	result   versionapp.ExtractionResult
 	calls    int
 	lastName string
 }
 
-func (f *fakeExtractor) Extract(_ context.Context, name, _ string, r io.Reader) (string, error) {
+func (f *fakeExtractor) Extract(_ context.Context, name, _ string, r io.Reader) (versionapp.ExtractionResult, error) {
 	f.calls++
 	f.lastName = name
 	_, _ = io.ReadAll(r)
 	if f.err != nil {
-		return "", f.err
+		return versionapp.ExtractionResult{}, f.err
 	}
-	return f.text, nil
+	result := f.result
+	if result.Text == "" {
+		result.Text = f.text
+	}
+	if result.Coverage.Found == 0 && result.Text != "" {
+		result.Coverage = versionapp.ExtractionCoverage{Found: 1, Parsed: 1}
+	}
+	return result, nil
 }
 
 // ---------- environment ----------
@@ -428,6 +436,37 @@ func TestExtractStoresTextAsContentReference(t *testing.T) {
 	}
 	if env.events.events[0].Payload["chars"] != len("hello extracted") {
 		t.Fatalf("payload = %#v", env.events.events[0].Payload)
+	}
+}
+
+func TestExtractReturnsCoverageAndImages(t *testing.T) {
+	env := newAttachmentEnv(t)
+	view := registerAttachment(t, env, strings.Repeat("a", 64), "requirements.docx", "application/octet-stream", []byte("docx"))
+	env.extractor.text = "3.2 用户登录"
+	env.extractor.result = versionapp.ExtractionResult{
+		Elements: []versionapp.ExtractionElement{
+			{Kind: "heading", Text: "3.2 用户登录", Level: 2, HeadingPath: "3.2 用户登录"},
+		},
+		Images: []versionapp.ExtractionImage{
+			{Seq: 1, Name: "image1.png", Source: "word/media/image1.png", MIME: "image/png", Width: 8, Height: 6, Data: []byte("png-bytes")},
+		},
+		Coverage: versionapp.ExtractionCoverage{
+			Found: 2, Parsed: 2, ImagesFound: 1, ImagesParsed: 1,
+		},
+	}
+
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.Coverage.Found != 2 || result.Coverage.Parsed != 2 || result.Coverage.Skipped != 0 {
+		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+	if len(result.Elements) != 1 || result.Elements[0].HeadingPath != "3.2 用户登录" {
+		t.Fatalf("elements = %+v", result.Elements)
+	}
+	if len(result.Images) != 1 || string(result.Images[0].Data) != "png-bytes" || result.Images[0].MIME != "image/png" {
+		t.Fatalf("images = %+v", result.Images)
 	}
 }
 

@@ -18,7 +18,10 @@ import (
 
 // ExtractionResult is the outcome of one attachment.ingest attempt. A parse
 // failure is a domain outcome (ErrorCode set, no Go error) so the worker can
-// finish the task; storage failures are retryable Go errors.
+// finish the task; storage failures are retryable Go errors. The document
+// parser also fills Elements/Skipped/Images/Coverage (R-A7-3/3a), so the
+// coverage report is visible to callers instead of being lost after the text
+// is persisted.
 type ExtractionResult struct {
 	Attachment            AttachmentView
 	Text                  string
@@ -26,6 +29,69 @@ type ExtractionResult struct {
 	ContentSHA256         string
 	ExtractedContentRefID int64
 	ErrorCode             string
+	Elements              []ExtractionElement
+	Skipped               []SkippedElement
+	Images                []ExtractionImage
+	Coverage              ExtractionCoverage
+}
+
+// ExtractionElement is one structured content unit preserved by the parser.
+// HeadingPath is the ancestor chain (for example "3.2 用户登录 > 手机号登录"),
+// so downstream chunking/requirements extraction can keep source positions
+// (R-A7-2). Row holds the cells of a table row when Kind is "table_row".
+type ExtractionElement struct {
+	Kind        string   `json:"kind"`
+	Text        string   `json:"text,omitempty"`
+	Level       int      `json:"level,omitempty"`
+	HeadingPath string   `json:"heading_path,omitempty"`
+	Source      string   `json:"source,omitempty"`
+	Row         []string `json:"row,omitempty"`
+	Page        int      `json:"page,omitempty"`
+	Slide       int      `json:"slide,omitempty"`
+	Sheet       string   `json:"sheet,omitempty"`
+}
+
+// ExtractionImage is one embedded image reference found by the parser. Data is
+// the original object bytes so the vision chain can analyze it; this package
+// never runs vision itself (R-E2-1/R-E3-1).
+type ExtractionImage struct {
+	Seq    int    `json:"seq"`
+	Name   string `json:"name,omitempty"`
+	Source string `json:"source,omitempty"`
+	MIME   string `json:"mime"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
+	Size   int    `json:"size,omitempty"`
+	Data   []byte `json:"-"`
+}
+
+// SkippedElement is one human-visible element the parser could not turn into
+// text or an image reference. Every skip carries a reason the UI/DB can show
+// (R-A7-3a/3b); a skip is never silently dropped.
+type SkippedElement struct {
+	Kind   string `json:"kind"`
+	Source string `json:"source,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// ExtractionCoverage is the structured found/parsed/skipped report of one
+// parse (R-A7-3a). Found always equals Parsed+Skipped.
+type ExtractionCoverage struct {
+	Found         int            `json:"found"`
+	Parsed        int            `json:"parsed"`
+	Skipped       int            `json:"skipped"`
+	ImagesFound   int            `json:"images_found"`
+	ImagesParsed  int            `json:"images_parsed"`
+	SkipReasons   []string       `json:"skip_reasons,omitempty"`
+	ElementCounts map[string]int `json:"element_counts,omitempty"`
+}
+
+// DocumentExtractor is the attachment parser port. It returns the text plus the
+// structured elements, skipped elements, embedded image references and
+// coverage report in one pass (R-A7-3/3a). It supersedes TextExtractor for the
+// document parser; the infrastructure attachments parser implements it.
+type DocumentExtractor interface {
+	Extract(ctx context.Context, name, mime string, r io.Reader) (ExtractionResult, error)
 }
 
 // AttachmentService registers message attachments against the content ledger
@@ -34,7 +100,7 @@ type AttachmentService struct {
 	repo      version.AttachmentRepository
 	storage   ContentStore
 	queue     TaskEnqueuer
-	extractor TextExtractor
+	extractor DocumentExtractor
 	images    ImageProber
 	events    eventingapp.Publisher
 	ids       platformid.Generator
@@ -46,7 +112,7 @@ func NewAttachmentService(
 	repo version.AttachmentRepository,
 	storage ContentStore,
 	queue TaskEnqueuer,
-	extractor TextExtractor,
+	extractor DocumentExtractor,
 	images ImageProber,
 	events eventingapp.Publisher,
 	ids platformid.Generator,
@@ -789,7 +855,8 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 			return ExtractionResult{}, fmt.Errorf("attachment extraction is already in progress")
 		}
 	}
-	text, extractErr := s.extractor.Extract(ctx, attachment.Name, attachment.MIME, reader)
+	parsed, extractErr := s.extractor.Extract(ctx, attachment.Name, attachment.MIME, reader)
+	text := parsed.Text
 	if extractErr == nil && int64(len(text)) > version.MaxExtractedTextBytes {
 		extractErr = version.ErrAttachmentTooLarge
 	}
@@ -823,6 +890,7 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		"attachment_id": platformid.Format(attachment.ID),
 		"message_id":    messageIDString(attachment.ConversationMessageID),
 		"chars":         chars,
+		"coverage":      parsed.Coverage,
 	})
 	return ExtractionResult{
 		Attachment:            toAttachmentView(attachment),
@@ -830,6 +898,10 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		Chars:                 chars,
 		ContentSHA256:         uploaded.SHA256,
 		ExtractedContentRefID: textRef.ID,
+		Elements:              parsed.Elements,
+		Skipped:               parsed.Skipped,
+		Images:                parsed.Images,
+		Coverage:              parsed.Coverage,
 	}, nil
 }
 
