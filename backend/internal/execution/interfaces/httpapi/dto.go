@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -168,4 +169,105 @@ func decodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) error {
 		return platform.Invalid("body", "request body must be a valid JSON object")
 	}
 	return nil
+}
+
+// createQuestionRequest is POST /versions/{id}/conversations/{cid}/questions.
+// version/conversation/agent-run identity is never part of the body.
+type createQuestionRequest struct {
+	Questions []questionItemInput `json:"questions"`
+	BatchID   string              `json:"batch_id"`
+	ExpiresAt *string             `json:"expires_at"`
+}
+
+type questionItemInput struct {
+	ID            string                `json:"id"`
+	Text          string                `json:"text"`
+	Options       []questionOptionInput `json:"options"`
+	Multiple      bool                  `json:"multiple"`
+	AllowFreeText bool                  `json:"allow_free_text"`
+	Required      bool                  `json:"required"`
+	SourceRefs    []string              `json:"source_refs"`
+}
+
+type questionOptionInput struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// parse converts the transport shape into the question payload; structural
+// validation (1-5, unique ids, required/free-text) stays in the domain service.
+func (r createQuestionRequest) parse() ([]execution.HumanQuestion, *time.Time, error) {
+	questions := make([]execution.HumanQuestion, 0, len(r.Questions))
+	for _, item := range r.Questions {
+		options := make([]execution.HumanQuestionOption, 0, len(item.Options))
+		for _, option := range item.Options {
+			options = append(options, execution.HumanQuestionOption{ID: option.ID, Label: option.Label})
+		}
+		questions = append(questions, execution.HumanQuestion{
+			ID:            item.ID,
+			Text:          item.Text,
+			Options:       options,
+			Multiple:      item.Multiple,
+			AllowFreeText: item.AllowFreeText,
+			Required:      item.Required,
+			SourceRefs:    append([]string{}, item.SourceRefs...),
+		})
+	}
+	var expiresAt *time.Time
+	if r.ExpiresAt != nil && strings.TrimSpace(*r.ExpiresAt) != "" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*r.ExpiresAt))
+		if err != nil {
+			return nil, nil, platform.Invalid("expires_at", "must be an RFC3339 timestamp")
+		}
+		expiresAt = &parsed
+	}
+	return questions, expiresAt, nil
+}
+
+// answerQuestionRequest is POST /versions/{id}/questions/{qid}/answer.
+type answerQuestionRequest struct {
+	Answers []questionAnswerInput `json:"answers"`
+}
+
+type questionAnswerInput struct {
+	QuestionID string   `json:"question_id"`
+	Selected   []string `json:"selected"`
+	Text       string   `json:"text"`
+}
+
+// parse normalizes the submitted answers. Answer semantics (required, option
+// membership, multiple) are validated by the execution domain.
+func (r answerQuestionRequest) parse() ([]execution.HumanQuestionAnswer, error) {
+	if r.Answers == nil {
+		return nil, platform.Invalid("answers", "answers is required")
+	}
+	answers := make([]execution.HumanQuestionAnswer, 0, len(r.Answers))
+	for _, answer := range r.Answers {
+		answers = append(answers, execution.HumanQuestionAnswer{
+			QuestionID: answer.QuestionID,
+			Selected:   append([]string{}, answer.Selected...),
+			Text:       answer.Text,
+		})
+	}
+	return answers, nil
+}
+
+// skipQuestionRequest is POST /versions/{id}/questions/{qid}/skip.
+type skipQuestionRequest struct {
+	Reason string `json:"reason"`
+}
+
+// questionOwnerID reads the owning Host agent run identity of a question write.
+// Host-internal endpoint contract; Task 37 mounts these routes behind the Host
+// run context, which injects this header.
+func questionOwnerID(r *http.Request) (int64, error) {
+	raw := strings.TrimSpace(r.Header.Get("X-Agent-Run-Id"))
+	if raw == "" {
+		return 0, platform.Invalid("agent_run_id", "the X-Agent-Run-Id host run header is required")
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, platform.Invalid("agent_run_id", "must be a positive decimal ID")
+	}
+	return value, nil
 }

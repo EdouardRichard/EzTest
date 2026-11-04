@@ -203,8 +203,10 @@ func newClosureFixture() Deps {
 		{ID: 2, VersionID: 7, CaseVersionID: 3003, Status: execution.IntentRunning},
 	}}}
 	humans := &fakeClosureHumans{open: []execution.HumanRequest{
-		{ID: 2, VersionID: 7, Status: execution.HumanOpen},
-		{ID: 3, VersionID: 8, Status: execution.HumanOpen},
+		{ID: 2, VersionID: 7, Kind: execution.HumanLoginTakeover, Status: execution.HumanPending},
+		{ID: 3, VersionID: 8, Kind: execution.HumanLoginTakeover, Status: execution.HumanPending},
+		// Pending structured questions never block version closure (R-B3-4/C-2).
+		{ID: 4, VersionID: 7, Kind: execution.HumanClarificationQuestion, Status: execution.HumanPending},
 	}}
 	workItems := &fakeClosureWorkItems{items: map[int64][]agent.WorkItem{7: {
 		{ID: 10, VersionID: 7, Type: "design.gap", Status: agent.WorkItemOpen, Payload: json.RawMessage(`{"requirement_id":"101"}`)},

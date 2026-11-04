@@ -445,11 +445,17 @@ func (r *ClosureReaders) CountOpenHumanRequests(ctx context.Context, versionID i
 	count := 0
 	var before *int64
 	for {
-		page, hasMore, err := r.deps.Humans.ListByVersion(ctx, versionID, string(execution.HumanOpen), pageSize, before)
+		page, hasMore, err := r.deps.Humans.ListByVersion(ctx, versionID, string(execution.HumanPending), pageSize, before)
 		if err != nil {
 			return 0, err
 		}
-		count += len(page)
+		// Structured questions never block version closure (R-B3-4/C-2); the
+		// close predicate only counts pending execution takeovers.
+		for _, request := range page {
+			if request.Kind == execution.HumanLoginTakeover {
+				count++
+			}
+		}
 		if !hasMore || len(page) == 0 {
 			break
 		}

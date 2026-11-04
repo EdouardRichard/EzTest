@@ -29,26 +29,33 @@ func TestEvidenceKinds(t *testing.T) {
 }
 
 func TestHumanRequestTransitions(t *testing.T) {
-	for _, to := range []HumanRequestStatus{HumanResolved, HumanCancelled, HumanExpired} {
-		if !HumanOpen.CanTransitionTo(to) {
-			t.Errorf("open -> %s must be allowed", to)
+	for _, to := range []HumanRequestStatus{HumanAnswered, HumanCancelled, HumanExpired} {
+		if !HumanPending.CanTransitionTo(to) {
+			t.Errorf("pending -> %s must be allowed", to)
 		}
-		if HumanResolved.CanTransitionTo(HumanOpen) {
-			t.Errorf("resolved -> open must be rejected")
+		if !HumanAnswered.CanTransitionTo(HumanPending) {
+			t.Errorf("answered -> pending (reopen) must be allowed")
 		}
 	}
-	for _, terminal := range []HumanRequestStatus{HumanResolved, HumanCancelled, HumanExpired} {
+	if HumanPending.CanTransitionTo(HumanPending) {
+		t.Error("pending -> pending must be rejected")
+	}
+	if HumanAnswered.CanTransitionTo(HumanExpired) {
+		t.Error("answered -> expired must be rejected")
+	}
+	for _, terminal := range []HumanRequestStatus{HumanAnswered, HumanCancelled, HumanExpired} {
 		if !terminal.Terminal() {
 			t.Errorf("%s must be terminal", terminal)
 		}
 	}
-	if HumanOpen.Terminal() {
-		t.Fatal("open must not be terminal")
+	if HumanPending.Terminal() {
+		t.Fatal("pending must not be terminal")
 	}
 	if HumanRequestStatus("bogus").Valid() {
 		t.Fatal("unknown human request status must be invalid")
 	}
-	for _, kind := range []HumanKind{HumanLoginTakeover, HumanConflict, HumanOther} {
+	for _, kind := range []HumanKind{HumanClarificationQuestion, HumanApproval, HumanBlockedRecovery,
+		HumanLoginTakeover, HumanConflict, HumanOther} {
 		if !kind.Valid() {
 			t.Errorf("%s must be a valid human request kind", kind)
 		}

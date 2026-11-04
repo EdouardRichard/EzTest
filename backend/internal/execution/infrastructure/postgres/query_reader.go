@@ -102,7 +102,7 @@ func (r *QueryReader) ListOpenHumanRequests(ctx context.Context, includeTakeover
 			created_at,
 			expires_at
 		FROM human_request
-		WHERE status = 'open'
+		WHERE status = 'pending'
 		  AND ($1::boolean OR kind <> 'login_takeover')
 		ORDER BY (kind = 'login_takeover') DESC, created_at DESC, id DESC
 		LIMIT $2

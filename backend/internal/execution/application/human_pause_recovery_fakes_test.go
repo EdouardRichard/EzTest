@@ -49,7 +49,7 @@ func (s *fakeHumanStore) GetOpenByCaseRun(_ context.Context, caseRunID int64) (*
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, request := range s.byID {
-		if request.Status == execution.HumanOpen && request.CaseRunID != nil && *request.CaseRunID == caseRunID {
+		if request.Status == execution.HumanPending && request.CaseRunID != nil && *request.CaseRunID == caseRunID {
 			copied := request
 			return &copied, nil
 		}
@@ -76,11 +76,68 @@ func (s *fakeHumanStore) ListOpen(_ context.Context) ([]execution.HumanRequest, 
 	defer s.mu.Unlock()
 	items := make([]execution.HumanRequest, 0)
 	for _, request := range s.byID {
-		if request.Status == execution.HumanOpen {
+		if request.Status == execution.HumanPending && request.Kind == execution.HumanLoginTakeover {
 			items = append(items, request)
 		}
 	}
 	return items, nil
+}
+
+// ListQuestions implements the structured-question read surface.
+func (s *fakeHumanStore) ListQuestions(_ context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]execution.HumanRequest, 0)
+	for _, request := range s.byID {
+		if request.VersionID != versionID || request.Kind != execution.HumanClarificationQuestion {
+			continue
+		}
+		if status != "" && string(request.Status) != status {
+			continue
+		}
+		if beforeID != nil && request.ID >= *beforeID {
+			continue
+		}
+		items = append(items, request)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID > items[j].ID })
+	hasMore := limit > 0 && len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	return items, hasMore, nil
+}
+
+// AttachMessage implements the conversation-card binding.
+func (s *fakeHumanStore) AttachMessage(_ context.Context, id, messageID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	request, ok := s.byID[id]
+	if !ok {
+		return execution.ErrNotFound
+	}
+	request.MessageID = &messageID
+	s.byID[id] = request
+	return nil
+}
+
+// ExpireQuestions implements the question-specific expiry sweep.
+func (s *fakeHumanStore) ExpireQuestions(_ context.Context, now time.Time) ([]execution.HumanRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expired := make([]execution.HumanRequest, 0)
+	for id, request := range s.byID {
+		if request.Kind != execution.HumanClarificationQuestion || request.Status != execution.HumanPending ||
+			request.ExpiresAt.After(now) {
+			continue
+		}
+		request.Status = execution.HumanExpired
+		request.UpdatedAt = now
+		s.byID[id] = request
+		expired = append(expired, request)
+	}
+	sort.Slice(expired, func(i, j int) bool { return expired[i].ID < expired[j].ID })
+	return expired, nil
 }
 
 func (s *fakeHumanStore) CountByCaseRun(_ context.Context, caseRunID int64) (int, error) {
@@ -107,9 +164,13 @@ func (s *fakeHumanStore) Transition(_ context.Context, id int64, from, to execut
 	}
 	request.Status = to
 	request.Response = response
-	if to == execution.HumanResolved || to == execution.HumanCancelled {
+	switch to {
+	case execution.HumanAnswered, execution.HumanCancelled:
 		request.ResolvedBy = actorPtr(actorID)
 		request.ResolvedAt = &at
+	case execution.HumanPending:
+		request.ResolvedBy = nil
+		request.ResolvedAt = nil
 	}
 	request.UpdatedAt = at
 	s.byID[id] = request
@@ -121,7 +182,8 @@ func (s *fakeHumanStore) Expire(_ context.Context, now time.Time) ([]execution.H
 	defer s.mu.Unlock()
 	expired := make([]execution.HumanRequest, 0)
 	for id, request := range s.byID {
-		if request.Status != execution.HumanOpen || !request.ExpiresAt.Before(now) {
+		if request.Kind != execution.HumanLoginTakeover || request.Status != execution.HumanPending ||
+			!request.ExpiresAt.Before(now) {
 			continue
 		}
 		request.Status = execution.HumanExpired

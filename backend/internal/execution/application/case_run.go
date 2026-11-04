@@ -1505,7 +1505,7 @@ func (s *CaseRunner) humanResponse(ctx context.Context, caseRun execution.CaseRu
 		}
 		return "", mapExecutionError(err, "human_request")
 	}
-	if request.Status != execution.HumanResolved {
+	if request.Status != execution.HumanAnswered {
 		return "", nil
 	}
 	parts := make([]string, 0, 2)

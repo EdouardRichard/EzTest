@@ -136,13 +136,48 @@ type HumanRequestRepository interface {
 	GetOpenByCaseRun(ctx context.Context, caseRunID int64) (*execution.HumanRequest, error)
 	ListByVersion(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error)
 	ListOpen(ctx context.Context) ([]execution.HumanRequest, error)
+	// ListQuestions returns one descending-ID page of the version's
+	// clarification_question rows, optionally filtered by status. Login-takeover
+	// execution rows are never part of the structured-question read surface.
+	ListQuestions(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error)
 	CountByCaseRun(ctx context.Context, caseRunID int64) (int, error)
 	// Transition applies a guarded status change with the optional response
 	// fields. It returns false,nil on a status mismatch.
 	Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time) (bool, error)
-	// Expire marks every open request whose expires_at is before now as
-	// expired and returns the affected rows.
+	// AttachMessage records the conversation_message id that renders the
+	// question card.
+	AttachMessage(ctx context.Context, id, messageID int64) error
+	// Expire marks every pending login_takeover request whose expires_at is
+	// before now as expired and returns the affected rows.
 	Expire(ctx context.Context, now time.Time) ([]execution.HumanRequest, error)
+	// ExpireQuestions marks every pending clarification_question whose
+	// expires_at is before now as expired and returns the affected rows. It is
+	// the question-specific sweep: it never touches execution case_runs/waves.
+	ExpireQuestions(ctx context.Context, now time.Time) ([]execution.HumanRequest, error)
+}
+
+// QuestionMessage is one conversation_message write for a structured question:
+// the question card message (kind=question) and the answer echo (kind=answer).
+// The version-context adapter owns conversation_message id/idempotency and must
+// map Kind to the DB-3 message kind.
+type QuestionMessage struct {
+	VersionID       int64
+	ConversationID  int64
+	QuestionID      int64
+	Kind            string
+	ClientMessageID string
+	Payload         map[string]any
+	ActorID         int64
+	AgentRunID      int64
+}
+
+// QuestionMessageWriter is the version conversation write port of the
+// structured-question service (R-B3-3/R-B3-5). It must be idempotent per
+// ClientMessageID: a retried answer returns the already-stored message id with
+// created=false instead of appending a duplicate. The production adapter wraps
+// versionapp.ConversationService (Task 36 wiring).
+type QuestionMessageWriter interface {
+	AppendQuestionMessage(ctx context.Context, message QuestionMessage) (messageID int64, created bool, err error)
 }
 
 // SUTContextRepository persists case_run_sut_context rows.

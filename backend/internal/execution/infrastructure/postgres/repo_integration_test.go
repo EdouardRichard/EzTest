@@ -669,7 +669,7 @@ func TestExecutorAndHumanRequest(t *testing.T) {
 
 	human := execution.HumanRequest{
 		ID: 10, VersionID: 100, CaseRunID: ptrInt64(500), Kind: execution.HumanLoginTakeover,
-		Payload: map[string]any{"reason": "2fa"}, Status: execution.HumanOpen,
+		Payload: map[string]any{"reason": "2fa"}, Status: execution.HumanPending,
 		ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
 	}
 	if err := repo.Humans.Create(ctx, human); err != nil {
@@ -682,21 +682,21 @@ func TestExecutorAndHumanRequest(t *testing.T) {
 	if count, err := repo.Humans.CountByCaseRun(ctx, 500); err != nil || count != 1 {
 		t.Fatalf("CountByCaseRun = %d err=%v", count, err)
 	}
-	changed, err := repo.Humans.Transition(ctx, 10, execution.HumanOpen, execution.HumanResolved,
+	changed, err := repo.Humans.Transition(ctx, 10, execution.HumanPending, execution.HumanAnswered,
 		map[string]any{"code": "246810"}, 7, now)
 	if err != nil || !changed {
 		t.Fatalf("resolve human request: %v %v", changed, err)
 	}
-	if changed, err := repo.Humans.Transition(ctx, 10, execution.HumanOpen, execution.HumanCancelled, nil, 7, now); err != nil || changed {
+	if changed, err := repo.Humans.Transition(ctx, 10, execution.HumanPending, execution.HumanCancelled, nil, 7, now); err != nil || changed {
 		t.Fatalf("second transition = %v err=%v", changed, err)
 	}
 	resolved, err := repo.Humans.Get(ctx, 10)
-	if err != nil || resolved.Status != execution.HumanResolved || resolved.Response["code"] != "246810" {
+	if err != nil || resolved.Status != execution.HumanAnswered || resolved.Response["code"] != "246810" {
 		t.Fatalf("resolved human request = %+v err=%v", resolved, err)
 	}
 
 	expired := execution.HumanRequest{
-		ID: 11, VersionID: 100, Kind: execution.HumanLoginTakeover, Status: execution.HumanOpen,
+		ID: 11, VersionID: 100, Kind: execution.HumanLoginTakeover, Status: execution.HumanPending,
 		ExpiresAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
 	}
 	if err := repo.Humans.Create(ctx, expired); err != nil {

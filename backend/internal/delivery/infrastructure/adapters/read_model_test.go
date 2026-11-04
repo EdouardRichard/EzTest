@@ -742,7 +742,7 @@ func TestReportDataReaderVersionReportReady(t *testing.T) {
 	}
 
 	deps.Intents = &fakeIntents{}
-	deps.Humans = &fakeHumans{open: []execution.HumanRequest{{ID: 2, VersionID: 7, Status: execution.HumanOpen}}}
+	deps.Humans = &fakeHumans{open: []execution.HumanRequest{{ID: 2, VersionID: 7, Status: execution.HumanPending}}}
 	reader = NewReportDataReader(deps)
 	if ok, err := reader.VersionReportReady(context.Background(), 7); err != nil || ok {
 		t.Fatalf("ready with open human request = %v/%v, want false", ok, err)

@@ -31,6 +31,9 @@ const (
 	EventHumanCreated      = "human_request.created"
 	EventHumanResolved     = "human_request.resolved"
 	EventHumanExpired      = "human_request.expired"
+	EventQuestionCreated   = "question.created"
+	EventQuestionAnswered  = "question.answered"
+	EventQuestionExpired   = "question.expired"
 	EventFailureCandidate  = "execution.failure_candidate"
 	EventCoverageGap       = "execution.coverage_gap"
 )

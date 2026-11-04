@@ -574,7 +574,7 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	if len(evidence["data"].([]any)) != 0 {
 		t.Fatalf("evidence = %#v", evidence)
 	}
-	humans := api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=open", nil, http.StatusOK)
+	humans := api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=pending", nil, http.StatusOK)
 	if len(humans["data"].([]any)) != 0 {
 		t.Fatalf("human requests = %#v", humans)
 	}
@@ -699,7 +699,7 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 		  VALUES ($1, $2, $3, 1, NULL, 'screenshot', 555, $4, $5, $6, 'p3-shot.txt')`,
 			[]any{int64(960001), int64(930001), int64(1), upload.Data.SHA256, upload.Data.Size, upload.Data.MIME}},
 		{`INSERT INTO human_request (id, version_id, case_run_id, kind, payload, status, expires_at)
-		  VALUES ($1, $2, $3, 'login_takeover', $4::jsonb, 'open', now() + interval '30 minutes')`,
+		  VALUES ($1, $2, $3, 'login_takeover', $4::jsonb, 'pending', now() + interval '30 minutes')`,
 			[]any{int64(970001), versionIDValue, int64(930001), `{"reason":"2FA code required","version_sut_id":"1","account_role":"admin","page_url":"http://127.0.0.1:13337/p3/2fa","challenge_kind":"totp"}`}},
 	}
 	for _, item := range seed {
@@ -793,14 +793,14 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 	api.do(http.MethodGet, "/api/versions/"+otherVersion["id"].(string)+"/evidence/960001/content", nil, http.StatusNotFound)
 
 	// Human takeover: list open, resolve once, never echo the one-time code.
-	humanList := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=open", nil, http.StatusOK))
+	humanList := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=pending", nil, http.StatusOK))
 	if len(humanList) != 1 {
 		t.Fatalf("human requests = %#v", humanList)
 	}
 	resolved := api.data(api.do(http.MethodPost, "/api/human-requests/970001/resolve", map[string]any{
 		"response": map[string]any{"code": "246810", "note": "code entered"},
 	}, http.StatusOK))
-	if resolved["status"] != "resolved" {
+	if resolved["status"] != "answered" {
 		t.Fatalf("resolved human request = %#v", resolved)
 	}
 	response, _ := resolved["response"].(map[string]any)

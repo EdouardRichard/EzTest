@@ -216,11 +216,11 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	p6SeedHumanRequest(t, pool, 6001, 1001, "login_takeover", "open", "验证码超时", base.Add(3*time.Hour))
-	p6SeedHumanRequest(t, pool, 6002, 1001, "conflict", "open", "账号冲突", base.Add(2*time.Hour))
-	p6SeedHumanRequest(t, pool, 6003, 1001, "other", "open", "", base.Add(1*time.Hour))
-	p6SeedHumanRequest(t, pool, 6004, 1001, "conflict", "resolved", "已解决", base.Add(4*time.Hour))
-	p6SeedHumanRequest(t, pool, 6011, 1002, "other", "open", "人工确认", base)
+	p6SeedHumanRequest(t, pool, 6001, 1001, "login_takeover", "pending", "验证码超时", base.Add(3*time.Hour))
+	p6SeedHumanRequest(t, pool, 6002, 1001, "conflict", "pending", "账号冲突", base.Add(2*time.Hour))
+	p6SeedHumanRequest(t, pool, 6003, 1001, "other", "pending", "", base.Add(1*time.Hour))
+	p6SeedHumanRequest(t, pool, 6004, 1001, "conflict", "answered", "已解决", base.Add(4*time.Hour))
+	p6SeedHumanRequest(t, pool, 6011, 1002, "other", "pending", "人工确认", base)
 
 	rows, err := reader.ListOpenHumanRequests(ctx, true, 10)
 	if err != nil {

@@ -366,7 +366,7 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 		t.Fatalf("human requests before seeding = %#v", source.OpenQuestions.HumanRequests)
 	}
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
-		VALUES (10011, 9004, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'open', now())`)
+		VALUES (10011, 9004, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'pending', now())`)
 	source := assertBlocker("paused", "")
 	if !reflect.DeepEqual(source.OpenQuestions.HumanRequests, []string{"需要短信验证码"}) {
 		t.Fatalf("human requests = %#v", source.OpenQuestions.HumanRequests)
@@ -593,13 +593,13 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 	}
 
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10001, 9001, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'open', $1, $2)`,
+		VALUES (10001, 9001, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'pending', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(3*time.Hour))
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10002, 9001, 'conflict', '{"reason":"账号归属冲突"}'::jsonb, 'open', $1, $2)`,
+		VALUES (10002, 9001, 'conflict', '{"reason":"账号归属冲突"}'::jsonb, 'pending', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(4*time.Hour))
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10003, 9001, 'other', '{"reason":"已处理"}'::jsonb, 'resolved', $1, $2)`,
+		VALUES (10003, 9001, 'other', '{"reason":"已处理"}'::jsonb, 'answered', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(5*time.Hour))
 
 	knowledge := []struct {

@@ -858,7 +858,7 @@ func (s *CaseRunner) HumanRequest(ctx context.Context, scope tools.Scope, in too
 	}
 	return map[string]any{
 		"human_request_id": platformid.Format(humanRequestID),
-		"status":           "open",
+		"status":           string(execution.HumanPending),
 		"note":             "case_run is paused until the request is resolved; stop this run",
 	}, nil
 }

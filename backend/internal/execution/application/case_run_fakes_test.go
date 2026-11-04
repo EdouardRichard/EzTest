@@ -494,7 +494,7 @@ func (f *fakeHumanRepo) GetOpenByCaseRun(_ context.Context, caseRunID int64) (*e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, row := range f.rows {
-		if row.CaseRunID != nil && *row.CaseRunID == caseRunID && row.Status == execution.HumanOpen {
+		if row.CaseRunID != nil && *row.CaseRunID == caseRunID && row.Status == execution.HumanPending {
 			copied := row
 			return &copied, nil
 		}
@@ -508,13 +508,23 @@ func (f *fakeHumanRepo) ListByVersion(context.Context, int64, string, int, *int6
 
 func (f *fakeHumanRepo) ListOpen(context.Context) ([]execution.HumanRequest, error) { return nil, nil }
 
+func (f *fakeHumanRepo) ListQuestions(context.Context, int64, string, int, *int64) ([]execution.HumanRequest, bool, error) {
+	return nil, false, nil
+}
+
 func (f *fakeHumanRepo) CountByCaseRun(context.Context, int64) (int, error) { return 0, nil }
 
 func (f *fakeHumanRepo) Transition(context.Context, int64, execution.HumanRequestStatus, execution.HumanRequestStatus, map[string]any, int64, time.Time) (bool, error) {
 	return false, nil
 }
 
+func (f *fakeHumanRepo) AttachMessage(context.Context, int64, int64) error { return nil }
+
 func (f *fakeHumanRepo) Expire(context.Context, time.Time) ([]execution.HumanRequest, error) {
+	return nil, nil
+}
+
+func (f *fakeHumanRepo) ExpireQuestions(context.Context, time.Time) ([]execution.HumanRequest, error) {
 	return nil, nil
 }
 

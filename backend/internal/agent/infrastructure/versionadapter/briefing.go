@@ -387,7 +387,7 @@ func loadBriefingOpenQuestions(ctx context.Context, tx pgx.Tx, versionID int64, 
 	rows, err := tx.Query(ctx, `
 		SELECT kind, COALESCE(payload ->> 'reason', '')
 		FROM human_request
-		WHERE version_id = $1 AND status = 'open'
+		WHERE version_id = $1 AND status = 'pending'
 		ORDER BY created_at, id
 		LIMIT $2
 	`, versionID, briefingOpenItemLimit)
