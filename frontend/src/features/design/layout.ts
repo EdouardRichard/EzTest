@@ -309,6 +309,22 @@ export function clampSplitPercent(value: number, min: number, max: number): numb
 }
 
 /**
+ * Resolves `window.localStorage` defensively. Browsers throw on the getter
+ * itself when storage is blocked (privacy mode, sandboxed iframe, disabled
+ * third-party storage), so a try/catch around getItem/setItem alone is not
+ * enough: the default-parameter read happens before either helper body runs.
+ * A blocked context degrades to the in-memory split default.
+ */
+function resolveSplitStorage(): Storage | null {
+  if (typeof window === "undefined") return null
+  try {
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+
+/**
  * Reads a persisted top-pane percentage. Invalid, missing or out-of-range
  * values fall back to the approved default; storage failures never break the
  * workspace (private mode / disabled storage).
@@ -318,9 +334,7 @@ export function readStoredSplit(
   fallback: number,
   min: number,
   max: number,
-  storage: Pick<Storage, "getItem"> | null = typeof window === "undefined"
-    ? null
-    : window.localStorage,
+  storage: Pick<Storage, "getItem"> | null = resolveSplitStorage(),
 ): number {
   if (storage === null) return fallback
   try {
@@ -338,9 +352,7 @@ export function readStoredSplit(
 export function writeStoredSplit(
   key: string,
   value: number,
-  storage: Pick<Storage, "setItem"> | null = typeof window === "undefined"
-    ? null
-    : window.localStorage,
+  storage: Pick<Storage, "setItem"> | null = resolveSplitStorage(),
 ): void {
   if (storage === null) return
   try {

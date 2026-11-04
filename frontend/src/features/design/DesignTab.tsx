@@ -675,7 +675,7 @@ export function DesignTab({
         minPercent={MIN_GRAPH_SPLIT}
         maxPercent={MAX_GRAPH_SPLIT}
         storageKey={DESIGN_SPLIT_STORAGE_KEYS.workbench}
-        ariaLabel="调整用例图与用例详情高度（双击复位）"
+        ariaLabel="调整用例图与用例详情高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
         topOverflow="auto"
         bottomOverflow="auto"
         className="min-h-0 flex-1"
@@ -749,7 +749,7 @@ export function DesignTab({
             <span className="text-[10px] text-muted-foreground">用例设计</span>
             <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
             <span data-testid="design-header-host" className="text-[10px] text-muted-foreground">
-              Design Host 单写者 · {sseLabel}
+              Design Host 单写者 · 事件通道：{sseLabel}
             </span>
             <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
               需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
@@ -834,7 +834,7 @@ export function DesignTab({
         minPercent={MIN_CHAT_SPLIT}
         maxPercent={MAX_CHAT_SPLIT}
         storageKey={DESIGN_SPLIT_STORAGE_KEYS.chat}
-        ariaLabel="调整设计对话与用例工作区高度（双击复位）"
+        ariaLabel="调整设计对话与用例工作区高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
         topCollapsed={chatCollapsed}
         topOverflow="hidden"
         bottomOverflow="hidden"

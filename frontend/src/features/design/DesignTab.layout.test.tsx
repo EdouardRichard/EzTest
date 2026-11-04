@@ -151,7 +151,9 @@ describe("DesignTab split layout (R-D2)", () => {
 
     expect(screen.getByTestId("design-header-version")).toHaveTextContent("2001")
     expect(within(header).getByText("用例设计")).toBeInTheDocument()
-    expect(screen.getByTestId("design-header-host")).toHaveTextContent("Design Host")
+    expect(screen.getByTestId("design-header-host")).toHaveTextContent("Design Host 单写者")
+    // The status label belongs to the version event channel, not host health.
+    expect(screen.getByTestId("design-header-host")).toHaveTextContent("事件通道：版本通道已连接")
     expect(screen.getByTestId("design-header-context")).toHaveTextContent("上下文水位")
     expect(screen.getByTestId("design-header-model")).toHaveTextContent("模型")
     expect(screen.getByTestId("design-stats")).toHaveTextContent("需求 2 · 场景 2 · 用例 3")
@@ -232,16 +234,16 @@ describe("DesignTab split layout (R-D2)", () => {
     mockHeight(mainSplit, 1000)
     mockHeight(workbenchSplit, 1000)
 
-    // Overshoot both directions: the panes keep their minimum heights.
+    // Overshoot both directions: the panes clamp exactly at their limits.
     dragDivider(mainDivider, 500, 1500)
-    expect(Number.parseFloat(mainTop.style.flexBasis)).toBeLessThanOrEqual(80)
+    expect(Number.parseFloat(mainTop.style.flexBasis)).toBe(80)
     dragDivider(mainDivider, 500, -1500)
-    expect(Number.parseFloat(mainTop.style.flexBasis)).toBeGreaterThanOrEqual(20)
+    expect(Number.parseFloat(mainTop.style.flexBasis)).toBe(20)
 
     dragDivider(workbenchDivider, 500, 1500)
-    expect(Number.parseFloat(graph.style.flexBasis)).toBeLessThanOrEqual(85)
+    expect(Number.parseFloat(graph.style.flexBasis)).toBe(85)
     dragDivider(workbenchDivider, 500, -1500)
-    expect(Number.parseFloat(graph.style.flexBasis)).toBeGreaterThanOrEqual(25)
+    expect(Number.parseFloat(graph.style.flexBasis)).toBe(25)
 
     // Double-click restores the approved defaults (40/60, 65/35).
     fireEvent.doubleClick(mainDivider)
@@ -249,11 +251,20 @@ describe("DesignTab split layout (R-D2)", () => {
     fireEvent.doubleClick(workbenchDivider)
     expect(graph.style.flexBasis).toBe("65%")
 
-    // Keyboard resize is the accessible equivalent of dragging.
+    // Keyboard resize is the accessible equivalent of dragging: arrows step
+    // ±5%, Home/End jump to the min/max split and the aria-label documents it.
+    expect(mainDivider).toHaveAttribute("aria-label", expect.stringContaining("Home 最小"))
+    expect(mainDivider).toHaveAttribute("aria-label", expect.stringContaining("End 最大"))
     fireEvent.keyDown(mainDivider, { key: "ArrowDown" })
     expect(mainTop.style.flexBasis).toBe("45%")
     fireEvent.keyDown(mainDivider, { key: "Home" })
-    expect(mainTop.style.flexBasis).toBe("40%")
+    expect(mainTop.style.flexBasis).toBe("20%")
+    fireEvent.keyDown(mainDivider, { key: "End" })
+    expect(mainTop.style.flexBasis).toBe("80%")
+    fireEvent.keyDown(workbenchDivider, { key: "Home" })
+    expect(graph.style.flexBasis).toBe("25%")
+    fireEvent.keyDown(workbenchDivider, { key: "End" })
+    expect(graph.style.flexBasis).toBe("85%")
   })
 
   it("opens the whole workbench as a 90vw×90vh dialog and closes with Escape", async () => {
@@ -261,7 +272,7 @@ describe("DesignTab split layout (R-D2)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "放大工作区" }))
 
-    const dialog = await screen.findByRole("dialog", { name: "脑图与用例详情" })
+    const dialog = await screen.findByRole("dialog", { name: "用例工作区" })
     expect(dialog).toHaveClass("w-[90vw]", "h-[90vh]")
 
     // Graph above detail, same live components (not a second copy).
@@ -283,12 +294,12 @@ describe("DesignTab split layout (R-D2)", () => {
     await renderWorkspace()
 
     fireEvent.click(screen.getByRole("button", { name: "放大工作区" }))
-    await screen.findByRole("dialog", { name: "脑图与用例详情" })
+    await screen.findByRole("dialog", { name: "用例工作区" })
     fireEvent.click(screen.getByRole("button", { name: "还原工作区" }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
 
     fireEvent.click(screen.getByRole("button", { name: "放大工作区" }))
-    await screen.findByRole("dialog", { name: "脑图与用例详情" })
+    await screen.findByRole("dialog", { name: "用例工作区" })
     fireEvent.click(screen.getByTestId("design-focus-backdrop"))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   })
@@ -322,6 +333,25 @@ describe("DesignTab split layout (R-D2)", () => {
     fireEvent.click(within(titleBar).getByTestId("design-chat-collapse-toggle"))
     expect(await screen.findByTestId("design-chat")).toBeInTheDocument()
     expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
+  })
+
+  it("collapses the chat on a narrow viewport with a normal height", async () => {
+    // Width alone triggers the collapse: 800px < 960px while the available
+    // height stays above the short-viewport band (900px viewport).
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(800)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(900)
+
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-mindmap")
+
+    const titleBar = await screen.findByTestId("design-chat-titlebar")
+    expect(within(titleBar).getByRole("heading", { name: "设计对话" })).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat")).not.toBeInTheDocument()
+
+    // The graph and detail stay available and no tabbed fallback is introduced.
+    expect(screen.getByTestId("design-graph")).toBeInTheDocument()
+    expect(screen.getByTestId("design-detail")).toBeInTheDocument()
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument()
   })
 
   it("collapses the chat when a resize enters the short-viewport band", async () => {

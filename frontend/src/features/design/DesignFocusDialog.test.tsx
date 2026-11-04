@@ -66,7 +66,7 @@ import { DesignTab } from "./DesignTab"
 import { designCaseDetailFixture, designGraphFixture, designOverviewFixture } from "./test-fixtures"
 
 const TIMESTAMP = "2026-10-31T12:00:00Z"
-const FOCUS_TITLE = "脑图与用例详情"
+const FOCUS_TITLE = "用例工作区"
 
 const designConversation: ConversationSummary = {
   id: "4009",

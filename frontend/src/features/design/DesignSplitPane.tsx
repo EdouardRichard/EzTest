@@ -54,7 +54,7 @@ type DragState = {
 /**
  * Vertical two-pane splitter with the accessible divider contract from the
  * approved v0.22 UI: pointer drag, double-click reset, ArrowUp/ArrowDown (5%)
- * and Home reset. The top share is persisted in `localStorage`, so the
+ * and Home/End (min/max). The top share is persisted in `localStorage`, so the
  * approved 40/60 and 65/35 ratios survive a refresh per user.
  *
  * It is deliberately presentation-only: the panes keep their own scroll and
@@ -130,9 +130,9 @@ export function DesignSplitPane({
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>): void {
     if (topCollapsed) return
-    if (event.key === "Home") {
+    if (event.key === "Home" || event.key === "End") {
       event.preventDefault()
-      reset()
+      setPercent(event.key === "Home" ? minPercent : maxPercent)
       return
     }
     if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return
