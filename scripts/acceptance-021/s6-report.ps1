@@ -414,7 +414,7 @@ try {
             # Direct intent cancel (open intent) as a separate API assertion.
             $cancelIntentRecord = $null
             if ($confirmedCaseVersions.Count -ge 1) {
-                $manualIntent = New-AcceptanceManualIntent -Context $context -VersionId $versionId -CaseVersionId $confirmedCaseVersions[0] -Purpose "retest"
+                $manualIntent = New-AcceptanceManualIntent -Context $context -VersionId $versionId -CaseVersionId $confirmedCaseVersions[0] -Purpose "manual"
                 if ($manualIntent.Ok) {
                     $manualIntentId = [string](Get-JsonProp -Object $manualIntent.Data -Name "id" -Default "")
                     $intentCancel = Invoke-AcceptanceIntentCancel -Context $context -VersionId $versionId -IntentId $manualIntentId
