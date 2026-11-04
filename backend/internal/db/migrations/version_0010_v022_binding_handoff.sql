@@ -97,7 +97,9 @@ CREATE UNIQUE INDEX uk_test_account_username ON test_account (lower(username));
 
 -- DB-22: the clarification -> design handoff pack. One row per revision;
 -- version_id is a logical version-context reference (no cross-context FK,
--- Agent.md §6.9.7). A regenerate writes the next revision.
+-- Agent.md §6.9.7). A regenerate writes the next revision. The handoff is
+-- generated/refreshed from clarification state, so it is mutable and keeps the
+-- standard created_at/updated_at audit pair (Agent.md §6.9.4, ruling C10).
 CREATE TABLE clarification_handoff (
     id          BIGINT NOT NULL,
     version_id  BIGINT NOT NULL,
@@ -107,6 +109,7 @@ CREATE TABLE clarification_handoff (
                 CONSTRAINT chk_clarification_handoff_content
                 CHECK (jsonb_typeof(content) = 'object'),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT pk_clarification_handoff PRIMARY KEY (id),
     CONSTRAINT uk_clarification_handoff_version_revision UNIQUE (version_id, revision)
 );

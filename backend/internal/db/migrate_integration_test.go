@@ -1284,6 +1284,11 @@ func TestV022CSchema(t *testing.T) {
 		requireTable(t, pool, table)
 	}
 
+	// DB-22 / Agent.md §6.9.4 (audit fields): the handoff is generated and then
+	// refreshed in place, so like the other mutable v0.22 tables it carries both
+	// created_at and updated_at.
+	requireColumn(t, pool, "clarification_handoff", "updated_at")
+
 	// D34 / Agent.md §6.9.5: the new tables name their primary-key constraints
 	// pk_<table> instead of PostgreSQL's implicit <table>_pkey.
 	for _, constraint := range []string{
@@ -1318,6 +1323,9 @@ func TestV022CSchema(t *testing.T) {
 		WHERE schemaname = current_schema() AND indexname = 'uk_test_account_username'
 	`).Scan(&testAccountIndexDef); err != nil {
 		t.Fatalf("read uk_test_account_username: %v", err)
+	}
+	if !strings.Contains(testAccountIndexDef, "UNIQUE INDEX") {
+		t.Errorf("uk_test_account_username is not unique: %s", testAccountIndexDef)
 	}
 	if !strings.Contains(testAccountIndexDef, "lower(") || !strings.Contains(testAccountIndexDef, "username") {
 		t.Errorf("uk_test_account_username does not cover lower(username): %s", testAccountIndexDef)
