@@ -55,12 +55,21 @@ func NewFactRepository(pool *pgxpool.Pool, ids platformid.Generator) *FactReposi
 
 // Record appends one fact. The unique (version_id, kind, key, content_hash)
 // index deduplicates an identical fact (the stored row is returned, conflict
-// false). A different hash under the same (version, kind, key) is resolved by
+// false). That dedupe is intentional idempotency (Lead ruling C14): the stored
+// row may be a superseded historical fact, and it is returned unchanged --
+// never resurrected, rewritten or treated as the new current value -- so a
+// higher confidence on the replayed payload cannot supersede the current row.
+// Callers detect the dedupe by comparing the assigned ID with the returned ID;
+// the application service exposes it as FactRecordOutcome.AlreadyRecorded.
+//
+// A different hash under the same (version, kind, key) is resolved by
 // versionapp.ResolveFactAppend inside the same transaction as the append: a
 // not-lower confidence sets the old row's superseded_by to the new fact, a
 // lower/unknown confidence stores the new row already superseded by the old
 // one, and two high-confidence contradictions stay current and report
-// conflict=true for the host to arbitrate.
+// conflict=true for the host to arbitrate. Once an unresolved conflict group
+// exists, a further append joins it as current regardless of confidence (the
+// pinned conflict-group policy in ResolveFactAppend).
 func (r *FactRepository) Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error) {
 	if fact.VersionID <= 0 {
 		return version.Fact{}, false, fmt.Errorf("record fact: version id must be positive")
@@ -93,7 +102,9 @@ func (r *FactRepository) Record(ctx context.Context, fact version.Fact) (version
 	`, fact.VersionID, fact.Kind, fact.Key, fact.ContentHash))
 	switch {
 	case err == nil:
-		// Same (version, kind, key, hash): append-only dedupe, nothing written.
+		// Same (version, kind, key, hash): C14 intentional idempotency. Return
+		// the historical row unchanged (it may already be superseded) and write
+		// nothing: no supersede of the current row, no conflict, no event.
 		return existing, false, nil
 	case !errors.Is(err, pgx.ErrNoRows):
 		return version.Fact{}, false, fmt.Errorf("record fact: lookup identical fact: %w", err)
@@ -216,6 +227,12 @@ func (r *FactRepository) Current(ctx context.Context, versionID int64, kind stri
 // Arbitrate marks dropID superseded by keepID. Both rows must exist, be
 // current and share the same (version_id, kind, key). Only superseded_by is
 // written; the losing fact body and every other row are preserved (D28).
+//
+// Deprecated: this is the legacy pairwise write required by the frozen
+// version.FactRepository port. It has no conflict-group selection and no
+// version/actor context, so it cannot publish fact.arbitrated or write the
+// audit record and bypasses the v0.22 arbitration audit trail. Production code
+// must call ArbitrateFact; there are no production callers of this method.
 func (r *FactRepository) Arbitrate(ctx context.Context, keepID, dropID int64) error {
 	if keepID <= 0 || dropID <= 0 || keepID == dropID {
 		return fmt.Errorf("arbitrate facts: keep and drop must be positive and distinct")

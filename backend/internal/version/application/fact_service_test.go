@@ -61,7 +61,9 @@ func (f *fakeFactRepo) Current(_ context.Context, versionID int64, kind string) 
 	return current, nil
 }
 
-// Arbitrate is the legacy pairwise write retained for compatibility.
+// Arbitrate is the deprecated legacy pairwise write retained because the frozen
+// version.FactRepository port requires it. It has no event/audit side effects;
+// production code uses ArbitrateFact.
 func (f *fakeFactRepo) Arbitrate(_ context.Context, keepID, dropID int64) error {
 	keep, ok := f.facts[keepID]
 	if !ok {
@@ -145,7 +147,29 @@ func (f *fakeFactRepo) rowsByKey(versionID int64, kind, key string) []version.Fa
 
 func (f *fakeFactRepo) count() int { return len(f.facts) }
 
-var _ version.FactRepository = (*fakeFactRepo)(nil)
+// appendOnlyFactRepo is a version.FactRepository without the optional
+// factArbitrationStore capability: append/read/legacy-arbitrate are available,
+// but the atomic whole-group arbitration write is not. A degraded assembly like
+// this must make the service answer a typed 503 instead of attempting a
+// partial write.
+type appendOnlyFactRepo struct{ repo *fakeFactRepo }
+
+func (f *appendOnlyFactRepo) Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error) {
+	return f.repo.Record(ctx, fact)
+}
+
+func (f *appendOnlyFactRepo) Current(ctx context.Context, versionID int64, kind string) ([]version.Fact, error) {
+	return f.repo.Current(ctx, versionID, kind)
+}
+
+func (f *appendOnlyFactRepo) Arbitrate(ctx context.Context, keepID, dropID int64) error {
+	return f.repo.Arbitrate(ctx, keepID, dropID)
+}
+
+var (
+	_ version.FactRepository = (*fakeFactRepo)(nil)
+	_ version.FactRepository = (*appendOnlyFactRepo)(nil)
+)
 
 // ---------- fact service test environment ----------
 
@@ -198,14 +222,19 @@ func findFactEvent(t *testing.T, publisher *fakePublisher, eventType string) eve
 	return eventingapp.Event{}
 }
 
-func countFactEvents(publisher *fakePublisher, eventType string) int {
-	count := 0
+// factEventsOfType returns the published events of one type in publish order.
+func factEventsOfType(publisher *fakePublisher, eventType string) []eventingapp.Event {
+	events := make([]eventingapp.Event, 0)
 	for _, event := range publisher.events {
 		if event.Type == eventType {
-			count++
+			events = append(events, event)
 		}
 	}
-	return count
+	return events
+}
+
+func countFactEvents(publisher *fakePublisher, eventType string) int {
+	return len(factEventsOfType(publisher, eventType))
 }
 
 // ---------- append resolution ----------
@@ -259,6 +288,81 @@ func TestFactSupersedesOldValue(t *testing.T) {
 			t.Fatalf("old superseded_by = %#v, want %d", stored.SupersededBy, newer.ID)
 		}
 	})
+}
+
+// TestFactDeduplicatesSupersededContent pins Lead ruling C14: the unique
+// (version_id, kind, key, content_hash) index is intentional idempotency. A
+// re-append of a payload that was previously superseded returns the historical
+// row unchanged (it does not resurrect or rewrite it, and the higher confidence
+// on the replay does not supersede the current row); the outcome is explicitly
+// flagged AlreadyRecorded and no fact.recorded/fact.conflict/fact.arbitrated
+// event claims a new append or a conflict.
+func TestFactDeduplicatesSupersededContent(t *testing.T) {
+	env := newFactTestEnv(t)
+	old, conflict := env.append(t, 7, "decision", "refund", map[string]any{"value": "T+1"}, float64Ptr(0.6))
+	if conflict {
+		t.Fatal("first fact reported a conflict")
+	}
+	current, conflict := env.append(t, 7, "decision", "refund", map[string]any{"value": "T+3"}, float64Ptr(0.7))
+	if conflict {
+		t.Fatal("a supersede must not be reported as a conflict")
+	}
+	if stored := env.repo.Get(old.ID); stored.SupersededBy == nil || *stored.SupersededBy != current.ID {
+		t.Fatalf("old superseded_by = %#v, want %d", stored.SupersededBy, current.ID)
+	}
+	eventsBefore := len(env.events.events)
+
+	outcome, err := env.service.RecordFact(context.Background(), version.Fact{
+		VersionID:  7,
+		Kind:       "decision",
+		Key:        "refund",
+		Payload:    map[string]any{"value": "T+1"},
+		Confidence: float64Ptr(0.9),
+		Source:     "host",
+	})
+	if err != nil {
+		t.Fatalf("RecordFact superseded content: %v", err)
+	}
+	if !outcome.AlreadyRecorded {
+		t.Fatal("same-content re-append was not flagged already_recorded/deduplicated")
+	}
+	if outcome.Conflict {
+		t.Fatal("a deduplicated historical row must not claim a new conflict")
+	}
+	if outcome.Fact.ID != old.ID {
+		t.Fatalf("replay fact id = %d, want the historical row %d", outcome.Fact.ID, old.ID)
+	}
+	if outcome.Fact.SupersededBy == nil || *outcome.Fact.SupersededBy != current.ID {
+		t.Fatalf("replay superseded_by = %#v, want %d (no resurrection)", outcome.Fact.SupersededBy, current.ID)
+	}
+	if outcome.Fact.Confidence == nil || *outcome.Fact.Confidence != 0.6 {
+		t.Fatalf("replay confidence = %#v, want the historical 0.6 (row unchanged)", outcome.Fact.Confidence)
+	}
+	if outcome.Fact.ContentHash != old.ContentHash {
+		t.Fatalf("replay content hash %q, want historical %q", outcome.Fact.ContentHash, old.ContentHash)
+	}
+	if env.repo.count() != 2 {
+		t.Fatalf("history rows = %d, want 2 (no duplicate append)", env.repo.count())
+	}
+	facts, err := env.service.Current(context.Background(), 7, "decision")
+	if err != nil {
+		t.Fatalf("Current after replay: %v", err)
+	}
+	if len(facts) != 1 || facts[0].ID != current.ID {
+		t.Fatalf("current after replay = %#v, want only the newer fact %d", facts, current.ID)
+	}
+	if len(env.events.events) != eventsBefore {
+		t.Fatalf("replay published events: %v", eventTypes(env.events))
+	}
+	if got := countFactEvents(env.events, "fact.recorded"); got != 2 {
+		t.Fatalf("fact.recorded events = %d, want only the two real appends", got)
+	}
+	if got := countFactEvents(env.events, "fact.conflict"); got != 0 {
+		t.Fatalf("fact.conflict events = %d, want 0", got)
+	}
+	if got := countFactEvents(env.events, "fact.arbitrated"); got != 0 {
+		t.Fatalf("fact.arbitrated events = %d, want 0", got)
+	}
 }
 
 // TestFactLowConfidenceDoesNotSupersede pins the negative side of R-B6-1: a
@@ -450,6 +554,60 @@ func TestFactConflictArbitrated(t *testing.T) {
 	})
 }
 
+// TestFactConflictGroupThreeWayPolicy pins the pinned conflict-group policy: a
+// low-confidence fact appended to an existing high-high conflict joins the
+// group as a third current row and reports conflict. It is NOT silently
+// superseded by, and does not silently supersede, either high-confidence row:
+// any automatic winner would resolve the host decision behind its back, so the
+// whole group stays current until the host arbitrates it (keep drops every
+// competitor; a bare drop in a >2 group is ErrFactArbitrationAmbiguous).
+func TestFactConflictGroupThreeWayPolicy(t *testing.T) {
+	env := newFactTestEnv(t)
+	highA, conflict := env.append(t, 7, "decision", "refund", map[string]any{"value": "A"}, float64Ptr(0.9))
+	if conflict {
+		t.Fatal("first high-confidence fact reported a conflict")
+	}
+	highB, conflict := env.append(t, 7, "decision", "refund", map[string]any{"value": "B"}, float64Ptr(0.9))
+	if !conflict {
+		t.Fatal("two high-confidence contradictions did not report a conflict")
+	}
+
+	low, conflict := env.append(t, 7, "decision", "refund", map[string]any{"value": "C"}, float64Ptr(0.2))
+	if !conflict {
+		t.Fatal("a low-confidence append into an existing conflict group did not report a conflict")
+	}
+	if low.SupersededBy != nil {
+		t.Fatalf("low-confidence group member superseded_by = %#v, want it current", low.SupersededBy)
+	}
+	for _, high := range []version.Fact{highA, highB} {
+		if stored := env.repo.Get(high.ID); stored.SupersededBy != nil {
+			t.Fatalf("high-confidence row %d was superseded by the low-confidence append: %#v", high.ID, stored.SupersededBy)
+		}
+	}
+	current, err := env.service.Current(context.Background(), 7, "decision")
+	if err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if len(current) != 3 {
+		t.Fatalf("current = %#v, want the three-member conflict group", current)
+	}
+	if env.repo.count() != 3 {
+		t.Fatalf("history rows = %d, want 3 (append-only)", env.repo.count())
+	}
+
+	conflicts := factEventsOfType(env.events, "fact.conflict")
+	if len(conflicts) != 2 {
+		t.Fatalf("fact.conflict events = %d, want one per append into the group", len(conflicts))
+	}
+	if conflicts[1].Payload["fact_id"] != strconv.FormatInt(low.ID, 10) {
+		t.Fatalf("latest fact.conflict fact_id = %#v, want the low-confidence member %d",
+			conflicts[1].Payload["fact_id"], low.ID)
+	}
+	if got := countFactEvents(env.events, "fact.arbitrated"); got != 0 {
+		t.Fatalf("fact.arbitrated events = %d, want 0 before the host decides", got)
+	}
+}
+
 // TestFactAppendOnlyAndConflict keeps the pre-existing append-only contract:
 // duplicate rows are deduplicated by content hash, contradictory high-confidence
 // rows coexist, and the legacy pairwise Arbitrate only writes superseded_by.
@@ -462,6 +620,13 @@ func TestFactAppendOnlyAndConflict(t *testing.T) {
 	}
 	if first.ID == 0 || len(first.ContentHash) != 64 {
 		t.Fatalf("first fact = %#v, want an assigned ID and SHA-256 content hash", first)
+	}
+	recordedEvents := factEventsOfType(env.events, "fact.recorded")
+	if len(recordedEvents) != 1 {
+		t.Fatalf("fact.recorded events after first append = %d, want 1", len(recordedEvents))
+	}
+	if recordedEvents[0].Payload["conflict"] != false {
+		t.Fatalf("fact.recorded conflict flag = %#v, want false for a plain append", recordedEvents[0].Payload["conflict"])
 	}
 
 	reordered := map[string]any{"title": "结算", "url": "/checkout"}
@@ -479,6 +644,14 @@ func TestFactAppendOnlyAndConflict(t *testing.T) {
 	second, conflict := env.append(t, 7, "page", "checkout", map[string]any{"url": "/checkout-v2"}, float64Ptr(0.9))
 	if !conflict {
 		t.Fatal("different high-confidence payload under the same key did not report a conflict")
+	}
+	recordedEvents = factEventsOfType(env.events, "fact.recorded")
+	if len(recordedEvents) != 2 {
+		t.Fatalf("fact.recorded events after conflict append = %d, want 2", len(recordedEvents))
+	}
+	if recordedEvents[0].Payload["conflict"] != false || recordedEvents[1].Payload["conflict"] != true {
+		t.Fatalf("fact.recorded conflict flags = %#v/%#v, want false then true",
+			recordedEvents[0].Payload["conflict"], recordedEvents[1].Payload["conflict"])
 	}
 	if second.ID == first.ID || second.ContentHash == first.ContentHash || env.repo.count() != 2 {
 		t.Fatalf("conflicting fact = %#v rows=%d", second, env.repo.count())
@@ -595,6 +768,29 @@ func TestFactArbitrationErrors(t *testing.T) {
 		}
 	})
 
+}
+
+// TestFactArbitrationWithoutStoreCapability pins the degraded assembly: a
+// repository that only implements the frozen FactRepository port cannot resolve
+// a whole conflict group atomically, so ArbitrateFact answers 503 instead of
+// falling back to the legacy pairwise write (which would bypass
+// fact.arbitrated and the audit record).
+func TestFactArbitrationWithoutStoreCapability(t *testing.T) {
+	repo := &appendOnlyFactRepo{repo: newFakeFactRepo()}
+	service := versionapp.NewFactService(repo, &seqIDs{}, nil)
+	first, _, err := service.Record(context.Background(), version.Fact{
+		VersionID: 7, Kind: "decision", Key: "refund",
+		Payload: map[string]any{"value": "T+1"}, Confidence: float64Ptr(0.9), Source: "host",
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	_, err = service.ArbitrateFact(context.Background(), 7, first.ID,
+		versionapp.FactArbitrationKeep, "keep T+1", 42)
+	apiErr := apiError(t, err)
+	if apiErr.Status != 503 || apiErr.Code != "unavailable" {
+		t.Fatalf("missing-capability error = %+v, want 503 unavailable", apiErr)
+	}
 }
 
 // ---------- pure resolution rules ----------

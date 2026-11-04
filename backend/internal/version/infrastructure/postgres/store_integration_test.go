@@ -261,6 +261,41 @@ func TestFactRepositoryAutoSupersedeConflictAndArbitrate(t *testing.T) {
 	}
 	snapshot("after not-lower-confidence append (supersede)")
 
+	// C14: re-appending the exact payload of the now-superseded row is an
+	// intentional unique-index no-op. The historical row is returned unchanged
+	// (still superseded by the current row); the higher replay confidence does
+	// not supersede the current row and no new row is inserted.
+	replayed, conflict := record("refund", map[string]any{"value": "T+1"}, confidence(0.9))
+	if conflict {
+		t.Fatal("same-content replay reported a conflict")
+	}
+	if replayed.ID != old.ID {
+		t.Fatalf("replay id = %d, want the historical row %d", replayed.ID, old.ID)
+	}
+	if replayed.SupersededBy == nil || *replayed.SupersededBy != newer.ID {
+		t.Fatalf("replay superseded_by = %#v, want %d (no resurrection)", replayed.SupersededBy, newer.ID)
+	}
+	if replayed.Confidence == nil || *replayed.Confidence != 0.6 {
+		t.Fatalf("replay confidence = %#v, want the historical 0.6 (row unchanged)", replayed.Confidence)
+	}
+	if count := countFacts(t, pool, versionID); count != 2 {
+		t.Fatalf("fact rows after same-content replay = %d, want 2", count)
+	}
+	if err := pool.QueryRow(ctx, `SELECT superseded_by FROM version_fact WHERE id = $1`, newer.ID).Scan(&supersededBy); err != nil {
+		t.Fatalf("read current superseded_by after replay: %v", err)
+	}
+	if supersededBy != nil {
+		t.Fatalf("current row superseded by same-content replay: %#v", supersededBy)
+	}
+	current, err = repo.Current(ctx, versionID, "decision")
+	if err != nil {
+		t.Fatalf("Current after replay: %v", err)
+	}
+	if len(current) != 1 || current[0].ID != newer.ID {
+		t.Fatalf("current after replay = %#v, want only %d", current, newer.ID)
+	}
+	snapshot("after same-content replay of a superseded fact (C14 no-op)")
+
 	// A lower confidence cannot replace the current value; it is stored as
 	// history superseded by the winner (no duplicate current row).
 	lower, conflict := record("refund", map[string]any{"value": "T+1 old"}, confidence(0.4))

@@ -56,6 +56,38 @@ func newFactArbitrationServer(svc versionapi.FactArbitrationService) http.Handle
 	return mux
 }
 
+// TestRegisterFactRoutesMountsBehindAuth pins the Task 37 seam: the exported
+// registration helper mounts the arbitration route through the supplied
+// authentication middleware, so the handler sees the actor the server auth
+// layer injects (the handler itself must still reject an unauthenticated
+// request, covered above).
+func TestRegisterFactRoutesMountsBehindAuth(t *testing.T) {
+	svc := &fakeFactArbitrationService{
+		results: []versionapp.FactArbitration{factArbitrationResult(versionapp.FactArbitrationKeep)},
+	}
+	mux := http.NewServeMux()
+	authCalls := 0
+	auth := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authCalls++
+			next.ServeHTTP(w, r.WithContext(platform.WithActor(r.Context(), *actor())))
+		})
+	}
+	versionapi.RegisterFactRoutes(mux, auth, versionapi.NewFactHandler(svc))
+
+	recorder := call(t, mux, http.MethodPost, "/api/versions/7/facts/2/arbitrate",
+		`{"decision":"keep","reason":"host prefers T+3"}`, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if authCalls != 1 {
+		t.Fatalf("auth middleware calls = %d, want 1 (route must be auth-wrapped)", authCalls)
+	}
+	if len(svc.calls) != 1 || svc.calls[0].actorID != 42 {
+		t.Fatalf("service calls = %+v, want one call with the authenticated actor", svc.calls)
+	}
+}
+
 func factArbitrationResult(decision versionapp.FactArbitrationDecision) versionapp.FactArbitration {
 	keepID := int64(2)
 	dropped := int64(1)
@@ -125,9 +157,9 @@ func TestFactArbitrateHandler(t *testing.T) {
 			if body["keep_id"] != tc.wantKeepID || body["changed"] != true {
 				t.Fatalf("response outcome = %#v", body)
 			}
-			drops, ok := body["drop_ids"].([]any)
+			drops, ok := body["dropped_ids"].([]any)
 			if !ok || len(drops) != tc.wantDropIDs {
-				t.Fatalf("response drop_ids = %#v", body["drop_ids"])
+				t.Fatalf("response dropped_ids = %#v", body["dropped_ids"])
 			}
 			current, ok := body["current"].([]any)
 			if !ok || len(current) != 1 {
@@ -246,6 +278,18 @@ func TestFactArbitrateHandlerActorAndUnavailable(t *testing.T) {
 			"/api/versions/7/facts/2/arbitrate", `{"decision":"keep","reason":"keep it"}`, actor())
 		if recorder.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+	})
+
+	t.Run("missing store capability", func(t *testing.T) {
+		svc := &fakeFactArbitrationService{err: platform.Unavailable("fact arbitration is not configured")}
+		recorder := call(t, newFactArbitrationServer(svc), http.MethodPost,
+			"/api/versions/7/facts/2/arbitrate", `{"decision":"keep","reason":"keep it"}`, actor())
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		if code := errorBody(t, recorder)["code"]; code != "unavailable" {
+			t.Fatalf("code = %#v, want unavailable", code)
 		}
 	})
 }

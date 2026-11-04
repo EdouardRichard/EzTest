@@ -48,6 +48,19 @@ type FactAppendDecision struct {
 	SupersedeNewBy  *int64
 }
 
+// FactRecordOutcome is the result of one fact append through the service.
+// AlreadyRecorded is the explicit dedupe signal (Lead ruling C14): the
+// (version_id, kind, key, content_hash) tuple already exists, so the historical
+// row is returned unchanged instead of appending again. Such a row can be
+// superseded; callers must inspect Fact.SupersededBy/Current instead of
+// assuming the returned fact is current, and Conflict is never true for a
+// deduplicated append.
+type FactRecordOutcome struct {
+	Fact            version.Fact
+	Conflict        bool
+	AlreadyRecorded bool
+}
+
 // FactArbitration is the resolved state of one conflict arbitration.
 type FactArbitration struct {
 	VersionID  int64
@@ -108,6 +121,14 @@ func NewFactService(repo version.FactRepository, ids platformid.Generator, event
 // supersedes the old row; a lower/unknown new confidence leaves the old row
 // current and stores the new row as immediately superseded, so no duplicate
 // current row is left without a conflict (R-B6-3).
+//
+// Conflict-group policy (pinned): once two or more current rows of the same key
+// coexist, every further append joins the group as another current row and
+// reports Conflict, regardless of the new confidence. Choosing a winner or
+// storing the new fact as already superseded by one of the conflicting rows
+// would silently resolve the host decision, so the conflict keeps growing until
+// the host arbitrates it. A replace/keep decision then drops every competitor;
+// a bare drop in a >2 group is ErrFactArbitrationAmbiguous.
 func ResolveFactAppend(current []version.Fact, fact version.Fact) FactAppendDecision {
 	switch len(current) {
 	case 0:
@@ -281,47 +302,74 @@ func currentFactsAfter(current []version.Fact, droppedIDs []int64) []version.Fac
 	return kept
 }
 
-// Record appends one fact. Equal (version, kind, key, content_hash) input is
-// not appended again: the stored row is returned with the same ID. Otherwise
-// the store applies ResolveFactAppend: a not-lower confidence supersedes the
-// current row, a lower/unknown confidence is stored as superseded, and two
-// high-confidence contradictions coexist and report conflict=true. Nothing is
-// ever overwritten or deleted, and conflicts are not errors (D28).
+// RecordFact records one fact and reports the append outcome explicitly. It is
+// the outcome-aware variant of Record for callers that must distinguish a real
+// append from the intentional content-hash dedupe (Lead ruling C14).
+//
+// Equal (version, kind, key, content_hash) input is not appended again: the
+// stored row is returned with AlreadyRecorded=true. That row may be a
+// superseded historical fact; it is returned unchanged and is never
+// resurrected, rewritten or claimed as a new current fact. Otherwise the store
+// applies ResolveFactAppend: a not-lower confidence supersedes the current row,
+// a lower/unknown confidence is stored as superseded, and two high-confidence
+// contradictions coexist and report conflict=true. Nothing is ever overwritten
+// or deleted, and conflicts are not errors (D28).
 //
 // The caller-supplied ID is ignored: the store owns fact identity, which also
-// lets Record distinguish a real append from an idempotent duplicate by
+// lets the service distinguish a real append from an idempotent duplicate by
 // comparing the assigned ID with the stored one. fact.recorded and
 // fact.conflict are published only for a real append.
-func (s *FactService) Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error) {
+func (s *FactService) RecordFact(ctx context.Context, fact version.Fact) (FactRecordOutcome, error) {
 	if fact.SupersededBy != nil {
-		return version.Fact{}, false, platform.Invalid("superseded_by", "a newly recorded fact must be current")
+		return FactRecordOutcome{}, platform.Invalid("superseded_by", "a newly recorded fact must be current")
 	}
 	fact.Normalize()
 	contentHash, err := version.FactContentHash(fact.Payload)
 	if err != nil {
-		return version.Fact{}, false, platform.Invalid("payload", "must be a JSON object")
+		return FactRecordOutcome{}, platform.Invalid("payload", "must be a JSON object")
 	}
 	if fact.ContentHash != "" && fact.ContentHash != contentHash {
-		return version.Fact{}, false, platform.Invalid("content_hash", "does not match the canonical payload hash")
+		return FactRecordOutcome{}, platform.Invalid("content_hash", "does not match the canonical payload hash")
 	}
 	fact.ContentHash = contentHash
 	if err := fact.Validate(); err != nil {
-		return version.Fact{}, false, err
+		return FactRecordOutcome{}, err
 	}
 
 	assignedID := s.ids.Next()
 	fact.ID = assignedID
 	stored, conflict, err := s.repo.Record(ctx, fact)
 	if err != nil {
-		return version.Fact{}, false, mapFactRepositoryError(err)
+		return FactRecordOutcome{}, mapFactRepositoryError(err)
 	}
-	if stored.ID == assignedID {
-		s.recordAppended(ctx, stored, conflict, true)
-		if conflict {
-			s.recordConflict(ctx, stored)
-		}
+	outcome := FactRecordOutcome{Fact: stored, Conflict: conflict}
+	if stored.ID != assignedID {
+		// C14: intentional idempotency. The unique (version, kind, key,
+		// content_hash) index returned an existing row, which can be a
+		// superseded historical fact. Return that row unchanged, flag the
+		// dedupe explicitly, and never claim a new append/conflict/current fact
+		// (no fact.recorded/fact.conflict event is published).
+		outcome.Conflict = false
+		outcome.AlreadyRecorded = true
+		return outcome, nil
 	}
-	return stored, conflict, nil
+	s.recordAppended(ctx, stored, conflict, true)
+	if conflict {
+		s.recordConflict(ctx, stored)
+	}
+	return outcome, nil
+}
+
+// Record is the legacy row/conflict signature retained for the existing fact
+// producers. It delegates to RecordFact; callers that must distinguish a
+// deduplicated historical row from a new append must use RecordFact and its
+// AlreadyRecorded flag.
+func (s *FactService) Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error) {
+	outcome, err := s.RecordFact(ctx, fact)
+	if err != nil {
+		return version.Fact{}, false, err
+	}
+	return outcome.Fact, outcome.Conflict, nil
 }
 
 // Current returns the effective facts (superseded_by IS NULL) of one version.
@@ -340,9 +388,15 @@ func (s *FactService) Current(ctx context.Context, versionID int64, kind string)
 // Arbitrate resolves a coexisting conflict by marking drop superseded by keep.
 // The dropped row is not deleted and its content is unchanged; Current then
 // returns only the kept fact (D28). decision is the required arbitration
-// rationale; the frozen version_fact schema has no decision column and the
-// 0.2.1 event contract defines no arbitration event, so this store does not
-// persist the rationale.
+// rationale; the frozen version_fact schema has no decision column, so this
+// store does not persist the rationale.
+//
+// Deprecated: this is the legacy pairwise write kept only for the frozen
+// version.FactRepository contract and compatibility tests. It performs a bare
+// pairwise superseded_by write with no conflict-group selection and no
+// version/actor context, so it cannot publish fact.arbitrated or write the
+// audit record and thus bypasses the v0.22 arbitration audit trail. Production
+// code must call ArbitrateFact; there are no production callers of this method.
 func (s *FactService) Arbitrate(ctx context.Context, keep, drop int64, decision string) error {
 	if keep <= 0 {
 		return platform.Invalid("keep", "must be a positive decimal ID")

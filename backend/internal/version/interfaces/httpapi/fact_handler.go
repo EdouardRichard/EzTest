@@ -104,19 +104,20 @@ type factArbitrationFactDTO struct {
 
 // factArbitrationDTO is the API-13 response payload (rendered inside the shared
 // {data} envelope by httpx.JSON): the applied decision, the winning row and the
-// current rows of the key after the arbitration. The Task 37 OpenAPI schema
-// must mirror it.
+// current rows of the key after the arbitration. dropped_ids uses the same name
+// as the fact.arbitrated event payload and the audit metadata (drop_ids is not
+// used anywhere); the Task 37 OpenAPI schema must mirror it.
 type factArbitrationDTO struct {
-	VersionID string                   `json:"version_id"`
-	FactID    string                   `json:"fact_id"`
-	Kind      string                   `json:"kind"`
-	Key       string                   `json:"key"`
-	Decision  string                   `json:"decision"`
-	Reason    string                   `json:"reason"`
-	KeepID    string                   `json:"keep_id"`
-	DropIDs   []string                 `json:"drop_ids"`
-	Changed   bool                     `json:"changed"`
-	Current   []factArbitrationFactDTO `json:"current"`
+	VersionID  string                   `json:"version_id"`
+	FactID     string                   `json:"fact_id"`
+	Kind       string                   `json:"kind"`
+	Key        string                   `json:"key"`
+	Decision   string                   `json:"decision"`
+	Reason     string                   `json:"reason"`
+	KeepID     string                   `json:"keep_id"`
+	DroppedIDs []string                 `json:"dropped_ids"`
+	Changed    bool                     `json:"changed"`
+	Current    []factArbitrationFactDTO `json:"current"`
 }
 
 func toFactArbitrationDTO(outcome versionapp.FactArbitration) factArbitrationDTO {
@@ -136,15 +137,15 @@ func toFactArbitrationDTO(outcome versionapp.FactArbitration) factArbitrationDTO
 		dropped = append(dropped, formatDecimal(id))
 	}
 	return factArbitrationDTO{
-		VersionID: formatDecimal(outcome.VersionID),
-		FactID:    formatDecimal(outcome.FactID),
-		Kind:      outcome.Kind,
-		Key:       outcome.Key,
-		Decision:  string(outcome.Decision),
-		Reason:    outcome.Reason,
-		KeepID:    formatDecimal(outcome.KeepID),
-		DropIDs:   dropped,
-		Changed:   outcome.Changed,
-		Current:   current,
+		VersionID:  formatDecimal(outcome.VersionID),
+		FactID:     formatDecimal(outcome.FactID),
+		Kind:       outcome.Kind,
+		Key:        outcome.Key,
+		Decision:   string(outcome.Decision),
+		Reason:     outcome.Reason,
+		KeepID:     formatDecimal(outcome.KeepID),
+		DroppedIDs: dropped,
+		Changed:    outcome.Changed,
+		Current:    current,
 	}
 }
