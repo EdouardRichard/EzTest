@@ -96,7 +96,8 @@ function Get-LatestPacket {
 }
 
 try {
-    $injectedPacketId = ""`n    Write-AcceptanceLog -Scenario $scenario -Message "S9 knowledge acceptance; injectionTimeout=${InjectionTimeoutSeconds}s revokeTimeout=${RevokeTimeoutSeconds}s token=$token"
+    $injectedPacketId = ""
+    Write-AcceptanceLog -Scenario $scenario -Message "S9 knowledge acceptance; injectionTimeout=${InjectionTimeoutSeconds}s revokeTimeout=${RevokeTimeoutSeconds}s token=$token"
 
     $login = Connect-EzTest -Context $context
     Add-AcceptanceCheck -Scenario $scenario -Name "EzTest admin login" -Passed $login.Ok -Severity blocker -Detail ($(if ($login.Ok) { "admin session established" } else { "admin credentials rejected" }))
@@ -191,6 +192,7 @@ try {
             }
             if ($null -ne $injected) {
                 $injectedPacketHash = $injected.PrefixHash
+                $injectedPacketId = $injected.Id
                 Write-EvidenceJson -Path (Join-Path $scenario.Directory "s9-context-packet-injected.json") -Value $injected.Packet
                 Add-AcceptanceArtifact -Scenario $scenario -Path (Join-Path $scenario.Directory "s9-context-packet-injected.json") -Kind "api" -Note "context packet with injected knowledge"
             }
