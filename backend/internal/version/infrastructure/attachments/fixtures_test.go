@@ -232,6 +232,33 @@ func docxFullyFixture() []byte {
 	})
 }
 
+// docxAuxiliaryTableFixture has tables in the header and footer parts plus a
+// comment with an author. The structured elements must keep this content too:
+// element-driven chunking (Task 16) never reads the concatenated Text.
+func docxAuxiliaryTableFixture() []byte {
+	document := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="` + wordNamespace + `"><w:body>
+<w:p><w:r><w:t>正文：登录需求。</w:t></w:r></w:p>
+</w:body></w:document>`
+	header := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="` + wordNamespace + `">
+<w:p><w:r><w:t>页眉：规格</w:t></w:r></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>页眉字段</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>页眉说明</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:hdr>`
+	footer := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:ftr xmlns:w="` + wordNamespace + `">
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>页脚字段</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>页脚说明</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:ftr>`
+	comments := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="` + wordNamespace + `"><w:comment w:id="0" w:author="张三"><w:p><w:r><w:t>批注：补充边界条件</w:t></w:r></w:p></w:comment></w:comments>`
+	return zipFixture(map[string]string{
+		"word/document.xml": document,
+		"word/header1.xml":  header,
+		"word/footer1.xml":  footer,
+		"word/comments.xml": comments,
+	})
+}
+
 // docxSkippedImageFixture embeds an EMF image the parser cannot turn into a
 // vision-compatible image reference, so it must be reported with a reason
 // instead of being silently dropped.

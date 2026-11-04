@@ -313,8 +313,9 @@ func (b *segmentBlockBuilder) flushTable() {
 	b.blocks = append(b.blocks, block)
 }
 
-// addTableRow groups contiguous table_row/comment elements into one Markdown
-// table block. Comments stay ordinary text blocks in their section.
+// addTableRow groups contiguous table_row/sheet_row elements into one Markdown
+// table block. DOCX/PPTX emit table_row and XLSX emits sheet_row for the same
+// structured row shape (Row holds the cells).
 func (b *segmentBlockBuilder) addTableRow(element ExtractionElement) {
 	if !b.hasTable {
 		b.hasTable = true
@@ -370,7 +371,7 @@ func buildSegmentBlocks(result ExtractionResult) []segmentBlock {
 	}
 	for _, element := range result.Elements {
 		switch element.Kind {
-		case "table_row":
+		case "table_row", "sheet_row":
 			builder.addTableRow(element)
 			continue
 		}
@@ -406,6 +407,12 @@ func buildSegmentBlocks(result ExtractionResult) []segmentBlock {
 		}
 	}
 	builder.flushTable()
+	if len(builder.blocks) == 0 && strings.TrimSpace(result.Text) != "" {
+		// Defensive no-loss fallback: an element list that renders no blocks
+		// (blank/unknown elements, replayed results) must not hide the parser's
+		// concatenated Text.
+		builder.addPlainText(result.Text, strings.TrimSpace(result.Attachment.Name))
+	}
 	return builder.blocks
 }
 
@@ -585,9 +592,10 @@ func extractionImageRef(image ExtractionImage) string {
 	return fmt.Sprintf("image-%d", image.Seq)
 }
 
-// expandOversizedTables splits tables over the segment maximum into row groups,
-// each re-rendering the Markdown header (spec R-A7-2: oversized tables become
-// standalone kind=table blocks).
+// expandOversizedTables splits tables over the segment maximum into standalone
+// kind=table blocks (spec R-A7-2). Row groups repeat the Markdown header; a
+// group that still cannot fit (a single row or header wider than the maximum)
+// is split again at a text boundary so no segment ever exceeds the maximum.
 func expandOversizedTables(blocks []segmentBlock, maxChars int) []segmentBlock {
 	expanded := make([]segmentBlock, 0, len(blocks))
 	for _, block := range blocks {
@@ -596,18 +604,31 @@ func expandOversizedTables(blocks []segmentBlock, maxChars int) []segmentBlock {
 			continue
 		}
 		for _, rows := range splitSegmentTableRows(block.rows, maxChars) {
-			piece := block
-			piece.rows = rows
-			piece.text = renderSegmentTable(rows)
-			piece.standalone = true
-			expanded = append(expanded, piece)
+			rendered := renderSegmentTable(rows)
+			if runeLen(rendered) <= maxChars {
+				piece := block
+				piece.rows = rows
+				piece.text = rendered
+				piece.standalone = true
+				expanded = append(expanded, piece)
+				continue
+			}
+			for _, text := range splitOversizedTableText(rows, rendered, maxChars) {
+				piece := block
+				piece.rows = nil
+				piece.text = text
+				piece.standalone = true
+				expanded = append(expanded, piece)
+			}
 		}
 	}
 	return expanded
 }
 
 // splitSegmentTableRows groups rows so each rendered Markdown table fits in
-// maxChars. The header row (and separator) repeats in every group.
+// maxChars. The header row (and separator) repeats in every group. A group that
+// still does not fit (for example one oversized row) is returned as-is and is
+// split again by splitOversizedTableText.
 func splitSegmentTableRows(rows [][]string, maxChars int) [][][]string {
 	if len(rows) == 0 {
 		return nil
@@ -629,6 +650,42 @@ func splitSegmentTableRows(rows [][]string, maxChars int) [][][]string {
 		groups = append(groups, current)
 	}
 	return groups
+}
+
+// splitOversizedTableText splits one oversized rendered table into pieces that
+// each fit maxChars. When the group still has data rows, continuation pieces
+// repeat the Markdown header so they keep column context; if the header alone
+// leaves no usable budget it is not repeated. This is the fallback for a single
+// row (or a header) wider than the maximum: there is no smaller row group, so
+// the rendered text is split at a newline/sentence/space boundary.
+func splitOversizedTableText(rows [][]string, rendered string, maxChars int) []string {
+	header := ""
+	if len(rows) > 1 {
+		header = renderSegmentTable(rows[:1])
+	}
+	pieces := make([]string, 0, 2)
+	remaining := []rune(rendered)
+	first := true
+	for len(remaining) > 0 {
+		budget := maxChars
+		prefix := ""
+		if !first && header != "" {
+			candidate := header + "\n"
+			if runeLen(candidate) < maxChars {
+				prefix = candidate
+				budget = maxChars - runeLen(prefix)
+			}
+		}
+		if len(remaining) <= budget {
+			pieces = append(pieces, prefix+string(remaining))
+			break
+		}
+		splitAt := extractionSplitIndex(string(remaining), budget)
+		pieces = append(pieces, prefix+string(remaining[:splitAt]))
+		remaining = remaining[splitAt:]
+		first = false
+	}
+	return pieces
 }
 
 // renderSegmentTable renders rows as a Markdown table, the portable textual

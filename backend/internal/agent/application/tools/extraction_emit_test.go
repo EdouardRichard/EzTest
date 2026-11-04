@@ -249,6 +249,95 @@ func TestEmitRejectsInvalidFields(t *testing.T) {
 	}
 }
 
+// TestEmitRequiresDescription covers the schema/runtime consistency fix: the
+// fixed core schema marks description required, so an omitted description must
+// be an explicit required-field error instead of silently becoming "".
+func TestEmitRequiresDescription(t *testing.T) {
+	sink := &fakeExtractionSink{}
+	raw := json.RawMessage(`{"requirements":[{
+		"external_id":"FR-001","title":"手机号登录","acceptance_criteria":[],
+		"priority":"P0","category":"functional","source_quote":"手机号","confidence":0.8
+	}]}`)
+	_, err := NewExtractionEmitTool(sink).Emit(t.Context(), Scope{VersionID: 7}, testExtractionChunk(), raw)
+	toolErr := asToolError(t, err)
+	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+		t.Fatalf("err = %+v, want a retryable invalid_argument", toolErr)
+	}
+	if field := toolErr.Details["field"]; field != "requirements[0].description" {
+		t.Fatalf("details.field = %#v, want requirements[0].description", field)
+	}
+	if sink.called {
+		t.Fatal("a requirement without description reached the sink")
+	}
+}
+
+// TestEmitConfidenceIsOptionalAndMergesOnlyWhenSupplied covers the confidence
+// contract: confidence is not schema-required, an omitted confidence is valid,
+// a duplicate external_id without confidence must not zero the earlier supplied
+// value, and an explicitly supplied 0 still overwrites.
+func TestEmitConfidenceIsOptionalAndMergesOnlyWhenSupplied(t *testing.T) {
+	requirement := func(confidence string) string {
+		value := `{"external_id":"FR-001","title":"手机号登录","description":"","acceptance_criteria":[],` +
+			`"priority":"P0","category":"functional","source_quote":"手机号"`
+		if confidence != "" {
+			value += `,"confidence":` + confidence
+		}
+		return value + "}"
+	}
+	t.Run("duplicate without confidence keeps the earlier value", func(t *testing.T) {
+		sink := &fakeExtractionSink{}
+		raw := json.RawMessage(`{"requirements":[` + requirement("0.9") + `,` + requirement("") + `]}`)
+		if _, err := NewExtractionEmitTool(sink).Emit(t.Context(), Scope{VersionID: 7}, testExtractionChunk(), raw); err != nil {
+			t.Fatal(err)
+		}
+		if len(sink.requirements) != 1 || sink.requirements[0].Confidence != 0.9 {
+			t.Fatalf("merged requirements = %+v, want the supplied 0.9 confidence kept", sink.requirements)
+		}
+	})
+	t.Run("explicit zero is supplied and overwrites", func(t *testing.T) {
+		sink := &fakeExtractionSink{}
+		raw := json.RawMessage(`{"requirements":[` + requirement("0.9") + `,` + requirement("0") + `]}`)
+		if _, err := NewExtractionEmitTool(sink).Emit(t.Context(), Scope{VersionID: 7}, testExtractionChunk(), raw); err != nil {
+			t.Fatal(err)
+		}
+		if len(sink.requirements) != 1 || sink.requirements[0].Confidence != 0 {
+			t.Fatalf("merged requirements = %+v, want the explicit 0 confidence", sink.requirements)
+		}
+	})
+	t.Run("omitted confidence alone is accepted", func(t *testing.T) {
+		sink := &fakeExtractionSink{}
+		raw := json.RawMessage(`{"requirements":[` + requirement("") + `]}`)
+		if _, err := NewExtractionEmitTool(sink).Emit(t.Context(), Scope{VersionID: 7}, testExtractionChunk(), raw); err != nil {
+			t.Fatalf("omitted confidence must be accepted: %v", err)
+		}
+		if len(sink.requirements) != 1 || sink.requirements[0].Confidence != 0 {
+			t.Fatalf("requirements = %+v, want one requirement with confidence 0", sink.requirements)
+		}
+	})
+}
+
+// TestEmitMissingVersionScopeIsInternalError covers the internal/missing-
+// dependency classification: an unwired scope is a server wiring bug, never a
+// model-retryable invalid_argument.
+func TestEmitMissingVersionScopeIsInternalError(t *testing.T) {
+	sink := &fakeExtractionSink{}
+	_, err := NewExtractionEmitTool(sink).Emit(
+		t.Context(), Scope{}, testExtractionChunk(), json.RawMessage(`{"requirements":[]}`))
+	if err == nil {
+		t.Fatal("Emit accepted a missing version scope")
+	}
+	var toolErr *Error
+	if errors.As(err, &toolErr) {
+		t.Fatalf("missing version scope returned a model-visible tool error %+v, want an internal error", toolErr)
+	}
+	if !strings.Contains(err.Error(), "version scope") {
+		t.Fatalf("err = %v, want a version-scope missing-dependency error", err)
+	}
+	if sink.called {
+		t.Fatal("the sink was called without a version scope")
+	}
+}
+
 func TestEmitExecuteUsesInjectedSegmentText(t *testing.T) {
 	sink := &fakeExtractionSink{counts: ExtractionEmitCounts{Created: 1}}
 	tool := NewExtractionEmitTool(sink)
@@ -303,6 +392,28 @@ func TestExtractionEmitToolRegisteredOnlyWithSink(t *testing.T) {
 	properties, ok := schema["properties"].(map[string]any)
 	if !ok || properties["requirements"] == nil {
 		t.Fatalf("schema properties = %#v, want requirements", properties)
+	}
+	requirements, ok := properties["requirements"].(map[string]any)
+	if !ok {
+		t.Fatalf("requirements schema = %#v, want an object", properties["requirements"])
+	}
+	items, ok := requirements["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("requirements.items schema = %#v, want an object", requirements["items"])
+	}
+	required := make(map[string]bool)
+	if fields, ok := items["required"].([]any); ok {
+		for _, field := range fields {
+			if name, ok := field.(string); ok {
+				required[name] = true
+			}
+		}
+	}
+	if !required["description"] {
+		t.Fatalf("description must stay schema-required: %#v", items["required"])
+	}
+	if required["confidence"] {
+		t.Fatalf("confidence must be optional in the schema (omitted confidence is accepted): %#v", items["required"])
 	}
 	if raw := strings.ToLower(string(tool.Parameters())); strings.Contains(raw, "version_id") {
 		t.Fatalf("schema leaks the injected version scope: %s", tool.Parameters())

@@ -81,6 +81,7 @@ type ExtractionSource struct {
 // ExtractionRequirement is one validated, normalized requirement of the fixed
 // core schema. SourceQuote is kept byte-for-byte (it passed the verbatim
 // substring check); ConstraintsJSON is the optional open JSON object.
+// Confidence is 0 when the model omitted the optional field.
 type ExtractionRequirement struct {
 	ExternalID         string
 	Title              string
@@ -177,7 +178,7 @@ func (t *ExtractionEmitTool) Parameters() json.RawMessage {
 			},
 			"confidence": map[string]any{
 				"type": "number", "minimum": 0, "maximum": 1,
-				"description": "抽取置信度 0-1。",
+				"description": "抽取置信度 0-1（可选；缺省表示模型未给出，不会覆盖同批前一条的值）。",
 			},
 			"constraints_json": map[string]any{
 				"type":        "object",
@@ -186,7 +187,7 @@ func (t *ExtractionEmitTool) Parameters() json.RawMessage {
 		},
 		"required": []string{
 			"external_id", "title", "description", "acceptance_criteria",
-			"priority", "category", "source_quote", "confidence",
+			"priority", "category", "source_quote",
 		},
 		"additionalProperties": false,
 	}
@@ -206,10 +207,14 @@ type extractionEmitParams struct {
 
 // extractionEmitRequirementParams is the strict per-requirement argument shape.
 // Unknown fields are rejected by decodeParams' DisallowUnknownFields decoder.
+// Description/Confidence are pointers to distinguish absent from empty/0:
+// description is schema-required (nil is an explicit required-field error) and
+// confidence is optional (nil means "not supplied", so a duplicate merge keeps
+// the earlier value instead of overwriting it with 0).
 type extractionEmitRequirementParams struct {
 	ExternalID         string          `json:"external_id"`
 	Title              string          `json:"title"`
-	Description        string          `json:"description"`
+	Description        *string         `json:"description"`
 	AcceptanceCriteria *[]string       `json:"acceptance_criteria"`
 	Priority           string          `json:"priority"`
 	Category           string          `json:"category"`
@@ -231,7 +236,9 @@ func (t *ExtractionEmitTool) Emit(ctx context.Context, scope Scope, segmentText 
 		return nil, missingDep("requirement extraction sink")
 	}
 	if scope.VersionID <= 0 {
-		return nil, extractionFieldError("scope", "requirement.extraction_emit requires the injected version scope", nil)
+		// A missing version scope is a worker/wiring bug, not a model error:
+		// keep it internal (and non-retryable) instead of invalid_argument.
+		return nil, fmt.Errorf("requirement.extraction_emit: %w", missingDep("version scope"))
 	}
 	var params extractionEmitParams
 	if err := decodeParams(raw, &params); err != nil {
@@ -250,7 +257,13 @@ func (t *ExtractionEmitTool) Emit(ctx context.Context, scope Scope, segmentText 
 			return nil, toolErr
 		}
 		if at, exists := indexByExternalID[requirement.ExternalID]; exists {
-			normalized[at] = mergeExtractionRequirement(normalized[at], requirement)
+			merged := mergeExtractionRequirement(normalized[at], requirement)
+			// Only a supplied confidence replaces the earlier value; an omitted
+			// confidence must not zero the duplicate's earlier 0.9, etc.
+			if item.Confidence != nil {
+				merged.Confidence = requirement.Confidence
+			}
+			normalized[at] = merged
 			continue
 		}
 		indexByExternalID[requirement.ExternalID] = len(normalized)
@@ -307,7 +320,11 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 		return ExtractionRequirement{}, extractionFieldError(field("title"),
 			fmt.Sprintf("must be at most %d characters", maxExtractionTitleChars), nil)
 	}
-	description := strings.TrimSpace(params.Description)
+	if params.Description == nil {
+		return ExtractionRequirement{}, extractionFieldError(field("description"),
+			"is required; use an empty string when the source has no description", nil)
+	}
+	description := strings.TrimSpace(*params.Description)
 	if utf8.RuneCountInString(description) > maxExtractionDescriptionChars {
 		return ExtractionRequirement{}, extractionFieldError(field("description"),
 			fmt.Sprintf("must be at most %d characters", maxExtractionDescriptionChars), nil)
@@ -333,7 +350,7 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 			fmt.Sprintf("must contain at most %d items", maxExtractionCriteria), nil)
 	}
 	priority := strings.ToUpper(strings.TrimSpace(params.Priority))
-	if !containsFoldExact(extractionPriorities, priority) {
+	if !containsExactString(extractionPriorities, priority) {
 		return ExtractionRequirement{}, extractionFieldError(field("priority"),
 			"must be one of P0/P1/P2/P3", map[string]any{
 				"allowed_values": append([]string(nil), extractionPriorities...),
@@ -341,7 +358,7 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 			})
 	}
 	category := strings.ToLower(strings.TrimSpace(params.Category))
-	if !containsFoldExact(extractionCategories, category) {
+	if !containsExactString(extractionCategories, category) {
 		return ExtractionRequirement{}, extractionFieldError(field("category"),
 			"must be one of functional/non_functional/planned", map[string]any{
 				"allowed_values": append([]string(nil), extractionCategories...),
@@ -402,6 +419,8 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 // mergeExtractionRequirement merges a duplicate external_id into the first
 // occurrence: later scalar values update the base, acceptance criteria are
 // unioned in order (R-A7-5 "duplicate → update/merge, not duplicate").
+// Confidence is applied by Emit only when the duplicate supplied it, so an
+// absent confidence never resets the earlier value to zero.
 func mergeExtractionRequirement(base, update ExtractionRequirement) ExtractionRequirement {
 	if update.Title != "" {
 		base.Title = update.Title
@@ -419,7 +438,6 @@ func mergeExtractionRequirement(base, update ExtractionRequirement) ExtractionRe
 	if update.SourceQuote != "" {
 		base.SourceQuote = update.SourceQuote
 	}
-	base.Confidence = update.Confidence
 	if len(update.ConstraintsJSON) > 0 {
 		base.ConstraintsJSON = update.ConstraintsJSON
 	}
@@ -436,8 +454,8 @@ func extractionFieldError(field, message string, extra map[string]any) *Error {
 	return &Error{Code: CodeInvalidArgument, Message: message, Retryable: true, Details: details}
 }
 
-// containsFoldExact reports whether values already contain value exactly.
-func containsFoldExact(values []string, value string) bool {
+// containsExactString reports whether values already contain value exactly.
+func containsExactString(values []string, value string) bool {
 	for _, existing := range values {
 		if existing == value {
 			return true
@@ -450,7 +468,7 @@ func containsFoldExact(values []string, value string) bool {
 // present, preserving order (acceptance-criteria union on duplicate external_id).
 func appendUniqueExtractionStrings(values []string, additions ...string) []string {
 	for _, addition := range additions {
-		if addition == "" || containsFoldExact(values, addition) {
+		if addition == "" || containsExactString(values, addition) {
 			continue
 		}
 		values = append(values, addition)

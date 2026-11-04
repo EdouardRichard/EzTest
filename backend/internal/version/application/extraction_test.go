@@ -13,6 +13,7 @@ package versionapp_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -189,7 +190,7 @@ func TestSegmentationPreservesTablesAndImages(t *testing.T) {
 	result := versionapp.ExtractionResult{
 		Elements: elements,
 		Images: []versionapp.ExtractionImage{
-			{Seq: 1, Name: "login-page.png", Source: "word/document.xml", MIME: "image/png"},
+			{Seq: 1, Name: "login-page.png", Source: "word/media/image1.png", MIME: "image/png"},
 		},
 	}
 	segments, err := versionapp.SegmentExtraction(result, versionapp.SegmentOptions{SourcePath: testDocxSource})
@@ -273,6 +274,73 @@ func TestSegmentationPPTXSlideAndXLSXSheetStructure(t *testing.T) {
 			t.Fatalf("xlsx value %q was dropped", value)
 		}
 	}
+	// XLSX rows are table rows: they must render as Markdown tables (not the
+	// parser's tab-separated Text) and the row-only sheet segment is table kind.
+	for _, segment := range segments {
+		if segment.Kind != versionapp.SegmentKindTable {
+			t.Fatalf("xlsx segment %d kind = %q, want %q (rows are a table)", segment.Seq, segment.Kind, versionapp.SegmentKindTable)
+		}
+	}
+	if !strings.Contains(segments[0].Text, "| 手机号 | 验证码 |") {
+		t.Fatalf("xlsx rows were not rendered as a Markdown table: %q", segments[0].Text)
+	}
+	if !strings.Contains(segments[0].Text, "13800000000") {
+		t.Fatalf("xlsx row cell dropped: %q", segments[0].Text)
+	}
+}
+
+// TestSegmentationXLSXOversizedRowBlockIsTableChunks covers R-A7-2 for XLSX:
+// a sheet row block over the segment maximum becomes standalone kind=table
+// chunks that repeat the Markdown header, and no row content is dropped.
+func TestSegmentationXLSXOversizedRowBlockIsTableChunks(t *testing.T) {
+	const sheetFile = "xl/worksheets/sheet1.xml"
+	row := func(index int) versionapp.ExtractionElement {
+		cells := []string{
+			fmt.Sprintf("TC-%03d", index),
+			strings.Repeat("输入数据", 100),
+			strings.Repeat("预期结果", 100),
+		}
+		return versionapp.ExtractionElement{
+			Kind: "sheet_row", Text: strings.Join(cells, "\t"), Row: cells,
+			Sheet: "用例", Source: sheetFile,
+		}
+	}
+	elements := []versionapp.ExtractionElement{
+		{Kind: "sheet", Text: "用例", Sheet: "用例", Source: sheetFile},
+		{Kind: "sheet_row", Text: "用例编号\t输入\t预期", Row: []string{"用例编号", "输入", "预期"}, Sheet: "用例", Source: sheetFile},
+	}
+	for index := 0; index < 30; index++ {
+		elements = append(elements, row(index))
+	}
+	segments, err := versionapp.SegmentExtraction(
+		versionapp.ExtractionResult{Elements: elements},
+		versionapp.SegmentOptions{SourcePath: "cases.xlsx"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableSegments := 0
+	joined := joinedSegmentTexts(segments)
+	for _, segment := range segments {
+		if segment.Kind != versionapp.SegmentKindTable {
+			continue
+		}
+		tableSegments++
+		if got := runeCount(segment.Text); got > versionapp.DefaultSegmentMaxChars {
+			t.Fatalf("table chunk %d has %d runes, over the %d-rune maximum", segment.Seq, got, versionapp.DefaultSegmentMaxChars)
+		}
+		if !strings.HasPrefix(segment.Text, "| 用例编号 | 输入 | 预期 |") {
+			t.Fatalf("table chunk %d does not repeat the Markdown header: %.60q", segment.Seq, segment.Text)
+		}
+	}
+	if tableSegments < 2 {
+		t.Fatalf("oversized xlsx row block produced %d kind=table chunks, want at least 2", tableSegments)
+	}
+	for index := 0; index < 30; index++ {
+		if token := fmt.Sprintf("TC-%03d", index); !strings.Contains(joined, token) {
+			t.Fatalf("xlsx row %q was dropped from the table chunks", token)
+		}
+	}
 }
 
 func TestSegmentationPDFPageHeadingHeuristic(t *testing.T) {
@@ -339,7 +407,7 @@ func TestSegmentationFillsTargetRange(t *testing.T) {
 func TestSegmentationImageOnlyResult(t *testing.T) {
 	result := versionapp.ExtractionResult{
 		Images: []versionapp.ExtractionImage{
-			{Seq: 1, Name: "scan.png", Source: "scan.pdf:object:1", MIME: "image/png"},
+			{Seq: 1, Name: "scan.png", Source: "pdf:object:1", MIME: "image/png"},
 		},
 	}
 	segments, err := versionapp.SegmentExtraction(result, versionapp.SegmentOptions{SourcePath: "scan.pdf"})
@@ -380,5 +448,111 @@ func TestSegmentationFallsBackToPlainText(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("plain-text content %q dropped: %q", want, joined)
 		}
+	}
+}
+
+// TestSegmentationFallsBackToTextWhenElementsYieldNoBlocks is the defensive
+// no-loss fallback: an element list that renders no blocks (blank/unknown
+// elements) must not hide the parser's concatenated Text.
+func TestSegmentationFallsBackToTextWhenElementsYieldNoBlocks(t *testing.T) {
+	result := versionapp.ExtractionResult{
+		Text: "# 1 概述\n用户使用手机号登录。",
+		Elements: []versionapp.ExtractionElement{
+			{Kind: "paragraph", Text: "   ", Source: "word/document.xml"},
+			{Kind: "unknown_future_kind", Source: "word/document.xml"},
+		},
+	}
+	segments, err := versionapp.SegmentExtraction(result, versionapp.SegmentOptions{SourcePath: "req.docx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) == 0 {
+		t.Fatal("elements with no renderable text hid the Text fallback: no segments")
+	}
+	joined := joinedSegmentTexts(segments)
+	for _, want := range []string{"1 概述", "用户使用手机号登录。"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("fallback text content %q dropped: %q", want, joined)
+		}
+	}
+}
+
+// TestSegmentationSplitsOversizedTable covers the row-group split of a table
+// over the maximum: each piece is a standalone kind=table chunk that repeats the
+// Markdown header, every piece stays within the maximum and no row is lost.
+func TestSegmentationSplitsOversizedTable(t *testing.T) {
+	const source = "word/document.xml"
+	elements := []versionapp.ExtractionElement{
+		{Kind: "table_row", Text: "用例编号 | 步骤 | 预期", Row: []string{"用例编号", "步骤", "预期"}, Source: source},
+	}
+	for index := 0; index < 20; index++ {
+		cells := []string{fmt.Sprintf("CASE-%02d", index), strings.Repeat("步骤", 400), strings.Repeat("预期", 400)}
+		elements = append(elements, versionapp.ExtractionElement{
+			Kind: "table_row", Text: strings.Join(cells, " | "), Row: cells, Source: source,
+		})
+	}
+	segments, err := versionapp.SegmentExtraction(
+		versionapp.ExtractionResult{Elements: elements},
+		versionapp.SegmentOptions{SourcePath: "req.docx"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableSegments := 0
+	joined := joinedSegmentTexts(segments)
+	for _, segment := range segments {
+		if segment.Kind != versionapp.SegmentKindTable {
+			t.Fatalf("segment %d kind = %q, want %q", segment.Seq, segment.Kind, versionapp.SegmentKindTable)
+		}
+		tableSegments++
+		if got := runeCount(segment.Text); got > versionapp.DefaultSegmentMaxChars {
+			t.Fatalf("table chunk %d has %d runes, over the %d-rune maximum", segment.Seq, got, versionapp.DefaultSegmentMaxChars)
+		}
+		if !strings.HasPrefix(segment.Text, "| 用例编号 | 步骤 | 预期 |") {
+			t.Fatalf("table chunk %d does not repeat the Markdown header: %.60q", segment.Seq, segment.Text)
+		}
+	}
+	if tableSegments < 2 {
+		t.Fatalf("oversized table produced %d kind=table chunks, want at least 2", tableSegments)
+	}
+	for index := 0; index < 20; index++ {
+		if token := fmt.Sprintf("CASE-%02d", index); !strings.Contains(joined, token) {
+			t.Fatalf("table row %q was dropped when splitting", token)
+		}
+	}
+}
+
+// TestSegmentationSplitsOversizedSingleRowTable covers the no-row-group edge
+// case: a table whose only row already exceeds the maximum is split into
+// standalone table text chunks that each stay within the maximum, and every
+// character of the row is preserved.
+func TestSegmentationSplitsOversizedSingleRowTable(t *testing.T) {
+	cells := []string{strings.Repeat("甲", 5000), strings.Repeat("乙", 5000)}
+	segments, err := versionapp.SegmentExtraction(
+		versionapp.ExtractionResult{Elements: []versionapp.ExtractionElement{{
+			Kind: "table_row", Text: strings.Join(cells, " | "), Row: cells, Source: "word/document.xml",
+		}}},
+		versionapp.SegmentOptions{SourcePath: "req.docx"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("oversized single-row table produced %d segments, want it split", len(segments))
+	}
+	joined := joinedSegmentTexts(segments)
+	for _, segment := range segments {
+		if segment.Kind != versionapp.SegmentKindTable {
+			t.Fatalf("segment %d kind = %q, want %q", segment.Seq, segment.Kind, versionapp.SegmentKindTable)
+		}
+		if got := runeCount(segment.Text); got > versionapp.DefaultSegmentMaxChars {
+			t.Fatalf("table chunk %d has %d runes, over the %d-rune maximum", segment.Seq, got, versionapp.DefaultSegmentMaxChars)
+		}
+	}
+	if got := strings.Count(joined, "甲"); got != 5000 {
+		t.Fatalf("first cell content lost when splitting: %d of 5000 %q runes kept", got, "甲")
+	}
+	if got := strings.Count(joined, "乙"); got != 5000 {
+		t.Fatalf("second cell content lost when splitting: %d of 5000 %q runes kept", got, "乙")
 	}
 }

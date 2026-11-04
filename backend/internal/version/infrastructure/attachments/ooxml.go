@@ -564,6 +564,19 @@ func appendWordSectionPart(builder *resultBuilder, archive *zip.Reader, file *zi
 			for _, id := range block.ImageIDs {
 				*imageRefs = append(*imageRefs, wordImageRef{Part: file.Name, ID: id})
 			}
+			// Header/footer tables are content too: emit the same structured
+			// table_row elements as the body so element-driven chunking does not
+			// lose them (the Markdown text below is the fallback copy).
+			headingPath := kind
+			for _, row := range block.Rows {
+				cells := append([]string(nil), row...)
+				if err := builder.element(versionapp.ExtractionElement{
+					Kind: "table_row", Text: strings.Join(cells, " | "), Row: cells,
+					HeadingPath: headingPath, Source: file.Name,
+				}); err != nil {
+					return err
+				}
+			}
 			if err := builder.addText(renderMarkdownTable(block.Rows)); err != nil {
 				return err
 			}
@@ -645,10 +658,14 @@ func appendWordNotesPart(builder *resultBuilder, archive *zip.Reader, name, kind
 	for _, item := range ordered {
 		text := strings.Join(item.texts, " ")
 		display := text
-		if kind == "comment" && item.author != "" {
-			display = item.author + ": " + text
+		elementText := text
+		if kind == "comment" {
+			if item.author != "" {
+				display = item.author + ": " + text
+			}
+			elementText = renderCommentElementText(text, item.author, item.id)
 		}
-		if err := builder.element(versionapp.ExtractionElement{Kind: kind, Text: text, Source: name}); err != nil {
+		if err := builder.element(versionapp.ExtractionElement{Kind: kind, Text: elementText, Source: name}); err != nil {
 			return err
 		}
 		if err := builder.addText("[" + marker + " " + item.id + "] " + display + "\n"); err != nil {
@@ -656,6 +673,20 @@ func appendWordNotesPart(builder *resultBuilder, archive *zip.Reader, name, kind
 		}
 	}
 	return nil
+}
+
+// renderCommentElementText keeps the comment author and reference inside the
+// structured element text. The caller also renders them into the concatenated
+// Text, but element-driven chunking (Task 16) only reads Elements, so the
+// metadata must not live in Text alone.
+func renderCommentElementText(text, author, ref string) string {
+	if author != "" {
+		text = author + ": " + text
+	}
+	if ref != "" {
+		text += "（批注 " + ref + "）"
+	}
+	return text
 }
 
 func appendWordImages(builder *resultBuilder, archive *zip.Reader, refs []wordImageRef) error {
@@ -1362,7 +1393,8 @@ func extractXLSXResult(data []byte) (versionapp.ExtractionResult, error) {
 		}
 		for _, comment := range comments {
 			if err := builder.element(versionapp.ExtractionElement{
-				Kind: "comment", Text: comment.Text, Source: sheet.File, Sheet: sheet.Name,
+				Kind: "comment", Text: renderCommentElementText(comment.Text, comment.Author, comment.Ref),
+				Source: sheet.File, Sheet: sheet.Name,
 			}); err != nil {
 				return versionapp.ExtractionResult{}, err
 			}

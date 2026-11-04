@@ -318,6 +318,27 @@ func findElement(elements []versionapp.ExtractionElement, kind, text string) boo
 	return false
 }
 
+// findTableRow reports whether elements has a table_row with the given
+// heading_path and exact cells (structured tables survive element-only chunking).
+func findTableRow(elements []versionapp.ExtractionElement, headingPath string, want []string) bool {
+	for _, element := range elements {
+		if element.Kind != "table_row" || element.HeadingPath != headingPath || len(element.Row) != len(want) {
+			continue
+		}
+		matches := true
+		for index := range want {
+			if element.Row[index] != want[index] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDOCXFullyExtracts(t *testing.T) {
 	result, err := extractResult(t, "req.docx", "", docxFullyFixture())
 	if err != nil {
@@ -370,6 +391,52 @@ func TestDOCXFullyExtracts(t *testing.T) {
 	}
 	if result.Coverage.Found == 0 || result.Coverage.Found != result.Coverage.Parsed {
 		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+}
+
+// TestDOCXAuxiliaryTablesAndCommentMetadata covers the no-loss fix for
+// element-driven chunking: header/footer tables and comment author/ref must be
+// structured elements, not only appended to the concatenated Text.
+func TestDOCXAuxiliaryTablesAndCommentMetadata(t *testing.T) {
+	result, err := extractResult(t, "req.docx", "", docxAuxiliaryTableFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	if !findTableRow(result.Elements, "header", []string{"页眉字段", "页眉说明"}) {
+		t.Fatalf("header table row element missing: %+v", result.Elements)
+	}
+	if !findTableRow(result.Elements, "footer", []string{"页脚字段", "页脚说明"}) {
+		t.Fatalf("footer table row element missing: %+v", result.Elements)
+	}
+	if !strings.Contains(result.Text, "| 页眉字段 | 页眉说明 |") ||
+		!strings.Contains(result.Text, "| 页脚字段 | 页脚说明 |") {
+		t.Fatalf("auxiliary tables missing from the markdown text:\n%s", result.Text)
+	}
+	if want := "张三: 批注：补充边界条件（批注 0）"; !findElement(result.Elements, "comment", want) {
+		t.Fatalf("comment element does not keep author/ref %q: %+v", want, result.Elements)
+	}
+}
+
+// TestDOCXHeaderFooterTableReachesSegments is the end-to-end no-loss check:
+// parsing then segmenting must keep the header/footer table cells and the
+// comment author/ref (the segmenter consumes Elements, not Text).
+func TestDOCXHeaderFooterTableReachesSegments(t *testing.T) {
+	result, err := extractResult(t, "req.docx", "", docxAuxiliaryTableFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	segments, err := versionapp.SegmentExtraction(result, versionapp.SegmentOptions{SourcePath: "req.docx"})
+	if err != nil {
+		t.Fatalf("segment: %v", err)
+	}
+	var joined strings.Builder
+	for _, segment := range segments {
+		joined.WriteString(segment.Text)
+	}
+	for _, want := range []string{"| 页眉字段 | 页眉说明 |", "| 页脚字段 | 页脚说明 |", "张三", "批注 0"} {
+		if !strings.Contains(joined.String(), want) {
+			t.Fatalf("header/footer/comment content %q was dropped from segments: %+v", want, segments)
+		}
 	}
 }
 
@@ -455,6 +522,9 @@ func TestXLSXFullyExtracts(t *testing.T) {
 	}
 	if !findElement(result.Elements, "comment", "批注：需要补充边界条件") {
 		t.Fatalf("comment element missing: %+v", result.Elements)
+	}
+	if !findElement(result.Elements, "comment", "李四") || !findElement(result.Elements, "comment", "B2") {
+		t.Fatalf("xlsx comment element lost its author/ref: %+v", result.Elements)
 	}
 	if result.Coverage.Skipped != 0 || result.Coverage.Found != result.Coverage.Parsed {
 		t.Fatalf("coverage = %+v", result.Coverage)
