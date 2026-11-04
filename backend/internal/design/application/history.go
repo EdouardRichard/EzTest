@@ -7,9 +7,11 @@ import (
 // CaseVersionHistoryView is one case-version row read by ID regardless of its
 // current/confirmation status (spec §8.1). Title is never empty because the
 // row keeps the historical title; Status may be draft/confirmed/stale/
-// superseded. Revision is int32 to match the wire/report projection.
+// superseded. Revision is int32 to match the wire/report projection. CaseID is
+// the owning logical case, used by the execution terminal-run projection.
 type CaseVersionHistoryView struct {
 	ID       int64
+	CaseID   int64
 	Revision int32
 	Title    string
 	Status   string
@@ -42,6 +44,7 @@ func (s *GraphService) ReadCaseVersionsByIDs(ctx context.Context, versionID int6
 		}
 		views = append(views, CaseVersionHistoryView{
 			ID:       row.ID,
+			CaseID:   row.CaseID,
 			Revision: int32(row.Revision),
 			Title:    row.Title,
 			Status:   row.Status,

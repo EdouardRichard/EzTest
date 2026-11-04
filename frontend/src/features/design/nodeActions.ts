@@ -6,8 +6,15 @@ export type DesignNodeActions = {
   onConfirmCase: (caseId: string) => void
   onConfirmScenario: (scenarioId: string) => void
   onConfirmRequirement: (requirementId: string) => void
+  /** Toggles one case in the multi-select batch selection (spec §9.3). */
+  onToggleCaseSelected: (caseId: string) => void
   /** `${scope}:${targetId}` while a confirmation request is in flight. */
   confirmingKey: string | null
+  /**
+   * Case confirmations are only available at the case hard gate (stage
+   * case_review). Defaults to true for isolated canvas tests.
+   */
+  caseReviewEnabled?: boolean
 }
 
 export const DESIGN_STATUS_LABEL: Record<DesignStatus, string> = {

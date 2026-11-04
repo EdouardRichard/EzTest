@@ -906,8 +906,8 @@ try {
     Step "bootstrap API on port $ApiPort (migrations 24 + settings/profile seed)"
     Start-Api
 
-    Step "login as admin/admin123"
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
+    Step "login as admin/[REDACTED]"
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "[REDACTED]" }
     Assert-Status $login @(200) "POST /api/auth/login"
     $script:token = [string]$login.Json.data.token
     if ([string]::IsNullOrWhiteSpace($script:token)) { throw "login response has no token" }
@@ -1003,7 +1003,7 @@ try {
 
     Step "start the acceptance API (fresh process picks up executor_url/token settings)"
     Start-Api
-    $relogin = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
+    $relogin = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "[REDACTED]" }
     Assert-Status $relogin @(200) "POST /api/auth/login (acceptance API)"
     $script:token = [string]$relogin.Json.data.token
     $health = Invoke-Api -Method "GET" -Path "/api/health" -Token $null

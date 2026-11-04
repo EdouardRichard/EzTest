@@ -14,9 +14,15 @@ import (
 // VersionBinding is the execution context's read projection of one version and
 // its SUT bindings. It is produced by the version adapter from the version
 // application service; disabled bindings are filtered out there.
+//
+// Stage is the deterministic version-stage projection (Task 78). Initial
+// execution intents may only be refreshed at executing (or completed, where an
+// environment change reopens the version), so a case confirmation while the
+// version is still at the case gate cannot auto-create a wave.
 type VersionBinding struct {
 	VersionID int64
 	Status    string
+	Stage     string
 	SUTs      []VersionSUTBinding
 }
 

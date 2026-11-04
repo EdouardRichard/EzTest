@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -33,6 +35,7 @@ type AttachmentService struct {
 	storage   ContentStore
 	queue     TaskEnqueuer
 	extractor TextExtractor
+	images    ImageProber
 	events    eventingapp.Publisher
 	ids       platformid.Generator
 	clock     clock.Clock
@@ -44,20 +47,24 @@ func NewAttachmentService(
 	storage ContentStore,
 	queue TaskEnqueuer,
 	extractor TextExtractor,
+	images ImageProber,
 	events eventingapp.Publisher,
 	ids platformid.Generator,
 	clk clock.Clock,
 ) *AttachmentService {
 	return &AttachmentService{
-		repo: repo, storage: storage, queue: queue, extractor: extractor,
+		repo: repo, storage: storage, queue: queue, extractor: extractor, images: images,
 		events: events, ids: ids, clock: clk,
 	}
 }
 
 // RegisterFromMessage validates one message attachment part against the
 // content ledger, stores the requirement_attachment runtime row and ensures
-// the ingest task. Images are stored as references (skipped extraction);
-// legacy .doc/.ppt are marked failed with unsupported_attachment_format
+// the ingest task. The conversation post path pre-registers rows via
+// PrepareUserMessageParts instead (so the pending gate can see them); this
+// entry point remains for direct registration and tests. Image attachments are
+// stored as an extraction-skipped row because there is no text to extract.
+// Legacy .doc/.ppt are marked failed with unsupported_attachment_format
 // without blocking the message.
 func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error) {
 	if versionID <= 0 || messageID <= 0 {
@@ -73,26 +80,29 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 	if err != nil {
 		return AttachmentView{}, err
 	}
-	content, reader, err := s.storage.Open(ctx, part.SHA256)
+	content, err := s.attachmentContent(ctx, part)
 	if err != nil {
-		if isPlatformNotFound(err) {
-			return AttachmentView{}, platform.Invalid("sha256", "content object was not uploaded")
-		}
 		return AttachmentView{}, err
 	}
-	_ = reader.Close()
-	if content.Size != part.Size {
-		return AttachmentView{}, platform.Invalid("size", "does not match the uploaded content size")
+	attachment, err := s.createAttachment(ctx, versionID, conversationID, messageID, part, name, content, actorID)
+	if err != nil {
+		return AttachmentView{}, err
 	}
+	return toAttachmentView(attachment), nil
+}
 
+// createAttachment inserts one requirement_attachment row and its content-ledger
+// reference. messageID is zero for a row pre-registered by the message post
+// preflight; LinkFromMessage binds it after the message insert wins.
+func (s *AttachmentService) createAttachment(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, name string, content ContentObject, actorID int64) (version.Attachment, error) {
 	now := s.clock.Now()
 	attachmentID := s.ids.Next()
 	ref, err := s.storage.AddRef(ctx, part.SHA256, version.AttachmentOwnerKind, attachmentID, version.AttachmentContentRole)
 	if err != nil {
 		if isPlatformNotFound(err) {
-			return AttachmentView{}, platform.Invalid("sha256", "content object was not uploaded")
+			return version.Attachment{}, platform.Invalid("sha256", "content object was not uploaded")
 		}
-		return AttachmentView{}, err
+		return version.Attachment{}, err
 	}
 
 	kind := version.DetectAttachmentKind(name, part.MIME)
@@ -102,16 +112,28 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 	switch {
 	case kind.IsImage():
 		status = version.AttachmentSkipped
+	case version.IsLegacyOfficeFormat(name):
+		// The pre-OOXML .doc/.ppt binary formats never reach the parser: the
+		// upload path must still return the same save-as hint the parser would
+		// (R26), not the generic unsupported-format message.
+		status = version.AttachmentFailed
+		errorCode = version.AttachmentErrorUnsupported
+		errorText = version.ErrUnsupportedLegacyAttachment.Error() + ": " + name
 	case !kind.SupportsExtraction():
 		status = version.AttachmentFailed
 		errorCode = version.AttachmentErrorUnsupported
-		errorText = "unsupported attachment format; upload md/txt/docx/pptx/pdf or an image"
+		errorText = "unsupported attachment format; upload md/txt/html/docx/pptx/xlsx/pdf or an image"
 	}
 
+	var linkedMessageID *int64
+	if messageID > 0 {
+		value := messageID
+		linkedMessageID = &value
+	}
 	attachment := version.Attachment{
 		ID:                    attachmentID,
 		VersionID:             versionID,
-		ConversationMessageID: &messageID,
+		ConversationMessageID: linkedMessageID,
 		ContentRefID:          ref.ID,
 		Name:                  name,
 		MIME:                  part.MIME,
@@ -124,7 +146,7 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 		UpdatedAt:             now,
 	}
 	if err := s.repo.Create(ctx, attachment); err != nil {
-		return AttachmentView{}, mapAttachmentRepositoryError(err)
+		return version.Attachment{}, mapAttachmentRepositoryError(err)
 	}
 
 	switch status {
@@ -138,7 +160,289 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 	case version.AttachmentPending:
 		s.enqueueIngest(ctx, versionID, conversationID, messageID, attachmentID)
 	}
-	return toAttachmentView(attachment), nil
+	return attachment, nil
+}
+
+// LinkFromMessage binds the pre-registered rows to the inserted message. It
+// deliberately does not re-open the content or enqueue extraction: the
+// preflight already did both, so the retry reuses the same row and parse.
+func (s *AttachmentService) LinkFromMessage(ctx context.Context, versionID, messageID int64, attachmentIDs []int64) error {
+	if versionID <= 0 || messageID <= 0 {
+		return platform.Invalid("attachment", "version and message are required")
+	}
+	for _, attachmentID := range attachmentIDs {
+		if attachmentID <= 0 {
+			continue
+		}
+		if err := s.repo.LinkMessage(ctx, attachmentID, messageID, s.clock.Now()); err != nil {
+			return mapAttachmentRepositoryError(err)
+		}
+	}
+	return nil
+}
+
+// PrepareUserMessageParts prepares a message before it is stored: image
+// attachment parts become R5 image parts (spec §8.1/§8.3), and every attachment
+// part gets an attachment row. Rows for brand-new content are pre-registered
+// here, which starts extraction and lets the submit gate observe a real pending
+// status (spec §8.5). Any pending/processing reference returns the typed 409
+// attachment_pending before the message is inserted; the returned attachment IDs
+// are the unlinked rows that must be linked after the insert wins.
+func (s *AttachmentService) PrepareUserMessageParts(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart, actorID int64) ([]version.MessagePart, []int64, error) {
+	if versionID <= 0 || conversationID <= 0 {
+		return nil, nil, platform.Invalid("conversation_id", "must be positive decimal IDs")
+	}
+	prepared := make([]version.MessagePart, 0, len(parts))
+	attachmentIDs := make([]int64, 0)
+	for _, part := range parts {
+		if part.Type != version.MessagePartAttachment {
+			prepared = append(prepared, part)
+			continue
+		}
+		name, err := version.SanitizeAttachmentName(part.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+		image := version.DetectAttachmentKind(name, part.MIME).IsImage()
+		var imagePart *version.MessagePart
+		var content ContentObject
+		if image {
+			built, object, err := s.imagePartFromAttachment(ctx, part)
+			if err != nil {
+				return nil, nil, err
+			}
+			imagePart = &built
+			content = object
+		} else {
+			content, err = s.attachmentContent(ctx, part)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
+		// A previous message already registered this content: its extraction
+		// state is the gate, and a done/failed/skipped row is reused without
+		// creating another row or extraction.
+		linked, err := s.attachmentBySHA(ctx, versionID, conversationID, part.SHA256)
+		if err != nil {
+			return nil, nil, err
+		}
+		if linked != nil {
+			if isAttachmentPending(linked.ExtractionStatus) {
+				return nil, nil, attachmentPendingError(*linked)
+			}
+			if imagePart != nil {
+				prepared = append(prepared, *imagePart)
+			} else {
+				prepared = append(prepared, part)
+			}
+			continue
+		}
+
+		// A blocked earlier attempt already pre-registered this content: reuse
+		// that row (and its extraction) instead of inserting a duplicate.
+		draft, err := s.unlinkedAttachmentBySHA(ctx, versionID, part.SHA256)
+		if err != nil {
+			return nil, nil, err
+		}
+		if draft != nil {
+			if isAttachmentPending(draft.ExtractionStatus) {
+				return nil, nil, attachmentPendingError(*draft)
+			}
+			attachmentIDs = append(attachmentIDs, draft.ID)
+			if imagePart != nil {
+				prepared = append(prepared, *imagePart)
+			} else {
+				prepared = append(prepared, part)
+			}
+			continue
+		}
+
+		attachment, err := s.createAttachment(ctx, versionID, conversationID, 0, part, name, content, actorID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if isAttachmentPending(attachment.ExtractionStatus) {
+			// The row now exists and extraction is enqueued; the message is
+			// rejected until the retry sees the same row as done.
+			return nil, nil, attachmentPendingError(attachment)
+		}
+		attachmentIDs = append(attachmentIDs, attachment.ID)
+		if imagePart != nil {
+			prepared = append(prepared, *imagePart)
+		} else {
+			prepared = append(prepared, part)
+		}
+	}
+	if err := version.ValidateUserMessageParts(prepared); err != nil {
+		return nil, nil, err
+	}
+	return prepared, attachmentIDs, nil
+}
+
+// isAttachmentPending reports whether extraction still has to finish.
+func isAttachmentPending(status string) bool {
+	return status == version.AttachmentPending || status == version.AttachmentProcessing
+}
+
+// imagePartFromAttachment reads the uploaded image and builds the validated
+// image part that replaces the attachment part in the stored message. It also
+// returns the content metadata so the caller can create the attachment row
+// without opening the object a second time.
+func (s *AttachmentService) imagePartFromAttachment(ctx context.Context, part version.MessagePart) (version.MessagePart, ContentObject, error) {
+	content, reader, err := s.storage.Open(ctx, part.SHA256)
+	if err != nil {
+		if isPlatformNotFound(err) {
+			return version.MessagePart{}, ContentObject{}, platform.Invalid("sha256", "content object was not uploaded")
+		}
+		return version.MessagePart{}, ContentObject{}, err
+	}
+	defer reader.Close()
+	if content.Size != part.Size {
+		return version.MessagePart{}, ContentObject{}, platform.Invalid("size", "does not match the uploaded content size")
+	}
+	if s.images == nil {
+		return version.MessagePart{}, ContentObject{}, errors.New("attachment service has no image prober")
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, version.MaxAttachmentBytes+1))
+	if err != nil {
+		return version.MessagePart{}, ContentObject{}, err
+	}
+	if int64(len(data)) > version.MaxAttachmentBytes {
+		return version.MessagePart{}, ContentObject{}, platform.Invalid("size", "image exceeds the 10 MiB upload limit")
+	}
+	mime, width, height, err := s.images.Probe(ctx, part.MIME, data)
+	if err != nil {
+		return version.MessagePart{}, ContentObject{}, err
+	}
+	return version.MessagePart{
+		Type:    version.MessagePartImage,
+		MIME:    mime,
+		DataRef: part.SHA256,
+		Width:   width,
+		Height:  height,
+	}, content, nil
+}
+
+// attachmentContent verifies that the uploaded object exists and has the size
+// the message part declares, returning its metadata for row creation.
+func (s *AttachmentService) attachmentContent(ctx context.Context, part version.MessagePart) (ContentObject, error) {
+	content, reader, err := s.storage.Open(ctx, part.SHA256)
+	if err != nil {
+		if isPlatformNotFound(err) {
+			return ContentObject{}, platform.Invalid("sha256", "content object was not uploaded")
+		}
+		return ContentObject{}, err
+	}
+	_ = reader.Close()
+	if content.Size != part.Size {
+		return ContentObject{}, platform.Invalid("size", "does not match the uploaded content size")
+	}
+	return content, nil
+}
+
+// attachmentBySHA finds an attachment already linked to this conversation via
+// one of its messages whose original content matches sha256.
+func (s *AttachmentService) attachmentBySHA(ctx context.Context, versionID, conversationID int64, sha256 string) (*version.Attachment, error) {
+	attachments, err := s.repo.ListByConversation(ctx, versionID, conversationID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	for _, attachment := range attachments {
+		objectID, err := s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID)
+		if err != nil {
+			return nil, err
+		}
+		if objectID == sha256 {
+			found := attachment
+			return &found, nil
+		}
+	}
+	return nil, nil
+}
+
+// unlinkedAttachmentBySHA finds a row pre-registered by an earlier blocked
+// message post for the same version and content.
+func (s *AttachmentService) unlinkedAttachmentBySHA(ctx context.Context, versionID int64, sha256 string) (*version.Attachment, error) {
+	attachments, err := s.repo.ListUnlinkedByVersion(ctx, versionID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	for _, attachment := range attachments {
+		objectID, err := s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID)
+		if err != nil {
+			return nil, err
+		}
+		if objectID == sha256 {
+			found := attachment
+			return &found, nil
+		}
+	}
+	return nil, nil
+}
+
+// attachmentPendingError is the typed 409 for a message that references an
+// attachment still being parsed; the client can retry after the parse finishes.
+func attachmentPendingError(attachment version.Attachment) error {
+	return &platform.Error{
+		Status:    http.StatusConflict,
+		Code:      AttachmentPendingCode,
+		Message:   AttachmentParsingMessage,
+		Retryable: true,
+		Details: map[string]any{
+			"attachment_id": platformid.Format(attachment.ID),
+			"name":          attachment.Name,
+		},
+	}
+}
+
+// ReadImage resolves an image part's content data_ref into the original bytes
+// plus the sniffed MIME for a vision model. The data_ref is the content-ledger
+// SHA-256; the bytes are re-probed so a non-image object can never reach the
+// model as an image.
+func (s *AttachmentService) ReadImage(ctx context.Context, dataRef string) (string, []byte, error) {
+	dataRef = strings.ToLower(strings.TrimSpace(dataRef))
+	if !isContentSHA256(dataRef) {
+		return "", nil, platform.Invalid("data_ref", "must be the 64 lowercase hex content sha256")
+	}
+	content, reader, err := s.storage.Open(ctx, dataRef)
+	if err != nil {
+		if isPlatformNotFound(err) {
+			return "", nil, platform.NotFound("content")
+		}
+		return "", nil, err
+	}
+	defer reader.Close()
+	if content.Size > version.MaxAttachmentBytes {
+		return "", nil, platform.Invalid("data_ref", "image exceeds the 10 MiB upload limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, version.MaxAttachmentBytes+1))
+	if err != nil {
+		return "", nil, err
+	}
+	if int64(len(data)) > version.MaxAttachmentBytes {
+		return "", nil, platform.Invalid("data_ref", "image exceeds the 10 MiB upload limit")
+	}
+	if s.images == nil {
+		return "", nil, errors.New("attachment service has no image prober")
+	}
+	mime, _, _, err := s.images.Probe(ctx, content.MIME, data)
+	if err != nil {
+		return "", nil, err
+	}
+	return mime, data, nil
+}
+
+func isContentSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Get returns one attachment scoped to its version.
@@ -178,6 +482,27 @@ type AttachmentInfo struct {
 	ErrorText             string
 	Text                  string
 	TotalChars            int
+}
+
+// AttachmentPendingCode is the stable error code of the typed 409 returned when
+// a message references an attachment whose extraction is still running
+// (spec §8.5: "解析中，可重试" instead of silently ignoring the attachment).
+const AttachmentPendingCode = "attachment_pending"
+
+// AttachmentTextRead is the structured outcome of reading attachment text. A
+// non-done status is a normal result: callers report it to the model instead
+// of turning it into a 409 state_conflict (§8.5).
+type AttachmentTextRead struct {
+	AttachmentID int64
+	Name         string
+	MIME         string
+	Status       string
+	Text         string
+	Offset       int
+	TotalChars   int
+	Truncated    bool
+	Error        string
+	Retryable    bool
 }
 
 // AttachmentMeta is the compact attachment list entry for agent tools.
@@ -267,12 +592,13 @@ func (s *AttachmentService) ListAttachments(ctx context.Context, versionID, conv
 	return metas, nil
 }
 
-// ReadAttachmentText returns a character window of the extracted text of one
-// conversation attachment. offset is a rune offset; maxChars defaults to 4000
-// and is capped at 20000.
-func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error) {
+// ReadAttachmentText returns the structured status and a character window of
+// the extracted text of one conversation attachment. offset is a rune offset;
+// maxChars defaults to 4000 and is capped at 20000. A non-done status is
+// returned as data, never as a state_conflict error.
+func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (AttachmentTextRead, error) {
 	if offset < 0 {
-		return "", 0, platform.Invalid("offset", "must be zero or positive")
+		return AttachmentTextRead{}, platform.Invalid("offset", "must be zero or positive")
 	}
 	if maxChars <= 0 {
 		maxChars = DefaultAttachmentReadChars
@@ -282,25 +608,60 @@ func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, c
 	}
 	attachment, err := s.conversationAttachment(ctx, versionID, conversationID, attachmentID)
 	if err != nil {
-		return "", 0, err
+		return AttachmentTextRead{}, err
 	}
-	if attachment.ExtractionStatus != version.AttachmentDone {
-		return "", 0, platform.StateConflict("attachment text is not available")
+	result := AttachmentTextRead{
+		AttachmentID: attachment.ID,
+		Name:         attachment.Name,
+		MIME:         attachment.MIME,
+		Status:       attachment.ExtractionStatus,
+		Offset:       offset,
 	}
-	text, err := s.readExtractedText(ctx, attachment)
-	if err != nil {
-		return "", 0, err
+	switch attachment.ExtractionStatus {
+	case version.AttachmentDone:
+		text, err := s.readExtractedText(ctx, attachment)
+		if err != nil {
+			return AttachmentTextRead{}, err
+		}
+		runes := []rune(text)
+		result.TotalChars = len(runes)
+		if offset < len(runes) {
+			end := offset + maxChars
+			if end > len(runes) {
+				end = len(runes)
+			}
+			result.Text = string(runes[offset:end])
+			result.Truncated = end < len(runes)
+		}
+	case version.AttachmentPending, version.AttachmentProcessing:
+		result.Error = AttachmentParsingMessage
+		result.Retryable = true
+	case version.AttachmentFailed:
+		result.Error = attachmentFailureText(attachment)
+	case version.AttachmentSkipped:
+		result.Error = "attachment was skipped because it has no extractable text; use an image part for vision"
+	default:
+		result.Error = "attachment text is not available yet"
 	}
-	runes := []rune(text)
-	total := len(runes)
-	if offset >= total {
-		return "", total, nil
+	return result, nil
+}
+
+// AttachmentParsingMessage is the explicit "still parsing, retry later" result
+// returned by attachment.read_text instead of a 409 (§8.5).
+const AttachmentParsingMessage = "附件解析中，可重试"
+
+// attachmentFailureText renders the stored parse failure reason. It keeps the
+// parser detail (for example the legacy .doc/.ppt save-as hint) instead of
+// collapsing it into a generic "text is not available" message.
+func attachmentFailureText(attachment version.Attachment) string {
+	switch {
+	case attachment.ExtractionErrorCode == "":
+		return attachment.ExtractionErrorText
+	case attachment.ExtractionErrorText == "":
+		return attachment.ExtractionErrorCode
+	default:
+		return attachment.ExtractionErrorCode + ": " + attachment.ExtractionErrorText
 	}
-	end := offset + maxChars
-	if end > total {
-		end = total
-	}
-	return string(runes[offset:end]), total, nil
 }
 
 // AttachmentImageRef returns the original content reference of an image
@@ -474,10 +835,12 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 
 func (s *AttachmentService) failExtraction(ctx context.Context, attachment version.Attachment, extractErr error) (ExtractionResult, error) {
 	code := version.AttachmentErrorExtraction
-	message := "attachment text extraction failed"
+	message := "attachment text extraction failed: " + extractErr.Error()
 	if errors.Is(extractErr, version.ErrUnsupportedAttachmentFormat) {
 		code = version.AttachmentErrorUnsupported
-		message = "unsupported attachment format"
+		// Keep the parser's detailed reason (the legacy .doc/.ppt save-as hint
+		// wraps this sentinel) instead of overwriting it.
+		message = extractErr.Error()
 	}
 	now := s.clock.Now()
 	if err := s.repo.MarkFailed(ctx, attachment.ID, code, message, now); err != nil {

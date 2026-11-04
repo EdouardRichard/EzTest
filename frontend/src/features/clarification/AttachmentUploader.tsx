@@ -1,7 +1,7 @@
 "use client"
 
 import { Paperclip, X } from "lucide-react"
-import { useId, useRef, useState } from "react"
+import { forwardRef, useEffect, useId, useImperativeHandle, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
@@ -13,6 +13,20 @@ import type { UploadedAttachment } from "./types"
 /** P1 attachment limit from `POST /api/content` (10 MiB, spec §7). */
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
+/** Native uploader accept list (spec §8.1). */
+export const ATTACHMENT_ACCEPT =
+  ".md,.markdown,.txt,.html,.htm,.docx,.pptx,.xlsx,.pdf,.png,.jpg,.jpeg,.webp"
+
+/** Legacy binary Office formats are rejected with a save-as hint (spec §8.1). */
+export function isLegacyOfficeFile(name: string): boolean {
+  return /\.(doc|ppt)$/i.test(name.trim())
+}
+
+/** Mirrors the backend's save-as message so the hint is visible before upload. */
+export function legacyOfficeMessage(name: string): string {
+  return `附件「${name}」是旧版 Office 格式（.doc/.ppt），请另存为 .docx/.pptx 后重新上传`
+}
+
 export type AttachmentUploaderProps = {
   items: UploadedAttachment[]
   onChange: (items: UploadedAttachment[]) => void
@@ -20,6 +34,18 @@ export type AttachmentUploaderProps = {
   onUploadingChange?: (uploading: boolean) => void
   maxBytes?: number
   disabled?: boolean
+}
+
+/** Imperative bridge used by the composer's paste/drop handlers. */
+export type AttachmentUploaderHandle = {
+  addFiles: (files: FileList | File[]) => void
+}
+
+/** One file queued for upload; rendered as a "解析中" chip until it resolves. */
+type PendingUpload = {
+  key: number
+  name: string
+  file: File
 }
 
 function describeError(cause: unknown): string {
@@ -30,112 +56,202 @@ function describeError(cause: unknown): string {
 /**
  * Uploads files through `POST /api/content` before the message is sent. Each
  * successful upload becomes a `{sha256,name,mime,size}` part; failures stay
- * visible inline and never block the message composer.
+ * visible inline and never block the message composer. Paste/drop files enter
+ * through `addFiles` so they use this same pipeline.
  */
-export function AttachmentUploader({
-  items,
-  onChange,
-  onUploadingChange,
-  maxBytes = MAX_ATTACHMENT_BYTES,
-  disabled = false,
-}: AttachmentUploaderProps) {
-  const inputRef = useRef<HTMLInputElement>(null)
-  const inputId = useId()
-  const [uploading, setUploading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+export const AttachmentUploader = forwardRef<AttachmentUploaderHandle, AttachmentUploaderProps>(
+  function AttachmentUploader(
+    {
+      items,
+      onChange,
+      onUploadingChange,
+      maxBytes = MAX_ATTACHMENT_BYTES,
+      disabled = false,
+    }: AttachmentUploaderProps,
+    ref,
+  ) {
+    const inputRef = useRef<HTMLInputElement>(null)
+    const inputId = useId()
+    const [uploading, setUploading] = useState(false)
+    const [error, setError] = useState<string | null>(null)
+    const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([])
+    // Latest committed list: uploads resolve asynchronously, so merging against
+    // the stale `items` prop silently drops a concurrent paste/drop batch.
+    const itemsRef = useRef(items)
+    const queueRef = useRef<Promise<void>>(Promise.resolve())
+    const pendingCountRef = useRef(0)
+    const nextKeyRef = useRef(0)
 
-  function setUploadingState(next: boolean): void {
-    setUploading(next)
-    onUploadingChange?.(next)
-  }
+    useEffect(() => {
+      itemsRef.current = items
+    }, [items])
 
-  async function handleFiles(files: FileList | null): Promise<void> {
-    if (files === null || files.length === 0) return
-    setError(null)
+    function setUploadingState(next: boolean): void {
+      setUploading(next)
+      onUploadingChange?.(next)
+    }
 
-    const accepted: UploadedAttachment[] = []
-    let failure: string | null = null
-    setUploadingState(true)
-    try {
-      for (const file of Array.from(files)) {
-        if (file.size > maxBytes) {
-          failure = `附件「${file.name}」不能超过 ${formatBytes(maxBytes)}`
-          continue
-        }
-        try {
-          const content = await uploadContent(file)
-          accepted.push({
+    function beginPending(entries: PendingUpload[]): void {
+      if (entries.length === 0) return
+      const idle = pendingCountRef.current === 0
+      pendingCountRef.current += entries.length
+      setPendingUploads((current) => [...current, ...entries])
+      if (idle) setUploadingState(true)
+    }
+
+    function finishPending(keys: number[]): void {
+      if (keys.length === 0) return
+      const finished = new Set(keys)
+      pendingCountRef.current = Math.max(0, pendingCountRef.current - keys.length)
+      setPendingUploads((current) => current.filter((entry) => !finished.has(entry.key)))
+      if (pendingCountRef.current === 0) setUploadingState(false)
+    }
+
+    function commit(next: UploadedAttachment[]): void {
+      itemsRef.current = next
+      onChange(next)
+    }
+
+    async function uploadEntry(
+      entry: PendingUpload,
+    ): Promise<{ accepted?: UploadedAttachment; failure?: string }> {
+      if (isLegacyOfficeFile(entry.name)) {
+        return { failure: legacyOfficeMessage(entry.name) }
+      }
+      if (entry.file.size > maxBytes) {
+        return { failure: `附件「${entry.name}」不能超过 ${formatBytes(maxBytes)}` }
+      }
+      try {
+        const content = await uploadContent(entry.file)
+        return {
+          accepted: {
             sha256: content.sha256,
-            name: file.name,
+            name: entry.name,
             mime: content.mime,
             size: content.size,
-          })
-        } catch (cause) {
-          failure = `${file.name}：${describeError(cause)}`
+          },
         }
+      } catch (cause) {
+        return { failure: `${entry.name}：${describeError(cause)}` }
       }
-      if (accepted.length > 0) onChange([...items, ...accepted])
-      if (failure !== null) setError(failure)
-    } finally {
-      setUploadingState(false)
     }
-  }
 
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <input
-          ref={inputRef}
-          id={inputId}
-          type="file"
-          multiple
-          className="hidden"
-          data-testid="attachment-input"
-          accept=".md,.markdown,.txt,.docx,.pptx,.pdf,.png,.jpg,.jpeg,.webp"
-          disabled={disabled || uploading}
-          onChange={(event) => {
-            void handleFiles(event.target.files)
-            event.target.value = ""
-          }}
-        />
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label="添加附件"
-          disabled={disabled || uploading}
-          onClick={() => inputRef.current?.click()}
-          className="gap-1 px-2 text-muted-foreground"
-        >
-          <Paperclip className="size-3.5" aria-hidden="true" />
-          {uploading ? "上传中…" : "附件"}
-        </Button>
-        {items.map((item) => (
-          <span
-            key={item.sha256}
-            className={cn(
-              "inline-flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5",
-              "text-[11px] text-muted-foreground",
-            )}
+    async function uploadBatch(entries: PendingUpload[]): Promise<void> {
+      let failure: string | null = null
+      const finished = new Set<number>()
+      // Do not clear a previous batch's inline error up front: a later batch
+      // succeeding must not hide an earlier failed upload.
+      try {
+        for (const entry of entries) {
+          const result = await uploadEntry(entry)
+          if (result.failure !== undefined) failure = result.failure
+          if (result.accepted !== undefined) commit([...itemsRef.current, result.accepted])
+          finished.add(entry.key)
+          finishPending([entry.key])
+        }
+      } finally {
+        // Defensive: an unexpected throw must not leave the send button wedged.
+        const remaining = entries
+          .filter((entry) => !finished.has(entry.key))
+          .map((entry) => entry.key)
+        finishPending(remaining)
+        if (failure !== null) setError(failure)
+      }
+    }
+
+    function addFiles(files: FileList | File[] | null): void {
+      if (files === null || disabled) return
+      const entries: PendingUpload[] = []
+      for (const file of Array.from(files)) {
+        entries.push({ key: nextKeyRef.current++, name: file.name, file })
+      }
+      if (entries.length === 0) return
+      // Queue instead of running concurrently: two overlapping paste/drop
+      // batches used to race on the items state and lose one of them.
+      beginPending(entries)
+      queueRef.current = queueRef.current
+        .then(() => uploadBatch(entries))
+        .catch(() => {
+          // uploadBatch records its own failure; keep the queue usable.
+        })
+    }
+
+    useImperativeHandle(ref, () => ({
+      addFiles(files: FileList | File[]) {
+        addFiles(files)
+      },
+    }))
+
+    return (
+      <div className="flex flex-col gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <input
+            ref={inputRef}
+            id={inputId}
+            type="file"
+            multiple
+            className="hidden"
+            data-testid="attachment-input"
+            accept={ATTACHMENT_ACCEPT}
+            disabled={disabled || uploading}
+            onChange={(event) => {
+              addFiles(event.target.files)
+              event.target.value = ""
+            }}
+          />
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label="添加附件"
+            disabled={disabled || uploading}
+            onClick={() => inputRef.current?.click()}
+            className="gap-1 px-2 text-muted-foreground"
           >
-            {item.name}
-            <button
-              type="button"
-              aria-label={`移除附件 ${item.name}`}
-              className="rounded-full p-0.5 hover:bg-background hover:text-foreground"
-              onClick={() =>
-                onChange(items.filter((candidate) => candidate.sha256 !== item.sha256))
-              }
+            <Paperclip className="size-3.5" aria-hidden="true" />
+            {uploading ? "上传中…" : "附件"}
+          </Button>
+          {pendingUploads.map((entry) => (
+            <span
+              key={`pending-${entry.key}`}
+              data-testid="attachment-pending"
+              aria-busy="true"
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full border border-dashed border-border bg-muted px-2 py-0.5",
+                "text-[11px] text-muted-foreground",
+              )}
             >
-              <X className="size-3" aria-hidden="true" />
-            </button>
-          </span>
-        ))}
+              {entry.name}
+              <span className="text-[10px]">解析中…</span>
+            </span>
+          ))}
+          {items.map((item) => (
+            <span
+              key={item.sha256}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5",
+                "text-[11px] text-muted-foreground",
+              )}
+            >
+              {item.name}
+              <button
+                type="button"
+                aria-label={`移除附件 ${item.name}`}
+                className="rounded-full p-0.5 hover:bg-background hover:text-foreground"
+                onClick={() =>
+                  commit(itemsRef.current.filter((candidate) => candidate.sha256 !== item.sha256))
+                }
+              >
+                <X className="size-3" aria-hidden="true" />
+              </button>
+            </span>
+          ))}
+        </div>
+        {error !== null ? (
+          <p role="alert" className="text-[11px] text-destructive">
+            {error}
+          </p>
+        ) : null}
       </div>
-      {error !== null ? (
-        <p role="alert" className="text-[11px] text-destructive">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  )
-}
+    )
+  },
+)

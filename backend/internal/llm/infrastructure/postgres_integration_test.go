@@ -5,11 +5,13 @@ package llminfra_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
@@ -27,12 +29,17 @@ func ptr[T any](value T) *T { return &value }
 
 func createConfig(t *testing.T, repo *llminfra.Repository, ids *id.Snowflake, name string, isDefault bool) llm.Config {
 	t.Helper()
+	return createConfigWithProtocol(t, repo, ids, name, llm.ProtocolOpenAI, isDefault)
+}
+
+func createConfigWithProtocol(t *testing.T, repo *llminfra.Repository, ids *id.Snowflake, name, protocol string, isDefault bool) llm.Config {
+	t.Helper()
 	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	cfg := llm.Config{
 		ID:             ids.Next(),
 		Name:           name,
 		Provider:       llm.ProviderOpenAI,
-		Protocol:       llm.ProtocolOpenAI,
+		Protocol:       protocol,
 		BaseURL:        "http://127.0.0.1:13334/v1",
 		APIKey:         "sk-plain-text",
 		Headers:        map[string]string{"X-Org": "team-a"},
@@ -68,6 +75,9 @@ func TestRepositoryConfigLifecycle(t *testing.T) {
 	}
 	if stored.Headers["X-Org"] != "team-a" {
 		t.Fatalf("headers = %#v", stored.Headers)
+	}
+	if stored.ThinkingType != llm.ThinkingTypeAuto || stored.ReasoningEffort != llm.ReasoningEffortNone || stored.DefaultModelID != 0 {
+		t.Fatalf("0.2.1 defaults = %q/%q/%d", stored.ThinkingType, stored.ReasoningEffort, stored.DefaultModelID)
 	}
 	if stored.CreatedBy == nil || *stored.CreatedBy != 42 {
 		t.Fatalf("created_by = %v", stored.CreatedBy)
@@ -257,5 +267,214 @@ func TestRepositoryModelUpsertAndCascade(t *testing.T) {
 	}
 	if len(remaining) != 0 {
 		t.Fatalf("models survived the config delete: %#v", remaining)
+	}
+}
+
+// TestCanonicalProtocolPersists pins that both canonical 0.2.1 protocol values
+// survive the database round trip. The legacy CHECK in llm_0001_llm.sql only
+// allowed openai/openai_compatible, so canonical values validated in Go but
+// could not be stored.
+func TestCanonicalProtocolPersists(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := llminfra.NewRepository(pool)
+	ids := newIDs(t)
+	ctx := context.Background()
+
+	canonical := []string{
+		string(llm.ProtocolOpenAIChatCompletions),
+		string(llm.ProtocolOpenAIResponses),
+	}
+	for _, protocol := range canonical {
+		created := createConfigWithProtocol(t, repo, ids, "canonical-"+protocol, protocol, false)
+
+		stored, err := repo.GetConfig(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("GetConfig(%s): %v", protocol, err)
+		}
+		if stored.Protocol != protocol {
+			t.Fatalf("stored protocol = %q, want %q", stored.Protocol, protocol)
+		}
+
+		stored.UpdatedAt = stored.UpdatedAt.Add(time.Hour)
+		updated, err := repo.UpdateConfig(ctx, stored)
+		if err != nil {
+			t.Fatalf("UpdateConfig(%s): %v", protocol, err)
+		}
+		if updated.Protocol != protocol {
+			t.Fatalf("updated protocol = %q, want %q", updated.Protocol, protocol)
+		}
+	}
+
+	list, err := repo.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs: %v", err)
+	}
+	got := make(map[string]bool, len(list))
+	for _, cfg := range list {
+		got[cfg.Protocol] = true
+	}
+	for _, protocol := range canonical {
+		if !got[protocol] {
+			t.Fatalf("ListConfigs lost canonical protocol %q: %#v", protocol, list)
+		}
+	}
+}
+
+// TestInvalidProtocolTyped400 pins that a CHECK violation on
+// llm_config.protocol (PostgreSQL 23514) becomes the stable 400
+// invalid_protocol instead of an unmapped 500.
+func TestInvalidProtocolTyped400(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := llminfra.NewRepository(pool)
+	ids := newIDs(t)
+	ctx := context.Background()
+
+	assertInvalidProtocol := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("invalid protocol was accepted")
+		}
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("error = %T %v, want a typed *platform.Error", err, err)
+		}
+		if apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_protocol" {
+			t.Fatalf("error = %d %q, want 400 invalid_protocol", apiErr.Status, apiErr.Code)
+		}
+	}
+
+	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	invalid := llm.Config{
+		ID:             ids.Next(),
+		Name:           "invalid-protocol",
+		Provider:       llm.ProviderOpenAI,
+		Protocol:       "anthropic",
+		BaseURL:        "http://127.0.0.1:13334/v1",
+		TimeoutSeconds: 60,
+		MaxRetries:     2,
+		Status:         llm.StatusActive,
+		CreatedAt:      at,
+		UpdatedAt:      at,
+	}
+	_, createErr := repo.CreateConfig(ctx, invalid)
+	assertInvalidProtocol(t, createErr)
+
+	valid := createConfig(t, repo, ids, "valid-before-invalid-update", false)
+	valid.Protocol = "anthropic"
+	valid.UpdatedAt = valid.UpdatedAt.Add(time.Hour)
+	_, updateErr := repo.UpdateConfig(ctx, valid)
+	assertInvalidProtocol(t, updateErr)
+}
+
+// TestRepositoryThinkingAndCapabilitiesRoundTrip pins the 0.2.1 columns:
+// llm_config.thinking_type/reasoning_effort/default_model_id and
+// llm_model.capabilities/deprecated (spec §7.2/§7.3).
+func TestRepositoryThinkingAndCapabilitiesRoundTrip(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := llminfra.NewRepository(pool)
+	ids := newIDs(t)
+	ctx := context.Background()
+	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+
+	cfg := llm.Config{
+		ID:              ids.Next(),
+		Name:            "Thinking",
+		Provider:        llm.ProviderOpenAI,
+		Protocol:        string(llm.ProtocolOpenAIChatCompletions),
+		BaseURL:         "http://127.0.0.1:13334/v1",
+		TimeoutSeconds:  60,
+		MaxRetries:      2,
+		Status:          llm.StatusActive,
+		ThinkingType:    llm.ThinkingTypeEnabled,
+		ReasoningEffort: llm.ReasoningEffortHigh,
+		CreatedAt:       at,
+		UpdatedAt:       at,
+	}
+	if _, err := repo.CreateConfig(ctx, cfg); err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	reasoning := llm.Model{
+		ID: ids.Next(), ConfigID: cfg.ID, Model: "reasoning-model", DisplayName: "reasoning-model",
+		ContextWindow: 64000, MaxOutput: 8192, SupportsTools: true,
+		Capabilities: llm.Capabilities{
+			SupportsTools:       true,
+			SupportsReasoning:   true,
+			SupportsPromptCache: true,
+			ContextWindow:       64000,
+		},
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive, CreatedAt: at, UpdatedAt: at,
+	}
+	retired := llm.Model{
+		ID: ids.Next(), ConfigID: cfg.ID, Model: "retired-model", DisplayName: "retired-model",
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive, CreatedAt: at, UpdatedAt: at,
+	}
+	if _, err := repo.UpsertModels(ctx, cfg.ID, []llm.Model{reasoning, retired}, at); err != nil {
+		t.Fatalf("UpsertModels: %v", err)
+	}
+
+	cfg.DefaultModelID = reasoning.ID
+	cfg.UpdatedAt = at.Add(time.Hour)
+	if _, err := repo.UpdateConfig(ctx, cfg); err != nil {
+		t.Fatalf("UpdateConfig default model: %v", err)
+	}
+	stored, err := repo.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	if stored.ThinkingType != llm.ThinkingTypeEnabled || stored.ReasoningEffort != llm.ReasoningEffortHigh {
+		t.Fatalf("thinking settings = %q/%q", stored.ThinkingType, stored.ReasoningEffort)
+	}
+	if stored.DefaultModelID != reasoning.ID {
+		t.Fatalf("default_model_id = %d, want %d", stored.DefaultModelID, reasoning.ID)
+	}
+
+	models, err := repo.ListModelsByConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("ListModelsByConfig: %v", err)
+	}
+	var storedReasoning *llm.Model
+	for i := range models {
+		if models[i].Model == "reasoning-model" {
+			storedReasoning = &models[i]
+		}
+	}
+	if storedReasoning == nil {
+		t.Fatalf("reasoning model missing: %#v", models)
+	}
+	if !storedReasoning.Capabilities.SupportsTools || !storedReasoning.Capabilities.SupportsReasoning ||
+		!storedReasoning.Capabilities.SupportsPromptCache || storedReasoning.Capabilities.ContextWindow != 64000 {
+		t.Fatalf("capabilities = %#v", storedReasoning.Capabilities)
+	}
+
+	// A refresh without the retired model keeps it and marks it deprecated.
+	nextAt := at.Add(2 * time.Hour)
+	reasoning.ContextWindow = 128000
+	reasoning.Capabilities.ContextWindow = 128000
+	reasoning.UpdatedAt = nextAt
+	if _, err := repo.UpsertModels(ctx, cfg.ID, []llm.Model{reasoning}, nextAt); err != nil {
+		t.Fatalf("second UpsertModels: %v", err)
+	}
+	models, err = repo.ListModelsByConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("second ListModelsByConfig: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("models = %#v, want the retired model kept", models)
+	}
+	for _, model := range models {
+		switch model.Model {
+		case "retired-model":
+			if !model.Deprecated {
+				t.Fatalf("retired model = %#v, want deprecated", model)
+			}
+		case "reasoning-model":
+			if model.Deprecated {
+				t.Fatalf("live model = %#v, want not deprecated", model)
+			}
+			if model.ContextWindow != 128000 || model.Capabilities.ContextWindow != 128000 {
+				t.Fatalf("refreshed model = %#v", model)
+			}
+		}
 	}
 }

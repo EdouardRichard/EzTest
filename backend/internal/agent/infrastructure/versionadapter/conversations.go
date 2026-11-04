@@ -40,6 +40,13 @@ func (a *Adapter) Snapshot(ctx context.Context, versionID, conversationID int64,
 	}
 	portMessages := make([]agentapp.ConversationMessage, 0, len(messages))
 	for _, message := range messages {
+		// A job card is a UI artifact of a background job, not a conversation
+		// turn: the card message carries no text, so injecting it would add an
+		// empty assistant turn to the Host/curator prompt (D25 keeps background
+		// work out of the conversation context).
+		if isJobCardOnlyMessage(message) {
+			continue
+		}
 		portMessages = append(portMessages, conversationMessage(message, versionID))
 	}
 	summaryText := summary.Summary
@@ -71,6 +78,24 @@ func (a *Adapter) ConversationKind(ctx context.Context, versionID, conversationI
 		return "", err
 	}
 	return conversation.Kind, nil
+}
+
+// ModelOverride returns the conversation-level 0.2.1 model override stored on
+// the conversation ("" when unset). The runner reads it before model resolution
+// so the user's last model switch applies to the next run. Ownership is
+// enforced by the scoped Get.
+func (a *Adapter) ModelOverride(ctx context.Context, versionID, conversationID int64) (string, error) {
+	if a.conversations == nil {
+		return "", a.missing("conversations")
+	}
+	conversation, err := a.conversations.Get(ctx, versionID, conversationID)
+	if err != nil {
+		return "", err
+	}
+	if conversation.ModelOverride == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*conversation.ModelOverride), nil
 }
 
 // GetMessage returns one UI-thread message, scoped to its conversation/version.
@@ -121,6 +146,30 @@ func (a *Adapter) AppendAssistantMessage(ctx context.Context, in agentapp.Assist
 	return message, nil
 }
 
+// UpsertJobCard stores or refreshes the single job_card part of one background
+// job in the conversation thread. The version context owns validation and the
+// one-card-per-job idempotency; the adapter only maps the runtime part shape.
+func (a *Adapter) UpsertJobCard(ctx context.Context, versionID, conversationID int64, part agentapp.ConversationPart) (agentapp.ConversationMessage, error) {
+	if a.conversations == nil {
+		return agentapp.ConversationMessage{}, a.missing("conversations")
+	}
+	if versionID <= 0 || conversationID <= 0 {
+		return agentapp.ConversationMessage{}, platform.Invalid("conversation_id", "must be positive decimal IDs")
+	}
+	mapped, err := versionPart(part)
+	if err != nil {
+		return agentapp.ConversationMessage{}, err
+	}
+	if mapped.Type != version.MessagePartJobCard {
+		return agentapp.ConversationMessage{}, platform.Invalid("type", "must be job_card")
+	}
+	view, _, err := a.conversations.UpsertJobCard(ctx, versionID, conversationID, mapped)
+	if err != nil {
+		return agentapp.ConversationMessage{}, err
+	}
+	return conversationMessage(view, versionID), nil
+}
+
 // UpdateSummary writes a new conversation summary revision and returns the
 // stored version.
 func (a *Adapter) UpdateSummary(ctx context.Context, versionID, conversationID int64, summary string, pinnedFacts []string) (agentapp.ConversationSummary, error) {
@@ -166,6 +215,17 @@ func (a *Adapter) allMessages(ctx context.Context, versionID, conversationID int
 	return all, nil
 }
 
+// isJobCardOnlyMessage reports whether a UI message exists only to carry a
+// background job card. Those messages are UI artifacts, not conversation turns:
+// the adapter keeps them out of the LLM history (an empty assistant turn would
+// otherwise pollute the Host/curator prompt).
+func isJobCardOnlyMessage(message versionapp.MessageView) bool {
+	if message.Role != version.MessageRoleAssistant || len(message.Parts) != 1 {
+		return false
+	}
+	return message.Parts[0].Type == version.MessagePartJobCard
+}
+
 func conversationMessage(view versionapp.MessageView, versionID int64) agentapp.ConversationMessage {
 	texts := make([]string, 0)
 	parts := make([]agentapp.ConversationPart, 0, len(view.Parts))
@@ -197,6 +257,13 @@ func conversationPart(part version.MessagePart) agentapp.ConversationPart {
 			"mime":   part.MIME,
 			"size":   part.Size,
 		}
+	case version.MessagePartImage:
+		mapped.Data = map[string]any{
+			"mime":     part.MIME,
+			"data_ref": part.DataRef,
+			"width":    part.Width,
+			"height":   part.Height,
+		}
 	case version.MessagePartRequirementCard:
 		mapped.Data = map[string]any{
 			"requirement_id": platformid.Format(part.RequirementID),
@@ -208,6 +275,43 @@ func conversationPart(part version.MessagePart) agentapp.ConversationPart {
 		mapped.Data = map[string]any{
 			"requirement_id": platformid.Format(part.RequirementID),
 			"reason":         part.Reason,
+		}
+	case version.MessagePartThinking:
+		mapped.Data = map[string]any{"duration_ms": part.DurationMS}
+	case version.MessagePartToolCall:
+		mapped.Data = map[string]any{
+			"call_id":     part.CallID,
+			"name":        part.Name,
+			"status":      part.Status,
+			"arguments":   part.Arguments,
+			"result":      part.Result,
+			"duration_ms": part.DurationMS,
+			"error":       part.Error,
+		}
+	case version.MessagePartJobCard:
+		mapped.Data = map[string]any{
+			"job_id":     platformid.Format(part.JobID),
+			"kind":       part.JobKind,
+			"status":     part.Status,
+			"current":    part.Current,
+			"total":      part.Total,
+			"cancelable": part.Cancelable,
+			"code":       part.Code,
+			"reason":     part.Reason,
+		}
+	case version.MessagePartCaseCard:
+		mapped.Data = map[string]any{
+			"case_id":         platformid.Format(part.CaseID),
+			"case_version_id": platformid.Format(part.CaseVersionID),
+			"title":           part.Title,
+			"status":          part.Status,
+		}
+	case version.MessagePartError:
+		mapped.Data = map[string]any{
+			"code":      part.Code,
+			"message":   part.Message,
+			"retryable": part.Retryable,
+			"action":    part.Action,
 		}
 	}
 	return mapped
@@ -237,6 +341,14 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 		return version.MessagePart{
 			Type: part.Type, SHA256: sha256, Name: name, MIME: mime, Size: size,
 		}, nil
+	case version.MessagePartImage:
+		mime, _ := dataString(part.Data, "mime")
+		dataRef, _ := dataString(part.Data, "data_ref")
+		width, _ := dataInt(part.Data, "width")
+		height, _ := dataInt(part.Data, "height")
+		return version.MessagePart{
+			Type: part.Type, MIME: mime, DataRef: dataRef, Width: int(width), Height: int(height),
+		}, nil
 	case version.MessagePartRequirementCard:
 		requirementID, ok := dataInt(part.Data, "requirement_id")
 		if !ok || requirementID <= 0 {
@@ -258,8 +370,53 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 		return version.MessagePart{
 			Type: part.Type, RequirementID: requirementID, Reason: reason,
 		}, nil
+	case version.MessagePartThinking:
+		duration, _ := dataInt(part.Data, "duration_ms")
+		return version.MessagePart{Type: part.Type, Text: part.Text, DurationMS: duration}, nil
+	case version.MessagePartToolCall:
+		callID, _ := dataString(part.Data, "call_id")
+		name, _ := dataString(part.Data, "name")
+		status, _ := dataString(part.Data, "status")
+		arguments, _ := dataRaw(part.Data, "arguments")
+		result, _ := dataRaw(part.Data, "result")
+		duration, _ := dataInt(part.Data, "duration_ms")
+		errText, _ := dataString(part.Data, "error")
+		return version.MessagePart{
+			Type: part.Type, CallID: callID, Name: name, Status: status,
+			Arguments: arguments, Result: result, DurationMS: duration, Error: errText,
+		}, nil
+	case version.MessagePartJobCard:
+		jobID, _ := dataInt(part.Data, "job_id")
+		kind, _ := dataString(part.Data, "kind")
+		status, _ := dataString(part.Data, "status")
+		current, _ := dataInt(part.Data, "current")
+		total, _ := dataInt(part.Data, "total")
+		failureCode, _ := dataString(part.Data, "code")
+		failureReason, _ := dataString(part.Data, "reason")
+		return version.MessagePart{
+			Type: part.Type, JobID: jobID, JobKind: kind, Status: status,
+			Current: int(current), Total: int(total), Cancelable: dataBoolPtr(part.Data, "cancelable"),
+			Code: failureCode, Reason: failureReason,
+		}, nil
+	case version.MessagePartCaseCard:
+		caseID, _ := dataInt(part.Data, "case_id")
+		caseVersionID, _ := dataInt(part.Data, "case_version_id")
+		title, _ := dataString(part.Data, "title")
+		status, _ := dataString(part.Data, "status")
+		return version.MessagePart{
+			Type: part.Type, CaseID: caseID, CaseVersionID: caseVersionID, Title: title, Status: status,
+		}, nil
+	case version.MessagePartError:
+		code, _ := dataString(part.Data, "code")
+		message, _ := dataString(part.Data, "message")
+		retryable, _ := dataBool(part.Data, "retryable")
+		action, _ := dataString(part.Data, "action")
+		return version.MessagePart{
+			Type: part.Type, Code: code, Message: message, Retryable: retryable, Action: action,
+		}, nil
 	default:
-		return version.MessagePart{}, platform.Invalid("type", "must be text, attachment, requirement_card or rollback_proposal")
+		return version.MessagePart{}, platform.Invalid("type",
+			"must be text, thinking, tool_call, job_card, attachment, image, requirement_card, case_card, error or rollback_proposal")
 	}
 }
 
@@ -297,4 +454,60 @@ func dataInt(data map[string]any, key string) (int64, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+// dataRaw reads an object-shaped JSON field carried either as a decoded map or
+// as raw JSON (the runner stores json.RawMessage for tool arguments/results).
+func dataRaw(data map[string]any, key string) (json.RawMessage, bool) {
+	if data == nil {
+		return nil, false
+	}
+	value, ok := data[key]
+	if !ok || value == nil {
+		return nil, false
+	}
+	switch typed := value.(type) {
+	case json.RawMessage:
+		if len(typed) == 0 {
+			return nil, false
+		}
+		return typed, true
+	case []byte:
+		if len(typed) == 0 {
+			return nil, false
+		}
+		return json.RawMessage(typed), true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil, false
+		}
+		return json.RawMessage(trimmed), true
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return nil, false
+		}
+		return json.RawMessage(encoded), true
+	}
+}
+
+func dataBool(data map[string]any, key string) (bool, bool) {
+	if data == nil {
+		return false, false
+	}
+	value, ok := data[key]
+	if !ok || value == nil {
+		return false, false
+	}
+	typed, ok := value.(bool)
+	return typed, ok
+}
+
+func dataBoolPtr(data map[string]any, key string) *bool {
+	value, ok := dataBool(data, key)
+	if !ok {
+		return nil
+	}
+	return &value
 }

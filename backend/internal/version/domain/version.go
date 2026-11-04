@@ -31,12 +31,22 @@ type Version struct {
 	Title                     string
 	Status                    string
 	AutoDesignNewRequirements bool
-	ClosedAt                  *time.Time
-	CloseReason               string
-	CloseRunID                *int64
-	CreatedBy                 int64
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	// Stage is the deterministic stage-machine state (spec §5.3). Only the
+	// stage machine writes it; a new version starts at StageCreated.
+	Stage          Stage
+	StageEnteredAt time.Time
+	// Blocker is the user-visible reason recorded while the version is
+	// suspended in blocked/paused; it is empty otherwise.
+	Blocker string
+	// SuspendedFrom is the workflow stage recorded when the version entered
+	// blocked/paused. A resume can only return to this stage.
+	SuspendedFrom *Stage
+	ClosedAt      *time.Time
+	CloseReason   string
+	CloseRunID    *int64
+	CreatedBy     int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // Validate checks the editable version fields.

@@ -6,15 +6,18 @@ import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { InlineError } from "@/components/ui/ErrorState"
+import { ApiError } from "@/lib/api-client"
 import { formatDuration } from "@/lib/format"
 
 import { createIntent } from "./api"
 import { CaseRunDetailView } from "./CaseRunDetail"
+import { rerunPurpose } from "./intent-purpose"
 import {
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
   CASE_RUN_TERMINAL_STATUSES,
   failureClassLabel,
+  terminalCauseLabel,
 } from "./labels"
 import type { CaseRun, CaseRunDetail } from "./types"
 
@@ -25,8 +28,13 @@ export type ResultsPanelProps = {
   onSelect: (caseRunId: string) => void
   onPause: (caseRun: CaseRun) => void
   onResume: (caseRun: CaseRun) => void
-  /** Called after a retest intent was created so the workspace refetches. */
+  /** Called after a rerun intent was created so the workspace refetches. */
   onRerunComplete?: () => void
+  /**
+   * Opens the requirements tab on the closed requirement a retest was rejected
+   * for, so the user can reopen it and retry.
+   */
+  onOpenRequirement?: (requirementId: string) => void
   detail: CaseRunDetail | null
   detailLoading: boolean
   detailError: unknown
@@ -36,6 +44,19 @@ export type ResultsPanelProps = {
 const PINNED_ORDER: Partial<Record<CaseRun["status"], number>> = {
   failed: 0,
   blocked: 1,
+}
+
+/**
+ * The retest 409 for a closed requirement carries a stable
+ * `details.reason=requirement_closed` plus the requirement ID. That is the one
+ * error the UI can turn into a real recovery action instead of a dead end.
+ */
+function closedRequirementId(error: unknown): string | null {
+  if (!(error instanceof ApiError) || error.details.reason !== "requirement_closed") {
+    return null
+  }
+  const requirementId = error.details.requirement_id
+  return typeof requirementId === "string" && requirementId.length > 0 ? requirementId : null
 }
 
 function pinOrder(status: CaseRun["status"]): number {
@@ -60,7 +81,9 @@ function assertionProgress(caseRun: CaseRun): string | null {
 /**
  * Right column of the execution workspace (spec §12.1): the case-run result
  * list with failed/blocked pinned on top, row expansion into the step detail,
- * case-level pause/resume and the retest action (purpose=retest, spec §5.8).
+ * case-level pause/resume and the rerun action. A failed verdict creates a
+ * retest intent, while a passed case (no failed result) is rerun manually
+ * (spec §5.8) so the API retest gate stays intact.
  */
 export function ResultsPanel({
   versionId,
@@ -70,6 +93,7 @@ export function ResultsPanel({
   onPause,
   onResume,
   onRerunComplete,
+  onOpenRequirement,
   detail,
   detailLoading,
   detailError,
@@ -82,6 +106,7 @@ export function ResultsPanel({
   const ordered = [...caseRuns].sort(
     (left, right) => pinOrder(left.status) - pinOrder(right.status),
   )
+  const closedRetestRequirement = closedRequirementId(rerunError)
 
   async function rerun(caseRun: CaseRun): Promise<void> {
     setRerunningId(caseRun.id)
@@ -89,7 +114,7 @@ export function ResultsPanel({
     try {
       await createIntent(versionId, {
         case_version_id: caseRun.case_version_id,
-        purpose: "retest",
+        purpose: rerunPurpose(caseRun),
       })
       setRerunConfirmId(null)
       onRerunComplete?.()
@@ -114,6 +139,22 @@ export function ResultsPanel({
       {rerunError !== null ? (
         <div className="border-b border-border px-3 py-2">
           <InlineError error={rerunError} />
+          {closedRetestRequirement !== null ? (
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <span className="text-[11px] text-muted-foreground">
+                该用例所属需求已闭环，重跑前需先重新打开该需求。
+              </span>
+              {onOpenRequirement !== undefined ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => onOpenRequirement(closedRetestRequirement)}
+                >
+                  前往重新打开需求
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -134,6 +175,8 @@ export function ResultsPanel({
             const selected = selectedCaseRunId === caseRun.id
             const terminal = CASE_RUN_TERMINAL_STATUSES.includes(caseRun.status)
             const progress = assertionProgress(caseRun)
+            const cause = terminalCauseLabel(caseRun.summary.terminal_cause)
+            const usageTokens = caseRun.summary.usage?.total_tokens ?? 0
             return (
               <li
                 key={caseRun.id}
@@ -160,6 +203,14 @@ export function ResultsPanel({
                           {failureClassLabel(caseRun.failure_class)}
                         </span>
                       ) : null}
+                      {cause !== null ? (
+                        <span
+                          data-testid={`case-run-cause-${caseRun.id}`}
+                          className="text-[11px] text-warning"
+                        >
+                          原因 {cause}
+                        </span>
+                      ) : null}
                       <span className="ml-auto text-[10px] text-muted-foreground">
                         {selected ? "收起" : "展开"}
                       </span>
@@ -169,6 +220,7 @@ export function ResultsPanel({
                         <span key={versionSutId}>SUT {versionSutId}</span>
                       ))}
                       {progress !== null ? <span>{progress}</span> : null}
+                      {usageTokens > 0 ? <span>{usageTokens} tokens</span> : null}
                       <span>证据 {caseRun.evidence_count}</span>
                       <span>{runDuration(caseRun)}</span>
                     </span>

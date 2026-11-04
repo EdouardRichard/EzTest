@@ -254,8 +254,9 @@ bash stop-eztest.sh
 bash smoke-test.sh
 ```
 
-`init-config` 生成包内 `.env`（数据库 URL、端口与执行器/renderer token），`start-eztest` 启动整个栈并
-打印 URL。打开 <http://localhost:6868> 登录——首次启动会种下管理员 `admin` / `admin123`，
+`init-config` 生成包内 `.env`（数据库 URL、端口、执行器/renderer token，以及随机生成的首次启动管理员
+密码），`start-eztest` 启动整个栈并打印 URL。打开 <http://localhost:6868>，以 `admin` 和包内 `.env`
+中 `EZTEST_INITIAL_ADMIN_PASSWORD` 的值登录（`.env` 仅当前用户可读，脚本不会打印该密码），
 **请立即在 UI 中修改该密码**（设置 → 账号）。HTML 与 PDF 报告开箱即用：包内 renderer 会随栈一起启动。
 Docker 部署与多副本说明见 [deploy/README.md](deploy/README.md)。
 
@@ -268,7 +269,7 @@ Docker 部署与多副本说明见 [deploy/README.md](deploy/README.md)。
 Compose 文件交付六个服务：两个 API 副本、Web、PostgreSQL 17、Playwright 执行器与 PDF renderer。
 
 ```bash
-cp .env.example .env      # 设置 deploy/docker-compose.yml 需要的 POSTGRES_* 与 secret
+cp .env.example .env      # 设置 deploy/docker-compose.yml 需要的 POSTGRES_*、EZTEST_INITIAL_ADMIN_PASSWORD 与 token
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 docker compose --env-file .env -f deploy/docker-compose.yml ps
 ```
@@ -282,11 +283,12 @@ docker compose --env-file .env -f deploy/docker-compose.yml ps
 以及执行器可用的 Chromium 内核浏览器。
 
 ```bash
-# 0) API 进程只读取 4 个启动变量。
+# 0) API 进程读取 4 个运行时变量；全新数据库还需首次启动的管理员凭据（无内置默认）。
 export EZTEST_DATABASE_URL="postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 export EZTEST_API_PORT=13333
 export EZTEST_WEB_PORT=6868
 export EZTEST_EXECUTOR_PORT=13336
+export EZTEST_INITIAL_ADMIN_PASSWORD="<首次启动的强密码>"
 
 # 1) API —— 首次启动自动应用内嵌迁移并种下管理员
 cd backend && go run ./cmd/eztest
@@ -317,7 +319,7 @@ cd renderer && node --test   # renderer node:test 套件
 
 以管理员登录后：
 
-1. **修改种子密码**（新库首次启动为 `admin` / `admin123`）。
+1. **修改种子密码**（首次启动时通过 `EZTEST_INITIAL_ADMIN_PASSWORD` 提供的值）。
 2. **设置 → LLM 配置：** 添加 OpenAI 兼容供应商（base URL、API Key、模型），刷新模型目录并运行连通性
    测试。凭据在 UI 中只显示掩码。
 3. **资源：** 登记被测系统及其环境、页面与 HTTP API，可选的只读 PostgreSQL 目标库、测试账号与浏览器
@@ -441,9 +443,11 @@ stateDiagram-v2
 
 ### 5. 配置与运维
 
-- API 进程只读取 **4 个启动环境变量**：`EZTEST_DATABASE_URL`、`EZTEST_API_PORT`、`EZTEST_WEB_PORT`、
-  `EZTEST_EXECUTOR_PORT`。其余配置——路径、LLM 凭据、执行器/renderer 的 URL 与 token、限额、保留期、
-  限流、报告模板——都在数据库设置中心，通过 UI 的**设置**页管理（85 个设置键，带审计，secret 掩码）。
+- API 进程只读取 **4 个运行时环境变量**：`EZTEST_DATABASE_URL`、`EZTEST_API_PORT`、`EZTEST_WEB_PORT`、
+  `EZTEST_EXECUTOR_PORT`。全新数据库另外需要 `EZTEST_INITIAL_ADMIN_PASSWORD` 作为首次启动的管理员种子；
+  它仅在用户表为空时必需，且没有内置默认值。其余配置——路径、LLM 凭据、执行器/renderer 的 URL 与 token、
+  限额、保留期、限流、报告模板——都在数据库设置中心，通过 UI 的**设置**页管理（85 个设置键，带审计，
+  secret 掩码）。
 - 迁移只追加、内嵌在二进制中，启动时在 advisory lock 下应用并做校验和检查；回退方式是恢复备份，而不是
   down migration。
 - API 可多副本：租约与 leader advisory lock 存在 PostgreSQL，readiness 暴露在飞计数，实例可以 drain，
@@ -467,7 +471,7 @@ deploy/                  Docker Compose 栈（双 API 副本、Web、PostgreSQL�
 scripts/                 开发、测试、验收与发布工具
 eval/                    质量中心使用的评测语料与指标
 assets/screenshots/      README 截图
-.env.example             4 个启动变量的注释模板
+.env.example             4 个运行时变量与首次启动管理员凭据的注释模板
 LICENSE                  Apache License 2.0
 ```
 

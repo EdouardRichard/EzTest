@@ -84,7 +84,7 @@ func (s *CaseRunner) Browser(ctx context.Context, scope tools.Scope, action stri
 		}
 		return nil, &tools.Error{Code: result.Error.Code, Message: result.Error.Message}
 	}
-	evidenceIDs, err := s.storeBrowserEvidence(ctx, caseRun, versionSUTID, action, result)
+	evidenceIDs, err := s.storeBrowserEvidence(ctx, caseRun, versionSUTID, action, result, scope.AgentRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +251,7 @@ func browserActionArgs(action string, in browserToolArgs) (json.RawMessage, erro
 	return json.Marshal(args)
 }
 
-func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution.CaseRun, versionSUTID int64, action string, result BrowserActionResult) ([]string, error) {
+func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution.CaseRun, versionSUTID int64, action string, result BrowserActionResult, agentRunID int64) ([]string, error) {
 	ids := make([]string, 0, 1)
 	versionRef := versionSUTID
 	for _, artifact := range result.Artifacts {
@@ -268,15 +268,7 @@ func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution
 		if err != nil {
 			return nil, errors.New("executor artifact is not valid base64")
 		}
-		evidence, addErr := s.AddEvidence(ctx, tools.Scope{
-			VersionID:     s.versionForCaseRun(caseRun),
-			WaveID:        caseRun.WaveID,
-			CaseRunID:     caseRun.ID,
-			IntentID:      caseRun.IntentID,
-			CaseVersionID: caseRun.CaseVersionID,
-			DispatchEpoch: caseRun.DispatchEpoch,
-			DispatchToken: caseRun.DispatchToken,
-		}, EvidenceInput{
+		evidence, addErr := s.addEvidenceForRun(ctx, caseRun, agentRunID, EvidenceInput{
 			Kind: kind, Data: data, Filename: artifact.Filename, VersionSUTID: &versionRef, Auto: true,
 		})
 		if addErr != nil {
@@ -296,15 +288,7 @@ func (s *CaseRunner) storeBrowserEvidence(ctx context.Context, caseRun execution
 		if len(data) == 0 {
 			data = json.RawMessage(`[]`)
 		}
-		evidence, err := s.AddEvidence(ctx, tools.Scope{
-			VersionID:     s.versionForCaseRun(caseRun),
-			WaveID:        caseRun.WaveID,
-			CaseRunID:     caseRun.ID,
-			IntentID:      caseRun.IntentID,
-			CaseVersionID: caseRun.CaseVersionID,
-			DispatchEpoch: caseRun.DispatchEpoch,
-			DispatchToken: caseRun.DispatchToken,
-		}, EvidenceInput{
+		evidence, err := s.addEvidenceForRun(ctx, caseRun, agentRunID, EvidenceInput{
 			Kind: kind, Data: data, VersionSUTID: &versionRef, Auto: true,
 		})
 		if err != nil {
@@ -607,7 +591,7 @@ func (s *CaseRunner) ResultRead(ctx context.Context, scope tools.Scope, in tools
 				"expected": assertion.Expected, "actual": assertion.Actual, "reason": assertion.Reason,
 			})
 		}
-		results = append(results, map[string]any{
+		result := map[string]any{
 			"case_run_id":     platformid.Format(caseRun.ID),
 			"case_version_id": platformid.Format(caseRun.CaseVersionID),
 			"status":          string(caseRun.Status),
@@ -616,7 +600,11 @@ func (s *CaseRunner) ResultRead(ctx context.Context, scope tools.Scope, in tools
 			"steps":           stepEntries,
 			"assertions":      assertionEntries,
 			"evidence_count":  evidenceCount,
-		})
+		}
+		if attribution := s.resultFailureAttribution(ctx, scope.VersionID, caseRun, steps, assertions); attribution != nil {
+			result["attribution"] = attribution
+		}
+		results = append(results, result)
 	}
 	return map[string]any{"wave_id": platformid.Format(scope.WaveID), "case_runs": results}, nil
 }
@@ -689,8 +677,9 @@ func (s *CaseRunner) CoverageRead(ctx context.Context, scope tools.Scope) (any, 
 }
 
 // FailureSubmit validates and persists one failure analysis candidate. Only
-// failed(application) is a P4 issue candidate; the analyst may refine but never
-// upgrade a non-application class into application.
+// failed(application) is a P4 issue candidate; the analyst may refine but may
+// upgrade a non-application class into application only when the stored step
+// observation is a requirement deviation (QA Q1).
 func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in tools.FailureSubmitInput) (any, error) {
 	if scope.WaveID <= 0 {
 		return nil, platform.Invalid("scope", "failure_submit requires the injected wave scope")
@@ -708,27 +697,62 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 	}
 	class := execution.FailureClass(in.FailureClass)
 	if class == execution.FailureClassApplication && caseRun.FailureClass != execution.FailureClassApplication {
-		return nil, platform.Invalid("failure_class", "a non-application failure cannot be upgraded to application")
+		// QA Q1: a stored observed requirement deviation is evidence the
+		// deterministic fallback may have missed; allow application only for
+		// that evidence.
+		steps, err := s.results.ListSteps(ctx, caseRun.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step_result")
+		}
+		hasDeviation := false
+		for _, step := range steps {
+			if execution.StepShowsApplicationDeviation(step) {
+				hasDeviation = true
+				break
+			}
+		}
+		if !hasDeviation {
+			return nil, platform.Invalid("failure_class", "a non-application failure cannot be upgraded to application without observed requirement deviation evidence")
+		}
 	}
 	if !class.Valid() || class == "" {
 		return nil, platform.Invalid("failure_class", "unsupported failure class")
 	}
+	if class == execution.FailureClassAutomation && caseRun.FailureClass == execution.FailureClassApplication {
+		// QA Q1: a real requirement deviation recorded on a failed step is
+		// product evidence; the analyst must not be able to dismiss it as a
+		// script/automation problem and suppress the issue candidate.
+		steps, err := s.results.ListSteps(ctx, caseRun.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step_result")
+		}
+		for _, step := range steps {
+			if execution.StepShowsApplicationDeviation(step) {
+				return nil, platform.StateConflict("an observed requirement deviation cannot be reclassified as automation")
+			}
+		}
+	}
 	updated := caseRun
 	updated.FailureClass = class
-	if in.Summary != "" {
-		updated.Summary.LastError = truncateRunes(in.Summary, 2000)
+	summary := execution.SanitizeFailureSummary(in.Summary)
+	if summary != "" {
+		updated.Summary.LastError = truncateRunes(summary, 2000)
 	}
 	if _, err := s.caseRuns.Update(ctx, updated); err != nil {
 		return nil, mapExecutionError(err, "case_run")
 	}
 	dedupe := in.DedupeHint
+	steps, _ := s.results.ListSteps(ctx, caseRun.ID)
+	assertions, _ := s.results.ListAssertions(ctx, caseRun.ID)
 	if dedupe == "" {
 		// Align with the deterministic §8.1 fallback so P4 sees one stable
 		// dedupe hint for both paths.
-		steps, _ := s.results.ListSteps(ctx, caseRun.ID)
-		assertions, _ := s.results.ListAssertions(ctx, caseRun.ID)
 		dedupe = failureDedupeHint(scope.VersionID, caseRun, class, steps, assertions)
 	}
+	// Task 112: never echo the analyst's suggested category/severity. They are a
+	// second source that can disagree with the P4 issue record (and the summary);
+	// emit the canonical derivation instead.
+	category, severity := s.caseIssueAttribution(ctx, scope.VersionID, caseRun, steps, assertions)
 	eventScope := map[string]any{
 		"wave_id":     platformid.Format(caseRun.WaveID),
 		"case_run_id": platformid.Format(caseRun.ID),
@@ -737,9 +761,9 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 		"case_run_id":     platformid.Format(caseRun.ID),
 		"case_version_id": platformid.Format(caseRun.CaseVersionID),
 		"failure_class":   string(class),
-		"category":        in.Category,
-		"severity":        in.Severity,
-		"summary":         truncateRunes(in.Summary, 2000),
+		"category":        category,
+		"severity":        severity,
+		"summary":         truncateRunes(summary, 2000),
 		"dedupe_hint":     dedupe,
 		"issue_candidate": class.IsIssueCandidate(),
 	}, nil)
@@ -748,13 +772,15 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 			VersionID: s.versionForCaseRun(caseRun),
 			Team:      "execution",
 			Kind:      "finding",
-			Content:   truncateRunes(in.Summary, 2000),
+			Content:   truncateRunes(summary, 2000),
 			Refs:      []TeamPostRef{{Kind: "case_run", ID: platformid.Format(caseRun.ID)}},
 		})
 	}
 	return map[string]any{
 		"case_run_id":   platformid.Format(caseRun.ID),
 		"failure_class": string(class),
+		"category":      category,
+		"severity":      severity,
 		"dedupe_hint":   dedupe,
 	}, nil
 }

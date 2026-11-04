@@ -364,7 +364,7 @@ try {
     $http = New-Object System.Net.Http.HttpClient
     $http.Timeout = [TimeSpan]::FromSeconds(180)
 
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "[REDACTED]" }
     Assert-Status $login @(200) "POST /api/auth/login (bootstrap)"
     $token = [string]$login.Json.data.token
     foreach ($setting in @(
@@ -433,7 +433,7 @@ try {
         $env:EZTEST_WEB_PORT = $previousWeb
     }
     if (-not (Wait-Http "$apiUrl/api/health" 180)) { throw "API did not become ready" }
-    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
+    $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "[REDACTED]" }
     Assert-Status $login @(200) "POST /api/auth/login"
     $token = [string]$login.Json.data.token
     Wait-For -TimeoutSeconds 120 -Description "executor registered active" -Condition {

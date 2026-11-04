@@ -38,6 +38,29 @@ const SECOND_HTML = `<!doctype html>
 <html><head><title>EzTest Second</title></head>
 <body><h1>Second page</h1><a id="back" href="/home">Back</a></body></html>`
 
+// DEEP_LOGIN_HTML nests the form six levels below body, so the generated CSS
+// path must keep every ancestor to resolve (SPA login modals routinely do
+// this). No id/name/data-testid short-circuits selector generation.
+const DEEP_LOGIN_HTML = `<!doctype html>
+<html>
+  <head><title>EzTest Deep Login</title></head>
+  <body>
+    <div class="app">
+      <div class="shell">
+        <div class="layer">
+          <section class="panel">
+            <form onsubmit="event.preventDefault()">
+              <label>账号 <input aria-label="账号" /></label>
+              <label>密码 <input type="password" aria-label="密码" /></label>
+              <button type="submit">登录</button>
+            </form>
+          </section>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>`
+
 const SPAM_HTML = `<!doctype html>
 <html><head><title>Spam</title></head>
 <body><h1>Spam</h1>
@@ -63,6 +86,10 @@ export async function startLocalPage() {
       case "/second":
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(SECOND_HTML)
+        return
+      case "/deep-login":
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(DEEP_LOGIN_HTML)
         return
       case "/spam":
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
@@ -219,6 +246,21 @@ export async function startLocalPage() {
                 if (node.textContent === 'pending') { node.textContent = 'worker-timeout' }
               }, 2000)
             </script></body></html>`,
+        )
+        return
+      case "/visibility":
+        // Mixes rendered and non-rendered interactive nodes so the inventory's
+        // `visible` flag can be asserted for display:none, visibility:hidden and
+        // the hidden attribute.
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(
+          `<!doctype html><html><head><title>Visibility</title></head><body><h1>Visibility</h1>` +
+            `<button id="visible-btn" onclick="mark('visible')">Visible</button>` +
+            `<button id="hidden-display" style="display:none">Hidden display</button>` +
+            `<button id="hidden-visibility" style="visibility:hidden">Hidden visibility</button>` +
+            `<input id="hidden-password" type="password" aria-label="Hidden password" hidden />` +
+            `<a id="visible-link" href="/second">Visible link</a>` +
+            `</body></html>`,
         )
         return
       case "/secret-leak":

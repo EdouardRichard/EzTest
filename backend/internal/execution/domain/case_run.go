@@ -1,6 +1,9 @@
 package execution
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // CaseRunStatus is the merged four-state/process state of one case_run
 // (P3-D-05): passed/failed/blocked/inconclusive are results; skipped,
@@ -121,6 +124,158 @@ func (c FailureClass) Valid() bool {
 // Only failed(application) qualifies (P3-D-12).
 func (c FailureClass) IsIssueCandidate() bool { return c == FailureClassApplication }
 
+// Terminal causes written to case_run.summary.terminal_cause when the agent run
+// ended without executing all steps. They are stable codes (the UI localizes
+// them) and always name a concrete resource/provider/agent stop, never a generic
+// "unknown".
+const (
+	TerminalCauseTurnBudget   = "turn_budget"
+	TerminalCauseTokenBudget  = "token_budget"
+	TerminalCauseTimeBudget   = "time_budget"
+	TerminalCauseAgentStopped = "agent_stopped"
+)
+
+// NextAction is the stable suggested human next step of a terminal run. The
+// system never auto-retries a terminal incomplete run: the human decides to
+// rerun with a fresh execution budget, resolve the blocker first, review the
+// failure, repair the case/visual baseline, or reconfirm a superseded case.
+const (
+	NextActionRerun          = "rerun"
+	NextActionResolveBlocker = "resolve_blocker"
+	NextActionReviewFailure  = "review_failure"
+	NextActionRepairVisual   = "repair_visual_baseline"
+	NextActionRepairCase     = "repair_case_version"
+	NextActionReconfirm      = "reconfirm_case_version"
+	// NextActionReplanned is written on a superseded run whose replacement was
+	// auto-requeued; it tells the human why no manual action is required.
+	NextActionReplanned = "case_version_superseded_replanned"
+)
+
+// TerminalCauseCaseVersionSuperseded is the stable cause of a run retired
+// because its confirmed case version left the executable set.
+const TerminalCauseCaseVersionSuperseded = "case_version_superseded"
+
+// TerminalExplanation returns the stable cause and the human next action of a
+// terminal case_run. An explicit settlement cause (for example token_budget)
+// and an already persisted next action always win. A row settled before those
+// fields existed derives the cause from its persisted status, failure class and
+// verdict reason, so the API/UI never show an unexplained terminal failure
+// (QA Q2). Passed/skipped/non-terminal rows keep whatever they carried.
+func TerminalExplanation(status CaseRunStatus, class FailureClass, summary CaseRunSummary) (string, string) {
+	cause, nextAction := summary.TerminalCause, summary.NextAction
+	switch status {
+	case CaseRunFailed, CaseRunBlocked, CaseRunInconclusive:
+		if cause == "" {
+			cause = persistedTerminalCause(status, class, summary)
+		}
+		if nextAction == "" {
+			nextAction = terminalNextAction(status, cause)
+		}
+	case CaseRunSuperseded:
+		if cause == "" {
+			if summary.VerdictReason != "" {
+				cause = summary.VerdictReason
+			} else {
+				cause = TerminalCauseCaseVersionSuperseded
+			}
+		}
+		if nextAction == "" {
+			nextAction = NextActionReconfirm
+		}
+	}
+	return cause, nextAction
+}
+
+// persistedTerminalCause derives a concrete cause from the terminal data that
+// was persisted before terminal_cause existed. An agent failure is reported as
+// its concrete failure class (environment/timeout/model/...) instead of the
+// generic agent_failure code.
+func persistedTerminalCause(status CaseRunStatus, class FailureClass, summary CaseRunSummary) string {
+	if reason := strings.TrimSpace(summary.VerdictReason); reason != "" {
+		if reason == VerdictReasonAgentFailure && class != "" && class != FailureClassApplication {
+			return string(class)
+		}
+		return reason
+	}
+	if class != "" {
+		return string(class)
+	}
+	return string(status)
+}
+
+// terminalNextAction maps a terminal cause/status onto the human next step. The
+// cause-specific guidance wins over the status: a blocked run that recorded a
+// failed assertion is a failure to review, not a generic blocker.
+func terminalNextAction(status CaseRunStatus, cause string) string {
+	switch cause {
+	case VerdictReasonAssertionFailed, VerdictReasonStepFailed, string(FailureClassApplication):
+		return NextActionReviewFailure
+	case VerdictReasonEmptyCase, VerdictReasonNoAssertions:
+		return NextActionRepairCase
+	case VerdictReasonVisualAssertionNotRun, "missing_visual_baseline", "visual_environment_mismatch":
+		return NextActionRepairVisual
+	case TerminalCauseCaseVersionSuperseded:
+		return NextActionReconfirm
+	}
+	if status == CaseRunBlocked {
+		return NextActionResolveBlocker
+	}
+	return NextActionRerun
+}
+
+// TerminalCauseNeedsHuman reports whether a terminal cause has no automatic
+// recovery path and must be handed to a human. Application defects are excluded:
+// the P4 issue-candidate pipeline owns them (a "finding" post is emitted
+// separately). A superseded run is excluded because the system requeues the
+// replacement itself.
+func TerminalCauseNeedsHuman(cause string) bool {
+	switch cause {
+	case "", VerdictReasonAssertionFailed, VerdictReasonStepFailed, string(FailureClassApplication),
+		TerminalCauseCaseVersionSuperseded, VerdictReasonPassed:
+		return false
+	}
+	return true
+}
+
+// CaseRunUsage is the agent-run resource usage persisted on the terminal
+// case_run.summary. QA Q2: the same numbers were previously only visible in
+// Agent Center; the execution page needs them next to the terminal explanation.
+// All fields are observed values (never estimates).
+type CaseRunUsage struct {
+	Turns            int `json:"turns,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+}
+
+// NewCaseRunUsage maps one finished agent run's usage onto the summary shape.
+// Providers report either prompt/completion or input/output keys; the total is
+// taken from total_tokens or derived from the two components. It returns nil
+// when the run carried no usage at all, so a clean zero-value is never invented.
+func NewCaseRunUsage(turns int, usage map[string]int) *CaseRunUsage {
+	prompt := usage["prompt_tokens"]
+	if prompt == 0 {
+		prompt = usage["input_tokens"]
+	}
+	completion := usage["completion_tokens"]
+	if completion == 0 {
+		completion = usage["output_tokens"]
+	}
+	total := usage["total_tokens"]
+	if total == 0 {
+		total = prompt + completion
+	}
+	if total == 0 && prompt == 0 && completion == 0 && turns <= 0 {
+		return nil
+	}
+	return &CaseRunUsage{
+		Turns:            turns,
+		TotalTokens:      total,
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+	}
+}
+
 // CaseRunSummary is the case_run.summary JSONB projection.
 type CaseRunSummary struct {
 	VerdictReason      string `json:"verdict_reason,omitempty"`
@@ -135,6 +290,12 @@ type CaseRunSummary struct {
 	VisualInconclusive int    `json:"visual_inconclusive"`
 	HumanRequestID     int64  `json:"human_request_id,omitempty"`
 	LastError          string `json:"last_error,omitempty"`
+	// TerminalCause/NextAction explain a terminal incomplete run: which budget
+	// (or agent stop) ended it and what the human should do next (QA Q2).
+	TerminalCause string `json:"terminal_cause,omitempty"`
+	NextAction    string `json:"next_action,omitempty"`
+	// Usage is the observed agent-run usage of the terminal run (QA Q2).
+	Usage *CaseRunUsage `json:"usage,omitempty"`
 }
 
 // EvidenceCountValue returns the evidence count as an int.

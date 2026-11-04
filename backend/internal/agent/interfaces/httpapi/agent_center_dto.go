@@ -108,14 +108,34 @@ type agentRunDTO struct {
 	TerminalReason *string        `json:"terminal_reason"`
 	Turns          int            `json:"turns"`
 	Usage          map[string]int `json:"usage"`
-	StartedAt      *string        `json:"started_at"`
-	FinishedAt     *string        `json:"finished_at"`
+	// Model/ConfigID/FallbackFrom are the run's actual target (spec §7.3);
+	// Tokens/Cache are the 0.2.1 accounting (spec §7.5).
+	Model        string         `json:"model"`
+	ConfigID     *string        `json:"config_id"`
+	FallbackFrom string         `json:"fallback_from"`
+	Tokens       map[string]int `json:"tokens"`
+	Cache        map[string]int `json:"cache"`
+	StartedAt    *string        `json:"started_at"`
+	FinishedAt   *string        `json:"finished_at"`
 }
 
 func toAgentRunDTO(view agentapp.RunView) agentRunDTO {
 	usage := view.Usage
 	if usage == nil {
 		usage = map[string]int{}
+	}
+	tokens := view.Tokens
+	if tokens == nil {
+		tokens = map[string]int{}
+	}
+	cache := view.Cache
+	if cache == nil {
+		cache = map[string]int{}
+	}
+	var configID *string
+	if view.ConfigID > 0 {
+		formatted := strconv.FormatInt(view.ConfigID, 10)
+		configID = &formatted
 	}
 	return agentRunDTO{
 		ID:             strconv.FormatInt(view.ID, 10),
@@ -129,6 +149,11 @@ func toAgentRunDTO(view agentapp.RunView) agentRunDTO {
 		TerminalReason: view.TerminalReason,
 		Turns:          view.Turns,
 		Usage:          usage,
+		Model:          view.Model,
+		ConfigID:       configID,
+		FallbackFrom:   view.FallbackFrom,
+		Tokens:         tokens,
+		Cache:          cache,
 		StartedAt:      formatTimePointer(view.StartedAt),
 		FinishedAt:     formatTimePointer(view.FinishedAt),
 	}

@@ -11,6 +11,7 @@ import fs from "node:fs"
 import http from "node:http"
 import { pathToFileURL } from "node:url"
 
+import { createExploreRuntime } from "./actions/explore.mjs"
 import { ContextManager } from "./contexts.mjs"
 import { parseAllowedHosts } from "./limits.mjs"
 import { startPushFromEnv } from "./push.mjs"
@@ -65,6 +66,7 @@ function statusForError(code) {
 const ACTION_ERROR_STATUS = {
   invalid_arguments: 400,
   context_not_found: 404,
+  page_limit: 409,
   too_large: 413,
 }
 
@@ -150,11 +152,21 @@ function decodeId(raw) {
   }
 }
 
-export function createExecutorServer({ token, manager, version = PACKAGE_VERSION, logger = null } = {}) {
+export function createExecutorServer({
+  token,
+  manager,
+  explore = null,
+  version = PACKAGE_VERSION,
+  logger = null,
+} = {}) {
   if (typeof token !== "string" || token.length === 0) {
     throw new Error("EZTEST_EXECUTOR_TOKEN is required")
   }
   const executor = manager ?? new ContextManager({ logger })
+  // P9 explorer action family (executor-protocol §13): its own page registry and
+  // browser, kept separate from the execution contexts. The browser is launched
+  // lazily on the first explore.open.
+  const exploreRuntime = explore ?? createExploreRuntime({ logger })
   const server = http.createServer((req, res) => {
     handle(req, res).catch((error) => {
       if (res.destroyed || res.writableEnded) {
@@ -174,12 +186,20 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
       })
     })
   })
+  // Best-effort teardown of the explore browser when the HTTP server closes; an
+  // injected runtime is also closed here, which is idempotent.
+  server.once("close", () => {
+    void exploreRuntime.close().catch(() => {})
+  })
 
   async function handle(req, res) {
     const startedAt = Date.now()
     let pathname = "/"
+    let searchParams = null
     try {
-      pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname
+      const parsed = new URL(req.url ?? "/", "http://127.0.0.1")
+      pathname = parsed.pathname
+      searchParams = parsed.searchParams
     } catch {
       // Keep the default path; the request will 404 below.
     }
@@ -206,6 +226,39 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
 
     if (!isAuthorized(req, token)) {
       return sendError(res, 401, "unauthorized", "missing or invalid bearer token")
+    }
+
+    // P9 explorer action family (executor-protocol §13). It has its own route:
+    // explore pages are not execution contexts and are addressed by page_id.
+    if (pathname === "/v1/explore/actions") {
+      if (req.method !== "POST") {
+        return sendError(res, 405, "invalid_request", "method not allowed")
+      }
+      const body = await readJsonBody(req, MAX_REQUEST_BYTES)
+      const envelope = await exploreRuntime.runAction(body)
+      const status = envelope.ok ? 200 : ACTION_ERROR_STATUS[envelope.error.code] ?? 200
+      return sendJson(res, status, envelope)
+    }
+
+    if (pathname === "/v1/explore/cancel") {
+      if (req.method !== "POST") {
+        return sendError(res, 405, "invalid_request", "method not allowed")
+      }
+      const result = await exploreRuntime.cancel()
+      return sendJson(res, 200, { ok: true, result })
+    }
+
+    if (pathname === "/v1/explore") {
+      if (req.method !== "DELETE") {
+        return sendError(res, 405, "invalid_request", "method not allowed")
+      }
+      // Optional page_id scopes the cleanup to one page (P9 login reuse closes
+      // only its throwaway verification page, leaving concurrent exploration
+      // pages/actions alone). Without it the route keeps its close-all meaning.
+      const pageId = searchParams?.get("page_id") ?? null
+      const result =
+        pageId === null ? await exploreRuntime.closePages() : await exploreRuntime.closePage(pageId)
+      return sendJson(res, 200, { ok: true, result })
     }
 
     if (pathname === "/v1/contexts") {
@@ -293,7 +346,10 @@ export function parseMaxContexts(value) {
   return DEFAULT_MAX_CONTEXTS
 }
 
-export async function startFromEnv(env = process.env, { manager: injectedManager = null } = {}) {
+export async function startFromEnv(
+  env = process.env,
+  { manager: injectedManager = null, explore: injectedExplore = null } = {},
+) {
   const token = String(env.EZTEST_EXECUTOR_TOKEN ?? "").trim()
   if (token.length === 0) {
     console.error("[executor] EZTEST_EXECUTOR_TOKEN is required")
@@ -308,10 +364,12 @@ export async function startFromEnv(env = process.env, { manager: injectedManager
   const logger = console
   const manager =
     injectedManager ?? new ContextManager({ maxContexts, logger, allowedHosts })
+  const exploreRuntime = injectedExplore ?? createExploreRuntime({ logger, allowedHosts })
   const version = env.EZTEST_EXECUTOR_VERSION ?? PACKAGE_VERSION
   const server = createExecutorServer({
     token,
     manager,
+    explore: exploreRuntime,
     logger,
     version,
   })
@@ -332,6 +390,7 @@ export async function startFromEnv(env = process.env, { manager: injectedManager
     console.log(`[executor] received ${signal}, shutting down`)
     push?.stop()
     await new Promise((resolve) => server.close(resolve))
+    await exploreRuntime.close()
     await manager.close()
     process.exit(0)
   }
@@ -341,7 +400,7 @@ export async function startFromEnv(env = process.env, { manager: injectedManager
   process.once("SIGTERM", () => {
     void shutdown("SIGTERM")
   })
-  return { server, manager, push }
+  return { server, manager, explore: exploreRuntime, push }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

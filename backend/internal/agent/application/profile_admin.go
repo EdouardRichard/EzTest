@@ -23,6 +23,12 @@ import (
 // prompt write (spec §8.5). Metadata never contains the prompt body.
 const ActionProfileUpdated = "agent.profile.updated"
 
+// ActionProfileToolDenied audits an administrator edit that tries to bind a
+// registered tool outside the profile's role whitelist (Task 8 fix round 1).
+// The edit is rejected before any write, so this event is the only record of
+// the attempt; metadata is limited to profile/role/tool/field.
+const ActionProfileToolDenied = "agent.profile.tool_denied"
+
 // PromptRevision is one append-only prompt revision of the admin API.
 type PromptRevision = agent.PromptRevision
 
@@ -83,7 +89,7 @@ type ToolRegistry interface {
 // ModelCatalog is the default LLM model catalog surface. *llmapp.Service
 // satisfies it: a non-empty profile model must resolve to a catalog model.
 type ModelCatalog interface {
-	ResolveModel(ctx context.Context, model string) (llmapp.ModelInfo, error)
+	ResolveModel(ctx context.Context, cfgID int64, modelID string, required ...llmapp.ModelRequirements) (llmapp.ModelInfo, error)
 }
 
 // ProfileAdminRepository is the persistence port of the admin API. The
@@ -220,7 +226,7 @@ func (s *ProfileAdminService) Patch(ctx context.Context, actor platform.Actor, k
 		fields = append(fields, "budgets")
 	}
 	if input.AllowedTools != nil {
-		allowed, err := s.validateAllowedTools(*input.AllowedTools)
+		allowed, err := s.validateAllowedTools(ctx, actor, profile, *input.AllowedTools)
 		if err != nil {
 			return ProfileView{}, false, err
 		}
@@ -462,15 +468,37 @@ func (s *ProfileAdminService) validateModel(ctx context.Context, model string) e
 	if s.models == nil {
 		return platform.Unavailable("LLM model catalog is not configured")
 	}
-	if _, err := s.models.ResolveModel(ctx, model); err != nil {
+	if _, err := s.models.ResolveModel(ctx, 0, model); err != nil {
 		return platform.Invalid("model", "must be a model of the default LLM configuration")
 	}
 	return nil
 }
 
-func (s *ProfileAdminService) validateAllowedTools(names []string) ([]string, error) {
+// validateAllowedTools applies the two independent admin-edit guards. A tool
+// must exist in the runtime registry (P5/P6 contract), and when the profile
+// executes one of the seven role-catalog roles it must also stay inside that
+// role's frozen whitelist. A role violation is a typed 400 on the
+// allowed_tools field, audited and rejected before any write (Task 8 fix
+// round 1: the registry-membership check alone let an admin bind
+// execution.case_finish to the assistant's clarification_host profile).
+func (s *ProfileAdminService) validateAllowedTools(
+	ctx context.Context,
+	actor platform.Actor,
+	profile agent.AgentProfile,
+	names []string,
+) ([]string, error) {
 	if s.tools == nil {
 		return nil, platform.Unavailable("tool registry is not configured")
+	}
+	role, roleScoped := RoleForProfile(profile.Key)
+	var roleTools tools.ToolSet
+	if roleScoped {
+		var ok bool
+		roleTools, ok = RoleToolSet(role.Key)
+		if !ok {
+			return nil, platform.Invalid("key", fmt.Sprintf(
+				"profile %q maps to unknown role %q", profile.Key, role.Key))
+		}
 	}
 	seen := make(map[string]struct{}, len(names))
 	deduped := make([]string, 0, len(names))
@@ -482,6 +510,15 @@ func (s *ProfileAdminService) validateAllowedTools(names []string) ([]string, er
 		if _, ok := s.tools.Get(trimmed); !ok {
 			return nil, platform.Invalid("allowed_tools", "unknown tool: "+trimmed)
 		}
+		if roleScoped && !roleTools.Allows(trimmed) {
+			s.recordToolDenied(ctx, actor, profile, role.Key, trimmed)
+			apiErr := platform.Invalid("allowed_tools", fmt.Sprintf(
+				"tool %q is outside the %q role whitelist", trimmed, role.Key))
+			apiErr.Details["reason"] = "role_whitelist"
+			apiErr.Details["role"] = string(role.Key)
+			apiErr.Details["tool"] = trimmed
+			return nil, apiErr
+		}
 		if _, duplicate := seen[trimmed]; duplicate {
 			continue
 		}
@@ -489,6 +526,32 @@ func (s *ProfileAdminService) validateAllowedTools(names []string) ([]string, er
 		deduped = append(deduped, trimmed)
 	}
 	return deduped, nil
+}
+
+// recordToolDenied writes the audit event of a rejected role-widening PATCH.
+// It never runs on a successful write and never carries tool arguments.
+func (s *ProfileAdminService) recordToolDenied(
+	ctx context.Context,
+	actor platform.Actor,
+	profile agent.AgentProfile,
+	role RoleKey,
+	toolName string,
+) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	_ = s.audit.Record(ctx, auditapp.Event{
+		ActorID:    actorID(actor),
+		Action:     ActionProfileToolDenied,
+		TargetKind: "agent_profile",
+		TargetID:   fmt.Sprintf("%d", profile.ID),
+		Metadata: map[string]any{
+			"profile_key": profile.Key,
+			"role":        string(role),
+			"tool":        toolName,
+			"field":       "allowed_tools",
+		},
+	})
 }
 
 func (s *ProfileAdminService) currentPromptVersion(ctx context.Context, key string) (int, bool) {

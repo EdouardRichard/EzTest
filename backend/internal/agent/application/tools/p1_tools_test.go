@@ -191,6 +191,24 @@ func TestRequirementReadRejectsCrossVersionRequirement(t *testing.T) {
 	}
 }
 
+func TestRequirementReadExplainsSnapshotFreshness(t *testing.T) {
+	// O5 follow-up: the Host must not turn one empty requirement.read into a
+	// "requirements=0 / drafts not created" claim while the parallel Curator is
+	// still writing. The tool description the model reads must say the list is a
+	// point-in-time snapshot and that a re-read may be needed.
+	registry := NewP1Registry(Deps{Requirement: &fakeRequirementPort{}})
+	tool, ok := registry.Get(ToolRequirementRead)
+	if !ok {
+		t.Fatalf("%s is not registered", ToolRequirementRead)
+	}
+	description := tool.Description()
+	for _, want := range []string{"快照", "重读"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("requirement.read description %q lacks %q", description, want)
+		}
+	}
+}
+
 func TestRequirementDraftCreateValidatesAndInjectsScope(t *testing.T) {
 	port := &fakeRequirementPort{created: RequirementSummary{ID: 501, CurrentVersionID: 700, Revision: 1, Status: "draft"}}
 	registry := NewP1Registry(Deps{Requirement: port})
@@ -201,8 +219,8 @@ func TestRequirementDraftCreateValidatesAndInjectsScope(t *testing.T) {
 		"acceptance_criteria":"手机号可登录",
 		"constraints":{"business_rules":["仅限国内手机号"]},
 		"target_version_suts":["5001"],
-		"target_pages":["/login"],
-		"target_apis":["POST /api/login"]
+		"target_pages":["1301"],
+		"target_apis":["1401"]
 	}`)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -231,6 +249,7 @@ func TestRequirementDraftCreateRejectsInvalidFields(t *testing.T) {
 		`{"title":"t","description":"d","acceptance_criteria":"a","priority":"P9"}`,
 		`{"title":"t","description":"d","acceptance_criteria":"a","constraints":[]}`,
 		`{"title":"t","description":"d","acceptance_criteria":"a","target_pages":[""]}`,
+		`{"title":"t","description":"d","acceptance_criteria":"a","target_pages":["/login"]}`,
 		`{"title":"t"}`,
 	}
 	for _, params := range cases {
@@ -434,6 +453,44 @@ func TestAttachmentReadTextPaging(t *testing.T) {
 		if _, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, params); err == nil {
 			t.Fatalf("expected invalid_argument for %s", params)
 		}
+	}
+}
+
+// TestAttachmentReadTextReportsPendingStatus covers §8.5: a pending or failed
+// attachment is reported as a structured status, not a 409/tool error.
+func TestAttachmentReadTextReportsPendingStatus(t *testing.T) {
+	port := &fakeAttachmentPort{text: AttachmentText{
+		AttachmentID: 9001, Name: "需求.md", MIME: "text/markdown",
+		Status: "pending", Error: "附件解析中，可重试", Retryable: true,
+	}}
+	registry := NewP1Registry(Deps{Attachment: port})
+	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9001"}`)
+	if err != nil {
+		t.Fatalf("pending read returned a tool error: %v", err)
+	}
+	body := resultMap(t, result)
+	if body["status"] != "pending" || body["retryable"] != true || body["text"] != "" {
+		t.Fatalf("body = %#v", body)
+	}
+	if body["error"] != "附件解析中，可重试" {
+		t.Fatalf("error = %#v", body["error"])
+	}
+
+	port.text = AttachmentText{
+		AttachmentID: 9002, Name: "legacy.doc", MIME: "application/msword",
+		Status: "failed", Error: "unsupported_attachment_format: save it as .docx/.pptx", Retryable: false,
+	}
+	port.textID = 0
+	result, err = execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9002"}`)
+	if err != nil {
+		t.Fatalf("failed read returned a tool error: %v", err)
+	}
+	body = resultMap(t, result)
+	if body["status"] != "failed" || body["retryable"] != false {
+		t.Fatalf("body = %#v", body)
+	}
+	if !strings.Contains(body["error"].(string), "docx") {
+		t.Fatalf("error = %#v", body["error"])
 	}
 }
 

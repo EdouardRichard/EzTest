@@ -49,12 +49,15 @@ function AuthProbe() {
       <span data-testid="loading">{auth.loading ? "loading" : "ready"}</span>
       <span data-testid="user">{auth.user?.username ?? "anon"}</span>
       <span data-testid="token">{auth.token ?? "none"}</span>
-      <button type="button" onClick={() => void auth.login("admin", "admin123").catch(() => {})}>
+      <button
+        type="button"
+        onClick={() => void auth.login("admin", "test-admin-pass").catch(() => {})}
+      >
         probe-login
       </button>
       <button
         type="button"
-        onClick={() => void auth.changePassword("admin123", "newpass123").catch(() => {})}
+        onClick={() => void auth.changePassword("test-admin-pass", "newpass123").catch(() => {})}
       >
         probe-change-password
       </button>
@@ -160,7 +163,7 @@ describe("AuthProvider", () => {
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe("http://localhost:13333/api/auth/login")
     expect(init?.method).toBe("POST")
-    expect(requestBody([url, init])).toEqual({ username: "admin", password: "admin123" })
+    expect(requestBody([url, init])).toEqual({ username: "admin", password: "test-admin-pass" })
   })
 
   it("propagates login failures without persisting a session", async () => {
@@ -218,7 +221,7 @@ describe("AuthProvider", () => {
       expect(changeCall).toBeDefined()
       expect(changeCall?.[1]?.method).toBe("POST")
       expect(requestBody([changeCall?.[0] ?? "", changeCall?.[1]])).toEqual({
-        old_password: "admin123",
+        old_password: "test-admin-pass",
         new_password: "newpass123",
       })
     })

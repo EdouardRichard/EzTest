@@ -44,6 +44,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 	settingsapp "github.com/EdouardRichard/EzTest/backend/internal/settings/application"
 	settingsdomain "github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
@@ -212,9 +213,10 @@ func (r p7SourceVersions) SourceVersionExists(ctx context.Context, versionID int
 }
 
 // p7VersionSystems resolves the SUT families bound to a version so system-scope
-// knowledge can match them. The version/resource read models do not expose
-// sut.family yet (resource migration #38 adds the column), so the adapter joins
-// version_sut to sut in one read-only query.
+// knowledge can match them. The version read model exposes the family on each
+// binding (VersionView.Bindings[].SUT.Family); this adapter answers the same
+// projection with one read-only version_sut/sut query so the P7 runtime keeps
+// its narrow pool-based dependency surface.
 type p7VersionSystems struct {
 	pool *pgxpool.Pool
 }
@@ -521,6 +523,35 @@ func startP7Orchestration(ctx context.Context, deps p7OrchestrationDeps) (*p7Orc
 	}, nil
 }
 
+// p7ResourceKnowledgeInvalidator adapts the knowledge application's binding
+// invalidation to the resource context's neutral port. The resource service
+// reports a genuinely changed page route / removed account role; knowledge
+// decides which approved items become stale. The adapter only maps types, so
+// neither context imports the other.
+type p7ResourceKnowledgeInvalidator struct {
+	service *knowledgeapp.Service
+}
+
+// MarkBindingsStale implements resourceapp.KnowledgeInvalidator.
+func (i p7ResourceKnowledgeInvalidator) MarkBindingsStale(ctx context.Context, change resourceapp.KnowledgeBindingChange) (resourceapp.KnowledgeBindingInvalidation, error) {
+	if i.service == nil {
+		return resourceapp.KnowledgeBindingInvalidation{}, errors.New("knowledge invalidator: knowledge service is not configured")
+	}
+	result, err := i.service.MarkBindingsStale(ctx, knowledgeapp.BindingChange{
+		SystemIDs:      change.SystemIDs,
+		EnvironmentIDs: change.EnvironmentIDs,
+		PageKeys:       change.PageKeys,
+		AccountRoles:   change.AccountRoles,
+		Reason:         change.Reason,
+	})
+	return resourceapp.KnowledgeBindingInvalidation{
+		Scanned: result.Scanned,
+		Matched: result.Matched,
+		Marked:  result.Marked,
+		Failed:  result.Failed,
+	}, err
+}
+
 // p7RuntimeDeps are the already-constructed P0-P6 services the P7 composition
 // consumes.
 type p7RuntimeDeps struct {
@@ -549,12 +580,16 @@ type p7RuntimeDeps struct {
 type p7Runtime struct {
 	Knowledge        *knowledgeapi.Handler
 	KnowledgeAdapter *knowledgeadapter.Adapter
-	Orchestration    *orchestrationapi.Handler
-	GC               *storageapi.GCHandler
-	RenderEnsurer    *deliveryapp.RenderJobEnsurer
-	RenderWorker     *deliveryapp.RenderWorker
-	GCWorker         *storageapp.GCWorker
-	Listener         *eventingpg.Listener
+	// KnowledgeInvalidator is the resource context's page/account → knowledge
+	// stale sink. It is wired onto the resource service by main after this
+	// runtime is built.
+	KnowledgeInvalidator resourceapp.KnowledgeInvalidator
+	Orchestration        *orchestrationapi.Handler
+	GC                   *storageapi.GCHandler
+	RenderEnsurer        *deliveryapp.RenderJobEnsurer
+	RenderWorker         *deliveryapp.RenderWorker
+	GCWorker             *storageapp.GCWorker
+	Listener             *eventingpg.Listener
 
 	orchestrator *orchestrationapp.Service
 	leader       *orchestrationpg.Leader
@@ -611,6 +646,13 @@ func newP7Runtime(ctx context.Context, deps p7RuntimeDeps) (*p7Runtime, error) {
 		deps.IDs,
 	)
 	knowledgeAdapter := knowledgeadapter.New(knowledgeService, p7VersionSystems{pool: deps.Pool})
+	// Task 67 (P8-T9): the P9 explore analysis performs the pre-discovery login;
+	// that real login success sediments the approved login_recipe knowledge item
+	// through this adapter. The P9 runtime is built earlier in main (its version
+	// facts feed the design graph), so the knowledge port is late-attached here
+	// instead of rebuilding the runtime. nil-safe for a boot without P9 or for
+	// tests that build P7 in isolation.
+	p9AttachLoginRecipeWriter(p9ExploreRuntime, knowledgeAdapter)
 
 	// Storage GC: repository, owner lookup, filesystem ledger adapter, service
 	// and the leader-gated periodic worker.
@@ -661,16 +703,17 @@ func newP7Runtime(ctx context.Context, deps p7RuntimeDeps) (*p7Runtime, error) {
 	)
 
 	return &p7Runtime{
-		Knowledge:        knowledgeapi.New(knowledgeService),
-		KnowledgeAdapter: knowledgeAdapter,
-		Orchestration:    orchestrationapi.New(deps.Orchestrator),
-		GC:               storageapi.NewGC(gcService),
-		RenderEnsurer:    deliveryapp.NewRenderJobEnsurer(deps.ReportRepo, deps.Settings),
-		RenderWorker:     renderWorker,
-		GCWorker:         storageapp.NewGCWorker(gcService, deps.Settings, logger),
-		Listener:         listener,
-		orchestrator:     deps.Orchestrator,
-		leader:           deps.Leader,
+		Knowledge:            knowledgeapi.New(knowledgeService),
+		KnowledgeAdapter:     knowledgeAdapter,
+		KnowledgeInvalidator: p7ResourceKnowledgeInvalidator{service: knowledgeService},
+		Orchestration:        orchestrationapi.New(deps.Orchestrator),
+		GC:                   storageapi.NewGC(gcService),
+		RenderEnsurer:        deliveryapp.NewRenderJobEnsurer(deps.ReportRepo, deps.Settings),
+		RenderWorker:         renderWorker,
+		GCWorker:             storageapp.NewGCWorker(gcService, deps.Settings, logger),
+		Listener:             listener,
+		orchestrator:         deps.Orchestrator,
+		leader:               deps.Leader,
 	}, nil
 }
 

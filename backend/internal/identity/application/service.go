@@ -3,6 +3,7 @@ package identityapp
 import (
 	"context"
 	"errors"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,9 +20,10 @@ import (
 const (
 	// SeedAdminUsername is the fixed first-start administrator account.
 	SeedAdminUsername = "admin"
-	// SeedAdminPassword is the fixed first-start administrator password. It is
-	// a development/test trust model default; deployments must change it.
-	SeedAdminPassword = "admin123"
+	// SeedAdminPasswordEnv names the environment variable that supplies the
+	// first-start administrator password. It is required only while the user
+	// table is empty; there is no built-in default.
+	SeedAdminPasswordEnv = "EZTEST_INITIAL_ADMIN_PASSWORD"
 	// SeedAdminDisplayName is the seeded administrator display name.
 	SeedAdminDisplayName = "管理员"
 
@@ -37,6 +39,13 @@ const (
 	// MaxListLimit caps the user-list page size.
 	MaxListLimit = 100
 )
+
+// ErrSeedAdminPasswordMissing is returned when the user table is empty and
+// EZTEST_INITIAL_ADMIN_PASSWORD is unset or blank. Startup fails closed instead
+// of creating an administrator with a guessable built-in password.
+var ErrSeedAdminPasswordMissing = errors.New(
+	"EZTEST_INITIAL_ADMIN_PASSWORD is required to seed the first administrator " +
+		"(at least " + strconv.Itoa(MinPasswordLength) + " characters)")
 
 var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,64}$`)
 
@@ -55,8 +64,10 @@ func New(repo identity.Repository, hasher PasswordHasher, ids id.Generator, clk 
 	return &Service{repo: repo, hasher: hasher, ids: ids, clock: clk, audit: audit}
 }
 
-// EnsureSeedAdmin creates the fixed admin/admin123 administrator when the user
-// table is empty. It is idempotent: an existing user table is never touched.
+// EnsureSeedAdmin creates the administrator from EZTEST_INITIAL_ADMIN_PASSWORD
+// when the user table is empty. It is idempotent: an existing user table is
+// never touched, so restarts do not need the variable. A missing or too short
+// password fails closed and creates nothing.
 func (s *Service) EnsureSeedAdmin(ctx context.Context) (bool, error) {
 	count, err := s.repo.CountUsers(ctx)
 	if err != nil {
@@ -66,7 +77,14 @@ func (s *Service) EnsureSeedAdmin(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	passwordHash, err := s.hasher.Hash(SeedAdminPassword)
+	password := strings.TrimSpace(os.Getenv(SeedAdminPasswordEnv))
+	if password == "" {
+		return false, ErrSeedAdminPasswordMissing
+	}
+	if err := validatePassword(SeedAdminPasswordEnv, password); err != nil {
+		return false, err
+	}
+	passwordHash, err := s.hasher.Hash(password)
 	if err != nil {
 		return false, err
 	}

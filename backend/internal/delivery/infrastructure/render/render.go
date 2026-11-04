@@ -312,12 +312,27 @@ func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts deli
 		copy(evidence, data.CaseRuns[index].Evidence)
 		sort.SliceStable(evidence, func(i, j int) bool { return evidence[i].ID < evidence[j].ID })
 		data.CaseRuns[index].Evidence = evidence
+		// Task 118: the frozen template keeps its columns; the render projection
+		// shows the triage-honoring class so a flaky-triaged failure is never
+		// rendered as an application product defect.
+		data.CaseRuns[index].FailureClass = data.CaseRuns[index].EffectiveFailureClass()
 	}
 	sort.SliceStable(data.CaseRuns, func(i, j int) bool { return data.CaseRuns[i].ID < data.CaseRuns[j].ID })
 
 	// Issues are kept in ascending ID order while truncating (so "first N by
-	// id" is deterministic) and reversed only for display (spec §6.1).
+	// id" is deterministic) and reversed only for display (spec §6.1). A
+	// flaky- or expected_failure-triaged issue is displayed with the triage
+	// classification instead of its stored product category; the issue row
+	// itself is never rewritten (Task 118/122).
 	data.Issues = append([]delivery.IssueSnapshot(nil), snapshot.Issues...)
+	for index := range data.Issues {
+		switch {
+		case data.Issues[index].FlakyTriage():
+			data.Issues[index].Category = delivery.TriageClassificationFlaky
+		case data.Issues[index].ExpectedFailureTriage():
+			data.Issues[index].Category = delivery.TriageClassificationExpectedFailure
+		}
+	}
 	sort.SliceStable(data.Issues, func(i, j int) bool { return data.Issues[i].ID < data.Issues[j].ID })
 
 	data.VersionSUTs = append([]delivery.VersionSUTSnapshot(nil), snapshot.VersionSUTs...)

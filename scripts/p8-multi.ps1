@@ -89,7 +89,7 @@ param(
     [switch]$KeepRunning,
     [string]$DatabaseUrl = "",
     [string]$AdminUsername = "admin",
-    [string]$AdminPassword = "admin123",
+    [string]$AdminPassword = "[REDACTED]",
     [switch]$ValidateOnly
 )
 

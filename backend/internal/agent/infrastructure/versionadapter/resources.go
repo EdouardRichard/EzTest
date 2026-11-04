@@ -55,6 +55,7 @@ func (a *Adapter) ListPages(ctx context.Context, versionID, versionSUTID int64) 
 		for _, page := range binding.Pages {
 			items = append(items, tools.ResourcePage{
 				VersionSUTID: binding.ID,
+				ID:           page.ID,
 				Kind:         "page",
 				Name:         page.Name,
 				Path:         page.RouteTemplate,
@@ -63,6 +64,7 @@ func (a *Adapter) ListPages(ctx context.Context, versionID, versionSUTID int64) 
 		for _, api := range binding.APIs {
 			items = append(items, tools.ResourcePage{
 				VersionSUTID: binding.ID,
+				ID:           api.ID,
 				Kind:         "api",
 				Name:         api.Name,
 				Path:         api.PathTemplate,

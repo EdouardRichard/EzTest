@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
@@ -13,6 +14,57 @@ import (
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
+
+// maxDesignRoundRequirements bounds the design.round authoring scope: one model
+// run reads the graph once and submits at most ten cases per proposal, so a
+// round that carries all 67 V1 requirement ids can never produce them. The
+// round run therefore proposes for the highest-priority prefix only; the
+// per-requirement design.requirement authors cover the rest of the scope.
+const maxDesignRoundRequirements = 3
+
+// Design authoring work-item priorities: P0 requirements are claimed before P1,
+// P2 and P3 so a 67-requirement authoring wave cannot starve the critical
+// scope behind FIFO requirement-import order (Task 79). The work queue claims
+// by priority DESC then id ASC.
+const (
+	designPriorityP3 = 0
+	designPriorityP2 = 1
+	designPriorityP1 = 2
+	designPriorityP0 = 3
+)
+
+// designRequirementPriority maps a requirement priority to the claim priority
+// of its authoring tasks. Unknown/empty priorities keep the default P3 level.
+func designRequirementPriority(priority string) int {
+	switch strings.ToUpper(strings.TrimSpace(priority)) {
+	case "P0":
+		return designPriorityP0
+	case "P1":
+		return designPriorityP1
+	case "P2":
+		return designPriorityP2
+	default:
+		return designPriorityP3
+	}
+}
+
+// roundTaskScope returns the bounded, highest-priority prefix of one round
+// scope for the design.round authoring payload. The full scope stays on the
+// design_round row; only the single model run is narrowed.
+func roundTaskScope(scope []design.RequirementRef) ([]int64, []int64) {
+	ordered := append([]design.RequirementRef(nil), scope...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, right := designRequirementPriority(ordered[i].Priority), designRequirementPriority(ordered[j].Priority)
+		if left != right {
+			return left > right
+		}
+		return ordered[i].ID < ordered[j].ID
+	})
+	if len(ordered) > maxDesignRoundRequirements {
+		ordered = ordered[:maxDesignRoundRequirements]
+	}
+	return requirementIDs(ordered), requirementVersionIDs(ordered)
+}
 
 // Planner deterministically activates design scopes, ensures design tasks and
 // serves the version design metrics. It never writes case content.
@@ -26,6 +78,7 @@ type Planner struct {
 	conversations ConversationCreator
 	versions      VersionStarter
 	staler        Staler
+	converger     DesignConverger
 }
 
 // NewPlanner wires the design planner. Sinks and collaborators may be nil in
@@ -48,6 +101,31 @@ func NewPlanner(
 		repo: repo, ids: ids, clock: clk, events: events, enqueuer: enqueuer,
 		teamRoom: teamRoom, conversations: conversations, versions: versions, staler: staler,
 	}
+}
+
+// SetDesignConverger wires the designing -> case_review convergence port. It is
+// a setter because the composition root builds the version stage machine after
+// the design planner; nil disables the edge for degraded assemblies.
+func (p *Planner) SetDesignConverger(converger DesignConverger) *Planner {
+	if p != nil {
+		p.converger = converger
+	}
+	return p
+}
+
+// EnsureDesignConversation resolves (creating when absent) the version's design
+// conversation. The dispatcher calls it before creating the design.cases
+// stage-entry job, so the persisted work-item payload carries the conversation
+// association the job card and cancel/retry write-back need. It is idempotent.
+func (p *Planner) EnsureDesignConversation(ctx context.Context, versionID int64) (int64, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return 0, err
+	}
+	conversationID, err := p.ensureDesignConversation(ctx, versionID)
+	if err != nil {
+		return 0, mapDesignError(err, "version")
+	}
+	return conversationID, nil
 }
 
 // StartRound creates (or repairs) the manual design round of one conversation.
@@ -86,13 +164,13 @@ func (p *Planner) StartRound(ctx context.Context, versionID, conversationID, act
 		if _, err := p.activateScopes(ctx, versionID, round.ID, pending); err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending"); err != nil {
+		if err := p.ensureRequirementTasks(ctx, versionID, pending, "pending", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRequirementTasks(ctx, versionID, redesign, "requirement_changed"); err != nil {
+		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureRoundTask(ctx, versionID, round.ID, conversationID); err != nil {
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID, scope); err != nil {
 			return err
 		}
 		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
@@ -120,6 +198,149 @@ func (p *Planner) StartRound(ctx context.Context, versionID, conversationID, act
 	}
 	roundNo := p.roundNumber(ctx, versionID, round.ID)
 	return roundView(round, roundNo), nil
+}
+
+// StartStageRound ensures the design round for the requirements confirmed by
+// the requirement hard gate (Task 65). It is the deterministic consumer of the
+// design.cases stage-entry work item and deliberately does not read the legacy
+// auto_design_new_requirements toggle: the stage transition already selected the
+// scope. It creates the design conversation when the version has none, creates
+// or reuses the conversation's round, activates the confirmed requirements,
+// enqueues one case-author task per requirement version (with the conversation
+// association) plus the round task, and returns the design conversation id.
+//
+// The operation is idempotent: a repeated stage entry (event replay or R49
+// repair) reuses the same conversation/round and adds no duplicate tasks.
+func (p *Planner) StartStageRound(ctx context.Context, versionID int64, requestedIDs []int64) (int64, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return 0, err
+	}
+	requested := make(map[int64]struct{}, len(requestedIDs))
+	for _, requirementID := range requestedIDs {
+		if requirementID <= 0 {
+			return 0, platform.Invalid("requirement_ids", "must contain only positive decimal IDs")
+		}
+		requested[requirementID] = struct{}{}
+	}
+
+	conversationID, err := p.ensureDesignConversation(ctx, versionID)
+	if err != nil {
+		return 0, mapDesignError(err, "version")
+	}
+
+	err = p.repo.WithVersionLock(ctx, versionID, func(ctx context.Context) error {
+		existing, err := p.repo.GetRoundByConversation(ctx, conversationID)
+		if err != nil {
+			return err
+		}
+		pending, err := p.pendingRequirements(ctx, versionID)
+		if err != nil {
+			return err
+		}
+		if len(requested) > 0 {
+			pending = filterRequirementRefs(pending, requested)
+		}
+		redesign, err := p.redesignRequirements(ctx, versionID)
+		if err != nil {
+			return err
+		}
+		if len(requested) > 0 {
+			redesign = filterRequirementRefs(redesign, requested)
+		}
+		scope := requirementRefsUnion(pending, redesign)
+
+		createdRound := false
+		var round design.Round
+		if existing != nil {
+			round = *existing
+			mergedIDs := mergeIDs(round.RequirementIDs, requirementIDs(scope))
+			mergedVersions := mergeIDs(round.RequirementVersionIDs, requirementVersionIDs(scope))
+			if len(mergedIDs) != len(round.RequirementIDs) {
+				if err := p.repo.UpdateRoundRequirements(ctx, round.ID, mergedIDs, mergedVersions); err != nil {
+					return err
+				}
+				round.RequirementIDs = mergedIDs
+				round.RequirementVersionIDs = mergedVersions
+			}
+		} else {
+			round, err = p.createRound(ctx, versionID, conversationID, 0, design.ActivationAutoNew, scope)
+			if err != nil {
+				return err
+			}
+			createdRound = true
+		}
+		activated, err := p.activateScopes(ctx, versionID, round.ID, scope)
+		if err != nil {
+			return err
+		}
+		if err := p.ensureRequirementTasks(ctx, versionID, pending, "requirement_confirmed", conversationID, round.ID); err != nil {
+			return err
+		}
+		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
+			return err
+		}
+		if err := p.ensureRoundTask(ctx, versionID, round, conversationID, scope); err != nil {
+			return err
+		}
+		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
+			return err
+		}
+		p.markRunning(ctx, versionID)
+		if createdRound {
+			p.publish(ctx, versionID, "design.round_started", map[string]any{
+				"round_id":        platformid.Format(round.ID),
+				"conversation_id": platformid.Format(conversationID),
+				"activation":      round.Activation,
+				"requirement_ids": formatIDList(requirementIDs(scope)),
+			})
+		}
+		if len(activated) > 0 {
+			p.publish(ctx, versionID, "design.scope_activated", map[string]any{
+				"round_id":        platformid.Format(round.ID),
+				"activation":      design.ActivationAutoNew,
+				"requirement_ids": formatIDList(requirementIDs(activated)),
+			})
+		}
+		if createdRound || len(activated) > 0 {
+			p.postRoundStatus(ctx, versionID, round, len(scope))
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, mapDesignError(err, "version")
+	}
+	return conversationID, nil
+}
+
+// ensureDesignConversation returns the version's latest design conversation,
+// creating one when the version has none. It is the conversation the
+// design.cases job card and the round's case-author traces are projected into.
+func (p *Planner) ensureDesignConversation(ctx context.Context, versionID int64) (int64, error) {
+	conversationID, has, err := p.repo.LatestDesignConversation(ctx, versionID)
+	if err != nil {
+		return 0, err
+	}
+	if has && conversationID > 0 {
+		return conversationID, nil
+	}
+	if p.conversations == nil {
+		return 0, fmt.Errorf("design planner has no conversation creator")
+	}
+	title := "AI 设计 " + p.clock.Now().Format("2006-01-02 15:04")
+	return p.conversations.CreateDesign(ctx, versionID, title)
+}
+
+// filterRequirementRefs keeps only the requested requirement IDs and preserves
+// the repository order.
+func filterRequirementRefs(requirements []design.RequirementRef, wanted map[int64]struct{}) []design.RequirementRef {
+	filtered := make([]design.RequirementRef, 0, len(requirements))
+	for _, requirement := range requirements {
+		if _, ok := wanted[requirement.ID]; !ok {
+			continue
+		}
+		filtered = append(filtered, requirement)
+	}
+	return filtered
 }
 
 // CountPendingDesign returns clarified requirements that are not yet activated.
@@ -220,6 +441,7 @@ func (p *Planner) RequestGap(ctx context.Context, in GapInput) error {
 				Type:      TaskTypeDesignGap,
 				DedupeKey: fmt.Sprintf("gap:%d:%d", in.RequirementID, dedupeSuffix),
 				Payload:   payload,
+				Priority:  designRequirementPriority(requirement.Priority),
 			}); err != nil {
 				return err
 			}
@@ -341,8 +563,10 @@ func (p *Planner) activateScopes(ctx context.Context, versionID, roundID int64, 
 }
 
 // ensureRequirementTasks enqueues one design.requirement task per requirement
-// version with the contract dedupe key.
-func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, requirements []design.RequirementRef, reason string) error {
+// version with the contract dedupe key. When conversationID/roundID are positive
+// the task payload carries the design round association so the case author's
+// proposal trace and summary land in the design thread (Task 65).
+func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, requirements []design.RequirementRef, reason string, conversationID, roundID int64) error {
 	if p.enqueuer == nil {
 		return nil
 	}
@@ -350,16 +574,24 @@ func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, r
 		if requirement.CurrentVersionID <= 0 {
 			continue
 		}
+		payload := map[string]any{
+			"requirement_id":         platformid.Format(requirement.ID),
+			"requirement_version_id": platformid.Format(requirement.CurrentVersionID),
+			"reason":                 reason,
+		}
+		if conversationID > 0 {
+			payload["conversation_id"] = platformid.Format(conversationID)
+		}
+		if roundID > 0 {
+			payload["round_id"] = platformid.Format(roundID)
+		}
 		if _, err := p.enqueuer.Ensure(ctx, TaskInput{
 			VersionID: versionID,
 			Team:      TeamDesign,
 			Type:      TaskTypeDesignRequirement,
 			DedupeKey: fmt.Sprintf("design:%d:%d", requirement.ID, requirement.CurrentVersionID),
-			Payload: map[string]any{
-				"requirement_id":         platformid.Format(requirement.ID),
-				"requirement_version_id": platformid.Format(requirement.CurrentVersionID),
-				"reason":                 reason,
-			},
+			Payload:   payload,
+			Priority:  designRequirementPriority(requirement.Priority),
 		}); err != nil {
 			return err
 		}
@@ -367,20 +599,84 @@ func (p *Planner) ensureRequirementTasks(ctx context.Context, versionID int64, r
 	return nil
 }
 
-// ensureRoundTask enqueues the design.round task of one conversation.
-func (p *Planner) ensureRoundTask(ctx context.Context, versionID, roundID, conversationID int64) error {
+// ensureCoverageRepairTasks re-triggers the case-author work for requirements
+// that are still uncovered (or stale) after their previous design.requirement
+// task finished. The port derives a fresh generation key from the base key, so a
+// terminal "done but produced no cases" item no longer blocks the next attempt;
+// the adapter still refuses to duplicate an in-flight generation and bounds the
+// number of repair generations (Task 70).
+func (p *Planner) ensureCoverageRepairTasks(ctx context.Context, versionID int64, requirements []design.RequirementRef, conversationID, roundID int64) error {
 	if p.enqueuer == nil {
 		return nil
+	}
+	for _, requirement := range requirements {
+		if requirement.CurrentVersionID <= 0 {
+			continue
+		}
+		payload := map[string]any{
+			"requirement_id":         platformid.Format(requirement.ID),
+			"requirement_version_id": platformid.Format(requirement.CurrentVersionID),
+			"reason":                 "coverage_repair",
+		}
+		if conversationID > 0 {
+			payload["conversation_id"] = platformid.Format(conversationID)
+		}
+		if roundID > 0 {
+			payload["round_id"] = platformid.Format(roundID)
+		}
+		if _, err := p.enqueuer.EnsureCoverageRepair(ctx, TaskInput{
+			VersionID: versionID,
+			Team:      TeamDesign,
+			Type:      TaskTypeDesignRequirement,
+			DedupeKey: fmt.Sprintf("design:%d:%d", requirement.ID, requirement.CurrentVersionID),
+			Payload:   payload,
+			Priority:  designRequirementPriority(requirement.Priority),
+		}, requirement.CurrentVersionID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureRoundTask enqueues the design.round task of one conversation. The
+// payload carries the round's activated requirement/version ids (Task 69), so
+// the round turn can propose cases for the scope without re-deriving it. The
+// scope is bounded to the highest-priority prefix (Task 79): one model run
+// cannot read and propose 67 requirements, and the per-requirement authors own
+// the rest of the round.
+func (p *Planner) ensureRoundTask(ctx context.Context, versionID int64, round design.Round, conversationID int64, scope []design.RequirementRef) error {
+	if p.enqueuer == nil {
+		return nil
+	}
+	payload := map[string]any{
+		"conversation_id": platformid.Format(conversationID),
+		"round_id":        platformid.Format(round.ID),
+	}
+	scopeIDs, scopeVersionIDs := roundTaskScope(scope)
+	if len(scopeIDs) == 0 && len(round.RequirementIDs) > 0 {
+		// Repair path with no refs in hand: keep the round order but still cap
+		// the single run's scope.
+		scopeIDs = round.RequirementIDs
+		scopeVersionIDs = round.RequirementVersionIDs
+		if len(scopeIDs) > maxDesignRoundRequirements {
+			scopeIDs = scopeIDs[:maxDesignRoundRequirements]
+		}
+		if len(scopeVersionIDs) > maxDesignRoundRequirements {
+			scopeVersionIDs = scopeVersionIDs[:maxDesignRoundRequirements]
+		}
+	}
+	if ids := formatIDList(scopeIDs); len(ids) > 0 {
+		payload["requirement_ids"] = ids
+	}
+	if ids := formatIDList(scopeVersionIDs); len(ids) > 0 {
+		payload["requirement_version_ids"] = ids
 	}
 	_, err := p.enqueuer.Ensure(ctx, TaskInput{
 		VersionID: versionID,
 		Team:      TeamDesign,
 		Type:      TaskTypeDesignRound,
 		DedupeKey: fmt.Sprintf("round:%d", conversationID),
-		Payload: map[string]any{
-			"conversation_id": platformid.Format(conversationID),
-			"round_id":        platformid.Format(roundID),
-		},
+		Payload:   payload,
 	})
 	return err
 }
@@ -403,6 +699,7 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 			"requirement_id":         platformid.Format(item.Requirement.ID),
 			"requirement_version_id": platformid.Format(item.Requirement.CurrentVersionID),
 		}
+		priority := designRequirementPriority(item.Requirement.Priority)
 		if item.DraftCount > 0 || item.ConfirmedCount > 0 {
 			if _, err := p.enqueuer.Ensure(ctx, TaskInput{
 				VersionID: versionID,
@@ -410,6 +707,7 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 				Type:      TaskTypeDesignCritic,
 				DedupeKey: fmt.Sprintf("critic:%d:%d", item.Requirement.ID, item.Requirement.CurrentVersionID),
 				Payload:   payload,
+				Priority:  priority,
 			}); err != nil {
 				return err
 			}
@@ -421,6 +719,7 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 				Type:      TaskTypeDesignDataPlan,
 				DedupeKey: fmt.Sprintf("dataplan:%d:%d", item.Requirement.ID, item.Requirement.CurrentVersionID),
 				Payload:   payload,
+				Priority:  priority,
 			}); err != nil {
 				return err
 			}

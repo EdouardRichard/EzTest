@@ -97,6 +97,16 @@ type IntentView struct {
 	CreatedAt     string   `json:"created_at"`
 }
 
+// CaseRunUsageView is the observed agent-run usage of a terminal case run.
+// Providers report prompt/completion or input/output keys; the domain already
+// normalized the total at settlement.
+type CaseRunUsageView struct {
+	Turns            int `json:"turns"`
+	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
 // CaseRunSummaryView is the stable subset of case_run.summary.
 type CaseRunSummaryView struct {
 	VerdictReason      string  `json:"verdict_reason"`
@@ -110,6 +120,14 @@ type CaseRunSummaryView struct {
 	VisualFailed       int     `json:"visual_failed"`
 	VisualInconclusive int     `json:"visual_inconclusive"`
 	HumanRequestID     *string `json:"human_request_id"`
+	// LastError/TerminalCause/NextAction explain an incomplete run: the concrete
+	// stop cause, the observable detail and the suggested human next step (QA Q2).
+	LastError     string `json:"last_error"`
+	TerminalCause string `json:"terminal_cause"`
+	NextAction    string `json:"next_action"`
+	// Usage is the observed agent-run usage persisted at terminal settlement
+	// (QA Q2: it used to be visible only in Agent Center).
+	Usage *CaseRunUsageView `json:"usage"`
 }
 
 // CaseRunView is the case_run projection (spec §9.3).
@@ -265,6 +283,16 @@ func toIntentView(intent execution.ExecutionIntent, caseID, title string) Intent
 }
 
 func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, evidenceCount int) CaseRunView {
+	terminalCause, nextAction := execution.TerminalExplanation(run.Status, run.FailureClass, run.Summary)
+	var usage *CaseRunUsageView
+	if run.Summary.Usage != nil {
+		usage = &CaseRunUsageView{
+			Turns:            run.Summary.Usage.Turns,
+			TotalTokens:      run.Summary.Usage.TotalTokens,
+			PromptTokens:     run.Summary.Usage.PromptTokens,
+			CompletionTokens: run.Summary.Usage.CompletionTokens,
+		}
+	}
 	return CaseRunView{
 		ID:            platformid.Format(run.ID),
 		WaveID:        platformid.Format(run.WaveID),
@@ -287,6 +315,10 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 			VisualFailed:       run.Summary.VisualFailed,
 			VisualInconclusive: run.Summary.VisualInconclusive,
 			HumanRequestID:     optionalIDString(run.Summary.HumanRequestID),
+			LastError:          run.Summary.LastError,
+			TerminalCause:      terminalCause,
+			NextAction:         nextAction,
+			Usage:              usage,
 		},
 		StartedAt:     formatOptionalTime(run.StartedAt),
 		FinishedAt:    formatOptionalTime(run.FinishedAt),
@@ -368,9 +400,13 @@ func toHumanRequestView(request execution.HumanRequest) HumanRequestView {
 }
 
 func toExecutorView(instance execution.ExecutorInstance) ExecutorView {
-	labels := instance.Labels
-	if labels == nil {
-		labels = map[string]any{}
+	// The degraded health marker is internal registry state, not a user label.
+	labels := make(map[string]any, len(instance.Labels))
+	for key, value := range instance.Labels {
+		if key == execution.ExecutorLabelDegraded {
+			continue
+		}
+		labels[key] = value
 	}
 	return ExecutorView{
 		ID:             platformid.Format(instance.ID),

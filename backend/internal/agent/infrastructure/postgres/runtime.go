@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
@@ -18,7 +19,8 @@ const profileColumns = `id, key, name, system_prompt, allowed_tools, model, budg
 	created_at, updated_at`
 
 const runColumns = `id, profile_key, work_item_id, conversation_id, status, terminal_reason,
-	turns, usage, owner_instance, lease_epoch, context_packet_id, started_at, finished_at`
+	turns, usage, owner_instance, lease_epoch, context_packet_id, started_at, finished_at,
+	model, config_id, fallback_from, tokens, cache`
 
 const messageColumns = `id, run_id, conversation_id, role, parts, tool_calls, tool_call_id,
 	usage, created_at`
@@ -115,7 +117,10 @@ func (r *RuntimeRepository) ListProfiles(ctx context.Context) ([]agent.AgentProf
 	return profiles, nil
 }
 
-// CreateRun inserts a running agent_run row.
+// CreateRun inserts one agent_run row with the run's status. A dispatch-ready
+// attempt is created running, while an attempt that failed before dispatch is
+// recorded with its terminal snapshot in the same insert (Task 75), so the
+// Agent center can list it without a transient running row.
 func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (agent.AgentRun, error) {
 	if err := run.Validate(); err != nil {
 		return agent.AgentRun{}, err
@@ -131,16 +136,48 @@ func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (
 	if err != nil {
 		return agent.AgentRun{}, err
 	}
+	tokens := run.Tokens
+	if tokens == nil {
+		tokens = map[string]int{}
+	}
+	encodedTokens, err := encodeJSONObject("run tokens", tokens)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
+	cache := run.Cache
+	if cache == nil {
+		cache = map[string]int{}
+	}
+	encodedCache, err := encodeJSONObject("run cache", cache)
+	if err != nil {
+		return agent.AgentRun{}, err
+	}
 	startedAt := timeOrNow(run.StartedAt)
+	var configID *int64
+	if run.ConfigID > 0 {
+		value := run.ConfigID
+		configID = &value
+	}
+	var fallbackFrom *string
+	if run.FallbackFrom != "" {
+		value := run.FallbackFrom
+		fallbackFrom = &value
+	}
+	var terminalReason *string
+	if run.TerminalReason != nil && strings.TrimSpace(*run.TerminalReason) != "" {
+		value := strings.TrimSpace(*run.TerminalReason)
+		terminalReason = &value
+	}
 
 	stored, err := scanRun(r.pool.QueryRow(ctx, `
 		INSERT INTO agent_run (id, profile_key, work_item_id, conversation_id, status,
 			terminal_reason, turns, usage, owner_instance, lease_epoch, context_packet_id,
-			started_at, finished_at)
-		VALUES ($1, $2, $3, $4, 'running', NULL, 0, $5::jsonb, $6, $7, NULL, $8, NULL)
+			started_at, finished_at, model, config_id, fallback_from, tokens, cache)
+		VALUES ($1, $2, $3, $4, $5, $6, 0, $7::jsonb, $8, $9, NULL, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb)
 		RETURNING `+runColumns,
-		run.ID, run.ProfileKey, run.WorkItemID, run.ConversationID, encodedUsage,
-		run.OwnerInstance, run.LeaseEpoch, startedAt))
+		run.ID, run.ProfileKey, run.WorkItemID, run.ConversationID, string(run.Status),
+		terminalReason, encodedUsage, run.OwnerInstance, run.LeaseEpoch, startedAt,
+		run.FinishedAt, run.Model, configID, fallbackFrom, encodedTokens, encodedCache))
 	if err != nil {
 		return agent.AgentRun{}, wrapDB("create agent run", err)
 	}
@@ -165,6 +202,22 @@ func (r *RuntimeRepository) FinishRun(ctx context.Context, run agent.AgentRun) e
 	if err != nil {
 		return err
 	}
+	tokens := run.Tokens
+	if tokens == nil {
+		tokens = map[string]int{}
+	}
+	encodedTokens, err := encodeJSONObject("run tokens", tokens)
+	if err != nil {
+		return err
+	}
+	cache := run.Cache
+	if cache == nil {
+		cache = map[string]int{}
+	}
+	encodedCache, err := encodeJSONObject("run cache", cache)
+	if err != nil {
+		return err
+	}
 	finishedAt := time.Now().UTC()
 	if run.FinishedAt != nil {
 		finishedAt = timeOrNow(*run.FinishedAt)
@@ -176,10 +229,10 @@ func (r *RuntimeRepository) FinishRun(ctx context.Context, run agent.AgentRun) e
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE agent_run
 		SET status = $3, terminal_reason = $4, turns = $5, usage = $6::jsonb,
-		    finished_at = $7
+		    tokens = $7::jsonb, cache = $8::jsonb, finished_at = $9
 		WHERE id = $1 AND lease_epoch = $2
 	`, run.ID, run.LeaseEpoch, string(run.Status), reason, run.Turns,
-		encodedUsage, finishedAt)
+		encodedUsage, encodedTokens, encodedCache, finishedAt)
 	if err != nil {
 		return wrapDB("finish agent run", err)
 	}
@@ -311,6 +364,64 @@ func (r *RuntimeRepository) GetContextPacket(ctx context.Context, id int64) (age
 	return packet, nil
 }
 
+// LatestVersionContextPacket returns the newest context packet persisted for one
+// version, or agent.ErrNotFound. It is the read side of the 0.2.1 cache-first
+// context packet API: read-only and version-scoped. The version is already
+// denormalized on the row (context_packet.version_id), so no agent_run join is
+// needed; ordering by the snowflake ID is the persisted creation order.
+func (r *RuntimeRepository) LatestVersionContextPacket(ctx context.Context, versionID int64) (agent.ContextPacket, error) {
+	if versionID <= 0 {
+		return agent.ContextPacket{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	packet, err := scanPacket(r.pool.QueryRow(ctx, `
+		SELECT `+packetColumns+` FROM context_packet
+		WHERE version_id = $1
+		ORDER BY id DESC
+		LIMIT 1
+	`, versionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agent.ContextPacket{}, agent.ErrNotFound
+	}
+	if err != nil {
+		return agent.ContextPacket{}, wrapDB("latest context packet", err)
+	}
+	return packet, nil
+}
+
+// UpdateContextPacketCacheStats overwrites the provider-reported prompt cache
+// bookkeeping of one persisted packet (contracts §18.2.6). Only token_counts
+// changes; sections, hash and identity stay immutable. It returns
+// agent.ErrNotFound when the packet does not exist.
+func (r *RuntimeRepository) UpdateContextPacketCacheStats(ctx context.Context, id int64, cachedTokens int, cacheHit bool) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if cachedTokens < 0 {
+		return platform.Invalid("cached_tokens", "must not be negative")
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE context_packet
+		SET token_counts = jsonb_set(
+			jsonb_set(token_counts, '{cached_tokens}', to_jsonb($2::int), true),
+			'{cache_hit}', to_jsonb($3::int), true)
+		WHERE id = $1
+	`, id, cachedTokens, boolToInt(cacheHit))
+	if err != nil {
+		return wrapDB("update context packet cache stats", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrNotFound
+	}
+	return nil
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func scanProfile(row rowScanner) (agent.AgentProfile, error) {
 	var profile agent.AgentProfile
 	var toolsRaw, budgetsRaw []byte
@@ -336,17 +447,38 @@ func scanProfile(row rowScanner) (agent.AgentProfile, error) {
 func scanRun(row rowScanner) (agent.AgentRun, error) {
 	var run agent.AgentRun
 	var status string
-	var usageRaw []byte
+	var usageRaw, tokensRaw, cacheRaw []byte
+	var configID *int64
+	var fallbackFrom *string
 	if err := row.Scan(&run.ID, &run.ProfileKey, &run.WorkItemID, &run.ConversationID,
 		&status, &run.TerminalReason, &run.Turns, &usageRaw, &run.OwnerInstance,
-		&run.LeaseEpoch, &run.ContextPacketID, &run.StartedAt, &run.FinishedAt); err != nil {
+		&run.LeaseEpoch, &run.ContextPacketID, &run.StartedAt, &run.FinishedAt,
+		&run.Model, &configID, &fallbackFrom, &tokensRaw, &cacheRaw); err != nil {
 		return agent.AgentRun{}, err
+	}
+	if configID != nil {
+		run.ConfigID = *configID
+	}
+	if fallbackFrom != nil {
+		run.FallbackFrom = *fallbackFrom
 	}
 	run.Status = agent.AgentRunStatus(status)
 	run.Usage = map[string]int{}
 	if len(usageRaw) > 0 {
 		if err := json.Unmarshal(usageRaw, &run.Usage); err != nil {
 			return agent.AgentRun{}, fmt.Errorf("decode run usage: %w", err)
+		}
+	}
+	run.Tokens = map[string]int{}
+	if len(tokensRaw) > 0 {
+		if err := json.Unmarshal(tokensRaw, &run.Tokens); err != nil {
+			return agent.AgentRun{}, fmt.Errorf("decode run tokens: %w", err)
+		}
+	}
+	run.Cache = map[string]int{}
+	if len(cacheRaw) > 0 {
+		if err := json.Unmarshal(cacheRaw, &run.Cache); err != nil {
+			return agent.AgentRun{}, fmt.Errorf("decode run cache: %w", err)
 		}
 	}
 	return run, nil

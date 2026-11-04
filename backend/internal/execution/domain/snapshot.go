@@ -16,8 +16,12 @@ type CaseStep struct {
 
 // CaseAssertion is the execution-relevant projection of one P2 case_assertion.
 // AssertionSeq is derived by ascending case_assertion ID within a step
-// (P3-D-06).
+// (P3-D-06). CaseAssertionID is the design case_assertion.id, used by the
+// execution.visual_assert mapping to join the exact design assertion to its
+// visual_assertion configuration (Task 115); it is zero for reads that predate
+// the projection.
 type CaseAssertion struct {
+	CaseAssertionID    int64
 	StepSeq            int
 	AssertionSeq       int
 	Kind               string

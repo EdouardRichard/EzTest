@@ -25,9 +25,46 @@ type TaskEnqueuer interface {
 }
 
 // MessageAttachmentRegistrar validates a message attachment part against the
-// content ledger and persists the requirement_attachment runtime row. The
-// attachment service implements it; conversation messages never block on
-// extraction.
+// content ledger, converts image attachments into image parts before the
+// message is stored, pre-registers/reuses the requirement_attachment runtime
+// rows, and enforces the §8.5 "done or parsing" submit gate. The attachment
+// service implements it.
 type MessageAttachmentRegistrar interface {
-	RegisterFromMessage(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error)
+	// PrepareUserMessageParts converts image attachment parts into image parts,
+	// pre-registers (or reuses) the attachment rows for the message's attachment
+	// parts and returns the typed 409 attachment_pending when any referenced
+	// attachment is still parsing. attachmentIDs are the unlinked rows that
+	// must be linked to the message once the insert wins.
+	PrepareUserMessageParts(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart, actorID int64) ([]version.MessagePart, []int64, error)
+	// LinkFromMessage binds pre-registered attachment rows to the inserted
+	// message without re-reading the content or re-running extraction.
+	LinkFromMessage(ctx context.Context, versionID, messageID int64, attachmentIDs []int64) error
+}
+
+// ClarifiedRequirementCounter exposes the clarified-requirement count used by
+// the design-conversation gate. RequirementService implements it; a nil counter
+// disables the gate for degraded assemblies and unit tests.
+type ClarifiedRequirementCounter interface {
+	CountClarifiedRequirements(ctx context.Context, versionID int64) (int, error)
+}
+
+// ConversationModel is the effective model of one conversation and the
+// capabilities the version context needs before dispatching a draft. The
+// version context never imports the LLM context (Agent.md §6.9.7), so the
+// composition root's adapter maps the LLM catalog row into this narrow shape.
+type ConversationModel struct {
+	// Model is the catalog name persisted in conversation.model_override and
+	// shown in effective_model.
+	Model string
+	// SupportsVision reports whether the model accepts image parts. An image
+	// draft must not be stored/queued for a model without it (Task 75).
+	SupportsVision bool
+}
+
+// ConversationModelCatalog resolves a conversation-level model override against
+// the default LLM configuration's selectable catalog. An empty override resolves
+// the configuration's explicit default_model_id (models[0] is never used,
+// D24). The LLM application service backs it in production.
+type ConversationModelCatalog interface {
+	ResolveConversationModel(ctx context.Context, modelOverride string) (ConversationModel, error)
 }

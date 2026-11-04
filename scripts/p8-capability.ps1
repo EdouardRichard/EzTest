@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 P8 S11 capability-matrix smoke (Task 13).
 
@@ -30,7 +30,7 @@ Usage:
 Defaults target the P8 acceptance layout:
   API    http://127.0.0.1:13333
   DB     eztest_v02_p8 (built from .env EZTEST_DATABASE_URL)
-  Admin  admin / admin123
+  Admin  admin / [REDACTED]
 
 The script writes its textual log to .tmp/p8-capability/capability.txt
 (-ListOnly writes capability-listonly.txt). It does not modify product code,
@@ -41,7 +41,7 @@ normal user created through POST /api/admin/users for the permission smoke.
 param(
   [string]$ApiBase = "http://127.0.0.1:13333",
   [string]$AdminUser = "admin",
-  [string]$AdminPassword = "admin123",
+  [string]$AdminPassword = "[REDACTED]",
   [string]$DatabaseName = "eztest_v02_p8",
   [string]$DatabaseUrl = "",
   [int]$ExpectedMigrations = 42,

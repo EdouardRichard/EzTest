@@ -23,6 +23,18 @@ type SettingsReader interface {
 	Bool(ctx context.Context, key string) (bool, error)
 }
 
+// BatchSelectionReader reads the case selection frozen by the execute.batch
+// stage-entry job (D23). The 0.2.1 job persists its case_ids on the work item;
+// the composition-root adapter projects the newest execute.batch item. found
+// distinguishes "no persisted selection" (typed repair skip) from an explicit
+// empty selection, which keeps the contract's "all current confirmed cases"
+// meaning. The agent reconciler's R49 recovery reads the same projection so a
+// lost execute.batch job is re-enqueued with the persisted selection, never
+// with a bare {} "all cases" target.
+type BatchSelectionReader interface {
+	ExecuteBatchSelection(ctx context.Context, versionID int64) (caseIDs []int64, found bool, err error)
+}
+
 // IntentRepository persists execution_intent rows.
 type IntentRepository interface {
 	Create(ctx context.Context, intent execution.ExecutionIntent) error
@@ -83,8 +95,9 @@ type CaseRunRepository interface {
 	// ClaimLease extends the run lease for the given dispatch epoch.
 	ClaimLease(ctx context.Context, id int64, epoch int64, until time.Time) (bool, error)
 	ListRunningByExecutor(ctx context.Context, executorID int64) ([]execution.CaseRun, error)
-	// LatestByCaseVersions returns the newest case_run per case_version_id of
-	// a version (coverage analysis).
+	// LatestByCaseVersions returns the newest non-superseded case_run per
+	// case_version_id of a version (coverage analysis). Superseded process
+	// rows carry no result and never shadow an earlier run.
 	LatestByCaseVersions(ctx context.Context, versionID int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error)
 }
 
@@ -149,6 +162,38 @@ type SUTContextRepository interface {
 type CaseReader interface {
 	GetCaseVersion(ctx context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, error)
 	ListExecutable(ctx context.Context, versionID int64) ([]execution.CaseSnapshot, error)
+	// ResolveReplacement returns the current+confirmed case version of the same
+	// logical case that replaced a historical case version, when one exists
+	// (Task 106). execution never reads the design tables directly; the design
+	// adapter resolves the historical case_id and re-reads its executable
+	// current version. found=false means the case has no executable replacement
+	// yet (it still needs re-design/re-confirmation), not a read failure.
+	ResolveReplacement(ctx context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, bool, error)
+	// CaseVersionLabel resolves the display labels of any case version of the
+	// version, including superseded/stale/draft history. It is the projection
+	// fallback for terminal case_runs whose version is no longer
+	// current+confirmed, so a superseded row keeps its case id/title instead of
+	// rendering anonymously (PO E2E F11).
+	CaseVersionLabel(ctx context.Context, versionID, caseVersionID int64) (CaseVersionLabel, error)
+}
+
+// CaseVersionLabel is the historical case-version display projection used by
+// the execution read models.
+type CaseVersionLabel struct {
+	CaseID        int64
+	CaseVersionID int64
+	Title         string
+	Revision      int
+	Status        string
+}
+
+// SupersededIntentReplanner retires an active intent whose case version left
+// the current+confirmed executable set and auto-enqueues the same logical
+// case's replacement confirmed revision when it exists (Task 106). It is
+// implemented by *IntentService; degraded assemblies may leave it nil and the
+// scheduler/recovery then only retire the intent (with the visible event).
+type SupersededIntentReplanner interface {
+	SupersedeAndReplan(ctx context.Context, intent execution.ExecutionIntent) (SupersedeResult, error)
 }
 
 // VersionReader is the read/write port into the version context.

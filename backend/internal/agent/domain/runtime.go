@@ -84,10 +84,19 @@ func (s AgentRunStatus) Terminal() bool {
 	return s != AgentRunRunning && s.Valid()
 }
 
-// AgentRun is one run of an agent profile, fenced by lease_epoch.
+// AgentRun is one run of an agent profile, fenced by lease_epoch. Model and
+// ConfigID record the model/config actually used (spec §7.3); FallbackFrom is
+// set only when a differently requested model was not used (P4 never switches
+// models automatically, so it normally stays empty). Tokens and Cache are the
+// 0.2.1 token/prompt-cache accounting persisted on the run (spec §7.5).
 type AgentRun struct {
 	ID              int64
 	ProfileKey      string
+	Model           string
+	ConfigID        int64
+	FallbackFrom    string
+	Tokens          map[string]int
+	Cache           map[string]int
 	WorkItemID      *int64
 	ConversationID  *int64
 	Status          AgentRunStatus

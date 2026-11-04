@@ -116,6 +116,8 @@ type fakeRepo struct {
 	executableCaseErr error
 	executableCases   map[int64]design.ExecutableCase
 	executableList    []design.ExecutableCase
+
+	caseVersionSummaries []design.CaseVersionSummary
 }
 
 // ReadExecutableCase implements the P3 execution read port in tests.
@@ -136,6 +138,21 @@ func (f *fakeRepo) ListExecutableCases(_ context.Context, versionID int64) ([]de
 		return nil, f.executableCaseErr
 	}
 	return f.executableList, nil
+}
+
+// ReadCaseVersionsByIDs implements the historical case-version reader in tests.
+func (f *fakeRepo) ReadCaseVersionsByIDs(_ context.Context, versionID int64, caseVersionIDs []int64) ([]design.CaseVersionSummary, error) {
+	wanted := make(map[int64]struct{}, len(caseVersionIDs))
+	for _, id := range caseVersionIDs {
+		wanted[id] = struct{}{}
+	}
+	summaries := make([]design.CaseVersionSummary, 0, len(caseVersionIDs))
+	for _, summary := range f.caseVersionSummaries {
+		if _, ok := wanted[summary.ID]; ok {
+			summaries = append(summaries, summary)
+		}
+	}
+	return summaries, nil
 }
 
 type fakeCase struct {

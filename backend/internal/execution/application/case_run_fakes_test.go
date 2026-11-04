@@ -3,6 +3,7 @@ package executionapp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -82,9 +83,14 @@ func (f *fakeIntentRepo) CountInitialFor(context.Context, int64, string, string)
 }
 
 type fakeCaseRunRepo struct {
-	mu      sync.Mutex
-	rows    map[int64]execution.CaseRun
-	updates int
+	mu            sync.Mutex
+	rows          map[int64]execution.CaseRun
+	updates       int
+	claimFailures int
+	claimAttempts int
+	// beforeUpdateCAS simulates a concurrent owner racing the next CAS write. It
+	// runs with the repository lock held and must only touch f.rows directly.
+	beforeUpdateCAS func()
 }
 
 func newFakeCaseRunRepo() *fakeCaseRunRepo {
@@ -131,6 +137,11 @@ func (f *fakeCaseRunRepo) Create(_ context.Context, caseRun execution.CaseRun) e
 func (f *fakeCaseRunRepo) UpdateCAS(_ context.Context, id, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.beforeUpdateCAS != nil {
+		hook := f.beforeUpdateCAS
+		f.beforeUpdateCAS = nil
+		hook()
+	}
 	row, ok := f.rows[id]
 	if !ok {
 		return false, nil
@@ -177,6 +188,11 @@ func (f *fakeCaseRunRepo) Transition(_ context.Context, id int64, from []executi
 func (f *fakeCaseRunRepo) ClaimLease(_ context.Context, id, epoch int64, until time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.claimAttempts++
+	if f.claimFailures > 0 {
+		f.claimFailures--
+		return false, errors.New("case_run store temporarily unavailable")
+	}
 	row, ok := f.rows[id]
 	if !ok || row.DispatchEpoch != epoch {
 		return false, nil
@@ -186,12 +202,46 @@ func (f *fakeCaseRunRepo) ClaimLease(_ context.Context, id, epoch int64, until t
 	return true, nil
 }
 
+// failNextClaims injects transient ClaimLease errors (a store blip).
+func (f *fakeCaseRunRepo) failNextClaims(count int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimFailures = count
+}
+
+// claimCount reports how many times the lease renewal was attempted.
+func (f *fakeCaseRunRepo) claimCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claimAttempts
+}
+
 func (f *fakeCaseRunRepo) ListRunningByExecutor(context.Context, int64) ([]execution.CaseRun, error) {
 	return nil, nil
 }
 
-func (f *fakeCaseRunRepo) LatestByCaseVersions(context.Context, int64, []int64) (map[int64]execution.CaseRun, error) {
-	return map[int64]execution.CaseRun{}, nil
+// LatestByCaseVersions mirrors the production "newest non-superseded run per
+// case version" projection (the coverage reader feeds on it).
+func (f *fakeCaseRunRepo) LatestByCaseVersions(_ context.Context, _ int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	wanted := make(map[int64]struct{}, len(caseVersionIDs))
+	for _, id := range caseVersionIDs {
+		wanted[id] = struct{}{}
+	}
+	latest := make(map[int64]execution.CaseRun, len(caseVersionIDs))
+	for _, row := range f.rows {
+		if row.Status == execution.CaseRunSuperseded {
+			continue
+		}
+		if _, ok := wanted[row.CaseVersionID]; !ok {
+			continue
+		}
+		if existing, ok := latest[row.CaseVersionID]; !ok || row.ID > existing.ID {
+			latest[row.CaseVersionID] = row
+		}
+	}
+	return latest, nil
 }
 
 func (f *fakeCaseRunRepo) get(t interface{ Fatalf(string, ...any) }, id int64) execution.CaseRun {
@@ -471,8 +521,9 @@ func (f *fakeHumanRepo) Expire(context.Context, time.Time) ([]execution.HumanReq
 // --- readers / ports -------------------------------------------------------
 
 type fakeExecutionCaseReader struct {
-	snapshot execution.CaseSnapshot
-	err      error
+	snapshot   execution.CaseSnapshot
+	executable []execution.CaseSnapshot
+	err        error
 }
 
 func (f *fakeExecutionCaseReader) GetCaseVersion(context.Context, int64, int64) (execution.CaseSnapshot, error) {
@@ -483,7 +534,15 @@ func (f *fakeExecutionCaseReader) GetCaseVersion(context.Context, int64, int64) 
 }
 
 func (f *fakeExecutionCaseReader) ListExecutable(context.Context, int64) ([]execution.CaseSnapshot, error) {
-	return nil, nil
+	return append([]execution.CaseSnapshot(nil), f.executable...), nil
+}
+
+func (f *fakeExecutionCaseReader) ResolveReplacement(context.Context, int64, int64) (execution.CaseSnapshot, bool, error) {
+	return execution.CaseSnapshot{}, false, nil
+}
+
+func (f *fakeExecutionCaseReader) CaseVersionLabel(context.Context, int64, int64) (executionapp.CaseVersionLabel, error) {
+	return executionapp.CaseVersionLabel{}, execution.ErrNotFound
 }
 
 type fakeBindingResolver struct {
@@ -664,9 +723,22 @@ func (f *fakeCaseRunnerSettings) Int(_ context.Context, key string) (int64, erro
 
 func (f *fakeCaseRunnerSettings) Bool(context.Context, string) (bool, error) { return false, nil }
 
-type caseRunnerClock struct{ now time.Time }
+type caseRunnerClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
 
-func (c *caseRunnerClock) Now() time.Time { return c.now }
+func (c *caseRunnerClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *caseRunnerClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(delta)
+}
 
 type caseRunnerIDs struct {
 	mu   sync.Mutex

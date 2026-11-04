@@ -21,8 +21,9 @@ const HIGHLIGHTS = [
 ]
 
 /**
- * Login screen for the fixed default admin seed. There is intentionally no
- * bootstrap/initialise-admin form: the API seeds admin/admin123 on first start.
+ * Login screen for the single administrator account. There is intentionally no
+ * bootstrap/initialise-admin form: the API seeds `admin` from
+ * `EZTEST_INITIAL_ADMIN_PASSWORD` the first time the user table is empty.
  */
 export function LoginPage() {
   const { login, loading, token } = useAuth()
@@ -103,8 +104,8 @@ export function LoginPage() {
             <p className="text-xs text-muted-foreground">使用平台账号进入工作区</p>
           </header>
 
-          <Alert tone="info" title="默认管理员账号">
-            首次启动默认 admin / admin123，登录后请在设置中修改密码
+          <Alert tone="info" title="初始管理员密码">
+            由部署时的 EZTEST_INITIAL_ADMIN_PASSWORD 设置，首次登录后请修改密码。
           </Alert>
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
@@ -139,7 +140,7 @@ export function LoginPage() {
           </form>
 
           <p className="text-[11px] leading-relaxed text-muted-foreground">
-            开发测试环境 · 受控网络。固定默认凭据仅供首启使用，请登录后立即改密。
+            开发测试环境 · 受控网络。管理员凭据由部署配置提供，请登录后立即修改初始密码。
           </p>
         </section>
       </div>

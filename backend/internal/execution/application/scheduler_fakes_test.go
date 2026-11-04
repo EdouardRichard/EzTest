@@ -530,8 +530,10 @@ func (s *fakeCaseRunStore) LatestByCaseVersions(_ context.Context, _ int64, case
 // ---- cross-context and infrastructure ports ----
 
 type fakeCaseReader struct {
-	mu    sync.Mutex
-	cases map[int64]execution.CaseSnapshot
+	mu           sync.Mutex
+	cases        map[int64]execution.CaseSnapshot
+	replacements map[int64]int64
+	labels       map[int64]CaseVersionLabel
 }
 
 func (r *fakeCaseReader) GetCaseVersion(_ context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, error) {
@@ -553,6 +555,35 @@ func (r *fakeCaseReader) ListExecutable(_ context.Context, versionID int64) ([]e
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].CaseVersionID < items[j].CaseVersionID })
 	return items, nil
+}
+
+// ResolveReplacement mirrors the design read used by the P3 re-plan: it maps a
+// historical case version to its replacement's snapshot when the fixture
+// declares one.
+func (r *fakeCaseReader) ResolveReplacement(_ context.Context, versionID, caseVersionID int64) (execution.CaseSnapshot, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	replacementID, ok := r.replacements[caseVersionID]
+	if !ok || replacementID <= 0 {
+		return execution.CaseSnapshot{}, false, nil
+	}
+	replacement, ok := r.cases[replacementID]
+	if !ok {
+		return execution.CaseSnapshot{}, false, nil
+	}
+	return replacement, true, nil
+}
+
+// CaseVersionLabel mirrors the design historical read used by the terminal-run
+// projection.
+func (r *fakeCaseReader) CaseVersionLabel(_ context.Context, versionID, caseVersionID int64) (CaseVersionLabel, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	label, ok := r.labels[caseVersionID]
+	if !ok {
+		return CaseVersionLabel{}, execution.ErrNotFound
+	}
+	return label, nil
 }
 
 type fakeVersionReader struct {
@@ -675,37 +706,39 @@ func (a *fakeAnalyzer) AnalyzeWave(_ context.Context, waveID int64) error {
 
 // buildTask6Fixture wires the Task 6 services with in-memory fakes.
 type task6Fixture struct {
-	intents   *fakeIntentStore
-	waves     *fakeWaveStore
-	runs      *fakeCaseRunStore
-	cases     *fakeCaseReader
-	versions  *fakeVersionReader
-	registry  *fakeExecutorRegistry
-	quota     *fakeQuotaReader
-	queue     *fakeWorkQueue
-	analysis  *fakeAnalyzer
-	events    *corePublisher
-	clock     *coreClock
-	ids       *coreIDs
-	intent    *IntentService
-	scheduler *Scheduler
+	intents    *fakeIntentStore
+	waves      *fakeWaveStore
+	runs       *fakeCaseRunStore
+	cases      *fakeCaseReader
+	versions   *fakeVersionReader
+	selections *fakeBatchSelectionReader
+	registry   *fakeExecutorRegistry
+	quota      *fakeQuotaReader
+	queue      *fakeWorkQueue
+	analysis   *fakeAnalyzer
+	events     *corePublisher
+	clock      *coreClock
+	ids        *coreIDs
+	intent     *IntentService
+	scheduler  *Scheduler
 }
 
 func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 	now := time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)
 	f := &task6Fixture{
-		intents:  newFakeIntentStore(),
-		waves:    newFakeWaveStore(),
-		runs:     newFakeCaseRunStore(),
-		cases:    &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}},
-		versions: &fakeVersionReader{bindings: map[int64]VersionBinding{}},
-		registry: &fakeExecutorRegistry{},
-		quota:    &fakeQuotaReader{},
-		queue:    &fakeWorkQueue{},
-		analysis: &fakeAnalyzer{},
-		events:   &corePublisher{},
-		clock:    &coreClock{now: now},
-		ids:      &coreIDs{next: 1000},
+		intents:    newFakeIntentStore(),
+		waves:      newFakeWaveStore(),
+		runs:       newFakeCaseRunStore(),
+		cases:      &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}, replacements: map[int64]int64{}, labels: map[int64]CaseVersionLabel{}},
+		versions:   &fakeVersionReader{bindings: map[int64]VersionBinding{}},
+		selections: &fakeBatchSelectionReader{found: true},
+		registry:   &fakeExecutorRegistry{},
+		quota:      &fakeQuotaReader{},
+		queue:      &fakeWorkQueue{},
+		analysis:   &fakeAnalyzer{},
+		events:     &corePublisher{},
+		clock:      &coreClock{now: now},
+		ids:        &coreIDs{next: 1000},
 	}
 	f.waves.runsStore = f.runs
 	f.waves.claim = func(intents []execution.ExecutionIntent) {
@@ -714,12 +747,13 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		}
 	}
 	f.intent = NewIntentService(IntentServiceDeps{
-		Intents:  f.intents,
-		Cases:    f.cases,
-		Versions: f.versions,
-		IDs:      f.ids,
-		Clock:    f.clock,
-		Events:   f.events,
+		Intents:         f.intents,
+		Cases:           f.cases,
+		Versions:        f.versions,
+		BatchSelections: f.selections,
+		IDs:             f.ids,
+		Clock:           f.clock,
+		Events:          f.events,
 	})
 	f.scheduler = NewScheduler(SchedulerDeps{
 		Intents:     f.intents,
@@ -732,6 +766,7 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		Quota:       domainQuota(3, 2, 1),
 		QuotaReader: f.quota,
 		Analyzer:    f.analysis,
+		Replanner:   f.intent,
 		IDs:         f.ids,
 		Clock:       f.clock,
 		Events:      f.events,
@@ -768,7 +803,7 @@ func task6Snapshot(caseVersionID int64, suts ...int64) execution.CaseSnapshot {
 }
 
 func task6Binding(versionID int64, status string, sutIDs ...int64) VersionBinding {
-	binding := VersionBinding{VersionID: versionID, Status: status}
+	binding := VersionBinding{VersionID: versionID, Status: status, Stage: intentExecutableStage}
 	for index, sutID := range sutIDs {
 		binding.SUTs = append(binding.SUTs, VersionSUTBinding{
 			VersionSUTID: sutID, SUTID: sutID + 100, EnvironmentID: sutID + 200,

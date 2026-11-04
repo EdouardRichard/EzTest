@@ -238,6 +238,39 @@ type CaseVersion struct {
 	SourceCount    int
 }
 
+// Minimum executable case content. A case version without an assertion can
+// only ever aggregate to inconclusive(no_assertions/incomplete), so it must be
+// repaired before it is confirmed or executed (Task 95 / PO O8: the confirmed
+// AC-FR-011-01 version carried 1 step and 0 assertions while the design
+// reported 5 steps / 3 assertions, and its run ended inconclusive(incomplete)).
+const (
+	MinimumCaseVersionSteps      = 1
+	MinimumCaseVersionAssertions = 1
+)
+
+// CaseVersionContentCounts returns the version's step and assertion counts.
+// Projection reads (confirmation, graph and propose queries) carry the counts
+// without loading the child rows; full reads carry the rows. Both shapes are
+// supported so the completeness rule never depends on which query loaded the
+// version.
+func CaseVersionContentCounts(version CaseVersion) (steps, assertions int) {
+	steps, assertions = version.StepCount, version.AssertionCount
+	if steps == 0 {
+		steps = len(version.Steps)
+	}
+	if assertions == 0 {
+		assertions = len(version.Assertions)
+	}
+	return steps, assertions
+}
+
+// CaseVersionComplete reports whether the version carries the minimum
+// executable content: at least one step and at least one assertion.
+func CaseVersionComplete(version CaseVersion) bool {
+	steps, assertions := CaseVersionContentCounts(version)
+	return steps >= MinimumCaseVersionSteps && assertions >= MinimumCaseVersionAssertions
+}
+
 // StepProposal is one submitted step.
 type StepProposal struct {
 	Seq                int
@@ -497,7 +530,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(stepField+".action", step.Action, 1, StepActionMax); err != nil {
 			return err
 		}
-		if err := validation.String(stepField+".expected", step.Expected, 0, CaseDescriptionMax); err != nil {
+		if err := validation.String(stepField+".expected", step.Expected, 1, CaseDescriptionMax); err != nil {
 			return err
 		}
 		if err := validation.String(stepField+".account_role", step.AccountRole, 0, AccountRoleMax); err != nil {
@@ -532,7 +565,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(assertionField+".target", assertion.Target, 1, AssertionTargetMax); err != nil {
 			return err
 		}
-		if err := validation.String(assertionField+".expected", assertion.Expected, 0, AssertionExpectMax); err != nil {
+		if err := validation.String(assertionField+".expected", assertion.Expected, 1, AssertionExpectMax); err != nil {
 			return err
 		}
 		targetSUT, err := assertionTargetSUT(assertionField, assertion, caseSUTs, ctx, stepSUTs[assertion.StepSeq])

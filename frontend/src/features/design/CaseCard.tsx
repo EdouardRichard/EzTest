@@ -13,6 +13,8 @@ import type { CaseVersionStatus } from "./types"
 type CaseData = Extract<DesignNodeData, { kind: "case" }> & {
   actions: DesignNodeActions
   selected: boolean
+  /** Checked in the mindmap multi-select (batch confirm/execute/AI modify). */
+  batchSelected: boolean
 }
 
 const STATUS_TONE: Record<Exclude<CaseVersionStatus, "superseded">, BadgeTone> = {
@@ -39,6 +41,15 @@ export function CaseCard({ data }: NodeProps) {
     >
       <Handle type="target" position={Position.Top} />
       <div className="flex flex-wrap items-center gap-1.5">
+        <input
+          type="checkbox"
+          data-testid={`case-checkbox-${designCase.case_id}`}
+          aria-label={`选择用例 ${designCase.title}`}
+          checked={node.batchSelected}
+          onChange={() => node.actions.onToggleCaseSelected(designCase.case_id)}
+          onClick={(event) => event.stopPropagation()}
+          className="size-3 shrink-0 accent-primary"
+        />
         <button
           type="button"
           data-testid={`case-select-${designCase.case_id}`}
@@ -75,7 +86,7 @@ export function CaseCard({ data }: NodeProps) {
       <p className="mt-1 text-[10px] text-muted-foreground">
         v{designCase.revision} · 步骤 {designCase.step_count} · 断言 {designCase.assertion_count}
       </p>
-      {designCase.status === "draft" ? (
+      {designCase.status === "draft" && node.actions.caseReviewEnabled !== false ? (
         <Button
           size="sm"
           variant="secondary"

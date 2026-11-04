@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 // ---------- fake requirement repository ----------
 
 type fakeRequirementRepo struct {
+	mu            sync.Mutex
 	requirements  map[int64]version.Requirement
 	versions      map[int64][]version.RequirementVersion // requirement ID -> revisions, newest first
 	confirmations map[int64][]version.Confirmation       // requirement ID -> confirmations
@@ -37,15 +40,46 @@ func newFakeRequirementRepo() *fakeRequirementRepo {
 }
 
 func (f *fakeRequirementRepo) Create(_ context.Context, requirement version.Requirement, revision version.RequirementVersion) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.addErr != nil {
 		return f.addErr
+	}
+	if requirement.SourceKey != "" {
+		for _, existing := range f.requirements {
+			if existing.VersionID == requirement.VersionID && existing.SourceKey == requirement.SourceKey &&
+				existing.Status != version.RequirementObsolete {
+				return version.ErrRequirementDuplicate
+			}
+		}
 	}
 	f.requirements[requirement.ID] = requirement
 	f.versions[requirement.ID] = []version.RequirementVersion{revision}
 	return nil
 }
 
+// GetBySourceKey mirrors the production partial unique index: the active
+// requirement carrying the source key, never an obsolete one.
+func (f *fakeRequirementRepo) GetBySourceKey(ctx context.Context, versionID int64, sourceKey string) (version.RequirementAggregate, error) {
+	f.mu.Lock()
+	var requirementID int64
+	for _, requirement := range f.requirements {
+		if requirement.VersionID == versionID && requirement.SourceKey == sourceKey &&
+			requirement.Status != version.RequirementObsolete {
+			requirementID = requirement.ID
+			break
+		}
+	}
+	f.mu.Unlock()
+	if requirementID == 0 {
+		return version.RequirementAggregate{}, version.ErrRequirementNotFound
+	}
+	return f.Get(ctx, versionID, requirementID)
+}
+
 func (f *fakeRequirementRepo) Get(_ context.Context, versionID, requirementID int64) (version.RequirementAggregate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	requirement, ok := f.requirements[requirementID]
 	if !ok || requirement.VersionID != versionID {
 		return version.RequirementAggregate{}, version.ErrRequirementNotFound
@@ -69,6 +103,8 @@ func (f *fakeRequirementRepo) Get(_ context.Context, versionID, requirementID in
 }
 
 func (f *fakeRequirementRepo) GetRequirement(_ context.Context, requirementID int64) (version.Requirement, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	requirement, ok := f.requirements[requirementID]
 	if !ok {
 		return version.Requirement{}, version.ErrRequirementNotFound
@@ -77,6 +113,8 @@ func (f *fakeRequirementRepo) GetRequirement(_ context.Context, requirementID in
 }
 
 func (f *fakeRequirementRepo) GetMany(_ context.Context, versionID int64, ids []int64) ([]version.RequirementWithCurrent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	items := make([]version.RequirementWithCurrent, 0, len(ids))
 	for _, id := range ids {
 		requirement, ok := f.requirements[id]
@@ -93,6 +131,8 @@ func (f *fakeRequirementRepo) GetMany(_ context.Context, versionID int64, ids []
 }
 
 func (f *fakeRequirementRepo) List(_ context.Context, versionID int64, status version.RequirementStatus, limit int, beforeID *int64) ([]version.RequirementListItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	items := make([]version.RequirementListItem, 0)
 	for _, requirement := range f.requirements {
 		if requirement.VersionID != versionID {
@@ -126,6 +166,8 @@ func (f *fakeRequirementRepo) List(_ context.Context, versionID int64, status ve
 }
 
 func (f *fakeRequirementRepo) AddRevision(_ context.Context, requirement version.Requirement, revision version.RequirementVersion) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.addErr != nil {
 		return f.addErr
 	}
@@ -136,12 +178,22 @@ func (f *fakeRequirementRepo) AddRevision(_ context.Context, requirement version
 	if stored.Status == version.RequirementClosed || stored.Status == version.RequirementObsolete {
 		return version.ErrStateConflict
 	}
+	if requirement.SourceKey != "" {
+		for id, existing := range f.requirements {
+			if id != requirement.ID && existing.VersionID == requirement.VersionID &&
+				existing.SourceKey == requirement.SourceKey && existing.Status != version.RequirementObsolete {
+				return version.ErrRequirementDuplicate
+			}
+		}
+	}
 	f.requirements[requirement.ID] = requirement
 	f.versions[requirement.ID] = append([]version.RequirementVersion{revision}, f.versions[requirement.ID]...)
 	return nil
 }
 
 func (f *fakeRequirementRepo) Confirm(_ context.Context, requirement version.Requirement, confirmation version.Confirmation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	stored, ok := f.requirements[requirement.ID]
 	if !ok || stored.VersionID != requirement.VersionID {
 		return version.ErrRequirementNotFound
@@ -155,6 +207,8 @@ func (f *fakeRequirementRepo) Confirm(_ context.Context, requirement version.Req
 }
 
 func (f *fakeRequirementRepo) BatchConfirm(_ context.Context, requirements []version.Requirement, confirmations []version.Confirmation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, requirement := range requirements {
 		stored, ok := f.requirements[requirement.ID]
 		if !ok || stored.Status != version.RequirementDraft {
@@ -175,6 +229,8 @@ func (f *fakeRequirementRepo) BatchConfirm(_ context.Context, requirements []ver
 }
 
 func (f *fakeRequirementRepo) CreateRelation(_ context.Context, relation version.Relation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, existing := range f.relations {
 		if existing.VersionID == relation.VersionID && existing.FromRequirementID == relation.FromRequirementID &&
 			existing.ToRequirementID == relation.ToRequirementID && existing.Kind == relation.Kind {
@@ -186,6 +242,8 @@ func (f *fakeRequirementRepo) CreateRelation(_ context.Context, relation version
 }
 
 func (f *fakeRequirementRepo) ListRelations(_ context.Context, versionID, requirementID int64) ([]version.Relation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	relations := make([]version.Relation, 0)
 	for _, relation := range f.relations {
 		if relation.VersionID == versionID && (relation.FromRequirementID == requirementID || relation.ToRequirementID == requirementID) {
@@ -193,6 +251,19 @@ func (f *fakeRequirementRepo) ListRelations(_ context.Context, versionID, requir
 		}
 	}
 	return relations, nil
+}
+
+func (f *fakeRequirementRepo) SetStatus(_ context.Context, versionID, requirementID int64, status version.RequirementStatus, updatedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	requirement, ok := f.requirements[requirementID]
+	if !ok || requirement.VersionID != versionID {
+		return version.ErrRequirementNotFound
+	}
+	requirement.Status = status
+	requirement.UpdatedAt = updatedAt
+	f.requirements[requirementID] = requirement
+	return nil
 }
 
 func (f *fakeRequirementRepo) currentVersion(requirement version.Requirement) (version.RequirementVersion, bool) {
@@ -210,6 +281,8 @@ func (f *fakeRequirementRepo) currentVersion(requirement version.Requirement) (v
 // seedRequirement inserts a raw requirement aggregate, used to build invalid
 // drafts that the service would normally reject.
 func (f *fakeRequirementRepo) seedRequirement(requirement version.Requirement, revision version.RequirementVersion) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.requirements[requirement.ID] = requirement
 	f.versions[requirement.ID] = append([]version.RequirementVersion{revision}, f.versions[requirement.ID]...)
 }
@@ -280,6 +353,36 @@ func validRequirementDraft(env *requirementEnv) versionapp.RequirementDraft {
 		TargetPages:        []string{"1301"},
 		TargetAPIs:         []string{"1401"},
 	}
+}
+
+// atomicIDs is a concurrency-safe generator for the draft-creation races.
+type atomicIDs struct{ next atomic.Int64 }
+
+func (s *atomicIDs) Next() int64 { return s.next.Add(1) }
+
+// staticVersionReader serves the already-created version without mutating shared
+// test state, so concurrent Create calls only exercise the requirement repo.
+type staticVersionReader struct{ view versionapp.VersionView }
+
+func (r *staticVersionReader) Get(context.Context, int64) (versionapp.VersionView, error) {
+	return r.view, nil
+}
+
+func (r *staticVersionReader) MarkRunning(context.Context, int64) error { return nil }
+
+// concurrentRequirementService builds a service whose only mutable dependency is
+// the requirement repository; events/audit/stale are nil so the race test does
+// not append to shared slices.
+func concurrentRequirementService(t *testing.T, env *requirementEnv) *versionapp.RequirementService {
+	t.Helper()
+	view, err := env.versionEnv.svc.Get(requestContext(), env.versionID)
+	if err != nil {
+		t.Fatalf("version Get: %v", err)
+	}
+	return versionapp.NewRequirementService(
+		env.repo, &staticVersionReader{view: view}, nil, nil, nil, nil,
+		&atomicIDs{}, fixedClock{at: testTime},
+	)
 }
 
 func createRequirement(t *testing.T, env *requirementEnv, title string) versionapp.RequirementDetail {
@@ -1008,7 +1111,452 @@ func TestRequirementGetDetailIncludesHistoryRelationsAndAttachments(t *testing.T
 	}
 }
 
+// requirementDraftWithContent builds one distinct draft; Dedupe groups by
+// normalized title or by identical description+acceptance text.
+func requirementDraftWithContent(env *requirementEnv, title, description, acceptance string) versionapp.RequirementDraft {
+	draft := validRequirementDraft(env)
+	draft.Title = title
+	draft.Description = description
+	draft.AcceptanceCriteria = acceptance
+	return draft
+}
+
+// TestRequirementDedup pins the product-owner "10 duplicate drafts with no
+// delete/merge" finding: duplicate drafts can be collapsed deterministically
+// (one survivor per duplicate group) and a draft can be deleted instead of
+// lingering forever.
+func TestRequirementDedup(t *testing.T) {
+	env := newRequirementEnv(t)
+
+	keepA, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Checkout supports coupons", "Users apply a coupon at checkout.", "A valid coupon reduces the total."), 42)
+	if err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	duplicateTitle, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "  Checkout supports coupons  ", "Refined description of the same requirement.", "The total is recalculated after the coupon."), 42)
+	if err != nil {
+		t.Fatalf("Create same-title duplicate: %v", err)
+	}
+	keepC, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Coupon checkout", "Coupon checkout description.", "Coupon checkout acceptance."), 42)
+	if err != nil {
+		t.Fatalf("Create C: %v", err)
+	}
+	duplicateContent, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Coupon checkout (refined)", "Coupon checkout description.", "Coupon checkout acceptance."), 42)
+	if err != nil {
+		t.Fatalf("Create same-content duplicate: %v", err)
+	}
+	unique, err := env.svc.Create(requestContext(), env.versionID,
+		requirementDraftWithContent(env, "Refund flow", "Refund flow description.", "Refund flow acceptance."), 42)
+	if err != nil {
+		t.Fatalf("Create unique: %v", err)
+	}
+
+	result, err := env.svc.Dedupe(requestContext(), env.versionID, 42)
+	if err != nil {
+		t.Fatalf("Dedupe: %v", err)
+	}
+	if !containsID(result.ObsoleteIDs, duplicateTitle.ID) || !containsID(result.ObsoleteIDs, duplicateContent.ID) {
+		t.Fatalf("obsolete ids = %v, want the title/content duplicates", result.ObsoleteIDs)
+	}
+	for _, kept := range []int64{keepA.ID, keepC.ID, unique.ID} {
+		if !containsID(result.KeptIDs, kept) {
+			t.Fatalf("kept ids = %v, want %d retained", result.KeptIDs, kept)
+		}
+	}
+	for _, obsolete := range []int64{duplicateTitle.ID, duplicateContent.ID} {
+		stored := env.repo.requirements[obsolete]
+		if stored.Status != version.RequirementObsolete {
+			t.Fatalf("requirement %d status = %q, want obsolete", obsolete, stored.Status)
+		}
+	}
+	for _, kept := range []int64{keepA.ID, keepC.ID, unique.ID} {
+		if stored := env.repo.requirements[kept]; stored.Status != version.RequirementDraft {
+			t.Fatalf("requirement %d status = %q, want draft", kept, stored.Status)
+		}
+	}
+	if len(env.repo.versions[keepA.ID]) != 1 {
+		t.Fatal("dedupe must not add a revision to the survivor")
+	}
+
+	t.Run("Delete", func(t *testing.T) {
+		deletable := createRequirement(t, env, "Delete me")
+		deleted, err := env.svc.Delete(requestContext(), env.versionID, deletable.ID, "duplicate scope", 42)
+		if err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if deleted.Status != string(version.RequirementObsolete) {
+			t.Fatalf("deleted status = %q", deleted.Status)
+		}
+		if stored := env.repo.requirements[deletable.ID]; stored.Status != version.RequirementObsolete {
+			t.Fatalf("stored status = %q", stored.Status)
+		}
+		if _, _, err := env.svc.List(requestContext(), env.versionID, string(version.RequirementDraft), 10, nil); err != nil {
+			t.Fatalf("List drafts: %v", err)
+		}
+		// Deleting an already obsolete draft is idempotent.
+		if again, err := env.svc.Delete(requestContext(), env.versionID, deletable.ID, "", 42); err != nil || again.Status != string(version.RequirementObsolete) {
+			t.Fatalf("second Delete = %#v, %v", again, err)
+		}
+
+		clarified := createRequirement(t, env, "Clarified delete")
+		if _, err := env.svc.Confirm(requestContext(), env.versionID, clarified.ID, 42); err != nil {
+			t.Fatalf("Confirm: %v", err)
+		}
+		if _, err := env.svc.Delete(requestContext(), env.versionID, clarified.ID, "", 42); err == nil {
+			t.Fatal("deleting a clarified requirement must be rejected")
+		} else if apiError(t, err).Code != "state_conflict" {
+			t.Fatalf("code = %q", apiError(t, err).Code)
+		}
+		if stored := env.repo.requirements[clarified.ID]; stored.Status != version.RequirementClarified {
+			t.Fatalf("clarified requirement changed after a rejected delete: %q", stored.Status)
+		}
+	})
+
+	t.Run("Merge", func(t *testing.T) {
+		target, err := env.svc.Create(requestContext(), env.versionID,
+			requirementDraftWithContent(env, "Author can publish", "Author publishes an article.", "The article is publicly visible."), 42)
+		if err != nil {
+			t.Fatalf("Create target: %v", err)
+		}
+		source, err := env.svc.Create(requestContext(), env.versionID,
+			requirementDraftWithContent(env, "Author can publish articles", "Author publishes an article.", "The public list shows it."), 42)
+		if err != nil {
+			t.Fatalf("Create source: %v", err)
+		}
+		merged, err := env.svc.Merge(requestContext(), env.versionID, target.ID, []int64{source.ID}, 42)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		if merged.Requirement.ID != target.ID || !containsID(merged.MergedIDs, source.ID) {
+			t.Fatalf("merge result = %#v", merged)
+		}
+		if merged.Requirement.Revision != 2 {
+			t.Fatalf("target revision = %d, want 2 with the merged acceptance text", merged.Requirement.Revision)
+		}
+		if !strings.Contains(merged.Requirement.CurrentVersion.AcceptanceCriteria, "publicly visible") ||
+			!strings.Contains(merged.Requirement.CurrentVersion.AcceptanceCriteria, "public list shows it") {
+			t.Fatalf("merged acceptance = %q", merged.Requirement.CurrentVersion.AcceptanceCriteria)
+		}
+		if stored := env.repo.requirements[source.ID]; stored.Status != version.RequirementObsolete {
+			t.Fatalf("source status = %q, want obsolete", stored.Status)
+		}
+		if _, err := env.svc.Merge(requestContext(), env.versionID, target.ID, []int64{source.ID}, 42); err == nil {
+			t.Fatal("merging an obsolete source must be rejected")
+		}
+	})
+}
+
 // keep imports used while iterating
 var _ = errors.Is
 var _ = platform.Invalid
 var _ = time.Time{}
+
+// countingRequirementRepo counts List calls without changing behavior, so the
+// dedupe page contract can be pinned.
+type countingRequirementRepo struct {
+	*fakeRequirementRepo
+	listCalls   int
+	listLimits  []int
+	listCursors []*int64
+}
+
+func (r *countingRequirementRepo) List(_ context.Context, versionID int64, status version.RequirementStatus, limit int, beforeID *int64) ([]version.RequirementListItem, error) {
+	r.listCalls++
+	r.listLimits = append(r.listLimits, limit)
+	r.listCursors = append(r.listCursors, beforeID)
+	return r.fakeRequirementRepo.List(context.Background(), versionID, status, limit, beforeID)
+}
+
+// TestRequirementDedupeScansOneCappedPage documents the accepted dedupe limit:
+// one page of at most 200 drafts, no pagination. Duplicates outside the newest
+// page are not found in that call, so re-running is not guaranteed to advance
+// for versions larger than the cap.
+func TestRequirementDedupeScansOneCappedPage(t *testing.T) {
+	env := newRequirementEnv(t)
+	repo := &countingRequirementRepo{fakeRequirementRepo: env.repo}
+	service := versionapp.NewRequirementService(
+		repo, env.versionEnv.svc, env.versionEnv.catalog, env.hook,
+		env.audit, env.events, &seqIDs{}, fixedClock{at: testTime},
+	)
+
+	result, err := service.Dedupe(requestContext(), env.versionID, 42)
+	if err != nil {
+		t.Fatalf("Dedupe: %v", err)
+	}
+	if len(result.KeptIDs) != 0 || len(result.ObsoleteIDs) != 0 {
+		t.Fatalf("empty dedupe = %#v, want no ids", result)
+	}
+	if repo.listCalls != 1 {
+		t.Fatalf("dedupe List calls = %d, want one capped page", repo.listCalls)
+	}
+	if len(repo.listLimits) != 1 || repo.listLimits[0] != 200 {
+		t.Fatalf("dedupe list limits = %v, want [200]", repo.listLimits)
+	}
+	if repo.listCursors[0] != nil {
+		t.Fatalf("dedupe reused a cursor: %v", *repo.listCursors[0])
+	}
+}
+
+// TestRequirementUpdateCannotReuseAnotherRequirementSource keeps the Update
+// path consistent with the create-side source key: renaming a draft into
+// another FR/NFR source must conflict instead of silently creating two active
+// requirements for one source.
+func TestRequirementUpdateCannotReuseAnotherRequirementSource(t *testing.T) {
+	env := newRequirementEnv(t)
+	first := createRequirement(t, env, "FR-011 账号密码登录")
+	second := createRequirement(t, env, "FR-025 保存草稿与发布")
+
+	draft := validRequirementDraft(env)
+	draft.Title = "FR-011 账号密码登录（改名）"
+	if _, err := env.svc.Update(requestContext(), env.versionID, second.ID, draft, "rename", 42); err == nil {
+		t.Fatalf("Update accepted the source of requirement %d; duplicate source keys are possible", first.ID)
+	} else if apiError(t, err).Status != http.StatusConflict {
+		t.Fatalf("Update collision status = %d, want 409", apiError(t, err).Status)
+	}
+	stored, err := env.svc.Get(requestContext(), env.versionID, second.ID)
+	if err != nil {
+		t.Fatalf("Get second: %v", err)
+	}
+	if stored.Title != "FR-025 保存草稿与发布" || stored.Revision != 1 {
+		t.Fatalf("rejected update changed the requirement: %#v", stored.RequirementView)
+	}
+}
+
+// TestConcurrentDraftCreationIsIdempotent reproduces the S2 retry-5 race: two
+// curators create the same FR drafts at the same time. Exactly one requirement
+// per FR must exist and every create must resolve to that same requirement.
+func TestConcurrentDraftCreationIsIdempotent(t *testing.T) {
+	env := newRequirementEnv(t)
+	svc := concurrentRequirementService(t, env)
+	titles := []string{
+		"FR-011 账号密码登录",
+		"FR-014 页面访问控制与权限跳转",
+		"FR-025 保存草稿与发布",
+	}
+	const copies = 2
+	total := len(titles) * copies
+	ids := make([]int64, total)
+	errs := make([]error, total)
+	var wg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			draft := validRequirementDraft(env)
+			draft.Title = titles[index%len(titles)]
+			detail, err := svc.Create(requestContext(), env.versionID, draft, 0)
+			ids[index], errs[index] = detail.ID, err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Create %d: %v", i, err)
+		}
+	}
+	items, err := env.repo.List(requestContext(), env.versionID, "", 100, nil)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != len(titles) {
+		t.Fatalf("requirements = %d, want exactly %d (duplicate drafts were persisted)", len(items), len(titles))
+	}
+	byTitle := make(map[string]int, len(items))
+	for _, item := range items {
+		byTitle[item.Current.Title]++
+	}
+	for _, title := range titles {
+		if byTitle[title] != 1 {
+			t.Fatalf("title %q rows = %d, want exactly 1 (%v)", title, byTitle[title], byTitle)
+		}
+	}
+	unique := make(map[int64]struct{}, total)
+	for _, id := range ids {
+		unique[id] = struct{}{}
+	}
+	if len(unique) != len(titles) {
+		t.Fatalf("create calls returned %d distinct requirement ids, want %d (%v)", len(unique), len(titles), unique)
+	}
+}
+
+// TestCuratorDoesNotDuplicateHostDrafts pins the source-key idempotency:
+// whichever actor created the FR draft first, a second create for the same FR
+// must resolve to that draft; an empty-target create must not replace populated
+// targets, while a populated create may enrich an empty draft.
+func TestCuratorDoesNotDuplicateHostDrafts(t *testing.T) {
+	t.Run("empty curator create keeps the populated host draft", func(t *testing.T) {
+		env := newRequirementEnv(t)
+		title := "FR-011 账号密码登录"
+
+		hostDraft := validRequirementDraft(env)
+		hostDraft.Title = title
+		host, err := env.svc.Create(requestContext(), env.versionID, hostDraft, 0)
+		if err != nil {
+			t.Fatalf("host Create: %v", err)
+		}
+
+		curatorDraft := validRequirementDraft(env)
+		curatorDraft.Title = title
+		curatorDraft.TargetVersionSUTs = nil
+		curatorDraft.TargetPages = nil
+		curatorDraft.TargetAPIs = nil
+		curator, err := env.svc.Create(requestContext(), env.versionID, curatorDraft, 0)
+		if err != nil {
+			t.Fatalf("curator Create: %v", err)
+		}
+		if curator.ID != host.ID {
+			t.Fatalf("curator requirement id = %d, want the host draft %d", curator.ID, host.ID)
+		}
+		items, err := env.repo.List(requestContext(), env.versionID, "", 100, nil)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if len(items) != 1 {
+			t.Fatalf("requirements = %d, want exactly 1 for %q", len(items), title)
+		}
+		if curator.Revision != 1 {
+			t.Fatalf("empty duplicate create revision = %d, want the untouched revision 1", curator.Revision)
+		}
+		if got := targetCount(curator.CurrentVersion.TargetVersionSUTs, curator.CurrentVersion.TargetPages, curator.CurrentVersion.TargetAPIs); got == 0 {
+			t.Fatalf("empty duplicate create erased the populated targets: %#v", curator.CurrentVersion)
+		}
+	})
+
+	t.Run("populated curator create enriches the empty host draft", func(t *testing.T) {
+		env := newRequirementEnv(t)
+		title := "FR-014 页面访问控制与权限跳转"
+
+		hostDraft := validRequirementDraft(env)
+		hostDraft.Title = title
+		hostDraft.TargetVersionSUTs = nil
+		hostDraft.TargetPages = nil
+		hostDraft.TargetAPIs = nil
+		host, err := env.svc.Create(requestContext(), env.versionID, hostDraft, 0)
+		if err != nil {
+			t.Fatalf("host Create: %v", err)
+		}
+
+		curator := validRequirementDraft(env)
+		curator.Title = title
+		enriched, err := env.svc.Create(requestContext(), env.versionID, curator, 0)
+		if err != nil {
+			t.Fatalf("curator Create: %v", err)
+		}
+		if enriched.ID != host.ID {
+			t.Fatalf("curator requirement id = %d, want the host draft %d", enriched.ID, host.ID)
+		}
+		if enriched.Revision != 2 {
+			t.Fatalf("enriched revision = %d, want 2", enriched.Revision)
+		}
+		if got := targetCount(enriched.CurrentVersion.TargetVersionSUTs, enriched.CurrentVersion.TargetPages, enriched.CurrentVersion.TargetAPIs); got == 0 {
+			t.Fatalf("populated duplicate create did not bind the targets: %#v", enriched.CurrentVersion)
+		}
+		items, err := env.repo.List(requestContext(), env.versionID, "", 100, nil)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if len(items) != 1 {
+			t.Fatalf("requirements = %d, want exactly 1 for %q", len(items), title)
+		}
+	})
+}
+
+// TestImportBatchCreatesExactlyThreeRequirements reproduces the retry-5 S2
+// shape: the primary curator (populated targets) and the extraction-batch
+// curator (empty targets) both create FR-011/FR-014/FR-025. The version must end
+// with exactly the expected 3 requirements, all carrying targets.
+func TestImportBatchCreatesExactlyThreeRequirements(t *testing.T) {
+	env := newRequirementEnv(t)
+	svc := concurrentRequirementService(t, env)
+	titles := []string{
+		"FR-011 账号密码登录",
+		"FR-014 页面访问控制与权限跳转",
+		"FR-025 保存草稿与发布",
+	}
+	type createCall struct {
+		title       string
+		withTargets bool
+	}
+	calls := make([]createCall, 0, len(titles)*2)
+	for _, title := range titles {
+		calls = append(calls, createCall{title: title, withTargets: true})
+	}
+	for _, title := range titles {
+		calls = append(calls, createCall{title: title, withTargets: false})
+	}
+
+	results := make([]versionapp.RequirementDetail, len(calls))
+	errs := make([]error, len(calls))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, call := range calls {
+		wg.Add(1)
+		go func(index int, call createCall) {
+			defer wg.Done()
+			<-start
+			draft := validRequirementDraft(env)
+			draft.Title = call.title
+			if !call.withTargets {
+				draft.TargetVersionSUTs = nil
+				draft.TargetPages = nil
+				draft.TargetAPIs = nil
+			}
+			results[index], errs[index] = svc.Create(requestContext(), env.versionID, draft, 0)
+		}(i, call)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("batch Create %d: %v", i, err)
+		}
+	}
+	items, err := env.repo.List(requestContext(), env.versionID, "", 100, nil)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("requirements = %d, want exactly the expected 3 (no duplicate FR drafts)", len(items))
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		frID := strings.Fields(item.Current.Title)[0]
+		if _, duplicate := seen[frID]; duplicate {
+			t.Fatalf("duplicate FR requirement persisted: %q", frID)
+		}
+		seen[frID] = struct{}{}
+		if got := targetCount(item.Current.TargetVersionSUTs, item.Current.TargetPages, item.Current.TargetAPIs); got == 0 {
+			t.Fatalf("%s has no targets; the empty batch create replaced the populated draft: %#v", frID, item.Current)
+		}
+	}
+	for _, title := range titles {
+		frID := strings.Fields(title)[0]
+		if _, ok := seen[frID]; !ok {
+			t.Fatalf("requirements missing %s: %v", frID, seen)
+		}
+	}
+	for i, result := range results {
+		if result.ID <= 0 {
+			t.Fatalf("batch Create %d returned no requirement id", i)
+		}
+	}
+}
+
+func targetCount(versionSUTs, pages, apis []string) int {
+	return len(versionSUTs) + len(pages) + len(apis)
+}
+
+// containsID reports whether ids holds target.
+func containsID(ids []int64, target int64) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}

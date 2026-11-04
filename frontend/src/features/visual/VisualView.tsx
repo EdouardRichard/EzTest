@@ -8,6 +8,7 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { createIntent, listCaseRuns, listWaves } from "@/features/execution/api"
+import { rerunPurpose } from "@/features/execution/intent-purpose"
 import type { CaseRun, RunWave } from "@/features/execution/types"
 
 import { getVisualOverview, listVisualAssertions, listVisualDiffs } from "./api"
@@ -147,11 +148,12 @@ export function VisualView({ versionId, initialWaveId }: VisualViewProps) {
     setBusy(true)
     setNotice(null)
     try {
+      const purpose = rerunPurpose(caseRun)
       await createIntent(versionId, {
         case_version_id: caseRun.case_version_id,
-        purpose: "retest",
+        purpose,
       })
-      setNotice("已创建复测意图")
+      setNotice(purpose === "manual" ? "已创建手动执行意图" : "已创建复测意图")
       await loadWorkspace()
     } catch (cause) {
       setError(cause)
@@ -242,7 +244,7 @@ export function VisualView({ versionId, initialWaveId }: VisualViewProps) {
         </p>
       ) : null}
 
-      {busy ? <LoadingCard label="正在创建复测…" /> : null}
+      {busy ? <LoadingCard label="正在创建执行意图…" /> : null}
 
       <VisualAssertionList
         versionId={versionId}

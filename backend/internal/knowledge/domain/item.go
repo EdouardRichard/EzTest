@@ -24,26 +24,32 @@ const (
 	ScopeSystem Scope = "system"
 )
 
-// Status is the review state of a knowledge item. `stale` is intentionally not
-// a status: source staleness is computed at read time.
+// Status is the review and verification state of a knowledge item. StatusStale
+// is the 0.2.1 binding-staleness state (page/route/account changed), not the
+// read-time SourceStale marker of a missing source version.
 type Status string
 
-// Knowledge review statuses.
+// Knowledge review and verification statuses.
 const (
 	StatusDraft    Status = "draft"
 	StatusApproved Status = "approved"
 	StatusRejected Status = "rejected"
 	StatusRevoked  Status = "revoked"
+	StatusSuspect  Status = "suspect"
+	StatusStale    Status = "stale"
 )
 
-// Physical limits of the frozen P7 contract.
+// Physical limits of the frozen P7 contract plus the 0.2.1 binding columns
+// (contracts/openapi.yaml KnowledgeItemView).
 const (
-	MaxTitleRunes     = 200
-	MaxContentRunes   = 20000
-	MaxTags           = 20
-	MaxTagRunes       = 40
-	MaxSystemKeyRunes = 64
-	MaxReasonRunes    = 2000
+	MaxTitleRunes       = 200
+	MaxContentRunes     = 20000
+	MaxTags             = 20
+	MaxTagRunes         = 40
+	MaxSystemKeyRunes   = 64
+	MaxReasonRunes      = 2000
+	MaxBindingKeyRunes  = 500
+	MaxAccountRoleRunes = 64
 
 	// SnippetMaxRunes caps the excerpt handed to a prompt so one long item
 	// cannot dominate the injected section.
@@ -53,25 +59,32 @@ const (
 // Valid reports whether the value is a supported scope.
 func (s Scope) Valid() bool { return s == ScopeGlobal || s == ScopeSystem }
 
-// Valid reports whether the value is a supported review status.
+// Valid reports whether the value is a supported review/verification status.
 func (s Status) Valid() bool {
 	switch s {
-	case StatusDraft, StatusApproved, StatusRejected, StatusRevoked:
+	case StatusDraft, StatusApproved, StatusRejected, StatusRevoked, StatusSuspect, StatusStale:
 		return true
 	default:
 		return false
 	}
 }
 
-// CanTransition reports whether the review state machine allows from -> to
-// (spec §4.3): draft -> approved|rejected, approved -> revoked,
+// CanTransition reports whether the lifecycle allows from -> to. The 0.2.1
+// verification states extend the review machine of spec §4.3 / contracts
+// §16.1: approved -> suspect (failed reuse) | stale (bindings changed) |
+// revoked; suspect -> approved (re-verified) | stale | revoked; stale ->
+// approved (re-verified) | revoked; draft -> approved|rejected;
 // revoked -> approved (re-review) and rejected -> draft (edit and resubmit).
 func CanTransition(from, to Status) bool {
 	switch from {
 	case StatusDraft:
 		return to == StatusApproved || to == StatusRejected
 	case StatusApproved:
-		return to == StatusRevoked
+		return to == StatusSuspect || to == StatusStale || to == StatusRevoked
+	case StatusSuspect:
+		return to == StatusApproved || to == StatusStale || to == StatusRevoked
+	case StatusStale:
+		return to == StatusApproved || to == StatusRevoked
 	case StatusRevoked:
 		return to == StatusApproved
 	case StatusRejected:
@@ -79,6 +92,69 @@ func CanTransition(from, to Status) bool {
 	default:
 		return false
 	}
+}
+
+// Bindings are the structured SUT identifiers a knowledge item applies to
+// (spec §10.2): system, environment, page, API and account role. Unset fields
+// are dimensions the item is not bound to; the JSON shape is persisted in
+// knowledge_item.bindings and never carries credentials.
+type Bindings struct {
+	SystemID      *int64  `json:"system_id,omitempty"`
+	EnvironmentID *int64  `json:"environment_id,omitempty"`
+	PageKey       *string `json:"page_key,omitempty"`
+	APIKey        *string `json:"api_key,omitempty"`
+	AccountRole   *string `json:"account_role,omitempty"`
+}
+
+// IsZero reports whether no binding dimension is set.
+func (b Bindings) IsZero() bool {
+	return b.SystemID == nil && b.EnvironmentID == nil && b.PageKey == nil &&
+		b.APIKey == nil && b.AccountRole == nil
+}
+
+// Normalize trims the string bindings, treats empty values as unset, validates
+// the identifier and key bounds and returns the canonical value.
+func (b Bindings) Normalize() (Bindings, error) {
+	out := b
+	if out.SystemID != nil && *out.SystemID <= 0 {
+		return Bindings{}, platform.Invalid("bindings.system_id", "must be a positive decimal ID")
+	}
+	if out.EnvironmentID != nil && *out.EnvironmentID <= 0 {
+		return Bindings{}, platform.Invalid("bindings.environment_id", "must be a positive decimal ID")
+	}
+	pageKey, err := normalizeBindingString(out.PageKey, "bindings.page_key", MaxBindingKeyRunes,
+		"must be at most 500 characters")
+	if err != nil {
+		return Bindings{}, err
+	}
+	apiKey, err := normalizeBindingString(out.APIKey, "bindings.api_key", MaxBindingKeyRunes,
+		"must be at most 500 characters")
+	if err != nil {
+		return Bindings{}, err
+	}
+	accountRole, err := normalizeBindingString(out.AccountRole, "bindings.account_role", MaxAccountRoleRunes,
+		"must be at most 64 characters")
+	if err != nil {
+		return Bindings{}, err
+	}
+	out.PageKey = pageKey
+	out.APIKey = apiKey
+	out.AccountRole = accountRole
+	return out, nil
+}
+
+func normalizeBindingString(value *string, field string, maxRunes int, message string) (*string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if utf8.RuneCountInString(trimmed) > maxRunes {
+		return nil, platform.Invalid(field, message)
+	}
+	return &trimmed, nil
 }
 
 // Item is one knowledge_item row plus the read-time SourceStale marker.
@@ -90,6 +166,8 @@ type Item struct {
 	Content               string
 	Tags                  []string
 	Status                Status
+	Bindings              Bindings
+	LastVerifiedAt        *time.Time
 	Confidence            *float64
 	SourceVersionID       *int64
 	PromotedFromVersionID *int64

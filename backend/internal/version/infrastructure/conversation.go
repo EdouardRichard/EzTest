@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -13,13 +14,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.created_by,
+const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.model_override, c.created_by,
 	c.created_at, c.updated_at,
 	(SELECT count(*) FROM conversation_message m WHERE m.conversation_id = c.id),
 	(SELECT max(m.created_at) FROM conversation_message m WHERE m.conversation_id = c.id)`
 
 const conversationMessageColumns = `id, conversation_id, role, parts, refs, token_usage,
 	actor_id, agent_run_id, client_message_id, reply_to_message_id, created_at`
+
+// conversationMessageSelectColumns reads a message together with the model that
+// actually generated it. actual_model is empty for user messages and for
+// assistant messages whose run link is absent; the DTO maps empty to null.
+const conversationMessageSelectColumns = `m.id, m.conversation_id, m.role, m.parts, m.refs, m.token_usage,
+	m.actor_id, m.agent_run_id, m.client_message_id, m.reply_to_message_id, m.created_at,
+	COALESCE(run.model, '')`
 
 const conversationSummaryColumns = `id, conversation_id, summary, pinned_facts,
 	token_estimate, version, updated_at`
@@ -41,10 +49,10 @@ func NewConversationRepository(pool *pgxpool.Pool, ids platformid.Generator) *Co
 // Create inserts one conversation.
 func (r *ConversationRepository) Create(ctx context.Context, conversation version.Conversation) error {
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO conversation (id, version_id, kind, title, status, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO conversation (id, version_id, kind, title, status, model_override, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`, conversation.ID, conversation.VersionID, conversation.Kind, conversation.Title, conversation.Status,
-		conversation.CreatedBy, conversation.CreatedAt, conversation.UpdatedAt)
+		conversation.ModelOverride, conversation.CreatedBy, conversation.CreatedAt, conversation.UpdatedAt)
 	if err != nil {
 		return wrapConversationDB("insert conversation", err)
 	}
@@ -75,6 +83,21 @@ func (r *ConversationRepository) GetByID(ctx context.Context, conversationID int
 	`, conversationID))
 	if err != nil {
 		return version.Conversation{}, wrapConversationDB("get conversation", err)
+	}
+	return conversation, nil
+}
+
+// UpdateModelOverride sets or clears the conversation-level model override and
+// returns the updated row (including its message counters).
+func (r *ConversationRepository) UpdateModelOverride(ctx context.Context, versionID, conversationID int64, modelOverride *string, updatedAt time.Time) (version.Conversation, error) {
+	conversation, err := scanConversation(r.pool.QueryRow(ctx, `
+		UPDATE conversation c
+		SET model_override = $3, updated_at = $4
+		WHERE c.id = $1 AND c.version_id = $2
+		RETURNING `+conversationColumns,
+		conversationID, versionID, modelOverride, updatedAt))
+	if err != nil {
+		return version.Conversation{}, wrapConversationDB("update conversation model override", err)
 	}
 	return conversation, nil
 }
@@ -111,8 +134,10 @@ func (r *ConversationRepository) List(ctx context.Context, versionID int64, kind
 // FindMessageByClientID resolves the idempotency key inside one conversation.
 func (r *ConversationRepository) FindMessageByClientID(ctx context.Context, conversationID int64, clientMessageID string) (*version.Message, error) {
 	message, err := scanMessage(r.pool.QueryRow(ctx, `
-		SELECT `+conversationMessageColumns+` FROM conversation_message
-		WHERE conversation_id = $1 AND client_message_id = $2
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE m.conversation_id = $1 AND m.client_message_id = $2
 	`, conversationID, clientMessageID))
 	if err != nil {
 		return nil, wrapMessageDB("find message by client id", err)
@@ -123,9 +148,11 @@ func (r *ConversationRepository) FindMessageByClientID(ctx context.Context, conv
 // Messages returns messages with id > after in ascending order.
 func (r *ConversationRepository) Messages(ctx context.Context, conversationID int64, after int64, limit int) ([]version.Message, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT `+conversationMessageColumns+` FROM conversation_message
-		WHERE conversation_id = $1 AND id > $2
-		ORDER BY id
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE m.conversation_id = $1 AND m.id > $2
+		ORDER BY m.id
 		LIMIT $3
 	`, conversationID, after, limit)
 	if err != nil {
@@ -144,6 +171,168 @@ func (r *ConversationRepository) Messages(ctx context.Context, conversationID in
 		return nil, fmt.Errorf("list conversation messages: %w", err)
 	}
 	return messages, nil
+}
+
+// MessageParts returns the streaming parts of one conversation message in seq
+// order. The message must belong to the version-scoped conversation: a foreign
+// or missing message is ErrMessageNotFound (404 at the API edge).
+func (r *ConversationRepository) MessageParts(ctx context.Context, versionID, conversationID, messageID int64) ([]version.ConversationMessagePart, error) {
+	var owned bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM conversation_message m
+			JOIN conversation c ON c.id = m.conversation_id
+			WHERE m.id = $1 AND m.conversation_id = $2 AND c.version_id = $3
+		)
+	`, messageID, conversationID, versionID).Scan(&owned); err != nil {
+		return nil, fmt.Errorf("check conversation message scope: %w", err)
+	}
+	if !owned {
+		return nil, version.ErrMessageNotFound
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT seq, part_type, payload, created_at
+		FROM conversation_message_part
+		WHERE message_id = $1
+		ORDER BY seq
+	`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation message parts: %w", err)
+	}
+	defer rows.Close()
+	parts := make([]version.ConversationMessagePart, 0)
+	for rows.Next() {
+		var part version.ConversationMessagePart
+		var payload []byte
+		if err := rows.Scan(&part.Seq, &part.Type, &payload, &part.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan conversation message part: %w", err)
+		}
+		part.Payload = json.RawMessage(payload)
+		parts = append(parts, part)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list conversation message parts: %w", err)
+	}
+	return parts, nil
+}
+
+// FindJobCardMessage returns the assistant message carrying jobID's job_card
+// part in one version-scoped conversation. It is the idempotency lookup behind
+// the one-card-per-job contract: a repeated start/update rewrites this message
+// instead of appending a second card.
+func (r *ConversationRepository) FindJobCardMessage(ctx context.Context, versionID, conversationID, jobID int64) (*version.Message, error) {
+	message, err := scanMessage(r.pool.QueryRow(ctx, `
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		JOIN conversation c ON c.id = m.conversation_id
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE c.version_id = $1 AND m.conversation_id = $2 AND m.role = 'assistant'
+		  AND EXISTS (
+			SELECT 1
+			FROM jsonb_array_elements(m.parts) AS part
+			WHERE part->>'type' = 'job_card' AND part->>'job_id' = $3
+		  )
+		ORDER BY m.id DESC
+		LIMIT 1
+	`, versionID, conversationID, platformid.Format(jobID)))
+	if err != nil {
+		return nil, wrapMessageDB("find job card message", err)
+	}
+	return &message, nil
+}
+
+// UpdateJobCardMessage rewrites the stored snapshot part of jobID and its
+// conversation_message_part payload inside messageID. The card is the one
+// mutable part of the conversation: no new message or part row is appended and
+// the append-only seq/created_at stay untouched.
+//
+// A cancelled card is terminal and sticky: a rewrite that would replace it with
+// a running/open/done/failed snapshot is rejected with version.ErrJobCardCancelled
+// and nothing is written. The stored status is re-read under FOR UPDATE, so a
+// late runner projection cannot overwrite a cancel that committed after the
+// caller's lookup. ReopenJobCardMessage is the explicit retry bypass.
+func (r *ConversationRepository) UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return r.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, false)
+}
+
+// ReopenJobCardMessage rewrites the stored job card even when it is currently
+// cancelled: the explicit user-retry reopen, so the new attempt can reuse the
+// same card.
+func (r *ConversationRepository) ReopenJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return r.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, true)
+}
+
+func (r *ConversationRepository) updateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart, allowCancelled bool) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("update job card message: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var raw []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT m.parts
+		FROM conversation_message m
+		JOIN conversation c ON c.id = m.conversation_id
+		WHERE m.id = $1 AND m.conversation_id = $2 AND c.version_id = $3
+		  AND m.role = 'assistant'
+		FOR UPDATE OF m
+	`, messageID, conversationID, versionID).Scan(&raw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return version.ErrMessageNotFound
+		}
+		return fmt.Errorf("update job card message: lock message: %w", err)
+	}
+	var parts []version.MessagePart
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &parts); err != nil {
+			return fmt.Errorf("update job card message: decode parts: %w", err)
+		}
+	}
+	replaced := -1
+	for index := range parts {
+		if parts[index].Type == version.MessagePartJobCard && parts[index].JobID == jobID {
+			// Re-check the sticky cancelled snapshot under the row lock. The
+			// cancel's own cancelled rewrite stays allowed (idempotent), and
+			// the explicit retry reopen bypasses the rule.
+			if !allowCancelled && !version.JobCardRewriteAllowed(parts[index].Status, part.Status) {
+				return version.ErrJobCardCancelled
+			}
+			replaced = index
+			break
+		}
+	}
+	if replaced < 0 {
+		return version.ErrMessageNotFound
+	}
+	parts[replaced] = part
+	encodedParts, err := json.Marshal(parts)
+	if err != nil {
+		return fmt.Errorf("update job card message: encode parts: %w", err)
+	}
+	encodedPart, err := json.Marshal(part)
+	if err != nil {
+		return fmt.Errorf("update job card message: encode card: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message SET parts = $2::jsonb WHERE id = $1
+	`, messageID, string(encodedParts)); err != nil {
+		return wrapConversationDB("update job card message snapshot", err)
+	}
+	// A missing streaming row is tolerated: the message snapshot is the primary
+	// read path and an existing card may predate its conversation_message_part.
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message_part
+		SET payload = $3::jsonb
+		WHERE message_id = $1 AND part_type = 'job_card' AND payload->>'job_id' = $2
+	`, messageID, platformid.Format(jobID), string(encodedPart)); err != nil {
+		return fmt.Errorf("update job card message: update part row: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("update job card message: commit: %w", err)
+	}
+	return nil
 }
 
 // PostUserMessage inserts the user message and bumps the conversation
@@ -175,8 +364,10 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 			return nil, false, fmt.Errorf("post user message: insert was ignored without a client message id")
 		}
 		existing, err := scanMessage(tx.QueryRow(ctx, `
-			SELECT `+conversationMessageColumns+` FROM conversation_message
-			WHERE conversation_id = $1 AND client_message_id = $2
+			SELECT `+conversationMessageSelectColumns+`
+			FROM conversation_message m
+			LEFT JOIN agent_run run ON run.id = m.agent_run_id
+			WHERE m.conversation_id = $1 AND m.client_message_id = $2
 		`, conversationID, *message.ClientMessageID))
 		if err != nil {
 			return nil, false, wrapMessageDB("get existing message", err)
@@ -195,8 +386,11 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 	return nil, true, nil
 }
 
-// AppendAssistantMessage inserts one assistant message and bumps the
-// conversation timestamp.
+// AppendAssistantMessage inserts one assistant message together with its
+// append-only conversation_message_part rows (0.2.1 streaming parts) in one
+// transaction, then bumps the conversation timestamp. The (message_id, seq)
+// unique index makes a duplicate/restarted seq a transaction failure instead of
+// a silent overwrite: append-only parts are never rewritten.
 func (r *ConversationRepository) AppendAssistantMessage(ctx context.Context, conversationID int64, message version.Message) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -215,6 +409,22 @@ func (r *ConversationRepository) AppendAssistantMessage(ctx context.Context, con
 		message.ActorID, message.AgentRunID, message.ClientMessageID,
 		message.ReplyToMessageID, message.CreatedAt); err != nil {
 		return wrapConversationDB("insert assistant message", err)
+	}
+	for _, part := range message.StreamParts {
+		payload := part.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage(`{}`)
+		}
+		createdAt := part.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = message.CreatedAt
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO conversation_message_part (id, message_id, seq, part_type, payload, created_at)
+			VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+		`, r.ids.Next(), message.ID, part.Seq, part.Type, string(payload), createdAt); err != nil {
+			return wrapConversationDB("insert conversation message part", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, conversationID, message.CreatedAt); err != nil {
 		return wrapConversationDB("touch conversation", err)
@@ -342,7 +552,7 @@ func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int
 func scanConversation(row rowScanner) (version.Conversation, error) {
 	var conversation version.Conversation
 	if err := row.Scan(&conversation.ID, &conversation.VersionID, &conversation.Kind, &conversation.Title,
-		&conversation.Status, &conversation.CreatedBy, &conversation.CreatedAt, &conversation.UpdatedAt,
+		&conversation.Status, &conversation.ModelOverride, &conversation.CreatedBy, &conversation.CreatedAt, &conversation.UpdatedAt,
 		&conversation.MessageCount, &conversation.LastMessageAt); err != nil {
 		return version.Conversation{}, err
 	}
@@ -354,7 +564,7 @@ func scanMessage(row rowScanner) (version.Message, error) {
 	var parts, refs, tokenUsage []byte
 	if err := row.Scan(&message.ID, &message.ConversationID, &message.Role, &parts, &refs, &tokenUsage,
 		&message.ActorID, &message.AgentRunID, &message.ClientMessageID,
-		&message.ReplyToMessageID, &message.CreatedAt); err != nil {
+		&message.ReplyToMessageID, &message.CreatedAt, &message.ActualModel); err != nil {
 		return version.Message{}, err
 	}
 	if len(parts) > 0 {

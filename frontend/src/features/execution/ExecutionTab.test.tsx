@@ -101,10 +101,29 @@ describe("ExecutionTab", () => {
     expect(toolbar).toHaveTextContent("失败 1")
     expect(toolbar).toHaveTextContent("阻塞 0")
     expect(toolbar).toHaveTextContent("待执行 1")
+    expect(toolbar).toHaveTextContent("已取代 0")
     expect(toolbar).toHaveTextContent("版本通道已连接")
     expect(screen.getByTestId("wave-list")).toBeInTheDocument()
     expect(screen.getByTestId("live-trace")).toBeInTheDocument()
     expect(screen.getByTestId("results-panel")).toBeInTheDocument()
+  })
+
+  it("surfaces a superseded confirmed case version instead of hiding the drop", async () => {
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByRole("heading", { name: "波次 #9201" })
+
+    events.handlers?.onExecutionChanged?.({
+      type: "execution.intent_superseded",
+      payload: {
+        reason: "case_version_superseded",
+        replanned: true,
+        replacement_case_version_id: "7004",
+      },
+    } as never)
+
+    expect(
+      await screen.findByText(/已确认用例版本被更新的已确认版本取代，已自动重新排入执行队列/),
+    ).toBeInTheDocument()
   })
 
   it("shows the empty state before any case is confirmed", async () => {

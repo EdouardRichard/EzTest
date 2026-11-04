@@ -36,3 +36,23 @@ backend/.data/
 Thumbs.db
 .idea/
 .vscode/
+
+# evidence tool outputs may contain credentials; never commit them
+**/tools/out-*.json
+**/out-*.json
+**/auth-state*.json
+**/.auth/
+
+# release evidence tool outputs / login dumps
+**/tools-login*.json
+**/release/tools-login*.json
+
+
+**/release/tools-*.log
+**/release/out-*.json
+
+
+**/e2e-final/tools-*.json
+**/e2e-final/tools-*.log
+**/qa/release/final/tools-*
+

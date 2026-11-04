@@ -49,6 +49,21 @@ export function CreateVersionDialog({ open, onClose, onCreated }: CreateVersionD
     }
   }, [])
 
+  /**
+   * Silent catalog reload used by the binding wizard after an inline resource
+   * create or a discovery refresh. It keeps the form mounted (no loading card)
+   * and preserves the draft, so a newly created/discovered page becomes
+   * selectable in place.
+   */
+  const refreshCatalog = useCallback(async () => {
+    try {
+      setCatalog(await getResourceCatalog())
+      setCatalogError(null)
+    } catch (error) {
+      setCatalogError(error)
+    }
+  }, [])
+
   useEffect(() => {
     if (!open) return
     setDraft(createVersionDraft())
@@ -128,6 +143,7 @@ export function CreateVersionDialog({ open, onClose, onCreated }: CreateVersionD
                 value={draft.bindings}
                 errors={errors.byBinding}
                 disabled={submitting}
+                onRefreshCatalog={refreshCatalog}
                 onChange={(bindings) => setDraft((current) => ({ ...current, bindings }))}
               />
             )

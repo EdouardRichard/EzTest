@@ -178,7 +178,14 @@ export type CaseDetailPanelProps = {
   onConfirm: (caseId: string) => void
   /** Fills the design chat input with a modification request (never sends). */
   onRequestChange: (title: string) => void
+  /** Hands this case to the design chat as a `case_card` reference (never sends). */
+  onRequestAiChange?: (caseId: string) => void
   confirming?: boolean
+  /**
+   * Whether the version is at the case hard gate. Defaults to true for direct
+   * panel tests; the design tab passes the real stage gate.
+   */
+  canConfirm?: boolean
 }
 
 function CaseDetailBody({
@@ -188,7 +195,9 @@ function CaseDetailBody({
   onSelectVersion,
   onConfirm,
   onRequestChange,
+  onRequestAiChange,
   confirming,
+  canConfirm: stageCanConfirm = true,
 }: {
   versionId: string
   detail: DesignCaseDetail
@@ -196,10 +205,12 @@ function CaseDetailBody({
   onSelectVersion: (caseVersionId: string) => void
   onConfirm: (caseId: string) => void
   onRequestChange: (title: string) => void
+  onRequestAiChange?: (caseId: string) => void
   confirming: boolean
+  canConfirm?: boolean
 }) {
   const selected = detail.selected
-  const canConfirm = detail.confirmable && selected.status === "draft"
+  const canConfirm = stageCanConfirm && detail.confirmable && selected.status === "draft"
   const previousVersion = [...detail.versions]
     .filter((version) => version.revision < selected.revision)
     .sort((left, right) => right.revision - left.revision)[0]
@@ -228,6 +239,16 @@ function CaseDetailBody({
         >
           请求修改
         </Button>
+        {onRequestAiChange === undefined ? null : (
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid={`btn-ai-modify-detail-${detail.case_id}`}
+            onClick={() => onRequestAiChange(detail.case_id)}
+          >
+            交给 AI 修改
+          </Button>
+        )}
         {canConfirm ? (
           <Button
             size="sm"
@@ -411,7 +432,9 @@ export function CaseDetailPanel({
   refreshToken = 0,
   onConfirm,
   onRequestChange,
+  onRequestAiChange,
   confirming = false,
+  canConfirm = true,
 }: CaseDetailPanelProps) {
   const [detail, setDetail] = useState<DesignCaseDetail | null>(null)
   const [selectedVersionId, setSelectedVersionId] = useState<string | undefined>(undefined)
@@ -458,7 +481,11 @@ export function CaseDetailPanel({
   const retry = useCallback(() => setReloadToken((token) => token + 1), [])
 
   return (
-    <section data-testid="case-detail" aria-label="用例详情" className="surface-card p-4">
+    <section
+      data-testid="case-detail"
+      aria-label="用例详情"
+      className="surface-card h-full min-h-0 overflow-auto p-4"
+    >
       {caseId === null ? (
         <p className="text-xs text-muted-foreground">选择用例查看详情</p>
       ) : loading && detail === null ? (
@@ -473,7 +500,9 @@ export function CaseDetailPanel({
           onSelectVersion={setSelectedVersionId}
           onConfirm={onConfirm}
           onRequestChange={onRequestChange}
+          onRequestAiChange={onRequestAiChange}
           confirming={confirming}
+          canConfirm={canConfirm}
         />
       )}
     </section>

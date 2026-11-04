@@ -115,6 +115,7 @@ type canonicalCaseRun struct {
 	VersionSUTIDs        []int64             `json:"version_sut_ids"`
 	Status               string              `json:"status"`
 	FailureClass         string              `json:"failure_class"`
+	TriageClassification string              `json:"triage_classification"`
 	Summary              string              `json:"summary"`
 	StepCount            int                 `json:"step_count"`
 	StepFailedCount      int                 `json:"step_failed_count"`
@@ -142,18 +143,20 @@ type canonicalEvidence struct {
 }
 
 type canonicalIssue struct {
-	ID             int64       `json:"id"`
-	VersionID      int64       `json:"version_id"`
-	Title          string      `json:"title"`
-	Status         IssueStatus `json:"status"`
-	Category       string      `json:"category"`
-	Severity       string      `json:"severity"`
-	Source         string      `json:"source"`
-	MergedIntoID   *int64      `json:"merged_into_id"`
-	SourceIssueIDs []int64     `json:"source_issue_ids"`
-	CaseRunIDs     []int64     `json:"case_run_ids"`
-	CreatedAt      time.Time   `json:"created_at"`
-	UpdatedAt      time.Time   `json:"updated_at"`
+	ID                   int64       `json:"id"`
+	VersionID            int64       `json:"version_id"`
+	Title                string      `json:"title"`
+	Status               IssueStatus `json:"status"`
+	Category             string      `json:"category"`
+	Severity             string      `json:"severity"`
+	Source               string      `json:"source"`
+	TriageStatus         string      `json:"triage_status"`
+	TriageClassification string      `json:"triage_classification"`
+	MergedIntoID         *int64      `json:"merged_into_id"`
+	SourceIssueIDs       []int64     `json:"source_issue_ids"`
+	CaseRunIDs           []int64     `json:"case_run_ids"`
+	CreatedAt            time.Time   `json:"created_at"`
+	UpdatedAt            time.Time   `json:"updated_at"`
 }
 
 type canonicalVersionSUT struct {
@@ -255,6 +258,7 @@ func canonicalCaseRuns(rows []CaseRunSnapshot) []canonicalCaseRun {
 			VersionSUTIDs:        sortedInt64s(row.VersionSUTIDs),
 			Status:               row.Status,
 			FailureClass:         row.FailureClass,
+			TriageClassification: row.TriageClassification,
 			Summary:              row.Summary,
 			StepCount:            row.StepCount,
 			StepFailedCount:      row.StepFailedCount,
@@ -296,18 +300,20 @@ func canonicalIssues(rows []IssueSnapshot) []canonicalIssue {
 	canonical := make([]canonicalIssue, 0, len(rows))
 	for _, row := range rows {
 		canonical = append(canonical, canonicalIssue{
-			ID:             row.ID,
-			VersionID:      row.VersionID,
-			Title:          row.Title,
-			Status:         row.Status,
-			Category:       row.Category,
-			Severity:       row.Severity,
-			Source:         row.Source,
-			MergedIntoID:   row.MergedIntoID,
-			SourceIssueIDs: sortedInt64s(row.SourceIssueIDs),
-			CaseRunIDs:     sortedInt64s(row.CaseRunIDs),
-			CreatedAt:      canonicalTime(row.CreatedAt),
-			UpdatedAt:      canonicalTime(row.UpdatedAt),
+			ID:                   row.ID,
+			VersionID:            row.VersionID,
+			Title:                row.Title,
+			Status:               row.Status,
+			Category:             row.Category,
+			Severity:             row.Severity,
+			Source:               row.Source,
+			TriageStatus:         row.TriageStatus,
+			TriageClassification: row.TriageClassification,
+			MergedIntoID:         row.MergedIntoID,
+			SourceIssueIDs:       sortedInt64s(row.SourceIssueIDs),
+			CaseRunIDs:           sortedInt64s(row.CaseRunIDs),
+			CreatedAt:            canonicalTime(row.CreatedAt),
+			UpdatedAt:            canonicalTime(row.UpdatedAt),
 		})
 	}
 	sort.SliceStable(canonical, func(i, j int) bool { return canonical[i].ID < canonical[j].ID })

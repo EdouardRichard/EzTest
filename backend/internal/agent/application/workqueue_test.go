@@ -318,6 +318,38 @@ func TestWorkQueueClaimForTeams(t *testing.T) {
 	}
 }
 
+// TestWorkQueueClaimContractDegradedAndValidation pins the 0.2.1 contract claim
+// facade: a legacy-only repository keeps claiming through the frozen 0.2.0 path
+// (the contract queue is simply empty), and the validation mirrors
+// ClaimForTeams. The SQL team filter itself is covered by the PostgreSQL
+// integration test.
+func TestWorkQueueClaimContractDegradedAndValidation(t *testing.T) {
+	repo := &fakeWorkItemRepo{}
+	queue := newWorkQueue(repo)
+	ctx := context.Background()
+	teams := []agent.Team{agent.TeamDesign, agent.TeamExecution}
+
+	if item, ok, err := queue.ClaimContract(ctx, "agent-worker", teams); err != nil || ok || item != nil {
+		t.Fatalf("legacy-only contract claim = %#v, %v, %v", item, ok, err)
+	}
+	if item, ok, err := queue.ClaimContract(ctx, "agent-worker", nil); err != nil || ok || item != nil {
+		t.Fatalf("empty teams claim = %#v, %v, %v", item, ok, err)
+	}
+	if _, _, err := queue.ClaimContract(ctx, "agent-worker", []agent.Team{agent.Team("unknown")}); err == nil {
+		t.Fatal("unknown team accepted")
+	} else {
+		assertAPIError(t, err, 400, "invalid_argument")
+	}
+	if _, _, err := queue.ClaimContract(ctx, "   ", teams); err == nil {
+		t.Fatal("empty claimant accepted")
+	} else {
+		assertAPIError(t, err, 400, "invalid_argument")
+	}
+	if len(repo.claimants) != 0 {
+		t.Fatalf("legacy repository called for the contract claim: %#v", repo.claimants)
+	}
+}
+
 func TestWorkQueueClaimForTypes(t *testing.T) {
 	repo := &fakeWorkItemRepo{item: agent.WorkItem{ID: 11, Type: "report.render_pdf"}, claimOK: true}
 	queue := newWorkQueue(repo)

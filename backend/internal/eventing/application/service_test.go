@@ -95,6 +95,46 @@ func TestPublishAppendsThenBroadcasts(t *testing.T) {
 	}
 }
 
+// TestPublishNotifiesObservers pins the event-driven wake seam: a local publish
+// notifies every registered observer after the hub broadcast, and an observer
+// error is ignored so a supplemental side effect never fails the publish.
+func TestPublishNotifiesObservers(t *testing.T) {
+	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	repo := &fakeRepo{appendFn: func(_ context.Context, event eventing.Event) (eventing.Event, error) {
+		event.Seq = 7
+		event.CreatedAt = at
+		return event, nil
+	}}
+	svc := New(repo, NewHub(4))
+	var observed []string
+	svc.Observe(func(_ context.Context, event eventing.Event) error {
+		if event.Seq != 7 {
+			t.Fatalf("observer saw seq %d, want the persisted 7", event.Seq)
+		}
+		observed = append(observed, event.Type)
+		return nil
+	})
+	svc.Observe(func(context.Context, eventing.Event) error {
+		return errors.New("observer failure must not fail the publish")
+	})
+
+	// Publish a contract-valid job.progress payload so the observer seam test
+	// cannot be mistaken for a second, weaker payload validator.
+	if err := svc.Publish(context.Background(), Event{
+		Channel: "version:42",
+		Type:    EventJobProgress,
+		Scope:   map[string]any{"version_id": "42", "job_id": "77"},
+		Payload: map[string]any{
+			"job_id": "77", "kind": "execute.batch", "current": 0, "total": 0, "status": JobStatusOpen,
+		},
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(observed) != 1 || observed[0] != EventJobProgress {
+		t.Fatalf("observed = %#v", observed)
+	}
+}
+
 func TestPublishRejectsInvalidChannelAndEmptyType(t *testing.T) {
 	repo := &fakeRepo{}
 	svc := New(repo, NewHub(1))

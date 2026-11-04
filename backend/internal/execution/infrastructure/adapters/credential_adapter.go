@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -76,13 +77,22 @@ func (a *CredentialAdapter) Account(ctx context.Context, versionID, versionSUTID
 			}
 		}
 	}
-	switch len(matches) {
-	case 0:
+	if len(matches) == 0 {
 		return executionapp.AccountCredential{}, platform.NotFound("test_account")
-	case 1:
-	default:
-		return executionapp.AccountCredential{}, platform.StateConflict("multiple test accounts share the requested role")
 	}
+	// Deterministic account selection (Task 90): several SUT test accounts may
+	// share a role (e.g. author). Selecting the lowest account ID keeps repeated
+	// case runs on the same account instead of failing mid-execution with a
+	// state_conflict; all candidates are bound to the version SUT, so no auth
+	// boundary is bypassed.
+	sort.SliceStable(matches, func(i, j int) bool {
+		left, leftErr := strconv.ParseInt(strings.TrimSpace(matches[i]), 10, 64)
+		right, rightErr := strconv.ParseInt(strings.TrimSpace(matches[j]), 10, 64)
+		if leftErr != nil || rightErr != nil {
+			return matches[i] < matches[j]
+		}
+		return left < right
+	})
 	accountID, err := strconv.ParseInt(strings.TrimSpace(matches[0]), 10, 64)
 	if err != nil || accountID <= 0 {
 		return executionapp.AccountCredential{}, platform.NewError(500, "internal", "test account has an invalid ID")

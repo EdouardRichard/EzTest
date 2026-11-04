@@ -26,8 +26,20 @@ const config: LLMConfig = {
   max_retries: 2,
   is_default: true,
   status: "active",
+  thinking_type: "auto",
+  reasoning_effort: "none",
   created_at: "2026-10-31T08:00:00Z",
   updated_at: "2026-10-31T08:00:00Z",
+}
+
+const canonicalConfig: LLMConfig = {
+  ...config,
+  id: "7003",
+  name: "responses-proxy",
+  protocol: "openai_responses",
+  thinking_type: "enabled",
+  reasoning_effort: "high",
+  default_model_id: "8002",
 }
 
 const model: LLMModel = {
@@ -43,6 +55,54 @@ const model: LLMModel = {
   status: "active",
   created_at: "2026-10-31T08:00:00Z",
   updated_at: "2026-10-31T08:00:00Z",
+}
+
+const reasoningModel: LLMModel = {
+  ...model,
+  id: "8002",
+  config_id: "7003",
+  model: "gpt-reasoning",
+  display_name: "gpt-reasoning",
+  context_window: 128000,
+  max_output: 16384,
+  supports_tools: true,
+  supports_vision: false,
+  capabilities: {
+    supports_tools: true,
+    supports_vision: false,
+    supports_reasoning: true,
+    supports_prompt_cache: true,
+    context_window: 128000,
+  },
+  deprecated: false,
+}
+
+const plainModel: LLMModel = {
+  ...model,
+  id: "8004",
+  config_id: "7003",
+  model: "gpt-plain",
+  display_name: "gpt-plain",
+  context_window: 32000,
+  supports_tools: true,
+  supports_vision: true,
+  capabilities: {
+    supports_tools: true,
+    supports_vision: true,
+    supports_reasoning: false,
+    supports_prompt_cache: false,
+    context_window: 32000,
+  },
+  deprecated: false,
+}
+
+const deprecatedModel: LLMModel = {
+  ...model,
+  id: "8003",
+  config_id: "7003",
+  model: "gpt-legacy",
+  display_name: "gpt-legacy",
+  deprecated: true,
 }
 
 type RouteHandler = (url: URL, init: RequestInit) => Response | Promise<Response>
@@ -168,7 +228,7 @@ describe("LLMSettings", () => {
 
     fireEvent.change(within(dialog).getByLabelText("配置名称"), { target: { value: "new-config" } })
     fireEvent.change(within(dialog).getByLabelText("协议"), {
-      target: { value: "openai_compatible" },
+      target: { value: "openai_chat_completions" },
     })
     fireEvent.change(within(dialog).getByLabelText("Base URL"), {
       target: { value: "http://127.0.0.1:19000/v1" },
@@ -189,7 +249,9 @@ describe("LLMSettings", () => {
     expect(readBody(post?.[1] ?? {})).toEqual({
       name: "new-config",
       base_url: "http://127.0.0.1:19000/v1",
-      protocol: "openai_compatible",
+      protocol: "openai_chat_completions",
+      thinking_type: "auto",
+      reasoning_effort: "none",
       api_key: "sk-test",
       headers: { "X-Tenant": "qa", "X-Trace": "1" },
       timeout_seconds: 45,
@@ -239,6 +301,224 @@ describe("LLMSettings", () => {
     })
     expect(body).not.toHaveProperty("api_key")
     expect(await screen.findByTestId("llm-config-7001")).toHaveTextContent("renamed-config")
+  })
+
+  it("labels canonical protocols and keeps legacy configurations visible", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") {
+        return jsonResponse({ data: [canonicalConfig, config] })
+      }
+      return jsonResponse({ data: [reasoningModel, plainModel, deprecatedModel] })
+    })
+
+    render(<LLMSettings />)
+    const canonicalCard = await screen.findByTestId("llm-config-7003")
+    expect(canonicalCard).toHaveTextContent("OpenAI Responses")
+    expect(canonicalCard).toHaveTextContent("enabled")
+    expect(canonicalCard).toHaveTextContent("high")
+    expect(canonicalCard).toHaveTextContent("gpt-reasoning")
+    expect(configCard("7001")).toHaveTextContent("OpenAI 兼容")
+
+    fireEvent.click(within(canonicalCard).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+    expect(within(dialog).getByLabelText("协议")).toHaveValue("openai_responses")
+    expect(
+      within(dialog).getByRole("option", { name: "OpenAI Chat Completions" }),
+    ).toBeInTheDocument()
+    expect(within(dialog).getByRole("option", { name: "OpenAI Responses" })).toBeInTheDocument()
+    expect(within(dialog).queryByRole("option", { name: "OpenAI 兼容" })).toBeNull()
+  })
+
+  it("edits thinking settings and shows the default model capabilities", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [canonicalConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [reasoningModel, plainModel, deprecatedModel] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
+        return jsonResponse({
+          data: {
+            ...canonicalConfig,
+            thinking_type: "disabled",
+            reasoning_effort: "xhigh",
+            default_model_id: "8004",
+          },
+        })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+
+    const thinking = within(dialog).getByLabelText("思考模式")
+    expect(thinking).toHaveValue("enabled")
+    const effort = within(dialog).getByLabelText("思考强度")
+    expect(effort).toHaveValue("high")
+    const defaultModel = within(dialog).getByLabelText("默认模型")
+    expect(defaultModel).toHaveValue("8002")
+    expect(within(dialog).getByRole("option", { name: /gpt-legacy/ })).toBeDisabled()
+    expect(within(dialog).getByLabelText("支持工具")).toBeChecked()
+    expect(within(dialog).getByLabelText("支持视觉")).not.toBeChecked()
+    expect(within(dialog).getByLabelText("支持推理")).toBeChecked()
+    expect(within(dialog).getByLabelText("提示缓存")).toBeChecked()
+    expect(within(dialog).getByText(/上下文窗口 128000/)).toBeVisible()
+
+    fireEvent.change(thinking, { target: { value: "disabled" } })
+    // disabled thinking cannot be combined with a non-none reasoning effort
+    // (the runtime rejects that contradiction): the effort is pinned to none.
+    expect(effort).toHaveValue("none")
+    expect(effort).toBeDisabled()
+    fireEvent.change(thinking, { target: { value: "enabled" } })
+    expect(effort).not.toBeDisabled()
+    fireEvent.change(effort, { target: { value: "xhigh" } })
+    fireEvent.change(defaultModel, { target: { value: "8004" } })
+    expect(within(dialog).getByLabelText("支持推理")).not.toBeChecked()
+    expect(within(dialog).getByLabelText("支持视觉")).toBeChecked()
+    expect(within(dialog).getByText(/上下文窗口 32000/)).toBeVisible()
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const patch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003",
+    )
+    expect(readBody(patch?.[1] ?? {})).toMatchObject({
+      protocol: "openai_responses",
+      thinking_type: "enabled",
+      reasoning_effort: "xhigh",
+      default_model_id: "8004",
+    })
+  })
+
+  it("edits a model capability and saves it through the model endpoint", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [canonicalConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [reasoningModel, plainModel, deprecatedModel] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
+        return jsonResponse({ data: canonicalConfig })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003/models/8002" && method(init) === "PATCH") {
+        return jsonResponse({
+          data: {
+            ...reasoningModel,
+            capabilities: {
+              ...reasoningModel.capabilities,
+              supports_reasoning: false,
+              supports_vision: true,
+            },
+          },
+        })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+
+    // The capability checkboxes edit the selected default model instead of
+    // being read-only: gateways that do not report capabilities can be fixed.
+    const reasoning = within(dialog).getByLabelText("支持推理")
+    expect(reasoning).toBeChecked()
+    fireEvent.click(reasoning)
+    expect(reasoning).not.toBeChecked()
+    fireEvent.click(within(dialog).getByLabelText("支持视觉"))
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const modelPatch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003/models/8002",
+    )
+    expect(readBody(modelPatch?.[1] ?? {})).toEqual({
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: false,
+      supports_prompt_cache: true,
+      context_window: 128000,
+    })
+    const configPatch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003",
+    )
+    expect(readBody(configPatch?.[1] ?? {})).toMatchObject({ default_model_id: "8002" })
+  })
+
+  it("allows clearing the default model when no selectable model exists", async () => {
+    const deprecatedOnly: LLMConfig = { ...canonicalConfig, default_model_id: "8003" }
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [deprecatedOnly] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [deprecatedModel] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
+        return jsonResponse({ data: { ...deprecatedOnly, default_model_id: undefined } })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+    const defaultModel = within(dialog).getByLabelText("默认模型")
+
+    // The stored default is deprecated, so it is visible but not selectable;
+    // clearing it must actually persist the clear instead of being omitted.
+    fireEvent.change(defaultModel, { target: { value: "" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const patch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003",
+    )
+    expect(readBody(patch?.[1] ?? {})).toMatchObject({ default_model_id: "" })
+  })
+
+  it("requires a default model when selectable models exist", async () => {
+    const withoutDefault: LLMConfig = {
+      ...canonicalConfig,
+      default_model_id: undefined,
+      thinking_type: "auto",
+      reasoning_effort: "none",
+    }
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [withoutDefault] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [reasoningModel] })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("请选择默认模型")
+    expect(fetchMock.mock.calls.some((call) => method(call[1] ?? {}) === "PATCH")).toBe(false)
   })
 
   it("deletes a config after confirmation", async () => {

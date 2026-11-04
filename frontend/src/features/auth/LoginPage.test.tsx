@@ -47,7 +47,7 @@ function renderLoginPage(): void {
 
 async function fillCredentials(): Promise<void> {
   fireEvent.change(await screen.findByLabelText("用户名"), { target: { value: "admin" } })
-  fireEvent.change(screen.getByLabelText("密码"), { target: { value: "admin123" } })
+  fireEvent.change(screen.getByLabelText("密码"), { target: { value: "test-admin-pass" } })
 }
 
 describe("LoginPage", () => {
@@ -65,12 +65,16 @@ describe("LoginPage", () => {
     window.sessionStorage.clear()
   })
 
-  it("shows the fixed default credential hint and password field", async () => {
+  it("shows env-based admin password guidance and no default credential hint", async () => {
     renderLoginPage()
 
     expect(
-      await screen.findByText("首次启动默认 admin / admin123，登录后请在设置中修改密码"),
+      await screen.findByText(
+        "由部署时的 EZTEST_INITIAL_ADMIN_PASSWORD 设置，首次登录后请修改密码。",
+      ),
     ).toBeInTheDocument()
+    expect(screen.queryByText(/admin123/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/首次启动默认|默认管理员账号/)).not.toBeInTheDocument()
     expect(screen.getByLabelText("密码")).toHaveAttribute("type", "password")
   })
 
@@ -118,7 +122,10 @@ describe("LoginPage", () => {
     expect(getToken()).toBe("ezt_login")
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe("http://localhost:13333/api/auth/login")
-    expect(JSON.parse(String(init?.body))).toEqual({ username: "admin", password: "admin123" })
+    expect(JSON.parse(String(init?.body))).toEqual({
+      username: "admin",
+      password: "test-admin-pass",
+    })
   })
 
   it("sends an already authenticated visitor to /versions", async () => {

@@ -2,6 +2,7 @@ package versionpg
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
@@ -232,4 +233,127 @@ func (r *QueryReader) ListDraftRequirements(ctx context.Context, limit int) ([]v
 		return nil, fmt.Errorf("scan draft requirements: %w", err)
 	}
 	return items, nil
+}
+
+var _ versionapp.VersionReadReader = (*QueryReader)(nil)
+
+// VersionExists reports whether the version row exists. The version-scoped read
+// routes use it to answer 404 for a missing version before touching the
+// fact/plan/work-item stores.
+func (r *QueryReader) VersionExists(ctx context.Context, versionID int64) (bool, error) {
+	if versionID <= 0 {
+		return false, fmt.Errorf("version exists: version id must be positive")
+	}
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM version WHERE id = $1)`, versionID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("version exists: %w", err)
+	}
+	return exists, nil
+}
+
+// ListFacts returns one version's facts ordered by id DESC, optionally limited
+// to the current rows (superseded_by IS NULL) and/or one kind. limit+1 rows are
+// read so the application can report has_more without a COUNT query.
+func (r *QueryReader) ListFacts(ctx context.Context, query versionapp.FactReadQuery) ([]versionapp.FactReadRow, bool, error) {
+	if query.VersionID <= 0 {
+		return nil, false, fmt.Errorf("list facts: version id must be positive")
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, version_id, kind, key, payload, confidence, source, source_ref,
+		       evidence_refs, content_hash, superseded_by, created_at
+		FROM version_fact
+		WHERE version_id = $1
+		  AND ($2 = '' OR kind = $2)
+		  AND ($3 OR superseded_by IS NULL)
+		  AND ($4::bigint IS NULL OR id < $4)
+		ORDER BY id DESC
+		LIMIT $5
+	`, query.VersionID, query.Kind, query.IncludeSuperseded, query.BeforeID, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("list facts: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]versionapp.FactReadRow, 0)
+	for rows.Next() {
+		var item versionapp.FactReadRow
+		var payload []byte
+		if err := rows.Scan(&item.ID, &item.VersionID, &item.Kind, &item.Key, &payload,
+			&item.Confidence, &item.Source, &item.SourceRef, &item.EvidenceIDs,
+			&item.ContentHash, &item.SupersededBy, &item.CreatedAt); err != nil {
+			return nil, false, fmt.Errorf("scan fact: %w", err)
+		}
+		if err := json.Unmarshal(payload, &item.Payload); err != nil {
+			return nil, false, fmt.Errorf("decode fact payload: %w", err)
+		}
+		if item.Payload == nil {
+			item.Payload = map[string]any{}
+		}
+		if item.EvidenceIDs == nil {
+			item.EvidenceIDs = []int64{}
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("scan facts: %w", err)
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	return items, hasMore, nil
+}
+
+// ListPlanItems returns one version's plan items ordered by id DESC, optionally
+// filtered by status. limit+1 rows are read so the application can report
+// has_more without a COUNT query.
+func (r *QueryReader) ListPlanItems(ctx context.Context, query versionapp.PlanItemReadQuery) ([]versionapp.PlanItemReadRow, bool, error) {
+	if query.VersionID <= 0 {
+		return nil, false, fmt.Errorf("list plan items: version id must be positive")
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, version_id, phase, title, status, depends_on, work_item_id,
+		       decision, sort_order, created_at, updated_at
+		FROM version_plan_item
+		WHERE version_id = $1
+		  AND ($2 = '' OR status = $2)
+		  AND ($3::bigint IS NULL OR id < $3)
+		ORDER BY id DESC
+		LIMIT $4
+	`, query.VersionID, query.Status, query.BeforeID, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("list plan items: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]versionapp.PlanItemReadRow, 0)
+	for rows.Next() {
+		var item versionapp.PlanItemReadRow
+		if err := rows.Scan(&item.ID, &item.VersionID, &item.Phase, &item.Title,
+			&item.Status, &item.DependsOn, &item.WorkItemID, &item.Decision,
+			&item.Order, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, false, fmt.Errorf("scan plan item: %w", err)
+		}
+		if item.DependsOn == nil {
+			item.DependsOn = []int64{}
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("scan plan items: %w", err)
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	return items, hasMore, nil
 }

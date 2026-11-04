@@ -64,7 +64,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/eval.ps1 -Mode r
 | `-DryRun` | off | 只做静态/DB/工具链检查 |
 | `-ApiBaseUrl` | `EZTEST_API_BASE_URL`，否则 `http://127.0.0.1:<EZTEST_API_PORT\|13333>` | P6 验收用隔离端口 |
 | `-ObservationFile` | `EZTEST_EVAL_OBSERVATION`，否则 `.tmp/p6-acceptance/observation.json` | 真实 observation |
-| `-BearerToken` | `EZTEST_ADMIN_TOKEN`；否则用 `.env` 的 `EZTEST_ADMIN_USERNAME`/`EZTEST_ADMIN_PASSWORD`（缺省为开发 seed `admin`/`admin123`）登录 | admin 凭据/口令永不打印 |
+| `-BearerToken` | `EZTEST_ADMIN_TOKEN`；否则用 `.env` / 环境中的 `EZTEST_ADMIN_USERNAME`/`EZTEST_ADMIN_PASSWORD` 登录（无内置默认口令，缺失即失败） | admin 凭据/口令永不打印 |
 | `-RequestTimeoutSeconds` | 60 | 单次 HTTP 超时 |
 
 DryRun 校验：14 个语料/真值文件存在且 JSON 可解析、`corpus_version` 一致、baseline 7 指标与阈值精确匹配 spec §5.3、语料与真值互相引用一致、OpenAPI 冻结标记/P6 quality 路径与 schema、quality 路由文件、迁移 `order.txt` 33 条（含 `quality_0001_eval.sql`）、`.env` 数据库 URL 本地可连接、LLM 配置三项非空、工具链（PowerShell/psql）。不要求服务已启动。

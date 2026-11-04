@@ -12,6 +12,7 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // fakeRuntimeRepo implements agent.RuntimeRepository in memory.
@@ -29,6 +30,9 @@ type fakeRuntimeRepo struct {
 	messages  []agent.AgentMessage
 	packets   []agent.ContextPacket
 	packetIDs map[int64]agent.ContextPacket
+	// packetCacheUpdates counts the provider cache-stat overwrites persisted
+	// through UpdateContextPacketCacheStats.
+	packetCacheUpdates int
 }
 
 func newFakeRuntimeRepo() *fakeRuntimeRepo {
@@ -143,6 +147,37 @@ func (f *fakeRuntimeRepo) GetContextPacket(_ context.Context, id int64) (agent.C
 	return packet, nil
 }
 
+// UpdateContextPacketCacheStats mirrors the production token_counts rewrite:
+// only the provider cache bookkeeping changes, the packet content is immutable.
+func (f *fakeRuntimeRepo) UpdateContextPacketCacheStats(_ context.Context, id int64, cachedTokens int, cacheHit bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	packet, ok := f.packetIDs[id]
+	if !ok {
+		return agent.ErrNotFound
+	}
+	f.packetCacheUpdates++
+	if packet.TokenCounts == nil {
+		packet.TokenCounts = map[string]int{}
+	}
+	packet.TokenCounts["cached_tokens"] = cachedTokens
+	packet.TokenCounts["cache_hit"] = cacheHitInt(cacheHit)
+	f.packetIDs[id] = packet
+	for index := range f.packets {
+		if f.packets[index].ID == id {
+			f.packets[index] = packet
+		}
+	}
+	return nil
+}
+
+func cacheHitInt(cacheHit bool) int {
+	if cacheHit {
+		return 1
+	}
+	return 0
+}
+
 func (f *fakeRuntimeRepo) lastFinished(t interface{ Fatalf(string, ...any) }) agent.AgentRun {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -162,7 +197,11 @@ type scriptedChat struct {
 	models    []llmapp.ModelInfo
 	modelErr  error
 	resolves  []string
-	onChat    func(index int, req llmapp.ChatRequest)
+	// supportsVision mirrors the catalog capability gate: a run that asks for
+	// Vision on a model without it must fail before Chat is called.
+	supportsVision bool
+	requirements   []llmapp.ModelRequirements
+	onChat         func(index int, req llmapp.ChatRequest)
 }
 
 func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
@@ -189,12 +228,23 @@ func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.C
 	return response, scriptedErr
 }
 
-func (f *scriptedChat) ResolveModel(_ context.Context, model string) (llmapp.ModelInfo, error) {
+func (f *scriptedChat) ResolveModel(_ context.Context, _ int64, model string, required ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resolves = append(f.resolves, model)
+	f.requirements = append(f.requirements, required...)
 	if f.modelErr != nil {
 		return llmapp.ModelInfo{}, f.modelErr
+	}
+	for _, requirement := range required {
+		if requirement.Vision && !f.supportsVision {
+			return llmapp.ModelInfo{}, &platform.Error{
+				Status:  400,
+				Code:    llmapp.CodeLLMCapabilityMismatch,
+				Message: "llm model does not support vision required by this role; choose a model with that capability",
+				Details: map[string]any{"missing_capabilities": []string{"vision"}},
+			}
+		}
 	}
 	if len(f.models) == 0 {
 		return llmapp.ModelInfo{ConfigID: 1, Model: "fake-llm", ContextWindow: 64000, MaxOutput: 8192}, nil
@@ -221,14 +271,27 @@ func (f *scriptedChat) request(index int) llmapp.ChatRequest {
 	return f.requests[index]
 }
 
+// fakeJobCardRecord is one job_card message the runner projected into a
+// conversation. The fake mirrors the version writer's one-card-per-job upsert:
+// a repeated projection updates Data/History instead of appending a record.
+type fakeJobCardRecord struct {
+	VersionID      int64
+	ConversationID int64
+	MessageID      int64
+	Data           map[string]any
+	History        []map[string]any
+}
+
 type fakeConversationPort struct {
-	kind        string
-	snapshot    agentapp.ConversationSnapshot
-	messages    map[int64]agentapp.ConversationMessage
-	appended    []agentapp.AssistantMessageInput
-	summaries   []string
-	summaryVer  int
-	snapshotErr error
+	kind          string
+	modelOverride string
+	snapshot      agentapp.ConversationSnapshot
+	messages      map[int64]agentapp.ConversationMessage
+	appended      []agentapp.AssistantMessageInput
+	jobCards      []fakeJobCardRecord
+	summaries     []string
+	summaryVer    int
+	snapshotErr   error
 }
 
 func (f *fakeConversationPort) Snapshot(_ context.Context, versionID, conversationID int64, _ int) (agentapp.ConversationSnapshot, error) {
@@ -250,6 +313,13 @@ func (f *fakeConversationPort) ConversationKind(_ context.Context, _, _ int64) (
 		return "clarification", nil
 	}
 	return f.kind, nil
+}
+
+func (f *fakeConversationPort) ModelOverride(_ context.Context, _, _ int64) (string, error) {
+	if f.snapshotErr != nil {
+		return "", f.snapshotErr
+	}
+	return f.modelOverride, nil
 }
 
 func (f *fakeConversationPort) GetMessage(_ context.Context, versionID, conversationID, messageID int64) (agentapp.ConversationMessage, error) {
@@ -280,6 +350,52 @@ func (f *fakeConversationPort) UpdateSummary(_ context.Context, _, _ int64, summ
 	return agentapp.ConversationSummary{Version: f.summaryVer, Summary: summary}, nil
 }
 
+// UpsertJobCard mirrors the version writer's one-card-per-job contract: the
+// first projection for a (conversation, job) appends the card message, later
+// projections rewrite that same record and keep the update history.
+func (f *fakeConversationPort) UpsertJobCard(_ context.Context, versionID, conversationID int64, part agentapp.ConversationPart) (agentapp.ConversationMessage, error) {
+	jobID, _ := part.Data["job_id"].(string)
+	for index := range f.jobCards {
+		record := &f.jobCards[index]
+		existingJobID, _ := record.Data["job_id"].(string)
+		if record.VersionID != versionID || record.ConversationID != conversationID || existingJobID != jobID {
+			continue
+		}
+		record.Data = copyPartData(part.Data)
+		record.History = append(record.History, copyPartData(part.Data))
+		return agentapp.ConversationMessage{
+			ID:             record.MessageID,
+			VersionID:      versionID,
+			ConversationID: conversationID,
+			Role:           "assistant",
+			Parts:          []agentapp.ConversationPart{part},
+		}, nil
+	}
+	record := fakeJobCardRecord{
+		VersionID:      versionID,
+		ConversationID: conversationID,
+		MessageID:      int64(9200 + len(f.jobCards)),
+		Data:           copyPartData(part.Data),
+	}
+	record.History = append(record.History, copyPartData(part.Data))
+	f.jobCards = append(f.jobCards, record)
+	return agentapp.ConversationMessage{
+		ID:             record.MessageID,
+		VersionID:      versionID,
+		ConversationID: conversationID,
+		Role:           "assistant",
+		Parts:          []agentapp.ConversationPart{part},
+	}, nil
+}
+
+func copyPartData(data map[string]any) map[string]any {
+	copied := make(map[string]any, len(data))
+	for key, value := range data {
+		copied[key] = value
+	}
+	return copied
+}
+
 type fakeVersionReader struct {
 	pack agentapp.VersionPack
 	err  error
@@ -306,6 +422,26 @@ func (f *fakeAttachmentReader) GetAttachment(_ context.Context, versionID, attac
 	info := f.info
 	info.ID = attachmentID
 	return info, nil
+}
+
+// fakeImageLoader resolves image part data_refs for vision runs and records
+// the refs the runner asked for.
+type fakeImageLoader struct {
+	images map[string]agentapp.ImageData
+	err    error
+	refs   []string
+}
+
+func (f *fakeImageLoader) LoadImage(_ context.Context, dataRef string) (agentapp.ImageData, error) {
+	f.refs = append(f.refs, dataRef)
+	if f.err != nil {
+		return agentapp.ImageData{}, f.err
+	}
+	image, ok := f.images[dataRef]
+	if !ok {
+		return agentapp.ImageData{}, platform.NotFound("content")
+	}
+	return image, nil
 }
 
 type fakeTeamRoomPort struct {
@@ -440,6 +576,37 @@ func (f *fakeDesignPort) SubmitDataPlan(_ context.Context, versionID, caseVersio
 	f.dataPlanRunID = runID
 	f.dataPlanInput = in
 	return f.dataPlanResult, f.dataPlanErr
+}
+
+// fakeDesignRoundStarter records the design.cases stage-entry port calls.
+type fakeDesignRoundStarter struct {
+	calls          int
+	versionID      int64
+	requirementIDs []int64
+	conversationID int64
+	err            error
+}
+
+func (f *fakeDesignRoundStarter) StartDesignRound(_ context.Context, versionID int64, requirementIDs []int64) (int64, error) {
+	f.calls++
+	f.versionID = versionID
+	f.requirementIDs = append([]int64(nil), requirementIDs...)
+	return f.conversationID, f.err
+}
+
+// fakeBatchStarter records the execute.batch stage-entry port calls.
+type fakeBatchStarter struct {
+	calls     int
+	versionID int64
+	caseIDs   []int64
+	err       error
+}
+
+func (f *fakeBatchStarter) StartBatch(_ context.Context, versionID int64, caseIDs []int64) error {
+	f.calls++
+	f.versionID = versionID
+	f.caseIDs = append([]int64(nil), caseIDs...)
+	return f.err
 }
 
 // fakeAttachmentPort implements tools.AttachmentPort.

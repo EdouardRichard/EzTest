@@ -65,7 +65,8 @@ type ExecutionAssertion struct {
 	// P5 visual assertion IDs (spec §7.3). CaseAssertionID is the design
 	// case_assertion.id; VisualAssertionID is the visual_assertion.id the
 	// execution.visual_assert tool takes as assertionId. Both stay zero for
-	// non-visual assertions and when the visual context has no configuration.
+	// non-visual assertions; a visual assertion whose configuration cannot be
+	// resolved is a typed pre-execution failure (Task 115), never a zero ID.
 	CaseAssertionID   int64
 	VisualAssertionID int64
 }

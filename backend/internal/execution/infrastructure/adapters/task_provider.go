@@ -3,20 +3,26 @@ package adapters
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
 )
 
 // VisualAssertionLister lists the visual assertion configurations of one case
 // version. *visualapp.ConfigService satisfies it. P5 wiring passes it through
-// NewTaskProvider; without it the task context still loads (the visual
-// assertion IDs stay empty and the server finalizer keeps the case
-// inconclusive instead of a false pass).
+// NewTaskProvider. Task 115: the lister is mandatory when the case version
+// carries kind=visual assertions — a missing or unresolvable configuration is a
+// typed pre-execution failure, never a silent inconclusive. It stays optional so
+// P3-only wiring keeps compiling for case versions without visual assertions.
 type VisualAssertionLister interface {
 	List(ctx context.Context, versionID int64, caseVersionID, versionSUTID *int64) ([]visual.Assertion, error)
 }
@@ -57,59 +63,119 @@ func (p *TaskProviderAdapter) ExecutionTask(ctx context.Context, item agent.Work
 		return agentapp.ExecutionTask{}, err
 	}
 	task := mapTaskSnapshot(snapshot)
-	p.attachVisualAssertions(ctx, item.VersionID, snapshot.Case.CaseVersionID, &task)
+	if err := p.attachVisualAssertions(ctx, item.VersionID, snapshot.Case.CaseVersionID, &task); err != nil {
+		return agentapp.ExecutionTask{}, err
+	}
 	return task, nil
 }
 
 // attachVisualAssertions joins the active visual configurations to the case
-// assertion positions already present in the task context. The join is by
-// (step_seq, assertion_seq) because that is the only position identity the
-// execution snapshot exposes for an assertion; the visual configuration is the
-// authoritative source of both the visual_assertion ID and the design
-// case_assertion ID. A missing configuration or an unavailable visual service
-// leaves the IDs empty; the case-run finalizer then reports
-// visual_assertion_not_run instead of passing.
-func (p *TaskProviderAdapter) attachVisualAssertions(ctx context.Context, versionID, caseVersionID int64, task *agentapp.ExecutionTask) {
-	if p.visual == nil || task == nil || versionID <= 0 || caseVersionID <= 0 {
-		return
+// assertion positions already present in the task context. The join prefers the
+// design case_assertion.id carried by the execution snapshot (Task 115) and
+// falls back to (step_seq, assertion_seq) for legacy task shapes; it validates
+// that the configuration targets the same case version, position and design
+// assertion. Every kind=visual assertion of the case version must resolve to an
+// active visual_assertion row: a missing, archived or mismatched configuration
+// is the typed 409 visual_assertion_unresolved pre-execution failure, so the
+// case can never reach the model with an empty visual_assertion_id and later
+// aggregate to a silent inconclusive. An unavailable visual context is the
+// retryable 503 unavailable failure.
+func (p *TaskProviderAdapter) attachVisualAssertions(ctx context.Context, versionID, caseVersionID int64, task *agentapp.ExecutionTask) error {
+	if task == nil {
+		return nil
 	}
-	hasVisual := false
+	visualPositions := make([]string, 0)
 	for _, assertion := range task.Assertions {
 		if assertion.Kind == string(execution.AssertionKindVisual) {
-			hasVisual = true
-			break
+			visualPositions = append(visualPositions, fmt.Sprintf("step %d assertion %d", assertion.StepSeq, assertion.AssertionSeq))
 		}
 	}
-	if !hasVisual {
-		return
+	if len(visualPositions) == 0 {
+		return nil
+	}
+	if versionID <= 0 || caseVersionID <= 0 {
+		return visualAssertionUnresolvedError(caseVersionID, visualPositions,
+			"the case scope does not identify a version and case version")
+	}
+	if p.visual == nil {
+		return visualAssertionUnresolvedError(caseVersionID, visualPositions,
+			"the visual assertion resolver is not configured")
 	}
 	configs, err := p.visual.List(ctx, versionID, &caseVersionID, nil)
 	if err != nil {
-		// Best effort: visual context availability must not block execution of
-		// non-visual assertions. The finalizer keeps the case inconclusive.
-		return
+		var apiErr *platform.Error
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
+		return platform.Unavailable(fmt.Sprintf(
+			"visual assertion resolution failed for case version %d: %v", caseVersionID, err))
 	}
+	byDesignAssertion := make(map[int64]visual.Assertion, len(configs))
 	byPosition := make(map[[2]int]visual.Assertion, len(configs))
 	for _, config := range configs {
-		if config.Status != visual.AssertionActive {
+		if config.Status != visual.AssertionActive || config.ID <= 0 ||
+			config.CaseVersionID != caseVersionID || config.CaseAssertionID <= 0 {
 			continue
+		}
+		if _, exists := byDesignAssertion[config.CaseAssertionID]; !exists {
+			byDesignAssertion[config.CaseAssertionID] = config
 		}
 		key := [2]int{config.StepSeq, config.AssertionSeq}
 		if _, exists := byPosition[key]; !exists {
 			byPosition[key] = config
 		}
 	}
+	unresolved := make([]string, 0)
 	for i := range task.Assertions {
 		assertion := &task.Assertions[i]
 		if assertion.Kind != string(execution.AssertionKindVisual) {
 			continue
 		}
-		config, found := byPosition[[2]int{assertion.StepSeq, assertion.AssertionSeq}]
-		if !found {
+		var (
+			config visual.Assertion
+			found  bool
+		)
+		if assertion.CaseAssertionID > 0 {
+			config, found = byDesignAssertion[assertion.CaseAssertionID]
+		} else {
+			config, found = byPosition[[2]int{assertion.StepSeq, assertion.AssertionSeq}]
+		}
+		if !found || config.StepSeq != assertion.StepSeq || config.AssertionSeq != assertion.AssertionSeq {
+			unresolved = append(unresolved, fmt.Sprintf("step %d assertion %d", assertion.StepSeq, assertion.AssertionSeq))
 			continue
 		}
 		assertion.CaseAssertionID = config.CaseAssertionID
 		assertion.VisualAssertionID = config.ID
+	}
+	if len(unresolved) > 0 {
+		return visualAssertionUnresolvedError(caseVersionID, unresolved,
+			"no active visual_assertion configuration targets these design assertions")
+	}
+	return nil
+}
+
+// visualAssertionUnresolvedError is the typed 409 pre-execution failure for a
+// kind=visual assertion that has no resolvable visual_assertion_id. It maps to
+// the execution case_blocked failure class (a deterministic, non-retryable case
+// scope blocker) instead of a silent inconclusive run.
+func visualAssertionUnresolvedError(caseVersionID int64, positions []string, reason string) *platform.Error {
+	message := fmt.Sprintf(
+		"case version %d has visual assertion(s) without a resolvable visual_assertion_id (%s); configure the visual assertion and approve its baseline before executing the case.",
+		caseVersionID, strings.Join(positions, ", "),
+	)
+	if reason != "" {
+		message += " " + reason + "."
+	}
+	return &platform.Error{
+		Status:  http.StatusConflict,
+		Code:    "visual_assertion_unresolved",
+		Message: message,
+		Details: map[string]any{
+			"case_version_id":       platformid.Format(caseVersionID),
+			"unresolved_assertions": positions,
+			"missing":               []string{"visual_assertion_id"},
+			"next_action":           "configure the visual assertion for each design visual assertion (and approve its baseline), then rerun the case",
+		},
 	}
 }
 
@@ -158,6 +224,7 @@ func mapTaskSnapshot(snapshot execution.TaskSnapshot) agentapp.ExecutionTask {
 	}
 	for _, assertion := range snapshot.Case.Assertions {
 		task.Assertions = append(task.Assertions, agentapp.ExecutionAssertion{
+			CaseAssertionID:    assertion.CaseAssertionID,
 			StepSeq:            assertion.StepSeq,
 			AssertionSeq:       assertion.AssertionSeq,
 			Kind:               assertion.Kind,

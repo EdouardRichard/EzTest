@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -17,14 +20,34 @@ import (
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
-// Case-run defaults. Settings override the bounded values; the lease is a
-// runtime constant because a case-run is renewed by the API-side agent loop.
+// Case-run defaults. The lease must outlive one executor action: the executor
+// caps an action at 60s and the HTTP client bounds it at 75s (see
+// executor.DefaultTimeout). 90s leaves headroom, and the independent heartbeat
+// renews the lease while an action is in flight, so a slow action never makes
+// recovery misread the run as executor_lost.
 const (
-	defaultCaseLeaseSeconds  = 30
+	// minCaseLease stays above the 75s executor client bound so a single slow
+	// action can never outlive the lease even before the first heartbeat.
+	minCaseLease = 80 * time.Second
+	// DefaultCaseLease is the case_run lease the agent stamps in Prepare and
+	// keeps alive with the independent heartbeat. The scheduler's dispatch lease
+	// must never be shorter (SchedulerDeps.LeaseTTL is clamped to it): a queued
+	// work item may wait a long time before any worker claims it, and Recovery
+	// must not interrupt that wait.
+	DefaultCaseLease         = 90 * time.Second
+	heartbeatRetryDelay      = time.Second
 	defaultEvidenceMaxBytes  = int64(5 << 20)
 	evidenceMaxPerCaseRun    = execution.EvidenceMaxPerCaseRun
 	maxSUTFilenameLength     = 255
 	executorContextKeyFormat = "run:%d:vs:%d:role:%s"
+	// terminalScreenshotTimeout bounds the P3 §6.4 automatic screenshot of a
+	// failed/blocked/inconclusive run. It is independent from the (possibly
+	// canceled) run context: the capture is best-effort and must never extend a
+	// terminal write.
+	terminalScreenshotTimeout = 8 * time.Second
+	// runFailureEvidenceFilename names the text evidence carrying the concrete
+	// error of a run that recorded no step/assertion result.
+	runFailureEvidenceFilename = "agent-failure.txt"
 )
 
 // SUTBindingResolver resolves the task-context bindings of a version (base URL,
@@ -44,6 +67,55 @@ type SUTAPI struct {
 // http.request requires a literal path instead of api_id.
 type SUTAPIResolver interface {
 	API(ctx context.Context, versionID, versionSUTID, apiID int64) (SUTAPI, error)
+}
+
+// CaseSuccessFact is the passed-case observation handed to the optional
+// knowledge success hook (spec §10.1 成功钩子). It carries identifiers only:
+// page/API/account references, the case title and the evidence count, never
+// knowledge content or credentials. The knowledge context turns it into
+// page_locator / api_auth / login_recipe candidates; the executor itself stays
+// knowledge-agnostic.
+type CaseSuccessFact struct {
+	VersionID     int64
+	CaseRunID     int64
+	CaseVersionID int64
+	Title         string
+	AccountRoles  []string
+	PageIDs       []int64
+	APIIDs        []int64
+	EvidenceCount int
+}
+
+// CaseSuccessHook is notified once when a case_run finishes passed. It is best
+// effort: a returned error or a panic is logged and never changes the case_run
+// result or blocks the run (spec §10.1; knowledge hooks are supplemental).
+// A nil hook (the default before assembly wiring) disables the notification.
+type CaseSuccessHook interface {
+	OnCaseRunPassed(ctx context.Context, fact CaseSuccessFact) error
+}
+
+// CaseFailureFact is the failed-case observation handed to the optional
+// knowledge failure hook (spec §10.1 失败复用 → suspect). It mirrors
+// CaseSuccessFact: identifiers (page/API/account-role back-references), the
+// version and the run identity plus the failure class, never knowledge content,
+// a case title or a credential.
+type CaseFailureFact struct {
+	VersionID     int64
+	CaseRunID     int64
+	CaseVersionID int64
+	FailureClass  execution.FailureClass
+	AccountRoles  []string
+	PageIDs       []int64
+	APIIDs        []int64
+}
+
+// CaseFailureHook is notified once when a case_run finishes failed. It exists so
+// the knowledge lifecycle can move the knowledge reused by the failed run to
+// suspect. Like CaseSuccessHook it is deliberately best effort: an error or a
+// panic is logged and never changes the persisted verdict. A nil hook disables
+// the notification.
+type CaseFailureHook interface {
+	OnCaseRunFailed(ctx context.Context, fact CaseFailureFact) error
 }
 
 // BrowserContextSpec is one lazily created executor browser context.
@@ -177,12 +249,25 @@ type CaseRunnerDeps struct {
 	TeamRoom    TeamRoom
 	Human       HumanRequestService
 	Visual      VisualAssertPort
-	Settings    SettingsReader
-	Clock       Clock
-	IDs         IDGenerator
-	Events      EventPublisher
-	Audit       AuditRecorder
-	InstanceID  string
+	// KnowledgeHook receives passed-case observations for knowledge
+	// sedimentation (spec §10.1). Optional and best effort.
+	KnowledgeHook CaseSuccessHook
+	// KnowledgeFailureHook receives failed-case observations so the knowledge
+	// reused by the failed run can be marked suspect. Optional and best effort.
+	KnowledgeFailureHook CaseFailureHook
+	Settings             SettingsReader
+	Clock                Clock
+	IDs                  IDGenerator
+	Events               EventPublisher
+	Audit                AuditRecorder
+	InstanceID           string
+	// LeaseTTL overrides the case_run lease. Values below 80s (the executor
+	// client bound is 75s) are raised to the minimum; zero selects the 90s
+	// default.
+	LeaseTTL time.Duration
+	// HeartbeatInterval overrides the independent lease renewal interval.
+	// Zero selects LeaseTTL/3.
+	HeartbeatInterval time.Duration
 }
 
 // CaseRunner executes one case_run as an API-side agent: it claims the run
@@ -209,17 +294,34 @@ type CaseRunner struct {
 	teamRoom    TeamRoom
 	human       HumanRequestService
 	visual      VisualAssertPort
-	settings    SettingsReader
-	clock       Clock
-	ids         IDGenerator
-	events      EventPublisher
-	audit       AuditRecorder
-	instanceID  string
+	knowledge   CaseSuccessHook
+	// knowledgeFailure is the optional failed-case knowledge hook.
+	knowledgeFailure CaseFailureHook
+	settings         SettingsReader
+	clock            Clock
+	ids              IDGenerator
+	events           EventPublisher
+	audit            AuditRecorder
+	instanceID       string
+	leaseTTL         time.Duration
+	heartbeat        time.Duration
+	// attribution is the deterministic four-value failure attribution the
+	// analyze.failure result exposes to the failure_analyst model (Task 37).
+	attribution *exploreapp.FailureAttribution
 
 	mu          sync.Mutex
 	activeRuns  map[int64]context.CancelFunc
+	heartbeats  map[int64]*leaseHeartbeat
 	waitTotals  map[int64]time.Duration
 	waitStarted map[int64]time.Time
+}
+
+// leaseHeartbeat is one independent renewal timer. The dispatch epoch is part of
+// its identity: a stale Finish/Finalize from an earlier epoch must not stop the
+// heartbeat of the dispatch that superseded it.
+type leaseHeartbeat struct {
+	epoch  int64
+	cancel context.CancelFunc
 }
 
 var (
@@ -229,6 +331,17 @@ var (
 
 // NewCaseRunner wires the case executor runtime.
 func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
+	lease := deps.LeaseTTL
+	if lease <= 0 {
+		lease = DefaultCaseLease
+	}
+	if lease < minCaseLease {
+		lease = minCaseLease
+	}
+	heartbeat := deps.HeartbeatInterval
+	if heartbeat <= 0 {
+		heartbeat = lease / 3
+	}
 	return &CaseRunner{
 		intents:     deps.Intents,
 		caseRuns:    deps.CaseRuns,
@@ -249,15 +362,23 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		teamRoom:    deps.TeamRoom,
 		human:       deps.Human,
 		visual:      deps.Visual,
-		settings:    deps.Settings,
-		clock:       deps.Clock,
-		ids:         deps.IDs,
-		events:      deps.Events,
-		audit:       deps.Audit,
-		instanceID:  deps.InstanceID,
-		activeRuns:  map[int64]context.CancelFunc{},
-		waitTotals:  map[int64]time.Duration{},
-		waitStarted: map[int64]time.Time{},
+		knowledge:   deps.KnowledgeHook,
+		// knowledgeFailure is optional: a nil field disables the failed-case
+		// notification.
+		knowledgeFailure: deps.KnowledgeFailureHook,
+		settings:         deps.Settings,
+		clock:            deps.Clock,
+		ids:              deps.IDs,
+		events:           deps.Events,
+		audit:            deps.Audit,
+		instanceID:       deps.InstanceID,
+		leaseTTL:         lease,
+		heartbeat:        heartbeat,
+		attribution:      exploreapp.NewFailureAttribution(),
+		activeRuns:       map[int64]context.CancelFunc{},
+		heartbeats:       map[int64]*leaseHeartbeat{},
+		waitTotals:       map[int64]time.Duration{},
+		waitStarted:      map[int64]time.Time{},
 	}
 }
 
@@ -282,7 +403,10 @@ func (s *CaseRunner) CancelRun(caseRunID int64) {
 	}
 }
 
-// ClearRun forgets the cancel function after a run finished.
+// ClearRun forgets the cancel function after a run finished. It deliberately
+// does not stop the lease heartbeat: the heartbeat is bound to the run context
+// (the worker cancels it when the run returns), and a late ClearRun from an old
+// dispatch epoch must not kill the heartbeat of a superseding run.
 func (s *CaseRunner) ClearRun(caseRunID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -341,7 +465,7 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 	if err != nil {
 		return execution.TaskSnapshot{}, mapExecutionError(err, "version")
 	}
-	suts, err := executionSUTBindings(caseSnapshot, bindings)
+	suts, err := executionSUTBindings(&caseSnapshot, bindings)
 	if err != nil {
 		return execution.TaskSnapshot{}, err
 	}
@@ -406,6 +530,11 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 	}
 
 	s.resetWaitTracking(caseRun.ID, now)
+	// Renew the case_run lease independently of tool result writes: one
+	// executor action may take up to 75s while no step/assertion row is
+	// written. The heartbeat stops when the worker cancels the run context, or
+	// explicitly on Finish/Finalize/ClearRun.
+	s.startLeaseHeartbeat(ctx, startedRun)
 	s.publishCaseRunEvent(EventCaseRunStarted, startedRun, map[string]any{
 		"status": string(startedRun.Status),
 	})
@@ -441,7 +570,10 @@ func (s *CaseRunner) StepRecord(ctx context.Context, scope tools.Scope, in tools
 	}
 	target := caseStep.TargetVersionSUTID
 	if in.VersionSUTID != nil {
-		if *in.VersionSUTID != caseStep.TargetVersionSUTID {
+		// An unresolved case target (a snapshot read before the default
+		// inheritance was applied) accepts the model's resolved target instead
+		// of rejecting the recording call.
+		if caseStep.TargetVersionSUTID > 0 && *in.VersionSUTID != caseStep.TargetVersionSUTID {
 			return nil, platform.Invalid("version_sut_id", "does not match the case step target")
 		}
 		target = *in.VersionSUTID
@@ -507,7 +639,7 @@ func (s *CaseRunner) AssertionRecord(ctx context.Context, scope tools.Scope, in 
 	}
 	target := assertion.TargetVersionSUTID
 	if in.VersionSUTID != nil {
-		if *in.VersionSUTID != assertion.TargetVersionSUTID {
+		if assertion.TargetVersionSUTID > 0 && *in.VersionSUTID != assertion.TargetVersionSUTID {
 			return nil, platform.Invalid("version_sut_id", "does not match the case assertion target")
 		}
 		target = *in.VersionSUTID
@@ -582,21 +714,32 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		return execution.CaseRun{}, platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	// P3 §6.4 automatic evidence: a failed/blocked/inconclusive run with a live
+	// browser context captures one screenshot before the terminal write so the
+	// failure is triageable instead of a zero-evidence row (QA-F1).
+	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
 	if caseRun.Summary.HumanRequestID > 0 {
 		summary.HumanRequestID = caseRun.Summary.HumanRequestID
 	}
-	finished, err := s.writeTerminal(ctx, caseRun, status, class, summary)
+	// Every terminal non-clean run explains itself: an explicit settlement cause
+	// wins, a legacy/other terminal outcome derives one from the persisted
+	// verdict/class (QA Q2). The deterministic verdict itself is untouched.
+	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, class, summary)
+	finished, terminalWrote, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
 		return execution.CaseRun{}, err
 	}
+	s.stopLeaseHeartbeat(caseRun.ID, caseRun.DispatchEpoch)
 	s.closeSUTContexts(ctx, caseRun.ID)
 	s.publishCaseRunEvent(EventCaseRunFinished, finished, map[string]any{
 		"status":           string(status),
 		"failure_class":    string(class),
 		"verdict_reason":   summary.VerdictReason,
+		"terminal_cause":   summary.TerminalCause,
+		"next_action":      summary.NextAction,
 		"assertion_total":  summary.AssertionTotal,
 		"assertion_failed": summary.AssertionFailed,
 		"step_total":       summary.StepTotal,
@@ -604,14 +747,28 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		"evidence_count":   summary.EvidenceCount,
 	})
 	s.forgetWaitTracking(caseRun.ID)
+	// Knowledge sedimentation/invalidation is supplemental: a hook failure never
+	// changes the persisted verdict (spec §10.1, best effort). Only the owner
+	// that won the terminal CAS notifies; an idempotent Finish that read another
+	// owner's row must not notify a second time.
+	if terminalWrote {
+		s.notifyCaseSuccess(ctx, scope.VersionID, finished, caseSnapshot, finished.Summary)
+		s.notifyCaseFailure(ctx, scope.VersionID, finished, caseSnapshot, finished.FailureClass)
+		s.postTerminalHandoff(ctx, caseRun, finished)
+	}
 	return finished, nil
 }
 
-// Finalize is called by the worker run sink after the agent loop ends. A
-// retryable run error before the attempt budget leaves the case_run running for
-// a redispatch; otherwise the deterministic aggregation writes the terminal
-// state. A lease-lost or paused run is left to its new owner.
-func (s *CaseRunner) Finalize(ctx context.Context, caseRunID int64, runErr error, attempt, maxAttempts int) error {
+// Finalize is called by the worker run sink after the agent loop ends.
+// dispatchEpoch is the case_run dispatch epoch carried by the work item: a late
+// Finalize from an older epoch has lost the run to a newer dispatch and must not
+// finalize it nor stop the new owner's heartbeat. result carries the run's turns,
+// usage and settlement cause so a budget-ended run is explained instead of being
+// aggregated as a silent inconclusive(incomplete) (QA Q2). A retryable run error
+// before the attempt budget leaves the case_run running for a redispatch;
+// otherwise the deterministic aggregation writes the terminal state. A
+// lease-lost or paused run is left to its new owner.
+func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int64, result agentapp.RunResult, runErr error, attempt, maxAttempts int) error {
 	if s.caseRuns == nil {
 		return errors.New("case runner is not configured")
 	}
@@ -619,12 +776,31 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID int64, runErr error
 	if err != nil {
 		return mapExecutionError(err, "case_run")
 	}
-	if caseRun.Status.Finished() || caseRun.Status == execution.CaseRunPaused {
+	// Fence before touching the heartbeat: a newer dispatch owns the run and its
+	// renewal timer.
+	if dispatchEpoch > 0 && caseRun.DispatchEpoch != dispatchEpoch {
 		return nil
 	}
 	if IsRunLeaseLost(runErr) {
+		// The dispatch fence is gone; the new owner owns the heartbeat.
 		return nil
 	}
+	// The agent loop is over and this dispatch still owns the case_run: no
+	// further renewal is needed.
+	s.stopLeaseHeartbeat(caseRunID, caseRun.DispatchEpoch)
+	if caseRun.Status.Finished() {
+		// The verdict was already written while the agent run was still active
+		// (execution.case_finish). The run result now carries the observed usage;
+		// attach it to the terminal summary without touching the verdict (QA Q2).
+		if caseRun.Status.Terminal() {
+			s.attachRunUsage(ctx, caseRun.ID, result)
+		}
+		return nil
+	}
+	if caseRun.Status == execution.CaseRunPaused {
+		return nil
+	}
+	usage := execution.NewCaseRunUsage(result.Turns, result.Usage)
 	if runErr != nil {
 		class, retryable := classifyFinalRunError(ctx, runErr)
 		if retryable && maxAttempts > 0 && attempt < maxAttempts {
@@ -643,20 +819,137 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID int64, runErr error
 		if class == execution.FailureClassBlocked {
 			candidate.Verdict = execution.CaseRunBlocked
 		}
-		if err := s.finalizeWithCandidate(ctx, caseRun, candidate); err != nil {
+		// A run that dies before recording any step/assertion result must not
+		// look like a silent zero-row failure: persist the concrete error as
+		// text evidence so the reason is visible in the report/UI.
+		s.recordRunFailureEvidence(ctx, caseRun, runErr)
+		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr, nil, usage); err != nil {
 			return err
 		}
 		return nil
 	}
-	// The agent loop succeeded but never finished the case (for example the turn
-	// budget was exhausted): aggregate whatever was recorded.
-	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}); err != nil {
+	// The agent loop succeeded but never finished the case (for example the
+	// budget was exhausted): aggregate whatever was recorded and explain the
+	// stop instead of writing a silent inconclusive(incomplete).
+	outcome := newIncompleteRunOutcome(result)
+	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil, &outcome, usage); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate) error {
+// incompleteRunOutcome is the typed explanation of an agent run that ended
+// without execution.case_finish. The deterministic verdict stays inconclusive;
+// these fields make the stop explainable and hand it to a human (rerun).
+type incompleteRunOutcome struct {
+	Cause      string
+	Detail     string
+	NextAction string
+}
+
+// newIncompleteRunOutcome derives the cause from the finished run result. A run
+// whose settlement was caused by a budget reports that budget; a run that
+// simply stopped without the completion tool reports agent_stopped. The cause is
+// never inferred from the model's prose.
+func newIncompleteRunOutcome(result agentapp.RunResult) incompleteRunOutcome {
+	cause := strings.TrimSpace(result.SettlementCause)
+	if cause == "" {
+		return incompleteRunOutcome{
+			Cause:      execution.TerminalCauseAgentStopped,
+			Detail:     fmt.Sprintf("the agent run ended without calling execution.case_finish after %d turns", result.Turns),
+			NextAction: execution.NextActionRerun,
+		}
+	}
+	cause = incompleteCauseCode(cause)
+	detail := strings.TrimSpace(result.SettlementDetail)
+	if detail == "" {
+		detail = incompleteCauseFallbackDetail(cause, result)
+	}
+	return incompleteRunOutcome{Cause: cause, Detail: detail, NextAction: execution.NextActionRerun}
+}
+
+// incompleteCauseCode maps the runner's stable budget cause onto the case_run
+// summary vocabulary. Unknown (future) causes are preserved verbatim.
+func incompleteCauseCode(cause string) string {
+	switch cause {
+	case agentapp.BudgetCauseTokens:
+		return execution.TerminalCauseTokenBudget
+	case agentapp.BudgetCauseTime:
+		return execution.TerminalCauseTimeBudget
+	case agentapp.BudgetCauseTurns:
+		return execution.TerminalCauseTurnBudget
+	default:
+		return cause
+	}
+}
+
+func incompleteCauseFallbackDetail(cause string, result agentapp.RunResult) string {
+	switch cause {
+	case execution.TerminalCauseTokenBudget:
+		return fmt.Sprintf("token budget: the run ended in its settlement turn after %d turns (%d tokens)",
+			result.Turns, runResultTokens(result.Usage))
+	case execution.TerminalCauseTimeBudget:
+		return fmt.Sprintf("time budget: the run ended in its settlement turn after %d turns", result.Turns)
+	case execution.TerminalCauseTurnBudget:
+		return fmt.Sprintf("turn budget: the run reached its turn fuse after %d turns", result.Turns)
+	default:
+		return fmt.Sprintf("the agent run ended before completing the case after %d turns", result.Turns)
+	}
+}
+
+// runResultTokens is the token count shown in the incomplete explanation. The
+// provider's total wins; older providers report prompt+completion components.
+func runResultTokens(usage map[string]int) int {
+	if total := usage["total_tokens"]; total > 0 {
+		return total
+	}
+	total := 0
+	for _, key := range []string{"prompt_tokens", "completion_tokens"} {
+		if value := usage[key]; value > 0 {
+			total += value
+		}
+	}
+	return total
+}
+
+// visualSymptomReached reports whether the visual assertion that left an
+// inconclusive run without a usable result was actually reached before the run
+// ended: the case step holding it was recorded, or the visual assertion itself
+// has a result row. A run stopped by the budget before that step has no visual
+// observation at all, so visual_assertion_not_run is only the downstream
+// symptom of the stop (QA release T9); a reached step (or a recorded visual
+// result) is a real observation and keeps its own cause/next action.
+func visualSymptomReached(caseSnapshot execution.CaseSnapshot, steps []execution.StepResult, assertions []execution.AssertionResult) bool {
+	recordedSteps := make(map[int]struct{}, len(steps))
+	for _, step := range steps {
+		recordedSteps[step.Seq] = struct{}{}
+	}
+	visualResults := make(map[[2]int]execution.AssertionResult, len(assertions))
+	for _, result := range assertions {
+		if result.Kind == execution.AssertionKindVisual {
+			visualResults[[2]int{result.StepSeq, result.AssertionSeq}] = result
+		}
+	}
+	for _, visual := range caseSnapshot.Assertions {
+		if visual.Kind != execution.AssertionKindVisual {
+			continue
+		}
+		result, hasResult := visualResults[[2]int{visual.StepSeq, visual.AssertionSeq}]
+		if hasResult && result.Verdict != execution.AssertionSkipped && result.Verdict != execution.AssertionInconclusive {
+			continue // this visual assertion did not block the verdict
+		}
+		if hasResult {
+			return true
+		}
+		_, stepRecorded := recordedSteps[visual.StepSeq]
+		return stepRecorded
+	}
+	// Visual results outside the snapshot (a legacy snapshot read) mean the
+	// visual tool ran, so the symptom was observed.
+	return len(visualResults) > 0
+}
+
+func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome, usage *execution.CaseRunUsage) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
 		return err
@@ -677,10 +970,42 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		return platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	if failure != nil {
+		// Persist the concrete failure reason (delivery reports and attribution
+		// read summary.last_error): a failed/blocked run must explain itself.
+		summary.LastError = truncateRunes(failure.Error(), 2000)
+	}
+	// An incomplete verdict explains why the run stopped and offers the human
+	// next step. The verdict itself is untouched: a 1/4-step run stays
+	// inconclusive, never a pass. The explicit settlement cause also wins over a
+	// downstream visual symptom: when a budget/turn stop happens before the
+	// visual step, the aggregate sees no visual result and reports
+	// visual_assertion_not_run even though the baseline/config may be healthy
+	// (QA release T9). That symptom is only trusted once the run actually
+	// reached the visual step; before that the budget/agent stop is the real
+	// cause and rerun is the human next step.
+	explained := incomplete != nil && status == execution.CaseRunInconclusive &&
+		(summary.VerdictReason == execution.VerdictReasonIncomplete ||
+			(summary.VerdictReason == execution.VerdictReasonVisualAssertionNotRun &&
+				!visualSymptomReached(caseSnapshot, steps, assertions)))
+	if explained {
+		summary.TerminalCause = incomplete.Cause
+		summary.NextAction = incomplete.NextAction
+		summary.LastError = truncateRunes(fmt.Sprintf("%s; the case recorded %d of %d steps before the run ended",
+			incomplete.Detail, len(steps), len(caseSnapshot.Steps)), 2000)
+	}
+	// All other terminal outcomes (blocked, failed, non-budget inconclusive) also
+	// carry a stable cause and next action derived from the persisted terminal
+	// data, so no terminal row is left unexplained (QA Q2).
+	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, class, summary)
+	if usage != nil {
+		summary.Usage = usage
+	}
+	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
-	finished, err := s.writeTerminal(ctx, caseRun, status, class, summary)
+	finished, terminalWrote, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
 		return err
 	}
@@ -689,9 +1014,62 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		"status":         string(status),
 		"failure_class":  string(class),
 		"verdict_reason": summary.VerdictReason,
+		"terminal_cause": summary.TerminalCause,
+		"next_action":    summary.NextAction,
 	})
 	s.forgetWaitTracking(caseRun.ID)
+	// A failed finalization (agent-run failure or exhausted redispatch) notifies
+	// the optional knowledge failure hook exactly once, from the terminal owner.
+	if terminalWrote {
+		s.notifyCaseFailure(ctx, s.versionForCaseRun(caseRun), finished, caseSnapshot, finished.FailureClass)
+		s.postTerminalHandoff(ctx, caseRun, finished)
+	}
 	return nil
+}
+
+// postTerminalHandoff records the human handoff of a terminal run whose cause
+// has no automatic recovery path in the execution team room. A terminal case run
+// cannot create a human_request (the run is already terminal and the P3 human
+// flow is limited to login takeover), so the durable handoff is a typed
+// team-room post carrying the cause, the explanation and the suggested next
+// action. Best effort: the verdict and its summary fields never depend on it.
+func (s *CaseRunner) postTerminalHandoff(ctx context.Context, caseRun execution.CaseRun, finished execution.CaseRun) {
+	if s.teamRoom == nil {
+		return
+	}
+	if !execution.TerminalCauseNeedsHuman(finished.Summary.TerminalCause) {
+		return
+	}
+	content := fmt.Sprintf("case run %s needs a human (%s); %s; next action: %s",
+		platformid.Format(caseRun.ID),
+		finished.Summary.TerminalCause,
+		finished.Summary.LastError,
+		finished.Summary.NextAction)
+	_ = s.teamRoom.Post(ctx, TeamPost{
+		VersionID: s.versionForCaseRun(caseRun),
+		Team:      "execution",
+		Kind:      "handoff",
+		Content:   truncateRunes(content, 2000),
+		Refs:      []TeamPostRef{{Kind: "case_run", ID: platformid.Format(caseRun.ID)}},
+	})
+}
+
+// attachRunUsage persists the observed usage of a run that ended after its
+// terminal verdict was already written (the execution.case_finish path). It is a
+// best-effort enrichment: the status, verdict reason and explanation are
+// untouched, and a row that already carries usage is never overwritten.
+func (s *CaseRunner) attachRunUsage(ctx context.Context, caseRunID int64, result agentapp.RunResult) {
+	usage := execution.NewCaseRunUsage(result.Turns, result.Usage)
+	if usage == nil {
+		return
+	}
+	current, err := s.caseRuns.Get(ctx, caseRunID)
+	if err != nil || !current.Status.Terminal() || current.Summary.Usage != nil {
+		return
+	}
+	current.Summary.Usage = usage
+	current.UpdatedAt = s.now()
+	_, _ = s.caseRuns.Update(ctx, current)
 }
 
 // RenewLease extends the case_run lease during a long agent run.
@@ -711,6 +1089,94 @@ func (s *CaseRunner) RenewLease(ctx context.Context, caseRunID, epoch int64, tok
 		return platform.LeaseLost()
 	}
 	return nil
+}
+
+// startLeaseHeartbeat runs the independent lease renewal timer (spec §5.7:
+// heartbeat renews independently; lease > executor single-action timeout). It
+// stops when ctx is canceled (the worker cancels its run context), when
+// Finish/Finalize stops this exact run+epoch, or when the dispatch fence is
+// definitively lost.
+func (s *CaseRunner) startLeaseHeartbeat(ctx context.Context, caseRun execution.CaseRun) {
+	if s.caseRuns == nil || s.heartbeat <= 0 {
+		return
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	heartbeat := &leaseHeartbeat{epoch: caseRun.DispatchEpoch, cancel: cancel}
+	s.mu.Lock()
+	if previous := s.heartbeats[caseRun.ID]; previous != nil {
+		previous.cancel()
+	}
+	s.heartbeats[caseRun.ID] = heartbeat
+	s.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(s.heartbeat)
+		defer ticker.Stop()
+		defer s.forgetLeaseHeartbeat(caseRun.ID, heartbeat)
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				if !s.renewLease(heartbeatCtx, caseRun) {
+					return
+				}
+			}
+		}
+	}()
+}
+
+// renewLease renews the lease once. Transient store errors are retried with a
+// short backoff while ctx is alive: one Postgres blip must not disable renewal
+// for the rest of a long action and turn it into executor_lost. Only a
+// definitive fence loss (!ok) stops the timer; the recovery sweep then owns the
+// redispatch.
+func (s *CaseRunner) renewLease(ctx context.Context, caseRun execution.CaseRun) bool {
+	for {
+		ok, err := s.caseRuns.ClaimLease(ctx, caseRun.ID, caseRun.DispatchEpoch,
+			s.now().Add(s.leaseDuration()))
+		if err == nil {
+			return ok
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		timer := time.NewTimer(heartbeatRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+// stopLeaseHeartbeat cancels and forgets the renewal timer of one dispatch. The
+// epoch is part of the identity so a stale owner cannot stop the heartbeat of
+// the dispatch that superseded it.
+func (s *CaseRunner) stopLeaseHeartbeat(caseRunID, dispatchEpoch int64) {
+	s.mu.Lock()
+	heartbeat := s.heartbeats[caseRunID]
+	if heartbeat == nil || heartbeat.epoch != dispatchEpoch {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.heartbeats, caseRunID)
+	s.mu.Unlock()
+	heartbeat.cancel()
+}
+
+// forgetLeaseHeartbeat drops the timer entry when its goroutine exits, unless a
+// newer dispatch already replaced it.
+func (s *CaseRunner) forgetLeaseHeartbeat(caseRunID int64, heartbeat *leaseHeartbeat) {
+	s.mu.Lock()
+	if s.heartbeats[caseRunID] != heartbeat {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.heartbeats, caseRunID)
+	s.mu.Unlock()
+	heartbeat.cancel()
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -768,12 +1234,20 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 	var runErr *agentapp.RunError
 	if errors.As(err, &runErr) {
 		switch runErr.Reason {
+		case "case_blocked":
+			// The execution task provider rejected the case scope before the
+			// agent loop (unresolvable step target, stale case, missing binding):
+			// this is a blocked case, not an automation failure.
+			return execution.FailureClassBlocked, false
 		case "budget", "model_error", "ai_unavailable", "invalid_payload", "profile_not_found":
 			return execution.FailureClassModel, runErr.Retryable
 		case "tool_failure":
 			var apiErr *platform.Error
 			if errors.As(err, &apiErr) && apiErr.Code == "executor_unavailable" {
-				return execution.FailureClassEnvironment, runErr.Retryable
+				// "executor" is its own failure class (executor_lost), never
+				// environment: the UI shows 执行器失联 and the run may be retried
+				// on a recovered executor.
+				return execution.FailureClassExecutorLost, runErr.Retryable
 			}
 			return execution.FailureClassAutomation, runErr.Retryable
 		case "interrupted", "aborted":
@@ -788,7 +1262,11 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 	return execution.FailureClassUnknown, agentapp.IsRetryable(err)
 }
 
-func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary) (execution.CaseRun, error) {
+// writeTerminal persists the terminal verdict when this owner still holds the
+// dispatch fence. The bool reports whether this call won the CAS: false means
+// another owner already finalized the run (or the fence was lost), so callers
+// must not repeat one-time side effects such as the knowledge success hook.
+func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary) (execution.CaseRun, bool, error) {
 	now := s.now()
 	ok, err := s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
 		run.Status = status
@@ -802,21 +1280,25 @@ func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRu
 		return nil
 	})
 	if err != nil {
-		return execution.CaseRun{}, mapExecutionError(err, "case_run")
+		return execution.CaseRun{}, false, mapExecutionError(err, "case_run")
 	}
 	if !ok {
 		// Another owner already finalized the run; return the stored truth
 		// (Finish is idempotent for terminal rows).
 		current, getErr := s.caseRuns.Get(ctx, caseRun.ID)
 		if getErr != nil {
-			return execution.CaseRun{}, mapExecutionError(getErr, "case_run")
+			return execution.CaseRun{}, false, mapExecutionError(getErr, "case_run")
 		}
 		if current.Status.Finished() {
-			return current, nil
+			return current, false, nil
 		}
-		return execution.CaseRun{}, platform.LeaseLost()
+		return execution.CaseRun{}, false, platform.LeaseLost()
 	}
-	return s.caseRuns.Get(ctx, caseRun.ID)
+	finished, err := s.caseRuns.Get(ctx, caseRun.ID)
+	if err != nil {
+		return execution.CaseRun{}, false, mapExecutionError(err, "case_run")
+	}
+	return finished, true, nil
 }
 
 func (s *CaseRunner) caseSnapshot(ctx context.Context, scope tools.Scope, caseRun execution.CaseRun) (execution.CaseSnapshot, error) {
@@ -857,11 +1339,30 @@ func mapCaseReadError(err error) error {
 }
 
 // executionSUTBindings resolves the SUTs referenced by the case snapshot and
-// validates every step/assertion target against the version bindings.
-func executionSUTBindings(snapshot execution.CaseSnapshot, bindings []execution.SUTBinding) ([]execution.SUTBinding, error) {
+// validates every step/assertion target against the version bindings. P2 allows
+// a step target to be empty (inherit case_version.default_version_sut_id); a
+// case with no default target inherits the version's sole binding. The resolved
+// targets are written back to the snapshot so the task context, the SUT context
+// rows and the recorded results all carry the same version_sut_id.
+//
+// account_role is deliberately not validated against the bound test accounts:
+// the design contract allows any role label (for example "anonymous" for a
+// logged-out step), an unbound role simply runs an unauthenticated browser
+// context, and account.credentials returns a typed business error if the model
+// asks for credentials that do not exist. Rejecting the role here killed the
+// whole run before any step/assertion/evidence could be recorded (QA-F1).
+func executionSUTBindings(snapshot *execution.CaseSnapshot, bindings []execution.SUTBinding) ([]execution.SUTBinding, error) {
+	if snapshot == nil {
+		return nil, platform.StateConflict("the case snapshot is missing")
+	}
 	byID := make(map[int64]execution.SUTBinding, len(bindings))
 	for _, binding := range bindings {
 		byID[binding.VersionSUTID] = binding
+	}
+	fallback := snapshot.DefaultVersionSUTID
+	if fallback <= 0 && len(bindings) == 1 {
+		fallback = bindings[0].VersionSUTID
+		snapshot.DefaultVersionSUTID = fallback
 	}
 	used := make([]int64, 0, len(bindings))
 	seen := map[int64]struct{}{}
@@ -878,15 +1379,42 @@ func executionSUTBindings(snapshot execution.CaseSnapshot, bindings []execution.
 	for _, id := range snapshot.VersionSUTIDs {
 		add(id)
 	}
-	for _, step := range snapshot.Steps {
-		add(step.TargetVersionSUTID)
+	add(fallback)
+	for i := range snapshot.Steps {
+		step := &snapshot.Steps[i]
+		target := step.TargetVersionSUTID
+		if target <= 0 {
+			target = fallback
+			step.TargetVersionSUTID = target
+		}
+		if target <= 0 {
+			return nil, platform.StateConflict(fmt.Sprintf(
+				"step %d has no target version_sut: set case_step.target_version_sut_id or case_version.default_version_sut_id", step.Seq))
+		}
+		if _, ok := byID[target]; !ok {
+			return nil, platform.StateConflict(fmt.Sprintf("step %d targets unbound version_sut %s", step.Seq, platformid.Format(target)))
+		}
+		add(target)
 	}
-	for _, assertion := range snapshot.Assertions {
-		add(assertion.TargetVersionSUTID)
+	for i := range snapshot.Assertions {
+		assertion := &snapshot.Assertions[i]
+		target := assertion.TargetVersionSUTID
+		if target <= 0 {
+			target = fallback
+			assertion.TargetVersionSUTID = target
+		}
+		if target <= 0 {
+			// The assertion carries only informational target metadata; the
+			// step target still routes the browser/API action.
+			continue
+		}
+		if _, ok := byID[target]; !ok {
+			return nil, platform.StateConflict(fmt.Sprintf(
+				"assertion %d.%d targets unbound version_sut %s", assertion.StepSeq, assertion.AssertionSeq, platformid.Format(target)))
+		}
+		add(target)
 	}
-	if snapshot.DefaultVersionSUTID > 0 {
-		add(snapshot.DefaultVersionSUTID)
-	}
+	snapshot.VersionSUTIDs = sortedSUTIDs(used)
 	resolved := make([]execution.SUTBinding, 0, len(used))
 	for _, id := range used {
 		binding, ok := byID[id]
@@ -895,16 +1423,14 @@ func executionSUTBindings(snapshot execution.CaseSnapshot, bindings []execution.
 		}
 		resolved = append(resolved, binding)
 	}
-	for _, step := range snapshot.Steps {
-		binding, ok := byID[step.TargetVersionSUTID]
-		if !ok {
-			return nil, platform.StateConflict(fmt.Sprintf("step %d targets unbound version_sut %s", step.Seq, platformid.Format(step.TargetVersionSUTID)))
-		}
-		if step.AccountRole != "" && len(binding.AccountRoles) > 0 && !containsString(binding.AccountRoles, step.AccountRole) {
-			return nil, platform.StateConflict(fmt.Sprintf("step %d account role %q is not bound to version_sut %s", step.Seq, step.AccountRole, platformid.Format(step.TargetVersionSUTID)))
-		}
-	}
 	return resolved, nil
+}
+
+// sortedSUTIDs deduplicates and sorts one resolved SUT id set.
+func sortedSUTIDs(ids []int64) []int64 {
+	out := append([]int64(nil), ids...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, epoch int64) error {
@@ -996,6 +1522,77 @@ func (s *CaseRunner) humanResponse(ctx context.Context, caseRun execution.CaseRu
 	return strings.Join(parts, "；"), nil
 }
 
+// recordRunFailureEvidence persists the concrete error of a run that never
+// recorded a step or assertion result as immutable text evidence (QA-F1): a
+// failed/blocked case_run must explain itself instead of showing zero rows and
+// zero evidence. Best effort: the terminal verdict never depends on it.
+func (s *CaseRunner) recordRunFailureEvidence(ctx context.Context, caseRun execution.CaseRun, runErr error) {
+	if runErr == nil || s.evidence == nil || s.content == nil || s.results == nil {
+		return
+	}
+	steps, err := s.results.ListSteps(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	assertions, err := s.results.ListAssertions(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	if len(steps) > 0 || len(assertions) > 0 {
+		return
+	}
+	if count, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr != nil || count > 0 {
+		return
+	}
+	message := fmt.Sprintf("agent run ended before recording any step/assertion result: %s",
+		truncateRunes(runErr.Error(), 1800))
+	_, _ = s.addEvidenceForRun(ctx, caseRun, 0, EvidenceInput{
+		Kind:     execution.EvidenceText,
+		Data:     []byte(message),
+		Filename: runFailureEvidenceFilename,
+	})
+}
+
+// captureTerminalEvidence implements the P3 §6.4 automatic capture: when a
+// case_run reaches failed/blocked/inconclusive and one of its browser contexts
+// is still active, take one screenshot and store it as evidence. The capture is
+// best effort and bounded; a missing/dead context never changes the verdict.
+func (s *CaseRunner) captureTerminalEvidence(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus) {
+	if s.browser == nil || s.evidence == nil || s.content == nil || s.sutContexts == nil {
+		return
+	}
+	switch status {
+	case execution.CaseRunFailed, execution.CaseRunBlocked, execution.CaseRunInconclusive:
+	default:
+		return
+	}
+	rows, err := s.sutContexts.ListByCaseRun(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	var target *execution.CaseRunSUTContext
+	for i := range rows {
+		if rows[i].Status == execution.SUTContextActive && rows[i].BrowserContextID != "" {
+			target = &rows[i]
+			break
+		}
+	}
+	if target == nil {
+		return
+	}
+	actionCtx, cancel := context.WithTimeout(context.Background(), terminalScreenshotTimeout)
+	defer cancel()
+	executorID := int64(0)
+	if target.ExecutorID != nil {
+		executorID = *target.ExecutorID
+	}
+	result, actionErr := s.browser.Action(actionCtx, executorID, target.BrowserContextID, "screenshot", json.RawMessage(`{}`))
+	if actionErr != nil || result.Error != nil {
+		return
+	}
+	_, _ = s.storeBrowserEvidence(actionCtx, caseRun, target.VersionSUTID, "screenshot", result, 0)
+}
+
 func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {
 	if s.sutContexts == nil {
 		return
@@ -1022,6 +1619,102 @@ func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {
 			return nil
 		})
 	}
+}
+
+// notifyCaseSuccess invokes the optional knowledge success hook for one passed
+// case_run. The hook never blocks or fails the executed case: an error is
+// logged and a panic is recovered (spec §10.1 best effort).
+func (s *CaseRunner) notifyCaseSuccess(ctx context.Context, versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary) {
+	if s.knowledge == nil || caseRun.Status != execution.CaseRunPassed || versionID <= 0 {
+		return
+	}
+	fact := caseSuccessFact(versionID, caseRun, snapshot, summary)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Default().ErrorContext(ctx, "knowledge success hook panicked",
+				"case_run_id", caseRun.ID, "panic", recovered)
+		}
+	}()
+	if err := s.knowledge.OnCaseRunPassed(ctx, fact); err != nil {
+		slog.Default().WarnContext(ctx, "knowledge success hook failed",
+			"case_run_id", caseRun.ID, "error", err)
+	}
+}
+
+// notifyCaseFailure invokes the optional knowledge failure hook for one failed
+// case_run. The hook never blocks or fails the executed case: an error is logged
+// and a panic is recovered (spec §10.1 best effort).
+func (s *CaseRunner) notifyCaseFailure(ctx context.Context, versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, class execution.FailureClass) {
+	if s.knowledgeFailure == nil || caseRun.Status != execution.CaseRunFailed || versionID <= 0 {
+		return
+	}
+	fact := caseFailureFact(versionID, caseRun, snapshot, class)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Default().ErrorContext(ctx, "knowledge failure hook panicked",
+				"case_run_id", caseRun.ID, "panic", recovered)
+		}
+	}()
+	if err := s.knowledgeFailure.OnCaseRunFailed(ctx, fact); err != nil {
+		slog.Default().WarnContext(ctx, "knowledge failure hook failed",
+			"case_run_id", caseRun.ID, "error", err)
+	}
+}
+
+// caseSuccessFact projects one passed case snapshot into the hook observation:
+// identifiers only, deduplicated and in case order.
+func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary) CaseSuccessFact {
+	fact := CaseSuccessFact{
+		VersionID:     versionID,
+		CaseRunID:     caseRun.ID,
+		CaseVersionID: caseRun.CaseVersionID,
+		Title:         snapshot.Title,
+		EvidenceCount: summary.EvidenceCount,
+	}
+	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot)
+	return fact
+}
+
+// caseFailureFact projects one failed case snapshot into the failure hook
+// observation. It deliberately carries no title and no summary text.
+func caseFailureFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, class execution.FailureClass) CaseFailureFact {
+	fact := CaseFailureFact{
+		VersionID:     versionID,
+		CaseRunID:     caseRun.ID,
+		CaseVersionID: caseRun.CaseVersionID,
+		FailureClass:  class,
+	}
+	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot)
+	return fact
+}
+
+// caseObservationIDs extracts the deduplicated page/API/account-role
+// back-references of one case snapshot in case order.
+func caseObservationIDs(snapshot execution.CaseSnapshot) (roles []string, pages []int64, apis []int64) {
+	seenRoles := map[string]struct{}{}
+	seenPages := map[int64]struct{}{}
+	seenAPIs := map[int64]struct{}{}
+	for _, step := range snapshot.Steps {
+		if role := strings.TrimSpace(step.AccountRole); role != "" {
+			if _, seen := seenRoles[role]; !seen {
+				seenRoles[role] = struct{}{}
+				roles = append(roles, role)
+			}
+		}
+		if step.TargetPageID != nil && *step.TargetPageID > 0 {
+			if _, seen := seenPages[*step.TargetPageID]; !seen {
+				seenPages[*step.TargetPageID] = struct{}{}
+				pages = append(pages, *step.TargetPageID)
+			}
+		}
+		if step.TargetAPIID != nil && *step.TargetAPIID > 0 {
+			if _, seen := seenAPIs[*step.TargetAPIID]; !seen {
+				seenAPIs[*step.TargetAPIID] = struct{}{}
+				apis = append(apis, *step.TargetAPIID)
+			}
+		}
+	}
+	return roles, pages, apis
 }
 
 func (s *CaseRunner) resetWaitTracking(caseRunID int64, now time.Time) {
@@ -1074,7 +1767,10 @@ func (s *CaseRunner) renewLeaseQuietly(ctx context.Context, caseRun execution.Ca
 }
 
 func (s *CaseRunner) leaseDuration() time.Duration {
-	return defaultCaseLeaseSeconds * time.Second
+	if s.leaseTTL <= 0 {
+		return DefaultCaseLease
+	}
+	return s.leaseTTL
 }
 
 func (s *CaseRunner) nextID() int64 {

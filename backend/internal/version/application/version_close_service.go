@@ -298,6 +298,10 @@ func (s *VersionCloseService) buildInput(ctx context.Context, stored version.Ver
 	if err != nil {
 		return version.VersionCloseInput{}, fmt.Errorf("version close %d: load version report: %w", stored.ID, err)
 	}
+	coverage, err := s.execution.ExecutionCoverage(ctx, stored.ID)
+	if err != nil {
+		return version.VersionCloseInput{}, fmt.Errorf("version close %d: load execution coverage: %w", stored.ID, err)
+	}
 	blockingWorkItems := workCounts.Total - workCounts.VersionClose
 	if blockingWorkItems < 0 {
 		blockingWorkItems = 0
@@ -309,6 +313,8 @@ func (s *VersionCloseService) buildInput(ctx context.Context, stored version.Ver
 		OpenHumanRequests: openHumanRequests,
 		ActiveWaves:       activeWaves,
 		InflightCaseRuns:  inflightRuns,
+		HasExecutionData:  coverage.HasExecutionData,
+		UnconfirmedCases:  coverage.UnconfirmedCases,
 		Requirements:      requirements,
 		Report:            report,
 	}, nil

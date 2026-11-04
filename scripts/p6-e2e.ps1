@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 P6 browser E2E against the real read models. It starts the Next.js web app on
 16870 against the P6 API (14345) and runs frontend/e2e/p6.spec.ts. The API/DB
@@ -71,7 +71,7 @@ if (-not (Test-Health)) {
 }
 
 # Resolve the version ID used by the chain and prompt scenarios.
-$login = Invoke-RestMethod -Uri "$ApiBaseUrl/api/auth/login" -Method Post -ContentType "application/json" -Body (@{ username = "admin"; password = "admin123" } | ConvertTo-Json)
+$login = Invoke-RestMethod -Uri "$ApiBaseUrl/api/auth/login" -Method Post -ContentType "application/json" -Body (@{ username = "admin"; password = "[REDACTED]" } | ConvertTo-Json)
 $token = $login.data.token
 $headers = @{ Authorization = "Bearer $token" }
 $versions = Invoke-RestMethod -Uri "$ApiBaseUrl/api/versions?limit=1" -Headers $headers

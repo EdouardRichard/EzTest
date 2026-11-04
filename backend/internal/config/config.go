@@ -27,7 +27,9 @@ type Config struct {
 }
 
 // Load reads EZTEST_DATABASE_URL, EZTEST_API_PORT, EZTEST_WEB_PORT and
-// EZTEST_EXECUTOR_PORT. No other environment variable is consulted.
+// EZTEST_EXECUTOR_PORT. No other environment variable is consulted here; the
+// first-start administrator seed reads EZTEST_INITIAL_ADMIN_PASSWORD in the
+// identity context instead.
 func Load() (Config, error) {
 	dbURL := strings.TrimSpace(os.Getenv("EZTEST_DATABASE_URL"))
 	if dbURL == "" {

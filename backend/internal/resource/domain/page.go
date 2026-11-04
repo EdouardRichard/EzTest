@@ -1,7 +1,9 @@
 package resource
 
 import (
+	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -37,8 +39,9 @@ type Page struct {
 	UpdatedAt     time.Time
 }
 
-// Validate checks page fields. RouteTemplate is required; callers derive it
-// from the URL when the caller omitted it.
+// Validate checks page fields. RouteTemplate is optional (a blank value is
+// derived from the URL by the application service); when present it must be a
+// path starting with "/".
 func (p Page) Validate() error {
 	if err := validation.String("name", p.Name, 1, 200); err != nil {
 		return err
@@ -46,11 +49,13 @@ func (p Page) Validate() error {
 	if err := validation.URL("url", p.URL); err != nil {
 		return err
 	}
-	if err := validation.String("route_template", p.RouteTemplate, 1, 500); err != nil {
-		return err
-	}
-	if !strings.HasPrefix(p.RouteTemplate, "/") {
-		return platform.Invalid("route_template", "must start with /")
+	if p.RouteTemplate != "" {
+		if err := validation.String("route_template", p.RouteTemplate, 1, 500); err != nil {
+			return err
+		}
+		if !strings.HasPrefix(p.RouteTemplate, "/") {
+			return platform.Invalid("route_template", "must start with /")
+		}
 	}
 	if err := validation.String("page_type", p.PageType, 1, 50); err != nil {
 		return err
@@ -72,6 +77,75 @@ func (p Page) Validate() error {
 		return invalidEnum("source", p.Source)
 	}
 	return nil
+}
+
+// ErrPageURLDuplicate reports a collision on (environment_id, normalized_url).
+var ErrPageURLDuplicate = fmt.Errorf("page url already exists: %w", ErrDuplicate)
+
+var (
+	// pageURLPattern mirrors the eztest_normalize_url regular expression.
+	pageURLPattern = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)([^?#]*)(?:\?[^#]*)?(#.*)?$`)
+	// pageHostPortPattern splits the last ":" followed by digits, as the SQL
+	// function does for the default-port check.
+	pageHostPortPattern = regexp.MustCompile(`^(.*):([0-9]+)$`)
+	pageTrailingSlashes = regexp.MustCompile(`/+$`)
+)
+
+// NormalizePageURL returns the canonical form of a page URL. It implements the
+// same rules as the eztest_normalize_url SQL function backing the generated
+// sut_page.normalized_url column, so application-level checks and the database
+// unique index cannot disagree:
+//
+//   - lowercase the scheme and host
+//   - strip default ports (:80 for http, :443 for https)
+//   - keep the path case-sensitive; drop trailing slashes except for root "/"
+//   - keep the fragment (SPA routes live there)
+//   - drop the query string
+//   - preserve the userinfo component
+//
+// Invalid (non absolute http(s)) URLs are rejected before normalization.
+func NormalizePageURL(raw string) (string, error) {
+	if err := validation.URL("url", raw); err != nil {
+		return "", err
+	}
+	trimmed := strings.Trim(raw, " ")
+	matched := pageURLPattern.FindStringSubmatch(trimmed)
+	if matched == nil {
+		return trimmed, nil
+	}
+
+	scheme := strings.ToLower(matched[1])
+	originalAuthority := matched[2]
+	path := matched[3]
+	fragment := matched[4]
+
+	userinfo := ""
+	hostPort := originalAuthority
+	if at := strings.Index(originalAuthority, "@"); at >= 0 {
+		userinfo = originalAuthority[:at+1]
+		hostPort = originalAuthority[at+1:]
+	}
+	host, port := hostPort, ""
+	if hostMatched := pageHostPortPattern.FindStringSubmatch(hostPort); hostMatched != nil {
+		host, port = hostMatched[1], hostMatched[2]
+	}
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	authority := userinfo + strings.ToLower(host)
+	if port != "" {
+		authority += ":" + port
+	}
+
+	if path == "" {
+		path = "/"
+	} else if trimmedPath := pageTrailingSlashes.ReplaceAllString(path, ""); trimmedPath != "" {
+		path = trimmedPath
+	} else {
+		path = "/"
+	}
+
+	return scheme + "://" + authority + path + fragment, nil
 }
 
 // DeriveRouteTemplate returns the URL path used as the route template default.

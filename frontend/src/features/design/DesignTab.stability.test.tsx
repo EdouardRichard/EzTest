@@ -9,6 +9,7 @@ const designApi = vi.hoisted(() => ({
   createDesignConversation: vi.fn(),
   getDesignCase: vi.fn(),
   confirmCases: vi.fn(),
+  confirmStageCases: vi.fn(),
   createExport: vi.fn(),
   downloadExport: vi.fn(),
   listExports: vi.fn(),

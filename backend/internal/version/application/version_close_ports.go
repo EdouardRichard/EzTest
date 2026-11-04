@@ -25,13 +25,26 @@ type VersionWorkItemReader interface {
 	BlockingWorkItems(ctx context.Context, versionID int64) (BlockingWorkItemCounts, error)
 }
 
+// VersionExecutionCoverage is the §5.3 completion projection of one version's
+// confirmed cases. HasExecutionData reports at least one case_run; a version
+// with no execution data has nothing to report. UnconfirmedCases counts current
+// confirmed case versions whose latest run is missing or not terminal
+// (passed/failed/blocked/inconclusive/skipped); an explicitly skipped run
+// counts as executed.
+type VersionExecutionCoverage struct {
+	HasExecutionData bool
+	UnconfirmedCases int
+}
+
 // VersionExecutionReader is the execution-context slice consumed by version
 // close evaluation. Waves in planned/running/paused are active (a paused wave
-// keeps its slot and carries a pending human decision).
+// keeps its slot and carries a pending human decision). ExecutionCoverage
+// supplies the §5.3 execution-data and confirmed-case terminal inputs.
 type VersionExecutionReader interface {
 	CountActiveIntents(ctx context.Context, versionID int64) (int, error)
 	CountActiveWaves(ctx context.Context, versionID int64) (int, error)
 	CountInflightCaseRuns(ctx context.Context, versionID int64) (int, error)
+	ExecutionCoverage(ctx context.Context, versionID int64) (VersionExecutionCoverage, error)
 }
 
 // VersionHumanRequestReader is the execution-context human_request slice

@@ -10,6 +10,7 @@ import type {
   ExportFormat,
   ExportRequest,
   ExportView,
+  StageView,
 } from "./types"
 
 /** Builds `?a=1&b=2`, skipping empty values (P0/P1 pagination style). */
@@ -74,6 +75,18 @@ export function confirmCases(
   input: CaseConfirmationInput,
 ): Promise<CaseConfirmationResult> {
   return apiPost<CaseConfirmationResult>(`${versionPath(versionId)}/design/confirmations`, input)
+}
+
+/**
+ * Applies the 0.2.1 case hard gate for an explicit selection
+ * (`POST /stage/confirm-cases`, spec §5.5/D23): the checked `case_ids` are the
+ * only cases confirmed, and the resulting `execute.batch` job carries exactly
+ * that list. An empty list means "all current draft cases".
+ */
+export function confirmStageCases(versionId: string, caseIds: string[]): Promise<StageView> {
+  return apiPost<StageView>(`${versionPath(versionId)}/stage/confirm-cases`, {
+    case_ids: caseIds,
+  })
 }
 
 /* ---------------------------------- exports --------------------------------- */

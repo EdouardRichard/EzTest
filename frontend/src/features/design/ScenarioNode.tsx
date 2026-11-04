@@ -34,16 +34,18 @@ export function ScenarioNode({ data }: NodeProps) {
       <p className="mt-1 text-[11px] text-muted-foreground">
         SUT {scenario.version_sut_ids.length} 个 · 页面 {scenario.page_ids.length} 个
       </p>
-      <Button
-        size="sm"
-        variant="secondary"
-        className="mt-2 w-full"
-        data-testid={`btn-confirm-scenario-${scenario.id}`}
-        disabled={node.draftCaseCount === 0 || confirming}
-        onClick={() => node.actions.onConfirmScenario(scenario.id)}
-      >
-        {confirming ? "确认中…" : "确认场景"}
-      </Button>
+      {node.actions.caseReviewEnabled === false ? null : (
+        <Button
+          size="sm"
+          variant="secondary"
+          className="mt-2 w-full"
+          data-testid={`btn-confirm-scenario-${scenario.id}`}
+          disabled={node.draftCaseCount === 0 || confirming}
+          onClick={() => node.actions.onConfirmScenario(scenario.id)}
+        >
+          {confirming ? "确认中…" : "确认场景"}
+        </Button>
+      )}
     </div>
   )
 }

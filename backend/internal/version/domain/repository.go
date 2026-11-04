@@ -10,6 +10,9 @@ import (
 var (
 	ErrNotFound  = errors.New("version not found")
 	ErrDuplicate = errors.New("version binding already exists")
+	// ErrStageConflict reports that a stage write lost a race: the persisted
+	// stage is no longer the source stage the caller validated against.
+	ErrStageConflict = errors.New("version stage changed concurrently")
 )
 
 // Summary is the list read model for one version.
@@ -65,6 +68,32 @@ type Repository interface {
 	DatabaseInUse(ctx context.Context, id int64) (bool, error)
 	AccountInUse(ctx context.Context, id int64) (bool, error)
 	RepositoryInUse(ctx context.Context, id int64) (bool, error)
+}
+
+// StageState is the persisted deterministic stage-machine projection of one
+// version (spec §5.3). SuspendedFrom is the workflow stage the version was in
+// when it entered blocked/paused; it is nil unless the version is suspended.
+type StageState struct {
+	VersionID      int64
+	Stage          Stage
+	StageEnteredAt time.Time
+	Blocker        string
+	SuspendedFrom  *Stage
+}
+
+// StageRepository persists the deterministic stage machine state. Only the
+// stage machine writes it: neither the LLM nor event consumers may derive or
+// rewrite a stage.
+type StageRepository interface {
+	// GetStage loads the current stage projection. A missing version yields
+	// ErrNotFound.
+	GetStage(ctx context.Context, versionID int64) (StageState, error)
+
+	// ApplyStage writes one validated stage transition. expected is the stage
+	// the caller validated the transition against; the UPDATE only applies
+	// while version.stage still equals expected, so two concurrent transitions
+	// cannot interleave. A stale expected stage yields ErrStageConflict.
+	ApplyStage(ctx context.Context, expected Stage, next StageState) error
 }
 
 // VersionCloseRepository persists the version close/reopen projection (spec

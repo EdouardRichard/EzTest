@@ -178,8 +178,111 @@ func TestProposeUpdatesNaturalKeyInsteadOfDuplicating(t *testing.T) {
 	}
 }
 
-func TestProposeUpdatesConfirmedCaseAsNewDraft(t *testing.T) {
+// TestCaseModificationCreatesVersion pins the S4 failure: a design
+// conversation modification of an existing case must persist a new immutable
+// case version (revision 2) instead of leaving "before=2 after=2". The proposal
+// addresses the case by its explicit id, exactly like the Host's modification
+// payload.
+func TestCaseModificationCreatesVersion(t *testing.T) {
 	service, repo, _, _ := newGraphFixture(t)
+	first, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
+	if err != nil {
+		t.Fatalf("initial Propose: %v", err)
+	}
+	caseID := first.CaseIDs[0]
+	initialVersionID := first.CaseVersionIDs[0]
+
+	modified := validProposeInput()
+	modified.Cases[0].ID = int64Ptr(caseID)
+	modified.Cases[0].Steps[0].Action = "打开墨栈博客首页"
+	modified.Cases[0].Steps[0].Expected = "首页加载成功"
+	modified.Cases[0].Steps[0].TargetVersionSUTID = int64Ptr(9001)
+	second, err := service.Propose(context.Background(), 1001, modified, 1, 1)
+	if err != nil {
+		t.Fatalf("modification Propose: %v", err)
+	}
+	if len(second.CaseIDs) != 1 || second.CaseIDs[0] != caseID {
+		t.Fatalf("modification changed the logical case id: %+v", second)
+	}
+	if second.CaseVersionIDs[0] == initialVersionID {
+		t.Fatalf("modification reused the old case version %d", initialVersionID)
+	}
+	current := repo.cases[caseID].current
+	if current == nil || current.Revision != 2 {
+		t.Fatalf("current version = %+v, want revision 2", current)
+	}
+	if current.Steps[0].Action != "打开墨栈博客首页" || current.Steps[0].Expected != "首页加载成功" {
+		t.Fatalf("modified step = %+v", current.Steps[0])
+	}
+	if current.Steps[0].TargetVersionSUTID == nil || *current.Steps[0].TargetVersionSUTID != 9001 {
+		t.Fatalf("modified step target = %+v", current.Steps[0].TargetVersionSUTID)
+	}
+	history := repo.versions(caseID)
+	if len(history) != 2 || history[0].Revision != 1 || history[1].Revision != 2 {
+		t.Fatalf("case history = %+v, want revisions 1 then 2", history)
+	}
+}
+
+// TestCasesHaveExpected pins the S4 "withExpected=0" failure: generated and
+// modified cases must carry an observable expected outcome on every step and
+// assertion; an empty expected is rejected instead of being persisted.
+func TestCasesHaveExpected(t *testing.T) {
+	service, _, _, _ := newGraphFixture(t)
+	invalid := []struct {
+		name   string
+		mutate func(*ProposeInput)
+		field  string
+	}{
+		{
+			name:   "empty assertion expected",
+			mutate: func(in *ProposeInput) { in.Cases[0].Assertions[0].Expected = "" },
+			field:  "cases[0].assertions[0].expected",
+		},
+		{
+			name:   "blank assertion expected",
+			mutate: func(in *ProposeInput) { in.Cases[0].Assertions[1].Expected = "   " },
+			field:  "cases[0].assertions[1].expected",
+		},
+		{
+			name:   "empty step expected",
+			mutate: func(in *ProposeInput) { in.Cases[0].Steps[0].Expected = "" },
+			field:  "cases[0].steps[0].expected",
+		},
+	}
+	for _, testCase := range invalid {
+		t.Run(testCase.name, func(t *testing.T) {
+			in := validProposeInput()
+			testCase.mutate(&in)
+			_, err := service.Propose(context.Background(), 1001, in, 1, 1)
+			var apiErr *platform.Error
+			if !errors.As(err, &apiErr) || apiErr.Code != "invalid_argument" {
+				t.Fatalf("err = %v, want invalid_argument", err)
+			}
+			if apiErr.Details["field"] != testCase.field {
+				t.Fatalf("field = %#v, want %q", apiErr.Details["field"], testCase.field)
+			}
+		})
+	}
+
+	// The well-formed proposal still persists with its expected outcomes.
+	result, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
+	if err != nil {
+		t.Fatalf("valid Propose: %v", err)
+	}
+	if len(result.CaseVersionIDs) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+// TestConfirmedCaseVersionIsFrozen pins the Task 106 / PO E2E F4 rule: once a
+// case version is confirmed it is frozen. The design AI kept revising the same
+// logical cases after confirmation (v1..v5); each revision silently replaced
+// the confirmed current version with a draft, so 6 of the 12 batch-A cases were
+// superseded at dispatch and never ran. A changed proposal against a confirmed
+// current version must be a typed conflict that names the explicit redesign
+// path instead of inserting a silent replacement draft.
+func TestConfirmedCaseVersionIsFrozen(t *testing.T) {
+	service, repo, publisher, audit := newGraphFixture(t)
 	first, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
 	if err != nil {
 		t.Fatalf("first Propose: %v", err)
@@ -193,28 +296,48 @@ func TestProposeUpdatesConfirmedCaseAsNewDraft(t *testing.T) {
 			item.versions[index].Status = design.CaseStatusConfirmed
 		}
 	}
+	eventCount := len(publisher.events)
+	auditCount := len(audit.events)
 
 	updated := validProposeInput()
 	updated.Cases[0].Steps[0].Expected = "显示登录表单"
-	second, err := service.Propose(context.Background(), 1001, updated, 1, 1)
-	if err != nil {
-		t.Fatalf("second Propose: %v", err)
+	_, err = service.Propose(context.Background(), 1001, updated, 1, 1)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "confirmed_case_version_frozen" {
+		t.Fatalf("changed proposal against a confirmed version = %v, want confirmed_case_version_frozen", err)
 	}
-	if second.CaseVersionIDs[0] == first.CaseVersionIDs[0] {
-		t.Fatal("new draft revision reused the confirmed version id")
+	if apiErr.Status != 409 {
+		t.Fatalf("status = %d, want 409", apiErr.Status)
 	}
-	if repo.cases[first.CaseIDs[0]].entity.Status != design.CaseStatusDraft {
-		t.Fatalf("entity status = %q, want draft", repo.cases[first.CaseIDs[0]].entity.Status)
+	if apiErr.Details["case_id"] == "" || apiErr.Details["case_version_id"] == "" || apiErr.Details["next_action"] == "" {
+		t.Fatalf("error details = %#v, want case/version/next_action", apiErr.Details)
 	}
+
 	history := repo.versions(first.CaseIDs[0])
-	if len(history) != 2 {
-		t.Fatalf("history = %d versions", len(history))
+	if len(history) != 1 || history[0].ID != first.CaseVersionIDs[0] ||
+		history[0].Status != design.CaseStatusConfirmed {
+		t.Fatalf("confirmed history changed: %+v", history)
 	}
-	if history[0].Status != design.CaseStatusConfirmed {
-		t.Fatalf("old version status = %q, want confirmed", history[0].Status)
+	entity := repo.cases[first.CaseIDs[0]]
+	if entity.entity.Status != design.CaseStatusConfirmed || entity.current == nil ||
+		entity.current.ID != first.CaseVersionIDs[0] || entity.current.Revision != 1 {
+		t.Fatalf("confirmed current version replaced: entity=%q current=%+v", entity.entity.Status, entity.current)
 	}
-	if history[1].Status != design.CaseStatusDraft || history[1].Revision != 2 {
-		t.Fatalf("new version = %+v", history[1])
+	if len(publisher.events) != eventCount || len(audit.events) != auditCount {
+		t.Fatalf("frozen rejection published %v / audited %v", publisher.types()[eventCount:], audit.events[auditCount:])
+	}
+
+	// An identical proposal stays an idempotent no-op: it never inserts a new
+	// version and never fails the design AI's repeated graph pass.
+	same, err := service.Propose(context.Background(), 1001, validProposeInput(), 1, 1)
+	if err != nil {
+		t.Fatalf("identical proposal against a confirmed version: %v", err)
+	}
+	if same.CaseVersionIDs[0] != first.CaseVersionIDs[0] {
+		t.Fatalf("identical proposal moved the confirmed current version: %+v", same)
+	}
+	if got := len(repo.versions(first.CaseIDs[0])); got != 1 {
+		t.Fatalf("history versions = %d, want 1", got)
 	}
 }
 
@@ -383,6 +506,212 @@ func TestProposeMapsRepositoryNotFound(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
 		t.Fatalf("err = %v, want not_found", err)
 	}
+}
+
+// fakeCaseRunStatuses emulates the execution read model consumed by the design
+// graph: it returns the newest run per queried case version and records every
+// call so the test can prove the lookup is batched (no N+1 per case).
+type fakeCaseRunStatuses struct {
+	runs  map[int64][]fakeCaseRun
+	calls []fakeCaseRunCall
+	err   error
+}
+
+type fakeCaseRun struct {
+	ID     int64
+	Status string
+}
+
+type fakeCaseRunCall struct {
+	versionID      int64
+	caseVersionIDs []int64
+}
+
+func (f *fakeCaseRunStatuses) LatestCaseRunStatuses(_ context.Context, versionID int64, caseVersionIDs []int64) (map[int64]string, error) {
+	f.calls = append(f.calls, fakeCaseRunCall{
+		versionID:      versionID,
+		caseVersionIDs: append([]int64(nil), caseVersionIDs...),
+	})
+	if f.err != nil {
+		return nil, f.err
+	}
+	latest := make(map[int64]string, len(caseVersionIDs))
+	for _, caseVersionID := range caseVersionIDs {
+		var newest fakeCaseRun
+		found := false
+		for _, run := range f.runs[caseVersionID] {
+			if !found || run.ID > newest.ID {
+				newest = run
+				found = true
+			}
+		}
+		if found {
+			latest[caseVersionID] = newest.Status
+		}
+	}
+	return latest, nil
+}
+
+// seedVerdictCases prepares one scenario with four current case versions:
+// multiple runs, one blocked run, one skipped run and one never-executed case.
+func seedVerdictCases(repo *fakeRepo) {
+	repo.scenarios = []design.Scenario{{
+		ID: 5001, VersionID: 1001, RequirementID: 3001, RequirementVersionID: 3002,
+		Name: "正常登录",
+	}}
+	seed := []struct {
+		caseID        int64
+		caseVersionID int64
+		title         string
+		status        string
+	}{
+		{caseID: 7001, caseVersionID: 7002, title: "登录成功", status: design.CaseStatusDraft},
+		{caseID: 7003, caseVersionID: 7004, title: "登录失败", status: design.CaseStatusConfirmed},
+		{caseID: 7005, caseVersionID: 7006, title: "被跳过的用例", status: design.CaseStatusConfirmed},
+		{caseID: 7009, caseVersionID: 7010, title: "未执行用例", status: design.CaseStatusStale},
+	}
+	for _, item := range seed {
+		current := design.CaseVersion{
+			ID: item.caseVersionID, CaseID: item.caseID, Revision: 1,
+			Title: item.title, Status: item.status,
+			ContentHash: fmt.Sprintf("hash-%d", item.caseVersionID),
+		}
+		repo.cases[item.caseID] = &fakeCase{
+			entity: design.CaseEntity{
+				ID: item.caseID, ScenarioID: 5001,
+				CurrentVersionID: int64Ptr(item.caseVersionID), Status: item.status,
+			},
+			current: &current,
+		}
+	}
+}
+
+func newVerdictGraphFixture(t *testing.T, reader CaseRunStatusReader) *GraphService {
+	t.Helper()
+	service, repo, _, _ := newGraphFixture(t)
+	seedVerdictCases(repo)
+	if reader != nil {
+		service.SetCaseRunStatusReader(reader)
+	}
+	return service
+}
+
+func verdictsByCaseID(view GraphView) map[int64]string {
+	verdicts := make(map[int64]string)
+	for _, requirement := range view.Requirements {
+		for _, scenario := range requirement.Scenarios {
+			for _, card := range scenario.Cases {
+				verdicts[card.CaseID] = card.ExecutionVerdict
+			}
+		}
+	}
+	return verdicts
+}
+
+func TestDesignGraphCarriesLatestVerdict(t *testing.T) {
+	t.Run("latest run wins over an older run", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{runs: map[int64][]fakeCaseRun{
+			// The higher-ID run is the latest; its verdict must win.
+			7002: {{ID: 1, Status: "passed"}, {ID: 3, Status: "failed"}},
+			7004: {{ID: 2, Status: "blocked"}},
+		}}
+		service := newVerdictGraphFixture(t, runs)
+
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		verdicts := verdictsByCaseID(view)
+		if verdicts[7001] != string(design.CaseRunVerdictFailed) {
+			t.Fatalf("case 7001 verdict = %q, want failed (latest run)", verdicts[7001])
+		}
+		if verdicts[7003] != string(design.CaseRunVerdictBlocked) {
+			t.Fatalf("case 7003 verdict = %q, want blocked", verdicts[7003])
+		}
+	})
+
+	t.Run("no execution yields inconclusive", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, &fakeCaseRunStatuses{})
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		verdicts := verdictsByCaseID(view)
+		if len(verdicts) != 4 {
+			t.Fatalf("case verdicts = %+v", verdicts)
+		}
+		for caseID, verdict := range verdicts {
+			if verdict != string(design.CaseRunVerdictInconclusive) {
+				t.Fatalf("case %d verdict = %q, want inconclusive", caseID, verdict)
+			}
+		}
+	})
+
+	t.Run("process states and skipped runs are not verdicts", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{runs: map[int64][]fakeCaseRun{
+			7006: {{ID: 4, Status: "skipped"}},
+		}}
+		service := newVerdictGraphFixture(t, runs)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		if verdicts := verdictsByCaseID(view); verdicts[7005] != string(design.CaseRunVerdictInconclusive) {
+			t.Fatalf("skipped run verdict = %q, want inconclusive", verdicts[7005])
+		}
+	})
+
+	t.Run("one batched lookup over the graph's current case versions", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{runs: map[int64][]fakeCaseRun{
+			// A deleted/other-version case version must never be queried.
+			9999: {{ID: 5, Status: "passed"}},
+		}}
+		service := newVerdictGraphFixture(t, runs)
+		if _, err := service.ReadGraph(context.Background(), 1001); err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		if len(runs.calls) != 1 {
+			t.Fatalf("verdict lookups = %d, want 1 batch", len(runs.calls))
+		}
+		call := runs.calls[0]
+		if call.versionID != 1001 {
+			t.Fatalf("lookup version = %d, want 1001", call.versionID)
+		}
+		want := []int64{7002, 7004, 7006, 7010}
+		if len(call.caseVersionIDs) != len(want) {
+			t.Fatalf("lookup case versions = %v, want %v", call.caseVersionIDs, want)
+		}
+		for index, caseVersionID := range want {
+			if call.caseVersionIDs[index] != caseVersionID {
+				t.Fatalf("lookup case versions = %v, want %v", call.caseVersionIDs, want)
+			}
+		}
+	})
+
+	t.Run("reader failure keeps the graph readable", func(t *testing.T) {
+		runs := &fakeCaseRunStatuses{err: errors.New("execution read unavailable")}
+		service := newVerdictGraphFixture(t, runs)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph must not fail on an execution projection error: %v", err)
+		}
+		for caseID, verdict := range verdictsByCaseID(view) {
+			if verdict != string(design.CaseRunVerdictInconclusive) {
+				t.Fatalf("case %d verdict = %q, want inconclusive", caseID, verdict)
+			}
+		}
+	})
+
+	t.Run("an unwired reader still reports inconclusive", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, nil)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		if verdicts := verdictsByCaseID(view); verdicts[7001] != string(design.CaseRunVerdictInconclusive) {
+			t.Fatalf("unwired verdict = %q, want inconclusive", verdicts[7001])
+		}
+	})
 }
 
 var _ = time.Now

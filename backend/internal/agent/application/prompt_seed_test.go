@@ -92,8 +92,8 @@ func TestEnsurePromptRevisionsWithoutRepository(t *testing.T) {
 
 func TestDefaultPromptMatchesSeedProfiles(t *testing.T) {
 	seeds := agentapp.ProfileSeeds()
-	if len(seeds) != 14 {
-		t.Fatalf("ProfileSeeds = %d, want 14", len(seeds))
+	if len(seeds) != 15 {
+		t.Fatalf("ProfileSeeds = %d, want 15 (14 frozen P1-P4 + the P7 knowledge_curator profile)", len(seeds))
 	}
 	for _, profile := range seeds {
 		got, ok := agentapp.DefaultPrompt(profile.Key)

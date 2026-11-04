@@ -173,10 +173,12 @@ func (r *Runner) recordKnowledgeUsage(ctx context.Context, state *runState) {
 }
 
 // packetHasKnowledge reports whether the persisted context packet actually
-// carries the knowledge section (compaction may have dropped it).
+// carries the injected knowledge block. The cache-first packet stores the
+// rendered knowledge inside its pinned facts segment; a failed retrieval
+// injects nothing, so no section carries the block.
 func packetHasKnowledge(packet ContextPacket) bool {
 	for _, section := range packet.Sections {
-		if section.Name == knowledgeSectionName {
+		if strings.Contains(section.Content, "知识:") && strings.Contains(section.Content, "[K-") {
 			return true
 		}
 	}

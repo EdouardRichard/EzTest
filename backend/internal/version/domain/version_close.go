@@ -42,6 +42,13 @@ const (
 
 // ClosePredicate is the server-side truth of one version close evaluation. A
 // version may complete only when every field is true (spec §7.3).
+//
+// HasExecutionData and UnconfirmedCases are the §5.3 completion inputs. The
+// Steward version.close_read contract is frozen at eight checks, so they are
+// folded into VersionReportPublished (a report without execution data is not a
+// valid completion report) and NoInflightCaseRuns (a confirmed case that was
+// never executed or explicitly skipped is still pending work). They are kept
+// as fields so callers can inspect the raw execution projection.
 type ClosePredicate struct {
 	Running                bool
 	NoBlockingWorkItems    bool
@@ -51,13 +58,16 @@ type ClosePredicate struct {
 	NoInflightCaseRuns     bool
 	RequirementsClosed     bool
 	VersionReportPublished bool
+	HasExecutionData       bool
+	UnconfirmedCases       int
 }
 
 // Passed reports whether every close condition is green.
 func (p ClosePredicate) Passed() bool {
 	return p.Running && p.NoBlockingWorkItems && p.NoActiveIntents &&
 		p.NoOpenHumanRequests && p.NoActiveWaves && p.NoInflightCaseRuns &&
-		p.RequirementsClosed && p.VersionReportPublished
+		p.RequirementsClosed && p.VersionReportPublished &&
+		p.HasExecutionData && p.UnconfirmedCases <= 0
 }
 
 // ReportStatus is the version-context projection of the latest kind='version'
@@ -103,11 +113,23 @@ type VersionCloseInput struct {
 	OpenHumanRequests int
 	ActiveWaves       int
 	InflightCaseRuns  int
-	Requirements      []Requirement
-	Report            ReportStatus
+	// HasExecutionData reports that the version has at least one case_run; a
+	// version with no execution data has nothing to report or close with
+	// (spec §5.3).
+	HasExecutionData bool
+	// UnconfirmedCases counts current confirmed case versions whose latest run
+	// is missing or not terminal (passed/failed/blocked/inconclusive/skipped).
+	// An explicit skipped run counts as executed. Only confirmed cases count:
+	// unconfirmed drafts are the partial-confirmation path (D23).
+	UnconfirmedCases int
+	Requirements     []Requirement
+	Report           ReportStatus
 }
 
-// EvaluateVersionClose recomputes the eight close conditions (spec §7.3).
+// EvaluateVersionClose recomputes the eight close conditions (spec §7.3). The
+// §5.3 execution inputs are folded into the frozen eight check fields so the
+// Steward contract stays stable: missing execution data fails the report check,
+// unexecuted confirmed cases fail the in-flight cases check.
 func EvaluateVersionClose(in VersionCloseInput) ClosePredicate {
 	requirementsClosed, _ := versionRequirementsClosed(in.Requirements)
 	return ClosePredicate{
@@ -116,9 +138,11 @@ func EvaluateVersionClose(in VersionCloseInput) ClosePredicate {
 		NoActiveIntents:        in.ActiveIntents <= 0,
 		NoOpenHumanRequests:    in.OpenHumanRequests <= 0,
 		NoActiveWaves:          in.ActiveWaves <= 0,
-		NoInflightCaseRuns:     in.InflightCaseRuns <= 0,
+		NoInflightCaseRuns:     in.InflightCaseRuns <= 0 && in.UnconfirmedCases <= 0,
 		RequirementsClosed:     requirementsClosed,
-		VersionReportPublished: VersionReportCurrent(in.Report),
+		VersionReportPublished: VersionReportCurrent(in.Report) && in.HasExecutionData,
+		HasExecutionData:       in.HasExecutionData,
+		UnconfirmedCases:       in.UnconfirmedCases,
 	}
 }
 
@@ -142,13 +166,13 @@ func VersionCloseFailureCounts(in VersionCloseInput) map[string]int {
 	if in.ActiveWaves > 0 {
 		failed[VersionCloseCheckNoActiveWaves] = in.ActiveWaves
 	}
-	if in.InflightCaseRuns > 0 {
-		failed[VersionCloseCheckNoInflightCaseRuns] = in.InflightCaseRuns
+	if in.InflightCaseRuns > 0 || in.UnconfirmedCases > 0 {
+		failed[VersionCloseCheckNoInflightCaseRuns] = in.InflightCaseRuns + in.UnconfirmedCases
 	}
 	if _, open := versionRequirementsClosed(in.Requirements); open > 0 {
 		failed[VersionCloseCheckRequirementsClosed] = open
 	}
-	if !VersionReportCurrent(in.Report) {
+	if !VersionReportCurrent(in.Report) || !in.HasExecutionData {
 		failed[VersionCloseCheckVersionReportPublished] = 1
 	}
 	return failed
@@ -178,6 +202,8 @@ func VersionCloseFingerprint(in VersionCloseInput) string {
 		OpenHumanRequests int                         `json:"open_human_requests"`
 		ActiveWaves       int                         `json:"active_waves"`
 		InflightCaseRuns  int                         `json:"inflight_case_runs"`
+		HasExecutionData  bool                        `json:"has_execution_data"`
+		UnconfirmedCases  int                         `json:"unconfirmed_cases"`
 	}{
 		VersionID:         in.Version.ID,
 		VersionStatus:     in.Version.Status,
@@ -190,6 +216,8 @@ func VersionCloseFingerprint(in VersionCloseInput) string {
 		OpenHumanRequests: in.OpenHumanRequests,
 		ActiveWaves:       in.ActiveWaves,
 		InflightCaseRuns:  in.InflightCaseRuns,
+		HasExecutionData:  in.HasExecutionData,
+		UnconfirmedCases:  in.UnconfirmedCases,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {

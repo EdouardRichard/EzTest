@@ -61,6 +61,55 @@ func TestMessagePartJSONShapes(t *testing.T) {
 	}
 }
 
+// TestJobCardFailureReasonJSONShape covers Task 75: a terminal failed job card
+// persists the typed failure code and the user-facing reason, and both survive
+// the JSON round trip so the stored part, its streaming row and the SSE frame
+// all carry the explanation instead of only "failed".
+func TestJobCardFailureReasonJSONShape(t *testing.T) {
+	part := version.MessagePart{
+		Type: "job_card", JobID: 9001, JobKind: "chat.turn", Status: "failed",
+		Code:   "llm_capability_mismatch",
+		Reason: `llm model "text-only" does not support images; choose a model with vision`,
+	}
+	raw, err := json.Marshal(part)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload["code"] != "llm_capability_mismatch" {
+		t.Fatalf("code = %#v, want the typed failure code (%s)", payload["code"], raw)
+	}
+	if reason, _ := payload["reason"].(string); !strings.Contains(reason, "does not support images") {
+		t.Fatalf("reason = %#v, want the failure message (%s)", payload["reason"], raw)
+	}
+	var roundTripped version.MessagePart
+	if err := json.Unmarshal(raw, &roundTripped); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if roundTripped.Code != part.Code || roundTripped.Reason != part.Reason {
+		t.Fatalf("round trip = %#v, want the failure code/reason", roundTripped)
+	}
+	if err := version.ValidateJobCardMessage(part); err != nil {
+		t.Fatalf("failed card with a reason rejected: %v", err)
+	}
+	// A running/done card without a failure reason keeps the optional fields
+	// empty and stays valid.
+	ok := version.MessagePart{Type: "job_card", JobID: 9001, JobKind: "chat.turn", Status: "running"}
+	raw, err = json.Marshal(ok)
+	if err != nil {
+		t.Fatalf("marshal without reason: %v", err)
+	}
+	if strings.Contains(string(raw), `"reason"`) || strings.Contains(string(raw), `"code"`) {
+		t.Fatalf("a card without a failure exposes empty failure fields: %s", raw)
+	}
+	if err := version.ValidateJobCardMessage(ok); err != nil {
+		t.Fatalf("card without a reason rejected: %v", err)
+	}
+}
+
 func TestValidateUserMessageParts(t *testing.T) {
 	valid := []version.MessagePart{
 		{Type: "text", Text: "Find the coupon rules"},
@@ -87,6 +136,66 @@ func TestValidateUserMessageParts(t *testing.T) {
 		{"blank name", []version.MessagePart{{Type: "attachment", SHA256: strings.Repeat("b", 64), MIME: "text/markdown", Size: 1}}, "parts[0].name"},
 		{"zero size", []version.MessagePart{{Type: "attachment", SHA256: strings.Repeat("b", 64), Name: "a.md", MIME: "text/markdown"}}, "parts[0].size"},
 		{"too many attachments", tooMany, "parts"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := version.ValidateUserMessageParts(tc.parts)
+			if err == nil {
+				t.Fatal("invalid parts accepted")
+			}
+			if field := requirementAPIField(t, err); field != tc.wantField {
+				t.Fatalf("field = %q, want %q", field, tc.wantField)
+			}
+		})
+	}
+}
+
+func TestUserMessageCaseCardParts(t *testing.T) {
+	validCaseCard := version.MessagePart{
+		Type: "case_card", CaseID: 7001, CaseVersionID: 9001,
+		Title: "Coupon applies at checkout", Status: "confirmed",
+	}
+	valid := []version.MessagePart{{Type: "text", Text: "请修改这条用例"}, validCaseCard}
+	if err := version.ValidateUserMessageParts(valid); err != nil {
+		t.Fatalf("valid user case_card rejected: %v", err)
+	}
+	// case_version_id is optional and every case_card status is accepted.
+	for _, status := range []string{"draft", "confirmed", "stale", "superseded"} {
+		part := validCaseCard
+		part.CaseVersionID = 0
+		part.Status = status
+		if err := version.ValidateUserMessageParts([]version.MessagePart{part}); err != nil {
+			t.Fatalf("status %q rejected: %v", status, err)
+		}
+	}
+	// The assistant path keeps accepting the same part unchanged.
+	if err := version.ValidateAssistantMessageParts([]version.MessagePart{validCaseCard}); err != nil {
+		t.Fatalf("assistant case_card rejected: %v", err)
+	}
+
+	// Existing text/attachment/image user-part behavior is unchanged.
+	image := version.MessagePart{Type: "image", MIME: "image/png", DataRef: strings.Repeat("c", 64), Width: 800, Height: 600}
+	if err := version.ValidateUserMessageParts([]version.MessagePart{{Type: "text", Text: "screens"}, image}); err != nil {
+		t.Fatalf("valid image user part rejected: %v", err)
+	}
+	if err := version.ValidateUserMessageParts([]version.MessagePart{{Type: "image", MIME: "text/plain", DataRef: strings.Repeat("c", 64), Width: 1, Height: 1}}); err == nil {
+		t.Fatal("non-image MIME accepted")
+	}
+
+	cases := []struct {
+		name      string
+		parts     []version.MessagePart
+		wantField string
+	}{
+		{"zero case id", []version.MessagePart{{Type: "case_card", Title: "T", Status: "draft"}}, "parts[0].case_id"},
+		{"negative case id", []version.MessagePart{{Type: "case_card", CaseID: -1, Title: "T", Status: "draft"}}, "parts[0].case_id"},
+		{"negative case version id", []version.MessagePart{{Type: "case_card", CaseID: 7001, CaseVersionID: -1, Title: "T", Status: "draft"}}, "parts[0].case_version_id"},
+		{"blank title", []version.MessagePart{{Type: "case_card", CaseID: 7001, Title: "  ", Status: "draft"}}, "parts[0].title"},
+		{"long title", []version.MessagePart{{Type: "case_card", CaseID: 7001, Title: strings.Repeat("a", version.CaseCardTitleMax+1), Status: "draft"}}, "parts[0].title"},
+		{"bad status", []version.MessagePart{{Type: "case_card", CaseID: 7001, Title: "T", Status: "queued"}}, "parts[0].status"},
+		// Assistant-only cards stay out of user messages.
+		{"requirement card", []version.MessagePart{{Type: "requirement_card", RequirementID: 1, Title: "T", Status: "draft", Revision: 1}}, "parts[0].type"},
+		{"rollback proposal", []version.MessagePart{{Type: "rollback_proposal", RequirementID: 1, Reason: "x"}}, "parts[0].type"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

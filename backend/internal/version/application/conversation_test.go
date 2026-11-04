@@ -2,9 +2,12 @@ package versionapp_test
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,16 +22,26 @@ import (
 type fakeConversationRepo struct {
 	conversations       map[int64]version.Conversation
 	messages            map[int64][]version.Message
+	messageParts        map[int64][]version.ConversationMessagePart
 	summaries           map[int64][]version.ConversationSummary
 	forceExisting       *version.Message
 	reconcilable        []version.ReconcilerConversation
 	lastReconcilerLimit int
+	// jobCardUpdateErr models a concurrent writer winning between the card
+	// lookup and the row-locked rewrite: the PostgreSQL update re-checks the
+	// stored status under FOR UPDATE and the fake returns this error instead of
+	// writing.
+	jobCardUpdateErr error
+	// jobCardFindOverride makes the next FindJobCardMessage return a stale
+	// snapshot, modelling a cancel that commits right after the lookup.
+	jobCardFindOverride *version.Message
 }
 
 func newFakeConversationRepo() *fakeConversationRepo {
 	return &fakeConversationRepo{
 		conversations: map[int64]version.Conversation{},
 		messages:      map[int64][]version.Message{},
+		messageParts:  map[int64][]version.ConversationMessagePart{},
 		summaries:     map[int64][]version.ConversationSummary{},
 	}
 }
@@ -36,6 +49,17 @@ func newFakeConversationRepo() *fakeConversationRepo {
 func (f *fakeConversationRepo) Create(_ context.Context, conversation version.Conversation) error {
 	f.conversations[conversation.ID] = conversation
 	return nil
+}
+
+func (f *fakeConversationRepo) UpdateModelOverride(_ context.Context, versionID, conversationID int64, modelOverride *string, updatedAt time.Time) (version.Conversation, error) {
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return version.Conversation{}, version.ErrConversationNotFound
+	}
+	conversation.ModelOverride = modelOverride
+	conversation.UpdatedAt = updatedAt
+	f.conversations[conversationID] = conversation
+	return conversation, nil
 }
 
 func (f *fakeConversationRepo) Get(_ context.Context, versionID, conversationID int64) (version.Conversation, *version.ConversationSummary, error) {
@@ -99,6 +123,26 @@ func (f *fakeConversationRepo) Messages(_ context.Context, conversationID int64,
 	return items, nil
 }
 
+func (f *fakeConversationRepo) MessageParts(_ context.Context, versionID, conversationID, messageID int64) ([]version.ConversationMessagePart, error) {
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return nil, version.ErrConversationNotFound
+	}
+	found := false
+	for _, message := range f.messages[conversationID] {
+		if message.ID == messageID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, version.ErrMessageNotFound
+	}
+	parts := append([]version.ConversationMessagePart(nil), f.messageParts[messageID]...)
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Seq < parts[j].Seq })
+	return parts, nil
+}
+
 func (f *fakeConversationRepo) PostUserMessage(_ context.Context, conversationID int64, message version.Message) (*version.Message, bool, error) {
 	if f.forceExisting != nil {
 		return f.forceExisting, false, nil
@@ -124,7 +168,27 @@ func (f *fakeConversationRepo) AppendAssistantMessage(_ context.Context, convers
 	if _, ok := f.conversations[conversationID]; !ok {
 		return version.ErrConversationNotFound
 	}
+	// Mirror the DB constraints the writer relies on: one part_type from the
+	// conversation_message_part enum and a unique (message_id, seq) per message,
+	// validated before anything is stored so a conflict leaves no head and no
+	// part row behind (transaction semantics).
+	seen := make(map[int]struct{}, len(message.StreamParts))
+	for _, part := range message.StreamParts {
+		if !version.IsStreamingMessagePartType(part.Type) {
+			return errors.New("fake: stream part type outside the conversation_message_part enum")
+		}
+		if part.Seq <= 0 {
+			return errors.New("fake: stream part seq must be positive")
+		}
+		if _, duplicate := seen[part.Seq]; duplicate {
+			return errors.New("fake: duplicate (message_id, seq)")
+		}
+		seen[part.Seq] = struct{}{}
+	}
 	f.messages[conversationID] = append(f.messages[conversationID], message)
+	if len(message.StreamParts) > 0 {
+		f.messageParts[message.ID] = append([]version.ConversationMessagePart(nil), message.StreamParts...)
+	}
 	conversation := f.conversations[conversationID]
 	conversation.MessageCount = len(f.messages[conversationID])
 	conversation.LastMessageAt = &message.CreatedAt
@@ -135,6 +199,113 @@ func (f *fakeConversationRepo) AppendAssistantMessage(_ context.Context, convers
 
 func (f *fakeConversationRepo) Summary(_ context.Context, conversationID int64) (*version.ConversationSummary, error) {
 	return f.latestSummary(conversationID), nil
+}
+
+// FindJobCardMessage mirrors the version writer's one-card-per-job lookup: the
+// newest assistant message whose parts carry a job_card for jobID.
+func (f *fakeConversationRepo) FindJobCardMessage(_ context.Context, versionID, conversationID, jobID int64) (*version.Message, error) {
+	if f.jobCardFindOverride != nil {
+		stale := *f.jobCardFindOverride
+		stale.Parts = append([]version.MessagePart(nil), f.jobCardFindOverride.Parts...)
+		f.jobCardFindOverride = nil
+		return &stale, nil
+	}
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return nil, version.ErrMessageNotFound
+	}
+	messages := f.messages[conversationID]
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		if message.Role != version.MessageRoleAssistant {
+			continue
+		}
+		for _, part := range message.Parts {
+			if part.Type == version.MessagePartJobCard && part.JobID == jobID {
+				copied := message
+				copied.Parts = append([]version.MessagePart(nil), message.Parts...)
+				return &copied, nil
+			}
+		}
+	}
+	return nil, version.ErrMessageNotFound
+}
+
+// UpdateJobCardMessage mirrors the writer's in-place card rewrite: the message
+// snapshot part and its conversation_message_part payload change, while the
+// message/row identity (id, seq, created_at) stays untouched. A cancelled card
+// is sticky, like the PostgreSQL row-locked update.
+func (f *fakeConversationRepo) UpdateJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return f.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, false)
+}
+
+// ReopenJobCardMessage is the explicit retry reopen: the one rewrite allowed to
+// replace a cancelled card.
+func (f *fakeConversationRepo) ReopenJobCardMessage(ctx context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart) error {
+	return f.updateJobCardMessage(ctx, versionID, conversationID, messageID, jobID, part, true)
+}
+
+func (f *fakeConversationRepo) updateJobCardMessage(_ context.Context, versionID, conversationID, messageID, jobID int64, part version.MessagePart, allowCancelled bool) error {
+	if f.jobCardUpdateErr != nil {
+		return f.jobCardUpdateErr
+	}
+	conversation, ok := f.conversations[conversationID]
+	if !ok || conversation.VersionID != versionID {
+		return version.ErrMessageNotFound
+	}
+	for index := range f.messages[conversationID] {
+		message := &f.messages[conversationID][index]
+		if message.ID != messageID || message.Role != version.MessageRoleAssistant {
+			continue
+		}
+		replaced := false
+		for partIndex := range message.Parts {
+			if message.Parts[partIndex].Type == version.MessagePartJobCard && message.Parts[partIndex].JobID == jobID {
+				if !allowCancelled && !version.JobCardRewriteAllowed(message.Parts[partIndex].Status, part.Status) {
+					return version.ErrJobCardCancelled
+				}
+				message.Parts[partIndex] = part
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			return version.ErrMessageNotFound
+		}
+		rows := f.messageParts[messageID]
+		for rowIndex := range rows {
+			if rows[rowIndex].Type != version.MessagePartJobCard {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(rows[rowIndex].Payload, &payload); err != nil {
+				return err
+			}
+			var rowJobID int64
+			switch typed := payload["job_id"].(type) {
+			case string:
+				parsed, err := strconv.ParseInt(typed, 10, 64)
+				if err != nil {
+					return err
+				}
+				rowJobID = parsed
+			case float64:
+				rowJobID = int64(typed)
+			}
+			if rowJobID != jobID {
+				continue
+			}
+			encoded, err := json.Marshal(part)
+			if err != nil {
+				return err
+			}
+			rows[rowIndex].Payload = encoded
+			f.messageParts[messageID] = rows
+			return nil
+		}
+		return nil
+	}
+	return version.ErrMessageNotFound
 }
 
 func (f *fakeConversationRepo) ListReconcilable(_ context.Context, limit int) ([]version.ReconcilerConversation, error) {
@@ -177,28 +348,47 @@ func (f *fakeQueue) find(taskType, dedupeKey string) (versionapp.TaskInput, bool
 }
 
 type registrarCall struct {
-	versionID int64
-	messageID int64
-	part      version.MessagePart
-	actorID   int64
+	versionID      int64
+	conversationID int64
+	messageID      int64
+	parts          []version.MessagePart
+	attachmentIDs  []int64
+	actorID        int64
 }
 
 type fakeRegistrar struct {
-	calls []registrarCall
-	err   error
-	id    int64
+	prepares []registrarCall
+	links    []registrarCall
+	err      error
+	id       int64
 }
 
-func (f *fakeRegistrar) RegisterFromMessage(_ context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (versionapp.AttachmentView, error) {
-	f.calls = append(f.calls, registrarCall{versionID: versionID, messageID: messageID, part: part, actorID: actorID})
+// PrepareUserMessageParts is the conversion/pre-registration hook: the fake
+// keeps the parts unchanged and hands back one attachment row for each
+// attachment part so conversation tests stay focused on message persistence.
+func (f *fakeRegistrar) PrepareUserMessageParts(_ context.Context, versionID, conversationID int64, parts []version.MessagePart, actorID int64) ([]version.MessagePart, []int64, error) {
 	if f.err != nil {
-		return versionapp.AttachmentView{}, f.err
+		return nil, nil, f.err
 	}
-	f.id++
-	return versionapp.AttachmentView{
-		ID: f.id, Name: part.Name, MIME: part.MIME, Size: part.Size,
-		ExtractionStatus: version.AttachmentPending, CreatedAt: testTime,
-	}, nil
+	ids := make([]int64, 0)
+	for _, part := range parts {
+		if part.Type != version.MessagePartAttachment {
+			continue
+		}
+		f.id++
+		ids = append(ids, f.id)
+	}
+	f.prepares = append(f.prepares, registrarCall{
+		versionID: versionID, conversationID: conversationID, parts: parts, actorID: actorID,
+	})
+	return parts, ids, nil
+}
+
+func (f *fakeRegistrar) LinkFromMessage(_ context.Context, versionID, messageID int64, attachmentIDs []int64) error {
+	f.links = append(f.links, registrarCall{
+		versionID: versionID, messageID: messageID, attachmentIDs: attachmentIDs,
+	})
+	return nil
 }
 
 // ---------- conversation test environment ----------
@@ -346,6 +536,60 @@ func TestCreateDesignConversationAllowsDesignAndEnqueuesDesignTeam(t *testing.T)
 	}
 }
 
+// fakeDesignRequirements counts the version's clarified requirements.
+type fakeDesignRequirements struct {
+	count     int
+	err       error
+	calls     int
+	versionID int64
+}
+
+func (f *fakeDesignRequirements) CountClarifiedRequirements(_ context.Context, versionID int64) (int, error) {
+	f.calls++
+	f.versionID = versionID
+	return f.count, f.err
+}
+
+// TestDesignRequiresClarified pins the product-owner gate finding: a design
+// conversation must not be created (burning AI work) when the version has no
+// clarified requirement; the failure is a typed conflict the UI can explain.
+func TestDesignRequiresClarified(t *testing.T) {
+	env := newConversationEnv(t)
+	counter := &fakeDesignRequirements{count: 0}
+	env.svc.SetClarifiedRequirementCounter(counter)
+
+	_, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || apiErr.Code != "design_requirements_missing" {
+		t.Fatalf("design create err = %v, want 409 design_requirements_missing", err)
+	}
+	if next, _ := apiErr.Details["next_action"].(string); next == "" {
+		t.Fatalf("design_requirements_missing details = %#v, want next_action guidance", apiErr.Details)
+	}
+	if counter.calls != 1 || counter.versionID != env.versionID {
+		t.Fatalf("counter calls = %d version = %d", counter.calls, counter.versionID)
+	}
+	if len(env.repo.conversations) != 0 || len(env.queue.tasks) != 0 {
+		t.Fatalf("blocked design conversation created side effects: conversations=%d tasks=%d",
+			len(env.repo.conversations), len(env.queue.tasks))
+	}
+
+	// Clarification conversations are unaffected: requirements are clarified there.
+	if _, err := env.svc.Create(requestContext(), env.versionID, "clarification", "", 42); err != nil {
+		t.Fatalf("clarification create: %v", err)
+	}
+
+	// One clarified requirement unlocks the design conversation.
+	counter.count = 1
+	view, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42)
+	if err != nil {
+		t.Fatalf("design create with a clarified requirement: %v", err)
+	}
+	if view.Kind != version.ConversationDesign {
+		t.Fatalf("view = %#v", view)
+	}
+}
+
 func TestDesignConversationUserMessageSkipsCurateAndUsesDesignTeam(t *testing.T) {
 	env := newConversationEnv(t)
 	conversation, err := env.svc.Create(requestContext(), env.versionID, "design", "Design chat", 42)
@@ -442,12 +686,17 @@ func TestPostUserMessageRegistersAttachmentsAndEnqueuesTasks(t *testing.T) {
 		t.Fatalf("client id = %#v", storedMessage.ClientMessageID)
 	}
 
-	if len(env.registrar.calls) != 1 {
-		t.Fatalf("registrar calls = %#v", env.registrar.calls)
+	if len(env.registrar.prepares) != 1 || len(env.registrar.links) != 1 {
+		t.Fatalf("registrar prepares = %#v, links = %#v", env.registrar.prepares, env.registrar.links)
 	}
-	call := env.registrar.calls[0]
-	if call.versionID != env.versionID || call.messageID != message.ID || call.actorID != 42 || call.part.Name != "spec.md" {
-		t.Fatalf("registrar call = %#v", call)
+	prepare := env.registrar.prepares[0]
+	if prepare.versionID != env.versionID || prepare.conversationID != conversation.ID || prepare.actorID != 42 ||
+		len(prepare.parts) != 2 || prepare.parts[1].Name != "spec.md" {
+		t.Fatalf("registrar prepare = %#v", prepare)
+	}
+	link := env.registrar.links[0]
+	if link.versionID != env.versionID || link.messageID != message.ID || len(link.attachmentIDs) != 1 {
+		t.Fatalf("registrar link = %#v", link)
 	}
 
 	replyKey := "reply:" + idString(message.ID)
@@ -496,7 +745,8 @@ func TestPostUserMessageIsIdempotent(t *testing.T) {
 	parts := []version.MessagePart{{Type: "text", Text: "hello"}}
 	first := postUserMessage(t, env, conversation.ID, parts, "same-id")
 	eventsAfterFirst := len(env.events.events)
-	registrarAfterFirst := len(env.registrar.calls)
+	preparesAfterFirst := len(env.registrar.prepares)
+	linksAfterFirst := len(env.registrar.links)
 
 	second, err := env.svc.PostUserMessage(requestContext(), env.versionID, conversation.ID, parts, "same-id", 42)
 	if err != nil {
@@ -511,7 +761,7 @@ func TestPostUserMessageIsIdempotent(t *testing.T) {
 	if len(env.events.events) != eventsAfterFirst {
 		t.Fatal("idempotent post emitted an event")
 	}
-	if len(env.registrar.calls) != registrarAfterFirst {
+	if len(env.registrar.prepares) != preparesAfterFirst || len(env.registrar.links) != linksAfterFirst {
 		t.Fatal("idempotent post registered attachments again")
 	}
 
@@ -621,6 +871,62 @@ func TestConversationMessagesPagination(t *testing.T) {
 		t.Fatal("cross-version messages returned")
 	} else if apiError(t, err).Status != http.StatusNotFound {
 		t.Fatalf("status = %d", apiError(t, err).Status)
+	}
+}
+
+func TestConversationMessagePartsScopedAndOrdered(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation, err := env.svc.Create(requestContext(), env.versionID, "clarification", "Chat", 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	message := postUserMessage(t, env, conversation.ID, []version.MessagePart{{Type: "text", Text: "hi"}}, "")
+	env.repo.messageParts[message.ID] = []version.ConversationMessagePart{
+		{Seq: 2, Type: "job_card", Payload: json.RawMessage(`{"job_id":"7"}`), CreatedAt: testTime},
+		{Seq: 1, Type: "text", Payload: json.RawMessage(`{"text":"hi"}`), CreatedAt: testTime},
+	}
+
+	parts, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, message.ID)
+	if err != nil {
+		t.Fatalf("MessageParts: %v", err)
+	}
+	if len(parts) != 2 || parts[0].Seq != 1 || parts[1].Seq != 2 ||
+		parts[0].Type != "text" || parts[1].Type != "job_card" {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if string(parts[1].Payload) != `{"job_id":"7"}` || !parts[0].CreatedAt.Equal(testTime) {
+		t.Fatalf("part payload/time = %#v", parts[1])
+	}
+
+	// Cross-version and foreign-message reads are 404; a zero mid is a 400.
+	notFound := []struct {
+		name      string
+		versionID int64
+		mid       int64
+	}{
+		{"foreign version", env.versionID + 1, message.ID},
+		{"unknown message", env.versionID, message.ID + 999},
+	}
+	for _, testCase := range notFound {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := env.svc.MessageParts(requestContext(), testCase.versionID, conversation.ID, testCase.mid); err == nil {
+				t.Fatal("out-of-scope message parts returned")
+			} else if apiError(t, err).Status != http.StatusNotFound {
+				t.Fatalf("status = %d", apiError(t, err).Status)
+			}
+		})
+	}
+	if _, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, 0); err == nil {
+		t.Fatal("zero message id accepted")
+	} else if apiError(t, err).Status != http.StatusBadRequest {
+		t.Fatalf("status = %d", apiError(t, err).Status)
+	}
+
+	// A scoped message with no appended parts is an empty list, not a 404.
+	other := postUserMessage(t, env, conversation.ID, []version.MessagePart{{Type: "text", Text: "no parts"}}, "")
+	empty, err := env.svc.MessageParts(requestContext(), env.versionID, conversation.ID, other.ID)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty parts = %#v, %v", empty, err)
 	}
 }
 
@@ -740,5 +1046,294 @@ func TestListReconcilableClampsLimit(t *testing.T) {
 	}
 	if env.repo.lastReconcilerLimit != 1 {
 		t.Fatalf("negative limit = %d, want clamped 1", env.repo.lastReconcilerLimit)
+	}
+}
+
+// TestPostUserMessageStoresImagePart covers R5/§8.3: an image the client sends
+// is persisted as an `image` part, not an attachment part or extracted text.
+func TestPostUserMessageStoresImagePart(t *testing.T) {
+	env := newConversationEnv(t)
+	env.svc.SetModelCatalog(visionConversationCatalog())
+	conversation, err := env.svc.Create(requestContext(), env.versionID, "clarification", "Chat", 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sha := strings.Repeat("e", 64)
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "这张截图说明了什么？"},
+		{Type: version.MessagePartImage, MIME: "image/png", DataRef: sha, Width: 800, Height: 600},
+	}
+	message := postUserMessage(t, env, conversation.ID, parts, "image-1")
+	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartImage ||
+		message.Parts[1].DataRef != sha || message.Parts[1].Width != 800 || message.Parts[1].Height != 600 {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+	if len(env.registrar.links) != 0 {
+		t.Fatalf("image part registered as a text attachment: %#v", env.registrar.links)
+	}
+	for _, prepare := range env.registrar.prepares {
+		for _, part := range prepare.parts {
+			if part.Type == version.MessagePartAttachment {
+				t.Fatalf("image part sent to attachment registration: %#v", part)
+			}
+		}
+	}
+	raw, err := json.Marshal(message.Parts[1])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["type"] != "image" || payload["data_ref"] != sha || payload["mime"] != "image/png" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	stored := env.repo.messages[conversation.ID][0]
+	if stored.Parts[1].Type != version.MessagePartImage {
+		t.Fatalf("stored = %#v", stored.Parts)
+	}
+}
+
+// ---------- image end-to-end (real attachment service) ----------
+
+// imageConversationEnv wires the conversation service to the real attachment
+// service so attachment parts are converted/probed end to end.
+type imageConversationEnv struct {
+	svc          *versionapp.ConversationService
+	repo         *fakeConversationRepo
+	attachments  *attachmentEnv
+	versionEnv   *testEnv
+	versionID    int64
+	conversation versionapp.ConversationView
+}
+
+func newImageConversationEnv(t *testing.T) *imageConversationEnv {
+	t.Helper()
+	base := newTestEnv(t)
+	created := createVersion(t, base, "Image conversation version")
+	attachEnv := newAttachmentEnv(t)
+	attachEnv.versionID = created.ID
+	repo := newFakeConversationRepo()
+	svc := versionapp.NewConversationService(
+		repo, &fakeQueue{}, attachEnv.svc, base.svc, fixedClock{at: testTime}, &seqIDs{}, &fakePublisher{})
+	svc.SetModelCatalog(visionConversationCatalog())
+	conversation, err := svc.Create(requestContext(), created.ID, "clarification", "Chat", 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	return &imageConversationEnv{
+		svc: svc, repo: repo, attachments: attachEnv, versionEnv: base,
+		versionID: created.ID, conversation: conversation,
+	}
+}
+
+// pngImageBytes builds the smallest header the image prober needs: a PNG
+// signature plus an IHDR chunk carrying the pixel dimensions.
+func pngImageBytes(width, height int) []byte {
+	data := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	header := make([]byte, 25)
+	binary.BigEndian.PutUint32(header[0:4], 13)
+	copy(header[4:8], "IHDR")
+	binary.BigEndian.PutUint32(header[8:12], uint32(width))
+	binary.BigEndian.PutUint32(header[12:16], uint32(height))
+	header[16] = 8 // bit depth
+	header[17] = 2 // truecolor
+	return append(data, header...)
+}
+
+// TestImageAttachmentBecomesImagePart covers the end-to-end server conversion:
+// an uploaded image the Composer sends as an attachment part is stored as a
+// vision-ready image part. The attachment row still exists (extraction skipped,
+// no text) as the content-ledger anchor that keeps the bytes alive.
+func TestImageAttachmentBecomesImagePart(t *testing.T) {
+	env := newImageConversationEnv(t)
+	data := pngImageBytes(800, 600)
+	sha := strings.Repeat("e", 64)
+	env.attachments.store.put(sha, data, "image/png")
+
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "这张截图说明了什么？"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "shot.png", MIME: "image/png", Size: int64(len(data))},
+	}
+	message, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "image-e2e", 42)
+	if err != nil {
+		t.Fatalf("PostUserMessage: %v", err)
+	}
+	if len(message.Parts) != 2 {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+	image := message.Parts[1]
+	if image.Type != version.MessagePartImage || image.MIME != "image/png" ||
+		image.DataRef != sha || image.Width != 800 || image.Height != 600 {
+		t.Fatalf("image part = %#v", image)
+	}
+	stored := env.repo.messages[env.conversation.ID][0]
+	if stored.Parts[1].Type != version.MessagePartImage || stored.Parts[1].DataRef != sha {
+		t.Fatalf("stored parts = %#v", stored.Parts)
+	}
+	// The attachment row is the content-ledger anchor (it adds the content ref
+	// the storage GC needs); images are extraction-skipped because there is no
+	// text, while the message itself carries the image part.
+	if len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("attachment rows = %#v", env.attachments.repo.attachments)
+	}
+	for _, row := range env.attachments.repo.attachments {
+		if row.ExtractionStatus != version.AttachmentSkipped || row.MIME != "image/png" {
+			t.Fatalf("image attachment row = %#v", row)
+		}
+	}
+	if len(env.attachments.store.refs) != 1 || env.attachments.store.refs[0].ObjectID != sha {
+		t.Fatalf("image content refs = %#v", env.attachments.store.refs)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 1 {
+		t.Fatalf("messages = %#v", env.repo.messages[env.conversation.ID])
+	}
+}
+
+// TestPostUserMessageBlocksPendingAttachment covers the §8.5 guard: a message
+// that references an attachment already registered in the conversation while
+// its extraction is still running returns the typed 409 attachment_pending
+// ("解析中，可重试") instead of being accepted.
+func TestPostUserMessageBlocksPendingAttachment(t *testing.T) {
+	env := newImageConversationEnv(t)
+	env.attachments.repo.conversationMessages = map[int64]int64{7001: env.conversation.ID}
+	env.attachments.repo.conversations = map[int64]int64{env.conversation.ID: env.versionID}
+	data := []byte("# 需求")
+	sha := strings.Repeat("a", 64)
+	env.attachments.store.put(sha, data, "text/markdown")
+	pending, err := env.attachments.svc.RegisterFromMessage(requestContext(), env.versionID,
+		env.conversation.ID, 7001, attachmentPart(sha, "spec.md", "text/markdown", int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if pending.ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("pending = %#v", pending)
+	}
+
+	referencing := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请再看一下附件"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "spec.md", MIME: "text/markdown", Size: int64(len(data))},
+	}
+	_, err = env.svc.PostUserMessage(requestContext(), env.versionID, env.conversation.ID, referencing, "", 42)
+	if err == nil {
+		t.Fatal("message referencing a pending attachment was accepted")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusConflict || apiErr.Code != "attachment_pending" {
+		t.Fatalf("error = %#v, want 409 attachment_pending", apiErr)
+	}
+	if !apiErr.Retryable || !strings.Contains(apiErr.Message, "解析中") {
+		t.Fatalf("error = %#v, want a retryable parsing message", apiErr)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 {
+		t.Fatalf("blocked message was stored: %#v", env.repo.messages[env.conversation.ID])
+	}
+
+	// Once the extraction is done the same reference is accepted.
+	env.attachments.extractor.text = "done text"
+	if _, err := env.attachments.svc.Extract(requestContext(), pending.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	message, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, referencing, "", 42)
+	if err != nil {
+		t.Fatalf("PostUserMessage after extraction: %v", err)
+	}
+	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartAttachment {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+}
+
+// TestPostUserMessageBlocksNewAttachmentUntilExtractionDone covers the normal
+// Composer flow: the content is uploaded and posted immediately, so no
+// attachment row exists before the message insert. The preflight must register
+// the row first, observe that it is still parsing, return the typed 409 and
+// leave the message uninserted. The retry after extraction must insert the
+// message, link the same row and not extract/register it twice.
+func TestPostUserMessageBlocksNewAttachmentUntilExtractionDone(t *testing.T) {
+	env := newImageConversationEnv(t)
+	data := []byte("# 需求")
+	sha := strings.Repeat("d", 64)
+	env.attachments.store.put(sha, data, "text/markdown")
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请读附件"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "spec.md", MIME: "text/markdown", Size: int64(len(data))},
+	}
+
+	_, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "new-attachment-1", 42)
+	if err == nil {
+		t.Fatal("message referencing a brand-new attachment was accepted while extraction is pending")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusConflict || apiErr.Code != "attachment_pending" || !apiErr.Retryable {
+		t.Fatalf("error = %#v, want a retryable 409 attachment_pending", apiErr)
+	}
+	if !strings.Contains(apiErr.Message, "解析中") {
+		t.Fatalf("error message = %q, want the parsing hint", apiErr.Message)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 {
+		t.Fatalf("blocked message was stored: %#v", env.repo.messages[env.conversation.ID])
+	}
+	if len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("pre-registered attachment rows = %#v", env.attachments.repo.attachments)
+	}
+	var pending version.Attachment
+	for _, row := range env.attachments.repo.attachments {
+		pending = row
+	}
+	if pending.ConversationMessageID != nil {
+		t.Fatalf("attachment row was linked before the message insert: %#v", pending)
+	}
+	if pending.ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("status = %q, want pending", pending.ExtractionStatus)
+	}
+	if _, ok := env.attachments.queue.find("attachment.ingest", "attachment:"+idString(pending.ID)); !ok {
+		t.Fatalf("pre-registered attachment did not enqueue extraction: %#v", env.attachments.queue.tasks)
+	}
+
+	// A retry while the row is still pending is rejected again, still leaving
+	// the message uninserted and the row single.
+	if _, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "new-attachment-1", 42); err == nil {
+		t.Fatal("message accepted while the pre-registered attachment is still pending")
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 || len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("pending retry inserted rows: messages=%d rows=%d",
+			len(env.repo.messages[env.conversation.ID]), len(env.attachments.repo.attachments))
+	}
+
+	env.attachments.extractor.text = "附件正文"
+	if _, err := env.attachments.svc.Extract(requestContext(), pending.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	message, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "new-attachment-2", 42)
+	if err != nil {
+		t.Fatalf("PostUserMessage after extraction: %v", err)
+	}
+	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartAttachment ||
+		message.Parts[1].SHA256 != sha || message.Parts[1].Name != "spec.md" {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+	if len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("retry created duplicate attachment rows: %#v", env.attachments.repo.attachments)
+	}
+	linked := env.attachments.repo.attachments[pending.ID]
+	if linked.ConversationMessageID == nil || *linked.ConversationMessageID != message.ID {
+		t.Fatalf("existing row was not linked to the message: %#v (message %d)", linked, message.ID)
+	}
+	if linked.ExtractionStatus != version.AttachmentDone {
+		t.Fatalf("linked row status = %q", linked.ExtractionStatus)
+	}
+	if env.attachments.extractor.calls != 1 || len(env.attachments.store.uploads) != 1 {
+		t.Fatalf("retry extracted twice: calls=%d uploads=%d",
+			env.attachments.extractor.calls, len(env.attachments.store.uploads))
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 1 {
+		t.Fatalf("messages = %d", len(env.repo.messages[env.conversation.ID]))
 	}
 }

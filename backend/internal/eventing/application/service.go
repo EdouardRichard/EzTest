@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -36,6 +37,9 @@ type Service struct {
 	repo     eventing.Repository
 	hub      *Hub
 	notifier Notifier
+
+	mu        sync.RWMutex
+	observers []EventObserver
 }
 
 // New wires the event service to its repository and in-process hub. The
@@ -51,6 +55,33 @@ func New(repo eventing.Repository, hub *Hub, notifiers ...Notifier) *Service {
 		notifier = notifiers[0]
 	}
 	return &Service{repo: repo, hub: hub, notifier: notifier}
+}
+
+// Observe registers an observer invoked after every locally published event has
+// been persisted and broadcast to this process's hub. The same EventObserver
+// contract is used by the cross-instance listener, so a caller (for example the
+// event-driven reconciler wake) can be registered on both delivery paths.
+//
+// Observers are best effort: an observer error is ignored so a supplemental
+// side effect can never fail or roll back the publish (events.md §18.2 #7).
+// Observers must not block; the reconciler wake only signals a buffered
+// channel. Observe is safe to call concurrently with Publish.
+func (s *Service) Observe(observer EventObserver) {
+	if s == nil || observer == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observers = append(s.observers, observer)
+}
+
+func (s *Service) notifyObservers(ctx context.Context, event eventing.Event) {
+	s.mu.RLock()
+	observers := append([]EventObserver(nil), s.observers...)
+	s.mu.RUnlock()
+	for _, observer := range observers {
+		_ = observer(ctx, event)
+	}
 }
 
 // Publish appends an event in its channel and broadcasts it after the append
@@ -77,6 +108,7 @@ func (s *Service) Publish(ctx context.Context, event Event) error {
 		return err
 	}
 	s.hub.Broadcast(stored)
+	s.notifyObservers(ctx, stored)
 	if s.notifier != nil {
 		_ = s.notifier.Notify(ctx, NewEventRef(stored))
 	}

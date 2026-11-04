@@ -25,13 +25,16 @@ name: eztest
 #
 # Required in the environment / repo-root .env for interpolation (see
 # ../.env.example): POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
-# EZTEST_EXECUTOR_TOKEN. EZTEST_RENDER_TOKEN is optional: when unset the renderer
-# starts with the DB seed default report.render_token (`eztest-dev-render-token`),
-# so a fresh stack's renderer token matches the settings center without any
-# override. If you do set it, also update the DB setting report.render_token to
-# the same value (see README "Renderer settings"). The API process itself still
-# reads only the four documented EZTEST_* startup variables; the renderer URL and
-# token come from DB settings.
+# EZTEST_EXECUTOR_TOKEN. A fresh database also requires
+# EZTEST_INITIAL_ADMIN_PASSWORD for the first-start administrator seed (passed
+# through env_file, no built-in default). EZTEST_RENDER_TOKEN is optional: when
+# unset the renderer starts with the DB seed default report.render_token
+# (`eztest-dev-render-token`), so a fresh stack's renderer token matches the
+# settings center without any override. If you do set it, also update the DB
+# setting report.render_token to the same value (see README "Renderer
+# settings"). The API process itself still reads only the four documented
+# runtime EZTEST_* variables; the seed credential is consulted once while the
+# user table is empty. The renderer URL and token come from DB settings.
 #
 # Optional read-only code repositories (P4): mount a host tree read-only and
 # register the container path (for example /repos/app) as the P2 localPath.

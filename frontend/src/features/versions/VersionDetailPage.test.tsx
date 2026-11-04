@@ -216,6 +216,27 @@ describe("VersionDetailPage", () => {
     expect(overview).toHaveTextContent("未绑定代码仓")
   })
 
+  it("guides the user to resources when the version has no bound pages", async () => {
+    api.getVersion.mockResolvedValue({
+      ...versionFixture,
+      bindings: versionFixture.bindings.map((binding) => ({
+        ...binding,
+        pages: [],
+        apis: [],
+        databases: [],
+      })),
+    })
+    render(<VersionDetailPage versionId="2001" />)
+
+    const notice = await screen.findByRole("alert")
+    expect(notice).toHaveTextContent("该版本未绑定页面")
+    expect(notice).toHaveTextContent("AI 设计")
+    expect(screen.getByRole("link", { name: /前往资源页/ })).toHaveAttribute(
+      "href",
+      "/resources?tab=pages",
+    )
+  })
+
   it("shows issue and report tab counts from the list projections", async () => {
     deliveryApi.listIssues.mockResolvedValue([
       { id: "9101", status: "open" },

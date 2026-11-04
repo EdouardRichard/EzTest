@@ -19,10 +19,17 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
+// MaxActionDuration is the executor's per-action cap. The API-side case_run
+// lease must be longer than the action plus transport overhead: the default
+// case lease is 90s and the client bound below is 75s.
+const MaxActionDuration = 60 * time.Second
+
 // DefaultTimeout bounds one executor request. The executor itself caps actions
 // at 60s (goto 30s); a slightly larger client bound lets the executor return its
-// own typed timeout error instead of the client aborting first.
-const DefaultTimeout = 75 * time.Second
+// own typed timeout error instead of the client aborting first. The case_run
+// lease (75s+) must stay above this bound so a slow action is never mistaken for
+// a lost executor by lease recovery.
+const DefaultTimeout = MaxActionDuration + 15*time.Second
 
 const (
 	healthPath   = "/healthz"

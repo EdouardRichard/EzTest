@@ -51,8 +51,10 @@ func TestP7RegistryRegistersKnowledgePropose(t *testing.T) {
 	if _, ok := registry.Get("case.confirm"); ok {
 		t.Fatal("NewP7Registry must not register confirmation tools")
 	}
-	if _, ok := registry.Get("knowledge.search"); ok {
-		t.Fatal("knowledge.search is deferred and must not be registered")
+	for _, name := range []string{ToolKnowledgeSearch, ToolKnowledgeRead} {
+		if _, ok := registry.Get(name); !ok {
+			t.Fatalf("NewP7Registry is missing the structured retrieval tool %q", name)
+		}
 	}
 }
 

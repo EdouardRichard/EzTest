@@ -20,28 +20,31 @@ var executionPromptProfiles = map[string]struct{}{
 
 // PromptVariables returns the admin-visible variable catalog of a profile.
 // Every profile gets the eight common runtime variables; execution profiles
-// additionally get the six P3 case-execution variables.
+// additionally get the six P3 case-execution variables. Each variable declares
+// its stability class: only "stable" variables may appear in the system prompt,
+// because that prompt is the cache-stable prefix; "run" variables change per
+// run/work item and belong to the task/user message (Task 81).
 func PromptVariables(profileKey string) []PromptVariable {
 	variables := []PromptVariable{
-		{Name: "Now", Description: "当前时间（RFC3339 UTC）", Example: "2026-11-01T12:00:00Z", Source: agent.PromptVariableSourceRuntime},
-		{Name: "ProfileKey", Description: "当前 Agent profile key", Example: profileKey, Source: agent.PromptVariableSourceRuntime},
-		{Name: "ProfileName", Description: "当前 Agent profile 名称", Example: profileExampleName(profileKey), Source: agent.PromptVariableSourceRuntime},
-		{Name: "VersionID", Description: "当前版本 ID（十进制字符串）", Example: "2001", Source: agent.PromptVariableSourceRuntime},
-		{Name: "VersionTitle", Description: "当前版本标题", Example: "订单系统 Q4", Source: agent.PromptVariableSourceRuntime},
-		{Name: "VersionStatus", Description: "当前版本状态", Example: "running", Source: agent.PromptVariableSourceRuntime},
-		{Name: "TaskType", Description: "当前任务类型", Example: profileExampleTaskType(profileKey), Source: agent.PromptVariableSourceRuntime},
-		{Name: "TaskGoal", Description: "当前任务目标", Example: "回答用户关于登录流程的问题", Source: agent.PromptVariableSourceRuntime},
+		{Name: "Now", Description: "当前时间（RFC3339 UTC）", Example: "2026-11-01T12:00:00Z", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		{Name: "ProfileKey", Description: "当前 Agent profile key", Example: profileKey, Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityStable},
+		{Name: "ProfileName", Description: "当前 Agent profile 名称", Example: profileExampleName(profileKey), Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityStable},
+		{Name: "VersionID", Description: "当前版本 ID（十进制字符串）", Example: "2001", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityStable},
+		{Name: "VersionTitle", Description: "当前版本标题", Example: "订单系统 Q4", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityStable},
+		{Name: "VersionStatus", Description: "当前版本状态", Example: "running", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityStable},
+		{Name: "TaskType", Description: "当前任务类型", Example: profileExampleTaskType(profileKey), Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		{Name: "TaskGoal", Description: "当前任务目标", Example: "回答用户关于登录流程的问题", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
 	}
 	if _, ok := executionPromptProfiles[profileKey]; !ok {
 		return variables
 	}
 	return append(variables,
-		PromptVariable{Name: "CaseRunID", Description: "当前用例运行 ID（十进制字符串）", Example: "3001", Source: agent.PromptVariableSourceRuntime},
-		PromptVariable{Name: "WaveID", Description: "当前执行波次 ID（十进制字符串）", Example: "12", Source: agent.PromptVariableSourceRuntime},
-		PromptVariable{Name: "IntentID", Description: "当前执行意图 ID（十进制字符串）", Example: "44", Source: agent.PromptVariableSourceRuntime},
-		PromptVariable{Name: "CaseVersionID", Description: "当前用例版本 ID（十进制字符串）", Example: "55", Source: agent.PromptVariableSourceRuntime},
-		PromptVariable{Name: "CaseTitle", Description: "当前执行用例标题", Example: "登录流程", Source: agent.PromptVariableSourceRuntime},
-		PromptVariable{Name: "Priority", Description: "当前用例优先级", Example: "P1", Source: agent.PromptVariableSourceRuntime},
+		PromptVariable{Name: "CaseRunID", Description: "当前用例运行 ID（十进制字符串）", Example: "3001", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		PromptVariable{Name: "WaveID", Description: "当前执行波次 ID（十进制字符串）", Example: "12", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		PromptVariable{Name: "IntentID", Description: "当前执行意图 ID（十进制字符串）", Example: "44", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		PromptVariable{Name: "CaseVersionID", Description: "当前用例版本 ID（十进制字符串）", Example: "55", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		PromptVariable{Name: "CaseTitle", Description: "当前执行用例标题", Example: "登录流程", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
+		PromptVariable{Name: "Priority", Description: "当前用例优先级", Example: "P1", Source: agent.PromptVariableSourceRuntime, Stability: agent.PromptVariableStabilityRun},
 	)
 }
 

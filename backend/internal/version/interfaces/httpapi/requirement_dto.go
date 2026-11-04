@@ -109,6 +109,20 @@ type batchConfirmDTO struct {
 	Skipped   []string `json:"skipped"`
 }
 
+// requirementDedupeDTO is the duplicate-draft collapse response: one survivor
+// per duplicate group and the retired duplicates.
+type requirementDedupeDTO struct {
+	KeptIDs     []string `json:"kept_ids"`
+	ObsoleteIDs []string `json:"obsolete_ids"`
+}
+
+// requirementMergeDTO is the duplicate-merge response: the canonical target
+// (with merged content when it changed) and the retired source IDs.
+type requirementMergeDTO struct {
+	Requirement requirementDetailDTO `json:"requirement"`
+	MergedIDs   []string             `json:"merged_ids"`
+}
+
 // ---------- request payloads ----------
 
 type requirementTargetsInput struct {
@@ -149,6 +163,18 @@ type rollbackRequirementRequest struct {
 // (openapi RequirementReopenRequest, 1..2000).
 type reopenRequirementRequest struct {
 	Reason string `json:"reason"`
+}
+
+// deleteRequirementRequest is the optional draft-delete payload. The reason is
+// recorded in the audit entry; the delete itself never adds a revision.
+type deleteRequirementRequest struct {
+	Reason string `json:"reason"`
+}
+
+// mergeRequirementsRequest folds draft duplicates into one canonical target.
+type mergeRequirementsRequest struct {
+	TargetRequirementID  string   `json:"target_requirement_id"`
+	SourceRequirementIDs []string `json:"source_requirement_ids"`
 }
 
 // draft converts the request body to the application command.
@@ -200,6 +226,25 @@ func (r batchConfirmRequest) ids() ([]int64, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// ids parses the canonical target and the duplicate sources. Whether the
+// source list is empty, contains the target or crosses versions is left to the
+// application service, which owns the merge invariants.
+func (r mergeRequirementsRequest) ids() (int64, []int64, error) {
+	targetID, err := validation.NonEmptyID("target_requirement_id", r.TargetRequirementID)
+	if err != nil {
+		return 0, nil, err
+	}
+	sourceIDs := make([]int64, 0, len(r.SourceRequirementIDs))
+	for index, raw := range r.SourceRequirementIDs {
+		id, err := validation.NonEmptyID("source_requirement_ids["+strconv.Itoa(index)+"]", raw)
+		if err != nil {
+			return 0, nil, err
+		}
+		sourceIDs = append(sourceIDs, id)
+	}
+	return targetID, sourceIDs, nil
 }
 
 // ---------- view -> DTO conversions ----------
@@ -336,15 +381,34 @@ func toConfirmRequirementDTO(view versionapp.ConfirmResult) confirmRequirementDT
 }
 
 func toBatchConfirmDTO(view versionapp.BatchConfirmResult) batchConfirmDTO {
-	confirmed := make([]string, 0, len(view.Confirmed))
-	for _, id := range view.Confirmed {
-		confirmed = append(confirmed, strconv.FormatInt(id, 10))
+	return batchConfirmDTO{
+		BatchID:   view.BatchID,
+		Confirmed: formatIDs(view.Confirmed),
+		Skipped:   formatIDs(view.Skipped),
 	}
-	skipped := make([]string, 0, len(view.Skipped))
-	for _, id := range view.Skipped {
-		skipped = append(skipped, strconv.FormatInt(id, 10))
+}
+
+func toRequirementDedupeDTO(view versionapp.RequirementDedupeResult) requirementDedupeDTO {
+	return requirementDedupeDTO{
+		KeptIDs:     formatIDs(view.KeptIDs),
+		ObsoleteIDs: formatIDs(view.ObsoleteIDs),
 	}
-	return batchConfirmDTO{BatchID: view.BatchID, Confirmed: confirmed, Skipped: skipped}
+}
+
+func toRequirementMergeDTO(view versionapp.RequirementMergeResult) requirementMergeDTO {
+	return requirementMergeDTO{
+		Requirement: toRequirementDetailDTO(view.Requirement),
+		MergedIDs:   formatIDs(view.MergedIDs),
+	}
+}
+
+// formatIDs renders internal IDs as the decimal strings of the JSON contract.
+func formatIDs(ids []int64) []string {
+	formatted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		formatted = append(formatted, strconv.FormatInt(id, 10))
+	}
+	return formatted
 }
 
 func nonNil(values []string) []string {

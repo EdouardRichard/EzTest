@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // fakeDesignPort implements DesignPort for the P2 tool tests.
@@ -14,15 +16,18 @@ type fakeDesignPort struct {
 	readCaseID        int64
 	readCalls         int
 	readResult        any
+	readResults       []any
 	readErr           error
 
 	proposeVersionID int64
 	proposeActorID   int64
 	proposeRunID     int64
 	proposeInput     GraphProposal
+	proposeInputs    []GraphProposal
 	proposeCalls     int
 	proposeResult    any
 	proposeErr       error
+	proposeErrs      []error
 
 	reviewVersionID     int64
 	reviewRequirementID int64
@@ -46,6 +51,11 @@ func (f *fakeDesignPort) ReadGraph(_ context.Context, versionID, requirementID, 
 	f.readVersionID = versionID
 	f.readRequirementID = requirementID
 	f.readCaseID = caseID
+	if len(f.readResults) > 0 {
+		result := f.readResults[0]
+		f.readResults = f.readResults[1:]
+		return result, f.readErr
+	}
 	return f.readResult, f.readErr
 }
 
@@ -53,8 +63,14 @@ func (f *fakeDesignPort) ProposeGraph(_ context.Context, versionID int64, in Gra
 	f.proposeCalls++
 	f.proposeVersionID = versionID
 	f.proposeInput = in
+	f.proposeInputs = append(f.proposeInputs, in)
 	f.proposeActorID = actorID
 	f.proposeRunID = runID
+	if len(f.proposeErrs) > 0 {
+		err := f.proposeErrs[0]
+		f.proposeErrs = f.proposeErrs[1:]
+		return nil, err
+	}
 	return f.proposeResult, f.proposeErr
 }
 
@@ -115,6 +131,119 @@ func validGraphProposalJSON() string {
 func executeDesignTool(t *testing.T, registry *Registry, scope Scope, name, payload string) (any, error) {
 	t.Helper()
 	return registry.Execute(context.Background(), scope, name, json.RawMessage(payload))
+}
+
+// TestGraphProposeNormalizesRequirementSourceRef pins the S3 failure fix: the
+// model may cite the requirement id it was scoped with as a requirement source
+// even though the immutable source must be the current requirement version.
+// The tool resolves exactly that unambiguous reference; a source pointing at
+// another requirement is never rewritten (the design context rejects it).
+func TestGraphProposeNormalizesRequirementSourceRef(t *testing.T) {
+	port := &fakeDesignPort{proposeResult: map[string]any{"case_version_ids": []string{"7001"}}}
+	registry := NewP2Registry(Deps{Design: port})
+	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
+
+	sameRequirement := strings.Replace(validGraphProposalJSON(), `"ref_id": "700"`, `"ref_id": "501"`, 1)
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, sameRequirement); err != nil {
+		t.Fatalf("propose with the requirement id as source: %v", err)
+	}
+	if got := port.proposeInput.Cases[0].Sources[0].RefID; got != "700" {
+		t.Fatalf("normalized requirement source = %q, want the requirement version 700", got)
+	}
+
+	foreignRequirement := strings.Replace(validGraphProposalJSON(), `"ref_id": "700"`, `"ref_id": "999"`, 1)
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, foreignRequirement); err != nil {
+		t.Fatalf("propose with a foreign requirement source: %v", err)
+	}
+	if got := port.proposeInput.Cases[0].Sources[0].RefID; got != "999" {
+		t.Fatalf("foreign requirement source = %q, want it passed through unchanged", got)
+	}
+}
+
+// TestDesignToolSchemaSources pins the product-owner failure "unknown field
+// sources". The model legitimately attaches provenance either per case or once
+// for the whole proposal; both shapes must be declared in the schema and
+// accepted by the executor. A top-level list is the default source set of every
+// case that does not declare its own.
+func TestDesignToolSchemaSources(t *testing.T) {
+	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}})
+	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
+	if len(definitions) != 1 {
+		t.Fatalf("definitions = %d", len(definitions))
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(definitions[0].Parameters, &schema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	if _, ok := properties["sources"]; !ok {
+		t.Fatalf("top-level sources is missing from the case.graph_propose schema: %s", definitions[0].Parameters)
+	}
+	casesSchema, _ := properties["cases"].(map[string]any)
+	caseItems, _ := casesSchema["items"].(map[string]any)
+	caseProperties, _ := caseItems["properties"].(map[string]any)
+	if _, ok := caseProperties["sources"]; !ok {
+		t.Fatalf("case-level sources is missing from the case.graph_propose schema")
+	}
+
+	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+	registry = NewP2Registry(Deps{Design: port})
+	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
+	withoutCaseSources := strings.Replace(validGraphProposalJSON(), `,
+      "sources": [
+        {"kind": "requirement", "ref_id": "700", "path": "", "line": null, "sha": ""}
+      ]`, "", 1)
+	if withoutCaseSources == validGraphProposalJSON() {
+		t.Fatal("test fixture did not remove the case-level sources")
+	}
+	withTopLevelSources := strings.Replace(withoutCaseSources, `"scenarios": [`,
+		`"sources": [{"kind": "requirement", "ref_id": "501"}],
+  "scenarios": [`, 1)
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, withTopLevelSources); err != nil {
+		t.Fatalf("propose with top-level sources: %v", err)
+	}
+	if port.proposeCalls != 1 || len(port.proposeInput.Cases) != 1 {
+		t.Fatalf("propose = %#v", port.proposeInput)
+	}
+	sources := port.proposeInput.Cases[0].Sources
+	if len(sources) != 1 || sources[0].Kind != "requirement" || sources[0].RefID != "700" {
+		t.Fatalf("top-level sources were not inherited: %#v", sources)
+	}
+}
+
+// TestDesignToolConvergesAfterGraphConflict pins the S4 repeat-conflict fix:
+// a stale base_graph_hash must be repaired server-side by re-reading the graph
+// and retrying, instead of forcing the model to spend another turn (and its
+// remaining budget) on a read the tool can do itself.
+func TestDesignToolConvergesAfterGraphConflict(t *testing.T) {
+	freshHash := strings.Repeat("a", 64)
+	port := &fakeDesignPort{
+		proposeErrs:   []error{platform.StateConflict("the design graph changed since it was read; re-read the graph and retry")},
+		proposeResult: map[string]any{"graph_hash": "after", "case_version_ids": []string{"7001"}},
+		readResults:   []any{map[string]any{"graph_hash": freshHash}},
+	}
+	registry := NewP2Registry(Deps{Design: port})
+	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
+	staleHash := strings.Repeat("0", 64)
+	payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
+		`"requirement_version_id": "700", "base_graph_hash": "`+staleHash+`",`, 1)
+
+	result, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, payload)
+	if err != nil {
+		t.Fatalf("propose did not converge: %v", err)
+	}
+	if port.proposeCalls != 2 {
+		t.Fatalf("propose calls = %d, want 2 (initial + converge retry)", port.proposeCalls)
+	}
+	if port.readCalls != 1 || port.readRequirementID != 501 {
+		t.Fatalf("converge read = calls %d requirement %d", port.readCalls, port.readRequirementID)
+	}
+	if got := port.proposeInputs[1].BaseGraphHash; got != freshHash {
+		t.Fatalf("retry base hash = %q, want the re-read hash %q", got, freshHash)
+	}
+	if got, _ := result.(map[string]any)["graph_hash"].(string); got != "after" {
+		t.Fatalf("result = %#v", result)
+	}
 }
 
 func TestDesignToolsRegisteredAndCaseConfirmAbsent(t *testing.T) {
@@ -264,6 +393,8 @@ func TestGraphProposeToolValidatesScopeAndPayload(t *testing.T) {
 		{"default sut outside case suts", scope, strings.Replace(validGraphProposalJSON(), `"default_version_sut_id": "9001"`, `"default_version_sut_id": "9999"`, 1), "cases[0].default_version_sut_id"},
 		{"invalid priority", scope, strings.Replace(validGraphProposalJSON(), `"priority": "P1"`, `"priority": "P9"`, 1), "cases[0].priority"},
 		{"db assertion without database", scope, strings.Replace(validGraphProposalJSON(), `"kind": "api"`, `"kind": "db"`, 1), "cases[0].assertions[1].database_id"},
+		{"empty step expected", scope, strings.Replace(validGraphProposalJSON(), `"expected": "显示表单"`, `"expected": ""`, 1), "cases[0].steps[0].expected"},
+		{"empty assertion expected", scope, strings.Replace(validGraphProposalJSON(), `"expected": "表单可见"`, `"expected": ""`, 1), "cases[0].assertions[0].expected"},
 		{"invalid assertion kind", scope, strings.Replace(validGraphProposalJSON(), `"kind": "ui"`, `"kind": "bogus"`, 1), "cases[0].assertions[0].kind"},
 		{"missing requirement id", Scope{VersionID: 10}, `{"requirement_version_id":"700","scenarios":[{"ref":"s1","name":"n"}],"cases":[]}`, "requirement_id"},
 	}

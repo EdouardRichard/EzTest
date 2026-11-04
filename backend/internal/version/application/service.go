@@ -531,6 +531,91 @@ func (s *Service) buildBindingView(ctx context.Context, binding version.Binding)
 	return view, nil
 }
 
+// KnowledgeBindingKeys is the structured page-route/account-role projection of
+// one version's bindings. Knowledge items store the same strings as their
+// page_key/account_role bindings, so a page/route/account change is detected by
+// comparing a captured key set with the current one and passing the removed
+// keys to the knowledge application's MarkBindingsStale (Task 33). The read is
+// cross-context but exposes only SUT identifiers and route templates, never a
+// credential.
+type KnowledgeBindingKeys struct {
+	VersionID      int64
+	SystemIDs      []int64
+	EnvironmentIDs []int64
+	PageKeys       []string
+	AccountRoles   []string
+}
+
+// KnowledgeBindingKeys returns the current page/route/account key set of one
+// version's bindings. Pages without a route template are omitted (they cannot
+// be named by a knowledge page_key), and the result is deduplicated in stable
+// binding order so two reads of unchanged bindings compare equal.
+func (s *Service) KnowledgeBindingKeys(ctx context.Context, id int64) (KnowledgeBindingKeys, error) {
+	if id <= 0 {
+		return KnowledgeBindingKeys{}, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	_, bindings, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return KnowledgeBindingKeys{}, mapRepositoryError(err)
+	}
+	keys := KnowledgeBindingKeys{
+		VersionID:      id,
+		SystemIDs:      make([]int64, 0, len(bindings)),
+		EnvironmentIDs: make([]int64, 0, len(bindings)),
+		PageKeys:       make([]string, 0, len(bindings)),
+		AccountRoles:   make([]string, 0, len(bindings)),
+	}
+	for _, binding := range bindings {
+		keys.SystemIDs = append(keys.SystemIDs, binding.SUTID)
+		keys.EnvironmentIDs = append(keys.EnvironmentIDs, binding.EnvironmentID)
+		for _, pageID := range binding.Scope.Pages {
+			page, err := s.catalog.GetPage(ctx, pageID)
+			if err != nil {
+				return KnowledgeBindingKeys{}, err
+			}
+			if route := strings.TrimSpace(page.RouteTemplate); route != "" {
+				keys.PageKeys = append(keys.PageKeys, route)
+			}
+		}
+		for _, account := range binding.Accounts {
+			if role := strings.TrimSpace(account.Role); role != "" {
+				keys.AccountRoles = append(keys.AccountRoles, role)
+			}
+		}
+	}
+	keys.SystemIDs = uniqueInt64s(keys.SystemIDs)
+	keys.EnvironmentIDs = uniqueInt64s(keys.EnvironmentIDs)
+	keys.PageKeys = uniqueStrings(keys.PageKeys)
+	keys.AccountRoles = uniqueStrings(keys.AccountRoles)
+	return keys, nil
+}
+
+func uniqueInt64s(values []int64) []int64 {
+	out := make([]int64, 0, len(values))
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 // ---------- resourceapp.UsageChecker ----------
 
 // SUTInUse reports whether any version binding references the SUT.

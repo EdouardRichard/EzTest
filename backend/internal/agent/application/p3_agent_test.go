@@ -166,6 +166,26 @@ func TestP3ProfilesToolsAndBudgets(t *testing.T) {
 			t.Fatalf("failure_analyst is missing tool %q", required)
 		}
 	}
+	// Task 37 (P9 capability #7): the failure analyst must consume the
+	// deterministic attribution and hand off a problem draft / retry-vs-human
+	// decision instead of inventing its own classification.
+	for _, required := range []string{"归因", "重试", "人工", "问题单草稿"} {
+		if !strings.Contains(failure.SystemPrompt, required) {
+			t.Fatalf("failure_analyst prompt is missing the %q handoff contract", required)
+		}
+	}
+	// Fix round 1: the prompt may only claim what the server actually supplies.
+	// execution.result_read carries the four-value attribution; the analyst has
+	// no issue.propose tool, so the prompt must name it as a boundary instead of
+	// implying the model creates problem reports.
+	for _, required := range []string{"execution.result_read", "attribution", "application/automation/environment/data", "issue.propose"} {
+		if !strings.Contains(failure.SystemPrompt, required) {
+			t.Fatalf("failure_analyst prompt is missing the %q contract detail", required)
+		}
+	}
+	if hasTool(failure, "issue.propose") {
+		t.Fatal("failure_analyst must not hold issue.propose; the server owns the issue candidate")
+	}
 
 	coverage, ok := profileByKey(profiles, agentapp.ProfileKeyCoverageAnalyst)
 	if !ok {
@@ -403,6 +423,8 @@ func (f *fakeRunnerCanceller) ClearRun(caseRunID int64) {
 // fakeExecutionPort records the P3 execution tool calls made by the runner.
 type fakeExecutionPort struct {
 	stepCalls    int
+	assertCalls  int
+	finishCalls  int
 	lastScope    tools.Scope
 	stepInput    tools.StepRecordInput
 	assertInput  tools.AssertionRecordInput
@@ -411,8 +433,11 @@ type fakeExecutionPort struct {
 	humanInput   tools.HumanRequestInput
 	credInput    tools.AccountCredentialsInput
 	browserCalls []string
-	stepResult   any
-	stepErr      error
+	// browserResults are the per-call browser results; a call index past the
+	// slice falls back to the small {"ok":true} result.
+	browserResults []any
+	stepResult     any
+	stepErr        error
 }
 
 func (f *fakeExecutionPort) StepRecord(_ context.Context, scope tools.Scope, in tools.StepRecordInput) (any, error) {
@@ -423,6 +448,7 @@ func (f *fakeExecutionPort) StepRecord(_ context.Context, scope tools.Scope, in 
 }
 
 func (f *fakeExecutionPort) AssertionRecord(_ context.Context, scope tools.Scope, in tools.AssertionRecordInput) (any, error) {
+	f.assertCalls++
 	f.lastScope = scope
 	f.assertInput = in
 	return map[string]any{"ok": true}, nil
@@ -433,6 +459,7 @@ func (f *fakeExecutionPort) EvidenceText(_ context.Context, _ tools.Scope, _ too
 }
 
 func (f *fakeExecutionPort) CaseFinish(_ context.Context, scope tools.Scope, in tools.CaseFinishInput) (any, error) {
+	f.finishCalls++
 	f.lastScope = scope
 	f.finishInput = in
 	return map[string]any{"ok": true}, nil
@@ -453,6 +480,9 @@ func (f *fakeExecutionPort) HumanRequest(_ context.Context, scope tools.Scope, i
 func (f *fakeExecutionPort) Browser(_ context.Context, scope tools.Scope, action string, _ json.RawMessage) (any, error) {
 	f.lastScope = scope
 	f.browserCalls = append(f.browserCalls, action)
+	if index := len(f.browserCalls) - 1; index < len(f.browserResults) {
+		return f.browserResults[index], nil
+	}
 	return map[string]any{"ok": true}, nil
 }
 

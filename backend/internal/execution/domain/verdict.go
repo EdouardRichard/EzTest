@@ -145,6 +145,19 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 
 	if failedStep != nil {
 		summary.VerdictReason = VerdictReasonStepFailed
+		// A failed step that recorded an observed product behavior (and no
+		// automation/tool error) is a requirement deviation, not a script
+		// failure (QA Q1). It must produce failed(application) so the issue
+		// candidate path is not suppressed. An explicit environment/model/
+		// timeout/session candidate stays on that class: it describes a
+		// separate infrastructure failure.
+		if FailedStepShowsRequirementDeviation(*failedStep) &&
+			(in.Finish == nil ||
+				in.Finish.FailureClass == "" ||
+				in.Finish.FailureClass == FailureClassApplication ||
+				in.Finish.FailureClass == FailureClassAutomation) {
+			return CaseRunFailed, FailureClassApplication, summary, nil
+		}
 		return CaseRunFailed, stepFailureClass(in.Finish), summary, nil
 	}
 

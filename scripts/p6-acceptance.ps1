@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 P6 acceptance — real LLM + real Chrome acceptance evidence for the P6 read
 models. It clones the real P4 acceptance database into eztest_v02_p6, applies
@@ -162,7 +162,7 @@ $api = Start-Process -FilePath $binary -PassThru -NoNewWindow -RedirectStandardO
 try {
   if (-not (Wait-Health 90)) { throw "API did not become healthy; see $apiErr" }
 
-  $login = Invoke-Api "POST" "/api/auth/login" @{ username = "admin"; password = "admin123" } ""
+  $login = Invoke-Api "POST" "/api/auth/login" @{ username = "admin"; password = "[REDACTED]" } ""
   Assert-Status $login @(200) "admin login"
   $script:token = [string]$login.Json.data.token
   if ([string]::IsNullOrWhiteSpace($script:token)) { throw "admin login returned no token" }

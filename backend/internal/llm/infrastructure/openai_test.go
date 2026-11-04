@@ -178,6 +178,102 @@ func TestOpenAITestFallsBackToChatCompletion(t *testing.T) {
 	}
 }
 
+// TestConnectionTestUsesProtocolEndpoint pins the protocol-aware connectivity
+// probe: a Responses config must POST /responses with the Responses input
+// shape, while chat completions keeps POSTing /chat/completions. The fake
+// upstream only answers the expected endpoint, so a chat-only probe fails the
+// Responses case.
+func TestConnectionTestUsesProtocolEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		protocol string
+		wantPath string
+		response string
+	}{
+		{
+			name:     "chat completions posts /chat/completions",
+			protocol: string(llm.ProtocolOpenAIChatCompletions),
+			wantPath: "/v1/chat/completions",
+			response: `{"choices":[]}`,
+		},
+		{
+			name:     "responses posts /responses",
+			protocol: string(llm.ProtocolOpenAIResponses),
+			wantPath: "/v1/responses",
+			response: `{"id":"resp_probe","object":"response","status":"completed","output":[]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var paths []string
+			var probeBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/v1/models":
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = io.WriteString(w, `{"error":{"message":"not found"}}`)
+				case tc.wantPath:
+					if r.Method != http.MethodPost {
+						t.Errorf("probe method = %s, want POST", r.Method)
+					}
+					if got := r.Header.Get("Authorization"); got != "Bearer "+testAPIKey {
+						t.Errorf("probe authorization = %q", got)
+					}
+					raw, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read probe body: %v", err)
+					} else if err := json.Unmarshal(raw, &probeBody); err != nil {
+						t.Errorf("decode probe body: %v", err)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, tc.response)
+				default:
+					t.Errorf("connection test hit %s, want %s", r.URL.Path, tc.wantPath)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			cfg := openAITestConfig(server.URL + "/v1")
+			cfg.Protocol = tc.protocol
+			result, err := llminfra.NewClient().Test(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("Test: %v", err)
+			}
+			if !result.OK {
+				t.Fatalf("result = %#v", result)
+			}
+			if len(paths) != 2 || paths[0] != "/v1/models" || paths[1] != tc.wantPath {
+				t.Fatalf("request paths = %v, want [/v1/models %s]", paths, tc.wantPath)
+			}
+			if model, _ := probeBody["model"].(string); strings.TrimSpace(model) == "" {
+				t.Fatalf("probe body has no model: %#v", probeBody)
+			}
+			if stream, _ := probeBody["stream"].(bool); stream {
+				t.Fatalf("probe must not stream: %#v", probeBody)
+			}
+
+			if tc.protocol == string(llm.ProtocolOpenAIResponses) {
+				if input, _ := probeBody["input"].([]any); len(input) == 0 {
+					t.Fatalf("responses probe input = %#v", probeBody["input"])
+				}
+				if _, ok := probeBody["messages"]; ok {
+					t.Fatalf("responses probe used a chat payload: %#v", probeBody)
+				}
+				return
+			}
+			if messages, _ := probeBody["messages"].([]any); len(messages) == 0 {
+				t.Fatalf("chat probe messages = %#v", probeBody["messages"])
+			}
+			if _, ok := probeBody["input"]; ok {
+				t.Fatalf("chat probe used a responses payload: %#v", probeBody)
+			}
+		})
+	}
+}
+
 func TestOpenAITestFailureDoesNotLeakKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)

@@ -47,6 +47,10 @@ type fakeGraphGateway struct {
 	dataPlanInput         designapp.DataPlanInput
 	dataPlanResult        designapp.DataPlanResult
 	dataPlanErr           error
+
+	factsVersionID int64
+	factsResult    []designapp.DiscoveryFact
+	factsErr       error
 }
 
 func (f *fakeGraphGateway) ReadGraph(_ context.Context, versionID int64) (designapp.GraphView, error) {
@@ -83,6 +87,11 @@ func (f *fakeGraphGateway) SubmitDataPlan(_ context.Context, versionID, caseVers
 	f.dataPlanRunID = runID
 	f.dataPlanInput = in
 	return f.dataPlanResult, f.dataPlanErr
+}
+
+func (f *fakeGraphGateway) CaseAuthorFacts(_ context.Context, versionID int64) ([]designapp.DiscoveryFact, error) {
+	f.factsVersionID = versionID
+	return f.factsResult, f.factsErr
 }
 
 var _ designadapter.GraphGateway = (*fakeGraphGateway)(nil)
@@ -198,7 +207,14 @@ func sampleCaseDetail() designapp.CaseDetailView {
 func int64Ptr(value int64) *int64 { return &value }
 
 func TestReadGraphRendersSnakeCaseAndFiltersRequirement(t *testing.T) {
-	gateway := &fakeGraphGateway{readResult: sampleGraphView()}
+	confidence := 0.9
+	gateway := &fakeGraphGateway{
+		readResult: sampleGraphView(),
+		factsResult: []designapp.DiscoveryFact{
+			{ID: 41, Kind: "page", Key: "page:http://sut/app", Summary: "/app · 工作台", Confidence: &confidence},
+			{ID: 42, Kind: "gap", Key: "gap:req:3001:acceptance", Summary: "acceptance · 3001 · 缺少验收标准"},
+		},
+	}
 	adapter := designadapter.New(gateway)
 
 	result, err := adapter.ReadGraph(context.Background(), 1001, 3001, 0)
@@ -248,6 +264,17 @@ func TestReadGraphRendersSnakeCaseAndFiltersRequirement(t *testing.T) {
 	}
 	if card["default_version_sut_id"] != "9001" || card["step_count"] != 3 || card["assertion_count"] != 2 {
 		t.Fatalf("case card = %#v", card)
+	}
+	if gateway.factsVersionID != 1001 {
+		t.Fatalf("case-author facts version = %d", gateway.factsVersionID)
+	}
+	discovery, _ := payload["discovery_facts"].([]any)
+	if len(discovery) != 2 {
+		t.Fatalf("discovery facts = %#v", payload["discovery_facts"])
+	}
+	first := discovery[0].(map[string]any)
+	if first["fact_id"] != "41" || first["kind"] != "page" || first["summary"] != "/app · 工作台" || first["confidence"] != 0.9 {
+		t.Fatalf("discovery fact = %#v", first)
 	}
 }
 

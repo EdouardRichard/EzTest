@@ -77,7 +77,7 @@ func (a *testAPI) getRaw(path string, authenticated bool) (int, http.Header, []b
 // are 404.
 func TestP4RoutesAuthAndEmptyState(t *testing.T) {
 	api := newTestAPI(t)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 	versionID, _ := api.createP4Version("P4 Routes")
 
 	for _, path := range []string{
@@ -114,7 +114,7 @@ func TestP4RoutesAuthAndEmptyState(t *testing.T) {
 	// Version and requirement reopen are mounted behind auth.
 	api.token = ""
 	api.do(http.MethodPost, "/api/versions/"+versionID+"/reopen", map[string]any{"reason": "x"}, http.StatusUnauthorized)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 }
 
 // TestP4ReportPublishAndHTML exercises the real report pipeline end-to-end: the
@@ -123,7 +123,7 @@ func TestP4RoutesAuthAndEmptyState(t *testing.T) {
 // endpoint serves the verified bytes.
 func TestP4ReportPublishAndHTML(t *testing.T) {
 	api := newTestAPI(t)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 	versionID, versionIDInt := api.createP4Version("P4 Report")
 	ctx := context.Background()
 
@@ -196,7 +196,7 @@ func TestP4ReportPublishAndHTML(t *testing.T) {
 // with the closure reopen count, and the 409/404 matrix.
 func TestP4VersionAndRequirementReopen(t *testing.T) {
 	api := newTestAPI(t)
-	api.login("admin", "admin123")
+	api.login("admin", testSeedAdminPassword)
 	versionID, versionIDInt := api.createP4Version("P4 Reopen")
 	ctx := context.Background()
 

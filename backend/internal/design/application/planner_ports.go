@@ -34,6 +34,13 @@ type TaskInput struct {
 // (version_id, type, dedupe_key); callers treat enqueue as best effort.
 type TaskEnqueuer interface {
 	Ensure(ctx context.Context, in TaskInput) (bool, error)
+	// EnsureCoverageRepair ensures one fresh design.requirement generation for a
+	// requirement version that is still uncovered. in.DedupeKey is the base key
+	// of the first generation; the adapter derives a new generation key while
+	// the previous generation is terminal, never duplicates an in-flight
+	// generation, and enforces the bounded repair budget so a persistently
+	// failing model cannot stampede the queue (Task 70).
+	EnsureCoverageRepair(ctx context.Context, in TaskInput, requirementVersionID int64) (bool, error)
 }
 
 // ConversationCreator creates the auto-design conversation. main adapts it to
@@ -61,6 +68,14 @@ type VersionReopener interface {
 // stale. StaleService implements it; the reconciler stale safety net uses it.
 type Staler interface {
 	MarkRequirementChanged(ctx context.Context, versionID, requirementID int64, reason string, revision int) ([]string, error)
+}
+
+// DesignConverger applies the designing -> case_review edge once the version's
+// activated requirements have usable case coverage (Task 69). main adapts it to
+// versionapp.StageMachine.ConvergeDesign; nil disables the edge for degraded
+// assemblies.
+type DesignConverger interface {
+	ConvergeDesign(ctx context.Context, versionID int64) error
 }
 
 // GapInput requests design work for an execution gap or an uncovered

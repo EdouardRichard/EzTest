@@ -28,7 +28,8 @@ type Service interface {
 	DeleteConfig(ctx context.Context, id int64, actorID int64) error
 	TestConfig(ctx context.Context, id int64) (llmapp.TestResult, error)
 	RefreshModels(ctx context.Context, id int64, actorID int64) ([]llm.Model, error)
-	AddModel(ctx context.Context, configID int64, model string, contextWindow, maxOutput int, tools, vision bool, actorID int64) (llm.Model, error)
+	AddModel(ctx context.Context, configID int64, input llmapp.ModelInput, actorID int64) (llm.Model, error)
+	UpdateModel(ctx context.Context, configID, modelID int64, patch llmapp.ModelPatch, actorID int64) (llm.Model, error)
 	DeleteModel(ctx context.Context, modelID int64, actorID int64) error
 	ListModels(ctx context.Context) ([]llm.Model, error)
 }
@@ -50,9 +51,18 @@ func (h *Handler) ListConfigs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
+	models, err := h.svc.ListModels(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	byConfig := make(map[int64][]llm.Model, len(configs))
+	for _, model := range models {
+		byConfig[model.ConfigID] = append(byConfig[model.ConfigID], model)
+	}
 	items := make([]configDTO, 0, len(configs))
 	for _, cfg := range configs {
-		items = append(items, toConfigDTO(cfg))
+		items = append(items, toConfigDTO(cfg, byConfig[cfg.ID]))
 	}
 	httpx.List(w, http.StatusOK, items, "", false)
 }
@@ -68,12 +78,17 @@ func (h *Handler) CreateConfig(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	cfg, err := h.svc.CreateConfig(r.Context(), request.input(), actorID)
+	input, err := request.input()
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg))
+	cfg, err := h.svc.CreateConfig(r.Context(), input, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	h.writeConfig(w, r, cfg)
 }
 
 // GetConfig GET /api/admin/llm/configs/{id}.
@@ -88,7 +103,7 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg))
+	h.writeConfig(w, r, cfg)
 }
 
 // UpdateConfig PATCH /api/admin/llm/configs/{id}.
@@ -107,12 +122,34 @@ func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	cfg, err := h.svc.UpdateConfig(r.Context(), id, request.input(), actorID)
+	input, err := request.input()
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg))
+	cfg, err := h.svc.UpdateConfig(r.Context(), id, input, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	h.writeConfig(w, r, cfg)
+}
+
+// writeConfig renders one config with its catalog rows. Model listing failures
+// are surfaced as the same typed error the list endpoints use.
+func (h *Handler) writeConfig(w http.ResponseWriter, r *http.Request, cfg llm.Config) {
+	models, err := h.svc.ListModels(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	owned := make([]llm.Model, 0, len(models))
+	for _, model := range models {
+		if model.ConfigID == cfg.ID {
+			owned = append(owned, model)
+		}
+	}
+	httpx.JSON(w, http.StatusOK, toConfigDTO(cfg, owned))
 }
 
 // DeleteConfig DELETE /api/admin/llm/configs/{id}.
@@ -189,8 +226,42 @@ func (h *Handler) AddModel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Invalid("body", "request body must be a JSON object"))
 		return
 	}
-	model, err := h.svc.AddModel(r.Context(), configID, request.Model, request.ContextWindow,
-		request.MaxOutput, request.SupportsTools, request.SupportsVision, actorID)
+	model, err := h.svc.AddModel(r.Context(), configID, request.input(), actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toModelDTO(model))
+}
+
+// UpdateModel PATCH /api/admin/llm/configs/{id}/models/{modelId}.
+//
+// It is the admin capability editor's write path: gateways whose /models
+// response does not report capabilities can be corrected here. Unknown model
+// IDs are a typed 404 from the application service.
+func (h *Handler) UpdateModel(w http.ResponseWriter, r *http.Request) {
+	actorID, ok := requireActor(w, r)
+	if !ok {
+		return
+	}
+	configID, err := pathID(r, "id", "id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	modelID, err := pathID(r, "modelId", "model_id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request updateModelRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		httpx.Error(w, r, platform.Invalid("body", "request body must be a JSON object"))
+		return
+	}
+	model, err := h.svc.UpdateModel(r.Context(), configID, modelID, request.patch(), actorID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -234,6 +305,62 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 		items = append(items, toModelDTO(model))
 	}
 	httpx.List(w, http.StatusOK, items, "", false)
+}
+
+// ListPublicModels GET /api/llm/models.
+//
+// The login-user model catalog backs the conversation model selector. Only
+// models of the unique active *default* LLM configuration that are themselves
+// enabled and not deprecated are returned (spec §7.3/§9.1); deprecated rows
+// stay in the admin catalog for display but can never be selected for a run.
+// Restricting the catalog to the default configuration is what keeps it
+// consistent with the conversation override resolver, which resolves only that
+// configuration: another active configuration's models would be advertised but
+// every PATCH naming them would be rejected. The response carries the 0.2.1
+// capability set and the config's default marker, and never any gateway
+// credential or base URL.
+func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
+	configs, err := h.svc.ListConfigs(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	defaultConfig, ok := activeDefaultConfig(configs)
+	if !ok {
+		// No active default configuration is selectable, so the catalog is
+		// empty (matching the override resolver, which has no target config).
+		httpx.JSON(w, http.StatusOK, []publicModelDTO{})
+		return
+	}
+	models, err := h.svc.ListModels(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]publicModelDTO, 0, len(models))
+	for _, model := range models {
+		if model.ConfigID != defaultConfig.ID || !model.Selectable() {
+			continue
+		}
+		items = append(items, toPublicModelDTO(model, defaultConfig))
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
+// activeDefaultConfig mirrors the application's selectConfig(0): the unique
+// is_default configuration must be active to be usable. First match wins, like
+// the service, so the catalog and the override resolver always agree.
+func activeDefaultConfig(configs []llm.Config) (llm.Config, bool) {
+	for _, cfg := range configs {
+		if !cfg.IsDefault {
+			continue
+		}
+		if cfg.Status != llm.StatusActive {
+			return llm.Config{}, false
+		}
+		return cfg, true
+	}
+	return llm.Config{}, false
 }
 
 func requireActor(w http.ResponseWriter, r *http.Request) (int64, bool) {
