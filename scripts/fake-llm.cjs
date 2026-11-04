@@ -810,7 +810,7 @@ async function handleRequest(req, res) {
     });
     return;
   }
-  if (req.method === "GET" && pathname === "/v1/models") {
+  if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
     sendJson(res, 200, { object: "list", data: MODELS });
     return;
   }
