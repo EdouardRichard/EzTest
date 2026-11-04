@@ -225,7 +225,7 @@ scripts. PostgreSQL is not bundled; it must be reachable from the machine.
 | Linux x64 (glibc) | `eztest-0.2.1-linux-x64.tar.gz` (~400 MB) |
 | Checksums | `SHA256SUMS.txt` |
 
-Download the archives from the [Releases](https://github.com/EdouardRichard/EzTest/releases) page.
+Download the archives from the private/binary release location (see docs/version-V0.2.1/acceptance/sign-off.md).
 Each package also ships the OpenAPI 3.0 contract at `docs/openapi/api.yaml`.
 On Linux, run the bundled `install-linux-deps.sh` once to install the Chromium system libraries
 (needs sudo); Windows needs nothing beyond the package. Free ports **13333**, **6868**, **13336** and
