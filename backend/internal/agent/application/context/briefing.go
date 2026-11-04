@@ -547,13 +547,18 @@ func casesBody(in CasesSnapshot) string {
 }
 
 // planTerminalStatuses are the statuses that mean a plan item no longer needs
-// work (spec R-A8-5). Current and next are always chosen among the other items.
+// work (spec R-A8-5). The set mirrors the production read port filter
+// (done/completed/cancelled/skipped/failed/closed) and also accepts the
+// cancelled spelling alias. Current and next are always chosen among the other
+// items.
 var planTerminalStatuses = map[string]bool{
 	"done":      true,
 	"completed": true,
 	"skipped":   true,
 	"cancelled": true,
 	"canceled":  true,
+	"failed":    true,
+	"closed":    true,
 }
 
 // planItemView is one renderable plan item: its normalized status and its

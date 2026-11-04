@@ -405,12 +405,12 @@ func TestBriefingSectionBudgets(t *testing.T) {
 		t.Fatalf("probe briefing uses %d tokens, want <= 3000", got)
 	}
 	plan := renderedSection(rendered, "计划")
-	if got := briefingTokens(plan); got < 590 || got > 600 {
-		t.Fatalf("plan section uses %d tokens, want the 600-token budget:\n%s", got, plan)
+	if got := briefingTokens(plan); got != 600 {
+		t.Fatalf("plan section uses %d tokens, want exactly 600 (600*5/3 = 1000 truncated runes):\n%s", got, plan)
 	}
 	findings := renderedSection(rendered, "发现")
-	if got := briefingTokens(findings); got < 790 || got > 800 {
-		t.Fatalf("findings section uses %d tokens, want the 800-token budget:\n%s", got, findings)
+	if got := briefingTokens(findings); got != 800 {
+		t.Fatalf("findings section uses %d tokens, want exactly 800 (800*5/3 = 1333 truncated runes):\n%s", got, findings)
 	}
 }
 
@@ -501,6 +501,222 @@ func TestBriefingKeepsCurrentAndNextPlanItems(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestBriefingPlanTerminalStatuses pins which plan statuses are terminal for
+// the current/next selection (R-A8-5). The set must match the production read
+// port filter (done/completed/cancelled/skipped/failed/closed) plus the
+// cancelled spelling alias, matched case-insensitively and after oneLine
+// normalization; an empty or unknown status still counts as open work. A
+// terminal item can never become current while an open item is available.
+func TestBriefingPlanTerminalStatuses(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		terminal bool
+	}{
+		{"done", "done", true},
+		{"completed", "completed", true},
+		{"cancelled", "cancelled", true},
+		{"canceled alias", "canceled", true},
+		{"skipped", "skipped", true},
+		{"failed", "failed", true},
+		{"closed", "closed", true},
+		{"uppercase done", "DONE", true},
+		{"mixed case completed", "Completed", true},
+		{"uppercase canceled", "CANCELED", true},
+		{"uppercase failed", "FAILED", true},
+		{"uppercase closed", "CLOSED", true},
+		{"whitespace normalized", "  closed  ", true},
+		{"empty is open", "", false},
+		{"pending is open", "pending", false},
+		{"in progress is open", "in_progress", false},
+		{"unknown is open", "mystery", false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			source := agentcontext.Source{
+				Plan: []agentcontext.PlanItemSnapshot{
+					{ID: 1, Title: "候选状态项", Status: testCase.status},
+					{ID: 2, Title: "兜底待办", Status: "pending"},
+				},
+			}
+			rendered := buildBriefing(t, source, 124).Render()
+			plan := renderedSection(rendered, "计划")
+			lines := strings.Split(plan, "\n")
+			if len(lines) == 0 || lines[0] == "" {
+				t.Fatalf("plan section is empty:\n%s", rendered)
+			}
+			want := "当前：[pending] 兜底待办"
+			if !testCase.terminal {
+				want = "当前：候选状态项"
+				if status := strings.Join(strings.Fields(testCase.status), " "); status != "" {
+					want = "当前：[" + status + "] 候选状态项"
+				}
+			}
+			if lines[0] != want {
+				t.Fatalf("status %q: first plan line = %q, want %q:\n%s", testCase.status, lines[0], want, plan)
+			}
+		})
+	}
+}
+
+// competingSqueezeSource is the discriminating mandatory-prefix fixture. The
+// four other regular groups carry enough content to compete for the total
+// budget, and the protected open questions are large enough that the six
+// regular groups are squeezed almost to their markers. The plan/findings
+// proportional share falls below the protected current/next and top-3 prefixes,
+// so their visibility can only come from the mandatory reservation.
+func competingSqueezeSource() agentcontext.Source {
+	base := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	source := agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "验证竞争压缩", Stage: "executing"},
+	}
+	for index := 0; index < 20; index++ {
+		source.Requirements.Confirmed = append(source.Requirements.Confirmed, agentcontext.RequirementSnapshot{
+			Title:      fmt.Sprintf("需求标题%d", index),
+			Acceptance: strings.Repeat("验收标准", 20),
+		})
+	}
+	for index := 0; index < 8; index++ {
+		source.Cases.CoverageGaps = append(source.Cases.CoverageGaps, strings.Repeat("覆盖缺口", 20))
+	}
+	source.Plan = []agentcontext.PlanItemSnapshot{
+		{ID: 1, Title: "生成用例草稿", Status: "in_progress", DependsOn: []string{"完成需求梳理"}},
+		{ID: 2, Title: "补充边界用例", Status: "pending", DependsOn: []string{"生成用例草稿"}},
+		{ID: 3, Title: "执行回归测试", Status: "pending", DependsOn: []string{"补充边界用例"}},
+		{ID: 4, Title: "归档旧结果", Status: "done"},
+	}
+	for index := 0; index < 8; index++ {
+		source.Findings = append(source.Findings, agentcontext.FactSnapshot{
+			ID:         int64(index + 1),
+			Kind:       "page",
+			Key:        fmt.Sprintf("top-%d", index+1),
+			Summary:    strings.Repeat("事实摘要", 8),
+			Confidence: floatPtr(0.95 - float64(index)*0.05),
+			CreatedAt:  base.Add(time.Duration(index) * time.Minute),
+		})
+	}
+	source.Execution = agentcontext.ExecutionSnapshot{
+		WaveStatus: "failed", Passed: 5, Failed: 9, Blocked: 2, Skipped: 1,
+		Blocker: strings.Repeat("执行阻塞原因", 50),
+	}
+	for index := 0; index < 5; index++ {
+		source.Knowledge = append(source.Knowledge, agentcontext.KnowledgeSnapshot{
+			ID:         int64(index + 1),
+			Title:      fmt.Sprintf("知识标题%d", index),
+			Summary:    strings.Repeat("知识摘要", 30),
+			Confidence: floatPtr(0.8),
+		})
+	}
+	// 4,660 protected open-question runes: the render lands just inside the 3k
+	// envelope, so Render must squeeze the regular groups instead of falling
+	// into the documented protected-content exception.
+	source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
+		Questions: []string{strings.Repeat("压缩", 2330)},
+	}
+	return source
+}
+
+// TestBriefingMandatoryPrefixesSurviveCompetingSqueeze is the R-A8-5
+// discrimination test: unlike the small current/next and top-3 fixtures, the
+// plan and findings groups must compete for the total envelope with large
+// unprotected sections. The squeeze allowance left for the plan and findings is
+// zero runes (both bodies collapse to their mandatory prefix plus the
+// truncation marker), so only the protected-prefix mechanism can keep the
+// tail of the second plan label (its dependency) and the tail of the third fact
+// (its confidence) visible. If that mechanism is removed these exact substrings
+// disappear.
+func TestBriefingMandatoryPrefixesSurviveCompetingSqueeze(t *testing.T) {
+	rendered := buildBriefing(t, competingSqueezeSource(), 125).Render()
+	if got := briefingTokens(rendered); got > agentcontext.BriefingTokenBudget {
+		t.Fatalf("squeezed briefing uses %d tokens, want <= %d", got, agentcontext.BriefingTokenBudget)
+	}
+
+	plan := renderedSection(rendered, "计划")
+	for _, want := range []string{
+		"当前：[in_progress] 生成用例草稿（依赖：完成需求梳理）",
+		"下一步：[pending] 补充边界用例（依赖：生成用例草稿）",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Fatalf("squeezed plan dropped the mandatory label tail %q:\n%s", want, plan)
+		}
+	}
+	if !strings.Contains(plan, "…") {
+		t.Fatalf("plan section was not squeezed:\n%s", plan)
+	}
+	if strings.Contains(plan, "执行回归测试") {
+		t.Fatalf("plan optional tail survived the squeeze fixture:\n%s", plan)
+	}
+
+	findings := renderedSection(rendered, "发现")
+	summary := strings.Repeat("事实摘要", 8)
+	for _, want := range []string{
+		"- [page] top-1：" + summary + "（置信 0.95）",
+		"- [page] top-2：" + summary + "（置信 0.90）",
+		"- [page] top-3：" + summary + "（置信 0.85）",
+	} {
+		if !strings.Contains(findings, want) {
+			t.Fatalf("squeezed findings dropped the mandatory fact tail %q:\n%s", want, findings)
+		}
+	}
+	if !strings.Contains(findings, "…") {
+		t.Fatalf("findings section was not squeezed:\n%s", findings)
+	}
+	if strings.Contains(findings, "top-4") {
+		t.Fatalf("findings optional tail survived the squeeze fixture:\n%s", findings)
+	}
+
+	// The competing unprotected groups sit far below their section caps (600 /
+	// 300 / 200 / 200 tokens): the squeeze is severe, not incidental.
+	for _, title := range []string{"需求", "用例", "执行", "知识"} {
+		body := renderedSection(rendered, title)
+		if got := briefingTokens(body); got > 10 {
+			t.Fatalf("section %q uses %d tokens, want <= 10 after the competing squeeze:\n%s", title, got, body)
+		}
+	}
+}
+
+// TestBriefingMandatoryPlanPrefixExceedsSectionCap pins the raise-to-protected
+// branch of the plan truncation: the current/next labels (long titles and
+// dependencies) alone exceed the 600-token plan section budget (600*5/3 = 1000
+// runes). Render must still emit the whole mandatory prefix, letting the plan
+// section body exceed its own budget rather than cut current/next.
+func TestBriefingMandatoryPlanPrefixExceedsSectionCap(t *testing.T) {
+	title := strings.Repeat("超长计划标题", 65)
+	nextTitle := title + "（副本）"
+	currentDependency := strings.Repeat("前置依赖甲", 25)
+	nextDependency := strings.Repeat("前置依赖乙", 25)
+	source := agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "验证必显前缀超出分节预算", Stage: "executing"},
+		Plan: []agentcontext.PlanItemSnapshot{
+			{ID: 1, Title: title, Status: "in_progress", DependsOn: []string{currentDependency}},
+			{ID: 2, Title: nextTitle, Status: "pending", DependsOn: []string{nextDependency}},
+			{ID: 3, Title: "可选计划项", Status: "pending"},
+		},
+	}
+	rendered := buildBriefing(t, source, 126).Render()
+	plan := renderedSection(rendered, "计划")
+	for _, want := range []string{
+		"当前：[in_progress] " + title + "（依赖：" + currentDependency + "）",
+		"下一步：[pending] " + nextTitle + "（依赖：" + nextDependency + "）",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Fatalf("over-cap plan dropped the mandatory label tail %q:\n%s", want, plan)
+		}
+	}
+	if got := briefingTokens(plan); got <= 600 {
+		t.Fatalf("plan section uses %d tokens, want > 600: the mandatory prefix must raise the section truncation limit:\n%s", got, plan)
+	}
+	if !strings.Contains(plan, "…") {
+		t.Fatalf("plan optional tail was not truncated:\n%s", plan)
+	}
+	if strings.Contains(plan, "可选计划项") {
+		t.Fatalf("plan optional item survived the over-cap truncation:\n%s", plan)
+	}
+	if got := briefingTokens(rendered); got > agentcontext.BriefingTokenBudget {
+		t.Fatalf("briefing uses %d tokens, want <= %d", got, agentcontext.BriefingTokenBudget)
+	}
 }
 
 // topFactsSource is the R-A8-5 top-3 fixture: eight findings with a descending
