@@ -632,7 +632,7 @@ func TestCreateApproveRejectSecrets(t *testing.T) {
 			secret  string
 		}{
 			{"assignment", `{"title":"登录配方","content":"password=hunter2"}`, "hunter2"},
-			{"jwt", `{"title":"登录配方","content":"token: [REDACTED_TOKEN]"}`,
+			{"jwt", `{"title":"登录配方","content":"token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"}`,
 				"eyJhbGciOiJIUzI1NiJ9"},
 			{"tag", `{"title":"登录配方","content":"打开 /login","tags":["Bearer abc123"]}`, "abc123"},
 		} {
