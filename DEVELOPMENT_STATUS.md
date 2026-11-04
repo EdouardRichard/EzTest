@@ -1,6 +1,6 @@
 # Development Status
 
-EzTest 0.2.1 — release readiness in progress (S0-S10 retry14 PASS; final-HEAD trap re-run + security history pending).
+EzTest 0.2.1 — release readiness in progress (S0-S10 retry14 PASS; final trap PASS_WITH_FINDINGS + QA rev5 PASS; release waivers/security pending).
 # EzTest 寮€鍙戠姸鎬侊紙0.2 / P8锛?
 
 > 鐘舵€侊細**P8 宸蹭弗鏍肩鏍稿畬鎴愶紙S9/S10 琛ヨ窇 PASS锛汱16鈥揕18 宸插叧闂級**锛?026-11-02锛涘彂甯冨垎鏀?`main`/`dev` 淇濈暀 B 鏃剁偣锛屽綋鍓?`feat/v0.2` 缁х画 A 琛ュ己锛夈€?

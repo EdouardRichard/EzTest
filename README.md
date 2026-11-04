@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: v0.2-preview" src="https://img.shields.io/badge/status-v0.2--preview-orange">
+  <img alt="Status: v0.2.1" src="https://img.shields.io/badge/status-v0.2--preview-orange">
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Go 1.24" src="https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white">
   <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-black">
@@ -16,7 +16,7 @@
   <img alt="Playwright 1.64" src="https://img.shields.io/badge/Playwright-1.64-2EAD33">
 </p>
 
-> **Status: v0.2-preview (pre-release).** EzTest implements the complete pipeline below and has been
+> **Status: v0.2.1 (pre-release).** EzTest implements the complete pipeline below and has been
 > exercised end-to-end on the maintainers' host with a real browser and a real OpenAI-compatible model.
 > This is a preview for evaluation, not a production release — validate it in your own environment
 > before relying on it.
@@ -221,8 +221,8 @@ scripts. PostgreSQL is not bundled; it must be reachable from the machine.
 
 | Platform | Archive |
 |---|---|
-| Windows x64 | `eztest-0.2.0-preview.1-windows-x64.zip` (~400 MB) |
-| Linux x64 (glibc) | `eztest-0.2.0-preview.1-linux-x64.tar.gz` (~400 MB) |
+| Windows x64 | `eztest-0.2.1-windows-x64.zip` (~400 MB) |
+| Linux x64 (glibc) | `eztest-0.2.1-linux-x64.tar.gz` (~400 MB) |
 | Checksums | `SHA256SUMS.txt` |
 
 Download the archives from the [Releases](https://github.com/EdouardRichard/EzTest/releases) page.
@@ -233,8 +233,8 @@ On Linux, run the bundled `install-linux-deps.sh` once to install the Chromium s
 
 ```powershell
 # Windows (PowerShell) — extract and enter the package folder
-Expand-Archive .\eztest-0.2.0-preview.1-windows-x64.zip -DestinationPath .\eztest
-cd .\eztest\eztest-0.2.0-preview.1-windows-x64
+Expand-Archive .\eztest-0.2.1-windows-x64.zip -DestinationPath .\eztest
+cd .\eztest\eztest-0.2.1-windows-x64
 .\init-config.ps1 -DatabaseUrl "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 .\start-eztest.ps1        # starts API, executor, renderer and web, then waits for health
 .\status-eztest.ps1       # processes, health probes and PostgreSQL status
@@ -243,7 +243,7 @@ cd .\eztest\eztest-0.2.0-preview.1-windows-x64
 ```
 
 Run these commands from the folder that directly contains `init-config.ps1` and
-`start-eztest.ps1` (the `eztest-0.2.0-preview.1-windows-x64` directory inside the extraction
+`start-eztest.ps1` (the `eztest-0.2.1-windows-x64` directory inside the extraction
 destination). If PowerShell says `.\init-config.ps1` is not recognized, you are in a parent folder —
 use `Get-ChildItem -Recurse -Filter init-config.ps1` to locate the package folder and `cd` into it.
 
@@ -265,8 +265,8 @@ scripts are not affected.
 ```bash
 # Linux (x64) — extract and enter the package folder
 mkdir -p eztest
-tar -xzf eztest-0.2.0-preview.1-linux-x64.tar.gz -C eztest
-cd eztest/eztest-0.2.0-preview.1-linux-x64
+tar -xzf eztest-0.2.1-linux-x64.tar.gz -C eztest
+cd eztest/eztest-0.2.1-linux-x64
 bash install-linux-deps.sh                                  # once, needs sudo
 bash init-config.sh --database-url "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 bash start-eztest.sh
