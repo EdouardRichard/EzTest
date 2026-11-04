@@ -393,10 +393,10 @@ func summaryCJK(r rune) bool {
 	}
 }
 
-// selectSummaryInput applies the R-A5-12 watermark exactly once per public
-// summary entry point. Messages may therefore be passed unfiltered: the
-// deterministic builder and the request builder both fold only the messages the
-// previous summary revision did not cover.
+// selectSummaryInput applies the R-A5-12 watermark exactly once per summary
+// transaction. Messages may therefore be passed unfiltered: the internal
+// builders assume an already-selected input and never filter again, so the
+// deterministic summary and the prefix request fold exactly the same slice.
 func selectSummaryInput(in SummaryInput) SummaryInput {
 	in.Messages = SelectSummaryMessages(in.Messages, in.PreviousCoveredMessageID)
 	return in
@@ -413,9 +413,15 @@ func BuildSummary(in SummaryInput) string {
 }
 
 // BuildSummaryResult is BuildSummary plus the truncation/token bookkeeping used
-// by the summary_truncated flag and event (R-A5-7).
+// by the summary_truncated flag and event (R-A5-7). The watermark is applied
+// here, and Summarize reuses the selected input for both the request and the
+// result so one transaction folds exactly one filtered slice (R-A5-12).
 func BuildSummaryResult(in SummaryInput) SummaryResult {
-	in = selectSummaryInput(in)
+	return buildSummaryResult(selectSummaryInput(in))
+}
+
+// buildSummaryResult is the already-selected builder. It never filters again.
+func buildSummaryResult(in SummaryInput) SummaryResult {
 	sections := buildSummarySections(in)
 	text, truncated := renderSummaryWithinBudget(sections, in.summaryMax())
 	return SummaryResult{
@@ -511,18 +517,25 @@ func summaryDBTruthSection(index int) bool {
 }
 
 // summaryMaterialMessages drops the pinned latest user message from the summary
-// material (R-A5-4). A trailing user message is the current/triggering turn: it
+// material (R-A5-4). The latest user message is the current/triggering turn: it
 // is retained verbatim by the live transcript and must never be folded into the
-// summary. Older user messages with a reply after them are folded transcript
-// material and stay.
+// summary. Only that one message is excluded; earlier user turns and all
+// assistant/tool material stay.
 func summaryMaterialMessages(messages []SummaryReplayMessage) []SummaryReplayMessage {
-	if len(messages) == 0 {
+	latest := -1
+	for index := len(messages) - 1; index >= 0; index-- {
+		if strings.EqualFold(strings.TrimSpace(messages[index].Role), "user") {
+			latest = index
+			break
+		}
+	}
+	if latest < 0 {
 		return messages
 	}
-	if !strings.EqualFold(strings.TrimSpace(messages[len(messages)-1].Role), "user") {
-		return messages
-	}
-	return messages[:len(messages)-1]
+	material := make([]SummaryReplayMessage, 0, len(messages)-1)
+	material = append(material, messages[:latest]...)
+	material = append(material, messages[latest+1:]...)
+	return material
 }
 
 // summaryGoalBody lists the older user requests folded into the summary. It is
@@ -1073,17 +1086,17 @@ func summaryPinnedNeedles(in SummaryInput) []string {
 	return needles
 }
 
-// summaryLatestUserText returns the trailing user message (the R-A5-4 pinned
-// latest user message) when the folded range ends with one.
+// summaryLatestUserText returns the latest user message of the folded range (the
+// R-A5-4 pinned latest user message) when one is present.
 func summaryLatestUserText(messages []SummaryReplayMessage) string {
-	if len(messages) == 0 {
-		return ""
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			continue
+		}
+		return summaryOneLine(message.Content)
 	}
-	last := messages[len(messages)-1]
-	if !strings.EqualFold(strings.TrimSpace(last.Role), "user") {
-		return ""
-	}
-	return summaryOneLine(last.Content)
+	return ""
 }
 
 // summaryLineHasNeedle reports whether a whitespace-normalized line contains any
@@ -1274,9 +1287,15 @@ const summaryInstructionMarker = "压缩指令"
 // compaction instruction as the last user message. Replaying the live messages
 // before the folded range is what lets the provider reuse the mid-transcript
 // prefix cache, not just the system prompt. Tool calls, tool-call identities,
-// reasoning content and images are preserved on replay.
+// reasoning content and images are preserved on replay. The watermark is applied
+// here; Summarize reuses the selected input for the result as well.
 func BuildSummaryRequest(in SummaryInput) llmapp.ChatRequest {
-	in = selectSummaryInput(in)
+	return buildSummaryRequest(selectSummaryInput(in))
+}
+
+// buildSummaryRequest is the already-selected request builder. It never filters
+// again.
+func buildSummaryRequest(in SummaryInput) llmapp.ChatRequest {
 	system := in.StablePrefix
 	if system == "" {
 		system = summaryCompactionSystemPrompt
@@ -1315,9 +1334,10 @@ func summaryReplayChatMessage(message SummaryReplayMessage) llmapp.ChatMessage {
 
 // SelectSummaryMessages returns the messages newer than the covered watermark
 // (R-A5-12). IDs are monotonic in a conversation, so a summary only folds the
-// messages the previous revision did not cover. BuildSummaryResult and
-// BuildSummaryRequest both call it exactly once, so callers pass Messages
-// unfiltered and the watermark is applied on a single, shared boundary.
+// messages the previous revision did not cover. Summarize applies it once per
+// transaction and hands the same selected input to the request and result
+// builders; the exported BuildSummaryResult/BuildSummaryRequest apply it once
+// for callers that start from unfiltered Messages.
 func SelectSummaryMessages(messages []SummaryReplayMessage, coveredMessageID int64) []SummaryReplayMessage {
 	if coveredMessageID <= 0 {
 		return messages
@@ -1686,22 +1706,26 @@ func NewCompactionSummarizer(chat llmapp.ChatGateway, options ...CompactionSumma
 // the provider cached_tokens and publishes summary_truncated. A provider failure
 // or a missing gateway degrades to the deterministic summary instead of failing
 // the compaction (R-A5-10).
+//
+// R-A5-12: the watermark is applied exactly once per transaction and the same
+// selected input feeds the request, the deterministic fallback and the result.
 func (s *CompactionSummarizer) Summarize(ctx context.Context, in SummaryInput) SummaryResult {
+	selected := selectSummaryInput(in)
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return s.fallback(ctx, in, err)
+			return s.fallback(ctx, selected, err)
 		}
 	}
 	if s == nil || s.chat == nil {
-		return s.fallback(ctx, in, errors.New("compaction summarizer is not configured"))
+		return s.fallback(ctx, selected, errors.New("compaction summarizer is not configured"))
 	}
-	response, err := s.chat.Chat(ctx, BuildSummaryRequest(in))
+	response, err := s.chat.Chat(ctx, buildSummaryRequest(selected))
 	if err != nil {
-		return s.fallback(ctx, in, err)
+		return s.fallback(ctx, selected, err)
 	}
-	final := in
+	final := selected
 	final.Draft = strings.TrimSpace(response.Content)
-	result := BuildSummaryResult(final)
+	result := buildSummaryResult(final)
 	if strings.TrimSpace(final.Draft) == "" {
 		result.UsedFallback = true
 		result.FallbackReason = "summary model returned an empty response"
@@ -1716,16 +1740,17 @@ func (s *CompactionSummarizer) Summarize(ctx context.Context, in SummaryInput) S
 		result.CacheHit = cacheHit
 	}
 	if result.Truncated {
-		s.publishTruncated(ctx, in, result)
+		s.publishTruncated(ctx, selected, result)
 	}
 	return result
 }
 
 // fallback returns the deterministic nine-section summary and records why the
-// model path was skipped. A truncated fallback still publishes summary_truncated
-// (R-A5-7): the event must not depend on which path authored the summary.
+// model path was skipped. in is already watermark-selected. A truncated fallback
+// still publishes summary_truncated (R-A5-7): the event must not depend on which
+// path authored the summary.
 func (s *CompactionSummarizer) fallback(ctx context.Context, in SummaryInput, cause error) SummaryResult {
-	result := BuildSummaryResult(in)
+	result := buildSummaryResult(in)
 	result.UsedFallback = true
 	if cause != nil {
 		result.FallbackReason = cause.Error()

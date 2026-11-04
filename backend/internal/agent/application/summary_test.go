@@ -742,6 +742,25 @@ func TestSummaryPreservesBareNumbers(t *testing.T) {
 	}
 }
 
+// TestSummaryExcludesLatestUserEvenWhenFollowedByToolOutput pins the R-A5-4
+// scope of the latest-user exclusion: the newest user message is pinned even
+// when later assistant/tool material follows it in the folded range, and the
+// folded tool output still survives in the summary.
+func TestSummaryExcludesLatestUserEvenWhenFollowedByToolOutput(t *testing.T) {
+	in := testSummaryInput()
+	in.Messages = append(in.Messages, agentapp.SummaryReplayMessage{
+		ID: 5, Role: "tool",
+		Content: "post-turn tool output: attachment_id=9002",
+	})
+	out := agentapp.BuildSummary(in)
+	if strings.Contains(out, "请实现 /api/login；错误码 FR-001。") {
+		t.Fatalf("summary folded the pinned latest user message:\n%s", out)
+	}
+	if !strings.Contains(out, "attachment_id=9002") {
+		t.Fatalf("summary dropped the folded post-turn tool output:\n%s", out)
+	}
+}
+
 // TestSummaryCommitCapsPinnedFacts pins the R-A5-4 ≤20 cap on the persistence
 // hook: the commit carries only the newest MaxPinnedFacts facts.
 func TestSummaryCommitCapsPinnedFacts(t *testing.T) {
