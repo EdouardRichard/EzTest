@@ -90,13 +90,15 @@ function Get-LatestPacket {
         Packet = $packet
         Text = (Get-PacketText -Packet $packet)
         PrefixHash = [string](Get-JsonProp -Object $packet -Name "prefix_hash" -Default "")
-        Id = [string](Get-JsonProp -Object $packet -Name "id" -Default "")
-        CreatedAt = [string](Get-JsonProp -Object $packet -Name "created_at" -Default "")
+        BriefingHash = [string](Get-JsonProp -Object $packet -Name "briefing_hash" -Default "")
+
     }
 }
 
 try {
     $injectedPacketId = ""
+    $injectedBriefingHash = ""
+    $injectedText = ""
     Write-AcceptanceLog -Scenario $scenario -Message "S9 knowledge acceptance; injectionTimeout=${InjectionTimeoutSeconds}s revokeTimeout=${RevokeTimeoutSeconds}s token=$token"
 
     $login = Connect-EzTest -Context $context
@@ -192,7 +194,8 @@ try {
             }
             if ($null -ne $injected) {
                 $injectedPacketHash = $injected.PrefixHash
-                $injectedPacketId = $injected.Id
+                $injectedBriefingHash = $injected.BriefingHash
+                $injectedText = $injected.Text
                 Write-EvidenceJson -Path (Join-Path $scenario.Directory "s9-context-packet-injected.json") -Value $injected.Packet
                 Add-AcceptanceArtifact -Scenario $scenario -Path (Join-Path $scenario.Directory "s9-context-packet-injected.json") -Kind "api" -Note "context packet with injected knowledge"
             }
@@ -234,7 +237,7 @@ try {
             $postRevokePacket = $null
             while ((Get-Date) -lt $deadline) {
                 $latest = Get-LatestPacket -Context $context -VersionId $versionId
-                if ($latest.HttpStatus -eq 200 -and -not ($latest.Text -match [regex]::Escape($marker)) -and (($latest.Id -ne "" -and $latest.Id -ne $injectedPacketId) -or ($latest.CreatedAt -ne "" -and $latest.CreatedAt -gt $revokedAt))) {
+                if ($latest.HttpStatus -eq 200 -and -not ($latest.Text -match [regex]::Escape($marker)) -and (($latest.BriefingHash -ne "" -and $latest.BriefingHash -ne $injectedBriefingHash) -or ($latest.Text -ne "" -and $latest.Text -ne $injectedText))) {
                     $postRevokePacket = $latest
                     break
                 }
