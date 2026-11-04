@@ -88,16 +88,21 @@ export function getConversation(versionId: string, conversationId: string): Prom
 
 /**
  * Loads one page of the conversation thread in ascending id order and keeps the
- * server pagination envelope (`next_cursor`/`has_more`). The history cursor must
- * come from here, never from the last live/optimistic message in the thread.
+ * server pagination envelope (`next_cursor`/`has_more`).
+ *
+ * API-8: with no cursor the endpoint returns the **latest** page; pass the
+ * oldest loaded id as `before` to walk backwards through history (the design's
+ * "首屏最新页" contract). `after` is kept for the legacy oldest-first P1
+ * envelope so already-loaded threads can still extend forwards.
  */
 export function listMessages(
   versionId: string,
   conversationId: string,
-  options: { after?: string; limit?: number } = {},
+  options: { before?: string; after?: string; limit?: number } = {},
 ): Promise<ApiPage<ConversationMessage>> {
   return apiGetPage<ConversationMessage>(
     `${conversationPath(versionId, conversationId)}/messages${query({
+      before: options.before,
       after: options.after,
       limit: options.limit ?? 100,
     })}`,

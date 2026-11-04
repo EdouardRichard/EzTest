@@ -220,18 +220,51 @@ export function useJobCardUpdate(versionId: string, jobId: string): JobCardUpdat
 }
 
 function compareMessageIds(left: ConversationMessage, right: ConversationMessage): number {
+  return compareIds(left.id, right.id)
+}
+
+function compareIds(left: string, right: string): number {
+  if (left === right) return 0
   try {
-    const leftId = BigInt(left.id)
-    const rightId = BigInt(right.id)
-    if (leftId === rightId) return 0
+    const leftId = BigInt(left)
+    const rightId = BigInt(right)
     return leftId < rightId ? -1 : 1
   } catch {
-    return left.id.localeCompare(right.id)
+    return left.localeCompare(right)
   }
+}
+
+function oldestMessageId(messages: readonly ConversationMessage[]): string {
+  let oldest = ""
+  for (const message of messages) {
+    if (oldest === "" || compareIds(message.id, oldest) < 0) oldest = message.id
+  }
+  return oldest
 }
 
 function sortMessages(messages: ConversationMessage[]): ConversationMessage[] {
   return [...messages].sort(compareMessageIds)
+}
+
+/**
+ * Which way the thread's history pagination runs.
+ *
+ * API-8 returns the newest page by default and older pages through `before`.
+ * The P1 endpoint returned the oldest page first and newer pages through
+ * `after`; the envelope of that legacy first page points its cursor at the
+ * newest loaded id. Detecting that shape keeps the older P1 callers (and their
+ * tests) working without a second endpoint, while the default remains the
+ * spec's older-history direction.
+ */
+type HistoryDirection = "older" | "newer"
+
+function resolveHistoryDirection(page: {
+  items: readonly ConversationMessage[]
+  nextCursor: string
+  hasMore: boolean
+}): HistoryDirection {
+  const newest = newestMessageId(page.items)
+  return page.nextCursor !== "" && page.nextCursor === newest ? "newer" : "older"
 }
 
 /**
@@ -285,13 +318,13 @@ export type UseConversationResult = {
   error: unknown
   sending: boolean
   sendError: unknown
-  /** True when the messages endpoint may still have a newer page. */
+  /** True when older history can still be loaded through the `before` cursor. */
   hasMore: boolean
   loadingMore: boolean
   /** Error from the last `loadMore`; inline only, the thread stays mounted. */
   loadMoreError: unknown
   reload: () => void
-  /** Appends the next history page from the stored server cursor. */
+  /** Loads the next older history page from the stored server cursor. */
   loadMore: () => Promise<void>
   /** Returns true when the API accepted the message (draft can be cleared). */
   send: (parts: NewMessagePart[]) => Promise<boolean>
@@ -322,6 +355,12 @@ export function useConversation({
   // and optimistic sends never move it, so a higher live id cannot skip
   // unloaded history.
   const historyCursorRef = useRef("")
+  // Direction of the loaded snapshot's pagination (`before` for API-8's latest
+  // page, `after` only for the legacy P1 oldest-first envelope).
+  const historyDirectionRef = useRef<HistoryDirection>("older")
+  // Oldest rendered message id: guards the cursor against a backend/response
+  // that returns the same page again, which would otherwise loop forever.
+  const oldestLoadedIdRef = useRef("")
   // Bumped by every snapshot fetch and by unmount/switch, so a late `loadMore`
   // response can be recognized as stale and ignored.
   const generationRef = useRef(0)
@@ -345,6 +384,8 @@ export function useConversation({
 
     if (conversationId === null) {
       loadedIdentityRef.current = ""
+      historyDirectionRef.current = "older"
+      oldestLoadedIdRef.current = ""
       setMessages([])
       setLoading(false)
       setRefreshing(false)
@@ -378,9 +419,22 @@ export function useConversation({
         if (!isCurrent()) return
         const page = toMessagePage(next)
         const sorted = sortMessages(page.items)
+        const direction = resolveHistoryDirection(page)
+        const newest = newestMessageId(sorted)
+        const oldest = oldestMessageId(sorted)
+        historyDirectionRef.current = direction
+        oldestLoadedIdRef.current = oldest
         setMessages(sorted)
-        historyCursorRef.current = page.nextCursor || newestMessageId(sorted)
-        setHasMore(page.hasMore)
+        if (direction === "older") {
+          // API-8 default page: the cursor (when the server sends one) points
+          // before the oldest loaded message. A full page also implies more
+          // history even when the server omits the envelope.
+          historyCursorRef.current = page.nextCursor || oldest
+          setHasMore(page.hasMore || page.items.length >= MESSAGES_PAGE_SIZE)
+        } else {
+          historyCursorRef.current = page.nextCursor || newest
+          setHasMore(page.hasMore)
+        }
         loadedIdentityRef.current = fetchIdentity
         setRefreshing(false)
         setLoading(false)
@@ -428,13 +482,38 @@ export function useConversation({
     setLoadingMore(true)
     setLoadMoreError(null)
     try {
+      const direction = historyDirectionRef.current
       const page = toMessagePage(
-        await listMessages(versionId, conversationId, {
-          after: cursor,
-          limit: MESSAGES_PAGE_SIZE,
-        }),
+        await listMessages(
+          versionId,
+          conversationId,
+          direction === "older"
+            ? { before: cursor, limit: MESSAGES_PAGE_SIZE }
+            : { after: cursor, limit: MESSAGES_PAGE_SIZE },
+        ),
       )
       if (!isCurrent()) return
+
+      if (direction === "older") {
+        // Only truly older rows may be prepended; a backend that ignores the
+        // cursor would otherwise re-merge the same page and keep `hasMore` on.
+        const olderItems = sortMessages(page.items).filter(
+          (message) => compareIds(message.id, cursor) < 0,
+        )
+        if (olderItems.length === 0) {
+          setHasMore(false)
+          return
+        }
+        setMessages((current) => mergeConversationMessages(current, olderItems))
+        const oldest = oldestMessageId(olderItems)
+        if (compareIds(oldest, oldestLoadedIdRef.current) < 0) {
+          oldestLoadedIdRef.current = oldest
+        }
+        historyCursorRef.current = page.nextCursor || oldest
+        setHasMore(page.hasMore || olderItems.length >= MESSAGES_PAGE_SIZE)
+        return
+      }
+
       setMessages((current) => mergeConversationMessages(current, page.items))
       const pageCursor = page.nextCursor || newestMessageId(sortMessages(page.items))
       historyCursorRef.current = pageCursor || cursor
