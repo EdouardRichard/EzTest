@@ -37,15 +37,16 @@ const (
 )
 
 // CompletionWrite is the atomic write set of one verified completion: the
-// target plan item (when PlanItemID > 0) and the progress fact. A store must
-// write both or neither (single transaction or outbox entry), so a crash can
-// never leave the plan done without the recorded fact or vice versa.
+// target plan item and the progress fact. A store must write both or neither
+// (single transaction or outbox entry), so a crash can never leave the plan done
+// without the recorded fact or vice versa. PlanItemID is always > 0: a
+// fact-only completion is rejected before this write set is built.
 type CompletionWrite struct {
 	VersionID  int64
 	AgentRunID int64
-	// PlanItemID is the target plan item, or 0 for a fact-only completion.
+	// PlanItemID is the verified target plan item; always > 0.
 	PlanItemID int64
-	// PlanStatus and Decision are empty when PlanItemID is 0.
+	// PlanStatus and Decision are the plan item update; always set.
 	PlanStatus  string
 	Decision    string
 	Summary     string
@@ -62,8 +63,8 @@ type CompletionWrite struct {
 type CompletionWriteResult struct {
 	// FactID is the appended (or idempotently matched) progress fact ID.
 	FactID int64
-	// PlanItemRevision is the new optimistic-lock revision of the plan item; 0
-	// for a fact-only completion.
+	// PlanItemRevision is the new optimistic-lock revision of the written plan
+	// item; the completion port propagates it to the caller.
 	PlanItemRevision int
 }
 
@@ -73,31 +74,36 @@ type CompletionStore interface {
 	CommitCompletion(ctx context.Context, write CompletionWrite) (CompletionWriteResult, error)
 }
 
-// CompletionService is the tools.CompletionWriter implementation that binds a
-// completed run to its task target (the plan item) and builds the atomic write
-// set.
+// CompletionService is the tools.CompletionWriter implementation that turns the
+// verified completion target into the atomic plan+fact write set. The target
+// comes only from tools.CompletionCommit, which the tool copies unchanged from
+// the validator's CompletionVerification, so there is no second target the
+// service could write by mistake.
 type CompletionService struct {
-	store      CompletionStore
-	planItemID int64
+	store CompletionStore
 }
 
-// NewCompletionService builds the completion writer for one run. planItemID is
-// the target plan item (0 = no plan target, write the progress fact only).
-func NewCompletionService(store CompletionStore, planItemID int64) *CompletionService {
-	return &CompletionService{store: store, planItemID: planItemID}
+// NewCompletionService builds the completion writer for one run. The target plan
+// item is carried by each tools.CompletionCommit; a zero target is rejected.
+func NewCompletionService(store CompletionStore) *CompletionService {
+	return &CompletionService{store: store}
 }
 
 var _ tools.CompletionWriter = (*CompletionService)(nil)
 
 // Commit implements tools.CompletionWriter. The declaration was already
 // server-verified; this method only validates the internal invariants, builds
-// the plan/fact write set and delegates the atomic persistence.
+// the plan/fact write set for the verified target and delegates the atomic
+// persistence.
 func (s *CompletionService) Commit(ctx context.Context, commit tools.CompletionCommit) (tools.CompletionOutcome, error) {
 	if s == nil || s.store == nil {
 		return tools.CompletionOutcome{}, errors.New("completion service has no completion store")
 	}
 	if commit.Scope.VersionID <= 0 {
 		return tools.CompletionOutcome{}, errors.New("completion service requires the injected version scope")
+	}
+	if commit.PlanItemID <= 0 {
+		return tools.CompletionOutcome{}, fmt.Errorf("completion service requires a positive target plan item ID (got %d); fact-only completions are not allowed", commit.PlanItemID)
 	}
 	summary := strings.TrimSpace(commit.Summary)
 	if summary == "" {
@@ -109,21 +115,15 @@ func (s *CompletionService) Commit(ctx context.Context, commit tools.CompletionC
 	}
 	artifacts := append([]string{}, commit.Artifacts...)
 
-	planStatus := ""
-	decision := ""
-	if s.planItemID > 0 {
-		planStatus = CompletionPlanStatusDone
-		decision = summary
-	}
-	factKey := completionFactKey(commit.Scope, s.planItemID)
+	planStatus := CompletionPlanStatusDone
+	decision := summary
+	factKey := completionFactKey(commit.Scope, commit.PlanItemID)
 	payload := map[string]any{
-		"summary":   summary,
-		"status":    status,
-		"artifacts": artifacts,
-	}
-	if s.planItemID > 0 {
-		payload["plan_item_id"] = platformid.Format(s.planItemID)
-		payload["decision"] = summary
+		"summary":      summary,
+		"status":       status,
+		"artifacts":    artifacts,
+		"plan_item_id": platformid.Format(commit.PlanItemID),
+		"decision":     summary,
 	}
 	if commit.Scope.AgentRunID > 0 {
 		payload["agent_run_id"] = platformid.Format(commit.Scope.AgentRunID)
@@ -132,7 +132,7 @@ func (s *CompletionService) Commit(ctx context.Context, commit tools.CompletionC
 	write := CompletionWrite{
 		VersionID:   commit.Scope.VersionID,
 		AgentRunID:  commit.Scope.AgentRunID,
-		PlanItemID:  s.planItemID,
+		PlanItemID:  commit.PlanItemID,
 		PlanStatus:  planStatus,
 		Decision:    decision,
 		Summary:     summary,
@@ -149,25 +149,25 @@ func (s *CompletionService) Commit(ctx context.Context, commit tools.CompletionC
 		return tools.CompletionOutcome{}, fmt.Errorf("commit completion: %w", err)
 	}
 	return tools.CompletionOutcome{
-		PlanItemID: s.planItemID,
-		PlanStatus: planStatus,
-		Decision:   decision,
-		FactID:     result.FactID,
-		FactKey:    factKey,
+		PlanItemID:       commit.PlanItemID,
+		PlanStatus:       planStatus,
+		Decision:         decision,
+		PlanItemRevision: result.PlanItemRevision,
+		FactID:           result.FactID,
+		FactKey:          factKey,
 	}, nil
 }
 
 // completionFactKey names the completion progress fact. Binding it to the run
-// makes a repeated task.complete call idempotent (the version_fact store returns
-// the existing row for the same kind/key/content hash) while distinct runs and
-// plan items stay distinguishable.
+// makes a repeated task.complete call deterministic (falling back to the target
+// plan item when the run ID is absent). Idempotency is the version_fact unique
+// key (version_id, kind, key, content_hash): replaying the same completion with
+// identical content matches the existing row, while changed content appends a
+// new fact (facts are append-only and never overwritten), so the key alone is
+// not the dedupe condition.
 func completionFactKey(scope tools.Scope, planItemID int64) string {
-	switch {
-	case scope.AgentRunID > 0:
+	if scope.AgentRunID > 0 {
 		return "task.complete:run:" + platformid.Format(scope.AgentRunID)
-	case planItemID > 0:
-		return "task.complete:plan_item:" + platformid.Format(planItemID)
-	default:
-		return "task.complete:version:" + platformid.Format(scope.VersionID)
 	}
+	return "task.complete:plan_item:" + platformid.Format(planItemID)
 }

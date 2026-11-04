@@ -31,13 +31,14 @@ func (f *fakeCompletionStore) CommitCompletion(_ context.Context, write agentapp
 
 func TestCompletionServiceCommitsPlanAndProgressFact(t *testing.T) {
 	store := &fakeCompletionStore{result: agentapp.CompletionWriteResult{FactID: 77, PlanItemRevision: 3}}
-	service := agentapp.NewCompletionService(store, 9)
+	service := agentapp.NewCompletionService(store)
 
 	outcome, err := service.Commit(context.Background(), tools.CompletionCommit{
-		Scope:     tools.Scope{VersionID: 7, AgentRunID: 42},
-		Summary:   "58/58 extracted",
-		Artifacts: []string{"extraction:5"},
-		Status:    "completed",
+		Scope:      tools.Scope{VersionID: 7, AgentRunID: 42},
+		Summary:    "58/58 extracted",
+		Artifacts:  []string{"extraction:5"},
+		Status:     "completed",
+		PlanItemID: 9,
 	})
 	if err != nil {
 		t.Fatalf("completion commit failed: %v", err)
@@ -61,11 +62,21 @@ func TestCompletionServiceCommitsPlanAndProgressFact(t *testing.T) {
 	if write.FactKind != agentapp.CompletionFactKindProgress || strings.TrimSpace(write.FactKey) == "" {
 		t.Fatalf("progress fact = kind=%q key=%q", write.FactKind, write.FactKey)
 	}
+	// Deterministic per-run idempotency key. version_fact is unique on
+	// (version_id, kind, key, content_hash), so identical replays match the
+	// existing row while changed content appends a new fact (facts never
+	// overwrite). The key alone is therefore not the dedupe condition.
+	if write.FactKey != "task.complete:run:42" {
+		t.Fatalf("fact key = %q, want task.complete:run:42", write.FactKey)
+	}
 	if got := write.FactPayload["summary"]; got != "58/58 extracted" {
 		t.Fatalf("fact payload summary = %#v", got)
 	}
 	if got := write.FactPayload["status"]; got != "completed" {
 		t.Fatalf("fact payload status = %#v", got)
+	}
+	if got := write.FactPayload["plan_item_id"]; got != "9" {
+		t.Fatalf("fact payload plan_item_id = %#v, want 9", got)
 	}
 	artifacts, ok := write.FactPayload["artifacts"].([]string)
 	if !ok || len(artifacts) != 1 || artifacts[0] != "extraction:5" {
@@ -77,42 +88,51 @@ func TestCompletionServiceCommitsPlanAndProgressFact(t *testing.T) {
 	if outcome.Decision != "58/58 extracted" || outcome.FactID != 77 {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	t.Logf("completion write: plan_item=%d plan_status=%q decision=%q fact=%s/%s summary=%q artifacts=%v",
-		write.PlanItemID, write.PlanStatus, write.Decision, write.FactKind, write.FactKey, write.Summary, write.Artifacts)
+	if outcome.FactKey != "task.complete:run:42" {
+		t.Fatalf("outcome fact key = %q, want task.complete:run:42", outcome.FactKey)
+	}
+	if outcome.PlanItemRevision != 3 {
+		t.Fatalf("outcome plan revision = %d, want the store revision 3", outcome.PlanItemRevision)
+	}
+	t.Logf("completion write: plan_item=%d plan_status=%q decision=%q revision=%d fact=%s/%s summary=%q artifacts=%v",
+		write.PlanItemID, write.PlanStatus, write.Decision, outcome.PlanItemRevision, write.FactKind, write.FactKey, write.Summary, write.Artifacts)
 }
 
-func TestCompletionServiceWithoutPlanTargetWritesOnlyFact(t *testing.T) {
-	store := &fakeCompletionStore{result: agentapp.CompletionWriteResult{FactID: 78}}
-	service := agentapp.NewCompletionService(store, 0)
+// TestCompletionServiceRejectsFactOnlyCommit pins the removed fact-only write
+// path: every completion writes plan status/decision plus the progress fact for
+// a positive target plan item, so a zero target is an internal error and never
+// reaches the store.
+func TestCompletionServiceRejectsFactOnlyCommit(t *testing.T) {
+	store := &fakeCompletionStore{}
+	service := agentapp.NewCompletionService(store)
 
-	if _, err := service.Commit(context.Background(), tools.CompletionCommit{
+	_, err := service.Commit(context.Background(), tools.CompletionCommit{
 		Scope:     tools.Scope{VersionID: 7},
 		Summary:   "requirements drafted",
 		Artifacts: []string{"draft:5"},
 		Status:    "completed",
-	}); err != nil {
-		t.Fatalf("fact-only completion failed: %v", err)
+	})
+	if err == nil {
+		t.Fatal("fact-only completion (plan item 0) was accepted")
 	}
-	if len(store.writes) != 1 {
-		t.Fatalf("store writes = %d, want 1", len(store.writes))
+	var toolErr *tools.Error
+	if errors.As(err, &toolErr) {
+		t.Fatalf("fact-only completion must be an internal (non-retryable) error, got %+v", toolErr)
 	}
-	write := store.writes[0]
-	if write.PlanItemID != 0 || write.PlanStatus != "" {
-		t.Fatalf("fact-only write touched a plan item: %+v", write)
-	}
-	if write.FactKind != agentapp.CompletionFactKindProgress {
-		t.Fatalf("fact kind = %q", write.FactKind)
+	if len(store.writes) != 0 {
+		t.Fatalf("store writes on fact-only completion = %d, want 0", len(store.writes))
 	}
 }
 
 func TestCompletionServicePropagatesStoreFailure(t *testing.T) {
 	store := &fakeCompletionStore{err: errors.New("store down")}
-	service := agentapp.NewCompletionService(store, 9)
+	service := agentapp.NewCompletionService(store)
 
 	_, err := service.Commit(context.Background(), tools.CompletionCommit{
-		Scope:   tools.Scope{VersionID: 7},
-		Summary: "done",
-		Status:  "completed",
+		Scope:      tools.Scope{VersionID: 7},
+		Summary:    "done",
+		Status:     "completed",
+		PlanItemID: 9,
 	})
 	if err == nil || !strings.Contains(err.Error(), "store down") {
 		t.Fatalf("error = %v, want the store failure", err)

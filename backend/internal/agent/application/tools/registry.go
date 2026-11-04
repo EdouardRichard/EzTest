@@ -274,10 +274,12 @@ type Deps struct {
 }
 
 // CompletionDeps is the per-run wiring of the task.complete tool: the
-// server-side Validator selects the completion criterion by task type and the
-// CompletionWriter persists the verified completion. Both must be present for
-// the tool to be registered; a nil writer would let a forged declaration end
-// the run without the plan/fact write, so the tool is never half-wired.
+// server-side Validator selects the completion criterion by task type and
+// resolves the single verified target plan item, and the CompletionWriter
+// persists that verified completion. Both must be present for the tool to be
+// registered; a nil writer would let a forged declaration end the run without
+// the plan/fact write, so the tool is never half-wired. Validators whose reader
+// is not wired fail closed with an internal missing-dependency error.
 type CompletionDeps struct {
 	Validator Validator
 	Writer    CompletionWriter

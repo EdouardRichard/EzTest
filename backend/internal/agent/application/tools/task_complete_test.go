@@ -16,12 +16,19 @@ import (
 
 type fakeCompletionValidator struct {
 	requests []CompletionRequest
-	err      error
+	// target is the verified plan item every passing validation reports. Zero
+	// means the validator could not resolve the run's completion target; the
+	// tool must reject that instead of falling back to a fact-only success.
+	target int64
+	err    error
 }
 
-func (f *fakeCompletionValidator) Validate(_ context.Context, req CompletionRequest) error {
+func (f *fakeCompletionValidator) Validate(_ context.Context, req CompletionRequest) (CompletionVerification, error) {
 	f.requests = append(f.requests, req)
-	return f.err
+	if f.err != nil {
+		return CompletionVerification{}, f.err
+	}
+	return CompletionVerification{PlanItemID: f.target}, nil
 }
 
 type fakeCompletionWriter struct {
@@ -89,13 +96,14 @@ func TestTaskCompleteRejectsWithoutArtifacts(t *testing.T) {
 }
 
 func TestTaskCompleteAcceptsValidExtraction(t *testing.T) {
-	validator := &fakeCompletionValidator{}
+	validator := &fakeCompletionValidator{target: 9}
 	writer := &fakeCompletionWriter{outcome: CompletionOutcome{
-		PlanItemID: 9,
-		PlanStatus: "done",
-		Decision:   "58/58",
-		FactID:     77,
-		FactKey:    "completion:42",
+		PlanItemID:       9,
+		PlanStatus:       "done",
+		Decision:         "58/58",
+		FactID:           77,
+		FactKey:          "completion:42",
+		PlanItemRevision: 3,
 	}}
 	tool := NewTaskCompleteTool(validator, writer)
 
@@ -124,6 +132,16 @@ func TestTaskCompleteAcceptsValidExtraction(t *testing.T) {
 	if len(commit.Artifacts) != 1 || commit.Artifacts[0] != "extraction:1" {
 		t.Fatalf("commit artifacts = %v", commit.Artifacts)
 	}
+	if commit.PlanItemID != validator.target {
+		t.Fatalf("commit target = %d, want the target the validator verified (%d)",
+			commit.PlanItemID, validator.target)
+	}
+	if result.PlanItemID != "9" {
+		t.Fatalf("result plan_item_id = %q, want 9", result.PlanItemID)
+	}
+	if result.PlanItemRevision != 3 {
+		t.Fatalf("result plan_item_revision = %d, want the store revision 3", result.PlanItemRevision)
+	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
 		t.Fatalf("result is not JSON-encodable: %v", err)
@@ -131,12 +149,16 @@ func TestTaskCompleteAcceptsValidExtraction(t *testing.T) {
 	if !strings.Contains(string(encoded), `"completed":true`) {
 		t.Fatalf("model-visible result lacks completed=true: %s", encoded)
 	}
-	t.Logf("accept result: %s (commit summary=%q artifacts=%v status=%q)", encoded, commit.Summary, commit.Artifacts, commit.Status)
+	if !strings.Contains(string(encoded), `"plan_item_revision":3`) {
+		t.Fatalf("model-visible/result hand-off lacks the new plan revision: %s", encoded)
+	}
+	t.Logf("accept result: %s (commit target=%d summary=%q artifacts=%v status=%q)",
+		encoded, commit.PlanItemID, commit.Summary, commit.Artifacts, commit.Status)
 }
 
 func TestTaskCompleteDefaultsStatusToCompleted(t *testing.T) {
-	validator := &fakeCompletionValidator{}
-	writer := &fakeCompletionWriter{}
+	validator := &fakeCompletionValidator{target: 9}
+	writer := &fakeCompletionWriter{outcome: CompletionOutcome{PlanItemID: 9, PlanStatus: "done"}}
 	tool := NewTaskCompleteTool(validator, writer)
 
 	if _, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
@@ -192,6 +214,118 @@ func TestTaskCompleteRequiresVersionScope(t *testing.T) {
 	}
 }
 
+// TestTaskCompleteRejectsFactOnlyCompletion pins the removed bypass: a validator
+// that passes without naming a plan item target must not produce a Completed
+// signal (there is no fact-only success path for task.complete).
+func TestTaskCompleteRejectsFactOnlyCompletion(t *testing.T) {
+	validator := &fakeCompletionValidator{} // passes, but resolves no target
+	writer := &fakeCompletionWriter{}
+	tool := NewTaskCompleteTool(validator, writer)
+
+	value, err := executeTaskComplete(t, tool, Scope{VersionID: 7, AgentRunID: 42},
+		`{"summary":"requirements drafted","artifacts":["draft:5"]}`)
+	if err == nil {
+		t.Fatalf("fact-only completion was accepted: %+v", value)
+	}
+	if value != nil {
+		t.Fatalf("fact-only completion returned a result instead of failing: %+v", value)
+	}
+	var toolErr *Error
+	if errors.As(err, &toolErr) {
+		t.Fatalf("missing target wiring must be an internal (non-retryable) error, got %+v", toolErr)
+	}
+	if len(writer.commits) != 0 {
+		t.Fatalf("writer was called without a verified target: %+v", writer.commits)
+	}
+	if len(validator.requests) != 1 {
+		t.Fatalf("validator calls = %d, want 1", len(validator.requests))
+	}
+}
+
+// TestTaskCompleteRejectsMismatchedWriterTarget pins that a writer reporting a
+// different plan item than the validator verified cannot silently complete.
+func TestTaskCompleteRejectsMismatchedWriterTarget(t *testing.T) {
+	validator := &fakeCompletionValidator{target: 9}
+	writer := &fakeCompletionWriter{outcome: CompletionOutcome{PlanItemID: 10, PlanStatus: "done", FactID: 77}}
+	tool := NewTaskCompleteTool(validator, writer)
+
+	value, err := executeTaskComplete(t, tool, Scope{VersionID: 7, AgentRunID: 42},
+		`{"summary":"done","artifacts":["extraction:1"]}`)
+	if err == nil {
+		t.Fatalf("writer that wrote plan item 10 for verified target 9 succeeded: %+v", value)
+	}
+	if value != nil {
+		t.Fatalf("mismatched write returned a result instead of failing: %+v", value)
+	}
+	var toolErr *Error
+	if errors.As(err, &toolErr) {
+		t.Fatalf("target mismatch must be an internal error, got %+v", toolErr)
+	}
+	if len(writer.commits) != 1 || writer.commits[0].PlanItemID != 9 {
+		t.Fatalf("writer commits = %+v, want one commit for the verified target 9", writer.commits)
+	}
+}
+
+// TestTaskCompleteWriterNotCalledOnCompletionError pins that every structured
+// validator rejection (not just the ErrMissingArtifacts sentinel) stops before
+// the write, and that the hint survives into the structured details.
+func TestTaskCompleteWriterNotCalledOnCompletionError(t *testing.T) {
+	validator := &fakeCompletionValidator{
+		target: 9,
+		err: NewNotCompleteError(
+			"plan item 9 is pending",
+			"finish the plan item and retry",
+			map[string]any{"field": "plan_item", "item_id": "9"},
+		),
+	}
+	writer := &fakeCompletionWriter{}
+	tool := NewTaskCompleteTool(validator, writer)
+
+	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7, AgentRunID: 42},
+		`{"summary":"done","artifacts":["plan_item:9"]}`)
+	toolErr := asToolError(t, err)
+	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+		t.Fatalf("task error = %+v, want retryable invalid_argument", toolErr)
+	}
+	if got := toolErr.Details["field"]; got != "plan_item" {
+		t.Fatalf("details.field = %#v, want plan_item", got)
+	}
+	if got := toolErr.Details["hint"]; got != "finish the plan item and retry" {
+		t.Fatalf("details.hint = %#v, want the validator hint", got)
+	}
+	if len(writer.commits) != 0 {
+		t.Fatalf("writer was called on a *CompletionError rejection: %+v", writer.commits)
+	}
+}
+
+// TestTaskCompleteRejectsModelSuppliedScopeIDs pins the strict decode: the
+// model can never inject a version or plan item id through the arguments.
+func TestTaskCompleteRejectsModelSuppliedScopeIDs(t *testing.T) {
+	payloads := map[string]string{
+		"version_id":   `{"summary":"done","artifacts":["extraction:1"],"version_id":9}`,
+		"plan_item_id": `{"summary":"done","artifacts":["extraction:1"],"plan_item_id":"9"}`,
+	}
+	for name, payload := range payloads {
+		t.Run(name, func(t *testing.T) {
+			validator := &fakeCompletionValidator{target: 9}
+			writer := &fakeCompletionWriter{}
+			tool := NewTaskCompleteTool(validator, writer)
+
+			_, err := executeTaskComplete(t, tool, Scope{VersionID: 7, AgentRunID: 42}, payload)
+			toolErr := asToolError(t, err)
+			if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+				t.Fatalf("task error = %+v, want retryable invalid_argument", toolErr)
+			}
+			if got := toolErr.Details["field"]; got != "parameters" {
+				t.Fatalf("details.field = %#v, want parameters", got)
+			}
+			if len(validator.requests) != 0 || len(writer.commits) != 0 {
+				t.Fatalf("validator/writer called on rejected scope id: %v/%v", validator.requests, writer.commits)
+			}
+		})
+	}
+}
+
 // --- extraction validator ---------------------------------------------------
 
 type fakeExtractionReader struct {
@@ -209,7 +343,7 @@ func (f *fakeExtractionReader) ExtractionDone(_ context.Context, versionID int64
 
 func TestExtractionCompletionValidatorRequiresArtifacts(t *testing.T) {
 	reader := &fakeExtractionReader{state: ExtractionReconciliation{RunID: 5, Done: true, Expected: 58, Extracted: 58}}
-	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader), &fakeCompletionWriter{})
+	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader, 9), &fakeCompletionWriter{})
 
 	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7}, `{"summary":"done"}`)
 	toolErr := asToolError(t, err)
@@ -229,8 +363,8 @@ func TestExtractionCompletionValidatorRequiresArtifacts(t *testing.T) {
 
 func TestExtractionCompletionValidatorAcceptsReconciledRun(t *testing.T) {
 	reader := &fakeExtractionReader{state: ExtractionReconciliation{RunID: 5, Done: true, Expected: 58, Extracted: 58}}
-	writer := &fakeCompletionWriter{}
-	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader), writer)
+	writer := &fakeCompletionWriter{outcome: CompletionOutcome{PlanItemID: 9, PlanStatus: "done"}}
+	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader, 9), writer)
 
 	if _, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
 		`{"summary":"58/58","artifacts":["extraction:5"]}`); err != nil {
@@ -246,7 +380,7 @@ func TestExtractionCompletionValidatorAcceptsReconciledRun(t *testing.T) {
 
 func TestExtractionCompletionValidatorRejectsUnfinishedRun(t *testing.T) {
 	reader := &fakeExtractionReader{state: ExtractionReconciliation{RunID: 5, Done: false, Expected: 58, Extracted: 58}}
-	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader), &fakeCompletionWriter{})
+	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader, 9), &fakeCompletionWriter{})
 
 	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
 		`{"summary":"done","artifacts":["extraction:5"]}`)
@@ -262,7 +396,7 @@ func TestExtractionCompletionValidatorRejectsUnfinishedRun(t *testing.T) {
 
 func TestExtractionCompletionValidatorRejectsCountMismatch(t *testing.T) {
 	reader := &fakeExtractionReader{state: ExtractionReconciliation{RunID: 5, Done: true, Expected: 58, Extracted: 55}}
-	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader), &fakeCompletionWriter{})
+	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader, 9), &fakeCompletionWriter{})
 
 	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
 		`{"summary":"58/58","artifacts":["extraction:5"]}`)
@@ -282,7 +416,51 @@ func TestExtractionCompletionValidatorRejectsCountMismatch(t *testing.T) {
 	if got := toolErr.Details["missing"]; got != 3 {
 		t.Fatalf("details.missing = %#v, want 3", got)
 	}
+	if got := toolErr.Details["field"]; got != "extraction" {
+		t.Fatalf("details.field = %#v, want extraction", got)
+	}
+	hint, ok := toolErr.Details["hint"].(string)
+	if !ok || !strings.Contains(hint, "reconcile") {
+		t.Fatalf("details.hint = %#v, want the reconcile hint", toolErr.Details["hint"])
+	}
 	t.Logf("extraction mismatch payload: %s", testJSON(t, toolErr.Payload()))
+}
+
+// TestExtractionCompletionValidatorRejectsOverExtraction pins the non-negative
+// reconciliation gap: extracted > expected reports over_extracted, never a
+// negative missing count.
+func TestExtractionCompletionValidatorRejectsOverExtraction(t *testing.T) {
+	reader := &fakeExtractionReader{state: ExtractionReconciliation{RunID: 5, Done: true, Expected: 58, Extracted: 61}}
+	tool := NewTaskCompleteTool(NewExtractionCompletionValidator(reader, 9), &fakeCompletionWriter{})
+
+	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
+		`{"summary":"61/58","artifacts":["extraction:5"]}`)
+	toolErr := asToolError(t, err)
+	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+		t.Fatalf("task error = %+v, want retryable invalid_argument", toolErr)
+	}
+	if got := toolErr.Details["expected"]; got != 58 {
+		t.Fatalf("details.expected = %#v, want 58", got)
+	}
+	if got := toolErr.Details["extracted"]; got != 61 {
+		t.Fatalf("details.extracted = %#v, want 61", got)
+	}
+	if got := toolErr.Details["over_extracted"]; got != 3 {
+		t.Fatalf("details.over_extracted = %#v, want 3", got)
+	}
+	if missing, exists := toolErr.Details["missing"]; exists {
+		t.Fatalf("details.missing = %#v must be absent when extracted > expected", missing)
+	}
+	if strings.Contains(toolErr.Message, "-3") {
+		t.Fatalf("message reports a negative gap: %q", toolErr.Message)
+	}
+	if !strings.Contains(strings.ToLower(toolErr.Message), "over") {
+		t.Fatalf("message does not explain the over-extraction: %q", toolErr.Message)
+	}
+	if !strings.Contains(toolErr.Message, "61") || !strings.Contains(toolErr.Message, "58") {
+		t.Fatalf("message does not name the reconciliation counts: %q", toolErr.Message)
+	}
+	t.Logf("extraction over-count payload: %s", testJSON(t, toolErr.Payload()))
 }
 
 // --- plan-item validator ----------------------------------------------------
@@ -304,11 +482,12 @@ func (f *fakePlanItemReader) GetPlanItem(_ context.Context, versionID, itemID in
 
 func TestPlanItemCompletionValidatorAcceptsDoneItemWithDecision(t *testing.T) {
 	reader := &fakePlanItemReader{item: PlanItemSnapshot{ID: 9, VersionID: 7, Status: "done", Decision: "approved"}}
-	writer := &fakeCompletionWriter{}
+	writer := &fakeCompletionWriter{outcome: CompletionOutcome{PlanItemID: 9, PlanStatus: "done", FactID: 88}}
 	tool := NewTaskCompleteTool(NewPlanItemCompletionValidator(reader, 9), writer)
 
-	if _, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
-		`{"summary":"plan item finished"}`); err != nil {
+	value, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
+		`{"summary":"plan item finished"}`)
+	if err != nil {
 		t.Fatalf("done plan item rejected: %v", err)
 	}
 	if reader.calls != 1 || reader.versionID != 7 || reader.itemID != 9 {
@@ -316,6 +495,13 @@ func TestPlanItemCompletionValidatorAcceptsDoneItemWithDecision(t *testing.T) {
 	}
 	if len(writer.commits) != 1 {
 		t.Fatalf("writer calls = %d, want 1", len(writer.commits))
+	}
+	if got := writer.commits[0].PlanItemID; got != 9 {
+		t.Fatalf("commit target = %d, want the plan item the validator re-read (9)", got)
+	}
+	result, ok := value.(*TaskCompleteResult)
+	if !ok || result.PlanItemID != "9" {
+		t.Fatalf("result = %#v, want plan_item_id 9", value)
 	}
 }
 
@@ -341,7 +527,7 @@ func TestPlanItemCompletionValidatorRejectsMissingDecision(t *testing.T) {
 	reader := &fakePlanItemReader{item: PlanItemSnapshot{ID: 9, VersionID: 7, Status: "done", Decision: "  "}}
 	validator := NewPlanItemCompletionValidator(reader, 9)
 
-	err := validator.Validate(context.Background(), CompletionRequest{
+	_, err := validator.Validate(context.Background(), CompletionRequest{
 		Scope:   Scope{VersionID: 7},
 		Summary: "plan item finished",
 		Status:  "completed",
@@ -380,7 +566,7 @@ func (f *fakeDesignRevisionReader) DesignRevisionExists(_ context.Context, versi
 }
 
 func TestDesignCompletionValidatorRequiresArtifactsAndRevision(t *testing.T) {
-	tool := NewTaskCompleteTool(NewDesignCompletionValidator(&fakeDesignRevisionReader{exists: false}), &fakeCompletionWriter{})
+	tool := NewTaskCompleteTool(NewDesignCompletionValidator(&fakeDesignRevisionReader{exists: false}, 9), &fakeCompletionWriter{})
 
 	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7}, `{"summary":"design done"}`)
 	toolErr := asToolError(t, err)
@@ -399,15 +585,38 @@ func TestDesignCompletionValidatorRequiresArtifactsAndRevision(t *testing.T) {
 	}
 }
 
+func TestDesignCompletionValidatorFailsClosedWithoutReader(t *testing.T) {
+	validator := NewDesignCompletionValidator(nil, 9)
+	_, err := validator.Validate(context.Background(), CompletionRequest{
+		Scope:   Scope{VersionID: 7},
+		Summary: "design done",
+		Status:  "completed",
+	})
+	if err == nil {
+		t.Fatal("unwired design revision reader must fail closed")
+	}
+	var toolErr *Error
+	if errors.As(err, &toolErr) {
+		t.Fatalf("unwired design reader must be an internal (non-retryable) error, got %+v", toolErr)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "not configured") {
+		t.Fatalf("error does not name the missing dependency: %v", err)
+	}
+}
+
 func TestDesignCompletionValidatorAcceptsExistingRevision(t *testing.T) {
 	reader := &fakeDesignRevisionReader{exists: true}
-	tool := NewTaskCompleteTool(NewDesignCompletionValidator(reader), &fakeCompletionWriter{})
+	writer := &fakeCompletionWriter{outcome: CompletionOutcome{PlanItemID: 9, PlanStatus: "done"}}
+	tool := NewTaskCompleteTool(NewDesignCompletionValidator(reader, 9), writer)
 	if _, err := executeTaskComplete(t, tool, Scope{VersionID: 7},
 		`{"summary":"design done","artifacts":["design:31"]}`); err != nil {
 		t.Fatalf("existing design revision rejected: %v", err)
 	}
 	if reader.versionID != 7 {
 		t.Fatalf("reader version = %d, want 7", reader.versionID)
+	}
+	if len(writer.commits) != 1 || writer.commits[0].PlanItemID != 9 {
+		t.Fatalf("design commit target = %+v, want 9", writer.commits)
 	}
 }
 
@@ -421,7 +630,7 @@ func (f *fakeHostTurnReader) TurnAnswered(_ context.Context, _ Scope) (bool, err
 }
 
 func TestHostCompletionValidatorRequiresAnsweredTurn(t *testing.T) {
-	tool := NewTaskCompleteTool(NewHostCompletionValidator(&fakeHostTurnReader{answered: false}), &fakeCompletionWriter{})
+	tool := NewTaskCompleteTool(NewHostCompletionValidator(&fakeHostTurnReader{answered: false}, 9), &fakeCompletionWriter{})
 	_, err := executeTaskComplete(t, tool, Scope{VersionID: 7, ConversationID: 3}, `{"summary":"answered"}`)
 	toolErr := asToolError(t, err)
 	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
@@ -431,18 +640,29 @@ func TestHostCompletionValidatorRequiresAnsweredTurn(t *testing.T) {
 		t.Fatalf("message does not name the unanswered question: %q", toolErr.Message)
 	}
 
-	accepted := NewTaskCompleteTool(NewHostCompletionValidator(&fakeHostTurnReader{answered: true}), &fakeCompletionWriter{})
+	writer := &fakeCompletionWriter{outcome: CompletionOutcome{PlanItemID: 9, PlanStatus: "done"}}
+	accepted := NewTaskCompleteTool(NewHostCompletionValidator(&fakeHostTurnReader{answered: true}, 9), writer)
 	if _, err := executeTaskComplete(t, accepted, Scope{VersionID: 7, ConversationID: 3},
 		`{"summary":"answered"}`); err != nil {
 		t.Fatalf("answered host turn rejected: %v", err)
 	}
+	if len(writer.commits) != 1 || writer.commits[0].PlanItemID != 9 {
+		t.Fatalf("host commit target = %+v, want 9", writer.commits)
+	}
 }
 
 func TestHostCompletionValidatorFailsClosedWithoutReader(t *testing.T) {
-	validator := NewHostCompletionValidator(nil)
-	err := validator.Validate(context.Background(), CompletionRequest{Scope: Scope{VersionID: 7}, Summary: "x", Status: "completed"})
-	if !errors.Is(err, ErrNotComplete) {
-		t.Fatalf("unwired host validator error = %v, want ErrNotComplete", err)
+	validator := NewHostCompletionValidator(nil, 9)
+	_, err := validator.Validate(context.Background(), CompletionRequest{Scope: Scope{VersionID: 7}, Summary: "x", Status: "completed"})
+	if err == nil {
+		t.Fatal("unwired host turn reader must fail closed")
+	}
+	var toolErr *Error
+	if errors.As(err, &toolErr) {
+		t.Fatalf("unwired host reader must be an internal (non-retryable) error, got %+v", toolErr)
+	}
+	if errors.Is(err, ErrNotComplete) {
+		t.Fatal("unwired host reader must not surface as a model-retryable completion rejection")
 	}
 }
 

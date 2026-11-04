@@ -6,11 +6,18 @@ package tools
 // declaration alone never ends a run: the injected Validator re-reads the
 // server-side state for the task type (extraction run done + count
 // reconciliation, target plan item done + decision written, design revision /
-// review artifact present, Host turn answered or handed off) and only then does
-// the injected CompletionWriter persist the plan item status/decision and the
-// progress fact in one transaction/outbox. A rejected declaration is a
-// retryable invalid_argument tool error, so the model can fix the missing work
-// instead of the run failing (R-A3-3).
+// review artifact present, Host turn answered or handed off), resolves the one
+// plan item target this completion writes, and only then does the injected
+// CompletionWriter persist that item's status/decision and the progress fact in
+// one transaction/outbox. A rejected declaration is a retryable
+// invalid_argument tool error, so the model can fix the missing work instead of
+// the run failing (R-A3-3).
+//
+// Every W0 completion writes exactly one plan item (R-A3-4): a validator that
+// cannot resolve a positive target fails closed as an internal error, and the
+// completion writer takes the target only from the verified commit — there is
+// no fact-only success path and no second target the writer could disagree
+// with.
 //
 // Wiring (Task 36): the composition root fills tools.Deps.Completion per run and
 // registers this group through the existing registration list:
@@ -148,6 +155,7 @@ func NewNotCompleteError(missing, hint string, details map[string]any) *Completi
 // NewExtractionNotDoneError reports an extraction run that has not finished.
 func NewExtractionNotDoneError(state ExtractionReconciliation) *CompletionError {
 	details := map[string]any{
+		"field":     "extraction",
 		"run_id":    idString(state.RunID),
 		"done":      state.Done,
 		"expected":  state.Expected,
@@ -161,19 +169,33 @@ func NewExtractionNotDoneError(state ExtractionReconciliation) *CompletionError 
 }
 
 // NewExtractionMismatchError reports a reconciled extraction whose extracted
-// count still differs from the declared/expected count.
+// count still differs from the declared/expected count. The reported gap is
+// always non-negative: a shortfall is "missing", an excess is "over_extracted"
+// (never a negative missing count).
 func NewExtractionMismatchError(state ExtractionReconciliation) *CompletionError {
-	missing := state.Expected - state.Extracted
 	details := map[string]any{
+		"field":     "extraction",
 		"run_id":    idString(state.RunID),
 		"expected":  state.Expected,
 		"extracted": state.Extracted,
-		"missing":   missing,
+	}
+	var message string
+	switch gap := state.Extracted - state.Expected; {
+	case gap > 0:
+		details["over_extracted"] = gap
+		message = fmt.Sprintf("extraction run %d extracted %d of %d requirements (%d over-extracted)",
+			state.RunID, state.Extracted, state.Expected, gap)
+	case gap < 0:
+		details["missing"] = -gap
+		message = fmt.Sprintf("extraction run %d reconciled %d of %d requirements (%d missing)",
+			state.RunID, state.Extracted, state.Expected, -gap)
+	default:
+		message = fmt.Sprintf("extraction run %d reconciled %d of %d requirements",
+			state.RunID, state.Extracted, state.Expected)
 	}
 	return NewNotCompleteError(
-		fmt.Sprintf("extraction run %d reconciled %d of %d requirements (%d missing)",
-			state.RunID, state.Extracted, state.Expected, missing),
-		"reconcile the extraction counts (re-run the extraction or resolve the missing requirements) and retry",
+		message,
+		"reconcile the extraction counts (re-run the extraction or resolve the mismatched requirements) and retry",
 		details,
 	)
 }
@@ -212,30 +234,44 @@ type CompletionRequest struct {
 	Status    string
 }
 
-// Validator is the server-side completion criterion of one task type
-// (R-A3-2). Implementations may return *Error, *CompletionError or a
-// *platform.Error; unexpected errors stay internal and fail the run.
-type Validator interface {
-	Validate(ctx context.Context, req CompletionRequest) error
+// CompletionVerification is the server-side result of a passing completion
+// criterion: the single plan item target this completion must write. Every W0
+// completion targets a plan item (R-A3-4), so a validator that cannot name a
+// positive target fails closed instead of allowing a fact-only success.
+type CompletionVerification struct {
+	// PlanItemID is the target plan item the validator verified or resolved for
+	// this run. It is the only target the completion writer receives.
+	PlanItemID int64
 }
 
-// CompletionCommit is a verified completion handed to the write port. It
-// contains only the declaration and scope; the task target (for example the
-// plan item ID) is bound to the per-run writer.
+// Validator is the server-side completion criterion of one task type
+// (R-A3-2). It returns the verified plan item target on success.
+// Implementations may return *Error, *CompletionError or a *platform.Error;
+// unexpected errors stay internal and fail the run.
+type Validator interface {
+	Validate(ctx context.Context, req CompletionRequest) (CompletionVerification, error)
+}
+
+// CompletionCommit is a verified completion handed to the write port. PlanItemID
+// is copied unchanged from the validator's CompletionVerification, so the write
+// target is the verified target by construction; the writer has no separate
+// target to disagree with.
 type CompletionCommit struct {
-	Scope     Scope
-	Summary   string
-	Artifacts []string
-	Status    string
+	Scope      Scope
+	PlanItemID int64
+	Summary    string
+	Artifacts  []string
+	Status     string
 }
 
 // CompletionOutcome reports what the write port persisted.
 type CompletionOutcome struct {
-	PlanItemID int64
-	PlanStatus string
-	Decision   string
-	FactID     int64
-	FactKey    string
+	PlanItemID       int64
+	PlanStatus       string
+	Decision         string
+	PlanItemRevision int
+	FactID           int64
+	FactKey          string
 }
 
 // CompletionWriter persists the completion side effects (plan item
@@ -253,13 +289,16 @@ type CompletionSignal interface {
 }
 
 // TaskCompleteResult is the model-visible success payload and the completion
-// signal. Completed is always true on a successful call.
+// signal. Completed is always true on a successful call. PlanItemRevision is
+// the new plan-item optimistic-lock revision the write port returned, so the
+// runner (Task 36) can reuse it without a re-read.
 type TaskCompleteResult struct {
-	Completed  bool   `json:"completed"`
-	Status     string `json:"status"`
-	PlanItemID string `json:"plan_item_id,omitempty"`
-	PlanStatus string `json:"plan_status,omitempty"`
-	FactID     string `json:"fact_id,omitempty"`
+	Completed        bool   `json:"completed"`
+	Status           string `json:"status"`
+	PlanItemID       string `json:"plan_item_id,omitempty"`
+	PlanStatus       string `json:"plan_status,omitempty"`
+	PlanItemRevision int    `json:"plan_item_revision,omitempty"`
+	FactID           string `json:"fact_id,omitempty"`
 }
 
 // SignalsCompletion implements CompletionSignal.
@@ -346,25 +385,39 @@ func (t *TaskCompleteTool) Execute(ctx context.Context, scope Scope, raw json.Ra
 	if toolErr != nil {
 		return nil, toolErr
 	}
-	if err := t.validator.Validate(ctx, req); err != nil {
+	verification, err := t.validator.Validate(ctx, req)
+	if err != nil {
 		return nil, mapCompletionError(err)
 	}
+	// Every W0 completion writes one plan item's status/decision plus the
+	// progress fact (R-A3-4). A validator that verified the task but resolved no
+	// target is a wiring bug, not a model-fixable rejection: fail the run
+	// instead of signaling Completed with a fact-only write.
+	if verification.PlanItemID <= 0 {
+		return nil, fmt.Errorf("task.complete validator resolved no target plan item; every completion must target a plan item")
+	}
 	outcome, err := t.writer.Commit(ctx, CompletionCommit{
-		Scope:     req.Scope,
-		Summary:   req.Summary,
-		Artifacts: req.Artifacts,
-		Status:    req.Status,
+		Scope:      req.Scope,
+		PlanItemID: verification.PlanItemID,
+		Summary:    req.Summary,
+		Artifacts:  req.Artifacts,
+		Status:     req.Status,
 	})
 	if err != nil {
 		return nil, mapCompletionError(err)
 	}
-	result := &TaskCompleteResult{
-		Completed:  true,
-		Status:     req.Status,
-		PlanStatus: outcome.PlanStatus,
+	// A writer that persisted a different item than the one the validator
+	// verified is a contract violation; never turn it into a completion signal.
+	if outcome.PlanItemID != verification.PlanItemID {
+		return nil, fmt.Errorf("task.complete writer wrote plan item %d but the validator verified target %d",
+			outcome.PlanItemID, verification.PlanItemID)
 	}
-	if outcome.PlanItemID > 0 {
-		result.PlanItemID = idString(outcome.PlanItemID)
+	result := &TaskCompleteResult{
+		Completed:        true,
+		Status:           req.Status,
+		PlanItemID:       idString(verification.PlanItemID),
+		PlanStatus:       outcome.PlanStatus,
+		PlanItemRevision: outcome.PlanItemRevision,
 	}
 	if outcome.FactID > 0 {
 		result.FactID = idString(outcome.FactID)
@@ -454,9 +507,15 @@ func mapCompletionError(err error) error {
 	}
 	var completionErr *CompletionError
 	if errors.As(err, &completionErr) {
-		details := completionErr.Details
-		if details == nil {
-			details = map[string]any{}
+		// Copy the validator's details and add the hint there too: the message
+		// already carries it, but every structured rejection must expose the
+		// same field/hint contract to the model.
+		details := make(map[string]any, len(completionErr.Details)+1)
+		for key, value := range completionErr.Details {
+			details[key] = value
+		}
+		if completionErr.Hint != "" {
+			details["hint"] = completionErr.Hint
 		}
 		return &Error{
 			Code:      CodeInvalidArgument,
@@ -482,7 +541,8 @@ func mapCompletionError(err error) error {
 			Message:   "completion rejected: the task's completion criteria are not met; finish the required work and retry",
 			Retryable: true,
 			Details: map[string]any{
-				"hint": "finish the missing deliverable or state transition, then retry",
+				"field": "completion",
+				"hint":  "finish the missing deliverable or state transition, then retry",
 			},
 		}
 	}
@@ -490,6 +550,16 @@ func mapCompletionError(err error) error {
 }
 
 // --- extraction validator ---------------------------------------------------
+
+// verifyCompletionTarget turns the run's bound plan item into the single write
+// target of a passing completion. A missing target is a wiring failure, not a
+// model-fixable rejection, so it fails the run.
+func verifyCompletionTarget(kind CompletionTaskKind, planItemID int64) (CompletionVerification, error) {
+	if planItemID <= 0 {
+		return CompletionVerification{}, fmt.Errorf("%s completion requires a positive target plan item ID", kind)
+	}
+	return CompletionVerification{PlanItemID: planItemID}, nil
+}
 
 // ExtractionReconciliation is the server-read state of a version's requirement
 // extraction run. Expected is the declared/derived requirement count and
@@ -509,37 +579,45 @@ type ExtractionReader interface {
 }
 
 // ExtractionCompletionValidator validates the extraction completion criterion
-// (R-A3-2): the run is done and expected == extracted.
+// (R-A3-2): the run is done and expected == extracted. It also carries the
+// run's target plan item into the verified write target.
 type ExtractionCompletionValidator struct {
-	runs ExtractionReader
+	runs       ExtractionReader
+	planItemID int64
 }
 
-// NewExtractionCompletionValidator builds the extraction validator.
-func NewExtractionCompletionValidator(runs ExtractionReader) *ExtractionCompletionValidator {
-	return &ExtractionCompletionValidator{runs: runs}
+// NewExtractionCompletionValidator builds the extraction validator for one run
+// target. planItemID is the work item's plan item that completion writes; it is
+// runtime data and never model-supplied.
+func NewExtractionCompletionValidator(runs ExtractionReader, planItemID int64) *ExtractionCompletionValidator {
+	return &ExtractionCompletionValidator{runs: runs, planItemID: planItemID}
 }
 
 var _ Validator = (*ExtractionCompletionValidator)(nil)
 
 // Validate implements Validator.
-func (v *ExtractionCompletionValidator) Validate(ctx context.Context, req CompletionRequest) error {
+func (v *ExtractionCompletionValidator) Validate(ctx context.Context, req CompletionRequest) (CompletionVerification, error) {
 	if v == nil || v.runs == nil {
-		return missingDep("extraction completion reader")
+		return CompletionVerification{}, missingDep("extraction completion reader")
+	}
+	verification, err := verifyCompletionTarget(CompletionKindExtraction, v.planItemID)
+	if err != nil {
+		return CompletionVerification{}, err
 	}
 	if err := RequireArtifacts(req, CompletionKindExtraction, "extraction:<run_id>"); err != nil {
-		return err
+		return CompletionVerification{}, err
 	}
 	state, err := v.runs.ExtractionDone(ctx, req.Scope.VersionID)
 	if err != nil {
-		return err
+		return CompletionVerification{}, err
 	}
 	if !state.Done {
-		return NewExtractionNotDoneError(state)
+		return CompletionVerification{}, NewExtractionNotDoneError(state)
 	}
 	if state.Expected != state.Extracted {
-		return NewExtractionMismatchError(state)
+		return CompletionVerification{}, NewExtractionMismatchError(state)
 	}
-	return nil
+	return verification, nil
 }
 
 // --- plan-item validator ----------------------------------------------------
@@ -574,25 +652,30 @@ func NewPlanItemCompletionValidator(items PlanItemReader, itemID int64) *PlanIte
 
 var _ Validator = (*PlanItemCompletionValidator)(nil)
 
-// Validate implements Validator.
-func (v *PlanItemCompletionValidator) Validate(ctx context.Context, req CompletionRequest) error {
+// Validate implements Validator. It re-reads the target item and returns its ID
+// as the single verified write target.
+func (v *PlanItemCompletionValidator) Validate(ctx context.Context, req CompletionRequest) (CompletionVerification, error) {
 	if v == nil || v.items == nil {
-		return missingDep("plan item completion reader")
+		return CompletionVerification{}, missingDep("plan item completion reader")
 	}
-	if v.itemID <= 0 {
-		return fmt.Errorf("plan item completion validator requires a positive target item ID")
+	verification, err := verifyCompletionTarget(CompletionKindPlanItem, v.itemID)
+	if err != nil {
+		return CompletionVerification{}, err
 	}
 	item, err := v.items.GetPlanItem(ctx, req.Scope.VersionID, v.itemID)
 	if err != nil {
-		return err
+		return CompletionVerification{}, err
+	}
+	if item.ID > 0 && item.ID != v.itemID {
+		return CompletionVerification{}, fmt.Errorf("plan item reader returned item %d for target %d", item.ID, v.itemID)
 	}
 	if !planItemDone(item.Status) {
-		return NewPlanItemNotDoneError(v.itemID, item.Status)
+		return CompletionVerification{}, NewPlanItemNotDoneError(v.itemID, item.Status)
 	}
 	if strings.TrimSpace(item.Decision) == "" {
-		return NewPlanItemMissingDecisionError(v.itemID)
+		return CompletionVerification{}, NewPlanItemMissingDecisionError(v.itemID)
 	}
-	return nil
+	return verification, nil
 }
 
 // planItemDone reports the terminal done statuses of version_plan_item.
@@ -615,45 +698,49 @@ type DesignRevisionReader interface {
 }
 
 // DesignCompletionValidator validates the design completion criterion (R-A3-2):
-// a revision/review artifact exists. It requires delivered artifacts and fails
-// closed when the reader is not wired yet.
+// a revision/review artifact exists. It requires delivered artifacts, carries
+// the run's target plan item into the write target, and fails closed on an
+// unwired reader as an internal error.
 type DesignCompletionValidator struct {
-	revisions DesignRevisionReader
+	revisions  DesignRevisionReader
+	planItemID int64
 }
 
-// NewDesignCompletionValidator builds the design validator. A nil reader makes
-// it return a retryable ErrNotComplete (fail closed, never forged success).
-func NewDesignCompletionValidator(revisions DesignRevisionReader) *DesignCompletionValidator {
-	return &DesignCompletionValidator{revisions: revisions}
+// NewDesignCompletionValidator builds the design validator for one run target.
+// planItemID is the work item's plan item that completion writes. A nil reader
+// is a wiring failure: Validate returns the internal missing-dependency error
+// instead of a model-retryable rejection.
+func NewDesignCompletionValidator(revisions DesignRevisionReader, planItemID int64) *DesignCompletionValidator {
+	return &DesignCompletionValidator{revisions: revisions, planItemID: planItemID}
 }
 
 var _ Validator = (*DesignCompletionValidator)(nil)
 
 // Validate implements Validator.
-func (v *DesignCompletionValidator) Validate(ctx context.Context, req CompletionRequest) error {
+func (v *DesignCompletionValidator) Validate(ctx context.Context, req CompletionRequest) (CompletionVerification, error) {
+	if v == nil || v.revisions == nil {
+		return CompletionVerification{}, missingDep("design revision completion reader")
+	}
+	verification, err := verifyCompletionTarget(CompletionKindDesign, v.planItemID)
+	if err != nil {
+		return CompletionVerification{}, err
+	}
 	if err := RequireArtifacts(req, CompletionKindDesign,
 		"design:<case_version_id>", "review:<case_version_id>"); err != nil {
-		return err
-	}
-	if v == nil || v.revisions == nil {
-		return NewNotCompleteError(
-			"design revision/review artifact cannot be verified yet",
-			"the design artifact reader is not wired on this assembly; complete the design revision and review through the design flow",
-			map[string]any{"field": "design_revision"},
-		)
+		return CompletionVerification{}, err
 	}
 	exists, err := v.revisions.DesignRevisionExists(ctx, req.Scope.VersionID)
 	if err != nil {
-		return err
+		return CompletionVerification{}, err
 	}
 	if !exists {
-		return NewNotCompleteError(
+		return CompletionVerification{}, NewNotCompleteError(
 			"design revision/review artifact is missing",
 			"produce a case revision (and its review) before completing the design task",
 			map[string]any{"field": "design_revision"},
 		)
 	}
-	return nil
+	return verification, nil
 }
 
 // --- host validator ---------------------------------------------------------
@@ -666,40 +753,45 @@ type HostTurnReader interface {
 }
 
 // HostCompletionValidator validates the Host completion criterion (R-A3-2): the
-// current turn's question was answered or handed off.
+// current turn's question was answered or handed off. It carries the run's
+// target plan item into the write target and fails closed on an unwired reader
+// as an internal error.
 type HostCompletionValidator struct {
-	turns HostTurnReader
+	turns      HostTurnReader
+	planItemID int64
 }
 
-// NewHostCompletionValidator builds the Host validator. A nil reader makes it
-// return a retryable ErrNotComplete (fail closed, never forged success).
-func NewHostCompletionValidator(turns HostTurnReader) *HostCompletionValidator {
-	return &HostCompletionValidator{turns: turns}
+// NewHostCompletionValidator builds the Host validator for one run target.
+// planItemID is the work item's plan item that completion writes. A nil reader
+// is a wiring failure: Validate returns the internal missing-dependency error
+// instead of a model-retryable rejection.
+func NewHostCompletionValidator(turns HostTurnReader, planItemID int64) *HostCompletionValidator {
+	return &HostCompletionValidator{turns: turns, planItemID: planItemID}
 }
 
 var _ Validator = (*HostCompletionValidator)(nil)
 
 // Validate implements Validator.
-func (v *HostCompletionValidator) Validate(ctx context.Context, req CompletionRequest) error {
+func (v *HostCompletionValidator) Validate(ctx context.Context, req CompletionRequest) (CompletionVerification, error) {
 	if v == nil || v.turns == nil {
-		return NewNotCompleteError(
-			"the current turn's question is neither answered nor handed off",
-			"answer the question or hand it off (the Host turn reader is not wired on this assembly)",
-			map[string]any{"field": "host_turn"},
-		)
+		return CompletionVerification{}, missingDep("host turn completion reader")
+	}
+	verification, err := verifyCompletionTarget(CompletionKindHost, v.planItemID)
+	if err != nil {
+		return CompletionVerification{}, err
 	}
 	answered, err := v.turns.TurnAnswered(ctx, req.Scope)
 	if err != nil {
-		return err
+		return CompletionVerification{}, err
 	}
 	if !answered {
-		return NewNotCompleteError(
+		return CompletionVerification{}, NewNotCompleteError(
 			"the current turn's question is neither answered nor handed off",
 			"answer the question or hand it off, then retry task.complete",
 			map[string]any{"field": "host_turn"},
 		)
 	}
-	return nil
+	return verification, nil
 }
 
 // --- registry hook ----------------------------------------------------------
