@@ -440,6 +440,219 @@ func TestHandoffGenerateRejectsMissingVersion(t *testing.T) {
 	}
 }
 
+// TestHandoffOpenKeepsAllPendingQuestionsOfBatch pins the fix-round contract:
+// one human_request batch may carry 1-5 questions (B §6.1), so every pending (or
+// expired) question must survive as its own open item. The old identity
+// (kind + "human_request:<request id>") collapsed a batch to one item.
+func TestHandoffOpenKeepsAllPendingQuestionsOfBatch(t *testing.T) {
+	service, _, reader, _ := newHandoffTest(t)
+	reader.qa = []versionapp.HandoffQAItem{
+		{
+			RequestID: 601, MessageID: 9601, ConversationID: 301,
+			QuestionKey: "q1", Question: "第一个问题", Status: "pending",
+			AskedAt: testTime,
+		},
+		{
+			RequestID: 601, MessageID: 9601, ConversationID: 301,
+			QuestionKey: "q2", Question: "第二个问题", Status: "pending",
+			AskedAt: testTime.Add(time.Minute),
+		},
+		{
+			RequestID: 601, MessageID: 9601, ConversationID: 301,
+			QuestionKey: "q3", Question: "第三个问题", Status: "expired",
+			AskedAt: testTime.Add(2 * time.Minute),
+		},
+		{
+			RequestID: 602, MessageID: 9602, ConversationID: 301,
+			QuestionKey: "q1", Question: "已回答的问题", Status: "answered",
+			AskedAt: testTime,
+		},
+	}
+	document, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	questions := make([]versionapp.HandoffOpenItem, 0, 3)
+	for _, item := range document.Open {
+		if item.Kind == "question" {
+			questions = append(questions, item)
+		}
+	}
+	if len(questions) != 3 {
+		t.Fatalf("open questions = %d (%+v), want all 3 questions of request 601", len(questions), questions)
+	}
+	expectedKeys := []string{"q1", "q2", "q3"}
+	expectedSources := []string{"human_request:601:q1", "human_request:601:q2", "human_request:601:q3"}
+	for index, question := range questions {
+		if question.ReferenceID != 601 {
+			t.Fatalf("open question %d reference = %d, want 601", index, question.ReferenceID)
+		}
+		if question.Source != expectedSources[index] {
+			t.Fatalf("open question %d source = %q, want %q", index, question.Source, expectedSources[index])
+		}
+		raw, err := json.Marshal(question)
+		if err != nil {
+			t.Fatalf("marshal open question: %v", err)
+		}
+		var object map[string]any
+		if err := json.Unmarshal(raw, &object); err != nil {
+			t.Fatalf("unmarshal open question: %v", err)
+		}
+		if object["question_key"] != expectedKeys[index] {
+			t.Fatalf("open question %d JSON = %s, want question_key %q", index, raw, expectedKeys[index])
+		}
+	}
+	if questions[0].Status != "pending" || questions[2].Status != "expired" {
+		t.Fatalf("open question statuses = %q/%q, want pending/expired", questions[0].Status, questions[2].Status)
+	}
+}
+
+// TestHandoffRequirementsExcludeClosed pins B §8.1: the requirements block holds
+// confirmed and draft requirements only; closed requirement rows are historical
+// and must not enter the resolution pack.
+func TestHandoffRequirementsExcludeClosed(t *testing.T) {
+	service, _, reader, _ := newHandoffTest(t)
+	reader.requirements = append(reader.requirements, versionapp.HandoffRequirement{
+		ID: 103, CurrentVersionID: 203, Revision: 1,
+		Title: "已关闭需求", Status: "closed",
+	})
+	document, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(document.Requirements) != 2 {
+		t.Fatalf("requirements = %d (%+v), want only the draft+clarified pair", len(document.Requirements), document.Requirements)
+	}
+	for _, item := range document.Requirements {
+		if item.Status != "draft" && item.Status != "clarified" {
+			t.Fatalf("requirements block contains status %q: %+v", item.Status, item)
+		}
+	}
+	for _, item := range document.Open {
+		if item.Kind == "requirement" && item.ReferenceID == 103 {
+			t.Fatalf("closed requirement leaked into open block: %+v", item)
+		}
+	}
+}
+
+// TestHandoffCapsKeepNewestRequirementsAndFacts pins the cap direction: when a
+// block exceeds its bound the newest rows are kept, not the oldest (an old
+// requirement/fact must not crowd out the current clarification state).
+func TestHandoffCapsKeepNewestRequirementsAndFacts(t *testing.T) {
+	service, _, reader, _ := newHandoffTest(t)
+	// Isolate the requirement/fact caps: no pending questions compete for the
+	// open-block budget.
+	reader.qa = nil
+	reader.requirements = make([]versionapp.HandoffRequirement, 0, 250)
+	for index := 1; index <= 250; index++ {
+		reader.requirements = append(reader.requirements, versionapp.HandoffRequirement{
+			ID: int64(index), CurrentVersionID: int64(1000 + index), Revision: 1,
+			Title: "需求", Status: "clarified",
+		})
+	}
+	reader.facts = make([]versionapp.HandoffFact, 0, 300)
+	for index := 1; index <= 150; index++ {
+		reader.facts = append(reader.facts, versionapp.HandoffFact{
+			ID: int64(index), Kind: "decision", Key: "decision", Summary: "决策", CreatedAt: testTime,
+		})
+	}
+	for index := 1; index <= 150; index++ {
+		reader.facts = append(reader.facts, versionapp.HandoffFact{
+			ID: int64(1000 + index), Kind: "gap", Key: "gap", Summary: "缺口", CreatedAt: testTime,
+		})
+	}
+	document, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(document.Requirements) != versionapp.HandoffMaxRequirements {
+		t.Fatalf("requirements = %d, want the cap %d", len(document.Requirements), versionapp.HandoffMaxRequirements)
+	}
+	if document.Requirements[0].ID != 51 || document.Requirements[len(document.Requirements)-1].ID != 250 {
+		t.Fatalf("requirements keep IDs %d..%d, want the newest 51..250",
+			document.Requirements[0].ID, document.Requirements[len(document.Requirements)-1].ID)
+	}
+	if len(document.Decisions) != versionapp.HandoffMaxDecisions {
+		t.Fatalf("decisions = %d, want the cap %d", len(document.Decisions), versionapp.HandoffMaxDecisions)
+	}
+	if document.Decisions[0].FactID != 51 || document.Decisions[len(document.Decisions)-1].FactID != 150 {
+		t.Fatalf("decisions keep IDs %d..%d, want the newest 51..150",
+			document.Decisions[0].FactID, document.Decisions[len(document.Decisions)-1].FactID)
+	}
+	openGaps := make([]versionapp.HandoffOpenItem, 0, 100)
+	for _, item := range document.Open {
+		if item.Kind == "gap" {
+			openGaps = append(openGaps, item)
+		}
+	}
+	if len(openGaps) != versionapp.HandoffMaxOpen {
+		t.Fatalf("open gaps = %d, want the cap %d", len(openGaps), versionapp.HandoffMaxOpen)
+	}
+	if openGaps[0].ReferenceID != 1051 || openGaps[len(openGaps)-1].ReferenceID != 1150 {
+		t.Fatalf("open gaps keep IDs %d..%d, want the newest 1051..1150",
+			openGaps[0].ReferenceID, openGaps[len(openGaps)-1].ReferenceID)
+	}
+}
+
+// conflictOnceHandoffStore scripts one revision race: the first Create reports
+// ErrHandoffRevisionConflict after a concurrent generator stored revision 1, so
+// the service must refresh the latest revision and retry as revision 2.
+type conflictOnceHandoffStore struct {
+	fakeHandoffStore
+	conflicts int
+	injected  bool
+}
+
+func (f *conflictOnceHandoffStore) Create(ctx context.Context, record versionapp.HandoffRecord) (versionapp.HandoffRecord, error) {
+	if f.conflicts > 0 {
+		f.conflicts--
+		if !f.injected {
+			f.injected = true
+			concurrent := record.Handoff
+			concurrent.Revision = 1
+			// Copy the requirement slice before mutating it: record.Handoff and
+			// the service's document share the backing array.
+			concurrent.Requirements = append([]versionapp.HandoffRequirement(nil), record.Handoff.Requirements...)
+			concurrent.Requirements[0].Title = "并发生成的内容"
+			f.rows = append(f.rows, versionapp.HandoffRecord{ID: 9001, Handoff: concurrent})
+		}
+		return versionapp.HandoffRecord{}, versionapp.ErrHandoffRevisionConflict
+	}
+	return f.fakeHandoffStore.Create(ctx, record)
+}
+
+// TestHandoffRetriesRevisionConflict pins the concurrency contract: a lost
+// revision race is re-read and retried against the refreshed latest revision,
+// and only the successful write publishes handoff.updated.
+func TestHandoffRetriesRevisionConflict(t *testing.T) {
+	reader := &fakeHandoffReader{
+		versionExists: true,
+		requirements: []versionapp.HandoffRequirement{{
+			ID: 101, CurrentVersionID: 201, Revision: 1, Title: "并发目标", Status: "clarified",
+		}},
+	}
+	store := &conflictOnceHandoffStore{conflicts: 1}
+	publisher := &fakePublisher{}
+	service := versionapp.NewHandoffService(store, reader, &seqIDs{}, publisher)
+	document, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if document.Revision != 2 {
+		t.Fatalf("revision = %d, want 2 after the conflict retry", document.Revision)
+	}
+	if len(store.rows) != 2 {
+		t.Fatalf("stored rows = %d, want the concurrent revision 1 plus the retried revision 2", len(store.rows))
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("events = %d, want only the successful revision", len(publisher.events))
+	}
+	if publisher.events[0].Payload["revision"] != 2 {
+		t.Fatalf("event payload = %+v, want revision 2", publisher.events[0].Payload)
+	}
+}
+
 // TestHandoffBoundsOversizedContent pins the text/JSON safety contract: each
 // free-text field is bounded and each block is capped before persistence.
 func TestHandoffBoundsOversizedContent(t *testing.T) {

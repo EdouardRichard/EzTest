@@ -150,13 +150,16 @@ type HandoffDecision struct {
 }
 
 // HandoffOpenItem is one unresolved question/gap/assumption or unconfirmed
-// draft requirement.
+// draft requirement. QuestionKey identifies which question of a multi-question
+// human_request batch this item is (empty for non-question items); it is part of
+// the item identity so a batch never collapses to a single open item.
 type HandoffOpenItem struct {
 	Kind        string     `json:"kind"`
 	Summary     string     `json:"summary"`
 	Status      string     `json:"status"`
 	Source      string     `json:"source"`
 	ReferenceID int64      `json:"reference_id"`
+	QuestionKey string     `json:"question_key,omitempty"`
 	CreatedAt   *time.Time `json:"created_at"`
 }
 
@@ -278,8 +281,9 @@ type HandoffStore interface {
 // passwords, DSNs or other secrets.
 type HandoffReader interface {
 	VersionExists(ctx context.Context, versionID int64) (bool, error)
-	// Requirements returns draft/clarified(/closed) current requirement
-	// revisions with acceptance criteria, priority and source_quote.
+	// Requirements returns the current draft/clarified requirement revisions
+	// with acceptance criteria, priority and source_quote. Closed (historical)
+	// rows are excluded per B §8.1.
 	Requirements(ctx context.Context, versionID int64) ([]HandoffRequirement, error)
 	// QA returns the version's structured clarification questions, answered
 	// and pending/expired included.
@@ -473,23 +477,41 @@ func normalizeHandoffRequirements(items []HandoffRequirement) []HandoffRequireme
 		if item.ID <= 0 {
 			continue
 		}
+		item.Status = strings.ToLower(strings.TrimSpace(truncateHandoffText(item.Status, HandoffStatusMax)))
+		// B §8.1: the handoff carries confirmed and draft requirements only.
+		// Closed rows are historical and must not enter the design pack.
+		if !handoffRequirementStatusIncluded(item.Status) {
+			continue
+		}
 		item.Title = truncateHandoffText(item.Title, HandoffTitleMax)
 		item.Description = truncateHandoffText(item.Description, HandoffDescriptionMax)
 		item.AcceptanceCriteria = truncateHandoffText(item.AcceptanceCriteria, HandoffAcceptanceMax)
 		item.Priority = truncateHandoffText(item.Priority, HandoffStatusMax)
-		item.Status = truncateHandoffText(item.Status, HandoffStatusMax)
 		item.SourceQuote = truncateHandoffText(item.SourceQuote, HandoffSourceQuoteMax)
 		item.Confidence = normalizeHandoffConfidence(item.Confidence)
 		normalized = append(normalized, item)
 	}
 	sort.SliceStable(normalized, func(i, j int) bool { return normalized[i].ID < normalized[j].ID })
+	// Keep the newest rows when the block overflows: an old requirement must
+	// not crowd out the current clarification state.
 	if len(normalized) > HandoffMaxRequirements {
-		normalized = normalized[:HandoffMaxRequirements]
+		normalized = normalized[len(normalized)-HandoffMaxRequirements:]
 	}
 	if normalized == nil {
 		return []HandoffRequirement{}
 	}
 	return normalized
+}
+
+// handoffRequirementStatusIncluded reports whether a requirement status belongs
+// in the requirements block (confirmed/draft only, B §8.1).
+func handoffRequirementStatusIncluded(status string) bool {
+	switch status {
+	case "draft", "clarified":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeHandoffQA(items []HandoffQAItem) []HandoffQAItem {
@@ -576,9 +598,6 @@ func splitHandoffFacts(facts []HandoffFact) ([]HandoffDecision, []HandoffOpenIte
 	for _, fact := range facts {
 		switch fact.Kind {
 		case "decision", "constraint":
-			if len(decisions) >= HandoffMaxDecisions {
-				continue
-			}
 			decisions = append(decisions, HandoffDecision{
 				FactID:     fact.ID,
 				Kind:       fact.Kind,
@@ -590,9 +609,6 @@ func splitHandoffFacts(facts []HandoffFact) ([]HandoffDecision, []HandoffOpenIte
 				CreatedAt:  fact.CreatedAt,
 			})
 		case "gap", "assumption", "risk":
-			if len(open) >= HandoffMaxOpen {
-				continue
-			}
 			createdAt := fact.CreatedAt
 			open = append(open, HandoffOpenItem{
 				Kind:        fact.Kind,
@@ -603,6 +619,13 @@ func splitHandoffFacts(facts []HandoffFact) ([]HandoffDecision, []HandoffOpenIte
 				CreatedAt:   &createdAt,
 			})
 		}
+	}
+	// facts arrive in id order; keep the newest rows when a block overflows.
+	if len(decisions) > HandoffMaxDecisions {
+		decisions = decisions[len(decisions)-HandoffMaxDecisions:]
+	}
+	if len(open) > HandoffMaxOpen {
+		open = open[len(open)-HandoffMaxOpen:]
 	}
 	return decisions, open
 }
@@ -617,13 +640,22 @@ func openHandoffQAItems(items []HandoffQAItem) []HandoffOpenItem {
 		if summary == "" {
 			summary = "待回答问题"
 		}
+		// A human_request batch carries 1-5 questions (B §6.1). The question
+		// key is part of the identity so every question of the batch becomes
+		// its own open item instead of collapsing on the request id.
+		questionKey := strings.TrimSpace(item.QuestionKey)
+		source := "human_request:" + formatHandoffID(item.RequestID)
+		if questionKey != "" {
+			source += ":" + questionKey
+		}
 		createdAt := item.AskedAt
 		open = append(open, HandoffOpenItem{
 			Kind:        "question",
 			Summary:     summary,
 			Status:      item.Status,
-			Source:      "human_request:" + formatHandoffID(item.RequestID),
+			Source:      source,
 			ReferenceID: item.RequestID,
+			QuestionKey: questionKey,
 			CreatedAt:   &createdAt,
 		})
 		if len(open) == HandoffMaxOpen {
@@ -662,10 +694,11 @@ func normalizeHandoffOpen(items []HandoffOpenItem) []HandoffOpenItem {
 		item.Summary = truncateHandoffText(item.Summary, HandoffFactSummaryMax)
 		item.Status = truncateHandoffText(item.Status, HandoffStatusMax)
 		item.Source = truncateHandoffText(item.Source, HandoffSourceMax)
+		item.QuestionKey = truncateHandoffText(item.QuestionKey, 64)
 		if item.Kind == "" || item.Summary == "" {
 			continue
 		}
-		key := item.Kind + "\x00" + item.Source
+		key := item.Kind + "\x00" + item.Source + "\x00" + item.QuestionKey
 		if _, duplicate := seen[key]; duplicate {
 			continue
 		}

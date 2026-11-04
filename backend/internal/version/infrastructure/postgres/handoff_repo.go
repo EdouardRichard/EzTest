@@ -20,6 +20,7 @@
 package versionpg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -147,8 +148,11 @@ func (r *HandoffReader) VersionExists(ctx context.Context, versionID int64) (boo
 	return exists, nil
 }
 
-// Requirements returns the current draft/clarified/closed requirement revisions
-// with acceptance criteria, priority, source_quote and confirmation time.
+// Requirements returns the current draft/clarified requirement revisions with
+// acceptance criteria, priority, source_quote and confirmation time. Closed
+// (historical) requirement rows are excluded: B §8.1 carries confirmed and
+// draft requirements only. Rows are read newest first so the application cap
+// keeps the current clarification state.
 func (r *HandoffReader) Requirements(ctx context.Context, versionID int64) ([]versionapp.HandoffRequirement, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT r.id, COALESCE(r.current_version_id, 0), rv.revision, rv.title,
@@ -157,8 +161,8 @@ func (r *HandoffReader) Requirements(ctx context.Context, versionID int64) ([]ve
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
 		LEFT JOIN requirement_confirmation rc ON rc.requirement_version_id = r.current_version_id
-		WHERE r.version_id = $1 AND r.status IN ('draft', 'clarified', 'closed')
-		ORDER BY r.id
+		WHERE r.version_id = $1 AND r.status IN ('draft', 'clarified')
+		ORDER BY r.id DESC
 		LIMIT $2
 	`, versionID, handoffReadRowLimit)
 	if err != nil {
@@ -211,6 +215,10 @@ type handoffQuestionResponse struct {
 // rows carry the selected options/free text and answer time; pending/expired
 // rows are kept as unresolved (the service mirrors them into the open block).
 func (r *HandoffReader) QA(ctx context.Context, versionID int64) ([]versionapp.HandoffQAItem, error) {
+	requirementIndex, err := loadHandoffRequirementIndex(ctx, r.pool, versionID)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, COALESCE(message_id, 0), COALESCE(conversation_id, 0),
 		       question, response, status, created_at, resolved_at
@@ -269,7 +277,10 @@ func (r *HandoffReader) QA(ctx context.Context, versionID int64) ([]versionapp.H
 				item.Options = append(item.Options, versionapp.HandoffQAOption{ID: option.ID, Label: option.Label})
 			}
 			item.SourceRefs = append(item.SourceRefs, question.SourceRefs...)
-			item.RequirementRefs = handoffRequirementRefs(question.SourceRefs)
+			// question.ask accepts arbitrary refs; the B §6.1 example uses
+			// "requirement:FR-012". Resolve both the internal decimal id and
+			// the version's requirement.external_id forms.
+			item.RequirementRefs = handoffResolveRequirementRefs(question.SourceRefs, requirementIndex)
 			if len(item.RequirementRefs) > 0 {
 				item.RequirementID = item.RequirementRefs[0]
 			}
@@ -295,7 +306,8 @@ func (r *HandoffReader) QA(ctx context.Context, versionID int64) ([]versionapp.H
 }
 
 // Facts returns the current decision/constraint/gap/assumption/risk facts of
-// the version (superseded rows excluded). The service projects decision and
+// the version (superseded rows excluded). Rows are read newest first so the
+// application cap keeps the current state. The service projects decision and
 // constraint rows into the decisions block and the rest into the open block.
 func (r *HandoffReader) Facts(ctx context.Context, versionID int64) ([]versionapp.HandoffFact, error) {
 	rows, err := r.pool.Query(ctx, `
@@ -303,7 +315,7 @@ func (r *HandoffReader) Facts(ctx context.Context, versionID int64) ([]versionap
 		FROM version_fact
 		WHERE version_id = $1 AND superseded_by IS NULL
 		  AND kind IN ('decision', 'constraint', 'gap', 'assumption', 'risk')
-		ORDER BY id
+		ORDER BY id DESC
 		LIMIT $2
 	`, versionID, handoffReadRowLimit)
 	if err != nil {
@@ -624,13 +636,18 @@ func (r *HandoffReader) handoffAccounts(ctx context.Context, versionID int64) ([
 // overrides: included=false removes an inherited row, included=true adds one.
 func (r *HandoffReader) handoffRepositories(ctx context.Context, versionID int64) ([]versionapp.HandoffRepository, error) {
 	repositories := make(map[int64]versionapp.HandoffRepository)
+	// A repository may be inherited from two SUTs with different roles. Pick
+	// one role deterministically (the lexicographically smallest) instead of
+	// letting SELECT DISTINCT + ORDER BY r.id return whichever row the plan
+	// happens to emit: that would flip the handoff signature across
+	// regenerations. sr.id is the final tie-breaker.
 	rows, err := r.pool.Query(ctx, `
-		SELECT DISTINCT r.id, r.name, r.branch, sr.role
+		SELECT DISTINCT ON (r.id) r.id, r.name, r.branch, sr.role
 		FROM version_sut vs
 		JOIN sut_repository sr ON sr.sut_id = vs.sut_id AND sr.enabled
 		JOIN code_repository r ON r.id = sr.repo_id AND r.status = 'active'
 		WHERE vs.version_id = $1 AND vs.status = 'active'
-		ORDER BY r.id
+		ORDER BY r.id, sr.role, sr.id
 		LIMIT $2
 	`, versionID, handoffReadRowLimit)
 	if err != nil {
@@ -715,21 +732,99 @@ func handoffIDSet(ids []int64) map[int64]struct{} {
 	return set
 }
 
-// handoffRequirementRefs extracts numeric requirement IDs from structured
-// source references ("requirement:123"). External IDs ("requirement:FR-012")
-// are not numeric and are ignored.
-func handoffRequirementRefs(refs []string) []int64 {
-	ids := make([]int64, 0)
-	seen := map[int64]struct{}{}
-	for _, ref := range refs {
-		trimmed := strings.TrimSpace(ref)
-		lower := strings.ToLower(trimmed)
-		if !strings.HasPrefix(lower, "requirement:") {
+// handoffRequirementIndex resolves a version's requirement references. The
+// structured-question format documented in B §6.1 is "requirement:FR-012"
+// (external id), while older rows/tools use "requirement:<internal id>"; both
+// forms point at the same version-scoped requirement.
+type handoffRequirementIndex struct {
+	byExternal map[string]int64
+	byID       map[int64]string
+}
+
+// loadHandoffRequirementIndex reads the version's requirement external ids. The
+// query stays scoped to the version, so an external id of another version can
+// never resolve here.
+func loadHandoffRequirementIndex(ctx context.Context, pool *pgxpool.Pool, versionID int64) (handoffRequirementIndex, error) {
+	index := handoffRequirementIndex{
+		byExternal: map[string]int64{},
+		byID:       map[int64]string{},
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT id, external_id
+		FROM requirement
+		WHERE version_id = $1 AND external_id <> ''
+		ORDER BY id
+	`, versionID)
+	if err != nil {
+		return handoffRequirementIndex{}, fmt.Errorf("list requirement external ids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var externalID string
+		if err := rows.Scan(&id, &externalID); err != nil {
+			return handoffRequirementIndex{}, fmt.Errorf("scan requirement external id: %w", err)
+		}
+		externalID = strings.TrimSpace(externalID)
+		if id <= 0 || externalID == "" {
 			continue
 		}
-		raw := strings.TrimSpace(trimmed[len("requirement:"):])
-		parsed, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || parsed <= 0 {
+		index.byExternal[externalID] = id
+		// Case-insensitive fallback without overriding an exact match.
+		if lower := strings.ToLower(externalID); lower != externalID {
+			if _, exists := index.byExternal[lower]; !exists {
+				index.byExternal[lower] = id
+			}
+		}
+		index.byID[id] = externalID
+	}
+	if err := rows.Err(); err != nil {
+		return handoffRequirementIndex{}, fmt.Errorf("scan requirement external ids: %w", err)
+	}
+	return index, nil
+}
+
+// resolveExternal maps an external requirement id to the version's internal id.
+func (index handoffRequirementIndex) resolveExternal(raw string) (int64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	if id, ok := index.byExternal[raw]; ok && id > 0 {
+		return id, true
+	}
+	if id, ok := index.byExternal[strings.ToLower(raw)]; ok && id > 0 {
+		return id, true
+	}
+	return 0, false
+}
+
+// handoffRequirementRefID parses one "requirement:<id>" ref, accepting both the
+// internal decimal id and the version's external id.
+func handoffRequirementRefID(ref string, index handoffRequirementIndex) (int64, bool) {
+	trimmed := strings.TrimSpace(ref)
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "requirement:") {
+		return 0, false
+	}
+	raw := strings.TrimSpace(trimmed[len("requirement:"):])
+	if raw == "" {
+		return 0, false
+	}
+	if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+		return parsed, true
+	}
+	return index.resolveExternal(raw)
+}
+
+// handoffResolveRequirementRefs extracts requirement IDs from structured source
+// references, resolving numeric and external forms and preserving order.
+func handoffResolveRequirementRefs(refs []string, index handoffRequirementIndex) []int64 {
+	ids := make([]int64, 0, len(refs))
+	seen := map[int64]struct{}{}
+	for _, ref := range refs {
+		parsed, ok := handoffRequirementRefID(ref, index)
+		if !ok {
 			continue
 		}
 		if _, duplicate := seen[parsed]; duplicate {
@@ -741,10 +836,32 @@ func handoffRequirementRefs(refs []string) []int64 {
 	return ids
 }
 
+// handoffRequirementRefs is the numeric-only parser kept for callers/tests that
+// have no version requirement index at hand.
+func handoffRequirementRefs(refs []string) []int64 {
+	return handoffResolveRequirementRefs(refs, handoffRequirementIndex{})
+}
+
+// decodeHandoffPayload decodes one JSONB payload without float64 precision
+// loss: ids are snowflake int64s and exceed 2^53, so json.Number keeps them
+// exact.
+func decodeHandoffPayload(payload []byte) (map[string]any, error) {
+	if len(payload) == 0 {
+		return nil, errors.New("empty JSON payload")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var object map[string]any
+	if err := decoder.Decode(&object); err != nil {
+		return nil, err
+	}
+	return object, nil
+}
+
 // handoffFactSummary renders the human-readable summary of one fact payload.
 func handoffFactSummary(key string, payload []byte) string {
-	var object map[string]any
-	if len(payload) == 0 || json.Unmarshal(payload, &object) != nil {
+	object, err := decodeHandoffPayload(payload)
+	if err != nil {
 		return key
 	}
 	for _, field := range []string{"summary", "text", "value", "decision", "title"} {
@@ -756,6 +873,10 @@ func handoffFactSummary(key string, payload []byte) string {
 		case string:
 			if strings.TrimSpace(typed) != "" {
 				return typed
+			}
+		case json.Number:
+			if typed.String() != "" {
+				return typed.String()
 			}
 		case float64:
 			return strconv.FormatFloat(typed, 'f', -1, 64)
@@ -784,15 +905,14 @@ var _ agenttools.ClarificationSearcher = (*ClarificationSearchStore)(nil)
 
 // SearchClarification searches the version's structured Q/A, decision/
 // constraint facts and message summaries. It returns bounded snippets with
-// sources only; whole raw messages are never returned.
+// sources only; whole raw messages are never returned. Every hit reports the
+// version_id of the row it came from (never a value stamped from the query), so
+// the tool's cross-version defense remains meaningful.
 func (s *ClarificationSearchStore) SearchClarification(ctx context.Context, query agenttools.ClarificationSearchQuery) ([]agenttools.ClarificationSearchHit, error) {
 	if query.VersionID <= 0 {
 		return nil, fmt.Errorf("clarification search: version id must be positive")
 	}
-	limit := query.Limit
-	if limit <= 0 || limit > agenttools.MaxClarificationSearchLimit {
-		limit = agenttools.DefaultClarificationSearchLimit
-	}
+	limit := handoffSearchLimit(query.Limit)
 	if len(query.Kinds) == 0 {
 		// An omitted kind filter means every kind: mirrors the tool's
 		// normalization so a direct adapter caller cannot accidentally search
@@ -803,9 +923,17 @@ func (s *ClarificationSearchStore) SearchClarification(ctx context.Context, quer
 	for _, kind := range query.Kinds {
 		kinds[kind] = struct{}{}
 	}
+	// Requirement refs use the documented external form ("requirement:FR-012")
+	// as well as internal decimal ids, so load the version's requirement
+	// identity index: requirement-scoped searches filter by it and unfiltered
+	// hits still report the resolved requirement id.
+	requirementIndex, err := loadHandoffRequirementIndex(ctx, s.pool, query.VersionID)
+	if err != nil {
+		return nil, err
+	}
 	hits := make([]agenttools.ClarificationSearchHit, 0, limit)
 	if _, ok := kinds[agenttools.ClarificationSearchKindQA]; ok {
-		items, err := s.searchClarificationQA(ctx, query, limit)
+		items, err := s.searchClarificationQA(ctx, query, requirementIndex, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -821,14 +949,14 @@ func (s *ClarificationSearchStore) SearchClarification(ctx context.Context, quer
 		}
 	}
 	if len(factKinds) > 0 {
-		items, err := s.searchClarificationFacts(ctx, query, factKinds, limit)
+		items, err := s.searchClarificationFacts(ctx, query, factKinds, requirementIndex, limit)
 		if err != nil {
 			return nil, err
 		}
 		hits = append(hits, items...)
 	}
 	if _, ok := kinds[agenttools.ClarificationSearchKindMessage]; ok {
-		items, err := s.searchClarificationMessages(ctx, query, limit)
+		items, err := s.searchClarificationMessages(ctx, query, requirementIndex, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -852,18 +980,25 @@ func (s *ClarificationSearchStore) SearchClarification(ctx context.Context, quer
 	return hits, nil
 }
 
-func (s *ClarificationSearchStore) searchClarificationQA(ctx context.Context, query agenttools.ClarificationSearchQuery, limit int) ([]agenttools.ClarificationSearchHit, error) {
+func (s *ClarificationSearchStore) searchClarificationQA(ctx context.Context, query agenttools.ClarificationSearchQuery, requirementIndex handoffRequirementIndex, limit int) ([]agenttools.ClarificationSearchHit, error) {
+	externalRequirementID := ""
+	if query.RequirementID > 0 {
+		externalRequirementID = requirementIndex.byID[query.RequirementID]
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT h.id, COALESCE(h.message_id, 0), question, response, status,
+		SELECT h.id, h.version_id, COALESCE(h.message_id, 0), question, response, status,
 		       h.created_at, h.resolved_at
 		FROM human_request h
 		WHERE h.version_id = $1 AND h.kind = 'clarification_question'
 		  AND ($2 = '' OR h.question::text ILIKE '%' || $2 || '%'
 		       OR h.response::text ILIKE '%' || $2 || '%')
-		  AND ($3 = 0 OR h.question::text ILIKE '%requirement:' || $3::text || '%')
+		  AND ($3 = 0
+		       OR strpos(lower(h.question::text), 'requirement:' || $3::text) > 0
+		       OR ($4::text <> '' AND strpos(lower(h.question::text),
+		            lower('requirement:' || $4::text)) > 0))
 		ORDER BY h.id DESC
-		LIMIT $4
-	`, query.VersionID, query.Query, query.RequirementID, clarificationSearchRowLimit)
+		LIMIT $5
+	`, query.VersionID, query.Query, query.RequirementID, externalRequirementID, clarificationSearchRowLimit)
 	if err != nil {
 		return nil, fmt.Errorf("search clarification questions: %w", err)
 	}
@@ -872,12 +1007,13 @@ func (s *ClarificationSearchStore) searchClarificationQA(ctx context.Context, qu
 	needle := strings.ToLower(strings.TrimSpace(query.Query))
 	hits := make([]agenttools.ClarificationSearchHit, 0, limit)
 	for rows.Next() {
-		var requestID, messageID int64
+		var requestID, hitVersionID, messageID int64
 		var questionRaw, responseRaw []byte
 		var status string
 		var askedAt time.Time
 		var resolvedAt *time.Time
-		if err := rows.Scan(&requestID, &messageID, &questionRaw, &responseRaw, &status, &askedAt, &resolvedAt); err != nil {
+		if err := rows.Scan(&requestID, &hitVersionID, &messageID, &questionRaw, &responseRaw,
+			&status, &askedAt, &resolvedAt); err != nil {
 			return nil, fmt.Errorf("scan clarification question hit: %w", err)
 		}
 		var batch handoffQuestionBatch
@@ -901,7 +1037,7 @@ func (s *ClarificationSearchStore) searchClarificationQA(ctx context.Context, qu
 			}{selected: answer.Selected, text: answer.Text}
 		}
 		for _, question := range batch.Questions {
-			refs := handoffRequirementRefs(question.SourceRefs)
+			refs := handoffResolveRequirementRefs(question.SourceRefs, requirementIndex)
 			if query.RequirementID > 0 && !handoffContainsID(refs, query.RequirementID) {
 				continue
 			}
@@ -914,7 +1050,7 @@ func (s *ClarificationSearchStore) searchClarificationQA(ctx context.Context, qu
 				timestamp = *resolvedAt
 			}
 			hit := agenttools.ClarificationSearchHit{
-				VersionID:  query.VersionID,
+				VersionID:  hitVersionID,
 				Kind:       agenttools.ClarificationSearchKindQA,
 				MessageID:  messageID,
 				QuestionID: requestID,
@@ -940,26 +1076,33 @@ func (s *ClarificationSearchStore) searchClarificationQA(ctx context.Context, qu
 	return hits, nil
 }
 
-func (s *ClarificationSearchStore) searchClarificationFacts(ctx context.Context, query agenttools.ClarificationSearchQuery, kinds []string, limit int) ([]agenttools.ClarificationSearchHit, error) {
+func (s *ClarificationSearchStore) searchClarificationFacts(ctx context.Context, query agenttools.ClarificationSearchQuery, kinds []string, requirementIndex handoffRequirementIndex, limit int) ([]agenttools.ClarificationSearchHit, error) {
 	var sql string
-	args := make([]any, 0, 5)
+	args := make([]any, 0, 6)
 	if query.RequirementID > 0 {
+		externalRequirementID := requirementIndex.byID[query.RequirementID]
 		sql = `
-			SELECT v.id, v.kind, v.key, v.payload, v.source_ref, v.created_at
+			SELECT v.id, v.version_id, v.kind, v.key, v.payload, v.source_ref, v.created_at
 			FROM version_fact v
 			WHERE v.version_id = $1 AND v.superseded_by IS NULL
 			  AND v.kind = ANY($2::text[])
 			  AND ($3 = '' OR v.key ILIKE '%' || $3 || '%'
 			       OR v.payload::text ILIKE '%' || $3 || '%')
 			  AND (v.source_ref = 'requirement:' || ($4::bigint)::text
-			       OR v.payload->>'requirement_id' = ($4::bigint)::text)
+			       OR v.payload->>'requirement_id' = ($4::bigint)::text
+			       OR v.payload->>'requirement' = ($4::bigint)::text
+			       OR ($5::text <> '' AND (
+			            v.source_ref = 'requirement:' || $5::text
+			            OR v.payload->>'requirement_id' = $5::text
+			            OR v.payload->>'requirement' = $5::text)))
 			ORDER BY v.id DESC
-			LIMIT $5
+			LIMIT $6
 		`
-		args = append(args, query.VersionID, kinds, query.Query, query.RequirementID, clarificationSearchRowLimit)
+		args = append(args, query.VersionID, kinds, query.Query, query.RequirementID,
+			externalRequirementID, clarificationSearchRowLimit)
 	} else {
 		sql = `
-			SELECT v.id, v.kind, v.key, v.payload, v.source_ref, v.created_at
+			SELECT v.id, v.version_id, v.kind, v.key, v.payload, v.source_ref, v.created_at
 			FROM version_fact v
 			WHERE v.version_id = $1 AND v.superseded_by IS NULL
 			  AND v.kind = ANY($2::text[])
@@ -980,20 +1123,20 @@ func (s *ClarificationSearchStore) searchClarificationFacts(ctx context.Context,
 	needle := strings.ToLower(strings.TrimSpace(query.Query))
 	hits := make([]agenttools.ClarificationSearchHit, 0, limit)
 	for rows.Next() {
-		var factID int64
+		var factID, hitVersionID int64
 		var kind, key, sourceRef string
 		var payload []byte
 		var createdAt time.Time
-		if err := rows.Scan(&factID, &kind, &key, &payload, &sourceRef, &createdAt); err != nil {
+		if err := rows.Scan(&factID, &hitVersionID, &kind, &key, &payload, &sourceRef, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan clarification fact hit: %w", err)
 		}
 		summary := handoffFactSummary(key, payload)
 		if needle != "" && !strings.Contains(strings.ToLower(key+" "+summary+" "+string(payload)), needle) {
 			continue
 		}
-		requirementID := handoffFactRequirementID(payload)
+		requirementID := handoffFactRequirementIDWithExternal(payload, requirementIndex)
 		if requirementID == 0 {
-			requirementID = handoffSourceRequirementID(sourceRef)
+			requirementID = handoffSourceRequirementIDWithExternal(sourceRef, requirementIndex)
 		}
 		if query.RequirementID > 0 && requirementID != query.RequirementID {
 			continue
@@ -1003,7 +1146,7 @@ func (s *ClarificationSearchStore) searchClarificationFacts(ctx context.Context,
 			snippet = key + "：" + summary
 		}
 		hits = append(hits, agenttools.ClarificationSearchHit{
-			VersionID:     query.VersionID,
+			VersionID:     hitVersionID,
 			Kind:          kind,
 			RequirementID: requirementID,
 			Snippet:       handoffBoundedSnippet(snippet, clarificationSnippetMax),
@@ -1020,21 +1163,28 @@ func (s *ClarificationSearchStore) searchClarificationFacts(ctx context.Context,
 	return hits, nil
 }
 
-func (s *ClarificationSearchStore) searchClarificationMessages(ctx context.Context, query agenttools.ClarificationSearchQuery, limit int) ([]agenttools.ClarificationSearchHit, error) {
+func (s *ClarificationSearchStore) searchClarificationMessages(ctx context.Context, query agenttools.ClarificationSearchQuery, requirementIndex handoffRequirementIndex, limit int) ([]agenttools.ClarificationSearchHit, error) {
+	externalRequirementID := ""
+	if query.RequirementID > 0 {
+		externalRequirementID = requirementIndex.byID[query.RequirementID]
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT m.id, m.parts, m.refs, m.created_at
+		SELECT m.id, c.version_id, m.parts, m.refs, m.created_at
 		FROM conversation_message m
 		JOIN conversation c ON c.id = m.conversation_id
 		WHERE c.version_id = $1
+		  AND c.kind = 'clarification'
 		  AND ($2 = '' OR m.parts::text ILIKE '%' || $2 || '%')
 		  AND ($3 = 0 OR EXISTS (
 		      SELECT 1
 		      FROM jsonb_array_elements(m.refs) AS ref
-		      WHERE ref->>'kind' = 'requirement' AND ref->>'id' = $3::text
+		      WHERE ref->>'kind' = 'requirement'
+		        AND (ref->>'id' = $3::text
+		             OR ($4::text <> '' AND ref->>'id' = $4::text))
 		  ))
 		ORDER BY m.id DESC
-		LIMIT $4
-	`, query.VersionID, query.Query, query.RequirementID, clarificationSearchRowLimit)
+		LIMIT $5
+	`, query.VersionID, query.Query, query.RequirementID, externalRequirementID, clarificationSearchRowLimit)
 	if err != nil {
 		return nil, fmt.Errorf("search clarification messages: %w", err)
 	}
@@ -1043,10 +1193,10 @@ func (s *ClarificationSearchStore) searchClarificationMessages(ctx context.Conte
 	needle := strings.ToLower(strings.TrimSpace(query.Query))
 	hits := make([]agenttools.ClarificationSearchHit, 0, limit)
 	for rows.Next() {
-		var messageID int64
+		var messageID, hitVersionID int64
 		var partsRaw, refsRaw []byte
 		var createdAt time.Time
-		if err := rows.Scan(&messageID, &partsRaw, &refsRaw, &createdAt); err != nil {
+		if err := rows.Scan(&messageID, &hitVersionID, &partsRaw, &refsRaw, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan clarification message hit: %w", err)
 		}
 		snippet := handoffMessageTextSnippet(partsRaw)
@@ -1056,7 +1206,7 @@ func (s *ClarificationSearchStore) searchClarificationMessages(ctx context.Conte
 		if needle != "" && !strings.Contains(strings.ToLower(snippet), needle) {
 			continue
 		}
-		requirementIDs := handoffMessageRequirementIDs(refsRaw)
+		requirementIDs := handoffResolveMessageRequirementIDs(refsRaw, requirementIndex)
 		requirementID := int64(0)
 		if len(requirementIDs) > 0 {
 			requirementID = requirementIDs[0]
@@ -1068,7 +1218,7 @@ func (s *ClarificationSearchStore) searchClarificationMessages(ctx context.Conte
 			requirementID = query.RequirementID
 		}
 		hits = append(hits, agenttools.ClarificationSearchHit{
-			VersionID:     query.VersionID,
+			VersionID:     hitVersionID,
 			Kind:          agenttools.ClarificationSearchKindMessage,
 			RequirementID: requirementID,
 			MessageID:     messageID,
@@ -1084,6 +1234,19 @@ func (s *ClarificationSearchStore) searchClarificationMessages(ctx context.Conte
 		return nil, fmt.Errorf("scan clarification message hits: %w", err)
 	}
 	return hits, nil
+}
+
+// handoffSearchLimit clamps a direct adapter caller's limit to the tool
+// contract: <=0 means the default page, >max is clamped to max (never reset to
+// the default, which would silently lose requested hits).
+func handoffSearchLimit(requested int) int {
+	if requested <= 0 {
+		return agenttools.DefaultClarificationSearchLimit
+	}
+	if requested > agenttools.MaxClarificationSearchLimit {
+		return agenttools.MaxClarificationSearchLimit
+	}
+	return requested
 }
 
 // handoffQAAnswerSnippet renders "question → answer" from the stored batch
@@ -1150,6 +1313,12 @@ func handoffMessageTextSnippet(partsRaw []byte) string {
 // handoffMessageRequirementIDs extracts every numeric requirement reference of
 // one conversation message. A message may be linked to several requirements.
 func handoffMessageRequirementIDs(refsRaw []byte) []int64 {
+	return handoffResolveMessageRequirementIDs(refsRaw, handoffRequirementIndex{})
+}
+
+// handoffResolveMessageRequirementIDs is handoffMessageRequirementIDs with
+// external requirement ids resolved through the version requirement index.
+func handoffResolveMessageRequirementIDs(refsRaw []byte, index handoffRequirementIndex) []int64 {
 	var refs []struct {
 		Kind string `json:"kind"`
 		ID   string `json:"id"`
@@ -1163,9 +1332,14 @@ func handoffMessageRequirementIDs(refsRaw []byte) []int64 {
 		if !strings.EqualFold(strings.TrimSpace(ref.Kind), "requirement") {
 			continue
 		}
-		parsed, err := strconv.ParseInt(strings.TrimSpace(ref.ID), 10, 64)
+		raw := strings.TrimSpace(ref.ID)
+		parsed, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || parsed <= 0 {
-			continue
+			resolved, ok := index.resolveExternal(raw)
+			if !ok {
+				continue
+			}
+			parsed = resolved
 		}
 		if _, duplicate := seen[parsed]; duplicate {
 			continue
@@ -1179,42 +1353,42 @@ func handoffMessageRequirementIDs(refsRaw []byte) []int64 {
 // handoffFactRequirementID reads the requirement linkage of one fact payload
 // (requirement_id or requirement).
 func handoffFactRequirementID(payload []byte) int64 {
-	var object map[string]any
-	if len(payload) == 0 || json.Unmarshal(payload, &object) != nil {
+	return handoffFactRequirementIDWithExternal(payload, handoffRequirementIndex{})
+}
+
+// handoffFactRequirementIDWithExternal reads the fact's requirement linkage and
+// resolves external requirement ids through the version requirement index.
+func handoffFactRequirementIDWithExternal(payload []byte, index handoffRequirementIndex) int64 {
+	object, err := decodeHandoffPayload(payload)
+	if err != nil {
 		return 0
 	}
-	if raw, ok := object["requirement_id"]; ok {
-		if parsed := handoffAnyID(raw); parsed > 0 {
-			return parsed
+	for _, field := range []string{"requirement_id", "requirement"} {
+		raw, ok := object[field]
+		if !ok {
+			continue
 		}
-	}
-	if raw, ok := object["requirement"]; ok {
-		if parsed := handoffAnyID(raw); parsed > 0 {
+		if parsed := handoffRequirementIDValue(raw, index); parsed > 0 {
 			return parsed
 		}
 	}
 	return 0
 }
 
-// handoffSourceRequirementID parses a numeric "requirement:<id>" source ref.
-func handoffSourceRequirementID(sourceRef string) int64 {
-	trimmed := strings.TrimSpace(sourceRef)
-	lower := strings.ToLower(trimmed)
-	if !strings.HasPrefix(lower, "requirement:") {
-		return 0
-	}
-	parsed, err := strconv.ParseInt(strings.TrimSpace(trimmed[len("requirement:"):]), 10, 64)
-	if err != nil || parsed <= 0 {
-		return 0
-	}
-	return parsed
-}
-
-func handoffAnyID(value any) int64 {
+// handoffRequirementIDValue converts a payload id (decimal string, JSON number
+// or external requirement id) to the internal requirement id.
+func handoffRequirementIDValue(value any, index handoffRequirementIndex) int64 {
 	switch typed := value.(type) {
 	case string:
-		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
-		if err == nil {
+		raw := strings.TrimSpace(typed)
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+		if id, ok := index.resolveExternal(raw); ok {
+			return id
+		}
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil && parsed > 0 {
 			return parsed
 		}
 	case float64:
@@ -1223,6 +1397,21 @@ func handoffAnyID(value any) int64 {
 		return typed
 	}
 	return 0
+}
+
+// handoffSourceRequirementID parses a numeric "requirement:<id>" source ref.
+func handoffSourceRequirementID(sourceRef string) int64 {
+	return handoffSourceRequirementIDWithExternal(sourceRef, handoffRequirementIndex{})
+}
+
+// handoffSourceRequirementIDWithExternal parses "requirement:<id>" accepting the
+// internal decimal id and the version's external id.
+func handoffSourceRequirementIDWithExternal(sourceRef string, index handoffRequirementIndex) int64 {
+	parsed, ok := handoffRequirementRefID(sourceRef, index)
+	if !ok {
+		return 0
+	}
+	return parsed
 }
 
 func handoffBoundedSnippet(value string, max int) string {

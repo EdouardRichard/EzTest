@@ -87,19 +87,28 @@ func handoffSeedRequirements(t *testing.T, pool *pgxpool.Pool, versionID int64) 
 			t.Fatalf("seed requirements: %v", err)
 		}
 	}
-	exec(`INSERT INTO requirement (id, version_id, status, source_quote, confidence)
-		VALUES (101, $1, 'clarified', '退款到账时间按 T+1 验收', 0.95)`, versionID)
+	exec(`INSERT INTO requirement (id, version_id, status, source_quote, confidence, external_id)
+		VALUES (101, $1, 'clarified', '退款到账时间按 T+1 验收', 0.95, 'FR-101')`, versionID)
 	exec(`INSERT INTO requirement_version (id, requirement_id, revision, title, description,
 			acceptance_criteria, priority, content_hash)
 		VALUES (201, 101, 2, '退款到账时效', '退款后约定时效到账。', 'T+1 到账', 'P1', $1)`, strings.Repeat("a", 64))
 	exec(`UPDATE requirement SET current_version_id = 201 WHERE id = 101`)
 	exec(`INSERT INTO requirement_confirmation (id, requirement_version_id, scope, actor_id)
 		VALUES (301, 201, 'requirement', 1)`)
-	exec(`INSERT INTO requirement (id, version_id, status, source_quote) VALUES (102, $1, 'draft', '')`, versionID)
+	exec(`INSERT INTO requirement (id, version_id, status, source_quote, external_id)
+		VALUES (102, $1, 'draft', '', 'FR-102')`, versionID)
 	exec(`INSERT INTO requirement_version (id, requirement_id, revision, title, description,
 			acceptance_criteria, priority, content_hash)
 		VALUES (202, 102, 1, '退款失败重试', '退款失败允许重试。', '重试不重复退款', 'P2', $1)`, strings.Repeat("b", 64))
 	exec(`UPDATE requirement SET current_version_id = 202 WHERE id = 102`)
+	// A historical closed requirement must not enter the handoff (B §8.1:
+	// confirmed/draft only).
+	exec(`INSERT INTO requirement (id, version_id, status, source_quote)
+		VALUES (103, $1, 'closed', '')`, versionID)
+	exec(`INSERT INTO requirement_version (id, requirement_id, revision, title, description,
+			acceptance_criteria, priority, content_hash)
+		VALUES (203, 103, 1, '已关闭需求', '', '', 'P2', $1)`, strings.Repeat("c", 64))
+	exec(`UPDATE requirement SET current_version_id = 203 WHERE id = 103`)
 }
 
 // handoffSeedQuestions seeds one answered and one pending structured question.
@@ -107,7 +116,10 @@ func handoffSeedQuestions(t *testing.T, pool *pgxpool.Pool, versionID, conversat
 	t.Helper()
 	answeredQuestion := `{"questions":[{"id":"q1","text":"退款到账时间按 T+1 还是 T+3 验收？","options":[{"id":"a","label":"T+1"},{"id":"b","label":"T+3"}],"multiple":false,"allow_free_text":true,"required":true,"source_refs":["requirement:101"]}],"batch_id":"qb-1","expires_at":"2026-11-06T06:00:00Z"}`
 	answeredResponse := `{"answers":[{"question_id":"q1","selected":["a"],"text":""}],"answered_at":"2026-11-05T06:00:00Z"}`
-	pendingQuestion := `{"questions":[{"id":"q1","text":"是否需要覆盖退款失败场景？","options":[{"id":"yes","label":"需要"},{"id":"no","label":"不需要"}],"allow_free_text":false,"source_refs":["requirement:102"]}],"batch_id":"qb-2","expires_at":"2026-11-06T06:00:00Z"}`
+	// The source ref uses the requirement's external id ("requirement:FR-102",
+	// the B §6.1 example format); the handoff/search reader must resolve it to
+	// the internal requirement id 102.
+	pendingQuestion := `{"questions":[{"id":"q1","text":"是否需要覆盖退款失败场景？","options":[{"id":"yes","label":"需要"},{"id":"no","label":"不需要"}],"allow_free_text":false,"source_refs":["requirement:FR-102"]}],"batch_id":"qb-2","expires_at":"2026-11-06T06:00:00Z"}`
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO human_request (id, version_id, conversation_id, message_id, kind, payload,
 			question, status, response, expires_at, resolved_at)
@@ -207,6 +219,13 @@ func TestHandoffRepositoryGenerateAndRead(t *testing.T) {
 	if len(document.Requirements) != 2 {
 		t.Fatalf("requirements = %d, want 2", len(document.Requirements))
 	}
+	for _, requirement := range document.Requirements {
+		// B §8.1: confirmed/draft only. The seeded closed requirement 103 must
+		// never enter the handoff.
+		if requirement.ID == 103 || requirement.Status == "closed" {
+			t.Fatalf("closed requirement leaked into the handoff: %+v", requirement)
+		}
+	}
 	if len(document.QA) != 2 {
 		t.Fatalf("qa = %d, want 2", len(document.QA))
 	}
@@ -215,6 +234,12 @@ func TestHandoffRepositoryGenerateAndRead(t *testing.T) {
 	}
 	if document.QA[1].Status != "pending" {
 		t.Fatalf("pending qa = %+v", document.QA[1])
+	}
+	// The pending question references "requirement:FR-102"; the handoff must
+	// resolve it through requirement.external_id to internal requirement 102.
+	if document.QA[1].RequirementID != 102 || len(document.QA[1].RequirementRefs) != 1 ||
+		document.QA[1].RequirementRefs[0] != 102 {
+		t.Fatalf("external requirement ref was not resolved: %+v", document.QA[1])
 	}
 	if len(document.Decisions) != 2 {
 		t.Fatalf("decisions = %d, want decision+constraint", len(document.Decisions))

@@ -69,7 +69,7 @@ func handoffReadDocument() versionapp.Handoff {
 		}},
 		Open: []versionapp.HandoffOpenItem{{
 			Kind: "question", Summary: "是否需要覆盖退款失败场景？", Status: "pending",
-			Source: "human_request:502", ReferenceID: 502,
+			Source: "human_request:502:q1", ReferenceID: 502, QuestionKey: "q1",
 		}},
 		Plan: versionapp.HandoffPlan{
 			Stage:   "designing",
@@ -129,7 +129,8 @@ func TestHandoffHandlerGet(t *testing.T) {
 		t.Fatalf("decision DTO = %#v", decision)
 	}
 	openItem := data["open"].([]any)[0].(map[string]any)
-	if openItem["kind"] != "question" || openItem["source"] != "human_request:502" {
+	if openItem["kind"] != "question" || openItem["source"] != "human_request:502:q1" ||
+		openItem["question_key"] != "q1" {
 		t.Fatalf("open DTO = %#v", openItem)
 	}
 	resources := data["resources"].(map[string]any)

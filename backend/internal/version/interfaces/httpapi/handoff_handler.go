@@ -153,6 +153,7 @@ type handoffOpenDTO struct {
 	Status      string  `json:"status"`
 	Source      string  `json:"source"`
 	ReferenceID string  `json:"reference_id,omitempty"`
+	QuestionKey string  `json:"question_key,omitempty"`
 	CreatedAt   *string `json:"created_at,omitempty"`
 }
 
@@ -294,6 +295,7 @@ func toHandoffDTO(document versionapp.Handoff) handoffDTO {
 			Status:      item.Status,
 			Source:      item.Source,
 			ReferenceID: formatOptionalID(item.ReferenceID),
+			QuestionKey: item.QuestionKey,
 			CreatedAt:   formatOptionalTime(item.CreatedAt),
 		})
 	}
