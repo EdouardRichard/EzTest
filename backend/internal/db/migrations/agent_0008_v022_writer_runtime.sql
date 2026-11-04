@@ -51,7 +51,7 @@ ALTER TABLE agent_run
 -- DB-6: per-run step trace for replay and the Agent Center run detail. run_id
 -- is a logical agent-context reference (no cross-context FK, Agent.md §6.9.7).
 CREATE TABLE agent_activity (
-    id          BIGINT PRIMARY KEY,
+    id          BIGINT NOT NULL,
     run_id      BIGINT NOT NULL,
     type        TEXT NOT NULL CHECK (type <> ''),
     title       TEXT NOT NULL DEFAULT '',
@@ -62,7 +62,8 @@ CREATE TABLE agent_activity (
                 CHECK (jsonb_typeof(payload) = 'object'),
     error       TEXT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_agent_activity PRIMARY KEY (id)
 );
 
 CREATE INDEX idx_agent_activity_run ON agent_activity (run_id, id);
@@ -70,7 +71,7 @@ CREATE INDEX idx_agent_activity_run ON agent_activity (run_id, id);
 -- DB-7: deterministic requirement-document extraction runs. version_id and
 -- attachment_id are same-context (version) references, so the FKs are safe.
 CREATE TABLE requirement_extraction_run (
-    id                BIGINT PRIMARY KEY,
+    id                BIGINT NOT NULL,
     version_id        BIGINT NOT NULL REFERENCES version (id),
     attachment_id     BIGINT NOT NULL REFERENCES requirement_attachment (id),
     input_sha256      TEXT NOT NULL,
@@ -84,13 +85,14 @@ CREATE TABLE requirement_extraction_run (
     extracted_count   INT NOT NULL DEFAULT 0 CHECK (extracted_count >= 0),
     error             TEXT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_requirement_extraction_run PRIMARY KEY (id)
 );
 
 -- DB-8: per-segment cursor. The unique (run_id, seq) key makes segment replay
 -- idempotent; renewed_at is the lease heartbeat for paused/resumed runs.
 CREATE TABLE requirement_extraction_segment (
-    id               BIGINT PRIMARY KEY,
+    id               BIGINT NOT NULL,
     run_id           BIGINT NOT NULL
                      CONSTRAINT fk_requirement_extraction_segment_run
                      REFERENCES requirement_extraction_run (id) ON DELETE CASCADE,
@@ -108,6 +110,7 @@ CREATE TABLE requirement_extraction_segment (
     renewed_at       TIMESTAMPTZ NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_requirement_extraction_segment PRIMARY KEY (id),
     CONSTRAINT uk_requirement_extraction_segment_run_seq UNIQUE (run_id, seq)
 );
 

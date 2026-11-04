@@ -1204,16 +1204,43 @@ func TestV022ABSchema(t *testing.T) {
 		requireColumn(t, pool, c.table, c.column)
 	}
 
+	// D34 / Agent.md §6.9.5: the three new tables name their primary-key
+	// constraints pk_<table> instead of PostgreSQL's implicit <table>_pkey.
+	for _, constraint := range []string{
+		"pk_agent_activity",
+		"pk_requirement_extraction_run",
+		"pk_requirement_extraction_segment",
+	} {
+		requirePKConstraint(t, pool, constraint)
+	}
+
 	requireIndex(t, pool, "uk_conversation_active_turn")
 
 	// The one-active-turn invariant is a partial UNIQUE index on
 	// conversation(id): rows with a NULL active_turn_id stay outside it.
-	var definition string
+	var (
+		table      string
+		column     string
+		definition string
+	)
 	if err := pool.QueryRow(context.Background(), `
-		SELECT indexdef FROM pg_indexes
-		WHERE schemaname = current_schema() AND indexname = 'uk_conversation_active_turn'
-	`).Scan(&definition); err != nil {
+		SELECT
+			t.relname,
+			pg_get_indexdef(i.indexrelid, 1, true),
+			pg_get_indexdef(i.indexrelid)
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_class t ON t.oid = i.indrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = current_schema() AND c.relname = 'uk_conversation_active_turn'
+	`).Scan(&table, &column, &definition); err != nil {
 		t.Fatalf("read uk_conversation_active_turn: %v", err)
+	}
+	if table != "conversation" {
+		t.Errorf("uk_conversation_active_turn is on table %s, want conversation", table)
+	}
+	if column != "id" {
+		t.Errorf("uk_conversation_active_turn covers %s, want id", column)
 	}
 	if !strings.Contains(definition, "UNIQUE INDEX") {
 		t.Errorf("uk_conversation_active_turn is not unique: %s", definition)
@@ -1271,5 +1298,26 @@ func requireIndex(t *testing.T, pool *pgxpool.Pool, index string) {
 	}
 	if !exists {
 		t.Errorf("missing index %s", index)
+	}
+}
+
+// requirePKConstraint asserts a primary-key constraint with exactly this name
+// exists in the test schema, pinning the D34 pk_<table> constraint naming.
+func requirePKConstraint(t *testing.T, pool *pgxpool.Pool, constraint string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = $1
+			  AND contype = 'p'
+			  AND connamespace = current_schema()::regnamespace
+		)
+	`, constraint).Scan(&exists); err != nil {
+		t.Errorf("check constraint %s: %v", constraint, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing primary-key constraint %s", constraint)
 	}
 }
