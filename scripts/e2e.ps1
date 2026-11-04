@@ -443,6 +443,8 @@ try {
     $env:EZTEST_VERSION_ATTACHMENT_DIR = $p3AttachmentDir
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
+    # The first-start seed reads EZTEST_INITIAL_ADMIN_PASSWORD; the e2e DB is fresh.
+    $env:EZTEST_INITIAL_ADMIN_PASSWORD = $adminPassword
     foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) {
             Set-Item -Path ("Env:" + $key) -Value $envValues[$key]
