@@ -1,0 +1,77 @@
+name: Release packages
+
+# Manual-only: builds the two self-contained EzTest packages (Windows x64 +
+# Linux x64) and keeps them as workflow artifacts. Public release/archive is
+# intentionally not created here.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version stamped into the packages
+        required: true
+        default: "0.2.1"
+        type: string
+      skip_smoke:
+        description: Skip the package smoke test (the hosted Windows runner has no WSL/Linux PG)
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows + Linux packages
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies (next build)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build release packages
+        shell: pwsh
+        run: |
+          ./scripts/build-release.ps1 -Version "${{ inputs.version }}" -SkipSmoke:${{ inputs.skip_smoke }}
+
+      - name: Show artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem .tmp/release | Select-Object Name, Length
+          Get-Content .tmp/release/SHA256SUMS.txt
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: eztest-${{ inputs.version }}-packages
+          path: |
+            .tmp/release/eztest-${{ inputs.version }}-windows-x64.zip
+            .tmp/release/eztest-${{ inputs.version }}-linux-x64.tar.gz
+            .tmp/release/SHA256SUMS.txt
+          if-no-files-found: error
