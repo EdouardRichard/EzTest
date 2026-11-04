@@ -839,3 +839,153 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 		t.Fatalf("intents after cancel = %#v", intents)
 	}
 }
+
+// TestP3ManualIntentForPassedRerun pins Task 119 (Release-T7): a passed case
+// has no failed result, so rerunning it from the UI must create purpose=manual.
+// The API keeps the retest gate unchanged (400 for a passed or never-run case)
+// while the manual intent is accepted (201) and stored with purpose=manual.
+func TestP3ManualIntentForPassedRerun(t *testing.T) {
+	api := newTestAPI(t)
+	api.login("admin", testSeedAdminPassword)
+
+	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{
+		"name": "T119 Rerun SUT", "intro": "task 119",
+	}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{
+		"name": "dev", "base_url": "http://127.0.0.1:13338", "is_default": true,
+	}, http.StatusCreated))
+	environmentID := environment["id"].(string)
+	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "T119 Manual Rerun Version",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID,
+			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
+		}},
+	}, http.StatusCreated))
+	versionID := version["id"].(string)
+	versionIDValue, err := strconv.ParseInt(versionID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse version id: %v", err)
+	}
+
+	ctx := context.Background()
+	var versionSUTID int64
+	if err := api.pool.QueryRow(ctx,
+		`SELECT id FROM version_sut WHERE version_id = $1 ORDER BY id LIMIT 1`, versionIDValue,
+	).Scan(&versionSUTID); err != nil {
+		t.Fatalf("read version_sut id: %v", err)
+	}
+	versionSUTIDs := "[" + strconv.FormatInt(versionSUTID, 10) + "]"
+
+	const (
+		requirementID         int64 = 830001
+		requirementVersionID  int64 = 830002
+		scenarioID            int64 = 830003
+		passedCaseVersionID   int64 = 830011
+		failedCaseVersionID   int64 = 830021
+		noResultCaseVersionID int64 = 830031
+	)
+	execSQL := func(statement string, args ...any) {
+		t.Helper()
+		if _, err := api.pool.Exec(ctx, statement, args...); err != nil {
+			t.Fatalf("seed execution fixture: %v\n%s", err, statement)
+		}
+	}
+	// The design read requires a current+confirmed case version reachable from
+	// the version's scenario/requirement revision.
+	execSQL(`INSERT INTO requirement (id, version_id, current_version_id, status)
+		VALUES ($1, $2, $3, 'clarified')`, requirementID, versionIDValue, requirementVersionID)
+	execSQL(`INSERT INTO requirement_version (id, requirement_id, revision, title, content_hash)
+		VALUES ($1, $2, 1, 'T119 rerun requirement', $3)`,
+		requirementVersionID, requirementID, strings.Repeat("a", 64))
+	execSQL(`INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name)
+		VALUES ($1, $2, $3, $4, 'T119 rerun scenario')`,
+		scenarioID, versionIDValue, requirementID, requirementVersionID)
+
+	seedCase := func(caseID, caseVersionID int64, title string) {
+		t.Helper()
+		execSQL(`INSERT INTO case_entity (id, scenario_id, current_version_id, status)
+			VALUES ($1, $2, $3, 'confirmed')`, caseID, scenarioID, caseVersionID)
+		execSQL(`INSERT INTO case_version (id, case_id, revision, title, description, priority,
+			default_version_sut_id, version_sut_ids, status, content_hash)
+			VALUES ($1, $2, 1, $3, '', 'P2', $4, $5::jsonb, 'confirmed', $6)`,
+			caseVersionID, caseID, title, versionSUTID, versionSUTIDs, strings.Repeat("b", 64))
+		execSQL(`INSERT INTO case_step (id, case_version_id, seq, action)
+			VALUES ($1, $2, 1, 'open the page')`, caseVersionID+100000, caseVersionID)
+		execSQL(`INSERT INTO case_assertion (id, case_version_id, step_seq, kind, target, expected)
+			VALUES ($1, $2, 1, 'ui', '#result', 'ok')`, caseVersionID+200000, caseVersionID)
+	}
+	seedCase(830010, passedCaseVersionID, "T119 passed case")
+	seedCase(830020, failedCaseVersionID, "T119 failed case")
+	seedCase(830030, noResultCaseVersionID, "T119 never-run case")
+
+	seedRun := func(waveID, intentID, caseRunID, caseVersionID int64, status, failureClass string) {
+		t.Helper()
+		execSQL(`INSERT INTO run_wave (id, version_id, status, trigger, counts, started_at, finished_at)
+			VALUES ($1, $2, 'done', 'auto', '{}'::jsonb, now(), now())`, waveID, versionIDValue)
+		execSQL(`INSERT INTO execution_intent (id, version_id, case_version_id, version_sut_ids,
+			environment_fingerprint, purpose, status, dedupe_key)
+			VALUES ($1, $2, $3, $4::jsonb, $5, 'initial', 'done', $6)`,
+			intentID, versionIDValue, caseVersionID, versionSUTIDs, strings.Repeat("c", 64),
+			"t119-seed-intent-"+strconv.FormatInt(intentID, 10))
+		execSQL(`INSERT INTO case_run (id, wave_id, intent_id, case_version_id, status, attempts,
+			failure_class, summary, started_at, finished_at)
+			VALUES ($1, $2, $3, $4, $5, 1, $6, '{}'::jsonb, now(), now())`,
+			caseRunID, waveID, intentID, caseVersionID, status, failureClass)
+	}
+	seedRun(830101, 830102, 830103, passedCaseVersionID, "passed", "")
+	seedRun(830201, 830202, 830203, failedCaseVersionID, "failed", "application")
+
+	intentPath := "/api/versions/" + versionID + "/execution/intents"
+	createIntent := func(caseVersionID int64, purpose string, wantStatus int) map[string]any {
+		t.Helper()
+		return api.do(http.MethodPost, intentPath, map[string]any{
+			"case_version_id": strconv.FormatInt(caseVersionID, 10),
+			"purpose":         purpose,
+		}, wantStatus)
+	}
+
+	// The passed-case retest gate is unchanged: 400, not a silent manual run.
+	rejected := createIntent(passedCaseVersionID, "retest", http.StatusBadRequest)
+	errorBody, ok := rejected["error"].(map[string]any)
+	if !ok || errorBody["code"] != "invalid_argument" {
+		t.Fatalf("passed-case retest error = %#v, want invalid_argument", rejected)
+	}
+	if details, _ := errorBody["details"].(map[string]any); details["field"] != "purpose" {
+		t.Fatalf("passed-case retest details = %#v, want field=purpose", errorBody["details"])
+	}
+	// A case without any result cannot be retested either; manual is its entry.
+	createIntent(noResultCaseVersionID, "retest", http.StatusBadRequest)
+
+	// The passed-case rerun creates a manual intent and execution records it.
+	manual := api.data(createIntent(passedCaseVersionID, "manual", http.StatusCreated))
+	if manual["purpose"] != "manual" || manual["status"] != "open" {
+		t.Fatalf("manual intent = %#v, want purpose=manual status=open", manual)
+	}
+	manualIntentID, err := strconv.ParseInt(manual["id"].(string), 10, 64)
+	if err != nil {
+		t.Fatalf("parse manual intent id: %v", err)
+	}
+	var storedPurpose string
+	if err := api.pool.QueryRow(ctx,
+		`SELECT purpose FROM execution_intent WHERE id = $1`, manualIntentID,
+	).Scan(&storedPurpose); err != nil {
+		t.Fatalf("read stored manual intent: %v", err)
+	}
+	if storedPurpose != "manual" {
+		t.Fatalf("stored intent purpose = %q, want manual", storedPurpose)
+	}
+
+	// A failed case still uses retest (and is accepted by the gate).
+	retest := api.data(createIntent(failedCaseVersionID, "retest", http.StatusCreated))
+	if retest["purpose"] != "retest" || retest["status"] != "open" {
+		t.Fatalf("failed-case retest intent = %#v, want purpose=retest status=open", retest)
+	}
+
+	// A never-run case can be started manually (201).
+	noResultManual := api.data(createIntent(noResultCaseVersionID, "manual", http.StatusCreated))
+	if noResultManual["purpose"] != "manual" {
+		t.Fatalf("no-result manual intent = %#v, want purpose=manual", noResultManual)
+	}
+}

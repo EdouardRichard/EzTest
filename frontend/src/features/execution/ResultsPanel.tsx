@@ -11,6 +11,7 @@ import { formatDuration } from "@/lib/format"
 
 import { createIntent } from "./api"
 import { CaseRunDetailView } from "./CaseRunDetail"
+import { rerunPurpose } from "./intent-purpose"
 import {
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
@@ -27,7 +28,7 @@ export type ResultsPanelProps = {
   onSelect: (caseRunId: string) => void
   onPause: (caseRun: CaseRun) => void
   onResume: (caseRun: CaseRun) => void
-  /** Called after a retest intent was created so the workspace refetches. */
+  /** Called after a rerun intent was created so the workspace refetches. */
   onRerunComplete?: () => void
   /**
    * Opens the requirements tab on the closed requirement a retest was rejected
@@ -80,7 +81,9 @@ function assertionProgress(caseRun: CaseRun): string | null {
 /**
  * Right column of the execution workspace (spec §12.1): the case-run result
  * list with failed/blocked pinned on top, row expansion into the step detail,
- * case-level pause/resume and the retest action (purpose=retest, spec §5.8).
+ * case-level pause/resume and the rerun action. A failed verdict creates a
+ * retest intent, while a passed case (no failed result) is rerun manually
+ * (spec §5.8) so the API retest gate stays intact.
  */
 export function ResultsPanel({
   versionId,
@@ -111,7 +114,7 @@ export function ResultsPanel({
     try {
       await createIntent(versionId, {
         case_version_id: caseRun.case_version_id,
-        purpose: "retest",
+        purpose: rerunPurpose(caseRun),
       })
       setRerunConfirmId(null)
       onRerunComplete?.()

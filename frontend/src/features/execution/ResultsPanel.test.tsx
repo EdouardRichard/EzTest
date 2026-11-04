@@ -176,7 +176,7 @@ describe("ResultsPanel", () => {
     expect(screen.getByText("正在加载用例详情…")).toBeInTheDocument()
   })
 
-  it("offers retest for terminal rows and calls createIntent with purpose=retest", async () => {
+  it("keeps retest for a failed case and calls createIntent with purpose=retest", async () => {
     const onRerunComplete = vi.fn()
     renderPanel({ onRerunComplete })
 
@@ -190,6 +190,23 @@ describe("ResultsPanel", () => {
       expect(api.createIntent).toHaveBeenCalledWith("2001", {
         case_version_id: "7004",
         purpose: "retest",
+      })
+    })
+    expect(onRerunComplete).toHaveBeenCalledTimes(1)
+  })
+
+  it("reruns a passed case with purpose=manual because it has no failed result", async () => {
+    const onRerunComplete = vi.fn()
+    renderPanel({ onRerunComplete })
+
+    const passed = row("case-run-row-9301")
+    fireEvent.click(within(passed).getByRole("button", { name: "重跑" }))
+    fireEvent.click(within(passed).getByRole("button", { name: "确认重跑" }))
+
+    await waitFor(() => {
+      expect(api.createIntent).toHaveBeenCalledWith("2001", {
+        case_version_id: "7002",
+        purpose: "manual",
       })
     })
     expect(onRerunComplete).toHaveBeenCalledTimes(1)
