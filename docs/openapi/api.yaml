@@ -639,6 +639,8 @@ paths:
       tags: [AdminSettings]
       operationId: listSettingRevisions
       summary: 设置变更历史（admin）
+      description: 设置页只读列表不消费变更历史；0.22 不提供前端入口（x-api-only）。
+      x-api-only: true
       parameters:
         - name: key
           in: query
@@ -677,6 +679,8 @@ paths:
       tags: [AdminSettings]
       operationId: getSetting
       summary: 读取单项设置（admin）
+      description: 仅管理调试使用；0.22 不提供前端入口（x-api-only）。
+      x-api-only: true
       parameters:
         - $ref: '#/components/parameters/SettingKey'
       responses:
@@ -797,6 +801,8 @@ paths:
       tags: [AdminLLM]
       operationId: getLLMConfig
       summary: LLM 配置详情（admin）
+      description: 设置页使用列表 + PATCH，不调用单条读取；仅管理调试使用（x-api-only）。
+      x-api-only: true
       parameters:
         - $ref: '#/components/parameters/ID'
       responses:
@@ -5748,6 +5754,8 @@ paths:
       tags: [Quality]
       operationId: getEvalRun
       summary: 评测 run 详情（admin）
+      description: 质量 UI 归 W2，0.22 不提供前端入口（x-api-only）。
+      x-api-only: true
       parameters:
         - $ref: '#/components/parameters/EvalRunID'
       responses:
