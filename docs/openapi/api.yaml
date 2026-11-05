@@ -188,9 +188,9 @@ info:
     `job.progress`/`job.finished` 事件与 `work_item` 查询为准，该路径仅作 0.3 预留并标 `deprecated`。
     另新增 admin-only 上下文包读取（`GET /api/versions/{id}/context-packets/latest`）与
     admin 模型能力编辑（`PATCH /api/admin/llm/configs/{id}/models/{modelId}`）。新增 tag `LLM`/`Jobs`。
-    上述 22 个 0.2.1 operation 当前均有实现：`GET /api/versions/{id}/work-items`、
-    `.../work-items/{workItemId}`、`.../plan-items`、`.../facts` 为 Task 62 契约先行、
-    Task 37 由 P6 read model 挂载（早前“实现未挂载”的描述已过时）；
+    0.2.1 operation 中除 `GET /api/versions/{id}/jobs/{jobId}` 外均已实现；
+    `GET /api/versions/{id}/work-items`、`.../work-items/{workItemId}`、`.../plan-items`、
+    `.../facts` 为 Task 62 契约先行、Task 37 由 P6 read model 挂载（早前“实现未挂载”的描述已过时）；
     `GET /api/versions/{id}/jobs/{jobId}` 为 0.3 预留并标 `deprecated`；
     `GET /api/versions/{id}/context-packets/latest` 已在 Task 48 装配 reader 后挂载。
     其余 0.2.1 operation 已按实现同步。

@@ -50,6 +50,10 @@ func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireActor(w, r); !ok {
 		return
 	}
+	if h == nil || h.svc == nil {
+		httpx.Error(w, r, platform.Unavailable("plan service is not configured"))
+		return
+	}
 	versionID, err := validation.NonEmptyID("id", r.PathValue("id"))
 	if err != nil {
 		httpx.Error(w, r, err)

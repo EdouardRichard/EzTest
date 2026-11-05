@@ -1375,10 +1375,11 @@ func main() {
 		Versions:      executionVersionAdapter,
 		Content:       executionContent,
 		Settings:      settingsSvc,
-		IntentService: executionIntents,
-		PauseService:  executionPause,
-		HumanService:  executionHumans,
-		Registry:      executorRegistry,
+		IntentService:   executionIntents,
+		PauseService:    executionPause,
+		HumanService:    executionHumans,
+		QuestionService: executionQuestions,
+		Registry:        executorRegistry,
 	})
 
 	// P4 delivery/chain/steward composition. The composition root is the only
