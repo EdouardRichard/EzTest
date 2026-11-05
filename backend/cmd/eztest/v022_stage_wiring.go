@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -28,9 +29,19 @@ import (
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
+
+// isPlatformNotFound reports whether err is the shared 404 API error. Some
+// version services map their store's no-record sentinel to platform.NotFound
+// (for example HandoffService.Latest), so gate adapters that need "absence is
+// an empty result" must accept it alongside the domain sentinel.
+func isPlatformNotFound(err error) bool {
+	var apiErr *platform.Error
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+}
 
 /* ----------------------------- callback relay ---------------------------- */
 
@@ -334,10 +345,17 @@ func newV022StageGates(deps v022StageGateDeps) versionapp.StageGates {
 			}
 			if deps.Handoff != nil {
 				latest, err := deps.Handoff.Latest(ctx, versionID, 0)
-				if err != nil && !errors.Is(err, versionapp.ErrHandoffNotFound) {
-					return 0, err
-				}
-				if err == nil {
+				if err != nil {
+					// HandoffService maps its store's no-record outcome to the
+					// shared 404 error, not to versionapp.ErrHandoffNotFound; a
+					// missing handoff means "no open gaps yet", not a gate
+					// infrastructure failure. Without this the requirement_review
+					// -> designing gate is permanently closed before the design
+					// handoff exists.
+					if !errors.Is(err, versionapp.ErrHandoffNotFound) && !isPlatformNotFound(err) {
+						return 0, err
+					}
+				} else {
 					open += len(latest.Open)
 				}
 			}

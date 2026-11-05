@@ -8,7 +8,7 @@ import (
 )
 
 const waveColumns = `id, version_id, status, trigger, counts, started_at, finished_at,
-	paused_at, paused_by, pause_reason, pause_mode, report_id, created_at, updated_at`
+	paused_at, paused_by, pause_reason, pause_mode, report_id, scope_snapshot, created_at, updated_at`
 
 // WaveRepository implements executionapp.WaveRepository.
 type WaveRepository struct{ base }
@@ -28,10 +28,16 @@ func (r *WaveRepository) CreateWithCaseRuns(ctx context.Context, wave execution.
 	if err != nil {
 		return err
 	}
+	// R-C5-1: the scope snapshot is frozen at wave creation. An assembly that
+	// did not compute one keeps the column's documented empty object.
+	scopeSnapshot := wave.ScopeSnapshot
+	if len(scopeSnapshot) == 0 {
+		scopeSnapshot = "{}"
+	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO run_wave (id, version_id, status, trigger, counts)
-		VALUES ($1, $2, $3, $4, $5::jsonb)
-	`, r.insertID(wave.ID), wave.VersionID, string(wave.Status), wave.Trigger, counts); err != nil {
+		INSERT INTO run_wave (id, version_id, status, trigger, counts, scope_snapshot)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+	`, r.insertID(wave.ID), wave.VersionID, string(wave.Status), wave.Trigger, counts, scopeSnapshot); err != nil {
 		return wrapDB("insert run wave", err)
 	}
 
@@ -270,7 +276,8 @@ func scanWave(row rowScanner) (execution.RunWave, error) {
 	var pausedBy *int64
 	err := row.Scan(&wave.ID, &wave.VersionID, &status, &trigger, &countsRaw,
 		&wave.StartedAt, &wave.FinishedAt, &wave.PausedAt, &pausedBy,
-		&wave.PauseReason, &pauseMode, &wave.ReportID, &wave.CreatedAt, &wave.UpdatedAt)
+		&wave.PauseReason, &pauseMode, &wave.ReportID, &wave.ScopeSnapshot,
+		&wave.CreatedAt, &wave.UpdatedAt)
 	if err != nil {
 		return execution.RunWave{}, err
 	}

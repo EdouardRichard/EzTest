@@ -519,7 +519,7 @@ type chatContentImageURL struct {
 func (m chatMessagePayload) MarshalJSON() ([]byte, error) {
 	type wireMessage struct {
 		Role             string                `json:"role"`
-		Content          any                   `json:"content,omitempty"`
+		Content          any                   `json:"content"`
 		ToolCalls        []chatToolCallPayload `json:"tool_calls,omitempty"`
 		ToolCallID       string                `json:"tool_call_id,omitempty"`
 		ReasoningContent string                `json:"reasoning_content,omitempty"`
@@ -535,6 +535,11 @@ func (m chatMessagePayload) MarshalJSON() ([]byte, error) {
 		content = parts
 	case m.Content != "":
 		content = m.Content
+	default:
+		// Always serialize content, as the empty string for a pure tool call:
+		// strict OpenAI-compatible upstreams (DeepSeek) answer 422 "missing
+		// field `content`" when the key is omitted.
+		content = ""
 	}
 	return json.Marshal(wireMessage{
 		Role:             m.Role,
