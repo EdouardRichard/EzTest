@@ -426,8 +426,8 @@ func TestDiscoveryObservationListByVersion(t *testing.T) {
 		t.Fatalf("kind=page rows = %d err=%v, want 2", len(pageRows), err)
 	}
 	newRows, err := repo.Observations.ListByVersion(ctx, versionID, nil, "", "new", 0)
-	if err != nil || len(newRows) != 2 {
-		t.Fatalf("decision=new rows = %d err=%v, want 2", len(newRows), err)
+	if err != nil || len(newRows) != 3 {
+		t.Fatalf("decision=new rows = %d err=%v, want 3 (all three upserted rows are unclassified)", len(newRows), err)
 	}
 	waveID := int64(9201)
 	waveRows, err := repo.Observations.ListByVersion(ctx, versionID, &waveID, "", "", 0)
