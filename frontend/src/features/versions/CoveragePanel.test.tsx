@@ -63,6 +63,17 @@ describe("CoveragePanel", () => {
     expect(versionApi.getDiscoveryCoverage).toHaveBeenCalledWith("2001")
   })
 
+  it("describes the decision tally as four decisions plus observed", async () => {
+    versionApi.getDiscoveryCoverage.mockResolvedValue(coverage())
+
+    render(<CoveragePanel versionId="2001" />)
+
+    expect(await screen.findByTestId("coverage-pages")).toBeInTheDocument()
+    // The API returns four decision counts + observed; there is no fifth bucket.
+    expect(screen.getByText(/四类决策 \+ observed/)).toBeInTheDocument()
+    expect(screen.queryByText(/五类决策/)).not.toBeInTheDocument()
+  })
+
   it("shows an explicit empty state when nothing was discovered", async () => {
     versionApi.getDiscoveryCoverage.mockResolvedValue(
       coverage({

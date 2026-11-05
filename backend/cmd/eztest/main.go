@@ -1888,10 +1888,15 @@ func main() {
 	eventSvc.Observe(wake)
 	eventSvc.Observe(eventingapp.NewSystemEventConsumer(slog.Default()))
 	// W1-14B: settle proposed discovery observations when an admin confirms or
-	// rejects a discovered page/API (system-channel resource events).
-	eventSvc.Observe(executionapp.NewResourceDecisionObserver(executionRepo.Observations, slog.Default()))
+	// rejects a discovered page/API (system-channel resource events). Like the
+	// wake above, both delivery paths are wired: local publishes (this replica)
+	// and cross-instance events loaded by the P7 listener, so a decision made
+	// against another API replica still settles this replica's observations.
+	decisionObserver := executionapp.NewResourceDecisionObserver(executionRepo.Observations, slog.Default())
+	eventSvc.Observe(decisionObserver)
 	if p7rt.Listener != nil {
 		p7rt.Listener.Observe(wake)
+		p7rt.Listener.Observe(decisionObserver)
 	}
 	background.Add(1)
 	go func() {

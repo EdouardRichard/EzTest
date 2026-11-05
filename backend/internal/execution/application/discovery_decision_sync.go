@@ -13,26 +13,41 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	eventing "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
 )
 
+// resourceDecisionWriteTimeout bounds the detached write-back so a stalled
+// database cannot hold the observer (and therefore the listener loop) forever.
+const resourceDecisionWriteTimeout = 5 * time.Second
+
 // ResourceDecisionMarker settles the DB-29 observations of one discovered
-// resource. Only rows whose decision is still `proposed` may change, so a
-// replayed/duplicated event can never rewrite an already-settled row; the
-// returned count reports how many observations were updated.
+// resource and kind. The kind scopes the update because a page and an API can
+// carry the same numeric resource id. Only rows whose decision is still
+// `proposed` may change, so a replayed/duplicated event can never rewrite an
+// already-settled row; the returned count reports how many observations were
+// updated.
 type ResourceDecisionMarker interface {
-	MarkDecisionByResource(ctx context.Context, resourceID int64, decision string) (int64, error)
+	MarkDecisionByResource(ctx context.Context, resourceID int64, kind, decision string) (int64, error)
+}
+
+// resourceDecisionTarget is the observation decision and kind a resource
+// lifecycle event settles.
+type resourceDecisionTarget struct {
+	kind     string
+	decision string
 }
 
 // resourceDecisionEvents maps the four resource lifecycle events that settle a
-// proposed discovery observation to the DB-29 decision value.
-var resourceDecisionEvents = map[string]string{
-	"resource.page.confirmed": "approved",
-	"resource.api.confirmed":  "approved",
-	"resource.page.rejected":  "rejected",
-	"resource.api.rejected":   "rejected",
+// proposed discovery observation to the DB-29 decision value and the observation
+// kind the event is about.
+var resourceDecisionEvents = map[string]resourceDecisionTarget{
+	"resource.page.confirmed": {kind: "page", decision: "approved"},
+	"resource.api.confirmed":  {kind: "api", decision: "approved"},
+	"resource.page.rejected":  {kind: "page", decision: "rejected"},
+	"resource.api.rejected":   {kind: "api", decision: "rejected"},
 }
 
 // NewResourceDecisionObserver returns the system-channel observer that writes
@@ -51,7 +66,7 @@ func NewResourceDecisionObserver(marker ResourceDecisionMarker, logger *slog.Log
 		if event.Channel != "system" {
 			return nil
 		}
-		decision, ok := resourceDecisionEvents[event.Type]
+		target, ok := resourceDecisionEvents[event.Type]
 		if !ok {
 			return nil
 		}
@@ -65,12 +80,21 @@ func NewResourceDecisionObserver(marker ResourceDecisionMarker, logger *slog.Log
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		rows, err := marker.MarkDecisionByResource(ctx, resourceID, decision)
+		// The observer runs after the request has been handled, so the publishing
+		// request context may already be canceled (client abort / streamed
+		// response); the cross-instance listener instead passes a long-lived
+		// context. Detach from whatever cancellation the delivery path carries and
+		// bound the write with a short timeout of its own, so an aborted client can
+		// never silently lose the decision write-back.
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resourceDecisionWriteTimeout)
+		defer cancel()
+		rows, err := marker.MarkDecisionByResource(writeCtx, resourceID, target.kind, target.decision)
 		if err != nil {
 			logger.WarnContext(ctx, "execution discovery: resource decision sync failed",
 				slog.String("type", event.Type),
 				slog.Int64("resource_id", resourceID),
-				slog.String("decision", decision),
+				slog.String("kind", target.kind),
+				slog.String("decision", target.decision),
 				slog.String("error", err.Error()),
 			)
 			return nil
@@ -78,7 +102,8 @@ func NewResourceDecisionObserver(marker ResourceDecisionMarker, logger *slog.Log
 		logger.DebugContext(ctx, "execution discovery: resource decision synced",
 			slog.String("type", event.Type),
 			slog.Int64("resource_id", resourceID),
-			slog.String("decision", decision),
+			slog.String("kind", target.kind),
+			slog.String("decision", target.decision),
 			slog.Int64("updated", rows),
 		)
 		return nil

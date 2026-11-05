@@ -73,6 +73,8 @@ export function DiscoveryPanel({ versionId, refreshKey = 0, onChanged }: Discove
 
   const load = useCallback(async () => {
     setError(null)
+    // A reload (filter switch, SSE refresh) supersedes any stale decision error.
+    setActionError(null)
     try {
       setObservations(
         await getDiscoveryObservations(versionId, {
@@ -248,6 +250,7 @@ export function DiscoveryPanel({ versionId, refreshKey = 0, onChanged }: Discove
               key={value}
               size="sm"
               variant={kind === value ? "primary" : "ghost"}
+              aria-pressed={kind === value}
               onClick={() => setKind(value)}
             >
               {KIND_LABEL[value]}
@@ -256,6 +259,7 @@ export function DiscoveryPanel({ versionId, refreshKey = 0, onChanged }: Discove
           <Button
             size="sm"
             variant={decision === "proposed" ? "primary" : "ghost"}
+            aria-pressed={decision === "proposed"}
             onClick={() => setDecision("proposed")}
           >
             仅待处理
@@ -263,6 +267,7 @@ export function DiscoveryPanel({ versionId, refreshKey = 0, onChanged }: Discove
           <Button
             size="sm"
             variant={decision === "all" ? "primary" : "ghost"}
+            aria-pressed={decision === "all"}
             onClick={() => setDecision("all")}
           >
             全部状态

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	eventing "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
@@ -17,25 +18,32 @@ import (
 
 type decisionCall struct {
 	resourceID int64
+	kind       string
 	decision   string
 }
 
 // fakeDecisionMarker records the (resource_id, decision) pair the observer
-// hands to the repository.
+// hands to the repository. The context state is sampled inside the call because
+// the observer cancels its own timeout as soon as the write returns.
 type fakeDecisionMarker struct {
-	calls   []decisionCall
-	rows    int64
-	err     error
-	panics  bool
-	lastCtx context.Context
+	calls    []decisionCall
+	rows     int64
+	err      error
+	panics   bool
+	lastCtx  context.Context
+	ctxErr   error
+	deadline time.Time
+	hasDl    bool
 }
 
-func (f *fakeDecisionMarker) MarkDecisionByResource(ctx context.Context, resourceID int64, decision string) (int64, error) {
+func (f *fakeDecisionMarker) MarkDecisionByResource(ctx context.Context, resourceID int64, kind, decision string) (int64, error) {
 	if f.panics {
 		panic("unexpected marker call")
 	}
 	f.lastCtx = ctx
-	f.calls = append(f.calls, decisionCall{resourceID: resourceID, decision: decision})
+	f.ctxErr = ctx.Err()
+	f.deadline, f.hasDl = ctx.Deadline()
+	f.calls = append(f.calls, decisionCall{resourceID: resourceID, kind: kind, decision: decision})
 	return f.rows, f.err
 }
 
@@ -49,16 +57,18 @@ func systemResourceEvent(eventType string, payload map[string]any) eventing.Even
 
 // TestResourceDecisionObserverMapsConfirmAndReject: the two confirmed event
 // types settle the observation as approved, the two rejected types as rejected,
-// and the decimal-string resource id is parsed into the repository argument.
+// the event type carries the page/api kind the repository matches on, and the
+// decimal-string resource id is parsed into the repository argument.
 func TestResourceDecisionObserverMapsConfirmAndReject(t *testing.T) {
 	cases := []struct {
 		eventType string
+		kind      string
 		decision  string
 	}{
-		{"resource.page.confirmed", "approved"},
-		{"resource.api.confirmed", "approved"},
-		{"resource.page.rejected", "rejected"},
-		{"resource.api.rejected", "rejected"},
+		{"resource.page.confirmed", "page", "approved"},
+		{"resource.api.confirmed", "api", "approved"},
+		{"resource.page.rejected", "page", "rejected"},
+		{"resource.api.rejected", "api", "rejected"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.eventType, func(t *testing.T) {
@@ -72,8 +82,8 @@ func TestResourceDecisionObserverMapsConfirmAndReject(t *testing.T) {
 				t.Fatalf("marker calls = %d, want 1: %+v", len(marker.calls), marker.calls)
 			}
 			got := marker.calls[0]
-			if got.resourceID != 11 || got.decision != tc.decision {
-				t.Fatalf("marker call = %+v, want {11 %s}", got, tc.decision)
+			if got.resourceID != 11 || got.kind != tc.kind || got.decision != tc.decision {
+				t.Fatalf("marker call = %+v, want {11 %s %s}", got, tc.kind, tc.decision)
 			}
 			if marker.lastCtx == nil {
 				t.Fatal("observer must pass a non-nil context to the repository")
@@ -92,8 +102,8 @@ func TestResourceDecisionObserverAcceptsInt64ID(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("observer: %v", err)
 	}
-	if len(marker.calls) != 1 || marker.calls[0].resourceID != 42 {
-		t.Fatalf("marker calls = %+v, want one resource 42", marker.calls)
+	if len(marker.calls) != 1 || marker.calls[0].resourceID != 42 || marker.calls[0].kind != "page" {
+		t.Fatalf("marker calls = %+v, want one page resource 42", marker.calls)
 	}
 }
 
@@ -155,8 +165,42 @@ func TestResourceDecisionObserverSwallowsRepositoryError(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("observer must not propagate the repository error, got %v", err)
 	}
-	if len(marker.calls) != 1 || marker.calls[0].resourceID != 77 || marker.calls[0].decision != "rejected" {
-		t.Fatalf("marker calls = %+v, want one rejected resource 77", marker.calls)
+	if len(marker.calls) != 1 || marker.calls[0].resourceID != 77 ||
+		marker.calls[0].kind != "api" || marker.calls[0].decision != "rejected" {
+		t.Fatalf("marker calls = %+v, want one rejected api resource 77", marker.calls)
+	}
+}
+
+// TestResourceDecisionObserverDetachesCanceledRequestContext: the observer runs
+// after the request has been handled, so the request context may already be
+// canceled (client abort / streamed response). The write-back must still
+// complete: it detaches from the request cancellation and bounds itself with its
+// own timeout instead of inheriting the aborted context.
+func TestResourceDecisionObserverDetachesCanceledRequestContext(t *testing.T) {
+	marker := &fakeDecisionMarker{}
+	observe := newResourceDecisionObserver(marker)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := observe(ctx, systemResourceEvent(
+		"resource.page.confirmed", map[string]any{"id": "11"},
+	)); err != nil {
+		t.Fatalf("observer returned error for a canceled request context: %v", err)
+	}
+	if len(marker.calls) != 1 {
+		t.Fatalf("marker calls = %d, want the write-back to survive cancellation", len(marker.calls))
+	}
+	if marker.lastCtx == nil {
+		t.Fatal("observer must pass a non-nil context to the repository")
+	}
+	if marker.ctxErr != nil {
+		t.Fatalf("write-back context inherits the request cancellation (%v), want a detached context", marker.ctxErr)
+	}
+	if !marker.hasDl {
+		t.Fatal("write-back context must carry its own timeout")
+	}
+	if remaining := time.Until(marker.deadline); remaining <= 0 || remaining > 6*time.Second {
+		t.Fatalf("write-back timeout remaining = %v, want about 5s", remaining)
 	}
 }
 

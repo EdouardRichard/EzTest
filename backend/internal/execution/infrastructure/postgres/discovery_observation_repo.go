@@ -158,25 +158,28 @@ func (r *DiscoveryObservationRepository) MarkDiscoveryObservationDecision(ctx co
 
 // discoveryObservationResourceDecisionUpdate is the W1-14B write-back from the
 // resource catalog: an admin confirm/reject of a discovered resource settles
-// every observation of that resource that is still `proposed`. A row already
-// settled (approved/rejected/out_of_scope) is never rewritten, so a replayed or
-// duplicated resource event cannot flip an earlier decision.
+// every observation of that resource and kind that is still `proposed`. The kind
+// predicate matters because a page resource and an API resource can share a
+// numeric id: a page confirmation must never settle an API observation. A row
+// already settled (approved/rejected/out_of_scope) is never rewritten, so a
+// replayed or duplicated resource event cannot flip an earlier decision.
 const discoveryObservationResourceDecisionUpdate = `
 	UPDATE execution_discovery_observation
-	SET decision = $2,
+	SET decision = $3,
 	    updated_at = now()
 	WHERE resource_id = $1
+	  AND kind = $2
 	  AND decision = 'proposed'
 `
 
 // MarkDecisionByResource implements executionapp.ResourceDecisionMarker. It
 // returns the number of observations the decision update touched.
-func (r *DiscoveryObservationRepository) MarkDecisionByResource(ctx context.Context, resourceID int64, decision string) (int64, error) {
+func (r *DiscoveryObservationRepository) MarkDecisionByResource(ctx context.Context, resourceID int64, kind, decision string) (int64, error) {
 	ctx = contextOrBackground(ctx)
 	if resourceID <= 0 {
 		return 0, execution.ErrNotFound
 	}
-	tag, err := r.pool.Exec(ctx, discoveryObservationResourceDecisionUpdate, resourceID, decision)
+	tag, err := r.pool.Exec(ctx, discoveryObservationResourceDecisionUpdate, resourceID, kind, decision)
 	if err != nil {
 		return 0, wrapDB("mark discovery observation decision by resource", err)
 	}

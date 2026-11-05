@@ -209,4 +209,50 @@ describe("DiscoveryPanel", () => {
     expect(screen.getByText("/orders/{id}")).toBeInTheDocument()
     expect(versionApi.getDiscoveryObservations).toHaveBeenCalledTimes(1)
   })
+
+  it("clears a stale action error when the panel reloads", async () => {
+    resourcesApi.confirmPageProposal.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "资源状态已变化",
+        requestId: "req_confirm",
+      }),
+    )
+    versionApi.getDiscoveryObservations.mockResolvedValue([proposedPage])
+
+    const { rerender } = render(<DiscoveryPanel versionId="2001" />)
+    await screen.findByText("/orders/{id}")
+    fireEvent.click(screen.getByRole("button", { name: "批准" }))
+    expect(await screen.findByText("资源状态已变化")).toBeInTheDocument()
+
+    // An SSE/refresh reload (or a filter switch) must not keep showing a stale
+    // action error from a previous decision attempt.
+    rerender(<DiscoveryPanel versionId="2001" refreshKey={1} />)
+    await waitFor(() => expect(screen.queryByText("资源状态已变化")).not.toBeInTheDocument())
+  })
+
+  it("marks the active filters with aria-pressed", async () => {
+    versionApi.getDiscoveryObservations.mockResolvedValue([proposedPage])
+
+    render(<DiscoveryPanel versionId="2001" />)
+    await screen.findByText("/orders/{id}")
+
+    expect(screen.getByRole("button", { name: "全部类型" })).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByRole("button", { name: "API" })).toHaveAttribute("aria-pressed", "false")
+    expect(screen.getByRole("button", { name: "仅待处理" })).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByRole("button", { name: "全部状态" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "API" }))
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "API" })).toHaveAttribute("aria-pressed", "true"),
+    )
+    expect(screen.getByRole("button", { name: "全部类型" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    )
+  })
 })

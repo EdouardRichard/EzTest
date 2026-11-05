@@ -121,7 +121,7 @@ export function CoveragePanel({ versionId, refreshKey = 0 }: CoveragePanelProps)
         <div>
           <h2 className="text-sm font-semibold text-foreground">探索覆盖</h2>
           <p className="text-[11px] text-muted-foreground">
-            发现侧覆盖：已观测模板 · 五类决策 · 未覆盖清单（用例覆盖属 W2）
+            发现侧覆盖：已观测模板 · 四类决策 + observed · 未覆盖清单（用例覆盖属 W2）
           </p>
         </div>
       </header>

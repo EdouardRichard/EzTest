@@ -442,9 +442,10 @@ func TestDiscoveryObservationListByVersion(t *testing.T) {
 
 // TestDiscoveryObservationMarkDecisionByResource covers the W1-14B write-back:
 // the confirm/reject event of a discovered resource settles every `proposed`
-// observation of that resource and nothing else. Rows already settled (or
-// belonging to another resource) keep their decision, and a replay updates zero
-// rows.
+// observation of that resource and kind, and nothing else. A page and an API
+// may carry the same numeric resource id, so the kind predicate must keep them
+// apart. Rows already settled (or belonging to another resource) keep their
+// decision, and a replay updates zero rows.
 func TestDiscoveryObservationMarkDecisionByResource(t *testing.T) {
 	repo, pool := newTestRepository(t)
 	ctx := context.Background()
@@ -488,12 +489,12 @@ func TestDiscoveryObservationMarkDecisionByResource(t *testing.T) {
 		t.Fatalf("seed settled row: %v", err)
 	}
 
-	updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "approved")
+	updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "page", "approved")
 	if err != nil {
 		t.Fatalf("MarkDecisionByResource: %v", err)
 	}
-	if updated != 2 {
-		t.Fatalf("updated = %d, want the 2 proposed observations of resource 9001", updated)
+	if updated != 1 {
+		t.Fatalf("updated = %d, want only the 1 proposed page observation of resource 9001", updated)
 	}
 
 	decisions := map[string]string{}
@@ -514,8 +515,12 @@ func TestDiscoveryObservationMarkDecisionByResource(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read decisions: %v", err)
 	}
-	if decisions["/orders/{id}"] != "approved" || decisions["/api/orders/{id}"] != "approved" {
-		t.Fatalf("proposed rows of 9001 = %v, want both approved", decisions)
+	if decisions["/orders/{id}"] != "approved" {
+		t.Fatalf("/orders/{id} decision = %q, want approved", decisions["/orders/{id}"])
+	}
+	// Same resource id, other kind: the kind predicate must not settle it.
+	if decisions["/api/orders/{id}"] != "proposed" {
+		t.Fatalf("/api/orders/{id} decision = %q, want the API kind untouched", decisions["/api/orders/{id}"])
 	}
 	if decisions["/login"] != "proposed" {
 		t.Fatalf("/login decision = %q, want another resource untouched", decisions["/login"])
@@ -524,11 +529,25 @@ func TestDiscoveryObservationMarkDecisionByResource(t *testing.T) {
 		t.Fatalf("/settled decision = %q, want an already-settled row unchanged", decisions["/settled"])
 	}
 
-	// Replaying the event is a no-op: no proposed row of 9001 remains.
-	if updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "approved"); err != nil || updated != 0 {
+	// The API event settles the API row of the same resource id.
+	if updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "api", "approved"); err != nil || updated != 1 {
+		t.Fatalf("api write-back updated = %d err=%v, want 1", updated, err)
+	}
+	var apiDecision string
+	if err := pool.QueryRow(ctx, `
+		SELECT decision FROM execution_discovery_observation WHERE version_id = $1 AND resource_template = '/api/orders/{id}'
+	`, versionID).Scan(&apiDecision); err != nil {
+		t.Fatalf("read api decision: %v", err)
+	}
+	if apiDecision != "approved" {
+		t.Fatalf("/api/orders/{id} decision = %q, want approved", apiDecision)
+	}
+
+	// Replaying the event is a no-op: no proposed row of 9001/page remains.
+	if updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "page", "approved"); err != nil || updated != 0 {
 		t.Fatalf("replay updated = %d err=%v, want 0", updated, err)
 	}
-	if _, err := repo.Observations.MarkDecisionByResource(ctx, 0, "approved"); err == nil {
+	if _, err := repo.Observations.MarkDecisionByResource(ctx, 0, "page", "approved"); err == nil {
 		t.Fatal("resource id 0 must be rejected")
 	}
 }
