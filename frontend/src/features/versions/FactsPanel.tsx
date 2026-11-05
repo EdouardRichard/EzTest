@@ -56,7 +56,9 @@ export function FactsPanel({ versionId, initialFactId, refreshKey = 0 }: FactsPa
   const load = useCallback(async () => {
     setError(null)
     try {
-      setFacts(await getVersionFacts(versionId))
+      // Superseded rows are the other side of a conflict group: without them the
+      // "已被替代" badge and the read-only arbitration reason are unreachable.
+      setFacts(await getVersionFacts(versionId, { includeSuperseded: true }))
     } catch (cause) {
       setFacts(null)
       setError(cause)
@@ -72,6 +74,17 @@ export function FactsPanel({ versionId, initialFactId, refreshKey = 0 }: FactsPa
     () => (facts === null ? [] : [...factConflicts(facts).values()]),
     [facts],
   )
+
+  /**
+   * The deep link may point at a row that has already lost its conflict. The
+   * read-only arbitration card then explains why there is nothing to arbitrate
+   * instead of silently rendering a highlighted row with no explanation.
+   */
+  const selectedSuperseded = useMemo(() => {
+    if (facts === null || initialFactId === undefined) return null
+    const selected = facts.find((fact) => fact.id === initialFactId)
+    return selected !== undefined && selected.superseded_by !== null ? selected : null
+  }, [facts, initialFactId])
 
   return (
     <section
@@ -154,6 +167,10 @@ export function FactsPanel({ versionId, initialFactId, refreshKey = 0 }: FactsPa
           />
         )
       })}
+
+      {selectedSuperseded !== null ? (
+        <FactArbitrationCard versionId={versionId} fact={selectedSuperseded} />
+      ) : null}
     </section>
   )
 }

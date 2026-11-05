@@ -35,6 +35,7 @@ import { DesignFocusDialog } from "./DesignFocusDialog"
 import { DesignMindmap } from "./DesignMindmap"
 import { DesignSplitPane } from "./DesignSplitPane"
 import { ExportCasesDialog } from "./ExportCasesDialog"
+import { ExportDetailPanel } from "./ExportDetailPanel"
 import { HandoffPanel } from "./HandoffPanel"
 import {
   DEFAULT_CHAT_SPLIT,
@@ -69,6 +70,8 @@ export type DesignTabProps = {
   initialCaseId?: string
   /** Deep link `?conversation=` forwarded by the version page. */
   initialConversationId?: string
+  /** Deep link `?export=` forwarded by the version page (export detail). */
+  initialExportId?: string
 }
 
 const EMPTY_REQUIREMENTS_COPY = "暂无已澄清需求，请先在需求与澄清中确认需求"
@@ -148,6 +151,7 @@ export function DesignTab({
   onStageChanged,
   initialCaseId,
   initialConversationId,
+  initialExportId,
 }: DesignTabProps) {
   const router = useRouter()
 
@@ -815,6 +819,12 @@ export function DesignTab({
         >
           {caseGateGuidance(stage)}
         </p>
+      ) : null}
+
+      {initialExportId !== undefined ? (
+        <div data-testid="design-export-detail" className="shrink-0">
+          <ExportDetailPanel exportId={initialExportId} />
+        </div>
       ) : null}
 
       {createError !== null ? <InlineError error={createError} /> : null}

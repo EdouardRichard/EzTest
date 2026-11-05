@@ -58,7 +58,7 @@ describe("FactsPanel", () => {
     expect(screen.getByText("page")).toBeInTheDocument()
     expect(screen.getByText("api")).toBeInTheDocument()
     expect(screen.getByText("code_scan", { exact: false })).toBeInTheDocument()
-    expect(api.getVersionFacts).toHaveBeenCalledWith("2001")
+    expect(api.getVersionFacts).toHaveBeenCalledWith("2001", { includeSuperseded: true })
   })
 
   it("shows an explicit empty state when the version has no facts", async () => {
@@ -110,5 +110,29 @@ describe("FactsPanel", () => {
     expect(screen.getByText(/2 条并存事实/)).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "保留此条" })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "丢弃此条" })).toBeInTheDocument()
+  })
+
+  it("requests superseded rows and renders their superseded badge", async () => {
+    api.getVersionFacts.mockResolvedValue([
+      fact({ id: "31", kind: "page", key: "page:env:1:/orders" }),
+      fact({ id: "32", kind: "page", key: "page:env:1:/orders", superseded_by: "31" }),
+    ])
+
+    render(<FactsPanel versionId="2001" />)
+
+    expect(await screen.findByText("已被 #31 替代")).toBeInTheDocument()
+    expect(api.getVersionFacts).toHaveBeenCalledWith("2001", { includeSuperseded: true })
+  })
+
+  it("shows the read-only reason when the deep-linked fact is superseded", async () => {
+    api.getVersionFacts.mockResolvedValue([
+      fact({ id: "31", kind: "page", key: "page:env:1:/orders" }),
+      fact({ id: "32", kind: "page", key: "page:env:1:/orders", superseded_by: "31" }),
+    ])
+
+    render(<FactsPanel versionId="2001" initialFactId="32" />)
+
+    expect(await screen.findByText("该事实已被 #31 替代，无需仲裁。")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "保留此条" })).not.toBeInTheDocument()
   })
 })

@@ -10,6 +10,7 @@ import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
+import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { ChainTab } from "@/features/chain/ChainTab"
 import { listQuestions, type QuestionBatch } from "@/features/clarification/api"
 import { QuestionCard } from "@/features/clarification/QuestionCard"
@@ -391,6 +392,9 @@ export function VersionDetailPage({
 }: VersionDetailPageProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
+  // The context packet contains prompt content and the API is admin-only; a
+  // normal user must not mount the block or fire the guaranteed-403 request.
+  const isAdmin = useIsAdmin()
   const [version, setVersion] = useState<Version | null>(null)
   const [stage, setStage] = useState<StageView | null>(null)
   const [loading, setLoading] = useState(true)
@@ -411,6 +415,8 @@ export function VersionDetailPage({
   const designConversationId =
     initialConversationId ?? searchParams.get("conversation") ?? undefined
   const designCaseId = searchParams.get("case") ?? undefined
+  // `?export=` opens one export artifact's detail inside the design workspace.
+  const designExportId = searchParams.get("export") ?? undefined
   // `?wave=` / `?case_run=` select a wave/case run inside the execution tab.
   const executionWaveId = searchParams.get("wave") ?? undefined
   const executionCaseRunId = searchParams.get("case_run") ?? undefined
@@ -634,8 +640,10 @@ export function VersionDetailPage({
     if (next === "design") {
       const conversationId = searchParams.get("conversation") ?? initialConversationId
       const caseId = searchParams.get("case")
+      const exportId = searchParams.get("export")
       if (conversationId) params.set("conversation", conversationId)
       if (caseId) params.set("case", caseId)
+      if (exportId) params.set("export", exportId)
     }
     if (next === "execution") {
       const waveId = searchParams.get("wave")
@@ -787,7 +795,9 @@ export function VersionDetailPage({
                     refreshKey={planRefreshKey}
                   />
                 </div>
-                <ContextPacketCard versionId={versionId} refreshKey={planRefreshKey} />
+                {isAdmin ? (
+                  <ContextPacketCard versionId={versionId} refreshKey={planRefreshKey} />
+                ) : null}
               </section>
               {pendingQuestions.length > 0 ? (
                 <section
@@ -845,6 +855,7 @@ export function VersionDetailPage({
           }}
           initialCaseId={designCaseId}
           initialConversationId={designConversationId}
+          initialExportId={designExportId}
         />
       ) : activeTab === "execution" ? (
         <ExecutionTab

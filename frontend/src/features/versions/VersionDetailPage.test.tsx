@@ -82,12 +82,14 @@ vi.mock("@/features/design/DesignTab", async () => {
       versionId: string
       initialCaseId?: string
       initialConversationId?: string
+      initialExportId?: string
     }) =>
       React.createElement("div", {
         "data-testid": "design-workspace",
         "data-version-id": props.versionId,
         "data-case-id": props.initialCaseId,
         "data-conversation-id": props.initialConversationId,
+        "data-export-id": props.initialExportId,
       }),
   }
 })
@@ -528,6 +530,16 @@ describe("VersionDetailPage", () => {
     expect(workspace).toHaveAttribute("data-version-id", "2001")
     expect(workspace).toHaveAttribute("data-case-id", "7001")
     expect(workspace).toHaveAttribute("data-conversation-id", "4009")
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("forwards the ?export= deep link to the design tab", async () => {
+    search.params = new URLSearchParams("tab=design&export=9001")
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByTestId("design-workspace")).toHaveAttribute("data-export-id", "9001")
     expect(navigation.replace).not.toHaveBeenCalled()
   })
 

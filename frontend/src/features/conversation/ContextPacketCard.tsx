@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { ApiError } from "@/lib/api-client"
 
 import { type ContextPacketView, getLatestContextPacket } from "./api"
@@ -38,10 +39,14 @@ function isApiError(error: unknown, status: number): boolean {
  * and an unwired reader stays a retryable error.
  */
 export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCardProps) {
+  const isAdmin = useIsAdmin()
   const [packet, setPacket] = useState<ContextPacketView | null>(null)
   const [error, setError] = useState<unknown>(null)
 
   const load = useCallback(async () => {
+    // Defence in depth for the admin-only endpoint: callers should not mount the
+    // card for a normal user, and if they do it must not fire a guaranteed 403.
+    if (!isAdmin) return
     setError(null)
     try {
       setPacket(await getLatestContextPacket(versionId))
@@ -49,14 +54,14 @@ export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCa
       setPacket(null)
       setError(cause)
     }
-  }, [versionId])
+  }, [versionId, isAdmin])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is the SSE nonce.
   useEffect(() => {
     void load()
   }, [load, refreshKey])
 
-  const forbidden = isApiError(error, 403)
+  const forbidden = !isAdmin || isApiError(error, 403)
   const missing = isApiError(error, 404)
 
   return (

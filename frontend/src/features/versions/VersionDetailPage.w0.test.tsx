@@ -22,6 +22,17 @@ vi.mock("./api", async (importOriginal) => {
   return { ...actual, ...versionApi }
 })
 
+// The context packet card is admin-only; the page gates its mount on the cached
+// session role, so the tests drive that role explicitly.
+const auth = vi.hoisted(() => ({ isAdmin: false }))
+vi.mock("@/features/auth/useIsAdmin", () => ({ useIsAdmin: () => auth.isAdmin }))
+
+const conversationApi = vi.hoisted(() => ({ getLatestContextPacket: vi.fn() }))
+vi.mock("@/features/conversation/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/conversation/api")>()
+  return { ...actual, ...conversationApi }
+})
+
 const clarificationApi = vi.hoisted(() => ({ listQuestions: vi.fn() }))
 vi.mock("@/features/clarification/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/features/clarification/api")>()
@@ -205,6 +216,11 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     search.params = new URLSearchParams()
     sse.handlers = null
     executionTab.evidenceId = undefined
+    auth.isAdmin = false
+    conversationApi.getLatestContextPacket.mockReset()
+    conversationApi.getLatestContextPacket.mockRejectedValue(
+      new ApiError({ status: 403, code: "forbidden", message: "上下文包仅管理员可读" }),
+    )
   })
 
   afterEach(() => {
@@ -223,6 +239,24 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     expect(await screen.findByRole("region", { name: "SUT 绑定概览" })).toBeInTheDocument()
     expect(versionApi.getVersionBinding).toHaveBeenCalledWith("2001")
     expect(clarificationApi.listQuestions).toHaveBeenCalledWith("2001", { status: "pending" })
+  })
+
+  it("does not mount or request the admin-only context packet for a non-admin", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+
+    await screen.findByTestId("version-data")
+    expect(screen.queryByTestId("context-packet")).not.toBeInTheDocument()
+    expect(conversationApi.getLatestContextPacket).not.toHaveBeenCalled()
+  })
+
+  it("mounts and requests the context packet for an admin", async () => {
+    auth.isAdmin = true
+
+    render(<VersionDetailPage versionId="2001" />)
+
+    expect(await screen.findByTestId("context-packet")).toBeInTheDocument()
+    await waitFor(() => expect(conversationApi.getLatestContextPacket).toHaveBeenCalledWith("2001"))
+    expect(await screen.findByTestId("context-packet-forbidden")).toBeInTheDocument()
   })
 
   it("refreshes stage, plan, questions and binding from version events", async () => {

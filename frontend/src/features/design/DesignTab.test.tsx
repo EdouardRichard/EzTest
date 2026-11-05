@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   confirmStageCases: vi.fn(),
   createExport: vi.fn(),
   downloadExport: vi.fn(),
+  getExport: vi.fn(),
   listExports: vi.fn(),
 }))
 
@@ -53,7 +54,7 @@ import type { ConversationSummary } from "@/features/clarification/types"
 import { versionFixture } from "@/features/versions/test-fixtures"
 import { DesignTab } from "./DesignTab"
 import { designCaseDetailFixture, designGraphFixture, designOverviewFixture } from "./test-fixtures"
-import type { DesignGraph } from "./types"
+import type { DesignGraph, ExportView } from "./types"
 
 const TIMESTAMP = "2026-10-31T12:00:00Z"
 
@@ -104,6 +105,22 @@ const publicModels = [
     deprecated: false,
   },
 ]
+
+const exportedView: ExportView = {
+  id: "9001",
+  version_id: "2001",
+  owner_kind: "case",
+  owner_id: "2001",
+  revision: 3,
+  format: "markdown",
+  size: 2048,
+  mime: "text/markdown",
+  filename: "cases-r3.md",
+  sha256: "a".repeat(64),
+  status: "ready",
+  created_at: "2026-11-01T08:00:00Z",
+  download_url: "/api/exports/9001/download",
+}
 
 function mockWorkspace(graph: DesignGraph = designGraphFixture) {
   api.getDesignGraph.mockResolvedValue(graph)
@@ -459,5 +476,31 @@ describe("DesignTab", () => {
     expect(screen.getByTestId("composer-textarea")).toHaveValue(
       "请修改以下 1 条用例：\n- 退款 T+1 到账（#7001）",
     )
+  })
+
+  it("opens the export detail panel from the ?export= deep link", async () => {
+    api.getExport.mockResolvedValue(exportedView)
+
+    render(<DesignTab versionId="2001" initialExportId="9001" />)
+
+    expect(await screen.findByTestId("export-detail")).toBeInTheDocument()
+    expect(await screen.findByText("cases-r3.md")).toBeInTheDocument()
+    expect(api.getExport).toHaveBeenCalledWith("9001")
+  })
+
+  it("shows an explicit error for a deep-linked export that does not exist", async () => {
+    api.getExport.mockRejectedValue(
+      new ApiError({
+        status: 404,
+        code: "not_found",
+        message: "导出不存在",
+        requestId: "req_export",
+      }),
+    )
+
+    render(<DesignTab versionId="2001" initialExportId="9999" />)
+
+    expect(await screen.findByText("导出不存在")).toBeInTheDocument()
+    expect(api.getExport).toHaveBeenCalledWith("9999")
   })
 })

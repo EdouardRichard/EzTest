@@ -7,6 +7,11 @@ import { ApiError } from "@/lib/api-client"
 const api = vi.hoisted(() => ({ getLatestContextPacket: vi.fn() }))
 vi.mock("./api", () => api)
 
+// The card is admin-only: it must never request the packet for a normal user,
+// even if a caller mounts it without the page-level gate.
+const auth = vi.hoisted(() => ({ isAdmin: true }))
+vi.mock("@/features/auth/useIsAdmin", () => ({ useIsAdmin: () => auth.isAdmin }))
+
 import type { ContextPacketView } from "./api"
 import { ContextPacketCard } from "./ContextPacketCard"
 
@@ -37,6 +42,7 @@ const packet: ContextPacketView = {
 describe("ContextPacketCard", () => {
   beforeEach(() => {
     api.getLatestContextPacket.mockReset()
+    auth.isAdmin = true
   })
 
   afterEach(cleanup)
@@ -52,6 +58,15 @@ describe("ContextPacketCard", () => {
     expect(screen.getByText(/stage_boundary/)).toBeInTheDocument()
     expect(screen.getByText(/2 段/)).toBeInTheDocument()
     expect(api.getLatestContextPacket).toHaveBeenCalledWith("2001")
+  })
+
+  it("never requests the packet for a non-admin and shows the admin-only notice", async () => {
+    auth.isAdmin = false
+
+    render(<ContextPacketCard versionId="2001" />)
+
+    expect(await screen.findByText(/上下文包仅管理员可读/)).toBeInTheDocument()
+    expect(api.getLatestContextPacket).not.toHaveBeenCalled()
   })
 
   it("shows the admin-only notice for a 403", async () => {
