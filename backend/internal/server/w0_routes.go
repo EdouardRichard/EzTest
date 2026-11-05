@@ -13,10 +13,13 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 	resourceapi "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -33,6 +36,9 @@ type StageService interface {
 	Unblock(ctx context.Context, versionID int64) error
 	Pause(ctx context.Context, versionID int64, reason string) error
 	Resume(ctx context.Context, versionID int64) error
+	// Reject is the audited hard-gate back edge (requirement_review ->
+	// clarifying, case_review -> designing); it is not a generic request edge.
+	Reject(ctx context.Context, versionID int64, reason string, target *version.Stage) error
 }
 
 var _ StageService = (*versionapp.StageService)(nil)
@@ -93,6 +99,7 @@ type stageHTTPAdapter struct {
 	workflow     StageService
 	requirements versionapp.RequirementGateConfirmer
 	cases        versionapp.CaseGateConfirmer
+	audit        auditapp.Recorder
 }
 
 // newStageHTTPAdapter wires the adapter from the server dependencies.
@@ -104,6 +111,9 @@ func newStageHTTPAdapter(deps Deps) *stageHTTPAdapter {
 	if deps.DesignGraph != nil {
 		adapter.cases = designCaseConfirmer{svc: deps.DesignGraph}
 	}
+	if deps.Audit != nil {
+		adapter.audit = deps.Audit
+	}
 	return adapter
 }
 
@@ -113,10 +123,22 @@ func (a *stageHTTPAdapter) Stage(ctx context.Context, versionID int64) (versiona
 }
 
 // OnRequirementConfirmed confirms the selected (or all draft) requirements and
-// then applies requirement_review -> designing through the stage service.
+// then applies requirement_review -> designing through the stage service. The
+// source stage is pinned before any entity mutation: the graph has legitimate
+// back edges, so confirming first and validating afterwards could freeze drafts
+// while the version never advances (or advance from a wrong stage). A wrong
+// source stage returns the documented 409 invalid_stage_for_gate and writes
+// nothing.
 func (a *stageHTTPAdapter) OnRequirementConfirmed(ctx context.Context, versionID int64, requirementIDs []int64) (versionapp.StageView, error) {
 	if a.requirements == nil {
 		return versionapp.StageView{}, platform.Unavailable("requirement gate confirmer is not configured")
+	}
+	current, err := a.workflow.Stage(ctx, versionID)
+	if err != nil {
+		return versionapp.StageView{}, err
+	}
+	if current.Stage != version.StageRequirementReview {
+		return versionapp.StageView{}, versionapp.InvalidStageForGate("requirement", version.StageRequirementReview, current.Stage)
 	}
 	if err := a.requirements.BatchConfirm(ctx, versionID, requirementIDs); err != nil {
 		return versionapp.StageView{}, err
@@ -128,10 +150,18 @@ func (a *stageHTTPAdapter) OnRequirementConfirmed(ctx context.Context, versionID
 }
 
 // OnCasesConfirmed confirms the selected (or all eligible) cases and then
-// applies case_review -> executing through the stage service.
+// applies case_review -> executing through the stage service. The source stage
+// is pinned before any entity mutation (see OnRequirementConfirmed).
 func (a *stageHTTPAdapter) OnCasesConfirmed(ctx context.Context, versionID int64, caseIDs []int64) (versionapp.StageView, error) {
 	if a.cases == nil {
 		return versionapp.StageView{}, platform.Unavailable("case gate confirmer is not configured")
+	}
+	current, err := a.workflow.Stage(ctx, versionID)
+	if err != nil {
+		return versionapp.StageView{}, err
+	}
+	if current.Stage != version.StageCaseReview {
+		return versionapp.StageView{}, versionapp.InvalidStageForGate("case", version.StageCaseReview, current.Stage)
 	}
 	if err := a.cases.ConfirmCases(ctx, versionID, caseIDs); err != nil {
 		return versionapp.StageView{}, err
@@ -142,22 +172,53 @@ func (a *stageHTTPAdapter) OnCasesConfirmed(ctx context.Context, versionID int64
 	return a.Stage(ctx, versionID)
 }
 
-// Reject is the legacy gate back-edge. The v0.22 StageService intentionally
-// exposes no generic back edge (gate rejects need a dedicated audited entry
-// point); the route stays mounted but answers the typed conflict instead of
-// writing the stage row behind the service.
-func (a *stageHTTPAdapter) Reject(_ context.Context, _ int64, _ string, _ *version.Stage) (versionapp.StageView, error) {
-	return versionapp.StageView{}, platform.StateConflict(
-		"gate rejection is not available through the v0.22 stage service; confirm the gate or reopen the version")
+// Reject is the audited legacy gate back edge: it goes through the v0.22
+// StageService (single writer + compare-and-swap + stage event + decision
+// audit), never by writing version.stage behind the service.
+func (a *stageHTTPAdapter) Reject(ctx context.Context, versionID int64, reason string, target *version.Stage) (versionapp.StageView, error) {
+	if err := a.workflow.Reject(ctx, versionID, reason, target); err != nil {
+		return versionapp.StageView{}, err
+	}
+	return a.Stage(ctx, versionID)
 }
 
-// RecordGateDenied is a no-op: the v0.22 request route is only reachable with a
-// user session, so the legacy audit-only denial path is not produced.
-func (a *stageHTTPAdapter) RecordGateDenied(_ context.Context, _ int64, _ string) {}
+// RecordGateDenied writes the audit-only denial entry for a non-user hard-gate
+// attempt. It never touches the stage row; a missing audit recorder degrades to
+// a no-op (the request is still rejected by the handler with 403).
+func (a *stageHTTPAdapter) RecordGateDenied(ctx context.Context, versionID int64, gate string) {
+	if a.audit == nil {
+		return
+	}
+	event := auditapp.Event{
+		Action:     versionapp.StageAuditGateDenied,
+		TargetKind: "version",
+		TargetID:   fmt.Sprintf("%d", versionID),
+		RequestID:  requestid.From(ctx),
+		Metadata:   map[string]any{"gate": gate},
+	}
+	if actor, ok := platform.ActorFrom(ctx); ok {
+		if actor.ID > 0 {
+			id := actor.ID
+			event.ActorID = &id
+		}
+		event.Metadata["role"] = actor.Role
+	}
+	_ = a.audit.Record(ctx, event)
+}
 
 // ConvergeClarification adapts RequirementService's automatic
-// clarifying -> requirement_review edge onto the stage service.
+// clarifying -> requirement_review edge onto the stage service. Like the
+// pre-v0.22 StageMachine it only acts on its source stage: a repeated host
+// confirmation or a version already past the gate is a no-op, so the call can
+// never walk a designing/executing version backwards.
 func (a *stageHTTPAdapter) ConvergeClarification(ctx context.Context, versionID int64) error {
+	current, err := a.workflow.Stage(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Stage != version.StageClarifying {
+		return nil
+	}
 	return a.workflow.Request(ctx, versionID, version.StageRequirementReview)
 }
 

@@ -51,7 +51,22 @@ describe("BindingOverview", () => {
     expect(scope).toHaveTextContent("订单详情")
     expect(scope).toHaveTextContent("order_db")
 
-    expect(screen.getByRole("button", { name: "编辑绑定" })).toBeEnabled()
+    const edit = screen.getByRole("button", { name: "编辑绑定" })
+    expect(edit).toBeDisabled()
+    expect(screen.getByTestId("binding-edit-deferred")).toHaveTextContent(/W1/)
+  })
+
+  it("enables the edit button only when an edit handler is provided", async () => {
+    respondWith(bindingOverviewFixture)
+    const onEdit = vi.fn()
+    render(<BindingOverview versionId="2001" onEdit={onEdit} />)
+
+    const edit = await screen.findByRole("button", { name: "编辑绑定" })
+    expect(edit).toBeEnabled()
+    expect(screen.queryByTestId("binding-edit-deferred")).not.toBeInTheDocument()
+    fireEvent.click(edit)
+    expect(onEdit).toHaveBeenCalledTimes(1)
+    expect(onEdit.mock.calls[0][0]).toMatchObject({ stage: bindingOverviewFixture.stage })
   })
 
   it("disables binding editing for a completed version and explains the stage gate", async () => {

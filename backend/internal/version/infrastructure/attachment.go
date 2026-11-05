@@ -86,6 +86,33 @@ func (r *AttachmentRepository) ListByRequirement(ctx context.Context, versionID,
 	return attachments, nil
 }
 
+// ListByVersion returns every attachment row of one version ordered by ID. The
+// requirement-extraction source resolves a version's ready document
+// attachments through it; the attachment visibility rules stay untouched.
+func (r *AttachmentRepository) ListByVersion(ctx context.Context, versionID int64) ([]version.Attachment, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+attachmentColumns+` FROM requirement_attachment
+		WHERE version_id = $1
+		ORDER BY id
+	`, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("list version attachments: %w", err)
+	}
+	defer rows.Close()
+	attachments := make([]version.Attachment, 0)
+	for rows.Next() {
+		attachment, err := scanAttachment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan requirement attachment: %w", err)
+		}
+		attachments = append(attachments, attachment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list version attachments: %w", err)
+	}
+	return attachments, nil
+}
+
 // ListByConversation returns the attachments visible to one conversation,
 // ordered by attachment ID: rows whose message belongs to the conversation,
 // plus pre-registered message attachments owned by this conversation whose

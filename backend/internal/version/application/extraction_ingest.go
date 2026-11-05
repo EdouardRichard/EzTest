@@ -22,6 +22,7 @@ package versionapp
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
@@ -156,6 +157,34 @@ func (s *ExtractionService) StartVersion(ctx context.Context, versionID, attachm
 // requirement.curate (or any other legacy) work item is created here.
 func (s *ExtractionService) EnqueueAfterIngest(ctx context.Context, input ExtractionStartInput) (ExtractionRun, error) {
 	return s.Start(ctx, input)
+}
+
+// ExtractionStartInputFromResult builds the deterministic Start input of one
+// freshly ingested attachment. The ingest worker (runAttachmentExtractionWorker)
+// calls EnqueueAfterIngest with it after requirement.attachment_ingested, so the
+// pending run is opened without re-parsing the document a second time. The
+// input sha is the original content object sha (ExtractionResult.SourceSHA256),
+// matching what the attachment-side ExtractionIngestSource re-derives later.
+func ExtractionStartInputFromResult(result ExtractionResult, versionID int64) (ExtractionStartInput, error) {
+	if versionID <= 0 || result.Attachment.ID <= 0 {
+		return ExtractionStartInput{}, platform.Invalid("attachment", "the extraction result has no version/attachment identity")
+	}
+	sha := strings.ToLower(strings.TrimSpace(result.SourceSHA256))
+	if len(sha) != 64 || !isHexSHA256(sha) {
+		return ExtractionStartInput{}, errors.New("the extraction result has no original content sha256")
+	}
+	segments, err := SegmentExtraction(result, SegmentOptions{SourcePath: result.Attachment.Name})
+	if err != nil {
+		return ExtractionStartInput{}, err
+	}
+	return ExtractionStartInput{
+		VersionID:      versionID,
+		AttachmentID:   result.Attachment.ID,
+		InputSHA256:    sha,
+		Segments:       segments,
+		DocumentText:   result.Text,
+		AttachmentName: result.Attachment.Name,
+	}, nil
 }
 
 // attachmentDocumentName resolves the attachment name for the plan title when

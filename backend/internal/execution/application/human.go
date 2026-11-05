@@ -567,6 +567,24 @@ const (
 	QuestionMessageKindAnswer   = "answer"
 )
 
+// HostRunScope is the validated identity of the Host run behind one question
+// write. AgentRunID is the X-Agent-Run-Id value; ConversationID is the run's
+// owning version conversation.
+type HostRunScope struct {
+	AgentRunID     int64
+	ConversationID int64
+}
+
+// HostRunValidator verifies that an X-Agent-Run-Id value is a real, active Host
+// run of the given version. The HTTP surface cannot trust the header by itself:
+// without this port any logged-in user could claim another run (or a made-up
+// one) and create/reopen questions. Implementations must return
+// platform.Forbidden for a run that does not exist, is not running, is not a
+// Host profile, or belongs to another version/conversation.
+type HostRunValidator interface {
+	ValidateHostRun(ctx context.Context, versionID, agentRunID int64) (HostRunScope, error)
+}
+
 // questionExpiryScanLimit bounds the lazy per-version expiry scan triggered by
 // a question read. The global ExpireQuestions sweep is the unbounded path.
 const questionExpiryScanLimit = 1000
@@ -584,11 +602,13 @@ type QuestionService struct {
 	events   EventPublisher
 	audit    AuditRecorder
 	timeout  time.Duration
+	hostRuns HostRunValidator
 }
 
 // QuestionServiceDeps wires the structured-question service. Messages is the
 // version-conversation write port; Timeout overrides question.timeout_seconds
-// when positive.
+// when positive. HostRuns is required for the Host-scoped create/reopen routes
+// and fails closed when absent.
 type QuestionServiceDeps struct {
 	Humans   HumanRequestRepository
 	Messages QuestionMessageWriter
@@ -598,6 +618,7 @@ type QuestionServiceDeps struct {
 	Events   EventPublisher
 	Audit    AuditRecorder
 	Timeout  time.Duration
+	HostRuns HostRunValidator
 }
 
 // NewQuestionService builds the structured-question service.
@@ -611,7 +632,24 @@ func NewQuestionService(deps QuestionServiceDeps) *QuestionService {
 		events:   deps.Events,
 		audit:    deps.Audit,
 		timeout:  deps.Timeout,
+		hostRuns: deps.HostRuns,
 	}
+}
+
+// validateHostRun verifies one Host-scoped write through the port. A nil port
+// fails closed with 503: the API must never trust an unverified header.
+func (s *QuestionService) validateHostRun(ctx context.Context, versionID, agentRunID int64) (HostRunScope, error) {
+	if s == nil || s.hostRuns == nil {
+		return HostRunScope{}, platform.Unavailable("question host run validation is not configured")
+	}
+	scope, err := s.hostRuns.ValidateHostRun(ctx, versionID, agentRunID)
+	if err != nil {
+		return HostRunScope{}, err
+	}
+	if scope.AgentRunID != agentRunID || scope.ConversationID <= 0 {
+		return HostRunScope{}, platform.Forbidden()
+	}
+	return scope, nil
 }
 
 // QuestionCreateInput is one Host question batch creation. AgentRunID is the
@@ -646,6 +684,13 @@ func (s *QuestionService) Create(ctx context.Context, in QuestionCreateInput) (e
 	}
 	if in.AgentRunID <= 0 {
 		return execution.HumanRequest{}, platform.Invalid("agent_run_id", "must be the owning Host run")
+	}
+	hostRun, err := s.validateHostRun(ctx, in.VersionID, in.AgentRunID)
+	if err != nil {
+		return execution.HumanRequest{}, err
+	}
+	if hostRun.ConversationID != in.ConversationID {
+		return execution.HumanRequest{}, platform.Forbidden()
 	}
 	if s.messages == nil {
 		return execution.HumanRequest{}, fmt.Errorf("question message writer is not configured")
@@ -914,6 +959,13 @@ func (s *QuestionService) Skip(ctx context.Context, versionID, questionID, actor
 	request.ResolvedAt = &now
 	request.UpdatedAt = now
 	s.record(ctx, "question.skipped", request, actorID)
+	s.publish(ctx, EventQuestionSkipped, request, actorID,
+		map[string]any{
+			"question_id":     platformid.Format(request.ID),
+			"conversation_id": platformid.Format(derefID(request.ConversationID)),
+			"batch_id":        request.Question.BatchID,
+			"status":          string(request.Status),
+		})
 	return request, nil
 }
 
@@ -927,6 +979,13 @@ func (s *QuestionService) Reopen(ctx context.Context, versionID, questionID int6
 	request, err := s.scoped(ctx, versionID, questionID)
 	if err != nil {
 		return execution.HumanRequest{}, err
+	}
+	hostRun, err := s.validateHostRun(ctx, versionID, owner.AgentRunID)
+	if err != nil {
+		return execution.HumanRequest{}, err
+	}
+	if request.ConversationID == nil || *request.ConversationID != hostRun.ConversationID {
+		return execution.HumanRequest{}, platform.Forbidden()
 	}
 	if err := requireQuestionOwner(request, owner); err != nil {
 		return execution.HumanRequest{}, err
@@ -962,6 +1021,15 @@ func (s *QuestionService) Reopen(ctx context.Context, versionID, questionID int6
 	request.ResolvedAt = nil
 	request.UpdatedAt = now
 	s.record(ctx, "question.reopened", request, 0)
+	s.publish(ctx, EventQuestionReopened, request, 0,
+		map[string]any{
+			"question_id":     platformid.Format(request.ID),
+			"conversation_id": platformid.Format(derefID(request.ConversationID)),
+			"batch_id":        request.Question.BatchID,
+			"status":          string(request.Status),
+			"expires_at":      eventTime(deadline),
+			"reopened_by":     platformid.Format(owner.AgentRunID),
+		})
 	return request, nil
 }
 

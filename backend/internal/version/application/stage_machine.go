@@ -755,6 +755,41 @@ func gateNextAction(gate string, want, current version.Stage) string {
 	return fmt.Sprintf("reach stage %s before confirming cases", want)
 }
 
+// InvalidStageForGate is the exported form of invalidStageForGate for the
+// composition-root adapters (the legacy hard-gate HTTP surface) that must pin a
+// gate's source stage before confirming any entity. Keeping one constructor
+// means every gate rejection exposes the same 409 invalid_stage_for_gate
+// envelope and actionable details.
+func InvalidStageForGate(gate string, want, current version.Stage) error {
+	return invalidStageForGate(gate, want, current)
+}
+
+// InvalidStageForReject is the typed 409 returned when the legacy reject route
+// is called at a stage that is not a hard gate. It uses the documented
+// invalid_stage_for_gate code (only a version at requirement_review/case_review
+// can be rejected) instead of a generic state_conflict.
+func InvalidStageForReject(current version.Stage) error {
+	return &platform.Error{
+		Status:  http.StatusConflict,
+		Code:    "invalid_stage_for_gate",
+		Message: fmt.Sprintf("only a version at a hard gate can be rejected, but the version is at %s", current),
+		Details: map[string]any{
+			"gate":           "reject",
+			"required_stage": string(version.StageRequirementReview) + "|" + string(version.StageCaseReview),
+			"current_stage":  string(current),
+			"next_action":    "confirm the gate or reopen the version; gate rejection requires requirement_review or case_review",
+		},
+	}
+}
+
+// StageAuditGateDecision is the audit action recorded for one explicit stage
+// decision (gate confirm/reject), exported for composition-root adapters.
+const StageAuditGateDecision = stageAuditDecision
+
+// StageAuditGateDenied is the audit action recorded for a forbidden hard-gate
+// attempt (a non-user token), exported for the legacy HTTP adapter.
+const StageAuditGateDenied = stageAuditDenied
+
 // ===========================================================================
 // v0.22 StageService (Task 25, R-B4-1..R-B4-6)
 // ===========================================================================
@@ -1003,6 +1038,43 @@ func (s *StageService) Resume(ctx context.Context, versionID int64) error {
 				"version_id", versionID, "error", err)
 		}
 	}
+	return nil
+}
+
+// Reject returns a hard gate one stage back: requirement_review -> clarifying,
+// case_review -> designing. It is the audited single-writer back edge the
+// legacy POST /api/versions/{id}/stage/reject route uses (Task 37 fix round 1):
+// the transition goes through the same atomic StageMachine core as every other
+// v0.22 write (compare-and-swap + version.stage.changed), and the decision is
+// recorded in the audit log with the reason and actor. target is the optional
+// client-selected back stage and must equal the gate's previous stage.
+func (s *StageService) Reject(ctx context.Context, versionID int64, reason string, target *version.Stage) error {
+	reason = strings.TrimSpace(reason)
+	if err := validateStageText("reason", reason, stageRejectReasonMax); err != nil {
+		return err
+	}
+	current, err := s.machine.load(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	var back version.Stage
+	var gate string
+	switch current.Stage {
+	case version.StageRequirementReview:
+		back, gate = version.StageClarifying, stageGateRequirement
+	case version.StageCaseReview:
+		back, gate = version.StageDesigning, stageGateCase
+	default:
+		return InvalidStageForReject(current.Stage)
+	}
+	if target != nil && *target != back {
+		return platform.StateConflict(fmt.Sprintf(
+			"reject target %s does not match the gate's previous stage %s", *target, back))
+	}
+	if _, err := s.machine.transitionFrom(ctx, current, back, "rejected", nil); err != nil {
+		return err
+	}
+	s.machine.recordDecision(ctx, versionID, gate, "rejected", back, reason, nil, nil)
 	return nil
 }
 

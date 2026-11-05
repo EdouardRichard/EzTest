@@ -108,6 +108,17 @@ func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, co
 	return items, nil
 }
 
+func (f *fakeAttachmentRepo) ListByVersion(_ context.Context, versionID int64) ([]version.Attachment, error) {
+	items := make([]version.Attachment, 0)
+	for _, attachment := range f.attachments {
+		if attachment.VersionID == versionID {
+			items = append(items, attachment)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items, nil
+}
+
 func (f *fakeAttachmentRepo) ListUnlinkedByVersion(_ context.Context, versionID int64) ([]version.Attachment, error) {
 	items := make([]version.Attachment, 0)
 	for _, attachment := range f.attachments {

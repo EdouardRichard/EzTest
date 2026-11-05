@@ -25,10 +25,16 @@ import (
 // coverage report is visible to callers instead of being lost after the text
 // is persisted.
 type ExtractionResult struct {
-	Attachment            AttachmentView
-	Text                  string
-	Chars                 int
-	ContentSHA256         string
+	Attachment AttachmentView
+	Text       string
+	Chars      int
+	// ContentSHA256 is the SHA-256 of the persisted extracted-text object.
+	ContentSHA256 string
+	// SourceSHA256 is the SHA-256 of the original attachment content object.
+	// It is the extraction run's input_sha256 identity: the same document bytes
+	// always produce the same deterministic parse plan, and a re-parsed
+	// attachment cannot silently reuse another document's run.
+	SourceSHA256          string
 	ExtractedContentRefID int64
 	ErrorCode             string
 	Elements              []ExtractionElement
@@ -1120,6 +1126,9 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 			Attachment:            toAttachmentView(attachment),
 			ExtractedContentRefID: derefInt64(attachment.ExtractedContentRefID),
 		}
+		if sha, shaErr := s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID); shaErr == nil {
+			result.SourceSHA256 = sha
+		}
 		if text, err := s.readExtractedText(ctx, attachment); err == nil {
 			result.Text = text
 			result.Chars = len([]rune(text))
@@ -1168,6 +1177,9 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 			result := ExtractionResult{
 				Attachment:            toAttachmentView(current),
 				ExtractedContentRefID: derefInt64(current.ExtractedContentRefID),
+			}
+			if sha, shaErr := s.originalObjectID(ctx, current.ID, current.ContentRefID); shaErr == nil {
+				result.SourceSHA256 = sha
 			}
 			if text, err := s.readExtractedText(ctx, current); err == nil {
 				result.Text = text
@@ -1279,6 +1291,7 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		Text:                  text,
 		Chars:                 chars,
 		ContentSHA256:         uploaded.SHA256,
+		SourceSHA256:          objectID,
 		ExtractedContentRefID: textRef.ID,
 		Elements:              parsed.Elements,
 		Skipped:               parsed.Skipped,

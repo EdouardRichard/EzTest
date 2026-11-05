@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
@@ -143,6 +144,7 @@ type P6Handlers struct {
 
 // New assembles the HTTP middleware chain and every P0 route.
 func New(deps Deps) http.Handler {
+	deps = normalizeDeps(deps)
 	mux := http.NewServeMux()
 
 	executorURL := ""
@@ -231,6 +233,52 @@ func New(deps Deps) http.Handler {
 	chain = CORS(deps.Config)(chain)
 	chain = TrackInflight(deps.Load)(chain)
 	return RequestID(Recover(Logging(chain)))
+}
+
+// isTypedNil reports whether an optional dependency is nil or an interface
+// holding a typed nil pointer. Without this check a typed-nil service would
+// pass a handler's `svc == nil` guard and then panic (or return the wrong
+// status) when its nil receiver is used.
+func isTypedNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
+// normalizeDeps clears typed-nil optional interface dependencies so the W0
+// handlers answer their documented typed 503 instead of panicking on a nil
+// receiver. Pointer-struct dependencies already compare to nil directly;
+// clearing the interfaces is what makes the degraded assembly safe.
+func normalizeDeps(deps Deps) Deps {
+	if isTypedNil(deps.Stage) {
+		deps.Stage = nil
+	}
+	if isTypedNil(deps.Plans) {
+		deps.Plans = nil
+	}
+	if isTypedNil(deps.Facts) {
+		deps.Facts = nil
+	}
+	if isTypedNil(deps.Handoffs) {
+		deps.Handoffs = nil
+	}
+	if isTypedNil(deps.Extraction) {
+		deps.Extraction = nil
+	}
+	if isTypedNil(deps.DesignStarter) {
+		deps.DesignStarter = nil
+	}
+	if isTypedNil(deps.ContextPackets) {
+		deps.ContextPackets = nil
+	}
+	return deps
 }
 
 // registerP7Routes mounts the optional P7 surfaces: knowledge, orchestration

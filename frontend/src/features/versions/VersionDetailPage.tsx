@@ -23,7 +23,7 @@ import { DesignTab } from "@/features/design/DesignTab"
 import type { StageView } from "@/features/design/types"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
 import { TodoDrawer } from "@/features/shell/TodoDrawer"
-import { apiGetPage, apiPost } from "@/lib/api-client"
+import { apiDownload, apiGetPage, apiPost } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { getVersion, getVersionStage, parseStageBlocker } from "./api"
@@ -215,6 +215,55 @@ type AttachmentImageRow = {
 }
 
 /**
+ * Authenticated "查看原图" link. The content endpoint needs the bearer token, so
+ * a plain `<a href="/api/content/...">` would 401; this fetches the blob and
+ * exposes a revocable object URL instead (same pattern as MessageImage).
+ */
+function AttachmentImageLink({ sha256 }: { sha256: string }) {
+  const [url, setUrl] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl: string | null = null
+    setUrl(null)
+    setFailed(false)
+    void apiDownload(`/api/content/${encodeURIComponent(sha256)}`).then(
+      (download) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(download.blob)
+        setUrl(objectUrl)
+      },
+      () => {
+        if (!cancelled) setFailed(true)
+      },
+    )
+    return () => {
+      cancelled = true
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl)
+    }
+  }, [sha256])
+
+  if (failed) {
+    return <span className="mt-1 inline-block text-muted-foreground">原图加载失败</span>
+  }
+  if (url === null) {
+    return <span className="mt-1 inline-block text-muted-foreground">原图加载中…</span>
+  }
+  return (
+    <a
+      className="mt-1 inline-block underline underline-offset-2"
+      data-testid="attachment-image-link"
+      href={url}
+      rel="noreferrer"
+      target="_blank"
+    >
+      查看原图
+    </a>
+  )
+}
+
+/**
  * H7 attachment-image panel: the page only reads images for the attachment
  * selected by `?attachment=` and always through the version-scoped route, so
  * another version's attachment can never be fetched by guessing an ID.
@@ -312,11 +361,7 @@ function AttachmentImagesPanel({
                 {image.caption !== "" ? image.caption : "暂无 caption"}
               </p>
               {image.error !== "" ? <p className="mt-1 text-destructive">{image.error}</p> : null}
-              {image.url !== undefined && image.url !== "" ? (
-                <a className="mt-1 inline-block underline underline-offset-2" href={image.url}>
-                  查看原图
-                </a>
-              ) : null}
+              {image.sha256 !== "" ? <AttachmentImageLink sha256={image.sha256} /> : null}
             </li>
           ))}
         </ul>
@@ -457,6 +502,7 @@ export function VersionDetailPage({
   }, [refreshCounts])
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const stageRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingRefresh = useRef({ version: false, counts: false })
 
   const runPendingRefresh = useCallback(() => {
@@ -484,10 +530,20 @@ export function VersionDetailPage({
   const refreshVersionAndCounts = useCallback(() => scheduleRefresh(true), [scheduleRefresh])
   const refreshCountsOnly = useCallback(() => scheduleRefresh(false), [scheduleRefresh])
 
+  // A version burst often carries the version event and the stage event back to
+  // back; both branches schedule the stage read, so debounce it to one GET.
+  const scheduleStageRefresh = useCallback(() => {
+    if (stageRefreshTimer.current !== null) clearTimeout(stageRefreshTimer.current)
+    stageRefreshTimer.current = setTimeout(() => {
+      stageRefreshTimer.current = null
+      void refreshStage()
+    }, SSE_REFRESH_DEBOUNCE_MS)
+  }, [refreshStage])
+
   const refreshVersionAndStage = useCallback(() => {
     refreshVersionAndCounts()
-    void refreshStage()
-  }, [refreshVersionAndCounts, refreshStage])
+    scheduleStageRefresh()
+  }, [refreshVersionAndCounts, scheduleStageRefresh])
 
   const refreshSnapshotNow = useCallback(() => {
     if (refreshTimer.current !== null) {
@@ -501,6 +557,7 @@ export function VersionDetailPage({
   useEffect(
     () => () => {
       if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+      if (stageRefreshTimer.current !== null) clearTimeout(stageRefreshTimer.current)
     },
     [],
   )
@@ -558,6 +615,11 @@ export function VersionDetailPage({
     const next = parseVersionTab(value)
     setActiveTab(next)
     const params = new URLSearchParams({ tab: next })
+    if (next === "overview") {
+      // Keep the H7 attachment-image deep link alive across tab switches.
+      const attachment = searchParams.get("attachment")
+      if (attachment) params.set("attachment", attachment)
+    }
     if (next === "requirements") {
       if (initialConversationId) params.set("conversation", initialConversationId)
       if (initialRequirementId) params.set("requirement", initialRequirementId)

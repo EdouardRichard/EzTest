@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -14,7 +14,15 @@ vi.mock("next/navigation", () => ({ useRouter: () => navigation }))
 
 // The extraction card must work through the real api.ts/api-client fetch path,
 // not a module mock: every request below goes through `global.fetch`.
-vi.mock("./useVersionEvents", () => ({ useVersionEvents: () => "live" }))
+const sse = vi.hoisted(() => ({
+  handlers: null as Record<string, (event: unknown) => void> | null,
+}))
+vi.mock("./useVersionEvents", () => ({
+  useVersionEvents: (_versionId: string, handlers: Record<string, (event: unknown) => void>) => {
+    sse.handlers = handlers
+    return "live"
+  },
+}))
 
 import { RequirementsTab } from "./RequirementsTab"
 import type { RequirementExtractionProgress } from "./types"
@@ -178,6 +186,7 @@ describe("RequirementsTab extraction progress", () => {
   beforeEach(() => {
     installFetchMock()
     navigation.replace.mockReset()
+    sse.handlers = null
   })
 
   afterEach(() => {
@@ -216,6 +225,33 @@ describe("RequirementsTab extraction progress", () => {
           route.method === "GET" && route.path === "/api/versions/2001/requirements/extractions",
       ),
     ).toBe(true)
+  })
+
+  it("refreshes the progress card from an extraction SSE event", async () => {
+    extraction.current = extractionFixture({ status: "running", done_segments: 1 })
+    await renderWorkspace()
+    await screen.findByTestId("extraction-progress-card")
+    const before = extraction.routes.filter(
+      (route) =>
+        route.method === "GET" && route.path === "/api/versions/2001/requirements/extractions",
+    ).length
+
+    extraction.current = extractionFixture({ status: "done", done_segments: 2 })
+    act(() => {
+      sse.handlers?.onExtractionChanged?.({
+        type: "extraction.done",
+        payload: { run_id: "9001", status: "done" },
+      })
+    })
+
+    await waitFor(() => {
+      const after = extraction.routes.filter(
+        (route) =>
+          route.method === "GET" && route.path === "/api/versions/2001/requirements/extractions",
+      ).length
+      expect(after).toBeGreaterThan(before)
+    })
+    await waitFor(() => expect(screen.getByTestId("extraction-status")).toHaveTextContent("已完成"))
   })
 
   it("shows the empty state and starts extraction from it", async () => {

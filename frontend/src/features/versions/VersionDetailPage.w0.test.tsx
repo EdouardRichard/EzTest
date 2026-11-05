@@ -193,7 +193,10 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     executionTab.evidenceId = undefined
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
 
   it("wires stage, plan and question cards into the version page", async () => {
     render(<VersionDetailPage versionId="2001" />)
@@ -286,5 +289,51 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     render(<VersionDetailPage versionId="2001" initialTab="execution" />)
     await screen.findByTestId("execution-workspace")
     expect(executionTab.evidenceId).toBe("960001")
+  })
+
+  it("loads the authenticated attachment image as a blob link and revokes the object URL", async () => {
+    search.params = new URLSearchParams("tab=overview&attachment=55")
+    const image = {
+      id: "77",
+      attachment_id: "55",
+      seq: 1,
+      sha256: "a".repeat(64),
+      url: `/api/content/${"a".repeat(64)}`,
+      mime: "image/png",
+      width: 320,
+      height: 200,
+      status: "done",
+      caption: "登录页面",
+      error: "",
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/attachments/55/images")) {
+        return new Response(JSON.stringify({ data: [image] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      if (url.includes("/api/content/")) {
+        return new Response(new Blob(["png"], { type: "image/png" }), {
+          status: 200,
+          headers: { "Content-Type": "image/png" },
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const createObjectURL = vi.fn(() => "blob:attachment-original")
+    const revokeObjectURL = vi.fn()
+    Object.assign(URL, { createObjectURL, revokeObjectURL })
+
+    const { unmount } = render(<VersionDetailPage versionId="2001" initialTab="overview" />)
+    const link = await screen.findByTestId("attachment-image-link")
+    expect(link).toHaveAttribute("href", "blob:attachment-original")
+    expect(link).toHaveAttribute("target", "_blank")
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+
+    unmount()
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:attachment-original")
   })
 })

@@ -1,7 +1,7 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
@@ -421,6 +421,9 @@ export function RequirementsTab({
   const [extractionActionError, setExtractionActionError] = useState<unknown>(null)
   const [extractionNotice, setExtractionNotice] = useState<string | null>(null)
   const [extractionBusy, setExtractionBusy] = useState<ExtractionAction | null>(null)
+  // `extraction.*` SSE events can arrive once per segment; coalesce them into a
+  // single progress read instead of one GET per event.
+  const extractionEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const loadRequirements = useCallback(async (): Promise<void> => {
     setRequirements(await listRequirements(versionId))
@@ -484,6 +487,23 @@ export function RequirementsTab({
 
   useEffect(() => {
     void loadExtraction()
+  }, [loadExtraction])
+
+  useEffect(
+    () => () => {
+      if (extractionEventTimer.current !== null) clearTimeout(extractionEventTimer.current)
+    },
+    [],
+  )
+
+  // The extraction progress card is owned by this tab; the page-level SSE
+  // subscription cannot reach it, so the tab consumes `extraction.*` itself.
+  const scheduleExtractionRefresh = useCallback(() => {
+    if (extractionEventTimer.current !== null) clearTimeout(extractionEventTimer.current)
+    extractionEventTimer.current = setTimeout(() => {
+      extractionEventTimer.current = null
+      void loadExtraction()
+    }, 350)
   }, [loadExtraction])
 
   /**
@@ -562,6 +582,7 @@ export function RequirementsTab({
       }
     },
     onTeamRoomChanged: () => setTeamRoomToken((token) => token + 1),
+    onExtractionChanged: scheduleExtractionRefresh,
   })
 
   const targetOptions = useMemo<TargetOptions>(() => {

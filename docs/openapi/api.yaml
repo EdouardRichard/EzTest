@@ -188,10 +188,11 @@ info:
     `job.progress`/`job.finished` 事件与 `work_item` 查询为准，该路径仅作 0.3 预留并标 `deprecated`。
     另新增 admin-only 上下文包读取（`GET /api/versions/{id}/context-packets/latest`）与
     admin 模型能力编辑（`PATCH /api/admin/llm/configs/{id}/models/{modelId}`）。新增 tag `LLM`/`Jobs`。
-    上述 22 个 0.2.1 operation 并不都是当前已挂载的实现：`GET /api/versions/{id}/work-items`、
-    `.../work-items/{workItemId}`、`.../plan-items`、`.../facts` 是 Task 62 的契约先行读路由
-    （实现未挂载）；`GET /api/versions/{id}/jobs/{jobId}` 为 0.3 预留并标 `deprecated`；
-    `GET /api/versions/{id}/context-packets/latest` 由 Task 48 装配 reader 后挂载。
+    上述 22 个 0.2.1 operation 当前均有实现：`GET /api/versions/{id}/work-items`、
+    `.../work-items/{workItemId}`、`.../plan-items`、`.../facts` 为 Task 62 契约先行、
+    Task 37 由 P6 read model 挂载（早前“实现未挂载”的描述已过时）；
+    `GET /api/versions/{id}/jobs/{jobId}` 为 0.3 预留并标 `deprecated`；
+    `GET /api/versions/{id}/context-packets/latest` 已在 Task 48 装配 reader 后挂载。
     其余 0.2.1 operation 已按实现同步。
 
     ## v0.22 W0 增量（Task 37，additive）
@@ -215,7 +216,9 @@ info:
     - `version.stage.changed`：`{version_id, from, to, reason, actor, stage_entered_at}`
     - `plan.item_changed`：`{version_id, plan_item_id, phase, title, status, order, revision}`
     - `fact.recorded` / `fact.conflict` / `fact.arbitrated`：`{version_id, fact_id, kind, key, confidence, source, content_hash, conflict|dropped_ids, keep_id, reason}`
-    - `question.created` / `question.answered` / `question.expired`：`{version_id, question_id, conversation_id, message_id, kind, status, expires_at, answers[]}`
+    - `question.created` / `question.answered` / `question.expired` / `question.reopened` /
+      `question.skipped`：`{version_id, question_id, conversation_id, message_id, kind, status, expires_at, answers[]}`
+      （reopened 另带 `reopened_by`；skipped 的 status 为 `cancelled`）
     - `handoff.updated`：`{version_id, revision, generated_at}`
     - `version.binding.changed`：`{version_id, changed{...}, actor_id}`
     - `extraction.started` / `extraction.progress` / `extraction.segment_failed` / `extraction.done`：
@@ -7041,9 +7044,12 @@ paths:
       operationId: rejectStage
       summary: 硬门退回澄清/设计（仅用户 token）
       description: |
-        需求门退回 `clarifying`、用例门退回 `designing`；只重生成受影响项，未退回项保持已确认。
+        需求门退回 `clarifying`、用例门退回 `designing`。退回只移动阶段并写一条 `version.stage_decision`
+        审计（reason + actor），不删除任何需求/用例；重新确认门禁后由既有的 design.cases 生成流程按需重建。
         `reason` 必填并写审计；当前阶段不是两硬门之一时返回 409 `invalid_stage_for_gate`；
-        其他非法迁移返回 409 `state_conflict`。只有用户 token 可退回，角色 token 返回 403 `forbidden`。
+        `target_stage` 与门的上一阶段不一致或其他非法迁移返回 409 `state_conflict`。
+        只有用户 token 可退回，角色 token 返回 403 `forbidden`。实现走 v0.22 StageService 单写入口
+        （compare-and-swap + `version.stage.changed` 事件），不直接写 version.stage。
       parameters:
         - $ref: '#/components/parameters/ID'
       requestBody:

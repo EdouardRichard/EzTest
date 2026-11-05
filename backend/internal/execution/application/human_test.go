@@ -99,6 +99,35 @@ func (f *fakeQuestionMessages) last() (QuestionMessage, bool) {
 	return f.rows[len(f.rows)-1], true
 }
 
+// fakeHostRunValidator is the Host-run auth port fake: only the run ids in
+// hosts resolve, and a run registered for another version is forbidden.
+type fakeHostRunValidator struct {
+	hosts        map[int64]HostRunScope
+	versionByRun map[int64]int64
+	err          error
+}
+
+func newFakeHostRunValidator() *fakeHostRunValidator {
+	return &fakeHostRunValidator{
+		hosts:        map[int64]HostRunScope{questionTestRun: {AgentRunID: questionTestRun, ConversationID: questionTestConversation}},
+		versionByRun: map[int64]int64{questionTestRun: questionTestVersion},
+	}
+}
+
+func (f *fakeHostRunValidator) ValidateHostRun(_ context.Context, versionID, agentRunID int64) (HostRunScope, error) {
+	if f.err != nil {
+		return HostRunScope{}, f.err
+	}
+	scope, ok := f.hosts[agentRunID]
+	if !ok {
+		return HostRunScope{}, platform.Forbidden()
+	}
+	if version, ok := f.versionByRun[agentRunID]; ok && version != versionID {
+		return HostRunScope{}, platform.Forbidden()
+	}
+	return scope, nil
+}
+
 type questionFixture struct {
 	humans   *fakeHumanStore
 	messages *fakeQuestionMessages
@@ -106,6 +135,7 @@ type questionFixture struct {
 	audit    *coreAudit
 	clock    *coreClock
 	ids      *coreIDs
+	hosts    *fakeHostRunValidator
 	service  *QuestionService
 }
 
@@ -118,6 +148,7 @@ func newQuestionFixture() *questionFixture {
 		audit:    &coreAudit{},
 		clock:    &coreClock{now: now},
 		ids:      &coreIDs{next: 5000},
+		hosts:    newFakeHostRunValidator(),
 	}
 	f.service = NewQuestionService(QuestionServiceDeps{
 		Humans:   f.humans,
@@ -127,6 +158,7 @@ func newQuestionFixture() *questionFixture {
 		Clock:    f.clock,
 		Events:   f.events,
 		Audit:    f.audit,
+		HostRuns: f.hosts,
 	})
 	return f
 }
@@ -869,6 +901,111 @@ func TestQuestionInvalidAnswersRejected(t *testing.T) {
 	}
 }
 
+// TestQuestionCreateRequiresVerifiedHostRun pins the Host-run validation port:
+// a forged/foreign/inactive run is a typed 403 with no persisted question, and
+// a missing validator fails closed with 503 instead of trusting the header.
+func TestQuestionCreateRequiresVerifiedHostRun(t *testing.T) {
+	tests := []struct {
+		name string
+		run  int64
+		// mutation changes the fake host registry before the call.
+		mutation func(*fakeHostRunValidator)
+		status   int
+	}{
+		{
+			name: "forged run",
+			run:  424242,
+			mutation: func(*fakeHostRunValidator) {
+			},
+			status: 403,
+		},
+		{
+			name: "foreign version",
+			run:  questionTestRun,
+			mutation: func(f *fakeHostRunValidator) {
+				f.versionByRun[questionTestRun] = questionTestVersion + 1
+			},
+			status: 403,
+		},
+		{
+			name: "foreign conversation",
+			run:  questionTestRun,
+			mutation: func(f *fakeHostRunValidator) {
+				f.hosts[questionTestRun] = HostRunScope{AgentRunID: questionTestRun, ConversationID: 9999}
+			},
+			status: 403,
+		},
+		{
+			name: "validator failure",
+			run:  questionTestRun,
+			mutation: func(f *fakeHostRunValidator) {
+				f.err = errors.New("agent run repository unavailable")
+			},
+			status: 500,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newQuestionFixture()
+			test.mutation(f.hosts)
+			_, err := f.service.Create(context.Background(), QuestionCreateInput{
+				VersionID:      questionTestVersion,
+				ConversationID: questionTestConversation,
+				AgentRunID:     test.run,
+				Questions:      questionBatchOf(1),
+			})
+			if err == nil {
+				t.Fatal("Create succeeded with an invalid Host run")
+			}
+			apiErr := platform.AsError(err)
+			if apiErr.Status != test.status {
+				t.Fatalf("status = %d (%v), want %d", apiErr.Status, err, test.status)
+			}
+			if got := f.messages.countKind(QuestionMessageKindQuestion); got != 0 {
+				t.Fatalf("invalid Host run wrote %d question messages", got)
+			}
+			if rows, _, listErr := f.humans.ListQuestions(context.Background(), questionTestVersion, "", 10, nil); listErr != nil || len(rows) != 0 {
+				t.Fatalf("invalid Host run persisted rows = %#v/%v", rows, listErr)
+			}
+		})
+	}
+
+	// A valid active Host run still creates the question.
+	f := newQuestionFixture()
+	request, err := f.service.Create(context.Background(), QuestionCreateInput{
+		VersionID:      questionTestVersion,
+		ConversationID: questionTestConversation,
+		AgentRunID:     questionTestRun,
+		Questions:      questionBatchOf(1),
+	})
+	if err != nil {
+		t.Fatalf("valid Host run Create: %v", err)
+	}
+	if request.Status != execution.HumanPending {
+		t.Fatalf("valid Host run status = %s, want pending", request.Status)
+	}
+
+	// A service built without the validator fails closed.
+	unwired := NewQuestionService(QuestionServiceDeps{
+		Humans:   f.humans,
+		Messages: f.messages,
+		Settings: &fakeSettings{values: map[string]any{"question.timeout_seconds": int64(86400)}},
+		IDs:      f.ids,
+		Clock:    f.clock,
+		Events:   f.events,
+		Audit:    f.audit,
+	})
+	_, err = unwired.Create(context.Background(), QuestionCreateInput{
+		VersionID:      questionTestVersion,
+		ConversationID: questionTestConversation,
+		AgentRunID:     questionTestRun,
+		Questions:      questionBatchOf(1),
+	})
+	if err == nil || platform.AsError(err).Status != 503 {
+		t.Fatalf("Create without a host validator = %v, want typed 503", err)
+	}
+}
+
 // TestCreateQuestionRequiresIDGenerator keeps a missing snowflake generator a
 // configuration error instead of a nil-pointer panic.
 func TestCreateQuestionRequiresIDGenerator(t *testing.T) {
@@ -880,6 +1017,7 @@ func TestCreateQuestionRequiresIDGenerator(t *testing.T) {
 		Clock:    f.clock,
 		Events:   f.events,
 		Audit:    f.audit,
+		HostRuns: f.hosts,
 	})
 	_, err := service.Create(context.Background(), QuestionCreateInput{
 		VersionID:      questionTestVersion,
@@ -911,6 +1049,7 @@ func TestCreateQuestionCancelsWhenAttachFails(t *testing.T) {
 		Clock:    f.clock,
 		Events:   f.events,
 		Audit:    f.audit,
+		HostRuns: f.hosts,
 	})
 	if _, err := service.Create(context.Background(), QuestionCreateInput{
 		VersionID:      questionTestVersion,

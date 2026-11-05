@@ -1035,11 +1035,12 @@ func main() {
 		versionapp.WithFactAudit(auditSvc))
 	handoffSvc := versionapp.NewHandoffService(
 		versionpostgres.NewHandoffStore(pool), versionpostgres.NewHandoffReader(pool), ids, eventSvc)
-	// v0.22 API-5/6/7 (Task 18/37): the extraction service backs the progress
-	// reads and the pause/resume/retry transitions. The segment processor and
-	// the attachment-side extraction source have no production implementation
-	// yet, so Start answers the typed 503 until that worker lands; the plan/fact
-	// milestone stores are already wired for the terminal reconciliation.
+	// v0.22 API-5/6/7 (Task 18/37 fix round 1): the extraction service backs the
+	// progress reads, the pause/resume/retry transitions and the production
+	// worker. The attachment-side source/processor are wired right after the
+	// attachment service is constructed (the extraction service is its own
+	// requirement sink); the plan/fact milestone stores are already wired for
+	// the terminal reconciliation.
 	extractionSvc := versionapp.NewExtractionService(
 		versionpostgres.NewExtractionRepository(pool, ids), nil, eventSvc, clk)
 	extractionSvc.SetMilestoneStores(planSvc, factSvc)
@@ -1063,6 +1064,14 @@ func main() {
 	attachmentSvc := versionapp.NewAttachmentService(
 		versionpg.NewAttachmentRepository(pool), contentstore.New(storageSvc), enqueuer,
 		attachments.NewParser(), attachments.NewImageProber(), eventSvc, ids, clk)
+	// v0.22 A-7 extraction runtime (Task 37 fix round 1): the attachment service
+	// is the production ExtractionIngestSource/ExtractionSegmentsSource (it
+	// re-parses the immutable original content by the run's input_sha256), and
+	// the deterministic W0 processor emits the declared FR ids through the
+	// extraction service sink. A real LLM extractor can replace the processor
+	// here without changing the worker/API contract.
+	extractionSvc.SetSource(attachmentSvc)
+	extractionSvc.SetProcessor(versionapp.NewDeterministicExtractionProcessor(attachmentSvc, extractionSvc))
 	// v0.22 R-E2/R-E3: image analysis is fail-closed until the vision captioner
 	// and the version-fact recorder are wired. The captioner resolves the
 	// default vision-capable model through the real LLM gateway; every caption
@@ -1253,6 +1262,10 @@ func main() {
 		Clock:    clk,
 		Events:   eventSvc,
 		Audit:    auditSvc,
+		// Task 37 fix round 1: X-Agent-Run-Id is verified against the real
+		// active Host run and its version conversation; a forged/foreign id is
+		// a typed 403 instead of a trusted create/reopen.
+		HostRuns: questionHostRunValidator{pool: pool},
 	})
 	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
 		Intents:  executionRepo.Intents,
@@ -1734,13 +1747,19 @@ func main() {
 		defer background.Done()
 		runStageReconciler(ctx, p7OrchestrationRuntime.Leader, versionSvc, versionRepo, stageService, 30*time.Second)
 	}()
-	// v0.22 deterministic attachment pipeline (Task 19/20): pending attachments
-	// are extracted by the server instead of the removed attachment.ingest agent
-	// work item.
+	// v0.22 deterministic attachment pipeline (Task 19/20) plus the requirement
+	// extraction worker (Task 37 fix round 1): pending attachments are parsed by
+	// the server, then handed to the extraction run via EnqueueAfterIngest; the
+	// extraction worker processes the claimed segments to done.
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runAttachmentExtractionWorker(ctx, p7OrchestrationRuntime.Leader, attachmentSvc, 5*time.Second)
+		runAttachmentExtractionWorker(ctx, p7OrchestrationRuntime.Leader, attachmentSvc, extractionSvc, 5*time.Second)
+	}()
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runExtractionWorker(ctx, p7OrchestrationRuntime.Leader, extractionSvc, 2*time.Second)
 	}()
 	background.Add(1)
 	go func() {

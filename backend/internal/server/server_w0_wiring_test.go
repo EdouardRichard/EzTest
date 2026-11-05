@@ -45,6 +45,9 @@ func (s stubStageService) Pause(context.Context, int64, string) error {
 	return s.requestErr
 }
 func (s stubStageService) Resume(context.Context, int64) error { return s.requestErr }
+func (s stubStageService) Reject(ctx context.Context, versionID int64, _ string, _ *version.Stage) error {
+	return s.requestErr
+}
 
 // actorAuth injects a user actor so the handlers reach the stage service.
 func actorAuth(next http.Handler) http.Handler {
@@ -119,13 +122,53 @@ func TestV022W0RoutesMounted(t *testing.T) {
 		{"POST", "/api/versions/7/stage/unblock"},
 		{"POST", "/api/versions/7/stage/pause"},
 		{"POST", "/api/versions/7/stage/resume"},
+		{"POST", "/api/versions/7/stage/reject"},
 	}
 	for _, tc := range cases {
 		recorder := httptest.NewRecorder()
 		mux.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, nil))
-		if recorder.Code == http.StatusNotFound {
-			t.Fatalf("%s %s not mounted", tc.method, tc.path)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s = %d, want 401 (mounted behind auth, never 404)", tc.method, tc.path, recorder.Code)
 		}
+	}
+}
+
+// TestV022W0StageRejectUsesAuditedBackEdge pins the contract: the legacy reject
+// route now answers 200 (not a permanent 409) by calling the audited
+// StageService back edge.
+func TestV022W0StageRejectUsesAuditedBackEdge(t *testing.T) {
+	stage := &adapterStage{stage: version.StageRequirementReview}
+	deps := Deps{Stage: stage}
+	handler := versionapi.NewStageHandler(newStageHTTPAdapter(deps))
+	handler.SetStageWorkflow(stage)
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/versions/{id}/stage/reject", actorAuth(http.HandlerFunc(handler.Reject)))
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost,
+		"/api/versions/7/stage/reject", strings.NewReader(`{"reason":"missing acceptance criteria"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stage reject = %d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if stage.rejects != 1 {
+		t.Fatalf("stage-service reject calls = %d, want 1", stage.rejects)
+	}
+}
+
+// TestNormalizeDepsTypedNil pins the degraded-assembly guard: an interface
+// holding a typed nil pointer must be cleared so the handler's nil check runs
+// (503) instead of a method call on a nil receiver.
+func TestNormalizeDepsTypedNil(t *testing.T) {
+	var stage StageService = (*stubStageService)(nil)
+	var extraction versionapi.ExtractionService = (*versionapp.ExtractionService)(nil)
+	deps := normalizeDeps(Deps{Stage: stage, Extraction: extraction})
+	if deps.Stage != nil {
+		t.Fatalf("typed-nil Stage was not cleared")
+	}
+	if deps.Extraction != nil {
+		t.Fatalf("typed-nil Extraction was not cleared")
+	}
+	if normalizeDeps(Deps{}).Stage != nil {
+		t.Fatalf("nil Stage changed")
 	}
 }
 

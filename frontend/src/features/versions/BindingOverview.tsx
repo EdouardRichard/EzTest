@@ -15,7 +15,11 @@ import type { VersionBindingOverview } from "./types"
 
 export type BindingOverviewProps = {
   versionId: string
-  /** Optional edit entry point (wired by Task 37); disabled when the stage is read-only. */
+  /**
+   * Optional edit entry point. W0 has no binding-edit flow yet (deferred to
+   * W1), so the page does not pass it and the button is disabled instead of
+   * being an enabled no-op.
+   */
   onEdit?: (overview: VersionBindingOverview) => void
   /** Nonce bumped by SSE (`version.binding.changed`) to re-read the overview. */
   refreshKey?: number
@@ -145,6 +149,12 @@ export function BindingOverview({ versionId, onEdit, refreshKey = 0 }: BindingOv
 
   const editable = overview.editable && overview.stage !== "completed"
   const readOnly = !editable
+  const editAvailable = editable && typeof onEdit === "function"
+  const editHint = readOnly
+    ? "当前阶段绑定只读，需暂停或回退后才能编辑"
+    : typeof onEdit === "function"
+      ? undefined
+      : "绑定编辑将在 W1 提供（当前为只读展示）"
   const excludedTotal =
     overview.scope_exclude.pages.length +
     overview.scope_exclude.apis.length +
@@ -165,8 +175,8 @@ export function BindingOverview({ versionId, onEdit, refreshKey = 0 }: BindingOv
           <Button
             variant="secondary"
             size="sm"
-            disabled={readOnly}
-            title={readOnly ? "当前阶段绑定只读，需暂停或回退后才能编辑" : undefined}
+            disabled={!editAvailable}
+            title={editHint}
             onClick={() => onEdit?.(overview)}
           >
             编辑绑定
@@ -181,6 +191,12 @@ export function BindingOverview({ versionId, onEdit, refreshKey = 0 }: BindingOv
           </Button>
         </div>
       </header>
+
+      {editable && typeof onEdit !== "function" ? (
+        <p className="text-[11px] text-muted-foreground" data-testid="binding-edit-deferred">
+          绑定编辑将在 W1 提供（当前为只读展示）。
+        </p>
+      ) : null}
 
       {readOnly ? (
         <Alert tone="warning" title="当前阶段绑定只读">

@@ -34,6 +34,8 @@ const (
 	EventQuestionCreated   = "question.created"
 	EventQuestionAnswered  = "question.answered"
 	EventQuestionExpired   = "question.expired"
+	EventQuestionReopened  = "question.reopened"
+	EventQuestionSkipped   = "question.skipped"
 	EventFailureCandidate  = "execution.failure_candidate"
 	EventCoverageGap       = "execution.coverage_gap"
 )

@@ -613,13 +613,30 @@ type pendingAttachmentExtractor interface {
 	Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
 }
 
+// attachmentExtractionEnqueuer is the requirement-extraction handoff
+// (*versionapp.ExtractionService implements it): EnqueueAfterIngest opens the
+// pending run for a just-ingested document without processing it.
+type attachmentExtractionEnqueuer interface {
+	EnqueueAfterIngest(ctx context.Context, input versionapp.ExtractionStartInput) (versionapp.ExtractionRun, error)
+}
+
+// extractionRunProcessor is the deterministic extraction cursor worker surface
+// (*versionapp.ExtractionService implements it).
+type extractionRunProcessor interface {
+	ProcessNext(ctx context.Context, limit int) (int, error)
+}
+
 // runAttachmentExtractionWorker drives the deterministic attachment pipeline for
 // pending rows. It is leader-gated, idempotent and bounded; parse failures are
-// persisted on the attachment row and never abort the loop.
+// persisted on the attachment row and never abort the loop. A successfully
+// parsed document is handed to the extraction service through
+// EnqueueAfterIngest (the requirement.attachment_ingested -> extraction run
+// hook of Task 18/20); the separate extraction worker processes its segments.
 func runAttachmentExtractionWorker(
 	ctx context.Context,
 	gate interface{ IsLeader() bool },
 	service pendingAttachmentExtractor,
+	enqueuer attachmentExtractionEnqueuer,
 	interval time.Duration,
 ) {
 	if service == nil {
@@ -640,9 +657,61 @@ func runAttachmentExtractionWorker(
 			return
 		}
 		for _, attachment := range pending {
-			if _, err := service.Extract(ctx, attachment.ID); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("eztest: attachment extraction worker: attachment=%d: %v", attachment.ID, err)
+			result, err := service.Extract(ctx, attachment.ID)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: attachment extraction worker: attachment=%d: %v", attachment.ID, err)
+				}
+				continue
 			}
+			if enqueuer == nil || result.Attachment.ExtractionStatus != versiondomain.AttachmentDone {
+				continue
+			}
+			input, err := versionapp.ExtractionStartInputFromResult(result, attachment.VersionID)
+			if err != nil {
+				log.Printf("eztest: attachment extraction worker: build extraction input attachment=%d: %v", attachment.ID, err)
+				continue
+			}
+			if _, err := enqueuer.EnqueueAfterIngest(ctx, input); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("eztest: attachment extraction worker: enqueue requirement extraction attachment=%d: %v", attachment.ID, err)
+			}
+		}
+	}
+	tick()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tick()
+		}
+	}
+}
+
+// runExtractionWorker drives the v0.22 requirement-extraction worker. It is
+// leader-gated like the other deterministic loops; ProcessRun claims segments
+// with FOR UPDATE SKIP LOCKED, so a non-leader replica that became leader
+// mid-run can safely take over within the lease timeout.
+func runExtractionWorker(
+	ctx context.Context,
+	gate interface{ IsLeader() bool },
+	service extractionRunProcessor,
+	interval time.Duration,
+) {
+	if service == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	tick := func() {
+		if gate != nil && !gate.IsLeader() {
+			return
+		}
+		if _, err := service.ProcessNext(ctx, 10); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("eztest: requirement extraction worker: %v", err)
 		}
 	}
 	tick()

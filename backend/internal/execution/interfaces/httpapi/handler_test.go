@@ -230,18 +230,46 @@ type handlerQuestionFixture struct {
 	messages *handlerQuestionMessages
 	events   *handlerEvents
 	service  *executionapp.QuestionService
+	hosts    *handlerHostRuns
+}
+
+// handlerHostRuns is the Host-run validation port fake: the seeded Host run
+// 9901 owns conversation 2001 of version 100; every other run is forbidden.
+type handlerHostRuns struct {
+	versionByRun      map[int64]int64
+	conversationByRun map[int64]int64
+}
+
+func newHandlerHostRuns() *handlerHostRuns {
+	return &handlerHostRuns{
+		versionByRun:      map[int64]int64{9901: 100},
+		conversationByRun: map[int64]int64{9901: 2001},
+	}
+}
+
+func (h *handlerHostRuns) ValidateHostRun(_ context.Context, versionID, agentRunID int64) (executionapp.HostRunScope, error) {
+	if version, ok := h.versionByRun[agentRunID]; !ok || version != versionID {
+		return executionapp.HostRunScope{}, platform.Forbidden()
+	}
+	conversationID, ok := h.conversationByRun[agentRunID]
+	if !ok {
+		return executionapp.HostRunScope{}, platform.Forbidden()
+	}
+	return executionapp.HostRunScope{AgentRunID: agentRunID, ConversationID: conversationID}, nil
 }
 
 func newHandlerQuestionFixture() *handlerQuestionFixture {
 	repo := newHandlerQuestionRepo()
 	messages := &handlerQuestionMessages{}
 	events := &handlerEvents{}
+	hosts := newHandlerHostRuns()
 	service := executionapp.NewQuestionService(executionapp.QuestionServiceDeps{
 		Humans:   repo,
 		Messages: messages,
 		IDs:      &handlerIDs{},
 		Clock:    &handlerClock{now: questionHandlerNow},
 		Events:   events,
+		HostRuns: hosts,
 	})
 	return &handlerQuestionFixture{
 		handler:  New(Deps{QuestionService: service}),
@@ -249,6 +277,7 @@ func newHandlerQuestionFixture() *handlerQuestionFixture {
 		messages: messages,
 		events:   events,
 		service:  service,
+		hosts:    hosts,
 	}
 }
 
@@ -417,6 +446,9 @@ func TestQuestionHandlerSkipAndReopen(t *testing.T) {
 	if skipped.Status != "cancelled" || !skipped.Skipped {
 		t.Fatalf("skipped view = %+v", skipped)
 	}
+	if got := f.events.count("question.skipped"); got != 1 {
+		t.Fatalf("question.skipped events = %d, want 1", got)
+	}
 
 	// Reopen is owner-scoped: the owning Host run only.
 	foreign := questionActorRequest(http.MethodPost, "/api/versions/100/questions/"+questionID(question.ID)+"/reopen", "")
@@ -443,11 +475,56 @@ func TestQuestionHandlerSkipAndReopen(t *testing.T) {
 	if reopened.Status != "pending" {
 		t.Fatalf("reopened status = %s, want pending", reopened.Status)
 	}
+	if got := f.events.count("question.reopened"); got != 1 {
+		t.Fatalf("question.reopened events = %d, want 1", got)
+	}
 }
 
-// TestQuestionHandlerAnswerValidationRejects pins the HTTP 400 mapping of the
-// domain answer validation, including the empty answer list (skip is a distinct
-// transition, never an empty answer).
+// TestQuestionHandlerCreateRequiresActiveHostRun pins the Host-run auth guard:
+// the X-Agent-Run-Id header is verified against the real active Host run of the
+// path version/conversation, so a forged or foreign id is a typed 403 and
+// writes nothing, while the valid run still creates the question (201).
+func TestQuestionHandlerCreateRequiresActiveHostRun(t *testing.T) {
+	f := newHandlerQuestionFixture()
+	body := `{"questions":[{"id":"q1","text":"退款按 T+1 还是 T+3？","options":[{"id":"a","label":"T+1"}],"allow_free_text":true,"required":true}]}`
+	create := func(versionID, conversationID, runID string) *httptest.ResponseRecorder {
+		request := questionActorRequest(http.MethodPost,
+			"/api/versions/"+versionID+"/conversations/"+conversationID+"/questions", body)
+		request.Header.Set("X-Agent-Run-Id", runID)
+		setQuestionPathValues(request, map[string]string{"id": versionID, "cid": conversationID})
+		recorder := httptest.NewRecorder()
+		f.handler.CreateQuestion(recorder, request)
+		return recorder
+	}
+
+	if got := create("100", "2001", "424242"); got.Code != http.StatusForbidden {
+		t.Fatalf("forged host run = %d, want 403; body=%s", got.Code, got.Body.String())
+	}
+	if got := create("101", "2001", "9901"); got.Code != http.StatusForbidden {
+		t.Fatalf("foreign-version host run = %d, want 403", got.Code)
+	}
+	if got := create("100", "2002", "9901"); got.Code != http.StatusForbidden {
+		t.Fatalf("foreign-conversation host run = %d, want 403", got.Code)
+	}
+	if got := f.messages.countKind("question"); got != 0 {
+		t.Fatalf("rejected host runs wrote %d question messages", got)
+	}
+	if got := create("100", "2001", "9901"); got.Code != http.StatusCreated {
+		t.Fatalf("valid host run = %d, want 201; body=%s", got.Code, got.Body.String())
+	}
+
+	// Reopen takes the same guard: a forged run cannot reopen a question.
+	question := f.seed(t, 1)
+	reopen := questionActorRequest(http.MethodPost, "/api/versions/100/questions/"+questionID(question.ID)+"/reopen", "")
+	reopen.Header.Set("X-Agent-Run-Id", "424242")
+	setQuestionPathValues(reopen, map[string]string{"id": "100", "qid": questionID(question.ID)})
+	reopenRecorder := httptest.NewRecorder()
+	f.handler.ReopenQuestion(reopenRecorder, reopen)
+	if reopenRecorder.Code != http.StatusForbidden {
+		t.Fatalf("forged host run reopen = %d, want 403", reopenRecorder.Code)
+	}
+}
+
 func TestQuestionHandlerAnswerValidationRejects(t *testing.T) {
 	tests := []struct {
 		name string

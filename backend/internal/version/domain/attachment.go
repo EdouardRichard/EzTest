@@ -192,6 +192,11 @@ type AttachmentRepository interface {
 	Get(ctx context.Context, attachmentID int64) (Attachment, error)
 	GetInVersion(ctx context.Context, versionID, attachmentID int64) (Attachment, error)
 	ListByRequirement(ctx context.Context, versionID, requirementID int64) ([]Attachment, error)
+	// ListByVersion returns every attachment row of one version ordered by ID.
+	// The v0.22 requirement-extraction source uses it to resolve the ready
+	// document attachments of a version for the extraction start endpoint and
+	// the ingest auto-enqueue hook.
+	ListByVersion(ctx context.Context, versionID int64) ([]Attachment, error)
 	// ListByConversation returns rows bound to one of the conversation's
 	// messages plus unbound drafts pre-registered for this conversation
 	// (conversation_id matches). Drafts with no conversation_id (legacy rows)

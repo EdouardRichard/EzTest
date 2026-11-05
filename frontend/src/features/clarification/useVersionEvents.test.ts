@@ -150,6 +150,34 @@ describe("useVersionEvents", () => {
     expect(onVersionChanged).toHaveBeenCalledTimes(1)
   })
 
+  it("routes structured-question and extraction events to their handlers", () => {
+    const onQuestionChanged = vi.fn()
+    const onExtractionChanged = vi.fn()
+    render(createElement(Harness, { handlers: { onQuestionChanged, onExtractionChanged } }))
+
+    for (const eventType of ["question.reopened", "question.skipped"]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(eventType, { question_id: "101", status: "pending" }),
+      })
+    }
+    for (const eventType of [
+      "extraction.started",
+      "extraction.progress",
+      "extraction.segment_failed",
+      "extraction.done",
+    ]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(eventType, { run_id: "9001", status: "running" }),
+      })
+    }
+
+    expect(onQuestionChanged).toHaveBeenCalledTimes(2)
+    expect(onExtractionChanged).toHaveBeenCalledTimes(4)
+    expect(onExtractionChanged.mock.calls[0][0]).toMatchObject({ type: "extraction.started" })
+  })
+
   it("routes P2 design events to the design handlers", () => {
     const onDesignGraphChanged = vi.fn()
     const onDesignCaseChanged = vi.fn()
