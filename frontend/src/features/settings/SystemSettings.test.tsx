@@ -77,6 +77,39 @@ const settings: Setting[] = [
     version: 1,
     updated_at: "2026-10-31T08:00:00Z",
   },
+  {
+    key: "paths.attachment_dir",
+    category: "paths",
+    type: "string",
+    value: "./.data/attachments",
+    is_secret: false,
+    restart_required: false,
+    description: "已删除的附件目录键",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "gc.retention_days",
+    category: "gc",
+    type: "number",
+    value: 30,
+    is_secret: false,
+    restart_required: false,
+    description: "存储对象保留天数",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "gc.dry_run",
+    category: "gc",
+    type: "boolean",
+    value: true,
+    is_secret: false,
+    restart_required: false,
+    description: "GC 默认演练模式",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
 ]
 
 function settingRow(key: string): HTMLElement {
@@ -234,5 +267,24 @@ describe("SystemSettings", () => {
       "value must be between 1 and 32",
     )
     expect(within(row).getByLabelText("execution.global_concurrency 新值")).toBeInTheDocument()
+  })
+
+  it("hides disposed settings and keeps gc.* read-only until W2", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: settings }))
+
+    render(<SystemSettings />)
+    await screen.findByTestId("setting-row-gc.retention_days")
+
+    expect(screen.queryByTestId("setting-row-paths.attachment_dir")).not.toBeInTheDocument()
+    expect(screen.queryByText("paths.attachment_dir")).not.toBeInTheDocument()
+
+    for (const key of ["gc.retention_days", "gc.dry_run"]) {
+      const row = settingRow(key)
+      expect(within(row).getByText("W2 接线")).toBeVisible()
+      expect(within(row).queryByRole("button", { name: "编辑" })).toBeNull()
+    }
+
+    const activeRow = settingRow("execution.global_concurrency")
+    expect(within(activeRow).getByRole("button", { name: "编辑" })).toBeVisible()
   })
 })

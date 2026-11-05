@@ -1064,6 +1064,9 @@ func main() {
 	attachmentSvc := versionapp.NewAttachmentService(
 		versionpg.NewAttachmentRepository(pool), contentstore.New(storageSvc), enqueuer,
 		attachments.NewParser(), attachments.NewImageProber(), eventSvc, ids, clk)
+	// v0.22 W1-2: the vision extraction limits are read from the settings center
+	// instead of hard-coded catalog defaults.
+	attachmentSvc.SetLimits(settingsSvc)
 	// v0.22 A-7 extraction runtime (Task 37 fix round 1): the attachment service
 	// is the production ExtractionIngestSource/ExtractionSegmentsSource (it
 	// re-parses the immutable original content by the run's input_sha256), and

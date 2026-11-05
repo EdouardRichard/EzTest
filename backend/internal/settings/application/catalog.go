@@ -88,10 +88,6 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "instance.heartbeat_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: minHeartbeat, Max: maxHeartbeat, Description: "Interval between API instance heartbeats in seconds."},
 		{Key: "instance.offline_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which an API instance is marked offline."},
 		{Key: "paths.data_root", Category: "paths", Type: settings.TypeString, Default: str("./.data"), RestartRequired: true, Description: "Root directory for runtime content (relative to the process CWD)."},
-		{Key: "paths.attachment_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/attachments"), Description: "Requirement attachment directory."},
-		{Key: "paths.evidence_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/evidence"), Description: "Execution evidence directory."},
-		{Key: "paths.report_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/reports"), Description: "Report HTML/PDF directory."},
-		{Key: "paths.export_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/exports"), Description: "Export artifact directory."},
 
 		{Key: "execution.global_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(3), Integer: true, Min: minConcurrency, Max: maxConcurrency, Description: "Maximum concurrent case runs across the instance."},
 		{Key: "execution.per_sut_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minPerSUT, Max: maxPerSUT, Description: "Maximum concurrent case runs per version SUT."},
@@ -135,7 +131,6 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "tool.retry_max", Category: "tool", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minToolRetries, Max: maxToolRetries, Description: "Automatic retries for retryable tool errors before the error card surfaces."},
 		{Key: "question.timeout_seconds", Category: "question", Type: settings.TypeNumber, Default: num(86400), Integer: true, Min: minQuestionTimeout, Max: maxQuestionTimeout, Description: "Human-request question expiry; questions never block execution (24h default, C-2)."},
 
-		{Key: "vision.required", Category: "vision", Type: settings.TypeBool, Default: boolean(true), Description: "Require a vision-capable model for image-bearing work; never silently degrade to text."},
 		{Key: "vision.max_images_per_attachment", Category: "vision", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minVisionImages, Max: maxVisionImages, Description: "Maximum images extracted from one attachment; excess images are reported as skipped."},
 		{Key: "vision.max_image_bytes", Category: "vision", Type: settings.TypeNumber, Default: num(10 * 1024 * 1024), Integer: true, Min: minImageBytes, Max: maxImageBytes, Description: "Maximum single image size in bytes accepted by the vision pipeline (10 MiB default)."},
 
@@ -191,10 +186,8 @@ func Definitions(executorURL string) []settings.Definition {
 
 		{Key: "security.audit_retention_days", Category: "security", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: number(1, 0), Description: "Audit log retention in days."},
 		{Key: "security.rate_limit_per_minute", Category: "security", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: minRateLimit, Max: maxRateLimit, Description: "Per-instance API request limit per minute; 0 disables limiting. Total rate is replicas x limit."},
-		{Key: "security.mask_secrets", Category: "security", Type: settings.TypeBool, Default: boolean(true), Description: "Mask secrets in admin responses (must stay on in 0.2)."},
 
 		{Key: "feature.auto_gap_design", Category: "feature", Type: settings.TypeBool, Default: boolean(true), Description: "Allow automatic design proposals for coverage gaps."},
-		{Key: "feature.experimental", Category: "feature", Type: settings.TypeBool, Default: boolean(false), Description: "Enable experimental features."},
 
 		{Key: "search.max_results_per_type", Category: "search", Type: settings.TypeNumber, Default: num(5), Integer: true, Min: minSearchResults, Max: maxSearchResults, Description: "Default maximum results per type for global search (query parameter may override)."},
 		{Key: "todos.max_items", Category: "workspace", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minTodoItems, Max: maxTodoItems, Description: "Default maximum items returned by the todos center (query parameter may override)."},

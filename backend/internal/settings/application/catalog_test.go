@@ -58,11 +58,12 @@ func TestP7SettingsRemainFrozen(t *testing.T) {
 
 // TestP8SettingsPinsCatalog pins the two P8 keys (spec §7: 83 -> 85) and the
 // two P8 category counts. Both are hot-reloadable and non-secret; the P7
-// defaults stay unchanged. The v0.22 additions grow the catalog to 98.
+// defaults stay unchanged. The v0.22 additions grow the catalog to 98 and W1-2
+// removes seven dead keys (91).
 func TestP8SettingsPinsCatalog(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 98 {
-		t.Fatalf("catalog has %d keys, want 98 (P8: 83 -> 85, v0.22: 85 -> 98)", len(defs))
+	if len(defs) != 91 {
+		t.Fatalf("catalog has %d keys, want 91 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys)", len(defs))
 	}
 
 	cases := []struct {
@@ -111,7 +112,7 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 		"execution": 12,
 		"knowledge": 3,
 		"retention": 8, // 7 P7 keys + retention.event_days
-		"security":  3, // 2 P0 keys + security.rate_limit_per_minute
+		"security":  2, // audit_retention_days + rate_limit_per_minute (W1-2 removed mask_secrets)
 		"instance":  2,
 	}
 	for category, want := range wantCounts {
@@ -124,12 +125,12 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 // TestV022Settings pins the v0.22 settings catalog (spec §8.1 ST-1..ST-19):
 // the raised context window default, the new compaction/vision/tool/question/gc
 // keys, and the already-existing agent.tool_result_max_bytes unchanged at
-// 32768. The catalog grows from 85 to 98 keys; the legacy keys stay in place
-// until W1 disposes of the dead ones, and question.blocking must not exist.
+// 32768. The v0.22 additions grew the catalog from 85 to 98 keys; W1-2 removes
+// seven dead keys (91), and question.blocking must not exist.
 func TestV022Settings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 98 {
-		t.Fatalf("catalog has %d keys, want 98 (v0.22: 85 -> 98)", len(defs))
+	if len(defs) != 91 {
+		t.Fatalf("catalog has %d keys, want 91 (v0.22: 85 -> 98, W1-2 removes 7 dead keys)", len(defs))
 	}
 
 	byKey := make(map[string]settings.Definition, len(defs))
@@ -155,7 +156,6 @@ func TestV022Settings(t *testing.T) {
 		{"compaction.summary_max_tokens", "compaction", settings.TypeNumber, "8192", true, floatPtr(256), floatPtr(8192)},
 		{"compaction.overflow_retries", "compaction", settings.TypeNumber, "1", true, floatPtr(0), floatPtr(5)},
 		{"agent.tool_result_max_bytes", "agent", settings.TypeNumber, "32768", true, floatPtr(1024), nil},
-		{"vision.required", "vision", settings.TypeBool, "true", false, nil, nil},
 		{"vision.max_images_per_attachment", "vision", settings.TypeNumber, "50", true, floatPtr(1), floatPtr(500)},
 		{"vision.max_image_bytes", "vision", settings.TypeNumber, "10485760", true, floatPtr(1024), floatPtr(104857600)},
 		{"tool.retry_max", "tool", settings.TypeNumber, "2", true, floatPtr(0), floatPtr(5)},
@@ -183,5 +183,39 @@ func TestV022Settings(t *testing.T) {
 
 	if _, ok := byKey["question.blocking"]; ok {
 		t.Fatal("question.blocking must not exist (questions never block, C-2)")
+	}
+}
+
+// TestDeadSettingsDisposed pins the W1-2 disposition of the 13 settings that
+// had no production reader: seven dead keys are removed from the catalog and
+// six are kept because their readers are wired by W1-2. gc.* keeps its keys
+// for W2, so they must stay present even though W1 does not read them yet.
+func TestDeadSettingsDisposed(t *testing.T) {
+	byKey := make(map[string]bool, 91)
+	for _, def := range Definitions("http://127.0.0.1:13336") {
+		byKey[def.Key] = true
+	}
+	for _, removed := range []string{
+		"paths.attachment_dir", "paths.evidence_dir", "paths.report_dir", "paths.export_dir",
+		"security.mask_secrets", "feature.experimental", "vision.required",
+	} {
+		if byKey[removed] {
+			t.Fatalf("%s must be removed from the catalog", removed)
+		}
+	}
+	for _, wired := range []string{
+		"vision.max_images_per_attachment", "vision.max_image_bytes", "tool.retry_max",
+		"compaction.overflow_retries", "search.max_results_per_type", "todos.max_items",
+	} {
+		if !byKey[wired] {
+			t.Fatalf("%s must stay in the catalog (wired)", wired)
+		}
+	}
+	for _, deferred := range []string{
+		"gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days",
+	} {
+		if !byKey[deferred] {
+			t.Fatalf("%s must stay in the catalog (W2 wiring)", deferred)
+		}
 	}
 }

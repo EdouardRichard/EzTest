@@ -410,3 +410,67 @@ func TestSnapshotWithoutVersionTitleReaderKeepsTitlesEmpty(t *testing.T) {
 		t.Fatalf("case version_title = %q, want empty without a wired reader", got)
 	}
 }
+
+// fakeLimits is the minimal settings port used by the W1-2 wiring test.
+type fakeLimits struct {
+	ints map[string]int64
+	err  error
+}
+
+func (f *fakeLimits) Int(_ context.Context, key string) (int64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	value, ok := f.ints[key]
+	if !ok {
+		return 0, errors.New("setting not found")
+	}
+	return value, nil
+}
+
+// TestSnapshotDefaultLimitFromSettings pins the W1-2 wiring of todos.max_items:
+// an unspecified (0) limit resolves the setting, the query limit still wins and
+// the resolved value is clamped to the workspace maximum.
+func TestSnapshotDefaultLimitFromSettings(t *testing.T) {
+	now := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	makeItems := func(count int) []workspaceapp.TodoItem {
+		items := make([]workspaceapp.TodoItem, 0, count)
+		for index := 0; index < count; index++ {
+			items = append(items, item(workspaceapp.KindCaseConfirmation, "用例", now.Add(-time.Duration(index)*time.Second)))
+		}
+		return items
+	}
+	cases := []struct {
+		name        string
+		setting     int64
+		limit       int
+		readerError bool
+		count       int
+		want        int
+	}{
+		{name: "setting default", setting: 7, limit: 0, count: 10, want: 7},
+		{name: "explicit limit wins", setting: 7, limit: 3, count: 10, want: 3},
+		{name: "setting clamps to max", setting: 999, limit: 0, count: 250, want: workspaceapp.MaxLimit},
+		{name: "unreadable setting falls back", setting: 7, limit: 0, readerError: true, count: 60, want: workspaceapp.DefaultLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &fakeLimits{ints: map[string]int64{"todos.max_items": tc.setting}}
+			if tc.readerError {
+				reader.err = errors.New("settings unavailable")
+			}
+			snapshot, err := workspaceapp.NewService(&fakeProvider{items: makeItems(tc.count)}).
+				SetLimits(reader).
+				Snapshot(context.Background(), platform.Actor{ID: 1, Role: "admin"}, tc.limit)
+			if err != nil {
+				t.Fatalf("Snapshot: %v", err)
+			}
+			if len(snapshot.Items) != tc.want {
+				t.Fatalf("items = %d, want %d", len(snapshot.Items), tc.want)
+			}
+			if snapshot.Counts.CaseConfirmation != tc.count {
+				t.Fatalf("count = %d, want the pre-limit %d", snapshot.Counts.CaseConfirmation, tc.count)
+			}
+		})
+	}
+}

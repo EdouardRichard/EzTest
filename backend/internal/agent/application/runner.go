@@ -33,9 +33,13 @@ const (
 	defaultSoftSeconds        = 300
 	defaultHardSeconds        = 600
 	defaultToolResultMaxBytes = 32768
-	finishTimeout             = 5 * time.Second
-	toolResultHeadRunes       = 2000
-	scoutAttachmentTextRunes  = 4000
+	// defaultToolRetryMax/defaultOverflowRetries mirror the catalog defaults so
+	// an unwired settings reader behaves as before W1-2.
+	defaultToolRetryMax      = 2
+	defaultOverflowRetries   = 1
+	finishTimeout            = 5 * time.Second
+	toolResultHeadRunes      = 2000
+	scoutAttachmentTextRunes = 4000
 )
 
 // RunnerDeps wires the P1 agent run loop.
@@ -1539,15 +1543,21 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			// R51: the runner intersects the profile role's whitelist even when
 			// a stored profile was widened outside it. A denial is a typed
 			// forbidden error and an audit event, never a tool execution.
-			payload, err = state.roleGuard.Execute(ctx, state.registry, scope, call.Name, json.RawMessage(call.Arguments))
+			payload, err = r.executeToolWithRetry(ctx, state, call.Name, func() (any, error) {
+				return state.roleGuard.Execute(ctx, state.registry, scope, call.Name, json.RawMessage(call.Arguments))
+			})
 		case !state.roleMapped:
 			// Unmapped profile: the profile whitelist was the only surface and
 			// it already passed the first case.
-			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			payload, err = r.executeToolWithRetry(ctx, state, call.Name, func() (any, error) {
+				return state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			})
 		case !state.roleTools.Allows(call.Name):
 			err = tools.Forbidden(state.roleTools.Role(), call.Name)
 		default:
-			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			payload, err = r.executeToolWithRetry(ctx, state, call.Name, func() (any, error) {
+				return state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			})
 		}
 		if err == nil {
 			// Task 98: successful execution recording calls are remembered so a
@@ -1637,13 +1647,15 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 
 // handleOverflow compacts the context at a forced overflow decision (R-A5-2/
 // R-A5-11) and retries. The provider rejected the prompt, so the forced
-// overflow decision runs with the halved 8% retain budget; the second retry
-// additionally halves the recent-segment window so strictly more history folds.
-// A recoverable compaction stop keeps the original context and still retries;
-// a third overflow is the terminal unrecoverable case.
+// overflow decision runs with the halved 8% retain budget; every retry after the
+// first additionally halves the recent-segment window so strictly more history
+// folds. The retry budget comes from compaction.overflow_retries (default 1);
+// zero disables the rescue, so the first overflow is terminal. A recoverable
+// compaction stop keeps the original context and still retries; exhausting the
+// budget is the terminal unrecoverable case.
 func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.overflowHits++
-	if state.overflowHits > 2 {
+	if state.overflowHits > r.overflowRetries() {
 		return &RunError{
 			Reason:    "context_overflow_unrecoverable",
 			Retryable: true,
@@ -2948,6 +2960,55 @@ func (r *Runner) intSetting(key string, fallback int) int {
 		return fallback
 	}
 	return int(value)
+}
+
+// intSettingAllowZero is intSetting for keys whose zero value is meaningful
+// (an explicit "disabled"), such as tool.retry_max and
+// compaction.overflow_retries. A missing/unreadable/negative value falls back.
+func (r *Runner) intSettingAllowZero(key string, fallback int) int {
+	if r.settings == nil {
+		return fallback
+	}
+	value, err := r.settings.Int(context.Background(), key)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return int(value)
+}
+
+// toolRetryMax is the automatic retry budget for retryable tool errors
+// (tool.retry_max). Zero disables automatic retries.
+func (r *Runner) toolRetryMax() int {
+	return r.intSettingAllowZero("tool.retry_max", defaultToolRetryMax)
+}
+
+// overflowRetries is the forced-compaction rescue budget after a provider
+// context-overflow (compaction.overflow_retries). Zero disables the rescue.
+func (r *Runner) overflowRetries() int {
+	return r.intSettingAllowZero("compaction.overflow_retries", defaultOverflowRetries)
+}
+
+// executeToolWithRetry runs one tool invocation and immediately retries a
+// retryable typed tool error up to the configured budget (no backoff). Every
+// retry publishes tool.retry with the attempt number and the error so the UI
+// can show the automatic retry. Non-retryable errors and a zero budget execute
+// exactly once.
+func (r *Runner) executeToolWithRetry(ctx context.Context, state *runState, toolName string, execute func() (any, error)) (any, error) {
+	maxRetries := r.toolRetryMax()
+	payload, err := execute()
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var toolErr *tools.Error
+		if !errors.As(err, &toolErr) || !toolErr.Retryable {
+			return payload, err
+		}
+		r.publish(state, "tool.retry", map[string]any{
+			"tool":    toolName,
+			"attempt": attempt,
+			"error":   err.Error(),
+		})
+		payload, err = execute()
+	}
+	return payload, err
 }
 
 func (r *Runner) now() time.Time {

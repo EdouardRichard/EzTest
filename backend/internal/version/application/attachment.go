@@ -188,6 +188,22 @@ func newVisionRequiredError(attachment version.Attachment, reason string) *Visio
 	}
 }
 
+// AttachmentSettings is the narrow settings-center port used for the vision
+// extraction limits. It is satisfied by settingsapp.Service; a nil reader keeps
+// the catalog defaults.
+type AttachmentSettings interface {
+	Int(ctx context.Context, key string) (int64, error)
+}
+
+// Vision extraction settings keys and fallbacks. They mirror the frozen catalog
+// defaults so an unwired deployment behaves exactly as before W1-2.
+const (
+	SettingMaxImagesPerAttachment = "vision.max_images_per_attachment"
+	SettingMaxImageBytes          = "vision.max_image_bytes"
+	fallbackMaxImages             = 50
+	fallbackMaxImageBytes         = 10 << 20
+)
+
 // AttachmentService registers message attachments against the content ledger
 // and extracts their text into a second content reference.
 type AttachmentService struct {
@@ -201,6 +217,7 @@ type AttachmentService struct {
 	clock     clock.Clock
 	vision    VisionCaptioner
 	facts     AttachmentFactRecorder
+	limits    AttachmentSettings
 }
 
 // NewAttachmentService wires the attachment use cases.
@@ -232,6 +249,37 @@ func (s *AttachmentService) SetVisionCaptioner(vision VisionCaptioner) {
 // success: a nil recorder fails the image explicitly.
 func (s *AttachmentService) SetFactRecorder(facts AttachmentFactRecorder) {
 	s.facts = facts
+}
+
+// SetLimits wires the settings-center reader for the vision extraction limits
+// (vision.max_images_per_attachment and vision.max_image_bytes). A nil reader or
+// an unreadable key keeps the catalog defaults.
+func (s *AttachmentService) SetLimits(limits AttachmentSettings) {
+	s.limits = limits
+}
+
+// visionMaxImages resolves the configured per-attachment image cap.
+func (s *AttachmentService) visionMaxImages(ctx context.Context) int {
+	if s == nil || s.limits == nil {
+		return fallbackMaxImages
+	}
+	value, err := s.limits.Int(ctx, SettingMaxImagesPerAttachment)
+	if err != nil || value <= 0 {
+		return fallbackMaxImages
+	}
+	return int(value)
+}
+
+// visionMaxImageBytes resolves the configured single-image byte cap.
+func (s *AttachmentService) visionMaxImageBytes(ctx context.Context) int64 {
+	if s == nil || s.limits == nil {
+		return fallbackMaxImageBytes
+	}
+	value, err := s.limits.Int(ctx, SettingMaxImageBytes)
+	if err != nil || value <= 0 {
+		return fallbackMaxImageBytes
+	}
+	return value
 }
 
 // RegisterFromMessage validates one message attachment part against the
@@ -1239,7 +1287,8 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		imageStatus = version.AttachmentImageSkipped
 		imageSkipReason = visionUnavailableMessage(visionReason)
 	}
-	imageRows, err := s.persistExtractedImages(ctx, attachment, parsed.Images, imageStatus, imageSkipReason)
+	imageRows, err := s.persistExtractedImages(ctx, attachment, parsed.Images, imageStatus, imageSkipReason,
+		s.visionMaxImages(ctx), s.visionMaxImageBytes(ctx))
 	if err != nil {
 		return ExtractionResult{}, err
 	}
@@ -1383,8 +1432,11 @@ func (s *AttachmentService) publishVisionUnavailable(ctx context.Context, attach
 // only references them. Rows are created with the status chosen by the caller
 // (extracted when a vision model is available, skipped otherwise) and are
 // idempotent on (attachment_id, seq): an existing row is reused and no
-// duplicate content object/reference is created.
-func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachment version.Attachment, parsed []ExtractionImage, status, skipReason string) ([]version.AttachmentImageRecord, error) {
+// duplicate content object/reference is created. When a vision model is
+// available, images beyond maxImages or above maxImageBytes are persisted as
+// skipped rows with the limit and value in their reason instead of being sent
+// to the model.
+func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachment version.Attachment, parsed []ExtractionImage, status, skipReason string, maxImages int, maxImageBytes int64) ([]version.AttachmentImageRecord, error) {
 	if len(parsed) == 0 {
 		return nil, nil
 	}
@@ -1402,10 +1454,25 @@ func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachme
 	}
 	now := s.clock.Now()
 	rows := make([]version.AttachmentImageRecord, 0, len(parsed))
-	for _, image := range parsed {
+	for index, image := range parsed {
 		if row, ok := bySeq[image.Seq]; ok {
 			rows = append(rows, row)
 			continue
+		}
+		rowStatus, rowReason := status, skipReason
+		if rowStatus == version.AttachmentImageExtracted {
+			switch {
+			case index >= maxImages:
+				rowStatus = version.AttachmentImageSkipped
+				rowReason = fmt.Sprintf(
+					"image %d of %d skipped: attachment exceeds %s (max %d images)",
+					image.Seq, len(parsed), SettingMaxImagesPerAttachment, maxImages)
+			case int64(len(image.Data)) > maxImageBytes:
+				rowStatus = version.AttachmentImageSkipped
+				rowReason = fmt.Sprintf(
+					"image %d skipped: %d bytes exceeds %s (max %d bytes)",
+					image.Seq, len(image.Data), SettingMaxImageBytes, maxImageBytes)
+			}
 		}
 		name := image.Name
 		if strings.TrimSpace(name) == "" {
@@ -1422,7 +1489,7 @@ func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachme
 		row := version.AttachmentImageRecord{
 			ID: s.ids.Next(), AttachmentID: attachment.ID, Seq: image.Seq, ContentRefID: ref.ID,
 			MIME: image.MIME, Width: image.Width, Height: image.Height, SourceKind: sourceKind,
-			Status: status, Error: skipReason, CreatedAt: now, UpdatedAt: now,
+			Status: rowStatus, Error: rowReason, CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.repo.CreateImage(ctx, row); err != nil {
 			return nil, mapAttachmentRepositoryError(err)

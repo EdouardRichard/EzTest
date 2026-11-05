@@ -58,6 +58,33 @@ function displayValue(setting: Setting): string {
 
 type Notice = { key: string; text: string }
 
+/**
+ * Keys removed by the v0.22 W1-2 settings disposition. They no longer exist in
+ * the backend catalog; the filter keeps stale rows from an older database out
+ * of the editor so the page only exposes settings that can take effect.
+ */
+const REMOVED_SETTING_KEYS = new Set([
+  "paths.attachment_dir",
+  "paths.evidence_dir",
+  "paths.report_dir",
+  "paths.export_dir",
+  "security.mask_secrets",
+  "feature.experimental",
+  "vision.required",
+])
+
+/**
+ * Keys whose GC reader is deferred to W2. They stay visible (read-only) so the
+ * parameter surface is complete, but the editor must not pretend a save takes
+ * effect before the W2 GC wiring lands.
+ */
+const DEFERRED_SETTING_KEYS = new Set([
+  "gc.retention_days",
+  "gc.max_bytes",
+  "gc.dry_run",
+  "gc.grace_days",
+])
+
 /** System settings grouped by category with one-key-at-a-time inline editing. */
 export function SystemSettings() {
   const [settings, setSettings] = useState<Setting[] | null>(null)
@@ -91,7 +118,13 @@ export function SystemSettings() {
     }
   }, [reloadKey])
 
-  const groups = useMemo(() => groupSettings(settings ?? []), [settings])
+  const groups = useMemo(
+    () =>
+      groupSettings(
+        (settings ?? []).filter((setting) => !REMOVED_SETTING_KEYS.has(setting.key)),
+      ),
+    [settings],
+  )
 
   const startEdit = useCallback((setting: Setting) => {
     setEditingKey(setting.key)
@@ -188,6 +221,7 @@ export function SystemSettings() {
           <ul className="divide-y divide-border">
             {group.settings.map((setting) => {
               const editing = editingKey === setting.key
+              const deferred = DEFERRED_SETTING_KEYS.has(setting.key)
               return (
                 <li
                   key={setting.key}
@@ -203,6 +237,7 @@ export function SystemSettings() {
                         <Badge tone="neutral">{setting.type}</Badge>
                         {setting.is_secret ? <Badge tone="info">密钥</Badge> : null}
                         {setting.restart_required ? <Badge tone="warning">需重启生效</Badge> : null}
+                        {deferred ? <Badge tone="info">W2 接线</Badge> : null}
                       </div>
                       <p className="mt-1 text-xs text-muted-foreground">{setting.description}</p>
                       <p className="mt-0.5 text-[10px] text-muted-foreground">
@@ -217,10 +252,15 @@ export function SystemSettings() {
                       >
                         {displayValue(setting)}
                       </span>
-                      {!editing ? (
+                      {!editing && !deferred ? (
                         <Button variant="secondary" size="sm" onClick={() => startEdit(setting)}>
                           编辑
                         </Button>
+                      ) : null}
+                      {deferred ? (
+                        <span className="text-[10px] text-muted-foreground">
+                          只读：W2 接线后生效
+                        </span>
                       ) : null}
                     </div>
                   </div>

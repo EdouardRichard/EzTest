@@ -515,6 +515,9 @@ func TestRunnerPersistsSingleFoldedSegmentAtPrepareBoundary(t *testing.T) {
 func TestRunnerSecondOverflowFoldsMoreHistory(t *testing.T) {
 	fixture := newBriefingRunnerFixture(t)
 	fixture.settings.ints["context.keep_recent_messages"] = 2
+	// The rescue budget is configurable (compaction.overflow_retries, default 1);
+	// this test exercises the second retry, so it needs a budget of two.
+	fixture.settings.ints["compaction.overflow_retries"] = 2
 	fixture.conv.snapshot.Summary = ""
 	fixture.conv.snapshot.PinnedFacts = nil
 	// Large messages make the folded transcript strictly larger than the

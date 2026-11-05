@@ -112,14 +112,14 @@ func newP6ReadRuntime(deps p6ReadDeps) (*p6ReadRuntime, error) {
 
 	searchSvc := searchapp.NewService(
 		searchproviders.New(versionQuery, designQuery, deliveryQuery),
-	).WithVersionTitles(versionQuery)
+	).WithVersionTitles(versionQuery).SetLimits(deps.Settings)
 
 	todosSvc := workspaceapp.NewService(
 		workspaceproviders.NewVersionProvider(versionQuery),
 		workspaceproviders.NewDesignProvider(designQuery),
 		workspaceproviders.NewExecutionProvider(executionQuery),
 		workspaceproviders.NewDeliveryProvider(deliveryQuery),
-	).WithVersionTitles(versionQuery)
+	).WithVersionTitles(versionQuery).SetLimits(deps.Settings)
 
 	globalRepo := deliverypg.NewGlobalRepository(deps.Pool)
 	if deps.Issues != nil {

@@ -162,7 +162,7 @@ func TestListTodosReturnsSnapshotEnvelope(t *testing.T) {
 	}
 }
 
-func TestListTodosDefaultsTo50(t *testing.T) {
+func TestListTodosForwardsZeroWhenLimitAbsent(t *testing.T) {
 	service := &fakeService{}
 	handler := workspaceapi.New(service)
 	request := actorRequest(http.MethodGet, "/api/todos", platform.Actor{ID: 1, Role: "admin"})
@@ -173,8 +173,8 @@ func TestListTodosDefaultsTo50(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
-	if service.limit != workspaceapp.DefaultLimit {
-		t.Fatalf("limit = %d, want %d", service.limit, workspaceapp.DefaultLimit)
+	if service.limit != 0 {
+		t.Fatalf("limit = %d, want 0 so the service resolves todos.max_items", service.limit)
 	}
 	// An empty snapshot is a successful empty feed, not a 404.
 	var envelope struct {
