@@ -1,6 +1,6 @@
 "use client"
 
-import { Plus, RefreshCw } from "lucide-react"
+import { RefreshCw } from "lucide-react"
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react"
 
 import { Alert } from "@/components/ui/Alert"
@@ -12,9 +12,9 @@ import { Input } from "@/components/ui/Input"
 import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
+import type { VersionStage } from "@/features/design/types"
 
 import {
-  addSutRepository,
   bindingErrorDetails,
   createVersion,
   getResourceCatalog,
@@ -22,14 +22,15 @@ import {
   listSutRepositories,
   updateVersionBinding,
 } from "./api"
+import { stageLabel } from "./stage"
 import type {
   AccountResource,
   BindingScopeExclude,
   Catalog,
-  CreateSutRepositoryRequest,
   SutRepository,
   SutResource,
   Version,
+  VersionBindingOverview,
 } from "./types"
 import {
   activeAccounts,
@@ -59,7 +60,6 @@ type ScopeOption = {
   id: string
   label: string
   hint?: string
-  status: string
 }
 
 function stepTitle(step: Step): string {
@@ -69,8 +69,14 @@ function stepTitle(step: Step): string {
   return "确认创建"
 }
 
-function scopeSummary(counts: { included: number; excluded: number; proposed: number }): string {
-  return `生效 ${counts.included} · 排除 ${counts.excluded} · 待确认 ${counts.proposed}`
+/** Baseline (approved) plus the live effective counts of one resource kind. */
+function scopeSummary(counts: {
+  approved: number
+  included: number
+  excluded: number
+  proposed: number
+}): string {
+  return `已确认 ${counts.approved} · 生效 ${counts.included} · 排除 ${counts.excluded} · 待确认 ${counts.proposed}`
 }
 
 type ScopeGroupProps = {
@@ -110,11 +116,6 @@ function ScopeGroup({ legend, options, excluded, onToggle, emptyText }: ScopeGro
                       {option.hint}
                     </span>
                   ) : null}
-                  {option.status === "proposed" ? (
-                    <Badge tone="warning" className="ml-1">
-                      待确认
-                    </Badge>
-                  ) : null}
                 </span>
               </label>
             )
@@ -125,20 +126,15 @@ function ScopeGroup({ legend, options, excluded, onToggle, emptyText }: ScopeGro
   )
 }
 
+type VersionOnlyRepository = { id: string; name: string; branch: string }
+
 type RepositorySectionProps = {
   repositories: SutRepository[] | null
   loading: boolean
   error: unknown
   selectedIds: string[] | null
-  available: Array<{ id: string; name: string; branch: string }>
-  addRepositoryId: string
-  addRole: string
-  adding: boolean
-  addError: unknown
+  versionOnlyRepositories: VersionOnlyRepository[]
   onToggle: (repoId: string) => void
-  onAddRepositoryId: (value: string) => void
-  onAddRole: (value: string) => void
-  onAdd: () => void
   onRetry: () => void
   onRefresh: () => void
 }
@@ -148,15 +144,8 @@ function RepositorySection({
   loading,
   error,
   selectedIds,
-  available,
-  addRepositoryId,
-  addRole,
-  adding,
-  addError,
+  versionOnlyRepositories,
   onToggle,
-  onAddRepositoryId,
-  onAddRole,
-  onAdd,
   onRetry,
   onRefresh,
 }: RepositorySectionProps) {
@@ -236,51 +225,39 @@ function RepositorySection({
         </ul>
       ) : null}
 
-      {!error && !loading ? (
-        <div className="mt-3 grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end">
-          <Field id="wizard-add-repository" label="可选代码仓">
-            <Select
-              id="wizard-add-repository"
-              value={addRepositoryId}
-              disabled={adding || available.length === 0}
-              onChange={(event) => onAddRepositoryId(event.target.value)}
-            >
-              <option value="">
-                {available.length === 0 ? "未关联其他代码仓" : "请选择代码仓"}
-              </option>
-              {available.map((repository) => (
-                <option key={repository.id} value={repository.id}>
-                  {repository.name}
-                  {repository.branch ? `（${repository.branch}）` : ""}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field id="wizard-add-repository-role" label="仓库角色">
-            <Input
-              id="wizard-add-repository-role"
-              value={addRole}
-              placeholder="backend / frontend / infra"
-              disabled={adding}
-              onChange={(event) => onAddRole(event.target.value)}
-            />
-          </Field>
-          <Button
-            variant="secondary"
-            size="sm"
-            disabled={adding || addRepositoryId === ""}
-            onClick={onAdd}
-          >
-            <Plus className="size-3.5" aria-hidden="true" />
-            {adding ? "添加中…" : "添加代码仓"}
-          </Button>
+      {!error && !loading && versionOnlyRepositories.length > 0 ? (
+        <div className="mt-3 border-t border-border pt-2">
+          <p className="text-[11px] font-medium text-foreground">其他启用代码仓（仅本版本）</p>
+          <p className="mb-1.5 text-[11px] text-muted-foreground">
+            未关联到 SUT 的代码仓只会以「版本覆盖」加入本版本，不会影响 SUT 或后续版本。
+          </p>
+          <div className="grid gap-1.5 sm:grid-cols-2">
+            {versionOnlyRepositories.map((repository) => (
+              <label
+                key={repository.id}
+                className="flex cursor-pointer items-start gap-2 text-xs text-foreground"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 size-3.5 accent-primary"
+                  checked={selectedIds?.includes(repository.id) ?? false}
+                  onChange={() => onToggle(repository.id)}
+                />
+                <span className="min-w-0">
+                  <span className="font-medium">{repository.name}</span>
+                  {repository.branch ? (
+                    <span className="ml-1 font-mono text-[11px] text-muted-foreground">
+                      {repository.branch}
+                    </span>
+                  ) : null}
+                  <Badge tone="info" className="ml-1">
+                    版本覆盖
+                  </Badge>
+                </span>
+              </label>
+            ))}
+          </div>
         </div>
-      ) : null}
-
-      {addError ? (
-        <p role="alert" className="mt-2 text-[11px] text-destructive">
-          {addError instanceof Error ? addError.message : "添加代码仓失败"}
-        </p>
       ) : null}
     </fieldset>
   )
@@ -370,21 +347,19 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
   const [repositoryLoading, setRepositoryLoading] = useState(false)
   const [repositoryError, setRepositoryError] = useState<unknown>(null)
   const [selectedRepositoryIds, setSelectedRepositoryIds] = useState<string[] | null>(null)
-  const [addRepositoryId, setAddRepositoryId] = useState("")
-  const [addRole, setAddRole] = useState("")
-  const [addingRepository, setAddingRepository] = useState(false)
-  const [addRepositoryError, setAddRepositoryError] = useState<unknown>(null)
   const repositoryRequest = useRef(0)
 
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[] | null>(null)
   const [scopeExclude, setScopeExclude] = useState<BindingScopeExclude>(emptyScopeExclude)
 
   const [submitting, setSubmitting] = useState(false)
+  const [submitPhase, setSubmitPhase] = useState<"create" | "binding" | null>(null)
   const [submitError, setSubmitError] = useState<unknown>(null)
   const [createdVersion, setCreatedVersion] = useState<Version | null>(null)
   const [savedVersion, setSavedVersion] = useState<Version | null>(null)
   const [refreshingBinding, setRefreshingBinding] = useState(false)
-  const [bindingRefreshed, setBindingRefreshed] = useState(false)
+  const [refreshedBinding, setRefreshedBinding] = useState<VersionBindingOverview | null>(null)
+  const [bindingRefreshError, setBindingRefreshError] = useState<unknown>(null)
 
   const loadCatalog = useCallback(async () => {
     setCatalogLoading(true)
@@ -435,7 +410,6 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
     setRepositoryError(null)
     setRepositories(null)
     setSelectedRepositoryIds(null)
-    setAddRepositoryError(null)
     setScopeExclude(emptyScopeExclude())
 
     const option = catalog === null ? undefined : findEnvironmentOption(catalog, nextEnvironmentId)
@@ -459,31 +433,11 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
     setScopeExclude((current) => toggleExclude(current, kind, id))
   }
 
-  async function addRepository(): Promise<void> {
-    if (derivedSut === undefined || addRepositoryId === "") return
-    setAddingRepository(true)
-    setAddRepositoryError(null)
-    try {
-      const payload: CreateSutRepositoryRequest = {
-        repository_id: addRepositoryId,
-        role: addRole.trim(),
-      }
-      const created = await addSutRepository(derivedSut.id, payload)
-      const row: SutRepository = { ...created }
-      setRepositories((current) => [...(current ?? []), row])
-      setSelectedRepositoryIds((current) => toggleSelection(current ?? [], row.repository.id))
-      setAddRepositoryId("")
-      setAddRole("")
-    } catch (error) {
-      setAddRepositoryError(error)
-    } finally {
-      setAddingRepository(false)
-    }
-  }
-
   function goTo(nextStep: Step): void {
     setSubmitError(null)
-    setBindingRefreshed(false)
+    setSubmitPhase(null)
+    setRefreshedBinding(null)
+    setBindingRefreshError(null)
     setStep(nextStep)
   }
 
@@ -512,11 +466,12 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
   async function refreshCreatedBinding(): Promise<void> {
     if (createdVersion === null) return
     setRefreshingBinding(true)
+    setBindingRefreshError(null)
     try {
-      await getVersionBinding(createdVersion.id)
-      setBindingRefreshed(true)
-    } catch {
-      setBindingRefreshed(false)
+      setRefreshedBinding(await getVersionBinding(createdVersion.id))
+    } catch (error) {
+      setRefreshedBinding(null)
+      setBindingRefreshError(error)
     } finally {
       setRefreshingBinding(false)
     }
@@ -526,9 +481,12 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
     if (submitting) return
     setSubmitting(true)
     setSubmitError(null)
+    setBindingRefreshError(null)
+    setRefreshedBinding(null)
     try {
       let version = createdVersion
       if (version === null) {
+        setSubmitPhase("create")
         version = await createVersion(
           buildCreateVersionPayload({
             title,
@@ -539,6 +497,7 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
         )
         setCreatedVersion(version)
       }
+      setSubmitPhase("binding")
       await updateVersionBinding(
         version.id,
         buildBindingUpdate({
@@ -593,21 +552,21 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
 
   const counts = environment
     ? {
-        pages: resourceCounts(environment.pages, []),
-        apis: resourceCounts(environment.apis, []),
-        databases: resourceCounts(scopeDatabases(environment), []),
+        pages: resourceCounts(environment.pages, scopeExclude.pages),
+        apis: resourceCounts(environment.apis, scopeExclude.apis),
+        databases: resourceCounts(scopeDatabases(environment), scopeExclude.databases),
       }
     : null
   const pageCounts = counts?.pages
   const apiCounts = counts?.apis
   const databaseCounts = counts?.databases
+  const proposedTotal = (pageCounts?.proposed ?? 0) + (apiCounts?.proposed ?? 0)
 
   const scopePages: ScopeOption[] = environment
     ? approvedPages(environment).map((page) => ({
         id: page.id,
         label: page.name,
         hint: page.route_template,
-        status: page.status,
       }))
     : []
   const scopeApis: ScopeOption[] = environment
@@ -615,7 +574,6 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
         id: api.id,
         label: api.name,
         hint: `${api.method} ${api.path_template}`,
-        status: api.status,
       }))
     : []
   const scopeDatabaseOptions: ScopeOption[] = environment
@@ -623,19 +581,36 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
         id: database.id,
         label: database.name,
         hint: database.read_only ? "只读" : "可写",
-        status: database.status,
       }))
     : []
 
   const associatedRepositoryIds = new Set((repositories ?? []).map((row) => row.repository.id))
-  const availableRepositories = catalog.repositories
+  const versionOnlyRepositories = catalog.repositories
     .filter((repository) => repository.status === "active")
     .filter((repository) => !associatedRepositoryIds.has(repository.id))
+    .map((repository) => ({
+      id: repository.id,
+      name: repository.name,
+      branch: repository.branch,
+    }))
 
-  const selectedRepositories =
-    repositories === null
+  const selectedRepositoryRows =
+    selectedRepositoryIds === null
       ? []
-      : repositories.filter((row) => selectedRepositoryIds?.includes(row.repository.id) ?? false)
+      : selectedRepositoryIds.flatMap((id) => {
+          const inherited = repositories?.find((row) => row.repository.id === id)
+          if (inherited !== undefined) {
+            return [
+              {
+                label: `${inherited.repository.name}${
+                  inherited.role ? `（${inherited.role}）` : ""
+                }`,
+              },
+            ]
+          }
+          const repository = catalog.repositories.find((item) => item.id === id)
+          return repository === undefined ? [] : [{ label: `${repository.name}（版本覆盖）` }]
+        })
   const selectedAccounts = accounts.filter(
     (account) => selectedAccountIds?.includes(account.id) ?? false,
   )
@@ -645,6 +620,12 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
     submitDetails !== null && submitDetails.field !== ""
       ? stepForBindingField(submitDetails.field)
       : null
+  const submitReadOnly = submitPhase === "binding" && submitDetails?.readOnly === true
+  const submitTitle = submitReadOnly
+    ? "绑定当前只读（409）"
+    : submitPhase === "create"
+      ? "创建版本失败"
+      : "保存绑定失败"
 
   return (
     <section aria-label="版本创建向导" className="space-y-3">
@@ -658,6 +639,11 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
 
       {step === 1 ? (
         <div className="space-y-3">
+          {createdVersion !== null ? (
+            <Alert tone="info" title="版本已创建：步骤 1 的修改不会自动保存">
+              重试只会提交绑定（PUT），不会更新版本名称/描述/目标/环境，也不会重复创建版本。
+            </Alert>
+          ) : null}
           <Field id="wizard-title" label="版本名称" required error={titleError}>
             <Input
               id="wizard-title"
@@ -722,13 +708,13 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
               apiCounts !== undefined &&
               databaseCounts !== undefined ? (
                 <p className="text-[11px] text-muted-foreground">
-                  环境资源：页面 {pageCounts.included} · API {apiCounts.included} · 目标库{" "}
-                  {databaseCounts.included} · 测试账号 {accounts.length}
+                  环境资源：页面 {pageCounts.approved} · API {apiCounts.approved} · 目标库{" "}
+                  {databaseCounts.approved} · 测试账号 {accounts.length}
                 </p>
               ) : null}
-              {pageCounts !== undefined && pageCounts.proposed > 0 ? (
+              {proposedTotal > 0 ? (
                 <p className="text-[11px] text-muted-foreground">
-                  探索待确认：页面 {pageCounts.proposed} · API {apiCounts?.proposed ?? 0}
+                  探索待确认：页面 {pageCounts?.proposed ?? 0} · API {apiCounts?.proposed ?? 0}
                   （确认后进入下一 wave，不在本次绑定范围）
                 </p>
               ) : null}
@@ -744,19 +730,8 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
             loading={repositoryLoading}
             error={repositoryError}
             selectedIds={selectedRepositoryIds}
-            available={availableRepositories.map((repository) => ({
-              id: repository.id,
-              name: repository.name,
-              branch: repository.branch,
-            }))}
-            addRepositoryId={addRepositoryId}
-            addRole={addRole}
-            adding={addingRepository}
-            addError={addRepositoryError}
+            versionOnlyRepositories={versionOnlyRepositories}
             onToggle={toggleRepository}
-            onAddRepositoryId={setAddRepositoryId}
-            onAddRole={setAddRole}
-            onAdd={() => void addRepository()}
             onRetry={() => {
               if (derivedSut !== undefined) void loadRepositories(derivedSut.id)
             }}
@@ -775,8 +750,8 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
       {step === 3 ? (
         <div className="space-y-3">
           <Alert tone="info" title="默认全部包含，只记录排除项">
-            取消勾选仅写入 `scope_exclude`，不会删除或改写环境资源目录；执行中的 wave
-            使用已冻结快照，改动影响下一个 wave。
+            取消勾选仅写入 scope_exclude，不会删除或改写环境资源目录；计数按「已确认基线 −
+            本版本排除」实时计算。执行中的 wave 使用已冻结快照，改动影响下一个 wave。
           </Alert>
           <ScopeGroup
             legend="页面"
@@ -828,11 +803,9 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
               <ReviewRow label="代码仓">
                 {selectedRepositoryIds === null
                   ? "继承 SUT 的全部代码仓（代码仓接口未就绪，未覆盖）"
-                  : selectedRepositories.length === 0
+                  : selectedRepositoryRows.length === 0
                     ? "本版本不包含任何代码仓"
-                    : selectedRepositories
-                        .map((row) => `${row.repository.name}${row.role ? `（${row.role}）` : ""}`)
-                        .join("、")}
+                    : selectedRepositoryRows.map((row) => row.label).join("、")}
               </ReviewRow>
               <ReviewRow label="测试账号">
                 {selectedAccountIds === null
@@ -854,10 +827,7 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
           </div>
 
           {submitError !== null ? (
-            <Alert
-              tone="danger"
-              title={submitDetails?.readOnly ? "绑定当前只读（409）" : "保存绑定失败"}
-            >
+            <Alert tone="danger" title={submitTitle}>
               <p>
                 {submitDetails?.message ??
                   (submitError instanceof Error ? submitError.message : "提交失败")}
@@ -865,18 +835,19 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
               {submitDetails !== null && submitDetails.field !== "" ? (
                 <p className="mt-1 text-[11px]">字段：{submitDetails.field}</p>
               ) : null}
-              {submitDetails?.readOnly ? (
+              {submitReadOnly ? (
                 <p className="mt-1 text-[11px]">
                   当前阶段不允许修改绑定；请暂停或回退到设计阶段后重试。
                 </p>
               ) : null}
               {createdVersion !== null ? (
                 <p className="mt-1 text-[11px]">
-                  版本已创建（#{createdVersion.id}），重试只会保存绑定，不会重复创建。
+                  版本已创建（#{createdVersion.id}），重试只会保存绑定，不会重复创建；步骤 1
+                  的版本信息修改不会随重试提交。
                 </p>
               ) : null}
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                {submitDetails?.readOnly ? (
+                {submitReadOnly ? (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -886,13 +857,52 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
                     {refreshingBinding ? "刷新中…" : "刷新绑定"}
                   </Button>
                 ) : null}
-                {submitFieldStep !== null && !submitDetails?.readOnly ? (
+                {submitFieldStep !== null && !submitReadOnly ? (
                   <Button variant="secondary" size="sm" onClick={() => goTo(submitFieldStep)}>
                     返回步骤 {submitFieldStep} 修正
                   </Button>
                 ) : null}
               </div>
-              {bindingRefreshed ? <p className="mt-1 text-[11px]">已刷新最新绑定。</p> : null}
+              {refreshedBinding !== null ? (
+                <div className="mt-2 space-y-1 rounded-md border border-border bg-muted/40 p-2 text-[11px]">
+                  <p className="font-medium">
+                    已读取最新绑定：阶段 {stageLabel(refreshedBinding.stage as VersionStage)}
+                    ，代码仓 {refreshedBinding.repositories.length} 个，测试账号{" "}
+                    {refreshedBinding.accounts.length} 个。
+                  </p>
+                  <p>
+                    页面 {scopeSummary(refreshedBinding.counts.pages)} · API{" "}
+                    {scopeSummary(refreshedBinding.counts.apis)} · 目标库{" "}
+                    {scopeSummary(refreshedBinding.counts.databases)}
+                  </p>
+                  {refreshedBinding.repositories.length > 0 ? (
+                    <ul className="space-y-0.5">
+                      {refreshedBinding.repositories.map((row) => (
+                        <li
+                          key={row.repository.id}
+                          className="flex flex-wrap items-center gap-1 text-foreground"
+                        >
+                          <span>{row.repository.name}</span>
+                          <Badge tone={row.source === "override" ? "info" : "neutral"}>
+                            {row.source === "override" ? "版本覆盖" : "SUT 继承"}
+                          </Badge>
+                          <Badge tone={row.included ? "success" : "warning"}>
+                            {row.included ? "已包含" : "已排除"}
+                          </Badge>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              ) : null}
+              {bindingRefreshError !== null ? (
+                <p className="mt-1 text-[11px]">
+                  刷新绑定失败：
+                  {bindingRefreshError instanceof Error
+                    ? bindingRefreshError.message
+                    : "请稍后重试"}
+                </p>
+              ) : null}
             </Alert>
           ) : null}
         </div>

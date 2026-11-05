@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { BindingWizard } from "./BindingWizard"
-import { catalogFixture, orderSutRepositories } from "./test-fixtures"
+import { bindingOverviewFixture, catalogFixture, orderSutRepositories } from "./test-fixtures"
 import type {
   AccountResource,
   ApiResource,
@@ -35,7 +35,7 @@ function page(id: string, name: string, status: PageResource["status"]): PageRes
   }
 }
 
-function api(id: string, name: string): ApiResource {
+function api(id: string, name: string, status: ApiResource["status"] = "approved"): ApiResource {
   return {
     id,
     sut_id: "1001",
@@ -45,7 +45,7 @@ function api(id: string, name: string): ApiResource {
     name,
     auth_role: "",
     source: "manual",
-    status: "approved",
+    status,
     schema_ref: "",
     created_at: TIMESTAMP,
     updated_at: TIMESTAMP,
@@ -161,22 +161,29 @@ function routeFetch(routes: MockRoute[]): void {
   vi.stubGlobal("fetch", fetchMock)
 }
 
-function standardRoutes(overrides: Partial<Record<"put", MockRoute>> = {}): MockRoute[] {
+function standardRoutes(
+  overrides: Partial<Record<"put" | "post" | "repositories" | "binding", MockRoute>> = {},
+): MockRoute[] {
   return [
     {
       method: "GET",
       path: "/api/resources/catalog",
       response: () => jsonResponse({ data: catalog }),
     },
-    {
+    overrides.repositories ?? {
       method: "GET",
       path: "/api/suts/1001/repositories",
       response: () => jsonResponse({ data: orderSutRepositories }),
     },
-    {
+    overrides.post ?? {
       method: "POST",
       path: "/api/versions",
       response: () => jsonResponse({ data: createdVersion }, 201),
+    },
+    overrides.binding ?? {
+      method: "GET",
+      path: "/api/versions/2001/binding",
+      response: () => jsonResponse({ data: bindingOverviewFixture }),
     },
     overrides.put ?? {
       method: "PUT",
@@ -354,6 +361,7 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
     const alert = await screen.findByRole("alert")
     expect(alert).toHaveTextContent("version binding is read-only at stage executing")
+    expect(alert).toHaveTextContent("步骤 1 的版本信息修改不会随重试提交")
     expect(screen.getByRole("button", { name: "刷新绑定" })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: "重试保存绑定" }))
@@ -396,5 +404,207 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     expect(await screen.findByText("请输入版本名称")).toBeInTheDocument()
     expect(screen.getByText("请选择环境")).toBeInTheDocument()
     expect(screen.queryByRole("group", { name: /代码仓/ })).not.toBeInTheDocument()
+  })
+
+  it("updates the live scope counts on step 3 and the step 4 review when a page is unchecked", async () => {
+    routeFetch(standardRoutes())
+    renderWizard()
+    await selectEnvironment()
+    await walkToStep3()
+
+    expect(screen.getByText("页面 已确认 2 · 生效 2 · 排除 0 · 待确认 0")).toBeInTheDocument()
+    const pages = screen.getByRole("group", { name: /页面/ })
+    fireEvent.click(within(pages).getByRole("checkbox", { name: /订单列表/ }))
+
+    expect(screen.getByText("页面 已确认 2 · 生效 1 · 排除 1 · 待确认 0")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByText("确认创建")
+    expect(screen.getByText("已确认 2 · 生效 1 · 排除 1 · 待确认 0")).toBeInTheDocument()
+  })
+
+  it("shows proposed API counts even when no page is proposed", async () => {
+    const withProposedApi: EnvironmentResource = {
+      ...environment,
+      apis: [...environment.apis, api("1402", "退款接口", "proposed")],
+    }
+    routeFetch([
+      {
+        method: "GET",
+        path: "/api/resources/catalog",
+        response: () =>
+          jsonResponse({
+            data: { ...catalog, suts: [{ ...sut, environments: [withProposedApi] }] },
+          }),
+      },
+      ...standardRoutes().filter((route) => route.path !== "/api/resources/catalog"),
+    ])
+    renderWizard()
+    await screen.findByLabelText("版本名称")
+    fireEvent.change(screen.getByLabelText("环境"), { target: { value: "1101" } })
+
+    expect(await screen.findByText(/探索待确认：页面 0 · API 1/)).toBeInTheDocument()
+  })
+
+  it("adds an unassociated catalog repository as a version-level override without POSTing to the SUT", async () => {
+    routeFetch(
+      standardRoutes({
+        repositories: {
+          method: "GET",
+          path: "/api/suts/1001/repositories",
+          response: () => jsonResponse({ data: orderSutRepositories.slice(0, 1) }),
+        },
+      }),
+    )
+    renderWizard()
+    await selectEnvironment()
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+
+    const repositories = await screen.findByRole("group", { name: /代码仓/ })
+    const payment = await within(repositories).findByRole("checkbox", { name: /payment-gateway/ })
+    expect(payment).not.toBeChecked()
+    fireEvent.click(payment)
+
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByRole("group", { name: /页面/ })
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByText("确认创建")
+    expect(screen.getByText(/payment-gateway（版本覆盖）/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
+    await waitFor(() => expect(callsFor("PUT", "/api/versions/2001/binding")).toHaveLength(1))
+
+    const [, putInit] = callsFor("PUT", "/api/versions/2001/binding")[0] as [string, RequestInit]
+    expect(JSON.parse(String(putInit.body))).toMatchObject({
+      repository_ids: ["1201", "1202"],
+    })
+    expect(callsFor("POST", "/api/suts/1001/repositories")).toHaveLength(0)
+  })
+
+  it("omits repository_ids and explains the fallback when the SUT repository read fails", async () => {
+    routeFetch(
+      standardRoutes({
+        repositories: {
+          method: "GET",
+          path: "/api/suts/1001/repositories",
+          response: () => errorResponse(503, "unavailable", "代码仓暂不可用"),
+        },
+      }),
+    )
+    renderWizard()
+    await selectEnvironment()
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+
+    expect(await screen.findByText("SUT 代码仓读取失败")).toBeInTheDocument()
+    expect(await screen.findByText("代码仓暂不可用")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByRole("group", { name: /页面/ })
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByText("确认创建")
+    expect(
+      screen.getByText(/继承 SUT 的全部代码仓（代码仓接口未就绪，未覆盖）/),
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
+    await waitFor(() => expect(callsFor("PUT", "/api/versions/2001/binding")).toHaveLength(1))
+
+    const [, putInit] = callsFor("PUT", "/api/versions/2001/binding")[0] as [string, RequestInit]
+    const body = JSON.parse(String(putInit.body)) as Record<string, unknown>
+    expect(body).not.toHaveProperty("repository_ids")
+    expect(body.account_ids).toEqual(["1601", "1602"])
+  })
+
+  it("refreshes the created binding after a 409 and renders the refreshed overview data", async () => {
+    routeFetch(
+      standardRoutes({
+        put: {
+          method: "PUT",
+          path: "/api/versions/2001/binding",
+          response: () =>
+            errorResponse(409, "state_conflict", "version binding is read-only at stage executing"),
+        },
+        binding: {
+          method: "GET",
+          path: "/api/versions/2001/binding",
+          response: () =>
+            jsonResponse({
+              data: { ...bindingOverviewFixture, stage: "executing", editable: false },
+            }),
+        },
+      }),
+    )
+    renderWizard()
+    await walkToConfirm()
+
+    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
+    const alert = await screen.findByRole("alert")
+    fireEvent.click(screen.getByRole("button", { name: "刷新绑定" }))
+
+    await waitFor(() => expect(callsFor("GET", "/api/versions/2001/binding")).toHaveLength(1))
+    expect(await screen.findByText(/已读取最新绑定：阶段 执行中/)).toBeInTheDocument()
+    expect(within(alert).getByText("order-center-web")).toBeInTheDocument()
+    expect(within(alert).getByText("版本覆盖")).toBeInTheDocument()
+  })
+
+  it("shows the binding refresh error when re-reading the binding fails", async () => {
+    routeFetch(
+      standardRoutes({
+        put: {
+          method: "PUT",
+          path: "/api/versions/2001/binding",
+          response: () =>
+            errorResponse(409, "state_conflict", "version binding is read-only at stage executing"),
+        },
+        binding: {
+          method: "GET",
+          path: "/api/versions/2001/binding",
+          response: () => errorResponse(503, "unavailable", "绑定读取失败"),
+        },
+      }),
+    )
+    renderWizard()
+    await walkToConfirm()
+
+    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
+    await screen.findByRole("alert")
+    fireEvent.click(screen.getByRole("button", { name: "刷新绑定" }))
+
+    expect(await screen.findByText(/刷新绑定失败：绑定读取失败/)).toBeInTheDocument()
+  })
+
+  it("renders the created-version success panel when no navigation callback is supplied", async () => {
+    routeFetch(standardRoutes())
+    render(<BindingWizard onCancel={vi.fn()} />)
+    await selectEnvironment()
+    await walkToStep3()
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByText("确认创建")
+
+    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
+
+    expect(await screen.findByText("版本 #2001 已创建，绑定已保存。")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "完成" })).toBeInTheDocument()
+  })
+
+  it("labels a create failure differently from a binding failure", async () => {
+    routeFetch(
+      standardRoutes({
+        post: {
+          method: "POST",
+          path: "/api/versions",
+          response: () => errorResponse(503, "unavailable", "版本创建接口不可用"),
+        },
+      }),
+    )
+    renderWizard()
+    await walkToConfirm()
+
+    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("创建版本失败")
+    expect(alert).toHaveTextContent("版本创建接口不可用")
+    expect(alert).not.toHaveTextContent("保存绑定失败")
+    expect(callsFor("PUT", "/api/versions/2001/binding")).toHaveLength(0)
   })
 })

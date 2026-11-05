@@ -110,7 +110,9 @@ export function bindingErrorDetails(error: unknown): BindingErrorDetails | null 
     code: error.code,
     message: error.message,
     field: readDetailString(error.details, "field"),
-    readOnly: error.status === 409,
+    // Only the stage-gate state conflict means the binding is read-only; other
+    // 409s (for example a stale-write conflict) are ordinary retryable failures.
+    readOnly: error.status === 409 && error.code === "state_conflict",
   }
 }
 

@@ -62,6 +62,7 @@ describe("VersionsPage", () => {
     expect(link).toHaveAttribute("href", "/versions/2001?tab=overview")
     expect(screen.getByText("运行中")).toBeInTheDocument()
     expect(screen.getByText("2 个 SUT")).toBeInTheDocument()
+    expect(screen.getByText(/每个版本绑定一个环境/)).toBeInTheDocument()
     expect(screen.getAllByText(formatDateTime(versionSummaryFixture.updated_at))).toHaveLength(2)
   })
 

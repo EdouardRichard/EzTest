@@ -23,13 +23,27 @@ export type BindingOverviewProps = {
 
 function stageTone(stage: string): BadgeTone {
   if (stage === "completed") return "neutral"
-  if (stage === "executing" || stage === "reporting") return "warning"
+  if (stage === "executing" || stage === "reporting" || stage === "paused") return "warning"
   if (stage === "blocked") return "danger"
   return "info"
 }
 
 function stageLabel(stage: string): string {
   return VERSION_STAGE_LABEL[stage as VersionStage] ?? stage
+}
+
+/** Why binding writes are currently disabled and how to make them writable again. */
+function stageReadOnlyMessage(stage: string): string {
+  if (stage === "completed") {
+    return "已完成版本只读，如需调整绑定请克隆新版本。"
+  }
+  if (stage === "paused") {
+    return "版本已暂停：暂停期间绑定只读。恢复后若仍处于执行/报告阶段，需回退到设计阶段才能修改绑定；改动只影响下一个 wave。"
+  }
+  if (stage === "blocked") {
+    return "版本已阻塞：阻塞期间绑定只读。解除阻塞后若仍处于执行/报告阶段，需回退到设计阶段才能修改绑定；改动只影响下一个 wave。"
+  }
+  return `当前阶段为「${stageLabel(stage)}」，执行中/报告阶段需暂停或回退到设计阶段后才能修改绑定；改动只影响下一个 wave。`
 }
 
 function resourceName(resources: Array<{ id: string; name: string }>, id: string): string {
@@ -170,9 +184,7 @@ export function BindingOverview({ versionId, onEdit, refreshKey = 0 }: BindingOv
 
       {readOnly ? (
         <Alert tone="warning" title="当前阶段绑定只读">
-          {overview.stage === "completed"
-            ? "已完成版本只读，如需调整绑定请克隆新版本。"
-            : `当前阶段为「${stageLabel(overview.stage)}」，执行中/报告阶段需暂停或回退到设计阶段后才能修改绑定；改动只影响下一个 wave。`}
+          {stageReadOnlyMessage(overview.stage)}
         </Alert>
       ) : null}
 
@@ -239,26 +251,25 @@ export function BindingOverview({ versionId, onEdit, refreshKey = 0 }: BindingOv
       <section aria-label="范围排除" className="rounded-xl border border-border bg-card p-3">
         <h3 className="mb-2 text-xs font-semibold text-foreground">范围排除</h3>
         {excludedTotal === 0 ? (
-          <p className="text-[11px] text-muted-foreground">未设置排除项（默认包含全部）</p>
-        ) : (
-          <div className="space-y-1.5">
-            <ExclusionRow
-              kind="页面"
-              ids={overview.scope_exclude.pages}
-              resources={overview.environment.pages}
-            />
-            <ExclusionRow
-              kind="API"
-              ids={overview.scope_exclude.apis}
-              resources={overview.environment.apis}
-            />
-            <ExclusionRow
-              kind="目标库"
-              ids={overview.scope_exclude.databases}
-              resources={overview.environment.databases}
-            />
-          </div>
-        )}
+          <p className="mb-1.5 text-[11px] text-muted-foreground">未设置排除项（默认包含全部）</p>
+        ) : null}
+        <div className="space-y-1.5">
+          <ExclusionRow
+            kind="页面"
+            ids={overview.scope_exclude.pages}
+            resources={overview.environment.pages}
+          />
+          <ExclusionRow
+            kind="API"
+            ids={overview.scope_exclude.apis}
+            resources={overview.environment.apis}
+          />
+          <ExclusionRow
+            kind="目标库"
+            ids={overview.scope_exclude.databases}
+            resources={overview.environment.databases}
+          />
+        </div>
       </section>
     </section>
   )

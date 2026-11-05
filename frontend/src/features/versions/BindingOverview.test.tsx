@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -103,5 +103,29 @@ describe("BindingOverview", () => {
     expect(await screen.findByText("该 SUT 未关联代码仓")).toBeInTheDocument()
     expect(screen.getByText(/未关联测试账号/)).toBeInTheDocument()
     expect(screen.getByText(/未设置排除项/)).toBeInTheDocument()
+
+    const scope = screen.getByRole("region", { name: "范围排除" })
+    expect(within(scope).getByText("页面")).toBeInTheDocument()
+    expect(within(scope).getByText("API")).toBeInTheDocument()
+    expect(within(scope).getByText("目标库")).toBeInTheDocument()
+    expect(within(scope).getAllByText("未排除")).toHaveLength(3)
+  })
+
+  it("explains the read-only binding while the version is paused", async () => {
+    respondWith({ ...bindingOverviewFixture, stage: "paused", editable: false })
+    render(<BindingOverview versionId="2001" />)
+
+    expect(await screen.findByText(/版本已暂停/)).toBeInTheDocument()
+    expect(screen.getByText("已暂停")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "编辑绑定" })).toBeDisabled()
+  })
+
+  it("explains the read-only binding while the version is blocked", async () => {
+    respondWith({ ...bindingOverviewFixture, stage: "blocked", editable: false })
+    render(<BindingOverview versionId="2001" />)
+
+    expect(await screen.findByText(/版本已阻塞/)).toBeInTheDocument()
+    expect(screen.getByText("已阻塞")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "编辑绑定" })).toBeDisabled()
   })
 })

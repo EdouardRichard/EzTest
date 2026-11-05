@@ -182,6 +182,27 @@ describe("versions API", () => {
     )
     const conflict = await updateVersionBinding("2001", {}).catch((error: unknown) => error)
     expect(bindingErrorDetails(conflict)?.readOnly).toBe(true)
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "conflict",
+            message: "binding was changed by another actor",
+          },
+        },
+        409,
+      ),
+    )
+    const otherConflict = await updateVersionBinding("2001", {}).catch((error: unknown) => error)
+    expect(bindingErrorDetails(otherConflict)).toEqual({
+      status: 409,
+      code: "conflict",
+      message: "binding was changed by another actor",
+      field: "",
+      readOnly: false,
+    })
+
     expect(bindingErrorDetails(new Error("boom"))).toBeNull()
   })
 
