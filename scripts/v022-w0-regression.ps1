@@ -1408,6 +1408,20 @@ async function skipPendingQuestions() {
   return skipped
 }
 
+// The clarification host can enqueue a follow-up batch after an answer is
+// posted or a batch is skipped. Drain every batch that surfaces for a few
+// rounds before curating requirements; skipping never blocks the stage gate
+// (C-2), it only removes the open-gap input that requirement_gap reports.
+async function drainPendingQuestions(rounds = 5) {
+  for (let round = 0; round < rounds; round++) {
+    const skipped = await skipPendingQuestions()
+    await sleep(3000)
+    const list = await api('GET', `/api/versions/${state.versionId}/questions`)
+    const pending = listData(list.json).filter((batch) => batch.status === 'pending')
+    if (pending.length === 0 && skipped === 0) return
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Browser helpers (Playwright from executor/node_modules).
 // ---------------------------------------------------------------------------
@@ -1848,19 +1862,16 @@ async function main() {
   } catch (err) { log('post-scroll host did not settle:', err.message) }
 
   // -- curate requirements down to one demonstrable requirement ------------
-  await skipPendingQuestions()
+  // The clarification host keeps running while the UI question card is
+  // exercised and can still emit requirement.draft_create rows or a follow-up
+  // batch after the first requirement list was read. Re-read the live list
+  // here (post-host settle, post-drain) and curate against it: otherwise those
+  // late drafts stay unconfirmed and the real requirement_confirmation gate
+  // keeps correctly rejecting the transition to designing.
+  await drainPendingQuestions()
   const first = requirementList.find((entry) => /首页|FR-001|blog list|首页内容/i.test(entry.title || '')) || requirementList[0]
   if (!first) throw new Error('no requirements extracted')
   state.primaryRequirementId = first.id
-  const keepIds = new Set([first.id])
-  let deleted = 0
-  for (const entry of requirementList) {
-    if (keepIds.has(entry.id)) continue
-    const del = await api('DELETE', `/api/versions/${state.versionId}/requirements/${entry.id}`)
-    if (del.status === 204 || del.status === 200) deleted++
-    else log('delete requirement skipped', entry.id, del.status)
-  }
-  log(`kept requirement ${first.id}; deleted=${deleted}`)
 
   // Fill the acceptance criteria required by the confirmation gate.
   await must('PATCH', `/api/versions/${state.versionId}/requirements/${first.id}`, {
@@ -1872,24 +1883,61 @@ async function main() {
     targets: { version_suts: [state.versionSutId], pages: [state.pageIds[0]], apis: [state.apiIds[0]] },
     reason: 'W0 e2e scope',
   })
-  await must('POST', `/api/versions/${state.versionId}/requirements/confirmations`, { requirement_ids: [first.id] })
+
+  // Keep exactly one live requirement and confirm it. The loop tolerates a
+  // clarification host that appends a draft (or a follow-up question) between
+  // the list read and the delete calls; every round re-reads the live list so
+  // the step converges to draft=0 instead of trusting one stale snapshot.
+  async function curateRequirementsToKeep(keepRequirementId) {
+    let deleted = 0
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const listed = listData(await must('GET', `/api/versions/${state.versionId}/requirements?limit=200`))
+      const live = listed.filter((entry) => entry.status !== 'obsolete')
+      for (const entry of live) {
+        if (entry.id === keepRequirementId) continue
+        const del = await api('DELETE', `/api/versions/${state.versionId}/requirements/${entry.id}`)
+        if (del.status === 204 || del.status === 200) deleted++
+        else log('delete requirement skipped', entry.id, del.status)
+      }
+      const current = listData(await must('GET', `/api/versions/${state.versionId}/requirements?limit=200`))
+      const liveAfter = current.filter((entry) => entry.status !== 'obsolete')
+      const drafts = liveAfter.filter((entry) => entry.status === 'draft' && entry.id !== keepRequirementId)
+      const keptLive = liveAfter.find((entry) => entry.id === keepRequirementId)
+      if (keptLive && drafts.length === 0 && liveAfter.length === 1) {
+        if (keptLive.status === 'draft') {
+          await must('POST', `/api/versions/${state.versionId}/requirements/confirmations`, { requirement_ids: [keepRequirementId] })
+        }
+        log(`kept requirement ${keepRequirementId}; deleted=${deleted}; live=${liveAfter.length}`)
+        return
+      }
+      log(`requirement curation not converged (drafts=${drafts.map((entry) => entry.id).join(',') || 'none'}); draining and retrying`)
+      await drainPendingQuestions()
+      await sleep(2000)
+    }
+    const last = listData(await must('GET', `/api/versions/${state.versionId}/requirements?limit=200`))
+    throw new Error(`requirement curation did not converge: live=${last.filter((entry) => entry.status !== 'obsolete').map((entry) => `${entry.id}:${entry.status}`).join(',')}`)
+  }
+  await curateRequirementsToKeep(first.id)
   state.requirementConfirmedAt = nowIso()
 
   // -- stage: ensure designing is entered (confirmation may already have
   // converged clarifying -> requirement_review), then let the design pass run.
-  await skipPendingQuestions()
+  await drainPendingQuestions()
   let stageNow = (await must('GET', `/api/versions/${state.versionId}/stage`)).data
-  for (let attempt = 0; attempt < 6 && (stageNow.stage === 'clarifying' || stageNow.stage === 'requirement_review'); attempt++) {
+  for (let attempt = 0; attempt < 8 && (stageNow.stage === 'clarifying' || stageNow.stage === 'requirement_review'); attempt++) {
     const advanced = await api('POST', `/api/versions/${state.versionId}/stage/advance`, {})
     if (advanced.status === 409) {
       const gate = advanced.json?.error?.details?.gate || ''
       log('stage advance rejected while waiting for design:', gate || advanced.status)
-      if (gate === 'requirement_gap') {
-        // A follow-up question or an open handoff gap: clear pending questions
-        // (they never block, C-2) and retry; the handoff 404 is treated as an
-        // empty gap set by the stage adapter.
-        await skipPendingQuestions()
+      if (gate === 'requirement_gap' || gate === 'requirement_confirmation') {
+        // A follow-up question, a late draft requirement or an open handoff
+        // gap: drain pending questions and curate the live requirement list
+        // again, then retry the real advance. The gate itself is never
+        // bypassed: the next iteration posts /stage/advance again.
+        await drainPendingQuestions()
+        await curateRequirementsToKeep(first.id)
         await sleep(3000)
+        stageNow = (await must('GET', `/api/versions/${state.versionId}/stage`)).data
         continue
       }
       break
