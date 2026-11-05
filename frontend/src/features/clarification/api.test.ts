@@ -12,6 +12,7 @@ import {
   deleteRequirement,
   getConversation,
   getRequirement,
+  getRequirementExtraction,
   getTeamRoom,
   listConversations,
   listMessages,
@@ -19,10 +20,14 @@ import {
   listRequirementRelations,
   listRequirements,
   mergeRequirements,
+  pauseRequirementExtraction,
   postMessage,
   reopenRequirement,
+  resumeRequirementExtraction,
+  retryRequirementExtraction,
   rollbackRequirement,
   skipQuestion,
+  startRequirementExtraction,
   updateRequirement,
   uploadContent,
 } from "./api"
@@ -514,4 +519,86 @@ describe("clarification api", () => {
       apis: [],
     })
   })
+
+  it("reads the latest extraction run and maps its typed 404 to the empty state", async () => {
+    const progress = extractionProgressFixture()
+    fetchMock.mockResolvedValue(jsonResponse({ data: progress }))
+
+    await expect(getRequirementExtraction("2001")).resolves.toEqual(progress)
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions",
+    )
+
+    fetchMock.mockResolvedValueOnce(errorResponse(404, "not_found", "no extraction run"))
+    await expect(getRequirementExtraction("2001")).resolves.toBeNull()
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await getRequirementExtraction("2001", { attachmentId: "8001" })
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions?attachment_id=8001",
+    )
+  })
+
+  it("starts, pauses, resumes and retries extraction with the pinned bodies", async () => {
+    const progress = extractionProgressFixture()
+    fetchMock.mockResolvedValue(jsonResponse({ data: { runs: [progress] } }))
+    await startRequirementExtraction("2001")
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions",
+    )
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("POST")
+    expect(readBody(fetchMock.mock.calls[0][1])).toEqual({})
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: { runs: [progress] } }))
+    await startRequirementExtraction("2001", "8001")
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({ attachment_id: "8001" })
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await pauseRequirementExtraction("2001", "9001")
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions/9001/pause",
+    )
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await resumeRequirementExtraction("2001", "9001")
+    expect(fetchMock.mock.calls[3][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions/9001/resume",
+    )
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await retryRequirementExtraction("2001", "9001")
+    expect(fetchMock.mock.calls[4][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions/9001/retry",
+    )
+    expect(fetchMock.mock.calls[4][1]?.body).toBeUndefined()
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await retryRequirementExtraction("2001", "9001", 2)
+    expect(readBody(fetchMock.mock.calls[5][1])).toEqual({ segment_seq: 2 })
+  })
 })
+
+function extractionProgressFixture() {
+  return {
+    id: "9001",
+    version_id: "2001",
+    attachment_id: "8001",
+    input_sha256: "a".repeat(64),
+    status: "done" as const,
+    total_segments: 2,
+    done_segments: 2,
+    failed_segments: 0,
+    expected: 58,
+    extracted: 58,
+    missing: 0,
+    missing_ids: [],
+    low_confidence: 2,
+    skipped_images: 1,
+    planned_count: 32,
+    planned_ids: ["FR-059"],
+    coverage: 1,
+    created_at: "2026-11-05T06:00:00Z",
+    updated_at: "2026-11-05T06:10:00Z",
+    segments: [],
+  }
+}

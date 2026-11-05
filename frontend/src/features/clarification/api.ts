@@ -1,6 +1,7 @@
 import type { StageView } from "@/features/design/types"
 import {
   type ApiDownload,
+  ApiError,
   type ApiPage,
   apiDelete,
   apiDownload,
@@ -25,6 +26,8 @@ import type {
   RequirementCreateRequest,
   RequirementDedupeResult,
   RequirementDetail,
+  RequirementExtractionProgress,
+  RequirementExtractionStartResult,
   RequirementMergeResult,
   RequirementRelation,
   RequirementStatus,
@@ -383,6 +386,77 @@ export async function listRequirementRelations(
     `${requirementPath(versionId, requirementId)}/relations`,
   )
   return page.items
+}
+
+/* --------------------------- requirement extraction ------------------------ */
+
+function extractionPath(versionId: string, runId?: string): string {
+  const base = `${versionPath(versionId)}/requirements/extractions`
+  return runId === undefined ? base : `${base}/${encodeURIComponent(runId)}`
+}
+
+/**
+ * Reads the latest requirement extraction run of the version (API-5). The
+ * backend answers a typed 404 when the version has no run yet; the UI renders
+ * its empty state for that case instead of treating it as a load failure.
+ */
+export async function getRequirementExtraction(
+  versionId: string,
+  options: { attachmentId?: string } = {},
+): Promise<RequirementExtractionProgress | null> {
+  try {
+    return await apiGet<RequirementExtractionProgress>(
+      `${extractionPath(versionId)}${query({ attachment_id: options.attachmentId })}`,
+    )
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 404) return null
+    throw cause
+  }
+}
+
+/**
+ * Triggers/replays requirement extraction (API-6). Without `attachmentId` the
+ * backend starts every ready attachment of the version; replay is idempotent by
+ * (attachment_id, input_sha256), so "重新抽取" never duplicates a run.
+ */
+export function startRequirementExtraction(
+  versionId: string,
+  attachmentId?: string,
+): Promise<RequirementExtractionStartResult> {
+  const body =
+    attachmentId === undefined || attachmentId === "" ? {} : { attachment_id: attachmentId }
+  return apiPost<RequirementExtractionStartResult>(extractionPath(versionId), body)
+}
+
+/** Pauses a pending/running extraction run (API-7; typed 409 on wrong state). */
+export function pauseRequirementExtraction(
+  versionId: string,
+  runId: string,
+): Promise<RequirementExtractionProgress> {
+  return apiPost<RequirementExtractionProgress>(`${extractionPath(versionId, runId)}/pause`)
+}
+
+/** Resumes a paused extraction run (API-7). */
+export function resumeRequirementExtraction(
+  versionId: string,
+  runId: string,
+): Promise<RequirementExtractionProgress> {
+  return apiPost<RequirementExtractionProgress>(`${extractionPath(versionId, runId)}/resume`)
+}
+
+/**
+ * Retries a failed extraction run (API-7). With `segmentSeq` only that failed
+ * segment is reset; without it every failed segment gets a fresh attempt budget.
+ */
+export function retryRequirementExtraction(
+  versionId: string,
+  runId: string,
+  segmentSeq?: number,
+): Promise<RequirementExtractionProgress> {
+  return apiPost<RequirementExtractionProgress>(
+    `${extractionPath(versionId, runId)}/retry`,
+    segmentSeq === undefined ? undefined : { segment_seq: segmentSeq },
+  )
 }
 
 /* --------------------------------- team room -------------------------------- */

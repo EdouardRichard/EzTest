@@ -145,12 +145,17 @@ type ExtractionSegment struct {
 // ExtractionStartInput is one idempotent Start call. Segments come from
 // SegmentExtraction (Task 16); DocumentText is optional and only feeds the
 // declared-FR reconciliation count (it is never persisted by this package).
+// AttachmentName/SkippedImages are optional metadata for the plan/fact
+// milestone (R-A7-10): the name feeds the plan title, the skipped-image count
+// feeds the parse fact and the reconciliation report.
 type ExtractionStartInput struct {
-	VersionID    int64
-	AttachmentID int64
-	InputSHA256  string
-	Segments     []Segment
-	DocumentText string
+	VersionID      int64
+	AttachmentID   int64
+	InputSHA256    string
+	Segments       []Segment
+	DocumentText   string
+	AttachmentName string
+	SkippedImages  int
 }
 
 // ExtractionSegmentResult is one segment processor outcome. A skipped segment
@@ -252,6 +257,13 @@ type ExtractionService struct {
 	clock      clock.Clock
 	claimBatch int
 	heartbeat  time.Duration
+
+	// Optional Task 18 projections: plan/fact milestone (R-A7-10) and the
+	// attachment-side source used by StartVersion and the terminal reconcile.
+	// They are best-effort and nil-safe in degraded assemblies.
+	plan   ExtractionPlanStore
+	facts  ExtractionFactStore
+	source ExtractionIngestSource
 }
 
 // NewExtractionService wires the worker. events may be nil (best-effort
@@ -327,7 +339,11 @@ func (s *ExtractionService) Start(ctx context.Context, input ExtractionStartInpu
 		expected := report.Expected
 		run.ExpectedCount = &expected
 	}
-	return s.repo.CreateRun(ctx, run, segments)
+	created, err := s.repo.CreateRun(ctx, run, segments)
+	if err != nil {
+		return ExtractionRun{}, err
+	}
+	return s.syncStartMilestone(ctx, created, input), nil
 }
 
 // ProcessRun drains one run deterministically: it claims batches of segments,
@@ -346,8 +362,13 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 		return ExtractionRun{}, err
 	}
 	switch run.Status {
-	case ExtractionRunPaused, ExtractionRunDone, ExtractionRunFailed:
+	case ExtractionRunPaused:
 		return run, nil
+	case ExtractionRunDone, ExtractionRunFailed:
+		// Re-running a terminal run (worker retry after a crash between the last
+		// segment transition and the milestone write) re-applies the idempotent
+		// plan/fact projection.
+		return s.syncTerminalMilestone(ctx, run), nil
 	case ExtractionRunPending:
 		transitioned, err := s.repo.TransitionRun(ctx, runID,
 			[]ExtractionRunStatus{ExtractionRunPending}, ExtractionRunRunning, s.clock.Now())
@@ -430,6 +451,9 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 			"failed_segments": final.FailedSegments,
 			"extracted_count": final.ExtractedCount,
 		})
+	}
+	if final.Status == ExtractionRunDone || final.Status == ExtractionRunFailed {
+		final = s.syncTerminalMilestone(ctx, final)
 	}
 	return final, nil
 }

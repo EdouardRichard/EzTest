@@ -333,6 +333,69 @@ export type VersionEvent = {
 /** Requirement list filter surfaced in the sidebar (closed folds in obsolete). */
 export type RequirementFilter = "all" | "draft" | "clarified" | "closed"
 
+/** Requirement extraction run status (`requirement_extraction_run.status`). */
+export type RequirementExtractionStatus = "pending" | "running" | "paused" | "done" | "failed"
+
+/** Requirement extraction segment status (`requirement_extraction_segment.status`). */
+export type RequirementExtractionSegmentStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "skipped"
+
+/** One `requirement_extraction_segment` row (no segment text on the wire). */
+export type RequirementExtractionSegment = {
+  id: string
+  run_id: string
+  seq: number
+  heading_path: string
+  char_start: number
+  char_end: number
+  text_sha256: string
+  status: RequirementExtractionSegmentStatus
+  attempts: number
+  extracted_count: number
+  error?: string
+  renewed_at?: string | null
+}
+
+/**
+ * `GET /api/versions/{id}/requirements/extractions` progress projection
+ * (API-5). `expected`/`extracted`/`missing`/`planned_count`/`low_confidence`/
+ * `skipped_images` come from the persisted reconciliation report. Planned V2
+ * ids are a separate partition and are never part of `missing_ids`.
+ */
+export type RequirementExtractionProgress = {
+  id: string
+  version_id: string
+  attachment_id: string
+  input_sha256: string
+  status: RequirementExtractionStatus
+  total_segments: number
+  done_segments: number
+  failed_segments: number
+  expected: number
+  extracted: number
+  missing: number
+  missing_ids: string[]
+  low_confidence: number
+  skipped_images: number
+  planned_count: number
+  planned_ids: string[]
+  /** extracted/expected ratio (done/total segments before expected is known), 0..1. */
+  coverage: number
+  error?: string
+  created_at: string
+  updated_at: string
+  segments: RequirementExtractionSegment[]
+}
+
+/** `POST /api/versions/{id}/requirements/extractions` response (API-6). */
+export type RequirementExtractionStartResult = {
+  runs: RequirementExtractionProgress[]
+}
+
 /** A selectable target (SUT, page or API) from the version's bindings. */
 export type TargetOption = {
   id: string
