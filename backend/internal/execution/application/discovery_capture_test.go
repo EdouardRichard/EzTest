@@ -221,6 +221,14 @@ func TestCaptureTerminalObservationsDropsQueryAndUserinfo(t *testing.T) {
 	if observation.Path != "/orders/42#/receipt" {
 		t.Fatalf("path = %q, want the query-free hash route", observation.Path)
 	}
+	if observation.ResourceTemplate != "/orders/{id}#/receipt" {
+		t.Fatalf("resource_template = %q, want /orders/{id}#/receipt", observation.ResourceTemplate)
+	}
+	for _, leaked := range []string{"secret", "token", "alice", "pw", "?"} {
+		if strings.Contains(observation.ResourceTemplate, leaked) {
+			t.Fatalf("resource_template leaked %q: %q", leaked, observation.ResourceTemplate)
+		}
+	}
 	for _, put := range fixture.content.puts {
 		payload := string(put)
 		for _, leaked := range []string{"secret", "token=", "alice", "pw"} {
@@ -250,7 +258,13 @@ func TestCaptureTerminalObservationResourceTypeMapping(t *testing.T) {
 	  {"method":"GET","url":"https://shop.example.com/font.woff2","status":200,"mime":"font/woff2","resource_type":"font"},
 	  {"method":"GET","url":"https://shop.example.com/old","status":200,"mime":"text/html; charset=utf-8","resource_type":""},
 	  {"method":"GET","url":"https://shop.example.com/legacy.html","status":200,"mime":"text/html","resource_type":""},
-	  {"method":"GET","url":"https://shop.example.com/data","status":200,"mime":"application/json","resource_type":""}
+	  {"method":"GET","url":"https://shop.example.com/data","status":200,"mime":"application/json","resource_type":""},
+	  {"method":"GET","url":"https://shop.example.com/api/stream","status":200,"mime":"text/event-stream","resource_type":"eventsource"},
+	  {"method":"GET","url":"https://shop.example.com/api/ws","status":200,"mime":"application/json","resource_type":"websocket"},
+	  {"method":"OPTIONS","url":"https://shop.example.com/api/preflight","status":204,"mime":"","resource_type":"preflight"},
+	  {"method":"GET","url":"https://shop.example.com/manifest.webmanifest","status":200,"mime":"application/manifest+json","resource_type":"manifest"},
+	  {"method":"GET","url":"https://shop.example.com/assets/logo","status":200,"mime":"image/png","resource_type":""},
+	  {"method":"GET","url":"https://shop.example.com/assets/thumb","status":200,"mime":"image/jpeg","resource_type":"other"}
 	]`)}
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
 
@@ -265,19 +279,23 @@ func TestCaptureTerminalObservationResourceTypeMapping(t *testing.T) {
 		resourceTypes[observation.Path] = observation.ResourceType
 	}
 	want := map[string]string{
-		"/page":        "page",
-		"/api/x":       "api",
-		"/api/y":       "api",
-		"/old":         "page",
-		"/legacy.html": "api",
-		"/data":        "api",
+		"/page":                 "page",
+		"/api/x":                "api",
+		"/api/y":                "api",
+		"/old":                  "page",
+		"/legacy.html":          "page", // text/html + extension is a page (M10)
+		"/data":                 "api",
+		"/api/stream":           "api", // eventsource is an api, never dropped (M8)
+		"/api/ws":               "api", // websocket is an api (M8)
+		"/api/preflight":        "api",
+		"/manifest.webmanifest": "api",
 	}
 	for path, kind := range want {
 		if got[path] != kind {
 			t.Fatalf("%s: kind = %q, want %q (all: %v)", path, got[path], kind, got)
 		}
 	}
-	for _, filtered := range []string{"/app.js", "/logo.png", "/style.css", "/font.woff2"} {
+	for _, filtered := range []string{"/app.js", "/logo.png", "/style.css", "/font.woff2", "/assets/logo", "/assets/thumb"} {
 		if _, ok := got[filtered]; ok {
 			t.Fatalf("static resource %s was not filtered", filtered)
 		}
@@ -344,5 +362,77 @@ func TestCaptureTerminalObservationsWithoutWriter(t *testing.T) {
 	}
 	if len(fixture.content.puts) != 2 {
 		t.Fatalf("sanitized evidence puts = %d, want one per active context", len(fixture.content.puts))
+	}
+}
+
+// TestCaptureTerminalObservationsAttachIdentity: the capture fills the
+// version_sut, wave and case_run identity it has; version_id and environment_id
+// stay zero for the ingest/repository layer to resolve.
+func TestCaptureTerminalObservationsAttachIdentity(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
+
+	observations := fixture.discovery.all()
+	if len(observations) == 0 {
+		t.Fatal("no observation was written")
+	}
+	for _, observation := range observations {
+		if observation.VersionSUTID != 7 {
+			t.Fatalf("version_sut_id = %d, want 7", observation.VersionSUTID)
+		}
+		if observation.WaveID != 2001 || observation.CaseRunID != 3001 {
+			t.Fatalf("wave/case_run = %d/%d, want 2001/3001", observation.WaveID, observation.CaseRunID)
+		}
+		if observation.VersionID != 0 || observation.EnvironmentID != 0 {
+			t.Fatalf("version/environment = %d/%d, want the repository to resolve them",
+				observation.VersionID, observation.EnvironmentID)
+		}
+		if observation.ResourceTemplate == "" || strings.Contains(observation.ResourceTemplate, "?") {
+			t.Fatalf("resource_template = %q, want a query-free normalized template", observation.ResourceTemplate)
+		}
+	}
+}
+
+// TestCaptureTerminalObservationsSkipsMalformedItem: per-item parsing keeps the
+// good network entries when one entry is malformed (M6).
+func TestCaptureTerminalObservationsSkipsMalformedItem(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(`[
+	  {"method":"GET","url":"https://shop.example.com/home","status":200,"mime":"text/html","resource_type":"document"},
+	  "not-an-item",
+	  {"method":"GET","url":"https://shop.example.com/api/x","status":200,"mime":"application/json","resource_type":"fetch"}
+	]`)}
+	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
+
+	calls := fixture.discovery.calls
+	if len(calls) != 2 {
+		t.Fatalf("writer calls = %d, want one per active context", len(calls))
+	}
+	for _, call := range calls {
+		if len(call) != 2 {
+			t.Fatalf("observations = %d, want the 2 good items (bad item skipped): %+v", len(call), call)
+		}
+	}
+}
+
+// TestCaptureTerminalObservationsSkipsBlockedWebSocket: the executor's
+// synthetic blocked-socket network entry (method WS) is not a real API
+// observation, so the capture skips it (M1). Real websocket/eventsource
+// resource types are still kept as api (M8).
+func TestCaptureTerminalObservationsSkipsBlockedWebSocket(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(`[
+	  {"method":"WS","url":"wss://payments.example.com/socket","status":null,"duration_ms":0,"mime":null,"resource_type":"websocket","error":"host_not_allowed"},
+	  {"method":"GET","url":"https://shop.example.com/home","status":200,"mime":"text/html","resource_type":"document"}
+	]`)}
+	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
+
+	for _, observation := range fixture.discovery.all() {
+		if observation.Path != "/home" {
+			t.Fatalf("blocked websocket leaked into observations: %+v", observation)
+		}
+	}
+	if got := len(fixture.discovery.all()); got != 2 {
+		t.Fatalf("observations = %d, want one page per active context", got)
 	}
 }

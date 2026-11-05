@@ -400,6 +400,9 @@ async function installWebSocketGuard(entry, browserContext, executorAllowedHosts
       status: null,
       duration_ms: 0,
       mime: null,
+      // Keep the network entry shape consistent with Playwright telemetry
+      // entries (W1-10 review M1); the Go capture skips method WS.
+      resource_type: "websocket",
       error: "host_not_allowed",
     })
     logger?.warn?.(

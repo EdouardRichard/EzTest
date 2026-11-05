@@ -228,6 +228,9 @@ test("a blocked WebSocket is recorded, closed and fails the action", async () =>
     const rejected = network.result.items.find((item) => item.error === "host_not_allowed")
     assert.ok(rejected, `network items must record the rejected websocket: ${JSON.stringify(network.result)}`)
     assert.match(rejected.url, /payments\.example\.com/)
+    // Every network entry carries a Playwright-style resource_type; the blocked
+    // socket is a websocket so the Go capture can classify/skip it consistently.
+    assert.equal(rejected.resource_type, "websocket")
   } finally {
     await manager.close()
   }
