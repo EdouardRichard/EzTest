@@ -1379,6 +1379,7 @@ func main() {
 		Content:       executionContent,
 		Settings:      settingsSvc,
 		IntentService:   executionIntents,
+		Planner:         executionScheduler,
 		PauseService:    executionPause,
 		HumanService:    executionHumans,
 		QuestionService: executionQuestions,

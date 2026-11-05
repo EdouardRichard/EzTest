@@ -32,6 +32,30 @@ func (r createIntentRequest) parse() (int64, execution.Purpose, error) {
 	return caseVersionID, purpose, nil
 }
 
+// startWaveRequest is POST /api/versions/{id}/waves (API-42). case_ids is the
+// optional wave scope; an absent or empty array keeps every current+confirmed
+// case (the handler calls the unselected intent scan then).
+type startWaveRequest struct {
+	CaseIDs []string `json:"case_ids"`
+}
+
+// parse converts the decimal-string case IDs; a nil/empty list means "no
+// selection". A non-decimal or non-positive ID is a 400.
+func (r startWaveRequest) parse() ([]int64, error) {
+	if len(r.CaseIDs) == 0 {
+		return nil, nil
+	}
+	caseIDs := make([]int64, 0, len(r.CaseIDs))
+	for _, raw := range r.CaseIDs {
+		caseID, err := parsePositiveIDField("case_ids", raw)
+		if err != nil {
+			return nil, err
+		}
+		caseIDs = append(caseIDs, caseID)
+	}
+	return caseIDs, nil
+}
+
 // pauseWaveRequest is POST /waves/{waveId}/pause (contract PauseWaveRequest).
 type pauseWaveRequest struct {
 	Mode   string `json:"mode"`

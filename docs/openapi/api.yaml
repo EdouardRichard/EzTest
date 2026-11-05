@@ -3444,6 +3444,63 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+    post:
+      tags: [Execution]
+      operationId: startRunWave
+      summary: 立即启动一个波次（可选 wave 级 case 选择；D1）
+      description: |
+        API-42 / R-W1-8 D1。body 可选：`case_ids` 是十进制字符串数组，空数组或缺省
+        表示全部 current+confirmed case。版本不在 executing 阶段、仍无可用 case、或已有
+        活跃 wave 时返回 409 `state_conflict`。成功后立即 plan 一个 wave 并返回其
+        id/状态/case_run 数。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                case_ids:
+                  type: array
+                  items:
+                    type: string
+                    pattern: '^[0-9]+$'
+      responses:
+        '201':
+          description: 已启动的波次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [wave_id, status, case_run_count]
+                    properties:
+                      wave_id:
+                        type: string
+                        pattern: '^[0-9]+$'
+                      status:
+                        type: string
+                        enum: [planned, running, paused, done, failed, cancelled]
+                      case_run_count:
+                        type: integer
+                        minimum: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
 
   /api/versions/{id}/waves/{waveId}:
     get:

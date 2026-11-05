@@ -83,6 +83,14 @@ type RunWaveView struct {
 	CreatedAt   string               `json:"created_at"`
 }
 
+// StartWaveView is the POST /versions/{id}/waves response (API-42): the wave
+// just started and how many case_runs it contains.
+type StartWaveView struct {
+	WaveID       string `json:"wave_id"`
+	Status       string `json:"status"`
+	CaseRunCount int    `json:"case_run_count"`
+}
+
 // IntentView is the execution_intent projection (spec §9.3).
 type IntentView struct {
 	ID            string   `json:"id"`

@@ -32,6 +32,22 @@ const (
 	settingHumanRequestTimeout = "execution.human_request_timeout_seconds"
 )
 
+// WavePlanner starts a wave for a version immediately (POST /versions/{id}/waves).
+// *executionapp.Scheduler implements it; the narrow interface keeps the handler
+// testable without building the whole scheduler.
+type WavePlanner interface {
+	ReconcileVersion(ctx context.Context, versionID int64) error
+}
+
+// WaveIntentEnsurer creates the initial execution intents a wave needs, plus the
+// manual/retest intent used by POST /execution/intents. *executionapp.
+// IntentService implements it.
+type WaveIntentEnsurer interface {
+	EnsureInitialIntents(ctx context.Context, versionID int64) (int, error)
+	EnsureInitialIntentsForCases(ctx context.Context, versionID int64, caseIDs []int64) (int, error)
+	CreateManual(ctx context.Context, versionID, caseVersionID int64, purpose execution.Purpose, actorID int64) (execution.ExecutionIntent, error)
+}
+
 // Deps is the fully wired execution surface; cmd/eztest constructs it, tests
 // build it over the real repositories/services.
 type Deps struct {
@@ -47,11 +63,15 @@ type Deps struct {
 	Content   executionapp.ContentStore
 	Settings  executionapp.SettingsReader
 
-	IntentService   *executionapp.IntentService
+	IntentService   WaveIntentEnsurer
 	PauseService    *executionapp.PauseService
 	HumanService    *executionapp.HumanService
 	QuestionService *executionapp.QuestionService
 	Registry        *executionapp.Registry
+
+	// Planner starts a wave immediately for POST /versions/{id}/waves. It is
+	// optional so degraded assemblies answer 503 instead of panicking.
+	Planner WavePlanner
 }
 
 // Handler serves the P3 execution endpoints.

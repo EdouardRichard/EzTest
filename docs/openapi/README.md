@@ -6,7 +6,7 @@ v0.22 additive 策略见下）。身份分两层：
 - **0.2.1 基线身份**：`info.version: 0.2.1`、`x-frozen: 0.2.1`；权威基线为
   **181 paths / 222 operations / 281 schemas**（events 目录口径：131 events）。
 - **v0.22 增量（additive）**：Task 37 在基线上追加 W0 契约（23 个 path item /
-  28 个 operation / 34 个 schema），当前文件为 **204 paths / 250 operations /
+  29 个 operation / 34 个 schema），当前文件为 **204 paths / 251 operations /
   315 schemas**。新增段在 `info.description` 的
   `### v0.22 W0 增量（Task 37，additive）` 中说明。
 - 公开端点 `GET /api/openapi.yaml` 原样返回本文件。
@@ -27,9 +27,10 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
 1. 0.2.1 基线的每一条 path / method / schema **必须仍然存在且语义不变**；
    不允许删除、重命名或改写 0.2.1 条目（`scripts/v021-contract-check.cjs` 断言“无缺失”）。
 2. v0.22 W0 只允许**追加**新的 path item、operation、schema 和可选字段；
-   追加内容集中在 `docs/openapi/api.yaml` 的 W0 区块，并在本 README 记录。
+   追加内容可新增 path item，也可在既有 path item 下新增 operation
+   （如 W1-7/D1 的 `POST /api/versions/{id}/waves`），并在本 README 记录。
 3. v0.22 增量本身由 `scripts/v022-contract-check.cjs` 断言：W0 的 23 个 path item /
-   28 个 operation 与关键 schema 必须存在，且文件仍保留 0.2.1 基线身份。
+   29 个 operation 与关键 schema 必须存在，且文件仍保留 0.2.1 基线身份。
 4. 基线计数 `181/222/281` 保留为本 README/历史的**基线口径**；当前文件实际计数
    允许为 `181+extras / 222+extras / 281+extras`，两个 gate 各自报告 extras。
 
@@ -38,6 +39,7 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
 - 计划写入、handoff 读取、事实仲裁、需求抽取、附件图片、绑定/多仓/版本账号；
 - 结构化提问（Host 创建/重开、用户 answer/skip）、阶段写入 request/advance/block/unblock/
   pause/resume，以及经 StageService 审计回边的硬门 reject；
+- 波次启动 `POST /api/versions/{id}/waves`（W1-7/D1，复用既有 GET path item 的 path）；
 - 对应 DTO/schema 与 `kind`/`revision` 等可选字段。
 
 ## 验证
