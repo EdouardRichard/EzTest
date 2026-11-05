@@ -488,3 +488,15 @@ func TestVersionAdapterProjectsStage(t *testing.T) {
 		t.Fatal("Get must propagate the stage read failure")
 	}
 }
+
+// NewBrowserAdapter is the test-only single-endpoint constructor kept after
+// W1-1 removed the unused production factory.
+func NewBrowserAdapter(client executorinfra.Client) *BrowserAdapter {
+	return &BrowserAdapter{client: client}
+}
+
+// NewExecutorControl is the test-only single-endpoint control constructor kept
+// after W1-1 removed the unused production factory.
+func NewExecutorControl(client executorinfra.Client) *ExecutorControlAdapter {
+	return &ExecutorControlAdapter{client: client}
+}

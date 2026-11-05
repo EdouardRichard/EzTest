@@ -11,6 +11,12 @@ import (
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 )
 
+// NewReportFinalizer is the test-only finalizer constructor kept after W1-1
+// removed the unused production factory.
+func NewReportFinalizer(svc *ReportService) *ReportFinalizer {
+	return &ReportFinalizer{svc: svc}
+}
+
 // reportToolsFixture seeds one wave report and one version report in the report
 // service fakes used by the report service tests.
 type reportToolsFixture struct {

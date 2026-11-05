@@ -15,7 +15,9 @@ func TestP1ProfilesMatchContract(t *testing.T) {
 	if len(profiles) != 1 {
 		t.Fatalf("profiles = %d, want 1 (the clarification Host; Curator/Scout were removed)", len(profiles))
 	}
-	registry := tools.NewP1Registry(tools.Deps{})
+	// W1-1 moved the unused test-only P1 constructor out of production; the
+	// superset registry still registers every P1 tool name.
+	registry := tools.NewP2Registry(tools.Deps{})
 
 	host := profiles[0]
 	if host.Key != agentapp.ProfileKeyClarificationHost || host.Name != "澄清 Host" {

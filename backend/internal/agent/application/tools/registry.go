@@ -154,11 +154,6 @@ func (e *Error) Error() string { return e.Code + ": " + e.Message }
 // Unwrap returns the optional classification sentinel.
 func (e *Error) Unwrap() error { return e.Cause }
 
-// NewError builds a structured tool error.
-func NewError(code, message string) *Error {
-	return &Error{Code: code, Message: message}
-}
-
 // Invalid builds an invalid_argument tool error for one field.
 func Invalid(field, message string) *Error {
 	err := &Error{Code: CodeInvalidArgument, Message: message}
@@ -492,11 +487,6 @@ type ResourcePage struct {
 type ResourcePort interface {
 	ListSUTs(ctx context.Context, versionID int64) ([]SUTSummary, error)
 	ListPages(ctx context.Context, versionID, versionSUTID int64) ([]ResourcePage, error)
-}
-
-// NewP1Registry registers exactly the P1 tool set (spec §5.5).
-func NewP1Registry(deps Deps) *Registry {
-	return NewRegistry(p1Tools(deps)...)
 }
 
 // NewP2Registry registers the frozen P1 tool set plus the P2 design tools.

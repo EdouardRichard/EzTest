@@ -42,12 +42,6 @@ type LLMSummarizer struct {
 	chat llmapp.ChatGateway
 }
 
-// NewLLMSummarizer wires the LLM-backed summarizer. A nil gateway is allowed;
-// Summarize then returns an error so the caller falls back deterministically.
-func NewLLMSummarizer(chat llmapp.ChatGateway) *LLMSummarizer {
-	return &LLMSummarizer{chat: chat}
-}
-
 // The context-package compaction port is narrow (no agentapp types), and
 // agentapp.Message is an alias of agentcontext.Message, so the LLM summarizer
 // satisfies it structurally. Boundary compaction can therefore inject this
@@ -1359,21 +1353,6 @@ func SelectSummaryMessages(messages []SummaryReplayMessage, coveredMessageID int
 // backwards. R-A5-12 requires the watermark to be monotonic.
 var ErrSummaryWatermarkStale = errors.New("agentapp: summary covered_message_id would move backwards")
 
-// NewCoveredMessageID applies the R-A5-12 monotonic watermark rule. A zero
-// candidate means "no new message" and keeps the previous watermark.
-func NewCoveredMessageID(previous, candidate int64) (int64, error) {
-	if previous < 0 || candidate < 0 {
-		return 0, errors.New("agentapp: summary covered_message_id must not be negative")
-	}
-	if candidate == 0 {
-		return previous, nil
-	}
-	if candidate < previous {
-		return 0, fmt.Errorf("%w: previous=%d candidate=%d", ErrSummaryWatermarkStale, previous, candidate)
-	}
-	return candidate, nil
-}
-
 // summaryOutputTokens derives the summary completion bound from summary_max.
 func summaryOutputTokens(in SummaryInput) int {
 	if in.MaxOutputTokens > 0 {
@@ -1912,11 +1891,6 @@ type SummaryLedger struct {
 	mu     sync.Mutex
 	now    func() time.Time
 	latest map[int64]SummaryRecord
-}
-
-// NewSummaryLedger returns an empty in-process summary ledger.
-func NewSummaryLedger() *SummaryLedger {
-	return &SummaryLedger{now: time.Now, latest: make(map[int64]SummaryRecord)}
 }
 
 // AppendSummary stores one summary revision under the R-A5-12 contract.

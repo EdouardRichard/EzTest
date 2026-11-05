@@ -83,7 +83,7 @@ func TestVisualAssertToolValidatesArguments(t *testing.T) {
 }
 
 func TestVisualAssertToolPropagatesPortErrors(t *testing.T) {
-	portErr := tools.NewError(tools.CodeStateConflict, "case_run is not running")
+	portErr := &tools.Error{Code: tools.CodeStateConflict, Message: "case_run is not running"}
 	tool := agenttool.NewVisualAssertTool(&fakePort{err: portErr})
 	_, err := tool.Execute(context.Background(), tools.Scope{VersionID: 10, CaseRunID: 3001}, json.RawMessage(`{"assertionId":"6001"}`))
 	if !errors.Is(err, portErr) {

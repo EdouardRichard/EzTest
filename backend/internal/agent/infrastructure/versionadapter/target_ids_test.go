@@ -61,7 +61,9 @@ func newTargetRegistry(t *testing.T) (*tools.Registry, *targetRequirementPort) {
 	requirements := &targetRequirementPort{
 		created: tools.RequirementSummary{ID: 90001, CurrentVersionID: 90002, Revision: 1, Status: "draft"},
 	}
-	return tools.NewP1Registry(tools.Deps{Resource: adapter, Requirement: requirements}), requirements
+	// W1-1 moved the unused test-only P1 constructor out of production; the
+	// superset registry still registers the P1 sut.page_list tool.
+	return tools.NewP2Registry(tools.Deps{Resource: adapter, Requirement: requirements}), requirements
 }
 
 func runTargetTool(t *testing.T, registry *tools.Registry, name, params string) (any, error) {

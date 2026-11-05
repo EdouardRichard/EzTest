@@ -36,12 +36,6 @@ type BrowserAdapter struct {
 	router *ExecutorRouter
 }
 
-// NewBrowserAdapter wires the browser executor adapter with a single client
-// (P3 single-endpoint mode).
-func NewBrowserAdapter(client executorinfra.Client) *BrowserAdapter {
-	return &BrowserAdapter{client: client}
-}
-
 // NewBrowserAdapterWithRouter wires the browser executor adapter with the P8
 // per-executor router. The router takes precedence over client.
 func NewBrowserAdapterWithRouter(router *ExecutorRouter) *BrowserAdapter {
@@ -203,11 +197,6 @@ func (a *ExecutorProbeAdapter) ListContexts(ctx context.Context) ([]executionapp
 type ExecutorControlAdapter struct {
 	client executorinfra.Client
 	router *ExecutorRouter
-}
-
-// NewExecutorControl wires the executor control adapter with a single client.
-func NewExecutorControl(client executorinfra.Client) *ExecutorControlAdapter {
-	return &ExecutorControlAdapter{client: client}
 }
 
 // NewExecutorControlWithRouter wires the P8 per-executor control adapter.

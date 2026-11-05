@@ -586,13 +586,6 @@ type ExtractionCompletionValidator struct {
 	planItemID int64
 }
 
-// NewExtractionCompletionValidator builds the extraction validator for one run
-// target. planItemID is the work item's plan item that completion writes; it is
-// runtime data and never model-supplied.
-func NewExtractionCompletionValidator(runs ExtractionReader, planItemID int64) *ExtractionCompletionValidator {
-	return &ExtractionCompletionValidator{runs: runs, planItemID: planItemID}
-}
-
 var _ Validator = (*ExtractionCompletionValidator)(nil)
 
 // Validate implements Validator.
