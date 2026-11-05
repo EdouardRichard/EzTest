@@ -562,6 +562,14 @@ export function VersionDetailPage({
     scheduleStageRefresh()
   }, [refreshVersionAndCounts, scheduleStageRefresh])
 
+  // A successful inline binding save is the same snapshot change as the
+  // `version.binding.changed` SSE event: re-read the binding and the version
+  // projection instead of trusting only the response the child applied.
+  const refreshBindingAfterSave = useCallback(() => {
+    setBindingRefreshKey((current) => current + 1)
+    refreshVersionAndCounts()
+  }, [refreshVersionAndCounts])
+
   const refreshSnapshotNow = useCallback(() => {
     if (refreshTimer.current !== null) {
       clearTimeout(refreshTimer.current)
@@ -786,7 +794,11 @@ export function VersionDetailPage({
                 <h2 className="text-sm font-semibold text-foreground">版本计划</h2>
                 <PlanPanel versionId={versionId} refreshKey={planRefreshKey} />
               </section>
-              <BindingOverview versionId={versionId} refreshKey={bindingRefreshKey} />
+              <BindingOverview
+                versionId={versionId}
+                refreshKey={bindingRefreshKey}
+                onUpdated={refreshBindingAfterSave}
+              />
               <section data-testid="version-data" aria-label="版本数据" className="space-y-3">
                 <div className="flex flex-wrap items-end justify-between gap-2">
                   <h2 className="text-sm font-semibold text-foreground">版本数据</h2>
