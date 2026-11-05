@@ -316,8 +316,8 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 98 {
-		t.Fatalf("settings count = %d, want 98 (v0.22 catalog: 85 -> 98)", len(settings))
+	if len(settings) != 91 {
+		t.Fatalf("settings count = %d, want 91 (v0.22 catalog: 85 -> 98, W1-2 removes 7 dead keys)", len(settings))
 	}
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {
