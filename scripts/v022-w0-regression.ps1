@@ -16,10 +16,19 @@
 
     Ports: API 13443, executor 13338, vision-caption proxy 13999, web 6869.
     Database: eztest_v022_w0 on PostgreSQL 5433 (reset on every run).
+
+    -W1 switches the same composition root to the v0.22 W1 end-to-end path
+    (W1-9): database eztest_v022_w1, API 13444, web 6870, logs and evidence
+    under .tmp/w1-e2e and .../evidence/w1/run, the real DeepSeek LLM (no
+    caption proxy) and a plain-text, image-free requirement fixture. The flow
+    stops at the W1 exit instead of the 14 W0 issues and ends with
+    run/w1-verdict.json. A preflight failure prints EXTERNAL-BLOCKED and exits
+    2. Without -W1 every W0 behavior is unchanged.
 #>
 param(
     [switch]$SkipBuild,
     [switch]$ReuseFlow,
+    [switch]$W1,
     [int]$DesignTimeoutSeconds = 720,
     [int]$ExecutionTimeoutSeconds = 900
 )
@@ -27,11 +36,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
-$w0 = Join-Path $repoRoot '.tmp\w0-e2e'
-$evidenceRoot = Join-Path $repoRoot 'docs\version-V0.22\acceptance\evidence\w0'
+# -W1 reuses this whole composition root on a disjoint work, evidence,
+# database and port namespace, so a W1 run never touches W0 artifacts.
+$mode = if ($W1) { 'w1' } else { 'w0' }
+$label = if ($W1) { 'W1 e2e' } else { 'W0 regression' }
+$work = Join-Path $repoRoot ('.tmp\' + $mode + '-e2e')
+$evidenceRoot = Join-Path $repoRoot ('docs\version-V0.22\acceptance\evidence\' + $mode)
 $runEvidence = Join-Path $evidenceRoot 'run'
-$fixtures = Join-Path $w0 'fixtures'
-New-Item -ItemType Directory -Force -Path $w0, $runEvidence, $fixtures | Out-Null
+$fixtures = Join-Path $work 'fixtures'
+$dbName = if ($W1) { 'eztest_v022_w1' } else { 'eztest_v022_w0' }
+$apiPort = if ($W1) { 13444 } else { 13443 }
+$webPort = if ($W1) { 6870 } else { 6869 }
+New-Item -ItemType Directory -Force -Path $work, $runEvidence, $fixtures | Out-Null
 # The run directory is the evidence of the latest execution only; scratch
 # evidence from a previous attempt must not be mistaken for the current one.
 # -ReuseFlow keeps the existing run directory and only replays the DB/verdict
@@ -41,33 +57,127 @@ if (-not $ReuseFlow) {
 }
 $flowExit = 0
 
+# UTF-8 without BOM: the evidence JSON/Markdown may carry CJK requirement
+# titles, and the Windows PowerShell 5.1 text cmdlets would rewrite them in the
+# active ANSI code page. .NET I/O keeps the bytes deterministic.
+function Write-Utf8([string]$path, [string]$text) {
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# A preflight failure is an environment defect, not a code failure: -W1 reports
+# it as EXTERNAL-BLOCKED (exit 2) with a machine-readable verdict instead of a
+# RED regression, so an operator can tell a broken host from broken code.
+function Exit-ExternalBlocked([string]$reason) {
+    $verdict = [ordered]@{
+        generatedAt     = (Get-Date -Format o)
+        flowExit        = 2
+        externalBlocked = $true
+        red             = @("EXTERNAL-BLOCKED: $reason")
+        dbCounters      = [ordered]@{}
+        llm             = [ordered]@{ model = $llmModel; base = $llmBase }
+        assertions      = [ordered]@{}
+    }
+    Write-Utf8 (Join-Path $runEvidence 'w1-verdict.json') ($verdict | ConvertTo-Json -Depth 8)
+    $report = @(
+        '# EzTest v0.22 W1 composition-root e2e',
+        '',
+        "- generatedAt: $($verdict.generatedAt)",
+        '- status: EXTERNAL-BLOCKED (exit 2)',
+        "- reason: $reason",
+        '',
+        'The W1 e2e did not run. Fix the environment (the .env keys, PostgreSQL',
+        'on 5433, the executor, the DeepSeek endpoint or the SUT checkout at',
+        'D:\project) and re-run scripts/v022-w1-e2e.ps1.'
+    ) -join [Environment]::NewLine
+    Write-Utf8 (Join-Path $runEvidence 'REPORT.md') $report
+    Write-Host 'EXTERNAL-BLOCKED'
+    Write-Host "== EXTERNAL-BLOCKED: $reason"
+    exit 2
+}
+
 function Get-EnvValue([string]$key) {
     $line = Select-String -Path (Join-Path $repoRoot '.env') -Pattern ("^" + [regex]::Escape($key) + "=(.*)$")
     if (-not $line) { throw "missing $key in .env" }
     return $line.Matches[0].Groups[1].Value
 }
 
-$dbUrl = Get-EnvValue 'EZTEST_DATABASE_URL'
-$dbPassword = [regex]::Match($dbUrl, 'postgres://[^:]+:([^@]+)@').Groups[1].Value
-$execToken = Get-EnvValue 'EZTEST_EXECUTOR_TOKEN'
-$adminPassword = Get-EnvValue 'EZTEST_ADMIN_PASSWORD'
-$sutPassword = Get-EnvValue 'SUT_PASSWORD'
-$llmKey = Get-EnvValue 'llm_api_key'
-$llmBase = Get-EnvValue 'llm_base_url'
-$llmModel = Get-EnvValue 'llm_model_name'
+try {
+    $dbUrl = Get-EnvValue 'EZTEST_DATABASE_URL'
+    $dbPassword = [regex]::Match($dbUrl, 'postgres://[^:]+:([^@]+)@').Groups[1].Value
+    $execToken = Get-EnvValue 'EZTEST_EXECUTOR_TOKEN'
+    $adminPassword = Get-EnvValue 'EZTEST_ADMIN_PASSWORD'
+    $sutPassword = Get-EnvValue 'SUT_PASSWORD'
+    $llmKey = Get-EnvValue 'llm_api_key'
+    $llmBase = Get-EnvValue 'llm_base_url'
+    $llmModel = Get-EnvValue 'llm_model_name'
+} catch {
+    if ($W1) { Exit-ExternalBlocked "cannot read .env: $($_.Exception.Message)" }
+    throw
+}
 $env:PGPASSWORD = $dbPassword
 $psql = Join-Path $repoRoot '.tools\pgsql\bin\psql.exe'
 $goExe = Join-Path $repoRoot '.tools\go\bin\go.exe'
 $nodeExe = (Get-Command node).Source
-$backendExe = Join-Path $w0 'eztest.exe'
+$backendExe = Join-Path $work 'eztest.exe'
 
-Write-Host "== W0 regression: repo=$repoRoot"
+# ---------------------------------------------------------------------------
+# 0a. W1 preflight: a missing .env key, an unreachable PostgreSQL or DeepSeek
+#     endpoint, a missing SUT checkout or a missing executor is an environment
+#     defect (EXTERNAL-BLOCKED, exit 2), never a RED regression.
+# ---------------------------------------------------------------------------
+function Invoke-W1Preflight {
+    $problems = New-Object System.Collections.Generic.List[string]
+    $envPath = Join-Path $repoRoot '.env'
+    foreach ($key in 'EZTEST_DATABASE_URL', 'EZTEST_EXECUTOR_TOKEN', 'EZTEST_ADMIN_PASSWORD', 'SUT_PASSWORD', 'llm_api_key', 'llm_base_url', 'llm_model_name') {
+        if (-not (Select-String -Path $envPath -Pattern ('^' + [regex]::Escape($key) + '=(.+)$') -ErrorAction SilentlyContinue)) {
+            $problems.Add("missing .env key: $key")
+        }
+    }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $psql -h localhost -p 5433 -U eztest -d postgres -tAc 'select 1' 2>&1 | Out-Null
+    $psqlOk = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $previous
+    if (-not $psqlOk) { $problems.Add('PostgreSQL 5433 is unreachable (psql select 1 failed)') }
+    if (-not (Test-Path -LiteralPath 'D:\project')) { $problems.Add('SUT checkout D:\project is missing') }
+    if (-not (Test-Path (Join-Path $repoRoot 'executor\src\server.mjs'))) { $problems.Add('executor/src/server.mjs is missing') }
+    if (-not $nodeExe) { $problems.Add('node is not on PATH') }
+    # The run starts the real executor on 13338. A host-provided executor on
+    # 13336 is only environment health, not a dependency of the run.
+    try {
+        $providedHealth = Invoke-RestMethod 'http://127.0.0.1:13336/healthz' -TimeoutSec 5
+        Write-Host "== preflight executor 13336: $($providedHealth.status)"
+    } catch {
+        Write-Host '== preflight executor 13336: not listening (the run starts its own on 13338)'
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        $probe = @{ model = $llmModel; messages = @(@{ role = 'user'; content = 'ping' }); max_tokens = 1; stream = $false } | ConvertTo-Json -Depth 5
+        $answer = Invoke-RestMethod -Uri ($llmBase.TrimEnd('/') + '/chat/completions') -Method Post -Headers @{ authorization = "Bearer $llmKey" } -ContentType 'application/json' -Body $probe -TimeoutSec 90
+        if (-not $answer.choices) {
+            $problems.Add("LLM probe returned no choices (base=$llmBase model=$llmModel)")
+        } else {
+            Write-Host "== preflight LLM: $llmBase model=$llmModel ok"
+        }
+    } catch {
+        $status = ''
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+        $problems.Add("LLM $llmBase (model=$llmModel) unreachable or rejected the key (status=$status): $($_.Exception.Message)")
+    }
+    if ($problems.Count -gt 0) { Exit-ExternalBlocked ($problems -join '; ') }
+}
+if ($W1) { Invoke-W1Preflight }
+
+Write-Host "== ${label}: repo=$repoRoot"
 Write-Host "== evidence=$runEvidence"
 
 # ---------------------------------------------------------------------------
 # 0. Fixtures (ASCII names; the deliverable names contain CJK characters that
-#    native curl/PowerShell 5.1 argument passing mangles).
+#    native curl/PowerShell 5.1 argument passing mangles). The W1 flow writes
+#    its own plain-text, image-free fixture (the model has no vision), so the
+#    W0 deliverable fixtures are not materialized in -W1 mode.
 # ---------------------------------------------------------------------------
+if (-not $W1) {
 $deliverables = 'D:\project\deliverables'
 $sutSources = @{
     'requirements.docx' = Join-Path $deliverables '墨栈博客系统需求文档（用户故事与BDD版）.docx'
@@ -98,23 +208,36 @@ if ($needsSubset) {
         Set-Content -Path $subsetMarker -Value '20-page subset built from requirements-full.pdf'
     }
 }
+} # end W0 fixtures
 
 # ---------------------------------------------------------------------------
 # 1. Fresh database + ports
 # ---------------------------------------------------------------------------
 if (-not $ReuseFlow) {
-foreach ($port in 13443, 13338, 13999, 6869) {
+$killPorts = if ($W1) { 13444, 13338, 13999, 6870 } else { 13443, 13338, 13999, 6869 }
+foreach ($port in $killPorts) {
     $conns = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
     foreach ($conn in $conns) { Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue }
 }
 Start-Sleep -Milliseconds 600
-& $psql -h localhost -p 5433 -U eztest -d postgres -c "DROP DATABASE IF EXISTS eztest_v022_w0" 2>&1 | Out-Null
-& $psql -h localhost -p 5433 -U eztest -d postgres -c "CREATE DATABASE eztest_v022_w0" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'could not create eztest_v022_w0' }
-$storage = Join-Path $w0 'storage'
+# psql writes the "database does not exist, skipping" NOTICE of a first-time
+# DROP to stderr; PS 5.1 turns native stderr into a terminating error under
+# $ErrorActionPreference='Stop', so the reset runs with Continue and the exit
+# code is checked explicitly.
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $psql -h localhost -p 5433 -U eztest -d postgres -c "DROP DATABASE IF EXISTS $dbName" 2>&1 | Out-Null
+& $psql -h localhost -p 5433 -U eztest -d postgres -c "CREATE DATABASE $dbName" 2>&1 | Out-Null
+$createExit = $LASTEXITCODE
+$ErrorActionPreference = $previous
+if ($createExit -ne 0) {
+    if ($W1) { Exit-ExternalBlocked "could not create database $dbName on PostgreSQL 5433" }
+    throw "could not create $dbName"
+}
+$storage = Join-Path $work 'storage'
 Remove-Item $storage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $storage | Out-Null
-Write-Host '== db eztest_v022_w0 created'
+Write-Host "== db $dbName created"
 
 # ---------------------------------------------------------------------------
 # 2. Build the composition root
@@ -132,63 +255,63 @@ if (-not $SkipBuild) {
 # 3. Service wrappers and detached start (WMI keeps the stack out of this
 #    process tree so it survives the orchestrating PowerShell invocation).
 # ---------------------------------------------------------------------------
-$runApi = Join-Path $w0 'run-api.cmd'
+$runApi = Join-Path $work 'run-api.cmd'
 @"
 @echo off
 cd /d "$repoRoot\backend"
-set EZTEST_DATABASE_URL=postgres://eztest:$dbPassword@localhost:5433/eztest_v022_w0?sslmode=disable
-set EZTEST_API_PORT=13443
-set EZTEST_WEB_PORT=6869
+set EZTEST_DATABASE_URL=postgres://eztest:$dbPassword@localhost:5433/${dbName}?sslmode=disable
+set EZTEST_API_PORT=$apiPort
+set EZTEST_WEB_PORT=$webPort
 set EZTEST_EXECUTOR_PORT=13338
 set EZTEST_STORAGE_DIR=$storage
 set EZTEST_INITIAL_ADMIN_PASSWORD=$adminPassword
 set EZTEST_ADMIN_USERNAME=admin
 set EZTEST_SNOWFLAKE_NODE_ID=7
-"$backendExe" >> "$w0\api.log" 2>&1
+"$backendExe" >> "$work\api.log" 2>&1
 "@ | Set-Content -Encoding ASCII $runApi
 
-$runExecutor = Join-Path $w0 'run-executor.cmd'
+$runExecutor = Join-Path $work 'run-executor.cmd'
 @"
 @echo off
 cd /d "$repoRoot\executor"
 set EZTEST_EXECUTOR_TOKEN=$execToken
 set EZTEST_EXECUTOR_ADDR=127.0.0.1:13338
-set EZTEST_API_URL=http://127.0.0.1:13443
-set EZTEST_EXECUTOR_NAME=w0-e2e
-"$nodeExe" src/server.mjs >> "$w0\executor.log" 2>&1
+set EZTEST_API_URL=http://127.0.0.1:$apiPort
+set EZTEST_EXECUTOR_NAME=$($mode)-e2e
+"$nodeExe" src/server.mjs >> "$work\executor.log" 2>&1
 "@ | Set-Content -Encoding ASCII $runExecutor
 
-$runProxy = Join-Path $w0 'run-vision-proxy.cmd'
+$runProxy = Join-Path $work 'run-vision-proxy.cmd'
 @"
 @echo off
-cd /d "$w0"
+cd /d "$work"
 set FAKE_LLM_PORT=13999
 set FAKE_LLM_UPSTREAM=$llmBase
 set FAKE_LLM_API_KEY=$llmKey
 set FAKE_LLM_MODEL=$llmModel
-"$nodeExe" "$w0\fake-vision-llm.mjs" >> "$w0\vision-proxy.log" 2>&1
+"$nodeExe" "$work\fake-vision-llm.mjs" >> "$work\vision-proxy.log" 2>&1
 "@ | Set-Content -Encoding ASCII $runProxy
 
-$runWeb = Join-Path $w0 'run-web.cmd'
+$runWeb = Join-Path $work 'run-web.cmd'
 @"
 @echo off
 cd /d "$repoRoot\frontend"
-set NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:13443
-"$nodeExe" "$repoRoot\frontend\node_modules\next\dist\bin\next" dev -p 6869 >> "$w0\web.log" 2>&1
+set NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:$apiPort
+"$nodeExe" "$repoRoot\frontend\node_modules\next\dist\bin\next" dev -p $webPort >> "$work\web.log" 2>&1
 "@ | Set-Content -Encoding ASCII $runWeb
 
-$restartScript = Join-Path $w0 'restart-api.ps1'
+$restartScript = Join-Path $work 'restart-api.ps1'
 @"
 `$ErrorActionPreference = 'Stop'
-`$conns = Get-NetTCPConnection -State Listen -LocalPort 13443 -ErrorAction SilentlyContinue
+`$conns = Get-NetTCPConnection -State Listen -LocalPort $apiPort -ErrorAction SilentlyContinue
 foreach (`$conn in `$conns) { Stop-Process -Id `$conn.OwningProcess -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
 `$p = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
   CommandLine = 'cmd.exe /c ""$runApi""'
-  CurrentDirectory = '$w0'
+  CurrentDirectory = '$work'
 }
 for (`$i = 0; `$i -lt 90; `$i++) {
-  try { `$r = Invoke-RestMethod 'http://127.0.0.1:13443/api/health' -TimeoutSec 2; Write-Host 'api restarted'; exit 0 } catch { Start-Sleep -Seconds 1 }
+  try { `$r = Invoke-RestMethod 'http://127.0.0.1:$apiPort/api/health' -TimeoutSec 2; Write-Host 'api restarted'; exit 0 } catch { Start-Sleep -Seconds 1 }
 }
 Write-Error 'api did not restart'
 exit 1
@@ -197,7 +320,10 @@ exit 1
 # Vision caption helper (C5: the environment has no real vision model). Text
 # requests are forwarded verbatim to the real DeepSeek endpoint from .env;
 # requests carrying image_url content get a deterministic caption so the
-# document-image pipeline can be exercised end to end.
+# document-image pipeline can be exercised end to end. The W1 flow points the
+# LLM config straight at the real endpoint and has no image-bearing fixture, so
+# the proxy is a W0-only service.
+if (-not $W1) {
 @'
 import fs from "node:fs"
 import http from "node:http"
@@ -269,7 +395,8 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { error: { message: `unknown path ${url.pathname}` } })
 })
 server.listen(port, "127.0.0.1", () => console.log(`[vision-caption-proxy] 127.0.0.1:${port} upstream=${upstream}`))
-'@ | Set-Content -Encoding UTF8 (Join-Path $w0 'fake-vision-llm.mjs')
+'@ | Set-Content -Encoding UTF8 (Join-Path $work 'fake-vision-llm.mjs')
+} # end W0 vision proxy
 
 function Start-Detached([string]$commandFile, [string]$workDir) {
     $null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
@@ -278,36 +405,56 @@ function Start-Detached([string]$commandFile, [string]$workDir) {
     }
 }
 
-Remove-Item (Join-Path $w0 'api.log') -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $w0 'executor.log') -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $w0 'web.log') -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $w0 'vision-proxy.log') -Force -ErrorAction SilentlyContinue
-Start-Detached $runProxy $w0
-Start-Detached $runExecutor (Join-Path $repoRoot 'executor')
-Start-Detached $runApi (Join-Path $repoRoot 'backend')
-Start-Detached $runWeb (Join-Path $repoRoot 'frontend')
+# W1: the composition root must outlive the orchestrating console. A WMI child
+# attaches to the caller's console, so a Ctrl+C delivered there takes the whole
+# stack down mid-run; `start /min` gives each service its own console and
+# process group instead.
+function Start-DetachedConsole([string]$name, [string]$commandFile, [string]$workDir) {
+    $null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine      = "cmd.exe /c start `"$name`" /min `"$commandFile`""
+        CurrentDirectory = $workDir
+    }
+}
+
+Remove-Item (Join-Path $work 'api.log') -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $work 'executor.log') -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $work 'web.log') -Force -ErrorAction SilentlyContinue
+if (-not $W1) {
+    Remove-Item (Join-Path $work 'vision-proxy.log') -Force -ErrorAction SilentlyContinue
+    Start-Detached $runProxy $work
+    Start-Detached $runExecutor (Join-Path $repoRoot 'executor')
+    Start-Detached $runApi (Join-Path $repoRoot 'backend')
+    Start-Detached $runWeb (Join-Path $repoRoot 'frontend')
+} else {
+    Start-DetachedConsole 'w1-executor' $runExecutor (Join-Path $repoRoot 'executor')
+    Start-DetachedConsole 'w1-api' $runApi (Join-Path $repoRoot 'backend')
+    Start-DetachedConsole 'w1-web' $runWeb (Join-Path $repoRoot 'frontend')
+}
 
 $apiReady = $false
 for ($i = 0; $i -lt 120; $i++) {
     try {
-        $health = Invoke-RestMethod 'http://127.0.0.1:13443/api/health' -TimeoutSec 2
+        $health = Invoke-RestMethod "http://127.0.0.1:$apiPort/api/health" -TimeoutSec 2
         $apiReady = $true
         Write-Host "== api ready version=$($health.data.version) db=$($health.data.db)"
         break
     } catch { Start-Sleep -Seconds 1 }
 }
 if (-not $apiReady) {
-    Get-Content (Join-Path $w0 'api.log') -Tail 40 -ErrorAction SilentlyContinue
+    Get-Content (Join-Path $work 'api.log') -Tail 40 -ErrorAction SilentlyContinue
     throw 'eztest API did not become ready'
 }
 $execReady = $false
 for ($i = 0; $i -lt 60; $i++) {
     try { $null = Invoke-RestMethod 'http://127.0.0.1:13338/healthz' -TimeoutSec 2; $execReady = $true; break } catch { Start-Sleep -Seconds 1 }
 }
-if (-not $execReady) { throw 'executor did not become ready' }
+if (-not $execReady) {
+    if ($W1) { Exit-ExternalBlocked 'the real executor did not become ready on 127.0.0.1:13338' }
+    throw 'executor did not become ready'
+}
 $webReady = $false
 for ($i = 0; $i -lt 180; $i++) {
-    try { $status = (Invoke-WebRequest -Uri 'http://127.0.0.1:6869/login' -UseBasicParsing -TimeoutSec 30).StatusCode; if ($status -eq 200) { $webReady = $true; break } } catch { Start-Sleep -Seconds 1 }
+    try { $status = (Invoke-WebRequest -Uri "http://127.0.0.1:$webPort/login" -UseBasicParsing -TimeoutSec 30).StatusCode; if ($status -eq 200) { $webReady = $true; break } } catch { Start-Sleep -Seconds 1 }
 }
 if (-not $webReady) { throw 'frontend did not become ready' }
 Write-Host '== stack ready'
@@ -315,7 +462,744 @@ Write-Host '== stack ready'
 # ---------------------------------------------------------------------------
 # 4. Run the embedded Node acceptance flow.
 # ---------------------------------------------------------------------------
-$flowPath = Join-Path $w0 'flow.mjs'
+$flowPath = Join-Path $work ($mode + '-flow.mjs')
+if ($W1) {
+# The W1 flow is a lean composition-root path: it stops after the version is
+# completed through POST /versions/{id}/waves (the W1-7 D1 route) instead of
+# the 14 W0 issues. Every step writes w1-steps.json (HTTP status, DB counters,
+# version event count, timestamp); the PowerShell phase writes w1-verdict.json.
+@'
+// EzTest v0.22 W1 composition-root e2e (W1-9).
+//
+// Composition root: fresh PostgreSQL database, real cmd/eztest, real executor,
+// real Next.js frontend, real DeepSeek endpoint from .env and the real SUT at
+// http://localhost:5173. The requirement fixture is plain text with no images:
+// the configured model is text-only, so visual evidence stays FA.
+import fs from "node:fs"
+import path from "node:path"
+import { spawnSync } from "node:child_process"
+import { createRequire } from "node:module"
+
+const BASE = process.env.W1_BASE
+const WEB = process.env.W1_WEB
+const EVIDENCE = process.env.W1_EVIDENCE
+const FIXTURES = process.env.W1_FIXTURES
+const REPO_ROOT = process.env.W1_REPO_ROOT
+const PSQL = process.env.W1_PSQL
+const DB_NAME = process.env.W1_DB
+const DB_PASSWORD = process.env.W1_DB_PASSWORD
+const ADMIN_PASSWORD = process.env.W1_ADMIN_PW
+const SUT_PASSWORD = process.env.W1_SUT_PW
+const LLM_MODEL = process.env.W1_LLM_MODEL
+const LLM_BASE = (process.env.W1_LLM_BASE || "").replace(/\/+$/, "")
+const LLM_KEY = process.env.W1_LLM_KEY
+const DESIGN_TIMEOUT = Number(process.env.W1_DESIGN_TIMEOUT || 720) * 1000
+const WAVE_TIMEOUT = Number(process.env.W1_EXEC_TIMEOUT || 900) * 1000
+const REPORT_TIMEOUT = Math.max(WAVE_TIMEOUT, 600000)
+const QUESTION_TIMEOUT = 240000
+
+const requireFromExecutor = createRequire(path.join(REPO_ROOT, 'executor', 'package.json'))
+const outDir = path.join(EVIDENCE, 'run')
+fs.mkdirSync(outDir, { recursive: true })
+
+const steps = []
+const state = { checks: {}, startedAt: new Date().toISOString() }
+let token = ''
+let lastHttp = null
+
+function log(...args) { console.log(new Date().toISOString(), ...args) }
+function saveJson(name, value) {
+  fs.writeFileSync(path.join(outDir, name), JSON.stringify(value, null, 2), 'utf8')
+}
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }
+function nowIso() { return new Date().toISOString() }
+function listData(json) { return json && Array.isArray(json.data) ? json.data : [] }
+
+// ---------------------------------------------------------------------------
+// DB counters. psql is the only way to see rows the API does not project; the
+// executor node has no PostgreSQL driver, so every step snapshot is one psql
+// call against the fresh W1 database.
+// ---------------------------------------------------------------------------
+function dbQuery(sql) {
+  const result = spawnSync(PSQL, ['-h', 'localhost', '-p', '5433', '-U', 'eztest', '-d', DB_NAME, '-tAc', sql], {
+    env: { ...process.env, PGPASSWORD: DB_PASSWORD }, encoding: 'utf8',
+  })
+  if (result.status !== 0) {
+    throw new Error(`psql failed (status=${result.status}): ${String(result.stderr || result.error?.message || '').trim().slice(0, 300)}`)
+  }
+  return String(result.stdout || '').trim()
+}
+const COUNTERS_SQL = `select json_build_object(
+  'requirements', (select count(*) from requirement),
+  'cases', (select count(*) from case_entity),
+  'planItems', (select count(*) from version_plan_item),
+  'waves', (select count(*) from run_wave),
+  'caseRuns', (select count(*) from case_run),
+  'evidenceRows', (select count(*) from evidence),
+  'events', (select count(*) from event),
+  'planEvents', (select count(*) from event where type = 'plan.item_changed'),
+  'resourceDeltaEvents', (select count(*) from event where type like 'resource.%'),
+  'scopeSnapshots', (select count(*) from run_wave where scope_snapshot <> '{}'::jsonb)
+)::text`
+function dbCounters() {
+  try { return JSON.parse(dbQuery(COUNTERS_SQL)) } catch (err) { return { error: String(err.message).slice(0, 300) } }
+}
+function versionEvents(versionId) {
+  if (!versionId) return 0
+  try { return Number(dbQuery(`select count(*) from event where channel = 'version:${versionId}'`)) } catch { return 0 }
+}
+
+function recordStep(name, detail = {}) {
+  const step = {
+    index: steps.length + 1, step: name, at: nowIso(),
+    db: dbCounters(), versionEvents: versionEvents(state.versionId), ...detail,
+  }
+  steps.push(step)
+  saveJson('w1-steps.json', steps)
+  saveJson('state.json', state)
+  log(`[STEP ${step.index}] ${name} http=${JSON.stringify(step.http)} db=${JSON.stringify(step.db)} versionEvents=${step.versionEvents}`)
+  return step
+}
+function check(name, ok, detail) {
+  state.checks[name] = { ok: !!ok, detail: detail === undefined ? '' : String(detail) }
+  saveJson('state.json', state)
+  log(`[${ok ? 'PASS' : 'RED'}] ${name}: ${detail}`)
+  return !!ok
+}
+
+async function api(method, p, body, opts = {}) {
+  const headers = { ...(opts.headers || {}) }
+  if (token) headers.authorization = `Bearer ${token}`
+  let payload
+  if (body !== undefined && body !== null) {
+    headers['content-type'] = 'application/json'
+    payload = JSON.stringify(body)
+  }
+  const res = await fetch(`${BASE}${p}`, { method, headers, body: payload })
+  const text = await res.text()
+  let json = null
+  try { json = text === '' ? null : JSON.parse(text) } catch { json = null }
+  lastHttp = { method, path: p, status: res.status }
+  return { status: res.status, json, text }
+}
+async function must(method, p, body, expected = [200, 201]) {
+  const r = await api(method, p, body)
+  if (!expected.includes(r.status)) {
+    throw new Error(`${method} ${p} -> ${r.status}: ${r.text.slice(0, 500)}`)
+  }
+  return r.json
+}
+async function waitFor(label, fn, timeoutMs = 120000, intervalMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  let last = null
+  while (Date.now() < deadline) {
+    try {
+      const value = await fn()
+      if (value) return value
+      last = value
+    } catch (err) { last = String(err) }
+    await sleep(intervalMs)
+  }
+  throw new Error(`timeout waiting for ${label} (last=${JSON.stringify(last)?.slice(0, 300)})`)
+}
+
+// ---------------------------------------------------------------------------
+// Plain-text, image-free requirement fixture (the model has no vision).
+// ---------------------------------------------------------------------------
+const REQUIREMENT_DOC = [
+  '# 墨栈博客系统 W1 验收需求（纯文本）',
+  '',
+  '本文档是 EzTest v0.22 W1 组合根端到端验收使用的纯文本需求输入。',
+  '文档不含任何图片，全部需求以用户故事与 BDD 验收标准描述。',
+  '',
+  '## FR-001 首页文章列表',
+  '作为访客，我希望在首页看到已发布文章列表，以便发现新内容。',
+  '- Given 系统中存在已发布文章',
+  '- When 访客打开首页',
+  '- Then 首页展示已发布文章标题，且列表数据来自 GET /api/v1/posts',
+  '',
+  '## FR-002 文章详情阅读',
+  '作为访客，我希望打开文章详情页阅读全文，以便完整阅读内容。',
+  '- Given 存在一篇已发布文章',
+  '- When 访客点击文章标题',
+  '- Then 详情页展示标题、正文与发布时间',
+  '',
+  '## FR-003 分类筛选',
+  '作为访客，我希望按分类筛选文章，以便只看感兴趣的主题。',
+  '- Given 首页存在多个分类',
+  '- When 访客选择某个分类',
+  '- Then 列表只展示该分类下的已发布文章',
+  '',
+  '## FR-004 登录',
+  '作为管理员，我希望使用账号密码登录后台，以便管理内容。',
+  '- Given 存在有效管理员账号',
+  '- When 管理员在登录页提交正确账号密码',
+  '- Then 进入后台管理页面',
+  '',
+  '## FR-005 空列表提示',
+  '作为访客，我希望在没有任何已发布文章时看到空状态提示，以便知道列表为空。',
+  '- Given 列表接口返回空数组',
+  '- When 访客打开首页',
+  '- Then 页面展示空状态提示而不是空白页',
+  '',
+  '## FR-006 分类列表接口',
+  '作为前端，我希望通过接口获取分类列表，以便渲染分类导航。',
+  '- Given 系统存在分类数据',
+  '- When 调用 GET /api/v1/categories',
+  '- Then 返回分类数组且状态码为 200',
+  '',
+].join('\n')
+
+// ---------------------------------------------------------------------------
+// Browser helpers (Playwright from executor/node_modules).
+// ---------------------------------------------------------------------------
+let browser = null
+let page = null
+async function ensureBrowser() {
+  if (page) return page
+  const { chromium } = requireFromExecutor('playwright')
+  try {
+    browser = await chromium.launch({ headless: true, channel: 'chrome' })
+  } catch (err) {
+    log('chrome channel unavailable, falling back to msedge:', String(err.message).split('\n')[0])
+    browser = await chromium.launch({ headless: true, channel: 'msedge' })
+  }
+  page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
+  page.setDefaultTimeout(45000)
+  return page
+}
+async function loginUi() {
+  const p = await ensureBrowser()
+  await p.goto(`${WEB}/login`, { waitUntil: 'domcontentloaded' })
+  await sleep(800)
+  if (!p.url().includes('/login')) return p
+  if (await p.locator('#username').count()) {
+    await p.fill('#username', 'admin')
+    await p.fill('#password', ADMIN_PASSWORD)
+    await p.locator('button[type=submit]').click()
+  }
+  await p.waitForURL(/\/versions/, { timeout: 60000 })
+  return p
+}
+async function screenshot(name) {
+  const p = await ensureBrowser()
+  await p.screenshot({ path: path.join(outDir, name), fullPage: true })
+  return name
+}
+async function openVersionTab(tabValue) {
+  const p = await ensureBrowser()
+  await p.goto(`${WEB}/versions/${state.versionId}?tab=${tabValue}`, { waitUntil: 'domcontentloaded' })
+  await p.waitForSelector('[data-testid="stage-bar"]', { timeout: 60000 })
+  await sleep(1500)
+  return p
+}
+
+// ---------------------------------------------------------------------------
+// Main flow.
+// ---------------------------------------------------------------------------
+async function main() {
+  const fixturePath = path.join(FIXTURES, 'w1-requirements.md')
+  fs.writeFileSync(fixturePath, REQUIREMENT_DOC, 'utf8')
+  saveJson('env.json', { base: BASE, web: WEB, llmBase: LLM_BASE, llmModel: LLM_MODEL, startedAt: state.startedAt })
+  recordStep('preflight.fixture', { http: null, fixture: 'w1-requirements.md', bytes: fs.statSync(fixturePath).size, images: 0 })
+
+  // -- login ----------------------------------------------------------------
+  const login = await must('POST', '/api/auth/login', { username: 'admin', password: ADMIN_PASSWORD })
+  token = login.data.token
+  state.adminId = login.data.user.id
+  recordStep('auth.login', { http: lastHttp, user: login.data.user.username })
+  check('login', !!token, `admin ${login.data.user.username}`)
+
+  // -- real LLM configuration ----------------------------------------------
+  const cfg = await must('POST', '/api/admin/llm/configs', {
+    name: 'w1-deepseek-real', base_url: LLM_BASE, api_key: LLM_KEY,
+    protocol: 'openai_chat_completions', is_default: true, timeout_seconds: 180, max_retries: 2,
+  })
+  state.llmConfigId = cfg.data.id
+  // The configured DeepSeek model is text-only, but the composition root
+  // requires the DEFAULT model to advertise vision so image-bearing documents
+  // can be analysed. The W1 fixture is image-free, so no image content ever
+  // reaches the model and visual acceptance stays FA. The declared flag is a
+  // composition-root requirement, recorded as such in the verdict.
+  const model = await must('POST', `/api/admin/llm/configs/${state.llmConfigId}/models`, {
+    model: LLM_MODEL, context_window: 128000, max_output: 8192,
+    supports_tools: true, supports_vision: true, supports_reasoning: false, supports_prompt_cache: false,
+  })
+  state.llmModelId = model.data.id
+  await must('PATCH', `/api/admin/llm/configs/${state.llmConfigId}`, { base_url: LLM_BASE, default_model_id: state.llmModelId })
+  const models = await must('GET', '/api/admin/llm/configs')
+  const cfgAfter = listData(models).find((entry) => entry.id === state.llmConfigId)
+  const cfgModel = cfgAfter && (cfgAfter.models || []).find((entry) => entry.id === state.llmModelId)
+  saveJson('llm-config.json', cfgAfter)
+  state.llm = { model: LLM_MODEL, base: LLM_BASE, configBaseUrl: cfgAfter?.base_url, textOnlyModel: true, declaredVision: cfgModel?.supports_vision }
+  recordStep('llm.config', { http: lastHttp, configBaseUrl: cfgAfter?.base_url, model: cfgModel?.model, declaredVision: cfgModel?.supports_vision })
+  check('llmRealEndpoint',
+    !!cfgAfter && (cfgAfter.base_url || '').replace(/\/+$/, '') === LLM_BASE && !!cfgModel && cfgModel.model === LLM_MODEL && cfgModel.supports_tools === true && cfgModel.supports_vision === true,
+    `base_url=${cfgAfter?.base_url} model=${cfgModel?.model} tools=${cfgModel?.supports_tools} declaredVision=${cfgModel?.supports_vision} (text-only endpoint; the default-model invariant requires the vision flag; image-free fixture)`)
+
+  // -- SUT / environment / resources / account ------------------------------
+  const sut = await must('POST', '/api/resources/suts', { name: '墨栈博客 W1', intro: 'v0.22 W1 e2e SUT (real composition root)' })
+  state.sutId = sut.data.id
+  const repoBackend = await must('POST', '/api/resources/code-repos', {
+    name: 'blog-backend', path: 'D:\\project\\blog-backend', branch: 'master', include: ['**/*.go'], exclude: ['node_modules'],
+  })
+  const repoFrontend = await must('POST', '/api/resources/code-repos', {
+    name: 'blog-frontend', path: 'D:\\project\\blog-frontend', branch: 'master', include: ['src/**'], exclude: ['node_modules'],
+  })
+  state.repoBackendId = repoBackend.data.id
+  state.repoFrontendId = repoFrontend.data.id
+  for (const repo of [repoBackend.data.id, repoFrontend.data.id]) {
+    await must('POST', `/api/suts/${state.sutId}/repositories`, { repository_id: repo, role: 'code' })
+  }
+  const environment = await must('POST', `/api/resources/suts/${state.sutId}/environments`, {
+    name: '本地环境', base_url: 'http://localhost:5173', is_default: true,
+  })
+  state.environmentId = environment.data.id
+  const pages = [
+    { name: '首页', url: 'http://localhost:5173/', route_template: '/' },
+    { name: '登录', url: 'http://localhost:5173/login', route_template: '/login' },
+    { name: '文章详情', url: 'http://localhost:5173/article/1', route_template: '/article/:id' },
+    { name: '后台管理', url: 'http://localhost:5173/admin', route_template: '/admin' },
+  ]
+  state.pageIds = []
+  for (const item of pages) {
+    const created = await must('POST', `/api/resources/environments/${state.environmentId}/pages`, item)
+    state.pageIds.push(created.data.id)
+  }
+  const apis = [
+    { method: 'GET', path_template: '/api/v1/posts', name: '文章列表' },
+    { method: 'GET', path_template: '/api/v1/posts/:id', name: '文章详情' },
+    { method: 'POST', path_template: '/api/v1/auth/login', name: '登录' },
+    { method: 'GET', path_template: '/api/v1/categories', name: '分类列表' },
+  ]
+  state.apiIds = []
+  for (const item of apis) {
+    const created = await must('POST', `/api/resources/environments/${state.environmentId}/apis`, item)
+    state.apiIds.push(created.data.id)
+  }
+  const database = await must('POST', `/api/resources/suts/${state.sutId}/databases`, {
+    environment_id: state.environmentId, name: 'blog-db', kind: 'postgres',
+    dsn: 'postgres://blog:REDACTED_SUT_DB_PASSWORD@REDACTED_SUT_DB_HOST:7899/blog?sslmode=disable',
+    username: 'blog', password: 'REDACTED_SUT_DB_PASSWORD', read_only: true,
+  })
+  state.databaseId = database.data.id
+  const account = await must('POST', `/api/resources/suts/${state.sutId}/accounts`, {
+    environment_id: state.environmentId, username: 'admin', password: SUT_PASSWORD, roles: ['admin'],
+  })
+  state.accountId = account.data.id
+  recordStep('resources', { http: lastHttp, sutId: state.sutId, environmentId: state.environmentId, pages: state.pageIds.length, apis: state.apiIds.length })
+  check('sutEnvironmentAccount',
+    !!state.sutId && !!state.environmentId && !!state.accountId && state.pageIds.length === 4 && state.apiIds.length === 4,
+    `sut=${state.sutId} environment=${state.environmentId} account=${state.accountId} pages=${state.pageIds.length} apis=${state.apiIds.length}`)
+
+  // -- version (environment only) -------------------------------------------
+  const version = await must('POST', '/api/versions', {
+    title: 'W1 墨栈博客组合根验收版本', description: 'v0.22 W1 e2e (real LLM + real executor + real SUT)', environment_id: state.environmentId,
+  })
+  state.versionId = version.data.id
+  const versionRead = await must('GET', `/api/versions/${state.versionId}`)
+  const binding = (versionRead.data.bindings || [])[0] || {}
+  state.versionSutId = binding.id
+  saveJson('version-binding.json', binding)
+  recordStep('version.created', { http: lastHttp, versionId: state.versionId, bindingId: state.versionSutId })
+  check('versionEnvironmentOnly',
+    !!binding.environment && binding.environment.id === state.environmentId && Array.isArray(binding.repositories) && binding.repositories.length === 2 &&
+      (binding.pages || []).length === 4 && (binding.apis || []).length === 4 && (binding.accounts || []).length === 1,
+    `environment=${binding.environment?.id} pages=${(binding.pages || []).length} apis=${(binding.apis || []).length} accounts=${(binding.accounts || []).length} repositories=${(binding.repositories || []).length}`)
+
+  // -- clarification conversation + plain-text requirement upload -----------
+  const conv = await must('POST', `/api/versions/${state.versionId}/conversations`, { kind: 'clarification', title: '需求澄清' })
+  state.conversationId = conv.data.id
+
+  async function postTextMessage(text, clientId) {
+    const r = await api('POST', `/api/versions/${state.versionId}/conversations/${state.conversationId}/messages`, {
+      client_message_id: clientId, parts: [{ type: 'text', text }],
+    })
+    if (r.status !== 201) throw new Error(`text message -> ${r.status}: ${r.text.slice(0, 300)}`)
+    return r.json
+  }
+  async function uploadContent(filePath, mime) {
+    const data = fs.readFileSync(filePath)
+    const form = new FormData()
+    form.append('file', new Blob([data], { type: mime }), path.basename(filePath))
+    const res = await fetch(`${BASE}/api/content`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: form,
+    })
+    const text = await res.text()
+    lastHttp = { method: 'POST', path: '/api/content', status: res.status }
+    if (res.status !== 201) throw new Error(`upload ${filePath} -> ${res.status}: ${text.slice(0, 300)}`)
+    return JSON.parse(text).data
+  }
+  async function postMessageAttachment(content, name, clientId) {
+    let attachmentId = null
+    const deadline = Date.now() + 240000
+    while (Date.now() < deadline) {
+      const r = await api('POST', `/api/versions/${state.versionId}/conversations/${state.conversationId}/messages`, {
+        client_message_id: clientId,
+        parts: [{ type: 'attachment', sha256: content.sha256, name, mime: content.mime, size: content.size }],
+      })
+      if (r.status === 201) return { status: 201, attachmentId, message: r.json?.data }
+      if (r.status === 409 && r.json?.error?.code === 'attachment_pending') {
+        attachmentId = r.json.error.details?.attachment_id || attachmentId
+        await sleep(2500)
+        continue
+      }
+      return { status: r.status, attachmentId, body: r.json || r.text }
+    }
+    throw new Error(`attachment ${name} stayed pending`)
+  }
+  async function waitExtraction(attachmentId, timeoutMs = 240000) {
+    if (!attachmentId) return null
+    return waitFor(`extraction of ${attachmentId}`, async () => {
+      const r = await api('GET', `/api/versions/${state.versionId}/requirements/extractions?attachment_id=${attachmentId}`)
+      if (r.status !== 200) return null
+      const run = r.json?.data
+      if (!run) return null
+      if (run.status === 'done' || run.status === 'failed' || run.status === 'skipped') return run
+      return null
+    }, timeoutMs, 2500)
+  }
+
+  const content = await uploadContent(fixturePath, 'text/plain')
+  const posted = await postMessageAttachment(content, 'w1-requirements.md', 'w1-md')
+  if (posted.status !== 201) throw new Error(`w1-requirements.md message post -> ${posted.status}: ${JSON.stringify(posted.body).slice(0, 400)}`)
+  const extraction = await waitExtraction(posted.attachmentId)
+  const extracted = extraction ? (extraction.extracted ?? extraction.extracted_count) : null
+  const expected = extraction ? (extraction.expected ?? extraction.expected_count) : null
+  state.attachment = { attachmentId: posted.attachmentId, sha256: content.sha256, size: content.size, extraction }
+  saveJson('attachments.json', state.attachment)
+  recordStep('requirement.upload.extract', { http: lastHttp, attachmentId: posted.attachmentId, extractionStatus: extraction?.status, extracted, expected })
+  check('requirementDocExtracted',
+    !!extraction && extraction.status === 'done' && Number(extracted) >= 1,
+    `attachment=${posted.attachmentId} status=${extraction?.status} extracted=${extracted}/${expected} (plain text, no images)`)
+
+  // -- clarification question (at least one answered batch) -----------------
+  async function pendingQuestions() {
+    const r = await api('GET', `/api/versions/${state.versionId}/questions`)
+    return listData(r.json).filter((batch) => batch.status === 'pending')
+  }
+  async function skipPendingQuestions() {
+    let skipped = 0
+    for (const batch of await pendingQuestions()) {
+      const res = await api('POST', `/api/versions/${state.versionId}/questions/${batch.id}/skip`, {})
+      if (res.status === 200) skipped++
+    }
+    if (skipped > 0) log(`skipped ${skipped} pending question batch(es)`)
+    return skipped
+  }
+  let question = null
+  try {
+    question = await waitFor('pending clarification question', async () => {
+      const pending = await pendingQuestions()
+      return pending.length > 0 ? pending[0] : null
+    }, QUESTION_TIMEOUT, 3000)
+  } catch (err) {
+    log('no pending question after the upload, nudging the clarification host:', String(err.message).slice(0, 160))
+    try {
+      await postTextMessage('请基于已上传的需求文档提出需要澄清的问题。', 'w1-nudge')
+      question = await waitFor('pending clarification question after nudge', async () => {
+        const pending = await pendingQuestions()
+        return pending.length > 0 ? pending[0] : null
+      }, 180000, 3000)
+    } catch (nudgeErr) {
+      log('clarification host produced no question:', String(nudgeErr.message).slice(0, 200))
+    }
+  }
+  let answeredBatch = null
+  if (question) {
+    state.questionId = question.id
+    const answers = (question.questions || []).map((item) => {
+      const firstOption = (item.options || [])[0]
+      return firstOption
+        ? { question_id: item.id, selected: [firstOption.id] }
+        : { question_id: item.id, text: '按需求文档默认值处理' }
+    })
+    const answered = await api('POST', `/api/versions/${state.versionId}/questions/${question.id}/answer`, { answers })
+    recordStep('clarification.answer', { http: lastHttp, batchId: question.id, answerStatus: answered.status, items: answers.length })
+    try {
+      answeredBatch = await waitFor('question answered', async () => {
+        const list = await api('GET', `/api/versions/${state.versionId}/questions`)
+        return listData(list.json).find((entry) => entry.status === 'answered') || null
+      }, 60000, 2000)
+    } catch (err) {
+      log('answered batch not observed:', String(err.message).slice(0, 200))
+    }
+    saveJson('question.json', { question, answeredBatch })
+  } else {
+    recordStep('clarification.answer', { http: null, batchId: null, answerStatus: null, items: 0 })
+  }
+  check('clarificationAsked', !!question, question ? `batch=${question.id} items=${(question.questions || []).length}` : 'the clarification host produced no question batch')
+  check('clarificationAnswered', !!answeredBatch, answeredBatch ? `batch=${answeredBatch.id} status=${answeredBatch.status}` : 'no answered question batch')
+  // Answering starts a host continuation that may ask follow-ups; clear them so
+  // they never block the requirement gate (C-2).
+  await skipPendingQuestions()
+  try {
+    await waitFor('clarification host runs settle', async () => {
+      const runs = await api('GET', '/api/agent-center/runs?limit=100')
+      return listData(runs.json).filter((run) => run.profile_key === 'clarification_host' && run.status === 'running').length === 0
+    }, 180000, 3000)
+    log('clarification host runs settled')
+  } catch (err) { log('clarification host did not settle:', String(err.message).slice(0, 160)) }
+
+  // -- curate + confirm requirements ----------------------------------------
+  const reqs = await must('GET', `/api/versions/${state.versionId}/requirements?limit=200`)
+  const requirementList = listData(reqs)
+  saveJson('requirements.json', reqs)
+  check('requirementsExtracted', requirementList.length >= 1, `requirements=${requirementList.length}`)
+  // Keep one requirement: the design pass converges quickly and the wave stays
+  // small. Prefer the home-list requirement the real SUT demonstrably serves;
+  // the rest are deleted so the LLM never designs cases against endpoints the
+  // SUT does not implement.
+  const preferred = requirementList.find((entry) => /首页|列表|home|FR-001/i.test(entry.title || '')) || requirementList[0]
+  const keep = [preferred]
+  let deleted = 0
+  for (const entry of requirementList) {
+    if (keep.some((kept) => kept.id === entry.id)) continue
+    const del = await api('DELETE', `/api/versions/${state.versionId}/requirements/${entry.id}`)
+    if (del.status === 204 || del.status === 200) deleted++
+  }
+  const criteria = [
+    'Given 访客打开首页 When 列表接口 GET /api/v1/posts 返回已发布文章 Then 页面展示已发布文章列表且接口返回 200',
+  ]
+  for (let index = 0; index < keep.length; index++) {
+    await must('PATCH', `/api/versions/${state.versionId}/requirements/${keep[index].id}`, {
+      title: keep[index].title,
+      description: `W1 e2e requirement ${index + 1}: ${keep[index].title}`,
+      acceptance_criteria: keep[index].acceptance_criteria || criteria[index] || criteria[0],
+      priority: 'P1',
+      constraints: { source: 'w1-e2e' },
+      targets: { version_suts: [state.versionSutId], pages: [state.pageIds[0]], apis: [state.apiIds[0]] },
+      reason: 'W1 e2e scope',
+    })
+  }
+  await must('POST', `/api/versions/${state.versionId}/requirements/confirmations`, { requirement_ids: keep.map((entry) => entry.id) })
+  state.requirementIds = keep.map((entry) => entry.id)
+  const confirmedReqs = await must('GET', `/api/versions/${state.versionId}/requirements?limit=200`)
+  // The confirmation gate counts draft==0 and clarified+closed>0; a confirmed
+  // requirement moves to clarified (the deleted ones become obsolete).
+  const currentReqs = listData(confirmedReqs).filter((entry) => entry.status !== 'obsolete')
+  const allConfirmed = currentReqs.length >= 1 && currentReqs.every((entry) => entry.status === 'clarified' || entry.status === 'closed')
+  recordStep('requirements.confirm', { http: lastHttp, kept: state.requirementIds.length, deleted, statuses: currentReqs.map((entry) => `${entry.id}:${entry.status}`) })
+  check('requirementsConfirmed', allConfirmed && state.requirementIds.length >= 1, `kept=${state.requirementIds.join(',')} deleted=${deleted} statuses=${currentReqs.map((entry) => entry.status).join(',')}`)
+
+  // -- design: advance to designing, wait for the LLM case graph ------------
+  let stageNow = (await must('GET', `/api/versions/${state.versionId}/stage`)).data
+  for (let attempt = 0; attempt < 6 && (stageNow.stage === 'clarifying' || stageNow.stage === 'requirement_review'); attempt++) {
+    const advanced = await api('POST', `/api/versions/${state.versionId}/stage/advance`, {})
+    if (advanced.status === 409) {
+      const gate = advanced.json?.error?.details?.gate || ''
+      log('stage advance rejected while waiting for design:', gate || advanced.status)
+      if (gate === 'requirement_gap') {
+        await skipPendingQuestions()
+        await sleep(3000)
+        continue
+      }
+      break
+    }
+    stageNow = (await must('GET', `/api/versions/${state.versionId}/stage`)).data
+  }
+  recordStep('stage.designing', { http: lastHttp, stage: stageNow.stage })
+  check('stageDesigning', stageNow.stage === 'designing', `stage=${stageNow.stage} after confirming ${state.requirementIds.length} requirement(s)`)
+
+  const design = await waitFor('design cases at case_review', async () => {
+    const stage = await api('GET', `/api/versions/${state.versionId}/stage`)
+    const graph = await api('GET', `/api/versions/${state.versionId}/design/graph`)
+    if (graph.status !== 200) return null
+    const requirements = graph.json?.data?.requirements || []
+    const cases = []
+    for (const requirement of requirements) {
+      for (const scenario of requirement.scenarios || []) {
+        for (const candidate of scenario.cases || []) cases.push({ requirement_id: requirement.requirement_id, ...candidate })
+      }
+    }
+    if (stage.json?.data?.stage === 'case_review' && cases.length > 0) {
+      return { stage: stage.json.data, graph: graph.json, cases }
+    }
+    return null
+  }, DESIGN_TIMEOUT, 3000)
+  saveJson('design-graph.json', design.graph)
+  const keepSet = new Set(state.requirementIds)
+  const designCases = design.cases.filter((entry) => keepSet.has(Number(entry.requirement_id)) || keepSet.has(String(entry.requirement_id)))
+  recordStep('design.cases', { http: lastHttp, stage: design.stage.stage, cases: design.cases.length, keptCases: designCases.length })
+  check('designCases', design.stage.stage === 'case_review' && design.cases.length >= 1, `stage=${design.stage.stage} cases=${design.cases.length} for requirements=${state.requirementIds.join(',')}`)
+  // Execution wants complete case versions: prefer cases that carry both steps
+  // and assertions, so the batch never aggregates to incomplete/no_assertions.
+  // Confirm exactly one case: the real SUT demonstrably serves the home list, so
+  // one passing case keeps the wave and the version-report gate clean.
+  const executable = designCases.filter((entry) => Number(entry.step_count) > 0 && Number(entry.assertion_count) > 0)
+  const ranked = executable.length > 0 ? executable : designCases
+  const homeCase = ranked.find((entry) => /首页|列表|home/i.test(entry.title || '') && !/空|错误|5xx|500|鉴权|分页|null/i.test(entry.title || ''))
+  const confirmable = [homeCase || ranked[0]].filter(Boolean)
+  if (confirmable.length === 0) throw new Error('design produced no case for the kept requirement')
+  const confirmedCases = []
+  for (let index = 0; index < confirmable.length; index++) {
+    const candidate = confirmable[index]
+    const confirm = await must('POST', `/api/versions/${state.versionId}/design/confirmations`, {
+      scope: 'case', target_id: candidate.case_id, batch_id: `w1-case-${index}`,
+    })
+    confirmedCases.push({ case_id: candidate.case_id, case_version_id: candidate.current_version_id, step_count: candidate.step_count, assertion_count: candidate.assertion_count })
+    log(`confirmed case ${candidate.case_id} (${candidate.step_count} steps, ${candidate.assertion_count} assertions) -> ${confirm.data?.confirmed?.length ?? '?'}`)
+  }
+  state.confirmedCases = confirmedCases
+  saveJson('confirmed-cases.json', confirmedCases)
+  recordStep('design.cases.confirm', { http: lastHttp, confirmed: confirmedCases.length })
+  check('designCasesConfirmed', confirmedCases.length >= 1, `confirmed=${confirmedCases.map((entry) => entry.case_id).join(',')}`)
+
+  // Keep the plan-item projection visible through the public read route.
+  const planItemsBefore = await must('GET', `/api/versions/${state.versionId}/plan-items`)
+  saveJson('plan-items.json', planItemsBefore)
+  recordStep('plan.items', { http: lastHttp, planItems: listData(planItemsBefore).length })
+  check('planItemsApi', listData(planItemsBefore).length >= 1, `GET /plan-items -> ${listData(planItemsBefore).length} item(s)`)
+
+  // The design host may still be finishing its round; let it settle before the
+  // case gate so the confirmation never races a case write.
+  try {
+    await waitFor('design host runs settle', async () => {
+      const runs = await api('GET', '/api/agent-center/runs?limit=100')
+      return listData(runs.json).filter((run) => run.profile_key === 'design_host' && run.status === 'running').length === 0
+    }, 180000, 3000)
+  } catch (err) { log('design host did not settle:', String(err.message).slice(0, 160)) }
+
+  // -- enter executing, then start the wave through POST /waves -------------
+  // Order matters: the case gate also enqueues the execute.batch stage job,
+  // which refreshes intents and would let the 1s scheduler plan a wave first.
+  // POST /waves is issued as the very next call so the W1-7 route owns the
+  // wave; the DB snapshots are taken after both calls.
+  const advance = await api('POST', `/api/versions/${state.versionId}/stage/advance`, {})
+  const advanceHttp = { ...lastHttp }
+  const waveStart = await api('POST', `/api/versions/${state.versionId}/waves`)
+  const waveHttp = { ...lastHttp }
+  state.waveId = waveStart.json?.data?.wave_id || null
+  state.waveStart = { status: waveStart.status, body: waveStart.json?.data || waveStart.text.slice(0, 400) }
+  recordStep('stage.executing', { http: advanceHttp, stage: advance.json?.data?.stage, body: advance.status === 200 ? undefined : advance.text.slice(0, 300) })
+  recordStep('wave.start', { http: waveHttp, waveId: state.waveId, status: waveStart.status, caseRunCount: waveStart.json?.data?.case_run_count, body: waveStart.status === 201 ? undefined : waveStart.text.slice(0, 300) })
+  check('stageExecuting', advance.status === 200 && advance.json?.data?.stage === 'executing', `POST /stage/advance -> ${advance.status} stage=${advance.json?.data?.stage}`)
+  check('waveStart201', waveStart.status === 201 && !!state.waveId, `POST /waves (empty body = every current+confirmed case) -> ${waveStart.status} wave_id=${state.waveId} case_run_count=${waveStart.json?.data?.case_run_count}`)
+  if (!state.waveId) throw new Error(`POST /waves did not return a wave_id: ${waveStart.status} ${waveStart.text.slice(0, 400)}`)
+
+  // -- poll the wave to a terminal status ----------------------------------
+  const wave = await waitFor('wave terminal', async () => {
+    const r = await api('GET', `/api/versions/${state.versionId}/waves/${state.waveId}`)
+    if (r.status !== 200) return null
+    const current = r.json?.data
+    return current && ['done', 'failed', 'cancelled'].includes(current.status) ? current : null
+  }, WAVE_TIMEOUT, 3000)
+  state.wave = wave
+  saveJson('wave.json', wave)
+  const caseRuns = await must('GET', `/api/versions/${state.versionId}/waves/${state.waveId}/case-runs`)
+  const runs = listData(caseRuns)
+  saveJson('wave-case-runs.json', runs)
+  state.caseRuns = runs.map((run) => ({ id: run.id, case_version_id: run.case_version_id, status: run.status }))
+  recordStep('wave.terminal', { http: lastHttp, waveId: state.waveId, status: wave.status, counts: wave.counts, caseRuns: runs.length, runStatuses: state.caseRuns.map((run) => run.status) })
+  check('waveTerminal', ['done', 'failed', 'cancelled'].includes(wave.status), `wave=${state.waveId} status=${wave.status} counts=${JSON.stringify(wave.counts)}`)
+  check('waveCaseRuns', runs.length >= 1, `case_runs=${runs.length} statuses=${state.caseRuns.map((run) => run.status).join(',')}`)
+
+  // -- stage reporting|completed, then reports/evidence, then completed ----
+  const stageAfterWave = await waitFor('stage reporting|completed', async () => {
+    const r = await api('GET', `/api/versions/${state.versionId}/stage`)
+    const stage = r.json?.data?.stage
+    return stage === 'reporting' || stage === 'completed' ? r.json.data : null
+  }, REPORT_TIMEOUT, 4000)
+  state.stageAfterWave = stageAfterWave.stage
+  recordStep('stage.afterWave', { http: lastHttp, stage: stageAfterWave.stage })
+  check('stageReporting', stageAfterWave.stage === 'reporting' || stageAfterWave.stage === 'completed', `stage=${stageAfterWave.stage}`)
+
+  const reports = await must('GET', `/api/versions/${state.versionId}/reports`)
+  const evidence = await must('GET', `/api/versions/${state.versionId}/evidence`)
+  const overview = await must('GET', `/api/versions/${state.versionId}/execution/overview`)
+  saveJson('reports.json', reports)
+  saveJson('evidence.json', evidence)
+  saveJson('execution-overview.json', overview)
+  const reportList = listData(reports)
+  const published = reportList.filter((entry) => entry.status === 'published' || entry.current_status === 'published')
+  recordStep('report.evidence', { http: lastHttp, reports: reportList.length, published: published.length, evidence: listData(evidence).length })
+  check('reportsPresent', reportList.length >= 1, `reports=${reportList.length} published=${published.length}`)
+  check('evidencePresent', listData(evidence).length >= 1, `evidence=${listData(evidence).length}`)
+
+  const finalState = await waitFor('version completed', async () => {
+    const stage = await api('GET', `/api/versions/${state.versionId}/stage`)
+    const versionState = await api('GET', `/api/versions/${state.versionId}`)
+    if (stage.json?.data?.stage === 'completed') return { stage: stage.json.data, version: versionState.json.data }
+    return null
+  }, REPORT_TIMEOUT, 5000)
+  state.finalStage = finalState.stage
+  state.finalVersion = { status: finalState.version.status, closed_at: finalState.version.closed_at }
+  recordStep('version.completed', { http: lastHttp, stage: finalState.stage.stage, status: finalState.version.status, closedAt: finalState.version.closed_at })
+  check('versionCompleted', finalState.stage.stage === 'completed' && !!finalState.version.closed_at, `stage=${finalState.stage.stage} status=${finalState.version.status} closed_at=${finalState.version.closed_at}`)
+
+  // -- public read surfaces -------------------------------------------------
+  const planItems = await must('GET', `/api/versions/${state.versionId}/plan-items`)
+  const events = await must('GET', `/api/events?channel=version:${state.versionId}`)
+  state.planItemsApi = listData(planItems).length
+  state.eventsApi = listData(events).length
+  saveJson('plan-items-final.json', planItems)
+  saveJson('events.json', events)
+  recordStep('api.reads', { http: lastHttp, planItems: state.planItemsApi, versionEventsApi: state.eventsApi })
+  check('planItemsApiNonEmpty', state.planItemsApi >= 1, `GET /plan-items -> ${state.planItemsApi}`)
+  check('eventsApiNonEmpty', state.eventsApi >= 1, `GET /api/events?channel=version:${state.versionId} -> ${state.eventsApi}`)
+
+  // -- screenshots: version page, design, execution, requirements, reports --
+  try {
+    const p = await loginUi()
+    await openVersionTab('overview')
+    await screenshot('w1-version-overview.png')
+    await openVersionTab('requirements')
+    await screenshot('w1-requirements.png')
+    await openVersionTab('design')
+    await screenshot('w1-design.png')
+    await openVersionTab('execution')
+    await screenshot('w1-execution.png')
+    await openVersionTab('reports')
+    await screenshot('w1-reports.png')
+    state.screenshots = fs.readdirSync(outDir).filter((name) => name.endsWith('.png')).sort()
+    check('screenshots', state.screenshots.length >= 3, state.screenshots.join(', '))
+  } catch (err) {
+    state.screenshots = fs.readdirSync(outDir).filter((name) => name.endsWith('.png')).sort()
+    check('screenshots', false, `screenshot flow failed: ${String(err.message).slice(0, 300)} (captured=${state.screenshots.length})`)
+  }
+
+  saveJson('state.json', state)
+  saveJson('result.json', { checks: state.checks, steps, state, finishedAt: nowIso() })
+  const failed = Object.entries(state.checks).filter(([, value]) => !value.ok)
+  log(`W1 FLOW COMPLETE: ${Object.keys(state.checks).length - failed.length} PASS / ${failed.length} RED`)
+  return failed.length === 0
+}
+
+async function shutdown(code) {
+  // Node 24 on Windows aborts on the uv async handle when process.exit races
+  // the stdout write of the final log line: close the browser and let the
+  // stream settle before the explicit exit.
+  try { if (browser) await browser.close() } catch { }
+  await sleep(500)
+  process.exit(code)
+}
+main().then((ok) => {
+  shutdown(ok ? 0 : 1)
+}).catch((err) => {
+  log('W1 FLOW FAILED:', err.stack || err.message)
+  state.error = String(err.stack || err.message)
+  saveJson('state.json', state)
+  saveJson('result.json', { checks: state.checks, steps, state, error: state.error, finishedAt: nowIso() })
+  shutdown(1)
+})
+'@ | Set-Content -Encoding UTF8 $flowPath
+
+$env:W1_BASE = "http://127.0.0.1:$apiPort"
+$env:W1_WEB = "http://127.0.0.1:$webPort"
+$env:W1_EVIDENCE = $evidenceRoot
+$env:W1_FIXTURES = $fixtures
+$env:W1_REPO_ROOT = $repoRoot
+$env:W1_PSQL = $psql
+$env:W1_DB = $dbName
+$env:W1_DB_PASSWORD = $dbPassword
+$env:W1_ADMIN_PW = $adminPassword
+$env:W1_SUT_PW = $sutPassword
+$env:W1_LLM_MODEL = $llmModel
+$env:W1_LLM_BASE = $llmBase
+$env:W1_LLM_KEY = $llmKey
+$env:W1_DESIGN_TIMEOUT = "$DesignTimeoutSeconds"
+$env:W1_EXEC_TIMEOUT = "$ExecutionTimeoutSeconds"
+} else {
 @'
 // W0 acceptance flow (Task 38). Invoked by scripts/v022-w0-regression.ps1.
 // API + DB waits in this file; DB evidence collection happens in PowerShell
@@ -1216,8 +2100,9 @@ $env:W0_SUT_PW = $sutPassword
 $env:W0_LLM_MODEL = $llmModel
 $env:W0_DESIGN_TIMEOUT = "$DesignTimeoutSeconds"
 $env:W0_EXEC_TIMEOUT = "$ExecutionTimeoutSeconds"
+} # end W0 flow
 
-Push-Location $w0
+Push-Location $work
 try {
     # PS 5.1 turns native stderr into terminating errors under
     # $ErrorActionPreference='Stop'; capture all streams to a file instead.
@@ -1233,6 +2118,250 @@ if (Test-Path (Join-Path $runEvidence 'flow.log')) {
     Get-Content (Join-Path $runEvidence 'flow.log') -Tail 30 | Write-Host
 }
 } # end -not $ReuseFlow
+
+# ---------------------------------------------------------------------------
+# 4b. W1 verdict: replay the DB/API assertions over the composition root.
+#     -W1 only. -ReuseFlow replays this phase against the kept stack/database
+#     without re-running the flow.
+# ---------------------------------------------------------------------------
+if ($W1) {
+Write-Host ''
+Write-Host '== W1 verdict phase (DB + API assertions)'
+
+$statePath = Join-Path $runEvidence 'state.json'
+$flowState = if (Test-Path $statePath) { Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
+$resultPath = Join-Path $runEvidence 'result.json'
+$flowResult = if (Test-Path $resultPath) { Get-Content $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
+
+$red = New-Object System.Collections.Generic.List[string]
+$assertions = [ordered]@{}
+$details = [ordered]@{}
+function Add-Assertion([string]$name, [bool]$ok, [string]$detail) {
+    $script:assertions[$name] = $ok
+    $script:details[$name] = $detail
+    if (-not $ok) { $script:red.Add("${name}: $detail") }
+    $status = if ($ok) { 'PASS' } else { 'RED ' }
+    Write-Host ("   [{0}] {1}: {2}" -f $status, $name, $detail)
+}
+function Db([string]$sql) {
+    return (& $psql -h localhost -p 5433 -U eztest -d $dbName -tAc $sql 2>&1 | Out-String).Trim()
+}
+
+if ($flowResult -and $flowResult.error) { $red.Add("flow: $($flowResult.error)") }
+if ($null -eq $flowResult) { $red.Add('flow produced no result.json') }
+
+# -- version / wave identity ------------------------------------------------
+$versionId = $null
+if ($flowState -and $flowState.versionId) { $versionId = [string]$flowState.versionId }
+if (-not $versionId) { try { $versionId = Db 'select id from version order by id desc limit 1' } catch { $versionId = '' } }
+$waveId = if ($flowState -and $flowState.waveId) { [string]$flowState.waveId } else { '' }
+if (-not $waveId -and $versionId) {
+    try { $waveId = Db "select id from run_wave where version_id = $versionId order by id desc limit 1" } catch { $waveId = '' }
+}
+
+$versionStage = ''
+$versionStatus = ''
+$versionClosedAt = ''
+if ($versionId) {
+    $versionParts = (Db "select stage||'|'||status||'|'||coalesce(closed_at::text,'null') from version where id = $versionId").Split('|')
+    if ($versionParts.Count -ge 3) {
+        $versionStage = $versionParts[0]
+        $versionStatus = $versionParts[1]
+        $versionClosedAt = $versionParts[2]
+    }
+}
+
+# -- DB counters (the contract names of run/w1-verdict.json) -----------------
+$rawCounters = $null
+try {
+    $rawCounters = (Db "select json_build_object('requirements',(select count(*) from requirement),'cases',(select count(*) from case_entity),'planItems',(select count(*) from version_plan_item),'waves',(select count(*) from run_wave),'caseRuns',(select count(*) from case_run),'evidenceRows',(select count(*) from evidence),'events',(select count(*) from event),'planEvents',(select count(*) from event where type = 'plan.item_changed'),'resourceDeltaEvents',(select count(*) from event where type like 'resource.%'),'scopeSnapshots',(select count(*) from run_wave where scope_snapshot <> '{}'::jsonb))::text") | ConvertFrom-Json
+} catch { $red.Add("db counters query failed: $($_.Exception.Message)") }
+$dbCounters = [ordered]@{}
+foreach ($key in 'requirements', 'cases', 'planItems', 'waves', 'caseRuns', 'evidenceRows', 'events', 'planEvents', 'resourceDeltaEvents', 'scopeSnapshots') {
+    $dbCounters[$key] = if ($rawCounters) { [int64]$rawCounters.$key } else { 0 }
+}
+
+$llmConfigBase = ''
+$llmModelRow = ''
+$llmDeclaredVision = ''
+try {
+    $llmParts = (Db "select base_url||'|'||model||'|'||supports_vision from llm_config c join llm_model m on m.config_id = c.id order by m.id asc limit 1").Split('|')
+    if ($llmParts.Count -ge 2) { $llmConfigBase = $llmParts[0]; $llmModelRow = $llmParts[1] }
+    if ($llmParts.Count -ge 3) { $llmDeclaredVision = $llmParts[2] }
+} catch { }
+
+# -- flow assertions --------------------------------------------------------
+if ($flowState -and $flowState.checks) {
+    foreach ($property in $flowState.checks.PSObject.Properties) {
+        Add-Assertion ("flow." + $property.Name) ([bool]$property.Value.ok) ([string]$property.Value.detail)
+    }
+} else {
+    Add-Assertion 'flow.checks' $false 'the flow wrote no state.checks'
+}
+Add-Assertion 'flow.flowExit' ($flowExit -eq 0) "flowExit=$flowExit"
+
+# -- DB assertions ----------------------------------------------------------
+$zeroDataDetail = ($dbCounters.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+Add-Assertion 'db.counters' (($dbCounters.Values | Measure-Object -Sum).Sum -gt 0) $zeroDataDetail
+foreach ($key in 'requirements', 'cases', 'planItems', 'waves', 'caseRuns', 'evidenceRows', 'events', 'planEvents', 'resourceDeltaEvents', 'scopeSnapshots') {
+    Add-Assertion ("db." + $key) ($dbCounters[$key] -ge 1) "$key=$($dbCounters[$key])"
+}
+
+$sutParts = (Db "select (select count(*) from sut)||'|'||(select count(*) from sut_environment)||'|'||(select count(*) from version_account)||'|'||(select count(*) from version_sut)").Split('|')
+$sutCount = if ($sutParts.Count -ge 1) { [int64]$sutParts[0] } else { 0 }
+$envCount = if ($sutParts.Count -ge 2) { [int64]$sutParts[1] } else { 0 }
+$accountCount = if ($sutParts.Count -ge 3) { [int64]$sutParts[2] } else { 0 }
+$versionSutCount = if ($sutParts.Count -ge 4) { [int64]$sutParts[3] } else { 0 }
+Add-Assertion 'db.sutEnvironmentAccount' ($sutCount -ge 1 -and $envCount -ge 1 -and $accountCount -ge 1 -and $versionSutCount -ge 1) "sut=$sutCount environments=$envCount version_accounts=$accountCount version_suts=$versionSutCount"
+
+$attachmentParts = (Db "select count(*)||'|'||count(*) filter (where extraction_status = 'done') from requirement_attachment").Split('|')
+$attachmentCount = [int64]$attachmentParts[0]
+$attachmentDone = if ($attachmentParts.Count -ge 2) { [int64]$attachmentParts[1] } else { 0 }
+$extractionParts = (Db "select count(*)||'|'||count(*) filter (where status = 'done')||'|'||count(*) filter (where status = 'done' and extracted_count = expected_count) from requirement_extraction_run").Split('|')
+$extractionCount = [int64]$extractionParts[0]
+$extractionDone = if ($extractionParts.Count -ge 2) { [int64]$extractionParts[1] } else { 0 }
+$extractionComplete = if ($extractionParts.Count -ge 3) { [int64]$extractionParts[2] } else { 0 }
+Add-Assertion 'db.requirementDocUploaded' ($attachmentCount -ge 1 -and $attachmentDone -ge 1) "requirement_attachment=$attachmentCount done=$attachmentDone (plain text, no images)"
+Add-Assertion 'db.extractionDone' ($extractionCount -ge 1 -and $extractionDone -ge 1) "requirement_extraction_run=$extractionCount status=done $extractionDone extracted==expected $extractionComplete"
+
+$waveStatus = ''
+$waveScope = ''
+if ($waveId) {
+    $waveParts = (Db "select status||'|'||coalesce(scope_snapshot::text,'{}') from run_wave where id = $waveId").Split('|')
+    if ($waveParts.Count -ge 2) { $waveStatus = $waveParts[0]; $waveScope = $waveParts[1] }
+}
+Add-Assertion 'db.waveTerminal' (@('done', 'failed', 'cancelled') -contains $waveStatus) "wave=$waveId status=$waveStatus"
+Add-Assertion 'db.waveScopeSnapshot' ($waveScope -ne '' -and $waveScope -ne '{}') "run_wave.scope_snapshot=$($waveScope.Substring(0, [Math]::Min(240, $waveScope.Length)))"
+Add-Assertion 'db.llmRealEndpoint' (($llmConfigBase.TrimEnd('/')) -eq ($llmBase.TrimEnd('/')) -and $llmModelRow -eq $llmModel) "llm_config.base_url=$llmConfigBase llm_model.model=$llmModelRow"
+Add-Assertion 'db.versionCompleted' ($versionStage -eq 'completed' -and $versionClosedAt -ne '' -and $versionClosedAt -ne 'null') "stage=$versionStage status=$versionStatus closed_at=$versionClosedAt"
+
+# -- API assertions (fresh reads, not the flow's cached state) -------------
+$apiStage = ''
+$apiPlanItems = 0
+$apiEvents = 0
+$apiError = ''
+if (-not $versionId) {
+    $apiError = 'no version id'
+} else {
+    try {
+        $loginBody = @{ username = 'admin'; password = $adminPassword } | ConvertTo-Json
+        $loginResp = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/auth/login" -Method Post -ContentType 'application/json' -Body $loginBody -TimeoutSec 30
+        $apiHeaders = @{ authorization = "Bearer $($loginResp.data.token)" }
+        $stageResp = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/versions/$versionId/stage" -Headers $apiHeaders -TimeoutSec 30
+        $planResp = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/versions/$versionId/plan-items" -Headers $apiHeaders -TimeoutSec 30
+        $eventsResp = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/events?channel=version:$versionId" -Headers $apiHeaders -TimeoutSec 30
+        $apiStage = [string]$stageResp.data.stage
+        $apiPlanItems = @($planResp.data).Count
+        $apiEvents = @($eventsResp.data).Count
+    } catch { $apiError = $_.Exception.Message }
+}
+Add-Assertion 'api.stage' ($apiStage -eq 'completed') "GET /api/versions/$versionId/stage -> '$apiStage' $apiError"
+Add-Assertion 'api.planItems' ($apiPlanItems -ge 1) "GET /api/versions/$versionId/plan-items -> $apiPlanItems"
+Add-Assertion 'api.events' ($apiEvents -ge 1) "GET /api/events?channel=version:$versionId -> $apiEvents"
+
+# -- screenshots ------------------------------------------------------------
+$screenshots = @(Get-ChildItem -Path $runEvidence -Filter 'w1-*.png' -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.Name })
+Add-Assertion 'ui.screenshots' ($screenshots.Count -ge 3) ("captured: " + ($screenshots -join ', '))
+$requiredShots = @('w1-version-overview.png', 'w1-design.png', 'w1-execution.png')
+$missingShots = @($requiredShots | Where-Object { -not (Test-Path (Join-Path $runEvidence $_)) })
+Add-Assertion 'ui.requiredScreenshots' ($missingShots.Count -eq 0) ("missing: " + ($missingShots -join ', '))
+
+# -- recorded steps ---------------------------------------------------------
+$stepsPath = Join-Path $runEvidence 'w1-steps.json'
+$steps = @()
+if (Test-Path $stepsPath) {
+    # Windows PowerShell 5.1 emits a JSON array as ONE pipeline object, so the
+    # parsed array must be assigned first: @(<pipeline>) would wrap it into a
+    # single-element array and undercount the steps.
+    $stepsParsed = Get-Content $stepsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $steps = @($stepsParsed)
+}
+Add-Assertion 'steps.recorded' ($steps.Count -ge 10) "w1-steps.json entries=$($steps.Count)"
+
+# -- verdict + report -------------------------------------------------------
+$verdict = [ordered]@{
+    generatedAt      = (Get-Date -Format o)
+    mode             = 'w1'
+    replayed         = [bool]$ReuseFlow
+    flowExit         = $flowExit
+    red              = @($red)
+    dbCounters       = $dbCounters
+    llm              = [ordered]@{ model = $llmModel; base = $llmBase; configBaseUrl = $llmConfigBase; configModel = $llmModelRow; textOnlyModel = $true; declaredVision = $llmDeclaredVision }
+    assertions       = $assertions
+    assertionDetails = $details
+    version          = [ordered]@{ id = "$versionId"; stage = $versionStage; status = $versionStatus; closedAt = $versionClosedAt }
+    wave             = [ordered]@{ id = "$waveId"; status = $waveStatus; scopeSnapshot = $waveScope }
+    steps            = @($steps | ForEach-Object { [ordered]@{ index = $_.index; step = $_.step; at = $_.at; httpStatus = $_.http.status; versionEvents = $_.versionEvents; db = $_.db } })
+}
+Write-Utf8 (Join-Path $runEvidence 'w1-verdict.json') ($verdict | ConvertTo-Json -Depth 10)
+
+$report = New-Object System.Collections.Generic.List[string]
+$report.Add('# EzTest v0.22 W1 composition-root e2e')
+$report.Add('')
+$report.Add("generatedAt: $($verdict.generatedAt)  replayed=$($ReuseFlow)")
+$report.Add("api: http://127.0.0.1:$apiPort   web: http://127.0.0.1:$webPort   database: $dbName (PostgreSQL 5433)")
+$report.Add("version: $versionId  stage=$versionStage  status=$versionStatus  closed_at=$versionClosedAt")
+$report.Add("wave: $waveId  status=$waveStatus")
+$report.Add("llm: model=$llmModel  base=$llmBase  config.base_url=$llmConfigBase  config.model=$llmModelRow  declaredVision=$llmDeclaredVision")
+$report.Add("flow exit: $flowExit")
+$report.Add('')
+$report.Add('## DB counters')
+$report.Add('')
+$report.Add('| counter | value |')
+$report.Add('| --- | --- |')
+foreach ($key in 'requirements', 'cases', 'planItems', 'waves', 'caseRuns', 'evidenceRows', 'events', 'planEvents', 'resourceDeltaEvents', 'scopeSnapshots') {
+    $report.Add("| $key | $($dbCounters[$key]) |")
+}
+$report.Add('')
+$report.Add('## Assertions')
+$report.Add('')
+$report.Add('| assertion | result | detail |')
+$report.Add('| --- | --- | --- |')
+foreach ($name in $assertions.Keys) {
+    $result = if ($assertions[$name]) { 'PASS' } else { 'RED' }
+    $report.Add("| $name | $result | $($details[$name]) |")
+}
+$report.Add('')
+$report.Add('## Steps (run/w1-steps.json)')
+$report.Add('')
+$report.Add('| # | step | HTTP | DB snapshot | version events | at |')
+$report.Add('| --- | --- | --- | --- | --- | --- |')
+foreach ($entry in $steps) {
+    $http = if ($entry.http) { "$($entry.http.method) $($entry.http.path) -> $($entry.http.status)" } else { '-' }
+    $db = ($entry.db.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '
+    $report.Add("| $($entry.index) | $($entry.step) | $http | $db | $($entry.versionEvents) | $($entry.at) |")
+}
+$report.Add('')
+$report.Add('## Screenshots')
+$report.Add('')
+foreach ($name in $screenshots) { $report.Add("- $name") }
+$report.Add('')
+$report.Add('## Reproduction')
+$report.Add('')
+$report.Add('```')
+$report.Add('powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/v022-w1-e2e.ps1            # fresh run')
+$report.Add('powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/v022-w1-e2e.ps1 -ReuseFlow # DB/API replay')
+$report.Add('```')
+$report.Add('')
+$report.Add('## Notes')
+$report.Add('')
+$report.Add('- The requirement fixture is plain text with no images (w1-requirements.md). The configured DeepSeek model is text-only, so no visual assertion is exercised and visual acceptance stays FA; the default-model vision invariant of the composition root requires the capability flag even for this image-free run.')
+$report.Add('- The execution entry point under test is POST /api/versions/{id}/waves with an empty body (every current+confirmed case), the W1-7 D1 route.')
+$report.Add('- The API, executor, web server and database are kept running after the run so -ReuseFlow can replay the assertions.')
+Write-Utf8 (Join-Path $runEvidence 'REPORT.md') (($report -join [Environment]::NewLine))
+
+Write-Host ''
+Write-Host "== W1 RED items ($($red.Count)):"
+foreach ($entry in $red) { Write-Host "   - $entry" }
+Write-Host ''
+if ($red.Count -gt 0 -or $flowExit -ne 0) {
+    Write-Host "W1 E2E: RED (evidence: $runEvidence)"
+    exit 1
+}
+Write-Host "W1 E2E: PASS (evidence: $runEvidence)"
+exit 0
+} # end -W1 verdict phase
+
 
 # ---------------------------------------------------------------------------
 # 5. Database evidence (fresh psql queries; zero rows are RED).
