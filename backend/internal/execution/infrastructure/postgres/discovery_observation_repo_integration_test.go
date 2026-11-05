@@ -440,6 +440,33 @@ func TestDiscoveryObservationListByVersion(t *testing.T) {
 	}
 }
 
+// TestDiscoveryObservationListForDeltaSnowflakeWaveID pins the W1-15 regression:
+// the delta query compared $2 with the integer literal 0, so pgx inferred int4
+// for the wave id. Real wave ids are snowflake int64 values, so every production
+// discovery-delta pass aborted with "unable to encode ... into binary format for
+// int4" and never classified a single observation. The wave/version ids here are
+// production-sized on purpose; the small ids used by the other tests masked it.
+func TestDiscoveryObservationListForDeltaSnowflakeWaveID(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	ctx := context.Background()
+	const versionID = int64(376765693154037760)
+	const waveID = int64(376765888507940864)
+	mustCreateWave(t, repo, waveID, versionID)
+	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{{
+		Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/v1/posts",
+		VersionID: versionID, VersionSUTID: 5001, WaveID: waveID, Occurrences: 1,
+	}}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	rows, err := repo.Observations.ListForDelta(ctx, versionID, waveID)
+	if err != nil {
+		t.Fatalf("ListForDelta with a snowflake wave id: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ResourceTemplate != "/api/v1/posts" {
+		t.Fatalf("rows = %+v, want the one snowflake-wave observation", rows)
+	}
+}
+
 // TestDiscoveryObservationMarkDecisionByResource covers the W1-14B write-back:
 // the confirm/reject event of a discovered resource settles every `proposed`
 // observation of that resource and kind, and nothing else. A page and an API

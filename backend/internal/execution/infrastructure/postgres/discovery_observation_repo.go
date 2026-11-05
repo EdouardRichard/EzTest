@@ -99,7 +99,7 @@ const discoveryObservationDeltaQuery = `
 	       resource_template, decision, COALESCE(resource_id, 0), COALESCE(fact_id, 0)
 	FROM execution_discovery_observation
 	WHERE version_id = $1
-	  AND ($2 = 0 OR wave_id = $2 OR decision = 'new')
+	  AND ($2::BIGINT = 0 OR wave_id = $2::BIGINT OR decision = 'new')
 	ORDER BY id ASC
 `
 
