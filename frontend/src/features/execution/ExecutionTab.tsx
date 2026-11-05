@@ -544,6 +544,9 @@ export function ExecutionTab({
   )
 
   const sseStatus = useVersionEvents(versionId, {
+    // Agent-run lifecycle events change the job/wave projection even when no
+    // wave event follows, so they join the same debounced snapshot refetch.
+    onAgentRunChanged: scheduleRefresh,
     onWaveChanged: scheduleRefresh,
     onCaseRunChanged: handleCaseRunChanged,
     onEvidenceCreated: scheduleRefresh,

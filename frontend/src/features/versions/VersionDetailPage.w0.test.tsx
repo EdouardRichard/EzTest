@@ -315,6 +315,43 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     )
   })
 
+  it("refreshes the work-item and context-packet projections from version events", async () => {
+    auth.isAdmin = true
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByTestId("work-items-panel")
+    await waitFor(() => expect(versionApi.listWorkItems).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(conversationApi.getLatestContextPacket).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      sse.handlers?.onWorkItemChanged?.({
+        type: "work_item.created",
+        payload: { work_item_id: "5001", state: "open" },
+      })
+      sse.handlers?.onContextChanged?.({
+        type: "context.compacted",
+        payload: { cached_tokens: 10 },
+      })
+    })
+
+    await waitFor(() => expect(versionApi.listWorkItems.mock.calls.length).toBe(2), { timeout: 2000 })
+    await waitFor(
+      () => expect(conversationApi.getLatestContextPacket.mock.calls.length).toBe(2),
+      { timeout: 2000 },
+    )
+  })
+
+  it("refreshes the work-item activity projection on tool.retry", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByTestId("work-items-panel")
+    await waitFor(() => expect(versionApi.listWorkItems).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      sse.handlers?.onToolRetry?.({ type: "tool.retry", payload: { attempt: 2 } })
+    })
+
+    await waitFor(() => expect(versionApi.listWorkItems.mock.calls.length).toBe(2), { timeout: 2000 })
+  })
+
   it("routes the legacy stage event name through the same refresh", async () => {
     render(<VersionDetailPage versionId="2001" />)
     await screen.findByTestId("stage-bar")

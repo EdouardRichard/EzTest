@@ -261,6 +261,21 @@ describe("ExecutionTab", () => {
     expect(api.listWaves).toHaveBeenCalledTimes(2)
   })
 
+  it("refetches the snapshot when an agent run changes", async () => {
+    render(<ExecutionTab versionId="2001" />)
+    await screen.findByRole("heading", { name: "波次 #9201" })
+    expect(events.handlers).not.toBeNull()
+    expect(api.getOverview).toHaveBeenCalledTimes(1)
+
+    events.handlers?.onAgentRunChanged?.({
+      type: "agent.run.started",
+      payload: { agent_run_id: "9601" },
+    })
+
+    await waitFor(() => expect(api.getOverview).toHaveBeenCalledTimes(2), { timeout: 3000 })
+    expect(api.listWaves).toHaveBeenCalledTimes(2)
+  })
+
   it("switches the selected wave and writes the deep link into the URL", async () => {
     render(<ExecutionTab versionId="2001" />)
     await screen.findByRole("heading", { name: "波次 #9201" })

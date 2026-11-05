@@ -407,6 +407,10 @@ export function VersionDetailPage({
   const [planRefreshKey, setPlanRefreshKey] = useState(0)
   const [bindingRefreshKey, setBindingRefreshKey] = useState(0)
   const [attachmentRefreshKey, setAttachmentRefreshKey] = useState(0)
+  // Work-item rows carry the job/run projection, so both `work_item.*` and
+  // `tool.retry` refresh them; the admin-only context packet has its own nonce.
+  const [workItemsRefreshKey, setWorkItemsRefreshKey] = useState(0)
+  const [contextRefreshKey, setContextRefreshKey] = useState(0)
   const [pendingQuestions, setPendingQuestions] = useState<QuestionBatch[]>([])
 
   // `?case=` / `?conversation=` deep links for the design workspace. The route
@@ -599,6 +603,11 @@ export function VersionDetailPage({
       refreshVersionAndCounts()
     },
     onAttachmentImageChanged: () => setAttachmentRefreshKey((current) => current + 1),
+    onWorkItemChanged: () => setWorkItemsRefreshKey((current) => current + 1),
+    onContextChanged: () => setContextRefreshKey((current) => current + 1),
+    // A tool retry re-runs one tool inside an agent run; the work-item rows show
+    // the run/activity projection, so they refetch on the same nonce.
+    onToolRetry: () => setWorkItemsRefreshKey((current) => current + 1),
     onRequirementChanged: refreshVersionAndStage,
     onIssueChanged: refreshCountsOnly,
     onReportChanged: refreshCountsOnly,
@@ -609,6 +618,8 @@ export function VersionDetailPage({
       setPlanRefreshKey((current) => current + 1)
       setBindingRefreshKey((current) => current + 1)
       setAttachmentRefreshKey((current) => current + 1)
+      setWorkItemsRefreshKey((current) => current + 1)
+      setContextRefreshKey((current) => current + 1)
     },
   })
 
@@ -792,11 +803,11 @@ export function VersionDetailPage({
                   <WorkItemsPanel
                     versionId={versionId}
                     initialWorkItemId={versionWorkItemId}
-                    refreshKey={planRefreshKey}
+                    refreshKey={workItemsRefreshKey}
                   />
                 </div>
                 {isAdmin ? (
-                  <ContextPacketCard versionId={versionId} refreshKey={planRefreshKey} />
+                  <ContextPacketCard versionId={versionId} refreshKey={contextRefreshKey} />
                 ) : null}
               </section>
               {pendingQuestions.length > 0 ? (

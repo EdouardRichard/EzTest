@@ -19,10 +19,11 @@
  *     `startsWith("<prefix>")` (and the type begins with that prefix);
  *   - system entries: the evidence file is exactly
  *     backend/internal/eventing/application/system_consumer.go, that file
- *     contains the `"system"` channel guard and a structured log call, and the
- *     entry's channel is `system`;
+ *     compares the event channel to `"system"` (not merely containing the
+ *     literal), counts observed events (`SystemEventCount`/`Add(`) and has a
+ *     structured log call, and the entry's channel is `system`;
  *   - Topbar.tsx has a non-empty system-channel `onEvent` implementation that
- *     logs (`console.`) or refreshes (`refresh`).
+ *     both logs (`console.`) and refreshes (`refresh`) on every event.
  *
  * Exit 0 = all registered and source-verified, 1 = any problem.
  */
@@ -82,6 +83,11 @@ function onEventBodies(source) {
     bodies.push(source.slice(brace + 1, cursor - 1))
   }
   return bodies
+}
+
+/** Drop comments so a prose mention of `refresh` cannot satisfy the check. */
+function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1")
 }
 
 function main() {
@@ -192,13 +198,21 @@ function main() {
     if (entry.channel !== "system") {
       problems.push('system entry channel must be "system": ' + type)
     }
-    const source = systemConsumerRead()
-    if (!source.includes('"system"')) {
-      problems.push(SYSTEM_CONSUMER + ' must contain the "system" channel guard')
-    }
-    if (!/(?:logger|log)\.(?:Debug|DebugContext|Info|InfoContext|Warn|WarnContext|Error|ErrorContext)\s*\(/.test(source)) {
-      problems.push(SYSTEM_CONSUMER + " must contain a structured log call")
-    }
+  }
+
+  // The system consumer is shared by every system entry, so verify its
+  // behaviour once. Matching the `"system"` literal alone would accept a
+  // consumer that logs a literal and drops every event, so require the real
+  // channel comparison and the counter that proves the event was observed.
+  const systemSource = systemConsumerRead()
+  if (!/(?:==|!=)\s*"system"/.test(systemSource)) {
+    problems.push(SYSTEM_CONSUMER + ' must compare the event channel to "system" (e.g. `channel == "system"`)')
+  }
+  if (!/(?:SystemEventCount\s*\(|\.Add\s*\()/.test(systemSource)) {
+    problems.push(SYSTEM_CONSUMER + " must count observed events (SystemEventCount/Add())")
+  }
+  if (!/(?:logger|log)\.(?:Debug|DebugContext|Info|InfoContext|Warn|WarnContext|Error|ErrorContext)\s*\(/.test(systemSource)) {
+    problems.push(SYSTEM_CONSUMER + " must contain a structured log call")
   }
 
   let topbar = ""
@@ -207,11 +221,14 @@ function main() {
   } catch (error) {
     problems.push("cannot read " + TOPBAR + ": " + (error && error.message ? error.message : String(error)))
   }
-  const topbarWired = onEventBodies(topbar).some(
-    (body) => body.trim().length > 0 && (body.includes("console.") || body.includes("refresh")),
-  )
+  const topbarWired = onEventBodies(topbar).some((body) => {
+    const code = stripComments(body).trim()
+    return code.length > 0 && code.includes("console.") && code.includes("refresh")
+  })
   if (!topbarWired) {
-    problems.push(TOPBAR + " system-channel onEvent must log (console.) or refresh (refresh): implementation is empty")
+    problems.push(
+      TOPBAR + " system-channel onEvent must both log (console.) and refresh (refresh): implementation is incomplete",
+    )
   }
 
   const ui = [...byType.values()].filter((entry) => entry.consumer === "ui").length
