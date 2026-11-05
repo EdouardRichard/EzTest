@@ -620,9 +620,10 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 
 	// v0.22 DB-14/DB-15: accounts are a global pool and a version opts into a
 	// subset through version_account; the role keys are the enabled accounts'
-	// roles, not per-binding role labels.
+	// trimmed roles, not per-binding role labels. Trimming here keeps a stored
+	// " buyer " role identical to the knowledge binding key "buyer".
 	rows, err = tx.Query(ctx, `
-		SELECT DISTINCT role
+		SELECT DISTINCT btrim(role) AS role
 		FROM version_account va
 		JOIN test_account a ON a.id = va.account_id
 		CROSS JOIN LATERAL jsonb_array_elements_text(a.roles) AS role
@@ -639,7 +640,9 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 			rows.Close()
 			return scope, fmt.Errorf("scan briefing account role: %w", err)
 		}
-		scope.accountRoles[role] = struct{}{}
+		if role = strings.TrimSpace(role); role != "" {
+			scope.accountRoles[role] = struct{}{}
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

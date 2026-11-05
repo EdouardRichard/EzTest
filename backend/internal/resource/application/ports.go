@@ -20,8 +20,10 @@ type CatalogReader interface {
 }
 
 // UsageChecker answers whether a resource is still referenced by a version
-// binding. The version context implements it; the resource context never
-// imports the version package.
+// binding. A page/API/database guard blocks resources that are inside a bound
+// environment's effective range (approved/active and not scope-excluded); an
+// explicitly excluded resource is not part of the version range. The version
+// context implements it; the resource context never imports the version package.
 type UsageChecker interface {
 	SUTInUse(context.Context, int64) (bool, error)
 	EnvironmentInUse(context.Context, int64) (bool, error)

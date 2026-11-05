@@ -44,13 +44,21 @@ func NewBindingHandler(svc BindingService) *BindingHandler {
 	return &BindingHandler{svc: svc}
 }
 
-// RegisterBindingRoutes mounts the binding read/update routes on mux. A nil
-// handler, mux or authentication middleware leaves the route table unchanged;
-// the Task 37 server assembly owns the middleware value. Both PUT and PATCH are
-// mounted because the design spec names the write as PATCH while the W0 task
-// description names PUT; both share the same partial-update semantics.
+// RegisterBindingRoutes mounts the binding read/update routes on mux for Task
+// 37. Both PUT and PATCH are mounted because the design spec names the write as
+// PATCH while the W0 task description names PUT; both share the same
+// partial-update semantics. A nil mux or authentication middleware is a wiring
+// bug (an authenticated route must never be silently unmounted), so the helper
+// panics; a nil handler keeps the route table of a deployment without the
+// binding context.
 func RegisterBindingRoutes(mux *http.ServeMux, auth func(http.Handler) http.Handler, h *BindingHandler) {
-	if mux == nil || auth == nil || h == nil {
+	if mux == nil {
+		panic("versionapi: RegisterBindingRoutes requires a non-nil mux")
+	}
+	if auth == nil {
+		panic("versionapi: RegisterBindingRoutes requires an authentication middleware")
+	}
+	if h == nil {
 		return
 	}
 	mux.Handle("GET /api/versions/{id}/binding", auth(http.HandlerFunc(h.Get)))
@@ -210,6 +218,15 @@ type bindingRepoRowDTO struct {
 	Source     string            `json:"source"`
 }
 
+// bindingSnapshotDTO is the R-C4-1 snapshot projection. scope_version is the
+// deterministic reference of the current effective scope; frozen_wave_id stays
+// null in W0 because the frozen wave snapshot is execution-owned (R-C5/API-19,
+// run_wave.scope_snapshot) and is not read by the version context.
+type bindingSnapshotDTO struct {
+	ScopeVersion string  `json:"scope_version"`
+	FrozenWaveID *string `json:"frozen_wave_id"`
+}
+
 type bindingOverviewDTO struct {
 	VersionID          string              `json:"version_id"`
 	Stage              string              `json:"stage"`
@@ -224,6 +241,7 @@ type bindingOverviewDTO struct {
 	Accounts           []accountDTO        `json:"accounts"`
 	Repositories       []bindingRepoRowDTO `json:"repositories"`
 	CodeBaselineCommit *string             `json:"code_baseline_commit"`
+	Snapshot           bindingSnapshotDTO  `json:"snapshot"`
 }
 
 func toBindingOverviewDTO(overview versionapp.BindingOverview) bindingOverviewDTO {
@@ -252,6 +270,11 @@ func toBindingOverviewDTO(overview versionapp.BindingOverview) bindingOverviewDT
 			Source:     repository.Source,
 		})
 	}
+	var frozenWaveID *string
+	if overview.Snapshot.FrozenWaveID != nil {
+		formatted := strconv.FormatInt(*overview.Snapshot.FrozenWaveID, 10)
+		frozenWaveID = &formatted
+	}
 	return bindingOverviewDTO{
 		VersionID:    strconv.FormatInt(overview.VersionID, 10),
 		Stage:        string(overview.Stage),
@@ -270,6 +293,10 @@ func toBindingOverviewDTO(overview versionapp.BindingOverview) bindingOverviewDT
 		Accounts:           accounts,
 		Repositories:       repositories,
 		CodeBaselineCommit: formatOptionalString(overview.CodeBaselineCommit),
+		Snapshot: bindingSnapshotDTO{
+			ScopeVersion: overview.Snapshot.ScopeVersion,
+			FrozenWaveID: frozenWaveID,
+		},
 	}
 }
 

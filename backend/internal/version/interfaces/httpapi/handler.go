@@ -72,7 +72,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request createVersionRequest
-	if err := decodeBody(w, r, &request); err != nil {
+	if err := decodeStrictBody(w, r, &request); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
@@ -231,6 +231,18 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err := decoder.Decode(dst); err != nil {
 		return platform.Invalid("body", "request body must be a valid JSON object")
+	}
+	return nil
+}
+
+// decodeStrictBody rejects unknown JSON fields. API-15 version creation uses it
+// so the 0.21 payload (bindings/pages/apis/accounts/repositories) fails with a
+// typed 400 instead of being silently ignored.
+func decodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return platform.Invalid("body", "request body must be a valid JSON object with only the documented fields")
 	}
 	return nil
 }

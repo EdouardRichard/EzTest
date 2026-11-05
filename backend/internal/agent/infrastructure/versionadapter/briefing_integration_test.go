@@ -112,8 +112,10 @@ func TestBriefingReaderSQL(t *testing.T) {
 		t.Fatalf("execution = %#v", source.Execution)
 	}
 
-	// Approved knowledge, top-K with binding and system-scope filtering.
-	wantKnowledge := []int64{11001, 11002, 11005, 11008, 11009}
+	// Approved knowledge, top-K with binding and system-scope filtering. The
+	// account-role bindings prove the trimmed role keys: the fixture stores
+	// " buyer " / " auditor ", and 11005/11010 must still match.
+	wantKnowledge := []int64{11001, 11002, 11005, 11010, 11008, 11009}
 	if len(source.Knowledge) != len(wantKnowledge) {
 		t.Fatalf("knowledge = %#v, want IDs %v", source.Knowledge, wantKnowledge)
 	}
@@ -498,7 +500,7 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, password)
 		VALUES (7801, 7001, 7101, 'main', 'postgres://user:secret@db/test', 'user', 'db-password')`)
 	exec(`INSERT INTO test_account (id, username, password, roles)
-		VALUES (7601, 'buyer', 'hunter2', '["buyer"]'::jsonb)`)
+		VALUES (7601, 'buyer', 'hunter2', '[" buyer ", " auditor ", ""]'::jsonb)`)
 	exec(`INSERT INTO version_account (id, version_id, account_id, enabled)
 		VALUES (7501, 9001, 7601, true)`)
 
@@ -628,6 +630,8 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 		{11008, "global", nil, "API知识", "选中 API 可用", "approved", ptrFloat(0.7),
 			`{"api_key":"POST /api/checkout"}`},
 		{11009, "global", nil, "无置信知识", "没有置信度", "approved", nil, `{}`},
+		{11010, "global", nil, "账号角色知识", "绑定账号角色可用", "approved", ptrFloat(0.75),
+			`{"account_role":"auditor"}`},
 	}
 	for _, item := range knowledge {
 		exec(`INSERT INTO knowledge_item

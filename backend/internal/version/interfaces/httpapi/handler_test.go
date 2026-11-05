@@ -335,6 +335,27 @@ func TestCreateVersionValidationErrors(t *testing.T) {
 			t.Fatalf("status = %d", recorder.Code)
 		}
 	})
+	t.Run("rejects legacy and unknown create fields", func(t *testing.T) {
+		bodies := []string{
+			`{"title":"T","environment_id":"1101","bindings":[{"sut_id":"1001"}]}`,
+			`{"title":"T","environment_id":"1101","pages":["1301"]}`,
+			`{"title":"T","environment_id":"1101","account_ids":["1601"]}`,
+			`{"title":"T","environment_id":"1101","unexpected":"x"}`,
+		}
+		for _, body := range bodies {
+			stub.calls = nil
+			recorder := call(t, handler, http.MethodPost, "/api/versions", body, actor())
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("body %s status = %d, want 400", body, recorder.Code)
+			}
+			if field := errorBody(t, recorder)["details"].(map[string]any)["field"]; field != "body" {
+				t.Fatalf("body %s field = %#v", body, field)
+			}
+			if len(stub.calls) != 0 {
+				t.Fatalf("legacy payload reached the service: %#v", stub.calls)
+			}
+		}
+	})
 }
 
 func TestCreateVersionSurfacesServiceValidationDetails(t *testing.T) {

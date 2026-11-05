@@ -239,8 +239,9 @@ func TestRepositoryUpdateBinding(t *testing.T) {
 	next.ScopeExclude = version.NewScopeExclude(nil, []int64{1402}, nil)
 	next.RepositoryOverrides = []version.RepositoryOverride{{RepoID: 1202, Included: true}}
 	next.Accounts = []version.AccountBinding{{AccountID: 1604}}
+	expectedUpdatedAt := v.UpdatedAt
 	v.UpdatedAt = testTime.Add(time.Hour)
-	if err := repo.UpdateBinding(ctx, v, next); err != nil {
+	if err := repo.UpdateBinding(ctx, v, next, expectedUpdatedAt); err != nil {
 		t.Fatalf("UpdateBinding: %v", err)
 	}
 
@@ -271,8 +272,75 @@ func TestRepositoryUpdateBinding(t *testing.T) {
 	missing.ID = 999999
 	missingBinding := next
 	missingBinding.VersionID = missing.ID
-	if err := repo.UpdateBinding(ctx, missing, missingBinding); !errors.Is(err, version.ErrNotFound) {
+	if err := repo.UpdateBinding(ctx, missing, missingBinding, expectedUpdatedAt); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("missing UpdateBinding = %v", err)
+	}
+
+	// An optimistic write derived from the old snapshot loses deterministically
+	// once another writer bumped version.updated_at.
+	if err := repo.UpdateBinding(ctx, v, next, expectedUpdatedAt); !errors.Is(err, version.ErrBindingConflict) {
+		t.Fatalf("stale UpdateBinding = %v, want ErrBindingConflict", err)
+	}
+}
+
+// TestRepositoryUpdateBindingSerializesOnVersionRowLock proves the binding write
+// takes the version row lock before rewriting the projection: a concurrent
+// transaction holding that lock blocks the update until it commits.
+func TestRepositoryUpdateBindingSerializesOnVersionRowLock(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 1)
+	binding := sampleBinding(ids, v.ID)
+	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock holder: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM version WHERE id = $1 FOR UPDATE`, v.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("lock version row: %v", err)
+	}
+	expectedUpdatedAt := v.UpdatedAt
+	v.UpdatedAt = testTime.Add(time.Hour)
+	next := binding
+	next.ScopeExclude = version.NewScopeExclude(nil, nil, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- repo.UpdateBinding(ctx, v, next, expectedUpdatedAt)
+	}()
+	select {
+	case err := <-done:
+		_ = tx.Rollback(ctx)
+		t.Fatalf("UpdateBinding did not wait for the version row lock: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("UpdateBinding after lock release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UpdateBinding did not finish after the lock was released")
+	}
+	stored, storedBindings, err := repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !stored.UpdatedAt.Equal(testTime.Add(time.Hour)) {
+		t.Fatalf("version updated_at = %v", stored.UpdatedAt)
+	}
+	if len(storedBindings[0].ScopeExclude.Pages) != 0 {
+		t.Fatalf("scope after serialized write = %#v", storedBindings[0].ScopeExclude)
 	}
 }
 
@@ -388,20 +456,47 @@ func TestRepositoryDuplicateBindingRollsBack(t *testing.T) {
 	}
 }
 
+// TestRepositoryUsageQueries pins the v0.22 delete-guard semantics: a
+// page/API/database is "in use" while it is inside a bound environment's
+// effective range (approved/active and not scope-excluded). An explicitly
+// excluded, proposed, disabled or foreign-environment resource is not part of
+// the version range, so the guard must not block its deletion.
 func TestRepositoryUsageQueries(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
 	repo := versionpg.New(pool, ids)
 	ctx := context.Background()
 
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, query, args...); err != nil {
+			t.Fatalf("seed %q: %v", query, err)
+		}
+	}
+	// The usage guards join the version binding to the resource catalog, so the
+	// fixture needs the owning SUT/environment and the surrounding resources.
+	exec(`INSERT INTO sut (id, name, intro, created_by) VALUES (1001, 'Orders', '', 42)`)
+	exec(`INSERT INTO sut_environment (id, sut_id, name, base_url)
+		VALUES (1101, 1001, 'prod', 'https://orders.example.test'),
+		       (1102, 1001, 'staging', 'https://staging.example.test')`)
+	exec(`INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template, status)
+		VALUES (1301, 1001, 1101, 'excluded', 'https://orders.example.test/excluded', '/excluded', 'approved'),
+		       (1302, 1001, 1101, 'in range', 'https://orders.example.test/in-range', '/in-range', 'approved'),
+		       (1304, 1001, 1101, 'proposed', 'https://orders.example.test/proposed', '/proposed', 'proposed'),
+		       (1305, 1001, 1102, 'staging', 'https://staging.example.test/page', '/staging-page', 'approved')`)
+	exec(`INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name, status)
+		VALUES (1401, 1001, 1101, 'GET', '/api/excluded', 'excluded', 'approved'),
+		       (1403, 1001, 1101, 'GET', '/api/in-range', 'in range', 'approved'),
+		       (1404, 1001, 1101, 'GET', '/api/proposed', 'proposed', 'proposed')`)
+	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, status)
+		VALUES (1501, 1001, 1101, 'excluded', 'postgres://excluded', 'reader', 'active'),
+		       (1503, 1001, 1101, 'in-range', 'postgres://in-range', 'reader', 'active'),
+		       (1504, 1001, 1101, 'disabled', 'postgres://disabled', 'reader', 'disabled')`)
+
 	// The SUT-level repository association backs RepositoryInUse for inherited
 	// repositories; version_repository_override covers appended ones.
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled)
-		VALUES (7001, 1001, 1201, 'backend', true)
-	`); err != nil {
-		t.Fatalf("seed sut_repository: %v", err)
-	}
+	exec(`INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled)
+		VALUES (7001, 1001, 1201, 'backend', true)`)
 
 	checks := []struct {
 		name  string
@@ -423,8 +518,6 @@ func TestRepositoryUsageQueries(t *testing.T) {
 
 	v := sampleVersion(ids, 1)
 	binding := sampleBinding(ids, v.ID)
-	// The scope fixture excludes page 1301, API 1401 and database 1501 and
-	// includes repository 1203 as an override.
 	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -439,12 +532,18 @@ func TestRepositoryUsageQueries(t *testing.T) {
 		{"sut unbound", repo.SUTInUse, 1003, false},
 		{"environment bound", repo.EnvironmentInUse, 1101, true},
 		{"environment unbound", repo.EnvironmentInUse, 1102, false},
-		{"page excluded", repo.PageInUse, 1301, true},
-		{"page in range", repo.PageInUse, 1302, false},
-		{"api excluded", repo.APIInUse, 1401, true},
-		{"api in range", repo.APIInUse, 1402, false},
-		{"database excluded", repo.DatabaseInUse, 1501, true},
-		{"database in range", repo.DatabaseInUse, 1503, false},
+		// Excluded resources are outside the version range: the guard does not
+		// block deleting them.
+		{"page excluded", repo.PageInUse, 1301, false},
+		{"page in range", repo.PageInUse, 1302, true},
+		{"page proposed", repo.PageInUse, 1304, false},
+		{"page other environment", repo.PageInUse, 1305, false},
+		{"api excluded", repo.APIInUse, 1401, false},
+		{"api in range", repo.APIInUse, 1403, true},
+		{"api proposed", repo.APIInUse, 1404, false},
+		{"database excluded", repo.DatabaseInUse, 1501, false},
+		{"database in range", repo.DatabaseInUse, 1503, true},
+		{"database disabled", repo.DatabaseInUse, 1504, false},
 		{"account bound", repo.AccountInUse, 1601, true},
 		{"account unbound", repo.AccountInUse, 1604, false},
 		{"repository inherited", repo.RepositoryInUse, 1201, true},

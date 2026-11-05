@@ -605,3 +605,126 @@ func TestRepositoryPasswordNeverLeaksInViews(t *testing.T) {
 		t.Fatal("view contains secret material")
 	}
 }
+
+// TestRepositorySUTRepositories pins the v0.22 DB-12/API-17 adapter: SUT-level
+// multi-repository rows round-trip through the PG repository in deterministic
+// repository-ID order, trim the role label and report the natural-key conflict.
+func TestRepositorySUTRepositories(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	sut := createSUT(t, e, "Order Center")
+	sutID := int64Of(t, sut.ID)
+
+	backend, err := e.svc.CreateRepository(ctx, resourceapp.RepositoryInput{
+		Name: "orders-backend", Path: "https://git.example.com/orders-backend.git",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateRepository backend: %v", err)
+	}
+	frontend, err := e.svc.CreateRepository(ctx, resourceapp.RepositoryInput{
+		Name: "orders-frontend", Path: "https://git.example.com/orders-frontend.git",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateRepository frontend: %v", err)
+	}
+	// Add the higher ID first so the read order proves the repo-ID sort, not
+	// insertion order.
+	if _, err := e.svc.AddSUTRepository(ctx, sutID, resourceapp.SUTRepositoryInput{
+		RepositoryID: int64Of(t, frontend.ID), Role: "  frontend  ",
+	}, 42); err != nil {
+		t.Fatalf("AddSUTRepository frontend: %v", err)
+	}
+	if _, err := e.svc.AddSUTRepository(ctx, sutID, resourceapp.SUTRepositoryInput{
+		RepositoryID: int64Of(t, backend.ID), Role: "backend",
+	}, 42); err != nil {
+		t.Fatalf("AddSUTRepository backend: %v", err)
+	}
+	if _, err := e.svc.AddSUTRepository(ctx, sutID, resourceapp.SUTRepositoryInput{
+		RepositoryID: int64Of(t, backend.ID),
+	}, 42); err == nil {
+		t.Fatal("duplicate SUT repository association accepted")
+	} else {
+		assertAPIErr(t, err, 409, "conflict")
+	}
+
+	list, err := e.svc.ListSUTRepositories(ctx, sutID)
+	if err != nil {
+		t.Fatalf("ListSUTRepositories: %v", err)
+	}
+	if len(list) != 2 || list[0].Repository.ID != backend.ID || list[1].Repository.ID != frontend.ID {
+		t.Fatalf("list = %#v", list)
+	}
+	if list[0].Role != "backend" || list[1].Role != "frontend" {
+		t.Fatalf("roles = %q/%q, want trimmed labels", list[0].Role, list[1].Role)
+	}
+	if !list[0].Enabled || list[0].SUTID != sut.ID {
+		t.Fatalf("association = %#v", list[0])
+	}
+	if list[0].Repository.Name != "orders-backend" {
+		t.Fatalf("repository projection = %#v", list[0].Repository)
+	}
+
+	var storedRole string
+	if err := e.pool.QueryRow(ctx, `SELECT role FROM sut_repository WHERE sut_id = $1 AND repo_id = $2`,
+		sutID, int64Of(t, frontend.ID)).Scan(&storedRole); err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+	if storedRole != "frontend" {
+		t.Fatalf("stored role = %q, want trimmed", storedRole)
+	}
+
+	if _, err := e.svc.ListSUTRepositories(ctx, 999999); err == nil {
+		t.Fatal("missing SUT list accepted")
+	} else {
+		assertAPIErr(t, err, 404, "not_found")
+	}
+
+	// Direct adapter delete round-trip (the service exposes add/list only).
+	associations, err := e.repo.ListSUTRepositories(ctx, sutID)
+	if err != nil || len(associations) != 2 {
+		t.Fatalf("adapter list = %#v/%v", associations, err)
+	}
+	if err := e.repo.DeleteSUTRepository(ctx, associations[0].ID); err != nil {
+		t.Fatalf("DeleteSUTRepository: %v", err)
+	}
+	if err := e.repo.DeleteSUTRepository(ctx, associations[0].ID); !errors.Is(err, resource.ErrNotFound) {
+		t.Fatalf("missing DeleteSUTRepository = %v", err)
+	}
+	remaining, err := e.repo.ListSUTRepositories(ctx, sutID)
+	if err != nil || len(remaining) != 1 {
+		t.Fatalf("remaining associations = %#v/%v", remaining, err)
+	}
+}
+
+// TestDeleteSUTCleansSUTRepositories pins the cascade hygiene of API-17 rows:
+// sut_repository has no cross-table FK in v0.22, so deleting a SUT must remove
+// its associations explicitly instead of leaving dangling rows.
+func TestDeleteSUTCleansSUTRepositories(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	sut := createSUT(t, e, "Order Center")
+	sutID := int64Of(t, sut.ID)
+	repository, err := e.svc.CreateRepository(ctx, resourceapp.RepositoryInput{
+		Name: "orders", Path: "https://git.example.com/orders.git",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	if _, err := e.svc.AddSUTRepository(ctx, sutID, resourceapp.SUTRepositoryInput{
+		RepositoryID: int64Of(t, repository.ID),
+	}, 42); err != nil {
+		t.Fatalf("AddSUTRepository: %v", err)
+	}
+
+	if err := e.svc.DeleteSUT(ctx, sutID, 42); err != nil {
+		t.Fatalf("DeleteSUT: %v", err)
+	}
+	var associations int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM sut_repository WHERE sut_id = $1`, sutID).
+		Scan(&associations); err != nil {
+		t.Fatalf("count sut_repository: %v", err)
+	}
+	if associations != 0 {
+		t.Fatalf("sut_repository rows survived the SUT delete: %d", associations)
+	}
+}

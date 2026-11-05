@@ -58,6 +58,11 @@ func sampleBindingOverview() versionapp.BindingOverview {
 		Environment: resourceapp.EnvironmentView{
 			ID: "1101", SUTID: "1001", Name: "prod", BaseURL: "https://orders.example.test",
 			Status: "active", CreatedAt: testTime, UpdatedAt: testTime,
+			// The service reports the version-bound account subset in the nested
+			// environment, never the global pool.
+			Accounts: []resourceapp.AccountView{
+				{ID: "1601", Username: "order-admin", Roles: []string{"admin"}, Status: "active"},
+			},
 		},
 		ScopeExclude: version.NewScopeExclude([]int64{1301}, nil, nil),
 		Counts: versionapp.BindingCounts{
@@ -94,6 +99,7 @@ func sampleBindingOverview() versionapp.BindingOverview {
 			},
 		},
 		CodeBaselineCommit: sampleCodeBaselineCommit,
+		Snapshot:           versionapp.BindingSnapshot{ScopeVersion: "scope-v1:abc"},
 	}
 }
 
@@ -149,6 +155,20 @@ func TestBindingGetHandler(t *testing.T) {
 	}
 	if data["code_baseline_commit"] != sampleCodeBaselineCommit {
 		t.Fatalf("baseline = %#v", data["code_baseline_commit"])
+	}
+	// R-C4-1 snapshot: the current scope reference is exposed; the frozen wave
+	// id stays null while the execution wave snapshot is execution-owned.
+	snapshot, ok := data["snapshot"].(map[string]any)
+	if !ok || snapshot["scope_version"] != "scope-v1:abc" {
+		t.Fatalf("snapshot = %#v", data["snapshot"])
+	}
+	if frozen, present := snapshot["frozen_wave_id"]; !present || frozen != nil {
+		t.Fatalf("frozen_wave_id = %#v, want null", frozen)
+	}
+	// environment.accounts is the bound subset, not the global pool.
+	environmentData := data["environment"].(map[string]any)
+	if accounts := environmentData["accounts"].([]any); len(accounts) != 1 {
+		t.Fatalf("environment accounts = %#v", accounts)
 	}
 	if recorder.Body.String() == "" || containsPassword(recorder.Body.String()) {
 		t.Fatalf("response leaks credentials: %s", recorder.Body.String())
@@ -269,4 +289,16 @@ func TestRegisterBindingRoutes(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("registered route status = %d", recorder.Code)
 	}
+}
+
+// A nil authentication middleware is a wiring bug: silently leaving the route
+// unmounted (or mounting it without auth) would hide a security boundary bug,
+// so the helper fails fast instead.
+func TestRegisterBindingRoutesRejectsNilAuth(t *testing.T) {
+	panics(t, "nil auth", func() {
+		versionapi.RegisterBindingRoutes(http.NewServeMux(), nil, versionapi.NewBindingHandler(nil))
+	})
+	panics(t, "nil mux", func() {
+		versionapi.RegisterBindingRoutes(nil, func(next http.Handler) http.Handler { return next }, versionapi.NewBindingHandler(nil))
+	})
 }

@@ -10,6 +10,10 @@ import (
 var (
 	ErrNotFound  = errors.New("version not found")
 	ErrDuplicate = errors.New("version binding already exists")
+	// ErrBindingConflict reports that a binding write lost an optimistic race:
+	// the version aggregate changed (another binding or stage write) between the
+	// read the update was derived from and the write.
+	ErrBindingConflict = errors.New("version binding changed concurrently")
 	// ErrStageConflict reports that a stage write lost a race: the persisted
 	// stage is no longer the source stage the caller validated against.
 	ErrStageConflict = errors.New("version stage changed concurrently")
@@ -42,9 +46,12 @@ type Repository interface {
 	// UpdateBinding rewrites the editable binding projection of one existing
 	// version: the environment and scope_exclude of version_sut, the
 	// version_repository_override rows and the version_account rows. It is one
-	// transaction and yields ErrNotFound when the version or its binding is
-	// missing.
-	UpdateBinding(ctx context.Context, version Version, binding Binding) error
+	// transaction, first locks the version row and then applies the write only
+	// while the persisted version.updated_at still equals expectedUpdatedAt
+	// (optimistic check, so concurrent binding/stage writers settle as
+	// ErrBindingConflict). It yields ErrNotFound when the version or its binding
+	// is missing.
+	UpdateBinding(ctx context.Context, version Version, binding Binding, expectedUpdatedAt time.Time) error
 
 	// SetCodeBaselineCommit writes the resolved commit SHA of one version_sut
 	// binding (P5 §5.5). The first successful code index uses it to backfill a

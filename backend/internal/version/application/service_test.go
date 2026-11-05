@@ -215,6 +215,7 @@ type fakeRepo struct {
 	versions map[int64]version.Version
 	bindings map[int64][]version.Binding
 	stages   map[int64]version.StageState
+	catalog  *fakeCatalog
 
 	createErr          error
 	updateErr          error
@@ -225,6 +226,7 @@ type fakeRepo struct {
 	createCalls        int
 	lastBinding        version.Binding
 	lastVersion        version.Version
+	lastExpectedUpdate time.Time
 	updateStages       []version.Stage
 }
 
@@ -267,7 +269,7 @@ func (f *fakeRepo) GetStage(_ context.Context, id int64) (version.StageState, er
 	return version.StageState{VersionID: id, Stage: version.StageCreated}, nil
 }
 
-func (f *fakeRepo) UpdateBinding(_ context.Context, v version.Version, binding version.Binding) error {
+func (f *fakeRepo) UpdateBinding(_ context.Context, v version.Version, binding version.Binding, expectedUpdatedAt time.Time) error {
 	if f.updateErr != nil {
 		return f.updateErr
 	}
@@ -277,6 +279,7 @@ func (f *fakeRepo) UpdateBinding(_ context.Context, v version.Version, binding v
 	f.updateCalls++
 	f.lastVersion = v
 	f.lastBinding = binding
+	f.lastExpectedUpdate = expectedUpdatedAt
 	f.versions[v.ID] = v
 	if len(f.bindings[v.ID]) == 0 {
 		f.bindings[v.ID] = []version.Binding{binding}
@@ -394,42 +397,68 @@ func (f *fakeRepo) EnvironmentInUse(_ context.Context, id int64) (bool, error) {
 }
 
 func (f *fakeRepo) PageInUse(_ context.Context, id int64) (bool, error) {
-	for _, bindings := range f.bindings {
-		for _, binding := range bindings {
-			for _, excluded := range binding.ScopeExclude.Pages {
-				if excluded == id {
-					return true, nil
-				}
-			}
-		}
-	}
-	return false, nil
+	return f.resourceInUse(id, func(binding version.Binding) bool {
+		return containsInt64(binding.ScopeExclude.Pages, id)
+	})
 }
 
 func (f *fakeRepo) APIInUse(_ context.Context, id int64) (bool, error) {
+	return f.resourceInUse(id, func(binding version.Binding) bool {
+		return containsInt64(binding.ScopeExclude.APIs, id)
+	})
+}
+
+func (f *fakeRepo) DatabaseInUse(_ context.Context, id int64) (bool, error) {
+	return f.resourceInUse(id, func(binding version.Binding) bool {
+		return containsInt64(binding.ScopeExclude.Databases, id)
+	})
+}
+
+// resourceInUse mirrors the SQL guard: a resource is in use when it belongs to
+// a bound environment and the binding does not exclude it.
+func (f *fakeRepo) resourceInUse(id int64, excluded func(version.Binding) bool) (bool, error) {
+	if f.catalog == nil {
+		return false, nil
+	}
+	var environmentID, sutID, status string
+	switch {
+	case f.catalog.pages[id].ID != "":
+		page := f.catalog.pages[id]
+		environmentID, sutID, status = page.EnvironmentID, page.SUTID, page.Status
+	case f.catalog.apis[id].ID != "":
+		api := f.catalog.apis[id]
+		environmentID, sutID, status = api.EnvironmentID, api.SUTID, api.Status
+	case f.catalog.databases[id].ID != "":
+		database := f.catalog.databases[id]
+		environmentID, sutID, status = database.EnvironmentID, database.SUTID, database.Status
+	default:
+		return false, nil
+	}
+	inRangeStatus := status == "approved" || status == "active"
+	if !inRangeStatus {
+		return false, nil
+	}
 	for _, bindings := range f.bindings {
 		for _, binding := range bindings {
-			for _, excluded := range binding.ScopeExclude.APIs {
-				if excluded == id {
-					return true, nil
-				}
+			if idString(binding.EnvironmentID) != environmentID || idString(binding.SUTID) != sutID {
+				continue
 			}
+			if excluded(binding) {
+				continue
+			}
+			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func (f *fakeRepo) DatabaseInUse(_ context.Context, id int64) (bool, error) {
-	for _, bindings := range f.bindings {
-		for _, binding := range bindings {
-			for _, excluded := range binding.ScopeExclude.Databases {
-				if excluded == id {
-					return true, nil
-				}
-			}
+func containsInt64(values []int64, target int64) bool {
+	for _, value := range values {
+		if value == target {
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func (f *fakeRepo) AccountInUse(_ context.Context, id int64) (bool, error) {
@@ -446,6 +475,17 @@ func (f *fakeRepo) AccountInUse(_ context.Context, id int64) (bool, error) {
 }
 
 func (f *fakeRepo) RepositoryInUse(_ context.Context, id int64) (bool, error) {
+	// Any SUT-level association references the repository (SQL guard), and so
+	// does an explicit version override.
+	if f.catalog != nil {
+		for _, associations := range f.catalog.sutRepos {
+			for _, association := range associations {
+				if association.Repository.ID == idString(id) {
+					return true, nil
+				}
+			}
+		}
+	}
 	for _, bindings := range f.bindings {
 		for _, binding := range bindings {
 			for _, override := range binding.RepositoryOverrides {
@@ -516,6 +556,7 @@ func newTestEnvWithResolver(t *testing.T, resolver versionapp.CodeBaselineResolv
 	t.Helper()
 	repo := newFakeRepo()
 	catalog := newFakeCatalog()
+	repo.catalog = catalog
 	audit := &fakeAudit{}
 	publisher := &fakePublisher{}
 	svc := versionapp.New(repo, catalog, &seqIDs{}, fixedClock{at: testTime}, audit, publisher, resolver)
@@ -1175,12 +1216,16 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 		{"sut unbound", usage.SUTInUse, 1002, false},
 		{"environment bound", usage.EnvironmentInUse, 1101, true},
 		{"environment unbound", usage.EnvironmentInUse, 1102, false},
-		{"page excluded", usage.PageInUse, 1301, false},
-		{"api excluded", usage.APIInUse, 1401, false},
-		{"database excluded", usage.DatabaseInUse, 1501, false},
+		// A resource in the bound environment's approved range is in use: the
+		// delete guard blocks it. Proposed resources are not in range.
+		{"page in range", usage.PageInUse, 1302, true},
+		{"page proposed", usage.PageInUse, 1304, false},
+		{"api in range", usage.APIInUse, 1401, true},
+		{"database in range", usage.DatabaseInUse, 1501, true},
 		{"account bound", usage.AccountInUse, 1602, true},
 		{"account unbound", usage.AccountInUse, 1603, false},
-		{"repository inherited", usage.RepositoryInUse, 1201, false},
+		{"repository inherited", usage.RepositoryInUse, 1201, true},
+		{"repository unbound", usage.RepositoryInUse, 1203, false},
 	}
 	for _, tc := range cases {
 		used, err := tc.check(requestContext(), tc.id)
@@ -1191,25 +1236,35 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
 		}
 	}
-	// Exclusions and overrides make a resource in use.
+	// An explicit exclusion removes the resource from the version range, so the
+	// guard must stop blocking its deletion. In-range resources and explicit
+	// repository overrides still count.
 	if _, err := env.svc.UpdateBinding(requestContext(), created.ID, versionapp.BindingPatch{
 		ScopeExclude:  &version.ScopeExclude{Pages: []int64{1301}, Databases: []int64{1501}},
 		RepositoryIDs: int64SlicePtr([]int64{1203}),
 	}, 42); err != nil {
 		t.Fatalf("UpdateBinding: %v", err)
 	}
-	for _, tc := range []struct {
+	after := []struct {
+		name  string
 		check func(context.Context, int64) (bool, error)
 		id    int64
+		want  bool
 	}{
-		{usage.PageInUse, 1301},
-		{usage.DatabaseInUse, 1501},
-		{usage.RepositoryInUse, 1201},
-		{usage.RepositoryInUse, 1203},
-	} {
+		{"excluded page", usage.PageInUse, 1301, false},
+		{"in-range page", usage.PageInUse, 1302, true},
+		{"excluded database", usage.DatabaseInUse, 1501, false},
+		{"in-range database", usage.DatabaseInUse, 1503, true},
+		{"sut repository association", usage.RepositoryInUse, 1201, true},
+		{"version repository override", usage.RepositoryInUse, 1203, true},
+	}
+	for _, tc := range after {
 		used, err := tc.check(requestContext(), tc.id)
-		if err != nil || !used {
-			t.Fatalf("usage(%d) = %v/%v, want in use", tc.id, used, err)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if used != tc.want {
+			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
 		}
 	}
 }

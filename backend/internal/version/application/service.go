@@ -2,6 +2,8 @@ package versionapp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -103,10 +105,22 @@ type BindingRepository struct {
 	Source     string
 }
 
+// BindingSnapshot is the R-C4-1 snapshot projection of one binding. W0 has no
+// frozen wave snapshot in the version context (R-C5/API-19 is execution-owned:
+// run_wave.scope_snapshot), so FrozenWaveID is nil and ScopeVersion is a
+// deterministic digest of the current effective scope (pages/APIs/databases,
+// accounts, effective repositories and the pinned code baseline). A client can
+// compare ScopeVersion with the snapshot reference recorded by a frozen wave to
+// detect that the version scope moved after that wave started.
+type BindingSnapshot struct {
+	ScopeVersion string
+	FrozenWaveID *int64
+}
+
 // BindingOverview is the API-16 read model (R-C4-1): the derived SUT, the bound
 // environment, the effective and excluded resources, the account subset, the
-// repositories and the code baseline. Snapshot is left to the wave execution
-// owner (R-C5) and is not part of the W0 binding read.
+// repositories, the code baseline and the snapshot reference. The embedded
+// Environment's Accounts are the version-bound subset (never the global pool).
 type BindingOverview struct {
 	VersionID          int64
 	Stage              version.Stage
@@ -121,6 +135,7 @@ type BindingOverview struct {
 	Accounts           []resourceapp.AccountView
 	Repositories       []BindingRepository
 	CodeBaselineCommit string
+	Snapshot           BindingSnapshot
 }
 
 // Patch is a partial version update; nil fields are untouched. Status is not
@@ -685,6 +700,9 @@ func (s *Service) buildBindingView(ctx context.Context, binding version.Binding)
 	}
 	excludedDatabases := idSet(binding.ScopeExclude.Databases)
 	for _, database := range environment.Databases {
+		if database.Status != "active" {
+			continue
+		}
 		if _, excluded := excludedDatabases[parseCatalogIDOrZero(database.ID)]; excluded {
 			continue
 		}
@@ -700,6 +718,10 @@ func (s *Service) buildBindingView(ctx context.Context, binding version.Binding)
 		}
 		view.Accounts = append(view.Accounts, accountView)
 	}
+	// The nested environment carries the version-bound account subset, not the
+	// global test-account pool (DB-15/R-C1-2).
+	environment.Accounts = append([]resourceapp.AccountView(nil), view.Accounts...)
+	view.Environment = environment
 	return view, nil
 }
 
@@ -722,8 +744,12 @@ func (s *Service) GetBinding(ctx context.Context, versionID int64) (BindingOverv
 
 // UpdateBinding applies one API-16 partial binding update inside the stage gate
 // (R-C4-2). It validates resources against the bound environment, recomputes the
-// repository overrides and the deterministic baseline, persists the binding and
-// records the version.binding.changed audit/event.
+// repository overrides and the deterministic baseline only when the effective
+// repository set changed, persists the binding and records the
+// version.binding.changed audit/event with the fields the patch actually
+// changed. An empty patch, or one that repeats the current binding state, is a
+// true no-op: no rows are written, no event is published and the baseline is
+// never re-resolved.
 func (s *Service) UpdateBinding(ctx context.Context, versionID int64, patch BindingPatch, actorID int64) (BindingOverview, error) {
 	if versionID <= 0 {
 		return BindingOverview{}, platform.Invalid("id", "must be a positive decimal ID")
@@ -748,7 +774,13 @@ func (s *Service) UpdateBinding(ctx context.Context, versionID int64, patch Bind
 		))
 	}
 
+	// v0.22 single-writer invariant: creation writes exactly one
+	// environment-derived version_sut row, so the lowest-ID row is the binding.
+	// A legacy multi-row version is still read deterministically through it and
+	// only that binding is rewritten below.
 	binding := bindings[0]
+	previousUpdatedAt := entity.UpdatedAt
+
 	environmentID := binding.EnvironmentID
 	if patch.EnvironmentID != nil {
 		if *patch.EnvironmentID <= 0 {
@@ -768,47 +800,100 @@ func (s *Service) UpdateBinding(ctx context.Context, versionID int64, patch Bind
 	if patch.ScopeExclude != nil {
 		scope = *patch.ScopeExclude
 	}
+	// Exclusions are always re-validated against the (possibly new) environment
+	// so switching environments cannot leave an exclusion pointing outside it.
 	normalizedScope, err := s.validateScopeExclude(ctx, scope, binding.SUTID, environmentID)
 	if err != nil {
 		return BindingOverview{}, err
 	}
+
+	changed := make(map[string]any)
+	if environmentID != binding.EnvironmentID {
+		changed["environment_id"] = changeRecord(
+			strconv.FormatInt(binding.EnvironmentID, 10),
+			strconv.FormatInt(environmentID, 10),
+		)
+	}
+	if patch.ScopeExclude != nil && !scopeExcludeEqual(normalizedScope, binding.ScopeExclude) {
+		changed["scope_exclude"] = changeRecord(
+			scopeExcludeSummary(binding.ScopeExclude),
+			scopeExcludeSummary(normalizedScope),
+		)
+	}
 	binding.EnvironmentID = environmentID
 	binding.ScopeExclude = normalizedScope
 
-	changed := map[string]any{"environment_id": fmt.Sprint(environmentID)}
+	repositoriesChanged := false
+	var repositories []BindingRepository
 	if patch.RepositoryIDs != nil {
 		overrides, err := s.repositoriesForSelection(ctx, binding.SUTID, *patch.RepositoryIDs)
 		if err != nil {
 			return BindingOverview{}, err
 		}
-		binding.RepositoryOverrides = overrides
-		changed["repository_ids"] = int64sToStrings(*patch.RepositoryIDs)
-	}
-	if patch.AccountIDs != nil {
-		binding.Accounts, err = s.validateAccounts(ctx, *patch.AccountIDs)
+		currentRepositories, err := s.bindingRepositories(ctx, binding.SUTID, binding.RepositoryOverrides)
 		if err != nil {
 			return BindingOverview{}, err
 		}
-		changed["account_ids"] = int64sToStrings(*patch.AccountIDs)
+		nextRepositories, err := s.bindingRepositories(ctx, binding.SUTID, overrides)
+		if err != nil {
+			return BindingOverview{}, err
+		}
+		if !sameRepositorySelection(currentRepositories, nextRepositories) {
+			changed["repository_ids"] = changeRecord(
+				effectiveRepositoryIDs(currentRepositories),
+				effectiveRepositoryIDs(nextRepositories),
+			)
+			binding.RepositoryOverrides = overrides
+			repositoriesChanged = true
+			repositories = nextRepositories
+		}
+	}
+	if patch.AccountIDs != nil {
+		accounts, err := s.validateAccounts(ctx, *patch.AccountIDs)
+		if err != nil {
+			return BindingOverview{}, err
+		}
+		if !accountBindingsEqual(accounts, binding.Accounts) {
+			changed["account_ids"] = changeRecord(
+				accountBindingIDs(binding.Accounts),
+				accountBindingIDs(accounts),
+			)
+			binding.Accounts = accounts
+		}
 	}
 
-	repositories, err := s.bindingRepositories(ctx, binding.SUTID, binding.RepositoryOverrides)
-	if err != nil {
-		return BindingOverview{}, err
+	if len(changed) == 0 {
+		// Empty patch or a patch that repeats the persisted state: do not touch
+		// version.updated_at, the binding rows, the baseline or the event stream.
+		return s.bindingOverview(ctx, entity, binding)
 	}
-	commit, warning := s.resolveBaseline(ctx, binding.ID, repositories)
-	binding.CodeBaselineCommit = commit
+
+	var warnings []codeBaselineWarning
+	if repositoriesChanged {
+		// Only an effective repository change can move the deterministic
+		// baseline (the lowest included repository ID). Account/scope/environment
+		// updates keep the pinned commit untouched.
+		commit, warning := s.resolveBaseline(ctx, binding.ID, repositories)
+		switch {
+		case warning != nil:
+			// A resolver failure never clears a previously pinned commit; the
+			// warning is audited and the old baseline stays stable for reruns.
+			warnings = append(warnings, *warning)
+		case commit == "":
+			binding.CodeBaselineCommit = ""
+		default:
+			binding.CodeBaselineCommit = commit
+		}
+	}
 	if err := binding.Validate(); err != nil {
 		return BindingOverview{}, err
 	}
 	entity.UpdatedAt = s.clock.Now()
-	if err := s.repo.UpdateBinding(ctx, entity, binding); err != nil {
+	if err := s.repo.UpdateBinding(ctx, entity, binding, previousUpdatedAt); err != nil {
 		return BindingOverview{}, mapRepositoryError(err)
 	}
-	if warning != nil {
-		s.recordCodeBaselineWarnings(ctx, entity.ID, []codeBaselineWarning{*warning}, actorID)
-	}
-	s.recordBindingChanged(ctx, entity.ID, environmentID, changed, actorID)
+	s.recordCodeBaselineWarnings(ctx, entity.ID, warnings, actorID)
+	s.recordBindingChanged(ctx, entity.ID, changed, actorID)
 	return s.bindingOverview(ctx, entity, binding)
 }
 
@@ -888,6 +973,9 @@ func (s *Service) bindingOverview(
 	}
 	excludedDatabases := idSet(binding.ScopeExclude.Databases)
 	for _, database := range environment.Databases {
+		if database.Status != "active" {
+			continue
+		}
 		if _, excluded := excludedDatabases[parseCatalogIDOrZero(database.ID)]; !excluded {
 			overview.Databases = append(overview.Databases, database)
 		}
@@ -902,6 +990,11 @@ func (s *Service) bindingOverview(
 		}
 		overview.Accounts = append(overview.Accounts, accountView)
 	}
+	// The nested environment carries the version-bound account subset, not the
+	// global test-account pool (DB-15/R-C1-2).
+	environment.Accounts = append([]resourceapp.AccountView(nil), overview.Accounts...)
+	overview.Environment = environment
+	overview.Snapshot = BindingSnapshot{ScopeVersion: bindingScopeVersion(overview)}
 	return overview, nil
 }
 
@@ -911,15 +1004,17 @@ type bindingStageReader interface {
 	GetStage(ctx context.Context, versionID int64) (version.StageState, error)
 }
 
-// bindingStage resolves the effective workflow stage of one version. Suspended
-// versions use the recorded suspended_from stage so the binding gate follows the
-// stage the version was suspended from (R-C4-2). Repositories that do not
-// implement the stage read port fall back to the version status.
+// bindingStage resolves the effective workflow stage of one version. A
+// completed version is terminal and always reports completed/read-only even
+// when the persisted stage projection lags behind (status is the close gate).
+// Suspended versions use the recorded suspended_from stage so the binding gate
+// follows the stage the version was suspended from (R-C4-2). Repositories that
+// do not implement the stage read port fall back to the version status.
 func (s *Service) bindingStage(ctx context.Context, entity version.Version) (version.Stage, bool, error) {
-	stage := version.StageCreated
 	if entity.Status == version.StatusCompleted {
-		stage = version.StageCompleted
+		return version.StageCompleted, false, nil
 	}
+	stage := version.StageCreated
 	reader, ok := s.repo.(bindingStageReader)
 	if !ok {
 		return stage, version.BindingEditable(stage), nil
@@ -1002,6 +1097,138 @@ func int64sToStrings(ids []int64) []string {
 		out = append(out, strconv.FormatInt(id, 10))
 	}
 	return out
+}
+
+// changeRecord renders one old/new pair of the version.binding.changed diff.
+func changeRecord(oldValue, newValue any) map[string]any {
+	return map[string]any{"old": oldValue, "new": newValue}
+}
+
+// scopeExcludeSummary renders the pages/apis/databases summary of one exclusion
+// document for the audit diff.
+func scopeExcludeSummary(scope version.ScopeExclude) map[string]any {
+	return map[string]any{
+		"pages":     int64sToStrings(scope.Pages),
+		"apis":      int64sToStrings(scope.APIs),
+		"databases": int64sToStrings(scope.Databases),
+	}
+}
+
+func scopeExcludeEqual(left, right version.ScopeExclude) bool {
+	return sameIDSet(left.Pages, right.Pages) &&
+		sameIDSet(left.APIs, right.APIs) &&
+		sameIDSet(left.Databases, right.Databases)
+}
+
+// sameIDSet compares two ID slices as sets, so a duplicate or reordered patch
+// value is not reported as a binding change.
+func sameIDSet(left, right []int64) bool {
+	leftSet := idSet(left)
+	rightSet := idSet(right)
+	if len(leftSet) != len(rightSet) {
+		return false
+	}
+	for id := range leftSet {
+		if _, present := rightSet[id]; !present {
+			return false
+		}
+	}
+	return true
+}
+
+// effectiveRepositoryIDs returns the sorted IDs of the included repositories.
+func effectiveRepositoryIDs(rows []BindingRepository) []string {
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.Included {
+			ids = append(ids, row.Repository.ID)
+		}
+	}
+	return ids
+}
+
+func sameRepositorySelection(left, right []BindingRepository) bool {
+	return sameStringSet(effectiveRepositoryIDs(left), effectiveRepositoryIDs(right))
+}
+
+func accountBindingIDs(accounts []version.AccountBinding) []string {
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		ids = append(ids, strconv.FormatInt(account.AccountID, 10))
+	}
+	return ids
+}
+
+func accountBindingsEqual(left, right []version.AccountBinding) bool {
+	leftIDs := make([]int64, 0, len(left))
+	for _, account := range left {
+		leftIDs = append(leftIDs, account.AccountID)
+	}
+	rightIDs := make([]int64, 0, len(right))
+	for _, account := range right {
+		rightIDs = append(rightIDs, account.AccountID)
+	}
+	return sameIDSet(leftIDs, rightIDs)
+}
+
+// sameStringSet compares two string slices as sets so repository selections are
+// not reported as changed when only their order differs.
+func sameStringSet(left, right []string) bool {
+	leftSet := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		leftSet[value] = struct{}{}
+	}
+	rightSet := make(map[string]struct{}, len(right))
+	for _, value := range right {
+		rightSet[value] = struct{}{}
+	}
+	if len(leftSet) != len(rightSet) {
+		return false
+	}
+	for value := range leftSet {
+		if _, present := rightSet[value]; !present {
+			return false
+		}
+	}
+	return true
+}
+
+// bindingScopeVersion is the deterministic snapshot reference of the current
+// effective binding scope (R-C4-1). It deliberately covers only the frozen
+// scope dimensions (bound environment, effective page/API/database/account/
+// repository IDs and the pinned baseline), so equal scopes always compare equal
+// and a binding change always moves the reference.
+func bindingScopeVersion(overview BindingOverview) string {
+	hasher := sha256.New()
+	fmt.Fprintf(hasher, "scope-v1|version:%d|sut:%s|environment:%s|baseline:%s|",
+		overview.VersionID, overview.SUT.ID, overview.Environment.ID, overview.CodeBaselineCommit)
+	writeScopeIDs := func(kind string, ids []string) {
+		fmt.Fprintf(hasher, "%s=", kind)
+		for _, id := range ids {
+			fmt.Fprintf(hasher, "%s,", id)
+		}
+		fmt.Fprint(hasher, "|")
+	}
+	writeScopeIDs("pages", resourceViewIDs(overview.Pages))
+	writeScopeIDs("apis", resourceViewIDs(overview.APIs))
+	writeScopeIDs("databases", resourceViewIDs(overview.Databases))
+	accountIDs := make([]string, 0, len(overview.Accounts))
+	for _, account := range overview.Accounts {
+		accountIDs = append(accountIDs, account.ID)
+	}
+	writeScopeIDs("accounts", accountIDs)
+	writeScopeIDs("repositories", effectiveRepositoryIDs(overview.Repositories))
+	return "scope-v1:" + hex.EncodeToString(hasher.Sum(nil))
+}
+
+func resourceViewIDs[T any](items []T) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if id := resourceID(item); id > 0 {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+	}
+	return ids
 }
 
 // KnowledgeBindingKeys is the structured page-route/account-role projection of
@@ -1111,17 +1338,22 @@ func (s *Service) EnvironmentInUse(ctx context.Context, id int64) (bool, error) 
 	return s.repo.EnvironmentInUse(ctx, id)
 }
 
-// PageInUse reports whether any binding scope references the page.
+// PageInUse reports whether the page is inside the effective scope of a version
+// binding (belongs to a bound environment as an approved page and is not
+// excluded). Deleting a resource that is in range is blocked; an excluded
+// resource is not part of the version range and stays deletable.
 func (s *Service) PageInUse(ctx context.Context, id int64) (bool, error) {
 	return s.repo.PageInUse(ctx, id)
 }
 
-// APIInUse reports whether any binding scope references the API.
+// APIInUse reports whether the API is inside the effective scope of a version
+// binding.
 func (s *Service) APIInUse(ctx context.Context, id int64) (bool, error) {
 	return s.repo.APIInUse(ctx, id)
 }
 
-// DatabaseInUse reports whether any binding references the target database.
+// DatabaseInUse reports whether the target database is inside the effective
+// scope of a version binding (active and not excluded).
 func (s *Service) DatabaseInUse(ctx context.Context, id int64) (bool, error) {
 	return s.repo.DatabaseInUse(ctx, id)
 }
@@ -1187,10 +1419,12 @@ func (s *Service) recordCreated(ctx context.Context, entity version.Version, sut
 }
 
 // recordBindingChanged writes the version.binding.changed audit entry and
-// publishes the same event to version:{id} and system (R-C4-3). Delivery is best
-// effort and never fails the business write.
+// publishes the same event to version:{id} and system (R-C4-3). changed carries
+// only the fields the request actually modified (with old/new values), so the
+// audit trail names the real diff instead of stamping the environment on every
+// update. Delivery is best effort and never fails the business write.
 func (s *Service) recordBindingChanged(
-	ctx context.Context, versionID, environmentID int64, changed map[string]any, actorID int64,
+	ctx context.Context, versionID int64, changed map[string]any, actorID int64,
 ) {
 	targetID := platformid.Format(versionID)
 	requestID := requestid.From(ctx)
@@ -1199,9 +1433,8 @@ func (s *Service) recordBindingChanged(
 		actor = &actorID
 	}
 	payload := map[string]any{
-		"version_id":     targetID,
-		"environment_id": platformid.Format(environmentID),
-		"changed":        changed,
+		"version_id": targetID,
+		"changed":    changed,
 	}
 	if s.audit != nil {
 		_ = s.audit.Record(ctx, auditapp.Event{
@@ -1318,6 +1551,8 @@ func mapRepositoryError(err error) error {
 		return platform.NotFound("version")
 	case errors.Is(err, version.ErrDuplicate):
 		return platform.Conflict("version binding already exists")
+	case errors.Is(err, version.ErrBindingConflict):
+		return platform.StateConflict("version binding changed concurrently; reload and retry")
 	default:
 		return err
 	}

@@ -102,13 +102,29 @@ func (r *Repository) Create(ctx context.Context, v version.Version, bindings []v
 
 // UpdateBinding rewrites the v0.22 binding projection of one existing version
 // in one transaction: version_sut (environment/scope_exclude/code baseline),
-// the version_repository_override rows and the version_account rows.
-func (r *Repository) UpdateBinding(ctx context.Context, v version.Version, binding version.Binding) error {
+// the version_repository_override rows and the version_account rows. The
+// version row is locked first and the write only proceeds while its
+// updated_at still equals expectedUpdatedAt, so concurrent binding or stage
+// writers settle deterministically (ErrBindingConflict) instead of silently
+// losing an update.
+func (r *Repository) UpdateBinding(ctx context.Context, v version.Version, binding version.Binding, expectedUpdatedAt time.Time) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("update version binding: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	var storedUpdatedAt time.Time
+	err = tx.QueryRow(ctx, `SELECT updated_at FROM version WHERE id = $1 FOR UPDATE`, v.ID).Scan(&storedUpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return version.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("update version binding: lock version: %w", err)
+	}
+	if !storedUpdatedAt.Equal(expectedUpdatedAt) {
+		return version.ErrBindingConflict
+	}
 
 	scopeExclude, err := encodeScopeExclude(binding.ScopeExclude)
 	if err != nil {
@@ -547,27 +563,45 @@ func (r *Repository) EnvironmentInUse(ctx context.Context, id int64) (bool, erro
 	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version_sut WHERE environment_id = $1)`, id)
 }
 
-// PageInUse reports whether any binding excludes the page.
+// PageInUse reports whether the page is inside the effective scope of a version
+// binding: it belongs to a bound environment and is not excluded. A resource
+// that is explicitly excluded is not part of the version range, so deleting it
+// is not blocked by this guard.
 func (r *Repository) PageInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut WHERE scope_exclude -> 'pages' @> to_jsonb($1::BIGINT)
+			SELECT 1
+			FROM version_sut vs
+			JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
+			WHERE p.id = $1 AND p.status = 'approved'
+			  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
 		)`, id)
 }
 
-// APIInUse reports whether any binding excludes the API.
+// APIInUse reports whether the API is inside the effective scope of a version
+// binding: it belongs to a bound environment and is not excluded.
 func (r *Repository) APIInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut WHERE scope_exclude -> 'apis' @> to_jsonb($1::BIGINT)
+			SELECT 1
+			FROM version_sut vs
+			JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
+			WHERE a.id = $1 AND a.status = 'approved'
+			  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
 		)`, id)
 }
 
-// DatabaseInUse reports whether any binding excludes the target database.
+// DatabaseInUse reports whether the target database is inside the effective
+// scope of a version binding: it belongs to a bound environment, is active and
+// is not excluded.
 func (r *Repository) DatabaseInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM version_sut WHERE scope_exclude -> 'databases' @> to_jsonb($1::BIGINT)
+			SELECT 1
+			FROM version_sut vs
+			JOIN target_database d ON d.sut_id = vs.sut_id AND d.environment_id = vs.environment_id
+			WHERE d.id = $1 AND d.status = 'active'
+			  AND NOT (vs.scope_exclude -> 'databases' @> to_jsonb(d.id))
 		)`, id)
 }
 

@@ -128,9 +128,30 @@ func (r *Repository) UpdateSUT(ctx context.Context, sut resource.SUT) (resource.
 	return sut, nil
 }
 
-// DeleteSUT deletes a SUT; environments and resources cascade.
+// DeleteSUT deletes a SUT; environments and resources cascade. The v0.22
+// sut_repository associations are logical cross-table rows without an FK, so
+// they are removed explicitly in the same transaction to avoid orphans.
 func (r *Repository) DeleteSUT(ctx context.Context, id int64) error {
-	return r.exec(ctx, "delete sut", `DELETE FROM sut WHERE id = $1`, id)
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("delete sut: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM sut_repository WHERE sut_id = $1`, id); err != nil {
+		return wrapDB("delete sut repositories", err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM sut WHERE id = $1`, id)
+	if err != nil {
+		return wrapDB("delete sut", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return resource.ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("delete sut: commit: %w", err)
+	}
+	return nil
 }
 
 func scanSUT(row rowScanner) (resource.SUT, error) {
