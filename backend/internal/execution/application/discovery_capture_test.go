@@ -176,6 +176,38 @@ func TestCaptureTerminalObservationsAllVerdicts(t *testing.T) {
 	}
 }
 
+// TestCaptureTerminalObservationsRequestsFullNetworkWindow pins the W1-15 fix:
+// the executor's network action defaults to the last 50 items, while a normal
+// SPA page load puts the document request first (the W1 SUT home page makes 52
+// requests), so the default window drops the page observation. The capture must
+// request the 200-item maximum the executor supports.
+func TestCaptureTerminalObservationsRequestsFullNetworkWindow(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
+	fixture.browser.mu.Lock()
+	defer fixture.browser.mu.Unlock()
+	networkCalls := 0
+	for index, action := range fixture.browser.actions {
+		if action != "network" {
+			continue
+		}
+		networkCalls++
+		var args map[string]any
+		if len(fixture.browser.actionArgs[index]) > 0 {
+			if err := json.Unmarshal(fixture.browser.actionArgs[index], &args); err != nil {
+				t.Fatalf("network action args are not JSON: %v", err)
+			}
+		}
+		if args["tail"] != float64(200) {
+			t.Fatalf("network action args = %s, want tail=200 so the first document request survives",
+				string(fixture.browser.actionArgs[index]))
+		}
+	}
+	if networkCalls == 0 {
+		t.Fatal("the terminal capture never read the network log")
+	}
+}
+
 // TestEvidenceCapDoesNotDropObservations: the 100-row evidence cap may drop the
 // evidence row, but the DB-29 observation write is independent of it.
 func TestEvidenceCapDoesNotDropObservations(t *testing.T) {

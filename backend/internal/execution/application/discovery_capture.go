@@ -135,7 +135,12 @@ func (s *CaseRunner) captureContextObservations(row execution.CaseRunSUTContext)
 	// its own short-lived context like the terminal screenshot does.
 	actionCtx, cancel := context.WithTimeout(context.Background(), discoveryNetworkTimeout)
 	defer cancel()
-	result, err := s.browser.Action(actionCtx, executorID, row.BrowserContextID, "network", json.RawMessage(`{}`))
+	// The executor's network action defaults to the last 50 items. A normal SPA
+	// page load puts the document request first (the W1 SUT home page makes 52
+	// requests), so the default window would silently lose the page observation.
+	// Ask for the 200-item maximum the executor supports; the executor still
+	// bounds memory with its 500-entry ring (W1-15 fix).
+	result, err := s.browser.Action(actionCtx, executorID, row.BrowserContextID, "network", json.RawMessage(`{"tail":200}`))
 	if err != nil {
 		slog.Warn("execution discovery: read browser network log failed",
 			"case_run_id", row.CaseRunID, "version_sut_id", row.VersionSUTID,

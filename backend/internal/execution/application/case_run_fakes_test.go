@@ -569,6 +569,7 @@ type fakeBrowserExecutor struct {
 	contexts       int
 	actions        []string
 	actionContexts []string
+	actionArgs     []json.RawMessage
 	lastArgs       json.RawMessage
 	contextID      string
 	actionErr      error
@@ -603,6 +604,7 @@ func (f *fakeBrowserExecutor) Action(_ context.Context, executorID int64, contex
 	f.lastExecutorID = executorID
 	f.actions = append(f.actions, action)
 	f.actionContexts = append(f.actionContexts, contextID)
+	f.actionArgs = append(f.actionArgs, args)
 	f.lastArgs = args
 	if err := f.actionErrByContext[contextID]; err != nil {
 		return executionapp.BrowserActionResult{}, err
