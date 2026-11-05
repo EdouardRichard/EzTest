@@ -29,13 +29,19 @@ const EVIDENCE_DIR = path.join(ROOT, 'docs', 'version-V0.22', 'acceptance', 'evi
 
 const EVENT_TYPE_RE = /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+$/
 
-// Event names that are not domain event types for the v0.22 baseline counts.
-// Each exclusion is reported in inventory.md with the reason so the baseline is
-// auditable rather than silently filtered.
+// Event-looking names that are not publishable event types for the v0.22
+// baseline counts. Each exclusion carries a source file:line proof and is
+// reported in inventory.md, so the baseline is auditable instead of
+// target-fitted. Do not add an exclusion without that evidence.
 const NON_EVENT_TYPES = new Map([
-  ['chat.turn', 'work item kind leaked by a local `type` assignment; not an event type'],
-  ['version.stage_changed', 'legacy alias superseded by version.stage.changed (R-W1-4 canonical name)'],
-  ['context.cache_stats', 'internal context-cache telemetry, not a domain event for the W1 consumer registry'],
+  [
+    'chat.turn',
+    'work item kind, not an event type: WorkTypeChatTurn = "chat.turn" at ' +
+      'backend/internal/agent/application/ports_agent.go:242. An Event type is never ' +
+      'assigned this value; the scanner reaches it through NewWorkItem{Type: workType} ' +
+      '(backend/internal/agent/application/reconciler.go:668-673) fed by the ensure(...) ' +
+      'call at reconciler.go:627.',
+  ],
 ])
 
 // The zero-production-reference constructors measured on the W1 baseline
@@ -113,7 +119,15 @@ const DISPOSED_CONSTRUCTORS = [
     testRefs: 1,
     disposition: 'moved to same-package _test.go helper (report_tools_test.go)',
   },
-]
+].map((c) => ({
+  ...c,
+  // Plan step 3 requires the disposition *and* the reason. The reason is
+  // derived from the measured reference counts so it cannot drift from them.
+  reason:
+    c.testRefs > 0
+      ? `zero production references at the 02bce00d baseline; test-only references (testRefs=${c.testRefs}) -> moved into a same-package _test.go helper so the test seam is kept`
+      : 'zero references (production and test) -> deleted',
+}))
 
 // ---------------------------------------------------------------------------
 // generic helpers
@@ -658,17 +672,22 @@ function scanPublishedEvents() {
   }
 
   const found = new Map()
-  function add(type, evidence) {
+  function add(type, evidence, via) {
     if (typeof type !== 'string' || !EVENT_TYPE_RE.test(type)) return
     if (NON_EVENT_TYPES.has(type)) return
-    if (!found.has(type)) found.set(type, evidence)
+    if (!found.has(type)) found.set(type, { evidence, via: via || '' })
   }
 
-  function resolveSimple(expr, locals) {
+  function resolveSimple(expr, locals, varTypes) {
     expr = expr.trim().replace(/^\(|\)$/g, '')
     let m
     if ((m = /^"([^"\\]*(?:\\.[^"\\]*)*)"$/.exec(expr))) return [m[1]]
     if ((m = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(expr))) {
+      const structType = varTypes && varTypes.get(m[1])
+      if (structType) {
+        const projected = structFieldValues.get(structType + '.' + m[2])
+        if (projected && projected.size > 0) return [...projected]
+      }
       const v = globalConsts.get(m[2])
       return v ? [v] : []
     }
@@ -679,7 +698,7 @@ function scanPublishedEvents() {
       return values
     }
     if ((m = /^"([^"]*)"\s*\+\s*(.+)$/.exec(expr))) {
-      return resolveSimple(m[2], locals).map((suffix) => m[1] + suffix)
+      return resolveSimple(m[2], locals, varTypes).map((suffix) => m[1] + suffix)
     }
     return []
   }
@@ -716,18 +735,106 @@ function scanPublishedEvents() {
         .filter(Boolean)
         .map((p) => (p.match(/^([A-Za-z_]\w*)/) || [])[1])
         .filter(Boolean)
-      functions.push({ name, params, body, unit, start: m.index, end: k })
+      functions.push({ name, params, paramsText, body, unit, start: m.index, end: k })
       re.lastIndex = k
     }
   }
 
+  /** Split a Go argument/parameter list at top-level commas. */
+  function splitTopLevel(text) {
+    const args = []
+    let cur = ''
+    let depth = 0
+    let quote = ''
+    for (let x = 0; x < text.length; x++) {
+      const ch = text[x]
+      if (quote) {
+        cur += ch
+        if (ch === '\\') cur += text[++x]
+        else if (ch === quote) quote = ''
+        continue
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch
+        cur += ch
+        continue
+      }
+      if (ch === '(' || ch === '{' || ch === '[') depth++
+      if (ch === ')' || ch === '}' || ch === ']') depth--
+      if (ch === ',' && depth === 0) {
+        args.push(cur.trim())
+        cur = ''
+      } else {
+        cur += ch
+      }
+    }
+    if (cur.trim()) args.push(cur.trim())
+    return args
+  }
+
+  // Struct definitions and literals: a package constant can be projected into a
+  // struct field and published later through that field (for example
+  // issueEventUpdated -> issueTransition.eventType -> publishIssueEvent). Parse
+  // the projection chain generically instead of hard-coding the event name.
+  const structTypes = new Map() // type name -> Set(field names)
+  for (const unit of units) {
+    const re = /\btype\s+([A-Za-z_]\w*)\s+struct\s*\{/g
+    let m
+    while ((m = re.exec(unit.src))) {
+      let depth = 1
+      let j = re.lastIndex
+      while (j < unit.src.length && depth > 0) {
+        if (unit.src[j] === '{') depth++
+        else if (unit.src[j] === '}') depth--
+        j++
+      }
+      const body = unit.src.slice(re.lastIndex, j - 1)
+      const fields = new Set()
+      for (const line of body.split(/\r?\n/)) {
+        const fm = /^\s*([A-Za-z_]\w*)\s+[A-Za-z_][\w.]*(?:\[[^\]]*\])?/.exec(line)
+        if (fm) fields.add(fm[1])
+      }
+      structTypes.set(m[1], fields)
+      re.lastIndex = j
+    }
+  }
+
+  function baseTypeName(type) {
+    return type.trim().replace(/^\*/, '').replace(/^\[\]/, '')
+  }
+
+  // Variables known to hold one of the local struct types: named parameters and
+  // local struct declarations.
+  function varTypesOf(fn) {
+    const types = new Map()
+    for (const part of splitTopLevel(fn.paramsText)) {
+      const pm = /^([A-Za-z_]\w*)\s+(.+)$/.exec(part)
+      if (!pm) continue
+      const base = baseTypeName(pm[2])
+      if (/^[A-Za-z_]\w*$/.test(base) && structTypes.has(base)) types.set(pm[1], base)
+    }
+    const declRe = /\b([A-Za-z_]\w*)\s*:?=\s*([A-Za-z_]\w*)\s*\{/g
+    let dm
+    while ((dm = declRe.exec(fn.body))) {
+      if (structTypes.has(dm[2])) types.set(dm[1], dm[2])
+    }
+    return types
+  }
+
+  function projectionVia(expr, varTypes) {
+    const m = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(expr.trim().replace(/^\(|\)$/g, ''))
+    if (!m || !varTypes || !varTypes.has(m[1])) return ''
+    return varTypes.get(m[1]) + '.' + m[2]
+  }
+
   function localsOf(fn) {
     const locals = new Map()
+    const varTypes = varTypesOf(fn)
     const re = /\b([A-Za-z_]\w*)\s*:?=\s*([^\n;]+)/g
     let m
     while ((m = re.exec(fn.body))) {
       if (!/^(event|action)/i.test(m[1]) && !/\+\s*[A-Za-z_]/.test(m[2])) continue
-      const values = resolveSimple(m[2], locals)
+      const values = resolveSimple(m[2], locals, varTypes)
       if (!locals.has(m[1])) locals.set(m[1], [])
       for (const value of values) {
         if (!locals.get(m[1]).includes(value)) locals.get(m[1]).push(value)
@@ -738,6 +845,44 @@ function scanPublishedEvents() {
 
   function enclosing(unit, index) {
     return functions.find((fn) => fn.unit === unit && fn.start <= index && index < fn.end)
+  }
+
+  // Field values seen in struct literals: "Type.field" -> Set(event types).
+  const structFieldValues = new Map()
+  const structLitRe = /\b([A-Za-z_]\w*)\s*\{/g
+  for (const unit of units) {
+    let m
+    while ((m = structLitRe.exec(unit.src))) {
+      const type = m[1]
+      if (!structTypes.has(type)) continue
+      let depth = 1
+      let j = structLitRe.lastIndex
+      while (j < unit.src.length && depth > 0) {
+        if (unit.src[j] === '{') depth++
+        else if (unit.src[j] === '}') depth--
+        j++
+      }
+      const body = unit.src.slice(structLitRe.lastIndex, j - 1)
+      const caller = enclosing(unit, m.index)
+      const locals = caller ? localsOf(caller) : new Map()
+      const varTypes = caller ? varTypesOf(caller) : new Map()
+      for (const pair of splitTopLevel(body)) {
+        const fm = /^([A-Za-z_]\w*)\s*:\s*([\s\S]+)$/.exec(pair)
+        if (!fm) continue
+        // The event envelope's Type field is already covered by the dedicated
+        // Event{Type: ...} scan. Projecting it back would be circular (the
+        // forwarding Publish/Append would resolve through values it seeded
+        // itself) and would shadow the originating publish site.
+        if (type === 'Event' && fm[1] === 'Type') continue
+        for (const value of resolveSimple(fm[2], locals, varTypes)) {
+          if (!EVENT_TYPE_RE.test(value)) continue
+          const key = type + '.' + fm[1]
+          if (!structFieldValues.has(key)) structFieldValues.set(key, new Set())
+          structFieldValues.get(key).add(value)
+        }
+      }
+      structLitRe.lastIndex = j
+    }
   }
 
   // Function event-type parameter positions.
@@ -798,39 +943,17 @@ function scanPublishedEvents() {
           else if (unit.src[j] === ')') depth--
           j++
         }
-        const args = []
-        let cur = ''
-        let d = 0
-        let quote = ''
-        for (let x = re.lastIndex; x < j - 1; x++) {
-          const ch = unit.src[x]
-          if (quote) {
-            cur += ch
-            if (ch === '\\') cur += unit.src[++x]
-            else if (ch === quote) quote = ''
-            continue
-          }
-          if (ch === '"' || ch === "'" || ch === '`') {
-            quote = ch
-            cur += ch
-            continue
-          }
-          if (ch === '(' || ch === '{' || ch === '[') d++
-          if (ch === ')' || ch === '}' || ch === ']') d--
-          if (ch === ',' && d === 0) {
-            args.push(cur.trim())
-            cur = ''
-          } else {
-            cur += ch
-          }
-        }
-        if (cur.trim()) args.push(cur.trim())
+        const args = splitTopLevel(unit.src.slice(re.lastIndex, j - 1))
         const caller = enclosing(unit, m.index)
         const locals = caller ? localsOf(caller) : new Map()
+        const varTypes = caller ? varTypesOf(caller) : new Map()
         for (const spec of specs) {
           const arg = args[spec.index]
           if (!arg) continue
-          for (const value of resolveSimple(arg, locals)) add(spec.prefix + value, unit.rel + ':' + lineOf(unit.src, m.index))
+          const via = projectionVia(arg, varTypes)
+          for (const value of resolveSimple(arg, locals, varTypes)) {
+            add(spec.prefix + value, unit.rel + ':' + lineOf(unit.src, m.index), via)
+          }
         }
       }
     }
@@ -851,11 +974,16 @@ function scanPublishedEvents() {
       const args = unit.src.slice(pubRe.lastIndex, j - 1)
       const caller = enclosing(unit, m.index)
       const locals = caller ? localsOf(caller) : new Map()
+      const varTypes = caller ? varTypesOf(caller) : new Map()
+      const site = unit.rel + ':' + lineOf(unit.src, m.index)
       const tokenRe = /"([^"\\]*(?:\\.[^"\\]*)*)"|([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)/g
       let tm
       while ((tm = tokenRe.exec(args))) {
-        if (tm[1] !== undefined) add(tm[1], unit.rel + ':' + lineOf(unit.src, m.index))
-        else for (const value of resolveSimple(tm[2], locals)) add(value, unit.rel + ':' + lineOf(unit.src, m.index))
+        if (tm[1] !== undefined) add(tm[1], site)
+        else {
+          const via = projectionVia(tm[2], varTypes)
+          for (const value of resolveSimple(tm[2], locals, varTypes)) add(value, site, via)
+        }
       }
       pubRe.lastIndex = j
     }
@@ -875,7 +1003,11 @@ function scanPublishedEvents() {
       if (tm) {
         const caller = enclosing(unit, em.index)
         const locals = caller ? localsOf(caller) : new Map()
-        for (const value of resolveSimple(tm[1], locals)) add(value, unit.rel + ':' + lineOf(unit.src, em.index))
+        const varTypes = caller ? varTypesOf(caller) : new Map()
+        const via = projectionVia(tm[1], varTypes)
+        for (const value of resolveSimple(tm[1], locals, varTypes)) {
+          add(value, unit.rel + ':' + lineOf(unit.src, em.index), via)
+        }
       }
       evRe.lastIndex = j
     }
@@ -907,7 +1039,7 @@ function scanPublishedEvents() {
   }
 
   return [...found.entries()]
-    .map(([type, evidence]) => ({ type, evidence }))
+    .map(([type, detail]) => (detail.via ? { type, evidence: detail.evidence, via: detail.via } : { type, evidence: detail.evidence }))
     .sort((a, b) => a.type.localeCompare(b.type))
 }
 
@@ -960,10 +1092,10 @@ function renderInventory({ constructors, settings, routeScan, events }) {
   lines.push('')
   lines.push('### Disposed zero-production-reference constructors (W1-1 baseline `02bce00d`)')
   lines.push('')
-  lines.push('| constructor | file:line | test refs | disposition |')
-  lines.push('|---|---|---:|---|')
+  lines.push('| constructor | file:line | test refs | disposition | reason |')
+  lines.push('|---|---|---:|---|---|')
   for (const c of DISPOSED_CONSTRUCTORS) {
-    lines.push(`| \`${c.name}\` | \`${c.file}:${c.line}\` | ${c.testRefs} | ${c.disposition} |`)
+    lines.push(`| \`${c.name}\` | \`${c.file}:${c.line}\` | ${c.testRefs} | ${c.disposition} | ${c.reason} |`)
   }
   lines.push('')
   lines.push('## Settings without production reader')
@@ -986,18 +1118,46 @@ function renderInventory({ constructors, settings, routeScan, events }) {
   lines.push('')
   lines.push('## Publishable event types')
   lines.push('')
-  lines.push('| event type | first publish site |')
+  lines.push('| event type | first publish site | resolution |')
+  lines.push('|---|---|---|')
+  for (const e of events) {
+    const resolution = e.via ? `struct field \`${e.via}\`` : 'direct publish/Append argument'
+    lines.push(`| \`${e.type}\` | \`${e.evidence}\` | ${resolution} |`)
+  }
+  lines.push('')
+  lines.push('### Struct-field projection resolution')
+  lines.push('')
+  const projected = events.filter((e) => e.via)
+  if (projected.length === 0) {
+    lines.push('No event type is reached through a struct-field projection.')
+  } else {
+    lines.push(
+      'These event types are carried by a value projected into a struct field and read at the publish site, not passed as a literal publish argument:',
+    )
+    lines.push('')
+    for (const e of projected) lines.push(`- \`${e.type}\` -> \`${e.via}\` -> \`${e.evidence}\``)
+    lines.push('')
+    lines.push(
+      '`issue.updated` chain: package constant `issueEventUpdated = "issue.updated"` (`backend/internal/delivery/application/issue_service.go:19`) -> `issueTransition{eventType: issueEventUpdated}` (`issue_service.go:264`, `issue_service.go:279`) -> `spec.eventType` (`issue_service.go:387`) -> `publishIssueEvent` -> `s.events.Publish` (`issue_service.go:670-674`). The scanner resolves this from struct definitions and literals; no event name is hard-coded as an exception.',
+    )
+  }
+  lines.push('')
+  lines.push('### Event scan exclusions')
+  lines.push('')
+  lines.push('Only non-event string values reached by the publish/Append scan are excluded. Each exclusion needs `file:line` evidence:')
+  lines.push('')
+  lines.push('| excluded value | reason and file:line evidence |')
   lines.push('|---|---|')
-  for (const e of events) lines.push(`| \`${e.type}\` | \`${e.evidence}\` |`)
+  for (const [type, reason] of NON_EVENT_TYPES) lines.push(`| \`${type}\` | ${reason} |`)
   lines.push('')
   lines.push('## Notes')
   lines.push('')
   lines.push('- Constructors: `func New[A-Z]...` in `backend/internal/**` non-test files; production references are import-aware and exclude comments and the definition line. The only whitelist is `backend/internal/testutil/**`.')
   lines.push('- Settings: keys from `backend/internal/settings/application/catalog.go`; readers are string-literal uses in production Go files outside the catalog and `_test.go`.')
   lines.push('- Routes: `mux.Handle`/`mux.HandleFunc` registrations; a route is frontend-used only by a production `frontend/src` call with the same method and a resolved path helper. Duplicate/legacy registrations that share a handler are treated as one reachable handler.')
-  lines.push('- Events: publishable types found from `Event{Type:...}`, `publish*`/`Publish`/`Append` arguments, constants, same-package literals, function event-type parameters followed to call sites, and `for range []string{...}`. Non-event exclusions are listed in the script (`NON_EVENT_TYPES`).')
+  lines.push('- Events: publishable types found from `Event{Type:...}`, `publish*`/`Publish`/`Append` arguments, constants, same-package literals, function event-type parameters followed to call sites, struct definitions/literals for field projection, and `for range []string{...}`. Only evidenced non-event strings are excluded (`NON_EVENT_TYPES`).')
   lines.push('')
-  return { markdown: lines.join('\n'), zero, noReaders, business, others }
+  return { markdown: lines.join('\n'), zero, currentZero, noReaders, business, others }
 }
 
 function main() {
@@ -1015,8 +1175,8 @@ function main() {
     baseline: '02bce00d',
     counts: {
       constructors: constructors.length,
-      constructor_zero_prod_refs: DISPOSED_CONSTRUCTORS.length,
-      constructor_zero_prod_refs_current: rendered.zero.length - DISPOSED_CONSTRUCTORS.length,
+      constructor_zero_prod_refs: rendered.zero.length,
+      constructor_zero_prod_refs_current: rendered.currentZero.length,
       settings: settings.length,
       settings_without_reader: rendered.noReaders.length,
       routes: routeScan.registered.length,
@@ -1051,7 +1211,7 @@ function main() {
 
   console.log('W1-1 inventory')
   console.log(
-    `  constructors: ${constructors.length} scanned, ${DISPOSED_CONSTRUCTORS.length} zero production refs (baseline disposed; ${rendered.zero.length - DISPOSED_CONSTRUCTORS.length} remaining)`,
+    `  constructors: ${constructors.length} scanned, ${rendered.zero.length} zero production refs (baseline disposed; ${rendered.currentZero.length} remaining)`,
   )
   console.log(`  settings: ${settings.length} keys, ${rendered.noReaders.length} without production reader`)
   console.log(`  routes: ${routeScan.registered.length} scanned, ${rendered.business.length} business API-only, ${rendered.others.length} non-business without frontend call`)

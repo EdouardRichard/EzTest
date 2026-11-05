@@ -22,8 +22,8 @@ const chatRetryBaseDelay = 25 * time.Millisecond
 
 var _ llmapp.ChatClient = (*Client)(nil)
 
-// newAdapter lets Client.Chat reuse its injected HTTP client while keeping the
-// exported factory free of transport placement details.
+// newAdapter selects the wire-protocol adapter for cfg. It lets Client.Chat
+// reuse its injected HTTP client without exposing transport placement details.
 func newAdapter(cfg llm.Config, client *Client) (llmapp.Adapter, error) {
 	protocol, ok := llm.NormalizeProtocol(cfg.Protocol)
 	if !ok {
