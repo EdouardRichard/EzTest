@@ -476,7 +476,7 @@ test("console keeps a bounded tail of page messages", async () => {
   })
 })
 
-test("network records method, url, status, duration and mime", async () => {
+test("network records method, url, status, duration, mime and resource_type", async () => {
   await withContext(async (context) => {
     await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
     const response = await act(context.contextId, "network", { tail: 50 })
@@ -487,6 +487,12 @@ test("network records method, url, status, duration and mime", async () => {
     assert.equal(home.status, 200)
     assert.match(home.mime, /text\/html/)
     assert.equal(typeof home.duration_ms, "number")
+    // Playwright resource semantics let the Go discovery capture discriminate
+    // page (document) from api (xhr/fetch) and filter static resources (R-EX-2).
+    assert.equal(home.resource_type, "document")
+    for (const item of response.result.items) {
+      assert.equal(typeof item.resource_type, "string", JSON.stringify(item))
+    }
   })
 })
 

@@ -249,6 +249,10 @@ type CaseRunnerDeps struct {
 	TeamRoom    TeamRoom
 	Human       HumanRequestService
 	Visual      VisualAssertPort
+	// Discovery receives the terminal-state discovery observations (WP-1).
+	// Optional: a nil writer skips the observation write; W1-11 provides the
+	// postgres adapter and assembles it.
+	Discovery DiscoveryObservationWriter
 	// KnowledgeHook receives passed-case observations for knowledge
 	// sedimentation (spec §10.1). Optional and best effort.
 	KnowledgeHook CaseSuccessHook
@@ -294,6 +298,7 @@ type CaseRunner struct {
 	teamRoom    TeamRoom
 	human       HumanRequestService
 	visual      VisualAssertPort
+	discovery   DiscoveryObservationWriter
 	knowledge   CaseSuccessHook
 	// knowledgeFailure is the optional failed-case knowledge hook.
 	knowledgeFailure CaseFailureHook
@@ -362,6 +367,7 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		teamRoom:    deps.TeamRoom,
 		human:       deps.Human,
 		visual:      deps.Visual,
+		discovery:   deps.Discovery,
 		knowledge:   deps.KnowledgeHook,
 		// knowledgeFailure is optional: a nil field disables the failed-case
 		// notification.
@@ -714,6 +720,10 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		return execution.CaseRun{}, platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	// Terminal-state discovery capture (R-EX-1): every active browser context is
+	// read before it is closed, at all four terminal states, and stored as
+	// DB-29 observations plus redacted network evidence. Best effort only.
+	s.captureTerminalObservations(ctx, caseRun, status)
 	// P3 §6.4 automatic evidence: a failed/blocked/inconclusive run with a live
 	// browser context captures one screenshot before the terminal write so the
 	// failure is triageable instead of a zero-evidence row (QA-F1).
@@ -1001,6 +1011,9 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	if usage != nil {
 		summary.Usage = usage
 	}
+	// Terminal-state discovery capture (R-EX-1) on the agent-loop finalization
+	// path too: read every active browser context before it is closed.
+	s.captureTerminalObservations(ctx, caseRun, status)
 	s.captureTerminalEvidence(ctx, caseRun, status)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount

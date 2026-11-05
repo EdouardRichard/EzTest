@@ -568,15 +568,19 @@ type fakeBrowserExecutor struct {
 	mu             sync.Mutex
 	contexts       int
 	actions        []string
+	actionContexts []string
 	lastArgs       json.RawMessage
 	contextID      string
 	actionErr      error
-	result         executionapp.BrowserActionResult
-	closed         int
-	canceled       int
-	lastSpec       executionapp.BrowserContextSpec
-	lastExecutorID int64
-	createErr      error
+	// actionErrByContext fails the action of one browser context only, so a
+	// multi-context test can prove the capture is per-context best effort.
+	actionErrByContext map[string]error
+	result             executionapp.BrowserActionResult
+	closed             int
+	canceled           int
+	lastSpec           executionapp.BrowserContextSpec
+	lastExecutorID     int64
+	createErr          error
 }
 
 func (f *fakeBrowserExecutor) CreateContext(_ context.Context, spec executionapp.BrowserContextSpec) (string, error) {
@@ -598,8 +602,25 @@ func (f *fakeBrowserExecutor) Action(_ context.Context, executorID int64, contex
 	defer f.mu.Unlock()
 	f.lastExecutorID = executorID
 	f.actions = append(f.actions, action)
+	f.actionContexts = append(f.actionContexts, contextID)
 	f.lastArgs = args
+	if err := f.actionErrByContext[contextID]; err != nil {
+		return executionapp.BrowserActionResult{}, err
+	}
 	return f.result, f.actionErr
+}
+
+// countActions counts executed actions of one kind (for example "network").
+func (f *fakeBrowserExecutor) countActions(action string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, recorded := range f.actions {
+		if recorded == action {
+			count++
+		}
+	}
+	return count
 }
 
 func (f *fakeBrowserExecutor) Cancel(context.Context, int64, string) error {

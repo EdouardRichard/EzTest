@@ -195,6 +195,15 @@ type SUTContextRepository interface {
 	ListAll(ctx context.Context) ([]execution.CaseRunSUTContext, error)
 }
 
+// DiscoveryObservationWriter persists normalized execution-time discovery
+// observations (spec DB-29, R-EX-1). It is optional in W1-10: a nil writer
+// skips the observation write while the sanitized network evidence still flows
+// through EvidenceRepository. The postgres adapter and its composition-root
+// assembly land in W1-11, which owns normalization/filtering/dedupe.
+type DiscoveryObservationWriter interface {
+	WriteObservations(ctx context.Context, observations []DiscoveryObservation) error
+}
+
 // CaseReader is the read port into the design context. It only exposes
 // current+confirmed case versions for execution.
 type CaseReader interface {

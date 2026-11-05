@@ -49,6 +49,9 @@ type caseRunnerFixture struct {
 	// knowledgeFailure receives failed-case observations. It is a nil-safe
 	// optional hook like KnowledgeHook; the failure lifecycle wiring test uses it.
 	knowledgeFailure *fakeCaseFailureHook
+	// discovery records the terminal-state discovery observation batches. It is
+	// nil in the default fixture (the port is optional in W1-10).
+	discovery *fakeDiscoveryWriter
 	runCtx           context.Context
 	runCancel        context.CancelFunc
 }
@@ -73,6 +76,21 @@ func caseRunSnapshot() execution.CaseSnapshot {
 }
 
 func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
+	t.Helper()
+	return newCaseRunnerFixtureWithDiscoveryWriter(t, nil)
+}
+
+// newCaseRunnerFixtureWithDiscovery is the default fixture plus a recording
+// discovery repository port so terminal captures are observable.
+func newCaseRunnerFixtureWithDiscovery(t *testing.T) *caseRunnerFixture {
+	t.Helper()
+	writer := &fakeDiscoveryWriter{}
+	fixture := newCaseRunnerFixtureWithDiscoveryWriter(t, writer)
+	fixture.discovery = writer
+	return fixture
+}
+
+func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionapp.DiscoveryObservationWriter) *caseRunnerFixture {
 	t.Helper()
 	fixture := &caseRunnerFixture{
 		intents:    newFakeIntentRepo(),
@@ -151,6 +169,7 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 		Audit:                fixture.audit,
 		KnowledgeHook:        fixture.knowledge,
 		KnowledgeFailureHook: fixture.knowledgeFailure,
+		Discovery:            discovery,
 		InstanceID:           "api-1",
 	})
 	return fixture
