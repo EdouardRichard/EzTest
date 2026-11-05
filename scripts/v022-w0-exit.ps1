@@ -52,6 +52,8 @@ $nodeExe = (Get-Command node.exe -ErrorAction Stop).Source
 $pnpmExe = (Get-Command pnpm.cmd -ErrorAction SilentlyContinue).Source
 if (-not $pnpmExe) { $pnpmExe = (Get-Command pnpm -ErrorAction Stop).Source }
 $powershellExe = (Get-Command powershell.exe -ErrorAction Stop).Source
+$exitChecksPath = Join-Path $exitEvidence 'checks.json'
+$exitDocScript = Join-Path $PSScriptRoot 'v022-w0-exit-doc.ps1'
 
 $precheckFailures = New-Object System.Collections.Generic.List[string]
 
@@ -79,6 +81,7 @@ $verdictState = [ordered]@{
     redCount = $null
     dbRedCount = $null
 }
+$verdictFailureStart = $precheckFailures.Count
 if (Test-Path -LiteralPath $verdictPath) {
     try {
         $verdict = Get-Content -LiteralPath $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -114,14 +117,37 @@ if (Test-Path -LiteralPath $verdictPath) {
         $precheckFailures.Add("cannot parse run/verdict.json: $($_.Exception.Message)")
     }
 }
+# True only when the fresh verdict passed every check above. It gates the
+# EXIT.md regeneration: a stale failing note is replaced only by a green
+# machine verdict, never to get a red verdict past the pre-check.
+$verdictGreen = ($null -ne $verdict) -and ($precheckFailures.Count -eq $verdictFailureStart)
 
 # ---------------------------------------------------------------------------
-# 3. EXIT.md may not contain an item marked with the red token.
+# 3. EXIT.md may not contain an item marked with the red token. A copy that
+#    still carries a failing note from an older HEAD is regenerated from the
+#    fresh green verdict before this pre-check; the verification commands below
+#    then rewrite it again with their own results. A red verdict never gets
+#    there: the verdict checks above already failed the pre-check.
 # ---------------------------------------------------------------------------
 if (Test-Path -LiteralPath $exitPath) {
     $exitText = Get-Content -LiteralPath $exitPath -Raw -Encoding UTF8
     if ($exitText -cmatch '\bRED\b') {
-        $precheckFailures.Add('EXIT.md contains an item marked RED; a W0 exit with a failing item must not be signed off')
+        if ($verdictGreen) {
+            Write-Host ''
+            Write-Host '== EXIT.md still carries a failing note from an older HEAD; regenerating it from the fresh run/verdict.json before the pre-check'
+            & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $exitDocScript -VerdictPath $verdictPath -OutPath $exitPath -Stage precheck | Out-Host
+            $regenerateExit = $LASTEXITCODE
+            if ($regenerateExit -ne 0) {
+                $precheckFailures.Add("EXIT.md could not be regenerated from the fresh verdict (helper exit $regenerateExit)")
+            } else {
+                $exitText = Get-Content -LiteralPath $exitPath -Raw -Encoding UTF8
+                if ($exitText -cmatch '\bRED\b') {
+                    $precheckFailures.Add('EXIT.md still contains an item marked red after regeneration from the fresh verdict')
+                }
+            }
+        } else {
+            $precheckFailures.Add('EXIT.md contains an item marked RED; a W0 exit with a failing item must not be signed off')
+        }
     }
 }
 
@@ -294,5 +320,18 @@ if ($failures.Count -gt 0) {
     Write-Host "W0 EXIT: FAIL (evidence: $(Get-RepoRelativePath $exitEvidence))"
     exit 1
 }
+
+# ---------------------------------------------------------------------------
+# 7. On success rewrite EXIT.md from this run's own evidence: the post-run
+#    verdict plus the checks just written to run/exit/checks.json. The helper
+#    refuses a non-green verdict, so the file can never certify a failure.
+# ---------------------------------------------------------------------------
+if (Test-Path -LiteralPath $verdictPath) {
+    & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $exitDocScript -VerdictPath $verdictPath -OutPath $exitPath -ChecksPath $exitChecksPath -Stage final | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "could not regenerate EXIT.md from the final verdict (helper exit $LASTEXITCODE)"
+    }
+}
+
 Write-Host "W0 EXIT: PASS (evidence: $(Get-RepoRelativePath $exitEvidence))"
 exit 0

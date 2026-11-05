@@ -427,6 +427,97 @@ if ($SkipE2E) {
 }
 
 # ---------------------------------------------------------------------------
+# 6b. The W1 e2e keeps its composition root running on purpose (so -ReuseFlow
+#     can replay it). The fresh W0 regression below starts a second root and a
+#     second `next dev` in the same frontend/ directory; Next refuses that while
+#     the W1 web server still holds frontend/.next/dev/lock, which is exactly
+#     what made the previous exit run fail at gate 7. Stop the W1 root here,
+#     wait for the ports, and remove a residual dev lock only when no process
+#     holds it anymore.
+# ---------------------------------------------------------------------------
+function Stop-W1CompositionRoot {
+    $w1Ports = @(13444, 13348, 13999, 6870)
+    foreach ($port in $w1Ports) {
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
+        if ($listeners.Count -eq 0) {
+            Write-Host "   port ${port}: free (no listener)"
+            continue
+        }
+        foreach ($listener in $listeners) {
+            $ownerId = [int]$listener.OwningProcess
+            $ownerName = '<gone>'
+            try { $ownerName = (Get-Process -Id $ownerId -ErrorAction Stop).ProcessName } catch { }
+            Stop-Process -Id $ownerId -Force -ErrorAction SilentlyContinue
+            Write-Host "   port ${port}: pid=$ownerId ($ownerName) -> stop requested"
+        }
+    }
+
+    # Wait (bounded, <=60s) for every W1 listener to disappear.
+    $pending = New-Object System.Collections.Generic.List[int]
+    foreach ($port in $w1Ports) { $pending.Add($port) }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
+        foreach ($port in @($pending)) {
+            if (@(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue).Count -eq 0) {
+                $null = $pending.Remove($port)
+            }
+        }
+        if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+    }
+    foreach ($port in $w1Ports) {
+        if ($pending.Contains($port)) {
+            $owner = (@(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique) -join ',')
+            Write-Host "   port ${port}: STILL LISTENING after 60s (pid=$owner)"
+            $red.Add("harness.ports: W1 port $port still has a listener after 60s (pid=$owner)")
+        } else {
+            Write-Host "   port ${port}: released"
+        }
+    }
+
+    # Next 16 writes the dev-server pid into frontend/.next/dev/lock. If that pid
+    # is gone the OS lock is gone too, and the leftover file is removed. If the
+    # pid is still alive the lock is genuinely held: report it, never delete it.
+    $devLock = Join-Path $repoRoot 'frontend\.next\dev\lock'
+    if (-not (Test-Path -LiteralPath $devLock)) {
+        Write-Host '   dev lock: absent'
+        return
+    }
+    $lockOwnerId = 0
+    try {
+        $lockInfo = Get-Content -LiteralPath $devLock -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -ne $lockInfo.pid) { $lockOwnerId = [int]$lockInfo.pid }
+    } catch { }
+    if ($lockOwnerId -le 0) {
+        Write-Host "   dev lock: present without a readable pid ($devLock)"
+    } else {
+        $lockDeadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $lockDeadline -and (Get-Process -Id $lockOwnerId -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 500
+        }
+        $holder = Get-Process -Id $lockOwnerId -ErrorAction SilentlyContinue
+        if ($holder) {
+            Write-Host "   dev lock: pid=$lockOwnerId ($($holder.ProcessName)) is STILL RUNNING; lock left in place"
+            $red.Add("harness.lock: frontend/.next/dev/lock is held by live pid $lockOwnerId ($($holder.ProcessName))")
+            return
+        }
+        Write-Host "   dev lock: holder pid=$lockOwnerId has exited"
+    }
+    Remove-Item -LiteralPath $devLock -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $devLock) {
+        Write-Host "   dev lock: residual file could NOT be removed ($devLock)"
+        $red.Add('harness.lock: residual frontend/.next/dev/lock could not be removed')
+    } else {
+        Write-Host '   dev lock: residual file removed (no process holds it)'
+    }
+}
+
+if (-not $SkipE2E -and -not $SkipW0 -and -not $externalBlocked) {
+    Write-Host ''
+    Write-Host '== [w1.e2e cleanup] stopping the W1 composition root before the fresh W0 regression'
+    Stop-W1CompositionRoot
+}
+
+# ---------------------------------------------------------------------------
 # 7. Fresh W0 regression (must rebuild the W0 run/ evidence; -ReuseFlow cannot
 #    restore result.json/verdict.json and is not accepted here).
 # ---------------------------------------------------------------------------
