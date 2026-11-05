@@ -16,6 +16,7 @@ import { QuestionCard } from "@/features/clarification/QuestionCard"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { CodeTab } from "@/features/code-intel/CodeTab"
+import { ContextPacketCard } from "@/features/conversation/ContextPacketCard"
 import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
@@ -29,11 +30,13 @@ import { formatDateTime } from "@/lib/format"
 import { getVersion, getVersionStage, parseStageBlocker } from "./api"
 import { BindingOverview } from "./BindingOverview"
 import { BlockerPanel } from "./BlockerPanel"
+import { FactsPanel } from "./FactsPanel"
 import { PlanPanel } from "./PlanPanel"
 import { StageBar } from "./StageBar"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
 import type { Version, VersionBinding, VersionTab } from "./types"
 import { VersionHeader } from "./VersionHeader"
+import { WorkItemsPanel } from "./WorkItemsPanel"
 
 /** SSE bursts (issue.created + report.published + version.closed) collapse into one refresh. */
 const SSE_REFRESH_DEBOUNCE_MS = 350
@@ -415,6 +418,10 @@ export function VersionDetailPage({
   const executionEvidenceId = searchParams.get("evidence") ?? undefined
   // H7: attachment images are only loaded for an explicitly selected attachment.
   const attachmentId = searchParams.get("attachment") ?? undefined
+  // W1-4A: work-item and fact deep links inside the overview data blocks.
+  const versionWorkItemId = searchParams.get("work_item") ?? undefined
+  const versionFactId =
+    searchParams.get("panel") === "facts" ? (searchParams.get("fact") ?? undefined) : undefined
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -708,6 +715,10 @@ export function VersionDetailPage({
         stage={stage}
         onOpenTodo={() => setTodoOpen(true)}
         onReopened={(next) => setVersion(next)}
+        onStageChanged={(view) => {
+          setStage(view)
+          refreshVersionAndCounts()
+        }}
       />
 
       {stage !== null ? (
@@ -757,6 +768,27 @@ export function VersionDetailPage({
                 <PlanPanel versionId={versionId} refreshKey={planRefreshKey} />
               </section>
               <BindingOverview versionId={versionId} refreshKey={bindingRefreshKey} />
+              <section data-testid="version-data" aria-label="版本数据" className="space-y-3">
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <h2 className="text-sm font-semibold text-foreground">版本数据</h2>
+                  <span className="text-[11px] text-muted-foreground">
+                    事实 · 作业与任务单 · 上下文包（只读投影）
+                  </span>
+                </div>
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <FactsPanel
+                    versionId={versionId}
+                    initialFactId={versionFactId}
+                    refreshKey={planRefreshKey}
+                  />
+                  <WorkItemsPanel
+                    versionId={versionId}
+                    initialWorkItemId={versionWorkItemId}
+                    refreshKey={planRefreshKey}
+                  />
+                </div>
+                <ContextPacketCard versionId={versionId} refreshKey={planRefreshKey} />
+              </section>
               {pendingQuestions.length > 0 ? (
                 <section
                   data-testid="pending-questions"

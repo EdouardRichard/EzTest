@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
+import { Dialog } from "@/components/ui/Dialog"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
@@ -34,6 +35,7 @@ import { DesignFocusDialog } from "./DesignFocusDialog"
 import { DesignMindmap } from "./DesignMindmap"
 import { DesignSplitPane } from "./DesignSplitPane"
 import { ExportCasesDialog } from "./ExportCasesDialog"
+import { HandoffPanel } from "./HandoffPanel"
 import {
   DEFAULT_CHAT_SPLIT,
   DEFAULT_WORKBENCH_SPLIT,
@@ -171,6 +173,7 @@ export function DesignTab({
   /** Cases checked in the mindmap and handed to the design chat ("交给 AI 修改"). */
   const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
+  const [handoffOpen, setHandoffOpen] = useState(false)
   const [activity, setActivity] = useState<string | null>(null)
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
@@ -765,6 +768,14 @@ export function DesignTab({
           <Button
             size="sm"
             variant="secondary"
+            data-testid="design-handoff"
+            onClick={() => setHandoffOpen(true)}
+          >
+            交接文档
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
             data-testid="export-cases"
             onClick={() => setExportOpen(true)}
           >
@@ -885,6 +896,18 @@ export function DesignTab({
         open={exportOpen}
         onClose={() => setExportOpen(false)}
       />
+
+      <Dialog
+        open={handoffOpen}
+        onClose={() => setHandoffOpen(false)}
+        title="澄清交接文档"
+        description="需求 / 问答 / 决策 / 待决 / 计划 / 资源六块交接（只读）"
+        className="max-w-3xl"
+      >
+        <div className="max-h-[70vh] overflow-y-auto pr-1">
+          <HandoffPanel versionId={versionId} />
+        </div>
+      </Dialog>
     </div>
   )
 }

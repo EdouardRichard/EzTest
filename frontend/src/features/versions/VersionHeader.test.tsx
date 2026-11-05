@@ -9,7 +9,10 @@ import { ApiError } from "@/lib/api-client"
 import type { Version } from "./types"
 
 const api = vi.hoisted(() => ({ reopenVersion: vi.fn() }))
-vi.mock("./api", () => api)
+vi.mock(import("./api"), async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>()
+  return { ...actual, ...api }
+})
 
 const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
 vi.mock("@/features/execution/api", () => executionApi)

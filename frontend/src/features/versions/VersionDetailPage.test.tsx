@@ -13,7 +13,17 @@ const api = vi.hoisted(() => ({
   getResourceCatalog: vi.fn(),
   reopenVersion: vi.fn(),
 }))
-vi.mock("./api", () => api)
+// Partial mock: the W1-4A panels import other helpers from this module, but they
+// stay unmounted without a stage projection. The stage read rejects so the page
+// keeps exercising the pre-existing stage-less overview path.
+vi.mock(import("./api"), async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>()
+  return {
+    ...actual,
+    getVersionStage: () => Promise.reject(new Error("stage projection unavailable")),
+    ...api,
+  }
+})
 
 const deliveryApi = vi.hoisted(() => ({
   listIssues: vi.fn(),

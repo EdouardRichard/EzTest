@@ -332,3 +332,177 @@ export function planConflictDetails(error: unknown): PlanConflictDetails | null 
     actualRevision: typeof actual === "number" && Number.isFinite(actual) ? actual : null,
   }
 }
+
+/* --------------------------- version facts (API-12/API-13) -------------------- */
+
+/**
+ * One append-only version fact row (`GET /api/versions/{id}/facts`). Facts never
+ * carry credentials; `payload` is a reference/summary document and
+ * `superseded_by` is non-null once the row lost a conflict or was replaced.
+ */
+export type VersionFact = {
+  id: string
+  version_id: string
+  kind: string
+  key: string
+  payload: Record<string, unknown>
+  confidence?: number | null
+  source: string
+  source_ref: string
+  evidence_refs: string[]
+  content_hash: string
+  superseded_by: string | null
+  created_at: string
+}
+
+export type GetVersionFactsOptions = {
+  kind?: string
+  /** Includes replaced/conflicting rows so the UI can render arbitration. */
+  includeSuperseded?: boolean
+  limit?: number
+}
+
+/**
+ * `GET /api/versions/{id}/facts`: the version fact page. The default projection
+ * only returns current facts; arbitration needs the full group, so the panel
+ * asks for superseded rows explicitly.
+ */
+export async function getVersionFacts(
+  versionId: string,
+  options: GetVersionFactsOptions = {},
+): Promise<VersionFact[]> {
+  const search = new URLSearchParams()
+  if (options.kind !== undefined && options.kind !== "") search.set("kind", options.kind)
+  if (options.includeSuperseded === true) search.set("include_superseded", "true")
+  search.set("limit", String(options.limit ?? 100))
+  const page = await apiGetPage<VersionFact>(`${versionPath(versionId)}/facts?${search.toString()}`)
+  return page.items
+}
+
+/** One competing fact in an arbitration result or group. */
+export type FactArbitrationFact = {
+  id: string
+  kind: string
+  key: string
+  confidence?: number | null
+  content_hash: string
+  superseded_by: string | null
+}
+
+export type FactArbitrationDecision = "keep" | "drop"
+
+/** `POST /api/versions/{id}/facts/{fid}/arbitrate` request body. */
+export type FactArbitrationInput = {
+  decision: FactArbitrationDecision
+  reason: string
+}
+
+/** `FactArbitrationView`: the applied decision, the winner and the current rows. */
+export type FactArbitrationResult = {
+  version_id: string
+  fact_id: string
+  kind: string
+  key: string
+  decision: FactArbitrationDecision
+  reason: string
+  keep_id: string
+  dropped_ids: string[]
+  changed: boolean
+  current: FactArbitrationFact[]
+}
+
+/**
+ * `POST /api/versions/{id}/facts/{fid}/arbitrate`: `keep` preserves this fact
+ * and supersedes its competitors; `drop` supersedes this fact instead. A reason
+ * is required (1–2000 chars) and is written to the audit trail.
+ */
+export function arbitrateFact(
+  versionId: string,
+  factId: string,
+  input: FactArbitrationInput,
+): Promise<FactArbitrationResult> {
+  return apiPost<FactArbitrationResult>(
+    `${versionPath(versionId)}/facts/${encodeURIComponent(factId)}/arbitrate`,
+    input,
+  )
+}
+
+/* ------------------------- work items (read projection) ---------------------- */
+
+/** One `work_item` projection (`GET /api/versions/{id}/work-items[/{id}]`). */
+export type WorkItem = {
+  id: string
+  version_id: string
+  kind: string
+  goal: string
+  state: string
+  target?: Record<string, unknown>
+  inputs?: Record<string, unknown>
+  expected?: Record<string, unknown>
+  budget?: Record<string, unknown>
+  depends_on?: string[] | null
+  lease?: Record<string, unknown> | null
+  attempt: number
+  result?: Record<string, unknown>
+  created_by: string
+  idempotency_key?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type ListWorkItemsOptions = {
+  kind?: string
+  state?: string
+  createdBy?: string
+  limit?: number
+}
+
+/** `GET /api/versions/{id}/work-items`: the version work-item page (id desc). */
+export async function listWorkItems(
+  versionId: string,
+  options: ListWorkItemsOptions = {},
+): Promise<WorkItem[]> {
+  const search = new URLSearchParams()
+  if (options.kind !== undefined && options.kind !== "") search.set("kind", options.kind)
+  if (options.state !== undefined && options.state !== "") search.set("state", options.state)
+  if (options.createdBy !== undefined && options.createdBy !== "") {
+    search.set("created_by", options.createdBy)
+  }
+  search.set("limit", String(options.limit ?? 100))
+  const page = await apiGetPage<WorkItem>(
+    `${versionPath(versionId)}/work-items?${search.toString()}`,
+  )
+  return page.items
+}
+
+/** `GET /api/versions/{id}/work-items/{workItemId}`: one work-item projection. */
+export function getWorkItem(versionId: string, workItemId: string): Promise<WorkItem> {
+  return apiGet<WorkItem>(`${versionPath(versionId)}/work-items/${encodeURIComponent(workItemId)}`)
+}
+
+/* ------------------------- hard-gate stage writes ---------------------------- */
+
+/** Target stage of the two hard-gate rejections. */
+export type StageRejectTarget = "clarifying" | "designing"
+
+export type RejectStageInput = {
+  reason: string
+  /** Omitted means "the previous stage of the current hard gate". */
+  target_stage?: StageRejectTarget
+}
+
+/**
+ * `POST /api/versions/{id}/stage/reject`: user-only hard-gate rollback. The
+ * reason is required and audited; no requirement/case rows are deleted.
+ */
+export function rejectStage(versionId: string, input: RejectStageInput): Promise<StageView> {
+  return apiPost<StageView>(`${versionPath(versionId)}/stage/reject`, input)
+}
+
+/**
+ * `POST /api/versions/{id}/stage/advance`: advances to the next forward
+ * workflow stage without naming it; the stage machine stays single-writer.
+ */
+export function advanceStage(versionId: string): Promise<StageView> {
+  return apiPost<StageView>(`${versionPath(versionId)}/stage/advance`)
+}

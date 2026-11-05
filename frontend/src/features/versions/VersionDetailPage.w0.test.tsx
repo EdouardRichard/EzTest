@@ -3,12 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import type { QuestionBatch } from "@/features/clarification/api"
+import { ApiError } from "@/lib/api-client"
 
 const versionApi = vi.hoisted(() => ({
   getVersion: vi.fn(),
   getVersionStage: vi.fn(),
   listPlanItems: vi.fn(),
   getVersionBinding: vi.fn(),
+  getVersionFacts: vi.fn(),
+  listWorkItems: vi.fn(),
+  getLatestContextPacket: vi.fn(),
+  advanceStage: vi.fn(),
+  rejectStage: vi.fn(),
+  arbitrateFact: vi.fn(),
 }))
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>()
@@ -183,6 +190,13 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     versionApi.getVersionStage.mockReset().mockResolvedValue(stageClarifying)
     versionApi.listPlanItems.mockReset().mockResolvedValue([])
     versionApi.getVersionBinding.mockReset().mockResolvedValue(bindingOverviewFixture)
+    versionApi.getVersionFacts.mockReset().mockResolvedValue([])
+    versionApi.listWorkItems.mockReset().mockResolvedValue([])
+    versionApi.getLatestContextPacket
+      .mockReset()
+      .mockRejectedValue(
+        new ApiError({ status: 403, code: "forbidden", message: "上下文包仅管理员可读" }),
+      )
     clarificationApi.listQuestions.mockReset().mockResolvedValue([questionBatch])
     deliveryApi.listIssues.mockReset().mockResolvedValue([])
     deliveryApi.listReports.mockReset().mockResolvedValue([])
