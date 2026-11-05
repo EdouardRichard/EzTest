@@ -40,6 +40,14 @@ func (f fakeWiringPlanCatalog) Update(_ context.Context, _, itemID int64, patch 
 	return versiondomain.PlanItem{}, versiondomain.ErrPlanNotFound
 }
 
+func (f fakeWiringPlanCatalog) Upsert(_ context.Context, item versiondomain.PlanItem) (versiondomain.PlanItem, error) {
+	if item.ID == 0 {
+		item.ID = int64(len(f.items) + 1)
+	}
+	item.Revision = 1
+	return item, nil
+}
+
 type fakeWiringCompletionStore struct {
 	commits int
 	last    agentapp.CompletionWrite

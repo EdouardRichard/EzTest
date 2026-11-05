@@ -306,6 +306,10 @@ func (s toolContentStore) ReadText(ctx context.Context, contentRef string) (stri
 type planCompletionCatalog interface {
 	List(ctx context.Context, versionID int64, status string) ([]versiondomain.PlanItem, error)
 	Update(ctx context.Context, versionID, itemID int64, patch versiondomain.PlanPatch, revision int) (versiondomain.PlanItem, error)
+	// Upsert creates the per-run Host plan item when the production plan
+	// creation path has not seeded one yet (W0 fallback; W1 replaces this with
+	// plan-driven Host turns). The work-item link keeps resolution stable.
+	Upsert(ctx context.Context, item versiondomain.PlanItem) (versiondomain.PlanItem, error)
 }
 
 // completionPlanItemReader resolves the optimistic-lock snapshot of one plan
@@ -479,6 +483,34 @@ func (b completionBuilder) resolveTarget(ctx context.Context, run agentapp.Compl
 	case 1:
 		return inProgress[0], nil
 	case 0:
+		if run.WorkItemID > 0 {
+			// W0 fallback: the production plan-item creation side is not yet
+			// wired for Host turns. Create one item per work item so the
+			// completion criterion (task.complete + server validation) is
+			// reachable; the work-item link makes later resolution stable.
+			phase := "clarifying"
+			title := "Host 回合"
+			switch run.ProfileKey {
+			case agentapp.ProfileKeyDesignHost, agentapp.ProfileKeyDesignAuthor, agentapp.ProfileKeyDesignCritic:
+				phase = "designing"
+				title = "设计 Host 回合"
+			case agentapp.ProfileKeyCaseExecutor:
+				phase = "executing"
+				title = "执行回合"
+			}
+			workItemID := run.WorkItemID
+			created, createErr := b.plans.Upsert(ctx, versiondomain.PlanItem{
+				VersionID:  run.VersionID,
+				Phase:      phase,
+				Title:      fmt.Sprintf("%s #%d", title, workItemID),
+				Status:     "in_progress",
+				WorkItemID: &workItemID,
+			})
+			if createErr != nil {
+				return versiondomain.PlanItem{}, fmt.Errorf("completion builder: create Host plan item: %w", createErr)
+			}
+			return created, nil
+		}
 		return versiondomain.PlanItem{}, fmt.Errorf(
 			"completion builder: no plan item is linked to work item %d and version %d has no in-progress plan item",
 			run.WorkItemID, run.VersionID)
