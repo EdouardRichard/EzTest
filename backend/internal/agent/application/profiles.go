@@ -130,6 +130,59 @@ var designCriticTools = []string{
 	tools.ToolDesignReviewSubmit,
 }
 
+// v022ProfileTools is the v0.22 W0 allowed_tools increment per existing profile
+// key (spec §4.3/§4.6/§4.8/§4.9/§4.15/§4.22). It is applied as a set union in
+// EnsureProfiles so the frozen per-phase seed lists stay readable and an
+// administrator-edited stored profile can still be validated against the role
+// whitelist. Every name here is registered by the composition root; a tool whose
+// production port is not wired is absent from the registry and the profile entry
+// is harmless.
+var v022ProfileTools = map[string][]string{
+	ProfileKeyClarificationHost: {
+		tools.ToolPlanUpdate,
+		tools.ToolQuestionAsk,
+		tools.ToolClarificationSearch,
+		tools.ToolTaskComplete,
+		tools.ToolAttachmentImageRef,
+		tools.ToolToolResultRead,
+	},
+	ProfileKeyDesignHost: {
+		tools.ToolPlanUpdate,
+		tools.ToolQuestionAsk,
+		tools.ToolClarificationSearch,
+		tools.ToolTaskComplete,
+		tools.ToolAttachmentImageRef,
+		tools.ToolSUTDatabaseList,
+		tools.ToolToolResultRead,
+	},
+	ProfileKeyDesignAuthor: {
+		tools.ToolSUTDatabaseList,
+		tools.ToolTaskComplete,
+	},
+	ProfileKeyDesignCritic: {
+		tools.ToolSUTDatabaseList,
+		tools.ToolTaskComplete,
+	},
+	ProfileKeyCaseExecutor: {
+		tools.ToolToolResultRead,
+		tools.ToolTaskComplete,
+	},
+}
+
+// V022ProfileTools returns a copy of the v0.22 per-profile tool increment.
+func V022ProfileTools() map[string][]string {
+	cloned := make(map[string][]string, len(v022ProfileTools))
+	for key, names := range v022ProfileTools {
+		cloned[key] = append([]string(nil), names...)
+	}
+	return cloned
+}
+
+// applyV022ProfileTools merges the v0.22 increment into one seed profile.
+func applyV022ProfileTools(profile agent.AgentProfile) agent.AgentProfile {
+	return mergeProfileTools(profile, v022ProfileTools[profile.Key])
+}
+
 // P1Profiles returns fresh seed definitions. The clarification Host carries the
 // v0.22 R-A2-2 envelope (12 turns / 600s soft / 900s hard); EnsureProfiles never
 // overwrites admin edits. v0.22 D-B1 removed the requirement Curator seed.
@@ -236,6 +289,7 @@ func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.
 	for i := range seeds {
 		seeds[i] = applyP5ProfileTools(seeds[i])
 		seeds[i] = applyP7ProfileTools(seeds[i])
+		seeds[i] = applyV022ProfileTools(seeds[i])
 	}
 	// The role catalog is the outer permission boundary: a seed profile that
 	// executes a catalog role must stay inside that role's tool whitelist. Fail

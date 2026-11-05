@@ -159,6 +159,18 @@ var roleSpecs = []RoleSpec{
 			tools.ToolCodeRoutes,
 			tools.ToolCodeAPIs,
 			tools.ToolKnowledgePropose,
+			// v0.22 W0 Host tools (Task 36): plan/structured question on both
+			// Hosts, clarification retrieval, the completion declaration, the
+			// image handle and the read-only DB inventory. The catalog remains
+			// the outer boundary; the profile lists stay narrower where a tool
+			// only makes sense for one Host.
+			tools.ToolPlanUpdate,
+			tools.ToolQuestionAsk,
+			tools.ToolClarificationSearch,
+			tools.ToolTaskComplete,
+			tools.ToolAttachmentImageRef,
+			tools.ToolSUTDatabaseList,
+			tools.ToolToolResultRead,
 		},
 		Profiles: []string{
 			ProfileKeyClarificationHost,
@@ -191,6 +203,10 @@ var roleSpecs = []RoleSpec{
 			tools.ToolCodeImpact,
 			tools.ToolCodeAnchors,
 			tools.ToolKnowledgePropose,
+			// v0.22 W0: the design author reads the read-only DB inventory and
+			// declares its completion through the verified plan/design target.
+			tools.ToolSUTDatabaseList,
+			tools.ToolTaskComplete,
 		},
 		Profiles: []string{
 			ProfileKeyDesignAuthor,
@@ -210,6 +226,8 @@ var roleSpecs = []RoleSpec{
 			tools.ToolContextTaskPack,
 			tools.ToolDesignGraphRead,
 			tools.ToolDesignReviewSubmit,
+			tools.ToolSUTDatabaseList,
+			tools.ToolTaskComplete,
 		},
 		Profiles: []string{
 			ProfileKeyDesignCritic,

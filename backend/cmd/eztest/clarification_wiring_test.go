@@ -46,9 +46,18 @@ func (f *fakeConvergeRequirements) Get(_ context.Context, _, _ int64) (versionap
 
 func newStageClarificationConvergerForTest(stage versiondomain.Stage, drafts int) (stageClarificationConverger, *fakeConvergeStageRepo) {
 	repo := &fakeConvergeStageRepo{stage: stage}
-	machine := versionapp.NewStageMachine(repo, nil, nil, nil, nil)
+	// The v0.22 stage service is the single writer (R-B4-1); the confirming Host
+	// edge only needs the requirement-count gate.
+	service := versionapp.NewStageService(versionapp.StageServiceDeps{
+		Repo: repo,
+		Gates: versionapp.StageGates{
+			RequirementCount: func(context.Context, int64) (int, error) {
+				return drafts, nil
+			},
+		},
+	})
 	return stageClarificationConverger{
-		machine:      machine,
+		service:      service,
 		requirements: &fakeConvergeRequirements{drafts: drafts},
 	}, repo
 }
@@ -75,9 +84,10 @@ func TestStageClarificationConvergerMovesClarifyingVersion(t *testing.T) {
 
 func TestStageClarificationConvergerIgnoresCreatedVersion(t *testing.T) {
 	converger, repo := newStageClarificationConvergerForTest(versiondomain.StageCreated, 2)
-	if err := converger.Converge(context.Background(), 101); err != nil {
-		t.Fatalf("Converge: %v", err)
-	}
+	// A created version is not at the requirement-review edge: the explicit
+	// Request(requirement_review) is rejected and writes nothing. The automatic
+	// created -> clarifying edge is driven by version.created instead.
+	_ = converger.Converge(context.Background(), 101)
 	if len(repo.applied) != 0 {
 		t.Fatalf("created version converged without clarification: %d writes", len(repo.applied))
 	}

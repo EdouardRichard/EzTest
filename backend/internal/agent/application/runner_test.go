@@ -862,16 +862,11 @@ func TestDesignRoundProducesCases(t *testing.T) {
 	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
 		t.Fatalf("proposal = %#v", fixture.design.proposeInput)
 	}
-	proposalInConversation := false
-	for _, message := range fixture.conv.appended {
-		for _, part := range message.Parts {
-			if part.Type == "tool_call" && stringValueForTest(part.Data["name"]) == tools.ToolCaseGraphPropose {
-				proposalInConversation = true
-			}
-		}
-	}
-	if !proposalInConversation {
-		t.Fatal("the design conversation does not record the case-proposal tool call")
+	// R-B1-2 (v0.22 Task 36): the background case author writes artifacts and
+	// the team-room post, never assistant text into the design conversation.
+	// The proposal trace is observable through the design port and the job card.
+	if len(fixture.conv.appended) != 0 {
+		t.Fatalf("background case author appended assistant text: %#v", fixture.conv.appended)
 	}
 	prompt := requestPrompt(fixture.chat.request(0))
 	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id", "视觉基线", "不要用 visual"} {

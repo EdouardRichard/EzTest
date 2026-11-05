@@ -72,6 +72,7 @@ import (
 	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
+	versionpostgres "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 	visualapp "github.com/EdouardRichard/EzTest/backend/internal/visual/application"
 	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
 )
@@ -1026,6 +1027,14 @@ func main() {
 	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, p5Bindings)
 	p5Bindings.SetVersionService(versionSvc, versionRepo)
 	resourceSvc.SetUsageChecker(versionSvc)
+	// v0.22 W0: the plan/fact/handoff services back plan.update, task.complete,
+	// the design handoff artifact and the attachment image-caption facts
+	// (Task 9/11/19/27/36).
+	planSvc := versionapp.NewPlanService(versionpostgres.NewPlanRepository(pool), ids, eventSvc)
+	factSvc := versionapp.NewFactService(versionpostgres.NewFactRepository(pool, ids), ids, eventSvc)
+	handoffSvc := versionapp.NewHandoffService(
+		versionpostgres.NewHandoffStore(pool), versionpostgres.NewHandoffReader(pool), ids, eventSvc)
+	clarificationSearch := versionpostgres.NewClarificationSearchStore(pool)
 	designRepo := designpg.New(pool)
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
 
@@ -1045,6 +1054,13 @@ func main() {
 	attachmentSvc := versionapp.NewAttachmentService(
 		versionpg.NewAttachmentRepository(pool), contentstore.New(storageSvc), enqueuer,
 		attachments.NewParser(), attachments.NewImageProber(), eventSvc, ids, clk)
+	// v0.22 R-E2/R-E3: image analysis is fail-closed until the vision captioner
+	// and the version-fact recorder are wired. The captioner resolves the
+	// default vision-capable model through the real LLM gateway; every caption
+	// is persisted as an attachment_image_caption fact and reaches the task
+	// pack through the same FactService.
+	attachmentSvc.SetVisionCaptioner(versionadapters.NewVisionCaptioner(llmSvc))
+	attachmentSvc.SetFactRecorder(factSvc)
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
 	conversationSvc.SetModelCatalog(conversationModelCatalog{svc: llmSvc})
@@ -1138,6 +1154,18 @@ func main() {
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
 	executorClient := executioninfra.NewClient(executorURL, executorToken, executioninfra.DefaultTimeout)
 	executorResolver := executioninfra.NewResolver(executorToken, executioninfra.DefaultTimeout)
+	// v0.22 Task 34/36: probe the executor authentication once at startup. The
+	// probe is log-only: a missing/offline executor keeps the API serving and
+	// the executor-online stage gate (registry heartbeat) stays the authority.
+	go func() {
+		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := executionadapters.NewExecutorSelfCheck(executorURL, executorToken).SelfCheck(checkCtx); err != nil {
+			log.Printf("eztest: executor self-check failed (executor-online gate stays closed until heartbeat): %v", err)
+			return
+		}
+		log.Printf("eztest: executor self-check ok endpoint=%s", executorURL)
+	}()
 	// P9 explore runtime: the real HTTP explore-action executor, the bounded
 	// version-scoped session cache and the version fact recorder are constructed
 	// once and shared by every exploration caller (Task 36/37). Reuse
@@ -1197,6 +1225,18 @@ func main() {
 		Audit:     auditSvc,
 		Timeout:   1800 * time.Second,
 	})
+	// v0.22 structured questions (R-B3-3): the Host question.ask tool and the
+	// questions API share one service; the message writer persists the question
+	// card/answer echo into the conversation thread.
+	executionQuestions := executionapp.NewQuestionService(executionapp.QuestionServiceDeps{
+		Humans:   executionRepo.Humans,
+		Messages: questionMessageWriterAdapter{pool: pool, ids: ids},
+		Settings: settingsSvc,
+		IDs:      ids,
+		Clock:    clk,
+		Events:   eventSvc,
+		Audit:    auditSvc,
+	})
 	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
 		Intents:  executionRepo.Intents,
 		Cases:    executionCases,
@@ -1225,6 +1265,11 @@ func main() {
 		Events:       eventSvc,
 		Audit:        auditSvc,
 	})
+	// v0.22 stage callbacks: the scheduler/pause/report services are built
+	// before the stage service (which reads the report service), so they
+	// receive a relay that the composition root binds once the stage service
+	// exists (Task 25 fix round 1 / Task 36).
+	stageCallbacks := newStageCallbackRelay()
 	executionPause := executionapp.NewPauseService(executionapp.PauseServiceDeps{
 		Intents:   executionRepo.Intents,
 		Waves:     executionRepo.Waves,
@@ -1236,6 +1281,9 @@ func main() {
 		Clock:     clk,
 		Events:    eventSvc,
 		Audit:     auditSvc,
+		// A cancelled wave is terminal; notify the stage machine so
+		// executing -> reporting is not stranded.
+		StageNotifier: stageCallbacks,
 	})
 	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
 		Intents:  executionRepo.Intents,
@@ -1262,6 +1310,10 @@ func main() {
 		// enforces this as a minimum): a queued work item can wait longer than
 		// 30s before a worker claims it.
 		LeaseTTL: executionapp.DefaultCaseLease,
+		// v0.22 wave-terminal callback and its retry sink (R-B4-3). Both point
+		// at the stage service once the composition root binds the relay.
+		StageNotifier:   stageCallbacks,
+		StageReconciler: stageCallbacks,
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Intents:     executionRepo.Intents,
@@ -1343,6 +1395,9 @@ func main() {
 		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
 		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc),
 	).WithRenderJobs(reportRepo, pdfEnabled, pdfAttempts)
+	// v0.22 report.published callback: only the version report completion read
+	// by the stage gate can advance reporting -> completed.
+	reportSvc.WithReportPublishedNotifier(stageCallbacks)
 
 	// Four-way work-item dispatcher (0.2.1 D21): the only writer of 0.2.1
 	// work_item rows. It enforces the creator-kind matrix, the version-stage
@@ -1369,10 +1424,9 @@ func main() {
 		versionapp.WithCaseGateConfirmer(designCaseGateConfirmer{svc: designGraph}),
 	)
 	// Task 69: the design reconciler is the production caller of the
-	// designing→case_review edge. It checks the design coverage on every event
-	// pass; the stage machine only transitions a version that is still designing,
-	// so the call is idempotent and case_review has no stage-entry job.
-	designPlanner.SetDesignConverger(stageMachine)
+	// designing→case_review edge. The v0.22 StageService is bound as the
+	// converger below, once the stage service exists, so the reconciler never
+	// writes the legacy stage path (R-B4-1).
 	// Task 78: the execution intent gate reads the deterministic stage through
 	// the same adapter, so a case confirmed at the case gate cannot auto-create
 	// an intent/wave. Wired here because the stage machine is assembled after
@@ -1402,6 +1456,39 @@ func main() {
 		Events:        eventSvc,
 		Clock:         clk,
 	})
+	// v0.22 W0 stage service (Task 36): the single orchestrated stage writer for
+	// the production callers. Every gate is adapted from an existing use case;
+	// a missing port fails the edge closed with a typed gate_not_configured.
+	stageService := versionapp.NewStageService(versionapp.StageServiceDeps{
+		Repo:   versionRepo,
+		Jobs:   dispatcher,
+		Audit:  auditSvc,
+		Events: eventSvc,
+		Clock:  clk,
+		Gates: newV022StageGates(v022StageGateDeps{
+			Versions:     versionSvc,
+			Requirements: requirementSvc,
+			Design:       designGraph,
+			Planner:      designPlanner,
+			Executors:    executorRegistry,
+			Waves:        executionRepo.Waves,
+			Reports:      reportSvc,
+			Issues:       issueSvc,
+			Questions:    executionQuestions,
+			Handoff:      handoffSvc,
+			Closer:       versionCloseSvc,
+		}),
+		Waves:       stageWaveReader{waves: executionRepo.Waves},
+		WaveControl: stageWaveControl{waves: executionRepo.Waves, pause: executionPause},
+		Reports:     stageReports{reports: reportSvc},
+		Closer:      stageVersionCloser{closer: versionCloseSvc, versions: versionSvc},
+		Handoff:     handoffSvc,
+	})
+	stageCallbacks.set(stageService)
+	// R-B4-1: the automatic forward edges now go through the stage service.
+	designPlanner.SetDesignConverger(stageAdvancer{service: stageService})
+	stageStarter := stageAdvancer{service: stageService}
+
 	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
 		Closures:     closureRepo,
 		Requirements: requirementRepo,
@@ -1556,7 +1643,7 @@ func main() {
 	runner := agentapp.NewRunner(agentapp.RunnerDeps{
 		Runtime:      runtimeRepo,
 		Chat:         llmSvc,
-		Settings:     settingsSvc,
+		Settings:     windowTokensSettings{reader: settingsSvc},
 		Clock:        clk,
 		IDs:          ids,
 		Events:       eventSvc,
@@ -1569,15 +1656,22 @@ func main() {
 		Content:      ports,
 		Briefing:     briefingBuilder,
 		// A clarification host turn that explicitly requests requirement
-		// confirmation converges the version to requirement_review (S2). The
-		// adapter refuses an empty draft list, so the gate is never opened empty.
-		Clarification: stageClarificationConverger{machine: stageMachine, requirements: requirementSvc},
+		// confirmation converges the version to requirement_review (S2) through
+		// the v0.22 StageService (R-B4-1). The adapter refuses an empty draft
+		// list, so the gate is never opened empty.
+		Clarification: stageClarificationConverger{service: stageService, requirements: requirementSvc},
 		// Task 65: the deterministic consumers of the 0.2.1 stage-entry jobs.
 		// design.cases opens the design round for the hard-gate-confirmed
 		// requirements; execute.batch refreshes the confirmed batch's execution
 		// intents for the deterministic scheduler.
 		DesignRounds: designRoundStarterAdapter{planner: designPlanner},
 		Batches:      executionBatchStarterAdapter{intents: executionIntents},
+		// v0.22 W0 Host tools: plan.update, question.ask, clarification.search
+		// and task.complete (Task 9/11/14/23/27/36).
+		PlanWriter:          planWriterAdapter{plans: planSvc},
+		QuestionAsker:       questionAskerAdapter{questions: executionQuestions},
+		ClarificationSearch: clarificationSearch,
+		Completion:          completionBuilder{plans: planSvc, graph: designGraph, questions: executionQuestions, store: completionStore{plans: planSvc, facts: factSvc}}.Build,
 		// P7 knowledge injection + usage accounting (S6 report §5).
 		Knowledge:      p7rt.KnowledgeAdapter,
 		KnowledgeUsage: p7rt.KnowledgeAdapter,
@@ -1592,6 +1686,11 @@ func main() {
 				Knowledge: p7rt.KnowledgeAdapter,
 				Retrieval: p7rt.KnowledgeAdapter,
 			},
+			// v0.22 A-6: spill/read/prune through the content ledger.
+			ToolResult: tools.ToolResultDeps{
+				Content:  toolContentStore{adapter: ports, storage: storageSvc},
+				Settings: settingsSvc,
+			},
 		},
 		TaskProvider:         executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
 		RunCanceller:         executionRunner,
@@ -1605,6 +1704,22 @@ func main() {
 		agentapp.WithWorkerDrainGate(p7OrchestrationRuntime.Service.IsDraining),
 		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)))
 	var background sync.WaitGroup
+	// v0.22 stage reconciler: retry a lost executing->reporting or
+	// reporting->completed callback. The scheduler's in-memory pending set is
+	// lost on restart and report-published failures have no other retry.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runStageReconciler(ctx, p7OrchestrationRuntime.Leader, versionSvc, versionRepo, stageService, 30*time.Second)
+	}()
+	// v0.22 deterministic attachment pipeline (Task 19/20): pending attachments
+	// are extracted by the server instead of the removed attachment.ingest agent
+	// work item.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runAttachmentExtractionWorker(ctx, p7OrchestrationRuntime.Leader, attachmentSvc, 5*time.Second)
+	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
@@ -1663,8 +1778,9 @@ func main() {
 		reconciler.Notify(event.Type, versionID)
 		// created→clarifying is automatic when a version exists (spec §5.3):
 		// the discovery sub-loop starts and the version leaves the created
-		// stage before the create response is returned.
-		advanceCreatedVersionToClarifying(ctx, stageMachine, event)
+		// stage before the create response is returned. Routed through the
+		// v0.22 StageService (R-B4-1).
+		advanceCreatedVersionToClarifying(ctx, stageStarter, event)
 		// P9 explore analysis (Task 37): every version-scoped event schedules a
 		// coalesced, leader-gated gap/coverage refresh. The analysis performs
 		// its page probes through the shared explore runtime (Login first,
