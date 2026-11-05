@@ -418,7 +418,7 @@ func TestJobRetryClaimAfterHistoricalAttempts(t *testing.T) {
 		pool := testutil.NewDB(t)
 		repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
 		ctx := context.Background()
-		now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		now := time.Now().UTC().Truncate(time.Millisecond)
 		const versionID = int64(7106)
 
 		seedJobControlItem(t, pool, jobControlSeed{
@@ -474,6 +474,9 @@ func TestJobRetryClaimAfterHistoricalAttempts(t *testing.T) {
 
 		// The next automatic retry keeps the log monotonic (4) while the budget
 		// moves 1 -> 2.
+		// FailWorkItem stamps available_at with the database clock, so the
+		// next claim must use a clock at least as new as that write.
+		now = time.Now().UTC().Add(2 * time.Second)
 		reclaimed, err := repo.ClaimWorkItem(ctx, "worker-history-2", now)
 		if err != nil {
 			t.Fatalf("ClaimWorkItem again: %v", err)
@@ -502,7 +505,7 @@ func TestJobRetryClaimAfterHistoricalAttempts(t *testing.T) {
 		pool := testutil.NewDB(t)
 		repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
 		ctx := context.Background()
-		now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		now := time.Now().UTC().Truncate(time.Millisecond)
 		const versionID = int64(7107)
 
 		seedJobControlItem(t, pool, jobControlSeed{
