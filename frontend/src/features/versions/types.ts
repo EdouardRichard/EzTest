@@ -172,52 +172,101 @@ export type UpdateVersionRequest = {
   auto_design_new_requirements?: boolean
 }
 
-/** `CreateVersionRequest` from the OpenAPI contract. */
-export type BindingInput = {
-  sut_id: string
-  environment_id: string
-  code_repository_id?: string | null
-  page_ids: string[]
-  api_ids: string[]
-  database_ids: string[]
-  accounts: Array<{ account_id: string; role?: string }>
-}
-
+/**
+ * `POST /api/versions` request (v0.22 API-15): only the version metadata and the
+ * environment. The SUT is derived from the environment; pages, APIs, databases,
+ * accounts and repositories are no longer accepted here (R-C3-2).
+ */
 export type CreateVersionRequest = {
   title: string
-  bindings: BindingInput[]
+  description: string
+  goal: string
+  environment_id: string
 }
 
-/** Local, editable shape of one SUT binding inside the create wizard. */
-export type BindingDraft = {
-  key: string
-  sutId: string
-  environmentId: string
-  repositoryId: string
-  pageIds: string[]
-  apiIds: string[]
-  databaseIds: string[]
-  accountIds: string[]
+/** One environment-level exclusion document (`version_sut.scope_exclude`). */
+export type BindingScopeExclude = {
+  pages: string[]
+  apis: string[]
+  databases: string[]
 }
 
-export type VersionDraft = {
-  title: string
-  bindings: BindingDraft[]
+/** Per-resource counts of one environment-owned kind (Task 29 binding DTO). */
+export type BindingResourceCounts = {
+  approved: number
+  proposed: number
+  excluded: number
+  included: number
 }
 
-export type BindingErrors = {
-  sutId?: string
-  environmentId?: string
-  pages?: string
-  apis?: string
-  databases?: string
-  accounts?: string
-  repositoryId?: string
+export type BindingCounts = {
+  pages: BindingResourceCounts
+  apis: BindingResourceCounts
+  databases: BindingResourceCounts
 }
 
-export type VersionDraftErrors = {
-  title?: string
-  bindings?: string
-  byBinding: Record<string, BindingErrors>
-  valid: boolean
+/**
+ * One effective repository of a version binding. `included` reports whether the
+ * repository is effective for the version; `source` is `sut` (inherited) or
+ * `override` (version-level include).
+ */
+export type BindingRepositoryRow = {
+  repository: CodeRepositoryResource
+  role: string
+  included: boolean
+  source: string
+}
+
+/**
+ * `GET /api/versions/{id}/binding` read model (v0.22 API-16, Task 29
+ * `bindingOverviewDTO`). `pages`/`apis`/`databases` are the effective
+ * (approved minus excluded) sets; `counts` carries approved/proposed/excluded/
+ * included for every kind.
+ */
+export type VersionBindingOverview = {
+  version_id: string
+  stage: string
+  editable: boolean
+  sut: SutResource
+  environment: EnvironmentResource
+  scope_exclude: BindingScopeExclude
+  counts: BindingCounts
+  pages: PageResource[]
+  apis: ApiResource[]
+  databases: DatabaseResource[]
+  accounts: AccountResource[]
+  repositories: BindingRepositoryRow[]
+  code_baseline_commit: string | null
+}
+
+/**
+ * `PUT|PATCH /api/versions/{id}/binding` partial update (v0.22 API-16). Omitted
+ * fields are untouched; an explicit empty list clears the selection.
+ */
+export type UpdateBindingRequest = {
+  environment_id?: string
+  repository_ids?: string[]
+  account_ids?: string[]
+  scope_exclude?: BindingScopeExclude
+}
+
+/**
+ * One SUT-level repository association (v0.22 API-17, Task 29
+ * `SUTRepositoryView`). Task 37 mounts the route; the wire shape mirrors the
+ * resource application view.
+ */
+export type SutRepository = {
+  id: string
+  sut_id: string
+  repository: CodeRepositoryResource
+  role: string
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+/** `POST /api/suts/{id}/repositories` request body. */
+export type CreateSutRepositoryRequest = {
+  repository_id: string
+  role: string
 }

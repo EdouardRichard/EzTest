@@ -10,6 +10,10 @@ const api = vi.hoisted(() => ({
   getVersion: vi.fn(),
   createVersion: vi.fn(),
   getResourceCatalog: vi.fn(),
+  listSutRepositories: vi.fn(),
+  updateVersionBinding: vi.fn(),
+  getVersionBinding: vi.fn(),
+  bindingErrorDetails: vi.fn(() => null),
 }))
 vi.mock("./api", () => api)
 
@@ -26,17 +30,26 @@ vi.mock("next/navigation", () => ({
   usePathname: () => "/versions",
 }))
 
-import { catalogFixture, versionFixture, versionSummaryFixture } from "./test-fixtures"
+import {
+  bindingOverviewFixture,
+  catalogFixture,
+  versionFixture,
+  versionSummaryFixture,
+} from "./test-fixtures"
 import { VersionsPage } from "./VersionsPage"
 
 describe("VersionsPage", () => {
   beforeEach(() => {
     api.listVersions.mockReset()
     api.getResourceCatalog.mockReset()
+    api.listSutRepositories.mockReset()
     api.createVersion.mockReset()
+    api.updateVersionBinding.mockReset()
     api.listVersions.mockResolvedValue([versionSummaryFixture])
     api.getResourceCatalog.mockResolvedValue(catalogFixture)
+    api.listSutRepositories.mockResolvedValue([])
     api.createVersion.mockResolvedValue(versionFixture)
+    api.updateVersionBinding.mockResolvedValue(bindingOverviewFixture)
     navigation.push.mockReset()
   })
 
@@ -60,10 +73,15 @@ describe("VersionsPage", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "新建版本" })[0] as HTMLElement)
 
     await screen.findByRole("dialog", { name: "新建版本" })
-    await screen.findByLabelText("SUT")
-    fireEvent.change(screen.getByLabelText("版本标题"), { target: { value: "新迭代" } })
-    fireEvent.change(screen.getByLabelText("SUT"), { target: { value: "1001" } })
+    await screen.findByLabelText("版本名称")
+    fireEvent.change(screen.getByLabelText("版本名称"), { target: { value: "新迭代" } })
     fireEvent.change(screen.getByLabelText("环境"), { target: { value: "1101" } })
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByRole("group", { name: /代码仓/ })
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByRole("group", { name: /页面/ })
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
+    await screen.findByText("确认创建")
     fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
 
     await waitFor(() => expect(navigation.push).toHaveBeenCalledWith("/versions/2001?tab=overview"))

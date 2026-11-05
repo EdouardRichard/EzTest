@@ -70,7 +70,7 @@ const COLUMNS: TableColumn<VersionSummary>[] = [
   },
 ]
 
-/** `/versions` list with the multi-SUT create dialog. */
+/** `/versions` list with the environment-only create dialog (v0.22 R-C3). */
 export function VersionsPage() {
   const router = useRouter()
   const [versions, setVersions] = useState<VersionSummary[]>([])
@@ -120,7 +120,7 @@ export function VersionsPage() {
         <EmptyState
           icon={<Layers className="size-5" aria-hidden="true" />}
           title="还没有版本"
-          description="创建第一个版本，绑定 SUT、环境、页面/API、目标库、测试账号与代码仓。"
+          description="创建第一个版本，选择环境后默认继承页面/API/目标库、SUT 代码仓与全局测试账号。"
           action={
             <Button onClick={() => setCreateOpen(true)}>
               <Plus className="size-4" aria-hidden="true" />

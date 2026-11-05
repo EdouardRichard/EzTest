@@ -2,11 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { StageView } from "@/features/design/types"
 
 import {
+  addSutRepository,
+  bindingErrorDetails,
   blockVersion,
   createVersion,
   getResourceCatalog,
   getVersion,
+  getVersionBinding,
   listPlanItems,
+  listSutRepositories,
   listVersions,
   type PlanItem,
   parseStageBlocker,
@@ -20,8 +24,15 @@ import {
   unblockVersion,
   updatePlanItem,
   updateVersion,
+  updateVersionBinding,
 } from "./api"
-import { catalogFixture, versionFixture, versionSummaryFixture } from "./test-fixtures"
+import {
+  bindingOverviewFixture,
+  catalogFixture,
+  orderSutRepositories,
+  versionFixture,
+  versionSummaryFixture,
+} from "./test-fixtures"
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -77,20 +88,13 @@ describe("versions API", () => {
     expect(url).toBe("http://localhost:13333/api/versions/2001")
   })
 
-  it("creates a version with a POST body", async () => {
+  it("creates a version with the environment-only API-15 body", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ data: versionFixture }, 201))
     const payload = {
       title: "订单中心 · 2026 Q4 迭代",
-      bindings: [
-        {
-          sut_id: "1001",
-          environment_id: "1101",
-          page_ids: ["1301"],
-          api_ids: [],
-          database_ids: [],
-          accounts: [],
-        },
-      ],
+      description: "订单迭代",
+      goal: "验证下单",
+      environment_id: "1101",
     }
 
     await expect(createVersion(payload)).resolves.toEqual(versionFixture)
@@ -99,6 +103,86 @@ describe("versions API", () => {
     expect(url).toBe("http://localhost:13333/api/versions")
     expect(init?.method).toBe("POST")
     expect(JSON.parse(String(init?.body))).toEqual(payload)
+  })
+
+  it("reads and updates the version binding with the Task 29 DTO", async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({ data: bindingOverviewFixture }))
+
+    await expect(getVersionBinding("2001")).resolves.toEqual(bindingOverviewFixture)
+
+    let [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/binding")
+    expect(init?.method).toBe("GET")
+
+    const patch = {
+      repository_ids: ["1201", "1202"],
+      account_ids: ["1601"],
+      scope_exclude: { pages: ["1302"], apis: [], databases: ["1501"] },
+    }
+    await expect(updateVersionBinding("2001", patch)).resolves.toEqual(bindingOverviewFixture)
+
+    ;[url, init] = fetchMock.mock.calls[1]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/binding")
+    expect(init?.method).toBe("PUT")
+    expect(JSON.parse(String(init?.body))).toEqual(patch)
+  })
+
+  it("lists and adds SUT-level repositories through API-17", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: orderSutRepositories }))
+
+    await expect(listSutRepositories("1001")).resolves.toEqual(orderSutRepositories)
+    let [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/suts/1001/repositories")
+    expect(init?.method).toBe("GET")
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: orderSutRepositories[0] }, 201))
+    await expect(addSutRepository("1001", { repository_id: "1201", role: "web" })).resolves.toEqual(
+      orderSutRepositories[0],
+    )
+    ;[url, init] = fetchMock.mock.calls[1]
+    expect(url).toBe("http://localhost:13333/api/suts/1001/repositories")
+    expect(init?.method).toBe("POST")
+    expect(JSON.parse(String(init?.body))).toEqual({ repository_id: "1201", role: "web" })
+  })
+
+  it("exposes typed binding 400/409 details for inline form errors", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "invalid_argument",
+            message: "page does not belong to the bound SUT environment",
+            details: { field: "scope_exclude.pages" },
+          },
+        },
+        400,
+      ),
+    )
+    const invalid = await updateVersionBinding("2001", {
+      scope_exclude: { pages: ["9999"], apis: [], databases: [] },
+    }).catch((error: unknown) => error)
+    expect(bindingErrorDetails(invalid)).toEqual({
+      status: 400,
+      code: "invalid_argument",
+      message: "page does not belong to the bound SUT environment",
+      field: "scope_exclude.pages",
+      readOnly: false,
+    })
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "state_conflict",
+            message: "version binding is read-only at stage executing",
+          },
+        },
+        409,
+      ),
+    )
+    const conflict = await updateVersionBinding("2001", {}).catch((error: unknown) => error)
+    expect(bindingErrorDetails(conflict)?.readOnly).toBe(true)
+    expect(bindingErrorDetails(new Error("boom"))).toBeNull()
   })
 
   it("patches the auto design flag for the version", async () => {

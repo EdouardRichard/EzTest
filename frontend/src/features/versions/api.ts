@@ -1,12 +1,16 @@
 import type { StageView, VersionStage } from "@/features/design/types"
-import { ApiError, apiGet, apiGetPage, apiPatch, apiPost } from "@/lib/api-client"
+import { ApiError, apiGet, apiGetPage, apiPatch, apiPost, apiPut } from "@/lib/api-client"
 
 import type {
   Catalog,
+  CreateSutRepositoryRequest,
   CreateVersionRequest,
   ReopenVersionInput,
+  SutRepository,
+  UpdateBindingRequest,
   UpdateVersionRequest,
   Version,
+  VersionBindingOverview,
   VersionSummary,
 } from "./types"
 
@@ -26,7 +30,7 @@ export function getVersionStage(id: string): Promise<StageView> {
   return apiGet<StageView>(`/api/versions/${encodeURIComponent(id)}/stage`)
 }
 
-/** Creates a version with the exact contract payload built by the wizard. */
+/** Creates a version with the API-15 environment-only create payload. */
 export function createVersion(payload: CreateVersionRequest): Promise<Version> {
   return apiPost<Version>("/api/versions", payload)
 }
@@ -46,6 +50,68 @@ export function reopenVersion(id: string, input: ReopenVersionInput): Promise<Ve
 /** SUT/environment/page/API/database/account/repository catalog for the wizard. */
 export function getResourceCatalog(): Promise<Catalog> {
   return apiGet<Catalog>("/api/resources/catalog")
+}
+
+/* ------------------------------- binding (API-16/API-17) ---------------------- */
+
+/** `GET /api/versions/{id}/binding`: Task 29 derived SUT/environment overview. */
+export function getVersionBinding(versionId: string): Promise<VersionBindingOverview> {
+  return apiGet<VersionBindingOverview>(`${versionPath(versionId)}/binding`)
+}
+
+/**
+ * `PUT /api/versions/{id}/binding`: partial binding update (repository
+ * inclusion, account threshold, scope exclusions). The server enforces the
+ * stage gate and returns the refreshed overview.
+ */
+export function updateVersionBinding(
+  versionId: string,
+  payload: UpdateBindingRequest,
+): Promise<VersionBindingOverview> {
+  return apiPut<VersionBindingOverview>(`${versionPath(versionId)}/binding`, payload)
+}
+
+/** One SUT-level repository association route (mounted by Task 37). */
+function sutRepositoriesPath(sutId: string): string {
+  return `/api/suts/${encodeURIComponent(sutId)}/repositories`
+}
+
+/** `GET /api/suts/{id}/repositories`: inherited multi-repository list (API-17). */
+export function listSutRepositories(sutId: string): Promise<SutRepository[]> {
+  return apiGet<SutRepository[]>(sutRepositoriesPath(sutId))
+}
+
+/** `POST /api/suts/{id}/repositories`: associate a global repository with a SUT. */
+export function addSutRepository(
+  sutId: string,
+  payload: CreateSutRepositoryRequest,
+): Promise<SutRepository> {
+  return apiPost<SutRepository>(sutRepositoriesPath(sutId), payload)
+}
+
+/**
+ * Typed details of a binding 400/409 response. A 400 carries the offending
+ * `details.field` (mapped back to a wizard step); a 409 means the binding is
+ * read-only at the current stage. Returns null for every other error.
+ */
+export type BindingErrorDetails = {
+  status: number
+  code: string
+  message: string
+  field: string
+  readOnly: boolean
+}
+
+export function bindingErrorDetails(error: unknown): BindingErrorDetails | null {
+  if (!(error instanceof ApiError)) return null
+  if (error.status !== 400 && error.status !== 409) return null
+  return {
+    status: error.status,
+    code: error.code,
+    message: error.message,
+    field: readDetailString(error.details, "field"),
+    readOnly: error.status === 409,
+  }
 }
 
 /* --------------------------------- stage machine (v0.22 B-4) ---------------------- */
