@@ -489,11 +489,24 @@ func TestRunnerSoftTimeoutDropsTools(t *testing.T) {
 
 func TestRunnerCompactsAndRetriesOnContextOverflow(t *testing.T) {
 	fixture := newRunnerFixture(t)
-	// First model call asks for a tool, the second rejects the accumulated
-	// tool result as context overflow, and the retry must drop that history.
+	fixture.settings.ints["context.keep_recent_messages"] = 1
+	fixture.conv.snapshot.Summary = ""
+	fixture.conv.snapshot.PinnedFacts = nil
+	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+		{ID: 661, Role: "user", Text: "较早需求一"},
+		{ID: 662, Role: "user", Text: "较早需求二"},
+		{ID: 663, Role: "user", Text: "较早需求三"},
+		{ID: 664, Role: "user", Text: "最新需求"},
+	}
+	// First model call asks for a tool, the second rejects the accumulated tool
+	// result as context overflow. The retry folds older history into the rolling
+	// summary, but it must keep the in-flight assistant tool call and its result:
+	// they are newer than the folded range and are not part of the snapshot.
 	fixture.chat.errors = []error{nil, fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
 	fixture.chat.responses = []llmapp.ChatResponse{
 		toolCall(tools.ToolContextVersionPack, `{}`),
+		{Content: "不应被采用的回复"},
+		{Content: "溢出压缩摘要"},
 		{Content: "恢复后的回复"},
 	}
 
@@ -504,19 +517,32 @@ func TestRunnerCompactsAndRetriesOnContextOverflow(t *testing.T) {
 	if result.Status != agent.AgentRunDone {
 		t.Fatalf("result = %#v", result)
 	}
-	if fixture.chat.requestCount() != 3 {
-		t.Fatalf("chat calls = %d, want tool, overflow, retry", fixture.chat.requestCount())
+	if fixture.chat.requestCount() != 4 {
+		t.Fatalf("chat calls = %d, want tool, overflow, summary, retry", fixture.chat.requestCount())
 	}
 	requests := fixture.chat.requests
 	before := requests[1]
-	after := requests[2]
+	after := requests[3]
 	if len(after.Messages) >= len(before.Messages) {
 		t.Fatalf("overflow retry did not shrink messages: before=%d after=%d", len(before.Messages), len(after.Messages))
 	}
-	for _, message := range after.Messages {
-		if message.Role == "tool" {
-			t.Fatalf("overflow retry kept a tool message: %#v", after.Messages)
+	// The folded range is gone; the in-flight tool call/result pair survives.
+	var assistant *llmapp.ChatMessage
+	var toolResult *llmapp.ChatMessage
+	for index := range after.Messages {
+		message := after.Messages[index]
+		if message.Role == "assistant" && len(message.ToolCalls) > 0 {
+			assistant = &after.Messages[index]
 		}
+		if message.Role == "tool" {
+			toolResult = &after.Messages[index]
+		}
+	}
+	if assistant == nil || toolResult == nil {
+		t.Fatalf("overflow retry lost the in-flight tool history: %#v", after.Messages)
+	}
+	if toolResult.ToolCallID != assistant.ToolCalls[0].ID {
+		t.Fatalf("overflow retry tool pairing = %q/%q", assistant.ToolCalls[0].ID, toolResult.ToolCallID)
 	}
 	if !containsEvent(fixture.events, "context.compacted") {
 		t.Fatalf("events = %v", eventTypes(fixture.events))

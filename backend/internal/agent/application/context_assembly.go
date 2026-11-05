@@ -10,6 +10,7 @@ import (
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // contextAssembly is one rendered cache-first round. Packet is the compacted
@@ -577,30 +578,46 @@ func (r *Runner) publishCompactionEvent(state *runState, event agentcontext.Comp
 // pressure/overflow triggers. On a recoverable stop (busy/thrashing/failure)
 // the run keeps its original context; only an unrecoverable overflow is
 // returned as a terminal error.
+//
+// A decision only replaces the live context when the compacted packet actually
+// folded transcript (result.Compacted). A no-op decision leaves state.messages
+// untouched and persists/publishes nothing: it must not write a duplicate
+// summary revision nor emit a before==after context.compacted event (fix round
+// 2).
 func (r *Runner) compactContext(ctx context.Context, state *runState, decision agentcontext.CompactionDecision, keepRecent int) error {
 	previous := state.contextPacket
 	var assembly contextAssembly
 	operation := func(operationCtx context.Context, transaction agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
 		state.lastCompactionID = transaction.ID
+		// The summary bookkeeping below belongs to this transaction only: a
+		// no-op attempt must not inherit a previous compaction's watermark.
+		state.lastCompactionSummary = SummaryResult{}
+		state.lastCompactedMessageID = 0
 		result, err := r.assembleContextWithDecision(operationCtx, state, &previous,
 			agentcontext.InvalidationWindowFull, keepRecent, &decision)
 		if err != nil {
 			return agentcontext.CompactionOutcome{}, err
 		}
 		assembly = result
-		covered := state.lastCompactedMessageID
+		// Persist a new rolling-summary revision only when the compacted packet
+		// really folded transcript. A no-op rebuild also carries the persisted
+		// summary segment, so packetSummary alone cannot decide this.
+		covered := int64(0)
 		summaryVersion := 0
-		if summary := packetSummary(result.Packet); summary != "" {
-			meta := state.lastCompactionSummary.Commit(SummaryInput{
-				VersionID:        state.item.VersionID,
-				ConversationID:   state.payload.ConversationID,
-				CompactionID:     transaction.ID,
-				Trigger:          decision.Trigger,
-				CoveredMessageID: covered,
-				PinnedFacts:      state.input.Conversation.PinnedFacts,
-				Policy:           decision.Policy,
-			}).SummaryMeta
-			summaryVersion = r.persistCompactionSummary(operationCtx, state, summary, covered, decision.Trigger, meta)
+		if result.Compacted {
+			covered = state.lastCompactedMessageID
+			if summary := packetSummary(result.Packet); summary != "" {
+				meta := state.lastCompactionSummary.Commit(SummaryInput{
+					VersionID:        state.item.VersionID,
+					ConversationID:   state.payload.ConversationID,
+					CompactionID:     transaction.ID,
+					Trigger:          decision.Trigger,
+					CoveredMessageID: covered,
+					PinnedFacts:      state.input.Conversation.PinnedFacts,
+					Policy:           decision.Policy,
+				}).SummaryMeta
+				summaryVersion = r.persistCompactionSummary(operationCtx, state, summary, covered, decision.Trigger, meta)
+			}
 		}
 		return agentcontext.CompactionOutcome{
 			BeforeTokens:     result.BeforeTokens,
@@ -626,14 +643,19 @@ func (r *Runner) compactContext(ctx context.Context, state *runState, decision a
 			r.logContextWarning(ctx, "context compaction stopped; keeping the original context", err)
 			return nil
 		}
-		return &RunError{Reason: "context_overflow_unrecoverable", Retryable: false, Cause: err}
+		return compactionRunError(err)
 	}
-	if assembly.Decision == nil {
+	if assembly.Decision == nil || !assembly.Compacted {
+		// No-op decision: nothing was folded, so the live transcript, the
+		// persisted packet chain and the summary ledger stay exactly as they
+		// were. Applying the rebuilt packet here would drop the run's in-flight
+		// assistant/tool messages and publish a before==after event.
 		return nil
 	}
 	// The manager publishes its own event when a publisher is wired; the runner
 	// publishes the extended payload exactly once so the run/conversation scope
-	// and cached_tokens are present in production.
+	// and cached_tokens are present in production. A no-op decision returned
+	// above, so before/after are always a real reduction here.
 	event := agentcontext.CompactionEvent{
 		Trigger:          decision.Trigger,
 		BeforeTokens:     outcome.BeforeTokens,
@@ -650,10 +672,43 @@ func (r *Runner) compactContext(ctx context.Context, state *runState, decision a
 	return nil
 }
 
+// compactionRunError classifies a failed compaction transaction instead of
+// reporting every failure as an unrecoverable context overflow (fix round 2):
+// a canceled run is aborted/interrupted, a prefix-cache violation or an
+// unexpected transaction failure is a retryable tool failure (a fresh attempt
+// can rebuild the chain), and an invalid policy/decision is a terminal payload
+// error. Only the R-A5-11 unrecoverable overflow keeps the dedicated terminal
+// reason.
+func compactionRunError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return contextRunError(err)
+	}
+	if errors.Is(err, agentcontext.ErrContextOverflowUnrecoverable) {
+		return &RunError{Reason: "context_overflow_unrecoverable", Retryable: false, Cause: err}
+	}
+	var apiErr *platform.Error
+	if errors.Is(err, agentcontext.ErrInvalidCompactionPolicy) ||
+		(errors.As(err, &apiErr) && apiErr.Code == "invalid_argument") {
+		return &RunError{Reason: "invalid_payload", Retryable: false, Cause: err}
+	}
+	return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+}
+
 // applyCompactedAssembly installs a successful compaction result in the run:
 // persist the packet, replay the compacted transcript and refresh the prompt
-// size bookkeeping.
+// size bookkeeping. Only the packet base and the current user turn are rebuilt
+// from the compacted packet; the run's in-flight assistant/tool messages (not
+// part of the conversation snapshot the packet replays) are re-appended in
+// order after it, so tool calls and their results are never lost.
 func (r *Runner) applyCompactedAssembly(ctx context.Context, state *runState, assembly contextAssembly) error {
+	inflightStart := state.promptBase
+	if inflightStart < 0 || inflightStart > len(state.messages) {
+		inflightStart = len(state.messages)
+	}
+	inflight := append([]llmapp.ChatMessage(nil), state.messages[inflightStart:]...)
 	state.contextPacket = assembly.Packet
 	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
 	if err != nil {
@@ -675,6 +730,8 @@ func (r *Runner) applyCompactedAssembly(ctx context.Context, state *runState, as
 		}
 	}
 	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
+	state.messages = append(state.messages, inflight...)
+	state.promptBase = len(state.messages) - len(inflight)
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem,
 		systemMessageText(assembly.Packet, state.input), nil, nil); err != nil {
 		return err

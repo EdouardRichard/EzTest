@@ -559,9 +559,14 @@ type runState struct {
 	turns          int
 	usage          map[string]int
 	messages       []llmapp.ChatMessage
-	images         []llmapp.ChatImage
-	userContent    string
-	cards          []ConversationPart
+	// promptBase is the number of leading state.messages rendered from the
+	// persisted packet plus the current user turn. Everything after it is this
+	// run's in-flight assistant/tool history, which the conversation snapshot
+	// does not contain yet and a mid-run compaction must preserve (fix round 2).
+	promptBase  int
+	images      []llmapp.ChatImage
+	userContent string
+	cards       []ConversationPart
 	// streamParts are the 0.2.1 UI streaming parts produced by this run
 	// (thinking/tool_call/error). They are written with the final assistant
 	// message as conversation_message_part rows and published on
@@ -1223,6 +1228,10 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
+	// Everything appended after this point is the run's in-flight transcript
+	// (assistant tool calls and tool results). A mid-run compaction rebuilds the
+	// leading packet+user base and re-appends this suffix via promptBase.
+	state.promptBase = len(state.messages)
 	return nil
 }
 

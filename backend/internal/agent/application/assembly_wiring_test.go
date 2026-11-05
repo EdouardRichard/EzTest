@@ -322,10 +322,20 @@ func TestRunnerPersistsContextCompactionAtWindowBoundary(t *testing.T) {
 		t.Fatalf("recent history = %#v, want the 2 newest messages verbatim", history)
 	}
 	retry := requestPrompt(fixture.chat.request(2))
-	// The folded messages must not be replayed as transcript segments; the
-	// summary itself may legitimately reference their content.
-	if strings.Contains(retry, "历史用户: 消息二：澄清回复") && strings.Contains(retry, "历史用户: 消息三") {
-		t.Fatalf("compact retry replayed more than the summary of the folded range:\n%s", retry)
+	// The folded messages must not be replayed as transcript segments. The
+	// rolling summary legitimately references folded user turns (历史用户: ...),
+	// so the negativity check is per message and skips the summary segment: no
+	// other prompt message may carry a folded message.
+	folded := []string{"消息一：需求背景", "消息二：澄清回复", "消息三：补充需求", "消息四：继续澄清"}
+	for _, message := range fixture.chat.request(2).Messages {
+		if strings.Contains(message.Content, agentapp.SummarySectionHeadings()[0]) {
+			continue
+		}
+		for _, want := range folded {
+			if strings.Contains(message.Content, want) {
+				t.Fatalf("compact retry replayed the folded message %q outside the summary:\n%s", want, message.Content)
+			}
+		}
 	}
 	for _, kept := range []string{"消息五：确认范围", "消息六：最新回复", agentapp.SummarySectionHeadings()[0]} {
 		if !strings.Contains(retry, kept) {
@@ -814,10 +824,29 @@ func TestTaskContextSurvivesWindowFull(t *testing.T) {
 	t.Run("execution task", func(t *testing.T) {
 		provider := &fakeTaskProvider{task: executionTaskFixture()}
 		fixture := newRunnerFixtureWithTaskProvider(t, provider)
+		// An execution run has no Host conversation, so give the overflow
+		// rebuild real transcript to fold: the retry must still carry the task
+		// block even though the packet base was replaced.
+		fixture.settings.ints["context.keep_recent_messages"] = 1
+		fixture.conv.snapshot.Summary = ""
+		fixture.conv.snapshot.PinnedFacts = nil
+		fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+			{ID: 711, Role: "user", Text: "消息一：需求背景"},
+			{ID: 712, Role: "assistant", Text: "消息二：澄清回复"},
+			{ID: 713, Role: "user", Text: "消息三：最新回复"},
+		}
 		fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
-		fixture.chat.responses = []llmapp.ChatResponse{{Content: "恢复后的回复"}}
+		fixture.chat.responses = []llmapp.ChatResponse{
+			{Content: "不应被采用的回复"},
+			{Content: "窗口压缩摘要"},
+			{Content: "恢复后的回复"},
+		}
+		item := fakeWorkItem(agentapp.WorkTypeExecuteCase, agentapp.WorkItemPayload{
+			ConversationID: 20, IntentID: 1001, WaveID: 2001, CaseRunID: 3001, CaseVersionID: 41,
+			DispatchEpoch: 3, DispatchToken: "dispatch-token",
+		})
 
-		if _, err := mustRun(t, fixture, p3CaseItem()); err != nil {
+		if _, err := mustRun(t, fixture, item); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		if len(fixture.repo.packets) != 2 {
@@ -827,10 +856,10 @@ func TestTaskContextSurvivesWindowFull(t *testing.T) {
 		if compacted.InvalidationReason != string(agentcontext.InvalidationWindowFull) {
 			t.Fatalf("invalidation reason = %q, want window_full", compacted.InvalidationReason)
 		}
-		if len(fixture.chat.requests) != 2 {
-			t.Fatalf("chat requests = %d, want overflow, retry", len(fixture.chat.requests))
+		if len(fixture.chat.requests) != 3 {
+			t.Fatalf("chat requests = %d, want overflow, summary, retry", len(fixture.chat.requests))
 		}
-		retry := fixture.chat.request(1)
+		retry := fixture.chat.request(2)
 		last := retry.Messages[len(retry.Messages)-1]
 		if last.Role != "user" {
 			t.Fatalf("retry last message role = %q, want the re-appended user turn", last.Role)
