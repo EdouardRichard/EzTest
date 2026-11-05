@@ -38,11 +38,8 @@ func (a *testAPI) createP4Version(title string) (string, int64) {
 	environment := a.data(a.do(http.MethodPost, "/api/resources/suts/"+sut["id"].(string)+"/environments",
 		map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
 	version := a.data(a.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": title,
-		"bindings": []any{map[string]any{
-			"sut_id": sut["id"], "environment_id": environment["id"],
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          title,
+		"environment_id": environment["id"],
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	parsed, err := strconv.ParseInt(versionID, 10, 64)

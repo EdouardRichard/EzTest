@@ -23,8 +23,24 @@ export type VersionEventHandlers = {
   onRequirementChanged?: (event: VersionEvent) => void
   /** `team_room.post` / `team_room.digest_updated`. */
   onTeamRoomChanged?: (event: VersionEvent) => void
-  /** `version.started` / `version.status_changed`. */
+  /** `version.started` / `version.status_changed` / closed / reopened. */
   onVersionChanged?: (event: VersionEvent) => void
+  /** `version.stage.changed` (v0.22) and the legacy `version.stage_changed`. */
+  onStageChanged?: (event: VersionEvent) => void
+  /** `plan.item_changed`: refresh the version plan overview. */
+  onPlanChanged?: (event: VersionEvent) => void
+  /** `fact.recorded` / `fact.conflict` / `fact.arbitrated`. */
+  onFactChanged?: (event: VersionEvent) => void
+  /** `question.created|answered|expired|reopened|skipped`: refresh the cards. */
+  onQuestionChanged?: (event: VersionEvent) => void
+  /** `handoff.updated`: refresh the clarification handoff projection. */
+  onHandoffChanged?: (event: VersionEvent) => void
+  /** `version.binding.changed`: refresh the binding overview. */
+  onBindingChanged?: (event: VersionEvent) => void
+  /** `extraction.*`: refresh requirement-extraction progress. */
+  onExtractionChanged?: (event: VersionEvent) => void
+  /** `attachment.image.*` / `model.vision.unavailable`: refresh image captions. */
+  onAttachmentImageChanged?: (event: VersionEvent) => void
   /** `design.graph_delta`: refetch the design graph snapshot. */
   onDesignGraphChanged?: (event: VersionEvent) => void
   /** `design.case_version_*` / `design.case_confirmed`: refresh graph and case detail. */
@@ -117,10 +133,49 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           break
         case "version.started":
         case "version.status_changed":
-        case "version.stage_changed":
         case "version.closed":
         case "version.reopened":
           handlersRef.current.onVersionChanged?.(event)
+          break
+        case "version.stage.changed":
+        case "version.stage_changed":
+          // v0.22 publishes the dot name and keeps the legacy underscore name;
+          // both refresh the stage projection and the version header.
+          handlersRef.current.onStageChanged?.(event)
+          handlersRef.current.onVersionChanged?.(event)
+          break
+        case "plan.item_changed":
+          handlersRef.current.onPlanChanged?.(event)
+          break
+        case "fact.recorded":
+        case "fact.conflict":
+        case "fact.arbitrated":
+          handlersRef.current.onFactChanged?.(event)
+          break
+        case "question.created":
+        case "question.answered":
+        case "question.expired":
+        case "question.reopened":
+        case "question.skipped":
+          handlersRef.current.onQuestionChanged?.(event)
+          break
+        case "handoff.updated":
+          handlersRef.current.onHandoffChanged?.(event)
+          break
+        case "version.binding.changed":
+          handlersRef.current.onBindingChanged?.(event)
+          break
+        case "extraction.started":
+        case "extraction.progress":
+        case "extraction.segment_failed":
+        case "extraction.done":
+          handlersRef.current.onExtractionChanged?.(event)
+          break
+        case "attachment.image.extracted":
+        case "attachment.image.analyzed":
+        case "attachment.image.failed":
+        case "model.vision.unavailable":
+          handlersRef.current.onAttachmentImageChanged?.(event)
           break
         case "requirement.closed":
         case "requirement.reopened":
@@ -153,6 +208,7 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "case_run.paused":
         case "case_run.resumed":
         case "case_run.finished":
+        case "case_run.blocked":
         case "case_run.step_finished":
         case "case_run.assertion_finished":
           handlersRef.current.onCaseRunChanged?.(event)

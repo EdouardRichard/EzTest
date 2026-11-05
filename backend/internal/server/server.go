@@ -67,9 +67,19 @@ type Deps struct {
 	Versions      *versionapp.Service
 	Requirements  *versionapp.RequirementService
 	Conversations *versionapp.ConversationService
-	// Stage is the deterministic version stage machine (spec §5.3). It is
-	// optional; nil leaves the stage-machine routes unmounted.
-	Stage         *versionapp.StageMachine
+	// Stage is the v0.22 orchestrated stage service (spec §5.3/R-B4-1). It is
+	// the only writer of version.stage the HTTP layer may use; nil leaves the
+	// stage routes unmounted. The v0.22 task report/Task 37 switch this field
+	// from the legacy *StageMachine so no handler can bypass the gate checks.
+	Stage StageService
+	// W0 v0.22 handler services. They are optional in degraded assemblies (the
+	// route is still mounted and answers 503); the production composition root
+	// always supplies them. Narrow interfaces keep the contract testable.
+	Plans         versionapi.PlanService
+	Facts         versionapi.FactArbitrationService
+	Handoffs      versionapi.HandoffService
+	Attachments   *versionapp.AttachmentService
+	Extraction    versionapi.ExtractionService
 	TeamRoom      *agentapp.TeamRoom
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
@@ -161,22 +171,30 @@ func New(deps Deps) http.Handler {
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
 	versionHandler := versionapi.New(deps.Versions, versionapi.WithVersionReopener(deps.VersionClose))
+	// Legacy hard-gate confirm/reject routes keep their handler interface but are
+	// routed through the v0.22 StageService via the adapter; the new
+	// request/block/pause routes use the same service directly (Task 37).
+	var stageAdapter *stageHTTPAdapter
+	if deps.Stage != nil {
+		stageAdapter = newStageHTTPAdapter(deps)
+	}
 	requirementOptions := []versionapi.RequirementHandlerOption{
 		versionapi.WithRequirementReopener(deps.Closure),
 		versionapi.WithRequirementClosures(deps.Closure),
 	}
 	// Task 78: confirming requirements through the real UI API must advance a
 	// clarifying version to requirement_review instead of leaving it stuck.
-	if deps.Stage != nil {
+	if stageAdapter != nil {
 		requirementOptions = append(requirementOptions,
-			versionapi.WithRequirementStageConverger(deps.Stage))
+			versionapi.WithRequirementStageConverger(stageAdapter))
 	}
 	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements, requirementOptions...)
 	registerVersionRoutes(mux, authenticated, versionHandler)
 	registerRequirementRoutes(mux, authenticated, requirementHandler)
 	var stageHandler *versionapi.StageHandler
-	if deps.Stage != nil {
-		stageHandler = versionapi.NewStageHandler(deps.Stage)
+	if stageAdapter != nil {
+		stageHandler = versionapi.NewStageHandler(stageAdapter)
+		stageHandler.SetStageWorkflow(deps.Stage)
 	}
 	registerStageRoutes(mux, authenticated, stageHandler)
 	conversationHandler := versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter)
@@ -192,6 +210,7 @@ func New(deps Deps) http.Handler {
 	}
 	registerDesignRoutes(mux, authenticated, designHandler)
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
+	registerW0Routes(mux, authenticated, deps)
 	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
 	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
 	registerChainRoutes(mux, authenticated, deps.Chain)
@@ -394,8 +413,9 @@ func registerRequirementRoutes(mux *http.ServeMux, authenticated func(http.Handl
 }
 
 // registerStageRoutes mounts the deterministic version stage-machine API: the
-// stage read plus the two user-only hard gates and the gate reject. A nil
-// handler keeps the route table of a deployment without the stage machine
+// stage read, the two user-only hard gates and the gate reject (legacy
+// contract) plus the v0.22 request/advance/block/unblock/pause/resume writes.
+// A nil handler keeps the route table of a deployment without the stage machine
 // unchanged.
 func registerStageRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.StageHandler) {
 	if h == nil {
@@ -405,6 +425,12 @@ func registerStageRoutes(mux *http.ServeMux, authenticated func(http.Handler) ht
 	mux.Handle("POST /api/versions/{id}/stage/confirm-requirements", authenticated(http.HandlerFunc(h.ConfirmRequirements)))
 	mux.Handle("POST /api/versions/{id}/stage/confirm-cases", authenticated(http.HandlerFunc(h.ConfirmCases)))
 	mux.Handle("POST /api/versions/{id}/stage/reject", authenticated(http.HandlerFunc(h.Reject)))
+	mux.Handle("POST /api/versions/{id}/stage/request", authenticated(http.HandlerFunc(h.Request)))
+	mux.Handle("POST /api/versions/{id}/stage/advance", authenticated(http.HandlerFunc(h.Advance)))
+	mux.Handle("POST /api/versions/{id}/stage/block", authenticated(http.HandlerFunc(h.Block)))
+	mux.Handle("POST /api/versions/{id}/stage/unblock", authenticated(http.HandlerFunc(h.Unblock)))
+	mux.Handle("POST /api/versions/{id}/stage/pause", authenticated(http.HandlerFunc(h.Pause)))
+	mux.Handle("POST /api/versions/{id}/stage/resume", authenticated(http.HandlerFunc(h.Resume)))
 }
 
 func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.ConversationHandler) {

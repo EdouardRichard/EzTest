@@ -316,8 +316,8 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 85 {
-		t.Fatalf("settings count = %d, want 85 (P8 83->85)", len(settings))
+	if len(settings) != 98 {
+		t.Fatalf("settings count = %d, want 98 (v0.22 catalog: 85 -> 98)", len(settings))
 	}
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {
@@ -346,14 +346,19 @@ func TestP0EndToEndFlow(t *testing.T) {
 	if len(catalog["suts"].([]any)) != 1 || len(catalog["repositories"].([]any)) != 1 {
 		t.Fatalf("catalog = %#v", catalog)
 	}
+	// API-15 no longer accepts explicit page/API/database/account/repository
+	// selections: the binding is derived from the environment, so the created
+	// resource IDs only need to be valid (and are exercised through the version
+	// detail below).
+	for _, id := range []string{pageID, apiID, databaseID, accountID, repositoryID} {
+		if id == "" {
+			t.Fatal("resource id is empty")
+		}
+	}
 
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "Order Center Q4",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID, "code_repository_id": repositoryID,
-			"page_ids": []string{pageID}, "api_ids": []string{apiID}, "database_ids": []string{databaseID},
-			"accounts": []any{map[string]any{"account_id": accountID, "role": "buyer"}},
-		}},
+		"title":          "Order Center Q4",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	if version["status"] != "initial" {
@@ -464,11 +469,8 @@ func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P2 Design Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P2 Design Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 
@@ -527,11 +529,8 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P3 Execution Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P3 Execution Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 
@@ -627,11 +626,8 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P3 Happy Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P3 Happy Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	versionIDValue, err := strconv.ParseInt(versionID, 10, 64)
@@ -784,11 +780,8 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 
 	// Evidence of one version is not downloadable through another version.
 	otherVersion := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P3 Other Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P3 Other Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	api.do(http.MethodGet, "/api/versions/"+otherVersion["id"].(string)+"/evidence/960001/content", nil, http.StatusNotFound)
 
@@ -857,11 +850,8 @@ func TestP3ManualIntentForPassedRerun(t *testing.T) {
 	}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "T119 Manual Rerun Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "T119 Manual Rerun Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	versionIDValue, err := strconv.ParseInt(versionID, 10, 64)

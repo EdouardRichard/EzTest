@@ -35,6 +35,15 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("POST /api/human-requests/{humanRequestId}/resolve", authenticated(http.HandlerFunc(h.ResolveHumanRequest)))
 	mux.Handle("POST /api/human-requests/{humanRequestId}/cancel", authenticated(http.HandlerFunc(h.CancelHumanRequest)))
 
+	// Structured clarification questions (v0.22 B §6 / API list). The create and
+	// reopen handlers are Host-run scoped through X-Agent-Run-Id; answer/skip are
+	// ordinary authenticated-user actions.
+	mux.Handle("GET /api/versions/{id}/questions", authenticated(http.HandlerFunc(h.ListQuestions)))
+	mux.Handle("POST /api/versions/{id}/conversations/{cid}/questions", authenticated(http.HandlerFunc(h.CreateQuestion)))
+	mux.Handle("POST /api/versions/{id}/questions/{qid}/answer", authenticated(http.HandlerFunc(h.AnswerQuestion)))
+	mux.Handle("POST /api/versions/{id}/questions/{qid}/skip", authenticated(http.HandlerFunc(h.SkipQuestion)))
+	mux.Handle("POST /api/versions/{id}/questions/{qid}/reopen", authenticated(http.HandlerFunc(h.ReopenQuestion)))
+
 	// Admin executor registry.
 	mux.Handle("GET /api/admin/executors", admin(http.HandlerFunc(h.ListExecutors)))
 	mux.Handle("POST /api/admin/executors/{executorId}/drain", admin(http.HandlerFunc(h.DrainExecutor)))

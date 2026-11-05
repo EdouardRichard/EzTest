@@ -1031,9 +1031,18 @@ func main() {
 	// the design handoff artifact and the attachment image-caption facts
 	// (Task 9/11/19/27/36).
 	planSvc := versionapp.NewPlanService(versionpostgres.NewPlanRepository(pool), ids, eventSvc)
-	factSvc := versionapp.NewFactService(versionpostgres.NewFactRepository(pool, ids), ids, eventSvc)
+	factSvc := versionapp.NewFactService(versionpostgres.NewFactRepository(pool, ids), ids, eventSvc,
+		versionapp.WithFactAudit(auditSvc))
 	handoffSvc := versionapp.NewHandoffService(
 		versionpostgres.NewHandoffStore(pool), versionpostgres.NewHandoffReader(pool), ids, eventSvc)
+	// v0.22 API-5/6/7 (Task 18/37): the extraction service backs the progress
+	// reads and the pause/resume/retry transitions. The segment processor and
+	// the attachment-side extraction source have no production implementation
+	// yet, so Start answers the typed 503 until that worker lands; the plan/fact
+	// milestone stores are already wired for the terminal reconciliation.
+	extractionSvc := versionapp.NewExtractionService(
+		versionpostgres.NewExtractionRepository(pool, ids), nil, eventSvc, clk)
+	extractionSvc.SetMilestoneStores(planSvc, factSvc)
 	clarificationSearch := versionpostgres.NewClarificationSearchStore(pool)
 	designRepo := designpg.New(pool)
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
@@ -1881,7 +1890,12 @@ func main() {
 		Versions:       versionSvc,
 		Requirements:   requirementSvc,
 		Conversations:  conversationSvc,
-		Stage:          stageMachine,
+		Stage:          stageService,
+		Plans:          planSvc,
+		Facts:          factSvc,
+		Handoffs:       handoffSvc,
+		Attachments:    attachmentSvc,
+		Extraction:     extractionSvc,
 		TeamRoom:       teamRoom,
 		DesignGraph:    designGraph,
 		DesignExports:  designExports,

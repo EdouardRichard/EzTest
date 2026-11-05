@@ -194,6 +194,38 @@ info:
     `GET /api/versions/{id}/context-packets/latest` 由 Task 48 装配 reader 后挂载。
     其余 0.2.1 operation 已按实现同步。
 
+    ## v0.22 W0 增量（Task 37，additive）
+
+    来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4/§6/§11.1。
+    P0–0.2.1 的 paths/schemas 语义不变；新增：
+    - 计划写入 `PATCH /api/versions/{id}/plan-items/{itemId}`（乐观锁 `revision`）。
+    - 结构化提问：`GET /api/versions/{id}/questions`、Host 创建/重开、用户 answer/skip。
+    - 交接 `GET /api/versions/{id}/handoff`；事实仲裁 `POST .../facts/{fid}/arbitrate`。
+    - 需求抽取 `GET/POST .../requirements/extractions` 与 `/{runID}/pause|resume|retry`。
+    - 附件图片 `GET /api/versions/{id}/attachments/{attachmentId}/images` 与 `.../reanalyze`
+      （H7：按版本校验附件归属，用户 token 才能读取）。
+    - 绑定/多仓/版本账号：`GET/PUT/PATCH .../binding`、`GET/POST /api/suts/{id}/repositories`、
+      `GET/POST /api/versions/{id}/accounts`。
+    - 阶段写入：`POST .../stage/request|advance|block|unblock|pause|resume`；门禁/迁移冲突统一
+      409 `stage_gate_failed` / `invalid_stage_transition`。JSON 解包沿用
+      `{data,next_cursor,has_more}`（`next_cursor` 为 `null` 或空串表示没有下一页）。
+
+    v0.22 W0 事件（版本频道 `version:{id}`；`version.stage.changed` 与 legacy
+    `version.stage_changed` 并行发布）：
+    - `version.stage.changed`：`{version_id, from, to, reason, actor, stage_entered_at}`
+    - `plan.item_changed`：`{version_id, plan_item_id, phase, title, status, order, revision}`
+    - `fact.recorded` / `fact.conflict` / `fact.arbitrated`：`{version_id, fact_id, kind, key, confidence, source, content_hash, conflict|dropped_ids, keep_id, reason}`
+    - `question.created` / `question.answered` / `question.expired`：`{version_id, question_id, conversation_id, message_id, kind, status, expires_at, answers[]}`
+    - `handoff.updated`：`{version_id, revision, generated_at}`
+    - `version.binding.changed`：`{version_id, changed{...}, actor_id}`
+    - `extraction.started` / `extraction.progress` / `extraction.segment_failed` / `extraction.done`：
+      `{version_id, run_id, attachment_id, status, done_segments, total_segments, ...}`
+    - `case_run.blocked`：`{wave_id, case_run_id, intent_id, reason, action}`（前端执行 Tab 消费）
+
+    `ConversationMessage` 新增 `kind`（DB-3 message kind；question/answer 卡片据此渲染），
+    `PlanItemView` 新增 `revision`；`CreateVersionRequest` 改为环境派生（API-15，旧
+    `bindings[]` 载荷 400）。
+
     `MessagePart` 新增 `thinking`/`tool_call`/`job_card`/`case_card`/`error`/`image` 分支；其中 `image`
     的载荷固定为 `{type,mime,data_ref,width,height}`（`data_ref` 是内容账本 64 位小写 hex，`width`/`height`
     ≥1 且总像素不超过 40,000,000），图片 part 只存在于消息快照（用户消息），不是
@@ -2222,9 +2254,9 @@ paths:
       operationId: createVersion
       summary: 创建版本（登录用户）
       description: |
-        1–20 个 binding；`sut_id` 不重复；环境/页面/API 必须属于同一 SUT+环境；页面/API ID 去重且保留排序；
-        库/账号属于该 SUT+环境；仓库必须存在。校验失败 400 并返回 `details.field`。
-        创建即 `initial`，事件 `version.created` 同时发到 `system` 与 `version:{id}`。
+        v0.22 API-15：`environment_id` 必填，SUT/页面/API/库/账号/仓库由环境与 SUT 派生；
+        旧的 `bindings[]` 载荷返回 400。创建即 `initial`，事件 `version.created` 同时发到
+        `system` 与 `version:{id}`。
       requestBody:
         required: true
         content:
@@ -2457,15 +2489,23 @@ paths:
     get:
       tags: [Conversations]
       operationId: listConversationMessages
-      summary: 消息列表（id 升序，登录用户）
+      summary: 消息列表（id 升序，登录用户；默认最新页）
       description: |
-        `after` 是消息 ID 游标（十进制字符串），返回 id 大于 `after` 的消息，按 id 升序；
-        省略 `after` 从最早消息开始。默认 100 条，最大 200 条。
-        SSE `conversation.message` 包含完整 message 对象，可直接渲染。
+        API-8/H4：无游标时返回**最新一页**（id 升序），`before` 是向更早翻页的游标；
+        `after` 保留 P1 的向更新翻页语义。响应 `has_more`/`next_cursor` 始终存在；
+        向更早翻页时 `next_cursor` 是本页最旧消息 ID，`before` 不可再前进时为空串。
+        默认 100 条，最大 200 条。SSE `conversation.message` 包含完整 message 对象。
       parameters:
         - $ref: '#/components/parameters/ID'
         - $ref: '#/components/parameters/CID'
         - $ref: '#/components/parameters/MessageAfter'
+        - name: before
+          in: query
+          required: false
+          description: 返回 id 小于该值的消息（最新页之后向更早翻页）
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
         - $ref: '#/components/parameters/MessageLimit'
       responses:
         '200':
@@ -7477,6 +7517,850 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  # ===========================================================================
+  # v0.22 W0 increment (Task 37). Additive only: the frozen P0-P8/0.2.1 paths and
+  # schemas above keep their semantics; these paths mirror the handlers wired by
+  # the W0 server assembly.
+  # ===========================================================================
+  /api/versions/{id}/plan-items/{itemId}:
+    patch:
+      tags: [Versions]
+      operationId: updatePlanItem
+      summary: 写入版本计划项（乐观锁 revision）
+      description: |
+        API-4。`revision` 必填且必须等于最近一次读取到的 revision；过期写入返回
+        409 `conflict`，details 带 `item_id`/`expected_revision`/`actual_revision`。
+        成功返回写入后的计划项（含新 revision），并发布 `plan.item_changed`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: itemId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanItemPatchRequest'
+      responses:
+        '200':
+          description: 写入后的计划项
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PlanItemWrite'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/handoff:
+    get:
+      tags: [Clarification]
+      operationId: getVersionHandoff
+      summary: 版本澄清交接文档（登录用户）
+      description: |
+        B §8.1。无 `revision` 返回最新重；未知版本/版本重 404。六块内容
+        requirements/qa/decisions/open/plan/resources 始终存在（数组不为 null）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: revision
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: 交接文档
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HandoffView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/facts/{fid}/arbitrate:
+    post:
+      tags: [Versions]
+      operationId: arbitrateVersionFact
+      summary: 仲裁冲突事实（登录用户）
+      description: |
+        API-13。`decision=keep|drop` + `reason`（必填）。重复同一决策幂等 200；
+        已解决/非冲突事实 409 `state_conflict`。成功写 `superseded_by`、审计与
+        `fact.arbitrated` 事件，响应 `dropped_ids` 与 `current[]`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: fid
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FactArbitrationRequest'
+      responses:
+        '200':
+          description: 仲裁结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/FactArbitrationView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/extractions:
+    get:
+      tags: [Requirements]
+      operationId: getRequirementExtraction
+      summary: 需求抽取进度/对账（登录用户）
+      description: |
+        API-5。默认返回版本最新一次 run；`run_id` 选指定 run，`attachment_id`
+        选该附件最新 run。版本没有任何 run 时 404；响应含 segment 游标、
+        expected/extracted/missing/planned 对账与 coverage。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: run_id
+          in: query
+          required: false
+          schema: {type: string, pattern: '^[0-9]+$'}
+        - name: attachment_id
+          in: query
+          required: false
+          schema: {type: string, pattern: '^[0-9]+$'}
+      responses:
+        '200':
+          description: 抽取进度
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExtractionRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Requirements]
+      operationId: startRequirementExtraction
+      summary: 触发/重跑需求抽取（登录用户）
+      description: |
+        API-6。body 可选 `attachment_id`；省略表示版本全部就绪附件。按
+        (attachment_id, input_sha256) 幂等，重跑不产生重复 run。响应 `runs[]`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtractionStartRequest'
+      responses:
+        '200':
+          description: 已开始的 run 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExtractionStartResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/extractions/{runID}/pause:
+    post:
+      tags: [Requirements]
+      operationId: pauseRequirementExtraction
+      summary: 暂停抽取 run（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RunID'
+      responses:
+        '200': {$ref: '#/components/responses/ExtractionRun'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/requirements/extractions/{runID}/resume:
+    post:
+      tags: [Requirements]
+      operationId: resumeRequirementExtraction
+      summary: 恢复抽取 run（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RunID'
+      responses:
+        '200': {$ref: '#/components/responses/ExtractionRun'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/requirements/extractions/{runID}/retry:
+    post:
+      tags: [Requirements]
+      operationId: retryRequirementExtraction
+      summary: 重试抽取 run/失败 segment（登录用户）
+      description: body 可选 `segment_seq`；省略重试整个失败 run。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RunID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                segment_seq:
+                  type: integer
+                  minimum: 1
+      responses:
+        '200': {$ref: '#/components/responses/ExtractionRun'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/attachments/{attachmentId}/images:
+    get:
+      tags: [Requirements]
+      operationId: listAttachmentImages
+      summary: 附件图片与 caption（登录用户，按版本限定）
+      description: |
+        API-22/H7。服务端先校验附件属于路径版本，再返回 attachment_image 行；
+        `url` 是鉴权内容下载路径，原始字节不在 JSON 中。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/AttachmentID'
+      responses:
+        '200':
+          description: 图片行
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AttachmentImageView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/attachments/{attachmentId}/reanalyze:
+    post:
+      tags: [Requirements]
+      operationId: reanalyzeAttachmentImages
+      summary: 重跑附件图片分析（登录用户，按版本限定）
+      description: |
+        API-21/H7。仅失败/跳过/已抽取的图片行原地重置后重新分析；无视觉模型
+        400 `vision_required`。成功返回刷新后的图片行。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/AttachmentID'
+      responses:
+        '200':
+          description: 刷新后的图片行
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AttachmentImageView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/binding:
+    get:
+      tags: [Resources]
+      operationId: getVersionBinding
+      summary: 版本绑定概览（登录用户）
+      description: API-16。派生 SUT/环境、有效仓库、账号子集、scope 排除、阶段门禁与快照引用。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 绑定概览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/BindingOverview'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+    put:
+      tags: [Resources]
+      operationId: updateVersionBinding
+      summary: 更新版本绑定（登录用户；与 PATCH 同语义）
+      description: API-16 部分更新。省略字段不变；显式空仓库/账号数组表示清空。阶段只读时 409。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BindingUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的绑定概览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/BindingOverview'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+    patch:
+      tags: [Resources]
+      operationId: patchVersionBinding
+      summary: 部分更新版本绑定（登录用户；与 PUT 同语义）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BindingUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的绑定概览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/BindingOverview'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/suts/{id}/repositories:
+    get:
+      tags: [Resources]
+      operationId: listSUTRepositories
+      summary: SUT 多仓关联（登录用户）
+      description: API-17。返回 SUT 级全局代码仓关联（role/enabled/source）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: SUT 仓库关联
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SUTRepositoryView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+    post:
+      tags: [Resources]
+      operationId: addSUTRepository
+      summary: 关联全局代码仓到 SUT（登录用户）
+      description: API-17。`repository_id` 必须存在；重复关联 409。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repository_id]
+              properties:
+                repository_id: {type: string, pattern: '^[0-9]+$'}
+                role: {type: string, maxLength: 64}
+      responses:
+        '201':
+          description: 已关联
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SUTRepositoryView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/accounts:
+    get:
+      tags: [Resources]
+      operationId: listVersionAccounts
+      summary: 版本关联测试账号（登录用户）
+      description: API-18。仅返回版本绑定子集。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 版本账号
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TestAccount'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+    post:
+      tags: [Resources]
+      operationId: addVersionAccounts
+      summary: 追加版本关联测试账号（登录用户）
+      description: API-18。`account_ids` 至少一个；未知/停用账号 400；已绑定账号幂等。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_ids]
+              properties:
+                account_ids:
+                  type: array
+                  minItems: 1
+                  items: {type: string, pattern: '^[0-9]+$'}
+      responses:
+        '200':
+          description: 追加后的账号列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TestAccount'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/questions:
+    get:
+      tags: [Clarification]
+      operationId: listVersionQuestions
+      summary: 版本结构化提问（登录用户）
+      description: |
+        v0.22 B §6。按 `status`（pending/answered/expired/cancelled）过滤；
+        过期 pending 在读取前惰性过期并发布 `question.expired`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, answered, expired, cancelled]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 提问分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/QuestionView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/conversations/{cid}/questions:
+    post:
+      tags: [Clarification]
+      operationId: createVersionQuestions
+      summary: Host 创建结构化提问批次（X-Agent-Run-Id）
+      description: |
+        v0.22 R-B3-1。仅 owning Host run（`X-Agent-Run-Id`）可创建；批次 1–5 题，
+        写入 conversation_message(kind=question) 并发布 `question.created`。
+        用户只回答/跳过，不创建。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CID'
+        - name: X-Agent-Run-Id
+          in: header
+          required: true
+          schema: {type: string, pattern: '^[0-9]+$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateQuestionRequest'
+      responses:
+        '201':
+          description: 已创建的问题批次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/QuestionView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/questions/{qid}/answer:
+    post:
+      tags: [Clarification]
+      operationId: answerVersionQuestion
+      summary: 回答结构化提问（登录用户）
+      description: 校验 required/多选/自由文本后写 conversation_message(kind=answer) 并发布 `question.answered`；同答案幂等。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/QID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswerQuestionRequest'
+      responses:
+        '200':
+          description: 已回答的批次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/QuestionView'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/questions/{qid}/skip:
+    post:
+      tags: [Clarification]
+      operationId: skipVersionQuestion
+      summary: 跳过结构化提问（登录用户）
+      description: 状态置 cancelled；幂等；发布审计。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/QID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: {type: string, maxLength: 2000}
+      responses:
+        '200':
+          description: 已跳过的批次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/QuestionView'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/questions/{qid}/reopen:
+    post:
+      tags: [Clarification]
+      operationId: reopenVersionQuestion
+      summary: Host 重新打开提问（X-Agent-Run-Id）
+      description: 仅 owning Host run 可把 answered/skipped/expired 重新置为 pending。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/QID'
+        - name: X-Agent-Run-Id
+          in: header
+          required: true
+          schema: {type: string, pattern: '^[0-9]+$'}
+      responses:
+        '200':
+          description: 重新打开后的批次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/QuestionView'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/stage/request:
+    post:
+      tags: [Versions]
+      operationId: requestVersionStage
+      summary: 请求推进版本阶段（登录用户）
+      description: |
+        R-B4-1。仅接受确定性前进边；blocked/paused 用专用 block/pause 路由。
+        门禁拒绝 409 `stage_gate_failed`（details.gate/reason/action/next）；
+        非法迁移 409 `invalid_stage_transition`（details.from/to/action）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to:
+                  $ref: '#/components/schemas/VersionStage'
+      responses:
+        '200': {$ref: '#/components/responses/StageViewResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/stage/advance:
+    post:
+      tags: [Versions]
+      operationId: advanceVersionStage
+      summary: 推进到下一个工作流阶段（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200': {$ref: '#/components/responses/StageViewResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/stage/block:
+    post:
+      tags: [Versions]
+      operationId: blockVersionStage
+      summary: 结构化阻塞版本（登录用户）
+      description: kind/reason/action/next 必填（kind 省略为 manual）；写入 version.blocker。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StageBlockRequest'
+      responses:
+        '200': {$ref: '#/components/responses/StageViewResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/stage/unblock:
+    post:
+      tags: [Versions]
+      operationId: unblockVersionStage
+      summary: 解除版本阻塞（登录用户）
+      description: 先校验阻塞清除门禁（未清除 409 `stage_gate_failed`），再恢复到 suspended_from。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200': {$ref: '#/components/responses/StageViewResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/stage/pause:
+    post:
+      tags: [Versions]
+      operationId: pauseVersionStage
+      summary: 暂停版本并优雅暂停运行中的 wave（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: {type: string, maxLength: 2000}
+      responses:
+        '200': {$ref: '#/components/responses/StageViewResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
+  /api/versions/{id}/stage/resume:
+    post:
+      tags: [Versions]
+      operationId: resumeVersionStage
+      summary: 恢复暂停版本（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200': {$ref: '#/components/responses/StageViewResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
 components:
   securitySchemes:
     bearerAuth:
@@ -8413,6 +9297,30 @@ components:
       description: 全文检索（title/content/tags；`websearch_to_tsquery('simple', q)`）
       schema:
         type: string
+    RunID:
+      name: runID
+      in: path
+      required: true
+      description: 需求抽取 run ID（十进制字符串；v0.22 API-7）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    AttachmentID:
+      name: attachmentId
+      in: path
+      required: true
+      description: 需求附件 ID（十进制字符串；H7 版本作用域校验）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    QID:
+      name: qid
+      in: path
+      required: true
+      description: 结构化提问批次 ID（human_request.id 的十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -8522,6 +9430,34 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
+    ExtractionRun:
+      description: 需求抽取 run 进度/对账投影
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data:
+                $ref: '#/components/schemas/ExtractionRunView'
+    StageViewResponse:
+      description: 版本阶段投影
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data:
+                $ref: '#/components/schemas/StageView'
   schemas:
     ErrorEnvelope:
       type: object
@@ -9872,17 +10808,24 @@ components:
           default: []
     CreateVersionRequest:
       type: object
-      required: [title, bindings]
+      description: |
+        v0.22 API-15：只接受环境，SUT/页面/API/数据库/账号/代码仓由环境与 SUT 派生；
+        旧版 `bindings[]` 载荷不再接受（400）。创建即 `initial`。
+      required: [title, environment_id]
       properties:
         title:
           type: string
           minLength: 1
-        bindings:
-          type: array
-          minItems: 1
-          maxItems: 20
-          items:
-            $ref: '#/components/schemas/BindingInput'
+          maxLength: 500
+        description:
+          type: string
+          maxLength: 4000
+        goal:
+          type: string
+          maxLength: 4000
+        environment_id:
+          type: string
+          pattern: '^[0-9]+$'
     UpdateVersionRequest:
       type: object
       properties:
@@ -9957,6 +10900,10 @@ components:
         role:
           type: string
           enum: [user, assistant]
+        kind:
+          type: string
+          description: DB-3 消息 kind（text/question/answer/...）；空串等同 text
+          default: text
         parts:
           type: array
           minItems: 1
@@ -15525,6 +16472,10 @@ components:
           type: integer
           minimum: 0
           description: 计划项排序值（DB 列 `sort_order`；spec/JSON 逻辑字段为 `order`）
+        revision:
+          type: integer
+          minimum: 1
+          description: v0.22 乐观锁版本；PATCH 必须回传读取到的值
         depends_on:
           type: array
           items:
@@ -15724,3 +16675,416 @@ components:
           description: 是否为所属 LLM 配置的 `default_model_id`
         deprecated:
           type: boolean
+
+    # -------------------------------------------------------------------------
+    # v0.22 W0 schemas (Task 37)
+    # -------------------------------------------------------------------------
+    VersionStage:
+      type: string
+      enum: [created, clarifying, requirement_review, designing, case_review, executing, reporting, completed, blocked, paused]
+    PlanItemPatchRequest:
+      type: object
+      description: API-4 部分写入；省略字段不变，revision 必填。
+      required: [revision]
+      properties:
+        title: {type: string, maxLength: 500}
+        status: {type: string, maxLength: 32}
+        decision: {type: string, maxLength: 2000}
+        order: {type: integer, minimum: 0}
+        revision: {type: integer, minimum: 1}
+    PlanItemWrite:
+      type: object
+      required: [id, version_id, phase, title, status, decision, order, revision, depends_on, work_item_id]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        version_id: {type: string, pattern: '^[0-9]+$'}
+        phase: {type: string}
+        title: {type: string}
+        status: {type: string}
+        decision: {type: string}
+        order: {type: integer, minimum: 0}
+        revision: {type: integer, minimum: 1}
+        depends_on:
+          type: array
+          items: {type: string, pattern: '^[0-9]+$'}
+        work_item_id: {type: string, pattern: '^[0-9]+$', nullable: true}
+
+    HandoffRequirement:
+      type: object
+      required: [id, current_version_id, revision, title, description, acceptance_criteria, priority, status, source_quote]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        current_version_id: {type: string, pattern: '^[0-9]+$'}
+        revision: {type: integer, minimum: 1}
+        title: {type: string}
+        description: {type: string}
+        acceptance_criteria: {type: string}
+        priority: {type: string}
+        status: {type: string}
+        source_quote: {type: string}
+        confidence: {type: number, format: double, nullable: true}
+        confirmed_at: {type: string, format: date-time, nullable: true}
+    HandoffQA:
+      type: object
+      required: [question_id, question, options, source_refs, requirement_refs, status, answer_selected, answer_text]
+      properties:
+        question_id: {type: string, pattern: '^[0-9]+$'}
+        message_id: {type: string, pattern: '^[0-9]+$'}
+        conversation_id: {type: string, pattern: '^[0-9]+$'}
+        question_key: {type: string}
+        question: {type: string}
+        options:
+          type: array
+          items:
+            type: object
+            required: [id, label]
+            properties:
+              id: {type: string}
+              label: {type: string}
+        source_refs: {type: array, items: {type: string}}
+        requirement_id: {type: string, pattern: '^[0-9]+$'}
+        requirement_refs: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+        status: {type: string}
+        answer_selected: {type: array, items: {type: string}}
+        answer_text: {type: string}
+        asked_at: {type: string, format: date-time}
+        answered_at: {type: string, format: date-time, nullable: true}
+    HandoffDecision:
+      type: object
+      required: [fact_id, kind, key, summary, source]
+      properties:
+        fact_id: {type: string, pattern: '^[0-9]+$'}
+        kind: {type: string}
+        key: {type: string}
+        summary: {type: string}
+        confidence: {type: number, format: double, nullable: true}
+        source: {type: string}
+        source_ref: {type: string}
+        created_at: {type: string, format: date-time}
+    HandoffOpen:
+      type: object
+      required: [kind, summary, status, source]
+      properties:
+        kind: {type: string}
+        summary: {type: string}
+        status: {type: string}
+        source: {type: string}
+        reference_id: {type: string, pattern: '^[0-9]+$'}
+        question_key: {type: string}
+        created_at: {type: string, format: date-time, nullable: true}
+    HandoffPlanItem:
+      type: object
+      required: [id, phase, title, status, decision]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        phase: {type: string}
+        title: {type: string}
+        status: {type: string}
+        decision: {type: string}
+    HandoffPlan:
+      type: object
+      required: [stage]
+      properties:
+        stage: {type: string}
+        current:
+          allOf:
+            - $ref: '#/components/schemas/HandoffPlanItem'
+          nullable: true
+        next:
+          allOf:
+            - $ref: '#/components/schemas/HandoffPlanItem'
+          nullable: true
+    HandoffResources:
+      type: object
+      required: [suts, pages, apis, accounts, databases, repositories]
+      properties:
+        suts: {type: array, items: {type: object}}
+        pages: {type: array, items: {type: object}}
+        apis: {type: array, items: {type: object}}
+        accounts: {type: array, items: {type: object}}
+        databases: {type: array, items: {type: object}}
+        repositories: {type: array, items: {type: object}}
+    HandoffView:
+      type: object
+      description: B §8.1 六块交接文档；数组始终存在。
+      required: [version_id, revision, generated_at, requirements, qa, decisions, open, plan, resources]
+      properties:
+        version_id: {type: string, pattern: '^[0-9]+$'}
+        revision: {type: integer, minimum: 1}
+        generated_at: {type: string, format: date-time}
+        requirements: {type: array, items: {$ref: '#/components/schemas/HandoffRequirement'}}
+        qa: {type: array, items: {$ref: '#/components/schemas/HandoffQA'}}
+        decisions: {type: array, items: {$ref: '#/components/schemas/HandoffDecision'}}
+        open: {type: array, items: {$ref: '#/components/schemas/HandoffOpen'}}
+        plan: {$ref: '#/components/schemas/HandoffPlan'}
+        resources: {$ref: '#/components/schemas/HandoffResources'}
+
+    FactArbitrationRequest:
+      type: object
+      required: [decision, reason]
+      properties:
+        decision: {type: string, enum: [keep, drop]}
+        reason: {type: string, minLength: 1, maxLength: 2000}
+    FactArbitrationFact:
+      type: object
+      required: [id, kind, key, content_hash, superseded_by]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        kind: {type: string}
+        key: {type: string}
+        confidence: {type: number, format: double, nullable: true}
+        content_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        superseded_by: {type: string, pattern: '^[0-9]+$', nullable: true}
+    FactArbitrationView:
+      type: object
+      required: [version_id, fact_id, kind, key, decision, reason, keep_id, dropped_ids, changed, current]
+      properties:
+        version_id: {type: string, pattern: '^[0-9]+$'}
+        fact_id: {type: string, pattern: '^[0-9]+$'}
+        kind: {type: string}
+        key: {type: string}
+        decision: {type: string, enum: [keep, drop]}
+        reason: {type: string}
+        keep_id: {type: string, pattern: '^[0-9]+$'}
+        dropped_ids: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+        changed: {type: boolean}
+        current: {type: array, items: {$ref: '#/components/schemas/FactArbitrationFact'}}
+
+    ExtractionStartRequest:
+      type: object
+      properties:
+        attachment_id: {type: string, pattern: '^[0-9]+$'}
+    ExtractionSegmentView:
+      type: object
+      required: [id, run_id, seq, heading_path, char_start, char_end, text_sha256, status, attempts, extracted_count, renewed_at]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        run_id: {type: string, pattern: '^[0-9]+$'}
+        seq: {type: integer, minimum: 1}
+        heading_path: {type: string}
+        char_start: {type: integer, minimum: 0}
+        char_end: {type: integer, minimum: 0}
+        text_sha256: {type: string}
+        status: {type: string, enum: [pending, running, done, failed, skipped]}
+        attempts: {type: integer, minimum: 0}
+        extracted_count: {type: integer, minimum: 0}
+        error: {type: string}
+        renewed_at: {type: string, format: date-time, nullable: true}
+    ExtractionRunView:
+      type: object
+      required: [id, version_id, attachment_id, input_sha256, status, total_segments, done_segments, failed_segments, expected, extracted, missing, missing_ids, low_confidence, skipped_images, planned_count, planned_ids, coverage, created_at, updated_at, segments]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        version_id: {type: string, pattern: '^[0-9]+$'}
+        attachment_id: {type: string, pattern: '^[0-9]+$'}
+        input_sha256: {type: string}
+        status: {type: string, enum: [pending, running, paused, done, failed, superseded]}
+        total_segments: {type: integer, minimum: 0}
+        done_segments: {type: integer, minimum: 0}
+        failed_segments: {type: integer, minimum: 0}
+        expected: {type: integer, minimum: 0}
+        extracted: {type: integer, minimum: 0}
+        missing: {type: integer, minimum: 0}
+        missing_ids: {type: array, items: {type: string}}
+        low_confidence: {type: integer, minimum: 0}
+        skipped_images: {type: integer, minimum: 0}
+        planned_count: {type: integer, minimum: 0}
+        planned_ids: {type: array, items: {type: string}}
+        coverage: {type: number, format: double, minimum: 0, maximum: 1}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        segments: {type: array, items: {$ref: '#/components/schemas/ExtractionSegmentView'}}
+    ExtractionStartResult:
+      type: object
+      required: [runs]
+      properties:
+        runs: {type: array, items: {$ref: '#/components/schemas/ExtractionRunView'}}
+
+    AttachmentImageView:
+      type: object
+      required: [id, attachment_id, seq, content_ref_id, sha256, mime, source_kind, status, caption, error, created_at, updated_at]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        attachment_id: {type: string, pattern: '^[0-9]+$'}
+        seq: {type: integer, minimum: 1}
+        content_ref_id: {type: string, pattern: '^[0-9]+$'}
+        sha256: {type: string}
+        url:
+          type: string
+          description: '鉴权内容下载路径（GET /api/content/{sha256}）'
+        mime: {type: string}
+        width: {type: integer, minimum: 0}
+        height: {type: integer, minimum: 0}
+        source_kind: {type: string, enum: [embedded, page_render]}
+        status: {type: string, enum: [extracted, analyzing, done, failed, skipped]}
+        caption: {type: string}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    BindingResourceCounts:
+      type: object
+      required: [approved, proposed, excluded, included]
+      properties:
+        approved: {type: integer, minimum: 0}
+        proposed: {type: integer, minimum: 0}
+        excluded: {type: integer, minimum: 0}
+        included: {type: integer, minimum: 0}
+    BindingCounts:
+      type: object
+      required: [pages, apis, databases]
+      properties:
+        pages: {$ref: '#/components/schemas/BindingResourceCounts'}
+        apis: {$ref: '#/components/schemas/BindingResourceCounts'}
+        databases: {$ref: '#/components/schemas/BindingResourceCounts'}
+    BindingRepositoryRow:
+      type: object
+      required: [repository, role, included, source]
+      properties:
+        repository: {$ref: '#/components/schemas/CodeRepository'}
+        role: {type: string}
+        included: {type: boolean}
+        source: {type: string, enum: [sut, override]}
+    BindingSnapshot:
+      type: object
+      required: [scope_version, frozen_wave_id]
+      properties:
+        scope_version: {type: string}
+        frozen_wave_id: {type: string, pattern: '^[0-9]+$', nullable: true}
+    ScopeExclude:
+      type: object
+      required: [pages, apis, databases]
+      properties:
+        pages: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+        apis: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+        databases: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+    BindingOverview:
+      type: object
+      required: [version_id, stage, editable, sut, environment, scope_exclude, counts, pages, apis, databases, accounts, repositories, code_baseline_commit, snapshot]
+      properties:
+        version_id: {type: string, pattern: '^[0-9]+$'}
+        stage: {$ref: '#/components/schemas/VersionStage'}
+        editable: {type: boolean}
+        sut: {$ref: '#/components/schemas/SUT'}
+        environment: {$ref: '#/components/schemas/Environment'}
+        scope_exclude: {$ref: '#/components/schemas/ScopeExclude'}
+        counts: {$ref: '#/components/schemas/BindingCounts'}
+        pages: {type: array, items: {$ref: '#/components/schemas/Page'}}
+        apis: {type: array, items: {$ref: '#/components/schemas/SutApi'}}
+        databases: {type: array, items: {$ref: '#/components/schemas/TargetDatabase'}}
+        accounts: {type: array, items: {$ref: '#/components/schemas/TestAccount'}}
+        repositories: {type: array, items: {$ref: '#/components/schemas/BindingRepositoryRow'}}
+        code_baseline_commit: {type: string, nullable: true}
+        snapshot: {$ref: '#/components/schemas/BindingSnapshot'}
+    BindingUpdateRequest:
+      type: object
+      description: 省略字段不变；显式空数组清空。
+      properties:
+        environment_id: {type: string, pattern: '^[0-9]+$'}
+        repository_ids: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+        account_ids: {type: array, items: {type: string, pattern: '^[0-9]+$'}}
+        scope_exclude: {$ref: '#/components/schemas/ScopeExclude'}
+    SUTRepositoryView:
+      type: object
+      required: [id, sut_id, repository, role, enabled, source]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        sut_id: {type: string, pattern: '^[0-9]+$'}
+        repository: {$ref: '#/components/schemas/CodeRepository'}
+        role: {type: string}
+        enabled: {type: boolean}
+        source: {type: string}
+
+    QuestionOptionView:
+      type: object
+      required: [id, label]
+      properties:
+        id: {type: string}
+        label: {type: string}
+    QuestionItemView:
+      type: object
+      required: [id, text, options, multiple, allow_free_text, required, source_refs]
+      properties:
+        id: {type: string}
+        text: {type: string}
+        options: {type: array, items: {$ref: '#/components/schemas/QuestionOptionView'}}
+        multiple: {type: boolean}
+        allow_free_text: {type: boolean}
+        required: {type: boolean}
+        source_refs: {type: array, items: {type: string}}
+    QuestionAnswerView:
+      type: object
+      required: [question_id, selected, text]
+      properties:
+        question_id: {type: string}
+        selected: {type: array, items: {type: string}}
+        text: {type: string}
+    QuestionView:
+      type: object
+      required: [id, version_id, conversation_id, message_id, kind, status, batch_id, questions, expires_at, answers, answered_by, answered_at, skipped, created_at]
+      properties:
+        id: {type: string, pattern: '^[0-9]+$'}
+        version_id: {type: string, pattern: '^[0-9]+$'}
+        conversation_id: {type: string, pattern: '^[0-9]+$', nullable: true}
+        message_id: {type: string, pattern: '^[0-9]+$', nullable: true}
+        kind: {type: string}
+        status: {type: string, enum: [pending, answered, expired, cancelled]}
+        batch_id: {type: string}
+        questions: {type: array, minItems: 1, maxItems: 5, items: {$ref: '#/components/schemas/QuestionItemView'}}
+        expires_at: {type: string, format: date-time}
+        answers: {type: array, items: {$ref: '#/components/schemas/QuestionAnswerView'}}
+        answered_by: {type: string, pattern: '^[0-9]+$', nullable: true}
+        answered_at: {type: string, format: date-time, nullable: true}
+        skipped: {type: boolean}
+        created_at: {type: string, format: date-time}
+    CreateQuestionRequest:
+      type: object
+      required: [questions]
+      properties:
+        batch_id: {type: string, maxLength: 128}
+        expires_at: {type: string, format: date-time}
+        questions:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            type: object
+            required: [id, text]
+            properties:
+              id: {type: string, maxLength: 64}
+              text: {type: string, minLength: 1, maxLength: 2000}
+              options:
+                type: array
+                items:
+                  type: object
+                  required: [id, label]
+                  properties:
+                    id: {type: string, maxLength: 64}
+                    label: {type: string, maxLength: 500}
+              multiple: {type: boolean}
+              allow_free_text: {type: boolean}
+              required: {type: boolean}
+              source_refs: {type: array, items: {type: string}}
+    AnswerQuestionRequest:
+      type: object
+      required: [answers]
+      properties:
+        answers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [question_id]
+            properties:
+              question_id: {type: string}
+              selected: {type: array, items: {type: string}}
+              text: {type: string, maxLength: 4000}
+    StageBlockRequest:
+      type: object
+      required: [reason, action, next]
+      properties:
+        kind: {type: string, maxLength: 64}
+        reason: {type: string, minLength: 1, maxLength: 2000}
+        action: {type: string, minLength: 1, maxLength: 2000}
+        next: {type: string, minLength: 1, maxLength: 2000}
