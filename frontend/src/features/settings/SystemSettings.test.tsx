@@ -11,6 +11,9 @@ vi.mock("./GCPanel", () => ({ GCPanel: () => <div data-testid="gc-panel-stub">GC
 vi.mock("./InstancePanel", () => ({
   InstancePanel: () => <div data-testid="instance-panel-stub">实例面板</div>,
 }))
+vi.mock("./ExecutorsPanel", () => ({
+  ExecutorsPanel: () => <div data-testid="executors-panel-stub">执行器面板</div>,
+}))
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

@@ -11,6 +11,7 @@ import { Spinner } from "@/components/ui/Spinner"
 import { CaseCard } from "@/features/conversation/CaseCard"
 import { ErrorPart as ErrorPartView } from "@/features/conversation/ErrorPart"
 import { JobCard } from "@/features/conversation/JobCard"
+import { MessagePartsPanel } from "@/features/conversation/MessagePartsPanel"
 import { ThinkingBlock } from "@/features/conversation/ThinkingBlock"
 import { ToolCallBlock } from "@/features/conversation/ToolCallBlock"
 import type {
@@ -312,6 +313,7 @@ function MessageBubble({
   onCaseSelect?: (caseId: string) => void
   onErrorAction?: (part: ErrorPayload) => void
 }) {
+  const [partsOpen, setPartsOpen] = useState(false)
   // The structured answer is already echoed by the question card; rendering the
   // answer message too would duplicate it as an empty assistant bubble.
   if (isAnswerMessage(message)) return null
@@ -375,7 +377,25 @@ function MessageBubble({
             {message.actual_model}
           </span>
         ) : null}
+        {!isUser ? (
+          <button
+            type="button"
+            data-testid={`message-parts-toggle-${message.id}`}
+            aria-expanded={partsOpen}
+            onClick={() => setPartsOpen((current) => !current)}
+            className="rounded-full border border-border bg-muted px-1.5 py-0.5 font-medium hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {partsOpen ? "收起片段历史" : "查看片段历史"}
+          </button>
+        ) : null}
       </span>
+      {partsOpen ? (
+        <MessagePartsPanel
+          versionId={versionId}
+          conversationId={message.conversation_id}
+          messageId={message.id}
+        />
+      ) : null}
     </article>
   )
 }

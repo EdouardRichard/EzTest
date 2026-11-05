@@ -1,5 +1,7 @@
 import { apiGet, apiPatch } from "@/lib/api-client"
 
+import type { MessagePartView } from "./types"
+
 /** `PublicModelView.capabilities` (OpenAPI, spec §9.1). */
 export type PublicModelCapabilities = {
   supports_tools: boolean
@@ -59,6 +61,24 @@ export type ContextPacketView = {
 export function getLatestContextPacket(versionId: string): Promise<ContextPacketView> {
   return apiGet<ContextPacketView>(
     `/api/versions/${encodeURIComponent(versionId)}/context-packets/latest`,
+  )
+}
+
+/**
+ * GET /api/versions/{id}/conversations/{cid}/messages/{mid}/parts — the
+ * append-only streaming history of one UI-thread message, ordered by `seq`.
+ * `mid` is `conversation_message.id`, not an `agent_message.id`; the service
+ * checks version/conversation/message ownership before returning rows.
+ */
+export function getMessageParts(
+  versionId: string,
+  conversationId: string,
+  messageId: string,
+): Promise<MessagePartView[]> {
+  return apiGet<MessagePartView[]>(
+    `/api/versions/${encodeURIComponent(versionId)}/conversations/${encodeURIComponent(
+      conversationId,
+    )}/messages/${encodeURIComponent(messageId)}/parts`,
   )
 }
 

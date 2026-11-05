@@ -443,6 +443,34 @@ export function getGCRun(id: string): Promise<GCRunDetail> {
   return apiGet<GCRunDetail>(`/api/admin/gc/runs/${encodeURIComponent(id)}`)
 }
 
+// --- Admin executors (read-only roster) ------------------------------------
+
+/** `execution.ExecutorStatus`; `degraded` is registry state, never a label. */
+export type AdminExecutorStatus = "active" | "draining" | "offline"
+
+/** `ExecutorView` from `GET /api/admin/executors` (no token hash). */
+export type AdminExecutor = {
+  id: string
+  name: string
+  endpoint: string
+  status: AdminExecutorStatus
+  capacity: number
+  active_contexts: number
+  labels: Record<string, unknown>
+  last_heartbeat: string | null
+  version: string
+  last_error: string
+}
+
+/**
+ * GET /api/admin/executors — the admin-only executor registry projection.
+ * The read model is health/status only; drain/activate remain separate write
+ * routes and are intentionally not offered by the read-only panel.
+ */
+export function listAdminExecutors(): Promise<AdminExecutor[]> {
+  return apiGet<AdminExecutor[]>("/api/admin/executors")
+}
+
 // --- Admin instances -------------------------------------------------------
 
 export type InstanceStatus = "active" | "draining" | "offline" | "stopped"

@@ -111,6 +111,11 @@ export async function listExports(
   return page.items
 }
 
+/** GET /api/exports/{exportId} — one export artifact's metadata (spec §7.4). */
+export function getExport(exportId: string): Promise<ExportView> {
+  return apiGet<ExportView>(`/api/exports/${encodeURIComponent(exportId)}`)
+}
+
 /** Downloads the export bytes through the shared bearer/401 client. */
 export function downloadExport(exportId: string): ReturnType<typeof apiDownload> {
   return apiDownload(`/api/exports/${encodeURIComponent(exportId)}/download`)

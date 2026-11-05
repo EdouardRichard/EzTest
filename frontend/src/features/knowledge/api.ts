@@ -6,6 +6,7 @@ import type {
   KnowledgeItemView,
   KnowledgeListOptions,
   KnowledgeRevisionView,
+  KnowledgeStatus,
   UpdateKnowledgeInput,
 } from "./types"
 
@@ -41,6 +42,64 @@ export function listKnowledge(
       system_key: options.systemKey,
       tag: options.tag,
       q: options.q,
+      cursor,
+      limit: options.limit ?? 20,
+    })}`,
+  )
+}
+
+/* ---------------------------- structured search --------------------------- */
+
+/** Structured SUT binding projection returned by the search read model. */
+export type KnowledgeSearchBindings = {
+  system_id: string | null
+  environment_id: string | null
+  page_key: string | null
+  api_key: string | null
+  account_role: string | null
+}
+
+/**
+ * `GET /api/knowledge/search` item: the frozen `KnowledgeItemView` plus the
+ * structured bindings and the last verification timestamp. The search is
+ * approved-only by default and never exposes a credential field.
+ */
+export type KnowledgeSearchResult = KnowledgeItemView & {
+  last_verified_at: string | null
+  bindings: KnowledgeSearchBindings
+}
+
+/** Optional filters accepted by `GET /api/knowledge/search`. */
+export type KnowledgeSearchOptions = {
+  /** Free-text query under the retrieval text bound (max 512 runes). */
+  q?: string
+  status?: KnowledgeStatus
+  systemId?: string
+  environmentId?: string
+  pageKey?: string
+  apiKey?: string
+  accountRole?: string
+  limit?: number
+}
+
+/**
+ * GET /api/knowledge/search — the 0.2.1 structured search. `status` defaults to
+ * `approved` on the server, so unpublished knowledge never leaks into the
+ * result unless a reviewer explicitly asks for another state.
+ */
+export function searchKnowledge(
+  options: KnowledgeSearchOptions = {},
+  cursor = "",
+): Promise<ApiPage<KnowledgeSearchResult>> {
+  return apiGetPage<KnowledgeSearchResult>(
+    `/api/knowledge/search${query({
+      q: options.q,
+      status: options.status,
+      system_id: options.systemId,
+      environment_id: options.environmentId,
+      page_key: options.pageKey,
+      api_key: options.apiKey,
+      account_role: options.accountRole,
       cursor,
       limit: options.limit ?? 20,
     })}`,

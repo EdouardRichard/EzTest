@@ -15,6 +15,7 @@ import { ApiError } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { fetchSettings, groupSettings, type Setting, updateSetting } from "./api"
+import { ExecutorsPanel } from "./ExecutorsPanel"
 import { GCPanel } from "./GCPanel"
 import { InstancePanel } from "./InstancePanel"
 
@@ -120,9 +121,7 @@ export function SystemSettings() {
 
   const groups = useMemo(
     () =>
-      groupSettings(
-        (settings ?? []).filter((setting) => !REMOVED_SETTING_KEYS.has(setting.key)),
-      ),
+      groupSettings((settings ?? []).filter((setting) => !REMOVED_SETTING_KEYS.has(setting.key))),
     [settings],
   )
 
@@ -345,6 +344,7 @@ export function SystemSettings() {
 
       <GCPanel />
       <InstancePanel />
+      <ExecutorsPanel />
     </div>
   )
 }

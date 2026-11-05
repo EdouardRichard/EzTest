@@ -7,6 +7,7 @@ import { ApiError } from "@/lib/api-client"
 const api = vi.hoisted(() => ({
   createExport: vi.fn(),
   downloadExport: vi.fn(),
+  getExport: vi.fn(),
 }))
 
 vi.mock("./api", () => api)
@@ -39,9 +40,11 @@ describe("ExportCasesDialog", () => {
   beforeEach(() => {
     api.createExport.mockReset()
     api.downloadExport.mockReset()
+    api.getExport.mockReset()
     download.saveDownload.mockReset()
     api.createExport.mockResolvedValue(exportViewFixture)
     api.downloadExport.mockResolvedValue(DOWNLOAD)
+    api.getExport.mockResolvedValue(exportViewFixture)
   })
 
   afterEach(cleanup)
