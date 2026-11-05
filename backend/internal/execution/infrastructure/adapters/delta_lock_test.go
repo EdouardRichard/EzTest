@@ -3,8 +3,21 @@ package adapters
 // W1-12 fix: the discovery delta lock key is a stable 64-bit hash of
 // (version_id, wave_id). Two cooperative processes must compute the same key
 // for the same wave and different keys for different waves/versions.
+//
+// W1-13 fix: a failed unlock must be logged and the pooled session must be
+// force-closed. A session advisory lock lives on the connection, so returning a
+// still-locked connection to the pool leaks the lock forever.
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
 
 func TestDiscoveryDeltaLockKeyIsStable(t *testing.T) {
 	key := discoveryDeltaLockKey(7, 3)
@@ -22,4 +35,63 @@ func TestDiscoveryDeltaLockKeyIsStable(t *testing.T) {
 	}
 	t.Logf("discovery delta lock key(7,3)=%d key(7,4)=%d key(8,3)=%d",
 		key, discoveryDeltaLockKey(7, 4), discoveryDeltaLockKey(8, 3))
+}
+
+type fakeDeltaLockConn struct {
+	unlockErr error
+	closed    int
+	released  int
+}
+
+func (c *fakeDeltaLockConn) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, c.unlockErr
+}
+
+func (c *fakeDeltaLockConn) Close(context.Context) error {
+	c.closed++
+	return nil
+}
+
+func (c *fakeDeltaLockConn) Release() {
+	c.released++
+}
+
+func captureDefaultLogger(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &logs
+}
+
+func TestReleaseDiscoveryDeltaLockClosesConnectionWhenUnlockFails(t *testing.T) {
+	logs := captureDefaultLogger(t)
+	conn := &fakeDeltaLockConn{unlockErr: errors.New("connection reset by peer")}
+
+	releaseDiscoveryDeltaLock(context.Background(), conn, 42)
+
+	if conn.closed != 1 {
+		t.Fatalf("closed = %d, want 1 (a session lock must never go back to the pool)", conn.closed)
+	}
+	if conn.released != 1 {
+		t.Fatalf("released = %d, want 1", conn.released)
+	}
+	if !strings.Contains(logs.String(), "unlock failed") {
+		t.Fatalf("unlock error was not logged: %s", logs.String())
+	}
+}
+
+func TestReleaseDiscoveryDeltaLockKeepsHealthyConnection(t *testing.T) {
+	captureDefaultLogger(t)
+	conn := &fakeDeltaLockConn{}
+
+	releaseDiscoveryDeltaLock(context.Background(), conn, 42)
+
+	if conn.closed != 0 {
+		t.Fatalf("closed = %d, want 0 for a successful unlock", conn.closed)
+	}
+	if conn.released != 1 {
+		t.Fatalf("released = %d, want 1", conn.released)
+	}
 }

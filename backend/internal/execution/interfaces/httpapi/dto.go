@@ -152,6 +152,19 @@ func optionalQueryID(r *http.Request, field string) (*int64, error) {
 	return &value, nil
 }
 
+// requiredQueryID parses a required positive decimal query ID (API-19
+// wave_id). Missing or non-decimal values are a typed 400.
+func requiredQueryID(r *http.Request, field string) (int64, error) {
+	value, err := optionalQueryID(r, field)
+	if err != nil {
+		return 0, err
+	}
+	if value == nil {
+		return 0, platform.Invalid(field, "is required")
+	}
+	return *value, nil
+}
+
 // parsePositiveIDField parses a required positive decimal body field.
 func parsePositiveIDField(field, raw string) (int64, error) {
 	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)

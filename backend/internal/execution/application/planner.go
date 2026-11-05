@@ -57,6 +57,7 @@ func (s *Scheduler) planVersion(ctx context.Context, versionID int64) error {
 	if err != nil {
 		return err
 	}
+	frozenAt := now.UTC().Format(time.RFC3339)
 	wave := execution.RunWave{
 		ID:            s.ids.Next(),
 		VersionID:     versionID,
@@ -94,6 +95,18 @@ func (s *Scheduler) planVersion(ctx context.Context, versionID int64) error {
 			"wave_id":      platformid.Format(wave.ID),
 			"trigger":      wave.Trigger,
 			"intent_count": len(open),
+		},
+		nil)
+	// R-EX-4/EV-11: the wave scope snapshot is frozen into run_wave above; this
+	// event tells consumers the current wave vs. next-wave scope. It is
+	// best-effort (publishEvent never fails the business write) and is emitted
+	// after wave.created.
+	publishEvent(ctx, s.events, EventVersionScopeSnapshotCreated, versionID,
+		map[string]any{"wave_id": platformid.Format(wave.ID)},
+		map[string]any{
+			"version_id": platformid.Format(versionID),
+			"wave_id":    platformid.Format(wave.ID),
+			"frozen_at":  frozenAt,
 		},
 		nil)
 	return nil
@@ -208,10 +221,7 @@ func buildWaveScopeSnapshot(binding VersionBinding, frozenAt time.Time) (string,
 			APIIDs:        append([]int64(nil), sut.APIIDs...),
 			DatabaseIDs:   append([]int64(nil), sut.DatabaseIDs...),
 			AccountRoles:  append([]string(nil), sut.AccountRoles...),
-			RepositoryIDs: []int64{},
-		}
-		if sut.CodeRepoID != nil {
-			item.RepositoryIDs = []int64{*sut.CodeRepoID}
+			RepositoryIDs: snapshotRepositoryIDs(sut),
 		}
 		sort.Slice(item.PageIDs, func(i, j int) bool { return item.PageIDs[i] < item.PageIDs[j] })
 		sort.Slice(item.APIIDs, func(i, j int) bool { return item.APIIDs[i] < item.APIIDs[j] })
@@ -228,4 +238,18 @@ func buildWaveScopeSnapshot(binding VersionBinding, frozenAt time.Time) (string,
 		return "", err
 	}
 	return string(raw), nil
+}
+
+// snapshotRepositoryIDs is the frozen repository_ids of one binding (DB-19):
+// the deduplicated ascending multi-repository set, or the legacy single
+// CodeRepoID when the binding predates the multi-repository projection.
+func snapshotRepositoryIDs(sut VersionSUTBinding) []int64 {
+	ids := sortedUniqueInt64(sut.RepositoryIDs)
+	if len(ids) > 0 {
+		return ids
+	}
+	if sut.CodeRepoID != nil && *sut.CodeRepoID > 0 {
+		return []int64{*sut.CodeRepoID}
+	}
+	return []int64{}
 }

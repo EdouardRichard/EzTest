@@ -272,6 +272,16 @@ info:
     事件见 `contracts/events.md` §18，表见 `contracts/db-schema.md` §18，任务/角色见
     `contracts/task-types.md` §9。列表沿用 `{data,next_cursor,has_more}`；ID 仍为十进制字符串；
     不新增通用 `Idempotency-Key`（`idempotency_key` 是 `work_item` body/DB 字段，不是 HTTP 头）。
+    ## v0.22 W1 增量（W1-13，additive）
+
+    R-EX-4 / DB-19 / EV-11 / API-19：
+    - 新增 `GET /api/versions/{id}/scope-snapshot?wave_id=`（波次冻结范围快照，inline schema）。
+    - `run_wave.scope_snapshot` 的 `version_suts[].repository_ids` 现在是该 binding 的全部
+      effective 代码仓（去重升序），不是单个基准仓；空集回退 `CodeRepoID` 单值。
+    - wave 创建成功后发布 `version.scope.snapshot_created`：`{version_id, wave_id, frozen_at}`
+      （版本频道 `version:{id}`，best-effort，不影响 wave 创建）。
+    - 当前 wave 的快照冻结不变；新 approved 资源只影响下一 wave。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -3654,6 +3664,62 @@ paths:
                         type: array
                         items:
                           $ref: '#/components/schemas/CaseRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/scope-snapshot:
+    get:
+      tags: [Execution]
+      operationId: getVersionScopeSnapshot
+      summary: 波次冻结范围快照（当前 wave 生效范围；API-19）
+      description: |
+        R-EX-4 / DB-19。返回指定 wave 启动时冻结的 `run_wave.scope_snapshot`，
+        形状为 `{version_id, frozen_at, version_suts:[{version_sut_id, sut_id,
+        environment_id, page_ids, api_ids, database_ids, account_roles,
+        repository_ids}]}`。`repository_ids` 是该 binding 的全部 effective 代码仓
+        （多仓、去重升序），不是单个基准仓；当前 wave 的快照不会因新 approved
+        资源而改变，新资源只在下一 wave 生效。`wave_id` 必填且为十进制 ID
+        （缺失/非法 400）；wave 不存在或不属于该版本一律 404（不泄漏跨版本存在性）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: wave_id
+          in: query
+          required: true
+          description: 波次（run_wave）雪花 ID 的十进制字符串
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      responses:
+        '200':
+          description: 冻结范围快照（空快照返回 {} 对象）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [wave_id, status, scope_snapshot, counts]
+                    properties:
+                      wave_id:
+                        type: string
+                        pattern: '^[0-9]+$'
+                      status:
+                        type: string
+                        enum: [planned, running, paused, done, failed, cancelled]
+                      scope_snapshot:
+                        type: object
+                        additionalProperties: true
+                        description: 冻结的 wave 范围，原样返回；空快照为 {}
+                      counts:
+                        $ref: '#/components/schemas/WaveCounts'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':

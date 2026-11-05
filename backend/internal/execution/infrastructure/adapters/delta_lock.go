@@ -11,11 +11,19 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
+
+// deltaLockCloseTimeout bounds the force-close of a connection whose unlock
+// failed. Closing the session is what releases a session advisory lock, so a
+// failure here is only a degraded log, never a blocked evaluation.
+const deltaLockCloseTimeout = 5 * time.Second
 
 // DiscoveryDeltaLocker holds the (version, wave) delta lock on PostgreSQL.
 type DiscoveryDeltaLocker struct {
@@ -64,7 +72,53 @@ func (l *DiscoveryDeltaLocker) LockDelta(ctx context.Context, versionID, waveID 
 	return func() {
 		// Release on a background context: the lock must be returned even when
 		// the evaluation context was canceled.
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
-		conn.Release()
+		releaseDiscoveryDeltaLock(context.Background(), pooledDeltaLockConn{conn: conn}, key)
 	}, nil
+}
+
+// deltaLockConn is the pooled-connection surface used by the release path. It
+// exists so the leak-prevention behavior is unit-testable without PostgreSQL.
+type deltaLockConn interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Close(ctx context.Context) error
+	Release()
+}
+
+// pooledDeltaLockConn adapts a *pgxpool.Conn: Close closes the underlying
+// session, so the subsequent Release makes the pool destroy it instead of
+// handing a still-locked session to the next caller.
+type pooledDeltaLockConn struct {
+	conn *pgxpool.Conn
+}
+
+func (c pooledDeltaLockConn) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return c.conn.Exec(ctx, sql, args...)
+}
+
+func (c pooledDeltaLockConn) Close(ctx context.Context) error {
+	return c.conn.Conn().Close(ctx)
+}
+
+func (c pooledDeltaLockConn) Release() {
+	c.conn.Release()
+}
+
+// releaseDiscoveryDeltaLock returns a held advisory lock and then releases (or,
+// after an unlock failure, destroys) the pooled connection. A session advisory
+// lock lives on the connection: returning it still locked would leak the lock
+// for every future caller, so an unlock error force-closes the session.
+func releaseDiscoveryDeltaLock(ctx context.Context, conn deltaLockConn, key int64) {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key); err != nil {
+		slog.Default().ErrorContext(ctx,
+			"discovery delta lock: unlock failed; closing the pooled connection to avoid a session-lock leak",
+			"lock_key", key, "error", err)
+		closeCtx, cancel := context.WithTimeout(context.Background(), deltaLockCloseTimeout)
+		if closeErr := conn.Close(closeCtx); closeErr != nil {
+			slog.Default().WarnContext(ctx,
+				"discovery delta lock: force close failed",
+				"lock_key", key, "error", closeErr)
+		}
+		cancel()
+	}
+	conn.Release()
 }

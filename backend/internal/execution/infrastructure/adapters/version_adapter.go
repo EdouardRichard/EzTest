@@ -246,7 +246,36 @@ func mapVersionBinding(item versionapp.BindingView) (executionapp.VersionSUTBind
 			binding.Commit = item.CodeBaselineCommit
 		}
 	}
+	// R-EX-4/DB-19: the wave scope snapshot freezes every effective repository
+	// of the binding (SUT inheritance plus version overrides), not only the
+	// single deterministic baseline repository. Legacy views without the
+	// multi-repository projection keep the single-repository fallback.
+	binding.RepositoryIDs = effectiveRepositoryIDs(item, binding.CodeRepoID)
 	return binding, nil
+}
+
+// effectiveRepositoryIDs returns the deduplicated ascending code-repository IDs
+// of one binding. When the version read model has no repositories list, it
+// falls back to the single baseline repository of the legacy shape.
+func effectiveRepositoryIDs(item versionapp.BindingView, codeRepoID *int64) []int64 {
+	ids := make([]int64, 0, len(item.Repositories)+1)
+	seen := make(map[int64]struct{}, len(item.Repositories)+1)
+	for _, repository := range item.Repositories {
+		id := parseViewID(repository.Repository.ID)
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 && codeRepoID != nil && *codeRepoID > 0 {
+		ids = append(ids, *codeRepoID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // parseViewID parses a decimal resource ID from a view. Invalid IDs become 0.

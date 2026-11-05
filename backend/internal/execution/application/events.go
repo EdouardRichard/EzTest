@@ -40,6 +40,12 @@ const (
 	EventCoverageGap       = "execution.coverage_gap"
 )
 
+// EventVersionScopeSnapshotCreated announces the frozen effective scope of a
+// newly planned wave (R-EX-4/EV-11). It is published after wave.created on the
+// version channel; the payload carries the decimal version/wave IDs and the
+// snapshot frozen_at timestamp.
+const EventVersionScopeSnapshotCreated = "version.scope.snapshot_created"
+
 // publishEvent publishes one event to the version channel. Publishing is
 // best-effort and never fails the business write.
 func publishEvent(ctx context.Context, publisher eventingapp.Publisher, eventType string, versionID int64, scope, payload map[string]any, actorID *int64) {

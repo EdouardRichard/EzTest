@@ -2,10 +2,11 @@ package httpapi
 
 import "net/http"
 
-// Register mounts the execution paths (27 path items / 29 operations as of
-// W1-8/D8) defined by spec §9.2 and the v0.22 B §6 question routes on the shared
-// mux. Every execution operation is available to any logged-in user; executor
-// administration additionally requires the admin guard.
+// Register mounts the execution paths (28 path items / 30 operations as of
+// W1-13) defined by spec §9.2, the v0.22 B §6 question routes and the v0.22
+// R-EX-4 wave scope-snapshot read on the shared mux. Every execution operation
+// is available to any logged-in user; executor administration additionally
+// requires the admin guard.
 func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler) {
 	// Overview / intents.
 	mux.Handle("GET /api/versions/{id}/execution/overview", authenticated(http.HandlerFunc(h.Overview)))
@@ -21,6 +22,8 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("POST /api/versions/{id}/waves/{waveId}/resume", authenticated(http.HandlerFunc(h.ResumeWave)))
 	mux.Handle("POST /api/versions/{id}/waves/{waveId}/cancel", authenticated(http.HandlerFunc(h.CancelWave)))
 	mux.Handle("GET /api/versions/{id}/waves/{waveId}/case-runs", authenticated(http.HandlerFunc(h.ListWaveCaseRuns)))
+	// Frozen wave scope (R-EX-4 / API-19).
+	mux.Handle("GET /api/versions/{id}/scope-snapshot", authenticated(http.HandlerFunc(h.ScopeSnapshot)))
 
 	// Case runs.
 	mux.Handle("GET /api/versions/{id}/case-runs/{caseRunId}", authenticated(http.HandlerFunc(h.GetCaseRun)))
