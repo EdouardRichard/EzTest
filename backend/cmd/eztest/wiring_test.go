@@ -170,6 +170,77 @@ func TestCompletionBuilderResolvesHostTarget(t *testing.T) {
 	}
 }
 
+// TestCompletionBuilderResolvesSettlementTarget pins A-14 at the composition
+// level: the settlement writeback reuses the completion target resolver, so a
+// run without an explicit plan link writes the version's single in-progress
+// item, while an ambiguous version fails closed (the runner then only logs the
+// best-effort warning).
+func TestCompletionBuilderResolvesSettlementTarget(t *testing.T) {
+	store := &fakeWiringCompletionStore{}
+	builder := completionBuilder{
+		plans: fakeWiringPlanCatalog{items: []versiondomain.PlanItem{
+			{ID: 70, VersionID: 7, Status: "done"},
+			{ID: 77, VersionID: 7, Status: "in_progress", Revision: 3},
+		}},
+		store: store,
+	}
+	recorder, err := builder.BuildSettlement(context.Background(), agentapp.CompletionContext{VersionID: 7, WorkItemID: 401})
+	if err != nil || recorder == nil {
+		t.Fatalf("BuildSettlement = %v, %v", recorder, err)
+	}
+	result, err := recorder.RecordSettlement(context.Background(), agentapp.Settlement{
+		VersionID: 7, AgentRunID: 901, Reason: agentapp.BudgetCauseTurns,
+	})
+	if err != nil {
+		t.Fatalf("RecordSettlement: %v", err)
+	}
+	if result.PlanItemID != 77 || store.commits != 1 || store.last.PlanItemID != 77 {
+		t.Fatalf("settlement write = %#v (store commits=%d)", result, store.commits)
+	}
+	if store.last.PlanStatus != agentapp.SettlementPlanStatus || store.last.FactKind != "progress" {
+		t.Fatalf("settlement store write = %#v", store.last)
+	}
+
+	// The explicit work_item_id link wins over the in-progress fallback.
+	linkedWorkItem := int64(401)
+	linkedStore := &fakeWiringCompletionStore{}
+	linkedBuilder := completionBuilder{
+		plans: fakeWiringPlanCatalog{items: []versiondomain.PlanItem{
+			{ID: 88, VersionID: 7, Status: "pending", WorkItemID: &linkedWorkItem},
+			{ID: 77, VersionID: 7, Status: "in_progress"},
+		}},
+		store: linkedStore,
+	}
+	linkedRecorder, err := linkedBuilder.BuildSettlement(context.Background(), agentapp.CompletionContext{VersionID: 7, WorkItemID: 401})
+	if err != nil {
+		t.Fatalf("BuildSettlement(linked): %v", err)
+	}
+	if _, err := linkedRecorder.RecordSettlement(context.Background(), agentapp.Settlement{
+		VersionID: 7, AgentRunID: 902, Reason: agentapp.BudgetCauseTime,
+	}); err != nil {
+		t.Fatalf("RecordSettlement(linked): %v", err)
+	}
+	if linkedStore.last.PlanItemID != 88 {
+		t.Fatalf("linked settlement target = %d, want the work-item link 88", linkedStore.last.PlanItemID)
+	}
+
+	// Ambiguity fails closed instead of guessing which item to settle.
+	ambiguous := completionBuilder{
+		plans: fakeWiringPlanCatalog{items: []versiondomain.PlanItem{
+			{ID: 1, VersionID: 7, Status: "in_progress"},
+			{ID: 2, VersionID: 7, Status: "in_progress"},
+		}},
+		store: store,
+	}
+	if _, err := ambiguous.BuildSettlement(context.Background(), agentapp.CompletionContext{VersionID: 7, WorkItemID: 401}); err == nil {
+		t.Fatal("ambiguous settlement target did not fail closed")
+	}
+	// A missing store is a configuration error, never a fact-only write.
+	if _, err := (completionBuilder{plans: fakeWiringPlanCatalog{}}).BuildSettlement(context.Background(), agentapp.CompletionContext{VersionID: 7}); err == nil {
+		t.Fatal("settlement builder without a store did not fail closed")
+	}
+}
+
 // TestQuestionMessageWriterAdapterRoundTrips pins Critical 1 at the composition
 // level: the adapter hands the conversation service a domain-valid question
 // part (no direct SQL, no question_card type) with the host writer run scope.

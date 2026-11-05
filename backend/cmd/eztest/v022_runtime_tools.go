@@ -424,6 +424,24 @@ func (b completionBuilder) Build(ctx context.Context, run agentapp.CompletionCon
 	}, nil
 }
 
+// BuildSettlement resolves the settlement writeback path of one run (R-A8-3,
+// A §6.12 rule 3). It reuses resolveTarget, so the plan item is the same
+// ordered choice task.complete would write (work-item link → payload
+// plan_item_id → the version's single in-progress item); a fact-only fallback
+// does not exist. The runner calls it only when a run actually ends on the
+// turn/time settlement turn without a verified completion, and treats an error
+// as best-effort (log-only), so a version without a plan item never fails a run.
+func (b completionBuilder) BuildSettlement(ctx context.Context, run agentapp.CompletionContext) (agentapp.SettlementRecorder, error) {
+	if b.plans == nil || b.store == nil {
+		return nil, errors.New("settlement builder: plan catalog or store is not configured")
+	}
+	target, err := b.resolveTarget(ctx, run)
+	if err != nil {
+		return nil, err
+	}
+	return agentapp.NewSettlementService(b.store, target.ID), nil
+}
+
 // resolveTarget applies the ordered completion target resolution documented on
 // completionBuilder. It never guesses between two candidates.
 func (b completionBuilder) resolveTarget(ctx context.Context, run agentapp.CompletionContext) (versiondomain.PlanItem, error) {

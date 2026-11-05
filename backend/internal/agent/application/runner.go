@@ -109,6 +109,13 @@ type RunnerDeps struct {
 	// task.complete (R-A3). A nil builder or a builder error leaves
 	// task.complete unregistered: a forged completion can never end a run.
 	Completion CompletionBuilder
+	// Settlement resolves the per-run settlement writeback (R-A8-3/A-14). It
+	// reuses the completion target resolver and writes the unresolved plan
+	// item's status/decision plus a progress fact when a run ends on the
+	// turn/time settlement turn without a verified completion. A nil builder or
+	// a builder/store error only logs a warning: the writeback is best effort
+	// and never changes the run verdict.
+	Settlement SettlementBuilder
 	// CompactionSummary persists the R-A5-12 summary revision (version =
 	// latest+1, monotonic covered_message_id). Nil disables summary persistence
 	// (the rolling summary still reaches the packet but not the DB).
@@ -149,6 +156,12 @@ type CompletionContext struct {
 // unregistered for the run, so a task whose completion cannot be verified never
 // exposes a half-wired completion tool.
 type CompletionBuilder func(ctx context.Context, run CompletionContext) (tools.CompletionDeps, error)
+
+// SettlementBuilder resolves the settlement writeback path of one run: the
+// target plan item resolved by the same ordered resolver task.complete uses,
+// bound to a SettlementRecorder. It is called only when a run actually ends on
+// the turn/time settlement turn without a verified completion.
+type SettlementBuilder func(ctx context.Context, run CompletionContext) (SettlementRecorder, error)
 
 // conversationWriterPort is the v0.22 single-writer lease surface of the
 // conversation context (R-B1-2, Task 21). The runner type-asserts its
@@ -199,6 +212,7 @@ type Runner struct {
 	questionAsker        tools.QuestionAsker
 	clarificationSearch  tools.ClarificationSearcher
 	completion           CompletionBuilder
+	settlement           SettlementBuilder
 	compactionSummary    SummaryStore
 	compactionManager    *agentcontext.CompactionManager
 }
@@ -250,6 +264,7 @@ func NewRunner(deps RunnerDeps) *Runner {
 		questionAsker:       deps.QuestionAsker,
 		clarificationSearch: deps.ClarificationSearch,
 		completion:          deps.Completion,
+		settlement:          deps.Settlement,
 		compactionSummary:   deps.CompactionSummary,
 		compactionManager:   compactionManager,
 	}
@@ -1979,6 +1994,13 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 		return result, &RunError{Reason: "run_finish_failed", Retryable: true, Cause: err}
 	}
 
+	// R-A8-3/A-14: a run that ended on the turn/time settlement turn without a
+	// verified completion writes the plan item status/decision and a progress
+	// fact back, so the next run's briefing does not keep the stale pre-run
+	// state. This is best effort: the run row above is already terminal and a
+	// resolution/store failure only logs a warning.
+	r.recordSettlementWriteback(state, status, reason)
+
 	eventType := "agent.run.finished"
 	payload := map[string]any{
 		"run_id": idText(state.run.ID),
@@ -2014,6 +2036,82 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 		SettlementCause:  state.settlementCause,
 		SettlementDetail: state.settlementDetail,
 	}, nil
+}
+
+// settlementEndedRun reports whether a terminal run outcome is the settlement
+// writeback trigger: a done run whose terminal reason is the budget that opened
+// the tool-less wrap-up turn, or a budget exhaustion during that wrap-up turn.
+// An interrupted/aborted or model-error run is not "ended by turn/time
+// settlement" and is never written back.
+func settlementEndedRun(status agent.AgentRunStatus, reason, cause string) bool {
+	if cause == "" {
+		return false
+	}
+	switch status {
+	case agent.AgentRunDone:
+		return reason == cause
+	case agent.AgentRunFailed:
+		// The settlement turn itself was still over budget; the plan item is
+		// still incomplete and the next run must see that.
+		return reason == "budget"
+	default:
+		return false
+	}
+}
+
+// recordSettlementWriteback persists the R-A8-3/A-14 plan/fact writeback of a
+// settled run. The completion target resolver is reused through the Settlement
+// builder, so the same ordered link/payload/single-in-progress resolution picks
+// the plan item. Failures are log-only: the run is already finished, and an
+// unresolvable target or a store outage must not change the run verdict.
+func (r *Runner) recordSettlementWriteback(state *runState, status agent.AgentRunStatus, reason string) {
+	if r == nil || r.settlement == nil || state == nil {
+		return
+	}
+	if state.completed || state.settlementCause == "" {
+		return
+	}
+	if !settlementEndedRun(status, reason, state.settlementCause) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finishTimeout)
+	defer cancel()
+	recorder, err := r.settlement(ctx, CompletionContext{
+		WorkType:       state.item.Type,
+		ProfileKey:     state.profile.Key,
+		VersionID:      state.item.VersionID,
+		WorkItemID:     state.item.ID,
+		ConversationID: state.payload.ConversationID,
+		AgentRunID:     state.run.ID,
+		RoundID:        state.payload.RoundID,
+		PlanItemID:     state.payload.PlanItemID,
+	})
+	if err != nil {
+		r.logger.Warn("settlement plan writeback target could not be resolved",
+			"version_id", state.item.VersionID, "work_item_id", state.item.ID,
+			"run_id", state.run.ID, "error", err)
+		return
+	}
+	if recorder == nil {
+		r.logger.Warn("settlement plan writeback target could not be resolved",
+			"version_id", state.item.VersionID, "work_item_id", state.item.ID,
+			"run_id", state.run.ID, "error", "settlement builder returned no recorder")
+		return
+	}
+	result, err := recorder.RecordSettlement(ctx, Settlement{
+		VersionID:  state.item.VersionID,
+		AgentRunID: state.run.ID,
+		Reason:     state.settlementCause,
+	})
+	if err != nil {
+		r.logger.Warn("settlement plan writeback failed",
+			"version_id", state.item.VersionID, "run_id", state.run.ID, "error", err)
+		return
+	}
+	r.logger.Info("settlement plan writeback recorded",
+		"version_id", state.item.VersionID, "run_id", state.run.ID,
+		"plan_item_id", result.PlanItemID, "plan_status", result.PlanStatus,
+		"decision", result.Decision, "fact_id", result.FactID)
 }
 
 func (r *Runner) appendTranscript(ctx context.Context, state *runState, role agent.MessageRole, content string, toolCallID *string, toolCalls []agent.ToolCall) error {

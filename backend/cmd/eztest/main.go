@@ -1670,6 +1670,10 @@ func main() {
 	// execution.visual_assert group resolves its port from the case runner.
 	p5Tools := p5.Tools
 	p5Tools.VisualAssert = executionRunner
+	// v0.22 W0 completion and settlement share one target resolver: the
+	// success-only task.complete write and the A-14 turn/time settlement
+	// writeback must agree on this version/run's one plan item.
+	completion := completionBuilder{plans: planSvc, graph: designGraph, questions: executionQuestions, store: pgCompletionStore{pool: pool, ids: ids}}
 	runner := agentapp.NewRunner(agentapp.RunnerDeps{
 		Runtime:      runtimeRepo,
 		Chat:         llmSvc,
@@ -1701,7 +1705,11 @@ func main() {
 		PlanWriter:          planWriterAdapter{plans: planSvc},
 		QuestionAsker:       questionAskerAdapter{questions: executionQuestions},
 		ClarificationSearch: clarificationSearch,
-		Completion:          completionBuilder{plans: planSvc, graph: designGraph, questions: executionQuestions, store: pgCompletionStore{pool: pool, ids: ids}}.Build,
+		Completion:          completion.Build,
+		// A-14: a run that ends on the turn/time settlement turn without a
+		// verified completion writes the plan item status/decision and a
+		// progress fact back through the same atomic CompletionStore.
+		Settlement: completion.BuildSettlement,
 		// v0.22 A-5 compaction: the policy is resolved per run from the model
 		// window/max_output and compaction.* settings; summaries persist through
 		// the version conversation writer and transactions through the manager.

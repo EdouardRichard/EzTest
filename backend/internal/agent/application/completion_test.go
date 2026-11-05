@@ -8,6 +8,7 @@ package agentapp_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -138,6 +139,107 @@ func TestCompletionServicePropagatesStoreFailure(t *testing.T) {
 		t.Fatalf("error = %v, want the store failure", err)
 	}
 	assertNoPartialWrite(t, store)
+}
+
+// TestSettlementServiceWritesInProgressPlanAndProgressFact pins the A-14
+// writeback set: the plan item is NOT marked done (the work is incomplete), the
+// decision names the budget that ended the run, and the fact is the existing
+// progress kind with a run-bound idempotency key.
+func TestSettlementServiceWritesInProgressPlanAndProgressFact(t *testing.T) {
+	store := &fakeCompletionStore{result: agentapp.CompletionWriteResult{FactID: 88, PlanItemRevision: 5}}
+	service := agentapp.NewSettlementService(store, 9)
+
+	result, err := service.RecordSettlement(context.Background(), agentapp.Settlement{
+		VersionID:  7,
+		AgentRunID: 42,
+		Reason:     agentapp.BudgetCauseTurns,
+	})
+	if err != nil {
+		t.Fatalf("RecordSettlement: %v", err)
+	}
+	if len(store.writes) != 1 {
+		t.Fatalf("store writes = %d, want one atomic write set", len(store.writes))
+	}
+	write := store.writes[0]
+	if write.VersionID != 7 || write.AgentRunID != 42 || write.PlanItemID != 9 {
+		t.Fatalf("write scope = version=%d run=%d item=%d", write.VersionID, write.AgentRunID, write.PlanItemID)
+	}
+	if write.PlanStatus != agentapp.SettlementPlanStatus || write.PlanStatus == agentapp.CompletionPlanStatusDone {
+		t.Fatalf("plan status = %q, want the non-success settlement status", write.PlanStatus)
+	}
+	if write.Decision != "settled by turn budget" {
+		t.Fatalf("decision = %q", write.Decision)
+	}
+	if write.FactKind != agentapp.CompletionFactKindProgress {
+		t.Fatalf("fact kind = %q, want the existing progress kind", write.FactKind)
+	}
+	if write.FactKey != "run.settle:42" || write.Source != agentapp.SettlementFactSource {
+		t.Fatalf("fact identity = key=%q source=%q", write.FactKey, write.Source)
+	}
+	if write.FactPayload["run_id"] != "42" || write.FactPayload["reason"] != agentapp.BudgetCauseTurns ||
+		write.FactPayload["plan_item_id"] != "9" || write.FactPayload["status"] != agentapp.SettlementPlanStatus {
+		t.Fatalf("fact payload = %#v", write.FactPayload)
+	}
+	if result.PlanItemID != 9 || result.PlanStatus != agentapp.SettlementPlanStatus ||
+		result.Decision != "settled by turn budget" || result.FactID != 88 || result.PlanItemRevision != 5 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+// TestSettlementServiceReplayIsIdempotent pins the outbox/replay contract: the
+// same run/cause always builds a byte-identical write set, so the version_fact
+// unique key (version_id, kind, key, content_hash) matches the stored row and a
+// retried writeback does not append a duplicate fact.
+func TestSettlementServiceReplayIsIdempotent(t *testing.T) {
+	store := &fakeCompletionStore{result: agentapp.CompletionWriteResult{FactID: 77, PlanItemRevision: 3}}
+	service := agentapp.NewSettlementService(store, 9)
+	settlement := agentapp.Settlement{VersionID: 7, AgentRunID: 42, Reason: agentapp.BudgetCauseTime}
+
+	if _, err := service.RecordSettlement(context.Background(), settlement); err != nil {
+		t.Fatalf("first RecordSettlement: %v", err)
+	}
+	if _, err := service.RecordSettlement(context.Background(), settlement); err != nil {
+		t.Fatalf("replayed RecordSettlement: %v", err)
+	}
+	if len(store.writes) != 2 {
+		t.Fatalf("store writes = %d, want the replay attempted", len(store.writes))
+	}
+	first, second := store.writes[0], store.writes[1]
+	if first.FactKey != second.FactKey || first.FactKind != second.FactKind ||
+		first.PlanStatus != second.PlanStatus || first.Decision != second.Decision {
+		t.Fatalf("replay write set differs: first=%+v second=%+v", first, second)
+	}
+	if !reflect.DeepEqual(first.FactPayload, second.FactPayload) {
+		t.Fatalf("replay fact payload differs: %#v vs %#v", first.FactPayload, second.FactPayload)
+	}
+}
+
+// TestSettlementServiceRejectsInvalidWrites pins that a settlement can never be
+// written without the server-resolved scope: no target, version, run or a
+// non-budget cause is rejected before the store is touched.
+func TestSettlementServiceRejectsInvalidWrites(t *testing.T) {
+	cases := []struct {
+		name       string
+		planItemID int64
+		settlement agentapp.Settlement
+	}{
+		{"no target", 0, agentapp.Settlement{VersionID: 7, AgentRunID: 42, Reason: agentapp.BudgetCauseTurns}},
+		{"no version", 9, agentapp.Settlement{AgentRunID: 42, Reason: agentapp.BudgetCauseTurns}},
+		{"no run", 9, agentapp.Settlement{VersionID: 7, Reason: agentapp.BudgetCauseTurns}},
+		{"non-budget cause", 9, agentapp.Settlement{VersionID: 7, AgentRunID: 42, Reason: agentapp.BudgetCauseTokens}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeCompletionStore{}
+			service := agentapp.NewSettlementService(store, tc.planItemID)
+			if _, err := service.RecordSettlement(context.Background(), tc.settlement); err == nil {
+				t.Fatal("invalid settlement write was accepted")
+			}
+			if len(store.writes) != 0 {
+				t.Fatalf("store writes = %d, want none", len(store.writes))
+			}
+		})
+	}
 }
 
 // assertNoPartialWrite documents the atomic/outbox contract: the service itself

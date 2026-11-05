@@ -171,3 +171,139 @@ func completionFactKey(scope tools.Scope, planItemID int64) string {
 	}
 	return "task.complete:plan_item:" + platformid.Format(planItemID)
 }
+
+// Settlement writeback contract (v0.22 R-A8-3, A §6.12 rule 3; acceptance
+// A-14). A run that ends on the turn/time settlement turn without a verified
+// completion did not finish its plan item, so the next run's briefing must not
+// keep showing the stale pre-run state.
+const (
+	// SettlementPlanStatus is the plan status written on settlement. The work
+	// was not completed, so the item stays in progress; the decision records
+	// why the run stopped. "blocked" is intentionally not used: the item is
+	// still actionable and a later run/attempt can continue it.
+	SettlementPlanStatus = "in_progress"
+	// SettlementFactKind is the existing progress fact kind ("progress");
+	// v0.22 adds no new fact type for settlement (A §6.12 calls for a
+	// progress/decision fact).
+	SettlementFactKind = CompletionFactKindProgress
+	// SettlementFactSource is the version_fact.source of a settlement fact,
+	// distinct from the verified-completion source task.complete.
+	SettlementFactSource = "run.settlement"
+)
+
+// Settlement is one settled-run writeback request. The target plan item and the
+// version/run scope are server-resolved; the model never supplies them.
+type Settlement struct {
+	VersionID  int64
+	AgentRunID int64
+	// Reason is the stable budget cause that opened the settlement turn:
+	// BudgetCauseTurns or BudgetCauseTime (tokens are telemetry in v0.22).
+	Reason string
+}
+
+// SettlementResult is what a settlement writeback persisted.
+type SettlementResult struct {
+	PlanItemID       int64
+	PlanStatus       string
+	Decision         string
+	FactID           int64
+	PlanItemRevision int
+}
+
+// SettlementRecorder persists the settlement write set. The target plan item is
+// bound by the builder that resolved it (the same ordered resolver task.complete
+// uses), so the runner cannot write an unprepared target.
+type SettlementRecorder interface {
+	RecordSettlement(ctx context.Context, settlement Settlement) (SettlementResult, error)
+}
+
+// SettlementService is the SettlementRecorder implementation. It reuses the
+// CompletionStore write path (one transaction/outbox entry over
+// version_plan_item + version_fact) but does not go through
+// CompletionService.Commit: that is the success-only path that hardcodes the
+// done status and requires a completion summary.
+type SettlementService struct {
+	store      CompletionStore
+	planItemID int64
+}
+
+// NewSettlementService binds a settlement writeback to one resolved plan item.
+func NewSettlementService(store CompletionStore, planItemID int64) *SettlementService {
+	return &SettlementService{store: store, planItemID: planItemID}
+}
+
+var _ SettlementRecorder = (*SettlementService)(nil)
+
+// RecordSettlement builds the plan+fact write set of one settled run and
+// delegates the atomic persistence to the shared CompletionStore. The fact key
+// is bound to the run and the payload is byte-identical on replay, so the
+// version_fact unique key (version_id, kind, key, content_hash) makes a retried
+// writeback converge to the existing row; the store's plan update is a no-op
+// when the status/decision already match, so a replay does not bump the
+// revision twice.
+func (s *SettlementService) RecordSettlement(ctx context.Context, settlement Settlement) (SettlementResult, error) {
+	if s == nil || s.store == nil {
+		return SettlementResult{}, errors.New("settlement service has no completion store")
+	}
+	if s.planItemID <= 0 {
+		return SettlementResult{}, fmt.Errorf("settlement service requires a positive target plan item ID (got %d)", s.planItemID)
+	}
+	if settlement.VersionID <= 0 {
+		return SettlementResult{}, errors.New("settlement service requires the injected version scope")
+	}
+	if settlement.AgentRunID <= 0 {
+		return SettlementResult{}, errors.New("settlement service requires the run ID for an idempotent fact key")
+	}
+	reason := strings.TrimSpace(settlement.Reason)
+	if reason != BudgetCauseTurns && reason != BudgetCauseTime {
+		return SettlementResult{}, fmt.Errorf("settlement service does not accept budget cause %q", settlement.Reason)
+	}
+	decision := settlementDecision(reason)
+	factKey := "run.settle:" + platformid.Format(settlement.AgentRunID)
+	payload := map[string]any{
+		"run_id":       platformid.Format(settlement.AgentRunID),
+		"reason":       reason,
+		"plan_item_id": platformid.Format(s.planItemID),
+		"status":       SettlementPlanStatus,
+		"decision":     decision,
+	}
+	write := CompletionWrite{
+		VersionID:   settlement.VersionID,
+		AgentRunID:  settlement.AgentRunID,
+		PlanItemID:  s.planItemID,
+		PlanStatus:  SettlementPlanStatus,
+		Decision:    decision,
+		Summary:     decision,
+		Status:      SettlementPlanStatus,
+		FactKind:    SettlementFactKind,
+		FactKey:     factKey,
+		FactPayload: payload,
+		Source:      SettlementFactSource,
+		SourceRef:   factKey,
+	}
+	result, err := s.store.CommitCompletion(ctx, write)
+	if err != nil {
+		return SettlementResult{}, fmt.Errorf("record settlement: %w", err)
+	}
+	return SettlementResult{
+		PlanItemID:       s.planItemID,
+		PlanStatus:       SettlementPlanStatus,
+		Decision:         decision,
+		FactID:           result.FactID,
+		PlanItemRevision: result.PlanItemRevision,
+	}, nil
+}
+
+// settlementDecision renders the stable plan decision of a settled run. It is
+// deterministic for a cause, so an idempotent replay produces the same content
+// hash.
+func settlementDecision(reason string) string {
+	switch reason {
+	case BudgetCauseTurns:
+		return "settled by turn budget"
+	case BudgetCauseTime:
+		return "settled by time budget"
+	default:
+		return "settled by resource budget"
+	}
+}
