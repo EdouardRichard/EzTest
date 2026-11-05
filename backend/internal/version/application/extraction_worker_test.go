@@ -142,18 +142,37 @@ type fakeExtractionRepo struct {
 	requirementOrder []string
 	renewals         int
 	lastRenewalAt    time.Time
+	milestoneLocksMu sync.Mutex
+	milestoneLocks   map[string]*sync.Mutex
 }
 
 func newFakeExtractionRepo() *fakeExtractionRepo {
 	return &fakeExtractionRepo{
-		runs:         map[int64]*versionapp.ExtractionRun{},
-		segments:     map[int64][]versionapp.ExtractionSegment{},
-		runByKey:     map[string]int64{},
-		requirements: map[string]*fakeRequirement{},
+		runs:           map[int64]*versionapp.ExtractionRun{},
+		segments:       map[int64][]versionapp.ExtractionSegment{},
+		runByKey:       map[string]int64{},
+		requirements:   map[string]*fakeRequirement{},
+		milestoneLocks: map[string]*sync.Mutex{},
 	}
 }
 
 var _ versionapp.ExtractionRepository = (*fakeExtractionRepo)(nil)
+var _ versionapp.ExtractionMilestoneLocker = (*fakeExtractionRepo)(nil)
+
+// LockMilestone is the in-memory equivalent of the PostgreSQL session advisory
+// lock: it serializes one attachment's milestone projection per process.
+func (r *fakeExtractionRepo) LockMilestone(_ context.Context, versionID, attachmentID int64) (func(), error) {
+	key := fmt.Sprintf("%d:%d", versionID, attachmentID)
+	r.milestoneLocksMu.Lock()
+	lock, ok := r.milestoneLocks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		r.milestoneLocks[key] = lock
+	}
+	r.milestoneLocksMu.Unlock()
+	lock.Lock()
+	return lock.Unlock, nil
+}
 
 func fakeRunKey(versionID, attachmentID int64, sha string) string {
 	return fmt.Sprintf("%d:%d:%s", versionID, attachmentID, sha)

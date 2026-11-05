@@ -56,10 +56,14 @@ type ExtractionIngestSource interface {
 	// (attachmentID == 0). An unknown/unready attachment yields an empty slice;
 	// the service maps that to its typed not-found/state-conflict response.
 	ExtractionInputs(ctx context.Context, versionID, attachmentID int64) ([]ExtractionStartInput, error)
-	// ExtractionDocument returns the canonical document of one attachment for
-	// reconciliation. Implementations must return platform.NotFound when the
-	// attachment or its extracted text is missing.
-	ExtractionDocument(ctx context.Context, versionID, attachmentID int64) (ExtractionDocument, error)
+	// ExtractionDocument returns the canonical parsed document of one run's
+	// input (version, attachment, input_sha256) for reconciliation and the plan
+	// title. The sha identifies the run's own parse even when the attachment has
+	// since been re-parsed: implementations must resolve the document for that
+	// input, not merely the attachment's current document. Implementations must
+	// return platform.NotFound when the attachment or its extracted text is
+	// missing.
+	ExtractionDocument(ctx context.Context, versionID, attachmentID int64, inputSHA256 string) (ExtractionDocument, error)
 }
 
 // SetSource wires the attachment-side extraction source (Task 36/37). A nil
@@ -146,8 +150,10 @@ func (s *ExtractionService) StartVersion(ctx context.Context, versionID, attachm
 //
 // Task 36/37 wiring: call it from the attachment.ingest completion path
 // (after requirement.attachment_ingested / MarkDone), with the deterministic
-// SegmentExtraction output and the parser coverage count. No
-// requirement.curate (or any other legacy work item) is created here.
+// SegmentExtraction output. The parser coverage count and the canonical
+// document text are resolved from the ExtractionIngestSource by the run's
+// input_sha256 when the terminal projection reconciles. No
+// requirement.curate (or any other legacy) work item is created here.
 func (s *ExtractionService) EnqueueAfterIngest(ctx context.Context, input ExtractionStartInput) (ExtractionRun, error) {
 	return s.Start(ctx, input)
 }
@@ -159,7 +165,7 @@ func (s *ExtractionService) attachmentDocumentName(ctx context.Context, run Extr
 	if s.source == nil {
 		return ""
 	}
-	document, err := s.source.ExtractionDocument(ctx, run.VersionID, run.AttachmentID)
+	document, err := s.source.ExtractionDocument(ctx, run.VersionID, run.AttachmentID, run.InputSHA256)
 	if err != nil {
 		return ""
 	}

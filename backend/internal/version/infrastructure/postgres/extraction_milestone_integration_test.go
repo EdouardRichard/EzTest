@@ -11,6 +11,7 @@ package versionpg_test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
@@ -31,11 +32,33 @@ type milestoneSource struct {
 	document versionapp.ExtractionDocument
 }
 
+// pausingMilestoneProcessor pauses the run while the already-claimed batch is
+// still finishing, the pause-during-processing edge of Task 17: both segments
+// settle while the run is paused, so Resume observes the terminal state.
+type pausingMilestoneProcessor struct {
+	svc  *versionapp.ExtractionService
+	run  int64
+	once sync.Once
+	err  error
+}
+
+func (p *pausingMilestoneProcessor) ProcessSegment(ctx context.Context, _ versionapp.ExtractionRun, _ versionapp.ExtractionSegment) (versionapp.ExtractionSegmentResult, error) {
+	p.once.Do(func() {
+		if _, err := p.svc.Pause(ctx, p.run); err != nil {
+			p.err = err
+		}
+	})
+	if p.err != nil {
+		return versionapp.ExtractionSegmentResult{}, p.err
+	}
+	return versionapp.ExtractionSegmentResult{ExtractedCount: 1}, nil
+}
+
 func (milestoneSource) ExtractionInputs(_ context.Context, _ int64, _ int64) ([]versionapp.ExtractionStartInput, error) {
 	return nil, nil
 }
 
-func (s milestoneSource) ExtractionDocument(_ context.Context, _ int64, _ int64) (versionapp.ExtractionDocument, error) {
+func (s milestoneSource) ExtractionDocument(_ context.Context, _ int64, _ int64, _ string) (versionapp.ExtractionDocument, error) {
 	return s.document, nil
 }
 
@@ -216,5 +239,84 @@ func TestExtractionMilestoneIntegration(t *testing.T) {
 	}
 	if !strings.HasPrefix(items[0].decision, versionapp.ExtractionPlanDecisionMarker(attachmentID, newRun.ID)) {
 		t.Fatalf("changed decision = %q, want run %d", items[0].decision, newRun.ID)
+	}
+}
+
+// TestExtractionMilestoneResumeIntegration is the live Resume-projection case:
+// the worker finishes the claimed batch while the run is paused, and only
+// Resume observes the done status. It must finalize the plan item, write both
+// facts and persist the report - exactly like a worker completion.
+func TestExtractionMilestoneResumeIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	ctx := context.Background()
+
+	extractionRepo := versionpg.NewExtractionRepository(pool, ids)
+	processor := &pausingMilestoneProcessor{}
+	svc := versionapp.NewExtractionService(extractionRepo, processor, nil, clock.System{})
+	svc.SetLeaseHeartbeat(0)
+	plan := versionapp.NewPlanService(versionpg.NewPlanRepository(pool), ids, nil)
+	facts := versionapp.NewFactService(versionpg.NewFactRepository(pool, ids), ids, nil)
+	svc.SetMilestoneStores(plan, facts)
+	svc.SetSource(milestoneSource{document: versionapp.ExtractionDocument{
+		Name: "需求文档.docx", Text: milestoneDocumentText(), SkippedImages: 3,
+	}})
+
+	run, err := svc.Start(ctx, versionapp.ExtractionStartInput{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256:  strings.Repeat("3", 64),
+		Segments:     milestoneSegments(),
+		DocumentText: milestoneDocumentText(),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	processor.svc = svc
+	processor.run = run.ID
+
+	paused, err := svc.ProcessRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("ProcessRun: %v", err)
+	}
+	if paused.Status != versionapp.ExtractionRunPaused || paused.DoneSegments != 2 {
+		t.Fatalf("paused-after-batch run = %+v, want paused with 2 done segments", paused)
+	}
+	items := loadMilestonePlan(t, pool, versionID)
+	if len(items) != 1 || items[0].status != versionapp.ExtractionPlanStatusRunning {
+		t.Fatalf("paused plan = %#v, want one in_progress row", items)
+	}
+	if got := len(loadMilestoneFacts(t, pool, versionID)); got != 0 {
+		t.Fatalf("paused facts = %d, want 0", got)
+	}
+
+	resumed, err := svc.Resume(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if resumed.Status != versionapp.ExtractionRunDone {
+		t.Fatalf("resumed run = %+v, want done", resumed)
+	}
+	items = loadMilestonePlan(t, pool, versionID)
+	if len(items) != 1 || items[0].status != versionapp.ExtractionPlanStatusDone {
+		t.Fatalf("resumed plan = %#v, want one done row", items)
+	}
+	factRows := loadMilestoneFacts(t, pool, versionID)
+	if len(factRows) != 2 {
+		t.Fatalf("resumed facts = %#v, want 2", factRows)
+	}
+	for _, fact := range factRows {
+		if fact["run_id"] != platformid.Format(run.ID) || fact["status"] != "done" {
+			t.Fatalf("resumed fact = %#v, want run %s done", fact, platformid.Format(run.ID))
+		}
+	}
+	stored, err := svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if stored.Report == nil || stored.Report.Expected != 2 || stored.Report.Extracted != 0 {
+		t.Fatalf("resumed run report = %+v, want persisted expected=2", stored.Report)
 	}
 }

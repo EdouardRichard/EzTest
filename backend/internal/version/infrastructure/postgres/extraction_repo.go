@@ -47,6 +47,32 @@ func NewExtractionRepository(pool *pgxpool.Pool, ids platformid.Generator) *Extr
 }
 
 var _ versionapp.ExtractionRepository = (*ExtractionRepository)(nil)
+var _ versionapp.ExtractionMilestoneLocker = (*ExtractionRepository)(nil)
+
+// LockMilestone serializes the plan projection of one attachment across
+// cooperative processes with a session-level advisory lock. The lock is held on
+// a dedicated pooled connection until the returned release function is called
+// (the caller must call it exactly once, normally with defer).
+func (r *ExtractionRepository) LockMilestone(ctx context.Context, versionID, attachmentID int64) (func(), error) {
+	if r.pool == nil {
+		return func() {}, errors.New("extraction repository: missing pool")
+	}
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("lock extraction milestone: acquire: %w", err)
+	}
+	key := fmt.Sprintf("eztest:extraction-milestone:%d:%d", versionID, attachmentID)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext($1))`, key); err != nil {
+		conn.Release()
+		return nil, fmt.Errorf("lock extraction milestone: %w", err)
+	}
+	return func() {
+		// Release on a background context: the lock must be returned even when
+		// the request context was canceled while the projection ran.
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext($1))`, key)
+		conn.Release()
+	}, nil
+}
 
 // CreateRun is idempotent on (version_id, attachment_id, input_sha256). The
 // advisory lock is keyed by (version_id, attachment_id) - not by sha - so

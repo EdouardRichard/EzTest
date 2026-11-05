@@ -42,6 +42,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
@@ -145,9 +146,10 @@ type ExtractionSegment struct {
 // ExtractionStartInput is one idempotent Start call. Segments come from
 // SegmentExtraction (Task 16); DocumentText is optional and only feeds the
 // declared-FR reconciliation count (it is never persisted by this package).
-// AttachmentName/SkippedImages are optional metadata for the plan/fact
-// milestone (R-A7-10): the name feeds the plan title, the skipped-image count
-// feeds the parse fact and the reconciliation report.
+// AttachmentName is optional metadata for the plan milestone title (R-A7-10);
+// the skipped-image count and the canonical document text are resolved from
+// the run's own parsed document by the terminal projection, never from this
+// start input.
 type ExtractionStartInput struct {
 	VersionID      int64
 	AttachmentID   int64
@@ -155,7 +157,6 @@ type ExtractionStartInput struct {
 	Segments       []Segment
 	DocumentText   string
 	AttachmentName string
-	SkippedImages  int
 }
 
 // ExtractionSegmentResult is one segment processor outcome. A skipped segment
@@ -264,6 +265,13 @@ type ExtractionService struct {
 	plan   ExtractionPlanStore
 	facts  ExtractionFactStore
 	source ExtractionIngestSource
+
+	// selectedRuns records the run Start nominated as the attachment's
+	// milestone generation (versionID:attachmentID -> runID). It lets the
+	// archive fence accept a run that Start deliberately revived while still
+	// rejecting every other older run (see extractionRunSuperseded).
+	selectedMu   sync.RWMutex
+	selectedRuns map[string]int64
 }
 
 // NewExtractionService wires the worker. events may be nil (best-effort
@@ -343,6 +351,7 @@ func (s *ExtractionService) Start(ctx context.Context, input ExtractionStartInpu
 	if err != nil {
 		return ExtractionRun{}, err
 	}
+	s.selectMilestoneRun(created)
 	return s.syncStartMilestone(ctx, created, input), nil
 }
 
@@ -368,7 +377,7 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 		// Re-running a terminal run (worker retry after a crash between the last
 		// segment transition and the milestone write) re-applies the idempotent
 		// plan/fact projection.
-		return s.syncTerminalMilestone(ctx, run), nil
+		return s.syncTerminalMilestone(ctx, run, false), nil
 	case ExtractionRunPending:
 		transitioned, err := s.repo.TransitionRun(ctx, runID,
 			[]ExtractionRunStatus{ExtractionRunPending}, ExtractionRunRunning, s.clock.Now())
@@ -453,7 +462,7 @@ func (s *ExtractionService) ProcessRun(ctx context.Context, runID int64) (Extrac
 		})
 	}
 	if final.Status == ExtractionRunDone || final.Status == ExtractionRunFailed {
-		final = s.syncTerminalMilestone(ctx, final)
+		final = s.syncTerminalMilestone(ctx, final, false)
 	}
 	return final, nil
 }
@@ -608,7 +617,15 @@ func (s *ExtractionService) Resume(ctx context.Context, runID int64) (Extraction
 	if !transitioned {
 		return ExtractionRun{}, ErrExtractionRunState
 	}
-	return s.mustGetRun(ctx, runID)
+	resumed, err := s.mustGetRun(ctx, runID)
+	if err != nil {
+		return ExtractionRun{}, err
+	}
+	// Resume can observe a run that the worker settled while it was paused
+	// (the last claimed batch finished mid-pause): the transition recomputes the
+	// terminal state, so the milestone projection must run here too. A resumed
+	// run that is still pending reopens the in-progress milestone.
+	return s.syncTransitionMilestone(ctx, resumed), nil
 }
 
 // RetryRun retries a failed run: failed segments get a fresh attempt budget and
@@ -636,7 +653,13 @@ func (s *ExtractionService) RetryRun(ctx context.Context, runID int64) (Extracti
 	if _, err := s.repo.RetryFailedSegments(ctx, runID, now); err != nil {
 		return ExtractionRun{}, err
 	}
-	return s.mustGetRun(ctx, runID)
+	retried, err := s.mustGetRun(ctx, runID)
+	if err != nil {
+		return ExtractionRun{}, err
+	}
+	// The plan milestone follows the latest run: a retry leaves the failed
+	// state and reopens the item (or finalizes it if the retry settled it).
+	return s.syncTransitionMilestone(ctx, retried), nil
 }
 
 // RetrySegment retries one terminal failed segment (and a failed run).
@@ -654,7 +677,12 @@ func (s *ExtractionService) RetrySegment(ctx context.Context, runID int64, seq i
 	if err := s.repo.RetrySegment(ctx, runID, seq, s.clock.Now()); err != nil {
 		return ExtractionRun{}, err
 	}
-	return s.mustGetRun(ctx, runID)
+	retried, err := s.mustGetRun(ctx, runID)
+	if err != nil {
+		return ExtractionRun{}, err
+	}
+	// The plan milestone follows the latest run (see RetryRun).
+	return s.syncTransitionMilestone(ctx, retried), nil
 }
 
 // GetRun reads one run (progress API, Task 18).

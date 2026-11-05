@@ -489,6 +489,64 @@ func TestExtractionAPIActions(t *testing.T) {
 	}
 }
 
+// TestExtractionAPILatestRunMultiAttachment pins the "latest run of the
+// version" read when several attachments have runs: GET without selectors
+// returns the newest run id, while ?attachment_id= selects that attachment's
+// latest run.
+func TestExtractionAPILatestRunMultiAttachment(t *testing.T) {
+	older := extractionDoneRun()
+	older.ID = 9001
+	older.AttachmentID = 8001
+	newer := extractionDoneRun()
+	newer.ID = 9002
+	newer.AttachmentID = 8002
+	newer.Status = versionapp.ExtractionRunRunning
+	svc := &fakeExtractionService{
+		run:       older,
+		runs:      []versionapp.ExtractionRun{older, newer},
+		latestRun: older,
+	}
+	mux := newExtractionMux(svc)
+
+	recorder := call(t, mux, http.MethodGet, "/api/versions/7/requirements/extractions", "", actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET latest status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !fakeServiceCalled(svc, "list_runs") {
+		t.Fatalf("GET latest calls = %v, want list_runs", svc.calls)
+	}
+	var body struct {
+		Data struct {
+			ID           string `json:"id"`
+			AttachmentID string `json:"attachment_id"`
+			Status       string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode latest body %q: %v", recorder.Body.String(), err)
+	}
+	if body.Data.ID != "9002" || body.Data.AttachmentID != "8002" || body.Data.Status != "running" {
+		t.Fatalf("latest run = %#v, want the newest run 9002 of attachment 8002", body.Data)
+	}
+
+	// The attachment selector still returns that attachment's latest run, not
+	// the version's newest one.
+	recorder = call(t, mux, http.MethodGet,
+		"/api/versions/7/requirements/extractions?attachment_id=8001", "", actor())
+	if recorder.Code != http.StatusOK || !fakeServiceCalled(svc, "latest_run") {
+		t.Fatalf("GET by attachment status = %d calls=%v", recorder.Code, svc.calls)
+	}
+	if svc.lastVersionID != 7 || svc.lastAttachmentID != 8001 {
+		t.Fatalf("latest args = %d/%d, want 7/8001", svc.lastVersionID, svc.lastAttachmentID)
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode attachment body %q: %v", recorder.Body.String(), err)
+	}
+	if body.Data.ID != "9001" || body.Data.AttachmentID != "8001" {
+		t.Fatalf("attachment run = %#v, want 9001", body.Data)
+	}
+}
+
 func withExtractionStatus(run versionapp.ExtractionRun, status versionapp.ExtractionRunStatus) versionapp.ExtractionRun {
 	run.Status = status
 	return run
