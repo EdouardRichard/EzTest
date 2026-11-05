@@ -3,8 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { BindingOverview } from "./BindingOverview"
-import { bindingOverviewFixture } from "./test-fixtures"
-import type { VersionBindingOverview } from "./types"
+import { bindingOverviewFixture, catalogFixture } from "./test-fixtures"
+import type {
+  AccountResource,
+  PageResource,
+  UpdateBindingRequest,
+  VersionBindingOverview,
+} from "./types"
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -15,9 +20,47 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const fetchMock = vi.fn<typeof fetch>()
 
-function respondWith(overview: VersionBindingOverview): void {
-  fetchMock.mockResolvedValue(jsonResponse({ data: overview }))
+type FetchRoute = () => Response
+
+type FetchRoutes = {
+  /** `GET /api/versions/2001/binding` */
+  binding: FetchRoute
+  /** `PUT /api/versions/2001/binding`; receives the raw request body. */
+  update?: (body: string) => Response
+  /** `GET /api/resources/catalog`; defaults to the shared catalog fixture. */
+  catalog?: FetchRoute
+}
+
+/**
+ * Routes the binding read/write and the account-pool catalog by URL. `GET
+ * /binding` carries only the bound account subset, so the editor reads the
+ * selectable pool from `/api/resources/catalog` (same source as the wizard).
+ */
+function routeFetch(routes: FetchRoutes): void {
+  fetchMock.mockImplementation(async (input, init) => {
+    const url = String(input)
+    const method = (init?.method ?? "GET").toUpperCase()
+    if (url.endsWith("/api/resources/catalog")) {
+      return (routes.catalog ?? (() => jsonResponse({ data: catalogFixture })))()
+    }
+    if (url.endsWith("/api/versions/2001/binding")) {
+      if (method === "PUT") {
+        return (routes.update ?? (() => routes.binding()))(String(init?.body ?? "{}"))
+      }
+      return routes.binding()
+    }
+    return jsonResponse(
+      { error: { code: "not_found", message: `unexpected ${method} ${url}` } },
+      404,
+    )
+  })
   vi.stubGlobal("fetch", fetchMock)
+}
+
+function putBodies(): UpdateBindingRequest[] {
+  return fetchMock.mock.calls
+    .filter(([, init]) => init?.method === "PUT")
+    .map(([, init]) => JSON.parse(String(init?.body)) as UpdateBindingRequest)
 }
 
 /** The one binding update request the inline editor is allowed to send. */
@@ -25,6 +68,14 @@ function updateRequest(): { url: string; body: unknown } {
   const call = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT")
   if (call === undefined) throw new Error("expected one binding update request")
   return { url: String(call[0]), body: JSON.parse(String(call[1]?.body)) }
+}
+
+function bindingReads(): number {
+  return fetchMock.mock.calls.filter(
+    ([input, init]) =>
+      (init?.method ?? "GET").toUpperCase() === "GET" &&
+      String(input).endsWith("/api/versions/2001/binding"),
+  ).length
 }
 
 const unexcludedOverview: VersionBindingOverview = {
@@ -45,6 +96,29 @@ const excludedAfterSave: VersionBindingOverview = {
   counts: bindingOverviewFixture.counts,
 }
 
+const buyer = bindingOverviewFixture.accounts[0] as AccountResource
+
+/** A page that was excluded while approved and has since become proposed. */
+const proposedPage: PageResource = {
+  ...(bindingOverviewFixture.environment.pages[0] as PageResource),
+  id: "1303",
+  name: "订单草稿",
+  status: "proposed",
+}
+
+const overviewWithUnavailableExclusion: VersionBindingOverview = {
+  ...bindingOverviewFixture,
+  environment: {
+    ...bindingOverviewFixture.environment,
+    pages: [...bindingOverviewFixture.environment.pages, proposedPage],
+  },
+  scope_exclude: { pages: ["1302", "1303"], apis: [], databases: [] },
+  counts: {
+    ...bindingOverviewFixture.counts,
+    pages: { approved: 2, proposed: 1, excluded: 1, included: 1 },
+  },
+}
+
 describe("BindingOverview", () => {
   beforeEach(() => {
     window.sessionStorage.clear()
@@ -57,7 +131,7 @@ describe("BindingOverview", () => {
   })
 
   it("renders the derived SUT, repository roles/overrides, enabled accounts and scope exclusion chips", async () => {
-    respondWith(bindingOverviewFixture)
+    routeFetch({ binding: () => jsonResponse({ data: bindingOverviewFixture }) })
     render(<BindingOverview versionId="2001" />)
 
     expect(await screen.findByText("SUT 绑定概览")).toBeInTheDocument()
@@ -82,7 +156,7 @@ describe("BindingOverview", () => {
   })
 
   it("invokes the optional onEdit callback when inline editing starts", async () => {
-    respondWith(bindingOverviewFixture)
+    routeFetch({ binding: () => jsonResponse({ data: bindingOverviewFixture }) })
     const onEdit = vi.fn()
     render(<BindingOverview versionId="2001" onEdit={onEdit} />)
 
@@ -96,15 +170,19 @@ describe("BindingOverview", () => {
     expect(screen.getByRole("button", { name: "保存绑定" })).toBeInTheDocument()
   })
 
-  it("opens an inline editor with repository, account and exclusion checkboxes", async () => {
-    respondWith(bindingOverviewFixture)
+  it("opens an inline editor with repository, account-pool and exclusion checkboxes", async () => {
+    routeFetch({ binding: () => jsonResponse({ data: bindingOverviewFixture }) })
     render(<BindingOverview versionId="2001" />)
 
     fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
 
     expect(screen.getByRole("checkbox", { name: "包含代码仓 order-center-web" })).toBeChecked()
     expect(screen.getByRole("checkbox", { name: "包含代码仓 payment-infra" })).not.toBeChecked()
+    // The pool comes from the catalog, so a currently unbound account is
+    // selectable again even though `GET /binding` only returns the bound subset.
+    expect(screen.getByText(/全局测试账号池/)).toBeInTheDocument()
     expect(screen.getByRole("checkbox", { name: "启用账号 buyer" })).toBeChecked()
+    expect(await screen.findByRole("checkbox", { name: "启用账号 operator" })).not.toBeChecked()
     expect(screen.getByRole("checkbox", { name: "排除页面 订单详情" })).toBeChecked()
     expect(screen.getByRole("checkbox", { name: "排除页面 订单列表" })).not.toBeChecked()
     expect(screen.getByRole("checkbox", { name: "排除目标库 order_db" })).toBeChecked()
@@ -115,10 +193,10 @@ describe("BindingOverview", () => {
   })
 
   it("saves only the changed scope_exclude document", async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: unexcludedOverview }))
-      .mockResolvedValueOnce(jsonResponse({ data: excludedAfterSave }))
-    vi.stubGlobal("fetch", fetchMock)
+    routeFetch({
+      binding: () => jsonResponse({ data: unexcludedOverview }),
+      update: () => jsonResponse({ data: excludedAfterSave }),
+    })
     const onUpdated = vi.fn()
 
     render(<BindingOverview versionId="2001" onUpdated={onUpdated} />)
@@ -147,10 +225,10 @@ describe("BindingOverview", () => {
         row.repository.id === "1202" ? { ...row, included: false } : row,
       ),
     }
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: bindingOverviewFixture }))
-      .mockResolvedValueOnce(jsonResponse({ data: after }))
-    vi.stubGlobal("fetch", fetchMock)
+    routeFetch({
+      binding: () => jsonResponse({ data: bindingOverviewFixture }),
+      update: () => jsonResponse({ data: after }),
+    })
 
     render(<BindingOverview versionId="2001" />)
     fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
@@ -161,36 +239,125 @@ describe("BindingOverview", () => {
     expect(updateRequest().body).toEqual({ repository_ids: ["1201"] })
   })
 
-  it("sends account_ids without an account whose enable checkbox was cleared", async () => {
-    const twoAccounts: VersionBindingOverview = {
-      ...bindingOverviewFixture,
-      accounts: bindingOverviewFixture.environment.accounts,
-    }
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: twoAccounts }))
-      .mockResolvedValueOnce(
-        jsonResponse({ data: { ...twoAccounts, accounts: twoAccounts.accounts.slice(0, 1) } }),
-      )
-    vi.stubGlobal("fetch", fetchMock)
+  it("sends account_ids without a bound account whose checkbox was cleared", async () => {
+    routeFetch({
+      binding: () => jsonResponse({ data: bindingOverviewFixture }),
+      update: () => jsonResponse({ data: { ...bindingOverviewFixture, accounts: [] } }),
+    })
 
     render(<BindingOverview versionId="2001" />)
     fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
-    fireEvent.click(screen.getByRole("checkbox", { name: "启用账号 operator" }))
+    // operator is in the pool but not bound, so it is selectable (not checked).
+    expect(await screen.findByRole("checkbox", { name: "启用账号 operator" })).not.toBeChecked()
+    fireEvent.click(screen.getByRole("checkbox", { name: "启用账号 buyer" }))
     fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
 
     await waitFor(() => expect(screen.queryByRole("button", { name: "保存绑定" })).toBeNull())
-    expect(updateRequest().body).toEqual({ account_ids: ["1601"] })
+    expect(updateRequest().body).toEqual({ account_ids: [] })
+  })
+
+  it("restores a removed account from the pool and sends it again", async () => {
+    let bound: AccountResource[] = [buyer]
+    routeFetch({
+      binding: () => jsonResponse({ data: { ...bindingOverviewFixture, accounts: bound } }),
+      update: (body) => {
+        const payload = JSON.parse(body) as UpdateBindingRequest
+        const ids = payload.account_ids ?? bound.map((account) => account.id)
+        bound = [buyer].filter((account) => ids.includes(account.id))
+        return jsonResponse({ data: { ...bindingOverviewFixture, accounts: bound } })
+      },
+    })
+
+    render(<BindingOverview versionId="2001" />)
+    fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
+    fireEvent.click(screen.getByRole("checkbox", { name: "启用账号 buyer" }))
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+    await waitFor(() => expect(screen.queryByRole("button", { name: "保存绑定" })).toBeNull())
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑绑定" }))
+    const restored = await screen.findByRole("checkbox", { name: "启用账号 buyer" })
+    expect(restored).not.toBeChecked()
+    fireEvent.click(restored)
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+    await waitFor(() => expect(screen.queryByRole("button", { name: "保存绑定" })).toBeNull())
+
+    expect(putBodies()).toEqual([{ account_ids: [] }, { account_ids: [buyer.id] }])
+  })
+
+  it("keeps the account pool selectable when the version binds no account", async () => {
+    const overview: VersionBindingOverview = { ...bindingOverviewFixture, accounts: [] }
+    routeFetch({
+      binding: () => jsonResponse({ data: overview }),
+      update: (body) => {
+        const payload = JSON.parse(body) as UpdateBindingRequest
+        const accounts = payload.account_ids?.includes(buyer.id) ? [buyer] : []
+        return jsonResponse({ data: { ...overview, accounts } })
+      },
+    })
+
+    render(<BindingOverview versionId="2001" />)
+    fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
+
+    // The empty-state hint stays, but it must not replace the selector.
+    expect(screen.getByText(/未关联测试账号/)).toBeInTheDocument()
+    const accountsRegion = screen.getByRole("region", { name: "测试账号" })
+    expect(within(accountsRegion).getByText(/全局测试账号池/)).toBeInTheDocument()
+    const selectableBuyer = await within(accountsRegion).findByRole("checkbox", {
+      name: "启用账号 buyer",
+    })
+    expect(selectableBuyer).not.toBeChecked()
+    fireEvent.click(selectableBuyer)
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "保存绑定" })).toBeNull())
+    expect(putBodies()).toEqual([{ account_ids: [buyer.id] }])
+  })
+
+  it("keeps an excluded resource that is no longer approved removable", async () => {
+    routeFetch({
+      binding: () => jsonResponse({ data: overviewWithUnavailableExclusion }),
+      update: (body) => {
+        const payload = JSON.parse(body) as UpdateBindingRequest
+        return jsonResponse({
+          data: {
+            ...overviewWithUnavailableExclusion,
+            scope_exclude: payload.scope_exclude ?? overviewWithUnavailableExclusion.scope_exclude,
+            counts: {
+              ...overviewWithUnavailableExclusion.counts,
+              pages: { approved: 2, proposed: 1, excluded: 1, included: 1 },
+            },
+          },
+        })
+      },
+    })
+
+    render(<BindingOverview versionId="2001" />)
+    fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
+
+    const scope = screen.getByRole("region", { name: "范围排除" })
+    expect(within(scope).getByText("已排除（不可用/未批准）")).toBeInTheDocument()
+    const unavailable = screen.getByRole("checkbox", {
+      name: "排除页面 订单草稿（不可用/未批准）",
+    })
+    expect(unavailable).toBeChecked()
+    fireEvent.click(unavailable)
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "保存绑定" })).toBeNull())
+    expect(updateRequest().body).toEqual({
+      scope_exclude: { pages: ["1302"], apis: [], databases: [] },
+    })
   })
 
   it("restores the original selection and sends no request when editing is cancelled", async () => {
-    respondWith(bindingOverviewFixture)
+    routeFetch({ binding: () => jsonResponse({ data: bindingOverviewFixture }) })
     render(<BindingOverview versionId="2001" />)
 
     fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
     fireEvent.click(screen.getByRole("checkbox", { name: "包含代码仓 order-center-web" }))
     fireEvent.click(screen.getByRole("button", { name: "取消编辑" }))
 
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(putBodies()).toHaveLength(0)
     expect(
       screen.queryByRole("checkbox", { name: "包含代码仓 order-center-web" }),
     ).not.toBeInTheDocument()
@@ -200,7 +367,10 @@ describe("BindingOverview", () => {
   })
 
   it("keeps a read-only binding view without an edit button", async () => {
-    respondWith({ ...bindingOverviewFixture, stage: "executing", editable: false })
+    routeFetch({
+      binding: () =>
+        jsonResponse({ data: { ...bindingOverviewFixture, stage: "executing", editable: false } }),
+    })
     render(<BindingOverview versionId="2001" />)
 
     expect(await screen.findByText(/当前阶段为「执行中」/)).toBeInTheDocument()
@@ -208,9 +378,9 @@ describe("BindingOverview", () => {
   })
 
   it("shows the stage-gate notice and stays read-only when the save is rejected with 409", async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: bindingOverviewFixture }))
-      .mockResolvedValueOnce(
+    routeFetch({
+      binding: () => jsonResponse({ data: bindingOverviewFixture }),
+      update: () =>
         jsonResponse(
           {
             error: {
@@ -220,8 +390,7 @@ describe("BindingOverview", () => {
           },
           409,
         ),
-      )
-    vi.stubGlobal("fetch", fetchMock)
+    })
 
     render(<BindingOverview versionId="2001" />)
     fireEvent.click(await screen.findByRole("button", { name: "编辑绑定" }))
@@ -235,7 +404,10 @@ describe("BindingOverview", () => {
   })
 
   it("disables binding editing for a completed version and explains the stage gate", async () => {
-    respondWith({ ...bindingOverviewFixture, stage: "completed", editable: false })
+    routeFetch({
+      binding: () =>
+        jsonResponse({ data: { ...bindingOverviewFixture, stage: "completed", editable: false } }),
+    })
     render(<BindingOverview versionId="2001" />)
 
     expect(await screen.findByText(/已完成版本只读/)).toBeInTheDocument()
@@ -251,31 +423,39 @@ describe("BindingOverview", () => {
   })
 
   it("shows the error state and retries the binding read", async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        jsonResponse({ error: { code: "unavailable", message: "绑定读取失败" } }, 503),
-      )
-      .mockResolvedValueOnce(jsonResponse({ data: bindingOverviewFixture }))
-    vi.stubGlobal("fetch", fetchMock)
+    let reads = 0
+    routeFetch({
+      binding: () => {
+        reads += 1
+        return reads === 1
+          ? jsonResponse({ error: { code: "unavailable", message: "绑定读取失败" } }, 503)
+          : jsonResponse({ data: bindingOverviewFixture })
+      },
+    })
 
     render(<BindingOverview versionId="2001" />)
     expect(await screen.findByText("绑定概览加载失败")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "重试" }))
     expect(await screen.findByText("SUT 绑定概览")).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(bindingReads()).toBe(2)
   })
 
   it("renders explicit empty states for repositories, accounts and exclusions", async () => {
-    respondWith({
-      ...bindingOverviewFixture,
-      scope_exclude: { pages: [], apis: [], databases: [] },
-      counts: {
-        pages: { approved: 2, proposed: 0, excluded: 0, included: 2 },
-        apis: { approved: 1, proposed: 0, excluded: 0, included: 1 },
-        databases: { approved: 1, proposed: 0, excluded: 0, included: 1 },
-      },
-      repositories: [],
-      accounts: [],
+    routeFetch({
+      binding: () =>
+        jsonResponse({
+          data: {
+            ...bindingOverviewFixture,
+            scope_exclude: { pages: [], apis: [], databases: [] },
+            counts: {
+              pages: { approved: 2, proposed: 0, excluded: 0, included: 2 },
+              apis: { approved: 1, proposed: 0, excluded: 0, included: 1 },
+              databases: { approved: 1, proposed: 0, excluded: 0, included: 1 },
+            },
+            repositories: [],
+            accounts: [],
+          },
+        }),
     })
     render(<BindingOverview versionId="2001" />)
 
@@ -291,7 +471,10 @@ describe("BindingOverview", () => {
   })
 
   it("explains the read-only binding while the version is paused", async () => {
-    respondWith({ ...bindingOverviewFixture, stage: "paused", editable: false })
+    routeFetch({
+      binding: () =>
+        jsonResponse({ data: { ...bindingOverviewFixture, stage: "paused", editable: false } }),
+    })
     render(<BindingOverview versionId="2001" />)
 
     expect(await screen.findByText(/版本已暂停/)).toBeInTheDocument()
@@ -300,7 +483,10 @@ describe("BindingOverview", () => {
   })
 
   it("explains the read-only binding while the version is blocked", async () => {
-    respondWith({ ...bindingOverviewFixture, stage: "blocked", editable: false })
+    routeFetch({
+      binding: () =>
+        jsonResponse({ data: { ...bindingOverviewFixture, stage: "blocked", editable: false } }),
+    })
     render(<BindingOverview versionId="2001" />)
 
     expect(await screen.findByText(/版本已阻塞/)).toBeInTheDocument()

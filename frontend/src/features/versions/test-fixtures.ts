@@ -298,6 +298,16 @@ export const orderSutRepositories: SutRepository[] = [
 ]
 
 /**
+ * `GET /api/versions/{id}/binding` replaces the environment account pool with
+ * the version's bound active subset (DB-15/R-C1-2). The catalog keeps the full
+ * global pool, so `environment.accounts` must not contradict `accounts`.
+ */
+const boundOrderEnvironment: EnvironmentResource = {
+  ...orderEnvironment,
+  accounts: [orderAccounts[0] as AccountResource],
+}
+
+/**
  * One Task 29 `GET /api/versions/{id}/binding` read model: derived SUT,
  * environment, effective repos/accounts and an excluded page + database.
  */
@@ -306,7 +316,7 @@ export const bindingOverviewFixture: VersionBindingOverview = {
   stage: "designing",
   editable: true,
   sut: orderSut,
-  environment: orderEnvironment,
+  environment: boundOrderEnvironment,
   scope_exclude: {
     pages: ["1302"],
     apis: [],

@@ -9,9 +9,21 @@ import { Button } from "@/components/ui/Button"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import type { VersionStage } from "@/features/design/types"
-import { bindingErrorDetails, getVersionBinding, updateVersionBinding } from "./api"
+import {
+  bindingErrorDetails,
+  getResourceCatalog,
+  getVersionBinding,
+  updateVersionBinding,
+} from "./api"
 import { VERSION_STAGE_LABEL } from "./stage"
-import type { BindingScopeExclude, UpdateBindingRequest, VersionBindingOverview } from "./types"
+import type {
+  AccountResource,
+  BindingScopeExclude,
+  Catalog,
+  UpdateBindingRequest,
+  VersionBindingOverview,
+} from "./types"
+import { activeAccounts, findEnvironmentOption } from "./wizard"
 
 export type BindingOverviewProps = {
   versionId: string
@@ -39,6 +51,8 @@ type BindingDraft = {
 type ScopeResource = {
   id: string
   name: string
+  /** Listed because it is still excluded but no longer selectable. */
+  unavailable: boolean
 }
 
 function stageTone(stage: string): BadgeTone {
@@ -136,24 +150,71 @@ function bindingPatch(overview: VersionBindingOverview, draft: BindingDraft): Up
   return patch
 }
 
-/** Approved/active environment resources that can be excluded from the scope. */
+/** Active accounts of the version environment from the shared catalog pool. */
+function catalogAccounts(
+  overview: VersionBindingOverview,
+  catalog: Catalog | null,
+): AccountResource[] {
+  if (catalog === null) return []
+  const environment = findEnvironmentOption(catalog, overview.environment.id)?.environment
+  if (environment === undefined) return []
+  return activeAccounts(environment)
+}
+
+/**
+ * Selectable accounts: the catalog's active pool merged with the currently bound
+ * accounts. `GET /binding` only returns the bound subset, so the pool is what
+ * makes a removed account selectable again; the bound accounts are kept as rows
+ * even when the pool read failed or they are missing from it, so they stay
+ * removable instead of being re-sent invisibly.
+ */
+function accountOptions(
+  overview: VersionBindingOverview,
+  catalog: Catalog | null,
+): AccountResource[] {
+  const options: AccountResource[] = []
+  const seen = new Set<string>()
+  for (const account of [...catalogAccounts(overview, catalog), ...overview.accounts]) {
+    if (seen.has(account.id)) continue
+    seen.add(account.id)
+    options.push(account)
+  }
+  return options
+}
+
+/**
+ * Selectable resources for one exclusion kind: the approved/active environment
+ * resources plus every currently excluded id. An id that was excluded while
+ * selectable and has since become proposed/disabled (or vanished) still gets a
+ * row, so it can be removed instead of being re-sent with every scope patch.
+ */
 function scopeResources(
   overview: VersionBindingOverview,
   kind: keyof BindingScopeExclude,
+  excludedIds: string[],
 ): ScopeResource[] {
-  if (kind === "pages") {
-    return overview.environment.pages
-      .filter((page) => page.status === "approved")
-      .map((page) => ({ id: page.id, name: page.name }))
+  let resources: Array<{ id: string; name: string; status: string }>
+  if (kind === "pages") resources = overview.environment.pages
+  else if (kind === "apis") resources = overview.environment.apis
+  else resources = overview.environment.databases
+  const selectableStatus = kind === "databases" ? "active" : "approved"
+  const options: ScopeResource[] = []
+  const seen = new Set<string>()
+  for (const resource of resources) {
+    if (resource.status !== selectableStatus) continue
+    seen.add(resource.id)
+    options.push({ id: resource.id, name: resource.name, unavailable: false })
   }
-  if (kind === "apis") {
-    return overview.environment.apis
-      .filter((api) => api.status === "approved")
-      .map((api) => ({ id: api.id, name: api.name }))
+  for (const id of excludedIds) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    options.push({
+      id,
+      name: resources.find((resource) => resource.id === id)?.name ?? `#${id}`,
+      unavailable: true,
+    })
   }
-  return overview.environment.databases
-    .filter((database) => database.status === "active")
-    .map((database) => ({ id: database.id, name: database.name }))
+  return options
 }
 
 type ChipRowProps = {
@@ -195,21 +256,29 @@ function ScopeEditor({ label, options, excluded, disabled, onToggle }: ScopeEdit
         <p className="text-[11px] text-muted-foreground">环境没有可排除的{label}</p>
       ) : (
         <ul className="grid gap-1 sm:grid-cols-2">
-          {options.map((option) => (
-            <li key={option.id}>
-              <label className="flex items-center gap-1.5 text-xs text-foreground">
-                <input
-                  type="checkbox"
-                  className="size-3.5 accent-primary"
-                  aria-label={`排除${label} ${option.name}`}
-                  checked={excluded.includes(option.id)}
-                  disabled={disabled}
-                  onChange={(event) => onToggle(option.id, event.target.checked)}
-                />
-                <span>{option.name}</span>
-              </label>
-            </li>
-          ))}
+          {options.map((option) => {
+            const unavailableSuffix = option.unavailable ? "（不可用/未批准）" : ""
+            return (
+              <li key={option.id}>
+                <label className="flex items-center gap-1.5 text-xs text-foreground">
+                  <input
+                    type="checkbox"
+                    className="size-3.5 accent-primary"
+                    aria-label={`排除${label} ${option.name}${unavailableSuffix}`}
+                    checked={excluded.includes(option.id)}
+                    disabled={disabled}
+                    onChange={(event) => onToggle(option.id, event.target.checked)}
+                  />
+                  <span>{option.name}</span>
+                  {option.unavailable ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      已排除{unavailableSuffix}
+                    </span>
+                  ) : null}
+                </label>
+              </li>
+            )
+          })}
         </ul>
       )}
     </fieldset>
@@ -240,6 +309,11 @@ function CountCard({ label, counts }: CountCardProps) {
  * `editable`, the overview switches to an inline editor whose checkboxes map to
  * the partial binding update (repository_ids, account_ids, scope_exclude);
  * completed/non-editable versions stay read-only with the stage explanation.
+ *
+ * The editor's account rows come from the catalog's global active pool (the same
+ * source as the wizard) so a removed account can be re-added; `GET /binding` only
+ * exposes the bound subset. Scope rows also list still-excluded resources that
+ * are no longer approved/active, so a stale exclusion stays removable.
  */
 export function BindingOverview({
   versionId,
@@ -257,6 +331,11 @@ export function BindingOverview({
   const [saveError, setSaveError] = useState<unknown>(null)
   // A 409 stage-gate rejection keeps the overview read-only until the next read.
   const [gateMessage, setGateMessage] = useState<string | null>(null)
+  // The account pool is not part of the binding read; load it from the catalog
+  // the first time the editor opens.
+  const [catalog, setCatalog] = useState<Catalog | null>(null)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogError, setCatalogError] = useState<unknown>(null)
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is the SSE-driven reload nonce and reloadToken the explicit refresh counter; both intentionally retrigger the read.
   useEffect(() => {
@@ -317,9 +396,33 @@ export function BindingOverview({
     overview.scope_exclude.pages.length +
     overview.scope_exclude.apis.length +
     overview.scope_exclude.databases.length
+  const accounts = accountOptions(overview, catalog)
+
+  /**
+   * Reads the global account pool the wizard also uses. `GET /binding` only
+   * returns the bound subset, so this is the only way a removed account becomes
+   * selectable again. A failed read is non-fatal: the bound accounts stay
+   * removable and the section explains the limitation.
+   */
+  function loadAccountPool(): void {
+    if (catalog !== null || catalogLoading) return
+    setCatalogLoading(true)
+    setCatalogError(null)
+    void getResourceCatalog()
+      .then((value) => {
+        setCatalog(value)
+      })
+      .catch((cause: unknown) => {
+        setCatalogError(cause)
+      })
+      .finally(() => {
+        setCatalogLoading(false)
+      })
+  }
 
   function startEditing(): void {
     if (overview === null) return
+    loadAccountPool()
     setDraft(draftFromOverview(overview))
     setSaveError(null)
     setEditing(true)
@@ -500,41 +603,56 @@ export function BindingOverview({
       <section aria-label="测试账号" className="rounded-xl border border-border bg-card p-3">
         <h3 className="mb-1 text-xs font-semibold text-foreground">测试账号</h3>
         <p className="mb-2 text-[11px] text-muted-foreground">
-          {editOpen ? "取消勾选即从启用账号中移除" : "仅显示启用账号"}
+          {editOpen ? "全局测试账号池（仅启用账号）：勾选加入，取消勾选移除。" : "仅显示启用账号"}
         </p>
         {overview.accounts.length === 0 ? (
           <p className="text-[11px] text-muted-foreground">未关联测试账号（执行将被拒绝）</p>
-        ) : editOpen && draft !== null ? (
-          <ul className="grid gap-1 sm:grid-cols-2">
-            {overview.accounts.map((account) => (
-              <li key={account.id}>
-                <label className="flex flex-wrap items-center gap-1.5 text-xs text-foreground">
-                  <input
-                    type="checkbox"
-                    className="size-3.5 accent-primary"
-                    aria-label={`启用账号 ${account.username}`}
-                    checked={draft.accountIds.includes(account.id)}
-                    disabled={saving}
-                    onChange={(event) => {
-                      const checked = event.target.checked
-                      setDraft((current) =>
-                        current === null
-                          ? current
-                          : {
-                              ...current,
-                              accountIds: toggleId(current.accountIds, account.id, checked),
-                            },
-                      )
-                    }}
-                  />
-                  <span className="font-medium">{account.username}</span>
-                  {account.roles.length > 0 ? (
-                    <span className="text-muted-foreground">· {account.roles.join(" / ")}</span>
-                  ) : null}
-                </label>
-              </li>
-            ))}
-          </ul>
+        ) : null}
+        {editOpen && draft !== null ? (
+          <>
+            {accounts.length > 0 ? (
+              <ul className="mt-1 grid gap-1 sm:grid-cols-2">
+                {accounts.map((account) => (
+                  <li key={account.id}>
+                    <label className="flex flex-wrap items-center gap-1.5 text-xs text-foreground">
+                      <input
+                        type="checkbox"
+                        className="size-3.5 accent-primary"
+                        aria-label={`启用账号 ${account.username}`}
+                        checked={draft.accountIds.includes(account.id)}
+                        disabled={saving}
+                        onChange={(event) => {
+                          const checked = event.target.checked
+                          setDraft((current) =>
+                            current === null
+                              ? current
+                              : {
+                                  ...current,
+                                  accountIds: toggleId(current.accountIds, account.id, checked),
+                                },
+                          )
+                        }}
+                      />
+                      <span className="font-medium">{account.username}</span>
+                      {account.roles.length > 0 ? (
+                        <span className="text-muted-foreground">· {account.roles.join(" / ")}</span>
+                      ) : null}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            ) : catalogLoading ? null : (
+              <p className="text-[11px] text-muted-foreground">账号池暂无可用账号。</p>
+            )}
+            {catalogLoading ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">正在加载测试账号池…</p>
+            ) : null}
+            {catalogError !== null ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                测试账号池读取失败，暂时只能移除已绑定账号。
+              </p>
+            ) : null}
+          </>
         ) : (
           <div className="flex flex-wrap gap-1.5">
             {overview.accounts.map((account) => (
@@ -553,21 +671,21 @@ export function BindingOverview({
           <div className="space-y-2">
             <ScopeEditor
               label="页面"
-              options={scopeResources(overview, "pages")}
+              options={scopeResources(overview, "pages", overview.scope_exclude.pages)}
               excluded={draft.scopeExclude.pages}
               disabled={saving}
               onToggle={(id, checked) => toggleScope("pages", id, checked)}
             />
             <ScopeEditor
               label="API"
-              options={scopeResources(overview, "apis")}
+              options={scopeResources(overview, "apis", overview.scope_exclude.apis)}
               excluded={draft.scopeExclude.apis}
               disabled={saving}
               onToggle={(id, checked) => toggleScope("apis", id, checked)}
             />
             <ScopeEditor
               label="目标库"
-              options={scopeResources(overview, "databases")}
+              options={scopeResources(overview, "databases", overview.scope_exclude.databases)}
               excluded={draft.scopeExclude.databases}
               disabled={saving}
               onToggle={(id, checked) => toggleScope("databases", id, checked)}
