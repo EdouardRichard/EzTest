@@ -156,6 +156,56 @@ func (r *DiscoveryObservationRepository) MarkDiscoveryObservationDecision(ctx co
 	return nil
 }
 
+// discoveryObservationListQuery is the W1-14A read (API-36/37/39). A NULL wave
+// filter widens the query to the whole version; an empty kind/decision means
+// every value. LIMIT NULL is PostgreSQL's "no limit", which the coverage
+// aggregation uses (it must count the whole version, not one page).
+const discoveryObservationListQuery = `
+	SELECT id, version_sut_id, environment_id, wave_id, case_run_id, kind, method,
+	       host, resource_template, status_code, mime, occurrences, decision,
+	       resource_id, fact_id, first_seen_at, last_seen_at
+	FROM execution_discovery_observation
+	WHERE version_id = $1
+	  AND ($2::BIGINT IS NULL OR wave_id = $2)
+	  AND ($3 = '' OR kind = $3)
+	  AND ($4 = '' OR decision = $4)
+	ORDER BY first_seen_at DESC, id DESC
+	LIMIT $5
+`
+
+// ListByVersion reads the DB-29 projection of one version. It implements
+// executionapp.DiscoveryQueryRepository and never writes.
+func (r *DiscoveryObservationRepository) ListByVersion(ctx context.Context, versionID int64, waveID *int64, kind, decision string, limit int) ([]executionapp.DiscoveryObservationRow, error) {
+	ctx = contextOrBackground(ctx)
+	var limitArg *int
+	if limit > 0 {
+		limitArg = &limit
+	}
+	rows, err := r.pool.Query(ctx, discoveryObservationListQuery, versionID, waveID, kind, decision, limitArg)
+	if err != nil {
+		return nil, wrapDB("list discovery observations", err)
+	}
+	defer rows.Close()
+
+	observations := make([]executionapp.DiscoveryObservationRow, 0)
+	for rows.Next() {
+		var observation executionapp.DiscoveryObservationRow
+		if err := rows.Scan(&observation.ID, &observation.VersionSUTID, &observation.EnvironmentID,
+			&observation.WaveID, &observation.CaseRunID, &observation.Kind, &observation.Method,
+			&observation.Host, &observation.ResourceTemplate, &observation.StatusCode,
+			&observation.MIME, &observation.Occurrences, &observation.Decision,
+			&observation.ResourceID, &observation.FactID,
+			&observation.FirstSeenAt, &observation.LastSeenAt); err != nil {
+			return nil, wrapDB("scan discovery observation", err)
+		}
+		observations = append(observations, observation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("read discovery observations", err)
+	}
+	return observations, nil
+}
+
 // DiscoverySUTHostResolver resolves the allowed hosts of one version_sut
 // binding: the SUT environment base URL host plus the hosts of its registered
 // pages. It implements executionapp.SUTHostResolver.

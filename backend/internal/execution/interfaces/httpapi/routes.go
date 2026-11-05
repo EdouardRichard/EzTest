@@ -25,6 +25,11 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	// Frozen wave scope (R-EX-4 / API-19).
 	mux.Handle("GET /api/versions/{id}/scope-snapshot", authenticated(http.HandlerFunc(h.ScopeSnapshot)))
 
+	// Execution-time discovery reads (W1-14A / R-EX-5 / API-36,37,39).
+	mux.Handle("GET /api/versions/{id}/discovery/observations", authenticated(http.HandlerFunc(h.DiscoveryObservations)))
+	mux.Handle("GET /api/versions/{id}/discovery/deltas", authenticated(http.HandlerFunc(h.DiscoveryDeltas)))
+	mux.Handle("GET /api/versions/{id}/coverage", authenticated(http.HandlerFunc(h.DiscoveryCoverage)))
+
 	// Case runs.
 	mux.Handle("GET /api/versions/{id}/case-runs/{caseRunId}", authenticated(http.HandlerFunc(h.GetCaseRun)))
 	mux.Handle("POST /api/versions/{id}/case-runs/{caseRunId}/pause", authenticated(http.HandlerFunc(h.PauseCaseRun)))

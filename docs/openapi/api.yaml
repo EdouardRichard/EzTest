@@ -282,6 +282,19 @@ info:
       （版本频道 `version:{id}`，best-effort，不影响 wave 创建）。
     - 当前 wave 的快照冻结不变；新 approved 资源只影响下一 wave。
 
+    ## v0.22 W1 增量（W1-14A，additive）
+
+    R-EX-5 / API-36 / API-37 / API-39 / API-40（只读）：
+    - 新增 `GET /api/versions/{id}/discovery/observations?kind=&decision=&wave_id=&limit=`
+      （DB-29 观测列表；ID 为十进制字符串，limit 默认 50、数值越界 clamp 到 1..200）。
+    - 新增 `GET /api/versions/{id}/discovery/deltas?wave_id=`
+      （new/proposed/approved/rejected/out_of_scope 五类计数 + 精简来源项）。
+    - 新增 `GET /api/versions/{id}/coverage`（发现侧覆盖矩阵；uncovered 为
+      decision=proposed 的模板，去重/升序/最多 200；case 覆盖 T14 属 W2）。
+    - 新增 `GET /api/versions/{id}/gaps`（version_fact kind=gap 的 current 行；
+      无 gap 返回空数组，不是 404）。
+    - `resource.delta` / `version.scope.snapshot_created` 的前端 SSE 消费属 W1-14B。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -3721,6 +3734,365 @@ paths:
                         description: 冻结的 wave 范围，原样返回；空快照为 {}
                       counts:
                         $ref: '#/components/schemas/WaveCounts'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/discovery/observations:
+    get:
+      tags: [Execution]
+      operationId: listDiscoveryObservations
+      summary: 执行期探索观测列表（API-36）
+      description: |
+        R-EX-5 / DB-29。只读返回该版本在执行过程中采集到的页面/API 观测
+        （归一化后的 `resource_template`，不含 query 值/header/cookie/body）。
+        `kind` 仅允许 `page|api`，`decision` 仅允许
+        `new|proposed|approved|rejected|out_of_scope`；`wave_id` 为可选规范十进制
+        ID（仅数字、无符号、无前导零），且必须属于该版本，否则 404。
+        `limit` 默认 50；显式数值越界会 clamp 到 1..200（非数字 400）。
+        排序为 `first_seen_at` 降序、`id` 降序；`count` 是本页返回条数。
+        所有 ID 字段为十进制字符串；可空的来源列（wave/case_run/environment/
+        resource/fact）返回 `null` 而不是伪造 id。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: kind
+          in: query
+          required: false
+          description: 观测类型；缺省表示全部
+          schema:
+            type: string
+            enum: [page, api]
+        - name: decision
+          in: query
+          required: false
+          description: 五类决策过滤；缺省表示全部
+          schema:
+            type: string
+            enum: [new, proposed, approved, rejected, out_of_scope]
+        - name: wave_id
+          in: query
+          required: false
+          description: 波次雪花 ID 的规范十进制字符串（无符号、无前导零），必须属于该版本
+          schema:
+            type: string
+            pattern: '^[1-9][0-9]*$'
+        - name: limit
+          in: query
+          required: false
+          description: 页大小；默认 50，数值越界 clamp 到 1..200，非数字 400
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: 观测列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [items, count]
+                    properties:
+                      count:
+                        type: integer
+                        description: 本页返回条数
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                            [observation_id, kind, method, host, resource_template,
+                             status_code, mime, occurrences, decision, wave_id, case_run_id,
+                             version_sut_id, environment_id, resource_id, fact_id,
+                             first_seen_at, last_seen_at]
+                          properties:
+                            observation_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                            kind:
+                              type: string
+                              enum: [page, api]
+                            method:
+                              type: string
+                            host:
+                              type: string
+                            resource_template:
+                              type: string
+                            status_code:
+                              type: integer
+                              nullable: true
+                            mime:
+                              type: string
+                            occurrences:
+                              type: integer
+                            decision:
+                              type: string
+                              enum: [new, proposed, approved, rejected, out_of_scope]
+                            wave_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            case_run_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            version_sut_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                            environment_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            resource_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            fact_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            first_seen_at:
+                              type: string
+                              format: date-time
+                            last_seen_at:
+                              type: string
+                              format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/discovery/deltas:
+    get:
+      tags: [Execution]
+      operationId: getDiscoveryDeltas
+      summary: 探索增量五类计数与来源（API-37）
+      description: |
+        R-EX-3 / R-EX-5。返回该版本（或指定 wave）观测的
+        new/proposed/approved/rejected/out_of_scope 五类计数，以及每条观测的精简
+        来源投影。`wave_id` 可选，语义同 observations；属于其它版本一律 404。
+        计数是整波/整版本的聚合，不受分页影响。所有 ID 为十进制字符串，可空
+        来源列为 `null`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: wave_id
+          in: query
+          required: false
+          description: 波次雪花 ID 的规范十进制字符串（无符号、无前导零），必须属于该版本
+          schema:
+            type: string
+            pattern: '^[1-9][0-9]*$'
+      responses:
+        '200':
+          description: 五类计数与来源项
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [counts, items]
+                    properties:
+                      counts:
+                        type: object
+                        required: [new, proposed, approved, rejected, out_of_scope]
+                        additionalProperties: false
+                        properties:
+                          new:
+                            type: integer
+                          proposed:
+                            type: integer
+                          approved:
+                            type: integer
+                          rejected:
+                            type: integer
+                          out_of_scope:
+                            type: integer
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                            [observation_id, kind, method, host, resource_template,
+                             decision, occurrences, wave_id, case_run_id, resource_id, fact_id]
+                          properties:
+                            observation_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                            kind:
+                              type: string
+                              enum: [page, api]
+                            method:
+                              type: string
+                            host:
+                              type: string
+                            resource_template:
+                              type: string
+                            decision:
+                              type: string
+                              enum: [new, proposed, approved, rejected, out_of_scope]
+                            occurrences:
+                              type: integer
+                            wave_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            case_run_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            resource_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+                            fact_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                              nullable: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/coverage:
+    get:
+      tags: [Execution]
+      operationId: getVersionCoverage
+      summary: 发现侧覆盖矩阵（API-39）
+      description: |
+        R-EX-5 / W1。按 page/api 聚合该版本的执行期观测：`observed` 为观测条数
+        （已按模板去重），`proposed/approved/rejected/out_of_scope` 为对应决策
+        计数，`uncovered` 为 decision=proposed 的资源模板（去重、升序、最多 200
+        条）。本端点只表达发现侧覆盖；case 级覆盖矩阵（T14）属 W2，不在本端点
+        伪造。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 按 kind 的发现侧覆盖
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [pages, apis]
+                    properties:
+                      pages:
+                        type: object
+                        required: [observed, proposed, approved, rejected, out_of_scope, uncovered]
+                        additionalProperties: false
+                        properties:
+                          observed:
+                            type: integer
+                          proposed:
+                            type: integer
+                          approved:
+                            type: integer
+                          rejected:
+                            type: integer
+                          out_of_scope:
+                            type: integer
+                          uncovered:
+                            type: array
+                            maxItems: 200
+                            items:
+                              type: string
+                      apis:
+                        type: object
+                        required: [observed, proposed, approved, rejected, out_of_scope, uncovered]
+                        additionalProperties: false
+                        properties:
+                          observed:
+                            type: integer
+                          proposed:
+                            type: integer
+                          approved:
+                            type: integer
+                          rejected:
+                            type: integer
+                          out_of_scope:
+                            type: integer
+                          uncovered:
+                            type: array
+                            maxItems: 200
+                            items:
+                              type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/gaps:
+    get:
+      tags: [Version]
+      operationId: listVersionGaps
+      summary: 当前 gap 事实（API-40）
+      description: |
+        R-EX-5 / API-40。只读返回该版本 `version_fact kind='gap'` 的当前行
+        （不含已 supersede 的历史），复用 facts 查询。无 gap 时返回空数组，
+        不是 404；版本不存在仍是 404。`fact_id` 为十进制字符串。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 当前 gap 事实
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          required: [fact_id, key, payload, confidence, created_at]
+                          properties:
+                            fact_id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                            key:
+                              type: string
+                            payload:
+                              type: object
+                              additionalProperties: true
+                            confidence:
+                              type: number
+                              nullable: true
+                            created_at:
+                              type: string
+                              format: date-time
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':

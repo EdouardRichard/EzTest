@@ -109,6 +109,12 @@ const v022Operations = [
   ["POST", "/api/admin/executors/{id}/check"],
   // W1-13 R-EX-4/API-19: frozen wave scope-snapshot read (1 new path, +1 operation).
   ["GET", "/api/versions/{id}/scope-snapshot"],
+  // W1-14A R-EX-5/API-36,37,39,40: discovery observations/deltas/coverage and
+  // current gap facts (4 new paths, +4 operations).
+  ["GET", "/api/versions/{id}/discovery/observations"],
+  ["GET", "/api/versions/{id}/discovery/deltas"],
+  ["GET", "/api/versions/{id}/coverage"],
+  ["GET", "/api/versions/{id}/gaps"],
 ]
 const v022Schemas = [
   "AnswerQuestionRequest",
@@ -207,8 +213,8 @@ const baselinePaths = frozenPaths.size
 const baselineOperations = [...frozenPaths.values()].reduce((total, methods) => total + methods.size, 0)
 const releaseOperations = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
 check(
-  releasePaths.size === baselinePaths + 25 && releaseOperations === baselineOperations + 31,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 25 paths / 31 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
+  releasePaths.size === baselinePaths + 29 && releaseOperations === baselineOperations + 35,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 29 paths / 35 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
 )
 check(
   releaseSchemas.size === frozenSchemas.size + 34,

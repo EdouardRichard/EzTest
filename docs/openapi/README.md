@@ -7,11 +7,13 @@ v0.22 additive 策略见下）。身份分两层：
   **181 paths / 222 operations / 281 schemas**（events 目录口径：131 events）。
 - **v0.22 增量（additive）**：Task 37 在基线上追加 W0 契约（23 个 path item /
   29 个 operation / 34 个 schema），W1 继续 additive 追加（W1-7/D1 的波次启动
-  operation、W1-8/D8 的执行器认证检查 path/operation，以及 W1-13/API-19 的
-  `GET /api/versions/{id}/scope-snapshot`，合计 **25 个 path item / 31 个 operation /
-  34 个 schema**）。当前文件为 **206 paths / 253 operations / 315 schemas**。新增段在
-  `info.description` 的 `### v0.22 W0 增量（Task 37，additive）` 与
-  `## v0.22 W1 增量（W1-13，additive）` 中说明。
+  operation、W1-8/D8 的执行器认证检查 path/operation、W1-13/API-19 的
+  `GET /api/versions/{id}/scope-snapshot`，以及 W1-14A/API-36/37/39/40 的
+  discovery observations/deltas/coverage 与 gaps 读，合计 **29 个 path item /
+  35 个 operation / 34 个 schema**）。当前文件为 **210 paths / 257 operations /
+  315 schemas**。新增段在 `info.description` 的
+  `### v0.22 W0 增量（Task 37，additive）`、`## v0.22 W1 增量（W1-13，additive）`
+  与 `## v0.22 W1 增量（W1-14A，additive）` 中说明。
 - 公开端点 `GET /api/openapi.yaml` 原样返回本文件。
 
 ## 单一事实源与整文件 port（0.2.1 基线）
@@ -33,8 +35,9 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
    追加内容可新增 path item，也可在既有 path item 下新增 operation
    （如 W1-7/D1 的 `POST /api/versions/{id}/waves`），并在本 README 记录。
 3. v0.22 增量本身由 `scripts/v022-contract-check.cjs` 断言：W0 的 23 个 path item /
-   29 个 operation 与关键 schema 必须存在，另有 W1 的 2 个新 path item / 3 个
-   operation（含 1 个复用既有 path item 的 operation），且文件仍保留 0.2.1 基线身份。
+   29 个 operation 与关键 schema 必须存在，另有 W1 的新 path/operation（W1-7 复用
+   既有 `waves` path item 的 operation；W1-8、W1-13、W1-14A 合计新增 path 与
+   operation），且文件仍保留 0.2.1 基线身份。
 4. 基线计数 `181/222/281` 保留为本 README/历史的**基线口径**；当前文件实际计数
    允许为 `181+extras / 222+extras / 281+extras`，两个 gate 各自报告 extras。
 
@@ -49,6 +52,12 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
 - 波次冻结范围快照 `GET /api/versions/{id}/scope-snapshot?wave_id=`（W1-13/API-19，
   inline schema；`repository_ids` 为多仓 id 集合；返回 `{wave_id,status,scope_snapshot,counts}`，
   当前 wave 冻结、新 approved 资源只在下一 wave 生效）；
+- 执行期探索只读面（W1-14A/API-36/37/39/40，inline schema）：
+  `GET /api/versions/{id}/discovery/observations`（DB-29 观测，ID 为十进制字符串，
+  `limit` 默认 50、数值越界 clamp 到 1..200）、`GET .../discovery/deltas`（五类计数 +
+  精简来源）、`GET .../coverage`（发现侧覆盖矩阵，uncovered 为 proposed 模板，
+  去重/升序/最多 200；case 覆盖 T14 属 W2）、`GET .../gaps`（current kind=gap 事实，
+  空数组而非 404）；
 - 对应 DTO/schema 与 `kind`/`revision` 等可选字段。
 
 ## 验证
@@ -79,4 +88,5 @@ node -e "const fs=require('fs'),Y=require('./frontend/node_modules/yaml');const 
 - `0.2.1`：整体 port 自 0.2.1 权威契约（Task 85，2026-11-04）。
 - `v0.22 W0`：在 0.2.1 基线上 additive 追加 W0 契约（Task 37，2026-11-05）。
 - `v0.22 W1`：追加波次启动（W1-7）、执行器认证检查（W1-8）与波次冻结范围快照
-  （W1-13/API-19，2026-11-05）。
+  （W1-13/API-19，2026-11-05）；W1-14A 追加探索观测/增量/覆盖与 gap 只读 API
+  （2026-11-05）。

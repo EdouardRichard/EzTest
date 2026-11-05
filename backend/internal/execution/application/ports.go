@@ -204,6 +204,49 @@ type DiscoveryObservationWriter interface {
 	WriteObservations(ctx context.Context, observations []DiscoveryObservation) error
 }
 
+// DiscoveryObservationRow is the full DB-29 read projection of one observation
+// (W1-14A, API-36/37/39). IDs stay int64 at the application boundary; the HTTP
+// DTO renders them as decimal strings. The nullable provenance columns are
+// pointers so a missing wave/case_run/environment/resource/fact is never
+// confused with the zero value.
+type DiscoveryObservationRow struct {
+	ID               int64
+	VersionSUTID     int64
+	EnvironmentID    *int64
+	WaveID           *int64
+	CaseRunID        *int64
+	Kind             string
+	Method           string
+	Host             string
+	ResourceTemplate string
+	StatusCode       *int
+	MIME             string
+	Occurrences      int
+	Decision         string
+	ResourceID       *int64
+	FactID           *int64
+	FirstSeenAt      time.Time
+	LastSeenAt       time.Time
+}
+
+// DiscoveryQueryRepository is the read-only DB-29 query port behind the
+// discovery observation/delta/coverage read APIs (W1-14A). Filters are optional:
+// an empty kind/decision means "every value" and a nil wave means the whole
+// version. A limit <= 0 means "no limit" (the coverage aggregation reads the
+// whole version); the HTTP layer clamps its own limit to 1..200. Rows are
+// ordered first_seen_at DESC, id DESC.
+type DiscoveryQueryRepository interface {
+	ListByVersion(ctx context.Context, versionID int64, waveID *int64, kind, decision string, limit int) ([]DiscoveryObservationRow, error)
+}
+
+// DiscoveryDeltaEvaluator is the narrow version-context delta trigger the
+// scheduler calls once when a wave reaches its terminal state (W1-14A,
+// R-EX-3). The production adapter returns nil for versionapp.ErrDeltaBusy
+// (another pass owns the lock), so a skipped pass never fails the wave.
+type DiscoveryDeltaEvaluator interface {
+	Evaluate(ctx context.Context, versionID, waveID int64) error
+}
+
 // CaseReader is the read port into the design context. It only exposes
 // current+confirmed case versions for execution.
 type CaseReader interface {

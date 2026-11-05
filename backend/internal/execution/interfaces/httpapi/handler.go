@@ -63,6 +63,11 @@ type Deps struct {
 	Content   executionapp.ContentStore
 	Settings  executionapp.SettingsReader
 
+	// Discovery is the read-only DB-29 query surface behind the W1-14A
+	// discovery observation/delta/coverage APIs. It is optional so degraded
+	// assemblies answer 503 instead of panicking.
+	Discovery executionapp.DiscoveryQueryRepository
+
 	// AuthChecker performs the admin token-bearing executor probe (D8). It is
 	// optional so degraded assemblies answer 503 instead of panicking.
 	AuthChecker executionapp.ExecutorAuthChecker

@@ -64,7 +64,7 @@ func NewVersionReadHandler(versions VersionReadService, workItems WorkItemReadSe
 	return &VersionReadHandler{versions: versions, workItems: workItems}
 }
 
-// RegisterVersionReadRoutes mounts the four read-only routes on mux. A nil
+// RegisterVersionReadRoutes mounts the read-only routes on mux. A nil
 // handler, mux or authentication middleware leaves the route table unchanged.
 // The assembly root owns the authentication middleware.
 func RegisterVersionReadRoutes(mux *http.ServeMux, auth func(http.Handler) http.Handler, h *VersionReadHandler) {
@@ -75,6 +75,8 @@ func RegisterVersionReadRoutes(mux *http.ServeMux, auth func(http.Handler) http.
 	mux.Handle("GET /api/versions/{id}/plan-items", auth(http.HandlerFunc(h.PlanItems)))
 	mux.Handle("GET /api/versions/{id}/work-items", auth(http.HandlerFunc(h.ListWorkItems)))
 	mux.Handle("GET /api/versions/{id}/work-items/{workItemId}", auth(http.HandlerFunc(h.GetWorkItem)))
+	// W1-14A / API-40: current gap facts, read-only (spec R-EX-5).
+	mux.Handle("GET /api/versions/{id}/gaps", auth(http.HandlerFunc(h.Gaps)))
 }
 
 // Facts GET /api/versions/{id}/facts?kind=&include_superseded=&cursor=&limit=.
@@ -115,6 +117,53 @@ func (h *VersionReadHandler) Facts(w http.ResponseWriter, r *http.Request) {
 		items = append(items, toFactReadDTO(view))
 	}
 	httpx.List(w, http.StatusOK, items, nextReadCursor(hasMore, lastReadID(views, factReadViewID)), hasMore)
+}
+
+// Gaps GET /api/versions/{id}/gaps. W1-14A / API-40 (spec R-EX-5): the current
+// version_fact rows of kind=gap. It reuses the current-only facts read
+// (include_superseded=false) and answers an empty items array when the version
+// has no gap, never a 404.
+func (h *VersionReadHandler) Gaps(w http.ResponseWriter, r *http.Request) {
+	versionID, err := versionReadPathID(r, "id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if !h.requireVersion(w, r, versionID) {
+		return
+	}
+	views, _, err := h.versions.Facts(r.Context(), versionID, versionapp.FactReadFilter{
+		Kind:  "gap",
+		Limit: maxGapReadLimit,
+	})
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]gapReadDTO, 0, len(views))
+	for _, view := range views {
+		items = append(items, toGapReadDTO(view))
+	}
+	httpx.JSON(w, http.StatusOK, gapReadListView{Items: items})
+}
+
+// maxGapReadLimit bounds the gap list; the route is unpaginated because a
+// version's open gaps are a small, current-only set.
+const maxGapReadLimit = 100
+
+// gapReadListView is the GET /api/versions/{id}/gaps envelope payload.
+type gapReadListView struct {
+	Items []gapReadDTO `json:"items"`
+}
+
+// gapReadDTO is the frozen gap projection (API-40): fact id/key/payload,
+// confidence and creation time.
+type gapReadDTO struct {
+	FactID     string         `json:"fact_id"`
+	Key        string         `json:"key"`
+	Payload    map[string]any `json:"payload"`
+	Confidence *float64       `json:"confidence"`
+	CreatedAt  string         `json:"created_at"`
 }
 
 // PlanItems GET /api/versions/{id}/plan-items?status=&cursor=&limit=. Each item
@@ -386,6 +435,20 @@ func toFactReadDTO(view versionapp.FactReadView) factReadDTO {
 		ContentHash:  view.ContentHash,
 		SupersededBy: formatOptionalDecimal(view.SupersededBy),
 		CreatedAt:    formatTime(view.CreatedAt),
+	}
+}
+
+func toGapReadDTO(view versionapp.FactReadView) gapReadDTO {
+	payload := view.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	return gapReadDTO{
+		FactID:     formatDecimal(view.ID),
+		Key:        view.Key,
+		Payload:    payload,
+		Confidence: view.Confidence,
+		CreatedAt:  formatTime(view.CreatedAt),
 	}
 }
 

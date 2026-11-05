@@ -364,3 +364,75 @@ func TestDiscoverySUTHostResolverIncludesBaseURLAndPages(t *testing.T) {
 	}
 	t.Logf("allowed hosts: %v", hosts)
 }
+
+// TestDiscoveryObservationListByVersion covers the W1-14A read API query: the
+// full DB-29 projection, the optional wave/kind/decision filters, the
+// first_seen_at DESC, id DESC order and the limit<=0 "no limit" contract used by
+// the coverage aggregation.
+func TestDiscoveryObservationListByVersion(t *testing.T) {
+	repo, pool := newTestRepository(t)
+	ctx := context.Background()
+	const versionID, versionSUTID, environmentID = int64(210), int64(5210), int64(7210)
+	seedDiscoveryBinding(t, pool, versionID, versionSUTID, environmentID)
+
+	batch := []executionapp.DiscoveryObservation{
+		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}", MIME: "text/html",
+			StatusCode: intPtr(200), VersionID: versionID, VersionSUTID: versionSUTID, WaveID: 9201, CaseRunID: 3201, Occurrences: 2},
+		{Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}", MIME: "application/json",
+			StatusCode: intPtr(200), VersionID: versionID, VersionSUTID: versionSUTID, WaveID: 9201, CaseRunID: 3201, Occurrences: 5},
+		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/login", MIME: "text/html",
+			StatusCode: intPtr(200), VersionID: versionID, VersionSUTID: versionSUTID, WaveID: 9202, CaseRunID: 3202, Occurrences: 1},
+	}
+	if err := repo.Observations.UpsertObservations(ctx, batch); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	rows, err := repo.Observations.ListByVersion(ctx, versionID, nil, "", "", 0)
+	if err != nil {
+		t.Fatalf("ListByVersion: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	if rows[0].ResourceTemplate != "/login" {
+		t.Fatalf("newest row = %q, want /login (first_seen_at DESC, id DESC)", rows[0].ResourceTemplate)
+	}
+	var page executionapp.DiscoveryObservationRow
+	found := false
+	for _, row := range rows {
+		if row.Kind == "page" && row.ResourceTemplate == "/orders/{id}" {
+			page, found = row, true
+		}
+	}
+	if !found {
+		t.Fatalf("page row /orders/{id} not found: %+v", rows)
+	}
+	if page.Kind != "page" || page.Method != "" || page.Host != "shop.example.com" ||
+		page.ResourceTemplate != "/orders/{id}" || page.MIME != "text/html" ||
+		page.StatusCode == nil || *page.StatusCode != 200 || page.Occurrences != 2 ||
+		page.Decision != "new" || page.WaveID == nil || *page.WaveID != 9201 ||
+		page.CaseRunID == nil || *page.CaseRunID != 3201 ||
+		page.EnvironmentID == nil || *page.EnvironmentID != environmentID ||
+		page.ResourceID != nil || page.FactID != nil ||
+		page.FirstSeenAt.IsZero() || page.LastSeenAt.IsZero() {
+		t.Fatalf("page row = %+v", page)
+	}
+
+	pageRows, err := repo.Observations.ListByVersion(ctx, versionID, nil, "page", "", 0)
+	if err != nil || len(pageRows) != 2 {
+		t.Fatalf("kind=page rows = %d err=%v, want 2", len(pageRows), err)
+	}
+	newRows, err := repo.Observations.ListByVersion(ctx, versionID, nil, "", "new", 0)
+	if err != nil || len(newRows) != 2 {
+		t.Fatalf("decision=new rows = %d err=%v, want 2", len(newRows), err)
+	}
+	waveID := int64(9201)
+	waveRows, err := repo.Observations.ListByVersion(ctx, versionID, &waveID, "", "", 0)
+	if err != nil || len(waveRows) != 2 {
+		t.Fatalf("wave 9201 rows = %d err=%v, want 2", len(waveRows), err)
+	}
+	limited, err := repo.Observations.ListByVersion(ctx, versionID, nil, "", "", 1)
+	if err != nil || len(limited) != 1 || limited[0].ResourceTemplate != "/login" {
+		t.Fatalf("limit=1 rows = %+v err=%v, want the newest only", limited, err)
+	}
+}

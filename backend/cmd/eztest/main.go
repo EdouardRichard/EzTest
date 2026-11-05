@@ -1147,8 +1147,8 @@ func main() {
 	// and crosses into execution only through the narrow observation adapter
 	// (Agent.md §6.2). It classifies terminal observations, proposes genuinely
 	// new pages/APIs, records provenance facts and publishes one wave-level
-	// resource.delta. W1-14 wires this service into the discovery HTTP handler;
-	// this task ends at the service layer.
+	// resource.delta. W1-14A triggers it once per terminal wave through the
+	// scheduler's narrow evaluator port (ErrDeltaBusy = skipped pass).
 	discoveryObservationAdapter := executionadapters.NewDiscoveryObservationAdapter(executionRepo.Observations)
 	discoveryDelta := versionapp.NewDiscoveryDelta(versionapp.DiscoveryDeltaDeps{
 		Observations: discoveryObservationAdapter,
@@ -1158,7 +1158,7 @@ func main() {
 		Events:       eventSvc,
 		Locker:       executionadapters.NewDiscoveryDeltaLocker(pool),
 	})
-	_ = discoveryDelta
+	discoveryDeltaEvaluator := executionadapters.NewDiscoveryDeltaEvaluator(discoveryDelta, nil)
 	// P7 design graph result colouring (spec §9.3): each case card carries the
 	// latest case_run verdict of its current version.
 	designGraph.SetCaseRunStatusReader(designCaseRunStatuses{runs: executionRepo.CaseRuns})
@@ -1366,6 +1366,8 @@ func main() {
 		// at the stage service once the composition root binds the relay.
 		StageNotifier:   stageCallbacks,
 		StageReconciler: stageCallbacks,
+		// W1-14A: classify the wave's execution-time observations once terminal.
+		Delta:           discoveryDeltaEvaluator,
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Intents:     executionRepo.Intents,
@@ -1397,6 +1399,8 @@ func main() {
 		Versions:      executionVersionAdapter,
 		Content:       executionContent,
 		Settings:      settingsSvc,
+		// W1-14A: read-only DB-29 query surface of the discovery APIs.
+		Discovery:     executionRepo.Observations,
 		AuthChecker:   executorAuthChecker,
 		IntentService:   executionIntents,
 		Planner:         executionScheduler,

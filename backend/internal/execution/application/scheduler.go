@@ -66,6 +66,9 @@ type Scheduler struct {
 	stageReconciler StageReconciler
 	pendingStageMu  sync.Mutex
 	pendingStage    map[int64]struct{}
+	// delta is the optional v0.22 version-context discovery-delta trigger
+	// (W1-14A): the scheduler calls it once when a wave becomes done.
+	delta DiscoveryDeltaEvaluator
 	// blocked deduplicates EventCaseRunBlocked by case_run ID; it holds the
 	// last published reason. A successful dispatch clears the entry.
 	blockedMu sync.Mutex
@@ -123,6 +126,9 @@ type SchedulerDeps struct {
 	// callback (Task 25 fix round 1). nil disables retries; Task 36 wires
 	// *versionapp.StageService here too.
 	StageReconciler StageReconciler
+	// Delta is the W1-14A wave-terminal discovery-delta trigger implemented by
+	// the version context. nil disables the trigger (degraded assemblies/tests).
+	Delta DiscoveryDeltaEvaluator
 }
 
 // NewScheduler builds the scheduler.
@@ -157,6 +163,7 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		leaseTTL:        lease,
 		stageNotifier:   deps.StageNotifier,
 		stageReconciler: deps.StageReconciler,
+		delta:           deps.Delta,
 		pendingStage:    map[int64]struct{}{},
 		blocked:         map[int64]string{},
 	}
@@ -463,7 +470,33 @@ func (s *Scheduler) completeWave(ctx context.Context, wave execution.RunWave, ru
 	// executing -> reporting (R-B4-3). The callback runs after analysis so the
 	// version report snapshot includes the analyzed issues.
 	s.notifyStageWaveTerminal(ctx, wave.VersionID, wave.ID)
+	// W1-14A: classify this wave's execution-time observations into resources/
+	// facts and publish resource.delta. It runs after the terminal transition
+	// (the changed guard makes it once per wave) and after the stage callback, is
+	// bounded to 15s and never fails the scheduler tick.
+	s.notifyDiscoveryDelta(ctx, wave.VersionID, wave.ID)
 	return nil
+}
+
+// discoveryDeltaTimeout bounds the best-effort wave-terminal delta evaluation.
+const discoveryDeltaTimeout = 15 * time.Second
+
+// notifyDiscoveryDelta invokes the optional v0.22 discovery delta after a wave
+// is terminal. The wave finalization is the source of truth: a failed or slow
+// evaluation is logged and never rolls the wave back. It is called from the
+// single terminal-transition branch of completeWave, so one wave triggers at
+// most one pass.
+func (s *Scheduler) notifyDiscoveryDelta(ctx context.Context, versionID, waveID int64) {
+	if s.delta == nil || waveID <= 0 {
+		return
+	}
+	evalCtx, cancel := context.WithTimeout(ctx, discoveryDeltaTimeout)
+	defer cancel()
+	if err := s.delta.Evaluate(evalCtx, versionID, waveID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: discovery delta evaluation failed; the wave stays terminal",
+			"version_id", versionID, "wave_id", waveID, "error", err)
+	}
 }
 
 // notifyStageWaveTerminal invokes the optional v0.22 production callback after a
