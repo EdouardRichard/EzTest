@@ -9,6 +9,7 @@ package versionpg_test
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 
@@ -95,6 +96,9 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("page facts = %d, want 1", len(facts))
 	}
+	if want := "page:env:7201:/orders/{id}"; facts[0].Key != want {
+		t.Fatalf("fact key = %q, want the P9 environment-qualified key %q", facts[0].Key, want)
+	}
 	provenance, ok := facts[0].Payload["provenance"].(map[string]any)
 	if !ok || provenance["wave_id"] != "7401" || provenance["case_run_id"] != "7501" {
 		t.Fatalf("fact provenance = %#v", facts[0].Payload["provenance"])
@@ -166,4 +170,32 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	if decision != "rejected" {
 		t.Fatalf("observation decision after reject = %q, want rejected", decision)
 	}
+}
+
+// TestDiscoveryDeltaLockerSerializesWave pins the PostgreSQL session advisory
+// lock contract: one holder per (version, wave), a concurrent try-lock returns
+// ErrDeltaBusy, another wave is independent, and unlock lets the next pass in.
+func TestDiscoveryDeltaLockerSerializesWave(t *testing.T) {
+	pool := testutil.NewDB(t)
+	locker := executionadapters.NewDiscoveryDeltaLocker(pool)
+	ctx := context.Background()
+
+	unlock, err := locker.LockDelta(ctx, 9001, 3)
+	if err != nil {
+		t.Fatalf("first LockDelta: %v", err)
+	}
+	if _, err := locker.LockDelta(ctx, 9001, 3); !errors.Is(err, versionapp.ErrDeltaBusy) {
+		t.Fatalf("concurrent LockDelta error = %v, want ErrDeltaBusy", err)
+	}
+	unlock()
+	otherUnlock, err := locker.LockDelta(ctx, 9001, 4)
+	if err != nil {
+		t.Fatalf("independent wave LockDelta: %v", err)
+	}
+	otherUnlock()
+	reacquired, err := locker.LockDelta(ctx, 9001, 3)
+	if err != nil {
+		t.Fatalf("reacquire after unlock: %v", err)
+	}
+	reacquired()
 }

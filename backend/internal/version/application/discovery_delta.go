@@ -14,6 +14,8 @@ package versionapp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sort"
@@ -24,6 +26,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	resource "github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -60,6 +63,19 @@ type DiscoveryObservationReader interface {
 type DiscoveryObservationDecider interface {
 	MarkDecision(ctx context.Context, observationID int64, decision string, resourceID, factID int64) error
 }
+
+// DeltaLocker serializes Evaluate of one (version, wave) across cooperative
+// processes. The PostgreSQL adapter holds a session advisory lock on a dedicated
+// pooled connection for the whole evaluation; the returned release function must
+// be called exactly once on success. A failed try-lock returns ErrDeltaBusy,
+// which callers treat as "this pass was skipped", not as a failure.
+type DeltaLocker interface {
+	LockDelta(ctx context.Context, versionID, waveID int64) (unlock func(), err error)
+}
+
+// ErrDeltaBusy reports that another evaluation currently owns the (version,
+// wave) delta lock. W1-14 skips the pass instead of failing the wave.
+var ErrDeltaBusy = errors.New("discovery delta: another evaluation is already running")
 
 // DiscoveryResourceCatalog is the resource-context surface the delta service
 // uses. *resourceapp.Service implements it: template lookups are status-agnostic
@@ -98,23 +114,28 @@ type DeltaItem struct {
 }
 
 // DeltaResult is the five-way classification of one wave (spec R-EX-3, API-37).
-// Every slice is non-nil.
+// Every slice is non-nil. Skipped counts observations that could not be
+// processed at all (invalid kind/environment/method/template or a rejected
+// proposal); they are logged, never decided, and do not abort the wave.
 type DeltaResult struct {
 	New        []DeltaItem `json:"new"`
 	Proposed   []DeltaItem `json:"proposed"`
 	Approved   []DeltaItem `json:"approved"`
 	Rejected   []DeltaItem `json:"rejected"`
 	OutOfScope []DeltaItem `json:"out_of_scope"`
+	Skipped    int         `json:"skipped"`
 }
 
 // DiscoveryDeltaDeps wires one delta evaluator. Observations and Resources are
-// mandatory; Decisions, Facts and Events may be nil in degraded assemblies.
+// mandatory; Decisions, Facts, Events and the Locker may be nil in degraded
+// assemblies (a nil locker keeps the old single-process behavior).
 type DiscoveryDeltaDeps struct {
 	Observations DiscoveryObservationReader
 	Decisions    DiscoveryObservationDecider
 	Resources    DiscoveryResourceCatalog
 	Facts        DiscoveryFactRecorder
 	Events       eventingapp.Publisher
+	Locker       DeltaLocker
 	Logger       *slog.Logger
 }
 
@@ -127,6 +148,7 @@ type DiscoveryDelta struct {
 	resources    DiscoveryResourceCatalog
 	facts        DiscoveryFactRecorder
 	events       eventingapp.Publisher
+	locker       DeltaLocker
 	logger       *slog.Logger
 }
 
@@ -142,6 +164,7 @@ func NewDiscoveryDelta(deps DiscoveryDeltaDeps) *DiscoveryDelta {
 		resources:    deps.Resources,
 		facts:        deps.Facts,
 		events:       deps.Events,
+		locker:       deps.Locker,
 		logger:       logger,
 	}
 }
@@ -158,145 +181,249 @@ func (d *DiscoveryDelta) Evaluate(ctx context.Context, versionID, waveID int64) 
 	if d == nil || d.observations == nil || d.resources == nil {
 		return result, platform.Unavailable("discovery delta is not configured")
 	}
+	// One evaluator at a time per (version, wave): a concurrent pass returns
+	// ErrDeltaBusy before reading observations, so it cannot duplicate facts or
+	// events. The session lock lives in the execution adapter.
+	if d.locker != nil {
+		unlock, lockErr := d.locker.LockDelta(ctx, versionID, waveID)
+		if lockErr != nil {
+			return result, lockErr
+		}
+		if unlock != nil {
+			defer unlock()
+		}
+	}
+
 	observations, err := d.observations.ListForDelta(ctx, versionID, waveID)
 	if err != nil {
 		return result, err
 	}
 
 	facts := d.loadCurrentFacts(ctx, versionID)
-	newItems := make([]DeltaItem, 0)
+	eventItems := make([]DeltaItem, 0)
 	for _, observation := range observations {
+		// Poison isolation: one unusable observation is logged/counted and
+		// skipped, never a reason to abandon the healthy items of the wave.
+		if reason := unprocessableObservation(observation); reason != "" {
+			result.Skipped++
+			d.logger.WarnContext(ctx, "discovery delta: skip unprocessable observation",
+				"observation_id", observation.ObservationID,
+				"kind", observation.Kind,
+				"environment_id", observation.EnvironmentID,
+				"method", observation.Method,
+				"reason", reason)
+			continue
+		}
 		item := deltaItemFromObservation(observation, waveID)
-		if status := strings.TrimSpace(observation.Kind); status != "page" && status != "api" {
-			d.logger.WarnContext(ctx, "discovery delta: skip observation with unsupported kind",
-				"observation_id", observation.ObservationID, "kind", observation.Kind)
-			continue
+		classified, event, skipped, evalErr := d.evaluateObservation(ctx, versionID, facts, observation, &item)
+		if evalErr != nil {
+			return result, evalErr
 		}
-		if observation.EnvironmentID <= 0 {
-			d.logger.WarnContext(ctx, "discovery delta: skip observation without an environment",
-				"observation_id", observation.ObservationID, "version_sut_id", observation.VersionSUTID)
+		if skipped {
+			result.Skipped++
 			continue
-		}
-		classified, created, err := d.evaluateObservation(ctx, versionID, facts, observation, &item)
-		if err != nil {
-			return result, err
 		}
 		appendDeltaItem(&result, classified, item)
-		if created {
-			newItems = append(newItems, item)
+		if event {
+			eventItems = append(eventItems, item)
 		}
 	}
 
 	sortDeltaResult(&result)
-	d.publishDelta(ctx, versionID, waveID, newItems)
+	d.publishDelta(ctx, versionID, waveID, eventItems)
 	return result, nil
 }
 
 // evaluateObservation classifies one observation, creating/proposing a resource
-// when it is genuinely new. The returned classification is the target slice name.
-func (d *DiscoveryDelta) evaluateObservation(ctx context.Context, versionID int64, facts map[string][]version.Fact, observation DiscoveryObservation, item *DeltaItem) (string, bool, error) {
-	switch observation.Kind {
+// when it is genuinely new. The returned classification is the target slice
+// name; event reports that the item belongs to this pass's resource.delta
+// (a new resource or a repaired fact); skipped reports a per-observation
+// validation failure that must not abort the wave.
+func (d *DiscoveryDelta) evaluateObservation(ctx context.Context, versionID int64, facts map[string][]version.Fact, observation DiscoveryObservation, item *DeltaItem) (string, bool, bool, error) {
+	switch item.Kind {
 	case "page":
-		view, found, err := d.resources.FindPageByRouteTemplate(ctx, observation.EnvironmentID, observation.ResourceTemplate)
+		view, found, err := d.resources.FindPageByRouteTemplate(ctx, observation.EnvironmentID, item.ResourceTemplate)
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		if found {
-			item.ResourceID = parseResourceID(view.ID)
+			resourceID := parseResourceID(view.ID)
+			item.ResourceID = resourceID
 			item.FactID = observation.FactID
 			switch view.Status {
 			case resource.PageStatusRejected:
-				return "rejected", false, d.markDecision(ctx, observation, "rejected", item.ResourceID, 0)
+				return "rejected", false, false, d.markDecision(ctx, observation, "rejected", resourceID, 0)
 			case resource.PageStatusProposed:
-				return "proposed", false, d.markDecision(ctx, observation, "proposed", item.ResourceID, item.FactID)
+				return d.classifyProposedExisting(ctx, versionID, facts, observation, item, resourceID)
 			case resource.PageStatusApproved:
 				if observation.Decision == "approved" {
-					return "approved", false, d.markDecision(ctx, observation, "approved", item.ResourceID, 0)
+					return "approved", false, false, d.markDecision(ctx, observation, "approved", resourceID, 0)
 				}
-				return "out_of_scope", false, d.markDecision(ctx, observation, "out_of_scope", item.ResourceID, 0)
+				return "out_of_scope", false, false, d.markDecision(ctx, observation, "out_of_scope", resourceID, 0)
 			default:
-				return "out_of_scope", false, d.markDecision(ctx, observation, "out_of_scope", item.ResourceID, 0)
+				return "out_of_scope", false, false, d.markDecision(ctx, observation, "out_of_scope", resourceID, 0)
 			}
 		}
 		// No catalog row: an observation that was already classified in a prior
 		// pass is never silently re-proposed.
 		if classified, handled := classifiedWithoutResource(observation); handled {
-			return classified, false, nil
+			return classified, false, false, nil
 		}
 		created, err := d.resources.CreateProposedPage(ctx, resourceapp.ProposedPageInput{
 			EnvironmentID: observation.EnvironmentID,
-			Name:          observation.ResourceTemplate,
+			Name:          item.ResourceTemplate,
 			URL:           discoveryProposedURL(*item),
-			RouteTemplate: observation.ResourceTemplate,
+			RouteTemplate: item.ResourceTemplate,
 			PageType:      "page",
 			Source:        resource.PageSourceAI,
 		})
 		if err != nil {
-			return "", false, err
+			if isInvalidObservationError(err) {
+				d.logger.WarnContext(ctx, "discovery delta: skip observation rejected by the proposal validator",
+					"observation_id", observation.ObservationID, "kind", item.Kind, "error", err)
+				return "", false, true, nil
+			}
+			return "", false, false, err
 		}
 		item.ResourceID = parseResourceID(created.ID)
 		return d.finalizeProposedResource(ctx, versionID, facts, observation, item, created.Status)
 	case "api":
-		view, found, err := d.resources.FindAPIByTemplate(ctx, observation.EnvironmentID, observation.Method, observation.ResourceTemplate)
+		view, found, err := d.resources.FindAPIByTemplate(ctx, observation.EnvironmentID, item.Method, item.ResourceTemplate)
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		if found {
-			item.ResourceID = parseResourceID(view.ID)
+			resourceID := parseResourceID(view.ID)
+			item.ResourceID = resourceID
 			item.FactID = observation.FactID
 			switch view.Status {
 			case resource.APIStatusRejected:
-				return "rejected", false, d.markDecision(ctx, observation, "rejected", item.ResourceID, 0)
+				return "rejected", false, false, d.markDecision(ctx, observation, "rejected", resourceID, 0)
 			case resource.APIStatusProposed:
-				return "proposed", false, d.markDecision(ctx, observation, "proposed", item.ResourceID, item.FactID)
+				return d.classifyProposedExisting(ctx, versionID, facts, observation, item, resourceID)
 			case resource.APIStatusApproved:
 				if observation.Decision == "approved" {
-					return "approved", false, d.markDecision(ctx, observation, "approved", item.ResourceID, 0)
+					return "approved", false, false, d.markDecision(ctx, observation, "approved", resourceID, 0)
 				}
-				return "out_of_scope", false, d.markDecision(ctx, observation, "out_of_scope", item.ResourceID, 0)
+				return "out_of_scope", false, false, d.markDecision(ctx, observation, "out_of_scope", resourceID, 0)
 			default:
-				return "out_of_scope", false, d.markDecision(ctx, observation, "out_of_scope", item.ResourceID, 0)
+				return "out_of_scope", false, false, d.markDecision(ctx, observation, "out_of_scope", resourceID, 0)
 			}
 		}
 		if classified, handled := classifiedWithoutResource(observation); handled {
-			return classified, false, nil
+			return classified, false, false, nil
 		}
 		created, err := d.resources.CreateProposedAPI(ctx, resourceapp.ProposedAPIInput{
 			EnvironmentID: observation.EnvironmentID,
-			Method:        observation.Method,
-			PathTemplate:  observation.ResourceTemplate,
-			Name:          strings.TrimSpace(observation.Method + " " + observation.ResourceTemplate),
+			Method:        item.Method,
+			PathTemplate:  item.ResourceTemplate,
+			Name:          strings.TrimSpace(item.Method + " " + item.ResourceTemplate),
 			Source:        resource.APISourceAI,
 		})
 		if err != nil {
-			return "", false, err
+			if isInvalidObservationError(err) {
+				d.logger.WarnContext(ctx, "discovery delta: skip observation rejected by the proposal validator",
+					"observation_id", observation.ObservationID, "kind", item.Kind, "error", err)
+				return "", false, true, nil
+			}
+			return "", false, false, err
 		}
 		item.ResourceID = parseResourceID(created.ID)
 		return d.finalizeProposedResource(ctx, versionID, facts, observation, item, created.Status)
 	}
-	return "", false, nil
+	return "", false, false, nil
+}
+
+// classifyProposedExisting handles an existing proposed catalog row. If the
+// observation never got its fact id (a prior pass created the resource and then
+// failed before/at the fact write), the fact is repaired idempotently, the
+// decision is written only after the fact succeeds, and the item joins this
+// pass's resource.delta so the missed event is re-published.
+func (d *DiscoveryDelta) classifyProposedExisting(ctx context.Context, versionID int64, facts map[string][]version.Fact, observation DiscoveryObservation, item *DeltaItem, resourceID int64) (string, bool, bool, error) {
+	item.ResourceID = resourceID
+	item.FactID = observation.FactID
+	if observation.FactID > 0 || d.facts == nil {
+		return "proposed", false, false, d.markDecision(ctx, observation, "proposed", resourceID, item.FactID)
+	}
+	factID, err := d.ensureFact(ctx, versionID, facts, observation, item)
+	if err != nil {
+		return "", false, false, err
+	}
+	item.FactID = factID
+	if err := d.markDecision(ctx, observation, "proposed", resourceID, factID); err != nil {
+		return "", false, false, err
+	}
+	return "proposed", true, false, nil
+}
+
+// isInvalidObservationError reports a field-level rejection (platform.Invalid)
+// of one proposal. Such an observation is skipped and counted; database and
+// port failures stay fatal for the pass.
+func isInvalidObservationError(err error) bool {
+	var platformErr *platform.Error
+	if errors.As(err, &platformErr) {
+		return platformErr.Code == "invalid_argument"
+	}
+	return false
+}
+
+// unprocessableObservation validates the fields a proposal needs before any
+// write. It returns a non-empty reason when the observation cannot be handled;
+// the observation is then logged/counted and skipped without a decision.
+func unprocessableObservation(observation DiscoveryObservation) string {
+	kind := strings.TrimSpace(observation.Kind)
+	if kind != "page" && kind != "api" {
+		return "unsupported kind"
+	}
+	if observation.EnvironmentID <= 0 {
+		return "missing environment"
+	}
+	template := discoveryTemplateKey(observation.ResourceTemplate)
+	if template == "" {
+		return "missing resource template"
+	}
+	if !strings.HasPrefix(template, "/") {
+		return "resource template must start with /"
+	}
+	if len([]rune(template)) > 500 {
+		return "resource template is too long"
+	}
+	if kind == "api" {
+		method := strings.ToUpper(strings.TrimSpace(observation.Method))
+		if method == "" {
+			return "missing method"
+		}
+		if err := validation.HTTPMethod(method); err != nil {
+			return "unsupported method"
+		}
+		return ""
+	}
+	if strings.TrimSpace(observation.Host) == "" {
+		return "missing host"
+	}
+	return ""
 }
 
 // finalizeProposedResource resolves the status returned by the proposal write.
 // The proposal path may return an already-proposed row (idempotent refresh) or
 // an approved/rejected row (the normalized_url lookup found one), so the fact
 // and the event are only written for a proposed row.
-func (d *DiscoveryDelta) finalizeProposedResource(ctx context.Context, versionID int64, facts map[string][]version.Fact, observation DiscoveryObservation, item *DeltaItem, status string) (string, bool, error) {
+func (d *DiscoveryDelta) finalizeProposedResource(ctx context.Context, versionID int64, facts map[string][]version.Fact, observation DiscoveryObservation, item *DeltaItem, status string) (string, bool, bool, error) {
 	switch status {
 	case "proposed":
 		factID, err := d.ensureFact(ctx, versionID, facts, observation, item)
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		item.FactID = factID
 		if err := d.markDecision(ctx, observation, "proposed", item.ResourceID, factID); err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
-		return "new", true, nil
+		return "new", true, false, nil
 	case "rejected":
-		return "rejected", false, d.markDecision(ctx, observation, "rejected", item.ResourceID, 0)
+		return "rejected", false, false, d.markDecision(ctx, observation, "rejected", item.ResourceID, 0)
 	default:
-		return "out_of_scope", false, d.markDecision(ctx, observation, "out_of_scope", item.ResourceID, 0)
+		return "out_of_scope", false, false, d.markDecision(ctx, observation, "out_of_scope", item.ResourceID, 0)
 	}
 }
 
@@ -419,8 +546,11 @@ func (d *DiscoveryDelta) publishDelta(ctx context.Context, versionID, waveID int
 }
 
 // discoveryDeltaFact builds the version_fact of one newly proposed resource. The
-// key is the normalized resource_template (task W1-12); the provenance ids are
-// decimal strings in Payload["provenance"] (spec R-EX-3: no typed columns).
+// key follows the P9 convention (`page:env:{environment}:{template}`,
+// `api:env:{environment}:{METHOD} {template}`) so two environments or two
+// methods on one template are distinct facts and never a bogus conflict. The
+// provenance ids are decimal strings in Payload["provenance"] (spec R-EX-3: no
+// typed columns).
 func discoveryDeltaFact(versionID int64, observation DiscoveryObservation, item DeltaItem) version.Fact {
 	confidence := 0.9
 	payload := map[string]any{
@@ -446,12 +576,23 @@ func discoveryDeltaFact(versionID int64, observation DiscoveryObservation, item 
 	return version.Fact{
 		VersionID:  versionID,
 		Kind:       item.Kind,
-		Key:        item.ResourceTemplate,
+		Key:        discoveryDeltaFactKey(item),
 		Payload:    payload,
 		Confidence: &confidence,
 		Source:     "execution",
 		SourceRef:  "execution_discovery_observation:" + platformid.Format(observation.ObservationID),
 	}
+}
+
+// discoveryDeltaFactKey is the P9-compatible identity of one execution fact.
+// The environment is always present (validated before the write) and the API
+// method is uppercase, matching pageFactKey/apiFactKey in the agent context.
+func discoveryDeltaFactKey(item DeltaItem) string {
+	template := discoveryTemplateKey(item.ResourceTemplate)
+	if item.Kind == "api" {
+		return fmt.Sprintf("api:env:%d:%s %s", item.EnvironmentID, strings.ToUpper(strings.TrimSpace(item.Method)), template)
+	}
+	return fmt.Sprintf("page:env:%d:%s", item.EnvironmentID, template)
 }
 
 // matchingDiscoveryFact finds a current fact describing the same resource. It
@@ -602,8 +743,8 @@ func newDeltaResult() DeltaResult {
 
 func deltaItemFromObservation(observation DiscoveryObservation, waveID int64) DeltaItem {
 	item := DeltaItem{
-		Kind:             observation.Kind,
-		Method:           observation.Method,
+		Kind:             strings.TrimSpace(observation.Kind),
+		Method:           strings.ToUpper(strings.TrimSpace(observation.Method)),
 		ResourceTemplate: discoveryTemplateKey(observation.ResourceTemplate),
 		Host:             observation.Host,
 		VersionSUTID:     observation.VersionSUTID,

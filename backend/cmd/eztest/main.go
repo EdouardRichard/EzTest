@@ -1156,6 +1156,7 @@ func main() {
 		Resources:    resourceSvc,
 		Facts:        factSvc,
 		Events:       eventSvc,
+		Locker:       executionadapters.NewDiscoveryDeltaLocker(pool),
 	})
 	_ = discoveryDelta
 	// P7 design graph result colouring (spec §9.3): each case card carries the
