@@ -910,7 +910,7 @@ func pageFact(versionID int64, cfg PageDiscoveryConfig, page DiscoveredPage) ver
 		Key:        pageFactKey(cfg.EnvironmentID, page.PageKey),
 		Payload:    payload,
 		Confidence: &confidence,
-		Source:     "explorer",
+		Source:     "p9",
 		SourceRef:  page.URL,
 	}
 }

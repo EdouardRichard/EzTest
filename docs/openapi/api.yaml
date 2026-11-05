@@ -2543,7 +2543,7 @@ paths:
       operationId: postConversationMessage
       summary: 发送用户消息（登录用户）
       description: |
-        写入用户消息并 best-effort ensure `chat.turn` / `requirement.curate` 任务（reconciler 兜底）。
+        写入用户消息并 best-effort ensure `chat.turn` 任务（reconciler 兜底）。
         `client_message_id`（≤64）在同一对话内唯一，重复提交幂等返回既有消息。
         `attachment` part 引用 `POST /api/content` 上传返回的 `{sha256,name,mime,size}`；
         附件解析失败不阻塞消息（仍返回 201，失败原因在附件 `extraction_error`）。
@@ -7106,7 +7106,7 @@ paths:
           description: 0.2.1 work_item kind
           schema:
             type: string
-            enum: [explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose]
+            enum: [design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose]
         - name: state
           in: query
           required: false
@@ -10952,9 +10952,9 @@ components:
         `conversation_message_part` 流式行；`job_card` 另可携带可选 `cancelable`，
         终态 `failed` 的卡片另带可选 `code`（typed failure code，≤64）与 `reason`
         （用户可读失败原因，≤2000；其他状态省略）。
-        `job_card.kind` 接受 11 个冻结 0.2.1 job kind，或对话 work type
-        `chat.turn`/`requirement.curate`/`design.round`（legacy `work_item.type` 投影，
-        不新增 `work_item.kind` 值，也不扩宽 `GET .../work-items?kind=` 的 11 值枚举）。
+        `job_card.kind` 接受 6 个冻结 0.2.1 job kind，或对话 work type
+        `chat.turn`/`design.round`（legacy `work_item.type` 投影，
+        不新增 `work_item.kind` 值，也不扩宽 `GET .../work-items?kind=` 的 6 值枚举）。
       oneOf:
         - type: object
           required: [type, text]
@@ -11061,7 +11061,7 @@ components:
               pattern: '^[0-9]+$'
             kind:
               type: string
-              enum: [explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose, chat.turn, requirement.curate, design.round]
+              enum: [design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose, chat.turn, design.round]
             status:
               type: string
               enum: [open, claimed, running, waiting_human, done, failed, cancelled]
@@ -16405,7 +16405,7 @@ components:
           pattern: '^[0-9]+$'
         kind:
           type: string
-          enum: [explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose]
+          enum: [design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose]
         goal:
           type: string
           maxLength: 500
@@ -16595,7 +16595,7 @@ components:
           pattern: '^[0-9]+$'
         kind:
           type: string
-          enum: [explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose]
+          enum: [design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose]
         state:
           type: string
           enum: [open, claimed, running, waiting_human, done, failed, cancelled]

@@ -56,7 +56,7 @@ func TestFactRepositoryAppendOnlyConflictAndArbitration(t *testing.T) {
 		Key:         "checkout",
 		Payload:     payload,
 		Confidence:  &confidence,
-		Source:      "explorer",
+		Source:      "p9",
 		SourceRef:   "intent-1",
 		EvidenceIDs: []int64{ids.Next()},
 		ContentHash: contentHash,
@@ -156,7 +156,7 @@ func TestFactRepositoryAppendOnlyConflictAndArbitration(t *testing.T) {
 	}
 	other, _, err := repo.Record(ctx, version.Fact{
 		VersionID: versionID, Kind: "page", Key: "cart", Payload: map[string]any{"url": "/cart"},
-		Source: "explorer", ContentHash: otherHash,
+		Source: "p9", ContentHash: otherHash,
 	})
 	if err != nil {
 		t.Fatalf("Record other key: %v", err)
@@ -169,7 +169,7 @@ func TestFactRepositoryAppendOnlyConflictAndArbitration(t *testing.T) {
 	// not-found, not an opaque database error.
 	if _, _, err := repo.Record(ctx, version.Fact{
 		VersionID: ids.Next(), Kind: "page", Key: "checkout", Payload: map[string]any{"url": "/checkout"},
-		Source: "explorer", ContentHash: contentHash,
+		Source: "p9", ContentHash: contentHash,
 	}); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("missing version Record = %v, want ErrNotFound", err)
 	}

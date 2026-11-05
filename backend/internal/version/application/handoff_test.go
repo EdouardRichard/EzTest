@@ -207,7 +207,7 @@ func newHandoffTest(t *testing.T) (
 			},
 			{
 				ID: 603, Kind: "gap", Key: "refund.failure",
-				Summary: "退款失败场景尚未覆盖", Source: "explorer", CreatedAt: testTime,
+				Summary: "退款失败场景尚未覆盖", Source: "p9", CreatedAt: testTime,
 			},
 		},
 		plan: versionapp.HandoffPlan{
