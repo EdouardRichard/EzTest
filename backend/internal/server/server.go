@@ -563,8 +563,9 @@ func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.H
 	mux.Handle("POST /api/resources/apis/{apiId}/reject", admin(http.HandlerFunc(h.RejectAPI)))
 }
 
-// registerExecutionRoutes mounts the P3 execution API (21 path items / 22
-// operations, spec §9.2). A nil handler keeps P0–P2 deployments unchanged.
+// registerExecutionRoutes mounts the P3 execution API plus the v0.22 question
+// routes (26 path items / 28 operations, spec §9.2 + v0.22 B §6). A nil handler
+// keeps P0–P2 deployments unchanged.
 func registerExecutionRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *executionhttp.Handler) {
 	if h == nil {
 		return

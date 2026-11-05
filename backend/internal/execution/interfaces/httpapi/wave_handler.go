@@ -13,9 +13,14 @@ import (
 // It starts one wave immediately: the optional body selects the wave scope by
 // case ID (absent/empty means every current+confirmed case), the initial intents
 // are ensured through the intent service, and one scheduler reconcile plans and
-// dispatches the wave. An already active wave is a 409, and so is a reconcile
-// that leaves no active wave (no dispatchable case, or the version is not at the
-// executing stage). The response carries the wave id, status and case_run count.
+// dispatches the wave. The empty selection uses the explicit ForCases(nil) scan,
+// not the D23 repair scan: the repair scan can only scope itself to a persisted
+// execute.batch selection and would answer the contract's valid empty selection
+// with ErrNoPersistedBatchSelection (500). Both scans keep the typed 409 for a
+// version that is not at executing. An already active wave is a 409, and so is a
+// reconcile that leaves no active wave (no dispatchable case, or the version is
+// not at the executing stage). The response carries the wave id, status and
+// case_run count.
 func (h *Handler) StartWave(w http.ResponseWriter, r *http.Request) {
 	versionID, err := h.versionID(r)
 	if err != nil {
@@ -57,7 +62,7 @@ func (h *Handler) StartWave(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, r, err)
 			return
 		}
-	} else if _, err := h.deps.IntentService.EnsureInitialIntents(ctx, versionID); err != nil {
+	} else if _, err := h.deps.IntentService.EnsureInitialIntentsForCases(ctx, versionID, nil); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}

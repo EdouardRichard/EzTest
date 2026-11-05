@@ -2,9 +2,10 @@ package httpapi
 
 import "net/http"
 
-// Register mounts the P3 execution paths (23 operations as of W1-7/D1) defined
-// by spec §9.2 on the shared mux. Every execution operation is available to any
-// logged-in user; executor administration additionally requires the admin guard.
+// Register mounts the execution paths (26 path items / 28 operations as of
+// W1-7/D1) defined by spec §9.2 and the v0.22 B §6 question routes on the shared
+// mux. Every execution operation is available to any logged-in user; executor
+// administration additionally requires the admin guard.
 func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler) {
 	// Overview / intents.
 	mux.Handle("GET /api/versions/{id}/execution/overview", authenticated(http.HandlerFunc(h.Overview)))

@@ -126,13 +126,19 @@ func (w *waveHandlerWaves) ListActive(context.Context) ([]execution.RunWave, err
 
 type waveHandlerVersions struct {
 	ids map[int64]bool
+	// stage overrides the version-stage projection; empty means executing.
+	stage string
 }
 
 func (v *waveHandlerVersions) Get(_ context.Context, id int64) (executionapp.VersionBinding, error) {
 	if !v.ids[id] {
 		return executionapp.VersionBinding{}, execution.ErrNotFound
 	}
-	return executionapp.VersionBinding{VersionID: id, Stage: "executing"}, nil
+	stage := v.stage
+	if stage == "" {
+		stage = "executing"
+	}
+	return executionapp.VersionBinding{VersionID: id, Stage: stage}, nil
 }
 
 func (v *waveHandlerVersions) Reopen(context.Context, int64) error { return nil }
@@ -209,6 +215,78 @@ func newStartWaveFixture() *startWaveFixture {
 	}
 }
 
+// startWaveCases is an empty executable-case projection: the intent-service
+// integration fixtures assert which scan the handler chooses, not what the scan
+// creates, so the scan can complete with zero cases.
+type startWaveCases struct{}
+
+func (startWaveCases) GetCaseVersion(context.Context, int64, int64) (execution.CaseSnapshot, error) {
+	return execution.CaseSnapshot{}, execution.ErrNotFound
+}
+
+func (startWaveCases) ListExecutable(context.Context, int64) ([]execution.CaseSnapshot, error) {
+	return nil, nil
+}
+
+func (startWaveCases) ResolveReplacement(context.Context, int64, int64) (execution.CaseSnapshot, bool, error) {
+	return execution.CaseSnapshot{}, false, nil
+}
+
+func (startWaveCases) CaseVersionLabel(context.Context, int64, int64) (executionapp.CaseVersionLabel, error) {
+	return executionapp.CaseVersionLabel{}, execution.ErrNotFound
+}
+
+// startWaveServiceIntents delegates to the real intent service (so the D23
+// stage/selection semantics are exercised) while recording which scan the
+// handler chose.
+type startWaveServiceIntents struct {
+	service     *executionapp.IntentService
+	ensureAll   int
+	forCaseCall [][]int64
+}
+
+func (s *startWaveServiceIntents) EnsureInitialIntents(ctx context.Context, versionID int64) (int, error) {
+	s.ensureAll++
+	return s.service.EnsureInitialIntents(ctx, versionID)
+}
+
+func (s *startWaveServiceIntents) EnsureInitialIntentsForCases(ctx context.Context, versionID int64, caseIDs []int64) (int, error) {
+	s.forCaseCall = append(s.forCaseCall, append([]int64(nil), caseIDs...))
+	return s.service.EnsureInitialIntentsForCases(ctx, versionID, caseIDs)
+}
+
+func (s *startWaveServiceIntents) CreateManual(ctx context.Context, versionID, caseVersionID int64, purpose execution.Purpose, actorID int64) (execution.ExecutionIntent, error) {
+	return s.service.CreateManual(ctx, versionID, caseVersionID, purpose, actorID)
+}
+
+// startWaveServiceFixture wires the handler to the real intent service with no
+// BatchSelectionReader, which is exactly the "executing version without a
+// persisted execute.batch selection" state the D23 repair scan cannot handle.
+type startWaveServiceFixture struct {
+	handler  *Handler
+	waves    *waveHandlerWaves
+	versions *waveHandlerVersions
+	intents  *startWaveServiceIntents
+	planner  *waveHandlerPlanner
+}
+
+func newStartWaveServiceFixture(stage string) *startWaveServiceFixture {
+	waves := newWaveHandlerWaves()
+	versions := &waveHandlerVersions{ids: map[int64]bool{7: true}, stage: stage}
+	intents := &startWaveServiceIntents{service: executionapp.NewIntentService(executionapp.IntentServiceDeps{
+		Cases:    startWaveCases{},
+		Versions: versions,
+	})}
+	planner := &waveHandlerPlanner{waves: waves}
+	return &startWaveServiceFixture{
+		handler:  New(Deps{Waves: waves, Versions: versions, IntentService: intents, Planner: planner}),
+		waves:    waves,
+		versions: versions,
+		intents:  intents,
+		planner:  planner,
+	}
+}
+
 func postStartWave(t *testing.T, handler *Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	requestPath := "/api/versions/7/waves"
@@ -268,8 +346,8 @@ func TestStartWaveCreatesWaveAndListsIt(t *testing.T) {
 	if f.planner.calls != 1 {
 		t.Fatalf("planner calls = %d, want 1", f.planner.calls)
 	}
-	if f.intents.ensureAll != 1 || len(f.intents.ensureForCases) != 0 {
-		t.Fatalf("intent scan = all %d / selection %v, want the unselected scan once",
+	if f.intents.ensureAll != 0 || len(f.intents.ensureForCases) != 1 || f.intents.ensureForCases[0] != nil {
+		t.Fatalf("intent scan = all %d / selection %v, want one explicit ForCases(nil) scan",
 			f.intents.ensureAll, f.intents.ensureForCases)
 	}
 
@@ -387,9 +465,64 @@ func TestStartWaveEmptySelectionEnsuresAllCases(t *testing.T) {
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("POST waves with empty selection = %d body=%s, want 201", recorder.Code, recorder.Body.String())
 	}
-	if f.intents.ensureAll != 1 || len(f.intents.ensureForCases) != 0 {
-		t.Fatalf("intent scan = all %d / selection %v, want the unselected scan once",
+	if f.intents.ensureAll != 0 || len(f.intents.ensureForCases) != 1 || f.intents.ensureForCases[0] != nil {
+		t.Fatalf("intent scan = all %d / selection %v, want one explicit ForCases(nil) scan",
 			f.intents.ensureAll, f.intents.ensureForCases)
+	}
+}
+
+// W1-7 fix 1: an empty body means "all current+confirmed cases". It must use the
+// explicit ForCases(nil) scan, not the D23 repair scan: the repair scan has no
+// persisted execute.batch selection to scope it on an executing version and
+// returns ErrNoPersistedBatchSelection (a 500), while the contract's empty
+// selection is a valid all-current+confirmed batch.
+func TestStartWaveEmptyBodyUsesExplicitAllCasesScanWithoutPersistedSelection(t *testing.T) {
+	f := newStartWaveServiceFixture("executing")
+	f.planner.create = true
+	f.planner.runs = 2
+
+	recorder := postStartWave(t, f.handler, "")
+	t.Logf("POST empty body without persisted selection -> %d %s",
+		recorder.Code, strings.TrimSpace(recorder.Body.String()))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("POST waves without a persisted batch selection = %d body=%s, want 201",
+			recorder.Code, recorder.Body.String())
+	}
+	if len(f.intents.forCaseCall) != 1 || f.intents.forCaseCall[0] != nil {
+		t.Fatalf("explicit selection scan = %v, want exactly one ForCases(nil) call",
+			f.intents.forCaseCall)
+	}
+	if f.intents.ensureAll != 0 {
+		t.Fatalf("D23 repair scan ran for an empty body (%d)", f.intents.ensureAll)
+	}
+	if f.planner.calls != 1 {
+		t.Fatalf("planner calls = %d, want 1", f.planner.calls)
+	}
+}
+
+// The empty body keeps the typed stage conflict: on a version that is not at
+// executing the explicit scan answers 409 invalid_stage_for_execution and no
+// wave is planned.
+func TestStartWaveEmptyBodyNonExecutingIsConflict(t *testing.T) {
+	f := newStartWaveServiceFixture("case_review")
+	f.planner.create = true
+	f.planner.runs = 1
+
+	recorder := postStartWave(t, f.handler, "")
+	t.Logf("POST empty body at case_review -> %d %s", recorder.Code, strings.TrimSpace(recorder.Body.String()))
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("POST waves at case_review = %d body=%s, want 409", recorder.Code, recorder.Body.String())
+	}
+	envelope := decodeStartWave(t, recorder)
+	if envelope.Error == nil || envelope.Error.Code != "invalid_stage_for_execution" {
+		t.Fatalf("error = %+v, want invalid_stage_for_execution", envelope.Error)
+	}
+	if f.planner.calls != 0 {
+		t.Fatalf("planner calls = %d, want 0 before the stage conflict", f.planner.calls)
+	}
+	if len(f.intents.forCaseCall) != 1 || f.intents.forCaseCall[0] != nil {
+		t.Fatalf("explicit selection scan = %v, want exactly one ForCases(nil) call",
+			f.intents.forCaseCall)
 	}
 }
 
