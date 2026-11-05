@@ -244,6 +244,27 @@ type VersionReader interface {
 	Reopen(ctx context.Context, id int64) error
 }
 
+// ExecutorAuthStatus is the outcome of a token-bearing executor probe. It tells
+// "the executor is down" apart from "the executor is up but rejects our token",
+// which the unauthenticated /healthz probe cannot do.
+type ExecutorAuthStatus string
+
+const (
+	// ExecutorAuthOK means the executor accepted the configured bearer token.
+	ExecutorAuthOK ExecutorAuthStatus = "ok"
+	// ExecutorAuthUnauthenticated means the token is missing or was rejected.
+	ExecutorAuthUnauthenticated ExecutorAuthStatus = "unauthenticated"
+	// ExecutorAuthUnreachable means the endpoint is missing, down or unhealthy.
+	ExecutorAuthUnreachable ExecutorAuthStatus = "unreachable"
+)
+
+// ExecutorAuthChecker performs a token-bearing probe against an executor
+// endpoint. The token comes from execution.executor_token settings; detail is a
+// diagnostic message that never contains the token.
+type ExecutorAuthChecker interface {
+	Check(ctx context.Context, endpoint string) (ExecutorAuthStatus, string)
+}
+
 // ExecutorRegistry selects the active executor instance for dispatch.
 type ExecutorRegistry interface {
 	// Select returns nil,nil when no active executor is registered.

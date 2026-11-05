@@ -194,7 +194,13 @@ export function ExecutionToolbar({
               执行器{EXECUTOR_STATUS_LABEL[executor.status]}
             </Badge>
             {executor.status === "offline" ? (
-              <span className="text-[11px] text-destructive">等待执行器恢复</span>
+              // D8: the roster heartbeat cannot tell "not started/unreachable"
+              // from "up but the bearer token is rejected"; name both causes and
+              // point at the settings-page probe instead of just waiting.
+              <span className="text-[11px] text-destructive">
+                执行器离线：未启动或不可达；若已启动仍离线，可能是 Bearer token
+                认证失败，请在设置页执行‘检查认证’
+              </span>
             ) : null}
             <span className="text-[10px] text-muted-foreground">
               上下文 {executor.active_contexts}/{executor.capacity}

@@ -63,6 +63,10 @@ type Deps struct {
 	Content   executionapp.ContentStore
 	Settings  executionapp.SettingsReader
 
+	// AuthChecker performs the admin token-bearing executor probe (D8). It is
+	// optional so degraded assemblies answer 503 instead of panicking.
+	AuthChecker executionapp.ExecutorAuthChecker
+
 	IntentService   WaveIntentEnsurer
 	PauseService    *executionapp.PauseService
 	HumanService    *executionapp.HumanService
@@ -1241,6 +1245,34 @@ func (h *Handler) setExecutorStatus(w http.ResponseWriter, r *http.Request, stat
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toExecutorView(instance))
+}
+
+// CheckExecutor POST /api/admin/executors/{id}/check (admin only). It probes the
+// stored endpoint with the configured bearer token so the UI can tell an
+// offline executor (not started / unreachable) from one that rejects the token.
+func (h *Handler) CheckExecutor(w http.ResponseWriter, r *http.Request) {
+	executorID, err := pathParamID(r, "id", "executor_id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	instance, err := h.deps.Executors.Get(ctx, executorID)
+	if err != nil {
+		httpx.Error(w, r, mapRepoError(err, "executor"))
+		return
+	}
+	if h.deps.AuthChecker == nil {
+		httpx.Error(w, r, platform.Unavailable("executor auth checker is not configured"))
+		return
+	}
+	status, detail := h.deps.AuthChecker.Check(ctx, instance.Endpoint)
+	httpx.JSON(w, http.StatusOK, ExecutorAuthCheckView{
+		ExecutorID: platformid.Format(instance.ID),
+		Endpoint:   instance.Endpoint,
+		AuthStatus: string(status),
+		Detail:     detail,
+	})
 }
 
 /* --------------------------------- helpers --------------------------------- */

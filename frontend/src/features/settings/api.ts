@@ -471,6 +471,26 @@ export function listAdminExecutors(): Promise<AdminExecutor[]> {
   return apiGet<AdminExecutor[]>("/api/admin/executors")
 }
 
+/** D8 probe outcome: token accepted, token rejected/missing, or executor down. */
+export type ExecutorAuthStatus = "ok" | "unauthenticated" | "unreachable"
+
+/** `POST /api/admin/executors/{id}/check` result (token is never returned). */
+export type ExecutorAuthCheck = {
+  executor_id: string
+  endpoint: string
+  auth_status: ExecutorAuthStatus
+  detail: string
+}
+
+/**
+ * Probes the executor with the configured `execution.executor_token` over its
+ * bearer-protected route. Unlike the roster heartbeat this distinguishes an
+ * unreachable executor from one that rejects the token (D8).
+ */
+export function checkExecutorAuth(id: string): Promise<ExecutorAuthCheck> {
+  return apiPost<ExecutorAuthCheck>(`/api/admin/executors/${encodeURIComponent(id)}/check`)
+}
+
 // --- Admin instances -------------------------------------------------------
 
 export type InstanceStatus = "active" | "draining" | "offline" | "stopped"

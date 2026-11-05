@@ -4053,6 +4053,54 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  /api/admin/executors/{id}/check:
+    post:
+      tags: [Execution]
+      operationId: checkExecutorAuth
+      summary: 检查执行器 Bearer 认证（admin）
+      description: 用 `execution.executor_token` 对执行器的受保护路由 `GET /v1/contexts` 发起探测。`ok` 表示 token 被接受；`unauthenticated` 表示 token 未配置或被 401/403 拒绝；`unreachable` 表示 endpoint 未配置、不可达、超时或返回其它异常状态。`detail` 是诊断文本（≤300 字符，永不回显 token）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 执行器实例（executor_instance）雪花 ID 的十进制字符串
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      responses:
+        '200':
+          description: 认证检查结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [executor_id, endpoint, auth_status, detail]
+                    properties:
+                      executor_id:
+                        type: string
+                        description: 执行器实例 ID（十进制字符串）
+                      endpoint:
+                        type: string
+                        description: 执行器 HTTP endpoint
+                      auth_status:
+                        type: string
+                        enum: [ok, unauthenticated, unreachable]
+                      detail:
+                        type: string
+                        description: 诊断说明；成功时为空串，截断至 300 字符，不含 token
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
   # -------------------------------------------------------------------------
   # P4 delivery/chain increments (frozen, 2026-11-01)
   # -------------------------------------------------------------------------

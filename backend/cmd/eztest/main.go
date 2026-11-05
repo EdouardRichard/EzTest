@@ -1181,6 +1181,9 @@ func main() {
 
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
+	// v0.22 D8: the admin "check auth" action distinguishes a rejected token
+	// from an unreachable executor; the checker reads the token per request.
+	executorAuthChecker := executionadapters.NewExecutorAuthChecker(settingsSvc)
 	executorClient := executioninfra.NewClient(executorURL, executorToken, executioninfra.DefaultTimeout)
 	executorResolver := executioninfra.NewResolver(executorToken, executioninfra.DefaultTimeout)
 	// v0.22 Task 34/36: probe the executor authentication once at startup. The
@@ -1378,6 +1381,7 @@ func main() {
 		Versions:      executionVersionAdapter,
 		Content:       executionContent,
 		Settings:      settingsSvc,
+		AuthChecker:   executorAuthChecker,
 		IntentService:   executionIntents,
 		Planner:         executionScheduler,
 		PauseService:    executionPause,

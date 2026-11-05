@@ -105,6 +105,8 @@ const v022Operations = [
   // W1-7 D1: POST reuses the existing GET /api/versions/{id}/waves path item
   // (0 new paths, +1 operation).
   ["POST", "/api/versions/{id}/waves"],
+  // W1-8 D8: admin token-bearing executor auth probe (1 new path, +1 operation).
+  ["POST", "/api/admin/executors/{id}/check"],
 ]
 const v022Schemas = [
   "AnswerQuestionRequest",
@@ -203,8 +205,8 @@ const baselinePaths = frozenPaths.size
 const baselineOperations = [...frozenPaths.values()].reduce((total, methods) => total + methods.size, 0)
 const releaseOperations = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
 check(
-  releasePaths.size === baselinePaths + 23 && releaseOperations === baselineOperations + 29,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 23 paths / 29 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
+  releasePaths.size === baselinePaths + 24 && releaseOperations === baselineOperations + 30,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 24 paths / 30 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
 )
 check(
   releaseSchemas.size === frozenSchemas.size + 34,

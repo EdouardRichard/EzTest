@@ -2,8 +2,8 @@ package httpapi
 
 import "net/http"
 
-// Register mounts the execution paths (26 path items / 28 operations as of
-// W1-7/D1) defined by spec §9.2 and the v0.22 B §6 question routes on the shared
+// Register mounts the execution paths (27 path items / 29 operations as of
+// W1-8/D8) defined by spec §9.2 and the v0.22 B §6 question routes on the shared
 // mux. Every execution operation is available to any logged-in user; executor
 // administration additionally requires the admin guard.
 func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler) {
@@ -50,6 +50,7 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("GET /api/admin/executors", admin(http.HandlerFunc(h.ListExecutors)))
 	mux.Handle("POST /api/admin/executors/{executorId}/drain", admin(http.HandlerFunc(h.DrainExecutor)))
 	mux.Handle("POST /api/admin/executors/{executorId}/activate", admin(http.HandlerFunc(h.ActivateExecutor)))
+	mux.Handle("POST /api/admin/executors/{id}/check", admin(http.HandlerFunc(h.CheckExecutor)))
 }
 
 // RegisterInternalRoutes mounts the P7 internal executor push endpoints

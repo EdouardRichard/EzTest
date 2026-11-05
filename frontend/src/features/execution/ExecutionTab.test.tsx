@@ -388,7 +388,12 @@ describe("ExecutionTab", () => {
 
     render(<ExecutionTab versionId="2001" />)
 
-    expect(await screen.findByText(/等待执行器恢复/)).toBeInTheDocument()
+    // D8: an offline executor is ambiguous. The copy must name both causes
+    // (not started/unreachable vs rejected bearer token) and point at the
+    // settings-page auth check instead of only waiting.
+    expect(await screen.findByText(/执行器离线：未启动或不可达/)).toBeInTheDocument()
+    expect(screen.getByText(/Bearer token 认证失败/)).toBeInTheDocument()
+    expect(screen.getByText(/检查认证/)).toBeInTheDocument()
   })
 
   it("opens the pause dialog for the wave and submits the pause", async () => {

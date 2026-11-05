@@ -68,6 +68,15 @@ type ExecutorView struct {
 	LastError      string         `json:"last_error"`
 }
 
+// ExecutorAuthCheckView is the admin-only token-bearing probe result (D8). It
+// separates an unreachable executor from one that rejects the bearer token.
+type ExecutorAuthCheckView struct {
+	ExecutorID string `json:"executor_id"`
+	Endpoint   string `json:"endpoint"`
+	AuthStatus string `json:"auth_status"`
+	Detail     string `json:"detail"`
+}
+
 // RunWaveView is the run_wave projection (spec §9.3).
 type RunWaveView struct {
 	ID          string               `json:"id"`
