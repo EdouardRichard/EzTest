@@ -162,12 +162,16 @@ function Invoke-ExitGate {
     Push-Location -LiteralPath $WorkDir
     try {
         $global:LASTEXITCODE = 0
+        $previousEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         try {
             $output = & $File @Arguments 2>&1
             $exitCode = $LASTEXITCODE
         } catch {
             $exitCode = 1
             $output = @("gate invocation error: $($_.Exception.Message)")
+        } finally {
+            $ErrorActionPreference = $previousEAP
         }
     } finally {
         Pop-Location
@@ -262,7 +266,7 @@ try {
 $gitHead = ''
 try { $gitHead = (& git rev-parse HEAD 2>$null | Out-String).Trim() } catch { }
 
-$summary = [ordered]@{
+$summary = @{
     generatedAt        = (Get-Date -Format o)
     gitHead            = $gitHead
     requirements       = 'spec section 11.1 W0 exit items 1-10'
