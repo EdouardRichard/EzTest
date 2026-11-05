@@ -2,11 +2,13 @@ package agentapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 )
 
@@ -20,6 +22,9 @@ type contextAssembly struct {
 	Compacted    bool
 	BeforeTokens int
 	AfterTokens  int
+	// Decision is the policy-aware compaction decision actually applied at a
+	// boundary (pressure/overflow/stage_boundary). Nil for a normal round.
+	Decision *agentcontext.CompactionDecision
 }
 
 // assembleContext renders the cache-first prompt of one run round.
@@ -51,9 +56,26 @@ func (r *Runner) assembleContextWithKeepRecent(
 	invalidation agentcontext.Invalidation,
 	keepRecent int,
 ) (contextAssembly, error) {
+	return r.assembleContextWithDecision(ctx, state, previous, invalidation, keepRecent, nil)
+}
+
+// assembleContextWithDecision is the v0.22 compaction-aware assembly. A non-nil
+// decision is the policy-aware trigger the caller already resolved (overflow /
+// stage_boundary / pressure); nil derives the boundary decision from the run's
+// resolved compaction policy. Compaction uses Compactor.CompactForDecision, so
+// the retain budget comes from the policy instead of the retired count-only
+// legacy Compact path.
+func (r *Runner) assembleContextWithDecision(
+	ctx context.Context,
+	state *runState,
+	previous *agentcontext.ContextPacket,
+	invalidation agentcontext.Invalidation,
+	keepRecent int,
+	decision *agentcontext.CompactionDecision,
+) (contextAssembly, error) {
 	builder := r.builder
 	if builder == nil {
-		builder = NewContextBuilder(r.settings, NewLLMSummarizer(r.chat))
+		builder = NewContextBuilder(r.settings, nil)
 	}
 	assembler := r.assembler
 	if assembler == nil {
@@ -96,12 +118,12 @@ func (r *Runner) assembleContextWithKeepRecent(
 	// never trigger the proactive boundary. The packet bookkeeping stays
 	// packet-only; this is the same conservative estimate used for the budget.
 	userTokens := EstimateTokens(state.userContent)
-	if invalidation == agentcontext.InvalidationNone &&
+	if invalidation == agentcontext.InvalidationNone && decision == nil &&
 		float64(result.BeforeTokens+userTokens) > threshold*float64(budget) {
 		// The window is nearly full: this round is a declared boundary.
 		invalidation = agentcontext.InvalidationWindowFull
 	}
-	if invalidation != agentcontext.InvalidationNone {
+	if invalidation != agentcontext.InvalidationNone || decision != nil {
 		// Rebuild at the boundary, carrying the persisted rolling summary so the
 		// conversation memory accumulates instead of being replaced by the
 		// summary of this round only.
@@ -123,20 +145,47 @@ func (r *Runner) assembleContextWithKeepRecent(
 		}
 		result.Packet = rebuilt.Packet
 		result.BeforeTokens = contextPacketTokens(rebuilt.Packet)
-		compactor := r.contextCompactor(ctx)
-		if keepRecent >= 0 {
-			compactor = r.contextCompactorWithKeepRecent(ctx, keepRecent)
+		resolved := agentcontext.CompactionDecision{}
+		if decision != nil {
+			resolved = *decision
+		} else {
+			resolved = r.boundaryCompactionDecision(state, invalidation, result.BeforeTokens+userTokens)
 		}
-		compacted, compactErr := compactor.Compact(ctx, result.Packet)
+		compactor := r.compactionCompactor(ctx, state, keepRecent, resolved)
+		compacted, compactErr := compactor.CompactForDecision(ctx, result.Packet, resolved)
 		if compactErr != nil {
 			return contextAssembly{}, compactErr
 		}
 		result.Compacted = contextPacketFolded(result.Packet, compacted)
 		result.Packet = compacted
 		result.AfterTokens = contextPacketTokens(compacted)
+		result.Decision = &resolved
 	}
 	result.Messages = contextPacketMessages(result.Packet)
 	return result, nil
+}
+
+// boundaryCompactionDecision maps an assembly boundary to the v0.22 trigger set
+// when the caller did not already resolve a policy-aware decision. A stage
+// boundary forces the stage_boundary trigger; a window_full boundary is the
+// pressure trigger (with a forced decision when the threshold check itself did
+// not fire, so a pre-run overflow still compacts).
+func (r *Runner) boundaryCompactionDecision(state *runState, invalidation agentcontext.Invalidation, promptTokens int) agentcontext.CompactionDecision {
+	policy := state.compactionPolicy
+	if policy.Trigger <= 0 {
+		policy = agentcontext.NewCompactionPolicy(state.input.ModelBudget.ContextWindow, state.input.ModelBudget.MaxOutput)
+	}
+	if invalidation == agentcontext.InvalidationStageBoundary || invalidation == agentcontext.InvalidationSessionReset {
+		return policy.StageBoundaryDecision()
+	}
+	if decision, ok := policy.PressureDecision(0, promptTokens); ok {
+		return decision
+	}
+	return agentcontext.CompactionDecision{
+		Trigger: agentcontext.CompactionTriggerPressure,
+		Policy:  policy,
+		Retain:  policy.Retain,
+	}
 }
 
 // withConversationSummary seeds the boundary rebuild with the persisted rolling
@@ -323,24 +372,82 @@ func packetSummary(packet agentcontext.ContextPacket) string {
 	return strings.TrimSpace(summary)
 }
 
-// contextCompactor wires boundary compaction with the configured recent window
-// (context.keep_recent_messages, default 12, zero folds everything compactable)
-// and the LLM summarizer with its deterministic fallback.
-func (r *Runner) contextCompactor(ctx context.Context) *agentcontext.Compactor {
-	return r.contextCompactorWithKeepRecent(ctx, -1)
-}
-
-// contextCompactorWithKeepRecent wires boundary compaction with an explicit
-// recent window. keepRecent < 0 resolves context.keep_recent_messages.
-func (r *Runner) contextCompactorWithKeepRecent(ctx context.Context, keepRecent int) *agentcontext.Compactor {
+// compactionCompactor wires policy-aware compaction with the configured recent
+// window (context.keep_recent_messages, default 12) and the v0.22
+// CompactionSummarizer (nine-section summary, prefix reuse, watermark, H5 pinned
+// leak filter) with its deterministic fallback.
+func (r *Runner) compactionCompactor(ctx context.Context, state *runState, keepRecent int, decision agentcontext.CompactionDecision) *agentcontext.Compactor {
 	if keepRecent < 0 {
 		keepRecent = r.keepRecentMessages(ctx)
 	}
+	summarizer := compactionSummaryAdapter{runner: r, state: state, decision: decision}
 	return agentcontext.NewCompactor(
-		NewLLMSummarizer(r.chat),
+		summarizer,
 		agentcontext.WithKeepRecent(keepRecent),
 		agentcontext.WithLogger(r.logger),
 	)
+}
+
+// compactionSummaryAdapter bridges the context package's narrow
+// []Message summarizer port to the v0.22 CompactionSummarizer (SummaryInput /
+// SummaryResult). The folded messages carry their conversation IDs, so the
+// adapter computes the R-A5-12 covered_message_id watermark of this transaction.
+type compactionSummaryAdapter struct {
+	runner   *Runner
+	state    *runState
+	decision agentcontext.CompactionDecision
+}
+
+func (a compactionSummaryAdapter) Summarize(ctx context.Context, messages []agentcontext.Message) (string, error) {
+	state := a.state
+	if state == nil {
+		return "", errors.New("compaction summary: run state is not configured")
+	}
+	covered := int64(0)
+	replay := make([]SummaryReplayMessage, 0, len(messages))
+	images := 0
+	for _, message := range messages {
+		if message.ID > covered {
+			covered = message.ID
+		}
+		replay = append(replay, SummaryReplayMessage{
+			ID: message.ID, Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID,
+		})
+	}
+	policy := a.decision.Policy
+	if policy.Trigger <= 0 && policy.Usable <= 0 {
+		policy = state.compactionPolicy
+	}
+	compactionID := state.lastCompactionID
+	if strings.TrimSpace(compactionID) == "" {
+		compactionID = fmt.Sprintf("compaction-run-%d", state.run.ID)
+	}
+	input := SummaryInput{
+		ConversationID:           state.payload.ConversationID,
+		VersionID:                state.item.VersionID,
+		CompactionID:             compactionID,
+		Trigger:                  a.decision.Trigger,
+		PreviousCoveredMessageID: 0,
+		CoveredMessageID:         covered,
+		StablePrefix:             stableSystemContent(state.input),
+		Messages:                 replay,
+		ImageCount:               images,
+		Task:                     state.input.Task,
+		WorkItemID:               state.item.ID,
+		Plan:                     nil,
+		Facts:                    nil,
+		PinnedFacts:              state.input.Conversation.PinnedFacts,
+		PriorSummary:             state.input.Conversation.Summary,
+		Policy:                   policy,
+	}
+	summarizer := NewCompactionSummarizer(a.runner.chat, WithSummaryLogger(a.runner.logger))
+	result := summarizer.Summarize(ctx, input)
+	state.lastCompactionSummary = result
+	state.lastCompactedMessageID = covered
+	if strings.TrimSpace(result.Text) == "" {
+		return "", errors.New("compaction summary is empty")
+	}
+	return result.Text, nil
 }
 
 // keepRecentMessages resolves context.keep_recent_messages. Unlike the generic
@@ -356,30 +463,225 @@ func (r *Runner) keepRecentMessages(ctx context.Context) int {
 	return int(value)
 }
 
-// recordContextCompaction persists the rolling summary of a boundary
-// compaction through the conversation memory and publishes context.compacted.
-// At most one summary segment is appended per compaction; a boundary that folds
-// nothing publishes the rebuild without a summary.
-func (r *Runner) recordContextCompaction(ctx context.Context, state *runState, packet agentcontext.ContextPacket, beforeTokens, afterTokens int, persistSummary bool) {
-	summary := packetSummary(packet)
-	summaryVersion := 0
-	if persistSummary && summary != "" && state.payload.ConversationID > 0 && r.conversation != nil {
-		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID,
-			state.payload.ConversationID, summary, state.input.Conversation.PinnedFacts)
-		if err == nil {
-			summaryVersion = stored.Version
+// resolveCompactionPolicy resolves the R-A5-1 policy of this run: the effective
+// model window (or the H2 128000 fallback) and max_output, overridden by the
+// seeded compaction.* settings and validated. An invalid configuration falls
+// back to the derived default policy and is logged instead of failing the run.
+func (r *Runner) resolveCompactionPolicy(ctx context.Context, state *runState) agentcontext.CompactionPolicy {
+	window := state.input.ModelBudget.ContextWindow
+	if window <= 0 && r.settings != nil {
+		if value, err := r.settings.Int(ctx, "context.window_tokens"); err == nil && value > 0 {
+			window = int(value)
 		}
 	}
-	payload := map[string]any{
-		"run_id":          idText(state.run.ID),
-		"summary_version": summaryVersion,
-		"token_before":    beforeTokens,
-		"token_after":     afterTokens,
+	output := state.input.ModelBudget.MaxOutput
+	policy := agentcontext.NewCompactionPolicy(window, output)
+	if r.settings != nil {
+		usable := policy.Usable
+		if ratio, err := r.settings.Float(ctx, "compaction.threshold_ratio"); err == nil && ratio > 0 && ratio <= 1 {
+			policy.Trigger = int(float64(usable) * ratio)
+		}
+		if ratio, err := r.settings.Float(ctx, "compaction.retain_ratio"); err == nil && ratio >= 0 && ratio <= 1 {
+			policy.Retain = int(float64(usable) * ratio)
+		}
+		if max, err := r.settings.Int(ctx, "compaction.summary_max_tokens"); err == nil && max > 0 {
+			if max > agentcontext.MaxCompactionSummaryTokens {
+				max = agentcontext.MaxCompactionSummaryTokens
+			}
+			policy.SummaryMax = int(max)
+		}
 	}
+	if err := policy.Validate(); err != nil {
+		r.logContextWarning(ctx, "compaction policy is invalid; using the derived default", err)
+		return agentcontext.NewCompactionPolicy(window, output)
+	}
+	return policy
+}
+
+// persistCompactionSummary writes the R-A5-12 summary revision of one completed
+// compaction transaction. It returns the stored revision (0 when persistence is
+// unavailable or fails; a failure is logged and never fails the run).
+func (r *Runner) persistCompactionSummary(ctx context.Context, state *runState, summary string, covered int64, trigger agentcontext.CompactionTrigger, meta map[string]any) int {
+	if r.compactionSummary == nil || summary == "" || state.payload.ConversationID <= 0 {
+		return 0
+	}
+	if meta == nil {
+		meta = map[string]any{"trigger": string(trigger)}
+	}
+	commit := SummaryCommit{
+		VersionID:        state.item.VersionID,
+		ConversationID:   state.payload.ConversationID,
+		CompactionID:     state.lastCompactionID,
+		Trigger:          trigger,
+		Summary:          summary,
+		PinnedFacts:      capPinnedFacts(state.input.Conversation.PinnedFacts),
+		CoveredMessageID: covered,
+		SummaryMeta:      meta,
+		TokenEstimate:    EstimateSummaryTokens(summary),
+	}
+	stored, err := r.compactionSummary.AppendSummary(ctx, commit)
+	if err != nil {
+		r.logContextWarning(ctx, "persist compaction summary failed", err)
+		return 0
+	}
+	return stored.Version
+}
+
+// recordContextCompaction publishes the extended R-A5-15 context.compacted
+// payload (trigger/before/after/retain/summary_version/covered_message_id/
+// cached) after a compaction transaction. The summary is persisted first when
+// this path completed outside a manager transaction.
+func (r *Runner) recordContextCompaction(ctx context.Context, state *runState, assembly contextAssembly, persistSummary bool) {
+	if assembly.Decision == nil {
+		return
+	}
+	trigger := assembly.Decision.Trigger
+	retain := assembly.Decision.Retain
+	summaryVersion := 0
+	covered := state.lastCompactedMessageID
+	if persistSummary && assembly.Compacted {
+		summary := packetSummary(assembly.Packet)
+		if summary != "" {
+			meta := map[string]any{
+				"trigger":       string(trigger),
+				"truncated":     state.lastCompactionSummary.Truncated,
+				"used_fallback": state.lastCompactionSummary.UsedFallback,
+			}
+			summaryVersion = r.persistCompactionSummary(ctx, state, summary, covered, trigger, meta)
+		}
+	}
+	event := agentcontext.CompactionEvent{
+		Trigger:          trigger,
+		BeforeTokens:     assembly.BeforeTokens,
+		AfterTokens:      assembly.AfterTokens,
+		RetainTokens:     retain,
+		SummaryVersion:   summaryVersion,
+		CoveredMessageID: covered,
+		CachedTokens:     state.providerCacheTokens,
+	}
+	r.publishCompactionEvent(state, event)
+}
+
+// publishCompactionEvent publishes the version-channel context.compacted event
+// with the runner's run/conversation scope.
+func (r *Runner) publishCompactionEvent(state *runState, event agentcontext.CompactionEvent) {
+	payload := event.Payload()
+	payload["run_id"] = idText(state.run.ID)
 	if state.payload.ConversationID > 0 {
 		payload["conversation_id"] = idText(state.payload.ConversationID)
 	}
-	r.publish(state, "context.compacted", payload)
+	r.publish(state, agentcontext.EventContextCompacted, payload)
+}
+
+// compactContext runs one policy-aware compaction transaction (R-A5-10) for the
+// pressure/overflow triggers. On a recoverable stop (busy/thrashing/failure)
+// the run keeps its original context; only an unrecoverable overflow is
+// returned as a terminal error.
+func (r *Runner) compactContext(ctx context.Context, state *runState, decision agentcontext.CompactionDecision, keepRecent int) error {
+	previous := state.contextPacket
+	var assembly contextAssembly
+	operation := func(operationCtx context.Context, transaction agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
+		state.lastCompactionID = transaction.ID
+		result, err := r.assembleContextWithDecision(operationCtx, state, &previous,
+			agentcontext.InvalidationWindowFull, keepRecent, &decision)
+		if err != nil {
+			return agentcontext.CompactionOutcome{}, err
+		}
+		assembly = result
+		covered := state.lastCompactedMessageID
+		summaryVersion := 0
+		if summary := packetSummary(result.Packet); summary != "" {
+			meta := state.lastCompactionSummary.Commit(SummaryInput{
+				VersionID:        state.item.VersionID,
+				ConversationID:   state.payload.ConversationID,
+				CompactionID:     transaction.ID,
+				Trigger:          decision.Trigger,
+				CoveredMessageID: covered,
+				PinnedFacts:      state.input.Conversation.PinnedFacts,
+				Policy:           decision.Policy,
+			}).SummaryMeta
+			summaryVersion = r.persistCompactionSummary(operationCtx, state, summary, covered, decision.Trigger, meta)
+		}
+		return agentcontext.CompactionOutcome{
+			BeforeTokens:     result.BeforeTokens,
+			AfterTokens:      result.AfterTokens,
+			RetainTokens:     decision.Retain,
+			SummaryVersion:   summaryVersion,
+			CoveredMessageID: covered,
+			CachedTokens:     state.providerCacheTokens,
+		}, nil
+	}
+	var outcome agentcontext.CompactionOutcome
+	var err error
+	if state.payload.ConversationID <= 0 {
+		// A run without a conversation (for example an attachment ingest task)
+		// has no per-conversation lock or summary to persist: run the operation
+		// directly so the context can still be compacted.
+		outcome, err = operation(ctx, agentcontext.CompactionTransaction{ID: state.lastCompactionID})
+	} else {
+		outcome, err = r.compactionManager.RunDecision(ctx, state.payload.ConversationID, decision, operation)
+	}
+	if err != nil {
+		if agentcontext.IsRecoverableCompactionError(err) {
+			r.logContextWarning(ctx, "context compaction stopped; keeping the original context", err)
+			return nil
+		}
+		return &RunError{Reason: "context_overflow_unrecoverable", Retryable: false, Cause: err}
+	}
+	if assembly.Decision == nil {
+		return nil
+	}
+	// The manager publishes its own event when a publisher is wired; the runner
+	// publishes the extended payload exactly once so the run/conversation scope
+	// and cached_tokens are present in production.
+	event := agentcontext.CompactionEvent{
+		Trigger:          decision.Trigger,
+		BeforeTokens:     outcome.BeforeTokens,
+		AfterTokens:      outcome.AfterTokens,
+		RetainTokens:     outcome.RetainTokens,
+		SummaryVersion:   outcome.SummaryVersion,
+		CoveredMessageID: outcome.CoveredMessageID,
+		CachedTokens:     state.providerCacheTokens,
+	}
+	r.publishCompactionEvent(state, event)
+	if err := r.applyCompactedAssembly(ctx, state, assembly); err != nil {
+		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	}
+	return nil
+}
+
+// applyCompactedAssembly installs a successful compaction result in the run:
+// persist the packet, replay the compacted transcript and refresh the prompt
+// size bookkeeping.
+func (r *Runner) applyCompactedAssembly(ctx context.Context, state *runState, assembly contextAssembly) error {
+	state.contextPacket = assembly.Packet
+	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
+	if err != nil {
+		return err
+	}
+	state.packet = saved
+	state.run.ContextPacketID = &saved.ID
+	if state.providerCacheReported {
+		state.contextPacket.CachedTokens = state.providerCacheTokens
+		state.contextPacket.CacheHit = state.providerCacheHit
+		if state.packet.TokenCounts == nil {
+			state.packet.TokenCounts = map[string]int{}
+		}
+		state.packet.TokenCounts["cached_tokens"] = state.providerCacheTokens
+		state.packet.TokenCounts["cache_hit"] = boolInt(state.providerCacheHit)
+		if err := r.repo.UpdateContextPacketCacheStats(ctx, saved.ID,
+			state.providerCacheTokens, state.providerCacheHit); err != nil {
+			r.logContextWarning(ctx, "carry provider cache stats to the compacted packet failed", err)
+		}
+	}
+	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
+	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem,
+		systemMessageText(assembly.Packet, state.input), nil, nil); err != nil {
+		return err
+	}
+	state.lastPromptTokens = assembly.AfterTokens
+	state.pendingNewTokens = 0
+	return nil
 }
 
 // currentUserChatMessage appends the triggering user turn (and its images) to

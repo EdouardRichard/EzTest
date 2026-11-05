@@ -444,7 +444,10 @@ func TestReconcilerEnsuresOpeningWhenPreviousAttemptFailed(t *testing.T) {
 	assertEnsured(t, fixture.queue, agentapp.WorkTypeChatTurn+":opening:20")
 }
 
-func TestReconcilerEnsuresPendingAttachmentsOnce(t *testing.T) {
+// TestReconcilerDoesNotEnqueueLegacyAttachmentIngest pins the v0.22 fix: the
+// deterministic attachment worker owns extraction, so pending attachments never
+// become agent work items (the reconciler section was removed).
+func TestReconcilerDoesNotEnqueueLegacyAttachmentIngest(t *testing.T) {
 	fixture := newReconcilerFixture(t)
 	fixture.attachments.attachments = []agentapp.PendingAttachment{{
 		ID: 9001, VersionID: 10, ConversationID: 20, MessageID: 501,
@@ -453,12 +456,14 @@ func TestReconcilerEnsuresPendingAttachmentsOnce(t *testing.T) {
 	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	assertEnsured(t, fixture.queue, agentapp.WorkTypeAttachmentIngest+":attachment:9001")
-
-	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
+	for _, ensured := range fixture.queue.ensured() {
+		if ensured == agentapp.WorkTypeAttachmentIngest+":attachment:9001" {
+			t.Fatalf("legacy attachment.ingest work item was enqueued: %v", fixture.queue.ensured())
+		}
 	}
-	assertEnsured(t, fixture.queue, agentapp.WorkTypeAttachmentIngest+":attachment:9001")
+	if len(fixture.queue.ensured()) != 0 {
+		t.Fatalf("reconciler ensured tasks for a pending attachment: %v", fixture.queue.ensured())
+	}
 }
 
 func TestReconcilerIsIdempotentAcrossRules(t *testing.T) {
@@ -468,20 +473,17 @@ func TestReconcilerIsIdempotentAcrossRules(t *testing.T) {
 		ID: 20, VersionID: 10,
 		Messages: []agentapp.ReconcilerMessage{{ID: 501, Role: "user"}},
 	}}
-	fixture.attachments.attachments = []agentapp.PendingAttachment{{
-		ID: 9001, VersionID: 10, ConversationID: 20, MessageID: 501,
-	}}
 
 	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if calls := len(fixture.queue.ensured()); calls != 2 {
+	if calls := len(fixture.queue.ensured()); calls != 1 {
 		t.Fatalf("first reconcile ensured %d tasks: %v", calls, fixture.queue.ensured())
 	}
 	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
 		t.Fatalf("second Reconcile: %v", err)
 	}
-	if calls := len(fixture.queue.ensured()); calls != 2 {
+	if calls := len(fixture.queue.ensured()); calls != 1 {
 		t.Fatalf("second reconcile added tasks: %v", fixture.queue.ensured())
 	}
 }

@@ -742,6 +742,156 @@ func (s *ConversationService) writerBusyError(ctx context.Context, conversationI
 	return newBusyError(conversation)
 }
 
+// StructuredMessageInput is the v0.22 structured-message write request (Task
+// 23/36): a question card (kind question, role assistant, written by the live
+// Host writer) or its answer echo (kind answer, role user, written by the
+// answering actor). ClientMessageID is the idempotency key; the writer API
+// returns the stored message with created=false on a retried write.
+type StructuredMessageInput struct {
+	VersionID       int64
+	ConversationID  int64
+	Kind            string
+	Parts           []version.MessagePart
+	ClientMessageID string
+	ActorID         int64
+	// AgentRunID is the owning Host run of a question card. It must match the
+	// conversation's active writer lease; the author_agent of the stored
+	// message is the lease holder, so a background job can never author a card.
+	AgentRunID int64
+}
+
+// AppendStructuredMessage is the only structured-question conversation writer.
+// It replaces the pre-fix direct SQL INSERT, which bypassed the conversation
+// service and wrote a part type the version domain rejected on read.
+//
+//   - kind question: assistant message gated by the live writer lease
+//     (conversation.active_turn_id == AgentRunID); author_agent is the lease
+//     holder and client_message_id makes a retried question.ask idempotent.
+//   - kind answer: user message written through the idempotent user-message
+//     path; it never enqueues a chat.turn task (the answer is not a prompt).
+//
+// The returned bool reports whether the message was created.
+func (s *ConversationService) AppendStructuredMessage(ctx context.Context, in StructuredMessageInput) (MessageView, bool, error) {
+	if err := validateConversationIDs(in.VersionID, in.ConversationID); err != nil {
+		return MessageView{}, false, err
+	}
+	kind := strings.TrimSpace(in.Kind)
+	switch kind {
+	case version.MessageKindQuestion, version.MessageKindAnswer:
+	default:
+		return MessageView{}, false, platform.Invalid("kind", "must be question or answer")
+	}
+	in.ClientMessageID = strings.TrimSpace(in.ClientMessageID)
+	if in.ClientMessageID != "" {
+		if err := version.ValidateClientMessageID(in.ClientMessageID); err != nil {
+			return MessageView{}, false, err
+		}
+	}
+	conversation, _, err := s.repo.Get(ctx, in.VersionID, in.ConversationID)
+	if err != nil {
+		return MessageView{}, false, mapConversationRepositoryError(err)
+	}
+
+	// Idempotency first: a retried question.ask/answer must resolve the stored
+	// message even if the writer lease changed in between.
+	if in.ClientMessageID != "" {
+		existing, lookupErr := s.repo.FindMessageByClientID(ctx, in.ConversationID, in.ClientMessageID)
+		switch {
+		case lookupErr == nil && existing != nil:
+			return toMessageView(*existing), false, nil
+		case lookupErr != nil && !errors.Is(lookupErr, version.ErrMessageNotFound):
+			return MessageView{}, false, mapConversationRepositoryError(lookupErr)
+		}
+	}
+
+	now := s.clock.Now()
+	switch kind {
+	case version.MessageKindQuestion:
+		if err := version.ValidateAssistantMessageParts(in.Parts); err != nil {
+			return MessageView{}, false, err
+		}
+		if in.AgentRunID <= 0 {
+			return MessageView{}, false, platform.Invalid("agent_run_id",
+				"is required to author a structured question card")
+		}
+		// The card is authored by the live Host writer only. The lease holder
+		// identity comes from the stored conversation, never from the caller,
+		// so the author_agent is truthful.
+		if conversation.ActiveTurnID == nil || *conversation.ActiveTurnID != in.AgentRunID ||
+			conversation.ActiveAgent == nil || strings.TrimSpace(*conversation.ActiveAgent) == "" {
+			return MessageView{}, false, newNotWriterError(in.ConversationID, in.AgentRunID, "", NotWriterReasonLeaseLost)
+		}
+		agent := strings.TrimSpace(*conversation.ActiveAgent)
+		message := version.Message{
+			ID:             s.ids.Next(),
+			ConversationID: in.ConversationID,
+			Role:           version.MessageRoleAssistant,
+			Parts:          append([]version.MessagePart{}, in.Parts...),
+			Refs:           []version.MessageRef{},
+			TokenUsage:     map[string]any{},
+			AuthorAgent:    agent,
+			Kind:           kind,
+			CreatedAt:      now,
+		}
+		runID := in.AgentRunID
+		message.AgentRunID = &runID
+		if in.ClientMessageID != "" {
+			clientID := in.ClientMessageID
+			message.ClientMessageID = &clientID
+		}
+		leaseUntil := now.Add(version.ConversationWriterLeaseDuration)
+		existing, created, err := s.repo.AppendAssistantMessageAsWriter(
+			ctx, in.ConversationID, message, in.AgentRunID, agent, now, leaseUntil)
+		if err != nil {
+			switch {
+			case errors.Is(err, version.ErrConversationBusy):
+				return MessageView{}, false, s.writerBusyError(ctx, in.ConversationID)
+			case errors.Is(err, version.ErrNotConversationWriter):
+				return MessageView{}, false, newNotWriterError(in.ConversationID, in.AgentRunID, agent, NotWriterReasonLeaseLost)
+			default:
+				return MessageView{}, false, mapConversationRepositoryError(err)
+			}
+		}
+		if !created && existing != nil {
+			return toMessageView(*existing), false, nil
+		}
+		s.publishMessageEvent(ctx, conversation.VersionID, message)
+		s.markRunning(ctx, conversation.VersionID)
+		return toMessageView(message), true, nil
+
+	case version.MessageKindAnswer:
+		if err := version.ValidateUserMessageParts(in.Parts); err != nil {
+			return MessageView{}, false, err
+		}
+		message := version.Message{
+			ID:             s.ids.Next(),
+			ConversationID: in.ConversationID,
+			Role:           version.MessageRoleUser,
+			Parts:          append([]version.MessagePart{}, in.Parts...),
+			Refs:           []version.MessageRef{},
+			TokenUsage:     map[string]any{},
+			ActorID:        optionalActor(in.ActorID),
+			Kind:           kind,
+			CreatedAt:      now,
+		}
+		if in.ClientMessageID != "" {
+			clientID := in.ClientMessageID
+			message.ClientMessageID = &clientID
+		}
+		existing, created, err := s.repo.PostUserMessage(ctx, in.ConversationID, message)
+		if err != nil {
+			return MessageView{}, false, mapConversationRepositoryError(err)
+		}
+		if !created && existing != nil {
+			return toMessageView(*existing), false, nil
+		}
+		s.publishMessageEvent(ctx, conversation.VersionID, message)
+		s.markRunning(ctx, conversation.VersionID)
+		return toMessageView(message), true, nil
+	}
+	return MessageView{}, false, platform.Invalid("kind", "must be question or answer")
+}
+
 // UpsertJobCard stores or refreshes the single job_card part of one background
 // job in a conversation. The first snapshot appends one assistant message whose
 // only part is the card (with its conversation_message_part row); every later
@@ -937,6 +1087,9 @@ func (s *ConversationService) ReopenJobCard(ctx context.Context, versionID, conv
 
 // ---------- tasks and events ----------
 
+// ensureMessageTasks enqueues the single Host reply for one user message
+// (chat.turn). v0.22 D-B1 removed the requirement.curate background job:
+// requirement drafting is a Host tool now, so no curation task is enqueued.
 func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID int64, kind string, conversationID, messageID int64) {
 	conversationIDString := platformid.Format(conversationID)
 	messageIDString := platformid.Format(messageID)
@@ -950,21 +1103,6 @@ func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID 
 			"conversation_id": conversationIDString,
 			"message_id":      messageIDString,
 			"trigger":         "reply",
-		},
-	})
-	// Design conversations are handled by the design team; requirement
-	// curation belongs to clarification conversations only (P2 spec §9.1).
-	if kind == version.ConversationDesign {
-		return
-	}
-	s.enqueue(ctx, TaskInput{
-		VersionID: versionID,
-		Team:      team,
-		Type:      "requirement.curate",
-		DedupeKey: "curate:" + messageIDString,
-		Payload: map[string]any{
-			"conversation_id": conversationIDString,
-			"message_id":      messageIDString,
 		},
 	})
 }

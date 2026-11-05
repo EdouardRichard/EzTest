@@ -109,6 +109,14 @@ type RunnerDeps struct {
 	// task.complete (R-A3). A nil builder or a builder error leaves
 	// task.complete unregistered: a forged completion can never end a run.
 	Completion CompletionBuilder
+	// CompactionSummary persists the R-A5-12 summary revision (version =
+	// latest+1, monotonic covered_message_id). Nil disables summary persistence
+	// (the rolling summary still reaches the packet but not the DB).
+	CompactionSummary SummaryStore
+	// CompactionManager coordinates the R-A5-10 compaction transactions (one
+	// live compaction per conversation, thrashing guard, context.compacted
+	// event). Nil builds an in-process manager with the runner's logger.
+	CompactionManager *agentcontext.CompactionManager
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -129,6 +137,11 @@ type CompletionContext struct {
 	ConversationID int64
 	AgentRunID     int64
 	RoundID        int64
+	// PlanItemID is the explicit plan target carried by the work-item payload
+	// (plan_item_id), when the creating path linked one. The builder still
+	// verifies it belongs to the version and falls back to the single
+	// in-progress plan item when it is zero.
+	PlanItemID int64
 }
 
 // CompletionBuilder resolves the server-side completion criterion of one run
@@ -186,6 +199,8 @@ type Runner struct {
 	questionAsker        tools.QuestionAsker
 	clarificationSearch  tools.ClarificationSearcher
 	completion           CompletionBuilder
+	compactionSummary    SummaryStore
+	compactionManager    *agentcontext.CompactionManager
 }
 
 // NewRunner wires the agent runner.
@@ -193,6 +208,10 @@ func NewRunner(deps RunnerDeps) *Runner {
 	logger := deps.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	compactionManager := deps.CompactionManager
+	if compactionManager == nil {
+		compactionManager = agentcontext.NewCompactionManager(agentcontext.WithCompactionLogger(logger))
 	}
 	return &Runner{
 		repo:                 deps.Runtime,
@@ -218,16 +237,21 @@ func NewRunner(deps RunnerDeps) *Runner {
 		logger:               logger,
 		load:                 deps.Load,
 		instanceID:           deps.InstanceID,
-		builder:              NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
-		briefing:             deps.Briefing,
-		assembler:            agentcontext.NewAssembler(),
-		clarification:        deps.Clarification,
-		designRounds:         deps.DesignRounds,
-		batches:              deps.Batches,
-		planWriter:           deps.PlanWriter,
-		questionAsker:        deps.QuestionAsker,
-		clarificationSearch:  deps.ClarificationSearch,
-		completion:           deps.Completion,
+		// The v0.22 context assembly owns compaction (CompactionSummarizer +
+		// CompactionManager); the legacy builder only resolves the token budget,
+		// so it is wired without the retired LLM summary path.
+		builder:             NewContextBuilder(deps.Settings, nil),
+		briefing:            deps.Briefing,
+		assembler:           agentcontext.NewAssembler(),
+		clarification:       deps.Clarification,
+		designRounds:        deps.DesignRounds,
+		batches:             deps.Batches,
+		planWriter:          deps.PlanWriter,
+		questionAsker:       deps.QuestionAsker,
+		clarificationSearch: deps.ClarificationSearch,
+		completion:          deps.Completion,
+		compactionSummary:   deps.CompactionSummary,
+		compactionManager:   compactionManager,
 	}
 }
 
@@ -357,6 +381,9 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	}
 	var err error
 	if payload.ConversationID, err = parseID("conversation_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.PlanItemID, err = parseID("plan_item_id"); err != nil {
 		return WorkItemPayload{}, err
 	}
 	if payload.MessageID, err = parseID("message_id"); err != nil {
@@ -564,6 +591,20 @@ type runState struct {
 	// result.
 	recordedSteps      map[int]string
 	recordedAssertions map[[2]int]struct{}
+
+	// v0.22 R-A5 compaction wiring (fix round 1). compactionPolicy is the
+	// resolved window/output/ratio budget of this run; lastPromptTokens is the
+	// provider prompt size of the last model call and pendingNewTokens the
+	// conservative estimate of what was appended since, so the pressure trigger
+	// matches R-A5-2. lastCompactionSummary/lastCompactedMessageID/lastCompactionID
+	// carry the summary transaction bookkeeping into the persistence + event.
+	compactionPolicy       agentcontext.CompactionPolicy
+	lastPromptTokens       int
+	pendingNewTokens       int
+	lastPressureTurn       int
+	lastCompactionSummary  SummaryResult
+	lastCompactedMessageID int64
+	lastCompactionID       string
 }
 
 // Run executes one work item and projects the job into its conversation as one
@@ -852,7 +893,15 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.finalizeRequirement(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
 	}
-	return r.finish(state, agent.AgentRunDone, "", false, Failure{})
+	// R-A3-1: a run ended by the verified task.complete signal carries the
+	// stable terminal_reason=completed, distinct from a run that merely used up
+	// its turns/wall clock. It is written to agent_run.terminal_reason and
+	// surfaced in RunResult.
+	reason := ""
+	if state.completed {
+		reason = "completed"
+	}
+	return r.finish(state, agent.AgentRunDone, reason, false, Failure{})
 }
 
 // finalizeReport runs the report finalizer hook for report tasks. It is a
@@ -1093,6 +1142,11 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	// The model was resolved before the run row was created; the context packet
 	// only needs its budget metadata here.
 	state.input.ModelBudget = ModelBudget{ContextWindow: state.model.ContextWindow, MaxOutput: state.model.MaxOutput}
+	// R-A5-1: resolve the compaction policy from the effective model window,
+	// max_output and the seeded compaction.* settings before the first assembly
+	// so every pressure/boundary decision uses the same validated budget.
+	state.compactionPolicy = r.resolveCompactionPolicy(ctx, state)
+	state.lastCompactionID = fmt.Sprintf("compaction-run-%d", state.run.ID)
 	state.input.Profile = state.profile
 	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
@@ -1150,10 +1204,12 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	}
 	state.packet = saved
 	state.run.ContextPacketID = &saved.ID
+	state.lastPromptTokens = assembly.AfterTokens + EstimateTokens(state.userContent)
+	state.pendingNewTokens = 0
 	// A boundary compaction persists its rolling summary and emits the
 	// compaction event; an append-only round writes neither.
 	if assembly.Compacted {
-		r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, true)
+		r.recordContextCompaction(ctx, state, assembly, true)
 	}
 	// knowledge_usage is written once per run from the persisted packet; a
 	// failure is logged and never fails the run (contracts §10.3).
@@ -1202,6 +1258,19 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			}
 		}
 		soft := decision == BudgetSettle
+		// v0.22 R-A5-2 pressure trigger: when the last provider prompt plus the
+		// conservative estimate of what was appended since reaches the policy
+		// trigger, compact before re-sending. Only one pressure attempt per turn
+		// so a non-reducing compaction cannot spin the loop; the manager's
+		// thrashing guard bounds consecutive attempts.
+		if state.compactionPolicy.Trigger > 0 && state.turns > state.lastPressureTurn {
+			if pressure, ok := state.compactionPolicy.PressureDecision(state.lastPromptTokens, state.pendingNewTokens); ok {
+				state.lastPressureTurn = state.turns
+				if err := r.compactContext(ctx, state, pressure, -1); err != nil {
+					return "", err
+				}
+			}
+		}
 		// Task 98: every turn re-sends the whole transcript, and a browser read
 		// result can be a 12KB ARIA tree. The prompt transcript keeps only the
 		// newest page reads; the persisted transcript stays complete.
@@ -1210,7 +1279,9 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		// pairs are folded to head/tail + content_ref before the prompt is
 		// re-sent. Pairing is preserved by construction and the persisted
 		// transcript is not rewritten. The case executor keeps its specialized
-		// browser-read pruner, whose stub must keep naming the read tool.
+		// browser-read pruner for now: the generic envelope would replace the
+		// specialized stub (which names the read tool) a second time, and that
+		// pruner lives in tools/ outside this fix's authorized paths.
 		if state.profile.Key != ProfileKeyCaseExecutor {
 			r.pruneToolResults(ctx, state)
 		}
@@ -1292,6 +1363,18 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			ReasoningContent: response.ReasoningContent,
 			ReasoningItems:   response.ReasoningItems,
 		})
+		// v0.22 R-A5-2 pressure bookkeeping: the provider prompt size is the
+		// authoritative anchor; every appended assistant/tool message since is
+		// the conservative delta for the next round's trigger check.
+		if promptTokens := response.Usage["prompt_tokens"]; promptTokens > 0 {
+			state.lastPromptTokens = promptTokens
+		} else {
+			state.lastPromptTokens = contextPacketTokens(state.contextPacket) + state.pendingNewTokens
+		}
+		state.pendingNewTokens = EstimateTokens(response.Content)
+		for _, call := range response.ToolCalls {
+			state.pendingNewTokens += EstimateTokens(call.Arguments)
+		}
 
 		if len(response.ToolCalls) == 0 {
 			return strings.TrimSpace(response.Content), nil
@@ -1523,17 +1606,17 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			Content:    content,
 			ToolCallID: call.ID,
 		})
+		state.pendingNewTokens += EstimateTokens(content)
 	}
 	return nil
 }
 
-// handleOverflow compacts the context at a declared window_full boundary and
-// retries. The first retry folds the transcript down to the configured recent
-// window. Rebuilding from the same history with the same window cannot shrink
-// the prompt again, so the second (last) retry halves the window and folds
-// strictly more history; a configured window of 0 is already the minimum, so
-// only the pinned prefix/facts remain and a third overflow is unrecoverable.
-// context_overflow alone never terminates the run.
+// handleOverflow compacts the context at a forced overflow decision (R-A5-2/
+// R-A5-11) and retries. The provider rejected the prompt, so the forced
+// overflow decision runs with the halved 8% retain budget; the second retry
+// additionally halves the recent-segment window so strictly more history folds.
+// A recoverable compaction stop keeps the original context and still retries;
+// a third overflow is the terminal unrecoverable case.
 func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.overflowHits++
 	if state.overflowHits > 2 {
@@ -1547,40 +1630,14 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	if state.overflowHits > 1 {
 		keepRecent = shrinkKeepRecentMessages(keepRecent)
 	}
-	previous := state.contextPacket
-	assembly, err := r.assembleContextWithKeepRecent(ctx, state, &previous, agentcontext.InvalidationWindowFull, keepRecent)
-	if err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	policy := state.compactionPolicy
+	if policy.Trigger <= 0 {
+		policy = agentcontext.NewCompactionPolicy(state.input.ModelBudget.ContextWindow, state.input.ModelBudget.MaxOutput)
 	}
-	state.contextPacket = assembly.Packet
-	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
-	if err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	decision := policy.OverflowDecision(-1)
+	if err := r.compactContext(ctx, state, decision, keepRecent); err != nil {
+		return err
 	}
-	state.packet = saved
-	state.run.ContextPacketID = &saved.ID
-	// A boundary rebuild persists a new packet row; carry the provider cache
-	// bookkeeping observed on an earlier turn so the latest row stays
-	// authoritative (the context.cache_stats event is still emitted once).
-	if state.providerCacheReported {
-		state.contextPacket.CachedTokens = state.providerCacheTokens
-		state.contextPacket.CacheHit = state.providerCacheHit
-		if state.packet.TokenCounts == nil {
-			state.packet.TokenCounts = map[string]int{}
-		}
-		state.packet.TokenCounts["cached_tokens"] = state.providerCacheTokens
-		state.packet.TokenCounts["cache_hit"] = boolInt(state.providerCacheHit)
-		if err := r.repo.UpdateContextPacketCacheStats(ctx, saved.ID,
-			state.providerCacheTokens, state.providerCacheHit); err != nil {
-			r.logContextWarning(ctx, "carry provider cache stats to the compacted packet failed", err)
-		}
-	}
-	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
-	systemText := systemMessageText(assembly.Packet, state.input)
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-	}
-	r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, assembly.Compacted)
 	return nil
 }
 
@@ -2043,6 +2100,7 @@ func (r *Runner) toolDepsForRun(ctx context.Context, state *runState) tools.Deps
 			ConversationID: state.payload.ConversationID,
 			AgentRunID:     state.run.ID,
 			RoundID:        state.payload.RoundID,
+			PlanItemID:     state.payload.PlanItemID,
 		})
 		if err != nil {
 			r.logger.Warn("task.complete is disabled for this run: completion target could not be resolved",
@@ -2837,8 +2895,45 @@ func attachmentUserText(info AttachmentInfo) string {
 	if info.Status != "" && info.Status != "done" && info.Status != "ready" && info.Status != "extracted" {
 		return fmt.Sprintf("附件《%s》解析状态为 %s，错误：%s。请向用户说明无法读取。", info.Name, info.Status, info.Error)
 	}
-	text := truncateRunes(strings.TrimSpace(info.Text), scoutAttachmentTextRunes)
-	return fmt.Sprintf("请阅读附件《%s》（%s，共 %d 字符）并总结要点：\n%s", info.Name, info.MIME, info.TotalChars, text)
+	// R-E3-4/R-E3-5: every embedded image reference/caption is part of the task
+	// pack and is charged 1500 tokens (AttachmentImageTokenBudget); the extracted
+	// text budget shrinks by the same charge so the combined prompt stays within
+	// the intent of the attachment task pack (one token ≈ two CJK runes).
+	textRuneBudget := scoutAttachmentTextRunes
+	if reserve := info.ImageTokens * 2; reserve > 0 {
+		if reserve >= textRuneBudget {
+			textRuneBudget = textRuneBudget / 4
+		} else {
+			textRuneBudget -= reserve
+		}
+	}
+	text := truncateRunes(strings.TrimSpace(info.Text), textRuneBudget)
+	header := fmt.Sprintf("请阅读附件《%s》（%s，共 %d 字符）并总结要点：\n%s", info.Name, info.MIME, info.TotalChars, text)
+	if len(info.Images) == 0 {
+		return header
+	}
+	var builder strings.Builder
+	builder.WriteString(header)
+	builder.WriteString(fmt.Sprintf("\n\n附件内嵌图片（%d 张，image_tokens=%d；字节在内容库，可按 sha256 续读）：",
+		len(info.Images), info.ImageTokens))
+	for _, image := range info.Images {
+		line := fmt.Sprintf("\n- image_id=%d seq=%d status=%s mime=%s", image.ID, image.Seq,
+			strings.Join(strings.Fields(image.Status), " "), strings.Join(strings.Fields(image.MIME), " "))
+		if image.Width > 0 && image.Height > 0 {
+			line += fmt.Sprintf(" %dx%d", image.Width, image.Height)
+		}
+		if image.SHA256 != "" {
+			line += " sha256=" + image.SHA256
+		}
+		if caption := strings.TrimSpace(image.Caption); caption != "" {
+			line += " caption=" + truncateRunes(redactPartText(caption, producedPartStringMax), producedPartStringMax)
+		}
+		if image.Error != "" {
+			line += " error=" + truncateRunes(redactPartText(image.Error, producedPartStringMax), producedPartStringMax)
+		}
+		builder.WriteString(line)
+	}
+	return builder.String()
 }
 
 func versionPackResult(pack VersionPack) map[string]any {
@@ -2849,6 +2944,7 @@ func versionPackResult(pack VersionPack) map[string]any {
 		"suts":         pack.SUTs,
 		"pages":        pack.Pages,
 		"apis":         pack.APIs,
+		"databases":    pack.Databases,
 		"requirements": pack.Requirements,
 		"attachments":  pack.Attachments,
 		"knowledge":    knowledgeRefsResult(pack.Knowledge),
@@ -3307,11 +3403,38 @@ func (r *Runner) appendToolParts(state *runState, call llmapp.ToolCall, content 
 	if code == "" || message == "" || state.hasErrorPart(code, message) {
 		return
 	}
-	state.appendStreamPart(ConversationPart{Type: "error", Data: map[string]any{
+	// v0.22 fix round 1: the structured retry metadata of the typed tool error
+	// is forwarded into the error part so the UI can explain how to recover
+	// (which field to fix, which values are allowed, the next step). Every
+	// value is bounded by the version contract; `error` parts are persisted in
+	// the conversation snapshot and streamed to the browser.
+	errorData := map[string]any{
 		"code":      code,
 		"message":   message,
-		"retryable": false,
-	}})
+		"retryable": typed.Retryable,
+	}
+	if field := truncateRunes(strings.TrimSpace(typed.Field), version.MessageErrorFieldMax); field != "" {
+		errorData["field"] = field
+	}
+	if len(typed.Allowed) > 0 {
+		allowed := make([]string, 0, len(typed.Allowed))
+		for _, value := range typed.Allowed {
+			if len(allowed) == version.MessageErrorAllowedMax {
+				break
+			}
+			value = truncateRunes(strings.TrimSpace(value), version.MessageErrorAllowedItemMax)
+			if value != "" {
+				allowed = append(allowed, value)
+			}
+		}
+		if len(allowed) > 0 {
+			errorData["allowed"] = allowed
+		}
+	}
+	if hint := redactPartText(typed.Hint, version.MessageErrorHintMax); hint != "" {
+		errorData["hint"] = hint
+	}
+	state.appendStreamPart(ConversationPart{Type: "error", Data: errorData})
 }
 
 // assistantConversationParts renders the parts of one final assistant message:

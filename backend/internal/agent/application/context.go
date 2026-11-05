@@ -17,7 +17,9 @@ import (
 // gateway takes precedence over the settings fallback (user decision
 // 2026-10-31); the design's global context.window_tokens remains the fallback.
 const (
-	DefaultWindowTokens        = 64000
+	// DefaultWindowTokens is the H2 fallback of context.window_tokens (v0.22
+	// spec §4.3): the retired 64000 value is aligned with the design default.
+	DefaultWindowTokens        = 128000
 	DefaultOutputReserveTokens = 8000
 	DefaultCompactThreshold    = 0.7
 	DefaultKeepRecentMessages  = 12

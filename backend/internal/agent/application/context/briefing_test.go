@@ -154,8 +154,8 @@ func TestBriefingDeterministic(t *testing.T) {
 		"- 缺少过期券的边界路径",
 		"草稿 2 / 已确认 3 / 失效 1",
 		"覆盖缺口（1）：",
-		"当前：[pending] 生成用例草稿（依赖：确认需求）",
-		"下一步：[in_progress] 评审用例草稿（依赖：生成用例草稿）",
+		"当前：[pending] 生成用例草稿 [id=1 revision=0]（依赖：确认需求）",
+		"下一步：[in_progress] 评审用例草稿 [id=2 revision=0]（依赖：生成用例草稿）",
 		"- [page] login：登录页可达（置信 0.90）",
 		"最近 wave：done（通过 8 / 失败 1 / 阻塞 0 / 跳过 2）",
 		"- 登录失败重试：先刷新再重试（置信 0.80）",
@@ -547,11 +547,11 @@ func TestBriefingPlanTerminalStatuses(t *testing.T) {
 			if len(lines) == 0 || lines[0] == "" {
 				t.Fatalf("plan section is empty:\n%s", rendered)
 			}
-			want := "当前：[pending] 兜底待办"
+			want := "当前：[pending] 兜底待办 [id=2 revision=0]"
 			if !testCase.terminal {
-				want = "当前：候选状态项"
+				want = "当前：候选状态项 [id=1 revision=0]"
 				if status := strings.Join(strings.Fields(testCase.status), " "); status != "" {
-					want = "当前：[" + status + "] 候选状态项"
+					want = "当前：[" + status + "] 候选状态项 [id=1 revision=0]"
 				}
 			}
 			if lines[0] != want {
@@ -609,11 +609,13 @@ func competingSqueezeSource() agentcontext.Source {
 			Confidence: floatPtr(0.8),
 		})
 	}
-	// 4,660 protected open-question runes: the render lands just inside the 3k
-	// envelope, so Render must squeeze the regular groups instead of falling
-	// into the documented protected-content exception.
+	// 4,600 protected open-question runes: the render lands just over the 3k
+	// envelope after the per-section truncation, so Render must squeeze the
+	// regular groups instead of falling into the documented protected-content
+	// exception. (The plan labels carry their id+revision optimistic-lock
+	// identity, which is protected content.)
 	source.OpenQuestions = agentcontext.OpenQuestionsSnapshot{
-		Questions: []string{strings.Repeat("压缩", 2330)},
+		Questions: []string{strings.Repeat("压缩", 2300)},
 	}
 	return source
 }
@@ -635,8 +637,8 @@ func TestBriefingMandatoryPrefixesSurviveCompetingSqueeze(t *testing.T) {
 
 	plan := renderedSection(rendered, "计划")
 	for _, want := range []string{
-		"当前：[in_progress] 生成用例草稿（依赖：完成需求梳理）",
-		"下一步：[pending] 补充边界用例（依赖：生成用例草稿）",
+		"当前：[in_progress] 生成用例草稿 [id=1 revision=0]（依赖：完成需求梳理）",
+		"下一步：[pending] 补充边界用例 [id=2 revision=0]（依赖：生成用例草稿）",
 	} {
 		if !strings.Contains(plan, want) {
 			t.Fatalf("squeezed plan dropped the mandatory label tail %q:\n%s", want, plan)
@@ -698,8 +700,8 @@ func TestBriefingMandatoryPlanPrefixExceedsSectionCap(t *testing.T) {
 	rendered := buildBriefing(t, source, 126).Render()
 	plan := renderedSection(rendered, "计划")
 	for _, want := range []string{
-		"当前：[in_progress] " + title + "（依赖：" + currentDependency + "）",
-		"下一步：[pending] " + nextTitle + "（依赖：" + nextDependency + "）",
+		"当前：[in_progress] " + title + " [id=1 revision=0]（依赖：" + currentDependency + "）",
+		"下一步：[pending] " + nextTitle + " [id=2 revision=0]（依赖：" + nextDependency + "）",
 	} {
 		if !strings.Contains(plan, want) {
 			t.Fatalf("over-cap plan dropped the mandatory label tail %q:\n%s", want, plan)
@@ -1100,5 +1102,57 @@ func TestBriefingProtectedBudgetBoundary(t *testing.T) {
 	}
 	if got, want := renderedSection(rendered, "未决"), renderedSection(protectedOnly.Render(), "未决"); got != want {
 		t.Fatalf("protected open questions changed at the exception boundary:\n%s\n---\n%s", got, want)
+	}
+}
+
+// TestBriefingPlanItemsCarryIDAndRevision pins the plan.update input contract
+// (R-A8-2): every rendered plan item exposes the id and revision the Host must
+// send back, so the model never has to guess an item id or present a stale
+// revision.
+func TestBriefingPlanItemsCarryIDAndRevision(t *testing.T) {
+	source := agentcontext.Source{
+		Plan: []agentcontext.PlanItemSnapshot{
+			{ID: 42, Title: "生成用例草稿", Status: "in_progress", Revision: 3},
+			{ID: 43, Title: "补充边界用例", Status: "pending", Revision: 1},
+		},
+	}
+	rendered := buildBriefing(t, source, 127).Render()
+	plan := renderedSection(rendered, "计划")
+	for _, want := range []string{
+		"当前：[in_progress] 生成用例草稿 [id=42 revision=3]",
+		"下一步：[pending] 补充边界用例 [id=43 revision=1]",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Fatalf("plan section missing %q:\n%s", want, plan)
+		}
+	}
+}
+
+// TestBriefingInjectsClarificationHandoff pins the clarification→design handoff
+// pack injection (R-B5-2): the Design Host briefing carries the artifact
+// revision and its document, and a version without a handoff renders no empty
+// handoff group (older briefings stay unchanged).
+func TestBriefingInjectsClarificationHandoff(t *testing.T) {
+	document := `{"requirements":[{"id":501,"title":"登录"}],"open":[{"title":"短信通道"}]}`
+	source := agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "设计登录版本", Stage: "designing"},
+		Handoff: &agentcontext.HandoffSnapshot{
+			Revision:    4,
+			GeneratedAt: "2026-11-04T09:00:00Z",
+			Document:    document,
+		},
+	}
+	rendered := buildBriefing(t, source, 128).Render()
+	handoff := renderedSection(rendered, "澄清交接包")
+	for _, want := range []string{"revision=4", "2026-11-04T09:00:00Z", "短信通道"} {
+		if !strings.Contains(handoff, want) {
+			t.Fatalf("handoff group missing %q:\n%s", want, rendered)
+		}
+	}
+	without := buildBriefing(t, agentcontext.Source{
+		Version: agentcontext.VersionSnapshot{Goal: "设计登录版本", Stage: "designing"},
+	}, 129).Render()
+	if strings.Contains(without, "澄清交接包") {
+		t.Fatalf("a version without a handoff rendered the handoff group:\n%s", without)
 	}
 }

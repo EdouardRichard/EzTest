@@ -51,12 +51,15 @@ type MessagePartView struct {
 
 // SummaryView is the latest thread memory of one conversation.
 type SummaryView struct {
-	ConversationID int64
-	Summary        string
-	PinnedFacts    []string
-	TokenEstimate  int
-	Version        int
-	UpdatedAt      time.Time
+	ConversationID   int64
+	Summary          string
+	PinnedFacts      []string
+	TokenEstimate    int
+	Version          int
+	CoveredMessageID int64
+	CompactionID     string
+	SummaryMeta      map[string]any
+	UpdatedAt        time.Time
 }
 
 func toConversationView(conversation version.Conversation, summary *version.ConversationSummary) ConversationView {

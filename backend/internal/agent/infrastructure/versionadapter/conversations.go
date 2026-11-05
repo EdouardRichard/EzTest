@@ -411,12 +411,37 @@ func versionPart(part agentapp.ConversationPart) (version.MessagePart, error) {
 		message, _ := dataString(part.Data, "message")
 		retryable, _ := dataBool(part.Data, "retryable")
 		action, _ := dataString(part.Data, "action")
+		field, _ := dataString(part.Data, "field")
+		hint, _ := dataString(part.Data, "hint")
 		return version.MessagePart{
 			Type: part.Type, Code: code, Message: message, Retryable: retryable, Action: action,
+			Field: field, Allowed: dataStringSlice(part.Data, "allowed"), Hint: hint,
 		}, nil
 	default:
 		return version.MessagePart{}, platform.Invalid("type",
-			"must be text, thinking, tool_call, job_card, attachment, image, requirement_card, case_card, error or rollback_proposal")
+			"must be text, thinking, tool_call, job_card, attachment, image, requirement_card, case_card, error, question or rollback_proposal")
+	}
+}
+
+// dataStringSlice reads a []string payload field carried either as a decoded
+// []any of strings or as []string (the runner builds the former).
+func dataStringSlice(data map[string]any, key string) []string {
+	if data == nil {
+		return nil
+	}
+	switch typed := data[key].(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if value, ok := item.(string); ok {
+				values = append(values, value)
+			}
+		}
+		return values
+	default:
+		return nil
 	}
 }
 

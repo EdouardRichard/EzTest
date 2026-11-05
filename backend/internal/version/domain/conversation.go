@@ -60,6 +60,10 @@ const (
 	MessagePartCaseCard         = "case_card"
 	MessagePartRollbackProposal = "rollback_proposal"
 	MessagePartError            = "error"
+	// MessagePartQuestion is the v0.22 structured-question card (Task 23/36).
+	// It is a snapshot-only part (no conversation_message_part row) whose
+	// payload is the question card written by the runtime conversation writer.
+	MessagePartQuestion = "question"
 )
 
 // Conversation and message limits.
@@ -84,6 +88,20 @@ const (
 	MessageErrorMessageMax = 2000
 	MessageErrorActionMax  = 500
 	CaseCardTitleMax       = 255
+	// MessageErrorFieldMax/MessageErrorHintMax bound the v0.22 error-part
+	// metadata forwarded from a typed tools.Error (Task 36 fix round 1), and
+	// MessageErrorAllowedMax/MessageErrorAllowedItemMax bound its `allowed`
+	// list so one tool failure can never bloat the conversation snapshot.
+	MessageErrorFieldMax       = 200
+	MessageErrorHintMax        = 500
+	MessageErrorAllowedMax     = 50
+	MessageErrorAllowedItemMax = 200
+	// QuestionPartPayloadMax is the JSON byte cap of one question card part.
+	QuestionPartPayloadMax = 64 << 10
+	// QuestionPartBatchIDMax and QuestionPartQuestionsMax mirror the
+	// structured-question contract (1–5 questions, qb- batch id).
+	QuestionPartBatchIDMax   = 64
+	QuestionPartQuestionsMax = 5
 )
 
 // Conversation domain errors.
@@ -225,6 +243,16 @@ type MessagePart struct {
 	Message   string
 	Retryable bool
 	Action    string
+	// Field/Allowed/Hint are the v0.22 retry metadata of a tool failure that
+	// the runner forwards from *tools.Error into the error part (Task 36 fix
+	// round 1). They are bounded by the MessageError* constants.
+	Field   string
+	Allowed []string
+	Hint    string
+	// question (v0.22 Task 23/36): the structured question card payload. It is
+	// opaque JSON owned by the question kind and is rendered flat on the wire
+	// (type + payload fields), matching the frontend QuestionPart contract.
+	Question json.RawMessage
 }
 
 // MarshalJSON renders the exact OpenAPI part shape for the part type.
@@ -331,15 +359,42 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 		return json.Marshal(payload)
 	case MessagePartError:
 		return json.Marshal(struct {
-			Type      string `json:"type"`
-			Code      string `json:"code"`
-			Message   string `json:"message"`
-			Retryable bool   `json:"retryable"`
-			Action    string `json:"action,omitempty"`
-		}{Type: p.Type, Code: p.Code, Message: p.Message, Retryable: p.Retryable, Action: p.Action})
+			Type      string   `json:"type"`
+			Code      string   `json:"code"`
+			Message   string   `json:"message"`
+			Retryable bool     `json:"retryable"`
+			Action    string   `json:"action,omitempty"`
+			Field     string   `json:"field,omitempty"`
+			Allowed   []string `json:"allowed,omitempty"`
+			Hint      string   `json:"hint,omitempty"`
+		}{
+			Type: p.Type, Code: p.Code, Message: p.Message, Retryable: p.Retryable,
+			Action: p.Action, Field: p.Field, Allowed: p.Allowed, Hint: p.Hint,
+		})
+	case MessagePartQuestion:
+		return marshalQuestionPart(p.Question)
 	default:
 		return nil, fmt.Errorf("unsupported message part type %q", p.Type)
 	}
+}
+
+// marshalQuestionPart renders the question card flat on the wire: the part
+// payload fields plus `type`. The frontend QuestionPart contract is
+// `{type:"question", ...payload}` (with the option of a nested `question`
+// object), never a nested `payload` field, so the stored snapshot and the SSE
+// frame share one shape.
+func marshalQuestionPart(payload json.RawMessage) ([]byte, error) {
+	fields := make(map[string]json.RawMessage)
+	if trimmed := bytes.TrimSpace(payload); len(trimmed) > 0 {
+		if err := json.Unmarshal(trimmed, &fields); err != nil {
+			return nil, fmt.Errorf("question part payload must be a JSON object: %w", err)
+		}
+	}
+	if fields == nil {
+		fields = make(map[string]json.RawMessage)
+	}
+	fields["type"], _ = json.Marshal(MessagePartQuestion)
+	return json.Marshal(fields)
 }
 
 // UnmarshalJSON reads the OpenAPI part shape back into the union.
@@ -479,15 +534,33 @@ func (p *MessagePart) UnmarshalJSON(data []byte) error {
 		*p = MessagePart{Type: probe.Type, CaseID: caseID, CaseVersionID: caseVersionID, Title: payload.Title, Status: payload.Status}
 	case MessagePartError:
 		var payload struct {
-			Code      string `json:"code"`
-			Message   string `json:"message"`
-			Retryable bool   `json:"retryable"`
-			Action    string `json:"action"`
+			Code      string   `json:"code"`
+			Message   string   `json:"message"`
+			Retryable bool     `json:"retryable"`
+			Action    string   `json:"action"`
+			Field     string   `json:"field"`
+			Allowed   []string `json:"allowed"`
+			Hint      string   `json:"hint"`
 		}
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return err
 		}
-		*p = MessagePart{Type: probe.Type, Code: payload.Code, Message: payload.Message, Retryable: payload.Retryable, Action: payload.Action}
+		*p = MessagePart{
+			Type: probe.Type, Code: payload.Code, Message: payload.Message,
+			Retryable: payload.Retryable, Action: payload.Action,
+			Field: payload.Field, Allowed: payload.Allowed, Hint: payload.Hint,
+		}
+	case MessagePartQuestion:
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return err
+		}
+		delete(fields, "type")
+		question, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		*p = MessagePart{Type: probe.Type, Question: question}
 	default:
 		return fmt.Errorf("unsupported message part type %q", probe.Type)
 	}
@@ -518,8 +591,22 @@ type ConversationSummary struct {
 	PinnedFacts    []string
 	TokenEstimate  int
 	Version        int
-	UpdatedAt      time.Time
+	// CoveredMessageID is the R-A5-12 incremental compaction watermark: the
+	// newest conversation message this revision folds. It is monotonic per
+	// conversation.
+	CoveredMessageID int64
+	// CompactionID is the opaque compaction transaction token that produced the
+	// revision (DB-4; not a snowflake ID).
+	CompactionID string
+	// SummaryMeta carries the compaction bookkeeping (trigger/summary tokens/
+	// truncation/cached tokens/fallback) as a JSON object.
+	SummaryMeta map[string]any
+	UpdatedAt   time.Time
 }
+
+// ErrSummaryWatermarkStale reports a summary revision whose covered_message_id
+// would move backwards (R-A5-12 monotonic watermark).
+var ErrSummaryWatermarkStale = errors.New("conversation summary covered_message_id would move backwards")
 
 // ConversationRepository persists conversations, messages and summaries.
 type ConversationRepository interface {
@@ -781,6 +868,26 @@ func ValidateAssistantMessageParts(parts []MessagePart) error {
 			if err := validation.String(field("action"), part.Action, 0, MessageErrorActionMax); err != nil {
 				return err
 			}
+			if err := validation.String(field("field"), part.Field, 0, MessageErrorFieldMax); err != nil {
+				return err
+			}
+			if err := validation.String(field("hint"), part.Hint, 0, MessageErrorHintMax); err != nil {
+				return err
+			}
+			if len(part.Allowed) > MessageErrorAllowedMax {
+				return platform.Invalid(field("allowed"),
+					fmt.Sprintf("must contain at most %d entries", MessageErrorAllowedMax))
+			}
+			for allowedIndex, allowed := range part.Allowed {
+				if err := validation.String(fmt.Sprintf("parts[%d].allowed[%d]", index, allowedIndex),
+					allowed, 1, MessageErrorAllowedItemMax); err != nil {
+					return err
+				}
+			}
+		case MessagePartQuestion:
+			if err := validateQuestionPart(part, field); err != nil {
+				return err
+			}
 		case MessagePartAttachment:
 			if err := validateAttachmentPart(part, field); err != nil {
 				return err
@@ -806,8 +913,53 @@ func ValidateAssistantMessageParts(parts []MessagePart) error {
 			}
 		default:
 			return platform.Invalid(field("type"),
-				"must be text, thinking, tool_call, job_card, attachment, requirement_card, case_card, error or rollback_proposal")
+				"must be text, thinking, tool_call, job_card, attachment, requirement_card, case_card, error, question or rollback_proposal")
 		}
+	}
+	return nil
+}
+
+// validateQuestionPart validates one structured-question card payload. The
+// authoritative question batch lives in human_request.question; this part is
+// the persisted conversation snapshot the frontend renders, so the domain only
+// enforces the stable envelope: a positive question_id, a bounded batch_id and
+// a non-empty, bounded questions array. Unknown payload fields are preserved
+// (status/answers/answered_* are written by the answer echo payload).
+func validateQuestionPart(part MessagePart, field func(string) string) error {
+	payload := bytes.TrimSpace(part.Question)
+	if len(payload) == 0 {
+		return platform.Invalid(field("question"), "must be a JSON object")
+	}
+	if len(payload) > QuestionPartPayloadMax {
+		return platform.Invalid(field("question"), "must be at most 64 KiB")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return platform.Invalid(field("question"), "must be a JSON object")
+	}
+	var questionID string
+	if raw, ok := object["question_id"]; !ok || json.Unmarshal(raw, &questionID) != nil {
+		return platform.Invalid(field("question_id"), "must be a positive decimal ID")
+	}
+	questionID = strings.TrimSpace(questionID)
+	parsedID, err := strconv.ParseInt(questionID, 10, 64)
+	if err != nil || parsedID <= 0 {
+		return platform.Invalid(field("question_id"), "must be a positive decimal ID")
+	}
+	var batchID string
+	if raw, ok := object["batch_id"]; !ok || json.Unmarshal(raw, &batchID) != nil {
+		return platform.Invalid(field("batch_id"), "must be a non-empty string")
+	}
+	if err := validation.String(field("batch_id"), batchID, 1, QuestionPartBatchIDMax); err != nil {
+		return err
+	}
+	var questions []json.RawMessage
+	if raw, ok := object["questions"]; !ok || json.Unmarshal(raw, &questions) != nil {
+		return platform.Invalid(field("questions"), "must be a non-empty array")
+	}
+	if len(questions) == 0 || len(questions) > QuestionPartQuestionsMax {
+		return platform.Invalid(field("questions"),
+			fmt.Sprintf("must contain between 1 and %d questions", QuestionPartQuestionsMax))
 	}
 	return nil
 }

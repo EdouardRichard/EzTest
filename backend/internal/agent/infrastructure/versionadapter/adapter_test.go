@@ -555,6 +555,46 @@ func TestAttachmentReaderMapsInfo(t *testing.T) {
 	}
 }
 
+// TestAttachmentReaderMapsImageRefsAndTokens covers the Task 19 handoff: the
+// version-side image references/captions reach the runtime attachment pack and
+// each image is charged the 1500-token budget (R-E3-4).
+func TestAttachmentReaderMapsImageRefsAndTokens(t *testing.T) {
+	ctx := context.Background()
+	sha := strings.Repeat("c", 64)
+	fake := &fakeAttachments{
+		extractFn: func(_ context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
+			return versionapp.ExtractionResult{}, nil
+		},
+		getInfoFn: func(_ context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error) {
+			return versionapp.AttachmentInfo{
+				ID: 9, VersionID: 10, Name: "spec.docx", MIME: "application/msword",
+				Status: "done", Text: "login", TotalChars: 5,
+				Images: []versionapp.AttachmentImageInfo{{
+					ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 640, Height: 480,
+					SourceKind: "embedded", Status: "done", Caption: "login form",
+				}},
+				ImageTokens: 1500,
+			}, nil
+		},
+	}
+	adapter := versionadapter.New(nil, nil, nil, fake, nil)
+	info, err := adapter.GetAttachment(ctx, 10, 9)
+	if err != nil {
+		t.Fatalf("GetAttachment: %v", err)
+	}
+	if len(info.Images) != 1 {
+		t.Fatalf("images = %#v", info.Images)
+	}
+	image := info.Images[0]
+	if image.ID != 901 || image.Seq != 1 || image.SHA256 != sha || image.Caption != "login form" ||
+		image.Width != 640 || image.SourceKind != "embedded" {
+		t.Fatalf("image = %#v", image)
+	}
+	if info.ImageTokens != 1500 {
+		t.Fatalf("image tokens = %d, want 1500", info.ImageTokens)
+	}
+}
+
 func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	ctx := context.Background()
 	requirementID := int64(501)

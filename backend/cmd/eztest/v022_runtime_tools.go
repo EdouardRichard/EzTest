@@ -21,11 +21,9 @@ import (
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
-	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 /* ------------------------------ settings --------------------------------- */
@@ -130,20 +128,27 @@ func (a questionAskerAdapter) AskQuestions(ctx context.Context, scope tools.Scop
 }
 
 // questionMessageWriterAdapter is the version conversation write port of the
-// structured-question service (R-B3-3/R-B3-5). It writes the question card and
-// the answer echo as conversation_message rows with kind=question/answer. The
-// (conversation_id, client_message_id) unique key makes a retried write return
-// the already-stored message id with created=false.
+// structured-question service (R-B3-3/R-B3-5). It replaces the pre-fix direct
+// SQL INSERT with the ConversationService structured-message API: the question
+// card is authored by the live Host writer lease (author_agent) and written as
+// a domain-valid `question` part, while the answer echo is an idempotent user
+// message. The (conversation_id, client_message_id) unique key makes a retried
+// write return the already-stored message.
 type questionMessageWriterAdapter struct {
-	pool *pgxpool.Pool
-	ids  platformid.Generator
+	conversations structuredConversationWriter
+}
+
+// structuredConversationWriter is the narrow version-conversation surface the
+// adapter needs (*versionapp.ConversationService in production).
+type structuredConversationWriter interface {
+	AppendStructuredMessage(ctx context.Context, in versionapp.StructuredMessageInput) (versionapp.MessageView, bool, error)
 }
 
 var _ executionapp.QuestionMessageWriter = questionMessageWriterAdapter{}
 
 func (a questionMessageWriterAdapter) AppendQuestionMessage(ctx context.Context, message executionapp.QuestionMessage) (int64, bool, error) {
-	if a.pool == nil || a.ids == nil {
-		return 0, false, errors.New("question message writer: pool or id generator is not configured")
+	if a.conversations == nil {
+		return 0, false, errors.New("question message writer: conversation service is not configured")
 	}
 	if message.ConversationID <= 0 || message.VersionID <= 0 {
 		return 0, false, errors.New("question message writer: version and conversation are required")
@@ -153,49 +158,101 @@ func (a questionMessageWriterAdapter) AppendQuestionMessage(ctx context.Context,
 		return 0, false, fmt.Errorf("question message writer: unsupported kind %q", message.Kind)
 	}
 	clientMessageID := strings.TrimSpace(message.ClientMessageID)
-	if clientMessageID == "" {
-		clientMessageID = fmt.Sprintf("question-%s-%d", kind, message.QuestionID)
-	}
-	role := "assistant"
-	if kind == executionapp.QuestionMessageKindAnswer {
-		role = "user"
-	}
-	partType := "question_card"
-	if kind == executionapp.QuestionMessageKindAnswer {
-		partType = "text"
-	}
-	parts, err := json.Marshal([]map[string]any{{
-		"type": partType,
-		"data": message.Payload,
-	}})
+	parts, err := questionMessageParts(kind, message)
 	if err != nil {
 		return 0, false, err
 	}
-	messageID := a.ids.Next()
-	const query = `
-INSERT INTO conversation_message
-    (id, conversation_id, role, kind, parts, actor_id, agent_run_id, client_message_id, created_at)
-SELECT $1, c.id, $2, $3, $4::jsonb, NULLIF($5, 0), NULLIF($6, 0), $7, now()
-FROM conversation c
-WHERE c.id = $8 AND c.version_id = $9
-ON CONFLICT (conversation_id, client_message_id)
-DO UPDATE SET kind = EXCLUDED.kind
-RETURNING id, (xmax = 0) AS created`
-	var storedID int64
-	var created bool
-	if err := a.pool.QueryRow(ctx, query,
-		messageID, role, kind, parts, message.ActorID, message.AgentRunID,
-		clientMessageID, message.ConversationID, message.VersionID,
-	).Scan(&storedID, &created); err != nil {
+	view, created, err := a.conversations.AppendStructuredMessage(ctx, versionapp.StructuredMessageInput{
+		VersionID:       message.VersionID,
+		ConversationID:  message.ConversationID,
+		Kind:            kind,
+		Parts:           parts,
+		ClientMessageID: clientMessageID,
+		ActorID:         message.ActorID,
+		AgentRunID:      message.AgentRunID,
+	})
+	if err != nil {
 		return 0, false, err
 	}
-	if created {
-		if _, err := a.pool.Exec(ctx,
-			`UPDATE conversation SET updated_at = now() WHERE id = $1`, message.ConversationID); err != nil {
-			return 0, false, err
+	return view.ID, created, nil
+}
+
+// questionMessageParts renders the domain parts of one structured message:
+// the question card is the `question` part (flat payload), the answer echo is
+// a bounded text summary of the submitted answers (the question card itself is
+// the authoritative UI snapshot and is keyed by the same question_id).
+func questionMessageParts(kind string, message executionapp.QuestionMessage) ([]versiondomain.MessagePart, error) {
+	if kind == executionapp.QuestionMessageKindQuestion {
+		payload, err := json.Marshal(message.Payload)
+		if err != nil {
+			return nil, err
+		}
+		return []versiondomain.MessagePart{{
+			Type:     versiondomain.MessagePartQuestion,
+			Question: payload,
+		}}, nil
+	}
+	return []versiondomain.MessagePart{{
+		Type: versiondomain.MessagePartText,
+		Text: questionAnswerEchoText(message.Payload),
+	}}, nil
+}
+
+// questionAnswerEchoText is the bounded user-facing text of one answer echo.
+// The structured payload remains on the question card/API; this message only
+// closes the thread with the submitted answer.
+func questionAnswerEchoText(payload map[string]any) string {
+	const maxRunes = 1500
+	builder := strings.Builder{}
+	builder.WriteString("已提交问题答案")
+	if questionID, ok := payload["question_id"].(string); ok && strings.TrimSpace(questionID) != "" {
+		builder.WriteString("（question_id=")
+		builder.WriteString(strings.TrimSpace(questionID))
+		builder.WriteString("）")
+	}
+	if rawAnswers, ok := payload["answers"].([]any); ok {
+		for _, rawAnswer := range rawAnswers {
+			answer, ok := rawAnswer.(map[string]any)
+			if !ok {
+				continue
+			}
+			line := answerEchoLine(answer)
+			if line == "" {
+				continue
+			}
+			builder.WriteString("\n- ")
+			builder.WriteString(line)
 		}
 	}
-	return storedID, created, nil
+	text := builder.String()
+	if runes := []rune(text); len(runes) > maxRunes {
+		text = string(runes[:maxRunes])
+	}
+	return text
+}
+
+func answerEchoLine(answer map[string]any) string {
+	questionID, _ := answer["question_id"].(string)
+	text, _ := answer["text"].(string)
+	selected := make([]string, 0)
+	if rawSelected, ok := answer["selected"].([]any); ok {
+		for _, value := range rawSelected {
+			if label, ok := value.(string); ok && strings.TrimSpace(label) != "" {
+				selected = append(selected, strings.TrimSpace(label))
+			}
+		}
+	}
+	parts := make([]string, 0, 3)
+	if value := strings.TrimSpace(questionID); value != "" {
+		parts = append(parts, value+":")
+	}
+	if len(selected) > 0 {
+		parts = append(parts, strings.Join(selected, ", "))
+	}
+	if value := strings.TrimSpace(text); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, " ")
 }
 
 /* --------------------------- tool result content ------------------------- */
@@ -243,10 +300,18 @@ func (s toolContentStore) ReadText(ctx context.Context, contentRef string) (stri
 
 /* ------------------------------ completion ------------------------------- */
 
+// planCompletionCatalog is the narrow plan read/write surface the completion
+// wiring needs. *versionapp.PlanService satisfies it; tests inject a fake so the
+// composition-root target resolver is testable without a database.
+type planCompletionCatalog interface {
+	List(ctx context.Context, versionID int64, status string) ([]versiondomain.PlanItem, error)
+	Update(ctx context.Context, versionID, itemID int64, patch versiondomain.PlanPatch, revision int) (versiondomain.PlanItem, error)
+}
+
 // completionPlanItemReader resolves the optimistic-lock snapshot of one plan
 // item for the plan-item completion criterion.
 type completionPlanItemReader struct {
-	plans *versionapp.PlanService
+	plans planCompletionCatalog
 }
 
 func (r completionPlanItemReader) GetPlanItem(ctx context.Context, versionID, itemID int64) (tools.PlanItemSnapshot, error) {
@@ -315,63 +380,21 @@ func (r designRevisionCompletionReader) DesignRevisionExists(ctx context.Context
 	return false, nil
 }
 
-// completionStore persists the verified completion write set: the target plan
-// item status/decision and the progress fact (R-A3-4/R-A8-3). It uses the
-// application services' validated writes; the plan write is optimistic and the
-// fact append is idempotent, so a retried completion converges.
-type completionStore struct {
-	plans *versionapp.PlanService
-	facts *versionapp.FactService
-}
-
-var _ agentapp.CompletionStore = completionStore{}
-
-func (s completionStore) CommitCompletion(ctx context.Context, write agentapp.CompletionWrite) (agentapp.CompletionWriteResult, error) {
-	if s.plans == nil || s.facts == nil {
-		return agentapp.CompletionWriteResult{}, errors.New("completion store: plan/fact services are not configured")
-	}
-	items, err := s.plans.List(ctx, write.VersionID, "")
-	if err != nil {
-		return agentapp.CompletionWriteResult{}, err
-	}
-	revision := 0
-	for _, item := range items {
-		if item.ID == write.PlanItemID {
-			revision = item.Revision
-			break
-		}
-	}
-	if revision <= 0 {
-		return agentapp.CompletionWriteResult{}, fmt.Errorf("completion store: plan item %d not found in version %d", write.PlanItemID, write.VersionID)
-	}
-	item, err := s.plans.Update(ctx, write.VersionID, write.PlanItemID, versiondomain.PlanPatch{
-		Status:   write.PlanStatus,
-		Decision: write.Decision,
-	}, revision)
-	if err != nil {
-		return agentapp.CompletionWriteResult{}, err
-	}
-	outcome, err := s.facts.RecordFact(ctx, versiondomain.Fact{
-		VersionID: write.VersionID,
-		Kind:      write.FactKind,
-		Key:       write.FactKey,
-		Payload:   write.FactPayload,
-		Source:    write.Source,
-		SourceRef: write.SourceRef,
-	})
-	if err != nil {
-		return agentapp.CompletionWriteResult{}, err
-	}
-	return agentapp.CompletionWriteResult{FactID: outcome.Fact.ID, PlanItemRevision: item.Revision}, nil
-}
-
 // completionBuilder is the per-run task.complete factory. It resolves the one
-// plan item linked to the run's work item and binds the completion criterion of
-// the profile. Every completion targets a plan item (R-A3-4); a work item with
-// no linked plan item leaves task.complete unregistered rather than exposing a
+// plan item the verified completion writes and binds the completion criterion of
+// the profile. Every completion targets a plan item (R-A3-4); a run whose target
+// cannot be resolved leaves task.complete unregistered rather than exposing a
 // fact-only completion.
+//
+// Target resolution is deterministic and ordered:
+//  1. a plan item whose work_item_id is the run's work item (the explicit link);
+//  2. the plan_item_id carried by the work-item payload (a Host/design work item
+//     created by a plan-driven path);
+//  3. the version's single in-progress plan item (the production fallback while
+//     the plan write path is still zero rows). More than one in-progress item is
+//     ambiguous and fails closed.
 type completionBuilder struct {
-	plans     *versionapp.PlanService
+	plans     planCompletionCatalog
 	graph     *designapp.GraphService
 	questions *executionapp.QuestionService
 	store     agentapp.CompletionStore
@@ -379,22 +402,11 @@ type completionBuilder struct {
 
 func (b completionBuilder) Build(ctx context.Context, run agentapp.CompletionContext) (tools.CompletionDeps, error) {
 	if b.plans == nil || b.store == nil {
-		return tools.CompletionDeps{}, errors.New("completion builder: plan service or store is not configured")
+		return tools.CompletionDeps{}, errors.New("completion builder: plan catalog or store is not configured")
 	}
-	items, err := b.plans.List(ctx, run.VersionID, "")
+	target, err := b.resolveTarget(ctx, run)
 	if err != nil {
 		return tools.CompletionDeps{}, err
-	}
-	var target *versiondomain.PlanItem
-	for index := range items {
-		item := items[index]
-		if item.WorkItemID != nil && *item.WorkItemID == run.WorkItemID {
-			target = &item
-			break
-		}
-	}
-	if target == nil {
-		return tools.CompletionDeps{}, fmt.Errorf("completion builder: no plan item is linked to work item %d", run.WorkItemID)
 	}
 	reader := completionPlanItemReader{plans: b.plans}
 	var validator tools.Validator
@@ -410,6 +422,53 @@ func (b completionBuilder) Build(ctx context.Context, run agentapp.CompletionCon
 		Validator: validator,
 		Writer:    agentapp.NewCompletionService(b.store),
 	}, nil
+}
+
+// resolveTarget applies the ordered completion target resolution documented on
+// completionBuilder. It never guesses between two candidates.
+func (b completionBuilder) resolveTarget(ctx context.Context, run agentapp.CompletionContext) (versiondomain.PlanItem, error) {
+	if run.VersionID <= 0 {
+		return versiondomain.PlanItem{}, errors.New("completion builder: run has no version")
+	}
+	items, err := b.plans.List(ctx, run.VersionID, "")
+	if err != nil {
+		return versiondomain.PlanItem{}, fmt.Errorf("completion builder: list plan items: %w", err)
+	}
+	if run.WorkItemID > 0 {
+		for _, item := range items {
+			if item.WorkItemID != nil && *item.WorkItemID == run.WorkItemID {
+				return item, nil
+			}
+		}
+	}
+	if run.PlanItemID > 0 {
+		for _, item := range items {
+			if item.ID == run.PlanItemID {
+				return item, nil
+			}
+		}
+		return versiondomain.PlanItem{}, fmt.Errorf(
+			"completion builder: plan item %d from the work-item payload is not in version %d",
+			run.PlanItemID, run.VersionID)
+	}
+	inProgress := make([]versiondomain.PlanItem, 0, 1)
+	for _, item := range items {
+		if strings.EqualFold(strings.TrimSpace(item.Status), "in_progress") {
+			inProgress = append(inProgress, item)
+		}
+	}
+	switch len(inProgress) {
+	case 1:
+		return inProgress[0], nil
+	case 0:
+		return versiondomain.PlanItem{}, fmt.Errorf(
+			"completion builder: no plan item is linked to work item %d and version %d has no in-progress plan item",
+			run.WorkItemID, run.VersionID)
+	default:
+		return versiondomain.PlanItem{}, fmt.Errorf(
+			"completion builder: version %d has %d in-progress plan items; cannot choose a completion target deterministically",
+			run.VersionID, len(inProgress))
+	}
 }
 
 func (b completionBuilder) completionDeps(ctx context.Context, run agentapp.CompletionContext) (tools.CompletionDeps, error) {

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -114,6 +115,12 @@ func (s *sqlBriefingSource) Load(ctx context.Context, versionID int64) (agentcon
 	if err := loadBriefingPlan(ctx, tx, versionID, &source); err != nil {
 		return agentcontext.Source{}, err
 	}
+	// The clarification→design handoff document/revision is part of the Design
+	// Host briefing (R-B5-2). A version without a handoff yields nil, and the
+	// briefing renders no handoff group.
+	if err := loadBriefingHandoff(ctx, tx, versionID, &source); err != nil {
+		return agentcontext.Source{}, err
+	}
 	if err := loadBriefingFacts(ctx, tx, versionID, &source); err != nil {
 		return agentcontext.Source{}, err
 	}
@@ -130,6 +137,39 @@ func (s *sqlBriefingSource) Load(ctx context.Context, versionID int64) (agentcon
 		return agentcontext.Source{}, fmt.Errorf("commit briefing read transaction: %w", err)
 	}
 	return source, nil
+}
+
+// loadBriefingHandoff reads the latest clarification_handoff artifact of the
+// version. The document is the persisted six-block JSON; it is passed through
+// verbatim and bounded by the briefing renderer's handoff budget, so the Design
+// Host sees the exact artifact revision the clarification stage produced.
+func loadBriefingHandoff(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
+	var revision int
+	var document []byte
+	var createdAt time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT revision, content, created_at
+		FROM clarification_handoff
+		WHERE version_id = $1
+		ORDER BY revision DESC
+		LIMIT 1
+	`, versionID).Scan(&revision, &document, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read briefing handoff: %w", err)
+	}
+	doc := strings.TrimSpace(string(document))
+	if doc == "" {
+		return nil
+	}
+	source.Handoff = &agentcontext.HandoffSnapshot{
+		Revision:    revision,
+		GeneratedAt: createdAt.UTC().Format(time.RFC3339),
+		Document:    doc,
+	}
+	return nil
 }
 
 func loadBriefingVersion(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {

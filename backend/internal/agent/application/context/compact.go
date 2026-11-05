@@ -315,6 +315,7 @@ func compactSegmentsWithRetain(ctx context.Context, segments []Segment, summariz
 	for _, index := range folded {
 		segment := segments[index]
 		messages = append(messages, Message{
+			ID:         segment.MessageID,
 			Role:       segment.Role,
 			Content:    segment.Content,
 			ToolCallID: segment.ToolCallID,

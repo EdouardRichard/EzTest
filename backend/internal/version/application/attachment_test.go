@@ -354,13 +354,10 @@ func TestRegisterFromMessageCreatesPendingAttachmentAndIngestTask(t *testing.T) 
 		t.Fatalf("content ref = %d", stored.ContentRefID)
 	}
 
-	task, ok := env.queue.find("attachment.ingest", "attachment:"+idString(view.ID))
-	if !ok {
-		t.Fatalf("ingest task missing: %#v", env.queue.tasks)
-	}
-	if task.VersionID != env.versionID || task.Payload["attachment_id"] != idString(view.ID) ||
-		task.Payload["message_id"] != "7001" || task.Payload["conversation_id"] != "6001" {
-		t.Fatalf("task = %#v", task)
+	// v0.22 fix round 1: extraction is deterministic (the pending row is the
+	// queue); no attachment.ingest agent work item is enqueued any more.
+	if len(env.queue.tasks) != 0 {
+		t.Fatalf("pending attachment enqueued a legacy ingest task: %#v", env.queue.tasks)
 	}
 	if len(env.events.events) != 0 {
 		t.Fatalf("events = %#v", env.events.events)
@@ -1187,16 +1184,16 @@ func TestIngestByAttachmentIDWhileBindingDeferred(t *testing.T) {
 	}
 }
 
-// TestRetryBindsOnceAndEnqueuesIngestOnce covers the ordering/idempotency half
-// of R-E4-1: the ingest task is enqueued exactly once per attachment, the
-// retry binds the pre-registered row to the inserted message (no duplicate
-// row), and a repeated post with the same client_message_id neither re-binds
-// nor re-enqueues.
-func TestRetryBindsOnceAndEnqueuesIngestOnce(t *testing.T) {
+// TestRetryBindsOnceWithoutLegacyIngestTask covers the ordering/idempotency
+// half of R-E4-1: the deterministic worker owns extraction (no legacy ingest
+// work item), the retry binds the pre-registered row to the inserted message
+// (no duplicate row), and a repeated post with the same client_message_id does
+// not re-bind.
+func TestRetryBindsOnceWithoutLegacyIngestTask(t *testing.T) {
 	h := newAttachmentHarness(t)
 	h.Upload("spec.docx")
-	if tasks := h.ingestTasks(); len(tasks) != 1 {
-		t.Fatalf("ingest tasks after upload = %d, want 1", len(tasks))
+	if tasks := h.ingestTasks(); len(tasks) != 0 {
+		t.Fatalf("upload enqueued a legacy ingest task: %#v", tasks)
 	}
 
 	h.Ingest("附件正文")
@@ -1212,8 +1209,8 @@ func TestRetryBindsOnceAndEnqueuesIngestOnce(t *testing.T) {
 	if bound.ConversationMessageID == nil || *bound.ConversationMessageID != message.ID {
 		t.Fatalf("bound = %#v (message %d)", bound, message.ID)
 	}
-	if tasks := h.ingestTasks(); len(tasks) != 1 {
-		t.Fatalf("ingest tasks after retry = %d, want 1", len(tasks))
+	if tasks := h.ingestTasks(); len(tasks) != 0 {
+		t.Fatalf("retry enqueued a legacy ingest task: %#v", tasks)
 	}
 
 	read := h.ReadText()
@@ -1236,7 +1233,7 @@ func TestRetryBindsOnceAndEnqueuesIngestOnce(t *testing.T) {
 		*rows[h.attachmentID].ConversationMessageID != message.ID {
 		t.Fatalf("rows after idempotent retry = %#v", rows)
 	}
-	if tasks := h.ingestTasks(); len(tasks) != 1 {
-		t.Fatalf("ingest tasks after idempotent retry = %d, want 1", len(tasks))
+	if tasks := h.ingestTasks(); len(tasks) != 0 {
+		t.Fatalf("idempotent retry enqueued a legacy ingest task: %#v", tasks)
 	}
 }

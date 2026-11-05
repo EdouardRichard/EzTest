@@ -85,7 +85,16 @@ type VersionReader interface {
 	VersionPack(ctx context.Context, versionID int64) (VersionPack, error)
 }
 
-// AttachmentInfo is the parsed attachment view used by the Scout run.
+// AttachmentImageTokenBudget is the R-E3-4 prompt charge of one embedded image
+// reference in the attachment task pack. It matches the version domain's
+// AttachmentImageTokenBudget and is charged once per image on top of the
+// extracted text.
+const AttachmentImageTokenBudget = 1500
+
+// AttachmentInfo is the parsed attachment view used by the ingest/vision task
+// pack. It carries the extracted text, its total character count and the
+// embedded image references with captions (R-E3-4/R-E3-5); ImageTokens is the
+// per-image prompt charge (1500 tokens each) the task pack budgets.
 type AttachmentInfo struct {
 	ID             int64
 	ConversationID int64
@@ -96,6 +105,25 @@ type AttachmentInfo struct {
 	Error          string
 	Text           string
 	TotalChars     int
+	Images         []AttachmentImageInfo
+	ImageTokens    int
+}
+
+// AttachmentImageInfo is the compact image reference/caption pair exposed to the
+// agent runtime. The bytes stay in the content ledger; SHA256 is the read
+// reference. Status/Error make a skipped/failed image visible instead of
+// silently dropping it.
+type AttachmentImageInfo struct {
+	ID         int64
+	Seq        int
+	SHA256     string
+	MIME       string
+	Width      int
+	Height     int
+	SourceKind string
+	Status     string
+	Caption    string
+	Error      string
 }
 
 // AttachmentReader loads one attachment with its extracted text for ingest runs.
@@ -253,9 +281,14 @@ const (
 // are parsed from decimal strings or JSON numbers for P0 payload
 // compatibility.
 type WorkItemPayload struct {
-	ConversationID       int64
-	MessageID            int64
-	AttachmentID         int64
+	ConversationID int64
+	MessageID      int64
+	AttachmentID   int64
+	// PlanItemID is the v0.22 task.complete target of a work item created by a
+	// plan-driven path (R-A3-4/R-A8-3). The runner falls back to the version's
+	// single in-progress plan item when the work item carries no explicit link,
+	// so a real Host run still registers task.complete.
+	PlanItemID           int64
 	RequirementID        int64
 	RequirementVersionID int64
 	CaseID               int64

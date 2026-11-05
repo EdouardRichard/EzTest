@@ -969,3 +969,36 @@ func TestSummaryImageTokensChargedInRequestEstimate(t *testing.T) {
 			result.InputTokens, 2*agentapp.SummaryImageTokens)
 	}
 }
+
+// TestCompactionSummarizerFiltersPinnedLeak is the H5 guard (v0.22 fix round
+// 1): a model draft that reproduces explicitly pinned material (session facts or
+// the pinned task context) must not leak it into the persisted rolling summary.
+func TestCompactionSummarizerFiltersPinnedLeak(t *testing.T) {
+	in := testSummaryInput()
+	chat := &scriptedChat{responses: []llmapp.ChatResponse{{
+		Content: "## 用户目标与意图\n- 回顾：JWT 有效期 15 分钟\n- 实现登录功能\n" +
+			"## 关键上下文\n- 不得修改已确认需求\n",
+	}}}
+	result := agentapp.NewCompactionSummarizer(chat).Summarize(context.Background(), in)
+	if !result.PinnedLeakFiltered {
+		t.Fatalf("pinned leak was not detected: %+v", result)
+	}
+	for _, leaked := range []string{"JWT 有效期 15 分钟", "不得修改已确认需求"} {
+		if strings.Contains(result.Text, leaked) {
+			t.Fatalf("summary leaked pinned material %q:\n%s", leaked, result.Text)
+		}
+	}
+	if result.Tokens != agentapp.EstimateSummaryTokens(result.Text) {
+		t.Fatalf("token bookkeeping not refreshed after filtering: %d", result.Tokens)
+	}
+
+	// A draft without pinned material is unchanged by the filter.
+	clean := testSummaryInput()
+	cleanChat := &scriptedChat{responses: []llmapp.ChatResponse{{
+		Content: "## 用户目标与意图\n- 实现登录接口\n",
+	}}}
+	cleanResult := agentapp.NewCompactionSummarizer(cleanChat).Summarize(context.Background(), clean)
+	if cleanResult.PinnedLeakFiltered {
+		t.Fatalf("clean summary was filtered: %+v", cleanResult)
+	}
+}

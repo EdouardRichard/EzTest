@@ -647,3 +647,47 @@ func ptrFloat(value float64) *float64 { return &value }
 func ptrString(value string) *string { return &value }
 
 func int64Ptr(value int64) *int64 { return &value }
+
+// TestBriefingReaderLoadsClarificationHandoff covers the v0.22 R-B5-2 handoff
+// injection (Task 36 fix round 1): the briefing source reads the latest
+// clarification_handoff artifact revision and the Design Host briefing renders
+// its revision and document.
+func TestBriefingReaderLoadsClarificationHandoff(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	briefingSeedSQL(t, pool, base)
+	document := `{"version_id":9001,"revision":3,"requirements":[{"id":501,"title":"登录需求"}],"open":[{"title":"短信通道"}]}`
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO clarification_handoff (id, version_id, revision, content)
+		VALUES (9901, 9001, 3, $1::jsonb)
+	`, document); err != nil {
+		t.Fatalf("seed handoff: %v", err)
+	}
+
+	reader, err := NewBriefingReader(pool)
+	if err != nil {
+		t.Fatalf("NewBriefingReader: %v", err)
+	}
+	source, err := reader.Load(ctx, 9001)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if source.Handoff == nil || source.Handoff.Revision != 3 {
+		t.Fatalf("handoff source = %#v", source.Handoff)
+	}
+	if !strings.Contains(source.Handoff.Document, "登录需求") {
+		t.Fatalf("handoff document = %q", source.Handoff.Document)
+	}
+
+	briefing, err := agentcontext.NewBriefingBuilder(reader).BuildBriefing(ctx, 9001)
+	if err != nil {
+		t.Fatalf("BuildBriefing: %v", err)
+	}
+	rendered := briefing.Render()
+	for _, want := range []string{"澄清交接包", "revision=3", "短信通道"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("design host briefing missing %q:\n%s", want, rendered)
+		}
+	}
+}

@@ -45,6 +45,7 @@ const (
 	SectionFindings      = "findings"
 	SectionExecution     = "execution"
 	SectionKnowledge     = "knowledge"
+	SectionHandoff       = "handoff"
 	SectionOpenQuestions = "open_questions"
 )
 
@@ -57,6 +58,9 @@ const (
 	briefingFindingsBudget     = 800
 	briefingExecutionBudget    = 200
 	briefingKnowledgeBudget    = 200
+	// briefingHandoffBudget bounds the clarification handoff document injected
+	// into the Design Host briefing (R-B5-2). The revision line is mandatory.
+	briefingHandoffBudget = 600
 
 	// maxPlanItems is the plan cap from spec §6.2 (open items ≤5). The current
 	// and next items count toward it but are always rendered. maxFindingItems
@@ -84,6 +88,7 @@ const (
 	sectionTitleFindings      = "发现"
 	sectionTitleExecution     = "执行"
 	sectionTitleKnowledge     = "知识"
+	sectionTitleHandoff       = "澄清交接包"
 	sectionTitleOpenQuestions = "未决"
 )
 
@@ -101,14 +106,18 @@ type Section struct {
 // order. The type is never persisted and carries no timestamps, so equal data
 // always renders to equal bytes.
 type Briefing struct {
-	Goal          string
-	Stage         string
-	Requirements  []Section
-	Cases         []Section
-	Plan          []Section
-	Findings      []Section
-	Execution     []Section
-	Knowledge     []Section
+	Goal         string
+	Stage        string
+	Requirements []Section
+	Cases        []Section
+	Plan         []Section
+	Findings     []Section
+	Execution    []Section
+	Knowledge    []Section
+	// Handoff is the clarification→design handoff pack injected into the Design
+	// Host briefing (R-B5-2). It is empty when the version has no handoff yet,
+	// and Render then omits the group entirely (older briefings stay identical).
+	Handoff       []Section
 	OpenQuestions []Section
 
 	// mandatoryPlan and mandatoryFindings are the protected prefixes of the
@@ -119,6 +128,7 @@ type Briefing struct {
 	// budget. Both are empty for a zero Briefing and for groups without data.
 	mandatoryPlan     string
 	mandatoryFindings string
+	mandatoryHandoff  string
 }
 
 // BriefingBuilder builds version briefings from a Reader.
@@ -160,7 +170,8 @@ func newBriefing(source Source) Briefing {
 		}
 		stage += "（阻塞：" + blocker + "）"
 	}
-	return Briefing{
+	handoffSections, handoffMandatory := handoffBriefing(source.Handoff)
+	briefing := Briefing{
 		Goal:              oneLine(source.Version.Goal),
 		Stage:             stage,
 		Requirements:      briefingSection(SectionRequirements, sectionTitleRequirements, requirementsBody(source.Requirements)),
@@ -169,10 +180,35 @@ func newBriefing(source Source) Briefing {
 		Findings:          briefingSection(SectionFindings, sectionTitleFindings, findingsBody(source.Findings)),
 		Execution:         briefingSection(SectionExecution, sectionTitleExecution, executionBody(source.Execution)),
 		Knowledge:         briefingSection(SectionKnowledge, sectionTitleKnowledge, knowledgeBody(source.Knowledge)),
+		Handoff:           handoffSections,
 		OpenQuestions:     briefingSection(SectionOpenQuestions, sectionTitleOpenQuestions, openQuestionsBody(source.OpenQuestions)),
 		mandatoryPlan:     planMandatoryBody(source.Plan),
 		mandatoryFindings: findingsMandatoryBody(source.Findings),
+		mandatoryHandoff:  handoffMandatory,
 	}
+	return briefing
+}
+
+// handoffBriefing renders the clarification→design handoff document injected
+// into the Design Host briefing (R-B5-2). The revision line is the mandatory,
+// never-truncated prefix; the document body is bounded by the group budget.
+// A version without a handoff renders no group at all, so the pre-handoff
+// briefing bytes are unchanged.
+func handoffBriefing(snapshot *HandoffSnapshot) ([]Section, string) {
+	if snapshot == nil || strings.TrimSpace(snapshot.Document) == "" {
+		return nil, ""
+	}
+	revision := snapshot.Revision
+	if revision <= 0 {
+		revision = 1
+	}
+	prefix := fmt.Sprintf("revision=%d", revision)
+	body := prefix
+	if generatedAt := strings.TrimSpace(snapshot.GeneratedAt); generatedAt != "" {
+		body += "\n生成时间: " + oneLine(generatedAt)
+	}
+	body += "\n文档:\n" + strings.TrimSpace(snapshot.Document)
+	return []Section{{Name: SectionHandoff, Title: sectionTitleHandoff, Content: body}}, prefix
 }
 
 // briefingSection returns the single section of one group, defaulting an empty
@@ -371,15 +407,23 @@ type briefingGroup struct {
 // briefingGroups returns the groups in the fixed spec §6.2 order. It allocates a
 // fresh slice every render; the values themselves are immutable.
 func briefingGroups(b Briefing) []briefingGroup {
-	return []briefingGroup{
+	groups := []briefingGroup{
 		{title: sectionTitleRequirements, sections: b.Requirements, budget: briefingRequirementsBudget},
 		{title: sectionTitleCases, sections: b.Cases, budget: briefingCasesBudget},
 		{title: sectionTitlePlan, sections: b.Plan, budget: briefingPlanBudget, mandatory: b.mandatoryPlan},
 		{title: sectionTitleFindings, sections: b.Findings, budget: briefingFindingsBudget, mandatory: b.mandatoryFindings},
 		{title: sectionTitleExecution, sections: b.Execution, budget: briefingExecutionBudget},
 		{title: sectionTitleKnowledge, sections: b.Knowledge, budget: briefingKnowledgeBudget},
-		{title: sectionTitleOpenQuestions, sections: b.OpenQuestions},
 	}
+	// The handoff group only exists once the clarification→design artifact was
+	// generated, so versions before the handoff keep byte-identical briefings.
+	if len(b.Handoff) > 0 {
+		groups = append(groups, briefingGroup{
+			title: sectionTitleHandoff, sections: b.Handoff,
+			budget: briefingHandoffBudget, mandatory: b.mandatoryHandoff,
+		})
+	}
+	return append(groups, briefingGroup{title: sectionTitleOpenQuestions, sections: b.OpenQuestions})
 }
 
 // renderHead renders the always-present goal/stage head. It is never truncated.
@@ -589,12 +633,19 @@ func planViews(items []PlanItemSnapshot) []planItemView {
 
 // planItemLabel renders one plan item without its bullet: the status, the title
 // and the dependency reference.
+// planItemLabel renders one plan item without its bullet: the status, the title,
+// the optimistic-lock identity and the dependency reference. The id/revision
+// pair is what plan.update consumes (R-A8-2), so the Host never has to guess the
+// item id or present a stale revision.
 func planItemLabel(item PlanItemSnapshot) string {
 	label := ""
 	if status := oneLine(item.Status); status != "" {
 		label = "[" + status + "] "
 	}
 	label += oneLine(item.Title)
+	if item.ID > 0 {
+		label += fmt.Sprintf(" [id=%d revision=%d]", item.ID, item.Revision)
+	}
 	if dependencies := dependencyText(item.DependsOn); dependencies != "" {
 		label += "（依赖：" + dependencies + "）"
 	}

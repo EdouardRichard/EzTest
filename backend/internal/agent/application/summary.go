@@ -313,6 +313,10 @@ type SummaryResult struct {
 	FallbackReason   string
 	CoveredMessageID int64
 	CompactionID     string
+	// PinnedLeakFiltered reports that the model draft reproduced explicitly
+	// pinned material (session pinned facts or the pinned task context) and the
+	// H5 filter removed those lines from the persisted summary.
+	PinnedLeakFiltered bool
 }
 
 // EstimateSummaryTokens is the R-A5-14 conservative estimator for summary
@@ -1739,9 +1743,75 @@ func (s *CompactionSummarizer) Summarize(ctx context.Context, in SummaryInput) S
 		result.CachedTokens = cachedTokens
 		result.CacheHit = cacheHit
 	}
+	result = filterSummaryPinnedLeak(result, selected)
 	if result.Truncated {
 		s.publishTruncated(ctx, selected, result)
 	}
+	return result
+}
+
+// FilterPinnedLeak is the H5 guard (v0.22 fix round 1): pinned session facts
+// and the pinned per-work-item task context must never be folded into the
+// rolling summary. The deterministic builder already excludes them, but a model
+// draft can reproduce them verbatim; any summary line containing an exact pinned
+// fact/constraint/acceptance/scope/goal string is dropped before persistence.
+// Strings shorter than 8 runes are ignored so generic words cannot blank the
+// summary.
+func FilterPinnedLeak(text string, in SummaryInput) (string, bool) {
+	needles := make([]string, 0, len(in.PinnedFacts)+5+len(in.Task.Constraints)+len(in.Task.AcceptanceCriteria)+len(in.Task.Scope))
+	appendNeedle := func(value string) {
+		value = strings.TrimSpace(value)
+		if len([]rune(value)) < 8 {
+			return
+		}
+		needles = append(needles, value)
+	}
+	for _, fact := range capPinnedFacts(in.PinnedFacts) {
+		appendNeedle(fact)
+	}
+	appendNeedle(in.Task.Goal)
+	for _, value := range in.Task.Constraints {
+		appendNeedle(value)
+	}
+	for _, value := range in.Task.AcceptanceCriteria {
+		appendNeedle(value)
+	}
+	for _, value := range in.Task.Scope {
+		appendNeedle(value)
+	}
+	if len(needles) == 0 || strings.TrimSpace(text) == "" {
+		return text, false
+	}
+	leaked := false
+	lines := strings.Split(text, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		drop := false
+		for _, needle := range needles {
+			if strings.Contains(line, needle) {
+				drop = true
+				break
+			}
+		}
+		if drop {
+			leaked = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n"), leaked
+}
+
+// filterSummaryPinnedLeak applies the H5 filter and refreshes the token
+// bookkeeping when lines were removed.
+func filterSummaryPinnedLeak(result SummaryResult, in SummaryInput) SummaryResult {
+	filtered, leaked := FilterPinnedLeak(result.Text, in)
+	if !leaked {
+		return result
+	}
+	result.Text = filtered
+	result.Tokens = EstimateSummaryTokens(filtered)
+	result.PinnedLeakFiltered = true
 	return result
 }
 
@@ -1756,6 +1826,7 @@ func (s *CompactionSummarizer) fallback(ctx context.Context, in SummaryInput, ca
 		result.FallbackReason = cause.Error()
 		s.logWarn(ctx, "context compaction: summary generation failed; using deterministic summary", "error", cause)
 	}
+	result = filterSummaryPinnedLeak(result, in)
 	if result.Truncated {
 		s.publishTruncated(ctx, in, result)
 	}
@@ -1916,14 +1987,15 @@ func (l *SummaryLedger) currentTime() time.Time {
 // never stores a different fact window than the prompt used.
 func (r SummaryResult) Commit(in SummaryInput) SummaryCommit {
 	meta := map[string]any{
-		"trigger":        string(in.Trigger),
-		"summary_tokens": r.Tokens,
-		"input_tokens":   r.InputTokens,
-		"image_tokens":   in.ImageCount * SummaryImageTokens,
-		"summary_max":    in.summaryMax(),
-		"truncated":      r.Truncated,
-		"cached_tokens":  r.CachedTokens,
-		"used_fallback":  r.UsedFallback,
+		"trigger":              string(in.Trigger),
+		"summary_tokens":       r.Tokens,
+		"input_tokens":         r.InputTokens,
+		"image_tokens":         in.ImageCount * SummaryImageTokens,
+		"summary_max":          in.summaryMax(),
+		"truncated":            r.Truncated,
+		"cached_tokens":        r.CachedTokens,
+		"used_fallback":        r.UsedFallback,
+		"pinned_leak_filtered": r.PinnedLeakFiltered,
 	}
 	if in.ConversationID > 0 {
 		meta["conversation_id"] = strconv.FormatInt(in.ConversationID, 10)

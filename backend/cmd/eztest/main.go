@@ -1063,6 +1063,14 @@ func main() {
 	attachmentSvc.SetFactRecorder(factSvc)
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
+	// v0.22 R-A5-12: compaction summary revisions persist through the version
+	// conversation writer (monotonic covered_message_id + DB advisory lock).
+	compactionSummary := versionadapter.NewSummaryStore(conversationSvc)
+	// v0.22 R-A5-10: the compaction transaction manager (one live compaction per
+	// conversation, TTL/thrashing guard). The runner publishes the extended
+	// context.compacted payload after every successful transaction.
+	compactionManager := agentcontext.NewCompactionManager(
+		agentcontext.WithCompactionLogger(slog.Default()))
 	conversationSvc.SetModelCatalog(conversationModelCatalog{svc: llmSvc})
 	// Task 77: a design conversation cannot be created before at least one
 	// requirement is clarified; the gate is typed and checked before any round
@@ -1230,7 +1238,7 @@ func main() {
 	// card/answer echo into the conversation thread.
 	executionQuestions := executionapp.NewQuestionService(executionapp.QuestionServiceDeps{
 		Humans:   executionRepo.Humans,
-		Messages: questionMessageWriterAdapter{pool: pool, ids: ids},
+		Messages: questionMessageWriterAdapter{conversations: conversationSvc},
 		Settings: settingsSvc,
 		IDs:      ids,
 		Clock:    clk,
@@ -1671,7 +1679,12 @@ func main() {
 		PlanWriter:          planWriterAdapter{plans: planSvc},
 		QuestionAsker:       questionAskerAdapter{questions: executionQuestions},
 		ClarificationSearch: clarificationSearch,
-		Completion:          completionBuilder{plans: planSvc, graph: designGraph, questions: executionQuestions, store: completionStore{plans: planSvc, facts: factSvc}}.Build,
+		Completion:          completionBuilder{plans: planSvc, graph: designGraph, questions: executionQuestions, store: pgCompletionStore{pool: pool, ids: ids}}.Build,
+		// v0.22 A-5 compaction: the policy is resolved per run from the model
+		// window/max_output and compaction.* settings; summaries persist through
+		// the version conversation writer and transactions through the manager.
+		CompactionSummary: compactionSummary,
+		CompactionManager: compactionManager,
 		// P7 knowledge injection + usage accounting (S6 report §5).
 		Knowledge:      p7rt.KnowledgeAdapter,
 		KnowledgeUsage: p7rt.KnowledgeAdapter,

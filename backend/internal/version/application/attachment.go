@@ -340,7 +340,11 @@ func (s *AttachmentService) createAttachment(ctx context.Context, versionID, con
 			"message":       errorText,
 		})
 	case version.AttachmentPending:
-		s.enqueueIngest(ctx, versionID, conversationID, messageID, attachmentID)
+		// v0.22 (Task 36 fix round 1): extraction is owned by the deterministic
+		// server-side attachment worker (runAttachmentExtractionWorker), not by
+		// an attachment.ingest agent work item. The pending row is the queue:
+		// no legacy enqueue here, so a deployment without the agent worker
+		// still extracts every upload.
 	}
 	return attachment, nil
 }
@@ -1602,33 +1606,6 @@ func (s *AttachmentService) readExtractedText(ctx context.Context, attachment ve
 		return string(data), nil
 	}
 	return "", version.ErrAttachmentNotFound
-}
-
-// enqueueIngest ensures the deterministic attachment.ingest task. The task is
-// keyed by attachment_id (never by the message join) and the row is already
-// persisted, so it may run before the message binding is known; message_id is
-// carried for observability and may be zero for a pre-registered row. Dedupe on
-// the attachment key keeps the enqueue idempotent when the retry path reuses
-// the same row.
-func (s *AttachmentService) enqueueIngest(ctx context.Context, versionID, conversationID, messageID, attachmentID int64) {
-	if s.queue == nil {
-		return
-	}
-	payload := map[string]any{
-		"attachment_id": platformid.Format(attachmentID),
-		"version_id":    platformid.Format(versionID),
-		"message_id":    platformid.Format(messageID),
-	}
-	if conversationID > 0 {
-		payload["conversation_id"] = platformid.Format(conversationID)
-	}
-	_ = s.queue.Ensure(ctx, TaskInput{
-		VersionID: versionID,
-		Team:      "clarification",
-		Type:      "attachment.ingest",
-		DedupeKey: "attachment:" + platformid.Format(attachmentID),
-		Payload:   payload,
-	})
 }
 
 func (s *AttachmentService) publishAttachmentEvent(ctx context.Context, versionID int64, eventType string, attachment version.Attachment, payload map[string]any) {

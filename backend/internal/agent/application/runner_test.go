@@ -135,9 +135,28 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 			Design:      fixture.design,
 			P7:          tools.P7Deps{Knowledge: fixture.knowledgeWriter},
 		},
-		InstanceID: "instance-1",
+		InstanceID:        "instance-1",
+		CompactionSummary: &fakeCompactionSummaryStore{conversations: fixture.conv},
 	})
 	return fixture
+}
+
+// fakeCompactionSummaryStore is the in-memory agentapp.SummaryStore of the
+// runner fixture. It appends to the fake conversation's summary list (the same
+// observable the legacy UpdateSummary used) and returns the next revision.
+type fakeCompactionSummaryStore struct {
+	conversations *fakeConversationPort
+}
+
+func (f *fakeCompactionSummaryStore) AppendSummary(ctx context.Context, commit agentapp.SummaryCommit) (agentapp.SummaryRecord, error) {
+	if f == nil || f.conversations == nil {
+		return agentapp.SummaryRecord{}, errors.New("fake summary store is not configured")
+	}
+	stored, err := f.conversations.UpdateSummary(ctx, commit.VersionID, commit.ConversationID, commit.Summary, commit.PinnedFacts)
+	if err != nil {
+		return agentapp.SummaryRecord{}, err
+	}
+	return agentapp.SummaryRecord{Version: stored.Version, SummaryCommit: commit}, nil
 }
 
 func hostItem() agent.WorkItem {

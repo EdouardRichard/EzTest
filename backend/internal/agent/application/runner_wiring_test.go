@@ -258,6 +258,9 @@ func TestTaskCompleteSignalsCompletionOnce(t *testing.T) {
 	if result.Status != agent.AgentRunDone {
 		t.Fatalf("status = %s", result.Status)
 	}
+	if result.TerminalReason != "completed" {
+		t.Fatalf("terminal reason = %q, want completed", result.TerminalReason)
+	}
 	if fixture.writer.commits != 1 {
 		t.Fatalf("completion commits = %d", fixture.writer.commits)
 	}

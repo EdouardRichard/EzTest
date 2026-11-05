@@ -102,8 +102,8 @@ func TestSendBlockedForNonVisionImage(t *testing.T) {
 	if _, ok := env.queue.find("chat.turn", "reply:"+idString(message.ID)); !ok {
 		t.Fatalf("vision send did not enqueue chat.turn: %#v", env.queue.tasks)
 	}
-	if _, ok := env.queue.find("requirement.curate", "curate:"+idString(message.ID)); !ok {
-		t.Fatalf("vision send did not enqueue requirement.curate: %#v", env.queue.tasks)
+	if _, ok := env.queue.find("requirement.curate", "curate:"+idString(message.ID)); ok {
+		t.Fatalf("v0.22 removed requirement.curate but it was enqueued: %#v", env.queue.tasks)
 	}
 }
 

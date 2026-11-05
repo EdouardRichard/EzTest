@@ -717,8 +717,8 @@ func TestPostUserMessageRegistersAttachmentsAndEnqueuesTasks(t *testing.T) {
 		t.Fatalf("reply task missing: %#v", env.queue.tasks)
 	}
 	curateKey := "curate:" + idString(message.ID)
-	if _, ok := env.queue.find("requirement.curate", curateKey); !ok {
-		t.Fatalf("curate task missing: %#v", env.queue.tasks)
+	if _, ok := env.queue.find("requirement.curate", curateKey); ok {
+		t.Fatalf("v0.22 removed requirement.curate but it was enqueued: %#v", env.queue.tasks)
 	}
 
 	if len(env.events.events) != 2 {
@@ -1303,8 +1303,8 @@ func TestPostUserMessageBlocksNewAttachmentUntilExtractionDone(t *testing.T) {
 	if pending.ExtractionStatus != version.AttachmentPending {
 		t.Fatalf("status = %q, want pending", pending.ExtractionStatus)
 	}
-	if _, ok := env.attachments.queue.find("attachment.ingest", "attachment:"+idString(pending.ID)); !ok {
-		t.Fatalf("pre-registered attachment did not enqueue extraction: %#v", env.attachments.queue.tasks)
+	if _, ok := env.attachments.queue.find("attachment.ingest", "attachment:"+idString(pending.ID)); ok {
+		t.Fatalf("v0.22 removed attachment.ingest but it was enqueued: %#v", env.attachments.queue.tasks)
 	}
 
 	// A retry while the row is still pending is rejected again, still leaving

@@ -33,7 +33,8 @@ const conversationMessageSelectColumns = `m.id, m.conversation_id, m.role, m.par
 	COALESCE(run.model, '')`
 
 const conversationSummaryColumns = `id, conversation_id, summary, pinned_facts,
-	token_estimate, version, updated_at`
+	token_estimate, version, COALESCE(covered_message_id, 0),
+	COALESCE(compaction_id, ''), summary_meta, updated_at`
 
 // ConversationRepository stores conversations, their UI-thread messages and
 // the versioned thread summaries.
@@ -714,7 +715,9 @@ func (r *ConversationRepository) Summary(ctx context.Context, conversationID int
 }
 
 // SaveSummary inserts the next summary version atomically and returns the
-// stored row.
+// stored row. R-A5-12: a per-conversation advisory lock serializes the watermark
+// check and the insert, so a covered_message_id can never move backwards and
+// two concurrent compactions cannot fork the revision sequence.
 func (r *ConversationRepository) SaveSummary(ctx context.Context, summary version.ConversationSummary) (version.ConversationSummary, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -722,17 +725,42 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('eztest:conversation:' || ($1::bigint)::text))`,
+		summary.ConversationID); err != nil {
+		return version.ConversationSummary{}, fmt.Errorf("save conversation summary: lock: %w", err)
+	}
+	var previousCovered int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(max(covered_message_id), 0)
+		FROM conversation_summary
+		WHERE conversation_id = $1
+	`, summary.ConversationID).Scan(&previousCovered); err != nil {
+		return version.ConversationSummary{}, wrapConversationDB("read summary watermark", err)
+	}
+	if summary.CoveredMessageID > 0 && summary.CoveredMessageID < previousCovered {
+		return version.ConversationSummary{}, fmt.Errorf("%w: previous=%d candidate=%d",
+			version.ErrSummaryWatermarkStale, previousCovered, summary.CoveredMessageID)
+	}
+	summaryMeta, err := encodeSummaryMeta(summary.SummaryMeta)
+	if err != nil {
+		return version.ConversationSummary{}, err
+	}
+
 	saved := summary
 	saved.ID = r.ids.Next()
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO conversation_summary (
-			id, conversation_id, summary, pinned_facts, token_estimate, version, updated_at
+			id, conversation_id, summary, pinned_facts, token_estimate, version,
+			covered_message_id, compaction_id, summary_meta, updated_at
 		)
 		VALUES ($1, $2, $3, $4::jsonb, $5,
-			COALESCE((SELECT max(version) FROM conversation_summary WHERE conversation_id = $2), 0) + 1, $6)
+			COALESCE((SELECT max(version) FROM conversation_summary WHERE conversation_id = $2), 0) + 1,
+			NULLIF($6, 0), NULLIF($7, ''), $8::jsonb, $9)
 		RETURNING version, updated_at
 	`, saved.ID, summary.ConversationID, summary.Summary, encodeStringSlice(summary.PinnedFacts),
-		summary.TokenEstimate, summary.UpdatedAt).Scan(&saved.Version, &saved.UpdatedAt); err != nil {
+		summary.TokenEstimate, summary.CoveredMessageID, summary.CompactionID, summaryMeta,
+		summary.UpdatedAt).Scan(&saved.Version, &saved.UpdatedAt); err != nil {
 		return version.ConversationSummary{}, wrapConversationDB("insert conversation summary", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, summary.ConversationID, summary.UpdatedAt); err != nil {
@@ -742,6 +770,18 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 		return version.ConversationSummary{}, fmt.Errorf("save conversation summary: commit: %w", err)
 	}
 	return saved, nil
+}
+
+// encodeSummaryMeta renders the summary_meta object. A nil map stores {}.
+func encodeSummaryMeta(meta map[string]any) (string, error) {
+	if len(meta) == 0 {
+		return "{}", nil
+	}
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return "", fmt.Errorf("encode summary meta: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // ListReconcilable returns the most recent conversations (including
@@ -863,11 +903,16 @@ func scanMessage(row rowScanner) (version.Message, error) {
 func scanSummary(row rowScanner) (version.ConversationSummary, error) {
 	var summary version.ConversationSummary
 	var pinned []byte
+	var meta []byte
 	if err := row.Scan(&summary.ID, &summary.ConversationID, &summary.Summary, &pinned,
-		&summary.TokenEstimate, &summary.Version, &summary.UpdatedAt); err != nil {
+		&summary.TokenEstimate, &summary.Version, &summary.CoveredMessageID, &summary.CompactionID,
+		&meta, &summary.UpdatedAt); err != nil {
 		return version.ConversationSummary{}, err
 	}
 	summary.PinnedFacts = decodeStringSlice(pinned)
+	if len(meta) > 0 {
+		_ = json.Unmarshal(meta, &summary.SummaryMeta)
+	}
 	return summary, nil
 }
 

@@ -104,8 +104,12 @@ type Segment struct {
 	Role       string
 	Content    string
 	ToolCallID string
-	Prefix     bool
-	Tokens     int
+	// MessageID is the persisted conversation message the segment replayed
+	// (R-A5-12); it is the watermark source of the folded range. Zero for
+	// derived segments (prefix/briefing/facts/summary/tool results).
+	MessageID int64
+	Prefix    bool
+	Tokens    int
 }
 
 // ContextPacket records the cache-first bookkeeping of one assembly (spec
@@ -267,6 +271,7 @@ func (a *Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembl
 			Role:       message.Role,
 			Content:    message.Content,
 			ToolCallID: message.ToolCallID,
+			MessageID:  message.ID,
 		}))
 		messages = append(messages, message)
 	}
