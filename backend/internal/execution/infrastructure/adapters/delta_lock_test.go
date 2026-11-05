@@ -41,19 +41,41 @@ type fakeDeltaLockConn struct {
 	unlockErr error
 	closed    int
 	released  int
+	// events records the ordered calls so the test pins "close before release":
+	// releasing first would hand the still-locked session back to the pool.
+	events []string
+}
+
+func (c *fakeDeltaLockConn) record(event string) {
+	c.events = append(c.events, event)
 }
 
 func (c *fakeDeltaLockConn) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	c.record("unlock")
 	return pgconn.CommandTag{}, c.unlockErr
 }
 
 func (c *fakeDeltaLockConn) Close(context.Context) error {
 	c.closed++
+	c.record("close")
 	return nil
 }
 
 func (c *fakeDeltaLockConn) Release() {
 	c.released++
+	c.record("release")
+}
+
+func assertDeltaLockEvents(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("delta lock calls = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("delta lock calls = %v, want %v (order must be %v)", got, want, want)
+		}
+	}
 }
 
 func captureDefaultLogger(t *testing.T) *bytes.Buffer {
@@ -77,6 +99,10 @@ func TestReleaseDiscoveryDeltaLockClosesConnectionWhenUnlockFails(t *testing.T) 
 	if conn.released != 1 {
 		t.Fatalf("released = %d, want 1", conn.released)
 	}
+	// The connection must be closed before it is released: Release returns it
+	// to the pool, and a still-locked session handed back to the pool leaks the
+	// advisory lock forever.
+	assertDeltaLockEvents(t, conn.events, []string{"unlock", "close", "release"})
 	if !strings.Contains(logs.String(), "unlock failed") {
 		t.Fatalf("unlock error was not logged: %s", logs.String())
 	}
@@ -94,4 +120,5 @@ func TestReleaseDiscoveryDeltaLockKeepsHealthyConnection(t *testing.T) {
 	if conn.released != 1 {
 		t.Fatalf("released = %d, want 1", conn.released)
 	}
+	assertDeltaLockEvents(t, conn.events, []string{"unlock", "release"})
 }

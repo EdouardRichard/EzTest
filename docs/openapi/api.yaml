@@ -3684,17 +3684,18 @@ paths:
         environment_id, page_ids, api_ids, database_ids, account_roles,
         repository_ids}]}`。`repository_ids` 是该 binding 的全部 effective 代码仓
         （多仓、去重升序），不是单个基准仓；当前 wave 的快照不会因新 approved
-        资源而改变，新资源只在下一 wave 生效。`wave_id` 必填且为十进制 ID
-        （缺失/非法 400）；wave 不存在或不属于该版本一律 404（不泄漏跨版本存在性）。
+        资源而改变，新资源只在下一 wave 生效。`wave_id` 必填且为规范十进制 ID
+        （仅数字、无符号、无前导零；缺失/非法 400）；wave 不存在或不属于该版本
+        一律 404（不泄漏跨版本存在性）。
       parameters:
         - $ref: '#/components/parameters/ID'
         - name: wave_id
           in: query
           required: true
-          description: 波次（run_wave）雪花 ID 的十进制字符串
+          description: 波次（run_wave）雪花 ID 的规范十进制字符串（无符号、无前导零）
           schema:
             type: string
-            pattern: '^[0-9]+$'
+            pattern: '^[1-9][0-9]*$'
       responses:
         '200':
           description: 冻结范围快照（空快照返回 {} 对象）

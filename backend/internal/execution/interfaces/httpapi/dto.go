@@ -153,16 +153,37 @@ func optionalQueryID(r *http.Request, field string) (*int64, error) {
 }
 
 // requiredQueryID parses a required positive decimal query ID (API-19
-// wave_id). Missing or non-decimal values are a typed 400.
+// wave_id). Only the canonical decimal form is accepted: digits only, no sign
+// and no leading zeros (OpenAPI ^[1-9][0-9]*$). ParseInt alone would also
+// accept +7 and 007, which the documented contract does not allow. Missing or
+// non-canonical values are a typed 400.
 func requiredQueryID(r *http.Request, field string) (int64, error) {
-	value, err := optionalQueryID(r, field)
-	if err != nil {
-		return 0, err
-	}
-	if value == nil {
+	raw := strings.TrimSpace(r.URL.Query().Get(field))
+	if raw == "" {
 		return 0, platform.Invalid(field, "is required")
 	}
-	return *value, nil
+	if !canonicalDecimalID(raw) {
+		return 0, platform.Invalid(field, "must be a positive decimal ID")
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, platform.Invalid(field, "must be a positive decimal ID")
+	}
+	return value, nil
+}
+
+// canonicalDecimalID reports whether raw is a canonical decimal ID: no sign, no
+// leading zero and at least one digit.
+func canonicalDecimalID(raw string) bool {
+	if raw == "" || raw[0] < '1' || raw[0] > '9' {
+		return false
+	}
+	for index := 1; index < len(raw); index++ {
+		if raw[index] < '0' || raw[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parsePositiveIDField parses a required positive decimal body field.
