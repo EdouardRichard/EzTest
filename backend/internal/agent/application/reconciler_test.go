@@ -457,7 +457,7 @@ func TestReconcilerDoesNotEnqueueLegacyAttachmentIngest(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	for _, ensured := range fixture.queue.ensured() {
-		if ensured == agentapp.WorkTypeAttachmentIngest+":attachment:9001" {
+		if ensured == "attachment.ingest:attachment:9001" {
 			t.Fatalf("legacy attachment.ingest work item was enqueued: %v", fixture.queue.ensured())
 		}
 	}

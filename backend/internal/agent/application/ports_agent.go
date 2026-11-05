@@ -241,7 +241,6 @@ func ProfileKeyForConversationKind(kind string) (string, bool) {
 const (
 	WorkTypeChatTurn          = "chat.turn"
 	WorkTypeRequirementCurate = "requirement.curate"
-	WorkTypeAttachmentIngest  = "attachment.ingest"
 )
 
 // P2 design work item types (contracts/task-types.md P2 increment).

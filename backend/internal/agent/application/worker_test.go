@@ -531,7 +531,7 @@ func TestWorkerRespectsConcurrencyLimit(t *testing.T) {
 	items := []agent.WorkItem{
 		fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20}),
 		fakeWorkItem(agentapp.WorkTypeRequirementCurate, agentapp.WorkItemPayload{ConversationID: 20}),
-		fakeWorkItem(agentapp.WorkTypeAttachmentIngest, agentapp.WorkItemPayload{AttachmentID: 9001}),
+		fakeWorkItem(agentapp.WorkTypeDesignGap, agentapp.WorkItemPayload{}),
 	}
 	for i := range items {
 		items[i].ID = int64(1000 + i)

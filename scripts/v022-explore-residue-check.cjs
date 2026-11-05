@@ -10,13 +10,10 @@
  *   2. backend Go code still writes exploration facts with the removed
  *      `Source: "explorer"` label instead of the P9 runtime label `"p9"`.
  *
- * WorkTypeAttachmentIngest: W0 moved attachment extraction to the deterministic
- * server pipeline (the reconciler no longer enqueues the agent work item), but
- * the legacy symbol and its fail-closed runner branches are still referenced at
- * this baseline, so an identifier-only "must not appear" check cannot pass
- * without deleting live code. W1-6 is scoped to residue, not to that deletion;
- * this gate therefore rejects only the dead shape the plan names: a constant
- * that is declared and referenced nowhere else.
+ * WorkTypeAttachmentIngest: v0.22 R-W1-5 moved attachment extraction to the
+ * deterministic server pipeline and deleted the Host `attachment.ingest` work
+ * item path. The legacy symbol must therefore have zero references anywhere in
+ * backend Go code (the plan's literal identifier check).
  *
  * Dependency-free (node:fs / node:path only). Exit 0 = clean, 1 = residue.
  */
@@ -46,7 +43,7 @@ apiText.split(/\r?\n/).forEach((line, index) => {
 })
 
 // ---------------------------------------------------------------------------
-// 2. Backend Go: legacy explorer fact source (and an unused ingest constant).
+// 2. Backend Go: legacy explorer fact source and the deleted ingest work item.
 // ---------------------------------------------------------------------------
 function walk(dir) {
   const files = []
@@ -64,22 +61,16 @@ function walk(dir) {
 
 const backendDir = path.join(root, "backend")
 const goFiles = walk(backendDir)
-const ingestFiles = []
 for (const file of goFiles) {
   const text = fs.readFileSync(file, "utf8")
-  if (text.includes("WorkTypeAttachmentIngest")) ingestFiles.push(file)
   text.split(/\r?\n/).forEach((line, index) => {
+    if (line.includes("WorkTypeAttachmentIngest")) {
+      report(file, index + 1, "deleted WorkTypeAttachmentIngest work item path")
+    }
     if (/Source:\s*"explorer"/.test(line)) {
       report(file, index + 1, 'legacy Source: "explorer" (use "p9")')
     }
   })
-}
-// The constant is only residue when nothing references it any more. A
-// declaration in ports_agent.go plus zero references elsewhere is dead code;
-// live references mean the deterministic attachment ingest still owns it.
-const ingestReferenced = ingestFiles.some((file) => path.basename(file) !== "ports_agent.go")
-if (ingestFiles.length > 0 && !ingestReferenced) {
-  report(ingestFiles[0], 1, "unused WorkTypeAttachmentIngest constant")
 }
 
 // ---------------------------------------------------------------------------

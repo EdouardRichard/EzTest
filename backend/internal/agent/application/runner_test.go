@@ -331,7 +331,7 @@ func TestRunnerHostToolCallWritesRequirementCard(t *testing.T) {
 func TestRunnerRejectsRemovedBackgroundWorkTypes(t *testing.T) {
 	for _, workType := range []string{
 		agentapp.WorkTypeRequirementCurate,
-		agentapp.WorkTypeAttachmentIngest,
+		"attachment.ingest",
 		agentapp.WorkTypeDesignRound,
 		agentapp.WorkTypeDesignDataPlan,
 		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
@@ -809,7 +809,7 @@ func TestRunnerAcceptsConversationKinds(t *testing.T) {
 	// Removed profiles/work types fail closed instead of resolving a deleted
 	// seed (v0.22 D-B1/R-W1-5).
 	for _, removed := range []string{
-		agentapp.WorkTypeRequirementCurate, agentapp.WorkTypeAttachmentIngest,
+		agentapp.WorkTypeRequirementCurate, "attachment.ingest",
 		agentapp.WorkTypeDesignRound, agentapp.WorkTypeDesignDataPlan,
 		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
 	} {
@@ -982,7 +982,7 @@ func TestProfileKeyForWorkType(t *testing.T) {
 	}
 	// The removed clarification Curator/Scout work types no longer map to a
 	// deleted profile.
-	for _, removed := range []string{agentapp.WorkTypeRequirementCurate, agentapp.WorkTypeAttachmentIngest} {
+	for _, removed := range []string{agentapp.WorkTypeRequirementCurate} {
 		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
 			t.Fatalf("removed work type %q still maps to a profile", removed)
 		}

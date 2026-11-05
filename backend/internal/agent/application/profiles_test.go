@@ -241,7 +241,7 @@ func TestProfileKeyForWorkTypeP2(t *testing.T) {
 	// The Planner/Curator/Scout work types were removed with their profiles.
 	for _, removed := range []string{
 		agentapp.WorkTypeDesignRound, agentapp.WorkTypeDesignDataPlan,
-		agentapp.WorkTypeRequirementCurate, agentapp.WorkTypeAttachmentIngest,
+		agentapp.WorkTypeRequirementCurate, "attachment.ingest",
 	} {
 		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
 			t.Fatalf("removed work type %q still maps to a profile", removed)

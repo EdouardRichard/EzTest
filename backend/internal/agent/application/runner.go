@@ -1177,23 +1177,6 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
 
-	attachmentText := ""
-	if state.item.Type == WorkTypeAttachmentIngest {
-		if r.attachments == nil {
-			return errors.New("agent runner has no attachment reader")
-		}
-		attachment, err := r.attachments.GetAttachment(ctx, state.item.VersionID, state.payload.AttachmentID)
-		if err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-		}
-		attachmentText = attachmentUserText(attachment)
-		state.input.Conversation.RecentMessages = append(state.input.Conversation.RecentMessages, Message{
-			ID:      attachment.ID,
-			Role:    "user",
-			Content: attachmentUserText(attachment),
-		})
-	}
-
 	// P5/P7 compose the P1–P4 registry with the codeintel/visual/knowledge tool
 	// groups; the profile allowed_tools still select the surface each run may
 	// call, and R51 intersects that surface with the profile role's whitelist.
@@ -1213,7 +1196,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	// threshold accounts for it (Task 80 moved the per-work-item task context
 	// into this turn, outside the assembler packet), and it is the exact text
 	// handleOverflow re-appends after a boundary rebuild.
-	state.userContent = r.userMessage(ctx, state, attachmentText)
+	state.userContent = r.userMessage(ctx, state)
 
 	// Task 48 cache-first prompt: the assembler renders the byte-stable prefix
 	// and the append-only suffix once per run (and again only at a declared
@@ -2346,15 +2329,6 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			AcceptanceCriteria: []string{"工具结果包含 requirement_id/revision/status", "用简短文本说明草案变化"},
 			Scope:              scope,
 		}
-	case WorkTypeAttachmentIngest:
-		ingestScope := append(scope, "attachment_id="+idText(state.payload.AttachmentID))
-		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               "总结附件中的关键事实、约束、风险与需要澄清的问题。",
-			Constraints:        []string{"只读附件与上下文", "不修改需求、不确认、不删除"},
-			AcceptanceCriteria: []string{"输出精简 finding 并引用附件名", "列出至少一个待澄清问题（如有）"},
-			Scope:              ingestScope,
-		}
 	case WorkTypeDesignRound:
 		roundRequirementIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_ids")
 		roundRequirementVersionIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_version_ids")
@@ -2477,16 +2451,14 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 // context is per-work-item data, so it belongs to the append-only user suffix,
 // not the cache-stable system prefix; rendering it here keeps goal, constraints,
 // acceptance and scope in front of the model without breaking the shared prefix.
-func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentText string) string {
-	return taskContextMessage(r.baseUserMessage(ctx, state, attachmentText), state.input)
+func (r *Runner) userMessage(ctx context.Context, state *runState) string {
+	return taskContextMessage(r.baseUserMessage(ctx, state), state.input)
 }
 
 // baseUserMessage renders the triggering user content without the per-work-item
 // task context block.
-func (r *Runner) baseUserMessage(ctx context.Context, state *runState, attachmentText string) string {
+func (r *Runner) baseUserMessage(ctx context.Context, state *runState) string {
 	switch state.item.Type {
-	case WorkTypeAttachmentIngest:
-		return attachmentText
 	case WorkTypeChatTurn, WorkTypeRequirementCurate:
 		if state.payload.MessageID > 0 && r.conversation != nil {
 			message, err := r.conversation.GetMessage(ctx, state.item.VersionID, state.payload.ConversationID, state.payload.MessageID)
