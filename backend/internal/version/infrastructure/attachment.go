@@ -387,6 +387,25 @@ func (r *AttachmentRepository) MarkImageFailed(ctx context.Context, imageID int6
 	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image failed")
 }
 
+// MarkImageSkipped writes the row back to skipped with the reason it was left
+// out of vision analysis, clearing any caption so a skipped row never exposes a
+// previously analyzed caption. The reanalyze path uses it to apply the vision
+// image caps after ResetImagesForReanalysis re-queued every limit-skipped row.
+func (r *AttachmentRepository) MarkImageSkipped(ctx context.Context, imageID int64, reason string, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE attachment_image
+		SET status = 'skipped', caption = '', error = $2, updated_at = $3
+		WHERE id = $1
+	`, imageID, reason, updatedAt)
+	if err != nil {
+		return fmt.Errorf("mark attachment image skipped: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image skipped")
+}
+
 // ResetImagesForReanalysis re-queues failed/skipped rows as extracted and
 // clears caption/error. The content reference is preserved, so reanalyze never
 // creates a duplicate content object.

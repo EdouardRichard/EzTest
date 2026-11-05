@@ -103,6 +103,21 @@ func (f *fakeAttachmentRepo) MarkImageFailed(_ context.Context, imageID int64, m
 	return nil
 }
 
+func (f *fakeAttachmentRepo) MarkImageSkipped(_ context.Context, imageID int64, reason string, updatedAt time.Time) error {
+	image, ok := f.images[imageID]
+	if !ok {
+		return version.ErrAttachmentNotFound
+	}
+	image.Status = version.AttachmentImageSkipped
+	// A skipped row must never expose a previously stored analyzed caption.
+	image.Caption = ""
+	image.Error = reason
+	image.UpdatedAt = updatedAt
+	f.images[imageID] = image
+	f.imageStatusLog = append(f.imageStatusLog, idString(int64(image.Seq))+":"+image.Status)
+	return nil
+}
+
 func (f *fakeAttachmentRepo) ResetImagesForReanalysis(_ context.Context, attachmentID int64, updatedAt time.Time) (int64, error) {
 	var reset int64
 	for id, image := range f.images {

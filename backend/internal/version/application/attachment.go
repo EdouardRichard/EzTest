@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -738,6 +739,10 @@ func (s *AttachmentService) ListImages(ctx context.Context, attachmentID int64) 
 // attachment. Failed/skipped rows are reset in place (no duplicate rows or
 // content objects) and rows already sitting in the extracted state are analyzed
 // too, so a crash between the reset and the vision calls is recoverable. The
+// vision.max_images_per_attachment and vision.max_image_bytes caps are applied
+// again on this path, ordered by seq, because the reset re-queues rows the
+// extraction had skipped for exactly those limits; the excess rows are written
+// back as skipped with the limit as their reason and never reach the model. The
 // attachment returns to done only when at least one row was analyzed and every
 // image succeeded. Without a vision model the call is rejected with the same
 // typed ErrVisionRequired as the send path, so the UI can point at the missing
@@ -772,15 +777,30 @@ func (s *AttachmentService) Reanalyze(ctx context.Context, attachmentID int64) (
 	if err != nil {
 		return nil, mapAttachmentRepositoryError(err)
 	}
+	// The caps are re-applied deterministically in seq order: the reset above
+	// re-queued rows the extraction skipped for the limits, so trusting the row
+	// status would send cap-excluded images to the model on every retry.
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Seq < rows[j].Seq })
+	maxImages := s.visionMaxImages(ctx)
+	maxImageBytes := s.visionMaxImageBytes(ctx)
 	failures := 0
 	analyzed := 0
 	firstFailure := ""
-	for _, image := range rows {
+	for index, image := range rows {
 		if image.Status != version.AttachmentImageExtracted {
 			continue
 		}
+		if index >= maxImages {
+			skipReason := fmt.Sprintf(
+				"image %d of %d skipped: attachment exceeds %s (max %d images)",
+				image.Seq, len(rows), SettingMaxImagesPerAttachment, maxImages)
+			if err := s.repo.MarkImageSkipped(ctx, image.ID, skipReason, s.clock.Now()); err != nil {
+				return nil, mapAttachmentRepositoryError(err)
+			}
+			continue
+		}
 		analyzed++
-		if err := s.analyzeExtractedImage(ctx, attachment, image); err != nil {
+		if err := s.analyzeExtractedImage(ctx, attachment, image, maxImageBytes); err != nil {
 			failures++
 			if firstFailure == "" {
 				firstFailure = err.Error()
@@ -1287,8 +1307,10 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		imageStatus = version.AttachmentImageSkipped
 		imageSkipReason = visionUnavailableMessage(visionReason)
 	}
+	maxImages := s.visionMaxImages(ctx)
+	maxImageBytes := s.visionMaxImageBytes(ctx)
 	imageRows, err := s.persistExtractedImages(ctx, attachment, parsed.Images, imageStatus, imageSkipReason,
-		s.visionMaxImages(ctx), s.visionMaxImageBytes(ctx))
+		maxImages, maxImageBytes)
 	if err != nil {
 		return ExtractionResult{}, err
 	}
@@ -1304,7 +1326,7 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 			if image.Status != version.AttachmentImageExtracted {
 				continue
 			}
-			if err := s.analyzeExtractedImage(ctx, attachment, image); err != nil {
+			if err := s.analyzeExtractedImage(ctx, attachment, image, maxImageBytes); err != nil {
 				failures++
 				if firstFailure == "" {
 					firstFailure = err.Error()
@@ -1506,8 +1528,12 @@ func (s *AttachmentService) persistExtractedImages(ctx context.Context, attachme
 // the caption, appends the attachment_image_caption fact and only then emits
 // attachment.image.analyzed (a consumer must never observe an analyzed image
 // whose caption fact was not persisted); any failure marks the image failed
-// with the reason (clearing the caption) and emits attachment.image.failed.
-func (s *AttachmentService) analyzeExtractedImage(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord) error {
+// with the reason (clearing the caption) and emits attachment.image.failed. An
+// image whose actual bytes exceed maxImageBytes is written back as skipped with
+// the limit and size in the reason and is never sent to the model, so the byte
+// cap holds on every path (Extract and Reanalyze), not only where the rows are
+// first persisted.
+func (s *AttachmentService) analyzeExtractedImage(ctx context.Context, attachment version.Attachment, image version.AttachmentImageRecord, maxImageBytes int64) error {
 	now := s.clock.Now()
 	started, err := s.repo.MarkImageAnalyzing(ctx, image.ID, now)
 	if err != nil {
@@ -1522,6 +1548,12 @@ func (s *AttachmentService) analyzeExtractedImage(ctx context.Context, attachmen
 	sha256, data, err := s.loadImageBytes(ctx, attachment.ID, image.ContentRefID)
 	if err != nil {
 		return s.failAnalyzedImage(ctx, attachment, image, err)
+	}
+	if maxImageBytes > 0 && int64(len(data)) > maxImageBytes {
+		skipReason := fmt.Sprintf(
+			"image %d skipped: %d bytes exceeds %s (max %d bytes)",
+			image.Seq, len(data), SettingMaxImageBytes, maxImageBytes)
+		return mapAttachmentRepositoryError(s.repo.MarkImageSkipped(ctx, image.ID, skipReason, s.clock.Now()))
 	}
 	caption, err := s.vision.Caption(ctx, image.MIME, data)
 	if err != nil {

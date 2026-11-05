@@ -234,6 +234,11 @@ type AttachmentRepository interface {
 	// MarkImageFailed stores the failure reason and clears any caption written
 	// before the failure, so a failed row never exposes a stale caption.
 	MarkImageFailed(ctx context.Context, imageID int64, message string, updatedAt time.Time) error
+	// MarkImageSkipped writes a row back to skipped with the reason it was
+	// excluded from vision analysis. Reanalyze uses it to deterministically
+	// re-apply the vision image caps after ResetImagesForReanalysis re-queued
+	// every limit-skipped row.
+	MarkImageSkipped(ctx context.Context, imageID int64, reason string, updatedAt time.Time) error
 	// ResetImagesForReanalysis re-queues failed/skipped image rows as extracted,
 	// clearing caption/error. The content reference is preserved, so a reanalyze
 	// never creates a duplicate content object. It returns how many rows were

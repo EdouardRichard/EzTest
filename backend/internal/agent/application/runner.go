@@ -34,7 +34,9 @@ const (
 	defaultHardSeconds        = 600
 	defaultToolResultMaxBytes = 32768
 	// defaultToolRetryMax/defaultOverflowRetries mirror the catalog defaults so
-	// an unwired settings reader behaves as before W1-2.
+	// an unwired settings reader keeps retrying tools and rescuing overflow.
+	// Tool retry keeps the pre-W1-2 default of 2; overflow is 1 per spec ST-5
+	// (the old hard-coded 2 was drift, not intended behavior).
 	defaultToolRetryMax      = 2
 	defaultOverflowRetries   = 1
 	finishTimeout            = 5 * time.Second
