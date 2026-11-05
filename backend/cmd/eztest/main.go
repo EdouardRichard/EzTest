@@ -1336,6 +1336,9 @@ func main() {
 		// A cancelled wave is terminal; notify the stage machine so
 		// executing -> reporting is not stranded.
 		StageNotifier: stageCallbacks,
+		// W1-14A: a cancelled wave is terminal too, so it runs the same
+		// discovery-delta pass as the scheduler's done/failed paths.
+		Delta: discoveryDeltaEvaluator,
 	})
 	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
 		Intents:  executionRepo.Intents,

@@ -366,7 +366,8 @@ func TestDiscoverySUTHostResolverIncludesBaseURLAndPages(t *testing.T) {
 }
 
 // TestDiscoveryObservationListByVersion covers the W1-14A read API query: the
-// full DB-29 projection, the optional wave/kind/decision filters, the
+// DB-29 read projection (including source_kind/created_at/updated_at; the
+// fingerprint stays DB-only), the optional wave/kind/decision filters, the
 // first_seen_at DESC, id DESC order and the limit<=0 "no limit" contract used by
 // the coverage aggregation.
 func TestDiscoveryObservationListByVersion(t *testing.T) {
@@ -410,11 +411,13 @@ func TestDiscoveryObservationListByVersion(t *testing.T) {
 	if page.Kind != "page" || page.Method != "" || page.Host != "shop.example.com" ||
 		page.ResourceTemplate != "/orders/{id}" || page.MIME != "text/html" ||
 		page.StatusCode == nil || *page.StatusCode != 200 || page.Occurrences != 2 ||
-		page.Decision != "new" || page.WaveID == nil || *page.WaveID != 9201 ||
+		page.Decision != "new" || page.SourceKind != "execution" ||
+		page.WaveID == nil || *page.WaveID != 9201 ||
 		page.CaseRunID == nil || *page.CaseRunID != 3201 ||
 		page.EnvironmentID == nil || *page.EnvironmentID != environmentID ||
 		page.ResourceID != nil || page.FactID != nil ||
-		page.FirstSeenAt.IsZero() || page.LastSeenAt.IsZero() {
+		page.FirstSeenAt.IsZero() || page.LastSeenAt.IsZero() ||
+		page.CreatedAt.IsZero() || page.UpdatedAt.IsZero() {
 		t.Fatalf("page row = %+v", page)
 	}
 

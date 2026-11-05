@@ -54,10 +54,12 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
   当前 wave 冻结、新 approved 资源只在下一 wave 生效）；
 - 执行期探索只读面（W1-14A/API-36/37/39/40，inline schema）：
   `GET /api/versions/{id}/discovery/observations`（DB-29 观测，ID 为十进制字符串，
-  `limit` 默认 50、数值越界 clamp 到 1..200）、`GET .../discovery/deltas`（五类计数 +
-  精简来源）、`GET .../coverage`（发现侧覆盖矩阵，uncovered 为 proposed 模板，
-  去重/升序/最多 200；case 覆盖 T14 属 W2）、`GET .../gaps`（current kind=gap 事实，
-  空数组而非 404）；
+  `limit` 默认 50、数值越界 clamp 到 1..200，含 source_kind/created_at/updated_at）、
+  `GET .../discovery/deltas`（五类计数 + 精简来源）、`GET .../coverage`（发现侧覆盖矩阵：
+  observed 按模板去重，uncovered 为 proposed 资源身份（API 为 `METHOD template`、page
+  为 template），去重/升序/最多 200；case 覆盖 T14 属 W2）、`GET .../gaps`
+  （current kind=gap 事实，共用 httpx.List 信封 data/next_cursor/has_more，空数组而非
+  404，100 行上限时 has_more=true）；
 - 对应 DTO/schema 与 `kind`/`revision` 等可选字段。
 
 ## 验证

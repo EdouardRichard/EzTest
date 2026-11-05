@@ -58,6 +58,7 @@ func discoveryIntPtr(value int) *int { return &value }
 func discoveryObservationRows() []executionapp.DiscoveryObservationRow {
 	firstSeen := time.Date(2026, 11, 5, 6, 0, 0, 0, time.UTC)
 	lastSeen := firstSeen.Add(2 * time.Minute)
+	created := firstSeen.Add(-time.Second)
 	return []executionapp.DiscoveryObservationRow{
 		{
 			ID:               375994775003729921,
@@ -71,12 +72,15 @@ func discoveryObservationRows() []executionapp.DiscoveryObservationRow {
 			ResourceTemplate: "/orders/{id}",
 			StatusCode:       discoveryIntPtr(200),
 			MIME:             "text/html",
+			SourceKind:       "execution",
 			Occurrences:      3,
 			Decision:         "proposed",
 			ResourceID:       discoveryInt64Ptr(11),
 			FactID:           discoveryInt64Ptr(21),
 			FirstSeenAt:      firstSeen,
 			LastSeenAt:       lastSeen,
+			CreatedAt:        created,
+			UpdatedAt:        lastSeen,
 		},
 		{
 			ID:               1002,
@@ -90,10 +94,13 @@ func discoveryObservationRows() []executionapp.DiscoveryObservationRow {
 			ResourceTemplate: "/api/orders/{id}",
 			StatusCode:       discoveryIntPtr(200),
 			MIME:             "application/json",
+			SourceKind:       "execution",
 			Occurrences:      5,
 			Decision:         "new",
 			FirstSeenAt:      firstSeen,
 			LastSeenAt:       lastSeen,
+			CreatedAt:        created,
+			UpdatedAt:        lastSeen,
 		},
 	}
 }
@@ -215,6 +222,15 @@ func TestDiscoveryObservationsReadAPI(t *testing.T) {
 	}
 	if _, ok := item["last_seen_at"].(string); !ok {
 		t.Fatalf("last_seen_at = %T %v, want a timestamp string", item["last_seen_at"], item["last_seen_at"])
+	}
+	if item["source_kind"] != "execution" {
+		t.Fatalf("source_kind = %T %v, want execution", item["source_kind"], item["source_kind"])
+	}
+	if _, ok := item["created_at"].(string); !ok {
+		t.Fatalf("created_at = %T %v, want a timestamp string", item["created_at"], item["created_at"])
+	}
+	if _, ok := item["updated_at"].(string); !ok {
+		t.Fatalf("updated_at = %T %v, want a timestamp string", item["updated_at"], item["updated_at"])
 	}
 
 	// Nullable provenance columns keep their null meaning instead of a bogus id.
@@ -392,7 +408,7 @@ func TestDiscoveryCoverageReadAPI(t *testing.T) {
 	if !ok {
 		t.Fatalf("pages = %T %v, want an object", data["pages"], data["pages"])
 	}
-	wantCounts := map[string]string{"observed": "6", "proposed": "2", "approved": "1", "rejected": "1", "out_of_scope": "1"}
+	wantCounts := map[string]string{"observed": "5", "proposed": "2", "approved": "1", "rejected": "1", "out_of_scope": "1"}
 	for field, want := range wantCounts {
 		value, ok := pages[field].(json.Number)
 		if !ok || value.String() != want {
@@ -412,7 +428,7 @@ func TestDiscoveryCoverageReadAPI(t *testing.T) {
 		t.Fatalf("apis.observed = %T %v, want 2", apis["observed"], apis["observed"])
 	}
 	apiUncovered, ok := apis["uncovered"].([]any)
-	if !ok || len(apiUncovered) != 1 || apiUncovered[0] != "/api/orders/{id}" {
+	if !ok || len(apiUncovered) != 1 || apiUncovered[0] != "GET /api/orders/{id}" {
 		t.Fatalf("apis.uncovered = %T %v", apis["uncovered"], apis["uncovered"])
 	}
 
@@ -420,6 +436,52 @@ func TestDiscoveryCoverageReadAPI(t *testing.T) {
 	query := handler.deps.Discovery.(*fakeDiscoveryQuery)
 	if len(query.calls) != 1 || query.calls[0].limit != 0 || query.calls[0].versionID != 7 {
 		t.Fatalf("coverage repository call = %+v", query.calls)
+	}
+}
+
+// TestDiscoveryCoverageDedupesObservedAndKeepsMethod pins the fix-round
+// semantics: observed counts distinct resource templates (not rows), an API
+// uncovered entry keeps its METHOD so GET and POST on the same path are two
+// resources (R-EX-2 identity), a page entry stays template-only, and an unknown
+// kind is skipped instead of panicking.
+func TestDiscoveryCoverageDedupesObservedAndKeepsMethod(t *testing.T) {
+	rows := []executionapp.DiscoveryObservationRow{
+		{ID: 1, VersionSUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders", Decision: "proposed"},
+		{ID: 2, VersionSUTID: 5001, Kind: "api", Method: "POST", ResourceTemplate: "/api/orders", Decision: "proposed"},
+		{ID: 3, VersionSUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders", Decision: "approved"},
+		{ID: 4, VersionSUTID: 5001, Kind: "page", Method: "GET", ResourceTemplate: "/orders", Decision: "proposed"},
+		{ID: 5, VersionSUTID: 5001, Kind: "page", Method: "", ResourceTemplate: "/orders", Decision: "proposed"},
+		// Defensive guard: an unknown kind can never panic the aggregation.
+		{ID: 6, VersionSUTID: 5001, Kind: "document", Method: "", ResourceTemplate: "/doc", Decision: "proposed"},
+	}
+	handler := newDiscoveryHandlerFixture(rows)
+
+	got := getDiscovery(handler, "7", "coverage", "")
+	t.Logf("GET coverage (dedupe/method) -> %d %s", got.Code, got.Body.String())
+	if got.Code != http.StatusOK {
+		t.Fatalf("coverage = %d body=%s, want 200", got.Code, got.Body.String())
+	}
+	data := decodeDiscoveryData(t, got)
+	pages := data["pages"].(map[string]any)
+	if value, ok := pages["observed"].(json.Number); !ok || value.String() != "1" {
+		t.Fatalf("pages.observed = %T %v, want 1 distinct template", pages["observed"], pages["observed"])
+	}
+	pageUncovered, ok := pages["uncovered"].([]any)
+	if !ok || len(pageUncovered) != 1 || pageUncovered[0] != "/orders" {
+		t.Fatalf("pages.uncovered = %T %v, want [/orders] (template only)", pages["uncovered"], pages["uncovered"])
+	}
+
+	apis := data["apis"].(map[string]any)
+	if value, ok := apis["observed"].(json.Number); !ok || value.String() != "1" {
+		t.Fatalf("apis.observed = %T %v, want 1 distinct template", apis["observed"], apis["observed"])
+	}
+	if value, ok := apis["proposed"].(json.Number); !ok || value.String() != "2" {
+		t.Fatalf("apis.proposed = %T %v, want 2 rows", apis["proposed"], apis["proposed"])
+	}
+	apiUncovered, ok := apis["uncovered"].([]any)
+	if !ok || len(apiUncovered) != 2 ||
+		apiUncovered[0] != "GET /api/orders" || apiUncovered[1] != "POST /api/orders" {
+		t.Fatalf("apis.uncovered = %T %v, want [GET /api/orders POST /api/orders]", apis["uncovered"], apis["uncovered"])
 	}
 }
 

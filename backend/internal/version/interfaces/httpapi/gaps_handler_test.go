@@ -3,18 +3,26 @@ package versionapi_test
 // W1-14A (spec R-EX-5, API-40): GET /api/versions/{id}/gaps exposes the current
 // version_fact rows of kind=gap. It reuses the version facts read model
 // (include_superseded=false), so gaps are current facts only and a version with
-// no gap answers an empty array instead of 404. Every id is a decimal string.
+// no gap answers an empty data array instead of 404. Fix round 1: the endpoint
+// uses the shared httpx.List envelope (data array plus next_cursor/has_more), so
+// it is shaped like the sibling facts route; the 100-row cap surfaces as
+// has_more=true.
 
 import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	versionapi "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 )
+
+type gapsEnvelope struct {
+	Data       []map[string]any `json:"data"`
+	NextCursor string           `json:"next_cursor"`
+	HasMore    bool             `json:"has_more"`
+}
 
 func getVersionGaps(handler *versionapi.VersionReadHandler, versionID string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(http.MethodGet, "/api/versions/"+versionID+"/gaps", nil)
@@ -24,15 +32,13 @@ func getVersionGaps(handler *versionapi.VersionReadHandler, versionID string) *h
 	return recorder
 }
 
-func decodeGapsData(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {
+func decodeGapsEnvelope(t *testing.T, recorder *httptest.ResponseRecorder) gapsEnvelope {
 	t.Helper()
-	var envelope struct {
-		Data map[string]any `json:"data"`
-	}
+	var envelope gapsEnvelope
 	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
 		t.Fatalf("decode body %s: %v", recorder.Body.String(), err)
 	}
-	return envelope.Data
+	return envelope
 }
 
 func TestGapsReadAPI(t *testing.T) {
@@ -57,12 +63,11 @@ func TestGapsReadAPI(t *testing.T) {
 	if got.Code != http.StatusOK {
 		t.Fatalf("gaps = %d body=%s, want 200", got.Code, got.Body.String())
 	}
-	data := decodeGapsData(t, got)
-	raw, ok := data["items"].([]any)
-	if !ok || len(raw) != 1 {
-		t.Fatalf("items = %T %v, want one entry", data["items"], data["items"])
+	envelope := decodeGapsEnvelope(t, got)
+	if len(envelope.Data) != 1 {
+		t.Fatalf("data = %T %v, want one entry", envelope.Data, envelope.Data)
 	}
-	item := raw[0].(map[string]any)
+	item := envelope.Data[0]
 	if item["fact_id"] != "102" {
 		t.Fatalf("fact_id = %T %v, want the decimal string 102", item["fact_id"], item["fact_id"])
 	}
@@ -79,14 +84,20 @@ func TestGapsReadAPI(t *testing.T) {
 	if _, ok := item["created_at"].(string); !ok {
 		t.Fatalf("created_at = %T %v, want a timestamp string", item["created_at"], item["created_at"])
 	}
+	// The envelope carries the shared pagination fields even when there is no
+	// next page, exactly like the sibling facts route.
+	if envelope.NextCursor != "" || envelope.HasMore {
+		t.Fatalf("next_cursor/has_more = %q/%v, want empty/false", envelope.NextCursor, envelope.HasMore)
+	}
 
-	// The gap list reuses the current-only facts read with kind=gap.
+	// The gap list reuses the current-only facts read with kind=gap and the
+	// 100-row cap.
 	if model.factCalls != 1 {
 		t.Fatalf("facts calls = %d, want 1", model.factCalls)
 	}
 	filter := model.factQuery[0]
-	if filter.Kind != "gap" || filter.IncludeSuperseded {
-		t.Fatalf("facts filter = %+v, want kind=gap and current facts only", filter)
+	if filter.Kind != "gap" || filter.IncludeSuperseded || filter.Limit != 100 {
+		t.Fatalf("facts filter = %+v, want kind=gap, current facts only and limit=100", filter)
 	}
 }
 
@@ -99,8 +110,41 @@ func TestGapsReadAPIEmptyIsArray(t *testing.T) {
 	if got.Code != http.StatusOK {
 		t.Fatalf("gaps = %d body=%s, want 200", got.Code, got.Body.String())
 	}
-	if body := got.Body.String(); !strings.Contains(body, `"items":[]`) {
-		t.Fatalf("body = %s, want an empty items array (not 404)", body)
+	envelope := decodeGapsEnvelope(t, got)
+	if envelope.Data == nil || len(envelope.Data) != 0 {
+		t.Fatalf("data = %T %v, want an empty array (not 404/null)", envelope.Data, envelope.Data)
+	}
+	if envelope.NextCursor != "" || envelope.HasMore {
+		t.Fatalf("next_cursor/has_more = %q/%v, want empty/false", envelope.NextCursor, envelope.HasMore)
+	}
+}
+
+// TestGapsReadAPICapReportsHasMore pins the 100-row cap: the truncated page
+// carries has_more=true and the last returned id as next_cursor, matching the
+// sibling facts envelope.
+func TestGapsReadAPICapReportsHasMore(t *testing.T) {
+	model := &fakeVersionReadModel{exists: true, factsMore: true}
+	for index := 0; index < 100; index++ {
+		model.facts = append(model.facts, versionapp.FactReadView{
+			ID: int64(index + 1), VersionID: 7, Kind: "gap", Key: "gap", CreatedAt: testTime,
+		})
+	}
+	handler := versionapi.NewVersionReadHandler(model, nil)
+
+	got := getVersionGaps(handler, "7")
+	t.Logf("GET gaps capped -> %d", got.Code)
+	if got.Code != http.StatusOK {
+		t.Fatalf("gaps = %d body=%s, want 200", got.Code, got.Body.String())
+	}
+	envelope := decodeGapsEnvelope(t, got)
+	if len(envelope.Data) != 100 {
+		t.Fatalf("data = %d items, want the 100 cap", len(envelope.Data))
+	}
+	if !envelope.HasMore {
+		t.Fatalf("has_more = false, want true at the 100-row cap")
+	}
+	if envelope.NextCursor != "100" {
+		t.Fatalf("next_cursor = %q, want the last id %q", envelope.NextCursor, "100")
 	}
 }
 

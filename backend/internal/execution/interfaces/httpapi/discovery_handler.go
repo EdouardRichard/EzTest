@@ -61,6 +61,7 @@ type DiscoveryObservationView struct {
 	ResourceTemplate string  `json:"resource_template"`
 	StatusCode       *int    `json:"status_code"`
 	MIME             string  `json:"mime"`
+	SourceKind       string  `json:"source_kind"`
 	Occurrences      int     `json:"occurrences"`
 	Decision         string  `json:"decision"`
 	WaveID           *string `json:"wave_id"`
@@ -71,6 +72,8 @@ type DiscoveryObservationView struct {
 	FactID           *string `json:"fact_id"`
 	FirstSeenAt      string  `json:"first_seen_at"`
 	LastSeenAt       string  `json:"last_seen_at"`
+	CreatedAt        string  `json:"created_at"`
+	UpdatedAt        string  `json:"updated_at"`
 }
 
 // DiscoveryObservationListView is the observations envelope payload.
@@ -242,19 +245,29 @@ func (h *Handler) DiscoveryCoverage(w http.ResponseWriter, r *http.Request) {
 		Pages: DiscoveryCoverageBucket{Uncovered: []string{}},
 		APIs:  DiscoveryCoverageBucket{Uncovered: []string{}},
 	}
+	// observed counts distinct resource templates per kind (a repeated
+	// observation row is the same discovery resource), never raw row counts.
+	observed := map[string]map[string]struct{}{"page": {}, "api": {}}
 	uncovered := map[string]map[string]struct{}{"page": {}, "api": {}}
 	for _, row := range rows {
-		bucket := &view.Pages
-		if row.Kind == "api" {
+		// DB-29 constrains kind to page|api, but a read model must never panic
+		// on unexpected data: skip an unknown kind instead of indexing a missing
+		// bucket.
+		var bucket *DiscoveryCoverageBucket
+		switch row.Kind {
+		case "page":
+			bucket = &view.Pages
+		case "api":
 			bucket = &view.APIs
+		default:
+			continue
 		}
-		bucket.Observed++
+		observed[row.Kind][strings.TrimSpace(row.ResourceTemplate)] = struct{}{}
 		switch row.Decision {
 		case discoveryDecisionProposed:
 			bucket.Proposed++
-			template := strings.TrimSpace(row.ResourceTemplate)
-			if template != "" {
-				uncovered[row.Kind][template] = struct{}{}
+			if identity := discoveryResourceIdentity(row); identity != "" {
+				uncovered[row.Kind][identity] = struct{}{}
 			}
 		case discoveryDecisionApproved:
 			bucket.Approved++
@@ -264,9 +277,29 @@ func (h *Handler) DiscoveryCoverage(w http.ResponseWriter, r *http.Request) {
 			bucket.OutOfScope++
 		}
 	}
+	view.Pages.Observed = len(observed["page"])
+	view.APIs.Observed = len(observed["api"])
 	view.Pages.Uncovered = sortedUncovered(uncovered["page"])
 	view.APIs.Uncovered = sortedUncovered(uncovered["api"])
 	httpx.JSON(w, http.StatusOK, view)
+}
+
+// discoveryResourceIdentity renders the R-EX-2 resource identity of an
+// uncovered observation: an API is "METHOD template" (GET and POST on the same
+// path are different resources), while a page is its template alone.
+func discoveryResourceIdentity(row executionapp.DiscoveryObservationRow) string {
+	template := strings.TrimSpace(row.ResourceTemplate)
+	if template == "" {
+		return ""
+	}
+	if row.Kind != "api" {
+		return template
+	}
+	method := strings.ToUpper(strings.TrimSpace(row.Method))
+	if method == "" {
+		method = "GET"
+	}
+	return method + " " + template
 }
 
 // discoveryFilters is the normalized query of the observations read.
@@ -362,6 +395,7 @@ func toDiscoveryObservationView(row executionapp.DiscoveryObservationRow) Discov
 		ResourceTemplate: row.ResourceTemplate,
 		StatusCode:       row.StatusCode,
 		MIME:             row.MIME,
+		SourceKind:       row.SourceKind,
 		Occurrences:      row.Occurrences,
 		Decision:         row.Decision,
 		WaveID:           formatOptionalRowID(row.WaveID),
@@ -372,6 +406,8 @@ func toDiscoveryObservationView(row executionapp.DiscoveryObservationRow) Discov
 		FactID:           formatOptionalRowID(row.FactID),
 		FirstSeenAt:      formatTime(row.FirstSeenAt),
 		LastSeenAt:       formatTime(row.LastSeenAt),
+		CreatedAt:        formatTime(row.CreatedAt),
+		UpdatedAt:        formatTime(row.UpdatedAt),
 	}
 }
 

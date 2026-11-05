@@ -121,8 +121,10 @@ func (h *VersionReadHandler) Facts(w http.ResponseWriter, r *http.Request) {
 
 // Gaps GET /api/versions/{id}/gaps. W1-14A / API-40 (spec R-EX-5): the current
 // version_fact rows of kind=gap. It reuses the current-only facts read
-// (include_superseded=false) and answers an empty items array when the version
-// has no gap, never a 404.
+// (include_superseded=false) and answers an empty data array when the version
+// has no gap, never a 404. It uses the shared httpx.List envelope
+// (data/next_cursor/has_more) like the sibling facts route; the 100-row cap
+// surfaces as has_more=true.
 func (h *VersionReadHandler) Gaps(w http.ResponseWriter, r *http.Request) {
 	versionID, err := versionReadPathID(r, "id")
 	if err != nil {
@@ -132,7 +134,7 @@ func (h *VersionReadHandler) Gaps(w http.ResponseWriter, r *http.Request) {
 	if !h.requireVersion(w, r, versionID) {
 		return
 	}
-	views, _, err := h.versions.Facts(r.Context(), versionID, versionapp.FactReadFilter{
+	views, hasMore, err := h.versions.Facts(r.Context(), versionID, versionapp.FactReadFilter{
 		Kind:  "gap",
 		Limit: maxGapReadLimit,
 	})
@@ -144,17 +146,13 @@ func (h *VersionReadHandler) Gaps(w http.ResponseWriter, r *http.Request) {
 	for _, view := range views {
 		items = append(items, toGapReadDTO(view))
 	}
-	httpx.JSON(w, http.StatusOK, gapReadListView{Items: items})
+	httpx.List(w, http.StatusOK, items, nextReadCursor(hasMore, lastReadID(views, factReadViewID)), hasMore)
 }
 
 // maxGapReadLimit bounds the gap list; the route is unpaginated because a
-// version's open gaps are a small, current-only set.
+// version's open gaps are a small, current-only set. A capped page reports
+// has_more=true.
 const maxGapReadLimit = 100
-
-// gapReadListView is the GET /api/versions/{id}/gaps envelope payload.
-type gapReadListView struct {
-	Items []gapReadDTO `json:"items"`
-}
 
 // gapReadDTO is the frozen gap projection (API-40): fact id/key/payload,
 // confidence and creation time.

@@ -286,13 +286,16 @@ info:
 
     R-EX-5 / API-36 / API-37 / API-39 / API-40（只读）：
     - 新增 `GET /api/versions/{id}/discovery/observations?kind=&decision=&wave_id=&limit=`
-      （DB-29 观测列表；ID 为十进制字符串，limit 默认 50、数值越界 clamp 到 1..200）。
+      （DB-29 观测列表；ID 为十进制字符串，limit 默认 50、数值越界 clamp 到 1..200；
+      DTO 含 source_kind/created_at/updated_at，fingerprint 不暴露）。
     - 新增 `GET /api/versions/{id}/discovery/deltas?wave_id=`
       （new/proposed/approved/rejected/out_of_scope 五类计数 + 精简来源项）。
-    - 新增 `GET /api/versions/{id}/coverage`（发现侧覆盖矩阵；uncovered 为
-      decision=proposed 的模板，去重/升序/最多 200；case 覆盖 T14 属 W2）。
+    - 新增 `GET /api/versions/{id}/coverage`（发现侧覆盖矩阵；observed 按模板去重，
+      uncovered 为 decision=proposed 的资源身份：API 为 `"METHOD template"`、
+      page 为 template，去重/升序/最多 200；case 覆盖 T14 属 W2）。
     - 新增 `GET /api/versions/{id}/gaps`（version_fact kind=gap 的 current 行；
-      无 gap 返回空数组，不是 404）。
+      共用 httpx.List 信封 data/next_cursor/has_more，无 gap 返回空数组，不是 404；
+      100 行上限时 has_more=true）。
     - `resource.delta` / `version.scope.snapshot_created` 的前端 SSE 消费属 W1-14B。
 
     ## 0.2.1 发布（2026-11-04）
@@ -3757,7 +3760,8 @@ paths:
         `limit` 默认 50；显式数值越界会 clamp 到 1..200（非数字 400）。
         排序为 `first_seen_at` 降序、`id` 降序；`count` 是本页返回条数。
         所有 ID 字段为十进制字符串；可空的来源列（wave/case_run/environment/
-        resource/fact）返回 `null` 而不是伪造 id。
+        resource/fact）返回 `null` 而不是伪造 id。`source_kind`、
+        `created_at`、`updated_at` 一并返回；fingerprint 仅存 DB，不对外暴露。
       parameters:
         - $ref: '#/components/parameters/ID'
         - name: kind
@@ -3812,9 +3816,9 @@ paths:
                           type: object
                           required:
                             [observation_id, kind, method, host, resource_template,
-                             status_code, mime, occurrences, decision, wave_id, case_run_id,
-                             version_sut_id, environment_id, resource_id, fact_id,
-                             first_seen_at, last_seen_at]
+                             status_code, mime, source_kind, occurrences, decision, wave_id,
+                             case_run_id, version_sut_id, environment_id, resource_id, fact_id,
+                             first_seen_at, last_seen_at, created_at, updated_at]
                           properties:
                             observation_id:
                               type: string
@@ -3833,6 +3837,9 @@ paths:
                               nullable: true
                             mime:
                               type: string
+                            source_kind:
+                              type: string
+                              enum: [execution, p9]
                             occurrences:
                               type: integer
                             decision:
@@ -3865,6 +3872,12 @@ paths:
                               type: string
                               format: date-time
                             last_seen_at:
+                              type: string
+                              format: date-time
+                            created_at:
+                              type: string
+                              format: date-time
+                            updated_at:
                               type: string
                               format: date-time
         '400':
@@ -3980,11 +3993,13 @@ paths:
       operationId: getVersionCoverage
       summary: 发现侧覆盖矩阵（API-39）
       description: |
-        R-EX-5 / W1。按 page/api 聚合该版本的执行期观测：`observed` 为观测条数
-        （已按模板去重），`proposed/approved/rejected/out_of_scope` 为对应决策
-        计数，`uncovered` 为 decision=proposed 的资源模板（去重、升序、最多 200
-        条）。本端点只表达发现侧覆盖；case 级覆盖矩阵（T14）属 W2，不在本端点
-        伪造。
+        R-EX-5 / W1。按 page/api 聚合该版本的执行期观测：`observed` 为按
+        `resource_template` 去重后的观测条数（重复观测行不重复计数），
+        `proposed/approved/rejected/out_of_scope` 为对应决策的行计数，
+        `uncovered` 为 decision=proposed 的资源身份（去重、升序、最多 200
+        条）：API 为 `"METHOD template"`（同一 path 的 GET/POST 是两项，符合
+        R-EX-2 的 METHOD+template 身份），page 仅 template。本端点只表达发现侧
+        覆盖；case 级覆盖矩阵（T14）属 W2，不在本端点伪造。
       parameters:
         - $ref: '#/components/parameters/ID'
       responses:
@@ -4056,8 +4071,10 @@ paths:
       summary: 当前 gap 事实（API-40）
       description: |
         R-EX-5 / API-40。只读返回该版本 `version_fact kind='gap'` 的当前行
-        （不含已 supersede 的历史），复用 facts 查询。无 gap 时返回空数组，
-        不是 404；版本不存在仍是 404。`fact_id` 为十进制字符串。
+        （不含已 supersede 的历史），复用 facts 查询。使用与兄弟 facts 路由一致的
+        `httpx.List` 信封（`data` 数组 + `next_cursor` + `has_more`）：无 gap 时
+        `data: []`，不是 404；版本不存在仍是 404。100 行上限被截断时
+        `has_more: true`，`next_cursor` 为最后一条 `fact_id`。`fact_id` 为十进制字符串。
       parameters:
         - $ref: '#/components/parameters/ID'
       responses:
@@ -4067,32 +4084,34 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [data]
+                required: [data, next_cursor, has_more]
                 properties:
                   data:
-                    type: object
-                    required: [items]
-                    properties:
-                      items:
-                        type: array
-                        items:
+                    type: array
+                    maxItems: 100
+                    items:
+                      type: object
+                      required: [fact_id, key, payload, confidence, created_at]
+                      properties:
+                        fact_id:
+                          type: string
+                          pattern: '^[0-9]+$'
+                        key:
+                          type: string
+                        payload:
                           type: object
-                          required: [fact_id, key, payload, confidence, created_at]
-                          properties:
-                            fact_id:
-                              type: string
-                              pattern: '^[0-9]+$'
-                            key:
-                              type: string
-                            payload:
-                              type: object
-                              additionalProperties: true
-                            confidence:
-                              type: number
-                              nullable: true
-                            created_at:
-                              type: string
-                              format: date-time
+                          additionalProperties: true
+                        confidence:
+                          type: number
+                          nullable: true
+                        created_at:
+                          type: string
+                          format: date-time
+                  next_cursor:
+                    type: string
+                    description: 下一页游标；`has_more=false` 时为空
+                  has_more:
+                    type: boolean
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':

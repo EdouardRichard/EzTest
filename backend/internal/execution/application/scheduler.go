@@ -67,7 +67,8 @@ type Scheduler struct {
 	pendingStageMu  sync.Mutex
 	pendingStage    map[int64]struct{}
 	// delta is the optional v0.22 version-context discovery-delta trigger
-	// (W1-14A): the scheduler calls it once when a wave becomes done.
+	// (W1-14A): the scheduler calls it once when a wave becomes terminal
+	// (done or failed); PauseService does the same for a cancelled wave.
 	delta DiscoveryDeltaEvaluator
 	// blocked deduplicates EventCaseRunBlocked by case_run ID; it holds the
 	// last published reason. A successful dispatch clears the entry.
@@ -260,6 +261,11 @@ func (s *Scheduler) failEmptyWave(ctx context.Context, wave execution.RunWave) e
 		map[string]any{"wave_id": platformid.Format(wave.ID), "status": string(execution.WaveFailed)},
 		nil)
 	s.notifyStageWaveTerminal(ctx, wave.VersionID, wave.ID)
+	// W1-14A: a failed wave is terminal too, so the discovery delta runs exactly
+	// once here (the changed guard makes the transition itself once-only). An
+	// empty wave produced no observation, so the version evaluator naturally
+	// no-ops.
+	s.notifyDiscoveryDelta(ctx, wave.VersionID, wave.ID)
 	return nil
 }
 
@@ -483,16 +489,24 @@ const discoveryDeltaTimeout = 15 * time.Second
 
 // notifyDiscoveryDelta invokes the optional v0.22 discovery delta after a wave
 // is terminal. The wave finalization is the source of truth: a failed or slow
-// evaluation is logged and never rolls the wave back. It is called from the
-// single terminal-transition branch of completeWave, so one wave triggers at
-// most one pass.
+// evaluation is logged and never rolls the wave back.
 func (s *Scheduler) notifyDiscoveryDelta(ctx context.Context, versionID, waveID int64) {
-	if s.delta == nil || waveID <= 0 {
+	evaluateDiscoveryDelta(ctx, s.delta, versionID, waveID)
+}
+
+// evaluateDiscoveryDelta is the shared best-effort terminal-wave trigger used by
+// the scheduler's done/failed paths and by PauseService.CancelWave. It is a
+// no-op when the dependency is absent; every terminal path bounds the pass to
+// the same 15s deadline so a slow evaluator can neither block nor fail the
+// wave/tick. Callers invoke it only after a terminal transition actually
+// committed, which keeps "one call per terminal wave".
+func evaluateDiscoveryDelta(ctx context.Context, delta DiscoveryDeltaEvaluator, versionID, waveID int64) {
+	if delta == nil || waveID <= 0 {
 		return
 	}
 	evalCtx, cancel := context.WithTimeout(ctx, discoveryDeltaTimeout)
 	defer cancel()
-	if err := s.delta.Evaluate(evalCtx, versionID, waveID); err != nil {
+	if err := delta.Evaluate(evalCtx, versionID, waveID); err != nil {
 		slog.Default().WarnContext(ctx,
 			"execution: discovery delta evaluation failed; the wave stays terminal",
 			"version_id", versionID, "wave_id", waveID, "error", err)

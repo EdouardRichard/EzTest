@@ -160,10 +160,13 @@ func (r *DiscoveryObservationRepository) MarkDiscoveryObservationDecision(ctx co
 // filter widens the query to the whole version; an empty kind/decision means
 // every value. LIMIT NULL is PostgreSQL's "no limit", which the coverage
 // aggregation uses (it must count the whole version, not one page).
+// source_kind/created_at/updated_at are part of the read projection; the
+// fingerprint is deliberately not exposed.
 const discoveryObservationListQuery = `
 	SELECT id, version_sut_id, environment_id, wave_id, case_run_id, kind, method,
-	       host, resource_template, status_code, mime, occurrences, decision,
-	       resource_id, fact_id, first_seen_at, last_seen_at
+	       host, resource_template, status_code, mime, source_kind, occurrences,
+	       decision, resource_id, fact_id, first_seen_at, last_seen_at,
+	       created_at, updated_at
 	FROM execution_discovery_observation
 	WHERE version_id = $1
 	  AND ($2::BIGINT IS NULL OR wave_id = $2)
@@ -193,9 +196,10 @@ func (r *DiscoveryObservationRepository) ListByVersion(ctx context.Context, vers
 		if err := rows.Scan(&observation.ID, &observation.VersionSUTID, &observation.EnvironmentID,
 			&observation.WaveID, &observation.CaseRunID, &observation.Kind, &observation.Method,
 			&observation.Host, &observation.ResourceTemplate, &observation.StatusCode,
-			&observation.MIME, &observation.Occurrences, &observation.Decision,
+			&observation.MIME, &observation.SourceKind, &observation.Occurrences, &observation.Decision,
 			&observation.ResourceID, &observation.FactID,
-			&observation.FirstSeenAt, &observation.LastSeenAt); err != nil {
+			&observation.FirstSeenAt, &observation.LastSeenAt,
+			&observation.CreatedAt, &observation.UpdatedAt); err != nil {
 			return nil, wrapDB("scan discovery observation", err)
 		}
 		observations = append(observations, observation)

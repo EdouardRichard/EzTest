@@ -30,6 +30,10 @@ type PauseService struct {
 	// notify the stage machine just like the scheduler's done/failed paths. nil
 	// keeps the pre-v0.22 behavior.
 	stageNotifier WaveTerminalStageNotifier
+	// delta is the optional W1-14A discovery-delta trigger. A cancelled wave is
+	// terminal, so CancelWave runs the same once-per-terminal-wave pass as the
+	// scheduler's done/failed paths. nil disables it.
+	delta DiscoveryDeltaEvaluator
 }
 
 // PauseServiceDeps wires the pause/resume service. contexts/executor/canceller
@@ -49,6 +53,10 @@ type PauseServiceDeps struct {
 	// round 1). nil keeps the pre-v0.22 behavior; Task 36 wires
 	// *versionapp.StageService here.
 	StageNotifier WaveTerminalStageNotifier
+	// Delta is the W1-14A wave-terminal discovery-delta trigger (W1-14A fix
+	// round 1). nil disables it. A cancelled wave calls it once, exactly like
+	// the scheduler's done/failed paths.
+	Delta DiscoveryDeltaEvaluator
 }
 
 // NewPauseService builds the pause/resume service.
@@ -65,6 +73,7 @@ func NewPauseService(deps PauseServiceDeps) *PauseService {
 		events:        deps.Events,
 		audit:         deps.Audit,
 		stageNotifier: deps.StageNotifier,
+		delta:         deps.Delta,
 	}
 }
 
@@ -309,8 +318,10 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		return execution.RunWave{}, err
 	}
 	if wave.Status == execution.WaveCancelled {
-		// A repeated cancel is idempotent but re-notifies: the stage callback is
-		// best effort, so this heals a stage advance lost after the first call.
+		// A repeated cancel is idempotent but re-notifies only the stage
+		// callback: the stage advance is best effort, so repeating it heals a
+		// lost advance. The discovery delta, in contrast, must run exactly once
+		// per terminal wave, so the already-cancelled branch never re-runs it.
 		s.notifyStageWaveCancelled(ctx, wave)
 		return wave, nil
 	}
@@ -339,6 +350,10 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 	// after the cancel committed so executing -> reporting is not stranded on a
 	// manual stage advance (Task 25 fix round 1).
 	s.notifyStageWaveCancelled(ctx, wave)
+	// W1-14A: the cancelled transition is the wave's terminal transition, so the
+	// discovery delta runs here exactly once (the already-cancelled branch above
+	// never reaches this point).
+	s.notifyDiscoveryDelta(ctx, wave.VersionID, wave.ID)
 	return wave, nil
 }
 
@@ -355,6 +370,17 @@ func (s *PauseService) notifyStageWaveCancelled(ctx context.Context, wave execut
 			"execution: cancelled-wave stage callback failed; the stage reconciler will retry",
 			"version_id", wave.VersionID, "wave_id", wave.ID, "error", err)
 	}
+}
+
+// notifyDiscoveryDelta runs the optional W1-14A terminal-wave delta trigger for
+// a cancelled wave through the same shared 15s best-effort helper as the
+// scheduler (W1-14A fix round 1). The cancellation is the source of truth, so a
+// failing/slow evaluator is logged and never rolls the cancel back.
+func (s *PauseService) notifyDiscoveryDelta(ctx context.Context, versionID, waveID int64) {
+	if s == nil {
+		return
+	}
+	evaluateDiscoveryDelta(ctx, s.delta, versionID, waveID)
 }
 
 // cancelWaveRunsAndIntents propagates cancellation from a wave to its

@@ -204,11 +204,12 @@ type DiscoveryObservationWriter interface {
 	WriteObservations(ctx context.Context, observations []DiscoveryObservation) error
 }
 
-// DiscoveryObservationRow is the full DB-29 read projection of one observation
+// DiscoveryObservationRow is the DB-29 read projection of one observation
 // (W1-14A, API-36/37/39). IDs stay int64 at the application boundary; the HTTP
 // DTO renders them as decimal strings. The nullable provenance columns are
 // pointers so a missing wave/case_run/environment/resource/fact is never
-// confused with the zero value.
+// confused with the zero value. The projection includes source_kind,
+// created_at and updated_at; the fingerprint deliberately stays DB-only.
 type DiscoveryObservationRow struct {
 	ID               int64
 	VersionSUTID     int64
@@ -221,12 +222,15 @@ type DiscoveryObservationRow struct {
 	ResourceTemplate string
 	StatusCode       *int
 	MIME             string
+	SourceKind       string
 	Occurrences      int
 	Decision         string
 	ResourceID       *int64
 	FactID           *int64
 	FirstSeenAt      time.Time
 	LastSeenAt       time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // DiscoveryQueryRepository is the read-only DB-29 query port behind the
@@ -240,9 +244,10 @@ type DiscoveryQueryRepository interface {
 }
 
 // DiscoveryDeltaEvaluator is the narrow version-context delta trigger the
-// scheduler calls once when a wave reaches its terminal state (W1-14A,
-// R-EX-3). The production adapter returns nil for versionapp.ErrDeltaBusy
-// (another pass owns the lock), so a skipped pass never fails the wave.
+// scheduler and PauseService call once when a wave reaches any terminal state
+// (done/failed/cancelled; W1-14A, R-EX-3). The production adapter returns nil
+// for versionapp.ErrDeltaBusy (another pass owns the lock), so a skipped pass
+// never fails the wave.
 type DiscoveryDeltaEvaluator interface {
 	Evaluate(ctx context.Context, versionID, waveID int64) error
 }
