@@ -6,9 +6,13 @@ import {
   bindingErrorDetails,
   blockVersion,
   createVersion,
+  getDiscoveryCoverage,
+  getDiscoveryDeltas,
+  getDiscoveryObservations,
   getResourceCatalog,
   getVersion,
   getVersionBinding,
+  getVersionGaps,
   listPlanItems,
   listSutRepositories,
   listVersions,
@@ -387,5 +391,110 @@ describe("versions API", () => {
     })
     expect(parseStageBlocker(null)).toBeNull()
     expect(parseStageBlocker("")).toBeNull()
+  })
+
+  it("reads discovery observations with URLSearchParams filters", async () => {
+    const observation = {
+      observation_id: "9001",
+      kind: "api" as const,
+      method: "GET",
+      host: "shop.example.com",
+      resource_template: "/api/orders/{id}",
+      status_code: 200,
+      mime: "application/json",
+      source_kind: "execution",
+      occurrences: 3,
+      decision: "proposed" as const,
+      wave_id: "9201",
+      case_run_id: null,
+      version_sut_id: "5201",
+      environment_id: "7201",
+      resource_id: "12",
+      fact_id: null,
+      first_seen_at: "2026-11-01T08:00:00Z",
+      last_seen_at: "2026-11-01T08:05:00Z",
+      created_at: "2026-11-01T08:00:00Z",
+      updated_at: "2026-11-01T08:00:00Z",
+    }
+    fetchMock.mockResolvedValue(jsonResponse({ data: { items: [observation], count: 1 } }))
+
+    await expect(
+      getDiscoveryObservations("2001", {
+        kind: "api",
+        decision: "proposed",
+        waveId: "9201",
+        limit: 10,
+      }),
+    ).resolves.toEqual([observation])
+
+    let [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      "http://localhost:13333/api/versions/2001/discovery/observations?kind=api&decision=proposed&wave_id=9201&limit=10",
+    )
+    expect(init?.method).toBe("GET")
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: { items: [], count: 0 } }))
+    await expect(getDiscoveryObservations("2001")).resolves.toEqual([])
+    ;[url] = fetchMock.mock.calls[1]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/discovery/observations?limit=50")
+  })
+
+  it("reads the discovery deltas with an optional wave filter", async () => {
+    const deltas = {
+      counts: { new: 1, proposed: 2, approved: 1, rejected: 0, out_of_scope: 0 },
+      items: [],
+    }
+    fetchMock.mockImplementation(async () => jsonResponse({ data: deltas }))
+
+    await expect(getDiscoveryDeltas("2001", "9201")).resolves.toEqual(deltas)
+    await expect(getDiscoveryDeltas("2001")).resolves.toEqual(deltas)
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/discovery/deltas?wave_id=9201",
+    )
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://localhost:13333/api/versions/2001/discovery/deltas",
+    )
+  })
+
+  it("reads the discovery-side coverage matrix", async () => {
+    const coverage = {
+      pages: {
+        observed: 1,
+        proposed: 1,
+        approved: 0,
+        rejected: 0,
+        out_of_scope: 0,
+        uncovered: ["/orders/{id}"],
+      },
+      apis: {
+        observed: 0,
+        proposed: 0,
+        approved: 0,
+        rejected: 0,
+        out_of_scope: 0,
+        uncovered: [],
+      },
+    }
+    fetchMock.mockResolvedValue(jsonResponse({ data: coverage }))
+
+    await expect(getDiscoveryCoverage("2001")).resolves.toEqual(coverage)
+    expect(fetchMock.mock.calls[0][0]).toBe("http://localhost:13333/api/versions/2001/coverage")
+  })
+
+  it("reads the current version gaps as a data array", async () => {
+    const gaps = [
+      {
+        fact_id: "6101",
+        key: "gap:orders",
+        payload: { reason: "no executable case" },
+        confidence: null,
+        created_at: "2026-11-01T08:00:00Z",
+      },
+    ]
+    fetchMock.mockResolvedValue(jsonResponse({ data: gaps, next_cursor: "", has_more: false }))
+
+    await expect(getVersionGaps("2001")).resolves.toEqual(gaps)
+    expect(fetchMock.mock.calls[0][0]).toBe("http://localhost:13333/api/versions/2001/gaps")
   })
 })

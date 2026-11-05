@@ -717,6 +717,12 @@
       "channel": "system"
     },
     {
+      "type": "resource.delta",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:280",
+      "channel": "version:N"
+    },
+    {
       "type": "resource.environment.created",
       "consumer": "system",
       "evidence": "backend/internal/eventing/application/system_consumer.go:36",
@@ -842,6 +848,12 @@
       "type": "version.reopened",
       "consumer": "ui",
       "evidence": "frontend/src/features/clarification/useVersionEvents.ts:163",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.scope.snapshot_created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:285",
       "channel": "version:N"
     },
     {

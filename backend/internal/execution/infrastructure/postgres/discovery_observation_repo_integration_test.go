@@ -439,3 +439,96 @@ func TestDiscoveryObservationListByVersion(t *testing.T) {
 		t.Fatalf("limit=1 rows = %+v err=%v, want the newest only", limited, err)
 	}
 }
+
+// TestDiscoveryObservationMarkDecisionByResource covers the W1-14B write-back:
+// the confirm/reject event of a discovered resource settles every `proposed`
+// observation of that resource and nothing else. Rows already settled (or
+// belonging to another resource) keep their decision, and a replay updates zero
+// rows.
+func TestDiscoveryObservationMarkDecisionByResource(t *testing.T) {
+	repo, pool := newTestRepository(t)
+	ctx := context.Background()
+	const versionID, versionSUTID, environmentID = int64(211), int64(5211), int64(7211)
+	seedDiscoveryBinding(t, pool, versionID, versionSUTID, environmentID)
+
+	batch := []executionapp.DiscoveryObservation{
+		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}",
+			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+		{Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}",
+			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/login",
+			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/settled",
+			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+	}
+	if err := repo.Observations.UpsertObservations(ctx, batch); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	// The delta pass is the normal producer of resource_id/decision; seed the
+	// stored classification the write-back reads.
+	if _, err := pool.Exec(ctx, `
+		UPDATE execution_discovery_observation
+		SET resource_id = 9001, decision = 'proposed'
+		WHERE version_id = $1 AND resource_template IN ('/orders/{id}', '/api/orders/{id}')
+	`, versionID); err != nil {
+		t.Fatalf("seed proposed rows: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE execution_discovery_observation
+		SET resource_id = 9002, decision = 'proposed'
+		WHERE version_id = $1 AND resource_template = '/login'
+	`, versionID); err != nil {
+		t.Fatalf("seed other resource: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE execution_discovery_observation
+		SET resource_id = 9001, decision = 'rejected'
+		WHERE version_id = $1 AND resource_template = '/settled'
+	`, versionID); err != nil {
+		t.Fatalf("seed settled row: %v", err)
+	}
+
+	updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "approved")
+	if err != nil {
+		t.Fatalf("MarkDecisionByResource: %v", err)
+	}
+	if updated != 2 {
+		t.Fatalf("updated = %d, want the 2 proposed observations of resource 9001", updated)
+	}
+
+	decisions := map[string]string{}
+	rows, err := pool.Query(ctx, `
+		SELECT resource_template, decision FROM execution_discovery_observation WHERE version_id = $1
+	`, versionID)
+	if err != nil {
+		t.Fatalf("read decisions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var template, decision string
+		if err := rows.Scan(&template, &decision); err != nil {
+			t.Fatalf("scan decision: %v", err)
+		}
+		decisions[template] = decision
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read decisions: %v", err)
+	}
+	if decisions["/orders/{id}"] != "approved" || decisions["/api/orders/{id}"] != "approved" {
+		t.Fatalf("proposed rows of 9001 = %v, want both approved", decisions)
+	}
+	if decisions["/login"] != "proposed" {
+		t.Fatalf("/login decision = %q, want another resource untouched", decisions["/login"])
+	}
+	if decisions["/settled"] != "rejected" {
+		t.Fatalf("/settled decision = %q, want an already-settled row unchanged", decisions["/settled"])
+	}
+
+	// Replaying the event is a no-op: no proposed row of 9001 remains.
+	if updated, err := repo.Observations.MarkDecisionByResource(ctx, 9001, "approved"); err != nil || updated != 0 {
+		t.Fatalf("replay updated = %d err=%v, want 0", updated, err)
+	}
+	if _, err := repo.Observations.MarkDecisionByResource(ctx, 0, "approved"); err == nil {
+		t.Fatal("resource id 0 must be rejected")
+	}
+}

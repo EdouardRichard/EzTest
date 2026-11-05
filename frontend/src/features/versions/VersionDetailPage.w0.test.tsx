@@ -12,6 +12,8 @@ const versionApi = vi.hoisted(() => ({
   getVersionBinding: vi.fn(),
   getVersionFacts: vi.fn(),
   listWorkItems: vi.fn(),
+  getDiscoveryObservations: vi.fn(),
+  getDiscoveryCoverage: vi.fn(),
   getLatestContextPacket: vi.fn(),
   advanceStage: vi.fn(),
   rejectStage: vi.fn(),
@@ -203,6 +205,25 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     versionApi.getVersionBinding.mockReset().mockResolvedValue(bindingOverviewFixture)
     versionApi.getVersionFacts.mockReset().mockResolvedValue([])
     versionApi.listWorkItems.mockReset().mockResolvedValue([])
+    versionApi.getDiscoveryObservations.mockReset().mockResolvedValue([])
+    versionApi.getDiscoveryCoverage.mockReset().mockResolvedValue({
+      pages: {
+        observed: 0,
+        proposed: 0,
+        approved: 0,
+        rejected: 0,
+        out_of_scope: 0,
+        uncovered: [],
+      },
+      apis: {
+        observed: 0,
+        proposed: 0,
+        approved: 0,
+        rejected: 0,
+        out_of_scope: 0,
+        uncovered: [],
+      },
+    })
     versionApi.getLatestContextPacket
       .mockReset()
       .mockRejectedValue(
@@ -315,6 +336,49 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     )
   })
 
+  it("mounts the discovery panels and refetches them on resource.delta", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+
+    expect(await screen.findByTestId("discovery-panel")).toBeInTheDocument()
+    expect(await screen.findByTestId("coverage-panel")).toBeInTheDocument()
+    expect(await screen.findByText("该版本暂无探索发现")).toBeInTheDocument()
+    expect(await screen.findByText("该版本暂无探索覆盖")).toBeInTheDocument()
+    await waitFor(() => expect(versionApi.getDiscoveryObservations).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(versionApi.getDiscoveryCoverage).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      sse.handlers?.onDiscoveryChanged?.({
+        type: "resource.delta",
+        payload: { version_id: "2001", wave_id: "9201" },
+      })
+    })
+
+    await waitFor(() => expect(versionApi.getDiscoveryObservations.mock.calls.length).toBe(2), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(versionApi.getDiscoveryCoverage.mock.calls.length).toBe(2), {
+      timeout: 2000,
+    })
+  })
+
+  it("refreshes the discovery panels and version on a frozen scope snapshot", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByTestId("discovery-panel")
+    await waitFor(() => expect(versionApi.getDiscoveryObservations).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      sse.handlers?.onScopeSnapshotChanged?.({
+        type: "version.scope.snapshot_created",
+        payload: { version_id: "2001", wave_id: "9201" },
+      })
+    })
+
+    await waitFor(() => expect(versionApi.getDiscoveryObservations.mock.calls.length).toBe(2), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(versionApi.getVersion).toHaveBeenCalledTimes(2), { timeout: 2000 })
+  })
+
   it("refreshes the work-item and context-packet projections from version events", async () => {
     auth.isAdmin = true
     render(<VersionDetailPage versionId="2001" />)
@@ -333,11 +397,12 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
       })
     })
 
-    await waitFor(() => expect(versionApi.listWorkItems.mock.calls.length).toBe(2), { timeout: 2000 })
-    await waitFor(
-      () => expect(conversationApi.getLatestContextPacket.mock.calls.length).toBe(2),
-      { timeout: 2000 },
-    )
+    await waitFor(() => expect(versionApi.listWorkItems.mock.calls.length).toBe(2), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(conversationApi.getLatestContextPacket.mock.calls.length).toBe(2), {
+      timeout: 2000,
+    })
   })
 
   it("refreshes the work-item activity projection on tool.retry", async () => {
@@ -349,7 +414,9 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
       sse.handlers?.onToolRetry?.({ type: "tool.retry", payload: { attempt: 2 } })
     })
 
-    await waitFor(() => expect(versionApi.listWorkItems.mock.calls.length).toBe(2), { timeout: 2000 })
+    await waitFor(() => expect(versionApi.listWorkItems.mock.calls.length).toBe(2), {
+      timeout: 2000,
+    })
   })
 
   it("routes the legacy stage event name through the same refresh", async () => {

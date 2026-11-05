@@ -270,3 +270,99 @@ export type CreateSutRepositoryRequest = {
   repository_id: string
   role: string
 }
+
+/* ------------------------- discovery observations (API-36..40) ---------------- */
+
+/** DB-29 resource kind of one execution-time observation. */
+export type DiscoveryKind = "page" | "api"
+
+/** Five-way DB-29 decision of one observation. */
+export type DiscoveryDecision = "new" | "proposed" | "approved" | "rejected" | "out_of_scope"
+
+/**
+ * One DB-29 observation (`GET /api/versions/{id}/discovery/observations`,
+ * W1-14A/API-36). Every id is a decimal string and every nullable provenance
+ * column is `null` rather than a zero id.
+ */
+export type DiscoveryObservation = {
+  observation_id: string
+  kind: DiscoveryKind
+  method: string
+  host: string
+  resource_template: string
+  status_code: number | null
+  mime: string
+  source_kind: string
+  occurrences: number
+  decision: DiscoveryDecision
+  wave_id: string | null
+  case_run_id: string | null
+  version_sut_id: string
+  environment_id: string | null
+  resource_id: string | null
+  fact_id: string | null
+  first_seen_at: string
+  last_seen_at: string
+  created_at: string
+  updated_at: string
+}
+
+/** Five-way decision counts of one delta pass (API-37). */
+export type DiscoveryDecisionCounts = {
+  new: number
+  proposed: number
+  approved: number
+  rejected: number
+  out_of_scope: number
+}
+
+/** Reduced per-resource projection of `GET .../discovery/deltas` (API-37). */
+export type DiscoveryDeltaItem = {
+  observation_id: string
+  kind: DiscoveryKind
+  method: string
+  host: string
+  resource_template: string
+  decision: DiscoveryDecision
+  occurrences: number
+  wave_id: string | null
+  case_run_id: string | null
+  resource_id: string | null
+  fact_id: string | null
+}
+
+/** `GET /api/versions/{id}/discovery/deltas?wave_id=` payload. */
+export type DiscoveryDeltas = {
+  counts: DiscoveryDecisionCounts
+  items: DiscoveryDeltaItem[]
+}
+
+/**
+ * Discovery-side coverage of one kind (`GET /api/versions/{id}/coverage`).
+ * `observed` counts distinct resource templates; the four decision buckets are
+ * row counts; `uncovered` lists the still-proposed resource identities (API
+ * identities are `"METHOD template"`, page identities the template alone).
+ */
+export type DiscoveryCoverageBucket = {
+  observed: number
+  proposed: number
+  approved: number
+  rejected: number
+  out_of_scope: number
+  uncovered: string[]
+}
+
+/** `GET /api/versions/{id}/coverage` payload (W1 discovery-side semantics). */
+export type DiscoveryCoverage = {
+  pages: DiscoveryCoverageBucket
+  apis: DiscoveryCoverageBucket
+}
+
+/** One current `version_fact kind='gap'` row (`GET /api/versions/{id}/gaps`). */
+export type VersionGap = {
+  fact_id: string
+  key: string
+  payload: Record<string, unknown>
+  confidence: number | null
+  created_at: string
+}

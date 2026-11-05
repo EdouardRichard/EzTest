@@ -156,6 +156,33 @@ func (r *DiscoveryObservationRepository) MarkDiscoveryObservationDecision(ctx co
 	return nil
 }
 
+// discoveryObservationResourceDecisionUpdate is the W1-14B write-back from the
+// resource catalog: an admin confirm/reject of a discovered resource settles
+// every observation of that resource that is still `proposed`. A row already
+// settled (approved/rejected/out_of_scope) is never rewritten, so a replayed or
+// duplicated resource event cannot flip an earlier decision.
+const discoveryObservationResourceDecisionUpdate = `
+	UPDATE execution_discovery_observation
+	SET decision = $2,
+	    updated_at = now()
+	WHERE resource_id = $1
+	  AND decision = 'proposed'
+`
+
+// MarkDecisionByResource implements executionapp.ResourceDecisionMarker. It
+// returns the number of observations the decision update touched.
+func (r *DiscoveryObservationRepository) MarkDecisionByResource(ctx context.Context, resourceID int64, decision string) (int64, error) {
+	ctx = contextOrBackground(ctx)
+	if resourceID <= 0 {
+		return 0, execution.ErrNotFound
+	}
+	tag, err := r.pool.Exec(ctx, discoveryObservationResourceDecisionUpdate, resourceID, decision)
+	if err != nil {
+		return 0, wrapDB("mark discovery observation decision by resource", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // discoveryObservationListQuery is the W1-14A read (API-36/37/39). A NULL wave
 // filter widens the query to the whole version; an empty kind/decision means
 // every value. LIMIT NULL is PostgreSQL's "no limit", which the coverage

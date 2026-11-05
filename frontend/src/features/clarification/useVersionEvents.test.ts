@@ -430,7 +430,12 @@ describe("useVersionEvents", () => {
     for (const type of ["agent.run.started", "agent.run.finished", "agent.run.failed"]) {
       connectOptions.onEvent({ event: "message", data: eventFrame(type, { agent_run_id: "9601" }) })
     }
-    for (const type of ["work_item.created", "work_item.claimed", "work_item.failed", "work_item.dead"]) {
+    for (const type of [
+      "work_item.created",
+      "work_item.claimed",
+      "work_item.failed",
+      "work_item.dead",
+    ]) {
       connectOptions.onEvent({ event: "message", data: eventFrame(type, { work_item_id: "9701" }) })
     }
     for (const type of ["context.cache_stats", "context.compacted"]) {
@@ -454,6 +459,31 @@ describe("useVersionEvents", () => {
     expect(onVersionChanged).toHaveBeenCalledTimes(1)
     expect(onWorkItemChanged.mock.calls[2][0].type).toBe("work_item.failed")
     expect(onContextChanged.mock.calls[1][0].type).toBe("context.compacted")
+  })
+
+  it("routes resource.delta and version.scope.snapshot_created to their handlers", () => {
+    const onDiscoveryChanged = vi.fn()
+    const onScopeSnapshotChanged = vi.fn()
+    render(createElement(Harness, { handlers: { onDiscoveryChanged, onScopeSnapshotChanged } }))
+
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("resource.delta", { version_id: "2001", wave_id: "9201" }),
+    })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("version.scope.snapshot_created", {
+        version_id: "2001",
+        wave_id: "9201",
+        frozen_at: "2026-11-01T08:00:00Z",
+      }),
+    })
+
+    expect(onDiscoveryChanged).toHaveBeenCalledTimes(1)
+    expect(onDiscoveryChanged.mock.calls[0][0].type).toBe("resource.delta")
+    expect(onScopeSnapshotChanged).toHaveBeenCalledTimes(1)
+    expect(onScopeSnapshotChanged.mock.calls[0][0].type).toBe("version.scope.snapshot_created")
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
   })
 
   it("uses the latest handlers without reconnecting and disconnects on unmount", () => {

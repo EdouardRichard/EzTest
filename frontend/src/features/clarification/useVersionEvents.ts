@@ -71,6 +71,10 @@ export type VersionEventHandlers = {
   onIssueChanged?: (event: VersionEvent) => void
   /** P4 `report.*`: refresh the report list/detail and current revision. */
   onReportChanged?: (event: VersionEvent) => void
+  /** `resource.delta`: refresh the discovery observations and coverage matrix. */
+  onDiscoveryChanged?: (event: VersionEvent) => void
+  /** `version.scope.snapshot_created`: refresh the frozen wave scope projection. */
+  onScopeSnapshotChanged?: (event: VersionEvent) => void
   /** P5 `visual.baseline_approved` / `visual.diff_created`: refresh visual projections. */
   onVisualChanged?: (event: VersionEvent) => void
   /** Synthetic `stream.reset`: refetch every snapshot instead of reconnecting. */
@@ -272,6 +276,15 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "visual.baseline_approved":
         case "visual.diff_created":
           handlersRef.current.onVisualChanged?.(event)
+          break
+        case "resource.delta":
+          // One delta pass can publish several discovered resources; the panel
+          // refetches the observation/coverage snapshot on the single event.
+          handlersRef.current.onDiscoveryChanged?.(event)
+          break
+        case "version.scope.snapshot_created":
+          // A new wave froze its effective scope; the snapshot readers refetch.
+          handlersRef.current.onScopeSnapshotChanged?.(event)
           break
         default:
           if (event.type.startsWith("requirement.")) {

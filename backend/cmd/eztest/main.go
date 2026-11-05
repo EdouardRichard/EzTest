@@ -1887,6 +1887,9 @@ func main() {
 	}
 	eventSvc.Observe(wake)
 	eventSvc.Observe(eventingapp.NewSystemEventConsumer(slog.Default()))
+	// W1-14B: settle proposed discovery observations when an admin confirms or
+	// rejects a discovered page/API (system-channel resource events).
+	eventSvc.Observe(executionapp.NewResourceDecisionObserver(executionRepo.Observations, slog.Default()))
 	if p7rt.Listener != nil {
 		p7rt.Listener.Observe(wake)
 	}

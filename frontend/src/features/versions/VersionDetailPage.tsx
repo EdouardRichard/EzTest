@@ -31,6 +31,8 @@ import { formatDateTime } from "@/lib/format"
 import { getVersion, getVersionStage, parseStageBlocker } from "./api"
 import { BindingOverview } from "./BindingOverview"
 import { BlockerPanel } from "./BlockerPanel"
+import { CoveragePanel } from "./CoveragePanel"
+import { DiscoveryPanel } from "./DiscoveryPanel"
 import { FactsPanel } from "./FactsPanel"
 import { PlanPanel } from "./PlanPanel"
 import { StageBar } from "./StageBar"
@@ -411,6 +413,10 @@ export function VersionDetailPage({
   // `tool.retry` refresh them; the admin-only context packet has its own nonce.
   const [workItemsRefreshKey, setWorkItemsRefreshKey] = useState(0)
   const [contextRefreshKey, setContextRefreshKey] = useState(0)
+  // W1-14B: execution-time discovery observations and the discovery-side
+  // coverage matrix share the `resource.delta` / frozen-scope events.
+  const [discoveryRefreshKey, setDiscoveryRefreshKey] = useState(0)
+  const [coverageRefreshKey, setCoverageRefreshKey] = useState(0)
   const [pendingQuestions, setPendingQuestions] = useState<QuestionBatch[]>([])
 
   // `?case=` / `?conversation=` deep links for the design workspace. The route
@@ -570,6 +576,13 @@ export function VersionDetailPage({
     refreshVersionAndCounts()
   }, [refreshVersionAndCounts])
 
+  // `resource.delta` and a frozen scope snapshot both change the discovered
+  // resource set, so the observations and the coverage matrix refetch together.
+  const refreshDiscovery = useCallback(() => {
+    setDiscoveryRefreshKey((current) => current + 1)
+    setCoverageRefreshKey((current) => current + 1)
+  }, [])
+
   const refreshSnapshotNow = useCallback(() => {
     if (refreshTimer.current !== null) {
       clearTimeout(refreshTimer.current)
@@ -613,6 +626,13 @@ export function VersionDetailPage({
     onAttachmentImageChanged: () => setAttachmentRefreshKey((current) => current + 1),
     onWorkItemChanged: () => setWorkItemsRefreshKey((current) => current + 1),
     onContextChanged: () => setContextRefreshKey((current) => current + 1),
+    // W1-14B: a delta pass settles/proposes discovered resources; the frozen
+    // scope snapshot changes which binding resources a wave may use.
+    onDiscoveryChanged: refreshDiscovery,
+    onScopeSnapshotChanged: () => {
+      refreshDiscovery()
+      refreshVersionAndCounts()
+    },
     // A tool retry re-runs one tool inside an agent run; the work-item rows show
     // the run/activity projection, so they refetch on the same nonce.
     onToolRetry: () => setWorkItemsRefreshKey((current) => current + 1),
@@ -628,6 +648,8 @@ export function VersionDetailPage({
       setAttachmentRefreshKey((current) => current + 1)
       setWorkItemsRefreshKey((current) => current + 1)
       setContextRefreshKey((current) => current + 1)
+      setDiscoveryRefreshKey((current) => current + 1)
+      setCoverageRefreshKey((current) => current + 1)
     },
   })
 
@@ -821,6 +843,24 @@ export function VersionDetailPage({
                 {isAdmin ? (
                   <ContextPacketCard versionId={versionId} refreshKey={contextRefreshKey} />
                 ) : null}
+                <section
+                  data-testid="discovery-overview"
+                  aria-label="探索发现"
+                  className="space-y-3 border-t border-border pt-3"
+                >
+                  <div className="flex flex-wrap items-end justify-between gap-2">
+                    <h2 className="text-sm font-semibold text-foreground">探索发现</h2>
+                    <span className="text-[11px] text-muted-foreground">
+                      执行观测 · 待处理资源 · 发现侧覆盖（审批复用资源目录）
+                    </span>
+                  </div>
+                  <DiscoveryPanel
+                    versionId={versionId}
+                    refreshKey={discoveryRefreshKey}
+                    onChanged={() => setCoverageRefreshKey((current) => current + 1)}
+                  />
+                  <CoveragePanel versionId={versionId} refreshKey={coverageRefreshKey} />
+                </section>
               </section>
               {pendingQuestions.length > 0 ? (
                 <section

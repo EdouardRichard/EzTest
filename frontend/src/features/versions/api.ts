@@ -5,12 +5,18 @@ import type {
   Catalog,
   CreateSutRepositoryRequest,
   CreateVersionRequest,
+  DiscoveryCoverage,
+  DiscoveryDecision,
+  DiscoveryDeltas,
+  DiscoveryKind,
+  DiscoveryObservation,
   ReopenVersionInput,
   SutRepository,
   UpdateBindingRequest,
   UpdateVersionRequest,
   Version,
   VersionBindingOverview,
+  VersionGap,
   VersionSummary,
 } from "./types"
 
@@ -505,4 +511,58 @@ export function rejectStage(versionId: string, input: RejectStageInput): Promise
  */
 export function advanceStage(versionId: string): Promise<StageView> {
   return apiPost<StageView>(`${versionPath(versionId)}/stage/advance`)
+}
+
+/* ---------------------- discovery observations (API-36..40) ------------------ */
+
+/** Optional filters of `GET /api/versions/{id}/discovery/observations`. */
+export type GetDiscoveryObservationsOptions = {
+  kind?: DiscoveryKind
+  /** Empty means every decision; the panel defaults to `proposed`. */
+  decision?: DiscoveryDecision
+  waveId?: string
+  /** Server default is 50; HTTP limits are clamped to 1..200. */
+  limit?: number
+}
+
+/**
+ * `GET /api/versions/{id}/discovery/observations`: the DB-29 observation page
+ * (W1-14A/API-36). The list envelope is unwrapped here; every id is already a
+ * decimal string on the wire.
+ */
+export async function getDiscoveryObservations(
+  versionId: string,
+  options: GetDiscoveryObservationsOptions = {},
+): Promise<DiscoveryObservation[]> {
+  const search = new URLSearchParams()
+  if (options.kind !== undefined) search.set("kind", options.kind)
+  if (options.decision !== undefined) search.set("decision", options.decision)
+  if (options.waveId !== undefined && options.waveId !== "") {
+    search.set("wave_id", options.waveId)
+  }
+  search.set("limit", String(options.limit ?? 50))
+  const payload = await apiGet<{ items: DiscoveryObservation[]; count: number }>(
+    `${versionPath(versionId)}/discovery/observations?${search.toString()}`,
+  )
+  return payload.items
+}
+
+/** `GET /api/versions/{id}/discovery/deltas?wave_id=`: one wave/version delta pass. */
+export function getDiscoveryDeltas(versionId: string, waveId?: string): Promise<DiscoveryDeltas> {
+  const search = new URLSearchParams()
+  if (waveId !== undefined && waveId !== "") search.set("wave_id", waveId)
+  const query = search.toString()
+  return apiGet<DiscoveryDeltas>(
+    `${versionPath(versionId)}/discovery/deltas${query === "" ? "" : `?${query}`}`,
+  )
+}
+
+/** `GET /api/versions/{id}/coverage`: W1 discovery-side coverage matrix. */
+export function getDiscoveryCoverage(versionId: string): Promise<DiscoveryCoverage> {
+  return apiGet<DiscoveryCoverage>(`${versionPath(versionId)}/coverage`)
+}
+
+/** `GET /api/versions/{id}/gaps`: current `version_fact kind='gap'` rows. */
+export function getVersionGaps(versionId: string): Promise<VersionGap[]> {
+  return apiGet<VersionGap[]>(`${versionPath(versionId)}/gaps`)
 }
