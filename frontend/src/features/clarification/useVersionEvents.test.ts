@@ -407,6 +407,55 @@ describe("useVersionEvents", () => {
     expect(onRequirementChanged).not.toHaveBeenCalled()
   })
 
+  it("routes the remaining business events added in W1-5", () => {
+    const onAgentRunChanged = vi.fn()
+    const onWorkItemChanged = vi.fn()
+    const onContextChanged = vi.fn()
+    const onToolRetry = vi.fn()
+    const onDesignCaseChanged = vi.fn()
+    const onVersionChanged = vi.fn()
+    render(
+      createElement(Harness, {
+        handlers: {
+          onAgentRunChanged,
+          onWorkItemChanged,
+          onContextChanged,
+          onToolRetry,
+          onDesignCaseChanged,
+          onVersionChanged,
+        },
+      }),
+    )
+
+    for (const type of ["agent.run.started", "agent.run.finished", "agent.run.failed"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { agent_run_id: "9601" }) })
+    }
+    for (const type of ["work_item.created", "work_item.claimed", "work_item.failed", "work_item.dead"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { work_item_id: "9701" }) })
+    }
+    for (const type of ["context.cache_stats", "context.compacted"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { cached_tokens: 10 }) })
+    }
+    connectOptions.onEvent({ event: "message", data: eventFrame("tool.retry", { attempt: 2 }) })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("design.review_submitted", { requirement_id: "6001" }),
+    })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("version.created", { title: "订单中心" }),
+    })
+
+    expect(onAgentRunChanged).toHaveBeenCalledTimes(3)
+    expect(onWorkItemChanged).toHaveBeenCalledTimes(4)
+    expect(onContextChanged).toHaveBeenCalledTimes(2)
+    expect(onToolRetry).toHaveBeenCalledTimes(1)
+    expect(onDesignCaseChanged).toHaveBeenCalledTimes(1)
+    expect(onVersionChanged).toHaveBeenCalledTimes(1)
+    expect(onWorkItemChanged.mock.calls[2][0].type).toBe("work_item.failed")
+    expect(onContextChanged.mock.calls[1][0].type).toBe("context.compacted")
+  })
+
   it("uses the latest handlers without reconnecting and disconnects on unmount", () => {
     const first = vi.fn()
     const second = vi.fn()

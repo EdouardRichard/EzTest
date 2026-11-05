@@ -1,0 +1,938 @@
+{
+  "events": [
+    {
+      "type": "agent.activity",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:128",
+      "channel": "version:N"
+    },
+    {
+      "type": "agent.run.failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:133",
+      "channel": "version:N"
+    },
+    {
+      "type": "agent.run.finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:132",
+      "channel": "version:N"
+    },
+    {
+      "type": "agent.run.started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:131",
+      "channel": "version:N"
+    },
+    {
+      "type": "attachment.image.analyzed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:202",
+      "channel": "version:N"
+    },
+    {
+      "type": "attachment.image.extracted",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:201",
+      "channel": "version:N"
+    },
+    {
+      "type": "attachment.image.failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:203",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.assertion_finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:241",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.blocked",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:239",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:238",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.paused",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:236",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.resumed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:237",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:235",
+      "channel": "version:N"
+    },
+    {
+      "type": "case_run.step_finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:240",
+      "channel": "version:N"
+    },
+    {
+      "type": "code.analysis_failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.analysis_finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.analysis_started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.anchor_validated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.fact_reviewed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.impact_computed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.index_failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.index_finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.index_started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "code.page_api_proposed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/code-intel/useCodeEvents.ts:54",
+      "channel": "version:N",
+      "prefix": "code."
+    },
+    {
+      "type": "content.uploaded",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "context.cache_stats",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:139",
+      "channel": "version:N"
+    },
+    {
+      "type": "context.compacted",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:140",
+      "channel": "version:N"
+    },
+    {
+      "type": "conversation.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:157",
+      "channel": "version:N"
+    },
+    {
+      "type": "conversation.message",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:123",
+      "channel": "version:N"
+    },
+    {
+      "type": "conversation.summary_updated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:158",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.case_confirmed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:217",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.case_version_created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:214",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.case_version_stale",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:215",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.case_version_superseded",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:216",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.export_ready",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:225",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.graph_delta",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:211",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.review_submitted",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:218",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.round_started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:221",
+      "channel": "version:N"
+    },
+    {
+      "type": "design.scope_activated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:222",
+      "channel": "version:N"
+    },
+    {
+      "type": "evidence.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:244",
+      "channel": "version:N"
+    },
+    {
+      "type": "execution.coverage_gap",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:256",
+      "channel": "version:N"
+    },
+    {
+      "type": "execution.failure_candidate",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:255",
+      "channel": "version:N"
+    },
+    {
+      "type": "execution.intent_cancelled",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:253",
+      "channel": "version:N"
+    },
+    {
+      "type": "execution.intent_created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:252",
+      "channel": "version:N"
+    },
+    {
+      "type": "execution.intent_superseded",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:254",
+      "channel": "version:N"
+    },
+    {
+      "type": "extraction.done",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:198",
+      "channel": "version:N"
+    },
+    {
+      "type": "extraction.progress",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:196",
+      "channel": "version:N"
+    },
+    {
+      "type": "extraction.segment_failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:197",
+      "channel": "version:N"
+    },
+    {
+      "type": "extraction.started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:195",
+      "channel": "version:N"
+    },
+    {
+      "type": "fact.arbitrated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:179",
+      "channel": "version:N"
+    },
+    {
+      "type": "fact.conflict",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:178",
+      "channel": "version:N"
+    },
+    {
+      "type": "fact.recorded",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:177",
+      "channel": "version:N"
+    },
+    {
+      "type": "gc.completed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "handoff.updated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:189",
+      "channel": "version:N"
+    },
+    {
+      "type": "human_request.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:247",
+      "channel": "version:N"
+    },
+    {
+      "type": "human_request.expired",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:249",
+      "channel": "version:N"
+    },
+    {
+      "type": "human_request.resolved",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:248",
+      "channel": "version:N"
+    },
+    {
+      "type": "instance.activated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "instance.drained",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "instance.offline",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "instance.registered",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "issue.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:259",
+      "channel": "version:N"
+    },
+    {
+      "type": "issue.merged",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:262",
+      "channel": "version:N"
+    },
+    {
+      "type": "issue.recurred",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:263",
+      "channel": "version:N"
+    },
+    {
+      "type": "issue.reopened",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:261",
+      "channel": "version:N"
+    },
+    {
+      "type": "issue.updated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:260",
+      "channel": "version:N"
+    },
+    {
+      "type": "job.canceled",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:151",
+      "channel": "version:N"
+    },
+    {
+      "type": "job.finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:150",
+      "channel": "version:N"
+    },
+    {
+      "type": "job.progress",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:149",
+      "channel": "version:N"
+    },
+    {
+      "type": "job.requeued",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:152",
+      "channel": "version:N"
+    },
+    {
+      "type": "knowledge.approved",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "knowledge.auto_approved",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "knowledge.proposed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "knowledge.rejected",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "knowledge.revoked",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "llm.config_created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "llm.config_deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "llm.config_updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "model.vision.unavailable",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:204",
+      "channel": "version:N"
+    },
+    {
+      "type": "plan.item_changed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:174",
+      "channel": "version:N"
+    },
+    {
+      "type": "question.answered",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:183",
+      "channel": "version:N"
+    },
+    {
+      "type": "question.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:182",
+      "channel": "version:N"
+    },
+    {
+      "type": "question.expired",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:184",
+      "channel": "version:N"
+    },
+    {
+      "type": "question.reopened",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:185",
+      "channel": "version:N"
+    },
+    {
+      "type": "question.skipped",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:186",
+      "channel": "version:N"
+    },
+    {
+      "type": "report.pdf_failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:269",
+      "channel": "version:N"
+    },
+    {
+      "type": "report.pdf_ready",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:268",
+      "channel": "version:N"
+    },
+    {
+      "type": "report.published",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:266",
+      "channel": "version:N"
+    },
+    {
+      "type": "report.stale",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:267",
+      "channel": "version:N"
+    },
+    {
+      "type": "requirement.attachment_failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.attachment_ingested",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.clarified",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.closed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:207",
+      "channel": "version:N"
+    },
+    {
+      "type": "requirement.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.deduped",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.merged",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.obsoleted",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.relation_created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.reopened",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:208",
+      "channel": "version:N"
+    },
+    {
+      "type": "requirement.rolled_back",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "requirement.version_created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:277",
+      "channel": "version:N",
+      "prefix": "requirement."
+    },
+    {
+      "type": "resource.account.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.account.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.account.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.api.confirmed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.api.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.api.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.api.proposed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.api.rejected",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.api.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.code_repo.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.code_repo.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.code_repo.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.database.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.database.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.database.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.environment.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.environment.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.environment.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.page.confirmed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.page.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.page.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.page.proposed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.page.rejected",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.page.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.sut_repository.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.sut.created",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.sut.deleted",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "resource.sut.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "settings.updated",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "channel": "system"
+    },
+    {
+      "type": "team_room.digest_updated",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:279",
+      "channel": "version:N",
+      "prefix": "team_room."
+    },
+    {
+      "type": "team_room.post",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:279",
+      "channel": "version:N",
+      "prefix": "team_room."
+    },
+    {
+      "type": "tool.retry",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:136",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.binding.changed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:192",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.closed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:162",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:164",
+      "channel": "version:N|system"
+    },
+    {
+      "type": "version.reopened",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:163",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.stage_changed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:168",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.stage.changed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:167",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:160",
+      "channel": "version:N"
+    },
+    {
+      "type": "version.status_changed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:161",
+      "channel": "version:N"
+    },
+    {
+      "type": "visual.baseline_approved",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:272",
+      "channel": "version:N"
+    },
+    {
+      "type": "visual.diff_created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:273",
+      "channel": "version:N"
+    },
+    {
+      "type": "wave.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:228",
+      "channel": "version:N"
+    },
+    {
+      "type": "wave.finished",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:232",
+      "channel": "version:N"
+    },
+    {
+      "type": "wave.paused",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:230",
+      "channel": "version:N"
+    },
+    {
+      "type": "wave.resumed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:231",
+      "channel": "version:N"
+    },
+    {
+      "type": "wave.started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:229",
+      "channel": "version:N"
+    },
+    {
+      "type": "work_item.claimed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:144",
+      "channel": "version:N"
+    },
+    {
+      "type": "work_item.created",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:143",
+      "channel": "version:N"
+    },
+    {
+      "type": "work_item.dead",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:146",
+      "channel": "version:N"
+    },
+    {
+      "type": "work_item.failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:145",
+      "channel": "version:N"
+    }
+  ]
+}

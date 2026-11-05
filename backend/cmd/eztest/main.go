@@ -1850,6 +1850,7 @@ func main() {
 		return nil
 	}
 	eventSvc.Observe(wake)
+	eventSvc.Observe(eventingapp.NewSystemEventConsumer(slog.Default()))
 	if p7rt.Listener != nil {
 		p7rt.Listener.Observe(wake)
 	}

@@ -19,6 +19,14 @@ export type VersionEventHandlers = {
   onConversationMessage?: (message: ConversationMessage) => void
   /** `agent.activity` payload; shape is not pinned by the contract yet. */
   onAgentActivity?: (payload: Record<string, unknown>) => void
+  /** `agent.run.started|finished|failed`: refresh the run/job projection. */
+  onAgentRunChanged?: (event: VersionEvent) => void
+  /** `work_item.created|claimed|failed|dead`: refresh the work queue. */
+  onWorkItemChanged?: (event: VersionEvent) => void
+  /** `context.cache_stats` / `context.compacted`: refresh context diagnostics. */
+  onContextChanged?: (event: VersionEvent) => void
+  /** `tool.retry`: refresh the activity/retry projection. */
+  onToolRetry?: (event: VersionEvent) => void
   /** Any `requirement.*` event; the workspace refetches the list. */
   onRequirementChanged?: (event: VersionEvent) => void
   /** `team_room.post` / `team_room.digest_updated`. */
@@ -120,6 +128,24 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "agent.activity":
           handlersRef.current.onAgentActivity?.(payload)
           break
+        case "agent.run.started":
+        case "agent.run.finished":
+        case "agent.run.failed":
+          handlersRef.current.onAgentRunChanged?.(event)
+          break
+        case "tool.retry":
+          handlersRef.current.onToolRetry?.(event)
+          break
+        case "context.cache_stats":
+        case "context.compacted":
+          handlersRef.current.onContextChanged?.(event)
+          break
+        case "work_item.created":
+        case "work_item.claimed":
+        case "work_item.failed":
+        case "work_item.dead":
+          handlersRef.current.onWorkItemChanged?.(event)
+          break
         case "job.progress":
         case "job.finished":
         case "job.canceled":
@@ -135,6 +161,7 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "version.status_changed":
         case "version.closed":
         case "version.reopened":
+        case "version.created":
           handlersRef.current.onVersionChanged?.(event)
           break
         case "version.stage.changed":
@@ -188,6 +215,7 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "design.case_version_stale":
         case "design.case_version_superseded":
         case "design.case_confirmed":
+        case "design.review_submitted":
           handlersRef.current.onDesignCaseChanged?.(event)
           break
         case "design.round_started":
