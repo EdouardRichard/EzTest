@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,7 +40,7 @@ const discoveryObservationUpsert = `
 	DO UPDATE SET
 		occurrences = execution_discovery_observation.occurrences + EXCLUDED.occurrences,
 		last_seen_at = now(),
-		mime = EXCLUDED.mime,
+		mime = COALESCE(NULLIF(EXCLUDED.mime, ''), execution_discovery_observation.mime),
 		status_code = COALESCE(EXCLUDED.status_code, execution_discovery_observation.status_code),
 		updated_at = now()
 `
@@ -83,6 +84,74 @@ func (r *DiscoveryObservationRepository) UpsertObservations(ctx context.Context,
 				"version_sut_id", observation.VersionSUTID,
 				"kind", observation.Kind, "template", observation.ResourceTemplate)
 		}
+	}
+	return nil
+}
+
+// discoveryObservationDeltaQuery returns the rows the version-context delta
+// evaluator reads (W1-12). A zero wave widens the query to the whole version.
+// Rows first seen in the wave plus any still-unclassified ("new") backlog row
+// are returned, so a retried/skipped delta pass backfills without re-emitting an
+// already classified resource.
+const discoveryObservationDeltaQuery = `
+	SELECT id, version_id, COALESCE(wave_id, 0), COALESCE(case_run_id, 0),
+	       version_sut_id, COALESCE(environment_id, 0), kind, method, host,
+	       resource_template, decision, COALESCE(resource_id, 0), COALESCE(fact_id, 0)
+	FROM execution_discovery_observation
+	WHERE version_id = $1
+	  AND ($2 = 0 OR wave_id = $2 OR decision = 'new')
+	ORDER BY id ASC
+`
+
+// ListForDelta reads the DB-29 observations of one wave for the version
+// context. It implements the execution side of the cross-context read port;
+// version never touches this table directly (Agent.md §6.2).
+func (r *DiscoveryObservationRepository) ListForDelta(ctx context.Context, versionID, waveID int64) ([]executionapp.DiscoveryDeltaObservation, error) {
+	ctx = contextOrBackground(ctx)
+	rows, err := r.pool.Query(ctx, discoveryObservationDeltaQuery, versionID, waveID)
+	if err != nil {
+		return nil, wrapDB("list discovery observations for delta", err)
+	}
+	defer rows.Close()
+
+	observations := make([]executionapp.DiscoveryDeltaObservation, 0)
+	for rows.Next() {
+		var observation executionapp.DiscoveryDeltaObservation
+		if err := rows.Scan(&observation.ObservationID, &observation.VersionID, &observation.WaveID,
+			&observation.CaseRunID, &observation.VersionSUTID, &observation.EnvironmentID,
+			&observation.Kind, &observation.Method, &observation.Host, &observation.ResourceTemplate,
+			&observation.Decision, &observation.ResourceID, &observation.FactID); err != nil {
+			return nil, wrapDB("scan discovery observation for delta", err)
+		}
+		observations = append(observations, observation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("read discovery observations for delta", err)
+	}
+	return observations, nil
+}
+
+// MarkDecision persists the delta classification of one observation. A zero
+// resource/fact id keeps the previously stored value, so marking a resource
+// rejected later never erases its proposal provenance. It is idempotent.
+const discoveryObservationDecisionUpdate = `
+	UPDATE execution_discovery_observation
+	SET decision = $2,
+	    resource_id = CASE WHEN $3::BIGINT > 0 THEN $3::BIGINT ELSE resource_id END,
+	    fact_id = CASE WHEN $4::BIGINT > 0 THEN $4::BIGINT ELSE fact_id END,
+	    updated_at = now()
+	WHERE id = $1
+`
+
+// MarkDiscoveryObservationDecision implements the execution side of the
+// cross-context decision write port.
+func (r *DiscoveryObservationRepository) MarkDiscoveryObservationDecision(ctx context.Context, observationID int64, decision string, resourceID, factID int64) error {
+	ctx = contextOrBackground(ctx)
+	if observationID <= 0 {
+		return execution.ErrNotFound
+	}
+	if _, err := r.pool.Exec(ctx, discoveryObservationDecisionUpdate, observationID, decision, resourceID, factID); err != nil {
+		return wrapDB("mark discovery observation decision", err)
 	}
 	return nil
 }

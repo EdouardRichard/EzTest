@@ -3,6 +3,8 @@ package executionapp
 import (
 	"context"
 	"log/slog"
+	"net"
+	"net/url"
 	"strings"
 )
 
@@ -141,7 +143,10 @@ func (s *DiscoveryIngest) normalize(ctx context.Context, observations []Discover
 
 // hostAllowed caches the allowed-host set per version_sut. A resolver failure or
 // an empty set disables the filter for that binding (fail open: a missing
-// binding must not silently hide every observation).
+// binding must not silently hide every observation). An exact host match always
+// wins; otherwise a host in the same registrable domain is first-party too, so
+// the SUT's own api./static. subdomains are not mistaken for third parties
+// (W1-11).
 func (s *DiscoveryIngest) hostAllowed(ctx context.Context, versionSUTID int64, host string, cache map[int64]discoveryHostCacheEntry) bool {
 	entry, cached := cache[versionSUTID]
 	if !cached {
@@ -158,12 +163,78 @@ func (s *DiscoveryIngest) hostAllowed(ctx context.Context, versionSUTID int64, h
 	if !entry.filter {
 		return true
 	}
-	return entry.hosts[host]
+	if entry.hosts[host] {
+		return true
+	}
+	target := discoveryRegistrableDomain(host)
+	if target == "" {
+		return false
+	}
+	for allowed := range entry.hosts {
+		if discoveryRegistrableDomain(allowed) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// discoveryRegistrableDomain returns the eTLD+1 approximation used for the
+// first-party host check. It deliberately handles only the common multi-label
+// public suffixes (the project does not vendor a public-suffix list); IP
+// literals compare exactly.
+func discoveryRegistrableDomain(host string) string {
+	host = discoveryNormalizedHost(host)
+	if host == "" {
+		return ""
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return host
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return host
+	}
+	if len(labels) >= 3 {
+		suffix := strings.Join(labels[len(labels)-2:], ".")
+		if _, ok := discoveryMultiLabelSuffixes[suffix]; ok {
+			return strings.Join(labels[len(labels)-3:], ".")
+		}
+	}
+	return strings.Join(labels[len(labels)-2:], ".")
+}
+
+// discoveryMultiLabelSuffixes is the pinned subset of multi-label public
+// suffixes needed to avoid treating two unrelated registrable domains as the
+// same first party.
+var discoveryMultiLabelSuffixes = map[string]struct{}{
+	"co.uk": {}, "org.uk": {}, "ac.uk": {}, "gov.uk": {},
+	"com.cn": {}, "net.cn": {}, "org.cn": {},
+	"com.au": {}, "net.au": {}, "org.au": {},
+	"co.jp": {}, "co.kr": {}, "co.nz": {},
+	"com.br": {}, "com.tw": {}, "com.hk": {}, "com.sg": {},
+}
+
+// discoveryNormalizedHost lowercases one host and strips brackets/port. A bare
+// IPv6 literal is recognized before url.Parse (which splits on the first colon).
+func discoveryNormalizedHost(host string) string {
+	value := strings.ToLower(strings.TrimSpace(host))
+	if value == "" {
+		return ""
+	}
+	if bare := strings.Trim(value, "[]"); net.ParseIP(bare) != nil {
+		return bare
+	}
+	if parsed, err := url.Parse("http://" + value); err == nil && parsed.Hostname() != "" {
+		return strings.ToLower(parsed.Hostname())
+	}
+	return strings.Trim(value, "[]")
 }
 
 // discoveryObservationURL rebuilds the redacted URL the normalizer consumes.
 // Query/userinfo were already dropped by the capture, but the ingest repeats the
-// normalization so a caller that stores a raw-ish Path still cannot leak it.
+// normalization so a caller that stores a raw-ish Path still cannot leak it. An
+// IPv6 literal must be bracketed before it is concatenated, otherwise the URL
+// parser reads only the first colon as the host (W1-11).
 func discoveryObservationURL(observation DiscoveryObservation) string {
 	path := observation.Path
 	if path == "" {
@@ -172,5 +243,9 @@ func discoveryObservationURL(observation DiscoveryObservation) string {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	return "http://" + strings.TrimSpace(observation.Host) + path
+	host := strings.TrimSpace(observation.Host)
+	if bare := strings.Trim(host, "[]"); net.ParseIP(bare) != nil && strings.Contains(bare, ":") {
+		host = "[" + bare + "]"
+	}
+	return "http://" + host + path
 }

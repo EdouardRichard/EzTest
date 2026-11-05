@@ -694,6 +694,28 @@ func (s *Service) GetPage(ctx context.Context, id int64) (PageView, error) {
 	return toPageView(page), nil
 }
 
+// FindPageByRouteTemplate resolves one page by (environment_id, route_template)
+// in any status. It is the W1-12 "already registered" lookup used by the
+// discovery delta service: observations carry host + template only, so the
+// normalized_url dedupe path of CreateProposedPage cannot be used. found=false
+// means the route is unregistered; an empty template is never found.
+func (s *Service) FindPageByRouteTemplate(ctx context.Context, environmentID int64, routeTemplate string) (PageView, bool, error) {
+	if environmentID <= 0 {
+		return PageView{}, false, platform.Invalid("environment_id", "must be a positive decimal ID")
+	}
+	if strings.TrimSpace(routeTemplate) == "" {
+		return PageView{}, false, nil
+	}
+	page, err := s.repo.GetPageByRouteTemplate(ctx, environmentID, routeTemplate)
+	if errors.Is(err, resource.ErrNotFound) {
+		return PageView{}, false, nil
+	}
+	if err != nil {
+		return PageView{}, false, err
+	}
+	return toPageView(page), true, nil
+}
+
 // ImportPages validates the whole batch first, then inserts it. Pages whose
 // normalized URL already exists are skipped; any invalid item rejects the batch
 // with 400.
@@ -858,6 +880,26 @@ func (s *Service) GetAPI(ctx context.Context, id int64) (APIView, error) {
 		return APIView{}, mapRepoError(err, "api", "")
 	}
 	return toAPIView(api), nil
+}
+
+// FindAPIByTemplate resolves one API by (environment_id, method,
+// path_template) in any status (W1-12). found=false means the endpoint is
+// unregistered.
+func (s *Service) FindAPIByTemplate(ctx context.Context, environmentID int64, method, pathTemplate string) (APIView, bool, error) {
+	if environmentID <= 0 {
+		return APIView{}, false, platform.Invalid("environment_id", "must be a positive decimal ID")
+	}
+	if strings.TrimSpace(method) == "" || strings.TrimSpace(pathTemplate) == "" {
+		return APIView{}, false, nil
+	}
+	api, err := s.repo.GetAPIByTemplate(ctx, environmentID, method, pathTemplate)
+	if errors.Is(err, resource.ErrNotFound) {
+		return APIView{}, false, nil
+	}
+	if err != nil {
+		return APIView{}, false, err
+	}
+	return toAPIView(api), true, nil
 }
 
 // ImportAPIs validates the whole batch first, then inserts it. Duplicate

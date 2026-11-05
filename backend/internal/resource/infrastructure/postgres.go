@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 	"github.com/jackc/pgx/v5"
@@ -264,6 +265,32 @@ func (r *Repository) GetPage(ctx context.Context, id int64) (resource.Page, erro
 	return item, nil
 }
 
+// GetPageByRouteTemplate resolves one page by (environment_id, route_template)
+// in any status. The comparison uses the same trailing-slash normalization as
+// the discovery observations (root keeps its slash).
+func (r *Repository) GetPageByRouteTemplate(ctx context.Context, environmentID int64, routeTemplate string) (resource.Page, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT `+pageColumns+`
+		FROM sut_page
+		WHERE environment_id = $1
+		  AND rtrim(COALESCE(route_template, ''), '/') = $2
+		ORDER BY id ASC
+		LIMIT 1
+	`, environmentID, normalizeTemplateLookup(routeTemplate))
+	item, err := scanPage(row)
+	if err != nil {
+		return resource.Page{}, wrapDB("get page by route template", err)
+	}
+	return item, nil
+}
+
+// normalizeTemplateLookup collapses a route/path template to the lookup key
+// shared by the page and API queries: trimmed, with every trailing slash
+// removed. The root "/" therefore becomes "", matching the SQL rtrim form.
+func normalizeTemplateLookup(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
 // CreatePage inserts a page.
 func (r *Repository) CreatePage(ctx context.Context, page resource.Page) (resource.Page, error) {
 	row := r.pool.QueryRow(ctx, `
@@ -345,6 +372,26 @@ func (r *Repository) GetAPI(ctx context.Context, id int64) (resource.API, error)
 	item, err := scanAPI(row)
 	if err != nil {
 		return resource.API{}, wrapDB("get api", err)
+	}
+	return item, nil
+}
+
+// GetAPIByTemplate resolves one API by (environment_id, method, path_template)
+// in any status. The method comparison is case-insensitive; the path uses the
+// same trailing-slash normalization as the page lookup.
+func (r *Repository) GetAPIByTemplate(ctx context.Context, environmentID int64, method, pathTemplate string) (resource.API, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT `+apiColumns+`
+		FROM sut_api
+		WHERE environment_id = $1
+		  AND upper(method) = upper($2)
+		  AND rtrim(COALESCE(path_template, ''), '/') = $3
+		ORDER BY id ASC
+		LIMIT 1
+	`, environmentID, strings.TrimSpace(method), normalizeTemplateLookup(pathTemplate))
+	item, err := scanAPI(row)
+	if err != nil {
+		return resource.API{}, wrapDB("get api by template", err)
 	}
 	return item, nil
 }

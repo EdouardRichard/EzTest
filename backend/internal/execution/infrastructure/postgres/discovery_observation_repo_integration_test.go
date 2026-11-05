@@ -197,6 +197,105 @@ func TestDiscoveryIngestStoresNoSensitiveFields(t *testing.T) {
 	}
 }
 
+// TestDiscoveryObservationUpsertKeepsExistingMIME: an empty EXCLUDED.mime no
+// longer erases the MIME learned by an earlier request (W1-11);
+// COALESCE(NULLIF(EXCLUDED.mime,”), existing.mime) is the merge rule.
+func TestDiscoveryObservationUpsertKeepsExistingMIME(t *testing.T) {
+	repo, pool := newTestRepository(t)
+	ctx := context.Background()
+	mustCreateWave(t, repo, 9105, 104)
+
+	observation := executionapp.DiscoveryObservation{
+		Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home",
+		MIME: "text/html", VersionSUTID: 5001, WaveID: 9105, Occurrences: 1,
+	}
+	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{observation}); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	observation.MIME = ""
+	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{observation}); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	var mime string
+	if err := pool.QueryRow(ctx, `
+		SELECT mime FROM execution_discovery_observation WHERE version_sut_id = 5001
+	`).Scan(&mime); err != nil {
+		t.Fatalf("read mime: %v", err)
+	}
+	if mime != "text/html" {
+		t.Fatalf("mime = %q, want the existing text/html kept", mime)
+	}
+}
+
+// TestDiscoveryObservationDeltaReadAndMark: the W1-12 cross-context read and
+// decision write keep the DB-29 row consistent (observed fields, proposed ids,
+// then a rejected decision that preserves provenance).
+func TestDiscoveryObservationDeltaReadAndMark(t *testing.T) {
+	repo, pool := newTestRepository(t)
+	ctx := context.Background()
+	mustCreateWave(t, repo, 9106, 105)
+
+	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{{
+		Kind: "api", Method: "GET", Host: "shop.example.com",
+		ResourceTemplate: "/api/orders/{id}", MIME: "application/json",
+		StatusCode: intPtr(200), VersionSUTID: 5001, WaveID: 9106, CaseRunID: 3006, Occurrences: 1,
+	}}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	rows, err := repo.Observations.ListForDelta(ctx, 105, 9106)
+	if err != nil {
+		t.Fatalf("ListForDelta: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.ObservationID == 0 || row.Kind != "api" || row.Method != "GET" ||
+		row.ResourceTemplate != "/api/orders/{id}" || row.Decision != "new" ||
+		row.WaveID != 9106 || row.CaseRunID != 3006 {
+		t.Fatalf("delta row = %+v", row)
+	}
+
+	if err := repo.Observations.MarkDiscoveryObservationDecision(ctx, row.ObservationID, "proposed", 9001, 9002); err != nil {
+		t.Fatalf("mark proposed: %v", err)
+	}
+	var decision string
+	var resourceID, factID *int64
+	if err := pool.QueryRow(ctx, `
+		SELECT decision, resource_id, fact_id FROM execution_discovery_observation WHERE id = $1
+	`, row.ObservationID).Scan(&decision, &resourceID, &factID); err != nil {
+		t.Fatalf("read decision: %v", err)
+	}
+	if decision != "proposed" || resourceID == nil || *resourceID != 9001 || factID == nil || *factID != 9002 {
+		t.Fatalf("marked row = decision %q resource %v fact %v", decision, resourceID, factID)
+	}
+
+	// A later rejected decision keeps the proposal provenance.
+	if err := repo.Observations.MarkDiscoveryObservationDecision(ctx, row.ObservationID, "rejected", 0, 0); err != nil {
+		t.Fatalf("mark rejected: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT decision, resource_id, fact_id FROM execution_discovery_observation WHERE id = $1
+	`, row.ObservationID).Scan(&decision, &resourceID, &factID); err != nil {
+		t.Fatalf("read rejected decision: %v", err)
+	}
+	if decision != "rejected" || resourceID == nil || *resourceID != 9001 || factID == nil || *factID != 9002 {
+		t.Fatalf("rejected row = decision %q resource %v fact %v", decision, resourceID, factID)
+	}
+
+	// A row of another wave is only returned when it is still unclassified.
+	rows, err = repo.Observations.ListForDelta(ctx, 105, 9999)
+	if err != nil {
+		t.Fatalf("ListForDelta other wave: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rows for an unrelated wave = %d, want 0: %+v", len(rows), rows)
+	}
+}
+
+func intPtr(value int) *int { return &value }
+
 // seedDiscoveryBinding inserts the logical catalog rows the repository and the
 // SUT host resolver read: one version/sut/environment binding plus one
 // registered page on a second host.

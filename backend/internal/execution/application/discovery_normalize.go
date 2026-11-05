@@ -78,9 +78,10 @@ func normalizeDiscoveryHashRoute(fragment string) string {
 	return normalizeDiscoveryRoute(fragment)
 }
 
-// normalizeDiscoveryRoute replaces identifier segments with {id}. Matrix
-// parameters (;jsessionid=...) are dropped. Percent-encoded characters stay
-// escaped so a %3F in a path can never be mistaken for a query separator.
+// normalizeDiscoveryRoute replaces identifier segments with {id} and drops a
+// trailing slash (the root "/" is kept). Matrix parameters (;jsessionid=...) are
+// dropped. Percent-encoded characters stay escaped so a %3F in a path can never
+// be mistaken for a query separator.
 func normalizeDiscoveryRoute(route string) string {
 	segments := strings.Split(route, "/")
 	for i, segment := range segments {
@@ -92,7 +93,16 @@ func normalizeDiscoveryRoute(route string) string {
 		}
 		segments[i] = segment
 	}
-	return strings.Join(segments, "/")
+	normalized := strings.Join(segments, "/")
+	if len(normalized) > 1 {
+		// W1-11: /orders/42 and /orders/42/ are the same resource; only the
+		// root keeps its slash.
+		normalized = strings.TrimRight(normalized, "/")
+		if normalized == "" {
+			return "/"
+		}
+	}
+	return normalized
 }
 
 // isDiscoveryIDSegment reports whether one path segment is a pure numeric or

@@ -161,6 +161,83 @@ func TestDiscoveryIngestPropagatesIdentity(t *testing.T) {
 	}
 }
 
+// TestDiscoveryIngestNormalizesTrailingSlash: /orders/42 and /orders/42/ are the
+// same page template; the root path keeps its slash.
+func TestDiscoveryIngestNormalizesTrailingSlash(t *testing.T) {
+	store := &fakeDiscoveryStore{}
+	ingest := newDiscoveryIngest(store, nil)
+
+	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
+		{Kind: "page", Host: "sut.test", Path: "/orders/42", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/orders/42/", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42/", MIME: "application/json", VersionSUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42", MIME: "application/json", VersionSUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/", MIME: "text/html", VersionSUTID: 8},
+	})
+	if err != nil {
+		t.Fatalf("WriteObservations: %v", err)
+	}
+	if len(store.rows) != 3 {
+		t.Fatalf("stored rows = %d, want page+api+root: %+v", len(store.rows), store.rows)
+	}
+	if store.rows[0].ResourceTemplate != "/orders/{id}" || store.rows[0].Occurrences != 2 {
+		t.Fatalf("page row = %+v, want /orders/{id} occurrences 2", store.rows[0])
+	}
+	if store.rows[1].ResourceTemplate != "/api/orders/{id}" || store.rows[1].Occurrences != 2 {
+		t.Fatalf("api row = %+v, want /api/orders/{id} occurrences 2", store.rows[1])
+	}
+	if store.rows[2].ResourceTemplate != "/" {
+		t.Fatalf("root row = %+v, want /", store.rows[2])
+	}
+}
+
+// TestDiscoveryIngestAllowsSameRegistrableDomain: an api subdomain of the
+// environment host is first-party; an unrelated registrable domain is not.
+func TestDiscoveryIngestAllowsSameRegistrableDomain(t *testing.T) {
+	store := &fakeDiscoveryStore{}
+	ingest := newDiscoveryIngest(store, &fakeDiscoveryHostResolver{hosts: map[int64]map[string]bool{
+		7: {"shop.example.com": true},
+	}})
+
+	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
+		{Kind: "page", Host: "shop.example.com", Path: "/home", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "api", Method: "GET", Host: "api.shop.example.com", Path: "/api/orders/1", MIME: "application/json", VersionSUTID: 7},
+		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "shop.example.com.evil.test", Path: "/orders/2", MIME: "text/html", VersionSUTID: 7},
+	})
+	if err != nil {
+		t.Fatalf("WriteObservations: %v", err)
+	}
+	if len(store.rows) != 2 {
+		t.Fatalf("stored rows = %d, want the env host and its api subdomain: %+v", len(store.rows), store.rows)
+	}
+	if store.rows[0].Host != "shop.example.com" || store.rows[1].Host != "api.shop.example.com" {
+		t.Fatalf("allowed hosts = %q/%q", store.rows[0].Host, store.rows[1].Host)
+	}
+}
+
+// TestDiscoveryIngestIPv6Host: an IPv6 literal observation must survive the URL
+// rebuild (the host is bracketed before normalization).
+func TestDiscoveryIngestIPv6Host(t *testing.T) {
+	store := &fakeDiscoveryStore{}
+	ingest := newDiscoveryIngest(store, nil)
+	if err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
+		{Kind: "page", Host: "::1", Path: "/orders/42", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "api", Method: "GET", Host: "::1", Path: "/api/orders/42", MIME: "application/json", VersionSUTID: 7},
+	}); err != nil {
+		t.Fatalf("WriteObservations: %v", err)
+	}
+	if len(store.rows) != 2 {
+		t.Fatalf("stored rows = %d, want the IPv6 page and api: %+v", len(store.rows), store.rows)
+	}
+	if store.rows[0].Host != "::1" || store.rows[0].ResourceTemplate != "/orders/{id}" {
+		t.Fatalf("ipv6 page = %+v", store.rows[0])
+	}
+	if store.rows[1].ResourceTemplate != "/api/orders/{id}" {
+		t.Fatalf("ipv6 api = %+v", store.rows[1])
+	}
+}
+
 // TestDiscoveryIngestReturnsStoreError: the capture is best effort, but the
 // service still reports a store failure to its caller.
 func TestDiscoveryIngestReturnsStoreError(t *testing.T) {

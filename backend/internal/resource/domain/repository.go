@@ -39,12 +39,22 @@ type Repository interface {
 
 	ListPages(ctx context.Context, environmentID int64) ([]Page, error)
 	GetPage(ctx context.Context, id int64) (Page, error)
+	// GetPageByRouteTemplate resolves the page of one environment by its
+	// route_template, regardless of status. It is the W1-12 "already
+	// registered" lookup: observations only carry host + template, so the
+	// normalized_url dedupe path cannot be reused. A trailing slash (except the
+	// root) is ignored. It returns ErrNotFound when no page matches.
+	GetPageByRouteTemplate(ctx context.Context, environmentID int64, routeTemplate string) (Page, error)
 	CreatePage(ctx context.Context, page Page) (Page, error)
 	UpdatePage(ctx context.Context, page Page) (Page, error)
 	DeletePage(ctx context.Context, id int64) error
 
 	ListAPIs(ctx context.Context, environmentID int64) ([]API, error)
 	GetAPI(ctx context.Context, id int64) (API, error)
+	// GetAPIByTemplate resolves the API of one environment by method +
+	// path_template, regardless of status (W1-12). A trailing slash (except
+	// the root) is ignored. It returns ErrNotFound when no API matches.
+	GetAPIByTemplate(ctx context.Context, environmentID int64, method, pathTemplate string) (API, error)
 	CreateAPI(ctx context.Context, api API) (API, error)
 	UpdateAPI(ctx context.Context, api API) (API, error)
 	DeleteAPI(ctx context.Context, id int64) error

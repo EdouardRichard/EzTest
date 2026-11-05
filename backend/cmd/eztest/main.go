@@ -1143,6 +1143,21 @@ func main() {
 
 	// P3 execution context: repositories, cross-context adapters and services.
 	executionRepo := executionpg.NewRepository(pool, ids)
+	// W1-12 (WP-3): the discovery delta evaluator lives in the version context
+	// and crosses into execution only through the narrow observation adapter
+	// (Agent.md §6.2). It classifies terminal observations, proposes genuinely
+	// new pages/APIs, records provenance facts and publishes one wave-level
+	// resource.delta. W1-14 wires this service into the discovery HTTP handler;
+	// this task ends at the service layer.
+	discoveryObservationAdapter := executionadapters.NewDiscoveryObservationAdapter(executionRepo.Observations)
+	discoveryDelta := versionapp.NewDiscoveryDelta(versionapp.DiscoveryDeltaDeps{
+		Observations: discoveryObservationAdapter,
+		Decisions:    discoveryObservationAdapter,
+		Resources:    resourceSvc,
+		Facts:        factSvc,
+		Events:       eventSvc,
+	})
+	_ = discoveryDelta
 	// P7 design graph result colouring (spec §9.3): each case card carries the
 	// latest case_run verdict of its current version.
 	designGraph.SetCaseRunStatusReader(designCaseRunStatuses{runs: executionRepo.CaseRuns})

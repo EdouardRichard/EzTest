@@ -236,6 +236,22 @@ func (f *fakeRepo) GetPage(_ context.Context, id int64) (resource.Page, error) {
 	return resource.Page{}, resource.ErrNotFound
 }
 
+// normalizeTemplateTestKey mirrors the SQL rtrim lookup used by the template
+// finders.
+func normalizeTemplateTestKey(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
+func (f *fakeRepo) GetPageByRouteTemplate(_ context.Context, environmentID int64, routeTemplate string) (resource.Page, error) {
+	key := normalizeTemplateTestKey(routeTemplate)
+	for _, item := range f.pages {
+		if item.EnvironmentID == environmentID && normalizeTemplateTestKey(item.RouteTemplate) == key {
+			return item, nil
+		}
+	}
+	return resource.Page{}, resource.ErrNotFound
+}
+
 // pageURLKey mirrors the sut_page unique key: (environment_id, normalized_url).
 func pageURLKey(page resource.Page) string {
 	normalized, err := resource.NormalizePageURL(page.URL)
@@ -298,6 +314,17 @@ func (f *fakeRepo) ListAPIs(_ context.Context, environmentID int64) ([]resource.
 func (f *fakeRepo) GetAPI(_ context.Context, id int64) (resource.API, error) {
 	for _, item := range f.apis {
 		if item.ID == id {
+			return item, nil
+		}
+	}
+	return resource.API{}, resource.ErrNotFound
+}
+
+func (f *fakeRepo) GetAPIByTemplate(_ context.Context, environmentID int64, method, pathTemplate string) (resource.API, error) {
+	key := normalizeTemplateTestKey(pathTemplate)
+	for _, item := range f.apis {
+		if item.EnvironmentID == environmentID && strings.EqualFold(item.Method, method) &&
+			normalizeTemplateTestKey(item.PathTemplate) == key {
 			return item, nil
 		}
 	}
