@@ -266,16 +266,20 @@ try {
 $gitHead = ''
 try { $gitHead = (& git rev-parse HEAD 2>$null | Out-String).Trim() } catch { }
 
-$summary = @{
-    generatedAt        = (Get-Date -Format o)
-    gitHead            = $gitHead
-    requirements       = 'spec section 11.1 W0 exit items 1-10'
-    verdict            = $verdictState
-    postRunVerdict     = $postVerdictState
-    checks             = @($checks)
-    failures           = @($failures)
+try {
+    $summary = [pscustomobject]@{
+        generatedAt    = (Get-Date -Format o)
+        gitHead        = [string]$gitHead
+        requirements   = 'spec section 11.1 W0 exit items 1-10'
+        verdict        = $verdictState
+        postRunVerdict = $postVerdictState
+        checks         = @($checks | ForEach-Object { [pscustomobject]$_ })
+        failures       = @($failures | ForEach-Object { [string]$_ })
+    }
+    $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $exitEvidence 'checks.json') -Encoding UTF8
+} catch {
+    Write-Warning "could not write the machine summary (continuing): $($_.Exception.Message)"
 }
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $exitEvidence 'checks.json') -Encoding UTF8
 
 Write-Host ''
 Write-Host "== W0 exit checks ($($checks.Count)):"
