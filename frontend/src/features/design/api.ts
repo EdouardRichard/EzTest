@@ -4,6 +4,7 @@ import { apiDownload, apiGet, apiGetPage, apiPost } from "@/lib/api-client"
 import type {
   CaseConfirmationInput,
   CaseConfirmationResult,
+  CaseRevisionRollbackView,
   DesignCaseDetail,
   DesignGraph,
   DesignOverview,
@@ -89,8 +90,28 @@ export function confirmStageCases(versionId: string, caseIds: string[]): Promise
   })
 }
 
-/* ---------------------------------- exports --------------------------------- */
+/* --------------------------- discovery revisions ---------------------------- */
 
+/**
+ * API-41: rolls back one auto-confirmed discovery revision (`trigger=discovery_delta`).
+ * The backend supersedes the original, creates a confirmed replacement revision
+ * (`trigger=rollback`, `rollback_of`) and keeps the case, so a repeat returns
+ * the same replacement instead of deleting anything (W2-C11). The optional
+ * `reason` is audit metadata.
+ */
+export function rollbackCaseVersion(
+  versionId: string,
+  caseVersionId: string,
+  reason?: string,
+): Promise<CaseRevisionRollbackView> {
+  const trimmed = reason?.trim() ?? ""
+  return apiPost<CaseRevisionRollbackView>(
+    `${versionPath(versionId)}/case-versions/${encodeURIComponent(caseVersionId)}/rollback`,
+    trimmed.length > 0 ? { reason: trimmed } : {},
+  )
+}
+
+/* ---------------------------------- exports --------------------------------- */
 /** Creates a whole-version case export; every call creates a new revision. */
 export function createExport(versionId: string, input: ExportRequest): Promise<ExportView> {
   return apiPost<ExportView>(`${versionPath(versionId)}/exports`, input)

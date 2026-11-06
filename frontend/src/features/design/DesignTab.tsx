@@ -9,6 +9,7 @@ import { Dialog } from "@/components/ui/Dialog"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { SSE_STATUS_LABEL } from "@/features/clarification/labels"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
@@ -28,12 +29,17 @@ import {
   getDesignGraph,
   getDesignOverview,
   listDesignConversations,
+  rollbackCaseVersion,
 } from "./api"
 import { CaseDetailPanel } from "./CaseDetailPanel"
 import { DesignChat } from "./DesignChat"
 import { DesignFocusDialog } from "./DesignFocusDialog"
 import { DesignMindmap } from "./DesignMindmap"
 import { DesignSplitPane } from "./DesignSplitPane"
+import {
+  DiscoveryRevisionNotice,
+  discoveryRevisionFromEventPayload,
+} from "./DiscoveryRevisionNotice"
 import { ExportCasesDialog } from "./ExportCasesDialog"
 import { ExportDetailPanel } from "./ExportDetailPanel"
 import { HandoffPanel } from "./HandoffPanel"
@@ -50,9 +56,11 @@ import {
 import { PendingDesignCTA } from "./PendingDesignCTA"
 import type {
   CaseConfirmationScope,
+  CaseRevisionRollbackView,
   DesignCaseSummary,
   DesignGraph,
   DesignOverview,
+  DiscoveryRevisionData,
   VersionStage,
 } from "./types"
 
@@ -181,6 +189,9 @@ export function DesignTab({
   const [activity, setActivity] = useState<string | null>(null)
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
+  /** Latest EV-12 discovery revision (auto-confirm or rollback replacement). */
+  const [discoveryRevision, setDiscoveryRevision] = useState<DiscoveryRevisionData | null>(null)
+  const isAdmin = useIsAdmin()
 
   const [chatCollapsed, setChatCollapsed] = useState(false)
   const [shortViewport, setShortViewport] = useState(false)
@@ -305,6 +316,12 @@ export function DesignTab({
     onDesignGraphChanged: () => scheduleGraphRefresh(),
     onDesignCaseChanged: (event) => {
       scheduleGraphRefresh()
+      if (event.type === "case.revision.auto_confirmed") {
+        // EV-12/W2-12: show the auto-confirmed or rollback replacement revision
+        // and keep the case detail/graph in sync.
+        const next = discoveryRevisionFromEventPayload(event.payload)
+        if (next !== null) setDiscoveryRevision(next)
+      }
       if (event.type === "design.case_version_stale") {
         const title = typeof event.payload.title === "string" ? event.payload.title : "关联用例"
         setStaleNotice(`${title} 因需求变更已过期，等待重新设计。`)
@@ -514,6 +531,36 @@ export function DesignTab({
     [versionId, refreshGraph, canReviewCases, stage],
   )
 
+  const rollbackDiscoveryRevision = useCallback(
+    (caseVersionId: string, reason?: string) =>
+      reason === undefined
+        ? rollbackCaseVersion(versionId, caseVersionId)
+        : rollbackCaseVersion(versionId, caseVersionId, reason),
+    [versionId],
+  )
+
+  const handleDiscoveryRolledBack = useCallback(
+    (result?: CaseRevisionRollbackView) => {
+      setDiscoveryRevision((current) => {
+        if (current === null || result === undefined) return current
+        return {
+          ...current,
+          caseId: result.case_id,
+          caseVersionId: result.case_version_id,
+          revision: result.revision,
+          status: "confirmed",
+          trigger: "rollback",
+          rollbackOf: result.rolled_back_from,
+          inferred: false,
+        }
+      })
+      scheduleGraphRefresh()
+      void refreshOverview()
+      setDetailToken((token) => token + 1)
+    },
+    [refreshOverview, scheduleGraphRefresh],
+  )
+
   // Stable wrappers for DesignMindmap's memoized node data: React Flow must not
   // see new callback identities on every parent render, or it re-resets the
   // measured node dimensions and the canvas never becomes visible.
@@ -638,6 +685,11 @@ export function DesignTab({
     activeConversation?.effective_model ?? activeConversation?.model_override ?? "—"
   const sseLabel = SSE_STATUS_LABEL[sseStatus]
   const chatTitle = activeConversation?.title ?? null
+  const selectedDiscoveryRevision =
+    discoveryRevision !== null && discoveryRevision.caseId === selectedCaseId
+      ? discoveryRevision
+      : null
+  const showDiscoveryBar = discoveryRevision !== null && selectedDiscoveryRevision === null
 
   const workbench = (
     <div
@@ -727,6 +779,9 @@ export function DesignTab({
             refreshToken={detailToken}
             confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
             canConfirm={canReviewCases}
+            discoveryRevision={selectedDiscoveryRevision}
+            readOnly={!isAdmin}
+            onRolledBack={handleDiscoveryRolledBack}
             onConfirm={confirmCase}
             onRequestChange={setChatDraft}
             onRequestAiChange={requestAiChangeForCase}
@@ -819,6 +874,17 @@ export function DesignTab({
         >
           {caseGateGuidance(stage)}
         </p>
+      ) : null}
+
+      {showDiscoveryBar && discoveryRevision !== null ? (
+        <div data-testid="design-discovery-revision" className="shrink-0">
+          <DiscoveryRevisionNotice
+            revision={discoveryRevision}
+            readOnly={!isAdmin}
+            onRollback={rollbackDiscoveryRevision}
+            onRolledBack={handleDiscoveryRolledBack}
+          />
+        </div>
       ) : null}
 
       {initialExportId !== undefined ? (

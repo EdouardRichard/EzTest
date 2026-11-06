@@ -13,6 +13,7 @@ import {
   getDesignOverview,
   listDesignConversations,
   listExports,
+  rollbackCaseVersion,
 } from "./api"
 import {
   designCaseDetailFixture,
@@ -157,6 +158,29 @@ describe("design api", () => {
     expect(url).toBe("http://localhost:13333/api/versions/2001/design/confirmations")
     expect(init?.method).toBe("POST")
     expect(readBody(init)).toEqual({ scope: "scenario", target_id: "5001" })
+  })
+
+  it("rolls back an auto-confirmed discovery revision with an optional reason", async () => {
+    const result = {
+      case_id: "7001",
+      case_version_id: "7011",
+      rolled_back_from: "7010",
+      revision: 3,
+      status: "confirmed",
+      trigger: "rollback",
+    }
+    fetchMock.mockResolvedValue(jsonResponse({ data: result }))
+
+    await expect(rollbackCaseVersion("2001", "7010", "探索误判")).resolves.toEqual(result)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/case-versions/7010/rollback")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({ reason: "探索误判" })
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: result }))
+    await expect(rollbackCaseVersion("2001", "7010")).resolves.toEqual(result)
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({})
   })
 
   it("creates a whole-version export and lists previous exports", async () => {

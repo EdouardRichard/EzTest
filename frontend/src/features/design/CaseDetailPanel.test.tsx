@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api-client"
 
 const api = vi.hoisted(() => ({
   getDesignCase: vi.fn(),
+  rollbackCaseVersion: vi.fn(),
 }))
 
 vi.mock("./api", () => api)
@@ -28,6 +29,7 @@ function renderPanel(overrides: Partial<Parameters<typeof CaseDetailPanel>[0]> =
 describe("CaseDetailPanel", () => {
   beforeEach(() => {
     api.getDesignCase.mockReset()
+    api.rollbackCaseVersion.mockReset()
     api.getDesignCase.mockResolvedValue(designCaseDetailFixture)
   })
 
@@ -129,5 +131,58 @@ describe("CaseDetailPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "重试" }))
     expect(await screen.findByText("退款 T+1 到账")).toBeInTheDocument()
     expect(api.getDesignCase).toHaveBeenCalledTimes(2)
+  })
+
+  it("shows a low-confidence discovery draft with manual confirmation", async () => {
+    api.getDesignCase.mockResolvedValue({
+      ...designCaseDetailFixture,
+      selected: {
+        ...designCaseDetailFixture.selected,
+        sources: [
+          ...designCaseDetailFixture.selected.sources,
+          {
+            kind: "knowledge" as const,
+            ref_id: "501",
+            path: "discovery_observation",
+            line: null,
+            sha: "",
+          },
+        ],
+      },
+    })
+    renderPanel()
+
+    expect(await screen.findByText("低置信草案")).toBeInTheDocument()
+    expect(screen.getByText(/需人工确认/)).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "回滚" })).not.toBeInTheDocument()
+  })
+
+  it("shows a live auto-confirmed revision and refreshes after rollback", async () => {
+    const rollbackResult = {
+      case_id: "7001",
+      case_version_id: "7002",
+      rolled_back_from: "7002",
+      revision: 3,
+      status: "confirmed" as const,
+      trigger: "rollback",
+    }
+    api.rollbackCaseVersion.mockResolvedValue(rollbackResult)
+    const onRolledBack = vi.fn()
+    renderPanel({
+      discoveryRevision: {
+        caseId: "7001",
+        caseVersionId: "7002",
+        status: "confirmed",
+        trigger: "discovery_delta",
+      },
+      onRolledBack,
+    })
+
+    expect(await screen.findByText(/自动确认/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "回滚" }))
+
+    await waitFor(() => expect(api.rollbackCaseVersion).toHaveBeenCalledWith("2001", "7002"))
+    expect(onRolledBack).toHaveBeenCalledWith(rollbackResult)
+    expect(await screen.findByText(/已回滚到替代 revision 7002/)).toBeInTheDocument()
   })
 })

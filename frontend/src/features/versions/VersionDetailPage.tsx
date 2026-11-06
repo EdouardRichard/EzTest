@@ -26,8 +26,17 @@ import { ContextPacketCard } from "@/features/conversation/ContextPacketCard"
 import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
+import { rollbackCaseVersion } from "@/features/design/api"
 import { DesignTab } from "@/features/design/DesignTab"
-import type { StageView } from "@/features/design/types"
+import {
+  DiscoveryRevisionNotice,
+  discoveryRevisionFromEventPayload,
+} from "@/features/design/DiscoveryRevisionNotice"
+import type {
+  CaseRevisionRollbackView,
+  DiscoveryRevisionData,
+  StageView,
+} from "@/features/design/types"
 import { listHumanRequests, resolveHumanRequest } from "@/features/execution/api"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
 import { HumanDecisionCards } from "@/features/execution/HumanRequestBanner"
@@ -425,6 +434,8 @@ export function VersionDetailPage({
   // coverage matrix share the `resource.delta` / frozen-scope events.
   const [discoveryRefreshKey, setDiscoveryRefreshKey] = useState(0)
   const [coverageRefreshKey, setCoverageRefreshKey] = useState(0)
+  // W2-12 FE-19: the latest discovery revision auto-confirm/rollback notice.
+  const [discoveryRevision, setDiscoveryRevision] = useState<DiscoveryRevisionData | null>(null)
   const [pendingQuestions, setPendingQuestions] = useState<QuestionBatch[]>([])
   // v0.22 decision requests are version todos too, but they are human_request
   // decision cards, not QuestionCards (approval/blocked_recovery/conflict).
@@ -621,6 +632,35 @@ export function VersionDetailPage({
     setCoverageRefreshKey((current) => current + 1)
   }, [])
 
+  const rollbackDiscoveryRevision = useCallback(
+    (caseVersionId: string, reason?: string) =>
+      reason === undefined
+        ? rollbackCaseVersion(versionId, caseVersionId)
+        : rollbackCaseVersion(versionId, caseVersionId, reason),
+    [versionId],
+  )
+
+  const handleDiscoveryRolledBack = useCallback(
+    (result?: CaseRevisionRollbackView) => {
+      setDiscoveryRevision((current) => {
+        if (current === null || result === undefined) return current
+        return {
+          ...current,
+          caseId: result.case_id,
+          caseVersionId: result.case_version_id,
+          revision: result.revision,
+          status: "confirmed",
+          trigger: "rollback",
+          rollbackOf: result.rolled_back_from,
+          inferred: false,
+        }
+      })
+      refreshDiscovery()
+      refreshVersionAndCounts()
+    },
+    [refreshDiscovery, refreshVersionAndCounts],
+  )
+
   const refreshSnapshotNow = useCallback(() => {
     if (refreshTimer.current !== null) {
       clearTimeout(refreshTimer.current)
@@ -673,6 +713,15 @@ export function VersionDetailPage({
     // W1-14B: a delta pass settles/proposes discovered resources; the frozen
     // scope snapshot changes which binding resources a wave may use.
     onDiscoveryChanged: refreshDiscovery,
+    // W2-12 FE-19/EV-12: a discovery revision was auto-confirmed or rolled back;
+    // show the replacement/auto-confirm notice and refetch the discovery panels.
+    onDesignCaseChanged: (event) => {
+      if (event.type !== "case.revision.auto_confirmed") return
+      const next = discoveryRevisionFromEventPayload(event.payload)
+      if (next === null) return
+      setDiscoveryRevision(next)
+      refreshDiscovery()
+    },
     onScopeSnapshotChanged: () => {
       refreshDiscovery()
       refreshVersionAndCounts()
@@ -898,6 +947,14 @@ export function VersionDetailPage({
                       执行观测 · 待处理资源 · 发现侧覆盖（审批复用资源目录）
                     </span>
                   </div>
+                  {discoveryRevision !== null ? (
+                    <DiscoveryRevisionNotice
+                      revision={discoveryRevision}
+                      readOnly={!isAdmin}
+                      onRollback={rollbackDiscoveryRevision}
+                      onRolledBack={handleDiscoveryRolledBack}
+                    />
+                  ) : null}
                   <DiscoveryPanel
                     versionId={versionId}
                     refreshKey={discoveryRefreshKey}

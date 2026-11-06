@@ -12,13 +12,19 @@ import { VisualConfigEditor } from "@/features/visual/components/VisualConfigEdi
 import type { VisualAssertion } from "@/features/visual/types"
 import { formatDateTime } from "@/lib/format"
 
-import { getDesignCase } from "./api"
+import { getDesignCase, rollbackCaseVersion } from "./api"
+import {
+  DiscoveryRevisionNotice,
+  discoveryRevisionFromCaseVersion,
+} from "./DiscoveryRevisionNotice"
 import { CASE_VERSION_STATUS_LABEL } from "./nodeActions"
 import type {
+  CaseRevisionRollbackView,
   DesignAssertion,
   DesignAssertionKind,
   DesignCaseDetail,
   DesignCaseVersionDetail,
+  DiscoveryRevisionData,
 } from "./types"
 
 function statusTone(status: DesignCaseVersionDetail["status"]): BadgeTone {
@@ -186,6 +192,16 @@ export type CaseDetailPanelProps = {
    * panel tests; the design tab passes the real stage gate.
    */
   canConfirm?: boolean
+  /**
+   * Authoritative live discovery revision for the selected case version, taken
+   * from the EV-12 `case.revision.auto_confirmed` payload. Historical discovery
+   * revisions are inferred from the case sources instead.
+   */
+  discoveryRevision?: DiscoveryRevisionData | null
+  /** Non-admin viewers read the notice but cannot roll back (FE-19). */
+  readOnly?: boolean
+  /** Called after a successful rollback so the page can refresh graph/detail. */
+  onRolledBack?: (result?: CaseRevisionRollbackView) => void
 }
 
 function CaseDetailBody({
@@ -198,6 +214,9 @@ function CaseDetailBody({
   onRequestAiChange,
   confirming,
   canConfirm: stageCanConfirm = true,
+  discoveryRevision,
+  readOnly = false,
+  onRolledBack,
 }: {
   versionId: string
   detail: DesignCaseDetail
@@ -208,6 +227,9 @@ function CaseDetailBody({
   onRequestAiChange?: (caseId: string) => void
   confirming: boolean
   canConfirm?: boolean
+  discoveryRevision?: DiscoveryRevisionData | null
+  readOnly?: boolean
+  onRolledBack?: (result?: CaseRevisionRollbackView) => void
 }) {
   const selected = detail.selected
   const canConfirm = stageCanConfirm && detail.confirmable && selected.status === "draft"
@@ -219,6 +241,14 @@ function CaseDetailBody({
     selected,
     previousCaseVersionId: previousVersion?.case_version_id,
   }
+  const inferredDiscoveryRevision = discoveryRevisionFromCaseVersion(selected)
+  const noticeRevision =
+    discoveryRevision !== undefined &&
+    discoveryRevision !== null &&
+    (discoveryRevision.caseId === detail.case_id ||
+      discoveryRevision.caseVersionId === selected.case_version_id)
+      ? discoveryRevision
+      : inferredDiscoveryRevision
 
   return (
     <div className="space-y-4">
@@ -260,6 +290,19 @@ function CaseDetailBody({
           </Button>
         ) : null}
       </header>
+
+      {noticeRevision !== null ? (
+        <DiscoveryRevisionNotice
+          revision={noticeRevision}
+          readOnly={readOnly}
+          onRollback={(caseVersionId, reason) =>
+            reason === undefined
+              ? rollbackCaseVersion(versionId, caseVersionId)
+              : rollbackCaseVersion(versionId, caseVersionId, reason)
+          }
+          onRolledBack={onRolledBack}
+        />
+      ) : null}
 
       <dl className="grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
         <div>
@@ -435,6 +478,9 @@ export function CaseDetailPanel({
   onRequestAiChange,
   confirming = false,
   canConfirm = true,
+  discoveryRevision = null,
+  readOnly = false,
+  onRolledBack,
 }: CaseDetailPanelProps) {
   const [detail, setDetail] = useState<DesignCaseDetail | null>(null)
   const [selectedVersionId, setSelectedVersionId] = useState<string | undefined>(undefined)
@@ -479,6 +525,13 @@ export function CaseDetailPanel({
   }, [versionId, caseId, selectedVersionId, refreshToken, reloadToken])
 
   const retry = useCallback(() => setReloadToken((token) => token + 1), [])
+  const handleRolledBack = useCallback(
+    (result?: CaseRevisionRollbackView) => {
+      setReloadToken((token) => token + 1)
+      onRolledBack?.(result)
+    },
+    [onRolledBack],
+  )
 
   return (
     <section
@@ -503,6 +556,9 @@ export function CaseDetailPanel({
           onRequestAiChange={onRequestAiChange}
           confirming={confirming}
           canConfirm={canConfirm}
+          discoveryRevision={discoveryRevision}
+          readOnly={readOnly}
+          onRolledBack={handleRolledBack}
         />
       )}
     </section>
