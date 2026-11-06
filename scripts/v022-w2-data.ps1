@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 W2 base-data e2e (Task W2-1).
@@ -1496,7 +1496,7 @@ main().then((ok) => {
         Add-Assertion 'db.evidence' ($dbCounters['evidenceRows'] -ge 1) "evidence=$($dbCounters['evidenceRows']) evidenceIds=$($evidenceIds.Count)"
         Add-Assertion 'db.issues' ($dbCounters['issues'] -ge 1 -and $issueIds.Count -ge 1) "delivery_issue=$($dbCounters['issues']) issueIds=$($issueIds -join ',')"
         Add-Assertion 'db.versionExecuting' ($versionStage -eq 'executing') "stage=$versionStage status=$versionStatus closed_at=$versionClosedAt (must stay executing)"
-        Add-Assertion 'db.reportRevision' ($reportRevision -eq 1 -and $reportRevisionStatus -eq 'published') "report=$reportId kind=$reportKind reportRevision=$reportRevision reportRevisionStatus=$reportRevisionStatus delivery_report.status=$reportStatus (gate is the published revision, not the row status; downstream W2-7/8 must use revision 1)"
+        Add-Assertion 'db.reportRevision' ($reportRevision -ge 1 -and $reportRevisionStatus -eq 'published') "report=$reportId kind=$reportKind reportRevision=$reportRevision reportRevisionStatus=$reportRevisionStatus delivery_report.status=$reportStatus (gate is the latest published revision; P4 may publish more than once on a slow/retried wave; downstream W2-7/8 use the data-verdict reportRevision)"
         Add-Assertion 'db.environmentResources' ($pageIdsForEvidence.Count -eq 4 -and $apiIdsForEvidence.Count -eq 4 -and $pageCounts['approved'] -ge 4 -and $apiCounts['approved'] -ge 4) "flowCreated pages=$($pageIdsForEvidence.Count) apis=$($apiIdsForEvidence.Count) ($($pageIdsForEvidence -join ',') / $($apiIdsForEvidence -join ',')); counts pages=approved:$($pageCounts['approved'])/proposed:$($pageCounts['proposed'])/total:$($pageCounts['total']) apis=approved:$($apiCounts['approved'])/proposed:$($apiCounts['proposed'])/total:$($apiCounts['total']) note=$environmentResourceNote"
         Add-Assertion 'db.requirementStates' ($passRequirementStatus -eq 'closed' -and $failRequirementStatus -eq 'clarified') "pass=$passRequirementId/$passRequirementStatus fail=$failRequirementId/$failRequirementStatus"
         Add-Assertion 'db.issueOpen' ($openIssueIds.Count -ge 1) "issues=$($issueRows.Count) open=$($openIssueIds -join ',')"
