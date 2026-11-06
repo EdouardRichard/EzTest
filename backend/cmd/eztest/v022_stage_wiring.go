@@ -252,6 +252,54 @@ func (c stageVersionCloser) CloseVersion(ctx context.Context, versionID int64, r
 	return nil
 }
 
+// pendingClarificationCount counts the structured clarification questions that
+// are still pending. The v0.22 approval/blocked_recovery/conflict rows are
+// recorded human decisions: they share the question read surface but are not
+// requirement gaps and must never gate the stage machine or a Host turn.
+func pendingClarificationCount(requests []execution.HumanRequest) int {
+	count := 0
+	for _, request := range requests {
+		if request.Kind == execution.HumanClarificationQuestion && request.Status == execution.HumanPending {
+			count++
+		}
+	}
+	return count
+}
+
+/* ------------------------------ decision port ----------------------------- */
+
+// stageUnblocker is the narrow version-stage port of a blocked_recovery
+// decision. *versionapp.StageService satisfies it.
+type stageUnblocker interface {
+	Unblock(ctx context.Context, versionID int64) error
+}
+
+// decisionStageUnblocker makes a blocked_recovery approval idempotent when the
+// version is already not blocked. The version StageService rejects Unblock on
+// any non-blocked stage with a typed StageTransitionError; a user can legitimately
+// clear the blocker through the version panel before deciding the still-pending
+// recovery card, so that already-unblocked outcome is success for the human
+// decision. Every other rejection (a genuinely closed blocker gate, a real
+// invalid transition) flows through unchanged and keeps the W2-2 409 mapping.
+type decisionStageUnblocker struct {
+	stages stageUnblocker
+}
+
+func (u decisionStageUnblocker) Unblock(ctx context.Context, versionID int64) error {
+	if u.stages == nil {
+		return errors.New("stage unblocker: stage service is not configured")
+	}
+	err := u.stages.Unblock(ctx, versionID)
+	if err == nil {
+		return nil
+	}
+	var transitionErr *versionapp.StageTransitionError
+	if errors.As(err, &transitionErr) && transitionErr.From != versiondomain.StageBlocked {
+		return nil
+	}
+	return err
+}
+
 /* --------------------------------- gates --------------------------------- */
 
 // v022StageGateDeps are the services the production stage gates read. They are
@@ -341,7 +389,7 @@ func newV022StageGates(deps v022StageGateDeps) versionapp.StageGates {
 				if err != nil {
 					return 0, err
 				}
-				open += len(pending)
+				open += pendingClarificationCount(pending)
 			}
 			if deps.Handoff != nil {
 				latest, err := deps.Handoff.Latest(ctx, versionID, 0)

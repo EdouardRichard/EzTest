@@ -1607,8 +1607,10 @@ func main() {
 	stageCallbacks.set(stageService)
 	// W2-2 R-W2-1: approving a blocked_recovery human request asks the version
 	// stage to leave the blocked stage. The port is wired here because the stage
-	// service is constructed after the human service.
-	executionHumans.SetStageUnblocker(stageService)
+	// service is constructed after the human service. The wrapper treats an
+	// already-unblocked version as success so a blocker cleared through the
+	// version panel first cannot self-lock the pending decision.
+	executionHumans.SetStageUnblocker(decisionStageUnblocker{stages: stageService})
 	// R-B4-1: the automatic forward edges now go through the stage service.
 	designPlanner.SetDesignConverger(stageAdvancer{service: stageService})
 	stageStarter := stageAdvancer{service: stageService}

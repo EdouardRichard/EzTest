@@ -355,7 +355,7 @@ func (r hostTurnCompletionReader) TurnAnswered(ctx context.Context, scope tools.
 	if err != nil {
 		return false, err
 	}
-	return len(pending) == 0, nil
+	return pendingClarificationCount(pending) == 0, nil
 }
 
 // designRevisionCompletionReader answers the design completion criterion: at
