@@ -124,7 +124,7 @@ if ($leaks.Count -gt 0) {
 $manual = @'
 # EzTest v0.22 FA 验收操作手册（ops manual）
 
-本手册与 `typical-section1.md` 是验收 Agent 的全部输入。请只使用这两个文件，不要读取第 6 节"禁读清单"中的任何内容。
+本手册与 `typical-section1.md` 是验收 Agent 的全部输入。请只使用这两个文件，不要读取第 6 节禁读清单中列出的任何内容。
 
 ## 1. FA 栈入口
 

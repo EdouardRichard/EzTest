@@ -208,6 +208,117 @@ function Assert-Png {
     return @($red)
 }
 
+function Invoke-Api {
+    <#
+    .SYNOPSIS
+        Call one JSON HTTP endpoint and return status + parsed body.
+
+    .DESCRIPTION
+        Never throws for an HTTP error status: the caller decides whether a
+        4xx/5xx is a RED/EXTERNAL-BLOCKED condition. The returned object always
+        carries Status (int), Raw (string), Body (parsed JSON or $null), Error
+        (transport message) and Ok (2xx). The request body is JSON-encoded with
+        ConvertTo-Json; request headers are never written to any evidence file.
+    #>
+    param(
+        [string]$Method = 'GET',
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [hashtable]$Headers = @{},
+        $Body = $null,
+        [int]$TimeoutSec = 60,
+        [string]$ContentType = 'application/json'
+    )
+
+    $bodyText = $null
+    if ($null -ne $Body) {
+        if ($Body -is [string]) {
+            $bodyText = $Body
+        }
+        else {
+            $bodyText = ($Body | ConvertTo-Json -Depth 20 -Compress)
+        }
+    }
+
+    $parameters = @{
+        Uri             = $Uri
+        Method          = $Method
+        Headers         = $Headers
+        UseBasicParsing = $true
+        TimeoutSec      = $TimeoutSec
+    }
+    if ($null -ne $bodyText) {
+        $parameters['Body'] = $bodyText
+        $parameters['ContentType'] = $ContentType
+    }
+
+    $status = 0
+    $raw = ''
+    $errorMessage = $null
+    try {
+        $response = Invoke-WebRequest @parameters
+        $status = [int]$response.StatusCode
+        $raw = [string]$response.Content
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        if ($null -ne $_.Exception.Response) {
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($null -ne $stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $raw = [string]$reader.ReadToEnd()
+                    $reader.Dispose()
+                }
+            }
+            catch { }
+        }
+    }
+
+    $parsed = $null
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        try { $parsed = $raw | ConvertFrom-Json } catch { $parsed = $null }
+    }
+
+    return [pscustomobject]@{
+        Status = $status
+        Raw    = $raw
+        Body   = $parsed
+        Error  = $errorMessage
+        Ok     = ($status -ge 200 -and $status -lt 300)
+    }
+}
+
+function Login-Admin {
+    <#
+    .SYNOPSIS
+        Log in as the bootstrap admin and return the bearer token.
+
+    .DESCRIPTION
+        The password is supplied by the caller (read from .env) and is never
+        written to the console or any evidence file. Throws when the API does
+        not return a session token; the FA prep script turns that into an
+        EXTERNAL-BLOCKED verdict.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+        [Parameter(Mandatory = $true)]
+        [string]$Password,
+        [string]$Username = 'admin',
+        [int]$TimeoutSec = 60
+    )
+
+    $response = Invoke-Api -Method Post -Uri ($BaseUrl.TrimEnd('/') + '/api/auth/login') `
+        -Body @{ username = $Username; password = $Password } -TimeoutSec $TimeoutSec
+    if (-not $response.Ok -or $null -eq $response.Body -or $null -eq $response.Body.data -or
+        [string]::IsNullOrWhiteSpace([string]$response.Body.data.token)) {
+        throw "admin login failed (http=$($response.Status), no session token returned)"
+    }
+    return [string]$response.Body.data.token
+}
+
 function Assert-ExactSetStrings {
     <#
     .SYNOPSIS

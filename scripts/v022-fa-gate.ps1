@@ -46,6 +46,213 @@ $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
 . (Join-Path $PSScriptRoot 'v022-fa-common.ps1')
 
+# ---------------------------------------------------------------------------
+# Gate prep (FA-2): read-only validation of the fresh-stack evidence. The gate
+# never starts/stops services and never writes evidence; it validates the
+# producer's verdict fields plus the frozen input/issue SHAs.
+# ---------------------------------------------------------------------------
+if ($Gate -eq 'prep') {
+    $prepDir = Join-Path $repoRoot 'docs\version-V0.22\acceptance\evidence\final\prep'
+    $prepVerdictPath = Join-Path $prepDir 'prep-verdict.json'
+    $prepCheckDir = Join-Path $prepDir 'checks'
+    $prepShotDir = Join-Path $prepDir 'screenshots'
+
+    $red = New-Object System.Collections.Generic.List[string]
+    $verdict = $null
+
+    if (-not (Test-Path -LiteralPath $prepVerdictPath)) {
+        $red.Add('missing prep/prep-verdict.json')
+    }
+    else {
+        try {
+            $verdict = Read-JsonUtf8 -Path $prepVerdictPath
+        }
+        catch {
+            $red.Add("prep-verdict.json unreadable: $($_.Exception.Message)")
+        }
+    }
+
+    if ($null -ne $verdict) {
+        $prepStatus = [string]$verdict.status
+        if ([string]::IsNullOrWhiteSpace($prepStatus)) {
+            $red.Add('prep-verdict.status missing')
+        }
+        elseif ($prepStatus -eq 'EXTERNAL-BLOCKED') {
+            $blockedReason = [string]$verdict.blockedReason
+            if ([string]::IsNullOrWhiteSpace($blockedReason)) {
+                $blockedReason = 'prep-verdict.status=EXTERNAL-BLOCKED without a reason'
+            }
+            Write-Host ("EXTERNAL-BLOCKED: " + $blockedReason)
+            Write-Host 'BLOCKED: gate prep (external dependency unavailable; no PASS claimed)'
+            exit 2
+        }
+        elseif ($prepStatus -ne 'PASS') {
+            $red.Add("prep-verdict.status=$prepStatus (expected PASS or EXTERNAL-BLOCKED)")
+        }
+
+        if ([int]$verdict.schemaVersion -ne 1) {
+            $red.Add("prep-verdict.schemaVersion=$([string]$verdict.schemaVersion) (expected 1)")
+        }
+
+        $gitHead = [string]$verdict.gitHead
+        if ($gitHead -notmatch '^[0-9a-f]{40}$') {
+            $red.Add("prep-verdict.gitHead is not a 40-char lowercase SHA: '$gitHead'")
+        }
+        else {
+            $currentHead = Get-Head
+            if ($gitHead -ne $currentHead) {
+                $red.Add("prep-verdict.gitHead=$gitHead does not match git HEAD=$currentHead")
+            }
+        }
+
+        # --- checks[]: at least 8, all ok, required probe names present ----
+        $checks = @($verdict.checks)
+        if ($checks.Count -lt 8) {
+            $red.Add("prep-verdict.checks=$($checks.Count) (need >= 8)")
+        }
+        $checkNames = New-Object System.Collections.Generic.List[string]
+        foreach ($check in $checks) {
+            $name = [string]$check.name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $red.Add('prep-verdict.checks[] entry without a name')
+                continue
+            }
+            $checkNames.Add($name)
+            if (-not [bool]$check.ok) {
+                $detail = [string]$check.detail
+                $red.Add("prep check not ok: $name ($detail)")
+            }
+        }
+        $requiredPrepChecks = @(
+            'db.eztest', 'db.sut', 'api.ready', 'executor.health', 'executor.auth',
+            'sut.health', 'sut.posts', 'sut.uploads', 'sut.web',
+            'vision.upstream', 'vision.catalog', 'screenshots'
+        )
+        foreach ($required in $requiredPrepChecks) {
+            if (@($checkNames) -notcontains $required) {
+                $red.Add("missing prep check: $required")
+            }
+        }
+
+        # --- db / executor / sut / vision / stack fields -------------------
+        if (-not [bool]$verdict.db.eztestSelect1) { $red.Add('db.eztestSelect1 is not true') }
+        if (-not [bool]$verdict.db.sutSelect1) { $red.Add('db.sutSelect1 is not true') }
+        if (-not [bool]$verdict.db.uploads) { $red.Add('db.uploads is not true') }
+
+        $executorUrl = [string]$verdict.executor.url
+        if ($executorUrl -ne 'http://127.0.0.1:13360') {
+            $red.Add("executor.url='$executorUrl' (expected http://127.0.0.1:13360)")
+        }
+        if ([int]$verdict.executor.httpStatus -ne 200) {
+            $red.Add("executor.httpStatus=$([string]$verdict.executor.httpStatus) (expected 200)")
+        }
+        if (-not [bool]$verdict.executor.auth.bearer200) {
+            $red.Add('executor auth: Bearer GET /v1/contexts did not return 200')
+        }
+        if (-not [bool]$verdict.executor.auth.noToken401) {
+            $red.Add('executor auth: GET /v1/contexts without a token did not return 401')
+        }
+
+        $visionModel = [string]$verdict.vision.model
+        $visionBaseUrl = [string]$verdict.vision.baseUrl
+        $visionCaption = [string]$verdict.vision.caption
+        if ([string]::IsNullOrWhiteSpace($visionModel)) { $red.Add('vision.model missing') }
+        if ([string]::IsNullOrWhiteSpace($visionBaseUrl)) {
+            $red.Add('vision.baseUrl missing')
+        }
+        elseif ($visionBaseUrl -match '^(https?://)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)') {
+            $red.Add("vision.baseUrl points at a local proxy, not the real upstream: $visionBaseUrl")
+        }
+        if (-not [bool]$verdict.vision.visionExercised) {
+            $red.Add('vision.visionExercised is not true')
+        }
+        if ([string]::IsNullOrWhiteSpace($visionCaption)) {
+            $red.Add('vision.caption is empty (no real image caption)')
+        }
+        if (-not [bool]$verdict.vision.catalogSupportsVision) {
+            $red.Add('vision.catalogSupportsVision is not true')
+        }
+        if (-not [bool]$verdict.vision.catalogDefault) {
+            $red.Add('vision.catalogDefault is not true')
+        }
+
+        if ([string]$verdict.stack.db -ne 'eztest_v022_fa') {
+            $red.Add("stack.db=$([string]$verdict.stack.db) (expected eztest_v022_fa)")
+        }
+        if ([int]$verdict.stack.apiPort -ne 13460) { $red.Add("stack.apiPort=$([string]$verdict.stack.apiPort) (expected 13460)") }
+        if ([int]$verdict.stack.webPort -ne 6880) { $red.Add("stack.webPort=$([string]$verdict.stack.webPort) (expected 6880)") }
+        if ([int]$verdict.stack.executorPort -ne 13360) { $red.Add("stack.executorPort=$([string]$verdict.stack.executorPort) (expected 13360)") }
+        foreach ($processName in @('api', 'web', 'executor')) {
+            if ([int]$verdict.stack.pids.$processName -le 0) {
+                $red.Add("stack.pids.$processName missing or not positive")
+            }
+        }
+
+        # --- frozen SHAs ---------------------------------------------------
+        # The input set and the issue ledger must not drift. The gate script
+        # itself evolves in FA-3..FA-15, so its frozen hash is recorded for the
+        # audit trail but is not re-compared here.
+        $inputsSection = Join-Path $repoRoot 'docs\version-V0.22\acceptance\evidence\final\inputs\typical-section1.md'
+        $issuesMd = Join-Path $repoRoot 'docs\version-V0.22\acceptance\issues.md'
+        $frozenInputs = [string]$verdict.frozenShas.inputs
+        $frozenGate = [string]$verdict.frozenShas.gate
+        $frozenIssues = [string]$verdict.frozenShas.issuesMd
+        if ($frozenInputs -notmatch '^[0-9a-f]{64}$') {
+            $red.Add('frozenShas.inputs is not a 64-char lowercase SHA256')
+        }
+        elseif (-not (Test-Path -LiteralPath $inputsSection)) {
+            $red.Add('missing inputs/typical-section1.md (cannot verify frozenShas.inputs)')
+        }
+        else {
+            $currentInputs = Get-Sha -Path $inputsSection
+            if ($frozenInputs -ne $currentInputs) {
+                $red.Add("frozenShas.inputs=$frozenInputs does not match current typical-section1.md=$currentInputs")
+            }
+        }
+        if ($frozenGate -notmatch '^[0-9a-f]{64}$') {
+            $red.Add('frozenShas.gate is not a 64-char lowercase SHA256')
+        }
+        if ($frozenIssues -notmatch '^[0-9a-f]{64}$') {
+            $red.Add('frozenShas.issuesMd is not a 64-char lowercase SHA256')
+        }
+        elseif (-not (Test-Path -LiteralPath $issuesMd)) {
+            $red.Add('missing docs/version-V0.22/acceptance/issues.md (cannot verify frozenShas.issuesMd)')
+        }
+        else {
+            $currentIssues = Get-Sha -Path $issuesMd
+            if ($frozenIssues -ne $currentIssues) {
+                $red.Add("frozenShas.issuesMd=$frozenIssues does not match current issues.md=$currentIssues")
+            }
+        }
+
+        # --- raw check payloads and screenshots ----------------------------
+        if (-not (Test-Path -LiteralPath $prepCheckDir)) {
+            $red.Add('missing prep/checks/ (raw responses)')
+        }
+        else {
+            $checkFiles = @(Get-ChildItem -LiteralPath $prepCheckDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+            if ($checkFiles.Count -lt 8) {
+                $red.Add("prep/checks/*.json=$($checkFiles.Count) (need >= 8 raw responses)")
+            }
+        }
+        foreach ($shotName in @('versions.png', 'settings.png')) {
+            $shotPath = Join-Path $prepShotDir $shotName
+            foreach ($item in @(Assert-Png -Path $shotPath)) { $red.Add($item) }
+        }
+    }
+
+    if ($red.Count -gt 0) {
+        foreach ($item in $red) {
+            Write-Host ("RED: " + $item)
+        }
+        Write-Host ("FAIL: gate prep ($($red.Count) red)")
+        exit 1
+    }
+
+    Write-Host ("PASS: gate prep (fresh eztest_v022_fa stack, 12 checks, real vision caption, frozen inputs)")
+    exit 0
+}
+
 if ($Gate -ne 'inputs') {
     throw "gate not implemented yet: $Gate"
 }
@@ -137,6 +344,12 @@ if ($null -ne $sectionText) {
         $red.Add('typical-section1.md missing the "## 1. 验收输入集" heading')
     }
 
+    # Section 2 of typical-requirements.md is the internal implementation-status
+    # table and must never appear in the isolated input set (spec §2.3 / FA-C6).
+    if ([regex]::IsMatch($sectionText, '(?m)^##\s+2\.')) {
+        $red.Add('typical-section1.md contains a "## 2." heading (section 2 must not be copied)')
+    }
+
     $preface = '本次需求输入共 12 条（R01–R12），共 41 个验收标准（AC）；任一 AC 的 Then/And 未满足即判该 AC 失败并记录 observed/expected。'
     if (-not $sectionText.Contains($preface)) {
         $red.Add('typical-section1.md missing the neutral preface sentence')
@@ -179,6 +392,12 @@ if ($null -ne $manifest) {
     }
 
     $manifestSha = [string]$manifest.sha256
+    if ([string]::IsNullOrWhiteSpace([string]$manifest.source)) {
+        $red.Add('manifest.source missing')
+    }
+    elseif ([string]$manifest.source -ne 'docs/version-V0.22/acceptance/typical-requirements.md') {
+        $red.Add("manifest.source=$([string]$manifest.source) (expected docs/version-V0.22/acceptance/typical-requirements.md)")
+    }
     if ([string]::IsNullOrWhiteSpace($manifestSha)) {
         $red.Add('manifest.sha256 missing')
     }
