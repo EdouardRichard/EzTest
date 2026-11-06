@@ -48,6 +48,239 @@ const (
 	issueReasonRecurrence = "recurrence"
 )
 
+// CreateManualIssueInput is the v0.22 W2-4 manual create command. CaseRunID and
+// the evidence/merge IDs are optional; empty strings mean absent.
+type CreateManualIssueInput struct {
+	VersionID   int64
+	Title       string
+	Summary     string
+	Category    string
+	Severity    string
+	CaseRunID   int64
+	EvidenceIDs []int64
+	MergeIntoID int64
+	Reason      string
+}
+
+// UpdateManualIssueInput is the v0.22 W2-4 manual patch command. Empty string
+// fields leave the stored column unchanged; ExpectedRevision is mandatory.
+type UpdateManualIssueInput struct {
+	Title            string
+	Summary          string
+	Category         string
+	Severity         string
+	CaseRunID        int64
+	EvidenceIDs      []int64
+	MergeIntoID      int64
+	Reason           string
+	ExpectedRevision int32
+}
+
+// CreateManual creates one source='manual' issue (v0.22 W2-4). A supplied
+// case_run is resolved through the execution read port so its case_version,
+// requirement and version SUT refs are persisted with the explicit evidence
+// refs. The creation history, event and audit are projections of the committed
+// write; a projection failure never rolls it back. When MergeIntoID is set the
+// existing merge use case runs after the create, so merge validation, history
+// and the issue.merged event stay unchanged.
+func (s *IssueService) CreateManual(ctx context.Context, in CreateManualIssueInput, actorID int64) (delivery.Issue, error) {
+	if in.VersionID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("version id must be a positive decimal ID")
+	}
+	if actorID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("actor id must be a positive decimal ID")
+	}
+	if in.CaseRunID < 0 {
+		return delivery.Issue{}, invalidArgumentf("case_run_id must be a positive decimal ID")
+	}
+	if in.MergeIntoID < 0 {
+		return delivery.Issue{}, invalidArgumentf("merge_into_id must be a positive decimal ID")
+	}
+	reason, err := normalizeIssueReason(in.Reason, false)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := delivery.ValidateManualIssueFields(in.Title, in.Summary, in.Category, in.Severity); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue", err)
+	}
+	if _, err := delivery.ValidateManualEvidenceIDs(in.EvidenceIDs); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue evidence", err)
+	}
+	manual, err := s.resolveManualIssueInput(ctx, in.VersionID, in.Title, in.Summary,
+		in.Category, in.Severity, in.CaseRunID, in.EvidenceIDs)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	issue, refs, err := delivery.NewManualIssue(manual)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("build manual issue", err)
+	}
+	now := s.nowUTC()
+	issue.CreatedAt = now
+	issue.UpdatedAt = now
+	created, err := s.repo.CreateManual(ctx, IssueManualCreate{
+		Issue: issue,
+		Refs:  refs,
+		History: delivery.IssueStatusChange{
+			To:        delivery.IssueStatusOpen,
+			Reason:    reason,
+			ActorID:   &actorID,
+			ActorKind: issueActorKindUser,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	})
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("create manual issue", err)
+	}
+	projected := created
+	if projected.VersionID <= 0 {
+		projected.VersionID = in.VersionID
+	}
+	payload := map[string]any{
+		"issue_id": formatIssueID(projected.ID),
+		"status":   string(projected.Status),
+		"category": projected.Category,
+		"severity": projected.Severity,
+		"source":   delivery.IssueManualSource,
+	}
+	if in.CaseRunID > 0 {
+		payload["case_run_id"] = formatIssueID(in.CaseRunID)
+	}
+	s.publishIssueEvent(ctx, issueEventCreated, projected.VersionID, payload)
+	s.recordManualIssueCreatedAudit(ctx, actorID, projected)
+	if in.MergeIntoID > 0 {
+		return s.Merge(ctx, in.VersionID, projected.ID, in.MergeIntoID, actorID, reason, &projected.ExpectedRevision)
+	}
+	return created, nil
+}
+
+// UpdateManual patches the editable fields of one issue under the
+// expected_revision CAS (v0.22 W2-4). Empty string fields leave the stored
+// column unchanged; evidence IDs are appended to the append-only refs. A stale
+// revision is reported as the stable issue_revision_conflict subcode. When
+// MergeIntoID is set the existing merge use case runs on the patched revision.
+func (s *IssueService) UpdateManual(ctx context.Context, versionID, issueID int64, in UpdateManualIssueInput, actorID int64) (delivery.Issue, error) {
+	if versionID <= 0 || issueID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("version and issue IDs must be positive decimal IDs")
+	}
+	if actorID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("actor id must be a positive decimal ID")
+	}
+	if in.ExpectedRevision <= 0 {
+		return delivery.Issue{}, invalidArgumentf("expected revision must be a positive integer")
+	}
+	if in.CaseRunID < 0 {
+		return delivery.Issue{}, invalidArgumentf("case_run_id must be a positive decimal ID")
+	}
+	if in.MergeIntoID < 0 {
+		return delivery.Issue{}, invalidArgumentf("merge_into_id must be a positive decimal ID")
+	}
+	reason, err := normalizeIssueReason(in.Reason, false)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	current, err := s.repo.Get(ctx, versionID, issueID)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("load issue for manual update", err)
+	}
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		title = current.Title
+	}
+	summary := current.Summary
+	if strings.TrimSpace(in.Summary) != "" {
+		summary = in.Summary
+	}
+	category := strings.TrimSpace(in.Category)
+	if category == "" {
+		category = current.Category
+	}
+	severity := strings.TrimSpace(in.Severity)
+	if severity == "" {
+		severity = current.Severity
+	}
+	if err := delivery.ValidateManualIssueFields(title, summary, category, severity); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue update", err)
+	}
+	if _, err := delivery.ValidateManualEvidenceIDs(in.EvidenceIDs); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue update evidence", err)
+	}
+	manual, err := s.resolveManualIssueInput(ctx, versionID, title, summary,
+		category, severity, in.CaseRunID, in.EvidenceIDs)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	_, refs, err := delivery.NewManualIssue(manual)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue update", err)
+	}
+	// The repository treats an empty summary as "unchanged"; a non-blank patch
+	// value replaces it, preserving intentional leading/trailing whitespace.
+	updatedSummary := ""
+	if strings.TrimSpace(in.Summary) != "" {
+		updatedSummary = in.Summary
+	}
+	now := s.nowUTC()
+	from := current.Status
+	updated, err := s.repo.UpdateManual(ctx, IssueManualUpdate{
+		VersionID:        versionID,
+		IssueID:          issueID,
+		Title:            strings.TrimSpace(in.Title),
+		Summary:          updatedSummary,
+		Category:         strings.TrimSpace(in.Category),
+		Severity:         strings.TrimSpace(in.Severity),
+		ExpectedRevision: in.ExpectedRevision,
+		Refs:             refs,
+		History: delivery.IssueStatusChange{
+			From:      &from,
+			To:        current.Status,
+			Reason:    reason,
+			ActorID:   &actorID,
+			ActorKind: issueActorKindUser,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	})
+	return s.finishManualUpdate(ctx, versionID, issueID, current, in, reason, actorID, updated, err)
+}
+
+// finishManualUpdate applies the patch projections (event, optional merge).
+func (s *IssueService) finishManualUpdate(ctx context.Context, versionID, issueID int64,
+	current delivery.Issue, in UpdateManualIssueInput, reason string, actorID int64,
+	updated delivery.Issue, repoErr error) (delivery.Issue, error) {
+	if repoErr != nil {
+		if errors.Is(repoErr, delivery.ErrStateConflict) {
+			return delivery.Issue{}, &IssueStateConflictError{Reason: IssueConflictRevisionMismatch}
+		}
+		return delivery.Issue{}, mapIssueRepositoryError("update manual issue", repoErr)
+	}
+	updatedID := updated.ID
+	if updatedID <= 0 {
+		updatedID = issueID
+	}
+	payload := map[string]any{
+		"issue_id":    formatIssueID(updatedID),
+		"from_status": string(current.Status),
+		"to_status":   string(updated.Status),
+		"source":      delivery.IssueManualSource,
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	s.publishIssueEvent(ctx, issueEventUpdated, versionID, payload)
+	if in.MergeIntoID > 0 {
+		return s.Merge(ctx, versionID, updatedID, in.MergeIntoID, actorID, reason, &updated.ExpectedRevision)
+	}
+	return updated, nil
+}
+
 // IssueDetail is the read projection of one issue: its row plus the append-only
 // refs and status history and the latest triage analysis run, when one is
 // attached through IssueTriageReader. MergedChain is the read-time merged_into
@@ -372,6 +605,58 @@ func (s *IssueService) Merge(ctx context.Context, versionID, sourceID, targetID,
 	}
 	s.recordIssueAudit(ctx, actorID, issueAuditMerged, mergedID, metadata)
 	return merged, nil
+}
+
+// resolveManualIssueInput validates the manual payload's case_run link and
+// maps the execution projection onto the domain manual-issue input. A supplied
+// case_run must resolve to the request's version.
+func (s *IssueService) resolveManualIssueInput(ctx context.Context, versionID int64,
+	title, summary, category, severity string, caseRunID int64, evidenceIDs []int64) (delivery.ManualIssueInput, error) {
+	in := delivery.ManualIssueInput{
+		VersionID:   versionID,
+		Title:       title,
+		Summary:     summary,
+		Category:    category,
+		Severity:    severity,
+		CaseRunID:   caseRunID,
+		EvidenceIDs: evidenceIDs,
+	}
+	if caseRunID <= 0 {
+		return in, nil
+	}
+	if s.exec == nil {
+		return in, invalidArgumentf("case_run_id requires an execution reader")
+	}
+	snapshot, err := s.exec.CaseRunSnapshot(ctx, caseRunID)
+	if err != nil {
+		return in, mapIssueRepositoryError("load manual issue case run", err)
+	}
+	if snapshot.ID <= 0 {
+		snapshot.ID = caseRunID
+	}
+	if snapshot.VersionID > 0 && snapshot.VersionID != versionID {
+		return in, invalidArgumentf("case run %d belongs to version %d, not %d",
+			caseRunID, snapshot.VersionID, versionID)
+	}
+	in.CaseRunID = snapshot.ID
+	in.CaseVersionID = snapshot.CaseVersionID
+	in.RequirementID = snapshot.RequirementID
+	in.VersionSUTID = snapshot.VersionSUTID
+	return in, nil
+}
+
+// recordManualIssueCreatedAudit records the user creation audit with the same
+// delivery.issue.created action as the candidate path (D52: IDs and
+// classification only, never body/evidence content).
+func (s *IssueService) recordManualIssueCreatedAudit(ctx context.Context, actorID int64, issue delivery.Issue) {
+	metadata := map[string]any{
+		"version_id": formatIssueID(issue.VersionID),
+		"status":     string(issue.Status),
+		"category":   issue.Category,
+		"severity":   issue.Severity,
+		"source":     delivery.IssueManualSource,
+	}
+	s.recordIssueAudit(ctx, actorID, issueAuditCreated, issue.ID, metadata)
 }
 
 // issueTransition is one status-machine action of the issue service.

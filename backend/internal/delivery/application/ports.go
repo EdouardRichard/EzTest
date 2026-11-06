@@ -58,6 +58,29 @@ type IssueRecurrence struct {
 	Refs      []delivery.IssueRef
 }
 
+// IssueManualCreate is one manual issue insert (v0.22 W2-4). The repository
+// inserts the row, its refs and the creation history in one transaction.
+type IssueManualCreate struct {
+	Issue   delivery.Issue
+	Refs    []delivery.IssueRef
+	History delivery.IssueStatusChange
+}
+
+// IssueManualUpdate is one manual issue patch. Empty string fields leave the
+// stored column unchanged; ExpectedRevision is the mandatory CAS value. Refs
+// are appended idempotently and History is appended as an append-only row.
+type IssueManualUpdate struct {
+	VersionID        int64
+	IssueID          int64
+	Title            string
+	Summary          string
+	Category         string
+	Severity         string
+	ExpectedRevision int32
+	Refs             []delivery.IssueRef
+	History          delivery.IssueStatusChange
+}
+
 // IssueRepository persists delivery_issue, delivery_issue_ref and
 // delivery_issue_status_history rows.
 type IssueRepository interface {
@@ -68,6 +91,13 @@ type IssueRepository interface {
 	// with ApplyRecurrence (or falls back to AppendRefs when the chain is
 	// broken), preserving the P7 "source refs unchanged" invariant.
 	CreateCandidate(ctx context.Context, issue delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, bool, error)
+	// CreateManual inserts one manual issue with its refs and user creation
+	// history in one transaction. It is separate from CreateCandidate so the
+	// failure-candidate dedupe path is never consumed by manual issues.
+	CreateManual(ctx context.Context, c IssueManualCreate) (delivery.Issue, error)
+	// UpdateManual patches the manual fields under the expected_revision CAS,
+	// appends refs/history and returns the stored row.
+	UpdateManual(ctx context.Context, u IssueManualUpdate) (delivery.Issue, error)
 	Get(ctx context.Context, versionID, issueID int64) (delivery.Issue, error)
 	// GetByID returns an issue regardless of version, for tools and workers
 	// that resolve an issue ID without the request's version scope.

@@ -118,6 +118,10 @@ const v022Operations = [
   // W2-2 R-W2-1/API-43: version-level human decision producer (the path item
   // already exists via the human-request GET; +1 operation, 0 new paths).
   ["POST", "/api/versions/{id}/human-requests"],
+  // W2-4 R-W2-2/API-24: manual issue create/update (both path items already
+  // exist from P4; +2 operations, 0 new paths, +2 request schemas).
+  ["POST", "/api/versions/{versionId}/issues"],
+  ["PATCH", "/api/versions/{versionId}/issues/{issueId}"],
 ]
 const v022Schemas = [
   "AnswerQuestionRequest",
@@ -145,6 +149,8 @@ const v022Schemas = [
   "HandoffRequirement",
   "HandoffResources",
   "HandoffView",
+  "ManualIssueCreateRequest",
+  "ManualIssueUpdateRequest",
   "PlanItemPatchRequest",
   "PlanItemWrite",
   "QuestionAnswerView",
@@ -217,12 +223,12 @@ const baselinePaths = frozenPaths.size
 const baselineOperations = [...frozenPaths.values()].reduce((total, methods) => total + methods.size, 0)
 const releaseOperations = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
 check(
-  releasePaths.size === baselinePaths + 29 && releaseOperations === baselineOperations + 36,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 29 paths / 36 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
+  releasePaths.size === baselinePaths + 29 && releaseOperations === baselineOperations + 38,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 29 paths / 38 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
 )
 check(
-  releaseSchemas.size === frozenSchemas.size + 35,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 35 schemas (got ${releaseSchemas.size}, baseline ${frozenSchemas.size})`,
+  releaseSchemas.size === frozenSchemas.size + 37,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 37 schemas (got ${releaseSchemas.size}, baseline ${frozenSchemas.size})`,
 )
 check(missingOperations.length === 0, `v0.22 openapi contains every documented operation (${missingOperations.length} missing)`)
 check(missingSchemas.length === 0, `v0.22 openapi contains every documented schema (${missingSchemas.length} missing)`)

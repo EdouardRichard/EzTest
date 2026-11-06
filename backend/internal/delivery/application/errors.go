@@ -28,6 +28,9 @@ const (
 	// IssueConflictNotReopenable marks a reopen of an issue that is not
 	// confirmed or dismissed (merged is terminal in P4).
 	IssueConflictNotReopenable = "issue_not_reopenable"
+	// IssueConflictRevisionMismatch marks a manual patch whose
+	// expected_revision no longer matches the stored revision (v0.22 W2-4).
+	IssueConflictRevisionMismatch = "issue_revision_conflict"
 )
 
 // IssueStateConflictError is an illegal issue transition with its stable

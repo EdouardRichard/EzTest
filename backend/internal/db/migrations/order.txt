@@ -61,3 +61,4 @@ design_0002_v022_case_auto_confirm.sql
 version_0012_v022_plan_revision.sql
 version_0013_v022_extraction_report.sql
 version_0014_v022_attachment_conversation.sql
+delivery_0002_v022_issue_manual_retest.sql

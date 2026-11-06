@@ -319,6 +319,21 @@ info:
     - 超时：leader-gated 定时 sweep 按 `question.timeout_seconds`（24h）把 pending 置 `expired`
       并发 `human_request.expired`；不阻塞阶段。
 
+    ## v0.22 W2-4 增量（manual issue create/update，additive）
+
+    R-W2-2 / API-24（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§6）：
+    - `POST /api/versions/{id}/issues`（登录用户 `authenticated`）创建 `source='manual'`
+      问题，body `{title,summary,category,severity,case_run_id?,evidence_ids?,merge_into_id?,reason?}`；
+      ID 均为十进制字符串；返回 201 + `IssueView`。
+    - `PATCH /api/versions/{id}/issues/{iid}` 编辑同一组字段；`expected_revision` 必填，
+      不匹配返回 409 `state_conflict` + `details.reason=issue_revision_conflict`。
+    - 创建写 user 创建历史并发 `issue.created`；编辑写 append-only `from=to` 历史并发
+      `issue.updated`；`merge_into_id` 复用既有 merge 路径（发 `issue.merged`）。
+      不新增事件类型，重复失败候选去重（`uk_delivery_issue_version_id_dedupe_key`）不变。
+    - `delivery_issue.source` 枚举由 `failure_candidate` 扩展为
+      `failure_candidate|manual`（DB-23 迁移 `delivery_0002_v022_issue_manual_retest.sql`）；
+      同迁移新增 `retest_status`/`last_retest_wave_id`/`last_retest_case_run_id`，由 W2-5 使用。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -4649,6 +4664,44 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+    post:
+      tags: [Delivery]
+      operationId: createManualIssue
+      summary: 手动创建问题（source=manual）
+      description: |
+        创建 `source='manual'` 的问题（v0.22 W2-4）。body 支持可选
+        `case_run_id`/`evidence_ids`/`merge_into_id`/`reason`；ID 均为十进制字符串。
+        创建后写 user 创建历史并发 `issue.created`；提供 `merge_into_id` 时复用既有
+        merge 路径，最终返回 merged 问题并额外发 `issue.merged`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualIssueCreateRequest'
+      responses:
+        '201':
+          description: 创建后的问题
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
 
   /api/versions/{versionId}/issues/{issueId}:
     get:
@@ -4675,6 +4728,45 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [Delivery]
+      operationId: updateManualIssue
+      summary: 手动编辑问题（expected_revision 乐观锁）
+      description: |
+        编辑问题的 title/summary/category/severity，可选追加 case_run/evidence refs，
+        或通过 `merge_into_id` 复用既有 merge 路径（v0.22 W2-4）。`expected_revision`
+        必填；不匹配返回 409 `state_conflict` + `details.reason=issue_revision_conflict`。
+        成功写 append-only `from=to` 历史并发 `issue.updated`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualIssueUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的问题
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/Internal'
 
@@ -13506,7 +13598,8 @@ components:
           enum: [major, minor, trivial]
         source:
           type: string
-          enum: [failure_candidate]
+          enum: [failure_candidate, manual]
+          description: failure_candidate = 失败候选自动建；manual = v0.22 手动创建/编辑
         expected_revision:
           type: integer
           minimum: 1
@@ -13611,6 +13704,78 @@ components:
         expected_revision:
           type: integer
           minimum: 1
+    ManualIssueCreateRequest:
+      type: object
+      description: v0.22 W2-4 manual issue create body（IDs 为十进制字符串）
+      required: [title, category, severity]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        summary:
+          type: string
+          maxLength: 4000
+        category:
+          type: string
+          enum: [ui, api, db]
+        severity:
+          type: string
+          enum: [major, minor, trivial]
+        case_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: 可选；解析出 case_version/requirement/version_sut refs
+        evidence_ids:
+          type: array
+          maxItems: 5
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        merge_into_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: 可选；创建后复用既有 merge 路径
+        reason:
+          type: string
+          maxLength: 2000
+    ManualIssueUpdateRequest:
+      type: object
+      description: v0.22 W2-4 manual issue patch body（IDs 为十进制字符串）
+      required: [expected_revision]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        summary:
+          type: string
+          maxLength: 4000
+        category:
+          type: string
+          enum: [ui, api, db]
+        severity:
+          type: string
+          enum: [major, minor, trivial]
+        case_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+        evidence_ids:
+          type: array
+          maxItems: 5
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        merge_into_id:
+          type: string
+          pattern: '^[0-9]+$'
+        reason:
+          type: string
+          maxLength: 2000
+        expected_revision:
+          type: integer
+          minimum: 1
+          description: 必填 CAS；不匹配返回 issue_revision_conflict
     ReportView:
       type: object
       required: [id, version_id, kind, status, created_at, updated_at]

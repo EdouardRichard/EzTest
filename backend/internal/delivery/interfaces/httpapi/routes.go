@@ -8,7 +8,9 @@ import "net/http"
 func Register(mux *http.ServeMux, h *Handler) {
 	// Issues.
 	mux.Handle("GET /api/versions/{versionId}/issues", http.HandlerFunc(h.ListIssues))
+	mux.Handle("POST /api/versions/{versionId}/issues", http.HandlerFunc(h.CreateIssue))
 	mux.Handle("GET /api/versions/{versionId}/issues/{issueId}", http.HandlerFunc(h.GetIssue))
+	mux.Handle("PATCH /api/versions/{versionId}/issues/{issueId}", http.HandlerFunc(h.UpdateIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/confirm", http.HandlerFunc(h.ConfirmIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", http.HandlerFunc(h.DismissIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", http.HandlerFunc(h.ReopenIssue))

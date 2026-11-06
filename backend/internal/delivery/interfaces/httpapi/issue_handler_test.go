@@ -48,6 +48,19 @@ type issueMergeCall struct {
 	expected  *int32
 }
 
+type issueManualCreateCall struct {
+	versionID int64
+	actorID   int64
+	input     deliveryapp.CreateManualIssueInput
+}
+
+type issueManualUpdateCall struct {
+	versionID int64
+	issueID   int64
+	actorID   int64
+	input     deliveryapp.UpdateManualIssueInput
+}
+
 // fakeIssueService is an in-memory Service. It mimics the application service
 // page contract (descending ID, exclusive before cursor, bounded limit) so the
 // handler's limit+1/has_more logic is exercised against realistic data.
@@ -72,6 +85,12 @@ type fakeIssueService struct {
 	dismissCalls []issueTransitionCall
 	reopenCalls  []issueTransitionCall
 	mergeCalls   []issueMergeCall
+
+	manualIssue       delivery.Issue
+	manualCreateErr   error
+	manualUpdateErr   error
+	manualCreateCalls []issueManualCreateCall
+	manualUpdateCalls []issueManualUpdateCall
 }
 
 func (f *fakeIssueService) List(_ context.Context, versionID int64, filter deliveryapp.IssueFilter) ([]delivery.Issue, error) {
@@ -132,6 +151,20 @@ func (f *fakeIssueService) Merge(_ context.Context, versionID, sourceID, targetI
 		versionID: versionID, sourceID: sourceID, targetID: targetID, actorID: actorID, reason: reason, expected: expected,
 	})
 	return f.actionIssue, f.mergeErr
+}
+
+func (f *fakeIssueService) CreateManual(_ context.Context, input deliveryapp.CreateManualIssueInput, actorID int64) (delivery.Issue, error) {
+	f.manualCreateCalls = append(f.manualCreateCalls, issueManualCreateCall{
+		versionID: input.VersionID, actorID: actorID, input: input,
+	})
+	return f.manualIssue, f.manualCreateErr
+}
+
+func (f *fakeIssueService) UpdateManual(_ context.Context, versionID, issueID int64, input deliveryapp.UpdateManualIssueInput, actorID int64) (delivery.Issue, error) {
+	f.manualUpdateCalls = append(f.manualUpdateCalls, issueManualUpdateCall{
+		versionID: versionID, issueID: issueID, actorID: actorID, input: input,
+	})
+	return f.manualIssue, f.manualUpdateErr
 }
 
 var _ Service = (*fakeIssueService)(nil)
@@ -797,6 +830,172 @@ func TestIssueHandlerActionsRequireActor(t *testing.T) {
 	requireStatus(t, recorder, http.StatusUnauthorized)
 	if len(service.confirmCalls) != 0 {
 		t.Errorf("Confirm calls = %d, want none", len(service.confirmCalls))
+	}
+}
+
+func TestIssueHandlerCreateManualIssue(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusOpen)
+	issue.Source = delivery.IssueManualSource
+	service := &fakeIssueService{
+		manualIssue: issue,
+		details:     map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)},
+	}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues",
+		`{"title":"登录失败","summary":"s","category":"api","severity":"major","case_run_id":"900","evidence_ids":["55","56"],"merge_into_id":"2002","reason":"  manual  "}`,
+		userActor())
+	requireStatus(t, recorder, http.StatusCreated)
+	if len(service.manualCreateCalls) != 1 {
+		t.Fatalf("CreateManual calls = %#v", service.manualCreateCalls)
+	}
+	call := service.manualCreateCalls[0]
+	if call.versionID != 42 || call.actorID != 7 || call.input.VersionID != 42 {
+		t.Errorf("CreateManual identity = %+v", call)
+	}
+	if call.input.Title != "登录失败" || call.input.Summary != "s" ||
+		call.input.Category != "api" || call.input.Severity != "major" {
+		t.Errorf("CreateManual fields = %+v", call.input)
+	}
+	if call.input.CaseRunID != 900 || call.input.MergeIntoID != 2002 {
+		t.Errorf("CreateManual IDs = %+v", call.input)
+	}
+	if len(call.input.EvidenceIDs) != 2 || call.input.EvidenceIDs[0] != 55 || call.input.EvidenceIDs[1] != 56 {
+		t.Errorf("CreateManual evidence = %v", call.input.EvidenceIDs)
+	}
+	if call.input.Reason != "manual" {
+		t.Errorf("CreateManual reason = %q, want trimmed", call.input.Reason)
+	}
+	data := decodeDeliveryObject(t, recorder)
+	if data["id"] != "1001" || data["source"] != "manual" {
+		t.Errorf("create response = %v", data)
+	}
+}
+
+func TestIssueHandlerPatchManualIssue(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusOpen)
+	issue.Source = delivery.IssueManualSource
+	service := &fakeIssueService{
+		manualIssue: issue,
+		details:     map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)},
+	}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodPatch, "/api/versions/42/issues/1001",
+		`{"summary":"s2","expected_revision":3,"case_run_id":"900","evidence_ids":["55"],"merge_into_id":"2002","reason":"  edit  "}`,
+		userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	if len(service.manualUpdateCalls) != 1 {
+		t.Fatalf("UpdateManual calls = %#v", service.manualUpdateCalls)
+	}
+	call := service.manualUpdateCalls[0]
+	if call.versionID != 42 || call.issueID != 1001 || call.actorID != 7 {
+		t.Errorf("UpdateManual identity = %+v", call)
+	}
+	if call.input.ExpectedRevision != 3 || call.input.Summary != "s2" ||
+		call.input.CaseRunID != 900 || call.input.MergeIntoID != 2002 || call.input.Reason != "edit" {
+		t.Errorf("UpdateManual input = %+v", call.input)
+	}
+	if len(call.input.EvidenceIDs) != 1 || call.input.EvidenceIDs[0] != 55 {
+		t.Errorf("UpdateManual evidence = %v", call.input.EvidenceIDs)
+	}
+	if data := decodeDeliveryObject(t, recorder); data["id"] != "1001" {
+		t.Errorf("patch response = %v", data)
+	}
+}
+
+func TestIssueHandlerManualIssueValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		target string
+		body   string
+		field  string
+	}{
+		{name: "create missing title", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"category":"api","severity":"major"}`, field: "title"},
+		{name: "create blank title", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"   ","category":"api","severity":"major"}`, field: "title"},
+		{name: "create missing category", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","severity":"major"}`, field: "category"},
+		{name: "create bad category", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"network","severity":"major"}`, field: "category"},
+		{name: "create bad severity", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"api","severity":"critical"}`, field: "severity"},
+		{name: "create bad case run", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"api","severity":"major","case_run_id":"abc"}`, field: "case_run_id"},
+		{name: "create bad evidence", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"api","severity":"major","evidence_ids":["0"]}`, field: "evidence_ids"},
+		{name: "create too many evidence", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"api","severity":"major","evidence_ids":["1","2","3","4","5","6"]}`, field: "evidence_ids"},
+		{name: "create bad merge target", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"api","severity":"major","merge_into_id":"-1"}`, field: "merge_into_id"},
+		{name: "create long reason", method: http.MethodPost, target: "/api/versions/42/issues", body: `{"title":"t","category":"api","severity":"major","reason":"` + strings.Repeat("x", 2001) + `"}`, field: "reason"},
+		{name: "patch missing expected", method: http.MethodPatch, target: "/api/versions/42/issues/1001", body: `{"summary":"s2"}`, field: "expected_revision"},
+		{name: "patch zero expected", method: http.MethodPatch, target: "/api/versions/42/issues/1001", body: `{"summary":"s2","expected_revision":0}`, field: "expected_revision"},
+		{name: "patch bad category", method: http.MethodPatch, target: "/api/versions/42/issues/1001", body: `{"category":"network","expected_revision":1}`, field: "category"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeIssueService{}
+			mux := newDeliveryMux(t, New(service))
+			recorder := deliveryCall(t, mux, test.method, test.target, test.body, userActor())
+			requireStatus(t, recorder, http.StatusBadRequest)
+			details := errorDetails(t, decodeDeliveryError(t, recorder))
+			if details["field"] != test.field {
+				t.Errorf("field = %v, want %s", details["field"], test.field)
+			}
+			if len(service.manualCreateCalls)+len(service.manualUpdateCalls) != 0 {
+				t.Errorf("invalid request reached the service: %#v", service)
+			}
+		})
+	}
+}
+
+func TestIssueHandlerManualIssueErrorMapping(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		service := &fakeIssueService{manualCreateErr: &deliveryapp.IssueStateConflictError{Reason: deliveryapp.IssueConflictRevisionMismatch}}
+		mux := newDeliveryMux(t, New(service))
+		recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues",
+			`{"title":"t","category":"api","severity":"major"}`, userActor())
+		requireStatus(t, recorder, http.StatusConflict)
+		apiError := decodeDeliveryError(t, recorder)
+		if apiError["code"] != "state_conflict" {
+			t.Errorf("code = %v, want state_conflict", apiError["code"])
+		}
+		if reason := errorDetails(t, apiError)["reason"]; reason != deliveryapp.IssueConflictRevisionMismatch {
+			t.Errorf("details.reason = %v, want %s", reason, deliveryapp.IssueConflictRevisionMismatch)
+		}
+	})
+
+	t.Run("patch not found", func(t *testing.T) {
+		service := &fakeIssueService{manualUpdateErr: deliveryapp.ErrNotFound}
+		mux := newDeliveryMux(t, New(service))
+		recorder := deliveryCall(t, mux, http.MethodPatch, "/api/versions/42/issues/1001",
+			`{"summary":"s2","expected_revision":1}`, userActor())
+		requireStatus(t, recorder, http.StatusNotFound)
+	})
+
+	t.Run("patch invalid argument", func(t *testing.T) {
+		service := &fakeIssueService{manualUpdateErr: fmt.Errorf("%w: summary too long", deliveryapp.ErrInvalidArgument)}
+		mux := newDeliveryMux(t, New(service))
+		recorder := deliveryCall(t, mux, http.MethodPatch, "/api/versions/42/issues/1001",
+			`{"summary":"s2","expected_revision":1}`, userActor())
+		requireStatus(t, recorder, http.StatusBadRequest)
+	})
+
+	t.Run("patch unknown error", func(t *testing.T) {
+		service := &fakeIssueService{manualUpdateErr: errors.New("boom")}
+		mux := newDeliveryMux(t, New(service))
+		recorder := deliveryCall(t, mux, http.MethodPatch, "/api/versions/42/issues/1001",
+			`{"summary":"s2","expected_revision":1}`, userActor())
+		requireStatus(t, recorder, http.StatusInternalServerError)
+	})
+}
+
+func TestIssueHandlerManualIssueRequiresActor(t *testing.T) {
+	service := &fakeIssueService{}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues",
+		`{"title":"t","category":"api","severity":"major"}`, nil)
+	requireStatus(t, recorder, http.StatusUnauthorized)
+	recorder = deliveryCall(t, mux, http.MethodPatch, "/api/versions/42/issues/1001",
+		`{"summary":"s2","expected_revision":1}`, nil)
+	requireStatus(t, recorder, http.StatusUnauthorized)
+	if len(service.manualCreateCalls)+len(service.manualUpdateCalls) != 0 {
+		t.Errorf("unauthenticated requests reached the service: %#v", service)
 	}
 }
 

@@ -28,6 +28,8 @@ type Service interface {
 	Dismiss(ctx context.Context, versionID, issueID, actorID int64, reason string, expected *int32) (delivery.Issue, error)
 	Reopen(ctx context.Context, versionID, issueID, actorID int64, reason string, expected *int32) (delivery.Issue, error)
 	Merge(ctx context.Context, versionID, sourceID, targetID, actorID int64, reason string, expected *int32) (delivery.Issue, error)
+	CreateManual(ctx context.Context, in deliveryapp.CreateManualIssueInput, actorID int64) (delivery.Issue, error)
+	UpdateManual(ctx context.Context, versionID, issueID int64, in deliveryapp.UpdateManualIssueInput, actorID int64) (delivery.Issue, error)
 }
 
 var _ Service = (*deliveryapp.IssueService)(nil)
@@ -190,6 +192,104 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 		History:     history,
 		RelatedRefs: relatedRefCounts(detail.Refs),
 	})
+}
+
+/* --------------------------------- manual --------------------------------- */
+
+// CreateIssue POST /api/versions/{versionId}/issues (v0.22 W2-4). The body is a
+// manual issue payload; the response is the created issue view (201).
+func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
+	if h.issues == nil {
+		writeNotConfigured(w, r, "issue service")
+		return
+	}
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := pathID(r, "versionId", "versionId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request manualIssueRequest
+	if err := decodeBody(w, r, &request, true); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	fields, err := request.parse(true)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	issue, err := h.issues.CreateManual(r.Context(), deliveryapp.CreateManualIssueInput{
+		VersionID:   versionID,
+		Title:       fields.Title,
+		Summary:     fields.Summary,
+		Category:    fields.Category,
+		Severity:    fields.Severity,
+		CaseRunID:   fields.CaseRunID,
+		EvidenceIDs: fields.EvidenceIDs,
+		MergeIntoID: fields.MergeIntoID,
+		Reason:      fields.Reason,
+	}, actorID)
+	if err != nil {
+		httpx.Error(w, r, mapIssueError(err, ""))
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, h.actionIssueView(r.Context(), versionID, issue))
+}
+
+// UpdateIssue PATCH /api/versions/{versionId}/issues/{issueId} (v0.22 W2-4).
+// expected_revision is the mandatory optimistic lock; the response is the
+// updated issue view (200).
+func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
+	if h.issues == nil {
+		writeNotConfigured(w, r, "issue service")
+		return
+	}
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := pathID(r, "versionId", "versionId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	issueID, err := pathID(r, "issueId", "issueId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request manualIssueRequest
+	if err := decodeBody(w, r, &request, true); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	fields, err := request.parse(false)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	issue, err := h.issues.UpdateManual(r.Context(), versionID, issueID, deliveryapp.UpdateManualIssueInput{
+		Title:            fields.Title,
+		Summary:          fields.Summary,
+		Category:         fields.Category,
+		Severity:         fields.Severity,
+		CaseRunID:        fields.CaseRunID,
+		EvidenceIDs:      fields.EvidenceIDs,
+		MergeIntoID:      fields.MergeIntoID,
+		Reason:           fields.Reason,
+		ExpectedRevision: *fields.Expected,
+	}, actorID)
+	if err != nil {
+		httpx.Error(w, r, mapIssueError(err, ""))
+		return
+	}
+	httpx.JSON(w, http.StatusOK, h.actionIssueView(r.Context(), versionID, issue))
 }
 
 /* -------------------------------- actions --------------------------------- */
@@ -438,6 +538,8 @@ func issueStateConflict(reason string) error {
 		message = "issue is not open"
 	case deliveryapp.IssueConflictNotReopenable:
 		message = "issue is not reopenable"
+	case deliveryapp.IssueConflictRevisionMismatch:
+		message = "issue revision is stale"
 	case delivery.MergeReasonTargetInvalid:
 		message = "merge target is invalid"
 	case delivery.MergeReasonCycle:

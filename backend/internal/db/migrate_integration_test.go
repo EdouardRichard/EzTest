@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 61 {
-		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
+	if len(applied) != 62 {
+		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -183,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 61 {
-		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
+	if len(applied) != 62 {
+		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -324,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 61 {
-		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
+	if len(applied) != 62 {
+		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -377,6 +377,7 @@ func TestP4DeliverySchema(t *testing.T) {
 		"uk_delivery_report_revision_report_id_revision",
 		"uk_delivery_report_ref_report_revision_id_kind_ref_id",
 		"uk_requirement_closure_requirement_id_close_round",
+		"ck_delivery_issue_source",
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT c.conname
@@ -695,7 +696,7 @@ func TestP7P9Schema(t *testing.T) {
 	}
 
 	// Column extensions on pre-existing tables: report PDF metadata, issue
-	// recurrence counters and the optional SUT family.
+	// recurrence counters, the v0.22 retest model and the optional SUT family.
 	columns := []struct {
 		table      string
 		column     string
@@ -709,6 +710,9 @@ func TestP7P9Schema(t *testing.T) {
 		{"delivery_report_revision", "pdf_rendered_at", "timestamp with time zone", "YES", ""},
 		{"delivery_issue", "recurrence_count", "integer", "NO", "0"},
 		{"delivery_issue", "last_recurred_at", "timestamp with time zone", "YES", ""},
+		{"delivery_issue", "retest_status", "text", "NO", "'not_retested'::text"},
+		{"delivery_issue", "last_retest_wave_id", "bigint", "YES", ""},
+		{"delivery_issue", "last_retest_case_run_id", "bigint", "YES", ""},
 		{"sut", "family", "text", "YES", ""},
 	}
 	for _, column := range columns {
@@ -1071,8 +1075,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 61 {
-		t.Fatalf("applied %d migrations, want 61: %v", len(applied), applied)
+	if len(applied) != 62 {
+		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
 	}
 
 	columns := []struct {

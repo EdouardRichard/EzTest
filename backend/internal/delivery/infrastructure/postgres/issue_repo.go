@@ -49,6 +49,15 @@ const (
 		ON CONFLICT (version_id, dedupe_key) DO NOTHING
 		RETURNING ` + issueColumns
 
+	insertManualIssueSQL = `
+		INSERT INTO delivery_issue (
+			id, version_id, title, summary, status, category, severity, dedupe_key,
+			fingerprint, source, expected_revision, created_by_run_id, created_at,
+			updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		RETURNING ` + issueColumns
+
 	selectIssueByDedupeSQL = `
 		SELECT ` + issueColumns + `
 		FROM delivery_issue
@@ -171,6 +180,156 @@ func (r *IssueRepository) CreateCandidate(ctx context.Context, issue delivery.Is
 		return delivery.Issue{}, false, fmt.Errorf("create issue candidate: commit: %w", err)
 	}
 	return created, true, nil
+}
+
+// CreateManual inserts one manual issue, its logical refs and its user creation
+// history in one transaction. It deliberately bypasses the candidate
+// ON CONFLICT dedupe path: manual issues carry a random dedupe key and must
+// always create a new row.
+func (r *IssueRepository) CreateManual(ctx context.Context, c deliveryapp.IssueManualCreate) (delivery.Issue, error) {
+	ctx = contextOrBackground(ctx)
+	if c.Issue.VersionID <= 0 {
+		return delivery.Issue{}, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, fmt.Errorf("create manual issue: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	createdAt := c.Issue.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = nowUTC()
+	}
+	updatedAt := c.Issue.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	status := c.Issue.Status
+	if status == "" {
+		status = delivery.IssueStatusOpen
+	}
+	source := c.Issue.Source
+	if source == "" {
+		source = delivery.IssueManualSource
+	}
+	expectedRevision := c.Issue.ExpectedRevision
+	if expectedRevision <= 0 {
+		expectedRevision = 1
+	}
+	created, err := scanIssue(tx.QueryRow(ctx, insertManualIssueSQL,
+		r.insertID(c.Issue.ID), c.Issue.VersionID, c.Issue.Title, c.Issue.Summary,
+		string(status), c.Issue.Category, c.Issue.Severity, c.Issue.DedupeKey,
+		c.Issue.Fingerprint, source, expectedRevision, c.Issue.CreatedByRunID,
+		createdAt, updatedAt,
+	))
+	if err != nil {
+		return delivery.Issue{}, wrapDB("create manual issue", err)
+	}
+	if err := r.insertRefs(ctx, tx, created.ID, c.Refs); err != nil {
+		return delivery.Issue{}, err
+	}
+	history := c.History
+	history.IssueID = created.ID
+	if history.To == "" {
+		history.To = created.Status
+	}
+	if history.CreatedAt.IsZero() {
+		history.CreatedAt = createdAt
+	}
+	if history.UpdatedAt.IsZero() {
+		history.UpdatedAt = history.CreatedAt
+	}
+	if err := r.insertHistory(ctx, tx, history); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, fmt.Errorf("create manual issue: commit: %w", err)
+	}
+	return created, nil
+}
+
+// UpdateManual applies one manual patch under the expected_revision CAS. The
+// row is locked, the revision is compared, then the provided fields, the refs
+// and the append-only history row commit atomically.
+func (r *IssueRepository) UpdateManual(ctx context.Context, u deliveryapp.IssueManualUpdate) (delivery.Issue, error) {
+	ctx = contextOrBackground(ctx)
+	if u.VersionID <= 0 || u.IssueID <= 0 || u.ExpectedRevision <= 0 {
+		return delivery.Issue{}, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, fmt.Errorf("update manual issue: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentRevision int32
+	err = tx.QueryRow(ctx, `
+		SELECT expected_revision
+		FROM delivery_issue
+		WHERE id = $1 AND version_id = $2
+		FOR UPDATE
+	`, u.IssueID, u.VersionID).Scan(&currentRevision)
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("update manual issue: lock issue", err)
+	}
+	if currentRevision != u.ExpectedRevision {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+
+	now := nowUTC()
+	updated, err := scanIssue(tx.QueryRow(ctx, `
+		UPDATE delivery_issue
+		SET title = COALESCE($3, title),
+			summary = COALESCE($4, summary),
+			category = COALESCE($5, category),
+			severity = COALESCE($6, severity),
+			expected_revision = expected_revision + 1,
+			updated_at = $7
+		WHERE id = $1 AND version_id = $2
+		RETURNING `+issueColumns,
+		u.IssueID, u.VersionID, nullableText(u.Title), nullableText(u.Summary),
+		nullableText(u.Category), nullableText(u.Severity), now,
+	))
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("update manual issue", err)
+	}
+	if err := r.insertRefs(ctx, tx, u.IssueID, u.Refs); err != nil {
+		return delivery.Issue{}, err
+	}
+	history := u.History
+	history.IssueID = u.IssueID
+	if history.To == "" {
+		history.To = updated.Status
+	}
+	if history.CreatedAt.IsZero() {
+		history.CreatedAt = now
+	}
+	if history.UpdatedAt.IsZero() {
+		history.UpdatedAt = history.CreatedAt
+	}
+	if err := r.insertHistory(ctx, tx, history); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, fmt.Errorf("update manual issue: commit: %w", err)
+	}
+	return updated, nil
+}
+
+// nullableText maps an empty patch field onto SQL NULL so COALESCE keeps the
+// stored column unchanged.
+func nullableText(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 // Get loads one issue inside its version scope.

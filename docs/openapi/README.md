@@ -11,12 +11,14 @@ v0.22 additive 策略见下）。身份分两层：
   `GET /api/versions/{id}/scope-snapshot`，以及 W1-14A/API-36/37/39/40 的
   discovery observations/deltas/coverage 与 gaps 读），W2-2 追加 R-W2-1/API-43 的
   `POST /api/versions/{id}/human-requests` operation（复用既有 human-requests path
-  item，+1 operation / +1 schema）。合计 **29 个 path item / 36 个 operation /
-  35 个 schema**。当前文件为 **210 paths / 258 operations / 316 schemas**。
-  新增段在 `info.description` 的
+  item，+1 operation / +1 schema），W2-4 追加 R-W2-2/API-24 的 manual issue
+  create/patch operation（复用既有 issues path item，+2 operations / +2 schemas）。
+  合计 **29 个 path item / 38 个 operation / 37 个 schema**。当前文件为
+  **210 paths / 260 operations / 318 schemas**。新增段在 `info.description` 的
   `### v0.22 W0 增量（Task 37，additive）`、`## v0.22 W1 增量（W1-13，additive）`、
-  `## v0.22 W1 增量（W1-14A，additive）` 与
-  `## v0.22 W2-2 增量（human request decisions，additive）` 中说明。
+  `## v0.22 W1 增量（W1-14A，additive）`、
+  `## v0.22 W2-2 增量（human request decisions，additive）` 与
+  `## v0.22 W2-4 增量（manual issue create/update，additive）` 中说明。
 - 公开端点 `GET /api/openapi.yaml` 原样返回本文件。
 
 ## 单一事实源与整文件 port（0.2.1 基线）
