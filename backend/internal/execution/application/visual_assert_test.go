@@ -347,3 +347,32 @@ func TestVisualAssertionNotRunBlocksFalsePass(t *testing.T) {
 		t.Fatalf("summary = %+v", finished.Summary)
 	}
 }
+
+// TestW2VisualExecutorFailureIsBlocked pins the fourth state: a hard executor
+// failure (no actual bytes) is reported as classification=blocked while the
+// assertion verdict stays inconclusive, and no fabricated visual_diff row is
+// written.
+func TestW2VisualExecutorFailureIsBlocked(t *testing.T) {
+	fixture, cfg := visualCaseFixture(t)
+	prepareCaseRun(t, fixture)
+	passVisualStep(t, fixture)
+	fixture.browser.result = executionapp.BrowserActionResult{
+		OK:    false,
+		Error: &executionapp.BrowserActionError{Code: "context_not_found", Message: "browser context is gone"},
+	}
+
+	out, err := fixture.runner.VisualAssert(context.Background(), p3Scope(), cfg.ID)
+	if err != nil {
+		t.Fatalf("VisualAssert: %v", err)
+	}
+	result := out.(map[string]any)
+	if result["classification"] != "blocked" || result["verdict"] != "inconclusive" {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(fixture.visual.recordCalls) != 0 {
+		t.Fatalf("blocked failure fabricated %d visual_diff rows", len(fixture.visual.recordCalls))
+	}
+	if kinds := evidenceKinds(fixture); len(kinds) != 0 {
+		t.Fatalf("blocked failure wrote evidence %v", kinds)
+	}
+}

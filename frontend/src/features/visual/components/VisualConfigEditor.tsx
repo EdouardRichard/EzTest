@@ -65,6 +65,14 @@ function regionFrom(value: unknown): VisualRegion | null {
   return { x, y, width, height }
 }
 
+// The API renders an absent region as `{}` (whole image). It must stay
+// disabled: saving it as a 0..1 crop would make the server see a config change,
+// bump config_revision and supersede an approved baseline without a real edit.
+function hasRegion(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  return Object.keys(value).length > 0
+}
+
 function waitPolicyText(value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return ""
   const keys = Object.keys(value)
@@ -99,9 +107,7 @@ export function VisualConfigEditor({
   const [deviceScaleFactor, setDeviceScaleFactor] = useState(
     String(initial?.device_scale_factor ?? DEFAULT_DPR),
   )
-  const [regionEnabled, setRegionEnabled] = useState(
-    initial?.region !== null && initial?.region !== undefined,
-  )
+  const [regionEnabled, setRegionEnabled] = useState(hasRegion(initial?.region))
   const [region, setRegion] = useState<VisualRegion>(
     regionFrom(initial?.region) ?? { x: 0, y: 0, width: 1, height: 1 },
   )
@@ -120,7 +126,7 @@ export function VisualConfigEditor({
     setViewportWidth(String(initial.viewport_width))
     setViewportHeight(String(initial.viewport_height))
     setDeviceScaleFactor(String(initial.device_scale_factor))
-    setRegionEnabled(initial.region !== null && initial.region !== undefined)
+    setRegionEnabled(hasRegion(initial.region))
     setRegion(regionFrom(initial.region) ?? { x: 0, y: 0, width: 1, height: 1 })
     setWaitPolicy(waitPolicyText(initial.wait_policy))
   }, [initial])
@@ -148,7 +154,7 @@ export function VisualConfigEditor({
       setViewportWidth(String(match.viewport_width))
       setViewportHeight(String(match.viewport_height))
       setDeviceScaleFactor(String(match.device_scale_factor))
-      setRegionEnabled(match.region !== null && match.region !== undefined)
+      setRegionEnabled(hasRegion(match.region))
       setRegion(regionFrom(match.region) ?? { x: 0, y: 0, width: 1, height: 1 })
       setWaitPolicy(waitPolicyText(match.wait_policy))
       setErrors({})
