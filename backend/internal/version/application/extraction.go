@@ -908,6 +908,11 @@ type ReconciliationReport struct {
 var (
 	// extractionFRIDPattern is the declared-requirement id syntax (R-A7-8).
 	extractionFRIDPattern = regexp.MustCompile(`FR-\d{3,}`)
+	// extractionRHeadingIDPattern is the second declared-requirement id scheme
+	// (FA-5 typical input): a Markdown heading whose text starts with R<2
+	// digits> ("## R01 账号密码登录"). It is applied to heading text only, so
+	// AC-R01-01 sub-items and body references never inflate the declared count.
+	extractionRHeadingIDPattern = regexp.MustCompile(`^(R\d{2})\b`)
 	// extractionFRHeadingPattern finds the heading sections that must be
 	// scanned a second time ("功能需求" / FR 清单).
 	extractionFRHeadingPattern = regexp.MustCompile(`(?i)功能需求|\bfr\b`)
@@ -917,18 +922,21 @@ var (
 	extractionCurrentHeadingPattern = regexp.MustCompile(`(?i)v1|当前|本期|current`)
 )
 
-// ReconcileDocument counts the FR ids declared by a requirements document and
-// compares them with the ids the run actually extracted.
+// ReconcileDocument counts the requirement ids declared by a requirements
+// document and compares them with the ids the run actually extracted. Two id
+// schemes are declared: FR-\d{3,} occurrences and R<2 digits> Markdown headings
+// ("## R01 账号密码登录") whose AC-Rxx-yy sub-items are not separate ids.
 //
 // The first pass applies FR-\d{3,} to the whole document (deduplicated in
-// appearance order). The heading second pass re-scans every Markdown heading
-// whose text contains "功能需求"/"FR" plus its following lines, so ids that only
-// occur in a functional-requirements section are never lost. Headings marking
-// V2/规划 split the declared ids into PlannedIDs; V1/当前 sections fill
-// CurrentIDs. Expected/Extracted/Missing and MissingIDs are computed over the
-// V1 current partition only; planned ids are counted separately and are never
-// missing. The report never invents an id and never rewrites extracted ids:
-// missing_ids is the set difference, in document order.
+// appearance order) and adds the id of every R heading. The heading second pass
+// re-scans every Markdown heading whose text contains "功能需求"/"FR" plus its
+// following lines, so ids that only occur in a functional-requirements section
+// are never lost. Headings marking V2/规划 split the declared ids into
+// PlannedIDs; V1/当前 sections fill CurrentIDs. Expected/Extracted/Missing and
+// MissingIDs are computed over the V1 current partition only; planned ids are
+// counted separately and are never missing. The report never invents an id and
+// never rewrites extracted ids: missing_ids is the set difference, in document
+// order.
 func ReconcileDocument(documentText string, input ReconciliationInput) ReconciliationReport {
 	report := ReconciliationReport{
 		LowConfidence: input.LowConfidence,
@@ -969,6 +977,9 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 				regionPlanned = true
 			case extractionCurrentHeadingPattern.MatchString(headingTexts[index]):
 				regionPlanned = false
+			}
+			if matches := extractionRHeadingIDPattern.FindStringSubmatch(headingTexts[index]); len(matches) == 2 {
+				add(matches[1])
 			}
 		}
 		for _, id := range extractionFRIDPattern.FindAllString(line, -1) {
