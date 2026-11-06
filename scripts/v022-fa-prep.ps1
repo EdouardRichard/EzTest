@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 final-acceptance FA-2 preparation: fresh stack + real vision gate.
@@ -331,6 +331,7 @@ function Save-PrepVerdict {
             eztestSelect1 = [bool]$script:dbEztestOk
             sutSelect1    = [bool]$script:dbSutOk
             uploads       = [bool]$script:dbUploadsOk
+            redis         = 'not_applicable'
         }
         executor      = [pscustomobject][ordered]@{
             url        = $executorBase
@@ -383,7 +384,28 @@ if ($Stop) {
 
 # ---------------------------------------------------------------------------
 # Reuse guard: never drop a database out from under a live FA stack.
+# A listener may be a child of the recorded process (e.g. Next.js dev spawns
+# start-server.js), so ownership is checked against the recorded PID's tree.
 # ---------------------------------------------------------------------------
+function Get-ProcessParentPid([int]$PidValue) {
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$PidValue" -ErrorAction Stop
+        if ($null -eq $p) { return 0 }
+        return [int]$p.ParentProcessId
+    }
+    catch { return 0 }
+}
+
+function Test-PidInTree([int]$RootPid, [int]$CandidatePid) {
+    if ($RootPid -le 0 -or $CandidatePid -le 0) { return $false }
+    $current = $CandidatePid
+    for ($depth = 0; $depth -lt 8 -and $current -gt 0; $depth++) {
+        if ($current -eq $RootPid) { return $true }
+        $current = Get-ProcessParentPid -PidValue $current
+    }
+    return $false
+}
+
 $portMap = [ordered]@{ api = $apiPort; web = $webPort; executor = $executorPort }
 $busy = [ordered]@{}
 foreach ($name in $portMap.Keys) {
@@ -398,7 +420,7 @@ if ($busy.Count -gt 0) {
             $allOurs = $true
             foreach ($name in 'api', 'web', 'executor') {
                 $expected = [int]$recorded.$name
-                if (-not $busy.Contains($name) -or [int]$busy[$name] -ne $expected) { $allOurs = $false }
+                if (-not $busy.Contains($name) -or -not (Test-PidInTree -RootPid $expected -CandidatePid ([int]$busy[$name]))) { $allOurs = $false }
             }
         }
         catch { $allOurs = $false }
