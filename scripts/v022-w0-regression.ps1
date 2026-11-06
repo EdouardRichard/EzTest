@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 W0 end-to-end regression (Task 38).
