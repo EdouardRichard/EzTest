@@ -525,15 +525,26 @@ function Invoke-GatePrep {
             $checkNames.Add($name)
             if (-not [bool]$check.ok) { Add-Red "prep check not ok: $name ($([string]$check.detail))" }
         }
-        $requiredPrepChecks = @('db.eztest', 'db.sut', 'api.ready', 'executor.health', 'executor.auth',
-            'sut.health', 'sut.posts', 'sut.uploads', 'sut.web', 'vision.upstream', 'vision.catalog', 'screenshots')
+        $requiredPrepChecks = @('sut.health', 'sut.posts', 'sut.uploads', 'sut.web',
+            'api.ready', 'executor.health', 'web.login', 'vision.catalog', 'vision.upstream',
+            'vision.caption', 'db.eztest', 'db.sut', 'executor.auth', 'screenshots')
+        if ($checks.Count -ne $requiredPrepChecks.Count) { Add-Red "prep-verdict.checks=$($checks.Count) (expected exactly $($requiredPrepChecks.Count))" }
         foreach ($required in $requiredPrepChecks) {
             if (@($checkNames) -notcontains $required) { Add-Red "missing prep check: $required" }
         }
+        foreach ($name in @($checkNames)) {
+            if ($requiredPrepChecks -notcontains $name) { Add-Red "unexpected prep check: $name" }
+        }
+        $duplicateChecks = @($checkNames | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+        if ($duplicateChecks.Count -gt 0) { Add-Red "duplicate prep checks: $($duplicateChecks -join ',')" }
 
         if (-not [bool]$verdict.db.eztestSelect1) { Add-Red 'db.eztestSelect1 is not true' }
         if (-not [bool]$verdict.db.sutSelect1) { Add-Red 'db.sutSelect1 is not true' }
         if (-not [bool]$verdict.db.uploads) { Add-Red 'db.uploads is not true' }
+        $redisField = $verdict.db.PSObject.Properties['redis']
+        if ($null -ne $redisField -and ([string]$redisField.Value -ne 'not_applicable') -and (-not [bool]$redisField.Value)) {
+            Add-Red "db.redis=$([string]$redisField.Value) (expected true or not_applicable)"
+        }
 
         $executorUrl = [string]$verdict.executor.url
         if ($executorUrl -ne 'http://127.0.0.1:13360') { Add-Red "executor.url='$executorUrl' (expected http://127.0.0.1:13360)" }
@@ -553,6 +564,45 @@ function Invoke-GatePrep {
         if ([string]::IsNullOrWhiteSpace($visionCaption)) { Add-Red 'vision.caption is empty (no real image caption)' }
         if (-not [bool]$verdict.vision.catalogSupportsVision) { Add-Red 'vision.catalogSupportsVision is not true' }
         if (-not [bool]$verdict.vision.catalogDefault) { Add-Red 'vision.catalogDefault is not true' }
+        if ([int]$verdict.vision.httpStatus -ne 200) { Add-Red "vision.httpStatus=$([string]$verdict.vision.httpStatus) (expected 200)" }
+        if ($visionModel -ne 'deepseek-flash') { Add-Red "vision.model='$visionModel' (expected deepseek-flash)" }
+
+        # Raw evidence cross-checks: a forged verdict must not pass while the
+        # recorded upstream response or catalog JSON says otherwise.
+        $visionRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\vision-upstream.json')
+        if ($null -eq $visionRaw) { Add-Red 'missing prep/checks/vision-upstream.json' }
+        else {
+            if ([int]$visionRaw.status -ne 200) { Add-Red "vision-upstream.json status=$([string]$visionRaw.status) (expected 200)" }
+            if ([string]$visionRaw.model -ne 'deepseek-flash') { Add-Red "vision-upstream.json model='$([string]$visionRaw.model)' (expected deepseek-flash)" }
+            if (-not ([string]$visionRaw.baseUrl).StartsWith('https://')) { Add-Red "vision-upstream.json baseUrl='$([string]$visionRaw.baseUrl)' (expected https upstream)" }
+            $rawCaption = [string]$visionRaw.caption
+            if ([string]::IsNullOrWhiteSpace($rawCaption)) { Add-Red 'vision-upstream.json caption is empty' }
+            elseif ($rawCaption -ne $visionCaption) { Add-Red "vision.caption='$visionCaption' does not match raw caption='$rawCaption'" }
+            $rawContent = ''
+            try { $rawContent = [string]$visionRaw.response.choices[0].message.content } catch { $rawContent = '' }
+            if ([string]::IsNullOrWhiteSpace($rawContent)) { Add-Red 'vision-upstream.json response has no assistant content' }
+            elseif ([string]::IsNullOrWhiteSpace($rawCaption) -or -not $rawContent.Contains($rawCaption)) { Add-Red 'vision-upstream.json content does not contain the recorded caption' }
+        }
+        $modelsRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\llm-models.json')
+        if ($null -eq $modelsRaw) { Add-Red 'missing prep/checks/llm-models.json' }
+        else {
+            if ([int]$modelsRaw.status -ne 200) { Add-Red "llm-models.json status=$([string]$modelsRaw.status) (expected 200)" }
+            $catalogModels = @($modelsRaw.body.data)
+            $catalogModel = @($catalogModels | Where-Object { [string]$_.model -eq 'deepseek-flash' })
+            if ($catalogModel.Count -ne 1) { Add-Red "llm-models.json deepseek-flash entries=$($catalogModel.Count) (expected 1)" }
+            else {
+                if (-not [bool]$catalogModel[0].capabilities.supports_vision) { Add-Red 'llm-models.json deepseek-flash supports_vision is not true' }
+                if (-not [bool]$catalogModel[0].default) { Add-Red 'llm-models.json deepseek-flash is not the default model' }
+            }
+        }
+        $webLoginRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\web-login.json')
+        if ($null -eq $webLoginRaw) { Add-Red 'missing prep/checks/web-login.json' }
+        elseif ([int]$webLoginRaw.status -ne 200) { Add-Red "web-login.json status=$([string]$webLoginRaw.status) (expected 200)" }
+        $execRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\executor-contexts.json')
+        $execNoAuthRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\executor-unauthorized.json')
+        if ($null -eq $execRaw) { Add-Red 'missing prep/checks/executor-contexts.json' }
+        if ($null -eq $execNoAuthRaw) { Add-Red 'missing prep/checks/executor-unauthorized.json' }
+        elseif ([int]$execNoAuthRaw.status -ne 401) { Add-Red "executor-unauthorized.json status=$([string]$execNoAuthRaw.status) (expected 401)" }
 
         if ([string]$verdict.stack.db -ne 'eztest_v022_fa') { Add-Red "stack.db=$([string]$verdict.stack.db) (expected eztest_v022_fa)" }
         if ([int]$verdict.stack.apiPort -ne 13460) { Add-Red "stack.apiPort=$([string]$verdict.stack.apiPort) (expected 13460)" }
