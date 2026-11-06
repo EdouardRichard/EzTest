@@ -1009,7 +1009,8 @@ async function main() {
     stage = await getStage()
   }
   record('stage.designing', { stage })
-  if (stage !== 'designing' && stage !== 'case_review') throw new Error(`stage=${stage} (expected designing/case_review)`)
+  if (stage !== 'designing' && stage !== 'case_review' && !(RESUME && stage === 'completed')) throw new Error(`stage=${stage} (expected designing/case_review)`)
+  if (RESUME && stage === 'completed') log('resume: version already completed; collecting evidence without re-running design/execution')
 
   // -- wait for design coverage (>=1 case per requirement) -----------------
   async function readDesignGraph() {
@@ -1086,8 +1087,10 @@ async function main() {
   for (let index = 0; index < state.requirementIds.length; index++) {
     const rid = String(state.requirementIds[index])
     const list = designCases.filter((entry) => entry.requirement_id === rid)
-    let candidate = pickCase(list)
-    if (String(candidate.status) === 'confirmed') {
+    let candidate = (RESUME && stage === 'completed')
+      ? (list.find((entry) => String(entry.status) === 'confirmed') || pickCase(list))
+      : pickCase(list)
+    if (String(candidate.status) === 'confirmed' || (RESUME && stage === 'completed')) {
       // Already confirmed (for example by the deterministic discovery path):
       // confirming again would be a 409, so adopt the current case version.
       confirmed.push({
