@@ -781,6 +781,10 @@ server.listen(port, "127.0.0.1", () => console.log(`[issue-llm-proxy] 127.0.0.1:
     $verdict.history = @($history)
     Write-Host "== db issue history rows=$($script:historyRows)"
     if ($script:historyRows -lt 1) { throw 'issue has no status history rows' }
+    $creationRow = $history[0]
+    if ($creationRow.from_status -ne 'null' -or $creationRow.to_status -ne 'open') {
+        throw "issue creation history row is from_status=$($creationRow.from_status) to_status=$($creationRow.to_status), want null -> open"
+    }
 
     $eventRaw = Invoke-Db ("select seq, type, coalesce(envelope->'payload'->>'issue_id',''), coalesce(envelope->'payload'->>'version_id',''), coalesce(envelope->'payload'->>'wave_id',''), coalesce(envelope->'payload'->>'retest_status',''), coalesce(envelope->'payload'->>'case_run_ids',''), coalesce(envelope->'payload'->>'error','') from event where channel = 'version:$versionId' and seq > $($script:eventBaseline) and type like 'issue.retest_%' order by seq")
     $eventRows = @()

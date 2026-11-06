@@ -112,52 +112,79 @@ function executionCaseRunHref(versionId: string, caseRunId: string): string {
 }
 
 /**
- * Picks the wave a ref belongs to. Retest refs use the retest wave (the last
- * role='retest' wave ref); source refs keep the original failure wave so a
- * retest never rewrites the evidence deep link of the source run.
+ * One append-only ref generation: the source failure (or recurrence) run with
+ * the wave it failed in, or one retest wave with the runs it created.
  */
-function relatedWaveID(refs: IssueRef[], role: string): string | undefined {
-  const isRetest = role === "retest"
-  const candidates = refs.filter(
-    (ref) => ref.kind === "wave" && (isRetest ? ref.role === "retest" : ref.role !== "retest"),
-  )
-  return candidates.length > 0 ? candidates[candidates.length - 1].ref_id : undefined
+type RefGeneration = {
+  waveId?: string
+  caseRunId?: string
+}
+
+/**
+ * Groups refs into the generations they were appended in. Source refs are
+ * written as `case_run, case_version, wave, …, evidence` and retest refs as
+ * `wave, case_run(s)`, so each source case_run / retest wave opens a new
+ * generation. Pairing every ref with its own generation keeps the original
+ * failure wave on older source evidence instead of the last wave of the issue.
+ */
+function refGenerations(refs: IssueRef[]): Array<RefGeneration | null> {
+  const generations: Array<RefGeneration | null> = refs.map(() => null)
+  for (const isRetest of [false, true]) {
+    let current: RefGeneration | null = null
+    for (let index = 0; index < refs.length; index++) {
+      const ref = refs[index]
+      if ((ref.role === "retest") !== isRetest) continue
+      if (isRetest) {
+        if (ref.kind === "wave") {
+          current = { waveId: ref.ref_id }
+        } else if (ref.kind === "case_run") {
+          if (current === null) current = { caseRunId: ref.ref_id }
+          else current.caseRunId ??= ref.ref_id
+        }
+      } else if (ref.kind === "case_run") {
+        current = { caseRunId: ref.ref_id }
+      } else if (ref.kind === "wave") {
+        if (current === null) current = { waveId: ref.ref_id }
+        else current.waveId ??= ref.ref_id
+      }
+      generations[index] = current
+    }
+  }
+  return generations
 }
 
 function executionHref(
   versionId: string,
-  refs: IssueRef[],
+  generation: RefGeneration | null,
   kind: "case_run" | "wave" | "evidence",
   refId: string,
-  role: string,
 ): string {
-  const isRetest = role === "retest"
-  const caseRunId = refs.find(
-    (ref) => ref.kind === "case_run" && (isRetest ? ref.role === "retest" : ref.role !== "retest"),
-  )?.ref_id
-  const waveId = relatedWaveID(refs, role)
   const params = new URLSearchParams({ tab: "execution" })
   if (kind === "wave") {
     params.set("wave", refId)
     return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
   }
-  if (waveId !== undefined) params.set("wave", waveId)
+  if (generation?.waveId !== undefined) params.set("wave", generation.waveId)
   if (kind === "case_run") {
     params.set("case_run", refId)
   } else {
-    if (caseRunId !== undefined) params.set("case_run", caseRunId)
+    if (generation?.caseRunId !== undefined) params.set("case_run", generation.caseRunId)
     params.set("evidence", refId)
   }
   return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
 }
 
 /** Builds the destination for one issue ref; `null` means "no deep link". */
-function refHref(versionId: string, refs: IssueRef[], ref: IssueRef): string | null {
+function refHref(
+  versionId: string,
+  ref: IssueRef,
+  generation: RefGeneration | null,
+): string | null {
   switch (ref.kind) {
     case "case_run":
     case "wave":
     case "evidence":
-      return executionHref(versionId, refs, ref.kind, ref.ref_id, ref.role)
+      return executionHref(versionId, generation, ref.kind, ref.ref_id)
     case "report": {
       const params = new URLSearchParams({ tab: "reports", report: ref.ref_id })
       return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
@@ -200,6 +227,7 @@ function HistoryRow({ entry }: { entry: IssueHistoryView }) {
 
 function RefsSection({ versionId, issue }: { versionId: string; issue: IssueDetailView }) {
   const counts = Object.entries(issue.related_refs)
+  const generations = refGenerations(issue.refs)
   return (
     <section data-testid="issue-refs" aria-label="关联引用" className="space-y-2">
       <h3 className="text-xs font-semibold text-foreground">关联引用</h3>
@@ -216,8 +244,8 @@ function RefsSection({ versionId, issue }: { versionId: string; issue: IssueDeta
         <p className="text-[11px] text-muted-foreground">暂无关联引用。</p>
       ) : (
         <ul className="space-y-1.5">
-          {issue.refs.map((ref) => {
-            const href = refHref(versionId, issue.refs, ref)
+          {issue.refs.map((ref, index) => {
+            const href = refHref(versionId, ref, generations[index])
             const label = `${refLabel(ref.kind)} #${ref.ref_id}`
             return (
               <li key={`${ref.kind}-${ref.ref_id}-${ref.role}`} className="flex items-center gap-2">

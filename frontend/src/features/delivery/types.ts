@@ -15,8 +15,11 @@ export type IssueCategory = "ui" | "api" | "db"
 
 export type IssueSeverity = "major" | "minor" | "trivial"
 
-/** P4 only ingests deterministic failure candidates. */
-export type IssueSource = "failure_candidate"
+/**
+ * `IssueView.source`: `failure_candidate` is the automatic failure candidate;
+ * `manual` is the v0.22 W2-4 user-created/edited issue.
+ */
+export type IssueSource = "failure_candidate" | "manual"
 
 export type IssueRefKind =
   | "case_run"
