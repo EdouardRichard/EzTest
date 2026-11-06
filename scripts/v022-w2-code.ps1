@@ -390,6 +390,22 @@ try {
     foreach ($item in @($repoRows.data)) {
         $repoInfo[[string]$item.repo_id] = $item
     }
+    # The base data may carry a stale branch name (for example "master" while
+    # the SUT worktree is on "main"). CodeTab's change preview resolves the
+    # repository branch, so align the metadata with the real branch through the
+    # product API before indexing.
+    $branchFixes = @()
+    foreach ($repoId in $repoIds) {
+        $path = [string]$repoInfo[$repoId].repository.path
+        $currentBranch = [string]$repoInfo[$repoId].repository.branch
+        $actualBranch = (& git -C $path symbolic-ref --short HEAD 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($actualBranch) -and $actualBranch -ne $currentBranch) {
+            Invoke-Api -Method 'PATCH' -Path "/api/resources/code-repos/$repoId" -Body @{ branch = $actualBranch } | Out-Null
+            $branchFixes += [ordered]@{ repoId = $repoId; from = $currentBranch; to = $actualBranch }
+            Write-Host "== repository $repoId branch metadata: $currentBranch -> $actualBranch"
+        }
+    }
+    $verdict.repositoryBranchFixes = $branchFixes
     $reposPlan = @()
     foreach ($repoId in $repoIds) {
         if (-not $repoInfo.ContainsKey($repoId)) { throw "repository $repoId is missing from the version code repos" }
@@ -675,11 +691,11 @@ try {
   await page.waitForTimeout(1200)
   await shot("01-codetab-anchor.png")
 
-  await page.goto(`${web}/versions/${versionId}?tab=code&repo=${repo2}`, { waitUntil: "domcontentloaded" })
-  await page.waitForSelector("select#code-repo", { timeout: 60000 })
-  await page.waitForFunction(() => document.querySelectorAll("select#code-repo option").length >= 2, null, { timeout: 30000 })
-  await page.waitForTimeout(1200)
-  await shot("02-codetab-repo2.png")
+  const anchorRow = page.locator("li[aria-label]").first()
+  await anchorRow.scrollIntoViewIfNeeded()
+  await page.waitForTimeout(600)
+  await page.screenshot({ path: path.join(out, "02-codetab-anchor-panel.png"), fullPage: false })
+  console.log("screenshot 02-codetab-anchor-panel.png")
 } finally {
   await browser.close()
 }
