@@ -22,12 +22,23 @@
     The admin then approves U/A through the existing resource confirm routes.
     W2-11 auto-confirms one additive case revision per resource
     (trigger=discovery_delta, auto_confirmed_by=system) while the current wave
-    case_run IDs stay unchanged. Wave 2 (explicit selection of the new cases)
-    shows the new resources in the frozen scope snapshot and executes the new
-    cases. Coverage moves from uncovered to covered. The script then rolls back
-    one auto-confirmed revision through the W2-12 UI (in-session notice) and
+    case_run IDs stay unchanged. The scheduler auto-creates wave 2 with every
+    current+confirmed case (including C1), not only the new discovery cases;
+    the script attaches to it and asserts that every new case ID actually ran.
+    Coverage moves from uncovered to covered. The script then rolls back one
+    auto-confirmed revision through the W2-12 UI (in-session notice) and
     verifies the W2-C11 replacement semantics (case kept, trigger=rollback,
     rollback_of set, repeated rollback idempotent).
+
+    Finally, a same-version replay phase creates manual intents for the two
+    current discovered cases and starts another wave on the same version. It
+    snapshots observation identities/counts, proposed catalog rows, facts,
+    case versions, case.revision.auto_confirmed events and resource.delta
+    events before and after; the replay must add no duplicate observation
+    group, no proposed resource, no fact, no case revision and no resource.delta
+    event, while observation occurrence counts increase to prove the replay
+    actually executed. The idempotency evidence is written by this script to
+    run/exploration-idempotency.json.
 
     The SUT and PostgreSQL are never stopped. The started API/executor/web/
     proxy are stopped at the end and execution.executor_url is restored to its
@@ -35,6 +46,7 @@
 
     Evidence (untracked):
         docs/version-V0.22/acceptance/evidence/w2/run/exploration-verdict.json
+        docs/version-V0.22/acceptance/evidence/w2/run/exploration-idempotency.json
         docs/version-V0.22/acceptance/evidence/w2/run/exploration/*.png
         docs/version-V0.22/acceptance/evidence/w2/run/exploration/*.json
 
@@ -43,6 +55,7 @@
 param(
     [switch]$SkipBuild,
     [switch]$VerdictOnly,
+    [switch]$SelfTestVerdictPersist,
     [switch]$KeepStack,
     [int]$DesignTimeoutSeconds = 1200,
     [int]$WaveTimeoutSeconds = 1200,
@@ -72,15 +85,20 @@ $proxyBase = "http://127.0.0.1:$proxyPort"
 $sutWeb = 'http://localhost:5173'
 $sutApi = 'http://localhost:8080/api/v1/posts?limit=1'
 $verdictPath = Join-Path $runEvidence 'exploration-verdict.json'
+$flowVerdictPath = Join-Path $runEvidence 'exploration-flow-verdict.json'
+$idempotencyPath = Join-Path $runEvidence 'exploration-idempotency.json'
 $statePath = Join-Path $runEvidence 'exploration-state.json'
 $flowLog = Join-Path $runEvidence 'exploration-flow.log'
 $originalExecutorUrlPath = Join-Path $work 'original-executor-url.txt'
+$selfTestVerdictPath = Join-Path $work 'verdict-selftest.json'
 $flowExit = 0
 $exitCode = 0
 $externalBlocked = $false
 $blockedReason = ''
 $stackStarted = $false
 $token = ''
+$activeVerdict = $null
+$finalVerdictWritten = $false
 
 New-Item -ItemType Directory -Force -Path $work, $runEvidence, $shotDir | Out-Null
 
@@ -88,6 +106,63 @@ New-Item -ItemType Directory -Force -Path $work, $runEvidence, $shotDir | Out-Nu
 # PowerShell 5.1 text cmdlets would rewrite them in the active ANSI code page.
 function Write-Utf8([string]$path, [string]$text) {
     [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-JsonFile([string]$path, $value) {
+    Write-Utf8 $path (($value | ConvertTo-Json -Depth 30) + "`n")
+}
+
+# Writes the final acceptance verdict. This is the single writer of
+# exploration-verdict.json: the Node flow only writes a draft, so a failure in
+# the independent PowerShell phase can never leave status=PASS behind. The
+# self-test exercises this function with an injected failure against a temp
+# path so the failure-persistence guarantee is itself verified.
+function Write-FinalVerdict([string]$path, $verdict, [string[]]$redItems) {
+    $allRed = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($verdict.red)) {
+        $text = [string]$item
+        if (-not [string]::IsNullOrWhiteSpace($text) -and -not $allRed.Contains($text)) { $allRed.Add($text) }
+    }
+    foreach ($item in @($redItems)) {
+        $text = [string]$item
+        if (-not [string]::IsNullOrWhiteSpace($text) -and -not $allRed.Contains($text)) { $allRed.Add($text) }
+    }
+    if ($allRed.Count -gt 0) { $verdict.status = 'FAIL' } else { $verdict.status = 'PASS' }
+    $verdict.red = @($allRed)
+    Write-JsonFile $path $verdict
+}
+
+function Invoke-VerdictPersistSelfTest {
+    $source = $null
+    if (Test-Path $verdictPath) {
+        try { $source = Get-Content $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $source = $null }
+    }
+    if (-not $source) {
+        $source = [pscustomobject]@{ status = 'PASS'; replayed = $true; red = @(); checks = [pscustomobject]@{}; generatedAt = (Get-Date -Format o) }
+    }
+    $source.status = 'PASS'
+    $source.red = @()
+    $source | Add-Member -NotePropertyName psPhase -NotePropertyValue ([pscustomobject]@{ executedAt = (Get-Date -Format o); checks = [pscustomobject]@{} }) -Force
+    $injected = 'forcedFailurePersist: injected PS assertion failure (self-test)'
+    $beforeHash = ''
+    if (Test-Path $verdictPath) { $beforeHash = (Get-FileHash $verdictPath -Algorithm SHA256).Hash }
+
+    Write-FinalVerdict $selfTestVerdictPath $source @($injected)
+
+    $read = Get-Content $selfTestVerdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($read.status -ne 'FAIL') {
+        throw "verdict self-test failed: status=$($read.status), want FAIL (a PowerShell-phase failure must persist as FAIL)"
+    }
+    $redText = @($read.red | ForEach-Object { [string]$_ })
+    if (-not ($redText -contains $injected)) {
+        throw "verdict self-test failed: injected red item is missing; red=$($redText -join '; ')"
+    }
+    $afterHash = ''
+    if (Test-Path $verdictPath) { $afterHash = (Get-FileHash $verdictPath -Algorithm SHA256).Hash }
+    if ($beforeHash -and $beforeHash -ne $afterHash) {
+        throw 'verdict self-test failed: the evidence verdict was modified (the self-test must use a temp path)'
+    }
+    Write-Host "== verdict self-test PASS: injected PS failure persisted status=FAIL red=[$injected]"
 }
 
 function Get-EnvValue([string]$key) {
@@ -160,12 +235,15 @@ function Stop-E2EPorts {
 # Verdict contract gate. This is the RED-phase acceptance test: it fails
 # before the evidence run exists and is re-evaluated after every run.
 # ---------------------------------------------------------------------------
-function Assert-ExplorationVerdict {
-    if (-not (Test-Path $verdictPath)) { throw 'missing exploration verdict' }
-    $v = Get-Content $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($null -eq $v) { throw 'unreadable exploration verdict' }
+function Assert-ExplorationVerdict([object]$Verdict = $null) {
+    if ($null -eq $Verdict) {
+        if (-not (Test-Path $verdictPath)) { throw 'missing exploration verdict' }
+        $Verdict = Get-Content $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    if ($null -eq $Verdict) { throw 'unreadable exploration verdict' }
+    $v = $Verdict
     if ($v.status -ne 'PASS') { throw "exploration verdict status=$($v.status)" }
-    if ($v.replayed -ne $false) { throw "exploration verdict replayed=$($v.replayed), want false" }
+    if ($v.replayed -ne $true) { throw "exploration verdict replayed=$($v.replayed), want true (the script executes a same-version replay phase)" }
 
     $before = @($v.currentWaveCaseRunIdsBefore | ForEach-Object { [string]$_ })
     $after = @($v.currentWaveCaseRunIdsAfter | ForEach-Object { [string]$_ })
@@ -188,6 +266,11 @@ function Assert-ExplorationVerdict {
     if ([int]$v.caseRevisionEvents -lt 1) { throw 'no case.revision.auto_confirmed events' }
     if (@($v.newCaseVersionIds | Where-Object { $_ }).Count -lt 1) { throw 'no auto-confirmed case revisions' }
     if ([string]::IsNullOrWhiteSpace([string]$v.rollbackRevisionId)) { throw 'no rollback replacement revision' }
+    if ($v.rollbackCaseKept -ne $true) { throw "rollbackCaseKept=$($v.rollbackCaseKept), want true (computed from the case table)" }
+    if ([string]::IsNullOrWhiteSpace([string]$v.replayWaveId)) { throw 'no same-version replay wave id' }
+    if ($null -eq $v.idempotency) { throw 'missing idempotency evidence' }
+    if ($v.idempotency.status -ne 'PASS') { throw "idempotency status=$($v.idempotency.status)" }
+    if ($v.idempotency.replayExecuted -ne $true) { throw 'idempotency evidence says the replay did not execute' }
 
     $shots = @($v.screenshots | Where-Object { $_ })
     if ($shots.Count -lt 3) { throw "screenshots=$($shots.Count), want at least 3" }
@@ -199,7 +282,10 @@ function Assert-ExplorationVerdict {
 }
 
 try {
-    if ($VerdictOnly) {
+    if ($SelfTestVerdictPersist) {
+        Invoke-VerdictPersistSelfTest
+        $exitCode = 0
+    } elseif ($VerdictOnly) {
         Assert-ExplorationVerdict
         Write-Host '== W2-13 exploration verdict contract: PASS'
         $exitCode = 0
@@ -486,7 +572,16 @@ fs.mkdirSync(SHOTS, { recursive: true })
 const designDir = path.join(RUN, "exploration")
 fs.mkdirSync(designDir, { recursive: true })
 
-const state = { checks: {}, startedAt: new Date().toISOString(), red: [] }
+const state = {
+  checks: {},
+  startedAt: new Date().toISOString(),
+  red: [],
+  // Same-version replay evidence (C1). Every field is filled from live API/DB
+  // reads; nothing here is a constant.
+  replay: { executed: false, checks: {}, waveId: null, caseRunIds: [], newCaseIds: [], intentIds: [] },
+  versionCreatedByThisRun: false,
+  rollbackCaseKept: false,
+}
 const steps = []
 let token = ""
 let lastHttp = null
@@ -554,6 +649,10 @@ function check(name, ok, detail) {
   log(`[${ok ? "PASS" : "RED"}] ${name}: ${detail === undefined ? "" : String(detail)}`)
   return !!ok
 }
+function replayCheck(name, ok, detail) {
+  state.replay.checks[name] = { ok: !!ok, detail: detail === undefined ? "" : String(detail) }
+  return check(name, ok, detail)
+}
 function recordStep(name, detail = {}) {
   const step = { index: steps.length + 1, step: name, at: nowIso(), ...detail }
   steps.push(step)
@@ -587,14 +686,25 @@ async function loginUi() {
   p.setDefaultTimeout(45000)
   await p.goto(`${WEB}/login`, { waitUntil: "domcontentloaded" })
   await sleep(900)
-  if (p.url().includes("/login")) {
-    if (await p.locator("#username").count()) {
+  // The isolated Next dev server can occasionally be slow to hydrate under
+  // parallel acceptance load; retry the form instead of turning a cold start
+  // into a false acceptance failure.
+  for (let attempt = 0; attempt < 3 && p.url().includes("/login"); attempt++) {
+    try {
+      await p.waitForSelector("#username", { timeout: 30000 })
       await p.fill("#username", "admin")
       await p.fill("#password", ADMIN_PASSWORD)
       await p.locator("button[type=submit]").click()
+      await p.waitForURL(/\/versions/, { timeout: 45000 })
+    } catch (err) {
+      if (attempt === 2) throw new Error(`UI login did not reach /versions after 3 attempts: ${String(err.message || err).split("\n")[0]}`)
+      log("UI login attempt failed; reloading /login:", String(err.message || err).split("\n")[0])
+      await sleep(2000)
+      await p.goto(`${WEB}/login`, { waitUntil: "domcontentloaded" })
+      await sleep(1500)
     }
-    await p.waitForURL(/\/versions/, { timeout: 60000 })
   }
+  if (!p.url().includes("/versions")) throw new Error(`UI login did not reach /versions (url=${p.url()})`)
   return p
 }
 async function openVersionTab(p, tab) {
@@ -638,6 +748,29 @@ async function waitWaveTerminal(waveId, timeoutMs) {
 async function caseRuns(waveId) {
   return listItems(await must("GET", `/api/versions/${state.versionId}/waves/${waveId}/case-runs`))
 }
+// Starts a wave for the selected case IDs. The scheduler may already have
+// created an auto wave (it includes every current+confirmed case, not only the
+// requested ones); in that case attach to the active wave instead of racing a
+// second POST. The caller asserts that every selected case still ran.
+async function startWaveSelected(caseIds, timeoutMs) {
+  let started = await api("POST", `/api/versions/${state.versionId}/waves`, { case_ids: caseIds })
+  let attached = false
+  if (started.status !== 201 && started.status !== 200) {
+    if (started.status === 409) {
+      const waves = await listWaves()
+      const active = waves.find((wave) => !["done", "failed", "cancelled"].includes(wave.status))
+      if (active) {
+        started = { status: 200, json: { data: { wave_id: active.id } }, text: "" }
+        attached = true
+      }
+    }
+  }
+  if (started.status !== 201 && started.status !== 200) throw new Error(`POST /waves -> ${started.status}: ${started.text.slice(0, 400)}`)
+  const waveId = String(started.json.data.wave_id)
+  const done = await waitWaveTerminal(waveId, timeoutMs)
+  const runs = await caseRuns(waveId)
+  return { waveId, attached, done, runs }
+}
 async function coverage() {
   return (await must("GET", `/api/versions/${state.versionId}/coverage`)).data
 }
@@ -656,6 +789,56 @@ async function requirementView(requirementId) {
 // digits.
 function dbRevisionRows(triggerCondition) {
   return dbJson(`select coalesce(json_agg(json_build_object('case_version_id', cv.id::text, 'case_id', cv.case_id::text, 'revision', cv.revision, 'status', cv.status, 'trigger', cv.trigger, 'auto_confirmed_by', cv.auto_confirmed_by, 'source_observation_id', cv.source_observation_id::text, 'rollback_of', cv.rollback_of::text) order by cv.id), '[]')::text from case_version cv join case_entity ce on ce.id = cv.case_id join case_scenario s on s.id = ce.scenario_id where s.version_id = ${state.versionId} and ${triggerCondition}`) || []
+}
+
+// -- Same-version replay snapshot (C1) -------------------------------------
+// Every value is a dynamic read of the current version; the replay assert
+// compares these snapshots instead of trusting a recorded artifact.
+function observationIdentity(row) {
+  return [String(row.kind || ""), String(row.method || ""), String(row.resource_template || "")].join("|")
+}
+function idempotencySnapshot() {
+  const observationRows = dbJson(`select coalesce(json_agg(json_build_object('id', o.id::text, 'kind', o.kind, 'method', coalesce(o.method, ''), 'resource_template', o.resource_template, 'decision', o.decision, 'occurrences', o.occurrences) order by o.id), '[]')::text from execution_discovery_observation o where o.version_id = ${state.versionId}`) || []
+  const groups = new Map()
+  for (const row of observationRows) {
+    const key = observationIdentity(row)
+    groups.set(key, (groups.get(key) || 0) + 1)
+  }
+  const decisions = {}
+  for (const row of observationRows) decisions[row.decision || "unknown"] = (decisions[row.decision || "unknown"] || 0) + 1
+  const proposedPages = dbJson(`select coalesce(json_agg(json_build_object('id', p.id::text, 'route_template', p.route_template) order by p.id), '[]')::text from sut_page p where p.environment_id = ${state.environmentId} and p.status = 'proposed'`) || []
+  const proposedApis = dbJson(`select coalesce(json_agg(json_build_object('id', a.id::text, 'method', a.method, 'path_template', a.path_template) order by a.id), '[]')::text from sut_api a where a.environment_id = ${state.environmentId} and a.status = 'proposed'`) || []
+  return {
+    observationRows: observationRows.length,
+    distinctObservationIdentities: groups.size,
+    duplicateObservationGroups: [...groups.values()].filter((count) => count > 1).length,
+    observationOccurrences: observationRows.reduce((sum, row) => sum + Number(row.occurrences || 0), 0),
+    observationIdentities: [...groups.keys()].sort(),
+    observationDecisions: decisions,
+    proposedPageIds: proposedPages.map((row) => String(row.id)).sort(),
+    proposedApiIds: proposedApis.map((row) => String(row.id)).sort(),
+    uPageCatalogRows: Number(dbQuery(`select count(*) from sut_page where id = ${state.uPageId} and environment_id = ${state.environmentId}`)),
+    aApiCatalogRows: Number(dbQuery(`select count(*) from sut_api where id = ${state.aApiId} and environment_id = ${state.environmentId}`)),
+    // Discovery facts only: design/gap/progress facts belong to concurrent
+    // design activity, not to the execution-time replay under test.
+    factRows: Number(dbQuery(`select count(*) from version_fact where version_id = ${state.versionId} and source = 'execution'`)),
+    allFactRows: Number(dbQuery(`select count(*) from version_fact where version_id = ${state.versionId}`)),
+    // Discovery revisions only: the design Host may publish unrelated normal
+    // drafts while the replay runs; those are not replay duplicates.
+    caseVersionRows: Number(dbQuery(`select count(*) from case_version cv join case_entity ce on ce.id = cv.case_id join case_scenario s on s.id = ce.scenario_id where s.version_id = ${state.versionId} and cv.trigger in ('discovery_delta','rollback')`)),
+    allCaseVersionRows: Number(dbQuery(`select count(*) from case_version cv join case_entity ce on ce.id = cv.case_id join case_scenario s on s.id = ce.scenario_id where s.version_id = ${state.versionId}`)),
+    resourceDeltaEvents: Number(dbQuery(`select count(*) from event where channel = 'version:${state.versionId}' and type = 'resource.delta'`)),
+    caseRevisionEvents: Number(dbQuery(`select count(*) from event where channel = 'version:${state.versionId}' and type = 'case.revision.auto_confirmed'`)),
+  }
+}
+function sortIds(values) {
+  return (values || []).map((value) => String(value)).sort()
+}
+function sameIdList(a, b) {
+  return sortIds(a).join(",") === sortIds(b).join(",")
+}
+function currentDiscoveredCaseVersions() {
+  return dbJson(`select coalesce(json_agg(json_build_object('case_id', ce.id::text, 'case_version_id', cv.id::text, 'revision', cv.revision, 'status', cv.status, 'trigger', cv.trigger) order by ce.id), '[]')::text from case_entity ce join case_version cv on cv.id = ce.current_version_id join case_scenario s on s.id = ce.scenario_id where s.version_id = ${state.versionId} and ce.id in (${state.newCaseIds.join(",")})`) || []
 }
 async function ensureRequirementClarified(requirementId) {
   const current = await requirementView(requirementId)
@@ -1087,26 +1270,28 @@ async function main() {
   state.screenshots.push(shotAfter.path)
   recordStep("ui.discovery.after", shotAfter)
 
-  // -- wave 2: explicit selection of the new cases only --------------------
-  let started2 = await api("POST", `/api/versions/${state.versionId}/waves`, { case_ids: state.newCaseIds })
-  if (started2.status !== 201 && started2.status !== 200 && started2.status === 409) {
-    // The scheduler may have planned a wave on its own; attach to the active
-    // wave (it contains every current+confirmed case, including the new ones).
-    const waves = await listWaves()
-    const active = waves.find((wave) => !["done", "failed", "cancelled"].includes(wave.status))
-    if (active) started2 = { status: 200, json: { data: { wave_id: active.id } }, text: "" }
-  }
-  if (started2.status !== 201 && started2.status !== 200) throw new Error(`POST /waves -> ${started2.status}: ${started2.text.slice(0, 400)}`)
-  state.wave2Id = String(started2.json.data.wave_id)
-  const wave2Done = await waitWaveTerminal(state.wave2Id, WAVE2_TIMEOUT)
-  const wave2Runs = await caseRuns(state.wave2Id)
+  // -- wave 2: the scheduler auto-creates a wave with every current+confirmed
+  //    case (including C1), so the selected POST may 409 and attach to that
+  //    wave. The acceptance requirement is that *every* new discovery case ID
+  //    actually ran in the next wave, not merely one of them.
+  const start2 = await startWaveSelected(state.newCaseIds, WAVE2_TIMEOUT)
+  state.wave2Id = start2.waveId
+  state.wave2AttachedToAutoWave = start2.attached
+  const wave2Done = start2.done
+  const wave2Runs = start2.runs
   state.wave2CaseRuns = wave2Runs.map((run) => ({ id: String(run.id), case_id: String(run.case_id), case_version_id: String(run.case_version_id), status: run.status, title: run.title }))
   const newCaseRuns = wave2Runs.filter((run) => state.newCaseIds.includes(String(run.case_id)))
-  check("nextWaveExecutedNewCase", newCaseRuns.length >= 1,
-    `wave2=${state.wave2Id} runs=${state.wave2CaseRuns.map((run) => `${run.case_id}:${run.status}`).join(",")}`)
-  check("nextWaveNewCasesTerminal", newCaseRuns.length >= 1 && newCaseRuns.every((run) => ["passed", "failed", "blocked", "inconclusive", "skipped", "interrupted", "superseded"].includes(run.status)) && newCaseRuns.some((run) => run.status === "passed"),
-    `newRuns=${newCaseRuns.map((run) => `${run.case_id}/${run.case_version_id}:${run.status}`).join(",")}`)
-  recordStep("wave2.terminal", { waveId: state.wave2Id, status: wave2Done.status, runs: state.wave2CaseRuns })
+  const newCaseIdsRan = [...new Set(newCaseRuns.map((run) => String(run.case_id)))]
+  const missingNewCaseIds = state.newCaseIds.filter((id) => !newCaseIdsRan.includes(id))
+  const terminalStatuses = ["passed", "failed", "blocked", "inconclusive", "skipped", "interrupted", "superseded"]
+  const newCasesAllPassed = state.newCaseIds.every((id) => wave2Runs.some((run) => String(run.case_id) === id && run.status === "passed"))
+  state.wave2NewCaseIdsRan = newCaseIdsRan
+  state.wave2MissingNewCaseIds = missingNewCaseIds
+  check("nextWaveExecutedNewCase", missingNewCaseIds.length === 0,
+    `wave2=${state.wave2Id} attachedToAutoWave=${start2.attached} newCaseIds=${state.newCaseIds.join(",")} ran=${newCaseIdsRan.join(",")} missing=${missingNewCaseIds.join(",")} runs=${state.wave2CaseRuns.map((run) => `${run.case_id}:${run.status}`).join(",")}`)
+  check("nextWaveNewCasesTerminal", missingNewCaseIds.length === 0 && newCaseRuns.every((run) => terminalStatuses.includes(run.status)) && newCasesAllPassed,
+    `newRuns=${newCaseRuns.map((run) => `${run.case_id}/${run.case_version_id}:${run.status}`).join(",")} allNewCasesPassed=${newCasesAllPassed}`)
+  recordStep("wave2.terminal", { waveId: state.wave2Id, attachedToAutoWave: start2.attached, status: wave2Done.status, runs: state.wave2CaseRuns })
 
   // -- next wave frozen scope contains U and A -----------------------------
   const snapshotResp = await api("GET", `/api/versions/${state.versionId}/scope-snapshot?wave_id=${state.wave2Id}`)
@@ -1146,13 +1331,14 @@ async function main() {
   state.rollbackTrigger = replacement.trigger
   state.rollbackCaseId = String(replacement.case_id)
   const rollbackCase = dbJson(`select coalesce(json_agg(json_build_object('id', ce.id::text) order by ce.id), '[]')::text from case_entity ce where ce.id = ${replacement.case_id}`) || []
+  state.rollbackCaseKept = Array.isArray(rollbackCase) ? rollbackCase.length === 1 : false
   // The API is idempotent: repeating the rollback of the original returns the
   // same replacement revision.
   const repeat = await must("POST", `/api/versions/${state.versionId}/case-versions/${state.rollbackOfRevisionId}/rollback`, { reason: "W2-13 repeated rollback (idempotency)" })
   const repeatId = String(repeat.data.case_version_id)
   check("rollbackReplacementConfirmed",
-    replacement.status === "confirmed" && replacement.trigger === "rollback" && String(replacement.rollback_of) === state.rollbackOfRevisionId && rollbackCase.length === 1,
-    `replacement=${state.rollbackRevisionId} original=${state.rollbackOfRevisionId} status=${replacement.status} trigger=${replacement.trigger} caseKept=${rollbackCase.length === 1}`)
+    replacement.status === "confirmed" && replacement.trigger === "rollback" && String(replacement.rollback_of) === state.rollbackOfRevisionId && state.rollbackCaseKept,
+    `replacement=${state.rollbackRevisionId} original=${state.rollbackOfRevisionId} status=${replacement.status} trigger=${replacement.trigger} caseKept=${state.rollbackCaseKept}`)
   check("rollbackIdempotent", repeatId === state.rollbackRevisionId, `repeat=${repeatId} first=${state.rollbackRevisionId}`)
   recordStep("rollback.verified", { replacement: state.rollbackRevisionId, original: state.rollbackOfRevisionId, repeated: repeatId })
   // The rollback publishes one more case.revision.auto_confirmed (rollback_of
@@ -1167,6 +1353,139 @@ async function main() {
   state.screenshots.push(shotExecution.path)
   recordStep("ui.execution.wave2", shotExecution)
 
+  // -- same-version replay (C1) -------------------------------------------
+  // The initial intents of the two discovered cases are terminal, so a plain
+  // POST /waves has nothing dispatchable. The replay therefore creates one
+  // explicit manual intent per *current* discovered case version and starts a
+  // new wave on the same version. This is a real re-execution of the same
+  // observation/capture path; it creates no environment or version and must
+  // not duplicate any observation group, proposed resource, fact, case
+  // revision or resource.delta event. Observation occurrence counts must rise
+  // to prove the replay actually ran (an upsert-only row is the expected
+  // cross-wave dedupe).
+  const replayBefore = idempotencySnapshot()
+  const replayCases = currentDiscoveredCaseVersions()
+  if (replayCases.length !== state.newCaseIds.length) {
+    throw new Error(`same-version replay: expected ${state.newCaseIds.length} current discovered case versions, got ${replayCases.length}`)
+  }
+  state.replay.intentIds = []
+  // Create both manual intents concurrently: the execution scheduler ticks
+  // every second, so a sequential pair can race an auto wave that contains
+  // only the first case. Both requests are issued in the same tick window.
+  const replayIntentResults = await Promise.all(replayCases.map(async (row) => {
+    const intent = await must("POST", `/api/versions/${state.versionId}/execution/intents`, {
+      case_version_id: String(row.case_version_id),
+      purpose: "manual",
+    })
+    return { row, intent }
+  }))
+  for (const { row, intent } of replayIntentResults) {
+    state.replay.intentIds.push(String(intent.data.id))
+    recordStep("replay.intent.created", { caseId: String(row.case_id), caseVersionId: String(row.case_version_id), intentId: String(intent.data.id) })
+  }
+  const replayStart = await startWaveSelected(state.newCaseIds, WAVE2_TIMEOUT)
+  const replayRuns = replayStart.runs
+  const replayNewCaseRuns = replayRuns.filter((run) => state.newCaseIds.includes(String(run.case_id)))
+  const replayRanIds = [...new Set(replayNewCaseRuns.map((run) => String(run.case_id)))]
+  const replayMissing = state.newCaseIds.filter((id) => !replayRanIds.includes(id))
+  const replayAllPassed = state.newCaseIds.every((id) => replayRuns.some((run) => String(run.case_id) === id && run.status === "passed"))
+  const replayAfter = idempotencySnapshot()
+  state.replay.executed = !!replayStart.waveId && replayMissing.length === 0
+  state.replay.waveId = replayStart.waveId
+  state.replay.attachedToAutoWave = replayStart.attached
+  state.replay.caseRunIds = replayRuns.map((run) => String(run.id)).sort()
+  state.replay.newCaseRuns = replayNewCaseRuns.map((run) => ({ id: String(run.id), case_id: String(run.case_id), case_version_id: String(run.case_version_id), status: run.status }))
+  state.replay.before = replayBefore
+  state.replay.after = replayAfter
+  state.replay.replayWaveStatus = replayStart.done.status
+  state.replayed = state.replay.executed
+
+  const noNewObservationGroups = replayBefore.observationRows === replayAfter.observationRows &&
+    replayBefore.distinctObservationIdentities === replayAfter.distinctObservationIdentities &&
+    sameIdList(replayBefore.observationIdentities, replayAfter.observationIdentities) &&
+    replayAfter.duplicateObservationGroups === 0
+  const noNewProposedResources = sameIdList(replayBefore.proposedPageIds, replayAfter.proposedPageIds) &&
+    sameIdList(replayBefore.proposedApiIds, replayAfter.proposedApiIds) &&
+    replayBefore.uPageCatalogRows === replayAfter.uPageCatalogRows &&
+    replayBefore.aApiCatalogRows === replayAfter.aApiCatalogRows
+  const noNewFacts = replayBefore.factRows === replayAfter.factRows
+  const noNewCaseRevisions = replayBefore.caseVersionRows === replayAfter.caseVersionRows &&
+    replayBefore.caseRevisionEvents === replayAfter.caseRevisionEvents
+  const noNewResourceDeltaEvents = replayBefore.resourceDeltaEvents === replayAfter.resourceDeltaEvents
+  const replayObserved = replayAfter.observationOccurrences > replayBefore.observationOccurrences
+
+  replayCheck("replayWaveExecutedAllNewCases", state.replay.executed,
+    `replayWave=${state.replay.waveId} status=${replayStart.done.status} attachedToAutoWave=${replayStart.attached} newCaseIds=${state.newCaseIds.join(",")} ran=${replayRanIds.join(",")} missing=${replayMissing.join(",")} runs=${replayRuns.map((run) => `${run.case_id}:${run.status}`).join(",")}`)
+  replayCheck("replayNewCasesPassed", replayAllPassed, `newCaseRuns=${replayNewCaseRuns.map((run) => `${run.case_id}:${run.status}`).join(",")}`)
+  replayCheck("replayObservationCaptured", replayObserved,
+    `occurrences ${replayBefore.observationOccurrences}->${replayAfter.observationOccurrences} rows ${replayBefore.observationRows}->${replayAfter.observationRows}`)
+  replayCheck("noNewObservationGroups", noNewObservationGroups,
+    `rows ${replayBefore.observationRows}->${replayAfter.observationRows} identities ${replayBefore.distinctObservationIdentities}->${replayAfter.distinctObservationIdentities} duplicateGroups=${replayAfter.duplicateObservationGroups}`)
+  replayCheck("noNewProposedResources", noNewProposedResources,
+    `proposedPages ${replayBefore.proposedPageIds.length}->${replayAfter.proposedPageIds.length} proposedApis ${replayBefore.proposedApiIds.length}->${replayAfter.proposedApiIds.length} catalogU ${replayBefore.uPageCatalogRows}->${replayAfter.uPageCatalogRows} catalogA ${replayBefore.aApiCatalogRows}->${replayAfter.aApiCatalogRows}`)
+  replayCheck("noNewFacts", noNewFacts, `executionFacts ${replayBefore.factRows}->${replayAfter.factRows} (allFacts ${replayBefore.allFactRows}->${replayAfter.allFactRows}, informational)`)
+  replayCheck("noNewCaseRevisions", noNewCaseRevisions,
+    `discoveryCaseVersions ${replayBefore.caseVersionRows}->${replayAfter.caseVersionRows} caseRevisionEvents ${replayBefore.caseRevisionEvents}->${replayAfter.caseRevisionEvents} (allCaseVersions ${replayBefore.allCaseVersionRows}->${replayAfter.allCaseVersionRows}, informational)`)
+  replayCheck("noNewResourceDeltaEvents", noNewResourceDeltaEvents,
+    `resourceDeltaEvents ${replayBefore.resourceDeltaEvents}->${replayAfter.resourceDeltaEvents}`)
+
+  const replayOk = Object.keys(state.replay.checks).length > 0 && Object.values(state.replay.checks).every((entry) => entry.ok) && state.replay.executed
+  const idempotency = {
+    status: replayOk ? "PASS" : "FAIL",
+    versionId: state.versionId,
+    environmentId: state.environmentId,
+    currentWaveId: state.wave1Id,
+    nextWaveId: state.wave2Id,
+    replayWaveId: state.replay.waveId,
+    replayExecuted: state.replay.executed,
+    replayed: state.replayed === true,
+    replayMechanism: "One manual execution intent per current discovered case version (page and API), followed by POST /waves with the same two case IDs on the same version. No new environment/version/wave discovery state was created.",
+    replayIntentIds: state.replay.intentIds,
+    replayCaseRunIds: state.replay.caseRunIds,
+    replayNewCaseIds: state.newCaseIds,
+    replayNewCaseRuns: state.replay.newCaseRuns,
+    replayWaveAttachedToAutoWave: state.replay.attachedToAutoWave,
+    observationRowsBefore: replayBefore.observationRows,
+    observationRowsAfter: replayAfter.observationRows,
+    distinctObservationIdentitiesBefore: replayBefore.distinctObservationIdentities,
+    distinctObservationIdentitiesAfter: replayAfter.distinctObservationIdentities,
+    duplicateObservationGroupsBefore: replayBefore.duplicateObservationGroups,
+    duplicateObservationGroupsAfter: replayAfter.duplicateObservationGroups,
+    observationOccurrencesBefore: replayBefore.observationOccurrences,
+    observationOccurrencesAfter: replayAfter.observationOccurrences,
+    observationDecisionsBefore: replayBefore.observationDecisions,
+    observationDecisionsAfter: replayAfter.observationDecisions,
+    proposedPageIdsBefore: replayBefore.proposedPageIds,
+    proposedPageIdsAfter: replayAfter.proposedPageIds,
+    proposedApiIdsBefore: replayBefore.proposedApiIds,
+    proposedApiIdsAfter: replayAfter.proposedApiIds,
+    factRowsBefore: replayBefore.factRows,
+    factRowsAfter: replayAfter.factRows,
+    allFactRowsBefore: replayBefore.allFactRows,
+    allFactRowsAfter: replayAfter.allFactRows,
+    factScope: "version_fact.source='execution' (discovery facts created by the execution-time delta; design/gap/progress facts are excluded because concurrent design activity may add them)",
+    caseVersionRowsBefore: replayBefore.caseVersionRows,
+    caseVersionRowsAfter: replayAfter.caseVersionRows,
+    allCaseVersionRowsBefore: replayBefore.allCaseVersionRows,
+    allCaseVersionRowsAfter: replayAfter.allCaseVersionRows,
+    caseVersionScope: "case_version.trigger in ('discovery_delta','rollback') (discovery revisions only; concurrent normal design drafts are excluded)",
+    caseRevisionEventsBefore: replayBefore.caseRevisionEvents,
+    caseRevisionEventsAfter: replayAfter.caseRevisionEvents,
+    resourceDeltaEventsBefore: replayBefore.resourceDeltaEvents,
+    resourceDeltaEventsAfter: replayAfter.resourceDeltaEvents,
+    noNewObservationGroups,
+    noNewProposedResources,
+    noNewFacts,
+    noNewCaseRevisions,
+    noNewResourceDeltaEvents,
+    checks: state.replay.checks,
+    note: "Cross-wave observation identity dedupe is the expected product behavior: the replay upserts the same (version, version_sut, kind, method, template) rows and increments occurrences, so a duplicate group would be the failure signal. replayed=true records that this same-version replay phase actually executed; the acceptance environment/version themselves were created fresh by this run.",
+    generatedAt: nowIso(),
+  }
+  state.idempotency = idempotency
+  saveJson("exploration-idempotency.json", idempotency)
+  recordStep("replay.complete", { replayWaveId: state.replay.waveId, executed: state.replay.executed, status: idempotency.status, checks: Object.keys(state.replay.checks).length })
+
   // -- cleanup: resolve the report-gate hold request -----------------------
   try {
     await must("POST", `/api/human-requests/${state.humanRequestId}/resolve`, { response: { decision: "approved", reason: "W2-13 acceptance evidence captured" } })
@@ -1177,14 +1496,16 @@ async function main() {
   state.finalStage = await stage()
   state.wave1RunStatusesFinal = (await caseRuns(state.wave1Id)).map((run) => `${run.id}:${run.status}`)
   state.dbFacts = dbJson(`select coalesce(json_agg(json_build_object('id', id::text, 'kind', kind, 'key', key) order by id), '[]')::text from version_fact where version_id = ${state.versionId} and source = 'execution'`) || []
-  state.dbCaseRuns = dbJson(`select coalesce(json_agg(json_build_object('id', r.id::text, 'wave_id', r.wave_id::text, 'case_id', cv.case_id::text, 'case_version_id', r.case_version_id::text, 'status', r.status) order by r.id), '[]')::text from case_run r join case_version cv on cv.id = r.case_version_id where r.wave_id in (${state.wave1Id}, ${state.wave2Id})`) || []
+  const caseRunWaveIds = [state.wave1Id, state.wave2Id, state.replay.waveId].filter((id) => !!id).join(",")
+  state.dbCaseRuns = dbJson(`select coalesce(json_agg(json_build_object('id', r.id::text, 'wave_id', r.wave_id::text, 'case_id', cv.case_id::text, 'case_version_id', r.case_version_id::text, 'status', r.status) order by r.id), '[]')::text from case_run r join case_version cv on cv.id = r.case_version_id where r.wave_id in (${caseRunWaveIds})`) || []
   saveJson("exploration-state.json", state)
 
   const verdict = {
     status: "PASS",
-    replayed: false,
+    replayed: state.replayed === true,
     currentWaveId: state.wave1Id,
     nextWaveId: state.wave2Id,
+    replayWaveId: state.replay.waveId,
     currentWaveCaseRunIdsBefore: state.currentWaveCaseRunIdsBefore,
     currentWaveCaseRunIdsAfter: state.currentWaveCaseRunIdsAfter,
     observationPages: state.observations.filter((row) => row.kind === "page").length,
@@ -1232,12 +1553,18 @@ async function main() {
     autoConfirmedRevisions: state.autoConfirmedRevisions,
     newCaseIds: state.newCaseIds,
     wave2CaseRuns: state.wave2CaseRuns,
+    wave2AttachedToAutoWave: state.wave2AttachedToAutoWave === true,
+    wave2NewCaseIdsRan: state.wave2NewCaseIdsRan,
+    wave2MissingNewCaseIds: state.wave2MissingNewCaseIds,
+    replayCaseRunIds: state.replay.caseRunIds,
+    replayNewCaseRuns: state.replay.newCaseRuns,
+    idempotency: state.idempotency,
     coverageBefore: state.coverageBefore,
     coverageAfter: state.coverageAfter,
     rollbackOfRevisionId: state.rollbackOfRevisionId,
     rollbackTrigger: state.rollbackTrigger,
     rollbackCaseId: state.rollbackCaseId,
-    rollbackCaseKept: true,
+    rollbackCaseKept: state.rollbackCaseKept === true,
     humanRequestId: state.humanRequestId,
     checks: state.checks,
     red: state.red,
@@ -1245,8 +1572,10 @@ async function main() {
     generatedAt: nowIso(),
   }
   if (state.red.length > 0) verdict.status = "FAIL"
-  saveJson("exploration-verdict.json", verdict)
-  log(`W2-13 EXPLORATION E2E COMPLETE: status=${verdict.status} checks=${Object.keys(state.checks).length} red=${state.red.length}`)
+  // Draft only: the PowerShell verdict phase writes exploration-verdict.json
+  // after its independent DB/API assertions, so it can persist FAIL + red.
+  saveJson("exploration-flow-verdict.json", verdict)
+  log(`W2-13 EXPLORATION E2E COMPLETE: status=${verdict.status} checks=${Object.keys(state.checks).length} red=${state.red.length} replay=${verdict.replayed}`)
   return state.red.length === 0
 }
 
@@ -1264,9 +1593,15 @@ main().then((ok) => {
   // readable result even when the flow throws mid-way.
   const failed = {
     status: "FAIL",
-    replayed: false,
+    replayed: state.replayed === true,
     currentWaveId: state.wave1Id || null,
     nextWaveId: state.wave2Id || null,
+    replayWaveId: state.replay?.waveId || null,
+    versionId: state.versionId || null,
+    environmentId: state.environmentId || null,
+    uPageId: state.uPageId || null,
+    aApiId: state.aApiId || null,
+    newCaseIds: state.newCaseIds || [],
     currentWaveCaseRunIdsBefore: state.currentWaveCaseRunIdsBefore || [],
     currentWaveCaseRunIdsAfter: state.currentWaveCaseRunIdsAfter || [],
     observationPages: (state.observations || []).filter((row) => row.kind === "page").length,
@@ -1284,6 +1619,8 @@ main().then((ok) => {
     coverageAfterCovered: state.coverageAfterCovered || 0,
     lowConfidenceDraftCount: state.lowConfidenceDraftCount || 0,
     rollbackRevisionId: state.rollbackRevisionId || null,
+    rollbackCaseKept: state.rollbackCaseKept === true,
+    idempotency: state.idempotency || null,
     screenshots: state.screenshots || [],
     apiBase: BASE,
     webUrl: WEB,
@@ -1293,10 +1630,17 @@ main().then((ok) => {
     red: state.red.concat([state.error]),
     generatedAt: nowIso(),
   }
-  saveJson("exploration-verdict.json", failed)
+  saveJson("exploration-flow-verdict.json", failed)
   shutdown(1)
 })
 '@ | Set-Content -Encoding ASCII $flowPath
+
+        # The flow writes only a draft; the final verdict is written by the
+        # PowerShell phase. Delete the previous run's final verdict and replay
+        # evidence now so a crash can never leave a stale PASS behind.
+        Remove-Item $verdictPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $flowVerdictPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $idempotencyPath -Force -ErrorAction SilentlyContinue
 
         $env:W213_API = $apiBase
         $env:W213_WEB = $webUrl
@@ -1333,11 +1677,28 @@ main().then((ok) => {
         # -------------------------------------------------------------------
         Write-Host ''
         Write-Host '== W2-13 verdict phase (verdict contract + independent DB/API assertions)'
-        Assert-ExplorationVerdict
-
-        $verdict = Get-Content $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $verdict = $null
+        if (Test-Path $flowVerdictPath) {
+            try { $verdict = Get-Content $flowVerdictPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $verdict = $null }
+        }
         $red = New-Object System.Collections.Generic.List[string]
+        if ($null -eq $verdict) {
+            $red.Add('flow verdict missing: the Node flow did not produce exploration-flow-verdict.json')
+            $verdict = [pscustomobject]@{
+                status = 'FAIL'; replayed = $false; red = @(); checks = [pscustomobject]@{}
+                currentWaveCaseRunIdsBefore = @(); currentWaveCaseRunIdsAfter = @()
+                proposedPageIds = @(); proposedApiIds = @(); screenshots = @()
+                generatedAt = (Get-Date -Format o)
+            }
+        } else {
+            foreach ($entry in @($verdict.red)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$entry)) { $script:red.Add([string]$entry) }
+            }
+        }
+        if ($flowExit -ne 0) { $script:red.Add("flow exit=$flowExit") }
         $assertions = [ordered]@{}
+        $script:activeVerdict = $verdict
+        $script:finalVerdictWritten = $false
         function Add-Assertion([string]$name, [bool]$ok, [string]$detail) {
             $script:assertions[$name] = $ok
             if (-not $ok) { $script:red.Add("${name}: $detail") }
@@ -1359,11 +1720,15 @@ main().then((ok) => {
             return $output
         }
 
+        try { Assert-ExplorationVerdict $verdict; Add-Assertion 'verdictContract' $true 'all required contract fields present' }
+        catch { Add-Assertion 'verdictContract' $false $_.Exception.Message }
+
         if ($verdict.status -ne 'PASS') { $red.Add("verdict.status=$($verdict.status)") }
-        if ($verdict.replayed -ne $false) { $red.Add("verdict.replayed=$($verdict.replayed)") }
+        if ($verdict.replayed -ne $true) { $red.Add("verdict.replayed=$($verdict.replayed), want true") }
         $before = @($verdict.currentWaveCaseRunIdsBefore | ForEach-Object { [string]$_ })
         $after = @($verdict.currentWaveCaseRunIdsAfter | ForEach-Object { [string]$_ })
         Add-Assertion 'currentWaveCaseRunsUnchanged' (($before -join ',') -eq ($after -join ',')) "before=$($before -join ',') after=$($after -join ',')"
+        Add-Assertion 'currentWaveCaseRunsPresent' ($before.Count -ge 1) "before=$($before -join ',')"
         Add-Assertion 'nextWaveSnapshotContainsU' ([bool]$verdict.nextWaveSnapshotContainsU) "uPageId=$($verdict.uPageId)"
         Add-Assertion 'nextWaveSnapshotContainsA' ([bool]$verdict.nextWaveSnapshotContainsA) "aApiId=$($verdict.aApiId)"
         Add-Assertion 'coverageBeforeUncovered' ([int]$verdict.coverageBeforeUncovered -ge 1) "coverageBeforeUncovered=$($verdict.coverageBeforeUncovered)"
@@ -1378,6 +1743,11 @@ main().then((ok) => {
         Add-Assertion 'caseRevisionEvents' ([int]$verdict.caseRevisionEvents -ge 1) "caseRevisionEvents=$($verdict.caseRevisionEvents)"
         Add-Assertion 'newCaseVersionIds' (@($verdict.newCaseVersionIds | Where-Object { $_ }).Count -ge 1) "newCaseVersionIds=$(@($verdict.newCaseVersionIds) -join ',')"
         Add-Assertion 'rollbackRevisionId' (-not [string]::IsNullOrWhiteSpace([string]$verdict.rollbackRevisionId)) "rollbackRevisionId=$($verdict.rollbackRevisionId)"
+        Add-Assertion 'rollbackCaseKept' ([bool]$verdict.rollbackCaseKept) "rollbackCaseId=$($verdict.rollbackCaseId) rollbackCaseKept=$($verdict.rollbackCaseKept)"
+        $newCaseIds = @($verdict.newCaseIds | ForEach-Object { [string]$_ })
+        $missingWave2 = @($verdict.wave2MissingNewCaseIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        Add-Assertion 'wave2AllNewCasesRan' ($newCaseIds.Count -ge 1 -and $missingWave2.Count -eq 0) "newCaseIds=$($newCaseIds -join ',') missing=$($missingWave2 -join ',')"
+        Add-Assertion 'replayWaveId' (-not [string]::IsNullOrWhiteSpace([string]$verdict.replayWaveId)) "replayWaveId=$($verdict.replayWaveId)"
         $shots = @($verdict.screenshots | Where-Object { $_ })
         $shotsOk = $shots.Count -ge 3
         foreach ($shot in $shots) {
@@ -1386,9 +1756,27 @@ main().then((ok) => {
         }
         Add-Assertion 'screenshots' $shotsOk "screenshots=$($shots -join ',')"
 
+        $idem = $verdict.idempotency
+        if ($null -eq $idem) {
+            Add-Assertion 'idempotencyEvidence' $false 'missing exploration-idempotency object'
+        } else {
+            Add-Assertion 'idempotencyStatus' ($idem.status -eq 'PASS') "status=$($idem.status)"
+            Add-Assertion 'idempotencyReplayExecuted' ([bool]$idem.replayExecuted) "replayExecuted=$($idem.replayExecuted) replayWaveId=$($idem.replayWaveId)"
+            Add-Assertion 'idempotencyNoNewObservationGroups' ([bool]$idem.noNewObservationGroups) "rows $($idem.observationRowsBefore)->$($idem.observationRowsAfter) identities $($idem.distinctObservationIdentitiesBefore)->$($idem.distinctObservationIdentitiesAfter) duplicateGroups=$($idem.duplicateObservationGroupsAfter)"
+            Add-Assertion 'idempotencyNoNewProposedResources' ([bool]$idem.noNewProposedResources) "proposedPages $($idem.proposedPageIdsBefore.Count)->$($idem.proposedPageIdsAfter.Count) proposedApis $($idem.proposedApiIdsBefore.Count)->$($idem.proposedApiIdsAfter.Count)"
+            Add-Assertion 'idempotencyNoNewFacts' ([bool]$idem.noNewFacts) "executionFacts $($idem.factRowsBefore)->$($idem.factRowsAfter) (allFacts $($idem.allFactRowsBefore)->$($idem.allFactRowsAfter), informational)"
+            Add-Assertion 'idempotencyNoNewCaseRevisions' ([bool]$idem.noNewCaseRevisions) "discoveryCaseVersions $($idem.caseVersionRowsBefore)->$($idem.caseVersionRowsAfter) caseRevisionEvents $($idem.caseRevisionEventsBefore)->$($idem.caseRevisionEventsAfter) (allCaseVersions $($idem.allCaseVersionRowsBefore)->$($idem.allCaseVersionRowsAfter), informational)"
+            Add-Assertion 'idempotencyNoNewResourceDeltaEvents' ([bool]$idem.noNewResourceDeltaEvents) "resourceDeltaEvents $($idem.resourceDeltaEventsBefore)->$($idem.resourceDeltaEventsAfter)"
+            Add-Assertion 'idempotencyObservationOccurrencesIncreased' ([int]$idem.observationOccurrencesAfter -gt [int]$idem.observationOccurrencesBefore) "occurrences $($idem.observationOccurrencesBefore)->$($idem.observationOccurrencesAfter)"
+            Add-Assertion 'idempotencyReplayAllNewCasesRan' (@($idem.replayNewCaseRuns | Where-Object { $_.status -eq 'passed' }).Count -ge $newCaseIds.Count) "replayNewCaseRuns=$(@($idem.replayNewCaseRuns | ForEach-Object { "$($_.case_id):$($_.status)" }) -join ',')"
+        }
+
         # Independent DB evidence: the two discovery_delta revisions, the
-        # resource.delta and case.revision.auto_confirmed events, and the
-        # rollback replacement row.
+        # resource.delta and case.revision.auto_confirmed events, the rollback
+        # replacement row and the replay snapshot.
+        if ([string]::IsNullOrWhiteSpace([string]$verdict.versionId)) {
+            Add-Assertion 'dbEvidence' $false 'flow failed before a versionId was recorded; DB replay assertions skipped'
+        } else {
         try {
             $autoRows = @(Parse-JsonArray (Db "select coalesce(json_agg(json_build_object('case_version_id', cv.id::text, 'case_id', cv.case_id::text, 'status', cv.status, 'trigger', cv.trigger, 'auto_confirmed_by', cv.auto_confirmed_by, 'source_observation_id', cv.source_observation_id::text) order by cv.id), '[]')::text from case_version cv join case_entity ce on ce.id = cv.case_id join case_scenario s on s.id = ce.scenario_id where s.version_id = $($verdict.versionId) and cv.trigger = 'discovery_delta'"))
             $autoSystem = @($autoRows | Where-Object { $_.auto_confirmed_by -eq 'system' })
@@ -1402,16 +1790,55 @@ main().then((ok) => {
             $deltaEvents = [int](Db "select count(*) from event where channel = 'version:$($verdict.versionId)' and type = 'resource.delta'")
             $revisionEvents = [int](Db "select count(*) from event where channel = 'version:$($verdict.versionId)' and type = 'case.revision.auto_confirmed'")
             Add-Assertion 'dbEvents' ($deltaEvents -ge 1 -and $revisionEvents -ge 1) "resource.delta=$deltaEvents case.revision.auto_confirmed=$revisionEvents"
+
+            # Independent replay checks: the current DB must still equal the
+            # script-generated "after replay" snapshot. If the replay had added
+            # an observation group, proposed resource, fact, case revision or
+            # delta event, these fail even if the JSON were forged.
+            $dbObservationRows = [int](Db "select count(*) from execution_discovery_observation where version_id = $($verdict.versionId)")
+            $dbFactRows = [int](Db "select count(*) from version_fact where version_id = $($verdict.versionId) and source = 'execution'")
+            $dbCaseVersionRows = [int](Db "select count(*) from case_version cv join case_entity ce on ce.id = cv.case_id join case_scenario s on s.id = ce.scenario_id where s.version_id = $($verdict.versionId) and cv.trigger in ('discovery_delta','rollback')")
+            $dbProposedPageIds = @(Parse-JsonArray (Db "select coalesce(json_agg(p.id::text order by p.id), '[]')::text from sut_page p where p.environment_id = $($verdict.environmentId) and p.status = 'proposed'"))
+            $dbProposedApiIds = @(Parse-JsonArray (Db "select coalesce(json_agg(a.id::text order by a.id), '[]')::text from sut_api a where a.environment_id = $($verdict.environmentId) and a.status = 'proposed'"))
+            if ($null -ne $idem) {
+                Add-Assertion 'dbReplayObservationRows' ($dbObservationRows -eq [int]$idem.observationRowsAfter) "db=$dbObservationRows evidenceAfter=$($idem.observationRowsAfter)"
+                Add-Assertion 'dbReplayProposedResources' ((($dbProposedPageIds -join ',') -eq (@($idem.proposedPageIdsAfter) -join ',')) -and (($dbProposedApiIds -join ',') -eq (@($idem.proposedApiIdsAfter) -join ','))) "dbPages=$($dbProposedPageIds -join ',') evidencePages=$(@($idem.proposedPageIdsAfter) -join ',') dbApis=$($dbProposedApiIds -join ',') evidenceApis=$(@($idem.proposedApiIdsAfter) -join ',')"
+                Add-Assertion 'dbReplayFacts' ($dbFactRows -eq [int]$idem.factRowsAfter) "db=$dbFactRows evidenceAfter=$($idem.factRowsAfter)"
+                Add-Assertion 'dbReplayCaseVersions' ($dbCaseVersionRows -eq [int]$idem.caseVersionRowsAfter) "db=$dbCaseVersionRows evidenceAfter=$($idem.caseVersionRowsAfter)"
+                Add-Assertion 'dbReplayEvents' (($deltaEvents -eq [int]$idem.resourceDeltaEventsAfter) -and ($revisionEvents -eq [int]$idem.caseRevisionEventsAfter)) "resource.delta=$deltaEvents/$($idem.resourceDeltaEventsAfter) case.revision=$revisionEvents/$($idem.caseRevisionEventsAfter)"
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$verdict.replayWaveId)) {
+                Add-Assertion 'dbReplayAllNewCasesRan' $false 'replayWaveId is empty (the replay phase did not run)'
+            } else {
+            $replayRuns = @(Parse-JsonArray (Db "select coalesce(json_agg(json_build_object('id', r.id::text, 'case_id', cv.case_id::text, 'case_version_id', r.case_version_id::text, 'status', r.status) order by r.id), '[]')::text from case_run r join case_version cv on cv.id = r.case_version_id where r.wave_id = $($verdict.replayWaveId)"))
+            $replayRanCaseIds = @($replayRuns | ForEach-Object { [string]$_.case_id })
+            $replayMissing = @($newCaseIds | Where-Object { $replayRanCaseIds -notcontains $_ })
+            Add-Assertion 'dbReplayAllNewCasesRan' ($newCaseIds.Count -ge 1 -and $replayMissing.Count -eq 0) "replayWave=$($verdict.replayWaveId) runs=$(@($replayRuns | ForEach-Object { "$($_.case_id):$($_.status)" }) -join ',') missing=$($replayMissing -join ',')"
+            $dbReplayRunIds = @($replayRuns | ForEach-Object { [string]$_.id } | Sort-Object)
+            $verdictReplayRunIds = @($verdict.replayCaseRunIds | ForEach-Object { [string]$_ } | Sort-Object)
+            Add-Assertion 'dbReplayCaseRunIds' (($dbReplayRunIds -join ',') -eq ($verdictReplayRunIds -join ',')) "db=$($dbReplayRunIds -join ',') verdict=$($verdictReplayRunIds -join ',')"
+            }
         } catch {
             $red.Add("db evidence query failed: $($_.Exception.Message)")
         }
+        }
 
+        $verdict | Add-Member -NotePropertyName psPhase -NotePropertyValue ([pscustomobject]@{
+            executedAt = (Get-Date -Format o)
+            flowExit   = $flowExit
+            checks     = $assertions
+        }) -Force
+        $verdict | Add-Member -NotePropertyName idempotencyPath -NotePropertyValue 'exploration-idempotency.json' -Force
         if ($red.Count -gt 0) {
             Write-Host ''
             Write-Host '== W2-13 RED:'
             foreach ($entry in $red) { Write-Host "   - $entry" }
+            $null = Write-FinalVerdict $verdictPath $verdict @($red)
+            $script:finalVerdictWritten = $true
             throw "W2-13 exploration acceptance failed with $($red.Count) red item(s)"
         }
+        $null = Write-FinalVerdict $verdictPath $verdict @()
+        $script:finalVerdictWritten = $true
         Write-Host '== W2-13 exploration acceptance: PASS'
         $exitCode = 0
     }
@@ -1421,6 +1848,21 @@ main().then((ok) => {
         Write-Host "== EXTERNAL-BLOCKED: $($script:blockedReason)"
         $exitCode = 2
     } else {
+        # C2: a PowerShell-phase exception after the flow draft exists must
+        # persist status=FAIL + the accumulated red, never leave a PASS verdict
+        # behind. If the final verdict was already written, do not rewrite it;
+        # the earlier Write-FinalVerdict already contains the full red list.
+        if (-not $script:finalVerdictWritten -and $null -ne $script:activeVerdict) {
+            try {
+                $script:activeVerdict | Add-Member -NotePropertyName failureMessage -NotePropertyValue $message -Force
+                $failureRed = @($script:activeVerdict.red) + @($message)
+                $null = Write-FinalVerdict $verdictPath $script:activeVerdict @($failureRed)
+                $script:finalVerdictWritten = $true
+                Write-Host "== persisted final verdict status=FAIL (PS phase: $message)"
+            } catch {
+                Write-Warning "could not persist FAIL verdict: $($_.Exception.Message)"
+            }
+        }
         Write-Host "== W2-13 EXPLORATION FAILED: $message"
         $exitCode = 1
     }
