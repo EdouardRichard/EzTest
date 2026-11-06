@@ -37,7 +37,7 @@ func retestFixture(t *testing.T) (*issueServiceFixture, int64, int64) {
 		ID:     900,
 		Status: "running",
 		CaseRuns: []RetestCaseRun{
-			{ID: 901, CaseVersionID: 71, Status: "pending"},
+			{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "pending"},
 		},
 	}
 	return f, issueID, caseRunID
@@ -88,6 +88,9 @@ func TestStartRetestAndWriteback(t *testing.T) {
 	if result.Wave.ID != 900 || result.Wave.Status != "running" {
 		t.Fatalf("retest wave = %+v, want 900/running", result.Wave)
 	}
+	if !reflect.DeepEqual(result.CaseRunIDs, []int64{901}) {
+		t.Fatalf("retest result case_run_ids = %v, want [901]", result.CaseRunIDs)
+	}
 	if len(f.retest.createCalls) != 1 {
 		t.Fatalf("CreateRetestIntent calls = %d, want 1", len(f.retest.createCalls))
 	}
@@ -122,6 +125,7 @@ func TestStartRetestAndWriteback(t *testing.T) {
 		"wave_id":       "900",
 		"case_run_ids":  []string{"901"},
 		"retest_status": "retesting",
+		"error":         "",
 	}
 	if !reflect.DeepEqual(started.payload, wantStarted) {
 		t.Fatalf("started payload = %#v, want %#v", started.payload, wantStarted)
@@ -152,6 +156,9 @@ func TestStartRetestAndWriteback(t *testing.T) {
 	}
 	if completed.payload["retest_status"] != "passed" {
 		t.Fatalf("completed payload = %#v, want retest_status passed", completed.payload)
+	}
+	if completed.payload["error"] != "" {
+		t.Fatalf("completed payload error = %#v, want empty", completed.payload["error"])
 	}
 
 	// Idempotent terminal callback: no duplicate event, same status.
@@ -237,8 +244,8 @@ func TestStartRetestSelectionRestrictsCaseVersions(t *testing.T) {
 	f.retest.wave = RetestWave{
 		ID: 900, Status: "running",
 		CaseRuns: []RetestCaseRun{
-			{ID: 901, CaseVersionID: 71, Status: "pending"},
-			{ID: 902, CaseVersionID: 72, Status: "pending"},
+			{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "pending"},
+			{ID: 902, IntentID: 1002, CaseVersionID: 72, Status: "pending"},
 		},
 	}
 
@@ -287,6 +294,13 @@ func TestOnRetestTerminalFailedAndOther(t *testing.T) {
 		if got := f.retestEventCount(issueEventRetestFailed); got != 1 {
 			t.Fatalf("issue.retest_failed events = %d, want 1", got)
 		}
+		failedEvent := f.events.records[len(f.events.records)-1]
+		if failedEvent.eventType != issueEventRetestFailed {
+			t.Fatalf("last event = %q, want %q", failedEvent.eventType, issueEventRetestFailed)
+		}
+		if failedEvent.payload["error"] != "failed" {
+			t.Fatalf("failed payload error = %#v, want %q", failedEvent.payload["error"], "failed")
+		}
 	})
 
 	t.Run("other keeps retesting", func(t *testing.T) {
@@ -326,8 +340,8 @@ func TestOnRetestWaveTerminalAggregates(t *testing.T) {
 		ctx := context.Background()
 		retestFixtureAddSecondCaseRun(f, issueID)
 		f.retest.wave.CaseRuns = []RetestCaseRun{
-			{ID: 901, CaseVersionID: 71, Status: "passed"},
-			{ID: 902, CaseVersionID: 72, Status: "failed"},
+			{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "passed"},
+			{ID: 902, IntentID: 1002, CaseVersionID: 72, Status: "failed"},
 		}
 		f.exec.waveSnapshots[900] = WaveSnapshot{ID: 900, VersionID: 7, CaseRuns: []CaseRunSnapshot{
 			{ID: 901, CaseVersionID: 71, Status: "passed"},
@@ -362,8 +376,8 @@ func TestOnRetestWaveTerminalAggregates(t *testing.T) {
 		ctx := context.Background()
 		retestFixtureAddSecondCaseRun(f, issueID)
 		f.retest.wave.CaseRuns = []RetestCaseRun{
-			{ID: 901, CaseVersionID: 71, Status: "passed"},
-			{ID: 902, CaseVersionID: 72, Status: "passed"},
+			{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "passed"},
+			{ID: 902, IntentID: 1002, CaseVersionID: 72, Status: "passed"},
 		}
 		f.exec.waveSnapshots[900] = WaveSnapshot{ID: 900, VersionID: 7, CaseRuns: []CaseRunSnapshot{
 			{ID: 901, CaseVersionID: 71, Status: "passed"},
@@ -387,7 +401,7 @@ func TestOnRetestWaveTerminalAggregates(t *testing.T) {
 	t.Run("other keeps retesting", func(t *testing.T) {
 		f, issueID, _ := retestFixture(t)
 		ctx := context.Background()
-		f.retest.wave.CaseRuns = []RetestCaseRun{{ID: 901, CaseVersionID: 71, Status: "blocked"}}
+		f.retest.wave.CaseRuns = []RetestCaseRun{{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "blocked"}}
 		f.exec.waveSnapshots[900] = WaveSnapshot{ID: 900, VersionID: 7, CaseRuns: []CaseRunSnapshot{
 			{ID: 901, CaseVersionID: 71, Status: "blocked"},
 		}}
@@ -416,5 +430,118 @@ func TestOnRetestWaveTerminalIgnoresRegularWave(t *testing.T) {
 	}
 	if len(f.repo.retestResultCalls) != 0 {
 		t.Fatalf("retest result writes = %d, want 0", len(f.repo.retestResultCalls))
+	}
+}
+
+// TestStartRetestLinksOnlyCreatedIntentRuns proves the issue links only the
+// case_runs produced by the retest intents it created. The deterministic wave
+// may also carry an unrelated open intent for the same case version; its run
+// must never be linked or returned for deep links (F2/F5).
+func TestStartRetestLinksOnlyCreatedIntentRuns(t *testing.T) {
+	f, issueID, _ := retestFixture(t)
+	f.retest.wave.CaseRuns = []RetestCaseRun{
+		{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "pending"},
+		{ID: 903, IntentID: 999, CaseVersionID: 71, Status: "pending"},
+	}
+
+	result, err := f.svc.StartRetest(context.Background(), 7, issueID, 9)
+	if err != nil {
+		t.Fatalf("StartRetest: %v", err)
+	}
+	if !reflect.DeepEqual(result.CaseRunIDs, []int64{901}) {
+		t.Fatalf("case_run_ids = %v, want only the retest intent run [901]", result.CaseRunIDs)
+	}
+	if f.hasRetestRef(issueID, delivery.IssueRefKindCaseRun, 903) {
+		t.Fatalf("unrelated open-intent run 903 was linked: %+v", f.repo.refs)
+	}
+}
+
+// TestStartRetestFailsClosedWhenWaveMissesIntent proves a started wave that
+// lacks a created retest intent is rejected and the orphan intent is cancelled:
+// the issue is never marked retesting without the matching linked run (F2).
+func TestStartRetestFailsClosedWhenWaveMissesIntent(t *testing.T) {
+	f, issueID, _ := retestFixture(t)
+	f.retest.wave.CaseRuns = []RetestCaseRun{
+		{ID: 902, IntentID: 999, CaseVersionID: 72, Status: "pending"},
+	}
+
+	_, err := f.svc.StartRetest(context.Background(), 7, issueID, 9)
+	var conflict *IssueStateConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("error = %v, want a retest state conflict", err)
+	}
+	if len(f.repo.retestStartCalls) != 0 {
+		t.Fatalf("StartRetest repo calls = %d, want 0 after a missing intent", len(f.repo.retestStartCalls))
+	}
+	if !reflect.DeepEqual(f.retest.canceled, []int64{1001}) {
+		t.Fatalf("cancelled intents = %v, want [1001]", f.retest.canceled)
+	}
+	if stored := f.repo.getIssues[issueID]; stored.RetestStatus != delivery.IssueRetestStatusNotRetested {
+		t.Fatalf("retest_status = %q, want not_retested", stored.RetestStatus)
+	}
+}
+
+// TestStartRetestMapsRepositoryCASConflict proves the repository CAS guard is
+// surfaced as the stable 409 retest_active conflict (R-14).
+func TestStartRetestMapsRepositoryCASConflict(t *testing.T) {
+	f, issueID, _ := retestFixture(t)
+	f.repo.retestStartErr = delivery.ErrStateConflict
+
+	_, err := f.svc.StartRetest(context.Background(), 7, issueID, 9)
+	var conflict *IssueStateConflictError
+	if !errors.As(err, &conflict) || conflict.Reason != IssueConflictRetestActive {
+		t.Fatalf("error = %v, want retest_active state conflict", err)
+	}
+}
+
+// TestOnRetestWaveTerminalNoLinkedRefsDoesNotWriteback proves F2: when the issue
+// has no role='retest' case_run refs, a non-empty wave must not fall back to all
+// of its runs. The issue keeps retesting and no result is applied.
+func TestOnRetestWaveTerminalNoLinkedRefsDoesNotWriteback(t *testing.T) {
+	f, issueID, _ := retestFixture(t)
+	waveID := int64(900)
+	issue := f.repo.getIssues[issueID]
+	issue.RetestStatus = delivery.IssueRetestStatusRetesting
+	issue.LastRetestWaveID = &waveID
+	f.repo.getIssues[issueID] = issue
+	f.repo.refs = nil
+	f.exec.waveSnapshots[900] = WaveSnapshot{ID: 900, VersionID: 7, CaseRuns: []CaseRunSnapshot{
+		{ID: 901, CaseVersionID: 71, Status: "failed"},
+	}}
+
+	if err := f.svc.OnRetestWaveTerminal(context.Background(), 900); err != nil {
+		t.Fatalf("OnRetestWaveTerminal: %v", err)
+	}
+	if len(f.repo.retestResultCalls) != 0 {
+		t.Fatalf("retest result writes = %d, want 0 without linked refs", len(f.repo.retestResultCalls))
+	}
+	stored := f.repo.getIssues[issueID]
+	if stored.RetestStatus != delivery.IssueRetestStatusRetesting {
+		t.Fatalf("retest_status = %q, want retesting", stored.RetestStatus)
+	}
+	if got := f.retestEventCount(issueEventRetestFailed); got != 0 {
+		t.Fatalf("issue.retest_failed events = %d, want 0", got)
+	}
+}
+
+// TestOnRetestTerminalPublishesOnlyWhenApplied proves F6: when the repository
+// reports the projection did not change (a duplicate terminal callback already
+// applied by a concurrent writer), no duplicate event is published.
+func TestOnRetestTerminalPublishesOnlyWhenApplied(t *testing.T) {
+	f, issueID, _ := retestFixture(t)
+	ctx := context.Background()
+	if _, err := f.svc.StartRetest(ctx, 7, issueID, 9); err != nil {
+		t.Fatalf("StartRetest: %v", err)
+	}
+	f.repo.retestResultNoop = true
+
+	if _, err := f.svc.OnRetestTerminal(ctx, 900, 901, "passed"); err != nil {
+		t.Fatalf("OnRetestTerminal: %v", err)
+	}
+	if got := f.retestEventCount(issueEventRetestCompleted); got != 0 {
+		t.Fatalf("issue.retest_completed events = %d, want 0 when not applied", got)
+	}
+	if len(f.repo.retestResultCalls) != 1 {
+		t.Fatalf("ApplyRetestResult calls = %d, want 1", len(f.repo.retestResultCalls))
 	}
 }

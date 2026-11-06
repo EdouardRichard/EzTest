@@ -85,12 +85,19 @@ type IssueManualUpdate struct {
 // wave (v0.22 W2-5 / DB-23). The repository locks the issue, writes
 // retest_status='retesting', stamps last_retest_wave_id and appends the role=
 // 'retest' wave/case_run refs in one transaction.
+//
+// ExpectedRetestStatus/ExpectedLastRetestWaveID are the retest projection the
+// service observed before creating the retest intents. The write is applied only
+// while the stored projection still matches (R-14 CAS): a concurrent retest that
+// committed first makes the second start a 409 instead of a double write.
 type IssueRetestStart struct {
-	VersionID int64
-	IssueID   int64
-	WaveID    int64
-	Refs      []delivery.IssueRef
-	Now       time.Time
+	VersionID                int64
+	IssueID                  int64
+	WaveID                   int64
+	ExpectedRetestStatus     string
+	ExpectedLastRetestWaveID *int64
+	Refs                     []delivery.IssueRef
+	Now                      time.Time
 }
 
 // IssueRetestResult writes back one retest outcome. TargetStatus is
@@ -108,9 +115,13 @@ type IssueRetestResult struct {
 	Now          time.Time
 }
 
-// RetestCaseRun is one case_run created by a retest wave.
+// RetestCaseRun is one case_run created by a retest wave. IntentID is the
+// execution intent that produced the run: the issue service links only the runs
+// of the retest intents it created, so an unrelated open intent planned into the
+// same deterministic wave can never be written back to the issue.
 type RetestCaseRun struct {
 	ID            int64
+	IntentID      int64
 	CaseVersionID int64
 	Status        string
 }
@@ -178,8 +189,9 @@ type IssueRepository interface {
 	// the role='retest' refs atomically.
 	StartRetest(ctx context.Context, in IssueRetestStart) (delivery.Issue, error)
 	// ApplyRetestResult writes one retest outcome guarded by last_retest_wave_id.
-	// It is idempotent for the same (wave, case_run, target status) tuple.
-	ApplyRetestResult(ctx context.Context, in IssueRetestResult) (delivery.Issue, error)
+	// The bool reports whether the stored projection actually changed; a
+	// duplicate terminal callback returns false and must not publish an event.
+	ApplyRetestResult(ctx context.Context, in IssueRetestResult) (delivery.Issue, bool, error)
 	// FindByRetestWave resolves the issue whose last_retest_wave_id is waveID.
 	FindByRetestWave(ctx context.Context, waveID int64) (delivery.Issue, bool, error)
 }

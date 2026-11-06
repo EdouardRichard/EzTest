@@ -339,14 +339,18 @@ info:
     R-W2-2 / API-25（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§6）：
     - `POST /api/versions/{id}/issues/{iid}/retest`（登录用户 `authenticated`）为 issue
       创建 `PurposeRetest` wave；body 可选 `{case_run_ids:[...]}`，缺省复测该 issue 关联的
-      全部 case_run。返回 200 + `{wave_id,wave_status,issue_id,version_id,retest_status,case_run_ids}`。
+      全部 case_run。返回 200 + `{wave_id,wave_status,issue_id,version_id,retest_status,case_run_ids}`；
+      响应 `case_run_ids` 仅含本次复测 intent 新建且已关联到 issue 的 case_run（不含同一 wave 中
+      无关 open intent 的 run），供 UI 深链到复测执行。
     - `delivery_issue_ref` 写 `kind='wave',role='retest'` 与每个复测 case_run 的
       `kind='case_run',role='retest'`；`delivery_issue.retest_status='retesting'` 并记录
-      `last_retest_wave_id`；已有活动 wave 时返回 409 `state_conflict` + `details.reason=retest_active`。
+      `last_retest_wave_id`；已有活动 wave（或并发 retest CAS 失败）时返回 409 `state_conflict`
+      + `details.reason=retest_active`。
     - wave 终态回写：case_run `passed`→`passed`、`failed`→`failed`、其他→保持 `retesting`
       并记录原因；写 `last_retest_case_run_id`；事件 `issue.retest_started`、
       `issue.retest_completed`、`issue.retest_failed`（版本频道，payload
-      `{issue_id,version_id,wave_id,case_run_ids,retest_status,case_run_status}`）。
+      `{issue_id,version_id,wave_id,case_run_ids,retest_status,error}`；`error` 成功时为空串，
+      failed/其他终态为原因）。
     - `IssueView` 增加 `retest_status`/`last_retest_wave_id`/`last_retest_case_run_id`。
 
     ## v0.22 W2-7 增量（report artifact export，additive）

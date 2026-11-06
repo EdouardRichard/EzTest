@@ -417,6 +417,62 @@ func TestIssueViewOptionalRecurrenceFieldsAreNull(t *testing.T) {
 	}
 }
 
+// TestIssueRetestFieldsProjection proves F1: the documented retest projection is
+// returned by both GET issue/list, with decimal-string IDs or null.
+func TestIssueRetestFieldsProjection(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusConfirmed)
+	issue.RetestStatus = delivery.IssueRetestStatusPassed
+	waveID, caseRunID := int64(900), int64(901)
+	issue.LastRetestWaveID = &waveID
+	issue.LastRetestCaseRunID = &caseRunID
+	service := &fakeIssueService{
+		listResult: []delivery.Issue{issue},
+		details:    map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)},
+	}
+	mux := newDeliveryMux(t, New(service))
+
+	for _, target := range []string{
+		"/api/versions/42/issues/1001",
+		"/api/versions/42/issues",
+	} {
+		recorder := deliveryCall(t, mux, http.MethodGet, target, "", userActor())
+		requireStatus(t, recorder, http.StatusOK)
+		var data map[string]any
+		if target == "/api/versions/42/issues" {
+			items, _, _ := decodeDeliveryList(t, recorder)
+			if len(items) != 1 {
+				t.Fatalf("%s items = %d, want 1", target, len(items))
+			}
+			data = items[0].(map[string]any)
+		} else {
+			data = decodeDeliveryObject(t, recorder)
+		}
+		if data["retest_status"] != "passed" {
+			t.Errorf("%s retest_status = %v, want passed", target, data["retest_status"])
+		}
+		if data["last_retest_wave_id"] != "900" {
+			t.Errorf("%s last_retest_wave_id = %v, want 900", target, data["last_retest_wave_id"])
+		}
+		if data["last_retest_case_run_id"] != "901" {
+			t.Errorf("%s last_retest_case_run_id = %v, want 901", target, data["last_retest_case_run_id"])
+		}
+	}
+
+	// A never-retested issue defaults to not_retested with null pointers.
+	plain := sampleIssue(1002, delivery.IssueStatusOpen)
+	plainService := &fakeIssueService{details: map[int64]deliveryapp.IssueDetail{1002: sampleIssueDetail(plain)}}
+	plainMux := newDeliveryMux(t, New(plainService))
+	recorder := deliveryCall(t, plainMux, http.MethodGet, "/api/versions/42/issues/1002", "", userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	data := decodeDeliveryObject(t, recorder)
+	if data["retest_status"] != "not_retested" {
+		t.Errorf("default retest_status = %v, want not_retested", data["retest_status"])
+	}
+	if data["last_retest_wave_id"] != nil || data["last_retest_case_run_id"] != nil {
+		t.Errorf("default retest IDs = %v/%v, want null", data["last_retest_wave_id"], data["last_retest_case_run_id"])
+	}
+}
+
 func requireStatus(t *testing.T, recorder *httptest.ResponseRecorder, want int) {
 	t.Helper()
 	if recorder.Code != want {
@@ -1120,11 +1176,12 @@ func TestIssueHandlerStartRetest(t *testing.T) {
 			Wave: deliveryapp.RetestWave{
 				ID: 900, Status: "running",
 				CaseRuns: []deliveryapp.RetestCaseRun{
-					{ID: 901, CaseVersionID: 71, Status: "pending"},
-					{ID: 902, CaseVersionID: 72, Status: "pending"},
+					{ID: 901, IntentID: 1001, CaseVersionID: 71, Status: "pending"},
+					{ID: 902, IntentID: 1002, CaseVersionID: 72, Status: "pending"},
 				},
 			},
-			Issue: issue,
+			CaseRunIDs: []int64{901},
+			Issue:      issue,
 		},
 		details: map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)},
 	}
@@ -1138,8 +1195,8 @@ func TestIssueHandlerStartRetest(t *testing.T) {
 		t.Fatalf("retest response = %#v, want wave 900/running/retesting", data)
 	}
 	caseRunIDs, ok := data["case_run_ids"].([]any)
-	if !ok || len(caseRunIDs) != 2 || caseRunIDs[0] != "901" || caseRunIDs[1] != "902" {
-		t.Fatalf("case_run_ids = %#v, want [901 902]", data["case_run_ids"])
+	if !ok || len(caseRunIDs) != 1 || caseRunIDs[0] != "901" {
+		t.Fatalf("case_run_ids = %#v, want only the linked retest run [901]", data["case_run_ids"])
 	}
 	if len(service.retestCalls) != 1 {
 		t.Fatalf("StartRetest calls = %d, want 1", len(service.retestCalls))

@@ -500,6 +500,7 @@ func (a deliveryRetestAdapter) retestWave(ctx context.Context, wave execution.Ru
 	for _, run := range runs {
 		projected.CaseRuns = append(projected.CaseRuns, deliveryapp.RetestCaseRun{
 			ID:            run.ID,
+			IntentID:      run.IntentID,
 			CaseVersionID: run.CaseVersionID,
 			Status:        string(run.Status),
 		})

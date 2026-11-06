@@ -269,27 +269,31 @@ func isIssueSeverity(severity string) bool {
 // RecurrenceCount/LastRecurredAt are the P7 recurrence projection; MergedChain
 // is the read-time merged_into target chain (direct target first, terminal
 // target last, at most MaxIssueMergeChain IDs) and is null for a non-merged
-// issue (spec §4.6).
+// issue (spec §4.6). RetestStatus/LastRetestWaveID/LastRetestCaseRunID are the
+// v0.22 W2-5 retest projection consumed by the issue UI.
 type IssueView struct {
-	ID               string           `json:"id"`
-	VersionID        string           `json:"version_id"`
-	Title            string           `json:"title"`
-	Summary          string           `json:"summary"`
-	Status           string           `json:"status"`
-	Category         string           `json:"category"`
-	Severity         string           `json:"severity"`
-	Source           string           `json:"source"`
-	ExpectedRevision int32            `json:"expected_revision"`
-	MergedIntoID     *string          `json:"merged_into_id"`
-	MergedAt         *string          `json:"merged_at"`
-	ReopenCount      int              `json:"reopen_count"`
-	RecurrenceCount  int              `json:"recurrence_count"`
-	LastRecurredAt   *string          `json:"last_recurred_at"`
-	MergedChain      []string         `json:"merged_chain"`
-	Refs             []IssueRefView   `json:"refs"`
-	Triage           *IssueTriageView `json:"triage"`
-	CreatedAt        string           `json:"created_at"`
-	UpdatedAt        string           `json:"updated_at"`
+	ID                  string           `json:"id"`
+	VersionID           string           `json:"version_id"`
+	Title               string           `json:"title"`
+	Summary             string           `json:"summary"`
+	Status              string           `json:"status"`
+	Category            string           `json:"category"`
+	Severity            string           `json:"severity"`
+	Source              string           `json:"source"`
+	ExpectedRevision    int32            `json:"expected_revision"`
+	MergedIntoID        *string          `json:"merged_into_id"`
+	MergedAt            *string          `json:"merged_at"`
+	ReopenCount         int              `json:"reopen_count"`
+	RecurrenceCount     int              `json:"recurrence_count"`
+	LastRecurredAt      *string          `json:"last_recurred_at"`
+	RetestStatus        string           `json:"retest_status"`
+	LastRetestWaveID    *string          `json:"last_retest_wave_id"`
+	LastRetestCaseRunID *string          `json:"last_retest_case_run_id"`
+	MergedChain         []string         `json:"merged_chain"`
+	Refs                []IssueRefView   `json:"refs"`
+	Triage              *IssueTriageView `json:"triage"`
+	CreatedAt           string           `json:"created_at"`
+	UpdatedAt           string           `json:"updated_at"`
 }
 
 // RetestIssueView is the POST .../issues/{issueId}/retest response (v0.22
@@ -342,26 +346,35 @@ func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *deliver
 	if source == "" {
 		source = delivery.IssueCandidateSource
 	}
+	retestStatus := issue.RetestStatus
+	if retestStatus == "" {
+		// Rows created before the v0.22 retest migration (or test doubles) read
+		// back as the persisted default so the contract enum never sees "".
+		retestStatus = delivery.IssueRetestStatusNotRetested
+	}
 	view := IssueView{
-		ID:               platformid.Format(issue.ID),
-		VersionID:        platformid.Format(issue.VersionID),
-		Title:            issue.Title,
-		Summary:          issue.Summary,
-		Status:           string(issue.Status),
-		Category:         issue.Category,
-		Severity:         issue.Severity,
-		Source:           source,
-		ExpectedRevision: issue.ExpectedRevision,
-		MergedIntoID:     optionalIDString(issue.MergedIntoID),
-		MergedAt:         formatOptionalTime(issue.MergedAt),
-		ReopenCount:      issue.ReopenCount,
-		RecurrenceCount:  issue.RecurrenceCount,
-		LastRecurredAt:   formatOptionalTime(issue.LastRecurredAt),
-		MergedChain:      formatIssueChain(mergedChain),
-		Refs:             make([]IssueRefView, 0, len(refs)),
-		Triage:           toIssueTriageView(triage),
-		CreatedAt:        formatTime(issue.CreatedAt),
-		UpdatedAt:        formatTime(issue.UpdatedAt),
+		ID:                  platformid.Format(issue.ID),
+		VersionID:           platformid.Format(issue.VersionID),
+		Title:               issue.Title,
+		Summary:             issue.Summary,
+		Status:              string(issue.Status),
+		Category:            issue.Category,
+		Severity:            issue.Severity,
+		Source:              source,
+		ExpectedRevision:    issue.ExpectedRevision,
+		MergedIntoID:        optionalIDString(issue.MergedIntoID),
+		MergedAt:            formatOptionalTime(issue.MergedAt),
+		ReopenCount:         issue.ReopenCount,
+		RecurrenceCount:     issue.RecurrenceCount,
+		LastRecurredAt:      formatOptionalTime(issue.LastRecurredAt),
+		RetestStatus:        retestStatus,
+		LastRetestWaveID:    optionalIDString(issue.LastRetestWaveID),
+		LastRetestCaseRunID: optionalIDString(issue.LastRetestCaseRunID),
+		MergedChain:         formatIssueChain(mergedChain),
+		Refs:                make([]IssueRefView, 0, len(refs)),
+		Triage:              toIssueTriageView(triage),
+		CreatedAt:           formatTime(issue.CreatedAt),
+		UpdatedAt:           formatTime(issue.UpdatedAt),
 	}
 	for _, ref := range refs {
 		view.Refs = append(view.Refs, toIssueRefView(ref))

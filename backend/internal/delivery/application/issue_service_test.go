@@ -87,6 +87,7 @@ type fakeIssueRepository struct {
 	retestStartErr    error
 	retestResultCalls []IssueRetestResult
 	retestResultErr   error
+	retestResultNoop  bool
 	retestFind        map[int64]delivery.Issue
 }
 
@@ -243,6 +244,9 @@ func (r *fakeIssueRepository) StartRetest(_ context.Context, in IssueRetestStart
 	if !ok {
 		return delivery.Issue{}, delivery.ErrNotFound
 	}
+	if in.ExpectedRetestStatus != issue.RetestStatus || !sameOptionalTestID(in.ExpectedLastRetestWaveID, issue.LastRetestWaveID) {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
 	issue.RetestStatus = delivery.IssueRetestStatusRetesting
 	waveID := in.WaveID
 	issue.LastRetestWaveID = &waveID
@@ -252,24 +256,36 @@ func (r *fakeIssueRepository) StartRetest(_ context.Context, in IssueRetestStart
 	return issue, nil
 }
 
-func (r *fakeIssueRepository) ApplyRetestResult(_ context.Context, in IssueRetestResult) (delivery.Issue, error) {
+func sameOptionalTestID(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func (r *fakeIssueRepository) ApplyRetestResult(_ context.Context, in IssueRetestResult) (delivery.Issue, bool, error) {
 	r.retestResultCalls = append(r.retestResultCalls, in)
 	if r.retestResultErr != nil {
-		return delivery.Issue{}, r.retestResultErr
+		return delivery.Issue{}, false, r.retestResultErr
 	}
 	issue, ok := r.getIssues[in.IssueID]
 	if !ok {
-		return delivery.Issue{}, delivery.ErrNotFound
+		return delivery.Issue{}, false, delivery.ErrNotFound
 	}
 	if issue.LastRetestWaveID == nil || *issue.LastRetestWaveID != in.WaveID {
-		return delivery.Issue{}, delivery.ErrStateConflict
+		return delivery.Issue{}, false, delivery.ErrStateConflict
+	}
+	changed := issue.RetestStatus != in.TargetStatus ||
+		issue.LastRetestCaseRunID == nil || *issue.LastRetestCaseRunID != in.CaseRunID
+	if r.retestResultNoop {
+		return issue, false, nil
 	}
 	issue.RetestStatus = in.TargetStatus
 	caseRunID := in.CaseRunID
 	issue.LastRetestCaseRunID = &caseRunID
 	issue.UpdatedAt = in.Now
 	r.getIssues[in.IssueID] = issue
-	return issue, nil
+	return issue, changed, nil
 }
 
 func (r *fakeIssueRepository) FindByRetestWave(_ context.Context, waveID int64) (delivery.Issue, bool, error) {

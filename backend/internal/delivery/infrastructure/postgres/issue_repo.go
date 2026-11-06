@@ -792,7 +792,8 @@ func (r *IssueRepository) FindByCaseRun(ctx context.Context, versionID, caseRunI
 
 // StartRetest marks one issue retesting and links the retest wave refs (v0.22
 // W2-5). The row is locked, the issue must still be open/confirmed, and the
-// status/pointer/refs commit atomically.
+// retest projection must still match the state the service observed before
+// creating the intents (R-14 CAS). The status/pointer/refs commit atomically.
 func (r *IssueRepository) StartRetest(ctx context.Context, in deliveryapp.IssueRetestStart) (delivery.Issue, error) {
 	ctx = contextOrBackground(ctx)
 	if in.VersionID <= 0 || in.IssueID <= 0 || in.WaveID <= 0 {
@@ -804,13 +805,17 @@ func (r *IssueRepository) StartRetest(ctx context.Context, in deliveryapp.IssueR
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var status string
+	var (
+		status   string
+		retest   string
+		lastWave *int64
+	)
 	err = tx.QueryRow(ctx, `
-		SELECT status
+		SELECT status, retest_status, last_retest_wave_id
 		FROM delivery_issue
 		WHERE id = $1 AND version_id = $2
 		FOR UPDATE
-	`, in.IssueID, in.VersionID).Scan(&status)
+	`, in.IssueID, in.VersionID).Scan(&status, &retest, &lastWave)
 	if isNoRows(err) {
 		return delivery.Issue{}, ErrNotFound
 	}
@@ -818,6 +823,14 @@ func (r *IssueRepository) StartRetest(ctx context.Context, in deliveryapp.IssueR
 		return delivery.Issue{}, wrapDB("start issue retest: lock issue", err)
 	}
 	if status != string(delivery.IssueStatusOpen) && status != string(delivery.IssueStatusConfirmed) {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+	// The CAS guards the whole retest projection, not just the pointer: two
+	// requests that both observed the same pre-retest state (for example two
+	// different case_run selections) cannot both win. A later legitimate retest
+	// observed the previous terminal wave and therefore matches its expected
+	// pointer.
+	if retest != in.ExpectedRetestStatus || !sameOptionalIssueID(lastWave, in.ExpectedLastRetestWaveID) {
 		return delivery.Issue{}, delivery.ErrStateConflict
 	}
 
@@ -849,24 +862,34 @@ func (r *IssueRepository) StartRetest(ctx context.Context, in deliveryapp.IssueR
 	return updated, nil
 }
 
+// sameOptionalIssueID compares two nullable ID pointers.
+func sameOptionalIssueID(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
 // ApplyRetestResult writes one retest outcome guarded by last_retest_wave_id
 // (v0.22 W2-5). A stale wave callback is a state conflict, never a silent
-// overwrite of a newer retest.
-func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.IssueRetestResult) (delivery.Issue, error) {
+// overwrite of a newer retest. The bool reports whether the stored projection
+// changed (a duplicate callback returns false so the service publishes no
+// duplicate event).
+func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.IssueRetestResult) (delivery.Issue, bool, error) {
 	ctx = contextOrBackground(ctx)
 	if in.VersionID <= 0 || in.IssueID <= 0 || in.WaveID <= 0 {
-		return delivery.Issue{}, delivery.ErrInvalidArgument
+		return delivery.Issue{}, false, delivery.ErrInvalidArgument
 	}
 	switch in.TargetStatus {
 	case delivery.IssueRetestStatusRetesting,
 		delivery.IssueRetestStatusPassed,
 		delivery.IssueRetestStatusFailed:
 	default:
-		return delivery.Issue{}, delivery.ErrInvalidArgument
+		return delivery.Issue{}, false, delivery.ErrInvalidArgument
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return delivery.Issue{}, fmt.Errorf("apply issue retest result: begin: %w", err)
+		return delivery.Issue{}, false, fmt.Errorf("apply issue retest result: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -883,13 +906,13 @@ func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.
 		FOR UPDATE
 	`, in.IssueID, in.VersionID).Scan(&status, &retest, &lastWave, &lastCase)
 	if isNoRows(err) {
-		return delivery.Issue{}, ErrNotFound
+		return delivery.Issue{}, false, ErrNotFound
 	}
 	if err != nil {
-		return delivery.Issue{}, wrapDB("apply issue retest result: lock issue", err)
+		return delivery.Issue{}, false, wrapDB("apply issue retest result: lock issue", err)
 	}
 	if lastWave == nil || *lastWave != in.WaveID {
-		return delivery.Issue{}, delivery.ErrStateConflict
+		return delivery.Issue{}, false, delivery.ErrStateConflict
 	}
 	changed := retest != in.TargetStatus || lastCase == nil || *lastCase != in.CaseRunID
 	now := in.Now
@@ -906,10 +929,10 @@ func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.
 		in.IssueID, in.VersionID, in.TargetStatus, in.CaseRunID, now,
 	))
 	if isNoRows(err) {
-		return delivery.Issue{}, ErrNotFound
+		return delivery.Issue{}, false, ErrNotFound
 	}
 	if err != nil {
-		return delivery.Issue{}, wrapDB("apply issue retest result: update issue", err)
+		return delivery.Issue{}, false, wrapDB("apply issue retest result: update issue", err)
 	}
 	if changed && in.Reason != "" {
 		// Retest status is independent of the four issue lifecycle statuses, so
@@ -926,13 +949,13 @@ func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.
 			CreatedAt: now,
 			UpdatedAt: now,
 		}); err != nil {
-			return delivery.Issue{}, err
+			return delivery.Issue{}, false, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return delivery.Issue{}, fmt.Errorf("apply issue retest result: commit: %w", err)
+		return delivery.Issue{}, false, fmt.Errorf("apply issue retest result: commit: %w", err)
 	}
-	return updated, nil
+	return updated, changed, nil
 }
 
 // FindByRetestWave resolves the issue whose last_retest_wave_id is waveID.

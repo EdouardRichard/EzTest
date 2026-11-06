@@ -22,7 +22,8 @@ import (
 
 // integrationIssueExecution serves the case_run snapshots of IngestCandidate.
 type integrationIssueExecution struct {
-	snapshots map[int64]deliveryapp.CaseRunSnapshot
+	snapshots     map[int64]deliveryapp.CaseRunSnapshot
+	waveSnapshots map[int64]deliveryapp.WaveSnapshot
 }
 
 func (e *integrationIssueExecution) ListFailedApplicationCaseRuns(context.Context, int64) ([]deliveryapp.CaseRunSnapshot, error) {
@@ -37,8 +38,12 @@ func (e *integrationIssueExecution) CaseRunSnapshot(_ context.Context, caseRunID
 	return snapshot, nil
 }
 
-func (e *integrationIssueExecution) WaveSnapshot(context.Context, int64, int64) (deliveryapp.WaveSnapshot, error) {
-	return deliveryapp.WaveSnapshot{}, nil
+func (e *integrationIssueExecution) WaveSnapshot(_ context.Context, _, waveID int64) (deliveryapp.WaveSnapshot, error) {
+	snapshot, ok := e.waveSnapshots[waveID]
+	if !ok {
+		return deliveryapp.WaveSnapshot{}, nil
+	}
+	return snapshot, nil
 }
 
 func (e *integrationIssueExecution) VersionSnapshot(context.Context, int64) (deliveryapp.VersionSnapshot, error) {
@@ -119,7 +124,10 @@ func newIntegrationIssueFixture(t *testing.T) *integrationIssueFixture {
 		t.Fatalf("new snowflake: %v", err)
 	}
 	repo := deliverypg.NewIssueRepository(pool, ids)
-	exec := &integrationIssueExecution{snapshots: map[int64]deliveryapp.CaseRunSnapshot{}}
+	exec := &integrationIssueExecution{
+		snapshots:     map[int64]deliveryapp.CaseRunSnapshot{},
+		waveSnapshots: map[int64]deliveryapp.WaveSnapshot{},
+	}
 	events := &integrationIssueEvents{}
 	audit := &integrationIssueAudit{}
 	svc := deliveryapp.NewIssueService(repo, exec, events, audit,
@@ -675,7 +683,10 @@ func TestIssueServiceIntegrationReportRevisionStableAfterRecurrence(t *testing.T
 	}); err != nil {
 		t.Fatalf("merge: %v", err)
 	}
-	exec := &integrationIssueExecution{snapshots: map[int64]deliveryapp.CaseRunSnapshot{}}
+	exec := &integrationIssueExecution{
+		snapshots:     map[int64]deliveryapp.CaseRunSnapshot{},
+		waveSnapshots: map[int64]deliveryapp.WaveSnapshot{},
+	}
 	recurrence := integrationIssueSnapshot(versionID, 3303, 4301)
 	exec.snapshots[recurrence.ID] = recurrence
 	issueSvc := deliveryapp.NewIssueService(issueRepo, exec, nil, nil,

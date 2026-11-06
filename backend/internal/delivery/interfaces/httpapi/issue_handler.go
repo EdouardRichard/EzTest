@@ -332,9 +332,9 @@ func (h *Handler) RetestIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, mapIssueError(err, deliveryapp.IssueConflictRetestActive))
 		return
 	}
-	caseRunIDsView := make([]string, 0, len(result.Wave.CaseRuns))
-	for _, run := range result.Wave.CaseRuns {
-		caseRunIDsView = append(caseRunIDsView, platformid.Format(run.ID))
+	caseRunIDsView := make([]string, 0, len(result.CaseRunIDs))
+	for _, caseRunID := range result.CaseRunIDs {
+		caseRunIDsView = append(caseRunIDsView, platformid.Format(caseRunID))
 	}
 	httpx.JSON(w, http.StatusOK, RetestIssueView{
 		IssueID:      platformid.Format(result.Issue.ID),
