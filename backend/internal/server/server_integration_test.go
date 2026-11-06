@@ -316,9 +316,23 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 91 {
-		t.Fatalf("settings count = %d, want 91 (v0.22 catalog: 85 -> 98, W1-2 removes 7 dead keys)", len(settings))
+	if len(settings) != 87 {
+		t.Fatalf("settings count = %d, want 87 (v0.22 catalog: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(settings))
 	}
+	settingKeys := make(map[string]bool, len(settings))
+	for _, raw := range settings {
+		key := raw.(map[string]any)["key"].(string)
+		if strings.HasPrefix(key, "gc.") {
+			t.Fatalf("removed setting %q leaked through GET /api/admin/settings", key)
+		}
+		settingKeys[key] = true
+	}
+	for _, key := range []string{"retention.gc_dry_run", "retention.gc_grace_hours", "retention.unreferenced_content_days"} {
+		if !settingKeys[key] {
+			t.Fatalf("%s is missing from GET /api/admin/settings", key)
+		}
+	}
+	api.do(http.MethodPatch, "/api/admin/settings/gc.retention_days", map[string]any{"value": 7}, http.StatusNotFound)
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {
 		t.Fatalf("updated setting = %#v", updated)

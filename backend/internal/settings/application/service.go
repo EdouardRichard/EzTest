@@ -79,6 +79,13 @@ func (s *Service) Reload(ctx context.Context) error {
 	}
 	cache := make(map[string]settings.Setting, len(list))
 	for _, item := range list {
+		// Rows seeded by an older catalog (for example the four gc.* aliases
+		// removed by W2-15) stay in system_setting because seeding never
+		// deletes. They are not part of the live catalog, so neither List nor
+		// Get may expose them.
+		if _, ok := s.byKey[item.Key]; !ok {
+			continue
+		}
 		cache[item.Key] = item
 	}
 	s.mu.Lock()

@@ -20,14 +20,16 @@
          objects/aa/bb/<sha> with an old mtime and no content_object row;
       5. run a dry-run and assert the report only records candidates (no rows,
          files or tombstones deleted);
-      6. capture an active case's evidence count, run apply and assert >= 1
-         deletion, >= 1 tombstone and the evidence count unchanged;
+      6. capture the base verdict's failed case_run evidence count, run apply
+         and assert >= 1 deletion, >= 1 tombstone and the evidence count
+         unchanged (the case_run is version-scoped to data.versionId, never a
+         globally most-evidenced run from another version);
       7. verify the gc.started / gc.completed events on the system channel and
          their EV-21 payload keys in PostgreSQL;
       8. write docs/version-V0.22/acceptance/evidence/w2/run/gc-verdict.json.
 
     PASS requires: dryDeleted = 0, dryTombstones = 0, applyDeleted >= 1,
-    applyTombstones >= 1, active case evidence unchanged, gc.started >= 2 and
+    applyTombstones >= 1, base case evidence unchanged, gc.started >= 2 and
     gc.completed >= 2.
 
 .PARAMETER SkipBuild
@@ -71,8 +73,6 @@ $verdict = [ordered]@{
     dryTombstones              = $null
     applyDeleted               = $null
     applyTombstones            = $null
-    runningCaseEvidenceBefore  = $null
-    runningCaseEvidenceAfter   = $null
     events                     = [ordered]@{ started = 0; completed = 0; failed = 0; total = 0 }
     apiBase                    = $apiBase
     generatedAt                = (Get-Date -Format o)
@@ -85,8 +85,12 @@ $verdict = [ordered]@{
     applyDeletedObjects        = $null
     applyDeletedRefs           = $null
     applyDeletedFiles          = $null
-    runningCaseId              = $null
-    runningCaseStatus          = $null
+    caseRunId                  = $null
+    caseStatus                 = $null
+    caseSource                 = $null
+    caseVersionId              = $null
+    caseEvidenceBefore         = $null
+    caseEvidenceAfter          = $null
     eventsDetail               = [ordered]@{}
     screenshots                = @()
     errors                     = @()
@@ -325,19 +329,39 @@ try {
     $verdict.candidateSha = $candidate.SHA
     Write-Host "== temp candidate $($candidate.SHA) at $($candidate.Path)"
 
-    # Active case evidence: prefer a running/paused case; otherwise use the
-    # case_run with the most evidence (it is still the protected evidence set).
-    $caseRow = Invoke-Db "select cr.id || '|' || cr.status || '|' || count(e.id) from case_run cr join evidence e on e.case_run_id = cr.id where cr.status in ('running','paused') group by cr.id, cr.status order by count(e.id) desc, cr.id desc limit 1"
-    if ([string]::IsNullOrWhiteSpace($caseRow)) {
-        $caseRow = Invoke-Db "select cr.id || '|' || cr.status || '|' || count(e.id) from case_run cr join evidence e on e.case_run_id = cr.id group by cr.id, cr.status order by count(e.id) desc, cr.id desc limit 1"
+    # Case evidence provenance: the protected evidence set must belong to the
+    # base version. Pin data.caseRunIds.failed[0] from run/data-verdict.json;
+    # if that row is gone, fall back to a version-scoped active run and finally
+    # to the version-scoped run with the most evidence. A globally
+    # most-evidenced case_run could belong to another version's run and would
+    # make the verdict claim the wrong provenance.
+    $baseFailedCaseRunId = ''
+    if ($null -ne $data.caseRunIds -and $null -ne $data.caseRunIds.failed -and @($data.caseRunIds.failed).Count -ge 1) {
+        $baseFailedCaseRunId = [string]@($data.caseRunIds.failed)[0]
     }
-    if ([string]::IsNullOrWhiteSpace($caseRow)) { throw 'no case_run with evidence exists in the base data' }
+    $caseSelect = "select cr.id || '|' || cr.status || '|' || count(e.id) from case_run cr join run_wave rw on rw.id = cr.wave_id left join evidence e on e.case_run_id = cr.id where rw.version_id = $($data.versionId)"
+    $caseRow = ''
+    if ($baseFailedCaseRunId -ne '') {
+        $caseRow = Invoke-Db "$caseSelect and cr.id = $baseFailedCaseRunId group by cr.id, cr.status"
+        if (-not [string]::IsNullOrWhiteSpace($caseRow)) { $verdict.caseSource = 'base-verdict-failed' }
+    }
+    if ([string]::IsNullOrWhiteSpace($caseRow)) {
+        $caseRow = Invoke-Db "$caseSelect and cr.status in ('running','paused') group by cr.id, cr.status order by count(e.id) desc, cr.id desc limit 1"
+        if (-not [string]::IsNullOrWhiteSpace($caseRow)) { $verdict.caseSource = 'base-version-active' }
+    }
+    if ([string]::IsNullOrWhiteSpace($caseRow)) {
+        $caseRow = Invoke-Db "$caseSelect group by cr.id, cr.status order by count(e.id) desc, cr.id desc limit 1"
+        if (-not [string]::IsNullOrWhiteSpace($caseRow)) { $verdict.caseSource = 'base-version-most-evidence' }
+    }
+    if ([string]::IsNullOrWhiteSpace($caseRow)) { throw "no case_run with evidence exists for base version $($data.versionId)" }
     $caseParts = $caseRow -split '\|'
     $script:caseRunId = [string]$caseParts[0]
-    $verdict.runningCaseId = $script:caseRunId
-    $verdict.runningCaseStatus = [string]$caseParts[1]
+    $verdict.caseRunId = $script:caseRunId
+    $verdict.caseStatus = [string]$caseParts[1]
+    $verdict.caseVersionId = [string]$data.versionId
     $script:evidenceBefore = [int]$caseParts[2]
-    $verdict.runningCaseEvidenceBefore = $script:evidenceBefore
+    $verdict.caseEvidenceBefore = $script:evidenceBefore
+    Write-Host "== base case_run $($script:caseRunId) status=$($verdict.caseStatus) source=$($verdict.caseSource) evidence=$($script:evidenceBefore)"
 
     $tombstonesBefore = [int](Invoke-Db 'select count(*) from gc_tombstone')
     $systemSeqBefore = [string](Invoke-Db "select coalesce(max(seq), 0) from event where channel = 'system'")
@@ -401,15 +425,15 @@ try {
     $candidateTombstone = Invoke-Db "select count(*) from gc_tombstone where run_id = $($applyRun.id) and object_sha = '$($candidate.SHA)'"
     if ($candidateTombstone -ne '1') { throw "no tombstone row for the apply run's temp candidate" }
 
-    # Running/active case evidence must survive the apply byte-for-byte.
+    # Base case evidence must survive the apply byte-for-byte.
     $evidenceAfter = [int](Invoke-Db "select count(*) from evidence where case_run_id = $($script:caseRunId)")
-    $verdict.runningCaseEvidenceAfter = $evidenceAfter
+    $verdict.caseEvidenceAfter = $evidenceAfter
     if ($evidenceAfter -ne $script:evidenceBefore) {
-        throw "active case $($script:caseRunId) evidence count $evidenceAfter != $($script:evidenceBefore)"
+        throw "base case $($script:caseRunId) evidence count $evidenceAfter != $($script:evidenceBefore)"
     }
     $liveEvidenceRefs = [int](Invoke-Db "select count(*) from evidence e join content_ref r on r.id = e.content_ref_id where e.case_run_id = $($script:caseRunId) and r.deleted_at is null")
     if ($liveEvidenceRefs -lt $evidenceAfter) {
-        throw "active case evidence content refs were soft-deleted ($liveEvidenceRefs < $evidenceAfter)"
+        throw "base case evidence content refs were soft-deleted ($liveEvidenceRefs < $evidenceAfter)"
     }
     Write-Host "== apply $($applyRun.id): deleted objects=$($verdict.applyDeletedObjects) refs=$($verdict.applyDeletedRefs) files=$applyFiles tombstones=$($verdict.applyTombstones); case $($script:caseRunId) evidence=$evidenceAfter"
 
