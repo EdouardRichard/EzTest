@@ -1237,6 +1237,7 @@ function Write-AcsSummary {
         $acs.Add([ordered]@{
             id            = $acId
             requirementId = $rid
+            kind          = [string]$probe.kind
             status        = [string]$probe.recomputed
             groundTruth   = [string]$probe.groundTruth
             eztestVerdict = $verdicts[$rid]
