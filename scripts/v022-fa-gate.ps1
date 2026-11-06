@@ -1043,7 +1043,8 @@ function Invoke-GateIssues14 {
                 foreach ($item in @(Get-Iarray (Get-Value $w0 @($collectionName)))) {
                     $id = Get-StringValue $item @('id', 'name')
                     $ok = Get-Value $item @('ok', 'pass', 'passed')
-                    if ($id -and $null -ne $ok -and [bool]$ok) { $passingChecks[$id] = $true }
+                    $statusValue = (Get-StringValue $item @('status')).ToUpperInvariant()
+                    if ($id -and ((($null -ne $ok) -and [bool]$ok) -or ($statusValue -eq 'PASS'))) { $passingChecks[$id] = $true }
                 }
             }
             $assertions = Get-Value $w0 @('assertions')
