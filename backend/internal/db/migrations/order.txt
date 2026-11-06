@@ -63,3 +63,4 @@ version_0013_v022_extraction_report.sql
 version_0014_v022_attachment_conversation.sql
 delivery_0002_v022_issue_manual_retest.sql
 design_0003_v022_case_rollback_trigger.sql
+quality_0002_v022_eval_scope.sql

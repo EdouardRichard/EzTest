@@ -16,17 +16,19 @@ v0.22 additive 策略见下）。身份分两层：
   W2-5 追加 R-W2-2/API-25 的 issue retest path/operation（+1 path / +1 operation /
   +1 schema），W2-7 追加 R-W2-3/API-28 的 report artifact export path/operation
   （+1 path / +1 operation / +1 schema），W2-11 追加 R-EX-6/API-41 的 discovery case
-  rollback path/operation（+1 path / +1 operation / +1 schema）。合计 **32 个
-  path item / 41 个 operation / 40 个 schema**。当前文件为
-  **213 paths / 263 operations / 321 schemas**。新增段在
+  rollback path/operation（+1 path / +1 operation / +1 schema），W2-14 追加 R-W2-6/API-31 的
+  质量趋势 path/operation（+1 path / +1 operation / +1 schema）。合计 **33 个
+  path item / 42 个 operation / 41 个 schema**。当前文件为
+  **214 paths / 264 operations / 322 schemas**。新增段在
   `info.description` 的
   `### v0.22 W0 增量（Task 37，additive）`、`## v0.22 W1 增量（W1-13，additive）`、
   `## v0.22 W1 增量（W1-14A，additive）`、
   `## v0.22 W2-2 增量（human request decisions，additive）`、
   `## v0.22 W2-4 增量（manual issue create/update，additive）`、
   `## v0.22 W2-5 增量（issue retest，additive）`、
-  `## v0.22 W2-7 增量（report artifact export，additive）` 与
-  `## v0.22 W2-11 增量（discovery case rollback，additive）` 中说明。
+  `## v0.22 W2-7 增量（report artifact export，additive）`、
+  `## v0.22 W2-11 增量（discovery case rollback，additive）` 与
+  `## v0.22 W2-14 增量（snapshot eval + trends，additive）` 中说明。
 - 公开端点 `GET /api/openapi.yaml` 原样返回本文件。
 
 ## 单一事实源与整文件 port（0.2.1 基线）

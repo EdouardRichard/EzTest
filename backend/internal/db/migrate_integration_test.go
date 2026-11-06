@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 63 {
-		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -183,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 63 {
-		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -324,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 63 {
-		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -644,6 +644,7 @@ func TestP6QualityPromptSchema(t *testing.T) {
 
 	indexes := []string{
 		"idx_eval_run_created_at", "idx_eval_metric_run",
+		"idx_eval_run_version_created",
 		"idx_agent_profile_prompt_revision_key",
 	}
 	rows, err = pool.Query(ctx, `
@@ -668,6 +669,23 @@ func TestP6QualityPromptSchema(t *testing.T) {
 		if !foundIndexes[name] {
 			t.Errorf("missing P6 index %s", name)
 		}
+	}
+
+	// v0.22 W2-14: eval_run.version_id is nullable BIGINT and the widened mode
+	// CHECK accepts the server-derived `snapshot` track.
+	var versionColumn string
+	if err := pool.QueryRow(ctx, `
+		SELECT data_type FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'eval_run' AND column_name = 'version_id'
+	`).Scan(&versionColumn); err != nil {
+		t.Fatalf("eval_run.version_id column: %v", err)
+	}
+	if versionColumn != "bigint" {
+		t.Errorf("eval_run.version_id type = %q, want bigint", versionColumn)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO eval_run (id, mode, corpus_version, status) VALUES (214001, 'snapshot', 'snapshot:test', 'passed')`); err != nil {
+		t.Errorf("mode=snapshot rejected by the widened CHECK: %v", err)
 	}
 }
 
@@ -1075,8 +1093,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 63 {
-		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 
 	columns := []struct {

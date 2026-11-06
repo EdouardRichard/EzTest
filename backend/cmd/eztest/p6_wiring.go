@@ -23,6 +23,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	qualityapp "github.com/EdouardRichard/EzTest/backend/internal/quality/application"
+	qualityadapter "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/adapters"
 	qualitymetrics "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/metrics"
 	qualitypg "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/postgres"
 	qualityapi "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
@@ -34,6 +35,8 @@ import (
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
 	versionapi "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
+	visualapp "github.com/EdouardRichard/EzTest/backend/internal/visual/application"
+	visualpg "github.com/EdouardRichard/EzTest/backend/internal/visual/infrastructure/postgres"
 	workspaceapp "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
 	workspaceproviders "github.com/EdouardRichard/EzTest/backend/internal/workspace/infrastructure/providers"
 	workspaceapi "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
@@ -47,6 +50,7 @@ type p6ReadDeps struct {
 	Clock    clock.Clock
 	Settings *settingsapp.Service
 	Audit    auditapp.Recorder
+	Events   eventingapp.Publisher
 	Issues   *deliveryapp.IssueService
 	Reports  *deliveryapp.ReportService
 }
@@ -108,7 +112,16 @@ func newP6ReadRuntime(deps p6ReadDeps) (*p6ReadRuntime, error) {
 	qualityRepo := qualitypg.NewRepository(deps.Pool)
 	aggregator := qualitymetrics.NewAggregator(
 		versionQuery, designQuery, executionQuery, deliveryQuery, agentQuery, eventingQuery)
-	qualitySvc := qualityapp.NewService(qualityRepo, deps.IDs, deps.Clock, aggregator, deps.Settings, deps.Audit)
+	// W2-14: the snapshot trigger reads the same version/design/execution ports
+	// as the operational overview plus the visual diff classification counts.
+	visualRepo := visualpg.NewRepository(deps.Pool)
+	visualOverview := visualapp.NewOverviewService(visualapp.OverviewServiceDeps{
+		Diffs: visualRepo.Diffs, Clock: deps.Clock,
+	})
+	qualitySvc := qualityapp.NewService(qualityRepo, deps.IDs, deps.Clock, aggregator, deps.Settings, deps.Audit).
+		WithSnapshotPorts(executionQuery, versionQuery, designQuery,
+			qualityadapter.NewVisualClassification(visualOverview)).
+		WithEvents(qualityadapter.NewEventPublisher(deps.Events))
 
 	searchSvc := searchapp.NewService(
 		searchproviders.New(versionQuery, designQuery, deliveryQuery),

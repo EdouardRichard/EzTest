@@ -44,6 +44,9 @@ type fakeRepo struct {
 
 	latest    *qualityapp.EvalRun
 	latestErr error
+
+	trends    []qualityapp.TrendPoint
+	trendsErr error
 }
 
 func (f *fakeRepo) Insert(_ context.Context, run qualityapp.EvalRun, metrics []quality.Metric) error {
@@ -64,6 +67,14 @@ func (f *fakeRepo) List(_ context.Context, limit int) ([]qualityapp.EvalRun, err
 
 func (f *fakeRepo) Latest(context.Context) (*qualityapp.EvalRun, error) {
 	return f.latest, f.latestErr
+}
+
+func (f *fakeRepo) LatestForVersion(context.Context, int64) (*qualityapp.EvalRun, error) {
+	return f.latest, f.latestErr
+}
+
+func (f *fakeRepo) Trends(context.Context, int64, string, time.Time, time.Time) ([]qualityapp.TrendPoint, error) {
+	return f.trends, f.trendsErr
 }
 
 type fakeSource struct {

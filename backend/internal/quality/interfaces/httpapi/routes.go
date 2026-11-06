@@ -13,6 +13,7 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("GET /api/quality/eval-runs", admin(http.HandlerFunc(h.ListEvalRuns)))
 	mux.Handle("POST /api/quality/eval-runs", admin(http.HandlerFunc(h.CreateEvalRun)))
 	mux.Handle("GET /api/quality/eval-runs/{id}", admin(http.HandlerFunc(h.GetEvalRun)))
+	mux.Handle("GET /api/quality/trends", admin(http.HandlerFunc(h.GetTrends)))
 	mux.Handle("GET /api/quality/overview", authenticated(http.HandlerFunc(h.GetOverview)))
 }
 

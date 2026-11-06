@@ -12,7 +12,7 @@ import type { BadgeTone } from "@/components/ui/Badge"
 
 /* ---------------------------------- enums ---------------------------------- */
 
-export type EvalMode = "real_llm"
+export type EvalMode = "real_llm" | "snapshot"
 
 export type EvalStatus = "running" | "passed" | "failed" | "error"
 
@@ -88,9 +88,27 @@ export type EvalRun = {
   model: string
   status: EvalStatus
   summary: Record<string, unknown>
+  /** v0.22 snapshot scope; null for legacy real_llm runs. */
+  version_id: string | null
   metrics: EvalMetric[]
   started_at: string | null
   finished_at: string | null
+  created_at: string
+}
+
+/** `TrendPointView` of GET /api/quality/trends (W2-14). */
+export type TrendPoint = {
+  run_id: string
+  version_id: string | null
+  mode: EvalMode
+  status: EvalStatus
+  metric: string
+  value: number
+  threshold: number
+  passed: boolean
+  /** Baseline value; only a warning signal, never a block. */
+  baseline?: number | null
+  regressed: boolean
   created_at: string
 }
 
@@ -114,7 +132,17 @@ export const EVAL_METRIC_LABEL: Record<string, string> = {
   issue_false_positive_rate: "问题误报率",
   supplement_hit_rate: "补充命中率",
   visual_classification_accuracy: "视觉分类准确率",
+  execution_pass_rate: "执行通过率",
+  case_coverage: "用例覆盖率",
 }
+
+/** v0.22 snapshot metrics offered by the trend chart selector. */
+export const TREND_METRICS: string[] = [
+  "design_coverage",
+  "execution_pass_rate",
+  "case_coverage",
+  "visual_classification_accuracy",
+]
 
 export const EVAL_REASON_LABEL: Record<string, string> = {
   ok: "通过",

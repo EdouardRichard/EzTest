@@ -10,12 +10,13 @@ import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
+import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { listVersions } from "@/features/versions/api"
 import type { VersionSummary } from "@/features/versions/types"
 import { QualityMetricsPanel } from "@/features/visual/QualityMetricsPanel"
 import { formatDateTime } from "@/lib/format"
 
-import { getQualityOverview, listEvalRuns } from "./api"
+import { getQualityOverview, getQualityTrends, listEvalRuns, triggerSnapshot } from "./api"
 import {
   EVAL_METRIC_LABEL,
   EVAL_STATUS_LABEL,
@@ -30,6 +31,8 @@ import {
   OPERATIONAL_METRIC_LABEL,
   type OperationalMetric,
   type QualityOverview,
+  TREND_METRICS,
+  type TrendPoint,
 } from "./types"
 
 export type QualityPageProps = {
@@ -65,6 +68,15 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
 
   const [overviewReloadToken, setOverviewReloadToken] = useState(0)
   const [evalReloadToken, setEvalReloadToken] = useState(0)
+
+  // W2-14: admin snapshot trigger + version/metric trend series.
+  const [trendMetric, setTrendMetric] = useState<string>(TREND_METRICS[0])
+  const [trendPoints, setTrendPoints] = useState<TrendPoint[]>([])
+  const [trendLoading, setTrendLoading] = useState(false)
+  const [trendError, setTrendError] = useState<unknown>(null)
+  const [triggering, setTriggering] = useState(false)
+  const [triggerError, setTriggerError] = useState<unknown>(null)
+  const [triggerResult, setTriggerResult] = useState<EvalRun | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -133,10 +145,55 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
     }
   }, [isAdmin, evalReloadToken])
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reload token re-runs the explicit refetch
+  useEffect(() => {
+    if (!isAdmin || versionId.length === 0) {
+      setTrendPoints([])
+      setTrendError(null)
+      setTrendLoading(false)
+      return
+    }
+    let cancelled = false
+    setTrendLoading(true)
+    setTrendError(null)
+    void getQualityTrends({ versionId, metric: trendMetric })
+      .then((points) => {
+        if (!cancelled) setTrendPoints(points)
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) {
+          setTrendPoints([])
+          setTrendError(cause)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setTrendLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isAdmin, versionId, trendMetric, evalReloadToken])
+
   const refresh = useCallback(() => {
     setOverviewReloadToken((token) => token + 1)
     if (isAdmin) setEvalReloadToken((token) => token + 1)
   }, [isAdmin])
+
+  const runSnapshot = useCallback(async () => {
+    if (versionId.length === 0 || triggering) return
+    setTriggering(true)
+    setTriggerError(null)
+    try {
+      const run = await triggerSnapshot(versionId)
+      setTriggerResult(run)
+      refresh()
+    } catch (cause: unknown) {
+      setTriggerResult(null)
+      setTriggerError(cause)
+    } finally {
+      setTriggering(false)
+    }
+  }, [versionId, triggering, refresh])
 
   function changeVersion(next: string): void {
     setVersionId(next)
@@ -237,6 +294,30 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           {isAdmin ? <Badge tone="neutral">admin-only</Badge> : null}
         </header>
 
+        {isAdmin && versionId.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              data-testid="quality-eval-trigger"
+              onClick={() => void runSnapshot()}
+              disabled={triggering}
+            >
+              {triggering ? "正在执行快照评测…" : "触发快照评测"}
+            </Button>
+            {triggerResult !== null ? (
+              <p
+                data-testid="quality-eval-trigger-result"
+                className="text-[11px] text-muted-foreground"
+              >
+                快照评测已生成 #{triggerResult.id}（
+                {EVAL_STATUS_LABEL[triggerResult.status]}，{triggerResult.metrics.length} 项指标）
+              </p>
+            ) : null}
+            {triggerError !== null ? <InlineError error={triggerError} /> : null}
+          </div>
+        ) : null}
+
         {!isAdmin ? (
           <div
             data-testid="quality-eval-admin-only"
@@ -266,6 +347,139 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           />
         )}
       </section>
+
+      {isAdmin && versionId.length > 0 ? (
+        <section
+          data-testid="quality-trends"
+          aria-label="指标趋势"
+          className="surface-card space-y-3 p-4"
+        >
+          <header className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-foreground">指标趋势</h2>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                同一版本的多次快照评测形成趋势；基线回归仅告警，不阻断阶段验收。
+              </p>
+            </div>
+            <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <span>趋势指标</span>
+              <Select
+                aria-label="趋势指标"
+                value={trendMetric}
+                onChange={(event) => setTrendMetric(event.target.value)}
+                className="h-8 w-44 text-xs"
+              >
+                {TREND_METRICS.map((metric) => (
+                  <option key={metric} value={metric}>
+                    {EVAL_METRIC_LABEL[metric] ?? metric}
+                  </option>
+                ))}
+              </Select>
+            </label>
+          </header>
+          {trendLoading && trendPoints.length === 0 ? (
+            <LoadingCard label="正在加载指标趋势…" />
+          ) : trendError !== null ? (
+            <ErrorState error={trendError} title="指标趋势加载失败" onRetry={refresh} />
+          ) : trendPoints.length === 0 ? (
+            <div
+              data-testid="quality-trend-empty"
+              className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-4 text-[11px] text-muted-foreground"
+            >
+              暂无趋势点：切换版本或触发一次快照评测后展示。
+            </div>
+          ) : (
+            <TrendChart points={trendPoints} metric={trendMetric} />
+          )}
+        </section>
+      ) : null}
+
+      {isAdmin && versionId.length > 0 ? (
+        <EvalEventsBridge versionId={versionId} onEvalChanged={refresh} />
+      ) : null}
+    </div>
+  )
+}
+
+function EvalEventsBridge({
+  versionId,
+  onEvalChanged,
+}: {
+  versionId: string
+  onEvalChanged: () => void
+}) {
+  useVersionEvents(versionId, { onEvalChanged })
+  return null
+}
+
+function TrendChart({ points, metric }: { points: TrendPoint[]; metric: string }) {
+  const label = EVAL_METRIC_LABEL[metric] ?? metric
+  return (
+    <div data-testid="quality-trend-chart" className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        {label} · {points.length} 个点（旧 → 新）
+      </p>
+      <div className="flex h-24 items-end gap-2 border-b border-border pb-1" aria-hidden="true">
+        {points.map((point) => (
+          <span
+            key={point.run_id}
+            data-trend-bar
+            title={`${label} ${formatPercent(point.value)}`}
+            className={
+              point.regressed
+                ? "w-6 rounded-t bg-destructive/70"
+                : point.passed
+                  ? "w-6 rounded-t bg-emerald-500/70"
+                  : "w-6 rounded-t bg-amber-500/70"
+            }
+            style={{ height: `${Math.max(6, Math.round(point.value * 80))}px` }}
+          />
+        ))}
+      </div>
+      <table className="w-full border-separate border-spacing-0 text-left text-xs">
+        <thead>
+          <tr className="text-[11px] uppercase tracking-wide text-muted-foreground">
+            <th className="border-b border-border px-2 py-1.5 font-medium">Run</th>
+            <th className="border-b border-border px-2 py-1.5 font-medium">值</th>
+            <th className="border-b border-border px-2 py-1.5 font-medium">阈值</th>
+            <th className="border-b border-border px-2 py-1.5 font-medium">基线</th>
+            <th className="border-b border-border px-2 py-1.5 font-medium">状态</th>
+            <th className="border-b border-border px-2 py-1.5 font-medium">时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          {points.map((point) => (
+            <tr key={point.run_id} data-testid={`quality-trend-point-${point.run_id}`}>
+              <td className="border-b border-border px-2 py-1.5 font-mono text-foreground">
+                #{point.run_id}
+              </td>
+              <td className="border-b border-border px-2 py-1.5 font-medium text-foreground">
+                {formatPercent(point.value)}
+              </td>
+              <td className="border-b border-border px-2 py-1.5 text-muted-foreground">
+                {formatPercent(point.threshold)}
+              </td>
+              <td className="border-b border-border px-2 py-1.5 text-muted-foreground">
+                {point.baseline !== null && point.baseline !== undefined
+                  ? formatPercent(point.baseline)
+                  : "—"}
+              </td>
+              <td className="border-b border-border px-2 py-1.5">
+                {point.regressed ? (
+                  <Badge tone="warning">基线回归仅告警</Badge>
+                ) : (
+                  <Badge tone={point.passed ? "success" : "danger"}>
+                    {point.passed ? "通过" : "未通过"}
+                  </Badge>
+                )}
+              </td>
+              <td className="border-b border-border px-2 py-1.5 text-muted-foreground">
+                {formatDateTime(point.created_at)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }

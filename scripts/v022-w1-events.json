@@ -299,6 +299,24 @@
       "channel": "version:N"
     },
     {
+      "type": "eval.completed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:298",
+      "channel": "version:N"
+    },
+    {
+      "type": "eval.failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:299",
+      "channel": "version:N"
+    },
+    {
+      "type": "eval.started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:297",
+      "channel": "version:N"
+    },
+    {
       "type": "extraction.done",
       "consumer": "ui",
       "evidence": "frontend/src/features/clarification/useVersionEvents.ts:198",

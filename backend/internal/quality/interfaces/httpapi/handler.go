@@ -16,10 +16,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	qualityapp "github.com/EdouardRichard/EzTest/backend/internal/quality/application"
+	quality "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
 )
 
 // Service is the subset of *qualityapp.Service used by the HTTP layer.
@@ -28,6 +30,8 @@ type Service interface {
 	Record(ctx context.Context, actor platform.Actor, input qualityapp.RecordInput) (qualityapp.EvalRun, error)
 	Get(ctx context.Context, id int64) (qualityapp.EvalRun, error)
 	Overview(ctx context.Context, versionID *int64) (qualityapp.Overview, error)
+	TriggerSnapshot(ctx context.Context, actor platform.Actor, versionID int64) (qualityapp.EvalRun, error)
+	Trends(ctx context.Context, versionID int64, metric string, from, to time.Time) ([]qualityapp.TrendPoint, error)
 }
 
 // Handler serves the P6 quality endpoints.
@@ -95,6 +99,22 @@ func (h *Handler) CreateEvalRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Unavailable("quality service is not configured"))
 		return
 	}
+	// W2-14 (R-W2-6): mode=snapshot is a server-derived trigger, not a client
+	// sample. version_id is required and the sample/verdict fields are ignored.
+	if strings.TrimSpace(body.Mode) == quality.EvalModeSnapshot {
+		versionID, err := parsePositiveID("version_id", body.VersionID)
+		if err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+		run, err := h.service.TriggerSnapshot(r.Context(), actor, versionID)
+		if err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+		httpx.JSON(w, http.StatusCreated, toEvalRunView(run))
+		return
+	}
 	run, err := h.service.Record(r.Context(), actor, body.toInput())
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -149,7 +169,70 @@ func (h *Handler) GetOverview(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toQualityOverviewView(overview))
 }
 
+// GetTrends GET /api/quality/trends?version_id=&metric=&from=&to= (admin).
+// Returns the version/metric eval series oldest first; from/to are optional
+// RFC3339 bounds. A baseline regression is carried as a flag only (warn-only).
+func (h *Handler) GetTrends(w http.ResponseWriter, r *http.Request) {
+	if _, err := requireAdmin(r); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	query := r.URL.Query()
+	versionID, err := parsePositiveID("version_id", query.Get("version_id"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	metric := strings.TrimSpace(query.Get("metric"))
+	if metric == "" {
+		httpx.Error(w, r, platform.Invalid("metric", "is required"))
+		return
+	}
+	if !quality.IsKnownMetric(metric) {
+		httpx.Error(w, r, platform.Invalid("metric", "is not a known eval metric"))
+		return
+	}
+	from, err := parseOptionalTime("from", query.Get("from"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	to, err := parseOptionalTime("to", query.Get("to"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.service == nil {
+		httpx.Error(w, r, platform.Unavailable("quality service is not configured"))
+		return
+	}
+	points, err := h.service.Trends(r.Context(), versionID, metric, from, to)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	views := make([]trendPointView, 0, len(points))
+	for _, point := range points {
+		views = append(views, toTrendPointView(point))
+	}
+	httpx.JSON(w, http.StatusOK, views)
+}
+
 /* --------------------------------- helpers -------------------------------- */
+
+// parseOptionalTime parses an optional RFC3339 query bound. An empty value means
+// unbounded and returns the zero time.
+func parseOptionalTime(field, raw string) (time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, trimmed)
+	if err != nil {
+		return time.Time{}, platform.Invalid(field, "must be an RFC3339 timestamp")
+	}
+	return parsed.UTC(), nil
+}
 
 func requireActor(r *http.Request) (platform.Actor, error) {
 	actor, ok := platform.ActorFrom(r.Context())

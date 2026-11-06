@@ -384,6 +384,24 @@ info:
       `design_0003_v022_case_rollback_trigger.sql` 扩展 `rollback`。不新增表。
     - 新增 schema `CaseRevisionRollbackView`；不新增服务。
 
+    ## v0.22 W2-14 增量（snapshot eval + trends，additive）
+
+    R-W2-6 / W2-C5（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§5/§6/§7）：
+    - `POST /api/quality/eval-runs` 在既有 `mode=real_llm` 之外接受 `mode=snapshot`（admin），
+      body `{mode:"snapshot",version_id}`；服务端通过 version/design/execution/visual 只读端口
+      从真实版本数据派生 `design_coverage`、`execution_pass_rate`、`case_coverage`、
+      `visual_classification_accuracy` 四项指标与 `status`（passed/failed），写入
+      `eval_run.version_id`（迁移 `quality_0002_v022_eval_scope.sql`）。客户端 sample/verdict 被忽略。
+    - 基线 = 同一版本的上一次 eval run；回归只标记 `regressed`/`baseline_regression`（告警），
+      不阻断触发或阶段验收。
+    - `GET /api/quality/trends?version_id=&metric=&from=&to=`（admin）返回该版本/指标的
+      时间序列（`created_at` 升序，≥2 点由同类多次 snapshot 触发自然产生）；`from`/`to` 为
+      RFC3339 可选边界。
+    - 生命周期事件 `eval.started` → `eval.completed`（失败 `eval.failed`），版本频道
+      `version:{id}`，payload `{eval_run_id,version_id,mode,status,metrics,error}`。
+    - 新增 schema `TrendPointView`；`EvalRunView`/`EvalRunCreateRequest` 增加 `version_id`
+      并扩展 `mode` 枚举。不新增服务。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -6749,6 +6767,74 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/quality/trends:
+    get:
+      tags: [Quality]
+      operationId: listQualityTrends
+      summary: 评测指标趋势（admin，按 created_at 升序）
+      description: |
+        返回一个版本 + 一个指标的历史评测点（`created_at` 升序、同时间按 run id 升序）。
+        `version_id`/`metric` 必填；`from`/`to` 为 RFC3339 可选边界。`baseline`/`regressed`
+        来自指标 detail：基线回归仅是告警（warn-only），不影响阶段验收。
+        W2-14 R-W2-6：至少两个点由同一版本多次 snapshot 触发产生。
+      parameters:
+        - name: version_id
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+        - name: metric
+          in: query
+          required: true
+          schema:
+            type: string
+            enum:
+              - design_coverage
+              - execution_pass_rate
+              - case_coverage
+              - visual_classification_accuracy
+              - impact_recall
+              - impact_precision
+              - classification_accuracy
+              - issue_false_positive_rate
+              - supplement_hit_rate
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: 该版本/指标的趋势点（升序）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TrendPointView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
 
@@ -16111,18 +16197,23 @@ components:
           pattern: '^[0-9]+$'
         mode:
           type: string
-          enum: [real_llm]
+          enum: [real_llm, snapshot]
         corpus_version:
           type: string
         model:
           type: string
-          description: 真实模型名（如 deepseek-flash），不得为 fake
+          description: 真实模型名（如 deepseek-flash），不得为 fake；snapshot 模式为空
         status:
           type: string
           enum: [running, passed, failed, error]
         summary:
           type: object
           additionalProperties: true
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+          description: v0.22 snapshot 评测范围；real_llm 行可为 null
         metrics:
           type: array
           items:
@@ -16140,17 +16231,25 @@ components:
           format: date-time
     EvalRunCreateRequest:
       type: object
-      required: [mode, corpus_version]
+      required: [mode]
       properties:
         mode:
           type: string
-          enum: [real_llm]
-          description: P6 只实现真实 LLM 轨；不接受 fake
+          enum: [real_llm, snapshot]
+          description: |
+            P6 只实现真实 LLM 轨（`real_llm`）；W2-14 增加服务端快照触发 `snapshot`
+            （body `{mode:"snapshot",version_id}`，sample/verdict 被忽略）。不接受 fake。
         corpus_version:
           type: string
           minLength: 1
+          description: '`mode=real_llm` 必填；`mode=snapshot` 由服务端写入'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: '`mode=snapshot` 必填（admin 触发范围）'
         model:
           type: string
+          description: '`mode=real_llm` 的真实模型名；snapshot 模式忽略'
         status:
           type: string
           description: 仅声明 `error` 生效；客户端传 passed/failed 被忽略（不 400），其余由服务端派生
@@ -16180,7 +16279,7 @@ components:
           pattern: '^[0-9]+$'
         mode:
           type: string
-          enum: [real_llm]
+          enum: [real_llm, snapshot]
         status:
           type: string
           enum: [running, passed, failed, error]
@@ -16202,6 +16301,40 @@ components:
               type: array
               items:
                 $ref: '#/components/schemas/EvalRunView'
+    TrendPointView:
+      type: object
+      required: [run_id, version_id, mode, status, metric, value, threshold, passed, regressed, created_at]
+      properties:
+        run_id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        mode:
+          type: string
+          enum: [real_llm, snapshot]
+        status:
+          type: string
+          enum: [running, passed, failed, error]
+        metric:
+          type: string
+        value:
+          type: number
+        threshold:
+          type: number
+        passed:
+          type: boolean
+        baseline:
+          type: number
+          nullable: true
+          description: 基线值；仅用于告警标记，不阻断阶段验收
+        regressed:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
     OperationalMetric:
       type: object
       required: [name, value, numerator, denominator, available, definition]

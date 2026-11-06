@@ -71,6 +71,8 @@ export type VersionEventHandlers = {
   onIssueChanged?: (event: VersionEvent) => void
   /** P4 `report.*`: refresh the report list/detail and current revision. */
   onReportChanged?: (event: VersionEvent) => void
+  /** `eval.started|completed|failed` (W2-14): refresh the quality eval board. */
+  onEvalChanged?: (event: VersionEvent) => void
   /** `resource.delta`: refresh the discovery observations and coverage matrix. */
   onDiscoveryChanged?: (event: VersionEvent) => void
   /** `version.scope.snapshot_created`: refresh the frozen wave scope projection. */
@@ -291,6 +293,13 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           // W2-7 R-W2-3: report artifact export lifecycle; the report page
           // refetches its artifact list on the terminal state.
           handlersRef.current.onReportChanged?.(event)
+          break
+        case "eval.started":
+        case "eval.completed":
+        case "eval.failed":
+          // W2-14 R-W2-6: snapshot evaluation lifecycle; the quality page
+          // refetches the run list and trend series on the terminal state.
+          handlersRef.current.onEvalChanged?.(event)
           break
         case "visual.baseline_approved":
         case "visual.diff_created":

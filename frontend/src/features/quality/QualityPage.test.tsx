@@ -5,8 +5,13 @@ import "@testing-library/jest-dom/vitest"
 const qualityApi = vi.hoisted(() => ({
   getQualityOverview: vi.fn(),
   listEvalRuns: vi.fn(),
+  triggerSnapshot: vi.fn(),
+  getQualityTrends: vi.fn(),
 }))
 vi.mock("./api", () => qualityApi)
+
+const versionEvents = vi.hoisted(() => ({ useVersionEvents: vi.fn(() => "open") }))
+vi.mock("@/features/clarification/useVersionEvents", () => versionEvents)
 
 const versionsApi = vi.hoisted(() => ({ listVersions: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
@@ -24,7 +29,7 @@ import { versionSummaryFixture } from "@/features/versions/test-fixtures"
 import { visualMetricsFixture } from "@/features/visual/test-fixtures"
 
 import { QualityPage } from "./QualityPage"
-import type { EvalRun, QualityOverview } from "./types"
+import type { EvalRun, QualityOverview, TrendPoint } from "./types"
 
 const overviewFixture: QualityOverview = {
   scope: { version_id: null },
@@ -104,6 +109,7 @@ const evalRunFixture: EvalRun = {
   model: "deepseek-flash",
   status: "failed",
   summary: { version_id: "2001" },
+  version_id: "2001",
   metrics: [
     {
       name: "design_coverage",
@@ -140,17 +146,50 @@ const evalRunFixture: EvalRun = {
   created_at: "2026-11-01T11:00:00Z",
 }
 
+const trendFixtures: TrendPoint[] = [
+  {
+    run_id: "101",
+    version_id: "2001",
+    mode: "snapshot",
+    status: "passed",
+    metric: "design_coverage",
+    value: 0.9,
+    threshold: 0.8,
+    passed: true,
+    regressed: false,
+    created_at: "2026-11-01T10:00:00Z",
+  },
+  {
+    run_id: "102",
+    version_id: "2001",
+    mode: "snapshot",
+    status: "failed",
+    metric: "design_coverage",
+    value: 0.6,
+    threshold: 0.8,
+    passed: false,
+    baseline: 0.9,
+    regressed: true,
+    created_at: "2026-11-01T11:00:00Z",
+  },
+]
+
 describe("QualityPage", () => {
   beforeEach(() => {
     auth.isAdmin = false
     qualityApi.getQualityOverview.mockReset()
     qualityApi.listEvalRuns.mockReset()
+    qualityApi.triggerSnapshot.mockReset()
+    qualityApi.getQualityTrends.mockReset()
     versionsApi.listVersions.mockReset()
     visualApi.getVisualMetrics.mockReset()
     navigation.replace.mockReset()
+    versionEvents.useVersionEvents.mockClear()
 
     qualityApi.getQualityOverview.mockResolvedValue(overviewFixture)
     qualityApi.listEvalRuns.mockResolvedValue([evalRunFixture])
+    qualityApi.triggerSnapshot.mockResolvedValue({ ...evalRunFixture, mode: "snapshot" })
+    qualityApi.getQualityTrends.mockResolvedValue(trendFixtures)
     versionsApi.listVersions.mockResolvedValue([
       versionSummaryFixture,
       { ...versionSummaryFixture, id: "2002", title: "订单中心 · 2027 Q1 迭代" },
@@ -246,5 +285,76 @@ describe("QualityPage", () => {
     fireEvent.change(selector, { target: { value: "2002" } })
     await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenLastCalledWith("2002"))
     expect(navigation.replace).toHaveBeenCalledWith("/quality?version=2002")
+  })
+
+  // W2-14 (R-W2-6): admin triggers one server-derived snapshot eval and the
+  // quality board refreshes from the returned run.
+  it("lets an admin trigger a snapshot eval for the selected version", async () => {
+    auth.isAdmin = true
+    render(<QualityPage initialVersionId="2001" />)
+
+    const trigger = await screen.findByRole("button", { name: "触发快照评测" })
+    expect(trigger).toBeEnabled()
+    expect(qualityApi.listEvalRuns).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(trigger)
+
+    await waitFor(() => expect(qualityApi.triggerSnapshot).toHaveBeenCalledWith("2001"))
+    expect(await screen.findByTestId("quality-eval-trigger-result")).toHaveTextContent("快照评测已生成")
+    await waitFor(() => expect(qualityApi.listEvalRuns).toHaveBeenCalledTimes(2))
+  })
+
+  it("shows the snapshot trigger only to admins with a selected version", async () => {
+    render(<QualityPage initialVersionId="2001" />)
+    expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "触发快照评测" })).not.toBeInTheDocument()
+
+    cleanup()
+    auth.isAdmin = true
+    render(<QualityPage />)
+    expect(await screen.findByTestId("quality-eval-board")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "触发快照评测" })).not.toBeInTheDocument()
+  })
+
+  it("surfaces a failed snapshot trigger without clearing the board", async () => {
+    auth.isAdmin = true
+    qualityApi.triggerSnapshot.mockRejectedValueOnce(new Error("快照评测不可用"))
+    render(<QualityPage initialVersionId="2001" />)
+
+    const trigger = await screen.findByRole("button", { name: "触发快照评测" })
+    fireEvent.click(trigger)
+
+    expect(await screen.findByText("快照评测不可用")).toBeInTheDocument()
+    expect(screen.getByTestId("quality-eval-runs")).toBeInTheDocument()
+    expect(qualityApi.listEvalRuns).toHaveBeenCalledTimes(1)
+  })
+
+  // W2-14: the trend chart reads GET /api/quality/trends for the selected
+  // version/metric and marks baseline regressions as warn-only.
+  it("renders the version metric trend with baseline warn-only points", async () => {
+    auth.isAdmin = true
+    render(<QualityPage initialVersionId="2001" />)
+
+    const chart = await screen.findByTestId("quality-trend-chart")
+    expect(chart).toHaveTextContent("设计覆盖率")
+    expect(qualityApi.getQualityTrends).toHaveBeenCalledWith({
+      versionId: "2001",
+      metric: "design_coverage",
+    })
+    expect(screen.getByTestId("quality-trend-point-101")).toHaveTextContent("90%")
+    const regressed = screen.getByTestId("quality-trend-point-102")
+    expect(regressed).toHaveTextContent("60%")
+    expect(regressed).toHaveTextContent("基线回归仅告警")
+    expect(chart.querySelectorAll("[data-trend-bar]")).toHaveLength(2)
+
+    fireEvent.change(screen.getByLabelText("趋势指标"), {
+      target: { value: "execution_pass_rate" },
+    })
+    await waitFor(() =>
+      expect(qualityApi.getQualityTrends).toHaveBeenLastCalledWith({
+        versionId: "2001",
+        metric: "execution_pass_rate",
+      }),
+    )
   })
 })

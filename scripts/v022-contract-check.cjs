@@ -129,6 +129,9 @@ const v022Operations = [
   // W2-11 R-EX-6/API-41: auto-confirmed discovery case rollback (1 new path,
   // +1 operation, +1 schema).
   ["POST", "/api/versions/{id}/case-versions/{caseVersionId}/rollback"],
+  // W2-14 R-W2-6/API-31: version/metric eval trend series (1 new path,
+  // +1 operation, +1 schema).
+  ["GET", "/api/quality/trends"],
 ]
 const v022Schemas = [
   "AnswerQuestionRequest",
@@ -170,6 +173,7 @@ const v022Schemas = [
   "SUTRepositoryView",
   "ScopeExclude",
   "StageBlockRequest",
+  "TrendPointView",
   "VersionStage",
 ]
 
@@ -233,12 +237,12 @@ const baselinePaths = frozenPaths.size
 const baselineOperations = [...frozenPaths.values()].reduce((total, methods) => total + methods.size, 0)
 const releaseOperations = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
 check(
-  releasePaths.size === baselinePaths + 32 && releaseOperations === baselineOperations + 41,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 32 paths / 41 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
+  releasePaths.size === baselinePaths + 33 && releaseOperations === baselineOperations + 42,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 33 paths / 42 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
 )
 check(
-  releaseSchemas.size === frozenSchemas.size + 40,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 40 schemas (got ${releaseSchemas.size}, baseline ${frozenSchemas.size})`,
+  releaseSchemas.size === frozenSchemas.size + 41,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 41 schemas (got ${releaseSchemas.size}, baseline ${frozenSchemas.size})`,
 )
 check(missingOperations.length === 0, `v0.22 openapi contains every documented operation (${missingOperations.length} missing)`)
 check(missingSchemas.length === 0, `v0.22 openapi contains every documented schema (${missingSchemas.length} missing)`)

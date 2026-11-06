@@ -1853,8 +1853,10 @@ func main() {
 		Clock:    clk,
 		Settings: settingsSvc,
 		Audit:    auditSvc,
-		Issues:   issueSvc,
-		Reports:  reportSvc,
+		// W2-14: eval.* lifecycle events go through the shared eventing service.
+		Events:  eventSvc,
+		Issues:  issueSvc,
+		Reports: reportSvc,
 	})
 	if err != nil {
 		log.Fatalf("eztest: wire P6 read models: %v", err)
