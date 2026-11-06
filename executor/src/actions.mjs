@@ -29,6 +29,8 @@ import { runVisualCompare } from "./visual.mjs"
 const WAIT_STATES = new Set(["attached", "detached", "visible", "hidden"])
 const MOUSE_BUTTONS = new Set(["left", "right", "middle"])
 const WAIT_UNTIL = new Set(["load", "domcontentloaded", "networkidle", "commit"])
+const MAX_UPLOAD_FILES = 5
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 function requireString(value, name, { allowEmpty = false } = {}) {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
@@ -336,6 +338,54 @@ const HANDLERS = {
     await locator.click({ timeout: timeoutMs })
     await locator.fill(value, { timeout: timeoutMs })
     return { result: { ok: true, secret } }
+  },
+
+  // upload_file injects local test files into a file input. The model never
+  // sees the filesystem: callers pass base64 content only, so a case cannot
+  // read arbitrary host files through the executor.
+  async upload_file(entry, args, timeoutMs) {
+    if (!Array.isArray(args.files) || args.files.length === 0 || args.files.length > MAX_UPLOAD_FILES) {
+      throw invalidArguments(`files must be an array of 1..${MAX_UPLOAD_FILES} entries`)
+    }
+    let total = 0
+    const files = args.files.map((file) => {
+      if (file === null || typeof file !== "object" || Array.isArray(file)) {
+        throw invalidArguments("files[] entries must be objects")
+      }
+      const name = requireString(file.name, "files[].name")
+      if (name !== path.basename(name) || name.includes("/") || name.includes("\\")) {
+        throw invalidArguments("files[].name must be a plain file name")
+      }
+      const mime = requireString(file.mime, "files[].mime")
+      const base64 = requireString(file.base64, "files[].base64")
+      const buffer = Buffer.from(base64, "base64")
+      if (buffer.length === 0) {
+        throw invalidArguments("files[].base64 must decode to a non-empty payload")
+      }
+      total += buffer.length
+      if (total > MAX_UPLOAD_BYTES) {
+        throw invalidArguments(`upload exceeds ${MAX_UPLOAD_BYTES} bytes`)
+      }
+      return { name, mimeType: mime, buffer }
+    })
+    const locator = await resolveOne(entry.page, parseTarget(args.target), timeoutMs)
+    await locator.setInputFiles(files, { timeout: timeoutMs })
+    return { result: { ok: true, files: files.map((file) => file.name), bytes: total } }
+  },
+
+  // set_viewport lets a case exercise responsive/mobile acceptance criteria on
+  // the live page without recreating the browser context.
+  async set_viewport(entry, args) {
+    const width = Number(args.width)
+    const height = Number(args.height)
+    if (!Number.isInteger(width) || width < 320 || width > 3840) {
+      throw invalidArguments("width must be an integer between 320 and 3840")
+    }
+    if (!Number.isInteger(height) || height < 200 || height > 2160) {
+      throw invalidArguments("height must be an integer between 200 and 2160")
+    }
+    await entry.page.setViewportSize({ width, height })
+    return { result: { ok: true, pageViewport: entry.page.viewportSize() } }
   },
 
   async press(entry, args, timeoutMs) {

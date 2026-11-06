@@ -22,11 +22,17 @@ const HOME_HTML = `<!doctype html>
     <a id="download" href="/download">Download</a>
     <a id="download-large" href="/download-large">Large download</a>
     <div id="clicked"></div>
+    <input id="upload" type="file" aria-label="Upload" />
+    <div id="uploaded"></div>
     <script>
       function mark(name) {
         document.getElementById('clicked').textContent = name
         console.log('clicked:' + name)
       }
+      document.getElementById('upload').addEventListener('change', (event) => {
+        const names = [...event.target.files].map((file) => file.name).join(',')
+        document.getElementById('uploaded').textContent = 'uploaded:' + names
+      })
       localStorage.setItem('local-key', 'local-value')
       sessionStorage.setItem('session-key', 'session-value')
       console.log('console-hello')

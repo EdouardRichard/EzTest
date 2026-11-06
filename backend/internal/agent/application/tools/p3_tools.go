@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -21,6 +23,8 @@ const (
 	ToolBrowserNetwork           = "browser.network"
 	ToolBrowserDownload          = "browser.download"
 	ToolBrowserStorageState      = "browser.storage_state"
+	ToolBrowserUploadFile        = "browser.upload_file"
+	ToolBrowserSetViewport       = "browser.set_viewport"
 	ToolHTTPRequest              = "http.request"
 	ToolDBQuery                  = "db.query"
 	ToolDatabaseSchemaRead       = "database.schema_read"
@@ -51,6 +55,8 @@ var p3ToolNames = []string{
 	ToolBrowserNetwork,
 	ToolBrowserDownload,
 	ToolBrowserStorageState,
+	ToolBrowserUploadFile,
+	ToolBrowserSetViewport,
 	ToolHTTPRequest,
 	ToolDBQuery,
 	ToolDatabaseSchemaRead,
@@ -241,18 +247,27 @@ func (t *browserTarget) validate() *Error {
 	return nil
 }
 
+type browserUploadFile struct {
+	Name   string `json:"name"`
+	Mime   string `json:"mime"`
+	Base64 string `json:"base64"`
+}
+
 type browserArgs struct {
-	VersionSUTID string         `json:"version_sut_id,omitempty"`
-	AccountRole  string         `json:"account_role,omitempty"`
-	URL          string         `json:"url,omitempty"`
-	Target       *browserTarget `json:"target,omitempty"`
-	Value        *string        `json:"value,omitempty"`
-	Secret       bool           `json:"secret,omitempty"`
-	Key          string         `json:"key,omitempty"`
-	TimeoutMS    *int           `json:"timeout_ms,omitempty"`
-	FullPage     bool           `json:"full_page,omitempty"`
-	Limit        *int           `json:"limit,omitempty"`
-	Filename     string         `json:"filename,omitempty"`
+	VersionSUTID string              `json:"version_sut_id,omitempty"`
+	AccountRole  string              `json:"account_role,omitempty"`
+	URL          string              `json:"url,omitempty"`
+	Target       *browserTarget      `json:"target,omitempty"`
+	Value        *string             `json:"value,omitempty"`
+	Secret       bool                `json:"secret,omitempty"`
+	Key          string              `json:"key,omitempty"`
+	TimeoutMS    *int                `json:"timeout_ms,omitempty"`
+	FullPage     bool                `json:"full_page,omitempty"`
+	Limit        *int                `json:"limit,omitempty"`
+	Filename     string              `json:"filename,omitempty"`
+	Files        []browserUploadFile `json:"files,omitempty"`
+	Width        *int                `json:"width,omitempty"`
+	Height       *int                `json:"height,omitempty"`
 }
 
 func validateBrowserArgs(action string, args *browserArgs) *Error {
@@ -314,6 +329,43 @@ func validateBrowserArgs(action string, args *browserArgs) *Error {
 			return Invalid("timeout_ms", "must be between 100 and 60000")
 		}
 	case "screenshot":
+	case "upload_file":
+		if err := args.Target.validate(); err != nil {
+			return err
+		}
+		if len(args.Files) == 0 || len(args.Files) > 5 {
+			return Invalid("files", "files must contain 1..5 entries")
+		}
+		total := 0
+		for _, file := range args.Files {
+			if err := validateText("files[].name", file.Name, 1, 255); err != nil {
+				return err
+			}
+			if strings.ContainsAny(file.Name, "/\\") || file.Name != filepath.Base(file.Name) {
+				return Invalid("files[].name", "must be a plain file name")
+			}
+			if err := validateText("files[].mime", file.Mime, 1, 100); err != nil {
+				return err
+			}
+			decoded, err := base64.StdEncoding.DecodeString(file.Base64)
+			if err != nil || len(decoded) == 0 {
+				return Invalid("files[].base64", "must be valid base64 with a non-empty payload")
+			}
+			total += len(decoded)
+			if total > 10*1024*1024 {
+				return Invalid("files", "upload exceeds 10MB")
+			}
+		}
+	case "set_viewport":
+		if args.Width == nil || args.Height == nil {
+			return Invalid("width", "width and height are required")
+		}
+		if *args.Width < 320 || *args.Width > 3840 {
+			return Invalid("width", "must be between 320 and 3840")
+		}
+		if *args.Height < 200 || *args.Height > 2160 {
+			return Invalid("height", "must be between 200 and 2160")
+		}
 	case "console", "network":
 		if args.Limit != nil && (*args.Limit < 1 || *args.Limit > 200) {
 			return Invalid("limit", "must be between 1 and 200")
@@ -419,6 +471,30 @@ func browserToolSet(deps Deps) []Tool {
 		&browserTool{deps: deps, name: ToolBrowserStorageState, action: "storage_state",
 			description: "Export a storageState summary (P3 returns no credentials and stores nothing).",
 			parameters:  schemaObject(browserParameters(nil))},
+		&browserTool{deps: deps, name: ToolBrowserUploadFile, action: "upload_file",
+			description: "Inject base64-encoded local files into a file input (no host filesystem access).",
+			parameters: schemaObject(browserParameters(map[string]any{
+				"target": targetRef,
+				"files": map[string]any{
+					"type": "array", "minItems": 1, "maxItems": 5,
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"name":   map[string]any{"type": "string"},
+							"mime":   map[string]any{"type": "string"},
+							"base64": map[string]any{"type": "string"},
+						},
+						"required":             []string{"name", "mime", "base64"},
+						"additionalProperties": false,
+					},
+				},
+			}), "target", "files")},
+		&browserTool{deps: deps, name: ToolBrowserSetViewport, action: "set_viewport",
+			description: "Resize the live page viewport (for responsive/mobile acceptance criteria).",
+			parameters: schemaObject(browserParameters(map[string]any{
+				"width":  map[string]any{"type": "integer", "minimum": 320, "maximum": 3840},
+				"height": map[string]any{"type": "integer", "minimum": 200, "maximum": 2160},
+			}), "width", "height")},
 	}
 }
 

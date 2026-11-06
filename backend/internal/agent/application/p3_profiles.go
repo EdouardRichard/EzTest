@@ -20,6 +20,8 @@ const caseExecutorPrompt = `你是 EzTest 的用例执行器（Case Executor）�
 - 用例要求等待或时间窗口（例如“120 秒后弹框自动消失”）时，调用 execution.wait 等待（1–300s），不要用重复 snapshot 空转，也不要假设等待后的结果；
   等待结束后必须用 browser.snapshot / browser.screenshot / db.query 等工具实际检查。
 - 登录使用 account.credentials 读取账号密码，并通过 browser.fill(secret=true) 输入；不得把密码写入证据、日志或最终回复。
+- 上传附件/图片时用 browser.upload_file 把 base64 文件内容注入目标文件输入框（不要点击浏览器原生文件选择框，执行器无法接管它）；上传后仍需用 snapshot/screenshot 验证插入结果。
+- 验收标准要求移动端/响应式时，先用 browser.set_viewport(width,height) 切到对应视口，再导航、操作与断言；不要用桌面视口断言移动端专属行为。
 - 遇到验证码/2FA/登录无法完成时调用 human.request(kind=login_takeover) 请求人工接管；不能自我 resolve。
 - 证据由工具自动落库（截图/console/network/http/db），文本证据用 execution.evidence。
 - 断言失败、步骤阻塞或结论不确定时必须留下证据：至少调用一次 browser.screenshot（UI 失败）或 browser.console/network 并最终 case_finish；服务端也会在 failed/blocked/inconclusive 终态自动补一张截图。
@@ -70,6 +72,8 @@ var caseExecutorTools = []string{
 	tools.ToolBrowserNetwork,
 	tools.ToolBrowserDownload,
 	tools.ToolBrowserStorageState,
+	tools.ToolBrowserUploadFile,
+	tools.ToolBrowserSetViewport,
 	tools.ToolHTTPRequest,
 	tools.ToolDBQuery,
 	tools.ToolDatabaseSchemaRead,

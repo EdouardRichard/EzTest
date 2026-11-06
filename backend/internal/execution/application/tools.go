@@ -32,6 +32,9 @@ type browserToolArgs struct {
 	FullPage     bool            `json:"full_page,omitempty"`
 	Limit        *int            `json:"limit,omitempty"`
 	Filename     string          `json:"filename,omitempty"`
+	Files        json.RawMessage `json:"files,omitempty"`
+	Width        *int            `json:"width,omitempty"`
+	Height       *int            `json:"height,omitempty"`
 }
 
 // Browser executes one browser.* tool: it lazily creates the (version_sut,
@@ -241,6 +244,18 @@ func browserActionArgs(action string, in browserToolArgs) (json.RawMessage, erro
 		}
 	case "screenshot":
 		args["full_page"] = in.FullPage
+	case "upload_file":
+		if len(in.Target) == 0 || len(in.Files) == 0 {
+			return nil, platform.Invalid("files", "target and files are required")
+		}
+		args["target"] = in.Target
+		args["files"] = in.Files
+	case "set_viewport":
+		if in.Width == nil || in.Height == nil {
+			return nil, platform.Invalid("width", "width and height are required")
+		}
+		args["width"] = *in.Width
+		args["height"] = *in.Height
 	case "console", "network":
 		if in.Limit != nil {
 			args["limit"] = *in.Limit
