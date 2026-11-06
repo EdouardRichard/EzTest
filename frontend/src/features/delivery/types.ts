@@ -161,6 +161,43 @@ export type ReportDetailView = ReportView & {
   refs: ReportRefView[]
 }
 
+/* ------------------------------- artifacts --------------------------------- */
+
+/** `POST .../reports/{reportId}/artifacts` request format (spec §4.29 R-W2-3). */
+export type ReportArtifactFormat = "html" | "pdf" | "markdown"
+
+/** One created artifact identity from the POST response (contract). */
+export type ReportArtifactView = {
+  id: string
+  format: ReportArtifactFormat
+  /** content ledger key (content_object_id). */
+  sha256: string
+  size: number
+  status: "ready" | "failed"
+}
+
+/**
+ * One export artifact returned by `GET /api/versions/{id}/exports`. The report
+ * page filters the version export list by `owner_kind=report`/`owner_id` because
+ * the report artifact POST is the only report-scoped write and there is no
+ * dedicated report list route (spec §6 API-28).
+ */
+export type ReportExportArtifact = {
+  id: string
+  version_id: string
+  owner_kind: "case" | "report" | "chain"
+  owner_id: string
+  revision: number
+  format: ReportArtifactFormat
+  size: number
+  mime: string
+  filename: string
+  sha256: string
+  status: "ready" | "failed"
+  created_at: string
+  download_url: string
+}
+
 /** `RegenerateReportResult` from the 202 response. */
 export type RegenerateReportResult = {
   report_id: string
@@ -290,4 +327,10 @@ export const REPORT_REF_LABELS: Record<ReportRefKind, string> = {
   case_run: "用例运行",
   issue: "问题",
   version_sut: "SUT",
+}
+
+export const REPORT_ARTIFACT_FORMAT_LABELS: Record<ReportArtifactFormat, string> = {
+  html: "HTML",
+  pdf: "PDF",
+  markdown: "Markdown",
 }

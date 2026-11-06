@@ -13,14 +13,29 @@ import { Field } from "@/components/ui/Field"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import { listEvidence } from "@/features/execution/api"
+import { EvidenceViewer } from "@/features/execution/EvidenceViewer"
+import type { Evidence } from "@/features/execution/types"
 import { formatDateTime } from "@/lib/format"
 
-import { downloadHTML, downloadPDF, getReport, getRevision, listReports, regenerate } from "./api"
+import {
+  createReportArtifact,
+  downloadHTML,
+  downloadPDF,
+  downloadReportArtifact,
+  getReport,
+  getRevision,
+  listReportArtifacts,
+  listReports,
+  regenerate,
+} from "./api"
 import { ReportDetailPanel } from "./ReportDetailPanel"
 import {
   REPORT_KIND_LABELS,
   REPORT_STATUS_LABELS,
+  type ReportArtifactFormat,
   type ReportDetailView,
+  type ReportExportArtifact,
   type ReportKind,
   type ReportRevisionView,
   type ReportStatus,
@@ -92,6 +107,21 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
   const [actionError, setActionError] = useState<unknown>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
+  // v0.22 W2-8 report export artifacts. There is no report-scoped list route, so
+  // the version export list is filtered by owner; `artifactsToken` refreshes it
+  // after an explicit POST and after an `export.*` SSE event.
+  const [artifacts, setArtifacts] = useState<ReportExportArtifact[]>([])
+  const [artifactsLoading, setArtifactsLoading] = useState(false)
+  const [artifactsError, setArtifactsError] = useState<unknown>(null)
+  const [artifactsToken, setArtifactsToken] = useState(0)
+  const [exportingFormat, setExportingFormat] = useState<ReportArtifactFormat | null>(null)
+  const [downloadingArtifactId, setDownloadingArtifactId] = useState<string | null>(null)
+
+  // Evidence thumbnails/deep links for the report's case runs (FE-9).
+  const [evidence, setEvidence] = useState<Evidence[]>([])
+  const [evidenceLoading, setEvidenceLoading] = useState(false)
+  const [viewerEvidence, setViewerEvidence] = useState<Evidence | null>(null)
+
   const [regenerateOpen, setRegenerateOpen] = useState(false)
   const [regenerateReason, setRegenerateReason] = useState("")
   const [regenerating, setRegenerating] = useState(false)
@@ -115,10 +145,16 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
       .then((items) => {
         if (cancelled) return
         setReports(items)
+        // A `?report=` deep link must also select the matching kind tab, or the
+        // list would stay on "version" while the detail shows a wave report.
+        const linkedReportId = searchParams.get("report")
+        if (linkedReportId !== null) {
+          const linked = items.find((report) => report.id === linkedReportId)
+          if (linked !== undefined) setKind(linked.kind)
+        }
         setSelectedReportId((current) => {
           if (current !== null) return current
-          const urlReport = searchParams.get("report")
-          if (urlReport !== null) return urlReport
+          if (linkedReportId !== null) return linkedReportId
           const versionReport = items.find((report) => report.kind === "version")
           return versionReport?.id ?? items[0]?.id ?? null
         })
@@ -161,6 +197,83 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
       cancelled = true
     }
   }, [versionId, selectedReportId, detailToken])
+
+  // Artifact list of the selected report. The report artifact POST is the only
+  // report-scoped write, so the version export list is filtered by owner.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: artifactsToken forces a refetch
+  useEffect(() => {
+    if (detail === null) {
+      setArtifacts([])
+      setArtifactsLoading(false)
+      setArtifactsError(null)
+      return undefined
+    }
+    let cancelled = false
+    setArtifactsLoading(true)
+    setArtifactsError(null)
+    void listReportArtifacts(versionId, detail.id)
+      .then((items) => {
+        if (!cancelled) setArtifacts(items)
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setArtifactsError(cause)
+      })
+      .finally(() => {
+        if (!cancelled) setArtifactsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [versionId, detail?.id, artifactsToken])
+
+  const caseRunRefIds = useMemo(() => {
+    if (detail === null) return []
+    const seen = new Set<string>()
+    const ids: string[] = []
+    for (const ref of detail.refs) {
+      if (ref.kind !== "case_run" || seen.has(ref.ref_id)) continue
+      seen.add(ref.ref_id)
+      ids.push(ref.ref_id)
+    }
+    return ids
+  }, [detail])
+
+  // Evidence of the report's case runs: metadata only, bytes stay behind the
+  // authenticated evidence content route and are fetched per thumbnail.
+  useEffect(() => {
+    if (detail === null || caseRunRefIds.length === 0) {
+      setEvidence([])
+      setEvidenceLoading(false)
+      return undefined
+    }
+    let cancelled = false
+    setEvidenceLoading(true)
+    void Promise.all(
+      caseRunRefIds.map((caseRunId) => listEvidence(versionId, { caseRunId, limit: 100 })),
+    )
+      .then((pages) => {
+        if (cancelled) return
+        const seen = new Set<string>()
+        const merged: Evidence[] = []
+        for (const page of pages) {
+          for (const item of page) {
+            if (seen.has(item.id)) continue
+            seen.add(item.id)
+            merged.push(item)
+          }
+        }
+        setEvidence(merged)
+      })
+      .catch(() => {
+        if (!cancelled) setEvidence([])
+      })
+      .finally(() => {
+        if (!cancelled) setEvidenceLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [versionId, detail, caseRunRefIds])
 
   const effectiveRevisionNumber =
     selectedRevision ?? detail?.current_revision?.revision ?? detail?.revisions[0]?.revision ?? null
@@ -206,6 +319,9 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
     if (reportId === null) return
     try {
       setDetail(await getReport(versionId, reportId))
+      // `export.started|completed|failed` (and report.*) can change the artifact
+      // list without changing the report row; refresh it explicitly.
+      setArtifactsToken((token) => token + 1)
     } catch {
       // Keep the last detail snapshot.
     }
@@ -375,6 +491,40 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
     }
   }
 
+  async function exportArtifact(format: ReportArtifactFormat): Promise<void> {
+    if (detail === null || exportingFormat !== null) return
+    setExportingFormat(format)
+    setActionError(null)
+    setNotice(null)
+    try {
+      const artifact = await createReportArtifact(versionId, detail.id, format)
+      setNotice(
+        `已生成 ${artifact.format} artifact #${artifact.id}（sha256 ${artifact.sha256.slice(0, 12)}…）。`,
+      )
+      setArtifactsToken((token) => token + 1)
+    } catch (cause) {
+      setActionError(cause)
+    } finally {
+      setExportingFormat(null)
+    }
+  }
+
+  async function downloadArtifact(artifact: ReportExportArtifact): Promise<void> {
+    if (downloadingArtifactId !== null) return
+    setDownloadingArtifactId(artifact.id)
+    setActionError(null)
+    try {
+      const download = await downloadReportArtifact(artifact.id)
+      const fallback =
+        artifact.filename.length > 0 ? artifact.filename : `report-artifact-${artifact.id}`
+      saveBlob(download.blob, download.filename.length > 0 ? download.filename : fallback)
+    } catch (cause) {
+      setActionError(cause)
+    } finally {
+      setDownloadingArtifactId(null)
+    }
+  }
+
   async function submitRegenerate(): Promise<void> {
     if (detail === null || regenerating) return
     setRegenerating(true)
@@ -523,8 +673,29 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
           regenerating={regenerating}
           actionError={actionError}
           notice={notice}
+          artifacts={artifacts}
+          artifactsLoading={artifactsLoading}
+          artifactsError={artifactsError}
+          exportingFormat={exportingFormat}
+          downloadingArtifactId={downloadingArtifactId}
+          onExport={(format) => {
+            void exportArtifact(format)
+          }}
+          onDownloadArtifact={(artifact) => {
+            void downloadArtifact(artifact)
+          }}
+          evidence={evidence}
+          evidenceLoading={evidenceLoading}
+          onOpenEvidence={setViewerEvidence}
         />
       </div>
+
+      <EvidenceViewer
+        versionId={versionId}
+        evidence={viewerEvidence}
+        open={viewerEvidence !== null}
+        onClose={() => setViewerEvidence(null)}
+      />
 
       <Dialog
         open={regenerateOpen}

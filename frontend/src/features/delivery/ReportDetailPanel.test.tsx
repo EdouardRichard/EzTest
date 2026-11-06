@@ -1,4 +1,5 @@
-import { cleanup, render, screen, within } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
+import type { ComponentProps } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -8,7 +9,7 @@ vi.mock("next/navigation", () => ({
 }))
 
 import { ReportDetailPanel } from "./ReportDetailPanel"
-import type { ReportDetailView, ReportRevisionView } from "./types"
+import type { ReportDetailView, ReportExportArtifact, ReportRevisionView } from "./types"
 
 const revision: ReportRevisionView = {
   id: "8201",
@@ -41,7 +42,12 @@ const report: ReportDetailView = {
   updated_at: "2026-11-01T05:30:00Z",
 }
 
-function renderPanel(nextRevision: Partial<ReportRevisionView>): void {
+type PanelProps = ComponentProps<typeof ReportDetailPanel>
+
+function renderPanel(
+  nextRevision: Partial<ReportRevisionView>,
+  overrides: Partial<PanelProps> = {},
+): void {
   const merged = { ...revision, ...nextRevision }
   render(
     <ReportDetailPanel
@@ -62,6 +68,7 @@ function renderPanel(nextRevision: Partial<ReportRevisionView>): void {
       regenerating={false}
       actionError={null}
       notice={null}
+      {...overrides}
     />,
   )
 }
@@ -119,5 +126,78 @@ describe("ReportDetailPanel PDF state", () => {
     const panel = screen.getByTestId("report-detail")
     expect(within(panel).getByRole("button", { name: "打开报告 HTML" })).toBeEnabled()
     expect(within(panel).getByRole("button", { name: "下载 HTML" })).toBeEnabled()
+  })
+})
+
+const artifact: ReportExportArtifact = {
+  id: "9301",
+  version_id: "2001",
+  owner_kind: "report",
+  owner_id: "8101",
+  revision: 2,
+  format: "markdown",
+  size: 1234,
+  mime: "text/markdown; charset=utf-8",
+  filename: "report-8101-r2.md",
+  sha256: "c".repeat(64),
+  status: "ready",
+  created_at: "2026-11-01T05:30:00Z",
+  download_url: "/api/exports/9301/download",
+}
+
+describe("ReportDetailPanel export artifacts", () => {
+  afterEach(cleanup)
+
+  it("exports HTML/PDF/Markdown and lists artifacts with sha256 and size", () => {
+    const onExport = vi.fn()
+    const onDownloadArtifact = vi.fn()
+    renderPanel(
+      { pdf_status: "done", pdf_available: true },
+      {
+        artifacts: [artifact],
+        artifactsLoading: false,
+        artifactsError: null,
+        exportingFormat: null,
+        onExport,
+        onDownloadArtifact,
+      },
+    )
+
+    expect(screen.getByText("artifacts")).toBeInTheDocument()
+    expect(screen.getByTestId("report-artifact-9301")).toHaveTextContent("sha256")
+    expect(screen.getByTestId("report-artifact-9301")).toHaveTextContent(
+      artifact.sha256.slice(0, 12),
+    )
+    expect(screen.getByTestId("report-artifact-9301")).toHaveTextContent("1.2 KB")
+
+    fireEvent.click(screen.getByRole("button", { name: "HTML" }))
+    fireEvent.click(screen.getByRole("button", { name: "PDF" }))
+    fireEvent.click(screen.getByRole("button", { name: "Markdown" }))
+
+    expect(onExport.mock.calls).toEqual([["html"], ["pdf"], ["markdown"]])
+    fireEvent.click(screen.getByRole("button", { name: "下载 artifact 9301" }))
+    expect(onDownloadArtifact).toHaveBeenCalledWith(artifact)
+  })
+
+  it("disables export while a historical revision is selected", () => {
+    renderPanel({}, { revisionNumber: 1 })
+
+    expect(screen.getByRole("button", { name: "HTML" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Markdown" })).toBeDisabled()
+  })
+
+  it("disables the PDF export until the current PDF is ready", () => {
+    renderPanel({ pdf_status: "pending", pdf_available: false })
+
+    expect(screen.getByRole("button", { name: "HTML" })).toBeEnabled()
+    expect(screen.getByRole("button", { name: "Markdown" })).toBeEnabled()
+    expect(screen.getByRole("button", { name: "PDF" })).toBeDisabled()
+  })
+
+  it("hides export and artifact UI in read-only mode", () => {
+    renderPanel({}, { readOnly: true, artifacts: [artifact] })
+
+    expect(screen.queryByText("artifacts")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "HTML" })).not.toBeInTheDocument()
   })
 })

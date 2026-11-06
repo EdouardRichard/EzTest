@@ -9,7 +9,10 @@ import type {
   RegenerateReportInput,
   RegenerateReportResult,
   ReopenIssueInput,
+  ReportArtifactFormat,
+  ReportArtifactView,
   ReportDetailView,
+  ReportExportArtifact,
   ReportListOptions,
   ReportRevisionView,
   ReportView,
@@ -184,4 +187,42 @@ export function downloadPDF(
   return apiDownload(
     `${reportPath(versionId, reportId)}/revisions/${encodeURIComponent(revision)}/pdf`,
   )
+}
+
+/* -------------------------------- artifacts -------------------------------- */
+
+/**
+ * `POST .../reports/{reportId}/artifacts` (v0.22 W2-7): renders the current
+ * published revision as one `export_artifact` (owner_kind=report). HTML/PDF
+ * reuse the verified revision bytes, Markdown is deterministic. PDF answers 409
+ * `pdf_not_ready` until the render job is done.
+ */
+export function createReportArtifact(
+  versionId: string,
+  reportId: string,
+  format: ReportArtifactFormat,
+): Promise<ReportArtifactView> {
+  return apiPost<ReportArtifactView>(`${reportPath(versionId, reportId)}/artifacts`, { format })
+}
+
+/**
+ * Lists the version's export artifacts and keeps the report-owned rows
+ * (`owner_kind=report`, `owner_id=reportId`). There is no report-scoped list
+ * route; the version export list is the existing contract read path (API-28).
+ */
+export async function listReportArtifacts(
+  versionId: string,
+  reportId: string,
+): Promise<ReportExportArtifact[]> {
+  const page = await apiGetPage<ReportExportArtifact>(
+    `${versionPath(versionId)}/exports${query({ limit: 100 })}`,
+  )
+  return page.items.filter(
+    (artifact) => artifact.owner_kind === "report" && artifact.owner_id === reportId,
+  )
+}
+
+/** `GET /api/exports/{exportId}/download`: authenticated artifact bytes. */
+export function downloadReportArtifact(exportId: string): Promise<ApiDownload> {
+  return apiDownload(`/api/exports/${encodeURIComponent(exportId)}/download`)
 }

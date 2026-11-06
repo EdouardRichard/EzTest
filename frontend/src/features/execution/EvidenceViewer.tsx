@@ -1,6 +1,7 @@
 "use client"
 
-import { Download } from "lucide-react"
+import { Download, FileText } from "lucide-react"
+import Link from "next/link"
 import { useEffect, useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
@@ -19,6 +20,146 @@ export type EvidenceViewerProps = {
   evidence: Evidence | null
   open: boolean
   onClose: () => void
+}
+
+/** Kinds whose bytes are an image and can be previewed as a thumbnail. */
+const IMAGE_EVIDENCE_KINDS = new Set<Evidence["kind"]>([
+  "screenshot",
+  "snapshot",
+  "visual_actual",
+  "visual_diff",
+])
+
+/**
+ * Deep link to the execution tab's `?evidence=` handler (v0.22 FE-8/FE-9).
+ * The link opens the immutable evidence dialog by ID without packaging bytes.
+ */
+export function evidenceDeepLinkHref(versionId: string, evidenceId: string): string {
+  const params = new URLSearchParams({ tab: "execution", evidence: evidenceId })
+  return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
+}
+
+function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement("a")
+  anchor.href = url
+  anchor.download = filename
+  anchor.rel = "noopener"
+  anchor.style.display = "none"
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
+export type EvidenceThumbnailProps = {
+  versionId: string
+  evidence: Evidence
+  onOpen?: (evidence: Evidence) => void
+}
+
+/**
+ * Compact evidence preview used by report pages (v0.22 FE-9): screenshot bytes
+ * render as a small thumbnail through an authenticated blob URL, while every
+ * kind keeps the execution deep link and the original-file download.
+ */
+export function EvidenceThumbnail({ versionId, evidence, onOpen }: EvidenceThumbnailProps) {
+  const imageLike = IMAGE_EVIDENCE_KINDS.has(evidence.kind)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [downloadError, setDownloadError] = useState<unknown>(null)
+
+  useEffect(() => {
+    if (!imageLike) return undefined
+    let cancelled = false
+    let objectUrl: string | null = null
+    setPreviewUrl(null)
+    setFailed(false)
+    downloadEvidence(versionId, evidence.id)
+      .then((result) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(result.blob)
+        setPreviewUrl(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true)
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl)
+    }
+  }, [versionId, evidence.id, imageLike])
+
+  async function handleDownload(): Promise<void> {
+    if (downloading) return
+    setDownloading(true)
+    setDownloadError(null)
+    try {
+      const result = await downloadEvidence(versionId, evidence.id)
+      saveBlob(
+        result.blob,
+        result.filename.length > 0
+          ? result.filename
+          : evidence.filename || `evidence-${evidence.id}`,
+      )
+    } catch (cause) {
+      setDownloadError(cause)
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  return (
+    <div className="w-28 space-y-1" data-testid={`evidence-card-${evidence.id}`}>
+      <button
+        type="button"
+        data-testid={`evidence-thumb-${evidence.id}`}
+        aria-label={`查看证据 #${evidence.id}`}
+        onClick={() => onOpen?.(evidence)}
+        className="flex h-20 w-full items-center justify-center overflow-hidden rounded-md border border-border bg-muted/40 text-[10px] text-muted-foreground hover:bg-muted"
+      >
+        {previewUrl !== null ? (
+          // biome-ignore lint/performance/noImgElement: evidence bytes are auth-gated blob URLs that next/image cannot optimize
+          <img
+            src={previewUrl}
+            alt={evidence.filename.length > 0 ? evidence.filename : `证据 #${evidence.id}`}
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <span className="flex flex-col items-center gap-1">
+            <FileText className="size-4" aria-hidden="true" />
+            {failed ? "缩略图不可用" : EVIDENCE_KIND_LABEL[evidence.kind]}
+          </span>
+        )}
+      </button>
+      <div className="flex items-center justify-between gap-1 text-[10px] text-muted-foreground">
+        <Link
+          href={evidenceDeepLinkHref(versionId, evidence.id)}
+          aria-label={`证据 #${evidence.id} 深链`}
+          className="text-primary underline-offset-2 hover:underline"
+        >
+          深链
+        </Link>
+        <button
+          type="button"
+          aria-label={`下载证据 #${evidence.id} 原文件`}
+          disabled={downloading}
+          onClick={() => {
+            void handleDownload()
+          }}
+          className="underline-offset-2 hover:underline disabled:opacity-50"
+        >
+          {downloading ? "下载中…" : "原文件"}
+        </button>
+      </div>
+      {downloadError !== null ? (
+        <p role="alert" className="text-[10px] text-destructive">
+          原文件下载失败
+        </p>
+      ) : null}
+    </div>
+  )
 }
 
 /**
@@ -80,13 +221,12 @@ export function EvidenceViewer({ versionId, evidence, open, onClose }: EvidenceV
     setDownloading(true)
     try {
       const result = await downloadEvidence(versionId, evidence.id)
-      const url = URL.createObjectURL(result.blob)
-      const anchor = document.createElement("a")
-      anchor.href = url
-      anchor.download = result.filename.length > 0 ? result.filename : evidence.filename
-      anchor.rel = "noopener"
-      anchor.click()
-      URL.revokeObjectURL(url)
+      saveBlob(
+        result.blob,
+        result.filename.length > 0
+          ? result.filename
+          : evidence.filename || `evidence-${evidence.id}`,
+      )
     } catch (cause) {
       setError(cause)
     } finally {
@@ -102,6 +242,13 @@ export function EvidenceViewer({ versionId, evidence, open, onClose }: EvidenceV
       description={evidence.filename.length > 0 ? evidence.filename : undefined}
       footer={
         <>
+          <Link
+            href={evidenceDeepLinkHref(versionId, evidence.id)}
+            aria-label={`证据 #${evidence.id} 深链`}
+            className="mr-auto text-[11px] text-primary underline-offset-2 hover:underline"
+          >
+            深链
+          </Link>
           <Button variant="secondary" size="sm" onClick={onClose}>
             关闭
           </Button>
