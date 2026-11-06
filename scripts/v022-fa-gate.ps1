@@ -709,11 +709,12 @@ function Invoke-GateHarness {
 # Gate: flow
 # ===========================================================================
 function Invoke-GateFlow {
-    $flow = Get-EvidenceJson "$($script:RunDir)/w0flow/result.json" 'w0flow/result.json'
+    # Prefer the normalized projection (stages/counters/model) when present;
+    # the raw W0 result.json is kept as the fallback and evidence of record.
+    $flow = Get-EvidenceJson "$($script:RunDir)/w0flow/flow.json" 'w0flow/flow.json'
     if ($null -eq $flow) {
-        $fallback = Get-EvidenceJson "$($script:RunDir)/w0flow/flow.json" 'w0flow/flow.json'
-        if ($null -eq $fallback) { return }
-        $flow = $fallback
+        $flow = Get-EvidenceJson "$($script:RunDir)/w0flow/result.json" 'w0flow/result.json'
+        if ($null -eq $flow) { return }
     }
 
     $flowExit = Get-IntValue $flow @('flowExit') -1
