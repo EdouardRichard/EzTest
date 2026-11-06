@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -193,5 +193,37 @@ describe("useConversation question overlay", () => {
     expect(
       merged[0].parts.filter((part) => (part as { type?: string }).type === "text"),
     ).toHaveLength(1)
+  })
+
+  it("does not render a pending approval row as a clarification QuestionCard", async () => {
+    // W2-2 extends GET /questions with the decision kinds. The approval row has
+    // an empty questions array; feeding it to QuestionCard would render
+    // "澄清提问 共 0 题" and let the user POST /questions/{id}/answer (404).
+    const decision = batch({
+      id: "401",
+      kind: "approval",
+      batch_id: "",
+      questions: [],
+      message_id: null,
+      decision: "",
+      reason: "",
+    })
+    api.listMessages.mockResolvedValue(pageOf([textMessage("9001"), textMessage("9002")]))
+    api.listQuestions.mockResolvedValue([decision])
+
+    render(<Thread />)
+    await screen.findByText("消息 9001")
+    await waitFor(() => expect(api.listQuestions).toHaveBeenCalled())
+
+    expect(screen.queryByTestId("question-card")).not.toBeInTheDocument()
+    expect(screen.queryByText(/共 0 题/)).not.toBeInTheDocument()
+    // No pending clarification question means no question todo banner either.
+    expect(screen.queryByTestId("pending-question-todo")).not.toBeInTheDocument()
+
+    // Even if a stale card slipped through, it must never reach the answer API.
+    for (const button of screen.queryAllByRole("button", { name: "提交" })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(api.answerQuestion).not.toHaveBeenCalled())
   })
 })

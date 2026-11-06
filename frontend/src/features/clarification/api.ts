@@ -153,9 +153,25 @@ export type QuestionAnswer = {
 }
 
 /**
+ * v0.22 version-level decision kinds that share the `human_request` table with
+ * structured questions (R-W2-1). Re-exported from `question-kinds` so the pure
+ * kind guards survive tests that mock this transport module.
+ */
+export {
+  HUMAN_DECISION_KINDS,
+  type HumanDecisionKind,
+  isClarificationQuestionBatch,
+  isHumanDecisionKind,
+} from "./question-kinds"
+
+/**
  * One structured-question batch (`GET /api/versions/{id}/questions`
  * QuestionView). The payload comes from `human_request`, lazily expired by the
  * backend, so a pending card survives a reload without local-only state.
+ *
+ * W2-2 extends the list with approval/blocked_recovery/conflict decision rows:
+ * they carry an empty `questions` array and their recorded decision/reason
+ * instead. `kind` separates the two shapes.
  */
 export type QuestionBatch = {
   id: string
@@ -171,6 +187,10 @@ export type QuestionBatch = {
   answered_by?: string | null
   answered_at?: string | null
   skipped?: boolean
+  /** Recorded decision of a v0.22 decision row (empty for questions). */
+  decision?: string
+  /** Recorded decision reason of a v0.22 decision row (empty for questions). */
+  reason?: string
   created_at?: string
 }
 

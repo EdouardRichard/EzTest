@@ -15,6 +15,7 @@ import {
   type QuestionPart,
   type QuestionStatus,
 } from "./api"
+import { isClarificationQuestionBatch } from "./question-kinds"
 import type { ConversationMessage, NewMessagePart } from "./types"
 
 /** Matches the messages endpoint default: a full page implies another page. */
@@ -359,23 +360,33 @@ function normalizeQuestionBatch(value: unknown): QuestionBatch | null {
  */
 export function questionBatchFromPart(value: unknown): QuestionBatch | null {
   if (!isRecord(value) || value.type !== "question") return null
-  if (isRecord(value.question)) return normalizeQuestionBatch(value.question)
-  // The DTO may expose the stored part payload either flat or nested; accept
-  // both so the card does not depend on Task 36/37's exact part serialization.
-  const source = isRecord(value.payload) ? value.payload : value
-  if (isRecord(source.question)) return normalizeQuestionBatch(source.question)
-  if (asString(source.question_id) === undefined || !Array.isArray(source.questions)) return null
-  return normalizeQuestionBatch({
-    id: source.question_id,
-    batch_id: source.batch_id,
-    questions: source.questions,
-    expires_at: source.expires_at,
-    status: source.status,
-    answers: source.answers,
-    conversation_id: source.conversation_id,
-    message_id: source.message_id,
-    kind: source.kind,
-  })
+  let batch: QuestionBatch | null = null
+  if (isRecord(value.question)) {
+    batch = normalizeQuestionBatch(value.question)
+  } else {
+    // The DTO may expose the stored part payload either flat or nested; accept
+    // both so the card does not depend on Task 36/37's exact part serialization.
+    const source = isRecord(value.payload) ? value.payload : value
+    if (isRecord(source.question)) {
+      batch = normalizeQuestionBatch(source.question)
+    } else if (asString(source.question_id) !== undefined && Array.isArray(source.questions)) {
+      batch = normalizeQuestionBatch({
+        id: source.question_id,
+        batch_id: source.batch_id,
+        questions: source.questions,
+        expires_at: source.expires_at,
+        status: source.status,
+        answers: source.answers,
+        conversation_id: source.conversation_id,
+        message_id: source.message_id,
+        kind: source.kind,
+      })
+    }
+  }
+  // W2-2 decision rows share the human_request/question DTO. They are never
+  // clarification question parts; dropping them here keeps every renderer
+  // (thread overlay and message snapshot) from creating an "共 0 题" card.
+  return batch !== null && isClarificationQuestionBatch(batch) ? batch : null
 }
 
 /**
@@ -387,7 +398,8 @@ export function questionBatchFromMessage(value: unknown): QuestionBatch | null {
   if (!isRecord(value)) return null
   let batch: QuestionBatch | null = null
   if (value.kind === "question" && isRecord(value.question)) {
-    batch = normalizeQuestionBatch(value.question)
+    const normalized = normalizeQuestionBatch(value.question)
+    batch = normalized !== null && isClarificationQuestionBatch(normalized) ? normalized : null
   }
   if (batch === null && Array.isArray(value.parts)) {
     for (const part of value.parts) {
@@ -469,6 +481,10 @@ export function mergeQuestionCards(
   for (const message of messages) byId.set(message.id, message)
   let changed = false
   for (const question of questions) {
+    // W2-2 decision rows (approval/blocked_recovery/conflict) are human_request
+    // rows with an empty questions array. They are decision cards, never
+    // clarification cards, and must not reach `/questions/{id}/answer`.
+    if (!isClarificationQuestionBatch(question)) continue
     const messageID = question.message_id ?? ""
     const existing = messageID !== "" ? byId.get(messageID) : undefined
     const part: QuestionPart = { type: "question", question }
@@ -696,7 +712,12 @@ export function useConversation({
         if (cancelled) return
         setQuestionSnapshot({
           identity: fetchIdentity,
-          items: items.filter((question) => question.conversation_id === conversationId),
+          // Only clarification questions belong to a conversation thread; the
+          // decision kinds share the endpoint but never render as question cards.
+          items: items.filter(
+            (question) =>
+              isClarificationQuestionBatch(question) && question.conversation_id === conversationId,
+          ),
         })
       } catch {
         // Additive only: an unavailable question endpoint keeps the messages.

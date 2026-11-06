@@ -313,9 +313,11 @@ export function ExecutionTab({
   // Only login takeover pauses execution and gates the wave resume (server
   // `GetOpenByCaseRun` is login_takeover-only). The other human_request kinds —
   // clarification questions above all — are version todos and must never render
-  // as a takeover or block a resume (R-B3-4).
-  const openHumanRequests = humanRequests.filter(
-    (request) => request.status === "pending" && request.kind === "login_takeover",
+  // as a takeover or block a resume (R-B3-4). Approval/blocked_recovery/conflict
+  // are decision cards, not pause owners: they are shown but do not gate resume.
+  const pendingHumanRequests = humanRequests.filter((request) => request.status === "pending")
+  const openHumanRequests = pendingHumanRequests.filter(
+    (request) => request.kind === "login_takeover",
   )
 
   // Deep link `?evidence=<id>`: resolve the metadata by id (the evidence may
@@ -738,9 +740,9 @@ export function ExecutionTab({
         ariaLabel="执行视图"
       />
 
-      {openHumanRequests.length > 0 ? (
+      {pendingHumanRequests.length > 0 ? (
         <HumanRequestBanner
-          requests={openHumanRequests}
+          requests={pendingHumanRequests}
           onResolve={handleResolveHumanRequest}
           onCancel={handleCancelHumanRequest}
         />

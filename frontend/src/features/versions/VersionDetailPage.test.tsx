@@ -31,7 +31,10 @@ const deliveryApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/delivery/api", () => deliveryApi)
 
-const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+const executionApi = vi.hoisted(() => ({
+  listHumanRequests: vi.fn(),
+  resolveHumanRequest: vi.fn(),
+}))
 vi.mock("@/features/execution/api", () => executionApi)
 
 const chainProps = vi.hoisted(() => ({
@@ -193,6 +196,7 @@ describe("VersionDetailPage", () => {
     deliveryApi.listReports.mockResolvedValue([])
     executionApi.listHumanRequests.mockReset()
     executionApi.listHumanRequests.mockResolvedValue([])
+    executionApi.resolveHumanRequest.mockReset()
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null

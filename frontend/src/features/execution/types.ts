@@ -299,24 +299,40 @@ export type CaseRunDetail = {
 /* ------------------------------- human request ----------------------------- */
 
 export type HumanRequestPayload = {
+  /**
+   * The user-facing title/reason. Login takeovers carry the challenge reason;
+   * v0.22 decision requests carry the reason supplied by the producer.
+   */
   reason: string
   /** Nullable in the contract when the request is not tied to one SUT. */
   version_sut_id?: string | null
-  account_role: string
-  page_url: string
-  challenge_kind: string
+  /** Login-takeover only fields (absent on v0.22 decision requests). */
+  account_role?: string
+  page_url?: string
+  challenge_kind?: string
   evidence_id?: string | null
 }
 
-/** `ResolveHumanRequestRequest.response` (the code is never echoed back). */
+/** v0.22 decision vocabulary of approval/blocked_recovery/conflict. */
+export type HumanDecision = "approved" | "rejected"
+
+/**
+ * `ResolveHumanRequestRequest.response` (the code is never echoed back).
+ * Login takeovers submit a one-time code/note; decision requests submit a
+ * `decision` and (for a rejection) a mandatory `reason`.
+ */
 export type HumanRequestResponseInput = {
   code?: string
   note?: string
+  decision?: HumanDecision
+  reason?: string
 }
 
-/** `HumanRequestResponseView`: P3 only echoes the note summary (spec §4.7). */
+/** `HumanRequestResponseView`: the code is never echoed back (spec §4.7). */
 export type HumanRequestResponseView = {
   note?: string
+  decision?: HumanDecision | string
+  reason?: string
 }
 
 /** `HumanRequestView` (spec §9.3). The response never echoes the plaintext code. */

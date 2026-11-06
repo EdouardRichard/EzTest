@@ -361,6 +361,34 @@ export const clarificationQuestionFixture: HumanRequest = {
   created_at: TIMESTAMP,
 }
 
+/** A pending v0.22 approval request (R-W2-1): decision card, not a question. */
+export const approvalHumanRequestFixture: HumanRequest = {
+  id: "9601",
+  version_id: "2001",
+  case_run_id: null,
+  kind: "approval",
+  status: "pending",
+  payload: { reason: "发布前请确认版本可以上线" },
+  expires_at: "2099-01-01T00:00:00Z",
+  created_at: TIMESTAMP,
+}
+
+/** A pending blocked_recovery request that owns a blocked version stage. */
+export const blockedRecoveryHumanRequestFixture: HumanRequest = {
+  ...approvalHumanRequestFixture,
+  id: "9602",
+  kind: "blocked_recovery",
+  payload: { reason: "执行器离线，确认恢复后继续" },
+}
+
+/** A pending conflict request: two persisted facts disagree. */
+export const conflictHumanRequestFixture: HumanRequest = {
+  ...approvalHumanRequestFixture,
+  id: "9603",
+  kind: "conflict",
+  payload: { reason: "需求与事实对退款口径的描述冲突" },
+}
+
 export const intentFixture: Intent = {
   id: "9101",
   version_id: "2001",

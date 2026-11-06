@@ -12,7 +12,12 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { ChainTab } from "@/features/chain/ChainTab"
-import { listQuestions, type QuestionBatch } from "@/features/clarification/api"
+import {
+  isClarificationQuestionBatch,
+  isHumanDecisionKind,
+  listQuestions,
+  type QuestionBatch,
+} from "@/features/clarification/api"
 import { QuestionCard } from "@/features/clarification/QuestionCard"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
@@ -23,7 +28,10 @@ import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
 import { DesignTab } from "@/features/design/DesignTab"
 import type { StageView } from "@/features/design/types"
+import { listHumanRequests, resolveHumanRequest } from "@/features/execution/api"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
+import { HumanDecisionCards } from "@/features/execution/HumanRequestBanner"
+import type { HumanRequest, HumanRequestResponseInput } from "@/features/execution/types"
 import { TodoDrawer } from "@/features/shell/TodoDrawer"
 import { apiDownload, apiGetPage, apiPost } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
@@ -418,6 +426,9 @@ export function VersionDetailPage({
   const [discoveryRefreshKey, setDiscoveryRefreshKey] = useState(0)
   const [coverageRefreshKey, setCoverageRefreshKey] = useState(0)
   const [pendingQuestions, setPendingQuestions] = useState<QuestionBatch[]>([])
+  // v0.22 decision requests are version todos too, but they are human_request
+  // decision cards, not QuestionCards (approval/blocked_recovery/conflict).
+  const [pendingDecisions, setPendingDecisions] = useState<HumanRequest[]>([])
 
   // `?case=` / `?conversation=` deep links for the design workspace. The route
   // already forwards `conversation` for clarification; read the URL here so the
@@ -503,13 +514,40 @@ export function VersionDetailPage({
   // Pending structured questions are a version todo: only load them once the
   // v0.22 stage projection is available. A failure renders no cards instead of
   // blocking the page (questions never block stage progression, R-B3-4).
+  //
+  // `GET /questions` also returns the approval/blocked_recovery/conflict
+  // decision rows (W2-2); those are split out and never become QuestionCards.
   const refreshQuestions = useCallback(async () => {
     try {
-      setPendingQuestions(await listQuestions(versionId, { status: "pending" }))
+      const questions = await listQuestions(versionId, { status: "pending" })
+      setPendingQuestions(questions.filter(isClarificationQuestionBatch))
     } catch {
       setPendingQuestions([])
     }
+    try {
+      const humanRequests = await listHumanRequests(versionId, { status: "pending" })
+      setPendingDecisions(
+        humanRequests.filter(
+          (request) => request.status === "pending" && isHumanDecisionKind(request.kind),
+        ),
+      )
+    } catch {
+      setPendingDecisions([])
+    }
   }, [versionId])
+
+  /**
+   * Resolve one approval/blocked_recovery/conflict request through the existing
+   * `POST /api/human-requests/{id}/resolve` route, then refetch the pending
+   * projections so an answered card disappears without a page reload.
+   */
+  const handleResolveDecision = useCallback(
+    async (id: string, response: HumanRequestResponseInput): Promise<void> => {
+      await resolveHumanRequest(id, response)
+      await refreshQuestions()
+    },
+    [refreshQuestions],
+  )
 
   useEffect(() => {
     if (stage === null) return
@@ -612,6 +650,12 @@ export function VersionDetailPage({
       setBindingRefreshKey((current) => current + 1)
     },
     onQuestionChanged: () => {
+      void refreshQuestions()
+    },
+    // approval.requested/decided share the human-request refresh with the
+    // execution banner: both the pending decision cards and the question todo
+    // projection may have changed (W2-2 R-W2-1).
+    onHumanRequestChanged: () => {
       void refreshQuestions()
     },
     onHandoffChanged: () => {
@@ -862,6 +906,22 @@ export function VersionDetailPage({
                   <CoveragePanel versionId={versionId} refreshKey={coverageRefreshKey} />
                 </section>
               </section>
+              {pendingDecisions.length > 0 ? (
+                <section
+                  data-testid="pending-human-decisions"
+                  aria-label="待处理人工决策"
+                  className="space-y-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-sm font-semibold text-foreground">待处理人工决策</h2>
+                    <Badge tone="warning">{pendingDecisions.length}</Badge>
+                  </div>
+                  <HumanDecisionCards
+                    requests={pendingDecisions}
+                    onResolve={handleResolveDecision}
+                  />
+                </section>
+              ) : null}
               {pendingQuestions.length > 0 ? (
                 <section
                   data-testid="pending-questions"

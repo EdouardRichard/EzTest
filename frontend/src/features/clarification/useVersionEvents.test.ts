@@ -278,10 +278,12 @@ describe("useVersionEvents", () => {
       "human_request.created",
       "human_request.resolved",
       "human_request.expired",
+      "approval.requested",
+      "approval.decided",
     ]) {
       connectOptions.onEvent({
         event: "message",
-        data: eventFrame(type, { human_request_id: "9501" }),
+        data: eventFrame(type, { human_request_id: "9501", kind: "approval" }),
       })
     }
     for (const type of [
@@ -297,11 +299,13 @@ describe("useVersionEvents", () => {
     expect(onWaveChanged).toHaveBeenCalledTimes(5)
     expect(onCaseRunChanged).toHaveBeenCalledTimes(6)
     expect(onEvidenceCreated).toHaveBeenCalledTimes(1)
-    expect(onHumanRequestChanged).toHaveBeenCalledTimes(3)
+    expect(onHumanRequestChanged).toHaveBeenCalledTimes(5)
     expect(onExecutionChanged).toHaveBeenCalledTimes(5)
     expect(onWaveChanged.mock.calls[0][0].type).toBe("wave.created")
     expect(onCaseRunChanged.mock.calls[0][0].type).toBe("case_run.started")
     expect(onHumanRequestChanged.mock.calls[2][0].type).toBe("human_request.expired")
+    expect(onHumanRequestChanged.mock.calls[3][0].type).toBe("approval.requested")
+    expect(onHumanRequestChanged.mock.calls[4][0].type).toBe("approval.decided")
     expect(onExecutionChanged.mock.calls[4][0].type).toBe("execution.coverage_gap")
   })
 

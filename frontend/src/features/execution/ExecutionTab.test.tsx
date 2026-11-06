@@ -37,6 +37,7 @@ vi.mock("@/features/clarification/useVersionEvents", () => ({
 
 import { ExecutionTab } from "./ExecutionTab"
 import {
+  approvalHumanRequestFixture,
   blockedCaseRunFixture,
   caseRunDetailFixture,
   caseRunsFixture,
@@ -381,6 +382,31 @@ describe("ExecutionTab", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "恢复" })[0])
     await waitFor(() => expect(api.resumeWave).toHaveBeenCalledWith("2001", "9202"))
     expect(screen.queryByText("请先处理待处理的人工请求，再恢复波次。")).not.toBeInTheDocument()
+  })
+
+  it("renders a pending approval as a decision card and resolves it with the reason", async () => {
+    api.listHumanRequests.mockResolvedValue([approvalHumanRequestFixture])
+
+    render(<ExecutionTab versionId="2001" />)
+
+    const card = await screen.findByTestId("human-decision-card-9601")
+    expect(within(card).getByText("发布前请确认版本可以上线")).toBeInTheDocument()
+    // A decision request is a version todo, not a login takeover: it must not
+    // render the 2FA form.
+    expect(screen.queryByRole("button", { name: "完成" })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("一次性验证码")).not.toBeInTheDocument()
+
+    fireEvent.change(within(card).getByLabelText("原因"), { target: { value: "no" } })
+    fireEvent.click(within(card).getByRole("button", { name: "拒绝" }))
+
+    await waitFor(() =>
+      expect(api.resolveHumanRequest).toHaveBeenCalledWith("9601", {
+        decision: "rejected",
+        reason: "no",
+      }),
+    )
+    // The parent refetches the pending list after a successful decision.
+    await waitFor(() => expect(api.listHumanRequests.mock.calls.length).toBeGreaterThan(1))
   })
 
   it("warns when the executor is offline", async () => {

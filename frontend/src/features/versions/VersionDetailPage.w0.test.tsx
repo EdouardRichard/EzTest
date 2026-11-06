@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -47,7 +47,10 @@ const deliveryApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/delivery/api", () => deliveryApi)
 
-const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+const executionApi = vi.hoisted(() => ({
+  listHumanRequests: vi.fn(),
+  resolveHumanRequest: vi.fn(),
+}))
 vi.mock("@/features/execution/api", () => executionApi)
 
 const sse = vi.hoisted(() => ({
@@ -154,6 +157,8 @@ vi.mock("next/navigation", () => ({
   useSearchParams: () => search.params,
 }))
 
+import { approvalHumanRequestFixture } from "@/features/execution/test-fixtures"
+
 import { bindingOverviewFixture, versionFixture } from "./test-fixtures"
 import { VersionDetailPage } from "./VersionDetailPage"
 
@@ -197,6 +202,15 @@ const questionBatch: QuestionBatch = {
   created_at: "2026-11-05T01:00:00Z",
 }
 
+/** W2-2 extends GET /questions with decision rows (empty questions array). */
+const decisionBatch: QuestionBatch = {
+  ...questionBatch,
+  id: "401",
+  kind: "approval",
+  batch_id: "",
+  questions: [],
+}
+
 describe("VersionDetailPage v0.22 W0 wiring", () => {
   beforeEach(() => {
     versionApi.getVersion.mockReset().mockResolvedValue(versionFixture)
@@ -233,6 +247,10 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     deliveryApi.listIssues.mockReset().mockResolvedValue([])
     deliveryApi.listReports.mockReset().mockResolvedValue([])
     executionApi.listHumanRequests.mockReset().mockResolvedValue([])
+    executionApi.resolveHumanRequest.mockReset().mockResolvedValue({
+      ...approvalHumanRequestFixture,
+      status: "answered",
+    })
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null
@@ -262,6 +280,31 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     expect(clarificationApi.listQuestions).toHaveBeenCalledWith("2001", { status: "pending" })
   })
 
+  it("renders decision rows as approval cards and keeps them out of QuestionCard", async () => {
+    clarificationApi.listQuestions.mockResolvedValue([questionBatch, decisionBatch])
+    executionApi.listHumanRequests.mockResolvedValue([approvalHumanRequestFixture])
+
+    render(<VersionDetailPage versionId="2001" />)
+
+    const card = await screen.findByTestId("human-decision-card-9601")
+    expect(within(card).getByText("发布前请确认版本可以上线")).toBeInTheDocument()
+    // Only the real clarification batch becomes a QuestionCard; the approval
+    // row must never render as "澄清提问 共 0 题" or reach /answer.
+    expect(screen.getAllByTestId("question-card")).toHaveLength(1)
+    expect(screen.queryByText(/共 0 题/)).not.toBeInTheDocument()
+
+    fireEvent.change(within(card).getByLabelText("原因"), { target: { value: "no" } })
+    fireEvent.click(within(card).getByRole("button", { name: "拒绝" }))
+
+    await waitFor(() =>
+      expect(executionApi.resolveHumanRequest).toHaveBeenCalledWith("9601", {
+        decision: "rejected",
+        reason: "no",
+      }),
+    )
+    await waitFor(() => expect(executionApi.listHumanRequests.mock.calls.length).toBeGreaterThan(1))
+  })
+
   it("does not mount or request the admin-only context packet for a non-admin", async () => {
     render(<VersionDetailPage versionId="2001" />)
 
@@ -286,6 +329,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     await waitFor(() => expect(versionApi.listPlanItems).toHaveBeenCalledTimes(1))
     const planCalls = versionApi.listPlanItems.mock.calls.length
     const questionCalls = clarificationApi.listQuestions.mock.calls.length
+    const humanCalls = executionApi.listHumanRequests.mock.calls.length
     const bindingCalls = versionApi.getVersionBinding.mock.calls.length
     const stageCalls = versionApi.getVersionStage.mock.calls.length
 
@@ -317,6 +361,10 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
         type: "question.answered",
         payload: { question_id: "101", status: "answered" },
       })
+      sse.handlers?.onHumanRequestChanged?.({
+        type: "approval.requested",
+        payload: { human_request_id: "9601", kind: "approval" },
+      })
       sse.handlers?.onBindingChanged?.({
         type: "version.binding.changed",
         payload: { version_id: "2001" },
@@ -328,6 +376,11 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     })
     await waitFor(
       () => expect(clarificationApi.listQuestions.mock.calls.length).toBeGreaterThan(questionCalls),
+      { timeout: 2000 },
+    )
+    // approval.requested/decided refresh the version-level decision cards.
+    await waitFor(
+      () => expect(executionApi.listHumanRequests.mock.calls.length).toBeGreaterThan(humanCalls),
       { timeout: 2000 },
     )
     await waitFor(

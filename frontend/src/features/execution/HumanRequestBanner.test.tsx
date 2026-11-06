@@ -1,10 +1,16 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { useState } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { HumanRequestBanner } from "./HumanRequestBanner"
-import { clarificationQuestionFixture, humanRequestFixture } from "./test-fixtures"
+import {
+  approvalHumanRequestFixture,
+  blockedRecoveryHumanRequestFixture,
+  clarificationQuestionFixture,
+  conflictHumanRequestFixture,
+  humanRequestFixture,
+} from "./test-fixtures"
 import type { HumanRequest, HumanRequestResponseInput } from "./types"
 
 const NOW = Date.parse("2026-10-31T12:00:00Z")
@@ -114,5 +120,99 @@ describe("HumanRequestBanner", () => {
     expect(screen.getByText("登录接管")).toBeInTheDocument()
     expect(screen.getByText(/支付网关需要 2FA 验证码/)).toBeInTheDocument()
     expect(screen.queryByText(/请确认退款口径/)).not.toBeInTheDocument()
+  })
+})
+
+describe("HumanRequestBanner decision requests (R-W2-1)", () => {
+  afterEach(cleanup)
+
+  it("renders an approval and rejects with the typed reason", async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined)
+    render(
+      <HumanRequestBanner
+        requests={[approvalHumanRequestFixture]}
+        onResolve={onResolve}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("发布前请确认版本可以上线")).toBeInTheDocument()
+    expect(screen.getByText("审批")).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText("原因"), { target: { value: "no" } })
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }))
+
+    await waitFor(() => {
+      expect(onResolve).toHaveBeenCalledWith("9601", { decision: "rejected", reason: "no" })
+    })
+  })
+
+  it("approves blocked_recovery and conflict requests with the reason", async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined)
+    render(
+      <HumanRequestBanner
+        requests={[blockedRecoveryHumanRequestFixture, conflictHumanRequestFixture]}
+        onResolve={onResolve}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("阻塞恢复")).toBeInTheDocument()
+    expect(screen.getByText("冲突处理")).toBeInTheDocument()
+    expect(screen.getByText("执行器离线，确认恢复后继续")).toBeInTheDocument()
+    expect(screen.getByText("需求与事实对退款口径的描述冲突")).toBeInTheDocument()
+
+    const blocked = screen.getByTestId("human-decision-card-9602")
+    fireEvent.change(within(blocked).getByLabelText("原因"), { target: { value: "ok" } })
+    fireEvent.click(within(blocked).getByRole("button", { name: "批准" }))
+
+    await waitFor(() => {
+      expect(onResolve).toHaveBeenCalledWith("9602", { decision: "approved", reason: "ok" })
+    })
+  })
+
+  it("requires a reason before a rejection is submitted", async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined)
+    render(
+      <HumanRequestBanner
+        requests={[approvalHumanRequestFixture]}
+        onResolve={onResolve}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }))
+
+    expect(await screen.findByText("拒绝时必须填写原因")).toBeInTheDocument()
+    expect(onResolve).not.toHaveBeenCalled()
+  })
+
+  it("renders decision requests read-only when the caller asks for it", () => {
+    render(
+      <HumanRequestBanner
+        requests={[approvalHumanRequestFixture]}
+        onResolve={vi.fn()}
+        onCancel={vi.fn()}
+        readOnly
+      />,
+    )
+
+    expect(screen.getByLabelText("原因")).toBeDisabled()
+    expect(screen.getByRole("button", { name: "批准" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "拒绝" })).toBeDisabled()
+  })
+
+  it("never renders clarification questions as decision cards", () => {
+    render(
+      <HumanRequestBanner
+        requests={[clarificationQuestionFixture]}
+        onResolve={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    expect(screen.queryByTestId("human-decision-card-9503")).not.toBeInTheDocument()
+    expect(screen.queryByText("澄清提问")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "批准" })).not.toBeInTheDocument()
   })
 })
