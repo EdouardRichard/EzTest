@@ -1,7 +1,8 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    EzTest v0.22 FA-6 independent AC probes for requirements R01-R06 (22 ACs).
+    EzTest v0.22 FA-6/FA-7 independent AC probes: R01-R06 (22 ACs) and
+    R07-R12 (19 ACs).
 
 .DESCRIPTION
     Each probe recomputes the SUT ground truth from independent sources:
@@ -14,6 +15,7 @@
       <EvidenceRoot>/<RunDir>/probes/<AcId>.raw.json   raw API/DB/UI evidence
       <EvidenceRoot>/<RunDir>/typical/screenshots/*.png
       <EvidenceRoot>/<RunDir>/acs-r01-r06.json         R01-R06 summary
+      <EvidenceRoot>/<RunDir>/acs-r07-r12.json         R07-R12 summary
 
     Exit code:
       0  probe(s) executed and their results recorded (pass/fail/gap/blocked);
@@ -27,9 +29,11 @@
 .NOTES
     Run from the repository root:
         powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File scripts\v022-fa-ac-probe.ps1 -AcId AC-R01-01 -RunDir RUN-1
+            -File scripts\v022-fa-ac-probe.ps1 -AcId AC-R07-01 -RunDir RUN-1
         powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File scripts\v022-fa-ac-probe.ps1 -Range R01-R06 -RunDir RUN-1
+        powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts\v022-fa-ac-probe.ps1 -Range R07-R12 -RunDir RUN-1
 #>
 
 param(
@@ -38,7 +42,7 @@ param(
     [ValidateSet('RUN-1', 'RUN-2')]
     [string]$RunDir = 'RUN-1',
 
-    [ValidateSet('R01-R06')]
+    [ValidateSet('R01-R06', 'R07-R12')]
     [string]$Range = 'R01-R06',
 
     [string]$EvidenceRoot,
@@ -87,7 +91,28 @@ foreach ($dir in @($script:ProbesDir, $script:ScreenshotsDir, $script:LogsDir, $
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 }
 
-$script:AcOrder = @(
+function Set-ProbeScope {
+    param([Parameter(Mandatory = $true)][string]$RangeName)
+    if ($RangeName -eq 'R07-R12') {
+        $script:ActiveRange = 'R07-R12'
+        $script:AcOrder = $script:R07R12AcOrder
+        $script:ProbeFamily = 'FA7'
+        $script:FixturesDir = Join-Path $script:RepoRoot '.tmp\fa7\fixtures'
+        $script:SutWritesLog = Join-Path $script:RepoRoot '.tmp\fa7\sut-writes.log'
+    }
+    else {
+        $script:ActiveRange = 'R01-R06'
+        $script:AcOrder = $script:R01R06AcOrder
+        $script:ProbeFamily = 'FA6'
+        $script:FixturesDir = Join-Path $script:RepoRoot '.tmp\fa6\fixtures'
+        $script:SutWritesLog = Join-Path $script:RepoRoot '.tmp\fa6\sut-writes.log'
+    }
+    foreach ($dir in @($script:FixturesDir, (Split-Path -Parent $script:SutWritesLog))) {
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    }
+}
+
+$script:R01R06AcOrder = @(
     'AC-R01-01', 'AC-R01-02', 'AC-R01-03',
     'AC-R02-01', 'AC-R02-02', 'AC-R02-03', 'AC-R02-04',
     'AC-R03-01', 'AC-R03-02', 'AC-R03-03', 'AC-R03-04',
@@ -95,6 +120,21 @@ $script:AcOrder = @(
     'AC-R05-01', 'AC-R05-02', 'AC-R05-03', 'AC-R05-04',
     'AC-R06-01', 'AC-R06-02', 'AC-R06-03'
 )
+
+$script:R07R12AcOrder = @(
+    'AC-R07-01', 'AC-R07-02', 'AC-R07-03',
+    'AC-R08-01', 'AC-R08-02', 'AC-R08-03', 'AC-R08-04',
+    'AC-R09-01', 'AC-R09-02', 'AC-R09-03',
+    'AC-R10-01', 'AC-R10-02', 'AC-R10-03',
+    'AC-R11-01', 'AC-R11-02', 'AC-R11-03',
+    'AC-R12-01', 'AC-R12-02', 'AC-R12-03'
+)
+
+$script:AcOrder = $script:R01R06AcOrder
+$script:ActiveRange = 'R01-R06'
+$script:ProbeFamily = 'FA6'
+$script:Fa7CreatedPosts = New-Object 'System.Collections.Generic.List[string]'
+$script:Fa7CreatedTags = New-Object 'System.Collections.Generic.List[string]'
 
 $script:AdminUser = $null
 $script:AuthorUser = $null
@@ -375,11 +415,10 @@ function Initialize-SutContext {
     $script:AdminToken = Get-SutLoginToken -Account $script:AdminUser
     $script:AuthorToken = Get-SutLoginToken -Account $script:AuthorUser
 
-    Ensure-Fixtures
+    if ($script:ProbeFamily -eq 'FA6') { Ensure-Fixtures }
 
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'node is not available on PATH' }
 }
-
 function Get-FirstCategory {
     $response = Invoke-SutJson -Path '/api/v1/categories'
     if (-not $response.Ok -or $null -eq $response.Body -or @($response.Body.data).Count -eq 0) {
@@ -515,6 +554,150 @@ function Get-PublishedArticleFixture {
 }
 
 # ---------------------------------------------------------------------------
+# FA-7 fixtures (R07-R12). All writes go through the public product API and
+# are recorded in .tmp/fa7/sut-writes.log; everything created here is removed
+# again by Remove-Fa7Assets.
+# ---------------------------------------------------------------------------
+function New-Fa7Tag {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Slug
+    )
+    $response = Invoke-SutJson -Method Post -Path '/api/v1/admin/tags' -Body ([ordered]@{ name = $Name; slug = $Slug }) -Token $script:AdminToken
+    if (-not $response.Ok -or $null -eq $response.Body -or $null -eq $response.Body.data -or
+        [string]::IsNullOrWhiteSpace([string]$response.Body.data.id)) {
+        throw "failed to create FA-7 tag $Slug (http=$($response.Status))"
+    }
+    $id = [string]$response.Body.data.id
+    $script:Fa7CreatedTags.Add($id)
+    Add-SutWriteLog 'create-tag' "id=$id name=$Name slug=$Slug"
+    return [pscustomobject]@{ Id = $id; Name = $Name; Slug = $Slug }
+}
+
+function New-Fa7FixturePost {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Slug,
+        [string]$Content = 'FA-7 probe fixture content.',
+        [string]$Status = 'draft',
+        [string[]]$TagIds = @(),
+        [string]$CategoryId = '',
+        [string]$Token = '',
+        [string]$Summary = 'FA-7 probe fixture summary'
+    )
+    if ([string]::IsNullOrWhiteSpace($Token)) { $Token = $script:AdminToken }
+    if ([string]::IsNullOrWhiteSpace($CategoryId)) {
+        $category = Get-FirstCategory
+        $CategoryId = [string]$category.id
+    }
+    $body = [ordered]@{
+        title      = $Title
+        slug       = $Slug
+        summary    = $Summary
+        content    = $Content
+        status     = $Status
+        categoryId = $CategoryId
+        tagIds     = @($TagIds)
+    }
+    $response = Invoke-SutJson -Method Post -Path '/api/v1/posts' -Body $body -Token $Token
+    if (-not $response.Ok -or $null -eq $response.Body -or $null -eq $response.Body.data -or
+        [string]::IsNullOrWhiteSpace([string]$response.Body.data.id)) {
+        throw "failed to create FA-7 fixture post $Slug (http=$($response.Status))"
+    }
+    $id = [string]$response.Body.data.id
+    $script:Fa7CreatedPosts.Add($id)
+    Add-SutWriteLog 'create-post' "id=$id slug=$Slug status=$Status tags=$(@($TagIds) -join ',')"
+    return [pscustomobject]@{
+        Id       = $id
+        Title    = $Title
+        Slug     = $Slug
+        Status   = $Status
+        Content  = $Content
+        Response = $response.Body.data
+    }
+}
+
+function Remove-Fa7Assets {
+    try {
+        $postIds = New-Object System.Collections.Generic.List[string]
+        foreach ($id in @($script:Fa7CreatedPosts)) { if (-not [string]::IsNullOrWhiteSpace($id)) { $postIds.Add($id) } }
+        $discoveredPosts = @(Invoke-SutDb "select id from blog.posts where slug like 'fa7-%' or title like 'FA7 %'")
+        foreach ($row in $discoveredPosts) {
+            $id = ([string]$row).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($id) -and -not $postIds.Contains($id)) { $postIds.Add($id) }
+        }
+        foreach ($id in @($postIds)) {
+            $postRows = @(Invoke-SutDb "select json_build_object('title', title, 'slug', slug, 'summary', summary, 'content', content, 'categoryId', category_id, 'status', status, 'tagIds', '[]'::json)::text from blog.posts where id = '$id'")
+            if ($postRows.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$postRows[0])) {
+                try {
+                    $post = [string]$postRows[0] | ConvertFrom-Json
+                    $categoryId = if ($null -eq $post.categoryId) { $null } else { [string]$post.categoryId }
+                    $body = [ordered]@{
+                        title      = [string]$post.title
+                        slug       = [string]$post.slug
+                        summary    = [string]$post.summary
+                        content    = [string]$post.content
+                        status     = [string]$post.status
+                        categoryId = $categoryId
+                        tagIds     = @()
+                    }
+                    $clear = Invoke-SutJson -Method Put -Path "/api/v1/posts/$id" -Body $body -Token $script:AdminToken
+                    Add-SutWriteLog 'clear-post-tags' "id=$id http=$($clear.Status)"
+                }
+                catch {
+                    Add-SutWriteLog 'clear-post-tags' "id=$id error=$($_.Exception.Message)"
+                }
+            }
+            $response = Invoke-SutJson -Method Delete -Path "/api/v1/posts/$id" -Token $script:AdminToken
+            Add-SutWriteLog 'delete-post' "id=$id http=$($response.Status)"
+        }
+        $script:Fa7CreatedPosts.Clear()
+
+        $tagIds = New-Object System.Collections.Generic.List[string]
+        foreach ($id in @($script:Fa7CreatedTags)) { if (-not [string]::IsNullOrWhiteSpace($id)) { $tagIds.Add($id) } }
+        $discoveredTags = @(Invoke-SutDb "select id from blog.tags where name like 'FA7-%' or slug like 'fa7-%'")
+        foreach ($row in $discoveredTags) {
+            $id = ([string]$row).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($id) -and -not $tagIds.Contains($id)) { $tagIds.Add($id) }
+        }
+        foreach ($id in @($tagIds)) {
+            $response = Invoke-SutJson -Method Delete -Path "/api/v1/admin/tags/$id" -Token $script:AdminToken
+            Add-SutWriteLog 'delete-tag' "id=$id http=$($response.Status)"
+        }
+        $script:Fa7CreatedTags.Clear()
+    }
+    catch {
+        Write-Host ("WARN: FA7 asset cleanup failed: " + $_.Exception.Message)
+    }
+}
+
+function Get-Fa7DbCount {
+    param([Parameter(Mandatory = $true)][string]$Sql)
+    $rows = @(Invoke-SutDb $Sql)
+    if ($rows.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$rows[0])) { return -1 }
+    $value = 0
+    if ([int]::TryParse(([string]$rows[0]).Trim(), [ref]$value)) { return $value }
+    return -1
+}
+
+function Test-RouteAbsent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Token = '',
+        $Body = $null
+    )
+    $response = Invoke-SutJson -Method $Method -Path $Path -Token $Token -Body $Body
+    return [pscustomobject]@{
+        Method   = $Method.ToUpperInvariant()
+        Path     = $Path
+        Status   = $response.Status
+        Absent   = ($response.Status -eq 404 -or $response.Status -eq 405)
+        Response = $response
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Probe result writing.
 # ---------------------------------------------------------------------------
 function Write-ProbeResult {
@@ -591,6 +774,10 @@ function Invoke-UiCheck {
     if ($null -eq $node) { throw 'node is not available on PATH' }
     $Environment['FA6_ADMIN_TOKEN'] = $script:AdminToken
     $Environment['FA6_AUTHOR_TOKEN'] = $script:AuthorToken
+    $Environment['FA7_ADMIN_TOKEN'] = $script:AdminToken
+    $Environment['FA7_AUTHOR_TOKEN'] = $script:AuthorToken
+    $Environment['FA7_ADMIN_USERNAME'] = $script:AdminUser
+    $Environment['FA7_AUTHOR_USERNAME'] = $script:AuthorUser
     foreach ($key in $Environment.Keys) {
         Set-Item -Path ("env:" + $key) -Value ([string]$Environment[$key])
     }
@@ -1082,6 +1269,461 @@ function Invoke-AcLogic {
             Add-Expected 'cover preview appears after upload and disappears after 清空封面'
         }
 
+        'AC-R07-01' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $category = Get-FirstCategory
+            $title = "FA7 AC-R07-01 publish $stamp"
+            $slug = "fa7-r07-01-publish-$stamp"
+            $ui = Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R07_TITLE       = $title
+                FA7_R07_SLUG        = $slug
+                FA7_R07_CATEGORY_ID = [string]$category.id
+            }
+            $rows = @(Invoke-SutDb "select id, status, review_status, (published_at is not null) from blog.posts where slug = '$slug'")
+            Add-DbEvidence 'published-post-row' "select id, status, review_status, (published_at is not null) from blog.posts where slug = '$slug'" $rows
+            $createdId = ''
+            if ($rows.Count -eq 1) { $createdId = ([string]$rows[0] -split '\|')[0] }
+            Add-Assertion 'db' ($rows.Count -eq 1 -and $rows[0] -match '^[0-9a-f-]+\|published\|approved\|t$') 'the UI publish created exactly one published/approved row with a publish time'
+            if (-not [string]::IsNullOrWhiteSpace($createdId)) {
+                $script:Fa7CreatedPosts.Add($createdId)
+                $detail = Invoke-SutJson -Path "/api/v1/posts/$createdId"
+                Add-Assertion 'api' ($detail.Ok -and [string]$detail.Body.data.status -eq 'published' -and $null -ne $detail.Body.data.publishedAt) "anonymous GET /posts/$createdId returns the published article (http=$($detail.Status))"
+                Add-ApiEvidence 'published-detail' $detail ([pscustomobject]@{ id = $createdId; title = $(if ($detail.Ok) { [string]$detail.Body.data.title } else { '' }); status = $(if ($detail.Ok) { [string]$detail.Body.data.status } else { '' }); publishedAt = $(if ($detail.Ok) { [string]$detail.Body.data.publishedAt } else { '' }) })
+            }
+            else { Add-Assertion 'api' $false 'cannot verify the published article because the UI publish did not create a row' }
+            Add-Observed "UI published '$title' as $slug; dbRows=$($rows.Count)"
+            Add-Expected 'the page opens the public reading view without preview mark and anonymous visitors can read it'
+        }
+
+        'AC-R07-02' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $title = "FA7 AC-R07-02 published-at $stamp"
+            $slug = "fa7-r07-02-published-at-$stamp"
+            $bodyText = 'FA7 R07-02 original content.'
+            $fixture = New-Fa7FixturePost -Title $title -Slug $slug -Content $bodyText -Status 'published' -Token $script:AuthorToken
+            $beforeApi = [string]$fixture.Response.publishedAt
+            $beforeDbRows = @(Invoke-SutDb "select published_at from blog.posts where id = '$($fixture.Id)'")
+            $beforeDb = if ($beforeDbRows.Count -eq 1) { ([string]$beforeDbRows[0]).Trim() } else { '' }
+            $updatedMarker = "FA7-R07-02-UPDATED-$stamp"
+            $updateBody = [ordered]@{
+                title      = $title
+                slug       = $slug
+                summary    = 'FA7 R07-02 updated summary'
+                content    = "$bodyText`n`n$updatedMarker"
+                status     = 'published'
+                categoryId = [string]$fixture.Response.categoryId
+                tagIds     = @()
+            }
+            $updated = Invoke-SutJson -Method Put -Path "/api/v1/posts/$($fixture.Id)" -Body $updateBody -Token $script:AuthorToken
+            $afterApi = if ($updated.Ok) { [string]$updated.Body.data.publishedAt } else { '' }
+            $afterDbRows = @(Invoke-SutDb "select published_at from blog.posts where id = '$($fixture.Id)'")
+            $afterDb = if ($afterDbRows.Count -eq 1) { ([string]$afterDbRows[0]).Trim() } else { '' }
+            Add-Assertion 'api' ($updated.Ok -and -not [string]::IsNullOrWhiteSpace($beforeApi) -and $beforeApi -eq $afterApi) "PUT /posts keeps first publishedAt unchanged ($beforeApi -> $afterApi, http=$($updated.Status))"
+            Add-ApiEvidence 'edit-published' $updated ([pscustomobject]@{ id = $fixture.Id; status = $(if ($updated.Ok) { [string]$updated.Body.data.status } else { '' }); publishedAt = $afterApi; contentUpdated = ($updated.Ok -and ([string]$updated.Body.data.content).Contains($updatedMarker)) })
+            Add-DbEvidence 'published-at-before-after' "select published_at from blog.posts where id = '$($fixture.Id)'" @("before=$beforeDb", "after=$afterDb")
+            Add-Assertion 'db' (-not [string]::IsNullOrWhiteSpace($beforeDb) -and $beforeDb -eq $afterDb) "DB published_at is unchanged by the edit ($beforeDb -> $afterDb)"
+            Add-Assertion 'api' ($updated.Ok -and ([string]$updated.Body.data.content).Contains($updatedMarker)) 'the edited content is persisted'
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R07_POST_ID       = $fixture.Id
+                FA7_R07_UPDATED_MARKER = $updatedMarker
+            } | Out-Null
+            Add-Observed "fixture=$($fixture.Id); publishedAt=$beforeApi; updated=$($updated.Status)"
+            Add-Expected 'first publish time stays T1 while the article content becomes the new content'
+        }
+
+        'AC-R07-03' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $category = Get-FirstCategory
+            $title = "FA7 AC-R07-03 duplicate submit $stamp"
+            $slug = "fa7-r07-03-duplicate-$stamp"
+            $ui = Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R07_TITLE       = $title
+                FA7_R07_SLUG        = $slug
+                FA7_R07_CATEGORY_ID = [string]$category.id
+            }
+            $rows = @(Invoke-SutDb "select count(*) from blog.posts where slug = '$slug'")
+            Add-DbEvidence 'single-row-per-slug' "select count(*) from blog.posts where slug = '$slug'" $rows
+            Add-Assertion 'db' ($rows.Count -eq 1 -and [string]$rows[0].Trim() -eq '1') 'only one row exists for the publish attempt (no duplicate submit)'
+            $idRows = @(Invoke-SutDb "select id from blog.posts where slug = '$slug'")
+            if ($idRows.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$idRows[0])) {
+                $script:Fa7CreatedPosts.Add(([string]$idRows[0]).Trim())
+            }
+            else { Add-Assertion 'api' $false 'cannot verify the published row because the UI publish failed' }
+            Add-Observed "UI publish with delayed save; slug=$slug rows=$($rows.Count)"
+            Add-Expected 'save and publish buttons stay disabled while saving and only one save request is sent'
+        }
+
+        'AC-R08-01' {
+            $draftApi = Invoke-SutJson -Path '/api/v1/admin/posts?page=1&pageSize=20&status=draft' -Token $script:AdminToken
+            $draftDb = Get-Fa7DbCount "select count(*) from blog.posts where status = 'draft'"
+            $draftTotal = if ($draftApi.Ok) { [int]$draftApi.Body.data.total } else { -1 }
+            Add-Assertion 'api' ($draftApi.Ok -and $draftTotal -ge 0 -and $draftTotal -eq $draftDb) "admin status=draft total=$draftTotal equals DB draft count=$draftDb (http=$($draftApi.Status))"
+            Add-ApiEvidence 'admin-status-draft' $draftApi ([pscustomobject]@{ status = 'draft'; page = $(if ($draftApi.Ok) { $draftApi.Body.data.page } else { $null }); total = $draftTotal; pageSize = $(if ($draftApi.Ok) { $draftApi.Body.data.pageSize } else { $null }) })
+            Add-DbEvidence 'draft-count' "select count(*) from blog.posts where status = 'draft'" @($draftDb)
+
+            $reviewApi = Invoke-SutJson -Path '/api/v1/admin/posts?page=1&pageSize=20&status=draft&reviewStatus=approved' -Token $script:AdminToken
+            $reviewDb = Get-Fa7DbCount "select count(*) from blog.posts where status = 'draft' and review_status = 'approved'"
+            $reviewTotal = if ($reviewApi.Ok) { [int]$reviewApi.Body.data.total } else { -1 }
+            Add-Assertion 'api' ($reviewApi.Ok -and $reviewTotal -eq $reviewDb) "combined draft+approved total=$reviewTotal equals DB count=$reviewDb (http=$($reviewApi.Status))"
+            Add-ApiEvidence 'admin-draft-approved' $reviewApi ([pscustomobject]@{ status = 'draft'; reviewStatus = 'approved'; page = $(if ($reviewApi.Ok) { $reviewApi.Body.data.page } else { $null }); total = $reviewTotal })
+            Add-DbEvidence 'draft-approved-count' "select count(*) from blog.posts where status = 'draft' and review_status = 'approved'" @($reviewDb)
+
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R08_DRAFT_TOTAL  = [string]$draftTotal
+                FA7_R08_REVIEW_TOTAL = [string]$reviewTotal
+            } | Out-Null
+            Add-Observed "draft total=$draftTotal; draft+approved total=$reviewTotal"
+            Add-Expected 'choosing a status/review filter resets to page 1, narrows rows and keeps the pagination total in sync'
+        }
+
+        'AC-R08-02' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $keyword = "fa7r08kw$stamp"
+            $title = "FA7 R08 auto filter $keyword"
+            $slug = "fa7-r08-02-$keyword"
+            $fixture = New-Fa7FixturePost -Title $title -Slug $slug -Content 'FA7 R08-02 debounce fixture.' -Status 'published'
+            $api = Invoke-SutJson -Path ("/api/v1/admin/posts?page=1&pageSize=20&q=" + [uri]::EscapeDataString($keyword)) -Token $script:AdminToken
+            $items = if ($api.Ok) { @($api.Body.data.items) } else { @() }
+            $hit = @($items | Where-Object { [string]$_.id -eq $fixture.Id })
+            Add-Assertion 'api' ($api.Ok -and $hit.Count -eq 1 -and [int]$api.Body.data.total -eq 1) "admin q=$keyword returns the fixture automatically (http=$($api.Status), total=$(if ($api.Ok) { $api.Body.data.total } else { 'n/a' }))"
+            Add-ApiEvidence 'admin-keyword' $api ([pscustomobject]@{ q = $keyword; total = $(if ($api.Ok) { $api.Body.data.total } else { $null }); fixtureId = $fixture.Id })
+            $rows = @(Invoke-SutDb "select count(*) from blog.posts where title ilike '%$keyword%' and status = 'published'")
+            Add-DbEvidence 'keyword-row' "select count(*) from blog.posts where title ilike '%$keyword%' and status = 'published'" $rows
+            Add-Assertion 'db' ($rows.Count -eq 1 -and [string]$rows[0].Trim() -eq '1') 'exactly one published fixture row matches the keyword'
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R08_KEYWORD = $keyword
+                FA7_R08_POST_ID = $fixture.Id
+            } | Out-Null
+            Add-Observed "keyword=$keyword; fixture=$($fixture.Id)"
+            Add-Expected 'the list refreshes automatically about 250ms after typing, without a manual search click'
+        }
+
+        'AC-R08-03' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $keyword = "fa7r08pv$stamp"
+            $title = "FA7 R08 preview draft $keyword"
+            $slug = "fa7-r08-03-$keyword"
+            $marker = "FA7-R08-03-PREVIEW-$stamp"
+            $fixture = New-Fa7FixturePost -Title $title -Slug $slug -Content "Draft body. $marker" -Status 'draft' -Token $script:AuthorToken
+            $adminPreview = Invoke-SutJson -Path "/api/v1/posts/$($fixture.Id)?preview=1" -Token $script:AdminToken
+            Add-Assertion 'api' ($adminPreview.Ok -and [string]$adminPreview.Body.data.title -eq $title) "admin preview GET returns the draft article (http=$($adminPreview.Status))"
+            Add-ApiEvidence 'admin-preview' $adminPreview ([pscustomobject]@{ id = $fixture.Id; title = $(if ($adminPreview.Ok) { [string]$adminPreview.Body.data.title } else { '' }); status = $(if ($adminPreview.Ok) { [string]$adminPreview.Body.data.status } else { '' }) })
+            $anonymousPreview = Invoke-SutJson -Path "/api/v1/posts/$($fixture.Id)?preview=1"
+            Add-Assertion 'api' ($anonymousPreview.Status -eq 404 -or $anonymousPreview.Status -eq 403) "anonymous preview of the draft is refused with HTTP 403/404 (got $($anonymousPreview.Status))"
+            $anonymousLeaksTitle = $anonymousPreview.Ok -and $null -ne $anonymousPreview.Body -and [string]$anonymousPreview.Body.data.title -eq $title
+            Add-Assertion 'api' (-not $anonymousLeaksTitle) 'anonymous preview does not return the draft article content'
+            Add-ApiEvidence 'anonymous-preview' $anonymousPreview ([pscustomobject]@{ id = $fixture.Id; message = [string](Get-ObjValue $anonymousPreview.Body @('message')) })
+            $rows = @(Invoke-SutDb "select status, review_status from blog.posts where id = '$($fixture.Id)'")
+            Add-DbEvidence 'preview-draft-row' "select status, review_status from blog.posts where id = '$($fixture.Id)'" $rows
+            Add-Assertion 'db' ($rows.Count -eq 1 -and $rows[0] -match '^draft\|') 'the previewed article is genuinely a draft'
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R08_KEYWORD  = $keyword
+                FA7_R08_DRAFT_ID = $fixture.Id
+                FA7_R08_MARKER   = $marker
+            } | Out-Null
+            Add-Observed "draft=$($fixture.Id); adminPreview=$($adminPreview.Status); anonymousPreview=$($anonymousPreview.Status)"
+            Add-Expected 'clicking 预览 opens the draft in preview mode and shows its unpublished content'
+        }
+
+        'AC-R08-04' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $title = "FA7 AC-R08-04 admin denial $stamp"
+            $slug = "fa7-r08-04-$stamp"
+            $fixture = New-Fa7FixturePost -Title $title -Slug $slug -Content 'FA7 R08-04 guard fixture.' -Status 'published'
+            $list = Invoke-SutJson -Path '/api/v1/admin/posts?page=1&pageSize=1' -Token $script:AuthorToken
+            Add-Assertion 'api' ($list.Status -eq 403) "author token is rejected from GET /admin/posts with HTTP 403 (got $($list.Status))"
+            Add-ApiEvidence 'author-admin-list' $list ([pscustomobject]@{ message = [string](Get-ObjValue $list.Body @('message')) })
+            $beforeRows = @(Invoke-SutDb "select status from blog.posts where id = '$($fixture.Id)'")
+            $customStatus = @('offline', 'draft') | Where-Object { $_ -ne [string]$fixture.Status } | Select-Object -First 1
+            $patch = Invoke-SutJson -Method Patch -Path "/api/v1/admin/posts/$($fixture.Id)/status" -Body @{ status = $customStatus } -Token $script:AuthorToken
+            Add-Assertion 'api' ($patch.Status -eq 403) "author token is rejected from PATCH /admin/posts/{id}/status with HTTP 403 (got $($patch.Status))"
+            Add-ApiEvidence 'author-admin-write' $patch ([pscustomobject]@{ targetPost = $fixture.Id; targetStatus = $customStatus; message = [string](Get-ObjValue $patch.Body @('message')) })
+            $afterRows = @(Invoke-SutDb "select status from blog.posts where id = '$($fixture.Id)'")
+            $before = if ($beforeRows.Count -eq 1) { ([string]$beforeRows[0]).Trim() } else { '' }
+            $after = if ($afterRows.Count -eq 1) { ([string]$afterRows[0]).Trim() } else { '' }
+            Add-DbEvidence 'guarded-post-status' "select status from blog.posts where id = '$($fixture.Id)'" @("before=$before", "after=$after")
+            Add-Assertion 'db' ($before -eq 'published' -and $after -eq 'published') "the rejected admin write leaves the post status unchanged ($before -> $after)"
+            Add-Assertion 'db' ((Get-Fa7DbCount "select count(*) from blog.users where role in ('admin','super_admin') and is_active = true") -ge 1) 'an active admin identity exists for the legitimate admin path'
+            Use-UiCheck -AcId $AcId | Out-Null
+            Add-Observed "author admin list=$($list.Status), write=$($patch.Status); status $before -> $after"
+            Add-Expected 'non-admin users are denied and the admin article data stays hidden'
+        }
+
+        'AC-R09-01' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $tagA = New-Fa7Tag -Name "FA7-R09-A-$stamp" -Slug "fa7-r09-a-$stamp"
+            $tagB = New-Fa7Tag -Name "FA7-R09-B-$stamp" -Slug "fa7-r09-b-$stamp"
+            $post1 = New-Fa7FixturePost -Title "FA7 R09-01 tag A only $stamp" -Slug "fa7-r09-01-a-$stamp" -Content 'FA7 R09-01 A.' -Status 'published' -TagIds @($tagA.Id)
+            $post2 = New-Fa7FixturePost -Title "FA7 R09-01 tag A and B $stamp" -Slug "fa7-r09-01-ab-$stamp" -Content 'FA7 R09-01 A+B.' -Status 'published' -TagIds @($tagA.Id, $tagB.Id)
+            $apiPath = "/api/v1/posts?page=1&pageSize=20&tag=$([uri]::EscapeDataString($tagA.Slug))&tag=$([uri]::EscapeDataString($tagB.Slug))"
+            $api = Invoke-SutJson -Path $apiPath
+            $items = if ($api.Ok) { @($api.Body.data.items) } else { @() }
+            $ids = @($items | ForEach-Object { [string]$_.id })
+            $uniqueIds = @($ids | Select-Object -Unique)
+            Add-Assertion 'api' ($api.Ok -and [int]$api.Body.data.total -eq 2 -and $ids.Count -eq 2 -and $uniqueIds.Count -eq 2 -and $ids -contains $post1.Id -and $ids -contains $post2.Id) "tag A ∪ B returns exactly the 2 unique fixture articles (http=$($api.Status), total=$(if ($api.Ok) { $api.Body.data.total } else { 'n/a' }))"
+            Add-ApiEvidence 'tag-union' $api ([pscustomobject]@{ tagA = $tagA.Slug; tagB = $tagB.Slug; total = $(if ($api.Ok) { $api.Body.data.total } else { $null }); ids = $ids })
+            $dbCount = Get-Fa7DbCount "select count(distinct p.id) from blog.posts p join blog.post_tags pt on pt.post_id = p.id join blog.tags t on t.id = pt.tag_id where p.status = 'published' and p.review_status = 'approved' and (t.slug in ('$($tagA.Slug)','$($tagB.Slug)') or t.name in ('$($tagA.Name)','$($tagB.Name)'))"
+            Add-DbEvidence 'tag-union-count' "distinct published posts tagged A or B" @($dbCount)
+            Add-Assertion 'db' ($dbCount -eq 2) "DB union of tags A and B has 2 distinct published articles (got $dbCount)"
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R09_TAG_A_SLUG = $tagA.Slug
+                FA7_R09_TAG_B_SLUG = $tagB.Slug
+                FA7_R09_TAG_A_NAME = $tagA.Name
+                FA7_R09_TAG_B_NAME = $tagB.Name
+                FA7_R09_POST_IDS   = ('[' + ((@($post1.Id, $post2.Id) | ForEach-Object { '"{0}"' -f $_ }) -join ',') + ']')
+            } | Out-Null
+            Add-Observed "tagA=$($tagA.Slug) tagB=$($tagB.Slug); union ids=$($ids -join ',')"
+            Add-Expected 'mobile users can select A and B together and see the deduplicated union of 2 articles'
+        }
+
+        'AC-R09-02' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $tagC = New-Fa7Tag -Name "FA7-R09-C-$stamp" -Slug "fa7-r09-c-$stamp"
+            $tagD = New-Fa7Tag -Name "FA7-R09-D-$stamp" -Slug "fa7-r09-d-$stamp"
+            $post1 = New-Fa7FixturePost -Title "FA7 R09-02 tag C $stamp" -Slug "fa7-r09-02-c-$stamp" -Content 'FA7 R09-02 C.' -Status 'published' -TagIds @($tagC.Id)
+            $post2 = New-Fa7FixturePost -Title "FA7 R09-02 tag D $stamp" -Slug "fa7-r09-02-d-$stamp" -Content 'FA7 R09-02 D.' -Status 'published' -TagIds @($tagD.Id)
+            $allApi = Invoke-SutJson -Path '/api/v1/posts?page=1&pageSize=5'
+            $allTotal = if ($allApi.Ok) { [int]$allApi.Body.data.total } else { -1 }
+            $allDb = Get-Fa7DbCount "select count(*) from blog.posts where status = 'published' and review_status = 'approved'"
+            Add-Assertion 'api' ($allApi.Ok -and $allTotal -eq $allDb) "unfiltered page-1 total=$allTotal equals DB public count=$allDb (http=$($allApi.Status))"
+            Add-ApiEvidence 'all-public' $allApi ([pscustomobject]@{ total = $allTotal; page = $(if ($allApi.Ok) { $allApi.Body.data.page } else { $null }); count = $(if ($allApi.Ok) { @($allApi.Body.data.items).Count } else { 0 }) })
+            Add-DbEvidence 'all-public-count' "select count(*) from blog.posts where status = 'published' and review_status = 'approved'" @($allDb)
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R09_TAG_C_SLUG = $tagC.Slug
+                FA7_R09_TAG_D_SLUG = $tagD.Slug
+                FA7_R09_ALL_TOTAL  = [string]$allTotal
+                FA7_R09_POST_IDS   = ('[' + ((@($post1.Id, $post2.Id) | ForEach-Object { '"{0}"' -f $_ }) -join ',') + ']')
+            } | Out-Null
+            Add-Observed "selected tags C+D then cleared; allTotal=$allTotal"
+            Add-Expected 'clearing all filters removes the selected tags and restores the full public article list'
+        }
+
+        'AC-R09-03' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $tagE = New-Fa7Tag -Name "FA7-R09-E-$stamp" -Slug "fa7-r09-e-$stamp"
+            $post1 = New-Fa7FixturePost -Title "FA7 R09-03 duplicate one $stamp" -Slug "fa7-r09-03-one-$stamp" -Content 'FA7 R09-03 one.' -Status 'published' -TagIds @($tagE.Id)
+            $post2 = New-Fa7FixturePost -Title "FA7 R09-03 duplicate two $stamp" -Slug "fa7-r09-03-two-$stamp" -Content 'FA7 R09-03 two.' -Status 'published' -TagIds @($tagE.Id)
+            $path = "/api/v1/posts?page=1&pageSize=20&tag=$([uri]::EscapeDataString($tagE.Slug))&tags=$([uri]::EscapeDataString($tagE.Name)),$([uri]::EscapeDataString($tagE.Slug))"
+            $api = Invoke-SutJson -Path $path
+            $items = if ($api.Ok) { @($api.Body.data.items) } else { @() }
+            $ids = @($items | ForEach-Object { [string]$_.id })
+            $unique = @($ids | Select-Object -Unique)
+            Add-Assertion 'api' ($api.Ok -and [int]$api.Body.data.total -eq 2 -and $ids.Count -eq 2 -and $unique.Count -eq 2) "duplicate tag conditions in different forms still return 2 unique articles (http=$($api.Status), total=$(if ($api.Ok) { $api.Body.data.total } else { 'n/a' }))"
+            Add-ApiEvidence 'duplicate-tag-conditions' $api ([pscustomobject]@{ tag = $tagE.Slug; tags = "$($tagE.Name),$($tagE.Slug)"; total = $(if ($api.Ok) { $api.Body.data.total } else { $null }); ids = $ids })
+            $dbCount = Get-Fa7DbCount "select count(*) from blog.posts p join blog.post_tags pt on pt.post_id = p.id join blog.tags t on t.id = pt.tag_id where p.status = 'published' and p.review_status = 'approved' and t.slug = '$($tagE.Slug)'"
+            Add-DbEvidence 'single-tag-post-count' "select count(*) from blog.posts p join blog.post_tags pt on pt.post_id = p.id join blog.tags t on t.id = pt.tag_id where p.status = 'published' and p.review_status = 'approved' and t.slug = '$($tagE.Slug)'" @($dbCount)
+            Add-Assertion 'db' ($dbCount -eq 2) "DB shows 2 published posts for tag E (got $dbCount)"
+            Use-UiCheck -AcId $AcId -Environment @{
+                FA7_R09_DUP_PATH  = ($path -replace '^/api/v1/posts', '/blog')
+                FA7_R09_POST_IDS  = ('[' + ((@($post1.Id, $post2.Id) | ForEach-Object { '"{0}"' -f $_ }) -join ',') + ']')
+                FA7_R09_EXPECTED  = '2'
+            } | Out-Null
+            Add-Observed "duplicate tag URL=$path; ids=$($ids -join ',')"
+            Add-Expected 'repeated/equivalent tag conditions are merged and no article appears twice'
+        }
+
+        'AC-R10-01' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $title = "FA7 AC-R10-01 schedule probe $stamp"
+            $slug = "fa7-r10-01-$stamp"
+            $fixture = New-Fa7FixturePost -Title $title -Slug $slug -Content 'FA7 R10-01 scheduling probe.' -Status 'draft' -Token $script:AuthorToken
+            $scheduledAt = (Get-Date).AddMinutes(2).ToString('o')
+            $updateBody = [ordered]@{
+                title       = $title
+                slug        = $slug
+                summary     = 'FA7 R10-01 schedule attempt'
+                content     = 'FA7 R10-01 scheduling probe.'
+                status      = 'scheduled'
+                categoryId  = [string]$fixture.Response.categoryId
+                tagIds      = @()
+                scheduledAt = $scheduledAt
+            }
+            $update = Invoke-SutJson -Method Put -Path "/api/v1/posts/$($fixture.Id)" -Body $updateBody -Token $script:AuthorToken
+            $hasScheduleField = $null -ne (Get-ObjValue $update.Body.data @('scheduledAt', 'scheduled_at', 'scheduleAt', 'publishAt', 'publish_at'))
+            Add-Assertion 'api' (-not $hasScheduleField) "the post API response exposes no scheduled publish field (http=$($update.Status))"
+            Add-ApiEvidence 'schedule-attempt' $update ([pscustomobject]@{ id = $fixture.Id; requestedStatus = 'scheduled'; requestedAt = $scheduledAt; responseStatus = $(if ($update.Ok) { [string]$update.Body.data.status } else { '' }); hasScheduleField = $hasScheduleField })
+            $columnCount = Get-Fa7DbCount "select count(*) from information_schema.columns where table_schema = 'blog' and table_name = 'posts' and column_name in ('scheduled_at','scheduled_for','publish_at','schedule_at')"
+            Add-DbEvidence 'schedule-columns' "select count(*) from information_schema.columns where table_schema='blog' and table_name='posts' and column_name in ('scheduled_at','scheduled_for','publish_at','schedule_at')" @($columnCount)
+            Add-Assertion 'db' ($columnCount -eq 0) "the SUT posts table has no scheduled-publish timestamp column (got $columnCount)"
+            $calendar1 = Test-RouteAbsent -Method Get -Path '/api/v1/admin/calendar' -Token $script:AdminToken
+            $calendar2 = Test-RouteAbsent -Method Get -Path '/api/v1/admin/publish-calendar' -Token $script:AdminToken
+            $calendar3 = Test-RouteAbsent -Method Get -Path '/api/v1/admin/posts/calendar' -Token $script:AdminToken
+            Add-Assertion 'api' ($calendar1.Absent -and $calendar2.Absent -and $calendar3.Absent) "no publish-calendar route exists (calendar=$($calendar1.Status), publish-calendar=$($calendar2.Status), posts/calendar=$($calendar3.Status))"
+            Add-ApiEvidence 'calendar-routes' $null ([pscustomobject]@{ calendar = $calendar1.Status; publishCalendar = $calendar2.Status; postsCalendar = $calendar3.Status })
+            $ui = Use-UiCheck -AcId $AcId
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and -not $hasScheduleField -and $columnCount -eq 0 -and $calendar1.Absent -and $calendar2.Absent -and $calendar3.Absent) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "scheduledAt field present=$hasScheduleField; schedule columns=$columnCount; calendar routes=$($calendar1.Status)/$($calendar2.Status)/$($calendar3.Status)"
+            Add-Expected 'author sets a future publish time, sees 预约发布 + the time, and visitors cannot see the scheduled article'
+        }
+
+        'AC-R10-02' {
+            $columnCount = Get-Fa7DbCount "select count(*) from information_schema.columns where table_schema = 'blog' and table_name = 'posts' and column_name in ('scheduled_at','scheduled_for','publish_at','schedule_at')"
+            Add-DbEvidence 'schedule-columns' "select count(*) from information_schema.columns where table_schema='blog' and table_name='posts' and column_name in ('scheduled_at','scheduled_for','publish_at','schedule_at')" @($columnCount)
+            Add-Assertion 'db' ($columnCount -eq 0) "no scheduled-publish timestamp column exists to drive automatic publishing (got $columnCount)"
+            $autoPublished = Get-Fa7DbCount "select count(*) from blog.posts where status = 'scheduled' and published_at is not null"
+            Add-DbEvidence 'scheduled-auto-published' "select count(*) from blog.posts where status = 'scheduled' and published_at is not null" @($autoPublished)
+            Add-Assertion 'db' ($autoPublished -eq 0) "no scheduled-status post has been automatically published (got $autoPublished)"
+            $schedule1 = Test-RouteAbsent -Method Get -Path '/api/v1/admin/schedules' -Token $script:AdminToken
+            $schedule2 = Test-RouteAbsent -Method Get -Path '/api/v1/admin/posts/scheduled' -Token $script:AdminToken
+            $schedule3 = Test-RouteAbsent -Method Post -Path '/api/v1/admin/publish-check' -Token $script:AdminToken
+            Add-Assertion 'api' ($schedule1.Absent -and $schedule2.Absent -and $schedule3.Absent) "no scheduler/publish-check route exists (schedules=$($schedule1.Status), scheduled=$($schedule2.Status), publish-check=$($schedule3.Status))"
+            Add-ApiEvidence 'scheduler-routes' $null ([pscustomobject]@{ schedules = $schedule1.Status; scheduledPosts = $schedule2.Status; publishCheck = $schedule3.Status })
+            $ui = Use-UiCheck -AcId $AcId
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $columnCount -eq 0 -and $autoPublished -eq 0 -and $schedule1.Absent -and $schedule2.Absent -and $schedule3.Absent) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "schedule columns=$columnCount; auto-published scheduled rows=$autoPublished; routes=$($schedule1.Status)/$($schedule2.Status)/$($schedule3.Status)"
+            Add-Expected 'at time T the article becomes published with first publish time T and becomes publicly readable'
+        }
+
+        'AC-R10-03' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $fixture = New-Fa7FixturePost -Title "FA7 AC-R10-03 cancel probe $stamp" -Slug "fa7-r10-03-$stamp" -Content 'FA7 R10-03 cancel probe.' -Status 'draft' -Token $script:AuthorToken
+            $calendar = Test-RouteAbsent -Method Get -Path '/api/v1/admin/calendar' -Token $script:AdminToken
+            $cancel1 = Test-RouteAbsent -Method Delete -Path "/api/v1/posts/$($fixture.Id)/schedule" -Token $script:AuthorToken
+            $cancel2 = Test-RouteAbsent -Method Delete -Path "/api/v1/admin/posts/$($fixture.Id)/schedule" -Token $script:AdminToken
+            Add-Assertion 'api' ($calendar.Absent -and $cancel1.Absent -and $cancel2.Absent) "no calendar or cancel-schedule route exists (calendar=$($calendar.Status), cancel=$($cancel1.Status), adminCancel=$($cancel2.Status))"
+            Add-ApiEvidence 'calendar-cancel-routes' $null ([pscustomobject]@{ calendar = $calendar.Status; cancel = $cancel1.Status; adminCancel = $cancel2.Status })
+            $tableCount = Get-Fa7DbCount "select count(*) from information_schema.tables where table_schema = 'blog' and table_name in ('schedules','schedule','publish_calendar','publishing_schedule','scheduled_posts')"
+            Add-DbEvidence 'schedule-tables' "select count(*) from information_schema.tables where table_schema='blog' and table_name in ('schedules','schedule','publish_calendar','publishing_schedule','scheduled_posts')" @($tableCount)
+            Add-Assertion 'db' ($tableCount -eq 0) "the SUT DB has no publish-calendar/schedule table (got $tableCount)"
+            $ui = Use-UiCheck -AcId $AcId
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $calendar.Absent -and $cancel1.Absent -and $cancel2.Absent -and $tableCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "calendar=$($calendar.Status); cancel routes=$($cancel1.Status)/$($cancel2.Status); schedule tables=$tableCount"
+            Add-Expected 'admin sees a 30-day publish calendar including the article; cancelling returns it to its pre-schedule state'
+        }
+
+        'AC-R11-01' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $fixture = New-Fa7FixturePost -Title "FA7 AC-R11-01 like probe $stamp" -Slug "fa7-r11-01-$stamp" -Content 'FA7 R11-01 like probe.' -Status 'published'
+            $detail = Invoke-SutJson -Path "/api/v1/posts/$($fixture.Id)"
+            $detailProps = if ($detail.Ok) { @($detail.Body.data.PSObject.Properties.Name) } else { @() }
+            $hasLikeField = @($detailProps | Where-Object { $_ -match '^(likeCount|liked|like_count|likes)$' }).Count -gt 0
+            Add-Assertion 'api' ($detail.Ok -and -not $hasLikeField) "the article detail exposes no like/like-count field (http=$($detail.Status))"
+            Add-ApiEvidence 'article-detail-like-fields' $detail ([pscustomobject]@{ id = $fixture.Id; properties = $detailProps; hasLikeField = $hasLikeField })
+            $like1 = Test-RouteAbsent -Method Post -Path "/api/v1/posts/$($fixture.Id)/like" -Token $script:AuthorToken
+            $like2 = Test-RouteAbsent -Method Delete -Path "/api/v1/posts/$($fixture.Id)/like" -Token $script:AuthorToken
+            Add-Assertion 'api' ($like1.Absent -and $like2.Absent) "no like/unlike route exists (like=$($like1.Status), unlike=$($like2.Status))"
+            Add-ApiEvidence 'like-routes' $null ([pscustomobject]@{ like = $like1.Status; unlike = $like2.Status })
+            $tableCount = Get-Fa7DbCount "select count(*) from information_schema.tables where table_schema = 'blog' and table_name in ('post_likes','likes','article_likes')"
+            $columnCount = Get-Fa7DbCount "select count(*) from information_schema.columns where table_schema = 'blog' and table_name = 'posts' and column_name in ('like_count','likes_count')"
+            Add-DbEvidence 'like-schema' "tables/columns for likes" @([pscustomobject]@{ tables = $tableCount; columns = $columnCount })
+            Add-Assertion 'db' ($tableCount -eq 0 -and $columnCount -eq 0) "the DB has no like table or like-count column (tables=$tableCount, columns=$columnCount)"
+            $ui = Use-UiCheck -AcId $AcId -Environment @{ FA7_R11_POST_ID = $fixture.Id }
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and -not $hasLikeField -and $like1.Absent -and $like2.Absent -and $tableCount -eq 0 -and $columnCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "like fields=$hasLikeField; routes=$($like1.Status)/$($like2.Status); like tables=$tableCount"
+            Add-Expected 'one click adds exactly one like, a second click does not increase the count, and the UI marks the user as having liked'
+        }
+
+        'AC-R11-02' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $fixture = New-Fa7FixturePost -Title "FA7 AC-R11-02 favorite probe $stamp" -Slug "fa7-r11-02-$stamp" -Content 'FA7 R11-02 favorite probe.' -Status 'published'
+            $favorites = Test-RouteAbsent -Method Get -Path '/api/v1/users/me/favorites' -Token $script:AuthorToken
+            $favorite1 = Test-RouteAbsent -Method Post -Path "/api/v1/posts/$($fixture.Id)/favorite" -Token $script:AuthorToken
+            $favorite2 = Test-RouteAbsent -Method Delete -Path "/api/v1/posts/$($fixture.Id)/favorite" -Token $script:AuthorToken
+            Add-Assertion 'api' ($favorites.Absent -and $favorite1.Absent -and $favorite2.Absent) "no favorites list/favorite/unfavorite route exists (list=$($favorites.Status), favorite=$($favorite1.Status), unfavorite=$($favorite2.Status))"
+            Add-ApiEvidence 'favorite-routes' $null ([pscustomobject]@{ list = $favorites.Status; favorite = $favorite1.Status; unfavorite = $favorite2.Status })
+            $tableCount = Get-Fa7DbCount "select count(*) from information_schema.tables where table_schema = 'blog' and table_name in ('favorites','post_favorites','user_favorites','favorite_posts')"
+            Add-DbEvidence 'favorite-tables' "tables for favorites" @($tableCount)
+            Add-Assertion 'db' ($tableCount -eq 0) "the DB has no favorites table (got $tableCount)"
+            $ui = Use-UiCheck -AcId $AcId -Environment @{ FA7_R11_POST_ID = $fixture.Id }
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $favorites.Absent -and $favorite1.Absent -and $favorite2.Absent -and $tableCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "favorite routes=$($favorites.Status)/$($favorite1.Status)/$($favorite2.Status); favorite tables=$tableCount"
+            Add-Expected '我的收藏 lists the 3 favorited articles newest-first'
+        }
+
+        'AC-R11-03' {
+            $stamp = Get-Date -Format 'yyyyMMddHHmmssfff'
+            $fixture = New-Fa7FixturePost -Title "FA7 AC-R11-03 progress probe $stamp" -Slug "fa7-r11-03-$stamp" -Content ("FA7 R11-03 reading progress probe.`n`n## Section`n`n" + ('Progress body. ' * 200)) -Status 'published'
+            $progress1 = Test-RouteAbsent -Method Put -Path "/api/v1/posts/$($fixture.Id)/reading-progress" -Token $script:AuthorToken -Body @{ percent = 50 }
+            $progress2 = Test-RouteAbsent -Method Get -Path '/api/v1/users/me/reading-progress' -Token $script:AuthorToken
+            $progress3 = Test-RouteAbsent -Method Get -Path "/api/v1/posts/$($fixture.Id)/reading-progress" -Token $script:AuthorToken
+            Add-Assertion 'api' ($progress1.Absent -and $progress2.Absent -and $progress3.Absent) "no reading-progress route exists (save=$($progress1.Status), list=$($progress2.Status), get=$($progress3.Status))"
+            Add-ApiEvidence 'reading-progress-routes' $null ([pscustomobject]@{ save = $progress1.Status; list = $progress2.Status; get = $progress3.Status })
+            $tableCount = Get-Fa7DbCount "select count(*) from information_schema.tables where table_schema = 'blog' and table_name in ('reading_progress','reading_positions','user_reading_progress','article_reading_progress')"
+            Add-DbEvidence 'reading-progress-tables' "tables for reading progress" @($tableCount)
+            Add-Assertion 'db' ($tableCount -eq 0) "the DB has no reading-progress table (got $tableCount)"
+            $ui = Use-UiCheck -AcId $AcId -Environment @{ FA7_R11_POST_ID = $fixture.Id }
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $progress1.Absent -and $progress2.Absent -and $progress3.Absent -and $tableCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "progress routes=$($progress1.Status)/$($progress2.Status)/$($progress3.Status); progress tables=$tableCount"
+            Add-Expected 'reopening the article offers to resume from the last saved reading position'
+        }
+
+        'AC-R12-01' {
+            $suggest1 = Test-RouteAbsent -Method Get -Path '/api/v1/search/suggest?q=%E9%83%A8'
+            $suggest2 = Test-RouteAbsent -Method Get -Path '/api/v1/posts/suggest?q=%E9%83%A8'
+            $suggest3 = Test-RouteAbsent -Method Get -Path '/api/v1/suggest?q=%E9%83%A8'
+            Add-Assertion 'api' ($suggest1.Absent -and $suggest2.Absent -and $suggest3.Absent) "no search-suggestion route exists (search/suggest=$($suggest1.Status), posts/suggest=$($suggest2.Status), suggest=$($suggest3.Status))"
+            Add-ApiEvidence 'suggest-routes' $null ([pscustomobject]@{ searchSuggest = $suggest1.Status; postsSuggest = $suggest2.Status; suggest = $suggest3.Status })
+            $tableCount = Get-Fa7DbCount "select count(*) from information_schema.tables where table_schema = 'blog' and table_name in ('search_suggestions','suggestions','search_keywords')"
+            Add-DbEvidence 'suggestion-tables' "tables for search suggestions" @($tableCount)
+            Add-Assertion 'db' ($tableCount -eq 0) "the DB has no search-suggestion table (got $tableCount)"
+            $ui = Use-UiCheck -AcId $AcId
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $suggest1.Absent -and $suggest2.Absent -and $suggest3.Absent -and $tableCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "suggest routes=$($suggest1.Status)/$($suggest2.Status)/$($suggest3.Status); suggestion tables=$tableCount"
+            Add-Expected 'typing 部 shows a suggestion containing 部署 and clicking it fills the box and runs the search'
+        }
+
+        'AC-R12-02' {
+            $list = Invoke-SutJson -Path '/api/v1/posts?page=1&pageSize=10&q=Vue'
+            $items = if ($list.Ok) { @($list.Body.data.items) } else { @() }
+            $highlightFields = @()
+            foreach ($item in $items) {
+                foreach ($prop in @($item.PSObject.Properties.Name)) {
+                    if ($prop -match 'highlight|matchedField|matchRanges') { $highlightFields += $prop }
+                }
+            }
+            Add-Assertion 'api' ($list.Ok -and $highlightFields.Count -eq 0) "search results expose no highlight/match metadata (http=$($list.Status))"
+            Add-ApiEvidence 'search-highlight-metadata' $list ([pscustomobject]@{ q = 'Vue'; total = $(if ($list.Ok) { $list.Body.data.total } else { $null }); highlightFields = @($highlightFields | Select-Object -Unique) })
+            $columnCount = Get-Fa7DbCount "select count(*) from information_schema.columns where table_schema = 'blog' and table_name = 'posts' and column_name in ('highlight','search_highlight')"
+            Add-DbEvidence 'highlight-columns' "select count(*) from information_schema.columns where table_schema='blog' and table_name='posts' and column_name in ('highlight','search_highlight')" @($columnCount)
+            Add-Assertion 'db' ($columnCount -eq 0) "the SUT has no stored highlight column (got $columnCount)"
+            $ui = Use-UiCheck -AcId $AcId
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $highlightFields.Count -eq 0 -and $columnCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "q=Vue results=$($items.Count); highlight fields=$(@($highlightFields | Select-Object -Unique).Count)"
+            Add-Expected 'the matched keyword is visually highlighted in result titles and summaries'
+        }
+
+        'AC-R12-03' {
+            $history1 = Test-RouteAbsent -Method Get -Path '/api/v1/search/history' -Token $script:AuthorToken
+            $history2 = Test-RouteAbsent -Method Get -Path '/api/v1/users/me/search-history' -Token $script:AuthorToken
+            $history3 = Test-RouteAbsent -Method Delete -Path '/api/v1/search/history' -Token $script:AuthorToken
+            Add-Assertion 'api' ($history1.Absent -and $history2.Absent -and $history3.Absent) "no search-history route exists (get=$($history1.Status), me=$($history2.Status), clear=$($history3.Status))"
+            Add-ApiEvidence 'search-history-routes' $null ([pscustomobject]@{ get = $history1.Status; me = $history2.Status; clear = $history3.Status })
+            $tableCount = Get-Fa7DbCount "select count(*) from information_schema.tables where table_schema = 'blog' and table_name in ('search_history','search_histories','user_search_history','search_records')"
+            Add-DbEvidence 'search-history-tables' "tables for search history" @($tableCount)
+            Add-Assertion 'db' ($tableCount -eq 0) "the DB has no search-history table (got $tableCount)"
+            $ui = Use-UiCheck -AcId $AcId
+            $uiOk = (@($ui.assertions | Where-Object { -not $_.ok }).Count -eq 0)
+            if ($uiOk -and $history1.Absent -and $history2.Absent -and $history3.Absent -and $tableCount -eq 0) {
+                $script:GroundTruthOverride = 'absent'
+            }
+            Add-Observed "history routes=$($history1.Status)/$($history2.Status)/$($history3.Status); history tables=$tableCount"
+            Add-Expected 'reopening the search box shows the last 10 searches and clearing removes them'
+        }
+
         default { throw "unsupported AC: $AcId" }
     }
 }
@@ -1119,6 +1761,25 @@ function Get-AcExpected {
         'AC-R06-01' { return 'image upload inserts reference at cursor' }
         'AC-R06-02' { return 'oversized/unsupported upload fails with feedback and no insertion' }
         'AC-R06-03' { return 'cover upload previews and clears' }
+        'AC-R07-01' { return 'publishing opens the public reading page and visitors can read it' }
+        'AC-R07-02' { return 'editing a published article keeps the first publish time and updates the content' }
+        'AC-R07-03' { return 'save/publish buttons are disabled while saving and only one save is sent' }
+        'AC-R08-01' { return 'status/review filters reset to page 1, narrow rows and keep the total in sync' }
+        'AC-R08-02' { return 'typing a keyword auto-refreshes the admin list after about 250ms' }
+        'AC-R08-03' { return 'admin preview opens an unpublished article and shows its content' }
+        'AC-R08-04' { return 'non-admin users are denied the admin article area and data' }
+        'AC-R09-01' { return 'mobile multi-tag selection shows the deduplicated union' }
+        'AC-R09-02' { return 'clear filters removes all selected tags and restores the public list' }
+        'AC-R09-03' { return 'duplicate tag conditions are merged without duplicate articles' }
+        'AC-R10-01' { return 'future publish stores a scheduled time and hides the article while scheduled' }
+        'AC-R10-02' { return 'the scheduled article is automatically published at T with first publish time T' }
+        'AC-R10-03' { return 'admin publish calendar shows future schedules and cancellation restores the draft' }
+        'AC-R11-01' { return 'repeated likes count once and the UI marks the user as having liked' }
+        'AC-R11-02' { return '我的收藏 lists favorited articles newest-first' }
+        'AC-R11-03' { return 'reopening an article offers to resume from the last reading position' }
+        'AC-R12-01' { return 'typing shows up to 8 suggestions from public article titles/tags' }
+        'AC-R12-02' { return 'matched keywords are highlighted in result titles and summaries' }
+        'AC-R12-03' { return 'the last 10 searches are shown and can be cleared' }
         default { return '' }
     }
 }
@@ -1145,8 +1806,12 @@ function Invoke-ForAc {
 # eztestVerdict join (case-runs.json; FA-5/FA-14 supplies it).
 # ---------------------------------------------------------------------------
 function Get-EztestVerdicts {
+    param([string[]]$RequirementIds = $null)
+    if ($null -eq $RequirementIds -or $RequirementIds.Count -eq 0) {
+        $RequirementIds = @('R01', 'R02', 'R03', 'R04', 'R05', 'R06')
+    }
     $verdicts = @{}
-    foreach ($rid in @('R01', 'R02', 'R03', 'R04', 'R05', 'R06')) { $verdicts[$rid] = 'missing' }
+    foreach ($rid in $RequirementIds) { $verdicts[$rid] = 'missing' }
 
     $path = Join-Path $script:EvidenceRoot "$RunDir\typical\case-runs.json"
     if (-not (Test-Path -LiteralPath $path)) { return $verdicts }
@@ -1221,7 +1886,8 @@ function Get-DerivedRequirementStatus {
 }
 
 function Write-AcsSummary {
-    $verdicts = Get-EztestVerdicts
+    $requirementIds = @($script:AcOrder | ForEach-Object { [regex]::Match($_, '^AC-(R\d{2})-').Groups[1].Value } | Select-Object -Unique)
+    $verdicts = Get-EztestVerdicts -RequirementIds $requirementIds
     $acs = New-Object System.Collections.Generic.List[object]
     $requirements = New-Object System.Collections.Generic.List[object]
     $statusByRequirement = @{}
@@ -1254,7 +1920,7 @@ function Write-AcsSummary {
         })
     }
 
-    foreach ($rid in @('R01', 'R02', 'R03', 'R04', 'R05', 'R06')) {
+    foreach ($rid in $requirementIds) {
         $statuses = @()
         if ($statusByRequirement.ContainsKey($rid)) { $statuses = @($statusByRequirement[$rid]) }
         $status = Get-DerivedRequirementStatus $statuses
@@ -1271,14 +1937,15 @@ function Write-AcsSummary {
 
     $summary = [ordered]@{
         schemaVersion = 1
-        range         = 'R01-R06'
+        range         = $script:ActiveRange
         runDir        = $RunDir
         gitHead       = (Get-Head)
         generatedAt   = (Get-Date).ToString('o')
         requirements  = $requirements.ToArray()
         acs           = $acs.ToArray()
     }
-    $summaryPath = Join-Path $script:EvidenceRoot "$RunDir\acs-r01-r06.json"
+    $summaryName = if ($script:ActiveRange -eq 'R07-R12') { 'acs-r07-r12.json' } else { 'acs-r01-r06.json' }
+    $summaryPath = Join-Path $script:EvidenceRoot "$RunDir\$summaryName"
     Write-JsonUtf8 -Path $summaryPath -Object $summary
     return $summaryPath
 }
@@ -1314,15 +1981,17 @@ function Invoke-SelfCheck {
     }
     foreach ($problem in @(Assert-ExactSetStrings -Actual @($seen) -Expected $expectedAcIds -Label 'probes')) { $red.Add($problem) }
 
-    $summaryPath = Join-Path $script:EvidenceRoot "$RunDir\acs-r01-r06.json"
-    if (-not (Test-Path -LiteralPath $summaryPath)) { $red.Add('acs-r01-r06.json missing') }
+    $expectedRequirementIds = @($expectedAcIds | ForEach-Object { [regex]::Match($_, '^AC-(R\d{2})-').Groups[1].Value } | Select-Object -Unique)
+    $summaryName = if ($script:ActiveRange -eq 'R07-R12') { 'acs-r07-r12.json' } else { 'acs-r01-r06.json' }
+    $summaryPath = Join-Path $script:EvidenceRoot "$RunDir\$summaryName"
+    if (-not (Test-Path -LiteralPath $summaryPath)) { $red.Add("$summaryName missing") }
     else {
-        try { $summary = Read-JsonUtf8 -Path $summaryPath } catch { $red.Add('acs-r01-r06.json unreadable'); $summary = $null }
+        try { $summary = Read-JsonUtf8 -Path $summaryPath } catch { $red.Add("$summaryName unreadable"); $summary = $null }
         if ($null -ne $summary) {
             $acs = @($summary.acs)
             $requirements = @($summary.requirements)
             foreach ($problem in @(Assert-ExactSetStrings -Actual @($acs | ForEach-Object { [string]$_.id }) -Expected $expectedAcIds -Label 'acs')) { $red.Add($problem) }
-            foreach ($problem in @(Assert-ExactSetStrings -Actual @($requirements | ForEach-Object { [string]$_.id }) -Expected @('R01', 'R02', 'R03', 'R04', 'R05', 'R06') -Label 'requirements')) { $red.Add($problem) }
+            foreach ($problem in @(Assert-ExactSetStrings -Actual @($requirements | ForEach-Object { [string]$_.id }) -Expected $expectedRequirementIds -Label 'requirements')) { $red.Add($problem) }
             foreach ($ac in $acs) {
                 $acId = [string]$ac.id
                 if ([string]::IsNullOrWhiteSpace([string]$ac.observed)) { $red.Add("$acId observed empty") }
@@ -1349,27 +2018,39 @@ function Invoke-SelfCheck {
         Write-Host ("SELFCHECK FAIL: {0} red" -f $red.Count)
         return $false
     }
-    Write-Host ("SELFCHECK PASS: {0} probes / 6 requirements / acs-r01-r06.json schema+PNG+evidence" -f $expectedAcIds.Count)
+    Write-Host ("SELFCHECK PASS: {0} probes / {1} requirements / {2} schema+PNG+evidence" -f $expectedAcIds.Count, $expectedRequirementIds.Count, $summaryName)
     return $true
 }
 
 function Write-GreenLog {
     param([bool]$SelfCheckPass, [string]$SummaryPath)
     $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add("FA-6 AC probe R01-R06 - generated $(Get-Date -Format o)")
+    $familyLabel = if ($script:ProbeFamily -eq 'FA7') { 'FA-7' } else { 'FA-6' }
+    $lines.Add("$familyLabel AC probe $($script:ActiveRange) - generated $(Get-Date -Format o)")
     $lines.Add("gitHead=$((Get-Head))")
     $lines.Add("runDir=$RunDir")
     $lines.Add("summary=$SummaryPath")
+    $verdicts = @{}
+    if ($script:ProbeFamily -eq 'FA7') {
+        $requirementIds = @($script:AcOrder | ForEach-Object { [regex]::Match($_, '^AC-(R\d{2})-').Groups[1].Value } | Select-Object -Unique)
+        $verdicts = Get-EztestVerdicts -RequirementIds $requirementIds
+    }
     foreach ($acId in $script:AcOrder) {
         $probePath = Join-Path $script:ProbesDir "$acId.json"
         if (Test-Path -LiteralPath $probePath) {
             $probe = Read-JsonUtf8 -Path $probePath
-            $lines.Add(("PROBE {0} groundTruth={1} recomputed={2}" -f $acId, $probe.groundTruth, $probe.recomputed))
+            $line = ("PROBE {0} groundTruth={1} recomputed={2}" -f $acId, $probe.groundTruth, $probe.recomputed)
+            if ($script:ProbeFamily -eq 'FA7') {
+                $rid = [regex]::Match($acId, '^AC-(R\d{2})-').Groups[1].Value
+                $line += " eztestVerdict=$($verdicts[$rid])"
+            }
+            $lines.Add($line)
         }
         else { $lines.Add("PROBE $acId MISSING") }
     }
     $lines.Add(("SELFCHECK " + $(if ($SelfCheckPass) { 'PASS' } else { 'FAIL' })))
-    $logPath = Join-Path $script:LogsDir 'fa6-green.log'
+    $logName = if ($script:ProbeFamily -eq 'FA7') { 'fa7-green.log' } else { 'fa6-green.log' }
+    $logPath = Join-Path $script:LogsDir $logName
     [System.IO.File]::WriteAllText($logPath, ($lines -join "`r`n") + "`r`n", $script:Utf8NoBom)
     return $logPath
 }
@@ -1393,6 +2074,13 @@ function Cleanup-Fa6Assets {
 # Entry point.
 # ---------------------------------------------------------------------------
 try {
+    $effectiveRange = $Range
+    if (-not [string]::IsNullOrWhiteSpace($AcId)) {
+        if ($AcId -match '^AC-R(07|08|09|10|11|12)-') { $effectiveRange = 'R07-R12' }
+        elseif ($AcId -match '^AC-R0[1-6]-') { $effectiveRange = 'R01-R06' }
+    }
+    Set-ProbeScope -RangeName $effectiveRange
+
     if ($SummaryOnly) {
         $summaryPath = Write-AcsSummary
         $selfCheckPass = Invoke-SelfCheck
@@ -1410,14 +2098,14 @@ try {
     }
 
     if ([string]::IsNullOrWhiteSpace($AcId)) {
-        if ($Range -ne 'R01-R06') { throw "unsupported range: $Range" }
         Initialize-SutContext
-        Write-Host ("FA6 range R01-R06: {0} probes against {1}" -f $script:AcOrder.Count, $script:SutApiBase)
+        $family = if ($script:ProbeFamily -eq 'FA7') { 'FA7' } else { 'FA6' }
+        Write-Host ("{0} range {1}: {2} probes against {3}" -f $family, $script:ActiveRange, $script:AcOrder.Count, $script:SutApiBase)
         foreach ($id in $script:AcOrder) {
             Invoke-ForAc -AcId $id | Out-Null
         }
         $summaryPath = Write-AcsSummary
-        Cleanup-Fa6Assets
+        if ($script:ProbeFamily -eq 'FA7') { Remove-Fa7Assets } else { Cleanup-Fa6Assets }
         $selfCheckPass = Invoke-SelfCheck
         $greenLog = Write-GreenLog -SelfCheckPass $selfCheckPass -SummaryPath $summaryPath
         Write-Host ("SUMMARY " + $summaryPath)
@@ -1431,6 +2119,7 @@ try {
     Initialize-SutContext
     Invoke-ForAc -AcId $AcId | Out-Null
     if ($AcId -like 'AC-R06-*') { Cleanup-Fa6Assets }
+    if ($script:ProbeFamily -eq 'FA7') { Remove-Fa7Assets }
     if ($script:InfraFailure) { exit 1 }
     exit 0
 }
