@@ -222,24 +222,27 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	p6SeedHumanRequest(t, pool, 6004, 1001, "conflict", "pending", "账号冲突", base.Add(4*time.Hour))
 	p6SeedHumanRequest(t, pool, 6005, 1001, "other", "pending", "", base.Add(1*time.Hour))
 	p6SeedHumanRequest(t, pool, 6006, 1001, "login_takeover", "answered", "已处理", base.Add(6*time.Hour))
+	p6SeedHumanRequest(t, pool, 6007, 1001, "approval", "pending", "发布确认", base.Add(5*time.Hour))
 	p6SeedHumanRequest(t, pool, 6011, 1002, "blocked_recovery", "pending", "恢复执行", base)
 
 	rows, err := reader.ListOpenHumanRequests(ctx, true, 10)
 	if err != nil {
 		t.Fatalf("ListOpenHumanRequests admin: %v", err)
 	}
-	// Execution todos are login_takeover/blocked_recovery only: structured
-	// clarification_question rows have their own version list, and the legacy
-	// conflict/other kinds are no longer execution todos.
-	if len(rows) != 3 {
-		t.Fatalf("rows = %d, want 3 open execution todo rows: %#v", len(rows), rows)
+	// Execution todos are login_takeover, approval, blocked_recovery and
+	// conflict (W2-2): structured clarification_question rows have their own
+	// version list, and the legacy other kind is not an execution todo.
+	if len(rows) != 5 {
+		t.Fatalf("rows = %d, want 5 open execution todo rows: %#v", len(rows), rows)
 	}
-	if rows[0].ID != 6001 || rows[1].ID != 6002 || rows[2].ID != 6011 {
-		t.Fatalf("ids = %d,%d,%d, want takeover first then created_at DESC",
-			rows[0].ID, rows[1].ID, rows[2].ID)
+	if rows[0].ID != 6001 || rows[1].ID != 6007 || rows[2].ID != 6004 || rows[3].ID != 6002 || rows[4].ID != 6011 {
+		t.Fatalf("ids = %d,%d,%d,%d,%d, want takeover first then created_at DESC",
+			rows[0].ID, rows[1].ID, rows[2].ID, rows[3].ID, rows[4].ID)
 	}
 	for _, row := range rows {
-		if row.Kind != "login_takeover" && row.Kind != "blocked_recovery" {
+		switch row.Kind {
+		case "login_takeover", "approval", "blocked_recovery", "conflict":
+		default:
 			t.Fatalf("execution todo leaked kind %q: %#v", row.Kind, row)
 		}
 	}
@@ -249,11 +252,17 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	if rows[0].ExpiresAt == nil || !rows[0].ExpiresAt.Equal(base.Add(3*time.Hour).Add(30*time.Minute)) {
 		t.Fatalf("expires_at = %v", rows[0].ExpiresAt)
 	}
-	if rows[1].Kind != "blocked_recovery" || rows[1].Title != "阻塞恢复" {
-		t.Fatalf("blocked recovery row = %#v, want the kind fallback title", rows[1])
+	if rows[1].Kind != "approval" || rows[1].Title != "发布确认" {
+		t.Fatalf("approval row = %#v, want the reason title", rows[1])
 	}
-	if rows[2].Title != "恢复执行" {
-		t.Fatalf("blocked recovery reason title = %q", rows[2].Title)
+	if rows[2].Kind != "conflict" || rows[2].Title != "账号冲突" {
+		t.Fatalf("conflict row = %#v, want the reason title", rows[2])
+	}
+	if rows[3].Kind != "blocked_recovery" || rows[3].Title != "阻塞恢复" {
+		t.Fatalf("blocked recovery row = %#v, want the kind fallback title", rows[3])
+	}
+	if rows[4].Title != "恢复执行" {
+		t.Fatalf("blocked recovery reason title = %q", rows[4].Title)
 	}
 	if rows[0].VersionTitle != "" {
 		t.Fatalf("version_title = %q, want empty (owned by the version context)", rows[0].VersionTitle)
@@ -263,11 +272,13 @@ func TestP6ExecutionQueryReaderListOpenHumanRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOpenHumanRequests member: %v", err)
 	}
-	if len(memberRows) != 2 {
-		t.Fatalf("rows = %d, want 2 non-takeover execution todo rows", len(memberRows))
+	if len(memberRows) != 4 {
+		t.Fatalf("rows = %d, want 4 non-takeover execution todo rows", len(memberRows))
 	}
 	for _, row := range memberRows {
-		if row.Kind != "blocked_recovery" {
+		switch row.Kind {
+		case "approval", "blocked_recovery", "conflict":
+		default:
 			t.Fatalf("non-admin read leaked %#v", row)
 		}
 	}

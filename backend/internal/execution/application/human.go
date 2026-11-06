@@ -30,6 +30,14 @@ type HumanService struct {
 	events    EventPublisher
 	audit     AuditRecorder
 	timeout   time.Duration
+	stages    StageUnblocker
+}
+
+// StageUnblocker is the narrow version-stage port of blocked_recovery decisions:
+// approving one asks the version context to leave the blocked stage. It is
+// optional so the decision path stays nil-safe in degraded assemblies.
+type StageUnblocker interface {
+	Unblock(ctx context.Context, versionID int64) error
 }
 
 // HumanServiceDeps wires the human takeover service. timeout overrides the
@@ -46,6 +54,7 @@ type HumanServiceDeps struct {
 	Events    EventPublisher
 	Audit     AuditRecorder
 	Timeout   time.Duration
+	Stages    StageUnblocker
 }
 
 // NewHumanService builds the human takeover service.
@@ -62,22 +71,100 @@ func NewHumanService(deps HumanServiceDeps) *HumanService {
 		events:    deps.Events,
 		audit:     deps.Audit,
 		timeout:   deps.Timeout,
+		stages:    deps.Stages,
 	}
+}
+
+// SetStageUnblocker wires the version stage port after the composition root has
+// built the version StageService (it is constructed later than this service).
+// A nil port keeps blocked_recovery approval a recorded decision.
+func (s *HumanService) SetStageUnblocker(port StageUnblocker) {
+	if s == nil {
+		return
+	}
+	s.stages = port
 }
 
 // HumanCreateInput is the application input of one human request.
 type HumanCreateInput struct {
-	VersionID     int64
-	CaseRunID     int64
-	WaveID        int64
-	DispatchEpoch int64
-	DispatchToken string
-	Kind          string
-	Reason        string
-	VersionSUTID  *int64
-	AccountRole   string
-	ChallengeKind string
-	ActorID       int64
+	VersionID      int64
+	CaseRunID      int64
+	WaveID         int64
+	DispatchEpoch  int64
+	DispatchToken  string
+	ConversationID int64
+	MessageID      int64
+	Kind           string
+	Reason         string
+	VersionSUTID   *int64
+	AccountRole    string
+	ChallengeKind  string
+	ActorID        int64
+}
+
+// CreateRequest creates one version-level approval/blocked_recovery/conflict
+// decision request (R-W2-1). It never requires a case_run, never pauses the
+// case/wave and never gates the stage machine: the request is only a recorded
+// human decision. The caller supplies the version; conversation/message are
+// optional logical hints for the UI card.
+func (s *HumanService) CreateRequest(ctx context.Context, in HumanCreateInput) (execution.HumanRequest, error) {
+	if s == nil || s.humans == nil {
+		return execution.HumanRequest{}, fmt.Errorf("human service repository is not configured")
+	}
+	if err := requirePositiveID("version_id", in.VersionID); err != nil {
+		return execution.HumanRequest{}, err
+	}
+	kind := execution.HumanKind(strings.TrimSpace(in.Kind))
+	if !kind.IsDecision() {
+		return execution.HumanRequest{}, platform.Invalid("kind", "must be one of approval, blocked_recovery, conflict")
+	}
+	reason := strings.TrimSpace(in.Reason)
+	if reason == "" {
+		return execution.HumanRequest{}, platform.Invalid("reason", "must not be empty")
+	}
+	if len(reason) > execution.MaxHumanDecisionReasonLength {
+		return execution.HumanRequest{}, platform.Invalid("reason", "must be at most 2000 characters")
+	}
+	if s.ids == nil {
+		return execution.HumanRequest{}, fmt.Errorf("human id generator is not configured")
+	}
+	now := s.now()
+	var conversationID, messageID *int64
+	if in.ConversationID > 0 {
+		value := in.ConversationID
+		conversationID = &value
+	}
+	if in.MessageID > 0 {
+		value := in.MessageID
+		messageID = &value
+	}
+	request := execution.HumanRequest{
+		ID:             s.ids.Next(),
+		VersionID:      in.VersionID,
+		ConversationID: conversationID,
+		MessageID:      messageID,
+		Kind:           kind,
+		Payload:        map[string]any{execution.HumanPayloadReason: reason},
+		Status:         execution.HumanPending,
+		ExpiresAt:      now.Add(s.decisionTimeout(ctx)),
+		CreatedBy:      actorPtr(in.ActorID),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := s.humans.Create(ctx, request); err != nil {
+		return execution.HumanRequest{}, mapExecutionError(err, "human_request")
+	}
+	title := humanDecisionTitle(kind, reason)
+	s.publish(ctx, EventApprovalRequested, request, in.ActorID, map[string]any{
+		"human_request_id": platformid.Format(request.ID),
+		"kind":             string(kind),
+		"version_id":       platformid.Format(request.VersionID),
+		"title":            title,
+		"reason":           reason,
+		"actor":            platformid.Format(in.ActorID),
+	})
+	s.record(ctx, "approval.requested", request, in.ActorID)
+	return request, nil
 }
 
 // CreateFromTool implements the CaseRunner HumanRequestService port.
@@ -246,9 +333,25 @@ func (s *HumanService) Resolve(ctx context.Context, humanRequestID, actorID int6
 	if request.Status != execution.HumanPending {
 		return execution.HumanRequest{}, platform.StateConflict("the human request is not pending")
 	}
-	normalized, err := normalizeHumanResponse(response)
+	decisionKind := request.Kind.IsDecision()
+	var normalized map[string]any
+	if decisionKind {
+		normalized, err = normalizeHumanDecision(response)
+	} else {
+		normalized, err = normalizeHumanResponse(response)
+	}
 	if err != nil {
 		return execution.HumanRequest{}, err
+	}
+	// Approving a blocked_recovery request asks the version stage to leave the
+	// blocked stage. The call happens before the state write so a gate failure
+	// (blocker not cleared) leaves the request pending and retryable; the port is
+	// nil-safe for degraded assemblies and never changes stage semantics.
+	if decisionKind && request.Kind == execution.HumanBlockedRecovery &&
+		normalized[execution.HumanResponseDecision] == execution.HumanDecisionApproved && s.stages != nil {
+		if err := s.stages.Unblock(ctx, request.VersionID); err != nil {
+			return execution.HumanRequest{}, err
+		}
 	}
 	now := s.now()
 	changed, err := s.humans.Transition(ctx, humanRequestID, execution.HumanPending, execution.HumanAnswered, normalized, actorID, now, nil)
@@ -258,7 +361,7 @@ func (s *HumanService) Resolve(ctx context.Context, humanRequestID, actorID int6
 	if !changed {
 		return execution.HumanRequest{}, platform.StateConflict("the human request is not pending")
 	}
-	if request.CaseRunID != nil {
+	if !decisionKind && request.CaseRunID != nil {
 		if err := s.resumeCaseRun(ctx, *request.CaseRunID, actorID); err != nil {
 			return execution.HumanRequest{}, err
 		}
@@ -266,6 +369,20 @@ func (s *HumanService) Resolve(ctx context.Context, humanRequestID, actorID int6
 	request, err = s.humans.Get(ctx, humanRequestID)
 	if err != nil {
 		return execution.HumanRequest{}, mapExecutionError(err, "human_request")
+	}
+	if decisionKind {
+		decision, _ := request.Response[execution.HumanResponseDecision].(string)
+		reason, _ := request.Response[execution.HumanResponseReason].(string)
+		s.publish(ctx, EventApprovalDecided, request, actorID, map[string]any{
+			"human_request_id": platformid.Format(request.ID),
+			"kind":             string(request.Kind),
+			"version_id":       platformid.Format(request.VersionID),
+			"decision":         decision,
+			"reason":           reason,
+			"actor":            platformid.Format(actorID),
+		})
+		s.record(ctx, "approval.decided", request, actorID)
+		return request, nil
 	}
 	publishEvent(ctx, s.events, EventHumanResolved, request.VersionID,
 		map[string]any{
@@ -350,6 +467,7 @@ func (s *HumanService) Expire(ctx context.Context, now time.Time) (int, error) {
 			map[string]any{
 				"human_request_id": platformid.Format(request.ID),
 				"case_run_id":      platformid.Format(derefID(request.CaseRunID)),
+				"kind":             string(request.Kind),
 			}, nil)
 		s.record(ctx, "human_request.expired", request, 0)
 	}
@@ -503,6 +621,84 @@ func (s *HumanService) requestTimeout(ctx context.Context) time.Duration {
 		return fallback
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// decisionTimeout resolves the decision-request expiry. The 24h
+// question.timeout_seconds setting is the single source of truth (R-W2-1); an
+// absent/zero setting falls back to the same 24h default.
+func (s *HumanService) decisionTimeout(ctx context.Context) time.Duration {
+	if s.settings == nil {
+		return execution.DefaultQuestionTimeout
+	}
+	seconds, err := s.settings.Int(ctx, "question.timeout_seconds")
+	if err != nil || seconds <= 0 {
+		return execution.DefaultQuestionTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// normalizeHumanDecision validates the decision vocabulary of a version-level
+// request: approved|rejected plus an optional reason; a rejection must carry a
+// reason because it is the only record of why the request was refused.
+func normalizeHumanDecision(response map[string]any) (map[string]any, error) {
+	raw, ok := response[execution.HumanResponseDecision]
+	if !ok || raw == nil {
+		return nil, platform.Invalid("response.decision", "must be approved or rejected")
+	}
+	text, ok := raw.(string)
+	if !ok {
+		return nil, platform.Invalid("response.decision", "must be approved or rejected")
+	}
+	decision := strings.TrimSpace(text)
+	if decision != execution.HumanDecisionApproved && decision != execution.HumanDecisionRejected {
+		return nil, platform.Invalid("response.decision", "must be approved or rejected")
+	}
+	normalized := map[string]any{execution.HumanResponseDecision: decision}
+	reason := ""
+	if rawReason, exists := response[execution.HumanResponseReason]; exists && rawReason != nil {
+		text, ok := rawReason.(string)
+		if !ok {
+			return nil, platform.Invalid("response.reason", "must be a string")
+		}
+		reason = strings.TrimSpace(text)
+	}
+	if len(reason) > execution.MaxHumanDecisionReasonLength {
+		return nil, platform.Invalid("response.reason", "must be at most 2000 characters")
+	}
+	if decision == execution.HumanDecisionRejected && reason == "" {
+		return nil, platform.Invalid("response.reason", "is required when rejecting a request")
+	}
+	if reason != "" {
+		normalized[execution.HumanResponseReason] = reason
+	}
+	return normalized, nil
+}
+
+// humanDecisionTitle is the event/todo title: the reason, falling back to the
+// kind label when the reason is empty.
+func humanDecisionTitle(kind execution.HumanKind, reason string) string {
+	if reason = strings.TrimSpace(reason); reason != "" {
+		return reason
+	}
+	switch kind {
+	case execution.HumanApproval:
+		return "审批"
+	case execution.HumanBlockedRecovery:
+		return "阻塞恢复"
+	case execution.HumanConflict:
+		return "冲突处理"
+	default:
+		return "人工请求"
+	}
+}
+
+// publish sends one human-request event to the version channel.
+func (s *HumanService) publish(ctx context.Context, eventType string, request execution.HumanRequest, actorID int64, payload map[string]any) {
+	scope := map[string]any{
+		"human_request_id": platformid.Format(request.ID),
+		"kind":             string(request.Kind),
+	}
+	publishEvent(ctx, s.events, eventType, request.VersionID, scope, payload, actorPtr(actorID))
 }
 
 func normalizeHumanResponse(response map[string]any) (map[string]any, error) {
@@ -792,9 +988,11 @@ func (s *QuestionService) Get(ctx context.Context, versionID, questionID int64) 
 	return s.expireIfOverdue(ctx, request)
 }
 
-// List returns one page of the version's questions, optionally filtered by
-// status. Overdue pending questions are expired before the read (R-B3-4 lazy
-// expiry) and each transition emits question.expired.
+// List returns one page of the version's question todo (clarification_question
+// plus the v0.22 approval/blocked_recovery/conflict decision requests),
+// optionally filtered by status. Overdue pending questions are expired before
+// the read (R-B3-4 lazy expiry) and each transition emits question.expired;
+// decision requests are expired by the human sweep instead.
 func (s *QuestionService) List(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error) {
 	if err := requirePositiveID("version_id", versionID); err != nil {
 		return nil, false, err
@@ -1208,6 +1406,12 @@ func (s *QuestionService) expireOverdueForVersion(ctx context.Context, versionID
 		return mapExecutionError(err, "question")
 	}
 	for _, request := range pending {
+		// The todo read also returns decision requests, but their 24h expiry is
+		// the human sweep's job (approval.requested has no question.expired
+		// semantics).
+		if request.Kind != execution.HumanClarificationQuestion {
+			continue
+		}
 		if request.ExpiresAt.IsZero() || s.now().Before(request.ExpiresAt) {
 			continue
 		}

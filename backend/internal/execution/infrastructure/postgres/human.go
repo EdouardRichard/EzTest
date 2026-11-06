@@ -98,13 +98,16 @@ func (r *HumanRequestRepository) ListByVersion(ctx context.Context, versionID in
 }
 
 // ListQuestions returns one descending-ID page of the version's structured
-// questions, optionally filtered by status. Login-takeover execution requests
-// are excluded from the question read surface.
+// questions plus the v0.22 version-level decision requests (approval/
+// blocked_recovery/conflict, R-W2-1), optionally filtered by status.
+// Login-takeover execution requests are excluded from the question read
+// surface.
 func (r *HumanRequestRepository) ListQuestions(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error) {
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+humanRequestColumns+` FROM human_request
-		WHERE version_id = $1 AND kind = 'clarification_question'
+		WHERE version_id = $1
+		  AND kind IN ('clarification_question', 'approval', 'blocked_recovery', 'conflict')
 		  AND ($2 = '' OR status = $2) AND ($3::BIGINT IS NULL OR id < $3)
 		ORDER BY id DESC LIMIT $4
 	`, versionID, status, beforeID, fetchLimit(limit))
@@ -204,14 +207,17 @@ func (r *HumanRequestRepository) AttachMessage(ctx context.Context, id, messageI
 	return r.existsOrNotFound(ctx, "human_request", id, "attach human request message")
 }
 
-// Expire marks every overdue pending login_takeover request as expired and
+// Expire marks every overdue pending human request (login takeover plus the
+// v0.22 approval/blocked_recovery/conflict decision kinds) as expired and
 // returns the affected rows. Structured questions have their own sweep so the
 // question.expired event and audit stay correct.
 func (r *HumanRequestRepository) Expire(ctx context.Context, now time.Time) ([]execution.HumanRequest, error) {
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
 		UPDATE human_request SET status = 'expired', updated_at = now()
-		WHERE status = 'pending' AND kind = 'login_takeover' AND expires_at < $1
+		WHERE status = 'pending'
+		  AND kind IN ('login_takeover', 'approval', 'blocked_recovery', 'conflict')
+		  AND expires_at < $1
 		RETURNING `+humanRequestColumns+`
 	`, now)
 	if err != nil {

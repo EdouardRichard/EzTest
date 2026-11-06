@@ -253,6 +253,12 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "human_request.expired":
           handlersRef.current.onHumanRequestChanged?.(event)
           break
+        case "approval.requested":
+        case "approval.decided":
+          // W2-2 R-W2-1: the version-level approval/blocked_recovery/conflict
+          // request changed; the human-request banner and todo refetch.
+          handlersRef.current.onHumanRequestChanged?.(event)
+          break
         case "execution.intent_created":
         case "execution.intent_cancelled":
         case "execution.intent_superseded":

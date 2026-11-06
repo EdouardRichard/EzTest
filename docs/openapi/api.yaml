@@ -298,6 +298,24 @@ info:
       100 行上限时 has_more=true）。
     - `resource.delta` / `version.scope.snapshot_created` 的前端 SSE 消费属 W1-14B。
 
+    ## v0.22 W2-2 增量（human request decisions，additive）
+
+    R-W2-1 / API-43（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§6）：
+    - `POST /api/versions/{id}/human-requests`（admin/版本编辑；Host 工具内部同路径）创建
+      `approval|blocked_recovery|conflict` 版本级请求，body `{kind,reason,conversation_id?,message_id?}`；
+      不要求 case_run，不暂停执行、不阻塞阶段。返回 201 + `HumanRequestView`。
+    - 决策复用既有 `POST /api/human-requests/{id}/resolve`，response
+      `{decision:"approved"|"rejected",reason}`；写入 `human_request.response` JSONB。
+      `blocked_recovery` approve 调用版本 `StageService.Unblock`；reject 保持 blocked 并记录 reason；
+      `conflict` 只记录决策，不改 fact。
+    - `GET /api/versions/{id}/questions?status=` 的待办扩展到 approval/blocked_recovery/conflict
+      （`QuestionView.kind` 为对应 kind，`questions` 为空数组，`decision/reason` 回显决策）。
+    - 新事件（版本频道 `version:{id}`）：
+      `approval.requested`：`{human_request_id,kind,version_id,title,reason,actor}`；
+      `approval.decided`：`{human_request_id,kind,version_id,decision,reason,actor}`。
+    - 超时：leader-gated 定时 sweep 按 `question.timeout_seconds`（24h）把 pending 置 `expired`
+      并发 `human_request.expired`；不阻塞阶段。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -4351,6 +4369,41 @@ paths:
                         type: array
                         items:
                           $ref: '#/components/schemas/HumanRequestView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [HumanRequests]
+      operationId: createHumanRequest
+      summary: 创建版本级人机决策请求（approval/blocked_recovery/conflict）
+      description: |
+        v0.22 R-W2-1 / API-43。admin/版本编辑创建版本级 decision 请求，不要求 case_run，
+        不暂停 case_run/wave，不阻塞阶段。`blocked_recovery` approve 由 resolve 调用版本
+        `Unblock`；`conflict` 只记录决策。创建发布 `approval.requested`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateHumanRequestRequest'
+      responses:
+        '201':
+          description: 已创建的人机决策请求
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HumanRequestView'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -13215,10 +13268,16 @@ components:
           pattern: '^[0-9]+$'
     HumanRequestResponseView:
       type: object
-      description: P3 只回显 note 摘要，不回显一次性 code/密码
+      description: P3 只回显 note 摘要，不回显一次性 code/密码；v0.22 decision 请求回显 decision/reason
       properties:
         note:
           type: string
+        decision:
+          type: string
+          enum: [approved, rejected]
+        reason:
+          type: string
+          maxLength: 2000
     HumanRequestView:
       type: object
       required: [id, version_id, case_run_id, kind, status, payload, expires_at, response, resolved_by, resolved_at, created_at]
@@ -13235,10 +13294,10 @@ components:
           pattern: '^[0-9]+$'
         kind:
           type: string
-          enum: [login_takeover, conflict, other]
+          enum: [clarification_question, approval, blocked_recovery, login_takeover, conflict, other]
         status:
           type: string
-          enum: [open, resolved, cancelled, expired]
+          enum: [pending, answered, cancelled, expired]
         payload:
           $ref: '#/components/schemas/HumanRequestPayload'
         expires_at:
@@ -13336,6 +13395,14 @@ components:
             note:
               type: string
               maxLength: 2000
+            decision:
+              type: string
+              enum: [approved, rejected]
+              description: approval/blocked_recovery/conflict 决策
+            reason:
+              type: string
+              maxLength: 2000
+              description: 决策原因；rejected 时必填
 
     # -------------------------------------------------------------------------
     # P4 delivery/chain schemas (frozen, 2026-11-01)
@@ -17599,7 +17666,7 @@ components:
         text: {type: string}
     QuestionView:
       type: object
-      required: [id, version_id, conversation_id, message_id, kind, status, batch_id, questions, expires_at, answers, answered_by, answered_at, skipped, created_at]
+      required: [id, version_id, conversation_id, message_id, kind, status, batch_id, questions, expires_at, answers, answered_by, answered_at, skipped, decision, reason, created_at]
       properties:
         id: {type: string, pattern: '^[0-9]+$'}
         version_id: {type: string, pattern: '^[0-9]+$'}
@@ -17608,12 +17675,14 @@ components:
         kind: {type: string}
         status: {type: string, enum: [pending, answered, expired, cancelled]}
         batch_id: {type: string}
-        questions: {type: array, minItems: 1, maxItems: 5, items: {$ref: '#/components/schemas/QuestionItemView'}}
+        questions: {type: array, minItems: 0, maxItems: 5, items: {$ref: '#/components/schemas/QuestionItemView'}}
         expires_at: {type: string, format: date-time}
         answers: {type: array, items: {$ref: '#/components/schemas/QuestionAnswerView'}}
         answered_by: {type: string, pattern: '^[0-9]+$', nullable: true}
         answered_at: {type: string, format: date-time, nullable: true}
         skipped: {type: boolean}
+        decision: {type: string, enum: [approved, rejected, '']}
+        reason: {type: string, maxLength: 2000}
         created_at: {type: string, format: date-time}
     CreateQuestionRequest:
       type: object
@@ -17643,6 +17712,25 @@ components:
               allow_free_text: {type: boolean}
               required: {type: boolean}
               source_refs: {type: array, items: {type: string}}
+    CreateHumanRequestRequest:
+      type: object
+      required: [kind, reason]
+      properties:
+        kind:
+          type: string
+          enum: [approval, blocked_recovery, conflict]
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        conversation_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        message_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
     AnswerQuestionRequest:
       type: object
       required: [answers]

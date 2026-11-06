@@ -109,7 +109,13 @@ func (r *handlerQuestionRepo) ListQuestions(_ context.Context, versionID int64, 
 	defer r.mu.Unlock()
 	items := make([]execution.HumanRequest, 0)
 	for _, request := range r.byID {
-		if request.VersionID != versionID || request.Kind != execution.HumanClarificationQuestion {
+		if request.VersionID != versionID {
+			continue
+		}
+		switch request.Kind {
+		case execution.HumanClarificationQuestion, execution.HumanApproval,
+			execution.HumanBlockedRecovery, execution.HumanConflict:
+		default:
 			continue
 		}
 		if status != "" && string(request.Status) != status {

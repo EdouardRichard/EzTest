@@ -36,6 +36,9 @@ const (
 	EventQuestionExpired   = "question.expired"
 	EventQuestionReopened  = "question.reopened"
 	EventQuestionSkipped   = "question.skipped"
+	// v0.22 R-W2-1 version-level decision requests.
+	EventApprovalRequested = "approval.requested"
+	EventApprovalDecided   = "approval.decided"
 	EventFailureCandidate  = "execution.failure_candidate"
 	EventCoverageGap       = "execution.coverage_gap"
 )

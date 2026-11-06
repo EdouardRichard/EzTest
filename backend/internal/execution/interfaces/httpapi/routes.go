@@ -2,11 +2,11 @@ package httpapi
 
 import "net/http"
 
-// Register mounts the execution paths (28 path items / 30 operations as of
-// W1-13) defined by spec §9.2, the v0.22 B §6 question routes and the v0.22
-// R-EX-4 wave scope-snapshot read on the shared mux. Every execution operation
-// is available to any logged-in user; executor administration additionally
-// requires the admin guard.
+// Register mounts the execution paths (28 path items / 31 operations as of
+// W2-2) defined by spec §9.2, the v0.22 B §6 question routes, the v0.22 R-W2-1
+// human decision producer and the v0.22 R-EX-4 wave scope-snapshot read on the
+// shared mux. Every execution operation is available to any logged-in user;
+// executor administration additionally requires the admin guard.
 func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler) {
 	// Overview / intents.
 	mux.Handle("GET /api/versions/{id}/execution/overview", authenticated(http.HandlerFunc(h.Overview)))
@@ -40,8 +40,10 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("GET /api/versions/{id}/evidence/{evidenceId}", authenticated(http.HandlerFunc(h.GetEvidence)))
 	mux.Handle("GET /api/versions/{id}/evidence/{evidenceId}/content", authenticated(http.HandlerFunc(h.DownloadEvidence)))
 
-	// Human takeover requests.
+	// Human takeover requests plus the v0.22 version-level decision producer
+	// (approval/blocked_recovery/conflict, R-W2-1/API-43).
 	mux.Handle("GET /api/versions/{id}/human-requests", authenticated(http.HandlerFunc(h.ListHumanRequests)))
+	mux.Handle("POST /api/versions/{id}/human-requests", authenticated(http.HandlerFunc(h.CreateHumanRequest)))
 	mux.Handle("POST /api/human-requests/{humanRequestId}/resolve", authenticated(http.HandlerFunc(h.ResolveHumanRequest)))
 	mux.Handle("POST /api/human-requests/{humanRequestId}/cancel", authenticated(http.HandlerFunc(h.CancelHumanRequest)))
 

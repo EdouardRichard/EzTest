@@ -83,13 +83,20 @@ func (s *fakeHumanStore) ListOpen(_ context.Context) ([]execution.HumanRequest, 
 	return items, nil
 }
 
-// ListQuestions implements the structured-question read surface.
+// ListQuestions implements the structured-question read surface plus the
+// version-level decision todo rows.
 func (s *fakeHumanStore) ListQuestions(_ context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items := make([]execution.HumanRequest, 0)
 	for _, request := range s.byID {
-		if request.VersionID != versionID || request.Kind != execution.HumanClarificationQuestion {
+		if request.VersionID != versionID {
+			continue
+		}
+		switch request.Kind {
+		case execution.HumanClarificationQuestion, execution.HumanApproval,
+			execution.HumanBlockedRecovery, execution.HumanConflict:
+		default:
 			continue
 		}
 		if status != "" && string(request.Status) != status {
@@ -186,8 +193,15 @@ func (s *fakeHumanStore) Expire(_ context.Context, now time.Time) ([]execution.H
 	defer s.mu.Unlock()
 	expired := make([]execution.HumanRequest, 0)
 	for id, request := range s.byID {
-		if request.Kind != execution.HumanLoginTakeover || request.Status != execution.HumanPending ||
-			!request.ExpiresAt.Before(now) {
+		if request.Status != execution.HumanPending || !request.ExpiresAt.Before(now) {
+			continue
+		}
+		// The human sweep covers login_takeover plus the W2 decision kinds;
+		// structured questions have their own ExpireQuestions sweep.
+		switch request.Kind {
+		case execution.HumanLoginTakeover, execution.HumanApproval,
+			execution.HumanBlockedRecovery, execution.HumanConflict:
+		default:
 			continue
 		}
 		request.Status = execution.HumanExpired

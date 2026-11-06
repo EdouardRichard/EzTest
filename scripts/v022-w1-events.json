@@ -25,6 +25,18 @@
       "channel": "version:N"
     },
     {
+      "type": "approval.decided",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:257",
+      "channel": "version:N"
+    },
+    {
+      "type": "approval.requested",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:256",
+      "channel": "version:N"
+    },
+    {
       "type": "attachment.image.analyzed",
       "consumer": "ui",
       "evidence": "frontend/src/features/clarification/useVersionEvents.ts:202",

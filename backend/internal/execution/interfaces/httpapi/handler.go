@@ -917,6 +917,49 @@ func (h *Handler) ListHumanRequests(w http.ResponseWriter, r *http.Request) {
 	httpx.List(w, http.StatusOK, items, nextCursor(hasMore, len(requests), lastID), hasMore)
 }
 
+// CreateHumanRequest POST /api/versions/{id}/human-requests. It creates one
+// version-level approval/blocked_recovery/conflict request (R-W2-1/API-43);
+// decisions use the existing POST /api/human-requests/{id}/resolve route.
+func (h *Handler) CreateHumanRequest(w http.ResponseWriter, r *http.Request) {
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := h.versionID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	if err := h.requireVersion(ctx, versionID); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.HumanService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "human service is not configured"))
+		return
+	}
+	var body createHumanRequestRequest
+	if err := decodeStrictBody(w, r, &body); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	input, err := body.parse()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	input.VersionID = versionID
+	input.ActorID = actorID
+	request, err := h.deps.HumanService.CreateRequest(ctx, input)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, toHumanRequestView(request))
+}
+
 // ResolveHumanRequest POST /api/human-requests/{humanRequestId}/resolve.
 func (h *Handler) ResolveHumanRequest(w http.ResponseWriter, r *http.Request) {
 	actorID, err := requireActor(r)

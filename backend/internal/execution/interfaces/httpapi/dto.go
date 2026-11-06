@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/pagination"
@@ -96,12 +97,16 @@ type resolveHumanRequestRequest struct {
 }
 
 type humanResponseInput struct {
-	Code *string `json:"code"`
-	Note *string `json:"note"`
+	Code     *string `json:"code"`
+	Note     *string `json:"note"`
+	Decision *string `json:"decision"`
+	Reason   *string `json:"reason"`
 }
 
 // parse normalizes the one-time response. Unknown keys are rejected by the
-// strict decoder; code/note are trimmed and bounded.
+// strict decoder; code/note/decision/reason are trimmed and bounded. The
+// decision vocabulary and the rejection reason requirement are validated by the
+// execution application service.
 func (r resolveHumanRequestRequest) parse() (map[string]any, error) {
 	if r.Response == nil {
 		return nil, platform.Invalid("response", "response is required")
@@ -121,7 +126,56 @@ func (r resolveHumanRequestRequest) parse() (map[string]any, error) {
 		}
 		response[execution.HumanResponseNote] = note
 	}
+	if r.Response.Decision != nil {
+		decision := strings.TrimSpace(*r.Response.Decision)
+		if decision == "" {
+			return nil, platform.Invalid("response.decision", "must be approved or rejected")
+		}
+		response[execution.HumanResponseDecision] = decision
+	}
+	if r.Response.Reason != nil {
+		reason := strings.TrimSpace(*r.Response.Reason)
+		if len(reason) > 2000 {
+			return nil, platform.Invalid("response.reason", "must be at most 2000 characters")
+		}
+		response[execution.HumanResponseReason] = reason
+	}
 	return response, nil
+}
+
+// createHumanRequestRequest is POST /versions/{id}/human-requests: the
+// version-level approval/blocked_recovery/conflict producer (R-W2-1/API-43).
+// The version identity is never part of the body; conversation/message are
+// optional logical hints of the UI card.
+type createHumanRequestRequest struct {
+	Kind           string  `json:"kind"`
+	Reason         string  `json:"reason"`
+	ConversationID *string `json:"conversation_id"`
+	MessageID      *string `json:"message_id"`
+}
+
+// parse converts the transport shape into the application input. Kind/reason
+// semantics stay in the application service; only decimal IDs are parsed here.
+func (r createHumanRequestRequest) parse() (executionapp.HumanCreateInput, error) {
+	input := executionapp.HumanCreateInput{
+		Kind:   strings.TrimSpace(r.Kind),
+		Reason: strings.TrimSpace(r.Reason),
+	}
+	if r.ConversationID != nil && strings.TrimSpace(*r.ConversationID) != "" {
+		value, err := parsePositiveIDField("conversation_id", *r.ConversationID)
+		if err != nil {
+			return input, err
+		}
+		input.ConversationID = value
+	}
+	if r.MessageID != nil && strings.TrimSpace(*r.MessageID) != "" {
+		value, err := parsePositiveIDField("message_id", *r.MessageID)
+		if err != nil {
+			return input, err
+		}
+		input.MessageID = value
+	}
+	return input, nil
 }
 
 // pageParams parses the shared before/limit pagination (spec §9.1).

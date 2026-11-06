@@ -41,9 +41,10 @@ type TodoHit struct {
 }
 
 // HumanRequestRow is one open human_request row returned by the P6 read
-// source. The execution todo feed only contains pending login_takeover and
-// blocked_recovery rows: clarification_question/approval are version todos
-// (W2) and conflict/other are legacy, so none of them are execution todos.
+// source. The execution todo feed contains pending login_takeover plus the
+// v0.22 approval/blocked_recovery/conflict decision kinds; clarification_question
+// rows have their own version todo (W2) and the legacy other kind is not an
+// execution todo.
 type HumanRequestRow struct {
 	ID           int64
 	Kind         string

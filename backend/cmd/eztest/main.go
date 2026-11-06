@@ -920,6 +920,64 @@ func runExecutorPoller(ctx context.Context, gate orchestrationapp.LeaderGate, re
 	}
 }
 
+// humanExpiryInterval is how often the leader sweeps overdue human requests.
+// It is much shorter than the 24h question timeout so an expiry is observable
+// well inside one timeout window.
+const humanExpiryInterval = time.Minute
+
+// runHumanQuestionExpiryWorker is the leader-gated timeout sweep of R-W2-1:
+// overdue structured questions expire through question.timeout_seconds and
+// overdue approval/blocked_recovery/conflict requests expire through the same
+// 24h setting. It only touches human_request rows and never stage/case_run/wave
+// state, so it cannot block the stage machine. A follower does nothing and
+// leadership is re-checked on every tick; a nil service is a no-op.
+func runHumanQuestionExpiryWorker(
+	ctx context.Context,
+	gate orchestrationapp.LeaderGate,
+	questions *executionapp.QuestionService,
+	humans *executionapp.HumanService,
+	interval time.Duration,
+) {
+	if questions == nil && humans == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = humanExpiryInterval
+	}
+	sweep := func() {
+		p7RunGated(gate, func() {
+			now := time.Now().UTC()
+			if questions != nil {
+				count, err := questions.ExpireQuestions(ctx, now)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: question expiry sweep: %v", err)
+				} else if count > 0 {
+					log.Printf("eztest: question expiry sweep: expired=%d", count)
+				}
+			}
+			if humans != nil {
+				count, err := humans.Expire(ctx, now)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: human request expiry sweep: %v", err)
+				} else if count > 0 {
+					log.Printf("eztest: human request expiry sweep: expired=%d", count)
+				}
+			}
+		})
+	}
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1547,6 +1605,10 @@ func main() {
 		Handoff:     handoffSvc,
 	})
 	stageCallbacks.set(stageService)
+	// W2-2 R-W2-1: approving a blocked_recovery human request asks the version
+	// stage to leave the blocked stage. The port is wired here because the stage
+	// service is constructed after the human service.
+	executionHumans.SetStageUnblocker(stageService)
 	// R-B4-1: the automatic forward edges now go through the stage service.
 	designPlanner.SetDesignConverger(stageAdvancer{service: stageService})
 	stageStarter := stageAdvancer{service: stageService}
@@ -1913,6 +1975,13 @@ func main() {
 	go func() {
 		defer background.Done()
 		runExecutorPoller(ctx, p7OrchestrationRuntime.Leader, executorRegistry, settingsSvc)
+	}()
+	// W2-2 R-W2-1: one leader-gated sweep expires overdue question/decision
+	// human requests (question.timeout_seconds). It never blocks the stage.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runHumanQuestionExpiryWorker(ctx, p7OrchestrationRuntime.Leader, executionQuestions, executionHumans, humanExpiryInterval)
 	}()
 	// P9 explore analysis consumer (Task 37, R93): the leader-gated refresh loop
 	// that drives GapAnalysis/Coverage/CaseAugment over the shared explore

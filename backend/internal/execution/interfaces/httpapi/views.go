@@ -243,7 +243,9 @@ type HumanRequestPayloadView struct {
 
 // HumanRequestResponseView never echoes the one-time code (spec §9.3).
 type HumanRequestResponseView struct {
-	Note string `json:"note"`
+	Note     string `json:"note"`
+	Decision string `json:"decision,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // HumanRequestView is the human_request projection (spec §9.3).
@@ -414,8 +416,10 @@ func toHumanRequestView(request execution.HumanRequest) HumanRequestView {
 		ResolvedAt: formatOptionalTime(request.ResolvedAt),
 		CreatedAt:  formatTime(request.CreatedAt),
 	}
-	if note := payloadString(request.Response, execution.HumanResponseNote); note != "" {
-		view.Response = &HumanRequestResponseView{Note: note}
+	if note, decision, reason := payloadString(request.Response, execution.HumanResponseNote),
+		payloadString(request.Response, execution.HumanResponseDecision),
+		payloadString(request.Response, execution.HumanResponseReason); note != "" || decision != "" || reason != "" {
+		view.Response = &HumanRequestResponseView{Note: note, Decision: decision, Reason: reason}
 	}
 	return view
 }
@@ -461,7 +465,11 @@ type QuestionView struct {
 	AnsweredBy     *string              `json:"answered_by"`
 	AnsweredAt     *string              `json:"answered_at"`
 	Skipped        bool                 `json:"skipped"`
-	CreatedAt      string               `json:"created_at"`
+	// Decision/Reason project the v0.22 approval/blocked_recovery/conflict
+	// decision recorded in human_request.response; empty for a plain question.
+	Decision  string `json:"decision"`
+	Reason    string `json:"reason"`
+	CreatedAt string `json:"created_at"`
 }
 
 func toQuestionView(request execution.HumanRequest) QuestionView {
@@ -494,6 +502,8 @@ func toQuestionView(request execution.HumanRequest) QuestionView {
 		Answers:        questionAnswersFromResponse(request.Response),
 		AnsweredBy:     payloadIDString(request.Response, execution.HumanResponseAnsweredBy),
 		Skipped:        payloadBool(request.Response, execution.HumanResponseSkipped),
+		Decision:       payloadString(request.Response, execution.HumanResponseDecision),
+		Reason:         payloadString(request.Response, execution.HumanResponseReason),
 		CreatedAt:      formatTime(request.CreatedAt),
 	}
 	if answeredAt := payloadString(request.Response, execution.HumanResponseAnsweredAt); answeredAt != "" {

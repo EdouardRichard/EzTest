@@ -89,6 +89,28 @@ func (k HumanKind) Valid() bool {
 	}
 }
 
+// IsDecision reports whether the kind is a v0.22 version-level decision request
+// (R-W2-1): approval, blocked_recovery or conflict. Login takeover keeps the
+// code/note response contract and clarification questions own the answer
+// endpoint, so neither is a decision.
+func (k HumanKind) IsDecision() bool {
+	switch k {
+	case HumanApproval, HumanBlockedRecovery, HumanConflict:
+		return true
+	default:
+		return false
+	}
+}
+
+// Decision vocabulary of approval/blocked_recovery/conflict requests (R-W2-1).
+const (
+	HumanDecisionApproved = "approved"
+	HumanDecisionRejected = "rejected"
+)
+
+// MaxHumanDecisionReasonLength bounds the decision reason recorded in response.
+const MaxHumanDecisionReasonLength = 2000
+
 // HumanQuestionOption is one answer option of a structured question.
 type HumanQuestionOption struct {
 	ID    string `json:"id"`
@@ -321,6 +343,8 @@ const (
 	HumanResponseReopenedBy      = "reopened_by"
 	HumanResponseReopenedAt      = "reopened_at"
 	HumanResponseReason          = "reason"
+	// HumanResponseDecision is the approval/blocked_recovery/conflict decision.
+	HumanResponseDecision = "decision"
 )
 
 // Human request verdict reasons written to case_run.summary.
