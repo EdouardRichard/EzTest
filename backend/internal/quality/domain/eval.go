@@ -150,10 +150,12 @@ func ValidateSnapshot(sample SnapshotSample) error {
 
 // EvaluateSnapshot derives the four mode=snapshot metrics from one validated
 // observation. baseline is the previous snapshot of the same version; it only
-// marks regressions (warn-only, never a block). case_coverage counts each
-// requirement as covered by at least one confirmed case version, so extra cases
-// cannot push the ratio above 100%. The status is passed only when all four
-// metrics pass their threshold and none regressed.
+// marks regressions (warn-only, never a block). case_coverage is the confirmed
+// case-version count over the confirmed requirement count with the numerator
+// capped at the denominator (the W2-14 brief: a requirement needs at least one
+// confirmed case, and extra case versions cannot push coverage above 100%). The
+// status is passed only when all four metrics pass their threshold and none
+// regressed.
 func EvaluateSnapshot(sample SnapshotSample, baseline map[string]float64, regressionTolerance float64) (string, []Metric) {
 	if regressionTolerance < 0 {
 		regressionTolerance = 0

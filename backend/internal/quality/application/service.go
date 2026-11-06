@@ -34,11 +34,12 @@ type Service struct {
 	settings    SettingsReader
 	audit       auditapp.Recorder
 
-	version   VersionSnapshotPort
-	design    DesignSnapshotPort
-	execution ExecutionSnapshotPort
-	visual    VisualSnapshotPort
-	events    EventPublisher
+	version       VersionSnapshotPort
+	versionExists VersionExistsPort
+	design        DesignSnapshotPort
+	execution     ExecutionSnapshotPort
+	visual        VisualSnapshotPort
+	events        EventPublisher
 }
 
 // NewService wires the quality application service. operational, settings and
@@ -76,6 +77,14 @@ func (s *Service) WithSnapshotPorts(
 	s.version = version
 	s.design = design
 	s.visual = visual
+	return s
+}
+
+// WithVersionExistence wires the narrow version-existence probe used by the
+// snapshot trigger and the trend series (W2-14). Without it both operations fail
+// honestly with 503 instead of returning data for a version that does not exist.
+func (s *Service) WithVersionExistence(port VersionExistsPort) *Service {
+	s.versionExists = port
 	return s
 }
 
@@ -175,6 +184,12 @@ func (s *Service) TriggerSnapshot(ctx context.Context, actor platform.Actor, ver
 	if s.execution == nil || s.version == nil || s.design == nil || s.visual == nil {
 		return EvalRun{}, platform.Unavailable("quality snapshot ports are not configured")
 	}
+	// Existence is checked before publishing eval.started or persisting the run:
+	// an unknown version must not create an all-zero failed snapshot (W2-14
+	// review, P2). The narrow port is owned by the version context.
+	if err := s.requireVersion(ctx, versionID); err != nil {
+		return EvalRun{}, err
+	}
 
 	runID := s.ids.Next()
 	version := versionID
@@ -262,7 +277,29 @@ func (s *Service) Trends(ctx context.Context, versionID int64, metric string, fr
 	if s.repo == nil {
 		return nil, platform.Unavailable("quality repository is not configured")
 	}
+	// An unknown version is a 404, not an empty 200 series (W2-14 review, P2).
+	if err := s.requireVersion(ctx, versionID); err != nil {
+		return nil, err
+	}
 	return s.repo.Trends(ctx, versionID, metric, from, to)
+}
+
+// requireVersion probes the narrow version-existence port shared by the
+// snapshot trigger and the trend read. A nil port is a wiring error rather than
+// an implicit success: the quality context must never fabricate data for a
+// version it cannot verify.
+func (s *Service) requireVersion(ctx context.Context, versionID int64) error {
+	if s.versionExists == nil {
+		return platform.Unavailable("quality version existence port is not configured")
+	}
+	exists, err := s.versionExists.VersionExists(ctx, versionID)
+	if err != nil {
+		return fmt.Errorf("quality version existence: %w", err)
+	}
+	if !exists {
+		return platform.NotFound("version")
+	}
+	return nil
 }
 
 // snapshotBaseline reads the previous run of the version and projects its metric

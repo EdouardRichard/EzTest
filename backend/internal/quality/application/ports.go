@@ -91,6 +91,15 @@ type VersionSnapshotPort interface {
 	CountRequirementClosure(ctx context.Context, versionID *int64) (int, int, error)
 }
 
+// VersionExistsPort is the narrow version-context existence probe
+// (versionapp.VersionReadService satisfies it). The quality context never reads
+// the version tables directly: the assembly root wires the version read service,
+// so an unknown version yields the shared 404 envelope for the snapshot trigger
+// and the trend series instead of a fabricated all-zero run or an empty series.
+type VersionExistsPort interface {
+	VersionExists(ctx context.Context, versionID int64) (bool, error)
+}
+
 // DesignSnapshotPort is the design context's case-confirmation counter
 // (designapp.QueryService satisfies it).
 type DesignSnapshotPort interface {

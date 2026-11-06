@@ -212,8 +212,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             {isAdmin ? <Badge tone="info">管理员</Badge> : null}
           </div>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            运营指标由服务端按只读口径派生；视觉质量沿用 P5。真实 LLM
-            评测看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
+            运营指标由服务端按只读口径派生；视觉质量沿用 P5。快照评测（4
+            项指标）、真实 LLM run 与趋势看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -288,7 +288,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           <div>
             <h2 className="text-sm font-semibold text-foreground">评测看板</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              真实 LLM 评测 run、6+1 指标、阈值与基线；服务端派生，客户端 verdict 不生效。
+              快照评测 run（服务端从版本真实数据派生 4 项指标）与历史真实 LLM run；阈值、基线与趋势由服务端派生，客户端 verdict 不生效。
             </p>
           </div>
           {isAdmin ? <Badge tone="neutral">admin-only</Badge> : null}
@@ -336,7 +336,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           <div data-testid="quality-eval-empty">
             <EmptyState
               title="尚未运行评测"
-              description="管理员执行真实 LLM 评测 runner 后，这里会展示指标、阈值、基线与历史。"
+              description="管理员触发快照评测（4 项指标）或执行真实 LLM 评测 runner 后，这里会展示指标、阈值、基线与历史。"
             />
           </div>
         ) : (

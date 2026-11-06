@@ -4,13 +4,21 @@ package qualitypg_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	qualityapp "github.com/EdouardRichard/EzTest/backend/internal/quality/application"
 	quality "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
 	qualitypg "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
 )
 
 func fixtureSnapshotRun(id, versionID int64, createdAt time.Time) qualityapp.EvalRun {
@@ -35,6 +43,79 @@ func fixtureSnapshotMetrics(pass float64) []quality.Metric {
 		{Name: quality.MetricExecutionPassRate, Value: pass, Threshold: 0.8, Passed: pass >= 0.8},
 		{Name: quality.MetricCaseCoverage, Value: 1, Threshold: 0.8, Passed: true},
 		{Name: quality.MetricVisualClassificationAccuracy, Value: 0.9, Threshold: 0.8, Passed: true},
+	}
+}
+
+// integrationSnapshotPorts is never read by the unknown-version tests: the
+// version-existence probe must abort the trigger before these counters run.
+type integrationSnapshotPorts struct{ calls int }
+
+func (p *integrationSnapshotPorts) CountRequirementClosure(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+func (p *integrationSnapshotPorts) CountCaseConfirmation(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+func (p *integrationSnapshotPorts) CountExecutionPass(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+func (p *integrationSnapshotPorts) VisualClassification(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+// TestSnapshotTriggerAndTrendsUnknownVersion404WithRealVersionRead wires the
+// real version read service and its SQL existence probe (not a fake-only error)
+// and proves an unknown version is a 404 with no eval_run row and no product
+// counter read, for both the snapshot trigger and the trend series.
+func TestSnapshotTriggerAndTrendsUnknownVersion404WithRealVersionRead(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := qualitypg.NewRepository(pool)
+	ctx := context.Background()
+
+	designReader, err := designpg.NewQueryReader(pool)
+	if err != nil {
+		t.Fatalf("design reader: %v", err)
+	}
+	versionReader, err := versionpg.NewQueryReader(pool, designapp.NewQueryService(designReader))
+	if err != nil {
+		t.Fatalf("version reader: %v", err)
+	}
+	ids, err := platformid.NewSnowflake(14)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	ports := &integrationSnapshotPorts{}
+	service := qualityapp.NewService(repo, ids, clock.System{}, nil, nil, nil).
+		WithSnapshotPorts(ports, ports, ports, ports).
+		WithVersionExistence(versionapp.NewVersionReadService(versionReader))
+
+	const unknown int64 = 999999
+	_, err = service.TriggerSnapshot(ctx, platform.Actor{ID: 9, Role: "admin"}, unknown)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != 404 || apiErr.Details["kind"] != "version" {
+		t.Fatalf("trigger error = %v", err)
+	}
+	if ports.calls != 0 {
+		t.Fatalf("unknown version read %d product counters", ports.calls)
+	}
+	var runs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eval_run`).Scan(&runs); err != nil {
+		t.Fatalf("count eval_run: %v", err)
+	}
+	if runs != 0 {
+		t.Fatalf("unknown version persisted %d eval run(s)", runs)
+	}
+
+	_, err = service.Trends(ctx, unknown, quality.MetricDesignCoverage, time.Time{}, time.Time{})
+	if !errors.As(err, &apiErr) || apiErr.Status != 404 || apiErr.Details["kind"] != "version" {
+		t.Fatalf("trends error = %v", err)
 	}
 }
 

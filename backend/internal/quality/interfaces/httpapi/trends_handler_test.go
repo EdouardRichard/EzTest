@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -143,5 +144,80 @@ func TestQualityTrendsRequiresAdminAndMapsNotFound(t *testing.T) {
 		"/api/quality/trends?version_id=7&metric=execution_pass_rate", "")
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status = %d (%s)", recorder.Code, recorder.Body.String())
+	}
+}
+
+// handlerSnapshotPorts is the minimal product-data surface the real quality
+// service requires before it reaches the version-existence probe. The 404 tests
+// below must fail before any of these counters is read.
+type handlerSnapshotPorts struct{ calls int }
+
+func (p *handlerSnapshotPorts) CountRequirementClosure(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+func (p *handlerSnapshotPorts) CountCaseConfirmation(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+func (p *handlerSnapshotPorts) CountExecutionPass(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+func (p *handlerSnapshotPorts) VisualClassification(context.Context, *int64) (int, int, error) {
+	p.calls++
+	return 0, 0, nil
+}
+
+type handlerVersionExists struct {
+	exists    bool
+	versionID int64
+}
+
+func (h *handlerVersionExists) VersionExists(_ context.Context, versionID int64) (bool, error) {
+	h.versionID = versionID
+	return h.exists, nil
+}
+
+// TestQualityUnknownVersion404WithRealService exercises the real application
+// service through the HTTP mux: the unknown version must be rejected by the
+// version-existence probe (not by a fake service returning a canned error), with
+// no eval run inserted and no counter read.
+func TestQualityUnknownVersion404WithRealService(t *testing.T) {
+	repo := &handlerRepo{}
+	ports := &handlerSnapshotPorts{}
+	existence := &handlerVersionExists{exists: false}
+	service := qualityapp.NewService(repo, &handlerIDs{}, handlerClock{}, nil, nil, nil).
+		WithSnapshotPorts(ports, ports, ports, ports).
+		WithVersionExistence(existence)
+	mux := newQualityMux(service, "admin")
+
+	recorder, decoded := performQuality(t, mux, http.MethodPost, "/api/quality/eval-runs",
+		`{"mode":"snapshot","version_id":"77"}`)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("snapshot status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if envelope := decoded["error"].(map[string]any); envelope["code"] != "not_found" ||
+		envelope["details"].(map[string]any)["kind"] != "version" {
+		t.Fatalf("snapshot error = %+v", envelope)
+	}
+	if repo.insertCalls != 0 || ports.calls != 0 {
+		t.Fatalf("unknown version side effects: inserts=%d ports=%d", repo.insertCalls, ports.calls)
+	}
+	if existence.versionID != 77 {
+		t.Fatalf("existence probe version = %d", existence.versionID)
+	}
+
+	recorder, decoded = performQuality(t, mux, http.MethodGet,
+		"/api/quality/trends?version_id=77&metric=design_coverage", "")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("trends status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if envelope := decoded["error"].(map[string]any); envelope["code"] != "not_found" ||
+		envelope["details"].(map[string]any)["kind"] != "version" {
+		t.Fatalf("trends error = %+v", envelope)
 	}
 }

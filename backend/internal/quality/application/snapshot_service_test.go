@@ -54,6 +54,22 @@ func (f *fakeSnapshotPorts) VisualClassification(_ context.Context, versionID *i
 	return f.visualPassed, f.visualFailed, f.err
 }
 
+// fakeVersionExists implements the narrow VersionExistsPort wired by
+// WithVersionExistence. The version id is recorded so a test can prove the
+// probe is scoped to the requested version.
+type fakeVersionExists struct {
+	exists    bool
+	err       error
+	versionID int64
+	calls     int
+}
+
+func (f *fakeVersionExists) VersionExists(_ context.Context, versionID int64) (bool, error) {
+	f.calls++
+	f.versionID = versionID
+	return f.exists, f.err
+}
+
 type fakeEvalEvents struct {
 	types   []string
 	version []int64
@@ -90,6 +106,7 @@ func snapshotPorts() *fakeSnapshotPorts {
 func snapshotService(repo *fakeRepo, ports *fakeSnapshotPorts, events *fakeEvalEvents) *qualityapp.Service {
 	service := newService(repo, nil, nil, nil)
 	service.WithSnapshotPorts(ports, ports, ports, ports)
+	service.WithVersionExistence(&fakeVersionExists{exists: true})
 	if events != nil {
 		service.WithEvents(events)
 	}
@@ -211,6 +228,50 @@ func TestSnapshotTriggerRejectsInvalidVersion(t *testing.T) {
 	}
 }
 
+// TestSnapshotTriggerUnknownVersionIsNotFound proves the trigger probes the
+// narrow version-existence port before publishing eval.started or inserting a
+// run: an unknown version is a 404, not an all-zero failed snapshot.
+func TestSnapshotTriggerUnknownVersionIsNotFound(t *testing.T) {
+	repo := &fakeRepo{}
+	events := &fakeEvalEvents{}
+	existence := &fakeVersionExists{exists: false}
+	service := snapshotService(repo, snapshotPorts(), events)
+	service.WithVersionExistence(existence)
+
+	_, err := service.TriggerSnapshot(context.Background(), platform.Actor{ID: 9, Role: "admin"}, 77)
+	apiErr := apiError(t, err)
+	if apiErr.Status != 404 || apiErr.Details["kind"] != "version" {
+		t.Fatalf("error = %+v", apiErr)
+	}
+	if existence.versionID != 77 || existence.calls != 1 {
+		t.Fatalf("existence probe = %+v", existence)
+	}
+	if repo.insertCalls != 0 {
+		t.Fatalf("unknown version persisted %d run(s)", repo.insertCalls)
+	}
+	if len(events.types) != 0 {
+		t.Fatalf("unknown version published events: %v", events.types)
+	}
+}
+
+// TestSnapshotTriggerVersionProbeFailureIsReported proves a failing existence
+// probe aborts before any side effect and surfaces the read failure.
+func TestSnapshotTriggerVersionProbeFailureIsReported(t *testing.T) {
+	boom := errors.New("version existence read failed")
+	repo := &fakeRepo{}
+	events := &fakeEvalEvents{}
+	service := snapshotService(repo, snapshotPorts(), events)
+	service.WithVersionExistence(&fakeVersionExists{err: boom})
+
+	_, err := service.TriggerSnapshot(context.Background(), platform.Actor{ID: 9, Role: "admin"}, 7)
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want wrapped probe failure", err)
+	}
+	if repo.insertCalls != 0 || len(events.types) != 0 {
+		t.Fatalf("probe failure had side effects: inserts=%d events=%v", repo.insertCalls, events.types)
+	}
+}
+
 // TestSnapshotTriggerPreviousSnapshotIsWarnOnlyBaseline: the prior snapshot of
 // the same version is the baseline; a regression marks metrics and the run
 // failed but the trigger still succeeds and persists the full series.
@@ -255,6 +316,7 @@ func TestServiceTrendsScopesVersionAndMetric(t *testing.T) {
 		{RunID: 102, Metric: quality.MetricExecutionPassRate, Value: 0.5},
 	}}
 	service := newService(repo, nil, nil, nil)
+	service.WithVersionExistence(&fakeVersionExists{exists: true})
 	from := testNow.Add(-time.Hour)
 	to := testNow
 
@@ -282,8 +344,27 @@ func TestServiceTrendsRejectsUnknownMetricAndVersion(t *testing.T) {
 func TestServiceTrendsReportsRepositoryFailure(t *testing.T) {
 	boom := errors.New("trends read failed")
 	service := newService(&fakeRepo{trendsErr: boom}, nil, nil, nil)
+	service.WithVersionExistence(&fakeVersionExists{exists: true})
 	_, err := service.Trends(context.Background(), 7, quality.MetricDesignCoverage, time.Time{}, time.Time{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+// TestServiceTrendsUnknownVersionIsNotFound proves the trend read validates the
+// version through the narrow existence port before querying the repository, so
+// an unknown version is a 404 instead of an empty 200 series.
+func TestServiceTrendsUnknownVersionIsNotFound(t *testing.T) {
+	existence := &fakeVersionExists{exists: false}
+	service := newService(&fakeRepo{}, nil, nil, nil)
+	service.WithVersionExistence(existence)
+
+	_, err := service.Trends(context.Background(), 77, quality.MetricDesignCoverage, time.Time{}, time.Time{})
+	apiErr := apiError(t, err)
+	if apiErr.Status != 404 || apiErr.Details["kind"] != "version" {
+		t.Fatalf("error = %+v", apiErr)
+	}
+	if existence.versionID != 77 || existence.calls != 1 {
+		t.Fatalf("existence probe = %+v", existence)
 	}
 }

@@ -16231,6 +16231,11 @@ components:
           format: date-time
     EvalRunCreateRequest:
       type: object
+      description: |
+        条件必填：`mode` 恒为必填。`mode=real_llm` 时 `corpus_version` 必填
+        （服务端拒绝空值）；`mode=snapshot` 时 `version_id` 必填，`corpus_version`
+        由服务端写入 `snapshot:<version_id>`，客户端 sample/verdict 被忽略。
+        因此 `required` 只列出两种模式都需要的 `mode`。
       required: [mode]
       properties:
         mode:

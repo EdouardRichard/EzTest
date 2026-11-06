@@ -121,6 +121,9 @@ func newP6ReadRuntime(deps p6ReadDeps) (*p6ReadRuntime, error) {
 	qualitySvc := qualityapp.NewService(qualityRepo, deps.IDs, deps.Clock, aggregator, deps.Settings, deps.Audit).
 		WithSnapshotPorts(executionQuery, versionQuery, designQuery,
 			qualityadapter.NewVisualClassification(visualOverview)).
+		// W2-14: reject unknown versions before the snapshot trigger or trend
+		// read produces data; the version read service owns the existence probe.
+		WithVersionExistence(versionRead).
 		WithEvents(qualityadapter.NewEventPublisher(deps.Events))
 
 	searchSvc := searchapp.NewService(
