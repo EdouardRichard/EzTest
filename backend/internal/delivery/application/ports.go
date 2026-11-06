@@ -81,6 +81,63 @@ type IssueManualUpdate struct {
 	History          delivery.IssueStatusChange
 }
 
+// IssueRetestStart marks one issue as retesting against a freshly created retest
+// wave (v0.22 W2-5 / DB-23). The repository locks the issue, writes
+// retest_status='retesting', stamps last_retest_wave_id and appends the role=
+// 'retest' wave/case_run refs in one transaction.
+type IssueRetestStart struct {
+	VersionID int64
+	IssueID   int64
+	WaveID    int64
+	Refs      []delivery.IssueRef
+	Now       time.Time
+}
+
+// IssueRetestResult writes back one retest outcome. TargetStatus is
+// passed/failed or retesting (the "other terminal status" case keeps retesting
+// and records Reason in the append-only status history). The repository only
+// applies the write while last_retest_wave_id still equals WaveID, so a stale
+// terminal callback from an earlier retest cannot overwrite a newer one.
+type IssueRetestResult struct {
+	VersionID    int64
+	IssueID      int64
+	WaveID       int64
+	CaseRunID    int64
+	TargetStatus string
+	Reason       string
+	Now          time.Time
+}
+
+// RetestCaseRun is one case_run created by a retest wave.
+type RetestCaseRun struct {
+	ID            int64
+	CaseVersionID int64
+	Status        string
+}
+
+// RetestWave is the narrow retest-wave projection consumed by the issue service.
+type RetestWave struct {
+	ID       int64
+	Status   string
+	CaseRuns []RetestCaseRun
+}
+
+// RetestExecutor is the delivery context's write port into execution for the
+// retest use case. It reuses IntentService.CreateManual(PurposeRetest) and the
+// deterministic scheduler; no separate scheduler is introduced.
+type RetestExecutor interface {
+	// CreateRetestIntent creates one PurposeRetest intent and returns its ID.
+	CreateRetestIntent(ctx context.Context, versionID, caseVersionID, actorID int64) (int64, error)
+	// CancelRetestIntent cancels one intent created by CreateRetestIntent; it is
+	// the rollback of a partially created retest batch.
+	CancelRetestIntent(ctx context.Context, intentID int64) error
+	// ActiveWave returns the active wave of a version, if any.
+	ActiveWave(ctx context.Context, versionID int64) (RetestWave, bool, error)
+	// StartRetestWave plans/dispatches the pending retest intents and returns the
+	// resulting active wave with its case_runs.
+	StartRetestWave(ctx context.Context, versionID int64) (RetestWave, error)
+}
+
 // IssueRepository persists delivery_issue, delivery_issue_ref and
 // delivery_issue_status_history rows.
 type IssueRepository interface {
@@ -117,6 +174,14 @@ type IssueRepository interface {
 	ListRefs(ctx context.Context, issueID int64) ([]delivery.IssueRef, error)
 	ListHistory(ctx context.Context, issueID int64) ([]delivery.IssueStatusChange, error)
 	FindByCaseRun(ctx context.Context, versionID, caseRunID int64) (delivery.Issue, bool, error)
+	// StartRetest marks the issue retesting, stamps the wave pointer and appends
+	// the role='retest' refs atomically.
+	StartRetest(ctx context.Context, in IssueRetestStart) (delivery.Issue, error)
+	// ApplyRetestResult writes one retest outcome guarded by last_retest_wave_id.
+	// It is idempotent for the same (wave, case_run, target status) tuple.
+	ApplyRetestResult(ctx context.Context, in IssueRetestResult) (delivery.Issue, error)
+	// FindByRetestWave resolves the issue whose last_retest_wave_id is waveID.
+	FindByRetestWave(ctx context.Context, waveID int64) (delivery.Issue, bool, error)
 }
 
 // Report repository and content-ledger sentinels. The postgres/content

@@ -140,10 +140,26 @@ type Issue struct {
 	// source issue's refs or history.
 	RecurrenceCount int
 	LastRecurredAt  *time.Time
-	CreatedByRunID  *int64
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// RetestStatus is the independent v0.22 retest result model (DB-23):
+	// not_retested/retesting/passed/failed. LastRetestWaveID and
+	// LastRetestCaseRunID point at the most recent retest attempt.
+	RetestStatus        string
+	LastRetestWaveID    *int64
+	LastRetestCaseRunID *int64
+	CreatedByRunID      *int64
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
+
+// Retest statuses of one issue (v0.22 W2-5 / DB-23). retest_status is
+// independent of the issue lifecycle status: a confirmed issue can be
+// retesting/passed/failed without changing open/confirmed/dismissed/merged.
+const (
+	IssueRetestStatusNotRetested = "not_retested"
+	IssueRetestStatusRetesting   = "retesting"
+	IssueRetestStatusPassed      = "passed"
+	IssueRetestStatusFailed      = "failed"
+)
 
 // IssueRef is one append-only logical reference of an issue (spec §3.2). Kind
 // names the referenced entity; RefID is its intra-domain ID.

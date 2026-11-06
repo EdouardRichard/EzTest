@@ -15,6 +15,7 @@ func Register(mux *http.ServeMux, h *Handler) {
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", http.HandlerFunc(h.DismissIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", http.HandlerFunc(h.ReopenIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", http.HandlerFunc(h.MergeIssue))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/retest", http.HandlerFunc(h.RetestIssue))
 
 	// Reports.
 	mux.Handle("GET /api/versions/{versionId}/reports", http.HandlerFunc(h.ListReports))

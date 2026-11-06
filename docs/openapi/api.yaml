@@ -334,6 +334,21 @@ info:
       `failure_candidate|manual`（DB-23 迁移 `delivery_0002_v022_issue_manual_retest.sql`）；
       同迁移新增 `retest_status`/`last_retest_wave_id`/`last_retest_case_run_id`，由 W2-5 使用。
 
+    ## v0.22 W2-5 增量（issue retest，additive）
+
+    R-W2-2 / API-25（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§6）：
+    - `POST /api/versions/{id}/issues/{iid}/retest`（登录用户 `authenticated`）为 issue
+      创建 `PurposeRetest` wave；body 可选 `{case_run_ids:[...]}`，缺省复测该 issue 关联的
+      全部 case_run。返回 200 + `{wave_id,wave_status,issue_id,version_id,retest_status,case_run_ids}`。
+    - `delivery_issue_ref` 写 `kind='wave',role='retest'` 与每个复测 case_run 的
+      `kind='case_run',role='retest'`；`delivery_issue.retest_status='retesting'` 并记录
+      `last_retest_wave_id`；已有活动 wave 时返回 409 `state_conflict` + `details.reason=retest_active`。
+    - wave 终态回写：case_run `passed`→`passed`、`failed`→`failed`、其他→保持 `retesting`
+      并记录原因；写 `last_retest_case_run_id`；事件 `issue.retest_started`、
+      `issue.retest_completed`、`issue.retest_failed`（版本频道，payload
+      `{issue_id,version_id,wave_id,case_run_ids,retest_status,case_run_status}`）。
+    - `IssueView` 增加 `retest_status`/`last_retest_wave_id`/`last_retest_case_run_id`。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -4905,6 +4920,69 @@ paths:
                 properties:
                   data:
                     $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/issues/{issueId}/retest:
+    post:
+      tags: [Delivery]
+      operationId: startIssueRetest
+      summary: 创建复测 wave（PurposeRetest）
+      description: |
+        为问题创建 `PurposeRetest` wave（v0.22 W2-5/API-25）。body 可选
+        `case_run_ids` 限定复测该 issue 关联的 case_run；缺省复测全部关联 case_run。
+        写 `retest_status='retesting'` + `last_retest_wave_id` 与 role='retest' 的
+        wave/case_run refs；已有活动 wave 返回 409 `state_conflict`
+        + `details.reason=retest_active`。终态由 wave 回写更新为 passed/failed。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetestIssueRequest'
+      responses:
+        '200':
+          description: 复测 wave 与问题 retest_status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [issue_id, version_id, wave_id, wave_status, retest_status, case_run_ids]
+                    properties:
+                      issue_id:
+                        type: string
+                        pattern: '^[0-9]+$'
+                      version_id:
+                        type: string
+                        pattern: '^[0-9]+$'
+                      wave_id:
+                        type: string
+                        pattern: '^[0-9]+$'
+                      wave_status:
+                        type: string
+                      retest_status:
+                        type: string
+                        enum: [not_retested, retesting, passed, failed]
+                      case_run_ids:
+                        type: array
+                        items:
+                          type: string
+                          pattern: '^[0-9]+$'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -13624,6 +13702,20 @@ components:
           format: date-time
           nullable: true
           description: P7 最近一次复发时间；从未复发为 null
+        retest_status:
+          type: string
+          enum: [not_retested, retesting, passed, failed]
+          description: v0.22 W2-5 复测结果模型，独立于 issue 四状态
+        last_retest_wave_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+          description: 最近一次复测 wave id；从未复测为 null
+        last_retest_case_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+          description: 最近一次复测写回的 case_run id；无终态回写为 null
         merged_chain:
           type: array
           nullable: true
@@ -13776,6 +13868,17 @@ components:
           type: integer
           minimum: 1
           description: 必填 CAS；不匹配返回 issue_revision_conflict
+    RetestIssueRequest:
+      type: object
+      description: v0.22 W2-5 retest body（可选 case_run 选择；IDs 为十进制字符串）
+      properties:
+        case_run_ids:
+          type: array
+          maxItems: 100
+          description: 仅复测该 issue 已关联的 case_run；缺省/空数组表示全部关联 case_run
+          items:
+            type: string
+            pattern: '^[0-9]+$'
     ReportView:
       type: object
       required: [id, version_id, kind, status, created_at, updated_at]

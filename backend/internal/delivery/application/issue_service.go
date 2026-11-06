@@ -22,6 +22,12 @@ const (
 	// issueEventRecurred is the P7 recurrence event (spec §7): emitted on both a
 	// successful redirect and a broken/cyclic chain fallback.
 	issueEventRecurred = "issue.recurred"
+	// v0.22 W2-5 retest events (spec EV-16 / R-W2-2). retest_started is emitted
+	// when a retest wave is linked; completed/failed are emitted by the terminal
+	// wave writeback. "Other" terminal statuses keep retesting (no event).
+	issueEventRetestStarted   = "issue.retest_started"
+	issueEventRetestCompleted = "issue.retest_completed"
+	issueEventRetestFailed    = "issue.retest_failed"
 )
 
 // Audit actions of the issue lifecycle (D52). Audit is best effort.
@@ -34,6 +40,11 @@ const (
 	// issueAuditRecurred records a recurrence redirect, including the fallback
 	// that keeps the pre-P7 dedupe behavior.
 	issueAuditRecurred = "delivery.issue.recurred"
+	// issueAuditRetestStarted/Completed/Failed record the v0.22 retest lifecycle
+	// (IDs only, never case/evidence content).
+	issueAuditRetestStarted   = "delivery.issue.retest_started"
+	issueAuditRetestCompleted = "delivery.issue.retest_completed"
+	issueAuditRetestFailed    = "delivery.issue.retest_failed"
 )
 
 const (
@@ -60,6 +71,13 @@ type CreateManualIssueInput struct {
 	EvidenceIDs []int64
 	MergeIntoID int64
 	Reason      string
+}
+
+// RetestResult is the outcome of StartRetest: the created retest wave and the
+// issue row carrying retest_status='retesting' and the wave pointer.
+type RetestResult struct {
+	Wave  RetestWave
+	Issue delivery.Issue
 }
 
 // UpdateManualIssueInput is the v0.22 W2-4 manual patch command. Empty string
@@ -281,6 +299,359 @@ func (s *IssueService) finishManualUpdate(ctx context.Context, versionID, issueI
 	return updated, nil
 }
 
+// StartRetest creates a retest wave for one issue (v0.22 W2-5 / R-W2-2). The
+// optional caseRunIDs restrict the retest to a subset of the issue's linked
+// case_runs; an empty selection retests every linked case_run. The retest
+// intents reuse IntentService.CreateManual(PurposeRetest), the wave reuses the
+// deterministic scheduler, and the issue/ref writeback is one transaction.
+func (s *IssueService) StartRetest(ctx context.Context, versionID, issueID, actorID int64, caseRunIDs ...int64) (RetestResult, error) {
+	if versionID <= 0 || issueID <= 0 {
+		return RetestResult{}, invalidArgumentf("version and issue IDs must be positive decimal IDs")
+	}
+	if actorID <= 0 {
+		return RetestResult{}, invalidArgumentf("actor id must be a positive decimal ID")
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return RetestResult{}, err
+	}
+	if err := s.requireExecutionReader(); err != nil {
+		return RetestResult{}, err
+	}
+	if s.retest == nil {
+		return RetestResult{}, issueServiceNotConfigured("retest executor")
+	}
+	issue, err := s.repo.Get(ctx, versionID, issueID)
+	if err != nil {
+		return RetestResult{}, mapIssueRepositoryError("load issue for retest", err)
+	}
+	if issue.Status != delivery.IssueStatusOpen && issue.Status != delivery.IssueStatusConfirmed {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictNotRetestable}
+	}
+	// Any active wave blocks a new retest: the deterministic scheduler keeps one
+	// active wave per version, so a concurrent retest/execute must be a typed
+	// conflict instead of a half-created intent batch.
+	if _, active, err := s.retest.ActiveWave(ctx, versionID); err != nil {
+		return RetestResult{}, mapIssueRepositoryError("check active retest wave", err)
+	} else if active {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictRetestActive}
+	}
+
+	refs, err := s.repo.ListRefs(ctx, issueID)
+	if err != nil {
+		return RetestResult{}, mapIssueRepositoryError("list issue refs for retest", err)
+	}
+	selected, err := selectRetestCaseRunRefs(refs, caseRunIDs)
+	if err != nil {
+		return RetestResult{}, err
+	}
+	if len(selected) == 0 {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictNotRetestable}
+	}
+
+	// Resolve the selected case_runs to their case versions. One retest intent is
+	// created per distinct case version, preserving the issue ref order.
+	type retestCaseVersion struct {
+		caseVersionID int64
+	}
+	ordered := make([]retestCaseVersion, 0, len(selected))
+	seen := make(map[int64]struct{}, len(selected))
+	for _, ref := range selected {
+		snapshot, err := s.exec.CaseRunSnapshot(ctx, ref.RefID)
+		if err != nil {
+			return RetestResult{}, mapIssueRepositoryError("load retest case run", err)
+		}
+		if snapshot.VersionID > 0 && snapshot.VersionID != versionID {
+			return RetestResult{}, invalidArgumentf("case run %d belongs to version %d, not %d",
+				ref.RefID, snapshot.VersionID, versionID)
+		}
+		if snapshot.CaseVersionID <= 0 {
+			return RetestResult{}, invalidArgumentf("case run %d has no case version", ref.RefID)
+		}
+		if _, ok := seen[snapshot.CaseVersionID]; ok {
+			continue
+		}
+		seen[snapshot.CaseVersionID] = struct{}{}
+		ordered = append(ordered, retestCaseVersion{caseVersionID: snapshot.CaseVersionID})
+	}
+	if len(ordered) == 0 {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictNotRetestable}
+	}
+
+	intentIDs := make([]int64, 0, len(ordered))
+	for _, item := range ordered {
+		intentID, err := s.retest.CreateRetestIntent(ctx, versionID, item.caseVersionID, actorID)
+		if err != nil {
+			s.cancelRetestIntents(ctx, intentIDs)
+			return RetestResult{}, err
+		}
+		intentIDs = append(intentIDs, intentID)
+	}
+	wave, err := s.retest.StartRetestWave(ctx, versionID)
+	if err != nil {
+		// The intents are now open but no wave was planned; cancel them so a
+		// failed start does not leave a phantom retest queue behind.
+		s.cancelRetestIntents(ctx, intentIDs)
+		return RetestResult{}, mapIssueRepositoryError("start retest wave", err)
+	}
+	if wave.ID <= 0 {
+		s.cancelRetestIntents(ctx, intentIDs)
+		return RetestResult{}, errors.New("delivery: retest wave has no ID")
+	}
+
+	now := s.nowUTC()
+	retestRefs := make([]delivery.IssueRef, 0, len(wave.CaseRuns)+1)
+	retestRefs = append(retestRefs, delivery.IssueRef{
+		Kind: delivery.IssueRefKindWave, RefID: wave.ID, Role: delivery.IssueRefRoleRetest,
+	})
+	linkedCaseRunIDs := make([]int64, 0, len(wave.CaseRuns))
+	for _, run := range wave.CaseRuns {
+		if _, ok := seen[run.CaseVersionID]; !ok {
+			continue
+		}
+		linkedCaseRunIDs = append(linkedCaseRunIDs, run.ID)
+		retestRefs = append(retestRefs, delivery.IssueRef{
+			Kind: delivery.IssueRefKindCaseRun, RefID: run.ID, Role: delivery.IssueRefRoleRetest,
+		})
+	}
+	updated, err := s.repo.StartRetest(ctx, IssueRetestStart{
+		VersionID: versionID,
+		IssueID:   issueID,
+		WaveID:    wave.ID,
+		Refs:      retestRefs,
+		Now:       now,
+	})
+	if err != nil {
+		return RetestResult{}, mapIssueRepositoryError("persist retest start", err)
+	}
+	payload := map[string]any{
+		"issue_id":      formatIssueID(updated.ID),
+		"version_id":    formatIssueID(versionID),
+		"wave_id":       formatIssueID(wave.ID),
+		"case_run_ids":  formatIssueIDs(linkedCaseRunIDs),
+		"retest_status": delivery.IssueRetestStatusRetesting,
+	}
+	s.publishIssueEvent(ctx, issueEventRetestStarted, versionID, payload)
+	s.recordIssueAudit(ctx, actorID, issueAuditRetestStarted, updated.ID, map[string]any{
+		"version_id": formatIssueID(versionID),
+		"wave_id":    formatIssueID(wave.ID),
+		"status":     delivery.IssueRetestStatusRetesting,
+	})
+	return RetestResult{Wave: wave, Issue: updated}, nil
+}
+
+// cancelRetestIntents best-effort rollback of a partially created retest batch.
+func (s *IssueService) cancelRetestIntents(ctx context.Context, intentIDs []int64) {
+	for _, intentID := range intentIDs {
+		if intentID <= 0 {
+			continue
+		}
+		_ = s.retest.CancelRetestIntent(ctx, intentID)
+	}
+}
+
+// selectRetestCaseRunRefs filters the issue's source case_run refs and applies
+// the optional client selection. A selected ID that is not linked to the issue
+// is invalid rather than silently dropped.
+func selectRetestCaseRunRefs(refs []delivery.IssueRef, caseRunIDs []int64) ([]delivery.IssueRef, error) {
+	source := make([]delivery.IssueRef, 0, len(refs))
+	available := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.Kind != delivery.IssueRefKindCaseRun || ref.Role == delivery.IssueRefRoleRetest {
+			continue
+		}
+		source = append(source, ref)
+		available[ref.RefID] = struct{}{}
+	}
+	if len(caseRunIDs) == 0 {
+		return source, nil
+	}
+	selected := make(map[int64]struct{}, len(caseRunIDs))
+	for _, caseRunID := range caseRunIDs {
+		if caseRunID <= 0 {
+			return nil, invalidArgumentf("case_run_ids must contain positive decimal IDs")
+		}
+		if _, ok := available[caseRunID]; !ok {
+			return nil, invalidArgumentf("case run %d is not linked to this issue", caseRunID)
+		}
+		selected[caseRunID] = struct{}{}
+	}
+	filtered := make([]delivery.IssueRef, 0, len(selected))
+	for _, ref := range source {
+		if _, ok := selected[ref.RefID]; ok {
+			filtered = append(filtered, ref)
+		}
+	}
+	return filtered, nil
+}
+
+// OnRetestTerminal writes back one terminal retest case_run result. passed and
+// failed map to the same issue retest_status; any other terminal status keeps
+// retesting and records the reason in the append-only status history. Repeated
+// calls for the same retest wave are idempotent and emit no duplicate event.
+func (s *IssueService) OnRetestTerminal(ctx context.Context, waveID, caseRunID int64, status string) (delivery.Issue, error) {
+	if waveID <= 0 || caseRunID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("wave and case run IDs must be positive decimal IDs")
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	issue, found, err := s.repo.FindByRetestWave(ctx, waveID)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("find issue for retest writeback", err)
+	}
+	if !found {
+		// A terminal wave that is not a retest wave has nothing to write back.
+		return delivery.Issue{}, nil
+	}
+	target, reason := retestOutcome(status)
+	if issue.RetestStatus == target && issue.LastRetestCaseRunID != nil && *issue.LastRetestCaseRunID == caseRunID {
+		return issue, nil
+	}
+	updated, err := s.repo.ApplyRetestResult(ctx, IssueRetestResult{
+		VersionID:    issue.VersionID,
+		IssueID:      issue.ID,
+		WaveID:       waveID,
+		CaseRunID:    caseRunID,
+		TargetStatus: target,
+		Reason:       reason,
+		Now:          s.nowUTC(),
+	})
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("write issue retest result", err)
+	}
+	payload := map[string]any{
+		"issue_id":        formatIssueID(updated.ID),
+		"version_id":      formatIssueID(updated.VersionID),
+		"wave_id":         formatIssueID(waveID),
+		"case_run_ids":    formatIssueIDs([]int64{caseRunID}),
+		"retest_status":   updated.RetestStatus,
+		"case_run_status": strings.TrimSpace(status),
+	}
+	auditMetadata := map[string]any{
+		"version_id": formatIssueID(updated.VersionID),
+		"wave_id":    formatIssueID(waveID),
+		"status":     updated.RetestStatus,
+	}
+	switch target {
+	case delivery.IssueRetestStatusPassed:
+		s.publishIssueEvent(ctx, issueEventRetestCompleted, updated.VersionID, payload)
+		s.recordIssueAudit(ctx, 0, issueAuditRetestCompleted, updated.ID, auditMetadata)
+	case delivery.IssueRetestStatusFailed:
+		s.publishIssueEvent(ctx, issueEventRetestFailed, updated.VersionID, payload)
+		s.recordIssueAudit(ctx, 0, issueAuditRetestFailed, updated.ID, auditMetadata)
+	}
+	return updated, nil
+}
+
+// OnRetestWaveTerminal is the wave-level writeback used by the execution
+// scheduler's WaveTerminalRetestNotifier. It aggregates the retest wave's linked
+// case_runs (any failed => failed, all passed => passed, otherwise retesting)
+// and applies one idempotent writeback.
+func (s *IssueService) OnRetestWaveTerminal(ctx context.Context, waveID int64) error {
+	if waveID <= 0 {
+		return invalidArgumentf("wave id must be a positive decimal ID")
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return err
+	}
+	if err := s.requireExecutionReader(); err != nil {
+		return err
+	}
+	issue, found, err := s.repo.FindByRetestWave(ctx, waveID)
+	if err != nil {
+		return mapIssueRepositoryError("find issue for retest wave", err)
+	}
+	if !found {
+		return nil
+	}
+	snapshot, err := s.exec.WaveSnapshot(ctx, issue.VersionID, waveID)
+	if err != nil {
+		return mapIssueRepositoryError("load retest wave snapshot", err)
+	}
+	linked, err := s.retestCaseRunIDs(ctx, issue.ID)
+	if err != nil {
+		return err
+	}
+	runs := make([]CaseRunSnapshot, 0, len(snapshot.CaseRuns))
+	for _, run := range snapshot.CaseRuns {
+		if len(linked) > 0 {
+			if _, ok := linked[run.ID]; !ok {
+				continue
+			}
+		}
+		runs = append(runs, run)
+	}
+	if len(runs) == 0 {
+		// An empty retest wave has no case_run result to write; the issue keeps
+		// the retesting status set by StartRetest.
+		return nil
+	}
+	target, representative, reason := aggregateRetestRuns(runs)
+	if target == delivery.IssueRetestStatusRetesting {
+		reason = representative.Status
+	}
+	_, err = s.OnRetestTerminal(ctx, waveID, representative.ID, reason)
+	return err
+}
+
+// retestCaseRunIDs returns the case_run IDs linked with role='retest'.
+func (s *IssueService) retestCaseRunIDs(ctx context.Context, issueID int64) (map[int64]struct{}, error) {
+	refs, err := s.repo.ListRefs(ctx, issueID)
+	if err != nil {
+		return nil, mapIssueRepositoryError("list retest refs", err)
+	}
+	linked := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.Kind == delivery.IssueRefKindCaseRun && ref.Role == delivery.IssueRefRoleRetest {
+			linked[ref.RefID] = struct{}{}
+		}
+	}
+	return linked, nil
+}
+
+// aggregateRetestRuns applies the R-W2-2 outcome rule. The representative run is
+// the failed run when any failed, otherwise the last passed run, otherwise the
+// last non-passed run (the reason source of the "keeps retesting" case).
+func aggregateRetestRuns(runs []CaseRunSnapshot) (string, CaseRunSnapshot, string) {
+	var lastPassed *CaseRunSnapshot
+	var lastOther *CaseRunSnapshot
+	for index := range runs {
+		run := runs[index]
+		switch run.Status {
+		case "failed":
+			return delivery.IssueRetestStatusFailed, run, "failed"
+		case "passed":
+			lastPassed = &run
+		default:
+			lastOther = &run
+		}
+	}
+	if lastOther != nil {
+		return delivery.IssueRetestStatusRetesting, *lastOther, lastOther.Status
+	}
+	if lastPassed != nil {
+		return delivery.IssueRetestStatusPassed, *lastPassed, "passed"
+	}
+	return delivery.IssueRetestStatusRetesting, CaseRunSnapshot{}, "unknown"
+}
+
+// retestOutcome maps a terminal case_run status onto the issue retest status and
+// the optional reason recorded for the "keeps retesting" case.
+func retestOutcome(status string) (string, string) {
+	trimmed := strings.TrimSpace(status)
+	switch trimmed {
+	case "passed":
+		return delivery.IssueRetestStatusPassed, ""
+	case "failed":
+		return delivery.IssueRetestStatusFailed, ""
+	default:
+		if trimmed == "" {
+			trimmed = "unknown"
+		}
+		return delivery.IssueRetestStatusRetesting, trimmed
+	}
+}
+
 // IssueDetail is the read projection of one issue: its row plus the append-only
 // refs and status history and the latest triage analysis run, when one is
 // attached through IssueTriageReader. MergedChain is the read-time merged_into
@@ -315,6 +686,10 @@ type IssueService struct {
 	clock  Clock
 	tasks  TaskEnsurer
 	triage IssueTriageReader
+	// retest is the v0.22 W2-5 execution write port (intent creation + wave
+	// planning). It is optional so the P4 constructor and its tests keep
+	// compiling; WithRetestExecutor attaches it in the composition root.
+	retest RetestExecutor
 
 	// P6 cross-version read ports. They stay optional so the P4 constructor
 	// and its tests keep compiling; WithGlobalReader attaches them.
@@ -343,6 +718,15 @@ func NewIssueService(repo IssueRepository, exec ExecutionReader, events EventPub
 func (s *IssueService) WithTriageReader(reader IssueTriageReader) *IssueService {
 	if s != nil {
 		s.triage = reader
+	}
+	return s
+}
+
+// WithRetestExecutor attaches the v0.22 W2-5 retest execution port. It returns
+// the service so the assembly root can chain it after construction.
+func (s *IssueService) WithRetestExecutor(executor RetestExecutor) *IssueService {
+	if s != nil {
+		s.retest = executor
 	}
 	return s
 }

@@ -82,6 +82,12 @@ type fakeIssueRepository struct {
 	listResult []delivery.Issue
 	listErr    error
 	listCalls  []issueListCall
+
+	retestStartCalls  []IssueRetestStart
+	retestStartErr    error
+	retestResultCalls []IssueRetestResult
+	retestResultErr   error
+	retestFind        map[int64]delivery.Issue
 }
 
 // issueAppendRefsCall records one AppendRefs fallback.
@@ -228,7 +234,114 @@ func (r *fakeIssueRepository) FindByCaseRun(_ context.Context, _, caseRunID int6
 	return issue, ok, nil
 }
 
+func (r *fakeIssueRepository) StartRetest(_ context.Context, in IssueRetestStart) (delivery.Issue, error) {
+	r.retestStartCalls = append(r.retestStartCalls, in)
+	if r.retestStartErr != nil {
+		return delivery.Issue{}, r.retestStartErr
+	}
+	issue, ok := r.getIssues[in.IssueID]
+	if !ok {
+		return delivery.Issue{}, delivery.ErrNotFound
+	}
+	issue.RetestStatus = delivery.IssueRetestStatusRetesting
+	waveID := in.WaveID
+	issue.LastRetestWaveID = &waveID
+	issue.UpdatedAt = in.Now
+	r.getIssues[in.IssueID] = issue
+	r.refs = append(r.refs, in.Refs...)
+	return issue, nil
+}
+
+func (r *fakeIssueRepository) ApplyRetestResult(_ context.Context, in IssueRetestResult) (delivery.Issue, error) {
+	r.retestResultCalls = append(r.retestResultCalls, in)
+	if r.retestResultErr != nil {
+		return delivery.Issue{}, r.retestResultErr
+	}
+	issue, ok := r.getIssues[in.IssueID]
+	if !ok {
+		return delivery.Issue{}, delivery.ErrNotFound
+	}
+	if issue.LastRetestWaveID == nil || *issue.LastRetestWaveID != in.WaveID {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+	issue.RetestStatus = in.TargetStatus
+	caseRunID := in.CaseRunID
+	issue.LastRetestCaseRunID = &caseRunID
+	issue.UpdatedAt = in.Now
+	r.getIssues[in.IssueID] = issue
+	return issue, nil
+}
+
+func (r *fakeIssueRepository) FindByRetestWave(_ context.Context, waveID int64) (delivery.Issue, bool, error) {
+	if r.retestFind != nil {
+		issue, ok := r.retestFind[waveID]
+		return issue, ok, nil
+	}
+	for _, issue := range r.getIssues {
+		if issue.LastRetestWaveID != nil && *issue.LastRetestWaveID == waveID {
+			return issue, true, nil
+		}
+	}
+	return delivery.Issue{}, false, nil
+}
+
 var _ IssueRepository = (*fakeIssueRepository)(nil)
+
+// fakeRetestExecutor is the in-memory W2-5 RetestExecutor.
+type fakeRetestExecutor struct {
+	active      *RetestWave
+	activeErr   error
+	wave        RetestWave
+	waveErr     error
+	createErr   error
+	createCalls []issueRetestIntentCall
+	cancelErr   error
+	canceled    []int64
+	activeCalls []int64
+	startCalls  []int64
+}
+
+type issueRetestIntentCall struct {
+	versionID     int64
+	caseVersionID int64
+	actorID       int64
+}
+
+func (e *fakeRetestExecutor) CreateRetestIntent(_ context.Context, versionID, caseVersionID, actorID int64) (int64, error) {
+	e.createCalls = append(e.createCalls, issueRetestIntentCall{
+		versionID: versionID, caseVersionID: caseVersionID, actorID: actorID,
+	})
+	if e.createErr != nil {
+		return 0, e.createErr
+	}
+	return int64(1000 + len(e.createCalls)), nil
+}
+
+func (e *fakeRetestExecutor) CancelRetestIntent(_ context.Context, intentID int64) error {
+	e.canceled = append(e.canceled, intentID)
+	return e.cancelErr
+}
+
+func (e *fakeRetestExecutor) ActiveWave(_ context.Context, versionID int64) (RetestWave, bool, error) {
+	e.activeCalls = append(e.activeCalls, versionID)
+	if e.activeErr != nil {
+		return RetestWave{}, false, e.activeErr
+	}
+	if e.active == nil {
+		return RetestWave{}, false, nil
+	}
+	return *e.active, true, nil
+}
+
+func (e *fakeRetestExecutor) StartRetestWave(_ context.Context, versionID int64) (RetestWave, error) {
+	e.startCalls = append(e.startCalls, versionID)
+	if e.waveErr != nil {
+		return RetestWave{}, e.waveErr
+	}
+	return e.wave, nil
+}
+
+var _ RetestExecutor = (*fakeRetestExecutor)(nil)
 
 // fakeIssueExecution is the in-memory ExecutionReader of the scan/ingest tests.
 type fakeIssueExecution struct {
@@ -239,6 +352,10 @@ type fakeIssueExecution struct {
 	snapshots         map[int64]CaseRunSnapshot
 	snapshotErrByCase map[int64]error
 	snapshotCalls     []int64
+
+	waveSnapshots map[int64]WaveSnapshot
+	waveErr       error
+	waveCalls     []int64
 }
 
 func (e *fakeIssueExecution) ListFailedApplicationCaseRuns(_ context.Context, versionID int64) ([]CaseRunSnapshot, error) {
@@ -261,8 +378,16 @@ func (e *fakeIssueExecution) CaseRunSnapshot(_ context.Context, caseRunID int64)
 	return snapshot, nil
 }
 
-func (e *fakeIssueExecution) WaveSnapshot(context.Context, int64, int64) (WaveSnapshot, error) {
-	return WaveSnapshot{}, nil
+func (e *fakeIssueExecution) WaveSnapshot(_ context.Context, _, waveID int64) (WaveSnapshot, error) {
+	e.waveCalls = append(e.waveCalls, waveID)
+	if e.waveErr != nil {
+		return WaveSnapshot{}, e.waveErr
+	}
+	snapshot, ok := e.waveSnapshots[waveID]
+	if !ok {
+		return WaveSnapshot{}, errIssueTestBoom
+	}
+	return snapshot, nil
 }
 
 func (e *fakeIssueExecution) VersionSnapshot(context.Context, int64) (VersionSnapshot, error) {
@@ -373,6 +498,7 @@ type issueServiceFixture struct {
 	audit  *fakeIssueAudit
 	clock  *fakeIssueClock
 	tasks  *fakeIssueTasks
+	retest *fakeRetestExecutor
 	svc    *IssueService
 }
 
@@ -387,13 +513,16 @@ func newIssueServiceFixture() *issueServiceFixture {
 		exec: &fakeIssueExecution{
 			snapshots:         map[int64]CaseRunSnapshot{},
 			snapshotErrByCase: map[int64]error{},
+			waveSnapshots:     map[int64]WaveSnapshot{},
 		},
 		events: &fakeIssueEvents{},
 		audit:  &fakeIssueAudit{},
 		clock:  &fakeIssueClock{now: issueServiceTestNow},
 		tasks:  &fakeIssueTasks{},
+		retest: &fakeRetestExecutor{},
 	}
 	fixture.svc = NewIssueService(fixture.repo, fixture.exec, fixture.events, fixture.audit, fixture.clock, fixture.tasks)
+	fixture.svc.WithRetestExecutor(fixture.retest)
 	return fixture
 }
 

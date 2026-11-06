@@ -53,6 +53,16 @@ func TestIssueRoutesAreRegistered(t *testing.T) {
 		t.Fatalf("patch manual route did not reach the service: %#v", service.manualUpdateCalls)
 	}
 
+	service.retestResult = deliveryapp.RetestResult{
+		Wave:  deliveryapp.RetestWave{ID: 900, Status: "running"},
+		Issue: issue,
+	}
+	recorder = deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/retest", "", userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	if len(service.retestCalls) != 1 || service.retestCalls[0].issueID != 1001 {
+		t.Fatalf("retest route did not reach the service: %#v", service.retestCalls)
+	}
+
 	// The mux must reject unsupported methods instead of falling through.
 	recorder = deliveryCall(t, mux, http.MethodDelete, "/api/versions/42/issues/1001", "", nil)
 	requireStatus(t, recorder, http.StatusMethodNotAllowed)

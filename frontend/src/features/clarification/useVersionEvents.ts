@@ -271,6 +271,9 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "issue.reopened":
         case "issue.merged":
         case "issue.recurred":
+        case "issue.retest_started":
+        case "issue.retest_completed":
+        case "issue.retest_failed":
           handlersRef.current.onIssueChanged?.(event)
           break
         case "report.published":

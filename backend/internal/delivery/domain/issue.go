@@ -25,6 +25,11 @@ const MaxIssueMergeChain = 16
 // (issue_id, kind, ref_id, role) key makes a repeated recurrence ref a no-op.
 const IssueRefRoleRecurrence = "recurrence"
 
+// IssueRefRoleRetest is the ref role that links an issue to its retest wave and
+// to the case_runs of that wave (v0.22 W2-5 / DB-23). Source refs keep
+// IssueRefRoleSource, so a retest never hides the original failure linkage.
+const IssueRefRoleRetest = "retest"
+
 // Stable merge conflict reasons (spec §5.2 details.reason subcodes).
 const (
 	// MergeReasonTargetInvalid marks a self, cross-version, unknown or already

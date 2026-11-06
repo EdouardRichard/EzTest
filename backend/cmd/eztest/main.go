@@ -423,6 +423,140 @@ func (a executionBatchStarterAdapter) StartBatch(ctx context.Context, versionID 
 	return err
 }
 
+// deliveryRetestAdapter adapts the execution context's intent service,
+// deterministic scheduler and wave/case_run repositories to the delivery W2-5
+// RetestExecutor port. The composition root is the only place that knows both
+// bounded contexts.
+type deliveryRetestAdapter struct {
+	intents   *executionapp.IntentService
+	waves     executionapp.WaveRepository
+	caseRuns  executionapp.CaseRunRepository
+	scheduler *executionapp.Scheduler
+}
+
+func (a deliveryRetestAdapter) CreateRetestIntent(ctx context.Context, versionID, caseVersionID, actorID int64) (int64, error) {
+	if a.intents == nil {
+		return 0, errors.New("retest intent service is not configured")
+	}
+	intent, err := a.intents.CreateManual(ctx, versionID, caseVersionID, execution.PurposeRetest, actorID)
+	if err != nil {
+		return 0, err
+	}
+	return intent.ID, nil
+}
+
+func (a deliveryRetestAdapter) CancelRetestIntent(ctx context.Context, intentID int64) error {
+	if a.intents == nil {
+		return errors.New("retest intent service is not configured")
+	}
+	return a.intents.Cancel(ctx, intentID, 0)
+}
+
+func (a deliveryRetestAdapter) ActiveWave(ctx context.Context, versionID int64) (deliveryapp.RetestWave, bool, error) {
+	if a.waves == nil {
+		return deliveryapp.RetestWave{}, false, errors.New("retest wave repository is not configured")
+	}
+	wave, err := a.waves.GetActive(ctx, versionID)
+	if err != nil {
+		return deliveryapp.RetestWave{}, false, err
+	}
+	if wave == nil {
+		return deliveryapp.RetestWave{}, false, nil
+	}
+	projected, err := a.retestWave(ctx, *wave)
+	if err != nil {
+		return deliveryapp.RetestWave{}, false, err
+	}
+	return projected, true, nil
+}
+
+func (a deliveryRetestAdapter) StartRetestWave(ctx context.Context, versionID int64) (deliveryapp.RetestWave, error) {
+	if a.scheduler == nil {
+		return deliveryapp.RetestWave{}, errors.New("retest scheduler is not configured")
+	}
+	if err := a.scheduler.ReconcileVersion(ctx, versionID); err != nil {
+		return deliveryapp.RetestWave{}, err
+	}
+	wave, err := a.waves.GetActive(ctx, versionID)
+	if err != nil {
+		return deliveryapp.RetestWave{}, err
+	}
+	if wave == nil {
+		return deliveryapp.RetestWave{}, errors.New("no retest wave was planned")
+	}
+	return a.retestWave(ctx, *wave)
+}
+
+func (a deliveryRetestAdapter) retestWave(ctx context.Context, wave execution.RunWave) (deliveryapp.RetestWave, error) {
+	runs, err := a.caseRuns.ListAllByWave(ctx, wave.ID)
+	if err != nil {
+		return deliveryapp.RetestWave{}, err
+	}
+	projected := deliveryapp.RetestWave{
+		ID:     wave.ID,
+		Status: string(wave.Status),
+	}
+	projected.CaseRuns = make([]deliveryapp.RetestCaseRun, 0, len(runs))
+	for _, run := range runs {
+		projected.CaseRuns = append(projected.CaseRuns, deliveryapp.RetestCaseRun{
+			ID:            run.ID,
+			CaseVersionID: run.CaseVersionID,
+			Status:        string(run.Status),
+		})
+	}
+	return projected, nil
+}
+
+var _ deliveryapp.RetestExecutor = deliveryRetestAdapter{}
+
+// deliveryRetestNotifier adapts the delivery issue service to the execution
+// WaveTerminalRetestNotifier port.
+type deliveryRetestNotifier struct {
+	issues *deliveryapp.IssueService
+}
+
+func (n deliveryRetestNotifier) OnWaveTerminalRetest(ctx context.Context, waveID int64) error {
+	if n.issues == nil {
+		return nil
+	}
+	return n.issues.OnRetestWaveTerminal(ctx, waveID)
+}
+
+var _ executionapp.WaveTerminalRetestNotifier = deliveryRetestNotifier{}
+
+// retestCallbackRelay lets the execution scheduler/pause services receive the
+// delivery retest writeback before the delivery issue service is constructed.
+type retestCallbackRelay struct {
+	mu       sync.RWMutex
+	notifier executionapp.WaveTerminalRetestNotifier
+}
+
+func newRetestCallbackRelay() *retestCallbackRelay { return &retestCallbackRelay{} }
+
+func (r *retestCallbackRelay) set(notifier executionapp.WaveTerminalRetestNotifier) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.notifier = notifier
+}
+
+func (r *retestCallbackRelay) OnWaveTerminalRetest(ctx context.Context, waveID int64) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	notifier := r.notifier
+	r.mu.RUnlock()
+	if notifier == nil {
+		return nil
+	}
+	return notifier.OnWaveTerminalRetest(ctx, waveID)
+}
+
+var _ executionapp.WaveTerminalRetestNotifier = (*retestCallbackRelay)(nil)
+
 // designMetricsAdapter maps designapp.CaseCounts to the version read model.
 type designMetricsAdapter struct {
 	planner *designapp.Planner
@@ -1380,6 +1514,7 @@ func main() {
 	// receive a relay that the composition root binds once the stage service
 	// exists (Task 25 fix round 1 / Task 36).
 	stageCallbacks := newStageCallbackRelay()
+	retestCallbacks := newRetestCallbackRelay()
 	executionPause := executionapp.NewPauseService(executionapp.PauseServiceDeps{
 		Intents:   executionRepo.Intents,
 		Waves:     executionRepo.Waves,
@@ -1397,6 +1532,9 @@ func main() {
 		// W1-14A: a cancelled wave is terminal too, so it runs the same
 		// discovery-delta pass as the scheduler's done/failed paths.
 		Delta: discoveryDeltaEvaluator,
+		// W2-5: a cancelled retest wave writes the "other terminal status" back
+		// to the delivery issue.
+		RetestNotifier: retestCallbacks,
 	})
 	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
 		Intents:  executionRepo.Intents,
@@ -1428,7 +1566,10 @@ func main() {
 		StageNotifier:   stageCallbacks,
 		StageReconciler: stageCallbacks,
 		// W1-14A: classify the wave's execution-time observations once terminal.
-		Delta:           discoveryDeltaEvaluator,
+		Delta: discoveryDeltaEvaluator,
+		// W2-5: a terminal retest wave writes passed/failed/other back to the
+		// delivery issue after the wave row is terminal.
+		RetestNotifier: retestCallbacks,
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Intents:     executionRepo.Intents,
@@ -1508,6 +1649,15 @@ func main() {
 	issueSvc := deliveryapp.NewIssueService(
 		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
 	issueSvc.WithTriageReader(analysisRepo)
+	issueSvc.WithRetestExecutor(deliveryRetestAdapter{
+		intents:   executionIntents,
+		waves:     executionRepo.Waves,
+		caseRuns:  executionRepo.CaseRuns,
+		scheduler: executionScheduler,
+	})
+	// The wave-terminal callback is owned by the delivery issue service; the
+	// relay was already passed to the scheduler/pause services above.
+	retestCallbacks.set(deliveryRetestNotifier{issues: issueSvc})
 	analysisSvc := deliveryapp.NewAnalysisService(analysisRepo, issueSvc, clk)
 	analysisSvc.WithTriagePoster(deliveryTriagePoster{room: teamRoom})
 	pdfEnabled, pdfAttempts := p7RenderSettings(ctx, settingsSvc)

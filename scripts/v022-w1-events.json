@@ -413,6 +413,24 @@
       "channel": "version:N"
     },
     {
+      "type": "issue.retest_completed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:275",
+      "channel": "version:N"
+    },
+    {
+      "type": "issue.retest_failed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:276",
+      "channel": "version:N"
+    },
+    {
+      "type": "issue.retest_started",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:274",
+      "channel": "version:N"
+    },
+    {
       "type": "issue.updated",
       "consumer": "ui",
       "evidence": "frontend/src/features/clarification/useVersionEvents.ts:260",

@@ -30,6 +30,7 @@ type Service interface {
 	Merge(ctx context.Context, versionID, sourceID, targetID, actorID int64, reason string, expected *int32) (delivery.Issue, error)
 	CreateManual(ctx context.Context, in deliveryapp.CreateManualIssueInput, actorID int64) (delivery.Issue, error)
 	UpdateManual(ctx context.Context, versionID, issueID int64, in deliveryapp.UpdateManualIssueInput, actorID int64) (delivery.Issue, error)
+	StartRetest(ctx context.Context, versionID, issueID, actorID int64, caseRunIDs ...int64) (deliveryapp.RetestResult, error)
 }
 
 var _ Service = (*deliveryapp.IssueService)(nil)
@@ -292,6 +293,59 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, h.actionIssueView(r.Context(), versionID, issue))
 }
 
+// RetestIssue POST /api/versions/{versionId}/issues/{issueId}/retest (v0.22
+// W2-5/API-25). The optional body selects a subset of the issue's linked
+// case_runs; the response carries the retest wave identity and the issue's new
+// retest_status.
+func (h *Handler) RetestIssue(w http.ResponseWriter, r *http.Request) {
+	if h.issues == nil {
+		writeNotConfigured(w, r, "issue service")
+		return
+	}
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := pathID(r, "versionId", "versionId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	issueID, err := pathID(r, "issueId", "issueId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request retestIssueRequest
+	if err := decodeBody(w, r, &request, false); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	caseRunIDs, err := request.parse()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	result, err := h.issues.StartRetest(r.Context(), versionID, issueID, actorID, caseRunIDs...)
+	if err != nil {
+		httpx.Error(w, r, mapIssueError(err, deliveryapp.IssueConflictRetestActive))
+		return
+	}
+	caseRunIDsView := make([]string, 0, len(result.Wave.CaseRuns))
+	for _, run := range result.Wave.CaseRuns {
+		caseRunIDsView = append(caseRunIDsView, platformid.Format(run.ID))
+	}
+	httpx.JSON(w, http.StatusOK, RetestIssueView{
+		IssueID:      platformid.Format(result.Issue.ID),
+		VersionID:    platformid.Format(versionID),
+		WaveID:       platformid.Format(result.Wave.ID),
+		WaveStatus:   result.Wave.Status,
+		RetestStatus: result.Issue.RetestStatus,
+		CaseRunIDs:   caseRunIDsView,
+	})
+}
+
 /* -------------------------------- actions --------------------------------- */
 
 // ConfirmIssue POST /api/versions/{versionId}/issues/{issueId}/confirm.
@@ -540,6 +594,10 @@ func issueStateConflict(reason string) error {
 		message = "issue is not reopenable"
 	case deliveryapp.IssueConflictRevisionMismatch:
 		message = "issue revision is stale"
+	case deliveryapp.IssueConflictNotRetestable:
+		message = "issue is not retestable"
+	case deliveryapp.IssueConflictRetestActive:
+		message = "a retest wave is already active"
 	case delivery.MergeReasonTargetInvalid:
 		message = "merge target is invalid"
 	case delivery.MergeReasonCycle:

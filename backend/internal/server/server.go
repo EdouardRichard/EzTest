@@ -605,6 +605,8 @@ func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", authenticated(http.HandlerFunc(h.DismissIssue)))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", authenticated(http.HandlerFunc(h.ReopenIssue)))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", authenticated(http.HandlerFunc(h.MergeIssue)))
+	// W2-5 issue retest (API-25); creates a PurposeRetest wave and links it back.
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/retest", authenticated(http.HandlerFunc(h.RetestIssue)))
 	// W2-4 manual issue creation/update (API-24); the handler is version-scoped
 	// and validates the version through the delivery repository.
 	mux.Handle("POST /api/versions/{versionId}/issues", authenticated(http.HandlerFunc(h.CreateIssue)))

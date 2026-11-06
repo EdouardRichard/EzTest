@@ -34,6 +34,10 @@ type PauseService struct {
 	// terminal, so CancelWave runs the same once-per-terminal-wave pass as the
 	// scheduler's done/failed paths. nil disables it.
 	delta DiscoveryDeltaEvaluator
+	// retestNotifier is the v0.22 W2-5 wave-terminal retest writeback callback.
+	// A cancelled wave is terminal, so CancelWave invokes it exactly like the
+	// scheduler's done/failed paths. nil disables it.
+	retestNotifier WaveTerminalRetestNotifier
 }
 
 // PauseServiceDeps wires the pause/resume service. contexts/executor/canceller
@@ -57,23 +61,28 @@ type PauseServiceDeps struct {
 	// round 1). nil disables it. A cancelled wave calls it once, exactly like
 	// the scheduler's done/failed paths.
 	Delta DiscoveryDeltaEvaluator
+	// RetestNotifier is the v0.22 W2-5 retest writeback callback. nil disables
+	// it; a cancelled wave invokes it exactly like the scheduler's done/failed
+	// paths.
+	RetestNotifier WaveTerminalRetestNotifier
 }
 
 // NewPauseService builds the pause/resume service.
 func NewPauseService(deps PauseServiceDeps) *PauseService {
 	return &PauseService{
-		intents:       deps.Intents,
-		waves:         deps.Waves,
-		caseRuns:      deps.CaseRuns,
-		humans:        deps.Humans,
-		contexts:      deps.Contexts,
-		canceller:     deps.Canceller,
-		executor:      deps.Executor,
-		clock:         deps.Clock,
-		events:        deps.Events,
-		audit:         deps.Audit,
-		stageNotifier: deps.StageNotifier,
-		delta:         deps.Delta,
+		intents:        deps.Intents,
+		waves:          deps.Waves,
+		caseRuns:       deps.CaseRuns,
+		humans:         deps.Humans,
+		contexts:       deps.Contexts,
+		canceller:      deps.Canceller,
+		executor:       deps.Executor,
+		clock:          deps.Clock,
+		events:         deps.Events,
+		audit:          deps.Audit,
+		stageNotifier:  deps.StageNotifier,
+		delta:          deps.Delta,
+		retestNotifier: deps.RetestNotifier,
 	}
 }
 
@@ -323,6 +332,10 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		// lost advance. The discovery delta, in contrast, must run exactly once
 		// per terminal wave, so the already-cancelled branch never re-runs it.
 		s.notifyStageWaveCancelled(ctx, wave)
+		// v0.22 W2-5: a repeated cancel re-runs the idempotent retest writeback
+		// so a lost delivery callback heals; the issue service deduplicates the
+		// event itself.
+		s.notifyRetestWaveCancelled(ctx, wave)
 		return wave, nil
 	}
 	now := s.now()
@@ -350,6 +363,10 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 	// after the cancel committed so executing -> reporting is not stranded on a
 	// manual stage advance (Task 25 fix round 1).
 	s.notifyStageWaveCancelled(ctx, wave)
+	// v0.22 W2-5: a cancelled retest wave keeps the issue retesting (the
+	// "other terminal status" rule) and records the cancellation reason. Best
+	// effort: the cancellation is the source of truth.
+	s.notifyRetestWaveCancelled(ctx, wave)
 	// W1-14A: the cancelled transition is the wave's terminal transition, so the
 	// discovery delta runs here exactly once (the already-cancelled branch above
 	// never reaches this point).
@@ -368,6 +385,22 @@ func (s *PauseService) notifyStageWaveCancelled(ctx context.Context, wave execut
 	if err := s.stageNotifier.OnWaveTerminal(ctx, wave.ID); err != nil {
 		slog.Default().WarnContext(ctx,
 			"execution: cancelled-wave stage callback failed; the stage reconciler will retry",
+			"version_id", wave.VersionID, "wave_id", wave.ID, "error", err)
+	}
+}
+
+// notifyRetestWaveCancelled invokes the optional v0.22 W2-5 retest writeback
+// for a cancelled wave. The cancellation is the source of truth: a delivery
+// failure is logged and never fails or rolls back the cancel.
+func (s *PauseService) notifyRetestWaveCancelled(ctx context.Context, wave execution.RunWave) {
+	if s == nil || s.retestNotifier == nil || wave.ID <= 0 {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, retestWritebackTimeout)
+	defer cancel()
+	if err := s.retestNotifier.OnWaveTerminalRetest(writeCtx, wave.ID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: cancelled-wave retest writeback failed; the issue keeps its current retest status",
 			"version_id", wave.VersionID, "wave_id", wave.ID, "error", err)
 	}
 }

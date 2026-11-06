@@ -208,6 +208,34 @@ func (r manualIssueRequest) parse(create bool) (manualIssueFields, error) {
 	return fields, nil
 }
 
+// retestIssueRequest is POST .../issues/{issueId}/retest (v0.22 W2-5/API-25).
+// The optional case_run_ids selection must reference case_runs linked to the
+// issue; an absent/empty list retests every linked case_run.
+type retestIssueRequest struct {
+	CaseRunIDs []string `json:"case_run_ids"`
+}
+
+// parse validates and deduplicates the optional case_run selection.
+func (r retestIssueRequest) parse() ([]int64, error) {
+	if len(r.CaseRunIDs) == 0 {
+		return nil, nil
+	}
+	seen := make(map[int64]struct{}, len(r.CaseRunIDs))
+	ids := make([]int64, 0, len(r.CaseRunIDs))
+	for _, raw := range r.CaseRunIDs {
+		id, err := validation.NonEmptyID("case_run_ids", raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // optionalIDField parses an optional decimal-string ID; a present empty or
 // non-positive value is invalid.
 func optionalIDField(field string, raw *string) (int64, error) {
@@ -262,6 +290,17 @@ type IssueView struct {
 	Triage           *IssueTriageView `json:"triage"`
 	CreatedAt        string           `json:"created_at"`
 	UpdatedAt        string           `json:"updated_at"`
+}
+
+// RetestIssueView is the POST .../issues/{issueId}/retest response (v0.22
+// W2-5/API-25): the retest wave identity and the issue's new retest_status.
+type RetestIssueView struct {
+	IssueID      string   `json:"issue_id"`
+	VersionID    string   `json:"version_id"`
+	WaveID       string   `json:"wave_id"`
+	WaveStatus   string   `json:"wave_status"`
+	RetestStatus string   `json:"retest_status"`
+	CaseRunIDs   []string `json:"case_run_ids"`
 }
 
 // IssueRefView is one append-only issue reference (contract IssueRefView).

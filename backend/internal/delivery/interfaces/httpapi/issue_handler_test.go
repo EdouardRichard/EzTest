@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +92,17 @@ type fakeIssueService struct {
 	manualUpdateErr   error
 	manualCreateCalls []issueManualCreateCall
 	manualUpdateCalls []issueManualUpdateCall
+
+	retestResult deliveryapp.RetestResult
+	retestErr    error
+	retestCalls  []issueRetestCall
+}
+
+type issueRetestCall struct {
+	versionID int64
+	issueID   int64
+	actorID   int64
+	caseRuns  []int64
 }
 
 func (f *fakeIssueService) List(_ context.Context, versionID int64, filter deliveryapp.IssueFilter) ([]delivery.Issue, error) {
@@ -165,6 +177,14 @@ func (f *fakeIssueService) UpdateManual(_ context.Context, versionID, issueID in
 		versionID: versionID, issueID: issueID, actorID: actorID, input: input,
 	})
 	return f.manualIssue, f.manualUpdateErr
+}
+
+func (f *fakeIssueService) StartRetest(_ context.Context, versionID, issueID, actorID int64, caseRunIDs ...int64) (deliveryapp.RetestResult, error) {
+	f.retestCalls = append(f.retestCalls, issueRetestCall{
+		versionID: versionID, issueID: issueID, actorID: actorID,
+		caseRuns: append([]int64(nil), caseRunIDs...),
+	})
+	return f.retestResult, f.retestErr
 }
 
 var _ Service = (*fakeIssueService)(nil)
@@ -1089,5 +1109,115 @@ func TestIssueHandlerActionErrorMapping(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestIssueHandlerStartRetest(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusConfirmed)
+	issue.RetestStatus = delivery.IssueRetestStatusRetesting
+	service := &fakeIssueService{
+		retestResult: deliveryapp.RetestResult{
+			Wave: deliveryapp.RetestWave{
+				ID: 900, Status: "running",
+				CaseRuns: []deliveryapp.RetestCaseRun{
+					{ID: 901, CaseVersionID: 71, Status: "pending"},
+					{ID: 902, CaseVersionID: 72, Status: "pending"},
+				},
+			},
+			Issue: issue,
+		},
+		details: map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)},
+	}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/retest",
+		`{"case_run_ids":["901","902"]}`, userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	data := decodeDeliveryObject(t, recorder)
+	if data["wave_id"] != "900" || data["wave_status"] != "running" || data["retest_status"] != "retesting" {
+		t.Fatalf("retest response = %#v, want wave 900/running/retesting", data)
+	}
+	caseRunIDs, ok := data["case_run_ids"].([]any)
+	if !ok || len(caseRunIDs) != 2 || caseRunIDs[0] != "901" || caseRunIDs[1] != "902" {
+		t.Fatalf("case_run_ids = %#v, want [901 902]", data["case_run_ids"])
+	}
+	if len(service.retestCalls) != 1 {
+		t.Fatalf("StartRetest calls = %d, want 1", len(service.retestCalls))
+	}
+	call := service.retestCalls[0]
+	if call.versionID != 42 || call.issueID != 1001 || call.actorID != 7 {
+		t.Fatalf("StartRetest call = %+v, want version 42 issue 1001 actor 7", call)
+	}
+	if !reflect.DeepEqual(call.caseRuns, []int64{901, 902}) {
+		t.Fatalf("selected case runs = %v, want [901 902]", call.caseRuns)
+	}
+
+	// An absent body is the "all linked case_runs" selection.
+	recorder = deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/retest", "", userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	if len(service.retestCalls) != 2 || len(service.retestCalls[1].caseRuns) != 0 {
+		t.Fatalf("empty-body call = %+v, want no case selection", service.retestCalls)
+	}
+}
+
+func TestIssueHandlerStartRetestErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		reason string
+	}{
+		{
+			name:   "not found",
+			err:    deliveryapp.ErrNotFound,
+			status: http.StatusNotFound,
+		},
+		{
+			name:   "active retest",
+			err:    &deliveryapp.IssueStateConflictError{Reason: deliveryapp.IssueConflictRetestActive},
+			status: http.StatusConflict,
+			reason: deliveryapp.IssueConflictRetestActive,
+		},
+		{
+			name:   "not retestable",
+			err:    &deliveryapp.IssueStateConflictError{Reason: deliveryapp.IssueConflictNotRetestable},
+			status: http.StatusConflict,
+			reason: deliveryapp.IssueConflictNotRetestable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeIssueService{retestErr: test.err}
+			mux := newDeliveryMux(t, New(service))
+			recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/retest", "", userActor())
+			requireStatus(t, recorder, test.status)
+			if test.reason != "" {
+				apiError := decodeDeliveryError(t, recorder)
+				if reason := errorDetails(t, apiError)["reason"]; reason != test.reason {
+					t.Fatalf("details.reason = %v, want %s", reason, test.reason)
+				}
+			}
+		})
+	}
+}
+
+func TestIssueHandlerStartRetestRejectsInvalidCaseRunID(t *testing.T) {
+	service := &fakeIssueService{}
+	mux := newDeliveryMux(t, New(service))
+	recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/retest",
+		`{"case_run_ids":["not-an-id"]}`, userActor())
+	requireStatus(t, recorder, http.StatusBadRequest)
+	if len(service.retestCalls) != 0 {
+		t.Fatalf("invalid selection reached the service: %+v", service.retestCalls)
+	}
+}
+
+func TestIssueHandlerStartRetestRequiresActor(t *testing.T) {
+	service := &fakeIssueService{}
+	mux := newDeliveryMux(t, New(service))
+	recorder := deliveryCall(t, mux, http.MethodPost, "/api/versions/42/issues/1001/retest", "", nil)
+	requireStatus(t, recorder, http.StatusUnauthorized)
+	if len(service.retestCalls) != 0 {
+		t.Fatalf("unauthenticated retest reached the service: %+v", service.retestCalls)
 	}
 }

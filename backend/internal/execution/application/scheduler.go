@@ -66,6 +66,9 @@ type Scheduler struct {
 	stageReconciler StageReconciler
 	pendingStageMu  sync.Mutex
 	pendingStage    map[int64]struct{}
+	// retestNotifier is the v0.22 W2-5 retest writeback callback. nil keeps the
+	// pre-v0.22 behavior; the composition root binds the delivery adapter.
+	retestNotifier WaveTerminalRetestNotifier
 	// delta is the optional v0.22 version-context discovery-delta trigger
 	// (W1-14A): the scheduler calls it once when a wave becomes terminal
 	// (done or failed); PauseService does the same for a cancelled wave.
@@ -84,6 +87,15 @@ type Scheduler struct {
 // failure and retries it on a later tick through StageReconciler.
 type WaveTerminalStageNotifier interface {
 	OnWaveTerminal(ctx context.Context, waveID int64) error
+}
+
+// WaveTerminalRetestNotifier is the narrow v0.22 W2-5 callback the scheduler and
+// PauseService invoke once when a wave becomes terminal (done/failed/cancelled),
+// so the delivery issue service can write the retest outcome back. Implementations
+// must be idempotent and must not block wave finalization: the call is best
+// effort, bounded by a deadline, and a failure is logged rather than rolled back.
+type WaveTerminalRetestNotifier interface {
+	OnWaveTerminalRetest(ctx context.Context, waveID int64) error
 }
 
 // StageReconciler is the narrow retry port the scheduler uses when a
@@ -130,6 +142,9 @@ type SchedulerDeps struct {
 	// Delta is the W1-14A wave-terminal discovery-delta trigger implemented by
 	// the version context. nil disables the trigger (degraded assemblies/tests).
 	Delta DiscoveryDeltaEvaluator
+	// RetestNotifier is the v0.22 W2-5 a wave-terminal retest writeback callback
+	// implemented by the delivery issue service adapter. nil disables it.
+	RetestNotifier WaveTerminalRetestNotifier
 }
 
 // NewScheduler builds the scheduler.
@@ -165,6 +180,7 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		stageNotifier:   deps.StageNotifier,
 		stageReconciler: deps.StageReconciler,
 		delta:           deps.Delta,
+		retestNotifier:  deps.RetestNotifier,
 		pendingStage:    map[int64]struct{}{},
 		blocked:         map[int64]string{},
 	}
@@ -261,6 +277,9 @@ func (s *Scheduler) failEmptyWave(ctx context.Context, wave execution.RunWave) e
 		map[string]any{"wave_id": platformid.Format(wave.ID), "status": string(execution.WaveFailed)},
 		nil)
 	s.notifyStageWaveTerminal(ctx, wave.VersionID, wave.ID)
+	// v0.22 W2-5: an empty/failed retest wave must still settle the issue
+	// retest state; the callback is best effort and idempotent.
+	s.notifyRetestWaveTerminal(ctx, wave.VersionID, wave.ID)
 	// W1-14A: a failed wave is terminal too, so the discovery delta runs exactly
 	// once here (the changed guard makes the transition itself once-only). An
 	// empty wave produced no observation, so the version evaluator naturally
@@ -476,6 +495,10 @@ func (s *Scheduler) completeWave(ctx context.Context, wave execution.RunWave, ru
 	// executing -> reporting (R-B4-3). The callback runs after analysis so the
 	// version report snapshot includes the analyzed issues.
 	s.notifyStageWaveTerminal(ctx, wave.VersionID, wave.ID)
+	// v0.22 W2-5: write the retest outcome back to the delivery issue after the
+	// wave row is terminal. Best effort: a delivery failure never rolls back the
+	// completed wave.
+	s.notifyRetestWaveTerminal(ctx, wave.VersionID, wave.ID)
 	// W1-14A: classify this wave's execution-time observations into resources/
 	// facts and publish resource.delta. It runs after the terminal transition
 	// (the changed guard makes it once per wave) and after the stage callback, is
@@ -531,6 +554,26 @@ func (s *Scheduler) notifyStageWaveTerminal(ctx context.Context, versionID, wave
 		return
 	}
 	s.clearPendingStage(versionID)
+}
+
+// retestWritebackTimeout bounds the best-effort retest writeback so a slow
+// delivery adapter can neither block nor fail the wave finalization.
+const retestWritebackTimeout = 15 * time.Second
+
+// notifyRetestWaveTerminal invokes the optional v0.22 W2-5 retest writeback
+// after a wave becomes terminal. The wave finalization is the source of truth:
+// a delivery failure is logged and never rolls the wave back or fails the tick.
+func (s *Scheduler) notifyRetestWaveTerminal(ctx context.Context, versionID, waveID int64) {
+	if s == nil || s.retestNotifier == nil || waveID <= 0 {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, retestWritebackTimeout)
+	defer cancel()
+	if err := s.retestNotifier.OnWaveTerminalRetest(writeCtx, waveID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: wave-terminal retest writeback failed; the issue keeps its current retest status",
+			"version_id", versionID, "wave_id", waveID, "error", err)
+	}
 }
 
 // retryPendingStageNotifications re-drives the stage machine for every version
