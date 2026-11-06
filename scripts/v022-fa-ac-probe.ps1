@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA-6/FA-7 independent AC probes: R01-R06 (22 ACs) and
@@ -1823,6 +1823,54 @@ function Get-EztestVerdicts {
         foreach ($name in @('runs', 'items', 'caseRuns', 'case_runs', 'records')) {
             $value = Get-ObjValue $json @($name)
             if ($null -ne $value) { $runs = @($value); break }
+        }
+    }
+    if ($runs.Count -eq 0) {
+        # FA-5 writes case-runs.json grouped by requirement:
+        # { requirements: [ { requirementId, runs: [{ status, ... }] } ] }.
+        # Flatten it into the per-run shape handled below.
+        $requirementGroups = @()
+        $groupValue = Get-ObjValue $json @('requirements')
+        if ($null -ne $groupValue) { $requirementGroups = @($groupValue) }
+        if ($requirementGroups.Count -gt 0) {
+            $runs = @()
+            foreach ($group in $requirementGroups) {
+                if ($null -eq $group) { continue }
+                $groupRid = [string](Get-ObjValue $group @('requirementId', 'requirement_id'))
+                foreach ($groupRun in @(Get-ObjValue $group @('runs'))) {
+                    if ($null -eq $groupRun) { continue }
+                    $runs += [pscustomobject]@{
+                        requirementId = $groupRid
+                        status = [string](Get-ObjValue $groupRun @('status'))
+                    }
+                }
+            }
+        }
+    }
+    if ($runs.Count -gt 0) {
+        # case-runs.json groups by the internal requirement id; requirements.json
+        # carries the declared external id (R01..R12). Translate before grouping.
+        $requirementsPath = Join-Path $script:EvidenceRoot "$RunDir\typical\requirements.json"
+        if (Test-Path -LiteralPath $requirementsPath) {
+            try {
+                $requirementDoc = Read-JsonUtf8 -Path $requirementsPath
+                $idToExternal = @{}
+                foreach ($requirementRow in @(Get-ObjValue $requirementDoc @('requirements'))) {
+                    if ($null -eq $requirementRow) { continue }
+                    $internalId = [string](Get-ObjValue $requirementRow @('id'))
+                    $externalId = [string](Get-ObjValue $requirementRow @('external_id', 'externalId'))
+                    if (-not [string]::IsNullOrWhiteSpace($internalId) -and -not [string]::IsNullOrWhiteSpace($externalId)) {
+                        $idToExternal[$internalId] = $externalId
+                    }
+                }
+                foreach ($run in $runs) {
+                    $runRid = [string](Get-ObjValue $run @('requirementId', 'requirement_id'))
+                    if (-not [string]::IsNullOrWhiteSpace($runRid) -and $idToExternal.ContainsKey($runRid)) {
+                        $run | Add-Member -NotePropertyName requirementId -NotePropertyValue $idToExternal[$runRid] -Force
+                    }
+                }
+            }
+            catch { }
         }
     }
     if ($runs.Count -eq 0) { return $verdicts }
