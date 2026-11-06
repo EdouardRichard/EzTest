@@ -1052,6 +1052,17 @@ async function main() {
     designGraph = designed.graph
     designCases = designed.cases
     stage = designed.stage
+    // The design agent keeps adding revisions while the stage is case_review; a
+    // revision that lands after a case was confirmed supersedes it, so wait for
+    // the running design runs to drain (bounded) before confirming anything.
+    for (let attempt = 0; attempt < 36; attempt++) {
+      const running = await activeDesignRuns()
+      if (running.length === 0) break
+      if (attempt === 0) log('design: waiting for', running.length, 'running design run(s) before confirming')
+      await sleep(5000)
+    }
+    designGraph = await readDesignGraph()
+    if (designGraph) designCases = flattenCases(designGraph)
     if (stage === 'designing') {
       try {
         stage = await waitFor('design convergence to case_review', async () => {
@@ -1156,7 +1167,18 @@ async function main() {
   let waveId = state.waveId || null
   let wave = null
   if (!waveId && (stage === 'executing' || stage === 'reporting')) {
-    const started = await api('POST', `/api/versions/${versionId}/waves`)
+    // Select exactly the cases that are confirmed *now*: an empty body picks
+    // every current+confirmed case, and a late design revision could silently
+    // shrink that set between the confirmation and the wave start.
+    const graphNow = await readDesignGraph()
+    const casesNow = graphNow ? flattenCases(graphNow) : designCases
+    const waveCaseIds = []
+    for (const rid of state.requirementIds) {
+      const hit = casesNow.find((entry) => String(entry.requirement_id) === String(rid) && String(entry.status) === 'confirmed')
+      if (hit) waveCaseIds.push(String(hit.case_id))
+    }
+    if (waveCaseIds.length < EXPECTED) throw new Error(`only ${waveCaseIds.length} confirmed cases before the wave (expected ${EXPECTED})`)
+    const started = await api('POST', `/api/versions/${versionId}/waves`, { case_ids: waveCaseIds })
     if (started.status === 201) waveId = started.json && started.json.data ? started.json.data.wave_id : null
     else if (started.status === 409) {
       const waves = listData(await must('GET', `/api/versions/${versionId}/waves`))
