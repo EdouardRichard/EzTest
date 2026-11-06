@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -155,14 +156,16 @@ func (s *HumanService) CreateRequest(ctx context.Context, in HumanCreateInput) (
 		return execution.HumanRequest{}, mapExecutionError(err, "human_request")
 	}
 	title := humanDecisionTitle(kind, reason)
-	s.publish(ctx, EventApprovalRequested, request, in.ActorID, map[string]any{
+	payload := map[string]any{
 		"human_request_id": platformid.Format(request.ID),
 		"kind":             string(kind),
 		"version_id":       platformid.Format(request.VersionID),
 		"title":            title,
 		"reason":           reason,
 		"actor":            platformid.Format(in.ActorID),
-	})
+	}
+	addHumanEventHints(payload, request.ConversationID, request.MessageID)
+	s.publish(ctx, EventApprovalRequested, request, in.ActorID, payload)
 	s.record(ctx, "approval.requested", request, in.ActorID)
 	return request, nil
 }
@@ -350,7 +353,7 @@ func (s *HumanService) Resolve(ctx context.Context, humanRequestID, actorID int6
 	if decisionKind && request.Kind == execution.HumanBlockedRecovery &&
 		normalized[execution.HumanResponseDecision] == execution.HumanDecisionApproved && s.stages != nil {
 		if err := s.stages.Unblock(ctx, request.VersionID); err != nil {
-			return execution.HumanRequest{}, err
+			return execution.HumanRequest{}, mapStageDecisionError(err)
 		}
 	}
 	now := s.now()
@@ -373,14 +376,16 @@ func (s *HumanService) Resolve(ctx context.Context, humanRequestID, actorID int6
 	if decisionKind {
 		decision, _ := request.Response[execution.HumanResponseDecision].(string)
 		reason, _ := request.Response[execution.HumanResponseReason].(string)
-		s.publish(ctx, EventApprovalDecided, request, actorID, map[string]any{
+		payload := map[string]any{
 			"human_request_id": platformid.Format(request.ID),
 			"kind":             string(request.Kind),
 			"version_id":       platformid.Format(request.VersionID),
 			"decision":         decision,
 			"reason":           reason,
 			"actor":            platformid.Format(actorID),
-		})
+		}
+		addHumanEventHints(payload, request.ConversationID, request.MessageID)
+		s.publish(ctx, EventApprovalDecided, request, actorID, payload)
 		s.record(ctx, "approval.decided", request, actorID)
 		return request, nil
 	}
@@ -672,6 +677,36 @@ func normalizeHumanDecision(response map[string]any) (map[string]any, error) {
 		normalized[execution.HumanResponseReason] = reason
 	}
 	return normalized, nil
+}
+
+// mapStageDecisionError maps the typed stage rejections of the version context
+// (StageGateError / StageTransitionError: closed gate, invalid transition) to
+// their shared 409 API envelope, mirroring the version HTTP layer's
+// writeStageError. A blocked_recovery approval rejected by the stage gate then
+// surfaces as 409 stage_gate_failed instead of an opaque 500. Every other error
+// keeps flowing unchanged to the handler's generic mapper.
+func mapStageDecisionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed interface{ APIError() *platform.Error }
+	if errors.As(err, &typed) {
+		if apiErr := typed.APIError(); apiErr != nil {
+			return apiErr
+		}
+	}
+	return err
+}
+
+// addHumanEventHints appends the optional EV-5 conversation/message hints to an
+// approval event payload only when the request carries them (decimal strings).
+func addHumanEventHints(payload map[string]any, conversationID, messageID *int64) {
+	if conversationID != nil && *conversationID > 0 {
+		payload["conversation_id"] = platformid.Format(*conversationID)
+	}
+	if messageID != nil && *messageID > 0 {
+		payload["message_id"] = platformid.Format(*messageID)
+	}
 }
 
 // humanDecisionTitle is the event/todo title: the reason, falling back to the

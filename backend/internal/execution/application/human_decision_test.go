@@ -3,6 +3,7 @@ package executionapp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -10,7 +11,9 @@ import (
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 // v0.22 R-W2-1: approval / blocked_recovery / conflict decision requests.
@@ -321,6 +324,109 @@ func TestBlockedRecoveryUnblockFailureKeepsRequestPending(t *testing.T) {
 	}
 	if got := f.events.count("approval.decided"); got != 0 {
 		t.Fatalf("approval.decided events = %d, want 0 on a failed unblock", got)
+	}
+}
+
+// TestBlockedRecoveryStageGateErrorMapsToConflict pins the review finding that a
+// typed version-stage rejection (gate closed / invalid transition) must surface
+// as its 409 platform error instead of leaking as an opaque 500, while the
+// request stays pending so the decision can be retried and no approval.decided
+// is published.
+func TestBlockedRecoveryStageGateErrorMapsToConflict(t *testing.T) {
+	ctx := context.Background()
+	f := newDecisionFixture()
+	f.stage.err = &versionapp.StageGateError{
+		Gate:   "blocker",
+		Reason: "blocker_not_cleared",
+		Action: "clear the blocker before approving the recovery",
+		Next:   "stage_request",
+	}
+
+	request, err := f.svc.CreateRequest(ctx, HumanCreateInput{
+		VersionID: 7, Kind: "blocked_recovery", Reason: "执行器离线", ActorID: 9,
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if _, err := f.svc.Resolve(ctx, request.ID, 9, map[string]any{"decision": "approved"}); err == nil {
+		t.Fatal("Resolve accepted a closed stage gate")
+	} else {
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("Resolve error = %T %v, want a *platform.Error (409), not a raw stage error", err, err)
+		}
+		if apiErr.Status != http.StatusConflict || apiErr.Code != "stage_gate_failed" {
+			t.Fatalf("Resolve error = %d %q, want 409 stage_gate_failed", apiErr.Status, apiErr.Code)
+		}
+		if apiErr.Details["reason"] != "blocker_not_cleared" {
+			t.Fatalf("Resolve error details = %#v, want the gate reason", apiErr.Details)
+		}
+	}
+
+	persisted, err := f.humans.Get(ctx, request.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if persisted.Status != execution.HumanPending {
+		t.Fatalf("status = %s, want pending after the stage rejection", persisted.Status)
+	}
+	if got := f.events.count("approval.decided"); got != 0 {
+		t.Fatalf("approval.decided events = %d, want 0 when the stage gate rejects", got)
+	}
+}
+
+// TestApprovalEventsIncludeConversationAndMessage pins EV-5: the approval
+// requested/decided payloads carry conversation_id/message_id when the request
+// was created with them, and omit the keys when absent.
+func TestApprovalEventsIncludeConversationAndMessage(t *testing.T) {
+	ctx := context.Background()
+	f := newDecisionFixture()
+
+	request, err := f.svc.CreateRequest(ctx, HumanCreateInput{
+		VersionID: 7, Kind: "approval", Reason: "发布？", ActorID: 9,
+		ConversationID: 2001, MessageID: 3001,
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	requested := requireOneEvent(t, f.events, "approval.requested")
+	requireEventPayload(t, requested, map[string]string{
+		"conversation_id": "2001",
+		"message_id":      "3001",
+	})
+
+	if _, err := f.svc.Resolve(ctx, request.ID, 9, map[string]any{"decision": "approved"}); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	decided := requireOneEvent(t, f.events, "approval.decided")
+	requireEventPayload(t, decided, map[string]string{
+		"conversation_id": "2001",
+		"message_id":      "3001",
+	})
+
+	// Without the optional hints the keys must be omitted rather than rendered
+	// as the zero ID.
+	f2 := newDecisionFixture()
+	plain, err := f2.svc.CreateRequest(ctx, HumanCreateInput{
+		VersionID: 7, Kind: "approval", Reason: "发布？", ActorID: 9,
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest without hints: %v", err)
+	}
+	plainRequested := requireOneEvent(t, f2.events, "approval.requested")
+	for _, key := range []string{"conversation_id", "message_id"} {
+		if _, ok := plainRequested.Payload[key]; ok {
+			t.Fatalf("approval.requested payload[%q] present without a hint: %#v", key, plainRequested.Payload)
+		}
+	}
+	if _, err := f2.svc.Resolve(ctx, plain.ID, 9, map[string]any{"decision": "approved"}); err != nil {
+		t.Fatalf("Resolve without hints: %v", err)
+	}
+	plainDecided := requireOneEvent(t, f2.events, "approval.decided")
+	for _, key := range []string{"conversation_id", "message_id"} {
+		if _, ok := plainDecided.Payload[key]; ok {
+			t.Fatalf("approval.decided payload[%q] present without a hint: %#v", key, plainDecided.Payload)
+		}
 	}
 }
 

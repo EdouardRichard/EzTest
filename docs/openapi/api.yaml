@@ -301,18 +301,21 @@ info:
     ## v0.22 W2-2 增量（human request decisions，additive）
 
     R-W2-1 / API-43（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§6）：
-    - `POST /api/versions/{id}/human-requests`（admin/版本编辑；Host 工具内部同路径）创建
+    - `POST /api/versions/{id}/human-requests`（登录用户 `authenticated`，与既有 execution
+      写路由一致；Host 工具内部同路径）创建
       `approval|blocked_recovery|conflict` 版本级请求，body `{kind,reason,conversation_id?,message_id?}`；
       不要求 case_run，不暂停执行、不阻塞阶段。返回 201 + `HumanRequestView`。
     - 决策复用既有 `POST /api/human-requests/{id}/resolve`，response
       `{decision:"approved"|"rejected",reason}`；写入 `human_request.response` JSONB。
       `blocked_recovery` approve 调用版本 `StageService.Unblock`；reject 保持 blocked 并记录 reason；
-      `conflict` 只记录决策，不改 fact。
+      `conflict` 只记录决策，不改 fact。阶段 gate 拒绝（如 blocker 未清除）返回 409
+      `stage_gate_failed`/`invalid_stage_transition`，请求保持 pending 以便重试。
     - `GET /api/versions/{id}/questions?status=` 的待办扩展到 approval/blocked_recovery/conflict
       （`QuestionView.kind` 为对应 kind，`questions` 为空数组，`decision/reason` 回显决策）。
     - 新事件（版本频道 `version:{id}`）：
-      `approval.requested`：`{human_request_id,kind,version_id,title,reason,actor}`；
-      `approval.decided`：`{human_request_id,kind,version_id,decision,reason,actor}`。
+      `approval.requested`：`{human_request_id,kind,version_id,conversation_id?,message_id?,title,reason,actor}`；
+      `approval.decided`：`{human_request_id,kind,version_id,conversation_id?,message_id?,decision,reason,actor}`
+      （conversation/message 仅在请求携带时出现，十进制字符串）。
     - 超时：leader-gated 定时 sweep 按 `question.timeout_seconds`（24h）把 pending 置 `expired`
       并发 `human_request.expired`；不阻塞阶段。
 
@@ -4382,9 +4385,11 @@ paths:
       operationId: createHumanRequest
       summary: 创建版本级人机决策请求（approval/blocked_recovery/conflict）
       description: |
-        v0.22 R-W2-1 / API-43。admin/版本编辑创建版本级 decision 请求，不要求 case_run，
+        v0.22 R-W2-1 / API-43。登录用户（`authenticated`，与既有 execution 写路由一致）
+        创建版本级 decision 请求，不要求 case_run，
         不暂停 case_run/wave，不阻塞阶段。`blocked_recovery` approve 由 resolve 调用版本
-        `Unblock`；`conflict` 只记录决策。创建发布 `approval.requested`。
+        `Unblock`（阶段 gate 拒绝映射为 409，请求保持 pending）；`conflict` 只记录决策。
+        创建发布 `approval.requested`。
       parameters:
         - $ref: '#/components/parameters/ID'
       requestBody:
@@ -8700,10 +8705,13 @@ paths:
     get:
       tags: [Clarification]
       operationId: listVersionQuestions
-      summary: 版本结构化提问（登录用户）
+      summary: 版本待办（结构化提问 + approval/blocked_recovery/conflict 决策）
       description: |
-        v0.22 B §6。按 `status`（pending/answered/expired/cancelled）过滤；
-        过期 pending 在读取前惰性过期并发布 `question.expired`。
+        v0.22 B §6 / R-W2-1。按 `status`（pending/answered/expired/cancelled）过滤；
+        返回 `clarification_question` 以及 `approval`/`blocked_recovery`/`conflict`
+        决策请求（决策行 `questions` 为空数组，`decision`/`reason` 回显决策）。
+        过期 pending 提问在读取前惰性过期并发布 `question.expired`；决策请求由
+        leader-gated 定时 sweep 过期并发布 `human_request.expired`。
       parameters:
         - $ref: '#/components/parameters/ID'
         - name: status

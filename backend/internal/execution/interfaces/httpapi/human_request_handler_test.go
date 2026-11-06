@@ -6,12 +6,15 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 // v0.22 W2-2 handler contract: POST /api/versions/{id}/human-requests creates the
@@ -24,6 +27,7 @@ type handlerHumanStage struct {
 	mu      sync.Mutex
 	calls   []int64
 	blocked map[int64]bool
+	err     error
 }
 
 func newHandlerHumanStage(blocked ...int64) *handlerHumanStage {
@@ -38,6 +42,9 @@ func (s *handlerHumanStage) Unblock(_ context.Context, versionID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, versionID)
+	if s.err != nil {
+		return s.err
+	}
 	s.blocked[versionID] = false
 	return nil
 }
@@ -73,9 +80,12 @@ type handlerHumanFixture struct {
 }
 
 func newHandlerHumanFixture() *handlerHumanFixture {
+	return newHandlerHumanFixtureWithStage(newHandlerHumanStage(100))
+}
+
+func newHandlerHumanFixtureWithStage(stage *handlerHumanStage) *handlerHumanFixture {
 	repo := newHandlerQuestionRepo()
 	events := &handlerEvents{}
-	stage := newHandlerHumanStage(100)
 	service := executionapp.NewHumanService(executionapp.HumanServiceDeps{
 		Humans:   repo,
 		Settings: humanHandlerSettings{timeoutSeconds: 86400},
@@ -237,6 +247,100 @@ func TestHumanRequestHandlerValidation(t *testing.T) {
 	}
 	if got := f.events.count("approval.decided"); got != 0 {
 		t.Fatalf("invalid resolves published %d approval.decided events", got)
+	}
+}
+
+// TestHumanRequestHandlerBlockedRecoveryGateErrorIs409 pins the HTTP side of the
+// stage-error mapping: a typed gate rejection (blocker still present) must be a
+// 409 stage_gate_failed, the request must stay pending and no approval.decided
+// event may be published.
+func TestHumanRequestHandlerBlockedRecoveryGateErrorIs409(t *testing.T) {
+	stage := newHandlerHumanStage(100)
+	stage.err = &versionapp.StageGateError{
+		Gate:   "blocker",
+		Reason: "blocker_not_cleared",
+		Action: "clear the blocker before approving the recovery",
+		Next:   "stage_request",
+	}
+	f := newHandlerHumanFixtureWithStage(stage)
+
+	create := questionActorRequest(http.MethodPost, "/api/versions/100/human-requests",
+		`{"kind":"blocked_recovery","reason":"执行器离线"}`)
+	setQuestionPathValues(create, map[string]string{"id": "100"})
+	createRecorder := httptest.NewRecorder()
+	f.handler.CreateHumanRequest(createRecorder, create)
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("create = %d body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	var created HumanRequestView
+	if err := json.Unmarshal(decodeQuestionData(t, createRecorder), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	requestID, err := strconv.ParseInt(created.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("created id %q: %v", created.ID, err)
+	}
+
+	resolve := questionActorRequest(http.MethodPost,
+		"/api/human-requests/"+created.ID+"/resolve", `{"response":{"decision":"approved"}}`)
+	setQuestionPathValues(resolve, map[string]string{"humanRequestId": created.ID})
+	resolveRecorder := httptest.NewRecorder()
+	f.handler.ResolveHumanRequest(resolveRecorder, resolve)
+	if resolveRecorder.Code != http.StatusConflict {
+		t.Fatalf("resolve = %d body=%s, want 409", resolveRecorder.Code, resolveRecorder.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(resolveRecorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode resolve error: %v", err)
+	}
+	if envelope.Error.Code != "stage_gate_failed" {
+		t.Fatalf("resolve error code = %q, want stage_gate_failed", envelope.Error.Code)
+	}
+
+	persisted, err := f.repo.Get(context.Background(), requestID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if persisted.Status != execution.HumanPending {
+		t.Fatalf("status = %s, want pending after the stage rejection", persisted.Status)
+	}
+	if got := f.events.count("approval.decided"); got != 0 {
+		t.Fatalf("approval.decided events = %d, want 0 when the stage gate rejects", got)
+	}
+}
+
+// TestHumanRequestCreateUnknownVersionReturns404 pins the version existence guard
+// of the create route (requireVersion): an unknown version is a 404, never a row.
+func TestHumanRequestCreateUnknownVersionReturns404(t *testing.T) {
+	repo := newHandlerQuestionRepo()
+	service := executionapp.NewHumanService(executionapp.HumanServiceDeps{
+		Humans:   repo,
+		Settings: humanHandlerSettings{timeoutSeconds: 86400},
+		IDs:      &handlerIDs{},
+		Clock:    &handlerClock{now: questionHandlerNow},
+		Events:   &handlerEvents{},
+		Stages:   newHandlerHumanStage(),
+	})
+	handler := New(Deps{
+		Humans:       repo,
+		HumanService: service,
+		Versions:     &waveHandlerVersions{ids: map[int64]bool{100: true}},
+	})
+
+	create := questionActorRequest(http.MethodPost, "/api/versions/999/human-requests",
+		`{"kind":"approval","reason":"发布？"}`)
+	setQuestionPathValues(create, map[string]string{"id": "999"})
+	recorder := httptest.NewRecorder()
+	handler.CreateHumanRequest(recorder, create)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown version create = %d body=%s, want 404", recorder.Code, recorder.Body.String())
+	}
+	if rows, _, err := repo.ListByVersion(context.Background(), 999, "", 10, nil); err != nil || len(rows) != 0 {
+		t.Fatalf("unknown version persisted rows = %#v / %v", rows, err)
 	}
 }
 
