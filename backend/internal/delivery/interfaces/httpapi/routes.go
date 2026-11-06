@@ -24,6 +24,8 @@ func Register(mux *http.ServeMux, h *Handler) {
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", http.HandlerFunc(h.DownloadReportHTML))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", http.HandlerFunc(h.DownloadReportPDF))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", http.HandlerFunc(h.RegenerateReport))
+	// v0.22 W2-7 report artifacts (html/pdf/markdown). No DELETE: GC owns it.
+	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/artifacts", http.HandlerFunc(h.CreateReportArtifact))
 }
 
 // RegisterGlobal mounts the P6 cross-version read-only issue/report paths on the

@@ -39,6 +39,13 @@ type reportRegenerateCall struct {
 	reportID  int64
 }
 
+type reportArtifactCall struct {
+	versionID int64
+	reportID  int64
+	format    string
+	actorID   int64
+}
+
 // fakeReportService records every call and returns configured fixtures/errors.
 type fakeReportService struct {
 	listResult  []delivery.Report
@@ -64,6 +71,10 @@ type fakeReportService struct {
 	regenerateRevision int32
 	regenerateErr      error
 	regenerateCalls    []reportRegenerateCall
+
+	artifact      deliveryapp.ReportArtifact
+	artifactErr   error
+	artifactCalls []reportArtifactCall
 }
 
 func (f *fakeReportService) List(_ context.Context, versionID int64, kind *delivery.ReportKind) ([]delivery.Report, error) {
@@ -119,6 +130,16 @@ func (f *fakeReportService) Regenerate(_ context.Context, versionID, reportID in
 		return 0, f.regenerateErr
 	}
 	return f.regenerateRevision, nil
+}
+
+func (f *fakeReportService) CreateArtifact(_ context.Context, versionID, reportID int64, format string, actorID int64) (deliveryapp.ReportArtifact, error) {
+	f.artifactCalls = append(f.artifactCalls, reportArtifactCall{
+		versionID: versionID, reportID: reportID, format: format, actorID: actorID,
+	})
+	if f.artifactErr != nil {
+		return deliveryapp.ReportArtifact{}, f.artifactErr
+	}
+	return f.artifact, nil
 }
 
 var _ ReportService = (*fakeReportService)(nil)
@@ -600,4 +621,78 @@ func TestReportHandlerWithoutReportsService(t *testing.T) {
 	mux := newDeliveryMux(t, New(nil))
 	recorder := deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports", "", nil)
 	requireStatus(t, recorder, http.StatusInternalServerError)
+}
+
+func TestReportHandlerCreateArtifact(t *testing.T) {
+	service := &fakeReportService{artifact: deliveryapp.ReportArtifact{
+		ID: 9001, Format: "markdown", ContentObjectID: strings64("a"), Size: 123, Status: "ready",
+	}}
+	mux := newDeliveryMux(t, New(nil, WithReports(service)))
+
+	recorder := deliveryCall(t, mux, http.MethodPost,
+		"/api/versions/42/reports/300/artifacts", `{"format":"markdown"}`, userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	data := decodeDeliveryObject(t, recorder)
+	if data["id"] != "9001" || data["format"] != "markdown" ||
+		data["sha256"] != strings64("a") || data["size"] != float64(123) || data["status"] != "ready" {
+		t.Fatalf("artifact response = %v", data)
+	}
+	if len(service.artifactCalls) != 1 {
+		t.Fatalf("CreateArtifact calls = %d, want 1", len(service.artifactCalls))
+	}
+	call := service.artifactCalls[0]
+	if call.versionID != 42 || call.reportID != 300 || call.format != "markdown" || call.actorID != 7 {
+		t.Fatalf("CreateArtifact call = %+v", call)
+	}
+
+	// There is deliberately no DELETE artifact API (GC owns deletion).
+	recorder = deliveryCall(t, mux, http.MethodDelete, "/api/versions/42/reports/300/artifacts", "", userActor())
+	requireStatus(t, recorder, http.StatusMethodNotAllowed)
+}
+
+func TestReportHandlerCreateArtifactErrors(t *testing.T) {
+	pdfNotReady := platform.NewError(409, "pdf_not_ready", "report PDF is not ready")
+	pdfNotReady.Details = map[string]any{"reason": "pdf_not_ready"}
+	tests := []struct {
+		name   string
+		body   string
+		actor  *platform.Actor
+		err    error
+		status int
+		reason string
+	}{
+		{name: "missing body", body: "", actor: userActor(), status: http.StatusBadRequest},
+		{name: "invalid json", body: `{"format":`, actor: userActor(), status: http.StatusBadRequest},
+		{name: "invalid format", body: `{"format":"excel"}`, actor: userActor(), status: http.StatusBadRequest},
+		{name: "no actor", body: `{"format":"markdown"}`, status: http.StatusUnauthorized},
+		{name: "missing report", body: `{"format":"markdown"}`, actor: userActor(),
+			err: platform.NotFound("report"), status: http.StatusNotFound},
+		{name: "pdf not ready", body: `{"format":"pdf"}`, actor: userActor(),
+			err: pdfNotReady, status: http.StatusConflict, reason: "pdf_not_ready"},
+		{name: "unknown", body: `{"format":"html"}`, actor: userActor(),
+			err: errors.New("boom"), status: http.StatusInternalServerError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeReportService{artifactErr: test.err}
+			mux := newDeliveryMux(t, New(nil, WithReports(service)))
+			recorder := deliveryCall(t, mux, http.MethodPost,
+				"/api/versions/42/reports/300/artifacts", test.body, test.actor)
+			requireStatus(t, recorder, test.status)
+			if test.status == http.StatusConflict {
+				apiError := decodeDeliveryError(t, recorder)
+				if apiError["code"] != "pdf_not_ready" {
+					t.Errorf("code = %v", apiError["code"])
+				}
+				if reason := errorDetails(t, apiError)["reason"]; reason != test.reason {
+					t.Errorf("details.reason = %v, want %s", reason, test.reason)
+				}
+			}
+			if test.status == http.StatusBadRequest || test.status == http.StatusUnauthorized {
+				if len(service.artifactCalls) != 0 {
+					t.Errorf("CreateArtifact calls = %d, want none", len(service.artifactCalls))
+				}
+			}
+		})
+	}
 }

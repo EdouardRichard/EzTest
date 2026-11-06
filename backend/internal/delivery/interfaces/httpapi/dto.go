@@ -477,6 +477,33 @@ func (r regenerateReportRequest) parse() error {
 	return nil
 }
 
+// reportArtifactRequest is POST .../reports/{reportId}/artifacts (v0.22 W2-7).
+// The format is one of html/pdf/markdown.
+type reportArtifactRequest struct {
+	Format string `json:"format"`
+}
+
+// parse normalizes and validates the requested artifact format.
+func (r reportArtifactRequest) parse() (string, error) {
+	format := strings.ToLower(strings.TrimSpace(r.Format))
+	switch format {
+	case "html", "pdf", "markdown":
+		return format, nil
+	default:
+		return "", platform.Invalid("format", "must be one of html, pdf, markdown")
+	}
+}
+
+// ReportArtifactView is the POST artifacts response body (contract
+// ReportArtifactCreateRequest response). It never exposes storage paths.
+type ReportArtifactView struct {
+	ID     string `json:"id"`
+	Format string `json:"format"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	Status string `json:"status"`
+}
+
 // ReportView is the list/detail report header projection (contract ReportView).
 type ReportView struct {
 	ID               string              `json:"id"`

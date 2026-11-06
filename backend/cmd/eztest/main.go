@@ -524,6 +524,41 @@ func (n deliveryRetestNotifier) OnWaveTerminalRetest(ctx context.Context, waveID
 
 var _ executionapp.WaveTerminalRetestNotifier = deliveryRetestNotifier{}
 
+// deliveryReportArtifactStore adapts the storage ExportService to the delivery
+// context's ReportArtifactStore port (v0.22 W2-7). Report bytes live in the
+// shared content ledger; export_artifact records owner_kind='report'.
+type deliveryReportArtifactStore struct {
+	exports *storageapp.ExportService
+}
+
+func (a deliveryReportArtifactStore) CreateReportArtifact(ctx context.Context, in deliveryapp.ReportArtifactStoreInput) (deliveryapp.ReportArtifactRecord, error) {
+	if a.exports == nil {
+		return deliveryapp.ReportArtifactRecord{}, errors.New("storage export service is not configured")
+	}
+	artifact, err := a.exports.Create(ctx, storageapp.CreateExportInput{
+		ID:        in.ID,
+		VersionID: in.VersionID,
+		OwnerID:   in.OwnerID,
+		OwnerKind: "report",
+		Format:    in.Format,
+		MIME:      in.MIME,
+		Filename:  in.Filename,
+		Data:      in.Data,
+	}, in.ActorID)
+	if err != nil {
+		return deliveryapp.ReportArtifactRecord{}, err
+	}
+	return deliveryapp.ReportArtifactRecord{
+		ID:              artifact.ID,
+		Format:          artifact.Format,
+		ContentObjectID: artifact.ContentObjectID,
+		Size:            artifact.Size,
+		Status:          artifact.Status,
+	}, nil
+}
+
+var _ deliveryapp.ReportArtifactStore = deliveryReportArtifactStore{}
+
 // retestCallbackRelay lets the execution scheduler/pause services receive the
 // delivery retest writeback before the delivery issue service is constructed.
 type retestCallbackRelay struct {
@@ -1668,6 +1703,9 @@ func main() {
 	// v0.22 report.published callback: only the version report completion read
 	// by the stage gate can advance reporting -> completed.
 	reportSvc.WithReportPublishedNotifier(stageCallbacks)
+	// v0.22 W2-7 report artifact export: reuse the storage content ledger via
+	// the narrow delivery port; the preallocated artifact ID names export.started.
+	reportSvc.WithArtifactStore(deliveryReportArtifactStore{exports: storageExportSvc}, ids)
 
 	// Four-way work-item dispatcher (0.2.1 D21): the only writer of 0.2.1
 	// work_item rows. It enforces the creator-kind matrix, the version-stage

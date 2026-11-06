@@ -1770,3 +1770,127 @@ func TestReportServiceListAndGet(t *testing.T) {
 		t.Fatalf("Get version report: %v", err)
 	}
 }
+
+/* ------------------------------ report artifacts ------------------------------ */
+
+type fakeReportArtifactStore struct {
+	mu     sync.Mutex
+	inputs []ReportArtifactStoreInput
+	err    error
+}
+
+func (s *fakeReportArtifactStore) CreateReportArtifact(_ context.Context, in ReportArtifactStoreInput) (ReportArtifactRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return ReportArtifactRecord{}, s.err
+	}
+	s.inputs = append(s.inputs, in)
+	sum := sha256.Sum256(in.Data)
+	return ReportArtifactRecord{
+		ID: in.ID, Format: in.Format,
+		ContentObjectID: hex.EncodeToString(sum[:]), Size: int64(len(in.Data)), Status: "ready",
+	}, nil
+}
+
+func (s *fakeReportArtifactStore) refs() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.inputs)
+}
+
+type fakeReportArtifactIDs struct{ next int64 }
+
+func (g *fakeReportArtifactIDs) Next() int64 {
+	g.next++
+	return 9000 + g.next
+}
+
+func TestReportArtifactThreeFormatsDeterministic(t *testing.T) {
+	f := newReportFixture(t)
+	report, _ := f.seedArtifactReport(7, true)
+	store := &fakeReportArtifactStore{}
+	f.svc.WithArtifactStore(store, &fakeReportArtifactIDs{})
+	ctx := context.Background()
+
+	for _, format := range []string{"html", "pdf", "markdown"} {
+		a, err := f.svc.CreateArtifact(ctx, 7, report.ID, format, 9)
+		if err != nil {
+			t.Fatalf("%s first create: %v", format, err)
+		}
+		b, err := f.svc.CreateArtifact(ctx, 7, report.ID, format, 9)
+		if err != nil {
+			t.Fatalf("%s second create: %v", format, err)
+		}
+		if a.ContentObjectID == "" || a.ContentObjectID != b.ContentObjectID {
+			t.Fatalf("%s not deterministic: %v %v", format, a, b)
+		}
+		if a.ID == b.ID {
+			t.Fatalf("%s reused artifact id %d", format, a.ID)
+		}
+		if a.Status != "ready" || b.Status != "ready" {
+			t.Fatalf("%s status = %q/%q", format, a.Status, b.Status)
+		}
+	}
+
+	if store.refs() != 6 {
+		t.Fatalf("ledger refs = %d, want 6", store.refs())
+	}
+	if got := f.events.count("export.started"); got != 6 {
+		t.Fatalf("export.started = %d, want 6", got)
+	}
+	if got := f.events.count("export.completed"); got != 6 {
+		t.Fatalf("export.completed = %d, want 6", got)
+	}
+	if got := f.events.count("export.failed"); got != 0 {
+		t.Fatalf("export.failed = %d, want 0", got)
+	}
+	for _, in := range store.inputs {
+		if in.OwnerKind != "report" || in.OwnerID != report.ID || in.VersionID != 7 || in.ActorID != 9 {
+			t.Fatalf("artifact input = %+v", in)
+		}
+	}
+}
+
+func TestReportArtifactPDFNotReadyPublishesFailed(t *testing.T) {
+	f := newReportFixture(t)
+	report, _ := f.seedArtifactReport(7, false)
+	store := &fakeReportArtifactStore{}
+	f.svc.WithArtifactStore(store, &fakeReportArtifactIDs{})
+
+	_, err := f.svc.CreateArtifact(context.Background(), 7, report.ID, "pdf", 9)
+	if err == nil {
+		t.Fatal("expected pdf_not_ready error")
+	}
+	apiErr := platform.AsError(err)
+	if apiErr.Status != 409 || apiErr.Details["reason"] != "pdf_not_ready" {
+		t.Fatalf("pdf error = %+v", apiErr)
+	}
+	if store.refs() != 0 {
+		t.Fatalf("ledger refs = %d, want 0", store.refs())
+	}
+	if got := f.events.count("export.started"); got != 1 {
+		t.Fatalf("export.started = %d, want 1", got)
+	}
+	if got := f.events.count("export.failed"); got != 1 {
+		t.Fatalf("export.failed = %d, want 1", got)
+	}
+	if got := f.events.count("export.completed"); got != 0 {
+		t.Fatalf("export.completed = %d, want 0", got)
+	}
+}
+
+func TestReportArtifactRejectsInvalidFormat(t *testing.T) {
+	f := newReportFixture(t)
+	report, _ := f.seedArtifactReport(7, true)
+	store := &fakeReportArtifactStore{}
+	f.svc.WithArtifactStore(store, &fakeReportArtifactIDs{})
+
+	_, err := f.svc.CreateArtifact(context.Background(), 7, report.ID, "excel", 9)
+	if apiErr := platform.AsError(err); apiErr.Status != 400 {
+		t.Fatalf("invalid format error = %v", err)
+	}
+	if store.refs() != 0 || f.events.count("export.started") != 0 {
+		t.Fatalf("invalid format wrote artifact/event: refs=%d started=%d", store.refs(), f.events.count("export.started"))
+	}
+}

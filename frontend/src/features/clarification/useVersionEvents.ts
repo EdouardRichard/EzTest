@@ -282,6 +282,13 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "report.pdf_failed":
           handlersRef.current.onReportChanged?.(event)
           break
+        case "export.started":
+        case "export.completed":
+        case "export.failed":
+          // W2-7 R-W2-3: report artifact export lifecycle; the report page
+          // refetches its artifact list on the terminal state.
+          handlersRef.current.onReportChanged?.(event)
+          break
         case "visual.baseline_approved":
         case "visual.diff_created":
           handlersRef.current.onVisualChanged?.(event)

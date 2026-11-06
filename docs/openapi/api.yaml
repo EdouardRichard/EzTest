@@ -349,6 +349,20 @@ info:
       `{issue_id,version_id,wave_id,case_run_ids,retest_status,case_run_status}`）。
     - `IssueView` 增加 `retest_status`/`last_retest_wave_id`/`last_retest_case_run_id`。
 
+    ## v0.22 W2-7 增量（report artifact export，additive）
+
+    R-W2-3 / API-28（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.29/§6/§7）：
+    - `POST /api/versions/{id}/reports/{rid}/artifacts`（登录用户 `authenticated`）body
+      `{format:"html|pdf|markdown"}`；html/pdf 复用既有报告 revision 校验（PDF 未就绪仍为
+      409 `pdf_not_ready`），markdown 由确定性渲染器生成（固定 revision `as_of` 与升序 ID，
+      字节稳定）。
+    - 产物复用 `export_artifact`（`owner_kind='report'`、`owner_id=report_id`、
+      `content_object_id`=sha256、status 仅 `ready|failed`）与 content ledger；
+      响应 `{id,format,sha256,size,status}`；不提供 DELETE（仅 GC 删除）。
+    - 同步事件 `export.started` → 生成 → `export.completed`（失败 `export.failed`），
+      版本频道，payload `{export_id,report_id,version_id,format,status,sha256,error}`。
+    - `ReportArtifactCreateRequest` 为本段新增 schema；产物下载走既有 `GET /api/exports/{exportId}`。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -5117,6 +5131,71 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reports/{reportId}/artifacts:
+    post:
+      tags: [Delivery]
+      operationId: createReportArtifact
+      summary: 生成报告 artifact（html/pdf/markdown）
+      description: |
+        R-W2-3/API-28（v0.22 W2-7）。按报告当前已发布 revision 生成一个 artifact：
+        html/pdf 复用 `OpenHTML`/`OpenPDF` 的版本归属、发布状态与内容账本校验，
+        PDF 未就绪返回 409 `pdf_not_ready`（failed 为 409 `pdf_failed`）；
+        markdown 使用确定性渲染器（固定 revision `as_of`、按十进制 ID 升序、证据仅引用
+        id/sha256/size），同一输入字节稳定。
+        产物写入既有 `export_artifact`（owner_kind=`report`、owner_id=report id、
+        content_object_id=sha256、status=`ready`）并写入 content ledger；不提供 DELETE
+        （仅 GC 删除）。同步发布 `export.started` → `export.completed`/`export.failed`
+        （版本频道，payload `{export_id,report_id,version_id,format,status,sha256,error}`）。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportArtifactCreateRequest'
+      responses:
+        '200':
+          description: 已生成的 artifact 身份（下载走 GET /api/exports/{exportId}）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [id, format, sha256, size, status]
+                    properties:
+                      id:
+                        type: string
+                        pattern: '^[0-9]+$'
+                      format:
+                        type: string
+                        enum: [html, pdf, markdown]
+                      sha256:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$'
+                        description: content_object_id（内容 sha256）
+                      size:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                      status:
+                        type: string
+                        enum: [ready, failed]
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -13879,6 +13958,15 @@ components:
           items:
             type: string
             pattern: '^[0-9]+$'
+    ReportArtifactCreateRequest:
+      type: object
+      description: v0.22 W2-7 report artifact create body
+      required: [format]
+      properties:
+        format:
+          type: string
+          enum: [html, pdf, markdown]
+          description: html/pdf 复用既有报告 revision；markdown 为确定性渲染
     ReportView:
       type: object
       required: [id, version_id, kind, status, created_at, updated_at]

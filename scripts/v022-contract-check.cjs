@@ -124,6 +124,8 @@ const v022Operations = [
   ["PATCH", "/api/versions/{versionId}/issues/{issueId}"],
   // W2-5 R-W2-2/API-25: issue retest wave (1 new path, +1 operation, +1 schema).
   ["POST", "/api/versions/{versionId}/issues/{issueId}/retest"],
+  // W2-7 R-W2-3/API-28: report artifact export (1 new path, +1 operation, +1 schema).
+  ["POST", "/api/versions/{versionId}/reports/{reportId}/artifacts"],
 ]
 const v022Schemas = [
   "AnswerQuestionRequest",
@@ -159,6 +161,7 @@ const v022Schemas = [
   "QuestionItemView",
   "QuestionOptionView",
   "QuestionView",
+  "ReportArtifactCreateRequest",
   "RetestIssueRequest",
   "SUTRepositoryView",
   "ScopeExclude",
@@ -226,12 +229,12 @@ const baselinePaths = frozenPaths.size
 const baselineOperations = [...frozenPaths.values()].reduce((total, methods) => total + methods.size, 0)
 const releaseOperations = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
 check(
-  releasePaths.size === baselinePaths + 30 && releaseOperations === baselineOperations + 39,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 30 paths / 39 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
+  releasePaths.size === baselinePaths + 31 && releaseOperations === baselineOperations + 40,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 31 paths / 40 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
 )
 check(
-  releaseSchemas.size === frozenSchemas.size + 38,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 38 schemas (got ${releaseSchemas.size}, baseline ${frozenSchemas.size})`,
+  releaseSchemas.size === frozenSchemas.size + 39,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 39 schemas (got ${releaseSchemas.size}, baseline ${frozenSchemas.size})`,
 )
 check(missingOperations.length === 0, `v0.22 openapi contains every documented operation (${missingOperations.length} missing)`)
 check(missingSchemas.length === 0, `v0.22 openapi contains every documented schema (${missingSchemas.length} missing)`)

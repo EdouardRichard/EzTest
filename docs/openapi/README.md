@@ -14,13 +14,16 @@ v0.22 additive 策略见下）。身份分两层：
   item，+1 operation / +1 schema），W2-4 追加 R-W2-2/API-24 的 manual issue
   create/patch operation（复用既有 issues path item，+2 operations / +2 schemas），
   W2-5 追加 R-W2-2/API-25 的 issue retest path/operation（+1 path / +1 operation /
-  +1 schema）。合计 **30 个 path item / 39 个 operation / 38 个 schema**。当前文件为
-  **211 paths / 261 operations / 319 schemas**。新增段在 `info.description` 的
+  +1 schema），W2-7 追加 R-W2-3/API-28 的 report artifact export path/operation
+  （+1 path / +1 operation / +1 schema）。合计 **31 个 path item / 40 个 operation /
+  39 个 schema**。当前文件为 **212 paths / 262 operations / 320 schemas**。新增段在
+  `info.description` 的
   `### v0.22 W0 增量（Task 37，additive）`、`## v0.22 W1 增量（W1-13，additive）`、
   `## v0.22 W1 增量（W1-14A，additive）`、
   `## v0.22 W2-2 增量（human request decisions，additive）`、
-  `## v0.22 W2-4 增量（manual issue create/update，additive）` 与
-  `## v0.22 W2-5 增量（issue retest，additive）` 中说明。
+  `## v0.22 W2-4 增量（manual issue create/update，additive）`、
+  `## v0.22 W2-5 增量（issue retest，additive）` 与
+  `## v0.22 W2-7 增量（report artifact export，additive）` 中说明。
 - 公开端点 `GET /api/openapi.yaml` 原样返回本文件。
 
 ## 单一事实源与整文件 port（0.2.1 基线）
@@ -67,6 +70,11 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
   为 template），去重/升序/最多 200；case 覆盖 T14 属 W2）、`GET .../gaps`
   （current kind=gap 事实，共用 httpx.List 信封 data/next_cursor/has_more，空数组而非
   404，100 行上限时 has_more=true）；
+- 报告 artifact 导出 `POST /api/versions/{id}/reports/{rid}/artifacts`（W2-7/API-28）：
+  body `{format:html|pdf|markdown}`，html/pdf 复用既有报告 revision 内容，
+  markdown 为确定性渲染；产物复用 `export_artifact`（owner_kind=report）+ content
+  ledger，响应 `{id,format,sha256,size,status}`，无 DELETE；发出
+  `export.started/completed/failed`；
 - 对应 DTO/schema 与 `kind`/`revision` 等可选字段。
 
 ## 验证
@@ -99,3 +107,5 @@ node -e "const fs=require('fs'),Y=require('./frontend/node_modules/yaml');const 
 - `v0.22 W1`：追加波次启动（W1-7）、执行器认证检查（W1-8）与波次冻结范围快照
   （W1-13/API-19，2026-11-05）；W1-14A 追加探索观测/增量/覆盖与 gap 只读 API
   （2026-11-05）。
+- `v0.22 W2`：W2-2 human decision、W2-4 manual issue、W2-5 issue retest 与
+  W2-7 report artifact export（2026-11-06）。

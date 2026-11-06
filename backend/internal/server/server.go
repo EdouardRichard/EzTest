@@ -618,6 +618,8 @@ func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", authenticated(http.HandlerFunc(h.DownloadReportHTML)))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", authenticated(http.HandlerFunc(h.DownloadReportPDF)))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", authenticated(http.HandlerFunc(h.RegenerateReport)))
+	// v0.22 W2-7 report artifact export (html/pdf/markdown, storage-backed).
+	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/artifacts", authenticated(http.HandlerFunc(h.CreateReportArtifact)))
 }
 
 // registerChainRoutes mounts the P4 read-only exploration-chain endpoint behind

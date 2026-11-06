@@ -78,6 +78,12 @@ type ReportService struct {
 	tasks    TaskEnsurer
 	sections delivery.SectionOptions
 
+	// v0.22 W2-7 report export artifacts (spec §4.29 R-W2-3). They stay
+	// optional so the P4/P7 constructors keep compiling; WithArtifactStore
+	// attaches the storage adapter and ID generator.
+	artifacts   ReportArtifactStore
+	artifactIDs platformid.Generator
+
 	// P6 cross-version read ports. They stay optional so the P4 constructor
 	// and its tests keep compiling; WithGlobalReader attaches them.
 	global GlobalReportReader
