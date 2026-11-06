@@ -43,6 +43,22 @@ function Write-Utf8([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# Next.js dev holds a single-instance lock per project directory, so a stage
+# stack from a previous stage must be stopped before the next stage starts.
+function Stop-WebListeners {
+    $owners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -in 6869, 6870, 6871, 6880, 6881 } |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+    foreach ($owner in $owners) {
+        if ($owner -le 0) { continue }
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -ErrorAction SilentlyContinue
+        if ($null -ne $process -and [string]$process.CommandLine -match 'next') {
+            Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Start-Sleep -Seconds 2
+}
+
 function Read-JsonFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
@@ -72,6 +88,7 @@ function Copy-Stage([string]$From, [string]$To) {
 }
 
 # ---------------------------------------------------------------- W0
+Stop-WebListeners
 $w0Exit = Invoke-StageScript -Name 'w0' -ScriptPath (Join-Path $PSScriptRoot 'v022-w0-regression.ps1') -Skip:$SkipRunW0
 $w0Source = Join-Path $repoRoot 'docs\version-V0.22\acceptance\evidence\w0\run'
 if (-not (Copy-Stage -From $w0Source -To (Join-Path $runRoot 'w0flow'))) {
@@ -88,6 +105,7 @@ $stages.Add([pscustomobject][ordered]@{
 })
 
 # ---------------------------------------------------------------- W1
+Stop-WebListeners
 $w1Exit = Invoke-StageScript -Name 'w1' -ScriptPath (Join-Path $PSScriptRoot 'v022-w1-e2e.ps1') -Skip:$SkipRunW1
 $w1Source = Join-Path $repoRoot 'docs\version-V0.22\acceptance\evidence\w1\run'
 if (-not (Copy-Stage -From $w1Source -To (Join-Path $runRoot 'w1'))) {
@@ -107,6 +125,7 @@ $stages.Add([pscustomobject][ordered]@{
 })
 
 # ---------------------------------------------------------------- W2
+Stop-WebListeners
 $w2Exit = Invoke-StageScript -Name 'w2' -ScriptPath (Join-Path $PSScriptRoot 'v022-w2-exit.ps1') -Skip:$SkipRunW2
 $w2Source = Join-Path $repoRoot 'docs\version-V0.22\acceptance\evidence\w2\run'
 if (-not (Copy-Stage -From $w2Source -To (Join-Path $runRoot 'w2'))) {
