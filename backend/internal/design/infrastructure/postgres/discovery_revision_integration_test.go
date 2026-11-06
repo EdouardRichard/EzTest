@@ -231,6 +231,94 @@ func TestDiscoveryRevisionLowConfidenceStaysDraftIntegration(t *testing.T) {
 	}
 }
 
+// TestDiscoveryRevisionDuplicateTargetLeavesNoNewCaseIntegration exercises the
+// real duplicate-target path: a second observation of the same approved target,
+// after the first additive revision is already confirmed, must stay a low
+// confidence draft and must not create or confirm another case. The unit fake
+// stubs the duplicate lookup, so only this SQL path proves the Task 106 freeze
+// (a confirmed same-title case) maps onto duplicate_target.
+func TestDiscoveryRevisionDuplicateTargetLeavesNoNewCaseIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	seedDiscoveryBase(t, pool, 2)
+	service, publisher := newDiscoveryRevisionService(t, pool)
+	ctx := context.Background()
+
+	first, err := service.OnResourceConfirmed(ctx, 1001, 6001, 8101, 3001)
+	if err != nil {
+		t.Fatalf("first OnResourceConfirmed: %v", err)
+	}
+	if first.Status != design.CaseStatusConfirmed {
+		t.Fatalf("first = %+v, want confirmed", first)
+	}
+	var casesBefore int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM case_entity ce
+		JOIN case_scenario s ON s.id = ce.scenario_id
+		WHERE s.version_id = 1001 AND s.requirement_id = 3001
+	`).Scan(&casesBefore); err != nil {
+		t.Fatalf("count cases before: %v", err)
+	}
+
+	// A second execution observation of the same approved target. Only the
+	// resource_template differs, to satisfy the observation unique key.
+	seedDiscoveryObservation(t, pool, 8102, 9201, 9301, 6001, "/orders/{id}/observed-again")
+
+	second, err := service.OnResourceConfirmed(ctx, 1001, 6001, 8102, 3001)
+	if err != nil {
+		t.Fatalf("second OnResourceConfirmed: %v", err)
+	}
+	if second.Status != design.CaseStatusDraft || second.LowConfidenceReason != "duplicate_target" {
+		t.Fatalf("second = %+v, want draft duplicate_target", second)
+	}
+	if second.CaseID != 0 || second.CaseVersionID != 0 {
+		t.Fatalf("duplicate target attached a case: %+v", second)
+	}
+
+	var casesAfter int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM case_entity ce
+		JOIN case_scenario s ON s.id = ce.scenario_id
+		WHERE s.version_id = 1001 AND s.requirement_id = 3001
+	`).Scan(&casesAfter); err != nil {
+		t.Fatalf("count cases after: %v", err)
+	}
+	if casesAfter != casesBefore {
+		t.Fatalf("duplicate target created a case: %d -> %d", casesBefore, casesAfter)
+	}
+	var duplicateVersions int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM case_version WHERE source_observation_id = 8102
+	`).Scan(&duplicateVersions); err != nil {
+		t.Fatalf("count duplicate revisions: %v", err)
+	}
+	if duplicateVersions != 0 {
+		t.Fatalf("duplicate target wrote %d case versions", duplicateVersions)
+	}
+	if got := caseVersionStatus(t, pool, first.CaseVersionID); got != "confirmed" {
+		t.Fatalf("first revision status = %q, want confirmed", got)
+	}
+	if publisher.count("case.revision.auto_confirmed") != 1 {
+		t.Fatalf("events = %d, want only the first auto-confirm", publisher.count("case.revision.auto_confirmed"))
+	}
+}
+
+// seedDiscoveryObservation inserts one more observation of an already executed
+// case_run. resource_template must be unique per version/SUT/kind.
+func seedDiscoveryObservation(t *testing.T, pool *pgxpool.Pool, observationID, waveID, caseRunID, resourceID int64, resourceTemplate string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO execution_discovery_observation (
+			id, version_id, wave_id, case_run_id, version_sut_id, environment_id,
+			kind, method, host, resource_template, decision, resource_id
+		) VALUES ($1, 1001, $2, $3, 9001, 9001, 'page', '', 'orders.example.test',
+		          $4, 'approved', $5)
+	`, observationID, waveID, caseRunID, resourceTemplate, resourceID); err != nil {
+		t.Fatalf("seed discovery observation: %v", err)
+	}
+}
+
 func currentWaveCaseRunIDs(t *testing.T, pool *pgxpool.Pool) []string {
 	t.Helper()
 	rows, err := pool.Query(context.Background(), `

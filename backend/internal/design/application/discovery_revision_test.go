@@ -324,9 +324,27 @@ func TestAutoConfirmKeepsCurrentWaveAndRollback(t *testing.T) {
 	if got := d.caseVersion(rev.CaseVersionID).Status; got != design.CaseStatusSuperseded {
 		t.Fatalf("original status = %q, want superseded", got)
 	}
+	if len(d.repo.confirmations) != 2 {
+		t.Fatalf("confirmations = %d, want auto-confirm + rollback = 2", len(d.repo.confirmations))
+	}
+	rollbackConfirmation := d.repo.confirmations[1]
+	if len(rollbackConfirmation.AffectedCaseVersionIDs) != 1 ||
+		rollbackConfirmation.AffectedCaseVersionIDs[0] != platformid.Format(alt.CaseVersionID) {
+		t.Fatalf("rollback affected ids = %v, want [%s]",
+			rollbackConfirmation.AffectedCaseVersionIDs, platformid.Format(alt.CaseVersionID))
+	}
+	if alt.ResourceID != d.pageID {
+		t.Fatalf("rollback resource_id = %d, want %d", alt.ResourceID, d.pageID)
+	}
 	again, err := d.svc.Rollback(context.Background(), d.versionID, rev.CaseVersionID, "revert", 9)
 	if err != nil || again.CaseVersionID != alt.CaseVersionID {
 		t.Fatalf("rollback not idempotent: again=%+v err=%v", again, err)
+	}
+	if again.ResourceID != d.pageID {
+		t.Fatalf("idempotent rollback resource_id = %d, want %d", again.ResourceID, d.pageID)
+	}
+	if len(d.repo.confirmations) != 2 {
+		t.Fatalf("idempotent rollback wrote another confirmation: %d", len(d.repo.confirmations))
 	}
 	if got := len(d.eventsOfType("case.revision.auto_confirmed")); got != 2 {
 		t.Fatalf("events = %d, want auto+rollback = 2", got)
@@ -337,6 +355,9 @@ func TestAutoConfirmKeepsCurrentWaveAndRollback(t *testing.T) {
 			rollbackEvents++
 			if event.Payload["rollback_of"] != platformid.Format(rev.CaseVersionID) {
 				t.Fatalf("rollback event payload = %+v", event.Payload)
+			}
+			if event.Payload["resource_id"] != platformid.Format(d.pageID) {
+				t.Fatalf("rollback event resource_id = %v, want %d", event.Payload["resource_id"], d.pageID)
 			}
 		}
 	}
@@ -509,6 +530,30 @@ func TestRollbackRejectsManualRevision(t *testing.T) {
 	}
 }
 
+func TestRollbackRejectsHumanConfirmedDiscoveryRevision(t *testing.T) {
+	d := newDiscoveryRevisionTest(t)
+	rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
+	if err != nil {
+		t.Fatalf("OnResourceConfirmed: %v", err)
+	}
+	// Model a human confirming a low-confidence discovery draft: the revision
+	// is confirmed and still a discovery_delta, but no system auto-confirmation
+	// actor is recorded.
+	for _, item := range d.repo.cases {
+		for index := range item.versions {
+			if item.versions[index].ID == rev.CaseVersionID {
+				item.versions[index].AutoConfirmedBy = ""
+			}
+		}
+	}
+
+	_, err = d.svc.Rollback(context.Background(), d.versionID, rev.CaseVersionID, "why", 9)
+	var platformErr *platform.Error
+	if !asPlatformError(err, &platformErr) || platformErr.Status != 409 {
+		t.Fatalf("err = %v, want 409", err)
+	}
+}
+
 func TestRollbackBasesReplacementOnPriorConfirmedRevision(t *testing.T) {
 	d := newDiscoveryRevisionTest(t)
 	d.repo.scenarios = append(d.repo.scenarios, design.Scenario{
@@ -519,6 +564,7 @@ func TestRollbackBasesReplacementOnPriorConfirmedRevision(t *testing.T) {
 	base := fakeCaseVersion(8901, 1, "稳定基线", 1, 1, design.CaseStatusConfirmed)
 	autorev := fakeCaseVersion(8901, 2, "探索新增", 1, 1, design.CaseStatusConfirmed)
 	autorev.Trigger = design.CaseTriggerDiscoveryDelta
+	autorev.AutoConfirmedBy = design.AutoConfirmationActor
 	observation := int64(8101)
 	autorev.SourceObservationID = &observation
 	item.versions = []design.CaseVersion{base, autorev}

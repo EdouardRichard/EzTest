@@ -390,7 +390,11 @@ func (s *GraphService) Rollback(ctx context.Context, versionID, caseVersionID in
 			Scope:                  design.ConfirmScopeCase,
 			TargetScopeID:          caseID,
 			BatchID:                batchID,
-			AffectedCaseVersionIDs: []string{platformid.Format(locked.ID)},
+			// The confirmation freezes the replacement, exactly like the normal
+			// Confirm path lists the versions it confirms. The rolled-back
+			// original is recorded in the snapshot (rollback_of) and was already
+			// superseded, not confirmed by this batch.
+			AffectedCaseVersionIDs: []string{platformid.Format(stored.ID)},
 			Snapshot: map[string]any{
 				"trigger":     design.CaseTriggerRollback,
 				"rollback_of": platformid.Format(locked.ID),
@@ -416,12 +420,19 @@ func (s *GraphService) Rollback(ctx context.Context, versionID, caseVersionID in
 	if actorID > 0 {
 		actor = platformid.Format(actorID)
 	}
+	// EV-12 keeps the same target provenance as the auto-confirmation it
+	// reverses: derive the discovered page/API id from the revision that is
+	// being rolled back, falling back to the replacement it produced.
+	resourceID := caseVersionResourceID(original)
+	if resourceID <= 0 {
+		resourceID = caseVersionResourceID(replacement)
+	}
 	view := DiscoveryRevisionView{
 		CaseID:              replacement.CaseID,
 		CaseVersionID:       replacement.ID,
 		Status:              replacement.Status,
 		Trigger:             design.CaseTriggerRollback,
-		ResourceID:          0,
+		ResourceID:          resourceID,
 		SourceObservationID: derefInt64(replacement.SourceObservationID),
 		RollbackOf:          caseVersionID,
 		Revision:            replacement.Revision,
@@ -548,6 +559,7 @@ func discoveryRevisionView(version design.CaseVersion) DiscoveryRevisionView {
 		CaseVersionID:       version.ID,
 		Status:              version.Status,
 		Trigger:             version.Trigger,
+		ResourceID:          caseVersionResourceID(version),
 		SourceObservationID: derefInt64(version.SourceObservationID),
 		RollbackOf:          derefInt64(version.RollbackOf),
 		Revision:            version.Revision,
@@ -623,6 +635,31 @@ func discoveryAugmentedDraft(provenance DiscoveryProvenance, resourceID int64, a
 	return draft
 }
 
+// caseVersionResourceID returns the discovered page/API id a case version is
+// bound to. Additive discovery revisions carry it on the version (and, since a
+// step may target the resource directly, defensively on the first step).
+func caseVersionResourceID(version design.CaseVersion) int64 {
+	for _, pageID := range version.PageIDs {
+		if pageID > 0 {
+			return pageID
+		}
+	}
+	for _, apiID := range version.APIIDs {
+		if apiID > 0 {
+			return apiID
+		}
+	}
+	for _, step := range version.Steps {
+		if step.TargetPageID != nil && *step.TargetPageID > 0 {
+			return *step.TargetPageID
+		}
+		if step.TargetAPIID != nil && *step.TargetAPIID > 0 {
+			return *step.TargetAPIID
+		}
+	}
+	return 0
+}
+
 // buildRollbackReplacement copies base into a new confirmed revision of the
 // rolled-back case. The original stays in history as superseded; the
 // replacement carries the rollback provenance (trigger/rollback_of).
@@ -685,6 +722,11 @@ func rollbackableCaseVersion(version design.CaseVersion) error {
 		return platform.StateConflict("only a confirmed case version can be rolled back")
 	case version.Trigger != design.CaseTriggerDiscoveryDelta:
 		return platform.StateConflict("only a discovery_delta case revision can be rolled back")
+	case version.AutoConfirmedBy != design.AutoConfirmationActor:
+		// A human may confirm a low-confidence discovery draft through the
+		// normal Confirm path; that revision is not an automatic revision, so
+		// it is redesigned rather than auto-rolled-back.
+		return platform.StateConflict("only a system auto-confirmed discovery revision can be rolled back")
 	case version.RollbackOf != nil:
 		return platform.StateConflict("a rollback replacement cannot be rolled back")
 	}

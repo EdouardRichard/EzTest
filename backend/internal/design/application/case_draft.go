@@ -7,10 +7,12 @@ package designapp
 // exploration package: the composition root adapts explore.CaseDraft onto
 // AugmentedCaseDraft.
 //
-// Hard boundary (spec §11, D25): augmentation only ever creates draft cases.
-// This entry point has no confirm/execute/requirement-mutation path: it calls
-// Propose (which always writes draft case versions) and returns the created
-// ids/status. Confirmation stays a human action.
+// Hard boundary (spec §11, D25): this entry point only ever creates draft
+// cases. It has no confirm/execute/requirement-mutation path: it calls Propose
+// (which always writes draft case versions) and returns the created
+// ids/status. A separate service (W2-11 discovery revision) may auto-confirm a
+// discovery_delta draft through the normal confirmation path; this draft-only
+// entry point never confirms anything itself.
 
 import (
 	"context"
