@@ -174,6 +174,63 @@ func TestIndexStartResolvesExplicitCommitAndHead(t *testing.T) {
 	}
 }
 
+// TestIndexStartUsesRepoHeadWhenSharedBaselineBelongsToAnotherRepo covers the
+// multi-repo entry from the CodeTab: a version_sut carries one baseline commit
+// that belongs to the first repository. Triggering an index for a second
+// repository must resolve that repository's own branch head instead of
+// reusing the shared commit.
+func TestIndexStartUsesRepoHeadWhenSharedBaselineBelongsToAnotherRepo(t *testing.T) {
+	fixture := newIndexFixture(t)
+	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
+		VersionSUTID: 11, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
+	})
+	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
+	fixture.git.resolveErrRefs = map[string]error{testCommitA: errors.New("unknown revision")}
+	fixture.git.head = testCommitB
+
+	run, created, err := fixture.service.Start(context.Background(), 1, 20, "")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !created {
+		t.Fatal("new run must be created")
+	}
+	if run.CommitSHA != testCommitB {
+		t.Fatalf("second-repository commit = %q, want its own head %q", run.CommitSHA, testCommitB)
+	}
+}
+
+// TestRepoStatusUsesRepoSpecificBaseline pins the multi-repo read model: the
+// shared version_sut baseline must not be shown for a repository where that
+// commit does not resolve; its own done index commit is the baseline.
+func TestRepoStatusUsesRepoSpecificBaseline(t *testing.T) {
+	fixture := newIndexFixture(t)
+	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
+		VersionSUTID: 11, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
+	})
+	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
+	fixture.runs.runs[5] = codeintel.IndexRun{
+		ID: 5, RepoID: 20, CommitSHA: testCommitB, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.order = []int64{5}
+	fixture.git.resolveErrRefs = map[string]error{testCommitA: errors.New("unknown revision")}
+
+	statuses, err := fixture.service.RepoStatus(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("RepoStatus: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+	byRepo := map[int64]RepoStatus{}
+	for _, status := range statuses {
+		byRepo[status.RepoID] = status
+	}
+	if byRepo[20].BaselineCommit != testCommitB {
+		t.Fatalf("repo 20 baseline = %q, want %q", byRepo[20].BaselineCommit, testCommitB)
+	}
+}
+
 func TestIndexExecuteIndexesFilesAndBackfillsBaseline(t *testing.T) {
 	fixture := newIndexFixture(t)
 	run := codeintel.IndexRun{

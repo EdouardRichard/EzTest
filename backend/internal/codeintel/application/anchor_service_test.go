@@ -246,6 +246,33 @@ func TestAnchorCreateComputesExcerptAndAudits(t *testing.T) {
 	}
 }
 
+// TestAnchorCreatePrefersLatestDoneCommitForMultiRepo pins that an anchor on a
+// second repository resolves the latest done index commit instead of the
+// version_sut baseline that belongs to another repository.
+func TestAnchorCreatePrefersLatestDoneCommitForMultiRepo(t *testing.T) {
+	h := newAnchorHarness()
+	h.versions.bindings = append(h.versions.bindings, VersionSUTBinding{
+		VersionSUTID: 11, VersionID: 1, SUTID: 21, RepoID: 20, Branch: "main",
+		CodeBaselineCommit: anchorCommitA,
+	})
+	h.resource.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/web", Branch: "main"}
+	h.seedWindow("src/a.ts", "line one")
+	_, _ = h.runs.CreateRun(h.ctx, codeintel.IndexRun{
+		ID: 502, VersionID: 1, RepoID: 20, CommitSHA: anchorCommitB, Status: string(codeintel.IndexDone),
+	})
+
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 20, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if anchor.CommitSHA != anchorCommitB {
+		t.Fatalf("anchor commit = %q, want latest done commit %q", anchor.CommitSHA, anchorCommitB)
+	}
+}
+
 func TestAnchorCreateRejectsInvalidSubjectsAndRepo(t *testing.T) {
 	h := newAnchorHarness()
 	h.seedWindow("src/a.ts", "a")

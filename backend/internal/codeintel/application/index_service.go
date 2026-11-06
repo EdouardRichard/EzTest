@@ -161,7 +161,19 @@ func (s *IndexService) Start(ctx context.Context, versionID, repoID int64, commi
 		}
 		runCommit = resolved
 	case binding.CodeBaselineCommit != "":
-		runCommit = binding.CodeBaselineCommit
+		// version_sut stores one baseline commit for the whole binding. In a
+		// multi-repo binding it belongs to the deterministic baseline repo, so
+		// another repository must resolve its own head instead of inheriting a
+		// foreign commit and failing the index.
+		if _, resolveErr := s.git.ResolveCommit(ctx, repository.Path, binding.CodeBaselineCommit); resolveErr == nil {
+			runCommit = binding.CodeBaselineCommit
+		} else {
+			head, headErr := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
+			if headErr != nil {
+				return codeintel.IndexRun{}, false, headErr
+			}
+			runCommit = head
+		}
 	default:
 		head, headErr := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
 		if headErr != nil {
@@ -365,10 +377,22 @@ func (s *IndexService) RepoStatus(ctx context.Context, versionID int64) ([]RepoS
 			return nil, mapDomainError(err, "code repository")
 		}
 		status := RepoStatus{RepoID: repoID, Repository: repository, BaselineCommit: seen[repoID]}
+		// A multi-repo binding carries one shared baseline commit, which only
+		// resolves in the deterministic baseline repository. Other repositories
+		// fall back to their own newest done index commit.
+		if ValidCommitSHA(status.BaselineCommit) {
+			if _, err := s.git.ResolveCommit(ctx, repository.Path, status.BaselineCommit); err != nil {
+				status.BaselineCommit = ""
+			}
+		}
 		if latest, err := s.runs.LatestRun(ctx, repoID); err == nil {
 			status.Latest = &latest
 		} else if !errors.Is(err, codeintel.ErrNotFound) {
 			return nil, err
+		}
+		if status.BaselineCommit == "" && status.Latest != nil &&
+			status.Latest.Status == string(codeintel.IndexDone) && ValidCommitSHA(status.Latest.CommitSHA) {
+			status.BaselineCommit = status.Latest.CommitSHA
 		}
 		if _, active, err := s.runs.ActiveRun(ctx, repoID); err == nil {
 			status.IndexInProgress = active

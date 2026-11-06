@@ -22,6 +22,7 @@ type analysisFixture struct {
 	extractor *fakeExtractor
 	versions  *fakeVersionReader
 	resources *fakeResourceReader
+	runs      *fakeIndexRepo
 	queue     *fakeWorkQueue
 	events    *fakeEvents
 	audit     *fakeAudit
@@ -45,6 +46,7 @@ func newAnalysisFixture(t *testing.T) *analysisFixture {
 			VersionSUTID: 11, VersionID: 1, RepoID: 10, Branch: "main", CodeBaselineCommit: testCommitA,
 		}}},
 		resources: &fakeResourceReader{repos: map[int64]RepoRef{10: {ID: 10, Name: "repo", Path: "/tmp/repo", Branch: "main"}}},
+		runs:      newFakeIndexRepo(),
 		queue:     &fakeWorkQueue{},
 		events:    &fakeEvents{},
 		audit:     &fakeAudit{},
@@ -59,6 +61,7 @@ func newAnalysisFixture(t *testing.T) *analysisFixture {
 		Bulk:      fixture.git,
 		Versions:  fixture.versions,
 		Resources: fixture.resources,
+		Runs:      fixture.runs,
 		Queue:     fixture.queue,
 		Events:    fixture.events,
 		Audit:     fixture.audit,
@@ -100,6 +103,34 @@ func TestAnalysisStartRejectsConflictingRepoBaselines(t *testing.T) {
 	apiErr := requireAPIError(t, err, http.StatusConflict, "state_conflict")
 	if apiErr.Details["reason"] != "repo_baseline_conflict" {
 		t.Fatalf("conflict reason = %v", apiErr.Details["reason"])
+	}
+}
+
+// TestAnalysisStartUsesRepoIndexBaselineForSecondRepository covers the
+// multi-repo analysis path: the version_sut baseline belongs to the first
+// repository, so a second repository must fall back to its own done index
+// commit instead of creating an analysis against a foreign commit.
+func TestAnalysisStartUsesRepoIndexBaselineForSecondRepository(t *testing.T) {
+	fixture := newAnalysisFixture(t)
+	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
+		VersionSUTID: 11, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
+	})
+	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
+	fixture.git.resolveErrRefs = map[string]error{testCommitA: errors.New("unknown revision")}
+	fixture.runs.runs[7] = codeintel.IndexRun{
+		ID: 7, VersionID: 1, RepoID: 20, CommitSHA: testCommitB, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.order = []int64{7}
+
+	analysis, created, err := fixture.service.Start(context.Background(), 1, 20, testCommitB, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !created {
+		t.Fatal("new analysis must be created")
+	}
+	if analysis.BaseCommitSHA != testCommitB {
+		t.Fatalf("analysis base = %q, want the repository's indexed commit %q", analysis.BaseCommitSHA, testCommitB)
 	}
 }
 

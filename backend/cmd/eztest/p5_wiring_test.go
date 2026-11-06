@@ -351,6 +351,37 @@ func TestP5WiringCodeBindingsVersionReader(t *testing.T) {
 	}
 }
 
+// TestP5WiringCodeBindingsExpandsMultipleRepositories pins the multi-repo
+// mapping: one version_sut with two effective repositories must produce two
+// codeintel bindings so index/analysis can cover both repositories.
+func TestP5WiringCodeBindingsExpandsMultipleRepositories(t *testing.T) {
+	view := p5TestVersionView()
+	view.Bindings[0].Repositories = []versionapp.BindingRepositoryView{
+		{Repository: resourceapp.CodeRepositoryView{ID: "400", Name: "backend", Path: "C:\\backend", Branch: "main"}},
+		{Repository: resourceapp.CodeRepositoryView{ID: "401", Name: "frontend", Path: "C:\\frontend", Branch: "main"}},
+	}
+	versions := &fakeP5BindingsVersions{view: view}
+	bindings := newP5TestBindings(t, versions, &fakeP5BindingsRepo{}, &fakeP5BindingResources{})
+
+	rows, err := bindings.VersionSUTBindings(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("VersionSUTBindings: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("bindings = %+v, want one per effective repository", rows)
+	}
+	repoIDs := map[int64]bool{}
+	for _, row := range rows {
+		repoIDs[row.RepoID] = true
+		if row.VersionSUTID != 300 || row.VersionID != 1 || row.SUTID != 100 {
+			t.Fatalf("binding = %+v", row)
+		}
+	}
+	if !repoIDs[400] || !repoIDs[401] {
+		t.Fatalf("repo ids = %+v", repoIDs)
+	}
+}
+
 func TestP5WiringCodeBindingsServesTargetsAndResources(t *testing.T) {
 	versions := &fakeP5BindingsVersions{view: p5TestVersionView()}
 	repo := &fakeP5BindingsRepo{}

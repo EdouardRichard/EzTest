@@ -344,11 +344,14 @@ func (s *AnchorService) targetCommit(ctx context.Context, binding VersionSUTBind
 		}
 		return value, nil
 	}
-	if ValidCommitSHA(binding.CodeBaselineCommit) {
-		return binding.CodeBaselineCommit, nil
-	}
+	// The version_sut baseline is shared by every repository of a multi-repo
+	// binding, so the repository's own latest done index commit wins. The
+	// shared baseline remains the fallback before any index run exists.
 	if commit, ok := s.latestDoneCommit(ctx, repository.ID); ok {
 		return commit, nil
+	}
+	if ValidCommitSHA(binding.CodeBaselineCommit) {
+		return binding.CodeBaselineCommit, nil
 	}
 	head, err := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
 	if err != nil {
