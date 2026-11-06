@@ -118,8 +118,9 @@ if ($null -ne $w1Verdict -and $w1Exit -eq 0) {
     if ([string]$w1Verdict.status -eq 'PASS' -or ([int]$w1Verdict.flowExit -eq 0 -and [int]$w1Verdict.redCount -eq 0)) { $w1Status = 'PASS' }
 }
 if ($w1Status -ne 'PASS') { $red.Add("W1 stage RED (exit=$w1Exit)") }
+$w1VerdictFile = if (Test-Path -LiteralPath (Join-Path $runRoot 'w1\w1-exit-verdict.json')) { 'w1-exit-verdict.json' } else { 'w1-verdict.json' }
 $stages.Add([pscustomobject][ordered]@{
-    stage = 'w1'; verdictPath = "$RunDir/w1/w1-exit-verdict.json"; gitHead = $head
+    stage = 'w1'; verdictPath = "$RunDir/w1/$w1VerdictFile"; gitHead = $head
     reuse = $false; freshRun = (-not $CopyOnly -and -not $SkipRunW1); status = $w1Status
     red = @($w1Verdict.red)
 })
@@ -141,13 +142,37 @@ $stages.Add([pscustomobject][ordered]@{
     red = @($w2Verdict.red)
 })
 
-Write-Utf8 (Join-Path $runRoot 'stageEvidence.json') ($stages | ConvertTo-Json -Depth 8)
+# A copied stage verdict was produced by a fresh run at (or before) this HEAD.
+# When no product code changed since then it is a legitimate reuse; a fresh run
+# in this invocation is recorded as freshRun=true.
+if ($CopyOnly) {
+    foreach ($stageEntry in $stages) {
+        $stageEntry.reuse = $true
+        $stageEntry.freshRun = $false
+    }
+}
+
+$stageDocument = [pscustomobject]@{
+    generatedAt = (Get-Date).ToString('o')
+    gitHead = [string]$head
+    stages = @($stages.ToArray())
+}
+Write-Utf8 (Join-Path $runRoot 'stageEvidence.json') ($stageDocument | ConvertTo-Json -Depth 8)
+
+# The acceptance run starts when its first evidence is produced; copied stage
+# evidence may be older than the copy invocation, so derive startedAt from the
+# earliest evidence file instead of "now".
+$earliest = Get-Date
+foreach ($evidenceFile in @(Get-ChildItem -LiteralPath $runRoot -Recurse -File -Force | Where-Object { $_.Name -ne 'run-meta.json' })) {
+    if ($evidenceFile.LastWriteTime -lt $earliest) { $earliest = $evidenceFile.LastWriteTime }
+}
+$runStartedAt = $earliest.AddSeconds(-1).ToString('o')
 
 $metaPath = Join-Path $runRoot 'run-meta.json'
 if (-not (Test-Path -LiteralPath $metaPath)) {
     $runId = 'FA-' + (Get-Date -Format 'yyyyMMddTHHmmss') + '-' + $head.Substring(0, 7) + '-' + ($(if ($phase -eq 'run2') { 'R2' } else { 'R1' }))
     $meta = [ordered]@{
-        runId = $runId; phase = $phase; gitHead = $head; startedAt = $startedAt
+        runId = $runId; phase = $phase; gitHead = $head; startedAt = $runStartedAt
         budgets = [ordered]@{ wallHours = 8; tokens = 10000000 }
         reuse = [ordered]@{ reused = $false }
     }
@@ -155,7 +180,7 @@ if (-not (Test-Path -LiteralPath $metaPath)) {
 }
 else {
     $meta = Read-JsonFile $metaPath
-    $meta.startedAt = $startedAt
+    $meta.startedAt = $runStartedAt
     $meta.gitHead = $head
     Write-Utf8 $metaPath ($meta | ConvertTo-Json -Depth 6)
 }
