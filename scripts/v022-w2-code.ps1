@@ -95,6 +95,7 @@ $verdict = [ordered]@{
     apiBase          = $apiBase
     generatedAt      = (Get-Date -Format o)
     screenshots      = @()
+    codeTab          = [ordered]@{ route = ''; testId = 'code-tab' }
     events           = [ordered]@{}
     runs             = [ordered]@{}
     restart          = [ordered]@{ equal = $false; before = $null; after = $null }
@@ -576,12 +577,31 @@ try {
         analysisStarted = [int](Invoke-Db "select count(*) from event where channel = 'version:$($script:versionId)' and type = 'code.analysis_started'")
         analysisFinished = [int](Invoke-Db "select count(*) from event where channel = 'version:$($script:versionId)' and type = 'code.analysis_finished'")
         impactComputed = [int](Invoke-Db "select count(*) from event where channel = 'version:$($script:versionId)' and type = 'code.impact_computed'")
+        anchorValidated = [int](Invoke-Db "select count(*) from event where channel = 'version:$($script:versionId)' and type = 'code.anchor_validated'")
     }
 
     $reposApi = Invoke-Api -Method 'GET' -Path "/api/versions/$($script:versionId)/code/repos"
     $impactApi = Invoke-Api -Method 'GET' -Path "/api/versions/$($script:versionId)/code/impact"
     $anchorsApi = Invoke-Api -Method 'GET' -Path "/api/versions/$($script:versionId)/code/anchors"
     $analysisApi = Invoke-Api -Method 'GET' -Path "/api/versions/$($script:versionId)/code/analyses/$analysisId"
+    # Per-repository baseline read model: every bound repository must expose a
+    # resolved baseline, and a repository that does not own the shared
+    # version_sut baseline must fall back to its own latest done index commit.
+    $repoApiRows = @($reposApi.data)
+    foreach ($repoState in $repoApiRows) {
+        if ([string]::IsNullOrWhiteSpace([string]$repoState.baseline_commit)) {
+            throw "repository $($repoState.repo_id) has no resolved baseline_commit"
+        }
+    }
+    $fallbackState = @($repoApiRows | Where-Object { [string]$_.repo_id -ne [string]$reposPlan[0].id }) | Select-Object -First 1
+    if ($null -ne $fallbackState) {
+        if ($null -eq $fallbackState.latest_index -or [string]$fallbackState.latest_index.status -ne 'done') {
+            throw "repository $($fallbackState.repo_id) has no done latest index for the fallback baseline assertion"
+        }
+        if ([string]$fallbackState.baseline_commit -ne [string]$fallbackState.latest_index.commit_sha) {
+            throw "repository $($fallbackState.repo_id) baseline=$($fallbackState.baseline_commit), want its own latest done commit $($fallbackState.latest_index.commit_sha)"
+        }
+    }
     $verdict.api = [ordered]@{
         repos    = [ordered]@{ status = 200; count = @($reposApi.data).Count }
         analysis = [ordered]@{ status = 200; id = [string]$analysisApi.data.analysis.id; state = [string]$analysisApi.data.analysis.status }
@@ -615,6 +635,7 @@ try {
     if ($verdict.retried -lt 1) { throw "retried=$($verdict.retried), want >= 1" }
     if ($verdict.events.indexFinished -lt 2) { throw "code.index_finished events=$($verdict.events.indexFinished), want >= 2" }
     if ($verdict.events.indexFailed -lt 1) { throw "code.index_failed events=$($verdict.events.indexFailed), want >= 1" }
+    if ($verdict.events.anchorValidated -lt 1) { throw "code.anchor_validated events=$($verdict.events.anchorValidated), want >= 1" }
     if (@($impactApi.data).Count -lt 1) { throw 'impact API returned no candidates' }
     if (@($anchorsApi.data).Count -lt 1) { throw 'anchors API returned no rows' }
 
@@ -645,6 +666,8 @@ try {
     Start-Web
     $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
     if (-not $nodeExe) { throw 'node is missing (required for the screenshot helper)' }
+    $codeTabRoute = "/versions/$($script:versionId)?tab=code&repo=$($script:analysisRepoId)&anchor=$anchorId"
+    $verdict.codeTab.route = $codeTabRoute
     $uiScript = @'
 import path from "node:path"
 import { createRequire } from "node:module"
@@ -655,6 +678,7 @@ const versionId = process.env.W29_VERSION_ID
 const repo1 = process.env.W29_REPO1
 const repo2 = process.env.W29_REPO2
 const anchorId = process.env.W29_ANCHOR_ID
+const route = process.env.W29_ROUTE
 const out = process.env.W29_OUT
 const adminPassword = process.env.W29_ADMIN_PW
 const requireFromExecutor = createRequire(path.join(repo, "executor", "package.json"))
@@ -684,7 +708,8 @@ try {
     await page.waitForURL(/\/versions/, { timeout: 60000 })
   }
 
-  await page.goto(`${web}/versions/${versionId}?tab=code&repo=${repo1}&anchor=${anchorId}`, { waitUntil: "domcontentloaded" })
+  await page.goto(`${web}${route}`, { waitUntil: "domcontentloaded" })
+  await page.waitForSelector('[data-testid="code-tab"]', { timeout: 90000 })
   await page.waitForSelector("select#code-repo", { timeout: 90000 })
   await page.waitForFunction(() => document.querySelectorAll("select#code-repo option").length >= 2, null, { timeout: 30000 })
   await page.waitForSelector("li[aria-current='true']", { timeout: 30000 })
@@ -708,6 +733,7 @@ try {
     $env:W29_REPO1 = $script:analysisRepoId
     $env:W29_REPO2 = $(if ($script:analysisRepoId -eq $script:repo1) { $script:repo2 } else { $script:repo1 })
     $env:W29_ANCHOR_ID = $anchorId
+    $env:W29_ROUTE = $codeTabRoute
     $env:W29_OUT = $codeDir
     $env:W29_ADMIN_PW = $script:adminPassword
     Write-Host '== capturing CodeTab screenshots'

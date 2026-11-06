@@ -666,7 +666,7 @@ export function CodeTab({ versionId }: CodeTabProps) {
   const reviewHistory = reviews
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-testid="code-tab">
       <RepositoryStatus
         repos={repos}
         selectedRepoId={selectedRepoId}

@@ -56,11 +56,14 @@ func ValidCommitSHA(value string) bool { return commitSHAPattern.MatchString(val
 
 // IndexRepository persists code_index_run rows. ActiveRun returns the single
 // queued/running run of a repository (partial unique index); DoneRunByCommit
-// backs the 200-reused idempotency rule.
+// backs the 200-reused idempotency rule; LatestDoneForVersion returns the newest
+// done run inside one version so a shared repository never leaks another
+// version's baseline.
 type IndexRepository interface {
 	CreateRun(ctx context.Context, run codeintel.IndexRun) (codeintel.IndexRun, error)
 	GetRun(ctx context.Context, id int64) (codeintel.IndexRun, error)
 	LatestRun(ctx context.Context, repoID int64) (codeintel.IndexRun, error)
+	LatestDoneForVersion(ctx context.Context, versionID, repoID int64) (codeintel.IndexRun, error)
 	UpdateRun(ctx context.Context, run codeintel.IndexRun) error
 	ActiveRun(ctx context.Context, repoID int64) (codeintel.IndexRun, bool, error)
 	DoneRunByCommit(ctx context.Context, repoID int64, commitSHA string) (codeintel.IndexRun, bool, error)
@@ -390,9 +393,16 @@ func (s *IndexService) RepoStatus(ctx context.Context, versionID int64) ([]RepoS
 		} else if !errors.Is(err, codeintel.ErrNotFound) {
 			return nil, err
 		}
-		if status.BaselineCommit == "" && status.Latest != nil &&
-			status.Latest.Status == string(codeintel.IndexDone) && ValidCommitSHA(status.Latest.CommitSHA) {
-			status.BaselineCommit = status.Latest.CommitSHA
+		// A failed/queued newest run must not hide an older done run, and
+		// another version sharing this repository must not supply the baseline.
+		if status.BaselineCommit == "" {
+			if done, doneErr := s.runs.LatestDoneForVersion(ctx, versionID, repoID); doneErr == nil {
+				if ValidCommitSHA(done.CommitSHA) {
+					status.BaselineCommit = done.CommitSHA
+				}
+			} else if !errors.Is(doneErr, codeintel.ErrNotFound) {
+				return nil, doneErr
+			}
 		}
 		if _, active, err := s.runs.ActiveRun(ctx, repoID); err == nil {
 			status.IndexInProgress = active

@@ -19,6 +19,7 @@ import (
 const (
 	testCommitA = "1111111111111111111111111111111111111111"
 	testCommitB = "2222222222222222222222222222222222222222"
+	testCommitC = "3333333333333333333333333333333333333333"
 )
 
 type indexFixture struct {
@@ -210,7 +211,7 @@ func TestRepoStatusUsesRepoSpecificBaseline(t *testing.T) {
 	})
 	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
 	fixture.runs.runs[5] = codeintel.IndexRun{
-		ID: 5, RepoID: 20, CommitSHA: testCommitB, Status: string(codeintel.IndexDone),
+		ID: 5, VersionID: 1, RepoID: 20, CommitSHA: testCommitB, Status: string(codeintel.IndexDone),
 	}
 	fixture.runs.order = []int64{5}
 	fixture.git.resolveErrRefs = map[string]error{testCommitA: errors.New("unknown revision")}
@@ -228,6 +229,39 @@ func TestRepoStatusUsesRepoSpecificBaseline(t *testing.T) {
 	}
 	if byRepo[20].BaselineCommit != testCommitB {
 		t.Fatalf("repo 20 baseline = %q, want %q", byRepo[20].BaselineCommit, testCommitB)
+	}
+}
+
+// TestRepoStatusFallsBackToVersionScopedDoneRun pins the fallback scope: the
+// shared version_sut baseline is absent here, the newest run of this repository
+// failed, and another version sharing the repository owns the newest done run.
+// The read model must use this version's newest done run instead.
+func TestRepoStatusFallsBackToVersionScopedDoneRun(t *testing.T) {
+	fixture := newIndexFixture(t)
+	fixture.versions.bindings[0].CodeBaselineCommit = ""
+	fixture.runs.runs[7] = codeintel.IndexRun{
+		ID: 7, VersionID: 1, RepoID: 10, CommitSHA: testCommitA, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.runs[8] = codeintel.IndexRun{
+		ID: 8, VersionID: 2, RepoID: 10, CommitSHA: testCommitC, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.runs[9] = codeintel.IndexRun{
+		ID: 9, VersionID: 1, RepoID: 10, CommitSHA: testCommitB, Status: string(codeintel.IndexFailed),
+	}
+	fixture.runs.order = []int64{7, 8, 9}
+
+	statuses, err := fixture.service.RepoStatus(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("RepoStatus: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+	if statuses[0].BaselineCommit != testCommitA {
+		t.Fatalf("baseline = %q, want this version's done commit %q", statuses[0].BaselineCommit, testCommitA)
+	}
+	if statuses[0].Latest == nil || statuses[0].Latest.ID != 9 {
+		t.Fatalf("latest run = %+v, want the newest run (failed) for display", statuses[0].Latest)
 	}
 }
 

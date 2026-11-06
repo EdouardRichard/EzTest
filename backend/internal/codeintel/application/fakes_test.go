@@ -55,6 +55,18 @@ func (f *fakeIndexRepo) LatestRun(_ context.Context, repoID int64) (codeintel.In
 	return codeintel.IndexRun{}, codeintel.ErrNotFound
 }
 
+func (f *fakeIndexRepo) LatestDoneForVersion(_ context.Context, versionID, repoID int64) (codeintel.IndexRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := len(f.order) - 1; index >= 0; index-- {
+		run := f.runs[f.order[index]]
+		if run.VersionID == versionID && run.RepoID == repoID && run.Status == string(codeintel.IndexDone) {
+			return run, nil
+		}
+	}
+	return codeintel.IndexRun{}, codeintel.ErrNotFound
+}
+
 func (f *fakeIndexRepo) UpdateRun(_ context.Context, run codeintel.IndexRun) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

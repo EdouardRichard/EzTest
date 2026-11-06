@@ -134,6 +134,58 @@ func TestAnalysisStartUsesRepoIndexBaselineForSecondRepository(t *testing.T) {
 	}
 }
 
+// TestAnalysisStartIgnoresDoneRunFromAnotherVersion pins the version scope of
+// the fallback: another version sharing the same repository must never supply
+// the analysis base commit.
+func TestAnalysisStartIgnoresDoneRunFromAnotherVersion(t *testing.T) {
+	fixture := newAnalysisFixture(t)
+	fixture.versions.bindings[0].CodeBaselineCommit = ""
+	fixture.runs.runs[7] = codeintel.IndexRun{
+		ID: 7, VersionID: 1, RepoID: 10, CommitSHA: testCommitA, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.runs[8] = codeintel.IndexRun{
+		ID: 8, VersionID: 2, RepoID: 10, CommitSHA: testCommitC, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.order = []int64{7, 8}
+
+	analysis, created, err := fixture.service.Start(context.Background(), 1, 10, testCommitB, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !created {
+		t.Fatal("new analysis must be created")
+	}
+	if analysis.BaseCommitSHA != testCommitA {
+		t.Fatalf("analysis base = %q, want this version's done commit %q", analysis.BaseCommitSHA, testCommitA)
+	}
+}
+
+// TestAnalysisStartFallsBackToOlderDoneRunWhenNewestFailed pins the "latest
+// done" rule: a failed newest run must not hide an older done run of the same
+// version and repository.
+func TestAnalysisStartFallsBackToOlderDoneRunWhenNewestFailed(t *testing.T) {
+	fixture := newAnalysisFixture(t)
+	fixture.versions.bindings[0].CodeBaselineCommit = ""
+	fixture.runs.runs[7] = codeintel.IndexRun{
+		ID: 7, VersionID: 1, RepoID: 10, CommitSHA: testCommitA, Status: string(codeintel.IndexDone),
+	}
+	fixture.runs.runs[8] = codeintel.IndexRun{
+		ID: 8, VersionID: 1, RepoID: 10, CommitSHA: testCommitC, Status: string(codeintel.IndexFailed),
+	}
+	fixture.runs.order = []int64{7, 8}
+
+	analysis, created, err := fixture.service.Start(context.Background(), 1, 10, testCommitB, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !created {
+		t.Fatal("new analysis must be created")
+	}
+	if analysis.BaseCommitSHA != testCommitA {
+		t.Fatalf("analysis base = %q, want the older done commit %q", analysis.BaseCommitSHA, testCommitA)
+	}
+}
+
 func TestAnalysisStartReusesDoneRange(t *testing.T) {
 	fixture := newAnalysisFixture(t)
 	fixture.analyses.runs[9] = codeintel.Analysis{

@@ -273,6 +273,67 @@ func TestAnchorCreatePrefersLatestDoneCommitForMultiRepo(t *testing.T) {
 	}
 }
 
+// TestAnchorCreateUsesVersionScopedLatestDone pins the target-commit scope: a
+// done run from another version sharing the repository and a failed newest run
+// of this version must not change the anchor target.
+func TestAnchorCreateUsesVersionScopedLatestDone(t *testing.T) {
+	h := newAnchorHarness()
+	h.versions.bindings[0].CodeBaselineCommit = ""
+	h.git.head = anchorCommitB
+	h.seedWindow("src/a.ts", "one")
+	_, _ = h.runs.CreateRun(h.ctx, codeintel.IndexRun{
+		ID: 501, VersionID: 1, RepoID: 10, CommitSHA: anchorCommitA, Status: string(codeintel.IndexDone),
+	})
+	_, _ = h.runs.CreateRun(h.ctx, codeintel.IndexRun{
+		ID: 502, VersionID: 2, RepoID: 10, CommitSHA: anchorCommitB, Status: string(codeintel.IndexDone),
+	})
+	_, _ = h.runs.CreateRun(h.ctx, codeintel.IndexRun{
+		ID: 503, VersionID: 1, RepoID: 10, CommitSHA: testCommitC, Status: string(codeintel.IndexFailed),
+	})
+
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if anchor.CommitSHA != anchorCommitA {
+		t.Fatalf("anchor commit = %q, want this version's done commit %q", anchor.CommitSHA, anchorCommitA)
+	}
+}
+
+// TestAnchorCreateSkipsSharedBaselineThatDoesNotResolveInRepo pins the
+// multi-repo baseline guard: without a local done run the shared version_sut
+// baseline may belong to another repository and must be resolved here before
+// use; otherwise the target is the repository's own branch head.
+func TestAnchorCreateSkipsSharedBaselineThatDoesNotResolveInRepo(t *testing.T) {
+	h := newAnchorHarness()
+	h.git.resolveErrRefs = map[string]error{anchorCommitA: errors.New("unknown revision")}
+	h.git.head = anchorCommitB
+	h.seedWindow("src/a.ts", "one")
+
+	anchor, err := h.service.Create(h.ctx, CreateAnchorInput{
+		VersionID: 1, SubjectKind: codeintel.AnchorSubjectRequirement, SubjectID: 100,
+		RepoID: 10, FilePath: "src/a.ts",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if anchor.CommitSHA != anchorCommitB {
+		t.Fatalf("anchor commit = %q, want the repository head %q", anchor.CommitSHA, anchorCommitB)
+	}
+	found := false
+	for _, ref := range h.git.resolvedRefs {
+		if ref == anchorCommitA {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("shared baseline %q was not resolved in the target repository: %v", anchorCommitA, h.git.resolvedRefs)
+	}
+}
+
 func TestAnchorCreateRejectsInvalidSubjectsAndRepo(t *testing.T) {
 	h := newAnchorHarness()
 	h.seedWindow("src/a.ts", "a")

@@ -122,7 +122,7 @@ func (s *AnalysisService) Start(ctx context.Context, versionID, repoID int64, he
 	if err != nil {
 		return codeintel.Analysis{}, false, mapDomainError(err, "code repository")
 	}
-	base, baselineErr := s.repoBaseline(ctx, bindings, repoID, repository)
+	base, baselineErr := s.repoBaseline(ctx, versionID, bindings, repoID, repository)
 	if baselineErr != nil {
 		return codeintel.Analysis{}, false, baselineErr
 	}
@@ -862,7 +862,7 @@ func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, 
 	if err != nil {
 		return ChangeSet{}, mapDomainError(err, "code repository")
 	}
-	base, baselineErr := s.repoBaseline(ctx, bindings, repoID, repository)
+	base, baselineErr := s.repoBaseline(ctx, versionID, bindings, repoID, repository)
 	if baselineErr != nil {
 		return ChangeSet{}, baselineErr
 	}
@@ -903,8 +903,10 @@ func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, 
 // repoBaseline resolves the analysis base commit of one repository. A
 // version_sut stores a single baseline commit shared by every effective
 // repository; when that commit does not resolve in this repository (multi-repo
-// binding), the repository's own newest done index commit is the baseline.
-func (s *AnalysisService) repoBaseline(ctx context.Context, bindings []VersionSUTBinding, repoID int64, repository RepoRef) (string, error) {
+// binding), the repository's own newest done index commit of this version is the
+// baseline. The version scope and the done filter keep another version's run and
+// a newer failed/queued run from hiding a usable baseline.
+func (s *AnalysisService) repoBaseline(ctx context.Context, versionID int64, bindings []VersionSUTBinding, repoID int64, repository RepoRef) (string, error) {
 	base, err := baselineForRepo(bindings, repoID)
 	if err != nil {
 		return "", err
@@ -916,9 +918,9 @@ func (s *AnalysisService) repoBaseline(ctx context.Context, bindings []VersionSU
 		}
 	}
 	if s.runs != nil {
-		run, runErr := s.runs.LatestRun(ctx, repoID)
+		run, runErr := s.runs.LatestDoneForVersion(ctx, versionID, repoID)
 		switch {
-		case runErr == nil && run.Status == string(codeintel.IndexDone) && ValidCommitSHA(run.CommitSHA):
+		case runErr == nil && ValidCommitSHA(run.CommitSHA):
 			return run.CommitSHA, nil
 		case runErr != nil && !errors.Is(runErr, codeintel.ErrNotFound):
 			return "", runErr
