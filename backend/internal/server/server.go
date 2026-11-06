@@ -605,6 +605,10 @@ func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", authenticated(http.HandlerFunc(h.DismissIssue)))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", authenticated(http.HandlerFunc(h.ReopenIssue)))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", authenticated(http.HandlerFunc(h.MergeIssue)))
+	// W2-4 manual issue creation/update (API-24); the handler is version-scoped
+	// and validates the version through the delivery repository.
+	mux.Handle("POST /api/versions/{versionId}/issues", authenticated(http.HandlerFunc(h.CreateIssue)))
+	mux.Handle("PATCH /api/versions/{versionId}/issues/{issueId}", authenticated(http.HandlerFunc(h.UpdateIssue)))
 
 	mux.Handle("GET /api/versions/{versionId}/reports", authenticated(http.HandlerFunc(h.ListReports)))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}", authenticated(http.HandlerFunc(h.GetReport)))
