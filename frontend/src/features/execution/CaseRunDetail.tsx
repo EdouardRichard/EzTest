@@ -1,10 +1,19 @@
 "use client"
 
+import Link from "next/link"
 import { useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
-import { ErrorState } from "@/components/ui/ErrorState"
+import { Button } from "@/components/ui/Button"
+import { Dialog } from "@/components/ui/Dialog"
+import { ErrorState, InlineError } from "@/components/ui/ErrorState"
+import { Field } from "@/components/ui/Field"
+import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { Textarea } from "@/components/ui/Textarea"
+import { createManualIssue } from "@/features/delivery/api"
+import type { IssueCategory, IssueSeverity } from "@/features/delivery/types"
+import { ISSUE_CATEGORY_LABELS, ISSUE_SEVERITY_LABELS } from "@/features/delivery/types"
 import { formatDuration } from "@/lib/format"
 
 import { EvidenceViewer } from "./EvidenceViewer"
@@ -20,7 +29,7 @@ import {
   STEP_STATUS_LABEL,
   terminalCauseLabel,
 } from "./labels"
-import type { AssertionResult, CaseRunDetail, Evidence, StepResult } from "./types"
+import type { AssertionResult, CaseRun, CaseRunDetail, Evidence, StepResult } from "./types"
 
 export type CaseRunDetailProps = {
   versionId: string
@@ -137,6 +146,155 @@ function StepRow({
   )
 }
 
+function issueHref(versionId: string, issueId: string): string {
+  const params = new URLSearchParams({ tab: "issues", issue: issueId })
+  return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
+}
+
+type CreateIssueDialogProps = {
+  versionId: string
+  run: CaseRun
+  evidence: Evidence[]
+  onClose: () => void
+}
+
+/**
+ * v0.22 W2-4 manual issue entry from a failed run. The case_run (and up to five
+ * evidence refs) are attached so the new issue keeps the execution deep links.
+ */
+function CreateIssueDialog({ versionId, run, evidence, onClose }: CreateIssueDialogProps) {
+  const defaultSummary =
+    typeof run.summary.last_error === "string" && run.summary.last_error.length > 0
+      ? run.summary.last_error
+      : typeof run.summary.verdict_reason === "string"
+        ? run.summary.verdict_reason
+        : ""
+  const evidenceIds = evidence.slice(0, 5).map((item) => item.id)
+
+  const [title, setTitle] = useState(run.title)
+  const [summary, setSummary] = useState(defaultSummary)
+  const [category, setCategory] = useState<IssueCategory>("ui")
+  const [severity, setSeverity] = useState<IssueSeverity>("major")
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState<unknown>(null)
+  const [createdIssueId, setCreatedIssueId] = useState<string | null>(null)
+
+  const disabled = creating || createdIssueId !== null || title.trim().length === 0
+
+  async function submit(): Promise<void> {
+    if (disabled) return
+    setCreating(true)
+    setError(null)
+    try {
+      const created = await createManualIssue(versionId, {
+        title: title.trim(),
+        summary: summary.trim(),
+        category,
+        severity,
+        case_run_id: run.id,
+        evidence_ids: evidenceIds,
+        reason: `从用例运行 #${run.id} 手工创建`,
+      })
+      setCreatedIssueId(created.id)
+    } catch (cause) {
+      setError(cause)
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title="创建问题"
+      description={`运行 #${run.id} 的失败结果将作为 issue 的 case_run 引用。`}
+      footer={
+        <>
+          <Button variant="secondary" size="sm" disabled={creating} onClick={onClose}>
+            {createdIssueId === null ? "取消" : "关闭"}
+          </Button>
+          {createdIssueId === null ? (
+            <Button
+              size="sm"
+              disabled={disabled}
+              onClick={() => {
+                void submit()
+              }}
+            >
+              {creating ? "创建中…" : "创建问题"}
+            </Button>
+          ) : null}
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <Field id="manual-issue-title" label="标题" required>
+          <input
+            id="manual-issue-title"
+            value={title}
+            maxLength={500}
+            disabled={creating || createdIssueId !== null}
+            onChange={(event) => setTitle(event.target.value)}
+            className="h-9 w-full rounded-md border border-border bg-input px-3 text-sm text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </Field>
+        <Field id="manual-issue-summary" label="摘要" hint="可选；描述失败现象与影响。">
+          <Textarea
+            id="manual-issue-summary"
+            value={summary}
+            maxLength={4000}
+            disabled={creating || createdIssueId !== null}
+            onChange={(event) => setSummary(event.target.value)}
+          />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field id="manual-issue-category" label="类别">
+            <Select
+              id="manual-issue-category"
+              value={category}
+              disabled={creating || createdIssueId !== null}
+              onChange={(event) => setCategory(event.target.value as IssueCategory)}
+            >
+              {(Object.keys(ISSUE_CATEGORY_LABELS) as IssueCategory[]).map((value) => (
+                <option key={value} value={value}>
+                  {ISSUE_CATEGORY_LABELS[value]}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field id="manual-issue-severity" label="严重度">
+            <Select
+              id="manual-issue-severity"
+              value={severity}
+              disabled={creating || createdIssueId !== null}
+              onChange={(event) => setSeverity(event.target.value as IssueSeverity)}
+            >
+              {(Object.keys(ISSUE_SEVERITY_LABELS) as IssueSeverity[]).map((value) => (
+                <option key={value} value={value}>
+                  {ISSUE_SEVERITY_LABELS[value]}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+        {error !== null ? <InlineError error={error} /> : null}
+        {createdIssueId !== null ? (
+          <p className="text-xs text-success">
+            问题已创建：{" "}
+            <Link
+              href={issueHref(versionId, createdIssueId)}
+              className="text-primary underline-offset-2 hover:underline"
+            >
+              查看问题 #{createdIssueId}
+            </Link>
+          </p>
+        ) : null}
+      </div>
+    </Dialog>
+  )
+}
+
 /**
  * Expanded case-run snapshot (spec §12.1): step list in `seq` order with the
  * assertions and evidence nested under their step, plus the evidence dialog.
@@ -151,6 +309,7 @@ export function CaseRunDetailView({
   onRetry,
 }: CaseRunDetailProps) {
   const [viewerEvidence, setViewerEvidence] = useState<Evidence | null>(null)
+  const [issueDialogOpen, setIssueDialogOpen] = useState(false)
 
   if (loading) return <LoadingCard label="正在加载用例详情…" />
 
@@ -214,6 +373,16 @@ export function CaseRunDetailView({
           </span>
         ) : verdictReason.length > 0 ? (
           <span className="text-muted-foreground">原因 {verdictReason}</span>
+        ) : null}
+        {run.status === "failed" ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="ml-auto"
+            onClick={() => setIssueDialogOpen(true)}
+          >
+            创建问题
+          </Button>
         ) : null}
       </div>
 
@@ -303,6 +472,15 @@ export function CaseRunDetailView({
         open={viewerEvidence !== null}
         onClose={() => setViewerEvidence(null)}
       />
+
+      {issueDialogOpen ? (
+        <CreateIssueDialog
+          versionId={versionId}
+          run={run}
+          evidence={detail.evidence}
+          onClose={() => setIssueDialogOpen(false)}
+        />
+      ) : null}
     </div>
   )
 }

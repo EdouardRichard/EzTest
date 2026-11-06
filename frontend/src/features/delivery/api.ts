@@ -1,6 +1,7 @@
 import { type ApiDownload, apiDownload, apiGet, apiGetPage, apiPost } from "@/lib/api-client"
 
 import type {
+  CreateManualIssueInput,
   IssueActionInput,
   IssueDetailView,
   IssueListOptions,
@@ -16,6 +17,7 @@ import type {
   ReportListOptions,
   ReportRevisionView,
   ReportView,
+  RetestIssueResult,
 } from "./types"
 
 /** Builds `?a=1&b=2`, skipping empty values (P0/P1 pagination style). */
@@ -118,6 +120,57 @@ export function mergeIssue(
   if (input.reason !== undefined && input.reason.length > 0) body.reason = input.reason
   if (input.expected_revision !== undefined) body.expected_revision = input.expected_revision
   return apiPost<IssueView>(`${issuePath(versionId, issueId)}/merge`, body)
+}
+
+/**
+ * `POST /api/versions/{id}/issues` (v0.22 W2-4): manual issue creation. The
+ * optional `case_run_id` links the source run (and its evidence) to the issue.
+ */
+export function createManualIssue(
+  versionId: string,
+  input: CreateManualIssueInput,
+): Promise<IssueView> {
+  const body: {
+    title: string
+    summary?: string
+    category: string
+    severity: string
+    case_run_id?: string
+    evidence_ids?: string[]
+    merge_into_id?: string
+    reason?: string
+  } = {
+    title: input.title,
+    category: input.category,
+    severity: input.severity,
+  }
+  if (input.summary !== undefined && input.summary.length > 0) body.summary = input.summary
+  if (input.case_run_id !== undefined && input.case_run_id.length > 0) {
+    body.case_run_id = input.case_run_id
+  }
+  if (input.evidence_ids !== undefined && input.evidence_ids.length > 0) {
+    body.evidence_ids = input.evidence_ids
+  }
+  if (input.merge_into_id !== undefined && input.merge_into_id.length > 0) {
+    body.merge_into_id = input.merge_into_id
+  }
+  if (input.reason !== undefined && input.reason.length > 0) body.reason = input.reason
+  return apiPost<IssueView>(`${versionPath(versionId)}/issues`, body)
+}
+
+/**
+ * `POST .../issues/{issueId}/retest` (v0.22 W2-5/API-25). An empty selection
+ * retests every case_run linked to the issue. The response `case_run_ids` are
+ * the new retest runs, not the request source runs.
+ */
+export function retestIssue(
+  versionId: string,
+  issueId: string,
+  caseRunIds: string[] = [],
+): Promise<RetestIssueResult> {
+  const body: { case_run_ids?: string[] } = {}
+  if (caseRunIds.length > 0) body.case_run_ids = caseRunIds
+  return apiPost<RetestIssueResult>(`${issuePath(versionId, issueId)}/retest`, body)
 }
 
 /* ---------------------------------- reports -------------------------------- */

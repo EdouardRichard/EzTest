@@ -1,11 +1,13 @@
 "use client"
 
+import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
+import { Button } from "@/components/ui/Button"
 import { EmptyState } from "@/components/ui/EmptyState"
-import { ErrorState } from "@/components/ui/ErrorState"
+import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { Field } from "@/components/ui/Field"
 import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
@@ -13,20 +15,24 @@ import { Table, type TableColumn } from "@/components/ui/Table"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { formatDateTime } from "@/lib/format"
 
-import { confirmIssue, dismissIssue, getIssue, listIssues, reopenIssue } from "./api"
+import { confirmIssue, dismissIssue, getIssue, listIssues, reopenIssue, retestIssue } from "./api"
 import { IssueDetailSheet, type IssueTransitionAction } from "./IssueDetailSheet"
 import { MergeIssueDialog } from "./MergeIssueDialog"
 import {
   ISSUE_CATEGORY_LABELS,
+  ISSUE_RETEST_STATUS_LABELS,
+  ISSUE_RETEST_STATUS_TONES,
   ISSUE_SEVERITY_LABELS,
   ISSUE_STATUS_LABELS,
   ISSUE_STATUS_ORDER,
   type IssueCategory,
   type IssueDetailView,
   type IssueListOptions,
+  type IssueRetestStatus,
   type IssueSeverity,
   type IssueStatus,
   type IssueView,
+  type RetestIssueResult,
 } from "./types"
 
 export type IssuesTabProps = {
@@ -56,6 +62,24 @@ const STATUS_TONE: Record<IssueStatus, BadgeTone> = {
 
 /** SSE bursts (issue.reopened + issue.updated) collapse into one snapshot refetch. */
 const SSE_REFRESH_DEBOUNCE_MS = 350
+
+function retestStatusOf(issue: IssueView): IssueRetestStatus {
+  return issue.retest_status ?? "not_retested"
+}
+
+/** Dismissed/merged issues are terminal; a running retest blocks another one. */
+function canRetest(issue: IssueView): boolean {
+  return (
+    (issue.status === "open" || issue.status === "confirmed") &&
+    retestStatusOf(issue) !== "retesting"
+  )
+}
+
+/** Deep link to one retest case run; the wave comes from the retest response. */
+function retestRunHref(versionId: string, waveId: string, caseRunId: string): string {
+  const params = new URLSearchParams({ tab: "execution", wave: waveId, case_run: caseRunId })
+  return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
+}
 
 function buildListOptions(filters: IssueFilters): IssueListOptions {
   const options: IssueListOptions = { limit: 20 }
@@ -122,6 +146,9 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
   const [detailError, setDetailError] = useState<unknown>(null)
   const [detailToken, setDetailToken] = useState(0)
   const [merging, setMerging] = useState(false)
+  const [retestingIds, setRetestingIds] = useState<Set<string>>(() => new Set())
+  const [retestError, setRetestError] = useState<unknown>(null)
+  const [retestNotice, setRetestNotice] = useState<RetestIssueResult | null>(null)
 
   const listOptions = useMemo(() => buildListOptions(filters), [filters])
 
@@ -287,6 +314,38 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
     [detail, refresh, selectedIssueId, versionId],
   )
 
+  /**
+   * Starts a retest with an empty selection (the server retests every linked
+   * source run). The response `case_run_ids` are the new retest runs and are
+   * the only IDs used for the deep links below.
+   */
+  const startRetest = useCallback(
+    async (issueId: string): Promise<void> => {
+      setRetestError(null)
+      setRetestingIds((current) => new Set(current).add(issueId))
+      try {
+        const result = await retestIssue(versionId, issueId)
+        setRetestNotice(result)
+        await refresh()
+      } catch (cause) {
+        setRetestError(cause)
+        throw cause
+      } finally {
+        setRetestingIds((current) => {
+          const next = new Set(current)
+          next.delete(issueId)
+          return next
+        })
+      }
+    },
+    [refresh, versionId],
+  )
+
+  const handleRetest = useCallback(async (): Promise<void> => {
+    if (selectedIssueId === null) return
+    await startRetest(selectedIssueId)
+  }, [selectedIssueId, startRetest])
+
   const sortedIssues = useMemo(() => [...issues].sort(compareIssues), [issues])
 
   const sutOptions = useMemo(() => {
@@ -325,6 +384,29 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
       render: (issue) => (
         <Badge tone={STATUS_TONE[issue.status]}>{ISSUE_STATUS_LABELS[issue.status]}</Badge>
       ),
+    },
+    {
+      key: "retest",
+      header: "复测",
+      render: (issue) => {
+        const retestStatus = retestStatusOf(issue)
+        return (
+          <span
+            data-testid={`issue-retest-${issue.id}`}
+            className="inline-flex items-center gap-1"
+            title={
+              issue.last_retest_wave_id != null
+                ? `最近复测波次 #${issue.last_retest_wave_id}`
+                : "尚未复测"
+            }
+          >
+            <Badge tone={ISSUE_RETEST_STATUS_TONES[retestStatus]}>
+              {ISSUE_RETEST_STATUS_LABELS[retestStatus]}
+            </Badge>
+            <span className="text-[10px] text-muted-foreground">{retestStatus}</span>
+          </span>
+        )
+      },
     },
     {
       key: "category",
@@ -384,6 +466,25 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
       render: (issue) => (
         <span className="text-xs text-muted-foreground">{formatDateTime(issue.updated_at)}</span>
       ),
+    },
+    {
+      key: "actions",
+      header: "操作",
+      render: (issue) =>
+        canRetest(issue) ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={retestingIds.has(issue.id)}
+            onClick={() => {
+              void startRetest(issue.id).catch(() => {})
+            }}
+          >
+            复测
+          </Button>
+        ) : (
+          <span className="text-[11px] text-muted-foreground">—</span>
+        ),
     },
   ]
 
@@ -458,6 +559,41 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
         </Field>
       </section>
 
+      {retestError !== null ? (
+        <InlineError error={retestError}>
+          <span className="ml-2 text-muted-foreground">（复测启动失败）</span>
+        </InlineError>
+      ) : null}
+
+      {retestNotice !== null ? (
+        <div
+          data-testid="issue-retest-notice"
+          role="status"
+          className="rounded-lg border border-info/30 bg-info/10 px-3 py-2 text-xs text-foreground"
+        >
+          <p className="font-medium">
+            问题 #{retestNotice.issue_id} 已启动复测：波次 #{retestNotice.wave_id}（
+            {ISSUE_RETEST_STATUS_LABELS[retestNotice.retest_status]}）
+          </p>
+          <p className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+            <span className="text-muted-foreground">新复测运行：</span>
+            {retestNotice.case_run_ids.length === 0 ? (
+              <span className="text-muted-foreground">等待执行器创建运行</span>
+            ) : (
+              retestNotice.case_run_ids.map((caseRunId) => (
+                <Link
+                  key={caseRunId}
+                  href={retestRunHref(versionId, retestNotice.wave_id, caseRunId)}
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  运行 #{caseRunId}
+                </Link>
+              ))
+            )}
+          </p>
+        </div>
+      ) : null}
+
       {loading ? (
         <LoadingCard label="正在加载问题…" />
       ) : error !== null ? (
@@ -490,6 +626,7 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
           onRetry={() => setDetailToken((token) => token + 1)}
           onTransition={handleTransition}
           onMerge={() => setMerging(true)}
+          onRetest={handleRetest}
         />
       ) : null}
 

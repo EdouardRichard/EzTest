@@ -18,12 +18,15 @@ import {
   ISSUE_ACTOR_LABELS,
   ISSUE_CATEGORY_LABELS,
   ISSUE_REF_LABELS,
+  ISSUE_RETEST_STATUS_LABELS,
+  ISSUE_RETEST_STATUS_TONES,
   ISSUE_SEVERITY_LABELS,
   ISSUE_STATUS_LABELS,
   type IssueDetailView,
   type IssueHistoryView,
   type IssueRef,
   type IssueRefKind,
+  type IssueRetestStatus,
   type IssueStatus,
 } from "./types"
 
@@ -41,6 +44,8 @@ export type IssueDetailSheetProps = {
   /** Resolves when the transition succeeded; throws ApiError otherwise. */
   onTransition: (action: IssueTransitionAction, reason: string) => Promise<void>
   onMerge: () => void
+  /** Starts a retest; omitted in the read-only global workspace. */
+  onRetest?: () => Promise<void>
 }
 
 const STATUS_TONE: Record<IssueStatus, BadgeTone> = {
@@ -91,14 +96,46 @@ function issueHref(versionId: string, issueId: string): string {
   return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
 }
 
+function executionWaveHref(versionId: string, waveId: string): string {
+  const params = new URLSearchParams({ tab: "execution", wave: waveId })
+  return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
+}
+
+function executionRunHref(versionId: string, waveId: string, caseRunId: string): string {
+  const params = new URLSearchParams({ tab: "execution", wave: waveId, case_run: caseRunId })
+  return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
+}
+
+function executionCaseRunHref(versionId: string, caseRunId: string): string {
+  const params = new URLSearchParams({ tab: "execution", case_run: caseRunId })
+  return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
+}
+
+/**
+ * Picks the wave a ref belongs to. Retest refs use the retest wave (the last
+ * role='retest' wave ref); source refs keep the original failure wave so a
+ * retest never rewrites the evidence deep link of the source run.
+ */
+function relatedWaveID(refs: IssueRef[], role: string): string | undefined {
+  const isRetest = role === "retest"
+  const candidates = refs.filter(
+    (ref) => ref.kind === "wave" && (isRetest ? ref.role === "retest" : ref.role !== "retest"),
+  )
+  return candidates.length > 0 ? candidates[candidates.length - 1].ref_id : undefined
+}
+
 function executionHref(
   versionId: string,
   refs: IssueRef[],
   kind: "case_run" | "wave" | "evidence",
   refId: string,
+  role: string,
 ): string {
-  const caseRunId = refs.find((ref) => ref.kind === "case_run")?.ref_id
-  const waveId = refs.find((ref) => ref.kind === "wave")?.ref_id
+  const isRetest = role === "retest"
+  const caseRunId = refs.find(
+    (ref) => ref.kind === "case_run" && (isRetest ? ref.role === "retest" : ref.role !== "retest"),
+  )?.ref_id
+  const waveId = relatedWaveID(refs, role)
   const params = new URLSearchParams({ tab: "execution" })
   if (kind === "wave") {
     params.set("wave", refId)
@@ -120,7 +157,7 @@ function refHref(versionId: string, refs: IssueRef[], ref: IssueRef): string | n
     case "case_run":
     case "wave":
     case "evidence":
-      return executionHref(versionId, refs, ref.kind, ref.ref_id)
+      return executionHref(versionId, refs, ref.kind, ref.ref_id, ref.role)
     case "report": {
       const params = new URLSearchParams({ tab: "reports", report: ref.ref_id })
       return `/versions/${encodeURIComponent(versionId)}?${params.toString()}`
@@ -201,6 +238,72 @@ function RefsSection({ versionId, issue }: { versionId: string; issue: IssueDeta
           })}
         </ul>
       )}
+    </section>
+  )
+}
+
+/**
+ * Retest projection section (v0.22 W2-5): status, the last wave and the last
+ * written-back run. Both are deep links into the execution tab.
+ */
+function RetestSection({ versionId, issue }: { versionId: string; issue: IssueDetailView }) {
+  const status: IssueRetestStatus = issue.retest_status ?? "not_retested"
+  const waveId = issue.last_retest_wave_id ?? null
+  const caseRunId = issue.last_retest_case_run_id ?? null
+  const retestRefs = issue.refs.filter((ref) => ref.role === "retest")
+  return (
+    <section data-testid="issue-retest" aria-label="复测信息" className="space-y-2">
+      <h3 className="text-xs font-semibold text-foreground">复测</h3>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+        <dt className="text-muted-foreground">复测状态</dt>
+        <dd className="flex flex-wrap items-center gap-1.5">
+          <Badge tone={ISSUE_RETEST_STATUS_TONES[status]}>
+            {ISSUE_RETEST_STATUS_LABELS[status]}
+          </Badge>
+          <span data-testid="issue-retest-status" className="text-muted-foreground">
+            {status}
+          </span>
+        </dd>
+        <dt className="text-muted-foreground">最近复测波次</dt>
+        <dd className="text-foreground">
+          {waveId === null ? (
+            "尚未复测"
+          ) : (
+            <Link
+              href={executionWaveHref(versionId, waveId)}
+              className="text-primary underline-offset-2 hover:underline"
+            >
+              复测波次 #{waveId}
+            </Link>
+          )}
+        </dd>
+        <dt className="text-muted-foreground">最近复测运行</dt>
+        <dd className="text-foreground">
+          {caseRunId === null ? (
+            "暂无终态回写"
+          ) : waveId === null ? (
+            <Link
+              href={executionCaseRunHref(versionId, caseRunId)}
+              className="text-primary underline-offset-2 hover:underline"
+            >
+              复测运行 #{caseRunId}
+            </Link>
+          ) : (
+            <Link
+              href={executionRunHref(versionId, waveId, caseRunId)}
+              className="text-primary underline-offset-2 hover:underline"
+            >
+              复测运行 #{caseRunId}
+            </Link>
+          )}
+        </dd>
+        {retestRefs.length > 0 ? (
+          <>
+            <dt className="text-muted-foreground">复测引用</dt>
+            <dd className="text-foreground">{retestRefs.length} 个</dd>
+          </>
+        ) : null}
+      </dl>
     </section>
   )
 }
@@ -346,8 +449,11 @@ export function IssueDetailSheet({
   onRetry,
   onTransition,
   onMerge,
+  onRetest,
 }: IssueDetailSheetProps) {
   const [transition, setTransition] = useState<IssueTransitionAction | null>(null)
+  const [retesting, setRetesting] = useState(false)
+  const [retestError, setRetestError] = useState<unknown>(null)
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -364,6 +470,21 @@ export function IssueDetailSheet({
   const lastRecurredAt = issue?.last_recurred_at ?? null
   const mergedChain = issue?.merged_chain ?? []
   const mergedIntoId = issue?.merged_into_id ?? null
+  const retestStatus: IssueRetestStatus = issue?.retest_status ?? "not_retested"
+
+  /** Runs the retest and keeps API errors inside the sheet (dialog stays open). */
+  async function submitRetest(): Promise<void> {
+    if (onRetest === undefined || retesting) return
+    setRetesting(true)
+    setRetestError(null)
+    try {
+      await onRetest()
+    } catch (cause) {
+      setRetestError(cause)
+    } finally {
+      setRetesting(false)
+    }
+  }
 
   return (
     <div className="fixed inset-0 z-40">
@@ -393,6 +514,9 @@ export function IssueDetailSheet({
                 <Badge tone={STATUS_TONE[issue.status]}>{ISSUE_STATUS_LABELS[issue.status]}</Badge>
                 <Badge tone="neutral">{ISSUE_CATEGORY_LABELS[issue.category]}</Badge>
                 <Badge tone="neutral">{ISSUE_SEVERITY_LABELS[issue.severity]}</Badge>
+                <Badge tone={ISSUE_RETEST_STATUS_TONES[retestStatus]}>
+                  {ISSUE_RETEST_STATUS_LABELS[retestStatus]}
+                </Badge>
                 <span className="text-[11px] text-muted-foreground">
                   重开 {issue.reopen_count} 次
                 </span>
@@ -489,36 +613,55 @@ export function IssueDetailSheet({
 
               {readOnly ? (
                 <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                  只读视图；请在所属版本工作区处理该问题。
+                  只读视图；请在所属版本工作区处理该问题（复测入口在版本问题 Tab）。
                 </p>
               ) : (
-                <div className="flex flex-wrap items-center gap-2">
-                  {issue.status === "open" ? (
-                    <>
-                      <Button size="sm" onClick={() => setTransition("confirm")}>
-                        确认
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {issue.status === "open" ? (
+                      <>
+                        <Button size="sm" onClick={() => setTransition("confirm")}>
+                          确认
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => setTransition("dismiss")}
+                        >
+                          驳回
+                        </Button>
+                      </>
+                    ) : null}
+                    {issue.status === "confirmed" || issue.status === "dismissed" ? (
+                      <Button size="sm" onClick={() => setTransition("reopen")}>
+                        重开
                       </Button>
+                    ) : null}
+                    {onRetest !== undefined &&
+                    (issue.status === "open" || issue.status === "confirmed") &&
+                    retestStatus !== "retesting" ? (
                       <Button
                         variant="secondary"
                         size="sm"
-                        onClick={() => setTransition("dismiss")}
+                        disabled={retesting}
+                        onClick={() => {
+                          void submitRetest()
+                        }}
                       >
-                        驳回
+                        {retesting ? "启动中…" : "复测"}
                       </Button>
-                    </>
-                  ) : null}
-                  {issue.status === "confirmed" || issue.status === "dismissed" ? (
-                    <Button size="sm" onClick={() => setTransition("reopen")}>
-                      重开
-                    </Button>
-                  ) : null}
-                  {canMerge ? (
-                    <Button variant="secondary" size="sm" onClick={onMerge}>
-                      合并
-                    </Button>
-                  ) : null}
+                    ) : null}
+                    {canMerge ? (
+                      <Button variant="secondary" size="sm" onClick={onMerge}>
+                        合并
+                      </Button>
+                    ) : null}
+                  </div>
+                  {retestError !== null ? <InlineError error={retestError} /> : null}
                 </div>
               )}
+
+              <RetestSection versionId={versionId} issue={issue} />
 
               <RefsSection versionId={versionId} issue={issue} />
 

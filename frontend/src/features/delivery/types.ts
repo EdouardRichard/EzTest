@@ -32,6 +32,13 @@ export type IssueTriageStatus = "queued" | "running" | "done" | "failed" | "degr
 
 export type IssueActorKind = "user" | "agent" | "system"
 
+/**
+ * v0.22 W2-5 retest result model (`delivery_issue.retest_status`). It is
+ * independent of the four issue lifecycle statuses: an issue can stay `open`
+ * while its last retest outcome is `passed`/`failed`.
+ */
+export type IssueRetestStatus = "not_retested" | "retesting" | "passed" | "failed"
+
 /* ---------------------------------- views ---------------------------------- */
 
 /** `IssueRefView`: one issue↔entity reference. */
@@ -70,6 +77,12 @@ export type IssueView = {
   last_recurred_at?: string | null
   /** Merge chain target IDs, direct target first (P7 read-time projection). */
   merged_chain?: string[] | null
+  /** v0.22 W2-5 retest projection; absent only on pre-W2 fixtures/projections. */
+  retest_status?: IssueRetestStatus
+  /** Wave of the most recent retest; null before the first retest. */
+  last_retest_wave_id?: string | null
+  /** Case run written back by the most recent retest; null before a terminal writeback. */
+  last_retest_case_run_id?: string | null
   reopen_count: number
   refs: IssueRef[]
   triage?: IssueTriage | null
@@ -245,6 +258,34 @@ export type MergeIssueInput = {
   expected_revision?: number
 }
 
+/** v0.22 W2-4 manual issue body (`POST /api/versions/{id}/issues`). */
+export type CreateManualIssueInput = {
+  title: string
+  summary?: string
+  category: IssueCategory
+  severity: IssueSeverity
+  /** Optional source run; the server resolves its refs (decimal string). */
+  case_run_id?: string
+  /** Up to five evidence refs (decimal strings). */
+  evidence_ids?: string[]
+  merge_into_id?: string
+  reason?: string
+}
+
+/**
+ * `POST .../issues/{id}/retest` response (v0.22 W2-5/API-25).
+ * `case_run_ids` are the NEW retest runs created by the wave; the request
+ * `case_run_ids` (source runs) are never echoed back.
+ */
+export type RetestIssueResult = {
+  issue_id: string
+  version_id: string
+  wave_id: string
+  wave_status: string
+  retest_status: IssueRetestStatus
+  case_run_ids: string[]
+}
+
 /* ------------------------------- UI metadata ------------------------------- */
 
 /** Sort priority used by the list: open first, then confirmed/dismissed/merged. */
@@ -289,6 +330,25 @@ export const ISSUE_ACTOR_LABELS: Record<IssueActorKind, string> = {
   user: "用户",
   agent: "代理",
   system: "系统",
+}
+
+/** `retest_status` labels; the raw enum value stays visible next to them. */
+export const ISSUE_RETEST_STATUS_LABELS: Record<IssueRetestStatus, string> = {
+  not_retested: "未复测",
+  retesting: "复测中",
+  passed: "通过",
+  failed: "失败",
+}
+
+/** Badge tones structurally match `BadgeTone` without importing UI code. */
+export const ISSUE_RETEST_STATUS_TONES: Record<
+  IssueRetestStatus,
+  "neutral" | "info" | "warning" | "success" | "danger"
+> = {
+  not_retested: "neutral",
+  retesting: "info",
+  passed: "success",
+  failed: "danger",
 }
 
 /* ------------------------------- report labels ------------------------------ */

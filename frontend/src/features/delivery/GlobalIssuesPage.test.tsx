@@ -245,6 +245,42 @@ describe("GlobalIssuesPage", () => {
     for (const label of ["确认", "驳回", "重开", "合并"]) {
       expect(within(sheet).queryByRole("button", { name: label })).not.toBeInTheDocument()
     }
-    expect(within(sheet).queryByRole("button", { name: "合并" })).not.toBeInTheDocument()
+  })
+
+  it("shows the issue retest status and retest deep links read-only", async () => {
+    const retested: GlobalIssueView = {
+      ...openIssue,
+      retest_status: "passed",
+      last_retest_wave_id: "9202",
+      last_retest_case_run_id: "9402",
+    }
+    globalApi.listGlobalIssues.mockResolvedValue(page([retested]))
+    api.getIssue.mockResolvedValue({
+      ...openDetail,
+      retest_status: "passed",
+      last_retest_wave_id: "9202",
+      last_retest_case_run_id: "9402",
+      refs: [
+        { kind: "wave", ref_id: "9202", version_sut_id: null, role: "retest" },
+        { kind: "case_run", ref_id: "9402", version_sut_id: null, role: "retest" },
+      ],
+    })
+
+    render(<GlobalIssuesPage />)
+
+    const cell = await screen.findByTestId("global-issue-retest-9101")
+    expect(within(cell).getByText("passed")).toBeInTheDocument()
+    expect(within(cell).getByText("通过")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("global-issue-9101"))
+    const sheet = await screen.findByTestId("issue-detail-sheet")
+    const retestSection = within(sheet).getByTestId("issue-retest")
+    expect(retestSection).toHaveTextContent("通过")
+    expect(within(retestSection).getByRole("link", { name: "复测运行 #9402" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202&case_run=9402",
+    )
+    // The global center stays read-only: the retest action lives in the version tab.
+    expect(within(sheet).queryByRole("button", { name: "复测" })).not.toBeInTheDocument()
   })
 })
