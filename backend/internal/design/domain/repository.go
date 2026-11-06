@@ -285,6 +285,40 @@ type PlannerRepository interface {
 	CaseCounts(ctx context.Context, versionID int64) (CaseCounts, error)
 }
 
+// RollbackTx is the row-locking read/write surface of one discovery
+// auto-confirm rollback (spec R-EX-6/API-41). The transaction holds the
+// requirement advisory lock so a concurrent rollback of the same revision is
+// idempotent.
+type RollbackTx interface {
+	Requirement(ctx context.Context) (RequirementRef, error)
+	// CaseVersionForUpdate loads one case version with its children and locks
+	// its case_version row.
+	CaseVersionForUpdate(ctx context.Context, caseVersionID int64) (CaseVersion, error)
+	// RollbackReplacement returns the already-inserted replacement of one
+	// rolled-back revision, looked up inside the transaction so a concurrent
+	// idempotent rollback returns it.
+	RollbackReplacement(ctx context.Context, caseID, rolledBackVersionID int64) (*CaseVersion, error)
+	// PriorConfirmedVersion returns the confirmed revision immediately before
+	// beforeRevision (the revision the auto-confirmation replaced).
+	PriorConfirmedVersion(ctx context.Context, caseID int64, beforeRevision int) (CaseVersion, error)
+	InsertCaseVersion(ctx context.Context, version CaseVersion) (CaseVersion, error)
+	SupersedeCaseVersion(ctx context.Context, caseVersionID int64, at time.Time) error
+	SetCurrentVersion(ctx context.Context, caseID, caseVersionID int64, status string, at time.Time) error
+	InsertConfirmation(ctx context.Context, confirmation Confirmation) error
+}
+
+// RollbackRepository runs the discovery auto-confirm rollback and its
+// idempotency reads.
+type RollbackRepository interface {
+	// CaseVersionByObservation finds the revision produced by one discovery
+	// observation (the auto-confirm idempotency key).
+	CaseVersionByObservation(ctx context.Context, versionID, observationID int64) (CaseVersion, bool, error)
+	// CaseVersionByRollbackOf finds the replacement revision of one rolled-back
+	// auto-confirmed revision (the rollback idempotency key).
+	CaseVersionByRollbackOf(ctx context.Context, versionID, rolledBackVersionID int64) (CaseVersion, bool, error)
+	WithRollbackLock(ctx context.Context, versionID, requirementID int64, fn func(context.Context, RollbackTx) error) error
+}
+
 // DataPlanRepository rewrites a draft case version for the data planner.
 type DataPlanRepository interface {
 	// CurrentCaseVersion loads one case version that is the current version of
@@ -307,4 +341,5 @@ type Repository interface {
 	StaleRepository
 	PlannerRepository
 	DataPlanRepository
+	RollbackRepository
 }

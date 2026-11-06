@@ -220,6 +220,9 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "design.case_version_superseded":
         case "design.case_confirmed":
         case "design.review_submitted":
+        case "case.revision.auto_confirmed":
+          // W2-11 R-EX-6: an additive discovery case revision was auto-confirmed
+          // or rolled back; the design page refetches the case.
           handlersRef.current.onDesignCaseChanged?.(event)
           break
         case "design.round_started":

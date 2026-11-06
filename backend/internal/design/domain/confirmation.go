@@ -27,6 +27,13 @@ type Confirmation struct {
 	Snapshot               map[string]any
 	ConfirmedBy            int64
 	ConfirmedAt            time.Time
+	// AutoConfirmed marks a confirmation performed by the system rather than a
+	// human (spec DB-30). Trigger/SourceObservationID keep the discovery or
+	// rollback provenance on the audit row.
+	AutoConfirmed       bool
+	AutoConfirmedBy     string
+	Trigger             string
+	SourceObservationID *int64
 }
 
 // ConfirmedCase is one case version confirmed in a batch.

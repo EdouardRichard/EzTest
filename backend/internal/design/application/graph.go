@@ -42,6 +42,9 @@ type GraphService struct {
 	reopener  VersionReopener
 	caseRuns  CaseRunStatusReader
 	discovery DiscoveryFactsReader
+	// revisionStore is the W2-11 cross-context provenance read port for the
+	// additive discovery case revision service.
+	revisionStore DiscoveryRevisionStore
 	// visual resolves the active visual_assertion configurations of a case
 	// version so confirmation can require a resolvable visual_assertion_id
 	// before a kind=visual assertion reaches execution (Task 115).
@@ -595,6 +598,10 @@ func (s *GraphService) buildCaseVersion(in CaseInput, caseID int64, current *des
 		PageIDs:             in.PageIDs,
 		APIIDs:              in.APIIDs,
 		Status:              design.CaseStatusDraft,
+		Trigger:             in.Trigger,
+		SourceObservationID: in.SourceObservationID,
+		AutoConfirmedBy:     in.AutoConfirmedBy,
+		RollbackOf:          in.RollbackOf,
 		CreatedAt:           now,
 		UpdatedAt:           now,
 		Steps:               make([]design.CaseStep, 0, len(in.Steps)),

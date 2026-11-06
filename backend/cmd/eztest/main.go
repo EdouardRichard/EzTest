@@ -1362,6 +1362,11 @@ func main() {
 		designStale,
 	)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, designTeamRoom)
+	// W2-11 (WP-6): the additive discovery case revision service reads the
+	// observation provenance chain through a design-side read projection; the
+	// resource-confirmed observer below turns an approved discovered page/API
+	// into one auto-confirmed (or low-confidence draft) case revision.
+	designGraph.SetDiscoveryRevisionStore(designpg.NewRevisionStore(pool))
 	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
 	designExports := designapp.NewExportService(
 		designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
@@ -2147,9 +2152,16 @@ func main() {
 	// against another API replica still settles this replica's observations.
 	decisionObserver := executionapp.NewResourceDecisionObserver(executionRepo.Observations, slog.Default())
 	eventSvc.Observe(decisionObserver)
+	// W2-11 (WP-6): an approved discovered page/API also drives the additive
+	// discovery case revision (Critic + auto-confirm, or a low-confidence
+	// draft). The observer is nil-safe and best effort, exactly like the
+	// W1-14B decision observer: it never blocks or fails the resource publish.
+	revisionObserver := designGraph.ResourceConfirmedObserver(slog.Default())
+	eventSvc.Observe(revisionObserver)
 	if p7rt.Listener != nil {
 		p7rt.Listener.Observe(wake)
 		p7rt.Listener.Observe(decisionObserver)
+		p7rt.Listener.Observe(revisionObserver)
 	}
 	background.Add(1)
 	go func() {

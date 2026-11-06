@@ -36,18 +36,23 @@ const (
 
 // AugmentedCaseDraftStep is one proposed step of an augmentation draft.
 type AugmentedCaseDraftStep struct {
-	Seq      int
-	Action   string
-	Expected string
+	Seq                int
+	Action             string
+	Expected           string
+	TargetVersionSUTID *int64
+	TargetPageID       *int64
+	TargetAPIID        *int64
 }
 
 // AugmentedCaseDraftAssertion is one proposed assertion of an augmentation
 // draft.
 type AugmentedCaseDraftAssertion struct {
-	StepSeq  int
-	Kind     string
-	Target   string
-	Expected string
+	StepSeq            int
+	Kind               string
+	Target             string
+	Expected           string
+	TargetVersionSUTID *int64
+	TargetAPIID        *int64
 }
 
 // AugmentedCaseDraft is one draft case produced by the requirement gap analysis.
@@ -61,9 +66,17 @@ type AugmentedCaseDraft struct {
 	Description          string
 	Preconditions        string
 	Priority             string
-	Steps                []AugmentedCaseDraftStep
-	Assertions           []AugmentedCaseDraftAssertion
-	SourceFactIDs        []int64
+	// PageIDs/APIIDs bind the draft to the approved discovered target
+	// (spec R-EX-6: additive case with target page/API).
+	PageIDs []int64
+	APIIDs  []int64
+	// SourceObservationID is the execution discovery observation that
+	// authorized the draft. When set, the draft carries a knowledge source
+	// "discovery_observation:<id>" and the version records the observation id.
+	SourceObservationID *int64
+	Steps               []AugmentedCaseDraftStep
+	Assertions          []AugmentedCaseDraftAssertion
+	SourceFactIDs       []int64
 }
 
 // AugmentedCaseDraftResult is the persisted result of one augmentation draft.
@@ -111,6 +124,8 @@ func (s *GraphService) CreateAugmentedDraftCase(ctx context.Context, versionID i
 		Name:          AugmentedCaseScenarioName,
 		Description:   "由探索缺口分析自动生成的用例草案，等待人工确认",
 		VersionSUTIDs: []int64{in.VersionSUTID},
+		PageIDs:       append([]int64(nil), in.PageIDs...),
+		APIIDs:        append([]int64(nil), in.APIIDs...),
 		SortOrder:     100,
 	}
 	// Reuse the existing augmentation scenario when it exists: mirroring its
@@ -129,21 +144,26 @@ func (s *GraphService) CreateAugmentedDraftCase(ctx context.Context, versionID i
 	steps := make([]StepInput, 0, len(in.Steps))
 	for _, step := range in.Steps {
 		steps = append(steps, StepInput{
-			Seq:      step.Seq,
-			Action:   step.Action,
-			Expected: step.Expected,
+			Seq:                step.Seq,
+			Action:             step.Action,
+			Expected:           step.Expected,
+			TargetVersionSUTID: step.TargetVersionSUTID,
+			TargetPageID:       step.TargetPageID,
+			TargetAPIID:        step.TargetAPIID,
 		})
 	}
 	assertions := make([]AssertionInput, 0, len(in.Assertions))
 	for _, assertion := range in.Assertions {
 		assertions = append(assertions, AssertionInput{
-			StepSeq:  assertion.StepSeq,
-			Kind:     assertion.Kind,
-			Target:   assertion.Target,
-			Expected: assertion.Expected,
+			StepSeq:            assertion.StepSeq,
+			Kind:               assertion.Kind,
+			Target:             assertion.Target,
+			Expected:           assertion.Expected,
+			TargetVersionSUTID: assertion.TargetVersionSUTID,
+			TargetAPIID:        assertion.TargetAPIID,
 		})
 	}
-	sources := make([]SourceInput, 0, len(in.SourceFactIDs))
+	sources := make([]SourceInput, 0, len(in.SourceFactIDs)+2+len(in.PageIDs)+len(in.APIIDs))
 	seen := make(map[int64]bool, len(in.SourceFactIDs))
 	for _, factID := range in.SourceFactIDs {
 		if factID <= 0 || seen[factID] {
@@ -156,8 +176,40 @@ func (s *GraphService) CreateAugmentedDraftCase(ctx context.Context, versionID i
 			Path:  "exploration_gap",
 		})
 	}
+	// The additive draft records why it exists: the requirement version text it
+	// extends, the approved discovered target, and the execution observation.
+	sources = append(sources, SourceInput{
+		Kind:  design.SourceRequirement,
+		RefID: strconv.FormatInt(in.RequirementVersionID, 10),
+		Path:  "requirement",
+	})
+	for _, pageID := range in.PageIDs {
+		if pageID > 0 {
+			sources = append(sources, SourceInput{
+				Kind: design.SourcePage, RefID: strconv.FormatInt(pageID, 10), Path: "discovery_delta",
+			})
+		}
+	}
+	for _, apiID := range in.APIIDs {
+		if apiID > 0 {
+			sources = append(sources, SourceInput{
+				Kind: design.SourceAPI, RefID: strconv.FormatInt(apiID, 10), Path: "discovery_delta",
+			})
+		}
+	}
+	if in.SourceObservationID != nil && *in.SourceObservationID > 0 {
+		sources = append(sources, SourceInput{
+			Kind:  design.SourceKnowledge,
+			RefID: strconv.FormatInt(*in.SourceObservationID, 10),
+			Path:  "discovery_observation",
+		})
+	}
 
 	versionSUTID := in.VersionSUTID
+	trigger := ""
+	if in.SourceObservationID != nil && *in.SourceObservationID > 0 {
+		trigger = design.CaseTriggerDiscoveryDelta
+	}
 	result, err := s.Propose(ctx, versionID, ProposeInput{
 		RequirementID:        in.RequirementID,
 		RequirementVersionID: in.RequirementVersionID,
@@ -171,9 +223,13 @@ func (s *GraphService) CreateAugmentedDraftCase(ctx context.Context, versionID i
 			Priority:            in.Priority,
 			DefaultVersionSUTID: &versionSUTID,
 			VersionSUTIDs:       []int64{in.VersionSUTID},
+			PageIDs:             append([]int64(nil), in.PageIDs...),
+			APIIDs:              append([]int64(nil), in.APIIDs...),
 			Steps:               steps,
 			Assertions:          assertions,
 			Sources:             sources,
+			Trigger:             trigger,
+			SourceObservationID: in.SourceObservationID,
 		}},
 	}, 0, 0)
 	if err != nil {

@@ -21,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 62 {
-		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
+	if len(applied) != 63 {
+		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -183,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 62 {
-		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
+	if len(applied) != 63 {
+		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -324,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 62 {
-		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
+	if len(applied) != 63 {
+		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1075,8 +1075,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 62 {
-		t.Fatalf("applied %d migrations, want 62: %v", len(applied), applied)
+	if len(applied) != 63 {
+		t.Fatalf("applied %d migrations, want 63: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1684,9 +1684,9 @@ func TestV022EEXSchema(t *testing.T) {
 	requireColumnDefault(t, pool, "case_version", "trigger", "'normal'::text")
 	requireColumnDefault(t, pool, "case_confirmation", "trigger", "'manual'::text")
 	requireCheckSet(t, pool, "chk_case_version_trigger",
-		[]string{"normal", "discovery_delta"}, []string{"bogus"})
+		[]string{"normal", "discovery_delta", "rollback"}, []string{"bogus"})
 	requireCheckSet(t, pool, "chk_case_confirmation_trigger",
-		[]string{"manual", "discovery_delta"}, []string{"bogus"})
+		[]string{"manual", "discovery_delta", "rollback"}, []string{"bogus"})
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name)
 		VALUES (9500, 950, 950, 951, 'scenario')
@@ -1719,6 +1719,11 @@ func TestV022EEXSchema(t *testing.T) {
 	`); err == nil {
 		t.Error("case_version accepts trigger 'bogus'")
 	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_version SET trigger = 'rollback' WHERE id = 9502
+	`); err != nil {
+		t.Errorf("case_version rejects trigger rollback: %v", err)
+	}
 	var confirmationTrigger string
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO case_confirmation
@@ -1740,6 +1745,11 @@ func TestV022EEXSchema(t *testing.T) {
 		UPDATE case_confirmation SET trigger = 'bogus' WHERE id = 9503
 	`); err == nil {
 		t.Error("case_confirmation accepts trigger 'bogus'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_confirmation SET trigger = 'rollback' WHERE id = 9503
+	`); err != nil {
+		t.Errorf("case_confirmation rejects trigger rollback: %v", err)
 	}
 }
 

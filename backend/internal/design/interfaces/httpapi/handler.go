@@ -25,6 +25,7 @@ type GraphService interface {
 	Overview(ctx context.Context, versionID int64) (designapp.OverviewView, error)
 	GetCase(ctx context.Context, versionID, caseID int64, caseVersionID *int64) (designapp.CaseDetailView, error)
 	Confirm(ctx context.Context, versionID int64, in designapp.ConfirmInput, actorID int64) (designapp.ConfirmResult, error)
+	RollbackCaseVersion(ctx context.Context, versionID, caseVersionID int64, reason string, actorID int64) (designapp.CaseVersionRollbackView, error)
 }
 
 // ExportService is the design export application surface.

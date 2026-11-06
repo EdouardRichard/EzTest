@@ -21,6 +21,19 @@ const (
 	CaseStatusSuperseded = "superseded"
 )
 
+// Case version/confirmation triggers (spec DB-28/DB-30). A case version is
+// normally proposed by design; discovery auto-confirmation and a rollback
+// replacement record their own trigger so the revision stays traceable.
+const (
+	CaseTriggerNormal         = "normal"
+	CaseTriggerDiscoveryDelta = "discovery_delta"
+	CaseTriggerRollback       = "rollback"
+)
+
+// AutoConfirmationActor is the auto_confirmed_by value of a discovery/rollback
+// automatic confirmation (spec R-EX-6).
+const AutoConfirmationActor = "system"
+
 // Case priorities (spec §3.1).
 const (
 	PriorityP0 = "P0"
@@ -224,13 +237,28 @@ type CaseVersion struct {
 	APIIDs              []int64
 	Status              string
 	ContentHash         string
-	CreatedBy           *int64
-	CreatedByRunID      *int64
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
-	Steps               []CaseStep
-	Assertions          []CaseAssertion
-	Sources             []CaseSource
+	// Trigger records how the version was produced. The DB column defaults to
+	// "normal" (a manual propose); discovery auto-confirmation writes
+	// "discovery_delta" and a rollback replacement writes "rollback" (spec
+	// DB-28/DB-30, R-EX-6).
+	Trigger string
+	// SourceObservationID is the execution discovery observation that produced
+	// a discovery_delta revision. It is a logical BIGINT reference into the
+	// execution context (no cross-context FK).
+	SourceObservationID *int64
+	// AutoConfirmedBy names the system actor of an automatic confirmation
+	// ("system"); empty for manual confirmations.
+	AutoConfirmedBy string
+	// RollbackOf is the auto-confirmed revision a rollback replacement replaces
+	// (set on the replacement, never on the original).
+	RollbackOf        *int64
+	CreatedBy         *int64
+	CreatedByRunID    *int64
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	Steps             []CaseStep
+	Assertions        []CaseAssertion
+	Sources           []CaseSource
 	// StepCount/AssertionCount/SourceCount are projection-only counts loaded
 	// by list/confirmation queries that do not need the full child rows.
 	StepCount      int

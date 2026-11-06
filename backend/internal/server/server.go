@@ -500,6 +500,8 @@ func registerDesignRoutes(mux *http.ServeMux, authenticated func(http.Handler) h
 	mux.Handle("GET /api/versions/{id}/design/overview", authenticated(http.HandlerFunc(h.Overview)))
 	mux.Handle("GET /api/versions/{id}/design/cases/{caseId}", authenticated(http.HandlerFunc(h.GetCase)))
 	mux.Handle("POST /api/versions/{id}/design/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	// W2-11 R-EX-6/API-41: rollback one auto-confirmed discovery case revision.
+	mux.Handle("POST /api/versions/{id}/case-versions/{caseVersionId}/rollback", authenticated(http.HandlerFunc(h.RollbackCaseVersion)))
 	mux.Handle("POST /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.CreateExport)))
 	mux.Handle("GET /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.ListExports)))
 	mux.Handle("GET /api/exports/{exportId}", authenticated(http.HandlerFunc(h.GetExport)))

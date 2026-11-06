@@ -217,12 +217,16 @@ func (t *proposeTx) InsertCaseVersion(ctx context.Context, version design.CaseVe
 		INSERT INTO case_version (
 			id, case_id, revision, title, description, preconditions, test_data, priority,
 			default_version_sut_id, version_sut_ids, page_ids, api_ids, status, content_hash,
+			trigger, source_observation_id, auto_confirmed_by, rollback_of,
 			created_by, created_by_run_id, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13,$14,
+		          COALESCE(NULLIF($15,''), 'normal'), $16, NULLIF($17,''), $18,
+		          $19,$20,$21,$22)
 		RETURNING id
 	`, version.ID, version.CaseID, version.Revision, version.Title, version.Description,
 		version.Preconditions, string(testData), version.Priority, version.DefaultVersionSUTID,
 		string(suts), string(pages), string(apis), version.Status, version.ContentHash,
+		version.Trigger, version.SourceObservationID, version.AutoConfirmedBy, version.RollbackOf,
 		version.CreatedBy, version.CreatedByRunID, version.CreatedAt, version.UpdatedAt).Scan(&version.ID)
 	if err != nil {
 		return design.CaseVersion{}, fmt.Errorf("insert case version: %w", err)

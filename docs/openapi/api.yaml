@@ -367,6 +367,23 @@ info:
       版本频道，payload `{export_id,report_id,version_id,format,status,sha256,error}`。
     - `ReportArtifactCreateRequest` 为本段新增 schema；产物下载走既有 `GET /api/exports/{exportId}`。
 
+    ## v0.22 W2-11 增量（discovery case rollback，additive）
+
+    R-EX-6 / API-41（来源：`docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md` §4.31/§6/§7）：
+    - `POST /api/versions/{id}/case-versions/{caseVersionId}/rollback`（登录用户
+      `authenticated`）回滚一个 auto-confirmed discovery revision（`trigger='discovery_delta'`）：
+      原 revision 置 `superseded`，基于其前一 confirmed revision 生成替代 revision
+      （`trigger='rollback'`、`rollback_of=<原 id>`、`status='confirmed'`），body 可选
+      `{reason}`。响应 `CaseRevisionRollbackView`（`case_id`/`case_version_id`/
+      `rolled_back_from`/`revision`/`status`/`trigger`），ID 均为十进制字符串。
+    - 幂等：重复回滚返回同一替代 revision；非 auto-confirmed（manual/normal）revision
+      返回 409 `state_conflict`；不存在的 revision 返回 404。
+    - 写 `case_confirmation`（`trigger='rollback'`、`auto_confirmed=true`、
+      `auto_confirmed_by='system'`）审计并发布 `case.revision.auto_confirmed`
+      （payload 带 `rollback_of`）；`case_version.trigger` 的 CHECK 由
+      `design_0003_v022_case_rollback_trigger.sql` 扩展 `rollback`。不新增表。
+    - 新增 schema `CaseRevisionRollbackView`；不新增服务。
+
     ## 0.2.1 发布（2026-11-04）
     本文件是 0.2.1 的公开 release 契约：由 Task 85（Release-T1）从
     `docs/version-V0.2/contracts/openapi.yaml`（0.2.1 authoritative 契约）**整体 port** 生成；
@@ -3224,6 +3241,58 @@ paths:
                 properties:
                   data:
                     $ref: '#/components/schemas/CaseConfirmationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/case-versions/{caseVersionId}/rollback:
+    post:
+      tags: [Design]
+      operationId: rollbackDiscoveryCaseVersion
+      summary: 回滚自动确认的探索用例 revision
+      description: |
+        v0.22 W2-11 R-EX-6/API-41（design 上下文）。将 auto-confirmed revision
+        （`trigger='discovery_delta'`）置为 `superseded`，并基于其前一 confirmed
+        revision 生成替代 revision（`trigger='rollback'`、`rollback_of=<id>`、
+        `status='confirmed'`）；写审计并发布 `case.revision.auto_confirmed`
+        （payload.rollback_of）。body 可选 `reason`（≤2000 字符）。幂等：重复回滚
+        返回已存在的替代 revision；原 revision 保留为历史，不删除行。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: caseVersionId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 2000
+      responses:
+        '200':
+          description: 替代 revision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CaseRevisionRollbackView'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -12998,6 +13067,29 @@ components:
         confirmed_at:
           type: string
           format: date-time
+    CaseRevisionRollbackView:
+      type: object
+      description: v0.22 W2-11 R-EX-6/API-41 rollback replacement revision
+      required: [case_id, case_version_id, rolled_back_from, revision, status, trigger]
+      properties:
+        case_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        rolled_back_from:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [confirmed]
+        trigger:
+          type: string
+          enum: [rollback]
     ExportRequest:
       type: object
       required: [owner_kind, owner_id, format]

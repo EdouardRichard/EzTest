@@ -55,6 +55,12 @@
       "channel": "version:N"
     },
     {
+      "type": "case.revision.auto_confirmed",
+      "consumer": "ui",
+      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:223",
+      "channel": "version:N"
+    },
+    {
       "type": "case_run.assertion_finished",
       "consumer": "ui",
       "evidence": "frontend/src/features/clarification/useVersionEvents.ts:241",
