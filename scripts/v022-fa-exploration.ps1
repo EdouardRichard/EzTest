@@ -340,8 +340,39 @@ $baseRef['idempotency'] = [ordered]@{ replayed = $replayed }
 if (-not $replayed) { $red.Add('idempotency.replayed is not true') }
 
 # ---------------------------------------------------------------------------
-# Screenshots: resolve, validate with Assert-Png, copy under the run dir.
+# Screenshots: resolve, validate as real non-blank PNGs of at least element
+# size, and copy under the run dir. Exploration evidence legitimately includes
+# element captures (a card/panel); the full-page >=800x600 rule is enforced by
+# the visual-review gate, not here (spec §11.14#12 only requires the screenshot).
 # ---------------------------------------------------------------------------
+function Test-EvidencePng {
+    param([string]$Path)
+    $problems = New-Object System.Collections.Generic.List[string]
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 33) { $problems.Add('not a PNG'); return $problems }
+    $signature = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+    for ($i = 0; $i -lt 8; $i++) { if ($bytes[$i] -ne $signature[$i]) { $problems.Add('bad PNG signature'); return $problems } }
+    $width = ([int]$bytes[16] -shl 24) -bor ([int]$bytes[17] -shl 16) -bor ([int]$bytes[18] -shl 8) -bor [int]$bytes[19]
+    $height = ([int]$bytes[20] -shl 24) -bor ([int]$bytes[21] -shl 16) -bor ([int]$bytes[22] -shl 8) -bor [int]$bytes[23]
+    if ($width -lt 200 -or $height -lt 100) { $problems.Add("too small (${width}x${height}, need >=200x100)") }
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $bitmap = [System.Drawing.Bitmap]::FromFile($Path)
+        try {
+            $colors = New-Object 'System.Collections.Generic.HashSet[int]'
+            $stepX = [Math]::Max(1, [int]($bitmap.Width / 32))
+            $stepY = [Math]::Max(1, [int]($bitmap.Height / 32))
+            for ($x = 0; $x -lt $bitmap.Width; $x += $stepX) {
+                for ($y = 0; $y -lt $bitmap.Height; $y += $stepY) { [void]$colors.Add($bitmap.GetPixel($x, $y).ToArgb()) }
+            }
+            if ($colors.Count -lt 4) { $problems.Add("looks blank (uniqueColors=$($colors.Count))") }
+        }
+        finally { $bitmap.Dispose() }
+    }
+    catch { $problems.Add('could not be decoded') }
+    return $problems
+}
+
 $shotEntries = @(Get-StringList $source @('screenshots'))
 $outShots = New-Object System.Collections.Generic.List[string]
 $seenNames = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -354,7 +385,7 @@ foreach ($entry in $shotEntries) {
         $red.Add("screenshot missing: $entry")
         continue
     }
-    foreach ($problem in @(Assert-Png -Path $resolved)) {
+    foreach ($problem in @(Test-EvidencePng -Path $resolved)) {
         $red.Add("screenshot $problem")
     }
     $name = [System.IO.Path]::GetFileName($resolved)
