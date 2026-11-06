@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 W0 end-to-end regression (Task 38).
@@ -106,12 +106,20 @@ try {
     $execToken = Get-EnvValue 'EZTEST_EXECUTOR_TOKEN'
     $adminPassword = Get-EnvValue 'EZTEST_ADMIN_PASSWORD'
     $sutPassword = Get-EnvValue 'SUT_PASSWORD'
+    $sutDbDsn = Get-EnvValue 'SUT_DB_DSN'
+    $sutDbPassword = Get-EnvValue 'SUT_DB_PASSWORD'
     $llmKey = Get-EnvValue 'llm_api_key'
     $llmBase = Get-EnvValue 'llm_base_url'
     $llmModel = Get-EnvValue 'llm_model_name'
 } catch {
     if ($W1) { Exit-ExternalBlocked "cannot read .env: $($_.Exception.Message)" }
     throw
+}
+# The SUT database credential is environment configuration, never a source
+# literal: the W0/W1 e2e flows register the SUT database resource from these
+# values. Missing keys are an environment defect (exit 2), not a test failure.
+if ([string]::IsNullOrWhiteSpace($sutDbDsn) -or [string]::IsNullOrWhiteSpace($sutDbPassword)) {
+    Exit-ExternalBlocked 'missing .env SUT_DB_DSN / SUT_DB_PASSWORD (required to register the SUT database)'
 }
 $env:PGPASSWORD = $dbPassword
 $psql = Join-Path $repoRoot '.tools\pgsql\bin\psql.exe'
@@ -585,6 +593,8 @@ const DB_NAME = process.env.W1_DB
 const DB_PASSWORD = process.env.W1_DB_PASSWORD
 const ADMIN_PASSWORD = process.env.W1_ADMIN_PW
 const SUT_PASSWORD = process.env.W1_SUT_PW
+const SUT_DB_DSN = process.env.W1_SUT_DB_DSN
+const SUT_DB_PASSWORD = process.env.W1_SUT_DB_PASSWORD
 const LLM_MODEL = process.env.W1_LLM_MODEL
 // The LLM config points at the local vision-caption proxy (never at DeepSeek
 // directly): text requests are forwarded verbatim to the upstream from .env and
@@ -888,8 +898,7 @@ async function main() {
   }
   const database = await must('POST', `/api/resources/suts/${state.sutId}/databases`, {
     environment_id: state.environmentId, name: 'blog-db', kind: 'postgres',
-    dsn: 'postgres://blog:REDACTED_SUT_DB_PASSWORD@REDACTED_SUT_DB_HOST:7899/blog?sslmode=disable',
-    username: 'blog', password: 'REDACTED_SUT_DB_PASSWORD', read_only: true,
+    dsn: SUT_DB_DSN, username: 'blog', password: SUT_DB_PASSWORD, read_only: true,
   })
   state.databaseId = database.data.id
   const account = await must('POST', `/api/resources/suts/${state.sutId}/accounts`, {
@@ -1318,6 +1327,8 @@ $env:W1_DB = $dbName
 $env:W1_DB_PASSWORD = $dbPassword
 $env:W1_ADMIN_PW = $adminPassword
 $env:W1_SUT_PW = $sutPassword
+$env:W1_SUT_DB_DSN = $sutDbDsn
+$env:W1_SUT_DB_PASSWORD = $sutDbPassword
 $env:W1_LLM_MODEL = $llmModel
 # The config endpoint is the local caption proxy; the real DeepSeek upstream is
 # passed separately so the verdict can record both without confusing them.
@@ -1343,6 +1354,8 @@ const REPO_ROOT = process.env.W0_REPO_ROOT
 const RESTART_SCRIPT = process.env.W0_RESTART_SCRIPT
 const ADMIN_PASSWORD = process.env.W0_ADMIN_PW
 const SUT_PASSWORD = process.env.W0_SUT_PW
+const SUT_DB_DSN = process.env.W0_SUT_DB_DSN
+const SUT_DB_PASSWORD = process.env.W0_SUT_DB_PASSWORD
 const DESIGN_TIMEOUT = Number(process.env.W0_DESIGN_TIMEOUT || 720) * 1000
 const EXEC_TIMEOUT = Number(process.env.W0_EXEC_TIMEOUT || 900) * 1000
 
@@ -1581,8 +1594,7 @@ async function main() {
   }
   const database = await must('POST', `/api/resources/suts/${state.sutId}/databases`, {
     environment_id: state.environmentId, name: 'blog-db', kind: 'postgres',
-    dsn: 'postgres://blog:REDACTED_SUT_DB_PASSWORD@REDACTED_SUT_DB_HOST:7899/blog?sslmode=disable',
-    username: 'blog', password: 'REDACTED_SUT_DB_PASSWORD', read_only: true,
+    dsn: SUT_DB_DSN, username: 'blog', password: SUT_DB_PASSWORD, read_only: true,
   })
   state.databaseId = database.data.id
   const account = await must('POST', `/api/resources/suts/${state.sutId}/accounts`, {
@@ -2271,6 +2283,8 @@ $env:W0_REPO_ROOT = $repoRoot
 $env:W0_RESTART_SCRIPT = $restartScript
 $env:W0_ADMIN_PW = $adminPassword
 $env:W0_SUT_PW = $sutPassword
+$env:W0_SUT_DB_DSN = $sutDbDsn
+$env:W0_SUT_DB_PASSWORD = $sutDbPassword
 $env:W0_LLM_MODEL = $llmModel
 $env:W0_DESIGN_TIMEOUT = "$DesignTimeoutSeconds"
 $env:W0_EXEC_TIMEOUT = "$ExecutionTimeoutSeconds"
