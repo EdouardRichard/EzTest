@@ -70,6 +70,28 @@ const settings: Setting[] = [
     updated_at: "2026-10-31T08:00:00Z",
   },
   {
+    key: "retention.gc_grace_hours",
+    category: "retention",
+    type: "number",
+    value: 168,
+    is_secret: false,
+    restart_required: false,
+    description: "两阶段删除宽限期（小时）",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "retention.unreferenced_content_days",
+    category: "retention",
+    type: "number",
+    value: 30,
+    is_secret: false,
+    restart_required: false,
+    description: "无引用内容保留天数",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
     key: "feature.experimental_flags",
     category: "feature",
     type: "json",
@@ -272,22 +294,34 @@ describe("SystemSettings", () => {
     expect(within(row).getByLabelText("execution.global_concurrency 新值")).toBeInTheDocument()
   })
 
-  it("hides disposed settings and keeps gc.* read-only until W2", async () => {
+  it("hides disposed and gc.* settings while keeping retention.* editable", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ data: settings }))
 
     render(<SystemSettings />)
-    await screen.findByTestId("setting-row-gc.retention_days")
+    await screen.findByTestId("setting-row-retention.gc_dry_run")
 
     expect(screen.queryByTestId("setting-row-paths.attachment_dir")).not.toBeInTheDocument()
     expect(screen.queryByText("paths.attachment_dir")).not.toBeInTheDocument()
 
-    for (const key of ["gc.retention_days", "gc.dry_run"]) {
-      const row = settingRow(key)
-      expect(within(row).getByText("W2 接线")).toBeVisible()
-      expect(within(row).queryByRole("button", { name: "编辑" })).toBeNull()
+    // W2-15 removed the gc.* aliases: neither the rows nor their category may
+    // remain in the editable UI.
+    for (const key of ["gc.retention_days", "gc.dry_run", "gc.max_bytes", "gc.grace_days"]) {
+      expect(screen.queryByTestId(`setting-row-${key}`)).not.toBeInTheDocument()
+      expect(screen.queryByText(key)).not.toBeInTheDocument()
     }
+    expect(screen.queryByText("W2 接线")).not.toBeInTheDocument()
 
-    const activeRow = settingRow("execution.global_concurrency")
-    expect(within(activeRow).getByRole("button", { name: "编辑" })).toBeVisible()
+    // retention.* is the only GC settings family and stays editable.
+    expect(displayValue("retention.gc_grace_hours")).toHaveTextContent("168")
+    expect(displayValue("retention.unreferenced_content_days")).toHaveTextContent("30")
+    expect(displayValue("retention.gc_dry_run")).toHaveTextContent("启用")
+    for (const key of [
+      "retention.gc_dry_run",
+      "retention.gc_grace_hours",
+      "retention.unreferenced_content_days",
+    ]) {
+      const row = settingRow(key)
+      expect(within(row).getByRole("button", { name: "编辑" })).toBeVisible()
+    }
   })
 })

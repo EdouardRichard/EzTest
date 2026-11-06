@@ -28,6 +28,9 @@ func SystemEventCount(eventType string) uint64 {
 // NewSystemEventConsumer returns the generic system-channel observer. It is
 // the W1-5 consumer for events that have no business UI: resource catalogs,
 // instances, LLM configuration, settings, stored content, GC and knowledge.
+// The GC lifecycle (gc.started, gc.completed, gc.failed — spec EV-21) also
+// lands here: the admin page consumes the system SSE stream, and the per-type
+// counter below makes an observed lifecycle event verifiable.
 //
 // The observer only reacts to event.Channel == "system"; every other channel
 // returns immediately with no side effect. Counters are atomic and the log is

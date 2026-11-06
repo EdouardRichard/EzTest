@@ -80,8 +80,6 @@ func Definitions(executorURL string) []settings.Definition {
 	minImageBytes, maxImageBytes := numberRange(1024, 104857600)
 	minToolRetries, maxToolRetries := numberRange(0, 5)
 	minQuestionTimeout, maxQuestionTimeout := numberRange(60, 604800)
-	minGCRetentionDays, maxGCRetentionDays := numberRange(1, 3650)
-	minGCGraceDays, maxGCGraceDays := numberRange(0, 365)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
@@ -151,16 +149,16 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "retention.temp_hours", Category: "retention", Type: settings.TypeNumber, Default: num(24), Integer: true, Min: number(1, 0), Description: "Retention for temporary files."},
 		{Key: "retention.replaced_export_days", Category: "retention", Type: settings.TypeNumber, Default: num(7), Integer: true, Min: number(1, 0), Description: "Retention for replaced exports."},
 		{Key: "retention.unreferenced_content_days", Category: "retention", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: number(1, 0), Description: "Retention for unreferenced content."},
-		{Key: "retention.gc_grace_hours", Category: "retention", Type: settings.TypeNumber, Default: num(24), Integer: true, Min: number(1, 0), Description: "GC grace period."},
+		{Key: "retention.gc_grace_hours", Category: "retention", Type: settings.TypeNumber, Default: num(168), Integer: true, Min: number(1, 0), Description: "Two-phase GC grace period in hours (168 = 7 days); dry-run reports candidates before apply may delete them."},
 		{Key: "retention.gc_dry_run", Category: "retention", Type: settings.TypeBool, Default: boolean(true), Description: "Run GC in dry-run mode by default."},
 		{Key: "retention.gc_interval_minutes", Category: "retention", Type: settings.TypeNumber, Default: num(1440), Integer: true, Min: minGCInterval, Max: maxGCInterval, Description: "Interval between leader-scheduled GC runs in minutes."},
 		{Key: "retention.gc_batch_size", Category: "retention", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minGCBatch, Max: maxGCBatch, Description: "Maximum candidate rows scanned by one GC pass."},
 		{Key: "retention.event_days", Category: "retention", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: minEventDays, Max: maxEventDays, Description: "Event-log retention in days; the leader-gated cleanup deletes older rows in batches."},
 
-		{Key: "gc.retention_days", Category: "gc", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minGCRetentionDays, Max: maxGCRetentionDays, Description: "Days a storage object is retained before GC may reclaim it."},
-		{Key: "gc.max_bytes", Category: "gc", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: number(0, 0), Description: "Maximum managed storage in bytes for GC; 0 means unlimited."},
-		{Key: "gc.dry_run", Category: "gc", Type: settings.TypeBool, Default: boolean(true), Description: "Run GC in dry-run mode (list candidates, delete nothing) by default."},
-		{Key: "gc.grace_days", Category: "gc", Type: settings.TypeNumber, Default: num(7), Integer: true, Min: minGCGraceDays, Max: maxGCGraceDays, Description: "Grace period in days between marking an object for deletion and reclaiming it."},
+		// W2-15 (spec R-W2-7, W2-C4, ST-16..ST-19): retention.* is the only GC
+		// settings family. The four legacy gc.* aliases were removed; capacity
+		// control (gc.max_bytes) is not implemented in v0.22 (residual) and must
+		// not be reintroduced as a dead key.
 
 		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("2"), Description: "Built-in report template version (\"1\" or \"2\")."},
 		{Key: "report.render_pdf", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Render PDF alongside the authoritative HTML report."},

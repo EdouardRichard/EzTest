@@ -25,6 +25,7 @@ import {
   type GCRunStatus,
   getGCRun,
   listGCRuns,
+  type Setting,
 } from "./api"
 
 /** Candidate class labels (matches storage.gc candidate classes). */
@@ -95,8 +96,28 @@ function RunStatusBadge({ status }: { status: GCRunStatus }) {
   return <Badge tone={GC_STATUS_TONE[status]}>{GC_STATUS_LABELS[status]}</Badge>
 }
 
+/** One retention.* value as displayed in the GC panel (no editable controls). */
+function retentionValue(setting: Setting): string {
+  if (setting.type === "boolean") return setting.value === true ? "启用" : "禁用"
+  if (setting.value === null || setting.value === undefined) return "—"
+  return String(setting.value)
+}
+
+/** Unit suffix derived from the retention.* key (hours/days/minutes). */
+function retentionUnit(key: string): string | null {
+  if (key.endsWith("_hours")) return "小时"
+  if (key.endsWith("_days")) return "天"
+  if (key.endsWith("_minutes")) return "分钟"
+  return null
+}
+
+type GCPanelProps = {
+  /** Effective retention.* rows owned by the settings center (W2-15). */
+  retentionSettings?: Setting[]
+}
+
 /** Admin-only data retention/GC panel (spec §10, contract p7-api §6.2). */
-export function GCPanel() {
+export function GCPanel({ retentionSettings = [] }: GCPanelProps) {
   const { user } = useAuth()
   const isAdmin = user?.role === "admin"
 
@@ -347,6 +368,48 @@ export function GCPanel() {
       </header>
 
       <div className="space-y-4 px-4 py-3">
+        <section
+          aria-label="retention 生效值"
+          data-testid="gc-retention-settings"
+          className="space-y-2 rounded-lg border border-border bg-muted/30 px-3 py-2"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-xs font-semibold text-foreground">
+              retention.* 生效值
+              <span className="ml-1.5 text-[10px] font-normal text-muted-foreground">
+                GC 唯一的设置族
+              </span>
+            </h3>
+            <Badge tone="success">生效</Badge>
+          </div>
+          {retentionSettings.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground">
+              设置中心暂未返回 retention.* 配置。
+            </p>
+          ) : (
+            <dl className="grid gap-x-4 gap-y-1.5 text-[11px] sm:grid-cols-2 lg:grid-cols-3">
+              {retentionSettings.map((setting) => {
+                const unit = retentionUnit(setting.key)
+                return (
+                  <div key={setting.key} data-testid={`gc-retention-${setting.key}`}>
+                    <dt className="font-mono text-[10px] text-muted-foreground">{setting.key}</dt>
+                    <dd className="text-foreground">
+                      <span>{retentionValue(setting)}</span>
+                      {unit !== null ? (
+                        <span className="ml-1 text-muted-foreground">{unit}</span>
+                      ) : null}
+                    </dd>
+                  </div>
+                )
+              })}
+            </dl>
+          )}
+          <p className="text-[11px] text-muted-foreground">
+            演练只记录候选；apply 在 retention.gc_grace_hours 后落 tombstone 并删除。容量控制（gc.max_bytes）在
+            v0.22 未实现（残余）。
+          </p>
+        </section>
+
         {actionError !== null ? <InlineError error={actionError} /> : null}
 
         {loading && runs.length === 0 ? (

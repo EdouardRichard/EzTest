@@ -56,10 +56,11 @@ type gcSequentialIDs struct{ next int64 }
 func (g *gcSequentialIDs) Next() int64 { g.next++; return g.next }
 
 type gcFakeSettings struct {
-	ints    map[string]int64
-	bools   map[string]bool
-	strings map[string]string
-	err     error
+	ints      map[string]int64
+	bools     map[string]bool
+	strings   map[string]string
+	err       error
+	requested []string
 }
 
 func newGCFakeSettings(root string) *gcFakeSettings {
@@ -78,6 +79,7 @@ func newGCFakeSettings(root string) *gcFakeSettings {
 }
 
 func (s *gcFakeSettings) String(_ context.Context, key string) (string, error) {
+	s.requested = append(s.requested, key)
 	if s.err != nil {
 		return "", s.err
 	}
@@ -85,6 +87,7 @@ func (s *gcFakeSettings) String(_ context.Context, key string) (string, error) {
 }
 
 func (s *gcFakeSettings) Int(_ context.Context, key string) (int64, error) {
+	s.requested = append(s.requested, key)
 	if s.err != nil {
 		return 0, s.err
 	}
@@ -92,6 +95,7 @@ func (s *gcFakeSettings) Int(_ context.Context, key string) (int64, error) {
 }
 
 func (s *gcFakeSettings) Bool(_ context.Context, key string) (bool, error) {
+	s.requested = append(s.requested, key)
 	if s.err != nil {
 		return false, s.err
 	}
@@ -597,15 +601,27 @@ func TestGCRunDryRunClassifiesFourCandidateClassesAndProtects(t *testing.T) {
 	if run.DeletedObjects != 0 || run.DeletedRefs != 0 || run.DeletedBytes != 0 {
 		t.Fatalf("dry run run counters = %#v", run)
 	}
-	if len(fixture.events.events) != 1 {
+	if len(fixture.events.events) != 2 {
 		t.Fatalf("events = %#v", fixture.events.events)
 	}
-	event := fixture.events.events[0]
+	started := fixture.events.events[0]
+	if started.Type != "gc.started" || started.Channel != "system" {
+		t.Fatalf("started event = %#v", started)
+	}
+	if started.Payload["gc_run_id"] != fmt.Sprintf("%d", run.ID) || started.Payload["mode"] != string(storage.GCModeDryRun) {
+		t.Fatalf("started payload = %#v", started.Payload)
+	}
+	event := fixture.events.events[1]
 	if event.Type != "gc.completed" || event.Channel != "system" {
-		t.Fatalf("event = %#v", event)
+		t.Fatalf("completed event = %#v", event)
 	}
 	if event.Payload["run_status"] != string(storage.GCRunCompleted) || event.Payload["mode"] != string(storage.GCModeDryRun) {
-		t.Fatalf("event payload = %#v", event.Payload)
+		t.Fatalf("completed event payload = %#v", event.Payload)
+	}
+	for _, field := range []string{"gc_run_id", "mode", "deleted_objects", "deleted_refs", "error"} {
+		if _, ok := event.Payload[field]; !ok {
+			t.Fatalf("completed payload missing %q: %#v", field, event.Payload)
+		}
 	}
 	if len(fixture.audit.events) != 1 || fixture.audit.events[0].Action != "storage.gc.completed" {
 		t.Fatalf("audit = %#v", fixture.audit.events)
@@ -893,5 +909,221 @@ func TestGCListAndGetRuns(t *testing.T) {
 	}
 	if _, err := fixture.svc.GetRun(context.Background(), 0); err == nil {
 		t.Fatal("zero id should fail")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W2-15: two-phase semantics, gc lifecycle events, retention.* authority and
+// running-case evidence safety.
+// ---------------------------------------------------------------------------
+
+// TestW2GCLifecycleEventsAndRetentionSettings pins the W2-15 contract:
+// gc.started is published before the work, gc.completed after it, the payload
+// carries {gc_run_id,mode,deleted_objects,deleted_refs,error}, and a pass reads
+// only retention.* (plus paths.data_root) settings.
+func TestW2GCLifecycleEventsAndRetentionSettings(t *testing.T) {
+	fixture := newGCFixture(t)
+	old := 40 * 24 * time.Hour
+	unreferenced := gcObject(gcSHA("a"), 512, old)
+	fixture.repo.unreferenced = []storage.Object{unreferenced}
+
+	dryRun, err := fixture.svc.Run(context.Background(), storage.GCModeDryRun, 9)
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if dryRun.DeletedObjects != 0 || dryRun.DeletedRefs != 0 {
+		t.Fatalf("dry run deleted rows: %+v", dryRun)
+	}
+	if len(fixture.repo.tombstones) != 0 || len(fixture.files.deletedPaths) != 0 {
+		t.Fatal("dry run deleted data or wrote tombstones")
+	}
+
+	applyRun, err := fixture.svc.Run(context.Background(), storage.GCModeApply, 9)
+	if err != nil {
+		t.Fatalf("apply run: %v", err)
+	}
+	if applyRun.Status != storage.GCRunCompleted || applyRun.DeletedObjects < 1 {
+		t.Fatalf("apply run = %+v", applyRun)
+	}
+	if len(fixture.repo.tombstones) < 1 {
+		t.Fatal("apply run wrote no tombstone")
+	}
+
+	wantTypes := []string{"gc.started", "gc.completed", "gc.started", "gc.completed"}
+	if len(fixture.events.events) != len(wantTypes) {
+		t.Fatalf("events = %#v", fixture.events.events)
+	}
+	for index, want := range wantTypes {
+		event := fixture.events.events[index]
+		if event.Type != want || event.Channel != "system" {
+			t.Fatalf("event %d = %s/%s, want %s/system", index, event.Type, event.Channel, want)
+		}
+		for _, field := range []string{"gc_run_id", "mode", "deleted_objects", "deleted_refs", "error"} {
+			if _, ok := event.Payload[field]; !ok {
+				t.Fatalf("%s payload missing %q: %#v", want, field, event.Payload)
+			}
+		}
+	}
+	if fixture.events.events[1].Payload["deleted_objects"] != 0 {
+		t.Fatalf("dry-run completed payload = %#v", fixture.events.events[1].Payload)
+	}
+	if fixture.events.events[3].Payload["deleted_objects"] != applyRun.DeletedObjects {
+		t.Fatalf("apply completed payload = %#v (run=%+v)", fixture.events.events[3].Payload, applyRun)
+	}
+
+	required := map[string]bool{
+		GCSettingTempHours:               false,
+		GCSettingReplacedExportDays:      false,
+		GCSettingUnreferencedContentDays: false,
+		GCSettingGraceHours:              false,
+		GCSettingBatchSize:               false,
+	}
+	for _, key := range fixture.settings.requested {
+		if key == DataRootSettingKey {
+			continue
+		}
+		if strings.Contains(key, "gc.") || !strings.HasPrefix(key, "retention.") {
+			t.Fatalf("GC read non-retention setting %q", key)
+		}
+		if _, ok := required[key]; ok {
+			required[key] = true
+		}
+	}
+	for key, seen := range required {
+		if !seen {
+			t.Fatalf("GC never read %s", key)
+		}
+	}
+	if DefaultGCGraceHours != 168 {
+		t.Fatalf("DefaultGCGraceHours = %d, want 168", DefaultGCGraceHours)
+	}
+}
+
+// TestW2GCApplyRespectsGraceHours pins the two-phase grace: a candidate inside
+// retention.gc_grace_hours is protected, one outside it is deleted on apply.
+func TestW2GCApplyRespectsGraceHours(t *testing.T) {
+	fixture := newGCFixture(t)
+	fixture.settings.ints[GCSettingGraceHours] = 168
+	insideGrace := gcObject(gcSHA("a"), 100, 100*time.Hour)
+	outsideGrace := gcObject(gcSHA("b"), 200, 200*time.Hour)
+	fixture.files.files = []FileInfo{
+		{SHA256: insideGrace.SHA256, RelativePath: insideGrace.RelativePath, Size: insideGrace.Size, ModTime: insideGrace.CreatedAt},
+		{SHA256: outsideGrace.SHA256, RelativePath: outsideGrace.RelativePath, Size: outsideGrace.Size, ModTime: outsideGrace.CreatedAt},
+	}
+
+	run, err := fixture.svc.Run(context.Background(), storage.GCModeApply, 0)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if run.Status != storage.GCRunCompleted {
+		t.Fatalf("run = %+v", run)
+	}
+	if len(fixture.files.deletedPaths) != 1 || fixture.files.deletedPaths[0] != outsideGrace.RelativePath {
+		t.Fatalf("deleted files = %v, want only %s", fixture.files.deletedPaths, outsideGrace.RelativePath)
+	}
+	report := decodeGCReport(t, run)
+	if report.Protected[GCProtectedGrace] < 1 {
+		t.Fatalf("protected = %#v, want the inside-grace candidate", report.Protected)
+	}
+	if report.Tombstones != 1 {
+		t.Fatalf("tombstones = %d, want 1", report.Tombstones)
+	}
+}
+
+// TestW2GCApplyProtectsRunningCaseEvidence pins the running-case safety rule:
+// evidence whose row still exists (a running case keeps writing evidence) is
+// never deleted, and apply re-checks the evidence owner before deleting a ref
+// that the scan selected.
+func TestW2GCApplyProtectsRunningCaseEvidence(t *testing.T) {
+	fixture := newGCFixture(t)
+	old := 40 * 24 * time.Hour
+	evidenceObject := gcObject(gcSHA("a"), 100, old)
+	orphanObject := gcObject(gcSHA("b"), 200, old)
+
+	fixture.repo.refs = []GCRef{
+		gcRef(101, evidenceObject, OwnerKindEvidence, 501, "text"),
+		gcRef(102, orphanObject, OwnerKindEvidence, 502, "text"),
+	}
+	fixture.repo.liveCounts = map[string]int{
+		evidenceObject.SHA256: 1,
+		orphanObject.SHA256:   1,
+	}
+	// Evidence 501 belongs to a running case_run: its evidence row exists.
+	fixture.owners.evidence[501] = true
+
+	run, err := fixture.svc.Run(context.Background(), storage.GCModeApply, 0)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if run.DeletedRefs != 1 {
+		t.Fatalf("deleted refs = %d, want only the orphan ref (run=%+v)", run.DeletedRefs, run)
+	}
+	if len(fixture.repo.deletedRefIDs) != 1 || fixture.repo.deletedRefIDs[0] != 102 {
+		t.Fatalf("deleted refs = %v", fixture.repo.deletedRefIDs)
+	}
+	for _, sha := range []string{evidenceObject.SHA256} {
+		for _, deleted := range fixture.repo.deletedSHAs {
+			if deleted == sha {
+				t.Fatalf("running-case evidence object %s was deleted", sha)
+			}
+		}
+	}
+	report := decodeGCReport(t, run)
+	if report.Protected[GCProtectedOwnerExists] < 1 {
+		t.Fatalf("protected = %#v, want the running-case evidence ref", report.Protected)
+	}
+
+	// Defensive apply-time re-check: even a ref the scan selected is skipped when
+	// the evidence row (belonging to an active case_run) appears before deletion.
+	raceReport := newGCReport(storage.GCModeApply, gcSettings{DataRoot: t.TempDir(), BatchSize: 500, GraceHours: 168}, gcNow)
+	raceCandidate := gcCandidate{
+		Object:         evidenceObject,
+		Class:          storage.GCCandidateOrphanFile,
+		RefID:          103,
+		OwnerKind:      OwnerKindEvidence,
+		OwnerID:        501,
+		DeletionReason: storage.GCCandidateOrphanFile,
+		AgeSeconds:     60,
+	}
+	if err := fixture.svc.apply(context.Background(), 1, gcSettings{DataRoot: t.TempDir(), BatchSize: 500, GraceHours: 168}, gcNow, []gcCandidate{raceCandidate}, raceReport); err != nil {
+		t.Fatalf("apply recheck: %v", err)
+	}
+	if len(fixture.repo.deletedRefIDs) != 1 {
+		t.Fatalf("apply-time recheck deleted a live evidence ref: %v", fixture.repo.deletedRefIDs)
+	}
+	if raceReport.Protected[GCProtectedOwnerExists] < 1 {
+		t.Fatalf("apply-time recheck protected = %#v", raceReport.Protected)
+	}
+}
+
+// TestW2GCFailedEventWhenScanFails pins the failure leg of the lifecycle:
+// gc.started is followed by gc.failed with the error in the payload.
+func TestW2GCFailedEventWhenScanFails(t *testing.T) {
+	fixture := newGCFixture(t)
+	fixture.repo.refsPageErr = errors.New("ledger unavailable")
+
+	if _, err := fixture.svc.Run(context.Background(), storage.GCModeDryRun, 1); err == nil {
+		t.Fatal("expected the scan error")
+	}
+	if len(fixture.events.events) != 2 {
+		t.Fatalf("events = %#v", fixture.events.events)
+	}
+	if fixture.events.events[0].Type != "gc.started" {
+		t.Fatalf("first event = %s", fixture.events.events[0].Type)
+	}
+	failed := fixture.events.events[1]
+	if failed.Type != "gc.failed" || failed.Channel != "system" {
+		t.Fatalf("failed event = %#v", failed)
+	}
+	if !strings.Contains(fmt.Sprint(failed.Payload["error"]), "ledger unavailable") {
+		t.Fatalf("failed payload = %#v", failed.Payload)
+	}
+	if len(fixture.repo.runs) != 1 {
+		t.Fatalf("run rows = %#v", fixture.repo.runs)
+	}
+	for _, run := range fixture.repo.runs {
+		if run.Status != storage.GCRunFailed {
+			t.Fatalf("run status = %q, want failed", run.Status)
+		}
 	}
 }

@@ -379,7 +379,19 @@
     {
       "type": "gc.completed",
       "consumer": "system",
-      "evidence": "backend/internal/eventing/application/system_consumer.go:36",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:44",
+      "channel": "system"
+    },
+    {
+      "type": "gc.failed",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:44",
+      "channel": "system"
+    },
+    {
+      "type": "gc.started",
+      "consumer": "system",
+      "evidence": "backend/internal/eventing/application/system_consumer.go:44",
       "channel": "system"
     },
     {

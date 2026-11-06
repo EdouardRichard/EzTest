@@ -1,6 +1,7 @@
 package settingsapp
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
@@ -58,12 +59,12 @@ func TestP7SettingsRemainFrozen(t *testing.T) {
 
 // TestP8SettingsPinsCatalog pins the two P8 keys (spec §7: 83 -> 85) and the
 // two P8 category counts. Both are hot-reloadable and non-secret; the P7
-// defaults stay unchanged. The v0.22 additions grow the catalog to 98 and W1-2
-// removes seven dead keys (91).
+// defaults stay unchanged. The v0.22 additions grow the catalog to 98, W1-2
+// removes seven dead keys (91), and W2-15 removes the four gc.* aliases (87).
 func TestP8SettingsPinsCatalog(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 91 {
-		t.Fatalf("catalog has %d keys, want 91 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys)", len(defs))
+	if len(defs) != 87 {
+		t.Fatalf("catalog has %d keys, want 87 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(defs))
 	}
 
 	cases := []struct {
@@ -123,14 +124,15 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 }
 
 // TestV022Settings pins the v0.22 settings catalog (spec §8.1 ST-1..ST-19):
-// the raised context window default, the new compaction/vision/tool/question/gc
+// the raised context window default, the new compaction/vision/tool/question
 // keys, and the already-existing agent.tool_result_max_bytes unchanged at
 // 32768. The v0.22 additions grew the catalog from 85 to 98 keys; W1-2 removes
-// seven dead keys (91), and question.blocking must not exist.
+// seven dead keys (91), W2-15 removes the four gc.* aliases (87), and
+// question.blocking must not exist.
 func TestV022Settings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 91 {
-		t.Fatalf("catalog has %d keys, want 91 (v0.22: 85 -> 98, W1-2 removes 7 dead keys)", len(defs))
+	if len(defs) != 87 {
+		t.Fatalf("catalog has %d keys, want 87 (v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(defs))
 	}
 
 	byKey := make(map[string]settings.Definition, len(defs))
@@ -160,10 +162,6 @@ func TestV022Settings(t *testing.T) {
 		{"vision.max_image_bytes", "vision", settings.TypeNumber, "10485760", true, floatPtr(1024), floatPtr(104857600)},
 		{"tool.retry_max", "tool", settings.TypeNumber, "2", true, floatPtr(0), floatPtr(5)},
 		{"question.timeout_seconds", "question", settings.TypeNumber, "86400", true, floatPtr(60), floatPtr(604800)},
-		{"gc.retention_days", "gc", settings.TypeNumber, "30", true, floatPtr(1), floatPtr(3650)},
-		{"gc.max_bytes", "gc", settings.TypeNumber, "0", true, floatPtr(0), nil},
-		{"gc.dry_run", "gc", settings.TypeBool, "true", false, nil, nil},
-		{"gc.grace_days", "gc", settings.TypeNumber, "7", true, floatPtr(0), floatPtr(365)},
 	}
 	for _, tc := range cases {
 		def, ok := byKey[tc.key]
@@ -188,16 +186,17 @@ func TestV022Settings(t *testing.T) {
 
 // TestDeadSettingsDisposed pins the W1-2 disposition of the 13 settings that
 // had no production reader: seven dead keys are removed from the catalog and
-// six are kept because their readers are wired by W1-2. gc.* keeps its keys
-// for W2, so they must stay present even though W1 does not read them yet.
+// six are kept because their readers are wired by W1-2. W2-15 removes the four
+// gc.* aliases so retention.* is the only GC settings family.
 func TestDeadSettingsDisposed(t *testing.T) {
-	byKey := make(map[string]bool, 91)
+	byKey := make(map[string]bool, 87)
 	for _, def := range Definitions("http://127.0.0.1:13336") {
 		byKey[def.Key] = true
 	}
 	for _, removed := range []string{
 		"paths.attachment_dir", "paths.evidence_dir", "paths.report_dir", "paths.export_dir",
 		"security.mask_secrets", "feature.experimental", "vision.required",
+		"gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days",
 	} {
 		if byKey[removed] {
 			t.Fatalf("%s must be removed from the catalog", removed)
@@ -211,11 +210,47 @@ func TestDeadSettingsDisposed(t *testing.T) {
 			t.Fatalf("%s must stay in the catalog (wired)", wired)
 		}
 	}
-	for _, deferred := range []string{
-		"gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days",
-	} {
-		if !byKey[deferred] {
-			t.Fatalf("%s must stay in the catalog (W2 wiring)", deferred)
+}
+
+// TestW2GCKeysRemovedAndRetentionAuthoritative is the W2-15 catalog contract
+// (spec R-W2-7, W2-C4, ST-16..ST-19): the four gc.* aliases are gone, there is
+// no "gc" category at all, and the retention family carries the frozen GC
+// defaults (unreferenced 30d, grace 168h, dry-run true, batch/interval kept).
+func TestW2GCKeysRemovedAndRetentionAuthoritative(t *testing.T) {
+	defs := Definitions("http://127.0.0.1:13336")
+	byKey := make(map[string]settings.Definition, len(defs))
+	for _, def := range defs {
+		if strings.HasPrefix(def.Key, "gc.") || def.Category == "gc" {
+			t.Fatalf("%s must not remain in the catalog (retention.* is the only GC settings family)", def.Key)
+		}
+		byKey[def.Key] = def
+	}
+	for _, removed := range []string{"gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days"} {
+		if _, ok := byKey[removed]; ok {
+			t.Fatalf("%s must be removed from the catalog", removed)
+		}
+	}
+
+	want := map[string]string{
+		"retention.unreferenced_content_days": "30",
+		"retention.gc_grace_hours":            "168",
+		"retention.gc_dry_run":                "true",
+		"retention.temp_hours":                "24",
+		"retention.replaced_export_days":      "7",
+		"retention.gc_batch_size":             "500",
+		"retention.gc_interval_minutes":       "1440",
+		"retention.event_days":                "90",
+	}
+	for key, defaultValue := range want {
+		def, ok := byKey[key]
+		if !ok {
+			t.Fatalf("%s missing from the catalog", key)
+		}
+		if string(def.Default) != defaultValue {
+			t.Fatalf("%s default = %s, want %s", key, def.Default, defaultValue)
+		}
+		if def.Category != "retention" {
+			t.Fatalf("%s category = %q, want retention", key, def.Category)
 		}
 	}
 }

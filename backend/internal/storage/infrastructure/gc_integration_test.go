@@ -406,7 +406,8 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 		t.Fatalf("insert attachment: %v", err)
 	}
 
-	// evidence row exists -> protected.
+	// evidence row exists -> protected. The owning case_run is still running:
+	// apply must never delete the evidence of an active case.
 	if _, err := fixture.pool.Exec(fixture.ctx, `
 		INSERT INTO execution_intent (id, version_id, case_version_id, environment_fingerprint, dedupe_key)
 		VALUES (6001, 5001, 7001, $1, 'gc-integration')
@@ -418,7 +419,7 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 	}
 	if _, err := fixture.pool.Exec(fixture.ctx, `
 		INSERT INTO case_run (id, wave_id, intent_id, case_version_id, status)
-		VALUES (6201, 6101, 6001, 7001, 'passed')
+		VALUES (6201, 6101, 6001, 7001, 'running')
 	`); err != nil {
 		t.Fatalf("insert case run: %v", err)
 	}
@@ -440,6 +441,7 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 	fixture.gcInsertRef(t, 308, youngOrphanSHA, "evidence", 880003, "text", young)
 
 	// --- dry run -------------------------------------------------------------
+	evidenceBefore := fixture.gcCount(t, `SELECT count(*) FROM evidence WHERE case_run_id = 6201`)
 	dryRun, err := fixture.svc.Run(fixture.ctx, storage.GCModeDryRun, 77)
 	if err != nil {
 		t.Fatalf("dry run: %v", err)
@@ -518,7 +520,11 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 		t.Fatalf("missing file still exists: %v", err)
 	}
 
-	// Protected owners/bytes survive, including the current export revision.
+	// Protected owners/bytes survive, including the current export revision and
+	// the running case's evidence (count unchanged before/after apply).
+	if got := fixture.gcCount(t, `SELECT count(*) FROM evidence WHERE case_run_id = 6201`); got != evidenceBefore || got < 1 {
+		t.Fatalf("running-case evidence count after apply = %d, want %d (>=1)", got, evidenceBefore)
+	}
 	for _, sha := range []string{reportSHA, attachmentSHA, evidenceSHA, currentSHA, youngOrphanSHA} {
 		if !fixture.gcObjectExists(t, sha) {
 			t.Fatalf("protected object %s was deleted", sha)
@@ -586,13 +592,26 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 		t.Fatalf("running runs = %d", got)
 	}
 
-	if len(fixture.events.events) != 2 {
+	wantEventTypes := []string{"gc.started", "gc.completed", "gc.started", "gc.completed"}
+	if len(fixture.events.events) != len(wantEventTypes) {
 		t.Fatalf("events = %#v", fixture.events.events)
 	}
-	for _, event := range fixture.events.events {
-		if event.Type != "gc.completed" || event.Channel != "system" {
-			t.Fatalf("event = %#v", event)
+	for index, want := range wantEventTypes {
+		event := fixture.events.events[index]
+		if event.Type != want || event.Channel != "system" {
+			t.Fatalf("event %d = %s/%s, want %s/system", index, event.Type, event.Channel, want)
 		}
+		for _, field := range []string{"gc_run_id", "mode", "deleted_objects", "deleted_refs", "error"} {
+			if _, ok := event.Payload[field]; !ok {
+				t.Fatalf("%s payload missing %q: %#v", want, field, event.Payload)
+			}
+		}
+	}
+	if fixture.events.events[1].Payload["deleted_objects"] != 0 {
+		t.Fatalf("dry-run payload = %#v", fixture.events.events[1].Payload)
+	}
+	if fixture.events.events[3].Payload["deleted_objects"] != applyRun.DeletedObjects {
+		t.Fatalf("apply payload = %#v (run=%+v)", fixture.events.events[3].Payload, applyRun)
 	}
 	if len(fixture.audit.actions) != 2 || fixture.audit.actions[0] != "storage.gc.completed" {
 		t.Fatalf("audit actions = %#v", fixture.audit.actions)

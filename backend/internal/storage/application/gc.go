@@ -47,6 +47,15 @@ const (
 	GCProtectedMissingRef       = "missing_ref"
 )
 
+// GC lifecycle events (spec EV-21). They are published on the system channel;
+// gc.started is emitted before any scan/deletion so subscribers can render an
+// in-flight state, and exactly one terminal event follows the pass.
+const (
+	GCEventStarted   = "gc.started"
+	GCEventCompleted = "gc.completed"
+	GCEventFailed    = "gc.failed"
+)
+
 // GCReportSettings records the retention values a pass used.
 type GCReportSettings struct {
 	TempHours               int64 `json:"temp_hours"`
@@ -239,6 +248,9 @@ func (s *GCService) Run(ctx context.Context, mode storage.GCMode, actorID int64)
 		}
 		return storage.GCRun{}, fmt.Errorf("create gc run: %w", err)
 	}
+	// gc.started is published before any scan/deletion so the admin page can
+	// show the in-flight run. Best-effort like every other GC event.
+	s.recordStart(ctx, created)
 
 	report := newGCReport(mode, settings, now)
 	candidates, err := s.scan(ctx, settings, now, report)
@@ -681,6 +693,21 @@ func (s *GCService) apply(ctx context.Context, runID int64, settings gcSettings,
 				report.Deleted.Files++
 			}
 		case storage.GCCandidateSupersededExport, storage.GCCandidateOrphanFile:
+			// Running-case safety (spec R-W2-7): evidence belongs to a case_run.
+			// The scan already protects evidence rows that exist, but re-check
+			// immediately before deletion so an evidence row created after the
+			// scan (e.g. by a case that is still running) is never purged.
+			if candidate.Class == storage.GCCandidateOrphanFile && candidate.OwnerKind == OwnerKindEvidence {
+				exists, err := s.owners.EvidenceExists(ctx, candidate.OwnerID)
+				if err != nil {
+					report.recordError(err)
+					continue
+				}
+				if exists {
+					report.protect(GCProtectedOwnerExists, candidate.Object.SHA256, candidate.OwnerKind, candidate.OwnerID, candidate.RefID, candidate.AgeSeconds)
+					continue
+				}
+			}
 			counts, err := s.repo.LiveRefCounts(ctx, []string{candidate.Object.SHA256})
 			if err != nil {
 				report.recordError(err)
@@ -791,27 +818,58 @@ func (s *GCService) finish(ctx context.Context, run storage.GCRun, report *GCRep
 	if err := s.repo.UpdateRun(finishCtx, run); err != nil {
 		return run, fmt.Errorf("finish gc run: %w", err)
 	}
-	s.recordCompletion(finishCtx, run, report)
+	s.recordTerminal(finishCtx, run, report)
 	return run, runErr
 }
 
-// recordCompletion emits the system gc.completed event and the storage audit
-// entry; both are best-effort and never fail the pass.
-func (s *GCService) recordCompletion(ctx context.Context, run storage.GCRun, report *GCReport) {
-	payload := map[string]any{
+// recordStart emits the system gc.started event. It is best-effort and never
+// fails a pass; the payload carries the same lifecycle shape as the terminal
+// event with zero counters so subscribers can update one way.
+func (s *GCService) recordStart(ctx context.Context, run storage.GCRun) {
+	if s.events == nil {
+		return
+	}
+	_ = s.events.Publish(ctx, eventingapp.Event{
+		Channel:   "system",
+		Type:      GCEventStarted,
+		Scope:     map[string]any{},
+		Payload:   gcEventPayload(run, 0, 0, ""),
+		ActorID:   run.ActorID,
+		RequestID: requestid.From(ctx),
+	})
+}
+
+// gcEventPayload is the EV-21 payload shared by gc.started/completed/failed:
+// {gc_run_id, mode, deleted_objects, deleted_refs, error}. deleted_bytes and
+// run_status are additive convenience fields the admin page renders.
+func gcEventPayload(run storage.GCRun, deletedObjects, deletedRefs int, errText string) map[string]any {
+	return map[string]any{
 		"gc_run_id":       platformid.Format(run.ID),
 		"mode":            string(run.Mode),
-		"deleted_objects": report.Deleted.Objects,
-		"deleted_bytes":   report.Deleted.Bytes,
+		"deleted_objects": deletedObjects,
+		"deleted_refs":    deletedRefs,
+		"deleted_bytes":   run.DeletedBytes,
+		"error":           errText,
 		"run_status":      string(run.Status),
+	}
+}
+
+// recordTerminal emits the system gc.completed/gc.failed event and the storage
+// audit entry; both are best-effort and never fail the pass.
+func (s *GCService) recordTerminal(ctx context.Context, run storage.GCRun, report *GCReport) {
+	eventType := GCEventCompleted
+	action := "storage.gc.completed"
+	if run.Status == storage.GCRunFailed {
+		eventType = GCEventFailed
+		action = "storage.gc.failed"
 	}
 	requestID := requestid.From(ctx)
 	if s.events != nil {
 		_ = s.events.Publish(ctx, eventingapp.Event{
 			Channel:   "system",
-			Type:      "gc.completed",
+			Type:      eventType,
 			Scope:     map[string]any{},
-			Payload:   payload,
+			Payload:   gcEventPayload(run, report.Deleted.Objects, report.Deleted.Refs, run.Error),
 			ActorID:   run.ActorID,
 			RequestID: requestID,
 		})
@@ -819,7 +877,7 @@ func (s *GCService) recordCompletion(ctx context.Context, run storage.GCRun, rep
 	if s.audit != nil {
 		_ = s.audit.Record(ctx, auditapp.Event{
 			ActorID:    run.ActorID,
-			Action:     "storage.gc.completed",
+			Action:     action,
 			TargetKind: "gc_run",
 			TargetID:   platformid.Format(run.ID),
 			RequestID:  requestID,

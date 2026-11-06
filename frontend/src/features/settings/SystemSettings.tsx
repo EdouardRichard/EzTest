@@ -60,9 +60,10 @@ function displayValue(setting: Setting): string {
 type Notice = { key: string; text: string }
 
 /**
- * Keys removed by the v0.22 W1-2 settings disposition. They no longer exist in
- * the backend catalog; the filter keeps stale rows from an older database out
- * of the editor so the page only exposes settings that can take effect.
+ * Keys removed by the v0.22 settings disposition. They no longer exist in the
+ * backend catalog; the filter keeps stale rows from an older database out of
+ * the editor so the page only exposes settings that can take effect. W2-15
+ * adds the four legacy gc.* aliases because retention.* is the only GC family.
  */
 const REMOVED_SETTING_KEYS = new Set([
   "paths.attachment_dir",
@@ -72,14 +73,6 @@ const REMOVED_SETTING_KEYS = new Set([
   "security.mask_secrets",
   "feature.experimental",
   "vision.required",
-])
-
-/**
- * Keys whose GC reader is deferred to W2. They stay visible (read-only) so the
- * parameter surface is complete, but the editor must not pretend a save takes
- * effect before the W2 GC wiring lands.
- */
-const DEFERRED_SETTING_KEYS = new Set([
   "gc.retention_days",
   "gc.max_bytes",
   "gc.dry_run",
@@ -122,6 +115,16 @@ export function SystemSettings() {
   const groups = useMemo(
     () =>
       groupSettings((settings ?? []).filter((setting) => !REMOVED_SETTING_KEYS.has(setting.key))),
+    [settings],
+  )
+
+  // retention.* is the only GC settings family (W2-15); the GC panel renders
+  // the effective values/status next to the run controls.
+  const retentionSettings = useMemo(
+    () =>
+      (settings ?? []).filter(
+        (setting) => setting.category === "retention" && !REMOVED_SETTING_KEYS.has(setting.key),
+      ),
     [settings],
   )
 
@@ -220,7 +223,6 @@ export function SystemSettings() {
           <ul className="divide-y divide-border">
             {group.settings.map((setting) => {
               const editing = editingKey === setting.key
-              const deferred = DEFERRED_SETTING_KEYS.has(setting.key)
               return (
                 <li
                   key={setting.key}
@@ -236,7 +238,6 @@ export function SystemSettings() {
                         <Badge tone="neutral">{setting.type}</Badge>
                         {setting.is_secret ? <Badge tone="info">密钥</Badge> : null}
                         {setting.restart_required ? <Badge tone="warning">需重启生效</Badge> : null}
-                        {deferred ? <Badge tone="info">W2 接线</Badge> : null}
                       </div>
                       <p className="mt-1 text-xs text-muted-foreground">{setting.description}</p>
                       <p className="mt-0.5 text-[10px] text-muted-foreground">
@@ -251,15 +252,10 @@ export function SystemSettings() {
                       >
                         {displayValue(setting)}
                       </span>
-                      {!editing && !deferred ? (
+                      {!editing ? (
                         <Button variant="secondary" size="sm" onClick={() => startEdit(setting)}>
                           编辑
                         </Button>
-                      ) : null}
-                      {deferred ? (
-                        <span className="text-[10px] text-muted-foreground">
-                          只读：W2 接线后生效
-                        </span>
                       ) : null}
                     </div>
                   </div>
@@ -342,7 +338,7 @@ export function SystemSettings() {
         `restart_required` 只做提示，不阻断保存；其余配置在保存成功后立即热加载。
       </Alert>
 
-      <GCPanel />
+      <GCPanel retentionSettings={retentionSettings} />
       <InstancePanel />
       <ExecutorsPanel />
     </div>
