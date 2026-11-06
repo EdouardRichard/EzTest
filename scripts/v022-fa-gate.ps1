@@ -569,7 +569,8 @@ function Invoke-GatePrep {
 
         # Raw evidence cross-checks: a forged verdict must not pass while the
         # recorded upstream response or catalog JSON says otherwise.
-        $visionRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\vision-upstream.json')
+        $visionRaw = $null
+        try { $visionRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\vision-upstream.json') } catch { $visionRaw = $null }
         if ($null -eq $visionRaw) { Add-Red 'missing prep/checks/vision-upstream.json' }
         else {
             if ([int]$visionRaw.status -ne 200) { Add-Red "vision-upstream.json status=$([string]$visionRaw.status) (expected 200)" }
@@ -583,7 +584,8 @@ function Invoke-GatePrep {
             if ([string]::IsNullOrWhiteSpace($rawContent)) { Add-Red 'vision-upstream.json response has no assistant content' }
             elseif ([string]::IsNullOrWhiteSpace($rawCaption) -or -not $rawContent.Contains($rawCaption)) { Add-Red 'vision-upstream.json content does not contain the recorded caption' }
         }
-        $modelsRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\llm-models.json')
+        $modelsRaw = $null
+        try { $modelsRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\llm-models.json') } catch { $modelsRaw = $null }
         if ($null -eq $modelsRaw) { Add-Red 'missing prep/checks/llm-models.json' }
         else {
             if ([int]$modelsRaw.status -ne 200) { Add-Red "llm-models.json status=$([string]$modelsRaw.status) (expected 200)" }
@@ -595,14 +597,24 @@ function Invoke-GatePrep {
                 if (-not [bool]$catalogModel[0].default) { Add-Red 'llm-models.json deepseek-flash is not the default model' }
             }
         }
-        $webLoginRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\web-login.json')
+        $prepChecksDir = Join-Path $script:EvidenceRoot 'prep\checks'
+        function Read-PrepRaw([string]$Name) {
+            $path = Join-Path $prepChecksDir $Name
+            if (-not (Test-Path -LiteralPath $path)) { return $null }
+            try { return (Read-JsonUtf8 -Path $path) } catch { return $null }
+        }
+        $webLoginRaw = Read-PrepRaw 'web-login.json'
         if ($null -eq $webLoginRaw) { Add-Red 'missing prep/checks/web-login.json' }
         elseif ([int]$webLoginRaw.status -ne 200) { Add-Red "web-login.json status=$([string]$webLoginRaw.status) (expected 200)" }
-        $execRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\executor-contexts.json')
-        $execNoAuthRaw = Read-JsonUtf8 -Path (Join-Path $script:EvidenceRoot 'prep\checks\executor-unauthorized.json')
+        $execRaw = Read-PrepRaw 'executor-contexts.json'
+        $execNoAuthRaw = Read-PrepRaw 'executor-unauthorized.json'
+        $execHealthRaw = Read-PrepRaw 'executor-health.json'
         if ($null -eq $execRaw) { Add-Red 'missing prep/checks/executor-contexts.json' }
+        elseif ([int]$execRaw.status -ne 200) { Add-Red "executor-contexts.json status=$([string]$execRaw.status) (expected 200)" }
         if ($null -eq $execNoAuthRaw) { Add-Red 'missing prep/checks/executor-unauthorized.json' }
         elseif ([int]$execNoAuthRaw.status -ne 401) { Add-Red "executor-unauthorized.json status=$([string]$execNoAuthRaw.status) (expected 401)" }
+        if ($null -eq $execHealthRaw) { Add-Red 'missing prep/checks/executor-health.json' }
+        elseif ([int]$execHealthRaw.status -ne 200) { Add-Red "executor-health.json status=$([string]$execHealthRaw.status) (expected 200)" }
 
         if ([string]$verdict.stack.db -ne 'eztest_v022_fa') { Add-Red "stack.db=$([string]$verdict.stack.db) (expected eztest_v022_fa)" }
         if ([int]$verdict.stack.apiPort -ne 13460) { Add-Red "stack.apiPort=$([string]$verdict.stack.apiPort) (expected 13460)" }
@@ -624,6 +636,10 @@ function Invoke-GatePrep {
             if ($frozenInputs -ne $currentInputs) { Add-Red "frozenShas.inputs=$frozenInputs does not match current typical-section1.md=$currentInputs" }
         }
         if ($frozenGate -notmatch '^[0-9a-f]{64}$') { Add-Red 'frozenShas.gate is not a 64-char lowercase SHA256' }
+        else {
+            $currentGateSha = Get-Sha -Path (Join-Path $PSScriptRoot 'v022-fa-gate.ps1')
+            if ($frozenGate -ne $currentGateSha) { Add-Red "frozenShas.gate=$frozenGate does not match the current gate script=$currentGateSha (re-run prep after any gate change)" }
+        }
         if ($frozenIssues -notmatch '^[0-9a-f]{64}$') { Add-Red 'frozenShas.issuesMd is not a 64-char lowercase SHA256' }
         elseif (-not (Test-Path -LiteralPath $issuesMd)) { Add-Red 'missing docs/version-V0.22/acceptance/issues.md (cannot verify frozenShas.issuesMd)' }
         else {
@@ -1496,6 +1512,37 @@ function Invoke-GateVerdict {
     if ($status -eq 'PASS' -and $redItems.Count -gt 0) { Add-Red 'fa-verdict.status=PASS but red is not empty' }
     if ($status -in @('FAIL', 'EXTERNAL-BLOCKED') -and $redItems.Count -eq 0) { Add-Red "fa-verdict.status=$status but red is empty" }
 
+    # Mechanical gate ledger: never trust the aggregate status alone. Every
+    # required gate must be recorded, green, and backed by an intact log.
+    $gates = @(Get-Iarray (Get-Value $fv @('gates')))
+    $requiredGateNames = @('inputs', 'prep', 'harness', 'flow', 'typical', 'acs', 'issues14', 'domains', 'exploration', 'visual', 'run1')
+    if ($gates.Count -eq 0) { Add-Red 'fa-verdict.gates is empty' }
+    $gateNames = New-Object System.Collections.Generic.List[string]
+    foreach ($gateEntry in $gates) {
+        $gateName = Get-StringValue $gateEntry @('name')
+        if ([string]::IsNullOrWhiteSpace($gateName)) { Add-Red 'fa-verdict.gates[] entry without name'; continue }
+        $gateNames.Add($gateName)
+        $gateExit = Get-IntValue $gateEntry @('exit') -1
+        if ($gateExit -ne 0) { Add-Red "fa-verdict gate '$gateName' exit=$gateExit (expected 0)" }
+        $gateLog = Get-StringValue $gateEntry @('log')
+        if ([string]::IsNullOrWhiteSpace($gateLog)) { Add-Red "fa-verdict gate '$gateName' has no log" }
+        else {
+            $gateLogPath = Resolve-FaPath $gateLog
+            if ($null -eq $gateLogPath) { Add-Red "fa-verdict gate '$gateName' log missing: $gateLog" }
+            else {
+                $gateLogSha = Get-StringValue $gateEntry @('sha256')
+                if ($gateLogSha -notmatch '^[0-9a-f]{64}$') { Add-Red "fa-verdict gate '$gateName' log sha256 invalid" }
+                elseif ($gateLogSha -ne (Get-Sha -Path $gateLogPath)) { Add-Red "fa-verdict gate '$gateName' log sha256 mismatch" }
+            }
+        }
+    }
+    foreach ($requiredGate in $requiredGateNames) {
+        if ($gateNames -notcontains $requiredGate) { Add-Red "fa-verdict.gates missing '$requiredGate'" }
+    }
+    $fixRecordsForGates = @(Get-Iarray (Get-Value $fv @('fixes')))
+    $fixGateCount = @($gateNames | Where-Object { $_ -eq 'fix' }).Count
+    if ($fixRecordsForGates.Count -ne $fixGateCount) { Add-Red "fa-verdict gates fix=$fixGateCount but fixes=$($fixRecordsForGates.Count)" }
+
     $reuse = Get-Value $fv @('reuse')
     if ($null -eq $reuse) { Add-Red 'fa-verdict.reuse missing' }
     elseif ([bool](Get-Value $reuse @('reused') $false)) { Add-Red 'fa-verdict.reuse.reused is true (final verdict must be fresh)' }
@@ -1533,6 +1580,27 @@ function Invoke-GateVerdict {
     }
     foreach ($problem in @(Assert-ExactSetStrings -Actual @($acIds) -Expected @($script:ExpectedAcIds) -Label 'fa-verdict.acs')) { Add-Red $problem }
 
+    foreach ($ac in $acs) {
+        $acId = Get-StringValue $ac @('id')
+        $acStatus = (Get-StringValue $ac @('status')).ToLowerInvariant()
+        $groundTruth = (Get-StringValue $ac @('groundTruth')).ToLowerInvariant()
+        $eztestVerdict = (Get-StringValue $ac @('eztestVerdict')).ToLowerInvariant()
+        if ($acStatus -notin @('pass', 'fail', 'gap', 'blocked')) { Add-Red "$acId status='$acStatus'" }
+        if ($groundTruth -notin @('present', 'absent', 'partial')) { Add-Red "$acId groundTruth='$groundTruth'" }
+        if ($eztestVerdict -notin @('pass', 'fail', 'gap', 'blocked', 'missing')) { Add-Red "$acId eztestVerdict='$eztestVerdict'" }
+        if ($groundTruth -eq 'absent' -and $eztestVerdict -eq 'pass') { Add-Red "FORGED PASS ${acId}: SUT absent but EzTest=pass" }
+        if ($groundTruth -eq 'absent' -and $acStatus -eq 'pass') { Add-Red "FORGED PASS ${acId}: SUT absent but status=pass" }
+        $probe = Get-Value $ac @('probe')
+        if ($null -eq $probe) { Add-Red "$acId probe missing" }
+        else {
+            $recomputed = (Get-StringValue $probe @('recomputed')).ToLowerInvariant()
+            if ($recomputed -ne $acStatus) { Add-Red "$acId status=$acStatus != probe.recomputed=$recomputed" }
+        }
+        if ([string]::IsNullOrWhiteSpace((Get-StringValue $ac @('observed')))) { Add-Red "$acId observed empty" }
+        if ([string]::IsNullOrWhiteSpace((Get-StringValue $ac @('expected')))) { Add-Red "$acId expected empty" }
+        if (@(Get-Iarray (Get-Value $ac @('evidence'))).Count -lt 1) { Add-Red "$acId evidence empty" }
+    }
+
     $problems = @(Get-Iarray (Get-Value $fv @('fourteenProblems')))
     $problemIds = New-Object System.Collections.Generic.List[string]
     foreach ($problem in $problems) {
@@ -1540,6 +1608,9 @@ function Invoke-GateVerdict {
         if ($id) { $problemIds.Add($id) }
     }
     foreach ($msg in @(Assert-ExactSetStrings -Actual @($problemIds) -Expected @(1..14 | ForEach-Object { [string]$_ }) -Label 'fa-verdict.fourteenProblems')) { Add-Red $msg }
+    foreach ($problem in $problems) {
+        if (@(Get-Iarray (Get-Value $problem @('assertions'))).Count -lt 1) { Add-Red "fourteenProblems $((Get-StringValue $problem @('id'))) assertions empty" }
+    }
 
     $domains = @(Get-Iarray (Get-Value $fv @('sevenDomains')))
     $domainIds = New-Object System.Collections.Generic.List[string]
@@ -1550,6 +1621,17 @@ function Invoke-GateVerdict {
         if ($verdict -ne 'PASS') { Add-Red "sevenDomains $id verdict='$verdict' (expected PASS)" }
     }
     foreach ($problem in @(Assert-ExactSetStrings -Actual @($domainIds) -Expected @('human', 'issue', 'export', 'code', 'visual', 'eval', 'gc') -Label 'fa-verdict.sevenDomains')) { Add-Red $problem }
+
+    $visualPayload = Get-Value $fv @('visual')
+    if ($null -eq $visualPayload) { Add-Red 'fa-verdict.visual missing' }
+    else {
+        if ([string]::IsNullOrWhiteSpace((Get-StringValue $visualPayload @('reviewer')))) { Add-Red 'fa-verdict.visual.reviewer is empty' }
+        $visualShots = @(Get-Iarray (Get-Value $visualPayload @('screenshots')))
+        $reviewedCount = Get-IntValue $visualPayload @('reviewedScreenshots') -1
+        if ($reviewedCount -ne $visualShots.Count) { Add-Red "visual.reviewedScreenshots=$reviewedCount != screenshots=$($visualShots.Count)" }
+        $visualVision = Get-Value $visualPayload @('vision')
+        if ($null -eq $visualVision -or -not [bool](Get-Value $visualVision @('visionExercised') $false)) { Add-Red 'fa-verdict.visual.vision.visionExercised is not true' }
+    }
 
     $evidence = Get-Value $fv @('evidence')
     if ($null -eq $evidence) { Add-Red 'fa-verdict.evidence missing' }
@@ -1567,6 +1649,8 @@ function Invoke-GateVerdict {
             if ($sha -notmatch '^[0-9a-f]{64}$') { Add-Red "evidence sha256 invalid: $path" }
             elseif ($sha -ne (Get-Sha -Path $resolved)) { Add-Red "evidence sha256 mismatch: $path" }
         }
+        $claims = @(Get-Iarray (Get-Value $evidence @('claims')))
+        if ($claims.Count -lt 1) { Add-Red 'fa-verdict.evidence.claims is empty (no traceable claim)' }
     }
 
     Assert-StageEvidence (Get-Value $fv @('stageEvidence')) 'fa-verdict'
