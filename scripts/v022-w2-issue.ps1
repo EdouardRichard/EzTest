@@ -15,14 +15,18 @@
          isolated executor (the previous value is restored at the end);
       3. select the auto-created issue of the failed base run, or create a
          manual issue linked to that run when no retestable issue exists;
-      4. POST /api/versions/{id}/issues/{iid}/retest with an empty selection,
+      4. resolve the failed run's requirement from case_run/case_source and,
+         when it is closed (a fresh base closes both requirements), reopen and
+         re-confirm it through the product API before starting the retest;
+      5. POST /api/versions/{id}/issues/{iid}/retest with an empty selection,
          wait (bounded) for the retest wave to reach its terminal state and for
-         the issue retest writeback;
-      5. verify delivery_issue.retest_status / last_retest_wave_id /
+         the issue retest writeback; a 409 requirement_closed from the retest
+         call triggers the same reopen helper once and a bounded retry;
+      6. verify delivery_issue.retest_status / last_retest_wave_id /
          last_retest_case_run_id, role='retest' refs, issue history, the
          issue.retest_started/completed/failed event payloads (including error)
          and that the response case_run_ids are the linked retest runs;
-      6. optionally capture 1-3 screenshots of the issue center, the detail
+      7. optionally capture 1-3 screenshots of the issue center, the detail
          sheet and the retest run (screenshots never gate the verdict).
 
     Evidence (untracked) is written next to the W2 base evidence:
@@ -110,6 +114,9 @@ $script:responseCaseRunIds = @()
 $script:dbLastWaveId = ''
 $script:dbLastCaseRunId = ''
 $script:dbRetestStatus = ''
+$script:failedRequirementId = ''
+$script:requirementStatusBefore = ''
+$script:requirementStatusAfter = ''
 
 # The verdict is written even when the flow fails so a reviewer can see exactly
 # which assertion failed.
@@ -125,6 +132,9 @@ $verdict = [ordered]@{
     apiBase            = $apiBase
     generatedAt        = (Get-Date -Format o)
     failedCaseRunId    = $null
+    failedRequirementId = ''
+    requirementStatusBefore = ''
+    requirementStatusAfter = ''
     issueSource        = ''
     issueStatus        = ''
     retestWaveStatus   = ''
@@ -270,7 +280,7 @@ function Invoke-Api {
 }
 
 function Get-ApiErrorInfo($raw) {
-    $info = [ordered]@{ code = ''; message = ''; reason = '' }
+    $info = [ordered]@{ code = ''; message = ''; reason = ''; requirement_id = '' }
     if ([string]::IsNullOrWhiteSpace($raw.Text)) { return $info }
     try {
         $parsed = $raw.Text | ConvertFrom-Json
@@ -279,12 +289,66 @@ function Get-ApiErrorInfo($raw) {
             $info.message = [string]$parsed.error.message
             if ($null -ne $parsed.error.details) {
                 $info.reason = [string]$parsed.error.details.reason
+                $info.requirement_id = [string]$parsed.error.details.requirement_id
             }
         }
     } catch {
         $info.message = $raw.Text.Substring(0, [Math]::Min(300, $raw.Text.Length))
     }
     return $info
+}
+
+# Resolve the requirement behind the failed run. A case_run's case_version can
+# carry several sources; the requirement source is the stable one used by the
+# execution intent guard.
+function Get-RunRequirementId([string]$runId) {
+    if ($runId -notmatch '^[0-9]+$') { throw "invalid case_run id '$runId' for requirement lookup" }
+    $raw = Invoke-Db ("select rv.requirement_id from case_run cr join case_source src on src.case_version_id = cr.case_version_id and src.kind='requirement' join requirement_version rv on rv.id::text = src.ref_id where cr.id = $runId order by src.id limit 1")
+    $value = ([string]$raw).Trim()
+    if ($value -eq '') { return '' }
+    if ($value -notmatch '^[0-9]+$') { throw "unexpected requirement id '$value' for case_run $runId" }
+    return $value
+}
+
+function Get-RequirementStatus([string]$versionId, [string]$requirementId) {
+    $detail = Invoke-Api -Method 'GET' -Path "/api/versions/$versionId/requirements/$requirementId"
+    return [string]$detail.data.status
+}
+
+# A fresh base can close the requirement after its case finishes. A retest
+# creates a new execution intent for the source run, and the product correctly
+# refuses that intent while the requirement is closed (409 requirement_closed).
+# Reopen and re-confirm the requirement through the product API before retest.
+function Ensure-RequirementOpen {
+    param(
+        [string]$VersionId,
+        [string]$RequirementId,
+        [string]$Context
+    )
+    if ([string]::IsNullOrWhiteSpace($RequirementId)) {
+        Write-Host "== ${Context}: no requirement linked to the failed run; skipping reopen"
+        return
+    }
+    $status = Get-RequirementStatus $VersionId $RequirementId
+    if ($script:requirementStatusBefore -eq '') { $script:requirementStatusBefore = $status }
+    Write-Host "== ${Context}: requirement=$RequirementId status=$status"
+    if ($status -ne 'closed') {
+        $script:requirementStatusAfter = $status
+        return
+    }
+    Write-Host "== ${Context}: requirement=$RequirementId is closed; reopening and confirming before retest"
+    $reason = 'W2-6 issue/retest domain script: reopen the requirement so the retest execution intent can be created.'
+    Invoke-Api -Method 'POST' -Path "/api/versions/$VersionId/requirements/$RequirementId/reopen" -Body @{ reason = $reason } | Out-Null
+    Invoke-Api -Method 'POST' -Path "/api/versions/$VersionId/requirements/$RequirementId/confirmations" | Out-Null
+    $after = Get-RequirementStatus $VersionId $RequirementId
+    $script:requirementStatusAfter = $after
+    if ($after -eq 'closed') {
+        throw "requirement $RequirementId is still closed after reopen+confirm (context: $Context)"
+    }
+    if ($after -ne 'clarified' -and $after -ne 'draft') {
+        throw "requirement $RequirementId status=$after after reopen+confirm, want clarified|draft (context: $Context)"
+    }
+    Write-Host "== ${Context}: requirement=$RequirementId reopened status=$after"
 }
 
 function Save-ExecutorUrl {
@@ -339,6 +403,9 @@ function Write-Verdict {
     $verdict.db.retestStatus = $script:dbRetestStatus
     $verdict.db.lastRetestWaveId = $script:dbLastWaveId
     $verdict.db.lastRetestCaseRunId = $script:dbLastCaseRunId
+    $verdict.failedRequirementId = $script:failedRequirementId
+    $verdict.requirementStatusBefore = $script:requirementStatusBefore
+    $verdict.requirementStatusAfter = $script:requirementStatusAfter
     $verdict.refs.rows = @($script:retestRefRows)
     $verdict.errors = @($script:errors)
     $verdict.startedAt = $script:startedAt.ToString('o')
@@ -648,11 +715,25 @@ server.listen(port, "127.0.0.1", () => console.log(`[issue-llm-proxy] 127.0.0.1:
     $script:eventBaseline = [long](Invoke-Db "select coalesce(max(seq),0) from event where channel = 'version:$versionId'")
     Write-Host "== retest event baseline seq=$($script:eventBaseline)"
 
+    # Fresh bases can close the requirement behind the failed run. The retest
+    # creates execution intents for the source runs, so make the requirement
+    # open (reopen + confirm) before asking for the retest. If the base already
+    # left it open this is a no-op.
+    $script:failedRequirementId = Get-RunRequirementId $failedRunId
+    $verdict.failedRequirementId = $script:failedRequirementId
+    if ($script:failedRequirementId -eq '') {
+        Write-Host "== failed run $failedRunId has no requirement source; no reopen needed"
+    } else {
+        Write-Host "== failed run $failedRunId requirement=$($script:failedRequirementId); ensuring it is open before retest"
+        Ensure-RequirementOpen $versionId $script:failedRequirementId 'pre-retest'
+    }
+
     # ---------------------------------------------------------------------
     # 7. Start the retest (empty selection retests every linked source run).
     # ---------------------------------------------------------------------
     $retestRaw = $null
     $retestAttempts = 0
+    $requirementRetryUsed = $false
     while ($true) {
         $retestAttempts = $retestAttempts + 1
         $retestRaw = Invoke-ApiRaw -Method 'POST' -Path "/api/versions/$versionId/issues/$issueId/retest" -Body @{}
@@ -663,6 +744,23 @@ server.listen(port, "127.0.0.1", () => console.log(`[issue-llm-proxy] 127.0.0.1:
             if (-not (Wait-NoActiveWave $versionId 180)) {
                 throw 'another wave stayed active; the retest could not start'
             }
+            continue
+        }
+        if ($info.reason -eq 'requirement_closed' -and -not $requirementRetryUsed) {
+            # The requirement was closed by a concurrent close between the
+            # pre-retest check and the intent creation. Reopen once and retry.
+            $requirementRetryUsed = $true
+            $retryRequirementId = $info.requirement_id
+            if ([string]::IsNullOrWhiteSpace($retryRequirementId)) {
+                $retryRequirementId = Get-RunRequirementId $failedRunId
+            }
+            if ([string]::IsNullOrWhiteSpace($retryRequirementId)) {
+                throw "start retest failed: HTTP $($retestRaw.Status) $($info.code)/$($info.reason) $($info.message) (no requirement id to reopen)"
+            }
+            if ($script:failedRequirementId -eq '') { $script:failedRequirementId = $retryRequirementId }
+            Write-Host "== retest rejected (attempt $retestAttempts): requirement $retryRequirementId is closed; reopening and retrying once"
+            Ensure-RequirementOpen $versionId $retryRequirementId 'retest-retry'
+            $verdict.failedRequirementId = $script:failedRequirementId
             continue
         }
         throw "start retest failed: HTTP $($retestRaw.Status) $($info.code)/$($info.reason) $($info.message)"
