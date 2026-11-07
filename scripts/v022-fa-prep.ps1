@@ -39,7 +39,8 @@
 #>
 
 param(
-    [switch]$Stop
+    [switch]$Stop,
+    [switch]$KeepDatabase
 )
 
 $ErrorActionPreference = 'Stop'
@@ -504,29 +505,34 @@ try {
     }
 
     # -- fresh database ------------------------------------------------------
-    Write-PrepLog "database: recreating $dbName"
-    Invoke-Psql -Database 'postgres' `
-        -Sql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbName' AND pid <> pg_backend_pid()" `
-        -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User | Out-Null
-    $drop = Invoke-Psql -Database 'postgres' -Sql "DROP DATABASE IF EXISTS $dbName" `
-        -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User
-    if ($drop.ExitCode -ne 0) {
-        # A connection may have appeared between terminate and drop; retry once.
+    if ($KeepDatabase) {
+        Write-PrepLog "database: keeping existing $dbName (KeepDatabase)"
+    }
+    else {
+        Write-PrepLog "database: recreating $dbName"
         Invoke-Psql -Database 'postgres' `
             -Sql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbName' AND pid <> pg_backend_pid()" `
             -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User | Out-Null
         $drop = Invoke-Psql -Database 'postgres' -Sql "DROP DATABASE IF EXISTS $dbName" `
             -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User
+        if ($drop.ExitCode -ne 0) {
+            # A connection may have appeared between terminate and drop; retry once.
+            Invoke-Psql -Database 'postgres' `
+                -Sql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$dbName' AND pid <> pg_backend_pid()" `
+                -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User | Out-Null
+            $drop = Invoke-Psql -Database 'postgres' -Sql "DROP DATABASE IF EXISTS $dbName" `
+                -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User
+        }
+        if ($drop.ExitCode -ne 0) {
+            Fail-External "could not drop database $dbName (psql exit=$($drop.ExitCode))"
+        }
+        $create = Invoke-Psql -Database 'postgres' -Sql "CREATE DATABASE $dbName" `
+            -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User
+        if ($create.ExitCode -ne 0) {
+            Fail-External "could not create database $dbName (psql exit=$($create.ExitCode))"
+        }
+        Write-PrepLog "database: $dbName created"
     }
-    if ($drop.ExitCode -ne 0) {
-        Fail-External "could not drop database $dbName (psql exit=$($drop.ExitCode))"
-    }
-    $create = Invoke-Psql -Database 'postgres' -Sql "CREATE DATABASE $dbName" `
-        -Password $dbParts.Password -DbHost $dbParts.Host -Port $dbParts.Port -User $dbParts.User
-    if ($create.ExitCode -ne 0) {
-        Fail-External "could not create database $dbName (psql exit=$($create.ExitCode))"
-    }
-    Write-PrepLog "database: $dbName created"
 
     # -- build the real composition root ------------------------------------
     $backendExe = Join-Path $work 'eztest.exe'
