@@ -1,6 +1,7 @@
 import type { StageView } from "@/features/design/types"
 import {
   type ApiDownload,
+  ApiError,
   type ApiPage,
   apiDelete,
   apiDownload,
@@ -25,6 +26,8 @@ import type {
   RequirementCreateRequest,
   RequirementDedupeResult,
   RequirementDetail,
+  RequirementExtractionProgress,
+  RequirementExtractionStartResult,
   RequirementMergeResult,
   RequirementRelation,
   RequirementStatus,
@@ -88,16 +91,21 @@ export function getConversation(versionId: string, conversationId: string): Prom
 
 /**
  * Loads one page of the conversation thread in ascending id order and keeps the
- * server pagination envelope (`next_cursor`/`has_more`). The history cursor must
- * come from here, never from the last live/optimistic message in the thread.
+ * server pagination envelope (`next_cursor`/`has_more`).
+ *
+ * API-8: with no cursor the endpoint returns the **latest** page; pass the
+ * oldest loaded id as `before` to walk backwards through history (the design's
+ * "首屏最新页" contract). `after` is kept for the legacy oldest-first P1
+ * envelope so already-loaded threads can still extend forwards.
  */
 export function listMessages(
   versionId: string,
   conversationId: string,
-  options: { after?: string; limit?: number } = {},
+  options: { before?: string; after?: string; limit?: number } = {},
 ): Promise<ApiPage<ConversationMessage>> {
   return apiGetPage<ConversationMessage>(
     `${conversationPath(versionId, conversationId)}/messages${query({
+      before: options.before,
       after: options.after,
       limit: options.limit ?? 100,
     })}`,
@@ -116,8 +124,145 @@ export function postMessage(
   )
 }
 
-/* -------------------------------- requirements ------------------------------ */
+/* ----------------------------- structured questions ------------------------ */
 
+/** `human_request.status` of a structured question (v0.22 R-B3-1). */
+export type QuestionStatus = "pending" | "answered" | "expired" | "cancelled"
+
+export type QuestionOption = {
+  id: string
+  label: string
+}
+
+/** One question inside a batch (`HumanQuestion.question` payload, R-B3-2). */
+export type QuestionItem = {
+  id: string
+  text: string
+  options: QuestionOption[]
+  multiple: boolean
+  allow_free_text: boolean
+  required: boolean
+  source_refs: string[]
+}
+
+/** One stored answer (`human_request.response.answers[]`). */
+export type QuestionAnswer = {
+  question_id: string
+  selected: string[]
+  text: string
+}
+
+/**
+ * v0.22 version-level decision kinds that share the `human_request` table with
+ * structured questions (R-W2-1). Re-exported from `question-kinds` so the pure
+ * kind guards survive tests that mock this transport module.
+ */
+export {
+  HUMAN_DECISION_KINDS,
+  type HumanDecisionKind,
+  isClarificationQuestionBatch,
+  isHumanDecisionKind,
+} from "./question-kinds"
+
+/**
+ * One structured-question batch (`GET /api/versions/{id}/questions`
+ * QuestionView). The payload comes from `human_request`, lazily expired by the
+ * backend, so a pending card survives a reload without local-only state.
+ *
+ * W2-2 extends the list with approval/blocked_recovery/conflict decision rows:
+ * they carry an empty `questions` array and their recorded decision/reason
+ * instead. `kind` separates the two shapes.
+ */
+export type QuestionBatch = {
+  id: string
+  version_id?: string
+  conversation_id?: string | null
+  message_id?: string | null
+  kind?: string
+  status: QuestionStatus
+  batch_id: string
+  questions: QuestionItem[]
+  expires_at: string
+  answers: QuestionAnswer[]
+  answered_by?: string | null
+  answered_at?: string | null
+  skipped?: boolean
+  /** Recorded decision of a v0.22 decision row (empty for questions). */
+  decision?: string
+  /** Recorded decision reason of a v0.22 decision row (empty for questions). */
+  reason?: string
+  created_at?: string
+}
+
+/** One answer typed in the card and sent with `onAnswer` for the echo. */
+export type QuestionAnswerInput = {
+  questionId: string
+  selected: string[]
+  text: string
+}
+
+/** A question card embedded in the conversation stream. */
+export type QuestionPart = {
+  type: "question"
+  question: QuestionBatch
+}
+
+/**
+ * The part payload the backend writes with `conversation_message(kind=question)`
+ * (`questionMessagePayload`): `{question_id, batch_id, questions, expires_at}`.
+ * Task 36/37 expose it through the conversation DTO; Task 24 renders it
+ * defensively from either this wire shape or an embedded `question` object.
+ */
+export type QuestionPartPayload = {
+  type: "question"
+  question?: QuestionBatch
+  question_id?: string
+  batch_id?: string
+  questions?: QuestionItem[]
+  expires_at?: string
+  status?: QuestionStatus
+  answers?: QuestionAnswer[]
+}
+
+/** Lists the version's structured questions (optionally one status). */
+export async function listQuestions(
+  versionId: string,
+  options: { status?: QuestionStatus; limit?: number } = {},
+): Promise<QuestionBatch[]> {
+  const page = await apiGetPage<QuestionBatch>(
+    `${versionPath(versionId)}/questions${query({
+      status: options.status,
+      limit: options.limit ?? 100,
+    })}`,
+  )
+  return page.items
+}
+
+/** Answers every question of one batch (`POST .../questions/{qid}/answer`). */
+export function answerQuestion(
+  versionId: string,
+  questionId: string,
+  answers: QuestionAnswer[],
+): Promise<QuestionBatch> {
+  return apiPost<QuestionBatch>(
+    `${versionPath(versionId)}/questions/${encodeURIComponent(questionId)}/answer`,
+    { answers },
+  )
+}
+
+/** Skips a pending batch (`POST .../questions/{qid}/skip` -> cancelled). */
+export function skipQuestion(
+  versionId: string,
+  questionId: string,
+  reason?: string,
+): Promise<QuestionBatch> {
+  return apiPost<QuestionBatch>(
+    `${versionPath(versionId)}/questions/${encodeURIComponent(questionId)}/skip`,
+    reason === undefined || reason === "" ? {} : { reason },
+  )
+}
+
+/* -------------------------------- requirements ------------------------------ */
 /** Lists requirements; the sidebar filters client-side, the API filter is optional. */
 export async function listRequirements(
   versionId: string,
@@ -261,6 +406,77 @@ export async function listRequirementRelations(
     `${requirementPath(versionId, requirementId)}/relations`,
   )
   return page.items
+}
+
+/* --------------------------- requirement extraction ------------------------ */
+
+function extractionPath(versionId: string, runId?: string): string {
+  const base = `${versionPath(versionId)}/requirements/extractions`
+  return runId === undefined ? base : `${base}/${encodeURIComponent(runId)}`
+}
+
+/**
+ * Reads the latest requirement extraction run of the version (API-5). The
+ * backend answers a typed 404 when the version has no run yet; the UI renders
+ * its empty state for that case instead of treating it as a load failure.
+ */
+export async function getRequirementExtraction(
+  versionId: string,
+  options: { attachmentId?: string } = {},
+): Promise<RequirementExtractionProgress | null> {
+  try {
+    return await apiGet<RequirementExtractionProgress>(
+      `${extractionPath(versionId)}${query({ attachment_id: options.attachmentId })}`,
+    )
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 404) return null
+    throw cause
+  }
+}
+
+/**
+ * Triggers/replays requirement extraction (API-6). Without `attachmentId` the
+ * backend starts every ready attachment of the version; replay is idempotent by
+ * (attachment_id, input_sha256), so "重新抽取" never duplicates a run.
+ */
+export function startRequirementExtraction(
+  versionId: string,
+  attachmentId?: string,
+): Promise<RequirementExtractionStartResult> {
+  const body =
+    attachmentId === undefined || attachmentId === "" ? {} : { attachment_id: attachmentId }
+  return apiPost<RequirementExtractionStartResult>(extractionPath(versionId), body)
+}
+
+/** Pauses a pending/running extraction run (API-7; typed 409 on wrong state). */
+export function pauseRequirementExtraction(
+  versionId: string,
+  runId: string,
+): Promise<RequirementExtractionProgress> {
+  return apiPost<RequirementExtractionProgress>(`${extractionPath(versionId, runId)}/pause`)
+}
+
+/** Resumes a paused extraction run (API-7). */
+export function resumeRequirementExtraction(
+  versionId: string,
+  runId: string,
+): Promise<RequirementExtractionProgress> {
+  return apiPost<RequirementExtractionProgress>(`${extractionPath(versionId, runId)}/resume`)
+}
+
+/**
+ * Retries a failed extraction run (API-7). With `segmentSeq` only that failed
+ * segment is reset; without it every failed segment gets a fresh attempt budget.
+ */
+export function retryRequirementExtraction(
+  versionId: string,
+  runId: string,
+  segmentSeq?: number,
+): Promise<RequirementExtractionProgress> {
+  return apiPost<RequirementExtractionProgress>(
+    `${extractionPath(versionId, runId)}/retry`,
+    segmentSeq === undefined ? undefined : { segment_seq: segmentSeq },
+  )
 }
 
 /* --------------------------------- team room -------------------------------- */

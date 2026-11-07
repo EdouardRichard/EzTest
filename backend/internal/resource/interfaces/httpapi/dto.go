@@ -103,6 +103,17 @@ type codeRepositoryDTO struct {
 	UpdatedAt string   `json:"updated_at"`
 }
 
+// sutRepositoryDTO is one API-17 SUT-level code-repository association.
+type sutRepositoryDTO struct {
+	ID         string            `json:"id"`
+	SUTID      string            `json:"sut_id"`
+	Repository codeRepositoryDTO `json:"repository"`
+	Role       string            `json:"role"`
+	Enabled    bool              `json:"enabled"`
+	CreatedAt  string            `json:"created_at"`
+	UpdatedAt  string            `json:"updated_at"`
+}
+
 func formatTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
@@ -246,6 +257,24 @@ func toCodeRepositoryDTO(view resourceapp.CodeRepositoryView) codeRepositoryDTO 
 		Status:    view.Status,
 		CreatedAt: formatTime(view.CreatedAt),
 		UpdatedAt: formatTime(view.UpdatedAt),
+	}
+}
+
+// sutRepositoryCreateRequest is the API-17 write payload.
+type sutRepositoryCreateRequest struct {
+	RepositoryID string `json:"repository_id"`
+	Role         string `json:"role"`
+}
+
+func toSUTRepositoryDTO(view resourceapp.SUTRepositoryView) sutRepositoryDTO {
+	return sutRepositoryDTO{
+		ID:         view.ID,
+		SUTID:      view.SUTID,
+		Repository: toCodeRepositoryDTO(view.Repository),
+		Role:       view.Role,
+		Enabled:    view.Enabled,
+		CreatedAt:  formatTime(view.CreatedAt),
+		UpdatedAt:  formatTime(view.UpdatedAt),
 	}
 }
 

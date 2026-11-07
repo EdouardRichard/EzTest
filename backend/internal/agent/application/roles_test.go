@@ -40,25 +40,20 @@ func TestRoleCatalogComplete(t *testing.T) {
 		vision    bool
 		reasoning bool
 	}
-	// The seven D19 keys, their spec §5.2 product names, executor kinds and
+	// The six converged role keys, their product names, executor kinds and
 	// model requirements.
 	want := []wantRole{
 		{agentapp.RoleAssistant, "测试助手", []string{agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases}, true, true},
-		{agentapp.RoleCaseAuthor, "用例编写员", []string{agent.WorkItemKindDesignCases}, false, true},
+		{agentapp.RoleCaseAuthor, "设计 Author", []string{agent.WorkItemKindDesignCases}, false, true},
 		{agentapp.RoleCaseReviewer, "用例评审员", []string{agent.WorkItemKindReviewCases}, false, true},
-		{agentapp.RoleExplorer, "探索者", []string{
-			agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage,
-			agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage,
-			agent.WorkItemKindExploreGap,
-		}, true, true},
 		{agentapp.RoleFailureAnalyst, "失败分析师", []string{agent.WorkItemKindAnalyzeFailure}, false, true},
 		{agentapp.RoleReportWriter, "报告撰写员", []string{agent.WorkItemKindReportVersion}, false, false},
 		{agentapp.RoleKnowledgeCurator, "知识维护员", []string{agent.WorkItemKindKnowledgePropose}, false, false},
 	}
 
 	catalog := agentapp.RoleCatalog()
-	if len(catalog) != 7 {
-		t.Fatalf("role catalog = %d roles, want 7", len(catalog))
+	if len(catalog) != 6 {
+		t.Fatalf("role catalog = %d roles, want 6", len(catalog))
 	}
 	keys := make([]agentapp.RoleKey, 0, len(catalog))
 	seenKeys := map[agentapp.RoleKey]bool{}
@@ -109,9 +104,9 @@ func TestRoleCatalogComplete(t *testing.T) {
 		if spec.Model.Reasoning != wantRole.reasoning {
 			t.Fatalf("role %q reasoning requirement = %v, want %v", spec.Key, spec.Model.Reasoning, wantRole.reasoning)
 		}
-		if spec.MaxTokens <= 0 || spec.RunSeconds <= 0 || spec.MaxTurnsFuse <= 0 {
-			t.Fatalf("role %q budget = {%d,%d,%d}, want positive defaults",
-				spec.Key, spec.MaxTokens, spec.RunSeconds, spec.MaxTurnsFuse)
+		if spec.RunSeconds <= 0 || spec.MaxTurnsFuse <= 0 {
+			t.Fatalf("role %q run guards = {%d,%d}, want positive defaults",
+				spec.Key, spec.RunSeconds, spec.MaxTurnsFuse)
 		}
 		if !strings.Contains(spec.SystemPrompt, "[role:"+string(spec.Key)+"]") {
 			t.Fatalf("role %q system prompt missing role marker: %s", spec.Key, spec.SystemPrompt)
@@ -157,7 +152,7 @@ func TestRoleCatalogComplete(t *testing.T) {
 	}
 
 	if _, ok := agentapp.Role(agentapp.RoleKey("case_executor")); ok {
-		t.Fatal("case_executor is not one of the seven D19 roles")
+		t.Fatal("case_executor is not one of the catalog roles")
 	}
 	if agentapp.ToolAllowed(agentapp.RoleKey("unknown"), tools.ToolContextVersionPack) {
 		t.Fatal("unknown role allowed a tool")
@@ -235,9 +230,6 @@ func TestRoleToolMatrix(t *testing.T) {
 		agentapp.RoleCaseReviewer: {
 			tools.ToolDesignReviewSubmit, tools.ToolDesignGraphRead,
 		},
-		agentapp.RoleExplorer: {
-			"explore.open", "explore.snapshot", tools.ToolCodeTree, tools.ToolSUTPagePropose,
-		},
 		agentapp.RoleFailureAnalyst: {
 			tools.ToolAnalysisFailureSubmit, tools.ToolExecutionResultRead, tools.ToolIssuePropose,
 		},
@@ -260,9 +252,6 @@ func TestRoleToolMatrix(t *testing.T) {
 		agentapp.RoleCaseReviewer: {
 			tools.ToolCaseGraphPropose, "execution.case_finish", "case.confirm",
 		},
-		agentapp.RoleExplorer: {
-			"browser.goto", "add_intent", "case.confirm", tools.ToolDesignReviewSubmit,
-		},
 		agentapp.RoleFailureAnalyst: {
 			"browser.goto", "execution.step_record", "case.confirm",
 		},
@@ -274,11 +263,12 @@ func TestRoleToolMatrix(t *testing.T) {
 		},
 	}
 
-	// Spec §5.4 default work-item budgets are frozen for every role.
+	// Spec §5.4 default work-item run guards are frozen for every role; the
+	// legacy token cap is telemetry-only metadata and was removed (Task 22).
 	for _, spec := range agentapp.RoleCatalog() {
-		if spec.MaxTokens != 20000 || spec.RunSeconds != 120 || spec.MaxTurnsFuse != 24 {
-			t.Fatalf("role %q budget = {%d,%d,%d}, want {20000,120,24}",
-				spec.Key, spec.MaxTokens, spec.RunSeconds, spec.MaxTurnsFuse)
+		if spec.RunSeconds != 120 || spec.MaxTurnsFuse != 24 {
+			t.Fatalf("role %q run guards = {%d,%d}, want {120,24}",
+				spec.Key, spec.RunSeconds, spec.MaxTurnsFuse)
 		}
 	}
 
@@ -350,18 +340,6 @@ func TestRoleToolMatrix(t *testing.T) {
 		t.Fatalf("allowed tool calls = %d, payload = %v", versionPack.calls, payload)
 	}
 
-	// Unknown names are also a typed failure; wildcard roles still let the
-	// registry reject a not-yet-registered explore tool instead of silently
-	// pretending it exists.
-	explorerTools, ok := agentapp.RoleToolSet(agentapp.RoleExplorer)
-	if !ok {
-		t.Fatal("explorer role tool set is missing")
-	}
-	_, err = explorerTools.Execute(context.Background(), registry, tools.Scope{}, "explore.unregistered", nil)
-	if !errors.As(err, &toolErr) || toolErr.Code != tools.CodeInvalidArgument {
-		t.Fatalf("unknown explore tool error = %v, want typed %q", err, tools.CodeInvalidArgument)
-	}
-
 	// A role guard records one audit event on denial (review focus 5), never
 	// the tool arguments, and delegates allowed calls.
 	audit := &fakeAuditRecorder{}
@@ -399,7 +377,6 @@ func TestRoleWorkItemMatrix(t *testing.T) {
 		agentapp.RoleAssistant:        {agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases},
 		agentapp.RoleCaseAuthor:       {agent.WorkItemKindDesignCases},
 		agentapp.RoleCaseReviewer:     {agent.WorkItemKindReviewCases},
-		agentapp.RoleExplorer:         {agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap},
 		agentapp.RoleFailureAnalyst:   {agent.WorkItemKindAnalyzeFailure},
 		agentapp.RoleReportWriter:     {agent.WorkItemKindReportVersion},
 		agentapp.RoleKnowledgeCurator: {agent.WorkItemKindKnowledgePropose},
@@ -407,10 +384,10 @@ func TestRoleWorkItemMatrix(t *testing.T) {
 
 	// Task 7's four-way creator matrix (dispatch.go actorMayCreate). A role may
 	// only request/execute kinds its creator is allowed to create; the role
-	// union must never exceed that matrix.
+	// union must never exceed that matrix. The planner actor no longer creates
+	// any kind after the explore.* removal.
 	actorKinds := map[string][]string{
 		agent.WorkItemCreatedByStateMachine: {agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases, agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion},
-		agent.WorkItemCreatedByPlanner:      {agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap},
 		agent.WorkItemCreatedByAssistant:    {agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases},
 		agent.WorkItemCreatedByTrigger:      {agent.WorkItemKindReportVersion, agent.WorkItemKindAnalyzeFailure, agent.WorkItemKindKnowledgePropose},
 	}
@@ -418,7 +395,6 @@ func TestRoleWorkItemMatrix(t *testing.T) {
 		agentapp.RoleAssistant:        agent.WorkItemCreatedByAssistant,
 		agentapp.RoleCaseAuthor:       agent.WorkItemCreatedByStateMachine,
 		agentapp.RoleCaseReviewer:     agent.WorkItemCreatedByStateMachine,
-		agentapp.RoleExplorer:         agent.WorkItemCreatedByPlanner,
 		agentapp.RoleFailureAnalyst:   agent.WorkItemCreatedByTrigger,
 		agentapp.RoleReportWriter:     agent.WorkItemCreatedByTrigger,
 		agentapp.RoleKnowledgeCurator: agent.WorkItemCreatedByTrigger,
@@ -453,11 +429,17 @@ func TestRoleWorkItemMatrix(t *testing.T) {
 			t.Fatalf("assistant RequestJob(%s): %v", kind, err)
 		}
 	}
-	for _, kind := range []string{agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion, agent.WorkItemKindExplorePage} {
+	for _, kind := range []string{agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion} {
 		if _, err := dispatcher.RequestJob(context.Background(), 42, kind, nil); err == nil {
 			t.Fatalf("assistant RequestJob(%s) succeeded, want forbidden", kind)
 		} else {
 			requirePlatformStatus(t, err, 403)
+		}
+	}
+	// The removed explore kinds are rejected before any stage check.
+	for _, kind := range []string{"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap"} {
+		if _, err := dispatcher.RequestJob(context.Background(), 42, kind, nil); err == nil {
+			t.Fatalf("assistant RequestJob(%s) succeeded, want forbidden/invalid", kind)
 		}
 	}
 	if got := repo.count(); got != len(want[agentapp.RoleAssistant]) {
@@ -471,6 +453,42 @@ func TestRoleWorkItemMatrix(t *testing.T) {
 			if agentapp.RoleAllowsWorkItemKind(role, kind) {
 				t.Fatalf("role %q allowed executor kind %q", role, kind)
 			}
+		}
+	}
+}
+
+// TestRoleCatalogRemovesDeadRolesKeepsExecutors pins the v0.22 D-B1 role
+// convergence (R-B1-1..R-B1-3): the Explorer role and the requirement-curator
+// mapping are gone, while the execution/analysis profiles (case_executor and
+// knowledge_curator included) are explicitly retained. Profile is the seed
+// lookup over Profiles(); it must never resolve a removed profile.
+func TestRoleCatalogRemovesDeadRolesKeepsExecutors(t *testing.T) {
+	if _, ok := agentapp.Role("explorer"); ok {
+		t.Fatal("explorer must be removed")
+	}
+	if _, ok := agentapp.Role("requirement_curator"); ok {
+		t.Fatal("requirement_curator must be removed")
+	}
+	if _, ok := agentapp.Profile(agentapp.ProfileKeyCaseExecutor); !ok {
+		t.Fatal("case_executor profile must remain")
+	}
+	if _, ok := agentapp.Profile(agentapp.ProfileKeyKnowledgeCurator); !ok {
+		t.Fatal("knowledge_curator profile must remain")
+	}
+}
+
+// TestExploreWorkItemKindsRemoved pins R-W1-5/D-B1: the five explore work item
+// kinds leave the 0.2.1 kind enum and its claim-default matrix. The server-side
+// P9 discovery pipeline stays, but no agent-facing explore kind is claimable.
+func TestExploreWorkItemKindsRemoved(t *testing.T) {
+	for _, kind := range []string{
+		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
+	} {
+		if agent.ValidWorkItemKind(kind) {
+			t.Fatalf("%s is still a valid work item kind", kind)
+		}
+		if _, _, ok := agent.ClaimDefaultsForKind(kind); ok {
+			t.Fatalf("%s still has claim defaults", kind)
 		}
 	}
 }
@@ -503,7 +521,7 @@ func TestAssistantCannotExecutor(t *testing.T) {
 
 	for _, kind := range []string{
 		agent.WorkItemKindExecuteBatch, agent.WorkItemKindReportVersion,
-		agent.WorkItemKindExplorePage, agent.WorkItemKindAnalyzeFailure,
+		"explore.page", agent.WorkItemKindAnalyzeFailure,
 		agent.WorkItemKindKnowledgePropose,
 	} {
 		if agentapp.RoleAllowsWorkItemKind(agentapp.RoleAssistant, kind) {

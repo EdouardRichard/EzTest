@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	qualityapp "github.com/EdouardRichard/EzTest/backend/internal/quality/application"
 	quality "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
@@ -15,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const runColumns = `id, mode, corpus_version, model, status, summary::text,
+const runColumns = `id, mode, corpus_version, model, status, summary::text, version_id,
 	started_at, finished_at, created_at`
 
 // Repository persists and reads eval_run/eval_metric rows.
@@ -46,10 +47,10 @@ func (r *Repository) Insert(ctx context.Context, run qualityapp.EvalRun, metrics
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO eval_run (id, mode, corpus_version, model, status, summary,
+		INSERT INTO eval_run (id, mode, corpus_version, model, status, summary, version_id,
 			started_at, finished_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $9)
-	`, run.ID, run.Mode, run.CorpusVersion, run.Model, run.Status, summary,
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $10)
+	`, run.ID, run.Mode, run.CorpusVersion, run.Model, run.Status, summary, run.VersionID,
 		run.StartedAt, run.FinishedAt, run.CreatedAt); err != nil {
 		return fmt.Errorf("insert eval run: %w", err)
 	}
@@ -166,6 +167,88 @@ func (r *Repository) Latest(ctx context.Context) (*qualityapp.EvalRun, error) {
 	return &run, nil
 }
 
+// LatestForVersion returns the newest run of one version, or (nil, nil) when the
+// version has no run yet.
+func (r *Repository) LatestForVersion(ctx context.Context, versionID int64) (*qualityapp.EvalRun, error) {
+	if r == nil || r.pool == nil {
+		return nil, errors.New("quality repository is not configured")
+	}
+	run, err := scanRun(r.pool.QueryRow(ctx,
+		`SELECT `+runColumns+` FROM eval_run WHERE version_id = $1
+		 ORDER BY created_at DESC, id DESC LIMIT 1`, versionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("latest eval run for version: %w", err)
+	}
+	byRun, err := r.metricsForRuns(ctx, []int64{run.ID})
+	if err != nil {
+		return nil, err
+	}
+	run.Metrics = byRun[run.ID]
+	if run.Metrics == nil {
+		run.Metrics = []quality.Metric{}
+	}
+	return &run, nil
+}
+
+// Trends returns one metric series of one version ordered oldest first. A zero
+// from/to bound is unbounded, so the caller can ask for the whole series.
+func (r *Repository) Trends(ctx context.Context, versionID int64, metric string, from, to time.Time) ([]qualityapp.TrendPoint, error) {
+	if r == nil || r.pool == nil {
+		return nil, errors.New("quality repository is not configured")
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT r.id, r.version_id, r.mode, r.status, r.created_at,
+			m.name, m.value::float8, m.threshold::float8, m.passed, m.detail::text
+		FROM eval_metric m
+		JOIN eval_run r ON r.id = m.run_id
+		WHERE r.version_id = $1 AND m.name = $2
+			AND ($3::timestamptz IS NULL OR r.created_at >= $3)
+			AND ($4::timestamptz IS NULL OR r.created_at <= $4)
+		ORDER BY r.created_at ASC, r.id ASC
+	`, versionID, metric, nullableTime(from), nullableTime(to))
+	if err != nil {
+		return nil, fmt.Errorf("list eval trends: %w", err)
+	}
+	defer rows.Close()
+
+	points := make([]qualityapp.TrendPoint, 0)
+	for rows.Next() {
+		var point qualityapp.TrendPoint
+		var detail string
+		if err := rows.Scan(&point.RunID, &point.VersionID, &point.Mode, &point.Status,
+			&point.CreatedAt, &point.Metric, &point.Value, &point.Threshold, &point.Passed,
+			&detail); err != nil {
+			return nil, fmt.Errorf("scan eval trend: %w", err)
+		}
+		if detail != "" {
+			var decoded quality.MetricDetail
+			if err := json.Unmarshal([]byte(detail), &decoded); err != nil {
+				return nil, fmt.Errorf("decode eval trend detail: %w", err)
+			}
+			point.Baseline = decoded.Baseline
+			point.Regressed = decoded.Regressed
+		}
+		points = append(points, point)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list eval trends: %w", err)
+	}
+	return points, nil
+}
+
+// nullableTime maps a zero time to SQL NULL so the query can treat the bound as
+// unbounded without a separate SQL statement.
+func nullableTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	utc := value.UTC()
+	return &utc
+}
+
 func (r *Repository) metricsForRuns(ctx context.Context, runIDs []int64) (map[int64][]quality.Metric, error) {
 	metrics := make(map[int64][]quality.Metric, len(runIDs))
 	if len(runIDs) == 0 {
@@ -213,7 +296,7 @@ func scanRun(row rowScanner) (qualityapp.EvalRun, error) {
 	var run qualityapp.EvalRun
 	var summary string
 	if err := row.Scan(&run.ID, &run.Mode, &run.CorpusVersion, &run.Model, &run.Status,
-		&summary, &run.StartedAt, &run.FinishedAt, &run.CreatedAt); err != nil {
+		&summary, &run.VersionID, &run.StartedAt, &run.FinishedAt, &run.CreatedAt); err != nil {
 		return qualityapp.EvalRun{}, err
 	}
 	run.Summary = map[string]any{}

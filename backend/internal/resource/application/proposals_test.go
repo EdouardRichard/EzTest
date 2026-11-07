@@ -257,6 +257,85 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 	}
 }
 
+// TestFindPageByRouteTemplateMatchesEveryStatus covers the W1-12 catalog lookup
+// key: (environment_id, route_template), independent of status and trailing
+// slash, without going through the normalized_url dedupe path.
+func TestFindPageByRouteTemplateMatchesEveryStatus(t *testing.T) {
+	h := newHarness()
+	seedProposalEnvironment(h)
+	approved, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+		Name: "Orders", URL: "https://staging.example.test/orders", RouteTemplate: "/orders",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreatePage: %v", err)
+	}
+	proposed, err := h.svc.CreateProposedPage(context.Background(), ProposedPageInput{
+		EnvironmentID: 1002, Name: "Cart", URL: "https://staging.example.test/cart", RouteTemplate: "/cart",
+	})
+	if err != nil {
+		t.Fatalf("CreateProposedPage: %v", err)
+	}
+
+	found, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/orders")
+	if err != nil || !ok || found.ID != approved.ID || found.Status != resource.PageStatusApproved {
+		t.Fatalf("approved lookup = %+v ok=%v err=%v", found, ok, err)
+	}
+	// A trailing slash is the same route key.
+	found, ok, err = h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/orders/")
+	if err != nil || !ok || found.ID != approved.ID {
+		t.Fatalf("trailing-slash lookup = %+v ok=%v err=%v", found, ok, err)
+	}
+	found, ok, err = h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/cart")
+	if err != nil || !ok || found.ID != proposed.ID || found.Status != resource.PageStatusProposed {
+		t.Fatalf("proposed lookup = %+v ok=%v err=%v", found, ok, err)
+	}
+	if _, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/missing"); err != nil || ok {
+		t.Fatalf("missing lookup ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), 9999, "/orders"); err != nil || ok {
+		t.Fatalf("other environment lookup ok=%v err=%v", ok, err)
+	}
+}
+
+// TestFindAPIByTemplateMatchesMethodPathAndStatus covers the W1-12 API catalog
+// key: (environment_id, method, path_template), every status, trailing slash.
+func TestFindAPIByTemplateMatchesMethodPathAndStatus(t *testing.T) {
+	h := newHarness()
+	seedProposalEnvironment(h)
+	approved, err := h.svc.CreateAPI(context.Background(), 1002, APIInput{
+		Method: "GET", PathTemplate: "/api/orders", Name: "Orders",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateAPI: %v", err)
+	}
+	proposed, err := h.svc.CreateProposedAPI(context.Background(), ProposedAPIInput{
+		EnvironmentID: 1002, Method: "POST", PathTemplate: "/api/refund", Name: "Refund",
+	})
+	if err != nil {
+		t.Fatalf("CreateProposedAPI: %v", err)
+	}
+
+	found, ok, err := h.svc.FindAPIByTemplate(context.Background(), 1002, "get", "/api/orders")
+	if err != nil || !ok || found.ID != approved.ID || found.Status != resource.APIStatusApproved {
+		t.Fatalf("approved lookup = %+v ok=%v err=%v", found, ok, err)
+	}
+	found, ok, err = h.svc.FindAPIByTemplate(context.Background(), 1002, "GET", "/api/orders/")
+	if err != nil || !ok || found.ID != approved.ID {
+		t.Fatalf("trailing-slash lookup = %+v ok=%v err=%v", found, ok, err)
+	}
+	found, ok, err = h.svc.FindAPIByTemplate(context.Background(), 1002, "POST", "/api/refund")
+	if err != nil || !ok || found.ID != proposed.ID || found.Status != resource.APIStatusProposed {
+		t.Fatalf("proposed lookup = %+v ok=%v err=%v", found, ok, err)
+	}
+	// A different method on the same path is a different endpoint.
+	if _, ok, err := h.svc.FindAPIByTemplate(context.Background(), 1002, "DELETE", "/api/orders"); err != nil || ok {
+		t.Fatalf("method mismatch ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := h.svc.FindAPIByTemplate(context.Background(), 9999, "GET", "/api/orders"); err != nil || ok {
+		t.Fatalf("other environment ok=%v err=%v", ok, err)
+	}
+}
+
 func TestProposedRouteTemplateBounds(t *testing.T) {
 	h := newHarness()
 	seedProposalEnvironment(h)

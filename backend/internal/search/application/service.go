@@ -15,6 +15,17 @@ import (
 type Service struct {
 	providers map[string]Provider
 	titles    VersionTitleReader
+	limits    LimitReader
+}
+
+// SettingMaxResultsPerType is the catalog key that supplies the default per-type
+// limit when the request omits one.
+const SettingMaxResultsPerType = "search.max_results_per_type"
+
+// LimitReader is the narrow settings-center port the search service needs. It is
+// satisfied by settingsapp.Service; a nil reader keeps the frozen default.
+type LimitReader interface {
+	Int(ctx context.Context, key string) (int64, error)
 }
 
 // NewService wires the five search-type providers.
@@ -39,6 +50,15 @@ func (s *Service) WithVersionTitles(titles VersionTitleReader) *Service {
 	return s
 }
 
+// SetLimits wires the settings-center reader for the default per-type limit.
+// The runner keeps the catalog fallback when the reader is nil or a read fails.
+func (s *Service) SetLimits(limits LimitReader) *Service {
+	if s != nil {
+		s.limits = limits
+	}
+	return s
+}
+
 // Search validates the request, queries each requested type exactly once and
 // assembles the canonical group order. A provider failure only empties its own
 // group and sets degraded=true: the healthy groups are still returned and a
@@ -54,6 +74,9 @@ func (s *Service) Search(ctx context.Context, q string, types []string, limit in
 	requested, err := NormalizeTypes(types)
 	if err != nil {
 		return Snapshot{}, err
+	}
+	if limit == 0 {
+		limit = s.defaultLimit(ctx)
 	}
 	perTypeLimit, err := NormalizeLimit(limit)
 	if err != nil {
@@ -201,6 +224,30 @@ func NormalizeTypes(types []string) ([]string, error) {
 		}
 	}
 	return ordered, nil
+}
+
+// defaultLimit resolves search.max_results_per_type for a request that did not
+// specify one. An unreadable value falls back to the frozen DefaultLimit; the
+// configured value is clamped into the documented per-type range.
+func (s *Service) defaultLimit(ctx context.Context) int {
+	if s == nil || s.limits == nil {
+		return DefaultLimit
+	}
+	value, err := s.limits.Int(ctx, SettingMaxResultsPerType)
+	if err != nil {
+		return DefaultLimit
+	}
+	return clampLimit(int(value))
+}
+
+func clampLimit(limit int) int {
+	if limit < MinLimit {
+		return MinLimit
+	}
+	if limit > MaxLimit {
+		return MaxLimit
+	}
+	return limit
 }
 
 // NormalizeLimit applies the documented per-type bounds: zero selects the

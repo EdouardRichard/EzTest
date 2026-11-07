@@ -161,9 +161,14 @@ func (t *confirmationTx) ConfirmCaseVersion(ctx context.Context, command design.
 	}
 	tag, err := t.tx.Exec(ctx, `
 		UPDATE case_version
-		SET status = 'confirmed', updated_at = $2
+		SET status = 'confirmed',
+		    updated_at = $2,
+		    trigger = COALESCE(NULLIF($3, ''), trigger),
+		    source_observation_id = COALESCE($4, source_observation_id),
+		    auto_confirmed_by = COALESCE(NULLIF($5, ''), auto_confirmed_by)
 		WHERE id = $1 AND status = 'draft'
-	`, confirmation.CaseVersionID, at)
+	`, confirmation.CaseVersionID, at, confirmation.Trigger,
+		confirmation.SourceObservationID, confirmation.AutoConfirmedBy)
 	if err != nil {
 		return fmt.Errorf("confirm case version: %w", err)
 	}
@@ -187,6 +192,12 @@ func (t *confirmationTx) ConfirmCaseVersion(ctx context.Context, command design.
 		return fmt.Errorf("project case entity status: %w", err)
 	}
 
+	return insertConfirmation(ctx, t.tx, confirmation)
+}
+
+// insertConfirmation writes one append-only confirmation row, including the
+// discovery auto-confirmation audit columns (spec DB-30).
+func insertConfirmation(ctx context.Context, tx pgx.Tx, confirmation design.Confirmation) error {
 	affected, err := encodeIDStrings(confirmation.AffectedCaseVersionIDs)
 	if err != nil {
 		return err
@@ -199,14 +210,20 @@ func (t *confirmationTx) ConfirmCaseVersion(ctx context.Context, command design.
 	if err != nil {
 		return fmt.Errorf("encode confirmation snapshot: %w", err)
 	}
-	if _, err := t.tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO case_confirmation (
 			id, case_version_id, scope, target_scope_id, batch_id, affected_case_version_ids,
-			snapshot, confirmed_by, confirmed_at, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$9,$9)
+			snapshot, confirmed_by, confirmed_at,
+			auto_confirmed, auto_confirmed_by, trigger, source_observation_id,
+			created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,
+		          $10, NULLIF($11, ''), COALESCE(NULLIF($12, ''), 'manual'), $13,
+		          $9,$9)
 	`, confirmation.ID, confirmation.CaseVersionID, confirmation.Scope,
 		confirmation.TargetScopeID, confirmation.BatchID, string(affected),
-		string(snapshotJSON), confirmation.ConfirmedBy, confirmation.ConfirmedAt); err != nil {
+		string(snapshotJSON), confirmation.ConfirmedBy, confirmation.ConfirmedAt,
+		confirmation.AutoConfirmed, confirmation.AutoConfirmedBy, confirmation.Trigger,
+		confirmation.SourceObservationID); err != nil {
 		return fmt.Errorf("insert case confirmation: %w", err)
 	}
 	return nil

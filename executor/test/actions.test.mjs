@@ -284,6 +284,94 @@ test("snapshot honours max_chars and marks truncation", async () => {
   })
 })
 
+test("upload_file sets local files on a file input", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const png = Buffer.from("89504e470d0a1a0a0000000d4948445200000001", "hex")
+    const response = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload" },
+      files: [{ name: "pic.png", mime: "image/png", base64: png.toString("base64") }],
+    })
+    assert.equal(response.ok, true, JSON.stringify(response.error))
+    assert.deepEqual(response.result.files, ["pic.png"])
+    assert.equal(response.result.bytes, png.length)
+    const snap = await act(context.contextId, "snapshot")
+    assert.match(snap.result.aria, /uploaded:pic\.png/)
+  })
+})
+
+test("upload_file sets files on a hidden file input", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const response = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload-hidden" },
+      files: [{ name: "hidden.png", mime: "image/png", base64: Buffer.from("89504e470d0a1a0a").toString("base64") }],
+    })
+    assert.equal(response.ok, true, JSON.stringify(response.error))
+    assert.deepEqual(response.result.files, ["hidden.png"])
+    const snap = await act(context.contextId, "snapshot")
+    assert.match(snap.result.aria, /uploaded:hidden\.png/)
+  })
+})
+
+test("upload_file drives a button that opens the native file chooser", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const response = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload-trigger" },
+      files: [{ name: "chooser.png", mime: "image/png", base64: Buffer.from("89504e470d0a1a0a").toString("base64") }],
+    })
+    assert.equal(response.ok, true, JSON.stringify(response.error))
+    assert.deepEqual(response.result.files, ["chooser.png"])
+    const snap = await act(context.contextId, "snapshot")
+    assert.match(snap.result.aria, /uploaded:chooser\.png/)
+  })
+})
+
+test("upload_file rejects missing files, path names and oversized payloads", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const noFiles = await act(context.contextId, "upload_file", { target: { selector: "#upload" } })
+    assert.equal(noFiles.ok, false)
+    assert.equal(noFiles.error.code, "invalid_arguments")
+
+    const traversal = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload" },
+      files: [{ name: "../evil.png", mime: "image/png", base64: "AA==" }],
+    })
+    assert.equal(traversal.ok, false)
+    assert.equal(traversal.error.code, "invalid_arguments")
+
+    const oversize = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload" },
+      files: [{ name: "big.bin", mime: "application/octet-stream", base64: "A".repeat(14 * 1024 * 1024) }],
+    })
+    assert.equal(oversize.ok, false)
+    assert.equal(oversize.error.code, "invalid_arguments")
+  })
+})
+
+test("set_viewport resizes the live page", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const response = await act(context.contextId, "set_viewport", { width: 390, height: 844 })
+    assert.equal(response.ok, true, JSON.stringify(response.error))
+    assert.deepEqual(response.result.pageViewport, { width: 390, height: 844 })
+  })
+})
+
+test("set_viewport rejects out-of-range sizes", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const tooSmall = await act(context.contextId, "set_viewport", { width: 100, height: 100 })
+    assert.equal(tooSmall.ok, false)
+    assert.equal(tooSmall.error.code, "invalid_arguments")
+    const tooLarge = await act(context.contextId, "set_viewport", { width: 5000, height: 844 })
+    assert.equal(tooLarge.ok, false)
+    assert.equal(tooLarge.error.code, "invalid_arguments")
+  })
+})
+
 test("click resolves role, text, test_id and selector targets", async () => {
   await withContext(async (context) => {
     const cases = [
@@ -476,7 +564,7 @@ test("console keeps a bounded tail of page messages", async () => {
   })
 })
 
-test("network records method, url, status, duration and mime", async () => {
+test("network records method, url, status, duration, mime and resource_type", async () => {
   await withContext(async (context) => {
     await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
     const response = await act(context.contextId, "network", { tail: 50 })
@@ -487,6 +575,12 @@ test("network records method, url, status, duration and mime", async () => {
     assert.equal(home.status, 200)
     assert.match(home.mime, /text\/html/)
     assert.equal(typeof home.duration_ms, "number")
+    // Playwright resource semantics let the Go discovery capture discriminate
+    // page (document) from api (xhr/fetch) and filter static resources (R-EX-2).
+    assert.equal(home.resource_type, "document")
+    for (const item of response.result.items) {
+      assert.equal(typeof item.resource_type, "string", JSON.stringify(item))
+    }
   })
 })
 

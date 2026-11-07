@@ -272,3 +272,146 @@ func TestListReconcilableIncludesKind(t *testing.T) {
 		t.Fatalf("design row = %#v", got)
 	}
 }
+
+// TestConversationSummaryWatermarkAndCompactionMeta covers the v0.22 R-A5-12
+// persistence contract (Task 36 fix round 1): the covered_message_id watermark,
+// the compaction id/meta and the monotonic guard of the real PostgreSQL store.
+func TestConversationSummaryWatermarkAndCompactionMeta(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewConversationRepository(pool, ids)
+	versionRepo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 42)
+	if err := versionRepo.Create(ctx, v, sampleBindings(ids, v.ID)); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	conversation := version.Conversation{
+		ID: ids.Next(), VersionID: v.ID, Kind: "clarification", Title: "Chat",
+		Status: version.ConversationActive, CreatedAt: testTime, UpdatedAt: testTime,
+	}
+	if err := repo.Create(ctx, conversation); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	first, err := repo.SaveSummary(ctx, version.ConversationSummary{
+		ConversationID: conversation.ID, Summary: "summary one", PinnedFacts: []string{"fact"},
+		TokenEstimate: 3, CoveredMessageID: 100, CompactionID: "compaction-1",
+		SummaryMeta: map[string]any{"trigger": "pressure"}, UpdatedAt: testTime,
+	})
+	if err != nil {
+		t.Fatalf("SaveSummary(first): %v", err)
+	}
+	if first.Version != 1 || first.CoveredMessageID != 100 || first.CompactionID != "compaction-1" {
+		t.Fatalf("first summary = %#v", first)
+	}
+	second, err := repo.SaveSummary(ctx, version.ConversationSummary{
+		ConversationID: conversation.ID, Summary: "summary two",
+		TokenEstimate: 3, CoveredMessageID: 150, CompactionID: "compaction-2",
+		SummaryMeta: map[string]any{"trigger": "overflow"}, UpdatedAt: testTime,
+	})
+	if err != nil {
+		t.Fatalf("SaveSummary(second): %v", err)
+	}
+	if second.Version != 2 || second.CoveredMessageID != 150 {
+		t.Fatalf("second summary = %#v", second)
+	}
+	if _, err := repo.SaveSummary(ctx, version.ConversationSummary{
+		ConversationID: conversation.ID, Summary: "stale", TokenEstimate: 3,
+		CoveredMessageID: 120, UpdatedAt: testTime,
+	}); !errors.Is(err, version.ErrSummaryWatermarkStale) {
+		t.Fatalf("stale watermark error = %v, want ErrSummaryWatermarkStale", err)
+	}
+	latest, err := repo.Summary(ctx, conversation.ID)
+	if err != nil || latest == nil {
+		t.Fatalf("Summary: %#v, %v", latest, err)
+	}
+	if latest.Version != 2 || latest.Summary != "summary two" || latest.CoveredMessageID != 150 ||
+		latest.CompactionID != "compaction-2" || latest.SummaryMeta["trigger"] != "overflow" {
+		t.Fatalf("latest summary = %#v", latest)
+	}
+}
+
+// TestConversationQuestionAndJobCardSnapshotRead is the Critical 1 PostgreSQL
+// regression: the persisted question card snapshot and a subsequent job-card
+// message both read back through the version domain (the pre-fix direct INSERT
+// of `question_card` corrupted the read path).
+func TestConversationQuestionAndJobCardSnapshotRead(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewConversationRepository(pool, ids)
+	versionRepo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 42)
+	if err := versionRepo.Create(ctx, v, sampleBindings(ids, v.ID)); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	conversation := version.Conversation{
+		ID: ids.Next(), VersionID: v.ID, Kind: "clarification", Title: "Chat",
+		Status: version.ConversationActive, CreatedAt: testTime, UpdatedAt: testTime,
+	}
+	if err := repo.Create(ctx, conversation); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	const runID = int64(701)
+	if err := repo.AcquireWriter(ctx, conversation.ID, runID, "clarification_host", testTime, testTime.Add(time.Minute)); err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+	question := version.MessagePart{
+		Type: version.MessagePartQuestion,
+		Question: json.RawMessage(`{"question_id":"9001","batch_id":"qb-9001",` +
+			`"questions":[{"id":"q1","text":"Which login method?"}],"expires_at":"2026-11-06T08:00:00Z"}`),
+	}
+	clientID := "question-ask:9001"
+	runIDValue := runID
+	message := version.Message{
+		ID: ids.Next(), ConversationID: conversation.ID, Role: version.MessageRoleAssistant,
+		Parts: []version.MessagePart{question}, Kind: version.MessageKindQuestion,
+		ClientMessageID: &clientID, AgentRunID: &runIDValue, AuthorAgent: "clarification_host",
+		CreatedAt: testTime,
+	}
+	if _, created, err := repo.AppendAssistantMessageAsWriter(ctx, conversation.ID, message, runID,
+		"clarification_host", testTime, testTime.Add(time.Minute)); err != nil || !created {
+		t.Fatalf("append question card = %v/%v", created, err)
+	}
+	// A later job card message in the same conversation must stay readable too.
+	jobCard := version.MessagePart{
+		Type: version.MessagePartJobCard, JobID: 9001, JobKind: "chat.turn", Status: "done",
+	}
+	cardMessage := version.Message{
+		ID: ids.Next(), ConversationID: conversation.ID, Role: version.MessageRoleAssistant,
+		Parts: []version.MessagePart{jobCard}, Kind: version.MessageKindArtifact, CreatedAt: testTime,
+	}
+	if err := repo.AppendAssistantMessage(ctx, conversation.ID, cardMessage); err != nil {
+		t.Fatalf("append job card: %v", err)
+	}
+
+	messages, err := repo.Messages(ctx, conversation.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	var questionRead, cardRead bool
+	for _, stored := range messages {
+		if stored.Kind == version.MessageKindQuestion {
+			if len(stored.Parts) != 1 || stored.Parts[0].Type != version.MessagePartQuestion ||
+				!strings.Contains(string(stored.Parts[0].Question), `"question_id":"9001"`) {
+				t.Fatalf("question card read = %#v", stored)
+			}
+			questionRead = true
+		}
+		if len(stored.Parts) == 1 && stored.Parts[0].Type == version.MessagePartJobCard {
+			if stored.Parts[0].JobID != 9001 {
+				t.Fatalf("job card read = %#v", stored.Parts[0])
+			}
+			cardRead = true
+		}
+	}
+	if !questionRead || !cardRead {
+		t.Fatalf("question/job card read = %v/%v", questionRead, cardRead)
+	}
+}

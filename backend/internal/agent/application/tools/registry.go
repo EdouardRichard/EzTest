@@ -44,6 +44,15 @@ const (
 	ToolAttachmentImageRef         = "attachment.image_ref"
 	ToolSUTList                    = "sut.list"
 	ToolSUTPageList                = "sut.page_list"
+	// ToolSUTDatabaseList is the v0.22 E-1 read-only database inventory
+	// (R-E1-2). It is additive: the frozen P1 registration order above does not
+	// include it; resources.go registers it through RegisterP4ToolGroup when the
+	// resource port also implements the DatabaseLister surface.
+	ToolSUTDatabaseList = "sut.database_list"
+	// ToolToolResultRead is the v0.22 A-6 continuation tool (R-A6-1). It is
+	// registered by NewP7Registry only when the content-store port is wired;
+	// the frozen P1 registration order above is unchanged.
+	ToolToolResultRead = "tool_result.read"
 )
 
 // p1ToolNames is the frozen P1 registration order.
@@ -97,6 +106,12 @@ type Scope struct {
 	CloseRound           int32
 	ReportRevisionID     int64
 	PredicateFingerprint string
+	// Extraction is the v0.22 A-7 deterministic extraction context of one
+	// requirement.extraction_emit call (spec R-A7-2/4/5). The extraction worker
+	// (Task 17/18) injects it out of band; it is never part of a tool schema.
+	// SegmentText is the exact chunk the model was shown and is the only
+	// accepted source of source_quote substrings.
+	Extraction ExtractionScope
 }
 
 // Tool is one scoped, schema-described agent tool.
@@ -108,21 +123,36 @@ type Tool interface {
 }
 
 // Error is a structured business failure returned to the model as
-// {"error":{"code","message","details"}}. Internal failures are plain errors
-// and fail the run.
+// {"error":{"code","message","retryable","field","allowed","hint","details"}}.
+// Internal failures are plain errors and fail the run.
+//
+// Retryable reports whether the same call can plausibly succeed on a retry.
+// Field-level corrections (invalid_argument) are retryable because the model can
+// fix the arguments; stale-revision conflicts are not blindly retryable and must
+// re-read the current revision first. Field/Allowed/Hint carry the v0.22 E-1
+// self-description contract (spec R-E1-3): the exact JSON path, the legal enum
+// values and the next action the model should take. They are also mirrored into
+// Details for older consumers (the frontend cards read both shapes).
 type Error struct {
-	Code    string
-	Message string
-	Details map[string]any
+	Code      string
+	Message   string
+	Retryable bool
+	Field     string
+	Allowed   []string
+	Hint      string
+	Details   map[string]any
+	// Cause is an optional sentinel wrapped by this tool error. It lets callers
+	// classify a failure with errors.Is while still receiving the typed
+	// invalid_argument shape (for example ErrSourceQuoteNotFound on
+	// requirement.extraction_emit). It is never rendered into Payload.
+	Cause error
 }
 
 // Error implements error.
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
-// NewError builds a structured tool error.
-func NewError(code, message string) *Error {
-	return &Error{Code: code, Message: message}
-}
+// Unwrap returns the optional classification sentinel.
+func (e *Error) Unwrap() error { return e.Cause }
 
 // Invalid builds an invalid_argument tool error for one field.
 func Invalid(field, message string) *Error {
@@ -130,6 +160,25 @@ func Invalid(field, message string) *Error {
 	if field != "" {
 		err.Details = map[string]any{"field": field}
 	}
+	return err
+}
+
+// InvalidField builds a retryable field-level invalid_argument error (v0.22
+// R-E1-3). The model can fix the named argument and retry the same call.
+func InvalidField(field, message string) *Error {
+	err := Invalid(field, message)
+	err.Retryable = true
+	err.Field = field
+	return err
+}
+
+// InvalidWithAllowed builds a retryable field-level invalid_argument error that
+// also names the accepted values and the next action. Used by the self-describing
+// case.graph_propose contract for enums, database ids and unknown fields.
+func InvalidWithAllowed(field, message string, allowed []string, hint string) *Error {
+	err := InvalidField(field, message)
+	err.Allowed = append([]string(nil), allowed...)
+	err.Hint = hint
 	return err
 }
 
@@ -143,19 +192,35 @@ func StateConflict(message string) *Error {
 	return &Error{Code: CodeStateConflict, Message: message}
 }
 
-// Payload renders the error in the shared tool result shape.
+// Payload renders the error in the shared tool result shape. The v0.22 E-1
+// contract exposes code/message/retryable/field/allowed/hint at the top level
+// and mirrors field/allowed/hint into details so both the new frontend cards and
+// older readers (which only look at details) see the same correction data.
 func (e *Error) Payload() map[string]any {
-	details := e.Details
-	if details == nil {
-		details = map[string]any{}
+	details := make(map[string]any, len(e.Details)+3)
+	for key, value := range e.Details {
+		details[key] = value
 	}
-	return map[string]any{
-		"error": map[string]any{
-			"code":    e.Code,
-			"message": e.Message,
-			"details": details,
-		},
+	body := map[string]any{
+		"code":      e.Code,
+		"message":   e.Message,
+		"retryable": e.Retryable,
+		"details":   details,
 	}
+	if e.Field != "" {
+		details["field"] = e.Field
+		body["field"] = e.Field
+	}
+	if len(e.Allowed) > 0 {
+		allowed := append([]string(nil), e.Allowed...)
+		details["allowed"] = allowed
+		body["allowed"] = allowed
+	}
+	if e.Hint != "" {
+		details["hint"] = e.Hint
+		body["hint"] = e.Hint
+	}
+	return map[string]any{"error": body}
 }
 
 // Registry is the immutable set of registered tools.
@@ -259,6 +324,56 @@ type Deps struct {
 	// P7 is the additive P7 knowledge tool surface. It is nested so the frozen
 	// P1–P6 Deps fields stay unchanged; a zero value disables the P7 tools.
 	P7 P7Deps
+	// Completion is the additive v0.22 task.complete surface (spec R-A3). It is
+	// nested so the frozen P1–P7 Deps fields stay unchanged. The composition
+	// root fills it per run (Task 36) and registers TaskCompleteTools through
+	// RegisterP4ToolGroup; a zero value leaves task.complete unregistered.
+	Completion CompletionDeps
+	// ToolResult is the additive v0.22 A-6 tool-result governance surface
+	// (R-A6-1..R-A6-5). The composition root fills it per run (Task 36); a nil
+	// Content leaves tool_result.read unregistered and a nil Settings falls
+	// back to the catalog default threshold.
+	ToolResult ToolResultDeps
+	// Extraction is the additive v0.22 A-7 deterministic requirement extraction
+	// surface (R-A7-4/R-A7-5). A nil Sink leaves requirement.extraction_emit
+	// unregistered; the extraction worker (Task 17/18) wires the requirement
+	// draft/upsert sink. It is nested so the frozen P1-P7 Deps fields stay
+	// unchanged.
+	Extraction ExtractionDeps
+}
+
+// ExtractionDeps is the per-run wiring of the v0.22 A-7 deterministic
+// requirement extraction tool. A nil Sink leaves requirement.extraction_emit
+// unregistered: the additive tool group is evaluated on every registry build
+// (P4 and later compose it), and the extraction worker (Task 17/18) supplies the
+// requirement draft/upsert sink. It is never half-wired.
+type ExtractionDeps struct {
+	Sink ExtractionSink
+}
+
+// registerExtractionToolGroup appends the extraction tool only when its sink is
+// wired. It uses the additive P4 tool-group mechanism from registry.go so the
+// frozen P1-P7 registration sets are not edited by this task; NewP4Registry and
+// every later composition (P5-P7, the runtime registry) evaluate it.
+func init() {
+	RegisterP4ToolGroup(func(deps Deps) []Tool {
+		if deps.Extraction.Sink == nil {
+			return nil
+		}
+		return []Tool{NewExtractionEmitTool(deps.Extraction.Sink)}
+	})
+}
+
+// CompletionDeps is the per-run wiring of the task.complete tool: the
+// server-side Validator selects the completion criterion by task type and
+// resolves the single verified target plan item, and the CompletionWriter
+// persists that verified completion. Both must be present for the tool to be
+// registered; a nil writer would let a forged declaration end the run without
+// the plan/fact write, so the tool is never half-wired. Validators whose reader
+// is not wired fail closed with an internal missing-dependency error.
+type CompletionDeps struct {
+	Validator Validator
+	Writer    CompletionWriter
 }
 
 // RequirementSummary is one requirement row shown to the model.
@@ -372,11 +487,6 @@ type ResourcePage struct {
 type ResourcePort interface {
 	ListSUTs(ctx context.Context, versionID int64) ([]SUTSummary, error)
 	ListPages(ctx context.Context, versionID, versionSUTID int64) ([]ResourcePage, error)
-}
-
-// NewP1Registry registers exactly the P1 tool set (spec §5.5).
-func NewP1Registry(deps Deps) *Registry {
-	return NewRegistry(p1Tools(deps)...)
 }
 
 // NewP2Registry registers the frozen P1 tool set plus the P2 design tools.

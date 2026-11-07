@@ -242,7 +242,7 @@ func TestConfigThinkingSettings(t *testing.T) {
 	}
 
 	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
-		Model: "thinking-model", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true,
+		Model: "thinking-model", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true, SupportsVision: true,
 	}, 1)
 	if err != nil {
 		t.Fatalf("AddModel: %v", err)
@@ -603,5 +603,126 @@ func TestDeprecatedModelExcluded(t *testing.T) {
 	}
 	if retired != 1 || live != 1 {
 		t.Fatalf("refreshed models = %#v", refreshed)
+	}
+}
+
+// createVisionDefaultConfig creates a configuration whose default model is the
+// vision-capable model "vision-llm", the state the irreversibility guards must
+// protect.
+func createVisionDefaultConfig(t *testing.T, svc *Service, repo *fakeRepo) (llm.Config, llm.Model) {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "vision-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsVision: true,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel: %v", err)
+	}
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &model.ID}, 1); err != nil {
+		t.Fatalf("set vision default: %v", err)
+	}
+	return cfg, model
+}
+
+// TestUpdateModelCannotRemoveVisionFromDefaultModel pins the irreversibility of
+// the default-model vision invariant (R-E2-2): once a vision-capable model is
+// the configured default, PATCHing supports_vision=false is rejected with the
+// same typed invalid_argument as setting a non-vision default, and nothing is
+// persisted. A non-default model may still be corrected.
+func TestUpdateModelCannotRemoveVisionFromDefaultModel(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _, _, _ := newTestService(t)
+	cfg, model := createVisionDefaultConfig(t, svc, repo)
+
+	disabled := false
+	rejected, err := svc.UpdateModel(ctx, cfg.ID, model.ID, ModelPatch{SupportsVision: &disabled}, 1)
+	if err == nil {
+		t.Fatalf("disabling vision on the default model was accepted: %#v", rejected)
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_argument" || apiErr.Retryable {
+		t.Fatalf("error = %#v, want non-retryable 400 invalid_argument", apiErr)
+	}
+	if field, _ := apiErr.Details["field"].(string); field != "supports_vision" && field != "default_model_id" {
+		t.Fatalf("details = %#v, want field=supports_vision or default_model_id", apiErr.Details)
+	}
+	if stored := repo.models[model.ID]; !stored.SupportsVision ||
+		!stored.EffectiveCapabilities().SupportsVision {
+		t.Fatalf("rejected patch persisted: %#v", stored)
+	}
+
+	// The guard is scoped to the configured default: a non-default model can
+	// still have its capability corrected.
+	other, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "other-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsVision: true,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel(other): %v", err)
+	}
+	if _, err := svc.UpdateModel(ctx, cfg.ID, other.ID, ModelPatch{SupportsVision: &disabled}, 1); err != nil {
+		t.Fatalf("non-default vision patch rejected: %v", err)
+	}
+	if stored := repo.models[other.ID]; stored.SupportsVision {
+		t.Fatalf("non-default patch not persisted: %#v", stored)
+	}
+}
+
+// TestRefreshModelsCannotDowngradeDefaultVision pins the second way to bypass
+// the invariant: an upstream catalog that stops advertising supports_vision for
+// the configured default model must fail the refresh before any capability is
+// persisted, never silently downgrade the default.
+func TestRefreshModelsCannotDowngradeDefaultVision(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, client, _, _ := newTestService(t)
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	client.models = []RemoteModel{{
+		ID: "vision-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsVision: true,
+	}}
+	refreshed, err := svc.RefreshModels(ctx, cfg.ID, 1)
+	if err != nil {
+		t.Fatalf("first RefreshModels: %v", err)
+	}
+	var defaultModel llm.Model
+	for _, model := range refreshed {
+		if model.Model == "vision-llm" {
+			defaultModel = model
+		}
+	}
+	if defaultModel.ID <= 0 {
+		t.Fatalf("refreshed models = %#v", refreshed)
+	}
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &defaultModel.ID}, 1); err != nil {
+		t.Fatalf("set refreshed vision default: %v", err)
+	}
+	upsertsBefore := repo.upsertCalls
+
+	// The provider now reports the same model without vision support.
+	client.models = []RemoteModel{{
+		ID: "vision-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsVision: false,
+	}}
+	if _, err := svc.RefreshModels(ctx, cfg.ID, 1); err == nil {
+		t.Fatal("refresh downgraded the configured default model to non-vision")
+	} else {
+		apiErr := apiError(t, err)
+		if apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_argument" {
+			t.Fatalf("error = %#v, want 400 invalid_argument", apiErr)
+		}
+		if field, _ := apiErr.Details["field"].(string); field != "supports_vision" && field != "default_model_id" {
+			t.Fatalf("details = %#v, want field=supports_vision or default_model_id", apiErr.Details)
+		}
+	}
+	if repo.upsertCalls != upsertsBefore {
+		t.Fatalf("rejected refresh persisted an upsert: %d -> %d", upsertsBefore, repo.upsertCalls)
+	}
+	stored := repo.models[defaultModel.ID]
+	if !stored.SupportsVision || !stored.EffectiveCapabilities().SupportsVision {
+		t.Fatalf("rejected refresh changed the stored capability: %#v", stored)
 	}
 }

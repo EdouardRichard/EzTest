@@ -108,6 +108,97 @@ describe("CaseRunDetail incomplete cause", () => {
     expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
   })
 
+  it("renders a case run with null usage without crashing", () => {
+    const detail: CaseRunDetail = {
+      ...caseRunDetailFixture,
+      case_run: {
+        ...caseRunDetailFixture.case_run,
+        status: "passed",
+        failure_class: "",
+        summary: { ...caseRunDetailFixture.case_run.summary, usage: null },
+      },
+    }
+
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={detail}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    // v0.22 audit §2.5-2: `usage: null` used to crash the whole tab. The
+    // terminal row must still render its status/duration and say the telemetry
+    // is unavailable instead of throwing.
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent("通过")
+    expect(screen.getByTestId("case-run-duration")).toHaveTextContent("41.0s")
+    expect(screen.getByTestId("case-run-telemetry-unavailable")).toHaveTextContent("遥测不可用")
+    expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
+  })
+
+  it("states that telemetry is unavailable on a superseded run", () => {
+    const detail: CaseRunDetail = {
+      ...caseRunDetailFixture,
+      case_run: {
+        ...caseRunDetailFixture.case_run,
+        status: "superseded",
+        failure_class: "",
+        summary: {
+          verdict_reason: "case_version_superseded",
+          terminal_cause: "case_version_superseded",
+          next_action: "reconfirm_case_version",
+          usage: null,
+        },
+      },
+    }
+
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={detail}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    // v0.22 audit §2.5-2: skipped/superseded rows settle without running and
+    // can carry `usage: null`; they are terminal and must state that the
+    // telemetry is unavailable instead of silently omitting the line.
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent("已取代")
+    expect(screen.getByTestId("case-run-telemetry-unavailable")).toHaveTextContent("遥测不可用")
+    expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
+  })
+
+  it("explains a blocked run without a last_error using its verdict reason", () => {
+    const detail: CaseRunDetail = {
+      ...caseRunDetailFixture,
+      case_run: {
+        ...caseRunDetailFixture.case_run,
+        status: "blocked",
+        failure_class: "blocked",
+        summary: { verdict_reason: "missing_account", evidence_count: 0 },
+      },
+    }
+
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={detail}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    // A blocked run must state the blocker and the next action even when the
+    // older row carries no last_error/next_action fields.
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent("缺少测试账号")
+    expect(screen.getByTestId("case-run-next-action")).toHaveTextContent("先解决阻塞条件")
+  })
+
   it("explains a blocked run with its cause, usage and next action", () => {
     render(
       <CaseRunDetailView

@@ -19,10 +19,13 @@ import { type GlobalIssueListOptions, type GlobalIssueView, listGlobalIssues } f
 import { IssueDetailSheet } from "./IssueDetailSheet"
 import {
   ISSUE_CATEGORY_LABELS,
+  ISSUE_RETEST_STATUS_LABELS,
+  ISSUE_RETEST_STATUS_TONES,
   ISSUE_SEVERITY_LABELS,
   ISSUE_STATUS_LABELS,
   type IssueCategory,
   type IssueDetailView,
+  type IssueRetestStatus,
   type IssueSeverity,
   type IssueStatus,
 } from "./types"
@@ -275,6 +278,24 @@ export function GlobalIssuesPage() {
       render: (issue) => (
         <Badge tone={STATUS_TONE[issue.status]}>{ISSUE_STATUS_LABELS[issue.status]}</Badge>
       ),
+    },
+    {
+      key: "retest",
+      header: "复测",
+      render: (issue) => {
+        const retestStatus: IssueRetestStatus = issue.retest_status ?? "not_retested"
+        return (
+          <span
+            data-testid={`global-issue-retest-${issue.id}`}
+            className="inline-flex items-center gap-1"
+          >
+            <Badge tone={ISSUE_RETEST_STATUS_TONES[retestStatus]}>
+              {ISSUE_RETEST_STATUS_LABELS[retestStatus]}
+            </Badge>
+            <span className="text-[10px] text-muted-foreground">{retestStatus}</span>
+          </span>
+        )
+      },
     },
     {
       key: "category",

@@ -214,6 +214,47 @@ export type DesignCaseDetail = {
 
 export type CaseConfirmationScope = "case" | "scenario" | "requirement"
 
+/* --------------------------- discovery revisions ---------------------------- */
+
+export type DiscoveryRevisionTrigger = "discovery_delta" | "rollback"
+
+/**
+ * One discovery/rollback case revision shown by `DiscoveryRevisionNotice`.
+ *
+ * The authoritative source is the EV-12 `case.revision.auto_confirmed` SSE
+ * payload (`trigger`, `rollback_of`, `confidence`). The design case-detail GET
+ * does not expose the revision trigger yet, so a historical notice can only be
+ * inferred from the case sources (`path=discovery_delta|discovery_observation`);
+ * `inferred` marks that weaker provenance and suppresses the auto-confirm claim.
+ */
+export type DiscoveryRevisionData = {
+  /** Alias accepted by the notice API for a case version id. */
+  id?: string
+  caseId?: string
+  caseVersionId: string
+  revision?: number
+  status: CaseVersionStatus
+  trigger?: DiscoveryRevisionTrigger | string
+  autoConfirmedBy?: string | null
+  rollbackOf?: string | null
+  sourceObservationId?: string | null
+  resourceId?: string | null
+  confidence?: string | null
+  lowConfidenceReason?: string | null
+  /** True when derived from case sources rather than an authoritative event. */
+  inferred?: boolean
+}
+
+/** `POST /api/versions/{id}/case-versions/{caseVersionId}/rollback` (API-41). */
+export type CaseRevisionRollbackView = {
+  case_id: string
+  case_version_id: string
+  rolled_back_from: string
+  revision: number
+  status: string
+  trigger: string
+}
+
 export type CaseConfirmationInput = {
   scope: CaseConfirmationScope
   target_id: string

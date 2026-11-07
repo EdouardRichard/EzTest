@@ -13,8 +13,9 @@ import (
 
 // planItemColumns is the column list of one version_plan_item row. The logical
 // Order field is persisted as sort_order (the name "order" is a SQL keyword).
+// revision is the optimistic-lock token of the plan write path (R-A8-2).
 const planItemColumns = `id, version_id, phase, title, status, depends_on,
-	work_item_id, decision, sort_order`
+	work_item_id, decision, sort_order, revision`
 
 // PlanRepository stores the version task plan (spec §6.1, task_plan.md).
 type PlanRepository struct {
@@ -56,9 +57,10 @@ func (r *PlanRepository) List(ctx context.Context, versionID int64, status strin
 
 // Upsert inserts a new plan item or updates the row with the same primary key.
 // It reports whether the stored values actually changed so the service only
-// publishes plan.item_changed for real changes. depends_on entries must name
-// existing plan items of the same version; a plan item can never move to
-// another version.
+// publishes plan.item_changed for real changes. A create starts at revision 1
+// and an update bumps revision by one; Upsert itself does not guard on revision
+// (Update is the optimistic path). depends_on entries must name existing plan
+// items of the same version; a plan item can never move to another version.
 func (r *PlanRepository) Upsert(ctx context.Context, item version.PlanItem) (version.PlanItem, bool, error) {
 	if item.ID <= 0 || item.VersionID <= 0 {
 		return version.PlanItem{}, false, fmt.Errorf("upsert plan item: id and version id must be positive")
@@ -106,7 +108,8 @@ func (r *PlanRepository) Upsert(ctx context.Context, item version.PlanItem) (ver
 		stored, err := scanPlanItem(tx.QueryRow(ctx, `
 			UPDATE version_plan_item SET
 				phase = $2, title = $3, status = $4, depends_on = $5,
-				work_item_id = $6, decision = $7, sort_order = $8, updated_at = now()
+				work_item_id = $6, decision = $7, sort_order = $8,
+				revision = revision + 1, updated_at = now()
 			WHERE id = $1
 			RETURNING `+planItemColumns+`
 		`, item.ID, item.Phase, item.Title, item.Status, dependencies,
@@ -125,9 +128,9 @@ func (r *PlanRepository) Upsert(ctx context.Context, item version.PlanItem) (ver
 	stored, err := scanPlanItem(tx.QueryRow(ctx, `
 		INSERT INTO version_plan_item (
 			id, version_id, phase, title, status, depends_on,
-			work_item_id, decision, sort_order, created_at, updated_at
+			work_item_id, decision, sort_order, revision, created_at, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, now(), now())
 		RETURNING `+planItemColumns+`
 	`, item.ID, item.VersionID, item.Phase, item.Title, item.Status, dependencies,
 		item.WorkItemID, item.Decision, item.Order))
@@ -144,10 +147,76 @@ func (r *PlanRepository) Upsert(ctx context.Context, item version.PlanItem) (ver
 	return stored, true, nil
 }
 
+// Update applies a partial write guarded by revision optimistic locking
+// (spec R-A8-2, DB-20). The row is locked FOR UPDATE, checked against
+// expectedRevision and only written when a patch field actually changes; a
+// real write bumps revision by one and refreshes updated_at, while a no-op
+// patch returns the stored row unchanged. A stale revision returns a
+// *version.PlanRevisionConflictError carrying the stored revision; a missing
+// item, or an item owned by another version, returns version.ErrPlanNotFound.
+func (r *PlanRepository) Update(ctx context.Context, versionID, itemID int64, patch version.PlanPatch, expectedRevision int) (version.PlanItem, bool, error) {
+	if versionID <= 0 || itemID <= 0 || expectedRevision <= 0 {
+		return version.PlanItem{}, false, fmt.Errorf("update plan item: version id, item id and revision must be positive")
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return version.PlanItem{}, false, fmt.Errorf("update plan item: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	existing, err := scanPlanItem(tx.QueryRow(ctx, `
+		SELECT `+planItemColumns+` FROM version_plan_item
+		WHERE id = $1 AND version_id = $2
+		FOR UPDATE
+	`, itemID, versionID))
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return version.PlanItem{}, false, version.ErrPlanNotFound
+	case err != nil:
+		return version.PlanItem{}, false, fmt.Errorf("update plan item: lookup: %w", err)
+	}
+	if existing.Revision != expectedRevision {
+		return version.PlanItem{}, false, &version.PlanRevisionConflictError{
+			ItemID: itemID, Expected: expectedRevision, Actual: existing.Revision,
+		}
+	}
+
+	updated := patch.Apply(existing)
+	if sameStoredPlanItem(existing, updated) {
+		return existing, false, nil
+	}
+
+	stored, err := scanPlanItem(tx.QueryRow(ctx, `
+		UPDATE version_plan_item SET
+			title = $3, status = $4, decision = $5, sort_order = $6,
+			revision = revision + 1, updated_at = now()
+		WHERE id = $1 AND version_id = $2 AND revision = $7
+		RETURNING `+planItemColumns+`
+	`, itemID, versionID, updated.Title, updated.Status, updated.Decision,
+		updated.Order, expectedRevision))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The row was locked above, so this can only happen if a trigger or a
+		// concurrent manual write changed the revision; report it as the same
+		// stale-revision contract.
+		return version.PlanItem{}, false, &version.PlanRevisionConflictError{
+			ItemID: itemID, Expected: expectedRevision,
+		}
+	}
+	if err != nil {
+		return version.PlanItem{}, false, fmt.Errorf("update plan item: write: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return version.PlanItem{}, false, fmt.Errorf("update plan item: commit: %w", err)
+	}
+	return stored, true, nil
+}
+
 func scanPlanItem(row rowScanner) (version.PlanItem, error) {
 	var item version.PlanItem
 	if err := row.Scan(&item.ID, &item.VersionID, &item.Phase, &item.Title,
-		&item.Status, &item.DependsOn, &item.WorkItemID, &item.Decision, &item.Order); err != nil {
+		&item.Status, &item.DependsOn, &item.WorkItemID, &item.Decision,
+		&item.Order, &item.Revision); err != nil {
 		return version.PlanItem{}, err
 	}
 	if item.DependsOn == nil {
@@ -157,8 +226,9 @@ func scanPlanItem(row rowScanner) (version.PlanItem, error) {
 }
 
 // sameStoredPlanItem compares the persisted fields of one plan item. Ordering
-// slices are compared element by element; the timestamps are not part of the
-// domain entity.
+// slices are compared element by element; the timestamps and the revision token
+// are not part of the comparison because the revision is bumped by the write
+// itself.
 func sameStoredPlanItem(a, b version.PlanItem) bool {
 	if a.ID != b.ID || a.VersionID != b.VersionID || a.Phase != b.Phase ||
 		a.Title != b.Title || a.Status != b.Status || a.Decision != b.Decision ||

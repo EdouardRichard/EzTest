@@ -136,9 +136,16 @@ func (t *fakeConfirmationTx) ConfirmCaseVersion(_ context.Context, command desig
 		return design.ErrStateConflict
 	}
 	item.current.Status = design.CaseStatusConfirmed
+	if command.Confirmation.Trigger != "" {
+		item.current.Trigger = command.Confirmation.Trigger
+	}
+	item.current.SourceObservationID = command.Confirmation.SourceObservationID
+	if command.Confirmation.AutoConfirmedBy != "" {
+		item.current.AutoConfirmedBy = command.Confirmation.AutoConfirmedBy
+	}
 	for index := range item.versions {
 		if item.versions[index].ID == command.Confirmation.CaseVersionID {
-			item.versions[index].Status = design.CaseStatusConfirmed
+			item.versions[index] = *item.current
 		}
 	}
 	item.entity.Status = command.EntityStatus
@@ -326,8 +333,8 @@ func seedFakeCaseVersions(t *testing.T, repo *fakeRepo, caseID, scenarioID int64
 		))
 	}
 	if len(item.versions) > 0 {
-		current := item.versions[len(item.versions)-1]
-		item.current = &current
+		item.current = &item.versions[len(item.versions)-1]
+		current := *item.current
 		versionID := current.ID
 		item.entity = design.CaseEntity{
 			ID: caseID, ScenarioID: scenarioID, CurrentVersionID: &versionID, Status: current.Status,
@@ -350,7 +357,7 @@ func appendFakeCaseVersion(t *testing.T, repo *fakeRepo, caseID int64, steps, as
 	revision := len(item.versions) + 1
 	version := fakeCaseVersion(caseID, revision, item.current.Title, steps, assertions, status)
 	item.versions = append(item.versions, version)
-	item.current = &version
+	item.current = &item.versions[len(item.versions)-1]
 	versionID := version.ID
 	item.entity.CurrentVersionID = &versionID
 	item.entity.Status = status

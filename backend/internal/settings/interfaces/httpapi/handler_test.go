@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	settingsapp "github.com/EdouardRichard/EzTest/backend/internal/settings/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
 )
 
@@ -196,6 +200,128 @@ func TestRevisionsRequiresKey(t *testing.T) {
 	handler.Revisions(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings/revisions", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+// staleSettingsRepo models an upgraded database: the four gc.* rows that
+// W2-15 removed from the catalog are still present in system_setting because
+// seeding is INSERT ... ON CONFLICT DO NOTHING. The admin API must not leak
+// those dead rows even though the repository still lists them.
+type staleSettingsRepo struct {
+	items map[string]settings.Setting
+}
+
+func newStaleSettingsRepo() *staleSettingsRepo {
+	repo := &staleSettingsRepo{items: map[string]settings.Setting{}}
+	for _, key := range []string{"gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days"} {
+		repo.items[key] = settings.Setting{
+			Key: key, Category: "gc", Type: settings.TypeNumber,
+			Value: json.RawMessage("1"), Version: 1, UpdatedAt: time.Unix(0, 0).UTC(),
+		}
+	}
+	return repo
+}
+
+func (r *staleSettingsRepo) List(context.Context) ([]settings.Setting, error) {
+	list := make([]settings.Setting, 0, len(r.items))
+	for _, item := range r.items {
+		list = append(list, item)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Key < list[j].Key })
+	return list, nil
+}
+
+func (r *staleSettingsRepo) Get(_ context.Context, key string) (settings.Setting, error) {
+	item, ok := r.items[key]
+	if !ok {
+		return settings.Setting{}, settings.ErrNotFound
+	}
+	return item, nil
+}
+
+func (r *staleSettingsRepo) Seed(_ context.Context, definitions []settings.Definition) error {
+	for _, def := range definitions {
+		if _, ok := r.items[def.Key]; ok {
+			continue
+		}
+		r.items[def.Key] = settings.Setting{
+			Key: def.Key, Value: def.Default, Category: def.Category, Type: def.Type,
+			Secret: def.Secret, RestartRequired: def.RestartRequired,
+			Description: def.Description, Version: 1, UpdatedAt: time.Unix(0, 0).UTC(),
+		}
+	}
+	return nil
+}
+
+func (r *staleSettingsRepo) Update(_ context.Context, key string, value json.RawMessage, _ int64, _ int64, at time.Time) (settings.Setting, error) {
+	item, ok := r.items[key]
+	if !ok {
+		return settings.Setting{}, settings.ErrNotFound
+	}
+	item.Value = value
+	item.Version++
+	item.UpdatedAt = at
+	r.items[key] = item
+	return item, nil
+}
+
+func (r *staleSettingsRepo) Revisions(context.Context, string, int, *int64) ([]settings.Revision, error) {
+	return nil, nil
+}
+
+// TestAdminListHidesRemovedGCKeys is the W2-15 fix contract: GET
+// /api/admin/settings only exposes catalog keys, so the four removed gc.*
+// aliases cannot reappear from an upgraded database, retention.* remains
+// visible, and PATCH gc.* still returns 404.
+func TestAdminListHidesRemovedGCKeys(t *testing.T) {
+	repo := newStaleSettingsRepo()
+	ids, err := id.NewSnowflake(1)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	svc := settingsapp.New(repo, settingsapp.Definitions("http://127.0.0.1:13336"), ids, clock.System{}, nil, nil)
+	if err := svc.SeedDefaults(context.Background()); err != nil {
+		t.Fatalf("seed defaults: %v", err)
+	}
+	handler := New(svc)
+
+	rec := httptest.NewRecorder()
+	handler.List(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data []settingDTO `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	seen := make(map[string]bool, len(body.Data))
+	for _, item := range body.Data {
+		if strings.HasPrefix(item.Key, "gc.") {
+			t.Fatalf("removed setting %q leaked through GET /api/admin/settings", item.Key)
+		}
+		seen[item.Key] = true
+	}
+	if len(body.Data) != 87 {
+		t.Fatalf("settings count = %d, want 87 (catalog keys only)", len(body.Data))
+	}
+	for _, key := range []string{
+		"retention.gc_dry_run", "retention.gc_grace_hours",
+		"retention.unreferenced_content_days", "retention.temp_hours",
+	} {
+		if !seen[key] {
+			t.Fatalf("%s is missing from GET /api/admin/settings", key)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/settings/gc.retention_days", strings.NewReader(`{"value":7}`))
+	req = req.WithContext(platform.WithActor(req.Context(), platform.Actor{ID: 1, Role: "admin"}))
+	req.SetPathValue("key", "gc.retention_days")
+	rec = httptest.NewRecorder()
+	handler.Update(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("PATCH gc.retention_days status = %d, want 404", rec.Code)
 	}
 }
 

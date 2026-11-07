@@ -87,6 +87,35 @@ type integrationReportFixture struct {
 	clock   integrationReportClock
 	report  delivery.Report
 	htmlRef int64
+	storage *storageapp.Service
+	exports *storageapp.ExportService
+	ids     platformid.Generator
+}
+
+// integrationArtifactStore adapts the real storage export service to the
+// delivery ReportArtifactStore port, mirroring the production main.go wiring.
+type integrationArtifactStore struct {
+	exports *storageapp.ExportService
+}
+
+func (a integrationArtifactStore) CreateReportArtifact(ctx context.Context, in deliveryapp.ReportArtifactStoreInput) (deliveryapp.ReportArtifactRecord, error) {
+	artifact, err := a.exports.Create(ctx, storageapp.CreateExportInput{
+		ID:        in.ID,
+		VersionID: in.VersionID,
+		OwnerID:   in.OwnerID,
+		OwnerKind: "report",
+		Format:    in.Format,
+		MIME:      in.MIME,
+		Filename:  in.Filename,
+		Data:      in.Data,
+	}, in.ActorID)
+	if err != nil {
+		return deliveryapp.ReportArtifactRecord{}, err
+	}
+	return deliveryapp.ReportArtifactRecord{
+		ID: artifact.ID, Format: artifact.Format, ContentObjectID: artifact.ContentObjectID,
+		Size: artifact.Size, Status: artifact.Status,
+	}, nil
 }
 
 func newIntegrationReportFixture(t *testing.T) *integrationReportFixture {
@@ -120,25 +149,31 @@ func newIntegrationReportFixture(t *testing.T) *integrationReportFixture {
 	audit := &integrationReportAudit{}
 	tasks := &integrationReportTasks{}
 	clock := integrationReportClock{now: time.Date(2026, 11, 1, 7, 0, 0, 0, time.UTC)}
+	exports := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clock)
+	service := deliveryapp.NewReportService(
+		deliverypg.NewReportRepository(pool, ids),
+		renderer,
+		contentstore.New(storageSvc, deliverypg.NewContentRefReader(pool)),
+		data,
+		events,
+		audit,
+		clock,
+		tasks,
+		delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true},
+	)
+	service.WithArtifactStore(integrationArtifactStore{exports: exports}, ids)
 	return &integrationReportFixture{
-		svc: deliveryapp.NewReportService(
-			deliverypg.NewReportRepository(pool, ids),
-			renderer,
-			contentstore.New(storageSvc, deliverypg.NewContentRefReader(pool)),
-			data,
-			events,
-			audit,
-			clock,
-			tasks,
-			delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true},
-		),
-		repo:   deliverypg.NewReportRepository(pool, ids),
-		pool:   pool,
-		data:   data,
-		events: events,
-		audit:  audit,
-		tasks:  tasks,
-		clock:  clock,
+		svc:     service,
+		repo:    deliverypg.NewReportRepository(pool, ids),
+		pool:    pool,
+		data:    data,
+		events:  events,
+		audit:   audit,
+		tasks:   tasks,
+		clock:   clock,
+		storage: storageSvc,
+		exports: exports,
+		ids:     ids,
 	}
 }
 
@@ -307,4 +342,159 @@ func TestReportServiceIntegrationPublishRegenerateStale(t *testing.T) {
 // deliveryappStatus returns the platform status of an error.
 func deliveryappStatus(err error) int {
 	return platform.AsError(err).Status
+}
+
+// TestReportServiceIntegrationCreateArtifact wires the real PostgreSQL report
+// repository, content ledger and storage export service. It proves three
+// formats produce export_artifact rows whose content_object_id is the sha256 of
+// ledger-backed bytes (no binary in the DB), the content refs exist, the
+// export.* events are published, and Markdown is byte-deterministic.
+func TestReportServiceIntegrationCreateArtifact(t *testing.T) {
+	fixture := newIntegrationReportFixture(t)
+	ctx := context.Background()
+
+	report, err := fixture.svc.EnsureWaveReport(ctx, 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport: %v", err)
+	}
+	revision, err := fixture.svc.Publish(ctx, report.ID, 1, "artifact report")
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Attach a ready PDF exactly like the render worker would.
+	pdfData := []byte("%PDF-1.4\n% report artifact\n%%EOF\n")
+	object, err := fixture.storage.Upload(ctx, "report.pdf", "application/pdf", bytes.NewReader(pdfData), storageapp.MaxUploadBytes, 1)
+	if err != nil {
+		t.Fatalf("upload PDF: %v", err)
+	}
+	pdfRef, err := fixture.storage.AddRef(ctx, object.SHA256, storageapp.OwnerKindReportRevision, revision.ID, storageapp.RoleReportPDF)
+	if err != nil {
+		t.Fatalf("add PDF ref: %v", err)
+	}
+	if err := fixture.repo.MarkPDFRunning(ctx, revision.ID); err != nil {
+		t.Fatalf("MarkPDFRunning: %v", err)
+	}
+	if err := fixture.repo.MarkPDFRendered(ctx, revision.ID, deliveryapp.ReportContentRef{
+		RefID: pdfRef.ID, SHA256: object.SHA256, Size: object.Size,
+	}, 1, fixture.clock.now); err != nil {
+		t.Fatalf("MarkPDFRendered: %v", err)
+	}
+
+	markdownSHA := ""
+	artifactIDs := make([]int64, 0, 3)
+	formats := make(map[string]string, 3)
+	for _, format := range []string{"html", "pdf", "markdown"} {
+		artifact, err := fixture.svc.CreateArtifact(ctx, 7, report.ID, format, 9)
+		if err != nil {
+			t.Fatalf("CreateArtifact %s: %v", format, err)
+		}
+		if artifact.ID <= 0 || artifact.Status != "ready" || len(artifact.ContentObjectID) != 64 || artifact.Size <= 0 {
+			t.Fatalf("%s artifact = %+v", format, artifact)
+		}
+		artifactIDs = append(artifactIDs, artifact.ID)
+		formats[format] = artifact.ContentObjectID
+		t.Logf("created artifact format=%s id=%d sha256=%s size=%d status=%s",
+			format, artifact.ID, artifact.ContentObjectID, artifact.Size, artifact.Status)
+		if format == "markdown" {
+			markdownSHA = artifact.ContentObjectID
+		}
+	}
+	again, err := fixture.svc.CreateArtifact(ctx, 7, report.ID, "markdown", 9)
+	if err != nil {
+		t.Fatalf("CreateArtifact markdown again: %v", err)
+	}
+	if again.ContentObjectID != markdownSHA {
+		t.Fatalf("markdown artifact changed: %s != %s", again.ContentObjectID, markdownSHA)
+	}
+
+	rows, err := fixture.pool.Query(ctx, `
+		SELECT id, owner_kind, owner_id, revision, file_format, content_object_id, size_bytes, status
+		FROM export_artifact
+		WHERE version_id = 7
+		ORDER BY id
+	`)
+	if err != nil {
+		t.Fatalf("query export_artifact: %v", err)
+	}
+	defer rows.Close()
+	count := 0
+	seenFormat := make(map[string]bool, 3)
+	for rows.Next() {
+		var id, ownerID int64
+		var ownerKind, format, sha, status string
+		var artifactRevision int
+		var size int64
+		if err := rows.Scan(&id, &ownerKind, &ownerID, &artifactRevision, &format, &sha, &size, &status); err != nil {
+			t.Fatalf("scan export_artifact: %v", err)
+		}
+		if ownerKind != "report" || ownerID != report.ID || status != "ready" || size <= 0 || len(sha) != 64 {
+			t.Fatalf("artifact row = id=%d owner=%s/%d revision=%d format=%s sha=%s size=%d status=%s",
+				id, ownerKind, ownerID, artifactRevision, format, sha, size, status)
+		}
+		if format != "markdown" && artifactRevision != 1 {
+			t.Fatalf("%s revision = %d, want 1", format, artifactRevision)
+		}
+		if format == "markdown" && (artifactRevision < 1 || artifactRevision > 2) {
+			t.Fatalf("markdown revision = %d, want 1 or 2", artifactRevision)
+		}
+		t.Logf("db export_artifact id=%d owner_kind=%s owner_id=%d revision=%d format=%s sha256=%s size=%d status=%s",
+			id, ownerKind, ownerID, artifactRevision, format, sha, size, status)
+		seenFormat[format] = true
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate export_artifact: %v", err)
+	}
+	if count != 4 || !seenFormat["html"] || !seenFormat["pdf"] || !seenFormat["markdown"] {
+		t.Fatalf("artifact rows = %d formats=%v, want 4 rows / three formats", count, seenFormat)
+	}
+
+	for _, artifactID := range artifactIDs {
+		var refs int
+		if err := fixture.pool.QueryRow(ctx, `
+			SELECT count(*) FROM content_ref
+			WHERE owner_kind = 'export' AND owner_id = $1 AND role = 'content' AND deleted_at IS NULL
+		`, artifactID).Scan(&refs); err != nil {
+			t.Fatalf("query content_ref %d: %v", artifactID, err)
+		}
+		if refs != 1 {
+			t.Fatalf("content_ref rows for artifact %d = %d, want 1", artifactID, refs)
+		}
+		t.Logf("content ledger ref export_artifact=%d owner_kind=export role=content rows=%d", artifactID, refs)
+	}
+
+	var binaryColumns int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name IN ('export_artifact', 'content_object')
+		  AND data_type IN ('bytea', 'blob')
+	`).Scan(&binaryColumns); err != nil {
+		t.Fatalf("query binary columns: %v", err)
+	}
+	if binaryColumns != 0 {
+		t.Fatalf("binary columns in export tables = %d, want 0", binaryColumns)
+	}
+
+	started, completed, failed := 0, 0, 0
+	for index, eventType := range fixture.events.types {
+		switch eventType {
+		case "export.started":
+			started++
+		case "export.completed":
+			completed++
+			payload := fixture.events.payload[index]
+			if payload["status"] != "completed" || payload["report_id"] == "" || payload["format"] == "" ||
+				payload["sha256"] == "" || payload["version_id"] == "" {
+				t.Fatalf("export.completed payload = %v", payload)
+			}
+		case "export.failed":
+			failed++
+		}
+	}
+	if started != 4 || completed != 4 || failed != 0 {
+		t.Fatalf("export events started=%d completed=%d failed=%d, want 4/4/0", started, completed, failed)
+	}
+	t.Logf("export events started=%d completed=%d failed=%d", started, completed, failed)
 }

@@ -29,11 +29,14 @@ type ConversationView struct {
 }
 
 // MessageView is the UI-thread message projection. ActualModel is set for
-// assistant messages from the linked agent_run (`actual_model`).
+// assistant messages from the linked agent_run (`actual_model`). Kind is the
+// DB-3 conversation_message kind (text/question/answer); question/answer cards
+// use it to render the structured batch, and empty keeps the legacy text row.
 type MessageView struct {
 	ID             int64
 	ConversationID int64
 	Role           string
+	Kind           string
 	Parts          []version.MessagePart
 	Refs           []version.MessageRef
 	ActualModel    *string
@@ -51,12 +54,15 @@ type MessagePartView struct {
 
 // SummaryView is the latest thread memory of one conversation.
 type SummaryView struct {
-	ConversationID int64
-	Summary        string
-	PinnedFacts    []string
-	TokenEstimate  int
-	Version        int
-	UpdatedAt      time.Time
+	ConversationID   int64
+	Summary          string
+	PinnedFacts      []string
+	TokenEstimate    int
+	Version          int
+	CoveredMessageID int64
+	CompactionID     string
+	SummaryMeta      map[string]any
+	UpdatedAt        time.Time
 }
 
 func toConversationView(conversation version.Conversation, summary *version.ConversationSummary) ConversationView {
@@ -85,6 +91,7 @@ func toMessageView(message version.Message) MessageView {
 		ID:             message.ID,
 		ConversationID: message.ConversationID,
 		Role:           message.Role,
+		Kind:           message.Kind,
 		Parts:          nonNilParts(message.Parts),
 		Refs:           nonNilRefs(message.Refs),
 		CreatedAt:      message.CreatedAt,

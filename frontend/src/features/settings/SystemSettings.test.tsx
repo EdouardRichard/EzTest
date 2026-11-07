@@ -11,6 +11,9 @@ vi.mock("./GCPanel", () => ({ GCPanel: () => <div data-testid="gc-panel-stub">GC
 vi.mock("./InstancePanel", () => ({
   InstancePanel: () => <div data-testid="instance-panel-stub">实例面板</div>,
 }))
+vi.mock("./ExecutorsPanel", () => ({
+  ExecutorsPanel: () => <div data-testid="executors-panel-stub">执行器面板</div>,
+}))
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -67,6 +70,28 @@ const settings: Setting[] = [
     updated_at: "2026-10-31T08:00:00Z",
   },
   {
+    key: "retention.gc_grace_hours",
+    category: "retention",
+    type: "number",
+    value: 168,
+    is_secret: false,
+    restart_required: false,
+    description: "两阶段删除宽限期（小时）",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "retention.unreferenced_content_days",
+    category: "retention",
+    type: "number",
+    value: 30,
+    is_secret: false,
+    restart_required: false,
+    description: "无引用内容保留天数",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
     key: "feature.experimental_flags",
     category: "feature",
     type: "json",
@@ -74,6 +99,39 @@ const settings: Setting[] = [
     is_secret: false,
     restart_required: false,
     description: "实验特性开关",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "paths.attachment_dir",
+    category: "paths",
+    type: "string",
+    value: "./.data/attachments",
+    is_secret: false,
+    restart_required: false,
+    description: "已删除的附件目录键",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "gc.retention_days",
+    category: "gc",
+    type: "number",
+    value: 30,
+    is_secret: false,
+    restart_required: false,
+    description: "存储对象保留天数",
+    version: 1,
+    updated_at: "2026-10-31T08:00:00Z",
+  },
+  {
+    key: "gc.dry_run",
+    category: "gc",
+    type: "boolean",
+    value: true,
+    is_secret: false,
+    restart_required: false,
+    description: "GC 默认演练模式",
     version: 1,
     updated_at: "2026-10-31T08:00:00Z",
   },
@@ -234,5 +292,36 @@ describe("SystemSettings", () => {
       "value must be between 1 and 32",
     )
     expect(within(row).getByLabelText("execution.global_concurrency 新值")).toBeInTheDocument()
+  })
+
+  it("hides disposed and gc.* settings while keeping retention.* editable", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: settings }))
+
+    render(<SystemSettings />)
+    await screen.findByTestId("setting-row-retention.gc_dry_run")
+
+    expect(screen.queryByTestId("setting-row-paths.attachment_dir")).not.toBeInTheDocument()
+    expect(screen.queryByText("paths.attachment_dir")).not.toBeInTheDocument()
+
+    // W2-15 removed the gc.* aliases: neither the rows nor their category may
+    // remain in the editable UI.
+    for (const key of ["gc.retention_days", "gc.dry_run", "gc.max_bytes", "gc.grace_days"]) {
+      expect(screen.queryByTestId(`setting-row-${key}`)).not.toBeInTheDocument()
+      expect(screen.queryByText(key)).not.toBeInTheDocument()
+    }
+    expect(screen.queryByText("W2 接线")).not.toBeInTheDocument()
+
+    // retention.* is the only GC settings family and stays editable.
+    expect(displayValue("retention.gc_grace_hours")).toHaveTextContent("168")
+    expect(displayValue("retention.unreferenced_content_days")).toHaveTextContent("30")
+    expect(displayValue("retention.gc_dry_run")).toHaveTextContent("启用")
+    for (const key of [
+      "retention.gc_dry_run",
+      "retention.gc_grace_hours",
+      "retention.unreferenced_content_days",
+    ]) {
+      const row = settingRow(key)
+      expect(within(row).getByRole("button", { name: "编辑" })).toBeVisible()
+    }
   })
 })

@@ -12,11 +12,18 @@ type CatalogReader interface {
 	GetDatabase(context.Context, int64) (DatabaseView, error)
 	GetAccount(context.Context, int64) (AccountView, error)
 	GetRepository(context.Context, int64) (CodeRepositoryView, error)
+	// ListSUTRepositories returns the SUT-level multi-repository associations
+	// (v0.22 R-C2). A version inherits the enabled rows.
+	ListSUTRepositories(context.Context, int64) ([]SUTRepositoryView, error)
+	// ListAllAccounts returns the global test-account pool (v0.22 DB-15).
+	ListAllAccounts(context.Context) ([]AccountView, error)
 }
 
 // UsageChecker answers whether a resource is still referenced by a version
-// binding. The version context implements it; the resource context never
-// imports the version package.
+// binding. A page/API/database guard blocks resources that are inside a bound
+// environment's effective range (approved/active and not scope-excluded); an
+// explicitly excluded resource is not part of the version range. The version
+// context implements it; the resource context never imports the version package.
 type UsageChecker interface {
 	SUTInUse(context.Context, int64) (bool, error)
 	EnvironmentInUse(context.Context, int64) (bool, error)

@@ -7,26 +7,56 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Alert } from "@/components/ui/Alert"
 import { Badge } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
-import { ErrorState } from "@/components/ui/ErrorState"
+import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
+import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { ChainTab } from "@/features/chain/ChainTab"
+import {
+  isClarificationQuestionBatch,
+  isHumanDecisionKind,
+  listQuestions,
+  type QuestionBatch,
+} from "@/features/clarification/api"
+import { QuestionCard } from "@/features/clarification/QuestionCard"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { CodeTab } from "@/features/code-intel/CodeTab"
+import { ContextPacketCard } from "@/features/conversation/ContextPacketCard"
 import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
+import { rollbackCaseVersion } from "@/features/design/api"
 import { DesignTab } from "@/features/design/DesignTab"
-import type { StageView } from "@/features/design/types"
+import {
+  DiscoveryRevisionNotice,
+  discoveryRevisionFromEventPayload,
+} from "@/features/design/DiscoveryRevisionNotice"
+import type {
+  CaseRevisionRollbackView,
+  DiscoveryRevisionData,
+  StageView,
+} from "@/features/design/types"
+import { listHumanRequests, resolveHumanRequest } from "@/features/execution/api"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
+import { HumanDecisionCards } from "@/features/execution/HumanRequestBanner"
+import type { HumanRequest, HumanRequestResponseInput } from "@/features/execution/types"
 import { TodoDrawer } from "@/features/shell/TodoDrawer"
+import { apiDownload, apiGetPage, apiPost } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
-import { getVersion, getVersionStage } from "./api"
+import { getVersion, getVersionStage, parseStageBlocker } from "./api"
+import { BindingOverview } from "./BindingOverview"
+import { BlockerPanel } from "./BlockerPanel"
+import { CoveragePanel } from "./CoveragePanel"
+import { DiscoveryPanel } from "./DiscoveryPanel"
+import { FactsPanel } from "./FactsPanel"
+import { PlanPanel } from "./PlanPanel"
+import { StageBar } from "./StageBar"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
 import type { Version, VersionBinding, VersionTab } from "./types"
 import { VersionHeader } from "./VersionHeader"
+import { WorkItemsPanel } from "./WorkItemsPanel"
 
 /** SSE bursts (issue.created + report.published + version.closed) collapse into one refresh. */
 const SSE_REFRESH_DEBOUNCE_MS = 350
@@ -101,7 +131,13 @@ function BindingCard({ binding, index }: { binding: VersionBinding; index: numbe
   )
 }
 
-function VersionOverview({ version }: { version: Version }) {
+function VersionOverview({
+  version,
+  showBindings = true,
+}: {
+  version: Version
+  showBindings?: boolean
+}) {
   const totals = version.bindings.reduce(
     (sum, binding) => ({
       pages: sum.pages + binding.pages.length,
@@ -155,33 +191,205 @@ function VersionOverview({ version }: { version: Version }) {
         </Alert>
       ) : null}
 
-      <section aria-label="绑定概览" className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold text-foreground">SUT 绑定概览</h2>
-          <span className="text-[11px] text-muted-foreground">
-            共 {version.bindings.length} 个 SUT · 更新于 {formatDateTime(version.updated_at)}
-          </span>
-        </div>
-
-        {version.bindings.length === 0 ? (
-          <EmptyState
-            title="该版本暂无 SUT 绑定"
-            description="P0 创建接口要求至少一个绑定，请检查数据或重新创建版本。"
-          />
-        ) : (
-          <div className="grid gap-3 lg:grid-cols-2">
-            {version.bindings.map((binding, index) => (
-              <BindingCard key={binding.id} binding={binding} index={index} />
-            ))}
+      {showBindings ? (
+        <section aria-label="绑定概览" className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-foreground">SUT 绑定概览</h2>
+            <span className="text-[11px] text-muted-foreground">
+              共 {version.bindings.length} 个 SUT · 更新于 {formatDateTime(version.updated_at)}
+            </span>
           </div>
-        )}
-      </section>
+
+          {version.bindings.length === 0 ? (
+            <EmptyState
+              title="该版本暂无 SUT 绑定"
+              description="P0 创建接口要求至少一个绑定，请检查数据或重新创建版本。"
+            />
+          ) : (
+            <div className="grid gap-3 lg:grid-cols-2">
+              {version.bindings.map((binding, index) => (
+                <BindingCard key={binding.id} binding={binding} index={index} />
+              ))}
+            </div>
+          )}
+        </section>
+      ) : null}
 
       <section className="rounded-xl border border-dashed border-border bg-card/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
         需求与澄清（P1）、用例设计（P2）、执行（P3）、探索链路/问题/报告（P4）与代码与变更（P5）
         已在对应 Tab 提供。
       </section>
     </div>
+  )
+}
+
+type AttachmentImageRow = {
+  id: string
+  attachment_id: string
+  seq: number
+  sha256: string
+  url?: string
+  mime: string
+  width?: number
+  height?: number
+  status: string
+  caption: string
+  error: string
+}
+
+/**
+ * Authenticated "查看原图" link. The content endpoint needs the bearer token, so
+ * a plain `<a href="/api/content/...">` would 401; this fetches the blob and
+ * exposes a revocable object URL instead (same pattern as MessageImage).
+ */
+function AttachmentImageLink({ sha256 }: { sha256: string }) {
+  const [url, setUrl] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl: string | null = null
+    setUrl(null)
+    setFailed(false)
+    void apiDownload(`/api/content/${encodeURIComponent(sha256)}`).then(
+      (download) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(download.blob)
+        setUrl(objectUrl)
+      },
+      () => {
+        if (!cancelled) setFailed(true)
+      },
+    )
+    return () => {
+      cancelled = true
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl)
+    }
+  }, [sha256])
+
+  if (failed) {
+    return <span className="mt-1 inline-block text-muted-foreground">原图加载失败</span>
+  }
+  if (url === null) {
+    return <span className="mt-1 inline-block text-muted-foreground">原图加载中…</span>
+  }
+  return (
+    <a
+      className="mt-1 inline-block underline underline-offset-2"
+      data-testid="attachment-image-link"
+      href={url}
+      rel="noreferrer"
+      target="_blank"
+    >
+      查看原图
+    </a>
+  )
+}
+
+/**
+ * H7 attachment-image panel: the page only reads images for the attachment
+ * selected by `?attachment=` and always through the version-scoped route, so
+ * another version's attachment can never be fetched by guessing an ID.
+ */
+function AttachmentImagesPanel({
+  versionId,
+  attachmentId,
+  refreshKey = 0,
+}: {
+  versionId: string
+  attachmentId: string
+  refreshKey?: number
+}) {
+  const [images, setImages] = useState<AttachmentImageRow[] | null>(null)
+  const [error, setError] = useState<unknown>(null)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setError(null)
+    try {
+      const page = await apiGetPage<AttachmentImageRow>(
+        `/api/versions/${encodeURIComponent(versionId)}/attachments/${encodeURIComponent(attachmentId)}/images?limit=100`,
+      )
+      setImages(page.items)
+    } catch (cause) {
+      setImages(null)
+      setError(cause)
+    }
+  }, [versionId, attachmentId])
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is the SSE nonce.
+  useEffect(() => {
+    void load()
+  }, [load, refreshKey])
+
+  async function reanalyze(): Promise<void> {
+    setBusy(true)
+    setError(null)
+    try {
+      await apiPost(
+        `/api/versions/${encodeURIComponent(versionId)}/attachments/${encodeURIComponent(attachmentId)}/reanalyze`,
+      )
+      await load()
+    } catch (cause) {
+      setError(cause)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section
+      data-testid="attachment-images"
+      aria-label="附件图片"
+      className="surface-card space-y-2 px-3 py-2.5"
+    >
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">附件图片</h2>
+          <p className="text-[11px] text-muted-foreground">
+            附件 #{attachmentId} · 图片分析结果与 caption（按版本授权读取）
+          </p>
+        </div>
+        <button
+          type="button"
+          className="inline-flex h-8 items-center rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy}
+          onClick={() => {
+            void reanalyze()
+          }}
+        >
+          {busy ? "分析中…" : "重新分析图片"}
+        </button>
+      </header>
+      {error !== null ? <InlineError error={error} /> : null}
+      {images === null && error === null ? (
+        <LoadingCard label="正在加载附件图片…" />
+      ) : images !== null && images.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground">该附件没有提取到图片。</p>
+      ) : (
+        <ul className="grid gap-2 sm:grid-cols-2">
+          {(images ?? []).map((image) => (
+            <li key={image.id} className="rounded-lg border border-border bg-card p-2 text-[11px]">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-medium text-foreground">#{image.seq}</span>
+                <Badge tone={image.status === "done" ? "success" : "warning"}>{image.status}</Badge>
+                <span className="text-muted-foreground">{image.mime}</span>
+                {image.width !== undefined && image.height !== undefined ? (
+                  <span className="text-muted-foreground">
+                    {image.width}×{image.height}
+                  </span>
+                ) : null}
+              </div>
+              <p className="mt-1 text-foreground">
+                {image.caption !== "" ? image.caption : "暂无 caption"}
+              </p>
+              {image.error !== "" ? <p className="mt-1 text-destructive">{image.error}</p> : null}
+              {image.sha256 !== "" ? <AttachmentImageLink sha256={image.sha256} /> : null}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 
@@ -203,6 +411,9 @@ export function VersionDetailPage({
 }: VersionDetailPageProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
+  // The context packet contains prompt content and the API is admin-only; a
+  // normal user must not mount the block or fire the guaranteed-403 request.
+  const isAdmin = useIsAdmin()
   const [version, setVersion] = useState<Version | null>(null)
   const [stage, setStage] = useState<StageView | null>(null)
   const [loading, setLoading] = useState(true)
@@ -211,6 +422,24 @@ export function VersionDetailPage({
   const [issueCount, setIssueCount] = useState<number | undefined>(undefined)
   const [reportRevision, setReportRevision] = useState<number | undefined>(undefined)
   const [todoOpen, setTodoOpen] = useState(false)
+  // v0.22 W0 SSE-driven refresh nonces and the pending question cards.
+  const [planRefreshKey, setPlanRefreshKey] = useState(0)
+  const [bindingRefreshKey, setBindingRefreshKey] = useState(0)
+  const [attachmentRefreshKey, setAttachmentRefreshKey] = useState(0)
+  // Work-item rows carry the job/run projection, so both `work_item.*` and
+  // `tool.retry` refresh them; the admin-only context packet has its own nonce.
+  const [workItemsRefreshKey, setWorkItemsRefreshKey] = useState(0)
+  const [contextRefreshKey, setContextRefreshKey] = useState(0)
+  // W1-14B: execution-time discovery observations and the discovery-side
+  // coverage matrix share the `resource.delta` / frozen-scope events.
+  const [discoveryRefreshKey, setDiscoveryRefreshKey] = useState(0)
+  const [coverageRefreshKey, setCoverageRefreshKey] = useState(0)
+  // W2-12 FE-19: the latest discovery revision auto-confirm/rollback notice.
+  const [discoveryRevision, setDiscoveryRevision] = useState<DiscoveryRevisionData | null>(null)
+  const [pendingQuestions, setPendingQuestions] = useState<QuestionBatch[]>([])
+  // v0.22 decision requests are version todos too, but they are human_request
+  // decision cards, not QuestionCards (approval/blocked_recovery/conflict).
+  const [pendingDecisions, setPendingDecisions] = useState<HumanRequest[]>([])
 
   // `?case=` / `?conversation=` deep links for the design workspace. The route
   // already forwards `conversation` for clarification; read the URL here so the
@@ -218,9 +447,19 @@ export function VersionDetailPage({
   const designConversationId =
     initialConversationId ?? searchParams.get("conversation") ?? undefined
   const designCaseId = searchParams.get("case") ?? undefined
+  // `?export=` opens one export artifact's detail inside the design workspace.
+  const designExportId = searchParams.get("export") ?? undefined
   // `?wave=` / `?case_run=` select a wave/case run inside the execution tab.
   const executionWaveId = searchParams.get("wave") ?? undefined
   const executionCaseRunId = searchParams.get("case_run") ?? undefined
+  // Task 35: forward the evidence deep link to the execution tab.
+  const executionEvidenceId = searchParams.get("evidence") ?? undefined
+  // H7: attachment images are only loaded for an explicitly selected attachment.
+  const attachmentId = searchParams.get("attachment") ?? undefined
+  // W1-4A: work-item and fact deep links inside the overview data blocks.
+  const versionWorkItemId = searchParams.get("work_item") ?? undefined
+  const versionFactId =
+    searchParams.get("panel") === "facts" ? (searchParams.get("fact") ?? undefined) : undefined
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -283,6 +522,49 @@ export function VersionDetailPage({
     void refreshStage()
   }, [refreshStage])
 
+  // Pending structured questions are a version todo: only load them once the
+  // v0.22 stage projection is available. A failure renders no cards instead of
+  // blocking the page (questions never block stage progression, R-B3-4).
+  //
+  // `GET /questions` also returns the approval/blocked_recovery/conflict
+  // decision rows (W2-2); those are split out and never become QuestionCards.
+  const refreshQuestions = useCallback(async () => {
+    try {
+      const questions = await listQuestions(versionId, { status: "pending" })
+      setPendingQuestions(questions.filter(isClarificationQuestionBatch))
+    } catch {
+      setPendingQuestions([])
+    }
+    try {
+      const humanRequests = await listHumanRequests(versionId, { status: "pending" })
+      setPendingDecisions(
+        humanRequests.filter(
+          (request) => request.status === "pending" && isHumanDecisionKind(request.kind),
+        ),
+      )
+    } catch {
+      setPendingDecisions([])
+    }
+  }, [versionId])
+
+  /**
+   * Resolve one approval/blocked_recovery/conflict request through the existing
+   * `POST /api/human-requests/{id}/resolve` route, then refetch the pending
+   * projections so an answered card disappears without a page reload.
+   */
+  const handleResolveDecision = useCallback(
+    async (id: string, response: HumanRequestResponseInput): Promise<void> => {
+      await resolveHumanRequest(id, response)
+      await refreshQuestions()
+    },
+    [refreshQuestions],
+  )
+
+  useEffect(() => {
+    if (stage === null) return
+    void refreshQuestions()
+  }, [stage, refreshQuestions])
+
   useEffect(() => {
     setActiveTab(parseVersionTab(initialTab))
   }, [initialTab])
@@ -292,6 +574,7 @@ export function VersionDetailPage({
   }, [refreshCounts])
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const stageRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingRefresh = useRef({ version: false, counts: false })
 
   const runPendingRefresh = useCallback(() => {
@@ -319,10 +602,64 @@ export function VersionDetailPage({
   const refreshVersionAndCounts = useCallback(() => scheduleRefresh(true), [scheduleRefresh])
   const refreshCountsOnly = useCallback(() => scheduleRefresh(false), [scheduleRefresh])
 
+  // A version burst often carries the version event and the stage event back to
+  // back; both branches schedule the stage read, so debounce it to one GET.
+  const scheduleStageRefresh = useCallback(() => {
+    if (stageRefreshTimer.current !== null) clearTimeout(stageRefreshTimer.current)
+    stageRefreshTimer.current = setTimeout(() => {
+      stageRefreshTimer.current = null
+      void refreshStage()
+    }, SSE_REFRESH_DEBOUNCE_MS)
+  }, [refreshStage])
+
   const refreshVersionAndStage = useCallback(() => {
     refreshVersionAndCounts()
-    void refreshStage()
-  }, [refreshVersionAndCounts, refreshStage])
+    scheduleStageRefresh()
+  }, [refreshVersionAndCounts, scheduleStageRefresh])
+
+  // A successful inline binding save is the same snapshot change as the
+  // `version.binding.changed` SSE event: re-read the binding and the version
+  // projection instead of trusting only the response the child applied.
+  const refreshBindingAfterSave = useCallback(() => {
+    setBindingRefreshKey((current) => current + 1)
+    refreshVersionAndCounts()
+  }, [refreshVersionAndCounts])
+
+  // `resource.delta` and a frozen scope snapshot both change the discovered
+  // resource set, so the observations and the coverage matrix refetch together.
+  const refreshDiscovery = useCallback(() => {
+    setDiscoveryRefreshKey((current) => current + 1)
+    setCoverageRefreshKey((current) => current + 1)
+  }, [])
+
+  const rollbackDiscoveryRevision = useCallback(
+    (caseVersionId: string, reason?: string) =>
+      reason === undefined
+        ? rollbackCaseVersion(versionId, caseVersionId)
+        : rollbackCaseVersion(versionId, caseVersionId, reason),
+    [versionId],
+  )
+
+  const handleDiscoveryRolledBack = useCallback(
+    (result?: CaseRevisionRollbackView) => {
+      setDiscoveryRevision((current) => {
+        if (current === null || result === undefined) return current
+        return {
+          ...current,
+          caseId: result.case_id,
+          caseVersionId: result.case_version_id,
+          revision: result.revision,
+          status: "confirmed",
+          trigger: "rollback",
+          rollbackOf: result.rolled_back_from,
+          inferred: false,
+        }
+      })
+      refreshDiscovery()
+      refreshVersionAndCounts()
+    },
+    [refreshDiscovery, refreshVersionAndCounts],
+  )
 
   const refreshSnapshotNow = useCallback(() => {
     if (refreshTimer.current !== null) {
@@ -336,20 +673,76 @@ export function VersionDetailPage({
   useEffect(
     () => () => {
       if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+      if (stageRefreshTimer.current !== null) clearTimeout(stageRefreshTimer.current)
     },
     [],
   )
 
   // One page-level subscription keeps the header projection and the tab counts
-  // live while the mounted tab owns its own workspace subscription.
+  // live while the mounted tab owns its own workspace subscription. Every v0.22
+  // event has exactly one branch in useVersionEvents (no duplicate handlers).
   useVersionEvents(versionId, {
     onVersionChanged: refreshVersionAndStage,
+    onStageChanged: refreshVersionAndStage,
+    onPlanChanged: () => setPlanRefreshKey((current) => current + 1),
+    onFactChanged: () => {
+      setPlanRefreshKey((current) => current + 1)
+      setBindingRefreshKey((current) => current + 1)
+    },
+    onQuestionChanged: () => {
+      void refreshQuestions()
+    },
+    // approval.requested/decided share the human-request refresh with the
+    // execution banner: both the pending decision cards and the question todo
+    // projection may have changed (W2-2 R-W2-1).
+    onHumanRequestChanged: () => {
+      void refreshQuestions()
+    },
+    onHandoffChanged: () => {
+      // The handoff is rendered by the clarification workspace; a version-level
+      // change only needs a projection refresh.
+      refreshCountsOnly()
+    },
+    onBindingChanged: () => {
+      setBindingRefreshKey((current) => current + 1)
+      refreshVersionAndCounts()
+    },
+    onAttachmentImageChanged: () => setAttachmentRefreshKey((current) => current + 1),
+    onWorkItemChanged: () => setWorkItemsRefreshKey((current) => current + 1),
+    onContextChanged: () => setContextRefreshKey((current) => current + 1),
+    // W1-14B: a delta pass settles/proposes discovered resources; the frozen
+    // scope snapshot changes which binding resources a wave may use.
+    onDiscoveryChanged: refreshDiscovery,
+    // W2-12 FE-19/EV-12: a discovery revision was auto-confirmed or rolled back;
+    // show the replacement/auto-confirm notice and refetch the discovery panels.
+    onDesignCaseChanged: (event) => {
+      if (event.type !== "case.revision.auto_confirmed") return
+      const next = discoveryRevisionFromEventPayload(event.payload)
+      if (next === null) return
+      setDiscoveryRevision(next)
+      refreshDiscovery()
+    },
+    onScopeSnapshotChanged: () => {
+      refreshDiscovery()
+      refreshVersionAndCounts()
+    },
+    // A tool retry re-runs one tool inside an agent run; the work-item rows show
+    // the run/activity projection, so they refetch on the same nonce.
+    onToolRetry: () => setWorkItemsRefreshKey((current) => current + 1),
     onRequirementChanged: refreshVersionAndStage,
     onIssueChanged: refreshCountsOnly,
     onReportChanged: refreshCountsOnly,
     onStreamReset: () => {
       refreshSnapshotNow()
       void refreshStage()
+      void refreshQuestions()
+      setPlanRefreshKey((current) => current + 1)
+      setBindingRefreshKey((current) => current + 1)
+      setAttachmentRefreshKey((current) => current + 1)
+      setWorkItemsRefreshKey((current) => current + 1)
+      setContextRefreshKey((current) => current + 1)
+      setDiscoveryRefreshKey((current) => current + 1)
+      setCoverageRefreshKey((current) => current + 1)
     },
   })
 
@@ -369,6 +762,11 @@ export function VersionDetailPage({
     const next = parseVersionTab(value)
     setActiveTab(next)
     const params = new URLSearchParams({ tab: next })
+    if (next === "overview") {
+      // Keep the H7 attachment-image deep link alive across tab switches.
+      const attachment = searchParams.get("attachment")
+      if (attachment) params.set("attachment", attachment)
+    }
     if (next === "requirements") {
       if (initialConversationId) params.set("conversation", initialConversationId)
       if (initialRequirementId) params.set("requirement", initialRequirementId)
@@ -376,14 +774,18 @@ export function VersionDetailPage({
     if (next === "design") {
       const conversationId = searchParams.get("conversation") ?? initialConversationId
       const caseId = searchParams.get("case")
+      const exportId = searchParams.get("export")
       if (conversationId) params.set("conversation", conversationId)
       if (caseId) params.set("case", caseId)
+      if (exportId) params.set("export", exportId)
     }
     if (next === "execution") {
       const waveId = searchParams.get("wave")
       const caseRunId = searchParams.get("case_run")
+      const evidenceId = searchParams.get("evidence")
       if (waveId) params.set("wave", waveId)
       if (caseRunId) params.set("case_run", caseRunId)
+      if (evidenceId) params.set("evidence", evidenceId)
     }
     if (next === "issues") {
       const issueId = searchParams.get("issue")
@@ -455,7 +857,42 @@ export function VersionDetailPage({
         stage={stage}
         onOpenTodo={() => setTodoOpen(true)}
         onReopened={(next) => setVersion(next)}
+        onStageChanged={(view) => {
+          setStage(view)
+          refreshVersionAndCounts()
+        }}
       />
+
+      {stage !== null ? (
+        <div className="space-y-3">
+          <StageBar
+            versionId={versionId}
+            stage={stage.stage}
+            stageEnteredAt={stage.stage_entered_at}
+            blocker={parseStageBlocker(stage.blocker)}
+            pausedReason={stage.stage === "paused" ? stage.blocker : null}
+            disabled={loading}
+            onStageChanged={(view) => {
+              setStage(view)
+              refreshVersionAndCounts()
+            }}
+          />
+          <BlockerPanel
+            versionId={versionId}
+            stage={stage.stage}
+            blocker={parseStageBlocker(stage.blocker)}
+            blockedSince={stage.stage === "blocked" ? stage.stage_entered_at : null}
+            onBlocked={(view) => {
+              setStage(view)
+              refreshVersionAndCounts()
+            }}
+            onUnblocked={(view) => {
+              setStage(view)
+              refreshVersionAndCounts()
+            }}
+          />
+        </div>
+      ) : null}
 
       <Tabs
         items={tabItems}
@@ -465,7 +902,120 @@ export function VersionDetailPage({
       />
 
       {activeTab === "overview" ? (
-        <VersionOverview version={version} />
+        <div className="space-y-4">
+          {stage !== null ? (
+            <>
+              <section data-testid="plan-overview" className="space-y-2">
+                <h2 className="text-sm font-semibold text-foreground">版本计划</h2>
+                <PlanPanel versionId={versionId} refreshKey={planRefreshKey} />
+              </section>
+              <BindingOverview
+                versionId={versionId}
+                refreshKey={bindingRefreshKey}
+                onUpdated={refreshBindingAfterSave}
+              />
+              <section data-testid="version-data" aria-label="版本数据" className="space-y-3">
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <h2 className="text-sm font-semibold text-foreground">版本数据</h2>
+                  <span className="text-[11px] text-muted-foreground">
+                    事实 · 作业与任务单 · 上下文包（只读投影）
+                  </span>
+                </div>
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <FactsPanel
+                    versionId={versionId}
+                    initialFactId={versionFactId}
+                    refreshKey={planRefreshKey}
+                  />
+                  <WorkItemsPanel
+                    versionId={versionId}
+                    initialWorkItemId={versionWorkItemId}
+                    refreshKey={workItemsRefreshKey}
+                  />
+                </div>
+                {isAdmin ? (
+                  <ContextPacketCard versionId={versionId} refreshKey={contextRefreshKey} />
+                ) : null}
+                <section
+                  data-testid="discovery-overview"
+                  aria-label="探索发现"
+                  className="space-y-3 border-t border-border pt-3"
+                >
+                  <div className="flex flex-wrap items-end justify-between gap-2">
+                    <h2 className="text-sm font-semibold text-foreground">探索发现</h2>
+                    <span className="text-[11px] text-muted-foreground">
+                      执行观测 · 待处理资源 · 发现侧覆盖（审批复用资源目录）
+                    </span>
+                  </div>
+                  {discoveryRevision !== null ? (
+                    <DiscoveryRevisionNotice
+                      revision={discoveryRevision}
+                      readOnly={!isAdmin}
+                      onRollback={rollbackDiscoveryRevision}
+                      onRolledBack={handleDiscoveryRolledBack}
+                    />
+                  ) : null}
+                  <DiscoveryPanel
+                    versionId={versionId}
+                    refreshKey={discoveryRefreshKey}
+                    onChanged={() => setCoverageRefreshKey((current) => current + 1)}
+                  />
+                  <CoveragePanel versionId={versionId} refreshKey={coverageRefreshKey} />
+                </section>
+              </section>
+              {pendingDecisions.length > 0 ? (
+                <section
+                  data-testid="pending-human-decisions"
+                  aria-label="待处理人工决策"
+                  className="space-y-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-sm font-semibold text-foreground">待处理人工决策</h2>
+                    <Badge tone="warning">{pendingDecisions.length}</Badge>
+                  </div>
+                  <HumanDecisionCards
+                    requests={pendingDecisions}
+                    onResolve={handleResolveDecision}
+                  />
+                </section>
+              ) : null}
+              {pendingQuestions.length > 0 ? (
+                <section
+                  data-testid="pending-questions"
+                  aria-label="待回答问题"
+                  className="space-y-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-sm font-semibold text-foreground">待回答问题</h2>
+                    <Badge tone="warning">{pendingQuestions.length}</Badge>
+                  </div>
+                  {pendingQuestions.map((question) => (
+                    <QuestionCard
+                      key={question.id}
+                      versionId={versionId}
+                      question={question}
+                      onUpdated={(updated) => {
+                        setPendingQuestions((current) =>
+                          current
+                            .map((item) => (item.id === updated.id ? updated : item))
+                            .filter((item) => item.status === "pending"),
+                        )
+                      }}
+                    />
+                  ))}
+                </section>
+              ) : null}
+            </>
+          ) : null}
+          <VersionOverview version={version} showBindings={stage === null} />
+          {attachmentId !== undefined ? (
+            <AttachmentImagesPanel
+              versionId={versionId}
+              attachmentId={attachmentId}
+              refreshKey={attachmentRefreshKey}
+            />
+          ) : null}
+        </div>
       ) : activeTab === "requirements" ? (
         <RequirementsTab
           versionId={versionId}
@@ -485,12 +1035,14 @@ export function VersionDetailPage({
           }}
           initialCaseId={designCaseId}
           initialConversationId={designConversationId}
+          initialExportId={designExportId}
         />
       ) : activeTab === "execution" ? (
         <ExecutionTab
           versionId={versionId}
           initialWaveId={executionWaveId}
           initialCaseRunId={executionCaseRunId}
+          initialEvidenceId={executionEvidenceId}
         />
       ) : activeTab === "chain" ? (
         <ChainTab versionId={versionId} onVersionChanged={refreshVersionAndCounts} />

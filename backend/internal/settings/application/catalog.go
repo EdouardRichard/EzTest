@@ -72,16 +72,20 @@ func Definitions(executorURL string) []settings.Definition {
 	minInjectionItems, maxInjectionItems := numberRange(0, 50)
 	minGCInterval, maxGCInterval := numberRange(5, 10080)
 	minGCBatch, maxGCBatch := numberRange(1, 5000)
+	minCompactionThreshold, maxCompactionThreshold := numberRange(0.5, 0.9)
+	minCompactionRetain, maxCompactionRetain := numberRange(0.05, 0.5)
+	minSummaryTokens, maxSummaryTokens := numberRange(256, 8192)
+	minOverflowRetries, maxOverflowRetries := numberRange(0, 5)
+	minVisionImages, maxVisionImages := numberRange(1, 500)
+	minImageBytes, maxImageBytes := numberRange(1024, 104857600)
+	minToolRetries, maxToolRetries := numberRange(0, 5)
+	minQuestionTimeout, maxQuestionTimeout := numberRange(60, 604800)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
 		{Key: "instance.heartbeat_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: minHeartbeat, Max: maxHeartbeat, Description: "Interval between API instance heartbeats in seconds."},
 		{Key: "instance.offline_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which an API instance is marked offline."},
 		{Key: "paths.data_root", Category: "paths", Type: settings.TypeString, Default: str("./.data"), RestartRequired: true, Description: "Root directory for runtime content (relative to the process CWD)."},
-		{Key: "paths.attachment_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/attachments"), Description: "Requirement attachment directory."},
-		{Key: "paths.evidence_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/evidence"), Description: "Execution evidence directory."},
-		{Key: "paths.report_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/reports"), Description: "Report HTML/PDF directory."},
-		{Key: "paths.export_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/exports"), Description: "Export artifact directory."},
 
 		{Key: "execution.global_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(3), Integer: true, Min: minConcurrency, Max: maxConcurrency, Description: "Maximum concurrent case runs across the instance."},
 		{Key: "execution.per_sut_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minPerSUT, Max: maxPerSUT, Description: "Maximum concurrent case runs per version SUT."},
@@ -122,10 +126,21 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "llm.request_timeout_seconds", Category: "llm", Type: settings.TypeNumber, Default: num(60), Integer: true, Min: number(1, 0), Description: "Default LLM request timeout."},
 		{Key: "llm.max_retries", Category: "llm", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: number(0, 0), Description: "Default LLM retry count."},
 
-		{Key: "context.window_tokens", Category: "context", Type: settings.TypeNumber, Default: num(64000), Integer: true, Min: number(1024, 0), Description: "Model context window used by the context budgeter."},
+		{Key: "tool.retry_max", Category: "tool", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minToolRetries, Max: maxToolRetries, Description: "Automatic retries for retryable tool errors before the error card surfaces."},
+		{Key: "question.timeout_seconds", Category: "question", Type: settings.TypeNumber, Default: num(86400), Integer: true, Min: minQuestionTimeout, Max: maxQuestionTimeout, Description: "Human-request question expiry; questions never block execution (24h default, C-2)."},
+
+		{Key: "vision.max_images_per_attachment", Category: "vision", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minVisionImages, Max: maxVisionImages, Description: "Maximum images extracted from one attachment; excess images are reported as skipped."},
+		{Key: "vision.max_image_bytes", Category: "vision", Type: settings.TypeNumber, Default: num(10 * 1024 * 1024), Integer: true, Min: minImageBytes, Max: maxImageBytes, Description: "Maximum single image size in bytes accepted by the vision pipeline (10 MiB default)."},
+
+		{Key: "context.window_tokens", Category: "context", Type: settings.TypeNumber, Default: num(128000), Integer: true, Min: number(1024, 0), Description: "Model context window used by the context budgeter."},
 		{Key: "context.output_reserve_tokens", Category: "context", Type: settings.TypeNumber, Default: num(8000), Integer: true, Min: number(0, 0), Description: "Tokens reserved for the model response."},
 		{Key: "context.compact_threshold", Category: "context", Type: settings.TypeNumber, Default: num(0.7), Min: minThreshold, Max: maxThreshold, Description: "Usage ratio that triggers rolling summarization."},
 		{Key: "context.keep_recent_messages", Category: "context", Type: settings.TypeNumber, Default: num(12), Integer: true, Min: number(0, 0), Description: "Recent messages kept verbatim during compaction."},
+
+		{Key: "compaction.threshold_ratio", Category: "compaction", Type: settings.TypeNumber, Default: num(0.8), Min: minCompactionThreshold, Max: maxCompactionThreshold, Description: "Usable-context usage ratio that triggers automatic compaction (spec formula 0.80)."},
+		{Key: "compaction.retain_ratio", Category: "compaction", Type: settings.TypeNumber, Default: num(0.16), Min: minCompactionRetain, Max: maxCompactionRetain, Description: "Fraction of the usable context kept verbatim after compaction (spec formula 0.16)."},
+		{Key: "compaction.summary_max_tokens", Category: "compaction", Type: settings.TypeNumber, Default: num(8192), Integer: true, Min: minSummaryTokens, Max: maxSummaryTokens, Description: "Maximum output tokens for one compaction summary; the budget formula also caps it at 8192."},
+		{Key: "compaction.overflow_retries", Category: "compaction", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minOverflowRetries, Max: maxOverflowRetries, Description: "Forced-compaction retries after a provider context-overflow error."},
 
 		{Key: "team_room.digest_every_n_posts", Category: "team_room", Type: settings.TypeNumber, Default: num(20), Integer: true, Min: number(1, 0), Description: "Generate a team-room digest every N posts."},
 		{Key: "team_room.digest_interval_minutes", Category: "team_room", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: number(1, 0), Description: "Generate a team-room digest at least every N minutes."},
@@ -134,11 +149,16 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "retention.temp_hours", Category: "retention", Type: settings.TypeNumber, Default: num(24), Integer: true, Min: number(1, 0), Description: "Retention for temporary files."},
 		{Key: "retention.replaced_export_days", Category: "retention", Type: settings.TypeNumber, Default: num(7), Integer: true, Min: number(1, 0), Description: "Retention for replaced exports."},
 		{Key: "retention.unreferenced_content_days", Category: "retention", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: number(1, 0), Description: "Retention for unreferenced content."},
-		{Key: "retention.gc_grace_hours", Category: "retention", Type: settings.TypeNumber, Default: num(24), Integer: true, Min: number(1, 0), Description: "GC grace period."},
+		{Key: "retention.gc_grace_hours", Category: "retention", Type: settings.TypeNumber, Default: num(168), Integer: true, Min: number(1, 0), Description: "Two-phase GC grace period in hours (168 = 7 days); dry-run reports candidates before apply may delete them."},
 		{Key: "retention.gc_dry_run", Category: "retention", Type: settings.TypeBool, Default: boolean(true), Description: "Run GC in dry-run mode by default."},
 		{Key: "retention.gc_interval_minutes", Category: "retention", Type: settings.TypeNumber, Default: num(1440), Integer: true, Min: minGCInterval, Max: maxGCInterval, Description: "Interval between leader-scheduled GC runs in minutes."},
 		{Key: "retention.gc_batch_size", Category: "retention", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minGCBatch, Max: maxGCBatch, Description: "Maximum candidate rows scanned by one GC pass."},
 		{Key: "retention.event_days", Category: "retention", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: minEventDays, Max: maxEventDays, Description: "Event-log retention in days; the leader-gated cleanup deletes older rows in batches."},
+
+		// W2-15 (spec R-W2-7, W2-C4, ST-16..ST-19): retention.* is the only GC
+		// settings family. The four legacy gc.* aliases were removed; capacity
+		// control (gc.max_bytes) is not implemented in v0.22 (residual) and must
+		// not be reintroduced as a dead key.
 
 		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("2"), Description: "Built-in report template version (\"1\" or \"2\")."},
 		{Key: "report.render_pdf", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Render PDF alongside the authoritative HTML report."},
@@ -164,10 +184,8 @@ func Definitions(executorURL string) []settings.Definition {
 
 		{Key: "security.audit_retention_days", Category: "security", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: number(1, 0), Description: "Audit log retention in days."},
 		{Key: "security.rate_limit_per_minute", Category: "security", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: minRateLimit, Max: maxRateLimit, Description: "Per-instance API request limit per minute; 0 disables limiting. Total rate is replicas x limit."},
-		{Key: "security.mask_secrets", Category: "security", Type: settings.TypeBool, Default: boolean(true), Description: "Mask secrets in admin responses (must stay on in 0.2)."},
 
 		{Key: "feature.auto_gap_design", Category: "feature", Type: settings.TypeBool, Default: boolean(true), Description: "Allow automatic design proposals for coverage gaps."},
-		{Key: "feature.experimental", Category: "feature", Type: settings.TypeBool, Default: boolean(false), Description: "Enable experimental features."},
 
 		{Key: "search.max_results_per_type", Category: "search", Type: settings.TypeNumber, Default: num(5), Integer: true, Min: minSearchResults, Max: maxSearchResults, Description: "Default maximum results per type for global search (query parameter may override)."},
 		{Key: "todos.max_items", Category: "workspace", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minTodoItems, Max: maxTodoItems, Description: "Default maximum items returned by the todos center (query parameter may override)."},

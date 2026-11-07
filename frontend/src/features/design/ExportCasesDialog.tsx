@@ -9,6 +9,7 @@ import { formatBytes } from "@/lib/format"
 
 import { createExport, downloadExport } from "./api"
 import { saveDownload } from "./download"
+import { ExportDetailPanel } from "./ExportDetailPanel"
 import { EXPORT_FORMATS, type ExportFormat, type ExportView } from "./types"
 
 const FORMAT_LABEL: Record<ExportFormat, string> = {
@@ -109,9 +110,12 @@ export function ExportCasesDialog({
       ) : null}
 
       {result !== null && busyFormat === null ? (
-        <p data-testid="export-status" role="status" className="mt-3 text-[11px] text-success">
-          已导出 {result.filename}（{formatBytes(result.size)}）
-        </p>
+        <div className="mt-3 space-y-2">
+          <p data-testid="export-status" role="status" className="text-[11px] text-success">
+            已导出 {result.filename}（{formatBytes(result.size)}）
+          </p>
+          <ExportDetailPanel exportId={result.id} initialView={result} />
+        </div>
       ) : null}
     </Dialog>
   )

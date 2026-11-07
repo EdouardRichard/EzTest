@@ -22,40 +22,65 @@ type CodeBaselineResolver interface {
 // creation (spec §5.5).
 const codeBaselineAuditWarning = "version.code_baseline_unresolved"
 
-// codeBaselineWarning is one binding whose baseline could not be resolved at
-// creation time.
+// codeBaselineWarning is one binding whose baseline could not be resolved.
 type codeBaselineWarning struct {
 	versionSUTID int64
 	repoID       int64
 }
 
-// resolveCodeBaselines fills Binding.CodeBaselineCommit for every binding with
-// a code repository. A resolver error or a malformed SHA leaves the column
-// empty and is returned as a warning so Create can record the audit entry after
-// the version is persisted.
+// resolveCodeBaselines fills Binding.CodeBaselineCommit for every binding's
+// deterministic baseline repository: the lowest effective repository ID among
+// the SUT inheritance plus the version overrides. A resolver error or a
+// malformed SHA leaves the column empty and is returned as a warning so Create
+// can record the audit entry after the version is persisted.
 func (s *Service) resolveCodeBaselines(ctx context.Context, bindings []version.Binding) []codeBaselineWarning {
 	if s.resolver == nil {
 		return nil
 	}
 	var warnings []codeBaselineWarning
 	for index := range bindings {
-		repoID := bindings[index].CodeRepositoryID
-		if repoID == nil || *repoID <= 0 {
-			continue
-		}
-		repository, err := s.catalog.GetRepository(ctx, *repoID)
+		repositories, err := s.bindingRepositories(ctx, bindings[index].SUTID, bindings[index].RepositoryOverrides)
 		if err != nil {
-			warnings = append(warnings, codeBaselineWarning{versionSUTID: bindings[index].ID, repoID: *repoID})
 			continue
 		}
-		commit, err := s.resolver.ResolveHeadCommit(ctx, repository)
-		if err != nil || !version.IsValidCodeBaselineCommit(commit) {
-			warnings = append(warnings, codeBaselineWarning{versionSUTID: bindings[index].ID, repoID: *repoID})
-			continue
-		}
+		commit, warning := s.resolveBaseline(ctx, bindings[index].ID, repositories)
 		bindings[index].CodeBaselineCommit = commit
+		if warning != nil {
+			warnings = append(warnings, *warning)
+		}
 	}
 	return warnings
+}
+
+// resolveBaseline resolves the HEAD commit of the first (lowest-ID) effective
+// repository of one binding. It returns an empty commit and a warning when the
+// resolver fails or returns a malformed SHA.
+func (s *Service) resolveBaseline(
+	ctx context.Context, versionSUTID int64, repositories []BindingRepository,
+) (string, *codeBaselineWarning) {
+	if s.resolver == nil {
+		return "", nil
+	}
+	var baseline *resourceapp.CodeRepositoryView
+	for _, repository := range repositories {
+		if repository.Included {
+			repositoryCopy := repository.Repository
+			baseline = &repositoryCopy
+			break
+		}
+	}
+	if baseline == nil {
+		return "", nil
+	}
+	repoID, err := parseCatalogID(baseline.ID)
+	if err != nil {
+		return "", &codeBaselineWarning{versionSUTID: versionSUTID}
+	}
+	commit, err := s.resolver.ResolveHeadCommit(ctx, *baseline)
+	if err != nil || !version.IsValidCodeBaselineCommit(commit) {
+		return "", &codeBaselineWarning{versionSUTID: versionSUTID, repoID: repoID}
+	}
+	return commit, nil
 }
 
 // recordCodeBaselineWarnings records one audit entry per unresolved binding.

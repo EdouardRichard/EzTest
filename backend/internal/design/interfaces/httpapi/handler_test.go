@@ -30,6 +30,9 @@ type fakeGraphService struct {
 	lastCaseID    int64
 	lastCaseVerID *int64
 	lastVersionID int64
+	rollbackView  designapp.CaseVersionRollbackView
+	lastReason    string
+	lastRolledID  int64
 }
 
 func (f *fakeGraphService) ReadGraph(_ context.Context, versionID int64) (designapp.GraphView, error) {
@@ -65,6 +68,17 @@ func (f *fakeGraphService) Confirm(_ context.Context, versionID int64, in design
 		return designapp.ConfirmResult{}, f.err
 	}
 	return f.confirmResult, nil
+}
+
+func (f *fakeGraphService) RollbackCaseVersion(_ context.Context, versionID, caseVersionID int64, reason string, actorID int64) (designapp.CaseVersionRollbackView, error) {
+	f.lastVersionID = versionID
+	f.lastRolledID = caseVersionID
+	f.lastReason = reason
+	f.lastActorID = actorID
+	if f.err != nil {
+		return designapp.CaseVersionRollbackView{}, f.err
+	}
+	return f.rollbackView, nil
 }
 
 type fakeExportService struct {
@@ -129,6 +143,7 @@ func testMux(handler *Handler) *http.ServeMux {
 	mux.Handle("GET /api/versions/{id}/design/overview", http.HandlerFunc(handler.Overview))
 	mux.Handle("GET /api/versions/{id}/design/cases/{caseId}", http.HandlerFunc(handler.GetCase))
 	mux.Handle("POST /api/versions/{id}/design/confirmations", http.HandlerFunc(handler.Confirm))
+	mux.Handle("POST /api/versions/{id}/case-versions/{caseVersionId}/rollback", http.HandlerFunc(handler.RollbackCaseVersion))
 	mux.Handle("POST /api/versions/{id}/exports", http.HandlerFunc(handler.CreateExport))
 	mux.Handle("GET /api/versions/{id}/exports", http.HandlerFunc(handler.ListExports))
 	mux.Handle("GET /api/exports/{exportId}", http.HandlerFunc(handler.GetExport))
@@ -534,6 +549,67 @@ func TestNoCloseDesignRoute(t *testing.T) {
 		if recorder.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want 404", target, recorder.Code)
 		}
+	}
+}
+
+func TestRollbackCaseVersionHandler(t *testing.T) {
+	handler, graph, _ := newTestHandler()
+	graph.rollbackView = designapp.CaseVersionRollbackView{
+		CaseID: 7001, CaseVersionID: 7009, RolledBackFrom: 7008,
+		Revision: 3, Status: "confirmed", Trigger: "rollback",
+	}
+	body := `{"reason":"探索误判"}`
+	recorder := httptest.NewRecorder()
+	testMux(handler).ServeHTTP(recorder, authedRequest(http.MethodPost,
+		"/api/versions/1001/case-versions/7008/rollback", strings.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	if graph.lastVersionID != 1001 || graph.lastRolledID != 7008 || graph.lastReason != "探索误判" || graph.lastActorID != 7 {
+		t.Fatalf("rollback input version=%d rolled=%d reason=%q actor=%d",
+			graph.lastVersionID, graph.lastRolledID, graph.lastReason, graph.lastActorID)
+	}
+	data := decodeEnvelope(t, recorder)
+	if data["case_id"] != "7001" || data["case_version_id"] != "7009" ||
+		data["rolled_back_from"] != "7008" || data["trigger"] != "rollback" {
+		t.Fatalf("rollback envelope = %v", data)
+	}
+
+	// Invalid path id and malformed JSON are 400s and never reach the service.
+	invalid := httptest.NewRecorder()
+	testMux(handler).ServeHTTP(invalid, authedRequest(http.MethodPost,
+		"/api/versions/1001/case-versions/not-a-number/rollback", nil))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid path status = %d", invalid.Code)
+	}
+	malformed := httptest.NewRecorder()
+	testMux(handler).ServeHTTP(malformed, authedRequest(http.MethodPost,
+		"/api/versions/1001/case-versions/7008/rollback", strings.NewReader("not-json")))
+	if malformed.Code != http.StatusBadRequest {
+		t.Fatalf("malformed body status = %d body=%s", malformed.Code, malformed.Body.String())
+	}
+}
+
+func TestRollbackCaseVersionHandlerErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"not_found", platform.NotFound("case version"), http.StatusNotFound},
+		{"conflict", platform.StateConflict("only a confirmed case version can be rolled back"), http.StatusConflict},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			handler, graph, _ := newTestHandler()
+			graph.err = testCase.err
+			recorder := httptest.NewRecorder()
+			testMux(handler).ServeHTTP(recorder, authedRequest(http.MethodPost,
+				"/api/versions/1001/case-versions/7008/rollback", nil))
+			if recorder.Code != testCase.status {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, testCase.status, recorder.Body.String())
+			}
+		})
 	}
 }
 

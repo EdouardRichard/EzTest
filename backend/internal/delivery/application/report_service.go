@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"time"
@@ -77,6 +78,12 @@ type ReportService struct {
 	tasks    TaskEnsurer
 	sections delivery.SectionOptions
 
+	// v0.22 W2-7 report export artifacts (spec §4.29 R-W2-3). They stay
+	// optional so the P4/P7 constructors keep compiling; WithArtifactStore
+	// attaches the storage adapter and ID generator.
+	artifacts   ReportArtifactStore
+	artifactIDs platformid.Generator
+
 	// P6 cross-version read ports. They stay optional so the P4 constructor
 	// and its tests keep compiling; WithGlobalReader attaches them.
 	global GlobalReportReader
@@ -87,6 +94,28 @@ type ReportService struct {
 	renderJobs     RenderJobRepository
 	renderPDF      bool
 	renderAttempts int
+
+	// stageNotifier is the v0.22 report.published production callback (Task 25,
+	// R-B4-3). nil keeps the pre-v0.22 behavior; Task 36 wires
+	// *versionapp.StageService here so a published version report can complete
+	// the version without a manual stage API call.
+	stageNotifier ReportPublishedStageNotifier
+}
+
+// ReportPublishedStageNotifier is the narrow production callback ReportService
+// invokes after a report revision is published (and again on an idempotent
+// re-publish so a lost stage advance can heal). Implementations must be
+// idempotent; the report publish is already committed, so the callback is best
+// effort.
+//
+// Report-kind contract (note for Task 36): Publish notifies for every report
+// kind, wave and version alike. The StageService.ReportPublished gate adapter
+// must therefore mean "the *version* report is published", never "some report is
+// published"; a wave-report publish arriving while the version is reporting must
+// not be treated as the completion evidence. The gate re-check makes that
+// explicit, and the deferred wording decision is tracked in task-25-report.md.
+type ReportPublishedStageNotifier interface {
+	OnReportPublished(ctx context.Context, versionID int64) error
 }
 
 // NewReportService wires the report use cases. events, audit and tasks may be
@@ -135,6 +164,14 @@ func (s *ReportService) WithRenderJobs(jobs RenderJobRepository, renderEnabled b
 		maxAttempts = DefaultRenderMaxAttempts
 	}
 	s.renderAttempts = maxAttempts
+	return s
+}
+
+// WithReportPublishedNotifier attaches the v0.22 report.published production
+// callback (Task 25, R-B4-3). It returns the service so the composition root can
+// chain it. A nil notifier keeps the pre-v0.22 behavior.
+func (s *ReportService) WithReportPublishedNotifier(notifier ReportPublishedStageNotifier) *ReportService {
+	s.stageNotifier = notifier
 	return s
 }
 
@@ -389,6 +426,9 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 		if err := s.ensureWaveLink(ctx, report); err != nil {
 			return current, err
 		}
+		// Re-fire the stage callback so a stage advance lost after the first
+		// publish can heal; the stage service is idempotent.
+		s.notifyReportPublished(ctx, report)
 		return current, nil
 	}
 	if current.Status != delivery.ReportStatusDraft {
@@ -457,7 +497,24 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 	s.bookPDF(ctx, report, published)
 	s.publishPublishedEvent(ctx, report, published)
 	s.recordPublishedAudit(ctx, report, published)
+	s.notifyReportPublished(ctx, report)
 	return published, nil
+}
+
+// notifyReportPublished invokes the optional v0.22 production report.published
+// callback (Task 25, R-B4-3). The publish is already committed, so the callback
+// is best effort: a failed stage advance is retried by the stage reconciler/API
+// and never rolls the report back. The failure is logged instead of silently
+// discarded (Task 25 fix round 1).
+func (s *ReportService) notifyReportPublished(ctx context.Context, report delivery.Report) {
+	if s.stageNotifier == nil || report.VersionID <= 0 {
+		return
+	}
+	if err := s.stageNotifier.OnReportPublished(ctx, report.VersionID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"delivery: report-published stage callback failed; the stage reconciler will retry",
+			"report_id", report.ID, "version_id", report.VersionID, "kind", string(report.Kind), "error", err)
+	}
 }
 
 // bookPDF books the P7 PDF work for one published revision (spec §4.2). It is

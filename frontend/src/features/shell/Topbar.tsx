@@ -2,7 +2,7 @@
 
 import { ChevronDown, KeyRound, LogOut } from "lucide-react"
 import { usePathname, useRouter } from "next/navigation"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { cn } from "@/components/ui/cn"
 import { useAuth } from "@/features/auth/AuthProvider"
 import { ChangePasswordDialog } from "@/features/auth/ChangePasswordDialog"
@@ -25,8 +25,10 @@ const ROLE_LABELS: Record<string, string> = {
   user: "普通用户",
 }
 
-function useSystemStreamStatus(token: string | null): SSEStatus {
+function useSystemStreamStatus(token: string | null, refresh: () => void): SSEStatus {
   const [status, setStatus] = useState<SSEStatus>("closed")
+  const refreshRef = useRef(refresh)
+  refreshRef.current = refresh
 
   useEffect(() => {
     if (token === null) {
@@ -36,7 +38,21 @@ function useSystemStreamStatus(token: string | null): SSEStatus {
     return connectSSE({
       url: `${getApiBaseUrl()}/api/stream?channel=system`,
       token,
-      onEvent: () => {},
+      onEvent: (event) => {
+        try {
+          const parsed: unknown = JSON.parse(event.data)
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return
+          const type = (parsed as { type?: unknown }).type
+          if (typeof type !== "string") return
+          // The system channel carries resource/settings/instance/config
+          // changes. Log the type for diagnosis and refresh the rendered
+          // server data; there is no new global store for these events.
+          console.debug("[system-sse] event", { channel: "system", type })
+          refreshRef.current()
+        } catch {
+          // Malformed frames are ignored; the status indicator still works.
+        }
+      },
       onStatus: setStatus,
     })
   }, [token])
@@ -52,7 +68,7 @@ export function Topbar() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [passwordOpen, setPasswordOpen] = useState(false)
   const [loggingOut, setLoggingOut] = useState(false)
-  const status = useSystemStreamStatus(token)
+  const status = useSystemStreamStatus(token, () => router.refresh())
   const statusMeta = STATUS_META[status]
 
   const title = findNavItem(pathname)?.label ?? "EzTest"

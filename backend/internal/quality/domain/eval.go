@@ -11,9 +11,15 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// EvalMode is the only evaluation track of P6. The deterministic fake-LLM
-// track of 0.1 P8 is intentionally not implemented (spec §5.4/P6-D-12).
+// EvalModeRealLLM is the P6 real-LLM evaluation track. The deterministic
+// fake-LLM track of 0.1 P8 is intentionally not implemented (spec
+// §5.4/P6-D-12).
 const EvalModeRealLLM = "real_llm"
+
+// EvalModeSnapshot is the v0.22 admin-triggered snapshot evaluation (W2-14,
+// R-W2-6): the server derives four metrics from the version's current real
+// product data instead of a client-supplied sample. No new LLM pipeline.
+const EvalModeSnapshot = "snapshot"
 
 // Terminal statuses of one eval run (contracts/openapi.yaml EvalRunView).
 const (
@@ -24,7 +30,10 @@ const (
 )
 
 // Metric names of spec §5.3. The impact KPI reports recall and precision
-// separately; the optional visual metric is the "+1".
+// separately; the optional visual metric is the "+1". The v0.22 snapshot track
+// (W2-14) reuses design_coverage/visual_classification_accuracy, promotes the
+// operational execution pass rate into an eval metric and adds case_coverage
+// (confirmed case versions over confirmed requirements, capped at 1).
 const (
 	MetricDesignCoverage               = "design_coverage"
 	MetricImpactRecall                 = "impact_recall"
@@ -33,6 +42,8 @@ const (
 	MetricIssueFalsePositiveRate       = "issue_false_positive_rate"
 	MetricSupplementHitRate            = "supplement_hit_rate"
 	MetricVisualClassificationAccuracy = "visual_classification_accuracy"
+	MetricExecutionPassRate            = "execution_pass_rate"
+	MetricCaseCoverage                 = "case_coverage"
 )
 
 // Real-LLM report thresholds of spec §5.3. They are observable quality
@@ -45,6 +56,8 @@ const (
 	ThresholdIssueFalsePositiveRate       = 0.15
 	ThresholdSupplementHitRate            = 0.50
 	ThresholdVisualClassificationAccuracy = 0.80
+	ThresholdExecutionPassRate            = 0.80
+	ThresholdCaseCoverage                 = 0.80
 )
 
 // Metric failure reasons recorded in MetricDetail (contract enum).
@@ -87,7 +100,86 @@ type Sample struct {
 	VisualCorrect          *int
 }
 
-// MetricDetail explains one metric verdict without exposing corpus content.
+// SnapshotSample is one server-derived mode=snapshot observation (W2-14). The
+// service builds it from the other contexts' read ports, never from a client
+// payload: requirements closed/total (version), finished case runs passed/total
+// (execution), confirmed case versions and requirement total (design) and the
+// visual diff classification passed/failed counters (visual).
+type SnapshotSample struct {
+	ConfirmedRequirements int
+	CoveredRequirements   int
+	ConfirmedCases        int
+	ExecutionPassed       int
+	ExecutionFinished     int
+	VisualPassed          int
+	VisualEvaluated       int
+}
+
+// ValidateSnapshot rejects a physically impossible snapshot observation. It is
+// the server-side counterpart of ValidateSample: a count metric may never exceed
+// its own denominator.
+func ValidateSnapshot(sample SnapshotSample) error {
+	nonNegative := []struct {
+		field string
+		value int
+	}{
+		{"confirmed_requirements", sample.ConfirmedRequirements},
+		{"covered_requirements", sample.CoveredRequirements},
+		{"confirmed_cases", sample.ConfirmedCases},
+		{"execution_passed", sample.ExecutionPassed},
+		{"execution_finished", sample.ExecutionFinished},
+		{"visual_passed", sample.VisualPassed},
+		{"visual_evaluated", sample.VisualEvaluated},
+	}
+	for _, item := range nonNegative {
+		if item.value < 0 {
+			return platform.Invalid(item.field, "must not be negative")
+		}
+	}
+	if sample.CoveredRequirements > sample.ConfirmedRequirements {
+		return platform.Invalid("covered_requirements", "must not exceed confirmed_requirements")
+	}
+	if sample.ExecutionPassed > sample.ExecutionFinished {
+		return platform.Invalid("execution_passed", "must not exceed execution_finished")
+	}
+	if sample.VisualPassed > sample.VisualEvaluated {
+		return platform.Invalid("visual_passed", "must not exceed visual_evaluated")
+	}
+	return nil
+}
+
+// EvaluateSnapshot derives the four mode=snapshot metrics from one validated
+// observation. baseline is the previous snapshot of the same version; it only
+// marks regressions (warn-only, never a block). case_coverage is the confirmed
+// case-version count over the confirmed requirement count with the numerator
+// capped at the denominator (the W2-14 brief: a requirement needs at least one
+// confirmed case, and extra case versions cannot push coverage above 100%). The
+// status is passed only when all four metrics pass their threshold and none
+// regressed.
+func EvaluateSnapshot(sample SnapshotSample, baseline map[string]float64, regressionTolerance float64) (string, []Metric) {
+	if regressionTolerance < 0 {
+		regressionTolerance = 0
+	}
+	caseNumerator := sample.ConfirmedCases
+	if caseNumerator > sample.ConfirmedRequirements {
+		caseNumerator = sample.ConfirmedRequirements
+	}
+	metrics := []Metric{
+		evaluateRatio(MetricDesignCoverage, sample.CoveredRequirements, sample.ConfirmedRequirements, baseline, regressionTolerance),
+		evaluateRatio(MetricExecutionPassRate, sample.ExecutionPassed, sample.ExecutionFinished, baseline, regressionTolerance),
+		evaluateRatio(MetricCaseCoverage, caseNumerator, sample.ConfirmedRequirements, baseline, regressionTolerance),
+		evaluateRatio(MetricVisualClassificationAccuracy, sample.VisualPassed, sample.VisualEvaluated, baseline, regressionTolerance),
+	}
+	status := StatusPassed
+	for _, metric := range metrics {
+		if !metric.Passed {
+			status = StatusFailed
+			break
+		}
+	}
+	return status, metrics
+}
+
 type MetricDetail struct {
 	Numerator       int      `json:"numerator"`
 	Denominator     int      `json:"denominator"`
@@ -122,6 +214,26 @@ var realLLMThresholds = map[string]threshold{
 	MetricIssueFalsePositiveRate:       {value: ThresholdIssueFalsePositiveRate, max: true},
 	MetricSupplementHitRate:            {value: ThresholdSupplementHitRate},
 	MetricVisualClassificationAccuracy: {value: ThresholdVisualClassificationAccuracy},
+	MetricExecutionPassRate:            {value: ThresholdExecutionPassRate},
+	MetricCaseCoverage:                 {value: ThresholdCaseCoverage},
+}
+
+// SnapshotMetricOrder is the stable metric order of a mode=snapshot run
+// (W2-14): design coverage, execution pass rate, case coverage and visual
+// classification accuracy.
+var SnapshotMetricOrder = []string{
+	MetricDesignCoverage,
+	MetricExecutionPassRate,
+	MetricCaseCoverage,
+	MetricVisualClassificationAccuracy,
+}
+
+// IsKnownMetric reports whether name is a metric this context derives. The
+// trends endpoint rejects unknown metric names instead of returning an
+// always-empty series.
+func IsKnownMetric(name string) bool {
+	_, ok := realLLMThresholds[name]
+	return ok
 }
 
 // ValidateSample rejects a physically impossible observation. The runner must

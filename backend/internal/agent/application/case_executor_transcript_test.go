@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
@@ -173,9 +174,9 @@ func TestCaseExecutorPrunesBrowserSnapshots(t *testing.T) {
 	}
 }
 
-// TestCaseBudgetExitKeepsExecutedAssertions covers the S5 retry-7 outcome: the
-// token budget turns the next turn into a settlement turn with tools disabled,
-// so the assertions of already executed steps could never be written
+// TestCaseBudgetExitKeepsExecutedAssertions covers the S5 retry-7 outcome: a
+// hit wall-clock budget turns the next turn into a settlement turn with tools
+// disabled, so the assertions of already executed steps could never be written
 // (assertion_total=0). The case executor keeps a recording-only settlement
 // surface: it may record the real results of steps it already executed, but it
 // may not run a new browser/network action nor finalize the case. The
@@ -183,11 +184,17 @@ func TestCaseExecutorPrunesBrowserSnapshots(t *testing.T) {
 // writes the budget cause/handoff (Task 92), so the verdict stays honest and
 // nothing is fabricated: the model still supplies every verdict, the server
 // overwrites expected with the P2 assertion truth, and unexecuted steps stay
-// unrecorded.
+// unrecorded. The time budget, not the retired token cap, opens the settlement
+// turn (R-A2-1).
 func TestCaseBudgetExitKeepsExecutedAssertions(t *testing.T) {
 	fixture, execution := newCaseExecutorTranscriptFixture(t, fourStepExecutionTask())
 	item := p3CaseItem()
-	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":8}`)
+	item.Budget = json.RawMessage(`{"run_seconds":1,"max_turns_fuse":8}`)
+	fixture.chat.onChat = func(index int, _ llmapp.ChatRequest) {
+		if index == 0 {
+			fixture.clock.Advance(2 * time.Second)
+		}
+	}
 	fixture.chat.responses = []llmapp.ChatResponse{
 		{
 			ToolCalls: []llmapp.ToolCall{{
@@ -219,8 +226,8 @@ func TestCaseBudgetExitKeepsExecutedAssertions(t *testing.T) {
 	if result.Status != agent.AgentRunDone {
 		t.Fatalf("result = %#v, want a settled done run", result)
 	}
-	if result.SettlementCause != agentapp.BudgetCauseTokens {
-		t.Fatalf("settlement cause = %q, want %q", result.SettlementCause, agentapp.BudgetCauseTokens)
+	if result.SettlementCause != agentapp.BudgetCauseTime {
+		t.Fatalf("settlement cause = %q, want %q", result.SettlementCause, agentapp.BudgetCauseTime)
 	}
 	if fixture.chat.requestCount() != 2 {
 		t.Fatalf("chat calls = %d, want tool turn + recording settlement turn", fixture.chat.requestCount())

@@ -15,6 +15,8 @@ import { listHumanRequests } from "@/features/execution/api"
 import { formatDateTime } from "@/lib/format"
 
 import { reopenVersion } from "./api"
+import { StageAdvanceAction } from "./StageAdvanceAction"
+import { StageRejectAction } from "./StageRejectAction"
 import { stageLabel } from "./stage"
 import type { Version, VersionStatus } from "./types"
 
@@ -24,6 +26,8 @@ export type VersionHeaderProps = {
   stage?: StageView | null
   /** Called with the server projection after a successful manual reopen. */
   onReopened?: (version: Version) => void
+  /** Called with the new stage projection after advance/reject. */
+  onStageChanged?: (view: StageView) => void
   /** Opens the shared topbar/page todo drawer. */
   onOpenTodo?: () => void
 }
@@ -44,6 +48,7 @@ export function VersionHeader({
   version,
   stage = null,
   onReopened,
+  onStageChanged,
   onOpenTodo,
 }: VersionHeaderProps) {
   const [openTodoCount, setOpenTodoCount] = useState<number | null>(null)
@@ -54,10 +59,10 @@ export function VersionHeader({
 
   useEffect(() => {
     let cancelled = false
-    void listHumanRequests(version.id, { status: "open" })
+    void listHumanRequests(version.id, { status: "pending" })
       .then((requests) => {
         if (!cancelled) {
-          setOpenTodoCount(requests.filter((request) => request.status === "open").length)
+          setOpenTodoCount(requests.filter((request) => request.status === "pending").length)
         }
       })
       .catch(() => {
@@ -141,6 +146,17 @@ export function VersionHeader({
             {pendingDesignCount} 条待设计
           </Link>
         ) : null}
+
+        <StageAdvanceAction
+          versionId={version.id}
+          stage={stage?.stage ?? null}
+          onAdvanced={onStageChanged}
+        />
+        <StageRejectAction
+          versionId={version.id}
+          stage={stage?.stage ?? null}
+          onRejected={onStageChanged}
+        />
 
         {completed ? (
           <Button

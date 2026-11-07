@@ -68,12 +68,27 @@ type fakeIssueRepository struct {
 	applyErr    error
 	applyCalls  []IssueRecurrence
 
+	manualResult delivery.Issue
+	manualErr    error
+	manualCalls  []IssueManualCreate
+
+	updateManualResult delivery.Issue
+	updateManualErr    error
+	updateManualCalls  []IssueManualUpdate
+
 	appendRefsErr   error
 	appendRefsCalls []issueAppendRefsCall
 
 	listResult []delivery.Issue
 	listErr    error
 	listCalls  []issueListCall
+
+	retestStartCalls  []IssueRetestStart
+	retestStartErr    error
+	retestResultCalls []IssueRetestResult
+	retestResultErr   error
+	retestResultNoop  bool
+	retestFind        map[int64]delivery.Issue
 }
 
 // issueAppendRefsCall records one AppendRefs fallback.
@@ -155,6 +170,36 @@ func (r *fakeIssueRepository) ApplyRecurrence(_ context.Context, rec IssueRecurr
 	return r.applyResult, nil
 }
 
+func (r *fakeIssueRepository) CreateManual(_ context.Context, c IssueManualCreate) (delivery.Issue, error) {
+	r.manualCalls = append(r.manualCalls, IssueManualCreate{
+		Issue:   c.Issue,
+		Refs:    append([]delivery.IssueRef(nil), c.Refs...),
+		History: c.History,
+	})
+	if r.manualErr != nil {
+		return delivery.Issue{}, r.manualErr
+	}
+	return r.manualResult, nil
+}
+
+func (r *fakeIssueRepository) UpdateManual(_ context.Context, u IssueManualUpdate) (delivery.Issue, error) {
+	r.updateManualCalls = append(r.updateManualCalls, IssueManualUpdate{
+		VersionID:        u.VersionID,
+		IssueID:          u.IssueID,
+		Title:            u.Title,
+		Summary:          u.Summary,
+		Category:         u.Category,
+		Severity:         u.Severity,
+		ExpectedRevision: u.ExpectedRevision,
+		Refs:             append([]delivery.IssueRef(nil), u.Refs...),
+		History:          u.History,
+	})
+	if r.updateManualErr != nil {
+		return delivery.Issue{}, r.updateManualErr
+	}
+	return r.updateManualResult, nil
+}
+
 func (r *fakeIssueRepository) AppendRefs(_ context.Context, issueID int64, refs []delivery.IssueRef) error {
 	r.appendRefsCalls = append(r.appendRefsCalls, issueAppendRefsCall{
 		issueID: issueID,
@@ -190,7 +235,129 @@ func (r *fakeIssueRepository) FindByCaseRun(_ context.Context, _, caseRunID int6
 	return issue, ok, nil
 }
 
+func (r *fakeIssueRepository) StartRetest(_ context.Context, in IssueRetestStart) (delivery.Issue, error) {
+	r.retestStartCalls = append(r.retestStartCalls, in)
+	if r.retestStartErr != nil {
+		return delivery.Issue{}, r.retestStartErr
+	}
+	issue, ok := r.getIssues[in.IssueID]
+	if !ok {
+		return delivery.Issue{}, delivery.ErrNotFound
+	}
+	if in.ExpectedRetestStatus != issue.RetestStatus || !sameOptionalTestID(in.ExpectedLastRetestWaveID, issue.LastRetestWaveID) {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+	issue.RetestStatus = delivery.IssueRetestStatusRetesting
+	waveID := in.WaveID
+	issue.LastRetestWaveID = &waveID
+	issue.UpdatedAt = in.Now
+	r.getIssues[in.IssueID] = issue
+	r.refs = append(r.refs, in.Refs...)
+	return issue, nil
+}
+
+func sameOptionalTestID(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func (r *fakeIssueRepository) ApplyRetestResult(_ context.Context, in IssueRetestResult) (delivery.Issue, bool, error) {
+	r.retestResultCalls = append(r.retestResultCalls, in)
+	if r.retestResultErr != nil {
+		return delivery.Issue{}, false, r.retestResultErr
+	}
+	issue, ok := r.getIssues[in.IssueID]
+	if !ok {
+		return delivery.Issue{}, false, delivery.ErrNotFound
+	}
+	if issue.LastRetestWaveID == nil || *issue.LastRetestWaveID != in.WaveID {
+		return delivery.Issue{}, false, delivery.ErrStateConflict
+	}
+	changed := issue.RetestStatus != in.TargetStatus ||
+		issue.LastRetestCaseRunID == nil || *issue.LastRetestCaseRunID != in.CaseRunID
+	if r.retestResultNoop {
+		return issue, false, nil
+	}
+	issue.RetestStatus = in.TargetStatus
+	caseRunID := in.CaseRunID
+	issue.LastRetestCaseRunID = &caseRunID
+	issue.UpdatedAt = in.Now
+	r.getIssues[in.IssueID] = issue
+	return issue, changed, nil
+}
+
+func (r *fakeIssueRepository) FindByRetestWave(_ context.Context, waveID int64) (delivery.Issue, bool, error) {
+	if r.retestFind != nil {
+		issue, ok := r.retestFind[waveID]
+		return issue, ok, nil
+	}
+	for _, issue := range r.getIssues {
+		if issue.LastRetestWaveID != nil && *issue.LastRetestWaveID == waveID {
+			return issue, true, nil
+		}
+	}
+	return delivery.Issue{}, false, nil
+}
+
 var _ IssueRepository = (*fakeIssueRepository)(nil)
+
+// fakeRetestExecutor is the in-memory W2-5 RetestExecutor.
+type fakeRetestExecutor struct {
+	active      *RetestWave
+	activeErr   error
+	wave        RetestWave
+	waveErr     error
+	createErr   error
+	createCalls []issueRetestIntentCall
+	cancelErr   error
+	canceled    []int64
+	activeCalls []int64
+	startCalls  []int64
+}
+
+type issueRetestIntentCall struct {
+	versionID     int64
+	caseVersionID int64
+	actorID       int64
+}
+
+func (e *fakeRetestExecutor) CreateRetestIntent(_ context.Context, versionID, caseVersionID, actorID int64) (int64, error) {
+	e.createCalls = append(e.createCalls, issueRetestIntentCall{
+		versionID: versionID, caseVersionID: caseVersionID, actorID: actorID,
+	})
+	if e.createErr != nil {
+		return 0, e.createErr
+	}
+	return int64(1000 + len(e.createCalls)), nil
+}
+
+func (e *fakeRetestExecutor) CancelRetestIntent(_ context.Context, intentID int64) error {
+	e.canceled = append(e.canceled, intentID)
+	return e.cancelErr
+}
+
+func (e *fakeRetestExecutor) ActiveWave(_ context.Context, versionID int64) (RetestWave, bool, error) {
+	e.activeCalls = append(e.activeCalls, versionID)
+	if e.activeErr != nil {
+		return RetestWave{}, false, e.activeErr
+	}
+	if e.active == nil {
+		return RetestWave{}, false, nil
+	}
+	return *e.active, true, nil
+}
+
+func (e *fakeRetestExecutor) StartRetestWave(_ context.Context, versionID int64) (RetestWave, error) {
+	e.startCalls = append(e.startCalls, versionID)
+	if e.waveErr != nil {
+		return RetestWave{}, e.waveErr
+	}
+	return e.wave, nil
+}
+
+var _ RetestExecutor = (*fakeRetestExecutor)(nil)
 
 // fakeIssueExecution is the in-memory ExecutionReader of the scan/ingest tests.
 type fakeIssueExecution struct {
@@ -201,6 +368,10 @@ type fakeIssueExecution struct {
 	snapshots         map[int64]CaseRunSnapshot
 	snapshotErrByCase map[int64]error
 	snapshotCalls     []int64
+
+	waveSnapshots map[int64]WaveSnapshot
+	waveErr       error
+	waveCalls     []int64
 }
 
 func (e *fakeIssueExecution) ListFailedApplicationCaseRuns(_ context.Context, versionID int64) ([]CaseRunSnapshot, error) {
@@ -223,8 +394,16 @@ func (e *fakeIssueExecution) CaseRunSnapshot(_ context.Context, caseRunID int64)
 	return snapshot, nil
 }
 
-func (e *fakeIssueExecution) WaveSnapshot(context.Context, int64, int64) (WaveSnapshot, error) {
-	return WaveSnapshot{}, nil
+func (e *fakeIssueExecution) WaveSnapshot(_ context.Context, _, waveID int64) (WaveSnapshot, error) {
+	e.waveCalls = append(e.waveCalls, waveID)
+	if e.waveErr != nil {
+		return WaveSnapshot{}, e.waveErr
+	}
+	snapshot, ok := e.waveSnapshots[waveID]
+	if !ok {
+		return WaveSnapshot{}, errIssueTestBoom
+	}
+	return snapshot, nil
 }
 
 func (e *fakeIssueExecution) VersionSnapshot(context.Context, int64) (VersionSnapshot, error) {
@@ -335,6 +514,7 @@ type issueServiceFixture struct {
 	audit  *fakeIssueAudit
 	clock  *fakeIssueClock
 	tasks  *fakeIssueTasks
+	retest *fakeRetestExecutor
 	svc    *IssueService
 }
 
@@ -349,13 +529,16 @@ func newIssueServiceFixture() *issueServiceFixture {
 		exec: &fakeIssueExecution{
 			snapshots:         map[int64]CaseRunSnapshot{},
 			snapshotErrByCase: map[int64]error{},
+			waveSnapshots:     map[int64]WaveSnapshot{},
 		},
 		events: &fakeIssueEvents{},
 		audit:  &fakeIssueAudit{},
 		clock:  &fakeIssueClock{now: issueServiceTestNow},
 		tasks:  &fakeIssueTasks{},
+		retest: &fakeRetestExecutor{},
 	}
 	fixture.svc = NewIssueService(fixture.repo, fixture.exec, fixture.events, fixture.audit, fixture.clock, fixture.tasks)
+	fixture.svc.WithRetestExecutor(fixture.retest)
 	return fixture
 }
 
@@ -1506,5 +1689,321 @@ func TestIssueServiceGetPropagatesMergedChainReadError(t *testing.T) {
 
 	if _, err := fixture.svc.Get(context.Background(), 7, 42); !errors.Is(err, errIssueTestBoom) {
 		t.Fatalf("Get() error = %v, want the read failure", err)
+	}
+}
+
+/* ------------------------------- manual issue ------------------------------ */
+
+// manualIssueCreateInput returns the canonical manual-create fixture of these
+// tests. Case run 11 resolves to version 7 with a requirement and a version SUT.
+func manualIssueCreateInput() CreateManualIssueInput {
+	return CreateManualIssueInput{
+		VersionID:   7,
+		Title:       "登录失败",
+		Summary:     "s",
+		Category:    "api",
+		Severity:    "major",
+		CaseRunID:   11,
+		EvidenceIDs: []int64{12},
+	}
+}
+
+// manualIssueCreated returns the row the fake repository reports after one
+// manual create.
+func manualIssueCreated() delivery.Issue {
+	return delivery.Issue{
+		ID:               500,
+		VersionID:        7,
+		Title:            "登录失败",
+		Summary:          "s",
+		Status:           delivery.IssueStatusOpen,
+		Category:         "api",
+		Severity:         "major",
+		Source:           delivery.IssueManualSource,
+		ExpectedRevision: 1,
+		CreatedAt:        issueServiceTestNow,
+		UpdatedAt:        issueServiceTestNow,
+	}
+}
+
+func seedManualCaseRun(fixture *issueServiceFixture) {
+	fixture.exec.snapshots[11] = CaseRunSnapshot{
+		ID:            11,
+		VersionID:     7,
+		CaseVersionID: 21,
+		RequirementID: 31,
+		VersionSUTID:  issueServiceTestInt64(5),
+	}
+}
+
+func TestManualIssueCreateAndPatch(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	seedManualCaseRun(fixture)
+	fixture.repo.manualResult = manualIssueCreated()
+
+	issue, err := fixture.svc.CreateManual(context.Background(), manualIssueCreateInput(), 9)
+	if err != nil {
+		t.Fatalf("CreateManual() error = %v", err)
+	}
+	if issue.Source != delivery.IssueManualSource {
+		t.Fatalf("issue.Source = %q, want %q", issue.Source, delivery.IssueManualSource)
+	}
+	if len(fixture.repo.manualCalls) != 1 {
+		t.Fatalf("CreateManual calls = %d, want 1", len(fixture.repo.manualCalls))
+	}
+	call := fixture.repo.manualCalls[0]
+	if call.Issue.VersionID != 7 || call.Issue.Source != delivery.IssueManualSource {
+		t.Errorf("created issue version/source = %d/%q", call.Issue.VersionID, call.Issue.Source)
+	}
+	if call.Issue.Status != delivery.IssueStatusOpen || call.Issue.ExpectedRevision != 1 {
+		t.Errorf("created issue status/revision = %q/%d", call.Issue.Status, call.Issue.ExpectedRevision)
+	}
+	if len(call.Issue.DedupeKey) != 32 {
+		t.Errorf("manual dedupe key = %q, want 32 hex chars", call.Issue.DedupeKey)
+	}
+	wantRefs := map[string]int64{
+		delivery.IssueRefKindCaseRun:     11,
+		delivery.IssueRefKindEvidence:    12,
+		delivery.IssueRefKindRequirement: 31,
+	}
+	if len(call.Refs) != len(wantRefs) {
+		t.Fatalf("manual refs = %+v, want case_run/evidence/requirement", call.Refs)
+	}
+	for _, ref := range call.Refs {
+		wantID, ok := wantRefs[ref.Kind]
+		if !ok || ref.RefID != wantID {
+			t.Errorf("manual ref = %+v, want kind/ref %v", ref, wantRefs)
+		}
+	}
+	if call.History.ActorID == nil || *call.History.ActorID != 9 ||
+		call.History.ActorKind != "user" || call.History.To != delivery.IssueStatusOpen || call.History.From != nil {
+		t.Errorf("creation history = %+v, want actor 9 user open", call.History)
+	}
+	if fixture.repo.createCalls != 0 {
+		t.Errorf("manual create used the candidate ingestion path (%d calls)", fixture.repo.createCalls)
+	}
+
+	event := fixture.events.records[0]
+	if event.eventType != "issue.created" || event.versionID != 7 {
+		t.Fatalf("event = %+v, want issue.created on version 7", event)
+	}
+	if event.payload["issue_id"] != "500" || event.payload["source"] != delivery.IssueManualSource ||
+		event.payload["case_run_id"] != "11" {
+		t.Errorf("issue.created payload = %v", event.payload)
+	}
+	if len(fixture.audit.records) != 1 || fixture.audit.records[0].action != "delivery.issue.created" ||
+		fixture.audit.records[0].actorID != 9 {
+		t.Errorf("manual create audit = %+v", fixture.audit.records)
+	}
+
+	fixture.repo.getIssues[500] = issue
+	fixture.repo.updateManualResult = manualIssueCreated()
+	fixture.repo.updateManualResult.Summary = "s2"
+	fixture.repo.updateManualResult.ExpectedRevision = 2
+
+	got, err := fixture.svc.UpdateManual(context.Background(), 7, 500,
+		UpdateManualIssueInput{ExpectedRevision: issue.ExpectedRevision, Summary: "s2"}, 9)
+	if err != nil {
+		t.Fatalf("UpdateManual() error = %v", err)
+	}
+	if got.Summary != "s2" || got.ExpectedRevision != 2 {
+		t.Fatalf("UpdateManual() = %+v, want summary s2 revision 2", got)
+	}
+	if len(fixture.repo.updateManualCalls) != 1 {
+		t.Fatalf("UpdateManual repository calls = %d, want 1", len(fixture.repo.updateManualCalls))
+	}
+	update := fixture.repo.updateManualCalls[0]
+	if update.VersionID != 7 || update.IssueID != 500 || update.ExpectedRevision != 1 {
+		t.Errorf("UpdateManual repository call = %+v", update)
+	}
+	if update.Summary != "s2" || update.Title != "" {
+		t.Errorf("UpdateManual patch fields = %+v, want only summary set", update)
+	}
+	if update.History.From == nil || *update.History.From != delivery.IssueStatusOpen ||
+		update.History.To != delivery.IssueStatusOpen ||
+		update.History.ActorID == nil || *update.History.ActorID != 9 {
+		t.Errorf("patch history = %+v, want from=to=open actor 9", update.History)
+	}
+	if len(fixture.events.records) != 2 {
+		t.Fatalf("events = %d, want issue.created + issue.updated", len(fixture.events.records))
+	}
+	updatedEvent := fixture.events.records[1]
+	if updatedEvent.eventType != "issue.updated" || updatedEvent.payload["issue_id"] != "500" ||
+		updatedEvent.payload["from_status"] != "open" || updatedEvent.payload["to_status"] != "open" {
+		t.Errorf("issue.updated payload = %v", updatedEvent.payload)
+	}
+}
+
+func TestManualIssueCreateValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input func(*CreateManualIssueInput)
+		exec  bool
+	}{
+		{name: "version", input: func(in *CreateManualIssueInput) { in.VersionID = 0 }, exec: true},
+		{name: "title", input: func(in *CreateManualIssueInput) { in.Title = "   " }, exec: true},
+		{name: "category", input: func(in *CreateManualIssueInput) { in.Category = "network" }, exec: true},
+		{name: "severity", input: func(in *CreateManualIssueInput) { in.Severity = "critical" }, exec: true},
+		{name: "evidence", input: func(in *CreateManualIssueInput) { in.EvidenceIDs = []int64{0} }, exec: true},
+		{name: "case run version", input: func(in *CreateManualIssueInput) { in.CaseRunID = 12 }, exec: true},
+		{name: "case run without reader", input: func(in *CreateManualIssueInput) {}, exec: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newIssueServiceFixture()
+			if test.name == "case run version" {
+				fixture.exec.snapshots[12] = CaseRunSnapshot{ID: 12, VersionID: 8, CaseVersionID: 22}
+			}
+			input := manualIssueCreateInput()
+			test.input(&input)
+			svc := fixture.svc
+			if !test.exec {
+				svc = NewIssueService(fixture.repo, nil, fixture.events, fixture.audit, fixture.clock, fixture.tasks)
+			}
+			_, err := svc.CreateManual(context.Background(), input, 9)
+			requireIssueError(t, err, ErrInvalidArgument)
+			if len(fixture.repo.manualCalls) != 0 {
+				t.Errorf("invalid create reached the repository: %+v", fixture.repo.manualCalls)
+			}
+			if len(fixture.events.records) != 0 {
+				t.Errorf("invalid create published %d events, want none", len(fixture.events.records))
+			}
+		})
+	}
+}
+
+func TestManualIssueCreateGeneratesDistinctDedupeKeys(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	seedManualCaseRun(fixture)
+	fixture.repo.manualResult = manualIssueCreated()
+
+	for i := 0; i < 2; i++ {
+		if _, err := fixture.svc.CreateManual(context.Background(), manualIssueCreateInput(), 9); err != nil {
+			t.Fatalf("CreateManual()[%d] error = %v", i, err)
+		}
+	}
+	if len(fixture.repo.manualCalls) != 2 {
+		t.Fatalf("CreateManual calls = %d, want 2", len(fixture.repo.manualCalls))
+	}
+	first, second := fixture.repo.manualCalls[0].Issue.DedupeKey, fixture.repo.manualCalls[1].Issue.DedupeKey
+	if first == "" || first == second {
+		t.Fatalf("manual dedupe keys = %q/%q, want two distinct non-empty keys", first, second)
+	}
+}
+
+func TestManualIssueUpdateRejectsStaleRevision(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	current := manualIssueCreated()
+	fixture.repo.getIssues[500] = current
+	fixture.repo.updateManualErr = delivery.ErrStateConflict
+
+	_, err := fixture.svc.UpdateManual(context.Background(), 7, 500,
+		UpdateManualIssueInput{ExpectedRevision: 99, Summary: "s2"}, 9)
+	requireIssueConflictReason(t, err, IssueConflictRevisionMismatch)
+	if len(fixture.events.records) != 0 {
+		t.Fatalf("stale patch published %d events, want none", len(fixture.events.records))
+	}
+}
+
+func TestManualIssueUpdateValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input UpdateManualIssueInput
+	}{
+		{name: "expected revision", input: UpdateManualIssueInput{Summary: "s2"}},
+		{name: "category", input: UpdateManualIssueInput{ExpectedRevision: 1, Category: "network"}},
+		{name: "severity", input: UpdateManualIssueInput{ExpectedRevision: 1, Severity: "critical"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newIssueServiceFixture()
+			fixture.repo.getIssues[500] = manualIssueCreated()
+			_, err := fixture.svc.UpdateManual(context.Background(), 7, 500, test.input, 9)
+			requireIssueError(t, err, ErrInvalidArgument)
+			if len(fixture.repo.updateManualCalls) != 0 {
+				t.Fatalf("invalid patch reached the repository: %+v", fixture.repo.updateManualCalls)
+			}
+		})
+	}
+}
+
+func TestManualIssueCreateMergeTargetAndReason(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	seedManualCaseRun(fixture)
+	created := manualIssueCreated()
+	fixture.repo.manualResult = created
+	fixture.repo.getIssues[created.ID] = created
+	fixture.repo.getIssues[20] = delivery.Issue{ID: 20, VersionID: 7, Status: delivery.IssueStatusConfirmed}
+	fixture.repo.mergeResult = delivery.Issue{
+		ID: created.ID, VersionID: 7, Status: delivery.IssueStatusMerged,
+		Source: delivery.IssueManualSource, ExpectedRevision: 2,
+		MergedIntoID: issueServiceTestInt64(20),
+	}
+
+	input := manualIssueCreateInput()
+	input.MergeIntoID = 20
+	input.Reason = "duplicate"
+	merged, err := fixture.svc.CreateManual(context.Background(), input, 9)
+	if err != nil {
+		t.Fatalf("CreateManual(merge) error = %v", err)
+	}
+	if merged.Status != delivery.IssueStatusMerged || merged.MergedIntoID == nil || *merged.MergedIntoID != 20 {
+		t.Fatalf("merged create = %+v, want merged into 20", merged)
+	}
+	if len(fixture.repo.mergeCalls) != 1 {
+		t.Fatalf("Merge calls = %d, want 1", len(fixture.repo.mergeCalls))
+	}
+	call := fixture.repo.mergeCalls[0]
+	if call.VersionID != 7 || call.SourceID != created.ID || call.TargetID != 20 ||
+		call.Reason != "duplicate" || call.ExpectedRevision == nil || *call.ExpectedRevision != 1 {
+		t.Errorf("merge call = %+v, want target 20 reason duplicate", call)
+	}
+	types := []string{fixture.events.records[0].eventType}
+	for _, record := range fixture.events.records[1:] {
+		types = append(types, record.eventType)
+	}
+	if len(fixture.events.records) != 2 || types[0] != "issue.created" || types[1] != "issue.merged" {
+		t.Fatalf("events = %v, want issue.created + issue.merged", types)
+	}
+}
+
+func TestManualIssueUpdateMergeTargetAndReason(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	current := manualIssueCreated()
+	fixture.repo.getIssues[current.ID] = current
+	fixture.repo.getIssues[20] = delivery.Issue{ID: 20, VersionID: 7, Status: delivery.IssueStatusConfirmed}
+	patched := current
+	patched.Summary = "s2"
+	patched.ExpectedRevision = 2
+	fixture.repo.updateManualResult = patched
+	fixture.repo.mergeResult = delivery.Issue{
+		ID: current.ID, VersionID: 7, Status: delivery.IssueStatusMerged,
+		Source: delivery.IssueManualSource, ExpectedRevision: 3,
+		MergedIntoID: issueServiceTestInt64(20),
+	}
+
+	got, err := fixture.svc.UpdateManual(context.Background(), 7, current.ID, UpdateManualIssueInput{
+		ExpectedRevision: 1,
+		Summary:          "s2",
+		MergeIntoID:      20,
+		Reason:           "duplicate",
+	}, 9)
+	if err != nil {
+		t.Fatalf("UpdateManual(merge) error = %v", err)
+	}
+	if got.Status != delivery.IssueStatusMerged {
+		t.Fatalf("patched merge = %+v, want merged", got)
+	}
+	if len(fixture.repo.mergeCalls) != 1 {
+		t.Fatalf("Merge calls = %d, want 1", len(fixture.repo.mergeCalls))
+	}
+	merge := fixture.repo.mergeCalls[0]
+	if merge.TargetID != 20 || merge.Reason != "duplicate" ||
+		merge.ExpectedRevision == nil || *merge.ExpectedRevision != 2 {
+		t.Errorf("merge call = %+v, want the patched revision 2", merge)
+	}
+	if len(fixture.events.records) != 2 || fixture.events.records[0].eventType != "issue.updated" ||
+		fixture.events.records[1].eventType != "issue.merged" {
+		t.Fatalf("events = %+v, want issue.updated + issue.merged", fixture.events.records)
 	}
 }

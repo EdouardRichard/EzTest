@@ -2,6 +2,7 @@ package versionapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,9 +14,10 @@ import (
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// StageService is the application surface the stage handlers need. The stage
-// machine is the only implementation: the HTTP layer never writes version.stage
-// itself.
+// StageService is the legacy (pre-v0.22) application surface the two hard-gate
+// confirmation routes need. The server adapts the v0.22 *StageService onto this
+// interface so the handlers never write version.stage themselves. New stage
+// writes go through StageWorkflow.
 type StageService interface {
 	Stage(ctx context.Context, versionID int64) (versionapp.StageView, error)
 	OnRequirementConfirmed(ctx context.Context, versionID int64, requirementIDs []int64) (versionapp.StageView, error)
@@ -23,6 +25,31 @@ type StageService interface {
 	Reject(ctx context.Context, versionID int64, reason string, target *version.Stage) (versionapp.StageView, error)
 	RecordGateDenied(ctx context.Context, versionID int64, gate string)
 }
+
+// StageWorkflow is the v0.22 orchestrated stage write surface (Task 25): the
+// single application entry point the HTTP layer uses for forward requests,
+// structured blockers and pause/resume. *versionapp.StageService implements it.
+type StageWorkflow interface {
+	// Stage returns the current stage projection.
+	Stage(ctx context.Context, versionID int64) (versionapp.StageView, error)
+	// Request validates and applies one explicit target stage.
+	Request(ctx context.Context, versionID int64, to version.Stage) error
+	// Advance applies the next forward workflow stage.
+	Advance(ctx context.Context, versionID int64) error
+	// Block enters blocked with a structured reason/action/next.
+	Block(ctx context.Context, versionID int64, blocker versionapp.Blocker) error
+	// Unblock resumes a blocked version to its recorded stage.
+	Unblock(ctx context.Context, versionID int64) error
+	// Pause enters paused and pauses the running waves.
+	Pause(ctx context.Context, versionID int64, reason string) error
+	// Resume leaves paused and continues the paused waves.
+	Resume(ctx context.Context, versionID int64) error
+}
+
+var (
+	_ StageService  = (*versionapp.StageMachine)(nil)
+	_ StageWorkflow = (*versionapp.StageService)(nil)
+)
 
 // Gate identifiers recorded on a forbidden hard-gate attempt.
 const (
@@ -32,9 +59,11 @@ const (
 )
 
 // StageHandler serves the version stage-machine API (spec §5.3/§5.5): the
-// stage read and the two user-only hard gates plus the gate reject.
+// stage read, the two user-only hard gates, the gate reject and the v0.22
+// request/block/unblock/pause/resume writes.
 type StageHandler struct {
-	svc StageService
+	svc      StageService
+	workflow StageWorkflow
 }
 
 // NewStageHandler builds the stage handler.
@@ -42,7 +71,12 @@ func NewStageHandler(svc StageService) *StageHandler {
 	return &StageHandler{svc: svc}
 }
 
-var _ StageService = (*versionapp.StageMachine)(nil)
+// SetStageWorkflow wires the v0.22 stage write surface. Without it the new
+// request/block/pause routes answer 503 instead of panicking; the production
+// assembly always sets it (Task 37).
+func (h *StageHandler) SetStageWorkflow(workflow StageWorkflow) {
+	h.workflow = workflow
+}
 
 // Get GET /api/versions/{id}/stage. Any authenticated user may read the stage.
 func (h *StageHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +87,7 @@ func (h *StageHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	view, err := h.svc.Stage(r.Context(), versionID)
 	if err != nil {
-		httpx.Error(w, r, err)
+		writeStageError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toStageDTO(view))
@@ -85,7 +119,7 @@ func (h *StageHandler) ConfirmRequirements(w http.ResponseWriter, r *http.Reques
 	}
 	view, err := h.svc.OnRequirementConfirmed(r.Context(), versionID, ids)
 	if err != nil {
-		httpx.Error(w, r, err)
+		writeStageError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toStageDTO(view))
@@ -116,7 +150,7 @@ func (h *StageHandler) ConfirmCases(w http.ResponseWriter, r *http.Request) {
 	}
 	view, err := h.svc.OnCasesConfirmed(r.Context(), versionID, ids)
 	if err != nil {
-		httpx.Error(w, r, err)
+		writeStageError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toStageDTO(view))
@@ -150,10 +184,179 @@ func (h *StageHandler) Reject(w http.ResponseWriter, r *http.Request) {
 	}
 	view, err := h.svc.Reject(r.Context(), versionID, reason, target)
 	if err != nil {
-		httpx.Error(w, r, err)
+		writeStageError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toStageDTO(view))
+}
+
+// Request POST /api/versions/{id}/stage/request. The body carries the explicit
+// target stage (`{"to":"designing"}`). Only forward workflow edges are accepted;
+// suspension stages have their own block/pause entry points. Typed gate
+// rejections map to 409 `stage_gate_failed`, invalid edges to 409
+// `invalid_stage_transition`.
+func (h *StageHandler) Request(w http.ResponseWriter, r *http.Request) {
+	versionID, err := stagePathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.workflow == nil {
+		httpx.Error(w, r, platform.Unavailable("version stage workflow is not configured"))
+		return
+	}
+	var request stageRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	target, err := parseStageTarget(request.To)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if err := h.workflow.Request(r.Context(), versionID, target); err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	h.writeCurrentStage(w, r, versionID)
+}
+
+// Advance POST /api/versions/{id}/stage/advance. Applies the next forward
+// workflow stage without naming it.
+func (h *StageHandler) Advance(w http.ResponseWriter, r *http.Request) {
+	versionID, err := stagePathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.workflow == nil {
+		httpx.Error(w, r, platform.Unavailable("version stage workflow is not configured"))
+		return
+	}
+	if err := h.workflow.Advance(r.Context(), versionID); err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	h.writeCurrentStage(w, r, versionID)
+}
+
+// Block POST /api/versions/{id}/stage/block. The structured kind/reason/action/
+// next are required (manual is the default kind) and persisted in version.blocker.
+func (h *StageHandler) Block(w http.ResponseWriter, r *http.Request) {
+	versionID, err := stagePathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.workflow == nil {
+		httpx.Error(w, r, platform.Unavailable("version stage workflow is not configured"))
+		return
+	}
+	var request stageBlockRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	blocker, err := (versionapp.Blocker{
+		Kind:   request.Kind,
+		Reason: request.Reason,
+		Action: request.Action,
+		Next:   request.Next,
+	}).Normalize()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if err := h.workflow.Block(r.Context(), versionID, blocker); err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	h.writeCurrentStage(w, r, versionID)
+}
+
+// Unblock POST /api/versions/{id}/stage/unblock. The blocker-clearance gate is
+// evaluated server-side; a still-blocked reason answers the typed gate 409.
+func (h *StageHandler) Unblock(w http.ResponseWriter, r *http.Request) {
+	versionID, err := stagePathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.workflow == nil {
+		httpx.Error(w, r, platform.Unavailable("version stage workflow is not configured"))
+		return
+	}
+	if err := h.workflow.Unblock(r.Context(), versionID); err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	h.writeCurrentStage(w, r, versionID)
+}
+
+// Pause POST /api/versions/{id}/stage/pause. The optional reason is recorded in
+// version.blocker and the running waves pause gracefully (R-B4-5).
+func (h *StageHandler) Pause(w http.ResponseWriter, r *http.Request) {
+	versionID, err := stagePathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.workflow == nil {
+		httpx.Error(w, r, platform.Unavailable("version stage workflow is not configured"))
+		return
+	}
+	var request stagePauseRequest
+	if err := decodeOptionalStageBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if err := h.workflow.Pause(r.Context(), versionID, request.Reason); err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	h.writeCurrentStage(w, r, versionID)
+}
+
+// Resume POST /api/versions/{id}/stage/resume. Only a paused version may resume;
+// blocked versions use unblock.
+func (h *StageHandler) Resume(w http.ResponseWriter, r *http.Request) {
+	versionID, err := stagePathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.workflow == nil {
+		httpx.Error(w, r, platform.Unavailable("version stage workflow is not configured"))
+		return
+	}
+	if err := h.workflow.Resume(r.Context(), versionID); err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	h.writeCurrentStage(w, r, versionID)
+}
+
+// writeCurrentStage renders the stage projection after a successful write.
+func (h *StageHandler) writeCurrentStage(w http.ResponseWriter, r *http.Request, versionID int64) {
+	view, err := h.svc.Stage(r.Context(), versionID)
+	if err != nil {
+		writeStageError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toStageDTO(view))
+}
+
+// writeStageError maps the typed stage gate/transition rejections through their
+// APIError envelope (409 stage_gate_failed / invalid_stage_transition) and
+// leaves every other platform/application error to the shared mapper.
+func writeStageError(w http.ResponseWriter, r *http.Request, err error) {
+	var typed interface{ APIError() *platform.Error }
+	if errors.As(err, &typed) {
+		httpx.Error(w, r, typed.APIError())
+		return
+	}
+	httpx.Error(w, r, err)
 }
 
 // requireUserGate enforces the D7 rule that only a user API may trigger a hard
@@ -192,6 +395,24 @@ type stageConfirmCasesRequest struct {
 type stageRejectRequest struct {
 	Reason      string  `json:"reason"`
 	TargetStage *string `json:"target_stage"`
+}
+
+// stageRequest is the POST /stage/request body.
+type stageRequest struct {
+	To string `json:"to"`
+}
+
+// stageBlockRequest is the POST /stage/block structured blocker body (R-B4-4).
+type stageBlockRequest struct {
+	Kind   string `json:"kind"`
+	Reason string `json:"reason"`
+	Action string `json:"action"`
+	Next   string `json:"next"`
+}
+
+// stagePauseRequest is the optional POST /stage/pause body.
+type stagePauseRequest struct {
+	Reason string `json:"reason"`
 }
 
 func toStageDTO(view versionapp.StageView) stageDTO {
@@ -235,6 +456,30 @@ func parseStageRejectTarget(raw *string) (*version.Stage, error) {
 	default:
 		return nil, platform.Invalid("target_stage", "must be one of clarifying, designing")
 	}
+}
+
+// parseStageTarget validates an explicit stage-request target. Suspension
+// stages are accepted by the parser and then rejected by the workflow with the
+// typed invalid-transition envelope, so the API explains the dedicated
+// block/pause entry point instead of answering a generic bad request.
+func parseStageTarget(raw string) (version.Stage, error) {
+	target := version.Stage(strings.TrimSpace(raw))
+	switch target {
+	case version.StageCreated, version.StageClarifying, version.StageRequirementReview,
+		version.StageDesigning, version.StageCaseReview, version.StageExecuting,
+		version.StageReporting, version.StageCompleted, version.StageBlocked,
+		version.StagePaused:
+		return target, nil
+	default:
+		return "", platform.Invalid("to", "must be a known version stage")
+	}
+}
+
+// decodeOptionalStageBody accepts an absent/empty body (pause carries an
+// optional reason). It reuses the shared optional-body decoder so malformed JSON
+// keeps the typed 400 envelope.
+func decodeOptionalStageBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	return decodeOptionalExtractionBody(w, r, dst)
 }
 
 // formatDecimal renders a decimal ID as the JSON string used by published

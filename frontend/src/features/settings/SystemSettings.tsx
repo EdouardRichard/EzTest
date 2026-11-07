@@ -15,6 +15,7 @@ import { ApiError } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { fetchSettings, groupSettings, type Setting, updateSetting } from "./api"
+import { ExecutorsPanel } from "./ExecutorsPanel"
 import { GCPanel } from "./GCPanel"
 import { InstancePanel } from "./InstancePanel"
 
@@ -58,6 +59,26 @@ function displayValue(setting: Setting): string {
 
 type Notice = { key: string; text: string }
 
+/**
+ * Keys removed by the v0.22 settings disposition. They no longer exist in the
+ * backend catalog; the filter keeps stale rows from an older database out of
+ * the editor so the page only exposes settings that can take effect. W2-15
+ * adds the four legacy gc.* aliases because retention.* is the only GC family.
+ */
+const REMOVED_SETTING_KEYS = new Set([
+  "paths.attachment_dir",
+  "paths.evidence_dir",
+  "paths.report_dir",
+  "paths.export_dir",
+  "security.mask_secrets",
+  "feature.experimental",
+  "vision.required",
+  "gc.retention_days",
+  "gc.max_bytes",
+  "gc.dry_run",
+  "gc.grace_days",
+])
+
 /** System settings grouped by category with one-key-at-a-time inline editing. */
 export function SystemSettings() {
   const [settings, setSettings] = useState<Setting[] | null>(null)
@@ -91,7 +112,21 @@ export function SystemSettings() {
     }
   }, [reloadKey])
 
-  const groups = useMemo(() => groupSettings(settings ?? []), [settings])
+  const groups = useMemo(
+    () =>
+      groupSettings((settings ?? []).filter((setting) => !REMOVED_SETTING_KEYS.has(setting.key))),
+    [settings],
+  )
+
+  // retention.* is the only GC settings family (W2-15); the GC panel renders
+  // the effective values/status next to the run controls.
+  const retentionSettings = useMemo(
+    () =>
+      (settings ?? []).filter(
+        (setting) => setting.category === "retention" && !REMOVED_SETTING_KEYS.has(setting.key),
+      ),
+    [settings],
+  )
 
   const startEdit = useCallback((setting: Setting) => {
     setEditingKey(setting.key)
@@ -303,8 +338,9 @@ export function SystemSettings() {
         `restart_required` 只做提示，不阻断保存；其余配置在保存成功后立即热加载。
       </Alert>
 
-      <GCPanel />
+      <GCPanel retentionSettings={retentionSettings} />
       <InstancePanel />
+      <ExecutorsPanel />
     </div>
   )
 }

@@ -65,6 +65,23 @@ func (r *IndexRunRepository) LatestRun(ctx context.Context, repoID int64) (codei
 	return run, nil
 }
 
+// LatestDoneForVersion returns the newest done run of one repository inside one
+// version. The version scope keeps a repository shared by several versions from
+// supplying another version's baseline; only done runs qualify so a newer
+// failed/queued run does not hide an older completed index.
+func (r *IndexRunRepository) LatestDoneForVersion(ctx context.Context, versionID, repoID int64) (codeintel.IndexRun, error) {
+	run, err := scanIndexRun(r.pool.QueryRow(ctx, `
+		SELECT `+indexRunColumns+` FROM code_index_run
+		WHERE version_id = $1 AND repo_id = $2 AND status = 'done'
+		ORDER BY finished_at DESC NULLS LAST, created_at DESC, id DESC
+		LIMIT 1
+	`, versionID, repoID))
+	if err != nil {
+		return codeintel.IndexRun{}, wrapDB("latest done code index run for version", err)
+	}
+	return run, nil
+}
+
 // UpdateRun writes the mutable status/counter/timestamp columns.
 func (r *IndexRunRepository) UpdateRun(ctx context.Context, run codeintel.IndexRun) error {
 	tag, err := r.pool.Exec(ctx, `

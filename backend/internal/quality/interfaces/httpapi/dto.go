@@ -15,15 +15,18 @@ import (
 // client-sent verdict/passed field is ignored instead of rejected. The sample
 // counts are validated again by the domain, which owns the physical rules.
 type createEvalRunRequest struct {
-	Mode          string            `json:"mode"`
-	CorpusVersion string            `json:"corpus_version"`
-	Model         string            `json:"model"`
-	Status        string            `json:"status"`
-	Sample        *evalSampleRequest `json:"sample"`
-	Baseline      map[string]float64 `json:"baseline"`
-	Summary       map[string]any     `json:"summary"`
-	StartedAt     *time.Time         `json:"started_at"`
-	FinishedAt    *time.Time         `json:"finished_at"`
+	Mode          string `json:"mode"`
+	CorpusVersion string `json:"corpus_version"`
+	Model         string `json:"model"`
+	Status        string `json:"status"`
+	// VersionID is the v0.22 snapshot scope (W2-14). It is a decimal string
+	// like every entity ID in the contract.
+	VersionID  string             `json:"version_id"`
+	Sample     *evalSampleRequest `json:"sample"`
+	Baseline   map[string]float64 `json:"baseline"`
+	Summary    map[string]any     `json:"summary"`
+	StartedAt  *time.Time         `json:"started_at"`
+	FinishedAt *time.Time         `json:"finished_at"`
 }
 
 type evalSampleRequest struct {
@@ -86,10 +89,10 @@ type evalMetricDetailView struct {
 }
 
 type evalMetricView struct {
-	Name      string              `json:"name"`
-	Value     float64             `json:"value"`
-	Threshold float64             `json:"threshold"`
-	Passed    bool                `json:"passed"`
+	Name      string               `json:"name"`
+	Value     float64              `json:"value"`
+	Threshold float64              `json:"threshold"`
+	Passed    bool                 `json:"passed"`
 	Detail    evalMetricDetailView `json:"detail"`
 }
 
@@ -100,10 +103,32 @@ type evalRunView struct {
 	Model         string           `json:"model"`
 	Status        string           `json:"status"`
 	Summary       map[string]any   `json:"summary"`
+	VersionID     *string          `json:"version_id"`
 	Metrics       []evalMetricView `json:"metrics"`
 	StartedAt     string           `json:"started_at"`
 	FinishedAt    *string          `json:"finished_at"`
 	CreatedAt     string           `json:"created_at"`
+}
+
+// trendPointView is one point of GET /api/quality/trends (W2-14 R-W2-6). It
+// carries the warn-only baseline/regressed flags so the chart can mark a
+// regression without ever blocking the phase.
+type trendPointView struct {
+	RunID     string   `json:"run_id"`
+	VersionID *string  `json:"version_id"`
+	Mode      string   `json:"mode"`
+	Status    string   `json:"status"`
+	Metric    string   `json:"metric"`
+	Value     float64  `json:"value"`
+	Threshold float64  `json:"threshold"`
+	Passed    bool     `json:"passed"`
+	Baseline  *float64 `json:"baseline,omitempty"`
+	Regressed bool     `json:"regressed"`
+	CreatedAt string   `json:"created_at"`
+}
+
+type trendPointList struct {
+	Data []trendPointView `json:"data"`
 }
 
 type overviewScopeView struct {
@@ -147,6 +172,10 @@ func toEvalRunView(run qualityapp.EvalRun) evalRunView {
 		StartedAt:     formatTime(run.StartedAt),
 		CreatedAt:     formatTime(run.CreatedAt),
 	}
+	if run.VersionID != nil {
+		versionID := platformid.Format(*run.VersionID)
+		view.VersionID = &versionID
+	}
 	if view.Summary == nil {
 		view.Summary = map[string]any{}
 	}
@@ -176,6 +205,26 @@ func toEvalMetricView(metric quality.Metric) evalMetricView {
 			ZeroDenominator: metric.Detail.ZeroDenominator,
 		},
 	}
+}
+
+func toTrendPointView(point qualityapp.TrendPoint) trendPointView {
+	view := trendPointView{
+		RunID:     platformid.Format(point.RunID),
+		Mode:      point.Mode,
+		Status:    point.Status,
+		Metric:    point.Metric,
+		Value:     point.Value,
+		Threshold: point.Threshold,
+		Passed:    point.Passed,
+		Baseline:  point.Baseline,
+		Regressed: point.Regressed,
+		CreatedAt: formatTime(point.CreatedAt),
+	}
+	if point.VersionID != nil {
+		versionID := platformid.Format(*point.VersionID)
+		view.VersionID = &versionID
+	}
+	return view
 }
 
 func toQualityOverviewView(overview qualityapp.Overview) qualityOverviewView {

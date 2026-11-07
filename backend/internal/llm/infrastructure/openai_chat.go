@@ -22,17 +22,8 @@ const chatRetryBaseDelay = 25 * time.Millisecond
 
 var _ llmapp.ChatClient = (*Client)(nil)
 
-// NewAdapter returns the config-bound protocol adapter for cfg.Protocol.
-// Legacy P0 values (openai/openai_compatible) read as the chat-completions
-// protocol, so stored rows keep working without a data migration. An unknown
-// protocol is rejected instead of silently defaulting. The OpenAI Responses
-// protocol returns the independent /responses wire adapter in responses.go.
-func NewAdapter(cfg llm.Config) (llmapp.Adapter, error) {
-	return newAdapter(cfg, NewClient())
-}
-
-// newAdapter lets Client.Chat reuse its injected HTTP client while keeping the
-// exported factory free of transport placement details.
+// newAdapter selects the wire-protocol adapter for cfg. It lets Client.Chat
+// reuse its injected HTTP client without exposing transport placement details.
 func newAdapter(cfg llm.Config, client *Client) (llmapp.Adapter, error) {
 	protocol, ok := llm.NormalizeProtocol(cfg.Protocol)
 	if !ok {
@@ -519,7 +510,7 @@ type chatContentImageURL struct {
 func (m chatMessagePayload) MarshalJSON() ([]byte, error) {
 	type wireMessage struct {
 		Role             string                `json:"role"`
-		Content          any                   `json:"content,omitempty"`
+		Content          any                   `json:"content"`
 		ToolCalls        []chatToolCallPayload `json:"tool_calls,omitempty"`
 		ToolCallID       string                `json:"tool_call_id,omitempty"`
 		ReasoningContent string                `json:"reasoning_content,omitempty"`
@@ -535,6 +526,11 @@ func (m chatMessagePayload) MarshalJSON() ([]byte, error) {
 		content = parts
 	case m.Content != "":
 		content = m.Content
+	default:
+		// Always serialize content, as the empty string for a pure tool call:
+		// strict OpenAI-compatible upstreams (DeepSeek) answer 422 "missing
+		// field `content`" when the key is omitted.
+		content = ""
 	}
 	return json.Marshal(wireMessage{
 		Role:             m.Role,

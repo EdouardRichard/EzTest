@@ -11,15 +11,20 @@ import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { Field } from "@/components/ui/Field"
 import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
-import { formatDateTime } from "@/lib/format"
+import { EvidenceThumbnail } from "@/features/execution/EvidenceViewer"
+import type { Evidence } from "@/features/execution/types"
+import { formatBytes, formatDateTime } from "@/lib/format"
 
 import {
+  REPORT_ARTIFACT_FORMAT_LABELS,
   REPORT_KIND_LABELS,
   REPORT_PDF_STATUS_LABELS,
   REPORT_REF_LABELS,
   REPORT_RENDER_STATUS_LABELS,
   REPORT_STATUS_LABELS,
+  type ReportArtifactFormat,
   type ReportDetailView,
+  type ReportExportArtifact,
   type ReportPDFStatus,
   type ReportRefKind,
   type ReportRefView,
@@ -52,6 +57,19 @@ export type ReportDetailPanelProps = {
   regenerating: boolean
   actionError: unknown
   notice: string | null
+  /** v0.22 W2-8: report artifacts created through the export API. */
+  artifacts?: ReportExportArtifact[]
+  artifactsLoading?: boolean
+  artifactsError?: unknown
+  /** Format currently being exported, if any. */
+  exportingFormat?: ReportArtifactFormat | null
+  downloadingArtifactId?: string | null
+  onExport?: (format: ReportArtifactFormat) => void
+  onDownloadArtifact?: (artifact: ReportExportArtifact) => void
+  /** Evidence attached to the report's case runs (thumbnail/deep link). */
+  evidence?: Evidence[]
+  evidenceLoading?: boolean
+  onOpenEvidence?: (evidence: Evidence) => void
 }
 
 const STATUS_TONE: Record<ReportStatus, BadgeTone> = {
@@ -156,6 +174,16 @@ export function ReportDetailPanel({
   regenerating,
   actionError,
   notice,
+  artifacts = [],
+  artifactsLoading = false,
+  artifactsError = null,
+  exportingFormat = null,
+  downloadingArtifactId = null,
+  onExport,
+  onDownloadArtifact,
+  evidence = [],
+  evidenceLoading = false,
+  onOpenEvidence,
 }: ReportDetailPanelProps) {
   if (loading) {
     return (
@@ -195,6 +223,15 @@ export function ReportDetailPanel({
   const pdfDownloadable = pdfStatus === "done" && revision?.pdf_available === true
   const pdfRenderedAt = revision?.pdf_rendered_at ?? null
   const pdfError = revision?.pdf_error ?? null
+  // Export always targets the report's current published revision on the
+  // server, so a historical selection must not silently export other bytes.
+  const canExport =
+    !readOnly &&
+    showingCurrent &&
+    revision !== null &&
+    revision.status === "published" &&
+    revision.render_status === "done"
+  const exporting = exportingFormat !== null
 
   return (
     <section data-testid="report-detail" aria-label="报告详情" className="surface-card p-4">
@@ -368,6 +405,118 @@ export function ReportDetailPanel({
         {opening ? <p className="text-[11px] text-muted-foreground">正在获取 HTML…</p> : null}
         {actionError !== null ? <InlineError error={actionError} /> : null}
       </div>
+
+      {readOnly ? null : (
+        <section aria-label="报告导出" className="mt-4 space-y-2 border-t border-border pt-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-xs font-semibold text-foreground">导出为 artifact</h3>
+            <span className="text-[10px] text-muted-foreground">
+              固定导出当前修订 v{currentRevisionNumber ?? "—"}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {(["html", "pdf", "markdown"] as const).map((format) => {
+              const pdfBlocked = format === "pdf" && !pdfDownloadable
+              return (
+                <Button
+                  key={format}
+                  size="sm"
+                  variant="secondary"
+                  data-testid={`report-export-${format}`}
+                  disabled={!canExport || exporting || pdfBlocked}
+                  title={pdfBlocked ? "PDF 未就绪，生成完成后方可导出" : undefined}
+                  onClick={() => onExport?.(format)}
+                >
+                  {exportingFormat === format ? "导出中…" : REPORT_ARTIFACT_FORMAT_LABELS[format]}
+                </Button>
+              )
+            })}
+          </div>
+
+          {!showingCurrent ? (
+            <p className="text-[11px] text-muted-foreground">
+              导出固定使用当前修订；请切换到当前修订后再导出。
+            </p>
+          ) : null}
+
+          <div className="space-y-1.5">
+            <h4 className="text-[11px] font-semibold text-foreground">
+              <span>artifacts</span>
+              <span className="text-muted-foreground"> · 报告产物</span>
+            </h4>
+
+            {artifactsLoading ? (
+              <p className="text-[11px] text-muted-foreground">正在加载报告产物…</p>
+            ) : artifactsError !== null ? (
+              <InlineError error={artifactsError} />
+            ) : artifacts.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">
+                尚未导出任何产物；可导出 HTML、PDF 或 Markdown。
+              </p>
+            ) : (
+              <ul aria-label="报告产物列表" className="space-y-1">
+                {artifacts.map((artifact) => (
+                  <li
+                    key={artifact.id}
+                    data-testid={`report-artifact-${artifact.id}`}
+                    className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card px-2 py-1.5 text-[11px]"
+                  >
+                    <Badge tone={artifact.status === "ready" ? "success" : "danger"}>
+                      {REPORT_ARTIFACT_FORMAT_LABELS[artifact.format] ?? artifact.format}
+                    </Badge>
+                    <span className="text-muted-foreground">#{artifact.id}</span>
+                    <span className="font-mono text-foreground" title={artifact.sha256}>
+                      sha256: {artifact.sha256.slice(0, 12)}…
+                    </span>
+                    <span className="text-muted-foreground">{formatBytes(artifact.size)}</span>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="ml-auto"
+                      aria-label={`下载 artifact ${artifact.id}`}
+                      disabled={downloadingArtifactId === artifact.id}
+                      onClick={() => onDownloadArtifact?.(artifact)}
+                    >
+                      <Download className="size-3.5" aria-hidden="true" />
+                      {downloadingArtifactId === artifact.id ? "下载中…" : "下载"}
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+      )}
+
+      {readOnly ? null : evidenceLoading || evidence.length > 0 ? (
+        <section
+          aria-label="报告证据"
+          data-testid="report-evidence"
+          className="mt-4 space-y-2 border-t border-border pt-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-xs font-semibold text-foreground">报告证据</h3>
+            <span className="text-[10px] text-muted-foreground">
+              缩略图 / 深链 / 原文件鉴权下载
+            </span>
+          </div>
+          {evidenceLoading ? (
+            <p className="text-[11px] text-muted-foreground">正在加载报告证据…</p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {evidence.map((item) => (
+                <EvidenceThumbnail
+                  key={item.id}
+                  versionId={versionId}
+                  evidence={item}
+                  onOpen={onOpenEvidence}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+      ) : null}
 
       <section aria-label="报告关联引用" className="mt-4 space-y-2 border-t border-border pt-3">
         <h3 className="text-xs font-semibold text-foreground">关联引用</h3>

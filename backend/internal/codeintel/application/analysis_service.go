@@ -45,6 +45,7 @@ type AnalysisDeps struct {
 	Bulk      FileWindowReader
 	Versions  VersionReader
 	Resources ResourceReader
+	Runs      IndexRepository
 	Design    DesignReader
 	Queue     WorkQueue
 	Events    EventPublisher
@@ -67,6 +68,7 @@ type AnalysisService struct {
 	bulk      FileWindowReader
 	versions  VersionReader
 	resources ResourceReader
+	runs      IndexRepository
 	queue     WorkQueue
 	events    EventPublisher
 	audit     AuditRecorder
@@ -87,6 +89,7 @@ func NewAnalysisService(deps AnalysisDeps) *AnalysisService {
 		bulk:      deps.Bulk,
 		versions:  deps.Versions,
 		resources: deps.Resources,
+		runs:      deps.Runs,
 		queue:     deps.Queue,
 		events:    deps.Events,
 		audit:     deps.Audit,
@@ -115,7 +118,11 @@ func (s *AnalysisService) Start(ctx context.Context, versionID, repoID int64, he
 	if _, ok := bindingForRepo(bindings, repoID); !ok {
 		return codeintel.Analysis{}, false, unprocessable("repo_not_bound", "repository is not bound to this version")
 	}
-	base, baselineErr := baselineForRepo(bindings, repoID)
+	repository, err := s.resources.CodeRepository(ctx, repoID)
+	if err != nil {
+		return codeintel.Analysis{}, false, mapDomainError(err, "code repository")
+	}
+	base, baselineErr := s.repoBaseline(ctx, versionID, bindings, repoID, repository)
 	if baselineErr != nil {
 		return codeintel.Analysis{}, false, baselineErr
 	}
@@ -125,10 +132,6 @@ func (s *AnalysisService) Start(ctx context.Context, versionID, repoID int64, he
 	}
 	if !ValidCommitSHA(base) {
 		return codeintel.Analysis{}, false, unprocessable("baseline_commit_missing", "the version baseline commit is not valid")
-	}
-	repository, err := s.resources.CodeRepository(ctx, repoID)
-	if err != nil {
-		return codeintel.Analysis{}, false, mapDomainError(err, "code repository")
 	}
 	head := strings.TrimSpace(headCommit)
 	if head != "" {
@@ -855,17 +858,17 @@ func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, 
 	if _, ok := bindingForRepo(bindings, repoID); !ok {
 		return ChangeSet{}, platform.NotFound("repository")
 	}
-	base, baselineErr := baselineForRepo(bindings, repoID)
+	repository, err := s.resources.CodeRepository(ctx, repoID)
+	if err != nil {
+		return ChangeSet{}, mapDomainError(err, "code repository")
+	}
+	base, baselineErr := s.repoBaseline(ctx, versionID, bindings, repoID, repository)
 	if baselineErr != nil {
 		return ChangeSet{}, baselineErr
 	}
 	base = strings.TrimSpace(base)
 	if base == "" || !ValidCommitSHA(base) {
 		return ChangeSet{}, unprocessable("baseline_commit_missing", "the version baseline commit is not resolved; index the repository first")
-	}
-	repository, err := s.resources.CodeRepository(ctx, repoID)
-	if err != nil {
-		return ChangeSet{}, mapDomainError(err, "code repository")
 	}
 	head := strings.TrimSpace(headCommit)
 	if head != "" {
@@ -895,6 +898,35 @@ func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, 
 		return ChangeSet{}, err
 	}
 	return ChangeSet{RepoID: repoID, BaseCommitSHA: base, HeadCommitSHA: head, Files: result.Files, Truncated: result.Truncated}, nil
+}
+
+// repoBaseline resolves the analysis base commit of one repository. A
+// version_sut stores a single baseline commit shared by every effective
+// repository; when that commit does not resolve in this repository (multi-repo
+// binding), the repository's own newest done index commit of this version is the
+// baseline. The version scope and the done filter keep another version's run and
+// a newer failed/queued run from hiding a usable baseline.
+func (s *AnalysisService) repoBaseline(ctx context.Context, versionID int64, bindings []VersionSUTBinding, repoID int64, repository RepoRef) (string, error) {
+	base, err := baselineForRepo(bindings, repoID)
+	if err != nil {
+		return "", err
+	}
+	base = strings.TrimSpace(base)
+	if ValidCommitSHA(base) {
+		if _, resolveErr := s.git.ResolveCommit(ctx, repository.Path, base); resolveErr == nil {
+			return base, nil
+		}
+	}
+	if s.runs != nil {
+		run, runErr := s.runs.LatestDoneForVersion(ctx, versionID, repoID)
+		switch {
+		case runErr == nil && ValidCommitSHA(run.CommitSHA):
+			return run.CommitSHA, nil
+		case runErr != nil && !errors.Is(runErr, codeintel.ErrNotFound):
+			return "", runErr
+		}
+	}
+	return "", nil
 }
 
 // failAnalysis persists the failed terminal state and publishes the failure.

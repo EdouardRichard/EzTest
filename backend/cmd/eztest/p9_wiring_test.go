@@ -629,3 +629,95 @@ func TestP9FactRecordsProjection(t *testing.T) {
 		t.Fatal("p9FactRecords must propagate a read error")
 	}
 }
+
+// TestP9AnalysisRunIsLeaderGated pins the composition root's leader gate: the
+// refresh loop consumes a follower's hint without probing, and the next hint
+// after leadership is acquired performs the analysis refresh. Without this the
+// runtime could be wired but fan out discovery/probe writes on every replica.
+func TestP9AnalysisRunIsLeaderGated(t *testing.T) {
+	now := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
+	requirements := &fakeP9Requirements{}
+	facts := &fakeP9Facts{byKind: map[string][]versiondomain.Fact{}}
+	analysis, err := newP9Analysis(p9AnalysisDeps{
+		Runtime:      &fakeP9Runtime{},
+		Facts:        facts,
+		Recorder:     facts,
+		Requirements: requirements,
+		Cases:        &fakeP9Cases{},
+		Roles:        &fakeP9Roles{},
+		Versions:     &fakeP9Versions{view: versionapp.VersionView{}},
+		Now:          func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("newP9Analysis: %v", err)
+	}
+
+	var mu sync.Mutex
+	leader := false
+	var logs []string
+	analysis.logf = func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	// gateCalls reports every shouldRun decision; the buffered channel keeps the
+	// loop from blocking when the test is not reading yet.
+	gateCalls := make(chan bool, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		analysis.Run(ctx, func() bool {
+			mu.Lock()
+			current := leader
+			mu.Unlock()
+			gateCalls <- current
+			return current
+		})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// Follower: the hint is drained through the gate and no refresh runs. Give
+	// the loop a scheduling window so a gate that is consulted but ignored
+	// (refresh still runs) is caught instead of racing the assertion.
+	analysis.Notify(1001)
+	if current := <-gateCalls; current {
+		t.Fatal("the gate reported leadership before it was acquired")
+	}
+	select {
+	case <-time.After(250 * time.Millisecond):
+	}
+	mu.Lock()
+	refreshes := len(logs)
+	mu.Unlock()
+	if refreshes != 0 {
+		t.Fatalf("a follower replica refreshed the analysis: %v", logs)
+	}
+
+	// Leader: the next hint for the same version runs the refresh.
+	mu.Lock()
+	leader = true
+	mu.Unlock()
+	analysis.Notify(1001)
+	if current := <-gateCalls; !current {
+		t.Fatal("the acquired leadership was not reported to the loop")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		refreshed := len(logs) > 0
+		mu.Unlock()
+		if refreshed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the leader hint did not refresh the analysis")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+

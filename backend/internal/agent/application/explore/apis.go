@@ -407,7 +407,7 @@ func apiFact(versionID int64, cfg APIDiscoveryConfig, candidate APICandidate) ve
 		Key:        apiFactKey(cfg.EnvironmentID, candidate.APIKey),
 		Payload:    payload,
 		Confidence: &confidence,
-		Source:     "explorer",
+		Source:     "p9",
 		SourceRef:  sourceRef,
 	}
 }

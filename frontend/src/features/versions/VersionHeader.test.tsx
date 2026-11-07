@@ -9,7 +9,10 @@ import { ApiError } from "@/lib/api-client"
 import type { Version } from "./types"
 
 const api = vi.hoisted(() => ({ reopenVersion: vi.fn() }))
-vi.mock("./api", () => api)
+vi.mock(import("./api"), async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>()
+  return { ...actual, ...api }
+})
 
 const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
 vi.mock("@/features/execution/api", () => executionApi)
@@ -21,7 +24,7 @@ const openRequest: HumanRequest = {
   version_id: "2001",
   case_run_id: "9301",
   kind: "login_takeover",
-  status: "open",
+  status: "pending",
   payload: {
     reason: "需要输入短信验证码",
     version_sut_id: "3001",
@@ -91,7 +94,7 @@ describe("VersionHeader", () => {
 
     const todo = screen.getByTestId("version-todo-entry")
     await waitFor(() => expect(todo).toHaveTextContent("1"))
-    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "pending" })
 
     const pending = screen.getByTestId("version-pending-design")
     expect(pending).toHaveTextContent("2 条待设计")

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -114,6 +115,12 @@ func (s *sqlBriefingSource) Load(ctx context.Context, versionID int64) (agentcon
 	if err := loadBriefingPlan(ctx, tx, versionID, &source); err != nil {
 		return agentcontext.Source{}, err
 	}
+	// The clarification→design handoff document/revision is part of the Design
+	// Host briefing (R-B5-2). A version without a handoff yields nil, and the
+	// briefing renders no handoff group.
+	if err := loadBriefingHandoff(ctx, tx, versionID, &source); err != nil {
+		return agentcontext.Source{}, err
+	}
 	if err := loadBriefingFacts(ctx, tx, versionID, &source); err != nil {
 		return agentcontext.Source{}, err
 	}
@@ -130,6 +137,39 @@ func (s *sqlBriefingSource) Load(ctx context.Context, versionID int64) (agentcon
 		return agentcontext.Source{}, fmt.Errorf("commit briefing read transaction: %w", err)
 	}
 	return source, nil
+}
+
+// loadBriefingHandoff reads the latest clarification_handoff artifact of the
+// version. The document is the persisted six-block JSON; it is passed through
+// verbatim and bounded by the briefing renderer's handoff budget, so the Design
+// Host sees the exact artifact revision the clarification stage produced.
+func loadBriefingHandoff(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
+	var revision int
+	var document []byte
+	var createdAt time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT revision, content, created_at
+		FROM clarification_handoff
+		WHERE version_id = $1
+		ORDER BY revision DESC
+		LIMIT 1
+	`, versionID).Scan(&revision, &document, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read briefing handoff: %w", err)
+	}
+	doc := strings.TrimSpace(string(document))
+	if doc == "" {
+		return nil
+	}
+	source.Handoff = &agentcontext.HandoffSnapshot{
+		Revision:    revision,
+		GeneratedAt: createdAt.UTC().Format(time.RFC3339),
+		Document:    doc,
+	}
+	return nil
 }
 
 func loadBriefingVersion(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
@@ -269,7 +309,7 @@ func loadBriefingCases(ctx context.Context, tx pgx.Tx, versionID int64, source *
 
 func loadBriefingPlan(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
 	rows, err := tx.Query(ctx, `
-		SELECT id, title, status, depends_on
+		SELECT id, title, status, depends_on, revision
 		FROM version_plan_item
 		WHERE version_id = $1
 		  AND status NOT IN ('done', 'completed', 'cancelled', 'skipped', 'failed', 'closed')
@@ -283,7 +323,7 @@ func loadBriefingPlan(ctx context.Context, tx pgx.Tx, versionID int64, source *a
 	for rows.Next() {
 		var item agentcontext.PlanItemSnapshot
 		var dependsOn []int64
-		if err := rows.Scan(&item.ID, &item.Title, &item.Status, &dependsOn); err != nil {
+		if err := rows.Scan(&item.ID, &item.Title, &item.Status, &dependsOn, &item.Revision); err != nil {
 			return fmt.Errorf("scan briefing plan item: %w", err)
 		}
 		item.DependsOn = make([]string, 0, len(dependsOn))
@@ -387,7 +427,7 @@ func loadBriefingOpenQuestions(ctx context.Context, tx pgx.Tx, versionID int64, 
 	rows, err := tx.Query(ctx, `
 		SELECT kind, COALESCE(payload ->> 'reason', '')
 		FROM human_request
-		WHERE version_id = $1 AND status = 'open'
+		WHERE version_id = $1 AND status = 'pending'
 		ORDER BY created_at, id
 		LIMIT $2
 	`, versionID, briefingOpenItemLimit)
@@ -542,10 +582,8 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 		return scope, fmt.Errorf("read briefing knowledge families: %w", err)
 	}
 
-	pageIDs := make([]int64, 0, 8)
-	apiIDs := make([]int64, 0, 8)
 	rows, err = tx.Query(ctx, `
-		SELECT sut_id, environment_id, scope
+		SELECT sut_id, environment_id
 		FROM version_sut
 		WHERE version_id = $1
 		ORDER BY id
@@ -555,81 +593,83 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 	}
 	for rows.Next() {
 		var sutID, environmentID int64
-		var scopeRaw []byte
-		if err := rows.Scan(&sutID, &environmentID, &scopeRaw); err != nil {
+		if err := rows.Scan(&sutID, &environmentID); err != nil {
 			rows.Close()
 			return scope, fmt.Errorf("scan briefing version binding: %w", err)
 		}
 		scope.systemIDs[sutID] = struct{}{}
 		scope.environmentID[environmentID] = struct{}{}
-		var binding struct {
-			Pages []int64 `json:"pages"`
-			APIs  []int64 `json:"apis"`
-		}
-		if len(scopeRaw) > 0 && json.Unmarshal(scopeRaw, &binding) == nil {
-			pageIDs = append(pageIDs, binding.Pages...)
-			apiIDs = append(apiIDs, binding.APIs...)
-		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return scope, fmt.Errorf("read briefing version bindings: %w", err)
 	}
 
-	if len(pageIDs) > 0 {
-		rows, err = tx.Query(ctx, `
-			SELECT route_template
-			FROM sut_page
-			WHERE id = ANY($1::bigint[])
-			ORDER BY id
-		`, pageIDs)
-		if err != nil {
-			return scope, fmt.Errorf("read briefing page keys: %w", err)
-		}
-		for rows.Next() {
-			var key string
-			if err := rows.Scan(&key); err != nil {
-				rows.Close()
-				return scope, fmt.Errorf("scan briefing page key: %w", err)
-			}
-			scope.pageKeys[key] = struct{}{}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return scope, fmt.Errorf("read briefing page keys: %w", err)
-		}
+	// v0.22 DB-11: version_sut.scope_exclude names resources removed from the
+	// environment-wide approved set. The effective page/API keys are therefore
+	// the environment's approved resources minus the excluded IDs, not an
+	// inclusion list.
+	rows, err = tx.Query(ctx, `
+		SELECT p.route_template
+		FROM version_sut vs
+		JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
+		WHERE vs.version_id = $1 AND vs.status = 'active' AND p.status = 'approved'
+		  AND btrim(p.route_template) <> ''
+		  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
+		ORDER BY p.id
+	`, versionID)
+	if err != nil {
+		return scope, fmt.Errorf("read briefing page keys: %w", err)
 	}
-
-	if len(apiIDs) > 0 {
-		rows, err = tx.Query(ctx, `
-			SELECT method || ' ' || path_template
-			FROM sut_api
-			WHERE id = ANY($1::bigint[])
-			ORDER BY id
-		`, apiIDs)
-		if err != nil {
-			return scope, fmt.Errorf("read briefing API keys: %w", err)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return scope, fmt.Errorf("scan briefing page key: %w", err)
 		}
-		for rows.Next() {
-			var key string
-			if err := rows.Scan(&key); err != nil {
-				rows.Close()
-				return scope, fmt.Errorf("scan briefing API key: %w", err)
-			}
-			scope.apiKeys[key] = struct{}{}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return scope, fmt.Errorf("read briefing API keys: %w", err)
-		}
+		scope.pageKeys[key] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return scope, fmt.Errorf("read briefing page keys: %w", err)
 	}
 
 	rows, err = tx.Query(ctx, `
-		SELECT vsr.role
-		FROM version_sut_resource vsr
-		JOIN version_sut vs ON vs.id = vsr.version_sut_id
-		WHERE vs.version_id = $1 AND vsr.kind = 'account' AND vsr.selected AND vsr.role <> ''
-		ORDER BY vsr.id
+		SELECT a.method || ' ' || a.path_template
+		FROM version_sut vs
+		JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
+		WHERE vs.version_id = $1 AND vs.status = 'active' AND a.status = 'approved'
+		  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
+		ORDER BY a.id
+	`, versionID)
+	if err != nil {
+		return scope, fmt.Errorf("read briefing API keys: %w", err)
+	}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return scope, fmt.Errorf("scan briefing API key: %w", err)
+		}
+		scope.apiKeys[key] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return scope, fmt.Errorf("read briefing API keys: %w", err)
+	}
+
+	// v0.22 DB-14/DB-15: accounts are a global pool and a version opts into a
+	// subset through version_account; the role keys are the enabled accounts'
+	// trimmed roles, not per-binding role labels. Trimming here keeps a stored
+	// " buyer " role identical to the knowledge binding key "buyer".
+	rows, err = tx.Query(ctx, `
+		SELECT DISTINCT btrim(role) AS role
+		FROM version_account va
+		JOIN test_account a ON a.id = va.account_id
+		CROSS JOIN LATERAL jsonb_array_elements_text(a.roles) AS role
+		WHERE va.version_id = $1 AND va.enabled AND a.status = 'active'
+		  AND btrim(role) <> ''
+		ORDER BY role
 	`, versionID)
 	if err != nil {
 		return scope, fmt.Errorf("read briefing account roles: %w", err)
@@ -640,7 +680,9 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 			rows.Close()
 			return scope, fmt.Errorf("scan briefing account role: %w", err)
 		}
-		scope.accountRoles[role] = struct{}{}
+		if role = strings.TrimSpace(role); role != "" {
+			scope.accountRoles[role] = struct{}{}
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

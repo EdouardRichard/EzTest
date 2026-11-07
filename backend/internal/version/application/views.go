@@ -1,6 +1,7 @@
-// Package versionapp implements the version use cases: create with multi-SUT
-// bindings, detail aggregation through the resource catalog, cursor listing,
-// title/auto-design updates and the resource delete-guard usage queries.
+// Package versionapp implements the version use cases: environment-only
+// creation, the v0.22 binding overview/update, detail aggregation through the
+// resource catalog, cursor listing, title/auto-design updates and the resource
+// delete-guard usage queries.
 package versionapp
 
 import (
@@ -17,6 +18,8 @@ import (
 type VersionView struct {
 	ID                        int64
 	Title                     string
+	Description               string
+	Goal                      string
 	Status                    string
 	AutoDesignNewRequirements bool
 	Bindings                  []BindingView
@@ -39,19 +42,29 @@ type CaseCounts struct {
 	Stale     int
 }
 
-// BindingView is one SUT binding with its selected resources in input order.
-// CodeBaselineCommit is empty while the bound repository's HEAD has not been
-// resolved (P5 §5.5).
+// BindingView is one SUT binding with its effective (approved minus excluded)
+// resources. Repository is the deterministic baseline repository (lowest
+// effective repository ID) and Repositories lists every effective repository;
+// both are resolved from the SUT inheritance plus the version overrides.
 type BindingView struct {
 	ID                 int64
 	CodeBaselineCommit string
 	SUT                resourceapp.SUTView
 	Environment        resourceapp.EnvironmentView
 	Repository         *resourceapp.CodeRepositoryView
+	Repositories       []BindingRepositoryView
+	ScopeExclude       version.ScopeExclude
 	Pages              []resourceapp.PageView
 	APIs               []resourceapp.APIView
 	Databases          []resourceapp.DatabaseView
 	Accounts           []resourceapp.AccountView
+}
+
+// BindingRepositoryView is one effective repository of a version binding.
+type BindingRepositoryView struct {
+	Repository resourceapp.CodeRepositoryView
+	Role       string
+	Source     string
 }
 
 // VersionSummary is the list read model.

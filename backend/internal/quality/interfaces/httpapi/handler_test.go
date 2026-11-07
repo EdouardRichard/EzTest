@@ -34,9 +34,20 @@ type fakeService struct {
 	getID  int64
 	getErr error
 
-	overview     qualityapp.Overview
-	overviewErr  error
+	overview      qualityapp.Overview
+	overviewErr   error
 	overviewScope *int64
+
+	snapshotRun     qualityapp.EvalRun
+	snapshotErr     error
+	snapshotVersion int64
+
+	trends       []qualityapp.TrendPoint
+	trendsErr    error
+	trendVersion int64
+	trendMetric  string
+	trendFrom    time.Time
+	trendTo      time.Time
 }
 
 func (f *fakeService) List(_ context.Context, limit int) ([]qualityapp.EvalRun, error) {
@@ -58,6 +69,19 @@ func (f *fakeService) Get(_ context.Context, id int64) (qualityapp.EvalRun, erro
 func (f *fakeService) Overview(_ context.Context, versionID *int64) (qualityapp.Overview, error) {
 	f.overviewScope = versionID
 	return f.overview, f.overviewErr
+}
+
+func (f *fakeService) TriggerSnapshot(_ context.Context, _ platform.Actor, versionID int64) (qualityapp.EvalRun, error) {
+	f.snapshotVersion = versionID
+	return f.snapshotRun, f.snapshotErr
+}
+
+func (f *fakeService) Trends(_ context.Context, versionID int64, metric string, from, to time.Time) ([]qualityapp.TrendPoint, error) {
+	f.trendVersion = versionID
+	f.trendMetric = metric
+	f.trendFrom = from
+	f.trendTo = to
+	return f.trends, f.trendsErr
 }
 
 type handlerRepo struct {
@@ -93,6 +117,14 @@ func (r *handlerRepo) List(_ context.Context, limit int) ([]qualityapp.EvalRun, 
 
 func (r *handlerRepo) Latest(context.Context) (*qualityapp.EvalRun, error) {
 	return r.latest, r.latestErr
+}
+
+func (r *handlerRepo) LatestForVersion(context.Context, int64) (*qualityapp.EvalRun, error) {
+	return r.latest, r.latestErr
+}
+
+func (r *handlerRepo) Trends(context.Context, int64, string, time.Time, time.Time) ([]qualityapp.TrendPoint, error) {
+	return nil, nil
 }
 
 type handlerClock struct{}

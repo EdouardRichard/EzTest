@@ -12,37 +12,37 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// RoleKey is one of the seven 0.2.1 role-catalog keys (spec §5.2/§5.8, D19).
-// The keys are fixed: assistant + six background roles.
+// RoleKey is one of the role-catalog keys (spec §5.2/§5.8, D19; converged by
+// v0.22 D-B1). The conversation/design domain keeps two Hosts (both mapped to
+// the assistant role) plus the Author/Critic background roles; the Explorer
+// role was removed with the explore work item kinds.
 type RoleKey string
 
-// The seven D19 role keys.
+// The six role keys after the v0.22 D-B1 convergence.
 const (
 	RoleAssistant        RoleKey = "assistant"
 	RoleCaseAuthor       RoleKey = "case_author"
 	RoleCaseReviewer     RoleKey = "case_reviewer"
-	RoleExplorer         RoleKey = "explorer"
 	RoleFailureAnalyst   RoleKey = "failure_analyst"
 	RoleReportWriter     RoleKey = "report_writer"
 	RoleKnowledgeCurator RoleKey = "knowledge_curator"
 )
 
-// roleKeys is the frozen catalog order: the assistant first, then the six
-// background roles.
+// roleKeys is the frozen catalog order: the assistant (two Hosts) first, then
+// the five background roles.
 var roleKeys = []RoleKey{
 	RoleAssistant,
 	RoleCaseAuthor,
 	RoleCaseReviewer,
-	RoleExplorer,
 	RoleFailureAnalyst,
 	RoleReportWriter,
 	RoleKnowledgeCurator,
 }
 
-// RoleKeys returns a copy of the seven catalog keys in catalog order.
+// RoleKeys returns a copy of the six catalog keys in catalog order.
 func RoleKeys() []RoleKey { return append([]RoleKey(nil), roleKeys...) }
 
-// Valid reports whether the key is one of the seven D19 roles.
+// Valid reports whether the key is one of the six catalog roles.
 func (r RoleKey) Valid() bool {
 	for _, key := range roleKeys {
 		if key == r {
@@ -54,7 +54,10 @@ func (r RoleKey) Valid() bool {
 
 // RoleSpec is one catalog entry: the role's product name, model capability
 // requirements (spec §7.3), work-item kinds, tool whitelist, existing profile
-// seeds that execute it, system prompt and default work-item budget (§5.4).
+// seeds that execute it and system prompt. The legacy role-level max_tokens
+// field was dead metadata (token accounting is telemetry-only in v0.22 and the
+// runner reads profile budgets), so Task 22 removed it; turn/wall-clock guards
+// remain on the seeded profile budgets.
 type RoleSpec struct {
 	Key           RoleKey
 	Name          string
@@ -63,7 +66,6 @@ type RoleSpec struct {
 	Tools         []string
 	Profiles      []string
 	SystemPrompt  string
-	MaxTokens     int
 	RunSeconds    int
 	MaxTurnsFuse  int
 }
@@ -71,35 +73,29 @@ type RoleSpec struct {
 // The role system prompts freeze the spec §5.2 boundaries. The [role:<key>]
 // marker follows the existing [profile:<key>] convention so deterministic test
 // doubles can identify a role while real models ignore the marker.
-const assistantRolePrompt = `你是 EzTest 的测试助手（assistant）。
+const assistantRolePrompt = `你是 EzTest 的测试助手（assistant，2 个对话 Host 的共享角色）。
 角色边界：
 - 只与用户对话：澄清需求、解释设计、复述决定；需求草稿与用例修改以 draft/候选提交，等待用户确认。
-- 通过 job.start 只能请求 design.cases / review.cases；不能请求 execute.batch、report.version 或 explore.*。
+- 澄清 Host 用 requirement.draft_create / requirement.draft_update 维护 draft；设计 Host 用 case.graph_propose 提交用例候选。
+- 通过 job.start 只能请求 design.cases / review.cases；不能请求 execute.batch、report.version。
 - 不能确认需求/用例、不能直接执行、不能使用浏览器/执行器工具、不能修改资源；确认只能由用户 API 触发。
 - 拿不准时提问并给出默认假设，不编造用户未表达的内容。
 [role:assistant]`
 
-const caseAuthorRolePrompt = `你是 EzTest 的用例编写员（case_author）。
+const caseAuthorRolePrompt = `你是 EzTest 的设计 Author（case_author，后台作业角色）。
 角色边界：
-- 只生成/修改用例草稿（case.graph_propose）与测试数据草案；不能确认、执行或修改需求。
+- 只生成/修改用例草稿（case.graph_propose）；不能确认、执行或修改需求。
 - 需求确认后按 design.cases 范围生成用例，步骤、断言、来源与目标 SUT 必须完整可执行。
 - 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求/验收标准明确要求视觉基线或像素级截图比对时才用 visual。
 - 不调用 browser.* / execution.* / case.confirm；确认只能由用户完成。
 [role:case_author]`
 
-const caseReviewerRolePrompt = `你是 EzTest 的用例评审员（case_reviewer）。
+const caseReviewerRolePrompt = `你是 EzTest 的设计 Critic（case_reviewer，后台作业角色）。
 角色边界：
 - 只通过 design.review_submit 提交评审发现（blocker/important/minor），可读取设计图。
 - 不能修改用例、不能确认、不能执行；内部评审不构成人工关卡。
 - 检查覆盖遗漏、步骤不可执行、断言缺失、目标 SUT 错误与重复用例。
 [role:case_reviewer]`
-
-const explorerRolePrompt = `你是 EzTest 的探索者（explorer）。
-角色边界：
-- 只执行 explore.* 探索意图，产出版本事实、证据与会话引用；供料不决策。
-- 不生成用例、不修改需求、不运行已确认用例；不使用浏览器/执行器写工具或确认工具。
-- 探索批量有上限，失败时记录明确原因，不越界。
-[role:explorer]`
 
 const failureAnalystRolePrompt = `你是 EzTest 的失败分析师（failure_analyst）。
 角色边界：
@@ -122,18 +118,18 @@ const knowledgeCuratorRolePrompt = `你是 EzTest 的知识维护员（knowledge
 - 不确认需求/用例，不运行测试，不直接改变知识审核状态。
 [role:knowledge_curator]`
 
-// 0.2.1 default work-item budget (spec §5.4): max_tokens 20000, run_seconds 120,
-// max_turns_fuse 24. The completion criterion remains primary (§5.7).
+// 0.2.1 default work-item run guards (spec §5.4): run_seconds 120 and
+// max_turns_fuse 24. The completion criterion remains primary (§5.7). Token
+// accounting is telemetry-only since v0.22, so there is no role-level token cap.
 const (
-	roleDefaultMaxTokens    = 20000
 	roleDefaultRunSeconds   = 120
 	roleDefaultMaxTurnsFuse = 24
 )
 
-// roleSpecs is the immutable 7-role catalog. Tool entries are exact registered
-// names or "namespace.*" wildcards for tools later phases register (explore.*).
+// roleSpecs is the immutable role catalog after the v0.22 D-B1 convergence.
 // Profiles lists the seed profiles that execute the role; every role has at
-// least one (knowledge_curator is seeded by the P7 knowledge increment).
+// least one (knowledge_curator is seeded by the P7 knowledge increment). The
+// Explorer role and explore.* wildcard are gone (R-W1-5).
 var roleSpecs = []RoleSpec{
 	{
 		Key:   RoleAssistant,
@@ -163,20 +159,30 @@ var roleSpecs = []RoleSpec{
 			tools.ToolCodeRoutes,
 			tools.ToolCodeAPIs,
 			tools.ToolKnowledgePropose,
+			// v0.22 W0 Host tools (Task 36): plan/structured question on both
+			// Hosts, clarification retrieval, the completion declaration, the
+			// image handle and the read-only DB inventory. The catalog remains
+			// the outer boundary; the profile lists stay narrower where a tool
+			// only makes sense for one Host.
+			tools.ToolPlanUpdate,
+			tools.ToolQuestionAsk,
+			tools.ToolClarificationSearch,
+			tools.ToolTaskComplete,
+			tools.ToolAttachmentImageRef,
+			tools.ToolSUTDatabaseList,
+			tools.ToolToolResultRead,
 		},
 		Profiles: []string{
 			ProfileKeyClarificationHost,
-			ProfileKeyRequirementCurator,
 			ProfileKeyDesignHost,
 		},
 		SystemPrompt: assistantRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
 	{
 		Key:   RoleCaseAuthor,
-		Name:  "用例编写员",
+		Name:  "设计 Author",
 		Model: llmapp.ModelRequirements{Tools: true, Reasoning: true},
 		WorkItemKinds: []string{
 			agent.WorkItemKindDesignCases,
@@ -188,7 +194,6 @@ var roleSpecs = []RoleSpec{
 			tools.ToolRequirementRead,
 			tools.ToolDesignGraphRead,
 			tools.ToolCaseGraphPropose,
-			tools.ToolDesignDataPlanSubmit,
 			tools.ToolSUTList,
 			tools.ToolSUTPageList,
 			tools.ToolCodeFacts,
@@ -198,14 +203,15 @@ var roleSpecs = []RoleSpec{
 			tools.ToolCodeImpact,
 			tools.ToolCodeAnchors,
 			tools.ToolKnowledgePropose,
+			// v0.22 W0: the design author reads the read-only DB inventory and
+			// declares its completion through the verified plan/design target.
+			tools.ToolSUTDatabaseList,
+			tools.ToolTaskComplete,
 		},
 		Profiles: []string{
-			ProfileKeyCaseAuthor,
-			ProfileKeyDesignPlanner,
-			ProfileKeyDataPlanner,
+			ProfileKeyDesignAuthor,
 		},
 		SystemPrompt: caseAuthorRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
@@ -220,53 +226,13 @@ var roleSpecs = []RoleSpec{
 			tools.ToolContextTaskPack,
 			tools.ToolDesignGraphRead,
 			tools.ToolDesignReviewSubmit,
+			tools.ToolSUTDatabaseList,
+			tools.ToolTaskComplete,
 		},
 		Profiles: []string{
 			ProfileKeyDesignCritic,
 		},
 		SystemPrompt: caseReviewerRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
-		RunSeconds:   roleDefaultRunSeconds,
-		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
-	},
-	{
-		Key:   RoleExplorer,
-		Name:  "探索者",
-		Model: llmapp.ModelRequirements{Tools: true, Vision: true, Reasoning: true},
-		WorkItemKinds: []string{
-			agent.WorkItemKindExploreLogin,
-			agent.WorkItemKindExplorePage,
-			agent.WorkItemKindExploreAPI,
-			agent.WorkItemKindExploreCoverage,
-			agent.WorkItemKindExploreGap,
-		},
-		Tools: []string{
-			"explore.*",
-			tools.ToolContextVersionPack,
-			tools.ToolContextTaskPack,
-			tools.ToolContextTeamRoomRead,
-			tools.ToolRequirementRead,
-			tools.ToolAttachmentList,
-			tools.ToolAttachmentReadText,
-			tools.ToolAttachmentImageRef,
-			tools.ToolSUTList,
-			tools.ToolSUTPageList,
-			tools.ToolSUTPagePropose,
-			tools.ToolCodeTree,
-			tools.ToolCodeRead,
-			tools.ToolCodeSearch,
-			tools.ToolCodeFacts,
-			tools.ToolCodeRoutes,
-			tools.ToolCodeAPIs,
-			tools.ToolCodeDiff,
-			tools.ToolCodeImpact,
-			tools.ToolKnowledgePropose,
-		},
-		Profiles: []string{
-			ProfileKeyContextScout,
-		},
-		SystemPrompt: explorerRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
@@ -294,7 +260,6 @@ var roleSpecs = []RoleSpec{
 			ProfileKeyIssueTriager,
 		},
 		SystemPrompt: failureAnalystRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
@@ -315,7 +280,6 @@ var roleSpecs = []RoleSpec{
 			ProfileKeyReportWriter,
 		},
 		SystemPrompt: reportWriterRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
@@ -355,13 +319,12 @@ var roleSpecs = []RoleSpec{
 		// RoleToolGuard keeps the surface closed.
 		Profiles:     []string{ProfileKeyKnowledgeCurator},
 		SystemPrompt: knowledgeCuratorRolePrompt,
-		MaxTokens:    roleDefaultMaxTokens,
 		RunSeconds:   roleDefaultRunSeconds,
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
 }
 
-// RoleCatalog returns a deep copy of the seven role specs in catalog order.
+// RoleCatalog returns a deep copy of the six role specs in catalog order.
 func RoleCatalog() []RoleSpec {
 	specs := make([]RoleSpec, 0, len(roleSpecs))
 	for _, spec := range roleSpecs {
@@ -390,7 +353,7 @@ func cloneRoleSpec(spec RoleSpec) RoleSpec {
 // RoleForProfile returns the catalog role that executes a stored profile key.
 // ProfileAdminService uses it to apply the role whitelist to administrator
 // edits, and ValidateRoleProfiles uses the same mapping at startup. Profiles
-// outside the seven roles (case_executor, coverage_analyst, version_steward,
+// outside the six roles (case_executor, coverage_analyst, version_steward,
 // ...) report false: they keep their own frozen contract whitelist.
 func RoleForProfile(profileKey string) (RoleSpec, bool) {
 	for _, spec := range roleSpecs {
@@ -448,7 +411,7 @@ func RoleAllowsWorkItemKind(role RoleKey, kind string) bool {
 // ValidateRoleProfiles fails closed when a seeded agent_profile that executes a
 // catalog role allows a tool outside that role's whitelist. It is called by
 // EnsureProfiles so a profile edit cannot silently widen a role's permissions
-// (review focus 5). Profiles outside the seven roles (for example
+// (review focus 5). Profiles outside the six roles (for example
 // case_executor or version_steward) are not constrained by this catalog.
 func ValidateRoleProfiles(profiles []agent.AgentProfile) error {
 	roleByProfile := make(map[string]RoleKey)
@@ -487,7 +450,7 @@ func ValidateRoleProfiles(profiles []agent.AgentProfile) error {
 const ActionRoleToolDenied = "agent.role.tool_denied"
 
 // RoleToolGuard enforces one role's whitelist before registry execution and
-// audits every denial. It is the runtime seam for the seven roles; the frozen
+// audits every denial. It is the runtime seam for the six roles; the frozen
 // 14 agent_profile seeds keep their own allowed_tools (validated as a subset by
 // ValidateRoleProfiles). The guard is safe for concurrent use: the ToolSet is
 // immutable and the audit recorder owns its synchronization.

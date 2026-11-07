@@ -56,11 +56,14 @@ func ValidCommitSHA(value string) bool { return commitSHAPattern.MatchString(val
 
 // IndexRepository persists code_index_run rows. ActiveRun returns the single
 // queued/running run of a repository (partial unique index); DoneRunByCommit
-// backs the 200-reused idempotency rule.
+// backs the 200-reused idempotency rule; LatestDoneForVersion returns the newest
+// done run inside one version so a shared repository never leaks another
+// version's baseline.
 type IndexRepository interface {
 	CreateRun(ctx context.Context, run codeintel.IndexRun) (codeintel.IndexRun, error)
 	GetRun(ctx context.Context, id int64) (codeintel.IndexRun, error)
 	LatestRun(ctx context.Context, repoID int64) (codeintel.IndexRun, error)
+	LatestDoneForVersion(ctx context.Context, versionID, repoID int64) (codeintel.IndexRun, error)
 	UpdateRun(ctx context.Context, run codeintel.IndexRun) error
 	ActiveRun(ctx context.Context, repoID int64) (codeintel.IndexRun, bool, error)
 	DoneRunByCommit(ctx context.Context, repoID int64, commitSHA string) (codeintel.IndexRun, bool, error)
@@ -161,7 +164,19 @@ func (s *IndexService) Start(ctx context.Context, versionID, repoID int64, commi
 		}
 		runCommit = resolved
 	case binding.CodeBaselineCommit != "":
-		runCommit = binding.CodeBaselineCommit
+		// version_sut stores one baseline commit for the whole binding. In a
+		// multi-repo binding it belongs to the deterministic baseline repo, so
+		// another repository must resolve its own head instead of inheriting a
+		// foreign commit and failing the index.
+		if _, resolveErr := s.git.ResolveCommit(ctx, repository.Path, binding.CodeBaselineCommit); resolveErr == nil {
+			runCommit = binding.CodeBaselineCommit
+		} else {
+			head, headErr := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
+			if headErr != nil {
+				return codeintel.IndexRun{}, false, headErr
+			}
+			runCommit = head
+		}
 	default:
 		head, headErr := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
 		if headErr != nil {
@@ -365,10 +380,29 @@ func (s *IndexService) RepoStatus(ctx context.Context, versionID int64) ([]RepoS
 			return nil, mapDomainError(err, "code repository")
 		}
 		status := RepoStatus{RepoID: repoID, Repository: repository, BaselineCommit: seen[repoID]}
+		// A multi-repo binding carries one shared baseline commit, which only
+		// resolves in the deterministic baseline repository. Other repositories
+		// fall back to their own newest done index commit.
+		if ValidCommitSHA(status.BaselineCommit) {
+			if _, err := s.git.ResolveCommit(ctx, repository.Path, status.BaselineCommit); err != nil {
+				status.BaselineCommit = ""
+			}
+		}
 		if latest, err := s.runs.LatestRun(ctx, repoID); err == nil {
 			status.Latest = &latest
 		} else if !errors.Is(err, codeintel.ErrNotFound) {
 			return nil, err
+		}
+		// A failed/queued newest run must not hide an older done run, and
+		// another version sharing this repository must not supply the baseline.
+		if status.BaselineCommit == "" {
+			if done, doneErr := s.runs.LatestDoneForVersion(ctx, versionID, repoID); doneErr == nil {
+				if ValidCommitSHA(done.CommitSHA) {
+					status.BaselineCommit = done.CommitSHA
+				}
+			} else if !errors.Is(doneErr, codeintel.ErrNotFound) {
+				return nil, doneErr
+			}
 		}
 		if _, active, err := s.runs.ActiveRun(ctx, repoID); err == nil {
 			status.IndexInProgress = active

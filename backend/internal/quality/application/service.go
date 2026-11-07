@@ -3,7 +3,9 @@ package qualityapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -15,6 +17,14 @@ import (
 // Audit action recorded for every accepted evaluation run.
 const ActionEvalRecorded = "quality.eval_recorded"
 
+// Snapshot eval lifecycle event types (W2-14, EV-20). They are published on the
+// version channel with {eval_run_id,version_id,mode,status,metrics,error}.
+const (
+	EventEvalStarted   = "eval.started"
+	EventEvalCompleted = "eval.completed"
+	EventEvalFailed    = "eval.failed"
+)
+
 // Service implements the quality application surface.
 type Service struct {
 	repo        Repository
@@ -23,6 +33,13 @@ type Service struct {
 	operational OperationalSource
 	settings    SettingsReader
 	audit       auditapp.Recorder
+
+	version       VersionSnapshotPort
+	versionExists VersionExistsPort
+	design        DesignSnapshotPort
+	execution     ExecutionSnapshotPort
+	visual        VisualSnapshotPort
+	events        EventPublisher
 }
 
 // NewService wires the quality application service. operational, settings and
@@ -45,6 +62,37 @@ func NewService(
 		settings:    settings,
 		audit:       audit,
 	}
+}
+
+// WithSnapshotPorts wires the read-only product-data ports used by
+// TriggerSnapshot (W2-14). Any nil port makes a snapshot trigger unavailable
+// instead of fabricating metric values.
+func (s *Service) WithSnapshotPorts(
+	execution ExecutionSnapshotPort,
+	version VersionSnapshotPort,
+	design DesignSnapshotPort,
+	visual VisualSnapshotPort,
+) *Service {
+	s.execution = execution
+	s.version = version
+	s.design = design
+	s.visual = visual
+	return s
+}
+
+// WithVersionExistence wires the narrow version-existence probe used by the
+// snapshot trigger and the trend series (W2-14). Without it both operations fail
+// honestly with 503 instead of returning data for a version that does not exist.
+func (s *Service) WithVersionExistence(port VersionExistsPort) *Service {
+	s.versionExists = port
+	return s
+}
+
+// WithEvents wires the eval.* lifecycle publisher. A nil publisher keeps the
+// trigger successful without events (best-effort UI projection).
+func (s *Service) WithEvents(events EventPublisher) *Service {
+	s.events = events
+	return s
 }
 
 // List returns the newest eval runs. A non-positive limit falls back to 20 and
@@ -119,6 +167,189 @@ func (s *Service) Record(ctx context.Context, actor platform.Actor, input Record
 	}
 	s.recordAudit(ctx, actor, run)
 	return run, nil
+}
+
+// TriggerSnapshot derives and persists one mode=snapshot eval run for a version
+// from the real product data read ports (W2-14). It publishes eval.started
+// before doing the work and eval.completed/eval.failed afterwards. The baseline
+// is the previous run of the same version and only marks regressions: it never
+// blocks the trigger.
+func (s *Service) TriggerSnapshot(ctx context.Context, actor platform.Actor, versionID int64) (EvalRun, error) {
+	if versionID <= 0 {
+		return EvalRun{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if s.repo == nil {
+		return EvalRun{}, platform.Unavailable("quality repository is not configured")
+	}
+	if s.execution == nil || s.version == nil || s.design == nil || s.visual == nil {
+		return EvalRun{}, platform.Unavailable("quality snapshot ports are not configured")
+	}
+	// Existence is checked before publishing eval.started or persisting the run:
+	// an unknown version must not create an all-zero failed snapshot (W2-14
+	// review, P2). The narrow port is owned by the version context.
+	if err := s.requireVersion(ctx, versionID); err != nil {
+		return EvalRun{}, err
+	}
+
+	runID := s.ids.Next()
+	version := versionID
+	now := s.clock.Now().UTC()
+	s.publishSnapshotEvent(ctx, EventEvalStarted, runID, version, quality.StatusRunning, nil, "")
+
+	closed, requirements, err := s.version.CountRequirementClosure(ctx, &version)
+	if err != nil {
+		return EvalRun{}, s.snapshotFailure(ctx, runID, version, fmt.Errorf("snapshot requirement closure: %w", err))
+	}
+	confirmedCases, _, err := s.design.CountCaseConfirmation(ctx, &version)
+	if err != nil {
+		return EvalRun{}, s.snapshotFailure(ctx, runID, version, fmt.Errorf("snapshot case confirmation: %w", err))
+	}
+	executionPassed, executionFinished, err := s.execution.CountExecutionPass(ctx, &version)
+	if err != nil {
+		return EvalRun{}, s.snapshotFailure(ctx, runID, version, fmt.Errorf("snapshot execution pass: %w", err))
+	}
+	visualPassed, visualFailed, err := s.visual.VisualClassification(ctx, &version)
+	if err != nil {
+		return EvalRun{}, s.snapshotFailure(ctx, runID, version, fmt.Errorf("snapshot visual classification: %w", err))
+	}
+
+	sample := quality.SnapshotSample{
+		ConfirmedRequirements: requirements,
+		CoveredRequirements:   closed,
+		ConfirmedCases:        confirmedCases,
+		ExecutionPassed:       executionPassed,
+		ExecutionFinished:     executionFinished,
+		VisualPassed:          visualPassed,
+		VisualEvaluated:       visualPassed + visualFailed,
+	}
+	if err := quality.ValidateSnapshot(sample); err != nil {
+		return EvalRun{}, s.snapshotFailure(ctx, runID, version, err)
+	}
+
+	status, metrics := quality.EvaluateSnapshot(sample, s.snapshotBaseline(ctx, version), s.regressionTolerance(ctx))
+	summary := map[string]any{
+		"version_id":             platformid.Format(version),
+		"source":                 quality.EvalModeSnapshot,
+		"confirmed_requirements": sample.ConfirmedRequirements,
+		"covered_requirements":   sample.CoveredRequirements,
+		"confirmed_cases":        sample.ConfirmedCases,
+		"execution_passed":       sample.ExecutionPassed,
+		"execution_finished":     sample.ExecutionFinished,
+		"visual_passed":          sample.VisualPassed,
+		"visual_evaluated":       sample.VisualEvaluated,
+	}
+	run := EvalRun{
+		ID:            runID,
+		Mode:          quality.EvalModeSnapshot,
+		CorpusVersion: "snapshot:" + platformid.Format(version),
+		Status:        status,
+		Summary:       summary,
+		VersionID:     &version,
+		StartedAt:     now,
+		FinishedAt:    &now,
+		CreatedAt:     now,
+		Metrics:       metrics,
+	}
+	if err := s.repo.Insert(ctx, run, metrics); err != nil {
+		return EvalRun{}, s.snapshotFailure(ctx, runID, version, err)
+	}
+	s.recordAudit(ctx, actor, run)
+	s.publishSnapshotEvent(ctx, EventEvalCompleted, runID, version, status, metrics, "")
+	return run, nil
+}
+
+// Trends returns the version/metric trend series ordered oldest first. from/to
+// are optional bounds (zero = unbounded).
+func (s *Service) Trends(ctx context.Context, versionID int64, metric string, from, to time.Time) ([]TrendPoint, error) {
+	if versionID <= 0 {
+		return nil, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	metric = strings.TrimSpace(metric)
+	if metric == "" {
+		return nil, platform.Invalid("metric", "is required")
+	}
+	if !quality.IsKnownMetric(metric) {
+		return nil, platform.Invalid("metric", "is not a known eval metric")
+	}
+	if !from.IsZero() && !to.IsZero() && from.After(to) {
+		return nil, platform.Invalid("from", "must not be after to")
+	}
+	if s.repo == nil {
+		return nil, platform.Unavailable("quality repository is not configured")
+	}
+	// An unknown version is a 404, not an empty 200 series (W2-14 review, P2).
+	if err := s.requireVersion(ctx, versionID); err != nil {
+		return nil, err
+	}
+	return s.repo.Trends(ctx, versionID, metric, from, to)
+}
+
+// requireVersion probes the narrow version-existence port shared by the
+// snapshot trigger and the trend read. A nil port is a wiring error rather than
+// an implicit success: the quality context must never fabricate data for a
+// version it cannot verify.
+func (s *Service) requireVersion(ctx context.Context, versionID int64) error {
+	if s.versionExists == nil {
+		return platform.Unavailable("quality version existence port is not configured")
+	}
+	exists, err := s.versionExists.VersionExists(ctx, versionID)
+	if err != nil {
+		return fmt.Errorf("quality version existence: %w", err)
+	}
+	if !exists {
+		return platform.NotFound("version")
+	}
+	return nil
+}
+
+// snapshotBaseline reads the previous run of the version and projects its metric
+// values into the baseline map. A read failure degrades to no baseline: the
+// baseline is a report-only signal and must never block a snapshot trigger.
+func (s *Service) snapshotBaseline(ctx context.Context, versionID int64) map[string]float64 {
+	previous, err := s.repo.LatestForVersion(ctx, versionID)
+	if err != nil || previous == nil || len(previous.Metrics) == 0 {
+		return nil
+	}
+	baseline := make(map[string]float64, len(previous.Metrics))
+	for _, metric := range previous.Metrics {
+		baseline[metric.Name] = metric.Value
+	}
+	return baseline
+}
+
+// snapshotFailure publishes eval.failed with the concrete error and returns the
+// original error so the HTTP layer can map it.
+func (s *Service) snapshotFailure(ctx context.Context, runID, versionID int64, err error) error {
+	s.publishSnapshotEvent(ctx, EventEvalFailed, runID, versionID, quality.StatusFailed, nil, err.Error())
+	return err
+}
+
+// publishSnapshotEvent is best effort: a projection failure never changes the
+// persisted eval result.
+func (s *Service) publishSnapshotEvent(
+	ctx context.Context,
+	eventType string,
+	runID, versionID int64,
+	status string,
+	metrics []quality.Metric,
+	failure string,
+) {
+	if s.events == nil {
+		return
+	}
+	values := make(map[string]float64, len(metrics))
+	for _, metric := range metrics {
+		values[metric.Name] = metric.Value
+	}
+	payload := map[string]any{
+		"eval_run_id": platformid.Format(runID),
+		"version_id":  platformid.Format(versionID),
+		"mode":        quality.EvalModeSnapshot,
+		"status":      status,
+		"metrics":     values,
+		"error":       failure,
+	}
+	_ = s.events.Publish(ctx, eventType, versionID, payload)
 }
 
 // Get returns one eval run or the shared 404 envelope.

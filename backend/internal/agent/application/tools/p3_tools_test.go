@@ -147,6 +147,50 @@ func requireToolError(t *testing.T, err error, code string) {
 	}
 }
 
+func TestP3UploadAndViewportTools(t *testing.T) {
+	port := &fakeP3ExecutionPort{}
+	registry := p3Registry(port)
+
+	if _, err := executeP3(t, registry, ToolBrowserUploadFile, `{"target":{"selector":"#upload"},"files":[{"name":"pic.png","mime":"image/png","base64":"AA=="}]}`); err != nil {
+		t.Fatalf("browser.upload_file: %v", err)
+	}
+	if port.browserAction != "upload_file" {
+		t.Fatalf("browser action = %q", port.browserAction)
+	}
+	var uploadArgs map[string]any
+	if err := json.Unmarshal(port.browserArgs, &uploadArgs); err != nil {
+		t.Fatalf("upload args are not JSON: %v", err)
+	}
+	files, ok := uploadArgs["files"].([]any)
+	if !ok || len(files) != 1 {
+		t.Fatalf("upload files = %v", uploadArgs["files"])
+	}
+	first, _ := files[0].(map[string]any)
+	if first["name"] != "pic.png" || first["mime"] != "image/png" {
+		t.Fatalf("upload file = %v", first)
+	}
+	if _, err := executeP3(t, registry, ToolBrowserUploadFile, `{"target":{"selector":"#upload"}}`); err == nil {
+		t.Fatalf("browser.upload_file accepted a call without files")
+	} else {
+		requireToolError(t, err, CodeInvalidArgument)
+	}
+	if _, err := executeP3(t, registry, ToolBrowserUploadFile, `{"target":{"selector":"#upload"},"files":[{"name":"../evil.png","mime":"image/png","base64":"AA=="}]}`); err == nil {
+		t.Fatalf("browser.upload_file accepted a path-traversal file name")
+	}
+
+	if _, err := executeP3(t, registry, ToolBrowserSetViewport, `{"width":390,"height":844}`); err != nil {
+		t.Fatalf("browser.set_viewport: %v", err)
+	}
+	if port.browserAction != "set_viewport" {
+		t.Fatalf("browser action = %q", port.browserAction)
+	}
+	if _, err := executeP3(t, registry, ToolBrowserSetViewport, `{"width":100,"height":100}`); err == nil {
+		t.Fatalf("browser.set_viewport accepted out-of-range sizes")
+	} else {
+		requireToolError(t, err, CodeInvalidArgument)
+	}
+}
+
 func TestP3ToolSchemasExcludeVersionID(t *testing.T) {
 	registry := p3Registry(&fakeP3ExecutionPort{})
 	names := P3ToolNames()

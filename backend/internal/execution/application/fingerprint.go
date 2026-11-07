@@ -41,8 +41,13 @@ type VersionSUTBinding struct {
 	DatabaseIDs     []int64
 	AccountRoles    []string
 	CodeRepoID      *int64
-	Branch          string
-	Commit          string
+	// RepositoryIDs is every effective code repository of the binding
+	// (versionapp.BindingView.Repositories), deduplicated ascending. CodeRepoID
+	// remains the single deterministic baseline repository of the code-baseline
+	// hash; RepositoryIDs is what the wave scope snapshot freezes.
+	RepositoryIDs []int64
+	Branch        string
+	Commit        string
 }
 
 // fingerprintPayload is the canonical JSON shape of §5.1. Field order is

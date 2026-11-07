@@ -494,7 +494,7 @@ func (f *fakeHumanRepo) GetOpenByCaseRun(_ context.Context, caseRunID int64) (*e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, row := range f.rows {
-		if row.CaseRunID != nil && *row.CaseRunID == caseRunID && row.Status == execution.HumanOpen {
+		if row.CaseRunID != nil && *row.CaseRunID == caseRunID && row.Status == execution.HumanPending {
 			copied := row
 			return &copied, nil
 		}
@@ -508,13 +508,23 @@ func (f *fakeHumanRepo) ListByVersion(context.Context, int64, string, int, *int6
 
 func (f *fakeHumanRepo) ListOpen(context.Context) ([]execution.HumanRequest, error) { return nil, nil }
 
+func (f *fakeHumanRepo) ListQuestions(context.Context, int64, string, int, *int64) ([]execution.HumanRequest, bool, error) {
+	return nil, false, nil
+}
+
 func (f *fakeHumanRepo) CountByCaseRun(context.Context, int64) (int, error) { return 0, nil }
 
-func (f *fakeHumanRepo) Transition(context.Context, int64, execution.HumanRequestStatus, execution.HumanRequestStatus, map[string]any, int64, time.Time) (bool, error) {
+func (f *fakeHumanRepo) Transition(context.Context, int64, execution.HumanRequestStatus, execution.HumanRequestStatus, map[string]any, int64, time.Time, *time.Time) (bool, error) {
 	return false, nil
 }
 
+func (f *fakeHumanRepo) AttachMessage(context.Context, int64, int64) error { return nil }
+
 func (f *fakeHumanRepo) Expire(context.Context, time.Time) ([]execution.HumanRequest, error) {
+	return nil, nil
+}
+
+func (f *fakeHumanRepo) ExpireQuestions(context.Context, time.Time) ([]execution.HumanRequest, error) {
 	return nil, nil
 }
 
@@ -558,15 +568,20 @@ type fakeBrowserExecutor struct {
 	mu             sync.Mutex
 	contexts       int
 	actions        []string
+	actionContexts []string
+	actionArgs     []json.RawMessage
 	lastArgs       json.RawMessage
 	contextID      string
 	actionErr      error
-	result         executionapp.BrowserActionResult
-	closed         int
-	canceled       int
-	lastSpec       executionapp.BrowserContextSpec
-	lastExecutorID int64
-	createErr      error
+	// actionErrByContext fails the action of one browser context only, so a
+	// multi-context test can prove the capture is per-context best effort.
+	actionErrByContext map[string]error
+	result             executionapp.BrowserActionResult
+	closed             int
+	canceled           int
+	lastSpec           executionapp.BrowserContextSpec
+	lastExecutorID     int64
+	createErr          error
 }
 
 func (f *fakeBrowserExecutor) CreateContext(_ context.Context, spec executionapp.BrowserContextSpec) (string, error) {
@@ -588,8 +603,26 @@ func (f *fakeBrowserExecutor) Action(_ context.Context, executorID int64, contex
 	defer f.mu.Unlock()
 	f.lastExecutorID = executorID
 	f.actions = append(f.actions, action)
+	f.actionContexts = append(f.actionContexts, contextID)
+	f.actionArgs = append(f.actionArgs, args)
 	f.lastArgs = args
+	if err := f.actionErrByContext[contextID]; err != nil {
+		return executionapp.BrowserActionResult{}, err
+	}
 	return f.result, f.actionErr
+}
+
+// countActions counts executed actions of one kind (for example "network").
+func (f *fakeBrowserExecutor) countActions(action string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, recorded := range f.actions {
+		if recorded == action {
+			count++
+		}
+	}
+	return count
 }
 
 func (f *fakeBrowserExecutor) Cancel(context.Context, int64, string) error {

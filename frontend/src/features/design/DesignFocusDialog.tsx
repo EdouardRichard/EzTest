@@ -4,34 +4,29 @@ import type { ReactNode } from "react"
 
 import { FloatingPanel } from "@/components/ui/FloatingPanel"
 
-/** Dialog title and accessible name of the focused mindmap workspace. */
-export const DESIGN_FOCUS_TITLE = "脑图与用例详情"
-
-/**
- * Fixed split of the focus layout (spec §9.3): mindmap 65%, detail 35%. The
- * inline three-layer layout keeps its own draggable chat/mindmap/detail split;
- * this pair only applies while the floating dialog is open.
- */
-export const DESIGN_FOCUS_SPLITS = { mindmap: 65, detail: 35 } as const
+/** Dialog title and accessible name of the enlarged case workbench. */
+export const DESIGN_FOCUS_TITLE = "用例工作区"
 
 export type DesignFocusDialogProps = {
   open: boolean
   onClose: () => void
   /**
-   * The inline three-layer region (chat / dividers / mindmap / detail). The
-   * floating panel re-parents this exact subtree instead of rendering a second
-   * mindmap: the canvas, its selection/filter state, the detail fetch and the
-   * scroll offsets all survive the toggle, and no test id is duplicated.
+   * The whole workbench subtree (graph over detail, with its toolbars and the
+   * persisted 65/35 split). The floating panel re-parents this exact subtree
+   * instead of rendering a second mindmap: the canvas, its selection/filter
+   * state, the detail fetch and the scroll offsets all survive the toggle, and
+   * no test id is duplicated.
    */
   children: ReactNode
 }
 
 /**
- * Enlarged mindmap + case detail workspace (spec §9.3). It is the same inline
- * three-layer region rendered through `FloatingPanel`: opening moves the host
- * into the 90vw × 90vh dialog while `DesignTab` switches to the fixed 65/35
- * split and hides the chat layer; closing moves the host back and restores the
- * draggable layout, the prior selection and the scroll offsets.
+ * Whole-workbench modal (R-D2-3). Opening moves only the graph + detail
+ * workbench into a 90vw × 90vh dialog while the design chat stays inline in the
+ * page; closing moves the same subtree back, preserving canvas state, selection,
+ * detail fetch and scroll offsets. The workbench keeps its draggable and
+ * persisted 65/35 split inside the dialog — there is no separate dialog layout
+ * and no focus-specific split constant.
  */
 export function DesignFocusDialog({ open, onClose, children }: DesignFocusDialogProps) {
   return (

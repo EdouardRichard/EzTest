@@ -35,38 +35,43 @@ func ptr[T any](value T) *T { return &value }
 
 func sampleVersion(ids *id.Snowflake, actorID int64) version.Version {
 	return version.Version{
-		ID:        ids.Next(),
-		Title:     "Orders Q4",
-		Status:    version.StatusInitial,
-		CreatedBy: actorID,
-		CreatedAt: testTime,
-		UpdatedAt: testTime,
+		ID:          ids.Next(),
+		Title:       "Orders Q4",
+		Description: "Q4 flows",
+		Goal:        "verify checkout",
+		Status:      version.StatusInitial,
+		CreatedBy:   actorID,
+		CreatedAt:   testTime,
+		UpdatedAt:   testTime,
 	}
 }
 
-func sampleBindings(ids *id.Snowflake, versionID int64) []version.Binding {
-	return []version.Binding{
-		{
-			ID:                 ids.Next(),
-			VersionID:          versionID,
-			SUTID:              1001,
-			EnvironmentID:      1101,
-			CodeRepositoryID:   ptr(int64(1201)),
-			CodeBaselineCommit: baselineCommit,
-			Scope:              version.Scope{Pages: []int64{1301, 1302}, APIs: []int64{1401}},
-			DatabaseIDs:        []int64{1501},
-			Accounts:           []version.AccountBinding{{AccountID: 1601, Role: "order_admin"}},
+// sampleBinding is the v0.22 environment-only binding: no single repository
+// column, exclusions as a JSON document, version-level overrides and the global
+// account subset.
+func sampleBinding(ids *id.Snowflake, versionID int64) version.Binding {
+	return version.Binding{
+		ID:                 ids.Next(),
+		VersionID:          versionID,
+		SUTID:              1001,
+		EnvironmentID:      1101,
+		CodeBaselineCommit: baselineCommit,
+		ScopeExclude: version.NewScopeExclude(
+			[]int64{1301}, []int64{1401}, []int64{1501},
+		),
+		RepositoryOverrides: []version.RepositoryOverride{
+			{RepoID: 1201, Included: false},
+			{RepoID: 1203, Included: true},
 		},
-		{
-			ID:            ids.Next(),
-			VersionID:     versionID,
-			SUTID:         1002,
-			EnvironmentID: 1102,
-			Scope:         version.Scope{Pages: []int64{1303}, APIs: []int64{}},
-			DatabaseIDs:   []int64{},
-			Accounts:      []version.AccountBinding{{AccountID: 1602}},
-		},
+		Accounts: []version.AccountBinding{{AccountID: 1601}, {AccountID: 1602}},
 	}
+}
+
+// sampleBindings keeps the unrelated integration fixtures (conversation,
+// requirement, closure, attachment) compiling: a v0.22 version has exactly one
+// environment-derived binding.
+func sampleBindings(ids *id.Snowflake, versionID int64) []version.Binding {
+	return []version.Binding{sampleBinding(ids, versionID)}
 }
 
 func TestRepositoryCreateGetListUpdate(t *testing.T) {
@@ -77,8 +82,8 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 
 	v := sampleVersion(ids, 42)
 	v.AutoDesignNewRequirements = true
-	bindings := sampleBindings(ids, v.ID)
-	if err := repo.Create(ctx, v, bindings); err != nil {
+	binding := sampleBinding(ids, v.ID)
+	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -86,102 +91,89 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if stored.Title != v.Title || stored.Status != version.StatusInitial || !stored.AutoDesignNewRequirements {
+	if stored.Title != v.Title || stored.Description != "Q4 flows" || stored.Goal != "verify checkout" {
 		t.Fatalf("stored version = %#v", stored)
+	}
+	if stored.Status != version.StatusInitial || !stored.AutoDesignNewRequirements {
+		t.Fatalf("stored status = %#v", stored)
 	}
 	if stored.CreatedBy != 42 || !stored.CreatedAt.Equal(testTime) || !stored.UpdatedAt.Equal(testTime) {
 		t.Fatalf("stored audit columns = %#v", stored)
 	}
-	if len(storedBindings) != 2 {
+	if len(storedBindings) != 1 {
 		t.Fatalf("bindings = %#v", storedBindings)
 	}
 
-	first := findBinding(t, storedBindings, 1001)
-	if first.CodeRepositoryID == nil || *first.CodeRepositoryID != 1201 {
-		t.Fatalf("repository = %v", first.CodeRepositoryID)
+	first := storedBindings[0]
+	if first.ID != binding.ID || first.SUTID != 1001 || first.EnvironmentID != 1101 {
+		t.Fatalf("binding = %#v", first)
 	}
 	if first.CodeBaselineCommit != baselineCommit {
-		t.Fatalf("code baseline commit = %q, want %q", first.CodeBaselineCommit, baselineCommit)
+		t.Fatalf("code baseline commit = %q", first.CodeBaselineCommit)
 	}
-	if got := first.Scope.Pages; len(got) != 2 || got[0] != 1301 || got[1] != 1302 {
-		t.Fatalf("scope pages = %#v", got)
+	if len(first.ScopeExclude.Pages) != 1 || first.ScopeExclude.Pages[0] != 1301 ||
+		len(first.ScopeExclude.APIs) != 1 || first.ScopeExclude.APIs[0] != 1401 ||
+		len(first.ScopeExclude.Databases) != 1 || first.ScopeExclude.Databases[0] != 1501 {
+		t.Fatalf("scope_exclude = %#v", first.ScopeExclude)
 	}
-	if got := first.Scope.APIs; len(got) != 1 || got[0] != 1401 {
-		t.Fatalf("scope apis = %#v", got)
+	if len(first.RepositoryOverrides) != 2 ||
+		first.RepositoryOverrides[0].RepoID != 1201 || first.RepositoryOverrides[0].Included ||
+		first.RepositoryOverrides[1].RepoID != 1203 || !first.RepositoryOverrides[1].Included {
+		t.Fatalf("repository overrides = %#v", first.RepositoryOverrides)
 	}
-	if got := first.DatabaseIDs; len(got) != 1 || got[0] != 1501 {
-		t.Fatalf("database ids = %#v", got)
-	}
-	if len(first.Accounts) != 1 || first.Accounts[0].AccountID != 1601 || first.Accounts[0].Role != "order_admin" {
+	if len(first.Accounts) != 2 || first.Accounts[0].AccountID != 1601 || first.Accounts[1].AccountID != 1602 {
 		t.Fatalf("accounts = %#v", first.Accounts)
 	}
+	t.Logf("created version=%d binding=%d sut=%d environment=%d scope_exclude=%#v overrides=%#v accounts=%#v",
+		v.ID, first.ID, first.SUTID, first.EnvironmentID,
+		first.ScopeExclude, first.RepositoryOverrides, first.Accounts)
 
-	second := findBinding(t, storedBindings, 1002)
-	if second.CodeRepositoryID != nil {
-		t.Fatalf("repository = %v, want nil", second.CodeRepositoryID)
-	}
-	if second.Scope.Pages == nil || len(second.Scope.Pages) != 1 || second.Scope.Pages[0] != 1303 {
-		t.Fatalf("pages = %#v", second.Scope.Pages)
-	}
-	if second.Scope.APIs == nil || len(second.Scope.APIs) != 0 {
-		t.Fatalf("apis = %#v", second.Scope.APIs)
-	}
-	if second.DatabaseIDs == nil || len(second.DatabaseIDs) != 0 {
-		t.Fatalf("database ids = %#v", second.DatabaseIDs)
-	}
-
-	// Raw rows: scope JSONB shape, resource rows and role.
+	// Raw rows: the scope_exclude JSONB shape and the version-level tables.
 	var scopeRaw []byte
-	if err := pool.QueryRow(ctx, `SELECT scope FROM version_sut WHERE id = $1`, first.ID).Scan(&scopeRaw); err != nil {
-		t.Fatalf("query scope: %v", err)
+	if err := pool.QueryRow(ctx, `SELECT scope_exclude FROM version_sut WHERE id = $1`, first.ID).Scan(&scopeRaw); err != nil {
+		t.Fatalf("query scope_exclude: %v", err)
 	}
 	var scope map[string]any
 	if err := json.Unmarshal(scopeRaw, &scope); err != nil {
-		t.Fatalf("decode scope: %v", err)
+		t.Fatalf("decode scope_exclude: %v", err)
 	}
 	pages, _ := scope["pages"].([]any)
-	if len(pages) != 2 || pages[0].(float64) != 1301 || pages[1].(float64) != 1302 {
-		t.Fatalf("scope JSON = %s", scopeRaw)
+	if len(pages) != 1 || pages[0].(float64) != 1301 {
+		t.Fatalf("scope_exclude JSON = %s", scopeRaw)
 	}
+	if _, ok := scope["databases"].([]any); !ok {
+		t.Fatalf("scope_exclude has no databases list: %s", scopeRaw)
+	}
+	t.Logf("persisted version_sut.scope_exclude = %s", scopeRaw)
 
-	rows, err := pool.Query(ctx, `
-		SELECT kind, resource_id, role, selected FROM version_sut_resource
-		WHERE version_sut_id = $1 ORDER BY id`, first.ID)
-	if err != nil {
-		t.Fatalf("query resources: %v", err)
+	var overrideCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM version_repository_override WHERE version_id = $1`, v.ID).Scan(&overrideCount); err != nil {
+		t.Fatalf("count overrides: %v", err)
 	}
-	defer rows.Close()
-	type resourceRow struct {
-		kind, role string
-		id         int64
-		selected   bool
+	if overrideCount != 2 {
+		t.Fatalf("override rows = %d", overrideCount)
 	}
-	resourceRows := []resourceRow{}
-	for rows.Next() {
-		var row resourceRow
-		if err := rows.Scan(&row.kind, &row.id, &row.role, &row.selected); err != nil {
-			t.Fatalf("scan resource: %v", err)
-		}
-		resourceRows = append(resourceRows, row)
+	var accountCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM version_account WHERE version_id = $1 AND enabled`, v.ID).Scan(&accountCount); err != nil {
+		t.Fatalf("count accounts: %v", err)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
+	if accountCount != 2 {
+		t.Fatalf("account rows = %d", accountCount)
 	}
-	if len(resourceRows) != 2 {
-		t.Fatalf("resource rows = %#v", resourceRows)
+	// The 0.21 resource join table is no longer written by the v0.22 binding.
+	var legacyCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM version_sut_resource`).Scan(&legacyCount); err != nil {
+		t.Fatalf("count legacy resources: %v", err)
 	}
-	if resourceRows[0].kind != "database" || resourceRows[0].id != 1501 || resourceRows[0].selected != true {
-		t.Fatalf("database row = %#v", resourceRows[0])
-	}
-	if resourceRows[1].kind != "account" || resourceRows[1].id != 1601 || resourceRows[1].role != "order_admin" {
-		t.Fatalf("account row = %#v", resourceRows[1])
+	if legacyCount != 0 {
+		t.Fatalf("legacy version_sut_resource rows = %d", legacyCount)
 	}
 
 	// A second version lands in the list with its own SUT count.
 	secondVersion := sampleVersion(ids, 7)
 	secondVersion.Title = "Billing Q4"
-	secondBindings := sampleBindings(ids, secondVersion.ID)[:1]
-	if err := repo.Create(ctx, secondVersion, secondBindings); err != nil {
+	secondBinding := sampleBinding(ids, secondVersion.ID)
+	if err := repo.Create(ctx, secondVersion, []version.Binding{secondBinding}); err != nil {
 		t.Fatalf("Create second: %v", err)
 	}
 
@@ -189,22 +181,15 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(page) != 1 || page[0].ID != secondVersion.ID {
+	if len(page) != 1 || page[0].ID != secondVersion.ID || page[0].SUTCount != 1 {
 		t.Fatalf("list = %#v", page)
 	}
-	if page[0].SUTCount != 1 || page[0].Title != "Billing Q4" || page[0].Status != version.StatusInitial {
-		t.Fatalf("summary = %#v", page[0])
-	}
-
 	older, err := repo.List(ctx, 10, &secondVersion.ID)
-	if err != nil {
-		t.Fatalf("List older: %v", err)
-	}
-	if len(older) != 1 || older[0].ID != v.ID || older[0].SUTCount != 2 {
-		t.Fatalf("older = %#v", older)
+	if err != nil || len(older) != 1 || older[0].ID != v.ID || older[0].SUTCount != 1 {
+		t.Fatalf("older = %#v, err = %v", older, err)
 	}
 
-	// Update only touches title/auto flag/updated_at.
+	// Update only touches the editable version fields.
 	updated := stored
 	updated.Title = "Orders Q4 renamed"
 	updated.AutoDesignNewRequirements = false
@@ -219,11 +204,11 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 	if reloaded.Title != "Orders Q4 renamed" || reloaded.AutoDesignNewRequirements {
 		t.Fatalf("updated = %#v", reloaded)
 	}
+	if reloaded.Description != "Q4 flows" || reloaded.Goal != "verify checkout" {
+		t.Fatalf("update dropped description/goal: %#v", reloaded)
+	}
 	if !reloaded.CreatedAt.Equal(testTime) || !reloaded.UpdatedAt.Equal(testTime.Add(time.Hour)) {
 		t.Fatalf("timestamps = %v/%v", reloaded.CreatedAt, reloaded.UpdatedAt)
-	}
-	if reloaded.Status != version.StatusInitial || reloaded.CreatedBy != 42 {
-		t.Fatalf("update changed immutable fields: %#v", reloaded)
 	}
 
 	if _, _, err := repo.Get(ctx, 999999); !errors.Is(err, version.ErrNotFound) {
@@ -236,6 +221,129 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 	}
 }
 
+func TestRepositoryUpdateBinding(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 1)
+	binding := sampleBinding(ids, v.ID)
+	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	next := binding
+	next.EnvironmentID = 1103
+	next.CodeBaselineCommit = otherBaselineCommit
+	next.ScopeExclude = version.NewScopeExclude(nil, []int64{1402}, nil)
+	next.RepositoryOverrides = []version.RepositoryOverride{{RepoID: 1202, Included: true}}
+	next.Accounts = []version.AccountBinding{{AccountID: 1604}}
+	expectedUpdatedAt := v.UpdatedAt
+	v.UpdatedAt = testTime.Add(time.Hour)
+	if err := repo.UpdateBinding(ctx, v, next, expectedUpdatedAt); err != nil {
+		t.Fatalf("UpdateBinding: %v", err)
+	}
+
+	reloaded, bindings, err := repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !reloaded.UpdatedAt.Equal(testTime.Add(time.Hour)) {
+		t.Fatalf("version updated_at = %v", reloaded.UpdatedAt)
+	}
+	stored := bindings[0]
+	if stored.EnvironmentID != 1103 || stored.CodeBaselineCommit != otherBaselineCommit {
+		t.Fatalf("binding = %#v", stored)
+	}
+	if len(stored.ScopeExclude.Pages) != 0 || len(stored.ScopeExclude.APIs) != 1 ||
+		stored.ScopeExclude.APIs[0] != 1402 || len(stored.ScopeExclude.Databases) != 0 {
+		t.Fatalf("scope_exclude = %#v", stored.ScopeExclude)
+	}
+	if len(stored.RepositoryOverrides) != 1 || stored.RepositoryOverrides[0].RepoID != 1202 ||
+		!stored.RepositoryOverrides[0].Included {
+		t.Fatalf("overrides = %#v", stored.RepositoryOverrides)
+	}
+	if len(stored.Accounts) != 1 || stored.Accounts[0].AccountID != 1604 {
+		t.Fatalf("accounts = %#v", stored.Accounts)
+	}
+
+	missing := v
+	missing.ID = 999999
+	missingBinding := next
+	missingBinding.VersionID = missing.ID
+	if err := repo.UpdateBinding(ctx, missing, missingBinding, expectedUpdatedAt); !errors.Is(err, version.ErrNotFound) {
+		t.Fatalf("missing UpdateBinding = %v", err)
+	}
+
+	// An optimistic write derived from the old snapshot loses deterministically
+	// once another writer bumped version.updated_at.
+	if err := repo.UpdateBinding(ctx, v, next, expectedUpdatedAt); !errors.Is(err, version.ErrBindingConflict) {
+		t.Fatalf("stale UpdateBinding = %v, want ErrBindingConflict", err)
+	}
+}
+
+// TestRepositoryUpdateBindingSerializesOnVersionRowLock proves the binding write
+// takes the version row lock before rewriting the projection: a concurrent
+// transaction holding that lock blocks the update until it commits.
+func TestRepositoryUpdateBindingSerializesOnVersionRowLock(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 1)
+	binding := sampleBinding(ids, v.ID)
+	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock holder: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM version WHERE id = $1 FOR UPDATE`, v.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("lock version row: %v", err)
+	}
+	expectedUpdatedAt := v.UpdatedAt
+	v.UpdatedAt = testTime.Add(time.Hour)
+	next := binding
+	next.ScopeExclude = version.NewScopeExclude(nil, nil, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- repo.UpdateBinding(ctx, v, next, expectedUpdatedAt)
+	}()
+	select {
+	case err := <-done:
+		_ = tx.Rollback(ctx)
+		t.Fatalf("UpdateBinding did not wait for the version row lock: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("UpdateBinding after lock release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UpdateBinding did not finish after the lock was released")
+	}
+	stored, storedBindings, err := repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !stored.UpdatedAt.Equal(testTime.Add(time.Hour)) {
+		t.Fatalf("version updated_at = %v", stored.UpdatedAt)
+	}
+	if len(storedBindings[0].ScopeExclude.Pages) != 0 {
+		t.Fatalf("scope after serialized write = %#v", storedBindings[0].ScopeExclude)
+	}
+}
+
 func TestRepositorySetCodeBaselineCommit(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
@@ -243,58 +351,54 @@ func TestRepositorySetCodeBaselineCommit(t *testing.T) {
 	ctx := context.Background()
 
 	v := sampleVersion(ids, 1)
-	bindings := sampleBindings(ids, v.ID)
-	bindings[0].CodeBaselineCommit = ""
-	if err := repo.Create(ctx, v, bindings); err != nil {
+	binding := sampleBinding(ids, v.ID)
+	binding.CodeBaselineCommit = ""
+	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	_, storedBindings, err := repo.Get(ctx, v.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	first := findBinding(t, storedBindings, 1001)
-	if first.CodeBaselineCommit != "" {
-		t.Fatalf("initial code baseline commit = %q, want empty", first.CodeBaselineCommit)
+	if got := storedBindings[0].CodeBaselineCommit; got != "" {
+		t.Fatalf("initial code baseline commit = %q, want empty", got)
 	}
 
-	if err := repo.SetCodeBaselineCommit(ctx, first.ID, baselineCommit); err != nil {
+	if err := repo.SetCodeBaselineCommit(ctx, binding.ID, baselineCommit); err != nil {
 		t.Fatalf("SetCodeBaselineCommit: %v", err)
 	}
 	_, storedBindings, err = repo.Get(ctx, v.ID)
 	if err != nil {
 		t.Fatalf("Get after backfill: %v", err)
 	}
-	if got := findBinding(t, storedBindings, 1001).CodeBaselineCommit; got != baselineCommit {
+	if got := storedBindings[0].CodeBaselineCommit; got != baselineCommit {
 		t.Fatalf("backfilled code baseline commit = %q, want %q", got, baselineCommit)
 	}
 
-	// The single-row update replaces an existing commit.
-	if err := repo.SetCodeBaselineCommit(ctx, first.ID, otherBaselineCommit); err != nil {
+	if err := repo.SetCodeBaselineCommit(ctx, binding.ID, otherBaselineCommit); err != nil {
 		t.Fatalf("SetCodeBaselineCommit replace: %v", err)
 	}
 	_, storedBindings, err = repo.Get(ctx, v.ID)
 	if err != nil {
 		t.Fatalf("Get after replace: %v", err)
 	}
-	if got := findBinding(t, storedBindings, 1001).CodeBaselineCommit; got != otherBaselineCommit {
-		t.Fatalf("replaced code baseline commit = %q, want %q", got, otherBaselineCommit)
+	if got := storedBindings[0].CodeBaselineCommit; got != otherBaselineCommit {
+		t.Fatalf("replaced code baseline commit = %q", got)
 	}
 
-	// An empty commit clears the column to NULL, keeping the stored baseline
-	// unresolved.
-	if err := repo.SetCodeBaselineCommit(ctx, first.ID, ""); err != nil {
+	if err := repo.SetCodeBaselineCommit(ctx, binding.ID, ""); err != nil {
 		t.Fatalf("SetCodeBaselineCommit clear: %v", err)
 	}
 	_, storedBindings, err = repo.Get(ctx, v.ID)
 	if err != nil {
 		t.Fatalf("Get after clear: %v", err)
 	}
-	if got := findBinding(t, storedBindings, 1001).CodeBaselineCommit; got != "" {
-		t.Fatalf("cleared code baseline commit = %q, want empty", got)
+	if got := storedBindings[0].CodeBaselineCommit; got != "" {
+		t.Fatalf("cleared code baseline commit = %q", got)
 	}
 	var isNull bool
 	if err := pool.QueryRow(ctx,
-		`SELECT code_baseline_commit IS NULL FROM version_sut WHERE id = $1`, first.ID).Scan(&isNull); err != nil {
+		`SELECT code_baseline_commit IS NULL FROM version_sut WHERE id = $1`, binding.ID).Scan(&isNull); err != nil {
 		t.Fatalf("query cleared column: %v", err)
 	}
 	if !isNull {
@@ -304,21 +408,9 @@ func TestRepositorySetCodeBaselineCommit(t *testing.T) {
 	if err := repo.SetCodeBaselineCommit(ctx, 999999, baselineCommit); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("missing SetCodeBaselineCommit = %v", err)
 	}
-	// The column CHECK rejects malformed commits.
-	if err := repo.SetCodeBaselineCommit(ctx, first.ID, "not-a-sha"); err == nil {
+	if err := repo.SetCodeBaselineCommit(ctx, binding.ID, "not-a-sha"); err == nil {
 		t.Fatal("malformed commit was persisted")
 	}
-}
-
-func findBinding(t *testing.T, bindings []version.Binding, sutID int64) version.Binding {
-	t.Helper()
-	for _, binding := range bindings {
-		if binding.SUTID == sutID {
-			return binding
-		}
-	}
-	t.Fatalf("binding for SUT %d not stored", sutID)
-	return version.Binding{}
 }
 
 func TestRepositoryDuplicateBindingRollsBack(t *testing.T) {
@@ -328,16 +420,15 @@ func TestRepositoryDuplicateBindingRollsBack(t *testing.T) {
 	ctx := context.Background()
 
 	v := sampleVersion(ids, 1)
-	bindings := sampleBindings(ids, v.ID)
+	binding := sampleBinding(ids, v.ID)
 	duplicated := []version.Binding{
-		bindings[0],
-		bindings[1],
+		binding,
 		{
 			ID:            ids.Next(),
 			VersionID:     v.ID,
-			SUTID:         bindings[0].SUTID,
-			EnvironmentID: bindings[0].EnvironmentID,
-			Scope:         version.Scope{Pages: []int64{}, APIs: []int64{}},
+			SUTID:         binding.SUTID,
+			EnvironmentID: binding.EnvironmentID,
+			ScopeExclude:  version.NewScopeExclude(nil, nil, nil),
 		},
 	}
 	if err := repo.Create(ctx, v, duplicated); !errors.Is(err, version.ErrDuplicate) {
@@ -357,13 +448,55 @@ func TestRepositoryDuplicateBindingRollsBack(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("version_sut rows survived: %d", count)
 	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM version_account WHERE version_id = $1`, v.ID).Scan(&count); err != nil {
+		t.Fatalf("count version_account: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("version_account rows survived: %d", count)
+	}
 }
 
+// TestRepositoryUsageQueries pins the v0.22 delete-guard semantics: a
+// page/API/database is "in use" while it is inside a bound environment's
+// effective range (approved/active and not scope-excluded). An explicitly
+// excluded, proposed, disabled or foreign-environment resource is not part of
+// the version range, so the guard must not block its deletion.
 func TestRepositoryUsageQueries(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
 	repo := versionpg.New(pool, ids)
 	ctx := context.Background()
+
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, query, args...); err != nil {
+			t.Fatalf("seed %q: %v", query, err)
+		}
+	}
+	// The usage guards join the version binding to the resource catalog, so the
+	// fixture needs the owning SUT/environment and the surrounding resources.
+	exec(`INSERT INTO sut (id, name, intro, created_by) VALUES (1001, 'Orders', '', 42)`)
+	exec(`INSERT INTO sut_environment (id, sut_id, name, base_url)
+		VALUES (1101, 1001, 'prod', 'https://orders.example.test'),
+		       (1102, 1001, 'staging', 'https://staging.example.test')`)
+	exec(`INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template, status)
+		VALUES (1301, 1001, 1101, 'excluded', 'https://orders.example.test/excluded', '/excluded', 'approved'),
+		       (1302, 1001, 1101, 'in range', 'https://orders.example.test/in-range', '/in-range', 'approved'),
+		       (1304, 1001, 1101, 'proposed', 'https://orders.example.test/proposed', '/proposed', 'proposed'),
+		       (1305, 1001, 1102, 'staging', 'https://staging.example.test/page', '/staging-page', 'approved')`)
+	exec(`INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name, status)
+		VALUES (1401, 1001, 1101, 'GET', '/api/excluded', 'excluded', 'approved'),
+		       (1403, 1001, 1101, 'GET', '/api/in-range', 'in range', 'approved'),
+		       (1404, 1001, 1101, 'GET', '/api/proposed', 'proposed', 'proposed')`)
+	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, status)
+		VALUES (1501, 1001, 1101, 'excluded', 'postgres://excluded', 'reader', 'active'),
+		       (1503, 1001, 1101, 'in-range', 'postgres://in-range', 'reader', 'active'),
+		       (1504, 1001, 1101, 'disabled', 'postgres://disabled', 'reader', 'disabled')`)
+
+	// The SUT-level repository association backs RepositoryInUse for inherited
+	// repositories; version_repository_override covers appended ones.
+	exec(`INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled)
+		VALUES (7001, 1001, 1201, 'backend', true)`)
 
 	checks := []struct {
 		name  string
@@ -384,8 +517,8 @@ func TestRepositoryUsageQueries(t *testing.T) {
 	}
 
 	v := sampleVersion(ids, 1)
-	bindings := sampleBindings(ids, v.ID)
-	if err := repo.Create(ctx, v, bindings); err != nil {
+	binding := sampleBinding(ids, v.ID)
+	if err := repo.Create(ctx, v, []version.Binding{binding}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -397,19 +530,25 @@ func TestRepositoryUsageQueries(t *testing.T) {
 	}{
 		{"sut bound", repo.SUTInUse, 1001, true},
 		{"sut unbound", repo.SUTInUse, 1003, false},
-		{"environment bound", repo.EnvironmentInUse, 1102, true},
-		{"environment unbound", repo.EnvironmentInUse, 1103, false},
-		{"page in scope", repo.PageInUse, 1301, true},
-		{"second page in scope", repo.PageInUse, 1302, true},
-		{"page unbound", repo.PageInUse, 1304, false},
-		{"api in scope", repo.APIInUse, 1401, true},
-		{"api unbound", repo.APIInUse, 1402, false},
-		{"database bound", repo.DatabaseInUse, 1501, true},
-		{"database unbound", repo.DatabaseInUse, 1503, false},
-		{"account bound", repo.AccountInUse, 1602, true},
+		{"environment bound", repo.EnvironmentInUse, 1101, true},
+		{"environment unbound", repo.EnvironmentInUse, 1102, false},
+		// Excluded resources are outside the version range: the guard does not
+		// block deleting them.
+		{"page excluded", repo.PageInUse, 1301, false},
+		{"page in range", repo.PageInUse, 1302, true},
+		{"page proposed", repo.PageInUse, 1304, false},
+		{"page other environment", repo.PageInUse, 1305, false},
+		{"api excluded", repo.APIInUse, 1401, false},
+		{"api in range", repo.APIInUse, 1403, true},
+		{"api proposed", repo.APIInUse, 1404, false},
+		{"database excluded", repo.DatabaseInUse, 1501, false},
+		{"database in range", repo.DatabaseInUse, 1503, true},
+		{"database disabled", repo.DatabaseInUse, 1504, false},
+		{"account bound", repo.AccountInUse, 1601, true},
 		{"account unbound", repo.AccountInUse, 1604, false},
-		{"repository bound", repo.RepositoryInUse, 1201, true},
-		{"repository unbound", repo.RepositoryInUse, 1203, false},
+		{"repository inherited", repo.RepositoryInUse, 1201, true},
+		{"repository override", repo.RepositoryInUse, 1203, true},
+		{"repository unbound", repo.RepositoryInUse, 1204, false},
 	}
 	for _, tc := range cases {
 		used, err := tc.check(ctx, tc.id)

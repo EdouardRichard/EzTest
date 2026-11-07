@@ -72,6 +72,7 @@ import (
 	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
+	versionpostgres "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 	visualapp "github.com/EdouardRichard/EzTest/backend/internal/visual/application"
 	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
 )
@@ -421,6 +422,176 @@ func (a executionBatchStarterAdapter) StartBatch(ctx context.Context, versionID 
 	_, err := a.intents.EnsureInitialIntentsForCases(ctx, versionID, caseIDs)
 	return err
 }
+
+// deliveryRetestAdapter adapts the execution context's intent service,
+// deterministic scheduler and wave/case_run repositories to the delivery W2-5
+// RetestExecutor port. The composition root is the only place that knows both
+// bounded contexts.
+type deliveryRetestAdapter struct {
+	intents   *executionapp.IntentService
+	waves     executionapp.WaveRepository
+	caseRuns  executionapp.CaseRunRepository
+	scheduler *executionapp.Scheduler
+}
+
+func (a deliveryRetestAdapter) CreateRetestIntent(ctx context.Context, versionID, caseVersionID, actorID int64) (int64, error) {
+	if a.intents == nil {
+		return 0, errors.New("retest intent service is not configured")
+	}
+	intent, err := a.intents.CreateManual(ctx, versionID, caseVersionID, execution.PurposeRetest, actorID)
+	if err != nil {
+		return 0, err
+	}
+	return intent.ID, nil
+}
+
+func (a deliveryRetestAdapter) CancelRetestIntent(ctx context.Context, intentID int64) error {
+	if a.intents == nil {
+		return errors.New("retest intent service is not configured")
+	}
+	return a.intents.Cancel(ctx, intentID, 0)
+}
+
+func (a deliveryRetestAdapter) ActiveWave(ctx context.Context, versionID int64) (deliveryapp.RetestWave, bool, error) {
+	if a.waves == nil {
+		return deliveryapp.RetestWave{}, false, errors.New("retest wave repository is not configured")
+	}
+	wave, err := a.waves.GetActive(ctx, versionID)
+	if err != nil {
+		return deliveryapp.RetestWave{}, false, err
+	}
+	if wave == nil {
+		return deliveryapp.RetestWave{}, false, nil
+	}
+	projected, err := a.retestWave(ctx, *wave)
+	if err != nil {
+		return deliveryapp.RetestWave{}, false, err
+	}
+	return projected, true, nil
+}
+
+func (a deliveryRetestAdapter) StartRetestWave(ctx context.Context, versionID int64) (deliveryapp.RetestWave, error) {
+	if a.scheduler == nil {
+		return deliveryapp.RetestWave{}, errors.New("retest scheduler is not configured")
+	}
+	if err := a.scheduler.ReconcileVersion(ctx, versionID); err != nil {
+		return deliveryapp.RetestWave{}, err
+	}
+	wave, err := a.waves.GetActive(ctx, versionID)
+	if err != nil {
+		return deliveryapp.RetestWave{}, err
+	}
+	if wave == nil {
+		return deliveryapp.RetestWave{}, errors.New("no retest wave was planned")
+	}
+	return a.retestWave(ctx, *wave)
+}
+
+func (a deliveryRetestAdapter) retestWave(ctx context.Context, wave execution.RunWave) (deliveryapp.RetestWave, error) {
+	runs, err := a.caseRuns.ListAllByWave(ctx, wave.ID)
+	if err != nil {
+		return deliveryapp.RetestWave{}, err
+	}
+	projected := deliveryapp.RetestWave{
+		ID:     wave.ID,
+		Status: string(wave.Status),
+	}
+	projected.CaseRuns = make([]deliveryapp.RetestCaseRun, 0, len(runs))
+	for _, run := range runs {
+		projected.CaseRuns = append(projected.CaseRuns, deliveryapp.RetestCaseRun{
+			ID:            run.ID,
+			IntentID:      run.IntentID,
+			CaseVersionID: run.CaseVersionID,
+			Status:        string(run.Status),
+		})
+	}
+	return projected, nil
+}
+
+var _ deliveryapp.RetestExecutor = deliveryRetestAdapter{}
+
+// deliveryRetestNotifier adapts the delivery issue service to the execution
+// WaveTerminalRetestNotifier port.
+type deliveryRetestNotifier struct {
+	issues *deliveryapp.IssueService
+}
+
+func (n deliveryRetestNotifier) OnWaveTerminalRetest(ctx context.Context, waveID int64) error {
+	if n.issues == nil {
+		return nil
+	}
+	return n.issues.OnRetestWaveTerminal(ctx, waveID)
+}
+
+var _ executionapp.WaveTerminalRetestNotifier = deliveryRetestNotifier{}
+
+// deliveryReportArtifactStore adapts the storage ExportService to the delivery
+// context's ReportArtifactStore port (v0.22 W2-7). Report bytes live in the
+// shared content ledger; export_artifact records owner_kind='report'.
+type deliveryReportArtifactStore struct {
+	exports *storageapp.ExportService
+}
+
+func (a deliveryReportArtifactStore) CreateReportArtifact(ctx context.Context, in deliveryapp.ReportArtifactStoreInput) (deliveryapp.ReportArtifactRecord, error) {
+	if a.exports == nil {
+		return deliveryapp.ReportArtifactRecord{}, errors.New("storage export service is not configured")
+	}
+	artifact, err := a.exports.Create(ctx, storageapp.CreateExportInput{
+		ID:        in.ID,
+		VersionID: in.VersionID,
+		OwnerID:   in.OwnerID,
+		OwnerKind: "report",
+		Format:    in.Format,
+		MIME:      in.MIME,
+		Filename:  in.Filename,
+		Data:      in.Data,
+	}, in.ActorID)
+	if err != nil {
+		return deliveryapp.ReportArtifactRecord{}, err
+	}
+	return deliveryapp.ReportArtifactRecord{
+		ID:              artifact.ID,
+		Format:          artifact.Format,
+		ContentObjectID: artifact.ContentObjectID,
+		Size:            artifact.Size,
+		Status:          artifact.Status,
+	}, nil
+}
+
+var _ deliveryapp.ReportArtifactStore = deliveryReportArtifactStore{}
+
+// retestCallbackRelay lets the execution scheduler/pause services receive the
+// delivery retest writeback before the delivery issue service is constructed.
+type retestCallbackRelay struct {
+	mu       sync.RWMutex
+	notifier executionapp.WaveTerminalRetestNotifier
+}
+
+func newRetestCallbackRelay() *retestCallbackRelay { return &retestCallbackRelay{} }
+
+func (r *retestCallbackRelay) set(notifier executionapp.WaveTerminalRetestNotifier) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.notifier = notifier
+}
+
+func (r *retestCallbackRelay) OnWaveTerminalRetest(ctx context.Context, waveID int64) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	notifier := r.notifier
+	r.mu.RUnlock()
+	if notifier == nil {
+		return nil
+	}
+	return notifier.OnWaveTerminalRetest(ctx, waveID)
+}
+
+var _ executionapp.WaveTerminalRetestNotifier = (*retestCallbackRelay)(nil)
 
 // designMetricsAdapter maps designapp.CaseCounts to the version read model.
 type designMetricsAdapter struct {
@@ -919,6 +1090,64 @@ func runExecutorPoller(ctx context.Context, gate orchestrationapp.LeaderGate, re
 	}
 }
 
+// humanExpiryInterval is how often the leader sweeps overdue human requests.
+// It is much shorter than the 24h question timeout so an expiry is observable
+// well inside one timeout window.
+const humanExpiryInterval = time.Minute
+
+// runHumanQuestionExpiryWorker is the leader-gated timeout sweep of R-W2-1:
+// overdue structured questions expire through question.timeout_seconds and
+// overdue approval/blocked_recovery/conflict requests expire through the same
+// 24h setting. It only touches human_request rows and never stage/case_run/wave
+// state, so it cannot block the stage machine. A follower does nothing and
+// leadership is re-checked on every tick; a nil service is a no-op.
+func runHumanQuestionExpiryWorker(
+	ctx context.Context,
+	gate orchestrationapp.LeaderGate,
+	questions *executionapp.QuestionService,
+	humans *executionapp.HumanService,
+	interval time.Duration,
+) {
+	if questions == nil && humans == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = humanExpiryInterval
+	}
+	sweep := func() {
+		p7RunGated(gate, func() {
+			now := time.Now().UTC()
+			if questions != nil {
+				count, err := questions.ExpireQuestions(ctx, now)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: question expiry sweep: %v", err)
+				} else if count > 0 {
+					log.Printf("eztest: question expiry sweep: expired=%d", count)
+				}
+			}
+			if humans != nil {
+				count, err := humans.Expire(ctx, now)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: human request expiry sweep: %v", err)
+				} else if count > 0 {
+					log.Printf("eztest: human request expiry sweep: expired=%d", count)
+				}
+			}
+		})
+	}
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1026,6 +1255,24 @@ func main() {
 	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, p5Bindings)
 	p5Bindings.SetVersionService(versionSvc, versionRepo)
 	resourceSvc.SetUsageChecker(versionSvc)
+	// v0.22 W0: the plan/fact/handoff services back plan.update, task.complete,
+	// the design handoff artifact and the attachment image-caption facts
+	// (Task 9/11/19/27/36).
+	planSvc := versionapp.NewPlanService(versionpostgres.NewPlanRepository(pool), ids, eventSvc)
+	factSvc := versionapp.NewFactService(versionpostgres.NewFactRepository(pool, ids), ids, eventSvc,
+		versionapp.WithFactAudit(auditSvc))
+	handoffSvc := versionapp.NewHandoffService(
+		versionpostgres.NewHandoffStore(pool), versionpostgres.NewHandoffReader(pool), ids, eventSvc)
+	// v0.22 API-5/6/7 (Task 18/37 fix round 1): the extraction service backs the
+	// progress reads, the pause/resume/retry transitions and the production
+	// worker. The attachment-side source/processor are wired right after the
+	// attachment service is constructed (the extraction service is its own
+	// requirement sink); the plan/fact milestone stores are already wired for
+	// the terminal reconciliation.
+	extractionSvc := versionapp.NewExtractionService(
+		versionpostgres.NewExtractionRepository(pool, ids), nil, eventSvc, clk)
+	extractionSvc.SetMilestoneStores(planSvc, factSvc)
+	clarificationSearch := versionpostgres.NewClarificationSearchStore(pool)
 	designRepo := designpg.New(pool)
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
 
@@ -1045,8 +1292,34 @@ func main() {
 	attachmentSvc := versionapp.NewAttachmentService(
 		versionpg.NewAttachmentRepository(pool), contentstore.New(storageSvc), enqueuer,
 		attachments.NewParser(), attachments.NewImageProber(), eventSvc, ids, clk)
+	// v0.22 W1-2: the vision extraction limits are read from the settings center
+	// instead of hard-coded catalog defaults.
+	attachmentSvc.SetLimits(settingsSvc)
+	// v0.22 A-7 extraction runtime (Task 37 fix round 1): the attachment service
+	// is the production ExtractionIngestSource/ExtractionSegmentsSource (it
+	// re-parses the immutable original content by the run's input_sha256), and
+	// the deterministic W0 processor emits the declared FR ids through the
+	// extraction service sink. A real LLM extractor can replace the processor
+	// here without changing the worker/API contract.
+	extractionSvc.SetSource(attachmentSvc)
+	extractionSvc.SetProcessor(versionapp.NewDeterministicExtractionProcessor(attachmentSvc, extractionSvc))
+	// v0.22 R-E2/R-E3: image analysis is fail-closed until the vision captioner
+	// and the version-fact recorder are wired. The captioner resolves the
+	// default vision-capable model through the real LLM gateway; every caption
+	// is persisted as an attachment_image_caption fact and reaches the task
+	// pack through the same FactService.
+	attachmentSvc.SetVisionCaptioner(versionadapters.NewVisionCaptioner(llmSvc))
+	attachmentSvc.SetFactRecorder(factSvc)
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
+	// v0.22 R-A5-12: compaction summary revisions persist through the version
+	// conversation writer (monotonic covered_message_id + DB advisory lock).
+	compactionSummary := versionadapter.NewSummaryStore(conversationSvc)
+	// v0.22 R-A5-10: the compaction transaction manager (one live compaction per
+	// conversation, TTL/thrashing guard). The runner publishes the extended
+	// context.compacted payload after every successful transaction.
+	compactionManager := agentcontext.NewCompactionManager(
+		agentcontext.WithCompactionLogger(slog.Default()))
 	conversationSvc.SetModelCatalog(conversationModelCatalog{svc: llmSvc})
 	// Task 77: a design conversation cannot be created before at least one
 	// requirement is clarified; the gate is typed and checked before any round
@@ -1089,6 +1362,11 @@ func main() {
 		designStale,
 	)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, designTeamRoom)
+	// W2-11 (WP-6): the additive discovery case revision service reads the
+	// observation provenance chain through a design-side read projection; the
+	// resource-confirmed observer below turns an approved discovered page/API
+	// into one auto-confirmed (or low-confidence draft) case revision.
+	designGraph.SetDiscoveryRevisionStore(designpg.NewRevisionStore(pool))
 	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
 	designExports := designapp.NewExportService(
 		designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
@@ -1098,6 +1376,22 @@ func main() {
 
 	// P3 execution context: repositories, cross-context adapters and services.
 	executionRepo := executionpg.NewRepository(pool, ids)
+	// W1-12 (WP-3): the discovery delta evaluator lives in the version context
+	// and crosses into execution only through the narrow observation adapter
+	// (Agent.md §6.2). It classifies terminal observations, proposes genuinely
+	// new pages/APIs, records provenance facts and publishes one wave-level
+	// resource.delta. W1-14A triggers it once per terminal wave through the
+	// scheduler's narrow evaluator port (ErrDeltaBusy = skipped pass).
+	discoveryObservationAdapter := executionadapters.NewDiscoveryObservationAdapter(executionRepo.Observations)
+	discoveryDelta := versionapp.NewDiscoveryDelta(versionapp.DiscoveryDeltaDeps{
+		Observations: discoveryObservationAdapter,
+		Decisions:    discoveryObservationAdapter,
+		Resources:    resourceSvc,
+		Facts:        factSvc,
+		Events:       eventSvc,
+		Locker:       executionadapters.NewDiscoveryDeltaLocker(pool),
+	})
+	discoveryDeltaEvaluator := executionadapters.NewDiscoveryDeltaEvaluator(discoveryDelta, nil)
 	// P7 design graph result colouring (spec §9.3): each case card carries the
 	// latest case_run verdict of its current version.
 	designGraph.SetCaseRunStatusReader(designCaseRunStatuses{runs: executionRepo.CaseRuns})
@@ -1136,8 +1430,23 @@ func main() {
 
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
+	// v0.22 D8: the admin "check auth" action distinguishes a rejected token
+	// from an unreachable executor; the checker reads the token per request.
+	executorAuthChecker := executionadapters.NewExecutorAuthChecker(settingsSvc)
 	executorClient := executioninfra.NewClient(executorURL, executorToken, executioninfra.DefaultTimeout)
 	executorResolver := executioninfra.NewResolver(executorToken, executioninfra.DefaultTimeout)
+	// v0.22 Task 34/36: probe the executor authentication once at startup. The
+	// probe is log-only: a missing/offline executor keeps the API serving and
+	// the executor-online stage gate (registry heartbeat) stays the authority.
+	go func() {
+		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := executionadapters.NewExecutorSelfCheck(executorURL, executorToken).SelfCheck(checkCtx); err != nil {
+			log.Printf("eztest: executor self-check failed (executor-online gate stays closed until heartbeat): %v", err)
+			return
+		}
+		log.Printf("eztest: executor self-check ok endpoint=%s", executorURL)
+	}()
 	// P9 explore runtime: the real HTTP explore-action executor, the bounded
 	// version-scoped session cache and the version fact recorder are constructed
 	// once and shared by every exploration caller (Task 36/37). Reuse
@@ -1197,6 +1506,22 @@ func main() {
 		Audit:     auditSvc,
 		Timeout:   1800 * time.Second,
 	})
+	// v0.22 structured questions (R-B3-3): the Host question.ask tool and the
+	// questions API share one service; the message writer persists the question
+	// card/answer echo into the conversation thread.
+	executionQuestions := executionapp.NewQuestionService(executionapp.QuestionServiceDeps{
+		Humans:   executionRepo.Humans,
+		Messages: questionMessageWriterAdapter{conversations: conversationSvc},
+		Settings: settingsSvc,
+		IDs:      ids,
+		Clock:    clk,
+		Events:   eventSvc,
+		Audit:    auditSvc,
+		// Task 37 fix round 1: X-Agent-Run-Id is verified against the real
+		// active Host run and its version conversation; a forged/foreign id is
+		// a typed 403 instead of a trusted create/reopen.
+		HostRuns: questionHostRunValidator{pool: pool},
+	})
 	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
 		Intents:  executionRepo.Intents,
 		Cases:    executionCases,
@@ -1225,6 +1550,12 @@ func main() {
 		Events:       eventSvc,
 		Audit:        auditSvc,
 	})
+	// v0.22 stage callbacks: the scheduler/pause/report services are built
+	// before the stage service (which reads the report service), so they
+	// receive a relay that the composition root binds once the stage service
+	// exists (Task 25 fix round 1 / Task 36).
+	stageCallbacks := newStageCallbackRelay()
+	retestCallbacks := newRetestCallbackRelay()
 	executionPause := executionapp.NewPauseService(executionapp.PauseServiceDeps{
 		Intents:   executionRepo.Intents,
 		Waves:     executionRepo.Waves,
@@ -1236,6 +1567,15 @@ func main() {
 		Clock:     clk,
 		Events:    eventSvc,
 		Audit:     auditSvc,
+		// A cancelled wave is terminal; notify the stage machine so
+		// executing -> reporting is not stranded.
+		StageNotifier: stageCallbacks,
+		// W1-14A: a cancelled wave is terminal too, so it runs the same
+		// discovery-delta pass as the scheduler's done/failed paths.
+		Delta: discoveryDeltaEvaluator,
+		// W2-5: a cancelled retest wave writes the "other terminal status" back
+		// to the delivery issue.
+		RetestNotifier: retestCallbacks,
 	})
 	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
 		Intents:  executionRepo.Intents,
@@ -1262,6 +1602,15 @@ func main() {
 		// enforces this as a minimum): a queued work item can wait longer than
 		// 30s before a worker claims it.
 		LeaseTTL: executionapp.DefaultCaseLease,
+		// v0.22 wave-terminal callback and its retry sink (R-B4-3). Both point
+		// at the stage service once the composition root binds the relay.
+		StageNotifier:   stageCallbacks,
+		StageReconciler: stageCallbacks,
+		// W1-14A: classify the wave's execution-time observations once terminal.
+		Delta: discoveryDeltaEvaluator,
+		// W2-5: a terminal retest wave writes passed/failed/other back to the
+		// delivery issue after the wave row is terminal.
+		RetestNotifier: retestCallbacks,
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Intents:     executionRepo.Intents,
@@ -1293,10 +1642,15 @@ func main() {
 		Versions:      executionVersionAdapter,
 		Content:       executionContent,
 		Settings:      settingsSvc,
-		IntentService: executionIntents,
-		PauseService:  executionPause,
-		HumanService:  executionHumans,
-		Registry:      executorRegistry,
+		// W1-14A: read-only DB-29 query surface of the discovery APIs.
+		Discovery:     executionRepo.Observations,
+		AuthChecker:   executorAuthChecker,
+		IntentService:   executionIntents,
+		Planner:         executionScheduler,
+		PauseService:    executionPause,
+		HumanService:    executionHumans,
+		QuestionService: executionQuestions,
+		Registry:        executorRegistry,
 	})
 
 	// P4 delivery/chain/steward composition. The composition root is the only
@@ -1336,6 +1690,15 @@ func main() {
 	issueSvc := deliveryapp.NewIssueService(
 		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
 	issueSvc.WithTriageReader(analysisRepo)
+	issueSvc.WithRetestExecutor(deliveryRetestAdapter{
+		intents:   executionIntents,
+		waves:     executionRepo.Waves,
+		caseRuns:  executionRepo.CaseRuns,
+		scheduler: executionScheduler,
+	})
+	// The wave-terminal callback is owned by the delivery issue service; the
+	// relay was already passed to the scheduler/pause services above.
+	retestCallbacks.set(deliveryRetestNotifier{issues: issueSvc})
 	analysisSvc := deliveryapp.NewAnalysisService(analysisRepo, issueSvc, clk)
 	analysisSvc.WithTriagePoster(deliveryTriagePoster{room: teamRoom})
 	pdfEnabled, pdfAttempts := p7RenderSettings(ctx, settingsSvc)
@@ -1343,6 +1706,12 @@ func main() {
 		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
 		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc),
 	).WithRenderJobs(reportRepo, pdfEnabled, pdfAttempts)
+	// v0.22 report.published callback: only the version report completion read
+	// by the stage gate can advance reporting -> completed.
+	reportSvc.WithReportPublishedNotifier(stageCallbacks)
+	// v0.22 W2-7 report artifact export: reuse the storage content ledger via
+	// the narrow delivery port; the preallocated artifact ID names export.started.
+	reportSvc.WithArtifactStore(deliveryReportArtifactStore{exports: storageExportSvc}, ids)
 
 	// Four-way work-item dispatcher (0.2.1 D21): the only writer of 0.2.1
 	// work_item rows. It enforces the creator-kind matrix, the version-stage
@@ -1369,10 +1738,9 @@ func main() {
 		versionapp.WithCaseGateConfirmer(designCaseGateConfirmer{svc: designGraph}),
 	)
 	// Task 69: the design reconciler is the production caller of the
-	// designing→case_review edge. It checks the design coverage on every event
-	// pass; the stage machine only transitions a version that is still designing,
-	// so the call is idempotent and case_review has no stage-entry job.
-	designPlanner.SetDesignConverger(stageMachine)
+	// designing→case_review edge. The v0.22 StageService is bound as the
+	// converger below, once the stage service exists, so the reconciler never
+	// writes the legacy stage path (R-B4-1).
 	// Task 78: the execution intent gate reads the deterministic stage through
 	// the same adapter, so a case confirmed at the case gate cannot auto-create
 	// an intent/wave. Wired here because the stage machine is assembled after
@@ -1402,6 +1770,45 @@ func main() {
 		Events:        eventSvc,
 		Clock:         clk,
 	})
+	// v0.22 W0 stage service (Task 36): the single orchestrated stage writer for
+	// the production callers. Every gate is adapted from an existing use case;
+	// a missing port fails the edge closed with a typed gate_not_configured.
+	stageService := versionapp.NewStageService(versionapp.StageServiceDeps{
+		Repo:   versionRepo,
+		Jobs:   dispatcher,
+		Audit:  auditSvc,
+		Events: eventSvc,
+		Clock:  clk,
+		Gates: newV022StageGates(v022StageGateDeps{
+			Versions:     versionSvc,
+			Requirements: requirementSvc,
+			Design:       designGraph,
+			Planner:      designPlanner,
+			Executors:    executorRegistry,
+			Waves:        executionRepo.Waves,
+			Reports:      reportSvc,
+			Issues:       issueSvc,
+			Questions:    executionQuestions,
+			Handoff:      handoffSvc,
+			Closer:       versionCloseSvc,
+		}),
+		Waves:       stageWaveReader{waves: executionRepo.Waves},
+		WaveControl: stageWaveControl{waves: executionRepo.Waves, pause: executionPause},
+		Reports:     stageReports{reports: reportSvc},
+		Closer:      stageVersionCloser{closer: versionCloseSvc, versions: versionSvc},
+		Handoff:     handoffSvc,
+	})
+	stageCallbacks.set(stageService)
+	// W2-2 R-W2-1: approving a blocked_recovery human request asks the version
+	// stage to leave the blocked stage. The port is wired here because the stage
+	// service is constructed after the human service. The wrapper treats an
+	// already-unblocked version as success so a blocker cleared through the
+	// version panel first cannot self-lock the pending decision.
+	executionHumans.SetStageUnblocker(decisionStageUnblocker{stages: stageService})
+	// R-B4-1: the automatic forward edges now go through the stage service.
+	designPlanner.SetDesignConverger(stageAdvancer{service: stageService})
+	stageStarter := stageAdvancer{service: stageService}
+
 	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
 		Closures:     closureRepo,
 		Requirements: requirementRepo,
@@ -1446,8 +1853,10 @@ func main() {
 		Clock:    clk,
 		Settings: settingsSvc,
 		Audit:    auditSvc,
-		Issues:   issueSvc,
-		Reports:  reportSvc,
+		// W2-14: eval.* lifecycle events go through the shared eventing service.
+		Events:  eventSvc,
+		Issues:  issueSvc,
+		Reports: reportSvc,
 	})
 	if err != nil {
 		log.Fatalf("eztest: wire P6 read models: %v", err)
@@ -1510,25 +1919,33 @@ func main() {
 	// success hook is non-nil (the hook is best effort at the Finish boundary:
 	// a failure is logged and never blocks or changes the case_run verdict).
 	executionRunner := executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
-		Intents:       executionRepo.Intents,
-		CaseRuns:      executionRepo.CaseRuns,
-		SUTContexts:   executionSUTContextRepo,
-		Results:       executionRepo.Results,
-		Evidence:      executionRepo.Evidence,
-		Humans:        executionRepo.Humans,
-		Cases:         executionCases,
-		Bindings:      executionVersionAdapter,
-		APIs:          executionVersionAdapter,
-		Browser:       executionadapters.NewBrowserAdapterWithRouter(executorRouter),
-		Credentials:   executionCredentials,
-		Content:       executionContent,
-		HTTPClient:    executionHTTPClient,
-		Database:      executionDatabase,
-		Coverage:      executionCoverage,
-		Gaps:          executionGaps,
-		TeamRoom:      executionTeamRoom,
-		Human:         executionHumans,
-		Visual:        p5.VisualPort,
+		Intents:     executionRepo.Intents,
+		CaseRuns:    executionRepo.CaseRuns,
+		SUTContexts: executionSUTContextRepo,
+		Results:     executionRepo.Results,
+		Evidence:    executionRepo.Evidence,
+		Humans:      executionRepo.Humans,
+		Cases:       executionCases,
+		Bindings:    executionVersionAdapter,
+		APIs:        executionVersionAdapter,
+		Browser:     executionadapters.NewBrowserAdapterWithRouter(executorRouter),
+		Credentials: executionCredentials,
+		Content:     executionContent,
+		HTTPClient:  executionHTTPClient,
+		Database:    executionDatabase,
+		Coverage:    executionCoverage,
+		Gaps:        executionGaps,
+		TeamRoom:    executionTeamRoom,
+		Human:       executionHumans,
+		Visual:      p5.VisualPort,
+		// WP-2: terminal discovery observations flow through the ingest service
+		// (normalize/filter/dedupe) into the DB-29 repository. The SUT host
+		// resolver filters third-party CDN/analytics traffic; a nil writer would
+		// skip observations without touching the verdict.
+		Discovery: executionapp.NewDiscoveryIngest(executionapp.DiscoveryIngestDeps{
+			Store: executionRepo.Observations,
+			Hosts: executionpg.NewDiscoverySUTHostResolver(pool),
+		}),
 		Settings:      settingsSvc,
 		Clock:         clk,
 		IDs:           ids,
@@ -1553,10 +1970,14 @@ func main() {
 	// execution.visual_assert group resolves its port from the case runner.
 	p5Tools := p5.Tools
 	p5Tools.VisualAssert = executionRunner
+	// v0.22 W0 completion and settlement share one target resolver: the
+	// success-only task.complete write and the A-14 turn/time settlement
+	// writeback must agree on this version/run's one plan item.
+	completion := completionBuilder{plans: planSvc, graph: designGraph, questions: executionQuestions, store: pgCompletionStore{pool: pool, ids: ids}}
 	runner := agentapp.NewRunner(agentapp.RunnerDeps{
 		Runtime:      runtimeRepo,
 		Chat:         llmSvc,
-		Settings:     settingsSvc,
+		Settings:     windowTokensSettings{reader: settingsSvc},
 		Clock:        clk,
 		IDs:          ids,
 		Events:       eventSvc,
@@ -1569,15 +1990,31 @@ func main() {
 		Content:      ports,
 		Briefing:     briefingBuilder,
 		// A clarification host turn that explicitly requests requirement
-		// confirmation converges the version to requirement_review (S2). The
-		// adapter refuses an empty draft list, so the gate is never opened empty.
-		Clarification: stageClarificationConverger{machine: stageMachine, requirements: requirementSvc},
+		// confirmation converges the version to requirement_review (S2) through
+		// the v0.22 StageService (R-B4-1). The adapter refuses an empty draft
+		// list, so the gate is never opened empty.
+		Clarification: stageClarificationConverger{service: stageService, requirements: requirementSvc},
 		// Task 65: the deterministic consumers of the 0.2.1 stage-entry jobs.
 		// design.cases opens the design round for the hard-gate-confirmed
 		// requirements; execute.batch refreshes the confirmed batch's execution
 		// intents for the deterministic scheduler.
 		DesignRounds: designRoundStarterAdapter{planner: designPlanner},
 		Batches:      executionBatchStarterAdapter{intents: executionIntents},
+		// v0.22 W0 Host tools: plan.update, question.ask, clarification.search
+		// and task.complete (Task 9/11/14/23/27/36).
+		PlanWriter:          planWriterAdapter{plans: planSvc},
+		QuestionAsker:       questionAskerAdapter{questions: executionQuestions},
+		ClarificationSearch: clarificationSearch,
+		Completion:          completion.Build,
+		// A-14: a run that ends on the turn/time settlement turn without a
+		// verified completion writes the plan item status/decision and a
+		// progress fact back through the same atomic CompletionStore.
+		Settlement: completion.BuildSettlement,
+		// v0.22 A-5 compaction: the policy is resolved per run from the model
+		// window/max_output and compaction.* settings; summaries persist through
+		// the version conversation writer and transactions through the manager.
+		CompactionSummary: compactionSummary,
+		CompactionManager: compactionManager,
 		// P7 knowledge injection + usage accounting (S6 report §5).
 		Knowledge:      p7rt.KnowledgeAdapter,
 		KnowledgeUsage: p7rt.KnowledgeAdapter,
@@ -1592,6 +2029,11 @@ func main() {
 				Knowledge: p7rt.KnowledgeAdapter,
 				Retrieval: p7rt.KnowledgeAdapter,
 			},
+			// v0.22 A-6: spill/read/prune through the content ledger.
+			ToolResult: tools.ToolResultDeps{
+				Content:  toolContentStore{adapter: ports, storage: storageSvc},
+				Settings: settingsSvc,
+			},
 		},
 		TaskProvider:         executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
 		RunCanceller:         executionRunner,
@@ -1600,11 +2042,43 @@ func main() {
 		InstanceID:           instanceID,
 		Load:                 workLoad,
 	})
-	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
+	workerOptions := []agentapp.WorkerOption{
 		agentapp.WithWorkerEvents(eventSvc),
 		agentapp.WithWorkerDrainGate(p7OrchestrationRuntime.Service.IsDraining),
-		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)))
+		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)),
+	}
+	// EZTEST_AGENT_CONCURRENCY lets a deployment bound how many agent runs
+	// share the LLM/executor at once (the acceptance stack uses 1 to avoid
+	// provider rate limits and executor contention).
+	if raw := strings.TrimSpace(os.Getenv("EZTEST_AGENT_CONCURRENCY")); raw != "" {
+		if limit, err := strconv.Atoi(raw); err == nil && limit > 0 {
+			workerOptions = append(workerOptions, agentapp.WithWorkerConcurrency(limit))
+		}
+	}
+	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID, workerOptions...)
 	var background sync.WaitGroup
+	// v0.22 stage reconciler: retry a lost executing->reporting or
+	// reporting->completed callback. The scheduler's in-memory pending set is
+	// lost on restart and report-published failures have no other retry.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runStageReconciler(ctx, p7OrchestrationRuntime.Leader, versionSvc, versionRepo, stageService, 30*time.Second)
+	}()
+	// v0.22 deterministic attachment pipeline (Task 19/20) plus the requirement
+	// extraction worker (Task 37 fix round 1): pending attachments are parsed by
+	// the server, then handed to the extraction run via EnqueueAfterIngest; the
+	// extraction worker processes the claimed segments to done.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runAttachmentExtractionWorker(ctx, p7OrchestrationRuntime.Leader, attachmentSvc, extractionSvc, 5*time.Second)
+	}()
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runExtractionWorker(ctx, p7OrchestrationRuntime.Leader, extractionSvc, 2*time.Second)
+	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
@@ -1663,8 +2137,9 @@ func main() {
 		reconciler.Notify(event.Type, versionID)
 		// created→clarifying is automatic when a version exists (spec §5.3):
 		// the discovery sub-loop starts and the version leaves the created
-		// stage before the create response is returned.
-		advanceCreatedVersionToClarifying(ctx, stageMachine, event)
+		// stage before the create response is returned. Routed through the
+		// v0.22 StageService (R-B4-1).
+		advanceCreatedVersionToClarifying(ctx, stageStarter, event)
 		// P9 explore analysis (Task 37): every version-scoped event schedules a
 		// coalesced, leader-gated gap/coverage refresh. The analysis performs
 		// its page probes through the shared explore runtime (Login first,
@@ -1681,8 +2156,24 @@ func main() {
 		return nil
 	}
 	eventSvc.Observe(wake)
+	eventSvc.Observe(eventingapp.NewSystemEventConsumer(slog.Default()))
+	// W1-14B: settle proposed discovery observations when an admin confirms or
+	// rejects a discovered page/API (system-channel resource events). Like the
+	// wake above, both delivery paths are wired: local publishes (this replica)
+	// and cross-instance events loaded by the P7 listener, so a decision made
+	// against another API replica still settles this replica's observations.
+	decisionObserver := executionapp.NewResourceDecisionObserver(executionRepo.Observations, slog.Default())
+	eventSvc.Observe(decisionObserver)
+	// W2-11 (WP-6): an approved discovered page/API also drives the additive
+	// discovery case revision (Critic + auto-confirm, or a low-confidence
+	// draft). The observer is nil-safe and best effort, exactly like the
+	// W1-14B decision observer: it never blocks or fails the resource publish.
+	revisionObserver := designGraph.ResourceConfirmedObserver(slog.Default())
+	eventSvc.Observe(revisionObserver)
 	if p7rt.Listener != nil {
 		p7rt.Listener.Observe(wake)
+		p7rt.Listener.Observe(decisionObserver)
+		p7rt.Listener.Observe(revisionObserver)
 	}
 	background.Add(1)
 	go func() {
@@ -1699,6 +2190,13 @@ func main() {
 	go func() {
 		defer background.Done()
 		runExecutorPoller(ctx, p7OrchestrationRuntime.Leader, executorRegistry, settingsSvc)
+	}()
+	// W2-2 R-W2-1: one leader-gated sweep expires overdue question/decision
+	// human requests (question.timeout_seconds). It never blocks the stage.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runHumanQuestionExpiryWorker(ctx, p7OrchestrationRuntime.Leader, executionQuestions, executionHumans, humanExpiryInterval)
 	}()
 	// P9 explore analysis consumer (Task 37, R93): the leader-gated refresh loop
 	// that drives GapAnalysis/Coverage/CaseAugment over the shared explore
@@ -1752,7 +2250,12 @@ func main() {
 		Versions:       versionSvc,
 		Requirements:   requirementSvc,
 		Conversations:  conversationSvc,
-		Stage:          stageMachine,
+		Stage:          stageService,
+		Plans:          planSvc,
+		Facts:          factSvc,
+		Handoffs:       handoffSvc,
+		Attachments:    attachmentSvc,
+		Extraction:     extractionSvc,
 		TeamRoom:       teamRoom,
 		DesignGraph:    designGraph,
 		DesignExports:  designExports,

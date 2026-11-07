@@ -103,8 +103,8 @@ func TestSearchHandlerMapsFiveGroupsToTheContractShape(t *testing.T) {
 	if cacheControl := recorder.Header().Get("Cache-Control"); cacheControl != "no-store" {
 		t.Fatalf("cache-control = %q, want no-store", cacheControl)
 	}
-	if svc.calls != 1 || svc.q != "login" || svc.types != nil || svc.limit != searchapp.DefaultLimit {
-		t.Fatalf("forwarded query = q:%q types:%v limit:%d calls:%d",
+	if svc.calls != 1 || svc.q != "login" || svc.types != nil || svc.limit != 0 {
+		t.Fatalf("forwarded query = q:%q types:%v limit:%d calls:%d (absent limit must forward 0 so the service resolves the setting)",
 			svc.q, svc.types, svc.limit, svc.calls)
 	}
 

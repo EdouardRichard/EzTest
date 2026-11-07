@@ -82,11 +82,30 @@ var kindOrder = map[string]int{
 type Service struct {
 	providers []Provider
 	titles    VersionTitleReader
+	limits    LimitReader
+}
+
+// SettingMaxItems is the catalog key that supplies the default todo limit when
+// the request omits one.
+const SettingMaxItems = "todos.max_items"
+
+// LimitReader is the narrow settings-center port the workspace service needs. It
+// is satisfied by settingsapp.Service; a nil reader keeps the frozen default.
+type LimitReader interface {
+	Int(ctx context.Context, key string) (int64, error)
 }
 
 // NewService wires the todo providers in any order.
 func NewService(providers ...Provider) *Service {
 	return &Service{providers: providers}
+}
+
+// SetLimits wires the settings-center reader for the default todo limit.
+func (s *Service) SetLimits(limits LimitReader) *Service {
+	if s != nil {
+		s.limits = limits
+	}
+	return s
 }
 
 // WithVersionTitles attaches the version title resolver used to fill the items
@@ -111,7 +130,7 @@ func (s *Service) Snapshot(ctx context.Context, viewer platform.Actor, limit int
 	if s == nil {
 		return Snapshot{}, platform.Unavailable("workspace service is not configured")
 	}
-	limit = normalizeLimit(limit)
+	limit = s.normalizeLimit(ctx, limit)
 
 	items := make([]TodoItem, 0)
 	for _, provider := range s.providers {
@@ -216,7 +235,15 @@ func missingVersionTitleIDs(items []TodoItem) []int64 {
 	return ids
 }
 
-func normalizeLimit(limit int) int {
+// normalizeLimit resolves a zero limit through todos.max_items, then clamps the
+// result to the frozen workspace bounds. A nil/unreadable reader and a
+// non-positive configured value fall back to DefaultLimit.
+func (s *Service) normalizeLimit(ctx context.Context, limit int) int {
+	if limit == 0 && s != nil && s.limits != nil {
+		if value, err := s.limits.Int(ctx, SettingMaxItems); err == nil && value > 0 {
+			limit = int(value)
+		}
+	}
 	if limit <= 0 {
 		return DefaultLimit
 	}

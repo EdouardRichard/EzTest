@@ -33,12 +33,13 @@ type contextPacketMeta struct {
 type contextPacketSegmentMeta struct {
 	Role       string `json:"role"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	MessageID  int64  `json:"message_id,omitempty"`
 	Prefix     bool   `json:"prefix,omitempty"`
 	Tokens     int    `json:"tokens"`
 }
 
 // EncodeContextPacket projects the cache-first packet produced by the assembler
-// onto the frozen context_packet row (db-schema §18.2 #9): the ordered prefix
+// onto the frozen context_packet row (db-schema 搂18.2 #9): the ordered prefix
 // and suffix segments are written to sections in packet order, token_counts
 // keeps the per-segment/total estimates plus the cache bookkeeping, and hash is
 // the stable prefix digest. One reserved metadata section carries the fields the
@@ -64,6 +65,7 @@ func EncodeContextPacket(runID, versionID int64, packet agentcontext.ContextPack
 		meta.Segments = append(meta.Segments, contextPacketSegmentMeta{
 			Role:       segment.Role,
 			ToolCallID: segment.ToolCallID,
+			MessageID:  segment.MessageID,
 			Prefix:     segment.Prefix,
 			Tokens:     segment.Tokens,
 		})
@@ -144,6 +146,7 @@ func DecodeContextPacket(stored agent.ContextPacket) (agentcontext.ContextPacket
 			Role:       segment.Role,
 			Content:    section.Content,
 			ToolCallID: segment.ToolCallID,
+			MessageID:  segment.MessageID,
 			Prefix:     segment.Prefix,
 			Tokens:     segment.Tokens,
 		})
@@ -181,3 +184,4 @@ func boolInt(value bool) int {
 	}
 	return 0
 }
+

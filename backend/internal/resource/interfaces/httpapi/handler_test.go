@@ -37,33 +37,37 @@ type fakeService struct {
 	databases    []resourceapp.DatabaseView
 	accounts     []resourceapp.AccountView
 	repositories []resourceapp.CodeRepositoryView
+	sutRepos     []resourceapp.SUTRepositoryView
 	catalog      []resourceapp.SUTView
 	hasMore      bool
+
+	sutRepository resourceapp.SUTRepositoryView
 
 	importPagesResult resourceapp.ImportPagesResult
 	importAPIsResult  resourceapp.ImportAPIsResult
 
-	lastActor     int64
-	lastID        int64
-	lastParentID  int64
-	lastLimit     int
-	lastBefore    *int64
-	lastSUTInput  resourceapp.SUTInput
-	lastSUTPatch  resourceapp.SUTPatch
-	lastEnvInput  resourceapp.EnvironmentInput
-	lastEnvPatch  resourceapp.EnvironmentPatch
-	lastPageInput resourceapp.PageInput
-	lastPagePatch resourceapp.PagePatch
-	lastAPIInput  resourceapp.APIInput
-	lastAPIPatch  resourceapp.APIPatch
-	lastDBInput   resourceapp.DatabaseInput
-	lastDBPatch   resourceapp.DatabasePatch
-	lastAcctInput resourceapp.AccountInput
-	lastAcctPatch resourceapp.AccountPatch
-	lastRepoInput resourceapp.RepositoryInput
-	lastRepoPatch resourceapp.RepositoryPatch
-	lastPageItems []resourceapp.PageInput
-	lastAPIItems  []resourceapp.APIInput
+	lastActor        int64
+	lastID           int64
+	lastParentID     int64
+	lastLimit        int
+	lastBefore       *int64
+	lastSUTInput     resourceapp.SUTInput
+	lastSUTPatch     resourceapp.SUTPatch
+	lastEnvInput     resourceapp.EnvironmentInput
+	lastEnvPatch     resourceapp.EnvironmentPatch
+	lastPageInput    resourceapp.PageInput
+	lastPagePatch    resourceapp.PagePatch
+	lastAPIInput     resourceapp.APIInput
+	lastAPIPatch     resourceapp.APIPatch
+	lastDBInput      resourceapp.DatabaseInput
+	lastDBPatch      resourceapp.DatabasePatch
+	lastAcctInput    resourceapp.AccountInput
+	lastAcctPatch    resourceapp.AccountPatch
+	lastRepoInput    resourceapp.RepositoryInput
+	lastRepoPatch    resourceapp.RepositoryPatch
+	lastSUTRepoInput resourceapp.SUTRepositoryInput
+	lastPageItems    []resourceapp.PageInput
+	lastAPIItems     []resourceapp.APIInput
 }
 
 func (f *fakeService) Catalog(context.Context) ([]resourceapp.SUTView, error) {
@@ -231,6 +235,19 @@ func (f *fakeService) ListRepositories(_ context.Context, limit int, beforeID *i
 func (f *fakeService) GetRepository(_ context.Context, id int64) (resourceapp.CodeRepositoryView, error) {
 	f.lastID = id
 	return f.repository, f.err
+}
+
+func (f *fakeService) ListSUTRepositories(_ context.Context, sutID int64) ([]resourceapp.SUTRepositoryView, error) {
+	f.lastParentID = sutID
+	return f.sutRepos, f.err
+}
+
+func (f *fakeService) AddSUTRepository(_ context.Context, sutID int64, input resourceapp.SUTRepositoryInput, actorID int64) (resourceapp.SUTRepositoryView, error) {
+	f.lastParentID, f.lastSUTRepoInput, f.lastActor = sutID, input, actorID
+	if f.err != nil {
+		return resourceapp.SUTRepositoryView{}, f.err
+	}
+	return f.sutRepository, nil
 }
 
 func (f *fakeService) ConfirmPage(_ context.Context, pageID, actorID int64) (resourceapp.PageView, error) {

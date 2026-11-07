@@ -23,6 +23,17 @@ export const CASE_RUN_TERMINAL_STATUSES: CaseRunStatus[] = [
   "inconclusive",
 ]
 
+/**
+ * Statuses that have settled and own a persisted telemetry record: the four
+ * verdicts plus `skipped`/`superseded`, which end without running the case and
+ * can therefore carry `usage: null` (v0.22 audit §2.5-2).
+ */
+export const CASE_RUN_TELEMETRY_TERMINAL_STATUSES: CaseRunStatus[] = [
+  ...CASE_RUN_TERMINAL_STATUSES,
+  "skipped",
+  "superseded",
+]
+
 export const CASE_RUN_STATUS_LABEL: Record<CaseRunStatus, string> = {
   pending: "待执行",
   running: "执行中",
@@ -101,22 +112,26 @@ export const PAUSE_MODE_LABEL: Record<PauseMode, string> = {
   immediate: "立即暂停",
 }
 
+/** All six v0.22 human_request kinds (spec R-W2-1 / DB-16). */
 export const HUMAN_REQUEST_KIND_LABEL: Record<HumanRequestKind, string> = {
+  clarification_question: "澄清提问",
+  approval: "审批",
+  blocked_recovery: "阻塞恢复",
   login_takeover: "登录接管",
   conflict: "冲突处理",
   other: "其他",
 }
 
 export const HUMAN_REQUEST_STATUS_LABEL: Record<HumanRequestStatus, string> = {
-  open: "待处理",
-  resolved: "已处理",
+  pending: "待处理",
+  answered: "已处理",
   cancelled: "已取消",
   expired: "已过期",
 }
 
 export const HUMAN_REQUEST_STATUS_TONE: Record<HumanRequestStatus, BadgeTone> = {
-  open: "warning",
-  resolved: "success",
+  pending: "warning",
+  answered: "success",
   cancelled: "neutral",
   expired: "neutral",
 }

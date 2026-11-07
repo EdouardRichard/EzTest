@@ -2,13 +2,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
-const nav = vi.hoisted(() => ({ replace: vi.fn(), pathname: "/issues" }))
+const nav = vi.hoisted(() => ({ replace: vi.fn(), refresh: vi.fn(), pathname: "/issues" }))
 vi.mock("next/navigation", () => ({
   usePathname: () => nav.pathname,
   useRouter: () => ({
     push: vi.fn(),
     replace: nav.replace,
-    refresh: vi.fn(),
+    refresh: nav.refresh,
     back: vi.fn(),
     forward: vi.fn(),
     prefetch: vi.fn(),
@@ -87,6 +87,7 @@ describe("Topbar", () => {
     auth.logout.mockResolvedValue(undefined)
     auth.changePassword.mockReset()
     nav.replace.mockReset()
+    nav.refresh.mockReset()
     nav.pathname = "/issues"
     api.apiGet.mockReset()
     api.apiGet.mockResolvedValue({ items: [], counts: emptyTodoCounts })
@@ -117,6 +118,26 @@ describe("Topbar", () => {
     expect(screen.getByText("实时")).toBeInTheDocument()
     act(() => sse.calls[0].onStatus("reconnecting"))
     expect(screen.getByText("重连中")).toBeInTheDocument()
+  })
+
+  it("logs system events and refreshes the current route", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {})
+    try {
+      render(<Topbar />)
+
+      expect(sse.calls).toHaveLength(1)
+      act(() => {
+        sse.calls[0].onEvent({
+          event: "message",
+          data: JSON.stringify({ type: "settings.updated", channel: "system", seq: 3 }),
+        })
+      })
+
+      expect(debug).toHaveBeenCalled()
+      expect(nav.refresh).toHaveBeenCalledTimes(1)
+    } finally {
+      debug.mockRestore()
+    }
   })
 
   it("opens the user menu with change-password and logout", async () => {

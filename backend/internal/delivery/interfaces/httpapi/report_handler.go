@@ -30,6 +30,7 @@ type ReportService interface {
 	OpenHTML(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error)
 	OpenPDF(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error)
 	Regenerate(ctx context.Context, versionID, reportID int64) (int32, error)
+	CreateArtifact(ctx context.Context, versionID, reportID int64, format string, actorID int64) (deliveryapp.ReportArtifact, error)
 }
 
 var _ ReportService = (*deliveryapp.ReportService)(nil)
@@ -357,6 +358,56 @@ func (h *Handler) RegenerateReport(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusAccepted, RegenerateReportResult{
 		ReportID: platformid.Format(reportID),
 		Revision: revision,
+	})
+}
+
+/* -------------------------------- artifacts ------------------------------- */
+
+// CreateReportArtifact POST /api/versions/{versionId}/reports/{reportId}/artifacts.
+// It creates one html/pdf/markdown artifact through the storage export service
+// (owner_kind=report, content ledger backed) and answers with the artifact
+// identity. There is deliberately no DELETE endpoint: GC owns artifact removal.
+func (h *Handler) CreateReportArtifact(w http.ResponseWriter, r *http.Request) {
+	if h.reports == nil {
+		writeNotConfigured(w, r, "report service")
+		return
+	}
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := pathID(r, "versionId", "versionId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	reportID, err := pathID(r, "reportId", "reportId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request reportArtifactRequest
+	if err := decodeBody(w, r, &request, true); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	format, err := request.parse()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	artifact, err := h.reports.CreateArtifact(r.Context(), versionID, reportID, format, actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, ReportArtifactView{
+		ID:     platformid.Format(artifact.ID),
+		Format: artifact.Format,
+		SHA256: artifact.ContentObjectID,
+		Size:   artifact.Size,
+		Status: artifact.Status,
 	})
 }
 

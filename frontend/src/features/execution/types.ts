@@ -57,9 +57,21 @@ export type IntentStatus =
   | "cancelled"
   | "superseded"
 
-export type HumanRequestKind = "login_takeover" | "conflict" | "other"
+/**
+ * v0.22 human_request kinds (DB-16 / spec R-W2-1). Structured question kinds
+ * (`clarification_question`/`approval`/`blocked_recovery`) share the table with
+ * the P3 login takeover and are version todos, not execution blockers.
+ */
+export type HumanRequestKind =
+  | "clarification_question"
+  | "approval"
+  | "blocked_recovery"
+  | "login_takeover"
+  | "conflict"
+  | "other"
 
-export type HumanRequestStatus = "open" | "resolved" | "cancelled" | "expired"
+/** v0.22 H1 human_request state machine (spec R-W2-1, DB-16). */
+export type HumanRequestStatus = "pending" | "answered" | "cancelled" | "expired"
 
 export type EvidenceKind =
   | "screenshot"
@@ -152,8 +164,13 @@ export type ExecutionOverview = {
   case_run_counts: CaseRunCounts
   open_human_requests: number
   executor: ExecutorStatusView | null
-  quotas: ExecutionQuotas
-  human_request_timeout_seconds: number
+  /**
+   * The overview always carries the effective settings, but older/fake
+   * projections may omit them; the UI treats a missing block as unavailable
+   * rather than crashing (v0.22 audit §2.5-5, Task 37 wiring).
+   */
+  quotas?: ExecutionQuotas
+  human_request_timeout_seconds?: number
 }
 
 /* ----------------------------------- wave ---------------------------------- */
@@ -207,7 +224,7 @@ export type CaseRunSummary = {
   last_error?: string
   next_action?: string
   /** Observed agent-run usage; absent on rows settled before usage persisted. */
-  usage?: CaseRunUsage
+  usage?: CaseRunUsage | null
 }
 
 /** `CaseRunView` (spec §9.3). */
@@ -282,24 +299,40 @@ export type CaseRunDetail = {
 /* ------------------------------- human request ----------------------------- */
 
 export type HumanRequestPayload = {
+  /**
+   * The user-facing title/reason. Login takeovers carry the challenge reason;
+   * v0.22 decision requests carry the reason supplied by the producer.
+   */
   reason: string
   /** Nullable in the contract when the request is not tied to one SUT. */
   version_sut_id?: string | null
-  account_role: string
-  page_url: string
-  challenge_kind: string
+  /** Login-takeover only fields (absent on v0.22 decision requests). */
+  account_role?: string
+  page_url?: string
+  challenge_kind?: string
   evidence_id?: string | null
 }
 
-/** `ResolveHumanRequestRequest.response` (the code is never echoed back). */
+/** v0.22 decision vocabulary of approval/blocked_recovery/conflict. */
+export type HumanDecision = "approved" | "rejected"
+
+/**
+ * `ResolveHumanRequestRequest.response` (the code is never echoed back).
+ * Login takeovers submit a one-time code/note; decision requests submit a
+ * `decision` and (for a rejection) a mandatory `reason`.
+ */
 export type HumanRequestResponseInput = {
   code?: string
   note?: string
+  decision?: HumanDecision
+  reason?: string
 }
 
-/** `HumanRequestResponseView`: P3 only echoes the note summary (spec §4.7). */
+/** `HumanRequestResponseView`: the code is never echoed back (spec §4.7). */
 export type HumanRequestResponseView = {
   note?: string
+  decision?: HumanDecision | string
+  reason?: string
 }
 
 /** `HumanRequestView` (spec §9.3). The response never echoes the plaintext code. */

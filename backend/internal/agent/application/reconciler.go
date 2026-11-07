@@ -234,9 +234,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err := r.reconcileConversations(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.reconcileAttachments(ctx); err != nil {
-		errs = append(errs, err)
-	}
+	// v0.22 (Task 36 fix round 1): attachment extraction is deterministic and
+	// server-side (the pending row is its queue); the reconciler no longer
+	// enqueues attachment.ingest agent work items.
 	if err := r.reconcileDesign(ctx); err != nil {
 		errs = append(errs, err)
 	}
@@ -636,8 +636,9 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 			}
 		}
 
-		// Rules 3 and 4: reply and curation per user message. Design
-		// conversations keep the reply Host but never run requirement.curate.
+		// Rule 3: reply per unanswered user message. v0.22 D-B1 removed the
+		// requirement.curate background job; requirement drafting is a Host tool
+		// now, so the reconciler no longer enqueues a curation task.
 		for index, message := range conversation.Messages {
 			if message.Role != "user" {
 				continue
@@ -657,61 +658,8 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 					}
 				}
 			}
-			if design {
-				continue
-			}
-			if !hasCuratorAfter(conversation.Messages, index) {
-				dedupeKey := fmt.Sprintf("curate:%d", message.ID)
-				if !hasBlockingTask(items, WorkTypeRequirementCurate, dedupeKey) {
-					created, err := r.ensure(ctx, conversation.VersionID, team, WorkTypeRequirementCurate, dedupeKey, map[string]any{
-						"conversation_id": idText(conversation.ID),
-						"message_id":      idText(message.ID),
-					})
-					if err != nil {
-						errs = append(errs, err)
-					} else if created {
-						items = append(items, agent.WorkItem{VersionID: conversation.VersionID, Type: WorkTypeRequirementCurate, DedupeKey: dedupeKey, Status: agent.WorkItemOpen})
-					}
-				}
-			}
 		}
 		tasks[conversation.VersionID] = items
-	}
-	return errors.Join(errs...)
-}
-
-func (r *Reconciler) reconcileAttachments(ctx context.Context) error {
-	if r.attachments == nil || r.queue == nil {
-		return nil
-	}
-	attachments, err := r.attachments.ListPendingAttachments(ctx, r.limit)
-	if err != nil {
-		return fmt.Errorf("list pending attachments: %w", err)
-	}
-	var errs []error
-	for _, attachment := range attachments {
-		dedupeKey := fmt.Sprintf("attachment:%d", attachment.ID)
-		items, err := r.queue.ListByVersion(ctx, attachment.VersionID, r.limit)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("list work items for version %d: %w", attachment.VersionID, err))
-			continue
-		}
-		if hasBlockingTask(items, WorkTypeAttachmentIngest, dedupeKey) {
-			continue
-		}
-		payload := map[string]any{
-			"attachment_id": idText(attachment.ID),
-			"version_id":    idText(attachment.VersionID),
-		}
-		if attachment.ConversationID > 0 {
-			payload["conversation_id"] = idText(attachment.ConversationID)
-		}
-		if attachment.MessageID > 0 {
-			payload["message_id"] = idText(attachment.MessageID)
-		}
-		if _, err := r.ensure(ctx, attachment.VersionID, agent.TeamClarification, WorkTypeAttachmentIngest, dedupeKey, payload); err != nil {
-			errs = append(errs, err)
-		}
 	}
 	return errors.Join(errs...)
 }
@@ -746,15 +694,6 @@ func hasBlockingTask(items []agent.WorkItem, workType, dedupeKey string) bool {
 func hasAssistantAfter(messages []ReconcilerMessage, index int) bool {
 	for i := index + 1; i < len(messages); i++ {
 		if messages[i].Role == "assistant" {
-			return true
-		}
-	}
-	return false
-}
-
-func hasCuratorAfter(messages []ReconcilerMessage, index int) bool {
-	for i := index + 1; i < len(messages); i++ {
-		if messages[i].Role == "assistant" && messages[i].AgentProfileKey == ProfileKeyRequirementCurator {
 			return true
 		}
 	}

@@ -35,14 +35,15 @@ type base struct {
 // narrow store interfaces (IntentRepository, WaveRepository, ...) rather than
 // this aggregate.
 type Repository struct {
-	Intents     *IntentRepository
-	Waves       *WaveRepository
-	CaseRuns    *CaseRunRepository
-	SUTContexts *SUTContextRepository
-	Results     *ResultRepository
-	Evidence    *EvidenceRepository
-	Executors   *ExecutorRepository
-	Humans      *HumanRequestRepository
+	Intents      *IntentRepository
+	Waves        *WaveRepository
+	CaseRuns     *CaseRunRepository
+	SUTContexts  *SUTContextRepository
+	Results      *ResultRepository
+	Evidence     *EvidenceRepository
+	Executors    *ExecutorRepository
+	Humans       *HumanRequestRepository
+	Observations *DiscoveryObservationRepository
 }
 
 // NewRepository wires every execution aggregate store over one pgx pool. ids
@@ -50,14 +51,15 @@ type Repository struct {
 func NewRepository(pool *pgxpool.Pool, ids platformid.Generator) *Repository {
 	shared := base{pool: pool, ids: ids}
 	return &Repository{
-		Intents:     &IntentRepository{shared},
-		Waves:       &WaveRepository{shared},
-		CaseRuns:    &CaseRunRepository{shared},
-		SUTContexts: &SUTContextRepository{shared},
-		Results:     &ResultRepository{shared},
-		Evidence:    &EvidenceRepository{shared},
-		Executors:   &ExecutorRepository{shared},
-		Humans:      &HumanRequestRepository{shared},
+		Intents:      &IntentRepository{shared},
+		Waves:        &WaveRepository{shared},
+		CaseRuns:     &CaseRunRepository{shared},
+		SUTContexts:  &SUTContextRepository{shared},
+		Results:      &ResultRepository{shared},
+		Evidence:     &EvidenceRepository{shared},
+		Executors:    &ExecutorRepository{shared},
+		Humans:       &HumanRequestRepository{shared},
+		Observations: &DiscoveryObservationRepository{shared},
 	}
 }
 

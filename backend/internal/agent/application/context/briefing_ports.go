@@ -28,6 +28,19 @@ type Source struct {
 	Execution     ExecutionSnapshot
 	Knowledge     []KnowledgeSnapshot
 	OpenQuestions OpenQuestionsSnapshot
+	// Handoff is the latest clarification→design handoff artifact of the
+	// version (Task 27/R-B5-2). Nil means the version has no handoff yet; the
+	// briefing then renders no handoff group at all.
+	Handoff *HandoffSnapshot
+}
+
+// HandoffSnapshot is the briefing read projection of one clarification_handoff
+// revision: the document is the persisted six-block JSON artifact and Revision
+// is its monotonic artifact revision.
+type HandoffSnapshot struct {
+	Revision    int
+	GeneratedAt string
+	Document    string
 }
 
 // VersionSnapshot is the goal/stage head of a version. The version store only
@@ -71,6 +84,10 @@ type PlanItemSnapshot struct {
 	Title     string
 	Status    string
 	DependsOn []string
+	// Revision is the optimistic-lock token the Host must present on the next
+	// plan.update write (R-A8-2). It starts at 1 and is bumped by every real
+	// write, so the Host can write without guessing and absorbing a conflict.
+	Revision int64
 }
 
 // FactSnapshot is one current finding of the version.

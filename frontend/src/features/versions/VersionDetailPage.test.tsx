@@ -13,7 +13,17 @@ const api = vi.hoisted(() => ({
   getResourceCatalog: vi.fn(),
   reopenVersion: vi.fn(),
 }))
-vi.mock("./api", () => api)
+// Partial mock: the W1-4A panels import other helpers from this module, but they
+// stay unmounted without a stage projection. The stage read rejects so the page
+// keeps exercising the pre-existing stage-less overview path.
+vi.mock(import("./api"), async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>()
+  return {
+    ...actual,
+    getVersionStage: () => Promise.reject(new Error("stage projection unavailable")),
+    ...api,
+  }
+})
 
 const deliveryApi = vi.hoisted(() => ({
   listIssues: vi.fn(),
@@ -21,7 +31,10 @@ const deliveryApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/delivery/api", () => deliveryApi)
 
-const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+const executionApi = vi.hoisted(() => ({
+  listHumanRequests: vi.fn(),
+  resolveHumanRequest: vi.fn(),
+}))
 vi.mock("@/features/execution/api", () => executionApi)
 
 const chainProps = vi.hoisted(() => ({
@@ -72,12 +85,14 @@ vi.mock("@/features/design/DesignTab", async () => {
       versionId: string
       initialCaseId?: string
       initialConversationId?: string
+      initialExportId?: string
     }) =>
       React.createElement("div", {
         "data-testid": "design-workspace",
         "data-version-id": props.versionId,
         "data-case-id": props.initialCaseId,
         "data-conversation-id": props.initialConversationId,
+        "data-export-id": props.initialExportId,
       }),
   }
 })
@@ -181,6 +196,7 @@ describe("VersionDetailPage", () => {
     deliveryApi.listReports.mockResolvedValue([])
     executionApi.listHumanRequests.mockReset()
     executionApi.listHumanRequests.mockResolvedValue([])
+    executionApi.resolveHumanRequest.mockReset()
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null
@@ -347,7 +363,7 @@ describe("VersionDetailPage", () => {
     fireEvent.click(screen.getByTestId("version-todo-entry"))
 
     expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()
-    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "pending" })
   })
 
   it("honours a deep-linked execution tab and mounts the execution workspace", async () => {
@@ -518,6 +534,16 @@ describe("VersionDetailPage", () => {
     expect(workspace).toHaveAttribute("data-version-id", "2001")
     expect(workspace).toHaveAttribute("data-case-id", "7001")
     expect(workspace).toHaveAttribute("data-conversation-id", "4009")
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("forwards the ?export= deep link to the design tab", async () => {
+    search.params = new URLSearchParams("tab=design&export=9001")
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByTestId("design-workspace")).toHaveAttribute("data-export-id", "9001")
     expect(navigation.replace).not.toHaveBeenCalled()
   })
 

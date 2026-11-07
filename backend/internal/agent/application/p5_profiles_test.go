@@ -9,23 +9,17 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 )
 
-// p5ExpectedProfileTools is the spec §4.4 / contracts §8.1 P5 increment. It is
-// a union with the P1–P4 tools, not a replacement.
+// p5ExpectedProfileTools is the spec §4.4 / contracts §8.1 P5 increment after
+// the v0.22 D-B1 convergence (the Scout/Planner entries were removed and the
+// author seed is now design_author). It is a union with the P1–P4 tools, not a
+// replacement.
 var p5ExpectedProfileTools = map[string][]string{
-	agentapp.ProfileKeyContextScout: {
-		tools.ToolCodeTree, tools.ToolCodeRead, tools.ToolCodeSearch,
-		tools.ToolCodeFacts, tools.ToolCodeRoutes, tools.ToolCodeAPIs,
-		tools.ToolCodeDiff, tools.ToolCodeImpact, tools.ToolSUTPagePropose,
-	},
-	agentapp.ProfileKeyCaseAuthor: {
+	agentapp.ProfileKeyDesignAuthor: {
 		tools.ToolCodeFacts, tools.ToolCodeRoutes, tools.ToolCodeAPIs,
 		tools.ToolCodeDiff, tools.ToolCodeImpact, tools.ToolCodeAnchors,
 	},
 	agentapp.ProfileKeyFailureAnalyst: {
 		tools.ToolCodeDiff, tools.ToolCodeFacts, tools.ToolCodeAnchors,
-	},
-	agentapp.ProfileKeyDesignPlanner: {
-		tools.ToolCodeImpact,
 	},
 	agentapp.ProfileKeyDesignHost: {
 		tools.ToolCodeFacts, tools.ToolCodeRoutes, tools.ToolCodeAPIs,

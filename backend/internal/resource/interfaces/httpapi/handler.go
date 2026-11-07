@@ -61,6 +61,10 @@ type Service interface {
 	ListRepositories(ctx context.Context, limit int, beforeID *int64) ([]resourceapp.CodeRepositoryView, bool, error)
 	GetRepository(ctx context.Context, id int64) (resourceapp.CodeRepositoryView, error)
 
+	// API-17: SUT-level multi-repository associations (v0.22 R-C2).
+	ListSUTRepositories(ctx context.Context, sutID int64) ([]resourceapp.SUTRepositoryView, error)
+	AddSUTRepository(ctx context.Context, sutID int64, input resourceapp.SUTRepositoryInput, actorID int64) (resourceapp.SUTRepositoryView, error)
+
 	ConfirmPage(ctx context.Context, pageID, actorID int64) (resourceapp.PageView, error)
 	RejectPage(ctx context.Context, pageID, actorID int64) (resourceapp.PageView, error)
 	ConfirmAPI(ctx context.Context, apiID, actorID int64) (resourceapp.APIView, error)

@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
-import type { GCRun, GCRunDetail } from "./api"
+import type { GCRun, GCRunDetail, Setting } from "./api"
 
 const api = vi.hoisted(() => ({
   listGCRuns: vi.fn(),
@@ -108,6 +108,53 @@ const dryRunDetail: GCRunDetail = {
   ],
 }
 
+const retentionSettings: Setting[] = [
+  {
+    key: "retention.gc_dry_run",
+    category: "retention",
+    type: "boolean",
+    value: true,
+    is_secret: false,
+    restart_required: false,
+    description: "GC 默认演练模式",
+    version: 1,
+    updated_at: startedAt,
+  },
+  {
+    key: "retention.gc_grace_hours",
+    category: "retention",
+    type: "number",
+    value: 168,
+    is_secret: false,
+    restart_required: false,
+    description: "两阶段删除宽限期（小时）",
+    version: 1,
+    updated_at: startedAt,
+  },
+  {
+    key: "retention.unreferenced_content_days",
+    category: "retention",
+    type: "number",
+    value: 30,
+    is_secret: false,
+    restart_required: false,
+    description: "无引用内容保留天数",
+    version: 1,
+    updated_at: startedAt,
+  },
+  {
+    key: "retention.gc_batch_size",
+    category: "retention",
+    type: "number",
+    value: 500,
+    is_secret: false,
+    restart_required: false,
+    description: "单次 GC 扫描上限",
+    version: 1,
+    updated_at: startedAt,
+  },
+]
+
 function mockApi(): void {
   api.listGCRuns.mockResolvedValue({ items: [dryRun, oldRun], nextCursor: "", hasMore: false })
   api.getGCRun.mockImplementation((runId: string) =>
@@ -117,7 +164,7 @@ function mockApi(): void {
 }
 
 function renderPanel(): void {
-  render(<GCPanel />)
+  render(<GCPanel retentionSettings={retentionSettings} />)
 }
 
 describe("GCPanel", () => {
@@ -158,6 +205,25 @@ describe("GCPanel", () => {
     const tombstones = await screen.findByTestId("gc-tombstones")
     expect(within(tombstones).getByText("objects/aa/aa.pdf")).toBeInTheDocument()
     expect(within(tombstones).getByText("1.0 KB")).toBeInTheDocument()
+  })
+
+  it("shows the effective retention.* values and no removed gc.* controls", async () => {
+    renderPanel()
+
+    const retention = await screen.findByTestId("gc-retention-settings")
+    expect(within(retention).getByText("retention.unreferenced_content_days")).toBeInTheDocument()
+    expect(within(retention).getByText("30")).toBeInTheDocument()
+    expect(within(retention).getByText("retention.gc_grace_hours")).toBeInTheDocument()
+    expect(within(retention).getByText("168")).toBeInTheDocument()
+    expect(within(retention).getByText("retention.gc_dry_run")).toBeInTheDocument()
+    expect(within(retention).getByText("启用")).toBeInTheDocument()
+    expect(within(retention).getByText("retention.gc_batch_size")).toBeInTheDocument()
+
+    for (const key of ["gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days"]) {
+      expect(screen.queryByText(key)).not.toBeInTheDocument()
+    }
+    // Capacity control is a documented v0.22 residual, not a dead control.
+    expect(screen.getByText(/gc\.max_bytes.*容量控制.*未实现|容量控制.*未实现/)).toBeInTheDocument()
   })
 
   it("runs a dry-run without confirmation and refreshes the history", async () => {

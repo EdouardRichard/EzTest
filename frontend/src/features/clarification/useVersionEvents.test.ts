@@ -150,6 +150,34 @@ describe("useVersionEvents", () => {
     expect(onVersionChanged).toHaveBeenCalledTimes(1)
   })
 
+  it("routes structured-question and extraction events to their handlers", () => {
+    const onQuestionChanged = vi.fn()
+    const onExtractionChanged = vi.fn()
+    render(createElement(Harness, { handlers: { onQuestionChanged, onExtractionChanged } }))
+
+    for (const eventType of ["question.reopened", "question.skipped"]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(eventType, { question_id: "101", status: "pending" }),
+      })
+    }
+    for (const eventType of [
+      "extraction.started",
+      "extraction.progress",
+      "extraction.segment_failed",
+      "extraction.done",
+    ]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(eventType, { run_id: "9001", status: "running" }),
+      })
+    }
+
+    expect(onQuestionChanged).toHaveBeenCalledTimes(2)
+    expect(onExtractionChanged).toHaveBeenCalledTimes(4)
+    expect(onExtractionChanged.mock.calls[0][0]).toMatchObject({ type: "extraction.started" })
+  })
+
   it("routes P2 design events to the design handlers", () => {
     const onDesignGraphChanged = vi.fn()
     const onDesignCaseChanged = vi.fn()
@@ -250,10 +278,12 @@ describe("useVersionEvents", () => {
       "human_request.created",
       "human_request.resolved",
       "human_request.expired",
+      "approval.requested",
+      "approval.decided",
     ]) {
       connectOptions.onEvent({
         event: "message",
-        data: eventFrame(type, { human_request_id: "9501" }),
+        data: eventFrame(type, { human_request_id: "9501", kind: "approval" }),
       })
     }
     for (const type of [
@@ -269,11 +299,13 @@ describe("useVersionEvents", () => {
     expect(onWaveChanged).toHaveBeenCalledTimes(5)
     expect(onCaseRunChanged).toHaveBeenCalledTimes(6)
     expect(onEvidenceCreated).toHaveBeenCalledTimes(1)
-    expect(onHumanRequestChanged).toHaveBeenCalledTimes(3)
+    expect(onHumanRequestChanged).toHaveBeenCalledTimes(5)
     expect(onExecutionChanged).toHaveBeenCalledTimes(5)
     expect(onWaveChanged.mock.calls[0][0].type).toBe("wave.created")
     expect(onCaseRunChanged.mock.calls[0][0].type).toBe("case_run.started")
     expect(onHumanRequestChanged.mock.calls[2][0].type).toBe("human_request.expired")
+    expect(onHumanRequestChanged.mock.calls[3][0].type).toBe("approval.requested")
+    expect(onHumanRequestChanged.mock.calls[4][0].type).toBe("approval.decided")
     expect(onExecutionChanged.mock.calls[4][0].type).toBe("execution.coverage_gap")
   })
 
@@ -377,6 +409,85 @@ describe("useVersionEvents", () => {
 
     expect(onConversationMessage).not.toHaveBeenCalled()
     expect(onRequirementChanged).not.toHaveBeenCalled()
+  })
+
+  it("routes the remaining business events added in W1-5", () => {
+    const onAgentRunChanged = vi.fn()
+    const onWorkItemChanged = vi.fn()
+    const onContextChanged = vi.fn()
+    const onToolRetry = vi.fn()
+    const onDesignCaseChanged = vi.fn()
+    const onVersionChanged = vi.fn()
+    render(
+      createElement(Harness, {
+        handlers: {
+          onAgentRunChanged,
+          onWorkItemChanged,
+          onContextChanged,
+          onToolRetry,
+          onDesignCaseChanged,
+          onVersionChanged,
+        },
+      }),
+    )
+
+    for (const type of ["agent.run.started", "agent.run.finished", "agent.run.failed"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { agent_run_id: "9601" }) })
+    }
+    for (const type of [
+      "work_item.created",
+      "work_item.claimed",
+      "work_item.failed",
+      "work_item.dead",
+    ]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { work_item_id: "9701" }) })
+    }
+    for (const type of ["context.cache_stats", "context.compacted"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { cached_tokens: 10 }) })
+    }
+    connectOptions.onEvent({ event: "message", data: eventFrame("tool.retry", { attempt: 2 }) })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("design.review_submitted", { requirement_id: "6001" }),
+    })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("version.created", { title: "订单中心" }),
+    })
+
+    expect(onAgentRunChanged).toHaveBeenCalledTimes(3)
+    expect(onWorkItemChanged).toHaveBeenCalledTimes(4)
+    expect(onContextChanged).toHaveBeenCalledTimes(2)
+    expect(onToolRetry).toHaveBeenCalledTimes(1)
+    expect(onDesignCaseChanged).toHaveBeenCalledTimes(1)
+    expect(onVersionChanged).toHaveBeenCalledTimes(1)
+    expect(onWorkItemChanged.mock.calls[2][0].type).toBe("work_item.failed")
+    expect(onContextChanged.mock.calls[1][0].type).toBe("context.compacted")
+  })
+
+  it("routes resource.delta and version.scope.snapshot_created to their handlers", () => {
+    const onDiscoveryChanged = vi.fn()
+    const onScopeSnapshotChanged = vi.fn()
+    render(createElement(Harness, { handlers: { onDiscoveryChanged, onScopeSnapshotChanged } }))
+
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("resource.delta", { version_id: "2001", wave_id: "9201" }),
+    })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("version.scope.snapshot_created", {
+        version_id: "2001",
+        wave_id: "9201",
+        frozen_at: "2026-11-01T08:00:00Z",
+      }),
+    })
+
+    expect(onDiscoveryChanged).toHaveBeenCalledTimes(1)
+    expect(onDiscoveryChanged.mock.calls[0][0].type).toBe("resource.delta")
+    expect(onScopeSnapshotChanged).toHaveBeenCalledTimes(1)
+    expect(onScopeSnapshotChanged.mock.calls[0][0].type).toBe("version.scope.snapshot_created")
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
   })
 
   it("uses the latest handlers without reconnecting and disconnects on unmount", () => {

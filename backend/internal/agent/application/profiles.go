@@ -7,139 +7,47 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
-// P1 profile keys (contracts/agent-profiles-tools.md §2).
-const (
-	ProfileKeyClarificationHost  = "clarification_host"
-	ProfileKeyRequirementCurator = "requirement_curator"
-	ProfileKeyContextScout       = "context_scout"
-)
+// P1 profile keys (contracts/agent-profiles-tools.md §2). v0.22 D-B1 removes the
+// requirement Curator and context Scout seeds: requirement drafting is a Host
+// tool and attachments move to the deterministic server pipeline, so the
+// clarification domain exposes exactly one Host.
+const ProfileKeyClarificationHost = "clarification_host"
 
-// P2 design profile keys (contracts/agent-profiles-tools.md P2 increment).
+// P2 conversation/design profile keys (contracts/agent-profiles-tools.md P2
+// increment, converged by v0.22 D-B1/R-B1-2): two Hosts plus two background
+// jobs. The jobs only write artifacts/job cards and never append assistant
+// messages; the removed Planner seeds are gone.
 const (
-	ProfileKeyDesignHost    = "design_host"
-	ProfileKeyDesignPlanner = "design_planner"
-	ProfileKeyCaseAuthor    = "case_author"
-	ProfileKeyDesignCritic  = "design_critic"
-	ProfileKeyDataPlanner   = "data_planner"
+	ProfileKeyDesignHost   = "design_host"
+	ProfileKeyDesignAuthor = "design_author"
+	ProfileKeyDesignCritic = "design_critic"
 )
 
 // P3 execution profile keys (contracts/agent-profiles-tools.md P3 increment).
+// v0.22 R-B1-2/R-B1-6 keeps these execution/analysis profiles outside the
+// two-Host conversation team.
 const (
 	ProfileKeyCaseExecutor    = "case_executor"
 	ProfileKeyFailureAnalyst  = "failure_analyst"
 	ProfileKeyCoverageAnalyst = "coverage_analyst"
 )
 
-// System prompts freeze the role boundaries: Host talks only, Curator produces
-// drafts/relations/reopen proposals, Scout reads and summarizes. The
+// System prompts freeze the role boundaries: a Host talks only, the design
+// Author produces case drafts/proposals and the Critic submits findings. The
 // [profile:<key>] marker is used by the deterministic fake LLM and is ignored
 // by real models.
 const clarificationHostPrompt = `你是 EzTest 的澄清 Host（需求澄清助手）。
 角色边界：
 - 只与用户对话、解释、提问与复述；不确认需求、不删除需求、不修改已确认需求。
-- 需要结构化需求时，引导需求 Curator 生成 draft 草案，不要声称已确认。
+- 需要结构化需求时，直接用 requirement.draft_create / requirement.draft_update 生成或更新 draft 草案，不要声称已确认。
 - 可以调用 context.summary_update 更新会话摘要与钉住事实。
-- 同一轮需求 Curator 会并行创建 draft：requirement.read 只是读取时刻的快照；若快照为空但会话已有 requirement_card，不要声称“未创建/需求数为 0”，以 Curator 卡片与最新需求列表为准。
-- 同一来源编号（如 FR-011）在版本内只对应一条 draft：需求列表/卡片已存在该编号时，不要再要求 Curator 重复创建，也不要声称会出现第二条。
-- 资源目标（页面/API/version_sut）由 sut.list / sut.page_list 返回的数字 id 表示，需求草案的 targets 必须使用这些 id；不要要求用户提供数字 ID，也不要接受 path/URL 作为目标。
+- requirement.read 只是读取时刻的快照；若快照为空但会话已有 requirement_card，不要声称“未创建/需求数为 0”，以卡片与最新需求列表为准。
+- 同一来源编号（如 FR-011）在版本内只对应一条 draft：需求列表/卡片已存在该编号时，直接用 requirement.draft_update 补全，不要再创建第二条。
+- 资源目标（页面/API/version_sut）由 sut.list / sut.page_list 返回的十进制数字 id 表示，需求草案的 targets 必须使用这些 id；不要要求用户提供数字 ID，也不要接受 path/URL 作为目标。
+- 不能使用浏览器/执行器工具、不能确认需求或用例；确认只能由用户完成。
 回答使用简洁中文；引用用户最新消息；每次最多提出 3 个澄清问题。
 [profile:clarification_host]`
 
-const requirementCuratorPrompt = `你是 EzTest 的需求 Curator（需求草案整理者）。
-角色边界：
-- 只能创建/更新 draft 需求、提议需求关系、写回退提议；不确认、不删除、不关闭需求。
-- 不直接修改 clarified 需求；若需求已确认，使用 requirement.reopen_propose 写回退提议。
-- 标题、描述、验收标准必须来自对话事实，不编造用户未表达的内容；priority 使用 P0–P3。
-- 目标必须使用版本资源数字 ID：target_version_suts 取 sut.list 的 version_sut_id；target_pages/target_apis 取 sut.page_list 对应条目的 id（十进制字符串）；不得填 path、URL、名称或“方法+路径”，目标必须属于当前版本绑定。
-- 同一版本同一来源编号（title 开头的 FR/NFR 等编号）只保留一条 requirement；若 requirement.read 已显示该编号的 draft，用 requirement.draft_update 补全内容与 targets，不要重复 draft_create。
-- 创建成功后回报 requirement_id / revision / status 与已绑定 target 数量；失败时按错误字段修正后用数字 ID 重试，不要留下空 targets。
-在工具结果基础上用一两句话向用户说明草案变化，等待用户确认。
-[profile:requirement_curator]`
-
-const contextScoutPrompt = `你是 EzTest 的上下文 Scout（附件与上下文侦察员）。
-角色边界：
-- 只读附件、页面、团队频道并总结要点；不修改需求、不确认、不删除。
-- 输出精简的 finding：关键事实、约束、风险与需要澄清的问题；引用附件名。
-- 不输出内部路径、prompt 或密钥。
-[profile:context_scout]`
-
-// clarificationHostTools is the Host read set (contract §2).
-var clarificationHostTools = []string{
-	tools.ToolContextVersionPack,
-	tools.ToolContextTaskPack,
-	tools.ToolContextTeamRoomRead,
-	tools.ToolContextSummaryUpdate,
-	tools.ToolRequirementRead,
-	tools.ToolAttachmentList,
-	tools.ToolAttachmentReadText,
-	tools.ToolSUTList,
-	tools.ToolSUTPageList,
-}
-
-// curationReadTools are the tools the Curator shares with the Host (minus the
-// Host-only summary updater).
-var curationReadTools = []string{
-	tools.ToolContextVersionPack,
-	tools.ToolContextTaskPack,
-	tools.ToolContextTeamRoomRead,
-	tools.ToolRequirementRead,
-	tools.ToolAttachmentList,
-	tools.ToolAttachmentReadText,
-	tools.ToolSUTList,
-	tools.ToolSUTPageList,
-}
-
-var requirementCuratorTools = append(append([]string{}, curationReadTools...),
-	tools.ToolRequirementDraftCreate,
-	tools.ToolRequirementDraftUpdate,
-	tools.ToolRequirementRelationPropose,
-	tools.ToolRequirementReopenPropose,
-)
-
-var contextScoutTools = []string{
-	tools.ToolAttachmentList,
-	tools.ToolAttachmentReadText,
-	tools.ToolAttachmentImageRef,
-	tools.ToolSUTList,
-	tools.ToolSUTPageList,
-	tools.ToolContextTeamRoomRead,
-}
-
-// P1Profiles returns fresh seed definitions. Values match the frozen budgets in
-// the P1 profile contract; EnsureProfiles never overwrites admin edits.
-func P1Profiles() []agent.AgentProfile {
-	return []agent.AgentProfile{
-		{
-			Key:          ProfileKeyClarificationHost,
-			Name:         "澄清 Host",
-			SystemPrompt: clarificationHostPrompt,
-			AllowedTools: append([]string(nil), clarificationHostTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
-			Enabled:      true,
-		},
-		{
-			Key:          ProfileKeyRequirementCurator,
-			Name:         "需求 Curator",
-			SystemPrompt: requirementCuratorPrompt,
-			AllowedTools: append([]string(nil), requirementCuratorTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 300, HardSeconds: 600},
-			Enabled:      true,
-		},
-		{
-			Key:          ProfileKeyContextScout,
-			Name:         "上下文 Scout",
-			SystemPrompt: contextScoutPrompt,
-			AllowedTools: append([]string(nil), contextScoutTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
-			Enabled:      true,
-		},
-	}
-}
-
-// P2 design prompts. Every prompt declares that AI only submits draft/
-// candidate content and can never confirm, delete or close; the Host only
-// explains and edits the mindmap. The [profile:<key>] marker is used by the
-// deterministic fake LLM and ignored by real models.
 const designHostPrompt = `你是 EzTest 的设计 Host（用例脑图助手）。
 角色边界：
 - 只解释、提问与修改脑图；不确认用例、不删除、不关闭版本或需求。
@@ -153,47 +61,49 @@ const designHostPrompt = `你是 EzTest 的设计 Host（用例脑图助手）�
 回答使用简洁中文，聚焦用例覆盖与可执行性。
 [profile:design_host]`
 
-const designPlannerPrompt = `你是 EzTest 的设计 Planner（设计轮次执行者）。
+const designAuthorPrompt = `你是 EzTest 的设计 Author（后台作业，场景/用例作者）。
 角色边界：
-- 读取一次脑图后立即用 case.graph_propose 提交本轮场景与用例 draft；不要询问用户、不要等待用户选择。
-- 只提交 draft/候选：不能确认、删除、关闭用例或需求；确认只属于用户。
-- 场景名用需求标题原文、用例标题用对应验收要点原文，降低与并发用例作者重复的概率；同一自然键已存在时更新而不是重复创建。
-- 先做一次 design.graph_read 获取本轮需求的 requirement_version_id 与发现事实；来源 sources.kind=requirement 的 ref_id 必须是 requirement_version_id（当前需求版本 ID），不能写 requirement_id。
-- 每条步骤与断言都必须有可观察的 expected，不得留空。
-- 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual。
-- 页面/API 来源只能引用版本已绑定的 page/api ID；未绑定时不要填 page/api 来源，改用 requirement/knowledge 来源，不要编造 ref_id。
-- 用例必须包含可执行步骤、断言、来源与目标 version_sut；页面/接口发现事实可作为 knowledge/page/api 来源。
-- 范围以服务端 Planner 扫描结果为准，不编造未激活需求；不编造需求未表达的内容。
-提交后用简洁中文说明新增/更新的场景与用例数量。
-[profile:design_planner]`
-
-const caseAuthorPrompt = `你是 EzTest 的用例 Author（场景/用例作者）。
-角色边界：
+- 按任务上下文（task pack、交接包摘要、当前图/用例、目标）生成或修订 case revision 与 graph proposal；只写产物表与作业卡，不写 assistant 消息、不进入 Host 对话。
 - 只能通过 case.graph_propose 提交场景与用例 draft；不能确认、删除、关闭用例或需求。
 - 先在 design.graph_read 读取当前脑图，避免重复创建；同一需求版本内修改已有用例时传既有 ID/自然键。
 - 场景名用需求标题原文、用例标题用对应验收要点原文，降低与同轮设计重复的概率；同一自然键已存在时更新而不是重复创建。
 - 用例必须包含可执行步骤、断言、来源与目标 version_sut；跨系统步骤分别指定目标。
 - 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求或验收标准明确要求视觉基线或像素级截图比对时才用 visual；“页面不显示某标识/文案”用 text/ui 断言，不要用 visual。
+- 断言必须逐条来自该需求/验收要点的原文：不得添加验收标准未要求的 UI 细节（额外列名、字段、颜色、布局、控件数量）；验收标准没写的“完整列集合/作者列/固定列数”不得作为硬断言。
+- 若验收标准写明平台/视口/端（如“移动端支持”“桌面端”），步骤必须在该条件下执行（指定对应 page/viewport），不得在桌面视口断言只属于移动端的行为；无法满足条件时写入 draft 并在 finding 说明，不得硬断言。
+- 上传类步骤用 browser.upload_file（base64 文件内容注入文件输入框）并用 snapshot/screenshot 验证插入结果，不得点击需要原生文件选择框的按钮；响应式/移动端 AC 先用 browser.set_viewport(width,height) 切到对应视口再设计操作与断言，无法满足时写 draft 并说明。
+- 数量/集合类断言必须基于执行时的实时数据（如 API 返回的 total/ids）或行为关系（并集=单标签之和−交集、无重复）推导，禁止硬编码验收标准示例里的具体条数（除非环境明确保证固定数据集）；数据不满足示例时写 draft/finding，不得把数据差异判成产品缺陷。
 - 不编造需求未表达的内容；拿不准时写入 draft 并在团队频道说明假设。
-完成后在团队频道说明新增/修改的场景与用例。
-[profile:case_author]`
+[profile:design_author]`
 
-const designCriticPrompt = `你是 EzTest 的 Design Critic（内部设计自审者）。
+const designCriticPrompt = `你是 EzTest 的 Design Critic（后台作业，内部设计自审者）。
 角色边界：
 - 通过 design.review_submit 提交 finding（blocker/important/minor），只读脑图；不修改用例、不确认。
 - 内部自审不构成人工关卡；确认权限只属于用户。
+- 只写 finding/作业卡，不写 assistant 消息、不进入 Host 对话。
 - 检查覆盖遗漏、步骤不可执行、断言缺失、目标 SUT 错误与重复用例。
+- 检查断言范围：出现验收标准未要求的额外 UI 细节断言（如“必须包含作者列/完整列集合/固定控件数”）即报 finding；断言必须能追溯到 AC 原文。
+- 检查端/视口条件：AC 写明移动端/桌面端而用例在错误视口执行，或依赖执行器不支持的文件选择框，即报 finding。
 - 检查断言 kind：无显式视觉基线要求的用例不得使用 visual；出现即报 finding。
 输出简洁、可执行的 finding。
 [profile:design_critic]`
 
-const dataPlannerPrompt = `你是 EzTest 的数据 Planner（测试数据设计者）。
-角色边界：
-- 只通过 design.data_plan_submit 为当前 draft 用例补充前置条件与测试数据，生成新的 draft revision。
-- 不确认、不删除；已确认或 stale 版本不可修改。
-- 先用 design.graph_read 找到当前 draft 用例，数据必须可复现且不包含真实密钥。
-完成后在团队频道说明补充的数据范围。
-[profile:data_planner]`
+// clarificationHostTools is the Host read/write set (contract §2).
+var clarificationHostTools = []string{
+	tools.ToolContextVersionPack,
+	tools.ToolContextTaskPack,
+	tools.ToolContextTeamRoomRead,
+	tools.ToolContextSummaryUpdate,
+	tools.ToolRequirementRead,
+	tools.ToolRequirementDraftCreate,
+	tools.ToolRequirementDraftUpdate,
+	tools.ToolRequirementRelationPropose,
+	tools.ToolRequirementReopenPropose,
+	tools.ToolAttachmentList,
+	tools.ToolAttachmentReadText,
+	tools.ToolSUTList,
+	tools.ToolSUTPageList,
+}
 
 // designHostTools is the design Host read/write set (contract §5.2).
 var designHostTools = []string{
@@ -210,16 +120,7 @@ var designHostTools = []string{
 	tools.ToolSUTPageList,
 }
 
-var designPlannerTools = []string{
-	tools.ToolContextVersionPack,
-	tools.ToolContextTaskPack,
-	tools.ToolContextTeamRoomRead,
-	tools.ToolRequirementRead,
-	tools.ToolDesignGraphRead,
-	tools.ToolCaseGraphPropose,
-}
-
-var caseAuthorTools = []string{
+var designAuthorTools = []string{
 	tools.ToolContextVersionPack,
 	tools.ToolContextTaskPack,
 	tools.ToolRequirementRead,
@@ -235,15 +136,82 @@ var designCriticTools = []string{
 	tools.ToolDesignReviewSubmit,
 }
 
-var dataPlannerTools = []string{
-	tools.ToolContextTaskPack,
-	tools.ToolDesignGraphRead,
-	tools.ToolDesignDataPlanSubmit,
+// v022ProfileTools is the v0.22 W0 allowed_tools increment per existing profile
+// key (spec §4.3/§4.6/§4.8/§4.9/§4.15/§4.22). It is applied as a set union in
+// EnsureProfiles so the frozen per-phase seed lists stay readable and an
+// administrator-edited stored profile can still be validated against the role
+// whitelist. Every name here is registered by the composition root; a tool whose
+// production port is not wired is absent from the registry and the profile entry
+// is harmless.
+var v022ProfileTools = map[string][]string{
+	ProfileKeyClarificationHost: {
+		tools.ToolPlanUpdate,
+		tools.ToolQuestionAsk,
+		tools.ToolClarificationSearch,
+		tools.ToolTaskComplete,
+		tools.ToolAttachmentImageRef,
+		tools.ToolToolResultRead,
+	},
+	ProfileKeyDesignHost: {
+		tools.ToolPlanUpdate,
+		tools.ToolQuestionAsk,
+		tools.ToolClarificationSearch,
+		tools.ToolTaskComplete,
+		tools.ToolAttachmentImageRef,
+		tools.ToolSUTDatabaseList,
+		tools.ToolToolResultRead,
+	},
+	ProfileKeyDesignAuthor: {
+		tools.ToolSUTDatabaseList,
+		tools.ToolTaskComplete,
+	},
+	ProfileKeyDesignCritic: {
+		tools.ToolSUTDatabaseList,
+		tools.ToolTaskComplete,
+	},
+	ProfileKeyCaseExecutor: {
+		tools.ToolToolResultRead,
+		tools.ToolTaskComplete,
+	},
 }
 
-// P2Profiles returns fresh P2 seed definitions. Budgets and tool sets are
-// frozen by the P2 profile contract; EnsureProfiles never overwrites admin
-// edits.
+// V022ProfileTools returns a copy of the v0.22 per-profile tool increment.
+func V022ProfileTools() map[string][]string {
+	cloned := make(map[string][]string, len(v022ProfileTools))
+	for key, names := range v022ProfileTools {
+		cloned[key] = append([]string(nil), names...)
+	}
+	return cloned
+}
+
+// applyV022ProfileTools merges the v0.22 increment into one seed profile.
+func applyV022ProfileTools(profile agent.AgentProfile) agent.AgentProfile {
+	return mergeProfileTools(profile, v022ProfileTools[profile.Key])
+}
+
+// P1Profiles returns fresh seed definitions. The clarification Host carries the
+// v0.22 R-A2-2 envelope (12 turns / 600s soft / 900s hard); EnsureProfiles never
+// overwrites admin edits. v0.22 D-B1 removed the requirement Curator seed.
+func P1Profiles() []agent.AgentProfile {
+	return []agent.AgentProfile{
+		{
+			Key:          ProfileKeyClarificationHost,
+			Name:         "澄清 Host",
+			SystemPrompt: clarificationHostPrompt,
+			AllowedTools: append([]string(nil), clarificationHostTools...),
+			// v0.22 R-A2-2: multi-turn clarification must not be cut off by the
+			// old 300s soft / 600s hard chat clock; tokens are telemetry only.
+			Budgets: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 600, HardSeconds: 900},
+			Enabled: true,
+		},
+	}
+}
+
+// P2Profiles returns fresh P2 seed definitions. The conversation/design domain
+// is exactly two Hosts (clarification_host, design_host) plus the two background
+// jobs (design_author, design_critic); the removed Planner seeds are gone. The
+// design critic keeps its 4-turn guard with the design team's 600/900 envelope.
+// EnsureProfiles never overwrites admin edits.
 func P2Profiles() []agent.AgentProfile {
 	return []agent.AgentProfile{
 		{
@@ -258,21 +226,10 @@ func P2Profiles() []agent.AgentProfile {
 			Enabled: true,
 		},
 		{
-			Key:          ProfileKeyDesignPlanner,
-			Name:         "设计 Planner",
-			SystemPrompt: designPlannerPrompt,
-			AllowedTools: append([]string(nil), designPlannerTools...),
-			// The round now proposes the case draft itself (Task 69): one graph
-			// read plus one graph_propose per activated requirement needs more
-			// turns/seconds than the frozen scope-narration budget.
-			Budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
-			Enabled: true,
-		},
-		{
-			Key:          ProfileKeyCaseAuthor,
-			Name:         "用例 Author",
-			SystemPrompt: caseAuthorPrompt,
-			AllowedTools: append([]string(nil), caseAuthorTools...),
+			Key:          ProfileKeyDesignAuthor,
+			Name:         "设计 Author",
+			SystemPrompt: designAuthorPrompt,
+			AllowedTools: append([]string(nil), designAuthorTools...),
 			// Task 79: the per-requirement author needs the read, propose and
 			// summary turns; one 67-requirement round runs the author once per
 			// requirement, so the seed matches the design team envelope.
@@ -284,18 +241,24 @@ func P2Profiles() []agent.AgentProfile {
 			Name:         "设计 Critic",
 			SystemPrompt: designCriticPrompt,
 			AllowedTools: append([]string(nil), designCriticTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
-			Enabled:      true,
-		},
-		{
-			Key:          ProfileKeyDataPlanner,
-			Name:         "数据 Planner",
-			SystemPrompt: dataPlannerPrompt,
-			AllowedTools: append([]string(nil), dataPlannerTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
-			Enabled:      true,
+			// v0.22 R-A2-2: the critic keeps its 4-turn guard but shares the
+			// design team's 600s soft / 900s hard clock; tokens are telemetry.
+			Budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 600, HardSeconds: 900},
+			Enabled: true,
 		},
 	}
+}
+
+// Profile returns one built-in seed definition by key. The lookup covers the
+// startup seeds only: removed v0.22 profiles never resolve, and an
+// administrator-edited database row does not widen this catalog lookup.
+func Profile(key string) (agent.AgentProfile, bool) {
+	for _, profile := range Profiles() {
+		if profile.Key == key {
+			return profile, true
+		}
+	}
+	return agent.AgentProfile{}, false
 }
 
 // Profiles returns every seed profile (P1 then P2 then P3 then P4 then the P7
@@ -325,18 +288,19 @@ func Profiles() []agent.AgentProfile {
 // EnsureProfiles idempotently seeds the P1, P2, P3 and P4 profiles plus the P7
 // knowledge_curator role profile and the P5 and P7 allowed_tools increments.
 // Existing rows (including administrator edits) are returned unchanged by the
-// repository. The assembled seeds are validated against the seven-role tool
+// repository. The assembled seeds are validated against the role tool
 // whitelist before the first write.
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
 	seeds := Profiles()
 	for i := range seeds {
 		seeds[i] = applyP5ProfileTools(seeds[i])
 		seeds[i] = applyP7ProfileTools(seeds[i])
+		seeds[i] = applyV022ProfileTools(seeds[i])
 	}
-	// The seven-role catalog is the outer permission boundary: a seed profile
-	// that executes a catalog role must stay inside that role's tool whitelist.
-	// Fail closed before writing so a profile/tool edit cannot silently widen a
-	// role (0.2.1 review focus 5).
+	// The role catalog is the outer permission boundary: a seed profile that
+	// executes a catalog role must stay inside that role's tool whitelist. Fail
+	// closed before writing so a profile/tool edit cannot silently widen a role
+	// (0.2.1 review focus 5).
 	if err := ValidateRoleProfiles(seeds); err != nil {
 		return nil, err
 	}

@@ -19,12 +19,36 @@ export type VersionEventHandlers = {
   onConversationMessage?: (message: ConversationMessage) => void
   /** `agent.activity` payload; shape is not pinned by the contract yet. */
   onAgentActivity?: (payload: Record<string, unknown>) => void
+  /** `agent.run.started|finished|failed`: refresh the run/job projection. */
+  onAgentRunChanged?: (event: VersionEvent) => void
+  /** `work_item.created|claimed|failed|dead`: refresh the work queue. */
+  onWorkItemChanged?: (event: VersionEvent) => void
+  /** `context.cache_stats` / `context.compacted`: refresh context diagnostics. */
+  onContextChanged?: (event: VersionEvent) => void
+  /** `tool.retry`: refresh the activity/retry projection. */
+  onToolRetry?: (event: VersionEvent) => void
   /** Any `requirement.*` event; the workspace refetches the list. */
   onRequirementChanged?: (event: VersionEvent) => void
   /** `team_room.post` / `team_room.digest_updated`. */
   onTeamRoomChanged?: (event: VersionEvent) => void
-  /** `version.started` / `version.status_changed`. */
+  /** `version.started` / `version.status_changed` / closed / reopened. */
   onVersionChanged?: (event: VersionEvent) => void
+  /** `version.stage.changed` (v0.22) and the legacy `version.stage_changed`. */
+  onStageChanged?: (event: VersionEvent) => void
+  /** `plan.item_changed`: refresh the version plan overview. */
+  onPlanChanged?: (event: VersionEvent) => void
+  /** `fact.recorded` / `fact.conflict` / `fact.arbitrated`. */
+  onFactChanged?: (event: VersionEvent) => void
+  /** `question.created|answered|expired|reopened|skipped`: refresh the cards. */
+  onQuestionChanged?: (event: VersionEvent) => void
+  /** `handoff.updated`: refresh the clarification handoff projection. */
+  onHandoffChanged?: (event: VersionEvent) => void
+  /** `version.binding.changed`: refresh the binding overview. */
+  onBindingChanged?: (event: VersionEvent) => void
+  /** `extraction.*`: refresh requirement-extraction progress. */
+  onExtractionChanged?: (event: VersionEvent) => void
+  /** `attachment.image.*` / `model.vision.unavailable`: refresh image captions. */
+  onAttachmentImageChanged?: (event: VersionEvent) => void
   /** `design.graph_delta`: refetch the design graph snapshot. */
   onDesignGraphChanged?: (event: VersionEvent) => void
   /** `design.case_version_*` / `design.case_confirmed`: refresh graph and case detail. */
@@ -47,6 +71,12 @@ export type VersionEventHandlers = {
   onIssueChanged?: (event: VersionEvent) => void
   /** P4 `report.*`: refresh the report list/detail and current revision. */
   onReportChanged?: (event: VersionEvent) => void
+  /** `eval.started|completed|failed` (W2-14): refresh the quality eval board. */
+  onEvalChanged?: (event: VersionEvent) => void
+  /** `resource.delta`: refresh the discovery observations and coverage matrix. */
+  onDiscoveryChanged?: (event: VersionEvent) => void
+  /** `version.scope.snapshot_created`: refresh the frozen wave scope projection. */
+  onScopeSnapshotChanged?: (event: VersionEvent) => void
   /** P5 `visual.baseline_approved` / `visual.diff_created`: refresh visual projections. */
   onVisualChanged?: (event: VersionEvent) => void
   /** Synthetic `stream.reset`: refetch every snapshot instead of reconnecting. */
@@ -104,6 +134,24 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "agent.activity":
           handlersRef.current.onAgentActivity?.(payload)
           break
+        case "agent.run.started":
+        case "agent.run.finished":
+        case "agent.run.failed":
+          handlersRef.current.onAgentRunChanged?.(event)
+          break
+        case "tool.retry":
+          handlersRef.current.onToolRetry?.(event)
+          break
+        case "context.cache_stats":
+        case "context.compacted":
+          handlersRef.current.onContextChanged?.(event)
+          break
+        case "work_item.created":
+        case "work_item.claimed":
+        case "work_item.failed":
+        case "work_item.dead":
+          handlersRef.current.onWorkItemChanged?.(event)
+          break
         case "job.progress":
         case "job.finished":
         case "job.canceled":
@@ -117,10 +165,50 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           break
         case "version.started":
         case "version.status_changed":
-        case "version.stage_changed":
         case "version.closed":
         case "version.reopened":
+        case "version.created":
           handlersRef.current.onVersionChanged?.(event)
+          break
+        case "version.stage.changed":
+        case "version.stage_changed":
+          // v0.22 publishes the dot name and keeps the legacy underscore name;
+          // both refresh the stage projection and the version header.
+          handlersRef.current.onStageChanged?.(event)
+          handlersRef.current.onVersionChanged?.(event)
+          break
+        case "plan.item_changed":
+          handlersRef.current.onPlanChanged?.(event)
+          break
+        case "fact.recorded":
+        case "fact.conflict":
+        case "fact.arbitrated":
+          handlersRef.current.onFactChanged?.(event)
+          break
+        case "question.created":
+        case "question.answered":
+        case "question.expired":
+        case "question.reopened":
+        case "question.skipped":
+          handlersRef.current.onQuestionChanged?.(event)
+          break
+        case "handoff.updated":
+          handlersRef.current.onHandoffChanged?.(event)
+          break
+        case "version.binding.changed":
+          handlersRef.current.onBindingChanged?.(event)
+          break
+        case "extraction.started":
+        case "extraction.progress":
+        case "extraction.segment_failed":
+        case "extraction.done":
+          handlersRef.current.onExtractionChanged?.(event)
+          break
+        case "attachment.image.extracted":
+        case "attachment.image.analyzed":
+        case "attachment.image.failed":
+        case "model.vision.unavailable":
+          handlersRef.current.onAttachmentImageChanged?.(event)
           break
         case "requirement.closed":
         case "requirement.reopened":
@@ -133,6 +221,10 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "design.case_version_stale":
         case "design.case_version_superseded":
         case "design.case_confirmed":
+        case "design.review_submitted":
+        case "case.revision.auto_confirmed":
+          // W2-11 R-EX-6: an additive discovery case revision was auto-confirmed
+          // or rolled back; the design page refetches the case.
           handlersRef.current.onDesignCaseChanged?.(event)
           break
         case "design.round_started":
@@ -153,6 +245,7 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "case_run.paused":
         case "case_run.resumed":
         case "case_run.finished":
+        case "case_run.blocked":
         case "case_run.step_finished":
         case "case_run.assertion_finished":
           handlersRef.current.onCaseRunChanged?.(event)
@@ -163,6 +256,12 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "human_request.created":
         case "human_request.resolved":
         case "human_request.expired":
+          handlersRef.current.onHumanRequestChanged?.(event)
+          break
+        case "approval.requested":
+        case "approval.decided":
+          // W2-2 R-W2-1: the version-level approval/blocked_recovery/conflict
+          // request changed; the human-request banner and todo refetch.
           handlersRef.current.onHumanRequestChanged?.(event)
           break
         case "execution.intent_created":
@@ -177,6 +276,9 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "issue.reopened":
         case "issue.merged":
         case "issue.recurred":
+        case "issue.retest_started":
+        case "issue.retest_completed":
+        case "issue.retest_failed":
           handlersRef.current.onIssueChanged?.(event)
           break
         case "report.published":
@@ -185,9 +287,32 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "report.pdf_failed":
           handlersRef.current.onReportChanged?.(event)
           break
+        case "export.started":
+        case "export.completed":
+        case "export.failed":
+          // W2-7 R-W2-3: report artifact export lifecycle; the report page
+          // refetches its artifact list on the terminal state.
+          handlersRef.current.onReportChanged?.(event)
+          break
+        case "eval.started":
+        case "eval.completed":
+        case "eval.failed":
+          // W2-14 R-W2-6: snapshot evaluation lifecycle; the quality page
+          // refetches the run list and trend series on the terminal state.
+          handlersRef.current.onEvalChanged?.(event)
+          break
         case "visual.baseline_approved":
         case "visual.diff_created":
           handlersRef.current.onVisualChanged?.(event)
+          break
+        case "resource.delta":
+          // One delta pass can publish several discovered resources; the panel
+          // refetches the observation/coverage snapshot on the single event.
+          handlersRef.current.onDiscoveryChanged?.(event)
+          break
+        case "version.scope.snapshot_created":
+          // A new wave froze its effective scope; the snapshot readers refetch.
+          handlersRef.current.onScopeSnapshotChanged?.(event)
           break
         default:
           if (event.type.startsWith("requirement.")) {

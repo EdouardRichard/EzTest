@@ -85,7 +85,16 @@ type VersionReader interface {
 	VersionPack(ctx context.Context, versionID int64) (VersionPack, error)
 }
 
-// AttachmentInfo is the parsed attachment view used by the Scout run.
+// AttachmentImageTokenBudget is the R-E3-4 prompt charge of one embedded image
+// reference in the attachment task pack. It matches the version domain's
+// AttachmentImageTokenBudget and is charged once per image on top of the
+// extracted text.
+const AttachmentImageTokenBudget = 1500
+
+// AttachmentInfo is the parsed attachment view used by the ingest/vision task
+// pack. It carries the extracted text, its total character count and the
+// embedded image references with captions (R-E3-4/R-E3-5); ImageTokens is the
+// per-image prompt charge (1500 tokens each) the task pack budgets.
 type AttachmentInfo struct {
 	ID             int64
 	ConversationID int64
@@ -96,6 +105,25 @@ type AttachmentInfo struct {
 	Error          string
 	Text           string
 	TotalChars     int
+	Images         []AttachmentImageInfo
+	ImageTokens    int
+}
+
+// AttachmentImageInfo is the compact image reference/caption pair exposed to the
+// agent runtime. The bytes stay in the content ledger; SHA256 is the read
+// reference. Status/Error make a skipped/failed image visible instead of
+// silently dropping it.
+type AttachmentImageInfo struct {
+	ID         int64
+	Seq        int
+	SHA256     string
+	MIME       string
+	Width      int
+	Height     int
+	SourceKind string
+	Status     string
+	Caption    string
+	Error      string
 }
 
 // AttachmentReader loads one attachment with its extracted text for ingest runs.
@@ -138,22 +166,20 @@ type ContentWriter interface {
 // work-item kinds are accepted as well (Task 65): they are the authoritative
 // kind of a contract row, and the two stage-entry kinds additionally have a
 // deterministic runner path before this profile is resolved.
+//
+// v0.22 D-B1/R-W1-5 removed the requirement.curate, attachment.ingest,
+// design.round, design.data_plan and explore.* mappings together with their
+// profiles: those capabilities moved to the deterministic server pipeline or
+// Host tools, so an item of one of those legacy types fails closed here instead
+// of resolving a deleted profile.
 func ProfileKeyForWorkType(workType string) (string, bool) {
 	switch workType {
 	case WorkTypeChatTurn:
 		return ProfileKeyClarificationHost, true
-	case WorkTypeRequirementCurate:
-		return ProfileKeyRequirementCurator, true
-	case WorkTypeAttachmentIngest:
-		return ProfileKeyContextScout, true
-	case WorkTypeDesignRound:
-		return ProfileKeyDesignPlanner, true
 	case WorkTypeDesignRequirement, WorkTypeDesignGap, agent.WorkItemKindDesignCases:
-		return ProfileKeyCaseAuthor, true
+		return ProfileKeyDesignAuthor, true
 	case WorkTypeDesignCritic, agent.WorkItemKindReviewCases:
 		return ProfileKeyDesignCritic, true
-	case WorkTypeDesignDataPlan:
-		return ProfileKeyDataPlanner, true
 	case WorkTypeExecuteCase, agent.WorkItemKindExecuteBatch:
 		return ProfileKeyCaseExecutor, true
 	case WorkTypeAnalyzeFailure:
@@ -166,10 +192,6 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyReportWriter, true
 	case WorkTypeRequirementClose, WorkTypeVersionClose:
 		return ProfileKeyVersionSteward, true
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage,
-		agent.WorkItemKindExploreAPI, agent.WorkItemKindExploreCoverage,
-		agent.WorkItemKindExploreGap:
-		return ProfileKeyContextScout, true
 	case agent.WorkItemKindKnowledgePropose:
 		return ProfileKeyKnowledgeCurator, true
 	default:
@@ -219,7 +241,6 @@ func ProfileKeyForConversationKind(kind string) (string, bool) {
 const (
 	WorkTypeChatTurn          = "chat.turn"
 	WorkTypeRequirementCurate = "requirement.curate"
-	WorkTypeAttachmentIngest  = "attachment.ingest"
 )
 
 // P2 design work item types (contracts/task-types.md P2 increment).
@@ -259,9 +280,14 @@ const (
 // are parsed from decimal strings or JSON numbers for P0 payload
 // compatibility.
 type WorkItemPayload struct {
-	ConversationID       int64
-	MessageID            int64
-	AttachmentID         int64
+	ConversationID int64
+	MessageID      int64
+	AttachmentID   int64
+	// PlanItemID is the v0.22 task.complete target of a work item created by a
+	// plan-driven path (R-A3-4/R-A8-3). The runner falls back to the version's
+	// single in-progress plan item when the work item carries no explicit link,
+	// so a real Host run still registers task.complete.
+	PlanItemID           int64
 	RequirementID        int64
 	RequirementVersionID int64
 	CaseID               int64

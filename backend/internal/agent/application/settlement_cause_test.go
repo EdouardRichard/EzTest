@@ -16,7 +16,8 @@ import (
 // budget actually hit. Before the fix the run ended "done" with no terminal
 // reason and the case run was finalized inconclusive(incomplete) with an empty
 // last_error; the settlement prompt also always blamed "运行时间" even when the
-// token budget was the trigger.
+// turn budget was the trigger. v0.22 keeps only the turn/time causes (tokens are
+// telemetry only, R-A2-1).
 func TestRunnerSettlementCarriesConcreteCause(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -28,13 +29,6 @@ func TestRunnerSettlementCarriesConcreteCause(t *testing.T) {
 		wantPrompt  []string
 		wantNoCause []string
 	}{
-		{
-			name:       "token budget",
-			itemBudget: `{"max_tokens":100,"run_seconds":120,"max_turns_fuse":12}`,
-			firstUsage: map[string]int{"total_tokens": 120},
-			wantCause:  agentapp.BudgetCauseTokens,
-			wantPrompt: []string{"token 预算"},
-		},
 		{
 			name:       "time budget",
 			itemBudget: `{"max_tokens":100000,"run_seconds":100,"max_turns_fuse":12}`,

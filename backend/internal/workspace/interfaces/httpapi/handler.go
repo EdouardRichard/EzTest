@@ -54,13 +54,14 @@ func (h *Handler) ListTodos(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toTodoSnapshotDTO(snapshot))
 }
 
-// todoLimit parses the contract limit (1–200, default 50). Unlike the shared
-// pagination helper it rejects an out-of-range value instead of clamping it, so
-// the API returns the contract 400 invalid_argument.
+// todoLimit parses the optional contract limit (1–200, configured default).
+// Unlike the shared pagination helper it rejects an out-of-range value instead
+// of clamping it, so the API returns the contract 400 invalid_argument. An
+// absent parameter forwards zero so the service resolves todos.max_items.
 func todoLimit(r *http.Request) (int, error) {
 	raw := strings.TrimSpace(r.URL.Query().Get("limit"))
 	if raw == "" {
-		return workspaceapp.DefaultLimit, nil
+		return 0, nil
 	}
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 1 || value > workspaceapp.MaxLimit {

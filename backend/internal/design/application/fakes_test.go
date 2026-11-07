@@ -150,6 +150,19 @@ func (f *fakeRepo) ReadCaseVersionsByIDs(_ context.Context, versionID int64, cas
 	for _, summary := range f.caseVersionSummaries {
 		if _, ok := wanted[summary.ID]; ok {
 			summaries = append(summaries, summary)
+			delete(wanted, summary.ID)
+		}
+	}
+	for _, item := range f.cases {
+		for _, version := range item.versions {
+			if _, ok := wanted[version.ID]; !ok {
+				continue
+			}
+			summaries = append(summaries, design.CaseVersionSummary{
+				ID: version.ID, CaseID: version.CaseID, Revision: version.Revision,
+				Status: version.Status, Title: version.Title, CreatedAt: version.CreatedAt,
+			})
+			delete(wanted, version.ID)
 		}
 	}
 	return summaries, nil
@@ -276,6 +289,14 @@ func (f *fakeRepo) ReadCase(_ context.Context, versionID, caseID int64, caseVers
 		Scenario:    scenario,
 		Requirement: f.requirement,
 	}
+	if caseVersionID != nil {
+		for _, version := range item.versions {
+			if version.ID == *caseVersionID {
+				data.Selected = version
+				return data, nil
+			}
+		}
+	}
 	if item.current != nil {
 		data.Selected = *item.current
 	}
@@ -376,14 +397,13 @@ func (t *fakeTx) InsertCaseVersion(_ context.Context, version design.CaseVersion
 	if version.Status == "" {
 		version.Status = design.CaseStatusDraft
 	}
-	stored := version
 	item, ok := t.repo.cases[version.CaseID]
 	if !ok {
 		return design.CaseVersion{}, design.ErrNotFound
 	}
-	item.current = &stored
-	item.versions = append(item.versions, stored)
-	return stored, nil
+	item.versions = append(item.versions, version)
+	item.current = &item.versions[len(item.versions)-1]
+	return *item.current, nil
 }
 
 func (t *fakeTx) SetCurrentVersion(_ context.Context, caseID, caseVersionID int64, status string, at time.Time) error {

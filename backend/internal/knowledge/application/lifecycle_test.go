@@ -402,13 +402,24 @@ func TestRouteChangeMarksStale(t *testing.T) {
 			VersionID:     42,
 			SUTID:         1001,
 			EnvironmentID: 1101,
-			Scope:         version.NewScope([]int64{1301, 1302}, nil),
-			Accounts:      []version.AccountBinding{{AccountID: 5001, Role: " admin "}},
+			ScopeExclude:  version.NewScopeExclude(nil, nil, nil),
+			Accounts:      []version.AccountBinding{{AccountID: 5001}},
 		}}
-		catalog := versionKeysCatalog{pages: map[int64]resourceapp.PageView{
-			1301: {ID: "1301", RouteTemplate: " /login "},
-			1302: {ID: "1302", RouteTemplate: ""},
-		}}
+		catalog := versionKeysCatalog{
+			pages: map[int64]resourceapp.PageView{
+				1301: {ID: "1301", RouteTemplate: " /login "},
+				1302: {ID: "1302", RouteTemplate: ""},
+			},
+			accounts: map[int64]resourceapp.AccountView{
+				5001: {ID: "5001", Username: "admin", Roles: []string{" admin "}, Status: "active"},
+			},
+			environments: map[int64]resourceapp.EnvironmentView{
+				1101: {ID: "1101", SUTID: "1001", Pages: []resourceapp.PageView{
+					{ID: "1301", RouteTemplate: " /login ", Status: "approved"},
+					{ID: "1302", RouteTemplate: "", Status: "approved"},
+				}},
+			},
+		}
 		service := versionapp.New(versionKeysRepo{bindings: bindings}, catalog, nil, nil, nil, nil, nil)
 		keys, err := service.KnowledgeBindingKeys(context.Background(), 42)
 		if err != nil {
@@ -582,7 +593,17 @@ func (r versionKeysRepo) Get(_ context.Context, id int64) (version.Version, []ve
 
 type versionKeysCatalog struct {
 	resourceapp.CatalogReader
-	pages map[int64]resourceapp.PageView
+	pages        map[int64]resourceapp.PageView
+	accounts     map[int64]resourceapp.AccountView
+	environments map[int64]resourceapp.EnvironmentView
+}
+
+func (c versionKeysCatalog) GetEnvironment(_ context.Context, id int64) (resourceapp.EnvironmentView, error) {
+	environment, ok := c.environments[id]
+	if !ok {
+		return resourceapp.EnvironmentView{}, platform.NotFound("environment")
+	}
+	return environment, nil
 }
 
 func (c versionKeysCatalog) GetPage(_ context.Context, id int64) (resourceapp.PageView, error) {
@@ -591,6 +612,14 @@ func (c versionKeysCatalog) GetPage(_ context.Context, id int64) (resourceapp.Pa
 		return resourceapp.PageView{}, platform.NotFound("page")
 	}
 	return page, nil
+}
+
+func (c versionKeysCatalog) GetAccount(_ context.Context, id int64) (resourceapp.AccountView, error) {
+	account, ok := c.accounts[id]
+	if !ok {
+		return resourceapp.AccountView{}, platform.NotFound("account")
+	}
+	return account, nil
 }
 
 /* ------------------------------- HTTP secrets ----------------------------- */

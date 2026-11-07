@@ -429,11 +429,6 @@ func (s *ReportService) RequirePublished(ctx context.Context, reportID int64, re
 // revision is an error so the work item is retried.
 type ReportFinalizer struct{ svc *ReportService }
 
-// NewReportFinalizer wraps a report service as the runner finalizer.
-func NewReportFinalizer(svc *ReportService) *ReportFinalizer {
-	return &ReportFinalizer{svc: svc}
-}
-
 // Finalize requires the current revision to be published.
 func (f *ReportFinalizer) Finalize(ctx context.Context, reportID int64, revision int32) error {
 	if f == nil || f.svc == nil {

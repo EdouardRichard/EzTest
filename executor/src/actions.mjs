@@ -29,6 +29,8 @@ import { runVisualCompare } from "./visual.mjs"
 const WAIT_STATES = new Set(["attached", "detached", "visible", "hidden"])
 const MOUSE_BUTTONS = new Set(["left", "right", "middle"])
 const WAIT_UNTIL = new Set(["load", "domcontentloaded", "networkidle", "commit"])
+const MAX_UPLOAD_FILES = 5
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 function requireString(value, name, { allowEmpty = false } = {}) {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
@@ -133,8 +135,28 @@ async function resolveOne(page, spec, timeoutMs) {
   return single
 }
 
-function clampTail(value, fallback = 50, max = 200) {
-  const numeric = Number(value)
+// resolveAttached mirrors resolveOne but only requires the element to exist in
+// the DOM. File inputs are commonly hidden (display:none) and native upload
+// buttons live behind a click, so an upload target must not wait for
+// visibility.
+async function resolveAttached(page, spec, timeoutMs) {
+  const locator = buildLocator(page, spec)
+  const count = await locator.count()
+  if (count === 0) {
+    throw new ExecutorError("target_not_found", `no element matched ${describeTarget(spec)}`)
+  }
+  if (count > 1) {
+    throw new ExecutorError(
+      "target_ambiguous",
+      `${count} elements matched ${describeTarget(spec)}; refine the target`,
+    )
+  }
+  const single = locator.first()
+  await single.waitFor({ state: "attached", timeout: timeoutMs })
+  return single
+}
+
+function clampTail(value, fallback = 50, max = 200) {  const numeric = Number(value)
   if (!Number.isFinite(numeric) || numeric <= 0) {
     return fallback
   }
@@ -336,6 +358,69 @@ const HANDLERS = {
     await locator.click({ timeout: timeoutMs })
     await locator.fill(value, { timeout: timeoutMs })
     return { result: { ok: true, secret } }
+  },
+
+  // upload_file injects local test files into a file input. The model never
+  // sees the filesystem: callers pass base64 content only, so a case cannot
+  // read arbitrary host files through the executor.
+  async upload_file(entry, args, timeoutMs) {
+    if (!Array.isArray(args.files) || args.files.length === 0 || args.files.length > MAX_UPLOAD_FILES) {
+      throw invalidArguments(`files must be an array of 1..${MAX_UPLOAD_FILES} entries`)
+    }
+    let total = 0
+    const files = args.files.map((file) => {
+      if (file === null || typeof file !== "object" || Array.isArray(file)) {
+        throw invalidArguments("files[] entries must be objects")
+      }
+      const name = requireString(file.name, "files[].name")
+      if (name !== path.basename(name) || name.includes("/") || name.includes("\\")) {
+        throw invalidArguments("files[].name must be a plain file name")
+      }
+      const mime = requireString(file.mime, "files[].mime")
+      const base64 = requireString(file.base64, "files[].base64")
+      const buffer = Buffer.from(base64, "base64")
+      if (buffer.length === 0) {
+        throw invalidArguments("files[].base64 must decode to a non-empty payload")
+      }
+      total += buffer.length
+      if (total > MAX_UPLOAD_BYTES) {
+        throw invalidArguments(`upload exceeds ${MAX_UPLOAD_BYTES} bytes`)
+      }
+      return { name, mimeType: mime, buffer }
+    })
+    const locator = await resolveAttached(entry.page, parseTarget(args.target), timeoutMs)
+    const isFileInput = await locator
+      .evaluate((element) => element instanceof HTMLInputElement && element.type === "file")
+      .catch(() => false)
+    const summary = { files: files.map((file) => file.name), bytes: total }
+    if (isFileInput) {
+      await locator.setInputFiles(files, { timeout: timeoutMs })
+      return { result: { ok: true, ...summary } }
+    }
+    // The case usually points at the upload button, which opens the native file
+    // chooser. Playwright intercepts it; attach the files there instead of
+    // requiring a visible input.
+    const [chooser] = await Promise.all([
+      entry.page.waitForEvent("filechooser", { timeout: timeoutMs }),
+      locator.click({ timeout: timeoutMs }),
+    ])
+    await chooser.setFiles(files)
+    return { result: { ok: true, viaChooser: true, ...summary } }
+  },
+
+  // set_viewport lets a case exercise responsive/mobile acceptance criteria on
+  // the live page without recreating the browser context.
+  async set_viewport(entry, args) {
+    const width = Number(args.width)
+    const height = Number(args.height)
+    if (!Number.isInteger(width) || width < 320 || width > 3840) {
+      throw invalidArguments("width must be an integer between 320 and 3840")
+    }
+    if (!Number.isInteger(height) || height < 200 || height > 2160) {
+      throw invalidArguments("height must be an integer between 200 and 2160")
+    }
+    await entry.page.setViewportSize({ width, height })
+    return { result: { ok: true, pageViewport: entry.page.viewportSize() } }
   },
 
   async press(entry, args, timeoutMs) {

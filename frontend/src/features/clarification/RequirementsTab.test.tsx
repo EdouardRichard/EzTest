@@ -19,6 +19,11 @@ const api = vi.hoisted(() => ({
   confirmStageRequirements: vi.fn(),
   rollbackRequirement: vi.fn(),
   listRequirementRelations: vi.fn(),
+  getRequirementExtraction: vi.fn(),
+  startRequirementExtraction: vi.fn(),
+  pauseRequirementExtraction: vi.fn(),
+  resumeRequirementExtraction: vi.fn(),
+  retryRequirementExtraction: vi.fn(),
   getTeamRoom: vi.fn(),
   uploadContent: vi.fn(),
 }))
@@ -129,6 +134,7 @@ describe("RequirementsTab shell", () => {
     api.listConversations.mockResolvedValue([])
     api.listRequirements.mockResolvedValue([])
     api.listMessages.mockResolvedValue([])
+    api.getRequirementExtraction.mockResolvedValue(null)
     versionsApi.getVersion.mockResolvedValue({ id: "2001", bindings: [] })
   })
 

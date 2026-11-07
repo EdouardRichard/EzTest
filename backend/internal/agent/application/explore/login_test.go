@@ -509,7 +509,7 @@ func TestLoginFlowDetectAndExecute(t *testing.T) {
 	if fact.Kind != exploreapp.KindLoginSession {
 		t.Fatalf("fact kind = %q, want %q", fact.Kind, exploreapp.KindLoginSession)
 	}
-	if fact.VersionID != 10 || fact.Source != "explorer" {
+	if fact.VersionID != 10 || fact.Source != "p9" {
 		t.Fatalf("fact identity = %+v", fact)
 	}
 	if fact.Payload["storage_state_ref"] != "ss_abc123" {

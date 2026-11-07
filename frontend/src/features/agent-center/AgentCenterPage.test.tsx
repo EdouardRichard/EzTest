@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -29,20 +29,21 @@ import type { AgentCatalog, AgentCenterQuality, AgentRunView, ProfileView } from
 
 function catalogFixture(): AgentCatalog {
   const teams: AgentCatalog["teams"] = [
-    { team: "clarification", label: "澄清", profile_keys: [] },
-    { team: "design", label: "设计", profile_keys: [] },
-    { team: "execution", label: "执行", profile_keys: [] },
-    { team: "delivery", label: "交付", profile_keys: [] },
-    { team: "steward", label: "版本管家", profile_keys: [] },
-    { team: "code", label: "代码", profile_keys: [], note: "确定性 worker，无 agent profile" },
+    { team: "conversation", label: "对话 Host 与后台作业", profile_keys: [] },
+    { team: "execution", label: "执行 / 分析", profile_keys: [] },
   ]
   const profiles: AgentCatalog["profiles"] = []
   const keysByTeam: Record<string, string[]> = {
-    clarification: ["clarification_host", "requirement_curator", "context_scout"],
-    design: ["design_host", "design_planner", "case_author", "design_critic", "data_planner"],
-    execution: ["case_executor", "failure_analyst", "coverage_analyst"],
-    delivery: ["issue_triager", "report_writer"],
-    steward: ["version_steward"],
+    conversation: ["clarification_host", "design_host", "design_author", "design_critic"],
+    execution: [
+      "case_executor",
+      "failure_analyst",
+      "coverage_analyst",
+      "issue_triager",
+      "report_writer",
+      "version_steward",
+      "knowledge_curator",
+    ],
   }
   let order = 0
   for (const team of teams) {
@@ -152,21 +153,56 @@ describe("AgentCenterPage", () => {
 
   afterEach(cleanup)
 
-  it("renders the read-only catalog grouped by team for a normal user", async () => {
+  it("renders the 2-Host conversation team and the execution area for a normal user", async () => {
     render(<AgentCenterPage />)
 
     expect(await screen.findByTestId("agent-center-catalog")).toBeInTheDocument()
     expect(agentCenterApi.getAgentCatalog).toHaveBeenCalledTimes(1)
-    expect(screen.getByTestId("agent-center-team-clarification")).toHaveTextContent("澄清")
-    expect(screen.getByTestId("agent-center-team-design")).toHaveTextContent("设计")
-    expect(screen.getByTestId("agent-center-team-execution")).toHaveTextContent("执行")
-    expect(screen.getByTestId("agent-center-team-delivery")).toHaveTextContent("交付")
-    expect(screen.getByTestId("agent-center-team-steward")).toHaveTextContent("版本管家")
-    expect(screen.getByTestId("agent-center-team-code")).toHaveTextContent("确定性 worker")
-    expect(screen.getAllByTestId(/agent-center-profile-/)).toHaveLength(14)
-    expect(screen.getByTestId("agent-center-profile-clarification_host")).toHaveTextContent(
-      "Profile clarification_host",
-    )
+
+    const conversation = screen.getByTestId("agent-center-team-conversation")
+    const execution = screen.getByTestId("agent-center-team-execution")
+    expect(conversation).toHaveTextContent("对话 Host 与后台作业")
+    expect(execution).toHaveTextContent("执行 / 分析")
+    expect(screen.getAllByTestId(/agent-center-profile-/)).toHaveLength(11)
+
+    // Two Hosts only; the design author/critic are background jobs, not Hosts.
+    for (const key of ["clarification_host", "design_host"]) {
+      const row = within(conversation).getByTestId(`agent-center-profile-${key}`)
+      expect(row).toHaveTextContent(`Profile ${key}`)
+      expect(row).toHaveTextContent("对话 Host")
+    }
+    for (const key of ["design_author", "design_critic"]) {
+      const job = within(conversation).getByTestId(`agent-center-profile-${key}`)
+      expect(job).toHaveTextContent("后台作业")
+      expect(job).toHaveTextContent("无对话入口")
+      expect(within(job).queryByRole("button", { name: /对话/ })).not.toBeInTheDocument()
+      expect(within(job).queryByRole("link", { name: /对话/ })).not.toBeInTheDocument()
+    }
+
+    // Execution/analysis runs are listed as profiles, not as conversation Agents.
+    for (const key of [
+      "case_executor",
+      "failure_analyst",
+      "coverage_analyst",
+      "issue_triager",
+      "report_writer",
+      "version_steward",
+      "knowledge_curator",
+    ]) {
+      expect(within(execution).getByTestId(`agent-center-profile-${key}`)).toBeInTheDocument()
+    }
+    expect(within(execution).queryByText("对话 Host")).not.toBeInTheDocument()
+
+    // Removed Scout/Curator/Planner/case_author profiles never surface.
+    expect(
+      screen.queryByText(/context_scout|requirement_curator|design_planner|data_planner|case_author/),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText(/explorer/)).not.toBeInTheDocument()
+
+    // UI copy no longer calls background jobs "Agent" or advertises 14 profiles.
+    expect(screen.getByText(/2 个对话 Host/)).toBeInTheDocument()
+    expect(screen.queryByText(/14 个固定 Agent profile/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/暂无 Agent profile/)).not.toBeInTheDocument()
 
     // Normal users never see prompt bodies or admin-only tabs/buttons.
     expect(screen.queryByText(/secret prompt/)).not.toBeInTheDocument()
@@ -248,7 +284,7 @@ describe("AgentCenterPage", () => {
     agentCenterApi.listAgentRuns.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     render(<AgentCenterPage initialTab="runs" />)
     expect(await screen.findByTestId("agent-center-runs-empty")).toHaveTextContent(
-      "尚无 Agent 运行记录",
+      "尚无运行记录",
     )
   })
 })

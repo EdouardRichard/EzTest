@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError } from "@/lib/api-client"
-
+import type { QuestionBatch } from "./api"
 import {
+  answerQuestion,
   confirmRequirement,
   confirmRequirements,
   createConversation,
@@ -11,15 +12,22 @@ import {
   deleteRequirement,
   getConversation,
   getRequirement,
+  getRequirementExtraction,
   getTeamRoom,
   listConversations,
   listMessages,
+  listQuestions,
   listRequirementRelations,
   listRequirements,
   mergeRequirements,
+  pauseRequirementExtraction,
   postMessage,
   reopenRequirement,
+  resumeRequirementExtraction,
+  retryRequirementExtraction,
   rollbackRequirement,
+  skipQuestion,
+  startRequirementExtraction,
   updateRequirement,
   uploadContent,
 } from "./api"
@@ -56,6 +64,39 @@ function readHeaders(init: RequestInit | undefined): Headers {
 function readBody(init: RequestInit | undefined): unknown {
   if (typeof init?.body !== "string") return undefined
   return JSON.parse(init.body) as unknown
+}
+
+function questionFixture(overrides: Partial<QuestionBatch> = {}): QuestionBatch {
+  return {
+    id: "101",
+    version_id: "2001",
+    conversation_id: "4001",
+    message_id: "5001",
+    kind: "clarification_question",
+    status: "pending",
+    batch_id: "qb-1",
+    questions: [
+      {
+        id: "q1",
+        text: "退款到账时间按 T+1 还是 T+3 验收？",
+        options: [
+          { id: "a", label: "T+1" },
+          { id: "b", label: "T+3" },
+        ],
+        multiple: false,
+        allow_free_text: true,
+        required: true,
+        source_refs: ["requirement:FR-012"],
+      },
+    ],
+    expires_at: "2099-01-01T00:00:00Z",
+    answers: [],
+    answered_by: null,
+    answered_at: null,
+    skipped: false,
+    created_at: "2026-11-05T06:00:00Z",
+    ...overrides,
+  }
 }
 
 const fetchMock = vi.fn<typeof fetch>()
@@ -145,6 +186,55 @@ describe("clarification api", () => {
       client_message_id: "client_1",
       parts: [{ type: "text", text: "退款 T+1 到账" }],
     })
+  })
+
+  it("lists structured questions with the status filter and paging envelope", async () => {
+    const question = questionFixture()
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: [question], next_cursor: "101", has_more: true }),
+    )
+
+    await expect(listQuestions("2001", { status: "pending", limit: 50 })).resolves.toEqual([
+      question,
+    ])
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/questions?status=pending&limit=50",
+    )
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("GET")
+  })
+
+  it("answers one question batch with the structured answers payload", async () => {
+    const answered = questionFixture({
+      status: "answered",
+      answers: [{ question_id: "q1", selected: ["a"], text: "T+1 更稳妥" }],
+    })
+    fetchMock.mockResolvedValue(jsonResponse({ data: answered }))
+
+    await expect(
+      answerQuestion("2001", "101", [{ question_id: "q1", selected: ["a"], text: "T+1 更稳妥" }]),
+    ).resolves.toEqual(answered)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/questions/101/answer")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({
+      answers: [{ question_id: "q1", selected: ["a"], text: "T+1 更稳妥" }],
+    })
+  })
+
+  it("skips one question batch with an empty or reasoned body", async () => {
+    const skipped = questionFixture({ status: "cancelled", skipped: true })
+    fetchMock.mockResolvedValue(jsonResponse({ data: skipped }))
+
+    await expect(skipQuestion("2001", "101")).resolves.toEqual(skipped)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/questions/101/skip")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({})
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: skipped }))
+    await skipQuestion("2001", "101", "重复提问")
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({ reason: "重复提问" })
   })
 
   it("lists requirements with an optional status filter", async () => {
@@ -429,4 +519,86 @@ describe("clarification api", () => {
       apis: [],
     })
   })
+
+  it("reads the latest extraction run and maps its typed 404 to the empty state", async () => {
+    const progress = extractionProgressFixture()
+    fetchMock.mockResolvedValue(jsonResponse({ data: progress }))
+
+    await expect(getRequirementExtraction("2001")).resolves.toEqual(progress)
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions",
+    )
+
+    fetchMock.mockResolvedValueOnce(errorResponse(404, "not_found", "no extraction run"))
+    await expect(getRequirementExtraction("2001")).resolves.toBeNull()
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await getRequirementExtraction("2001", { attachmentId: "8001" })
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions?attachment_id=8001",
+    )
+  })
+
+  it("starts, pauses, resumes and retries extraction with the pinned bodies", async () => {
+    const progress = extractionProgressFixture()
+    fetchMock.mockResolvedValue(jsonResponse({ data: { runs: [progress] } }))
+    await startRequirementExtraction("2001")
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions",
+    )
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("POST")
+    expect(readBody(fetchMock.mock.calls[0][1])).toEqual({})
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: { runs: [progress] } }))
+    await startRequirementExtraction("2001", "8001")
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({ attachment_id: "8001" })
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await pauseRequirementExtraction("2001", "9001")
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions/9001/pause",
+    )
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await resumeRequirementExtraction("2001", "9001")
+    expect(fetchMock.mock.calls[3][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions/9001/resume",
+    )
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await retryRequirementExtraction("2001", "9001")
+    expect(fetchMock.mock.calls[4][0]).toBe(
+      "http://localhost:13333/api/versions/2001/requirements/extractions/9001/retry",
+    )
+    expect(fetchMock.mock.calls[4][1]?.body).toBeUndefined()
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
+    await retryRequirementExtraction("2001", "9001", 2)
+    expect(readBody(fetchMock.mock.calls[5][1])).toEqual({ segment_seq: 2 })
+  })
 })
+
+function extractionProgressFixture() {
+  return {
+    id: "9001",
+    version_id: "2001",
+    attachment_id: "8001",
+    input_sha256: "a".repeat(64),
+    status: "done" as const,
+    total_segments: 2,
+    done_segments: 2,
+    failed_segments: 0,
+    expected: 58,
+    extracted: 58,
+    missing: 0,
+    missing_ids: [],
+    low_confidence: 2,
+    skipped_images: 1,
+    planned_count: 32,
+    planned_ids: ["FR-059"],
+    coverage: 1,
+    created_at: "2026-11-05T06:00:00Z",
+    updated_at: "2026-11-05T06:10:00Z",
+    segments: [],
+  }
+}

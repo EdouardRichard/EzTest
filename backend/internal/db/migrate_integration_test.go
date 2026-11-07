@@ -10,6 +10,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
@@ -20,8 +21,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -38,13 +39,19 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"schema_migrations", "sut", "sut_api", "sut_environment", "sut_page",
 		"system_setting", "system_setting_revision", "target_database", "test_account",
 		"version", "version_sut", "version_sut_resource",
+		"sut_repository", "version_repository_override", "version_account",
+		"clarification_handoff",
 		"work_item", "work_item_attempt", "team_room_post", "team_room_digest",
 		"agent_profile", "agent_run", "agent_message", "context_packet",
+		"agent_activity",
 		"requirement", "requirement_version", "requirement_confirmation", "requirement_relation",
+		"requirement_extraction_run", "requirement_extraction_segment",
 		"conversation", "conversation_message", "conversation_summary", "requirement_attachment",
+		"attachment_image",
 		"case_scenario", "case_entity", "case_version", "case_step", "case_assertion",
 		"case_source", "case_confirmation", "design_round", "design_scope", "export_artifact",
 		"execution_intent", "run_wave", "case_run", "case_run_sut_context",
+		"execution_discovery_observation",
 		"step_result", "assertion_result", "evidence", "evidence_ref",
 		"executor_instance", "human_request",
 		"delivery_issue", "delivery_issue_ref", "delivery_issue_status_history",
@@ -176,8 +183,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -317,8 +324,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -370,6 +377,7 @@ func TestP4DeliverySchema(t *testing.T) {
 		"uk_delivery_report_revision_report_id_revision",
 		"uk_delivery_report_ref_report_revision_id_kind_ref_id",
 		"uk_requirement_closure_requirement_id_close_round",
+		"ck_delivery_issue_source",
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT c.conname
@@ -636,6 +644,7 @@ func TestP6QualityPromptSchema(t *testing.T) {
 
 	indexes := []string{
 		"idx_eval_run_created_at", "idx_eval_metric_run",
+		"idx_eval_run_version_created",
 		"idx_agent_profile_prompt_revision_key",
 	}
 	rows, err = pool.Query(ctx, `
@@ -660,6 +669,23 @@ func TestP6QualityPromptSchema(t *testing.T) {
 		if !foundIndexes[name] {
 			t.Errorf("missing P6 index %s", name)
 		}
+	}
+
+	// v0.22 W2-14: eval_run.version_id is nullable BIGINT and the widened mode
+	// CHECK accepts the server-derived `snapshot` track.
+	var versionColumn string
+	if err := pool.QueryRow(ctx, `
+		SELECT data_type FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'eval_run' AND column_name = 'version_id'
+	`).Scan(&versionColumn); err != nil {
+		t.Fatalf("eval_run.version_id column: %v", err)
+	}
+	if versionColumn != "bigint" {
+		t.Errorf("eval_run.version_id type = %q, want bigint", versionColumn)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO eval_run (id, mode, corpus_version, status) VALUES (214001, 'snapshot', 'snapshot:test', 'passed')`); err != nil {
+		t.Errorf("mode=snapshot rejected by the widened CHECK: %v", err)
 	}
 }
 
@@ -688,7 +714,7 @@ func TestP7P9Schema(t *testing.T) {
 	}
 
 	// Column extensions on pre-existing tables: report PDF metadata, issue
-	// recurrence counters and the optional SUT family.
+	// recurrence counters, the v0.22 retest model and the optional SUT family.
 	columns := []struct {
 		table      string
 		column     string
@@ -702,6 +728,9 @@ func TestP7P9Schema(t *testing.T) {
 		{"delivery_report_revision", "pdf_rendered_at", "timestamp with time zone", "YES", ""},
 		{"delivery_issue", "recurrence_count", "integer", "NO", "0"},
 		{"delivery_issue", "last_recurred_at", "timestamp with time zone", "YES", ""},
+		{"delivery_issue", "retest_status", "text", "NO", "'not_retested'::text"},
+		{"delivery_issue", "last_retest_wave_id", "bigint", "YES", ""},
+		{"delivery_issue", "last_retest_case_run_id", "bigint", "YES", ""},
 		{"sut", "family", "text", "YES", ""},
 	}
 	for _, column := range columns {
@@ -1064,8 +1093,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 51 {
-		t.Fatalf("applied %d migrations, want 51: %v", len(applied), applied)
+	if len(applied) != 64 {
+		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
 	}
 
 	columns := []struct {
@@ -1122,5 +1151,793 @@ func TestP8HardeningSchema(t *testing.T) {
 	}
 	if requests != 0 || work != 0 {
 		t.Fatalf("api_instance inflight defaults = %d/%d, want 0/0", requests, work)
+	}
+}
+
+// TestV022ABSchema pins the A/B core schema of v0.22: model parameter
+// provenance, the single-writer conversation lease, message kinds, summary
+// watermarks, run telemetry, the per-run activity trace and requirement
+// extraction run/segment bookkeeping.
+// See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-1..DB-9,
+// docs/version-V0.22/B-clarification-messaging.md §5.1 and
+// docs/version-V0.22/A-model-token-budget.md §4.2, §5.2, §6.4, §7.3.
+func TestV022ABSchema(t *testing.T) {
+	pool := integrationDB(t)
+
+	for _, table := range []string{
+		"agent_activity",
+		"requirement_extraction_run",
+		"requirement_extraction_segment",
+	} {
+		requireTable(t, pool, table)
+	}
+
+	for _, c := range []struct{ table, column string }{
+		// DB-1: catalog/manual provenance per model parameter.
+		{"llm_model", "window_source"},
+		{"llm_model", "output_source"},
+		// DB-2: single active turn and its lease.
+		{"conversation", "active_turn_id"},
+		{"conversation", "active_agent"},
+		{"conversation", "lease_until"},
+		// DB-3: message author and kind.
+		{"conversation_message", "author_agent"},
+		{"conversation_message", "kind"},
+		// DB-4: compaction watermark and metadata.
+		{"conversation_summary", "covered_message_id"},
+		{"conversation_summary", "compaction_id"},
+		{"conversation_summary", "summary_meta"},
+		// DB-5: run telemetry (model/config_id exist since 0.2.1).
+		{"agent_run", "cached_tokens"},
+		{"agent_run", "duration_ms"},
+		// DB-6: run activity trace.
+		{"agent_activity", "id"},
+		{"agent_activity", "run_id"},
+		{"agent_activity", "type"},
+		{"agent_activity", "title"},
+		{"agent_activity", "started_at"},
+		{"agent_activity", "ended_at"},
+		{"agent_activity", "payload"},
+		{"agent_activity", "error"},
+		// DB-7: requirement extraction runs.
+		{"requirement_extraction_run", "version_id"},
+		{"requirement_extraction_run", "attachment_id"},
+		{"requirement_extraction_run", "input_sha256"},
+		{"requirement_extraction_run", "status"},
+		{"requirement_extraction_run", "total_segments"},
+		{"requirement_extraction_run", "done_segments"},
+		{"requirement_extraction_run", "failed_segments"},
+		{"requirement_extraction_run", "expected_count"},
+		{"requirement_extraction_run", "extracted_count"},
+		{"requirement_extraction_run", "error"},
+		// R-A7-8 / Lead ruling C12 (version_0013): the full reconciliation
+		// report object persisted for the progress API (58/58 current plus the
+		// separate V2 planned partition).
+		{"requirement_extraction_run", "report"},
+		// DB-8: extraction segments / cursor.
+		{"requirement_extraction_segment", "run_id"},
+		{"requirement_extraction_segment", "seq"},
+		{"requirement_extraction_segment", "heading_path"},
+		{"requirement_extraction_segment", "char_start"},
+		{"requirement_extraction_segment", "char_end"},
+		{"requirement_extraction_segment", "text_sha256"},
+		{"requirement_extraction_segment", "status"},
+		{"requirement_extraction_segment", "attempts"},
+		{"requirement_extraction_segment", "extracted_count"},
+		{"requirement_extraction_segment", "renewed_at"},
+		// DB-9: requirement source and reconciliation.
+		{"requirement", "extraction_run_id"},
+		{"requirement", "source_quote"},
+		{"requirement", "external_id"},
+		{"requirement", "confidence"},
+		// DB-20 / R-A8-2: optimistic-lock revision of the plan write path
+		// (Lead-approved additive column, version_0012).
+		{"version_plan_item", "revision"},
+		// Task 20 follow-up (version_0014): pre-registered message attachments
+		// carry their owning conversation, so an unbound draft stays scoped to
+		// that conversation and never leaks into another conversation of the
+		// same version. NULL stays valid for requirement-scoped and legacy rows.
+		{"requirement_attachment", "conversation_id"},
+	} {
+		requireColumn(t, pool, c.table, c.column)
+	}
+
+	// The plan revision backs the R-A8-2 optimistic lock: every stored row has
+	// one, and rows written without a revision (the pre-v0.22 write path)
+	// start at 1.
+	requireColumnNotNull(t, pool, "version_plan_item", "revision")
+	requireColumnDefault(t, pool, "version_plan_item", "revision", "1")
+
+	// R-A7-8 / Lead ruling C12: report is a NOT NULL JSON object with an empty
+	// object default, so pre-v0.22 rows and a run that never reconciled read
+	// back as "no report yet" instead of NULL.
+	requireColumnNotNull(t, pool, "requirement_extraction_run", "report")
+	requireColumnDefault(t, pool, "requirement_extraction_run", "report", "'{}'::jsonb")
+	var reportCheck string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conname = 'chk_requirement_extraction_run_report'
+		  AND contype = 'c'
+		  AND connamespace = current_schema()::regnamespace
+	`).Scan(&reportCheck); err != nil {
+		t.Errorf("read chk_requirement_extraction_run_report: %v", err)
+	} else if !strings.Contains(reportCheck, "jsonb_typeof(report) = 'object'") {
+		t.Errorf("requirement_extraction_run.report CHECK is not an object check: %s", reportCheck)
+	}
+
+	// D34 / Agent.md §6.9.5: the three new tables name their primary-key
+	// constraints pk_<table> instead of PostgreSQL's implicit <table>_pkey.
+	for _, constraint := range []string{
+		"pk_agent_activity",
+		"pk_requirement_extraction_run",
+		"pk_requirement_extraction_segment",
+	} {
+		requirePKConstraint(t, pool, constraint)
+	}
+
+	requireIndex(t, pool, "uk_conversation_active_turn")
+	// Task 20 follow-up: the unbound-draft lookup by conversation before the
+	// message binding exists.
+	requireIndex(t, pool, "idx_requirement_attachment_conversation")
+
+	// The one-active-turn invariant is a partial UNIQUE index on
+	// conversation(id): rows with a NULL active_turn_id stay outside it.
+	var (
+		table      string
+		column     string
+		definition string
+	)
+	if err := pool.QueryRow(context.Background(), `
+		SELECT
+			t.relname,
+			pg_get_indexdef(i.indexrelid, 1, true),
+			pg_get_indexdef(i.indexrelid)
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_class t ON t.oid = i.indrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = current_schema() AND c.relname = 'uk_conversation_active_turn'
+	`).Scan(&table, &column, &definition); err != nil {
+		t.Fatalf("read uk_conversation_active_turn: %v", err)
+	}
+	if table != "conversation" {
+		t.Errorf("uk_conversation_active_turn is on table %s, want conversation", table)
+	}
+	if column != "id" {
+		t.Errorf("uk_conversation_active_turn covers %s, want id", column)
+	}
+	if !strings.Contains(definition, "UNIQUE INDEX") {
+		t.Errorf("uk_conversation_active_turn is not unique: %s", definition)
+	}
+	if !strings.Contains(definition, "WHERE (active_turn_id IS NOT NULL)") {
+		t.Errorf("uk_conversation_active_turn is not partial: %s", definition)
+	}
+}
+
+// TestV022CSchema pins the C-domain v0.22 schema: version description/goal, the
+// version_sut single-repository column removal and exclusion-document rename,
+// the SUT/version repository bindings, the global test-account pool with
+// per-version enablement, and the clarification handoff artifact.
+// See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-10..DB-15,
+// DB-22 and docs/version-V0.22/C-version-sut-resources.md §3.
+func TestV022CSchema(t *testing.T) {
+	pool := integrationDB(t)
+
+	// DB-10: version information and the blocked exit. version.blocker already
+	// exists as TEXT and stays unchanged (lead ruling C6); only presence is
+	// pinned here. DB-11: scope is renamed in place to scope_exclude.
+	for _, c := range []struct{ table, column string }{
+		{"version", "description"},
+		{"version", "goal"},
+		{"version", "blocker"},
+		{"version_sut", "scope_exclude"},
+	} {
+		requireColumn(t, pool, c.table, c.column)
+	}
+	// DB-11: the single-repository column moves to sut_repository.
+	requireNoColumn(t, pool, "version_sut", "code_repo_id")
+
+	for _, table := range []string{
+		"sut_repository",
+		"version_repository_override",
+		"version_account",
+		"clarification_handoff",
+	} {
+		requireTable(t, pool, table)
+	}
+
+	// DB-22 / Agent.md §6.9.4 (audit fields): the handoff is generated and then
+	// refreshed in place, so like the other mutable v0.22 tables it carries both
+	// created_at and updated_at.
+	requireColumn(t, pool, "clarification_handoff", "updated_at")
+
+	// D34 / Agent.md §6.9.5: the new tables name their primary-key constraints
+	// pk_<table> instead of PostgreSQL's implicit <table>_pkey.
+	for _, constraint := range []string{
+		"pk_sut_repository",
+		"pk_version_repository_override",
+		"pk_version_account",
+		"pk_clarification_handoff",
+	} {
+		requirePKConstraint(t, pool, constraint)
+	}
+
+	// DB-12..DB-14, DB-22 natural keys plus the lookup indexes on the logical
+	// repo/account references.
+	for _, index := range []string{
+		"uk_sut_repository_sut_repo",
+		"uk_version_repository_override_version_repo",
+		"uk_version_account_version_account",
+		"uk_clarification_handoff_version_revision",
+		"idx_sut_repository_repo",
+		"idx_version_account_account",
+	} {
+		requireIndex(t, pool, index)
+	}
+
+	// DB-15: test accounts are a global, case-insensitively unique pool. The old
+	// uniqueness was scoped to environment_id, which is gone.
+	requireNoColumn(t, pool, "test_account", "sut_id")
+	requireNoColumn(t, pool, "test_account", "environment_id")
+	var testAccountIndexDef string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = 'uk_test_account_username'
+	`).Scan(&testAccountIndexDef); err != nil {
+		t.Fatalf("read uk_test_account_username: %v", err)
+	}
+	if !strings.Contains(testAccountIndexDef, "UNIQUE INDEX") {
+		t.Errorf("uk_test_account_username is not unique: %s", testAccountIndexDef)
+	}
+	if !strings.Contains(testAccountIndexDef, "lower(") || !strings.Contains(testAccountIndexDef, "username") {
+		t.Errorf("uk_test_account_username does not cover lower(username): %s", testAccountIndexDef)
+	}
+	if strings.Contains(testAccountIndexDef, "environment_id") {
+		t.Errorf("uk_test_account_username is still environment-scoped: %s", testAccountIndexDef)
+	}
+}
+
+// TestV022EEXSchema pins the E/EX v0.22 schema: document-image extraction rows
+// and the extraction coverage report, the frozen wave scope snapshot,
+// execution-time discovery observations, structured human questions and the
+// discovery-delta case auto-confirmation audit trail.
+// See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-16..DB-19,
+// DB-29, DB-30; docs/version-V0.22/E-tools-attachments.md §2.3;
+// docs/version-V0.22/B-clarification-messaging.md §6.1 and
+// docs/version-V0.22/A-model-token-budget.md §7.3.
+func TestV022EEXSchema(t *testing.T) {
+	pool := integrationDB(t)
+	ctx := context.Background()
+
+	requireTable(t, pool, "attachment_image")
+	requireTable(t, pool, "execution_discovery_observation")
+	requireColumn(t, pool, "requirement_attachment", "extraction_report")
+	requireNoColumn(t, pool, "requirement_attachment", "parse_status")
+	requireColumn(t, pool, "run_wave", "scope_snapshot")
+	requireColumn(t, pool, "human_request", "question")
+	requireColumn(t, pool, "case_version", "source_observation_id")
+	requireColumn(t, pool, "case_confirmation", "auto_confirmed_by")
+	requireUnique(t, pool, "uk_execution_discovery_observation")
+
+	// DB-17: one row per image extracted from a document attachment. The
+	// attachment reference is a same-context FK that cascades on delete; every
+	// image must point at a content object and declare where it came from
+	// (E §2.3). Image statuses are independent from the attachment extraction
+	// status and (attachment_id, seq) is the natural key.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_attachment (id, version_id, content_ref_id, name, mime, size)
+		VALUES (9200, 920, 920, 'doc.pdf', 'application/pdf', 10)
+	`); err != nil {
+		t.Fatalf("insert requirement attachment: %v", err)
+	}
+	for _, column := range []string{
+		"id", "attachment_id", "seq", "content_ref_id", "mime", "width", "height",
+		"source_kind", "status", "caption", "error", "created_at", "updated_at",
+	} {
+		requireColumn(t, pool, "attachment_image", column)
+	}
+	requireColumnNotNull(t, pool, "attachment_image", "content_ref_id")
+	requireColumnNotNull(t, pool, "attachment_image", "source_kind")
+	requireCheckSet(t, pool, "chk_attachment_image_source_kind",
+		[]string{"embedded", "page_render", "standalone"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_attachment_image_status",
+		[]string{"extracted", "analyzing", "done", "failed", "skipped"}, []string{"bogus"})
+	requirePKConstraint(t, pool, "pk_attachment_image")
+	requireUnique(t, pool, "uk_attachment_image_attachment_seq")
+	requireIndex(t, pool, "idx_attachment_image_attachment_status")
+
+	// Image rows default to extracted, require seq > 0, declare a known
+	// source kind and keep the (attachment_id, seq) identity unique.
+	var imageStatus string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9201, 9200, 1, 920, 'embedded')
+		RETURNING status
+	`).Scan(&imageStatus); err != nil {
+		t.Fatalf("insert attachment image: %v", err)
+	}
+	if imageStatus != "extracted" {
+		t.Errorf("attachment_image.status default = %q, want extracted", imageStatus)
+	}
+	for _, sourceKind := range []string{"page_render", "standalone"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET source_kind = $1 WHERE id = 9201
+		`, sourceKind); err != nil {
+			t.Errorf("attachment_image rejects source_kind %q: %v", sourceKind, err)
+		}
+	}
+	for _, sourceKind := range []string{"", "bogus"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET source_kind = $1 WHERE id = 9201
+		`, sourceKind); err == nil {
+			t.Errorf("attachment_image accepts source_kind %q", sourceKind)
+		}
+	}
+	for _, status := range []string{"analyzing", "done", "failed", "skipped"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET status = $1 WHERE id = 9201
+		`, status); err != nil {
+			t.Errorf("attachment_image rejects status %q: %v", status, err)
+		}
+	}
+	for _, status := range []string{"", "bogus"} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE attachment_image SET status = $1 WHERE id = 9201
+		`, status); err == nil {
+			t.Errorf("attachment_image accepts status %q", status)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id)
+		VALUES (9202, 9200, 2, 920)
+	`); err == nil {
+		t.Error("attachment_image accepts a missing source_kind")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9203, 9200, 3, NULL, 'embedded')
+	`); err == nil {
+		t.Error("attachment_image accepts a NULL content_ref_id")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9204, 999999, 4, 920, 'embedded')
+	`); err == nil {
+		t.Error("attachment_image accepts an unknown attachment_id")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9205, 9200, 1, 920, 'embedded')
+	`); err == nil {
+		t.Error("duplicate attachment_image (attachment_id, seq) accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO attachment_image (id, attachment_id, seq, content_ref_id, source_kind)
+		VALUES (9206, 9200, 0, 920, 'embedded')
+	`); err == nil {
+		t.Error("attachment_image seq = 0 accepted")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM requirement_attachment WHERE id = 9200`); err != nil {
+		t.Fatalf("delete requirement attachment: %v", err)
+	}
+	var remainingImages int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM attachment_image WHERE attachment_id = 9200
+	`).Scan(&remainingImages); err != nil {
+		t.Fatalf("count attachment images after cascade: %v", err)
+	}
+	if remainingImages != 0 {
+		t.Errorf("attachment_image rows after attachment delete = %d, want 0 (ON DELETE CASCADE)", remainingImages)
+	}
+
+	// DB-16: the structured question state machine. The 0.21 open/resolved
+	// statuses are gone and new rows default to pending.
+	for _, column := range []string{"conversation_id", "message_id"} {
+		requireColumn(t, pool, "human_request", column)
+	}
+	requireCheckSet(t, pool, "chk_human_request_kind",
+		[]string{"clarification_question", "approval", "blocked_recovery", "login_takeover", "conflict", "other"},
+		[]string{"escalation"})
+	requireCheckSet(t, pool, "chk_human_request_status",
+		[]string{"pending", "answered", "expired", "cancelled"}, []string{"open", "resolved"})
+	requireIndex(t, pool, "idx_human_request_conversation")
+	var humanStatus string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO human_request (id, version_id, kind, expires_at)
+		VALUES (9301, 9300, 'approval', now() + interval '1 hour')
+		RETURNING status
+	`).Scan(&humanStatus); err != nil {
+		t.Fatalf("insert human request: %v", err)
+	}
+	if humanStatus != "pending" {
+		t.Errorf("human_request.status default = %q, want pending", humanStatus)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'open' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request still accepts legacy status 'open'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'resolved' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request still accepts legacy status 'resolved'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET kind = 'clarification_question' WHERE id = 9301
+	`); err != nil {
+		t.Errorf("human_request rejects v0.22 kind clarification_question: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET kind = 'escalation' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request accepts unknown kind 'escalation'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'answered' WHERE id = 9301
+	`); err != nil {
+		t.Errorf("human_request rejects v0.22 status answered: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE human_request SET status = 'bogus' WHERE id = 9301
+	`); err == nil {
+		t.Error("human_request accepts unknown status 'bogus'")
+	}
+
+	// DB-29: executions keep only normalized resource templates. The unique key
+	// is the observation identity; sensitive request payload columns must not
+	// exist (N-16/T8).
+	for _, column := range []string{
+		"id", "version_id", "wave_id", "case_run_id", "version_sut_id",
+		"environment_id", "kind", "method", "host", "resource_template",
+		"status_code", "mime", "source_kind", "fingerprint", "occurrences",
+		"first_seen_at", "last_seen_at", "decision", "resource_id", "fact_id",
+		"created_at", "updated_at",
+	} {
+		requireColumn(t, pool, "execution_discovery_observation", column)
+	}
+	for _, column := range []string{
+		"query", "query_values", "query_string", "headers", "header",
+		"cookie", "cookies", "body", "request_body", "response_body", "raw",
+	} {
+		requireNoColumn(t, pool, "execution_discovery_observation", column)
+	}
+	requirePKConstraint(t, pool, "pk_execution_discovery_observation")
+	// version_sut_id is part of the observation identity, so it must be
+	// non-null or NULLS DISTINCT would defeat the unique key.
+	requireColumnNotNull(t, pool, "execution_discovery_observation", "version_sut_id")
+	requireCheckSet(t, pool, "chk_execution_discovery_observation_kind",
+		[]string{"page", "api"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_execution_discovery_observation_decision",
+		[]string{"new", "proposed", "approved", "rejected", "out_of_scope"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_execution_discovery_observation_source_kind",
+		[]string{"execution", "p9"}, []string{"bogus"})
+	for _, index := range []string{
+		"idx_execution_discovery_observation_version_decision",
+		"idx_execution_discovery_observation_wave",
+		"idx_execution_discovery_observation_resource",
+	} {
+		requireIndex(t, pool, index)
+	}
+	var uniqueDef string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid)
+		FROM pg_constraint
+		WHERE conname = 'uk_execution_discovery_observation'
+		  AND connamespace = current_schema()::regnamespace
+	`).Scan(&uniqueDef); err != nil {
+		t.Fatalf("read uk_execution_discovery_observation: %v", err)
+	}
+	wantUniqueDef := "UNIQUE (version_id, version_sut_id, kind, method, resource_template)"
+	if uniqueDef != wantUniqueDef {
+		t.Errorf("uk_execution_discovery_observation = %q, want %q", uniqueDef, wantUniqueDef)
+	}
+	var decision, sourceKind string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9401, 9400, 9410, 'page', '/orders/42')
+		RETURNING decision, source_kind
+	`).Scan(&decision, &sourceKind); err != nil {
+		t.Fatalf("insert discovery observation: %v", err)
+	}
+	if decision != "new" || sourceKind != "execution" {
+		t.Errorf("observation defaults = (%q, %q), want (new, execution)", decision, sourceKind)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9402, 9400, 9410, 'page', '/orders/42')
+	`); err == nil {
+		t.Error("duplicate execution_discovery_observation identity accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9403, 9400, 9410, 'api', '/orders/42')
+	`); err != nil {
+		t.Errorf("distinct discovery observation kind rejected: %v", err)
+	}
+	for _, change := range []struct{ column, value string }{
+		{"decision", "proposed"},
+		{"source_kind", "p9"},
+	} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE execution_discovery_observation SET `+change.column+` = $1 WHERE id = 9401
+		`, change.value); err != nil {
+			t.Errorf("execution_discovery_observation rejects %s %q: %v", change.column, change.value, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE execution_discovery_observation SET `+change.column+` = 'bogus' WHERE id = 9401
+		`); err == nil {
+			t.Errorf("execution_discovery_observation accepts %s 'bogus'", change.column)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, version_sut_id, kind, resource_template)
+		VALUES (9404, 9400, 9410, 'bogus', '/orders/43')
+	`); err == nil {
+		t.Error("execution_discovery_observation accepts kind 'bogus'")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO execution_discovery_observation
+			(id, version_id, kind, resource_template)
+		VALUES (9405, 9400, 'page', '/orders/44')
+	`); err == nil {
+		t.Error("execution_discovery_observation accepts a NULL version_sut_id")
+	}
+
+	// DB-30: discovery-delta case versions and the auto-confirmation audit.
+	for _, column := range []string{
+		"trigger", "source_observation_id", "auto_confirmed_by", "rollback_of",
+	} {
+		requireColumn(t, pool, "case_version", column)
+	}
+	requireIndex(t, pool, "idx_case_version_source_observation")
+	for _, column := range []string{
+		"auto_confirmed", "auto_confirmed_by", "trigger", "source_observation_id",
+	} {
+		requireColumn(t, pool, "case_confirmation", column)
+	}
+	requireColumnDefault(t, pool, "case_version", "trigger", "'normal'::text")
+	requireColumnDefault(t, pool, "case_confirmation", "trigger", "'manual'::text")
+	requireCheckSet(t, pool, "chk_case_version_trigger",
+		[]string{"normal", "discovery_delta", "rollback"}, []string{"bogus"})
+	requireCheckSet(t, pool, "chk_case_confirmation_trigger",
+		[]string{"manual", "discovery_delta", "rollback"}, []string{"bogus"})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name)
+		VALUES (9500, 950, 950, 951, 'scenario')
+	`); err != nil {
+		t.Fatalf("insert case scenario: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_entity (id, scenario_id) VALUES (9501, 9500)
+	`); err != nil {
+		t.Fatalf("insert case entity: %v", err)
+	}
+	var caseVersionTrigger string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO case_version (id, case_id, revision, title, content_hash)
+		VALUES (9502, 9501, 1, 'case', repeat('a', 64))
+		RETURNING trigger
+	`).Scan(&caseVersionTrigger); err != nil {
+		t.Fatalf("insert case version: %v", err)
+	}
+	if caseVersionTrigger != "normal" {
+		t.Errorf("case_version.trigger default = %q, want normal", caseVersionTrigger)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_version SET trigger = 'discovery_delta' WHERE id = 9502
+	`); err != nil {
+		t.Errorf("case_version rejects trigger discovery_delta: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_version SET trigger = 'bogus' WHERE id = 9502
+	`); err == nil {
+		t.Error("case_version accepts trigger 'bogus'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_version SET trigger = 'rollback' WHERE id = 9502
+	`); err != nil {
+		t.Errorf("case_version rejects trigger rollback: %v", err)
+	}
+	var confirmationTrigger string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO case_confirmation
+			(id, case_version_id, scope, target_scope_id, batch_id, confirmed_by)
+		VALUES (9503, 9502, 'case', 9502, 'batch-1', 950)
+		RETURNING trigger
+	`).Scan(&confirmationTrigger); err != nil {
+		t.Fatalf("insert case confirmation: %v", err)
+	}
+	if confirmationTrigger != "manual" {
+		t.Errorf("case_confirmation.trigger default = %q, want manual", confirmationTrigger)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_confirmation SET trigger = 'discovery_delta' WHERE id = 9503
+	`); err != nil {
+		t.Errorf("case_confirmation rejects trigger discovery_delta: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_confirmation SET trigger = 'bogus' WHERE id = 9503
+	`); err == nil {
+		t.Error("case_confirmation accepts trigger 'bogus'")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE case_confirmation SET trigger = 'rollback' WHERE id = 9503
+	`); err != nil {
+		t.Errorf("case_confirmation rejects trigger rollback: %v", err)
+	}
+}
+
+// integrationDB returns a fresh, fully migrated test schema.
+func integrationDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := testutil.NewEmptyDB(t)
+	if _, err := db.Migrate(context.Background(), pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	return pool
+}
+
+func requireTable(t *testing.T, pool *pgxpool.Pool, table string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+		t.Errorf("check table %s: %v", table, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing table %s", table)
+	}
+}
+
+func requireColumn(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+		)
+	`, table, column).Scan(&exists); err != nil {
+		t.Errorf("check column %s.%s: %v", table, column, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing column %s.%s", table, column)
+	}
+}
+
+func requireNoColumn(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+		)
+	`, table, column).Scan(&exists); err != nil {
+		t.Errorf("check column %s.%s: %v", table, column, err)
+		return
+	}
+	if exists {
+		t.Errorf("column %s.%s still exists", table, column)
+	}
+}
+
+func requireIndex(t *testing.T, pool *pgxpool.Pool, index string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `SELECT to_regclass($1) IS NOT NULL`, index).Scan(&exists); err != nil {
+		t.Errorf("check index %s: %v", index, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing index %s", index)
+	}
+}
+
+// requireUnique asserts a UNIQUE constraint (contype 'u') with exactly this
+// name exists in the test schema, pinning the D34 uk_<table>_<columns> naming.
+func requireUnique(t *testing.T, pool *pgxpool.Pool, constraint string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = $1
+			  AND contype = 'u'
+			  AND connamespace = current_schema()::regnamespace
+		)
+	`, constraint).Scan(&exists); err != nil {
+		t.Errorf("check unique constraint %s: %v", constraint, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing unique constraint %s", constraint)
+	}
+}
+
+// requirePKConstraint asserts a primary-key constraint with exactly this name
+// exists in the test schema, pinning the D34 pk_<table> constraint naming.
+func requirePKConstraint(t *testing.T, pool *pgxpool.Pool, constraint string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = $1
+			  AND contype = 'p'
+			  AND connamespace = current_schema()::regnamespace
+		)
+	`, constraint).Scan(&exists); err != nil {
+		t.Errorf("check constraint %s: %v", constraint, err)
+		return
+	}
+	if !exists {
+		t.Errorf("missing primary-key constraint %s", constraint)
+	}
+}
+
+// requireColumnNotNull asserts information_schema reports the column as NOT
+// NULL, so a silently reintroduced NULL slips no further than this test.
+func requireColumnNotNull(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var nullable string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+	`, table, column).Scan(&nullable); err != nil {
+		t.Errorf("read %s.%s nullability: %v", table, column, err)
+		return
+	}
+	if nullable != "NO" {
+		t.Errorf("%s.%s is nullable, want NOT NULL", table, column)
+	}
+}
+
+// requireColumnDefault asserts the exact column default, pinning enum-like
+// defaults (normal/manual) against a silent drop.
+func requireColumnDefault(t *testing.T, pool *pgxpool.Pool, table, column, want string) {
+	t.Helper()
+	var got string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT column_default FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+	`, table, column).Scan(&got); err != nil {
+		t.Errorf("read %s.%s default: %v", table, column, err)
+		return
+	}
+	if got != want {
+		t.Errorf("%s.%s default = %q, want %q", table, column, got, want)
+	}
+}
+
+// requireCheckSet pins a named CHECK constraint's value set via
+// pg_get_constraintdef: every allowed value must still be listed and no
+// forbidden (legacy/draft) value may survive.
+func requireCheckSet(t *testing.T, pool *pgxpool.Pool, constraint string, allowed, forbidden []string) {
+	t.Helper()
+	var def string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conname = $1
+		  AND contype = 'c'
+		  AND connamespace = current_schema()::regnamespace
+	`, constraint).Scan(&def); err != nil {
+		t.Errorf("read check constraint %s: %v", constraint, err)
+		return
+	}
+	for _, value := range allowed {
+		if !strings.Contains(def, "'"+value+"'") {
+			t.Errorf("check constraint %s misses %q: %s", constraint, value, def)
+		}
+	}
+	for _, value := range forbidden {
+		if strings.Contains(def, "'"+value+"'") {
+			t.Errorf("check constraint %s still allows %q: %s", constraint, value, def)
+		}
 	}
 }

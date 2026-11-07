@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,19 @@ type PauseService struct {
 	clock     Clock
 	events    EventPublisher
 	audit     AuditRecorder
+	// stageNotifier is the v0.22 wave-terminal stage callback (Task 25 fix
+	// round 1). B §7.1 counts a cancelled wave as terminal, so CancelWave must
+	// notify the stage machine just like the scheduler's done/failed paths. nil
+	// keeps the pre-v0.22 behavior.
+	stageNotifier WaveTerminalStageNotifier
+	// delta is the optional W1-14A discovery-delta trigger. A cancelled wave is
+	// terminal, so CancelWave runs the same once-per-terminal-wave pass as the
+	// scheduler's done/failed paths. nil disables it.
+	delta DiscoveryDeltaEvaluator
+	// retestNotifier is the v0.22 W2-5 wave-terminal retest writeback callback.
+	// A cancelled wave is terminal, so CancelWave invokes it exactly like the
+	// scheduler's done/failed paths. nil disables it.
+	retestNotifier WaveTerminalRetestNotifier
 }
 
 // PauseServiceDeps wires the pause/resume service. contexts/executor/canceller
@@ -39,21 +53,36 @@ type PauseServiceDeps struct {
 	Clock     Clock
 	Events    EventPublisher
 	Audit     AuditRecorder
+	// StageNotifier is the v0.22 wave-terminal stage callback (Task 25 fix
+	// round 1). nil keeps the pre-v0.22 behavior; Task 36 wires
+	// *versionapp.StageService here.
+	StageNotifier WaveTerminalStageNotifier
+	// Delta is the W1-14A wave-terminal discovery-delta trigger (W1-14A fix
+	// round 1). nil disables it. A cancelled wave calls it once, exactly like
+	// the scheduler's done/failed paths.
+	Delta DiscoveryDeltaEvaluator
+	// RetestNotifier is the v0.22 W2-5 retest writeback callback. nil disables
+	// it; a cancelled wave invokes it exactly like the scheduler's done/failed
+	// paths.
+	RetestNotifier WaveTerminalRetestNotifier
 }
 
 // NewPauseService builds the pause/resume service.
 func NewPauseService(deps PauseServiceDeps) *PauseService {
 	return &PauseService{
-		intents:   deps.Intents,
-		waves:     deps.Waves,
-		caseRuns:  deps.CaseRuns,
-		humans:    deps.Humans,
-		contexts:  deps.Contexts,
-		canceller: deps.Canceller,
-		executor:  deps.Executor,
-		clock:     deps.Clock,
-		events:    deps.Events,
-		audit:     deps.Audit,
+		intents:        deps.Intents,
+		waves:          deps.Waves,
+		caseRuns:       deps.CaseRuns,
+		humans:         deps.Humans,
+		contexts:       deps.Contexts,
+		canceller:      deps.Canceller,
+		executor:       deps.Executor,
+		clock:          deps.Clock,
+		events:         deps.Events,
+		audit:          deps.Audit,
+		stageNotifier:  deps.StageNotifier,
+		delta:          deps.Delta,
+		retestNotifier: deps.RetestNotifier,
 	}
 }
 
@@ -298,6 +327,15 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		return execution.RunWave{}, err
 	}
 	if wave.Status == execution.WaveCancelled {
+		// A repeated cancel is idempotent but re-notifies only the stage
+		// callback: the stage advance is best effort, so repeating it heals a
+		// lost advance. The discovery delta, in contrast, must run exactly once
+		// per terminal wave, so the already-cancelled branch never re-runs it.
+		s.notifyStageWaveCancelled(ctx, wave)
+		// v0.22 W2-5: a repeated cancel re-runs the idempotent retest writeback
+		// so a lost delivery callback heals; the issue service deduplicates the
+		// event itself.
+		s.notifyRetestWaveCancelled(ctx, wave)
 		return wave, nil
 	}
 	now := s.now()
@@ -321,7 +359,61 @@ func (s *PauseService) CancelWave(ctx context.Context, versionID, waveID, actorI
 		map[string]any{"wave_id": platformid.Format(wave.ID), "status": string(execution.WaveCancelled), "counts": wave.Counts},
 		actorPtr(actorID))
 	s.record(ctx, "execution.wave_cancelled", "execution_wave", wave.ID, actorID, nil)
+	// B §7.1 counts a cancelled wave as terminal: notify the v0.22 stage machine
+	// after the cancel committed so executing -> reporting is not stranded on a
+	// manual stage advance (Task 25 fix round 1).
+	s.notifyStageWaveCancelled(ctx, wave)
+	// v0.22 W2-5: a cancelled retest wave keeps the issue retesting (the
+	// "other terminal status" rule) and records the cancellation reason. Best
+	// effort: the cancellation is the source of truth.
+	s.notifyRetestWaveCancelled(ctx, wave)
+	// W1-14A: the cancelled transition is the wave's terminal transition, so the
+	// discovery delta runs here exactly once (the already-cancelled branch above
+	// never reaches this point).
+	s.notifyDiscoveryDelta(ctx, wave.VersionID, wave.ID)
 	return wave, nil
+}
+
+// notifyStageWaveCancelled invokes the optional v0.22 wave-terminal stage
+// callback for a cancelled wave. It is best effort: the cancellation is the
+// source of truth, so a callback failure is logged and never fails or rolls back
+// the cancel; the stage reconciler retries the advance.
+func (s *PauseService) notifyStageWaveCancelled(ctx context.Context, wave execution.RunWave) {
+	if s.stageNotifier == nil || wave.ID <= 0 {
+		return
+	}
+	if err := s.stageNotifier.OnWaveTerminal(ctx, wave.ID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: cancelled-wave stage callback failed; the stage reconciler will retry",
+			"version_id", wave.VersionID, "wave_id", wave.ID, "error", err)
+	}
+}
+
+// notifyRetestWaveCancelled invokes the optional v0.22 W2-5 retest writeback
+// for a cancelled wave. The cancellation is the source of truth: a delivery
+// failure is logged and never fails or rolls back the cancel.
+func (s *PauseService) notifyRetestWaveCancelled(ctx context.Context, wave execution.RunWave) {
+	if s == nil || s.retestNotifier == nil || wave.ID <= 0 {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, retestWritebackTimeout)
+	defer cancel()
+	if err := s.retestNotifier.OnWaveTerminalRetest(writeCtx, wave.ID); err != nil {
+		slog.Default().WarnContext(ctx,
+			"execution: cancelled-wave retest writeback failed; the issue keeps its current retest status",
+			"version_id", wave.VersionID, "wave_id", wave.ID, "error", err)
+	}
+}
+
+// notifyDiscoveryDelta runs the optional W1-14A terminal-wave delta trigger for
+// a cancelled wave through the same shared 15s best-effort helper as the
+// scheduler (W1-14A fix round 1). The cancellation is the source of truth, so a
+// failing/slow evaluator is logged and never rolls the cancel back.
+func (s *PauseService) notifyDiscoveryDelta(ctx context.Context, versionID, waveID int64) {
+	if s == nil {
+		return
+	}
+	evaluateDiscoveryDelta(ctx, s.delta, versionID, waveID)
 }
 
 // cancelWaveRunsAndIntents propagates cancellation from a wave to its

@@ -136,13 +136,51 @@ type HumanRequestRepository interface {
 	GetOpenByCaseRun(ctx context.Context, caseRunID int64) (*execution.HumanRequest, error)
 	ListByVersion(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error)
 	ListOpen(ctx context.Context) ([]execution.HumanRequest, error)
+	// ListQuestions returns one descending-ID page of the version's
+	// clarification_question rows, optionally filtered by status. Login-takeover
+	// execution rows are never part of the structured-question read surface.
+	ListQuestions(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.HumanRequest, bool, error)
 	CountByCaseRun(ctx context.Context, caseRunID int64) (int, error)
 	// Transition applies a guarded status change with the optional response
-	// fields. It returns false,nil on a status mismatch.
-	Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time) (bool, error)
-	// Expire marks every open request whose expires_at is before now as
-	// expired and returns the affected rows.
+	// fields. A non-nil expiresAt extends the deadline in the same statement
+	// (column and question payload); reopening uses it so lazy expiry cannot
+	// immediately re-expire the question. It returns false,nil on a status
+	// mismatch.
+	Transition(ctx context.Context, id int64, from, to execution.HumanRequestStatus, response map[string]any, actorID int64, at time.Time, expiresAt *time.Time) (bool, error)
+	// AttachMessage records the conversation_message id that renders the
+	// question card.
+	AttachMessage(ctx context.Context, id, messageID int64) error
+	// Expire marks every pending login_takeover request whose expires_at is
+	// before now as expired and returns the affected rows.
 	Expire(ctx context.Context, now time.Time) ([]execution.HumanRequest, error)
+	// ExpireQuestions marks every pending clarification_question whose
+	// expires_at is before now as expired and returns the affected rows. It is
+	// the question-specific sweep: it never touches execution case_runs/waves.
+	ExpireQuestions(ctx context.Context, now time.Time) ([]execution.HumanRequest, error)
+}
+
+// QuestionMessage is one conversation_message write for a structured question:
+// the question card message (kind=question) and the answer echo (kind=answer).
+// The version-context adapter owns conversation_message id/idempotency and must
+// map Kind to the DB-3 message kind.
+type QuestionMessage struct {
+	VersionID       int64
+	ConversationID  int64
+	QuestionID      int64
+	Kind            string
+	ClientMessageID string
+	Payload         map[string]any
+	ActorID         int64
+	AgentRunID      int64
+}
+
+// QuestionMessageWriter is the version conversation write port of the
+// structured-question service (R-B3-3/R-B3-5). It must be idempotent per
+// ClientMessageID: a retried answer returns the already-stored message id with
+// created=false instead of appending a duplicate. The production adapter wraps
+// versionapp.ConversationService (Task 36 wiring).
+type QuestionMessageWriter interface {
+	AppendQuestionMessage(ctx context.Context, message QuestionMessage) (messageID int64, created bool, err error)
 }
 
 // SUTContextRepository persists case_run_sut_context rows.
@@ -155,6 +193,63 @@ type SUTContextRepository interface {
 	ListStale(ctx context.Context, createdBefore time.Time, limit int) ([]execution.CaseRunSUTContext, error)
 	// ListAll returns every non-closed context (orphan reconciliation).
 	ListAll(ctx context.Context) ([]execution.CaseRunSUTContext, error)
+}
+
+// DiscoveryObservationWriter persists normalized execution-time discovery
+// observations (spec DB-29, R-EX-1). It is optional: a nil writer skips the
+// observation write while the sanitized network evidence still flows through
+// EvidenceRepository. DiscoveryIngest implements the normalization/filtering/
+// dedupe on top of DiscoveryObservationStore (W1-11).
+type DiscoveryObservationWriter interface {
+	WriteObservations(ctx context.Context, observations []DiscoveryObservation) error
+}
+
+// DiscoveryObservationRow is the DB-29 read projection of one observation
+// (W1-14A, API-36/37/39). IDs stay int64 at the application boundary; the HTTP
+// DTO renders them as decimal strings. The nullable provenance columns are
+// pointers so a missing wave/case_run/environment/resource/fact is never
+// confused with the zero value. The projection includes source_kind,
+// created_at and updated_at; the fingerprint deliberately stays DB-only.
+type DiscoveryObservationRow struct {
+	ID               int64
+	VersionSUTID     int64
+	EnvironmentID    *int64
+	WaveID           *int64
+	CaseRunID        *int64
+	Kind             string
+	Method           string
+	Host             string
+	ResourceTemplate string
+	StatusCode       *int
+	MIME             string
+	SourceKind       string
+	Occurrences      int
+	Decision         string
+	ResourceID       *int64
+	FactID           *int64
+	FirstSeenAt      time.Time
+	LastSeenAt       time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// DiscoveryQueryRepository is the read-only DB-29 query port behind the
+// discovery observation/delta/coverage read APIs (W1-14A). Filters are optional:
+// an empty kind/decision means "every value" and a nil wave means the whole
+// version. A limit <= 0 means "no limit" (the coverage aggregation reads the
+// whole version); the HTTP layer clamps its own limit to 1..200. Rows are
+// ordered first_seen_at DESC, id DESC.
+type DiscoveryQueryRepository interface {
+	ListByVersion(ctx context.Context, versionID int64, waveID *int64, kind, decision string, limit int) ([]DiscoveryObservationRow, error)
+}
+
+// DiscoveryDeltaEvaluator is the narrow version-context delta trigger the
+// scheduler and PauseService call once when a wave reaches any terminal state
+// (done/failed/cancelled; W1-14A, R-EX-3). The production adapter returns nil
+// for versionapp.ErrDeltaBusy (another pass owns the lock), so a skipped pass
+// never fails the wave.
+type DiscoveryDeltaEvaluator interface {
+	Evaluate(ctx context.Context, versionID, waveID int64) error
 }
 
 // CaseReader is the read port into the design context. It only exposes
@@ -204,6 +299,27 @@ type VersionReader interface {
 	// trigger=execution_intent to version:{id} and system and marks the version
 	// report stale. It is idempotent for non-completed versions.
 	Reopen(ctx context.Context, id int64) error
+}
+
+// ExecutorAuthStatus is the outcome of a token-bearing executor probe. It tells
+// "the executor is down" apart from "the executor is up but rejects our token",
+// which the unauthenticated /healthz probe cannot do.
+type ExecutorAuthStatus string
+
+const (
+	// ExecutorAuthOK means the executor accepted the configured bearer token.
+	ExecutorAuthOK ExecutorAuthStatus = "ok"
+	// ExecutorAuthUnauthenticated means the token is missing or was rejected.
+	ExecutorAuthUnauthenticated ExecutorAuthStatus = "unauthenticated"
+	// ExecutorAuthUnreachable means the endpoint is missing, down or unhealthy.
+	ExecutorAuthUnreachable ExecutorAuthStatus = "unreachable"
+)
+
+// ExecutorAuthChecker performs a token-bearing probe against an executor
+// endpoint. The token comes from execution.executor_token settings; detail is a
+// diagnostic message that never contains the token.
+type ExecutorAuthChecker interface {
+	Check(ctx context.Context, endpoint string) (ExecutorAuthStatus, string)
 }
 
 // ExecutorRegistry selects the active executor instance for dispatch.

@@ -151,6 +151,16 @@ export type ErrorPart = {
   message: string
   retryable?: boolean
   action?: string
+  /**
+   * v0.22 E-1 (R-E1-3) field-level correction data: the JSON path of the
+   * rejected argument (e.g. `cases[0].assertions[0].database_id`), the legal
+   * values, and the next action. Older payloads carry the same keys inside
+   * `details`.
+   */
+  field?: string
+  allowed?: string[]
+  hint?: string
+  details?: Record<string, unknown>
 }
 
 /** Discriminated union rendered by the conversation thread (P6-T2 consumes it). */

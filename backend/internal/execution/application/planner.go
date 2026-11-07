@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"time"
@@ -45,14 +46,27 @@ func (s *Scheduler) planVersion(ctx context.Context, versionID int64) error {
 	}
 	sort.Slice(open, func(i, j int) bool { return open[i].ID < open[j].ID })
 	now := s.now()
+	// R-C5-1: freeze the effective binding scope into the wave row before any
+	// case_run exists. Later binding edits affect only the next wave; a rerun of
+	// this wave reads the same snapshot.
+	binding, err := s.versions.Get(ctx, versionID)
+	if err != nil {
+		return mapExecutionError(err, "version")
+	}
+	scopeSnapshot, err := buildWaveScopeSnapshot(binding, now)
+	if err != nil {
+		return err
+	}
+	frozenAt := now.UTC().Format(time.RFC3339)
 	wave := execution.RunWave{
-		ID:        s.ids.Next(),
-		VersionID: versionID,
-		Status:    execution.WavePlanned,
-		Trigger:   plannedTrigger(open),
-		Counts:    execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}},
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:            s.ids.Next(),
+		VersionID:     versionID,
+		Status:        execution.WavePlanned,
+		Trigger:       plannedTrigger(open),
+		Counts:        execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}},
+		ScopeSnapshot: scopeSnapshot,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	caseRuns := make([]execution.CaseRun, 0, len(open))
 	for _, intent := range open {
@@ -81,6 +95,18 @@ func (s *Scheduler) planVersion(ctx context.Context, versionID int64) error {
 			"wave_id":      platformid.Format(wave.ID),
 			"trigger":      wave.Trigger,
 			"intent_count": len(open),
+		},
+		nil)
+	// R-EX-4/EV-11: the wave scope snapshot is frozen into run_wave above; this
+	// event tells consumers the current wave vs. next-wave scope. It is
+	// best-effort (publishEvent never fails the business write) and is emitted
+	// after wave.created.
+	publishEvent(ctx, s.events, EventVersionScopeSnapshotCreated, versionID,
+		map[string]any{"wave_id": platformid.Format(wave.ID)},
+		map[string]any{
+			"version_id": platformid.Format(versionID),
+			"wave_id":    platformid.Format(wave.ID),
+			"frozen_at":  frozenAt,
 		},
 		nil)
 	return nil
@@ -156,4 +182,74 @@ func (s *Scheduler) now() time.Time {
 		return time.Now().UTC()
 	}
 	return s.clock.Now()
+}
+
+// waveScopeSnapshotPayload is the frozen effective scope recorded in
+// run_wave.scope_snapshot (R-C5-1, DB-19). IDs are normalized ascending so two
+// plans over the same binding produce the same document.
+type waveScopeSnapshotPayload struct {
+	VersionID   int64                  `json:"version_id"`
+	FrozenAt    string                 `json:"frozen_at"`
+	VersionSUTs []waveScopeSUTSnapshot `json:"version_suts"`
+}
+
+type waveScopeSUTSnapshot struct {
+	VersionSUTID  int64    `json:"version_sut_id"`
+	SUTID         int64    `json:"sut_id"`
+	EnvironmentID int64    `json:"environment_id"`
+	PageIDs       []int64  `json:"page_ids"`
+	APIIDs        []int64  `json:"api_ids"`
+	DatabaseIDs   []int64  `json:"database_ids"`
+	AccountRoles  []string `json:"account_roles"`
+	RepositoryIDs []int64  `json:"repository_ids"`
+}
+
+// buildWaveScopeSnapshot projects one version binding into the immutable scope
+// document of a new wave.
+func buildWaveScopeSnapshot(binding VersionBinding, frozenAt time.Time) (string, error) {
+	payload := waveScopeSnapshotPayload{
+		VersionID:   binding.VersionID,
+		FrozenAt:    frozenAt.UTC().Format(time.RFC3339),
+		VersionSUTs: make([]waveScopeSUTSnapshot, 0, len(binding.SUTs)),
+	}
+	for _, sut := range binding.SUTs {
+		item := waveScopeSUTSnapshot{
+			VersionSUTID:  sut.VersionSUTID,
+			SUTID:         sut.SUTID,
+			EnvironmentID: sut.EnvironmentID,
+			PageIDs:       append([]int64(nil), sut.PageIDs...),
+			APIIDs:        append([]int64(nil), sut.APIIDs...),
+			DatabaseIDs:   append([]int64(nil), sut.DatabaseIDs...),
+			AccountRoles:  append([]string(nil), sut.AccountRoles...),
+			RepositoryIDs: snapshotRepositoryIDs(sut),
+		}
+		sort.Slice(item.PageIDs, func(i, j int) bool { return item.PageIDs[i] < item.PageIDs[j] })
+		sort.Slice(item.APIIDs, func(i, j int) bool { return item.APIIDs[i] < item.APIIDs[j] })
+		sort.Slice(item.DatabaseIDs, func(i, j int) bool { return item.DatabaseIDs[i] < item.DatabaseIDs[j] })
+		sort.Slice(item.RepositoryIDs, func(i, j int) bool { return item.RepositoryIDs[i] < item.RepositoryIDs[j] })
+		sort.Strings(item.AccountRoles)
+		payload.VersionSUTs = append(payload.VersionSUTs, item)
+	}
+	sort.Slice(payload.VersionSUTs, func(i, j int) bool {
+		return payload.VersionSUTs[i].VersionSUTID < payload.VersionSUTs[j].VersionSUTID
+	})
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// snapshotRepositoryIDs is the frozen repository_ids of one binding (DB-19):
+// the deduplicated ascending multi-repository set, or the legacy single
+// CodeRepoID when the binding predates the multi-repository projection.
+func snapshotRepositoryIDs(sut VersionSUTBinding) []int64 {
+	ids := sortedUniqueInt64(sut.RepositoryIDs)
+	if len(ids) > 0 {
+		return ids
+	}
+	if sut.CodeRepoID != nil && *sut.CodeRepoID > 0 {
+		return []int64{*sut.CodeRepoID}
+	}
+	return []int64{}
 }

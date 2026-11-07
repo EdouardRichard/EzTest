@@ -6,8 +6,10 @@ import type {
   DatabaseResource,
   EnvironmentResource,
   PageResource,
+  SutRepository,
   SutResource,
   Version,
+  VersionBindingOverview,
   VersionSummary,
 } from "./types"
 
@@ -271,4 +273,87 @@ export const versionFixture: Version = {
   created_by: "9001",
   created_at: TIMESTAMP,
   updated_at: TIMESTAMP,
+}
+
+/** SUT-level repository associations returned by API-17 (Task 29 service view). */
+export const orderSutRepositories: SutRepository[] = [
+  {
+    id: "3101",
+    sut_id: "1001",
+    repository: orderRepository,
+    role: "web",
+    enabled: true,
+    created_at: TIMESTAMP,
+    updated_at: TIMESTAMP,
+  },
+  {
+    id: "3102",
+    sut_id: "1001",
+    repository: catalogFixture.repositories[1] as CodeRepositoryResource,
+    role: "api",
+    enabled: true,
+    created_at: TIMESTAMP,
+    updated_at: TIMESTAMP,
+  },
+]
+
+/**
+ * `GET /api/versions/{id}/binding` replaces the environment account pool with
+ * the version's bound active subset (DB-15/R-C1-2). The catalog keeps the full
+ * global pool, so `environment.accounts` must not contradict `accounts`.
+ */
+const boundOrderEnvironment: EnvironmentResource = {
+  ...orderEnvironment,
+  accounts: [orderAccounts[0] as AccountResource],
+}
+
+/**
+ * One Task 29 `GET /api/versions/{id}/binding` read model: derived SUT,
+ * environment, effective repos/accounts and an excluded page + database.
+ */
+export const bindingOverviewFixture: VersionBindingOverview = {
+  version_id: "2001",
+  stage: "designing",
+  editable: true,
+  sut: orderSut,
+  environment: boundOrderEnvironment,
+  scope_exclude: {
+    pages: ["1302"],
+    apis: [],
+    databases: ["1501"],
+  },
+  counts: {
+    pages: { approved: 2, proposed: 0, excluded: 1, included: 1 },
+    apis: { approved: 1, proposed: 0, excluded: 0, included: 1 },
+    databases: { approved: 1, proposed: 0, excluded: 1, included: 0 },
+  },
+  pages: [orderPages[0] as PageResource],
+  apis: [orderApis[0] as ApiResource],
+  databases: [],
+  accounts: [orderAccounts[0] as AccountResource],
+  repositories: [
+    {
+      repository: orderRepository,
+      role: "web",
+      included: true,
+      source: "sut",
+    },
+    {
+      repository: catalogFixture.repositories[1] as CodeRepositoryResource,
+      role: "api",
+      included: true,
+      source: "override",
+    },
+    {
+      repository: {
+        ...(catalogFixture.repositories[1] as CodeRepositoryResource),
+        id: "1203",
+        name: "payment-infra",
+      },
+      role: "infra",
+      included: false,
+      source: "sut",
+    },
+  ],
+  code_baseline_commit: "abc123",
 }

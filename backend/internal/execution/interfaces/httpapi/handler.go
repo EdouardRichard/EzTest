@@ -32,6 +32,22 @@ const (
 	settingHumanRequestTimeout = "execution.human_request_timeout_seconds"
 )
 
+// WavePlanner starts a wave for a version immediately (POST /versions/{id}/waves).
+// *executionapp.Scheduler implements it; the narrow interface keeps the handler
+// testable without building the whole scheduler.
+type WavePlanner interface {
+	ReconcileVersion(ctx context.Context, versionID int64) error
+}
+
+// WaveIntentEnsurer creates the initial execution intents a wave needs, plus the
+// manual/retest intent used by POST /execution/intents. *executionapp.
+// IntentService implements it.
+type WaveIntentEnsurer interface {
+	EnsureInitialIntents(ctx context.Context, versionID int64) (int, error)
+	EnsureInitialIntentsForCases(ctx context.Context, versionID int64, caseIDs []int64) (int, error)
+	CreateManual(ctx context.Context, versionID, caseVersionID int64, purpose execution.Purpose, actorID int64) (execution.ExecutionIntent, error)
+}
+
 // Deps is the fully wired execution surface; cmd/eztest constructs it, tests
 // build it over the real repositories/services.
 type Deps struct {
@@ -47,10 +63,24 @@ type Deps struct {
 	Content   executionapp.ContentStore
 	Settings  executionapp.SettingsReader
 
-	IntentService *executionapp.IntentService
-	PauseService  *executionapp.PauseService
-	HumanService  *executionapp.HumanService
-	Registry      *executionapp.Registry
+	// Discovery is the read-only DB-29 query surface behind the W1-14A
+	// discovery observation/delta/coverage APIs. It is optional so degraded
+	// assemblies answer 503 instead of panicking.
+	Discovery executionapp.DiscoveryQueryRepository
+
+	// AuthChecker performs the admin token-bearing executor probe (D8). It is
+	// optional so degraded assemblies answer 503 instead of panicking.
+	AuthChecker executionapp.ExecutorAuthChecker
+
+	IntentService   WaveIntentEnsurer
+	PauseService    *executionapp.PauseService
+	HumanService    *executionapp.HumanService
+	QuestionService *executionapp.QuestionService
+	Registry        *executionapp.Registry
+
+	// Planner starts a wave immediately for POST /versions/{id}/waves. It is
+	// optional so degraded assemblies answer 503 instead of panicking.
+	Planner WavePlanner
 }
 
 // Handler serves the P3 execution endpoints.
@@ -147,7 +177,7 @@ func (h *Handler) countOpenHumanRequests(ctx context.Context, versionID int64) (
 	count := 0
 	var beforeID *int64
 	for scanned := 0; scanned < maxOpenHumanScan; {
-		items, hasMore, err := h.deps.Humans.ListByVersion(ctx, versionID, string(execution.HumanOpen), pagination.MaxLimit, beforeID)
+		items, hasMore, err := h.deps.Humans.ListByVersion(ctx, versionID, string(execution.HumanPending), pagination.MaxLimit, beforeID)
 		if err != nil {
 			return 0, mapRepoError(err, "human_request")
 		}
@@ -860,7 +890,7 @@ func (h *Handler) ListHumanRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status, err := requireEnum("status", r.URL.Query().Get("status"),
-		string(execution.HumanOpen), string(execution.HumanResolved),
+		string(execution.HumanPending), string(execution.HumanAnswered),
 		string(execution.HumanCancelled), string(execution.HumanExpired))
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -885,6 +915,49 @@ func (h *Handler) ListHumanRequests(w http.ResponseWriter, r *http.Request) {
 		lastID = requests[len(requests)-1].ID
 	}
 	httpx.List(w, http.StatusOK, items, nextCursor(hasMore, len(requests), lastID), hasMore)
+}
+
+// CreateHumanRequest POST /api/versions/{id}/human-requests. It creates one
+// version-level approval/blocked_recovery/conflict request (R-W2-1/API-43);
+// decisions use the existing POST /api/human-requests/{id}/resolve route.
+func (h *Handler) CreateHumanRequest(w http.ResponseWriter, r *http.Request) {
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := h.versionID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	if err := h.requireVersion(ctx, versionID); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.HumanService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "human service is not configured"))
+		return
+	}
+	var body createHumanRequestRequest
+	if err := decodeStrictBody(w, r, &body); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	input, err := body.parse()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	input.VersionID = versionID
+	input.ActorID = actorID
+	request, err := h.deps.HumanService.CreateRequest(ctx, input)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, toHumanRequestView(request))
 }
 
 // ResolveHumanRequest POST /api/human-requests/{humanRequestId}/resolve.
@@ -942,6 +1015,230 @@ func (h *Handler) CancelHumanRequest(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toHumanRequestView(request))
 }
 
+/* ----------------------------- structured questions ------------------------ */
+
+// ListQuestions GET /api/versions/{id}/questions?status=.
+//
+// It lists the version's clarification_question rows (pending/answered/expired/
+// cancelled) with the question payload, answer and timestamps. Overdue pending
+// questions are lazily expired by the service before the read.
+func (h *Handler) ListQuestions(w http.ResponseWriter, r *http.Request) {
+	versionID, err := h.versionID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	if err := h.requireVersion(ctx, versionID); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.QuestionService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "question service is not configured"))
+		return
+	}
+	status, err := requireEnum("status", r.URL.Query().Get("status"),
+		string(execution.HumanPending), string(execution.HumanAnswered),
+		string(execution.HumanCancelled), string(execution.HumanExpired))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	limit, beforeID, err := pageParams(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	requests, hasMore, err := h.deps.QuestionService.List(ctx, versionID, status, limit, beforeID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]QuestionView, 0, len(requests))
+	for _, request := range requests {
+		items = append(items, toQuestionView(request))
+	}
+	lastID := int64(0)
+	if len(requests) > 0 {
+		lastID = requests[len(requests)-1].ID
+	}
+	httpx.List(w, http.StatusOK, items, nextCursor(hasMore, len(requests), lastID), hasMore)
+}
+
+// CreateQuestion POST /api/versions/{id}/conversations/{cid}/questions.
+//
+// The endpoint is Host-run scoped: the owning agent run arrives in the
+// X-Agent-Run-Id header (Task 37 mounts it behind the Host run context); users
+// can only answer/skip. The model/tool path is question.ask, which carries the
+// same scope in-process.
+func (h *Handler) CreateQuestion(w http.ResponseWriter, r *http.Request) {
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, err := h.versionID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	conversationID, err := pathParamID(r, "cid", "conversation_id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	agentRunID, err := questionOwnerID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	if err := h.requireVersion(ctx, versionID); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.QuestionService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "question service is not configured"))
+		return
+	}
+	var request createQuestionRequest
+	if err := decodeStrictBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	questions, expiresAt, err := request.parse()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	created, err := h.deps.QuestionService.Create(ctx, executionapp.QuestionCreateInput{
+		VersionID:      versionID,
+		ConversationID: conversationID,
+		AgentRunID:     agentRunID,
+		Questions:      questions,
+		BatchID:        request.BatchID,
+		ExpiresAt:      expiresAt,
+		ActorID:        actorID,
+	})
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, toQuestionView(created))
+}
+
+// AnswerQuestion POST /api/versions/{id}/questions/{qid}/answer. Users answer a
+// pending question; the service validates the batch answers and writes
+// conversation_message(kind=answer) idempotently.
+func (h *Handler) AnswerQuestion(w http.ResponseWriter, r *http.Request) {
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, questionID, err := h.questionPathIDs(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.QuestionService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "question service is not configured"))
+		return
+	}
+	var request answerQuestionRequest
+	if err := decodeStrictBody(w, r, &request); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	answers, err := request.parse()
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	answered, err := h.deps.QuestionService.Answer(r.Context(), versionID, questionID, actorID, answers)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toQuestionView(answered))
+}
+
+// SkipQuestion POST /api/versions/{id}/questions/{qid}/skip. Skipping cancels
+// the question (status=cancelled, response.skipped) and never writes an answer.
+func (h *Handler) SkipQuestion(w http.ResponseWriter, r *http.Request) {
+	actorID, err := requireActor(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	versionID, questionID, err := h.questionPathIDs(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.QuestionService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "question service is not configured"))
+		return
+	}
+	var request skipQuestionRequest
+	if r.ContentLength != 0 {
+		if err := decodeStrictBody(w, r, &request); err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+	}
+	skipped, err := h.deps.QuestionService.Skip(r.Context(), versionID, questionID, actorID, request.Reason)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toQuestionView(skipped))
+}
+
+// ReopenQuestion POST /api/versions/{id}/questions/{qid}/reopen. Reopening is a
+// Host action scoped to the owning run (X-Agent-Run-Id), guarded by the state
+// machine back to pending.
+func (h *Handler) ReopenQuestion(w http.ResponseWriter, r *http.Request) {
+	versionID, questionID, err := h.questionPathIDs(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	agentRunID, err := questionOwnerID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h.deps.QuestionService == nil {
+		httpx.Error(w, r, platform.NewError(http.StatusInternalServerError, "internal", "question service is not configured"))
+		return
+	}
+	reopened, err := h.deps.QuestionService.Reopen(r.Context(), versionID, questionID,
+		executionapp.QuestionOwner{AgentRunID: agentRunID})
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toQuestionView(reopened))
+}
+
+// questionPathIDs parses the version/question path pair and verifies the version
+// exists.
+func (h *Handler) questionPathIDs(r *http.Request) (int64, int64, error) {
+	versionID, err := h.versionID(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	questionID, err := pathParamID(r, "qid", "question_id")
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := h.requireVersion(r.Context(), versionID); err != nil {
+		return 0, 0, err
+	}
+	return versionID, questionID, nil
+}
+
 /* ------------------------------ admin executors ---------------------------- */
 
 // ListExecutors GET /api/admin/executors (admin only).
@@ -996,6 +1293,34 @@ func (h *Handler) setExecutorStatus(w http.ResponseWriter, r *http.Request, stat
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toExecutorView(instance))
+}
+
+// CheckExecutor POST /api/admin/executors/{id}/check (admin only). It probes the
+// stored endpoint with the configured bearer token so the UI can tell an
+// offline executor (not started / unreachable) from one that rejects the token.
+func (h *Handler) CheckExecutor(w http.ResponseWriter, r *http.Request) {
+	executorID, err := pathParamID(r, "id", "executor_id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	ctx := r.Context()
+	instance, err := h.deps.Executors.Get(ctx, executorID)
+	if err != nil {
+		httpx.Error(w, r, mapRepoError(err, "executor"))
+		return
+	}
+	if h.deps.AuthChecker == nil {
+		httpx.Error(w, r, platform.Unavailable("executor auth checker is not configured"))
+		return
+	}
+	status, detail := h.deps.AuthChecker.Check(ctx, instance.Endpoint)
+	httpx.JSON(w, http.StatusOK, ExecutorAuthCheckView{
+		ExecutorID: platformid.Format(instance.ID),
+		Endpoint:   instance.Endpoint,
+		AuthStatus: string(status),
+		Detail:     detail,
+	})
 }
 
 /* --------------------------------- helpers --------------------------------- */

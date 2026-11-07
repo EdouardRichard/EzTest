@@ -15,12 +15,20 @@ const (
 // SupportsVision and ContextWindow mirror the legacy llm_model columns;
 // SupportsReasoning and SupportsPromptCache are stored in the capabilities
 // JSONB object. Readers merge both sources.
+//
+// CatalogContextWindow/CatalogMaxOutput keep the most recent upstream values of
+// the two numeric parameters inside the same JSONB object (A §4.4). They are
+// written on every catalog refresh so "reset to upstream" still works when an
+// administrator has overridden the legacy columns; no dedicated migration
+// columns are added (llm_0004 only carries the source markers).
 type Capabilities struct {
-	SupportsTools       bool `json:"supports_tools"`
-	SupportsVision      bool `json:"supports_vision"`
-	SupportsReasoning   bool `json:"supports_reasoning"`
-	SupportsPromptCache bool `json:"supports_prompt_cache"`
-	ContextWindow       int  `json:"context_window"`
+	SupportsTools        bool `json:"supports_tools"`
+	SupportsVision       bool `json:"supports_vision"`
+	SupportsReasoning    bool `json:"supports_reasoning"`
+	SupportsPromptCache  bool `json:"supports_prompt_cache"`
+	ContextWindow        int  `json:"context_window"`
+	CatalogContextWindow int  `json:"catalog_context_window,omitempty"`
+	CatalogMaxOutput     int  `json:"catalog_max_output,omitempty"`
 }
 
 // Model is one model exposed by an LLM configuration. Catalog rows come from
@@ -38,9 +46,18 @@ type Model struct {
 	Capabilities   Capabilities
 	Deprecated     bool
 	Source         string
-	Status         string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// WindowSource/OutputSource record where ContextWindow/MaxOutput came from:
+	// SourceCatalog (upstream, refresh may update it) or SourceManual (an
+	// administrator set it, refresh must preserve it). See llm_0004 and A §4.2.
+	WindowSource string
+	OutputSource string
+	// MaxInput is a derived, read-only view value (effective window minus
+	// effective output). It is never persisted; the application layer fills it
+	// before returning a model to the HTTP layer.
+	MaxInput  int64
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // EffectiveCapabilities merges the structured capability set with the legacy
@@ -54,6 +71,25 @@ func (m Model) EffectiveCapabilities() Capabilities {
 		capabilities.ContextWindow = m.ContextWindow
 	}
 	return capabilities
+}
+
+// EffectiveWindowSource returns the stored provenance of ContextWindow. Rows
+// written before llm_0004 (or fixtures that never set the field) read as
+// catalog, which is also the migration default.
+func (m Model) EffectiveWindowSource() string {
+	if m.WindowSource == "" {
+		return SourceCatalog
+	}
+	return m.WindowSource
+}
+
+// EffectiveOutputSource returns the stored provenance of MaxOutput; see
+// EffectiveWindowSource.
+func (m Model) EffectiveOutputSource() string {
+	if m.OutputSource == "" {
+		return SourceCatalog
+	}
+	return m.OutputSource
 }
 
 // Selectable reports whether the model may be resolved for a run: deprecated

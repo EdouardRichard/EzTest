@@ -1,8 +1,8 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useCallback, useEffect, useMemo, useState } from "react"
-
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
@@ -18,9 +18,14 @@ import {
   dedupeRequirements,
   deleteRequirement,
   getRequirement,
+  getRequirementExtraction,
   listConversations,
   listRequirements,
   mergeRequirements,
+  pauseRequirementExtraction,
+  resumeRequirementExtraction,
+  retryRequirementExtraction,
+  startRequirementExtraction,
 } from "./api"
 import { BulkConfirmBar } from "./BulkConfirmBar"
 import { ChatPanel } from "./ChatPanel"
@@ -34,6 +39,7 @@ import type {
   ConversationSummary,
   Requirement,
   RequirementDetail,
+  RequirementExtractionProgress,
   RequirementFilter,
   TargetOptions,
   VersionClarificationStats,
@@ -69,6 +75,296 @@ function activityText(payload: Record<string, unknown>): string | null {
   if (typeof payload.activity === "string" && payload.activity.length > 0) return payload.activity
   if (typeof payload.message === "string" && payload.message.length > 0) return payload.message
   return "AI 正在处理…"
+}
+
+/** Status labels of the requirement extraction card (API-5). */
+const EXTRACTION_STATUS_LABELS: Record<string, string> = {
+  pending: "待开始",
+  running: "解析中",
+  paused: "已暂停",
+  done: "已完成",
+  failed: "失败",
+}
+
+const EXTRACTION_SEGMENT_LABELS: Record<string, string> = {
+  pending: "待处理",
+  running: "处理中",
+  done: "完成",
+  failed: "失败",
+  skipped: "跳过",
+}
+
+export type ExtractionAction = "start" | "pause" | "resume" | "retry" | "retry_segment"
+
+export type ExtractionProgressCardProps = {
+  /** Latest run of the version; null before the first extraction. */
+  run: RequirementExtractionProgress | null
+  loading: boolean
+  /** Load failure of the progress read (never blocks the workspace itself). */
+  error: unknown
+  /** Typed action failure (400/404/409/503 from start/pause/resume/retry). */
+  actionError: unknown
+  notice: string | null
+  busy: ExtractionAction | null
+  onStart: () => void
+  onPause: () => void
+  onResume: () => void
+  onRetry: () => void
+  onRetrySegment: (seq: number) => void
+}
+
+/**
+ * Requirement extraction progress card (v0.22 A §7.8/API-5/API-6/API-7).
+ *
+ * It is a pure projection of the latest `requirement_extraction_run`: status,
+ * segment cursor, expected/extracted/missing counts, the persisted
+ * reconciliation report and the start/pause/resume/retry actions. V2 planned ids
+ * are rendered in their own partition and never listed as missing current ids.
+ */
+export function ExtractionProgressCard({
+  run,
+  loading,
+  error,
+  actionError,
+  notice,
+  busy,
+  onStart,
+  onPause,
+  onResume,
+  onRetry,
+  onRetrySegment,
+}: ExtractionProgressCardProps) {
+  const status = run?.status ?? null
+  const loadFailed = error !== null && run === null
+  const canStart = !loadFailed && (run === null || status === "done" || status === "failed")
+  const canPause = status === "pending" || status === "running"
+  const canResume = status === "paused"
+  const failedSegments = run?.segments.filter((segment) => segment.status === "failed") ?? []
+  const canRetry = status === "failed" || (run?.failed_segments ?? 0) > 0
+  const disabled = busy !== null
+  const coveragePercent =
+    run === null ? 0 : Math.min(100, Math.max(0, Math.round(run.coverage * 100)))
+  const startLabel = run === null ? "开始抽取" : "重新抽取"
+
+  return (
+    <section
+      data-testid="extraction-progress-card"
+      aria-label="需求文档抽取"
+      className="surface-card px-4 py-3"
+    >
+      <div className="flex flex-wrap items-start gap-2">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-foreground">需求文档抽取</h2>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            逐段抽取需求，完成后自动对账；可暂停、继续与重试失败段。
+          </p>
+        </div>
+        <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          {!loading && canStart ? (
+            <Button data-testid="extraction-start" size="sm" disabled={disabled} onClick={onStart}>
+              {startLabel}
+            </Button>
+          ) : null}
+          {canPause ? (
+            <Button
+              data-testid="extraction-pause"
+              size="sm"
+              variant="secondary"
+              disabled={disabled}
+              onClick={onPause}
+            >
+              暂停
+            </Button>
+          ) : null}
+          {canResume ? (
+            <Button
+              data-testid="extraction-resume"
+              size="sm"
+              disabled={disabled}
+              onClick={onResume}
+            >
+              继续
+            </Button>
+          ) : null}
+          {canRetry ? (
+            <Button
+              data-testid="extraction-retry"
+              size="sm"
+              variant="secondary"
+              disabled={disabled}
+              onClick={onRetry}
+            >
+              重试
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      {loading ? (
+        <p data-testid="extraction-loading" className="mt-2 text-[11px] text-muted-foreground">
+          正在加载抽取进度…
+        </p>
+      ) : null}
+
+      {error !== null ? (
+        <div className="mt-2">
+          <InlineError error={error} />
+        </div>
+      ) : null}
+
+      {!loading && run === null && error === null ? (
+        <p
+          data-testid="extraction-empty"
+          className="mt-2 rounded-lg border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground"
+        >
+          尚未开始抽取需求文档。上传需求文档后点击「开始抽取」，系统会按 4–8k
+          字符分段抽取并自动对账。
+        </p>
+      ) : null}
+
+      {run !== null ? (
+        <div className="mt-2.5 space-y-2">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+            <span
+              data-testid="extraction-status"
+              className={cn(
+                "rounded-full px-2 py-0.5 font-medium",
+                run.status === "failed"
+                  ? "bg-destructive/10 text-destructive"
+                  : run.status === "done"
+                    ? "bg-success/10 text-success"
+                    : "bg-muted text-foreground",
+              )}
+            >
+              {EXTRACTION_STATUS_LABELS[run.status] ?? run.status}
+            </span>
+            <span data-testid="extraction-segments" className="text-muted-foreground">
+              分段 {run.done_segments}/{run.total_segments}
+              {run.failed_segments > 0 ? `（失败 ${run.failed_segments}）` : ""}
+            </span>
+            <span data-testid="extraction-counts" className="text-foreground">
+              已抽取 {run.extracted}
+              {run.expected > 0 ? `/${run.expected}` : ""} 条
+            </span>
+            <span data-testid="extraction-coverage" className="text-muted-foreground">
+              覆盖率 {coveragePercent}%
+            </span>
+            {run.error ? <span className="text-destructive">{run.error}</span> : null}
+          </div>
+
+          <div
+            data-testid="extraction-coverage-bar"
+            role="progressbar"
+            aria-label="抽取覆盖率"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={coveragePercent}
+            className="h-1.5 overflow-hidden rounded-full bg-muted"
+          >
+            <div
+              className={cn(
+                "h-full rounded-full transition-[width]",
+                run.status === "failed" ? "bg-destructive" : "bg-primary",
+              )}
+              style={{ width: `${coveragePercent}%` }}
+            />
+          </div>
+
+          <div
+            data-testid="extraction-metrics"
+            className="flex flex-wrap gap-x-3 gap-y-1 text-[10.5px] text-muted-foreground"
+          >
+            <span>缺失 {run.missing}</span>
+            <span>规划 {run.planned_count}</span>
+            <span>低置信 {run.low_confidence}</span>
+            <span>跳过图片 {run.skipped_images}</span>
+          </div>
+
+          {failedSegments.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-1.5 text-[10.5px] text-muted-foreground">
+              <span>失败段：</span>
+              {failedSegments.map((segment) => (
+                <Button
+                  key={segment.seq}
+                  data-testid={`extraction-retry-segment-${segment.seq}`}
+                  size="sm"
+                  variant="ghost"
+                  disabled={disabled}
+                  onClick={() => onRetrySegment(segment.seq)}
+                >
+                  重试第 {segment.seq} 段
+                </Button>
+              ))}
+            </div>
+          ) : null}
+
+          <fieldset
+            data-testid="extraction-reconciliation"
+            aria-label="抽取对账"
+            className="grid gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] md:grid-cols-2"
+          >
+            <section data-testid="extraction-missing">
+              <h3 className="font-medium text-foreground">缺失（当前版本）· {run.missing}</h3>
+              {run.missing_ids.length === 0 ? (
+                <p className="mt-0.5 text-muted-foreground">无缺失</p>
+              ) : (
+                <ul className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 text-muted-foreground">
+                  {run.missing_ids.map((id) => (
+                    <li key={id}>{id}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+            <section data-testid="extraction-planned">
+              <h3 className="font-medium text-foreground">
+                V2 规划（不计入缺失）· {run.planned_count}
+              </h3>
+              {run.planned_ids.length === 0 ? (
+                <p className="mt-0.5 text-muted-foreground">无规划需求</p>
+              ) : (
+                <ul className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 text-muted-foreground">
+                  {run.planned_ids.map((id) => (
+                    <li key={id}>{id}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </fieldset>
+
+          {run.segments.length > 0 ? (
+            <div
+              data-testid="extraction-segment-list"
+              className="flex flex-wrap gap-1.5 text-[10.5px] text-muted-foreground"
+            >
+              {run.segments.map((segment) => (
+                <span
+                  key={segment.seq}
+                  title={segment.error ?? segment.heading_path}
+                  className={cn(
+                    "rounded border border-border px-1.5 py-0.5",
+                    segment.status === "failed" ? "text-destructive" : null,
+                  )}
+                >
+                  #{segment.seq} {EXTRACTION_SEGMENT_LABELS[segment.status] ?? segment.status}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {notice !== null ? (
+        <p data-testid="extraction-notice" role="status" className="mt-2 text-[11px] text-success">
+          {notice}
+        </p>
+      ) : null}
+      {actionError !== null ? (
+        <div className="mt-2">
+          <InlineError error={actionError} />
+        </div>
+      ) : null}
+    </section>
+  )
 }
 
 /**
@@ -119,6 +415,16 @@ export function RequirementsTab({
   const [activity, setActivity] = useState<string | null>(null)
   const [teamRoomToken, setTeamRoomToken] = useState(0)
 
+  const [extraction, setExtraction] = useState<RequirementExtractionProgress | null>(null)
+  const [extractionLoading, setExtractionLoading] = useState(true)
+  const [extractionError, setExtractionError] = useState<unknown>(null)
+  const [extractionActionError, setExtractionActionError] = useState<unknown>(null)
+  const [extractionNotice, setExtractionNotice] = useState<string | null>(null)
+  const [extractionBusy, setExtractionBusy] = useState<ExtractionAction | null>(null)
+  // `extraction.*` SSE events can arrive once per segment; coalesce them into a
+  // single progress read instead of one GET per event.
+  const extractionEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   const loadRequirements = useCallback(async (): Promise<void> => {
     setRequirements(await listRequirements(versionId))
   }, [versionId])
@@ -161,6 +467,69 @@ export function RequirementsTab({
   useEffect(() => {
     void loadWorkspace()
   }, [loadWorkspace])
+
+  /**
+   * The extraction progress is an independent read: a typed 404 (no run yet) is
+   * the card's empty state and any other failure only disables the card instead
+   * of failing the whole clarification workspace.
+   */
+  const loadExtraction = useCallback(async (): Promise<void> => {
+    setExtractionLoading(true)
+    setExtractionError(null)
+    try {
+      setExtraction(await getRequirementExtraction(versionId))
+    } catch (cause) {
+      setExtractionError(cause)
+    } finally {
+      setExtractionLoading(false)
+    }
+  }, [versionId])
+
+  useEffect(() => {
+    void loadExtraction()
+  }, [loadExtraction])
+
+  useEffect(
+    () => () => {
+      if (extractionEventTimer.current !== null) clearTimeout(extractionEventTimer.current)
+    },
+    [],
+  )
+
+  // The extraction progress card is owned by this tab; the page-level SSE
+  // subscription cannot reach it, so the tab consumes `extraction.*` itself.
+  const scheduleExtractionRefresh = useCallback(() => {
+    if (extractionEventTimer.current !== null) clearTimeout(extractionEventTimer.current)
+    extractionEventTimer.current = setTimeout(() => {
+      extractionEventTimer.current = null
+      void loadExtraction()
+    }, 350)
+  }, [loadExtraction])
+
+  /**
+   * Runs one extraction action (start/pause/resume/retry) and reloads the
+   * progress card. Server errors are typed ApiErrors and stay on the card as an
+   * inline alert; they never unmount the workspace.
+   */
+  async function runExtractionAction(
+    action: ExtractionAction,
+    notice: string,
+    request: () => Promise<unknown>,
+  ): Promise<void> {
+    if (extractionBusy !== null) return
+    setExtractionBusy(action)
+    setExtractionActionError(null)
+    setExtractionNotice(null)
+    try {
+      await request()
+      setExtractionNotice(notice)
+      await loadExtraction()
+    } catch (cause) {
+      setExtractionActionError(cause)
+    } finally {
+      setExtractionBusy(null)
+    }
+  }
 
   // The route passes searchParams as props; keep internal state in sync when a
   // browser back/forward navigation replaces the deep links.
@@ -213,6 +582,7 @@ export function RequirementsTab({
       }
     },
     onTeamRoomChanged: () => setTeamRoomToken((token) => token + 1),
+    onExtractionChanged: scheduleExtractionRefresh,
   })
 
   const targetOptions = useMemo<TargetOptions>(() => {
@@ -495,6 +865,44 @@ export function RequirementsTab({
   return (
     <div data-testid="requirements-tab" className="space-y-3">
       {createError !== null ? <InlineError error={createError} /> : null}
+
+      <ExtractionProgressCard
+        run={extraction}
+        loading={extractionLoading}
+        error={extractionError}
+        actionError={extractionActionError}
+        notice={extractionNotice}
+        busy={extractionBusy}
+        onStart={() => {
+          void runExtractionAction("start", "已开始抽取需求文档", () =>
+            startRequirementExtraction(versionId),
+          )
+        }}
+        onPause={() => {
+          if (extraction === null) return
+          void runExtractionAction("pause", "已暂停抽取", () =>
+            pauseRequirementExtraction(versionId, extraction.id),
+          )
+        }}
+        onResume={() => {
+          if (extraction === null) return
+          void runExtractionAction("resume", "已继续抽取", () =>
+            resumeRequirementExtraction(versionId, extraction.id),
+          )
+        }}
+        onRetry={() => {
+          if (extraction === null) return
+          void runExtractionAction("retry", "已重试失败段", () =>
+            retryRequirementExtraction(versionId, extraction.id),
+          )
+        }}
+        onRetrySegment={(seq) => {
+          if (extraction === null) return
+          void runExtractionAction("retry_segment", `已重试第 ${seq} 段`, () =>
+            retryRequirementExtraction(versionId, extraction.id, seq),
+          )
+        }}
+      />
 
       <div
         data-testid="workspace-grid"

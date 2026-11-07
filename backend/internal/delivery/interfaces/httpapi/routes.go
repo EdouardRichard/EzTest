@@ -8,11 +8,14 @@ import "net/http"
 func Register(mux *http.ServeMux, h *Handler) {
 	// Issues.
 	mux.Handle("GET /api/versions/{versionId}/issues", http.HandlerFunc(h.ListIssues))
+	mux.Handle("POST /api/versions/{versionId}/issues", http.HandlerFunc(h.CreateIssue))
 	mux.Handle("GET /api/versions/{versionId}/issues/{issueId}", http.HandlerFunc(h.GetIssue))
+	mux.Handle("PATCH /api/versions/{versionId}/issues/{issueId}", http.HandlerFunc(h.UpdateIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/confirm", http.HandlerFunc(h.ConfirmIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", http.HandlerFunc(h.DismissIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", http.HandlerFunc(h.ReopenIssue))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", http.HandlerFunc(h.MergeIssue))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/retest", http.HandlerFunc(h.RetestIssue))
 
 	// Reports.
 	mux.Handle("GET /api/versions/{versionId}/reports", http.HandlerFunc(h.ListReports))
@@ -21,6 +24,8 @@ func Register(mux *http.ServeMux, h *Handler) {
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", http.HandlerFunc(h.DownloadReportHTML))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", http.HandlerFunc(h.DownloadReportPDF))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", http.HandlerFunc(h.RegenerateReport))
+	// v0.22 W2-7 report artifacts (html/pdf/markdown). No DELETE: GC owns it.
+	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/artifacts", http.HandlerFunc(h.CreateReportArtifact))
 }
 
 // RegisterGlobal mounts the P6 cross-version read-only issue/report paths on the

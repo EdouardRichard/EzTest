@@ -78,6 +78,8 @@ type DatabaseView struct {
 }
 
 // AccountView never carries a password, only whether one is configured.
+// SUTID/EnvironmentID are retained for API compatibility but are always empty:
+// the v0.22 test-account pool is global (DB-15).
 type AccountView struct {
 	ID            string
 	SUTID         string
@@ -89,6 +91,18 @@ type AccountView struct {
 	PasswordSet   bool
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+// SUTRepositoryView is one SUT-level code-repository association with the
+// global repository summary and the optional role label (v0.22 DB-12).
+type SUTRepositoryView struct {
+	ID         string
+	SUTID      string
+	Repository CodeRepositoryView
+	Role       string
+	Enabled    bool
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // CodeRepositoryView is one source repository.

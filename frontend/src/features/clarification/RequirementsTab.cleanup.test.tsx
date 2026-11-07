@@ -38,6 +38,11 @@ const api = vi.hoisted(() => ({
   dedupeRequirements: vi.fn(),
   deleteRequirement: vi.fn(),
   mergeRequirements: vi.fn(),
+  getRequirementExtraction: vi.fn(),
+  startRequirementExtraction: vi.fn(),
+  pauseRequirementExtraction: vi.fn(),
+  resumeRequirementExtraction: vi.fn(),
+  retryRequirementExtraction: vi.fn(),
   getTeamRoom: vi.fn(),
   uploadContent: vi.fn(),
 }))
@@ -85,6 +90,7 @@ describe("RequirementsTab draft cleanup", () => {
     api.listMessages.mockResolvedValue([])
     api.getRequirement.mockResolvedValue(requirementDetailFixture)
     api.getTeamRoom.mockResolvedValue(teamRoomFixture)
+    api.getRequirementExtraction.mockResolvedValue(null)
     api.deleteRequirement.mockResolvedValue({ ...requirementDetailFixture, status: "obsolete" })
     api.mergeRequirements.mockResolvedValue({
       requirement: { ...requirementDetailFixture, revision: 2 },

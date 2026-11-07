@@ -192,7 +192,13 @@ func (h *ConversationHandler) UpdateModel(w http.ResponseWriter, r *http.Request
 	httpx.JSON(w, http.StatusOK, toConversationDTO(view))
 }
 
-// Messages GET /api/versions/{id}/conversations/{cid}/messages?after=&limit=.
+// Messages GET /api/versions/{id}/conversations/{cid}/messages?before=&after=&limit=.
+//
+// API-8/H4: without a cursor the newest page is returned (ascending by id) and
+// older history is fetched with `before`; the envelope always carries
+// `has_more` and `next_cursor`, which points at the oldest row of the returned
+// page when older history remains. The legacy `after` cursor keeps its P1
+// ascending/newest-cursor semantics so existing callers are not broken.
 func (h *ConversationHandler) Messages(w http.ResponseWriter, r *http.Request) {
 	versionID, conversationID, err := conversationPathIDs(r)
 	if err != nil {
@@ -205,8 +211,17 @@ func (h *ConversationHandler) Messages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Invalid("after", "must be a zero or positive decimal ID"))
 		return
 	}
+	var before *int64
+	if rawBefore := strings.TrimSpace(query.Get("before")); rawBefore != "" {
+		value, parseErr := pagination.Cursor(rawBefore)
+		if parseErr != nil || value <= 0 {
+			httpx.Error(w, r, platform.Invalid("before", "must be a positive decimal ID"))
+			return
+		}
+		before = &value
+	}
 	limit := pagination.Limit(query.Get("limit"), version.MessagesDefaultLimit, version.MessagesMaxLimit)
-	views, hasMore, err := h.svc.Messages(r.Context(), versionID, conversationID, after, limit)
+	views, hasMore, err := h.messagePage(r.Context(), versionID, conversationID, before, after, limit)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -217,9 +232,75 @@ func (h *ConversationHandler) Messages(w http.ResponseWriter, r *http.Request) {
 	}
 	nextCursor := ""
 	if hasMore && len(items) > 0 {
-		nextCursor = items[len(items)-1].ID
+		if before != nil || after == 0 {
+			// Older-page direction: continue before the oldest returned row.
+			nextCursor = items[0].ID
+		} else {
+			// Legacy after direction: continue after the newest returned row.
+			nextCursor = items[len(items)-1].ID
+		}
 	}
 	httpx.List(w, http.StatusOK, items, nextCursor, hasMore)
+}
+
+// messageScanMaxPages bounds the full-history scan the latest-page read performs
+// with the frozen max page size (200), so a hostile/degenerate conversation
+// cannot make one request unbounded. 500 pages = 100k messages.
+const messageScanMaxPages = 500
+
+// messagePage resolves one API-8 page: `before` returns the newest messages
+// older than the cursor, no cursor returns the newest page, and `after` keeps
+// the legacy ascending page. The scan is bounded and every page is re-validated
+// by the conversation service (version ownership).
+func (h *ConversationHandler) messagePage(
+	ctx context.Context,
+	versionID, conversationID int64,
+	before *int64,
+	after int64,
+	limit int,
+) ([]versionapp.MessageView, bool, error) {
+	if before == nil && after > 0 {
+		return h.svc.Messages(ctx, versionID, conversationID, after, limit)
+	}
+	if limit <= 0 {
+		limit = version.MessagesDefaultLimit
+	}
+	if limit > version.MessagesMaxLimit {
+		limit = version.MessagesMaxLimit
+	}
+	all := make([]versionapp.MessageView, 0, limit)
+	cursor := int64(0)
+	for page := 0; page < messageScanMaxPages; page++ {
+		views, hasMore, err := h.svc.Messages(ctx, versionID, conversationID, cursor, version.MessagesMaxLimit)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, view := range views {
+			if cursor > 0 && view.ID <= cursor {
+				// A static/misbehaving source repeated the page; stop instead of
+				// looping forever or duplicating rows.
+				return tailMessages(all, limit), len(all) > limit, nil
+			}
+			if before != nil && view.ID >= *before {
+				// Everything older than the cursor has been collected.
+				return tailMessages(all, limit), len(all) > limit, nil
+			}
+			all = append(all, view)
+		}
+		if !hasMore || len(views) == 0 {
+			return tailMessages(all, limit), len(all) > limit, nil
+		}
+		cursor = views[len(views)-1].ID
+	}
+	return tailMessages(all, limit), len(all) > limit, nil
+}
+
+// tailMessages keeps the newest `limit` messages of an ascending history.
+func tailMessages(views []versionapp.MessageView, limit int) []versionapp.MessageView {
+	if limit <= 0 || len(views) <= limit {
+		return views
+	}
+	return views[len(views)-limit:]
 }
 
 // PostMessage POST /api/versions/{id}/conversations/{cid}/messages.

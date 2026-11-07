@@ -61,13 +61,25 @@ func TestCaseAugmentDraftWriterPersistsDraft(t *testing.T) {
 	if len(item.current.Steps) != 2 || len(item.current.Assertions) != 1 {
 		t.Fatalf("persisted steps/assertions = %d/%d", len(item.current.Steps), len(item.current.Assertions))
 	}
-	if len(item.current.Sources) != 2 {
-		t.Fatalf("persisted sources = %+v, want one per gap fact", item.current.Sources)
+	// One knowledge source per gap fact plus the requirement-version provenance
+	// source that the refinement adds to every augmentation draft.
+	if len(item.current.Sources) != 3 {
+		t.Fatalf("persisted sources = %+v, want one per gap fact + requirement", item.current.Sources)
 	}
+	knowledgeSources := 0
+	requirementSources := 0
 	for _, source := range item.current.Sources {
-		if source.Kind != design.SourceKnowledge {
-			t.Fatalf("source kind = %q, want knowledge", source.Kind)
+		switch source.Kind {
+		case design.SourceKnowledge:
+			knowledgeSources++
+		case design.SourceRequirement:
+			requirementSources++
+		default:
+			t.Fatalf("source kind = %q, want knowledge or requirement", source.Kind)
 		}
+	}
+	if knowledgeSources != 2 || requirementSources != 1 {
+		t.Fatalf("sources = %+v, want 2 knowledge + 1 requirement", item.current.Sources)
 	}
 	// The requirement projection must be unchanged: augmentation never mutates a
 	// requirement (and it never confirms the case it created).

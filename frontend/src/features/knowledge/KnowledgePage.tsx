@@ -18,6 +18,7 @@ import { formatDateTime } from "@/lib/format"
 import { listKnowledge } from "./api"
 import { KnowledgeDetail } from "./KnowledgeDetail"
 import { KnowledgeEditor } from "./KnowledgeEditor"
+import { KnowledgeSearchPanel } from "./KnowledgeSearchPanel"
 import {
   KNOWLEDGE_SCOPE_LABELS,
   KNOWLEDGE_STATUS_LABELS,
@@ -259,6 +260,8 @@ export function KnowledgePage() {
           新建知识
         </Button>
       </header>
+
+      <KnowledgeSearchPanel onSelect={setSelectedId} />
 
       <form
         aria-label="知识筛选"

@@ -81,10 +81,13 @@ func (r *QueryReader) CountEvidenceCompleteness(ctx context.Context, versionID *
 	return num, denom, nil
 }
 
-// ListOpenHumanRequests returns open human requests, newest first with login
-// takeovers first. includeTakeover is false for non-admin viewers so
-// login_takeover rows are never fetched. The title is the request reason,
-// falling back to the kind label.
+// ListOpenHumanRequests returns pending execution-todo human requests, newest
+// first with login takeovers first. Execution todos are login_takeover plus the
+// v0.22 version-level approval/blocked_recovery/conflict decision kinds;
+// structured clarification_question rows have their own version question list
+// (Task 23), and the legacy other kind is not an execution todo. includeTakeover
+// is false for non-admin viewers so login_takeover rows are never fetched. The
+// title is the request reason, falling back to the kind label.
 func (r *QueryReader) ListOpenHumanRequests(ctx context.Context, includeTakeover bool, limit int) ([]executionapp.HumanRequestRow, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT
@@ -95,14 +98,17 @@ func (r *QueryReader) ListOpenHumanRequests(ctx context.Context, includeTakeover
 				NULLIF(payload->>'reason', ''),
 				CASE kind
 					WHEN 'login_takeover' THEN '登录接管'
-					WHEN 'conflict' THEN '账号冲突'
+					WHEN 'approval' THEN '审批'
+					WHEN 'blocked_recovery' THEN '阻塞恢复'
+					WHEN 'conflict' THEN '冲突处理'
 					ELSE '人工请求'
 				END
 			),
 			created_at,
 			expires_at
 		FROM human_request
-		WHERE status = 'open'
+		WHERE status = 'pending'
+		  AND kind IN ('login_takeover', 'approval', 'blocked_recovery', 'conflict')
 		  AND ($1::boolean OR kind <> 'login_takeover')
 		ORDER BY (kind = 'login_takeover') DESC, created_at DESC, id DESC
 		LIMIT $2

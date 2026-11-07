@@ -1,6 +1,7 @@
 package delivery
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,7 +24,148 @@ const (
 	IssueAssertionRefsMax = 3
 	// IssueCandidateSource is the only persisted issue source in P4.
 	IssueCandidateSource = "failure_candidate"
+	// IssueManualSource is the source of an issue created or edited manually
+	// (v0.22 W2-4). Candidate ingestion never writes it.
+	IssueManualSource = "manual"
 )
+
+// ManualIssueInput is the validated manual-create payload (v0.22 W2-4). The
+// case_run-derived fields are resolved by the application service; refs are
+// built from them plus the explicit evidence IDs.
+type ManualIssueInput struct {
+	VersionID     int64
+	Title         string
+	Summary       string
+	Category      string
+	Severity      string
+	CaseRunID     int64
+	CaseVersionID int64
+	RequirementID int64
+	VersionSUTID  *int64
+	EvidenceIDs   []int64
+}
+
+// NewManualIssue builds one open manual issue and its logical refs (v0.22
+// W2-4). The issue is always source='manual' and revision 1; the dedupe key is
+// a random 32-hex value so two manually created issues never collide on
+// uk_delivery_issue_version_id_dedupe_key and never consume the failure
+// candidate dedupe path.
+func NewManualIssue(in ManualIssueInput) (Issue, []IssueRef, error) {
+	if in.VersionID <= 0 {
+		return Issue{}, nil, ErrInvalidArgument
+	}
+	title := strings.TrimSpace(in.Title)
+	if err := validateManualIssueFields(title, in.Summary, in.Category, in.Severity); err != nil {
+		return Issue{}, nil, err
+	}
+	if in.CaseRunID < 0 || in.CaseVersionID < 0 || in.RequirementID < 0 {
+		return Issue{}, nil, ErrInvalidArgument
+	}
+	if in.VersionSUTID != nil && *in.VersionSUTID <= 0 {
+		return Issue{}, nil, ErrInvalidArgument
+	}
+	evidenceIDs, err := validateManualEvidenceIDs(in.EvidenceIDs)
+	if err != nil {
+		return Issue{}, nil, err
+	}
+	dedupeKey, err := manualDedupeKey()
+	if err != nil {
+		return Issue{}, nil, err
+	}
+	issue := Issue{
+		VersionID:        in.VersionID,
+		Title:            title,
+		Summary:          in.Summary,
+		Status:           IssueStatusOpen,
+		Category:         in.Category,
+		Severity:         in.Severity,
+		DedupeKey:        dedupeKey,
+		Source:           IssueManualSource,
+		ExpectedRevision: 1,
+	}
+	refs := make([]IssueRef, 0, 2+len(evidenceIDs))
+	appendRef := func(kind string, refID int64) {
+		refs = append(refs, IssueRef{
+			Kind:         kind,
+			RefID:        refID,
+			VersionSUTID: in.VersionSUTID,
+			Role:         IssueRefRoleSource,
+		})
+	}
+	if in.CaseRunID > 0 {
+		appendRef(IssueRefKindCaseRun, in.CaseRunID)
+	}
+	for _, evidenceID := range evidenceIDs {
+		appendRef(IssueRefKindEvidence, evidenceID)
+	}
+	if in.RequirementID > 0 {
+		appendRef(IssueRefKindRequirement, in.RequirementID)
+	}
+	return issue, capIssueRefs(refs), nil
+}
+
+// ValidateManualIssueFields exposes the manual title/summary/classification
+// bounds so the application service can reject invalid input before resolving
+// the optional case_run projection.
+func ValidateManualIssueFields(title, summary, category, severity string) error {
+	return validateManualIssueFields(strings.TrimSpace(title), summary, category, severity)
+}
+
+// ValidateManualEvidenceIDs exposes the explicit evidence-ref bounds.
+func ValidateManualEvidenceIDs(ids []int64) ([]int64, error) {
+	return validateManualEvidenceIDs(ids)
+}
+
+// validateManualIssueFields applies the delivery_issue title/summary/classification
+// bounds shared by create and patch.
+func validateManualIssueFields(title, summary, category, severity string) error {
+	titleLength := len([]rune(title))
+	if titleLength == 0 || titleLength > IssueTitleMax {
+		return ErrInvalidArgument
+	}
+	if len([]rune(summary)) > IssueSummaryMax {
+		return ErrInvalidArgument
+	}
+	if !validIssueCategory(category) || !validIssueSeverity(severity) {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
+// validateManualEvidenceIDs bounds and deduplicates the explicit evidence refs
+// of one manual issue. Non-positive IDs are a caller bug.
+func validateManualEvidenceIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	unique := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, ErrInvalidArgument
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) > IssueEvidenceRefsMax {
+		return nil, ErrInvalidArgument
+	}
+	return unique, nil
+}
+
+// manualDedupeKey draws the random 32-hex key of one manual issue. The unique
+// (version_id, dedupe_key) constraint then stays satisfied for every manual
+// create while the candidate path keeps deriving deterministic keys.
+func manualDedupeKey() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("delivery: generate manual issue dedupe key: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
+}
 
 // Issue ref kinds persisted by delivery_issue_ref (spec §3.2).
 const (

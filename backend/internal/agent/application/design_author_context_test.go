@@ -169,8 +169,7 @@ func TestDesignAuthorContextIsBounded(t *testing.T) {
 		totalTokens += segment.Tokens
 	}
 	if totalTokens > 32000 {
-		t.Fatalf("author context = %d conservative tokens, want <= 32000 (three turns must fit %d)",
-			totalTokens, agentapp.DesignRunMaxTokens)
+		t.Fatalf("author context = %d conservative tokens, want the bounded <= 32000 context", totalTokens)
 	}
 }
 
@@ -228,7 +227,6 @@ func TestDesignHostContextIsBounded(t *testing.T) {
 		totalTokens += segment.Tokens
 	}
 	if totalTokens > 32000 {
-		t.Fatalf("design host context = %d conservative tokens, want <= 32000 (three turns must fit %d)",
-			totalTokens, agentapp.DesignRunMaxTokens)
+		t.Fatalf("design host context = %d conservative tokens, want the bounded <= 32000 context", totalTokens)
 	}
 }

@@ -24,6 +24,27 @@ const (
 	ConversationClosed        = "closed"
 )
 
+// Conversation message kinds (design DB-3, B §5.1/§5.2). The Host reply is
+// text; a structured question is question; the DB CHECK constraint is the final
+// guard, so the application validates before writing.
+const (
+	MessageKindText     = "text"
+	MessageKindQuestion = "question"
+	MessageKindAnswer   = "answer"
+	MessageKindSystem   = "system"
+	MessageKindArtifact = "artifact"
+)
+
+// ConversationWriterLeaseDuration is the single-writer lease of one
+// conversation (B §5.1): 90 seconds, renewed by the Host's heartbeat. A crashed
+// turn is recoverable once the lease expires.
+const ConversationWriterLeaseDuration = 90 * time.Second
+
+// hostTurnClientMessageIDPrefix is the reserved client_message_id namespace of
+// a Host turn's idempotency key. User-supplied client ids must not collide with
+// it, otherwise a retried turn could resolve a user message (or vice versa).
+const hostTurnClientMessageIDPrefix = "host-turn:"
+
 // Message roles and part types.
 const (
 	MessageRoleUser      = "user"
@@ -39,6 +60,10 @@ const (
 	MessagePartCaseCard         = "case_card"
 	MessagePartRollbackProposal = "rollback_proposal"
 	MessagePartError            = "error"
+	// MessagePartQuestion is the v0.22 structured-question card (Task 23/36).
+	// It is a snapshot-only part (no conversation_message_part row) whose
+	// payload is the question card written by the runtime conversation writer.
+	MessagePartQuestion = "question"
 )
 
 // Conversation and message limits.
@@ -63,12 +88,34 @@ const (
 	MessageErrorMessageMax = 2000
 	MessageErrorActionMax  = 500
 	CaseCardTitleMax       = 255
+	// MessageErrorFieldMax/MessageErrorHintMax bound the v0.22 error-part
+	// metadata forwarded from a typed tools.Error (Task 36 fix round 1), and
+	// MessageErrorAllowedMax/MessageErrorAllowedItemMax bound its `allowed`
+	// list so one tool failure can never bloat the conversation snapshot.
+	MessageErrorFieldMax       = 200
+	MessageErrorHintMax        = 500
+	MessageErrorAllowedMax     = 50
+	MessageErrorAllowedItemMax = 200
+	// QuestionPartPayloadMax is the JSON byte cap of one question card part.
+	QuestionPartPayloadMax = 64 << 10
+	// QuestionPartBatchIDMax and QuestionPartQuestionsMax mirror the
+	// structured-question contract (1–5 questions, qb- batch id).
+	QuestionPartBatchIDMax   = 64
+	QuestionPartQuestionsMax = 5
 )
 
 // Conversation domain errors.
 var (
 	ErrConversationNotFound = errors.New("conversation not found")
 	ErrMessageNotFound      = errors.New("message not found")
+	// ErrConversationBusy reports that another Host turn holds the conversation's
+	// single-writer lease (typed 409 conversation_busy at the API edge).
+	ErrConversationBusy = errors.New("conversation is being written by another turn")
+	// ErrNotConversationWriter reports that the caller does not own the active
+	// writer lease (typed 403 not_writer at the API edge). Background jobs have
+	// no conversation.append capability; only the lease owner may write Host
+	// replies (R-B2-3/R-B2-4).
+	ErrNotConversationWriter = errors.New("not the active writer of the conversation")
 	// ErrJobCardCancelled reports that a job-card rewrite was rejected because
 	// the stored card is already cancelled: a late runner projection must never
 	// overwrite the terminal cancel snapshot. Callers treat it as an ignored,
@@ -89,6 +136,13 @@ type Conversation struct {
 	// (`llm_model.model`). Nil means "use the LLM config default_model_id";
 	// the runtime never switches models on its own (D24).
 	ModelOverride *string
+	// ActiveTurnID/ActiveAgent/LeaseUntil are the single-writer lease of the
+	// conversation (B §5.1 DB-2): while ActiveTurnID is non-nil that Host turn is
+	// the only writer allowed to append assistant messages, and LeaseUntil gates
+	// recovery after a crash. All three are cleared together.
+	ActiveTurnID  *int64
+	ActiveAgent   *string
+	LeaseUntil    *time.Time
 	CreatedBy     *int64
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
@@ -126,6 +180,13 @@ type Message struct {
 	AgentRunID       *int64
 	ClientMessageID  *string
 	ReplyToMessageID *int64
+	// AuthorAgent is the agent profile key that authored an assistant message
+	// (DB conversation_message.author_agent, B §5.1). It is empty for user
+	// messages and for server-generated cards (job_card/requirement_card).
+	AuthorAgent string
+	// Kind is the conversation_message kind enum (text/question/answer/system/
+	// artifact, DB-3). Empty is normalized to text for legacy writers.
+	Kind string
 	// ActualModel is the model that actually generated an assistant message,
 	// read from the linked agent_run. Empty for user messages and for
 	// assistant messages without a run (contracts `actual_model`).
@@ -182,6 +243,16 @@ type MessagePart struct {
 	Message   string
 	Retryable bool
 	Action    string
+	// Field/Allowed/Hint are the v0.22 retry metadata of a tool failure that
+	// the runner forwards from *tools.Error into the error part (Task 36 fix
+	// round 1). They are bounded by the MessageError* constants.
+	Field   string
+	Allowed []string
+	Hint    string
+	// question (v0.22 Task 23/36): the structured question card payload. It is
+	// opaque JSON owned by the question kind and is rendered flat on the wire
+	// (type + payload fields), matching the frontend QuestionPart contract.
+	Question json.RawMessage
 }
 
 // MarshalJSON renders the exact OpenAPI part shape for the part type.
@@ -288,15 +359,42 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 		return json.Marshal(payload)
 	case MessagePartError:
 		return json.Marshal(struct {
-			Type      string `json:"type"`
-			Code      string `json:"code"`
-			Message   string `json:"message"`
-			Retryable bool   `json:"retryable"`
-			Action    string `json:"action,omitempty"`
-		}{Type: p.Type, Code: p.Code, Message: p.Message, Retryable: p.Retryable, Action: p.Action})
+			Type      string   `json:"type"`
+			Code      string   `json:"code"`
+			Message   string   `json:"message"`
+			Retryable bool     `json:"retryable"`
+			Action    string   `json:"action,omitempty"`
+			Field     string   `json:"field,omitempty"`
+			Allowed   []string `json:"allowed,omitempty"`
+			Hint      string   `json:"hint,omitempty"`
+		}{
+			Type: p.Type, Code: p.Code, Message: p.Message, Retryable: p.Retryable,
+			Action: p.Action, Field: p.Field, Allowed: p.Allowed, Hint: p.Hint,
+		})
+	case MessagePartQuestion:
+		return marshalQuestionPart(p.Question)
 	default:
 		return nil, fmt.Errorf("unsupported message part type %q", p.Type)
 	}
+}
+
+// marshalQuestionPart renders the question card flat on the wire: the part
+// payload fields plus `type`. The frontend QuestionPart contract is
+// `{type:"question", ...payload}` (with the option of a nested `question`
+// object), never a nested `payload` field, so the stored snapshot and the SSE
+// frame share one shape.
+func marshalQuestionPart(payload json.RawMessage) ([]byte, error) {
+	fields := make(map[string]json.RawMessage)
+	if trimmed := bytes.TrimSpace(payload); len(trimmed) > 0 {
+		if err := json.Unmarshal(trimmed, &fields); err != nil {
+			return nil, fmt.Errorf("question part payload must be a JSON object: %w", err)
+		}
+	}
+	if fields == nil {
+		fields = make(map[string]json.RawMessage)
+	}
+	fields["type"], _ = json.Marshal(MessagePartQuestion)
+	return json.Marshal(fields)
 }
 
 // UnmarshalJSON reads the OpenAPI part shape back into the union.
@@ -436,15 +534,33 @@ func (p *MessagePart) UnmarshalJSON(data []byte) error {
 		*p = MessagePart{Type: probe.Type, CaseID: caseID, CaseVersionID: caseVersionID, Title: payload.Title, Status: payload.Status}
 	case MessagePartError:
 		var payload struct {
-			Code      string `json:"code"`
-			Message   string `json:"message"`
-			Retryable bool   `json:"retryable"`
-			Action    string `json:"action"`
+			Code      string   `json:"code"`
+			Message   string   `json:"message"`
+			Retryable bool     `json:"retryable"`
+			Action    string   `json:"action"`
+			Field     string   `json:"field"`
+			Allowed   []string `json:"allowed"`
+			Hint      string   `json:"hint"`
 		}
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return err
 		}
-		*p = MessagePart{Type: probe.Type, Code: payload.Code, Message: payload.Message, Retryable: payload.Retryable, Action: payload.Action}
+		*p = MessagePart{
+			Type: probe.Type, Code: payload.Code, Message: payload.Message,
+			Retryable: payload.Retryable, Action: payload.Action,
+			Field: payload.Field, Allowed: payload.Allowed, Hint: payload.Hint,
+		}
+	case MessagePartQuestion:
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return err
+		}
+		delete(fields, "type")
+		question, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		*p = MessagePart{Type: probe.Type, Question: question}
 	default:
 		return fmt.Errorf("unsupported message part type %q", probe.Type)
 	}
@@ -475,8 +591,22 @@ type ConversationSummary struct {
 	PinnedFacts    []string
 	TokenEstimate  int
 	Version        int
-	UpdatedAt      time.Time
+	// CoveredMessageID is the R-A5-12 incremental compaction watermark: the
+	// newest conversation message this revision folds. It is monotonic per
+	// conversation.
+	CoveredMessageID int64
+	// CompactionID is the opaque compaction transaction token that produced the
+	// revision (DB-4; not a snowflake ID).
+	CompactionID string
+	// SummaryMeta carries the compaction bookkeeping (trigger/summary tokens/
+	// truncation/cached tokens/fallback) as a JSON object.
+	SummaryMeta map[string]any
+	UpdatedAt   time.Time
 }
+
+// ErrSummaryWatermarkStale reports a summary revision whose covered_message_id
+// would move backwards (R-A5-12 monotonic watermark).
+var ErrSummaryWatermarkStale = errors.New("conversation summary covered_message_id would move backwards")
 
 // ConversationRepository persists conversations, messages and summaries.
 type ConversationRepository interface {
@@ -515,6 +645,37 @@ type ConversationRepository interface {
 	// returns the already-stored message instead of an error.
 	PostUserMessage(ctx context.Context, conversationID int64, message Message) (*Message, bool, error)
 	AppendAssistantMessage(ctx context.Context, conversationID int64, message Message) error
+	// AppendAssistantMessageAsBackground inserts one server/background assistant
+	// message only while no live Host writer lease exists. The conversation row
+	// is locked FOR UPDATE, so the lease re-check and the insert are one
+	// serialized step: a Host that acquires between the caller's read and this
+	// write cannot be overtaken by background text. A live lease (any turn,
+	// including the caller's) is ErrNotConversationWriter — the background path
+	// never becomes a writer, never renews and never clears the lease. An idle
+	// conversation or an expired non-NULL lease stays writable; the stored lease
+	// fields are left untouched so the owning turn's lifecycle is unaffected.
+	AppendAssistantMessageAsBackground(ctx context.Context, conversationID int64, message Message, now time.Time) error
+	// AcquireWriter atomically claims the conversation's single-writer lease for
+	// (turnID, agent) until leaseUntil. It succeeds when the conversation is idle
+	// (no active turn), when the stored lease already expired at now, or when the
+	// same turn/agent re-acquires (idempotent retry). A different live turn is
+	// ErrConversationBusy; an unknown conversation is ErrConversationNotFound.
+	AcquireWriter(ctx context.Context, conversationID, turnID int64, agent string, now, leaseUntil time.Time) error
+	// RenewWriterLease extends the lease of the current owner (heartbeat). It
+	// fails with ErrNotConversationWriter when turnID/agent no longer own a
+	// non-expired lease, and ErrConversationNotFound for an unknown conversation.
+	RenewWriterLease(ctx context.Context, conversationID, turnID int64, agent string, now, leaseUntil time.Time) error
+	// ReleaseWriter clears the lease of the current owner (clean turn end). A
+	// foreign turn is ErrNotConversationWriter and an already-released lease is a
+	// no-op; an unknown conversation is ErrConversationNotFound.
+	ReleaseWriter(ctx context.Context, conversationID, turnID int64, agent string) error
+	// AppendAssistantMessageAsWriter inserts one assistant message only when
+	// (turnID, agent) owns the live lease. An idle conversation or an expired
+	// lease is taken over atomically inside the write transaction (crash
+	// recovery); a different live writer is ErrConversationBusy. A repeated
+	// client_message_id returns the stored message with created=false instead of
+	// appending a duplicate (turn-level idempotency).
+	AppendAssistantMessageAsWriter(ctx context.Context, conversationID int64, message Message, turnID int64, agent string, now, leaseUntil time.Time) (*Message, bool, error)
 	Summary(ctx context.Context, conversationID int64) (*ConversationSummary, error)
 	// SaveSummary inserts a new summary version computed by the adapter.
 	SaveSummary(ctx context.Context, summary ConversationSummary) (ConversationSummary, error)
@@ -548,10 +709,49 @@ func ValidateConversationTitle(title string) error {
 	return validation.String("title", title, 1, ConversationTitleMax)
 }
 
-// ValidateClientMessageID validates the optional idempotency key length.
+// ValidateConversationMessageKind validates the DB-3 conversation_message kind
+// enum. Empty is the legacy default: NormalizeMessageKind maps it to text before
+// a write, and callers validate the normalized value.
+func ValidateConversationMessageKind(kind string) error {
+	switch kind {
+	case MessageKindText, MessageKindQuestion, MessageKindAnswer, MessageKindSystem, MessageKindArtifact:
+		return nil
+	default:
+		return platform.Invalid("kind", "must be one of text, question, answer, system, artifact")
+	}
+}
+
+// NormalizeMessageKind maps the empty legacy value to text and leaves explicit
+// kinds untouched.
+func NormalizeMessageKind(kind string) string {
+	if kind == "" {
+		return MessageKindText
+	}
+	return kind
+}
+
+// HostTurnClientMessageID derives the reserved idempotency key of one Host
+// turn. Assistant message writes store it in conversation_message.
+// client_message_id, so a retried turn resolves the stored message instead of
+// appending a duplicate (B §5.1: client_message_id / turn_id).
+func HostTurnClientMessageID(turnID int64) string {
+	return hostTurnClientMessageIDPrefix + strconv.FormatInt(turnID, 10)
+}
+
+// IsReservedClientMessageID reports whether raw collides with the Host-turn
+// idempotency namespace. User client ids may not use it.
+func IsReservedClientMessageID(raw string) bool {
+	return strings.HasPrefix(raw, hostTurnClientMessageIDPrefix)
+}
+
+// ValidateClientMessageID validates the optional idempotency key length and
+// keeps the reserved Host-turn namespace out of user input.
 func ValidateClientMessageID(raw string) error {
 	if utf8.RuneCountInString(raw) > ClientMessageIDMax {
 		return platform.Invalid("client_message_id", "must be at most 64 characters")
+	}
+	if IsReservedClientMessageID(raw) {
+		return platform.Invalid("client_message_id", "must not use the reserved host-turn idempotency namespace")
 	}
 	return nil
 }
@@ -668,6 +868,26 @@ func ValidateAssistantMessageParts(parts []MessagePart) error {
 			if err := validation.String(field("action"), part.Action, 0, MessageErrorActionMax); err != nil {
 				return err
 			}
+			if err := validation.String(field("field"), part.Field, 0, MessageErrorFieldMax); err != nil {
+				return err
+			}
+			if err := validation.String(field("hint"), part.Hint, 0, MessageErrorHintMax); err != nil {
+				return err
+			}
+			if len(part.Allowed) > MessageErrorAllowedMax {
+				return platform.Invalid(field("allowed"),
+					fmt.Sprintf("must contain at most %d entries", MessageErrorAllowedMax))
+			}
+			for allowedIndex, allowed := range part.Allowed {
+				if err := validation.String(fmt.Sprintf("parts[%d].allowed[%d]", index, allowedIndex),
+					allowed, 1, MessageErrorAllowedItemMax); err != nil {
+					return err
+				}
+			}
+		case MessagePartQuestion:
+			if err := validateQuestionPart(part, field); err != nil {
+				return err
+			}
 		case MessagePartAttachment:
 			if err := validateAttachmentPart(part, field); err != nil {
 				return err
@@ -693,8 +913,53 @@ func ValidateAssistantMessageParts(parts []MessagePart) error {
 			}
 		default:
 			return platform.Invalid(field("type"),
-				"must be text, thinking, tool_call, job_card, attachment, requirement_card, case_card, error or rollback_proposal")
+				"must be text, thinking, tool_call, job_card, attachment, requirement_card, case_card, error, question or rollback_proposal")
 		}
+	}
+	return nil
+}
+
+// validateQuestionPart validates one structured-question card payload. The
+// authoritative question batch lives in human_request.question; this part is
+// the persisted conversation snapshot the frontend renders, so the domain only
+// enforces the stable envelope: a positive question_id, a bounded batch_id and
+// a non-empty, bounded questions array. Unknown payload fields are preserved
+// (status/answers/answered_* are written by the answer echo payload).
+func validateQuestionPart(part MessagePart, field func(string) string) error {
+	payload := bytes.TrimSpace(part.Question)
+	if len(payload) == 0 {
+		return platform.Invalid(field("question"), "must be a JSON object")
+	}
+	if len(payload) > QuestionPartPayloadMax {
+		return platform.Invalid(field("question"), "must be at most 64 KiB")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return platform.Invalid(field("question"), "must be a JSON object")
+	}
+	var questionID string
+	if raw, ok := object["question_id"]; !ok || json.Unmarshal(raw, &questionID) != nil {
+		return platform.Invalid(field("question_id"), "must be a positive decimal ID")
+	}
+	questionID = strings.TrimSpace(questionID)
+	parsedID, err := strconv.ParseInt(questionID, 10, 64)
+	if err != nil || parsedID <= 0 {
+		return platform.Invalid(field("question_id"), "must be a positive decimal ID")
+	}
+	var batchID string
+	if raw, ok := object["batch_id"]; !ok || json.Unmarshal(raw, &batchID) != nil {
+		return platform.Invalid(field("batch_id"), "must be a non-empty string")
+	}
+	if err := validation.String(field("batch_id"), batchID, 1, QuestionPartBatchIDMax); err != nil {
+		return err
+	}
+	var questions []json.RawMessage
+	if raw, ok := object["questions"]; !ok || json.Unmarshal(raw, &questions) != nil {
+		return platform.Invalid(field("questions"), "must be a non-empty array")
+	}
+	if len(questions) == 0 || len(questions) > QuestionPartQuestionsMax {
+		return platform.Invalid(field("questions"),
+			fmt.Sprintf("must contain between 1 and %d questions", QuestionPartQuestionsMax))
 	}
 	return nil
 }
@@ -728,12 +993,12 @@ func StreamingMessagePartTypes() []string {
 }
 
 var jobCardKinds = map[string]struct{}{
-	"explore.login": {}, "explore.page": {}, "explore.api": {}, "explore.coverage": {},
-	"explore.gap": {}, "design.cases": {}, "review.cases": {}, "execute.batch": {},
+	"design.cases": {}, "review.cases": {}, "execute.batch": {},
 	"analyze.failure": {}, "report.version": {}, "knowledge.propose": {},
 }
 
 // IsValidJobCardKind reports whether kind is one of the frozen 0.2.1 job kinds.
+// The five explore.* kinds were removed by v0.22 D-B1/R-W1-5.
 func IsValidJobCardKind(kind string) bool {
 	_, ok := jobCardKinds[kind]
 	return ok

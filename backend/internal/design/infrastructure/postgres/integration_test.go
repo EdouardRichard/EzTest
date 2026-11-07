@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -44,25 +45,60 @@ func seedVersion(t *testing.T, pool *pgxpool.Pool, versionID int64, autoDesign b
 
 func seedVersionSUT(t *testing.T, pool *pgxpool.Pool, versionID, versionSUTID int64, pages, apis []int64) {
 	t.Helper()
-	scope, err := json.Marshal(map[string]any{"pages": pages, "apis": apis})
-	if err != nil {
-		t.Fatalf("encode scope: %v", err)
+	ctx := context.Background()
+	// v0.22 derives the version range from the bound SUT environment's approved
+	// resources, so the fixture must create the owning SUT/environment and the
+	// approved page/API rows. The version_sut row itself no longer carries an
+	// inclusion list (scope_exclude is empty = whole environment).
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sut (id, name, created_by) VALUES ($1, $2, 1)
+		ON CONFLICT (id) DO NOTHING
+	`, versionSUTID, fmt.Sprintf("design-sut-%d", versionSUTID)); err != nil {
+		t.Fatalf("seed version sut: %v", err)
 	}
-	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO version_sut (id, version_id, sut_id, environment_id, scope)
-		VALUES ($1, $2, $1, $1, $3::jsonb)
-	`, versionSUTID, versionID, string(scope)); err != nil {
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sut_environment (id, sut_id, name, base_url)
+		VALUES ($1, $1, $2, $3)
+		ON CONFLICT (id) DO NOTHING
+	`, versionSUTID, fmt.Sprintf("env-%d", versionSUTID), fmt.Sprintf("https://env-%d.example.test", versionSUTID)); err != nil {
+		t.Fatalf("seed version environment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO version_sut (id, version_id, sut_id, environment_id, status)
+		VALUES ($1, $2, $1, $1, 'active')
+	`, versionSUTID, versionID); err != nil {
 		t.Fatalf("seed version_sut: %v", err)
+	}
+	for _, pageID := range pages {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template, status)
+			VALUES ($1, $2, $2, $3, $4, $5, 'approved')
+		`, pageID, versionSUTID, fmt.Sprintf("page-%d", pageID),
+			fmt.Sprintf("https://env.example.test/p%d", pageID), fmt.Sprintf("/p%d", pageID)); err != nil {
+			t.Fatalf("seed version page: %v", err)
+		}
+	}
+	for _, apiID := range apis {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name, status)
+			VALUES ($1, $2, $2, 'GET', $3, $4, 'approved')
+		`, apiID, versionSUTID, fmt.Sprintf("/api/a%d", apiID), fmt.Sprintf("api-%d", apiID)); err != nil {
+			t.Fatalf("seed version api: %v", err)
+		}
 	}
 }
 
 func seedVersionDatabase(t *testing.T, pool *pgxpool.Pool, versionSUTID, databaseID int64) {
 	t.Helper()
+	// v0.22 excludes databases through version_sut.scope_exclude; the version's
+	// databases are the bound environment's active target databases. A fixture
+	// row therefore lands in target_database, not in version_sut_resource.
 	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO version_sut_resource (id, version_sut_id, kind, resource_id, selected)
-		VALUES ($1, $2, 'database', $3, true)
-	`, databaseID+1, versionSUTID, databaseID); err != nil {
-		t.Fatalf("seed version_sut_resource: %v", err)
+		INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username)
+		VALUES ($1, $3, $3, $2, $4, 'reader')
+	`, databaseID, fmt.Sprintf("db-%d", databaseID), versionSUTID,
+		fmt.Sprintf("postgres://db-%d.example.test/test", databaseID)); err != nil {
+		t.Fatalf("seed version database: %v", err)
 	}
 }
 

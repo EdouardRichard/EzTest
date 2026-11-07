@@ -5,6 +5,7 @@ package deliveryapp_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -21,7 +22,8 @@ import (
 
 // integrationIssueExecution serves the case_run snapshots of IngestCandidate.
 type integrationIssueExecution struct {
-	snapshots map[int64]deliveryapp.CaseRunSnapshot
+	snapshots     map[int64]deliveryapp.CaseRunSnapshot
+	waveSnapshots map[int64]deliveryapp.WaveSnapshot
 }
 
 func (e *integrationIssueExecution) ListFailedApplicationCaseRuns(context.Context, int64) ([]deliveryapp.CaseRunSnapshot, error) {
@@ -36,8 +38,12 @@ func (e *integrationIssueExecution) CaseRunSnapshot(_ context.Context, caseRunID
 	return snapshot, nil
 }
 
-func (e *integrationIssueExecution) WaveSnapshot(context.Context, int64, int64) (deliveryapp.WaveSnapshot, error) {
-	return deliveryapp.WaveSnapshot{}, nil
+func (e *integrationIssueExecution) WaveSnapshot(_ context.Context, _, waveID int64) (deliveryapp.WaveSnapshot, error) {
+	snapshot, ok := e.waveSnapshots[waveID]
+	if !ok {
+		return deliveryapp.WaveSnapshot{}, nil
+	}
+	return snapshot, nil
 }
 
 func (e *integrationIssueExecution) VersionSnapshot(context.Context, int64) (deliveryapp.VersionSnapshot, error) {
@@ -118,7 +124,10 @@ func newIntegrationIssueFixture(t *testing.T) *integrationIssueFixture {
 		t.Fatalf("new snowflake: %v", err)
 	}
 	repo := deliverypg.NewIssueRepository(pool, ids)
-	exec := &integrationIssueExecution{snapshots: map[int64]deliveryapp.CaseRunSnapshot{}}
+	exec := &integrationIssueExecution{
+		snapshots:     map[int64]deliveryapp.CaseRunSnapshot{},
+		waveSnapshots: map[int64]deliveryapp.WaveSnapshot{},
+	}
 	events := &integrationIssueEvents{}
 	audit := &integrationIssueAudit{}
 	svc := deliveryapp.NewIssueService(repo, exec, events, audit,
@@ -184,6 +193,228 @@ func integrationIssueCreate(t *testing.T, repo *deliverypg.IssueRepository, snap
 		t.Fatalf("create candidate %d reported an existing issue %d", snapshot.ID, created.ID)
 	}
 	return created, refs
+}
+
+/* ------------------------------- manual issue ------------------------------ */
+
+// TestIssueServiceIntegrationManualCreateAndPatch drives the manual create and
+// patch use cases through the real PostgreSQL repository:
+//   - create persists source='manual', the case_run/evidence/requirement refs and
+//     the user creation history, then publishes issue.created;
+//   - patch increments expected_revision, appends the new evidence ref and a
+//     from=to history row, then publishes issue.updated;
+//   - a stale expected_revision is a conflict and leaves the row untouched;
+//   - merge_into_id merges the issue through the existing merge path;
+//   - unrelated candidate de-duplication still reuses the same issue.
+func TestIssueServiceIntegrationManualCreateAndPatch(t *testing.T) {
+	fixture := newIntegrationIssueFixture(t)
+	ctx := context.Background()
+	const versionID = int64(100)
+
+	caseRun := integrationIssueSnapshot(versionID, 5001, 6001)
+	fixture.exec.snapshots[caseRun.ID] = caseRun
+
+	issue, err := fixture.svc.CreateManual(ctx, deliveryapp.CreateManualIssueInput{
+		VersionID:   versionID,
+		Title:       "Manual checkout failure",
+		Summary:     "first",
+		Category:    "api",
+		Severity:    "major",
+		CaseRunID:   caseRun.ID,
+		EvidenceIDs: []int64{7001, 7002},
+	}, 77)
+	if err != nil {
+		t.Fatalf("CreateManual: %v", err)
+	}
+	if issue.ID <= 0 || issue.Source != delivery.IssueManualSource || issue.ExpectedRevision != 1 {
+		t.Fatalf("manual issue = %+v, want source manual revision 1", issue)
+	}
+
+	var source, retestStatus string
+	if err := fixture.pool.QueryRow(ctx,
+		`SELECT source, retest_status FROM delivery_issue WHERE id = $1`, issue.ID,
+	).Scan(&source, &retestStatus); err != nil {
+		t.Fatalf("read manual issue row: %v", err)
+	}
+	if source != delivery.IssueManualSource {
+		t.Errorf("stored source = %q, want manual", source)
+	}
+	if retestStatus != "not_retested" {
+		t.Errorf("stored retest_status = %q, want the migration default not_retested", retestStatus)
+	}
+
+	refs, err := fixture.repo.ListRefs(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("ListRefs after manual create: %v", err)
+	}
+	wantRefs := map[string][]int64{
+		delivery.IssueRefKindCaseRun:     {caseRun.ID},
+		delivery.IssueRefKindEvidence:    {7001, 7002},
+		delivery.IssueRefKindRequirement: {caseRun.RequirementID},
+	}
+	gotRefs := map[string][]int64{}
+	for _, ref := range refs {
+		gotRefs[ref.Kind] = append(gotRefs[ref.Kind], ref.RefID)
+	}
+	for kind, want := range wantRefs {
+		got := gotRefs[kind]
+		if len(got) != len(want) {
+			t.Errorf("%s refs = %v, want %v", kind, got, want)
+			continue
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("%s refs = %v, want %v", kind, got, want)
+			}
+		}
+	}
+
+	history, err := fixture.repo.ListHistory(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("ListHistory after manual create: %v", err)
+	}
+	if len(history) != 1 || history[0].From != nil || history[0].To != delivery.IssueStatusOpen ||
+		history[0].ActorID == nil || *history[0].ActorID != 77 || history[0].ActorKind != "user" {
+		t.Fatalf("manual creation history = %+v, want from=NULL to=open actor 77", history)
+	}
+	if len(fixture.events.records) != 1 || fixture.events.records[0].eventType != "issue.created" ||
+		fixture.events.records[0].payload["source"] != delivery.IssueManualSource {
+		t.Fatalf("manual create events = %+v, want issue.created with source manual", fixture.events.records)
+	}
+	t.Logf("manual issue row: id=%d version=%d source=%s expected_revision=%d retest_status=%s",
+		issue.ID, issue.VersionID, source, issue.ExpectedRevision, retestStatus)
+	for _, ref := range refs {
+		t.Logf("manual issue ref: issue_id=%d kind=%s ref_id=%d role=%s", ref.IssueID, ref.Kind, ref.RefID, ref.Role)
+	}
+	for _, row := range history {
+		t.Logf("manual issue history: from=%v to=%s actor_id=%v actor_kind=%s",
+			row.From, row.To, row.ActorID, row.ActorKind)
+	}
+	t.Logf("manual issue event: type=%s version_id=%d payload=%v",
+		fixture.events.records[0].eventType, fixture.events.records[0].versionID, fixture.events.records[0].payload)
+	if len(fixture.audit.records) != 1 || fixture.audit.records[0].action != "delivery.issue.created" ||
+		fixture.audit.records[0].actorID != 77 {
+		t.Fatalf("manual create audit = %+v", fixture.audit.records)
+	}
+
+	patched, err := fixture.svc.UpdateManual(ctx, versionID, issue.ID, deliveryapp.UpdateManualIssueInput{
+		ExpectedRevision: issue.ExpectedRevision,
+		Summary:          "second",
+		EvidenceIDs:      []int64{7003},
+	}, 78)
+	if err != nil {
+		t.Fatalf("UpdateManual: %v", err)
+	}
+	if patched.Summary != "second" || patched.ExpectedRevision != 2 {
+		t.Fatalf("patched issue = %+v, want summary second revision 2", patched)
+	}
+	refsAfter, err := fixture.repo.ListRefs(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("ListRefs after patch: %v", err)
+	}
+	foundEvidence := false
+	for _, ref := range refsAfter {
+		if ref.Kind == delivery.IssueRefKindEvidence && ref.RefID == 7003 {
+			foundEvidence = true
+		}
+	}
+	if !foundEvidence {
+		t.Errorf("patched issue refs = %+v, want the new evidence 7003", refsAfter)
+	}
+	history, err = fixture.repo.ListHistory(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("ListHistory after patch: %v", err)
+	}
+	if len(history) != 2 || history[1].From == nil || *history[1].From != delivery.IssueStatusOpen ||
+		history[1].To != delivery.IssueStatusOpen ||
+		history[1].ActorID == nil || *history[1].ActorID != 78 || history[1].ActorKind != "user" {
+		t.Fatalf("manual patch history = %+v, want a from=to=open user row", history)
+	}
+	if len(fixture.events.records) != 2 || fixture.events.records[1].eventType != "issue.updated" {
+		t.Fatalf("manual patch events = %+v, want issue.updated", fixture.events.records)
+	}
+
+	if _, err := fixture.svc.UpdateManual(ctx, versionID, issue.ID, deliveryapp.UpdateManualIssueInput{
+		ExpectedRevision: 1,
+		Summary:          "stale",
+	}, 78); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("stale patch error = %v, want ErrStateConflict", err)
+	}
+	stored, err := fixture.repo.Get(ctx, versionID, issue.ID)
+	if err != nil || stored.Summary != "second" || stored.ExpectedRevision != 2 {
+		t.Fatalf("stale patch changed issue: %+v err=%v", stored, err)
+	}
+
+	target, err := fixture.svc.CreateManual(ctx, deliveryapp.CreateManualIssueInput{
+		VersionID: versionID,
+		Title:     "Merge target",
+		Summary:   "target",
+		Category:  "ui",
+		Severity:  "minor",
+	}, 79)
+	if err != nil {
+		t.Fatalf("CreateManual(target): %v", err)
+	}
+	merged, err := fixture.svc.UpdateManual(ctx, versionID, issue.ID, deliveryapp.UpdateManualIssueInput{
+		ExpectedRevision: patched.ExpectedRevision,
+		MergeIntoID:      target.ID,
+		Reason:           "duplicate of target",
+	}, 79)
+	if err != nil {
+		t.Fatalf("UpdateManual(merge): %v", err)
+	}
+	if merged.Status != delivery.IssueStatusMerged || merged.MergedIntoID == nil || *merged.MergedIntoID != target.ID {
+		t.Fatalf("merged manual issue = %+v, want merged into %d", merged, target.ID)
+	}
+	stored, err = fixture.repo.Get(ctx, versionID, issue.ID)
+	if err != nil || stored.Status != delivery.IssueStatusMerged ||
+		stored.MergedIntoID == nil || *stored.MergedIntoID != target.ID {
+		t.Fatalf("stored merged manual issue = %+v err=%v", stored, err)
+	}
+	eventTypes := make([]string, 0, len(fixture.events.records))
+	for _, record := range fixture.events.records {
+		eventTypes = append(eventTypes, record.eventType)
+	}
+	if len(eventTypes) < 4 || eventTypes[len(eventTypes)-1] != "issue.merged" {
+		t.Fatalf("event types = %v, want the merge as the last event", eventTypes)
+	}
+
+	// Manual issues never consume the failure-candidate dedupe path, and the
+	// candidate de-duplication itself still reuses one issue per dedupe key.
+	secondManual, err := fixture.svc.CreateManual(ctx, deliveryapp.CreateManualIssueInput{
+		VersionID: versionID,
+		Title:     "Manual checkout failure",
+		Summary:   "a separate manual issue",
+		Category:  "api",
+		Severity:  "major",
+	}, 80)
+	if err != nil {
+		t.Fatalf("second CreateManual: %v", err)
+	}
+	if secondManual.ID == issue.ID {
+		t.Fatalf("two manual issues reused ID %d, want distinct rows", issue.ID)
+	}
+
+	firstCandidate, _ := integrationIssueCreate(t, fixture.repo,
+		integrationIssueSnapshot(versionID, 5101, 6101))
+	second, secondRefs := integrationIssueBuildCandidate(t, integrationIssueSnapshot(versionID, 5102, 6101))
+	deduped, created, err := fixture.repo.CreateCandidate(ctx, second, secondRefs)
+	if err != nil {
+		t.Fatalf("candidate dedupe: %v", err)
+	}
+	if created || deduped.ID != firstCandidate.ID {
+		t.Fatalf("candidate dedupe = %+v created=%v, want the existing issue %d", deduped, created, firstCandidate.ID)
+	}
+}
+
+// integrationIssueBuildCandidate builds a candidate without inserting it.
+func integrationIssueBuildCandidate(t *testing.T, snapshot deliveryapp.CaseRunSnapshot) (delivery.Issue, []delivery.IssueRef) {
+	t.Helper()
+	issue, refs, err := delivery.NewIssueCandidate(integrationIssueInput(snapshot))
+	if err != nil {
+		t.Fatalf("build candidate %d: %v", snapshot.ID, err)
+	}
+	return issue, refs
 }
 
 /* ---------------------------------- tests --------------------------------- */
@@ -452,7 +683,10 @@ func TestIssueServiceIntegrationReportRevisionStableAfterRecurrence(t *testing.T
 	}); err != nil {
 		t.Fatalf("merge: %v", err)
 	}
-	exec := &integrationIssueExecution{snapshots: map[int64]deliveryapp.CaseRunSnapshot{}}
+	exec := &integrationIssueExecution{
+		snapshots:     map[int64]deliveryapp.CaseRunSnapshot{},
+		waveSnapshots: map[int64]deliveryapp.WaveSnapshot{},
+	}
 	recurrence := integrationIssueSnapshot(versionID, 3303, 4301)
 	exec.snapshots[recurrence.ID] = recurrence
 	issueSvc := deliveryapp.NewIssueService(issueRepo, exec, nil, nil,

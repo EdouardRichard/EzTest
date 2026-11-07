@@ -50,6 +50,36 @@ func (s SUT) Validate() error {
 	return nil
 }
 
+// SUTRepository associates one global code repository with a SUT (v0.22
+// R-C2/DB-12). A SUT may associate two or more repositories; versions inherit
+// the enabled rows and adjust them through version_repository_override.
+type SUTRepository struct {
+	ID        int64
+	SUTID     int64
+	RepoID    int64
+	Role      string
+	Enabled   bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// MaxRepositoryRoleRunes caps the optional repository role label.
+const MaxRepositoryRoleRunes = 64
+
+// Validate checks one SUT-repository association.
+func (r SUTRepository) Validate() error {
+	if r.SUTID <= 0 {
+		return platform.Invalid("sut_id", "must be a positive decimal ID")
+	}
+	if r.RepoID <= 0 {
+		return platform.Invalid("repo_id", "must be a positive decimal ID")
+	}
+	if utf8.RuneCountInString(r.Role) > MaxRepositoryRoleRunes {
+		return platform.Invalid("role", "must be at most 64 characters")
+	}
+	return nil
+}
+
 // NormalizeFamily trims and validates the optional SUT family. nil means the
 // SUT has no family. A present family must be lowercase, 1..64 runes and free
 // of whitespace so it can be used as a knowledge system_key.

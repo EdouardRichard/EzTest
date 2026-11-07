@@ -15,9 +15,10 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
-// TestBudgetDecide pins the P2-T4 budget policy: completion wins over resource
-// budgets, a budget hit triggers settlement, and a settlement that is itself
-// over budget is exhausted (hard stop).
+// TestBudgetDecide pins the v0.22 budget policy (spec R-A2): completion wins
+// over resource budgets, tokens are telemetry only and never terminate, while a
+// hit wall-clock/turn budget triggers settlement; a settlement turn that is
+// itself over budget is exhausted (hard stop).
 func TestBudgetDecide(t *testing.T) {
 	defaults := agentapp.Budget{}
 	cases := []struct {
@@ -26,20 +27,19 @@ func TestBudgetDecide(t *testing.T) {
 		usage  agentapp.Usage
 		want   agentapp.BudgetDecision
 	}{
-		{"default under budget", defaults, agentapp.Usage{Tokens: 19999, Seconds: 119, Turns: 23}, agentapp.BudgetContinue},
-		{"default tokens at cap", defaults, agentapp.Usage{Tokens: 20000}, agentapp.BudgetSettle},
-		{"default tokens over cap", defaults, agentapp.Usage{Tokens: 20001}, agentapp.BudgetSettle},
+		{"default under budget", defaults, agentapp.Usage{Tokens: 1_000_000, Seconds: 119, Turns: 23}, agentapp.BudgetContinue},
+		{"default token telemetry never settles", defaults, agentapp.Usage{Tokens: 20001}, agentapp.BudgetContinue},
 		{"default run seconds at cap", defaults, agentapp.Usage{Seconds: 120}, agentapp.BudgetSettle},
 		{"default turns fuse", defaults, agentapp.Usage{Turns: 24}, agentapp.BudgetSettle},
 		{"explicit budget under", agentapp.Budget{MaxTokens: 100, RunSeconds: 10, MaxTurnsFuse: 3},
 			agentapp.Usage{Tokens: 99, Seconds: 9, Turns: 2}, agentapp.BudgetContinue},
-		{"explicit tokens hit", agentapp.Budget{MaxTokens: 100, RunSeconds: 10, MaxTurnsFuse: 3},
-			agentapp.Usage{Tokens: 100}, agentapp.BudgetSettle},
-		{"settlement over token budget", agentapp.Budget{MaxTokens: 100, RunSeconds: 10, MaxTurnsFuse: 3},
-			agentapp.Usage{Tokens: 101, Settling: true}, agentapp.BudgetExhaust},
-		{"settlement within budget continues", agentapp.Budget{MaxTokens: 100, RunSeconds: 10, MaxTurnsFuse: 3},
-			agentapp.Usage{Tokens: 101, Settling: true, Completed: true}, agentapp.BudgetSettle},
-		{"completion wins over resource exhaustion", defaults,
+		{"explicit token telemetry never settles", agentapp.Budget{MaxTokens: 100, RunSeconds: 10, MaxTurnsFuse: 3},
+			agentapp.Usage{Tokens: 100}, agentapp.BudgetContinue},
+		{"settlement over time budget", agentapp.Budget{RunSeconds: 10, MaxTurnsFuse: 3},
+			agentapp.Usage{Seconds: 10, Settling: true}, agentapp.BudgetExhaust},
+		{"settlement over turn fuse", agentapp.Budget{RunSeconds: 10, MaxTurnsFuse: 3},
+			agentapp.Usage{Turns: 3, Settling: true}, agentapp.BudgetExhaust},
+		{"completed wins over every resource", defaults,
 			agentapp.Usage{Tokens: 1_000_000, Seconds: 100_000, Turns: 1000, Completed: true}, agentapp.BudgetSettle},
 	}
 	for _, testCase := range cases {
@@ -48,6 +48,74 @@ func TestBudgetDecide(t *testing.T) {
 				t.Fatalf("Decide(%+v) = %q, want %q", testCase.usage, got, testCase.want)
 			}
 		})
+	}
+}
+
+// TestTokenBudgetNeverSettles demonstrates the R-A2-1 end state: a token-heavy
+// run continues while it is inside its turn/time guards. It covers both the
+// explicit unlimited flag and legacy budgets that still carry a numeric
+// MaxTokens (the retired 20k default or a per-item legacy cap): token usage is
+// telemetry and must not produce a settlement cause even at 90k tokens.
+func TestTokenBudgetNeverSettles(t *testing.T) {
+	budgets := []struct {
+		name   string
+		budget agentapp.Budget
+	}{
+		{"unlimited profile budget", agentapp.Budget{MaxTurnsFuse: 12, MaxTokens: 0, UnlimitedTokens: true}},
+		{"legacy zero max tokens", agentapp.Budget{MaxTurnsFuse: 12}},
+		{"legacy 20k max tokens", agentapp.Budget{MaxTurnsFuse: 12, MaxTokens: 20000}},
+	}
+	for _, testCase := range budgets {
+		t.Run(testCase.name, func(t *testing.T) {
+			usage := agentapp.Usage{Tokens: 90_000, Turns: 1}
+			if got := testCase.budget.Decide(usage); got != agentapp.BudgetContinue {
+				t.Fatalf("decide=%v, want Continue at 90k tokens", got)
+			}
+			if cause := testCase.budget.ExceededBy(usage); cause != "" {
+				t.Fatalf("ExceededBy(%+v)=%q, want no token cause", usage, cause)
+			}
+		})
+	}
+}
+
+// TestTurnBudgetSettles pins the turn settlement reason: reaching the turn fuse
+// asks for settlement with the stable turn_budget cause.
+func TestTurnBudgetSettles(t *testing.T) {
+	budget := agentapp.Budget{MaxTurnsFuse: 2, UnlimitedTokens: true}
+	usage := agentapp.Usage{Tokens: 90_000, Turns: 2}
+	if got := budget.Decide(usage); got != agentapp.BudgetSettle {
+		t.Fatalf("decide=%v, want Settle at the turn fuse", got)
+	}
+	if cause := budget.ExceededBy(usage); cause != agentapp.BudgetCauseTurns {
+		t.Fatalf("cause=%q, want %q", cause, agentapp.BudgetCauseTurns)
+	}
+}
+
+// TestTimeBudgetSettles pins the wall-clock settlement reason: reaching
+// RunSeconds asks for settlement with the stable time_budget cause.
+func TestTimeBudgetSettles(t *testing.T) {
+	budget := agentapp.Budget{RunSeconds: 600, MaxTurnsFuse: 12, UnlimitedTokens: true}
+	usage := agentapp.Usage{Tokens: 90_000, Seconds: 600, Turns: 1}
+	if got := budget.Decide(usage); got != agentapp.BudgetSettle {
+		t.Fatalf("decide=%v, want Settle at the time budget", got)
+	}
+	if cause := budget.ExceededBy(usage); cause != agentapp.BudgetCauseTime {
+		t.Fatalf("cause=%q, want %q", cause, agentapp.BudgetCauseTime)
+	}
+}
+
+// TestCompletedSettles pins R-A3-4's completion priority at the budget seam:
+// a met completion criterion settles even when every resource guard is
+// exhausted and the run is already in its settlement turn.
+func TestCompletedSettles(t *testing.T) {
+	budget := agentapp.Budget{RunSeconds: 1, MaxTurnsFuse: 1, UnlimitedTokens: true}
+	for _, usage := range []agentapp.Usage{
+		{Tokens: 1_000_000, Seconds: 100_000, Turns: 1000, Completed: true},
+		{Tokens: 1_000_000, Seconds: 100_000, Turns: 1000, Completed: true, Settling: true},
+	} {
+		if got := budget.Decide(usage); got != agentapp.BudgetSettle {
+			t.Fatalf("Decide(%+v)=%q, want Settle for a completed run", usage, got)
+		}
 	}
 }
 

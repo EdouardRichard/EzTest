@@ -1383,17 +1383,19 @@ try {
             break
         }
         if (-not $humanResolved) {
-            $humanResponse = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=open&limit=10" -Token $script:token
+            $humanResponse = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=pending&limit=10" -Token $script:token
             if ($humanResponse.Status -eq 200) {
-                $openRequests = Get-Array $humanResponse.Json.data
+                # Only the login takeover gates execution: v0.22 clarification
+                # questions share this list and must not be resolved here.
+                $openRequests = @(Get-Array $humanResponse.Json.data | Where-Object { [string]$_.kind -eq "login_takeover" })
                 if ($openRequests.Count -gt 0) {
                     $human = $openRequests[0]
-                    $s8 = Start-Scenario "S8 login takeover: 2FA human_request open -> resolve 246810 -> resume -> pass"
+                    $s8 = Start-Scenario "S8 login takeover: 2FA human_request pending -> resolve 246810 -> resume -> pass"
                     $script:humanScenario = $s8
-                    Step "human_request open: kind=$($human.kind), challenge=$($human.payload.challenge_kind), case_run=$($human.case_run_id)"
+                    Step "human_request pending: kind=$($human.kind), challenge=$($human.payload.challenge_kind), case_run=$($human.case_run_id)"
                     Assert-Equal $human.kind "login_takeover" "human request kind"
                     Assert-True ([string]$human.payload.challenge_kind -match "2fa|two|mfa|2_factor") ("human request challenge_kind = '{0}'" -f $human.payload.challenge_kind)
-                    Assert-True ($human.status -eq "open") "human request must be open"
+                    Assert-True ($human.status -eq "pending") "human request must be pending"
                     $humanCaseRun = (Get-CaseRun -CaseRunID ([string]$human.case_run_id)).case_run
                     Assert-Equal $humanCaseRun.status "paused" "case_run status while waiting for a human"
                     $waitingWave = Get-Waves | Where-Object { [string]$_.id -eq [string]$humanCaseRun.wave_id }
@@ -1403,11 +1405,12 @@ try {
                         response = @{ code = "246810"; note = "P3 acceptance 2FA code" }
                     }
                     Assert-Status $resolveResponse @(200) "resolve human request with code 246810"
-                    Assert-Equal $resolveResponse.Json.data.status "resolved" "human request status after resolve"
+                    Assert-Equal $resolveResponse.Json.data.status "answered" "human request status after resolve"
                     Assert-True ($null -eq $resolveResponse.Json.data.response.code) "resolve response must not echo the code"
-                    $openAfterResolve = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=open&limit=10" -Token $script:token
-                    Assert-Status $openAfterResolve @(200) "GET open human requests after resolve"
-                    Assert-Equal (Get-Array $openAfterResolve.Json.data).Count 0 "open human requests after resolve"
+                    $openAfterResolve = Invoke-Api -Method "GET" -Path "/api/versions/$script:versionID/human-requests?status=pending&limit=10" -Token $script:token
+                    Assert-Status $openAfterResolve @(200) "GET pending human requests after resolve"
+                    $pendingTakeoversAfterResolve = @(Get-Array $openAfterResolve.Json.data | Where-Object { [string]$_.kind -eq "login_takeover" })
+                    Assert-Equal $pendingTakeoversAfterResolve.Count 0 "pending human requests after resolve"
                     $humanResolved = $true
                     Pass-Scenario $s8
                     Start-Sleep -Milliseconds 500
@@ -1632,7 +1635,7 @@ try {
 
     # ---------------- S8 fallback (if no human request was observed) ------
     if (-not $humanResolved) {
-        $s8 = Start-Scenario "S8 login takeover: 2FA human_request open -> resolve 246810 -> resume -> pass"
+        $s8 = Start-Scenario "S8 login takeover: 2FA human_request pending -> resolve 246810 -> resume -> pass"
         throw "no open login_takeover human request was observed for the 2FA case; the real LLM did not request human help"
     }
     Step "assert the 2FA case D eventually passed after the human takeover"
@@ -1660,8 +1663,8 @@ try {
     } catch {
         Add-SoftFailure ("human takeover resume event contract: " + $_.Exception.Message) $script:humanScenario
     }
-    $humanRows = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText ("SELECT count(*) FROM human_request WHERE version_id = {0} AND kind = 'login_takeover' AND status = 'resolved';" -f $script:versionID)
-    Assert-True ([int]$humanRows -ge 1) "no resolved login_takeover human_request in the database"
+    $humanRows = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText ("SELECT count(*) FROM human_request WHERE version_id = {0} AND kind = 'login_takeover' AND status = 'answered';" -f $script:versionID)
+    Assert-True ([int]$humanRows -ge 1) "no answered login_takeover human_request in the database"
 
     # ---------------- S9: pause/resume -----------------------------------
     $s9 = Start-Scenario "S9 pause/resume: immediate pause keeps finished results, resume continues to a terminal state"

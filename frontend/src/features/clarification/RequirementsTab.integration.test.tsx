@@ -31,6 +31,11 @@ const api = vi.hoisted(() => ({
   confirmRequirements: vi.fn(),
   rollbackRequirement: vi.fn(),
   listRequirementRelations: vi.fn(),
+  getRequirementExtraction: vi.fn(),
+  startRequirementExtraction: vi.fn(),
+  pauseRequirementExtraction: vi.fn(),
+  resumeRequirementExtraction: vi.fn(),
+  retryRequirementExtraction: vi.fn(),
   getTeamRoom: vi.fn(),
   uploadContent: vi.fn(),
 }))
@@ -105,6 +110,7 @@ describe("RequirementsTab integration", () => {
       Promise.resolve(requirementId === "6002" ? secondDetail : requirementDetailFixture),
     )
     api.getTeamRoom.mockResolvedValue(teamRoomFixture)
+    api.getRequirementExtraction.mockResolvedValue(null)
     api.confirmRequirements.mockResolvedValue({
       batch_id: "batch_1",
       confirmed: ["6001"],

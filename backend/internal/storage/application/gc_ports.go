@@ -7,7 +7,11 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
 )
 
-// GC settings keys (spec §8) and the P7 retention values GC consumes.
+// GC settings keys (spec §8, W2-15) and the P7 retention values GC consumes.
+// retention.* is the only settings family GC reads: the legacy gc.* aliases
+// (gc.retention_days, gc.max_bytes, gc.dry_run, gc.grace_days) were removed in
+// W2-15 so retention.* stays authoritative. Capacity control (gc.max_bytes) is
+// not implemented in v0.22 (residual).
 const (
 	GCSettingTempHours               = "retention.temp_hours"
 	GCSettingReplacedExportDays      = "retention.replaced_export_days"
@@ -22,7 +26,7 @@ const (
 	DefaultGCTempHours               int64 = 24
 	DefaultGCReplacedExportDays      int64 = 7
 	DefaultGCUnreferencedContentDays int64 = 30
-	DefaultGCGraceHours              int64 = 24
+	DefaultGCGraceHours              int64 = 168
 	DefaultGCBatchSize                     = 500
 	MaxGCBatchSize                         = 5000
 	DefaultGCInterval                      = 24 * time.Hour

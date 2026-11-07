@@ -438,13 +438,17 @@ func loadCaseVersion(ctx context.Context, q querier, caseVersionID int64) (desig
 		SELECT id, case_id, revision, title, description, preconditions, test_data, priority,
 		       default_version_sut_id, COALESCE(version_sut_ids, '[]'::jsonb),
 		       COALESCE(page_ids, '[]'::jsonb), COALESCE(api_ids, '[]'::jsonb),
-		       status, content_hash, created_by, created_by_run_id, created_at
+		       status, content_hash, trigger, source_observation_id,
+		       COALESCE(auto_confirmed_by, ''), rollback_of,
+		       created_by, created_by_run_id, created_at, updated_at
 		FROM case_version
 		WHERE id = $1
 	`, caseVersionID).Scan(
 		&version.ID, &version.CaseID, &version.Revision, &version.Title, &version.Description,
 		&version.Preconditions, &testData, &version.Priority, &defaultSUT, &suts, &pages, &apis,
-		&version.Status, &version.ContentHash, &version.CreatedBy, &version.CreatedByRunID, &createdAt,
+		&version.Status, &version.ContentHash, &version.Trigger, &version.SourceObservationID,
+		&version.AutoConfirmedBy, &version.RollbackOf,
+		&version.CreatedBy, &version.CreatedByRunID, &createdAt, &version.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return design.CaseVersion{}, design.ErrNotFound

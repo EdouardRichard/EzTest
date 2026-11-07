@@ -101,7 +101,7 @@ func TestResumeWaveRejectsOpenHuman(t *testing.T) {
 	f.runs.byID[500] = run
 	human := execution.HumanRequest{
 		ID: 700, VersionID: 100, CaseRunID: int64PtrValue(500), Kind: execution.HumanLoginTakeover,
-		Status: execution.HumanOpen, ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
+		Status: execution.HumanPending, ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
 	}
 	if err := f.humans.Create(ctx, human); err != nil {
 		t.Fatalf("create human request: %v", err)
@@ -167,7 +167,7 @@ func TestHumanResolveResumesCase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if resolved.Status != execution.HumanResolved {
+	if resolved.Status != execution.HumanAnswered {
 		t.Fatalf("request status = %s", resolved.Status)
 	}
 	resumed, _ := f.runs.Get(ctx, 500)

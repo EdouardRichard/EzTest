@@ -84,11 +84,13 @@ func parseTypes(r *http.Request) ([]string, error) {
 	return searchapp.NormalizeTypes(tokens)
 }
 
-// parseLimit validates the optional per-type limit (default 5, range 1–20).
+// parseLimit validates the optional per-type limit (configured default, range
+// 1–20). An absent parameter forwards zero so the application service resolves
+// the search.max_results_per_type setting.
 func parseLimit(r *http.Request) (int, error) {
 	raw := strings.TrimSpace(r.URL.Query().Get("limit"))
 	if raw == "" {
-		return searchapp.DefaultLimit, nil
+		return 0, nil
 	}
 	limit, err := strconv.Atoi(raw)
 	if err != nil || limit < searchapp.MinLimit || limit > searchapp.MaxLimit {

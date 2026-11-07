@@ -5,6 +5,7 @@ import {
   ASSERTION_VERDICT_LABEL,
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
+  CASE_RUN_TELEMETRY_TERMINAL_STATUSES,
   CASE_RUN_TERMINAL_STATUSES,
   EVIDENCE_KIND_LABEL,
   EXECUTOR_STATUS_LABEL,
@@ -49,6 +50,17 @@ describe("case run labels", () => {
 
   it("marks the four verdicts as terminal and process states as not", () => {
     expect(CASE_RUN_TERMINAL_STATUSES).toEqual(["passed", "failed", "blocked", "inconclusive"])
+  })
+
+  it("treats skipped and superseded rows as telemetry-terminal too", () => {
+    expect(CASE_RUN_TELEMETRY_TERMINAL_STATUSES).toEqual([
+      "passed",
+      "failed",
+      "blocked",
+      "inconclusive",
+      "skipped",
+      "superseded",
+    ])
   })
 })
 
@@ -98,20 +110,24 @@ describe("wave labels", () => {
 })
 
 describe("human request labels", () => {
-  it("labels kinds, statuses and tones", () => {
+  it("labels every v0.22 kind, status and tone", () => {
     expect(HUMAN_REQUEST_KIND_LABEL).toEqual({
+      clarification_question: "澄清提问",
+      approval: "审批",
+      blocked_recovery: "阻塞恢复",
       login_takeover: "登录接管",
       conflict: "冲突处理",
       other: "其他",
     })
+    expect(Object.keys(HUMAN_REQUEST_KIND_LABEL)).toHaveLength(6)
     expect(HUMAN_REQUEST_STATUS_LABEL).toEqual({
-      open: "待处理",
-      resolved: "已处理",
+      pending: "待处理",
+      answered: "已处理",
       cancelled: "已取消",
       expired: "已过期",
     })
-    expect(HUMAN_REQUEST_STATUS_TONE.open).toBe("warning")
-    expect(HUMAN_REQUEST_STATUS_TONE.resolved).toBe("success")
+    expect(HUMAN_REQUEST_STATUS_TONE.pending).toBe("warning")
+    expect(HUMAN_REQUEST_STATUS_TONE.answered).toBe("success")
   })
 })
 

@@ -135,7 +135,7 @@ func (s *AnchorService) Create(ctx context.Context, in CreateAnchorInput) (codei
 		return codeintel.Anchor{}, unprocessable("path_escape", "path must be a normalized repo-relative path")
 	}
 
-	commit, err := s.targetCommit(ctx, binding, repository, in.CommitSHA)
+	commit, err := s.targetCommit(ctx, in.VersionID, binding, repository, in.CommitSHA)
 	if err != nil {
 		return codeintel.Anchor{}, err
 	}
@@ -332,9 +332,10 @@ func (s *AnchorService) checkSubject(ctx context.Context, versionID int64, kind 
 	return nil
 }
 
-// targetCommit resolves the create-time commit: explicit 40-hex, then the
-// version baseline, then the latest done index commit, then the branch head.
-func (s *AnchorService) targetCommit(ctx context.Context, binding VersionSUTBinding, repository RepoRef, explicit string) (string, error) {
+// targetCommit resolves the create-time commit: explicit 40-hex, then this
+// version's latest done index commit, then the version baseline only when it
+// resolves in this repository, then the branch head.
+func (s *AnchorService) targetCommit(ctx context.Context, versionID int64, binding VersionSUTBinding, repository RepoRef, explicit string) (string, error) {
 	if value := strings.TrimSpace(explicit); value != "" {
 		if !ValidCommitSHA(value) {
 			return "", unprocessable("invalid_commit", "commit must be a 40-character lowercase hex commit SHA")
@@ -344,11 +345,17 @@ func (s *AnchorService) targetCommit(ctx context.Context, binding VersionSUTBind
 		}
 		return value, nil
 	}
-	if ValidCommitSHA(binding.CodeBaselineCommit) {
-		return binding.CodeBaselineCommit, nil
-	}
-	if commit, ok := s.latestDoneCommit(ctx, repository.ID); ok {
+	// The version_sut baseline is shared by every repository of a multi-repo
+	// binding, so the repository's own latest done index commit wins. The
+	// shared baseline remains the fallback only when it resolves in this
+	// repository; otherwise it belongs to another repository.
+	if commit, ok := s.latestDoneCommit(ctx, versionID, repository.ID); ok {
 		return commit, nil
+	}
+	if ValidCommitSHA(binding.CodeBaselineCommit) {
+		if _, resolveErr := s.git.ResolveCommit(ctx, repository.Path, binding.CodeBaselineCommit); resolveErr == nil {
+			return binding.CodeBaselineCommit, nil
+		}
 	}
 	head, err := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
 	if err != nil {
@@ -360,7 +367,7 @@ func (s *AnchorService) targetCommit(ctx context.Context, binding VersionSUTBind
 // validationCommit returns the newest provable commit, then the branch head,
 // then the anchor commit (spec §6.1).
 func (s *AnchorService) validationCommit(ctx context.Context, anchor codeintel.Anchor, repository RepoRef) string {
-	if commit, ok := s.latestDoneCommit(ctx, anchor.RepoID); ok {
+	if commit, ok := s.latestDoneCommit(ctx, anchor.VersionID, anchor.RepoID); ok {
 		return commit
 	}
 	head, err := s.git.HeadCommit(ctx, repository.Path, repository.Branch)
@@ -373,12 +380,15 @@ func (s *AnchorService) validationCommit(ctx context.Context, anchor codeintel.A
 	return ""
 }
 
-// latestDoneCommit returns the commit of the newest done index run.
-func (s *AnchorService) latestDoneCommit(ctx context.Context, repoID int64) (string, bool) {
+// latestDoneCommit returns the commit of the newest done index run of one
+// version and repository. The version scope keeps a shared repository from
+// lending another version's commit; the done filter ignores a newer failed or
+// queued run.
+func (s *AnchorService) latestDoneCommit(ctx context.Context, versionID, repoID int64) (string, bool) {
 	if s.runs == nil {
 		return "", false
 	}
-	run, err := s.runs.LatestRun(ctx, repoID)
+	run, err := s.runs.LatestDoneForVersion(ctx, versionID, repoID)
 	if err != nil || run.Status != string(codeintel.IndexDone) || !ValidCommitSHA(run.CommitSHA) {
 		return "", false
 	}

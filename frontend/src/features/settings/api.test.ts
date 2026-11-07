@@ -4,6 +4,7 @@ import {
   type AuditLogEntry,
   activateInstance,
   addLLMModel,
+  checkExecutorAuth,
   createGCRun,
   createLLMConfig,
   createUser,
@@ -550,5 +551,36 @@ describe("admin GC and instance API", () => {
     ])
     expect(fetchMock.mock.calls[1][1]?.method).toBe("POST")
     expect(fetchMock.mock.calls[2][1]?.method).toBe("POST")
+  })
+})
+
+describe("executor auth check API", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear()
+    fetchMock.mockReset()
+    vi.stubGlobal("fetch", fetchMock)
+    vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", "")
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
+    window.sessionStorage.clear()
+  })
+
+  it("posts the check action and returns the three-state projection", async () => {
+    const result = {
+      executor_id: "1",
+      endpoint: "http://127.0.0.1:13336",
+      auth_status: "unauthenticated",
+      detail: "executor returned HTTP 401",
+    }
+    fetchMock.mockResolvedValue(jsonResponse({ data: result }))
+
+    await expect(checkExecutorAuth("1")).resolves.toEqual(result)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/admin/executors/1/check")
+    expect(init?.method).toBe("POST")
   })
 })

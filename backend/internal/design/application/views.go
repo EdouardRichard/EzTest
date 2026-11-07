@@ -210,6 +210,13 @@ type CaseInput struct {
 	Steps               []StepInput
 	Assertions          []AssertionInput
 	Sources             []SourceInput
+	// Trigger/SourceObservationID/AutoConfirmedBy/RollbackOf carry the
+	// discovery/rollback provenance of a programmatic proposal (spec DB-30).
+	// A zero Trigger means the normal manual propose.
+	Trigger             string
+	SourceObservationID *int64
+	AutoConfirmedBy     string
+	RollbackOf          *int64
 }
 
 // StepInput is one submitted step.

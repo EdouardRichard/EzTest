@@ -15,8 +15,11 @@ export type IssueCategory = "ui" | "api" | "db"
 
 export type IssueSeverity = "major" | "minor" | "trivial"
 
-/** P4 only ingests deterministic failure candidates. */
-export type IssueSource = "failure_candidate"
+/**
+ * `IssueView.source`: `failure_candidate` is the automatic failure candidate;
+ * `manual` is the v0.22 W2-4 user-created/edited issue.
+ */
+export type IssueSource = "failure_candidate" | "manual"
 
 export type IssueRefKind =
   | "case_run"
@@ -31,6 +34,13 @@ export type IssueRefKind =
 export type IssueTriageStatus = "queued" | "running" | "done" | "failed" | "degraded"
 
 export type IssueActorKind = "user" | "agent" | "system"
+
+/**
+ * v0.22 W2-5 retest result model (`delivery_issue.retest_status`). It is
+ * independent of the four issue lifecycle statuses: an issue can stay `open`
+ * while its last retest outcome is `passed`/`failed`.
+ */
+export type IssueRetestStatus = "not_retested" | "retesting" | "passed" | "failed"
 
 /* ---------------------------------- views ---------------------------------- */
 
@@ -70,6 +80,12 @@ export type IssueView = {
   last_recurred_at?: string | null
   /** Merge chain target IDs, direct target first (P7 read-time projection). */
   merged_chain?: string[] | null
+  /** v0.22 W2-5 retest projection; absent only on pre-W2 fixtures/projections. */
+  retest_status?: IssueRetestStatus
+  /** Wave of the most recent retest; null before the first retest. */
+  last_retest_wave_id?: string | null
+  /** Case run written back by the most recent retest; null before a terminal writeback. */
+  last_retest_case_run_id?: string | null
   reopen_count: number
   refs: IssueRef[]
   triage?: IssueTriage | null
@@ -161,6 +177,43 @@ export type ReportDetailView = ReportView & {
   refs: ReportRefView[]
 }
 
+/* ------------------------------- artifacts --------------------------------- */
+
+/** `POST .../reports/{reportId}/artifacts` request format (spec §4.29 R-W2-3). */
+export type ReportArtifactFormat = "html" | "pdf" | "markdown"
+
+/** One created artifact identity from the POST response (contract). */
+export type ReportArtifactView = {
+  id: string
+  format: ReportArtifactFormat
+  /** content ledger key (content_object_id). */
+  sha256: string
+  size: number
+  status: "ready" | "failed"
+}
+
+/**
+ * One export artifact returned by `GET /api/versions/{id}/exports`. The report
+ * page filters the version export list by `owner_kind=report`/`owner_id` because
+ * the report artifact POST is the only report-scoped write and there is no
+ * dedicated report list route (spec §6 API-28).
+ */
+export type ReportExportArtifact = {
+  id: string
+  version_id: string
+  owner_kind: "case" | "report" | "chain"
+  owner_id: string
+  revision: number
+  format: ReportArtifactFormat
+  size: number
+  mime: string
+  filename: string
+  sha256: string
+  status: "ready" | "failed"
+  created_at: string
+  download_url: string
+}
+
 /** `RegenerateReportResult` from the 202 response. */
 export type RegenerateReportResult = {
   report_id: string
@@ -206,6 +259,34 @@ export type MergeIssueInput = {
   target_issue_id: string
   reason?: string
   expected_revision?: number
+}
+
+/** v0.22 W2-4 manual issue body (`POST /api/versions/{id}/issues`). */
+export type CreateManualIssueInput = {
+  title: string
+  summary?: string
+  category: IssueCategory
+  severity: IssueSeverity
+  /** Optional source run; the server resolves its refs (decimal string). */
+  case_run_id?: string
+  /** Up to five evidence refs (decimal strings). */
+  evidence_ids?: string[]
+  merge_into_id?: string
+  reason?: string
+}
+
+/**
+ * `POST .../issues/{id}/retest` response (v0.22 W2-5/API-25).
+ * `case_run_ids` are the NEW retest runs created by the wave; the request
+ * `case_run_ids` (source runs) are never echoed back.
+ */
+export type RetestIssueResult = {
+  issue_id: string
+  version_id: string
+  wave_id: string
+  wave_status: string
+  retest_status: IssueRetestStatus
+  case_run_ids: string[]
 }
 
 /* ------------------------------- UI metadata ------------------------------- */
@@ -254,6 +335,25 @@ export const ISSUE_ACTOR_LABELS: Record<IssueActorKind, string> = {
   system: "系统",
 }
 
+/** `retest_status` labels; the raw enum value stays visible next to them. */
+export const ISSUE_RETEST_STATUS_LABELS: Record<IssueRetestStatus, string> = {
+  not_retested: "未复测",
+  retesting: "复测中",
+  passed: "通过",
+  failed: "失败",
+}
+
+/** Badge tones structurally match `BadgeTone` without importing UI code. */
+export const ISSUE_RETEST_STATUS_TONES: Record<
+  IssueRetestStatus,
+  "neutral" | "info" | "warning" | "success" | "danger"
+> = {
+  not_retested: "neutral",
+  retesting: "info",
+  passed: "success",
+  failed: "danger",
+}
+
 /* ------------------------------- report labels ------------------------------ */
 
 export const REPORT_KIND_LABELS: Record<ReportKind, string> = {
@@ -290,4 +390,10 @@ export const REPORT_REF_LABELS: Record<ReportRefKind, string> = {
   case_run: "用例运行",
   issue: "问题",
   version_sut: "SUT",
+}
+
+export const REPORT_ARTIFACT_FORMAT_LABELS: Record<ReportArtifactFormat, string> = {
+  html: "HTML",
+  pdf: "PDF",
+  markdown: "Markdown",
 }

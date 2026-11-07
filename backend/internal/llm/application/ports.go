@@ -82,12 +82,22 @@ type ModelInput struct {
 }
 
 // ModelPatch is a partial model update: nil fields keep the stored value. It
-// backs the capability editor and the deprecated flag; there is no rename.
+// backs the per-model parameter/capability editor; there is no rename. Writing
+// ContextWindow/MaxOutput marks that field's source as manual (A §4.3).
 type ModelPatch struct {
 	ContextWindow       *int
+	MaxOutput           *int64
 	SupportsTools       *bool
 	SupportsVision      *bool
 	SupportsReasoning   *bool
 	SupportsPromptCache *bool
 	Deprecated          *bool
+}
+
+// UpdateModelParams is the per-model numeric-parameter update used by the
+// catalog editor: nil keeps the stored value, a supplied value is persisted
+// with its field source set to manual (A §4.3).
+type UpdateModelParams struct {
+	ContextWindow *int64
+	MaxOutput     *int64
 }

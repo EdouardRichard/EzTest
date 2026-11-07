@@ -2,8 +2,10 @@ package httpapi
 
 import "net/http"
 
-// Register mounts the 21 P3 path items (22 operations) defined by spec §9.2 on
-// the shared mux. Every execution operation is available to any logged-in user;
+// Register mounts the execution paths (28 path items / 31 operations as of
+// W2-2) defined by spec §9.2, the v0.22 B §6 question routes, the v0.22 R-W2-1
+// human decision producer and the v0.22 R-EX-4 wave scope-snapshot read on the
+// shared mux. Every execution operation is available to any logged-in user;
 // executor administration additionally requires the admin guard.
 func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler) {
 	// Overview / intents.
@@ -14,11 +16,19 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 
 	// Waves.
 	mux.Handle("GET /api/versions/{id}/waves", authenticated(http.HandlerFunc(h.ListWaves)))
+	mux.Handle("POST /api/versions/{id}/waves", authenticated(http.HandlerFunc(h.StartWave)))
 	mux.Handle("GET /api/versions/{id}/waves/{waveId}", authenticated(http.HandlerFunc(h.GetWave)))
 	mux.Handle("POST /api/versions/{id}/waves/{waveId}/pause", authenticated(http.HandlerFunc(h.PauseWave)))
 	mux.Handle("POST /api/versions/{id}/waves/{waveId}/resume", authenticated(http.HandlerFunc(h.ResumeWave)))
 	mux.Handle("POST /api/versions/{id}/waves/{waveId}/cancel", authenticated(http.HandlerFunc(h.CancelWave)))
 	mux.Handle("GET /api/versions/{id}/waves/{waveId}/case-runs", authenticated(http.HandlerFunc(h.ListWaveCaseRuns)))
+	// Frozen wave scope (R-EX-4 / API-19).
+	mux.Handle("GET /api/versions/{id}/scope-snapshot", authenticated(http.HandlerFunc(h.ScopeSnapshot)))
+
+	// Execution-time discovery reads (W1-14A / R-EX-5 / API-36,37,39).
+	mux.Handle("GET /api/versions/{id}/discovery/observations", authenticated(http.HandlerFunc(h.DiscoveryObservations)))
+	mux.Handle("GET /api/versions/{id}/discovery/deltas", authenticated(http.HandlerFunc(h.DiscoveryDeltas)))
+	mux.Handle("GET /api/versions/{id}/coverage", authenticated(http.HandlerFunc(h.DiscoveryCoverage)))
 
 	// Case runs.
 	mux.Handle("GET /api/versions/{id}/case-runs/{caseRunId}", authenticated(http.HandlerFunc(h.GetCaseRun)))
@@ -30,15 +40,27 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("GET /api/versions/{id}/evidence/{evidenceId}", authenticated(http.HandlerFunc(h.GetEvidence)))
 	mux.Handle("GET /api/versions/{id}/evidence/{evidenceId}/content", authenticated(http.HandlerFunc(h.DownloadEvidence)))
 
-	// Human takeover requests.
+	// Human takeover requests plus the v0.22 version-level decision producer
+	// (approval/blocked_recovery/conflict, R-W2-1/API-43).
 	mux.Handle("GET /api/versions/{id}/human-requests", authenticated(http.HandlerFunc(h.ListHumanRequests)))
+	mux.Handle("POST /api/versions/{id}/human-requests", authenticated(http.HandlerFunc(h.CreateHumanRequest)))
 	mux.Handle("POST /api/human-requests/{humanRequestId}/resolve", authenticated(http.HandlerFunc(h.ResolveHumanRequest)))
 	mux.Handle("POST /api/human-requests/{humanRequestId}/cancel", authenticated(http.HandlerFunc(h.CancelHumanRequest)))
+
+	// Structured clarification questions (v0.22 B §6 / API list). The create and
+	// reopen handlers are Host-run scoped through X-Agent-Run-Id; answer/skip are
+	// ordinary authenticated-user actions.
+	mux.Handle("GET /api/versions/{id}/questions", authenticated(http.HandlerFunc(h.ListQuestions)))
+	mux.Handle("POST /api/versions/{id}/conversations/{cid}/questions", authenticated(http.HandlerFunc(h.CreateQuestion)))
+	mux.Handle("POST /api/versions/{id}/questions/{qid}/answer", authenticated(http.HandlerFunc(h.AnswerQuestion)))
+	mux.Handle("POST /api/versions/{id}/questions/{qid}/skip", authenticated(http.HandlerFunc(h.SkipQuestion)))
+	mux.Handle("POST /api/versions/{id}/questions/{qid}/reopen", authenticated(http.HandlerFunc(h.ReopenQuestion)))
 
 	// Admin executor registry.
 	mux.Handle("GET /api/admin/executors", admin(http.HandlerFunc(h.ListExecutors)))
 	mux.Handle("POST /api/admin/executors/{executorId}/drain", admin(http.HandlerFunc(h.DrainExecutor)))
 	mux.Handle("POST /api/admin/executors/{executorId}/activate", admin(http.HandlerFunc(h.ActivateExecutor)))
+	mux.Handle("POST /api/admin/executors/{id}/check", admin(http.HandlerFunc(h.CheckExecutor)))
 }
 
 // RegisterInternalRoutes mounts the P7 internal executor push endpoints

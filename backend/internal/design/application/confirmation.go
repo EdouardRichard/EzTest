@@ -14,11 +14,20 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
-// ConfirmInput is one POST /design/confirmations request.
+// ConfirmInput is one POST /design/confirmations request, or one internal
+// automatic confirmation (spec R-EX-6). The auto fields are zero for the user
+// request path, so the HTTP surface cannot forge a system confirmation.
 type ConfirmInput struct {
 	Scope    string
 	TargetID int64
 	BatchID  string
+	// AutoConfirmed marks an internal system confirmation. Trigger is
+	// "discovery_delta" for the additive revision; SourceObservationID keeps the
+	// originating execution observation on the confirmation audit row.
+	AutoConfirmed       bool
+	AutoConfirmedBy     string
+	Trigger             string
+	SourceObservationID *int64
 }
 
 // ConfirmedCaseView is one confirmed case version.
@@ -345,6 +354,10 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 				Snapshot:               snapshot,
 				ConfirmedBy:            actorID,
 				ConfirmedAt:            now,
+				AutoConfirmed:          in.AutoConfirmed,
+				AutoConfirmedBy:        in.AutoConfirmedBy,
+				Trigger:                in.Trigger,
+				SourceObservationID:    in.SourceObservationID,
 			}
 			if err := tx.ConfirmCaseVersion(ctx, design.ConfirmCaseVersionCommand{
 				Confirmation: confirmation,
@@ -397,17 +410,26 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 		}
 	}
 	if s.audit != nil {
+		metadata := map[string]any{
+			"scope":            in.Scope,
+			"target_id":        platformid.Format(in.TargetID),
+			"batch_id":         batchID,
+			"case_version_ids": formatIDList(caseVersionIDs),
+		}
+		if in.AutoConfirmed {
+			metadata["auto_confirmed"] = true
+			metadata["auto_confirmed_by"] = in.AutoConfirmedBy
+			metadata["trigger"] = in.Trigger
+			if in.SourceObservationID != nil {
+				metadata["source_observation_id"] = platformid.Format(*in.SourceObservationID)
+			}
+		}
 		event := auditapp.Event{
 			Action:     "case.confirmed",
 			TargetKind: "case",
 			TargetID:   platformid.Format(in.TargetID),
 			RequestID:  requestid.From(ctx),
-			Metadata: map[string]any{
-				"scope":            in.Scope,
-				"target_id":        platformid.Format(in.TargetID),
-				"batch_id":         batchID,
-				"case_version_ids": formatIDList(caseVersionIDs),
-			},
+			Metadata:   metadata,
 		}
 		if actorID > 0 {
 			actor := actorID

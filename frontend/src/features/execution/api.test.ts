@@ -24,6 +24,7 @@ import {
   resumeWave,
 } from "./api"
 import {
+  answeredHumanRequestFixture,
   caseRunDetailFixture,
   evidenceScreenshotFixture,
   executionOverviewFixture,
@@ -31,7 +32,6 @@ import {
   humanRequestFixture,
   intentFixture,
   pausedWaveFixture,
-  resolvedHumanRequestFixture,
   runningWaveFixture,
 } from "./test-fixtures"
 
@@ -223,18 +223,18 @@ describe("execution api", () => {
     expect(headersOf(init).get("Authorization")).toBe("Bearer ezt_token")
   })
 
-  it("lists open human requests and resolves/cancels one", async () => {
+  it("lists pending human requests and resolves/cancels one", async () => {
     fetchMock.mockResolvedValueOnce(listResponse([humanRequestFixture]))
-    await expect(listHumanRequests("2001", { status: "open" })).resolves.toEqual([
+    await expect(listHumanRequests("2001", { status: "pending" })).resolves.toEqual([
       humanRequestFixture,
     ])
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://localhost:13333/api/versions/2001/human-requests?status=open",
+      "http://localhost:13333/api/versions/2001/human-requests?status=pending",
     )
 
-    fetchMock.mockResolvedValueOnce(jsonResponse({ data: resolvedHumanRequestFixture }))
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: answeredHumanRequestFixture }))
     await expect(resolveHumanRequest("9501", { code: "246810", note: "已输入" })).resolves.toEqual(
-      resolvedHumanRequestFixture,
+      answeredHumanRequestFixture,
     )
     const [resolveUrl, resolveInit] = fetchMock.mock.calls[1]
     expect(resolveUrl).toBe("http://localhost:13333/api/human-requests/9501/resolve")

@@ -98,33 +98,213 @@ func (r mergeIssueRequest) parse() (int64, issueAction, error) {
 	return targetID, action, nil
 }
 
+// manualIssueRequest is the shared body of the v0.22 W2-4 manual create
+// (POST .../issues) and patch (PATCH .../issues/{issueId}). IDs are decimal
+// strings on the wire.
+type manualIssueRequest struct {
+	Title            *string  `json:"title"`
+	Summary          *string  `json:"summary"`
+	Category         *string  `json:"category"`
+	Severity         *string  `json:"severity"`
+	CaseRunID        *string  `json:"case_run_id"`
+	EvidenceIDs      []string `json:"evidence_ids"`
+	MergeIntoID      *string  `json:"merge_into_id"`
+	Reason           *string  `json:"reason"`
+	ExpectedRevision *int64   `json:"expected_revision"`
+}
+
+// manualIssueFields is the normalized manual create/patch input.
+type manualIssueFields struct {
+	Title       string
+	Summary     string
+	Category    string
+	Severity    string
+	CaseRunID   int64
+	EvidenceIDs []int64
+	MergeIntoID int64
+	Reason      string
+	Expected    *int32
+}
+
+// parse validates the shared manual request. create requires title, category
+// and severity; patch requires expected_revision and treats absent/blank
+// strings as "leave unchanged".
+func (r manualIssueRequest) parse(create bool) (manualIssueFields, error) {
+	var fields manualIssueFields
+	if r.Title != nil {
+		fields.Title = strings.TrimSpace(*r.Title)
+	}
+	if create || r.Title != nil {
+		if fields.Title == "" {
+			return manualIssueFields{}, platform.Invalid("title", "must not be empty")
+		}
+	}
+	if utf8.RuneCountInString(fields.Title) > 500 {
+		return manualIssueFields{}, platform.Invalid("title", "must be at most 500 characters")
+	}
+	if r.Summary != nil {
+		fields.Summary = *r.Summary
+		if utf8.RuneCountInString(fields.Summary) > 4000 {
+			return manualIssueFields{}, platform.Invalid("summary", "must be at most 4000 characters")
+		}
+	}
+	if r.Category != nil {
+		fields.Category = strings.TrimSpace(*r.Category)
+	}
+	if create && fields.Category == "" {
+		return manualIssueFields{}, platform.Invalid("category", "must be one of ui, api, db")
+	}
+	if fields.Category != "" && !isIssueCategory(fields.Category) {
+		return manualIssueFields{}, platform.Invalid("category", "must be one of ui, api, db")
+	}
+	if r.Severity != nil {
+		fields.Severity = strings.TrimSpace(*r.Severity)
+	}
+	if create && fields.Severity == "" {
+		return manualIssueFields{}, platform.Invalid("severity", "must be one of major, minor, trivial")
+	}
+	if fields.Severity != "" && !isIssueSeverity(fields.Severity) {
+		return manualIssueFields{}, platform.Invalid("severity", "must be one of major, minor, trivial")
+	}
+	caseRunID, err := optionalIDField("case_run_id", r.CaseRunID)
+	if err != nil {
+		return manualIssueFields{}, err
+	}
+	fields.CaseRunID = caseRunID
+	mergeIntoID, err := optionalIDField("merge_into_id", r.MergeIntoID)
+	if err != nil {
+		return manualIssueFields{}, err
+	}
+	fields.MergeIntoID = mergeIntoID
+	if len(r.EvidenceIDs) > 5 {
+		return manualIssueFields{}, platform.Invalid("evidence_ids", "must contain at most 5 IDs")
+	}
+	seenEvidence := make(map[int64]struct{}, len(r.EvidenceIDs))
+	for _, raw := range r.EvidenceIDs {
+		id, err := validation.NonEmptyID("evidence_ids", raw)
+		if err != nil {
+			return manualIssueFields{}, err
+		}
+		if _, ok := seenEvidence[id]; ok {
+			continue
+		}
+		seenEvidence[id] = struct{}{}
+		fields.EvidenceIDs = append(fields.EvidenceIDs, id)
+	}
+	if r.Reason != nil {
+		fields.Reason = strings.TrimSpace(*r.Reason)
+		if utf8.RuneCountInString(fields.Reason) > maxIssueReasonRunes {
+			return manualIssueFields{}, platform.Invalid("reason", "must be at most 2000 characters")
+		}
+	}
+	expected, err := parseExpectedRevision(r.ExpectedRevision)
+	if err != nil {
+		return manualIssueFields{}, err
+	}
+	if !create && expected == nil {
+		return manualIssueFields{}, platform.Invalid("expected_revision", "is required")
+	}
+	fields.Expected = expected
+	return fields, nil
+}
+
+// retestIssueRequest is POST .../issues/{issueId}/retest (v0.22 W2-5/API-25).
+// The optional case_run_ids selection must reference case_runs linked to the
+// issue; an absent/empty list retests every linked case_run.
+type retestIssueRequest struct {
+	CaseRunIDs []string `json:"case_run_ids"`
+}
+
+// parse validates and deduplicates the optional case_run selection.
+func (r retestIssueRequest) parse() ([]int64, error) {
+	if len(r.CaseRunIDs) == 0 {
+		return nil, nil
+	}
+	seen := make(map[int64]struct{}, len(r.CaseRunIDs))
+	ids := make([]int64, 0, len(r.CaseRunIDs))
+	for _, raw := range r.CaseRunIDs {
+		id, err := validation.NonEmptyID("case_run_ids", raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// optionalIDField parses an optional decimal-string ID; a present empty or
+// non-positive value is invalid.
+func optionalIDField(field string, raw *string) (int64, error) {
+	if raw == nil {
+		return 0, nil
+	}
+	return validation.NonEmptyID(field, *raw)
+}
+
+func isIssueCategory(category string) bool {
+	switch category {
+	case "ui", "api", "db":
+		return true
+	default:
+		return false
+	}
+}
+
+func isIssueSeverity(severity string) bool {
+	switch severity {
+	case "major", "minor", "trivial":
+		return true
+	default:
+		return false
+	}
+}
+
 /* ---------------------------------- views --------------------------------- */
 
 // IssueView is the list/action projection of one issue (contract IssueView).
 // RecurrenceCount/LastRecurredAt are the P7 recurrence projection; MergedChain
 // is the read-time merged_into target chain (direct target first, terminal
 // target last, at most MaxIssueMergeChain IDs) and is null for a non-merged
-// issue (spec §4.6).
+// issue (spec §4.6). RetestStatus/LastRetestWaveID/LastRetestCaseRunID are the
+// v0.22 W2-5 retest projection consumed by the issue UI.
 type IssueView struct {
-	ID               string           `json:"id"`
-	VersionID        string           `json:"version_id"`
-	Title            string           `json:"title"`
-	Summary          string           `json:"summary"`
-	Status           string           `json:"status"`
-	Category         string           `json:"category"`
-	Severity         string           `json:"severity"`
-	Source           string           `json:"source"`
-	ExpectedRevision int32            `json:"expected_revision"`
-	MergedIntoID     *string          `json:"merged_into_id"`
-	MergedAt         *string          `json:"merged_at"`
-	ReopenCount      int              `json:"reopen_count"`
-	RecurrenceCount  int              `json:"recurrence_count"`
-	LastRecurredAt   *string          `json:"last_recurred_at"`
-	MergedChain      []string         `json:"merged_chain"`
-	Refs             []IssueRefView   `json:"refs"`
-	Triage           *IssueTriageView `json:"triage"`
-	CreatedAt        string           `json:"created_at"`
-	UpdatedAt        string           `json:"updated_at"`
+	ID                  string           `json:"id"`
+	VersionID           string           `json:"version_id"`
+	Title               string           `json:"title"`
+	Summary             string           `json:"summary"`
+	Status              string           `json:"status"`
+	Category            string           `json:"category"`
+	Severity            string           `json:"severity"`
+	Source              string           `json:"source"`
+	ExpectedRevision    int32            `json:"expected_revision"`
+	MergedIntoID        *string          `json:"merged_into_id"`
+	MergedAt            *string          `json:"merged_at"`
+	ReopenCount         int              `json:"reopen_count"`
+	RecurrenceCount     int              `json:"recurrence_count"`
+	LastRecurredAt      *string          `json:"last_recurred_at"`
+	RetestStatus        string           `json:"retest_status"`
+	LastRetestWaveID    *string          `json:"last_retest_wave_id"`
+	LastRetestCaseRunID *string          `json:"last_retest_case_run_id"`
+	MergedChain         []string         `json:"merged_chain"`
+	Refs                []IssueRefView   `json:"refs"`
+	Triage              *IssueTriageView `json:"triage"`
+	CreatedAt           string           `json:"created_at"`
+	UpdatedAt           string           `json:"updated_at"`
+}
+
+// RetestIssueView is the POST .../issues/{issueId}/retest response (v0.22
+// W2-5/API-25): the retest wave identity and the issue's new retest_status.
+type RetestIssueView struct {
+	IssueID      string   `json:"issue_id"`
+	VersionID    string   `json:"version_id"`
+	WaveID       string   `json:"wave_id"`
+	WaveStatus   string   `json:"wave_status"`
+	RetestStatus string   `json:"retest_status"`
+	CaseRunIDs   []string `json:"case_run_ids"`
 }
 
 // IssueRefView is one append-only issue reference (contract IssueRefView).
@@ -166,26 +346,35 @@ func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *deliver
 	if source == "" {
 		source = delivery.IssueCandidateSource
 	}
+	retestStatus := issue.RetestStatus
+	if retestStatus == "" {
+		// Rows created before the v0.22 retest migration (or test doubles) read
+		// back as the persisted default so the contract enum never sees "".
+		retestStatus = delivery.IssueRetestStatusNotRetested
+	}
 	view := IssueView{
-		ID:               platformid.Format(issue.ID),
-		VersionID:        platformid.Format(issue.VersionID),
-		Title:            issue.Title,
-		Summary:          issue.Summary,
-		Status:           string(issue.Status),
-		Category:         issue.Category,
-		Severity:         issue.Severity,
-		Source:           source,
-		ExpectedRevision: issue.ExpectedRevision,
-		MergedIntoID:     optionalIDString(issue.MergedIntoID),
-		MergedAt:         formatOptionalTime(issue.MergedAt),
-		ReopenCount:      issue.ReopenCount,
-		RecurrenceCount:  issue.RecurrenceCount,
-		LastRecurredAt:   formatOptionalTime(issue.LastRecurredAt),
-		MergedChain:      formatIssueChain(mergedChain),
-		Refs:             make([]IssueRefView, 0, len(refs)),
-		Triage:           toIssueTriageView(triage),
-		CreatedAt:        formatTime(issue.CreatedAt),
-		UpdatedAt:        formatTime(issue.UpdatedAt),
+		ID:                  platformid.Format(issue.ID),
+		VersionID:           platformid.Format(issue.VersionID),
+		Title:               issue.Title,
+		Summary:             issue.Summary,
+		Status:              string(issue.Status),
+		Category:            issue.Category,
+		Severity:            issue.Severity,
+		Source:              source,
+		ExpectedRevision:    issue.ExpectedRevision,
+		MergedIntoID:        optionalIDString(issue.MergedIntoID),
+		MergedAt:            formatOptionalTime(issue.MergedAt),
+		ReopenCount:         issue.ReopenCount,
+		RecurrenceCount:     issue.RecurrenceCount,
+		LastRecurredAt:      formatOptionalTime(issue.LastRecurredAt),
+		RetestStatus:        retestStatus,
+		LastRetestWaveID:    optionalIDString(issue.LastRetestWaveID),
+		LastRetestCaseRunID: optionalIDString(issue.LastRetestCaseRunID),
+		MergedChain:         formatIssueChain(mergedChain),
+		Refs:                make([]IssueRefView, 0, len(refs)),
+		Triage:              toIssueTriageView(triage),
+		CreatedAt:           formatTime(issue.CreatedAt),
+		UpdatedAt:           formatTime(issue.UpdatedAt),
 	}
 	for _, ref := range refs {
 		view.Refs = append(view.Refs, toIssueRefView(ref))
@@ -299,6 +488,33 @@ func (r regenerateReportRequest) parse() error {
 		return platform.Invalid("reason", "must be at most 2000 characters")
 	}
 	return nil
+}
+
+// reportArtifactRequest is POST .../reports/{reportId}/artifacts (v0.22 W2-7).
+// The format is one of html/pdf/markdown.
+type reportArtifactRequest struct {
+	Format string `json:"format"`
+}
+
+// parse normalizes and validates the requested artifact format.
+func (r reportArtifactRequest) parse() (string, error) {
+	format := strings.ToLower(strings.TrimSpace(r.Format))
+	switch format {
+	case "html", "pdf", "markdown":
+		return format, nil
+	default:
+		return "", platform.Invalid("format", "must be one of html, pdf, markdown")
+	}
+}
+
+// ReportArtifactView is the POST artifacts response body (contract
+// ReportArtifactCreateRequest response). It never exposes storage paths.
+type ReportArtifactView struct {
+	ID     string `json:"id"`
+	Format string `json:"format"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	Status string `json:"status"`
 }
 
 // ReportView is the list/detail report header projection (contract ReportView).

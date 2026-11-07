@@ -1,6 +1,7 @@
 import { type ApiDownload, apiDownload, apiGet, apiGetPage, apiPost } from "@/lib/api-client"
 
 import type {
+  CreateManualIssueInput,
   IssueActionInput,
   IssueDetailView,
   IssueListOptions,
@@ -9,10 +10,14 @@ import type {
   RegenerateReportInput,
   RegenerateReportResult,
   ReopenIssueInput,
+  ReportArtifactFormat,
+  ReportArtifactView,
   ReportDetailView,
+  ReportExportArtifact,
   ReportListOptions,
   ReportRevisionView,
   ReportView,
+  RetestIssueResult,
 } from "./types"
 
 /** Builds `?a=1&b=2`, skipping empty values (P0/P1 pagination style). */
@@ -117,6 +122,57 @@ export function mergeIssue(
   return apiPost<IssueView>(`${issuePath(versionId, issueId)}/merge`, body)
 }
 
+/**
+ * `POST /api/versions/{id}/issues` (v0.22 W2-4): manual issue creation. The
+ * optional `case_run_id` links the source run (and its evidence) to the issue.
+ */
+export function createManualIssue(
+  versionId: string,
+  input: CreateManualIssueInput,
+): Promise<IssueView> {
+  const body: {
+    title: string
+    summary?: string
+    category: string
+    severity: string
+    case_run_id?: string
+    evidence_ids?: string[]
+    merge_into_id?: string
+    reason?: string
+  } = {
+    title: input.title,
+    category: input.category,
+    severity: input.severity,
+  }
+  if (input.summary !== undefined && input.summary.length > 0) body.summary = input.summary
+  if (input.case_run_id !== undefined && input.case_run_id.length > 0) {
+    body.case_run_id = input.case_run_id
+  }
+  if (input.evidence_ids !== undefined && input.evidence_ids.length > 0) {
+    body.evidence_ids = input.evidence_ids
+  }
+  if (input.merge_into_id !== undefined && input.merge_into_id.length > 0) {
+    body.merge_into_id = input.merge_into_id
+  }
+  if (input.reason !== undefined && input.reason.length > 0) body.reason = input.reason
+  return apiPost<IssueView>(`${versionPath(versionId)}/issues`, body)
+}
+
+/**
+ * `POST .../issues/{issueId}/retest` (v0.22 W2-5/API-25). An empty selection
+ * retests every case_run linked to the issue. The response `case_run_ids` are
+ * the new retest runs, not the request source runs.
+ */
+export function retestIssue(
+  versionId: string,
+  issueId: string,
+  caseRunIds: string[] = [],
+): Promise<RetestIssueResult> {
+  const body: { case_run_ids?: string[] } = {}
+  if (caseRunIds.length > 0) body.case_run_ids = caseRunIds
+  return apiPost<RetestIssueResult>(`${issuePath(versionId, issueId)}/retest`, body)
+}
+
 /* ---------------------------------- reports -------------------------------- */
 
 /** `GET /api/versions/{id}/reports` (version summary first, then wave id DESC). */
@@ -184,4 +240,42 @@ export function downloadPDF(
   return apiDownload(
     `${reportPath(versionId, reportId)}/revisions/${encodeURIComponent(revision)}/pdf`,
   )
+}
+
+/* -------------------------------- artifacts -------------------------------- */
+
+/**
+ * `POST .../reports/{reportId}/artifacts` (v0.22 W2-7): renders the current
+ * published revision as one `export_artifact` (owner_kind=report). HTML/PDF
+ * reuse the verified revision bytes, Markdown is deterministic. PDF answers 409
+ * `pdf_not_ready` until the render job is done.
+ */
+export function createReportArtifact(
+  versionId: string,
+  reportId: string,
+  format: ReportArtifactFormat,
+): Promise<ReportArtifactView> {
+  return apiPost<ReportArtifactView>(`${reportPath(versionId, reportId)}/artifacts`, { format })
+}
+
+/**
+ * Lists the version's export artifacts and keeps the report-owned rows
+ * (`owner_kind=report`, `owner_id=reportId`). There is no report-scoped list
+ * route; the version export list is the existing contract read path (API-28).
+ */
+export async function listReportArtifacts(
+  versionId: string,
+  reportId: string,
+): Promise<ReportExportArtifact[]> {
+  const page = await apiGetPage<ReportExportArtifact>(
+    `${versionPath(versionId)}/exports${query({ limit: 100 })}`,
+  )
+  return page.items.filter(
+    (artifact) => artifact.owner_kind === "report" && artifact.owner_id === reportId,
+  )
+}
+
+/** `GET /api/exports/{exportId}/download`: authenticated artifact bytes. */
+export function downloadReportArtifact(exportId: string): Promise<ApiDownload> {
+  return apiDownload(`/api/exports/${encodeURIComponent(exportId)}/download`)
 }

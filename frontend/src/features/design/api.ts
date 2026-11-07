@@ -4,6 +4,7 @@ import { apiDownload, apiGet, apiGetPage, apiPost } from "@/lib/api-client"
 import type {
   CaseConfirmationInput,
   CaseConfirmationResult,
+  CaseRevisionRollbackView,
   DesignCaseDetail,
   DesignGraph,
   DesignOverview,
@@ -89,8 +90,28 @@ export function confirmStageCases(versionId: string, caseIds: string[]): Promise
   })
 }
 
-/* ---------------------------------- exports --------------------------------- */
+/* --------------------------- discovery revisions ---------------------------- */
 
+/**
+ * API-41: rolls back one auto-confirmed discovery revision (`trigger=discovery_delta`).
+ * The backend supersedes the original, creates a confirmed replacement revision
+ * (`trigger=rollback`, `rollback_of`) and keeps the case, so a repeat returns
+ * the same replacement instead of deleting anything (W2-C11). The optional
+ * `reason` is audit metadata.
+ */
+export function rollbackCaseVersion(
+  versionId: string,
+  caseVersionId: string,
+  reason?: string,
+): Promise<CaseRevisionRollbackView> {
+  const trimmed = reason?.trim() ?? ""
+  return apiPost<CaseRevisionRollbackView>(
+    `${versionPath(versionId)}/case-versions/${encodeURIComponent(caseVersionId)}/rollback`,
+    trimmed.length > 0 ? { reason: trimmed } : {},
+  )
+}
+
+/* ---------------------------------- exports --------------------------------- */
 /** Creates a whole-version case export; every call creates a new revision. */
 export function createExport(versionId: string, input: ExportRequest): Promise<ExportView> {
   return apiPost<ExportView>(`${versionPath(versionId)}/exports`, input)
@@ -111,7 +132,117 @@ export async function listExports(
   return page.items
 }
 
+/** GET /api/exports/{exportId} — one export artifact's metadata (spec §7.4). */
+export function getExport(exportId: string): Promise<ExportView> {
+  return apiGet<ExportView>(`/api/exports/${encodeURIComponent(exportId)}`)
+}
+
 /** Downloads the export bytes through the shared bearer/401 client. */
 export function downloadExport(exportId: string): ReturnType<typeof apiDownload> {
   return apiDownload(`/api/exports/${encodeURIComponent(exportId)}/download`)
+}
+
+/* ------------------------ clarification → design handoff -------------------- */
+
+export type HandoffRequirement = {
+  id: string
+  current_version_id: string
+  revision: number
+  title: string
+  description: string
+  acceptance_criteria: string
+  priority: string
+  status: string
+  source_quote: string
+  confidence?: number | null
+  confirmed_at?: string | null
+}
+
+export type HandoffQAOption = { id: string; label: string }
+
+export type HandoffQA = {
+  question_id: string
+  message_id?: string
+  conversation_id?: string
+  question_key?: string
+  question: string
+  options: HandoffQAOption[]
+  source_refs: string[]
+  requirement_id?: string
+  requirement_refs: string[]
+  status: string
+  answer_selected: string[]
+  answer_text: string
+  asked_at?: string
+  answered_at?: string | null
+}
+
+export type HandoffDecision = {
+  fact_id: string
+  kind: string
+  key: string
+  summary: string
+  confidence?: number | null
+  source: string
+  source_ref?: string
+  created_at?: string
+}
+
+export type HandoffOpen = {
+  kind: string
+  summary: string
+  status: string
+  source: string
+  reference_id?: string
+  question_key?: string
+  created_at?: string | null
+}
+
+export type HandoffPlanItem = {
+  id: string
+  phase: string
+  title: string
+  status: string
+  decision: string
+}
+
+export type HandoffPlan = {
+  stage: string
+  current?: HandoffPlanItem | null
+  next?: HandoffPlanItem | null
+}
+
+export type HandoffResources = {
+  suts: Array<Record<string, unknown>>
+  pages: Array<Record<string, unknown>>
+  apis: Array<Record<string, unknown>>
+  accounts: Array<Record<string, unknown>>
+  databases: Array<Record<string, unknown>>
+  repositories: Array<Record<string, unknown>>
+}
+
+/** `HandoffView`: the six-block clarification → design handoff document. */
+export type HandoffView = {
+  version_id: string
+  revision: number
+  generated_at: string
+  requirements: HandoffRequirement[]
+  qa: HandoffQA[]
+  decisions: HandoffDecision[]
+  open: HandoffOpen[]
+  plan: HandoffPlan
+  resources: HandoffResources
+}
+
+/**
+ * `GET /api/versions/{id}/handoff[?revision=]`: the newest handoff revision, or
+ * the explicitly requested one. All six blocks are always arrays/objects.
+ */
+export function getVersionHandoff(
+  versionId: string,
+  revision?: string | number,
+): Promise<HandoffView> {
+  return apiGet<HandoffView>(
+    `${versionPath(versionId)}/handoff${query({ revision: revision === undefined ? undefined : String(revision) })}`,
+  )
 }

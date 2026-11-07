@@ -22,6 +22,12 @@ const (
 	// issueEventRecurred is the P7 recurrence event (spec §7): emitted on both a
 	// successful redirect and a broken/cyclic chain fallback.
 	issueEventRecurred = "issue.recurred"
+	// v0.22 W2-5 retest events (spec EV-16 / R-W2-2). retest_started is emitted
+	// when a retest wave is linked; completed/failed are emitted by the terminal
+	// wave writeback. "Other" terminal statuses keep retesting (no event).
+	issueEventRetestStarted   = "issue.retest_started"
+	issueEventRetestCompleted = "issue.retest_completed"
+	issueEventRetestFailed    = "issue.retest_failed"
 )
 
 // Audit actions of the issue lifecycle (D52). Audit is best effort.
@@ -34,6 +40,11 @@ const (
 	// issueAuditRecurred records a recurrence redirect, including the fallback
 	// that keeps the pre-P7 dedupe behavior.
 	issueAuditRecurred = "delivery.issue.recurred"
+	// issueAuditRetestStarted/Completed/Failed record the v0.22 retest lifecycle
+	// (IDs only, never case/evidence content).
+	issueAuditRetestStarted   = "delivery.issue.retest_started"
+	issueAuditRetestCompleted = "delivery.issue.retest_completed"
+	issueAuditRetestFailed    = "delivery.issue.retest_failed"
 )
 
 const (
@@ -47,6 +58,721 @@ const (
 	// redirect (spec §4.6); the status itself does not change.
 	issueReasonRecurrence = "recurrence"
 )
+
+// CreateManualIssueInput is the v0.22 W2-4 manual create command. CaseRunID and
+// the evidence/merge IDs are optional; empty strings mean absent.
+type CreateManualIssueInput struct {
+	VersionID   int64
+	Title       string
+	Summary     string
+	Category    string
+	Severity    string
+	CaseRunID   int64
+	EvidenceIDs []int64
+	MergeIntoID int64
+	Reason      string
+}
+
+// RetestResult is the outcome of StartRetest: the created retest wave, the
+// issue row carrying retest_status='retesting' and the wave pointer, and the
+// newly created retest case_run IDs (in selection order) for deep links.
+type RetestResult struct {
+	Wave       RetestWave
+	Issue      delivery.Issue
+	CaseRunIDs []int64
+}
+
+// retestIntent is one PurposeRetest intent created for a selected case version.
+// The intent ID is the only trustworthy link to the case_run the wave planned:
+// the deterministic wave may also contain unrelated open intents.
+type retestIntent struct {
+	caseVersionID int64
+	intentID      int64
+}
+
+// retestIntentIDs maps created retest intents onto their IDs for a best-effort
+// rollback.
+func retestIntentIDs(intents []retestIntent) []int64 {
+	if len(intents) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(intents))
+	for _, intent := range intents {
+		ids = append(ids, intent.intentID)
+	}
+	return ids
+}
+
+// UpdateManualIssueInput is the v0.22 W2-4 manual patch command. Empty string
+// fields leave the stored column unchanged; ExpectedRevision is mandatory.
+type UpdateManualIssueInput struct {
+	Title            string
+	Summary          string
+	Category         string
+	Severity         string
+	CaseRunID        int64
+	EvidenceIDs      []int64
+	MergeIntoID      int64
+	Reason           string
+	ExpectedRevision int32
+}
+
+// CreateManual creates one source='manual' issue (v0.22 W2-4). A supplied
+// case_run is resolved through the execution read port so its case_version,
+// requirement and version SUT refs are persisted with the explicit evidence
+// refs. The creation history, event and audit are projections of the committed
+// write; a projection failure never rolls it back. When MergeIntoID is set the
+// existing merge use case runs after the create, so merge validation, history
+// and the issue.merged event stay unchanged.
+func (s *IssueService) CreateManual(ctx context.Context, in CreateManualIssueInput, actorID int64) (delivery.Issue, error) {
+	if in.VersionID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("version id must be a positive decimal ID")
+	}
+	if actorID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("actor id must be a positive decimal ID")
+	}
+	if in.CaseRunID < 0 {
+		return delivery.Issue{}, invalidArgumentf("case_run_id must be a positive decimal ID")
+	}
+	if in.MergeIntoID < 0 {
+		return delivery.Issue{}, invalidArgumentf("merge_into_id must be a positive decimal ID")
+	}
+	reason, err := normalizeIssueReason(in.Reason, false)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := delivery.ValidateManualIssueFields(in.Title, in.Summary, in.Category, in.Severity); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue", err)
+	}
+	if _, err := delivery.ValidateManualEvidenceIDs(in.EvidenceIDs); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue evidence", err)
+	}
+	manual, err := s.resolveManualIssueInput(ctx, in.VersionID, in.Title, in.Summary,
+		in.Category, in.Severity, in.CaseRunID, in.EvidenceIDs)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	issue, refs, err := delivery.NewManualIssue(manual)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("build manual issue", err)
+	}
+	now := s.nowUTC()
+	issue.CreatedAt = now
+	issue.UpdatedAt = now
+	created, err := s.repo.CreateManual(ctx, IssueManualCreate{
+		Issue: issue,
+		Refs:  refs,
+		History: delivery.IssueStatusChange{
+			To:        delivery.IssueStatusOpen,
+			Reason:    reason,
+			ActorID:   &actorID,
+			ActorKind: issueActorKindUser,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	})
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("create manual issue", err)
+	}
+	projected := created
+	if projected.VersionID <= 0 {
+		projected.VersionID = in.VersionID
+	}
+	payload := map[string]any{
+		"issue_id": formatIssueID(projected.ID),
+		"status":   string(projected.Status),
+		"category": projected.Category,
+		"severity": projected.Severity,
+		"source":   delivery.IssueManualSource,
+	}
+	if in.CaseRunID > 0 {
+		payload["case_run_id"] = formatIssueID(in.CaseRunID)
+	}
+	s.publishIssueEvent(ctx, issueEventCreated, projected.VersionID, payload)
+	s.recordManualIssueCreatedAudit(ctx, actorID, projected)
+	if in.MergeIntoID > 0 {
+		return s.Merge(ctx, in.VersionID, projected.ID, in.MergeIntoID, actorID, reason, &projected.ExpectedRevision)
+	}
+	return created, nil
+}
+
+// UpdateManual patches the editable fields of one issue under the
+// expected_revision CAS (v0.22 W2-4). Empty string fields leave the stored
+// column unchanged; evidence IDs are appended to the append-only refs. A stale
+// revision is reported as the stable issue_revision_conflict subcode. When
+// MergeIntoID is set the existing merge use case runs on the patched revision.
+func (s *IssueService) UpdateManual(ctx context.Context, versionID, issueID int64, in UpdateManualIssueInput, actorID int64) (delivery.Issue, error) {
+	if versionID <= 0 || issueID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("version and issue IDs must be positive decimal IDs")
+	}
+	if actorID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("actor id must be a positive decimal ID")
+	}
+	if in.ExpectedRevision <= 0 {
+		return delivery.Issue{}, invalidArgumentf("expected revision must be a positive integer")
+	}
+	if in.CaseRunID < 0 {
+		return delivery.Issue{}, invalidArgumentf("case_run_id must be a positive decimal ID")
+	}
+	if in.MergeIntoID < 0 {
+		return delivery.Issue{}, invalidArgumentf("merge_into_id must be a positive decimal ID")
+	}
+	reason, err := normalizeIssueReason(in.Reason, false)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	current, err := s.repo.Get(ctx, versionID, issueID)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("load issue for manual update", err)
+	}
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		title = current.Title
+	}
+	summary := current.Summary
+	if strings.TrimSpace(in.Summary) != "" {
+		summary = in.Summary
+	}
+	category := strings.TrimSpace(in.Category)
+	if category == "" {
+		category = current.Category
+	}
+	severity := strings.TrimSpace(in.Severity)
+	if severity == "" {
+		severity = current.Severity
+	}
+	if err := delivery.ValidateManualIssueFields(title, summary, category, severity); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue update", err)
+	}
+	if _, err := delivery.ValidateManualEvidenceIDs(in.EvidenceIDs); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue update evidence", err)
+	}
+	manual, err := s.resolveManualIssueInput(ctx, versionID, title, summary,
+		category, severity, in.CaseRunID, in.EvidenceIDs)
+	if err != nil {
+		return delivery.Issue{}, err
+	}
+	_, refs, err := delivery.NewManualIssue(manual)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("validate manual issue update", err)
+	}
+	// The repository treats an empty summary as "unchanged"; a non-blank patch
+	// value replaces it, preserving intentional leading/trailing whitespace.
+	updatedSummary := ""
+	if strings.TrimSpace(in.Summary) != "" {
+		updatedSummary = in.Summary
+	}
+	now := s.nowUTC()
+	from := current.Status
+	updated, err := s.repo.UpdateManual(ctx, IssueManualUpdate{
+		VersionID:        versionID,
+		IssueID:          issueID,
+		Title:            strings.TrimSpace(in.Title),
+		Summary:          updatedSummary,
+		Category:         strings.TrimSpace(in.Category),
+		Severity:         strings.TrimSpace(in.Severity),
+		ExpectedRevision: in.ExpectedRevision,
+		Refs:             refs,
+		History: delivery.IssueStatusChange{
+			From:      &from,
+			To:        current.Status,
+			Reason:    reason,
+			ActorID:   &actorID,
+			ActorKind: issueActorKindUser,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	})
+	return s.finishManualUpdate(ctx, versionID, issueID, current, in, reason, actorID, updated, err)
+}
+
+// finishManualUpdate applies the patch projections (event, optional merge).
+func (s *IssueService) finishManualUpdate(ctx context.Context, versionID, issueID int64,
+	current delivery.Issue, in UpdateManualIssueInput, reason string, actorID int64,
+	updated delivery.Issue, repoErr error) (delivery.Issue, error) {
+	if repoErr != nil {
+		if errors.Is(repoErr, delivery.ErrStateConflict) {
+			return delivery.Issue{}, &IssueStateConflictError{Reason: IssueConflictRevisionMismatch}
+		}
+		return delivery.Issue{}, mapIssueRepositoryError("update manual issue", repoErr)
+	}
+	updatedID := updated.ID
+	if updatedID <= 0 {
+		updatedID = issueID
+	}
+	payload := map[string]any{
+		"issue_id":    formatIssueID(updatedID),
+		"from_status": string(current.Status),
+		"to_status":   string(updated.Status),
+		"source":      delivery.IssueManualSource,
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	s.publishIssueEvent(ctx, issueEventUpdated, versionID, payload)
+	if in.MergeIntoID > 0 {
+		return s.Merge(ctx, versionID, updatedID, in.MergeIntoID, actorID, reason, &updated.ExpectedRevision)
+	}
+	return updated, nil
+}
+
+// StartRetest creates a retest wave for one issue (v0.22 W2-5 / R-W2-2). The
+// optional caseRunIDs restrict the retest to a subset of the issue's linked
+// case_runs; an empty selection retests every linked case_run. The retest
+// intents reuse IntentService.CreateManual(PurposeRetest), the wave reuses the
+// deterministic scheduler, and the issue/ref writeback is one transaction.
+func (s *IssueService) StartRetest(ctx context.Context, versionID, issueID, actorID int64, caseRunIDs ...int64) (RetestResult, error) {
+	if versionID <= 0 || issueID <= 0 {
+		return RetestResult{}, invalidArgumentf("version and issue IDs must be positive decimal IDs")
+	}
+	if actorID <= 0 {
+		return RetestResult{}, invalidArgumentf("actor id must be a positive decimal ID")
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return RetestResult{}, err
+	}
+	if err := s.requireExecutionReader(); err != nil {
+		return RetestResult{}, err
+	}
+	if s.retest == nil {
+		return RetestResult{}, issueServiceNotConfigured("retest executor")
+	}
+	issue, err := s.repo.Get(ctx, versionID, issueID)
+	if err != nil {
+		return RetestResult{}, mapIssueRepositoryError("load issue for retest", err)
+	}
+	if issue.Status != delivery.IssueStatusOpen && issue.Status != delivery.IssueStatusConfirmed {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictNotRetestable}
+	}
+	// Any active wave blocks a new retest: the deterministic scheduler keeps one
+	// active wave per version, so a concurrent retest/execute must be a typed
+	// conflict instead of a half-created intent batch.
+	if _, active, err := s.retest.ActiveWave(ctx, versionID); err != nil {
+		return RetestResult{}, mapIssueRepositoryError("check active retest wave", err)
+	} else if active {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictRetestActive}
+	}
+
+	refs, err := s.repo.ListRefs(ctx, issueID)
+	if err != nil {
+		return RetestResult{}, mapIssueRepositoryError("list issue refs for retest", err)
+	}
+	selected, err := selectRetestCaseRunRefs(refs, caseRunIDs)
+	if err != nil {
+		return RetestResult{}, err
+	}
+	if len(selected) == 0 {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictNotRetestable}
+	}
+
+	// Resolve the selected case_runs to their case versions. One retest intent is
+	// created per distinct case version, preserving the issue ref order.
+	type retestCaseVersion struct {
+		caseVersionID int64
+	}
+	ordered := make([]retestCaseVersion, 0, len(selected))
+	seen := make(map[int64]struct{}, len(selected))
+	for _, ref := range selected {
+		snapshot, err := s.exec.CaseRunSnapshot(ctx, ref.RefID)
+		if err != nil {
+			return RetestResult{}, mapIssueRepositoryError("load retest case run", err)
+		}
+		if snapshot.VersionID > 0 && snapshot.VersionID != versionID {
+			return RetestResult{}, invalidArgumentf("case run %d belongs to version %d, not %d",
+				ref.RefID, snapshot.VersionID, versionID)
+		}
+		if snapshot.CaseVersionID <= 0 {
+			return RetestResult{}, invalidArgumentf("case run %d has no case version", ref.RefID)
+		}
+		if _, ok := seen[snapshot.CaseVersionID]; ok {
+			continue
+		}
+		seen[snapshot.CaseVersionID] = struct{}{}
+		ordered = append(ordered, retestCaseVersion{caseVersionID: snapshot.CaseVersionID})
+	}
+	if len(ordered) == 0 {
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictNotRetestable}
+	}
+
+	// Create the retest intents and remember the intent -> case_version mapping.
+	// The started wave is filtered by this mapping: only case_runs produced by
+	// the intents created here may be linked to the issue. An unrelated open
+	// intent planned into the same deterministic wave must never be written back.
+	intents := make([]retestIntent, 0, len(ordered))
+	for _, item := range ordered {
+		intentID, err := s.retest.CreateRetestIntent(ctx, versionID, item.caseVersionID, actorID)
+		if err != nil {
+			s.cancelRetestIntents(ctx, retestIntentIDs(intents))
+			return RetestResult{}, err
+		}
+		intents = append(intents, retestIntent{caseVersionID: item.caseVersionID, intentID: intentID})
+	}
+	created := make(map[int64]int64, len(intents))
+	for _, item := range intents {
+		created[item.intentID] = item.caseVersionID
+	}
+	wave, err := s.retest.StartRetestWave(ctx, versionID)
+	if err != nil {
+		// The intents are now open but no wave was planned; cancel them so a
+		// failed start does not leave a phantom retest queue behind.
+		s.cancelRetestIntents(ctx, retestIntentIDs(intents))
+		return RetestResult{}, mapIssueRepositoryError("start retest wave", err)
+	}
+	if wave.ID <= 0 {
+		s.cancelRetestIntents(ctx, retestIntentIDs(intents))
+		return RetestResult{}, errors.New("delivery: retest wave has no ID")
+	}
+
+	now := s.nowUTC()
+	retestRefs := make([]delivery.IssueRef, 0, len(intents)+1)
+	retestRefs = append(retestRefs, delivery.IssueRef{
+		Kind: delivery.IssueRefKindWave, RefID: wave.ID, Role: delivery.IssueRefRoleRetest,
+	})
+	linkedCaseRunIDs := make([]int64, 0, len(intents))
+	matched := make(map[int64]struct{}, len(intents))
+	for _, run := range wave.CaseRuns {
+		caseVersionID, ok := created[run.IntentID]
+		if !ok {
+			continue
+		}
+		if run.CaseVersionID > 0 && run.CaseVersionID != caseVersionID {
+			continue
+		}
+		if _, duplicate := matched[run.IntentID]; duplicate {
+			continue
+		}
+		matched[run.IntentID] = struct{}{}
+		linkedCaseRunIDs = append(linkedCaseRunIDs, run.ID)
+		retestRefs = append(retestRefs, delivery.IssueRef{
+			Kind: delivery.IssueRefKindCaseRun, RefID: run.ID, Role: delivery.IssueRefRoleRetest,
+		})
+	}
+	if len(matched) != len(intents) {
+		// The started wave did not consume every retest intent (a concurrent
+		// retest/retirement won the plan). Fail closed: cancel the orphan intents
+		// and leave the issue untouched so no unrelated run can be written back.
+		orphans := make([]int64, 0, len(intents)-len(matched))
+		for _, item := range intents {
+			if _, ok := matched[item.intentID]; !ok {
+				orphans = append(orphans, item.intentID)
+			}
+		}
+		s.cancelRetestIntents(ctx, orphans)
+		return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictRetestActive}
+	}
+	updated, err := s.repo.StartRetest(ctx, IssueRetestStart{
+		VersionID:                versionID,
+		IssueID:                  issueID,
+		WaveID:                   wave.ID,
+		ExpectedRetestStatus:     issue.RetestStatus,
+		ExpectedLastRetestWaveID: issue.LastRetestWaveID,
+		Refs:                     retestRefs,
+		Now:                      now,
+	})
+	if err != nil {
+		if errors.Is(err, delivery.ErrStateConflict) {
+			// The R-14 CAS lost: a concurrent retest committed between the issue
+			// read and this write. The linked intents belong to the winner's
+			// active wave, so they are deliberately not cancelled here.
+			return RetestResult{}, &IssueStateConflictError{Reason: IssueConflictRetestActive}
+		}
+		return RetestResult{}, mapIssueRepositoryError("persist retest start", err)
+	}
+	payload := map[string]any{
+		"issue_id":      formatIssueID(updated.ID),
+		"version_id":    formatIssueID(versionID),
+		"wave_id":       formatIssueID(wave.ID),
+		"case_run_ids":  formatIssueIDs(linkedCaseRunIDs),
+		"retest_status": delivery.IssueRetestStatusRetesting,
+		"error":         "",
+	}
+	s.publishIssueEvent(ctx, issueEventRetestStarted, versionID, payload)
+	s.recordIssueAudit(ctx, actorID, issueAuditRetestStarted, updated.ID, map[string]any{
+		"version_id": formatIssueID(versionID),
+		"wave_id":    formatIssueID(wave.ID),
+		"status":     delivery.IssueRetestStatusRetesting,
+	})
+	return RetestResult{Wave: wave, Issue: updated, CaseRunIDs: linkedCaseRunIDs}, nil
+}
+
+// cancelRetestIntents best-effort rollback of a partially created retest batch.
+func (s *IssueService) cancelRetestIntents(ctx context.Context, intentIDs []int64) {
+	for _, intentID := range intentIDs {
+		if intentID <= 0 {
+			continue
+		}
+		_ = s.retest.CancelRetestIntent(ctx, intentID)
+	}
+}
+
+// selectRetestCaseRunRefs filters the issue's source case_run refs and applies
+// the optional client selection. A selected ID that is not linked to the issue
+// is invalid rather than silently dropped.
+func selectRetestCaseRunRefs(refs []delivery.IssueRef, caseRunIDs []int64) ([]delivery.IssueRef, error) {
+	source := make([]delivery.IssueRef, 0, len(refs))
+	available := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.Kind != delivery.IssueRefKindCaseRun || ref.Role == delivery.IssueRefRoleRetest {
+			continue
+		}
+		source = append(source, ref)
+		available[ref.RefID] = struct{}{}
+	}
+	if len(caseRunIDs) == 0 {
+		return source, nil
+	}
+	selected := make(map[int64]struct{}, len(caseRunIDs))
+	for _, caseRunID := range caseRunIDs {
+		if caseRunID <= 0 {
+			return nil, invalidArgumentf("case_run_ids must contain positive decimal IDs")
+		}
+		if _, ok := available[caseRunID]; !ok {
+			return nil, invalidArgumentf("case run %d is not linked to this issue", caseRunID)
+		}
+		selected[caseRunID] = struct{}{}
+	}
+	filtered := make([]delivery.IssueRef, 0, len(selected))
+	for _, ref := range source {
+		if _, ok := selected[ref.RefID]; ok {
+			filtered = append(filtered, ref)
+		}
+	}
+	return filtered, nil
+}
+
+// retestWriteback is one normalized terminal retest outcome. errorText is the
+// EV-16 event error field: empty on success, the terminal reason on failed/other.
+type retestWriteback struct {
+	targetStatus string
+	caseRunID    int64
+	reason       string
+	errorText    string
+}
+
+// OnRetestTerminal writes back one terminal retest case_run result. passed and
+// failed map to the same issue retest_status; any other terminal status keeps
+// retesting and records the reason in the append-only status history. Repeated
+// calls for the same retest wave are idempotent and emit no duplicate event.
+func (s *IssueService) OnRetestTerminal(ctx context.Context, waveID, caseRunID int64, status string) (delivery.Issue, error) {
+	if waveID <= 0 || caseRunID <= 0 {
+		return delivery.Issue{}, invalidArgumentf("wave and case run IDs must be positive decimal IDs")
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return delivery.Issue{}, err
+	}
+	issue, found, err := s.repo.FindByRetestWave(ctx, waveID)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("find issue for retest writeback", err)
+	}
+	if !found {
+		// A terminal wave that is not a retest wave has nothing to write back.
+		return delivery.Issue{}, nil
+	}
+	outcome := retestWritebackFor(status)
+	outcome.caseRunID = caseRunID
+	if issue.RetestStatus == outcome.targetStatus && issue.LastRetestCaseRunID != nil && *issue.LastRetestCaseRunID == caseRunID {
+		return issue, nil
+	}
+	return s.applyRetestWriteback(ctx, issue, waveID, outcome)
+}
+
+// applyRetestWriteback persists one terminal outcome and publishes the EV-16
+// event only when the repository reports that the projection actually changed.
+// A duplicate callback (or a concurrent writer that already applied the same
+// result) therefore never publishes a second terminal event.
+func (s *IssueService) applyRetestWriteback(ctx context.Context, issue delivery.Issue, waveID int64, outcome retestWriteback) (delivery.Issue, error) {
+	updated, applied, err := s.repo.ApplyRetestResult(ctx, IssueRetestResult{
+		VersionID:    issue.VersionID,
+		IssueID:      issue.ID,
+		WaveID:       waveID,
+		CaseRunID:    outcome.caseRunID,
+		TargetStatus: outcome.targetStatus,
+		Reason:       outcome.reason,
+		Now:          s.nowUTC(),
+	})
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("write issue retest result", err)
+	}
+	if !applied || outcome.targetStatus == delivery.IssueRetestStatusRetesting {
+		return updated, nil
+	}
+	payload := map[string]any{
+		"issue_id":      formatIssueID(updated.ID),
+		"version_id":    formatIssueID(updated.VersionID),
+		"wave_id":       formatIssueID(waveID),
+		"case_run_ids":  formatIssueIDs([]int64{outcome.caseRunID}),
+		"retest_status": updated.RetestStatus,
+		"error":         outcome.errorText,
+	}
+	auditMetadata := map[string]any{
+		"version_id": formatIssueID(updated.VersionID),
+		"wave_id":    formatIssueID(waveID),
+		"status":     updated.RetestStatus,
+	}
+	switch outcome.targetStatus {
+	case delivery.IssueRetestStatusPassed:
+		s.publishIssueEvent(ctx, issueEventRetestCompleted, updated.VersionID, payload)
+		s.recordIssueAudit(ctx, 0, issueAuditRetestCompleted, updated.ID, auditMetadata)
+	case delivery.IssueRetestStatusFailed:
+		s.publishIssueEvent(ctx, issueEventRetestFailed, updated.VersionID, payload)
+		s.recordIssueAudit(ctx, 0, issueAuditRetestFailed, updated.ID, auditMetadata)
+	}
+	return updated, nil
+}
+
+// OnRetestWaveTerminal is the wave-level writeback used by the execution
+// scheduler's WaveTerminalRetestNotifier. It aggregates only the issue's linked
+// role='retest' case_runs (any failed => failed, all passed => passed, otherwise
+// retesting) and applies one idempotent writeback.
+func (s *IssueService) OnRetestWaveTerminal(ctx context.Context, waveID int64) error {
+	if waveID <= 0 {
+		return invalidArgumentf("wave id must be a positive decimal ID")
+	}
+	if err := s.requireIssueRepository(); err != nil {
+		return err
+	}
+	if err := s.requireExecutionReader(); err != nil {
+		return err
+	}
+	issue, found, err := s.repo.FindByRetestWave(ctx, waveID)
+	if err != nil {
+		return mapIssueRepositoryError("find issue for retest wave", err)
+	}
+	if !found {
+		return nil
+	}
+	snapshot, err := s.exec.WaveSnapshot(ctx, issue.VersionID, waveID)
+	if err != nil {
+		return mapIssueRepositoryError("load retest wave snapshot", err)
+	}
+	linked, err := s.retestCaseRunIDs(ctx, issue.ID)
+	if err != nil {
+		return err
+	}
+	if len(linked) == 0 {
+		// No role='retest' case_run refs means this issue has no retest result to
+		// write back. Falling back to every run of the wave would let an
+		// unrelated/retired case version flip the issue (F2), so keep retesting.
+		return nil
+	}
+	runs := make([]CaseRunSnapshot, 0, len(snapshot.CaseRuns))
+	for _, run := range snapshot.CaseRuns {
+		if _, ok := linked[run.ID]; !ok {
+			continue
+		}
+		runs = append(runs, run)
+	}
+	if len(runs) == 0 {
+		// The linked runs are missing from the snapshot (for example the wave was
+		// superseded). There is no trustworthy result to write; keep retesting.
+		return nil
+	}
+	outcome := aggregateRetestWriteback(runs)
+	if issue.RetestStatus == outcome.targetStatus && issue.LastRetestCaseRunID != nil &&
+		*issue.LastRetestCaseRunID == outcome.caseRunID {
+		return nil
+	}
+	_, err = s.applyRetestWriteback(ctx, issue, waveID, outcome)
+	return err
+}
+
+// retestCaseRunIDs returns the case_run IDs linked with role='retest'.
+func (s *IssueService) retestCaseRunIDs(ctx context.Context, issueID int64) (map[int64]struct{}, error) {
+	refs, err := s.repo.ListRefs(ctx, issueID)
+	if err != nil {
+		return nil, mapIssueRepositoryError("list retest refs", err)
+	}
+	linked := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.Kind == delivery.IssueRefKindCaseRun && ref.Role == delivery.IssueRefRoleRetest {
+			linked[ref.RefID] = struct{}{}
+		}
+	}
+	return linked, nil
+}
+
+// aggregateRetestWriteback applies the R-W2-2 outcome rule. The representative
+// run is the failed run when any failed, otherwise the last passed run,
+// otherwise the last non-passed run (the reason source of the "keeps retesting"
+// case). The failed/other run also supplies the EV-16 error text.
+func aggregateRetestWriteback(runs []CaseRunSnapshot) retestWriteback {
+	var lastPassed *CaseRunSnapshot
+	var lastOther *CaseRunSnapshot
+	for index := range runs {
+		run := runs[index]
+		switch run.Status {
+		case "failed":
+			return retestWriteback{
+				targetStatus: delivery.IssueRetestStatusFailed,
+				caseRunID:    run.ID,
+				errorText:    retestErrorText(run),
+			}
+		case "passed":
+			lastPassed = &runs[index]
+		default:
+			lastOther = &runs[index]
+		}
+	}
+	if lastOther != nil {
+		return retestWriteback{
+			targetStatus: delivery.IssueRetestStatusRetesting,
+			caseRunID:    lastOther.ID,
+			reason:       lastOther.Status,
+			errorText:    retestErrorText(*lastOther),
+		}
+	}
+	if lastPassed != nil {
+		return retestWriteback{
+			targetStatus: delivery.IssueRetestStatusPassed,
+			caseRunID:    lastPassed.ID,
+		}
+	}
+	return retestWriteback{
+		targetStatus: delivery.IssueRetestStatusRetesting,
+		reason:       "unknown",
+		errorText:    "unknown",
+	}
+}
+
+// retestErrorText is the EV-16 error field of a non-passed run: prefer the
+// recorded failure reason, otherwise the terminal status.
+func retestErrorText(run CaseRunSnapshot) string {
+	if reason := strings.TrimSpace(run.FailedReason); reason != "" {
+		return reason
+	}
+	return strings.TrimSpace(run.Status)
+}
+
+// retestWritebackFor maps one terminal case_run status onto the issue retest
+// status, the optional history reason (other statuses only) and the EV-16 error
+// text (empty on success, the reason on failed/other).
+func retestWritebackFor(status string) retestWriteback {
+	trimmed := strings.TrimSpace(status)
+	switch trimmed {
+	case "passed":
+		return retestWriteback{targetStatus: delivery.IssueRetestStatusPassed}
+	case "failed":
+		return retestWriteback{
+			targetStatus: delivery.IssueRetestStatusFailed,
+			errorText:    trimmed,
+		}
+	default:
+		if trimmed == "" {
+			trimmed = "unknown"
+		}
+		return retestWriteback{
+			targetStatus: delivery.IssueRetestStatusRetesting,
+			reason:       trimmed,
+			errorText:    trimmed,
+		}
+	}
+}
 
 // IssueDetail is the read projection of one issue: its row plus the append-only
 // refs and status history and the latest triage analysis run, when one is
@@ -82,6 +808,10 @@ type IssueService struct {
 	clock  Clock
 	tasks  TaskEnsurer
 	triage IssueTriageReader
+	// retest is the v0.22 W2-5 execution write port (intent creation + wave
+	// planning). It is optional so the P4 constructor and its tests keep
+	// compiling; WithRetestExecutor attaches it in the composition root.
+	retest RetestExecutor
 
 	// P6 cross-version read ports. They stay optional so the P4 constructor
 	// and its tests keep compiling; WithGlobalReader attaches them.
@@ -110,6 +840,15 @@ func NewIssueService(repo IssueRepository, exec ExecutionReader, events EventPub
 func (s *IssueService) WithTriageReader(reader IssueTriageReader) *IssueService {
 	if s != nil {
 		s.triage = reader
+	}
+	return s
+}
+
+// WithRetestExecutor attaches the v0.22 W2-5 retest execution port. It returns
+// the service so the assembly root can chain it after construction.
+func (s *IssueService) WithRetestExecutor(executor RetestExecutor) *IssueService {
+	if s != nil {
+		s.retest = executor
 	}
 	return s
 }
@@ -372,6 +1111,58 @@ func (s *IssueService) Merge(ctx context.Context, versionID, sourceID, targetID,
 	}
 	s.recordIssueAudit(ctx, actorID, issueAuditMerged, mergedID, metadata)
 	return merged, nil
+}
+
+// resolveManualIssueInput validates the manual payload's case_run link and
+// maps the execution projection onto the domain manual-issue input. A supplied
+// case_run must resolve to the request's version.
+func (s *IssueService) resolveManualIssueInput(ctx context.Context, versionID int64,
+	title, summary, category, severity string, caseRunID int64, evidenceIDs []int64) (delivery.ManualIssueInput, error) {
+	in := delivery.ManualIssueInput{
+		VersionID:   versionID,
+		Title:       title,
+		Summary:     summary,
+		Category:    category,
+		Severity:    severity,
+		CaseRunID:   caseRunID,
+		EvidenceIDs: evidenceIDs,
+	}
+	if caseRunID <= 0 {
+		return in, nil
+	}
+	if s.exec == nil {
+		return in, invalidArgumentf("case_run_id requires an execution reader")
+	}
+	snapshot, err := s.exec.CaseRunSnapshot(ctx, caseRunID)
+	if err != nil {
+		return in, mapIssueRepositoryError("load manual issue case run", err)
+	}
+	if snapshot.ID <= 0 {
+		snapshot.ID = caseRunID
+	}
+	if snapshot.VersionID > 0 && snapshot.VersionID != versionID {
+		return in, invalidArgumentf("case run %d belongs to version %d, not %d",
+			caseRunID, snapshot.VersionID, versionID)
+	}
+	in.CaseRunID = snapshot.ID
+	in.CaseVersionID = snapshot.CaseVersionID
+	in.RequirementID = snapshot.RequirementID
+	in.VersionSUTID = snapshot.VersionSUTID
+	return in, nil
+}
+
+// recordManualIssueCreatedAudit records the user creation audit with the same
+// delivery.issue.created action as the candidate path (D52: IDs and
+// classification only, never body/evidence content).
+func (s *IssueService) recordManualIssueCreatedAudit(ctx context.Context, actorID int64, issue delivery.Issue) {
+	metadata := map[string]any{
+		"version_id": formatIssueID(issue.VersionID),
+		"status":     string(issue.Status),
+		"category":   issue.Category,
+		"severity":   issue.Severity,
+		"source":     delivery.IssueManualSource,
+	}
+	s.recordIssueAudit(ctx, actorID, issueAuditCreated, issue.ID, metadata)
 }
 
 // issueTransition is one status-machine action of the issue service.

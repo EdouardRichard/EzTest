@@ -283,8 +283,7 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
             {isAdmin ? <Badge tone="info">管理员</Badge> : null}
           </div>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            14 个固定 Agent profile 的目录、运行观察与质量投影。普通用户只读，且不会返回 prompt 或
-            transcript；配置与提示词版本仅管理员可编辑。
+            2 个对话 Host（clarification/design）是对话的唯一写者；design_author/design_critic 是后台作业，只出作业卡、无对话入口。执行 / 分析 profile 的目录、运行观察与质量投影只读展示，不返回 prompt 或 transcript；配置与提示词版本仅管理员可编辑。
           </p>
         </div>
         <Button variant="secondary" size="sm" onClick={refresh}>
@@ -359,6 +358,13 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
 
 /* -------------------------------- catalog -------------------------------- */
 
+// The two Hosts are the only conversation writers; design_author/design_critic
+// are background jobs exposed as job cards without a conversation entry
+// (v0.22 R-B1-1/R-B1-4). The grouping is derived from the API's profile key so
+// the job/Agent distinction never depends on a display name.
+const CONVERSATION_HOST_KEYS = new Set(["clarification_host", "design_host"])
+const CONVERSATION_JOB_KEYS = new Set(["design_author", "design_critic"])
+
 function CatalogPanel({
   catalog,
   loading,
@@ -370,16 +376,16 @@ function CatalogPanel({
   error: unknown
   onRetry: () => void
 }) {
-  if (loading && catalog === null) return <LoadingCard label="正在加载 Agent 目录…" />
+  if (loading && catalog === null) return <LoadingCard label="正在加载目录…" />
   if (error !== null) {
-    return <ErrorState error={error} title="Agent 目录加载失败" onRetry={onRetry} />
+    return <ErrorState error={error} title="目录加载失败" onRetry={onRetry} />
   }
   if (catalog === null || catalog.profiles.length === 0) {
     return (
       <div data-testid="agent-center-catalog-empty">
         <EmptyState
-          title="暂无 Agent profile"
-          description="启动 seed 后会显示 14 个固定 profile。"
+          title="暂无 profile"
+          description="启动 seed 后会显示对话 Host、后台作业与执行/分析 profile。"
         />
       </div>
     )
@@ -429,10 +435,23 @@ function CatalogPanel({
                         data-testid={`agent-center-profile-${profile.profile_key}`}
                       >
                         <td className="border-b border-border px-2 py-1.5">
-                          <p className="font-medium text-foreground">{profile.name}</p>
+                          <p className="flex flex-wrap items-center gap-1.5 font-medium text-foreground">
+                            {profile.name}
+                            {CONVERSATION_HOST_KEYS.has(profile.profile_key) ? (
+                              <Badge tone="info">对话 Host</Badge>
+                            ) : null}
+                            {CONVERSATION_JOB_KEYS.has(profile.profile_key) ? (
+                              <Badge tone="neutral">后台作业</Badge>
+                            ) : null}
+                          </p>
                           <p className="font-mono text-[10px] text-muted-foreground">
                             {profile.profile_key}
                           </p>
+                          {CONVERSATION_JOB_KEYS.has(profile.profile_key) ? (
+                            <p className="text-[10px] text-muted-foreground">
+                              仅作业卡，无对话入口
+                            </p>
+                          ) : null}
                         </td>
                         <td className="border-b border-border px-2 py-1.5 text-muted-foreground">
                           {profile.model ?? "默认"}
@@ -545,14 +564,14 @@ function RunsPanel({
       </header>
 
       {loading && runs === null ? (
-        <LoadingCard label="正在加载 Agent 运行…" />
+        <LoadingCard label="正在加载运行记录…" />
       ) : error !== null ? (
-        <ErrorState error={error} title="Agent 运行加载失败" onRetry={onRetry} />
+        <ErrorState error={error} title="运行记录加载失败" onRetry={onRetry} />
       ) : runs === null || runs.length === 0 ? (
         <div data-testid="agent-center-runs-empty">
           <EmptyState
-            title="尚无 Agent 运行记录"
-            description="Agent 开始处理 work item 后会出现在这里。"
+            title="尚无运行记录"
+            description="Host、后台作业或执行运行开始后会出现在这里。"
           />
         </div>
       ) : (
@@ -644,9 +663,9 @@ function QualityPanel({
   error: unknown
   onRetry: () => void
 }) {
-  if (loading && quality === null) return <LoadingCard label="正在加载 Agent 质量…" />
+  if (loading && quality === null) return <LoadingCard label="正在加载质量投影…" />
   if (error !== null) {
-    return <ErrorState error={error} title="Agent 质量加载失败" onRetry={onRetry} />
+    return <ErrorState error={error} title="质量投影加载失败" onRetry={onRetry} />
   }
   if (quality === null) return null
   return (
@@ -742,7 +761,7 @@ function ConfigPanel({
       ) : error !== null ? (
         <ErrorState error={error} title="profile 配置加载失败" onRetry={onRetry} />
       ) : profiles === null || profiles.length === 0 ? (
-        <EmptyState title="暂无 profile" description="启动 seed 后会显示 14 个固定 profile。" />
+        <EmptyState title="暂无 profile" description="启动 seed 后会显示固定 profile。" />
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] border-separate border-spacing-0 text-left text-xs">

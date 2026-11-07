@@ -14,23 +14,27 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.model_override, c.created_by,
+const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.model_override,
+	c.active_turn_id, c.active_agent, c.lease_until, c.created_by,
 	c.created_at, c.updated_at,
 	(SELECT count(*) FROM conversation_message m WHERE m.conversation_id = c.id),
 	(SELECT max(m.created_at) FROM conversation_message m WHERE m.conversation_id = c.id)`
 
 const conversationMessageColumns = `id, conversation_id, role, parts, refs, token_usage,
-	actor_id, agent_run_id, client_message_id, reply_to_message_id, created_at`
+	actor_id, agent_run_id, client_message_id, reply_to_message_id, created_at,
+	author_agent, kind`
 
 // conversationMessageSelectColumns reads a message together with the model that
 // actually generated it. actual_model is empty for user messages and for
 // assistant messages whose run link is absent; the DTO maps empty to null.
 const conversationMessageSelectColumns = `m.id, m.conversation_id, m.role, m.parts, m.refs, m.token_usage,
 	m.actor_id, m.agent_run_id, m.client_message_id, m.reply_to_message_id, m.created_at,
+	m.author_agent, m.kind,
 	COALESCE(run.model, '')`
 
 const conversationSummaryColumns = `id, conversation_id, summary, pinned_facts,
-	token_estimate, version, updated_at`
+	token_estimate, version, COALESCE(covered_message_id, 0),
+	COALESCE(compaction_id, ''), summary_meta, updated_at`
 
 // ConversationRepository stores conversations, their UI-thread messages and
 // the versioned thread summaries.
@@ -339,6 +343,10 @@ func (r *ConversationRepository) updateJobCardMessage(ctx context.Context, versi
 // timestamp. A client_message_id conflict returns the existing message with
 // created=false.
 func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversationID int64, message version.Message) (*version.Message, bool, error) {
+	kind, err := normalizeMessageKindForWrite(message.Kind)
+	if err != nil {
+		return nil, false, err
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("post user message: begin: %w", err)
@@ -351,11 +359,12 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO conversation_message (`+conversationMessageColumns+`)
-		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (conversation_id, client_message_id) DO NOTHING
 	`, message.ID, conversationID, message.Role, parts, refs, tokenUsage,
 		message.ActorID, message.AgentRunID, message.ClientMessageID,
-		message.ReplyToMessageID, message.CreatedAt)
+		message.ReplyToMessageID, message.CreatedAt,
+		message.AuthorAgent, kind)
 	if err != nil {
 		return nil, false, wrapConversationDB("insert conversation message", err)
 	}
@@ -386,28 +395,92 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 	return nil, true, nil
 }
 
-// AppendAssistantMessage inserts one assistant message together with its
-// append-only conversation_message_part rows (0.2.1 streaming parts) in one
-// transaction, then bumps the conversation timestamp. The (message_id, seq)
-// unique index makes a duplicate/restarted seq a transaction failure instead of
-// a silent overwrite: append-only parts are never rewritten.
+// AppendAssistantMessage inserts one server-generated assistant message together
+// with its append-only conversation_message_part rows (0.2.1 streaming parts) in
+// one transaction, then bumps the conversation timestamp. It is the
+// unconditional artifact/card writer: Host replies go through
+// AppendAssistantMessageAsWriter and background text through the fenced
+// AppendAssistantMessageAsBackground. The (message_id, seq) unique index makes a
+// duplicate/restarted seq a transaction failure instead of a silent overwrite:
+// append-only parts are never rewritten.
 func (r *ConversationRepository) AppendAssistantMessage(ctx context.Context, conversationID int64, message version.Message) error {
+	kind, err := normalizeMessageKindForWrite(message.Kind)
+	if err != nil {
+		return err
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("append assistant message: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := r.insertAssistantMessage(ctx, tx, conversationID, message, kind); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("append assistant message: commit: %w", err)
+	}
+	return nil
+}
+
+// AppendAssistantMessageAsBackground inserts one background/server assistant
+// message iff no live Host writer lease exists. The conversation row is locked
+// FOR UPDATE, so the lease re-check and the insert are one serialized decision:
+// a Host that acquires between the caller's pre-read and this write cannot be
+// handed background assistant text. A live lease is ErrNotConversationWriter
+// (the background path is never a writer); an idle conversation or an expired
+// non-NULL lease stays writable and the stored lease fields are left untouched.
+func (r *ConversationRepository) AppendAssistantMessageAsBackground(ctx context.Context, conversationID int64, message version.Message, now time.Time) error {
+	kind, err := normalizeMessageKindForWrite(message.Kind)
+	if err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("append background assistant message: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var activeTurnID *int64
+	var leaseUntil *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT active_turn_id, lease_until
+		FROM conversation WHERE id = $1
+		FOR UPDATE
+	`, conversationID).Scan(&activeTurnID, &leaseUntil); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return version.ErrConversationNotFound
+		}
+		return fmt.Errorf("append background assistant message: lock conversation: %w", err)
+	}
+	if activeTurnID != nil && leaseUntil != nil && !leaseUntil.Before(now) {
+		return version.ErrNotConversationWriter
+	}
+	if err := r.insertAssistantMessage(ctx, tx, conversationID, message, kind); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("append background assistant message: commit: %w", err)
+	}
+	return nil
+}
+
+// insertAssistantMessage writes one assistant message head, its append-only
+// conversation_message_part rows and the conversation timestamp inside tx. Every
+// assistant-write path shares it so the column/kind contract cannot drift
+// between the writer, background and artifact paths.
+func (r *ConversationRepository) insertAssistantMessage(ctx context.Context, tx pgx.Tx, conversationID int64, message version.Message, kind string) error {
 	parts, refs, tokenUsage, err := encodeMessageJSON(message)
 	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO conversation_message (`+conversationMessageColumns+`)
-		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
 	`, message.ID, conversationID, message.Role, parts, refs, tokenUsage,
 		message.ActorID, message.AgentRunID, message.ClientMessageID,
-		message.ReplyToMessageID, message.CreatedAt); err != nil {
+		message.ReplyToMessageID, message.CreatedAt,
+		message.AuthorAgent, kind); err != nil {
 		return wrapConversationDB("insert assistant message", err)
 	}
 	for _, part := range message.StreamParts {
@@ -429,10 +502,201 @@ func (r *ConversationRepository) AppendAssistantMessage(ctx context.Context, con
 	if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, conversationID, message.CreatedAt); err != nil {
 		return wrapConversationDB("touch conversation", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("append assistant message: commit: %w", err)
-	}
 	return nil
+}
+
+// normalizeMessageKindForWrite normalizes the legacy empty kind and validates
+// the DB-3 conversation_message kind enum before any INSERT, so an invalid kind
+// is the typed 400 platform.Invalid instead of a database CHECK violation
+// surfacing as a 500.
+func normalizeMessageKindForWrite(kind string) (string, error) {
+	kind = version.NormalizeMessageKind(kind)
+	if err := version.ValidateConversationMessageKind(kind); err != nil {
+		return "", err
+	}
+	return kind, nil
+}
+
+// ---------- single-writer writer lease (B §5.1, R-B2-1..R-B2-5) ----------
+
+// AcquireWriter claims the conversation's single-writer lease with one atomic
+// compare-and-set: idle conversations, expired leases and the same owner's
+// retry are claimable; a different live turn is ErrConversationBusy. The
+// partial unique index uk_conversation_active_turn keeps the row shape honest,
+// while this UPDATE is the cross-writer serialization point.
+func (r *ConversationRepository) AcquireWriter(ctx context.Context, conversationID, turnID int64, agent string, now, leaseUntil time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE conversation
+		SET active_turn_id = $2, active_agent = $3, lease_until = $4
+		WHERE id = $1
+		  AND (active_turn_id IS NULL OR lease_until IS NULL OR lease_until < $5
+		       OR (active_turn_id = $2 AND active_agent = $3))
+	`, conversationID, turnID, agent, leaseUntil, now)
+	if err != nil {
+		return fmt.Errorf("acquire conversation writer: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	exists, err := r.conversationExists(ctx, conversationID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return version.ErrConversationNotFound
+	}
+	return version.ErrConversationBusy
+}
+
+// RenewWriterLease extends the lease of the current owner only. A zero-row
+// update means the lease expired, was released, or belongs to another
+// turn/agent: ErrNotConversationWriter.
+func (r *ConversationRepository) RenewWriterLease(ctx context.Context, conversationID, turnID int64, agent string, now, leaseUntil time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE conversation
+		SET lease_until = $5
+		WHERE id = $1 AND active_turn_id = $2 AND active_agent = $3
+		  AND lease_until IS NOT NULL AND lease_until >= $4
+	`, conversationID, turnID, agent, now, leaseUntil)
+	if err != nil {
+		return fmt.Errorf("renew conversation writer lease: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	return r.notWriterOrNotFound(ctx, conversationID)
+}
+
+// ReleaseWriter clears the current owner's lease. A foreign turn never clears
+// another turn's lease; an already-released conversation is an idempotent no-op.
+func (r *ConversationRepository) ReleaseWriter(ctx context.Context, conversationID, turnID int64, agent string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE conversation
+		SET active_turn_id = NULL, active_agent = NULL, lease_until = NULL
+		WHERE id = $1 AND active_turn_id = $2 AND active_agent = $3
+	`, conversationID, turnID, agent)
+	if err != nil {
+		return fmt.Errorf("release conversation writer: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var activeTurnID *int64
+	if err := r.pool.QueryRow(ctx, `SELECT active_turn_id FROM conversation WHERE id = $1`, conversationID).Scan(&activeTurnID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return version.ErrConversationNotFound
+		}
+		return fmt.Errorf("release conversation writer: %w", err)
+	}
+	if activeTurnID == nil {
+		return nil
+	}
+	return version.ErrNotConversationWriter
+}
+
+// AppendAssistantMessageAsWriter inserts one assistant message iff (turnID,
+// agent) owns the conversation's live lease. The conversation row is locked FOR
+// UPDATE, so the lease check, the crash-recovery takeover and the insert are
+// one serialized compare-and-set: concurrent writers cannot both append. An
+// idle conversation is NOT silently claimed here — the caller must Acquire
+// first; only an expired non-NULL lease may be taken over implicitly (crash
+// recovery). A repeated client_message_id (the Host turn idempotency key)
+// returns the stored message with created=false.
+func (r *ConversationRepository) AppendAssistantMessageAsWriter(ctx context.Context, conversationID int64, message version.Message, turnID int64, agent string, now, leaseUntil time.Time) (*version.Message, bool, error) {
+	kind, err := normalizeMessageKindForWrite(message.Kind)
+	if err != nil {
+		return nil, false, err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("append assistant message as writer: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var activeTurnID *int64
+	var activeAgent *string
+	var activeLease *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT active_turn_id, active_agent, lease_until
+		FROM conversation WHERE id = $1
+		FOR UPDATE
+	`, conversationID).Scan(&activeTurnID, &activeAgent, &activeLease); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, version.ErrConversationNotFound
+		}
+		return nil, false, fmt.Errorf("append assistant message as writer: lock conversation: %w", err)
+	}
+	leaseActive := activeTurnID != nil && activeAgent != nil && activeLease != nil && !activeLease.Before(now)
+	switch {
+	case leaseActive:
+		if *activeTurnID != turnID || *activeAgent != agent {
+			return nil, false, version.ErrConversationBusy
+		}
+	case activeTurnID != nil && activeLease != nil && activeLease.Before(now):
+		// The previous turn stopped heartbeating: take its expired lease over.
+		if _, err := tx.Exec(ctx, `
+			UPDATE conversation
+			SET active_turn_id = $2, active_agent = $3, lease_until = $4
+			WHERE id = $1
+		`, conversationID, turnID, agent, leaseUntil); err != nil {
+			return nil, false, fmt.Errorf("append assistant message as writer: take over lease: %w", err)
+		}
+	default:
+		// Idle (NULL active_turn) or a lease-less active turn: appending must not
+		// silently make this turn the writer. The caller has to Acquire the
+		// lease explicitly; only an expired non-NULL lease is recoverable here.
+		return nil, false, version.ErrNotConversationWriter
+	}
+
+	if message.ClientMessageID != nil {
+		existing, err := scanMessage(tx.QueryRow(ctx, `
+			SELECT `+conversationMessageSelectColumns+`
+			FROM conversation_message m
+			LEFT JOIN agent_run run ON run.id = m.agent_run_id
+			WHERE m.conversation_id = $1 AND m.client_message_id = $2 AND m.role = 'assistant'
+		`, conversationID, *message.ClientMessageID))
+		switch {
+		case err == nil:
+			if err := tx.Commit(ctx); err != nil {
+				return nil, false, fmt.Errorf("append assistant message as writer: commit: %w", err)
+			}
+			return &existing, false, nil
+		case errors.Is(err, pgx.ErrNoRows):
+			// No prior turn write: continue with the insert.
+		default:
+			return nil, false, wrapMessageDB("find idempotent assistant message", err)
+		}
+	}
+
+	if err := r.insertAssistantMessage(ctx, tx, conversationID, message, kind); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("append assistant message as writer: commit: %w", err)
+	}
+	return nil, true, nil
+}
+
+// conversationExists reports whether the conversation row exists.
+func (r *ConversationRepository) conversationExists(ctx context.Context, conversationID int64) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation WHERE id = $1)`, conversationID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check conversation exists: %w", err)
+	}
+	return exists, nil
+}
+
+// notWriterOrNotFound classifies a zero-row lease write: a missing conversation
+// is ErrConversationNotFound, an existing one is ErrNotConversationWriter.
+func (r *ConversationRepository) notWriterOrNotFound(ctx context.Context, conversationID int64) error {
+	exists, err := r.conversationExists(ctx, conversationID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return version.ErrConversationNotFound
+	}
+	return version.ErrNotConversationWriter
 }
 
 // Summary returns the latest summary revision or nil when none exists.
@@ -451,7 +715,9 @@ func (r *ConversationRepository) Summary(ctx context.Context, conversationID int
 }
 
 // SaveSummary inserts the next summary version atomically and returns the
-// stored row.
+// stored row. R-A5-12: a per-conversation advisory lock serializes the watermark
+// check and the insert, so a covered_message_id can never move backwards and
+// two concurrent compactions cannot fork the revision sequence.
 func (r *ConversationRepository) SaveSummary(ctx context.Context, summary version.ConversationSummary) (version.ConversationSummary, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -459,17 +725,42 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('eztest:conversation:' || ($1::bigint)::text))`,
+		summary.ConversationID); err != nil {
+		return version.ConversationSummary{}, fmt.Errorf("save conversation summary: lock: %w", err)
+	}
+	var previousCovered int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(max(covered_message_id), 0)
+		FROM conversation_summary
+		WHERE conversation_id = $1
+	`, summary.ConversationID).Scan(&previousCovered); err != nil {
+		return version.ConversationSummary{}, wrapConversationDB("read summary watermark", err)
+	}
+	if summary.CoveredMessageID > 0 && summary.CoveredMessageID < previousCovered {
+		return version.ConversationSummary{}, fmt.Errorf("%w: previous=%d candidate=%d",
+			version.ErrSummaryWatermarkStale, previousCovered, summary.CoveredMessageID)
+	}
+	summaryMeta, err := encodeSummaryMeta(summary.SummaryMeta)
+	if err != nil {
+		return version.ConversationSummary{}, err
+	}
+
 	saved := summary
 	saved.ID = r.ids.Next()
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO conversation_summary (
-			id, conversation_id, summary, pinned_facts, token_estimate, version, updated_at
+			id, conversation_id, summary, pinned_facts, token_estimate, version,
+			covered_message_id, compaction_id, summary_meta, updated_at
 		)
 		VALUES ($1, $2, $3, $4::jsonb, $5,
-			COALESCE((SELECT max(version) FROM conversation_summary WHERE conversation_id = $2), 0) + 1, $6)
+			COALESCE((SELECT max(version) FROM conversation_summary WHERE conversation_id = $2), 0) + 1,
+			NULLIF($6, 0), NULLIF($7, ''), $8::jsonb, $9)
 		RETURNING version, updated_at
 	`, saved.ID, summary.ConversationID, summary.Summary, encodeStringSlice(summary.PinnedFacts),
-		summary.TokenEstimate, summary.UpdatedAt).Scan(&saved.Version, &saved.UpdatedAt); err != nil {
+		summary.TokenEstimate, summary.CoveredMessageID, summary.CompactionID, summaryMeta,
+		summary.UpdatedAt).Scan(&saved.Version, &saved.UpdatedAt); err != nil {
 		return version.ConversationSummary{}, wrapConversationDB("insert conversation summary", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, summary.ConversationID, summary.UpdatedAt); err != nil {
@@ -479,6 +770,18 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 		return version.ConversationSummary{}, fmt.Errorf("save conversation summary: commit: %w", err)
 	}
 	return saved, nil
+}
+
+// encodeSummaryMeta renders the summary_meta object. A nil map stores {}.
+func encodeSummaryMeta(meta map[string]any) (string, error) {
+	if len(meta) == 0 {
+		return "{}", nil
+	}
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return "", fmt.Errorf("encode summary meta: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // ListReconcilable returns the most recent conversations (including
@@ -552,7 +855,9 @@ func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int
 func scanConversation(row rowScanner) (version.Conversation, error) {
 	var conversation version.Conversation
 	if err := row.Scan(&conversation.ID, &conversation.VersionID, &conversation.Kind, &conversation.Title,
-		&conversation.Status, &conversation.ModelOverride, &conversation.CreatedBy, &conversation.CreatedAt, &conversation.UpdatedAt,
+		&conversation.Status, &conversation.ModelOverride,
+		&conversation.ActiveTurnID, &conversation.ActiveAgent, &conversation.LeaseUntil,
+		&conversation.CreatedBy, &conversation.CreatedAt, &conversation.UpdatedAt,
 		&conversation.MessageCount, &conversation.LastMessageAt); err != nil {
 		return version.Conversation{}, err
 	}
@@ -564,7 +869,8 @@ func scanMessage(row rowScanner) (version.Message, error) {
 	var parts, refs, tokenUsage []byte
 	if err := row.Scan(&message.ID, &message.ConversationID, &message.Role, &parts, &refs, &tokenUsage,
 		&message.ActorID, &message.AgentRunID, &message.ClientMessageID,
-		&message.ReplyToMessageID, &message.CreatedAt, &message.ActualModel); err != nil {
+		&message.ReplyToMessageID, &message.CreatedAt,
+		&message.AuthorAgent, &message.Kind, &message.ActualModel); err != nil {
 		return version.Message{}, err
 	}
 	if len(parts) > 0 {
@@ -597,11 +903,16 @@ func scanMessage(row rowScanner) (version.Message, error) {
 func scanSummary(row rowScanner) (version.ConversationSummary, error) {
 	var summary version.ConversationSummary
 	var pinned []byte
+	var meta []byte
 	if err := row.Scan(&summary.ID, &summary.ConversationID, &summary.Summary, &pinned,
-		&summary.TokenEstimate, &summary.Version, &summary.UpdatedAt); err != nil {
+		&summary.TokenEstimate, &summary.Version, &summary.CoveredMessageID, &summary.CompactionID,
+		&meta, &summary.UpdatedAt); err != nil {
 		return version.ConversationSummary{}, err
 	}
 	summary.PinnedFacts = decodeStringSlice(pinned)
+	if len(meta) > 0 {
+		_ = json.Unmarshal(meta, &summary.SummaryMeta)
+	}
 	return summary, nil
 }
 

@@ -320,7 +320,7 @@ export const humanRequestFixture: HumanRequest = {
   version_id: "2001",
   case_run_id: "9303",
   kind: "login_takeover",
-  status: "open",
+  status: "pending",
   payload: {
     reason: "支付网关需要 2FA 验证码",
     version_sut_id: "1002",
@@ -332,12 +332,61 @@ export const humanRequestFixture: HumanRequest = {
   created_at: TIMESTAMP,
 }
 
-export const resolvedHumanRequestFixture: HumanRequest = {
+export const answeredHumanRequestFixture: HumanRequest = {
   ...humanRequestFixture,
   id: "9502",
-  status: "resolved",
+  status: "answered",
   resolved_at: LATER,
   response: { note: "已输入验证码" },
+}
+
+/**
+ * A pending structured clarification question (v0.22 R-B3-1): it shares the
+ * human_request table but is a version todo, never an execution blocker.
+ */
+export const clarificationQuestionFixture: HumanRequest = {
+  id: "9503",
+  version_id: "2001",
+  case_run_id: null,
+  kind: "clarification_question",
+  status: "pending",
+  payload: {
+    reason: "请确认退款口径：T+1 还是 T+3？",
+    version_sut_id: null,
+    account_role: "",
+    page_url: "",
+    challenge_kind: "",
+  },
+  expires_at: "2026-10-31T12:30:00Z",
+  created_at: TIMESTAMP,
+}
+
+/** A pending v0.22 approval request (R-W2-1): decision card, not a question. */
+export const approvalHumanRequestFixture: HumanRequest = {
+  id: "9601",
+  version_id: "2001",
+  case_run_id: null,
+  kind: "approval",
+  status: "pending",
+  payload: { reason: "发布前请确认版本可以上线" },
+  expires_at: "2099-01-01T00:00:00Z",
+  created_at: TIMESTAMP,
+}
+
+/** A pending blocked_recovery request that owns a blocked version stage. */
+export const blockedRecoveryHumanRequestFixture: HumanRequest = {
+  ...approvalHumanRequestFixture,
+  id: "9602",
+  kind: "blocked_recovery",
+  payload: { reason: "执行器离线，确认恢复后继续" },
+}
+
+/** A pending conflict request: two persisted facts disagree. */
+export const conflictHumanRequestFixture: HumanRequest = {
+  ...approvalHumanRequestFixture,
+  id: "9603",
+  kind: "conflict",
+  payload: { reason: "需求与事实对退款口径的描述冲突" },
 }
 
 export const intentFixture: Intent = {

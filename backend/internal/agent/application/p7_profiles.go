@@ -29,9 +29,9 @@ var knowledgeCuratorProfileTools = []string{
 
 // P7Profiles returns the 0.2.1 profile seeds introduced by the knowledge
 // increment. They are appended by Profiles() after the frozen P1–P4 seeds; the
-// agent-center catalog keeps its frozen 14-profile team map and intentionally
-// does not list this background role profile, but the admin profile surface and
-// the startup seed do.
+// v0.22 converged agent-center catalog lists this background profile in the
+// execution/analysis team, and the admin profile surface and the startup seed
+// list it too.
 func P7Profiles() []agent.AgentProfile {
 	return []agent.AgentProfile{
 		{
@@ -55,16 +55,10 @@ var p7ProfileTools = map[string][]string{
 	ProfileKeyClarificationHost: {
 		tools.ToolKnowledgePropose,
 	},
-	ProfileKeyContextScout: {
-		tools.ToolKnowledgePropose,
-	},
 	ProfileKeyDesignHost: {
 		tools.ToolKnowledgePropose,
 	},
-	ProfileKeyDesignPlanner: {
-		tools.ToolKnowledgePropose,
-	},
-	ProfileKeyCaseAuthor: {
+	ProfileKeyDesignAuthor: {
 		tools.ToolKnowledgePropose,
 	},
 }

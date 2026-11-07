@@ -2,12 +2,15 @@ package versionapp_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +25,8 @@ import (
 
 type fakeAttachmentRepo struct {
 	attachments          map[int64]version.Attachment
+	images               map[int64]version.AttachmentImageRecord
+	imageStatusLog       []string
 	conversationMessages map[int64]int64 // message ID -> conversation ID
 	conversations        map[int64]int64 // conversation ID -> version ID
 	pendingForIngest     []version.PendingAttachment
@@ -30,7 +35,10 @@ type fakeAttachmentRepo struct {
 }
 
 func newFakeAttachmentRepo() *fakeAttachmentRepo {
-	return &fakeAttachmentRepo{attachments: map[int64]version.Attachment{}}
+	return &fakeAttachmentRepo{
+		attachments: map[int64]version.Attachment{},
+		images:      map[int64]version.AttachmentImageRecord{},
+	}
 }
 
 func (f *fakeAttachmentRepo) Create(_ context.Context, attachment version.Attachment) error {
@@ -68,10 +76,25 @@ func (f *fakeAttachmentRepo) ListByRequirement(_ context.Context, versionID, req
 	return items, nil
 }
 
+// ListByConversation mirrors the SQL: linked rows of the conversation plus
+// pre-registered message attachments owned by this conversation whose message
+// binding is still deferred. A draft with no conversation_id (legacy row) is
+// never returned; a draft of another conversation is not returned either.
+// Requirement attachments stay requirement-scoped and never appear here.
 func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, conversationID int64) ([]version.Attachment, error) {
 	items := make([]version.Attachment, 0)
 	for _, attachment := range f.attachments {
-		if attachment.VersionID != versionID || attachment.ConversationMessageID == nil {
+		if attachment.VersionID != versionID {
+			continue
+		}
+		if attachment.ConversationMessageID == nil {
+			if attachment.RequirementID != nil || attachment.RequirementVersionID != nil {
+				continue
+			}
+			if attachment.ConversationID == nil || *attachment.ConversationID != conversationID {
+				continue
+			}
+			items = append(items, attachment)
 			continue
 		}
 		if f.conversationMessages != nil {
@@ -80,6 +103,17 @@ func (f *fakeAttachmentRepo) ListByConversation(_ context.Context, versionID, co
 			}
 		}
 		items = append(items, attachment)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items, nil
+}
+
+func (f *fakeAttachmentRepo) ListByVersion(_ context.Context, versionID int64) ([]version.Attachment, error) {
+	items := make([]version.Attachment, 0)
+	for _, attachment := range f.attachments {
+		if attachment.VersionID == versionID {
+			items = append(items, attachment)
+		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return items, nil
@@ -105,6 +139,13 @@ func (f *fakeAttachmentRepo) LinkMessage(_ context.Context, attachmentID, messag
 		return nil
 	}
 	attachment.ConversationMessageID = &messageID
+	// Mirror the SQL backfill: a legacy unscoped draft gets the conversation of
+	// the message it is bound to.
+	if attachment.ConversationID == nil && f.conversationMessages != nil {
+		if conversationID, ok := f.conversationMessages[messageID]; ok {
+			attachment.ConversationID = &conversationID
+		}
+	}
 	attachment.UpdatedAt = updatedAt
 	f.attachments[attachmentID] = attachment
 	return nil
@@ -222,7 +263,8 @@ func (f *fakeContentStore) Upload(_ context.Context, filename, mime string, r io
 	if err != nil {
 		return versionapp.ContentObject{}, err
 	}
-	sha := strings.Repeat("f", 64)
+	sum := sha256.Sum256(data)
+	sha := hex.EncodeToString(sum[:])
 	f.objects[sha] = versionapp.ContentObject{SHA256: sha, Size: int64(len(data)), MIME: mime}
 	f.data[sha] = data
 	f.uploads = append(f.uploads, filename+"|"+mime+"|"+string(data))
@@ -232,18 +274,26 @@ func (f *fakeContentStore) Upload(_ context.Context, filename, mime string, r io
 type fakeExtractor struct {
 	text     string
 	err      error
+	result   versionapp.ExtractionResult
 	calls    int
 	lastName string
 }
 
-func (f *fakeExtractor) Extract(_ context.Context, name, _ string, r io.Reader) (string, error) {
+func (f *fakeExtractor) Extract(_ context.Context, name, _ string, r io.Reader) (versionapp.ExtractionResult, error) {
 	f.calls++
 	f.lastName = name
 	_, _ = io.ReadAll(r)
 	if f.err != nil {
-		return "", f.err
+		return versionapp.ExtractionResult{}, f.err
 	}
-	return f.text, nil
+	result := f.result
+	if result.Text == "" {
+		result.Text = f.text
+	}
+	if result.Coverage.Found == 0 && result.Text != "" {
+		result.Coverage = versionapp.ExtractionCoverage{Found: 1, Parsed: 1}
+	}
+	return result, nil
 }
 
 // ---------- environment ----------
@@ -255,19 +305,25 @@ type attachmentEnv struct {
 	queue     *fakeQueue
 	extractor *fakeExtractor
 	events    *fakePublisher
+	vision    *fakeVisionCaptioner
+	facts     *fakeFactRecorder
 	versionID int64
 }
 
 func newAttachmentEnv(t *testing.T) *attachmentEnv {
 	t.Helper()
-	repo := newFakeAttachmentRepo()
-	store := newFakeContentStore()
-	queue := &fakeQueue{}
-	extractor := &fakeExtractor{text: "extracted text"}
-	events := &fakePublisher{}
-	svc := versionapp.NewAttachmentService(
-		repo, store, queue, extractor, attachments.NewImageProber(), events, &seqIDs{}, fixedClock{at: testTime})
-	return &attachmentEnv{svc: svc, repo: repo, store: store, queue: queue, extractor: extractor, events: events, versionID: 1}
+	env := &attachmentEnv{
+		repo: newFakeAttachmentRepo(), store: newFakeContentStore(), queue: &fakeQueue{},
+		extractor: &fakeExtractor{text: "extracted text"}, events: &fakePublisher{},
+		vision:    &fakeVisionCaptioner{available: true, caption: "登录界面截图：手机号与验证码输入框"},
+		facts:     &fakeFactRecorder{},
+		versionID: 1,
+	}
+	env.svc = versionapp.NewAttachmentService(
+		env.repo, env.store, env.queue, env.extractor, attachments.NewImageProber(), env.events, &seqIDs{}, fixedClock{at: testTime})
+	env.svc.SetVisionCaptioner(env.vision)
+	env.svc.SetFactRecorder(env.facts)
+	return env
 }
 
 func attachmentPart(sha, name, mime string, size int64) version.MessagePart {
@@ -309,13 +365,10 @@ func TestRegisterFromMessageCreatesPendingAttachmentAndIngestTask(t *testing.T) 
 		t.Fatalf("content ref = %d", stored.ContentRefID)
 	}
 
-	task, ok := env.queue.find("attachment.ingest", "attachment:"+idString(view.ID))
-	if !ok {
-		t.Fatalf("ingest task missing: %#v", env.queue.tasks)
-	}
-	if task.VersionID != env.versionID || task.Payload["attachment_id"] != idString(view.ID) ||
-		task.Payload["message_id"] != "7001" || task.Payload["conversation_id"] != "6001" {
-		t.Fatalf("task = %#v", task)
+	// v0.22 fix round 1: extraction is deterministic (the pending row is the
+	// queue); no attachment.ingest agent work item is enqueued any more.
+	if len(env.queue.tasks) != 0 {
+		t.Fatalf("pending attachment enqueued a legacy ingest task: %#v", env.queue.tasks)
 	}
 	if len(env.events.events) != 0 {
 		t.Fatalf("events = %#v", env.events.events)
@@ -428,6 +481,98 @@ func TestExtractStoresTextAsContentReference(t *testing.T) {
 	}
 	if env.events.events[0].Payload["chars"] != len("hello extracted") {
 		t.Fatalf("payload = %#v", env.events.events[0].Payload)
+	}
+}
+
+func TestExtractReturnsCoverageAndImages(t *testing.T) {
+	env := newAttachmentEnv(t)
+	view := registerAttachment(t, env, strings.Repeat("a", 64), "requirements.docx", "application/octet-stream", []byte("docx"))
+	env.extractor.text = "3.2 用户登录"
+	env.extractor.result = versionapp.ExtractionResult{
+		Elements: []versionapp.ExtractionElement{
+			{Kind: "heading", Text: "3.2 用户登录", Level: 2, HeadingPath: "3.2 用户登录"},
+		},
+		Images: []versionapp.ExtractionImage{
+			{Seq: 1, Name: "image1.png", Source: "word/media/image1.png", MIME: "image/png", Width: 8, Height: 6, Data: []byte("png-bytes")},
+		},
+		Coverage: versionapp.ExtractionCoverage{
+			Found: 2, Parsed: 2, ImagesFound: 1, ImagesParsed: 1,
+		},
+	}
+
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.Coverage.Found != 2 || result.Coverage.Parsed != 2 || result.Coverage.Skipped != 0 {
+		t.Fatalf("coverage = %+v", result.Coverage)
+	}
+	if len(result.Elements) != 1 || result.Elements[0].HeadingPath != "3.2 用户登录" {
+		t.Fatalf("elements = %+v", result.Elements)
+	}
+	if len(result.Images) != 1 || string(result.Images[0].Data) != "png-bytes" || result.Images[0].MIME != "image/png" {
+		t.Fatalf("images = %+v", result.Images)
+	}
+}
+
+// TestExtractImageOnlyDocumentReturnsImages covers spec X-1: a document with
+// no text layer but with embedded images (a scanned/image-only PDF) must not
+// be failed as "no text could be extracted". Its images are the extraction
+// output and flow to the vision chain; only a text-less document without any
+// image is a failure.
+func TestExtractImageOnlyDocumentReturnsImages(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.extractor.text = "" // the parser produced no text at all
+	view := registerAttachment(t, env, strings.Repeat("b", 64), "scan.pdf", "application/pdf", []byte("%PDF-1.7"))
+	env.extractor.result = versionapp.ExtractionResult{
+		Images: []versionapp.ExtractionImage{
+			{Seq: 1, Name: "pdf-image-6.png", Source: "pdf:object:6", MIME: "image/png", Width: 240, Height: 120, Data: []byte("png-bytes")},
+		},
+		Skipped: []versionapp.SkippedElement{
+			{Kind: "page", Source: "pdf:page:1", Reason: "page has no extractable text layer"},
+		},
+		Coverage: versionapp.ExtractionCoverage{
+			Found: 2, Parsed: 1, Skipped: 1, ImagesFound: 1, ImagesParsed: 1,
+			SkipReasons: []string{"page has no extractable text layer"},
+		},
+	}
+
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.Attachment.ExtractionStatus != version.AttachmentDone || result.ErrorCode != "" {
+		t.Fatalf("image-only document failed: %#v", result)
+	}
+	if len(result.Images) != 1 || string(result.Images[0].Data) != "png-bytes" || result.Images[0].MIME != "image/png" {
+		t.Fatalf("images = %+v", result.Images)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Source != "pdf:page:1" {
+		t.Fatalf("skips = %+v", result.Skipped)
+	}
+	stored := env.repo.attachments[view.ID]
+	if stored.ExtractionStatus != version.AttachmentDone || stored.ExtractionErrorCode != "" {
+		t.Fatalf("stored = %#v", stored)
+	}
+}
+
+// TestExtractEmptyTextWithoutImagesStillFails pins the other half of the X-1
+// contract: an empty extraction with no image at all remains a failure.
+func TestExtractEmptyTextWithoutImagesStillFails(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.extractor.text = ""
+	view := registerAttachment(t, env, strings.Repeat("c", 64), "empty.docx", "application/octet-stream", []byte("docx"))
+
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if result.ErrorCode != version.AttachmentErrorExtraction {
+		t.Fatalf("error code = %q, want %q", result.ErrorCode, version.AttachmentErrorExtraction)
+	}
+	stored := env.repo.attachments[view.ID]
+	if stored.ExtractionStatus != version.AttachmentFailed || !strings.Contains(stored.ExtractionErrorText, "no text") {
+		t.Fatalf("stored = %#v", stored)
 	}
 }
 
@@ -820,5 +965,286 @@ func TestLegacyAttachmentSaveAsHint(t *testing.T) {
 	lastEvent := env.events.events[len(env.events.events)-1]
 	if lastEvent.Type != "requirement.attachment_failed" || !strings.Contains(lastEvent.Payload["message"].(string), "requirements.doc") {
 		t.Fatalf("event = %#v", lastEvent)
+	}
+}
+
+// ---------- upload-then-immediate-chat harness (R-E4-1/R-E4-2) ----------
+
+// uploadHarness reproduces the Composer path for "upload a document, then chat
+// immediately": the content object is already uploaded and the user message is
+// posted at once while extraction runs asynchronously. A brand-new document is
+// pre-registered by the message post preflight (its conversation_message_id is
+// still NULL) and the first post is gated with the retryable 409 while ingest
+// is pending. Everything the attachment.ingest run reads during that window
+// must still see the attachment instead of an empty conversation list or a
+// not_found.
+type uploadHarness struct {
+	t              *testing.T
+	env            *imageConversationEnv
+	conversationID int64
+	parts          []version.MessagePart
+	attachmentID   int64
+}
+
+func newAttachmentHarness(t *testing.T) *uploadHarness {
+	t.Helper()
+	env := newImageConversationEnv(t)
+	return &uploadHarness{t: t, env: env, conversationID: env.conversation.ID}
+}
+
+// Upload stores the document content and posts the user message. The message
+// post pre-registers the attachment row and enqueues ingest; while the parse is
+// pending the post is rejected with the typed 409, so the row stays unlinked
+// (message binding deferred) exactly like the live race.
+func (h *uploadHarness) Upload(name string) {
+	h.t.Helper()
+	data := []byte("# 需求\n登录、退款")
+	sha := strings.Repeat("7", 64)
+	h.env.attachments.store.put(sha, data, docxMIME)
+	h.parts = []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请读附件"},
+		attachmentPart(sha, name, docxMIME, int64(len(data))),
+	}
+	_, err := h.env.svc.PostUserMessage(
+		requestContext(), h.env.versionID, h.conversationID, h.parts, "upload-immediate-1", 42)
+	if err == nil {
+		h.t.Fatal("first post of a still-parsing attachment was accepted")
+	}
+	apiErr := apiError(h.t, err)
+	if apiErr.Code != versionapp.AttachmentPendingCode {
+		h.t.Fatalf("first post code = %q, want %q", apiErr.Code, versionapp.AttachmentPendingCode)
+	}
+	rawID, _ := apiErr.Details["attachment_id"].(string)
+	id, parseErr := strconv.ParseInt(rawID, 10, 64)
+	if parseErr != nil || id <= 0 {
+		h.t.Fatalf("attachment_id detail = %q", rawID)
+	}
+	h.attachmentID = id
+}
+
+// List is the attachment.list read of the conversation.
+func (h *uploadHarness) List() []versionapp.AttachmentMeta {
+	h.t.Helper()
+	metas, err := h.env.attachments.svc.ListAttachments(requestContext(), h.env.versionID, h.conversationID)
+	if err != nil {
+		h.t.Fatalf("ListAttachments: %v", err)
+	}
+	return metas
+}
+
+// ReadText is the attachment.read_text read by attachment ID.
+func (h *uploadHarness) ReadText() versionapp.AttachmentTextRead {
+	h.t.Helper()
+	read, err := h.env.attachments.svc.ReadAttachmentText(
+		requestContext(), h.env.versionID, h.conversationID, h.attachmentID, 0, 0)
+	if err != nil {
+		h.t.Fatalf("ReadAttachmentText: %v", err)
+	}
+	return read
+}
+
+// Ingest runs the attachment.ingest worker while the message binding may still
+// be deferred.
+func (h *uploadHarness) Ingest(text string) {
+	h.t.Helper()
+	h.env.attachments.extractor.text = text
+	if _, err := h.env.attachments.svc.Extract(requestContext(), h.attachmentID); err != nil {
+		h.t.Fatalf("Extract: %v", err)
+	}
+}
+
+// Retry posts the same user message again once ingest finished; this is the
+// client retry after the 409 and must bind the pre-registered row.
+func (h *uploadHarness) Retry(clientMessageID string) versionapp.MessageView {
+	h.t.Helper()
+	message, err := h.env.svc.PostUserMessage(
+		requestContext(), h.env.versionID, h.conversationID, h.parts, clientMessageID, 42)
+	if err != nil {
+		h.t.Fatalf("retry post: %v", err)
+	}
+	return message
+}
+
+// ingestTasks returns the attachment.ingest tasks queued for this attachment.
+func (h *uploadHarness) ingestTasks() []versionapp.TaskInput {
+	h.t.Helper()
+	tasks := make([]versionapp.TaskInput, 0, 1)
+	for _, task := range h.env.attachments.queue.tasks {
+		if task.Type == "attachment.ingest" && task.Payload["attachment_id"] == idString(h.attachmentID) {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+// TestUploadThenImmediateList covers R-E4-2: immediately after uploading a
+// document and attempting the first chat, attachment.list returns the
+// pre-registered attachment (not 0) and attachment.read_text returns the
+// structured "still parsing, retry" result (not not_found, and not a Go error).
+func TestUploadThenImmediateList(t *testing.T) {
+	h := newAttachmentHarness(t)
+	h.Upload("spec.docx")
+
+	listed := h.List()
+	if len(listed) != 1 {
+		t.Fatalf("list=%d, want 1", len(listed))
+	}
+	if listed[0].ID != h.attachmentID || listed[0].Name != "spec.docx" {
+		t.Fatalf("listed = %#v", listed[0])
+	}
+	if listed[0].ConversationMessageID != 0 {
+		t.Fatalf("pre-registered attachment was already bound: %#v", listed[0])
+	}
+	if listed[0].ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("status = %q, want pending", listed[0].ExtractionStatus)
+	}
+
+	read := h.ReadText()
+	if read.Status != version.AttachmentPending || !read.Retryable {
+		t.Fatalf("read_text = %#v, want a retryable pending result", read)
+	}
+	if read.AttachmentID != h.attachmentID || read.Name != "spec.docx" {
+		t.Fatalf("read metadata = %#v", read)
+	}
+	if !strings.Contains(read.Error, "解析中") {
+		t.Fatalf("read error = %q, want the parsing hint", read.Error)
+	}
+	t.Logf("attachment.list -> %+v", listed)
+	t.Logf("attachment.read_text -> %+v", read)
+}
+
+// TestPreRegisteredAttachmentNotVisibleToOtherConversation covers the Task 20
+// follow-up scope leak: a document pre-registered by a blocked post in
+// conversation A is unbound until the retry, but that must not make it visible
+// to another conversation of the same version. Conversation A keeps the R-E4-2
+// behavior (its own draft is listed); conversation B must neither list nor read
+// it. This is the regression test for the version-scoped unbound-row branch.
+func TestPreRegisteredAttachmentNotVisibleToOtherConversation(t *testing.T) {
+	env := newAttachmentEnv(t)
+	const conversationA, conversationB = int64(6001), int64(6002)
+	data := []byte("# 需求\n登录")
+	sha := strings.Repeat("9", 64)
+	env.store.put(sha, data, "text/markdown")
+	parts := []version.MessagePart{attachmentPart(sha, "spec.md", "text/markdown", int64(len(data)))}
+
+	_, _, err := env.svc.PrepareUserMessageParts(requestContext(), env.versionID, conversationA, parts, 42)
+	if err == nil {
+		t.Fatal("first post of a still-parsing attachment was accepted")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Code != versionapp.AttachmentPendingCode {
+		t.Fatalf("first post code = %q, want %q", apiErr.Code, versionapp.AttachmentPendingCode)
+	}
+	rawID, _ := apiErr.Details["attachment_id"].(string)
+	attachmentID, parseErr := strconv.ParseInt(rawID, 10, 64)
+	if parseErr != nil || attachmentID <= 0 {
+		t.Fatalf("attachment_id detail = %q", rawID)
+	}
+
+	// Conversation A still sees its own pre-registered draft (R-E4-2).
+	own, err := env.svc.ListAttachments(requestContext(), env.versionID, conversationA)
+	if err != nil {
+		t.Fatalf("ListAttachments(A): %v", err)
+	}
+	if len(own) != 1 || own[0].ID != attachmentID || own[0].ConversationMessageID != 0 {
+		t.Fatalf("conversation A list = %#v", own)
+	}
+
+	// Conversation B must never see conversation A's unbound draft.
+	other, err := env.svc.ListAttachments(requestContext(), env.versionID, conversationB)
+	if err != nil {
+		t.Fatalf("ListAttachments(B): %v", err)
+	}
+	if len(other) != 0 {
+		t.Fatalf("conversation B sees conversation A's pre-registered draft: %#v", other)
+	}
+
+	// read_text by attachment id in conversation B must not resolve it either.
+	if _, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, conversationB, attachmentID, 0, 10); err == nil {
+		t.Fatal("conversation B read conversation A's pre-registered draft")
+	} else if readErr := apiError(t, err); readErr.Status != http.StatusNotFound {
+		t.Fatalf("read_text error = %#v, want 404 not_found", readErr)
+	}
+}
+
+// TestIngestByAttachmentIDWhileBindingDeferred covers R-E4-1's second clause:
+// attachment.ingest resolves and extracts the row by attachment_id only, so it
+// completes even though the conversation message binding has not happened yet;
+// the extracted text is then readable through the conversation without a
+// not_found.
+func TestIngestByAttachmentIDWhileBindingDeferred(t *testing.T) {
+	h := newAttachmentHarness(t)
+	h.Upload("spec.docx")
+
+	h.Ingest("完整需求正文：登录、退款")
+	stored := h.env.attachments.repo.attachments[h.attachmentID]
+	if stored.ConversationMessageID != nil {
+		t.Fatalf("binding was not deferred: %#v", stored)
+	}
+	if stored.ExtractionStatus != version.AttachmentDone {
+		t.Fatalf("stored status = %q", stored.ExtractionStatus)
+	}
+
+	read := h.ReadText()
+	if read.Status != version.AttachmentDone || !strings.Contains(read.Text, "完整需求正文") {
+		t.Fatalf("read_text = %#v", read)
+	}
+	listed := h.List()
+	if len(listed) != 1 || listed[0].ExtractionStatus != version.AttachmentDone {
+		t.Fatalf("list = %#v", listed)
+	}
+}
+
+// TestRetryBindsOnceWithoutLegacyIngestTask covers the ordering/idempotency
+// half of R-E4-1: the deterministic worker owns extraction (no legacy ingest
+// work item), the retry binds the pre-registered row to the inserted message
+// (no duplicate row), and a repeated post with the same client_message_id does
+// not re-bind.
+func TestRetryBindsOnceWithoutLegacyIngestTask(t *testing.T) {
+	h := newAttachmentHarness(t)
+	h.Upload("spec.docx")
+	if tasks := h.ingestTasks(); len(tasks) != 0 {
+		t.Fatalf("upload enqueued a legacy ingest task: %#v", tasks)
+	}
+
+	h.Ingest("附件正文")
+	message := h.Retry("upload-immediate-2")
+	if message.ID <= 0 || len(h.env.repo.messages[h.conversationID]) != 1 {
+		t.Fatalf("retry message = %#v", message)
+	}
+	rows := h.env.attachments.repo.attachments
+	if len(rows) != 1 {
+		t.Fatalf("attachment rows = %d, want 1", len(rows))
+	}
+	bound := rows[h.attachmentID]
+	if bound.ConversationMessageID == nil || *bound.ConversationMessageID != message.ID {
+		t.Fatalf("bound = %#v (message %d)", bound, message.ID)
+	}
+	if tasks := h.ingestTasks(); len(tasks) != 0 {
+		t.Fatalf("retry enqueued a legacy ingest task: %#v", tasks)
+	}
+
+	read := h.ReadText()
+	if read.Status != version.AttachmentDone || read.Text != "附件正文" {
+		t.Fatalf("read after binding = %#v", read)
+	}
+	listed := h.List()
+	if len(listed) != 1 || listed[0].ConversationMessageID != message.ID {
+		t.Fatalf("list after binding = %#v", listed)
+	}
+
+	// The idempotent client retry returns the stored message without touching
+	// the binding or the ingest queue.
+	again := h.Retry("upload-immediate-2")
+	if again.ID != message.ID {
+		t.Fatalf("idempotent retry message = %d, want %d", again.ID, message.ID)
+	}
+	rows = h.env.attachments.repo.attachments
+	if len(rows) != 1 || rows[h.attachmentID].ConversationMessageID == nil ||
+		*rows[h.attachmentID].ConversationMessageID != message.ID {
+		t.Fatalf("rows after idempotent retry = %#v", rows)
+	}
+	if tasks := h.ingestTasks(); len(tasks) != 0 {
+		t.Fatalf("idempotent retry enqueued a legacy ingest task: %#v", tasks)
 	}
 }

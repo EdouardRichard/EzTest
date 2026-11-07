@@ -160,6 +160,12 @@ func TestOpenAIChatSendsToolContinuationMessages(t *testing.T) {
 	if assistant["role"] != "assistant" {
 		t.Fatalf("assistant message = %#v", assistant)
 	}
+	// Strict OpenAI-compatible upstreams (DeepSeek) reject a tool-call message
+	// that omits the content field ("missing field `content`", HTTP 422). The
+	// wire must always carry it, as the empty string for a pure tool call.
+	if content, ok := assistant["content"]; !ok || content != "" {
+		t.Fatalf("assistant content = %#v (present=%v), want explicit empty content", content, ok)
+	}
 	toolCalls, ok := assistant["tool_calls"].([]any)
 	if !ok || len(toolCalls) != 1 {
 		t.Fatalf("assistant tool_calls = %#v", assistant["tool_calls"])

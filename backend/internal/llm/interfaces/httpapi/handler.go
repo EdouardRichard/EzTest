@@ -30,6 +30,7 @@ type Service interface {
 	RefreshModels(ctx context.Context, id int64, actorID int64) ([]llm.Model, error)
 	AddModel(ctx context.Context, configID int64, input llmapp.ModelInput, actorID int64) (llm.Model, error)
 	UpdateModel(ctx context.Context, configID, modelID int64, patch llmapp.ModelPatch, actorID int64) (llm.Model, error)
+	ResetModelParams(ctx context.Context, configID, modelID int64) (llm.Model, error)
 	DeleteModel(ctx context.Context, modelID int64, actorID int64) error
 	ListModels(ctx context.Context) ([]llm.Model, error)
 }
@@ -269,6 +270,34 @@ func (h *Handler) UpdateModel(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toModelDTO(model))
 }
 
+// ResetModelParams POST /api/admin/llm/configs/{id}/models/{modelId}/reset-params.
+//
+// It restores one model's window/output to the values recorded by the most
+// recent catalog refresh and flips both field sources back to catalog (A
+// §4.3/R-A1-4). Route mounting is owned by the server task; the handler is
+// unit-tested directly.
+func (h *Handler) ResetModelParams(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireActor(w, r); !ok {
+		return
+	}
+	configID, err := pathID(r, "id", "id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	modelID, err := pathID(r, "modelId", "model_id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	model, err := h.svc.ResetModelParams(r.Context(), configID, modelID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toModelDTO(model))
+}
+
 // DeleteModel DELETE /api/admin/llm/configs/{id}/models/{modelId}.
 func (h *Handler) DeleteModel(w http.ResponseWriter, r *http.Request) {
 	actorID, ok := requireActor(w, r)
@@ -311,14 +340,16 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 //
 // The login-user model catalog backs the conversation model selector. Only
 // models of the unique active *default* LLM configuration that are themselves
-// enabled and not deprecated are returned (spec §7.3/§9.1); deprecated rows
-// stay in the admin catalog for display but can never be selected for a run.
-// Restricting the catalog to the default configuration is what keeps it
-// consistent with the conversation override resolver, which resolves only that
-// configuration: another active configuration's models would be advertised but
-// every PATCH naming them would be rejected. The response carries the 0.2.1
-// capability set and the config's default marker, and never any gateway
-// credential or base URL.
+// enabled, not deprecated and vision-capable are returned (spec
+// §7.3/§9.1/R-E2-2). Deprecated rows stay in the admin catalog for display but
+// can never be selected for a run; models without supports_vision are omitted
+// because a conversation chat is allowed to carry image drafts and document
+// images, which those models cannot serve. Restricting the catalog to the
+// default configuration is what keeps it consistent with the conversation
+// override resolver, which resolves only that configuration: another active
+// configuration's models would be advertised but every PATCH naming them would
+// be rejected. The response carries the 0.2.1 capability set and the config's
+// default marker, and never any gateway credential or base URL.
 func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
 	configs, err := h.svc.ListConfigs(r.Context())
 	if err != nil {
@@ -340,6 +371,9 @@ func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
 	items := make([]publicModelDTO, 0, len(models))
 	for _, model := range models {
 		if model.ConfigID != defaultConfig.ID || !model.Selectable() {
+			continue
+		}
+		if !model.EffectiveCapabilities().SupportsVision {
 			continue
 		}
 		items = append(items, toPublicModelDTO(model, defaultConfig))

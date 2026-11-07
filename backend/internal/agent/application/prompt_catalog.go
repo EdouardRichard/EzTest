@@ -71,20 +71,12 @@ func profileExampleTaskType(profileKey string) string {
 	switch profileKey {
 	case ProfileKeyClarificationHost:
 		return WorkTypeChatTurn
-	case ProfileKeyRequirementCurator:
-		return WorkTypeRequirementCurate
-	case ProfileKeyContextScout:
-		return WorkTypeAttachmentIngest
 	case ProfileKeyDesignHost:
 		return WorkTypeChatTurn
-	case ProfileKeyDesignPlanner:
-		return WorkTypeDesignRound
-	case ProfileKeyCaseAuthor:
+	case ProfileKeyDesignAuthor:
 		return WorkTypeDesignRequirement
 	case ProfileKeyDesignCritic:
 		return WorkTypeDesignCritic
-	case ProfileKeyDataPlanner:
-		return WorkTypeDesignDataPlan
 	case ProfileKeyCaseExecutor:
 		return WorkTypeExecuteCase
 	case ProfileKeyFailureAnalyst:

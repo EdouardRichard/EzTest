@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/pagination"
@@ -29,6 +31,30 @@ func (r createIntentRequest) parse() (int64, execution.Purpose, error) {
 		return 0, "", platform.Invalid("purpose", "must be retest or manual")
 	}
 	return caseVersionID, purpose, nil
+}
+
+// startWaveRequest is POST /api/versions/{id}/waves (API-42). case_ids is the
+// optional wave scope; an absent or empty array keeps every current+confirmed
+// case (the handler calls the unselected intent scan then).
+type startWaveRequest struct {
+	CaseIDs []string `json:"case_ids"`
+}
+
+// parse converts the decimal-string case IDs; a nil/empty list means "no
+// selection". A non-decimal or non-positive ID is a 400.
+func (r startWaveRequest) parse() ([]int64, error) {
+	if len(r.CaseIDs) == 0 {
+		return nil, nil
+	}
+	caseIDs := make([]int64, 0, len(r.CaseIDs))
+	for _, raw := range r.CaseIDs {
+		caseID, err := parsePositiveIDField("case_ids", raw)
+		if err != nil {
+			return nil, err
+		}
+		caseIDs = append(caseIDs, caseID)
+	}
+	return caseIDs, nil
 }
 
 // pauseWaveRequest is POST /waves/{waveId}/pause (contract PauseWaveRequest).
@@ -71,12 +97,16 @@ type resolveHumanRequestRequest struct {
 }
 
 type humanResponseInput struct {
-	Code *string `json:"code"`
-	Note *string `json:"note"`
+	Code     *string `json:"code"`
+	Note     *string `json:"note"`
+	Decision *string `json:"decision"`
+	Reason   *string `json:"reason"`
 }
 
 // parse normalizes the one-time response. Unknown keys are rejected by the
-// strict decoder; code/note are trimmed and bounded.
+// strict decoder; code/note/decision/reason are trimmed and bounded. The
+// decision vocabulary and the rejection reason requirement are validated by the
+// execution application service.
 func (r resolveHumanRequestRequest) parse() (map[string]any, error) {
 	if r.Response == nil {
 		return nil, platform.Invalid("response", "response is required")
@@ -96,7 +126,56 @@ func (r resolveHumanRequestRequest) parse() (map[string]any, error) {
 		}
 		response[execution.HumanResponseNote] = note
 	}
+	if r.Response.Decision != nil {
+		decision := strings.TrimSpace(*r.Response.Decision)
+		if decision == "" {
+			return nil, platform.Invalid("response.decision", "must be approved or rejected")
+		}
+		response[execution.HumanResponseDecision] = decision
+	}
+	if r.Response.Reason != nil {
+		reason := strings.TrimSpace(*r.Response.Reason)
+		if len(reason) > 2000 {
+			return nil, platform.Invalid("response.reason", "must be at most 2000 characters")
+		}
+		response[execution.HumanResponseReason] = reason
+	}
 	return response, nil
+}
+
+// createHumanRequestRequest is POST /versions/{id}/human-requests: the
+// version-level approval/blocked_recovery/conflict producer (R-W2-1/API-43).
+// The version identity is never part of the body; conversation/message are
+// optional logical hints of the UI card.
+type createHumanRequestRequest struct {
+	Kind           string  `json:"kind"`
+	Reason         string  `json:"reason"`
+	ConversationID *string `json:"conversation_id"`
+	MessageID      *string `json:"message_id"`
+}
+
+// parse converts the transport shape into the application input. Kind/reason
+// semantics stay in the application service; only decimal IDs are parsed here.
+func (r createHumanRequestRequest) parse() (executionapp.HumanCreateInput, error) {
+	input := executionapp.HumanCreateInput{
+		Kind:   strings.TrimSpace(r.Kind),
+		Reason: strings.TrimSpace(r.Reason),
+	}
+	if r.ConversationID != nil && strings.TrimSpace(*r.ConversationID) != "" {
+		value, err := parsePositiveIDField("conversation_id", *r.ConversationID)
+		if err != nil {
+			return input, err
+		}
+		input.ConversationID = value
+	}
+	if r.MessageID != nil && strings.TrimSpace(*r.MessageID) != "" {
+		value, err := parsePositiveIDField("message_id", *r.MessageID)
+		if err != nil {
+			return input, err
+		}
+		input.MessageID = value
+	}
+	return input, nil
 }
 
 // pageParams parses the shared before/limit pagination (spec §9.1).
@@ -125,6 +204,40 @@ func optionalQueryID(r *http.Request, field string) (*int64, error) {
 		return nil, platform.Invalid(field, "must be a positive decimal ID")
 	}
 	return &value, nil
+}
+
+// requiredQueryID parses a required positive decimal query ID (API-19
+// wave_id). Only the canonical decimal form is accepted: digits only, no sign
+// and no leading zeros (OpenAPI ^[1-9][0-9]*$). ParseInt alone would also
+// accept +7 and 007, which the documented contract does not allow. Missing or
+// non-canonical values are a typed 400.
+func requiredQueryID(r *http.Request, field string) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(field))
+	if raw == "" {
+		return 0, platform.Invalid(field, "is required")
+	}
+	if !canonicalDecimalID(raw) {
+		return 0, platform.Invalid(field, "must be a positive decimal ID")
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, platform.Invalid(field, "must be a positive decimal ID")
+	}
+	return value, nil
+}
+
+// canonicalDecimalID reports whether raw is a canonical decimal ID: no sign, no
+// leading zero and at least one digit.
+func canonicalDecimalID(raw string) bool {
+	if raw == "" || raw[0] < '1' || raw[0] > '9' {
+		return false
+	}
+	for index := 1; index < len(raw); index++ {
+		if raw[index] < '0' || raw[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parsePositiveIDField parses a required positive decimal body field.
@@ -168,4 +281,105 @@ func decodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) error {
 		return platform.Invalid("body", "request body must be a valid JSON object")
 	}
 	return nil
+}
+
+// createQuestionRequest is POST /versions/{id}/conversations/{cid}/questions.
+// version/conversation/agent-run identity is never part of the body.
+type createQuestionRequest struct {
+	Questions []questionItemInput `json:"questions"`
+	BatchID   string              `json:"batch_id"`
+	ExpiresAt *string             `json:"expires_at"`
+}
+
+type questionItemInput struct {
+	ID            string                `json:"id"`
+	Text          string                `json:"text"`
+	Options       []questionOptionInput `json:"options"`
+	Multiple      bool                  `json:"multiple"`
+	AllowFreeText bool                  `json:"allow_free_text"`
+	Required      bool                  `json:"required"`
+	SourceRefs    []string              `json:"source_refs"`
+}
+
+type questionOptionInput struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// parse converts the transport shape into the question payload; structural
+// validation (1-5, unique ids, required/free-text) stays in the domain service.
+func (r createQuestionRequest) parse() ([]execution.HumanQuestion, *time.Time, error) {
+	questions := make([]execution.HumanQuestion, 0, len(r.Questions))
+	for _, item := range r.Questions {
+		options := make([]execution.HumanQuestionOption, 0, len(item.Options))
+		for _, option := range item.Options {
+			options = append(options, execution.HumanQuestionOption{ID: option.ID, Label: option.Label})
+		}
+		questions = append(questions, execution.HumanQuestion{
+			ID:            item.ID,
+			Text:          item.Text,
+			Options:       options,
+			Multiple:      item.Multiple,
+			AllowFreeText: item.AllowFreeText,
+			Required:      item.Required,
+			SourceRefs:    append([]string{}, item.SourceRefs...),
+		})
+	}
+	var expiresAt *time.Time
+	if r.ExpiresAt != nil && strings.TrimSpace(*r.ExpiresAt) != "" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*r.ExpiresAt))
+		if err != nil {
+			return nil, nil, platform.Invalid("expires_at", "must be an RFC3339 timestamp")
+		}
+		expiresAt = &parsed
+	}
+	return questions, expiresAt, nil
+}
+
+// answerQuestionRequest is POST /versions/{id}/questions/{qid}/answer.
+type answerQuestionRequest struct {
+	Answers []questionAnswerInput `json:"answers"`
+}
+
+type questionAnswerInput struct {
+	QuestionID string   `json:"question_id"`
+	Selected   []string `json:"selected"`
+	Text       string   `json:"text"`
+}
+
+// parse normalizes the submitted answers. Answer semantics (required, option
+// membership, multiple) are validated by the execution domain.
+func (r answerQuestionRequest) parse() ([]execution.HumanQuestionAnswer, error) {
+	if r.Answers == nil {
+		return nil, platform.Invalid("answers", "answers is required")
+	}
+	answers := make([]execution.HumanQuestionAnswer, 0, len(r.Answers))
+	for _, answer := range r.Answers {
+		answers = append(answers, execution.HumanQuestionAnswer{
+			QuestionID: answer.QuestionID,
+			Selected:   append([]string{}, answer.Selected...),
+			Text:       answer.Text,
+		})
+	}
+	return answers, nil
+}
+
+// skipQuestionRequest is POST /versions/{id}/questions/{qid}/skip.
+type skipQuestionRequest struct {
+	Reason string `json:"reason"`
+}
+
+// questionOwnerID reads the owning Host agent run identity of a question write.
+// Host-internal endpoint contract; Task 37 mounts these routes behind the Host
+// run context, which injects this header.
+func questionOwnerID(r *http.Request) (int64, error) {
+	raw := strings.TrimSpace(r.Header.Get("X-Agent-Run-Id"))
+	if raw == "" {
+		return 0, platform.Invalid("agent_run_id", "the X-Agent-Run-Id host run header is required")
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, platform.Invalid("agent_run_id", "must be a positive decimal ID")
+	}
+	return value, nil
 }

@@ -14,6 +14,7 @@ import (
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -77,6 +78,12 @@ func TestBriefingReaderSQL(t *testing.T) {
 	if !reflect.DeepEqual(source.Plan[1].DependsOn, []string{"准备"}) {
 		t.Fatalf("plan dependency = %#v", source.Plan[1].DependsOn)
 	}
+	// The optimistic-lock revision is read with the item: a value written
+	// explicitly must surface, and a fixture row written without one keeps the
+	// migration default 1. Without the read the Host would have to guess.
+	if source.Plan[0].Revision != 1 || source.Plan[1].Revision != 4 {
+		t.Fatalf("plan revisions = %d/%d, want 1/4", source.Plan[0].Revision, source.Plan[1].Revision)
+	}
 
 	// Facts: current rows only, ranked by confidence then recency (the same
 	// order the briefing renderer uses for its top-K), with a deterministic
@@ -105,8 +112,10 @@ func TestBriefingReaderSQL(t *testing.T) {
 		t.Fatalf("execution = %#v", source.Execution)
 	}
 
-	// Approved knowledge, top-K with binding and system-scope filtering.
-	wantKnowledge := []int64{11001, 11002, 11005, 11008, 11009}
+	// Approved knowledge, top-K with binding and system-scope filtering. The
+	// account-role bindings prove the trimmed role keys: the fixture stores
+	// " buyer " / " auditor ", and 11005/11010 must still match.
+	wantKnowledge := []int64{11001, 11002, 11005, 11010, 11008, 11009}
 	if len(source.Knowledge) != len(wantKnowledge) {
 		t.Fatalf("knowledge = %#v, want IDs %v", source.Knowledge, wantKnowledge)
 	}
@@ -148,6 +157,56 @@ func TestBriefingReaderSQL(t *testing.T) {
 	// A missing version is reported with the version not-found error.
 	if _, err := reader.Load(ctx, 999999); !errors.Is(err, versiondomain.ErrNotFound) {
 		t.Fatalf("missing version error = %v, want %v", err, versiondomain.ErrNotFound)
+	}
+}
+
+// TestLoadBriefingPlanSQLRevision pins the R-A8-2 optimistic-lock token at the
+// production plan read: loadBriefingPlan must SELECT the stored revision and
+// scan it into the snapshot, because the Host consumes it to guard plan.update
+// instead of guessing it and absorbing a conflict. The function is called
+// directly so the test stays focused on the plan read (Task 29 updated the
+// sibling knowledge read to the v0.22 version_sut.scope_exclude shape). A row
+// written without a revision keeps the migration default 1.
+func TestLoadBriefingPlanSQLRevision(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v\nSQL: %s", err, sql)
+		}
+	}
+	exec(`INSERT INTO version (id, title, status, created_by, stage)
+		VALUES (9006, '计划版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order, revision)
+		VALUES (9511, 9006, 'execute', '准备', 'pending', 0, 4)`)
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order)
+		VALUES (9512, 9006, 'execute', '执行', 'pending', 1)`)
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order, revision)
+		VALUES (9513, 9006, 'execute', '已完成', 'done', 2, 7)`)
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatalf("begin read transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var source agentcontext.Source
+	if err := loadBriefingPlan(ctx, tx, 9006, &source); err != nil {
+		t.Fatalf("loadBriefingPlan: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit read transaction: %v", err)
+	}
+	t.Logf("briefing plan snapshot: %+v", source.Plan)
+
+	if len(source.Plan) != 2 {
+		t.Fatalf("plan = %#v, want the two open items", source.Plan)
+	}
+	if source.Plan[0].ID != 9511 || source.Plan[0].Revision != 4 {
+		t.Fatalf("plan[0] = %#v, want id 9511 revision 4", source.Plan[0])
+	}
+	if source.Plan[1].ID != 9512 || source.Plan[1].Revision != 1 {
+		t.Fatalf("plan[1] = %#v, want id 9512 revision 1 (migration default)", source.Plan[1])
 	}
 }
 
@@ -309,7 +368,7 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 		t.Fatalf("human requests before seeding = %#v", source.OpenQuestions.HumanRequests)
 	}
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
-		VALUES (10011, 9004, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'open', now())`)
+		VALUES (10011, 9004, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'pending', now())`)
 	source := assertBlocker("paused", "")
 	if !reflect.DeepEqual(source.OpenQuestions.HumanRequests, []string{"需要短信验证码"}) {
 		t.Fatalf("human requests = %#v", source.OpenQuestions.HumanRequests)
@@ -328,7 +387,7 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 	// never truncated by the renderer.
 	longReason := strings.Repeat("验", 300)
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
-		VALUES (10012, 9004, 'other', jsonb_build_object('reason', $1::text), 'open', now())`, longReason)
+		VALUES (10012, 9004, 'other', jsonb_build_object('reason', $1::text), 'pending', now())`, longReason)
 	source = assertBlocker("cancelled", "")
 	if len(source.OpenQuestions.Questions) != 1 {
 		t.Fatalf("questions = %#v", source.OpenQuestions.Questions)
@@ -431,16 +490,19 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 		VALUES (7201, 7001, 7101, 'Checkout', 'https://shop.test/checkout', '/checkout')`)
 	exec(`INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name)
 		VALUES (7301, 7001, 7101, 'POST', '/api/checkout', 'Checkout API')`)
-	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id, scope)
-		VALUES (7401, 9001, 7001, 7101, '{"pages":[7201],"apis":[7301]}'::jsonb)`)
-	exec(`INSERT INTO version_sut_resource (id, version_sut_id, kind, resource_id, role)
-		VALUES (7501, 7401, 'account', 7601, 'buyer')`)
+	// v0.22 binding shape: version_sut carries the environment exclusions
+	// (empty = whole environment) and accounts are the enabled rows of the
+	// global test-account pool.
+	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id)
+		VALUES (7401, 9001, 7001, 7101)`)
 
 	// Credentials in sibling resource tables must never reach the briefing.
 	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, password)
 		VALUES (7801, 7001, 7101, 'main', 'postgres://user:secret@db/test', 'user', 'db-password')`)
-	exec(`INSERT INTO test_account (id, sut_id, environment_id, username, password)
-		VALUES (7601, 7001, 7101, 'buyer', 'hunter2')`)
+	exec(`INSERT INTO test_account (id, username, password, roles)
+		VALUES (7601, 'buyer', 'hunter2', '[" buyer ", " auditor ", ""]'::jsonb)`)
+	exec(`INSERT INTO version_account (id, version_id, account_id, enabled)
+		VALUES (7501, 9001, 7601, true)`)
 
 	requirements := []struct {
 		id, currentID int64
@@ -491,9 +553,11 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 	}
 
 	// The dependent plan item sorts before its dependency; the reader must
-	// restore dependency-first order. A done item must be omitted.
-	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)
-		VALUES (9501, 9001, 'execute', '执行', 'pending', '{9502}'::bigint[], 0)`)
+	// restore dependency-first order. A done item must be omitted. 9501 carries
+	// an explicit revision while 9502 relies on the migration default (1), so
+	// the read mapping is pinned for both shapes.
+	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order, revision)
+		VALUES (9501, 9001, 'execute', '执行', 'pending', '{9502}'::bigint[], 0, 4)`)
 	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)
 		VALUES (9502, 9001, 'execute', '准备', 'pending', '{}'::bigint[], 1)`)
 	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)
@@ -534,13 +598,13 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 	}
 
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10001, 9001, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'open', $1, $2)`,
+		VALUES (10001, 9001, 'login_takeover', '{"reason":"需要短信验证码"}'::jsonb, 'pending', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(3*time.Hour))
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10002, 9001, 'conflict', '{"reason":"账号归属冲突"}'::jsonb, 'open', $1, $2)`,
+		VALUES (10002, 9001, 'conflict', '{"reason":"账号归属冲突"}'::jsonb, 'pending', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(4*time.Hour))
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10003, 9001, 'other', '{"reason":"已处理"}'::jsonb, 'resolved', $1, $2)`,
+		VALUES (10003, 9001, 'other', '{"reason":"已处理"}'::jsonb, 'answered', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(5*time.Hour))
 
 	knowledge := []struct {
@@ -566,6 +630,8 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 		{11008, "global", nil, "API知识", "选中 API 可用", "approved", ptrFloat(0.7),
 			`{"api_key":"POST /api/checkout"}`},
 		{11009, "global", nil, "无置信知识", "没有置信度", "approved", nil, `{}`},
+		{11010, "global", nil, "账号角色知识", "绑定账号角色可用", "approved", ptrFloat(0.75),
+			`{"account_role":"auditor"}`},
 	}
 	for _, item := range knowledge {
 		exec(`INSERT INTO knowledge_item
@@ -581,3 +647,47 @@ func ptrFloat(value float64) *float64 { return &value }
 func ptrString(value string) *string { return &value }
 
 func int64Ptr(value int64) *int64 { return &value }
+
+// TestBriefingReaderLoadsClarificationHandoff covers the v0.22 R-B5-2 handoff
+// injection (Task 36 fix round 1): the briefing source reads the latest
+// clarification_handoff artifact revision and the Design Host briefing renders
+// its revision and document.
+func TestBriefingReaderLoadsClarificationHandoff(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	briefingSeedSQL(t, pool, base)
+	document := `{"version_id":9001,"revision":3,"requirements":[{"id":501,"title":"登录需求"}],"open":[{"title":"短信通道"}]}`
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO clarification_handoff (id, version_id, revision, content)
+		VALUES (9901, 9001, 3, $1::jsonb)
+	`, document); err != nil {
+		t.Fatalf("seed handoff: %v", err)
+	}
+
+	reader, err := NewBriefingReader(pool)
+	if err != nil {
+		t.Fatalf("NewBriefingReader: %v", err)
+	}
+	source, err := reader.Load(ctx, 9001)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if source.Handoff == nil || source.Handoff.Revision != 3 {
+		t.Fatalf("handoff source = %#v", source.Handoff)
+	}
+	if !strings.Contains(source.Handoff.Document, "登录需求") {
+		t.Fatalf("handoff document = %q", source.Handoff.Document)
+	}
+
+	briefing, err := agentcontext.NewBriefingBuilder(reader).BuildBriefing(ctx, 9001)
+	if err != nil {
+		t.Fatalf("BuildBriefing: %v", err)
+	}
+	rendered := briefing.Render()
+	for _, want := range []string{"澄清交接包", "revision=3", "短信通道"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("design host briefing missing %q:\n%s", want, rendered)
+		}
+	}
+}

@@ -13,6 +13,7 @@ const api = vi.hoisted(() => ({
   dismissIssue: vi.fn(),
   reopenIssue: vi.fn(),
   mergeIssue: vi.fn(),
+  retestIssue: vi.fn(),
 }))
 vi.mock("./api", () => api)
 
@@ -189,6 +190,14 @@ function mockWorkspace(): void {
   api.dismissIssue.mockResolvedValue({ ...openIssue, status: "dismissed" })
   api.reopenIssue.mockResolvedValue({ ...confirmedIssue, status: "open", reopen_count: 2 })
   api.mergeIssue.mockResolvedValue({ ...openIssue, status: "merged", merged_into_id: "9102" })
+  api.retestIssue.mockResolvedValue({
+    issue_id: openIssue.id,
+    version_id: openIssue.version_id,
+    wave_id: "9202",
+    wave_status: "running",
+    retest_status: "retesting",
+    case_run_ids: ["9402"],
+  })
 }
 
 function rowOf(issueId: string): HTMLElement {
@@ -565,6 +574,167 @@ describe("IssuesTab", () => {
 
     expect(await screen.findByText("暂无问题")).toBeInTheDocument()
     expect(screen.getByText("执行失败后会自动生成问题候选。")).toBeInTheDocument()
+  })
+
+  it("shows the retest status and starts a retest from the issue row", async () => {
+    api.listIssues.mockResolvedValue([
+      {
+        ...openIssue,
+        retest_status: "passed",
+        last_retest_wave_id: "9202",
+        last_retest_case_run_id: "9402",
+      },
+    ])
+
+    render(<IssuesTab versionId="2001" />)
+
+    const cell = await screen.findByTestId("issue-retest-9101")
+    expect(within(cell).getByText("passed")).toBeInTheDocument()
+    expect(within(cell).getByText("通过")).toBeInTheDocument()
+
+    fireEvent.click(within(rowOf("9101")).getByRole("button", { name: "复测" }))
+
+    await waitFor(() => expect(api.retestIssue).toHaveBeenCalledWith("2001", "9101"))
+    await waitFor(() => expect(api.listIssues).toHaveBeenCalledTimes(2))
+  })
+
+  it("deep-links the response retest runs instead of the source runs", async () => {
+    api.retestIssue.mockResolvedValue({
+      issue_id: "9101",
+      version_id: "2001",
+      wave_id: "9202",
+      wave_status: "running",
+      retest_status: "retesting",
+      case_run_ids: ["9402", "9403"],
+    })
+
+    render(<IssuesTab versionId="2001" />)
+    await screen.findByTestId("issue-9101")
+
+    fireEvent.click(within(rowOf("9101")).getByRole("button", { name: "复测" }))
+
+    const notice = await screen.findByTestId("issue-retest-notice")
+    expect(within(notice).getByRole("link", { name: "运行 #9402" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202&case_run=9402",
+    )
+    expect(within(notice).getByRole("link", { name: "运行 #9403" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202&case_run=9403",
+    )
+    // The request selection was empty and the source run must not be relinked.
+    expect(notice).not.toHaveTextContent("9302")
+  })
+
+  it("shows the retest status, history refs and starts a retest from the sheet", async () => {
+    api.listIssues.mockResolvedValue([
+      {
+        ...openIssue,
+        retest_status: "failed",
+        last_retest_wave_id: "9202",
+        last_retest_case_run_id: "9402",
+      },
+    ])
+    api.getIssue.mockResolvedValue({
+      ...openDetailFixture,
+      retest_status: "failed",
+      last_retest_wave_id: "9202",
+      last_retest_case_run_id: "9402",
+      refs: [
+        ...openDetailFixture.refs,
+        { kind: "wave", ref_id: "9202", version_sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9402", version_sut_id: "3001", role: "retest" },
+      ],
+    })
+
+    render(<IssuesTab versionId="2001" />)
+    const sheet = await openDetail("9101")
+
+    const retestSection = within(sheet).getByTestId("issue-retest")
+    expect(retestSection).toHaveTextContent("失败")
+    expect(within(retestSection).getByRole("link", { name: "复测波次 #9202" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202",
+    )
+    expect(within(retestSection).getByRole("link", { name: "复测运行 #9402" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202&case_run=9402",
+    )
+    // The retest case-run ref deep-links to the retest wave, not the source wave.
+    expect(within(sheet).getByRole("link", { name: "用例运行 #9402" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202&case_run=9402",
+    )
+
+    fireEvent.click(within(sheet).getByRole("button", { name: "复测" }))
+    await waitFor(() => expect(api.retestIssue).toHaveBeenCalledWith("2001", "9101"))
+    await waitFor(() => expect(api.getIssue).toHaveBeenCalledTimes(2))
+  })
+
+  it("pairs each source and retest ref with the wave of its own generation", async () => {
+    // Two failure generations (source + recurrence) followed by two retest
+    // generations: refs stay in append order, so the older run must keep the
+    // older wave instead of inheriting the last wave of the issue.
+    api.getIssue.mockResolvedValue({
+      ...openDetailFixture,
+      retest_status: "failed",
+      last_retest_wave_id: "9203",
+      last_retest_case_run_id: "9403",
+      refs: [
+        { kind: "case_run", ref_id: "9302", version_sut_id: "3001", role: "source" },
+        { kind: "case_version", ref_id: "9102", version_sut_id: "3001", role: "source" },
+        { kind: "wave", ref_id: "9201", version_sut_id: "3001", role: "source" },
+        { kind: "evidence", ref_id: "9501", version_sut_id: "3001", role: "source" },
+        { kind: "case_run", ref_id: "9312", version_sut_id: "3001", role: "recurrence" },
+        { kind: "case_version", ref_id: "9112", version_sut_id: "3001", role: "recurrence" },
+        { kind: "wave", ref_id: "9211", version_sut_id: "3001", role: "recurrence" },
+        { kind: "evidence", ref_id: "9511", version_sut_id: "3001", role: "recurrence" },
+        { kind: "wave", ref_id: "9202", version_sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9402", version_sut_id: "3001", role: "retest" },
+        { kind: "wave", ref_id: "9203", version_sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9403", version_sut_id: "3001", role: "retest" },
+      ],
+    })
+
+    render(<IssuesTab versionId="2001" />)
+    const sheet = await openDetail("9101")
+    const refs = within(sheet).getByTestId("issue-refs")
+
+    expect(within(refs).getByRole("link", { name: "用例运行 #9302" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9201&case_run=9302",
+    )
+    expect(within(refs).getByRole("link", { name: "证据 #9501" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9201&case_run=9302&evidence=9501",
+    )
+    expect(within(refs).getByRole("link", { name: "用例运行 #9312" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9211&case_run=9312",
+    )
+    expect(within(refs).getByRole("link", { name: "证据 #9511" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9211&case_run=9312&evidence=9511",
+    )
+    expect(within(refs).getByRole("link", { name: "用例运行 #9402" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9202&case_run=9402",
+    )
+    expect(within(refs).getByRole("link", { name: "用例运行 #9403" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=execution&wave=9203&case_run=9403",
+    )
+  })
+
+  it("does not offer a retest for a merged issue", async () => {
+    api.listIssues.mockResolvedValue([mergedIssue])
+
+    render(<IssuesTab versionId="2001" />)
+
+    const row = await screen.findByTestId("issue-9103")
+    expect(
+      within(row.closest("tr") as HTMLElement).queryByRole("button", { name: "复测" }),
+    ).toBeNull()
   })
 
   it("shows a retryable error state when the issue list fails", async () => {

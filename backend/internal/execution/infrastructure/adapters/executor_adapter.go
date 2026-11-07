@@ -16,18 +16,24 @@ func errNotConfigured(name string) error {
 	return fmt.Errorf("%s is not configured", name)
 }
 
+// Executor self-check sentinels (spec §11.1 item 6). The startup probe has to
+// distinguish a rejected bearer token from an unreachable executor so the UI
+// can show "authentication failed" instead of a generic "offline".
+var (
+	// ErrExecutorUnauthorized reports that the executor rejected the configured
+	// Bearer token (HTTP 401/403).
+	ErrExecutorUnauthorized = errors.New("executor rejected the bearer token")
+	// ErrExecutorOffline reports that the executor could not be reached or
+	// answered with an unexpected status.
+	ErrExecutorOffline = errors.New("executor is offline")
+)
+
 // BrowserAdapter adapts the executor protocol client to the execution browser
 // port. One client call maps one action; context lifecycle is owned by the
 // CaseRunner.
 type BrowserAdapter struct {
 	client executorinfra.Client
 	router *ExecutorRouter
-}
-
-// NewBrowserAdapter wires the browser executor adapter with a single client
-// (P3 single-endpoint mode).
-func NewBrowserAdapter(client executorinfra.Client) *BrowserAdapter {
-	return &BrowserAdapter{client: client}
 }
 
 // NewBrowserAdapterWithRouter wires the browser executor adapter with the P8
@@ -191,11 +197,6 @@ func (a *ExecutorProbeAdapter) ListContexts(ctx context.Context) ([]executionapp
 type ExecutorControlAdapter struct {
 	client executorinfra.Client
 	router *ExecutorRouter
-}
-
-// NewExecutorControl wires the executor control adapter with a single client.
-func NewExecutorControl(client executorinfra.Client) *ExecutorControlAdapter {
-	return &ExecutorControlAdapter{client: client}
 }
 
 // NewExecutorControlWithRouter wires the P8 per-executor control adapter.

@@ -133,9 +133,11 @@ func TestRunnerAppendsJobCardPart(t *testing.T) {
 	if cancelable, ok := card.Data["cancelable"].(bool); !ok || cancelable {
 		t.Fatalf("cancelable = %#v, want false for a terminal job", card.Data["cancelable"])
 	}
-	parts := assistantParts(t, fixture)
-	if _, ok := partOfType(parts, "job_card"); ok {
-		t.Fatalf("job card duplicated in the final assistant message: %v", partTypes(parts))
+	// R-B1-2 (v0.22 Task 36): a background design job never appends assistant
+	// text into the shared conversation; the job card is its only thread
+	// projection.
+	if len(fixture.conv.appended) != 0 {
+		t.Fatalf("background design job appended assistant text: %#v", fixture.conv.appended)
 	}
 }
 

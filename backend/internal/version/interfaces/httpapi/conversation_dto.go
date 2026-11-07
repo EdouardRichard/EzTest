@@ -36,6 +36,7 @@ type conversationMessageDTO struct {
 	ID             string                `json:"id"`
 	ConversationID string                `json:"conversation_id"`
 	Role           string                `json:"role"`
+	Kind           string                `json:"kind"`
 	Parts          []version.MessagePart `json:"parts"`
 	Refs           []version.MessageRef  `json:"refs"`
 	ActualModel    *string               `json:"actual_model"`
@@ -180,6 +181,7 @@ func toConversationMessageDTO(view versionapp.MessageView) conversationMessageDT
 		ID:             strconv.FormatInt(view.ID, 10),
 		ConversationID: strconv.FormatInt(view.ConversationID, 10),
 		Role:           view.Role,
+		Kind:           view.Kind,
 		Parts:          parts,
 		Refs:           refs,
 		ActualModel:    view.ActualModel,

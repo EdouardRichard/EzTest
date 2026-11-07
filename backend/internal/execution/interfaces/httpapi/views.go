@@ -68,6 +68,15 @@ type ExecutorView struct {
 	LastError      string         `json:"last_error"`
 }
 
+// ExecutorAuthCheckView is the admin-only token-bearing probe result (D8). It
+// separates an unreachable executor from one that rejects the bearer token.
+type ExecutorAuthCheckView struct {
+	ExecutorID string `json:"executor_id"`
+	Endpoint   string `json:"endpoint"`
+	AuthStatus string `json:"auth_status"`
+	Detail     string `json:"detail"`
+}
+
 // RunWaveView is the run_wave projection (spec §9.3).
 type RunWaveView struct {
 	ID          string               `json:"id"`
@@ -81,6 +90,14 @@ type RunWaveView struct {
 	PauseMode   string               `json:"pause_mode"`
 	PauseReason string               `json:"pause_reason"`
 	CreatedAt   string               `json:"created_at"`
+}
+
+// StartWaveView is the POST /versions/{id}/waves response (API-42): the wave
+// just started and how many case_runs it contains.
+type StartWaveView struct {
+	WaveID       string `json:"wave_id"`
+	Status       string `json:"status"`
+	CaseRunCount int    `json:"case_run_count"`
 }
 
 // IntentView is the execution_intent projection (spec §9.3).
@@ -226,22 +243,26 @@ type HumanRequestPayloadView struct {
 
 // HumanRequestResponseView never echoes the one-time code (spec §9.3).
 type HumanRequestResponseView struct {
-	Note string `json:"note"`
+	Note     string `json:"note"`
+	Decision string `json:"decision,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // HumanRequestView is the human_request projection (spec §9.3).
 type HumanRequestView struct {
-	ID         string                    `json:"id"`
-	VersionID  string                    `json:"version_id"`
-	CaseRunID  *string                   `json:"case_run_id"`
-	Kind       string                    `json:"kind"`
-	Status     string                    `json:"status"`
-	Payload    HumanRequestPayloadView   `json:"payload"`
-	ExpiresAt  string                    `json:"expires_at"`
-	Response   *HumanRequestResponseView `json:"response"`
-	ResolvedBy *string                   `json:"resolved_by"`
-	ResolvedAt *string                   `json:"resolved_at"`
-	CreatedAt  string                    `json:"created_at"`
+	ID             string                    `json:"id"`
+	VersionID      string                    `json:"version_id"`
+	CaseRunID      *string                   `json:"case_run_id"`
+	ConversationID *string                   `json:"conversation_id"`
+	MessageID      *string                   `json:"message_id"`
+	Kind           string                    `json:"kind"`
+	Status         string                    `json:"status"`
+	Payload        HumanRequestPayloadView   `json:"payload"`
+	ExpiresAt      string                    `json:"expires_at"`
+	Response       *HumanRequestResponseView `json:"response"`
+	ResolvedBy     *string                   `json:"resolved_by"`
+	ResolvedAt     *string                   `json:"resolved_at"`
+	CreatedAt      string                    `json:"created_at"`
 }
 
 func toRunWaveView(wave execution.RunWave) RunWaveView {
@@ -375,11 +396,13 @@ func toEvidenceView(evidence execution.Evidence) EvidenceView {
 func toHumanRequestView(request execution.HumanRequest) HumanRequestView {
 	payload := request.Payload
 	view := HumanRequestView{
-		ID:        platformid.Format(request.ID),
-		VersionID: platformid.Format(request.VersionID),
-		CaseRunID: optionalIDStringPtr(request.CaseRunID),
-		Kind:      string(request.Kind),
-		Status:    string(request.Status),
+		ID:             platformid.Format(request.ID),
+		VersionID:      platformid.Format(request.VersionID),
+		CaseRunID:      optionalIDStringPtr(request.CaseRunID),
+		ConversationID: optionalIDStringPtr(request.ConversationID),
+		MessageID:      optionalIDStringPtr(request.MessageID),
+		Kind:           string(request.Kind),
+		Status:         string(request.Status),
 		Payload: HumanRequestPayloadView{
 			Reason:        payloadString(payload, execution.HumanPayloadReason),
 			VersionSUTID:  payloadIDString(payload, execution.HumanPayloadVersionSUTID),
@@ -393,10 +416,131 @@ func toHumanRequestView(request execution.HumanRequest) HumanRequestView {
 		ResolvedAt: formatOptionalTime(request.ResolvedAt),
 		CreatedAt:  formatTime(request.CreatedAt),
 	}
-	if note := payloadString(request.Response, execution.HumanResponseNote); note != "" {
-		view.Response = &HumanRequestResponseView{Note: note}
+	if note, decision, reason := payloadString(request.Response, execution.HumanResponseNote),
+		payloadString(request.Response, execution.HumanResponseDecision),
+		payloadString(request.Response, execution.HumanResponseReason); note != "" || decision != "" || reason != "" {
+		view.Response = &HumanRequestResponseView{Note: note, Decision: decision, Reason: reason}
 	}
 	return view
+}
+
+// QuestionOptionView is one structured-question answer option.
+type QuestionOptionView struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// QuestionItemView is one question of a batch.
+type QuestionItemView struct {
+	ID            string               `json:"id"`
+	Text          string               `json:"text"`
+	Options       []QuestionOptionView `json:"options"`
+	Multiple      bool                 `json:"multiple"`
+	AllowFreeText bool                 `json:"allow_free_text"`
+	Required      bool                 `json:"required"`
+	SourceRefs    []string             `json:"source_refs"`
+}
+
+// QuestionAnswerView is one submitted answer.
+type QuestionAnswerView struct {
+	QuestionID string   `json:"question_id"`
+	Selected   []string `json:"selected"`
+	Text       string   `json:"text"`
+}
+
+// QuestionView is the GET /api/versions/{id}/questions projection: the pending /
+// answered / expired / cancelled state machine plus the question payload,
+// answer and timestamps (R-B3-2/R-B3-3).
+type QuestionView struct {
+	ID             string               `json:"id"`
+	VersionID      string               `json:"version_id"`
+	ConversationID *string              `json:"conversation_id"`
+	MessageID      *string              `json:"message_id"`
+	Kind           string               `json:"kind"`
+	Status         string               `json:"status"`
+	BatchID        string               `json:"batch_id"`
+	Questions      []QuestionItemView   `json:"questions"`
+	ExpiresAt      string               `json:"expires_at"`
+	Answers        []QuestionAnswerView `json:"answers"`
+	AnsweredBy     *string              `json:"answered_by"`
+	AnsweredAt     *string              `json:"answered_at"`
+	Skipped        bool                 `json:"skipped"`
+	// Decision/Reason project the v0.22 approval/blocked_recovery/conflict
+	// decision recorded in human_request.response; empty for a plain question.
+	Decision  string `json:"decision"`
+	Reason    string `json:"reason"`
+	CreatedAt string `json:"created_at"`
+}
+
+func toQuestionView(request execution.HumanRequest) QuestionView {
+	questions := make([]QuestionItemView, 0, len(request.Question.Questions))
+	for _, question := range request.Question.Questions {
+		options := make([]QuestionOptionView, 0, len(question.Options))
+		for _, option := range question.Options {
+			options = append(options, QuestionOptionView{ID: option.ID, Label: option.Label})
+		}
+		questions = append(questions, QuestionItemView{
+			ID:            question.ID,
+			Text:          question.Text,
+			Options:       options,
+			Multiple:      question.Multiple,
+			AllowFreeText: question.AllowFreeText,
+			Required:      question.Required,
+			SourceRefs:    append([]string{}, question.SourceRefs...),
+		})
+	}
+	view := QuestionView{
+		ID:             platformid.Format(request.ID),
+		VersionID:      platformid.Format(request.VersionID),
+		ConversationID: optionalIDStringPtr(request.ConversationID),
+		MessageID:      optionalIDStringPtr(request.MessageID),
+		Kind:           string(request.Kind),
+		Status:         string(request.Status),
+		BatchID:        request.Question.BatchID,
+		Questions:      questions,
+		ExpiresAt:      formatTime(request.ExpiresAt),
+		Answers:        questionAnswersFromResponse(request.Response),
+		AnsweredBy:     payloadIDString(request.Response, execution.HumanResponseAnsweredBy),
+		Skipped:        payloadBool(request.Response, execution.HumanResponseSkipped),
+		Decision:       payloadString(request.Response, execution.HumanResponseDecision),
+		Reason:         payloadString(request.Response, execution.HumanResponseReason),
+		CreatedAt:      formatTime(request.CreatedAt),
+	}
+	if answeredAt := payloadString(request.Response, execution.HumanResponseAnsweredAt); answeredAt != "" {
+		view.AnsweredAt = &answeredAt
+	}
+	return view
+}
+
+// questionAnswersFromResponse decodes the stored answers list into the API view.
+func questionAnswersFromResponse(response map[string]any) []QuestionAnswerView {
+	stored, ok := response[execution.HumanResponseAnswers].([]any)
+	if !ok {
+		return []QuestionAnswerView{}
+	}
+	answers := make([]QuestionAnswerView, 0, len(stored))
+	for _, raw := range stored {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		answer := QuestionAnswerView{QuestionID: payloadString(item, "question_id"), Text: payloadString(item, "text")}
+		answer.Selected = []string{}
+		if selected, ok := item["selected"].([]any); ok {
+			for _, value := range selected {
+				if text, ok := value.(string); ok {
+					answer.Selected = append(answer.Selected, text)
+				}
+			}
+		}
+		answers = append(answers, answer)
+	}
+	return answers
+}
+
+func payloadBool(payload map[string]any, key string) bool {
+	value, ok := payload[key].(bool)
+	return ok && value
 }
 
 func toExecutorView(instance execution.ExecutorInstance) ExecutorView {

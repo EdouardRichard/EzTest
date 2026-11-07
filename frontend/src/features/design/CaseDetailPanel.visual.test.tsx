@@ -113,6 +113,35 @@ describe("CaseDetailPanel visual config and anchors", () => {
     expect(screen.getByRole("button", { name: "保存视觉配置" })).toBeEnabled()
   })
 
+  it("saves an empty region as null so an unchanged config never supersedes the baseline", async () => {
+    designApi.getDesignCase.mockResolvedValue(visualDetail({ caseAssertionId: "6199" }))
+    // The API renders an absent region as `{}`; the editor must not turn that
+    // into a full-image crop on save (which would bump config_revision and
+    // supersede an approved baseline without a real change).
+    visualApi.listVisualAssertions.mockResolvedValue([
+      {
+        ...visualAssertionFixture,
+        step_seq: 2,
+        assertion_seq: 1,
+        region: {},
+      },
+    ])
+
+    renderPanel()
+
+    await screen.findByText("视觉断言配置")
+    fireEvent.click(screen.getByRole("button", { name: "配置视觉断言" }))
+    fireEvent.click(screen.getByRole("button", { name: "保存视觉配置" }))
+
+    await waitFor(() =>
+      expect(visualApi.upsertVisualAssertion).toHaveBeenCalledWith(
+        "2001",
+        "6199",
+        expect.objectContaining({ region: null }),
+      ),
+    )
+  })
+
   it("stays readable when neither the design API nor a config exposes the assertion id", async () => {
     designApi.getDesignCase.mockResolvedValue(visualDetail())
     visualApi.listVisualAssertions.mockResolvedValue([])

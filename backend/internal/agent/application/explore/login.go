@@ -1306,7 +1306,7 @@ func (f *LoginFlow) record(ctx context.Context, fact *SessionFact) error {
 		Key:        fmt.Sprintf("vs:%d:role:%s", fact.VersionSUTID, fact.AccountRole),
 		Payload:    loginFactPayload(*fact),
 		Confidence: &confidence,
-		Source:     "explorer",
+		Source:     "p9",
 		SourceRef:  fact.LoginURL,
 	})
 	if err != nil {

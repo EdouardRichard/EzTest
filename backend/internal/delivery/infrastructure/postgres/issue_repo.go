@@ -26,7 +26,8 @@ import (
 const issueColumns = `id, version_id, title, summary, status, category, severity,
 	dedupe_key, fingerprint, source, expected_revision, merged_into_id, merged_at,
 	merged_by, reopen_count, recurrence_count, last_recurred_at,
-	created_by_run_id, created_at, updated_at`
+	created_by_run_id, created_at, updated_at,
+	retest_status, last_retest_wave_id, last_retest_case_run_id`
 
 const issueRefColumns = `id, issue_id, kind, ref_id, version_sut_id, role, created_at, updated_at`
 
@@ -47,6 +48,15 @@ const (
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (version_id, dedupe_key) DO NOTHING
+		RETURNING ` + issueColumns
+
+	insertManualIssueSQL = `
+		INSERT INTO delivery_issue (
+			id, version_id, title, summary, status, category, severity, dedupe_key,
+			fingerprint, source, expected_revision, created_by_run_id, created_at,
+			updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING ` + issueColumns
 
 	selectIssueByDedupeSQL = `
@@ -171,6 +181,156 @@ func (r *IssueRepository) CreateCandidate(ctx context.Context, issue delivery.Is
 		return delivery.Issue{}, false, fmt.Errorf("create issue candidate: commit: %w", err)
 	}
 	return created, true, nil
+}
+
+// CreateManual inserts one manual issue, its logical refs and its user creation
+// history in one transaction. It deliberately bypasses the candidate
+// ON CONFLICT dedupe path: manual issues carry a random dedupe key and must
+// always create a new row.
+func (r *IssueRepository) CreateManual(ctx context.Context, c deliveryapp.IssueManualCreate) (delivery.Issue, error) {
+	ctx = contextOrBackground(ctx)
+	if c.Issue.VersionID <= 0 {
+		return delivery.Issue{}, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, fmt.Errorf("create manual issue: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	createdAt := c.Issue.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = nowUTC()
+	}
+	updatedAt := c.Issue.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	status := c.Issue.Status
+	if status == "" {
+		status = delivery.IssueStatusOpen
+	}
+	source := c.Issue.Source
+	if source == "" {
+		source = delivery.IssueManualSource
+	}
+	expectedRevision := c.Issue.ExpectedRevision
+	if expectedRevision <= 0 {
+		expectedRevision = 1
+	}
+	created, err := scanIssue(tx.QueryRow(ctx, insertManualIssueSQL,
+		r.insertID(c.Issue.ID), c.Issue.VersionID, c.Issue.Title, c.Issue.Summary,
+		string(status), c.Issue.Category, c.Issue.Severity, c.Issue.DedupeKey,
+		c.Issue.Fingerprint, source, expectedRevision, c.Issue.CreatedByRunID,
+		createdAt, updatedAt,
+	))
+	if err != nil {
+		return delivery.Issue{}, wrapDB("create manual issue", err)
+	}
+	if err := r.insertRefs(ctx, tx, created.ID, c.Refs); err != nil {
+		return delivery.Issue{}, err
+	}
+	history := c.History
+	history.IssueID = created.ID
+	if history.To == "" {
+		history.To = created.Status
+	}
+	if history.CreatedAt.IsZero() {
+		history.CreatedAt = createdAt
+	}
+	if history.UpdatedAt.IsZero() {
+		history.UpdatedAt = history.CreatedAt
+	}
+	if err := r.insertHistory(ctx, tx, history); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, fmt.Errorf("create manual issue: commit: %w", err)
+	}
+	return created, nil
+}
+
+// UpdateManual applies one manual patch under the expected_revision CAS. The
+// row is locked, the revision is compared, then the provided fields, the refs
+// and the append-only history row commit atomically.
+func (r *IssueRepository) UpdateManual(ctx context.Context, u deliveryapp.IssueManualUpdate) (delivery.Issue, error) {
+	ctx = contextOrBackground(ctx)
+	if u.VersionID <= 0 || u.IssueID <= 0 || u.ExpectedRevision <= 0 {
+		return delivery.Issue{}, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, fmt.Errorf("update manual issue: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentRevision int32
+	err = tx.QueryRow(ctx, `
+		SELECT expected_revision
+		FROM delivery_issue
+		WHERE id = $1 AND version_id = $2
+		FOR UPDATE
+	`, u.IssueID, u.VersionID).Scan(&currentRevision)
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("update manual issue: lock issue", err)
+	}
+	if currentRevision != u.ExpectedRevision {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+
+	now := nowUTC()
+	updated, err := scanIssue(tx.QueryRow(ctx, `
+		UPDATE delivery_issue
+		SET title = COALESCE($3, title),
+			summary = COALESCE($4, summary),
+			category = COALESCE($5, category),
+			severity = COALESCE($6, severity),
+			expected_revision = expected_revision + 1,
+			updated_at = $7
+		WHERE id = $1 AND version_id = $2
+		RETURNING `+issueColumns,
+		u.IssueID, u.VersionID, nullableText(u.Title), nullableText(u.Summary),
+		nullableText(u.Category), nullableText(u.Severity), now,
+	))
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("update manual issue", err)
+	}
+	if err := r.insertRefs(ctx, tx, u.IssueID, u.Refs); err != nil {
+		return delivery.Issue{}, err
+	}
+	history := u.History
+	history.IssueID = u.IssueID
+	if history.To == "" {
+		history.To = updated.Status
+	}
+	if history.CreatedAt.IsZero() {
+		history.CreatedAt = now
+	}
+	if history.UpdatedAt.IsZero() {
+		history.UpdatedAt = history.CreatedAt
+	}
+	if err := r.insertHistory(ctx, tx, history); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, fmt.Errorf("update manual issue: commit: %w", err)
+	}
+	return updated, nil
+}
+
+// nullableText maps an empty patch field onto SQL NULL so COALESCE keeps the
+// stored column unchanged.
+func nullableText(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 // Get loads one issue inside its version scope.
@@ -630,6 +790,196 @@ func (r *IssueRepository) FindByCaseRun(ctx context.Context, versionID, caseRunI
 	return issue, true, nil
 }
 
+// StartRetest marks one issue retesting and links the retest wave refs (v0.22
+// W2-5). The row is locked, the issue must still be open/confirmed, and the
+// retest projection must still match the state the service observed before
+// creating the intents (R-14 CAS). The status/pointer/refs commit atomically.
+func (r *IssueRepository) StartRetest(ctx context.Context, in deliveryapp.IssueRetestStart) (delivery.Issue, error) {
+	ctx = contextOrBackground(ctx)
+	if in.VersionID <= 0 || in.IssueID <= 0 || in.WaveID <= 0 {
+		return delivery.Issue{}, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, fmt.Errorf("start issue retest: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		status   string
+		retest   string
+		lastWave *int64
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT status, retest_status, last_retest_wave_id
+		FROM delivery_issue
+		WHERE id = $1 AND version_id = $2
+		FOR UPDATE
+	`, in.IssueID, in.VersionID).Scan(&status, &retest, &lastWave)
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("start issue retest: lock issue", err)
+	}
+	if status != string(delivery.IssueStatusOpen) && status != string(delivery.IssueStatusConfirmed) {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+	// The CAS guards the whole retest projection, not just the pointer: two
+	// requests that both observed the same pre-retest state (for example two
+	// different case_run selections) cannot both win. A later legitimate retest
+	// observed the previous terminal wave and therefore matches its expected
+	// pointer.
+	if retest != in.ExpectedRetestStatus || !sameOptionalIssueID(lastWave, in.ExpectedLastRetestWaveID) {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+
+	now := in.Now
+	if now.IsZero() {
+		now = nowUTC()
+	}
+	updated, err := scanIssue(tx.QueryRow(ctx, `
+		UPDATE delivery_issue
+		SET retest_status = $3,
+			last_retest_wave_id = $4,
+			updated_at = $5
+		WHERE id = $1 AND version_id = $2
+		RETURNING `+issueColumns,
+		in.IssueID, in.VersionID, delivery.IssueRetestStatusRetesting, in.WaveID, now,
+	))
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("start issue retest: update issue", err)
+	}
+	if err := r.insertRefs(ctx, tx, in.IssueID, in.Refs); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, fmt.Errorf("start issue retest: commit: %w", err)
+	}
+	return updated, nil
+}
+
+// sameOptionalIssueID compares two nullable ID pointers.
+func sameOptionalIssueID(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+// ApplyRetestResult writes one retest outcome guarded by last_retest_wave_id
+// (v0.22 W2-5). A stale wave callback is a state conflict, never a silent
+// overwrite of a newer retest. The bool reports whether the stored projection
+// changed (a duplicate callback returns false so the service publishes no
+// duplicate event).
+func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.IssueRetestResult) (delivery.Issue, bool, error) {
+	ctx = contextOrBackground(ctx)
+	if in.VersionID <= 0 || in.IssueID <= 0 || in.WaveID <= 0 {
+		return delivery.Issue{}, false, delivery.ErrInvalidArgument
+	}
+	switch in.TargetStatus {
+	case delivery.IssueRetestStatusRetesting,
+		delivery.IssueRetestStatusPassed,
+		delivery.IssueRetestStatusFailed:
+	default:
+		return delivery.Issue{}, false, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, false, fmt.Errorf("apply issue retest result: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		status   string
+		retest   string
+		lastWave *int64
+		lastCase *int64
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT status, retest_status, last_retest_wave_id, last_retest_case_run_id
+		FROM delivery_issue
+		WHERE id = $1 AND version_id = $2
+		FOR UPDATE
+	`, in.IssueID, in.VersionID).Scan(&status, &retest, &lastWave, &lastCase)
+	if isNoRows(err) {
+		return delivery.Issue{}, false, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, false, wrapDB("apply issue retest result: lock issue", err)
+	}
+	if lastWave == nil || *lastWave != in.WaveID {
+		return delivery.Issue{}, false, delivery.ErrStateConflict
+	}
+	changed := retest != in.TargetStatus || lastCase == nil || *lastCase != in.CaseRunID
+	now := in.Now
+	if now.IsZero() {
+		now = nowUTC()
+	}
+	updated, err := scanIssue(tx.QueryRow(ctx, `
+		UPDATE delivery_issue
+		SET retest_status = $3,
+			last_retest_case_run_id = $4,
+			updated_at = $5
+		WHERE id = $1 AND version_id = $2
+		RETURNING `+issueColumns,
+		in.IssueID, in.VersionID, in.TargetStatus, in.CaseRunID, now,
+	))
+	if isNoRows(err) {
+		return delivery.Issue{}, false, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, false, wrapDB("apply issue retest result: update issue", err)
+	}
+	if changed && in.Reason != "" {
+		// Retest status is independent of the four issue lifecycle statuses, so
+		// the reason is recorded as an append-only from=to history row: the
+		// "other terminal status keeps retesting" rule is then auditable.
+		from := delivery.IssueStatus(status)
+		if err := r.insertHistory(ctx, tx, delivery.IssueStatusChange{
+			ID:        r.ids.Next(),
+			IssueID:   in.IssueID,
+			From:      &from,
+			To:        from,
+			Reason:    in.Reason,
+			ActorKind: "system",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}); err != nil {
+			return delivery.Issue{}, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, false, fmt.Errorf("apply issue retest result: commit: %w", err)
+	}
+	return updated, changed, nil
+}
+
+// FindByRetestWave resolves the issue whose last_retest_wave_id is waveID.
+func (r *IssueRepository) FindByRetestWave(ctx context.Context, waveID int64) (delivery.Issue, bool, error) {
+	ctx = contextOrBackground(ctx)
+	if waveID <= 0 {
+		return delivery.Issue{}, false, nil
+	}
+	issue, err := scanIssue(r.pool.QueryRow(ctx, `
+		SELECT `+issueColumns+`
+		FROM delivery_issue
+		WHERE last_retest_wave_id = $1
+		ORDER BY id
+		LIMIT 1
+	`, waveID))
+	if isNoRows(err) {
+		return delivery.Issue{}, false, nil
+	}
+	if err != nil {
+		return delivery.Issue{}, false, wrapDB("find issue by retest wave", err)
+	}
+	return issue, true, nil
+}
+
 // insertID preserves an explicit positive ID and otherwise draws a snowflake.
 func (r *IssueRepository) insertID(explicit int64) int64 {
 	if explicit > 0 {
@@ -700,6 +1050,7 @@ func scanIssue(row rowScanner) (delivery.Issue, error) {
 		&issue.MergedAt, &issue.MergedBy, &issue.ReopenCount,
 		&issue.RecurrenceCount, &issue.LastRecurredAt,
 		&issue.CreatedByRunID, &issue.CreatedAt, &issue.UpdatedAt,
+		&issue.RetestStatus, &issue.LastRetestWaveID, &issue.LastRetestCaseRunID,
 	); err != nil {
 		return delivery.Issue{}, err
 	}

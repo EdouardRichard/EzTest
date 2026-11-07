@@ -33,9 +33,15 @@ const (
 	defaultSoftSeconds        = 300
 	defaultHardSeconds        = 600
 	defaultToolResultMaxBytes = 32768
-	finishTimeout             = 5 * time.Second
-	toolResultHeadRunes       = 2000
-	scoutAttachmentTextRunes  = 4000
+	// defaultToolRetryMax/defaultOverflowRetries mirror the catalog defaults so
+	// an unwired settings reader keeps retrying tools and rescuing overflow.
+	// Tool retry keeps the pre-W1-2 default of 2; overflow is 1 per spec ST-5
+	// (the old hard-coded 2 was drift, not intended behavior).
+	defaultToolRetryMax      = 2
+	defaultOverflowRetries   = 1
+	finishTimeout            = 5 * time.Second
+	toolResultHeadRunes      = 2000
+	scoutAttachmentTextRunes = 4000
 )
 
 // RunnerDeps wires the P1 agent run loop.
@@ -94,6 +100,36 @@ type RunnerDeps struct {
 	// execution planner for the confirmed case batch. Nil fails an execute.batch
 	// item as a configuration error.
 	Batches BatchStarter
+	// PlanWriter is the v0.22 plan.update port (R-A8-2). The tool is registered
+	// per run and additionally filtered by the profile/role allow-lists, so a
+	// nil writer simply leaves plan.update unregistered.
+	PlanWriter tools.PlanWriter
+	// QuestionAsker is the v0.22 question.ask port (R-B3-3). The execution
+	// question service satisfies it through the composition-root adapter; nil
+	// leaves question.ask unregistered.
+	QuestionAsker tools.QuestionAsker
+	// ClarificationSearch is the v0.22 clarification.search retrieval port
+	// (R-B5). A nil searcher leaves the tool unregistered.
+	ClarificationSearch tools.ClarificationSearcher
+	// Completion builds the per-run server-side completion validator/writer of
+	// task.complete (R-A3). A nil builder or a builder error leaves
+	// task.complete unregistered: a forged completion can never end a run.
+	Completion CompletionBuilder
+	// Settlement resolves the per-run settlement writeback (R-A8-3/A-14). It
+	// reuses the completion target resolver and writes the unresolved plan
+	// item's status/decision plus a progress fact when a run ends on the
+	// turn/time settlement turn without a verified completion. A nil builder or
+	// a builder/store error only logs a warning: the writeback is best effort
+	// and never changes the run verdict.
+	Settlement SettlementBuilder
+	// CompactionSummary persists the R-A5-12 summary revision (version =
+	// latest+1, monotonic covered_message_id). Nil disables summary persistence
+	// (the rolling summary still reaches the packet but not the DB).
+	CompactionSummary SummaryStore
+	// CompactionManager coordinates the R-A5-10 compaction transactions (one
+	// live compaction per conversation, thrashing guard, context.compacted
+	// event). Nil builds an in-process manager with the runner's logger.
+	CompactionManager *agentcontext.CompactionManager
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -101,6 +137,47 @@ type RunnerDeps struct {
 	// observability). Nil disables the counter.
 	Load       *load.Counter
 	InstanceID string
+}
+
+// CompletionContext is the runtime scope of one task.complete target. The
+// builder resolves the single plan item the verified completion writes; the
+// model never supplies any of these values.
+type CompletionContext struct {
+	WorkType       string
+	ProfileKey     string
+	VersionID      int64
+	WorkItemID     int64
+	ConversationID int64
+	AgentRunID     int64
+	RoundID        int64
+	// PlanItemID is the explicit plan target carried by the work-item payload
+	// (plan_item_id), when the creating path linked one. The builder still
+	// verifies it belongs to the version and falls back to the single
+	// in-progress plan item when it is zero.
+	PlanItemID int64
+}
+
+// CompletionBuilder resolves the server-side completion criterion of one run
+// (R-A3-2). A nil/zero CompletionDeps or an error leaves task.complete
+// unregistered for the run, so a task whose completion cannot be verified never
+// exposes a half-wired completion tool.
+type CompletionBuilder func(ctx context.Context, run CompletionContext) (tools.CompletionDeps, error)
+
+// SettlementBuilder resolves the settlement writeback path of one run: the
+// target plan item resolved by the same ordered resolver task.complete uses,
+// bound to a SettlementRecorder. It is called only when a run actually ends on
+// the turn/time settlement turn without a verified completion.
+type SettlementBuilder func(ctx context.Context, run CompletionContext) (SettlementRecorder, error)
+
+// conversationWriterPort is the v0.22 single-writer lease surface of the
+// conversation context (R-B1-2, Task 21). The runner type-asserts its
+// ConversationPort: when the adapter implements the lease, Host replies are
+// written as the leased writer and the legacy writer-less append is never used.
+type conversationWriterPort interface {
+	AcquireWriter(ctx context.Context, conversationID int64, agent string, turnID int64) error
+	RenewWriter(ctx context.Context, conversationID int64, agent string, turnID int64) error
+	ReleaseWriter(ctx context.Context, conversationID int64, agent string, turnID int64) error
+	AppendWriterAssistant(ctx context.Context, conversationID int64, agent string, turnID int64, runID int64, replyTo *int64, parts []ConversationPart) (ConversationMessage, error)
 }
 
 // Runner executes one work item as an agent run: context packet, bounded model
@@ -137,6 +214,13 @@ type Runner struct {
 	clarification        ClarificationConverger
 	designRounds         DesignRoundStarter
 	batches              BatchStarter
+	planWriter           tools.PlanWriter
+	questionAsker        tools.QuestionAsker
+	clarificationSearch  tools.ClarificationSearcher
+	completion           CompletionBuilder
+	settlement           SettlementBuilder
+	compactionSummary    SummaryStore
+	compactionManager    *agentcontext.CompactionManager
 }
 
 // NewRunner wires the agent runner.
@@ -144,6 +228,10 @@ func NewRunner(deps RunnerDeps) *Runner {
 	logger := deps.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	compactionManager := deps.CompactionManager
+	if compactionManager == nil {
+		compactionManager = agentcontext.NewCompactionManager(agentcontext.WithCompactionLogger(logger))
 	}
 	return &Runner{
 		repo:                 deps.Runtime,
@@ -169,12 +257,22 @@ func NewRunner(deps RunnerDeps) *Runner {
 		logger:               logger,
 		load:                 deps.Load,
 		instanceID:           deps.InstanceID,
-		builder:              NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
-		briefing:             deps.Briefing,
-		assembler:            agentcontext.NewAssembler(),
-		clarification:        deps.Clarification,
-		designRounds:         deps.DesignRounds,
-		batches:              deps.Batches,
+		// The v0.22 context assembly owns compaction (CompactionSummarizer +
+		// CompactionManager); the legacy builder only resolves the token budget,
+		// so it is wired without the retired LLM summary path.
+		builder:             NewContextBuilder(deps.Settings, nil),
+		briefing:            deps.Briefing,
+		assembler:           agentcontext.NewAssembler(),
+		clarification:       deps.Clarification,
+		designRounds:        deps.DesignRounds,
+		batches:             deps.Batches,
+		planWriter:          deps.PlanWriter,
+		questionAsker:       deps.QuestionAsker,
+		clarificationSearch: deps.ClarificationSearch,
+		completion:          deps.Completion,
+		settlement:          deps.Settlement,
+		compactionSummary:   deps.CompactionSummary,
+		compactionManager:   compactionManager,
 	}
 }
 
@@ -185,10 +283,12 @@ type RunResult struct {
 	Turns          int
 	Usage          map[string]int
 	TerminalReason string
-	// SettlementCause is the stable budget cause (turn_budget/time_budget/
-	// token_budget) when the run's last turn was the tool-less settlement turn.
-	// It stays empty when the model finished on its own. The execution context
-	// uses it to explain an incomplete case run instead of silently aggregating.
+	// SettlementCause is the stable budget cause (turn_budget/time_budget) when
+	// the run's last turn was the tool-less settlement turn. It stays empty when
+	// the model finished on its own. token_budget is only a legacy mapping and
+	// is never produced since v0.22 (tokens are telemetry). The execution
+	// context uses it to explain an incomplete case run instead of silently
+	// aggregating.
 	SettlementCause string
 	// SettlementDetail is one bounded, secret-free sentence with the observed
 	// usage and the limit that triggered the settlement.
@@ -302,6 +402,9 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	}
 	var err error
 	if payload.ConversationID, err = parseID("conversation_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.PlanItemID, err = parseID("plan_item_id"); err != nil {
 		return WorkItemPayload{}, err
 	}
 	if payload.MessageID, err = parseID("message_id"); err != nil {
@@ -477,9 +580,14 @@ type runState struct {
 	turns          int
 	usage          map[string]int
 	messages       []llmapp.ChatMessage
-	images         []llmapp.ChatImage
-	userContent    string
-	cards          []ConversationPart
+	// promptBase is the number of leading state.messages rendered from the
+	// persisted packet plus the current user turn. Everything after it is this
+	// run's in-flight assistant/tool history, which the conversation snapshot
+	// does not contain yet and a mid-run compaction must preserve (fix round 2).
+	promptBase  int
+	images      []llmapp.ChatImage
+	userContent string
+	cards       []ConversationPart
 	// streamParts are the 0.2.1 UI streaming parts produced by this run
 	// (thinking/tool_call/error). They are written with the final assistant
 	// message as conversation_message_part rows and published on
@@ -495,12 +603,34 @@ type runState struct {
 	// done run, into agent_run.terminal_reason so a 1/4-step stop is explainable.
 	settlementCause  string
 	settlementDetail string
+	// completed is the v0.22 task.complete signal: a successful verified
+	// completion ends the model loop immediately and allows exactly one
+	// completion write per run (R-A3-1/R-A3-4).
+	completed bool
+	// writerLeased records the v0.22 Host single-writer lease acquired before
+	// the loop and released when the run ends (R-B1-2).
+	writerLeased bool
+	writerStop   chan struct{}
 	// recordedSteps/recordedAssertions are the successful execution recording
 	// calls of this run (Task 98). The case executor's settlement turn uses them
 	// to name the assertions of already executed steps that still need a real
 	// result.
 	recordedSteps      map[int]string
 	recordedAssertions map[[2]int]struct{}
+
+	// v0.22 R-A5 compaction wiring (fix round 1). compactionPolicy is the
+	// resolved window/output/ratio budget of this run; lastPromptTokens is the
+	// provider prompt size of the last model call and pendingNewTokens the
+	// conservative estimate of what was appended since, so the pressure trigger
+	// matches R-A5-2. lastCompactionSummary/lastCompactedMessageID/lastCompactionID
+	// carry the summary transaction bookkeeping into the persistence + event.
+	compactionPolicy       agentcontext.CompactionPolicy
+	lastPromptTokens       int
+	pendingNewTokens       int
+	lastPressureTurn       int
+	lastCompactionSummary  SummaryResult
+	lastCompactedMessageID int64
+	lastCompactionID       string
 }
 
 // Run executes one work item and projects the job into its conversation as one
@@ -749,6 +879,14 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	}
 	state.images = images
 
+	// v0.22 single-writer lease: a Host turn owns the conversation for the
+	// duration of its run. Acquiring before the loop fences every legacy
+	// writer-less append; a busy conversation fails the run as retryable.
+	if err := r.beginWriterLease(runCtx, state); err != nil {
+		return r.fail(runCtx, state, err)
+	}
+	defer r.endWriterLease(state)
+
 	if err := r.prepare(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
 	}
@@ -781,7 +919,15 @@ func (r *Runner) run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.finalizeRequirement(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
 	}
-	return r.finish(state, agent.AgentRunDone, "", false, Failure{})
+	// R-A3-1: a run ended by the verified task.complete signal carries the
+	// stable terminal_reason=completed, distinct from a run that merely used up
+	// its turns/wall clock. It is written to agent_run.terminal_reason and
+	// surfaced in RunResult.
+	reason := ""
+	if state.completed {
+		reason = "completed"
+	}
+	return r.finish(state, agent.AgentRunDone, reason, false, Failure{})
 }
 
 // finalizeReport runs the report finalizer hook for report tasks. It is a
@@ -1022,31 +1168,19 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	// The model was resolved before the run row was created; the context packet
 	// only needs its budget metadata here.
 	state.input.ModelBudget = ModelBudget{ContextWindow: state.model.ContextWindow, MaxOutput: state.model.MaxOutput}
+	// R-A5-1: resolve the compaction policy from the effective model window,
+	// max_output and the seeded compaction.* settings before the first assembly
+	// so every pressure/boundary decision uses the same validated budget.
+	state.compactionPolicy = r.resolveCompactionPolicy(ctx, state)
+	state.lastCompactionID = fmt.Sprintf("compaction-run-%d", state.run.ID)
 	state.input.Profile = state.profile
 	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
 
-	attachmentText := ""
-	if state.item.Type == WorkTypeAttachmentIngest {
-		if r.attachments == nil {
-			return errors.New("agent runner has no attachment reader")
-		}
-		attachment, err := r.attachments.GetAttachment(ctx, state.item.VersionID, state.payload.AttachmentID)
-		if err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-		}
-		attachmentText = attachmentUserText(attachment)
-		state.input.Conversation.RecentMessages = append(state.input.Conversation.RecentMessages, Message{
-			ID:      attachment.ID,
-			Role:    "user",
-			Content: attachmentUserText(attachment),
-		})
-	}
-
 	// P5/P7 compose the P1–P4 registry with the codeintel/visual/knowledge tool
 	// groups; the profile allowed_tools still select the surface each run may
 	// call, and R51 intersects that surface with the profile role's whitelist.
-	state.registry = tools.NewP7Registry(r.toolDepsForRun(state))
+	state.registry = r.registryForRun(ctx, state)
 	state.roleTools, state.roleGuard, state.roleMapped = roleToolSurface(state.profile, r.audit)
 	state.definitions = state.roleTools.Definitions(state.registry)
 
@@ -1062,7 +1196,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	// threshold accounts for it (Task 80 moved the per-work-item task context
 	// into this turn, outside the assembler packet), and it is the exact text
 	// handleOverflow re-appends after a boundary rebuild.
-	state.userContent = r.userMessage(ctx, state, attachmentText)
+	state.userContent = r.userMessage(ctx, state)
 
 	// Task 48 cache-first prompt: the assembler renders the byte-stable prefix
 	// and the append-only suffix once per run (and again only at a declared
@@ -1079,10 +1213,12 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	}
 	state.packet = saved
 	state.run.ContextPacketID = &saved.ID
+	state.lastPromptTokens = assembly.AfterTokens + EstimateTokens(state.userContent)
+	state.pendingNewTokens = 0
 	// A boundary compaction persists its rolling summary and emits the
 	// compaction event; an append-only round writes neither.
 	if assembly.Compacted {
-		r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, true)
+		r.recordContextCompaction(ctx, state, assembly, true)
 	}
 	// knowledge_usage is written once per run from the persisted packet; a
 	// failure is logged and never fails the run (contracts §10.3).
@@ -1096,6 +1232,10 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
+	// Everything appended after this point is the run's in-flight transcript
+	// (assistant tool calls and tool results). A mid-run compaction rebuilds the
+	// leading packet+user base and re-appends this suffix via promptBase.
+	state.promptBase = len(state.messages)
 	return nil
 }
 
@@ -1112,10 +1252,11 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		// summary) instead of a hard stop; a settlement turn that is still over
 		// budget is exhausted.
 		usage := Usage{
-			Tokens:   usageTokens(state.usage),
-			Seconds:  r.elapsedSeconds(state),
-			Turns:    state.turns,
-			Settling: state.softNoted,
+			Tokens:    usageTokens(state.usage),
+			Seconds:   r.elapsedSeconds(state),
+			Turns:     state.turns,
+			Settling:  state.softNoted,
+			Completed: state.completed,
 		}
 		decision := state.resourceBudget.Decide(usage)
 		if decision == BudgetExhaust {
@@ -1130,10 +1271,33 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			}
 		}
 		soft := decision == BudgetSettle
+		// v0.22 R-A5-2 pressure trigger: when the last provider prompt plus the
+		// conservative estimate of what was appended since reaches the policy
+		// trigger, compact before re-sending. Only one pressure attempt per turn
+		// so a non-reducing compaction cannot spin the loop; the manager's
+		// thrashing guard bounds consecutive attempts.
+		if state.compactionPolicy.Trigger > 0 && state.turns > state.lastPressureTurn {
+			if pressure, ok := state.compactionPolicy.PressureDecision(state.lastPromptTokens, state.pendingNewTokens); ok {
+				state.lastPressureTurn = state.turns
+				if err := r.compactContext(ctx, state, pressure, -1); err != nil {
+					return "", err
+				}
+			}
+		}
 		// Task 98: every turn re-sends the whole transcript, and a browser read
 		// result can be a 12KB ARIA tree. The prompt transcript keeps only the
 		// newest page reads; the persisted transcript stays complete.
 		r.pruneCaseExecutorBrowserReads(state)
+		// v0.22 A-6 (R-A6-4): tool results older than the newest two call/result
+		// pairs are folded to head/tail + content_ref before the prompt is
+		// re-sent. Pairing is preserved by construction and the persisted
+		// transcript is not rewritten. The case executor keeps its specialized
+		// browser-read pruner for now: the generic envelope would replace the
+		// specialized stub (which names the read tool) a second time, and that
+		// pruner lives in tools/ outside this fix's authorized paths.
+		if state.profile.Key != ProfileKeyCaseExecutor {
+			r.pruneToolResults(ctx, state)
+		}
 		request := llmapp.ChatRequest{
 			Model:           state.model.Model,
 			Messages:        append([]llmapp.ChatMessage(nil), state.messages...),
@@ -1212,6 +1376,18 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			ReasoningContent: response.ReasoningContent,
 			ReasoningItems:   response.ReasoningItems,
 		})
+		// v0.22 R-A5-2 pressure bookkeeping: the provider prompt size is the
+		// authoritative anchor; every appended assistant/tool message since is
+		// the conservative delta for the next round's trigger check.
+		if promptTokens := response.Usage["prompt_tokens"]; promptTokens > 0 {
+			state.lastPromptTokens = promptTokens
+		} else {
+			state.lastPromptTokens = contextPacketTokens(state.contextPacket) + state.pendingNewTokens
+		}
+		state.pendingNewTokens = EstimateTokens(response.Content)
+		for _, call := range response.ToolCalls {
+			state.pendingNewTokens += EstimateTokens(call.Arguments)
+		}
 
 		if len(response.ToolCalls) == 0 {
 			return strings.TrimSpace(response.Content), nil
@@ -1244,6 +1420,12 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 		if err := r.executeTools(ctx, state, response.ToolCalls); err != nil {
 			return "", err
 		}
+		// R-A3-1: a verified task.complete ends the run without another model
+		// turn (and without spending a settlement turn): the completion is the
+		// terminal condition of the task.
+		if state.completed {
+			return strings.TrimSpace(response.Content), nil
+		}
 	}
 	return "", &RunError{
 		Reason:    "budget",
@@ -1254,8 +1436,9 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 
 // settlementInstruction is the system message of the tool-less wrap-up turn. It
 // must name the budget that actually triggered the settlement: the pre-QA-Q2
-// fixed text always blamed the clock, so a token/turn-budget stop produced a
-// model summary that pointed at the wrong cause.
+// fixed text always blamed the clock, so a turn/time-budget stop produced a
+// model summary that pointed at the wrong cause. The token branch is retained
+// only as a legacy mapping; v0.22 tokens are telemetry and never settle.
 func settlementInstruction(cause string) string {
 	switch cause {
 	case BudgetCauseTokens:
@@ -1321,8 +1504,6 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 		ReportRevisionID:     state.payload.ReportRevisionID,
 		PredicateFingerprint: state.payload.PredicateFingerprint,
 	}
-	maxBytes := r.intSetting("agent.tool_result_max_bytes", defaultToolResultMaxBytes)
-
 	for _, call := range calls {
 		r.publishActivity(state, "tool", call.Name, "")
 		callStarted := r.now()
@@ -1336,26 +1517,43 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			// execution.case_finish, whose deterministic replacement (Finalize)
 			// must write the verdict with the budget cause/handoff.
 			err = caseExecutorSettlementRejection(call.Name)
+		case call.Name == tools.ToolTaskComplete && state.completed:
+			// R-A3-4: every completion writes exactly one plan item and one
+			// progress fact. A second declaration in the same run is rejected
+			// instead of writing a duplicate completion.
+			err = tools.Invalid("completion", "task.complete was already accepted for this run")
 		case !profileAllowsTool(state.profile, call.Name):
 			err = tools.Invalid("tool", "tool is not allowed for this profile: "+call.Name)
 		case state.roleGuard != nil:
 			// R51: the runner intersects the profile role's whitelist even when
 			// a stored profile was widened outside it. A denial is a typed
 			// forbidden error and an audit event, never a tool execution.
-			payload, err = state.roleGuard.Execute(ctx, state.registry, scope, call.Name, json.RawMessage(call.Arguments))
+			payload, err = r.executeToolWithRetry(ctx, state, call.Name, func() (any, error) {
+				return state.roleGuard.Execute(ctx, state.registry, scope, call.Name, json.RawMessage(call.Arguments))
+			})
 		case !state.roleMapped:
 			// Unmapped profile: the profile whitelist was the only surface and
 			// it already passed the first case.
-			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			payload, err = r.executeToolWithRetry(ctx, state, call.Name, func() (any, error) {
+				return state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			})
 		case !state.roleTools.Allows(call.Name):
 			err = tools.Forbidden(state.roleTools.Role(), call.Name)
 		default:
-			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			payload, err = r.executeToolWithRetry(ctx, state, call.Name, func() (any, error) {
+				return state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+			})
 		}
 		if err == nil {
 			// Task 98: successful execution recording calls are remembered so a
 			// budget settlement turn can name the assertions still missing.
 			state.trackCaseExecutorRecording(call)
+			// v0.22 R-A3-1: a successful, server-verified task.complete result
+			// signals the completion criterion. The run ends after this tool
+			// round; the completion is never declared twice.
+			if signal, ok := payload.(tools.CompletionSignal); ok && signal.SignalsCompletion() {
+				state.completed = true
+			}
 		}
 		content := ""
 		contentRef := ""
@@ -1382,19 +1580,22 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			if card, ok := requirementCard(call.Name, payload); ok {
 				state.cards = append(state.cards, card)
 			}
-			if maxBytes > 0 && len(encoded) > maxBytes && r.content != nil {
-				ref, spillErr := r.content.PutText(ctx, "agent_tool_result", encoded)
+			// v0.22 A-6 (R-A6-3): an oversized result spills in full to the
+			// content ledger and is replaced by head + tail + content_ref. The
+			// policy comes from agent.tool_result_max_bytes (catalog default
+			// 32768 bytes).
+			policy := tools.LoadToolResultPolicy(ctx, r.settings)
+			if policy.MaxBytes > 0 && len(encoded) > policy.MaxBytes && r.content != nil {
+				spilled, spillErr := tools.SpillToolResult(ctx, runnerContentWriter{writer: r.content}, content, policy)
 				if spillErr != nil {
 					return &RunError{Reason: "tool_failure", Retryable: true, Cause: spillErr}
 				}
-				contentRef = ref.Ref
-				spilled, _ := json.Marshal(map[string]any{
-					"head":        truncateRunes(content, toolResultHeadRunes),
-					"sha256":      ref.SHA256,
-					"content_ref": ref.Ref,
-					"truncated":   true,
-				})
-				content = string(spilled)
+				contentRef = spilled.ContentRef
+				envelope, encodeErr := json.Marshal(spilled)
+				if encodeErr != nil {
+					return &RunError{Reason: "tool_failure", Retryable: true, Cause: encodeErr}
+				}
+				content = string(envelope)
 			}
 		}
 
@@ -1424,20 +1625,22 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 			Content:    content,
 			ToolCallID: call.ID,
 		})
+		state.pendingNewTokens += EstimateTokens(content)
 	}
 	return nil
 }
 
-// handleOverflow compacts the context at a declared window_full boundary and
-// retries. The first retry folds the transcript down to the configured recent
-// window. Rebuilding from the same history with the same window cannot shrink
-// the prompt again, so the second (last) retry halves the window and folds
-// strictly more history; a configured window of 0 is already the minimum, so
-// only the pinned prefix/facts remain and a third overflow is unrecoverable.
-// context_overflow alone never terminates the run.
+// handleOverflow compacts the context at a forced overflow decision (R-A5-2/
+// R-A5-11) and retries. The provider rejected the prompt, so the forced
+// overflow decision runs with the halved 8% retain budget; every retry after the
+// first additionally halves the recent-segment window so strictly more history
+// folds. The retry budget comes from compaction.overflow_retries (default 1);
+// zero disables the rescue, so the first overflow is terminal. A recoverable
+// compaction stop keeps the original context and still retries; exhausting the
+// budget is the terminal unrecoverable case.
 func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.overflowHits++
-	if state.overflowHits > 2 {
+	if state.overflowHits > r.overflowRetries() {
 		return &RunError{
 			Reason:    "context_overflow_unrecoverable",
 			Retryable: true,
@@ -1448,40 +1651,14 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	if state.overflowHits > 1 {
 		keepRecent = shrinkKeepRecentMessages(keepRecent)
 	}
-	previous := state.contextPacket
-	assembly, err := r.assembleContextWithKeepRecent(ctx, state, &previous, agentcontext.InvalidationWindowFull, keepRecent)
-	if err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	policy := state.compactionPolicy
+	if policy.Trigger <= 0 {
+		policy = agentcontext.NewCompactionPolicy(state.input.ModelBudget.ContextWindow, state.input.ModelBudget.MaxOutput)
 	}
-	state.contextPacket = assembly.Packet
-	saved, err := r.repo.SaveContextPacket(ctx, EncodeContextPacket(state.run.ID, state.item.VersionID, assembly.Packet))
-	if err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	decision := policy.OverflowDecision(-1)
+	if err := r.compactContext(ctx, state, decision, keepRecent); err != nil {
+		return err
 	}
-	state.packet = saved
-	state.run.ContextPacketID = &saved.ID
-	// A boundary rebuild persists a new packet row; carry the provider cache
-	// bookkeeping observed on an earlier turn so the latest row stays
-	// authoritative (the context.cache_stats event is still emitted once).
-	if state.providerCacheReported {
-		state.contextPacket.CachedTokens = state.providerCacheTokens
-		state.contextPacket.CacheHit = state.providerCacheHit
-		if state.packet.TokenCounts == nil {
-			state.packet.TokenCounts = map[string]int{}
-		}
-		state.packet.TokenCounts["cached_tokens"] = state.providerCacheTokens
-		state.packet.TokenCounts["cache_hit"] = boolInt(state.providerCacheHit)
-		if err := r.repo.UpdateContextPacketCacheStats(ctx, saved.ID,
-			state.providerCacheTokens, state.providerCacheHit); err != nil {
-			r.logContextWarning(ctx, "carry provider cache stats to the compacted packet failed", err)
-		}
-	}
-	state.messages = append(assembly.Messages, currentUserChatMessage(state, state.userContent))
-	systemText := systemMessageText(assembly.Packet, state.input)
-	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemText, nil, nil); err != nil {
-		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-	}
-	r.recordContextCompaction(ctx, state, assembly.Packet, assembly.BeforeTokens, assembly.AfterTokens, assembly.Compacted)
 	return nil
 }
 
@@ -1496,9 +1673,138 @@ func shrinkKeepRecentMessages(keepRecent int) int {
 	return keepRecent / 2
 }
 
-// writeOutputs persists the profile-specific result: Host/Curator/Design Host/
-// Design Planner conversation messages (Curator with requirement cards),
-// Scout/Case Author/Design Critic/Data Planner team-room updates.
+// writeOutputs persists the profile-specific result: the two conversation Hosts
+// write assistant messages (the clarification Host also carries requirement
+// cards), while Design Author/Critic write team-room updates and background jobs
+// never append assistant text.
+// beginWriterLease acquires the v0.22 conversation single-writer lease for a
+// Host turn (R-B1-2). Non-Host runs and adapters without the lease surface keep
+// the pre-v0.22 behavior. The run ID is the lease turn ID; the profile key is
+// the writing agent. A heartbeat renews the lease while the model loop runs.
+func (r *Runner) beginWriterLease(ctx context.Context, state *runState) error {
+	if state == nil || state.payload.ConversationID <= 0 || !isHostConversationProfile(state.profile.Key) {
+		return nil
+	}
+	port, ok := r.conversation.(conversationWriterPort)
+	if !ok {
+		return nil
+	}
+	if err := port.AcquireWriter(ctx, state.payload.ConversationID, state.profile.Key, state.run.ID); err != nil {
+		return &RunError{Reason: "conversation_busy", Retryable: true, Cause: err}
+	}
+	state.writerLeased = true
+	stop := make(chan struct{})
+	state.writerStop = stop
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				renewCtx, cancel := context.WithTimeout(context.Background(), finishTimeout)
+				err := port.RenewWriter(renewCtx, state.payload.ConversationID, state.profile.Key, state.run.ID)
+				cancel()
+				if err != nil {
+					r.logger.Warn("conversation writer lease renewal failed",
+						"conversation_id", state.payload.ConversationID,
+						"run_id", state.run.ID, "error", err)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+// endWriterLease releases the Host single-writer lease. Expiry covers a crashed
+// process, so a release failure is logged and never fails the run.
+func (r *Runner) endWriterLease(state *runState) {
+	if state == nil || !state.writerLeased {
+		return
+	}
+	if state.writerStop != nil {
+		close(state.writerStop)
+		state.writerStop = nil
+	}
+	port, ok := r.conversation.(conversationWriterPort)
+	if !ok {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), finishTimeout)
+	defer cancel()
+	if err := port.ReleaseWriter(releaseCtx, state.payload.ConversationID, state.profile.Key, state.run.ID); err != nil {
+		r.logger.Warn("conversation writer lease release failed",
+			"conversation_id", state.payload.ConversationID,
+			"run_id", state.run.ID, "error", err)
+	}
+	state.writerLeased = false
+}
+
+// isHostConversationProfile reports whether the profile writes assistant text
+// into a conversation and therefore must own the writer lease. Background jobs
+// (design author/critic) never append assistant text.
+func isHostConversationProfile(profileKey string) bool {
+	return profileKey == ProfileKeyClarificationHost || profileKey == ProfileKeyDesignHost
+}
+
+// appendAssistantReply writes one Host reply through the single-writer lease.
+// The lease-less fallback keeps the previous behavior for deployments that do
+// not wire the v0.22 conversation lease.
+func (r *Runner) appendAssistantReply(ctx context.Context, state *runState, parts []ConversationPart) error {
+	if state == nil || r.conversation == nil {
+		return errors.New("agent runner has no conversation port")
+	}
+	if port, ok := r.conversation.(conversationWriterPort); ok && state.writerLeased {
+		_, err := port.AppendWriterAssistant(ctx, state.payload.ConversationID, state.profile.Key,
+			state.run.ID, state.run.ID, replyTarget(state.payload.MessageID), parts)
+		return err
+	}
+	_, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
+		VersionID:        state.item.VersionID,
+		ConversationID:   state.payload.ConversationID,
+		AgentRunID:       state.run.ID,
+		ReplyToMessageID: replyTarget(state.payload.MessageID),
+		Parts:            parts,
+	})
+	return err
+}
+
+// runnerContentWriter adapts the runtime's content writer to the tools
+// package's content-ledger ref (R-A6-3/R-A6-4). The two structs are kept
+// separate so the tools package never imports the agent application.
+type runnerContentWriter struct {
+	writer ContentWriter
+}
+
+func (w runnerContentWriter) PutText(ctx context.Context, owner string, data []byte) (tools.ContentRef, error) {
+	if w.writer == nil {
+		return tools.ContentRef{}, errors.New("tool result content storage is not configured")
+	}
+	ref, err := w.writer.PutText(ctx, owner, data)
+	if err != nil {
+		return tools.ContentRef{}, err
+	}
+	return tools.ContentRef{Ref: ref.Ref, SHA256: ref.SHA256, Size: len(data)}, nil
+}
+
+// pruneToolResults folds old tool results to head/tail + content_ref before a
+// prompt turn (R-A6-4). Failures are log-only: the unpruned transcript is
+// always a valid prompt and pruning must never fail the run.
+func (r *Runner) pruneToolResults(ctx context.Context, state *runState) {
+	if r.content == nil || state == nil {
+		return
+	}
+	pruned, err := tools.PruneToolResultMessages(ctx, state.messages,
+		runnerContentWriter{writer: r.content}, tools.PruneKeepRecentToolPairs)
+	if err != nil {
+		r.logger.Warn("tool result pruning failed; keeping the full transcript",
+			"run_id", state.run.ID, "error", err)
+		return
+	}
+	state.messages = pruned
+}
+
 func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText string) error {
 	switch state.profile.Key {
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst,
@@ -1509,73 +1815,42 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		return nil
 	case ProfileKeyClarificationHost:
 		if finalText == "" {
+			if state.completed {
+				// task.complete already answered/closed the turn; there is no
+				// free-text reply to project.
+				return nil
+			}
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("host produced an empty final message")}
 		}
-		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-			VersionID:        state.item.VersionID,
-			ConversationID:   state.payload.ConversationID,
-			AgentRunID:       state.run.ID,
-			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            r.assistantConversationParts(state, finalText, nil),
-		}); err != nil {
+		// The clarification Host owns requirement drafting after the v0.22
+		// Curator removal, so requirement cards created by its tools ride on the
+		// same assistant message. The reply goes through the single-writer lease.
+		if err := r.appendAssistantReply(ctx, state, r.assistantConversationParts(state, finalText, state.cards)); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
 		r.convergeClarification(ctx, state, finalText)
 	case ProfileKeyDesignHost:
 		if finalText == "" {
+			if state.completed {
+				return nil
+			}
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design host produced an empty final message")}
 		}
 		if state.payload.ConversationID <= 0 {
 			return &RunError{Reason: "invalid_payload", Retryable: false, Cause: errors.New("design host run has no conversation")}
 		}
-		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-			VersionID:        state.item.VersionID,
-			ConversationID:   state.payload.ConversationID,
-			AgentRunID:       state.run.ID,
-			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            r.assistantConversationParts(state, finalText, nil),
-		}); err != nil {
+		if err := r.appendAssistantReply(ctx, state, r.assistantConversationParts(state, finalText, nil)); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
-	case ProfileKeyDesignPlanner:
+	case ProfileKeyDesignAuthor:
 		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design planner produced an empty scope message")}
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design author produced no design update")}
 		}
-		if state.payload.ConversationID <= 0 {
-			return &RunError{Reason: "invalid_payload", Retryable: false, Cause: errors.New("design planner run has no conversation")}
-		}
-		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-			VersionID:      state.item.VersionID,
-			ConversationID: state.payload.ConversationID,
-			AgentRunID:     state.run.ID,
-			Parts:          r.assistantConversationParts(state, finalText, nil),
-		}); err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-		}
-		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
-			return err
-		}
-	case ProfileKeyCaseAuthor:
-		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("case author produced no design update")}
-		}
-		// A case-author task enqueued by a design round carries the round's
-		// conversation/round association: persist the proposal trace and the
-		// summary there so the design thread shows the case.graph_propose call
-		// with its evidence (Task 65), alongside the team-room update. A task
-		// without the round association keeps the frozen P2 behavior (team room
-		// only) and never writes into a conversation.
-		if r.conversation != nil && state.payload.ConversationID > 0 && state.payload.RoundID > 0 {
-			if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-				VersionID:        state.item.VersionID,
-				ConversationID:   state.payload.ConversationID,
-				AgentRunID:       state.run.ID,
-				ReplyToMessageID: replyTarget(state.payload.MessageID),
-				Parts:            r.assistantConversationParts(state, finalText, nil),
-			}); err != nil {
-				return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-			}
-		}
+		// R-B1-2: a background job never appends assistant text into the shared
+		// design conversation. Its artifacts are the case revisions and the
+		// team-room post; the job card is projected by the worker. This removes
+		// the pre-v0.22 conversation append so a concurrent author cannot spam
+		// the Host thread.
 		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
 			return err
 		}
@@ -1585,48 +1860,6 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 		}
 		if err := r.postDesignUpdate(ctx, state, agent.PostKindFinding, finalText); err != nil {
 			return err
-		}
-	case ProfileKeyDataPlanner:
-		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("data planner produced no data update")}
-		}
-		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
-			return err
-		}
-	case ProfileKeyRequirementCurator:
-		if finalText == "" && len(state.cards) == 0 {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("curator produced no message or requirement card")}
-		}
-		parts := r.assistantConversationParts(state, finalText, state.cards)
-		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
-			VersionID:        state.item.VersionID,
-			ConversationID:   state.payload.ConversationID,
-			AgentRunID:       state.run.ID,
-			ReplyToMessageID: replyTarget(state.payload.MessageID),
-			Parts:            parts,
-		}); err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
-		}
-	case ProfileKeyContextScout:
-		if finalText == "" {
-			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("scout produced an empty finding")}
-		}
-		if r.teamRoom == nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: errors.New("agent runner has no team room port")}
-		}
-		refs := []agent.PostRef{}
-		if state.payload.AttachmentID > 0 {
-			refs = append(refs, agent.PostRef{Kind: "attachment", ID: idText(state.payload.AttachmentID)})
-		}
-		if _, err := r.teamRoom.Post(ctx, agent.TeamRoomPost{
-			VersionID:  state.item.VersionID,
-			Team:       agent.TeamClarification,
-			Kind:       agent.PostKindFinding,
-			Content:    finalText,
-			Refs:       refs,
-			AgentRunID: &state.run.ID,
-		}); err != nil {
-			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 		}
 	default:
 		if finalText == "" {
@@ -1758,6 +1991,13 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 		return result, &RunError{Reason: "run_finish_failed", Retryable: true, Cause: err}
 	}
 
+	// R-A8-3/A-14: a run that ended on the turn/time settlement turn without a
+	// verified completion writes the plan item status/decision and a progress
+	// fact back, so the next run's briefing does not keep the stale pre-run
+	// state. This is best effort: the run row above is already terminal and a
+	// resolution/store failure only logs a warning.
+	r.recordSettlementWriteback(state, status, reason)
+
 	eventType := "agent.run.finished"
 	payload := map[string]any{
 		"run_id": idText(state.run.ID),
@@ -1793,6 +2033,82 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 		SettlementCause:  state.settlementCause,
 		SettlementDetail: state.settlementDetail,
 	}, nil
+}
+
+// settlementEndedRun reports whether a terminal run outcome is the settlement
+// writeback trigger: a done run whose terminal reason is the budget that opened
+// the tool-less wrap-up turn, or a budget exhaustion during that wrap-up turn.
+// An interrupted/aborted or model-error run is not "ended by turn/time
+// settlement" and is never written back.
+func settlementEndedRun(status agent.AgentRunStatus, reason, cause string) bool {
+	if cause == "" {
+		return false
+	}
+	switch status {
+	case agent.AgentRunDone:
+		return reason == cause
+	case agent.AgentRunFailed:
+		// The settlement turn itself was still over budget; the plan item is
+		// still incomplete and the next run must see that.
+		return reason == "budget"
+	default:
+		return false
+	}
+}
+
+// recordSettlementWriteback persists the R-A8-3/A-14 plan/fact writeback of a
+// settled run. The completion target resolver is reused through the Settlement
+// builder, so the same ordered link/payload/single-in-progress resolution picks
+// the plan item. Failures are log-only: the run is already finished, and an
+// unresolvable target or a store outage must not change the run verdict.
+func (r *Runner) recordSettlementWriteback(state *runState, status agent.AgentRunStatus, reason string) {
+	if r == nil || r.settlement == nil || state == nil {
+		return
+	}
+	if state.completed || state.settlementCause == "" {
+		return
+	}
+	if !settlementEndedRun(status, reason, state.settlementCause) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finishTimeout)
+	defer cancel()
+	recorder, err := r.settlement(ctx, CompletionContext{
+		WorkType:       state.item.Type,
+		ProfileKey:     state.profile.Key,
+		VersionID:      state.item.VersionID,
+		WorkItemID:     state.item.ID,
+		ConversationID: state.payload.ConversationID,
+		AgentRunID:     state.run.ID,
+		RoundID:        state.payload.RoundID,
+		PlanItemID:     state.payload.PlanItemID,
+	})
+	if err != nil {
+		r.logger.Warn("settlement plan writeback target could not be resolved",
+			"version_id", state.item.VersionID, "work_item_id", state.item.ID,
+			"run_id", state.run.ID, "error", err)
+		return
+	}
+	if recorder == nil {
+		r.logger.Warn("settlement plan writeback target could not be resolved",
+			"version_id", state.item.VersionID, "work_item_id", state.item.ID,
+			"run_id", state.run.ID, "error", "settlement builder returned no recorder")
+		return
+	}
+	result, err := recorder.RecordSettlement(ctx, Settlement{
+		VersionID:  state.item.VersionID,
+		AgentRunID: state.run.ID,
+		Reason:     state.settlementCause,
+	})
+	if err != nil {
+		r.logger.Warn("settlement plan writeback failed",
+			"version_id", state.item.VersionID, "run_id", state.run.ID, "error", err)
+		return
+	}
+	r.logger.Info("settlement plan writeback recorded",
+		"version_id", state.item.VersionID, "run_id", state.run.ID,
+		"plan_item_id", result.PlanItemID, "plan_status", result.PlanStatus,
+		"decision", result.Decision, "fact_id", result.FactID)
 }
 
 func (r *Runner) appendTranscript(ctx context.Context, state *runState, role agent.MessageRole, content string, toolCallID *string, toolCalls []agent.ToolCall) error {
@@ -1831,8 +2147,72 @@ func (r *Runner) persistAssistant(ctx context.Context, state *runState, response
 	return nil
 }
 
-func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
+// registryForRun builds the per-run tool registry: the frozen P1-P7 surface
+// (which includes the self-registered task.complete/tool_result groups when
+// their deps are wired) plus the additive v0.22 Host tools that have no Deps
+// group (plan.update, question.ask, clarification.search). Profile and role
+// allow-lists still filter every registered tool, so adding a tool here can
+// never widen a profile that does not list it.
+func (r *Runner) registryForRun(ctx context.Context, state *runState) *tools.Registry {
+	base := tools.NewP7Registry(r.toolDepsForRun(ctx, state))
+	extras := make([]tools.Tool, 0, 3)
+	add := func(tool tools.Tool) {
+		if tool == nil {
+			return
+		}
+		if _, exists := base.Get(tool.Name()); exists {
+			return
+		}
+		extras = append(extras, tool)
+	}
+	if r.planWriter != nil {
+		add(tools.NewPlanUpdateTool(r.planWriter))
+	}
+	if r.questionAsker != nil {
+		add(tools.NewQuestionAskTool(r.questionAsker))
+	}
+	if r.clarificationSearch != nil {
+		add(tools.NewClarificationSearchTool(r.clarificationSearch))
+	}
+	if len(extras) == 0 {
+		return base
+	}
+	all := make([]tools.Tool, 0, len(base.Names())+len(extras))
+	for _, name := range base.Names() {
+		tool, ok := base.Get(name)
+		if !ok {
+			continue
+		}
+		all = append(all, tool)
+	}
+	all = append(all, extras...)
+	return tools.NewRegistry(all...)
+}
+
+func (r *Runner) toolDepsForRun(ctx context.Context, state *runState) tools.Deps {
 	deps := r.toolDeps
+	// v0.22 task.complete: the validator/writer are resolved per run from the
+	// work-item target. A builder failure leaves the tool unregistered rather
+	// than exposing a half-wired completion that could end the run without the
+	// plan/fact write (R-A3-4).
+	if r.completion != nil {
+		completion, err := r.completion(ctx, CompletionContext{
+			WorkType:       state.item.Type,
+			ProfileKey:     state.profile.Key,
+			VersionID:      state.item.VersionID,
+			WorkItemID:     state.item.ID,
+			ConversationID: state.payload.ConversationID,
+			AgentRunID:     state.run.ID,
+			RoundID:        state.payload.RoundID,
+			PlanItemID:     state.payload.PlanItemID,
+		})
+		if err != nil {
+			r.logger.Warn("task.complete is disabled for this run: completion target could not be resolved",
+				"version_id", state.item.VersionID, "work_item_id", state.item.ID, "error", err)
+		} else {
+			deps.Completion = completion
+		}
+	}
 	versionID := state.item.VersionID
 	versionPack := state.input.VersionPack
 	deps.VersionPack = func(context.Context, tools.Scope) (any, error) {
@@ -1949,15 +2329,6 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			AcceptanceCriteria: []string{"工具结果包含 requirement_id/revision/status", "用简短文本说明草案变化"},
 			Scope:              scope,
 		}
-	case WorkTypeAttachmentIngest:
-		ingestScope := append(scope, "attachment_id="+idText(state.payload.AttachmentID))
-		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               "总结附件中的关键事实、约束、风险与需要澄清的问题。",
-			Constraints:        []string{"只读附件与上下文", "不修改需求、不确认、不删除"},
-			AcceptanceCriteria: []string{"输出精简 finding 并引用附件名", "列出至少一个待澄清问题（如有）"},
-			Scope:              ingestScope,
-		}
 	case WorkTypeDesignRound:
 		roundRequirementIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_ids")
 		roundRequirementVersionIDs, _ := ParseWorkItemIDList(state.item.Payload, "requirement_version_ids")
@@ -2064,15 +2435,6 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 			AcceptanceCriteria: []string{"每条缺口引用属于当前版本的 requirement 与 wave 内证据", "使用 analysis.coverage_submit"},
 			Scope:              scope,
 		}
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
-		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
-		return TaskContext{
-			Type:               state.item.Type,
-			Goal:               "执行当前 explore 任务：读取版本上下文与已有发现事实，用 explore.* 工具补齐可复现的页面/接口/登录事实并说明证据来源。",
-			Constraints:        []string{"只读 SUT 与版本事实，不生成/确认用例，不修改需求", "不编造事实；无法完成时说明明确原因", "记录证据引用，不写入凭据"},
-			AcceptanceCriteria: []string{"产生或补充可复现的发现事实", "说明证据来源与下一步"},
-			Scope:              scope,
-		}
 	default:
 		// P4 domains register their task-context providers from init hooks. When
 		// one claims the type, its JSON-ready payload is rendered by
@@ -2089,16 +2451,14 @@ func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 // context is per-work-item data, so it belongs to the append-only user suffix,
 // not the cache-stable system prefix; rendering it here keeps goal, constraints,
 // acceptance and scope in front of the model without breaking the shared prefix.
-func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentText string) string {
-	return taskContextMessage(r.baseUserMessage(ctx, state, attachmentText), state.input)
+func (r *Runner) userMessage(ctx context.Context, state *runState) string {
+	return taskContextMessage(r.baseUserMessage(ctx, state), state.input)
 }
 
 // baseUserMessage renders the triggering user content without the per-work-item
 // task context block.
-func (r *Runner) baseUserMessage(ctx context.Context, state *runState, attachmentText string) string {
+func (r *Runner) baseUserMessage(ctx context.Context, state *runState) string {
 	switch state.item.Type {
-	case WorkTypeAttachmentIngest:
-		return attachmentText
 	case WorkTypeChatTurn, WorkTypeRequirementCurate:
 		if state.payload.MessageID > 0 && r.conversation != nil {
 			message, err := r.conversation.GetMessage(ctx, state.item.VersionID, state.payload.ConversationID, state.payload.MessageID)
@@ -2145,9 +2505,6 @@ func (r *Runner) baseUserMessage(ctx context.Context, state *runState, attachmen
 		return fmt.Sprintf("请分析 wave %s 的失败结果并提交 failure 候选细化。", idText(state.payload.WaveID))
 	case WorkTypeAnalyzeCoverage:
 		return fmt.Sprintf("请分析 wave %s 的执行覆盖缺口并提交覆盖候选。", idText(state.payload.WaveID))
-	case agent.WorkItemKindExploreLogin, agent.WorkItemKindExplorePage, agent.WorkItemKindExploreAPI,
-		agent.WorkItemKindExploreCoverage, agent.WorkItemKindExploreGap:
-		return "请执行当前 explore 任务，读取版本上下文与已有事实，补齐可复现的页面/接口/登录发现并说明证据来源。"
 	default:
 		return "请根据当前任务继续执行。"
 	}
@@ -2345,74 +2702,26 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 	})
 }
 
-// DesignRunMaxTokens is the case-scale token budget of the design team. Usage is
-// cumulative across the turns of one run and every turn re-sends the design
-// thread plus the graph read, so the generic 20k chat budget was exhausted after
-// the read in the final S4 run: the following settlement turn disabled tools and
-// case.graph_propose could never write the modification. 200k covers a full
-// round (read + one propose per activated requirement) without being unbounded.
-const DesignRunMaxTokens = 200000
-
-// CaseExecutorRunMaxTokens is the case-scale token budget of a real case
-// execution (Task 89, raised by Tasks 97, 103 and 109). Usage is cumulative
-// across the turns of one run and every turn re-sends the task pack plus the
-// browser snapshot/ARIA tool results, so the generic 20k chat budget was
-// exhausted after four turns in the final small S5 run (31,943 / 33,979 total
-// tokens): the following settlement turn disabled tools and
-// execution.step_record/assertion_record could never write anything, leaving
-// both case runs with assertion_total=0. The first 200k raise was still not
-// enough for a real 4-step case: S5 retry-6 (case run 375990017199177730) used
-// 216,814 tokens after 15 turns and stopped during step 2 of 4 with no
-// assertion recorded. 400k covers the remaining steps, assertions and evidence
-// calls while remaining a bounded cap (above the observed failure point, not an
-// unbounded budget). 400k was still too small for the complete 5-step/
-// 3-assertion case of the O13 PO retry: AC-FR-025-01 used 409,842 tokens after
-// 28 turns and had recorded only 2 of 5 steps and 0 of 3 assertions when the
-// token settlement turned the run inconclusive/token_budget. 800k kept that
-// observed usage inside the run (28 turns is still well below the 60-turn case
-// envelope), but it was still too small for the complete 4-step/5-assertion case
-// of the PO final E2E: AC-FR-011-01 used 813,006 tokens after 44 turns and had
-// recorded only 3 of 4 steps and 1 of 5 assertions when the token settlement
-// turned the run inconclusive/token_budget. 1.2M keeps that observed usage
-// inside the run (44 turns is still below the 60-turn envelope) and covers the
-// remaining step, assertions and evidence calls while remaining a bounded cap
-// (above the observed failure point, not an unbounded budget).
-// Task 98 additionally bounds the per-turn replay: older browser read results are
-// pruned from the prompt transcript and the budget settlement turn can still
-// record the assertions of already executed steps. The runner enforces the cap in
-// code because the stored profile row is seeded once and EnsureProfiles never
-// overwrites an existing row, so a stale chat-scale row must not pull the
-// executor back to the generic budget (same reasoning as the Task 79 design
-// floor). A work item's explicit 0.2.1 budget declaration still wins over the
-// profile floor.
-const CaseExecutorRunMaxTokens = 0
-
-// Design authoring envelope (Task 79). The stored profile budgets cannot be
-// trusted for design runs: profiles are seeded once and EnsureProfiles never
-// overwrites an existing row, so the live 0.2.1 database still carries the
-// chat-scale design budgets (case_author 8/300/600, design_planner 12/300/600)
-// even after the seeds were raised. The runner therefore enforces the design
-// authoring floor in code, like the token budget: a focused case-author run
-// needs the read turn, the propose turn and the summary turn, and must not be
-// cut off by the generic chat-scale soft timeout.
+// Design authoring envelope (Task 79, kept by v0.22). The stored profile
+// budgets cannot be trusted for design runs: profiles are seeded once and
+// EnsureProfiles never overwrites an existing row, so an older database can
+// still carry the chat-scale design budgets (design_author 8/300/600,
+// design_planner 12/300/600) even after the seeds were raised. The runner
+// therefore enforces the design authoring floor in code: a focused design-author
+// run needs the read turn, the propose turn and the summary turn, and must not
+// be cut off by the generic chat-scale soft timeout. Tokens are telemetry only
+// since v0.22, so the envelope consists of turns and wall-clock time only
+// (R-A2-1/R-A2-2).
 //
 // The envelope is profile-scoped, so it deliberately covers every design
-// profile. design_critic and data_planner remain seeded at the lighter
-// 4/120/300 (that seed is the admin-visible default), but they share the 200k
-// design token budget and can still face a full design.graph_read + submit
-// turn, so their runtime envelope is expanded to 16/600/900 as well. This is a
-// documented expansion, pinned by TestDesignBudgetExpandsCriticAndDataPlanner,
-// not an accidental override.
+// profile. design_critic can face a full design.graph_read + submit turn, so
+// its runtime envelope is expanded to 16/600/900 as well. This is a documented
+// expansion, pinned by TestDesignBudgetExpandsCritic, not an accidental
+// override.
 const (
 	DesignRunMaxTurns       = 16
 	DesignRunMinSeconds     = 600
 	DesignRunMinHardSeconds = 900
-	DesignRunMinAuthorTurns = 3
-	// DesignAuthorTurnTokens is the conservative per-turn token envelope of one
-	// focused case-author run after the Task 79 context scoping: profile prompt,
-	// version briefing/facts, one design.graph_read and the bounded
-	// human-history/team-room tail.
-	DesignAuthorTurnTokens = 32000
 )
 
 func (r *Runner) maxTurns(profile agent.AgentProfile) int {
@@ -2461,8 +2770,7 @@ func isP3Profile(key string) bool {
 // they use the design-scale token budget and are not clamped by agent.max_turns.
 func isDesignProfile(key string) bool {
 	switch key {
-	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
-		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
+	case ProfileKeyDesignHost, ProfileKeyDesignAuthor, ProfileKeyDesignCritic:
 		return true
 	default:
 		return false
@@ -2497,31 +2805,20 @@ func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 }
 
 // resourceBudget maps the work item's 0.2.1 budget (spec §5.4: max_tokens /
-// run_seconds / max_turns_fuse) onto the Task 9 Budget policy. Legacy P1-P8
-// items carry no Budget JSON and fall back to the frozen profile limits; the
-// token default is the contract default when neither source sets it.
+// run_seconds / max_turns_fuse) onto the v0.22 Budget policy. Legacy P1-P8
+// items carry no Budget JSON and fall back to the frozen profile limits. Token
+// accounting is telemetry only (R-A2-1): every profile runs with the explicit
+// unlimited shape (MaxTokens=0 + UnlimitedTokens=true) and a declared legacy
+// max_tokens is recorded without ever terminating the run.
 func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile) Budget {
 	budget := Budget{
-		MaxTokens:  DefaultBudgetMaxTokens,
-		RunSeconds: r.softSeconds(profile),
+		MaxTokens:       0,
+		UnlimitedTokens: true,
+		RunSeconds:      r.softSeconds(profile),
 		// Reserve the last loop turn for settlement. With the fuse equal to the
 		// loop cap the loop exits before Decide can observe the fuse, so the
 		// budget policy would never get to ask for a wrap-up turn.
 		MaxTurnsFuse: r.turnFuse(profile),
-	}
-	if isDesignProfile(profile.Key) {
-		budget.MaxTokens = DesignRunMaxTokens
-		// At least the read/propose/summary turns of one focused author run must
-		// fit inside the design token budget.
-		if minimum := DesignRunMinAuthorTurns * DesignAuthorTurnTokens; budget.MaxTokens < minimum {
-			budget.MaxTokens = minimum
-		}
-	} else if profile.Key == ProfileKeyCaseExecutor {
-		// Real execute.case runs must record steps/assertions before the token
-		// budget asks for settlement; the generic 20k chat default cannot cover
-		// the task pack plus browser results (Task 89).
-		budget.MaxTokens = CaseExecutorRunMaxTokens
-		budget.UnlimitedTokens = CaseExecutorRunMaxTokens <= 0
 	}
 	trimmed := strings.TrimSpace(string(item.Budget))
 	if trimmed == "" || trimmed == "null" {
@@ -2536,6 +2833,7 @@ func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile)
 		return budget
 	}
 	if declared.MaxTokens > 0 {
+		// Kept as the future token-quota hook (R-A2-5); ExceededBy ignores it.
 		budget.MaxTokens = declared.MaxTokens
 		budget.UnlimitedTokens = false
 	}
@@ -2638,6 +2936,55 @@ func (r *Runner) intSetting(key string, fallback int) int {
 	return int(value)
 }
 
+// intSettingAllowZero is intSetting for keys whose zero value is meaningful
+// (an explicit "disabled"), such as tool.retry_max and
+// compaction.overflow_retries. A missing/unreadable/negative value falls back.
+func (r *Runner) intSettingAllowZero(key string, fallback int) int {
+	if r.settings == nil {
+		return fallback
+	}
+	value, err := r.settings.Int(context.Background(), key)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return int(value)
+}
+
+// toolRetryMax is the automatic retry budget for retryable tool errors
+// (tool.retry_max). Zero disables automatic retries.
+func (r *Runner) toolRetryMax() int {
+	return r.intSettingAllowZero("tool.retry_max", defaultToolRetryMax)
+}
+
+// overflowRetries is the forced-compaction rescue budget after a provider
+// context-overflow (compaction.overflow_retries). Zero disables the rescue.
+func (r *Runner) overflowRetries() int {
+	return r.intSettingAllowZero("compaction.overflow_retries", defaultOverflowRetries)
+}
+
+// executeToolWithRetry runs one tool invocation and immediately retries a
+// retryable typed tool error up to the configured budget (no backoff). Every
+// retry publishes tool.retry with the attempt number and the error so the UI
+// can show the automatic retry. Non-retryable errors and a zero budget execute
+// exactly once.
+func (r *Runner) executeToolWithRetry(ctx context.Context, state *runState, toolName string, execute func() (any, error)) (any, error) {
+	maxRetries := r.toolRetryMax()
+	payload, err := execute()
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var toolErr *tools.Error
+		if !errors.As(err, &toolErr) || !toolErr.Retryable {
+			return payload, err
+		}
+		r.publish(state, "tool.retry", map[string]any{
+			"tool":    toolName,
+			"attempt": attempt,
+			"error":   err.Error(),
+		})
+		payload, err = execute()
+	}
+	return payload, err
+}
+
 func (r *Runner) now() time.Time {
 	if r.clock == nil {
 		return time.Now()
@@ -2690,8 +3037,45 @@ func attachmentUserText(info AttachmentInfo) string {
 	if info.Status != "" && info.Status != "done" && info.Status != "ready" && info.Status != "extracted" {
 		return fmt.Sprintf("附件《%s》解析状态为 %s，错误：%s。请向用户说明无法读取。", info.Name, info.Status, info.Error)
 	}
-	text := truncateRunes(strings.TrimSpace(info.Text), scoutAttachmentTextRunes)
-	return fmt.Sprintf("请阅读附件《%s》（%s，共 %d 字符）并总结要点：\n%s", info.Name, info.MIME, info.TotalChars, text)
+	// R-E3-4/R-E3-5: every embedded image reference/caption is part of the task
+	// pack and is charged 1500 tokens (AttachmentImageTokenBudget); the extracted
+	// text budget shrinks by the same charge so the combined prompt stays within
+	// the intent of the attachment task pack (one token ≈ two CJK runes).
+	textRuneBudget := scoutAttachmentTextRunes
+	if reserve := info.ImageTokens * 2; reserve > 0 {
+		if reserve >= textRuneBudget {
+			textRuneBudget = textRuneBudget / 4
+		} else {
+			textRuneBudget -= reserve
+		}
+	}
+	text := truncateRunes(strings.TrimSpace(info.Text), textRuneBudget)
+	header := fmt.Sprintf("请阅读附件《%s》（%s，共 %d 字符）并总结要点：\n%s", info.Name, info.MIME, info.TotalChars, text)
+	if len(info.Images) == 0 {
+		return header
+	}
+	var builder strings.Builder
+	builder.WriteString(header)
+	builder.WriteString(fmt.Sprintf("\n\n附件内嵌图片（%d 张，image_tokens=%d；字节在内容库，可按 sha256 续读）：",
+		len(info.Images), info.ImageTokens))
+	for _, image := range info.Images {
+		line := fmt.Sprintf("\n- image_id=%d seq=%d status=%s mime=%s", image.ID, image.Seq,
+			strings.Join(strings.Fields(image.Status), " "), strings.Join(strings.Fields(image.MIME), " "))
+		if image.Width > 0 && image.Height > 0 {
+			line += fmt.Sprintf(" %dx%d", image.Width, image.Height)
+		}
+		if image.SHA256 != "" {
+			line += " sha256=" + image.SHA256
+		}
+		if caption := strings.TrimSpace(image.Caption); caption != "" {
+			line += " caption=" + truncateRunes(redactPartText(caption, producedPartStringMax), producedPartStringMax)
+		}
+		if image.Error != "" {
+			line += " error=" + truncateRunes(redactPartText(image.Error, producedPartStringMax), producedPartStringMax)
+		}
+		builder.WriteString(line)
+	}
+	return builder.String()
 }
 
 func versionPackResult(pack VersionPack) map[string]any {
@@ -2702,6 +3086,7 @@ func versionPackResult(pack VersionPack) map[string]any {
 		"suts":         pack.SUTs,
 		"pages":        pack.Pages,
 		"apis":         pack.APIs,
+		"databases":    pack.Databases,
 		"requirements": pack.Requirements,
 		"attachments":  pack.Attachments,
 		"knowledge":    knowledgeRefsResult(pack.Knowledge),
@@ -2894,8 +3279,7 @@ func artifactRefs(state *runState) []ArtifactRef {
 // room, and every P1 profile keeps the clarification team room.
 func teamForProfile(profileKey string) agent.Team {
 	switch profileKey {
-	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
-		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
+	case ProfileKeyDesignHost, ProfileKeyDesignAuthor, ProfileKeyDesignCritic:
 		return agent.TeamDesign
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
 		return agent.TeamExecution
@@ -3161,11 +3545,38 @@ func (r *Runner) appendToolParts(state *runState, call llmapp.ToolCall, content 
 	if code == "" || message == "" || state.hasErrorPart(code, message) {
 		return
 	}
-	state.appendStreamPart(ConversationPart{Type: "error", Data: map[string]any{
+	// v0.22 fix round 1: the structured retry metadata of the typed tool error
+	// is forwarded into the error part so the UI can explain how to recover
+	// (which field to fix, which values are allowed, the next step). Every
+	// value is bounded by the version contract; `error` parts are persisted in
+	// the conversation snapshot and streamed to the browser.
+	errorData := map[string]any{
 		"code":      code,
 		"message":   message,
-		"retryable": false,
-	}})
+		"retryable": typed.Retryable,
+	}
+	if field := truncateRunes(strings.TrimSpace(typed.Field), version.MessageErrorFieldMax); field != "" {
+		errorData["field"] = field
+	}
+	if len(typed.Allowed) > 0 {
+		allowed := make([]string, 0, len(typed.Allowed))
+		for _, value := range typed.Allowed {
+			if len(allowed) == version.MessageErrorAllowedMax {
+				break
+			}
+			value = truncateRunes(strings.TrimSpace(value), version.MessageErrorAllowedItemMax)
+			if value != "" {
+				allowed = append(allowed, value)
+			}
+		}
+		if len(allowed) > 0 {
+			errorData["allowed"] = allowed
+		}
+	}
+	if hint := redactPartText(typed.Hint, version.MessageErrorHintMax); hint != "" {
+		errorData["hint"] = hint
+	}
+	state.appendStreamPart(ConversationPart{Type: "error", Data: errorData})
 }
 
 // assistantConversationParts renders the parts of one final assistant message:

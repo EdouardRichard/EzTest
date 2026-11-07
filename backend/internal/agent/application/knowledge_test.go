@@ -439,10 +439,13 @@ func TestRunnerRejectsKnowledgeProposeOutsideWhitelist(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.chat.responses = []llmapp.ChatResponse{
 		toolCall(tools.ToolKnowledgePropose, `{"title":"标题","content":"内容"}`),
-		{Content: "已创建需求草案，请确认。"},
+		{Content: "已提交评审 finding。"},
 	}
+	criticItem := fakeWorkItem(agentapp.WorkTypeDesignCritic, agentapp.WorkItemPayload{
+		ConversationID: 20, RequirementID: 501, RequirementVersionID: 700,
+	})
 
-	if _, err := mustRun(t, fixture, curatorItem()); err != nil {
+	if _, err := mustRun(t, fixture, criticItem); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if fixture.knowledgeWriter.calls != 0 {

@@ -207,7 +207,7 @@ func ValidateWorkItemFilter(filter WorkItemFilter) error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if filter.Kind != "" && !agent.ValidWorkItemKind(filter.Kind) {
-		return platform.Invalid("kind", "must be one of explore.login, explore.page, explore.api, explore.coverage, explore.gap, design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose")
+		return platform.Invalid("kind", "must be one of design.cases, review.cases, execute.batch, analyze.failure, report.version, knowledge.propose")
 	}
 	if filter.State != "" && !validWorkItemStateFilter(filter.State) {
 		return platform.Invalid("state", "must be one of open, claimed, running, waiting_human, done, failed, cancelled")

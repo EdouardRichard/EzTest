@@ -171,9 +171,9 @@ func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) map[int64]time.Time {
 		{`INSERT INTO version (id, title, status, auto_design_new_requirements, created_by, created_at, updated_at)
 		  VALUES ($1, 'P4 chain integration', 'running', false, 1, now(), now())`,
 			[]any{itVersionID}},
-		{`INSERT INTO version_sut (id, version_id, sut_id, environment_id, scope, status)
-		  VALUES ($1, $3, $4, $5, '{"pages":[9301],"apis":[]}'::jsonb, 'active'),
-		         ($2, $3, $6, $7, '{"pages":[9302],"apis":[]}'::jsonb, 'active')`,
+		{`INSERT INTO version_sut (id, version_id, sut_id, environment_id, status)
+		  VALUES ($1, $3, $4, $5, 'active'),
+		         ($2, $3, $6, $7, 'active')`,
 			[]any{itVersionSUT1, itVersionSUT2, itVersionID, itSUT1, itEnv1, itSUT2, itEnv2}},
 		{`INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids,
 		                          closed_at, created_at, updated_at)

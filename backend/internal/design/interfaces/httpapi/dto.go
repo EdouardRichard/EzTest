@@ -378,6 +378,32 @@ func toConfirmResultDTO(result designapp.ConfirmResult) confirmResultDTO {
 	return dto
 }
 
+// ---------- discovery revision rollback ----------
+
+type rollbackCaseVersionRequest struct {
+	Reason string `json:"reason"`
+}
+
+type caseVersionRollbackDTO struct {
+	CaseID         string `json:"case_id"`
+	CaseVersionID  string `json:"case_version_id"`
+	RolledBackFrom string `json:"rolled_back_from"`
+	Revision       int    `json:"revision"`
+	Status         string `json:"status"`
+	Trigger        string `json:"trigger"`
+}
+
+func toCaseVersionRollbackDTO(view designapp.CaseVersionRollbackView) caseVersionRollbackDTO {
+	return caseVersionRollbackDTO{
+		CaseID:         platformid.Format(view.CaseID),
+		CaseVersionID:  platformid.Format(view.CaseVersionID),
+		RolledBackFrom: platformid.Format(view.RolledBackFrom),
+		Revision:       view.Revision,
+		Status:         view.Status,
+		Trigger:        view.Trigger,
+	}
+}
+
 // ---------- exports ----------
 
 type createExportRequest struct {

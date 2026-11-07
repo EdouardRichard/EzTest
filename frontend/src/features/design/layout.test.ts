@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { layoutDesignGraph } from "./layout"
+import { layoutDesignGraph, readStoredSplit, writeStoredSplit } from "./layout"
 import { designGraphFixture } from "./test-fixtures"
 import type { DesignGraph } from "./types"
 
@@ -118,5 +118,30 @@ describe("layoutDesignGraph", () => {
     const coordinates = new Set(layout.nodes.map((node) => `${node.position.x},${node.position.y}`))
     expect(coordinates.size).toBe(layout.nodes.length)
     expect(layoutDesignGraph(graphWithCases(200))).toEqual(layout)
+  })
+})
+
+describe("split preference storage", () => {
+  it("falls back to the default when localStorage access is blocked", () => {
+    // Browsers throw on the `window.localStorage` getter itself when storage is
+    // blocked (third-party cookie policy, sandboxed iframe). The helpers must
+    // resolve the storage object defensively, not only catch getItem/setItem.
+    const descriptor = Object.getOwnPropertyDescriptor(window, "localStorage")
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      get() {
+        throw new Error("storage access blocked")
+      },
+    })
+    try {
+      expect(readStoredSplit("eztest.design.chat-split", 40, 20, 80)).toBe(40)
+      expect(() => writeStoredSplit("eztest.design.chat-split", 55)).not.toThrow()
+    } finally {
+      if (descriptor === undefined) {
+        Reflect.deleteProperty(window, "localStorage")
+      } else {
+        Object.defineProperty(window, "localStorage", descriptor)
+      }
+    }
   })
 })

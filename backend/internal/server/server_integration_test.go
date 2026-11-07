@@ -316,9 +316,23 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 85 {
-		t.Fatalf("settings count = %d, want 85 (P8 83->85)", len(settings))
+	if len(settings) != 87 {
+		t.Fatalf("settings count = %d, want 87 (v0.22 catalog: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(settings))
 	}
+	settingKeys := make(map[string]bool, len(settings))
+	for _, raw := range settings {
+		key := raw.(map[string]any)["key"].(string)
+		if strings.HasPrefix(key, "gc.") {
+			t.Fatalf("removed setting %q leaked through GET /api/admin/settings", key)
+		}
+		settingKeys[key] = true
+	}
+	for _, key := range []string{"retention.gc_dry_run", "retention.gc_grace_hours", "retention.unreferenced_content_days"} {
+		if !settingKeys[key] {
+			t.Fatalf("%s is missing from GET /api/admin/settings", key)
+		}
+	}
+	api.do(http.MethodPatch, "/api/admin/settings/gc.retention_days", map[string]any{"value": 7}, http.StatusNotFound)
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {
 		t.Fatalf("updated setting = %#v", updated)
@@ -346,14 +360,19 @@ func TestP0EndToEndFlow(t *testing.T) {
 	if len(catalog["suts"].([]any)) != 1 || len(catalog["repositories"].([]any)) != 1 {
 		t.Fatalf("catalog = %#v", catalog)
 	}
+	// API-15 no longer accepts explicit page/API/database/account/repository
+	// selections: the binding is derived from the environment, so the created
+	// resource IDs only need to be valid (and are exercised through the version
+	// detail below).
+	for _, id := range []string{pageID, apiID, databaseID, accountID, repositoryID} {
+		if id == "" {
+			t.Fatal("resource id is empty")
+		}
+	}
 
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "Order Center Q4",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID, "code_repository_id": repositoryID,
-			"page_ids": []string{pageID}, "api_ids": []string{apiID}, "database_ids": []string{databaseID},
-			"accounts": []any{map[string]any{"account_id": accountID, "role": "buyer"}},
-		}},
+		"title":          "Order Center Q4",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	if version["status"] != "initial" {
@@ -464,11 +483,8 @@ func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P2 Design Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P2 Design Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 
@@ -527,11 +543,8 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P3 Execution Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P3 Execution Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 
@@ -574,7 +587,7 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	if len(evidence["data"].([]any)) != 0 {
 		t.Fatalf("evidence = %#v", evidence)
 	}
-	humans := api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=open", nil, http.StatusOK)
+	humans := api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=pending", nil, http.StatusOK)
 	if len(humans["data"].([]any)) != 0 {
 		t.Fatalf("human requests = %#v", humans)
 	}
@@ -627,11 +640,8 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P3 Happy Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P3 Happy Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	versionIDValue, err := strconv.ParseInt(versionID, 10, 64)
@@ -699,7 +709,7 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 		  VALUES ($1, $2, $3, 1, NULL, 'screenshot', 555, $4, $5, $6, 'p3-shot.txt')`,
 			[]any{int64(960001), int64(930001), int64(1), upload.Data.SHA256, upload.Data.Size, upload.Data.MIME}},
 		{`INSERT INTO human_request (id, version_id, case_run_id, kind, payload, status, expires_at)
-		  VALUES ($1, $2, $3, 'login_takeover', $4::jsonb, 'open', now() + interval '30 minutes')`,
+		  VALUES ($1, $2, $3, 'login_takeover', $4::jsonb, 'pending', now() + interval '30 minutes')`,
 			[]any{int64(970001), versionIDValue, int64(930001), `{"reason":"2FA code required","version_sut_id":"1","account_role":"admin","page_url":"http://127.0.0.1:13337/p3/2fa","challenge_kind":"totp"}`}},
 	}
 	for _, item := range seed {
@@ -784,23 +794,20 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 
 	// Evidence of one version is not downloadable through another version.
 	otherVersion := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "P3 Other Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "P3 Other Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	api.do(http.MethodGet, "/api/versions/"+otherVersion["id"].(string)+"/evidence/960001/content", nil, http.StatusNotFound)
 
 	// Human takeover: list open, resolve once, never echo the one-time code.
-	humanList := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=open", nil, http.StatusOK))
+	humanList := api.listData(api.do(http.MethodGet, "/api/versions/"+versionID+"/human-requests?status=pending", nil, http.StatusOK))
 	if len(humanList) != 1 {
 		t.Fatalf("human requests = %#v", humanList)
 	}
 	resolved := api.data(api.do(http.MethodPost, "/api/human-requests/970001/resolve", map[string]any{
 		"response": map[string]any{"code": "246810", "note": "code entered"},
 	}, http.StatusOK))
-	if resolved["status"] != "resolved" {
+	if resolved["status"] != "answered" {
 		t.Fatalf("resolved human request = %#v", resolved)
 	}
 	response, _ := resolved["response"].(map[string]any)
@@ -857,11 +864,8 @@ func TestP3ManualIntentForPassedRerun(t *testing.T) {
 	}, http.StatusCreated))
 	environmentID := environment["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
-		"title": "T119 Manual Rerun Version",
-		"bindings": []any{map[string]any{
-			"sut_id": sutID, "environment_id": environmentID,
-			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
-		}},
+		"title":          "T119 Manual Rerun Version",
+		"environment_id": environmentID,
 	}, http.StatusCreated))
 	versionID := version["id"].(string)
 	versionIDValue, err := strconv.ParseInt(versionID, 10, 64)

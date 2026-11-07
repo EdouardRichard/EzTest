@@ -1,22 +1,16 @@
 "use client"
 
-import { Maximize2, Minimize2 } from "lucide-react"
+import { ChevronDown, Maximize2, Minimize2 } from "lucide-react"
 import { useRouter } from "next/navigation"
-import {
-  type KeyboardEvent,
-  type PointerEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
-import { cn } from "@/components/ui/cn"
+import { Dialog } from "@/components/ui/Dialog"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { useIsAdmin } from "@/features/auth/useIsAdmin"
+import { SSE_STATUS_LABEL } from "@/features/clarification/labels"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import type { ConversationModel } from "@/features/conversation/api"
@@ -35,19 +29,38 @@ import {
   getDesignGraph,
   getDesignOverview,
   listDesignConversations,
+  rollbackCaseVersion,
 } from "./api"
 import { CaseDetailPanel } from "./CaseDetailPanel"
 import { DesignChat } from "./DesignChat"
-import { DESIGN_FOCUS_SPLITS, DesignFocusDialog } from "./DesignFocusDialog"
+import { DesignFocusDialog } from "./DesignFocusDialog"
 import { DesignMindmap } from "./DesignMindmap"
+import { DesignSplitPane } from "./DesignSplitPane"
+import {
+  DiscoveryRevisionNotice,
+  discoveryRevisionFromEventPayload,
+} from "./DiscoveryRevisionNotice"
 import { ExportCasesDialog } from "./ExportCasesDialog"
-import type { DesignExecutionResults } from "./layout"
+import { ExportDetailPanel } from "./ExportDetailPanel"
+import { HandoffPanel } from "./HandoffPanel"
+import {
+  DEFAULT_CHAT_SPLIT,
+  DEFAULT_WORKBENCH_SPLIT,
+  DESIGN_SPLIT_STORAGE_KEYS,
+  type DesignExecutionResults,
+  MAX_CHAT_SPLIT,
+  MAX_GRAPH_SPLIT,
+  MIN_CHAT_SPLIT,
+  MIN_GRAPH_SPLIT,
+} from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
 import type {
   CaseConfirmationScope,
+  CaseRevisionRollbackView,
   DesignCaseSummary,
   DesignGraph,
   DesignOverview,
+  DiscoveryRevisionData,
   VersionStage,
 } from "./types"
 
@@ -65,6 +78,8 @@ export type DesignTabProps = {
   initialCaseId?: string
   /** Deep link `?conversation=` forwarded by the version page. */
   initialConversationId?: string
+  /** Deep link `?export=` forwarded by the version page (export detail). */
+  initialExportId?: string
 }
 
 const EMPTY_REQUIREMENTS_COPY = "暂无已澄清需求，请先在需求与澄清中确认需求"
@@ -77,72 +92,63 @@ function activityText(payload: Record<string, unknown>): string | null {
   return "AI 正在处理…"
 }
 
-/** The two draggable boundaries of the vertical three-layer workspace. */
-type DividerKind = "chat" | "mindmap"
-
-/** Chat / mindmap / detail share of the workspace height, in percent. */
-type LayerSplits = { chat: number; mindmap: number; detail: number }
-
-const DEFAULT_LAYER_SPLITS: LayerSplits = { chat: 35, mindmap: 40, detail: 25 }
-const MIN_LAYER_PERCENT = 10
-const KEYBOARD_RESIZE_STEP = 5
 /** `.app-content` bottom padding, reserved so the page itself never scrolls. */
 const PAGE_BOTTOM_INSET = 48
 const MIN_WORKSPACE_HEIGHT = 320
 /**
- * The version header/tabs leave a 1422x904 viewport with only ~450px for the
- * three layers. At a 35/40/25 split that is a ~30px message list and a ~50px
- * graph canvas: the design chat renders as a blank strip and the mindmap as a
- * microscopic cluster. The layers therefore keep a usable stacked height and
- * the dedicated scroll container moves between them; the page itself still
- * never scrolls and each layer keeps its own internal scroll.
- *
- * 1000px yields a ~130px message thread, a ~280px graph canvas and a ~250px
- * detail pane before scrolling, and leaves `收起` able to grow the mindmap to
- * ~600px instead of stealing its height.
- */
-const MIN_WORKSPACE_TRACK_HEIGHT = 1000
-const INLINE_TRACK_HEIGHT = `max(100%, ${MIN_WORKSPACE_TRACK_HEIGHT}px)`
-/**
- * Below this design-tab height the expanded chat (35% of the stacked track)
- * plus the mindmap's filter/batch chrome consume the whole first screen, so the
- * graph is invisible until the user scrolls. The design chat starts collapsed
- * to its composer bar so the mindmap is visible on load; 展开 restores the
- * inline thread and 放大 gives it the full dialog.
+ * Below this available height (viewport minus the version header/tabs) the
+ * design chat folds into its title bar so the graph and detail stay usable
+ * (R-D2-4). The user can expand it again from the bar.
  */
 const SHORT_WORKSPACE_HEIGHT = 620
-
-function clampPercent(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max)
-}
-
-function roundPercent(value: number): number {
-  return Math.round(value * 100) / 100
-}
+/** Narrow viewports get the same collapse: the workbench is prioritised. */
+const NARROW_WORKSPACE_WIDTH = 960
 
 /**
- * Move one divider by `delta` percent. A boundary always keeps the combined
- * height of its two neighbouring layers constant (chat+mindmap / mindmap+detail),
- * so dragging never changes the third layer.
+ * Collapsed chat title bar (R-D2-4). It replaces the full DesignChat on a
+ * short/narrow viewport or after the user collapses it; one click restores the
+ * inline thread and composer. Kept deliberately thin (header row only) so the
+ * graph + detail workbench keeps the available height.
  */
-function resizeLayerSplits(current: LayerSplits, divider: DividerKind, delta: number): LayerSplits {
-  if (divider === "chat") {
-    const total = current.chat + current.mindmap
-    const chat = roundPercent(
-      clampPercent(current.chat + delta, MIN_LAYER_PERCENT, total - MIN_LAYER_PERCENT),
-    )
-    return { chat, mindmap: roundPercent(total - chat), detail: current.detail }
-  }
-  const total = current.mindmap + current.detail
-  const mindmap = roundPercent(
-    clampPercent(current.mindmap + delta, MIN_LAYER_PERCENT, total - MIN_LAYER_PERCENT),
+function ChatTitleBar({
+  conversationTitle,
+  onExpand,
+}: {
+  conversationTitle: string | null
+  onExpand: () => void
+}) {
+  return (
+    <div
+      data-testid="design-chat-titlebar"
+      className="surface-card flex min-w-0 shrink-0 items-center gap-2 overflow-hidden border border-border px-3 py-2"
+    >
+      <h2 className="shrink-0 text-sm font-semibold text-foreground">设计对话</h2>
+      <p className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+        {conversationTitle ?? "创建对话后，设计团队会扫描待设计需求并生成用例"}
+      </p>
+      <Button
+        variant="secondary"
+        size="sm"
+        data-testid="design-chat-collapse-toggle"
+        aria-expanded={false}
+        aria-label="展开对话"
+        onClick={onExpand}
+        className="shrink-0 gap-1"
+      >
+        <ChevronDown className="size-3.5" aria-hidden="true" />
+        <span>展开</span>
+      </Button>
+    </div>
   )
-  return { chat: current.chat, mindmap, detail: roundPercent(total - mindmap) }
 }
 
 /**
- * P2 design workspace: a full-height, vertically stacked three-layer layout
- * (design chat / React Flow mindmap / case detail) with draggable separators.
+ * D-2 design workspace: page header + a vertical split with the design chat on
+ * top (40%) and the case workbench below (60%). The workbench itself splits
+ * into the graph (65%) over the case detail (35%); both dividers drag, reset on
+ * double-click and persist their ratio. The page never scrolls — each panel
+ * scrolls internally (R-D2-1..R-D2-6).
+ *
  * The URL is the deep-link source of truth and the `version:{id}` SSE channel
  * drives debounced snapshot refreshes; node positions stay local (`layout.ts`)
  * and are never persisted.
@@ -153,6 +159,7 @@ export function DesignTab({
   onStageChanged,
   initialCaseId,
   initialConversationId,
+  initialExportId,
 }: DesignTabProps) {
   const router = useRouter()
 
@@ -178,15 +185,18 @@ export function DesignTab({
   /** Cases checked in the mindmap and handed to the design chat ("交给 AI 修改"). */
   const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
+  const [handoffOpen, setHandoffOpen] = useState(false)
   const [activity, setActivity] = useState<string | null>(null)
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
+  /** Latest EV-12 discovery revision (auto-confirm or rollback replacement). */
+  const [discoveryRevision, setDiscoveryRevision] = useState<DiscoveryRevisionData | null>(null)
+  const isAdmin = useIsAdmin()
 
-  const [layerSplits, setLayerSplits] = useState<LayerSplits>(DEFAULT_LAYER_SPLITS)
   const [chatCollapsed, setChatCollapsed] = useState(false)
-  const [activeDivider, setActiveDivider] = useState<DividerKind | null>(null)
+  const [shortViewport, setShortViewport] = useState(false)
   const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
-  /** Mindmap + detail enlarged in the floating focus dialog (spec §9.3). */
+  /** Graph + detail enlarged together in the 90vw×90vh floating dialog (R-D2-3). */
   const [focusOpen, setFocusOpen] = useState(false)
   /** Bumped on every focus toggle so the canvas re-fits after the size change. */
   const [fitViewToken, setFitViewToken] = useState(0)
@@ -215,14 +225,8 @@ export function DesignTab({
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const workspaceRef = useRef<HTMLDivElement>(null)
-  const layersRef = useRef<HTMLDivElement>(null)
-  /** Applies the short-viewport default at most once, never over a user toggle. */
-  const autoCollapseApplied = useRef(false)
-  const dividerDrag = useRef<{
-    divider: DividerKind
-    startY: number
-    startSplits: LayerSplits
-  } | null>(null)
+  /** Previous short/narrow state so crossing the threshold collapses the chat. */
+  const wasShortViewport = useRef(false)
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true)
@@ -312,6 +316,12 @@ export function DesignTab({
     onDesignGraphChanged: () => scheduleGraphRefresh(),
     onDesignCaseChanged: (event) => {
       scheduleGraphRefresh()
+      if (event.type === "case.revision.auto_confirmed") {
+        // EV-12/W2-12: show the auto-confirmed or rollback replacement revision
+        // and keep the case detail/graph in sync.
+        const next = discoveryRevisionFromEventPayload(event.payload)
+        if (next !== null) setDiscoveryRevision(next)
+      }
       if (event.type === "design.case_version_stale") {
         const title = typeof event.payload.title === "string" ? event.payload.title : "关联用例"
         setStaleNotice(`${title} 因需求变更已过期，等待重新设计。`)
@@ -521,6 +531,36 @@ export function DesignTab({
     [versionId, refreshGraph, canReviewCases, stage],
   )
 
+  const rollbackDiscoveryRevision = useCallback(
+    (caseVersionId: string, reason?: string) =>
+      reason === undefined
+        ? rollbackCaseVersion(versionId, caseVersionId)
+        : rollbackCaseVersion(versionId, caseVersionId, reason),
+    [versionId],
+  )
+
+  const handleDiscoveryRolledBack = useCallback(
+    (result?: CaseRevisionRollbackView) => {
+      setDiscoveryRevision((current) => {
+        if (current === null || result === undefined) return current
+        return {
+          ...current,
+          caseId: result.case_id,
+          caseVersionId: result.case_version_id,
+          revision: result.revision,
+          status: "confirmed",
+          trigger: "rollback",
+          rollbackOf: result.rolled_back_from,
+          inferred: false,
+        }
+      })
+      scheduleGraphRefresh()
+      void refreshOverview()
+      setDetailToken((token) => token + 1)
+    },
+    [refreshOverview, scheduleGraphRefresh],
+  )
+
   // Stable wrappers for DesignMindmap's memoized node data: React Flow must not
   // see new callback identities on every parent render, or it re-resets the
   // measured node dimensions and the canvas never becomes visible.
@@ -575,9 +615,9 @@ export function DesignTab({
 
   const toggleChatCollapsed = useCallback(() => setChatCollapsed((value) => !value), [])
 
-  // The focus toggle never re-creates the canvas: it only switches the split
-  // and lets `FloatingPanel` re-parent the existing host. The fit token defers
-  // the re-fit until the new size is committed (see DesignMindmap).
+  // The zoom toggle never re-creates the canvas: it only switches the 90vw×90vh
+  // frame and lets `FloatingPanel` re-parent the existing workbench host. The
+  // fit token defers the re-fit until the new size is committed (DesignMindmap).
   const toggleFocus = useCallback(() => {
     setFocusOpen((open) => !open)
     setFitViewToken((token) => token + 1)
@@ -590,7 +630,7 @@ export function DesignTab({
 
   // The version page is not a flex column, so the workspace measures the space
   // left below its own top edge and caps itself to the viewport. That keeps the
-  // document from growing: only the three layers (and their panels) scroll.
+  // document from growing: only the three panes (and their panels) scroll.
   useEffect(() => {
     if (loading || graph === null) return undefined
     const updateHeight = () => {
@@ -599,10 +639,13 @@ export function DesignTab({
       const top = workspace.getBoundingClientRect().top
       const available = Math.max(MIN_WORKSPACE_HEIGHT, window.innerHeight - top - PAGE_BOTTOM_INSET)
       setWorkspaceHeight(`${Math.round(available)}px`)
-      if (!autoCollapseApplied.current) {
-        autoCollapseApplied.current = true
-        if (available < SHORT_WORKSPACE_HEIGHT) setChatCollapsed(true)
-      }
+      const isShort =
+        available < SHORT_WORKSPACE_HEIGHT || window.innerWidth < NARROW_WORKSPACE_WIDTH
+      setShortViewport(isShort)
+      // Collapse when the workspace *enters* the short/narrow band. Resizes
+      // while already short never override the user's explicit expand.
+      if (isShort && !wasShortViewport.current) setChatCollapsed(true)
+      wasShortViewport.current = isShort
     }
     updateHeight()
     window.addEventListener("resize", updateHeight)
@@ -636,99 +679,38 @@ export function DesignTab({
   const roundTitle = overview?.active_round
     ? `设计轮次 #${overview.active_round.round_no}`
     : "暂无设计轮次"
+  const activeConversation =
+    conversations.find((conversation) => conversation.id === activeConversationId) ?? null
+  const effectiveModel =
+    activeConversation?.effective_model ?? activeConversation?.model_override ?? "—"
+  const sseLabel = SSE_STATUS_LABEL[sseStatus]
+  const chatTitle = activeConversation?.title ?? null
+  const selectedDiscoveryRevision =
+    discoveryRevision !== null && discoveryRevision.caseId === selectedCaseId
+      ? discoveryRevision
+      : null
+  const showDiscoveryBar = discoveryRevision !== null && selectedDiscoveryRevision === null
 
-  const chatPairTotal = layerSplits.chat + layerSplits.mindmap
-  const mindmapPairTotal = layerSplits.mindmap + layerSplits.detail
-
-  function dividerDisabled(divider: DividerKind): boolean {
-    return divider === "chat" && chatCollapsed
-  }
-
-  function handleDividerPointerDown(
-    divider: DividerKind,
-    event: PointerEvent<HTMLDivElement>,
-  ): void {
-    if (dividerDisabled(divider)) return
-    dividerDrag.current = { divider, startY: event.clientY, startSplits: layerSplits }
-    setActiveDivider(divider)
-    if (typeof event.currentTarget.setPointerCapture === "function") {
-      event.currentTarget.setPointerCapture(event.pointerId)
-    }
-    event.preventDefault()
-  }
-
-  function handleDividerPointerMove(
-    divider: DividerKind,
-    event: PointerEvent<HTMLDivElement>,
-  ): void {
-    const drag = dividerDrag.current
-    if (drag === null || drag.divider !== divider) return
-    const height = layersRef.current?.getBoundingClientRect().height ?? 0
-    if (height <= 0) return
-    const delta = ((event.clientY - drag.startY) / height) * 100
-    setLayerSplits(resizeLayerSplits(drag.startSplits, divider, delta))
-  }
-
-  function handleDividerPointerUp(divider: DividerKind): void {
-    if (dividerDrag.current?.divider !== divider) return
-    dividerDrag.current = null
-    setActiveDivider(null)
-  }
-
-  function handleDividerKeyDown(divider: DividerKind, event: KeyboardEvent<HTMLDivElement>): void {
-    if (dividerDisabled(divider)) return
-    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return
-    event.preventDefault()
-    const delta = event.key === "ArrowDown" ? KEYBOARD_RESIZE_STEP : -KEYBOARD_RESIZE_STEP
-    setLayerSplits((current) => resizeLayerSplits(current, divider, delta))
-  }
-
-  const chatLayerStyle = chatCollapsed
-    ? { flexGrow: 0, flexShrink: 0, flexBasis: "auto" }
-    : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.chat}%` }
-  // Collapsed chat takes only its content height; the mindmap grows into the rest.
-  const mindmapLayerStyle = chatCollapsed
-    ? { flexGrow: 1, flexShrink: 1, flexBasis: "0%" }
-    : { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.mindmap}%` }
-  const detailLayerStyle = { flexGrow: 0, flexShrink: 1, flexBasis: `${layerSplits.detail}%` }
-
-  // While the focus dialog is open the pair fills the floating body with the
-  // fixed spec split; the chat layer and both dividers leave so nothing can be
-  // dragged away from 65/35. Closing restores the inline styles untouched.
-  const focusMindmapStyle = {
-    flexGrow: 0,
-    flexShrink: 1,
-    flexBasis: `${DESIGN_FOCUS_SPLITS.mindmap}%`,
-  }
-  const focusDetailStyle = {
-    flexGrow: 0,
-    flexShrink: 1,
-    flexBasis: `${DESIGN_FOCUS_SPLITS.detail}%`,
-  }
-  const hiddenWhileFocused = focusOpen ? { display: "none" } : undefined
-  const effectiveChatStyle = focusOpen ? hiddenWhileFocused : chatLayerStyle
-  const effectiveMindmapStyle = focusOpen ? focusMindmapStyle : mindmapLayerStyle
-  const effectiveDetailStyle = focusOpen ? focusDetailStyle : detailLayerStyle
-
-  return (
+  const workbench = (
     <div
-      ref={workspaceRef}
-      data-testid="design-tab"
-      className="flex min-h-0 flex-col gap-3 overflow-hidden"
-      style={{ height: workspaceHeight }}
+      data-testid="design-workbench"
+      className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
     >
-      <header className="flex shrink-0 flex-wrap items-center gap-2">
-        <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
-        <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
-          需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
-          {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
-        </span>
+      <header
+        data-testid="design-workbench-toolbar"
+        className="flex shrink-0 flex-wrap items-center gap-2 px-1 pb-1"
+      >
+        <h2 className="text-sm font-semibold text-foreground">用例工作区</h2>
+        <span className="text-[10px] text-muted-foreground">图在上 · 详情紧接在下 · 内部滚动</span>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <span data-testid="design-workbench-live" className="text-[10px] text-muted-foreground">
+            {sseLabel}
+          </span>
           <Button
             size="sm"
             variant="secondary"
-            data-testid="design-mindmap-expand"
-            aria-label={focusOpen ? "退出放大脑图与详情" : "放大脑图与详情"}
+            data-testid="design-workbench-zoom"
+            aria-label={focusOpen ? "还原工作区" : "放大工作区"}
             aria-expanded={focusOpen}
             aria-haspopup="dialog"
             onClick={toggleFocus}
@@ -739,7 +721,116 @@ export function DesignTab({
             ) : (
               <Maximize2 className="size-3.5" aria-hidden="true" />
             )}
-            <span className="hidden sm:inline">{focusOpen ? "退出放大" : "放大脑图"}</span>
+            {focusOpen ? "还原工作区" : "放大工作区"}
+          </Button>
+        </div>
+      </header>
+
+      <DesignSplitPane
+        testId="design-split-workbench"
+        topTestId="design-graph"
+        bottomTestId="design-detail"
+        defaultPercent={DEFAULT_WORKBENCH_SPLIT}
+        minPercent={MIN_GRAPH_SPLIT}
+        maxPercent={MAX_GRAPH_SPLIT}
+        storageKey={DESIGN_SPLIT_STORAGE_KEYS.workbench}
+        ariaLabel="调整用例图与用例详情高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
+        topOverflow="auto"
+        bottomOverflow="auto"
+        className="min-h-0 flex-1"
+        topClassName="[&>section]:min-h-0 [&>section]:flex-1"
+        top={
+          graph.requirements.length === 0 ? (
+            <div className="surface-card flex h-full items-center justify-center p-6">
+              <EmptyState
+                title={EMPTY_REQUIREMENTS_COPY}
+                description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
+                action={
+                  <Button size="sm" disabled={creatingConversation} onClick={createConversation}>
+                    ＋ 新建对话
+                  </Button>
+                }
+                className="border-none bg-transparent"
+              />
+            </div>
+          ) : (
+            <DesignMindmap
+              graph={graph}
+              selectedCaseId={selectedCaseId}
+              confirmingKey={confirmingKey}
+              executionResults={executionResults}
+              batchBusy={batchBusy}
+              caseReviewEnabled={canReviewCases}
+              onSelectCase={selectCase}
+              onConfirmCase={confirmCase}
+              onConfirmScenario={confirmScenario}
+              onConfirmRequirement={confirmRequirement}
+              onBatchConfirmCases={batchConfirmCases}
+              onBatchExecuteCases={batchExecuteCases}
+              onRequestAiChange={requestAiChange}
+              fitViewToken={fitViewToken}
+            />
+          )
+        }
+        bottom={
+          <CaseDetailPanel
+            versionId={versionId}
+            caseId={selectedCaseId}
+            refreshToken={detailToken}
+            confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
+            canConfirm={canReviewCases}
+            discoveryRevision={selectedDiscoveryRevision}
+            readOnly={!isAdmin}
+            onRolledBack={handleDiscoveryRolledBack}
+            onConfirm={confirmCase}
+            onRequestChange={setChatDraft}
+            onRequestAiChange={requestAiChangeForCase}
+          />
+        }
+      />
+    </div>
+  )
+
+  return (
+    <div
+      ref={workspaceRef}
+      data-testid="design-scroll"
+      data-short-viewport={shortViewport ? "true" : "false"}
+      className="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden"
+      style={{ height: workspaceHeight, overflow: "hidden" }}
+    >
+      <header data-testid="design-header" className="flex shrink-0 flex-wrap items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span
+              data-testid="design-header-version"
+              className="rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            >
+              版本 #{versionId}
+            </span>
+            <span className="text-[10px] text-muted-foreground">用例设计</span>
+            <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
+            <span data-testid="design-header-host" className="text-[10px] text-muted-foreground">
+              Design Host 单写者 · 事件通道：{sseLabel}
+            </span>
+            <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
+              需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
+              {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
+            </span>
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+            <span data-testid="design-header-context">上下文水位 —</span>
+            <span data-testid="design-header-model">模型 {effectiveModel}</span>
+          </div>
+        </div>
+        <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid="design-handoff"
+            onClick={() => setHandoffOpen(true)}
+          >
+            交接文档
           </Button>
           <Button
             size="sm"
@@ -770,7 +861,7 @@ export function DesignTab({
         <p
           data-testid="design-stage-notice"
           role="status"
-          className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-[11px] text-warning"
+          className="shrink-0 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-[11px] text-warning"
         >
           {designStageGuidance(stage)}
         </p>
@@ -779,10 +870,27 @@ export function DesignTab({
         <p
           data-testid="case-gate-notice"
           role="status"
-          className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground"
+          className="shrink-0 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground"
         >
           {caseGateGuidance(stage)}
         </p>
+      ) : null}
+
+      {showDiscoveryBar && discoveryRevision !== null ? (
+        <div data-testid="design-discovery-revision" className="shrink-0">
+          <DiscoveryRevisionNotice
+            revision={discoveryRevision}
+            readOnly={!isAdmin}
+            onRollback={rollbackDiscoveryRevision}
+            onRolledBack={handleDiscoveryRolledBack}
+          />
+        </div>
+      ) : null}
+
+      {initialExportId !== undefined ? (
+        <div data-testid="design-export-detail" className="shrink-0">
+          <ExportDetailPanel exportId={initialExportId} />
+        </div>
       ) : null}
 
       {createError !== null ? <InlineError error={createError} /> : null}
@@ -791,7 +899,7 @@ export function DesignTab({
         <p
           data-testid="design-confirm-notice"
           role="status"
-          className="rounded-lg border border-success/30 bg-success/10 px-3 py-2 text-[11px] text-success"
+          className="shrink-0 rounded-lg border border-success/30 bg-success/10 px-3 py-2 text-[11px] text-success"
         >
           {confirmNotice}
         </p>
@@ -806,22 +914,26 @@ export function DesignTab({
         />
       ) : null}
 
-      <DesignFocusDialog open={focusOpen} onClose={closeFocus}>
-        <div
-          data-testid="design-layers-scroll"
-          className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-        >
-          <div
-            ref={layersRef}
-            data-testid="design-layers"
-            className="flex min-h-0 flex-col overflow-hidden"
-            style={{ height: focusOpen ? "100%" : INLINE_TRACK_HEIGHT }}
-          >
+      {/* R-D2-1/2: chat above the workbench (40/60), each pane owns its scroll. */}
+      <DesignSplitPane
+        testId="design-split-main"
+        defaultPercent={DEFAULT_CHAT_SPLIT}
+        minPercent={MIN_CHAT_SPLIT}
+        maxPercent={MAX_CHAT_SPLIT}
+        storageKey={DESIGN_SPLIT_STORAGE_KEYS.chat}
+        ariaLabel="调整设计对话与用例工作区高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
+        topCollapsed={chatCollapsed}
+        topOverflow="hidden"
+        bottomOverflow="hidden"
+        className="min-h-0 flex-1"
+        top={
+          chatCollapsed ? (
+            <ChatTitleBar conversationTitle={chatTitle} onExpand={toggleChatCollapsed} />
+          ) : (
             <div
-              data-testid="design-layer-chat"
-              data-collapsed={chatCollapsed ? "true" : "false"}
-              className="min-h-0 overflow-auto"
-              style={effectiveChatStyle}
+              data-testid="design-chat-pane"
+              className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
+              style={{ overflow: "hidden" }}
             >
               <DesignChat
                 versionId={versionId}
@@ -837,7 +949,7 @@ export function DesignTab({
                 draftText={chatDraft}
                 onDraftTextChange={setChatDraft}
                 refreshToken={teamRoomToken}
-                collapsed={chatCollapsed}
+                collapsed={false}
                 onToggleCollapsed={toggleChatCollapsed}
                 onConversationModelChanged={applyConversationModel}
                 caseReferences={chatCaseReferences}
@@ -845,128 +957,33 @@ export function DesignTab({
                 onCaseSelect={selectCase}
               />
             </div>
-
-            <hr
-              data-testid="design-divider-chat"
-              // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
-              role="separator"
-              aria-orientation="horizontal"
-              aria-label="调整对话与脑图高度"
-              aria-valuemin={MIN_LAYER_PERCENT}
-              aria-valuemax={Math.round(chatPairTotal - MIN_LAYER_PERCENT)}
-              aria-valuenow={Math.round(layerSplits.chat)}
-              aria-disabled={chatCollapsed ? true : undefined}
-              tabIndex={chatCollapsed ? -1 : 0}
-              style={hiddenWhileFocused}
-              onPointerDown={(event) => handleDividerPointerDown("chat", event)}
-              onPointerMove={(event) => handleDividerPointerMove("chat", event)}
-              onPointerUp={() => handleDividerPointerUp("chat")}
-              onPointerCancel={() => handleDividerPointerUp("chat")}
-              onKeyDown={(event) => handleDividerKeyDown("chat", event)}
-              className={cn(
-                "group relative m-0 h-2 w-full shrink-0 touch-none select-none border-0 bg-transparent",
-                "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
-                "after:rounded-full after:bg-border after:transition-colors after:content-['']",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                chatCollapsed
-                  ? "cursor-not-allowed opacity-60"
-                  : "cursor-row-resize hover:after:bg-primary/60",
-                activeDivider === "chat" && "after:bg-primary",
-              )}
-            />
-
-            <div
-              data-testid="design-layer-mindmap"
-              className="flex min-h-0 flex-col overflow-auto [&>section]:min-h-0 [&>section]:flex-1"
-              style={effectiveMindmapStyle}
-            >
-              {graph.requirements.length === 0 ? (
-                <div className="surface-card flex h-full items-center justify-center p-6">
-                  <EmptyState
-                    title={EMPTY_REQUIREMENTS_COPY}
-                    description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
-                    action={
-                      <Button
-                        size="sm"
-                        disabled={creatingConversation}
-                        onClick={createConversation}
-                      >
-                        ＋ 新建对话
-                      </Button>
-                    }
-                    className="border-none bg-transparent"
-                  />
-                </div>
-              ) : (
-                <DesignMindmap
-                  graph={graph}
-                  selectedCaseId={selectedCaseId}
-                  confirmingKey={confirmingKey}
-                  executionResults={executionResults}
-                  batchBusy={batchBusy}
-                  caseReviewEnabled={canReviewCases}
-                  onSelectCase={selectCase}
-                  onConfirmCase={confirmCase}
-                  onConfirmScenario={confirmScenario}
-                  onConfirmRequirement={confirmRequirement}
-                  onBatchConfirmCases={batchConfirmCases}
-                  onBatchExecuteCases={batchExecuteCases}
-                  onRequestAiChange={requestAiChange}
-                  fitViewToken={fitViewToken}
-                />
-              )}
-            </div>
-
-            <hr
-              data-testid="design-divider-mindmap"
-              // biome-ignore lint/a11y/noRedundantRoles: explicit role documents the splitter contract
-              role="separator"
-              aria-orientation="horizontal"
-              aria-label="调整脑图与详情高度"
-              aria-valuemin={MIN_LAYER_PERCENT}
-              aria-valuemax={Math.round(mindmapPairTotal - MIN_LAYER_PERCENT)}
-              aria-valuenow={Math.round(layerSplits.mindmap)}
-              tabIndex={0}
-              style={hiddenWhileFocused}
-              onPointerDown={(event) => handleDividerPointerDown("mindmap", event)}
-              onPointerMove={(event) => handleDividerPointerMove("mindmap", event)}
-              onPointerUp={() => handleDividerPointerUp("mindmap")}
-              onPointerCancel={() => handleDividerPointerUp("mindmap")}
-              onKeyDown={(event) => handleDividerKeyDown("mindmap", event)}
-              className={cn(
-                "group relative m-0 h-2 w-full shrink-0 cursor-row-resize touch-none select-none border-0 bg-transparent",
-                "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
-                "after:rounded-full after:bg-border after:transition-colors after:content-[''] hover:after:bg-primary/60",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                activeDivider === "mindmap" && "after:bg-primary",
-              )}
-            />
-
-            <div
-              data-testid="design-layer-detail"
-              className="min-h-0 overflow-auto"
-              style={effectiveDetailStyle}
-            >
-              <CaseDetailPanel
-                versionId={versionId}
-                caseId={selectedCaseId}
-                refreshToken={detailToken}
-                confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
-                canConfirm={canReviewCases}
-                onConfirm={confirmCase}
-                onRequestChange={setChatDraft}
-                onRequestAiChange={requestAiChangeForCase}
-              />
-            </div>
-          </div>
-        </div>
-      </DesignFocusDialog>
+          )
+        }
+        bottom={
+          // R-D2-3: graph + detail move together into the 90vw×90vh dialog.
+          <DesignFocusDialog open={focusOpen} onClose={closeFocus}>
+            {workbench}
+          </DesignFocusDialog>
+        }
+      />
 
       <ExportCasesDialog
         versionId={versionId}
         open={exportOpen}
         onClose={() => setExportOpen(false)}
       />
+
+      <Dialog
+        open={handoffOpen}
+        onClose={() => setHandoffOpen(false)}
+        title="澄清交接文档"
+        description="需求 / 问答 / 决策 / 待决 / 计划 / 资源六块交接（只读）"
+        className="max-w-3xl"
+      >
+        <div className="max-h-[70vh] overflow-y-auto pr-1">
+          <HandoffPanel versionId={versionId} />
+        </div>
+      </Dialog>
     </div>
   )
 }

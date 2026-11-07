@@ -55,6 +55,18 @@ func (f *fakeIndexRepo) LatestRun(_ context.Context, repoID int64) (codeintel.In
 	return codeintel.IndexRun{}, codeintel.ErrNotFound
 }
 
+func (f *fakeIndexRepo) LatestDoneForVersion(_ context.Context, versionID, repoID int64) (codeintel.IndexRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := len(f.order) - 1; index >= 0; index-- {
+		run := f.runs[f.order[index]]
+		if run.VersionID == versionID && run.RepoID == repoID && run.Status == string(codeintel.IndexDone) {
+			return run, nil
+		}
+	}
+	return codeintel.IndexRun{}, codeintel.ErrNotFound
+}
+
 func (f *fakeIndexRepo) UpdateRun(_ context.Context, run codeintel.IndexRun) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -303,28 +315,32 @@ func (f *fakeWorkQueue) Fail(_ context.Context, id, epoch int64, message string,
 // --- git -------------------------------------------------------------------------
 
 type fakeGit struct {
-	resolveCommit string
-	resolveErr    error
-	head          string
-	headErr       error
-	ancestor      bool
-	ancestorErr   error
-	tree          codeintel.TreeResult
-	treeErr       error
-	diff          codeintel.DiffResult
-	diffErr       error
-	windows       map[string]codeintel.FileWindow
-	readErr       error
-	fileDiffs     map[string]codeintel.FileDiff
-	fileDiffErr   error
-	commits       map[string]codeintel.CommitInfo
-	commitErr     error
-	resolvedRefs  []string
-	readPaths     []string
+	resolveCommit  string
+	resolveErr     error
+	resolveErrRefs map[string]error
+	head           string
+	headErr        error
+	ancestor       bool
+	ancestorErr    error
+	tree           codeintel.TreeResult
+	treeErr        error
+	diff           codeintel.DiffResult
+	diffErr        error
+	windows        map[string]codeintel.FileWindow
+	readErr        error
+	fileDiffs      map[string]codeintel.FileDiff
+	fileDiffErr    error
+	commits        map[string]codeintel.CommitInfo
+	commitErr      error
+	resolvedRefs   []string
+	readPaths      []string
 }
 
 func (f *fakeGit) ResolveCommit(_ context.Context, _ string, ref string) (string, error) {
 	f.resolvedRefs = append(f.resolvedRefs, ref)
+	if err := f.resolveErrRefs[ref]; err != nil {
+		return "", err
+	}
 	if f.resolveErr != nil {
 		return "", f.resolveErr
 	}

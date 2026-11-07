@@ -310,7 +310,11 @@ func TestRunnerPersistsContextCompactionAtWindowBoundary(t *testing.T) {
 		t.Fatalf("compaction rewrote the prefix: %s -> %s", prepared.PrefixHash, compacted.PrefixHash)
 	}
 	summary := segmentContents(compacted, agentcontext.SegmentSummary)
-	if len(summary) != 1 || !strings.Contains(summary[0], "压缩后的摘要") {
+	// v0.22 fix round 1: the summary is the nine-section CompactionSummarizer
+	// contract (the old legacy LLM summary was retired) and it merges the
+	// persisted prior summary.
+	if len(summary) != 1 || !strings.Contains(summary[0], agentapp.SummarySectionHeadings()[0]) ||
+		!strings.Contains(summary[0], "更早的滚动摘要") {
 		t.Fatalf("summary segments = %#v", summary)
 	}
 	history := segmentContents(compacted, agentcontext.SegmentHistory)
@@ -318,17 +322,27 @@ func TestRunnerPersistsContextCompactionAtWindowBoundary(t *testing.T) {
 		t.Fatalf("recent history = %#v, want the 2 newest messages verbatim", history)
 	}
 	retry := requestPrompt(fixture.chat.request(2))
-	for _, folded := range []string{"消息一：需求背景", "消息二：澄清回复", "消息三：补充需求", "消息四：继续澄清"} {
-		if strings.Contains(retry, folded) {
-			t.Fatalf("compact retry replayed the folded message %q:\n%s", folded, retry)
+	// The folded messages must not be replayed as transcript segments. The
+	// rolling summary legitimately references folded user turns (历史用户: ...),
+	// so the negativity check is per message and skips the summary segment: no
+	// other prompt message may carry a folded message.
+	folded := []string{"消息一：需求背景", "消息二：澄清回复", "消息三：补充需求", "消息四：继续澄清"}
+	for _, message := range fixture.chat.request(2).Messages {
+		if strings.Contains(message.Content, agentapp.SummarySectionHeadings()[0]) {
+			continue
+		}
+		for _, want := range folded {
+			if strings.Contains(message.Content, want) {
+				t.Fatalf("compact retry replayed the folded message %q outside the summary:\n%s", want, message.Content)
+			}
 		}
 	}
-	for _, kept := range []string{"消息五：确认范围", "消息六：最新回复", "压缩后的摘要"} {
+	for _, kept := range []string{"消息五：确认范围", "消息六：最新回复", agentapp.SummarySectionHeadings()[0]} {
 		if !strings.Contains(retry, kept) {
 			t.Fatalf("compact retry misses %q:\n%s", kept, retry)
 		}
 	}
-	if len(fixture.conv.summaries) == 0 || !strings.Contains(fixture.conv.summaries[len(fixture.conv.summaries)-1], "压缩后的摘要") {
+	if len(fixture.conv.summaries) == 0 || !strings.Contains(fixture.conv.summaries[len(fixture.conv.summaries)-1], agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("conversation summaries = %#v", fixture.conv.summaries)
 	}
 	if !containsEvent(fixture.events, "context.compacted") {
@@ -362,13 +376,12 @@ func compactedEventPayload(t *testing.T, publisher *fakePublisher) map[string]an
 // its summary version.
 func TestRunnerPersistsSingleFoldedSegmentAtWindowBoundary(t *testing.T) {
 	fixture := newBriefingRunnerFixture(t)
-	fixture.settings.ints["context.keep_recent_messages"] = 2
+	fixture.settings.ints["context.keep_recent_messages"] = 1
 	fixture.conv.snapshot.Summary = ""
 	fixture.conv.snapshot.PinnedFacts = nil
 	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
 		{ID: 611, Role: "user", Text: "消息一：需求背景"},
-		{ID: 612, Role: "assistant", Text: "消息二：澄清回复"},
-		{ID: 613, Role: "user", Text: "消息三：最新补充"},
+		{ID: 612, Role: "user", Text: "消息二：最新补充"},
 	}
 	fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
 	fixture.chat.responses = []llmapp.ChatResponse{
@@ -385,24 +398,24 @@ func TestRunnerPersistsSingleFoldedSegmentAtWindowBoundary(t *testing.T) {
 	}
 	prepared := decodeStoredPacket(t, fixture.repo.packets[0])
 	compacted := decodeStoredPacket(t, fixture.repo.packets[1])
-	// The bug this pins: the folded segment is replaced by the summary segment,
+	// The bug this pins: the one folded segment is replaced by the summary segment,
 	// so the two packets have the same number of segments.
 	if len(compacted.Segments) != len(prepared.Segments) {
 		t.Fatalf("segment counts = %d -> %d, want the foldCount==1 shape (equal counts)",
 			len(prepared.Segments), len(compacted.Segments))
 	}
 	summary := segmentContents(compacted, agentcontext.SegmentSummary)
-	if len(summary) != 1 || !strings.Contains(summary[0], "单条折叠摘要") {
+	if len(summary) != 1 || !strings.Contains(summary[0], agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("summary segments = %#v", summary)
 	}
 	history := segmentContents(compacted, agentcontext.SegmentHistory)
-	if len(history) != 2 || history[0] != "消息二：澄清回复" || history[1] != "消息三：最新补充" {
-		t.Fatalf("recent history = %#v, want the 2 newest messages verbatim", history)
+	if len(history) != 1 || history[0] != "消息二：最新补充" {
+		t.Fatalf("recent history = %#v, want the newest message verbatim", history)
 	}
 
 	// The summary carried by the prompt must be persisted even though the
 	// segment count did not change.
-	if len(fixture.conv.summaries) != 1 || !strings.Contains(fixture.conv.summaries[0], "单条折叠摘要") {
+	if len(fixture.conv.summaries) != 1 || !strings.Contains(fixture.conv.summaries[0], agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("conversation summaries = %#v, want the folded summary persisted", fixture.conv.summaries)
 	}
 	payload := compactedEventPayload(t, fixture.events)
@@ -412,13 +425,55 @@ func TestRunnerPersistsSingleFoldedSegmentAtWindowBoundary(t *testing.T) {
 	}
 }
 
+// TestContextCompactedPayloadCarriesPolicyFields pins the extended R-A5-15
+// payload of a policy-aware overflow compaction: trigger, before/after/retain
+// tokens, summary version, covered_message_id and cached_tokens are all present
+// and the covered watermark is the folded message ID.
+func TestContextCompactedPayloadCarriesPolicyFields(t *testing.T) {
+	fixture := newBriefingRunnerFixture(t)
+	fixture.settings.ints["context.keep_recent_messages"] = 1
+	fixture.conv.snapshot.Summary = ""
+	fixture.conv.snapshot.PinnedFacts = nil
+	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+		{ID: 641, Role: "user", Text: "消息一：需求背景"},
+		{ID: 642, Role: "user", Text: "消息二：最新补充"},
+	}
+	fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "恢复后的回复"}}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	payload := compactedEventPayload(t, fixture.events)
+	if trigger, _ := payload["trigger"].(string); trigger != string(agentcontext.Overflow) {
+		t.Fatalf("context.compacted trigger = %#v, want overflow", payload["trigger"])
+	}
+	for _, key := range []string{
+		"before_tokens", "after_tokens", "retain_tokens", "summary_version",
+		"covered_message_id", "cached_tokens", "duration_ms", "run_id", "conversation_id",
+	} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("context.compacted payload missing %q: %#v", key, payload)
+		}
+	}
+	if covered, _ := payload["covered_message_id"].(int64); covered != 641 {
+		t.Fatalf("covered_message_id = %#v, want the folded message 641", payload["covered_message_id"])
+	}
+	if before, _ := payload["before_tokens"].(int); before <= 0 {
+		t.Fatalf("before_tokens = %#v", payload["before_tokens"])
+	}
+	if after, _ := payload["after_tokens"].(int); after <= 0 {
+		t.Fatalf("after_tokens = %#v", payload["after_tokens"])
+	}
+}
+
 // TestRunnerPersistsSingleFoldedSegmentAtPrepareBoundary covers the proactive
 // window_full boundary detected during prepare: a compaction that folds exactly
 // one segment must still publish context.compacted and persist its summary even
 // though the appended summary keeps the segment count unchanged.
 func TestRunnerPersistsSingleFoldedSegmentAtPrepareBoundary(t *testing.T) {
 	fixture := newBriefingRunnerFixture(t)
-	fixture.settings.ints["context.keep_recent_messages"] = 2
+	fixture.settings.ints["context.keep_recent_messages"] = 1
 	// Any assembled packet is "over threshold"; the round is a window_full
 	// boundary detected during prepare (not by a provider overflow).
 	fixture.settings.floats = map[string]float64{"context.compact_threshold": 0.000001}
@@ -426,8 +481,7 @@ func TestRunnerPersistsSingleFoldedSegmentAtPrepareBoundary(t *testing.T) {
 	fixture.conv.snapshot.PinnedFacts = nil
 	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
 		{ID: 621, Role: "user", Text: "消息一：需求背景"},
-		{ID: 622, Role: "assistant", Text: "消息二：澄清回复"},
-		{ID: 623, Role: "user", Text: "消息三：最新补充"},
+		{ID: 622, Role: "user", Text: "消息二：最新补充"},
 	}
 	fixture.chat.responses = []llmapp.ChatResponse{
 		{Content: "prepare 单条折叠摘要"},
@@ -442,10 +496,10 @@ func TestRunnerPersistsSingleFoldedSegmentAtPrepareBoundary(t *testing.T) {
 	}
 	packet := decodeStoredPacket(t, fixture.repo.packets[0])
 	summary := segmentContents(packet, agentcontext.SegmentSummary)
-	if len(summary) != 1 || !strings.Contains(summary[0], "prepare 单条折叠摘要") {
+	if len(summary) != 1 || !strings.Contains(summary[0], agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("summary segments = %#v", summary)
 	}
-	if len(fixture.conv.summaries) != 1 || !strings.Contains(fixture.conv.summaries[0], "prepare 单条折叠摘要") {
+	if len(fixture.conv.summaries) != 1 || !strings.Contains(fixture.conv.summaries[0], agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("conversation summaries = %#v, want the folded summary persisted", fixture.conv.summaries)
 	}
 	payload := compactedEventPayload(t, fixture.events)
@@ -461,13 +515,19 @@ func TestRunnerPersistsSingleFoldedSegmentAtPrepareBoundary(t *testing.T) {
 func TestRunnerSecondOverflowFoldsMoreHistory(t *testing.T) {
 	fixture := newBriefingRunnerFixture(t)
 	fixture.settings.ints["context.keep_recent_messages"] = 2
+	// The rescue budget is configurable (compaction.overflow_retries, default 1);
+	// this test exercises the second retry, so it needs a budget of two.
+	fixture.settings.ints["compaction.overflow_retries"] = 2
 	fixture.conv.snapshot.Summary = ""
 	fixture.conv.snapshot.PinnedFacts = nil
+	// Large messages make the folded transcript strictly larger than the
+	// nine-section summary, so both compactions reduce the prompt and the
+	// R-A5-11 thrashing guard does not stop the second retry.
+	longText := strings.Repeat("需求背景补充。", 300)
 	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
-		{ID: 631, Role: "user", Text: "消息一：需求背景"},
-		{ID: 632, Role: "assistant", Text: "消息二：澄清回复"},
-		{ID: 633, Role: "user", Text: "消息三：补充需求"},
-		{ID: 634, Role: "assistant", Text: "消息四：最新回复"},
+		{ID: 631, Role: "user", Text: "消息一：需求背景" + longText},
+		{ID: 632, Role: "user", Text: "消息二：澄清回复" + longText},
+		{ID: 633, Role: "user", Text: "消息三：补充需求" + longText},
 	}
 	overflow := fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)
 	fixture.chat.errors = []error{overflow, nil, overflow, nil, nil}
@@ -496,7 +556,7 @@ func TestRunnerSecondOverflowFoldsMoreHistory(t *testing.T) {
 		t.Fatalf("second compacted history = %#v, want the halved window of 1", secondHistory)
 	}
 	if summary := segmentContents(second, agentcontext.SegmentSummary); len(summary) != 1 ||
-		!strings.Contains(summary[0], "第二次摘要") {
+		!strings.Contains(summary[0], agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("second compacted summary = %#v", summary)
 	}
 
@@ -507,10 +567,10 @@ func TestRunnerSecondOverflowFoldsMoreHistory(t *testing.T) {
 		t.Fatalf("chat requests = %d, want overflow, summary, overflow, summary, final", len(fixture.chat.requests))
 	}
 	secondRetry := requestPrompt(fixture.chat.request(4))
-	if strings.Contains(secondRetry, "消息三：补充需求") {
+	if strings.Contains(secondRetry, "消息二：澄清回复") {
 		t.Fatalf("second retry replayed the folded message:\n%s", secondRetry)
 	}
-	if !strings.Contains(secondRetry, "消息四：最新回复") || !strings.Contains(secondRetry, "第二次摘要") {
+	if !strings.Contains(secondRetry, "消息三：补充需求") || !strings.Contains(secondRetry, agentapp.SummarySectionHeadings()[0]) {
 		t.Fatalf("second retry misses the retained recent window/summary:\n%s", secondRetry)
 	}
 	if len(fixture.chat.request(4).Messages) >= len(fixture.chat.request(2).Messages) {
@@ -576,7 +636,7 @@ func TestPrefixStableAcrossWorkItems(t *testing.T) {
 		}
 	}
 	for _, stable := range []string{
-		"[profile:case_author]", "版本目标: 订单系统", "阶段: clarifying",
+		"[profile:design_author]", "版本目标: 订单系统", "阶段: clarifying",
 	} {
 		if !strings.Contains(firstPrefix.Content, stable) {
 			t.Fatalf("stable prefix is missing %q:\n%s", stable, firstPrefix.Content)
@@ -767,10 +827,29 @@ func TestTaskContextSurvivesWindowFull(t *testing.T) {
 	t.Run("execution task", func(t *testing.T) {
 		provider := &fakeTaskProvider{task: executionTaskFixture()}
 		fixture := newRunnerFixtureWithTaskProvider(t, provider)
+		// An execution run has no Host conversation, so give the overflow
+		// rebuild real transcript to fold: the retry must still carry the task
+		// block even though the packet base was replaced.
+		fixture.settings.ints["context.keep_recent_messages"] = 1
+		fixture.conv.snapshot.Summary = ""
+		fixture.conv.snapshot.PinnedFacts = nil
+		fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+			{ID: 711, Role: "user", Text: "消息一：需求背景"},
+			{ID: 712, Role: "assistant", Text: "消息二：澄清回复"},
+			{ID: 713, Role: "user", Text: "消息三：最新回复"},
+		}
 		fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
-		fixture.chat.responses = []llmapp.ChatResponse{{Content: "恢复后的回复"}}
+		fixture.chat.responses = []llmapp.ChatResponse{
+			{Content: "不应被采用的回复"},
+			{Content: "窗口压缩摘要"},
+			{Content: "恢复后的回复"},
+		}
+		item := fakeWorkItem(agentapp.WorkTypeExecuteCase, agentapp.WorkItemPayload{
+			ConversationID: 20, IntentID: 1001, WaveID: 2001, CaseRunID: 3001, CaseVersionID: 41,
+			DispatchEpoch: 3, DispatchToken: "dispatch-token",
+		})
 
-		if _, err := mustRun(t, fixture, p3CaseItem()); err != nil {
+		if _, err := mustRun(t, fixture, item); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		if len(fixture.repo.packets) != 2 {
@@ -780,10 +859,10 @@ func TestTaskContextSurvivesWindowFull(t *testing.T) {
 		if compacted.InvalidationReason != string(agentcontext.InvalidationWindowFull) {
 			t.Fatalf("invalidation reason = %q, want window_full", compacted.InvalidationReason)
 		}
-		if len(fixture.chat.requests) != 2 {
-			t.Fatalf("chat requests = %d, want overflow, retry", len(fixture.chat.requests))
+		if len(fixture.chat.requests) != 3 {
+			t.Fatalf("chat requests = %d, want overflow, summary, retry", len(fixture.chat.requests))
 		}
-		retry := fixture.chat.request(1)
+		retry := fixture.chat.request(2)
 		last := retry.Messages[len(retry.Messages)-1]
 		if last.Role != "user" {
 			t.Fatalf("retry last message role = %q, want the re-appended user turn", last.Role)

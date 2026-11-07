@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
@@ -212,5 +213,23 @@ func TestTaskContextNotDuplicatedOnEmptyPrefix(t *testing.T) {
 	}}}
 	if got := systemMessageText(packet, in); got != "[stable-prefix]" {
 		t.Fatalf("systemMessageText(packet) = %q, want the persisted prefix", got)
+	}
+}
+
+// TestVersionPackRendersEnvironmentDatabases pins R-E1-2 discoverability: the
+// bound databases reach the model through the rendered version pack, including
+// the database_id used by db assertions, so it never has to guess one.
+func TestVersionPackRendersEnvironmentDatabases(t *testing.T) {
+	pack := VersionPack{
+		VersionID: 10, Title: "订单系统 Q4", Status: "running",
+		Databases: []tools.DatabaseSummary{
+			{ID: "1501", Name: "order_db", Kind: "postgres", ReadOnly: true},
+		},
+	}
+	content := versionPackContent(pack)
+	for _, want := range []string{"1501", "order_db", "postgres", "read_only=true"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("version pack misses database material %q:\n%s", want, content)
+		}
 	}
 }

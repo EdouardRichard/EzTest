@@ -509,3 +509,67 @@ func TestSearchWithoutTitleReaderKeepsTitlesEmpty(t *testing.T) {
 		t.Fatal("degraded = true without a title reader, want an unwired decoration to stay silent")
 	}
 }
+
+// fakeLimits is the minimal settings port used by the W1-2 wiring tests.
+type fakeLimits struct {
+	ints map[string]int64
+	err  error
+}
+
+func (f *fakeLimits) Int(_ context.Context, key string) (int64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	value, ok := f.ints[key]
+	if !ok {
+		return 0, errors.New("setting not found")
+	}
+	return value, nil
+}
+
+// TestSearchDefaultPerTypeLimitFromSettings pins the W1-2 wiring of
+// search.max_results_per_type: a zero (unspecified) limit resolves the catalog
+// setting, clamps it into the 1..20 contract range and is passed to every
+// provider. An explicit limit still wins.
+func TestSearchDefaultPerTypeLimitFromSettings(t *testing.T) {
+	cases := []struct {
+		name        string
+		setting     int64
+		limit       int
+		readerError bool
+		want        int
+	}{
+		{name: "setting default", setting: 3, limit: 0, want: 3},
+		{name: "explicit limit wins", setting: 3, limit: 7, want: 7},
+		{name: "setting clamps above max", setting: 500, limit: 0, want: MaxLimit},
+		{name: "setting clamps below min", setting: 0, limit: 0, want: MinLimit},
+		{name: "unreadable setting falls back", setting: 3, limit: 0, readerError: true, want: DefaultLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			providers, fakes := allProviders(100)
+			reader := &fakeLimits{ints: map[string]int64{"search.max_results_per_type": tc.setting}}
+			if tc.readerError {
+				reader.err = errors.New("settings unavailable")
+			}
+			snapshot, err := NewService(providers).SetLimits(reader).
+				Search(context.Background(), "order", []string{TypeVersion, TypeCase}, tc.limit)
+			if err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			for typeName, provider := range fakes {
+				if typeName != TypeVersion && typeName != TypeCase {
+					continue
+				}
+				if provider.limit != tc.want {
+					t.Fatalf("%s provider limit = %d, want %d", typeName, provider.limit, tc.want)
+				}
+			}
+			for _, group := range snapshot.Groups {
+				if len(group.Items) != tc.want {
+					t.Fatalf("%s group items = %d, want %d", group.Type, len(group.Items), tc.want)
+				}
+			}
+		})
+	}
+}

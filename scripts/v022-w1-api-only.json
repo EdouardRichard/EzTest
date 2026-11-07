@@ -1,0 +1,166 @@
+{
+  "version": "0.22",
+  "wave": "W1-3",
+  "baseline": "325694e6",
+  "plan": "docs/superpowers/plans/2026-11-05-eztest-v0.22-w1-plan.md",
+  "routes": [
+    {
+      "method": "get",
+      "path": "/api/admin/settings/{key}",
+      "disposition": "x-api-only",
+      "evidence": "backend/internal/server/server.go:407"
+    },
+    {
+      "method": "get",
+      "path": "/api/admin/settings/revisions",
+      "disposition": "x-api-only",
+      "evidence": "backend/internal/server/server.go:406"
+    },
+    {
+      "method": "get",
+      "path": "/api/admin/llm/configs/{id}",
+      "disposition": "x-api-only",
+      "evidence": "backend/internal/server/server.go:421"
+    },
+    {
+      "method": "get",
+      "path": "/api/knowledge/search",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/knowledge/KnowledgeSearchPanel.tsx",
+      "apiFunction": "searchKnowledge",
+      "apiModule": "frontend/src/features/knowledge/api.ts",
+      "evidence": "backend/internal/knowledge/interfaces/httpapi/routes.go:31"
+    },
+    {
+      "method": "get",
+      "path": "/api/versions/{id}/conversations/{cid}/messages/{mid}/parts",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/conversation/MessagePartsPanel.tsx",
+      "apiFunction": "getMessageParts",
+      "apiModule": "frontend/src/features/conversation/api.ts",
+      "evidence": "backend/internal/version/interfaces/httpapi/message_parts_handler.go:74"
+    },
+    {
+      "method": "get",
+      "path": "/api/exports/{exportId}",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/design/ExportDetailPanel.tsx",
+      "apiFunction": "getExport",
+      "apiModule": "frontend/src/features/design/api.ts",
+      "evidence": "backend/internal/server/server.go:505"
+    },
+    {
+      "method": "get",
+      "path": "/api/versions/{id}/facts",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/versions/FactsPanel.tsx",
+      "apiFunction": "getVersionFacts",
+      "apiModule": "frontend/src/features/versions/api.ts",
+      "evidence": "backend/internal/version/interfaces/httpapi/version_read_handler.go:74"
+    },
+    {
+      "method": "get",
+      "path": "/api/versions/{id}/work-items",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/versions/WorkItemsPanel.tsx",
+      "apiFunction": "listWorkItems",
+      "apiModule": "frontend/src/features/versions/api.ts",
+      "evidence": "backend/internal/version/interfaces/httpapi/version_read_handler.go:76"
+    },
+    {
+      "method": "get",
+      "path": "/api/versions/{id}/work-items/{workItemId}",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/versions/WorkItemDetailPanel.tsx",
+      "apiFunction": "getWorkItem",
+      "apiModule": "frontend/src/features/versions/api.ts",
+      "evidence": "backend/internal/version/interfaces/httpapi/version_read_handler.go:77"
+    },
+    {
+      "method": "get",
+      "path": "/api/versions/{id}/context-packets/latest",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/conversation/ContextPacketCard.tsx",
+      "apiFunction": "getLatestContextPacket",
+      "apiModule": "frontend/src/features/conversation/api.ts",
+      "evidence": "backend/internal/agent/interfaces/httpapi/agent_center_routes.go:61"
+    },
+    {
+      "method": "get",
+      "path": "/api/admin/executors",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/settings/ExecutorsPanel.tsx",
+      "apiFunction": "listAdminExecutors",
+      "apiModule": "frontend/src/features/settings/api.ts",
+      "evidence": "backend/internal/execution/interfaces/httpapi/routes.go:48"
+    },
+    {
+      "method": "get",
+      "path": "/api/quality/eval-runs/{id}",
+      "disposition": "x-api-only",
+      "evidence": "backend/internal/quality/interfaces/httpapi/routes.go:15"
+    },
+    {
+      "method": "post",
+      "path": "/api/versions/{id}/stage/reject",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/versions/StageRejectAction.tsx",
+      "apiFunction": "rejectStage",
+      "apiModule": "frontend/src/features/versions/api.ts",
+      "evidence": "backend/internal/server/server.go:475"
+    },
+    {
+      "method": "post",
+      "path": "/api/versions/{id}/stage/advance",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/versions/StageAdvanceAction.tsx",
+      "apiFunction": "advanceStage",
+      "apiModule": "frontend/src/features/versions/api.ts",
+      "evidence": "backend/internal/server/server.go:477"
+    },
+    {
+      "method": "get",
+      "path": "/api/versions/{id}/handoff",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/design/HandoffPanel.tsx",
+      "apiFunction": "getVersionHandoff",
+      "apiModule": "frontend/src/features/design/api.ts",
+      "evidence": "backend/internal/server/w0_routes.go:62"
+    },
+    {
+      "method": "post",
+      "path": "/api/versions/{id}/facts/{fid}/arbitrate",
+      "disposition": "ui",
+      "frontendFile": "frontend/src/features/versions/FactArbitrationCard.tsx",
+      "apiFunction": "arbitrateFact",
+      "apiModule": "frontend/src/features/versions/api.ts",
+      "evidence": "backend/internal/version/interfaces/httpapi/fact_handler.go:49"
+    }
+  ],
+  "infraExempt": [
+    {
+      "method": "get",
+      "path": "/api/health",
+      "disposition": "infra-exempt",
+      "evidence": "backend/internal/server/health.go:34"
+    },
+    {
+      "method": "get",
+      "path": "/api/health/ready",
+      "disposition": "infra-exempt",
+      "evidence": "backend/internal/orchestration/interfaces/httpapi/routes.go:15"
+    },
+    {
+      "method": "post",
+      "path": "/api/internal/executors/register",
+      "disposition": "infra-exempt",
+      "evidence": "backend/internal/execution/interfaces/httpapi/routes.go:61"
+    },
+    {
+      "method": "post",
+      "path": "/api/internal/executors/heartbeat",
+      "disposition": "infra-exempt",
+      "evidence": "backend/internal/execution/interfaces/httpapi/routes.go:62"
+    }
+  ]
+}

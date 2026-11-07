@@ -1,10 +1,12 @@
 package versionapp_test
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
@@ -100,8 +102,8 @@ func TestSendBlockedForNonVisionImage(t *testing.T) {
 	if _, ok := env.queue.find("chat.turn", "reply:"+idString(message.ID)); !ok {
 		t.Fatalf("vision send did not enqueue chat.turn: %#v", env.queue.tasks)
 	}
-	if _, ok := env.queue.find("requirement.curate", "curate:"+idString(message.ID)); !ok {
-		t.Fatalf("vision send did not enqueue requirement.curate: %#v", env.queue.tasks)
+	if _, ok := env.queue.find("requirement.curate", "curate:"+idString(message.ID)); ok {
+		t.Fatalf("v0.22 removed requirement.curate but it was enqueued: %#v", env.queue.tasks)
 	}
 }
 
@@ -133,5 +135,63 @@ func TestSendBlockedForNonVisionUploadedImage(t *testing.T) {
 	}
 	if got := len(env.repo.messages[env.conversation.ID]); got != 0 {
 		t.Fatalf("rejected uploaded image stored %d messages", got)
+	}
+}
+
+// TestImageBearingDocumentSendRequiresVision covers the end-to-end send path
+// for a document attachment: the first post registers the upload and returns
+// the 409 parsing gate, the ingest fails explicitly because no vision model is
+// configured, the retry is rejected with the typed ErrVisionRequired before a
+// message row is stored, and after the vision model is configured a reanalyze
+// makes the same draft sendable.
+func TestImageBearingDocumentSendRequiresVision(t *testing.T) {
+	env := newImageConversationEnv(t)
+	env.attachments.vision.available = false
+	sha := strings.Repeat("d", 64)
+	data := []byte("docx")
+	env.attachments.store.put(sha, data, docxMIME)
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "看下这个文档"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "with-image.docx", MIME: docxMIME, Size: int64(len(data))},
+	}
+
+	if _, err := env.svc.PostUserMessage(requestContext(), env.versionID, env.conversation.ID, parts, "doc-image-1", 42); err == nil {
+		t.Fatal("first send of a parsing document was accepted")
+	} else if code := apiError(t, err).Code; code != versionapp.AttachmentPendingCode {
+		t.Fatalf("first send code = %q, want %q", code, versionapp.AttachmentPendingCode)
+	}
+	var attachmentID int64
+	for id := range env.attachments.repo.attachments {
+		attachmentID = id
+	}
+	env.attachments.extractor.result = versionapp.ExtractionResult{
+		Text: "登录界面示意", Images: []versionapp.ExtractionImage{fakeExtractedImage()},
+		Coverage: versionapp.ExtractionCoverage{Found: 2, Parsed: 2, ImagesFound: 1, ImagesParsed: 1},
+	}
+	if _, err := env.attachments.svc.Extract(requestContext(), attachmentID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	if _, err := env.svc.PostUserMessage(requestContext(), env.versionID, env.conversation.ID, parts, "doc-image-2", 42); !errors.Is(err, version.ErrVisionRequired) {
+		t.Fatalf("send err = %v, want ErrVisionRequired", err)
+	} else if apiErr := apiError(t, err); apiErr.Status != http.StatusBadRequest || apiErr.Code != version.AttachmentErrorVisionRequired {
+		t.Fatalf("send error = %#v, want typed 400 vision_required", apiErr)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 {
+		t.Fatalf("rejected image document was stored: %#v", env.repo.messages[env.conversation.ID])
+	}
+
+	// Configuring vision and reanalyzing makes the same draft sendable.
+	env.attachments.vision.available = true
+	env.attachments.vision.caption = "登录界面：手机号与验证码"
+	if _, err := env.attachments.svc.Reanalyze(requestContext(), attachmentID); err != nil {
+		t.Fatalf("Reanalyze: %v", err)
+	}
+	message, err := env.svc.PostUserMessage(requestContext(), env.versionID, env.conversation.ID, parts, "doc-image-3", 42)
+	if err != nil {
+		t.Fatalf("send after reanalyze: %v", err)
+	}
+	if message.ID <= 0 || len(env.repo.messages[env.conversation.ID]) != 1 {
+		t.Fatalf("message = %#v", message)
 	}
 }

@@ -121,8 +121,12 @@ export type LLMModel = {
   config_id: string
   model: string
   display_name: string
+  /** Raw tokens; the admin UI renders the value in K (1K = 1000 tokens). */
   context_window: number
+  /** Raw tokens; the admin UI renders the value in K (1K = 1000 tokens). */
   max_output: number
+  /** Derived read-only input budget in raw tokens (0.22 API, v0.22 A §4.1). */
+  max_input?: number
   supports_tools: boolean
   supports_vision: boolean
   /** 0.2.1 capability set; optional for older/partial payloads. */
@@ -130,6 +134,12 @@ export type LLMModel = {
   /** Deprecated catalog rows stay visible but are not selectable. */
   deprecated?: boolean
   source: LLMModelSource
+  /**
+   * Provenance of context_window / max_output: `manual` values survive a
+   * catalog refresh; only reset-params hands them back to `catalog` (A §4.2).
+   */
+  window_source?: LLMModelSource
+  output_source?: LLMModelSource
   status: LLMStatus
   created_at: string
   updated_at: string
@@ -176,9 +186,13 @@ export type AddLLMModelInput = {
   supports_prompt_cache?: boolean
 }
 
-/** Partial capability patch for an existing model (admin capability editor). */
+/**
+ * Partial per-model patch (admin model editor). Numeric fields are raw tokens:
+ * the UI converts its K inputs before calling this layer (A §4.3).
+ */
 export type UpdateLLMModelInput = {
   context_window?: number
+  max_output?: number
   supports_tools?: boolean
   supports_vision?: boolean
   supports_reasoning?: boolean
@@ -237,6 +251,16 @@ export function updateLLMModel(
 export function deleteLLMModel(configId: string, modelId: string): Promise<void> {
   return apiDelete<void>(
     `/api/admin/llm/configs/${encodeURIComponent(configId)}/models/${encodeURIComponent(modelId)}`,
+  )
+}
+
+/**
+ * Restores a model's window/output to the last catalog-refresh snapshot and
+ * flips both field sources back to `catalog` (R-A1-4).
+ */
+export function resetLLMModelParams(configId: string, modelId: string): Promise<LLMModel> {
+  return apiPost<LLMModel>(
+    `/api/admin/llm/configs/${encodeURIComponent(configId)}/models/${encodeURIComponent(modelId)}/reset-params`,
   )
 }
 
@@ -417,6 +441,54 @@ export function createGCRun(mode: GCRunMode, confirm?: boolean): Promise<GCRun> 
 /** `GET /api/admin/gc/runs/{gcRunId}`: run + tombstones. */
 export function getGCRun(id: string): Promise<GCRunDetail> {
   return apiGet<GCRunDetail>(`/api/admin/gc/runs/${encodeURIComponent(id)}`)
+}
+
+// --- Admin executors (read-only roster) ------------------------------------
+
+/** `execution.ExecutorStatus`; `degraded` is registry state, never a label. */
+export type AdminExecutorStatus = "active" | "draining" | "offline"
+
+/** `ExecutorView` from `GET /api/admin/executors` (no token hash). */
+export type AdminExecutor = {
+  id: string
+  name: string
+  endpoint: string
+  status: AdminExecutorStatus
+  capacity: number
+  active_contexts: number
+  labels: Record<string, unknown>
+  last_heartbeat: string | null
+  version: string
+  last_error: string
+}
+
+/**
+ * GET /api/admin/executors — the admin-only executor registry projection.
+ * The read model is health/status only; drain/activate remain separate write
+ * routes and are intentionally not offered by the read-only panel.
+ */
+export function listAdminExecutors(): Promise<AdminExecutor[]> {
+  return apiGet<AdminExecutor[]>("/api/admin/executors")
+}
+
+/** D8 probe outcome: token accepted, token rejected/missing, or executor down. */
+export type ExecutorAuthStatus = "ok" | "unauthenticated" | "unreachable"
+
+/** `POST /api/admin/executors/{id}/check` result (token is never returned). */
+export type ExecutorAuthCheck = {
+  executor_id: string
+  endpoint: string
+  auth_status: ExecutorAuthStatus
+  detail: string
+}
+
+/**
+ * Probes the executor with the configured `execution.executor_token` over its
+ * bearer-protected route. Unlike the roster heartbeat this distinguishes an
+ * unreachable executor from one that rejects the token (D8).
+ */
+export function checkExecutorAuth(id: string): Promise<ExecutorAuthCheck> {
+  return apiPost<ExecutorAuthCheck>(`/api/admin/executors/${encodeURIComponent(id)}/check`)
 }
 
 // --- Admin instances -------------------------------------------------------

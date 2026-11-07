@@ -30,6 +30,18 @@ func (a *Adapter) GetAttachment(ctx context.Context, versionID, attachmentID int
 	if info.RequirementID != nil {
 		requirementID = *info.RequirementID
 	}
+	images := make([]agentapp.AttachmentImageInfo, 0, len(info.Images))
+	for _, image := range info.Images {
+		images = append(images, agentapp.AttachmentImageInfo{
+			ID: image.ID, Seq: image.Seq, SHA256: image.SHA256, MIME: image.MIME,
+			Width: image.Width, Height: image.Height, SourceKind: image.SourceKind,
+			Status: image.Status, Caption: image.Caption, Error: image.Error,
+		})
+	}
+	imageTokens := info.ImageTokens
+	if imageTokens <= 0 && len(images) > 0 {
+		imageTokens = len(images) * agentapp.AttachmentImageTokenBudget
+	}
 	return agentapp.AttachmentInfo{
 		ID:             info.ID,
 		ConversationID: 0,
@@ -40,6 +52,8 @@ func (a *Adapter) GetAttachment(ctx context.Context, versionID, attachmentID int
 		Error:          attachmentError(info.ErrorCode, info.ErrorText),
 		Text:           info.Text,
 		TotalChars:     info.TotalChars,
+		Images:         images,
+		ImageTokens:    imageTokens,
 	}, nil
 }
 

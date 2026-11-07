@@ -565,7 +565,7 @@ func gapFact(versionID int64, cfg GapAnalysisConfig, gap GapItem) version.Fact {
 		Key:        gapFactKey(cfg.EnvironmentID, gap),
 		Payload:    payload,
 		Confidence: &confidence,
-		Source:     "explorer",
+		Source:     "p9",
 		SourceRef:  gap.Target,
 	}
 }

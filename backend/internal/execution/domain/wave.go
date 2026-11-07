@@ -125,8 +125,13 @@ type RunWave struct {
 	PauseReason string
 	PauseMode   string
 	ReportID    *int64
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// ScopeSnapshot is the frozen effective scope of the wave (R-C5-1): the
+	// version_sut page/API/database/account/repository id sets captured when the
+	// wave is planned. It is written once and never updated, so a rerun of the
+	// same wave observes the same scope even if the version binding changed.
+	ScopeSnapshot string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // PauseModeOrDefault returns the effective pause mode.

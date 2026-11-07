@@ -6,18 +6,18 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
-// TestAccount is one credential set used by tests in a SUT environment.
+// TestAccount is one credential set of the global test-account pool (v0.22
+// R-C1-2/DB-15). Accounts are no longer owned by a SUT or environment; a version
+// opts into a subset through version_account.
 type TestAccount struct {
-	ID            int64
-	SUTID         int64
-	EnvironmentID int64
-	Username      string
-	Password      string
-	Roles         []string
-	Notes         string
-	Status        string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID        int64
+	Username  string
+	Password  string
+	Roles     []string
+	Notes     string
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Validate checks account fields for creation; password is required.

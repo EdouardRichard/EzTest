@@ -31,9 +31,23 @@ const (
 	EventHumanCreated      = "human_request.created"
 	EventHumanResolved     = "human_request.resolved"
 	EventHumanExpired      = "human_request.expired"
+	EventQuestionCreated   = "question.created"
+	EventQuestionAnswered  = "question.answered"
+	EventQuestionExpired   = "question.expired"
+	EventQuestionReopened  = "question.reopened"
+	EventQuestionSkipped   = "question.skipped"
+	// v0.22 R-W2-1 version-level decision requests.
+	EventApprovalRequested = "approval.requested"
+	EventApprovalDecided   = "approval.decided"
 	EventFailureCandidate  = "execution.failure_candidate"
 	EventCoverageGap       = "execution.coverage_gap"
 )
+
+// EventVersionScopeSnapshotCreated announces the frozen effective scope of a
+// newly planned wave (R-EX-4/EV-11). It is published after wave.created on the
+// version channel; the payload carries the decimal version/wave IDs and the
+// snapshot frozen_at timestamp.
+const EventVersionScopeSnapshotCreated = "version.scope.snapshot_created"
 
 // publishEvent publishes one event to the version channel. Publishing is
 // best-effort and never fails the business write.

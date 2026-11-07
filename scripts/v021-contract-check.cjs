@@ -1147,10 +1147,12 @@ check(
 )
 
 // ---------------------------------------------------------------------------
-// Task 85 (Release-T1): docs/openapi/api.yaml is the public release artifact.
-// It is a whole port of the frozen 0.2.1 contract, never a partial splice of
-// the 0.2.0-p8 snapshot: identity flips to 0.2.1 while the P0-P8 history
-// paragraphs stay, and every path/operation/schema equals the frozen file.
+// Task 85 (Release-T1) + v0.22 additive policy (Task 37 fix round 1):
+// docs/openapi/api.yaml is the public release artifact. The 0.2.1 baseline is a
+// whole port of the frozen contract (identity flips to 0.2.1 while the P0-P8
+// history paragraphs stay), and every 0.2.1 path/operation/schema must remain
+// present and unchanged. v0.22 W0 may append additive paths/operations/schemas:
+// extras are allowed and reported, missing/renamed 0.2.1 entries are not.
 // ---------------------------------------------------------------------------
 const releaseFile = path.join(root, "docs", "openapi", "api.yaml")
 check(fs.existsSync(releaseFile), "docs/openapi/api.yaml exists")
@@ -1216,8 +1218,8 @@ const releaseSchemaNames = componentSchemaNames(release)
 const frozenSchemaNames = componentSchemaNames(openapi)
 
 check(
-  releasePaths.size === 181 && releaseOperationCount === 222 && releaseSchemaCount === 281,
-  `release openapi carries the 0.2.1 totals 181/222/281 (got ${releasePaths.size}/${releaseOperationCount}/${releaseSchemaCount})`,
+  releasePaths.size >= 181 && releaseOperationCount >= 222 && releaseSchemaCount >= 281,
+  `release openapi keeps the 0.2.1 baseline 181/222/281 (got ${releasePaths.size}/${releaseOperationCount}/${releaseSchemaCount}; additive extras allowed)`,
 )
 for (const [route, method, label] of apiChecks) {
   check(Boolean(releasePaths.get(route)?.has(method)), `release openapi ${method.toUpperCase()} ${route} (${label})`)
@@ -1225,37 +1227,50 @@ for (const [route, method, label] of apiChecks) {
 for (const schema of schemaChecks) {
   check(releaseSchemaNames.has(schema), `release openapi schema ${schema}`)
 }
-// Release paths/operations/schemas must equal the frozen 0.2.1 contract exactly:
-// no missing route and no release-only invention.
-const samePathMap =
-  releasePaths.size === openapiPaths.size &&
-  [...openapiPaths].every(([route, methods]) => {
-    const releaseMethods = releasePaths.get(route)
-    return (
-      Boolean(releaseMethods) &&
-      releaseMethods.size === methods.size &&
-      [...methods].every((method) => releaseMethods.has(method))
-    )
-  })
+// Release paths/operations/schemas are a SUPERSET of the frozen 0.2.1
+// contract: no 0.2.1 route/method/schema may disappear or be renamed, while
+// v0.22 additive extras are allowed and reported (they are asserted by
+// scripts/v022-contract-check.cjs). This keeps the frozen gate meaningful
+// without freezing the additive v0.22 evolution of the release artifact.
+const missingReleasePaths = [...openapiPaths].filter(([route, methods]) => {
+  const releaseMethods = releasePaths.get(route)
+  return !releaseMethods || [...methods].some((method) => !releaseMethods.has(method))
+})
 check(
-  samePathMap,
-  `release openapi paths/operations exactly match the frozen contract (${openapiPaths.size} paths / ${openapiOperationCount} operations)`,
+  missingReleasePaths.length === 0,
+  `release openapi keeps every 0.2.1 path/operation (missing ${missingReleasePaths.length}: ${missingReleasePaths
+    .map(([route]) => route)
+    .join(", ")})`,
 )
-const sameSchemaSet =
-  releaseSchemaNames.size === frozenSchemaNames.size &&
-  [...frozenSchemaNames].every((schema) => releaseSchemaNames.has(schema))
+const extraReleasePaths = [...releasePaths].filter(([route, methods]) => {
+  const frozenMethods = openapiPaths.get(route)
+  return !frozenMethods || [...methods].some((method) => !frozenMethods.has(method))
+})
+if (extraReleasePaths.length > 0) {
+  console.log(
+    `info: v0.22 additive paths/operations beyond the 0.2.1 baseline: ${extraReleasePaths.length} path item(s) / ${extraReleasePaths.reduce(
+      (total, [, methods]) => total + methods.size,
+      0,
+    )} operation(s) (allowed)`,
+  )
+}
+const missingReleaseSchemas = [...frozenSchemaNames].filter((schema) => !releaseSchemaNames.has(schema))
 check(
-  sameSchemaSet,
-  `release openapi schemas exactly match the frozen contract (${openapiSchemaCount} schemas)`,
+  missingReleaseSchemas.length === 0,
+  `release openapi keeps every 0.2.1 schema (missing ${missingReleaseSchemas.length}: ${missingReleaseSchemas.join(", ")})`,
 )
-// Whole-port proof, not a partial splice: every section after identity is
-// byte-identical to the frozen contract (servers/security/tags/paths/components).
-const releaseBody = release.slice(release.indexOf("\nservers:"))
-const frozenBody = openapi.slice(openapi.indexOf("\nservers:"))
+const extraReleaseSchemas = [...releaseSchemaNames].filter((schema) => !frozenSchemaNames.has(schema))
+if (extraReleaseSchemas.length > 0) {
+  console.log(`info: v0.22 additive schemas beyond the 0.2.1 baseline: ${extraReleaseSchemas.length} (allowed)`)
+}
+// The additive section must be the documented W0 block, not an unrecorded
+// splice: the release artifact carries the v0.22 marker and the 0.2.1
+// provenance/history stays visible.
 check(
-  releaseBody.length > 0 && releaseBody === frozenBody,
-  "release openapi body (servers/security/tags/paths/components) is a whole port of the frozen contract",
+  release.includes("v0.22 W0 增量（Task 37，additive）"),
+  "release openapi documents the v0.22 W0 additive section",
 )
+check(/Task 85/.test(release), "release openapi keeps the Task 85 0.2.1 provenance")
 
 for (const [needle, label] of [
   ["enum: [job_card]", "job_card message part"],
@@ -1284,6 +1299,20 @@ check(
   /node scripts\/v021-contract-check\.cjs/.test(releaseReadme),
   "release README documents the release gate command",
 )
+check(
+  /v0\.22/.test(releaseReadme) && /additive/.test(releaseReadme),
+  "release README documents the v0.22 additive policy",
+)
+check(
+  releaseReadme.includes("v022-contract-check.cjs"),
+  "release README documents the v0.22 additive contract check",
+)
+check(
+  releaseReadme.includes(`${releasePaths.size} paths`) &&
+    releaseReadme.includes(`${releaseOperationCount} operations`) &&
+    releaseReadme.includes(`${releaseSchemaCount} schemas`),
+  `release README reports the current additive artifact counts (${releasePaths.size}/${releaseOperationCount}/${releaseSchemaCount})`,
+)
 
 // ---------------------------------------------------------------------------
 // Result. Counts are derived from the parsed catalogs above, not hardcoded.
@@ -1308,8 +1337,10 @@ check(summary.kinds === 11, `summary work_item kind count = 11 (got ${summary.ki
 check(summary.roles === 7, `summary role count = 7 (got ${summary.roles})`)
 check(summary.createdBy === 4, `summary created_by count = 4 (got ${summary.createdBy})`)
 check(
-  summary.releasePaths === 181 && summary.releaseOperations === 222 && summary.releaseSchemas === 281,
-  `summary release openapi counts = 181/222/281 (got ${summary.releasePaths}/${summary.releaseOperations}/${summary.releaseSchemas})`,
+  summary.releasePaths >= openapiPaths.size &&
+    summary.releaseOperations >= openapiOperationCount &&
+    summary.releaseSchemas >= frozenSchemaNames.size,
+  `summary release openapi keeps the 0.2.1 baseline 181/222/281 (got ${summary.releasePaths}/${summary.releaseOperations}/${summary.releaseSchemas}; extras allowed)`,
 )
 
 if (failures > 0) {

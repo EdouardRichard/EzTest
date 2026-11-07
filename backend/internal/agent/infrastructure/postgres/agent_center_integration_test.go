@@ -57,13 +57,13 @@ func TestAgentCenterReaderCatalogAndStats(t *testing.T) {
 		t.Fatalf("ListCatalogProfiles: %v", err)
 	}
 	// ListCatalogProfiles is the raw profile read model: it returns every seeded
-	// profile (15, including the P7 knowledge_curator background profile). The
-	// service-level Catalog intentionally keeps the frozen 14-profile team map
+	// profile (11, including the knowledge_curator background profile). The
+	// service-level Catalog keeps the converged two-team catalog map
 	// (agent_center_test.go).
 	if want := len(agentapp.ProfileSeeds()); len(profiles) != want {
 		t.Fatalf("catalog profiles = %d, want %d (every seeded profile)", len(profiles), want)
 	}
-	if profiles[0].Profile.Key != agentapp.ProfileKeyCaseExecutor && profiles[0].Profile.Key != agentapp.ProfileKeyCaseAuthor {
+	if profiles[0].Profile.Key != agentapp.ProfileKeyCaseExecutor && profiles[0].Profile.Key != agentapp.ProfileKeyDesignAuthor {
 		// The query orders by key; only assert the row shape.
 	}
 	host := findCatalogRow(t, profiles, agentapp.ProfileKeyClarificationHost)

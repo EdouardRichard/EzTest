@@ -73,18 +73,24 @@ func P7ToolNames() []string {
 	return []string{ToolKnowledgePropose, ToolKnowledgeSearch, ToolKnowledgeRead}
 }
 
-// NewP7Registry registers the frozen P1–P6 tool set plus the P7 knowledge tool
-// and the P8 structured retrieval tools. Profiles still filter the registry by
+// NewP7Registry registers the frozen P1–P6 tool set plus the P7 knowledge tool,
+// the P8 structured retrieval tools and the v0.22 tool_result.read continuation
+// tool when its content store is wired. Profiles still filter the registry by
 // allowed_tools (and the runtime RoleToolGuard by the role whitelist), so only
-// roles that explicitly list them can call knowledge.*.
+// roles that explicitly list them can call knowledge.* or tool_result.read.
 func NewP7Registry(deps Deps) *Registry {
 	base := NewP5Registry(deps)
-	all := make([]Tool, 0, len(base.byName)+3)
+	all := make([]Tool, 0, len(base.byName)+4)
 	all = append(all,
 		&knowledgePropose{deps: deps},
 		&knowledgeSearch{deps: deps},
 		&knowledgeRead{deps: deps},
 	)
+	// R-A6-1: a nil content store means the spill/continuation surface is not
+	// wired yet, so the tool stays unregistered instead of failing at call time.
+	if deps.ToolResult.Content != nil {
+		all = append(all, &toolResultRead{deps: deps})
+	}
 	for _, name := range base.Names() {
 		tool, _ := base.Get(name)
 		all = append(all, tool)

@@ -30,10 +30,28 @@ type EvalRun struct {
 	Model         string
 	Status        string
 	Summary       map[string]any
+	VersionID     *int64
 	StartedAt     time.Time
 	FinishedAt    *time.Time
 	CreatedAt     time.Time
 	Metrics       []quality.Metric
+}
+
+// TrendPoint is one eval_metric value projected for the version/metric trend
+// series (GET /api/quality/trends, W2-14). Baseline/Regressed explain the
+// warn-only baseline comparison stored in metric detail.
+type TrendPoint struct {
+	RunID     int64
+	VersionID *int64
+	Mode      string
+	Status    string
+	Metric    string
+	Value     float64
+	Threshold float64
+	Passed    bool
+	Baseline  *float64
+	Regressed bool
+	CreatedAt time.Time
 }
 
 // Repository persists and reads eval_run/eval_metric rows. Insert must write the
@@ -44,6 +62,13 @@ type Repository interface {
 	Get(ctx context.Context, id int64) (EvalRun, error)
 	List(ctx context.Context, limit int) ([]EvalRun, error)
 	Latest(ctx context.Context) (*EvalRun, error)
+	// LatestForVersion returns the newest run of one version (any mode), or
+	// (nil, nil) when the version has no run yet. Snapshot evaluation uses it
+	// to build the warn-only baseline.
+	LatestForVersion(ctx context.Context, versionID int64) (*EvalRun, error)
+	// Trends returns one metric series ordered by created_at ASC, id ASC. A
+	// zero from/to bound is unbounded.
+	Trends(ctx context.Context, versionID int64, metric string, from, to time.Time) ([]TrendPoint, error)
 }
 
 // OperationalSource aggregates the seven operational KPI counters through the
@@ -52,6 +77,46 @@ type Repository interface {
 // which case the overview reports seven unavailable metrics.
 type OperationalSource interface {
 	Snapshot(ctx context.Context, versionID *int64) (quality.OperationalSnapshot, error)
+}
+
+// ExecutionSnapshotPort is the execution context's pass-rate counter
+// (executionapp.QueryService satisfies it).
+type ExecutionSnapshotPort interface {
+	CountExecutionPass(ctx context.Context, versionID *int64) (int, int, error)
+}
+
+// VersionSnapshotPort is the version context's requirement-closure counter
+// (versionapp.QueryService satisfies it).
+type VersionSnapshotPort interface {
+	CountRequirementClosure(ctx context.Context, versionID *int64) (int, int, error)
+}
+
+// VersionExistsPort is the narrow version-context existence probe
+// (versionapp.VersionReadService satisfies it). The quality context never reads
+// the version tables directly: the assembly root wires the version read service,
+// so an unknown version yields the shared 404 envelope for the snapshot trigger
+// and the trend series instead of a fabricated all-zero run or an empty series.
+type VersionExistsPort interface {
+	VersionExists(ctx context.Context, versionID int64) (bool, error)
+}
+
+// DesignSnapshotPort is the design context's case-confirmation counter
+// (designapp.QueryService satisfies it).
+type DesignSnapshotPort interface {
+	CountCaseConfirmation(ctx context.Context, versionID *int64) (int, int, error)
+}
+
+// VisualSnapshotPort is the visual context's diff-classification counter. The
+// adapter returns passed and failed visual diffs; inconclusive/blocked diffs are
+// not an opportunity and stay out of both counters.
+type VisualSnapshotPort interface {
+	VisualClassification(ctx context.Context, versionID *int64) (passed, failed int, err error)
+}
+
+// EventPublisher publishes the eval.* lifecycle events on the version channel
+// (W2-14, EV-20). Publish failures never roll back the eval run.
+type EventPublisher interface {
+	Publish(ctx context.Context, eventType string, versionID int64, payload map[string]any) error
 }
 
 // SettingsReader is the quality view of the settings centre.

@@ -349,8 +349,15 @@ func TestConversationMessagesParseCursorAndReturnParts(t *testing.T) {
 	if defaulted.Code != http.StatusOK {
 		t.Fatalf("status = %d", defaulted.Code)
 	}
-	if stub.lastAfter != 0 || stub.lastLimit != 100 {
-		t.Fatalf("defaults = %d/%d", stub.lastAfter, stub.lastLimit)
+	// API-8: the cursor-less request reads the newest page, so the handler scans
+	// the history with the frozen max page size; this stub keeps claiming more,
+	// and the repeated-page guard stops the scan after the second call.
+	if stub.lastAfter != 8101 || stub.lastLimit != version.MessagesMaxLimit {
+		t.Fatalf("latest-page scan = %d/%d, want 8101/%d",
+			stub.lastAfter, stub.lastLimit, version.MessagesMaxLimit)
+	}
+	if payload := decodeBody(t, defaulted); payload["has_more"] != false {
+		t.Fatalf("latest-page envelope = %#v", payload)
 	}
 }
 

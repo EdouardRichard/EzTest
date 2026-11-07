@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
@@ -67,9 +68,19 @@ type Deps struct {
 	Versions      *versionapp.Service
 	Requirements  *versionapp.RequirementService
 	Conversations *versionapp.ConversationService
-	// Stage is the deterministic version stage machine (spec §5.3). It is
-	// optional; nil leaves the stage-machine routes unmounted.
-	Stage         *versionapp.StageMachine
+	// Stage is the v0.22 orchestrated stage service (spec §5.3/R-B4-1). It is
+	// the only writer of version.stage the HTTP layer may use; nil leaves the
+	// stage routes unmounted. The v0.22 task report/Task 37 switch this field
+	// from the legacy *StageMachine so no handler can bypass the gate checks.
+	Stage StageService
+	// W0 v0.22 handler services. They are optional in degraded assemblies (the
+	// route is still mounted and answers 503); the production composition root
+	// always supplies them. Narrow interfaces keep the contract testable.
+	Plans         versionapi.PlanService
+	Facts         versionapi.FactArbitrationService
+	Handoffs      versionapi.HandoffService
+	Attachments   *versionapp.AttachmentService
+	Extraction    versionapi.ExtractionService
 	TeamRoom      *agentapp.TeamRoom
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
@@ -133,6 +144,7 @@ type P6Handlers struct {
 
 // New assembles the HTTP middleware chain and every P0 route.
 func New(deps Deps) http.Handler {
+	deps = normalizeDeps(deps)
 	mux := http.NewServeMux()
 
 	executorURL := ""
@@ -161,22 +173,30 @@ func New(deps Deps) http.Handler {
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
 	versionHandler := versionapi.New(deps.Versions, versionapi.WithVersionReopener(deps.VersionClose))
+	// Legacy hard-gate confirm/reject routes keep their handler interface but are
+	// routed through the v0.22 StageService via the adapter; the new
+	// request/block/pause routes use the same service directly (Task 37).
+	var stageAdapter *stageHTTPAdapter
+	if deps.Stage != nil {
+		stageAdapter = newStageHTTPAdapter(deps)
+	}
 	requirementOptions := []versionapi.RequirementHandlerOption{
 		versionapi.WithRequirementReopener(deps.Closure),
 		versionapi.WithRequirementClosures(deps.Closure),
 	}
 	// Task 78: confirming requirements through the real UI API must advance a
 	// clarifying version to requirement_review instead of leaving it stuck.
-	if deps.Stage != nil {
+	if stageAdapter != nil {
 		requirementOptions = append(requirementOptions,
-			versionapi.WithRequirementStageConverger(deps.Stage))
+			versionapi.WithRequirementStageConverger(stageAdapter))
 	}
 	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements, requirementOptions...)
 	registerVersionRoutes(mux, authenticated, versionHandler)
 	registerRequirementRoutes(mux, authenticated, requirementHandler)
 	var stageHandler *versionapi.StageHandler
-	if deps.Stage != nil {
-		stageHandler = versionapi.NewStageHandler(deps.Stage)
+	if stageAdapter != nil {
+		stageHandler = versionapi.NewStageHandler(stageAdapter)
+		stageHandler.SetStageWorkflow(deps.Stage)
 	}
 	registerStageRoutes(mux, authenticated, stageHandler)
 	conversationHandler := versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter)
@@ -192,6 +212,7 @@ func New(deps Deps) http.Handler {
 	}
 	registerDesignRoutes(mux, authenticated, designHandler)
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
+	registerW0Routes(mux, authenticated, deps)
 	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
 	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
 	registerChainRoutes(mux, authenticated, deps.Chain)
@@ -212,6 +233,52 @@ func New(deps Deps) http.Handler {
 	chain = CORS(deps.Config)(chain)
 	chain = TrackInflight(deps.Load)(chain)
 	return RequestID(Recover(Logging(chain)))
+}
+
+// isTypedNil reports whether an optional dependency is nil or an interface
+// holding a typed nil pointer. Without this check a typed-nil service would
+// pass a handler's `svc == nil` guard and then panic (or return the wrong
+// status) when its nil receiver is used.
+func isTypedNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
+// normalizeDeps clears typed-nil optional interface dependencies so the W0
+// handlers answer their documented typed 503 instead of panicking on a nil
+// receiver. Pointer-struct dependencies already compare to nil directly;
+// clearing the interfaces is what makes the degraded assembly safe.
+func normalizeDeps(deps Deps) Deps {
+	if isTypedNil(deps.Stage) {
+		deps.Stage = nil
+	}
+	if isTypedNil(deps.Plans) {
+		deps.Plans = nil
+	}
+	if isTypedNil(deps.Facts) {
+		deps.Facts = nil
+	}
+	if isTypedNil(deps.Handoffs) {
+		deps.Handoffs = nil
+	}
+	if isTypedNil(deps.Extraction) {
+		deps.Extraction = nil
+	}
+	if isTypedNil(deps.DesignStarter) {
+		deps.DesignStarter = nil
+	}
+	if isTypedNil(deps.ContextPackets) {
+		deps.ContextPackets = nil
+	}
+	return deps
 }
 
 // registerP7Routes mounts the optional P7 surfaces: knowledge, orchestration
@@ -394,8 +461,9 @@ func registerRequirementRoutes(mux *http.ServeMux, authenticated func(http.Handl
 }
 
 // registerStageRoutes mounts the deterministic version stage-machine API: the
-// stage read plus the two user-only hard gates and the gate reject. A nil
-// handler keeps the route table of a deployment without the stage machine
+// stage read, the two user-only hard gates and the gate reject (legacy
+// contract) plus the v0.22 request/advance/block/unblock/pause/resume writes.
+// A nil handler keeps the route table of a deployment without the stage machine
 // unchanged.
 func registerStageRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.StageHandler) {
 	if h == nil {
@@ -405,6 +473,12 @@ func registerStageRoutes(mux *http.ServeMux, authenticated func(http.Handler) ht
 	mux.Handle("POST /api/versions/{id}/stage/confirm-requirements", authenticated(http.HandlerFunc(h.ConfirmRequirements)))
 	mux.Handle("POST /api/versions/{id}/stage/confirm-cases", authenticated(http.HandlerFunc(h.ConfirmCases)))
 	mux.Handle("POST /api/versions/{id}/stage/reject", authenticated(http.HandlerFunc(h.Reject)))
+	mux.Handle("POST /api/versions/{id}/stage/request", authenticated(http.HandlerFunc(h.Request)))
+	mux.Handle("POST /api/versions/{id}/stage/advance", authenticated(http.HandlerFunc(h.Advance)))
+	mux.Handle("POST /api/versions/{id}/stage/block", authenticated(http.HandlerFunc(h.Block)))
+	mux.Handle("POST /api/versions/{id}/stage/unblock", authenticated(http.HandlerFunc(h.Unblock)))
+	mux.Handle("POST /api/versions/{id}/stage/pause", authenticated(http.HandlerFunc(h.Pause)))
+	mux.Handle("POST /api/versions/{id}/stage/resume", authenticated(http.HandlerFunc(h.Resume)))
 }
 
 func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.ConversationHandler) {
@@ -426,6 +500,8 @@ func registerDesignRoutes(mux *http.ServeMux, authenticated func(http.Handler) h
 	mux.Handle("GET /api/versions/{id}/design/overview", authenticated(http.HandlerFunc(h.Overview)))
 	mux.Handle("GET /api/versions/{id}/design/cases/{caseId}", authenticated(http.HandlerFunc(h.GetCase)))
 	mux.Handle("POST /api/versions/{id}/design/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	// W2-11 R-EX-6/API-41: rollback one auto-confirmed discovery case revision.
+	mux.Handle("POST /api/versions/{id}/case-versions/{caseVersionId}/rollback", authenticated(http.HandlerFunc(h.RollbackCaseVersion)))
 	mux.Handle("POST /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.CreateExport)))
 	mux.Handle("GET /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.ListExports)))
 	mux.Handle("GET /api/exports/{exportId}", authenticated(http.HandlerFunc(h.GetExport)))
@@ -489,8 +565,9 @@ func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.H
 	mux.Handle("POST /api/resources/apis/{apiId}/reject", admin(http.HandlerFunc(h.RejectAPI)))
 }
 
-// registerExecutionRoutes mounts the P3 execution API (21 path items / 22
-// operations, spec §9.2). A nil handler keeps P0–P2 deployments unchanged.
+// registerExecutionRoutes mounts the P3 execution API plus the v0.22 question
+// routes (26 path items / 28 operations, spec §9.2 + v0.22 B §6). A nil handler
+// keeps P0–P2 deployments unchanged.
 func registerExecutionRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *executionhttp.Handler) {
 	if h == nil {
 		return
@@ -530,6 +607,12 @@ func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", authenticated(http.HandlerFunc(h.DismissIssue)))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", authenticated(http.HandlerFunc(h.ReopenIssue)))
 	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", authenticated(http.HandlerFunc(h.MergeIssue)))
+	// W2-5 issue retest (API-25); creates a PurposeRetest wave and links it back.
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/retest", authenticated(http.HandlerFunc(h.RetestIssue)))
+	// W2-4 manual issue creation/update (API-24); the handler is version-scoped
+	// and validates the version through the delivery repository.
+	mux.Handle("POST /api/versions/{versionId}/issues", authenticated(http.HandlerFunc(h.CreateIssue)))
+	mux.Handle("PATCH /api/versions/{versionId}/issues/{issueId}", authenticated(http.HandlerFunc(h.UpdateIssue)))
 
 	mux.Handle("GET /api/versions/{versionId}/reports", authenticated(http.HandlerFunc(h.ListReports)))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}", authenticated(http.HandlerFunc(h.GetReport)))
@@ -537,6 +620,8 @@ func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", authenticated(http.HandlerFunc(h.DownloadReportHTML)))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", authenticated(http.HandlerFunc(h.DownloadReportPDF)))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", authenticated(http.HandlerFunc(h.RegenerateReport)))
+	// v0.22 W2-7 report artifact export (html/pdf/markdown, storage-backed).
+	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/artifacts", authenticated(http.HandlerFunc(h.CreateReportArtifact)))
 }
 
 // registerChainRoutes mounts the P4 read-only exploration-chain endpoint behind

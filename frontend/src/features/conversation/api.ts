@@ -1,5 +1,7 @@
 import { apiGet, apiPatch } from "@/lib/api-client"
 
+import type { MessagePartView } from "./types"
+
 /** `PublicModelView.capabilities` (OpenAPI, spec §9.1). */
 export type PublicModelCapabilities = {
   supports_tools: boolean
@@ -28,6 +30,56 @@ export type ConversationModel = {
   id: string
   model_override: string | null
   effective_model: string | null
+}
+
+/** One ordered segment of the cache-first context packet (admin-only read). */
+export type ContextPacketSegment = {
+  name: string
+  role: string
+  content: string
+  tool_call_id?: string
+  /** True for the stable, cacheable system prefix. */
+  prefix: boolean
+  tokens: number
+}
+
+/** `GET /api/versions/{id}/context-packets/latest` (admin-only, spec §6.3). */
+export type ContextPacketView = {
+  prefix_hash: string
+  segments: ContextPacketSegment[]
+  cached_tokens: number
+  cache_hit: boolean
+  invalidation_reason: string
+  briefing_hash: string
+}
+
+/**
+ * Reads the latest persisted context packet of the version. The payload contains
+ * prompt content, so the backend only serves it to an admin (403 for a normal
+ * user, 404 when no packet was recorded, 503 when the reader is not wired).
+ */
+export function getLatestContextPacket(versionId: string): Promise<ContextPacketView> {
+  return apiGet<ContextPacketView>(
+    `/api/versions/${encodeURIComponent(versionId)}/context-packets/latest`,
+  )
+}
+
+/**
+ * GET /api/versions/{id}/conversations/{cid}/messages/{mid}/parts — the
+ * append-only streaming history of one UI-thread message, ordered by `seq`.
+ * `mid` is `conversation_message.id`, not an `agent_message.id`; the service
+ * checks version/conversation/message ownership before returning rows.
+ */
+export function getMessageParts(
+  versionId: string,
+  conversationId: string,
+  messageId: string,
+): Promise<MessagePartView[]> {
+  return apiGet<MessagePartView[]>(
+    `/api/versions/${encodeURIComponent(versionId)}/conversations/${encodeURIComponent(
+      conversationId,
+    )}/messages/${encodeURIComponent(messageId)}/parts`,
+  )
 }
 
 /**

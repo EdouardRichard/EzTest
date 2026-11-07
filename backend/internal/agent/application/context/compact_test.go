@@ -850,3 +850,217 @@ func TestContextPacketReadAPIAdminOnly(t *testing.T) {
 		t.Fatalf("admin status = %d, body = %s", admin.Code, admin.Body.String())
 	}
 }
+
+/* --------------------------- token-based retain -------------------------- */
+
+// tokenSizedContent returns content of exactly size runes that starts with
+// marker, so the conservative token estimate is predictable and every segment
+// carries an identifiable marker.
+func tokenSizedContent(marker string, size int) string {
+	runes := []rune(marker)
+	if len(runes) >= size {
+		return string(runes[:size])
+	}
+	return marker + strings.Repeat("a", size-len(runes))
+}
+
+// buildHistoryPacket assembles a packet with the supplied transcript history.
+func buildHistoryPacket(t *testing.T, history []agentcontext.Message) agentcontext.ContextPacket {
+	t.Helper()
+	request := baseRequest()
+	request.History = history
+	built, err := agentcontext.NewAssembler().Build(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return built.Packet
+}
+
+// TestCompactionDecisionRetainsRecentTokenBudget pins R-A5-5: a 128K/8K policy
+// (retain 19200) keeps roughly 19.2K tokens of the newest whole turns instead of
+// a fixed segment window. The packet is sized so eight whole turns are exactly
+// 19200 estimated tokens; the ninth would exceed the retain budget.
+func TestCompactionDecisionRetainsRecentTokenBudget(t *testing.T) {
+	policy := mustPolicy(t, 128000, 8000)
+	if policy.Retain != 19200 {
+		t.Fatalf("fixture policy retain = %d, want 19200", policy.Retain)
+	}
+	const turns = 12
+	history := make([]agentcontext.Message, 0, turns*2)
+	for turn := 0; turn < turns; turn++ {
+		history = append(history,
+			agentcontext.Message{
+				ID:      int64(1000 + turn*2),
+				Role:    "user",
+				Content: tokenSizedContent(fmt.Sprintf("turn-%02d-user:", turn), 2000),
+			},
+			agentcontext.Message{
+				ID:      int64(1001 + turn*2),
+				Role:    "assistant",
+				Content: tokenSizedContent(fmt.Sprintf("turn-%02d-assistant:", turn), 2000),
+			},
+		)
+	}
+	packet := buildHistoryPacket(t, history)
+	decision, ok := policy.PressureDecision(policy.Trigger, 0)
+	if !ok {
+		t.Fatal("PressureDecision() = not triggered at the trigger")
+	}
+	compacted, err := agentcontext.NewCompactor(nil, agentcontext.WithKeepRecent(24)).
+		CompactForDecision(context.Background(), packet, decision)
+	if err != nil {
+		t.Fatalf("CompactForDecision: %v", err)
+	}
+
+	retained := compactableSegments(compacted)
+	if len(retained) != 16 {
+		t.Fatalf("retained segments = %d, want eight two-message turns (16)", len(retained))
+	}
+	retainedTokens := 0
+	for _, segment := range retained {
+		retainedTokens += segment.Tokens
+	}
+	if retainedTokens != 19200 {
+		t.Fatalf("retained tokens = %d, want the 19200 R-A5-1 retain budget", retainedTokens)
+	}
+	if compacted.PrefixHash != packet.PrefixHash {
+		t.Fatalf("token retain rewrote the stable prefix: %q -> %q", packet.PrefixHash, compacted.PrefixHash)
+	}
+	_, summary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok {
+		t.Fatalf("compacted packet has no summary: %#v", compacted.Segments)
+	}
+	for _, folded := range []string{"turn-00-user:", "turn-03-assistant:"} {
+		if !strings.Contains(summary.Content, folded) {
+			t.Fatalf("summary does not cover the folded older turn %q: %q", folded, summary.Content)
+		}
+	}
+	for _, kept := range []string{"turn-04-user:", "turn-11-user:"} {
+		if strings.Contains(summary.Content, kept) {
+			t.Fatalf("summary folded a retained whole turn %q: %q", kept, summary.Content)
+		}
+	}
+}
+
+// TestCompactionDecisionAlwaysKeepsLastTurn pins R-A5-5's "at least the last
+// turn" rule: an oversized final turn is retained whole even though it exceeds
+// the retain budget.
+func TestCompactionDecisionAlwaysKeepsLastTurn(t *testing.T) {
+	policy := mustPolicy(t, 128000, 8000)
+	history := []agentcontext.Message{
+		{ID: 1, Role: "user", Content: tokenSizedContent("old-user:", 2000)},
+		{ID: 2, Role: "assistant", Content: tokenSizedContent("old-assistant:", 2000)},
+		{ID: 3, Role: "user", Content: tokenSizedContent("last-user:", 20000)},
+		{ID: 4, Role: "assistant", Content: tokenSizedContent("last-assistant:", 20000)},
+	}
+	packet := buildHistoryPacket(t, history)
+	decision := agentcontext.CompactionDecision{
+		Trigger: agentcontext.Pressure,
+		Policy:  policy,
+		Retain:  policy.Retain,
+	}
+	compacted, err := agentcontext.NewCompactor(nil, agentcontext.WithKeepRecent(24)).
+		CompactForDecision(context.Background(), packet, decision)
+	if err != nil {
+		t.Fatalf("CompactForDecision: %v", err)
+	}
+	retained := compactableSegments(compacted)
+	if len(retained) != 2 {
+		t.Fatalf("retained segments = %d, want the whole oversized last turn (2)", len(retained))
+	}
+	if !strings.Contains(retained[0].Content, "last-user:") || !strings.Contains(retained[1].Content, "last-assistant:") {
+		t.Fatalf("retained segments are not the last turn: %#v", retained)
+	}
+	_, summary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok {
+		t.Fatalf("compacted packet has no summary: %#v", compacted.Segments)
+	}
+	if !strings.Contains(summary.Content, "old-user:") {
+		t.Fatalf("summary lost the folded older turn: %q", summary.Content)
+	}
+	if strings.Contains(summary.Content, "last-user:") {
+		t.Fatalf("summary folded the retained last turn: %q", summary.Content)
+	}
+}
+
+// TestCompactionDecisionKeepsToolPairsTogether pins R-A5-5's tool-pair rule: an
+// assistant tool-call turn and all of its tool results are folded or retained as
+// one unit, never split across the summary boundary.
+func TestCompactionDecisionKeepsToolPairsTogether(t *testing.T) {
+	policy := mustPolicy(t, 128000, 8000)
+	history := []agentcontext.Message{
+		{ID: 1, Role: "user", Content: tokenSizedContent("tool-turn-user:", 2000)},
+		{ID: 2, Role: "assistant", Content: tokenSizedContent("tool-call-assistant:", 2000)},
+		{ID: 3, Role: "tool", ToolCallID: "call-1", Content: tokenSizedContent("tool-result-one:", 2000)},
+		{ID: 4, Role: "tool", ToolCallID: "call-2", Content: tokenSizedContent("tool-result-two:", 2000)},
+		{ID: 5, Role: "user", Content: tokenSizedContent("last-user:", 2000)},
+		{ID: 6, Role: "assistant", Content: tokenSizedContent("last-assistant:", 2000)},
+	}
+	packet := buildHistoryPacket(t, history)
+	// Only the last 2400-token turn fits, so the tool turn must fold as a unit.
+	decision := agentcontext.CompactionDecision{
+		Trigger: agentcontext.Pressure,
+		Policy:  policy,
+		Retain:  2400,
+	}
+	compacted, err := agentcontext.NewCompactor(nil, agentcontext.WithKeepRecent(24)).
+		CompactForDecision(context.Background(), packet, decision)
+	if err != nil {
+		t.Fatalf("CompactForDecision: %v", err)
+	}
+	retained := compactableSegments(compacted)
+	if len(retained) != 2 || !strings.Contains(retained[0].Content, "last-user:") {
+		t.Fatalf("retained segments = %#v, want only the last turn", retained)
+	}
+	_, summary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok {
+		t.Fatalf("compacted packet has no summary: %#v", compacted.Segments)
+	}
+	for _, folded := range []string{"tool-call-assistant:", "tool-result-one:", "tool-result-two:"} {
+		if !strings.Contains(summary.Content, folded) {
+			t.Fatalf("tool pair was split: summary misses %q: %q", folded, summary.Content)
+		}
+	}
+	for _, kept := range []string{"tool-result-one:", "tool-result-two:"} {
+		for _, segment := range retained {
+			if strings.Contains(segment.Content, kept) {
+				t.Fatalf("tool result %q was retained without its turn: %#v", kept, retained)
+			}
+		}
+	}
+}
+
+// TestCompactionDecisionKeepRecentBoundsTokenRetain pins the secondary bound:
+// context.keep_recent_messages still caps the retained segment count even when
+// the token budget would allow more whole turns.
+func TestCompactionDecisionKeepRecentBoundsTokenRetain(t *testing.T) {
+	policy := mustPolicy(t, 128000, 8000)
+	history := make([]agentcontext.Message, 0, 8)
+	for turn := 0; turn < 4; turn++ {
+		history = append(history,
+			agentcontext.Message{ID: int64(100 + turn*2), Role: "user", Content: tokenSizedContent(fmt.Sprintf("small-%02d-user:", turn), 100)},
+			agentcontext.Message{ID: int64(101 + turn*2), Role: "assistant", Content: tokenSizedContent(fmt.Sprintf("small-%02d-assistant:", turn), 100)},
+		)
+	}
+	packet := buildHistoryPacket(t, history)
+	decision, ok := policy.PressureDecision(policy.Trigger, 0)
+	if !ok {
+		t.Fatal("PressureDecision() = not triggered at the trigger")
+	}
+	compacted, err := agentcontext.NewCompactor(nil, agentcontext.WithKeepRecent(2)).
+		CompactForDecision(context.Background(), packet, decision)
+	if err != nil {
+		t.Fatalf("CompactForDecision: %v", err)
+	}
+	retained := compactableSegments(compacted)
+	if len(retained) != 2 {
+		t.Fatalf("retained segments = %d, want the keep_recent secondary bound 2", len(retained))
+	}
+	if !strings.Contains(retained[0].Content, "small-03-user:") {
+		t.Fatalf("retained the wrong turn: %#v", retained)
+	}
+	_, summary, ok := findSegment(compacted, agentcontext.SegmentSummary)
+	if !ok || !strings.Contains(summary.Content, "small-00-user:") {
+		t.Fatalf("summary does not cover the turns dropped by the keep_recent bound: %#v", compacted.Segments)
+	}
+}

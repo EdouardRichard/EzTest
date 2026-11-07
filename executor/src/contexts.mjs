@@ -400,6 +400,9 @@ async function installWebSocketGuard(entry, browserContext, executorAllowedHosts
       status: null,
       duration_ms: 0,
       mime: null,
+      // Keep the network entry shape consistent with Playwright telemetry
+      // entries (W1-10 review M1); the Go capture skips method WS.
+      resource_type: "websocket",
       error: "host_not_allowed",
     })
     logger?.warn?.(
@@ -593,6 +596,10 @@ function attachPageTelemetry(entry, page) {
       status,
       duration_ms: Date.now() - (pending?.start ?? Date.now()),
       mime,
+      // Playwright request semantics: document/xhr/fetch/script/image/
+      // stylesheet/font/... The Go discovery capture uses it to classify page
+      // vs api and to filter static resources (R-EX-2).
+      resource_type: request.resourceType(),
       ...(failed ? { error: scrub(failureText ?? "", entry.secrets) } : {}),
     })
   }

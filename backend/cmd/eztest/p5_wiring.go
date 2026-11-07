@@ -124,7 +124,7 @@ func newP5Runtime(ctx context.Context, deps p5RuntimeDeps) *p5Runtime {
 	analysisSvc := codeintelapp.NewAnalysisService(codeintelapp.AnalysisDeps{
 		Analyses: analyses, Facts: facts, Entities: entities, Git: deps.Bindings,
 		Extractor: extractor, Models: extractor, Bulk: deps.Bindings, Versions: deps.Bindings,
-		Resources: deps.Bindings, Design: designReader, Queue: queue, Events: codeEvents,
+		Resources: deps.Bindings, Runs: indexRuns, Design: designReader, Queue: queue, Events: codeEvents,
 		Audit: codeAudit, Settings: settings, Clock: deps.Clock, IDs: deps.IDs,
 	})
 	impactSvc := codeintelapp.NewImpactService(codeintelapp.ImpactDeps{
@@ -345,15 +345,23 @@ func (b *p5CodeBindings) VersionSUTBindings(ctx context.Context, versionID int64
 	bindings := make([]codeintelapp.VersionSUTBinding, 0, len(view.Bindings))
 	cache := make(map[int64]p5CachedBinding, len(view.Bindings))
 	for _, item := range view.Bindings {
-		binding := codeintelapp.VersionSUTBinding{
-			VersionSUTID:       item.ID,
-			VersionID:          view.ID,
-			SUTID:              parseP5ID(item.SUT.ID),
-			CodeBaselineCommit: item.CodeBaselineCommit,
+		// One version_sut can bind several effective repositories (SUT
+		// inheritance plus version overrides). Codeintel indexes and analyses
+		// per repository, so emit one binding per repository. Repository is the
+		// deterministic baseline repository kept for older read models.
+		repositories := item.Repositories
+		if len(repositories) == 0 && item.Repository != nil {
+			repositories = []versionapp.BindingRepositoryView{{Repository: *item.Repository}}
 		}
-		if item.Repository != nil {
-			binding.RepoID = parseP5ID(item.Repository.ID)
-			binding.Branch = item.Repository.Branch
+		for _, effective := range repositories {
+			bindings = append(bindings, codeintelapp.VersionSUTBinding{
+				VersionSUTID:       item.ID,
+				VersionID:          view.ID,
+				SUTID:              parseP5ID(item.SUT.ID),
+				RepoID:             parseP5ID(effective.Repository.ID),
+				Branch:             effective.Repository.Branch,
+				CodeBaselineCommit: item.CodeBaselineCommit,
+			})
 		}
 		if item.ID > 0 {
 			cache[item.ID] = p5CachedBinding{
@@ -364,7 +372,6 @@ func (b *p5CodeBindings) VersionSUTBindings(ctx context.Context, versionID int64
 				APIs:          p5APIRefs(item.APIs),
 			}
 		}
-		bindings = append(bindings, binding)
 	}
 	b.mu.Lock()
 	for id, entry := range cache {

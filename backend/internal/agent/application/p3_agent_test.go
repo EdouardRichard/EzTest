@@ -90,6 +90,21 @@ func hasTool(profile agent.AgentProfile, name string) bool {
 	return false
 }
 
+func TestCaseExecutorPromptUsesUploadActionAndBailsOut(t *testing.T) {
+	for _, profile := range agentapp.P3Profiles() {
+		if profile.Key != agentapp.ProfileKeyCaseExecutor {
+			continue
+		}
+		for _, want := range []string{"browser.upload_file", "禁止用 browser.click", "case_finish(verdict=blocked)", "立即调用 execution.case_finish", "工具栏", "封面", "database.schema_read", "即使工具失败也要"} {
+			if !strings.Contains(profile.SystemPrompt, want) {
+				t.Fatalf("case_executor prompt is missing %q", want)
+			}
+		}
+		return
+	}
+	t.Fatal("case_executor profile is not registered")
+}
+
 func TestParseP3WorkItemPayload(t *testing.T) {
 	payload := json.RawMessage(`{
 		"intent_id":"11","wave_id":"22","case_run_id":"33","case_version_id":"44",
@@ -138,7 +153,7 @@ func TestP3ProfilesToolsAndBudgets(t *testing.T) {
 	if !ok {
 		t.Fatalf("case_executor profile is missing")
 	}
-	if executor.Budgets.MaxTurns != 60 || executor.Budgets.SoftSeconds != 780 || executor.Budgets.HardSeconds != 900 {
+	if executor.Budgets.MaxTurns != 150 || executor.Budgets.SoftSeconds != 1200 || executor.Budgets.HardSeconds != 2400 {
 		t.Fatalf("case_executor budgets = %+v", executor.Budgets)
 	}
 	for _, name := range []string{
