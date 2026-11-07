@@ -27,10 +27,13 @@ func (r *DiffRepository) Overview(ctx context.Context, versionID *int64) (visual
 	}
 
 	rows, err := r.pool.Query(ctx, `
-		SELECT d.classification, count(*)
-		FROM visual_diff d JOIN visual_assertion a ON a.id = d.visual_assertion_id
-		WHERE true`+filter+`
-		GROUP BY d.classification`, args...)
+		SELECT classification, count(*) FROM (
+			SELECT DISTINCT ON (d.visual_assertion_id) d.classification
+			FROM visual_diff d JOIN visual_assertion a ON a.id = d.visual_assertion_id
+			WHERE a.status = 'active'`+filter+`
+			ORDER BY d.visual_assertion_id, d.id DESC
+		) latest
+		GROUP BY classification`, args...)
 	if err != nil {
 		return visualapp.OverviewData{}, wrapDB("overview classification counts", err)
 	}
@@ -50,10 +53,14 @@ func (r *DiffRepository) Overview(ctx context.Context, versionID *int64) (visual
 	rows.Close()
 
 	reasonRows, err := r.pool.Query(ctx, `
-		SELECT d.reason, count(*)
-		FROM visual_diff d JOIN visual_assertion a ON a.id = d.visual_assertion_id
-		WHERE d.classification = 'inconclusive'`+filter+`
-		GROUP BY d.reason ORDER BY count(*) DESC, d.reason LIMIT 20`, args...)
+		SELECT reason, count(*) FROM (
+			SELECT DISTINCT ON (d.visual_assertion_id) d.classification, d.reason
+			FROM visual_diff d JOIN visual_assertion a ON a.id = d.visual_assertion_id
+			WHERE a.status = 'active'`+filter+`
+			ORDER BY d.visual_assertion_id, d.id DESC
+		) latest
+		WHERE latest.classification = 'inconclusive'
+		GROUP BY reason ORDER BY count(*) DESC, reason LIMIT 20`, args...)
 	if err != nil {
 		return visualapp.OverviewData{}, wrapDB("overview inconclusive reasons", err)
 	}

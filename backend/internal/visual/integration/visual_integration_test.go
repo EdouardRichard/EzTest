@@ -108,6 +108,31 @@ func TestVisualRepositoriesPartialUniqueAndOverview(t *testing.T) {
 		t.Fatalf("overview classifications = %+v", overview.DiffCounts)
 	}
 
+	// A newer diff for the same assertion must supersede the earlier one in the
+	// overview: the strip shows one state per assertion, so counting every
+	// historical diff row would report more results than assertions.
+	later := diff
+	later.ID = 6
+	later.CaseRunID = 61
+	later.AssertionResultID = 71
+	later.Classification = visual.ClassificationInconclusive
+	later.Reason = visual.ReasonMissingBaseline
+	later.BaselineID = nil
+	if _, createdNew, err := repo.Diffs.Insert(ctx, later); err != nil || !createdNew {
+		t.Fatalf("insert later diff created=%v err=%v", createdNew, err)
+	}
+	latestOverview, err := repo.Diffs.Overview(ctx, nil)
+	if err != nil {
+		t.Fatalf("overview after later diff: %v", err)
+	}
+	if latestOverview.DiffCounts[visual.ClassificationPassed] != 0 ||
+		latestOverview.DiffCounts[visual.ClassificationInconclusive] != 1 {
+		t.Fatalf("overview must count the latest diff per assertion: %+v", latestOverview.DiffCounts)
+	}
+	if latestOverview.AssertionTotal != 1 {
+		t.Fatalf("assertion total = %d, want 1", latestOverview.AssertionTotal)
+	}
+
 	var _ visualapp.DiffRepository = repo.Diffs
 }
 
