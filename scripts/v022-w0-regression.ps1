@@ -1810,11 +1810,21 @@ async function main() {
       await skipPendingQuestions()
       await p.reload({ waitUntil: 'domcontentloaded' })
       await sleep(2500)
+      // The evidence must show the answered card, not only the conversation
+      // continuation jobs (which can fail/queue independently of the answer).
+      // Wait for the card's answered state and scroll it into view before the
+      // screenshot; the API check above already proves the answer persisted.
+      const answeredCard = p.locator('[data-testid="question-card"]').filter({ hasText: '已回答' }).first()
+      const answeredCardFound = await answeredCard.waitFor({ state: 'visible', timeout: 20000 }).then(() => true).catch(() => false)
+      if (answeredCardFound) {
+        await answeredCard.scrollIntoViewIfNeeded().catch(() => {})
+        await sleep(500)
+      }
       const cardAfterReload = await p.locator('[data-testid="question-card"]').count()
       await screenshot('ui-question-answered.png')
       record('issue-14-question-card',
         answeredBatch.status === 'answered' && questionItems >= 1,
-        `question-card rendered (${questionItems} items), answer persisted through the answer API (batch=${answeredBatch.status}); refresh shows ${cardAfterReload} pending follow-up card(s), which are new questions rather than a lost answer`,
+        `question-card rendered (${questionItems} items), answer persisted through the answer API (batch=${answeredBatch.status}); answered card visible=${answeredCardFound}; refresh shows ${cardAfterReload} pending follow-up card(s), which are new questions rather than a lost answer`,
         'screenshots/ui-question-card.png, screenshots/ui-question-answered.png')
       saveJson('question-answered.json', answeredBatch)
     } catch (err) {
