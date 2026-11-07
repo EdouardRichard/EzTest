@@ -2042,10 +2042,20 @@ func main() {
 		InstanceID:           instanceID,
 		Load:                 workLoad,
 	})
-	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
+	workerOptions := []agentapp.WorkerOption{
 		agentapp.WithWorkerEvents(eventSvc),
 		agentapp.WithWorkerDrainGate(p7OrchestrationRuntime.Service.IsDraining),
-		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)))
+		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)),
+	}
+	// EZTEST_AGENT_CONCURRENCY lets a deployment bound how many agent runs
+	// share the LLM/executor at once (the acceptance stack uses 1 to avoid
+	// provider rate limits and executor contention).
+	if raw := strings.TrimSpace(os.Getenv("EZTEST_AGENT_CONCURRENCY")); raw != "" {
+		if limit, err := strconv.Atoi(raw); err == nil && limit > 0 {
+			workerOptions = append(workerOptions, agentapp.WithWorkerConcurrency(limit))
+		}
+	}
+	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID, workerOptions...)
 	var background sync.WaitGroup
 	// v0.22 stage reconciler: retry a lost executing->reporting or
 	// reporting->completed callback. The scheduler's in-memory pending set is
