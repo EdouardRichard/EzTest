@@ -116,7 +116,7 @@ func P3Profiles() []agent.AgentProfile {
 			Name:         "用例执行器",
 			SystemPrompt: caseExecutorPrompt,
 			AllowedTools: append([]string(nil), caseExecutorTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 100, SoftSeconds: 900, HardSeconds: 1800},
+			Budgets:      agent.ProfileBudgets{MaxTurns: 150, SoftSeconds: 1200, HardSeconds: 2400},
 			Enabled:      true,
 		},
 		{

@@ -153,7 +153,7 @@ func TestP3ProfilesToolsAndBudgets(t *testing.T) {
 	if !ok {
 		t.Fatalf("case_executor profile is missing")
 	}
-	if executor.Budgets.MaxTurns != 100 || executor.Budgets.SoftSeconds != 900 || executor.Budgets.HardSeconds != 1800 {
+	if executor.Budgets.MaxTurns != 150 || executor.Budgets.SoftSeconds != 1200 || executor.Budgets.HardSeconds != 2400 {
 		t.Fatalf("case_executor budgets = %+v", executor.Budgets)
 	}
 	for _, name := range []string{

@@ -49,7 +49,7 @@ func TestProfileBudgetsV022(t *testing.T) {
 	}
 
 	executor := v022Profile(t, P3Profiles(), ProfileKeyCaseExecutor)
-	wantExecutor := agent.ProfileBudgets{MaxTurns: 100, SoftSeconds: 900, HardSeconds: 1800}
+	wantExecutor := agent.ProfileBudgets{MaxTurns: 150, SoftSeconds: 1200, HardSeconds: 2400}
 	if executor.Budgets != wantExecutor {
 		t.Fatalf("case_executor budgets = %+v, want %+v", executor.Budgets, wantExecutor)
 	}
