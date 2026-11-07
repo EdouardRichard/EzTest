@@ -577,10 +577,20 @@ func (a stageAdvancer) ConvergeClarification(ctx context.Context, versionID int6
 	return a.service.Request(ctx, versionID, versiondomain.StageRequirementReview)
 }
 
-// ConvergeDesign applies designing -> case_review.
+// ConvergeDesign applies designing -> case_review. The design reconciler runs
+// on every version, including versions already executing; requesting the back
+// edge from executing is not a generic stage request (it needs the audited
+// reopen entry point), so the convergence must be a no-op outside designing.
 func (a stageAdvancer) ConvergeDesign(ctx context.Context, versionID int64) error {
 	if a.service == nil {
 		return errors.New("stage advancer: stage service is not configured")
+	}
+	view, err := a.service.Stage(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if view.Stage != versiondomain.StageDesigning {
+		return nil
 	}
 	return a.service.Request(ctx, versionID, versiondomain.StageCaseReview)
 }
