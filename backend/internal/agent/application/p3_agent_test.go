@@ -95,7 +95,7 @@ func TestCaseExecutorPromptUsesUploadActionAndBailsOut(t *testing.T) {
 		if profile.Key != agentapp.ProfileKeyCaseExecutor {
 			continue
 		}
-		for _, want := range []string{"browser.upload_file", "禁止点击", "case_finish(verdict=blocked)"} {
+		for _, want := range []string{"browser.upload_file", "禁止点击", "case_finish(verdict=blocked)", "立即调用 execution.case_finish"} {
 			if !strings.Contains(profile.SystemPrompt, want) {
 				t.Fatalf("case_executor prompt is missing %q", want)
 			}
@@ -153,7 +153,7 @@ func TestP3ProfilesToolsAndBudgets(t *testing.T) {
 	if !ok {
 		t.Fatalf("case_executor profile is missing")
 	}
-	if executor.Budgets.MaxTurns != 60 || executor.Budgets.SoftSeconds != 780 || executor.Budgets.HardSeconds != 900 {
+	if executor.Budgets.MaxTurns != 100 || executor.Budgets.SoftSeconds != 900 || executor.Budgets.HardSeconds != 1800 {
 		t.Fatalf("case_executor budgets = %+v", executor.Budgets)
 	}
 	for _, name := range []string{

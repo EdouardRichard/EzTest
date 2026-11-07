@@ -300,6 +300,34 @@ test("upload_file sets local files on a file input", async () => {
   })
 })
 
+test("upload_file sets files on a hidden file input", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const response = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload-hidden" },
+      files: [{ name: "hidden.png", mime: "image/png", base64: Buffer.from("89504e470d0a1a0a").toString("base64") }],
+    })
+    assert.equal(response.ok, true, JSON.stringify(response.error))
+    assert.deepEqual(response.result.files, ["hidden.png"])
+    const snap = await act(context.contextId, "snapshot")
+    assert.match(snap.result.aria, /uploaded:hidden\.png/)
+  })
+})
+
+test("upload_file drives a button that opens the native file chooser", async () => {
+  await withContext(async (context) => {
+    await act(context.contextId, "goto", { url: `${pageServer.url}/home` })
+    const response = await act(context.contextId, "upload_file", {
+      target: { selector: "#upload-trigger" },
+      files: [{ name: "chooser.png", mime: "image/png", base64: Buffer.from("89504e470d0a1a0a").toString("base64") }],
+    })
+    assert.equal(response.ok, true, JSON.stringify(response.error))
+    assert.deepEqual(response.result.files, ["chooser.png"])
+    const snap = await act(context.contextId, "snapshot")
+    assert.match(snap.result.aria, /uploaded:chooser\.png/)
+  })
+})
+
 test("upload_file rejects missing files, path names and oversized payloads", async () => {
   await withContext(async (context) => {
     await act(context.contextId, "goto", { url: `${pageServer.url}/home` })

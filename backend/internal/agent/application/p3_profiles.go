@@ -27,6 +27,7 @@ const caseExecutorPrompt = `你是 EzTest 的用例执行器（Case Executor）�
 - 断言失败、步骤阻塞或结论不确定时必须留下证据：至少调用一次 browser.screenshot（UI 失败）或 browser.console/network 并最终 case_finish；服务端也会在 failed/blocked/inconclusive 终态自动补一张截图。
 - 无法继续（缺账号/环境不可用/步骤阻塞）时调用 execution.case_finish(verdict=blocked) 并说明原因；全部步骤与断言完成后调用 execution.case_finish 提交候选终态。
 - 服务端会按步骤与断言真值覆写你的候选终态；如实记录失败即可。
+- 所有步骤与断言记录完成后立即调用 execution.case_finish 提交终态；不要为了额外确认继续探索或重复验证，避免耗尽 turn/time 预算导致 inconclusive。
 [profile:case_executor]`
 
 const failureAnalystPrompt = `你是 EzTest 的失败分析师（Failure Analyst）。
@@ -115,7 +116,7 @@ func P3Profiles() []agent.AgentProfile {
 			Name:         "用例执行器",
 			SystemPrompt: caseExecutorPrompt,
 			AllowedTools: append([]string(nil), caseExecutorTools...),
-			Budgets:      agent.ProfileBudgets{MaxTurns: 60, SoftSeconds: 780, HardSeconds: 900},
+			Budgets:      agent.ProfileBudgets{MaxTurns: 100, SoftSeconds: 900, HardSeconds: 1800},
 			Enabled:      true,
 		},
 		{

@@ -135,8 +135,28 @@ async function resolveOne(page, spec, timeoutMs) {
   return single
 }
 
-function clampTail(value, fallback = 50, max = 200) {
-  const numeric = Number(value)
+// resolveAttached mirrors resolveOne but only requires the element to exist in
+// the DOM. File inputs are commonly hidden (display:none) and native upload
+// buttons live behind a click, so an upload target must not wait for
+// visibility.
+async function resolveAttached(page, spec, timeoutMs) {
+  const locator = buildLocator(page, spec)
+  const count = await locator.count()
+  if (count === 0) {
+    throw new ExecutorError("target_not_found", `no element matched ${describeTarget(spec)}`)
+  }
+  if (count > 1) {
+    throw new ExecutorError(
+      "target_ambiguous",
+      `${count} elements matched ${describeTarget(spec)}; refine the target`,
+    )
+  }
+  const single = locator.first()
+  await single.waitFor({ state: "attached", timeout: timeoutMs })
+  return single
+}
+
+function clampTail(value, fallback = 50, max = 200) {  const numeric = Number(value)
   if (!Number.isFinite(numeric) || numeric <= 0) {
     return fallback
   }
@@ -368,9 +388,24 @@ const HANDLERS = {
       }
       return { name, mimeType: mime, buffer }
     })
-    const locator = await resolveOne(entry.page, parseTarget(args.target), timeoutMs)
-    await locator.setInputFiles(files, { timeout: timeoutMs })
-    return { result: { ok: true, files: files.map((file) => file.name), bytes: total } }
+    const locator = await resolveAttached(entry.page, parseTarget(args.target), timeoutMs)
+    const isFileInput = await locator
+      .evaluate((element) => element instanceof HTMLInputElement && element.type === "file")
+      .catch(() => false)
+    const summary = { files: files.map((file) => file.name), bytes: total }
+    if (isFileInput) {
+      await locator.setInputFiles(files, { timeout: timeoutMs })
+      return { result: { ok: true, ...summary } }
+    }
+    // The case usually points at the upload button, which opens the native file
+    // chooser. Playwright intercepts it; attach the files there instead of
+    // requiring a visible input.
+    const [chooser] = await Promise.all([
+      entry.page.waitForEvent("filechooser", { timeout: timeoutMs }),
+      locator.click({ timeout: timeoutMs }),
+    ])
+    await chooser.setFiles(files)
+    return { result: { ok: true, viaChooser: true, ...summary } }
   },
 
   // set_viewport lets a case exercise responsive/mobile acceptance criteria on
