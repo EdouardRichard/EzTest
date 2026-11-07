@@ -96,7 +96,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_author]",
-			mustSay: []string{"后台作业", "draft", "不能确认", "视觉基线", "不要用 visual", "验收标准未要求", "移动端", "文件选择框"},
+			mustSay: []string{"后台作业", "draft", "不能确认", "视觉基线", "不要用 visual", "验收标准未要求", "移动端", "文件选择框", "实时", "硬编码"},
 		},
 		agentapp.ProfileKeyDesignCritic: {
 			tools: []string{
