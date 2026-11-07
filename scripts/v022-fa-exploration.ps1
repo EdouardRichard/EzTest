@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA-9 execution-time exploration (T10-T14) evidence gate.
@@ -36,7 +36,7 @@
     -Fresh is opt-in because it boots the FA stack and touches the real SUT.
 #>
 param(
-    [ValidateSet('RUN-1', 'RUN-2')]
+    [ValidatePattern('^RUN-[0-9]+$')]
     [string]$RunDir = 'RUN-1',
 
     [string]$EvidenceRoot,

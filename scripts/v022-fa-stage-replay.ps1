@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA stage-evidence replay (FA-4 / FA-14).
@@ -16,7 +16,7 @@
     Exit codes: 0 = all stages PASS, 1 = a stage is RED, 2 = EXTERNAL-BLOCKED.
 #>
 param(
-    [ValidateSet('RUN-1', 'RUN-2')][string]$RunDir = 'RUN-1',
+    [ValidatePattern('^RUN-[0-9]+$')][string]$RunDir = 'RUN-1',
     [switch]$CopyOnly,
     [switch]$SkipRunW0,
     [switch]$SkipRunW1,

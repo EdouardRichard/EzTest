@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA visual-review harness (FA-10).
@@ -66,7 +66,7 @@
     changes product code.
 #>
 param(
-    [ValidateSet('RUN-1', 'RUN-2')]
+    [ValidatePattern('^RUN-[0-9]+$')]
     [string]$RunDir = 'RUN-1',
 
     [string]$EvidenceRoot,

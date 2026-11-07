@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 final-acceptance (FA) verdict joiner.
@@ -25,7 +25,7 @@
 #>
 
 param(
-    [ValidateSet('RUN-1', 'RUN-2')]
+    [ValidatePattern('^RUN-[0-9]+$')]
     [string]$RunDir = 'RUN-2',
 
     [string]$EvidenceRoot,

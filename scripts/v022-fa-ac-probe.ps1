@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA-6/FA-7 independent AC probes: R01-R06 (22 ACs) and
@@ -39,7 +39,7 @@
 param(
     [string]$AcId,
 
-    [ValidateSet('RUN-1', 'RUN-2')]
+    [ValidatePattern('^RUN-[0-9]+$')]
     [string]$RunDir = 'RUN-1',
 
     [ValidateSet('R01-R06', 'R07-R12')]

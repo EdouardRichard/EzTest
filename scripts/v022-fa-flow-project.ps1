@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA flow projection: normalize the W0 regression evidence into
@@ -15,7 +15,7 @@
     Exit codes: 0 = flow.json written, 1 = required input missing.
 #>
 param(
-    [ValidateSet('RUN-1', 'RUN-2')][string]$RunDir = 'RUN-1',
+    [ValidatePattern('^RUN-[0-9]+$')][string]$RunDir = 'RUN-1',
     [string]$Database = 'eztest_v022_w0',
     [string]$EvidenceRoot = ''
 )

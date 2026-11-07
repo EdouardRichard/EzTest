@@ -40,7 +40,7 @@ param(
         'domains', 'exploration', 'visual', 'run1', 'fix', 'verdict', 'report')]
     [string]$Gate,
 
-    [ValidateSet('RUN-1', 'RUN-2')]
+    [ValidatePattern('^RUN-[0-9]+$')]
     [string]$RunDir = 'RUN-2',
 
     [ValidateSet('R01-R06', 'R07-R12', 'all')]

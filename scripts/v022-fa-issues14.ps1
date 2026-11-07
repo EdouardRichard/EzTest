@@ -39,7 +39,7 @@
         powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\v022-fa-issues14.ps1 -VerifyOnly
 #>
 param(
-    [ValidateSet('RUN-1', 'RUN-2')]
+    [ValidatePattern('^RUN-[0-9]+$')]
     [string]$RunDir = 'RUN-1',
 
     [switch]$VerifyOnly,
