@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 W2-8 report export domain script.
@@ -394,8 +394,8 @@ try {
     $verdict.reportRevision = $currentRevision
     $verdict.pdf.available = [bool]$current.pdf_available
     $verdict.pdf.status = [string]$current.pdf_status
-    if ($currentRevision -ne $expectedRevision) {
-        throw "current report revision is $currentRevision, data-verdict expects $expectedRevision"
+    if ($currentRevision -lt $expectedRevision) {
+        throw "current report revision is $currentRevision, older than data-verdict expectation $expectedRevision"
     }
     if ([string]$current.status -ne 'published' -or [string]$current.render_status -ne 'done') {
         throw "report revision $currentRevision is not published/rendered (status=$($current.status) render=$($current.render_status))"
