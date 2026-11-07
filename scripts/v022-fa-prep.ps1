@@ -557,7 +557,6 @@ try {
             EZTEST_WEB_PORT               = [string]$webPort
             EZTEST_EXECUTOR_PORT          = [string]$executorPort
             EZTEST_INITIAL_ADMIN_PASSWORD = $initialAdminPassword
-            EZTEST_AGENT_CONCURRENCY      = '1'
         }
     $script:apiPid = [int]$apiProcess.Id
     $apiReady = Wait-Http -Uri "$apiBase/api/health/ready" -TimeoutSeconds 180
