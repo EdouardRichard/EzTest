@@ -472,7 +472,7 @@ func browserToolSet(deps Deps) []Tool {
 			description: "Export a storageState summary (P3 returns no credentials and stores nothing).",
 			parameters:  schemaObject(browserParameters(nil))},
 		&browserTool{deps: deps, name: ToolBrowserUploadFile, action: "upload_file",
-			description: "Inject base64-encoded local files into a file input (no host filesystem access).",
+			description: "Inject base64-encoded local files into a file input, or into a button that opens the native file chooser (the executor drives the chooser). No host filesystem access.",
 			parameters: schemaObject(browserParameters(map[string]any{
 				"target": targetRef,
 				"files": map[string]any{

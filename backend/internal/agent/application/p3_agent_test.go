@@ -95,7 +95,7 @@ func TestCaseExecutorPromptUsesUploadActionAndBailsOut(t *testing.T) {
 		if profile.Key != agentapp.ProfileKeyCaseExecutor {
 			continue
 		}
-		for _, want := range []string{"browser.upload_file", "禁止点击", "case_finish(verdict=blocked)", "立即调用 execution.case_finish"} {
+		for _, want := range []string{"browser.upload_file", "禁止用 browser.click", "case_finish(verdict=blocked)", "立即调用 execution.case_finish", "工具栏", "封面"} {
 			if !strings.Contains(profile.SystemPrompt, want) {
 				t.Fatalf("case_executor prompt is missing %q", want)
 			}
