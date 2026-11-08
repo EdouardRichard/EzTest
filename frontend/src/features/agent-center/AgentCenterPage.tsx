@@ -283,7 +283,10 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
             {isAdmin ? <Badge tone="info">管理员</Badge> : null}
           </div>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            2 个对话 Host（clarification/design）是对话的唯一写者；design_author/design_critic 是后台作业，只出作业卡、无对话入口。执行 / 分析 profile 的目录、运行观察与质量投影只读展示，不返回 prompt 或 transcript；配置与提示词版本仅管理员可编辑。
+            2 个对话 Host（clarification/design）是对话的唯一写者；design_author/design_critic
+            是后台作业，只出作业卡、无对话入口。执行 / 分析 profile
+            的目录、运行观察与质量投影只读展示，不返回 prompt 或
+            transcript；配置与提示词版本仅管理员可编辑。
           </p>
         </div>
         <Button variant="secondary" size="sm" onClick={refresh}>

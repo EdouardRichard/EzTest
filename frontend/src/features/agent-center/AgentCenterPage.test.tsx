@@ -195,7 +195,9 @@ describe("AgentCenterPage", () => {
 
     // Removed Scout/Curator/Planner/case_author profiles never surface.
     expect(
-      screen.queryByText(/context_scout|requirement_curator|design_planner|data_planner|case_author/),
+      screen.queryByText(
+        /context_scout|requirement_curator|design_planner|data_planner|case_author/,
+      ),
     ).not.toBeInTheDocument()
     expect(screen.queryByText(/explorer/)).not.toBeInTheDocument()
 
@@ -283,8 +285,6 @@ describe("AgentCenterPage", () => {
   it("renders the runs empty state", async () => {
     agentCenterApi.listAgentRuns.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     render(<AgentCenterPage initialTab="runs" />)
-    expect(await screen.findByTestId("agent-center-runs-empty")).toHaveTextContent(
-      "尚无运行记录",
-    )
+    expect(await screen.findByTestId("agent-center-runs-empty")).toHaveTextContent("尚无运行记录")
   })
 })

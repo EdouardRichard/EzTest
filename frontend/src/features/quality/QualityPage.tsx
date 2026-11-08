@@ -212,8 +212,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             {isAdmin ? <Badge tone="info">管理员</Badge> : null}
           </div>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            运营指标由服务端按只读口径派生；视觉质量沿用 P5。快照评测（4
-            项指标）、真实 LLM run 与趋势看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
+            运营指标由服务端按只读口径派生；视觉质量沿用 P5。快照评测（4 项指标）、真实 LLM run
+            与趋势看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -288,7 +288,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           <div>
             <h2 className="text-sm font-semibold text-foreground">评测看板</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              快照评测 run（服务端从版本真实数据派生 4 项指标）与历史真实 LLM run；阈值、基线与趋势由服务端派生，客户端 verdict 不生效。
+              快照评测 run（服务端从版本真实数据派生 4 项指标）与历史真实 LLM
+              run；阈值、基线与趋势由服务端派生，客户端 verdict 不生效。
             </p>
           </div>
           {isAdmin ? <Badge tone="neutral">admin-only</Badge> : null}
@@ -310,8 +311,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
                 data-testid="quality-eval-trigger-result"
                 className="text-[11px] text-muted-foreground"
               >
-                快照评测已生成 #{triggerResult.id}（
-                {EVAL_STATUS_LABEL[triggerResult.status]}，{triggerResult.metrics.length} 项指标）
+                快照评测已生成 #{triggerResult.id}（{EVAL_STATUS_LABEL[triggerResult.status]}，
+                {triggerResult.metrics.length} 项指标）
               </p>
             ) : null}
             {triggerError !== null ? <InlineError error={triggerError} /> : null}
@@ -361,10 +362,13 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
                 同一版本的多次快照评测形成趋势；基线回归仅告警，不阻断阶段验收。
               </p>
             </div>
-            <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <label
+              htmlFor="quality-trend-metric"
+              className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
+            >
               <span>趋势指标</span>
               <Select
-                aria-label="趋势指标"
+                id="quality-trend-metric"
                 value={trendMetric}
                 onChange={(event) => setTrendMetric(event.target.value)}
                 className="h-8 w-44 text-xs"

@@ -300,7 +300,9 @@ describe("QualityPage", () => {
     fireEvent.click(trigger)
 
     await waitFor(() => expect(qualityApi.triggerSnapshot).toHaveBeenCalledWith("2001"))
-    expect(await screen.findByTestId("quality-eval-trigger-result")).toHaveTextContent("快照评测已生成")
+    expect(await screen.findByTestId("quality-eval-trigger-result")).toHaveTextContent(
+      "快照评测已生成",
+    )
     await waitFor(() => expect(qualityApi.listEvalRuns).toHaveBeenCalledTimes(2))
   })
 
