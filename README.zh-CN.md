@@ -502,7 +502,3 @@ LICENSE                  Apache License 2.0
 ## 许可证
 
 基于 [Apache License 2.0](LICENSE) 许可。
-
-EzTest 的产品设计受到 ARTEX 项目中探索过的想法启发（AGPL-3.0）；仓库不包含任何 ARTEX 源代码。第三方
-组件（Go 模块、npm 包、Node.js、Playwright 与 Chromium）按其各自许可证分发；可运行包内附
-`THIRD_PARTY_NOTICES.md`。
